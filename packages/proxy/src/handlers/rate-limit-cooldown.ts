@@ -1,7 +1,9 @@
 import {
 	computeRateLimitBackoffMs,
+	getRateLimitMaxCooldownMs,
 	logError,
 	RateLimitError,
+	resolveCooldownUntil,
 } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import type { Account, RateLimitReason } from "@better-ccflare/types";
@@ -88,7 +90,9 @@ export function resetRateLimitProbeGatesForTests(): void {
  * all_models_exhausted_429, mid-stream sniffer) — never reach into rate_limited_until manually.
  *
  * @param account - The account that just received a 429 (mutated in place).
- * @param rateLimitInfo - `resetTime` caps the computed cooldown via min(resetTime, now + backoff).
+ * @param rateLimitInfo - `resetTime` (if known) is honored as the cooldown target,
+ *   bounded below by the exponential backoff and above by the safety ceiling
+ *   (CCFLARE_RATE_LIMIT_MAX_COOLDOWN_MS) — see resolveCooldownUntil.
  *   `remaining` is forwarded to the emitted RateLimitError. `reason` overrides the
  *   auto-derived audit reason.
  * @param ctx - The proxy context (provides asyncWriter + dbOps).
@@ -108,10 +112,15 @@ export function applyRateLimitCooldown(
 	// tier short, but the persisted counter still ramps correctly.
 	const nextCount = account.consecutive_rate_limits + 1;
 	const backoffMs = computeRateLimitBackoffMs(nextCount);
-	const candidateUntil = now + backoffMs;
-	const cooldownUntil = rateLimitInfo.resetTime
-		? Math.min(rateLimitInfo.resetTime, candidateUntil)
-		: candidateUntil;
+	// When the upstream reset is known, bench until that reset (bounded below by
+	// the exponential backoff, above by the safety ceiling) instead of discarding
+	// a far-future reset and re-probing every ~5min — see resolveCooldownUntil.
+	const cooldownUntil = resolveCooldownUntil({
+		now,
+		backoffMs,
+		maxCooldownMs: getRateLimitMaxCooldownMs(),
+		resetTime: rateLimitInfo.resetTime,
+	});
 	const reason: RateLimitReason =
 		rateLimitInfo.reason ??
 		(rateLimitInfo.resetTime
