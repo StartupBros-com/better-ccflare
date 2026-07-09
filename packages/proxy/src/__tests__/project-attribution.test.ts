@@ -23,6 +23,7 @@ import { describe, expect, it } from "bun:test";
 import {
 	extractProjectAttributionFromParts,
 	extractProjectAttributionFromRequest,
+	extractSystemPromptFromBase64,
 	isLowRiskProjectSlug,
 } from "../project-attribution";
 
@@ -143,6 +144,21 @@ describe("extractProjectAttributionFromRequest", () => {
 			});
 		}
 	});
+
+	it("rejects an H1 heading whose secret sits past the 64-char truncation boundary end-to-end", () => {
+		// Full end-to-end path (not just isLowRiskProjectSlug directly): a
+		// heading that is unambiguously rejected (UUID + >6 words) must still
+		// come back as no attribution, proving the full un-truncated heading
+		// is what gets validated.
+		const headers = new Headers();
+		const body = {
+			system:
+				"# <a heading carrying a UUID like 550e8400-e29b-41d4-a716-446655440000>",
+		};
+		const result = extractProjectAttributionFromRequest(headers, body);
+		expect(result.project).toBeNull();
+		expect(result.projectAttributionSource).toBe("none");
+	});
 });
 
 describe("isLowRiskProjectSlug", () => {
@@ -179,6 +195,79 @@ describe("isLowRiskProjectSlug", () => {
 			expect(isLowRiskProjectSlug("attribution-source-tags")).toBe(true);
 			expect(isLowRiskProjectSlug("my-really-long-project-name")).toBe(true);
 		});
+	});
+
+	describe("rejects trace-id, URL, and path shapes (hardened heading validator)", () => {
+		const rejectedCases: Array<[string, string]> = [
+			["UUID / raw trace id", "550e8400-e29b-41d4-a716-446655440000"],
+			["uppercase host (case-insensitive)", "WWW.EXAMPLE.COM"],
+			["URI scheme", "file:/etc/passwd"],
+			["Windows drive path", "C:/Users/alice/acme"],
+			["traversal path", "../../etc/passwd"],
+			["absolute path", "/etc/passwd"],
+			[
+				"host:port/path (slash+colon excluded from slug grammar)",
+				"host:8080/path",
+			],
+		];
+
+		for (const [label, value] of rejectedCases) {
+			it(`rejects: ${label}`, () => {
+				expect(isLowRiskProjectSlug(value)).toBe(false);
+			});
+		}
+
+		it("still accepts ordinary slug-shaped labels (no over-rejection regression)", () => {
+			expect(isLowRiskProjectSlug("better-ccflare")).toBe(true);
+			expect(isLowRiskProjectSlug("Harness")).toBe(true);
+			expect(isLowRiskProjectSlug("eval-suite")).toBe(true);
+			expect(isLowRiskProjectSlug("My Project")).toBe(true);
+			expect(isLowRiskProjectSlug("attribution-source-tags")).toBe(true);
+			expect(isLowRiskProjectSlug("my-really-long-project-name")).toBe(true);
+		});
+	});
+
+	describe("validates the FULL value, not a 64-char-truncated prefix (R10a)", () => {
+		// Pre-boundary prefix: exactly 64 chars, slug-clean (dash-delimited
+		// 15-char runs, so no unbroken alnum run reaches the 20-char
+		// LONG_TOKEN_RE threshold) and ending in a dash so nothing can merge
+		// across the boundary with whatever follows.
+		const CLEAN_64_PREFIX = `${"x".repeat(15)}-`.repeat(4);
+
+		it("sanity: the clean 64-char prefix alone is accepted", () => {
+			expect(CLEAN_64_PREFIX.length).toBe(64);
+			expect(isLowRiskProjectSlug(CLEAN_64_PREFIX)).toBe(true);
+		});
+
+		it("rejects wholesale once a 25-char high-entropy token sits entirely past char 64", () => {
+			// A pre-truncation validator (64-char cap applied BEFORE validation,
+			// the bug this hardening fixes) would have sliced this value down to
+			// CLEAN_64_PREFIX and returned true, because the secret only exists
+			// past the truncation boundary. The hardened validator sees the
+			// full, untruncated value and rejects it — both via LONG_TOKEN_RE
+			// matching the trailing run and via the slug grammar's length bound.
+			const boundaryStraddlingSecret = `${CLEAN_64_PREFIX}${"Z".repeat(25)}`;
+			expect(isLowRiskProjectSlug(boundaryStraddlingSecret)).toBe(false);
+		});
+	});
+});
+
+describe("extractSystemPromptFromBase64", () => {
+	it("tolerates a null element in a system array without throwing (parity with the parsed-body path)", () => {
+		const requestBodyBase64 = Buffer.from(
+			JSON.stringify({
+				system: [
+					null,
+					{ type: "text", text: "context /home/u/projects/acme/x.ts" },
+				],
+			}),
+		).toString("base64");
+
+		let result: string | null = null;
+		expect(() => {
+			result = extractSystemPromptFromBase64(requestBodyBase64);
+		}).not.toThrow();
+		expect(result).toContain("/home/u/projects/acme/x.ts");
 	});
 });
 
@@ -218,5 +307,20 @@ describe("extractProjectAttributionFromParts (usage-collector base64 fallback)",
 		const result = extractProjectAttributionFromParts(null, null);
 		expect(result.project).toBeNull();
 		expect(result.projectAttributionSource).toBe("none");
+	});
+
+	it("resolves path_project from a base64 body whose system array contains a null element (parity with the parsed-body path)", () => {
+		const requestBodyBase64 = Buffer.from(
+			JSON.stringify({
+				system: [
+					null,
+					{ type: "text", text: "context /home/u/projects/acme/x.ts" },
+				],
+			}),
+		).toString("base64");
+
+		const result = extractProjectAttributionFromParts({}, requestBodyBase64);
+		expect(result.project).toBe("acme");
+		expect(result.projectAttributionSource).toBe("path_project");
 	});
 });

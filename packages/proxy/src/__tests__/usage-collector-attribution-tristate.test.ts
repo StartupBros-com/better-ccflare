@@ -206,4 +206,35 @@ describe("UsageCollector - attribution tri-state (real collector, end-to-end)", 
 		expect(summary.projectAttributionSource).toBe("path_project");
 		expect(summary.agentAttributionSource).toBe("none");
 	});
+
+	test("branch A: authoritative project value is sanitized (control chars stripped) while the authoritative source is still honored", async () => {
+		const rawProject = "ac\x1b[31m me\x07";
+		const start = makeStart({
+			requestId: "tristate-5-authoritative-value-sanitized",
+			project: rawProject,
+			projectAttributionSource: "header_project",
+		});
+
+		const summary = await runRequestAndGetSummary(start);
+
+		// biome-ignore lint/suspicious/noControlCharactersInRegex: computing the expected sanitized value the same way sanitizeProjectName does
+		const expected = rawProject.replace(/[\x00-\x1F\x7F]/g, "").trim();
+		expect(summary.project).toBe(expected);
+		// biome-ignore lint/suspicious/noControlCharactersInRegex: asserting control chars are gone
+		expect(summary.project ?? "").not.toMatch(/[\x00-\x1F\x7F]/);
+		expect(summary.projectAttributionSource).toBe("header_project");
+	});
+
+	test('branch A: an authoritative project value that sanitizes to empty falls back to "none"', async () => {
+		const start = makeStart({
+			requestId: "tristate-6-authoritative-value-empties",
+			project: " ",
+			projectAttributionSource: "header_project",
+		});
+
+		const summary = await runRequestAndGetSummary(start);
+
+		expect(summary.project == null).toBe(true);
+		expect(summary.projectAttributionSource).toBe("none");
+	});
 });

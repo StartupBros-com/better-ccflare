@@ -13,7 +13,10 @@ import {
 } from "@better-ccflare/types";
 import { formatCost } from "@better-ccflare/ui-common";
 import { cacheBodyStore } from "./cache-body-store";
-import { extractProjectAttributionFromParts } from "./project-attribution";
+import {
+	extractProjectAttributionFromParts,
+	sanitizeProjectName,
+} from "./project-attribution";
 import { combineChunks } from "./stream-tee";
 import {
 	type EndMessage,
@@ -383,10 +386,17 @@ export class UsageCollector {
 		// message that carries a project but no source is tagged "none"; a fully
 		// legacy/direct message with neither is recomputed via the shared helper.
 		if (msg.projectAttributionSource != null) {
-			state.project = msg.project ?? null;
-			state.projectAttributionSource = msg.projectAttributionSource;
+			// Authoritative source, but still sanitize the value — a legacy/direct
+			// producer could pair a real source label with an unsanitized project
+			// (control chars, ANSI, overlong). Drop to "none" if nothing survives.
+			const sanitized = sanitizeProjectName(msg.project);
+			state.project = sanitized;
+			state.projectAttributionSource = sanitized
+				? msg.projectAttributionSource
+				: "none";
 		} else if (msg.project) {
-			state.project = msg.project;
+			// Legacy message: project set, no source. Sanitize and tag "none".
+			state.project = sanitizeProjectName(msg.project);
 			state.projectAttributionSource = "none";
 		} else {
 			const extracted = extractProjectAttributionFromParts(

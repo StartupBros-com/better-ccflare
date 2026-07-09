@@ -60,26 +60,13 @@ export function extractSystemPromptFromBase64(
 	if (!requestBody) return null;
 
 	try {
-		// Decode base64 request body
+		// Decode base64 request body, then reuse the SAME extraction as the
+		// parsed-body path so the legacy/direct fallback never diverges (R7) —
+		// e.g. `system: [null, {type:"text", text:"..."}]` is tolerated here
+		// exactly as extractSystemPromptFromJson tolerates it, not thrown on.
 		const decodedBody = Buffer.from(requestBody, "base64").toString("utf-8");
-		const parsed = JSON.parse(decodedBody);
-
-		// Check if there's a system property in the request
-		if (parsed.system) {
-			// Handle both string and array formats
-			if (typeof parsed.system === "string") {
-				return parsed.system;
-			} else if (Array.isArray(parsed.system)) {
-				// Concatenate all text from system messages
-				return parsed.system
-					.filter(
-						(item: { type?: string; text?: string }) =>
-							item.type === "text" && item.text,
-					)
-					.map((item: { type?: string; text?: string }) => item.text)
-					.join("\n");
-			}
-		}
+		const parsed = JSON.parse(decodedBody) as RequestJsonBody;
+		return extractSystemPromptFromJson(parsed);
 	} catch (error) {
 		// Malformed/undecodable body — treat as no system prompt, but keep it
 		// diagnosable on the legacy usage-collector recompute path.
@@ -101,41 +88,76 @@ const AWS_KEY_RE = /AKIA[0-9A-Z]{12,}/;
 const LONG_TOKEN_RE = /[A-Za-z0-9]{20,}/;
 // Bare IPv4 address — an internal host, never a real project name.
 const IPV4_RE = /\b\d{1,3}(?:\.\d{1,3}){3}\b/;
+// UUID / raw trace-id shape (explicitly prohibited as attribution metadata).
+const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+// A leading URI scheme or Windows drive letter (file:, http:, mailto:, C:, ...).
+// Matches "scheme:" anchored at the start; ordinary slugs have no leading scheme.
+const URI_SCHEME_RE = /^[A-Za-z][A-Za-z0-9+.-]*:/;
 // Allowed low-risk project-slug shape: starts with a word char or dot, then
-// word chars, dots, spaces, colons, slashes, or dashes, capped at 64 chars.
-const SLUG_SHAPE_RE = /^[\w.][\w .:/-]{0,63}$/;
+// word chars, dots, spaces, or dashes, capped at 64 chars. Slashes and colons
+// are intentionally excluded — they enable path, URI, host:port, and drive-letter
+// shapes that must never be surfaced as a project label.
+const SLUG_SHAPE_RE = /^[\w.][\w .-]{0,63}$/;
 
 /**
  * Conservative validator for heading-derived project labels (R10a).
  *
- * Rejects values that look like they could carry a secret, a URL, an email
- * address, or free-form sentence/incident text. Accepts ordinary
- * repo-name-shaped labels (e.g. "better-ccflare", "Harness", "eval-suite",
- * "My Project").
+ * Validates the FULL cleaned heading (control-stripped, trimmed, but NEVER
+ * length-capped) so a secret positioned near the 64-char truncation boundary
+ * cannot be shortened below a detector threshold and slip through. Rejects
+ * values that look like they could carry a secret, a raw trace/UUID id, a URL
+ * or URI scheme, an absolute/drive/traversal path, an email address, or
+ * free-form sentence/incident text. Accepts ordinary repo-name-shaped labels
+ * (e.g. "better-ccflare", "Harness", "eval-suite", "My Project").
  */
 export function isLowRiskProjectSlug(value: string): boolean {
-	if (value.includes("://") || value.includes("www.")) return false;
+	// biome-ignore lint/suspicious/noControlCharactersInRegex: stripping them is the point
+	const cleaned = value.replace(/[\x00-\x1F\x7F]/g, "").trim();
+	if (!cleaned) return false;
+	const lower = cleaned.toLowerCase();
 
-	const atIndex = value.indexOf("@");
-	if (atIndex !== -1 && value.indexOf(".", atIndex) !== -1) return false;
-
+	// URLs / URI schemes / hosts (case-insensitive — WWW.EXAMPLE.COM must fail too).
 	if (
-		SECRET_TOKEN_RE.test(value) ||
-		value.toLowerCase().includes("bearer ") ||
-		AWS_KEY_RE.test(value) ||
-		IPV4_RE.test(value) ||
-		LONG_TOKEN_RE.test(value)
+		lower.includes("://") ||
+		lower.includes("www.") ||
+		URI_SCHEME_RE.test(cleaned)
 	) {
 		return false;
 	}
 
-	const wordCount = value.split(/\s+/).filter(Boolean).length;
-	if (wordCount > 6) return false;
+	// Absolute, Windows-drive, UNC, or traversal paths.
+	if (
+		cleaned.startsWith("/") ||
+		cleaned.startsWith("\\") ||
+		cleaned.includes("..")
+	) {
+		return false;
+	}
 
-	const sanitized = sanitizeProjectName(value);
-	if (!sanitized || !SLUG_SHAPE_RE.test(sanitized)) return false;
+	// Email address.
+	const atIndex = cleaned.indexOf("@");
+	if (atIndex !== -1 && cleaned.indexOf(".", atIndex) !== -1) return false;
 
-	return true;
+	// Raw trace / UUID identifiers.
+	if (UUID_RE.test(cleaned)) return false;
+
+	// Secrets, keys, IPs, and high-entropy tokens.
+	if (
+		SECRET_TOKEN_RE.test(cleaned) ||
+		lower.includes("bearer ") ||
+		AWS_KEY_RE.test(cleaned) ||
+		IPV4_RE.test(cleaned) ||
+		LONG_TOKEN_RE.test(cleaned)
+	) {
+		return false;
+	}
+
+	// Sentence / incident-shaped free text.
+	if (cleaned.split(/\s+/).filter(Boolean).length > 6) return false;
+
+	// Strict slug grammar on the FULL value (no slashes/colons; a >64-char value
+	// fails the {0,63} bound and is rejected wholesale rather than truncated).
+	return SLUG_SHAPE_RE.test(cleaned);
 }
 
 const WORKSPACE_PATH_RE =
@@ -187,16 +209,21 @@ export function extractProjectAttribution(
 
 		const headingMatch = systemPrompt.match(HEADING_RE);
 		if (headingMatch) {
-			const heading = sanitizeProjectName(headingMatch[1]);
+			// Validate the FULL captured heading, then length-cap only after it
+			// passes — truncating first could shorten a boundary-straddling secret
+			// below a detector threshold and let a partial secret through.
+			const rawHeading = headingMatch[1];
 			if (
-				heading &&
-				!heading.toLowerCase().startsWith("claude") &&
-				isLowRiskProjectSlug(heading)
+				!rawHeading.trim().toLowerCase().startsWith("claude") &&
+				isLowRiskProjectSlug(rawHeading)
 			) {
-				return {
-					project: heading,
-					projectAttributionSource: "heading_project",
-				};
+				const heading = sanitizeProjectName(rawHeading);
+				if (heading) {
+					return {
+						project: heading,
+						projectAttributionSource: "heading_project",
+					};
+				}
 			}
 		}
 	}
