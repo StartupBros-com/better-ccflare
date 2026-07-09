@@ -722,6 +722,8 @@ export class UsageCollector {
 					// instead of duplicating the `model` column's value.
 					modelRewritten ? startMessage.originalModel : null,
 					modelRewritten ? startMessage.appliedModel : null,
+					state.projectAttributionSource ?? null,
+					state.agentAttributionSource ?? null,
 				);
 			} catch (error) {
 				log.error(

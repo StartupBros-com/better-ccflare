@@ -946,6 +946,8 @@ OAuth tokens will need to be re-authenticated.
 		comboName?: string | null,
 		originalModel?: string | null,
 		appliedModel?: string | null,
+		projectAttributionSource?: string | null,
+		agentAttributionSource?: string | null,
 	): Promise<void> {
 		await withDatabaseRetry(
 			() =>
@@ -968,6 +970,8 @@ OAuth tokens will need to be re-authenticated.
 					comboName,
 					originalModel,
 					appliedModel,
+					projectAttributionSource,
+					agentAttributionSource,
 				}),
 			this.retryConfig,
 			"saveRequest",

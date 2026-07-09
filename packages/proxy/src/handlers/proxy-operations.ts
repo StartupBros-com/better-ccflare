@@ -808,6 +808,10 @@ export async function proxyWithAccount(
 						requestMeta.project ?? null,
 						undefined,
 						requestMeta.comboName ?? null,
+						requestMeta.originalModel ?? null,
+						requestMeta.appliedModel ?? null,
+						requestMeta.projectAttributionSource ?? null,
+						requestMeta.agentAttributionSource ?? null,
 					),
 				);
 				return null;
@@ -870,6 +874,10 @@ export async function proxyWithAccount(
 								requestMeta.project ?? null,
 								undefined,
 								requestMeta.comboName ?? null,
+								requestMeta.originalModel ?? null,
+								requestMeta.appliedModel ?? null,
+								requestMeta.projectAttributionSource ?? null,
+								requestMeta.agentAttributionSource ?? null,
 							),
 						);
 						return null;
@@ -1006,6 +1014,10 @@ export async function proxyWithAccount(
 								requestMeta.project ?? null,
 								undefined,
 								requestMeta.comboName ?? null,
+								requestMeta.originalModel ?? null,
+								requestMeta.appliedModel ?? null,
+								requestMeta.projectAttributionSource ?? null,
+								requestMeta.agentAttributionSource ?? null,
 							),
 						);
 					}

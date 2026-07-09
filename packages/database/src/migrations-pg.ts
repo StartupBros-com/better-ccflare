@@ -109,7 +109,9 @@ export async function ensureSchemaPg(adapter: BunSqlAdapter): Promise<void> {
 			billing_type TEXT DEFAULT 'api',
 			combo_name TEXT,
 			original_model TEXT,
-			applied_model TEXT
+			applied_model TEXT,
+			project_attribution_source TEXT,
+			agent_attribution_source TEXT
 		)
 	`);
 
@@ -428,6 +430,18 @@ export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 			table: "requests",
 			column: "applied_model",
 			definition: "ALTER TABLE requests ADD COLUMN applied_model TEXT",
+		},
+		{
+			table: "requests",
+			column: "project_attribution_source",
+			definition:
+				"ALTER TABLE requests ADD COLUMN project_attribution_source TEXT",
+		},
+		{
+			table: "requests",
+			column: "agent_attribution_source",
+			definition:
+				"ALTER TABLE requests ADD COLUMN agent_attribution_source TEXT",
 		},
 		{
 			table: "request_payloads",
