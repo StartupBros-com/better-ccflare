@@ -5,9 +5,14 @@ import {
 } from "@better-ccflare/core";
 import { AsyncDbWriter, DatabaseOperations } from "@better-ccflare/database";
 import { Logger } from "@better-ccflare/logger";
-import { NO_ACCOUNT_ID, type RequestResponse } from "@better-ccflare/types";
+import {
+	NO_ACCOUNT_ID,
+	type ProjectAttributionSource,
+	type RequestResponse,
+} from "@better-ccflare/types";
 import { formatCost } from "@better-ccflare/ui-common";
 import { cacheBodyStore } from "./cache-body-store";
+import { extractProjectAttributionFromParts } from "./project-attribution";
 import { combineChunks } from "./stream-tee";
 import {
 	type EndMessage,
@@ -37,6 +42,7 @@ interface RequestState {
 	createdAt: number; // TTL tracking
 	agentUsed?: string;
 	project?: string | null;
+	projectAttributionSource?: ProjectAttributionSource | null;
 	billingType?: string;
 	firstTokenTimestamp?: number;
 	lastTokenTimestamp?: number;
@@ -60,102 +66,6 @@ function shouldLogRequest(path: string, status: number): boolean {
 		return false;
 	}
 	return true;
-}
-
-// Project names are persisted to a single TEXT column and surfaced in the UI.
-// Cap length and strip control chars so a hostile system prompt can't smuggle
-// newlines, ANSI escapes, or megabyte-long blobs into the database.
-const PROJECT_NAME_MAX_LEN = 64;
-
-function sanitizeProjectName(raw: string | undefined | null): string | null {
-	if (!raw) return null;
-	// Strip ASCII control chars (incl. newlines/tabs) — keep Unicode letters,
-	// dashes, dots, and spaces that real project directories use.
-	// biome-ignore lint/suspicious/noControlCharactersInRegex: stripping them is the point
-	const cleaned = raw.replace(/[\x00-\x1F\x7F]/g, "").trim();
-	if (!cleaned) return null;
-	return cleaned.length > PROJECT_NAME_MAX_LEN
-		? cleaned.slice(0, PROJECT_NAME_MAX_LEN)
-		: cleaned;
-}
-
-/**
- * Extract a project name from a Claude API request.
- *
- * Resolution order:
- *  1. Case-insensitive `x-project` request header
- *  2. Workspace path embedded in the system prompt
- *     (e.g. /Users/me/Desktop/MyProj/...)
- *  3. First Markdown H1 heading in the system prompt (if reasonable)
- *
- * All return values are sanitized (control chars stripped, length-capped).
- * Returns null when no project can be inferred.
- */
-function extractProjectFromRequest(startMessage: StartMessage): string | null {
-	const messageProject = sanitizeProjectName(startMessage.project);
-	if (messageProject) return messageProject;
-
-	if (startMessage.requestHeaders) {
-		// The Web Headers API normalizes keys to lowercase, but defensively
-		// match case-insensitively in case the collector receives a plain object.
-		const headerProject = Object.entries(startMessage.requestHeaders).find(
-			([k]) => k.toLowerCase() === "x-project",
-		)?.[1];
-		const sanitizedHeader = sanitizeProjectName(headerProject);
-		if (sanitizedHeader) return sanitizedHeader;
-	}
-
-	const systemPrompt = _extractSystemPrompt(startMessage.requestBody);
-	if (!systemPrompt) return null;
-
-	const pathMatch = systemPrompt.match(
-		/\/(?:Users|home)\/[^/]+\/(?:Desktop|projects|repos|src)\/([^/]+)\//,
-	);
-	const sanitizedPath = sanitizeProjectName(pathMatch?.[1]);
-	if (sanitizedPath) return sanitizedPath;
-
-	// Mirror of the regex in proxy.ts (both cap output via sanitizeProjectName)
-	const headingMatch = systemPrompt.match(/^#\s+([^\n\r]{1,100})/m);
-	if (headingMatch) {
-		const heading = sanitizeProjectName(headingMatch[1]);
-		if (heading && !heading.toLowerCase().startsWith("claude")) {
-			return heading;
-		}
-	}
-
-	return null;
-}
-
-// Extract system prompt from request body
-function _extractSystemPrompt(requestBody: string | null): string | null {
-	if (!requestBody) return null;
-
-	try {
-		// Decode base64 request body
-		const decodedBody = Buffer.from(requestBody, "base64").toString("utf-8");
-		const parsed = JSON.parse(decodedBody);
-
-		// Check if there's a system property in the request
-		if (parsed.system) {
-			// Handle both string and array formats
-			if (typeof parsed.system === "string") {
-				return parsed.system;
-			} else if (Array.isArray(parsed.system)) {
-				// Concatenate all text from system messages
-				return parsed.system
-					.filter(
-						(item: { type?: string; text?: string }) =>
-							item.type === "text" && item.text,
-					)
-					.map((item: { type?: string; text?: string }) => item.text)
-					.join("\n");
-			}
-		}
-	} catch (error) {
-		log.debug("Failed to extract system prompt:", error);
-	}
-
-	return null;
 }
 
 // Parse SSE lines to extract usage (reuse existing logic)
@@ -465,8 +375,22 @@ export class UsageCollector {
 			log.debug(`Agent '${msg.agentUsed}' used for request ${msg.requestId}`);
 		}
 
-		// Extract project name (header or system prompt)
-		state.project = extractProjectFromRequest(msg);
+		// Extract project name + attribution source (header, path, or heading)
+		if (msg.project) {
+			state.project = msg.project;
+			// authoritative source from the start message when available (U4 populates
+			// StartMessage.projectAttributionSource); fall back to "none" until then
+			state.projectAttributionSource =
+				(msg as { projectAttributionSource?: ProjectAttributionSource })
+					.projectAttributionSource ?? "none";
+		} else {
+			const extracted = extractProjectAttributionFromParts(
+				msg.requestHeaders,
+				msg.requestBody,
+			);
+			state.project = extracted.project;
+			state.projectAttributionSource = extracted.projectAttributionSource;
+		}
 		if (state.project) {
 			log.debug(
 				`Project '${state.project}' extracted for request ${msg.requestId}`,
