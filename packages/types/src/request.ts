@@ -137,6 +137,7 @@ export interface RequestPayload {
 		path?: string;
 		method?: string;
 		agentUsed?: string;
+		agentAttributionSource?: AgentAttributionSource;
 		requestBodyTruncated?: boolean;
 		responseBodyTruncated?: boolean;
 		limitApplied?: number;

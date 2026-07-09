@@ -1,5 +1,8 @@
+import { Logger } from "@better-ccflare/logger";
 import type { ProjectAttributionSource } from "@better-ccflare/types";
 import type { RequestJsonBody } from "./request-body-context";
+
+const log = new Logger("ProjectAttribution");
 
 export interface ProjectExtractionResult {
 	project: string | null;
@@ -77,8 +80,10 @@ export function extractSystemPromptFromBase64(
 					.join("\n");
 			}
 		}
-	} catch {
-		// Silent fail — malformed/undecodable body, treat as no system prompt.
+	} catch (error) {
+		// Malformed/undecodable body — treat as no system prompt, but keep it
+		// diagnosable on the legacy usage-collector recompute path.
+		log.debug("Failed to extract system prompt from request body:", error);
 	}
 
 	return null;
@@ -88,8 +93,14 @@ export function extractSystemPromptFromBase64(
 const SECRET_TOKEN_RE = /\b(?:sk|pk|rk|ak)[-_][A-Za-z0-9]{8,}/i;
 // AWS access-key-id shape.
 const AWS_KEY_RE = /AKIA[0-9A-Z]{12,}/;
-// A long run of base64/hex-ish characters (high-entropy token shape).
-const LONG_TOKEN_RE = /[A-Za-z0-9+/_-]{32,}/;
+// An unbroken run of 20+ alphanumeric chars — the shape of a raw secret, hash,
+// or high-entropy token. Excludes separators (-, _, /) on purpose so ordinary
+// hyphenated slugs like "attribution-source-tags" are NOT rejected, while still
+// catching bare tokens the old 32-char base64-class pattern missed (16-31 char
+// hex/base32 secrets, session ids, etc.).
+const LONG_TOKEN_RE = /[A-Za-z0-9]{20,}/;
+// Bare IPv4 address — an internal host, never a real project name.
+const IPV4_RE = /\b\d{1,3}(?:\.\d{1,3}){3}\b/;
 // Allowed low-risk project-slug shape: starts with a word char or dot, then
 // word chars, dots, spaces, colons, slashes, or dashes, capped at 64 chars.
 const SLUG_SHAPE_RE = /^[\w.][\w .:/-]{0,63}$/;
@@ -112,6 +123,7 @@ export function isLowRiskProjectSlug(value: string): boolean {
 		SECRET_TOKEN_RE.test(value) ||
 		value.toLowerCase().includes("bearer ") ||
 		AWS_KEY_RE.test(value) ||
+		IPV4_RE.test(value) ||
 		LONG_TOKEN_RE.test(value)
 	) {
 		return false;

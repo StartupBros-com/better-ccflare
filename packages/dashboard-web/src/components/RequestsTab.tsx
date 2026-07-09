@@ -721,7 +721,8 @@ export function RequestsTab() {
 									: null);
 							const agent = summary?.agentUsed || request.meta.agentUsed;
 							const agentSrcLabel = attributionSourceLabel(
-								summary?.agentAttributionSource,
+								summary?.agentAttributionSource ||
+									request.meta.agentAttributionSource,
 							);
 							const projectSrcLabel = attributionSourceLabel(
 								summary?.projectAttributionSource,
@@ -869,7 +870,11 @@ export function RequestsTab() {
 											{summary?.project && (
 												<Badge variant="secondary" className="text-xs">
 													Project: {summary.project}
-													{projectSrcLabel ? ` · ${projectSrcLabel}` : ""}
+													{projectSrcLabel && (
+														<span className="text-muted-foreground/70 ml-1">
+															· {projectSrcLabel}
+														</span>
+													)}
 												</Badge>
 											)}
 											{agent && (

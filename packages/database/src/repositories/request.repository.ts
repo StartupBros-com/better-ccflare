@@ -1,4 +1,8 @@
 import { Logger } from "@better-ccflare/logger";
+import type {
+	AgentAttributionSource,
+	ProjectAttributionSource,
+} from "@better-ccflare/types";
 import { decryptPayload, encryptPayload } from "../payload-encryption";
 import { BaseRepository } from "./base.repository";
 
@@ -52,8 +56,8 @@ export interface RequestData {
 	 */
 	originalModel?: string | null;
 	appliedModel?: string | null;
-	projectAttributionSource?: string | null;
-	agentAttributionSource?: string | null;
+	projectAttributionSource?: ProjectAttributionSource | null;
+	agentAttributionSource?: AgentAttributionSource | null;
 	usage?: {
 		model?: string;
 		promptTokens?: number;
@@ -111,6 +115,14 @@ export class RequestRepository extends BaseRepository<RequestData> {
 				combo_name = COALESCE(EXCLUDED.combo_name, requests.combo_name),
 				original_model = COALESCE(EXCLUDED.original_model, requests.original_model),
 				applied_model = COALESCE(EXCLUDED.applied_model, requests.applied_model),
+				-- Attribution source columns move in LOCKSTEP with the value they describe (KTD7).
+				-- agent_used is overwritten unconditionally above, so its source mirrors that.
+				-- project uses COALESCE(EXCLUDED.project, requests.project) (preserve-first), so its
+				-- source must be gated on EXCLUDED.project being non-null (NOT on the source column
+				-- itself): keep the old source exactly when the old project value survives, take the
+				-- new source exactly when the new project value wins. Do NOT "simplify" this to
+				-- COALESCE(EXCLUDED.project_attribution_source, requests.project_attribution_source) —
+				-- that desyncs the source from the value whenever a caller sends project + null source.
 				agent_attribution_source = EXCLUDED.agent_attribution_source,
 				project_attribution_source = CASE WHEN EXCLUDED.project IS NOT NULL THEN EXCLUDED.project_attribution_source ELSE requests.project_attribution_source END
 		`,

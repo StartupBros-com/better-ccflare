@@ -370,7 +370,7 @@ export async function handleProxy(
 				requestBody: null,
 				project: project ?? null,
 				projectAttributionSource: projectAttributionSource ?? "none",
-				agentAttributionSource: requestMeta.agentAttributionSource ?? "none",
+				agentAttributionSource: agentAttributionSource ?? "none",
 				responseStatus: 503,
 				responseHeaders: Object.fromEntries(
 					poolExhaustedResponse.headers.entries(),

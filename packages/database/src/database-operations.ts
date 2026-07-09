@@ -7,12 +7,14 @@ import type { Disposable } from "@better-ccflare/core";
 import { TIME_CONSTANTS } from "@better-ccflare/core";
 import type {
 	Account,
+	AgentAttributionSource,
 	Combo,
 	ComboFamily,
 	ComboFamilyAssignment,
 	ComboSlot,
 	ComboWithSlots,
 	IntegrityStatus,
+	ProjectAttributionSource,
 	RateLimitReason,
 	StrategyStore,
 } from "@better-ccflare/types";
@@ -946,8 +948,8 @@ OAuth tokens will need to be re-authenticated.
 		comboName?: string | null,
 		originalModel?: string | null,
 		appliedModel?: string | null,
-		projectAttributionSource?: string | null,
-		agentAttributionSource?: string | null,
+		projectAttributionSource?: ProjectAttributionSource | null,
+		agentAttributionSource?: AgentAttributionSource | null,
 	): Promise<void> {
 		await withDatabaseRetry(
 			() =>

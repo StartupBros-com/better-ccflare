@@ -43,13 +43,14 @@ function makeAccount(overrides: Partial<Account> = {}): Account {
 	};
 }
 
-function makeRequestMeta(): RequestMeta {
+function makeRequestMeta(overrides: Partial<RequestMeta> = {}): RequestMeta {
 	return {
 		id: "req-1",
 		method: "POST",
 		path: "/v1/messages",
 		timestamp: Date.now(),
 		headers: new Headers(),
+		...overrides,
 	};
 }
 
@@ -457,6 +458,108 @@ describe("proxyWithAccount — rate limit audit trail (issue #178)", () => {
 			(args: unknown[]) => args[2] as string,
 		);
 		expect(reasons).toContain("all_models_exhausted_429");
+	});
+});
+
+describe("proxyWithAccount — attribution source pass-through to saveRequest (P2)", () => {
+	let originalFetch: typeof globalThis.fetch;
+
+	beforeEach(() => {
+		originalFetch = globalThis.fetch;
+	});
+
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+	});
+
+	it("passes requestMeta.projectAttributionSource/agentAttributionSource through to saveRequest at positions 16/17 on the model_fallback_429 failover path", async () => {
+		globalThis.fetch = mock(async () =>
+			jsonResponse(
+				{
+					error: {
+						type: "api_error",
+						message:
+							"Rate limit exceeded: limit_rpm/qwen/qwen3.6-plus:free/abc",
+					},
+				},
+				429,
+			),
+		);
+
+		const ctx = makeProxyContextWithAsyncExec();
+		const bodyBuffer = makeRequestBody();
+		const req = makeRequest(bodyBuffer);
+
+		await proxyWithAccount(
+			req,
+			new URL("https://proxy.local/v1/messages"),
+			makeAccount(), // no model_fallbacks -> model_fallback_429 path
+			makeRequestMeta({
+				projectAttributionSource: "header_project",
+				agentAttributionSource: "header_agent",
+			}),
+			bodyBuffer,
+			() => undefined,
+			0,
+			ctx,
+		);
+
+		const saveRequestMock = ctx.dbOps.saveRequest as ReturnType<typeof mock>;
+		expect(saveRequestMock.mock.calls.length).toBeGreaterThan(0);
+		const args = saveRequestMock.mock.calls[0] as unknown[];
+		// Full positional order (0-indexed): id, method, path, accountUsed,
+		// statusCode, success, errorMessage, responseTime, failoverAttempts,
+		// usage, agentUsed, apiKeyId, apiKeyName, project, billingType,
+		// comboName, projectAttributionSource, agentAttributionSource.
+		expect(args[16]).toBe("header_project");
+		expect(args[17]).toBe("header_agent");
+	});
+
+	it("passes null attribution sources through to saveRequest when requestMeta omits them", async () => {
+		globalThis.fetch = mock(async () =>
+			jsonResponse(
+				{
+					error: {
+						type: "api_error",
+						message: "Rate limit exceeded: limit_rpm/model/abc",
+					},
+				},
+				429,
+			),
+		);
+
+		const ctx = makeProxyContextWithAsyncExec();
+		const bodyBuffer = makeRequestBody();
+		const req = makeRequest(bodyBuffer);
+
+		await proxyWithAccount(
+			req,
+			new URL("https://proxy.local/v1/messages"),
+			makeAccount({
+				model_mappings: JSON.stringify({
+					sonnet: [
+						"qwen/qwen3.6-plus:free",
+						"bytedance-seed/dola-seed-2.0-pro:free",
+					],
+				}),
+			}),
+			makeRequestMeta(), // no attribution source overrides
+			bodyBuffer,
+			() => undefined,
+			0,
+			ctx,
+		);
+
+		const saveRequestMock = ctx.dbOps.saveRequest as ReturnType<typeof mock>;
+		const reasons = saveRequestMock.mock.calls.map(
+			(args: unknown[]) => args[6] as string,
+		);
+		expect(reasons).toContain("all_models_exhausted_429");
+		const call = saveRequestMock.mock.calls.find(
+			(args: unknown[]) => args[6] === "all_models_exhausted_429",
+		) as unknown[];
+		expect(call[16]).toBeNull();
+		expect(call[17]).toBeNull();
 	});
 });
 

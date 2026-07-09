@@ -121,6 +121,15 @@ describe("extractProjectAttributionFromRequest", () => {
 				"sentence/incident-shaped (>6 words)",
 				"# This is a very long sentence about an incident that happened today",
 			],
+			[
+				"24-char unbroken hex token (hardened LONG_TOKEN_RE)",
+				"# a1b2c3d4e5f6a1b2c3d4e5f6",
+			],
+			["bare IPv4 address (hardened IPV4_RE)", "# 10.0.0.5"],
+			[
+				"20+ char unbroken alphanumeric session id (hardened LONG_TOKEN_RE)",
+				"# sess1234567890qwerty",
+			],
 		];
 
 		for (const [label, system] of cases) {
@@ -149,6 +158,27 @@ describe("isLowRiskProjectSlug", () => {
 		expect(isLowRiskProjectSlug("www.example.com")).toBe(false);
 		expect(isLowRiskProjectSlug("me@example.com")).toBe(false);
 		expect(isLowRiskProjectSlug("Bearer sk_live_abc123456789")).toBe(false);
+	});
+
+	describe("hardened LONG_TOKEN_RE / IPV4_RE (unbroken 20+ alphanumeric run, bare IPv4)", () => {
+		it("rejects a 24-char unbroken hex token", () => {
+			expect(isLowRiskProjectSlug("a1b2c3d4e5f6a1b2c3d4e5f6")).toBe(false);
+		});
+
+		it("rejects a bare IPv4 address", () => {
+			expect(isLowRiskProjectSlug("10.0.0.5")).toBe(false);
+		});
+
+		it("rejects a 20+ char unbroken alphanumeric session id", () => {
+			expect(isLowRiskProjectSlug("sess1234567890qwerty")).toBe(false);
+		});
+
+		it("still accepts hyphen-broken slugs over 20 chars total (no over-rejection regression)", () => {
+			// Total length > 20 chars, but every hyphen-delimited segment is well
+			// under the 20-char unbroken-run threshold — must NOT be rejected.
+			expect(isLowRiskProjectSlug("attribution-source-tags")).toBe(true);
+			expect(isLowRiskProjectSlug("my-really-long-project-name")).toBe(true);
+		});
 	});
 });
 
