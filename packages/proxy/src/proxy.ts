@@ -171,15 +171,15 @@ export async function handleProxy(
 	}
 
 	// 4. Intercept and modify request for agent model preferences
-	const { modifiedBody, agentUsed, originalModel, appliedModel } =
-		await interceptAndModifyRequest(
-			requestBodyContext,
-			ctx.dbOps,
-			req.headers,
-			{
-				frontmatterModelFallback: ctx.config.getAgentFrontmatterModelFallback(),
-			},
-		);
+	const {
+		modifiedBody,
+		agentUsed,
+		originalModel,
+		appliedModel,
+		agentAttributionSource,
+	} = await interceptAndModifyRequest(requestBodyContext, ctx.dbOps, req.headers, {
+		frontmatterModelFallback: ctx.config.getAgentFrontmatterModelFallback(),
+	});
 
 	// Use modified body if available
 	const finalBodyBuffer = modifiedBody || requestBodyContext.getBuffer();
@@ -197,6 +197,7 @@ export async function handleProxy(
 	// 5. Create request metadata with agent info
 	const requestMeta = createRequestMetadata(req, url);
 	requestMeta.agentUsed = agentUsed;
+	requestMeta.agentAttributionSource = agentAttributionSource;
 	requestMeta.project = project;
 	requestMeta.projectAttributionSource = projectAttributionSource;
 	requestMeta.clientSessionId = requestBodyContext.getClientId();
@@ -368,7 +369,8 @@ export async function handleProxy(
 				requestHeaders: Object.fromEntries(req.headers.entries()),
 				requestBody: null,
 				project: project ?? null,
-				// U4: projectAttributionSource threaded via StartMessage
+				projectAttributionSource: projectAttributionSource ?? "none",
+				agentAttributionSource: requestMeta.agentAttributionSource ?? "none",
 				responseStatus: 503,
 				responseHeaders: Object.fromEntries(
 					poolExhaustedResponse.headers.entries(),

@@ -6,6 +6,7 @@ import {
 import { AsyncDbWriter, DatabaseOperations } from "@better-ccflare/database";
 import { Logger } from "@better-ccflare/logger";
 import {
+	type AgentAttributionSource,
 	NO_ACCOUNT_ID,
 	type ProjectAttributionSource,
 	type RequestResponse,
@@ -41,6 +42,7 @@ interface RequestState {
 	lastActivity: number;
 	createdAt: number; // TTL tracking
 	agentUsed?: string;
+	agentAttributionSource?: AgentAttributionSource | null;
 	project?: string | null;
 	projectAttributionSource?: ProjectAttributionSource | null;
 	billingType?: string;
@@ -374,15 +376,18 @@ export class UsageCollector {
 			state.agentUsed = msg.agentUsed;
 			log.debug(`Agent '${msg.agentUsed}' used for request ${msg.requestId}`);
 		}
+		state.agentAttributionSource = msg.agentAttributionSource ?? "none";
 
-		// Extract project name + attribution source (header, path, or heading)
-		if (msg.project) {
+		// Tri-state source contract: an authoritative source label on the StartMessage
+		// (a concrete value or "none") is honored without recomputation; a legacy
+		// message that carries a project but no source is tagged "none"; a fully
+		// legacy/direct message with neither is recomputed via the shared helper.
+		if (msg.projectAttributionSource != null) {
+			state.project = msg.project ?? null;
+			state.projectAttributionSource = msg.projectAttributionSource;
+		} else if (msg.project) {
 			state.project = msg.project;
-			// authoritative source from the start message when available (U4 populates
-			// StartMessage.projectAttributionSource); fall back to "none" until then
-			state.projectAttributionSource =
-				(msg as { projectAttributionSource?: ProjectAttributionSource })
-					.projectAttributionSource ?? "none";
+			state.projectAttributionSource = "none";
 		} else {
 			const extracted = extractProjectAttributionFromParts(
 				msg.requestHeaders,
@@ -857,6 +862,8 @@ export class UsageCollector {
 			originalModel: startMessage.originalModel || undefined,
 			appliedModel: startMessage.appliedModel || undefined,
 			comboName: startMessage.comboName || undefined,
+			projectAttributionSource: state.projectAttributionSource ?? undefined,
+			agentAttributionSource: state.agentAttributionSource ?? undefined,
 		};
 
 		// Notify cacheBodyStore and emit summary for real-time updates
