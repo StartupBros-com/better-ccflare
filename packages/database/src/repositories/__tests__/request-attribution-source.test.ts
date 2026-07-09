@@ -180,9 +180,9 @@ describe("RequestRepository — attribution source persistence", () => {
 		expect(
 			KNOWN_PROJECT_SOURCES.has(row.project_attribution_source as string),
 		).toBe(true);
-		expect(KNOWN_AGENT_SOURCES.has(row.agent_attribution_source as string)).toBe(
-			true,
-		);
+		expect(
+			KNOWN_AGENT_SOURCES.has(row.agent_attribution_source as string),
+		).toBe(true);
 	});
 
 	it("saving without attribution source fields leaves the columns null", async () => {

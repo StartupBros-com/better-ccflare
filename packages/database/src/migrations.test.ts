@@ -1363,9 +1363,7 @@ describe("PostgreSQL migration parity — attribution source columns", () => {
 			path.join(__dirname, "../src/migrations-pg.ts"),
 			"utf8",
 		);
-		const columnsToAddMatch = source.match(
-			/const columnsToAdd[\s\S]*?\n\t\];/,
-		);
+		const columnsToAddMatch = source.match(/const columnsToAdd[\s\S]*?\n\t\];/);
 		expect(columnsToAddMatch).not.toBeNull();
 		const columnsToAddBody = columnsToAddMatch?.[0] ?? "";
 

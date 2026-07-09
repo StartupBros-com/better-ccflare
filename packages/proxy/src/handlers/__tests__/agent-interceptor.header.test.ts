@@ -140,7 +140,9 @@ describe("Agent Interceptor - X-Anthropic-Agent-Id Header", () => {
 			const result = await interceptAndModifyRequest(
 				buffer,
 				dbOps,
-				headers({ "x-better-ccflare-agent-id": "  trimmed-namespaced-agent  " }),
+				headers({
+					"x-better-ccflare-agent-id": "  trimmed-namespaced-agent  ",
+				}),
 			);
 			expect(result.agentUsed).toBe("trimmed-namespaced-agent");
 			expect(result.agentAttributionSource).toBe("header_agent");
