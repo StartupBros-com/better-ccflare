@@ -102,6 +102,7 @@ export {
 	CLAUDE_CLI_VERSION,
 	extractClaudeVersion,
 	getClientVersion,
+	getGitSha,
 	getVersion,
 	getVersionSync,
 	trackClientVersion,

@@ -25,6 +25,9 @@ Always branch from `main` with a fresh pull. Never make changes directly on main
 PRs: `gh pr checkout <PR_NUMBER>` or `git checkout <branch-name>`.
 - If `git push origin main` fails with `src refspec main matches more than one` (branch/tag name collision), push explicitly: `git push origin refs/heads/main:refs/heads/main`.
 
+## Deployment source (production)
+Production is a root systemd service, `ccflare-stack.service` (guard on `:8788` in front of the binary on `:8789`). Deploys build from `main` ONLY, via `scripts/deploy-ccflare.sh` — it refuses to build or ship any commit that is not an ancestor of `origin/main`. The binary embeds its git SHA at build time, verifiable at runtime via the health endpoint's `git_sha` field (no need to trust the binary filename). The systemd pin lives at `/etc/systemd/system/ccflare-stack.service.d/50-pinned-build.conf`. Never let a long-lived feature branch become the de-facto trunk again — merge to `main` and deploy from there.
+
 ## PR Review Against Current Main (MANDATORY)
 
 Before reviewing or merging any PR, always find the merge base and identify what main has added since the PR branched:

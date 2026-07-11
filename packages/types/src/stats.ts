@@ -212,6 +212,11 @@ export interface HealthResponse {
 	accounts: number;
 	timestamp: string;
 	strategy: string;
+	version?: string;
+	// Git short SHA the running binary was built from, or null if unknown
+	// (e.g. dev runs outside a compiled binary). Lets a deploy be verified
+	// over HTTP without trusting the binary filename.
+	git_sha?: string | null;
 	pool?: PoolStatus;
 	accounts_detail?: Array<AccountDetail>;
 	runtime?: {

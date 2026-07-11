@@ -9,8 +9,15 @@ export const CLAUDE_CLI_VERSION = "2.1.206";
 // Replaced by bun bundler with a string literal; undefined at dev/runtime.
 declare const __BETTER_CCFLARE_VERSION__: string | undefined;
 
+// Build-time injected git short SHA via --define __BETTER_CCFLARE_GIT_SHA__="abc1234"
+// Replaced by bun bundler with a string literal; undefined at dev/runtime.
+declare const __BETTER_CCFLARE_GIT_SHA__: string | undefined;
+
 // Cache the version to avoid repeated file reads
 let cachedVersion: string | null = null;
+
+// Cache the git SHA (undefined = not yet resolved, null = resolved-but-unknown)
+let cachedGitSha: string | null | undefined;
 
 export async function getVersion(): Promise<string> {
 	if (cachedVersion) {
@@ -86,6 +93,41 @@ export function getVersionSync(): string {
 
 	cachedVersion = CLAUDE_CLI_VERSION;
 	return cachedVersion;
+}
+
+/**
+ * Get the git short SHA the running binary was built from.
+ *
+ * Mirrors getVersionSync(): a compiled binary has the SHA burned in at
+ * build time via --define; dev/test environments fall back to an env var.
+ * Unlike the version, there is no static default — an unknown SHA means
+ * the deploy provenance can't be verified, so callers must handle null.
+ *
+ * @returns The build-time injected SHA, the BETTER_CCFLARE_GIT_SHA env var, or null if unknown.
+ */
+export function getGitSha(): string | null {
+	if (cachedGitSha !== undefined) {
+		return cachedGitSha;
+	}
+
+	// 1. Build-time injected SHA (reliable for compiled binaries)
+	if (
+		typeof __BETTER_CCFLARE_GIT_SHA__ !== "undefined" &&
+		__BETTER_CCFLARE_GIT_SHA__ &&
+		__BETTER_CCFLARE_GIT_SHA__ !== "unknown"
+	) {
+		cachedGitSha = __BETTER_CCFLARE_GIT_SHA__;
+		return cachedGitSha;
+	}
+
+	// 2. Runtime env var fallback (dev/test environments)
+	if (process.env.BETTER_CCFLARE_GIT_SHA) {
+		cachedGitSha = process.env.BETTER_CCFLARE_GIT_SHA;
+		return cachedGitSha;
+	}
+
+	cachedGitSha = null;
+	return cachedGitSha;
 }
 
 /**

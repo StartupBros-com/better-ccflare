@@ -1,5 +1,10 @@
 import type { Config } from "@better-ccflare/config";
-import { isAccountAvailable, TtlCache } from "@better-ccflare/core";
+import {
+	getGitSha,
+	getVersionSync,
+	isAccountAvailable,
+	TtlCache,
+} from "@better-ccflare/core";
 import type { DatabaseOperations } from "@better-ccflare/database";
 import { jsonResponse } from "@better-ccflare/http-common";
 import {
@@ -183,6 +188,10 @@ export function createHealthHandler(
 			accounts: pool.configured,
 			timestamp: new Date().toISOString(),
 			strategy: config.getStrategy(),
+			// Deploy provenance: lets a deploy be verified over HTTP (git_sha)
+			// without trusting the pinned binary filename.
+			version: getVersionSync(),
+			git_sha: getGitSha(),
 			pool,
 		};
 

@@ -21,9 +21,10 @@ packages/database/src/inline-vacuum-worker.ts
 packages/database/src/inline-incremental-vacuum-worker.ts
 CLAUDE.md
 AGENTS.md
-# Disallow .sh files except in .github/scripts/
+# Disallow .sh files except in .github/scripts/ and the tracked scripts/ dir
 **/*.sh
 !.github/scripts/*.sh
+!scripts/*.sh
 
 # Build artifacts and test files
 better-ccflare-*
