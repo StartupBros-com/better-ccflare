@@ -472,7 +472,7 @@ describe("proxyWithAccount — attribution source pass-through to saveRequest (P
 		globalThis.fetch = originalFetch;
 	});
 
-	it("passes requestMeta.projectAttributionSource/agentAttributionSource through to saveRequest at positions 16/17 on the model_fallback_429 failover path", async () => {
+	it("passes requestMeta.projectAttributionSource/agentAttributionSource through to saveRequest at positions 18/19 on the model_fallback_429 failover path", async () => {
 		globalThis.fetch = mock(async () =>
 			jsonResponse(
 				{
@@ -510,9 +510,10 @@ describe("proxyWithAccount — attribution source pass-through to saveRequest (P
 		// Full positional order (0-indexed): id, method, path, accountUsed,
 		// statusCode, success, errorMessage, responseTime, failoverAttempts,
 		// usage, agentUsed, apiKeyId, apiKeyName, project, billingType,
-		// comboName, projectAttributionSource, agentAttributionSource.
-		expect(args[16]).toBe("header_project");
-		expect(args[17]).toBe("header_agent");
+		// comboName, originalModel, appliedModel, projectAttributionSource,
+		// agentAttributionSource.
+		expect(args[18]).toBe("header_project");
+		expect(args[19]).toBe("header_agent");
 	});
 
 	it("passes null attribution sources through to saveRequest when requestMeta omits them", async () => {
@@ -558,8 +559,8 @@ describe("proxyWithAccount — attribution source pass-through to saveRequest (P
 		const call = saveRequestMock.mock.calls.find(
 			(args: unknown[]) => args[6] === "all_models_exhausted_429",
 		) as unknown[];
-		expect(call[16]).toBeNull();
-		expect(call[17]).toBeNull();
+		expect(call[18]).toBeNull();
+		expect(call[19]).toBeNull();
 	});
 });
 

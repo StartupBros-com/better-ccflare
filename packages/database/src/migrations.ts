@@ -965,7 +965,6 @@ export function runMigrations(db: Database, dbPath?: string): void {
 			log.info("Added agent_attribution_source column to requests table");
 		}
 
-
 		// Add timestamp column to request_payloads if it doesn't exist
 		if (!requestPayloadsColumnNames.includes("timestamp")) {
 			db.prepare(

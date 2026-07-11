@@ -177,9 +177,14 @@ export async function handleProxy(
 		originalModel,
 		appliedModel,
 		agentAttributionSource,
-	} = await interceptAndModifyRequest(requestBodyContext, ctx.dbOps, req.headers, {
-		frontmatterModelFallback: ctx.config.getAgentFrontmatterModelFallback(),
-	});
+	} = await interceptAndModifyRequest(
+		requestBodyContext,
+		ctx.dbOps,
+		req.headers,
+		{
+			frontmatterModelFallback: ctx.config.getAgentFrontmatterModelFallback(),
+		},
+	);
 
 	// Use modified body if available
 	const finalBodyBuffer = modifiedBody || requestBodyContext.getBuffer();

@@ -6,8 +6,8 @@ import {
 	DatabaseFactory,
 	type DatabaseOperations,
 } from "@better-ccflare/database";
-import type { ModelCatalog } from "../../model-catalog";
 import type { Agent } from "@better-ccflare/types";
+import type { ModelCatalog } from "../../model-catalog";
 import { interceptAndModifyRequest } from "../agent-interceptor";
 
 const TEST_DB_PATH = "/tmp/test-agent-interceptor-header.db";

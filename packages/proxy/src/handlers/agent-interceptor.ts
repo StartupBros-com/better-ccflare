@@ -239,6 +239,7 @@ export async function interceptAndModifyRequest(
 				agentUsed: detectedAgent.id,
 				originalModel,
 				appliedModel: originalModel,
+				agentAttributionSource: "prompt_agent",
 			};
 		}
 
