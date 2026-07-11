@@ -181,7 +181,8 @@ interface AnthropicRequest {
 // ── SSE streaming state ───────────────────────────────────────────────────────
 
 interface FunctionCallBuffer {
-	contentBlockIndex: number;
+	callId: string;
+	name: string;
 	arguments: string[];
 }
 
@@ -209,7 +210,8 @@ interface StreamState {
 	cacheReadInputTokens: number;
 	cacheCreationInputTokens: number;
 	contextWindow: ContextWindow | null;
-	// Track function_call items: output_index → buffered arguments and block index
+	// Track function_call items awaiting emission: output_index → call identity
+	// and buffered arguments (blocks are emitted atomically at output_item.done)
 	functionCallBlocks: Map<number, FunctionCallBuffer>;
 	// True once any function_call output item was seen; drives stop_reason
 	sawFunctionCall: boolean;
@@ -746,21 +748,41 @@ export class CodexProvider extends BaseProvider {
 	}
 
 	/**
-	 * Emit buffered arguments and content_block_stop for one tracked
-	 * function-call block, so the client always sees complete block framing
-	 * (start → delta → stop) exactly once per block. Shared by the
-	 * output_item.done handler, the next-item guard, and terminal flushing.
+	 * Emit one completed function call as an atomic Anthropic content block
+	 * (content_block_start → input_json_delta → content_block_stop) at the next
+	 * block index, closing any open text block first. Buffering until emission
+	 * keeps block lifecycles strictly sequential, matching real Anthropic
+	 * streams; nothing is lost because arguments never stream incrementally on
+	 * this path (they are buffered until output_item.done regardless).
 	 */
-	private async closeFunctionCallBlock(
+	private async emitFunctionCallBlock(
 		state: StreamState,
 		writeSSE: (event: string, data: unknown) => Promise<void>,
-		outputIndex: number,
 		buffer: FunctionCallBuffer,
 	): Promise<void> {
+		if (state.hasSentContentBlockStart) {
+			await writeSSE("content_block_stop", {
+				type: "content_block_stop",
+				index: state.contentBlockIndex,
+			});
+			state.contentBlockIndex++;
+			state.hasSentContentBlockStart = false;
+		}
+		const blockIdx = state.contentBlockIndex;
+		await writeSSE("content_block_start", {
+			type: "content_block_start",
+			index: blockIdx,
+			content_block: {
+				type: "tool_use",
+				id: buffer.callId,
+				name: buffer.name,
+				input: {},
+			},
+		});
 		if (buffer.arguments.length > 0) {
 			await writeSSE("content_block_delta", {
 				type: "content_block_delta",
-				index: buffer.contentBlockIndex,
+				index: blockIdx,
 				delta: {
 					type: "input_json_delta",
 					partial_json: buffer.arguments.join(""),
@@ -769,31 +791,26 @@ export class CodexProvider extends BaseProvider {
 		}
 		await writeSSE("content_block_stop", {
 			type: "content_block_stop",
-			index: buffer.contentBlockIndex,
+			index: blockIdx,
 		});
-		state.functionCallBlocks.delete(outputIndex);
-		if (
-			state.hasSentContentBlockStart &&
-			state.contentBlockIndex === buffer.contentBlockIndex
-		) {
-			state.contentBlockIndex++;
-			state.hasSentContentBlockStart = false;
-		}
+		state.contentBlockIndex++;
 	}
 
 	/**
-	 * Close function-call blocks that never received response.output_item.done
-	 * before terminal events are emitted.
+	 * Emit function calls that never received response.output_item.done. Only
+	 * reached from response.completed/incomplete, where the upstream asserted
+	 * the response ended; a cut stream takes the error path instead.
 	 */
 	private async flushOrphanedFunctionCalls(
 		state: StreamState,
 		writeSSE: (event: string, data: unknown) => Promise<void>,
 	): Promise<void> {
 		const orphans = [...state.functionCallBlocks.entries()].sort(
-			(a, b) => a[1].contentBlockIndex - b[1].contentBlockIndex,
+			(a, b) => a[0] - b[0],
 		);
 		for (const [outputIndex, buffer] of orphans) {
-			await this.closeFunctionCallBlock(state, writeSSE, outputIndex, buffer);
+			await this.emitFunctionCallBlock(state, writeSSE, buffer);
+			state.functionCallBlocks.delete(outputIndex);
 		}
 	}
 
@@ -1162,17 +1179,17 @@ export class CodexProvider extends BaseProvider {
 				// Flush any remaining
 				await ensureMessageStart();
 
-				if (!state.hasSentTerminalEvents && state.functionCallBlocks.size > 0) {
-					// The upstream stream ended without a terminal event while tool
-					// call arguments were still incomplete. Never finalize partial
-					// arguments as an executable tool_use: surface an error so the
-					// client treats the turn as failed and retries.
+				if (!state.hasSentTerminalEvents && state.sawFunctionCall) {
+					// The upstream stream ended without a terminal event on a turn
+					// that emitted tool calls. Completeness of the call set cannot
+					// be verified (arguments may be truncated, or a parallel call
+					// may never have arrived), so never synthesize a successful
+					// tool_use turn: surface an error and let the client retry.
 					await writeSSE("error", {
 						type: "error",
 						error: {
 							type: "api_error",
-							message:
-								"Codex stream ended before tool call arguments completed",
+							message: "Codex stream ended before the tool call turn completed",
 						},
 					});
 				} else {
@@ -1250,41 +1267,20 @@ export class CodexProvider extends BaseProvider {
 					// Nothing to emit yet
 				} else if (itemType === "function_call") {
 					state.sawFunctionCall = true;
-					const callId = item?.call_id as string;
-					const name = item?.name as string;
-
-					if (state.hasSentContentBlockStart) {
-						// Leave a still-open function_call block open: its own
-						// output_item.done closes it with the buffered arguments, so
-						// late deltas keyed by output_index are never lost. Only
-						// non-function-call (text) blocks are closed here, mirroring
-						// the content_part.added handler.
-						const isOpenFunctionCallBlock = [
-							...state.functionCallBlocks.values(),
-						].some((b) => b.contentBlockIndex === state.contentBlockIndex);
-						if (!isOpenFunctionCallBlock) {
-							await writeSSE("content_block_stop", {
-								type: "content_block_stop",
-								index: state.contentBlockIndex,
-							});
-						}
-						state.contentBlockIndex++;
-						state.hasSentContentBlockStart = false;
-					}
-
-					const blockIdx = state.contentBlockIndex;
 					await ensureMessageStart();
-					await writeSSE("content_block_start", {
-						type: "content_block_start",
-						index: blockIdx,
-						content_block: { type: "tool_use", id: callId, name, input: {} },
-					});
-					state.hasSentContentBlockStart = true;
+					// Buffer the call; its block is emitted atomically at
+					// output_item.done (or terminal flushing) so content block
+					// lifecycles stay strictly sequential on the wire.
 					if (outputIndex !== undefined) {
 						state.functionCallBlocks.set(outputIndex, {
-							contentBlockIndex: blockIdx,
+							callId: (item?.call_id as string) ?? "",
+							name: (item?.name as string) ?? "",
 							arguments: [],
 						});
+					} else {
+						log.warn(
+							"Codex function_call output item without output_index; call cannot be tracked",
+						);
 					}
 				}
 				break;
@@ -1296,20 +1292,13 @@ export class CodexProvider extends BaseProvider {
 
 				if (partType === "output_text") {
 					await ensureMessageStart();
-					// Start a text content block
+					// Start a text content block, closing any open block first
+					// (function calls never hold a block open: they emit atomically)
 					if (state.hasSentContentBlockStart) {
-						// Only close the current block if it's not a still-open function-call
-						// block awaiting output_item.done — closing it here would produce a
-						// premature content_block_stop that output_item.done will duplicate.
-						const isOpenFunctionCallBlock = [
-							...state.functionCallBlocks.values(),
-						].some((b) => b.contentBlockIndex === state.contentBlockIndex);
-						if (!isOpenFunctionCallBlock) {
-							await writeSSE("content_block_stop", {
-								type: "content_block_stop",
-								index: state.contentBlockIndex,
-							});
-						}
+						await writeSSE("content_block_stop", {
+							type: "content_block_stop",
+							index: state.contentBlockIndex,
+						});
 						state.contentBlockIndex++;
 					}
 
@@ -1327,6 +1316,16 @@ export class CodexProvider extends BaseProvider {
 				const delta = data.delta as string | undefined;
 				if (delta) {
 					await ensureMessageStart();
+					if (!state.hasSentContentBlockStart) {
+						// A function-call emission closed the previous text block;
+						// continue the text in a fresh block.
+						await writeSSE("content_block_start", {
+							type: "content_block_start",
+							index: state.contentBlockIndex,
+							content_block: { type: "text", text: "" },
+						});
+						state.hasSentContentBlockStart = true;
+					}
 					await writeSSE("content_block_delta", {
 						type: "content_block_delta",
 						index: state.contentBlockIndex,
@@ -1359,12 +1358,8 @@ export class CodexProvider extends BaseProvider {
 							? state.functionCallBlocks.get(outputIndex)
 							: undefined;
 					if (buffer && outputIndex !== undefined) {
-						await this.closeFunctionCallBlock(
-							state,
-							writeSSE,
-							outputIndex,
-							buffer,
-						);
+						await this.emitFunctionCallBlock(state, writeSSE, buffer);
+						state.functionCallBlocks.delete(outputIndex);
 					}
 					break;
 				}
@@ -1429,15 +1424,17 @@ export class CodexProvider extends BaseProvider {
 					| undefined;
 				const isIncomplete =
 					eventName === "response.incomplete" || resp?.status === "incomplete";
-				// max_output_tokens → max_tokens (client may retry with more budget);
-				// content_filter → refusal (client must discard partial output).
-				// Unknown incomplete reasons fall back to the observed turn shape.
+				// An incomplete response never resolves to a success stop_reason:
+				// content_filter → refusal (client discards partial output); every
+				// other reason, including unknown future ones, → max_tokens (generic
+				// truncation, mirroring real Anthropic mid-tool-input truncation
+				// semantics: partial blocks are framed, stop_reason forbids execution).
 				const stopReason: "end_turn" | "tool_use" | "max_tokens" | "refusal" =
-					isIncomplete && incompleteDetails?.reason === "max_output_tokens"
-						? "max_tokens"
-						: isIncomplete && incompleteDetails?.reason === "content_filter"
+					isIncomplete
+						? incompleteDetails?.reason === "content_filter"
 							? "refusal"
-							: this.resolveStopReason(state);
+							: "max_tokens"
+						: this.resolveStopReason(state);
 
 				const messageDelta: {
 					type: "message_delta";

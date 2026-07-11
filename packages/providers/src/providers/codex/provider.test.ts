@@ -228,7 +228,9 @@ describe("CodexProvider.processResponse", () => {
 			);
 
 		expect(deltaLine).not.toBeUndefined();
-		expect(deltaLine).toContain('"index":0');
+		// Text streams first at index 0; the tool block is emitted atomically
+		// at output_item.done as index 1, carrying the buffered arguments.
+		expect(deltaLine).toContain('"index":1');
 		expect(deltaLine).toContain('"partial_json":"{\\"query\\":\\"hello\\"}"');
 	});
 
@@ -281,36 +283,33 @@ describe("CodexProvider.processResponse", () => {
 					JSON.parse(l.slice("data:".length).trim()) as Record<string, unknown>,
 			);
 
-		// Collect events for block index 0 in order
-		const block0Events = events
+		// Block lifecycles must be strictly sequential: text streams at index 0,
+		// then the tool block is emitted atomically at index 1.
+		const blockEvents = events
 			.filter(
 				(e) =>
-					(e.type === "content_block_start" ||
-						e.type === "content_block_stop" ||
-						e.type === "content_block_delta") &&
-					(e.index === 0 ||
-						(e.type === "content_block_start" &&
-							(e.content_block as Record<string, unknown>)?.type ===
-								"tool_use")),
+					e.type === "content_block_start" ||
+					e.type === "content_block_delta" ||
+					e.type === "content_block_stop",
 			)
-			.map((e) => e.type);
-
-		// Must be: start → delta → stop (no premature stop before delta)
-		expect(block0Events).toEqual([
-			"content_block_start",
-			"content_block_delta",
-			"content_block_stop",
+			.map((e) => `${e.type}:${e.index}`);
+		expect(blockEvents).toEqual([
+			"content_block_start:0",
+			"content_block_delta:0",
+			"content_block_stop:0",
+			"content_block_start:1",
+			"content_block_delta:1",
+			"content_block_stop:1",
 		]);
 
-		// Text block (index 1) must come after function-call block opens
-		const block1Start = events.findIndex(
-			(e) => e.type === "content_block_start" && e.index === 1,
+		// The tool block carries the buffered arguments exactly once
+		const toolStart = events.find(
+			(e) =>
+				e.type === "content_block_start" &&
+				(e.content_block as Record<string, unknown>)?.type === "tool_use",
 		);
-		const block0Stop = events.findIndex(
-			(e) => e.type === "content_block_stop" && e.index === 0,
-		);
-		expect(block1Start).toBeGreaterThan(-1);
-		expect(block0Stop).toBeGreaterThan(block1Start);
+		expect(toolStart?.index).toBe(1);
+		expect(transformedBody).toContain('"partial_json":"{\\"q\\":1}"');
 	});
 
 	it("includes input_tokens when model metadata is unavailable", async () => {
@@ -1101,9 +1100,10 @@ describe("CodexProvider stop_reason protocol", () => {
 		expect(payload.delta.stop_reason).toBe("end_turn");
 	});
 
-	it("emits stop_reason tool_use and full usage on the fallback path", async () => {
+	it("errors instead of synthesizing success when a tool turn ends without a terminal event", async () => {
 		const provider = new CodexProvider();
-		// No response.completed: upstream stream was cut off after the tool call
+		// No response.completed: even though the observed call finished, the
+		// turn's completeness is unverifiable (a parallel call may be missing)
 		const upstreamBody = sseBody(functionCallTurn);
 		const response = new Response(upstreamBody, {
 			status: 200,
@@ -1112,16 +1112,40 @@ describe("CodexProvider stop_reason protocol", () => {
 
 		const transformed = await provider.processResponse(response, null);
 		const body = await transformed.text();
-		const payload = parseEventPayload(body, "message_delta");
 
-		expect(payload.delta.stop_reason).toBe("tool_use");
-		expect(payload.usage).toEqual({
-			input_tokens: 0,
-			output_tokens: 0,
-			cache_read_input_tokens: 0,
-			cache_creation_input_tokens: 0,
+		expect(body).toContain("event: error");
+		expect(body).toContain('"type":"api_error"');
+		expect(body).not.toContain("event: message_stop");
+	});
+
+	it("maps unknown incomplete reasons to max_tokens rather than success", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_test", model: "gpt-5.4" },
+			}),
+			...functionCallTurn.slice(3),
+			...eventLine("response.incomplete", {
+				response: {
+					model: "gpt-5.4",
+					status: "incomplete",
+					incomplete_details: { reason: "some_future_reason" },
+					usage: { input_tokens: 2, output_tokens: 1 },
+				},
+			}),
+		]);
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
 		});
-		expect(body).toContain("event: message_stop");
+
+		const transformed = await provider.processResponse(response, null);
+		const payload = parseEventPayload(
+			await transformed.text(),
+			"message_delta",
+		);
+
+		expect(payload.delta.stop_reason).toBe("max_tokens");
 	});
 
 	it("maps response.incomplete max_output_tokens to stop_reason max_tokens", async () => {
@@ -1236,16 +1260,20 @@ describe("CodexProvider stop_reason protocol", () => {
 			events.filter((e) => e.type === "content_block_stop" && e.index === 1)
 				.length,
 		).toBe(1);
-		// call_1's block stays open until its own output_item.done, so its stop
-		// arrives after call_2's start (same out-of-order framing as text blocks)
+		// Each call's block is emitted atomically at its own output_item.done,
+		// so block 0 completes before block 1 starts (strictly sequential)
 		const delta0 = events.findIndex(
 			(e) => e.type === "content_block_delta" && e.index === 0,
 		);
 		const stop0 = events.findIndex(
 			(e) => e.type === "content_block_stop" && e.index === 0,
 		);
+		const start1 = events.findIndex(
+			(e) => e.type === "content_block_start" && e.index === 1,
+		);
 		expect(delta0).toBeGreaterThan(-1);
 		expect(stop0).toBeGreaterThan(delta0);
+		expect(start1).toBeGreaterThan(stop0);
 		const messageDelta = events.find((e) => e.type === "message_delta");
 		expect(messageDelta?.delta.stop_reason).toBe("tool_use");
 	});
