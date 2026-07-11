@@ -864,6 +864,381 @@ describe("CodexProvider.transformRequestBody", () => {
 	});
 });
 
+describe("CodexProvider tool-call request protocol", () => {
+	const makeRequest = (body: Record<string, unknown>) =>
+		new Request("https://example.com/v1/messages", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(body),
+		});
+
+	const searchTool = {
+		name: "search",
+		description: "search",
+		input_schema: {
+			type: "object",
+			properties: { query: { type: "string" } },
+		},
+	};
+
+	it("forwards max_tokens as max_output_tokens", async () => {
+		const provider = new CodexProvider();
+		const transformed = await provider.transformRequestBody(
+			makeRequest({
+				model: "claude-3-7-sonnet",
+				max_tokens: 4096,
+				messages: [{ role: "user", content: "hello" }],
+			}),
+		);
+		const body = await transformed.json();
+
+		expect(body.max_output_tokens).toBe(4096);
+	});
+
+	it("omits max_output_tokens when max_tokens is not a positive number", async () => {
+		const provider = new CodexProvider();
+		const transformed = await provider.transformRequestBody(
+			makeRequest({
+				model: "claude-3-7-sonnet",
+				messages: [{ role: "user", content: "hello" }],
+			}),
+		);
+		const body = await transformed.json();
+
+		expect(body.max_output_tokens).toBeUndefined();
+	});
+
+	it("defaults to auto tool_choice with parallel tool calls when tools are present", async () => {
+		const provider = new CodexProvider();
+		const transformed = await provider.transformRequestBody(
+			makeRequest({
+				model: "claude-3-7-sonnet",
+				max_tokens: 100,
+				tools: [searchTool],
+				messages: [{ role: "user", content: "hello" }],
+			}),
+		);
+		const body = await transformed.json();
+
+		expect(body.tool_choice).toBe("auto");
+		expect(body.parallel_tool_calls).toBe(true);
+	});
+
+	it("maps tool_choice any to required and honours disable_parallel_tool_use", async () => {
+		const provider = new CodexProvider();
+		const transformed = await provider.transformRequestBody(
+			makeRequest({
+				model: "claude-3-7-sonnet",
+				max_tokens: 100,
+				tools: [searchTool],
+				tool_choice: { type: "any", disable_parallel_tool_use: true },
+				messages: [{ role: "user", content: "hello" }],
+			}),
+		);
+		const body = await transformed.json();
+
+		expect(body.tool_choice).toBe("required");
+		expect(body.parallel_tool_calls).toBe(false);
+	});
+
+	it("maps tool_choice none to none", async () => {
+		const provider = new CodexProvider();
+		const transformed = await provider.transformRequestBody(
+			makeRequest({
+				model: "claude-3-7-sonnet",
+				max_tokens: 100,
+				tools: [searchTool],
+				tool_choice: { type: "none" },
+				messages: [{ role: "user", content: "hello" }],
+			}),
+		);
+		const body = await transformed.json();
+
+		expect(body.tool_choice).toBe("none");
+	});
+
+	it("downgrades named tool_choice to required", async () => {
+		const provider = new CodexProvider();
+		const transformed = await provider.transformRequestBody(
+			makeRequest({
+				model: "claude-3-7-sonnet",
+				max_tokens: 100,
+				tools: [searchTool],
+				tool_choice: { type: "tool", name: "search" },
+				messages: [{ role: "user", content: "hello" }],
+			}),
+		);
+		const body = await transformed.json();
+
+		expect(body.tool_choice).toBe("required");
+	});
+
+	it("omits tool_choice and parallel_tool_calls when no tools are present", async () => {
+		const provider = new CodexProvider();
+		const transformed = await provider.transformRequestBody(
+			makeRequest({
+				model: "claude-3-7-sonnet",
+				max_tokens: 100,
+				messages: [{ role: "user", content: "hello" }],
+			}),
+		);
+		const body = await transformed.json();
+
+		expect(body.tool_choice).toBeUndefined();
+		expect(body.parallel_tool_calls).toBeUndefined();
+	});
+});
+
+describe("CodexProvider stop_reason protocol", () => {
+	const parseEventPayload = (body: string, type: string) => {
+		const line = body
+			.split("\n")
+			.find((l) => l.startsWith("data:") && l.includes(`"type":"${type}"`));
+		expect(line).not.toBeUndefined();
+		return JSON.parse((line as string).slice("data:".length).trim()) as Record<
+			string,
+			// biome-ignore lint/suspicious/noExplicitAny: test helper
+			any
+		>;
+	};
+
+	const functionCallTurn = [
+		...eventLine("response.created", {
+			response: { id: "resp_test", model: "gpt-5.4" },
+		}),
+		...eventLine("response.output_item.added", {
+			item: { type: "function_call", call_id: "call_1", name: "search" },
+			output_index: 0,
+		}),
+		...eventLine("response.function_call_arguments.delta", {
+			delta: '{"query":"hello"}',
+			output_index: 0,
+		}),
+		...eventLine("response.output_item.done", {
+			item: { type: "function_call", call_id: "call_1", name: "search" },
+			output_index: 0,
+		}),
+	];
+
+	it("emits stop_reason tool_use when the turn contains function calls", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...functionCallTurn,
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.4",
+					usage: { input_tokens: 1, output_tokens: 1 },
+				},
+			}),
+		]);
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const payload = parseEventPayload(
+			await transformed.text(),
+			"message_delta",
+		);
+
+		expect(payload.delta.stop_reason).toBe("tool_use");
+	});
+
+	it("keeps stop_reason end_turn for text-only turns", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_test", model: "gpt-5.4" },
+			}),
+			...eventLine("response.output_item.added", {
+				item: { type: "message" },
+				output_index: 0,
+			}),
+			...eventLine("response.content_part.added", {
+				part: { type: "output_text" },
+			}),
+			...eventLine("response.output_text.delta", { delta: "hello" }),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.4",
+					usage: { input_tokens: 1, output_tokens: 1 },
+				},
+			}),
+		]);
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const payload = parseEventPayload(
+			await transformed.text(),
+			"message_delta",
+		);
+
+		expect(payload.delta.stop_reason).toBe("end_turn");
+	});
+
+	it("emits stop_reason tool_use and full usage on the fallback path", async () => {
+		const provider = new CodexProvider();
+		// No response.completed: upstream stream was cut off after the tool call
+		const upstreamBody = sseBody(functionCallTurn);
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const body = await transformed.text();
+		const payload = parseEventPayload(body, "message_delta");
+
+		expect(payload.delta.stop_reason).toBe("tool_use");
+		expect(payload.usage).toEqual({
+			input_tokens: 0,
+			output_tokens: 0,
+			cache_read_input_tokens: 0,
+			cache_creation_input_tokens: 0,
+		});
+		expect(body).toContain("event: message_stop");
+	});
+
+	it("maps response.incomplete max_output_tokens to stop_reason max_tokens", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_test", model: "gpt-5.4" },
+			}),
+			...eventLine("response.output_item.added", {
+				item: { type: "message" },
+				output_index: 0,
+			}),
+			...eventLine("response.content_part.added", {
+				part: { type: "output_text" },
+			}),
+			...eventLine("response.output_text.delta", { delta: "truncated tex" }),
+			...eventLine("response.incomplete", {
+				response: {
+					model: "gpt-5.4",
+					status: "incomplete",
+					incomplete_details: { reason: "max_output_tokens" },
+					usage: { input_tokens: 11, output_tokens: 64 },
+				},
+			}),
+		]);
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const body = await transformed.text();
+		const payload = parseEventPayload(body, "message_delta");
+
+		expect(payload.delta.stop_reason).toBe("max_tokens");
+		expect(payload.usage.output_tokens).toBe(64);
+		expect(payload.usage.input_tokens).toBe(11);
+		// Terminal events must not be duplicated by the stream-end fallback
+		expect(body.match(/event: message_delta/g)?.length ?? 0).toBe(1);
+		expect(body.match(/event: message_stop/g)?.length ?? 0).toBe(1);
+	});
+
+	it("flushes orphaned function_call blocks at response.completed", async () => {
+		const provider = new CodexProvider();
+		// output_item.done never arrives for the function call
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_test", model: "gpt-5.4" },
+			}),
+			...eventLine("response.output_item.added", {
+				item: { type: "function_call", call_id: "call_1", name: "search" },
+				output_index: 0,
+			}),
+			...eventLine("response.function_call_arguments.delta", {
+				delta: '{"q":"x"}',
+				output_index: 0,
+			}),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.4",
+					usage: { input_tokens: 1, output_tokens: 1 },
+				},
+			}),
+		]);
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const body = await transformed.text();
+
+		expect(body.match(/"input_json_delta"/g)?.length ?? 0).toBe(1);
+		expect(body).toContain('"partial_json":"{\\"q\\":\\"x\\"}"');
+		const stopPos = body.indexOf("event: content_block_stop");
+		const deltaPos = body.indexOf("event: message_delta");
+		expect(stopPos).toBeGreaterThan(-1);
+		expect(deltaPos).toBeGreaterThan(stopPos);
+		const payload = parseEventPayload(body, "message_delta");
+		expect(payload.delta.stop_reason).toBe("tool_use");
+	});
+
+	it("sets stop_reason tool_use in non-streaming SSE to JSON conversion", async () => {
+		const provider = new CodexProvider();
+		const requestId = "req_non_stream_tool_stop_reason";
+		const originalRequest = new Request("https://example.test/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"x-better-ccflare-request-id": requestId,
+			},
+			body: JSON.stringify({
+				model: "claude-sonnet-4-5",
+				max_tokens: 16,
+				stream: false,
+				tools: [
+					{
+						name: "search",
+						description: "search",
+						input_schema: {
+							type: "object",
+							properties: { query: { type: "string" } },
+						},
+					},
+				],
+				messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+			}),
+		});
+		await provider.transformRequestBody(originalRequest);
+
+		const upstreamBody = sseBody([
+			...functionCallTurn,
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.4",
+					usage: { input_tokens: 9, output_tokens: 4 },
+				},
+			}),
+		]);
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: {
+				"content-type": "text/event-stream",
+				"x-better-ccflare-request-id": requestId,
+				"x-better-ccflare-request-stream": "false",
+			},
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const payload = JSON.parse(await transformed.text()) as Record<
+			string,
+			unknown
+		>;
+
+		expect(payload.stop_reason).toBe("tool_use");
+	});
+});
+
 describe("parseCodexUsageHeaders", () => {
 	it("normalizes primary and secondary codex quota headers", () => {
 		const headers = new Headers({

@@ -116,6 +116,11 @@ interface CodexRequest {
 	reasoning?: { effort: string };
 	instructions?: string;
 	tools?: CodexTool[];
+	// The Codex Responses schema types tool_choice as a plain string
+	// (see openai/codex ResponsesApiRequest), never an object.
+	tool_choice?: string;
+	parallel_tool_calls?: boolean;
+	max_output_tokens?: number;
 }
 
 // ── Anthropic request types ───────────────────────────────────────────────────
@@ -154,6 +159,12 @@ interface AnthropicTool {
 	input_schema?: Record<string, unknown>;
 }
 
+interface AnthropicToolChoice {
+	type: string;
+	name?: string;
+	disable_parallel_tool_use?: boolean;
+}
+
 interface AnthropicRequest {
 	model: string;
 	max_tokens: number;
@@ -161,6 +172,7 @@ interface AnthropicRequest {
 	system?: string | { type: string; text: string }[];
 	stream?: boolean;
 	tools?: AnthropicTool[];
+	tool_choice?: AnthropicToolChoice;
 	reasoning?: { effort?: string };
 	[key: string]: unknown;
 }
@@ -198,6 +210,8 @@ interface StreamState {
 	contextWindow: ContextWindow | null;
 	// Track function_call items: output_index → buffered arguments and block index
 	functionCallBlocks: Map<number, FunctionCallBuffer>;
+	// True once any function_call output item was seen; drives stop_reason
+	sawFunctionCall: boolean;
 }
 
 export class CodexProvider extends BaseProvider {
@@ -680,9 +694,82 @@ export class CodexProvider extends BaseProvider {
 		codexRequest.instructions = instructions || "You are a helpful assistant.";
 		if (tools) {
 			codexRequest.tools = tools;
+			codexRequest.tool_choice = this.mapToolChoice(body.tool_choice);
+			// Anthropic semantics: parallel tool calls are allowed unless the client
+			// disabled them via tool_choice.disable_parallel_tool_use.
+			codexRequest.parallel_tool_calls =
+				body.tool_choice?.disable_parallel_tool_use !== true;
+		}
+		if (
+			typeof body.max_tokens === "number" &&
+			Number.isFinite(body.max_tokens) &&
+			body.max_tokens > 0
+		) {
+			codexRequest.max_output_tokens = Math.floor(body.max_tokens);
 		}
 
 		return codexRequest;
+	}
+
+	private mapToolChoice(toolChoice?: AnthropicToolChoice): string {
+		switch (toolChoice?.type) {
+			case "any":
+				return "required";
+			case "none":
+				return "none";
+			case "tool":
+				// A named function choice is an object in the OpenAI schema, but the
+				// Codex wire format only carries strings; "required" is the closest
+				// enforceable semantic.
+				log.debug(
+					`Downgrading named tool_choice ${toolChoice.name ?? "<unnamed>"} to "required"`,
+				);
+				return "required";
+			default:
+				return "auto";
+		}
+	}
+
+	private resolveStopReason(state: StreamState): "tool_use" | "end_turn" {
+		return state.sawFunctionCall ? "tool_use" : "end_turn";
+	}
+
+	/**
+	 * Emit buffered arguments and content_block_stop for function-call blocks
+	 * that never received response.output_item.done, so the client always sees
+	 * complete block framing (start → delta → stop) before terminal events.
+	 */
+	private async flushOrphanedFunctionCalls(
+		state: StreamState,
+		writeSSE: (event: string, data: unknown) => Promise<void>,
+	): Promise<void> {
+		const orphans = [...state.functionCallBlocks.entries()].sort(
+			(a, b) => a[1].contentBlockIndex - b[1].contentBlockIndex,
+		);
+		for (const [outputIndex, buffer] of orphans) {
+			if (buffer.arguments.length > 0) {
+				await writeSSE("content_block_delta", {
+					type: "content_block_delta",
+					index: buffer.contentBlockIndex,
+					delta: {
+						type: "input_json_delta",
+						partial_json: buffer.arguments.join(""),
+					},
+				});
+			}
+			await writeSSE("content_block_stop", {
+				type: "content_block_stop",
+				index: buffer.contentBlockIndex,
+			});
+			state.functionCallBlocks.delete(outputIndex);
+			if (
+				state.hasSentContentBlockStart &&
+				state.contentBlockIndex === buffer.contentBlockIndex
+			) {
+				state.contentBlockIndex++;
+				state.hasSentContentBlockStart = false;
+			}
+		}
 	}
 
 	private async transformSseResponseToJson(
@@ -841,6 +928,14 @@ export class CodexProvider extends BaseProvider {
 				`[codex:model-debug] request_id=${requestId} transformSseResponseToJson used fallback model=gpt-5.4 (startMessage.model missing)`,
 			);
 		}
+		const deltaPayload = (messageDeltaPayload as Record<string, unknown> | null)
+			?.delta as Record<string, unknown> | undefined;
+		const stopReason =
+			typeof deltaPayload?.stop_reason === "string"
+				? deltaPayload.stop_reason
+				: content.some((b) => b.type === "tool_use")
+					? "tool_use"
+					: "end_turn";
 		const jsonPayload = {
 			id:
 				typeof startMessage.id === "string"
@@ -850,7 +945,7 @@ export class CodexProvider extends BaseProvider {
 			role: "assistant",
 			model: resolvedModel,
 			content: content.length > 0 ? content : [{ type: "text", text: "" }],
-			stop_reason: "end_turn",
+			stop_reason: stopReason,
 			stop_sequence: null,
 			usage,
 		};
@@ -885,6 +980,7 @@ export class CodexProvider extends BaseProvider {
 			cacheCreationInputTokens: 0,
 			contextWindow: null,
 			functionCallBlocks: new Map(),
+			sawFunctionCall: false,
 		};
 
 		const headers = sanitizeResponseHeaders(response.headers);
@@ -1023,7 +1119,9 @@ export class CodexProvider extends BaseProvider {
 				// Flush any remaining
 				await ensureMessageStart();
 
-				// Close any open content block
+				// Complete block framing for function calls that never saw
+				// output_item.done, then close any open content block
+				await this.flushOrphanedFunctionCalls(state, writeSSE);
 				if (state.hasSentContentBlockStart) {
 					await writeSSE("content_block_stop", {
 						type: "content_block_stop",
@@ -1035,8 +1133,16 @@ export class CodexProvider extends BaseProvider {
 				if (!state.hasSentTerminalEvents) {
 					await writeSSE("message_delta", {
 						type: "message_delta",
-						delta: { stop_reason: "end_turn", stop_sequence: null },
-						usage: { output_tokens: state.outputTokens },
+						delta: {
+							stop_reason: this.resolveStopReason(state),
+							stop_sequence: null,
+						},
+						usage: {
+							input_tokens: state.inputTokens,
+							output_tokens: state.outputTokens,
+							cache_read_input_tokens: state.cacheReadInputTokens,
+							cache_creation_input_tokens: state.cacheCreationInputTokens,
+						},
 					});
 					await writeSSE("message_stop", { type: "message_stop" });
 				}
@@ -1086,6 +1192,7 @@ export class CodexProvider extends BaseProvider {
 					// Text content block will start on content_part.added
 					// Nothing to emit yet
 				} else if (itemType === "function_call") {
+					state.sawFunctionCall = true;
 					const callId = item?.call_id as string;
 					const name = item?.name as string;
 
@@ -1222,6 +1329,7 @@ export class CodexProvider extends BaseProvider {
 				break;
 			}
 
+			case "response.incomplete":
 			case "response.completed": {
 				const resp = data.response as Record<string, unknown> | undefined;
 				const usage = resp?.usage as
@@ -1253,7 +1361,10 @@ export class CodexProvider extends BaseProvider {
 				state.cacheReadInputTokens = cacheRead;
 				state.cacheCreationInputTokens = cacheCreation;
 				state.contextWindow = this.extractContextWindow(resp, usage);
-				// Close any lingering content block
+				await ensureMessageStart();
+				// Complete block framing for function calls that never saw
+				// output_item.done, then close any lingering content block
+				await this.flushOrphanedFunctionCalls(state, writeSSE);
 				if (state.hasSentContentBlockStart) {
 					await writeSSE("content_block_stop", {
 						type: "content_block_stop",
@@ -1262,9 +1373,22 @@ export class CodexProvider extends BaseProvider {
 					state.hasSentContentBlockStart = false;
 				}
 
+				const incompleteDetails = resp?.incomplete_details as
+					| { reason?: string }
+					| undefined;
+				const truncatedByMaxTokens =
+					(eventName === "response.incomplete" ||
+						resp?.status === "incomplete") &&
+					incompleteDetails?.reason === "max_output_tokens";
+				const stopReason: "end_turn" | "tool_use" | "max_tokens" =
+					truncatedByMaxTokens ? "max_tokens" : this.resolveStopReason(state);
+
 				const messageDelta: {
 					type: "message_delta";
-					delta: { stop_reason: "end_turn"; stop_sequence: null };
+					delta: {
+						stop_reason: "end_turn" | "tool_use" | "max_tokens";
+						stop_sequence: null;
+					};
 					usage: {
 						input_tokens: number;
 						output_tokens: number;
@@ -1274,7 +1398,7 @@ export class CodexProvider extends BaseProvider {
 					context_window?: ContextWindow;
 				} = {
 					type: "message_delta",
-					delta: { stop_reason: "end_turn", stop_sequence: null },
+					delta: { stop_reason: stopReason, stop_sequence: null },
 					usage: {
 						input_tokens: state.inputTokens,
 						output_tokens: state.outputTokens,
