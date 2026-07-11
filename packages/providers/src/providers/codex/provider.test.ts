@@ -690,8 +690,10 @@ describe("CodexProvider.processResponse", () => {
 		const provider = new CodexProvider();
 		const cases: Array<[string, string]> = [
 			["insufficient_quota", "rate_limit_error"],
+			["server_is_overloaded", "overloaded_error"],
 			["slow_down", "overloaded_error"],
 			["context_length_exceeded", "invalid_request_error"],
+			["cyber_policy", "invalid_request_error"],
 			["usage_not_included", "permission_error"],
 		];
 		for (const [code, expectedType] of cases) {

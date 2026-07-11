@@ -68,9 +68,15 @@ const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
 // Known Codex failure codes → Anthropic error types. Quota exhaustion cools
 // the account like a rate limit; slow_down is a throttle; context/policy and
 // subscription errors are permanent and must not be retried as 5xx.
+// Codes and their retry semantics mirror the reference client
+// (openai/codex codex-api/src/sse/responses.rs + api_bridge.rs): quota codes
+// cool the account, server_is_overloaded/slow_down are throttles, context and
+// policy errors are permanent 4xx, usage_not_included is a plan-entitlement
+// error the reference surfaces as its own non-retryable variant.
 const CODEX_ERROR_TYPE_BY_CODE: Record<string, string> = {
 	rate_limit_exceeded: "rate_limit_error",
 	insufficient_quota: "rate_limit_error",
+	server_is_overloaded: "overloaded_error",
 	slow_down: "overloaded_error",
 	server_error: "api_error",
 	context_length_exceeded: "invalid_request_error",
@@ -808,12 +814,16 @@ export class CodexProvider extends BaseProvider {
 	 * streams; nothing is lost because arguments never stream incrementally on
 	 * this path (they are buffered until output_item.done regardless).
 	 *
-	 * Emission happens in output_item.done arrival order, which equals
-	 * output_index order under the Responses protocol's sequential item
-	 * semantics (an item's done precedes the next item's added); the terminal
-	 * flush sorts by output_index for the same reason. Reordering machinery
-	 * (cursor + buffer-until-lower-indices-complete) is deliberately avoided:
-	 * it would stall all output behind a single missing done event.
+	 * Emission happens in output_item.done arrival order. This is the correct
+	 * final order: the reference client (openai/codex codex-rs/core/src/client.rs)
+	 * aggregates OutputItemDone events into items_added by arrival with no
+	 * reorder by output_index, and its tool_parallelism suite asserts outputs
+	 * arrive in call order — i.e. the ChatGPT Codex backend finalizes items in
+	 * output_index order. A reorder buffer (cursor + hold-until-lower-indices)
+	 * is deliberately avoided: it would defend against an ordering the backend
+	 * does not produce (and that the official client itself does not guard
+	 * against) while stalling all output behind a single missing done event.
+	 * The terminal flush sorts by output_index as belt-and-suspenders.
 	 */
 	private async emitFunctionCallBlock(
 		state: StreamState,
