@@ -564,6 +564,107 @@ describe("proxyWithAccount — attribution source pass-through to saveRequest (P
 	});
 });
 
+describe("proxyWithAccount — originalModel/appliedModel gated by isModelRewrite on direct 429 saveRequest paths (P2)", () => {
+	let originalFetch: typeof globalThis.fetch;
+
+	beforeEach(() => {
+		originalFetch = globalThis.fetch;
+	});
+
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+	});
+
+	it("persists null/null (not the equal pair) on the model_fallback_429 path when requestMeta carries an unmodified originalModel/appliedModel pair", async () => {
+		globalThis.fetch = mock(async () =>
+			jsonResponse(
+				{
+					error: {
+						type: "api_error",
+						message:
+							"Rate limit exceeded: limit_rpm/qwen/qwen3.6-plus:free/abc",
+					},
+				},
+				429,
+			),
+		);
+
+		const ctx = makeProxyContextWithAsyncExec();
+		const bodyBuffer = makeRequestBody();
+		const req = makeRequest(bodyBuffer);
+
+		await proxyWithAccount(
+			req,
+			new URL("https://proxy.local/v1/messages"),
+			makeAccount(), // no model_fallbacks -> model_fallback_429 path
+			makeRequestMeta({
+				// Agent-detected but NOT rewritten: original === applied. Before the
+				// fix this bypassed isModelRewrite and persisted the equal pair,
+				// making an untouched request look like a real rewrite.
+				originalModel: "claude-sonnet-4-5",
+				appliedModel: "claude-sonnet-4-5",
+			}),
+			bodyBuffer,
+			() => undefined,
+			0,
+			ctx,
+		);
+
+		const saveRequestMock = ctx.dbOps.saveRequest as ReturnType<typeof mock>;
+		expect(saveRequestMock.mock.calls.length).toBeGreaterThan(0);
+		const args = saveRequestMock.mock.calls[0] as unknown[];
+		expect(args[16]).toBeNull();
+		expect(args[17]).toBeNull();
+	});
+
+	it("still persists a genuine originalModel/appliedModel rewrite pair on the all_models_exhausted_429 path", async () => {
+		globalThis.fetch = mock(async () =>
+			jsonResponse(
+				{
+					error: {
+						type: "api_error",
+						message: "Rate limit exceeded: limit_rpm/model/abc",
+					},
+				},
+				429,
+			),
+		);
+
+		const ctx = makeProxyContextWithAsyncExec();
+		const bodyBuffer = makeRequestBody();
+		const req = makeRequest(bodyBuffer);
+
+		await proxyWithAccount(
+			req,
+			new URL("https://proxy.local/v1/messages"),
+			makeAccount({
+				model_mappings: JSON.stringify({
+					sonnet: [
+						"qwen/qwen3.6-plus:free",
+						"bytedance-seed/dola-seed-2.0-pro:free",
+					],
+				}),
+			}),
+			makeRequestMeta({
+				originalModel: "claude-sonnet-4-5",
+				appliedModel: "qwen/qwen3.6-plus:free",
+			}),
+			bodyBuffer,
+			() => undefined,
+			0,
+			ctx,
+		);
+
+		const saveRequestMock = ctx.dbOps.saveRequest as ReturnType<typeof mock>;
+		const call = saveRequestMock.mock.calls.find(
+			(args: unknown[]) => args[6] === "all_models_exhausted_429",
+		) as unknown[];
+		expect(call).toBeDefined();
+		expect(call[16]).toBe("claude-sonnet-4-5");
+		expect(call[17]).toBe("qwen/qwen3.6-plus:free");
+	});
+});
+
 describe("proxyWithAccount — in-memory cooldown mutation (issue #178 fix)", () => {
 	let originalFetch: typeof globalThis.fetch;
 

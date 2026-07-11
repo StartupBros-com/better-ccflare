@@ -92,6 +92,19 @@ describe("extractProjectAttributionFromRequest", () => {
 		expect(result.projectAttributionSource).toBe("none");
 	});
 
+	it("falls through a leading Claude heading to the next eligible H1 heading", () => {
+		// Regression: extraction used to stop at the FIRST H1 heading rather
+		// than the first ELIGIBLE one, losing valid attribution whenever a
+		// Claude-prefixed heading appeared before the real project heading.
+		const headers = new Headers();
+		const body = {
+			system: "# Claude Code Instructions\nSome content.\n# Harness\nMore.",
+		};
+		const result = extractProjectAttributionFromRequest(headers, body);
+		expect(result.project).toBe("Harness");
+		expect(result.projectAttributionSource).toBe("heading_project");
+	});
+
 	it("returns none when there is no header, path, or heading", () => {
 		const headers = new Headers();
 		const body = { system: "Just a plain system prompt with no markers." };
@@ -130,6 +143,14 @@ describe("extractProjectAttributionFromRequest", () => {
 			[
 				"20+ char unbroken alphanumeric session id (hardened LONG_TOKEN_RE)",
 				"# sess1234567890qwerty",
+			],
+			[
+				"multi-segment secret token (second separator defeats SECRET_TOKEN_RE)",
+				"# sk_live_abc123456789",
+			],
+			[
+				"short incident/customer label (dodges the six-word sentence heuristic)",
+				"# Incident INC-123 Acme",
 			],
 		];
 
@@ -194,6 +215,39 @@ describe("isLowRiskProjectSlug", () => {
 			// under the 20-char unbroken-run threshold — must NOT be rejected.
 			expect(isLowRiskProjectSlug("attribution-source-tags")).toBe(true);
 			expect(isLowRiskProjectSlug("my-really-long-project-name")).toBe(true);
+		});
+	});
+
+	describe("rejects multi-segment secret shapes and customer/incident labels (P1 privacy)", () => {
+		it("rejects a multi-segment secret token where a second separator defeats SECRET_TOKEN_RE", () => {
+			// "sk_live_" + a digit-bearing tail: each underscore-delimited segment
+			// stays under LONG_TOKEN_RE's 20-char threshold, and the second
+			// separator ("_live_") means the single-separator SECRET_TOKEN_RE
+			// never matches either. Must still be rejected as a secret shape.
+			expect(isLowRiskProjectSlug("sk_live_abc123456789")).toBe(false);
+		});
+
+		it("rejects other known secret-token prefixes with a second separator", () => {
+			expect(isLowRiskProjectSlug("ghp_9f8e7d6c5b4a3210")).toBe(false);
+			expect(isLowRiskProjectSlug("xoxb-1234-5678-abcdefgh")).toBe(false);
+			expect(isLowRiskProjectSlug("api-key-9f8e7d6c5b4a")).toBe(false);
+		});
+
+		it("rejects a short incident/customer label that dodges the six-word sentence heuristic", () => {
+			expect(isLowRiskProjectSlug("Incident INC-123 Acme")).toBe(false);
+		});
+
+		it("rejects other customer/ticket-shaped labels", () => {
+			expect(isLowRiskProjectSlug("Ticket CASE-42")).toBe(false);
+			expect(isLowRiskProjectSlug("Customer Acme Corp")).toBe(false);
+			expect(isLowRiskProjectSlug("PROJ-4821")).toBe(false);
+			expect(isLowRiskProjectSlug("acct-88213")).toBe(false);
+		});
+
+		it("does not over-reject ordinary hyphenated slugs with word-only tails", () => {
+			expect(isLowRiskProjectSlug("attribution-source-tags")).toBe(true);
+			expect(isLowRiskProjectSlug("my-really-long-project-name")).toBe(true);
+			expect(isLowRiskProjectSlug("better-ccflare")).toBe(true);
 		});
 	});
 

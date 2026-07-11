@@ -21,6 +21,7 @@ import type {
 import { cacheBodyStore } from "../cache-body-store";
 import { RequestBodyContext } from "../request-body-context";
 import { forwardToClient } from "../response-handler";
+import { isModelRewrite } from "../worker-messages";
 import { ERROR_MESSAGES, type ProxyContext } from "./proxy-types";
 import { applyRateLimitCooldown } from "./rate-limit-cooldown";
 import { makeProxyRequest, validateProviderPath } from "./request-handler";
@@ -808,8 +809,12 @@ export async function proxyWithAccount(
 						requestMeta.project ?? null,
 						undefined,
 						requestMeta.comboName ?? null,
-						requestMeta.originalModel ?? null,
-						requestMeta.appliedModel ?? null,
+						isModelRewrite(requestMeta.originalModel, requestMeta.appliedModel)
+							? (requestMeta.originalModel ?? null)
+							: null,
+						isModelRewrite(requestMeta.originalModel, requestMeta.appliedModel)
+							? (requestMeta.appliedModel ?? null)
+							: null,
 						requestMeta.projectAttributionSource ?? null,
 						requestMeta.agentAttributionSource ?? null,
 					),
@@ -874,8 +879,18 @@ export async function proxyWithAccount(
 								requestMeta.project ?? null,
 								undefined,
 								requestMeta.comboName ?? null,
-								requestMeta.originalModel ?? null,
-								requestMeta.appliedModel ?? null,
+								isModelRewrite(
+									requestMeta.originalModel,
+									requestMeta.appliedModel,
+								)
+									? (requestMeta.originalModel ?? null)
+									: null,
+								isModelRewrite(
+									requestMeta.originalModel,
+									requestMeta.appliedModel,
+								)
+									? (requestMeta.appliedModel ?? null)
+									: null,
 								requestMeta.projectAttributionSource ?? null,
 								requestMeta.agentAttributionSource ?? null,
 							),
@@ -1014,8 +1029,18 @@ export async function proxyWithAccount(
 								requestMeta.project ?? null,
 								undefined,
 								requestMeta.comboName ?? null,
-								requestMeta.originalModel ?? null,
-								requestMeta.appliedModel ?? null,
+								isModelRewrite(
+									requestMeta.originalModel,
+									requestMeta.appliedModel,
+								)
+									? (requestMeta.originalModel ?? null)
+									: null,
+								isModelRewrite(
+									requestMeta.originalModel,
+									requestMeta.appliedModel,
+								)
+									? (requestMeta.appliedModel ?? null)
+									: null,
 								requestMeta.projectAttributionSource ?? null,
 								requestMeta.agentAttributionSource ?? null,
 							),

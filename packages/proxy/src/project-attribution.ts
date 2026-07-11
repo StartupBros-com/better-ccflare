@@ -78,6 +78,20 @@ export function extractSystemPromptFromBase64(
 
 // Matches bearer/API-key-ish tokens such as sk-..., pk_..., rk-..., ak_...
 const SECRET_TOKEN_RE = /\b(?:sk|pk|rk|ak)[-_][A-Za-z0-9]{8,}/i;
+// Known branded secret-token prefixes SECRET_TOKEN_RE doesn't cover: GitHub
+// PATs (ghp_/gho_/ghu_/ghs_/ghr_) and Slack tokens (xoxb-/xoxp-/xoxa-/xoxr-/xoxs-).
+const KNOWN_SECRET_PREFIX_RE =
+	/\bgh[opsur]_[A-Za-z0-9]{6,}\b|\bxox[baprs]-[A-Za-z0-9-]{6,}\b/i;
+// "sk_live_...", "api-key-9f8e7d6c...": 2+ short segments delimited by `_`/`-`
+// followed by a long tail that mixes letters AND digits. A second separator
+// defeats SECRET_TOKEN_RE (which only tolerates one), and each individual
+// segment can stay under LONG_TOKEN_RE's 20-char unbroken-run threshold — this
+// catches the shape as a whole instead. The digit+letter requirement on the
+// tail is what keeps ordinary hyphenated slugs safe: "attribution-source-tags"
+// and "my-really-long-project-name" have word-only (no-digit) tails, so they
+// are unaffected; only token-shaped tails ("abc123456789") match.
+const MULTI_SEGMENT_TOKEN_RE =
+	/\b(?:[A-Za-z0-9]+[_-]){2,}(?=[A-Za-z0-9]*[0-9])(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]{8,}\b/;
 // AWS access-key-id shape.
 const AWS_KEY_RE = /AKIA[0-9A-Z]{12,}/;
 // An unbroken run of 20+ alphanumeric chars — the shape of a raw secret, hash,
@@ -93,6 +107,13 @@ const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 // A leading URI scheme or Windows drive letter (file:, http:, mailto:, C:, ...).
 // Matches "scheme:" anchored at the start; ordinary slugs have no leading scheme.
 const URI_SCHEME_RE = /^[A-Za-z][A-Za-z0-9+.-]*:/;
+// Customer / incident / ticket labels — operational metadata (who reported,
+// what ticket) that must never be surfaced as a project name, even when short
+// enough to dodge the six-word sentence heuristic (e.g. "Incident INC-123 Acme").
+const INCIDENT_LABEL_RE =
+	/\b(?:incident|inc|ticket|case|customer|acct|account)\b[-\s]?[A-Za-z0-9-]+/i;
+// Jira-style ticket keys (PROJ-123) and explicit INC-### shapes.
+const JIRA_TICKET_RE = /\b[A-Z]{2,}-\d+\b/;
 // Allowed low-risk project-slug shape: starts with a word char or dot, then
 // word chars, dots, spaces, or dashes, capped at 64 chars. Slashes and colons
 // are intentionally excluded — they enable path, URI, host:port, and drive-letter
@@ -106,7 +127,8 @@ const SLUG_SHAPE_RE = /^[\w.][\w .-]{0,63}$/;
  * length-capped) so a secret positioned near the 64-char truncation boundary
  * cannot be shortened below a detector threshold and slip through. Rejects
  * values that look like they could carry a secret, a raw trace/UUID id, a URL
- * or URI scheme, an absolute/drive/traversal path, an email address, or
+ * or URI scheme, an absolute/drive/traversal path, an email address, a
+ * multi-segment API-key/token shape, a customer/incident/ticket label, or
  * free-form sentence/incident text. Accepts ordinary repo-name-shaped labels
  * (e.g. "better-ccflare", "Harness", "eval-suite", "My Project").
  */
@@ -144,11 +166,19 @@ export function isLowRiskProjectSlug(value: string): boolean {
 	// Secrets, keys, IPs, and high-entropy tokens.
 	if (
 		SECRET_TOKEN_RE.test(cleaned) ||
+		KNOWN_SECRET_PREFIX_RE.test(cleaned) ||
+		MULTI_SEGMENT_TOKEN_RE.test(cleaned) ||
 		lower.includes("bearer ") ||
 		AWS_KEY_RE.test(cleaned) ||
 		IPV4_RE.test(cleaned) ||
 		LONG_TOKEN_RE.test(cleaned)
 	) {
+		return false;
+	}
+
+	// Customer / incident / ticket-shaped labels — operational metadata, not a
+	// project name, even when short enough to dodge the sentence heuristic below.
+	if (INCIDENT_LABEL_RE.test(cleaned) || JIRA_TICKET_RE.test(cleaned)) {
 		return false;
 	}
 
@@ -162,7 +192,9 @@ export function isLowRiskProjectSlug(value: string): boolean {
 
 const WORKSPACE_PATH_RE =
 	/\/(?:Users|home)\/[^/]+\/(?:Desktop|projects|repos|src)\/([^/]+)\//;
-const HEADING_RE = /^#\s+([^\n\r]{1,100})/m;
+// Global so extractProjectAttribution can walk every H1 heading in the system
+// prompt (not just the first) and pick the first one that is eligible.
+const HEADING_RE = /^#\s+([^\n\r]{1,100})/gm;
 
 /**
  * Core project attribution extraction. Accepts a header accessor so it works
@@ -207,23 +239,24 @@ export function extractProjectAttribution(
 			};
 		}
 
-		const headingMatch = systemPrompt.match(HEADING_RE);
-		if (headingMatch) {
+		// Walk EVERY H1 heading (not just the first) and use the first one that
+		// is both non-Claude and passes the low-risk slug validator. A doc that
+		// opens with "# Claude Code Instructions" before a real "# Harness"
+		// heading must not lose attribution just because the first heading was
+		// ineligible.
+		for (const headingMatch of systemPrompt.matchAll(HEADING_RE)) {
 			// Validate the FULL captured heading, then length-cap only after it
 			// passes — truncating first could shorten a boundary-straddling secret
 			// below a detector threshold and let a partial secret through.
 			const rawHeading = headingMatch[1];
-			if (
-				!rawHeading.trim().toLowerCase().startsWith("claude") &&
-				isLowRiskProjectSlug(rawHeading)
-			) {
-				const heading = sanitizeProjectName(rawHeading);
-				if (heading) {
-					return {
-						project: heading,
-						projectAttributionSource: "heading_project",
-					};
-				}
+			if (rawHeading.trim().toLowerCase().startsWith("claude")) continue;
+			if (!isLowRiskProjectSlug(rawHeading)) continue;
+			const heading = sanitizeProjectName(rawHeading);
+			if (heading) {
+				return {
+					project: heading,
+					projectAttributionSource: "heading_project",
+				};
 			}
 		}
 	}

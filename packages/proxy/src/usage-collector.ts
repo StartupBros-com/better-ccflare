@@ -803,6 +803,8 @@ export class UsageCollector {
 						isStream: startMessage.isStream,
 						retry: startMessage.retryAttempt,
 						project: state.project ?? undefined,
+						projectAttributionSource:
+							state.projectAttributionSource ?? undefined,
 					},
 				});
 
