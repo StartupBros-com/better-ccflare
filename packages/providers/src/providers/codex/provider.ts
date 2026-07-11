@@ -116,8 +116,9 @@ interface CodexRequest {
 	reasoning?: { effort: string };
 	instructions?: string;
 	tools?: CodexTool[];
-	// The Codex Responses schema types tool_choice as a plain string
-	// (see openai/codex ResponsesApiRequest), never an object.
+	// The official codex client (openai/codex ResponsesApiRequest) types
+	// tool_choice as a plain string and never sends the object form to the
+	// ChatGPT Codex backend, so this provider stays within that schema.
 	tool_choice?: string;
 	parallel_tool_calls?: boolean;
 	max_output_tokens?: number;
@@ -718,9 +719,11 @@ export class CodexProvider extends BaseProvider {
 			case "none":
 				return "none";
 			case "tool":
-				// A named function choice is an object in the OpenAI schema, but the
-				// Codex wire format only carries strings; "required" is the closest
-				// enforceable semantic.
+				// The general Responses API accepts {type: "function", name} here,
+				// but the official codex client only ever sends strings and the
+				// ChatGPT Codex backend's tolerance for the object form is
+				// unverified; "required" is the closest safely-representable
+				// semantic (forces some tool call, not the named one).
 				log.debug(
 					`Downgrading named tool_choice ${toolChoice.name ?? "<unnamed>"} to "required"`,
 				);
@@ -735,9 +738,44 @@ export class CodexProvider extends BaseProvider {
 	}
 
 	/**
-	 * Emit buffered arguments and content_block_stop for function-call blocks
-	 * that never received response.output_item.done, so the client always sees
-	 * complete block framing (start → delta → stop) before terminal events.
+	 * Emit buffered arguments and content_block_stop for one tracked
+	 * function-call block, so the client always sees complete block framing
+	 * (start → delta → stop) exactly once per block. Shared by the
+	 * output_item.done handler, the next-item guard, and terminal flushing.
+	 */
+	private async closeFunctionCallBlock(
+		state: StreamState,
+		writeSSE: (event: string, data: unknown) => Promise<void>,
+		outputIndex: number,
+		buffer: FunctionCallBuffer,
+	): Promise<void> {
+		if (buffer.arguments.length > 0) {
+			await writeSSE("content_block_delta", {
+				type: "content_block_delta",
+				index: buffer.contentBlockIndex,
+				delta: {
+					type: "input_json_delta",
+					partial_json: buffer.arguments.join(""),
+				},
+			});
+		}
+		await writeSSE("content_block_stop", {
+			type: "content_block_stop",
+			index: buffer.contentBlockIndex,
+		});
+		state.functionCallBlocks.delete(outputIndex);
+		if (
+			state.hasSentContentBlockStart &&
+			state.contentBlockIndex === buffer.contentBlockIndex
+		) {
+			state.contentBlockIndex++;
+			state.hasSentContentBlockStart = false;
+		}
+	}
+
+	/**
+	 * Close function-call blocks that never received response.output_item.done
+	 * before terminal events are emitted.
 	 */
 	private async flushOrphanedFunctionCalls(
 		state: StreamState,
@@ -747,28 +785,7 @@ export class CodexProvider extends BaseProvider {
 			(a, b) => a[1].contentBlockIndex - b[1].contentBlockIndex,
 		);
 		for (const [outputIndex, buffer] of orphans) {
-			if (buffer.arguments.length > 0) {
-				await writeSSE("content_block_delta", {
-					type: "content_block_delta",
-					index: buffer.contentBlockIndex,
-					delta: {
-						type: "input_json_delta",
-						partial_json: buffer.arguments.join(""),
-					},
-				});
-			}
-			await writeSSE("content_block_stop", {
-				type: "content_block_stop",
-				index: buffer.contentBlockIndex,
-			});
-			state.functionCallBlocks.delete(outputIndex);
-			if (
-				state.hasSentContentBlockStart &&
-				state.contentBlockIndex === buffer.contentBlockIndex
-			) {
-				state.contentBlockIndex++;
-				state.hasSentContentBlockStart = false;
-			}
+			await this.closeFunctionCallBlock(state, writeSSE, outputIndex, buffer);
 		}
 	}
 
@@ -928,6 +945,8 @@ export class CodexProvider extends BaseProvider {
 				`[codex:model-debug] request_id=${requestId} transformSseResponseToJson used fallback model=gpt-5.4 (startMessage.model missing)`,
 			);
 		}
+		// Cast defeats TS narrowing to null: assignment happens inside the
+		// processLine closure, invisible to control-flow analysis here.
 		const deltaPayload = (messageDeltaPayload as Record<string, unknown> | null)
 			?.delta as Record<string, unknown> | undefined;
 		const stopReason =
@@ -1023,12 +1042,8 @@ export class CodexProvider extends BaseProvider {
 					typeof payload.delta === "object" && payload.delta !== null
 						? (payload.delta as Record<string, unknown>)
 						: {};
-				if (!("stop_reason" in delta)) {
-					delta.stop_reason = "end_turn";
-				}
-				if (!("stop_sequence" in delta)) {
-					delta.stop_sequence = null;
-				}
+				// stop_reason/stop_sequence are always set explicitly by the emitters;
+				// resolveStopReason is the single source of truth for stop_reason.
 				if (!("usage" in delta)) {
 					delta.usage = payload.usage;
 				}
@@ -1197,12 +1212,31 @@ export class CodexProvider extends BaseProvider {
 					const name = item?.name as string;
 
 					if (state.hasSentContentBlockStart) {
-						await writeSSE("content_block_stop", {
-							type: "content_block_stop",
-							index: state.contentBlockIndex,
-						});
-						state.contentBlockIndex++;
-						state.hasSentContentBlockStart = false;
+						// If the open block is a function call still awaiting
+						// output_item.done, close it completely (buffered arguments
+						// included) so its input is not lost and terminal flushing
+						// cannot close it a second time.
+						const openFunctionCall = [
+							...state.functionCallBlocks.entries(),
+						].find(
+							([, buffer]) =>
+								buffer.contentBlockIndex === state.contentBlockIndex,
+						);
+						if (openFunctionCall) {
+							await this.closeFunctionCallBlock(
+								state,
+								writeSSE,
+								openFunctionCall[0],
+								openFunctionCall[1],
+							);
+						} else {
+							await writeSSE("content_block_stop", {
+								type: "content_block_stop",
+								index: state.contentBlockIndex,
+							});
+							state.contentBlockIndex++;
+							state.hasSentContentBlockStart = false;
+						}
 					}
 
 					const blockIdx = state.contentBlockIndex;
@@ -1291,29 +1325,13 @@ export class CodexProvider extends BaseProvider {
 						outputIndex !== undefined
 							? state.functionCallBlocks.get(outputIndex)
 							: undefined;
-					if (buffer) {
-						await writeSSE("content_block_delta", {
-							type: "content_block_delta",
-							index: buffer.contentBlockIndex,
-							delta: {
-								type: "input_json_delta",
-								partial_json: buffer.arguments.join(""),
-							},
-						});
-						await writeSSE("content_block_stop", {
-							type: "content_block_stop",
-							index: buffer.contentBlockIndex,
-						});
-						if (outputIndex !== undefined) {
-							state.functionCallBlocks.delete(outputIndex);
-						}
-						if (
-							state.hasSentContentBlockStart &&
-							state.contentBlockIndex === buffer.contentBlockIndex
-						) {
-							state.contentBlockIndex++;
-							state.hasSentContentBlockStart = false;
-						}
+					if (buffer && outputIndex !== undefined) {
+						await this.closeFunctionCallBlock(
+							state,
+							writeSSE,
+							outputIndex,
+							buffer,
+						);
 					}
 					break;
 				}
@@ -1356,8 +1374,8 @@ export class CodexProvider extends BaseProvider {
 						? inputTokenDetails.cache_creation_input_tokens
 						: 0;
 
-				state.inputTokens = usage?.input_tokens || state.inputTokens;
-				state.outputTokens = usage?.output_tokens || state.outputTokens;
+				state.inputTokens = usage?.input_tokens ?? state.inputTokens;
+				state.outputTokens = usage?.output_tokens ?? state.outputTokens;
 				state.cacheReadInputTokens = cacheRead;
 				state.cacheCreationInputTokens = cacheCreation;
 				state.contextWindow = this.extractContextWindow(resp, usage);

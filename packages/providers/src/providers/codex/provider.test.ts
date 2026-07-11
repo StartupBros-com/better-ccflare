@@ -9,6 +9,14 @@ const eventLine = (name: string, data: unknown) => [
 	`data: ${typeof data === "string" ? data : JSON.stringify(data)}`,
 	"",
 ];
+const searchTool = {
+	name: "search",
+	description: "search",
+	input_schema: {
+		type: "object",
+		properties: { query: { type: "string" } },
+	},
+};
 
 describe("CodexProvider request conversion", () => {
 	it("handles only /v1/messages path", () => {
@@ -872,15 +880,6 @@ describe("CodexProvider tool-call request protocol", () => {
 			body: JSON.stringify(body),
 		});
 
-	const searchTool = {
-		name: "search",
-		description: "search",
-		input_schema: {
-			type: "object",
-			properties: { query: { type: "string" } },
-		},
-	};
-
 	it("forwards max_tokens as max_output_tokens", async () => {
 		const provider = new CodexProvider();
 		const transformed = await provider.transformRequestBody(
@@ -1143,6 +1142,86 @@ describe("CodexProvider stop_reason protocol", () => {
 		expect(body.match(/event: message_stop/g)?.length ?? 0).toBe(1);
 	});
 
+	it("closes an open function_call block with its arguments when the next call starts", async () => {
+		const provider = new CodexProvider();
+		// call_2 starts before call_1 ever receives output_item.done
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_test", model: "gpt-5.4" },
+			}),
+			...eventLine("response.output_item.added", {
+				item: { type: "function_call", call_id: "call_1", name: "search" },
+				output_index: 0,
+			}),
+			...eventLine("response.function_call_arguments.delta", {
+				delta: '{"a":1}',
+				output_index: 0,
+			}),
+			...eventLine("response.output_item.added", {
+				item: { type: "function_call", call_id: "call_2", name: "search" },
+				output_index: 1,
+			}),
+			...eventLine("response.function_call_arguments.delta", {
+				delta: '{"b":2}',
+				output_index: 1,
+			}),
+			...eventLine("response.output_item.done", {
+				item: { type: "function_call", call_id: "call_2", name: "search" },
+				output_index: 1,
+			}),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.4",
+					usage: { input_tokens: 1, output_tokens: 1 },
+				},
+			}),
+		]);
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const body = await transformed.text();
+		const events = body
+			.split("\n")
+			.filter((l) => l.startsWith("data:"))
+			.map(
+				(l) =>
+					JSON.parse(l.slice("data:".length).trim()) as Record<
+						string,
+						// biome-ignore lint/suspicious/noExplicitAny: test helper
+						any
+					>,
+			);
+
+		// Exactly one stop per block, arguments delivered before each stop
+		expect(
+			events.filter((e) => e.type === "content_block_stop" && e.index === 0)
+				.length,
+		).toBe(1);
+		expect(
+			events.filter((e) => e.type === "content_block_stop" && e.index === 1)
+				.length,
+		).toBe(1);
+		const delta0 = events.findIndex(
+			(e) => e.type === "content_block_delta" && e.index === 0,
+		);
+		const stop0 = events.findIndex(
+			(e) => e.type === "content_block_stop" && e.index === 0,
+		);
+		const start1 = events.findIndex(
+			(e) => e.type === "content_block_start" && e.index === 1,
+		);
+		expect(delta0).toBeGreaterThan(-1);
+		expect(stop0).toBeGreaterThan(delta0);
+		expect(start1).toBeGreaterThan(stop0);
+		expect(body).toContain('"partial_json":"{\\"a\\":1}"');
+		expect(body).toContain('"partial_json":"{\\"b\\":2}"');
+		const messageDelta = events.find((e) => e.type === "message_delta");
+		expect(messageDelta?.delta.stop_reason).toBe("tool_use");
+	});
+
 	it("flushes orphaned function_call blocks at response.completed", async () => {
 		const provider = new CodexProvider();
 		// output_item.done never arrives for the function call
@@ -1196,16 +1275,7 @@ describe("CodexProvider stop_reason protocol", () => {
 				model: "claude-sonnet-4-5",
 				max_tokens: 16,
 				stream: false,
-				tools: [
-					{
-						name: "search",
-						description: "search",
-						input_schema: {
-							type: "object",
-							properties: { query: { type: "string" } },
-						},
-					},
-				],
+				tools: [searchTool],
 				messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
 			}),
 		});
