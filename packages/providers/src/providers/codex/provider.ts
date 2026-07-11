@@ -754,6 +754,13 @@ export class CodexProvider extends BaseProvider {
 	 * keeps block lifecycles strictly sequential, matching real Anthropic
 	 * streams; nothing is lost because arguments never stream incrementally on
 	 * this path (they are buffered until output_item.done regardless).
+	 *
+	 * Emission happens in output_item.done arrival order, which equals
+	 * output_index order under the Responses protocol's sequential item
+	 * semantics (an item's done precedes the next item's added); the terminal
+	 * flush sorts by output_index for the same reason. Reordering machinery
+	 * (cursor + buffer-until-lower-indices-complete) is deliberately avoided:
+	 * it would stall all output behind a single missing done event.
 	 */
 	private async emitFunctionCallBlock(
 		state: StreamState,
@@ -1179,49 +1186,35 @@ export class CodexProvider extends BaseProvider {
 				// Flush any remaining
 				await ensureMessageStart();
 
-				if (!state.hasSentTerminalEvents && state.sawFunctionCall) {
-					// The upstream stream ended without a terminal event on a turn
-					// that emitted tool calls. Completeness of the call set cannot
-					// be verified (arguments may be truncated, or a parallel call
-					// may never have arrived), so never synthesize a successful
-					// tool_use turn: surface an error and let the client retry.
+				if (!state.hasSentTerminalEvents) {
+					// The upstream stream ended without response.completed,
+					// response.incomplete, or response.failed. The turn cannot be
+					// verified complete (text may be truncated; a parallel tool
+					// call set may be partial), so never synthesize a successful
+					// terminal: surface an error and let the client retry.
 					await writeSSE("error", {
 						type: "error",
 						error: {
 							type: "api_error",
-							message: "Codex stream ended before the tool call turn completed",
+							message: "Codex stream ended without a terminal response event",
 						},
 					});
-				} else {
-					// Close any open content block
-					if (state.hasSentContentBlockStart) {
-						await writeSSE("content_block_stop", {
-							type: "content_block_stop",
-							index: state.contentBlockIndex,
-						});
-					}
-
-					// Final message_delta + message_stop if upstream never sent
-					// response.completed (all observed tool calls completed here)
-					if (!state.hasSentTerminalEvents) {
-						await writeSSE("message_delta", {
-							type: "message_delta",
-							delta: {
-								stop_reason: this.resolveStopReason(state),
-								stop_sequence: null,
-							},
-							usage: {
-								input_tokens: state.inputTokens,
-								output_tokens: state.outputTokens,
-								cache_read_input_tokens: state.cacheReadInputTokens,
-								cache_creation_input_tokens: state.cacheCreationInputTokens,
-							},
-						});
-						await writeSSE("message_stop", { type: "message_stop" });
-					}
 				}
 			} catch (error) {
 				log.error("Error processing Codex SSE stream:", error);
+				if (!state.hasSentTerminalEvents) {
+					try {
+						await writeSSE("error", {
+							type: "error",
+							error: {
+								type: "api_error",
+								message: "Proxy failed while processing the Codex stream",
+							},
+						});
+					} catch {
+						// writer already broken; nothing more to emit
+					}
+				}
 			} finally {
 				await writer.close();
 			}
@@ -1372,6 +1365,23 @@ export class CodexProvider extends BaseProvider {
 					state.contentBlockIndex++;
 					state.hasSentContentBlockStart = false;
 				}
+				break;
+			}
+
+			case "response.failed": {
+				const resp = data.response as Record<string, unknown> | undefined;
+				const upstreamError = resp?.error as
+					| { code?: string; message?: string }
+					| undefined;
+				await ensureMessageStart();
+				await writeSSE("error", {
+					type: "error",
+					error: {
+						type: "api_error",
+						message: upstreamError?.message ?? "Codex reported response.failed",
+					},
+				});
+				state.hasSentTerminalEvents = true;
 				break;
 			}
 

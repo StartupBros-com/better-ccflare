@@ -621,7 +621,7 @@ describe("CodexProvider.processResponse", () => {
 		expect(messageDeltaLine).toContain('"output_tokens":3');
 	});
 
-	it("fallback message_start includes top-level usage", async () => {
+	it("emits zeroed message_start usage then errors when no terminal event arrives", async () => {
 		const provider = new CodexProvider();
 		const upstreamBody = sseBody([
 			...eventLine("response.output_item.added", {
@@ -642,9 +642,6 @@ describe("CodexProvider.processResponse", () => {
 		const messageStartLine = transformedBody
 			.split("\n")
 			.find((line) => line.includes('"type":"message_start"'));
-		const messageDeltaLine = transformedBody
-			.split("\n")
-			.find((line) => line.includes('"type":"message_delta"'));
 
 		expect(messageStartLine).not.toBeUndefined();
 		const payload = JSON.parse(
@@ -656,13 +653,70 @@ describe("CodexProvider.processResponse", () => {
 		expect(payload.usage.cache_creation_input_tokens).toBe(0);
 		expect(payload.message.usage.input_tokens).toBe(0);
 		expect(payload.message.usage.output_tokens).toBe(0);
-		expect(messageDeltaLine).not.toBeUndefined();
-		expect(messageDeltaLine).toContain('"usage":{');
-		expect(messageDeltaLine).toContain('"input_tokens":0');
-		expect(messageDeltaLine).toContain('"output_tokens":0');
-		expect(messageDeltaLine).toContain(
-			'"delta":{"stop_reason":"end_turn","stop_sequence":null,"usage":{',
-		);
+		// A stream without response.completed/incomplete/failed is unverifiable:
+		// no synthesized success terminal, an error event instead
+		expect(transformedBody).toContain("event: error");
+		expect(transformedBody).not.toContain("event: message_delta");
+		expect(transformedBody).not.toContain("event: message_stop");
+	});
+
+	it("surfaces response.failed as an SSE error with the upstream message", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_test", model: "gpt-5.4" },
+			}),
+			...eventLine("response.content_part.added", {
+				part: { type: "output_text" },
+			}),
+			...eventLine("response.output_text.delta", { delta: "partial" }),
+			...eventLine("response.failed", {
+				response: {
+					model: "gpt-5.4",
+					status: "failed",
+					error: { code: "server_error", message: "upstream exploded" },
+				},
+			}),
+		]);
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const body = await transformed.text();
+
+		expect(body).toContain("event: error");
+		expect(body).toContain("upstream exploded");
+		expect(body).not.toContain("event: message_stop");
+		expect(body.match(/event: error/g)?.length ?? 0).toBe(1);
+	});
+
+	it("propagates mid-stream processing failures as an error event", async () => {
+		const provider = new CodexProvider();
+		const encoder = new TextEncoder();
+		const firstChunk = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_test", model: "gpt-5.4" },
+			}),
+		]);
+		const stream = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(encoder.encode(firstChunk));
+				controller.error(new Error("connection reset"));
+			},
+		});
+		const response = new Response(stream, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const body = await transformed.text();
+
+		expect(body).toContain("event: error");
+		expect(body).toContain('"type":"api_error"');
+		expect(body).not.toContain("event: message_stop");
 	});
 
 	it("includes cache_creation_input_tokens in synthesized context_window when present", async () => {
