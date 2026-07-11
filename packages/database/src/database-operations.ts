@@ -68,7 +68,90 @@ export interface DatabaseRetryConfig {
 }
 
 /**
+ * SQLite's `busy_timeout` PRAGMA takes a signed 32-bit integer. A value
+ * above `Number.isInteger`'s (unbounded) range overflows to a non-positive
+ * timeout, which silently disables lock waiting instead of erroring. This
+ * mirrors the 300000ms (5 minute) ceiling already enforced on
+ * `RuntimeConfig.database.busyTimeoutMs` by `validateDatabaseConfig` in
+ * packages/config/src/index.ts — applied here too since `DatabaseOperations`
+ * can be constructed directly with a `DatabaseConfig` that never passes
+ * through that validator, and is well under the true int32 max
+ * (2147483647) so it is never itself a source of overflow.
+ */
+const MAX_BUSY_TIMEOUT_MS = 300_000;
+
+/**
+ * Validates operator-supplied SQLite PRAGMA config values. Pure: no I/O, no
+ * side effects, throws `Error` on the first invalid field. Must be called
+ * BEFORE `new Database(...)` opens the handle and before any PRAGMA runs —
+ * see the constructor for why (validating mid-flight, as `configureSqlite()`
+ * used to, let bad input persist `journal_mode = WAL` to disk and leave an
+ * unclosed handle when the constructor threw).
+ */
+function validateSqliteConfig(config: DatabaseConfig): void {
+	if (config.busyTimeoutMs !== undefined) {
+		if (
+			!Number.isSafeInteger(config.busyTimeoutMs) ||
+			config.busyTimeoutMs < 0 ||
+			config.busyTimeoutMs > MAX_BUSY_TIMEOUT_MS
+		) {
+			throw new Error(
+				`Invalid busyTimeoutMs: ${config.busyTimeoutMs} (must be a safe integer between 0 and ${MAX_BUSY_TIMEOUT_MS})`,
+			);
+		}
+	}
+
+	if (config.cacheSize !== undefined) {
+		if (!Number.isSafeInteger(config.cacheSize)) {
+			throw new Error(
+				`Invalid cacheSize: ${config.cacheSize} (must be an integer)`,
+			);
+		}
+	}
+
+	// Default ONLY when the raw value is undefined. A present-but-falsy value
+	// ("", null, 0) must fall through to the type/allowlist checks below
+	// instead of silently becoming "FULL" — that used to happen via
+	// `config.synchronous || "FULL"`, which treats any falsy input as "not
+	// specified".
+	const rawSync: unknown =
+		config.synchronous === undefined ? "FULL" : config.synchronous;
+	if (typeof rawSync !== "string" || !/^(OFF|NORMAL|FULL)$/.test(rawSync)) {
+		throw new Error(
+			`Invalid synchronous mode: ${JSON.stringify(config.synchronous)} (must be OFF, NORMAL, or FULL)`,
+		);
+	}
+
+	if (config.mmapSize !== undefined) {
+		if (!Number.isSafeInteger(config.mmapSize) || config.mmapSize < 0) {
+			throw new Error(
+				`Invalid mmapSize: ${config.mmapSize} (must be a non-negative integer)`,
+			);
+		}
+	}
+
+	// SQLite only supports page sizes that are a power of two in [512, 65536].
+	if (config.pageSize !== undefined) {
+		const p = config.pageSize;
+		if (
+			!Number.isSafeInteger(p) ||
+			p < 512 ||
+			p > 65536 ||
+			(p & (p - 1)) !== 0
+		) {
+			throw new Error(
+				`Invalid pageSize: ${p} (must be a power of two between 512 and 65536)`,
+			);
+		}
+	}
+}
+
+/**
  * Apply SQLite pragmas for optimal performance on distributed filesystems.
+ *
+ * Assumes `config` has already passed `validateSqliteConfig()` — called by
+ * the constructor before this function runs, so every value interpolated
+ * into a PRAGMA string below is known-safe.
  *
  * Note: `PRAGMA integrity_check` is NOT run here. The check is moved to a
  * background worker (see `packages/proxy/src/integrity-scheduler.ts`) so it
@@ -119,31 +202,19 @@ function configureSqlite(db: Database, config: DatabaseConfig): void {
 
 		// Set busy timeout for lock handling
 		if (config.busyTimeoutMs !== undefined) {
-			if (!Number.isInteger(config.busyTimeoutMs) || config.busyTimeoutMs < 0) {
-				throw new Error(
-					`Invalid busyTimeoutMs: ${config.busyTimeoutMs} (must be a non-negative integer)`,
-				);
-			}
 			db.run(`PRAGMA busy_timeout = ${config.busyTimeoutMs}`);
 		}
 
 		// Configure cache size
 		if (config.cacheSize !== undefined) {
-			if (!Number.isInteger(config.cacheSize)) {
-				throw new Error(
-					`Invalid cacheSize: ${config.cacheSize} (must be an integer)`,
-				);
-			}
 			db.run(`PRAGMA cache_size = ${config.cacheSize}`);
 		}
 
-		// Set synchronous mode (more conservative for distributed filesystems)
-		const syncMode = config.synchronous || "FULL"; // Default to FULL for safety
-		if (!/^(OFF|NORMAL|FULL)$/.test(syncMode)) {
-			throw new Error(
-				`Invalid synchronous mode: ${syncMode} (must be OFF, NORMAL, or FULL)`,
-			);
-		}
+		// Set synchronous mode (more conservative for distributed filesystems).
+		// Default to FULL for safety — already validated by
+		// `validateSqliteConfig()`, so this mirrors its defaulting exactly.
+		const syncMode =
+			config.synchronous === undefined ? "FULL" : config.synchronous;
 		db.run(`PRAGMA synchronous = ${syncMode}`);
 
 		// Configure memory-mapped I/O. `mmap_size = 0` is the SQLite-defined
@@ -157,11 +228,6 @@ function configureSqlite(db: Database, config: DatabaseConfig): void {
 		// `mmapSize` as "issue the PRAGMA whenever the operator has specified
 		// a value, including 0".
 		if (config.mmapSize !== undefined) {
-			if (!Number.isInteger(config.mmapSize) || config.mmapSize < 0) {
-				throw new Error(
-					`Invalid mmapSize: ${config.mmapSize} (must be a non-negative integer)`,
-				);
-			}
 			try {
 				db.run(`PRAGMA mmap_size = ${config.mmapSize}`);
 			} catch (error) {
@@ -171,11 +237,6 @@ function configureSqlite(db: Database, config: DatabaseConfig): void {
 
 		// Set page size (only effective before any data is written, or after VACUUM)
 		if (config.pageSize !== undefined) {
-			if (!Number.isInteger(config.pageSize) || config.pageSize < 0) {
-				throw new Error(
-					`Invalid pageSize: ${config.pageSize} (must be a non-negative integer)`,
-				);
-			}
 			const currentPageSize = (
 				db.query("PRAGMA page_size").get() as { page_size: number }
 			).page_size;
@@ -365,22 +426,39 @@ export class DatabaseOperations implements StrategyStore, Disposable {
 			const dir = dirname(resolvedPath);
 			mkdirSync(dir, { recursive: true });
 
+			// Validate operator-supplied PRAGMA config BEFORE opening the handle.
+			// `configureSqlite()` used to validate mid-flight, after
+			// `auto_vacuum`/`journal_mode = WAL` had already executed — WAL mode
+			// persists to disk immediately, so a bad value would leave that
+			// mutation on disk and throw out of the constructor with an unclosed
+			// handle. Validating here guarantees neither happens on bad input.
+			validateSqliteConfig(this.dbConfig);
+
 			this.sqliteDb = new Database(resolvedPath, { create: true });
 
-			// Capture the persisted auto_vacuum mode BEFORE configureSqlite's
-			// leading PRAGMA flips the connection-local view. See the field
-			// docstring for the SQLite quirk this works around. (Greptile #230)
-			this.originalAutoVacuumMode = (
-				this.sqliteDb.query("PRAGMA auto_vacuum").get() as {
-					auto_vacuum: number;
-				}
-			).auto_vacuum;
+			try {
+				// Capture the persisted auto_vacuum mode BEFORE configureSqlite's
+				// leading PRAGMA flips the connection-local view. See the field
+				// docstring for the SQLite quirk this works around. (Greptile #230)
+				this.originalAutoVacuumMode = (
+					this.sqliteDb.query("PRAGMA auto_vacuum").get() as {
+						auto_vacuum: number;
+					}
+				).auto_vacuum;
 
-			// Apply SQLite configuration
-			configureSqlite(this.sqliteDb, this.dbConfig);
+				// Apply SQLite configuration
+				configureSqlite(this.sqliteDb, this.dbConfig);
 
-			ensureSchema(this.sqliteDb);
-			runMigrations(this.sqliteDb, resolvedPath);
+				ensureSchema(this.sqliteDb);
+				runMigrations(this.sqliteDb, resolvedPath);
+			} catch (error) {
+				// Post-open setup failed — close the handle rather than leaking it
+				// out of a throwing constructor, which the caller has no reference
+				// to clean up.
+				this.sqliteDb.close();
+				this.sqliteDb = undefined;
+				throw error;
+			}
 
 			this.adapter = new BunSqlAdapter(this.sqliteDb);
 		}
