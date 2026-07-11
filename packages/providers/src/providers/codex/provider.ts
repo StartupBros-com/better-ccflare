@@ -65,6 +65,19 @@ const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
 	"gpt-5.4-mini": 272_000,
 };
 
+// Known Codex failure codes → Anthropic error types. Quota exhaustion cools
+// the account like a rate limit; slow_down is a throttle; context/policy and
+// subscription errors are permanent and must not be retried as 5xx.
+const CODEX_ERROR_TYPE_BY_CODE: Record<string, string> = {
+	rate_limit_exceeded: "rate_limit_error",
+	insufficient_quota: "rate_limit_error",
+	slow_down: "overloaded_error",
+	server_error: "api_error",
+	context_length_exceeded: "invalid_request_error",
+	cyber_policy: "invalid_request_error",
+	usage_not_included: "permission_error",
+};
+
 // ── Codex Responses API types ─────────────────────────────────────────────────
 
 interface CodexInputTextItem {
@@ -731,10 +744,17 @@ export class CodexProvider extends BaseProvider {
 		}
 		if (
 			typeof body.max_tokens === "number" &&
-			Number.isFinite(body.max_tokens) &&
-			body.max_tokens > 0
+			Number.isFinite(body.max_tokens)
 		) {
-			codexRequest.max_output_tokens = Math.floor(body.max_tokens);
+			if (body.max_tokens > 0) {
+				codexRequest.max_output_tokens = Math.floor(body.max_tokens);
+			} else if (body.max_tokens === 0) {
+				// Anthropic max_tokens: 0 is a cache-prewarm request that must not
+				// generate. The Responses schema has no zero-output mode, so clamp
+				// to the 1-token minimum the usage ping already uses instead of
+				// dropping the cap and allowing unbounded generation.
+				codexRequest.max_output_tokens = 1;
+			}
 		}
 
 		return codexRequest;
@@ -764,13 +784,15 @@ export class CodexProvider extends BaseProvider {
 		message: string | undefined,
 	): { type: string; message: string } {
 		const normalized = (code ?? "").toLowerCase();
-		const type = normalized.includes("rate_limit")
-			? "rate_limit_error"
-			: normalized.includes("overloaded")
-				? "overloaded_error"
-				: normalized.includes("invalid")
-					? "invalid_request_error"
-					: "api_error";
+		const type =
+			CODEX_ERROR_TYPE_BY_CODE[normalized] ??
+			(normalized.includes("rate_limit") || normalized.includes("quota")
+				? "rate_limit_error"
+				: normalized.includes("overloaded")
+					? "overloaded_error"
+					: normalized.includes("invalid")
+						? "invalid_request_error"
+						: "api_error");
 		return { type, message: message ?? "Codex upstream error" };
 	}
 
@@ -970,9 +992,11 @@ export class CodexProvider extends BaseProvider {
 					? 429
 					: errorType === "invalid_request_error"
 						? 400
-						: errorType === "overloaded_error"
-							? 529
-							: 502;
+						: errorType === "permission_error"
+							? 403
+							: errorType === "overloaded_error"
+								? 529
+								: 502;
 			const headers = sanitizeResponseHeaders(response.headers);
 			headers.set("content-type", "application/json");
 			return new Response(JSON.stringify(finalError), {

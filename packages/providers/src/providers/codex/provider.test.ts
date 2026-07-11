@@ -686,6 +686,33 @@ describe("CodexProvider.processResponse", () => {
 		expect(body).not.toContain("event: message_stop");
 	});
 
+	it("maps known Codex failure codes to their Anthropic error classes", async () => {
+		const provider = new CodexProvider();
+		const cases: Array<[string, string]> = [
+			["insufficient_quota", "rate_limit_error"],
+			["slow_down", "overloaded_error"],
+			["context_length_exceeded", "invalid_request_error"],
+			["usage_not_included", "permission_error"],
+		];
+		for (const [code, expectedType] of cases) {
+			const upstreamBody = sseBody([
+				...eventLine("response.created", {
+					response: { id: "resp_test", model: "gpt-5.4" },
+				}),
+				...eventLine("error", { type: "error", code, message: code }),
+			]);
+			const response = new Response(upstreamBody, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			});
+
+			const transformed = await provider.processResponse(response, null);
+			const body = await transformed.text();
+
+			expect(body).toContain(`"type":"${expectedType}"`);
+		}
+	});
+
 	it("maps upstream error class to HTTP status for non-streaming clients", async () => {
 		const provider = new CodexProvider();
 		const requestId = "req_non_stream_rate_limit";
@@ -1020,7 +1047,7 @@ describe("CodexProvider tool-call request protocol", () => {
 		expect(body.max_output_tokens).toBe(4096);
 	});
 
-	it("omits max_output_tokens when max_tokens is not a positive number", async () => {
+	it("omits max_output_tokens when max_tokens is absent", async () => {
 		const provider = new CodexProvider();
 		const transformed = await provider.transformRequestBody(
 			makeRequest({
@@ -1031,6 +1058,20 @@ describe("CodexProvider tool-call request protocol", () => {
 		const body = await transformed.json();
 
 		expect(body.max_output_tokens).toBeUndefined();
+	});
+
+	it("clamps prewarm max_tokens 0 to a 1-token cap instead of dropping it", async () => {
+		const provider = new CodexProvider();
+		const transformed = await provider.transformRequestBody(
+			makeRequest({
+				model: "claude-3-7-sonnet",
+				max_tokens: 0,
+				messages: [{ role: "user", content: "warmup" }],
+			}),
+		);
+		const body = await transformed.json();
+
+		expect(body.max_output_tokens).toBe(1);
 	});
 
 	it("defaults to auto tool_choice with parallel tool calls when tools are present", async () => {
