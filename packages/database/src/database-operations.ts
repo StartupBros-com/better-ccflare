@@ -119,16 +119,31 @@ function configureSqlite(db: Database, config: DatabaseConfig): void {
 
 		// Set busy timeout for lock handling
 		if (config.busyTimeoutMs !== undefined) {
+			if (!Number.isInteger(config.busyTimeoutMs) || config.busyTimeoutMs < 0) {
+				throw new Error(
+					`Invalid busyTimeoutMs: ${config.busyTimeoutMs} (must be a non-negative integer)`,
+				);
+			}
 			db.run(`PRAGMA busy_timeout = ${config.busyTimeoutMs}`);
 		}
 
 		// Configure cache size
 		if (config.cacheSize !== undefined) {
+			if (!Number.isInteger(config.cacheSize)) {
+				throw new Error(
+					`Invalid cacheSize: ${config.cacheSize} (must be an integer)`,
+				);
+			}
 			db.run(`PRAGMA cache_size = ${config.cacheSize}`);
 		}
 
 		// Set synchronous mode (more conservative for distributed filesystems)
 		const syncMode = config.synchronous || "FULL"; // Default to FULL for safety
+		if (!/^(OFF|NORMAL|FULL)$/.test(syncMode)) {
+			throw new Error(
+				`Invalid synchronous mode: ${syncMode} (must be OFF, NORMAL, or FULL)`,
+			);
+		}
 		db.run(`PRAGMA synchronous = ${syncMode}`);
 
 		// Configure memory-mapped I/O. `mmap_size = 0` is the SQLite-defined
@@ -142,6 +157,11 @@ function configureSqlite(db: Database, config: DatabaseConfig): void {
 		// `mmapSize` as "issue the PRAGMA whenever the operator has specified
 		// a value, including 0".
 		if (config.mmapSize !== undefined) {
+			if (!Number.isInteger(config.mmapSize) || config.mmapSize < 0) {
+				throw new Error(
+					`Invalid mmapSize: ${config.mmapSize} (must be a non-negative integer)`,
+				);
+			}
 			try {
 				db.run(`PRAGMA mmap_size = ${config.mmapSize}`);
 			} catch (error) {
@@ -151,6 +171,11 @@ function configureSqlite(db: Database, config: DatabaseConfig): void {
 
 		// Set page size (only effective before any data is written, or after VACUUM)
 		if (config.pageSize !== undefined) {
+			if (!Number.isInteger(config.pageSize) || config.pageSize < 0) {
+				throw new Error(
+					`Invalid pageSize: ${config.pageSize} (must be a non-negative integer)`,
+				);
+			}
 			const currentPageSize = (
 				db.query("PRAGMA page_size").get() as { page_size: number }
 			).page_size;
