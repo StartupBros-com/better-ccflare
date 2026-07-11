@@ -490,6 +490,60 @@ describe("CodexProvider request conversion", () => {
 		});
 		expect(body.input[1].arguments).toBe("null");
 	});
+
+	it("forwards Anthropic max_tokens as Codex max_output_tokens", async () => {
+		const provider = new CodexProvider();
+		const request = new Request("https://example.com/v1/messages", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				model: "claude-3-5-sonnet-20241022",
+				max_tokens: 4096,
+				messages: [{ role: "user", content: "Hello" }],
+			}),
+		});
+
+		const transformed = await provider.transformRequestBody(request);
+		const body = await transformed.json();
+
+		expect(body.max_output_tokens).toBe(4096);
+	});
+
+	it("floors a fractional max_tokens when forwarding max_output_tokens", async () => {
+		const provider = new CodexProvider();
+		const request = new Request("https://example.com/v1/messages", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				model: "claude-3-5-sonnet-20241022",
+				max_tokens: 100.7,
+				messages: [{ role: "user", content: "Hello" }],
+			}),
+		});
+
+		const transformed = await provider.transformRequestBody(request);
+		const body = await transformed.json();
+
+		expect(body.max_output_tokens).toBe(100);
+	});
+
+	it("clamps a cache-prewarm max_tokens: 0 to max_output_tokens: 1 instead of leaving the cap unbounded", async () => {
+		const provider = new CodexProvider();
+		const request = new Request("https://example.com/v1/messages", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				model: "claude-3-5-sonnet-20241022",
+				max_tokens: 0,
+				messages: [{ role: "user", content: "Hello" }],
+			}),
+		});
+
+		const transformed = await provider.transformRequestBody(request);
+		const body = await transformed.json();
+
+		expect(body.max_output_tokens).toBe(1);
+	});
 });
 
 describe("CodexProvider.processResponse", () => {
@@ -1817,6 +1871,126 @@ describe("CodexProvider.processResponse", () => {
 		expect(body).not.toContain("event: message_stop");
 	});
 
+	it("maps response.incomplete with a content_filter reason to a refusal stop_reason", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_incomplete", model: "gpt-5.5" },
+			}),
+			...eventLine("response.incomplete", {
+				response: {
+					model: "gpt-5.5",
+					status: "incomplete",
+					incomplete_details: { reason: "content_filter" },
+					usage: { input_tokens: 3, output_tokens: 1 },
+				},
+			}),
+		]);
+
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const body = await transformed.text();
+
+		expect(body).toContain('"stop_reason":"refusal"');
+		expect(body).toContain("event: message_delta");
+		expect(body).toContain("event: message_stop");
+	});
+
+	it("maps response.incomplete with a non-content_filter reason to max_tokens", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_incomplete", model: "gpt-5.5" },
+			}),
+			...eventLine("response.incomplete", {
+				response: {
+					model: "gpt-5.5",
+					status: "incomplete",
+					incomplete_details: { reason: "max_output_tokens" },
+					usage: { input_tokens: 3, output_tokens: 512 },
+				},
+			}),
+		]);
+
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const body = await transformed.text();
+
+		expect(body).toContain('"stop_reason":"max_tokens"');
+	});
+
+	it("treats a response.completed event carrying status incomplete the same as response.incomplete", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_incomplete", model: "gpt-5.5" },
+			}),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.5",
+					status: "incomplete",
+					incomplete_details: { reason: "unknown_future_reason" },
+					usage: { input_tokens: 3, output_tokens: 10 },
+				},
+			}),
+		]);
+
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const body = await transformed.text();
+
+		expect(body).toContain('"stop_reason":"max_tokens"');
+	});
+
+	it("never resolves an incomplete response with a pending tool call to a success stop_reason", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_incomplete", model: "gpt-5.5" },
+			}),
+			...eventLine("response.output_item.added", {
+				item: { type: "function_call", call_id: "call_1", name: "search" },
+				output_index: 0,
+			}),
+			...eventLine("response.output_item.done", {
+				item: { type: "function_call", call_id: "call_1", name: "search" },
+				output_index: 0,
+			}),
+			...eventLine("response.incomplete", {
+				response: {
+					model: "gpt-5.5",
+					status: "incomplete",
+					incomplete_details: { reason: "max_output_tokens" },
+					usage: { input_tokens: 3, output_tokens: 50 },
+				},
+			}),
+		]);
+
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const body = await transformed.text();
+
+		expect(body).not.toContain('"stop_reason":"tool_use"');
+		expect(body).not.toContain('"stop_reason":"end_turn"');
+		expect(body).toContain('"stop_reason":"max_tokens"');
+	});
+
 	it("passes through non-streaming error responses", async () => {
 		const provider = new CodexProvider();
 		const response = new Response('{"error":"bad_request"}', {
@@ -1828,6 +2002,69 @@ describe("CodexProvider.processResponse", () => {
 
 		expect(processed.status).toBe(400);
 		expect(await processed.text()).toBe('{"error":"bad_request"}');
+	});
+});
+
+describe("CodexProvider upstream error code classification", () => {
+	const errorForCode = async (code: string) => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("error", {
+				type: "error",
+				code,
+				message: `Codex reported ${code}`,
+			}),
+		]);
+
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: {
+				"content-type": "text/event-stream",
+				"x-better-ccflare-request-stream": "false",
+			},
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const body = (await transformed.json()) as {
+			error: { type: string; code?: string };
+		};
+		return { status: transformed.status, body };
+	};
+
+	it("maps insufficient_quota to rate_limit_error", async () => {
+		const { status, body } = await errorForCode("insufficient_quota");
+		expect(body.error.type).toBe("rate_limit_error");
+		expect(status).toBe(429);
+	});
+
+	it("maps server_is_overloaded to overloaded_error", async () => {
+		const { status, body } = await errorForCode("server_is_overloaded");
+		expect(body.error.type).toBe("overloaded_error");
+		expect(status).toBe(529);
+	});
+
+	it("maps slow_down to overloaded_error", async () => {
+		const { status, body } = await errorForCode("slow_down");
+		expect(body.error.type).toBe("overloaded_error");
+		expect(status).toBe(529);
+	});
+
+	it("maps cyber_policy to invalid_request_error", async () => {
+		const { status, body } = await errorForCode("cyber_policy");
+		expect(body.error.type).toBe("invalid_request_error");
+		expect(status).toBe(400);
+	});
+
+	it("maps usage_not_included to permission_error", async () => {
+		const { status, body } = await errorForCode("usage_not_included");
+		expect(body.error.type).toBe("permission_error");
+		expect(status).toBe(403);
+	});
+
+	it("maps server_error to api_error", async () => {
+		const { status, body } = await errorForCode("server_error");
+		expect(body.error.type).toBe("api_error");
+		expect(status).toBe(502);
 	});
 });
 

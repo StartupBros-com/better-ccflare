@@ -75,6 +75,24 @@ const DEFAULT_MODEL_MAP: Record<string, string> = {
 	haiku: "gpt-5.4-mini",
 };
 
+// Known Codex failure codes → Anthropic error types. Quota exhaustion cools
+// the account like a rate limit; slow_down is a throttle; context/policy and
+// subscription errors are permanent and must not be retried as 5xx. Codes and
+// their retry semantics mirror the reference client (openai/codex
+// codex-api/src/sse/responses.rs + api_bridge.rs): quota codes cool the
+// account, server_is_overloaded/slow_down are throttles, context and policy
+// errors are permanent 4xx, usage_not_included is a plan-entitlement error.
+const CODEX_ERROR_TYPE_BY_CODE: Record<string, string> = {
+	rate_limit_exceeded: "rate_limit_error",
+	insufficient_quota: "rate_limit_error",
+	server_is_overloaded: "overloaded_error",
+	slow_down: "overloaded_error",
+	server_error: "api_error",
+	context_length_exceeded: "invalid_request_error",
+	cyber_policy: "invalid_request_error",
+	usage_not_included: "permission_error",
+};
+
 // Synced from the Codex CLI model cache (~/.codex/models_cache.json,
 // codex-cli 0.144.1). Missing entries mean no context_window block is
 // reported to the client, which disables its context gauge and compaction
@@ -187,6 +205,7 @@ interface CodexRequest {
 		| "none"
 		| { type: "function"; name: string };
 	parallel_tool_calls?: boolean;
+	max_output_tokens?: number;
 }
 
 // ── Anthropic request types ───────────────────────────────────────────────────
@@ -1238,6 +1257,21 @@ export class CodexProvider extends BaseProvider {
 			}
 		}
 
+		if (
+			typeof body.max_tokens === "number" &&
+			Number.isFinite(body.max_tokens)
+		) {
+			if (body.max_tokens > 0) {
+				codexRequest.max_output_tokens = Math.floor(body.max_tokens);
+			} else if (body.max_tokens === 0) {
+				// Anthropic max_tokens: 0 is a cache-prewarm request that must not
+				// generate. The Responses schema has no zero-output mode, so clamp
+				// to the 1-token minimum the usage ping already uses instead of
+				// dropping the cap and allowing unbounded generation.
+				codexRequest.max_output_tokens = 1;
+			}
+		}
+
 		return codexRequest;
 	}
 
@@ -1700,9 +1734,12 @@ export class CodexProvider extends BaseProvider {
 		const status = error?.status === "rate_limited" ? error.status : undefined;
 		const rawType = error?.type;
 		let type = "api_error";
-		if (code === "context_length_exceeded") {
-			type = "invalid_request_error";
-		} else if (code === "rate_limit_exceeded" || status === "rate_limited") {
+		const mappedFromCode = code
+			? CODEX_ERROR_TYPE_BY_CODE[code.toLowerCase()]
+			: undefined;
+		if (mappedFromCode) {
+			type = mappedFromCode;
+		} else if (status === "rate_limited") {
 			type = "rate_limit_error";
 		} else if (
 			rawType === "invalid_request_error" ||
@@ -1978,6 +2015,7 @@ export class CodexProvider extends BaseProvider {
 				break;
 			}
 
+			case "response.incomplete":
 			case "response.completed": {
 				if (state.upstreamError || state.hasSentTerminalEvents) break;
 				const resp = data.response as Record<string, unknown> | undefined;
@@ -2019,9 +2057,31 @@ export class CodexProvider extends BaseProvider {
 					state.hasSentContentBlockStart = false;
 				}
 
+				const incompleteDetails = resp?.incomplete_details as
+					| { reason?: string }
+					| undefined;
+				const isIncomplete =
+					eventName === "response.incomplete" || resp?.status === "incomplete";
+				// An incomplete response never resolves to a success stop_reason:
+				// content_filter → refusal (client discards partial output); every
+				// other reason, including unknown future ones, → max_tokens (generic
+				// truncation, mirroring real Anthropic mid-tool-input truncation
+				// semantics: partial blocks are framed, stop_reason forbids execution).
+				const stopReason: "end_turn" | "tool_use" | "max_tokens" | "refusal" =
+					isIncomplete
+						? incompleteDetails?.reason === "content_filter"
+							? "refusal"
+							: "max_tokens"
+						: state.sawToolUse
+							? "tool_use"
+							: "end_turn";
+
 				const messageDelta: {
 					type: "message_delta";
-					delta: { stop_reason: "end_turn" | "tool_use"; stop_sequence: null };
+					delta: {
+						stop_reason: "end_turn" | "tool_use" | "max_tokens" | "refusal";
+						stop_sequence: null;
+					};
 					usage: {
 						input_tokens: number;
 						output_tokens: number;
@@ -2032,7 +2092,7 @@ export class CodexProvider extends BaseProvider {
 				} = {
 					type: "message_delta",
 					delta: {
-						stop_reason: state.sawToolUse ? "tool_use" : "end_turn",
+						stop_reason: stopReason,
 						stop_sequence: null,
 					},
 					usage: {
@@ -2059,7 +2119,14 @@ export class CodexProvider extends BaseProvider {
 							cache_read_input_tokens: state.cacheReadInputTokens,
 							cache_creation_input_tokens: state.cacheCreationInputTokens,
 						},
-						messageDelta.delta.stop_reason,
+						// The trace schema's stop_reason column predates incomplete
+						// handling and only models success/error; bucket max_tokens and
+						// refusal as "error" there so the trace stays valid without
+						// widening a persisted, versioned schema for a rare terminal.
+						messageDelta.delta.stop_reason === "tool_use" ||
+							messageDelta.delta.stop_reason === "end_turn"
+							? messageDelta.delta.stop_reason
+							: "error",
 					),
 				});
 				await writeSSE("message_stop", { type: "message_stop" });
