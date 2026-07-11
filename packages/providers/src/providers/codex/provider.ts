@@ -694,12 +694,28 @@ export class CodexProvider extends BaseProvider {
 
 		codexRequest.instructions = instructions || "You are a helpful assistant.";
 		if (tools) {
-			codexRequest.tools = tools;
-			codexRequest.tool_choice = this.mapToolChoice(body.tool_choice);
+			const toolChoice = body.tool_choice;
+			if (toolChoice?.type === "tool") {
+				// The Codex wire schema cannot express a named tool choice (the
+				// official codex client types tool_choice as a plain string), so
+				// enforce the same contract by narrowing the tool list to the named
+				// tool and requiring a call.
+				const named = tools.filter((t) => t.name === toolChoice.name);
+				if (named.length === 0) {
+					throw new ValidationError(
+						`tool_choice.name "${toolChoice.name}" does not match any tool`,
+					);
+				}
+				codexRequest.tools = named;
+				codexRequest.tool_choice = "required";
+			} else {
+				codexRequest.tools = tools;
+				codexRequest.tool_choice = this.mapToolChoice(toolChoice);
+			}
 			// Anthropic semantics: parallel tool calls are allowed unless the client
 			// disabled them via tool_choice.disable_parallel_tool_use.
 			codexRequest.parallel_tool_calls =
-				body.tool_choice?.disable_parallel_tool_use !== true;
+				toolChoice?.disable_parallel_tool_use !== true;
 		}
 		if (
 			typeof body.max_tokens === "number" &&
@@ -713,21 +729,13 @@ export class CodexProvider extends BaseProvider {
 	}
 
 	private mapToolChoice(toolChoice?: AnthropicToolChoice): string {
+		// type "tool" (named forcing) is handled by the caller via tool-list
+		// narrowing; this maps the remaining string-representable choices.
 		switch (toolChoice?.type) {
 			case "any":
 				return "required";
 			case "none":
 				return "none";
-			case "tool":
-				// The general Responses API accepts {type: "function", name} here,
-				// but the official codex client only ever sends strings and the
-				// ChatGPT Codex backend's tolerance for the object form is
-				// unverified; "required" is the closest safely-representable
-				// semantic (forces some tool call, not the named one).
-				log.debug(
-					`Downgrading named tool_choice ${toolChoice.name ?? "<unnamed>"} to "required"`,
-				);
-				return "required";
 			default:
 				return "auto";
 		}
@@ -800,6 +808,7 @@ export class CodexProvider extends BaseProvider {
 			.getReader();
 		let messageStartPayload: Record<string, unknown> | null = null;
 		let messageDeltaPayload: Record<string, unknown> | null = null;
+		let errorPayload: Record<string, unknown> | null = null;
 		const content: Array<Record<string, unknown>> = [];
 		const textByIndex = new Map<number, string>();
 		const toolByIndex = new Map<
@@ -828,6 +837,10 @@ export class CodexProvider extends BaseProvider {
 				}
 				if (eventName === "message_delta") {
 					messageDeltaPayload = data;
+					return;
+				}
+				if (eventName === "error") {
+					errorPayload = data;
 					return;
 				}
 				if (eventName === "content_block_delta") {
@@ -886,6 +899,21 @@ export class CodexProvider extends BaseProvider {
 			} finally {
 				reader.releaseLock();
 			}
+		}
+
+		// Cast defeats TS narrowing to null: assignments happen inside the
+		// processLine closure, invisible to control-flow analysis here.
+		const finalError = errorPayload as Record<string, unknown> | null;
+		if (finalError && messageDeltaPayload === null) {
+			// The transformed stream errored before completing; propagate the
+			// error instead of synthesizing a successful message.
+			const headers = sanitizeResponseHeaders(response.headers);
+			headers.set("content-type", "application/json");
+			return new Response(JSON.stringify(finalError), {
+				status: 502,
+				statusText: "Bad Gateway",
+				headers,
+			});
 		}
 
 		const allIndices = new Set([...textByIndex.keys(), ...toolByIndex.keys()]);
@@ -1134,32 +1162,46 @@ export class CodexProvider extends BaseProvider {
 				// Flush any remaining
 				await ensureMessageStart();
 
-				// Complete block framing for function calls that never saw
-				// output_item.done, then close any open content block
-				await this.flushOrphanedFunctionCalls(state, writeSSE);
-				if (state.hasSentContentBlockStart) {
-					await writeSSE("content_block_stop", {
-						type: "content_block_stop",
-						index: state.contentBlockIndex,
+				if (!state.hasSentTerminalEvents && state.functionCallBlocks.size > 0) {
+					// The upstream stream ended without a terminal event while tool
+					// call arguments were still incomplete. Never finalize partial
+					// arguments as an executable tool_use: surface an error so the
+					// client treats the turn as failed and retries.
+					await writeSSE("error", {
+						type: "error",
+						error: {
+							type: "api_error",
+							message:
+								"Codex stream ended before tool call arguments completed",
+						},
 					});
-				}
+				} else {
+					// Close any open content block
+					if (state.hasSentContentBlockStart) {
+						await writeSSE("content_block_stop", {
+							type: "content_block_stop",
+							index: state.contentBlockIndex,
+						});
+					}
 
-				// Final message_delta + message_stop if upstream never sent response.completed
-				if (!state.hasSentTerminalEvents) {
-					await writeSSE("message_delta", {
-						type: "message_delta",
-						delta: {
-							stop_reason: this.resolveStopReason(state),
-							stop_sequence: null,
-						},
-						usage: {
-							input_tokens: state.inputTokens,
-							output_tokens: state.outputTokens,
-							cache_read_input_tokens: state.cacheReadInputTokens,
-							cache_creation_input_tokens: state.cacheCreationInputTokens,
-						},
-					});
-					await writeSSE("message_stop", { type: "message_stop" });
+					// Final message_delta + message_stop if upstream never sent
+					// response.completed (all observed tool calls completed here)
+					if (!state.hasSentTerminalEvents) {
+						await writeSSE("message_delta", {
+							type: "message_delta",
+							delta: {
+								stop_reason: this.resolveStopReason(state),
+								stop_sequence: null,
+							},
+							usage: {
+								input_tokens: state.inputTokens,
+								output_tokens: state.outputTokens,
+								cache_read_input_tokens: state.cacheReadInputTokens,
+								cache_creation_input_tokens: state.cacheCreationInputTokens,
+							},
+						});
+						await writeSSE("message_stop", { type: "message_stop" });
+					}
 				}
 			} catch (error) {
 				log.error("Error processing Codex SSE stream:", error);
@@ -1212,31 +1254,22 @@ export class CodexProvider extends BaseProvider {
 					const name = item?.name as string;
 
 					if (state.hasSentContentBlockStart) {
-						// If the open block is a function call still awaiting
-						// output_item.done, close it completely (buffered arguments
-						// included) so its input is not lost and terminal flushing
-						// cannot close it a second time.
-						const openFunctionCall = [
-							...state.functionCallBlocks.entries(),
-						].find(
-							([, buffer]) =>
-								buffer.contentBlockIndex === state.contentBlockIndex,
-						);
-						if (openFunctionCall) {
-							await this.closeFunctionCallBlock(
-								state,
-								writeSSE,
-								openFunctionCall[0],
-								openFunctionCall[1],
-							);
-						} else {
+						// Leave a still-open function_call block open: its own
+						// output_item.done closes it with the buffered arguments, so
+						// late deltas keyed by output_index are never lost. Only
+						// non-function-call (text) blocks are closed here, mirroring
+						// the content_part.added handler.
+						const isOpenFunctionCallBlock = [
+							...state.functionCallBlocks.values(),
+						].some((b) => b.contentBlockIndex === state.contentBlockIndex);
+						if (!isOpenFunctionCallBlock) {
 							await writeSSE("content_block_stop", {
 								type: "content_block_stop",
 								index: state.contentBlockIndex,
 							});
-							state.contentBlockIndex++;
-							state.hasSentContentBlockStart = false;
 						}
+						state.contentBlockIndex++;
+						state.hasSentContentBlockStart = false;
 					}
 
 					const blockIdx = state.contentBlockIndex;
@@ -1394,17 +1427,22 @@ export class CodexProvider extends BaseProvider {
 				const incompleteDetails = resp?.incomplete_details as
 					| { reason?: string }
 					| undefined;
-				const truncatedByMaxTokens =
-					(eventName === "response.incomplete" ||
-						resp?.status === "incomplete") &&
-					incompleteDetails?.reason === "max_output_tokens";
-				const stopReason: "end_turn" | "tool_use" | "max_tokens" =
-					truncatedByMaxTokens ? "max_tokens" : this.resolveStopReason(state);
+				const isIncomplete =
+					eventName === "response.incomplete" || resp?.status === "incomplete";
+				// max_output_tokens → max_tokens (client may retry with more budget);
+				// content_filter → refusal (client must discard partial output).
+				// Unknown incomplete reasons fall back to the observed turn shape.
+				const stopReason: "end_turn" | "tool_use" | "max_tokens" | "refusal" =
+					isIncomplete && incompleteDetails?.reason === "max_output_tokens"
+						? "max_tokens"
+						: isIncomplete && incompleteDetails?.reason === "content_filter"
+							? "refusal"
+							: this.resolveStopReason(state);
 
 				const messageDelta: {
 					type: "message_delta";
 					delta: {
-						stop_reason: "end_turn" | "tool_use" | "max_tokens";
+						stop_reason: "end_turn" | "tool_use" | "max_tokens" | "refusal";
 						stop_sequence: null;
 					};
 					usage: {

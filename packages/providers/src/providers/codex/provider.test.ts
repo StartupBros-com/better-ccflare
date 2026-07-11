@@ -956,13 +956,18 @@ describe("CodexProvider tool-call request protocol", () => {
 		expect(body.tool_choice).toBe("none");
 	});
 
-	it("downgrades named tool_choice to required", async () => {
+	it("narrows tools to the named tool and requires a call for named tool_choice", async () => {
 		const provider = new CodexProvider();
+		const otherTool = {
+			name: "other",
+			description: "other",
+			input_schema: { type: "object", properties: {} },
+		};
 		const transformed = await provider.transformRequestBody(
 			makeRequest({
 				model: "claude-3-7-sonnet",
 				max_tokens: 100,
-				tools: [searchTool],
+				tools: [searchTool, otherTool],
 				tool_choice: { type: "tool", name: "search" },
 				messages: [{ role: "user", content: "hello" }],
 			}),
@@ -970,6 +975,23 @@ describe("CodexProvider tool-call request protocol", () => {
 		const body = await transformed.json();
 
 		expect(body.tool_choice).toBe("required");
+		expect(body.tools).toHaveLength(1);
+		expect(body.tools[0].name).toBe("search");
+	});
+
+	it("rejects named tool_choice that matches no tool", async () => {
+		const provider = new CodexProvider();
+		await expect(
+			provider.transformRequestBody(
+				makeRequest({
+					model: "claude-3-7-sonnet",
+					max_tokens: 100,
+					tools: [searchTool],
+					tool_choice: { type: "tool", name: "missing" },
+					messages: [{ role: "user", content: "hello" }],
+				}),
+			),
+		).rejects.toThrow('tool_choice.name "missing" does not match any tool');
 	});
 
 	it("omits tool_choice and parallel_tool_calls when no tools are present", async () => {
@@ -1142,9 +1164,9 @@ describe("CodexProvider stop_reason protocol", () => {
 		expect(body.match(/event: message_stop/g)?.length ?? 0).toBe(1);
 	});
 
-	it("closes an open function_call block with its arguments when the next call starts", async () => {
+	it("preserves each parallel call's arguments including deltas arriving after the next call starts", async () => {
 		const provider = new CodexProvider();
-		// call_2 starts before call_1 ever receives output_item.done
+		// call_1's second argument delta arrives after call_2 has already started
 		const upstreamBody = sseBody([
 			...eventLine("response.created", {
 				response: { id: "resp_test", model: "gpt-5.4" },
@@ -1154,7 +1176,7 @@ describe("CodexProvider stop_reason protocol", () => {
 				output_index: 0,
 			}),
 			...eventLine("response.function_call_arguments.delta", {
-				delta: '{"a":1}',
+				delta: '{"a"',
 				output_index: 0,
 			}),
 			...eventLine("response.output_item.added", {
@@ -1162,8 +1184,16 @@ describe("CodexProvider stop_reason protocol", () => {
 				output_index: 1,
 			}),
 			...eventLine("response.function_call_arguments.delta", {
+				delta: ":1}",
+				output_index: 0,
+			}),
+			...eventLine("response.function_call_arguments.delta", {
 				delta: '{"b":2}',
 				output_index: 1,
+			}),
+			...eventLine("response.output_item.done", {
+				item: { type: "function_call", call_id: "call_1", name: "search" },
+				output_index: 0,
 			}),
 			...eventLine("response.output_item.done", {
 				item: { type: "function_call", call_id: "call_2", name: "search" },
@@ -1195,7 +1225,9 @@ describe("CodexProvider stop_reason protocol", () => {
 					>,
 			);
 
-		// Exactly one stop per block, arguments delivered before each stop
+		// Complete arguments for both calls, exactly one stop per block
+		expect(body).toContain('"partial_json":"{\\"a\\":1}"');
+		expect(body).toContain('"partial_json":"{\\"b\\":2}"');
 		expect(
 			events.filter((e) => e.type === "content_block_stop" && e.index === 0)
 				.length,
@@ -1204,22 +1236,137 @@ describe("CodexProvider stop_reason protocol", () => {
 			events.filter((e) => e.type === "content_block_stop" && e.index === 1)
 				.length,
 		).toBe(1);
+		// call_1's block stays open until its own output_item.done, so its stop
+		// arrives after call_2's start (same out-of-order framing as text blocks)
 		const delta0 = events.findIndex(
 			(e) => e.type === "content_block_delta" && e.index === 0,
 		);
 		const stop0 = events.findIndex(
 			(e) => e.type === "content_block_stop" && e.index === 0,
 		);
-		const start1 = events.findIndex(
-			(e) => e.type === "content_block_start" && e.index === 1,
-		);
 		expect(delta0).toBeGreaterThan(-1);
 		expect(stop0).toBeGreaterThan(delta0);
-		expect(start1).toBeGreaterThan(stop0);
-		expect(body).toContain('"partial_json":"{\\"a\\":1}"');
-		expect(body).toContain('"partial_json":"{\\"b\\":2}"');
 		const messageDelta = events.find((e) => e.type === "message_delta");
 		expect(messageDelta?.delta.stop_reason).toBe("tool_use");
+	});
+
+	it("emits an error instead of finalizing tool calls when the stream is cut mid-arguments", async () => {
+		const provider = new CodexProvider();
+		// Stream dies after a partial argument delta: no output_item.done, no terminal
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_test", model: "gpt-5.4" },
+			}),
+			...eventLine("response.output_item.added", {
+				item: { type: "function_call", call_id: "call_1", name: "search" },
+				output_index: 0,
+			}),
+			...eventLine("response.function_call_arguments.delta", {
+				delta: '{"query":"trunc',
+				output_index: 0,
+			}),
+		]);
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const body = await transformed.text();
+
+		expect(body).toContain("event: error");
+		expect(body).toContain('"type":"api_error"');
+		expect(body).not.toContain("event: message_stop");
+		expect(body).not.toContain('"input_json_delta"');
+	});
+
+	it("maps response.incomplete content_filter to stop_reason refusal", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_test", model: "gpt-5.4" },
+			}),
+			...eventLine("response.output_item.added", {
+				item: { type: "message" },
+				output_index: 0,
+			}),
+			...eventLine("response.content_part.added", {
+				part: { type: "output_text" },
+			}),
+			...eventLine("response.output_text.delta", { delta: "partial" }),
+			...eventLine("response.incomplete", {
+				response: {
+					model: "gpt-5.4",
+					status: "incomplete",
+					incomplete_details: { reason: "content_filter" },
+					usage: { input_tokens: 5, output_tokens: 3 },
+				},
+			}),
+		]);
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const payload = parseEventPayload(
+			await transformed.text(),
+			"message_delta",
+		);
+
+		expect(payload.delta.stop_reason).toBe("refusal");
+	});
+
+	it("returns an error response for non-streaming requests when the stream is cut mid-arguments", async () => {
+		const provider = new CodexProvider();
+		const requestId = "req_non_stream_cut";
+		const originalRequest = new Request("https://example.test/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"x-better-ccflare-request-id": requestId,
+			},
+			body: JSON.stringify({
+				model: "claude-sonnet-4-5",
+				max_tokens: 16,
+				stream: false,
+				tools: [searchTool],
+				messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+			}),
+		});
+		await provider.transformRequestBody(originalRequest);
+
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_cut", model: "gpt-5.4" },
+			}),
+			...eventLine("response.output_item.added", {
+				item: { type: "function_call", call_id: "call_1", name: "search" },
+				output_index: 0,
+			}),
+			...eventLine("response.function_call_arguments.delta", {
+				delta: '{"query":"trunc',
+				output_index: 0,
+			}),
+		]);
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: {
+				"content-type": "text/event-stream",
+				"x-better-ccflare-request-id": requestId,
+				"x-better-ccflare-request-stream": "false",
+			},
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		expect(transformed.status).toBe(502);
+		const payload = JSON.parse(await transformed.text()) as Record<
+			string,
+			// biome-ignore lint/suspicious/noExplicitAny: test helper
+			any
+		>;
+		expect(payload.type).toBe("error");
+		expect(payload.error.type).toBe("api_error");
 	});
 
 	it("flushes orphaned function_call blocks at response.completed", async () => {
