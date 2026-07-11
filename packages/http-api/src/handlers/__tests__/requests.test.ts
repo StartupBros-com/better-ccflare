@@ -51,6 +51,8 @@ describe("createRequestsSummaryHandler — attribution source mapping", () => {
 			"acme", // project
 			undefined, // billingType
 			undefined, // comboName
+			undefined, // originalModel
+			undefined, // appliedModel
 			"path_project", // projectAttributionSource
 			"prompt_agent", // agentAttributionSource
 		);
