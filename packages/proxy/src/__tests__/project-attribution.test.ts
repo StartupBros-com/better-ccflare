@@ -166,6 +166,51 @@ describe("extractProjectAttributionFromRequest", () => {
 		}
 	});
 
+	describe("round-2 P1 hardening: still-leaking heading shapes are rejected end-to-end (H1)", () => {
+		const cases: Array<[string, string]> = [
+			[
+				"multi-segment credential label with a letters-only opaque tail",
+				"# api-key-abcdefghijkl",
+			],
+			["16-char opaque hex/base32 token", "# deadbeefcafebabe"],
+			["dotted hostname-shaped label", "# customer.example.com"],
+			["round-1: sk_live-style secret", "# sk_live_abc123456789"],
+			["round-1: incident/customer label", "# Incident INC-123 Acme"],
+		];
+
+		for (const [label, system] of cases) {
+			it(`rejects: ${label}`, () => {
+				const headers = new Headers();
+				const result = extractProjectAttributionFromRequest(headers, {
+					system,
+				});
+				expect(result.project).toBeNull();
+				expect(result.projectAttributionSource).toBe("none");
+			});
+		}
+
+		const legit: Array<[string, string, string]> = [
+			["Harness", "# Harness\nWelcome.", "Harness"],
+			[
+				"attribution-source-tags",
+				"# attribution-source-tags\nDetails.",
+				"attribution-source-tags",
+			],
+			["My Cool Project", "# My Cool Project\nDetails.", "My Cool Project"],
+		];
+
+		for (const [label, system, expected] of legit) {
+			it(`still extracts legit slug: ${label}`, () => {
+				const headers = new Headers();
+				const result = extractProjectAttributionFromRequest(headers, {
+					system,
+				});
+				expect(result.project).toBe(expected);
+				expect(result.projectAttributionSource).toBe("heading_project");
+			});
+		}
+	});
+
 	it("rejects an H1 heading whose secret sits past the 64-char truncation boundary end-to-end", () => {
 		// Full end-to-end path (not just isLowRiskProjectSlug directly): a
 		// heading that is unambiguously rejected (UUID + >6 words) must still
@@ -278,6 +323,36 @@ describe("isLowRiskProjectSlug", () => {
 			expect(isLowRiskProjectSlug("My Project")).toBe(true);
 			expect(isLowRiskProjectSlug("attribution-source-tags")).toBe(true);
 			expect(isLowRiskProjectSlug("my-really-long-project-name")).toBe(true);
+		});
+	});
+
+	describe("round-2 P1 hardening: dotted hostnames, opaque tokens, credential labels", () => {
+		it("rejects dotted hostname-shaped labels", () => {
+			expect(isLowRiskProjectSlug("customer.example.com")).toBe(false);
+			expect(isLowRiskProjectSlug("*.example.com")).toBe(false);
+			expect(isLowRiskProjectSlug("foo.bar")).toBe(false);
+		});
+
+		it("rejects a 16-char opaque hex/base32-shaped token below the 20-char LONG_TOKEN_RE floor", () => {
+			expect(isLowRiskProjectSlug("deadbeefcafebabe")).toBe(false);
+		});
+
+		it("rejects a 16+ char opaque alnum token that mixes letters and digits", () => {
+			expect(isLowRiskProjectSlug("aB3dE7gH9jK1mN5p")).toBe(false);
+		});
+
+		it("rejects a credential-labeled value with a letters-only opaque tail", () => {
+			expect(isLowRiskProjectSlug("api-key-abcdefghijkl")).toBe(false);
+			expect(isLowRiskProjectSlug("apikey-abcdefghijkl")).toBe(false);
+			expect(isLowRiskProjectSlug("access-key-abcdefghijkl")).toBe(false);
+			expect(isLowRiskProjectSlug("password-abcdefghijkl")).toBe(false);
+		});
+
+		it("does not over-reject legit slugs (no embedded dots, no 16+ char single segment)", () => {
+			expect(isLowRiskProjectSlug("Harness")).toBe(true);
+			expect(isLowRiskProjectSlug("attribution-source-tags")).toBe(true);
+			expect(isLowRiskProjectSlug("My Cool Project")).toBe(true);
+			expect(isLowRiskProjectSlug("better-ccflare")).toBe(true);
 		});
 	});
 

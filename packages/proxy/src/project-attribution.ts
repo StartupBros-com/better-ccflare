@@ -114,6 +114,32 @@ const INCIDENT_LABEL_RE =
 	/\b(?:incident|inc|ticket|case|customer|acct|account)\b[-\s]?[A-Za-z0-9-]+/i;
 // Jira-style ticket keys (PROJ-123) and explicit INC-### shapes.
 const JIRA_TICKET_RE = /\b[A-Z]{2,}-\d+\b/;
+// Dotted hostname-shaped label: an alphanumeric on both sides of a `.`, e.g.
+// "customer.example.com" or "*.example.com" (via the "example.com" tail) or
+// even a bare "foo.bar". Real project slugs don't need embedded dots between
+// alnum runs, and this shape is exactly how hostnames/domains look, so it's
+// rejected wholesale rather than only when a known TLD/scheme is present.
+const DOTTED_HOSTNAME_LABEL_RE = /[A-Za-z0-9]\.[A-Za-z0-9]/;
+// Opaque hex-shaped token: 16+ chars drawn only from [0-9a-f] (case-insensitive)
+// with no separators — the shape of a hex-encoded id/hash/secret (e.g.
+// "deadbeefcafebabe"). Below LONG_TOKEN_RE's 20-char general threshold, so it
+// needs its own narrower rule restricted to the hex alphabet.
+const HEX_OPAQUE_TOKEN_RE = /\b[0-9a-fA-F]{16,}\b/;
+// Opaque base32/base64-ish token: 16+ unbroken alnum chars that mix letters
+// AND digits — the shape of a random/opaque id (session id, API key body,
+// etc.) rather than an ordinary English word. Requiring a digit keeps this
+// from flagging long single-word slugs ("documentation-site" segments stay
+// short anyway; a hypothetical all-letter 16+ char word is still let through).
+const OPAQUE_MIXED_TOKEN_RE =
+	/\b(?=[A-Za-z0-9]*[0-9])(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]{16,}\b/;
+// Credential-label prefix ("api-key-", "apikey", "access-key", "secret-key",
+// "auth-token", "password", "credential(s)") followed by an opaque-looking
+// tail. Catches shapes like "api-key-abcdefghijkl" that dodge
+// MULTI_SEGMENT_TOKEN_RE because the tail is letters-only (no digit), by
+// keying off the credential-shaped label itself rather than the tail's
+// character class.
+const CREDENTIAL_LABEL_RE =
+	/\b(?:api[-_ ]?key|apikey|access[-_ ]?key|secret[-_ ]?key|auth[-_ ]?token|api[-_ ]?token|password|credentials?)\b[-_\s]?[A-Za-z0-9]{6,}/i;
 // Allowed low-risk project-slug shape: starts with a word char or dot, then
 // word chars, dots, spaces, or dashes, capped at 64 chars. Slashes and colons
 // are intentionally excluded — they enable path, URI, host:port, and drive-letter
@@ -121,15 +147,19 @@ const JIRA_TICKET_RE = /\b[A-Z]{2,}-\d+\b/;
 const SLUG_SHAPE_RE = /^[\w.][\w .-]{0,63}$/;
 
 /**
- * Conservative validator for heading-derived project labels (R10a).
+ * Conservative validator for heading-derived project labels (R10a, hardened
+ * round-2 per P1 review: reject-when-in-doubt rather than denylist
+ * whack-a-mole).
  *
  * Validates the FULL cleaned heading (control-stripped, trimmed, but NEVER
  * length-capped) so a secret positioned near the 64-char truncation boundary
  * cannot be shortened below a detector threshold and slip through. Rejects
  * values that look like they could carry a secret, a raw trace/UUID id, a URL
- * or URI scheme, an absolute/drive/traversal path, an email address, a
- * multi-segment API-key/token shape, a customer/incident/ticket label, or
- * free-form sentence/incident text. Accepts ordinary repo-name-shaped labels
+ * or URI scheme, a dotted hostname-shaped label, an absolute/drive/traversal
+ * path, an email address, a multi-segment API-key/token shape, an opaque
+ * hex/base32/base64-ish token (16+ chars), a credential-labeled value
+ * ("api-key-..."), a customer/incident/ticket label, or free-form
+ * sentence/incident text. Accepts ordinary repo-name-shaped labels
  * (e.g. "better-ccflare", "Harness", "eval-suite", "My Project").
  */
 export function isLowRiskProjectSlug(value: string): boolean {
@@ -163,15 +193,23 @@ export function isLowRiskProjectSlug(value: string): boolean {
 	// Raw trace / UUID identifiers.
 	if (UUID_RE.test(cleaned)) return false;
 
+	// Dotted hostname-shaped labels (customer.example.com, foo.bar, ...) —
+	// reject before the slug check even though dots are otherwise slug-legal,
+	// since this exact shape is how a hostname/domain reads.
+	if (DOTTED_HOSTNAME_LABEL_RE.test(cleaned)) return false;
+
 	// Secrets, keys, IPs, and high-entropy tokens.
 	if (
 		SECRET_TOKEN_RE.test(cleaned) ||
 		KNOWN_SECRET_PREFIX_RE.test(cleaned) ||
 		MULTI_SEGMENT_TOKEN_RE.test(cleaned) ||
+		CREDENTIAL_LABEL_RE.test(cleaned) ||
 		lower.includes("bearer ") ||
 		AWS_KEY_RE.test(cleaned) ||
 		IPV4_RE.test(cleaned) ||
-		LONG_TOKEN_RE.test(cleaned)
+		LONG_TOKEN_RE.test(cleaned) ||
+		HEX_OPAQUE_TOKEN_RE.test(cleaned) ||
+		OPAQUE_MIXED_TOKEN_RE.test(cleaned)
 	) {
 		return false;
 	}
