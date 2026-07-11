@@ -695,6 +695,16 @@ export class CodexProvider extends BaseProvider {
 		};
 
 		codexRequest.instructions = instructions || "You are a helpful assistant.";
+		if (
+			(body.tool_choice?.type === "any" || body.tool_choice?.type === "tool") &&
+			!tools
+		) {
+			// Mirrors the Anthropic API: a forcing tool_choice without tools is an
+			// impossible contract, not something to silently drop.
+			throw new ValidationError(
+				`tool_choice type "${body.tool_choice.type}" requires a non-empty tools array`,
+			);
+		}
 		if (tools) {
 			const toolChoice = body.tool_choice;
 			if (toolChoice?.type === "tool") {
@@ -741,6 +751,27 @@ export class CodexProvider extends BaseProvider {
 			default:
 				return "auto";
 		}
+	}
+
+	/**
+	 * Normalize an upstream Codex failure into an Anthropic error payload.
+	 * Preserving the class matters: the SSE rate-limit sniffer and the guard
+	 * key off rate_limit_error/overloaded_error strings, and non-streaming
+	 * clients derive retry behavior from the mapped HTTP status.
+	 */
+	private mapUpstreamError(
+		code: string | undefined,
+		message: string | undefined,
+	): { type: string; message: string } {
+		const normalized = (code ?? "").toLowerCase();
+		const type = normalized.includes("rate_limit")
+			? "rate_limit_error"
+			: normalized.includes("overloaded")
+				? "overloaded_error"
+				: normalized.includes("invalid")
+					? "invalid_request_error"
+					: "api_error";
+		return { type, message: message ?? "Codex upstream error" };
 	}
 
 	private resolveStopReason(state: StreamState): "tool_use" | "end_turn" {
@@ -930,12 +961,22 @@ export class CodexProvider extends BaseProvider {
 		const finalError = errorPayload as Record<string, unknown> | null;
 		if (finalError && messageDeltaPayload === null) {
 			// The transformed stream errored before completing; propagate the
-			// error instead of synthesizing a successful message.
+			// error instead of synthesizing a successful message, with the HTTP
+			// status derived from the normalized error class.
+			const errorType = (finalError.error as Record<string, unknown> | null)
+				?.type;
+			const status =
+				errorType === "rate_limit_error"
+					? 429
+					: errorType === "invalid_request_error"
+						? 400
+						: errorType === "overloaded_error"
+							? 529
+							: 502;
 			const headers = sanitizeResponseHeaders(response.headers);
 			headers.set("content-type", "application/json");
 			return new Response(JSON.stringify(finalError), {
-				status: 502,
-				statusText: "Bad Gateway",
+				status,
 				headers,
 			});
 		}
@@ -1368,6 +1409,20 @@ export class CodexProvider extends BaseProvider {
 				break;
 			}
 
+			case "error": {
+				// Standard Responses streaming error event: terminal for the turn
+				await ensureMessageStart();
+				await writeSSE("error", {
+					type: "error",
+					error: this.mapUpstreamError(
+						data.code as string | undefined,
+						data.message as string | undefined,
+					),
+				});
+				state.hasSentTerminalEvents = true;
+				break;
+			}
+
 			case "response.failed": {
 				const resp = data.response as Record<string, unknown> | undefined;
 				const upstreamError = resp?.error as
@@ -1376,10 +1431,10 @@ export class CodexProvider extends BaseProvider {
 				await ensureMessageStart();
 				await writeSSE("error", {
 					type: "error",
-					error: {
-						type: "api_error",
-						message: upstreamError?.message ?? "Codex reported response.failed",
-					},
+					error: this.mapUpstreamError(
+						upstreamError?.code,
+						upstreamError?.message ?? "Codex reported response.failed",
+					),
 				});
 				state.hasSentTerminalEvents = true;
 				break;

@@ -660,6 +660,79 @@ describe("CodexProvider.processResponse", () => {
 		expect(transformedBody).not.toContain("event: message_stop");
 	});
 
+	it("normalizes upstream error events preserving the failure class", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_test", model: "gpt-5.4" },
+			}),
+			...eventLine("error", {
+				type: "error",
+				code: "rate_limit_exceeded",
+				message: "slow down",
+			}),
+		]);
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const body = await transformed.text();
+
+		expect(body).toContain('"type":"rate_limit_error"');
+		expect(body).toContain("slow down");
+		expect(body.match(/event: error/g)?.length ?? 0).toBe(1);
+		expect(body).not.toContain("event: message_stop");
+	});
+
+	it("maps upstream error class to HTTP status for non-streaming clients", async () => {
+		const provider = new CodexProvider();
+		const requestId = "req_non_stream_rate_limit";
+		const originalRequest = new Request("https://example.test/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"x-better-ccflare-request-id": requestId,
+			},
+			body: JSON.stringify({
+				model: "claude-sonnet-4-5",
+				max_tokens: 16,
+				stream: false,
+				messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+			}),
+		});
+		await provider.transformRequestBody(originalRequest);
+
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_test", model: "gpt-5.4" },
+			}),
+			...eventLine("error", {
+				type: "error",
+				code: "rate_limit_exceeded",
+				message: "slow down",
+			}),
+		]);
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: {
+				"content-type": "text/event-stream",
+				"x-better-ccflare-request-id": requestId,
+				"x-better-ccflare-request-stream": "false",
+			},
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		expect(transformed.status).toBe(429);
+		const payload = JSON.parse(await transformed.text()) as Record<
+			string,
+			// biome-ignore lint/suspicious/noExplicitAny: test helper
+			any
+		>;
+		expect(payload.error.type).toBe("rate_limit_error");
+	});
+
 	it("surfaces response.failed as an SSE error with the upstream message", async () => {
 		const provider = new CodexProvider();
 		const upstreamBody = sseBody([
@@ -1030,6 +1103,23 @@ describe("CodexProvider tool-call request protocol", () => {
 		expect(body.tool_choice).toBe("required");
 		expect(body.tools).toHaveLength(1);
 		expect(body.tools[0].name).toBe("search");
+	});
+
+	it("rejects forcing tool_choice without tools", async () => {
+		const provider = new CodexProvider();
+		await expect(
+			provider.transformRequestBody(
+				makeRequest({
+					model: "claude-3-7-sonnet",
+					max_tokens: 100,
+					tools: [],
+					tool_choice: { type: "any" },
+					messages: [{ role: "user", content: "hello" }],
+				}),
+			),
+		).rejects.toThrow(
+			'tool_choice type "any" requires a non-empty tools array',
+		);
 	});
 
 	it("rejects named tool_choice that matches no tool", async () => {
