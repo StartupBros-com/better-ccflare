@@ -14,6 +14,7 @@ import type { ProxyContext } from "./handlers";
 import { applyRateLimitCooldown } from "./handlers/rate-limit-cooldown";
 import { createSseRateLimitSniffer } from "./handlers/sse-rate-limit-sniffer";
 import { ingestModelsListing } from "./model-catalog";
+import { clearSession, recordServedAccount } from "./session-account-observer";
 import { combineChunks, teeStream } from "./stream-tee";
 import { getUsageCollector } from "./usage-collector";
 import {
@@ -141,6 +142,24 @@ export async function forwardToClient(
 		originalModel,
 		appliedModel,
 	} = options;
+
+	// Record which account actually served this session's request, keyed on the
+	// Claude Code session id header, for the status-line account badge (R1, R2).
+	// This is the single success point where the definitive serving account and
+	// the original request headers are both in scope, after force-routing and the
+	// failover loop settled (KTD-1). Synchronous and in-memory so the status-line
+	// read never races the async usage collector. When this is the unauthenticated
+	// passthrough (account === null), no account served the request, so clear any
+	// stale association instead of recording one (KTD-5). Headers.get is
+	// case-insensitive and the header is not stripped from the live request.
+	const servedSessionId = requestHeaders.get("x-claude-code-session-id");
+	if (servedSessionId) {
+		if (account) {
+			recordServedAccount(servedSessionId, account.id);
+		} else {
+			clearSession(servedSessionId);
+		}
+	}
 
 	// Always strip compression headers *before* we do anything else
 	const response = withSanitizedProxyHeaders(responseRaw);

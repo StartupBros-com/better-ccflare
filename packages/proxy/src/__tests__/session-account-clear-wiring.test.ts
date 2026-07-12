@@ -1,0 +1,216 @@
+import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { usageCache } from "@better-ccflare/providers";
+import type { Account } from "@better-ccflare/types";
+import type { ProxyContext } from "../handlers";
+import { handleProxy } from "../proxy";
+import {
+	clearSession,
+	getServedAccount,
+	recordServedAccount,
+} from "../session-account-observer";
+
+/**
+ * KTD-5 wiring: every handleProxy exit that finishes with NO serving account
+ * must clear the session→account association, so the status-line badge degrades
+ * to unknown instead of showing the last healthy account. These drive
+ * handleProxy into representative no-account-served exits with the
+ * X-Claude-Code-Session-Id header present and assert a previously recorded
+ * entry is gone afterward (verifies the wiring, not just the observer module).
+ */
+
+const SESSION_ID = "clear-wiring-session";
+
+function makeAccount(overrides: Partial<Account> = {}): Account {
+	return {
+		id: "acc-1",
+		name: "codex-primary",
+		provider: "codex",
+		api_key: null,
+		refresh_token: "refresh-token",
+		access_token: "access-token",
+		expires_at: Date.now() + 60 * 60 * 1000,
+		request_count: 0,
+		total_requests: 0,
+		last_used: null,
+		created_at: Date.now(),
+		rate_limited_until: null,
+		rate_limited_reason: null,
+		rate_limited_at: null,
+		session_start: null,
+		session_request_count: 0,
+		paused: false,
+		rate_limit_reset: null,
+		rate_limit_status: null,
+		rate_limit_remaining: null,
+		priority: 0,
+		auto_fallback_enabled: false,
+		auto_refresh_enabled: false,
+		auto_pause_on_overage_enabled: false,
+		peak_hours_pause_enabled: false,
+		custom_endpoint: null,
+		model_mappings: null,
+		cross_region_mode: null,
+		model_fallbacks: null,
+		billing_type: null,
+		pause_reason: null,
+		refresh_token_issued_at: null,
+		consecutive_rate_limits: 0,
+		...overrides,
+	};
+}
+
+function makeContext(
+	accounts: Account[],
+	overrides: {
+		throttling?: boolean;
+		providerName?: string;
+	} = {},
+): ProxyContext {
+	return {
+		strategy: {
+			select: (accs: Account[]) => {
+				const now = Date.now();
+				return accs.filter(
+					(acc) =>
+						!acc.paused &&
+						(!acc.rate_limited_until || acc.rate_limited_until <= now),
+				);
+			},
+		} as never,
+		dbOps: {
+			getAllAccounts: mock(async () => accounts),
+			getActiveComboForFamily: mock(async () => null),
+		} as never,
+		runtime: { port: 8080, clientId: "test" } as never,
+		config: {
+			getUsageThrottlingFiveHourEnabled: () => overrides.throttling ?? false,
+			getUsageThrottlingWeeklyEnabled: () => overrides.throttling ?? false,
+			getSystemPromptCacheTtl1h: () => false,
+			getAgentFrontmatterModelFallback: () => false,
+		} as never,
+		provider: {
+			name: overrides.providerName ?? "codex",
+			canHandle: () => true,
+		} as never,
+		refreshInFlight: new Map(),
+		asyncWriter: { enqueue: mock(() => {}) } as never,
+	};
+}
+
+function makeRequest(extraHeaders: Record<string, string> = {}): Request {
+	return new Request("https://proxy.local/v1/messages", {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json",
+			"X-Claude-Code-Session-Id": SESSION_ID,
+			...extraHeaders,
+		},
+		body: JSON.stringify({
+			model: "claude-sonnet-4-5",
+			messages: [{ role: "user", content: "hello" }],
+			max_tokens: 16,
+		}),
+	});
+}
+
+let savedPassthrough: string | undefined;
+
+beforeEach(() => {
+	savedPassthrough = process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
+	delete process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
+	// Seed a stale association so each exit has something to clear.
+	recordServedAccount(SESSION_ID, "stale-account");
+});
+
+afterEach(() => {
+	clearSession(SESSION_ID);
+	usageCache.delete("acc-throttled");
+	if (savedPassthrough === undefined) {
+		delete process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
+	} else {
+		process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL = savedPassthrough;
+	}
+});
+
+describe("KTD-5: clearSession on no-account-served exits", () => {
+	it("clears on the no-accounts 503 pool-exhausted exit", async () => {
+		expect(getServedAccount(SESSION_ID)).toBe("stale-account");
+
+		const response = await handleProxy(
+			makeRequest(),
+			new URL("https://proxy.local/v1/messages"),
+			makeContext([]),
+		);
+
+		expect(response.status).toBe(503);
+		expect(getServedAccount(SESSION_ID)).toBeUndefined();
+	});
+
+	it("clears on the usage-throttled early return", async () => {
+		const account = makeAccount({
+			id: "acc-throttled",
+			access_token: "access-token",
+			expires_at: Date.now() + 60_000,
+		});
+		const now = Date.UTC(2026, 3, 28, 12, 0, 0);
+		const resetAt = new Date(now + 2 * 60 * 60 * 1000).toISOString();
+		usageCache.set(account.id, {
+			five_hour: { utilization: 80, resets_at: resetAt },
+			seven_day: { utilization: 10, resets_at: null },
+		});
+
+		const realDateNow = Date.now;
+		Date.now = () => now;
+		try {
+			expect(getServedAccount(SESSION_ID)).toBe("stale-account");
+
+			const response = await handleProxy(
+				makeRequest(),
+				new URL("https://proxy.local/v1/messages"),
+				makeContext([account], { throttling: true }),
+			);
+
+			expect(response.status).toBe(529);
+			expect(getServedAccount(SESSION_ID)).toBeUndefined();
+		} finally {
+			Date.now = realDateNow;
+		}
+	});
+
+	it("clears on the all-candidates-failed ServiceUnavailableError throw", async () => {
+		// Force-route to an account whose provider is unregistered, so
+		// proxyWithAccount falls back to the minimal stub ctx.provider and throws
+		// inside prepareHeaders (no network) — every candidate fails, driving the
+		// post-loop generic throw. refresh_token is null so the reauth branch is
+		// skipped and the generic throw fires.
+		const account = makeAccount({
+			id: "acc-force",
+			provider: "test-unregistered-provider",
+			// Falsy refresh_token so the reauth branch is skipped and the generic
+			// ServiceUnavailableError throw fires instead.
+			refresh_token: "",
+			api_key: null,
+			access_token: "access-token",
+			expires_at: Date.now() + 60 * 60 * 1000,
+		});
+		const ctx = makeContext([account], {
+			providerName: "test-unregistered-provider",
+		});
+
+		expect(getServedAccount(SESSION_ID)).toBe("stale-account");
+
+		let threw = false;
+		try {
+			await handleProxy(
+				makeRequest({ "x-better-ccflare-account-id": account.id }),
+				new URL("https://proxy.local/v1/messages"),
+				ctx,
+			);
+		} catch {
+			threw = true;
+		}
+
+		expect(threw).toBe(true);
+		expect(getServedAccount(SESSION_ID)).toBeUndefined();
+	});
+});

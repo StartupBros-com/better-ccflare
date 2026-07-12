@@ -148,6 +148,15 @@ export class AuthService {
 			return true;
 		}
 
+		// Session→account lookup for the local status-line badge. The caller is a
+		// local status-line script with no credential store, and the payload is
+		// coarse operational state (account name + usage/health) with no secrets
+		// (KTD-3). Prefix match because the path carries a dynamic session-id
+		// segment, mirroring the /api/oauth exemption above.
+		if (path.startsWith("/api/sessions/")) {
+			return true;
+		}
+
 		// All other paths are dashboard routes (client-side routing) or static assets
 		// These should be exempt to allow serving the dashboard HTML and assets
 		// This matches the server logic that serves index.html for non-API routes

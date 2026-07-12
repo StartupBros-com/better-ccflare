@@ -184,6 +184,70 @@ curl http://localhost:8080/api/accounts
 
 ---
 
+### Session Account
+
+#### GET /api/sessions/:sessionId/account
+
+Return the better-ccflare account that most recently served a given Claude Code
+session, along with its usage-toward-limit and rate-limit/paused/throttled state.
+This is the read endpoint the local status-line script polls to render a per-chat
+account badge.
+
+`sessionId` is the value of the `X-Claude-Code-Session-Id` request header that
+Claude Code sends (CLI ≥ v2.1.86), which is the same `session_id` the status line
+receives on stdin. The proxy records the serving account per session in memory as
+requests flow through; the association is short-lived (5h TTL) and is not
+persisted to the database.
+
+This endpoint is **exempt from API-key authentication**: the caller is a local
+status-line script with no credential store, and the payload is coarse
+operational state (account name plus usage/health) with no secrets.
+
+**Response — known session (200):**
+```json
+{
+  "success": true,
+  "data": {
+    "status": "known",
+    "account": {
+      "id": "uuid-here",
+      "name": "account1",
+      "provider": "anthropic",
+      "paused": false,
+      "usageUtilization": 42,
+      "usageWindow": "five_hour",
+      "usageResetMs": 1765000000000,
+      "rateLimitStatus": "OK",
+      "rateLimitedUntil": null,
+      "rateLimitReset": null,
+      "usageThrottledUntil": null,
+      "usageThrottledWindows": []
+    }
+  }
+}
+```
+
+**Response — unknown session (200):**
+```json
+{
+  "success": true,
+  "data": { "status": "unknown" }
+}
+```
+
+`status` is `"unknown"` when no association exists for the session id (a fresh
+chat that has issued no request, a proxy restart that cleared the in-memory map,
+a client that sends no session header, or a mapping that points at a
+since-deleted account). It is never an error shape, so a caller can parse a
+single response shape. An empty or whitespace session id segment returns `400`.
+
+**Example:**
+```bash
+curl http://localhost:8080/api/sessions/abc123-session-id/account
+```
+
+---
+
 ### OAuth Flow
 
 #### POST /api/oauth/init

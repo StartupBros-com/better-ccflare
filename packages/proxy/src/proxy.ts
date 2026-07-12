@@ -35,6 +35,7 @@ import {
 	validateProviderPath,
 } from "./handlers";
 import { extractProjectAttributionFromRequest } from "./project-attribution";
+import { clearSession } from "./session-account-observer";
 import {
 	buildSessionRejectResponse,
 	recordSessionRequest,
@@ -115,6 +116,13 @@ export async function handleProxy(
 
 	// 1. Track client version from user-agent for use in auto-refresh
 	trackClientVersion(req.headers.get("user-agent"));
+
+	// Claude Code session id (sent since CLI v2.1.86) used to correlate this
+	// chat with its serving account for the status-line badge. Read once here so
+	// every no-account-served exit below can clear the association, degrading the
+	// badge to unknown instead of showing the last healthy account (KTD-5). The
+	// success path records the account in forwardToClient (KTD-1).
+	const sessionId = req.headers.get("x-claude-code-session-id");
 
 	// 2. Validate provider can handle path
 	validateProviderPath(ctx.provider, url.pathname);
@@ -316,6 +324,8 @@ export async function handleProxy(
 	// 7. Handle no accounts case
 	if (accounts.length === 0) {
 		if (throttledAccounts.length > 0) {
+			// No account served this request — degrade the badge to unknown (KTD-5).
+			if (sessionId) clearSession(sessionId);
 			return finishPacing(
 				pacingSlot,
 				createUsageThrottledResponse(throttledAccounts),
@@ -410,6 +420,8 @@ export async function handleProxy(
 				});
 		}
 
+		// Pool exhausted, no account served — degrade the badge to unknown (KTD-5).
+		if (sessionId) clearSession(sessionId);
 		return finishPacing(pacingSlot, poolExhaustedResponse);
 	}
 
@@ -531,6 +543,8 @@ export async function handleProxy(
 			}
 		} else if (throttledFallbackAccounts.length > 0) {
 			cacheBodyStore.discardStaged(requestMeta.id);
+			// Combo fallback throttled, no account served — badge unknown (KTD-5).
+			if (sessionId) clearSession(sessionId);
 			return finishPacing(
 				pacingSlot,
 				createUsageThrottledResponse(throttledFallbackAccounts),
@@ -557,6 +571,8 @@ export async function handleProxy(
 			.join("\n  ");
 		cacheBodyStore.discardStaged(requestMeta.id);
 		pacingSlot?.abandon();
+		// All candidates failed, no account served — degrade the badge (KTD-5).
+		if (sessionId) clearSession(sessionId);
 		throw new ServiceUnavailableError(
 			`All accounts failed to proxy the request. OAuth tokens have expired for accounts: ${needsReauth.map((acc) => acc.name).join(", ")}.\n\nPlease re-authenticate:\n  ${reauthCommands}`,
 			ctx.provider.name,
@@ -565,6 +581,8 @@ export async function handleProxy(
 
 	cacheBodyStore.discardStaged(requestMeta.id);
 	pacingSlot?.abandon();
+	// All candidates failed, no account served — degrade the badge (KTD-5).
+	if (sessionId) clearSession(sessionId);
 	throw new ServiceUnavailableError(
 		`${ERROR_MESSAGES.ALL_ACCOUNTS_FAILED} (${allAttemptedAccounts.length} attempted)`,
 		ctx.provider.name,
