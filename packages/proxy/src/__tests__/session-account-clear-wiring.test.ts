@@ -118,8 +118,9 @@ let savedPassthrough: string | undefined;
 beforeEach(() => {
 	savedPassthrough = process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
 	delete process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
-	// Seed a stale association so each exit has something to clear.
-	recordServedAccount(SESSION_ID, "stale-account");
+	// Seed a stale association (from an OLDER request, version 1) so each exit's
+	// clear — stamped with the current request's later timestamp — supersedes it.
+	recordServedAccount(SESSION_ID, "stale-account", 1);
 });
 
 afterEach(() => {
@@ -197,6 +198,23 @@ describe("KTD-5: clearSession on no-account-served exits", () => {
 		}
 
 		expect(getServedAccount(SESSION_ID)).toBeUndefined();
+	});
+
+	it("does NOT clear on a failed cache-keepalive replay carrying the session header", async () => {
+		// A keepalive replay carries the original client's session id; when it fails
+		// (empty pool here), it reaches a clear exit — but the synthetic-traffic
+		// guard must prevent it from wiping the active session's real mapping.
+		recordServedAccount(SESSION_ID, "healthy-account", 100);
+		expect(getServedAccount(SESSION_ID)).toBe("healthy-account");
+
+		await handleProxy(
+			makeRequest({ "x-better-ccflare-keepalive": "true" }),
+			new URL("https://proxy.local/v1/messages"),
+			makeContext([]),
+		);
+
+		// Still mapped — the keepalive failure did not clear it.
+		expect(getServedAccount(SESSION_ID)).toBe("healthy-account");
 	});
 
 	it("clears on the all-candidates-failed ServiceUnavailableError throw", async () => {

@@ -7,7 +7,7 @@ import {
 } from "@better-ccflare/http-common";
 import {
 	type AnyUsageData,
-	getRepresentativeUtilizationForProvider,
+	getRepresentativeUtilizationForDisplay,
 	getRepresentativeWindowForProvider,
 	usageCache,
 } from "@better-ccflare/providers";
@@ -110,13 +110,15 @@ export function createSessionAccountHandler(
 		let usageWindow: string | null = null;
 		let usageResetMs: number | null = null;
 		if (usageData) {
-			usageUtilization = getRepresentativeUtilizationForProvider(
+			// Utilization, window, and reset must all describe the SAME quota, so
+			// use the display-paired dispatchers (not the routing-side
+			// getRepresentativeUtilizationForProvider, which selects a different
+			// window set). This mirrors the accounts-list display and keeps the
+			// badge's percentage, window label, and reset countdown consistent.
+			usageUtilization = getRepresentativeUtilizationForDisplay(
 				usageData as AnyUsageData,
 				provider,
 			);
-			// Provider-aware window label so non-anthropic providers (zai, nanogpt,
-			// kilo, alibaba-coding-plan, xai) don't silently resolve to a null window
-			// while their utilization is known.
 			usageWindow = getRepresentativeWindowForProvider(
 				usageData as AnyUsageData,
 				provider,

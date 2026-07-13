@@ -15,6 +15,22 @@ export interface AuthenticationResult {
 	error?: string;
 }
 
+/**
+ * Exact shape of the status-line read route `GET /api/sessions/:id/account`:
+ * five segments, `/api/sessions/<id>/account`. Kept identical to the router's
+ * own match so the auth exemption never covers a path the router won't serve
+ * (which would otherwise fall through to the upstream proxy).
+ */
+function isSessionAccountPath(path: string): boolean {
+	const parts = path.split("/");
+	return (
+		parts.length === 5 &&
+		parts[1] === "api" &&
+		parts[2] === "sessions" &&
+		parts[4] === "account"
+	);
+}
+
 export class AuthService {
 	private crypto: NodeCryptoUtils;
 	private dbOps: DatabaseOperations;
@@ -130,7 +146,7 @@ export class AuthService {
 	 * Check if a path is statically exempt from authentication
 	 * (does not require async DB check)
 	 */
-	isStaticPathExempt(path: string): boolean {
+	isStaticPathExempt(path: string, method?: string): boolean {
 		// Health endpoint is always exempt
 		if (path === "/health") {
 			return true;
@@ -151,12 +167,17 @@ export class AuthService {
 		// Session→account lookup for the local status-line badge. The caller is a
 		// local status-line script with no credential store, and the payload is
 		// coarse operational state (account name + usage/health) with no secrets
-		// (KTD-3). Scoped to the exact `/account` read route (mirroring the
-		// router's own `endsWith("/account")` match) so a future write endpoint
-		// under `/api/sessions/` — e.g. the deferred manual-pinning feature — does
-		// NOT silently inherit this unauthenticated exemption and must make its own
-		// explicit auth decision.
-		if (path.startsWith("/api/sessions/") && path.endsWith("/account")) {
+		// (KTD-3). Scoped to EXACTLY `GET /api/sessions/:id/account` — the same
+		// method and 5-segment shape the router matches. This is load-bearing: an
+		// exemption broader than its route (e.g. a POST, or extra path segments)
+		// would pass auth here, fail to match any API route, and then fall through
+		// to the upstream proxy — letting an unauthenticated caller drive a
+		// configured account. A future write endpoint under /api/sessions/ must
+		// make its own explicit auth decision.
+		if (
+			(method === undefined || method === "GET") &&
+			isSessionAccountPath(path)
+		) {
 			return true;
 		}
 
@@ -178,8 +199,9 @@ export class AuthService {
 	 * Check if a path should be exempt from authentication
 	 */
 	async isPathExempt(path: string, method: string): Promise<boolean> {
-		// Static exemptions first (no DB hit)
-		if (this.isStaticPathExempt(path)) {
+		// Static exemptions first (no DB hit). Method matters: the session-account
+		// exemption is GET-only so a non-GET request can't be exempt-but-unmatched.
+		if (this.isStaticPathExempt(path, method)) {
 			return true;
 		}
 

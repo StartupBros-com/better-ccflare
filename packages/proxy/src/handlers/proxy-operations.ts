@@ -21,6 +21,10 @@ import type {
 import { cacheBodyStore } from "../cache-body-store";
 import { RequestBodyContext } from "../request-body-context";
 import { forwardToClient } from "../response-handler";
+import {
+	recordServedAccount,
+	sessionIdForObservation,
+} from "../session-account-observer";
 import { isModelRewrite } from "../worker-messages";
 import { ERROR_MESSAGES, type ProxyContext } from "./proxy-types";
 import { applyRateLimitCooldown } from "./rate-limit-cooldown";
@@ -902,6 +906,20 @@ export async function proxyWithAccount(
 					// first: Bun's fetch already decompressed the body, so leaving the
 					// upstream `content-encoding: gzip` header makes the client try to
 					// gunzip plaintext → "Decompression error: ZlibError".
+					//
+					// This is a final account-backed response returned OUTSIDE
+					// forwardToClient, so record the serving account for the status-line
+					// badge here too — otherwise a force-routed request that ends in
+					// model-not-found leaves the badge showing a previously-served
+					// account (skips synthetic keepalive/auto-refresh traffic).
+					const observedSessionId = sessionIdForObservation(req.headers);
+					if (observedSessionId) {
+						recordServedAccount(
+							observedSessionId,
+							account.id,
+							requestMeta.timestamp,
+						);
+					}
 					return withSanitizedProxyHeaders(rawResponse);
 				}
 

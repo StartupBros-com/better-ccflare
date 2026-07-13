@@ -14,7 +14,11 @@ import type { ProxyContext } from "./handlers";
 import { applyRateLimitCooldown } from "./handlers/rate-limit-cooldown";
 import { createSseRateLimitSniffer } from "./handlers/sse-rate-limit-sniffer";
 import { ingestModelsListing } from "./model-catalog";
-import { clearSession, recordServedAccount } from "./session-account-observer";
+import {
+	clearSession,
+	recordServedAccount,
+	sessionIdForObservation,
+} from "./session-account-observer";
 import { combineChunks, teeStream } from "./stream-tee";
 import { getUsageCollector } from "./usage-collector";
 import {
@@ -153,24 +157,17 @@ export async function forwardToClient(
 	// stale association instead of recording one (KTD-5). Headers.get is
 	// case-insensitive and the header is not stripped from the live request.
 	//
-	// Skip synthetic internal traffic. Cache-keepalive REPLAYS the original client
-	// request (session id and all — cache-body-store's STRIP_HEADERS keeps the
-	// session id) force-routed to a specific account to keep a prompt cache warm;
-	// recording it would overwrite the real serving account for an active session
-	// and refresh the entry's TTL indefinitely. Auto-refresh probes are built
-	// without a session id, but exclude them too for symmetry. Mirrors how every
-	// other user-facing accounting path filters this traffic.
-	const isSyntheticInternal =
-		requestHeaders.get("x-better-ccflare-keepalive") === "true" ||
-		requestHeaders.get("x-better-ccflare-auto-refresh") === "true";
-	const servedSessionId = isSyntheticInternal
-		? null
-		: requestHeaders.get("x-claude-code-session-id");
+	// Skip synthetic internal traffic (cache-keepalive replays, auto-refresh
+	// probes) via the shared chokepoint, so a keepalive replay's account never
+	// overwrites the active session's badge (see sessionIdForObservation).
+	const servedSessionId = sessionIdForObservation(requestHeaders);
 	if (servedSessionId) {
+		// `timestamp` is the request's start time — the ordering version that keeps
+		// concurrent same-session requests resolving by issuance, not completion.
 		if (account) {
-			recordServedAccount(servedSessionId, account.id);
+			recordServedAccount(servedSessionId, account.id, timestamp);
 		} else {
-			clearSession(servedSessionId);
+			clearSession(servedSessionId, timestamp);
 		}
 	}
 

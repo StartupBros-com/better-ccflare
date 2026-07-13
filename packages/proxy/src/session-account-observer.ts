@@ -24,7 +24,15 @@ const DEFAULT_MAX_ENTRIES = 10_000;
 
 interface SessionAccountEntry {
 	accountId: string;
+	/** Observation (completion) time — drives TTL expiry and eviction recency. */
 	recordedAt: number;
+	/**
+	 * Ordering version = the request's START time. A record/clear only applies
+	 * when its version is not older than the stored one, so a slow failing
+	 * request cannot clear (or an out-of-order completion overwrite) a mapping a
+	 * newer concurrent request already recorded for the same session.
+	 */
+	version: number;
 }
 
 export interface SessionAccountObserverOptions {
@@ -59,14 +67,25 @@ export class SessionAccountObserver {
 	 * for the same session overwrites (failover, R2) and refreshes the entry's
 	 * recency so an active session is never the eviction victim. Empty session or
 	 * account ids are ignored (no header / unauthenticated passthrough, AE4).
+	 *
+	 * `version` is the request's start time; a record whose version is older than
+	 * the stored one is dropped, so an out-of-order completion of an earlier
+	 * request can't clobber a newer concurrent request's mapping. Defaults to the
+	 * current clock (last-observed-wins) when a caller supplies no version.
 	 */
-	record(sessionId: string, accountId: string): void {
+	record(
+		sessionId: string,
+		accountId: string,
+		version: number = this.now(),
+	): void {
 		if (!sessionId || !accountId) return;
+		const existing = this.map.get(sessionId);
+		if (existing && existing.version > version) return;
 		// Only a brand-new key grows the map, so bound-check just then.
-		if (!this.map.has(sessionId)) {
+		if (!existing) {
 			this.evictOldestIfFull();
 		}
-		this.map.set(sessionId, { accountId, recordedAt: this.now() });
+		this.map.set(sessionId, { accountId, recordedAt: this.now(), version });
 	}
 
 	/**
@@ -84,9 +103,17 @@ export class SessionAccountObserver {
 		return entry.accountId;
 	}
 
-	/** Drop `sessionId`'s entry. A no-op when the session id is absent or empty. */
-	clear(sessionId: string): void {
+	/**
+	 * Drop `sessionId`'s entry. A no-op when the session id is absent or empty, or
+	 * when a newer request (higher `version`) has already recorded for this session
+	 * — so a slow failing request can't erase a newer concurrent success. Defaults
+	 * to the current clock when a caller supplies no version.
+	 */
+	clear(sessionId: string, version: number = this.now()): void {
 		if (!sessionId) return;
+		const existing = this.map.get(sessionId);
+		if (!existing) return;
+		if (existing.version > version) return;
 		this.map.delete(sessionId);
 	}
 
@@ -117,12 +144,37 @@ export class SessionAccountObserver {
  */
 const observer = new SessionAccountObserver();
 
-/** Record the account that served `sessionId`'s most recent request. */
+/**
+ * The Claude Code session id to correlate this request with, or null when the
+ * request is synthetic internal traffic that must never mutate the session→
+ * account map. Cache-keepalive REPLAYS the original client request (session id
+ * and all), force-routed to a specific account, so recording/clearing on it
+ * would corrupt the active session's badge; auto-refresh probes carry no session
+ * id but are excluded for symmetry. This single chokepoint keeps every observer
+ * mutation site (forwardToClient, handleProxy exits, the model-not-found direct
+ * return) guarding synthetic traffic identically.
+ */
+export function sessionIdForObservation(headers: Headers): string | null {
+	if (
+		headers.get("x-better-ccflare-keepalive") === "true" ||
+		headers.get("x-better-ccflare-auto-refresh") === "true"
+	) {
+		return null;
+	}
+	return headers.get("x-claude-code-session-id");
+}
+
+/**
+ * Record the account that served `sessionId`'s most recent request. Pass the
+ * request's start time as `version` so concurrent same-session requests resolve
+ * by issuance order rather than completion order.
+ */
 export function recordServedAccount(
 	sessionId: string,
 	accountId: string,
+	version?: number,
 ): void {
-	observer.record(sessionId, accountId);
+	observer.record(sessionId, accountId, version);
 }
 
 /** Look up the account id that last served `sessionId`, if still live. */
@@ -130,7 +182,11 @@ export function getServedAccount(sessionId: string): string | undefined {
 	return observer.get(sessionId);
 }
 
-/** Forget `sessionId`'s association (request completed with no serving account). */
-export function clearSession(sessionId: string): void {
-	observer.clear(sessionId);
+/**
+ * Forget `sessionId`'s association (request completed with no serving account).
+ * Pass the request's start time as `version` so a slow failing request can't
+ * clear a newer concurrent request's mapping.
+ */
+export function clearSession(sessionId: string, version?: number): void {
+	observer.clear(sessionId, version);
 }

@@ -251,8 +251,36 @@ describe("createSessionAccountHandler", () => {
 });
 
 describe("session-account endpoint auth exemption", () => {
-	it("is statically exempt from API-key auth (KTD-3)", () => {
-		const auth = new AuthService({} as unknown as DatabaseOperations);
+	const auth = new AuthService({} as unknown as DatabaseOperations);
+
+	it("exempts exactly GET /api/sessions/:id/account (KTD-3)", () => {
+		expect(auth.isStaticPathExempt("/api/sessions/abc123/account", "GET")).toBe(
+			true,
+		);
+		// No method supplied still resolves to the GET exemption (back-compat).
 		expect(auth.isStaticPathExempt("/api/sessions/abc123/account")).toBe(true);
+	});
+
+	it("does NOT exempt non-GET methods on the account route", () => {
+		// Critical: a POST here would pass auth, fail to match the GET-only route,
+		// and fall through to the upstream proxy — an unauthenticated bypass.
+		expect(
+			auth.isStaticPathExempt("/api/sessions/abc123/account", "POST"),
+		).toBe(false);
+		expect(
+			auth.isStaticPathExempt("/api/sessions/abc123/account", "DELETE"),
+		).toBe(false);
+	});
+
+	it("does NOT exempt structurally different /api/sessions/ paths", () => {
+		// Extra segments (would not match the router's 5-segment route).
+		expect(auth.isStaticPathExempt("/api/sessions/a/b/account", "GET")).toBe(
+			false,
+		);
+		// A future write endpoint under the namespace must make its own decision.
+		expect(auth.isStaticPathExempt("/api/sessions/abc123/pin", "GET")).toBe(
+			false,
+		);
+		expect(auth.isStaticPathExempt("/api/sessions/", "GET")).toBe(false);
 	});
 });

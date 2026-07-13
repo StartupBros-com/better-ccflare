@@ -131,6 +131,25 @@ describe("SessionAccountObserver", () => {
 		expect(obs.get("s3")).toBe("acc-3");
 	});
 
+	it("does not let an older request's record or clear override a newer one", () => {
+		const obs = new SessionAccountObserver();
+		// A newer request (version 20) records acc-new.
+		obs.record("s", "acc-new", 20);
+		expect(obs.get("s")).toBe("acc-new");
+
+		// An older request (version 10) completing late must NOT overwrite it.
+		obs.record("s", "acc-old", 10);
+		expect(obs.get("s")).toBe("acc-new");
+
+		// ...and an older request's clear must NOT wipe the newer mapping.
+		obs.clear("s", 10);
+		expect(obs.get("s")).toBe("acc-new");
+
+		// A same-or-newer clear does remove it.
+		obs.clear("s", 20);
+		expect(obs.get("s")).toBeUndefined();
+	});
+
 	it("clears an existing entry and is a no-op for an absent session", () => {
 		const obs = new SessionAccountObserver();
 		obs.record("session-a", "acc-1");
