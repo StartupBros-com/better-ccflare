@@ -23,14 +23,26 @@ import { TIME_CONSTANTS } from "@better-ccflare/core";
 const DEFAULT_MAX_ENTRIES = 10_000;
 
 interface SessionAccountEntry {
-	accountId: string;
+	/** Account id, or null for a TOMBSTONE — a cleared session whose version
+	 * watermark is retained so a slow older request can't recreate the mapping. */
+	accountId: string | null;
 	/** Observation (completion) time — drives TTL expiry and eviction recency. */
 	recordedAt: number;
 	/**
 	 * Ordering version = the request's START time. A record/clear only applies
 	 * when its version is not older than the stored one, so a slow failing
 	 * request cannot clear (or an out-of-order completion overwrite) a mapping a
-	 * newer concurrent request already recorded for the same session.
+	 * newer concurrent request already recorded for the same session. A clear
+	 * leaves a tombstone carrying this version rather than deleting, so a later
+	 * older-versioned record is rejected instead of restoring stale state.
+	 *
+	 * The version is a millisecond timestamp, which is a near-total but not total
+	 * order: two same-session requests that start within the same millisecond get
+	 * equal versions and then resolve by completion order. This residual race is
+	 * accepted — the map is observational/cosmetic (KTD-1), the window is a single
+	 * millisecond of exactly-concurrent same-session traffic, and the badge
+	 * self-heals on the next request. A process-monotonic sequence would close it
+	 * but is not warranted for a cosmetic badge.
 	 */
 	version: number;
 }
@@ -90,7 +102,8 @@ export class SessionAccountObserver {
 
 	/**
 	 * Return the account id last recorded for `sessionId`, or undefined when the
-	 * session is unknown or its entry has aged past the TTL (swept on access).
+	 * session is unknown, tombstoned (cleared), or aged past the TTL (swept on
+	 * access).
 	 */
 	get(sessionId: string): string | undefined {
 		if (!sessionId) return undefined;
@@ -100,21 +113,32 @@ export class SessionAccountObserver {
 			this.map.delete(sessionId);
 			return undefined;
 		}
-		return entry.accountId;
+		return entry.accountId ?? undefined;
 	}
 
 	/**
-	 * Drop `sessionId`'s entry. A no-op when the session id is absent or empty, or
-	 * when a newer request (higher `version`) has already recorded for this session
-	 * — so a slow failing request can't erase a newer concurrent success. Defaults
-	 * to the current clock when a caller supplies no version.
+	 * Mark `sessionId` as served by no account. A no-op when the session id is
+	 * absent/empty or when a newer request (higher `version`) has already recorded
+	 * for it — so a slow failing request can't erase a newer concurrent success.
+	 *
+	 * Leaves a TOMBSTONE (accountId null) carrying the clear's version instead of
+	 * deleting the entry: deleting would drop the version watermark and let a slow
+	 * older-versioned record recreate the just-cleared mapping. Tombstones read as
+	 * unknown and age out via the same TTL and eviction as real entries.
 	 */
 	clear(sessionId: string, version: number = this.now()): void {
 		if (!sessionId) return;
 		const existing = this.map.get(sessionId);
-		if (!existing) return;
-		if (existing.version > version) return;
-		this.map.delete(sessionId);
+		if (existing && existing.version > version) return;
+		// A brand-new tombstone grows the map, so bound-check just then.
+		if (!existing) {
+			this.evictOldestIfFull();
+		}
+		this.map.set(sessionId, {
+			accountId: null,
+			recordedAt: this.now(),
+			version,
+		});
 	}
 
 	/**

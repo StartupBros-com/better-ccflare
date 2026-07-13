@@ -329,9 +329,14 @@ export async function handleProxy(
 
 	// 7. Handle no accounts case
 	if (accounts.length === 0) {
+		// No account will serve this request, whichever branch below fires. Clear
+		// the badge association up front — BEFORE the fallible getAllAccounts fetch,
+		// collector logging, and the passthrough (a thrown proxyUnauthenticated
+		// never reaches forwardToClient's null-account clear) — so no failure or
+		// throw below can leave a stale mapping (KTD-5).
+		if (sessionId) clearSession(sessionId, requestMeta.timestamp);
+
 		if (throttledAccounts.length > 0) {
-			// No account served this request — degrade the badge to unknown (KTD-5).
-			if (sessionId) clearSession(sessionId, requestMeta.timestamp);
 			return finishPacing(
 				pacingSlot,
 				createUsageThrottledResponse(throttledAccounts),
@@ -341,11 +346,6 @@ export async function handleProxy(
 		// Check feature flag for backwards compatibility
 		if (process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL === "1") {
 			log.warn(ERROR_MESSAGES.NO_ACCOUNTS);
-			// No better-ccflare account serves a passthrough request. Clear here
-			// rather than relying only on forwardToClient's null-account branch: a
-			// thrown proxyUnauthenticated (upstream network failure) never reaches
-			// forwardToClient, which would otherwise leave a stale mapping (KTD-5).
-			if (sessionId) clearSession(sessionId, requestMeta.timestamp);
 			return finishPacing(
 				pacingSlot,
 				await proxyUnauthenticated(
@@ -431,8 +431,7 @@ export async function handleProxy(
 				});
 		}
 
-		// Pool exhausted, no account served — degrade the badge to unknown (KTD-5).
-		if (sessionId) clearSession(sessionId, requestMeta.timestamp);
+		// (Session badge already cleared at the top of this block.)
 		return finishPacing(pacingSlot, poolExhaustedResponse);
 	}
 
