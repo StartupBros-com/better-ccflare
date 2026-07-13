@@ -71,6 +71,11 @@ type SessionAccountBody = {
 			usageUtilization: number | null;
 			usageWindow: string | null;
 			usageResetMs: number | null;
+			windows: Array<{
+				window: string;
+				utilization: number;
+				resetMs: number | null;
+			}>;
 			rateLimitStatus: string;
 			rateLimitedUntil: number | null;
 			rateLimitReset: number | null;
@@ -122,6 +127,14 @@ describe("createSessionAccountHandler", () => {
 		expect(body.data.account?.usageResetMs).toBeGreaterThan(now);
 		expect(body.data.account?.paused).toBe(false);
 		expect(body.data.account?.rateLimitStatus).toBe("OK");
+		// Anthropic exposes BOTH its 5h and 7d limits independently.
+		const w = body.data.account?.windows ?? [];
+		expect(w.map((x) => x.window).sort()).toEqual(["five_hour", "seven_day"]);
+		expect(w.find((x) => x.window === "five_hour")?.utilization).toBe(30);
+		expect(w.find((x) => x.window === "seven_day")?.utilization).toBe(10);
+		expect(w.find((x) => x.window === "five_hour")?.resetMs).toBeGreaterThan(
+			now,
+		);
 	});
 
 	it("composes usage provider-aware for a non-anthropic (zai) account", async () => {
@@ -146,6 +159,10 @@ describe("createSessionAccountHandler", () => {
 		// regression getRepresentativeWindowForProvider fixes — plain
 		// getRepresentativeWindow only recognizes anthropic/codex shapes).
 		expect(body.data.account?.usageWindow).toBe("five_hour");
+		// Single-window provider: exactly one limit window, its representative.
+		expect(body.data.account?.windows).toEqual([
+			{ window: "five_hour", utilization: 55, resetMs: null },
+		]);
 	});
 
 	it("AE2: returns unknown for a session id that was never recorded", async () => {
