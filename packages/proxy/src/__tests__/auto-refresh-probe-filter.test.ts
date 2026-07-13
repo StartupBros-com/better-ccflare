@@ -16,6 +16,11 @@ import {
 	spyOn,
 } from "bun:test";
 import type { Account } from "@better-ccflare/types";
+import { cacheBodyStore } from "../cache-body-store";
+import {
+	applyCacheBodyStagingPolicy,
+	getCacheBodyStagingAction,
+} from "../handlers/proxy-operations";
 import * as usageCollectorModule from "../usage-collector";
 
 // ---------------------------------------------------------------------------
@@ -61,56 +66,113 @@ function makeAccount(overrides: Partial<Account> = {}): Account {
 }
 
 // ---------------------------------------------------------------------------
-// Site 1: isSyntheticInternal in proxy-operations.ts
+// Site 1: cache-body staging policy in proxy-operations.ts
 //
-// The guard is: isSyntheticInternal = !!req.headers.get("x-better-ccflare-auto-refresh")
-// We test the header detection logic in isolation — the exact boolean produced
-// by the header check — rather than mocking cache-body-store (which poisons
-// the module registry in Bun and breaks cache-body-store.test.ts).
+// Exercise the production policy/action seam with the real cacheBodyStore.
+// Avoid mocking cache-body-store because that poisons Bun's module registry and
+// breaks cache-body-store.test.ts when the files share a test process.
 // ---------------------------------------------------------------------------
 
-describe("proxy-operations — isSyntheticInternal header detection", () => {
-	it("header x-better-ccflare-auto-refresh: true is truthy (probe detected)", () => {
-		const req = new Request("https://proxy.local/v1/messages", {
-			method: "POST",
-			headers: { "x-better-ccflare-auto-refresh": "true" },
-		});
-		const isSyntheticInternal =
-			!!req.headers.get("x-better-ccflare-keepalive") ||
-			!!req.headers.get("x-better-ccflare-auto-refresh");
-		expect(isSyntheticInternal).toBe(true);
+describe("proxy-operations — cache-body staging policy", () => {
+	const cacheableBody = new TextEncoder().encode(
+		JSON.stringify({
+			model: "claude-sonnet-4-5",
+			messages: [
+				{
+					role: "user",
+					content: [
+						{
+							type: "text",
+							text: "hello",
+							cache_control: { type: "ephemeral" },
+						},
+					],
+				},
+			],
+		}),
+	).buffer;
+
+	beforeEach(() => {
+		cacheBodyStore.setEnabled(false);
+		cacheBodyStore.setEnabled(true);
 	});
 
-	it("header x-better-ccflare-auto-refresh absent is falsy (normal request)", () => {
-		const req = new Request("https://proxy.local/v1/messages", {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-		});
-		const isSyntheticInternal =
-			!!req.headers.get("x-better-ccflare-keepalive") ||
-			!!req.headers.get("x-better-ccflare-auto-refresh");
-		expect(isSyntheticInternal).toBe(false);
+	afterEach(() => {
+		cacheBodyStore.setEnabled(false);
 	});
 
-	it("keepalive header also triggers isSyntheticInternal (existing guard preserved)", () => {
-		const req = new Request("https://proxy.local/v1/messages", {
-			method: "POST",
-			headers: { "x-better-ccflare-keepalive": "1" },
+	it("stages ordinary non-Codex requests", () => {
+		expect(getCacheBodyStagingAction(new Headers(), "anthropic")).toBe("stage");
+
+		const action = applyCacheBodyStagingPolicy({
+			requestId: "req-anthropic",
+			accountId: "account-anthropic",
+			providerName: "anthropic",
+			body: cacheableBody,
+			headers: new Headers({ "content-type": "application/json" }),
+			path: "/v1/messages",
 		});
-		const isSyntheticInternal =
-			!!req.headers.get("x-better-ccflare-keepalive") ||
-			!!req.headers.get("x-better-ccflare-auto-refresh");
-		expect(isSyntheticInternal).toBe(true);
+		cacheBodyStore.onSummary("req-anthropic", 12);
+
+		expect(action).toBe("stage");
+		expect(
+			cacheBodyStore.getLastCachedRequest("account-anthropic"),
+		).not.toBeNull();
 	});
 
-	it("neither header present produces false (real user traffic passes through)", () => {
-		const req = new Request("https://proxy.local/v1/messages", {
-			method: "POST",
-		});
-		const isSyntheticInternal =
-			!!req.headers.get("x-better-ccflare-keepalive") ||
-			!!req.headers.get("x-better-ccflare-auto-refresh");
-		expect(isSyntheticInternal).toBe(false);
+	it("preserves truthy synthetic-header semantics", () => {
+		expect(
+			getCacheBodyStagingAction(
+				new Headers({ "x-better-ccflare-auto-refresh": "false" }),
+				"anthropic",
+			),
+		).toBe("skip");
+		expect(
+			getCacheBodyStagingAction(
+				new Headers({ "x-better-ccflare-keepalive": "1" }),
+				"anthropic",
+			),
+		).toBe("skip");
+		expect(
+			getCacheBodyStagingAction(
+				new Headers({ "x-better-ccflare-auto-refresh": "" }),
+				"anthropic",
+			),
+		).toBe("stage");
+		expect(
+			getCacheBodyStagingAction(
+				new Headers({ "x-better-ccflare-auto-refresh": "true" }),
+				"codex",
+			),
+		).toBe("discard");
+	});
+
+	it("discards an Anthropic staged entry when the same request fails over to Codex", () => {
+		expect(
+			applyCacheBodyStagingPolicy({
+				requestId: "req-failover",
+				accountId: "account-anthropic",
+				providerName: "anthropic",
+				body: cacheableBody,
+				headers: new Headers(),
+				path: "/v1/messages",
+			}),
+		).toBe("stage");
+
+		expect(
+			applyCacheBodyStagingPolicy({
+				requestId: "req-failover",
+				accountId: "account-codex",
+				providerName: "codex",
+				body: cacheableBody,
+				headers: new Headers(),
+				path: "/v1/messages",
+			}),
+		).toBe("discard");
+
+		cacheBodyStore.onSummary("req-failover", 12);
+		expect(cacheBodyStore.getLastCachedRequest("account-anthropic")).toBeNull();
+		expect(cacheBodyStore.getLastCachedRequest("account-codex")).toBeNull();
 	});
 });
 

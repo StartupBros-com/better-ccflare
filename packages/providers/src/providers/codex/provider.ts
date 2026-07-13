@@ -41,6 +41,8 @@ export const CODEX_USER_AGENT = `codex-cli/${CODEX_VERSION} (Windows 10.0.26100;
 export const CODEX_PING_MODEL = "gpt-5-codex";
 const CODEX_SYNTHETIC_COUNT_TOKENS_URL =
 	"https://better-ccflare.local/codex/count_tokens";
+const CODEX_SYNTHETIC_RESPONSE_URL =
+	"https://better-ccflare.local/codex/response";
 export const CODEX_PROMPT_CACHE_KEY_ENV = "CCFLARE_CODEX_PROMPT_CACHE_KEY";
 /** "conversation" (default) or "session"; see derivePromptCacheKey. */
 export const CODEX_CACHE_KEY_MODE_ENV = "CCFLARE_CODEX_CACHE_KEY_MODE";
@@ -48,6 +50,46 @@ export const CODEX_CACHE_KEY_MODE_ENV = "CCFLARE_CODEX_CACHE_KEY_MODE";
 // a size marker: replaying megabyte payloads (e.g. base64 documents) into
 // every subsequent turn bloats context and destroys prompt-cache reuse.
 const CODEX_MAX_STRUCTURED_BLOCK_CHARS = 8_192;
+
+/** Resolve a configured Codex endpoint with the same validation as proxy requests. */
+export function resolveCodexEndpoint(
+	endpoint?: string | null,
+	accountName?: string,
+): string {
+	if (endpoint) {
+		try {
+			return validateEndpointUrl(endpoint, "custom_endpoint");
+		} catch (error) {
+			const accountSuffix = accountName ? ` for ${accountName}` : "";
+			log.warn(
+				`Invalid custom endpoint${accountSuffix}: ${endpoint}. Using default.`,
+				error,
+			);
+		}
+	}
+	return CODEX_DEFAULT_ENDPOINT;
+}
+
+/**
+ * Whether an already-resolved endpoint targets the ChatGPT subscription API.
+ * Query strings and trailing slashes do not change that API contract.
+ */
+export function isCodexSubscriptionEndpoint(endpoint: string): boolean {
+	try {
+		const candidate = new URL(endpoint);
+		const subscription = new URL(CODEX_DEFAULT_ENDPOINT);
+		const normalizePath = (pathname: string) =>
+			pathname.replace(/\/+$/, "") || "/";
+		return (
+			candidate.username === "" &&
+			candidate.password === "" &&
+			candidate.origin === subscription.origin &&
+			normalizePath(candidate.pathname) === normalizePath(subscription.pathname)
+		);
+	} catch {
+		return false;
+	}
+}
 
 const _normalizeUsage = (value: unknown): Record<string, number> => {
 	const usage =
@@ -413,17 +455,7 @@ export class CodexProvider extends BaseProvider {
 			return CODEX_SYNTHETIC_COUNT_TOKENS_URL;
 		}
 
-		if (account?.custom_endpoint) {
-			try {
-				return validateEndpointUrl(account.custom_endpoint, "custom_endpoint");
-			} catch (error) {
-				log.warn(
-					`Invalid custom endpoint for ${account.name}: ${account.custom_endpoint}. Using default.`,
-					error,
-				);
-			}
-		}
-		return CODEX_DEFAULT_ENDPOINT;
+		return resolveCodexEndpoint(account?.custom_endpoint, account?.name);
 	}
 
 	prepareHeaders(headers: Headers, accessToken?: string): Headers {
@@ -474,6 +506,15 @@ export class CodexProvider extends BaseProvider {
 			if (isSyntheticCountTokens) {
 				return this.createSyntheticCountTokensResponse(request, body);
 			}
+			const isSubscriptionEndpoint = isCodexSubscriptionEndpoint(request.url);
+			if (isSubscriptionEndpoint && body.max_tokens === 0) {
+				return this.createSyntheticErrorResponse(
+					request,
+					400,
+					"invalid_request_error",
+					"Codex subscription requests do not support max_tokens: 0.",
+				);
+			}
 
 			const requestId = request.headers.get("x-better-ccflare-request-id");
 			if (requestId) {
@@ -487,6 +528,10 @@ export class CodexProvider extends BaseProvider {
 				account,
 				requestId ?? undefined,
 			);
+			if (isSubscriptionEndpoint) {
+				// ChatGPT's subscription Responses endpoint rejects this API-only field.
+				delete codexBody.max_output_tokens;
+			}
 
 			// Best-effort, env-gated observability (no-op unless CCFLARE_CODEX_TRACE_DIR set).
 			writeCodexTrace({
@@ -1032,7 +1077,7 @@ export class CodexProvider extends BaseProvider {
 			"x-better-ccflare-synthetic-response": "true",
 			"x-better-ccflare-synthetic-status": String(status),
 		});
-		return new Request(request.url, {
+		return new Request(CODEX_SYNTHETIC_RESPONSE_URL, {
 			method: request.method,
 			headers,
 			body: JSON.stringify(body),

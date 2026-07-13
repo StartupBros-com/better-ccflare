@@ -174,6 +174,64 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 		);
 	});
 
+	it("returns max_tokens: 0 as a trusted local 400 without fetching Codex", async () => {
+		const fetchMock = mock(async () => {
+			throw new Error("max_tokens: 0 should not call upstream Codex");
+		});
+		globalThis.fetch = fetchMock;
+
+		const bodyBuffer = new TextEncoder().encode(
+			JSON.stringify({
+				model: "claude-sonnet-4-5",
+				messages: [{ role: "user", content: "hello world" }],
+				max_tokens: 0,
+			}),
+		).buffer;
+		const collector = {
+			handleStart: mock(() => {}),
+			handleChunk: mock(() => {}),
+			handleEnd: mock(() => Promise.resolve()),
+		};
+		const collectorSpy = spyOn(
+			usageCollectorModule,
+			"getUsageCollector",
+		).mockReturnValue(
+			collector as unknown as usageCollectorModule.UsageCollector,
+		);
+
+		try {
+			const result = await proxyWithAccount(
+				makeMessagesRequest(bodyBuffer, {
+					"Content-Type": "application/json",
+				}),
+				new URL("https://proxy.local/v1/messages"),
+				makeCodexAccount({
+					access_token: "access-token",
+					expires_at: Date.now() + 60 * 60 * 1000,
+				}),
+				makeRequestMeta("/v1/messages"),
+				bodyBuffer,
+				() => undefined,
+				0,
+				makeProxyContext(),
+			);
+
+			expect(fetchMock).toHaveBeenCalledTimes(0);
+			expect(result).toBeInstanceOf(Response);
+			expect(result?.status).toBe(400);
+			expect(result?.headers.get("content-type")).toContain("application/json");
+			expect(await result?.json()).toEqual({
+				type: "error",
+				error: {
+					type: "invalid_request_error",
+					message: "Codex subscription requests do not support max_tokens: 0.",
+				},
+			});
+		} finally {
+			collectorSpy.mockRestore();
+		}
+	});
+
 	it("does not trust client-supplied synthetic response markers", async () => {
 		let fetchedRequest: Request | null = null;
 		const fetchMock = mock(async (input: RequestInfo | URL) => {

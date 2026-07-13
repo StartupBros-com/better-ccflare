@@ -38,6 +38,60 @@ const SYNTHETIC_RESPONSE_HEADER = "x-better-ccflare-synthetic-response";
 const SYNTHETIC_STATUS_HEADER = "x-better-ccflare-synthetic-status";
 const SYNTHETIC_RESPONSE_URL_PREFIX = "https://better-ccflare.local/";
 
+export type CacheBodyStagingAction = "stage" | "discard" | "skip";
+
+export interface CacheBodyStagingInput {
+	requestId: string;
+	accountId: string | null;
+	providerName: string;
+	body: ArrayBuffer | null;
+	headers: Headers;
+	path: string;
+}
+
+function isSyntheticInternalRequest(headers: Headers): boolean {
+	return (
+		!!headers.get("x-better-ccflare-keepalive") ||
+		!!headers.get("x-better-ccflare-auto-refresh")
+	);
+}
+
+/**
+ * Chooses how one provider attempt should affect cache-keepalive staging.
+ * Synthetic non-Codex requests retain the historical truthy-header skip
+ * semantics. Every Codex attempt discards any entry staged by an earlier
+ * provider so a later response summary cannot promote stale failover residue.
+ */
+export function getCacheBodyStagingAction(
+	headers: Headers,
+	providerName: string,
+): CacheBodyStagingAction {
+	if (providerName === "codex") return "discard";
+	if (isSyntheticInternalRequest(headers)) return "skip";
+	return "stage";
+}
+
+/** Applies the cache-body staging policy for one account/provider attempt. */
+export function applyCacheBodyStagingPolicy(
+	input: CacheBodyStagingInput,
+): CacheBodyStagingAction {
+	const action = getCacheBodyStagingAction(input.headers, input.providerName);
+
+	if (action === "stage") {
+		cacheBodyStore.stageRequest(
+			input.requestId,
+			input.accountId,
+			input.body,
+			input.headers,
+			input.path,
+		);
+	} else if (action === "discard") {
+		cacheBodyStore.discardStaged(input.requestId);
+	}
+
+	return action;
+}
+
 /**
  * Determines the absolute epoch timestamp (ms since epoch) until which an account
  * should be marked rate-limited after model exhaustion. Priority:
@@ -559,6 +613,10 @@ export async function proxyWithAccount(
 			}
 		}
 
+		// Get the provider for this account before applying the staging policy: the
+		// resolved provider (including ctx fallback) determines replay safety.
+		const provider = getProvider(account.provider) || ctx.provider;
+
 		// Stage the original request body + headers for cache keepalive replay.
 		// Uses the pre-transform body (effectiveBodyBuffer may have a model override
 		// patched in, so use the original requestBodyBuffer for a faithful replay).
@@ -570,24 +628,22 @@ export async function proxyWithAccount(
 		//   - auto-refresh probes — same loop-prevention concern, plus these
 		//     hit known-cooled accounts and shouldn't pollute the staged-body cache
 		//     (issue #199, bug 2).
-		// Both checks are truthy (not strict-equality) to preserve the original
-		// keepalive guard's behaviour: any non-empty header value triggers the
-		// skip, matching what `!req.headers.get(...)` returned before.
-		const isSyntheticInternal =
-			!!req.headers.get("x-better-ccflare-keepalive") ||
-			!!req.headers.get("x-better-ccflare-auto-refresh");
-		if (!isSyntheticInternal) {
-			cacheBodyStore.stageRequest(
-				requestMeta.id,
-				account.id,
-				baseBodyContext.getBuffer(),
-				req.headers,
-				url.pathname,
-			);
-		}
-
-		// Get the provider for this account
-		const provider = getProvider(account.provider) || ctx.provider;
+		// Ordinary Codex attempts also cannot be staged: the subscription endpoint
+		// does not support the output cap used by keepalive replays. Discard instead
+		// so failover from an earlier provider cannot leave promotable residue.
+		// For non-Codex providers, both header checks are truthy (not
+		// strict-equality) to preserve the original keepalive guard's behaviour:
+		// any non-empty value skips staging, matching what
+		// `!req.headers.get(...)` returned before.
+		const isSyntheticInternal = isSyntheticInternalRequest(req.headers);
+		applyCacheBodyStagingPolicy({
+			requestId: requestMeta.id,
+			accountId: account.id,
+			providerName: provider.name,
+			body: baseBodyContext.getBuffer(),
+			headers: req.headers,
+			path: url.pathname,
+		});
 
 		// Validate that the account-specific provider can handle this path
 		validateProviderPath(provider, url.pathname);

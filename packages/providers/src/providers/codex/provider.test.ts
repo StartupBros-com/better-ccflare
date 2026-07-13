@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { fetchCodexUsageOnDemand } from "./on-demand-fetch";
 import {
 	CODEX_CACHE_KEY_MODE_ENV,
+	CODEX_DEFAULT_ENDPOINT,
 	CODEX_PROMPT_CACHE_KEY_ENV,
 	CodexProvider,
 } from "./provider";
@@ -491,45 +492,69 @@ describe("CodexProvider request conversion", () => {
 		expect(body.input[1].arguments).toBe("null");
 	});
 
-	it("forwards Anthropic max_tokens as Codex max_output_tokens", async () => {
+	it("omits max_output_tokens for the ChatGPT subscription endpoint and URL variants", async () => {
 		const provider = new CodexProvider();
-		const request = new Request("https://example.com/v1/messages", {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify({
-				model: "claude-3-5-sonnet-20241022",
-				max_tokens: 4096,
-				messages: [{ role: "user", content: "Hello" }],
-			}),
-		});
+		const cases = [
+			{ url: CODEX_DEFAULT_ENDPOINT, maxTokens: 4096 },
+			{ url: `${CODEX_DEFAULT_ENDPOINT}/`, maxTokens: 100.7 },
+			{ url: `${CODEX_DEFAULT_ENDPOINT}?source=test`, maxTokens: 100.7 },
+		];
 
-		const transformed = await provider.transformRequestBody(request);
-		const body = await transformed.json();
+		for (const { url, maxTokens } of cases) {
+			const request = new Request(url, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					model: "claude-3-5-sonnet-20241022",
+					max_tokens: maxTokens,
+					messages: [{ role: "user", content: "Hello" }],
+				}),
+			});
 
-		expect(body.max_output_tokens).toBe(4096);
+			const transformed = await provider.transformRequestBody(request);
+			const body = await transformed.json();
+
+			expect(body).not.toHaveProperty("max_output_tokens");
+		}
 	});
 
-	it("floors a fractional max_tokens when forwarding max_output_tokens", async () => {
+	it("preserves legacy max_output_tokens mapping for valid custom endpoints", async () => {
 		const provider = new CodexProvider();
-		const request = new Request("https://example.com/v1/messages", {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify({
+		const cases = [
+			{ maxTokens: 4096, expected: 4096 },
+			{ maxTokens: 100.7, expected: 100 },
+			{ maxTokens: 0.7, expected: 0 },
+			{ maxTokens: 0, expected: 1 },
+			{ maxTokens: -1, expected: undefined },
+			{ maxTokens: undefined, expected: undefined },
+		];
+
+		for (const { maxTokens, expected } of cases) {
+			const requestBody: Record<string, unknown> = {
 				model: "claude-3-5-sonnet-20241022",
-				max_tokens: 100.7,
 				messages: [{ role: "user", content: "Hello" }],
-			}),
-		});
+			};
+			if (maxTokens !== undefined) requestBody.max_tokens = maxTokens;
+			const request = new Request("https://example.test/codex/responses", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(requestBody),
+			});
 
-		const transformed = await provider.transformRequestBody(request);
-		const body = await transformed.json();
+			const transformed = await provider.transformRequestBody(request);
+			const body = await transformed.json();
 
-		expect(body.max_output_tokens).toBe(100);
+			if (expected === undefined) {
+				expect(body).not.toHaveProperty("max_output_tokens");
+			} else {
+				expect(body.max_output_tokens).toBe(expected);
+			}
+		}
 	});
 
-	it("clamps a cache-prewarm max_tokens: 0 to max_output_tokens: 1 instead of leaving the cap unbounded", async () => {
+	it("returns a local Anthropic error for max_tokens: 0 on the subscription endpoint", async () => {
 		const provider = new CodexProvider();
-		const request = new Request("https://example.com/v1/messages", {
+		const request = new Request(CODEX_DEFAULT_ENDPOINT, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify({
@@ -542,7 +567,45 @@ describe("CodexProvider request conversion", () => {
 		const transformed = await provider.transformRequestBody(request);
 		const body = await transformed.json();
 
-		expect(body.max_output_tokens).toBe(1);
+		expect(transformed.headers.get("x-better-ccflare-synthetic-response")).toBe(
+			"true",
+		);
+		expect(transformed.headers.get("x-better-ccflare-synthetic-status")).toBe(
+			"400",
+		);
+		expect(transformed.url).toBe("https://better-ccflare.local/codex/response");
+		expect(body).toEqual({
+			type: "error",
+			error: {
+				type: "invalid_request_error",
+				message: "Codex subscription requests do not support max_tokens: 0.",
+			},
+		});
+	});
+
+	it("falls back from an invalid custom endpoint and applies subscription rules", async () => {
+		const provider = new CodexProvider();
+		const account = {
+			name: "invalid-codex",
+			custom_endpoint: "not-a-url",
+		} as Parameters<typeof provider.buildUrl>[2];
+		const resolvedUrl = provider.buildUrl("/v1/messages", "", account);
+		expect(resolvedUrl).toBe(CODEX_DEFAULT_ENDPOINT);
+
+		const request = new Request(resolvedUrl, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				model: "claude-3-5-sonnet-20241022",
+				max_tokens: 4096,
+				messages: [{ role: "user", content: "Hello" }],
+			}),
+		});
+
+		const transformed = await provider.transformRequestBody(request, account);
+		const body = await transformed.json();
+
+		expect(body).not.toHaveProperty("max_output_tokens");
 	});
 });
 
@@ -2729,6 +2792,139 @@ describe("fetchCodexUsageOnDemand", () => {
 		expect(result.response.headers.get("x-codex-primary-reset-at")).toBe(
 			"1775000000",
 		);
+		expect(recorded?.init.signal?.aborted).toBe(true);
+	});
+
+	it("omits max_output_tokens for default subscription usage refreshes", async () => {
+		globalThis.fetch = makeMockFetch(
+			new Response("event: ignored\n\n", { status: 200 }),
+		) as unknown as typeof fetch;
+
+		await fetchCodexUsageOnDemand("test-token");
+
+		expect(recorded?.url).toBe(CODEX_DEFAULT_ENDPOINT);
+		const body = JSON.parse(recorded?.init.body as string);
+		expect(body).not.toHaveProperty("max_output_tokens");
+	});
+
+	it("falls back from an invalid usage endpoint and applies subscription rules", async () => {
+		globalThis.fetch = makeMockFetch(
+			new Response("event: ignored\n\n", { status: 200 }),
+		) as unknown as typeof fetch;
+
+		await fetchCodexUsageOnDemand("test-token", "not-a-url");
+
+		expect(recorded?.url).toBe(CODEX_DEFAULT_ENDPOINT);
+		const body = JSON.parse(recorded?.init.body as string);
+		expect(body).not.toHaveProperty("max_output_tokens");
+	});
+
+	it("preserves the response snapshot when body cancellation throws", async () => {
+		const body = new ReadableStream({
+			cancel() {
+				throw new Error("cancel failed");
+			},
+		});
+		globalThis.fetch = makeMockFetch(
+			new Response(body, {
+				status: 429,
+				headers: {
+					"x-codex-primary-used-percent": "100",
+					"x-codex-primary-window-minutes": "300",
+					"x-codex-primary-reset-at": "1775000000",
+				},
+			}),
+		) as unknown as typeof fetch;
+
+		const result = await fetchCodexUsageOnDemand(
+			"test-token",
+			"https://example.test/codex/responses",
+		);
+
+		expect(recorded?.init.signal?.aborted).toBe(true);
+		expect(result.response.status).toBe(429);
+		expect(result.response.headers.get("x-codex-primary-reset-at")).toBe(
+			"1775000000",
+		);
+		expect(result.data?.five_hour.utilization).toBe(100);
+	});
+
+	it("aborts a pending usage refresh when the request timeout fires", async () => {
+		const originalSetTimeout = globalThis.setTimeout;
+		const originalClearTimeout = globalThis.clearTimeout;
+		let timeoutCallback: (() => void) | null = null;
+		let observedSignal: AbortSignal | null = null;
+		let clearTimeoutCalls = 0;
+
+		globalThis.setTimeout = ((callback: (...args: unknown[]) => void) => {
+			timeoutCallback = () => callback();
+			return 1 as unknown as ReturnType<typeof setTimeout>;
+		}) as typeof setTimeout;
+		globalThis.clearTimeout = (() => {
+			clearTimeoutCalls += 1;
+		}) as typeof clearTimeout;
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			recorded = { url: String(input), init: init ?? {} };
+			observedSignal = init?.signal ?? null;
+			return await new Promise<Response>((_resolve, reject) => {
+				observedSignal?.addEventListener(
+					"abort",
+					() =>
+						reject(
+							new DOMException("The operation was aborted.", "AbortError"),
+						),
+					{ once: true },
+				);
+			});
+		}) as typeof fetch;
+
+		try {
+			const pending = fetchCodexUsageOnDemand("test-token");
+			expect(timeoutCallback).not.toBeNull();
+			timeoutCallback?.();
+
+			await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+			expect(observedSignal?.aborted).toBe(true);
+			expect(clearTimeoutCalls).toBe(1);
+		} finally {
+			globalThis.setTimeout = originalSetTimeout;
+			globalThis.clearTimeout = originalClearTimeout;
+		}
+	});
+
+	it("aborts before cancelling the body and preserves the response snapshot", async () => {
+		let cancelCalled = 0;
+		let signalWasAbortedDuringCancel = false;
+		const body = new ReadableStream({
+			cancel() {
+				cancelCalled += 1;
+				signalWasAbortedDuringCancel = recorded?.init.signal?.aborted === true;
+			},
+		});
+		globalThis.fetch = makeMockFetch(
+			new Response(body, {
+				status: 202,
+				headers: {
+					"x-codex-primary-used-percent": "42",
+					"x-codex-primary-window-minutes": "300",
+					"x-codex-primary-reset-at": "1775000000",
+				},
+			}),
+		) as unknown as typeof fetch;
+
+		const result = await fetchCodexUsageOnDemand("test-token");
+
+		expect(cancelCalled).toBe(1);
+		expect(signalWasAbortedDuringCancel).toBe(true);
+		expect(recorded?.init.signal?.aborted).toBe(true);
+		expect(result.response.status).toBe(202);
+		expect(result.response.headers.get("x-codex-primary-reset-at")).toBe(
+			"1775000000",
+		);
+		expect(result.data?.five_hour.utilization).toBe(42);
 	});
 
 	it("returns null data when no Codex usage headers are present", async () => {
