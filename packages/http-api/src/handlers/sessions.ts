@@ -9,6 +9,7 @@ import {
 	type AnyUsageData,
 	getRepresentativeUtilizationForDisplay,
 	getRepresentativeWindowForProvider,
+	type UsageData,
 	usageCache,
 } from "@better-ccflare/providers";
 import {
@@ -26,6 +27,16 @@ import {
  * present only when `status === "known"` (KTD-4), so the caller never branches
  * on an error envelope.
  */
+/** One of an account's usage-limit windows (e.g. Anthropic 5h and 7d are two). */
+interface LimitWindow {
+	/** Window key, e.g. "five_hour" / "seven_day" / provider-specific like "credits". */
+	window: string;
+	/** Utilization toward this window's limit (0-100). */
+	utilization: number;
+	/** Reset time (ms epoch) of this window, if known. */
+	resetMs: number | null;
+}
+
 interface SessionAccountData {
 	status: "known" | "unknown";
 	account?: {
@@ -33,12 +44,20 @@ interface SessionAccountData {
 		name: string;
 		provider: string;
 		paused: boolean;
-		/** Representative usage-window utilization (0-100), or null when unknown. */
+		/** Representative (worst) usage-window utilization (0-100), or null. */
 		usageUtilization: number | null;
 		/** Label of the representative usage window (e.g. "five_hour"), or null. */
 		usageWindow: string | null;
 		/** Reset time (ms epoch) of the representative usage window, if known. */
 		usageResetMs: number | null;
+		/**
+		 * ALL of the account's active limit windows, each with its own utilization
+		 * and reset — so the badge can show them independently (an account can hit
+		 * its 5h limit while well under its 7d weekly). Adaptive: 2 for Anthropic
+		 * (5h + 7d), 1 for single-window providers (e.g. Grok credits), 0 when the
+		 * account reports no usage data (e.g. Codex during a no-limit promo).
+		 */
+		windows: LimitWindow[];
 		/** Human-readable rate-limit display string ("OK", "usage_exhausted (12m)", …). */
 		rateLimitStatus: string;
 		/** Local cooldown lock (ms epoch), set by 429-driven backoff. */
@@ -57,6 +76,72 @@ function unknownResponse(): Response {
 		success: true,
 		data: { status: "unknown" } satisfies SessionAccountData,
 	});
+}
+
+/** Parse a reset timestamp: ISO string (anthropic) or ms number (zai/nanogpt). */
+function toResetMs(resets: unknown): number | null {
+	if (typeof resets === "string") {
+		const ms = Date.parse(resets);
+		return Number.isFinite(ms) ? ms : null;
+	}
+	if (typeof resets === "number" && Number.isFinite(resets)) return resets;
+	return null;
+}
+
+/**
+ * All of an account's active limit windows. Anthropic/Codex expose two
+ * account-level hard limits — five_hour (rolling session) and seven_day (weekly)
+ * — that move independently, so both are returned when present; a limits[]-only
+ * payload derives them from the session/weekly_all entries. Every other provider
+ * has a single meaningful window, so its representative window is returned as a
+ * one-element list. Windows the account doesn't report are simply omitted, which
+ * is what makes the badge adapt (no 5h during a Codex no-limit promo, Grok's
+ * single dynamic window, etc.).
+ */
+function buildLimitWindows(
+	usageData: AnyUsageData | null,
+	provider: string,
+	representative: LimitWindow | null,
+): LimitWindow[] {
+	if (!usageData) return [];
+	if (provider === "anthropic" || provider === "codex") {
+		const ud = usageData as UsageData;
+		const out: LimitWindow[] = [];
+		for (const key of ["five_hour", "seven_day"] as const) {
+			const w = ud[key] as
+				| { utilization?: number; resets_at?: string | null }
+				| undefined;
+			if (w && typeof w.utilization === "number") {
+				out.push({
+					window: key,
+					utilization: w.utilization,
+					resetMs: toResetMs(w.resets_at),
+				});
+			}
+		}
+		// limits[]-only payloads carry no flat five_hour/seven_day objects; derive
+		// them from the generic session / weekly_all caps instead.
+		if (out.length === 0 && Array.isArray(ud.limits)) {
+			for (const lim of ud.limits) {
+				if (!lim || typeof lim.percent !== "number") continue;
+				if (lim.kind === "session")
+					out.push({
+						window: "five_hour",
+						utilization: lim.percent,
+						resetMs: toResetMs(lim.resets_at),
+					});
+				else if (lim.kind === "weekly_all")
+					out.push({
+						window: "seven_day",
+						utilization: lim.percent,
+						resetMs: toResetMs(lim.resets_at),
+					});
+			}
+		}
+		return out;
+	}
+	// Single-window providers: surface the representative window as-is.
+	return representative ? [representative] : [];
 }
 
 /**
@@ -126,6 +211,20 @@ export function createSessionAccountHandler(
 			usageResetMs = getRepresentativeUsageResetMs(usageData, provider);
 		}
 
+		// All of the account's limit windows (Anthropic 5h + 7d; others their one
+		// window), so the badge can show them independently.
+		const windows = buildLimitWindows(
+			usageData as AnyUsageData | null,
+			provider,
+			usageUtilization != null
+				? {
+						window: usageWindow ?? "",
+						utilization: usageUtilization,
+						resetMs: usageResetMs,
+					}
+				: null,
+		);
+
 		// Computed after usage resolution so an exhausted usage window can outrank
 		// stale header snapshots and the bare "OK" default (same precedence as the
 		// accounts list handler; incident 2026-07-09).
@@ -172,6 +271,7 @@ export function createSessionAccountHandler(
 				usageUtilization,
 				usageWindow,
 				usageResetMs,
+				windows,
 				rateLimitStatus,
 				rateLimitedUntil: account.rate_limited_until ?? null,
 				rateLimitReset: account.rate_limit_reset ?? null,

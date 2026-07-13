@@ -217,6 +217,10 @@ operational state (account name plus usage/health) with no secrets.
       "usageUtilization": 42,
       "usageWindow": "five_hour",
       "usageResetMs": 1765000000000,
+      "windows": [
+        { "window": "five_hour", "utilization": 42, "resetMs": 1765000000000 },
+        { "window": "seven_day", "utilization": 61, "resetMs": 1765400000000 }
+      ],
       "rateLimitStatus": "OK",
       "rateLimitedUntil": null,
       "rateLimitReset": null,
@@ -234,6 +238,14 @@ operational state (account name plus usage/health) with no secrets.
   "data": { "status": "unknown" }
 }
 ```
+
+`windows` lists **all** of the account's active limit windows, each with its own
+utilization and reset, so a caller can show them independently (an account can be
+at its 5-hour limit while well under its 7-day weekly). It adapts to the account:
+two entries for Anthropic (`five_hour` + `seven_day`), one for single-window
+providers (e.g. Grok's `credits`), and an empty array when the account reports no
+usage data (e.g. Codex during a no-limit promotion). `usageUtilization` /
+`usageWindow` / `usageResetMs` remain the single representative (worst) window.
 
 `status` is `"unknown"` when no association exists for the session id (a fresh
 chat that has issued no request, a proxy restart that cleared the in-memory map,
