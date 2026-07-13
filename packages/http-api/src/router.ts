@@ -1,5 +1,5 @@
 import { validateNumber } from "@better-ccflare/core";
-import { Unauthorized } from "@better-ccflare/errors";
+import { BadRequest, Unauthorized } from "@better-ccflare/errors";
 import {
 	createAccountAddHandler,
 	createAccountAutoFallbackHandler,
@@ -902,7 +902,15 @@ export class APIRouter {
 		) {
 			const parts = path.split("/");
 			if (parts.length === 5) {
-				const sessionId = decodeURIComponent(parts[3]);
+				// Guard decode: this route is auth-exempt, so a malformed
+				// percent-encoding (e.g. `/api/sessions/%/account`) must return a
+				// clean 400 rather than throw a URIError outside wrapHandler's catch.
+				let sessionId: string;
+				try {
+					sessionId = decodeURIComponent(parts[3]);
+				} catch {
+					return errorResponse(BadRequest("Invalid session id encoding"));
+				}
 				const sessionAccountHandler = createSessionAccountHandler(
 					this.context.dbOps,
 					this.context.config,

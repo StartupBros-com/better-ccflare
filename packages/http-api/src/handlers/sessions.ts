@@ -8,8 +8,7 @@ import {
 import {
 	type AnyUsageData,
 	getRepresentativeUtilizationForProvider,
-	getRepresentativeWindow,
-	type UsageData,
+	getRepresentativeWindowForProvider,
 	usageCache,
 } from "@better-ccflare/providers";
 import {
@@ -115,7 +114,13 @@ export function createSessionAccountHandler(
 				usageData as AnyUsageData,
 				provider,
 			);
-			usageWindow = getRepresentativeWindow(usageData as UsageData);
+			// Provider-aware window label so non-anthropic providers (zai, nanogpt,
+			// kilo, alibaba-coding-plan, xai) don't silently resolve to a null window
+			// while their utilization is known.
+			usageWindow = getRepresentativeWindowForProvider(
+				usageData as AnyUsageData,
+				provider,
+			);
 			usageResetMs = getRepresentativeUsageResetMs(usageData, provider);
 		}
 

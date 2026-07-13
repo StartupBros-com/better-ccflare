@@ -16,6 +16,7 @@ import {
 import {
 	fetchNanoGPTUsageData,
 	getRepresentativeNanoGPTUtilization,
+	getRepresentativeNanoGPTWindow,
 	type NanoGPTUsageData,
 } from "./nanogpt-usage-fetcher";
 import {
@@ -24,7 +25,11 @@ import {
 	getRepresentativeXaiWindow,
 	type XaiUsageData,
 } from "./xai-usage-fetcher";
-import { fetchZaiUsageData, type ZaiUsageData } from "./zai-usage-fetcher";
+import {
+	fetchZaiUsageData,
+	getRepresentativeZaiWindow,
+	type ZaiUsageData,
+} from "./zai-usage-fetcher";
 
 const log = new Logger("UsageFetcher");
 
@@ -394,6 +399,40 @@ export function getRepresentativeUtilizationForProvider(
 		case "xai": {
 			return getRepresentativeXaiUtilization(data as XaiUsageData);
 		}
+		default:
+			return null;
+	}
+}
+
+/**
+ * Provider-aware sibling of {@link getRepresentativeUtilizationForProvider}:
+ * returns the LABEL of the representative usage window (e.g. "five_hour") for
+ * any supported provider, or null. The plain {@link getRepresentativeWindow}
+ * only recognizes anthropic/codex-shaped windows (objects with a `utilization`
+ * field), so callers that must label the window for non-anthropic providers
+ * (zai/nanogpt/kilo/alibaba-coding-plan/xai) need this dispatch — otherwise the
+ * window silently resolves to null even when utilization is known.
+ */
+export function getRepresentativeWindowForProvider(
+	data: AnyUsageData,
+	provider: string,
+): string | null {
+	switch (provider) {
+		case "anthropic":
+		case "codex":
+			return getRepresentativeWindow(data as UsageData);
+		case "nanogpt":
+			return getRepresentativeNanoGPTWindow(data as NanoGPTUsageData);
+		case "zai":
+			return getRepresentativeZaiWindow(data as ZaiUsageData);
+		case "kilo":
+			return getRepresentativeKiloWindow(data as KiloUsageData);
+		case "alibaba-coding-plan":
+			return getRepresentativeAlibabaCodingPlanWindow(
+				data as AlibabaCodingPlanUsageData,
+			);
+		case "xai":
+			return getRepresentativeXaiWindow(data as XaiUsageData);
 		default:
 			return null;
 	}

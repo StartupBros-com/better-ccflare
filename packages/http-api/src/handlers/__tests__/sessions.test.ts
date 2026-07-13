@@ -117,8 +117,35 @@ describe("createSessionAccountHandler", () => {
 		expect(body.data.account?.name).toBe("healthy-acct");
 		expect(body.data.account?.usageUtilization).toBe(30);
 		expect(body.data.account?.usageWindow).toBe("five_hour");
+		// Representative window (five_hour, higher util) reset time resolves to its
+		// resets_at epoch, not null.
+		expect(body.data.account?.usageResetMs).toBeGreaterThan(now);
 		expect(body.data.account?.paused).toBe(false);
 		expect(body.data.account?.rateLimitStatus).toBe("OK");
+	});
+
+	it("composes usage provider-aware for a non-anthropic (zai) account", async () => {
+		usageCache.set(ACCOUNT_ID, {
+			time_limit: null,
+			tokens_limit: { percentage: 55 },
+		});
+		recordServedAccount(SESSION, ACCOUNT_ID);
+		const account = makeAccount({ id: ACCOUNT_ID, provider: "zai" });
+
+		const handler = createSessionAccountHandler(
+			makeDbOps([account]),
+			makeConfig(),
+		);
+		const res = await handler(SESSION);
+		const body = (await res.json()) as SessionAccountBody;
+
+		expect(body.data.status).toBe("known");
+		expect(body.data.account?.provider).toBe("zai");
+		expect(body.data.account?.usageUtilization).toBe(55);
+		// Provider-aware window: zai must resolve a window label, not null (the
+		// regression getRepresentativeWindowForProvider fixes — plain
+		// getRepresentativeWindow only recognizes anthropic/codex shapes).
+		expect(body.data.account?.usageWindow).toBe("five_hour");
 	});
 
 	it("AE2: returns unknown for a session id that was never recorded", async () => {

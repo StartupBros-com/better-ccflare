@@ -151,9 +151,12 @@ export class AuthService {
 		// Session→account lookup for the local status-line badge. The caller is a
 		// local status-line script with no credential store, and the payload is
 		// coarse operational state (account name + usage/health) with no secrets
-		// (KTD-3). Prefix match because the path carries a dynamic session-id
-		// segment, mirroring the /api/oauth exemption above.
-		if (path.startsWith("/api/sessions/")) {
+		// (KTD-3). Scoped to the exact `/account` read route (mirroring the
+		// router's own `endsWith("/account")` match) so a future write endpoint
+		// under `/api/sessions/` — e.g. the deferred manual-pinning feature — does
+		// NOT silently inherit this unauthenticated exemption and must make its own
+		// explicit auth decision.
+		if (path.startsWith("/api/sessions/") && path.endsWith("/account")) {
 			return true;
 		}
 

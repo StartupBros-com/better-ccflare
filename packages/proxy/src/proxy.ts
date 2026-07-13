@@ -335,6 +335,11 @@ export async function handleProxy(
 		// Check feature flag for backwards compatibility
 		if (process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL === "1") {
 			log.warn(ERROR_MESSAGES.NO_ACCOUNTS);
+			// No better-ccflare account serves a passthrough request. Clear here
+			// rather than relying only on forwardToClient's null-account branch: a
+			// thrown proxyUnauthenticated (upstream network failure) never reaches
+			// forwardToClient, which would otherwise leave a stale mapping (KTD-5).
+			if (sessionId) clearSession(sessionId);
 			return finishPacing(
 				pacingSlot,
 				await proxyUnauthenticated(

@@ -177,6 +177,28 @@ describe("KTD-5: clearSession on no-account-served exits", () => {
 		}
 	});
 
+	it("clears on the CCFLARE_PASSTHROUGH_ON_EMPTY_POOL passthrough (even when it throws)", async () => {
+		// With an empty pool and the passthrough flag on, no better-ccflare account
+		// serves the request. The clear runs BEFORE proxyUnauthenticated, so even
+		// when the passthrough throws (no real upstream here) the stale mapping is
+		// still cleared — the gap a thrown proxyUnauthenticated would otherwise
+		// leave by bypassing forwardToClient's null-account branch (KTD-5).
+		process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL = "1";
+		expect(getServedAccount(SESSION_ID)).toBe("stale-account");
+
+		try {
+			await handleProxy(
+				makeRequest(),
+				new URL("https://proxy.local/v1/messages"),
+				makeContext([]),
+			);
+		} catch {
+			// proxyUnauthenticated throws without a real upstream — expected.
+		}
+
+		expect(getServedAccount(SESSION_ID)).toBeUndefined();
+	});
+
 	it("clears on the all-candidates-failed ServiceUnavailableError throw", async () => {
 		// Force-route to an account whose provider is unregistered, so
 		// proxyWithAccount falls back to the minimal stub ctx.provider and throws

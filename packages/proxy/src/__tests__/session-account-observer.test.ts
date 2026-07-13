@@ -120,6 +120,15 @@ describe("SessionAccountObserver", () => {
 		expect(obs.size).toBe(2);
 		expect(obs.get("s1")).toBe("acc-1b");
 		expect(obs.get("s2")).toBe("acc-2");
+
+		// ...and the overwrite refreshed s1's recency, so the NEXT eviction round at
+		// capacity drops s2 (the genuinely older entry), not the just-refreshed s1.
+		clock.advance(1);
+		obs.record("s3", "acc-3");
+		expect(obs.size).toBe(2);
+		expect(obs.get("s2")).toBeUndefined();
+		expect(obs.get("s1")).toBe("acc-1b");
+		expect(obs.get("s3")).toBe("acc-3");
 	});
 
 	it("clears an existing entry and is a no-op for an absent session", () => {
