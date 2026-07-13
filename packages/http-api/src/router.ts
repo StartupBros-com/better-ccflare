@@ -1,5 +1,5 @@
 import { validateNumber } from "@better-ccflare/core";
-import { Unauthorized } from "@better-ccflare/errors";
+import { BadRequest, Unauthorized } from "@better-ccflare/errors";
 import {
 	createAccountAddHandler,
 	createAccountAutoFallbackHandler,
@@ -110,6 +110,7 @@ import {
 	createRequestsSummaryHandler,
 } from "./handlers/requests";
 import { createRequestsStreamHandler } from "./handlers/requests-stream";
+import { createSessionAccountHandler } from "./handlers/sessions";
 import { createStatsHandler, createStatsResetHandler } from "./handlers/stats";
 import {
 	createIntegrityCheckHandler,
@@ -884,6 +885,37 @@ export class APIRouter {
 			const sessionId = parts[5];
 			if (sessionId) {
 				return await this.wrapHandler(() => this.codexStatusHandler(sessionId))(
+					req,
+					url,
+				);
+			}
+		}
+
+		// Session→account lookup for the local status-line badge (KTD-3).
+		// GET /api/sessions/:sessionId/account — always call the handler (even on
+		// an empty session segment) so it can return a well-formed 400/unknown
+		// rather than falling through to a 404.
+		if (
+			path.startsWith("/api/sessions/") &&
+			path.endsWith("/account") &&
+			method === "GET"
+		) {
+			const parts = path.split("/");
+			if (parts.length === 5) {
+				// Guard decode: this route is auth-exempt, so a malformed
+				// percent-encoding (e.g. `/api/sessions/%/account`) must return a
+				// clean 400 rather than throw a URIError outside wrapHandler's catch.
+				let sessionId: string;
+				try {
+					sessionId = decodeURIComponent(parts[3]);
+				} catch {
+					return errorResponse(BadRequest("Invalid session id encoding"));
+				}
+				const sessionAccountHandler = createSessionAccountHandler(
+					this.context.dbOps,
+					this.context.config,
+				);
+				return await this.wrapHandler(() => sessionAccountHandler(sessionId))(
 					req,
 					url,
 				);

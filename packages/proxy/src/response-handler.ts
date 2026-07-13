@@ -18,6 +18,11 @@ import type { ProxyContext } from "./handlers";
 import { applyRateLimitCooldown } from "./handlers/rate-limit-cooldown";
 import { createSseRateLimitSniffer } from "./handlers/sse-rate-limit-sniffer";
 import { ingestModelsListing } from "./model-catalog";
+import {
+	clearSession,
+	recordServedAccount,
+	sessionIdForObservation,
+} from "./session-account-observer";
 import { combineChunks, teeStream } from "./stream-tee";
 import { getUsageCollector } from "./usage-collector";
 import {
@@ -145,6 +150,30 @@ export async function forwardToClient(
 		originalModel,
 		appliedModel,
 	} = options;
+
+	// Record which account actually served this session's request, keyed on the
+	// Claude Code session id header, for the status-line account badge (R1, R2).
+	// This is the single success point where the definitive serving account and
+	// the original request headers are both in scope, after force-routing and the
+	// failover loop settled (KTD-1). Synchronous and in-memory so the status-line
+	// read never races the async usage collector. When this is the unauthenticated
+	// passthrough (account === null), no account served the request, so clear any
+	// stale association instead of recording one (KTD-5). Headers.get is
+	// case-insensitive and the header is not stripped from the live request.
+	//
+	// Skip synthetic internal traffic (cache-keepalive replays, auto-refresh
+	// probes) via the shared chokepoint, so a keepalive replay's account never
+	// overwrites the active session's badge (see sessionIdForObservation).
+	const servedSessionId = sessionIdForObservation(requestHeaders);
+	if (servedSessionId) {
+		// `timestamp` is the request's start time — the ordering version that keeps
+		// concurrent same-session requests resolving by issuance, not completion.
+		if (account) {
+			recordServedAccount(servedSessionId, account.id, timestamp);
+		} else {
+			clearSession(servedSessionId, timestamp);
+		}
+	}
 
 	// Always strip compression headers *before* we do anything else
 	const response = withSanitizedProxyHeaders(responseRaw);

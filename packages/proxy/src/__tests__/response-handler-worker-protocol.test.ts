@@ -3,6 +3,7 @@ import { requestEvents } from "@better-ccflare/core";
 import type { Account } from "@better-ccflare/types";
 import * as modelCatalogModule from "../model-catalog";
 import { forwardToClient } from "../response-handler";
+import { clearSession, getServedAccount } from "../session-account-observer";
 import * as usageCollectorModule from "../usage-collector";
 
 describe("forwardToClient usage-collector protocol", () => {
@@ -725,5 +726,93 @@ describe("forwardToClient passive model-catalog capture", () => {
 		);
 
 		await expect(response.text()).resolves.toBe(malformedBody);
+	});
+});
+
+describe("forwardToClient session-account recording", () => {
+	function createCtx() {
+		return {
+			strategy: {},
+			dbOps: {},
+			runtime: { port: 8080, tlsEnabled: false },
+			config: { getStorePayloads: () => true },
+			provider: { name: "anthropic", isStreamingResponse: () => false },
+			refreshInFlight: new Map<string, Promise<string>>(),
+			asyncWriter: {},
+		} as unknown as import("../handlers").ProxyContext;
+	}
+
+	// forwardToClient reads only a few account fields on the record path.
+	function acct(id: string): Account {
+		return {
+			id,
+			name: id,
+			provider: "anthropic",
+			billing_type: null,
+			auto_pause_on_overage_enabled: false,
+		} as unknown as Account;
+	}
+
+	async function forward(
+		account: Account | null,
+		headers: Record<string, string>,
+	) {
+		// Mock the usage collector but do NOT restore it (matching this file's
+		// createMockCollector): the broader proxy suite relies on getUsageCollector
+		// staying mocked across files, and a mockRestore here would re-expose the
+		// uninitialized collector to later tests, failing them.
+		const collector = {
+			handleStart: mock(() => {}),
+			handleChunk: mock(() => {}),
+			handleEnd: mock(() => Promise.resolve()),
+		};
+		spyOn(usageCollectorModule, "getUsageCollector").mockReturnValue(
+			collector as unknown as usageCollectorModule.UsageCollector,
+		);
+		await forwardToClient(
+			{
+				requestId: `req-${Math.round(performance.now())}`,
+				method: "POST",
+				path: "/v1/messages",
+				account,
+				requestHeaders: new Headers(headers),
+				requestBody: null,
+				response: new Response("{}", {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+				timestamp: Date.now(),
+				retryAttempt: 0,
+				failoverAttempts: 0,
+			},
+			createCtx(),
+		);
+	}
+
+	it("records the serving account for a real request carrying the session header", async () => {
+		const sid = "rhwp-real-session";
+		clearSession(sid);
+		await forward(acct("acc-real"), { "x-claude-code-session-id": sid });
+		expect(getServedAccount(sid)).toBe("acc-real");
+		clearSession(sid);
+	});
+
+	it("does NOT record a cache-keepalive replay that carries the session header", async () => {
+		const sid = "rhwp-keepalive-session";
+		clearSession(sid);
+
+		// A prior real request pinned the session to acc-A.
+		await forward(acct("acc-A"), { "x-claude-code-session-id": sid });
+		expect(getServedAccount(sid)).toBe("acc-A");
+
+		// A cache-keepalive replay for acc-B carries the SAME session id
+		// (STRIP_HEADERS keeps it) — it must NOT overwrite the active session's
+		// observed account.
+		await forward(acct("acc-B"), {
+			"x-claude-code-session-id": sid,
+			"x-better-ccflare-keepalive": "true",
+		});
+		expect(getServedAccount(sid)).toBe("acc-A");
+		clearSession(sid);
 	});
 });

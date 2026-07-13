@@ -16,6 +16,7 @@ import {
 import {
 	fetchNanoGPTUsageData,
 	getRepresentativeNanoGPTUtilization,
+	getRepresentativeNanoGPTWindow,
 	type NanoGPTUsageData,
 } from "./nanogpt-usage-fetcher";
 import {
@@ -24,7 +25,12 @@ import {
 	getRepresentativeXaiWindow,
 	type XaiUsageData,
 } from "./xai-usage-fetcher";
-import { fetchZaiUsageData, type ZaiUsageData } from "./zai-usage-fetcher";
+import {
+	fetchZaiUsageData,
+	getRepresentativeZaiUtilization,
+	getRepresentativeZaiWindow,
+	type ZaiUsageData,
+} from "./zai-usage-fetcher";
 
 const log = new Logger("UsageFetcher");
 
@@ -394,6 +400,80 @@ export function getRepresentativeUtilizationForProvider(
 		case "xai": {
 			return getRepresentativeXaiUtilization(data as XaiUsageData);
 		}
+		default:
+			return null;
+	}
+}
+
+/**
+ * DISPLAY utilization: the provider-aware counterpart that PAIRS with
+ * {@link getRepresentativeWindowForProvider} and {@link getRepresentativeUsageResetMs}
+ * — all three dispatch to the same per-provider window set, so a badge composed
+ * from them describes ONE consistent quota (utilization %, its window label, and
+ * its reset time all agree).
+ *
+ * This differs from {@link getRepresentativeUtilizationForProvider}, which is the
+ * ROUTING/health variant: for anthropic it counts only hard-limit windows
+ * (excludes model-scoped fallbacks) and for zai it takes max(time_limit,
+ * tokens_limit). Mixing the routing utilization with the display window/reset is
+ * what let the badge report a percentage from one quota with the label/reset of
+ * another (matches the accounts-list display, which pairs
+ * getRepresentativeUtilization + getRepresentativeWindow).
+ */
+export function getRepresentativeUtilizationForDisplay(
+	data: AnyUsageData,
+	provider: string,
+): number | null {
+	switch (provider) {
+		case "anthropic":
+		case "codex":
+			return getRepresentativeUtilization(data as UsageData);
+		case "nanogpt":
+			return getRepresentativeNanoGPTUtilization(data as NanoGPTUsageData);
+		case "zai":
+			return getRepresentativeZaiUtilization(data as ZaiUsageData);
+		case "kilo":
+			return getRepresentativeKiloUtilization(data as KiloUsageData);
+		case "alibaba-coding-plan":
+			return getRepresentativeAlibabaCodingPlanUtilization(
+				data as AlibabaCodingPlanUsageData,
+			);
+		case "xai":
+			return getRepresentativeXaiUtilization(data as XaiUsageData);
+		default:
+			return null;
+	}
+}
+
+/**
+ * Provider-aware sibling of {@link getRepresentativeUtilizationForDisplay}:
+ * returns the LABEL of the representative usage window (e.g. "five_hour") for
+ * any supported provider, or null. The plain {@link getRepresentativeWindow}
+ * only recognizes anthropic/codex-shaped windows (objects with a `utilization`
+ * field), so callers that must label the window for non-anthropic providers
+ * (zai/nanogpt/kilo/alibaba-coding-plan/xai) need this dispatch — otherwise the
+ * window silently resolves to null even when utilization is known.
+ */
+export function getRepresentativeWindowForProvider(
+	data: AnyUsageData,
+	provider: string,
+): string | null {
+	switch (provider) {
+		case "anthropic":
+		case "codex":
+			return getRepresentativeWindow(data as UsageData);
+		case "nanogpt":
+			return getRepresentativeNanoGPTWindow(data as NanoGPTUsageData);
+		case "zai":
+			return getRepresentativeZaiWindow(data as ZaiUsageData);
+		case "kilo":
+			return getRepresentativeKiloWindow(data as KiloUsageData);
+		case "alibaba-coding-plan":
+			return getRepresentativeAlibabaCodingPlanWindow(
+				data as AlibabaCodingPlanUsageData,
+			);
+		case "xai":
+			return getRepresentativeXaiWindow(data as XaiUsageData);
 		default:
 			return null;
 	}

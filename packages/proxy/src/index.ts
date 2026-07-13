@@ -65,6 +65,11 @@ export {
 	forwardToClient,
 	type ResponseHandlerOptions,
 } from "./response-handler";
+export {
+	clearSession,
+	getServedAccount,
+	recordServedAccount,
+} from "./session-account-observer";
 export type { ProxyRequest, ProxyResponse } from "./types";
 export type { UsageCollectorHealth } from "./usage-collector";
 export type {
