@@ -89,6 +89,19 @@ function toResetMs(resets: unknown): number | null {
 }
 
 /**
+ * Whether a window represents a REAL active limit rather than a dormant or
+ * absent one. A window with no reset AND zero utilization is either dormant
+ * (nothing consumed in that window) or a placeholder the provider fills in for a
+ * limit that doesn't currently apply — e.g. Codex's usage parser defaults the
+ * five_hour window to {0, null} during the current no-5h-limit promo. Surfacing
+ * those as "5h 0%" would invent a limit that isn't there, so they're dropped;
+ * anything with a pending reset or real usage is a genuine limit and is kept.
+ */
+function isActiveWindow(utilization: number, resetMs: number | null): boolean {
+	return resetMs !== null || utilization > 0;
+}
+
+/**
  * All of an account's active limit windows. Anthropic/Codex expose two
  * account-level hard limits — five_hour (rolling session) and seven_day (weekly)
  * — that move independently, so both are returned when present; a limits[]-only
@@ -112,11 +125,9 @@ function buildLimitWindows(
 				| { utilization?: number; resets_at?: string | null }
 				| undefined;
 			if (w && typeof w.utilization === "number") {
-				out.push({
-					window: key,
-					utilization: w.utilization,
-					resetMs: toResetMs(w.resets_at),
-				});
+				const resetMs = toResetMs(w.resets_at);
+				if (isActiveWindow(w.utilization, resetMs))
+					out.push({ window: key, utilization: w.utilization, resetMs });
 			}
 		}
 		// limits[]-only payloads carry no flat five_hour/seven_day objects; derive
@@ -124,24 +135,25 @@ function buildLimitWindows(
 		if (out.length === 0 && Array.isArray(ud.limits)) {
 			for (const lim of ud.limits) {
 				if (!lim || typeof lim.percent !== "number") continue;
-				if (lim.kind === "session")
-					out.push({
-						window: "five_hour",
-						utilization: lim.percent,
-						resetMs: toResetMs(lim.resets_at),
-					});
-				else if (lim.kind === "weekly_all")
-					out.push({
-						window: "seven_day",
-						utilization: lim.percent,
-						resetMs: toResetMs(lim.resets_at),
-					});
+				const window =
+					lim.kind === "session"
+						? "five_hour"
+						: lim.kind === "weekly_all"
+							? "seven_day"
+							: null;
+				if (!window) continue;
+				const resetMs = toResetMs(lim.resets_at);
+				if (isActiveWindow(lim.percent, resetMs))
+					out.push({ window, utilization: lim.percent, resetMs });
 			}
 		}
 		return out;
 	}
-	// Single-window providers: surface the representative window as-is.
-	return representative ? [representative] : [];
+	// Single-window providers: surface the representative window if it's active.
+	return representative &&
+		isActiveWindow(representative.utilization, representative.resetMs)
+		? [representative]
+		: [];
 }
 
 /**

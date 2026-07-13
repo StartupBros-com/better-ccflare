@@ -165,6 +165,33 @@ describe("createSessionAccountHandler", () => {
 		]);
 	});
 
+	it("shows only ACTIVE windows — a Codex no-5h promo surfaces just the weekly", async () => {
+		const now = Date.now();
+		// parseCodexUsageHeaders fills an absent window with {0, null}; during the
+		// no-5h promo that placeholder must NOT render as a phantom "5h 0%".
+		usageCache.set(ACCOUNT_ID, {
+			five_hour: { utilization: 0, resets_at: null },
+			seven_day: {
+				utilization: 40,
+				resets_at: new Date(now + 5 * 86400_000).toISOString(),
+			},
+		});
+		recordServedAccount(SESSION, ACCOUNT_ID);
+		const account = makeAccount({ id: ACCOUNT_ID, provider: "codex" });
+
+		const handler = createSessionAccountHandler(
+			makeDbOps([account]),
+			makeConfig(),
+		);
+		const res = await handler(SESSION);
+		const body = (await res.json()) as SessionAccountBody;
+
+		expect(body.data.account?.windows.map((w) => w.window)).toEqual([
+			"seven_day",
+		]);
+		expect(body.data.account?.windows[0]?.utilization).toBe(40);
+	});
+
 	it("AE2: returns unknown for a session id that was never recorded", async () => {
 		const handler = createSessionAccountHandler(
 			makeDbOps([makeAccount()]),
