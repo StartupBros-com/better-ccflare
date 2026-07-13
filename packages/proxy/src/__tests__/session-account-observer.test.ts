@@ -150,6 +150,20 @@ describe("SessionAccountObserver", () => {
 		expect(obs.get("s")).toBeUndefined();
 	});
 
+	it("keeps a tombstone so a slow older request can't recreate a cleared session", () => {
+		const obs = new SessionAccountObserver();
+		// A newer request clears (fails) at version 20 — no prior entry existed.
+		obs.clear("s", 20);
+		expect(obs.get("s")).toBeUndefined();
+		// A slow OLDER request (version 10) completing late must NOT recreate the
+		// mapping — the tombstone's version 20 rejects it.
+		obs.record("s", "acc-old", 10);
+		expect(obs.get("s")).toBeUndefined();
+		// A genuinely newer request still records over the tombstone.
+		obs.record("s", "acc-new", 30);
+		expect(obs.get("s")).toBe("acc-new");
+	});
+
 	it("clears an existing entry and is a no-op for an absent session", () => {
 		const obs = new SessionAccountObserver();
 		obs.record("session-a", "acc-1");

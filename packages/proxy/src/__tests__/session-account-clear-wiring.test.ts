@@ -18,7 +18,11 @@ import {
  * entry is gone afterward (verifies the wiring, not just the observer module).
  */
 
-const SESSION_ID = "clear-wiring-session";
+// A UNIQUE session id per test: clear() now leaves a tombstone carrying the
+// clear's version, so a shared id would let one test's afterEach tombstone
+// (large version) reject the next test's version-1 seed. Unique ids isolate.
+let sessionCounter = 0;
+let SESSION_ID = "clear-wiring-session-0";
 
 function makeAccount(overrides: Partial<Account> = {}): Account {
 	return {
@@ -118,6 +122,7 @@ let savedPassthrough: string | undefined;
 beforeEach(() => {
 	savedPassthrough = process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
 	delete process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
+	SESSION_ID = `clear-wiring-session-${++sessionCounter}`;
 	// Seed a stale association (from an OLDER request, version 1) so each exit's
 	// clear — stamped with the current request's later timestamp — supersedes it.
 	recordServedAccount(SESSION_ID, "stale-account", 1);
