@@ -561,6 +561,13 @@ export class CodexProvider extends BaseProvider {
 					"x-better-ccflare-pacing-cohort-id",
 				),
 				pacingAction: request.headers.get("x-better-ccflare-pacing-action"),
+				isDescendant: isAttributedAgent,
+				toolsBeforeCount: body.tools?.length ?? 0,
+				filteredToolNames: isAttributedAgent
+					? (body.tools
+							?.filter((tool) => tool.name === "Agent" || tool.name === "Task")
+							.map((tool) => tool.name) ?? [])
+					: [],
 				instructions: codexBody.instructions,
 				tools: codexBody.tools,
 				codexInput: codexBody.input,
@@ -635,40 +642,27 @@ export class CodexProvider extends BaseProvider {
 			return this.transformSseResponseToJson(response, requestId ?? undefined);
 		}
 
-		if (response.ok && response.body !== null) {
-			const probeText = await response.text();
-			const trimmed = probeText.trimStart();
-			const isSseLike = trimmed.startsWith("event:");
-
-			if (isSseLike) {
-				log.warn(
-					`Codex returned successful response without SSE content-type (${contentType ?? "<missing>"}); transforming as ${requestedStream ? "SSE" : "JSON"}`,
-				);
-				const headers = sanitizeResponseHeaders(response.headers);
-				headers.set("content-type", "text/event-stream");
-				const sseResponse = new Response(probeText, {
-					status: response.status,
-					statusText: response.statusText,
-					headers,
-				});
-				if (requestedStream) {
-					return this.transformStreamingResponse(
-						sseResponse,
-						requestId ?? undefined,
-					);
-				}
-				return this.transformSseResponseToJson(
-					sseResponse,
-					requestId ?? undefined,
-				);
-			}
-
+		if (response.ok && response.body !== null && contentType === null) {
+			log.warn(
+				`Codex returned successful response without SSE content-type (<missing>); transforming as ${requestedStream ? "SSE" : "JSON"}`,
+			);
 			const headers = sanitizeResponseHeaders(response.headers);
-			return new Response(probeText, {
+			headers.set("content-type", "text/event-stream");
+			const sseResponse = new Response(response.body, {
 				status: response.status,
 				statusText: response.statusText,
 				headers,
 			});
+			if (requestedStream) {
+				return this.transformStreamingResponse(
+					sseResponse,
+					requestId ?? undefined,
+				);
+			}
+			return this.transformSseResponseToJson(
+				sseResponse,
+				requestId ?? undefined,
+			);
 		}
 
 		const headers = sanitizeResponseHeaders(response.headers);

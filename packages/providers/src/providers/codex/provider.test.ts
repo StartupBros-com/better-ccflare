@@ -1531,6 +1531,44 @@ describe("CodexProvider.processResponse", () => {
 		expect(messageDeltaLine).toContain('"context_window_size":272000');
 	});
 
+	for (const contentType of [undefined, "text/event-stream"]) {
+		it(`streams the first SSE event before upstream closes with ${contentType ?? "missing"} content-type`, async () => {
+			const provider = new CodexProvider();
+			const encoder = new TextEncoder();
+			let closeUpstream!: () => void;
+			const upstreamBody = new ReadableStream<Uint8Array>({
+				start(controller) {
+					controller.enqueue(
+						encoder.encode(
+							sseBody(
+								eventLine("response.created", {
+									response: { id: "resp_live", model: "gpt-5.4" },
+								}),
+							),
+						),
+					);
+					closeUpstream = () => controller.close();
+				},
+			});
+			const headers = contentType ? { "content-type": contentType } : {};
+			const response = new Response(upstreamBody, { status: 200, headers });
+
+			const transformed = await provider.processResponse(response, null);
+			const reader = transformed.body?.getReader();
+			expect(reader).toBeDefined();
+			const firstRead = await reader?.read();
+			expect(firstRead?.done).toBeFalse();
+			expect(new TextDecoder().decode(firstRead?.value)).toContain(
+				"event: message_start",
+			);
+
+			closeUpstream();
+			while (!(await reader?.read())?.done) {
+				// Drain the transformed stream so its writer can close cleanly.
+			}
+		});
+	}
+
 	it("treats successful missing-content-type SSE bodies as streams", async () => {
 		const provider = new CodexProvider();
 		const upstreamBody = sseBody([
@@ -1646,16 +1684,18 @@ describe("CodexProvider.processResponse", () => {
 		}
 	});
 
-	it("passes through successful missing-content-type unknown bodies", async () => {
+	it("passes through successful explicitly typed JSON bodies", async () => {
 		const provider = new CodexProvider();
-		const response = new Response("ok", {
+		const response = new Response('{"ok":true}', {
 			status: 200,
-			headers: {},
+			headers: { "content-type": "application/json" },
 		});
 
 		const transformed = await provider.processResponse(response, null);
-		expect(transformed.headers.get("content-type")).toBeNull();
-		expect(await transformed.text()).toBe("ok");
+		expect(transformed.headers.get("content-type")).toContain(
+			"application/json",
+		);
+		expect(await transformed.text()).toBe('{"ok":true}');
 	});
 
 	it("returns Anthropic JSON for non-streaming missing-content-type SSE bodies", async () => {
@@ -2537,7 +2577,35 @@ describe("CodexProvider.transformRequestBody", () => {
 			topLevelBody.tools.map((tool: { name: string }) => tool.name),
 		).toEqual(["Agent", "Task", "Read"]);
 
-		const descendant = await transform(true);
+		const traceDir = mkdtempSync(join(tmpdir(), "codex-trace-"));
+		process.env[CODEX_TRACE_DIR_ENV] = traceDir;
+		let descendant: Request;
+		try {
+			descendant = await provider.transformRequestBody(
+				new Request("https://example.com/v1/messages", {
+					method: "POST",
+					headers: {
+						"content-type": "application/json",
+						"x-better-ccflare-attributed-agent": "true",
+						"x-better-ccflare-request-id": "descendant-trace",
+					},
+					body: JSON.stringify(payload),
+				}),
+			);
+			const requestTrace = readTraceRecords(traceDir).find(
+				(record) => record.phase === "request",
+			);
+			expect(requestTrace).toMatchObject({
+				trace_schema_version: 5,
+				is_descendant: true,
+				tools_before_count: 3,
+				tools_after_count: 1,
+				filtered_tool_names: ["Agent", "Task"],
+			});
+		} finally {
+			delete process.env[CODEX_TRACE_DIR_ENV];
+			rmSync(traceDir, { recursive: true, force: true });
+		}
 		const descendantBody = await descendant.json();
 		expect(
 			descendant.headers.get("x-better-ccflare-attributed-agent"),

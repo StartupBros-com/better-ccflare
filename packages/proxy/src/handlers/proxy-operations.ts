@@ -45,6 +45,20 @@ const INTERNAL_TRANSPORT_HEADERS = [
 	"x-better-ccflare-request-stream",
 	"x-better-ccflare-attributed-agent",
 ] as const;
+const ANTHROPIC_BILLING_HEADER = "x-anthropic-billing-header";
+
+function isBillingAttributedSubagent(headers: Headers): boolean {
+	const billing = headers.get(ANTHROPIC_BILLING_HEADER);
+	if (!billing) return false;
+	return billing.split(";").some((field) => {
+		const separator = field.indexOf("=");
+		if (separator < 0) return false;
+		return (
+			field.slice(0, separator).trim() === "cc_is_subagent" &&
+			field.slice(separator + 1).trim() === "true"
+		);
+	});
+}
 
 export function sanitizeInternalHeaders(headers: Headers): Headers {
 	const sanitized = new Headers(headers);
@@ -697,6 +711,9 @@ export async function proxyWithAccount(
 		// ID during transformRequestBody. The Codex provider consumes and strips this
 		// internal header before the request is sent upstream.
 		if (provider.name === "codex") {
+			const isAttributedAgent =
+				Boolean(requestMeta.agentUsed) ||
+				isBillingAttributedSubagent(req.headers);
 			// Client-supplied copies are untrusted. Strip before attaching only
 			// server-derived experiment metadata so traces cannot be spoofed or
 			// retain arbitrary sensitive header content.
@@ -706,7 +723,7 @@ export async function proxyWithAccount(
 			headers.set("x-better-ccflare-request-id", requestMeta.id);
 			// Attribution is resolved by the proxy before account selection. Replace
 			// any client-supplied marker here, once the selected provider is known.
-			if (requestMeta.agentUsed) {
+			if (isAttributedAgent) {
 				headers.set("x-better-ccflare-attributed-agent", "true");
 			} else {
 				headers.delete("x-better-ccflare-attributed-agent");
