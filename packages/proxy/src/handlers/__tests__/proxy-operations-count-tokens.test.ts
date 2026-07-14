@@ -10,7 +10,7 @@ import {
 import { CodexProvider } from "@better-ccflare/providers";
 import type { Account, RequestMeta } from "@better-ccflare/types";
 import * as usageCollectorModule from "../../usage-collector";
-import { proxyWithAccount } from "../proxy-operations";
+import { proxyWithAccount, sanitizeInternalHeaders } from "../proxy-operations";
 import type { ProxyContext } from "../proxy-types";
 
 function makeCodexAccount(overrides: Partial<Account> = {}): Account {
@@ -174,7 +174,6 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 		);
 	});
 
-
 	it("returns max_tokens: 0 as a trusted local 400 without fetching Codex", async () => {
 		const fetchMock = mock(async () => {
 			throw new Error("max_tokens: 0 should not call upstream Codex");
@@ -233,7 +232,7 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 		}
 	});
 
-it("marks attributed Codex descendants after provider selection and strips the marker upstream", async () => {
+	it("marks attributed Codex descendants after provider selection and strips the marker upstream", async () => {
 		let fetchedRequest: Request | null = null;
 		const fetchMock = mock(async (input: RequestInfo | URL) => {
 			fetchedRequest = input instanceof Request ? input : new Request(input);
@@ -424,6 +423,32 @@ it("marks attributed Codex descendants after provider selection and strips the m
 		expect(
 			fetchedRequest?.headers.get("x-better-ccflare-synthetic-status"),
 		).toBeNull();
+	});
+
+	it("strips every internal transport header from passthrough headers", () => {
+		const headers = new Headers({
+			authorization: "Bearer public-upstream-token",
+			"x-better-ccflare-request-id": "req-internal",
+			"x-better-ccflare-pacing-canary": "bypass",
+			"x-better-ccflare-pacing-cohort-id": "cohort",
+			"x-better-ccflare-pacing-action": "bypassed",
+			"x-better-ccflare-request-stream": "true",
+			"x-better-ccflare-attributed-agent": "true",
+		});
+		const sanitized = sanitizeInternalHeaders(headers);
+		expect(sanitized.get("authorization")).toBe("Bearer public-upstream-token");
+		for (const name of [
+			"x-better-ccflare-request-id",
+			"x-better-ccflare-pacing-canary",
+			"x-better-ccflare-pacing-cohort-id",
+			"x-better-ccflare-pacing-action",
+			"x-better-ccflare-request-stream",
+			"x-better-ccflare-attributed-agent",
+		]) {
+			expect(sanitized.get(name)).toBeNull();
+		}
+		// Pure helper: the reusable transform headers remain intact for retries.
+		expect(headers.get("x-better-ccflare-request-id")).toBe("req-internal");
 	});
 
 	it("does not trust client-supplied pacing experiment metadata", async () => {

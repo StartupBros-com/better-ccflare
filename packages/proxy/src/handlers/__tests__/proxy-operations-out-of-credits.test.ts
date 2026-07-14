@@ -1,4 +1,12 @@
-import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import {
+	afterEach,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	mock,
+	spyOn,
+} from "bun:test";
 import { usageCache } from "@better-ccflare/providers";
 import type { Account, RequestMeta } from "@better-ccflare/types";
 import { proxyWithAccount } from "../proxy-operations";
@@ -196,6 +204,62 @@ describe("proxyWithAccount — out_of_credits (issue #261)", () => {
 		expect(args[6]).toBe("out_of_credits");
 		// 10th positional arg is the `usage` parameter.
 		expect(args[9]).toEqual({ model: "claude-sonnet-4-5" });
+	});
+
+	it("keeps fallback-model out_of_credits scoped instead of benching the account", async () => {
+		let calls = 0;
+		globalThis.fetch = mock(async () => {
+			calls++;
+			return calls === 1
+				? new Response(
+						JSON.stringify({
+							type: "error",
+							error: {
+								type: "not_found_error",
+								message: "model not found",
+							},
+						}),
+						{ status: 404, headers: { "content-type": "application/json" } },
+					)
+				: outOfCreditsResponse();
+		});
+		const ctx = makeProxyContextWithAsyncExec();
+		const markScoped = spyOn(usageCache, "markModelScopedExhausted");
+		const account = makeAccount({
+			model_mappings: JSON.stringify({
+				sonnet: ["claude-sonnet-4-5", "claude-opus-4-8"],
+			}),
+		});
+		const bodyBuffer = makeRequestBody("claude-sonnet-4-5");
+		const result = await proxyWithAccount(
+			makeRequest(bodyBuffer),
+			new URL("https://proxy.local/v1/messages"),
+			account,
+			makeRequestMeta(),
+			bodyBuffer,
+			() => undefined,
+			0,
+			ctx,
+		);
+
+		expect(result).toBeNull();
+		expect(calls).toBe(2);
+		expect(account.rate_limited_until).toBeNull();
+		expect(markScoped).toHaveBeenCalledWith(
+			account.id,
+			"claude-opus-4-8",
+			null,
+		);
+		const markMock = ctx.dbOps.markAccountRateLimited as ReturnType<
+			typeof mock
+		>;
+		expect(markMock.mock.calls.length).toBe(0);
+		const saveMock = ctx.dbOps.saveRequest as ReturnType<typeof mock>;
+		expect(saveMock.mock.calls.length).toBe(1);
+		const args = saveMock.mock.calls[0] as unknown[];
+		expect(args[6]).toBe("out_of_credits");
+		expect(args[9]).toEqual({ model: "claude-opus-4-8" });
+		markScoped.mockRestore();
 	});
 
 	it("returns null without recording an audit row on keepalive out_of_credits 429", async () => {

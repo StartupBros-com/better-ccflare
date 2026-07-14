@@ -104,7 +104,10 @@ describe("Codex pacing bypass cohort", () => {
 			accountName: "max-secondary",
 			provider: "anthropic",
 		};
-		recordCachePacingRoute(null, codex, { candidate: true, bypassed: true });
+		recordCachePacingRoute(null, codex, {
+			candidate: true,
+			assignedBypass: true,
+		});
 		const control = {
 			key: "k",
 			role: "leader" as const,
@@ -114,16 +117,16 @@ describe("Codex pacing bypass cohort", () => {
 		};
 		recordCachePacingRoute(control, codex, {
 			candidate: true,
-			bypassed: false,
+			assignedBypass: false,
 		});
 		// The ordinary non-treatment population is also part of control.
 		recordCachePacingRoute(control, codex, {
 			candidate: true,
-			bypassed: false,
+			assignedBypass: false,
 		});
 		recordCachePacingRoute(null, anthropic, {
 			candidate: true,
-			bypassed: true,
+			assignedBypass: true,
 		});
 
 		const routes = getCachePacingRouteStats();

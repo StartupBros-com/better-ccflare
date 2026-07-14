@@ -37,6 +37,33 @@ const log = new Logger("ProxyOperations");
 const SYNTHETIC_RESPONSE_HEADER = "x-better-ccflare-synthetic-response";
 const SYNTHETIC_STATUS_HEADER = "x-better-ccflare-synthetic-status";
 const SYNTHETIC_RESPONSE_URL_PREFIX = "https://better-ccflare.local/";
+const INTERNAL_TRANSPORT_HEADERS = [
+	"x-better-ccflare-request-id",
+	"x-better-ccflare-pacing-canary",
+	"x-better-ccflare-pacing-cohort-id",
+	"x-better-ccflare-pacing-action",
+	"x-better-ccflare-request-stream",
+	"x-better-ccflare-attributed-agent",
+] as const;
+
+export function sanitizeInternalHeaders(headers: Headers): Headers {
+	const sanitized = new Headers(headers);
+	for (const name of INTERNAL_TRANSPORT_HEADERS) sanitized.delete(name);
+	return sanitized;
+}
+
+/** Strip proxy-only metadata from a concrete request before upstream fetch. */
+function sanitizeInternalTransportHeaders(request: Request): Request {
+	if (!INTERNAL_TRANSPORT_HEADERS.some((name) => request.headers.has(name))) {
+		return request;
+	}
+	return new Request(request.url, {
+		method: request.method,
+		headers: sanitizeInternalHeaders(request.headers),
+		body: request.body,
+		...(request.body ? { duplex: "half" as const } : {}),
+	});
+}
 
 export type CacheBodyStagingAction = "stage" | "discard" | "skip";
 
@@ -494,10 +521,8 @@ export async function proxyUnauthenticated(
 	log.warn(ERROR_MESSAGES.NO_ACCOUNTS);
 
 	const targetUrl = ctx.provider.buildUrl(url.pathname, url.search);
-	const headers = ctx.provider.prepareHeaders(
-		req.headers,
-		undefined,
-		undefined,
+	const headers = sanitizeInternalHeaders(
+		ctx.provider.prepareHeaders(req.headers, undefined, undefined),
 	);
 
 	try {
@@ -723,13 +748,10 @@ export async function proxyWithAccount(
 		}
 
 		const providerRequest = new Request(targetUrl, requestInit);
-		// Retries below reuse `headers`; strip one-shot internal metadata now so
-		// no fallback transform can leak it upstream. The initial request already
-		// captured the values in providerRequest for tracing.
-		headers.delete("x-better-ccflare-request-id");
-		headers.delete("x-better-ccflare-pacing-canary");
-		headers.delete("x-better-ccflare-pacing-cohort-id");
-		headers.delete("x-better-ccflare-pacing-action");
+		// Keep server-derived correlation/experiment metadata on the reusable
+		// transform headers: model fallback transforms need the same request ID and
+		// cohort attribution. Strip only the concrete transport request below,
+		// after each transform, so internal headers never reach upstream.
 
 		let transformedRequest = provider.transformRequestBody
 			? await provider.transformRequestBody(providerRequest, account)
@@ -741,28 +763,8 @@ export async function proxyWithAccount(
 			"x-better-ccflare-request-stream",
 		);
 		// Defense-in-depth: providers normally consume these before returning,
-		// but transform fallbacks may return the original request. Never leak
-		// internal correlation or experiment metadata upstream.
-		const sanitizedTransformedHeaders = new Headers(transformedRequest.headers);
-		sanitizedTransformedHeaders.delete("x-better-ccflare-request-id");
-		sanitizedTransformedHeaders.delete("x-better-ccflare-pacing-canary");
-		sanitizedTransformedHeaders.delete("x-better-ccflare-pacing-cohort-id");
-		sanitizedTransformedHeaders.delete("x-better-ccflare-pacing-action");
-		sanitizedTransformedHeaders.delete("x-better-ccflare-request-stream");
-		if (
-			transformedRequest.headers.has("x-better-ccflare-request-id") ||
-			transformedRequest.headers.has("x-better-ccflare-pacing-canary") ||
-			transformedRequest.headers.has("x-better-ccflare-pacing-cohort-id") ||
-			transformedRequest.headers.has("x-better-ccflare-pacing-action") ||
-			transformedRequest.headers.has("x-better-ccflare-request-stream")
-		) {
-			transformedRequest = new Request(transformedRequest.url, {
-				method: transformedRequest.method,
-				headers: sanitizedTransformedHeaders,
-				body: transformedRequest.body,
-				...(transformedRequest.body ? { duplex: "half" as const } : {}),
-			});
-		}
+		// but transform fallbacks may return the original request.
+		transformedRequest = sanitizeInternalTransportHeaders(transformedRequest);
 
 		// Pre-strip cache_control for (account, model) pairs known to reject it
 		const transformedBodyText = await transformedRequest.clone().text();
@@ -833,10 +835,15 @@ export async function proxyWithAccount(
 					? await provider.transformRequestBody(retryProviderRequest, account)
 					: retryProviderRequest;
 
+				// Preserve internal metadata through the transform for tracing, then
+				// strip it from the concrete transport request.
+				const retryTransportRequest = sanitizeInternalTransportHeaders(
+					retryTransformedRequest,
+				);
 				// Make the retry request (or unwrap a synthetic provider response)
 				rawResponse = isSyntheticProviderResponse(retryTransformedRequest)
 					? materializeSyntheticResponse(retryTransformedRequest)
-					: await makeProxyRequest(retryTransformedRequest);
+					: await makeProxyRequest(retryTransportRequest);
 			} else {
 				log.warn(
 					"Failed to filter thinking blocks or no changes made, proceeding with original error response",
@@ -879,6 +886,10 @@ export async function proxyWithAccount(
 		// model_mappings arrays and legacy model_fallbacks. We already tried index 0
 		// (the primary), so start at index 1.
 		if (await isModelUnavailableError(rawResponse)) {
+			// Tracks the concrete model used by the last fallback attempt so a
+			// fallback out_of_credits response is scoped to that model, not the
+			// originally requested model or the whole account.
+			let finalAttemptModel: string | null = null;
 			// Log 429 response headers for debugging upstream rate-limit info
 			if (rawResponse.status === 429) {
 				const rlHeaders: Record<string, string> = {};
@@ -1055,6 +1066,7 @@ export async function proxyWithAccount(
 					return withSanitizedProxyHeaders(rawResponse);
 				}
 
+				finalAttemptModel = requestedModel;
 				for (let i = 1; i < modelList.length; i++) {
 					const nextModel = modelList[i];
 					log.info(
@@ -1115,14 +1127,71 @@ export async function proxyWithAccount(
 						// If re-patching fails, proceed with the transformed request as-is
 					}
 
+					// Fallback transforms need internal correlation metadata, but the
+					// concrete transport request must never carry it upstream.
+					const retryTransportRequest = sanitizeInternalTransportHeaders(
+						retryTransformedRequest,
+					);
+					// Attribution advances only once a concrete request is ready to
+					// execute. A failed patch must leave it on the previous model.
+					finalAttemptModel = nextModel;
 					rawResponse = isSyntheticProviderResponse(retryTransformedRequest)
 						? materializeSyntheticResponse(retryTransformedRequest)
-						: await makeProxyRequest(retryTransformedRequest);
+						: await makeProxyRequest(retryTransportRequest);
 
 					if (!(await isModelUnavailableError(rawResponse.clone()))) {
 						break; // Success — stop cycling
 					}
 				}
+			}
+
+			// A fallback model may itself return Anthropic out_of_credits. Re-run
+			// scoped classification against the final response/model before
+			// account-wide handling, otherwise one fallback benches the account.
+			if (rawResponse.status === 429 && isAnthropicOutOfCredits(rawResponse)) {
+				if (req.headers.get("x-better-ccflare-keepalive") === "true") {
+					return null;
+				}
+				if (finalAttemptModel) {
+					usageCache.markModelScopedExhausted(
+						account.id,
+						finalAttemptModel,
+						req.headers.get("anthropic-beta"),
+					);
+				}
+				log.warn(
+					`Account ${account.name} out_of_credits (429${finalAttemptModel ? `, model=${finalAttemptModel}` : ""}) — model/beta-scoped after fallback, NOT benching account`,
+				);
+				const responseTime = Date.now() - requestMeta.timestamp;
+				ctx.asyncWriter.enqueue(() =>
+					ctx.dbOps.saveRequest(
+						crypto.randomUUID(),
+						req.method,
+						url.pathname,
+						account.id,
+						429,
+						false,
+						"out_of_credits",
+						responseTime,
+						failoverAttempts,
+						finalAttemptModel ? { model: finalAttemptModel } : undefined,
+						requestMeta.agentUsed ?? undefined,
+						apiKeyId ?? undefined,
+						apiKeyName ?? undefined,
+						requestMeta.project ?? null,
+						undefined,
+						requestMeta.comboName ?? null,
+						isModelRewrite(requestMeta.originalModel, requestMeta.appliedModel)
+							? (requestMeta.originalModel ?? null)
+							: null,
+						isModelRewrite(requestMeta.originalModel, requestMeta.appliedModel)
+							? (requestMeta.appliedModel ?? null)
+							: null,
+						requestMeta.projectAttributionSource ?? null,
+						requestMeta.agentAttributionSource ?? null,
+					),
+				);
+				return null;
 			}
 
 			// If still unavailable/rate-limited after exhausting the model list,

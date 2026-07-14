@@ -269,16 +269,17 @@ export async function handleProxy(
 		url.pathname === "/v1/messages" &&
 		!req.headers.get("x-better-ccflare-keepalive") &&
 		!req.headers.get("x-better-ccflare-auto-refresh");
-	const pacingCohortKey = derivePacingCohortKey(
-		requestMeta.clientSessionId,
-		parsedBody,
-	);
-	const canaryCandidate =
-		pacingEligible && isCodexPacingBypassCandidate(pacingCohortKey);
+	const pacingCohortKey = pacingEligible
+		? derivePacingCohortKey(requestMeta.clientSessionId, parsedBody)
+		: null;
+	const canaryCandidate = isCodexPacingBypassCandidate(pacingCohortKey);
 	requestMeta.codexPacingCohortId = pacingCohortKey?.slice(0, 16) ?? null;
 	const effectiveModel = resolveEffectiveModel(appliedModel, requestModel);
 	let pacingObservation: CachePacingObservation | null = null;
 	let pacingBypassed = false;
+	// Immutable assignment. Effective action may become crossover-paced, but
+	// route cohort attribution must remain treatment, not control.
+	const assignedCodexPacingBypass = canaryCandidate;
 	let selectedAccounts: Account[] | null = null;
 
 	if (!canaryCandidate && pacingEligible) {
@@ -611,7 +612,7 @@ export async function handleProxy(
 				},
 				{
 					candidate: pacingEligible,
-					bypassed: pacingBypassed,
+					assignedBypass: assignedCodexPacingBypass,
 				},
 			);
 			return finishPacing(pacingSlot, response);
@@ -691,7 +692,7 @@ export async function handleProxy(
 						},
 						{
 							candidate: pacingEligible,
-							bypassed: pacingBypassed,
+							assignedBypass: assignedCodexPacingBypass,
 						},
 					);
 					return finishPacing(pacingSlot, response);

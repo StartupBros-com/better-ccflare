@@ -126,7 +126,11 @@ export function getCachePacingRouteStats(): Record<
 export function recordCachePacingRoute(
 	observation: CachePacingObservation | null,
 	target: CachePacingTarget,
-	canary?: { candidate: boolean; bypassed: boolean },
+	canary?: {
+		candidate: boolean;
+		/** Immutable treatment assignment, independent of effective pacing action. */
+		assignedBypass: boolean;
+	},
 ): void {
 	// Route volume and cohort counts apply even when pacing was disabled or
 	// ineligible (observation=null). Only wait/leader mechanics need a receipt.
@@ -152,11 +156,11 @@ export function recordCachePacingRoute(
 	entry.provider = target.provider;
 	entry.requestsServed++;
 	if (canary?.candidate) {
-		if (canary.bypassed && target.provider === "codex") {
+		if (canary.assignedBypass && target.provider === "codex") {
 			entry.canaryBypassServed++;
-		} else if (canary.bypassed) {
-			// Candidate was selected for Codex bypass but ultimately served by a
-			// different provider after failover. Keep it out of treatment metrics.
+		} else if (canary.assignedBypass) {
+			// Treatment assignment is immutable even when Anthropic crossover
+			// restores pacing. Count the serving route as crossover, not control.
 			entry.canaryCrossovers++;
 		} else if (target.provider === "codex") {
 			entry.canaryControlServed++;
