@@ -383,9 +383,14 @@ export async function handleProxy(
 	let pacingSlot = pacingObservation?.slot ?? null;
 	let crossoverPacingRestored = false;
 	requestMeta.codexPacingCanary = pacingEligible
-		? pacingBypassed
+		? canaryCandidate
 			? "bypass"
 			: "control"
+		: null;
+	requestMeta.codexPacingAction = pacingEligible
+		? pacingBypassed
+			? "bypassed"
+			: "paced"
 		: null;
 
 	// 7. Handle no accounts case
@@ -540,7 +545,7 @@ export async function handleProxy(
 			pacingSlot = pacingObservation?.slot ?? null;
 			crossoverPacingRestored = true;
 			pacingBypassed = false;
-			requestMeta.codexPacingCanary = "control";
+			requestMeta.codexPacingAction = "crossover-paced";
 		}
 		// For combo routing: enrich metadata with slot index and look up model override
 		let modelOverride: string | null = null;
@@ -657,7 +662,7 @@ export async function handleProxy(
 					pacingSlot = pacingObservation?.slot ?? null;
 					crossoverPacingRestored = true;
 					pacingBypassed = false;
-					requestMeta.codexPacingCanary = "control";
+					requestMeta.codexPacingAction = "crossover-paced";
 				}
 				upstreamAttempts++;
 				response = await proxyWithAccount(
