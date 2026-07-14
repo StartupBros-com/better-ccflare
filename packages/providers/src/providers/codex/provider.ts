@@ -459,6 +459,8 @@ export class CodexProvider extends BaseProvider {
 			}
 
 			const requestId = request.headers.get("x-better-ccflare-request-id");
+			const isAttributedAgent =
+				request.headers.get("x-better-ccflare-attributed-agent") === "true";
 			if (requestId) {
 				this.requestStreamById.set(requestId, {
 					stream: body.stream === true,
@@ -469,6 +471,7 @@ export class CodexProvider extends BaseProvider {
 				body,
 				account,
 				requestId ?? undefined,
+				isAttributedAgent,
 			);
 
 			// Best-effort, env-gated observability (no-op unless CCFLARE_CODEX_TRACE_DIR set).
@@ -507,6 +510,7 @@ export class CodexProvider extends BaseProvider {
 			);
 
 			newHeaders.delete("x-better-ccflare-request-id");
+			newHeaders.delete("x-better-ccflare-attributed-agent");
 			newHeaders.delete("x-better-ccflare-pacing-canary");
 			newHeaders.delete("x-better-ccflare-pacing-cohort-id");
 			newHeaders.delete("content-length");
@@ -1133,6 +1137,7 @@ export class CodexProvider extends BaseProvider {
 		body: AnthropicRequest,
 		account?: Account,
 		requestId?: string,
+		isAttributedAgent = false,
 	): CodexRequest {
 		const model = this.mapModel(body.model, account);
 		if (process.env.DEBUG?.includes("model") || process.env.DEBUG === "true") {
@@ -1185,7 +1190,12 @@ export class CodexProvider extends BaseProvider {
 		// Convert tools
 		let tools: CodexTool[] | undefined;
 		if (body.tools && body.tools.length > 0) {
-			tools = body.tools.map((t) => ({
+			const currentTools = isAttributedAgent
+				? body.tools.filter(
+						(tool) => tool.name !== "Agent" && tool.name !== "Task",
+					)
+				: body.tools;
+			tools = currentTools.map((t) => ({
 				type: "function" as const,
 				name: t.name,
 				description: t.description,
@@ -1724,11 +1734,16 @@ export class CodexProvider extends BaseProvider {
 		) {
 			type = rawType;
 		}
+		const upstreamMessage = error?.message || "Codex upstream failed.";
+		const message =
+			code === "context_length_exceeded"
+				? `Prompt is too long. Codex reported: ${upstreamMessage}`
+				: upstreamMessage;
 		return {
 			type: "error",
 			error: {
 				type,
-				message: error?.message || "Codex upstream failed.",
+				message,
 				...(code ? { code } : {}),
 				...(status ? { status } : {}),
 			},

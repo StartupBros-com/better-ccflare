@@ -615,6 +615,13 @@ export async function proxyWithAccount(
 			headers.delete("x-better-ccflare-pacing-canary");
 			headers.delete("x-better-ccflare-pacing-cohort-id");
 			headers.set("x-better-ccflare-request-id", requestMeta.id);
+			// Attribution is resolved by the proxy before account selection. Replace
+			// any client-supplied marker here, once the selected provider is known.
+			if (requestMeta.agentUsed) {
+				headers.set("x-better-ccflare-attributed-agent", "true");
+			} else {
+				headers.delete("x-better-ccflare-attributed-agent");
+			}
 			if (requestMeta.codexPacingCanary) {
 				headers.set(
 					"x-better-ccflare-pacing-canary",
@@ -627,6 +634,8 @@ export async function proxyWithAccount(
 					requestMeta.codexPacingCohortId,
 				);
 			}
+		} else {
+			headers.delete("x-better-ccflare-attributed-agent");
 		}
 		// Synthetic-response markers are internal provider-to-proxy signals. Strip
 		// client-supplied copies before providers transform the outbound request.

@@ -174,6 +174,129 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 		);
 	});
 
+	it("marks attributed Codex descendants after provider selection and strips the marker upstream", async () => {
+		let fetchedRequest: Request | null = null;
+		const fetchMock = mock(async (input: RequestInfo | URL) => {
+			fetchedRequest = input instanceof Request ? input : new Request(input);
+			return new Response(JSON.stringify({ ok: true }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		});
+		globalThis.fetch = fetchMock;
+
+		const collectorSpy = spyOn(
+			usageCollectorModule,
+			"getUsageCollector",
+		).mockReturnValue({
+			handleStart: mock(() => {}),
+			handleChunk: mock(() => {}),
+			handleEnd: mock(() => Promise.resolve()),
+		} as unknown as usageCollectorModule.UsageCollector);
+
+		try {
+			const bodyBuffer = new TextEncoder().encode(
+				JSON.stringify({
+					model: "claude-sonnet-4-5",
+					messages: [{ role: "user", content: "hello world" }],
+					max_tokens: 16,
+					tools: [
+						{
+							name: "Agent",
+							description: "Spawn an agent.",
+							input_schema: { type: "object" },
+						},
+					],
+				}),
+			).buffer;
+			await proxyWithAccount(
+				makeMessagesRequest(bodyBuffer, {
+					"Content-Type": "application/json",
+					"x-better-ccflare-attributed-agent": "false",
+				}),
+				new URL("https://proxy.local/v1/messages"),
+				makeCodexAccount({
+					access_token: "access-token",
+					expires_at: Date.now() + 60 * 60 * 1000,
+				}),
+				{
+					...makeRequestMeta("/v1/messages"),
+					agentUsed: "general-purpose",
+				},
+				bodyBuffer,
+				() => undefined,
+				0,
+				makeProxyContext(),
+			);
+		} finally {
+			collectorSpy.mockRestore();
+		}
+
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(fetchedRequest).not.toBeNull();
+		expect(
+			fetchedRequest?.headers.get("x-better-ccflare-attributed-agent"),
+		).toBeNull();
+		const upstreamBody = await fetchedRequest?.clone().json();
+		expect(upstreamBody.tools).toEqual([]);
+	});
+
+	it("does not mark unattributed Codex requests", async () => {
+		let fetchedRequest: Request | null = null;
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			fetchedRequest = input instanceof Request ? input : new Request(input);
+			return new Response(JSON.stringify({ ok: true }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		});
+		const collectorSpy = spyOn(
+			usageCollectorModule,
+			"getUsageCollector",
+		).mockReturnValue({
+			handleStart: mock(() => {}),
+			handleChunk: mock(() => {}),
+			handleEnd: mock(() => Promise.resolve()),
+		} as unknown as usageCollectorModule.UsageCollector);
+
+		try {
+			const bodyBuffer = new TextEncoder().encode(
+				JSON.stringify({
+					model: "claude-sonnet-4-5",
+					messages: [{ role: "user", content: "hello world" }],
+					max_tokens: 16,
+					tools: [
+						{
+							name: "Agent",
+							description: "Spawn an agent.",
+							input_schema: { type: "object" },
+						},
+					],
+				}),
+			).buffer;
+			await proxyWithAccount(
+				makeMessagesRequest(bodyBuffer, { "Content-Type": "application/json" }),
+				new URL("https://proxy.local/v1/messages"),
+				makeCodexAccount({
+					access_token: "access-token",
+					expires_at: Date.now() + 60 * 60 * 1000,
+				}),
+				makeRequestMeta("/v1/messages"),
+				bodyBuffer,
+				() => undefined,
+				0,
+				makeProxyContext(),
+			);
+		} finally {
+			collectorSpy.mockRestore();
+		}
+
+		const upstreamBody = await fetchedRequest?.clone().json();
+		expect(
+			upstreamBody.tools.map((tool: { name: string }) => tool.name),
+		).toEqual(["Agent"]);
+	});
+
 	it("does not trust client-supplied synthetic response markers", async () => {
 		let fetchedRequest: Request | null = null;
 		const fetchMock = mock(async (input: RequestInfo | URL) => {
