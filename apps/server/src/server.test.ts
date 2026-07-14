@@ -47,10 +47,7 @@ describe("readShutdownDrainMs", () => {
 });
 
 describe("trackStreamForShutdown", () => {
-	const {
-		trackStreamForShutdown,
-		abortInflightStreams,
-	} = require("./server");
+	const { trackStreamForShutdown, abortInflightStreams } = require("./server");
 
 	const endlessResponse = () =>
 		new Response(

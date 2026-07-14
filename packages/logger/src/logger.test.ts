@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import type { LogEvent } from "@better-ccflare/types";
-import { Logger, setConsoleLogging, LogLevel, logBus } from "./index";
+import { Logger, LogLevel, logBus, setConsoleLogging } from "./index";
 
 describe("Logger error serialization", () => {
 	let captured: LogEvent[] = [];
