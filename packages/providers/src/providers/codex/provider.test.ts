@@ -1726,7 +1726,9 @@ describe("CodexProvider.processResponse", () => {
 		const transformedBody = await transformed.text();
 
 		expect(transformedBody).toContain("event: error");
-		expect(transformedBody).toContain("Input is too large");
+		expect(transformedBody).toContain(
+			"Prompt is too long. Codex reported: Input is too large",
+		);
 		expect(transformedBody).toContain("context_length_exceeded");
 		expect(transformedBody).not.toContain("event: message_delta");
 		expect(transformedBody).not.toContain("event: message_stop");
@@ -1839,7 +1841,7 @@ describe("CodexProvider.processResponse", () => {
 			type: "error",
 			error: {
 				type: "invalid_request_error",
-				message: "Input is too large",
+				message: "Prompt is too long. Codex reported: Input is too large",
 				code: "context_length_exceeded",
 			},
 		});
@@ -2478,6 +2480,115 @@ describe("CodexProvider.transformRequestBody", () => {
 
 		await expect(provider.transformRequestBody(request)).rejects.toThrow(
 			"tool_choice references unknown tool: WebSearch",
+		);
+	});
+
+	it("filters current Agent and Task tools for attributed descendants only", async () => {
+		const provider = new CodexProvider();
+		const payload = {
+			model: "claude-opus-4-8",
+			max_tokens: 10,
+			messages: [
+				{
+					role: "assistant",
+					content: [
+						{
+							type: "tool_use",
+							id: "agent-history",
+							name: "Agent",
+							input: { prompt: "historical call" },
+						},
+					],
+				},
+				{
+					role: "user",
+					content: [
+						{
+							type: "tool_result",
+							tool_use_id: "agent-history",
+							content: "historical result",
+						},
+					],
+				},
+			],
+			tools: ["Agent", "Task", "Read"].map((name) => ({
+				name,
+				description: `${name} tool`,
+				input_schema: { type: "object" },
+			})),
+		};
+		const transform = (attributed: boolean) =>
+			provider.transformRequestBody(
+				new Request("https://example.com/v1/messages", {
+					method: "POST",
+					headers: {
+						"content-type": "application/json",
+						...(attributed
+							? { "x-better-ccflare-attributed-agent": "true" }
+							: {}),
+					},
+					body: JSON.stringify(payload),
+				}),
+			);
+
+		const topLevel = await transform(false);
+		const topLevelBody = await topLevel.json();
+		expect(
+			topLevelBody.tools.map((tool: { name: string }) => tool.name),
+		).toEqual(["Agent", "Task", "Read"]);
+
+		const descendant = await transform(true);
+		const descendantBody = await descendant.json();
+		expect(
+			descendant.headers.get("x-better-ccflare-attributed-agent"),
+		).toBeNull();
+		expect(
+			descendantBody.tools.map((tool: { name: string }) => tool.name),
+		).toEqual(["Read"]);
+		expect(descendantBody.input).toContainEqual(
+			expect.objectContaining({
+				type: "function_call",
+				name: "Agent",
+				call_id: "agent-history",
+			}),
+		);
+		expect(descendantBody.input).toContainEqual(
+			expect.objectContaining({
+				type: "function_call_output",
+				call_id: "agent-history",
+				output: "historical result",
+			}),
+		);
+	});
+
+	it.each([
+		"Agent",
+		"Task",
+	])("rejects explicit %s tool_choice after descendant filtering", async (toolName) => {
+		const provider = new CodexProvider();
+		const request = new Request("https://example.com/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"x-better-ccflare-attributed-agent": "true",
+			},
+			body: JSON.stringify({
+				model: "claude-opus-4-8",
+				max_tokens: 10,
+				messages: [{ role: "user", content: "delegate" }],
+				tools: [
+					{
+						name: toolName,
+						description: "Delegate work.",
+						input_schema: { type: "object" },
+					},
+				],
+				tool_choice: { type: "tool", name: toolName },
+			}),
+		});
+
+		await expect(provider.transformRequestBody(request)).rejects.toThrow(
+			`tool_choice references unknown tool: ${toolName}`,
 		);
 	});
 
