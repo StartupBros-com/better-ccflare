@@ -67,13 +67,16 @@ describe("Codex trace wiring (integration)", () => {
 		const files = readdirSync(dir).filter((f) => f.endsWith(".jsonl"));
 		expect(files.length).toBe(1);
 		const rec = JSON.parse(readFileSync(join(dir, files[0]), "utf8").trim());
-		expect(rec.trace_schema_version).toBe(4);
+		expect(rec.trace_schema_version).toBe(5);
 		expect(rec.phase).toBe("request");
 		expect(rec.request_id).toBe("req_trace_1");
 		// Cache-key experiment is off by default in this test environment.
 		expect(rec.prompt_cache_key_set).toBe(false);
 		expect(rec.prompt_cache_key_id).toBeNull();
 		expect(rec.cache_key_mode).toBeNull();
+		expect(rec.is_descendant).toBe(false);
+		expect(rec.tools_before_count).toBe(rec.tools_after_count);
+		expect(rec.filtered_tool_names).toEqual([]);
 		expect(rec.model_in).toBe("claude-opus-4-8");
 		expect(rec.input_bytes).toBeGreaterThan(0);
 		expect(rec.input_hmac).toBeNull();
