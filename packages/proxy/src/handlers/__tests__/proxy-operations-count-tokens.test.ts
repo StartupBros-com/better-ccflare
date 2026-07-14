@@ -355,6 +355,73 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 		).toEqual(["Agent"]);
 	});
 
+	it.each([
+		["cc_version=2.1.207; cc_entrypoint=cli; cc_is_subagent=true", []],
+		["cc_version=2.1.207; cc_is_subagent=false", ["Agent"]],
+		["cc_version=2.1.207; cc_is_subagent=TRUE", ["Agent"]],
+		["cc_version=2.1.207; not_cc_is_subagent=true", ["Agent"]],
+	])("derives descendant containment from billing metadata %s", async (billingHeader, expectedTools) => {
+		let fetchedRequest: Request | null = null;
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			fetchedRequest = input instanceof Request ? input : new Request(input);
+			return new Response(JSON.stringify({ ok: true }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		});
+		const collectorSpy = spyOn(
+			usageCollectorModule,
+			"getUsageCollector",
+		).mockReturnValue({
+			handleStart: mock(() => {}),
+			handleChunk: mock(() => {}),
+			handleEnd: mock(() => Promise.resolve()),
+		} as unknown as usageCollectorModule.UsageCollector);
+
+		try {
+			const bodyBuffer = new TextEncoder().encode(
+				JSON.stringify({
+					model: "claude-sonnet-4-5",
+					messages: [{ role: "user", content: "hello world" }],
+					max_tokens: 16,
+					tools: [
+						{
+							name: "Agent",
+							description: "Spawn an agent.",
+							input_schema: { type: "object" },
+						},
+					],
+				}),
+			).buffer;
+			await proxyWithAccount(
+				makeMessagesRequest(bodyBuffer, {
+					"Content-Type": "application/json",
+					"x-anthropic-billing-header": billingHeader,
+				}),
+				new URL("https://proxy.local/v1/messages"),
+				makeCodexAccount({
+					access_token: "access-token",
+					expires_at: Date.now() + 60 * 60 * 1000,
+				}),
+				makeRequestMeta("/v1/messages"),
+				bodyBuffer,
+				() => undefined,
+				0,
+				makeProxyContext(),
+			);
+		} finally {
+			collectorSpy.mockRestore();
+		}
+
+		const upstreamBody = await fetchedRequest?.clone().json();
+		expect(
+			upstreamBody.tools.map((tool: { name: string }) => tool.name),
+		).toEqual(expectedTools);
+		expect(
+			fetchedRequest?.headers.get("x-better-ccflare-attributed-agent"),
+		).toBeNull();
+	});
+
 	it("does not trust client-supplied synthetic response markers", async () => {
 		let fetchedRequest: Request | null = null;
 		const fetchMock = mock(async (input: RequestInfo | URL) => {

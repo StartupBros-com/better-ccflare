@@ -28,7 +28,7 @@ export const CODEX_TRACE_HMAC_KEY_ENV = "CCFLARE_CODEX_TRACE_HMAC_KEY";
 /** Warn when one response spawns at least this many subagents (0 disables). */
 export const CODEX_FANOUT_WARN_ENV = "CCFLARE_CODEX_FANOUT_WARN";
 
-const TRACE_SCHEMA_VERSION = 4;
+const TRACE_SCHEMA_VERSION = 5;
 const DEFAULT_FANOUT_WARN = 8;
 /**
  * Tool names that spawn subagents in Claude Code ("Task" historically,
@@ -169,6 +169,9 @@ interface TraceInputs {
 	/** Effective request action: paced | bypassed | crossover-paced. */
 	pacingAction?: string | null;
 	instructions?: string;
+	isDescendant?: boolean;
+	toolsBeforeCount?: number;
+	filteredToolNames?: readonly string[];
 	tools?: readonly unknown[];
 	codexInput: readonly unknown[];
 	/** full bodies, only embedded when CCFLARE_CODEX_TRACE_FULL=1 */
@@ -260,6 +263,10 @@ export function writeCodexTrace(inputs: TraceInputs): void {
 		pacing_canary: inputs.pacingCanary ?? null,
 		pacing_cohort_id: inputs.pacingCohortId ?? null,
 		pacing_action: inputs.pacingAction ?? null,
+		is_descendant: inputs.isDescendant ?? false,
+		tools_before_count: inputs.toolsBeforeCount ?? inputs.tools?.length ?? 0,
+		tools_after_count: inputs.tools?.length ?? 0,
+		filtered_tool_names: inputs.filteredToolNames ?? [],
 		instructions_len: inputs.instructions?.length ?? null,
 		instructions_bytes: instructionsMetrics?.bytes ?? null,
 		instructions_hmac: instructionsMetrics?.hmac ?? null,
