@@ -102,6 +102,43 @@ describe("summarizeCodexTransform (request/history phase)", () => {
 		expect(first.input_hmac).not.toBe(changed.input_hmac);
 		expect(first.input_first_item_hmac).toBe(changed.input_first_item_hmac);
 	});
+
+	test("emits per-item HMACs that prove an earlier full input is a later prefix", () => {
+		process.env[CODEX_TRACE_HMAC_KEY_ENV] = "test-only-key";
+		const earlierInput = [
+			{ role: "user", content: "first" },
+			{ role: "assistant", content: "second" },
+		];
+		const earlier = summarizeCodexTransform(earlierInput);
+		const later = summarizeCodexTransform([
+			...earlierInput,
+			{ role: "user", content: "third" },
+		]);
+
+		expect(earlier.input_item_fingerprints).toEqual(
+			later.input_item_fingerprints.slice(0, earlierInput.length),
+		);
+		expect(earlier.input_item_total_count).toBe(2);
+		expect(earlier.input_item_fingerprints_truncated).toBe(false);
+	});
+
+	test("keeps per-item telemetry empty without a key and caps trace growth", () => {
+		const disabled = summarizeCodexTransform([{ value: "private" }]);
+		expect(disabled.input_item_fingerprints).toEqual([]);
+
+		process.env[CODEX_TRACE_HMAC_KEY_ENV] = "test-only-key";
+		const many = summarizeCodexTransform(
+			Array.from({ length: 100 }, (_, index) => ({ index })),
+		);
+		expect(many.input_item_fingerprints.length).toBeLessThan(100);
+		expect(many.input_item_fingerprints[0]).toEqual({
+			index: 0,
+			bytes: 11,
+			hmac: expect.any(String),
+		});
+		expect(many.input_item_total_count).toBe(100);
+		expect(many.input_item_fingerprints_truncated).toBe(true);
+	});
 });
 
 describe("summarizeCodexResponse (response phase)", () => {
