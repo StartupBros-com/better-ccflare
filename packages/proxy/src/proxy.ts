@@ -10,9 +10,12 @@ import type { Account } from "@better-ccflare/types";
 import { cacheBodyStore } from "./cache-body-store";
 import { recordDiagnosisCandidate } from "./cache-diagnosis";
 import {
-	acquireCachePacing,
-	type CachePacingSlot,
+	type CachePacingObservation,
+	derivePacingCohortKey,
 	finishPacing,
+	isCodexPacingBypassCandidate,
+	observeCachePacing,
+	recordCachePacingRoute,
 } from "./cache-pacing";
 import { warnOnLookbackRisk } from "./cache-telemetry";
 import {
@@ -51,6 +54,24 @@ import {
 } from "./usage-collector";
 
 export type { ProxyContext } from "./handlers";
+
+export function isReactivelyModelDepleted(opts: {
+	accountId: string;
+	model: string | null;
+	betaSignature: string | null;
+	syntheticProbe: boolean;
+	now?: number;
+}): boolean {
+	if (opts.syntheticProbe || !opts.model) return false;
+	return (
+		usageCache.getModelScopedExhaustion(
+			opts.accountId,
+			opts.model,
+			opts.betaSignature,
+			opts.now,
+		) != null
+	);
+}
 
 const log = new Logger("Proxy");
 
@@ -239,22 +260,35 @@ export async function handleProxy(
 		}
 	}
 
-	// 5c. Cache-aware fan-out pacing: parallel same-session requests all miss
-	// the prompt cache because an entry only becomes readable once the first
-	// response starts streaming. Hold concurrent followers (bounded) until the
-	// session leader's first body chunk so they read the cache it just wrote.
-	// Opt-in via CCFLARE_CACHE_PACING_MS; leader exit paths below must call
-	// finishPacing()/abandon() so followers never wait past the cap.
-	let pacingSlot: CachePacingSlot | null = null;
-	if (
+	// 5c. Cache pacing and the Codex-only bypass canary. Non-candidate controls
+	// retain the original wait-before-selection ordering. Candidates select
+	// early; after usage throttling, only a first usable Codex route bypasses.
+	// A candidate resolving elsewhere is paced before any upstream call and
+	// reselected afterward so Anthropic never receives stale or unpaced traffic.
+	const pacingEligible =
 		url.pathname === "/v1/messages" &&
 		!req.headers.get("x-better-ccflare-keepalive") &&
-		!req.headers.get("x-better-ccflare-auto-refresh")
-	) {
-		pacingSlot = await acquireCachePacing({
+		!req.headers.get("x-better-ccflare-auto-refresh");
+	const pacingCohortKey = pacingEligible
+		? derivePacingCohortKey(requestMeta.clientSessionId, parsedBody)
+		: null;
+	const canaryCandidate = isCodexPacingBypassCandidate(pacingCohortKey);
+	requestMeta.codexPacingCohortId = pacingCohortKey?.slice(0, 16) ?? null;
+	const effectiveModel = resolveEffectiveModel(appliedModel, requestModel);
+	let pacingObservation: CachePacingObservation | null = null;
+	let pacingBypassed = false;
+	// Immutable assignment. Effective action may become crossover-paced, but
+	// route cohort attribution must remain treatment, not control.
+	const assignedCodexPacingBypass = canaryCandidate;
+	let selectedAccounts: Account[] | null = null;
+
+	if (!canaryCandidate && pacingEligible) {
+		pacingObservation = await observeCachePacing({
 			sessionKey: requestMeta.clientSessionId,
-			model: appliedModel ?? requestModel,
+			model: effectiveModel,
 		});
+	}
+	if (pacingEligible) {
 		warnOnLookbackRisk(parsedBody, requestMeta.clientSessionId);
 		recordDiagnosisCandidate(
 			requestMeta.clientSessionId,
@@ -263,26 +297,22 @@ export async function handleProxy(
 		);
 	}
 
-	// 6. Select accounts. Route on the model that will actually be sent
-	// upstream (post-interceptor-rewrite), not the model the client asked
-	// for — otherwise combo routing and family-based selection see a model
-	// that no longer matches the outgoing request.
-	const effectiveModel = resolveEffectiveModel(appliedModel, requestModel);
-	const selectedAccounts = await selectAccountsForRequest(
+	// 6. Controls select after pacing. Candidates select here so the bypass
+	// decision can use the first actually available, usage-throttled account.
+	selectedAccounts = await selectAccountsForRequest(
 		requestMeta,
 		ctx,
 		effectiveModel ?? undefined,
 	);
-
+	const syntheticProbe =
+		req.headers.get("x-better-ccflare-keepalive") === "true";
 	const applyUsageThrottling = (accounts: Account[]) => {
 		const settings = {
 			fiveHourEnabled: ctx.config.getUsageThrottlingFiveHourEnabled(),
 			weeklyEnabled: ctx.config.getUsageThrottlingWeeklyEnabled(),
 		};
-		if (!settings.fiveHourEnabled && !settings.weeklyEnabled) {
-			return { available: accounts, throttled: [] as Account[] };
-		}
-
+		const predictiveUsageEnabled =
+			settings.fiveHourEnabled || settings.weeklyEnabled;
 		const now = Date.now();
 		const available: Account[] = [];
 		const throttled: Account[] = [];
@@ -299,16 +329,22 @@ export async function handleProxy(
 		const effectiveModel = appliedModel ?? requestModel ?? null;
 
 		for (const account of accounts) {
-			const throttleUntil = getUsageThrottleUntil(
-				usageCache.get(account.id),
-				settings,
-				now,
-				{
-					requestModel: comboRouted ? null : effectiveModel,
-					scopedMode: "match",
-				},
-			);
-			if (throttleUntil && throttleUntil > now) {
+			const throttleUntil = predictiveUsageEnabled
+				? getUsageThrottleUntil(usageCache.get(account.id), settings, now, {
+						requestModel: comboRouted ? null : effectiveModel,
+						scopedMode: "match",
+					})
+				: null;
+			const reactivelyDepleted =
+				!comboRouted &&
+				isReactivelyModelDepleted({
+					accountId: account.id,
+					model: effectiveModel,
+					betaSignature: req.headers.get("anthropic-beta"),
+					syntheticProbe,
+					now,
+				});
+			if ((throttleUntil && throttleUntil > now) || reactivelyDepleted) {
 				throttled.push(account);
 				continue;
 			}
@@ -324,8 +360,39 @@ export async function handleProxy(
 		return { available, throttled };
 	};
 
-	const { available: accounts, throttled: throttledAccounts } =
+	let { available: accounts, throttled: throttledAccounts } =
 		applyUsageThrottling(selectedAccounts);
+
+	if (canaryCandidate && accounts[0]?.provider === "codex") {
+		pacingBypassed = true;
+	} else if (canaryCandidate && pacingEligible) {
+		// This candidate did not resolve to a usable Codex route. Pace before any
+		// upstream call, then discard the pre-wait selection and route again so
+		// Anthropic availability/cooldowns are fresh after the wait.
+		pacingObservation = await observeCachePacing({
+			sessionKey: requestMeta.clientSessionId,
+			model: effectiveModel,
+		});
+		selectedAccounts = await selectAccountsForRequest(
+			requestMeta,
+			ctx,
+			effectiveModel ?? undefined,
+		);
+		({ available: accounts, throttled: throttledAccounts } =
+			applyUsageThrottling(selectedAccounts));
+	}
+	let pacingSlot = pacingObservation?.slot ?? null;
+	let crossoverPacingRestored = false;
+	requestMeta.codexPacingCanary = pacingEligible
+		? canaryCandidate
+			? "bypass"
+			: "control"
+		: null;
+	requestMeta.codexPacingAction = pacingEligible
+		? pacingBypassed
+			? "bypassed"
+			: "paced"
+		: null;
 
 	// 7. Handle no accounts case
 	if (accounts.length === 0) {
@@ -459,8 +526,28 @@ export async function handleProxy(
 			}
 		: null;
 	let response: Response | null = null;
+	let upstreamAttempts = 0;
+	const reactiveDepletionSkips: Account[] = [];
+	const betaSignature = req.headers.get("anthropic-beta");
 
 	for (let i = 0; i < accounts.length; i++) {
+		// A Codex treatment may fail over to Anthropic. Before the first
+		// non-Codex attempt, restore pacing so no crossover sends Anthropic
+		// traffic unpaced. The route is still marked as a crossover, not treatment.
+		if (
+			pacingBypassed &&
+			!crossoverPacingRestored &&
+			accounts[i].provider !== "codex"
+		) {
+			pacingObservation = await observeCachePacing({
+				sessionKey: requestMeta.clientSessionId,
+				model: effectiveModel,
+			});
+			pacingSlot = pacingObservation?.slot ?? null;
+			crossoverPacingRestored = true;
+			pacingBypassed = false;
+			requestMeta.codexPacingAction = "crossover-paced";
+		}
 		// For combo routing: enrich metadata with slot index and look up model override
 		let modelOverride: string | null = null;
 		if (filteredComboInfo?.slots[i]) {
@@ -478,6 +565,27 @@ export async function handleProxy(
 			);
 		}
 
+		const attemptModel = modelOverride ?? effectiveModel;
+		// Normal routes were filtered above. Combo slots need this attempt-level
+		// check because each slot may override the model independently.
+		if (
+			!syntheticProbe &&
+			filteredComboInfo &&
+			attemptModel &&
+			usageCache.getModelScopedExhaustion(
+				accounts[i].id,
+				attemptModel,
+				betaSignature,
+			)
+		) {
+			reactiveDepletionSkips.push(accounts[i]);
+			log.info(
+				`Skipping account ${accounts[i].name} for model ${attemptModel}: recent model-scoped out_of_credits`,
+			);
+			continue;
+		}
+
+		upstreamAttempts++;
 		response = await proxyWithAccount(
 			req,
 			url,
@@ -495,6 +603,18 @@ export async function handleProxy(
 		);
 
 		if (response) {
+			recordCachePacingRoute(
+				pacingObservation,
+				{
+					accountId: accounts[i].id,
+					accountName: accounts[i].name,
+					provider: accounts[i].provider,
+				},
+				{
+					candidate: pacingEligible,
+					assignedBypass: assignedCodexPacingBypass,
+				},
+			);
 			return finishPacing(pacingSlot, response);
 		}
 
@@ -531,6 +651,21 @@ export async function handleProxy(
 				`Fallback: trying ${fallbackAccounts.length} SessionStrategy accounts`,
 			);
 			for (let i = 0; i < fallbackAccounts.length; i++) {
+				if (
+					pacingBypassed &&
+					!crossoverPacingRestored &&
+					fallbackAccounts[i].provider !== "codex"
+				) {
+					pacingObservation = await observeCachePacing({
+						sessionKey: requestMeta.clientSessionId,
+						model: effectiveModel,
+					});
+					pacingSlot = pacingObservation?.slot ?? null;
+					crossoverPacingRestored = true;
+					pacingBypassed = false;
+					requestMeta.codexPacingAction = "crossover-paced";
+				}
+				upstreamAttempts++;
 				response = await proxyWithAccount(
 					req,
 					url,
@@ -548,6 +683,18 @@ export async function handleProxy(
 				);
 
 				if (response) {
+					recordCachePacingRoute(
+						pacingObservation,
+						{
+							accountId: fallbackAccounts[i].id,
+							accountName: fallbackAccounts[i].name,
+							provider: fallbackAccounts[i].provider,
+						},
+						{
+							candidate: pacingEligible,
+							assignedBypass: assignedCodexPacingBypass,
+						},
+					);
 					return finishPacing(pacingSlot, response);
 				}
 			}
@@ -558,6 +705,20 @@ export async function handleProxy(
 			return finishPacing(
 				pacingSlot,
 				createUsageThrottledResponse(throttledFallbackAccounts),
+			);
+		}
+	}
+
+	// If routing skipped every remaining candidate using direct, short-lived
+	// model-scoped depletion evidence, report temporary usage throttling rather
+	// than a generic all-accounts failure. The account itself remains available
+	// for other model families and beta configurations.
+	if (reactiveDepletionSkips.length > 0) {
+		if (upstreamAttempts === 0) {
+			cacheBodyStore.discardStaged(requestMeta.id);
+			return finishPacing(
+				pacingSlot,
+				createUsageThrottledResponse(reactiveDepletionSkips),
 			);
 		}
 	}

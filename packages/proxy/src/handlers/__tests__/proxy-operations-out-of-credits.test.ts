@@ -1,4 +1,13 @@
-import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import {
+	afterEach,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	mock,
+	spyOn,
+} from "bun:test";
+import { usageCache } from "@better-ccflare/providers";
 import type { Account, RequestMeta } from "@better-ccflare/types";
 import { proxyWithAccount } from "../proxy-operations";
 import type { ProxyContext } from "../proxy-types";
@@ -143,6 +152,7 @@ describe("proxyWithAccount — out_of_credits (issue #261)", () => {
 
 	afterEach(() => {
 		globalThis.fetch = originalFetch;
+		usageCache.delete("acc-anthropic-1");
 	});
 
 	it("does NOT bench the account and fails over on out_of_credits 429", async () => {
@@ -167,8 +177,16 @@ describe("proxyWithAccount — out_of_credits (issue #261)", () => {
 		// Failed over to the next account.
 		expect(result).toBeNull();
 
-		// Account was NOT benched.
+		// Account was NOT benched, but the exact model/beta candidate is marked
+		// reactively so the next request can skip this known failed route.
 		expect(account.rate_limited_until).toBeNull();
+		expect(
+			usageCache.getModelScopedExhaustion(
+				account.id,
+				"claude-sonnet-4-5",
+				null,
+			),
+		).not.toBeNull();
 		expect(account.consecutive_rate_limits).toBe(0);
 
 		// markAccountRateLimited was never called (no bench).
@@ -186,6 +204,62 @@ describe("proxyWithAccount — out_of_credits (issue #261)", () => {
 		expect(args[6]).toBe("out_of_credits");
 		// 10th positional arg is the `usage` parameter.
 		expect(args[9]).toEqual({ model: "claude-sonnet-4-5" });
+	});
+
+	it("keeps fallback-model out_of_credits scoped instead of benching the account", async () => {
+		let calls = 0;
+		globalThis.fetch = mock(async () => {
+			calls++;
+			return calls === 1
+				? new Response(
+						JSON.stringify({
+							type: "error",
+							error: {
+								type: "not_found_error",
+								message: "model not found",
+							},
+						}),
+						{ status: 404, headers: { "content-type": "application/json" } },
+					)
+				: outOfCreditsResponse();
+		});
+		const ctx = makeProxyContextWithAsyncExec();
+		const markScoped = spyOn(usageCache, "markModelScopedExhausted");
+		const account = makeAccount({
+			model_mappings: JSON.stringify({
+				sonnet: ["claude-sonnet-4-5", "claude-opus-4-8"],
+			}),
+		});
+		const bodyBuffer = makeRequestBody("claude-sonnet-4-5");
+		const result = await proxyWithAccount(
+			makeRequest(bodyBuffer),
+			new URL("https://proxy.local/v1/messages"),
+			account,
+			makeRequestMeta(),
+			bodyBuffer,
+			() => undefined,
+			0,
+			ctx,
+		);
+
+		expect(result).toBeNull();
+		expect(calls).toBe(2);
+		expect(account.rate_limited_until).toBeNull();
+		expect(markScoped).toHaveBeenCalledWith(
+			account.id,
+			"claude-opus-4-8",
+			null,
+		);
+		const markMock = ctx.dbOps.markAccountRateLimited as ReturnType<
+			typeof mock
+		>;
+		expect(markMock.mock.calls.length).toBe(0);
+		const saveMock = ctx.dbOps.saveRequest as ReturnType<typeof mock>;
+		expect(saveMock.mock.calls.length).toBe(1);
+		const args = saveMock.mock.calls[0] as unknown[];
+		expect(args[6]).toBe("out_of_credits");
+		expect(args[9]).toEqual({ model: "claude-opus-4-8" });
+		markScoped.mockRestore();
 	});
 
 	it("returns null without recording an audit row on keepalive out_of_credits 429", async () => {
@@ -217,9 +291,52 @@ describe("proxyWithAccount — out_of_credits (issue #261)", () => {
 		expect(result).toBeNull();
 		expect(account.rate_limited_until).toBeNull();
 
-		// keepalive path skips the audit row entirely.
+		// keepalive path skips the audit row and does not create routing evidence.
 		const saveMock = ctx.dbOps.saveRequest as ReturnType<typeof mock>;
 		expect(saveMock.mock.calls.length).toBe(0);
+		expect(
+			usageCache.getModelScopedExhaustion(
+				account.id,
+				"claude-sonnet-4-5",
+				null,
+			),
+		).toBeNull();
+	});
+
+	it("treats a literal false keepalive header as real traffic", async () => {
+		globalThis.fetch = mock(async () => outOfCreditsResponse());
+		const ctx = makeProxyContextWithAsyncExec();
+		const account = makeAccount();
+		const bodyBuffer = makeRequestBody();
+		const req = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			body: bodyBuffer,
+			headers: {
+				"Content-Type": "application/json",
+				"x-better-ccflare-keepalive": "false",
+			},
+		});
+
+		await proxyWithAccount(
+			req,
+			new URL(req.url),
+			account,
+			makeRequestMeta(),
+			bodyBuffer,
+			() => undefined,
+			0,
+			ctx,
+		);
+
+		expect(
+			usageCache.getModelScopedExhaustion(
+				account.id,
+				"claude-sonnet-4-5",
+				null,
+			),
+		).not.toBeNull();
+		const saveMock = ctx.dbOps.saveRequest as ReturnType<typeof mock>;
+		expect(saveMock.mock.calls.length).toBe(1);
 	});
 
 	it("persists null/null originalModel/appliedModel (not the equal pair) when requestMeta carries an unmodified pair (P2: isModelRewrite guard)", async () => {

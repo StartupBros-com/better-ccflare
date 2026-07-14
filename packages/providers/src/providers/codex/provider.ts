@@ -22,6 +22,9 @@ const log = new Logger("CodexProvider");
 const INTERNAL_HEADERS = [
 	"x-better-ccflare-request-id",
 	"x-better-ccflare-request-stream",
+	"x-better-ccflare-pacing-canary",
+	"x-better-ccflare-pacing-cohort-id",
+	"x-better-ccflare-pacing-action",
 ];
 
 function sanitizeResponseHeaders(headers: Headers): Headers {
@@ -517,6 +520,8 @@ export class CodexProvider extends BaseProvider {
 			}
 
 			const requestId = request.headers.get("x-better-ccflare-request-id");
+			const isAttributedAgent =
+				request.headers.get("x-better-ccflare-attributed-agent") === "true";
 			if (requestId) {
 				this.requestStreamById.set(requestId, {
 					stream: body.stream === true,
@@ -527,6 +532,7 @@ export class CodexProvider extends BaseProvider {
 				body,
 				account,
 				requestId ?? undefined,
+				isAttributedAgent,
 			);
 			if (isSubscriptionEndpoint) {
 				// ChatGPT's subscription Responses endpoint rejects this API-only field.
@@ -550,6 +556,11 @@ export class CodexProvider extends BaseProvider {
 						? "conversation"
 						: "session"
 					: null,
+				pacingCanary: request.headers.get("x-better-ccflare-pacing-canary"),
+				pacingCohortId: request.headers.get(
+					"x-better-ccflare-pacing-cohort-id",
+				),
+				pacingAction: request.headers.get("x-better-ccflare-pacing-action"),
 				instructions: codexBody.instructions,
 				tools: codexBody.tools,
 				codexInput: codexBody.input,
@@ -563,7 +574,12 @@ export class CodexProvider extends BaseProvider {
 				"x-better-ccflare-request-stream",
 				body.stream === true ? "true" : "false",
 			);
+
 			newHeaders.delete("x-better-ccflare-request-id");
+			newHeaders.delete("x-better-ccflare-attributed-agent");
+			newHeaders.delete("x-better-ccflare-pacing-canary");
+			newHeaders.delete("x-better-ccflare-pacing-cohort-id");
+			newHeaders.delete("x-better-ccflare-pacing-action");
 			newHeaders.delete("content-length");
 
 			return new Request(request.url, {
@@ -1188,6 +1204,7 @@ export class CodexProvider extends BaseProvider {
 		body: AnthropicRequest,
 		account?: Account,
 		requestId?: string,
+		isAttributedAgent = false,
 	): CodexRequest {
 		const model = this.mapModel(body.model, account);
 		if (process.env.DEBUG?.includes("model") || process.env.DEBUG === "true") {
@@ -1240,7 +1257,12 @@ export class CodexProvider extends BaseProvider {
 		// Convert tools
 		let tools: CodexTool[] | undefined;
 		if (body.tools && body.tools.length > 0) {
-			tools = body.tools.map((t) => ({
+			const currentTools = isAttributedAgent
+				? body.tools.filter(
+						(tool) => tool.name !== "Agent" && tool.name !== "Task",
+					)
+				: body.tools;
+			tools = currentTools.map((t) => ({
 				type: "function" as const,
 				name: t.name,
 				description: t.description,
@@ -1797,11 +1819,16 @@ export class CodexProvider extends BaseProvider {
 		) {
 			type = rawType;
 		}
+		const upstreamMessage = error?.message || "Codex upstream failed.";
+		const message =
+			code === "context_length_exceeded"
+				? `Prompt is too long. Codex reported: ${upstreamMessage}`
+				: upstreamMessage;
 		return {
 			type: "error",
 			error: {
 				type,
-				message: error?.message || "Codex upstream failed.",
+				message,
 				...(code ? { code } : {}),
 				...(status ? { status } : {}),
 			},

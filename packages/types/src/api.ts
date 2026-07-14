@@ -32,6 +32,12 @@ export interface RequestMeta {
 	originalModel?: string | null;
 	/** Model actually forwarded upstream after an agent-preference rewrite (equal to originalModel when none occurred). */
 	appliedModel?: string | null;
+	/** Immutable deterministic canary assignment (intention-to-treat). */
+	codexPacingCanary?: "control" | "bypass" | null;
+	/** Effective action on this request (per-protocol). */
+	codexPacingAction?: "paced" | "bypassed" | "crossover-paced" | null;
+	/** Privacy-preserving digest of the pacing-canary conversation identity. */
+	codexPacingCohortId?: string | null;
 }
 
 export interface AgentUpdatePayload {

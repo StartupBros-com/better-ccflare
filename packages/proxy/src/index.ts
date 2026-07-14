@@ -14,8 +14,15 @@ export { handleCacheDiagnosisRequest } from "./cache-diagnosis";
 export { CacheKeepaliveScheduler } from "./cache-keepalive-scheduler";
 export {
 	type CachePacingFamilyStats,
+	type CachePacingObservation,
+	type CachePacingRouteStats,
+	type CachePacingTarget,
+	CODEX_PACING_BYPASS_PERCENT_ENV,
+	getCachePacingRouteStats,
 	getCachePacingStats,
+	isCodexPacingBypassCandidate,
 	readCachePacingMs,
+	readCodexPacingBypassPercent,
 } from "./cache-pacing";
 export {
 	type CodexUsageRefreshOutcome,

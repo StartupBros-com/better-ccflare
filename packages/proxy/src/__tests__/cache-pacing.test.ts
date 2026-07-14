@@ -2,15 +2,23 @@ import { afterEach, describe, expect, test } from "bun:test";
 import {
 	acquireCachePacing,
 	CACHE_PACING_MS_ENV,
+	CODEX_PACING_BYPASS_PERCENT_ENV,
+	derivePacingCohortKey,
 	finishPacing,
+	getCachePacingRouteStats,
 	getCachePacingStats,
+	isCodexPacingBypassCandidate,
+	observeCachePacing,
 	readCachePacingMs,
+	readCodexPacingBypassPercent,
+	recordCachePacingRoute,
 	resetCachePacing,
 } from "../cache-pacing";
 
 afterEach(() => {
 	resetCachePacing();
 	delete process.env[CACHE_PACING_MS_ENV];
+	delete process.env[CODEX_PACING_BYPASS_PERCENT_ENV];
 });
 
 function sseResponse(chunks: string[], delayMs = 0): Response {
@@ -39,6 +47,94 @@ describe("readCachePacingMs", () => {
 		expect(readCachePacingMs()).toBe(15_000);
 		process.env[CACHE_PACING_MS_ENV] = "junk";
 		expect(readCachePacingMs()).toBe(0);
+	});
+});
+
+describe("Codex pacing bypass cohort", () => {
+	test("defaults off, parses strictly, and clamps to 100", () => {
+		expect(readCodexPacingBypassPercent()).toBe(0);
+		for (const invalid of ["junk", "1e2", "-1", "1.5"]) {
+			process.env[CODEX_PACING_BYPASS_PERCENT_ENV] = invalid;
+			expect(readCodexPacingBypassPercent()).toBe(0);
+		}
+		process.env[CODEX_PACING_BYPASS_PERCENT_ENV] = "17";
+		expect(readCodexPacingBypassPercent()).toBe(17);
+		process.env[CODEX_PACING_BYPASS_PERCENT_ENV] = "999";
+		expect(readCodexPacingBypassPercent()).toBe(100);
+	});
+
+	test("assignment is deterministic by conversation and missing identity stays control", () => {
+		process.env[CACHE_PACING_MS_ENV] = "15000";
+		const turn1 = derivePacingCohortKey("session-a", {
+			system: "same system",
+			messages: [{ role: "user", content: "task A" }],
+		});
+		const turn2 = derivePacingCohortKey("session-a", {
+			system: "same system",
+			messages: [
+				{ role: "user", content: "task A" },
+				{ role: "assistant", content: "working" },
+				{ role: "user", content: "continue" },
+			],
+		});
+		const sibling = derivePacingCohortKey("session-a", {
+			system: "same system",
+			messages: [{ role: "user", content: "task B" }],
+		});
+		expect(turn1).toBe(turn2);
+		expect(sibling).not.toBe(turn1);
+		expect(derivePacingCohortKey(null, { messages: [] })).toBeNull();
+		expect(isCodexPacingBypassCandidate(null, 100)).toBe(false);
+		expect(isCodexPacingBypassCandidate(turn1, 0)).toBe(false);
+		expect(isCodexPacingBypassCandidate(turn1, 100)).toBe(true);
+		const first = isCodexPacingBypassCandidate(turn1, 37);
+		for (let i = 0; i < 20; i++) {
+			expect(isCodexPacingBypassCandidate(turn1, 37)).toBe(first);
+		}
+	});
+
+	test("records treatment, control, and crossovers separately", () => {
+		const codex = {
+			accountId: "pro",
+			accountName: "pro-primary",
+			provider: "codex",
+		};
+		const anthropic = {
+			accountId: "max",
+			accountName: "max-secondary",
+			provider: "anthropic",
+		};
+		recordCachePacingRoute(null, codex, {
+			candidate: true,
+			assignedBypass: true,
+		});
+		const control = {
+			key: "k",
+			role: "leader" as const,
+			waitedMs: 0,
+			releaseReason: null,
+			slot: null,
+		};
+		recordCachePacingRoute(control, codex, {
+			candidate: true,
+			assignedBypass: false,
+		});
+		// The ordinary non-treatment population is also part of control.
+		recordCachePacingRoute(control, codex, {
+			candidate: true,
+			assignedBypass: false,
+		});
+		recordCachePacingRoute(null, anthropic, {
+			candidate: true,
+			assignedBypass: true,
+		});
+
+		const routes = getCachePacingRouteStats();
+		expect(routes.pro.canaryBypassServed).toBe(1);
+		expect(routes.pro.canaryControlServed).toBe(2);
+		expect(routes.pro.canaryCrossovers).toBe(0);
+		expect(routes.max.canaryCrossovers).toBe(1);
+		expect(routes.max.canaryBypassServed).toBe(0);
 	});
 });
 
@@ -178,7 +274,7 @@ describe("getCachePacingStats", () => {
 		expect(stats.anthropic.followersReleasedByLeader).toBe(1);
 		expect(stats.anthropic.followersReleasedByCap).toBe(0);
 		expect(stats.anthropic.followerWaitMsTotal).toBeGreaterThanOrEqual(0);
-		expect(stats.openai).toBeUndefined();
+		expect(stats.codex).toBeUndefined();
 	});
 
 	test("attributes cap releases and abandons, families separated", async () => {
@@ -202,10 +298,76 @@ describe("getCachePacingStats", () => {
 		expect(stats.anthropic).toBeUndefined();
 	});
 
-	test("reset clears stats", async () => {
+	test("attributes observations only after the serving route is known", async () => {
 		process.env[CACHE_PACING_MS_ENV] = "5000";
-		await acquireCachePacing({ sessionKey: "st4", model: "claude-opus-4-8" });
+		const leader = await observeCachePacing({
+			sessionKey: "shadow",
+			model: "claude-opus-4-8",
+		});
+		const followerPromise = observeCachePacing({
+			sessionKey: "shadow",
+			model: "claude-opus-4-8",
+		});
+		await new Promise((r) => setTimeout(r, 10));
+		const wrapped = finishPacing(
+			leader?.slot ?? null,
+			sseResponse(["event: a\n\n"], 1),
+		);
+		await wrapped.text();
+		const follower = await followerPromise;
+
+		// No selection-time attribution: only successful routes are counted.
+		expect(getCachePacingRouteStats()).toEqual({});
+		recordCachePacingRoute(leader, {
+			accountId: "acct-a",
+			accountName: "failed-first-account",
+			provider: "anthropic",
+		});
+		recordCachePacingRoute(follower, {
+			accountId: "acct-pro",
+			accountName: "pro-primary",
+			provider: "codex",
+		});
+
+		const routes = getCachePacingRouteStats();
+		expect(routes["acct-a"].leaders).toBe(1);
+		expect(routes["acct-a"].requestsServed).toBe(1);
+		expect(routes["acct-pro"].followersHeld).toBe(1);
+		expect(routes["acct-pro"].followersReleasedByLeader).toBe(1);
+		expect(routes["acct-pro"].followerWaitMsTotal).toBeGreaterThanOrEqual(0);
+		expect(routes["acct-pro"].provider).toBe("codex");
+	});
+
+	// Route counters are the Codex-bypass counterfactual: a served Codex
+	// follower's ordinary wait metrics are exactly what bypass would avoid.
+	test("preserves openai family compatibility while routes carry actual provider", async () => {
+		process.env[CACHE_PACING_MS_ENV] = "5000";
+		const observation = await observeCachePacing({
+			sessionKey: "codex",
+			model: "gpt-5.6-sol",
+		});
+		recordCachePacingRoute(observation, {
+			accountId: "acct-pro",
+			accountName: "pro-primary",
+			provider: "codex",
+		});
+		expect(getCachePacingStats().openai.leaders).toBe(1);
+		expect(getCachePacingRouteStats()["acct-pro"].provider).toBe("codex");
+		observation?.slot?.abandon();
+	});
+	test("reset clears family and route stats", async () => {
+		process.env[CACHE_PACING_MS_ENV] = "5000";
+		const observation = await observeCachePacing({
+			sessionKey: "st4",
+			model: "claude-opus-4-8",
+		});
+		recordCachePacingRoute(observation, {
+			accountId: "acct",
+			accountName: "account",
+			provider: "anthropic",
+		});
 		resetCachePacing();
 		expect(getCachePacingStats()).toEqual({});
+		expect(getCachePacingRouteStats()).toEqual({});
 	});
 });
