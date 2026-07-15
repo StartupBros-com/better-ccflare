@@ -87,7 +87,7 @@ The Codex path already solved the related failure mode where one Claude session 
 **Routing safety**
 
 - R5. When the feature is active and a request force-routes to an unavailable account, the system fails closed with an explicit unavailable outcome rather than silently selecting another account.
-- R6. The native Chat affinity identifier is attached only for verified official xAI endpoints. Custom or self-hosted endpoints remain ungated for this feature until separately verified.
+- R6. The native Chat affinity identifier is attached only for verified official xAI endpoints. Custom or self-hosted endpoints remain gated off for this feature until separately verified.
 - R7. When identity cannot be derived safely from request metadata, the system omits the native identifier rather than inventing an unstable or colliding one.
 
 **Proof and telemetry**
@@ -126,7 +126,7 @@ The Codex path already solved the related failure mode where one Claude session 
   - **Covers:** R8, R10
   - **Given:** Official xAI streaming and non-streaming fixtures that include cached-token usage details.
   - **When:** Those responses are translated.
-  - **Then:** Cache-read accounting is populated correctly, and a fixture with absent cache details records unknown rather than inventing a zero-hit result if the path can distinguish absence.
+  - **Then:** Cache-read accounting is populated correctly, and a fixture with absent cache details records `unknown` rather than inventing a zero-hit result.
 
 ### Success Criteria
 
@@ -176,6 +176,10 @@ The Codex path already solved the related failure mode where one Claude session 
 
 - Exact smoke-test harness for optional live official xAI canary traffic on non-Anthropic accounts.
 - Whether a future second flag is needed for session-only identity mode; v1 ships conversation-partitioned only.
+- How feature-active Grok ownership is established before strategy selection without changing non-xAI stickiness (provider-eligible account partition vs strategy wrap).
+- Discriminated force-route terminal result shape (status, error type, history, canary fields) so empty-account arrays do not enter passthrough.
+- Completion-side canary ownership boundary: request-scoped context store + stream/non-stream observer for hit/miss/unknown.
+- Whether identity/fingerprint derivation uses plain hash or deployment-scoped HMAC, and the telemetry retention/access policy for canary logs.
 
 ### Sources / Research
 
@@ -219,7 +223,7 @@ Request-scoped identity is derived once from Claude metadata and a stable conver
 - **KTD4. Official endpoint gate uses resolved host allowlist.** Official when the account's resolved endpoint host is `api.x.ai` (or an explicit verified allowlist). Custom endpoints stay inert even when the flag is on. Accounts whose custom_endpoint still resolves to official xAI may attach.
 - **KTD5. Request-scoped post-conversion hook for headers.** Current `afterConvert(body)` cannot attach headers. Prefer a request-scoped hook or `transformRequestBody` override that can set `x-grok-conv-id` from the original body without mutable provider-instance state.
 - **KTD6. Sticky ownership uses a conversation affinity key when the feature is active.** Existing `SessionAffinityStrategy` keys on raw `metadata.user_id` (session-level). For feature-active Grok traffic, thread a conversation-level affinity key into account selection so sibling conversations do not forced-share ownership, while still reusing restore-preserving failover semantics.
-- **KTD7. Force-route fail-closed is feature-scoped.** When the flag is on and `x-better-ccflare-account-id` names an unavailable account, return an explicit unavailable result before combo/normal selection. Preserve authenticated auto-refresh / `x-better-ccflare-bypass-session` probe behavior. Default flag-off behavior remains today's silent fallback.
+- **KTD7. Force-route fail-closed is feature-scoped to eligible Grok-native requests.** Fail closed only when the flag is on and the forced target is a known official-xAI account (or the request is otherwise marked Grok-native-eligible before selection). Unknown forced IDs with no account record keep today's fallback unless planning later chooses global fail-closed. Preserve authenticated auto-refresh / `x-better-ccflare-bypass-session` probe behavior. Default flag-off behavior remains today's silent fallback.
 - **KTD8. Usage proof rides shared OpenAI-compatible translation.** Continue mapping `usage.prompt_tokens_details.cached_tokens` into cache-read accounting. Add xAI-shaped fixtures for stream and non-stream. Distinguish absent cache details as unknown in canary telemetry when the response lacks the field.
 - **KTD9. Canary telemetry is compact structured logs.** Logger component such as `XaiCacheNative`. Fields: request id, account id/name, official-endpoint boolean, key-present, truncated identity fingerprint, prefix fingerprint, cache outcome (`hit`/`miss`/`unknown`/`fail_closed`), cached tokens, input tokens. No prompt bodies, raw session UUIDs, or auth material. Full Codex JSONL is out of scope.
 - **KTD10. No dashboard work in v1.** Request DB already has cache-read columns; if stream/non-stream translation already populates them, leave UI untouched.
@@ -348,7 +352,7 @@ Request-scoped identity is derived once from Claude metadata and a stable conver
 - **Test scenarios:**
   - Covers AE5. Non-stream usage with `cached_tokens` → cache-read populated.
   - Stream final usage chunk with `cached_tokens` → cache-read populated.
-  - Usage without `prompt_tokens_details` → canary outcome `unknown` (or documented equivalent).
+  - Usage without `prompt_tokens_details` → canary outcome `unknown`.
   - Canary log includes truncated identity fingerprint and account id, never raw session UUID/prompt.
   - Fail-closed path logs distinct reason.
 - **Verification:** provider/format/proxy tests covering AE5 and telemetry fields pass; `bun run lint && bun run typecheck` clean for touched packages.
