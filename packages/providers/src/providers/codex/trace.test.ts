@@ -231,6 +231,21 @@ describe("summarizeCodexResponse (response phase)", () => {
 		expect(s.error_status).toBe("rate_limited");
 	});
 
+	test.each([
+		"end_turn",
+		"tool_use",
+		"max_tokens",
+		"refusal",
+	] as const)("preserves the %s terminal reason without error metadata", (stopReason) => {
+		const s = summarizeCodexResponse([], { input_tokens: 10 }, stopReason, {
+			type: "must_not_leak",
+			message: "not an error",
+		});
+		expect(s.stop_reason).toBe(stopReason);
+		expect(s.error_type).toBeUndefined();
+		expect(s.error_message).toBeUndefined();
+	});
+
 	test("classifies metadata-free error stops without guessing a cause", () => {
 		const s = summarizeCodexResponse([], { input_tokens: 10 }, "error");
 		expect(s.stop_reason).toBe("error");

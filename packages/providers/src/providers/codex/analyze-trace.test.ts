@@ -161,10 +161,320 @@ describe("analyzeCodexTrace", () => {
 		});
 	});
 
-	test("parseTraceJsonl skips blank and malformed lines", () => {
+	test("reports fingerprint coverage and cache-key transitions in timestamp order", () => {
+		const fp = (index: number, hmac: string) => ({
+			index,
+			bytes: index + 1,
+			hmac,
+		});
+		const report = analyzeCodexTrace([
+			{
+				phase: "request",
+				ts: "2026-07-10T00:00:03Z",
+				prompt_cache_key_id: "key-a",
+				input_item_total_count: 3,
+				input_item_fingerprints: [fp(0, "a"), fp(1, "b"), fp(2, "c")],
+				input_item_fingerprints_truncated: false,
+				instructions_hmac: "instructions-2",
+				tools_hmac: "tools-1",
+			},
+			{
+				phase: "request",
+				ts: "2026-07-10T00:00:01Z",
+				prompt_cache_key_id: "key-a",
+				input_item_total_count: 2,
+				input_item_fingerprints: [fp(0, "a"), fp(1, "b")],
+				input_item_fingerprints_truncated: false,
+				instructions_hmac: "instructions-1",
+				tools_hmac: "tools-1",
+			},
+			{
+				phase: "request",
+				ts: "2026-07-10T00:00:04Z",
+				prompt_cache_key_id: "key-a",
+				input_item_total_count: 100,
+				input_item_fingerprints: [fp(36, "x")],
+				input_item_fingerprints_truncated: true,
+				instructions_hmac: null,
+				tools_hmac: null,
+			},
+			{
+				phase: "request",
+				ts: "2026-07-10T00:00:02Z",
+				prompt_cache_key_id: null,
+				input_item_total_count: 1,
+				input_item_fingerprints: [fp(0, "a")],
+				instructions_hmac: null,
+				tools_hmac: null,
+			},
+			{
+				phase: "request",
+				ts: "2026-07-10T00:00:05Z",
+				prompt_cache_key_id: "key-b",
+				input_item_total_count: 1,
+				input_item_fingerprints: [],
+				input_item_fingerprints_truncated: false,
+			},
+			{
+				phase: "request",
+				ts: "2026-07-10T00:00:06Z",
+				prompt_cache_key_id: "key-b",
+				input_item_total_count: 2,
+				input_item_fingerprints: [],
+				input_item_fingerprints_truncated: false,
+			},
+		]);
+
+		expect(report.request.fingerprintCoverage).toEqual({
+			usable: 4,
+			missing: 2,
+			truncated: 1,
+		});
+		expect(report.request.prefixTransitions).toEqual({
+			retainedExactPriorFullPrefix: 1,
+			measurableChanged: 0,
+			unavailableAbsentFingerprints: 1,
+			unavailableRetentionWindow: 1,
+		});
+		expect(report.request.instructionStability).toEqual({
+			stable: 0,
+			changed: 1,
+			unavailable: 2,
+		});
+		expect(report.request.toolStability).toEqual({
+			stable: 1,
+			changed: 0,
+			unavailable: 2,
+		});
+	});
+
+	test("classifies changed prefixes and never matches null cache keys or HMACs", () => {
+		const report = analyzeCodexTrace([
+			{
+				phase: "request",
+				ts: "1",
+				prompt_cache_key_id: "key",
+				input_item_total_count: 1,
+				input_item_fingerprints: [{ index: 0, bytes: 1, hmac: "old" }],
+				instructions_hmac: null,
+				tools_hmac: null,
+			},
+			{
+				phase: "request",
+				ts: "2",
+				prompt_cache_key_id: "key",
+				input_item_total_count: 2,
+				input_item_fingerprints: [{ index: 0, bytes: 1, hmac: "new" }],
+				instructions_hmac: null,
+				tools_hmac: null,
+			},
+			{ phase: "request", ts: "3", prompt_cache_key_id: null },
+			{ phase: "request", ts: "4", prompt_cache_key_id: null },
+		]);
+		expect(report.request.prefixTransitions.measurableChanged).toBe(1);
+		expect(report.request.instructionStability.stable).toBe(0);
+		expect(report.request.toolStability.stable).toBe(0);
+	});
+
+	test("reports context boundaries, terminals, weighted reuse, usage, and true errors", () => {
+		const report = analyzeCodexTrace([
+			{
+				phase: "response",
+				context_utilization_pct: 49.9,
+				stop_reason: "end_turn",
+				input_tokens: 100,
+				output_tokens: 1,
+				cache_read_input_tokens: 0,
+				cache_creation_input_tokens: 2,
+			},
+			{
+				phase: "response",
+				context_utilization_pct: 50,
+				stop_reason: "max_tokens",
+				input_tokens: 300,
+				output_tokens: 2,
+				cache_read_input_tokens: 150,
+			},
+			{
+				phase: "response",
+				context_utilization_pct: 80,
+				stop_reason: "refusal",
+				input_tokens: 0,
+				output_tokens: 3,
+				cache_read_input_tokens: 0,
+			},
+			{
+				phase: "response",
+				context_utilization_pct: 95,
+				stop_reason: "tool_use",
+				input_tokens: 100,
+				output_tokens: 4,
+				cache_read_input_tokens: 100,
+			},
+			{
+				phase: "response",
+				context_utilization_pct: null,
+				stop_reason: "error",
+				error_type: "rate_limit_error",
+				error_code: "rate_limit_exceeded",
+				error_status: "rate_limited",
+				input_tokens: 0,
+				output_tokens: 0,
+			},
+		]);
+		expect(report.response.contextBands).toEqual({
+			under50: {
+				responses: 1,
+				terminals: { end_turn: 1 },
+				zeroCacheResponses: 1,
+				weightedCacheReusePct: 0,
+			},
+			from50To80: {
+				responses: 1,
+				terminals: { max_tokens: 1 },
+				zeroCacheResponses: 0,
+				weightedCacheReusePct: 50,
+			},
+			from80To95: {
+				responses: 1,
+				terminals: { refusal: 1 },
+				zeroCacheResponses: 1,
+				weightedCacheReusePct: null,
+			},
+			atLeast95: {
+				responses: 1,
+				terminals: { tool_use: 1 },
+				zeroCacheResponses: 0,
+				weightedCacheReusePct: 100,
+			},
+			unavailable: {
+				responses: 1,
+				terminals: { error: 1 },
+				zeroCacheResponses: 0,
+				weightedCacheReusePct: null,
+			},
+		});
+		expect(report.response.stopReasons).toEqual({
+			end_turn: 1,
+			max_tokens: 1,
+			refusal: 1,
+			tool_use: 1,
+			error: 1,
+		});
+		expect(report.response.zeroCacheResponses).toBe(2);
+		expect(report.response.weightedCacheReusePct).toBe(50);
+		expect(report.response.usage).toEqual({
+			inputTokens: 500,
+			outputTokens: 10,
+			cacheReadInputTokens: 250,
+			cacheCreationInputTokens: 2,
+		});
+		expect(report.response.errors).toEqual({ rate_limit_error: 1 });
+		expect(report.response.errorCodes).toEqual({ rate_limit_exceeded: 1 });
+		expect(report.response.errorStatuses).toEqual({ rate_limited: 1 });
+	});
+
+	test("keeps schema 6 and schema 7 records compatible in one report", () => {
+		const report = analyzeCodexTrace([
+			{
+				trace_schema_version: 6,
+				phase: "response",
+				stop_reason: "error",
+				error_type: "legacy",
+			},
+			{ trace_schema_version: 7, phase: "response", stop_reason: "max_tokens" },
+		]);
+		expect(report.response.stopReasons).toEqual({ error: 1, max_tokens: 1 });
+		expect(report.response.errors).toEqual({ legacy: 1 });
+	});
+
+	test("classifies a shorter complete input as measurably changed", () => {
+		const fingerprints = (count: number) =>
+			Array.from({ length: count }, (_, index) => ({
+				index,
+				bytes: index + 1,
+				hmac: `fp-${index}`,
+			}));
+		const report = analyzeCodexTrace([
+			{
+				phase: "request",
+				ts: "1",
+				prompt_cache_key_id: "key",
+				input_item_total_count: 3,
+				input_item_fingerprints: fingerprints(3),
+				input_item_fingerprints_truncated: false,
+			},
+			{
+				phase: "request",
+				ts: "2",
+				prompt_cache_key_id: "key",
+				input_item_total_count: 2,
+				input_item_fingerprints: fingerprints(2),
+				input_item_fingerprints_truncated: false,
+			},
+		]);
+		expect(report.request.prefixTransitions.measurableChanged).toBe(1);
+		expect(report.request.prefixTransitions.unavailableAbsentFingerprints).toBe(
+			0,
+		);
+	});
+
+	test("excludes missing cache telemetry from zero-cache and weighted reuse", () => {
+		const report = analyzeCodexTrace([
+			{ phase: "response", input_tokens: 900 },
+			{
+				phase: "response",
+				input_tokens: 100,
+				cache_read_input_tokens: 50,
+			},
+		]);
+		expect(report.response.zeroCacheResponses).toBe(0);
+		expect(report.response.weightedCacheReusePct).toBe(50);
+	});
+
+	test("classifies a missing retained boundary as a measurable prefix change", () => {
+		const report = analyzeCodexTrace([
+			{
+				phase: "request",
+				ts: "1",
+				prompt_cache_key_id: "key",
+				input_item_total_count: 2,
+				input_item_fingerprints: [
+					{ index: 0, bytes: 1, hmac: "a" },
+					{ index: 1, bytes: 2, hmac: "b" },
+				],
+			},
+			{
+				phase: "request",
+				ts: "2",
+				prompt_cache_key_id: "key",
+				input_item_total_count: 3,
+				input_item_fingerprints: [
+					{ index: 0, bytes: 1, hmac: "a" },
+					{ index: 2, bytes: 3, hmac: "c" },
+				],
+			},
+		]);
+		expect(report.request.prefixTransitions.measurableChanged).toBe(1);
+		expect(report.request.prefixTransitions.unavailableAbsentFingerprints).toBe(
+			0,
+		);
+	});
+
+	test("handles request volumes above the engine argument limit", () => {
+		const request = { phase: "request" as const, input_item_count: 1 };
+		const report = analyzeCodexTrace(
+			Array.from({ length: 150_000 }, () => request),
+		);
+		expect(report.requests).toBe(150_000);
+		expect(report.request.maxInputItems).toBe(1);
+	});
+
+	test("parseTraceJsonl skips blank, malformed, and non-object lines", () => {
 		const recs = parseTraceJsonl(
-			'{"phase":"request"}\n\nnot-json\n{"phase":"response"}\n',
+			'{"phase":"request"}\n\nnot-json\nnull\n42\n[]\n{"phase":"response"}\n',
 		);
 		expect(recs.length).toBe(2);
+		expect(() => analyzeCodexTrace(recs)).not.toThrow();
 	});
 });

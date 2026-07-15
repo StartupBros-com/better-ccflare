@@ -11,7 +11,6 @@ import type { Account } from "@better-ccflare/types";
 import { BaseProvider } from "../../base";
 import {
 	estimateAnthropicRequestTokens,
-	MODEL_CONTEXT_WINDOWS,
 	resolveModelContextCapability,
 } from "../../request-capabilities";
 import type { RateLimitInfo, TokenRefreshResult } from "../../types";
@@ -1649,7 +1648,10 @@ export class CodexProvider extends BaseProvider {
 					writeCodexResponseTrace({
 						requestId,
 						modelOut: state.model,
-						modelContextWindow: MODEL_CONTEXT_WINDOWS[state.model],
+						modelContextWindow: resolveModelContextCapability(
+							"codex",
+							state.model,
+						)?.rawContextWindow,
 						summary: summarizeCodexResponse(
 							state.traceNewToolCalls,
 							{ output_tokens: state.outputTokens },
@@ -1973,6 +1975,45 @@ export class CodexProvider extends BaseProvider {
 
 			case "error":
 			case "response.failed": {
+				const response =
+					data.response && typeof data.response === "object"
+						? (data.response as Record<string, unknown>)
+						: undefined;
+				const usage = response?.usage as
+					| {
+							input_tokens?: number;
+							output_tokens?: number;
+							input_tokens_details?: {
+								cached_tokens?: number;
+								cache_creation_input_tokens?: number;
+							};
+					  }
+					| undefined;
+				if (usage) {
+					const details = usage.input_tokens_details;
+					const normalized = normalizeCodexInputUsage(
+						usage.input_tokens,
+						details?.cached_tokens,
+					);
+					state.totalInputTokens = normalized.totalInputTokens;
+					state.inputTokens = normalized.inputTokens;
+					state.cacheReadInputTokens = normalized.cacheReadInputTokens;
+					if (
+						typeof usage.output_tokens === "number" &&
+						Number.isFinite(usage.output_tokens) &&
+						usage.output_tokens >= 0
+					) {
+						state.outputTokens = usage.output_tokens;
+					}
+					state.cacheCreationInputTokens =
+						typeof details?.cache_creation_input_tokens === "number" &&
+						Number.isFinite(details.cache_creation_input_tokens) &&
+						details.cache_creation_input_tokens >= 0
+							? details.cache_creation_input_tokens
+							: 0;
+				}
+				if (typeof response?.model === "string") state.model = response.model;
+				state.contextWindow = this.extractContextWindow(response, usage);
 				state.upstreamError = this.normalizeCodexStreamError(eventName, data);
 				if (!state.hasSentTerminalEvents) {
 					if (state.hasSentContentBlockStart) {
@@ -1990,11 +2031,14 @@ export class CodexProvider extends BaseProvider {
 					writeCodexResponseTrace({
 						requestId: state.traceRequestId,
 						modelOut: state.model,
-						modelContextWindow: MODEL_CONTEXT_WINDOWS[state.model],
+						modelContextWindow: resolveModelContextCapability(
+							"codex",
+							state.model,
+						)?.rawContextWindow,
 						summary: summarizeCodexResponse(
 							state.traceNewToolCalls,
 							{
-								input_tokens: state.inputTokens,
+								input_tokens: state.totalInputTokens,
 								output_tokens: state.outputTokens,
 								cache_read_input_tokens: state.cacheReadInputTokens,
 								cache_creation_input_tokens: state.cacheCreationInputTokens,
@@ -2108,7 +2152,10 @@ export class CodexProvider extends BaseProvider {
 				writeCodexResponseTrace({
 					requestId: state.traceRequestId,
 					modelOut: state.model,
-					modelContextWindow: MODEL_CONTEXT_WINDOWS[state.model],
+					modelContextWindow: resolveModelContextCapability(
+						"codex",
+						state.model,
+					)?.rawContextWindow,
 					summary: summarizeCodexResponse(
 						state.traceNewToolCalls,
 						{
@@ -2117,14 +2164,7 @@ export class CodexProvider extends BaseProvider {
 							cache_read_input_tokens: state.cacheReadInputTokens,
 							cache_creation_input_tokens: state.cacheCreationInputTokens,
 						},
-						// The trace schema's stop_reason column predates incomplete
-						// handling and only models success/error; bucket max_tokens and
-						// refusal as "error" there so the trace stays valid without
-						// widening a persisted, versioned schema for a rare terminal.
-						messageDelta.delta.stop_reason === "tool_use" ||
-							messageDelta.delta.stop_reason === "end_turn"
-							? messageDelta.delta.stop_reason
-							: "error",
+						messageDelta.delta.stop_reason,
 					),
 				});
 				await writeSSE("message_stop", { type: "message_stop" });

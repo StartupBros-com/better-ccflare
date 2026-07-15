@@ -28,7 +28,7 @@ export const CODEX_TRACE_HMAC_KEY_ENV = "CCFLARE_CODEX_TRACE_HMAC_KEY";
 /** Warn when one response spawns at least this many subagents (0 disables). */
 export const CODEX_FANOUT_WARN_ENV = "CCFLARE_CODEX_FANOUT_WARN";
 
-const TRACE_SCHEMA_VERSION = 6;
+const TRACE_SCHEMA_VERSION = 7;
 const DEFAULT_FANOUT_WARN = 8;
 const MAX_INPUT_ITEM_FINGERPRINTS = 64;
 /**
@@ -83,7 +83,7 @@ export interface CodexResponseSummary {
 	new_subagent_spawn_count: number;
 	new_tool_use_by_name: Record<string, number>;
 	new_tool_calls: ToolCallSummary[];
-	stop_reason: "tool_use" | "end_turn" | "error";
+	stop_reason: "tool_use" | "end_turn" | "max_tokens" | "refusal" | "error";
 	input_tokens: number;
 	output_tokens: number;
 	cache_read_input_tokens: number;
@@ -262,11 +262,13 @@ export function summarizeCodexResponse(
 					) / 10
 				: null,
 		...(stopReason === "error"
-			? { error_type: error?.type || "unclassified_upstream_error" }
+			? {
+					error_type: error?.type || "unclassified_upstream_error",
+					...(error?.message ? { error_message: error.message } : {}),
+					...(error?.code ? { error_code: error.code } : {}),
+					...(error?.status ? { error_status: error.status } : {}),
+				}
 			: {}),
-		...(error?.message ? { error_message: error.message } : {}),
-		...(error?.code ? { error_code: error.code } : {}),
-		...(error?.status ? { error_status: error.status } : {}),
 	};
 }
 
