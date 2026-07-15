@@ -237,6 +237,30 @@ const usagePollingRetryTimeouts = new Map<string, NodeJS.Timeout>();
 // SSL/TLS configuration
 let tlsEnabled = false;
 
+async function cleanupCacheFlightRecorderRetention(
+	config: Config,
+	dbOps: DatabaseOperations,
+	log: Logger,
+): Promise<void> {
+	try {
+		const retentionHours = config.getCacheFlightRecorderRetentionHours();
+		const now = Date.now();
+		const retentionMs = retentionHours * 60 * 60 * 1000;
+		const expired = await dbOps.expireCacheFlightRecorderTimelines(
+			now - retentionMs,
+			now + retentionMs,
+		);
+		await dbOps.expireCacheFlightRecorderTombstones(now);
+		if (expired > 0) {
+			log.info(
+				`Expired ${expired} cache flight recorder timelines (retention=${retentionHours}h)`,
+			);
+		}
+	} catch (err) {
+		log.error(`Cache flight recorder retention error: ${err}`);
+	}
+}
+
 // Startup maintenance (one-shot): cleanup only (compaction available via API endpoint)
 async function runStartupMaintenance(
 	config: Config,
@@ -259,19 +283,10 @@ async function runStartupMaintenance(
 		if (removedSnapshots > 0) {
 			log.info(`Pruned ${removedSnapshots} old usage snapshots`);
 		}
-		const recorderRetentionHours =
-			config.getCacheFlightRecorderRetentionHours();
-		const expiredTimelines = await dbOps.expireCacheFlightRecorderTimelines(
-			Date.now() - recorderRetentionHours * 60 * 60 * 1000,
-		);
-		if (expiredTimelines > 0) {
-			log.info(
-				`Expired ${expiredTimelines} cache flight recorder timelines (retention=${recorderRetentionHours}h)`,
-			);
-		}
 	} catch (err) {
 		log.error(`Startup cleanup error: ${err}`);
 	}
+	await cleanupCacheFlightRecorderRetention(config, dbOps, log);
 	try {
 		// Clean up expired OAuth sessions
 		const removedSessions = await dbOps.cleanupExpiredOAuthSessions();
@@ -858,19 +873,10 @@ export default async function startServer(options?: {
 			if (removedSnapshots > 0) {
 				log.info(`Pruned ${removedSnapshots} old usage snapshots`);
 			}
-			const recorderRetentionHours =
-				config.getCacheFlightRecorderRetentionHours();
-			const expiredTimelines = await dbOps.expireCacheFlightRecorderTimelines(
-				Date.now() - recorderRetentionHours * 60 * 60 * 1000,
-			);
-			if (expiredTimelines > 0) {
-				log.info(
-					`Expired ${expiredTimelines} cache flight recorder timelines (retention=${recorderRetentionHours}h)`,
-				);
-			}
 		} catch (err) {
 			log.error(`Periodic data retention cleanup error: ${err}`);
 		}
+		await cleanupCacheFlightRecorderRetention(config, dbOps, log);
 	};
 
 	// Periodic data retention cleanup every 1 hour (reduced from 6 hours for more aggressive cleanup).

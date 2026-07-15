@@ -36,6 +36,10 @@ export interface CacheFlightRecorderTimeline extends Timeline {
 	droppedEvents: number;
 }
 
+export type CacheFlightRecorderLookup =
+	| { status: "found"; timeline: CacheFlightRecorderTimeline }
+	| { status: "expired" | "not_found" };
+
 const TURN_EVIDENCE_KEYS = new Set<keyof TurnEvidence>([
 	"sequence",
 	"timestamp",
@@ -69,6 +73,10 @@ export class CacheFlightRecorderRepository extends BaseRepository<Timeline> {
 	): Promise<void> {
 		this.assertPrivacySafeRecorderId(recorderConversationId);
 		this.assertPrivacySafeTurn(turn);
+		await this.run(
+			"DELETE FROM cache_flight_recorder_tombstones WHERE recorder_conversation_id = ?",
+			[recorderConversationId],
+		);
 		await this.run(
 			`INSERT INTO cache_flight_recorder_conversations (
 				recorder_conversation_id, created_at, updated_at, incomplete, dropped_events
@@ -152,6 +160,24 @@ export class CacheFlightRecorderRepository extends BaseRepository<Timeline> {
 		};
 	}
 
+	async lookupTimeline(
+		recorderConversationId: string,
+	): Promise<CacheFlightRecorderLookup> {
+		this.assertPrivacySafeRecorderId(recorderConversationId);
+		const timeline = await this.loadTimeline(recorderConversationId);
+		if (timeline) return { status: "found", timeline };
+		const tombstone = await this.get<{ found: number }>(
+			`SELECT 1 AS found FROM cache_flight_recorder_tombstones
+			 WHERE recorder_conversation_id = ?`,
+			[recorderConversationId],
+		);
+		if (!tombstone) return { status: "not_found" };
+		const recreated = await this.loadTimeline(recorderConversationId);
+		return recreated
+			? { status: "found", timeline: recreated }
+			: { status: "expired" };
+	}
+
 	async markIncomplete(
 		recorderConversationId: string,
 		options: MarkIncompleteOptions = {},
@@ -195,14 +221,35 @@ export class CacheFlightRecorderRepository extends BaseRepository<Timeline> {
 		};
 	}
 
-	async expireOlderThan(cutoffTs: number): Promise<number> {
-		const expired = await this.query<{ recorder_conversation_id: string }>(
-			`DELETE FROM cache_flight_recorder_conversations
-			 WHERE updated_at < ?
-			 RETURNING recorder_conversation_id`,
-			[cutoffTs],
+	async expireOlderThan(
+		cutoffTs: number,
+		tombstoneExpiresAt: number,
+	): Promise<number> {
+		const [expired] = await this.adapter.runBatchWithChanges([
+			{
+				sql: `INSERT INTO cache_flight_recorder_tombstones (
+					recorder_conversation_id, expires_at
+				) SELECT recorder_conversation_id, ?
+				FROM cache_flight_recorder_conversations
+				WHERE updated_at < ?
+				ON CONFLICT (recorder_conversation_id) DO UPDATE SET
+					expires_at = EXCLUDED.expires_at`,
+				params: [tombstoneExpiresAt, cutoffTs],
+			},
+			{
+				sql: `DELETE FROM cache_flight_recorder_conversations
+				 WHERE updated_at < ?`,
+				params: [cutoffTs],
+			},
+		]);
+		return expired ?? 0;
+	}
+
+	async expireTombstonesOlderThan(now: number): Promise<number> {
+		return this.runWithChanges(
+			`DELETE FROM cache_flight_recorder_tombstones WHERE expires_at < ?`,
+			[now],
 		);
-		return expired.length;
 	}
 
 	private assertPrivacySafeRecorderId(recorderConversationId: string): void {

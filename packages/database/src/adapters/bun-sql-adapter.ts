@@ -294,6 +294,34 @@ export class BunSqlAdapter {
 		return (result as unknown as { count: number }).count ?? 0;
 	}
 
+	/** Execute a fixed DML batch atomically and return each affected-row count. */
+	async runBatchWithChanges(
+		statements: Array<{ sql: string; params?: unknown[] }>,
+	): Promise<number[]> {
+		if (this.isSQLite && this.sqliteDb) {
+			const db = this.sqliteDb;
+			return this.withBusyRetry(() =>
+				db.transaction(() =>
+					statements.map(
+						({ sql, params = [] }) => db.run(sql, params as never[]).changes,
+					),
+				)(),
+			);
+		}
+		if (!this.sql) throw new Error("SQL client not available for transaction");
+		return this.sql.begin(async (tx) => {
+			const changes: number[] = [];
+			for (const statement of statements) {
+				const result = await tx.unsafe(
+					this.pgSql(statement.sql),
+					statement.params as never[],
+				);
+				changes.push((result as unknown as { count?: number }).count ?? 0);
+			}
+			return changes;
+		});
+	}
+
 	/**
 	 * Execute a function within a transaction.
 	 * For SQLite: uses bun:sqlite's synchronous transaction API.

@@ -44,6 +44,7 @@ describe("cache flight recorder schema", () => {
 			.all() as Array<{ name: string }>;
 		expect(tables.map((row) => row.name)).toEqual([
 			"cache_flight_recorder_conversations",
+			"cache_flight_recorder_tombstones",
 			"cache_flight_recorder_turns",
 		]);
 		db.close();
@@ -75,6 +76,13 @@ describe("cache flight recorder schema", () => {
 				sql.includes("CREATE TABLE IF NOT EXISTS cache_flight_recorder_turns"),
 			),
 		).toBe(true);
+		expect(
+			statements.some((sql) =>
+				sql.includes(
+					"CREATE TABLE IF NOT EXISTS cache_flight_recorder_tombstones",
+				),
+			),
+		).toBe(true);
 
 		statements.length = 0;
 		await runMigrationsPg(adapter as never);
@@ -88,6 +96,13 @@ describe("cache flight recorder schema", () => {
 		expect(
 			statements.some((sql) =>
 				sql.includes("CREATE TABLE IF NOT EXISTS cache_flight_recorder_turns"),
+			),
+		).toBe(true);
+		expect(
+			statements.some((sql) =>
+				sql.includes(
+					"CREATE TABLE IF NOT EXISTS cache_flight_recorder_tombstones",
+				),
 			),
 		).toBe(true);
 	});
@@ -143,27 +158,87 @@ describe("CacheFlightRecorderRepository", () => {
 		db.close();
 	});
 
-	it("expires only timelines older than the cutoff and reports expired separately", async () => {
+	it("distinguishes bounded expired tombstones from never-observed IDs", async () => {
 		const db = makeDb();
 		const repo = new CacheFlightRecorderRepository(new BunSqlAdapter(db));
 		await repo.appendTurn("old-id", turn(1), 1_000);
 		await repo.appendTurn("new-id", turn(1), 5_000);
 		await repo.markIncomplete("new-id", { dropped: true, at: 5_100 });
 
-		expect(await repo.expireOlderThan(3_000)).toBe(1);
-		expect(await repo.loadTimeline("old-id")).toBeNull();
+		expect(await repo.expireOlderThan(3_000, 7_000)).toBe(1);
+		expect(await repo.lookupTimeline("old-id")).toEqual({ status: "expired" });
+		expect(await repo.lookupTimeline("never-seen-id")).toEqual({
+			status: "not_found",
+		});
+		const tombstoneColumns = db
+			.query("PRAGMA table_info(cache_flight_recorder_tombstones)")
+			.all() as Array<{ name: string }>;
+		expect(tombstoneColumns.map((column) => column.name)).toEqual([
+			"recorder_conversation_id",
+			"expires_at",
+		]);
 		const oldTurns = db
 			.query(
 				"SELECT COUNT(*) AS count FROM cache_flight_recorder_turns WHERE recorder_conversation_id = ?",
 			)
 			.get("old-id") as { count: number };
 		expect(oldTurns.count).toBe(0);
-		expect(await repo.loadTimeline("new-id")).not.toBeNull();
+		expect(await repo.lookupTimeline("new-id")).toMatchObject({
+			status: "found",
+		});
 		expect(await repo.countRetained()).toBe(1);
 		expect(await repo.countDroppedIncomplete()).toEqual({
 			dropped: 1,
 			incomplete: 1,
 		});
+
+		expect(await repo.expireTombstonesOlderThan(7_001)).toBe(1);
+		expect(await repo.lookupTimeline("old-id")).toEqual({
+			status: "not_found",
+		});
+		db.close();
+	});
+
+	it("removes stale tombstones when an expired ID is recreated", async () => {
+		const db = makeDb();
+		const repo = new CacheFlightRecorderRepository(new BunSqlAdapter(db));
+		await repo.appendTurn("recreated-id", turn(1), 1_000);
+		await repo.expireOlderThan(2_000, 7_000);
+		expect(await repo.lookupTimeline("recreated-id")).toEqual({
+			status: "expired",
+		});
+
+		await repo.appendTurn("recreated-id", turn(2), 3_000);
+		expect(await repo.lookupTimeline("recreated-id")).toMatchObject({
+			status: "found",
+		});
+		const tombstone = db
+			.query(
+				"SELECT recorder_conversation_id FROM cache_flight_recorder_tombstones WHERE recorder_conversation_id = ?",
+			)
+			.get("recreated-id");
+		expect(tombstone).toBeNull();
+		db.close();
+	});
+
+	it("rolls back tombstones when timeline deletion fails", async () => {
+		const db = makeDb();
+		const repo = new CacheFlightRecorderRepository(new BunSqlAdapter(db));
+		await repo.appendTurn("atomic-id", turn(1), 1_000);
+		db.exec(`CREATE TRIGGER reject_recorder_delete
+			BEFORE DELETE ON cache_flight_recorder_conversations
+			BEGIN SELECT RAISE(ABORT, 'reject delete'); END`);
+
+		await expect(repo.expireOlderThan(2_000, 7_000)).rejects.toThrow();
+		expect(await repo.lookupTimeline("atomic-id")).toMatchObject({
+			status: "found",
+		});
+		const tombstone = db
+			.query(
+				"SELECT recorder_conversation_id FROM cache_flight_recorder_tombstones WHERE recorder_conversation_id = ?",
+			)
+			.get("atomic-id");
+		expect(tombstone).toBeNull();
 		db.close();
 	});
 
@@ -229,7 +304,9 @@ describe("DatabaseOperations cache flight recorder facade", () => {
 			expect(
 				await dbOps.loadCacheFlightRecorderTimeline("recorder-safe-id"),
 			).not.toBeNull();
-			expect(await dbOps.expireCacheFlightRecorderTimelines(2_000)).toBe(1);
+			expect(await dbOps.expireCacheFlightRecorderTimelines(2_000, 7_000)).toBe(
+				1,
+			);
 		} finally {
 			await dbOps.dispose();
 		}
