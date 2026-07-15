@@ -44,6 +44,44 @@ async function _tableExists(
 	return (result?.exists ?? 0) > 0;
 }
 
+async function ensureCacheFlightRecorderTablesPg(
+	adapter: BunSqlAdapter,
+): Promise<void> {
+	await adapter.unsafe(`
+		CREATE TABLE IF NOT EXISTS cache_flight_recorder_conversations (
+			recorder_conversation_id TEXT PRIMARY KEY,
+			created_at BIGINT NOT NULL,
+			updated_at BIGINT NOT NULL,
+			incomplete INTEGER NOT NULL DEFAULT 0,
+			dropped_events INTEGER NOT NULL DEFAULT 0
+		)
+	`);
+	await adapter.unsafe(
+		`CREATE INDEX IF NOT EXISTS idx_cache_flight_recorder_conversations_updated_at
+		 ON cache_flight_recorder_conversations(updated_at)`,
+	);
+	await adapter.unsafe(`
+		CREATE TABLE IF NOT EXISTS cache_flight_recorder_turns (
+			recorder_conversation_id TEXT NOT NULL,
+			sequence INTEGER NOT NULL,
+			timestamp TEXT NOT NULL,
+			identity_fingerprint TEXT,
+			serving_account_id TEXT,
+			prefix_fingerprint TEXT,
+			cache_outcome TEXT NOT NULL,
+			input_tokens INTEGER,
+			cached_tokens INTEGER,
+			completeness TEXT NOT NULL,
+			unavailable_dimensions TEXT NOT NULL DEFAULT '[]',
+			gap_before INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (recorder_conversation_id, sequence),
+			FOREIGN KEY (recorder_conversation_id)
+				REFERENCES cache_flight_recorder_conversations(recorder_conversation_id)
+				ON DELETE CASCADE
+		)
+	`);
+}
+
 /**
  * Ensure the full schema exists for PostgreSQL
  */
@@ -316,6 +354,8 @@ export async function ensureSchemaPg(adapter: BunSqlAdapter): Promise<void> {
 	await adapter.unsafe(
 		`CREATE INDEX IF NOT EXISTS idx_usage_snapshots_ts ON usage_snapshots(timestamp)`,
 	);
+
+	await ensureCacheFlightRecorderTablesPg(adapter);
 
 	log.info("PostgreSQL schema ensured");
 }
@@ -614,6 +654,9 @@ export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 	await adapter.unsafe(
 		`CREATE INDEX IF NOT EXISTS idx_usage_snapshots_ts ON usage_snapshots(timestamp)`,
 	);
+
+	// New recorder tables must also be created on upgrades, not only fresh installs.
+	await ensureCacheFlightRecorderTablesPg(adapter);
 
 	// Rename oauth_sessions.mode 'max' → 'claude-oauth'
 	try {

@@ -259,6 +259,16 @@ async function runStartupMaintenance(
 		if (removedSnapshots > 0) {
 			log.info(`Pruned ${removedSnapshots} old usage snapshots`);
 		}
+		const recorderRetentionHours =
+			config.getCacheFlightRecorderRetentionHours();
+		const expiredTimelines = await dbOps.expireCacheFlightRecorderTimelines(
+			Date.now() - recorderRetentionHours * 60 * 60 * 1000,
+		);
+		if (expiredTimelines > 0) {
+			log.info(
+				`Expired ${expiredTimelines} cache flight recorder timelines (retention=${recorderRetentionHours}h)`,
+			);
+		}
 	} catch (err) {
 		log.error(`Startup cleanup error: ${err}`);
 	}
@@ -847,6 +857,16 @@ export default async function startServer(options?: {
 			);
 			if (removedSnapshots > 0) {
 				log.info(`Pruned ${removedSnapshots} old usage snapshots`);
+			}
+			const recorderRetentionHours =
+				config.getCacheFlightRecorderRetentionHours();
+			const expiredTimelines = await dbOps.expireCacheFlightRecorderTimelines(
+				Date.now() - recorderRetentionHours * 60 * 60 * 1000,
+			);
+			if (expiredTimelines > 0) {
+				log.info(
+					`Expired ${expiredTimelines} cache flight recorder timelines (retention=${recorderRetentionHours}h)`,
+				);
 			}
 		} catch (err) {
 			log.error(`Periodic data retention cleanup error: ${err}`);

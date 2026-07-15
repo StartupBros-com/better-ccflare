@@ -22,6 +22,11 @@ export {
 	isEncryptionEnabled,
 } from "./payload-encryption";
 export { analyzeIndexUsage } from "./performance-indexes";
+export {
+	type CacheFlightRecorderCounts,
+	CacheFlightRecorderRepository,
+	type MarkIncompleteOptions,
+} from "./repositories/cache-flight-recorder.repository";
 export type {
 	ModelTranslation,
 	SimilarModel,
