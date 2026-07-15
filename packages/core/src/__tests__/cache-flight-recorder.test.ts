@@ -161,6 +161,56 @@ describe("diagnoseTimeline", () => {
 		expect(report.cause).toBe("identity_changed");
 	});
 
+	it("diagnoses against the last proven hit, not earlier continuity history", () => {
+		// Identity drifts on a hit turn, which advances continuity proof.
+		// The later miss therefore diagnoses the first break after that hit.
+		const report = diagnoseTimeline(
+			timeline(
+				turn(1),
+				turn(2, { identityFingerprint: "identity-b" }),
+				turn(3, {
+					identityFingerprint: "identity-b",
+					servingAccountId: "account-b",
+					prefixFingerprint: "prefix-b",
+					cacheOutcome: "miss",
+					cachedTokens: 0,
+				}),
+			),
+		);
+
+		expect(report.cause).toBe("serving_account_changed");
+		expect(
+			report.supportingEvidence
+				.filter((item) => item.kind === "changed")
+				.map((item) => [item.fromSequence, item.toSequence, item.dimension]),
+		).toEqual([
+			[2, 3, "serving_account"],
+			[2, 3, "cacheable_prefix"],
+		]);
+	});
+
+	it("keeps later supporting transitions when identity is the first break before a miss", () => {
+		const report = diagnoseTimeline(
+			timeline(
+				turn(1),
+				turn(2, {
+					identityFingerprint: "identity-b",
+					servingAccountId: "account-b",
+					prefixFingerprint: "prefix-b",
+					cacheOutcome: "miss",
+					cachedTokens: 0,
+				}),
+			),
+		);
+
+		expect(report.cause).toBe("identity_changed");
+		expect(
+			report.supportingEvidence
+				.filter((item) => item.kind === "changed")
+				.map((item) => item.dimension),
+		).toEqual(["identity", "serving_account", "cacheable_prefix"]);
+	});
+
 	it("returns telemetry unknown for an explicit sequence gap", () => {
 		const report = diagnoseTimeline(
 			timeline(
