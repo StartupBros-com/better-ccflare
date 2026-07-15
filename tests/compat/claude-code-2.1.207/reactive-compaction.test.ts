@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, mock, test } from "bun:test";
+import { estimateAnthropicAdmissionTokens } from "../../../packages/providers/src/request-capabilities";
 import type { Account } from "@better-ccflare/types";
 import type { ProxyContext } from "../../../packages/proxy/src/handlers";
 import { chmod, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
@@ -38,6 +39,8 @@ interface ScenarioContext {
 	credentialReads?: { count: number };
 	rejectedCredentialReads?: number;
 	rejectedStatus?: number;
+	warmupOccupiedTokens?: number[];
+	triggerOccupiedTokens?: number;
 	restoreFetch?: () => void;
 }
 
@@ -243,6 +246,7 @@ async function createAdmissionScenario(): Promise<ScenarioContext> {
 	const credentialReads = { count: 0 };
 	const account = makeCodexAccount(credentialReads);
 	const upstreamCalls: CapturedRequest[] = [];
+	const warmupOccupiedTokens: number[] = [];
 	let summarySeen = false;
 	const originalFetch = globalThis.fetch;
 	globalThis.fetch = mock(async (input: RequestInfo | URL) => {
@@ -289,8 +293,26 @@ async function createAdmissionScenario(): Promise<ScenarioContext> {
 			const body = await request.clone().json() as Record<string, unknown>;
 			const serialized = JSON.stringify(body);
 			context.requests.push({ body, serialized });
+			const inputTokens = estimateAnthropicAdmissionTokens(body).tokens;
+			const outputReserve =
+				typeof body.max_tokens === "number" ? body.max_tokens : 0;
+			const occupiedTokens = inputTokens + outputReserve;
 			const isRejectedTrigger = serialized.includes(triggerSentinel) && !summarySeen;
-			if (isRejectedTrigger) credentialReads.count = 0;
+			if (isRejectedTrigger) {
+				credentialReads.count = 0;
+				context.triggerOccupiedTokens = occupiedTokens;
+				const largestWarmup = Math.max(...warmupOccupiedTokens);
+				if (occupiedTokens <= largestWarmup + 1) {
+					throw new Error(
+						`Trigger occupancy ${occupiedTokens} did not exceed warmup ${largestWarmup}`,
+					);
+				}
+				process.env.CCFLARE_CONTEXT_ADMISSION_TEST_EFFECTIVE_WINDOW = String(
+					Math.floor((largestWarmup + occupiedTokens) / 2),
+				);
+			} else if (!summarySeen && !serialized.includes(triggerSentinel)) {
+				warmupOccupiedTokens.push(occupiedTokens);
+			}
 			const response = await handleProxy(request, new URL(request.url), ctx);
 			if (isRejectedTrigger) {
 				context.rejectedCredentialReads = credentialReads.count;
@@ -314,6 +336,7 @@ async function createAdmissionScenario(): Promise<ScenarioContext> {
 	context.account = account;
 	context.upstreamCalls = upstreamCalls;
 	context.credentialReads = credentialReads;
+	context.warmupOccupiedTokens = warmupOccupiedTokens;
 	return context;
 }
 
@@ -418,7 +441,9 @@ describe("Claude Code 2.1.207 reactive compaction compatibility", () => {
 		const savedAdmission = process.env.CCFLARE_CONTEXT_ADMISSION;
 		const savedWindow = process.env.CCFLARE_CONTEXT_ADMISSION_TEST_EFFECTIVE_WINDOW;
 		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
-		process.env.CCFLARE_CONTEXT_ADMISSION_TEST_EFFECTIVE_WINDOW = "90000";
+		process.env.CCFLARE_CONTEXT_ADMISSION_TEST_EFFECTIVE_WINDOW = String(
+			Number.MAX_SAFE_INTEGER,
+		);
 		try {
 			mock.module("../../../packages/database/src/inline-integrity-check-worker", () => ({ EMBEDDED_INTEGRITY_CHECK_WORKER_CODE: "" }));
 			mock.module("../../../packages/database/src/inline-vacuum-worker", () => ({ EMBEDDED_VACUUM_WORKER_CODE: "" }));
@@ -440,6 +465,7 @@ describe("Claude Code 2.1.207 reactive compaction compatibility", () => {
 			await warmPersistedSession(context, sessionId);
 			const warmupUpstreamCalls = context.upstreamCalls?.length ?? 0;
 			expect(warmupUpstreamCalls).toBe(3);
+			expect(context.warmupOccupiedTokens).toHaveLength(3);
 			const output = await runTurn(context, sessionId, `${triggerSentinel} answer only after recovering`, false);
 			expect(output).toContain("FINAL_REACTIVE_COMPACTION_SUCCESS");
 
@@ -452,6 +478,9 @@ describe("Claude Code 2.1.207 reactive compaction compatibility", () => {
 			expect(summary!.serialized.length).toBeLessThan(rejected!.serialized.length);
 			expect(context.upstreamCalls?.length).toBe(warmupUpstreamCalls + 2);
 			expect(context.upstreamCalls?.some(({ serialized }) => serialized.includes(triggerSentinel) && !serialized.includes(summaryMarker))).toBe(false);
+			expect(context.triggerOccupiedTokens).toBeGreaterThan(
+				Math.max(...context.warmupOccupiedTokens!),
+			);
 			expect(context.rejectedStatus).toBe(400);
 			expect(context.rejectedCredentialReads).toBe(0);
 			expect(context.account?.rate_limited_until).toBeNull();
