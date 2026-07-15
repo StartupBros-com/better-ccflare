@@ -600,11 +600,9 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 		});
 	});
 
-	it.each([
-		["/v1/messages/count_tokens", {}],
-		["/v1/messages", { "x-better-ccflare-keepalive": "true" }],
-		["/v1/messages", { "x-better-ccflare-auto-refresh": "true" }],
-	])("excludes synthetic request %s from admission", async (path, extraHeaders) => {
+	it("excludes count_tokens from admission", async () => {
+		const path = "/v1/messages/count_tokens";
+		const extraHeaders = {};
 		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
 		const fetchMock = mock(
 			async () =>
@@ -661,6 +659,53 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 		} finally {
 			collectorSpy.mockRestore();
 		}
+	});
+
+	it.each([
+		["x-better-ccflare-keepalive", "true"],
+		["x-better-ccflare-keepalive", "false"],
+		["x-better-ccflare-auto-refresh", "true"],
+		["x-better-ccflare-auto-refresh", "false"],
+	])("does not let client header %s=%s bypass admission", async (header, value) => {
+		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
+		const fetchMock = mock(async () => {
+			throw new Error("capacity rejection must happen before fetch");
+		});
+		globalThis.fetch = fetchMock;
+		const bodyBuffer = new TextEncoder().encode(
+			JSON.stringify({
+				model: "gpt-5.3-codex-spark",
+				messages: [{ role: "user", content: "internal-looking" }],
+				max_tokens: 20_000,
+			}),
+		).buffer;
+		const tracker = createContextAdmissionTracker(120_000, 20_000);
+		const result = await proxyWithAccount(
+			makeMessagesRequest(bodyBuffer, {
+				"Content-Type": "application/json",
+				[header]: value,
+			}),
+			new URL("https://proxy.local/v1/messages"),
+			makeCodexAccount({
+				access_token: "access-token",
+				expires_at: Date.now() + 60 * 60 * 1000,
+			}),
+			makeRequestMeta("/v1/messages"),
+			bodyBuffer,
+			() => undefined,
+			0,
+			makeProxyContext(),
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			false,
+			tracker,
+		);
+		expect(result).toBeNull();
+		expect(fetchMock).toHaveBeenCalledTimes(0);
+		expect(tracker.rejectedCount).toBe(1);
+		expect(tracker.attemptedCount).toBe(0);
 	});
 
 	it("excludes max_tokens zero cache-prewarm requests from admission", async () => {

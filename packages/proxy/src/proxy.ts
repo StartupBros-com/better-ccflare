@@ -6,7 +6,7 @@ import {
 import { DatabaseFactory } from "@better-ccflare/database";
 import { Logger } from "@better-ccflare/logger";
 import {
-	estimateAnthropicRequestTokens,
+	estimateAnthropicAdmissionTokens,
 	usageCache,
 } from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
@@ -167,17 +167,13 @@ export async function handleProxy(
 	const { buffer: requestBodyBuffer } = await prepareRequestBody(req);
 	const requestBodyContext = new RequestBodyContext(requestBodyBuffer);
 	const originalParsedBody = requestBodyContext.getParsedJson();
-	const isSyntheticContextRequest =
-		url.pathname !== "/v1/messages" ||
-		!!req.headers.get("x-better-ccflare-keepalive") ||
-		!!req.headers.get("x-better-ccflare-auto-refresh") ||
-		originalParsedBody?.max_tokens === 0;
 	const contextAdmissionTracker =
 		process.env.CCFLARE_CONTEXT_ADMISSION === "1" &&
+		url.pathname === "/v1/messages" &&
 		originalParsedBody &&
-		!isSyntheticContextRequest
+		originalParsedBody.max_tokens !== 0
 			? createContextAdmissionTracker(
-					estimateAnthropicRequestTokens(originalParsedBody).tokens,
+					estimateAnthropicAdmissionTokens(originalParsedBody).tokens,
 					originalParsedBody.max_tokens,
 				)
 			: undefined;

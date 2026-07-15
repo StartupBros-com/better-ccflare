@@ -75,7 +75,7 @@ export function resolveModelContextCapability(
 
 export interface AnthropicRequestTokenEstimate {
 	tokens: number;
-	method: "prompt-material-chars";
+	method: "prompt-material-chars" | "request-envelope-bytes";
 	confidence: "low";
 }
 
@@ -139,17 +139,35 @@ export function estimateAnthropicRequestTokens(
 			serialized = String(body ?? "");
 		}
 	}
-	const charEstimate = Math.ceil(serialized.length / 3);
-	const containsNonAscii = /[^\x00-\x7f]/.test(serialized);
-	// This remains a low-confidence heuristic rather than tokenization. ASCII keeps
-	// the established chars/3 estimate, while Unicode uses UTF-8 bytes/2 as a
-	// conservative floor because UTF-16 character counts understate emoji and CJK.
-	const unicodeEstimate = containsNonAscii
-		? Math.ceil(new TextEncoder().encode(serialized).byteLength / 2)
-		: 0;
 	return {
-		tokens: Math.max(1, charEstimate, unicodeEstimate),
+		tokens: Math.max(1, Math.ceil(serialized.length / 3)),
 		method: "prompt-material-chars",
+		confidence: "low",
+	};
+}
+
+export function estimateAnthropicAdmissionTokens(
+	body: unknown,
+): AnthropicRequestTokenEstimate {
+	let serialized: string;
+	try {
+		serialized = JSON.stringify(body) ?? "";
+	} catch {
+		serialized = String(body ?? "");
+	}
+
+	const byteLength = new TextEncoder().encode(serialized).byteLength;
+	// Admission is safety-critical, unlike the advisory count endpoint. Counting
+	// the complete JSON envelope captures roles, block types, schemas, and framing.
+	// The bytes/2 floor is deliberately conservative for Unicode and code-heavy
+	// payloads while avoiding the severe inflation of treating every byte as a token.
+	return {
+		tokens: Math.max(
+			1,
+			Math.ceil(serialized.length / 3),
+			Math.ceil(byteLength / 2),
+		),
+		method: "request-envelope-bytes",
 		confidence: "low",
 	};
 }

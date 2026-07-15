@@ -801,7 +801,6 @@ export async function proxyWithAccount(
 				: [];
 		const admissionEnabledForAttempt =
 			url.pathname === "/v1/messages" &&
-			!isSyntheticInternalRequest(req.headers) &&
 			effectiveBodyContext.getParsedJson()?.max_tokens !== 0;
 		const attemptAdmissionTracker = admissionEnabledForAttempt
 			? contextAdmissionTracker

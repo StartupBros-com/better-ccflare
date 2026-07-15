@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import {
 	decideContextAdmission,
+	estimateAnthropicAdmissionTokens,
 	estimateAnthropicRequestTokens,
 	resolveModelContextCapability,
 } from "./request-capabilities";
@@ -82,27 +83,11 @@ describe("estimateAnthropicRequestTokens", () => {
 		expect(estimateAnthropicRequestTokens(request).tokens).toBe(4);
 	});
 
-	it("uses a materially more conservative UTF-8 estimate for emoji", () => {
-		const ascii = estimateAnthropicRequestTokens({
-			messages: [{ role: "user", content: "a".repeat(30) }],
-		});
+	it("preserves legacy Unicode advisory estimates", () => {
 		const emoji = estimateAnthropicRequestTokens({
 			messages: [{ role: "user", content: "😀".repeat(30) }],
 		});
-		expect(ascii.tokens).toBe(12);
-		expect(emoji.tokens).toBe(63);
-		expect(emoji.tokens).toBeGreaterThan(ascii.tokens * 5);
-	});
-
-	it("uses a materially more conservative UTF-8 estimate for CJK", () => {
-		const ascii = estimateAnthropicRequestTokens({
-			messages: [{ role: "user", content: "a".repeat(30) }],
-		});
-		const cjk = estimateAnthropicRequestTokens({
-			messages: [{ role: "user", content: "漢".repeat(30) }],
-		});
-		expect(cjk.tokens).toBe(48);
-		expect(cjk.tokens).toBeGreaterThan(ascii.tokens * 3);
+		expect(emoji.tokens).toBe(22);
 	});
 
 	it("always returns a nonnegative integer for malformed input", () => {
@@ -111,6 +96,79 @@ describe("estimateAnthropicRequestTokens", () => {
 			expect(estimate.tokens).toBeGreaterThanOrEqual(0);
 			expect(Number.isInteger(estimate.tokens)).toBeTrue();
 		}
+	});
+});
+
+describe("estimateAnthropicAdmissionTokens", () => {
+	it("counts the full request envelope, including roles and block framing", () => {
+		const contentOnly = "hello";
+		const request = {
+			model: "claude-sonnet",
+			max_tokens: 100,
+			messages: [
+				{ role: "user", content: [{ type: "text", text: contentOnly }] },
+			],
+		};
+		const estimate = estimateAnthropicAdmissionTokens(request);
+		expect(estimate.tokens).toBeGreaterThan(Math.ceil(contentOnly.length / 3));
+		expect(estimate.method).toBe("request-envelope-bytes");
+		expect(estimate.confidence).toBe("low");
+	});
+
+	it("accounts for empty and many content blocks", () => {
+		const empty = estimateAnthropicAdmissionTokens({
+			messages: [{ role: "user", content: [] }],
+		});
+		const many = estimateAnthropicAdmissionTokens({
+			messages: [
+				{
+					role: "user",
+					content: Array.from({ length: 50 }, () => ({
+						type: "text",
+						text: "",
+					})),
+				},
+			],
+		});
+		expect(empty.tokens).toBeGreaterThan(0);
+		expect(many.tokens).toBeGreaterThan(empty.tokens * 5);
+	});
+
+	it("includes tool schemas and code-heavy ASCII conservatively", () => {
+		const plain = estimateAnthropicAdmissionTokens({
+			messages: [{ role: "user", content: "a".repeat(300) }],
+		});
+		const code = estimateAnthropicAdmissionTokens({
+			messages: [
+				{ role: "user", content: "const x = foo?.bar ?? [];\n".repeat(30) },
+			],
+			tools: [
+				{
+					name: "lookup",
+					description: "find a value",
+					input_schema: {
+						type: "object",
+						properties: { query: { type: "string", enum: ["a", "b"] } },
+						required: ["query"],
+					},
+				},
+			],
+		});
+		expect(code.tokens).toBeGreaterThan(plain.tokens * 2);
+	});
+
+	it("uses materially more conservative UTF-8 estimates for emoji and CJK", () => {
+		const ascii = estimateAnthropicAdmissionTokens({
+			messages: [{ role: "user", content: "a".repeat(30) }],
+		});
+		const emoji = estimateAnthropicAdmissionTokens({
+			messages: [{ role: "user", content: "😀".repeat(30) }],
+		});
+		const cjk = estimateAnthropicAdmissionTokens({
+			messages: [{ role: "user", content: "漢".repeat(30) }],
+		});
+		expect(emoji.tokens).toBeGreaterThan(ascii.tokens * 2);
+		expect(cjk.tokens).toBeGreaterThan(ascii.tokens * 1.5);
 	});
 });
 
