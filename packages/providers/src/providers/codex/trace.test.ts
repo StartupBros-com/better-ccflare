@@ -203,13 +203,24 @@ describe("summarizeCodexResponse (response phase)", () => {
 		expect(s.cache_hit_pct).toBeNull();
 	});
 
-	test("carries upstream error type/message", () => {
+	test("carries normalized upstream error details", () => {
 		const s = summarizeCodexResponse([], { input_tokens: 10 }, "error", {
 			type: "rate_limit_error",
 			message: "429",
+			code: "rate_limit_exceeded",
+			status: "rate_limited",
 		});
 		expect(s.stop_reason).toBe("error");
 		expect(s.error_type).toBe("rate_limit_error");
 		expect(s.error_message).toBe("429");
+		expect(s.error_code).toBe("rate_limit_exceeded");
+		expect(s.error_status).toBe("rate_limited");
+	});
+
+	test("classifies metadata-free error stops without guessing a cause", () => {
+		const s = summarizeCodexResponse([], { input_tokens: 10 }, "error");
+		expect(s.stop_reason).toBe("error");
+		expect(s.error_type).toBe("unclassified_upstream_error");
+		expect(s.error_message).toBeUndefined();
 	});
 });

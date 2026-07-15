@@ -91,6 +91,8 @@ export interface CodexResponseSummary {
 	cache_hit_pct: number | null;
 	error_type?: string;
 	error_message?: string;
+	error_code?: string;
+	error_status?: string;
 }
 
 /**
@@ -240,7 +242,7 @@ export function summarizeCodexResponse(
 		cache_creation_input_tokens?: number;
 	},
 	stopReason: CodexResponseSummary["stop_reason"],
-	error?: { type?: string; message?: string },
+	error?: { type?: string; message?: string; code?: string; status?: string },
 ): CodexResponseSummary {
 	const newToolUseByName: Record<string, number> = {};
 	let subagentSpawnCount = 0;
@@ -269,8 +271,12 @@ export function summarizeCodexResponse(
 							inputTokens,
 					) / 10
 				: null,
-		...(error?.type ? { error_type: error.type } : {}),
+		...(stopReason === "error"
+			? { error_type: error?.type || "unclassified_upstream_error" }
+			: {}),
 		...(error?.message ? { error_message: error.message } : {}),
+		...(error?.code ? { error_code: error.code } : {}),
+		...(error?.status ? { error_status: error.status } : {}),
 	};
 }
 

@@ -1861,10 +1861,13 @@ export class CodexProvider extends BaseProvider {
 			type = rawType;
 		}
 		const upstreamMessage = error?.message || "Codex upstream failed.";
-		const message =
-			code === "context_length_exceeded"
-				? `Prompt is too long. Codex reported: ${upstreamMessage}`
-				: upstreamMessage;
+		const normalizedCode = code?.toLowerCase();
+		const isContextOverflow =
+			normalizedCode === "context_length_exceeded" ||
+			/^your input exceeds the context window\b/i.test(upstreamMessage);
+		const message = isContextOverflow
+			? `Prompt is too long. Codex reported: ${upstreamMessage}`
+			: upstreamMessage;
 		return {
 			type: "error",
 			error: {

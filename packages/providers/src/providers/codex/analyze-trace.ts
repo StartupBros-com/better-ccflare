@@ -213,7 +213,10 @@ export function analyzeCodexTrace(
 		const stop = r.stop_reason ?? "unknown";
 		stopReasons[stop] = (stopReasons[stop] ?? 0) + 1;
 		if (stop === "end_turn" && newCalls === 0) textOnlyResponses++;
-		if (r.error_type) errors[r.error_type] = (errors[r.error_type] ?? 0) + 1;
+		if (stop === "error") {
+			const errorType = r.error_type || "unclassified_upstream_error";
+			errors[errorType] = (errors[errorType] ?? 0) + 1;
+		}
 		if (typeof r.cache_hit_pct === "number") cacheHitPcts.push(r.cache_hit_pct);
 
 		// Cache-key cohort join via request_id.

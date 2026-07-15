@@ -70,10 +70,19 @@ describe("analyzeCodexTrace", () => {
 				stop_reason: "error",
 				error_type: "rate_limit_error",
 			},
+			{
+				phase: "response",
+				new_tool_call_count: 0,
+				stop_reason: "error",
+				input_tokens: 123,
+			},
 		]);
 		expect(report.response.textOnlyResponses).toBe(2);
-		expect(report.response.stopReasons).toEqual({ end_turn: 2, error: 1 });
-		expect(report.response.errors).toEqual({ rate_limit_error: 1 });
+		expect(report.response.stopReasons).toEqual({ end_turn: 2, error: 2 });
+		expect(report.response.errors).toEqual({
+			rate_limit_error: 1,
+			unclassified_upstream_error: 1,
+		});
 	});
 
 	test("treats records without a phase as request (back-compat)", () => {
