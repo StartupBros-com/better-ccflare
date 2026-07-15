@@ -7,8 +7,10 @@ import {
 import { DatabaseFactory } from "@better-ccflare/database";
 import { Logger } from "@better-ccflare/logger";
 import {
+	deriveCacheFlightRecorderId,
 	deriveXaiConversationIdentity,
 	estimateAnthropicAdmissionTokens,
+	isCacheFlightRecorderEnabled,
 	isXaiCacheNativeEnabled,
 	usageCache,
 } from "@better-ccflare/providers";
@@ -265,19 +267,22 @@ export async function handleProxy(
 	requestMeta.project = project;
 	requestMeta.projectAttributionSource = projectAttributionSource;
 	requestMeta.clientSessionId = requestBodyContext.getClientId();
-	if (isXaiCacheNativeEnabled()) {
-		const parsed = requestBodyContext.getParsedJson() as Record<
-			string,
-			unknown
-		> | null;
-		if (parsed) {
-			const identity = deriveXaiConversationIdentity(parsed);
-			if (identity) {
-				requestMeta.cacheAffinityKey = identity.affinityKey;
-				requestMeta.xaiCacheNativeActive = true;
-				requestMeta.xaiCacheIdentityFingerprint = identity.identityFingerprint;
-				requestMeta.xaiCachePrefixFingerprint = identity.prefixFingerprint;
-			}
+	const parsedConversationBody = requestBodyContext.getParsedJson() as Record<
+		string,
+		unknown
+	> | null;
+	if (parsedConversationBody && isCacheFlightRecorderEnabled()) {
+		requestMeta.cacheFlightRecorderConversationId = deriveCacheFlightRecorderId(
+			parsedConversationBody,
+		);
+	}
+	if (parsedConversationBody && isXaiCacheNativeEnabled()) {
+		const identity = deriveXaiConversationIdentity(parsedConversationBody);
+		if (identity) {
+			requestMeta.cacheAffinityKey = identity.affinityKey;
+			requestMeta.xaiCacheNativeActive = true;
+			requestMeta.xaiCacheIdentityFingerprint = identity.identityFingerprint;
+			requestMeta.xaiCachePrefixFingerprint = identity.prefixFingerprint;
 		}
 	}
 	requestMeta.originalModel = originalModel;

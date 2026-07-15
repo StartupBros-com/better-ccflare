@@ -94,11 +94,11 @@ describe("cache flight recorder schema", () => {
 });
 
 describe("CacheFlightRecorderRepository", () => {
-	it("appends and reloads turns in deterministic sequence order", async () => {
+	it("allocates deterministic append-only sequences at persistence", async () => {
 		const db = makeDb();
 		const repo = new CacheFlightRecorderRepository(new BunSqlAdapter(db));
-		await repo.appendTurn("recorder-safe-id", turn(2), 2_000);
-		await repo.appendTurn("recorder-safe-id", turn(1), 1_000);
+		await repo.appendTurn("recorder-safe-id", turn(99), 2_000);
+		await repo.appendTurn("recorder-safe-id", turn(99), 1_000);
 
 		const timeline = await repo.loadTimeline("recorder-safe-id");
 		expect(timeline).toEqual({
@@ -107,7 +107,10 @@ describe("CacheFlightRecorderRepository", () => {
 			updatedAt: 2_000,
 			incomplete: false,
 			droppedEvents: 0,
-			turns: [turn(1), turn(2)],
+			turns: [
+				{ ...turn(99), sequence: 0 },
+				{ ...turn(99), sequence: 1 },
+			],
 		});
 		expect(await repo.countRetained()).toBe(1);
 		db.close();
@@ -175,6 +178,24 @@ describe("CacheFlightRecorderRepository", () => {
 		await expect(
 			repo.appendTurn("recorder-safe-id", unsafeTurn, 1_000),
 		).rejects.toThrow("unsupported fields: prompt");
+		expect(await repo.countRetained()).toBe(0);
+		db.close();
+	});
+
+	it("rejects unbounded identifiers and non-allowlisted dimensions", async () => {
+		const db = makeDb();
+		const repo = new CacheFlightRecorderRepository(new BunSqlAdapter(db));
+
+		await expect(
+			repo.appendTurn(`cfr_${"a".repeat(200)}`, turn(1), 1_000),
+		).rejects.toThrow("bounded safe identifier");
+		await expect(
+			repo.appendTurn(
+				"recorder-safe-id",
+				turn(1, { unavailableDimensions: ["raw_prompt"] }),
+				1_000,
+			),
+		).rejects.toThrow("dimensions must be allowlisted");
 		expect(await repo.countRetained()).toBe(0);
 		db.close();
 	});

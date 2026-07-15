@@ -67,6 +67,11 @@ export interface StartMessage {
 	xaiCacheOfficialEndpoint?: boolean;
 	xaiCacheKeyPresent?: boolean;
 
+	// Privacy-safe cache flight recorder context, set only for eligible official xAI Chat routes
+	cacheFlightRecorderConversationId?: string | null;
+	cacheFlightRecorderEligible?: boolean;
+	cacheFlightRecorderNativeActive?: boolean;
+
 	// Retry info
 	retryAttempt: number;
 	failoverAttempts: number;
