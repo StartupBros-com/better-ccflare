@@ -24,7 +24,8 @@
 #
 # WHAT A FULL RUN DOES
 #   1. `git fetch origin` (quiet), then refuse unless HEAD is an ancestor
-#      of origin/main.
+#      of origin/main, the working tree is clean, and package versions are not
+#      behind the highest v* tag already contained in HEAD.
 #   2. `bun run build` -> apps/cli/dist/better-ccflare.
 #   3. Copy the binary to
 #      /home/will/.config/better-ccflare/better-ccflare-v<version>-<short-sha>
@@ -93,18 +94,54 @@ else
 	echo "refusing to deploy: working tree has uncommitted changes — commit or stash them so the built binary matches the verified commit" >&2
 fi
 
-if [[ "$CHECK_ONLY" == "1" ]]; then
-	{ [[ "$ANCESTRY_OK" == "1" && "$TREE_OK" == "1" ]]; } && exit 0 || exit 1
+# Version consistency gate: refuse to ship a binary whose package version is
+# lower than the highest v* tag already contained in HEAD. Upstream merges can
+# silently keep a fork's older package.json while absorbing a newer tagged
+# release, and the binary name/health endpoint would then lie about the
+# release lineage even though the code is present.
+VERSION="$(node -p "require('./apps/cli/package.json').version")"
+ROOT_VERSION="$(node -p "require('./package.json').version")"
+VERSION_OK=0
+if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+	echo "refusing to deploy: apps/cli/package.json version '$VERSION' is not a plain semver x.y.z" >&2
+elif [[ "$ROOT_VERSION" != "$VERSION" ]]; then
+	echo "refusing to deploy: root package.json version '$ROOT_VERSION' does not match apps/cli version '$VERSION'" >&2
+else
+	LATEST_CONTAINED_VERSION="$(
+		git tag --list 'v[0-9]*' --merged HEAD 2>/dev/null \
+			| sed -n 's/^v//p' \
+			| grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+			| sort -V \
+			| tail -n 1
+	)"
+	if [[ -z "$LATEST_CONTAINED_VERSION" ]]; then
+		VERSION_OK=1
+		echo "OK: package version $VERSION (no merged v* tags to compare)."
+	elif [[ "$VERSION" == "$LATEST_CONTAINED_VERSION" ]]; then
+		VERSION_OK=1
+		echo "OK: package version $VERSION matches highest contained tag v$LATEST_CONTAINED_VERSION."
+	else
+		HIGHER="$(printf '%s\n' "$VERSION" "$LATEST_CONTAINED_VERSION" | sort -V | tail -n 1)"
+		if [[ "$HIGHER" == "$VERSION" ]]; then
+			VERSION_OK=1
+			echo "OK: package version $VERSION is ahead of highest contained tag v$LATEST_CONTAINED_VERSION."
+		else
+			echo "refusing to deploy: package version $VERSION is behind highest v* tag already in HEAD (v$LATEST_CONTAINED_VERSION). Sync package.json and apps/cli/package.json before shipping." >&2
+		fi
+	fi
 fi
 
-if [[ "$ANCESTRY_OK" != "1" || "$TREE_OK" != "1" ]]; then
+if [[ "$CHECK_ONLY" == "1" ]]; then
+	{ [[ "$ANCESTRY_OK" == "1" && "$TREE_OK" == "1" && "$VERSION_OK" == "1" ]]; } && exit 0 || exit 1
+fi
+
+if [[ "$ANCESTRY_OK" != "1" || "$TREE_OK" != "1" || "$VERSION_OK" != "1" ]]; then
 	exit 1
 fi
 
 # ---------------------------------------------------------------------------
 # 2) Build
 # ---------------------------------------------------------------------------
-VERSION="$(node -p "require('./apps/cli/package.json').version")"
 BIN_NAME="better-ccflare-v${VERSION}-${SHORT}"
 
 echo "==> Building better-ccflare v${VERSION} (${SHORT})…"
