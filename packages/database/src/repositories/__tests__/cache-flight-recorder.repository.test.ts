@@ -126,7 +126,7 @@ describe("CacheFlightRecorderRepository", () => {
 			cacheOutcome: "unknown",
 			cachedTokens: undefined,
 		});
-		const reloadedIncomplete = { ...incomplete };
+		const reloadedIncomplete = { ...incomplete, sequence: 0 };
 		delete reloadedIncomplete.cachedTokens;
 		await repo.appendTurn("recorder-safe-id", incomplete, 3_000);
 		await repo.markIncomplete("recorder-safe-id", { dropped: true, at: 3_100 });
