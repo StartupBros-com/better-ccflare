@@ -6,7 +6,12 @@ import {
 	CODEX_SINGLE_ORCHESTRATION_ROOT_ENV,
 	resetOrchestrationElectionForTest,
 } from "./orchestration-election";
-import { CodexProvider } from "./provider";
+import {
+	CODEX_CACHE_KEY_MODE_ENV,
+	CODEX_CACHE_KEY_SESSION_PERCENT_ENV,
+	CODEX_PROMPT_CACHE_KEY_ENV,
+	CodexProvider,
+} from "./provider";
 import { CODEX_TRACE_DIR_ENV, CODEX_TRACE_FULL_ENV } from "./trace";
 
 function messagesRequest(
@@ -58,6 +63,9 @@ describe("Codex trace wiring (integration)", () => {
 	afterEach(() => {
 		delete process.env[CODEX_TRACE_DIR_ENV];
 		delete process.env[CODEX_TRACE_FULL_ENV];
+		delete process.env[CODEX_PROMPT_CACHE_KEY_ENV];
+		delete process.env[CODEX_CACHE_KEY_MODE_ENV];
+		delete process.env[CODEX_CACHE_KEY_SESSION_PERCENT_ENV];
 		delete process.env[CODEX_SINGLE_ORCHESTRATION_ROOT_ENV];
 		resetOrchestrationElectionForTest();
 		rmSync(dir, { recursive: true, force: true });
@@ -73,7 +81,7 @@ describe("Codex trace wiring (integration)", () => {
 		const files = readdirSync(dir).filter((f) => f.endsWith(".jsonl"));
 		expect(files.length).toBe(1);
 		const rec = JSON.parse(readFileSync(join(dir, files[0]), "utf8").trim());
-		expect(rec.trace_schema_version).toBe(7);
+		expect(rec.trace_schema_version).toBe(8);
 		expect(rec.phase).toBe("request");
 		expect(rec.orchestration_admission).toBe("no_orchestration_tools");
 		expect(rec.request_id).toBe("req_trace_1");
@@ -94,6 +102,132 @@ describe("Codex trace wiring (integration)", () => {
 		expect(transformed.headers.get("x-better-ccflare-request-id")).toBeNull();
 		// full bodies must be absent unless FULL is set
 		expect(rec.anthropic_request).toBeUndefined();
+	});
+
+	test("traces stable canary decisions across sibling conversations", async () => {
+		process.env[CODEX_TRACE_DIR_ENV] = dir;
+		process.env[CODEX_PROMPT_CACHE_KEY_ENV] = "1";
+		process.env[CODEX_CACHE_KEY_SESSION_PERCENT_ENV] = "100";
+		const sessionId = "11111111-1111-4111-8111-111111111111";
+		const metadata = { user_id: JSON.stringify({ session_id: sessionId }) };
+		const provider = new CodexProvider();
+		for (const [requestId, content] of [
+			["sibling-a", "first conversation"],
+			["sibling-b", "second conversation"],
+		] as const) {
+			const transformed = await provider.transformRequestBody(
+				messagesRequest(
+					{
+						model: "claude-opus-4-8",
+						max_tokens: 10,
+						metadata,
+						messages: [{ role: "user", content }],
+					},
+					requestId,
+				),
+			);
+			const upstream = await transformed.json();
+			expect(upstream).not.toHaveProperty("cache_key_assignment");
+			expect(upstream).not.toHaveProperty("cache_key_cohort_id");
+			expect(upstream).not.toHaveProperty("conversation_id");
+			expect(upstream).not.toHaveProperty("cache_key_assignment_source");
+		}
+
+		const file = readdirSync(dir).find((f) => f.endsWith(".jsonl")) as string;
+		const records = readFileSync(join(dir, file), "utf8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line));
+		expect(records.every((record) => record.trace_schema_version === 8)).toBe(
+			true,
+		);
+		expect(records.map((record) => record.cache_key_assignment)).toEqual([
+			"session",
+			"session",
+		]);
+		expect(records.map((record) => record.cache_key_assignment_source)).toEqual(
+			["canary", "canary"],
+		);
+		expect(records[0].cache_key_cohort_id).toMatch(/^[0-9a-f]{16}$/);
+		expect(records[1].cache_key_cohort_id).toBe(records[0].cache_key_cohort_id);
+		expect(records[0].conversation_id).toMatch(/^[0-9a-f]{16}$/);
+		expect(records[1].conversation_id).not.toBe(records[0].conversation_id);
+		expect(records.map((record) => record.cache_key_mode)).toEqual([
+			"session",
+			"session",
+		]);
+		expect(records[1].prompt_cache_key_id).toBe(records[0].prompt_cache_key_id);
+	});
+
+	test("traces conversation control and explicit session crossover", async () => {
+		process.env[CODEX_TRACE_DIR_ENV] = dir;
+		process.env[CODEX_PROMPT_CACHE_KEY_ENV] = "1";
+		process.env[CODEX_CACHE_KEY_SESSION_PERCENT_ENV] = "0";
+		const metadata = {
+			user_id: JSON.stringify({
+				session_id: "22222222-2222-4222-8222-222222222222",
+			}),
+		};
+		const provider = new CodexProvider();
+		await provider.transformRequestBody(
+			messagesRequest({ ...SAMPLE, metadata }, "control"),
+		);
+		process.env[CODEX_CACHE_KEY_MODE_ENV] = "session";
+		await provider.transformRequestBody(
+			messagesRequest({ ...SAMPLE, metadata }, "override"),
+		);
+
+		const file = readdirSync(dir).find((f) => f.endsWith(".jsonl")) as string;
+		const records = readFileSync(join(dir, file), "utf8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line));
+		expect(records[0]).toMatchObject({
+			cache_key_assignment: "conversation",
+			cache_key_assignment_source: "canary",
+			cache_key_mode: "conversation",
+		});
+		expect(records[1]).toMatchObject({
+			cache_key_assignment: "conversation",
+			cache_key_assignment_source: "explicit_session_override",
+			cache_key_mode: "session",
+		});
+		expect(records[1].cache_key_cohort_id).toBe(records[0].cache_key_cohort_id);
+		expect(records[1].conversation_id).toBe(records[0].conversation_id);
+	});
+
+	test("traces null experiment fields for malformed or disabled metadata", async () => {
+		process.env[CODEX_TRACE_DIR_ENV] = dir;
+		const provider = new CodexProvider();
+		await provider.transformRequestBody(
+			messagesRequest(
+				{ ...SAMPLE, metadata: { user_id: "not-json" } },
+				"disabled",
+			),
+		);
+		process.env[CODEX_PROMPT_CACHE_KEY_ENV] = "1";
+		await provider.transformRequestBody(
+			messagesRequest(
+				{ ...SAMPLE, metadata: { user_id: "not-json" } },
+				"malformed",
+			),
+		);
+
+		const file = readdirSync(dir).find((f) => f.endsWith(".jsonl")) as string;
+		const records = readFileSync(join(dir, file), "utf8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line));
+		for (const record of records) {
+			expect(record).toMatchObject({
+				cache_key_assignment: null,
+				cache_key_cohort_id: null,
+				conversation_id: null,
+				cache_key_assignment_source: null,
+				cache_key_mode: null,
+				prompt_cache_key_set: false,
+			});
+		}
 	});
 
 	test("traces every orchestration admission status and exact removals", async () => {

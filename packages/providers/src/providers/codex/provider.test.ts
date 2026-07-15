@@ -9,9 +9,12 @@ import {
 } from "./orchestration-election";
 import {
 	CODEX_CACHE_KEY_MODE_ENV,
+	CODEX_CACHE_KEY_SESSION_PERCENT_ENV,
 	CODEX_DEFAULT_ENDPOINT,
 	CODEX_PROMPT_CACHE_KEY_ENV,
 	CodexProvider,
+	deriveCodexCacheKeySessionBucket,
+	readCodexCacheKeySessionPercent,
 } from "./provider";
 import { CODEX_TRACE_DIR_ENV } from "./trace";
 import { parseCodexUsageHeaders } from "./usage";
@@ -35,6 +38,7 @@ const readTraceRecords = (dir: string): Array<Record<string, unknown>> => {
 afterEach(() => {
 	delete process.env[CODEX_PROMPT_CACHE_KEY_ENV];
 	delete process.env[CODEX_CACHE_KEY_MODE_ENV];
+	delete process.env[CODEX_CACHE_KEY_SESSION_PERCENT_ENV];
 	delete process.env[CODEX_SINGLE_ORCHESTRATION_ROOT_ENV];
 	resetOrchestrationElectionForTest();
 });
@@ -2921,7 +2925,7 @@ describe("CodexProvider.transformRequestBody", () => {
 				(record) => record.phase === "request",
 			);
 			expect(requestTrace).toMatchObject({
-				trace_schema_version: 7,
+				trace_schema_version: 8,
 				orchestration_admission: "no_session",
 				is_descendant: true,
 				tools_before_count: 3,
@@ -2984,6 +2988,139 @@ describe("CodexProvider.transformRequestBody", () => {
 		await expect(provider.transformRequestBody(request)).rejects.toThrow(
 			`tool_choice references unknown tool: ${toolName}`,
 		);
+	});
+
+	describe("session cache-key canary", () => {
+		const sessionA = "11111111-1111-4111-8111-111111111111";
+		const sessionB = "22222222-2222-4222-8222-222222222222";
+		const transform = async (
+			sessionId: string,
+			content = "task A",
+			system = "shared system prompt",
+			messages?: Array<Record<string, unknown>>,
+		) => {
+			const request = new Request("https://example.com/v1/messages", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					model: "claude-opus-4-8",
+					max_tokens: 10,
+					system,
+					metadata: { user_id: JSON.stringify({ session_id: sessionId }) },
+					messages: messages ?? [{ role: "user", content }],
+				}),
+			});
+			return new CodexProvider()
+				.transformRequestBody(request)
+				.then((response) => response.json());
+		};
+
+		it.each([
+			[undefined, 0],
+			["", 0],
+			["0", 0],
+			["37", 37],
+			["100", 100],
+			["101", 100],
+			["999", 100],
+			["-1", 0],
+			["+1", 0],
+			["1.5", 0],
+			["1e2", 0],
+			[" 10", 0],
+			["10 ", 0],
+			["nope", 0],
+		] as const)("strictly parses session percentage %p", (raw, expected) => {
+			expect(readCodexCacheKeySessionPercent(raw)).toBe(expected);
+		});
+
+		it("uses stable domain-separated bucket fixtures and normalizes UUID case", () => {
+			expect(deriveCodexCacheKeySessionBucket(sessionA)).toBe(39);
+			expect(deriveCodexCacheKeySessionBucket(sessionB)).toBe(31);
+			expect(deriveCodexCacheKeySessionBucket(sessionA.toUpperCase())).toBe(
+				deriveCodexCacheKeySessionBucket(sessionA),
+			);
+		});
+
+		it("keeps 0 percent in conversation mode and 100 percent in session mode", async () => {
+			process.env[CODEX_PROMPT_CACHE_KEY_ENV] = "1";
+			process.env[CODEX_CACHE_KEY_SESSION_PERCENT_ENV] = "0";
+			const control = await transform(sessionA);
+			expect(control.prompt_cache_key).toMatch(/^ccflare-convo-[0-9a-f]{48}$/);
+
+			process.env[CODEX_CACHE_KEY_SESSION_PERCENT_ENV] = "100";
+			const treatment = await transform(sessionA);
+			expect(treatment.prompt_cache_key).toMatch(
+				/^ccflare-session-[0-9a-f]{48}$/,
+			);
+		});
+
+		it("assigns fixed sessions on opposite sides of a deterministic boundary", async () => {
+			process.env[CODEX_PROMPT_CACHE_KEY_ENV] = "1";
+			process.env[CODEX_CACHE_KEY_SESSION_PERCENT_ENV] = "35";
+			const control = await transform(sessionA);
+			const treatment = await transform(sessionB);
+			expect(control.prompt_cache_key).toMatch(/^ccflare-convo-/);
+			expect(treatment.prompt_cache_key).toMatch(/^ccflare-session-/);
+		});
+
+		it("keeps assignment stable across turns, providers, restarts, and sibling conversations", async () => {
+			process.env[CODEX_PROMPT_CACHE_KEY_ENV] = "1";
+			process.env[CODEX_CACHE_KEY_SESSION_PERCENT_ENV] = "35";
+			const first = await transform(sessionA, "task A");
+			const later = await transform(
+				sessionA,
+				"task A",
+				"shared system prompt",
+				[
+					{ role: "user", content: "task A" },
+					{ role: "assistant", content: "working" },
+					{ role: "user", content: "continue" },
+				],
+			);
+			const sibling = await transform(sessionA, "task B");
+			expect(first.prompt_cache_key).toMatch(/^ccflare-convo-/);
+			expect(later.prompt_cache_key).toBe(first.prompt_cache_key);
+			expect(sibling.prompt_cache_key).toMatch(/^ccflare-convo-/);
+			expect(sibling.prompt_cache_key).not.toBe(first.prompt_cache_key);
+		});
+
+		it("shares one session key across sibling conversations in treatment", async () => {
+			process.env[CODEX_PROMPT_CACHE_KEY_ENV] = "1";
+			process.env[CODEX_CACHE_KEY_SESSION_PERCENT_ENV] = "100";
+			const first = await transform(sessionA, "task A");
+			const sibling = await transform(
+				sessionA,
+				"task B",
+				"other system prompt",
+			);
+			expect(sibling.prompt_cache_key).toBe(first.prompt_cache_key);
+		});
+
+		it("gives the explicit session override precedence over canary control", async () => {
+			process.env[CODEX_PROMPT_CACHE_KEY_ENV] = "1";
+			process.env[CODEX_CACHE_KEY_SESSION_PERCENT_ENV] = "0";
+			process.env[CODEX_CACHE_KEY_MODE_ENV] = "session";
+			const body = await transform(sessionA);
+			expect(body.prompt_cache_key).toMatch(/^ccflare-session-/);
+		});
+
+		it("preserves the session-key empty-input fallback", async () => {
+			process.env[CODEX_PROMPT_CACHE_KEY_ENV] = "1";
+			process.env[CODEX_CACHE_KEY_SESSION_PERCENT_ENV] = "0";
+			const body = await transform(sessionA, "", "shared system prompt", []);
+			expect(body.prompt_cache_key).toMatch(/^ccflare-session-/);
+		});
+
+		it("does not assign malformed metadata or bypass the disabled feature gate", async () => {
+			process.env[CODEX_CACHE_KEY_SESSION_PERCENT_ENV] = "100";
+			const disabled = await transform(sessionA);
+			expect(disabled.prompt_cache_key).toBeUndefined();
+
+			process.env[CODEX_PROMPT_CACHE_KEY_ENV] = "1";
+			const malformed = await transform("not-a-uuid");
+			expect(malformed.prompt_cache_key).toBeUndefined();
+		});
 	});
 
 	it("omits prompt_cache_key by default", async () => {

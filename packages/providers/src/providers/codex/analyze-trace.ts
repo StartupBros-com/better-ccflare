@@ -19,6 +19,12 @@ export interface TraceRecord {
 	request_id?: string | null;
 	model_in?: string | null;
 	model_out?: string | null;
+	account?: string | null;
+	cache_key_mode?: "conversation" | "session" | null;
+	cache_key_assignment?: "conversation" | "session" | null;
+	cache_key_cohort_id?: string | null;
+	conversation_id?: string | null;
+	cache_key_assignment_source?: "canary" | "explicit_session_override" | null;
 	input_item_count?: number;
 	input_item_total_count?: number;
 	input_item_fingerprints?: InputFingerprint[];
@@ -79,10 +85,52 @@ interface ContextBandAccumulator extends ContextBandStats {
 	cacheReadInputTokens: number;
 }
 
+interface CanaryTurnStats {
+	requests: number;
+	joinedTerminalResponses: number;
+	cacheMeasuredResponses: number;
+	weightedCacheReusePct: number | null;
+	cachePositiveResponses: number;
+	cachePositiveRatePct: number | null;
+}
+
+export interface CanaryArmStats {
+	assignedRequests: number;
+	joinedTerminalResponses: number;
+	missingTerminalRequests: number;
+	cacheMeasuredResponses: number;
+	weightedCacheReusePct: number | null;
+	cachePositiveResponses: number;
+	cachePositiveRatePct: number | null;
+	usage: {
+		inputTokens: number;
+		outputTokens: number;
+		cacheReadInputTokens: number;
+		cacheCreationInputTokens: number;
+	};
+	terminals: Record<string, number>;
+	effectiveModes: Record<string, number>;
+	explicitCrossovers: {
+		conversationToSession: number;
+		sessionToConversation: number;
+	};
+	models: Record<string, number>;
+	accounts: Record<string, number>;
+	logicalConversations: number;
+	turns: { first: CanaryTurnStats; followUp: CanaryTurnStats };
+	conversationTurnBands: Record<string, number>;
+}
+
 export interface TraceReport {
 	requests: number;
 	responses: number;
 	span: { first?: string; last?: string };
+	canary: {
+		conversation: CanaryArmStats;
+		session: CanaryArmStats;
+		unassigned: CanaryArmStats;
+		unjoinedResponses: number;
+	};
 	request: {
 		maxHistoryToolCalls: number;
 		maxInputItems: number;
@@ -201,6 +249,239 @@ function finishContextBand(band: ContextBandAccumulator): ContextBandStats {
 			band.inputTokens > 0
 				? Math.round((1000 * band.cacheReadInputTokens) / band.inputTokens) / 10
 				: null,
+	};
+}
+
+function increment(distribution: Record<string, number>, value: string): void {
+	distribution[value] = (distribution[value] ?? 0) + 1;
+}
+
+interface CanaryTurnAccumulator extends CanaryTurnStats {
+	measuredInputTokens: number;
+	cacheReadInputTokens: number;
+}
+
+interface CanaryArmAccumulator extends Omit<CanaryArmStats, "turns"> {
+	measuredInputTokens: number;
+	conversationIds: Set<string>;
+	turns: {
+		first: CanaryTurnAccumulator;
+		followUp: CanaryTurnAccumulator;
+	};
+}
+
+function canaryTurnAccumulator(): CanaryTurnAccumulator {
+	return {
+		requests: 0,
+		joinedTerminalResponses: 0,
+		cacheMeasuredResponses: 0,
+		weightedCacheReusePct: null,
+		cachePositiveResponses: 0,
+		cachePositiveRatePct: null,
+		measuredInputTokens: 0,
+		cacheReadInputTokens: 0,
+	};
+}
+
+function canaryArmAccumulator(): CanaryArmAccumulator {
+	return {
+		assignedRequests: 0,
+		joinedTerminalResponses: 0,
+		missingTerminalRequests: 0,
+		cacheMeasuredResponses: 0,
+		weightedCacheReusePct: null,
+		cachePositiveResponses: 0,
+		cachePositiveRatePct: null,
+		usage: {
+			inputTokens: 0,
+			outputTokens: 0,
+			cacheReadInputTokens: 0,
+			cacheCreationInputTokens: 0,
+		},
+		terminals: {},
+		effectiveModes: {},
+		explicitCrossovers: {
+			conversationToSession: 0,
+			sessionToConversation: 0,
+		},
+		models: {},
+		accounts: {},
+		logicalConversations: 0,
+		turns: {
+			first: canaryTurnAccumulator(),
+			followUp: canaryTurnAccumulator(),
+		},
+		conversationTurnBands: {},
+		measuredInputTokens: 0,
+		conversationIds: new Set(),
+	};
+}
+
+function finishCanaryTurn(turn: CanaryTurnAccumulator): CanaryTurnStats {
+	return {
+		requests: turn.requests,
+		joinedTerminalResponses: turn.joinedTerminalResponses,
+		cacheMeasuredResponses: turn.cacheMeasuredResponses,
+		weightedCacheReusePct:
+			turn.measuredInputTokens > 0
+				? Math.round(
+						(1000 * turn.cacheReadInputTokens) / turn.measuredInputTokens,
+					) / 10
+				: null,
+		cachePositiveResponses: turn.cachePositiveResponses,
+		cachePositiveRatePct:
+			turn.cacheMeasuredResponses > 0
+				? Math.round(
+						(1000 * turn.cachePositiveResponses) / turn.cacheMeasuredResponses,
+					) / 10
+				: null,
+	};
+}
+
+function finishCanaryArm(arm: CanaryArmAccumulator): CanaryArmStats {
+	return {
+		assignedRequests: arm.assignedRequests,
+		joinedTerminalResponses: arm.joinedTerminalResponses,
+		missingTerminalRequests: arm.missingTerminalRequests,
+		cacheMeasuredResponses: arm.cacheMeasuredResponses,
+		weightedCacheReusePct:
+			arm.measuredInputTokens > 0
+				? Math.round(
+						(1000 * arm.usage.cacheReadInputTokens) / arm.measuredInputTokens,
+					) / 10
+				: null,
+		cachePositiveResponses: arm.cachePositiveResponses,
+		cachePositiveRatePct:
+			arm.cacheMeasuredResponses > 0
+				? Math.round(
+						(1000 * arm.cachePositiveResponses) / arm.cacheMeasuredResponses,
+					) / 10
+				: null,
+		usage: arm.usage,
+		terminals: arm.terminals,
+		effectiveModes: arm.effectiveModes,
+		explicitCrossovers: arm.explicitCrossovers,
+		models: arm.models,
+		accounts: arm.accounts,
+		logicalConversations: arm.conversationIds.size,
+		turns: {
+			first: finishCanaryTurn(arm.turns.first),
+			followUp: finishCanaryTurn(arm.turns.followUp),
+		},
+		conversationTurnBands: arm.conversationTurnBands,
+	};
+}
+
+function analyzeCanary(
+	requestRecords: readonly TraceRecord[],
+	responseRecords: readonly TraceRecord[],
+): TraceReport["canary"] {
+	const requestsById = new Map<string, TraceRecord>();
+	const responsesById = new Map<string, TraceRecord>();
+	const requestsWithoutId: TraceRecord[] = [];
+	let responsesWithoutId = 0;
+	for (const request of requestRecords) {
+		if (request.request_id) requestsById.set(request.request_id, request);
+		else requestsWithoutId.push(request);
+	}
+	for (const response of responseRecords) {
+		if (response.request_id) responsesById.set(response.request_id, response);
+		else responsesWithoutId++;
+	}
+	const retainedRequests = [...requestsById.values(), ...requestsWithoutId];
+
+	const conversationRequests = new Map<string, TraceRecord[]>();
+	for (const request of retainedRequests) {
+		if (!request.conversation_id) continue;
+		const group = conversationRequests.get(request.conversation_id) ?? [];
+		group.push(request);
+		conversationRequests.set(request.conversation_id, group);
+	}
+	const turnIndexByRequest = new Map<TraceRecord, number>();
+	const conversationSizeByRequest = new Map<TraceRecord, number>();
+	for (const group of conversationRequests.values()) {
+		group.sort((a, b) => (a.ts ?? "").localeCompare(b.ts ?? ""));
+		group.forEach((request, index) => {
+			turnIndexByRequest.set(request, index);
+			conversationSizeByRequest.set(request, group.length);
+		});
+	}
+
+	const arms = {
+		conversation: canaryArmAccumulator(),
+		session: canaryArmAccumulator(),
+		unassigned: canaryArmAccumulator(),
+	};
+	for (const request of retainedRequests) {
+		const assignment = request.cache_key_assignment;
+		const arm =
+			assignment === "conversation" || assignment === "session"
+				? arms[assignment]
+				: arms.unassigned;
+		arm.assignedRequests++;
+		if (request.cache_key_mode)
+			increment(arm.effectiveModes, request.cache_key_mode);
+		if (request.model_out) increment(arm.models, request.model_out);
+		if (request.account) increment(arm.accounts, request.account);
+		if (request.conversation_id)
+			arm.conversationIds.add(request.conversation_id);
+		const conversationSize = conversationSizeByRequest.get(request);
+		if (conversationSize !== undefined)
+			increment(arm.conversationTurnBands, String(conversationSize));
+		if (
+			request.cache_key_assignment_source === "explicit_session_override" &&
+			assignment === "conversation" &&
+			request.cache_key_mode === "session"
+		)
+			arm.explicitCrossovers.conversationToSession++;
+		if (assignment === "session" && request.cache_key_mode === "conversation")
+			arm.explicitCrossovers.sessionToConversation++;
+
+		const turn =
+			turnIndexByRequest.get(request) === 0
+				? arm.turns.first
+				: arm.turns.followUp;
+		turn.requests++;
+		const response = request.request_id
+			? responsesById.get(request.request_id)
+			: undefined;
+		if (!response) {
+			arm.missingTerminalRequests++;
+			continue;
+		}
+		arm.joinedTerminalResponses++;
+		turn.joinedTerminalResponses++;
+		increment(arm.terminals, response.stop_reason ?? "unknown");
+		const inputTokens = response.input_tokens ?? 0;
+		arm.usage.inputTokens += inputTokens;
+		arm.usage.outputTokens += response.output_tokens ?? 0;
+		arm.usage.cacheCreationInputTokens +=
+			response.cache_creation_input_tokens ?? 0;
+		if (typeof response.cache_read_input_tokens !== "number") continue;
+		const cacheRead = Math.min(
+			Math.max(response.cache_read_input_tokens, 0),
+			inputTokens,
+		);
+		arm.cacheMeasuredResponses++;
+		arm.measuredInputTokens += inputTokens;
+		arm.usage.cacheReadInputTokens += cacheRead;
+		turn.cacheMeasuredResponses++;
+		turn.measuredInputTokens += inputTokens;
+		turn.cacheReadInputTokens += cacheRead;
+		if (cacheRead > 0) {
+			arm.cachePositiveResponses++;
+			turn.cachePositiveResponses++;
+		}
+	}
+
+	let unjoinedResponses = responsesWithoutId;
+	for (const requestId of responsesById.keys())
+		if (!requestsById.has(requestId)) unjoinedResponses++;
+	return {
+		conversation: finishCanaryArm(arms.conversation),
+		session: finishCanaryArm(arms.session),
+		unassigned: finishCanaryArm(arms.unassigned),
+		unjoinedResponses,
 	};
 }
 
@@ -470,6 +751,7 @@ export function analyzeCodexTrace(
 		requests: requestRecords.length,
 		responses: responseRecords.length,
 		span: { first: timestamps[0], last: timestamps.at(-1) },
+		canary: analyzeCanary(requestRecords, responseRecords),
 		request: {
 			maxHistoryToolCalls,
 			maxInputItems,
@@ -540,6 +822,24 @@ export function parseTraceJsonl(text: string): TraceRecord[] {
 	return records;
 }
 
+function formatCanaryArm(name: string, arm: CanaryArmStats): string[] {
+	return [
+		`  ${name}: assigned=${arm.assignedRequests} joined=${arm.joinedTerminalResponses} missing-terminal=${arm.missingTerminalRequests}`,
+		`    cache measured: ${arm.cacheMeasuredResponses}; weighted reuse: ${arm.weightedCacheReusePct ?? "n/a"}%`,
+		`    cache positive: ${arm.cachePositiveResponses}/${arm.cacheMeasuredResponses} measured (${arm.cachePositiveRatePct ?? "n/a"}%)`,
+		`    terminals: ${JSON.stringify(arm.terminals)}`,
+		`    effective modes: ${JSON.stringify(arm.effectiveModes)}`,
+		`    explicit crossovers: conversation->session=${arm.explicitCrossovers.conversationToSession}, session->conversation=${arm.explicitCrossovers.sessionToConversation}`,
+		`    usage: ${JSON.stringify(arm.usage)}`,
+		`    models: ${JSON.stringify(arm.models)}`,
+		`    accounts: ${JSON.stringify(arm.accounts)}`,
+		`    logical conversations: ${arm.logicalConversations}`,
+		`    first requests: ${JSON.stringify(arm.turns.first)}`,
+		`    cache-eligible follow-ups: ${JSON.stringify(arm.turns.followUp)}`,
+		`    observed conversation-turn bands: ${JSON.stringify(arm.conversationTurnBands)}`,
+	];
+}
+
 export function formatReport(report: TraceReport): string {
 	const lines = [
 		`FINGERPRINT AVAILABILITY: usable=${report.request.fingerprintCoverage.usable} missing=${report.request.fingerprintCoverage.missing} truncated=${report.request.fingerprintCoverage.truncated}`,
@@ -580,6 +880,12 @@ export function formatReport(report: TraceReport): string {
 			.map((session) => `${session.session.slice(0, 8)}=${session.requests}`)
 			.join(", ")}`,
 		`  RE-SPAWN responses         : ${report.response.respawnResponses}`,
+		"",
+		"CONVERSATION VS SESSION CANARY (intention-to-treat):",
+		...formatCanaryArm("conversation", report.canary.conversation),
+		...formatCanaryArm("session", report.canary.session),
+		...formatCanaryArm("unassigned compatibility", report.canary.unassigned),
+		`  unjoined responses: ${report.canary.unjoinedResponses}`,
 	];
 	if (report.response.worstRespawns.length > 0) {
 		lines.push("  worst within-response re-spawns:");
