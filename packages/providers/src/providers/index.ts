@@ -17,6 +17,7 @@ export {
 	CodexProvider,
 	fetchCodexUsageOnDemand,
 	parseCodexUsageHeaders,
+	resolveCodexRequestModel,
 } from "./codex/index";
 export { KiloProvider } from "./kilo/index";
 export { MinimaxProvider } from "./minimax/index";

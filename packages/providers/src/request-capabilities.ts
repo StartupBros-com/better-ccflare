@@ -139,8 +139,16 @@ export function estimateAnthropicRequestTokens(
 			serialized = String(body ?? "");
 		}
 	}
+	const charEstimate = Math.ceil(serialized.length / 3);
+	const containsNonAscii = /[^\x00-\x7f]/.test(serialized);
+	// This remains a low-confidence heuristic rather than tokenization. ASCII keeps
+	// the established chars/3 estimate, while Unicode uses UTF-8 bytes/2 as a
+	// conservative floor because UTF-16 character counts understate emoji and CJK.
+	const unicodeEstimate = containsNonAscii
+		? Math.ceil(new TextEncoder().encode(serialized).byteLength / 2)
+		: 0;
 	return {
-		tokens: Math.max(1, Math.ceil(serialized.length / 3)),
+		tokens: Math.max(1, charEstimate, unicodeEstimate),
 		method: "prompt-material-chars",
 		confidence: "low",
 	};

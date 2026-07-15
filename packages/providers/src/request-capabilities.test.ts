@@ -74,12 +74,35 @@ describe("estimateAnthropicRequestTokens", () => {
 		expect(result.confidence).toBe("low");
 	});
 
-	it("preserves the synthetic Codex estimator result", () => {
+	it("preserves ASCII chars-per-token parity for synthetic Codex estimates", () => {
 		const request = {
 			model: "claude-3-7-sonnet",
 			messages: [{ role: "user", content: "hello" }],
 		};
 		expect(estimateAnthropicRequestTokens(request).tokens).toBe(4);
+	});
+
+	it("uses a materially more conservative UTF-8 estimate for emoji", () => {
+		const ascii = estimateAnthropicRequestTokens({
+			messages: [{ role: "user", content: "a".repeat(30) }],
+		});
+		const emoji = estimateAnthropicRequestTokens({
+			messages: [{ role: "user", content: "😀".repeat(30) }],
+		});
+		expect(ascii.tokens).toBe(12);
+		expect(emoji.tokens).toBe(63);
+		expect(emoji.tokens).toBeGreaterThan(ascii.tokens * 5);
+	});
+
+	it("uses a materially more conservative UTF-8 estimate for CJK", () => {
+		const ascii = estimateAnthropicRequestTokens({
+			messages: [{ role: "user", content: "a".repeat(30) }],
+		});
+		const cjk = estimateAnthropicRequestTokens({
+			messages: [{ role: "user", content: "漢".repeat(30) }],
+		});
+		expect(cjk.tokens).toBe(48);
+		expect(cjk.tokens).toBeGreaterThan(ascii.tokens * 3);
 	});
 
 	it("always returns a nonnegative integer for malformed input", () => {

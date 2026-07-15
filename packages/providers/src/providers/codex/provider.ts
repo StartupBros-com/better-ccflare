@@ -132,6 +132,23 @@ const DEFAULT_MODEL_MAP: Record<string, string> = {
 	haiku: "gpt-5.4-mini",
 };
 
+/** Resolve the concrete Codex model exactly as request transformation will. */
+export function resolveCodexRequestModel(
+	anthropicModel: string,
+	account?: Account,
+): string {
+	if (account) {
+		const mapped = mapModelName(anthropicModel, account);
+		if (mapped !== anthropicModel) return mapped;
+	}
+
+	const lower = anthropicModel.toLowerCase();
+	if (lower.includes("haiku")) return DEFAULT_MODEL_MAP.haiku;
+	if (lower.includes("sonnet")) return DEFAULT_MODEL_MAP.sonnet;
+	if (lower.includes("opus")) return DEFAULT_MODEL_MAP.opus;
+	return anthropicModel;
+}
+
 // Known Codex failure codes → Anthropic error types. Quota exhaustion cools
 // the account like a rate limit; slow_down is a throttle; context/policy and
 // subscription errors are permanent and must not be retried as 5xx. Codes and
@@ -683,18 +700,7 @@ export class CodexProvider extends BaseProvider {
 	// ── Private helpers ──────────────────────────────────────────────────────
 
 	private mapModel(anthropicModel: string, account?: Account): string {
-		if (account) {
-			const mapped = mapModelName(anthropicModel, account);
-			if (mapped !== anthropicModel) {
-				return mapped;
-			}
-		}
-
-		const lower = anthropicModel.toLowerCase();
-		if (lower.includes("haiku")) return DEFAULT_MODEL_MAP.haiku;
-		if (lower.includes("sonnet")) return DEFAULT_MODEL_MAP.sonnet;
-		if (lower.includes("opus")) return DEFAULT_MODEL_MAP.opus;
-		return anthropicModel;
+		return resolveCodexRequestModel(anthropicModel, account);
 	}
 
 	private extractSystemPrompt(

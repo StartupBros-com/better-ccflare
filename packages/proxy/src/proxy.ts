@@ -5,7 +5,10 @@ import {
 } from "@better-ccflare/core";
 import { DatabaseFactory } from "@better-ccflare/database";
 import { Logger } from "@better-ccflare/logger";
-import { usageCache } from "@better-ccflare/providers";
+import {
+	estimateAnthropicRequestTokens,
+	usageCache,
+} from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
 import { cacheBodyStore } from "./cache-body-store";
 import { recordDiagnosisCandidate } from "./cache-diagnosis";
@@ -19,6 +22,8 @@ import {
 } from "./cache-pacing";
 import { warnOnLookbackRisk } from "./cache-telemetry";
 import {
+	createContextAdmissionTracker,
+	createContextLengthExceededResponse,
 	createPoolExhaustedResponse,
 	createRequestMetadata,
 	createUsageThrottledResponse,
@@ -161,6 +166,21 @@ export async function handleProxy(
 	// 3. Prepare request body
 	const { buffer: requestBodyBuffer } = await prepareRequestBody(req);
 	const requestBodyContext = new RequestBodyContext(requestBodyBuffer);
+	const originalParsedBody = requestBodyContext.getParsedJson();
+	const isSyntheticContextRequest =
+		url.pathname !== "/v1/messages" ||
+		!!req.headers.get("x-better-ccflare-keepalive") ||
+		!!req.headers.get("x-better-ccflare-auto-refresh") ||
+		originalParsedBody?.max_tokens === 0;
+	const contextAdmissionTracker =
+		process.env.CCFLARE_CONTEXT_ADMISSION === "1" &&
+		originalParsedBody &&
+		!isSyntheticContextRequest
+			? createContextAdmissionTracker(
+					estimateAnthropicRequestTokens(originalParsedBody).tokens,
+					originalParsedBody.max_tokens,
+				)
+			: undefined;
 
 	// 3b. Optionally inject 1h TTL into system prompt cache_control blocks
 	if (ctx.config.getSystemPromptCacheTtl1h() && requestBodyBuffer) {
@@ -583,6 +603,9 @@ export async function handleProxy(
 			)
 		) {
 			reactiveDepletionSkips.push(accounts[i]);
+			if (contextAdmissionTracker) {
+				contextAdmissionTracker.nonCapacitySkipCount++;
+			}
 			log.info(
 				`Skipping account ${accounts[i].name} for model ${attemptModel}: recent model-scoped out_of_credits`,
 			);
@@ -591,10 +614,13 @@ export async function handleProxy(
 
 		const probeAdmission = getRateLimitProbeAdmission(accounts[i]);
 		if (probeAdmission === "suppressed") {
+			if (contextAdmissionTracker) {
+				contextAdmissionTracker.nonCapacitySkipCount++;
+			}
 			continue;
 		}
 
-		upstreamAttempts++;
+		const attemptedBefore = contextAdmissionTracker?.attemptedCount ?? 0;
 		try {
 			response = await proxyWithAccount(
 				req,
@@ -610,11 +636,18 @@ export async function handleProxy(
 				apiKeyName,
 				requestBodyContext,
 				!filteredComboInfo?.comboName && i === accounts.length - 1,
+				contextAdmissionTracker,
 			);
 		} finally {
 			if (probeAdmission === "admitted") {
 				completeRateLimitProbe(accounts[i], "abandoned");
 			}
+		}
+		if (
+			!contextAdmissionTracker ||
+			contextAdmissionTracker.attemptedCount > attemptedBefore
+		) {
+			upstreamAttempts++;
 		}
 
 		if (response) {
@@ -682,10 +715,13 @@ export async function handleProxy(
 				}
 				const probeAdmission = getRateLimitProbeAdmission(fallbackAccounts[i]);
 				if (probeAdmission === "suppressed") {
+					if (contextAdmissionTracker) {
+						contextAdmissionTracker.nonCapacitySkipCount++;
+					}
 					continue;
 				}
 
-				upstreamAttempts++;
+				const attemptedBefore = contextAdmissionTracker?.attemptedCount ?? 0;
 				try {
 					response = await proxyWithAccount(
 						req,
@@ -701,11 +737,18 @@ export async function handleProxy(
 						apiKeyName,
 						requestBodyContext,
 						i === fallbackAccounts.length - 1,
+						contextAdmissionTracker,
 					);
 				} finally {
 					if (probeAdmission === "admitted") {
 						completeRateLimitProbe(fallbackAccounts[i], "abandoned");
 					}
+				}
+				if (
+					!contextAdmissionTracker ||
+					contextAdmissionTracker.attemptedCount > attemptedBefore
+				) {
+					upstreamAttempts++;
 				}
 
 				if (response) {
@@ -747,6 +790,18 @@ export async function handleProxy(
 				createUsageThrottledResponse(reactiveDepletionSkips),
 			);
 		}
+	}
+
+	if (
+		contextAdmissionTracker &&
+		contextAdmissionTracker.rejectedCount > 0 &&
+		contextAdmissionTracker.attemptedCount === 0 &&
+		contextAdmissionTracker.nonCapacitySkipCount === 0
+	) {
+		cacheBodyStore.discardStaged(requestMeta.id);
+		pacingSlot?.abandon();
+		if (sessionId) clearSession(sessionId, requestMeta.timestamp);
+		return createContextLengthExceededResponse(contextAdmissionTracker);
 	}
 
 	// 11. All accounts failed - check if OAuth token issues are the cause
