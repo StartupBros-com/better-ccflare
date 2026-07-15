@@ -9,6 +9,7 @@ import type {
 	AgentAttributionSource,
 	ProjectAttributionSource,
 	RateLimitReason,
+	RequestMeta,
 } from "@better-ccflare/types";
 import {
 	ANTHROPIC_TERMINAL_RECOVERY_GRACE_MS,
@@ -117,6 +118,10 @@ export interface ResponseHandlerOptions {
 	comboName?: string | null;
 	originalModel?: string | null;
 	appliedModel?: string | null;
+	xaiCacheIdentityFingerprint?: RequestMeta["xaiCacheIdentityFingerprint"];
+	xaiCachePrefixFingerprint?: RequestMeta["xaiCachePrefixFingerprint"];
+	xaiCacheOfficialEndpoint?: boolean;
+	xaiCacheKeyPresent?: boolean;
 }
 
 /**
@@ -149,6 +154,10 @@ export async function forwardToClient(
 		comboName,
 		originalModel,
 		appliedModel,
+		xaiCacheIdentityFingerprint,
+		xaiCachePrefixFingerprint,
+		xaiCacheOfficialEndpoint,
+		xaiCacheKeyPresent,
 	} = options;
 
 	// Record which account actually served this session's request, keyed on the
@@ -248,6 +257,10 @@ export async function forwardToClient(
 			apiKeyId: apiKeyId || null,
 			apiKeyName: apiKeyName || null,
 			retryAttempt,
+			xaiCacheIdentityFingerprint,
+			xaiCachePrefixFingerprint,
+			xaiCacheOfficialEndpoint,
+			xaiCacheKeyPresent,
 			failoverAttempts,
 		};
 		getUsageCollector().handleStart(startMessage);

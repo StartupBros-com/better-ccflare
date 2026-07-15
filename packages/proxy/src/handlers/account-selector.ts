@@ -1,4 +1,8 @@
-import { getModelFamily, isAccountAvailable } from "@better-ccflare/core";
+import {
+	getModelFamily,
+	isAccountAvailable,
+	isOfficialXaiEndpoint,
+} from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import type {
 	Account,
@@ -9,6 +13,19 @@ import type {
 import type { ProxyContext } from "./proxy-types";
 
 const log = new Logger("AccountSelector");
+
+/** Thrown when Grok cache-native is active and force-route cannot use the target. */
+export class ForceRouteUnavailableError extends Error {
+	readonly accountId: string;
+	readonly reason: string;
+
+	constructor(accountId: string, reason: string) {
+		super(`Force-routed account unavailable: ${reason}`);
+		this.name = "ForceRouteUnavailableError";
+		this.accountId = accountId;
+		this.reason = reason;
+	}
+}
 
 // Module-level WeakMap to store combo slot info per RequestMeta
 const comboSlotInfoMap = new WeakMap<RequestMeta, ComboSlotInfo>();
@@ -44,14 +61,42 @@ export function resolveEffectiveModel(
  * @param ctx - The proxy context
  * @returns Array of ordered accounts
  */
+function setXaiCacheEligibleAccounts(
+	meta: RequestMeta,
+	accounts: Account[],
+): void {
+	if (!meta.xaiCacheNativeActive) return;
+	meta.xaiCacheEligibleAccountIds = new Set(
+		accounts
+			.filter(
+				(account) =>
+					account.provider === "xai" && isOfficialXaiEndpoint(account),
+			)
+			.map((account) => account.id),
+	);
+}
+
+function applyXaiCacheAffinity(
+	accounts: Account[],
+	meta: RequestMeta,
+	ctx: ProxyContext,
+): Account[] {
+	return ctx.cacheAffinityOrderer?.order(accounts, meta) ?? accounts;
+}
+
 export async function getOrderedAccounts(
 	meta: RequestMeta,
 	ctx: ProxyContext,
 ): Promise<Account[]> {
 	try {
 		const allAccounts = await ctx.dbOps.getAllAccounts();
+		setXaiCacheEligibleAccounts(meta, allAccounts);
 		// Return all accounts - the provider will be determined dynamically per account
-		return ctx.strategy.select(allAccounts, meta);
+		return applyXaiCacheAffinity(
+			ctx.strategy.select(allAccounts, meta),
+			meta,
+			ctx,
+		);
 	} catch (error) {
 		log.error("Failed to get accounts from database:", error);
 		console.error("\n❌ DATABASE ERROR DETECTED");
@@ -124,9 +169,21 @@ export async function selectAccountsForRequest(
 					if (allowThrough) {
 						return [forcedAccount];
 					}
+					// Feature-scoped fail-closed for official xAI force-routes only.
+					if (
+						meta.xaiCacheNativeActive &&
+						forcedAccount.provider === "xai" &&
+						isOfficialXaiEndpoint(forcedAccount)
+					) {
+						throw new ForceRouteUnavailableError(
+							forcedAccountId,
+							forcedAccount.paused ? "paused" : "rate_limited_or_unavailable",
+						);
+					}
 				}
 				// If forced account not found or unavailable (paused/rate-limited), fall back to normal selection
 			} catch (error) {
+				if (error instanceof ForceRouteUnavailableError) throw error;
 				log.error(
 					"Failed to get accounts from database for forced account lookup:",
 					error,
@@ -236,17 +293,31 @@ export async function selectAccountsForRequest(
 						});
 					}
 
-					// Store combo slot info for downstream consumption
-					const slotInfo: ComboSlotInfo = {
-						comboName: combo.name,
-						slots: slotEntries,
-					};
-					setComboSlotInfo(meta, slotInfo);
-					meta.comboName = combo.name;
-
+					setXaiCacheEligibleAccounts(meta, allAccounts);
 					const filteredComboAccounts = applyExclusions(availableAccounts);
 					if (filteredComboAccounts.length > 0) {
-						return filteredComboAccounts;
+						const orderedAccounts = applyXaiCacheAffinity(
+							filteredComboAccounts,
+							meta,
+							ctx,
+						);
+						const modelsByAccountId = new Map<string, string[]>();
+						for (const slot of slotEntries) {
+							const models = modelsByAccountId.get(slot.accountId) ?? [];
+							models.push(slot.modelOverride);
+							modelsByAccountId.set(slot.accountId, models);
+						}
+						const slotInfo: ComboSlotInfo = {
+							comboName: combo.name,
+							slots: orderedAccounts.map((account) => ({
+								accountId: account.id,
+								modelOverride:
+									modelsByAccountId.get(account.id)?.shift() ?? model,
+							})),
+						};
+						setComboSlotInfo(meta, slotInfo);
+						meta.comboName = combo.name;
+						return orderedAccounts;
 					}
 
 					// All slots unavailable — fall back to normal routing

@@ -3,6 +3,10 @@ import { logBus } from "@better-ccflare/logger";
 import type { LogEvent } from "@better-ccflare/types";
 import { isValidClaudeModel } from "../../../core/src/model-mappings";
 import { CLAUDE_MODEL_IDS } from "../../../core/src/models";
+import {
+	cacheOutcomeFromTokens,
+	formatXaiCacheCanary,
+} from "../../../core/src/xai";
 import type { StartMessage } from "../worker-messages";
 
 interface PricingTokens {
@@ -23,6 +27,8 @@ const estimateCostUSD = mock((model: string, tokens: PricingTokens) =>
 );
 
 mock.module("@better-ccflare/core", () => ({
+	cacheOutcomeFromTokens,
+	formatXaiCacheCanary,
 	BUFFER_SIZES: {
 		STREAM_TEE_MAX_BYTES: 1024 * 1024,
 		STREAM_USAGE_BUFFER_KB: 64,
@@ -112,6 +118,7 @@ function createHarness(storePayloads = false): TestHarness {
 	const pendingWrites = new Set<Promise<void>>();
 
 	const dbOps = {
+		async updateAccountUsage(): Promise<void> {},
 		async saveRequest(requestId: string): Promise<void> {
 			saveRequestIds.push(requestId);
 		},
@@ -204,6 +211,161 @@ describe("UsageCollector request lifecycle", () => {
 		collectors.push(value.collector);
 		return value;
 	}
+
+	it.each([
+		{
+			label: "hit",
+			cacheUsage: ',"cache_read_input_tokens":12',
+			expected: "outcome=hit",
+			expectedCached: "cached=12",
+		},
+		{
+			label: "miss",
+			cacheUsage: ',"cache_read_input_tokens":0',
+			expected: "outcome=miss",
+			expectedCached: "cached=0",
+		},
+		{
+			label: "unknown",
+			cacheUsage: "",
+			expected: "outcome=unknown",
+			expectedCached: null,
+		},
+	])("emits one privacy-safe Grok cache canary for a $label outcome", async ({
+		cacheUsage,
+		expected,
+		expectedCached,
+	}) => {
+		const { collector } = harness();
+		const canaryEvents: LogEvent[] = [];
+		const onLog = (event: LogEvent) => {
+			if (event.msg.startsWith("Grok cache canary ")) {
+				canaryEvents.push(event);
+			}
+		};
+		logBus.on("log", onLog);
+
+		try {
+			collector.handleStart(
+				makeStartMessage(`cache-${expected}`, {
+					accountId: "xai-account",
+					accountName: "Grok Primary",
+					providerName: "xai",
+					xaiCacheIdentityFingerprint: "identity12345678",
+					xaiCachePrefixFingerprint: "prefix123456789",
+					xaiCacheOfficialEndpoint: true,
+					xaiCacheKeyPresent: true,
+				}),
+			);
+			collector.handleChunk(
+				`cache-${expected}`,
+				new TextEncoder().encode(
+					`event: message_start\ndata: {"type":"message_start","message":{"model":"grok-4","usage":{"input_tokens":20,"output_tokens":0}}}\n\nevent: message_delta\ndata: {"type":"message_delta","usage":{"input_tokens":20,"output_tokens":5${cacheUsage}}}\n\n`,
+				),
+			);
+			await collector.handleEnd({
+				type: "end",
+				requestId: `cache-${expected}`,
+				success: true,
+			});
+			await collector.drain();
+		} finally {
+			logBus.off("log", onLog);
+		}
+
+		expect(canaryEvents).toHaveLength(1);
+		const message = canaryEvents[0]?.msg ?? "";
+		expect(message).toContain(expected);
+		expect(message).toContain("official=1");
+		expect(message).toContain("key=1");
+		expect(message).toContain("account=xai-account");
+		expect(message).toContain("account_name=Grok Primary");
+		expect(message).toContain("id=identity12345678");
+		expect(message).toContain("prefix=prefix123456789");
+		if (expectedCached) {
+			expect(message).toContain(expectedCached);
+		} else {
+			expect(message).not.toContain("cached=");
+		}
+		expect(message).not.toContain("session_id");
+		expect(message).not.toContain("raw prompt");
+	});
+
+	it("treats explicit cache tokens from a generic usage event as present", async () => {
+		const { collector } = harness();
+		const canaryEvents: LogEvent[] = [];
+		const onLog = (event: LogEvent) => {
+			if (event.msg.startsWith("Grok cache canary ")) {
+				canaryEvents.push(event);
+			}
+		};
+		logBus.on("log", onLog);
+
+		try {
+			collector.handleStart(
+				makeStartMessage("cache-generic-usage", {
+					accountId: "xai-account",
+					providerName: "xai",
+					xaiCacheIdentityFingerprint: "identity12345678",
+					xaiCacheOfficialEndpoint: true,
+					xaiCacheKeyPresent: true,
+				}),
+			);
+			collector.handleChunk("cache-generic-usage", modelBearingChunk());
+			collector.handleChunk(
+				"cache-generic-usage",
+				new TextEncoder().encode(
+					'event: response.completed\ndata: {"usage":{"input_tokens":20,"output_tokens":5,"cache_read_input_tokens":0}}\n\n',
+				),
+			);
+			await collector.handleEnd({
+				type: "end",
+				requestId: "cache-generic-usage",
+				success: true,
+			});
+			await collector.drain();
+		} finally {
+			logBus.off("log", onLog);
+		}
+
+		expect(canaryEvents).toHaveLength(1);
+		expect(canaryEvents[0]?.msg).toContain("outcome=miss");
+		expect(canaryEvents[0]?.msg).toContain("cached=0");
+	});
+
+	it("does not count a custom or non-xAI serving route as an active Grok canary", async () => {
+		const { collector } = harness();
+		const canaryEvents: LogEvent[] = [];
+		const onLog = (event: LogEvent) => {
+			if (event.msg.startsWith("Grok cache canary ")) {
+				canaryEvents.push(event);
+			}
+		};
+		logBus.on("log", onLog);
+
+		try {
+			collector.handleStart(
+				makeStartMessage("cache-ineligible-route", {
+					accountId: "custom-account",
+					providerName: "xai",
+					xaiCacheIdentityFingerprint: "identity12345678",
+					xaiCacheOfficialEndpoint: false,
+					xaiCacheKeyPresent: false,
+				}),
+			);
+			collector.handleChunk("cache-ineligible-route", modelBearingChunk());
+			await collector.handleEnd({
+				type: "end",
+				requestId: "cache-ineligible-route",
+				success: true,
+			});
+			await collector.drain();
+		} finally {
+			logBus.off("log", onLog);
+		}
+
+		expect(canaryEvents).toHaveLength(0);
+	});
 
 	it("keeps an actively chunking stream beyond two minutes and persists it on end", async () => {
 		const { collector, saveRequestIds, summaries } = harness();

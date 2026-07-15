@@ -163,8 +163,8 @@ export interface TransformStreamContext {
 	textBlockIndex: number;
 	promptTokens: number;
 	completionTokens: number;
-	cacheReadInputTokens: number;
-	cacheCreationInputTokens: number;
+	cacheReadInputTokens?: number;
+	cacheCreationInputTokens?: number;
 	encounteredToolCall: boolean;
 	toolCallAccumulators: Record<number, string>;
 	/**

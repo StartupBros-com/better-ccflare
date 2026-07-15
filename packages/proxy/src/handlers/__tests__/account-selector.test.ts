@@ -4,7 +4,9 @@ import type {
 	ComboWithSlots,
 	RequestMeta,
 } from "@better-ccflare/types";
+import { CacheAffinityOrderer } from "../../cache-affinity-orderer";
 import {
+	ForceRouteUnavailableError,
 	getComboSlotInfo,
 	resolveEffectiveModel,
 	selectAccountsForRequest,
@@ -197,6 +199,245 @@ describe("selectAccountsForRequest — x-better-ccflare-account-id header", () =
 		const result = await selectAccountsForRequest(meta, ctx);
 		// Rate-limited forced account is skipped; falls back to strategy.select which returns activeAcc
 		expect(result).toHaveLength(1);
+		expect(result[0]?.id).toBe("acc-active");
+	});
+});
+
+describe("selectAccountsForRequest — Grok cache-native ownership", () => {
+	it("keeps the same owner when the configured strategy changes order", async () => {
+		const a = makeAccount({ id: "xai-a", provider: "xai" });
+		const b = makeAccount({ id: "xai-b", provider: "xai" });
+		let reverse = false;
+		const ctx = makeCtx({ accounts: [a, b] });
+		ctx.strategy.select = mock(() => {
+			reverse = !reverse;
+			return reverse ? [a, b] : [b, a];
+		});
+		ctx.cacheAffinityOrderer = new CacheAffinityOrderer(60_000);
+
+		const first = await selectAccountsForRequest(
+			makeRequestMeta({
+				xaiCacheNativeActive: true,
+				cacheAffinityKey: "conversation",
+			}),
+			ctx,
+		);
+		const second = await selectAccountsForRequest(
+			makeRequestMeta({
+				xaiCacheNativeActive: true,
+				cacheAffinityKey: "conversation",
+			}),
+			ctx,
+		);
+
+		expect(first[0]?.id).toBe("xai-a");
+		expect(second[0]?.id).toBe("xai-a");
+	});
+
+	it("keeps combo account and model slots aligned after affinity ordering", async () => {
+		const a = makeAccount({ id: "xai-a", provider: "xai" });
+		const b = makeAccount({ id: "xai-b", provider: "xai" });
+		const ctx = makeCtx({
+			accounts: [a, b],
+			activeCombo: makeCombo([
+				{
+					id: "slot-a",
+					combo_id: "combo-1",
+					account_id: "xai-a",
+					model: "grok-a",
+					priority: 0,
+					enabled: true,
+				},
+				{
+					id: "slot-b",
+					combo_id: "combo-1",
+					account_id: "xai-b",
+					model: "grok-b",
+					priority: 1,
+					enabled: true,
+				},
+			]),
+		});
+		ctx.cacheAffinityOrderer = new CacheAffinityOrderer(60_000);
+		const affinity = {
+			xaiCacheNativeActive: true,
+			cacheAffinityKey: "conversation",
+		};
+
+		await selectAccountsForRequest(
+			makeRequestMeta(affinity),
+			ctx,
+			"claude-sonnet-4-5",
+		);
+		const reversedCombo = makeCombo([
+			{
+				id: "slot-b",
+				combo_id: "combo-1",
+				account_id: "xai-b",
+				model: "grok-b",
+				priority: 0,
+				enabled: true,
+			},
+			{
+				id: "slot-a",
+				combo_id: "combo-1",
+				account_id: "xai-a",
+				model: "grok-a",
+				priority: 1,
+				enabled: true,
+			},
+		]);
+		(
+			ctx.dbOps.getActiveComboForFamily as ReturnType<typeof mock>
+		).mockImplementation(async () => reversedCombo);
+		const meta = makeRequestMeta(affinity);
+		const result = await selectAccountsForRequest(
+			meta,
+			ctx,
+			"claude-sonnet-4-5",
+		);
+
+		expect(result.map((account) => account.id)).toEqual(["xai-a", "xai-b"]);
+		expect(getComboSlotInfo(meta)?.slots).toEqual([
+			{ accountId: "xai-a", modelOverride: "grok-a" },
+			{ accountId: "xai-b", modelOverride: "grok-b" },
+		]);
+	});
+});
+
+describe("selectAccountsForRequest — Grok cache-native force-route fail-closed", () => {
+	it("throws when feature is active and forced xAI account is paused", async () => {
+		const pausedAcc = makeAccount({
+			id: "acc-paused",
+			name: "paused",
+			provider: "xai",
+			paused: true,
+		});
+		const activeAcc = makeAccount({
+			id: "acc-active",
+			name: "active",
+			provider: "xai",
+		});
+		const ctx: ProxyContext = {
+			strategy: { select: mock(() => [activeAcc]) },
+			dbOps: {
+				getAllAccounts: mock(async () => [pausedAcc, activeAcc]),
+				getActiveComboForFamily: mock(async () => null),
+			},
+			refreshInFlight: new Map(),
+			asyncWriter: { enqueue: mock(() => {}) },
+			usageWorker: { postMessage: mock(() => {}) },
+		} as unknown as ProxyContext;
+		const meta = makeRequestMeta({
+			xaiCacheNativeActive: true,
+			headers: new Headers({ "x-better-ccflare-account-id": "acc-paused" }),
+		});
+		await expect(selectAccountsForRequest(meta, ctx)).rejects.toBeInstanceOf(
+			ForceRouteUnavailableError,
+		);
+	});
+
+	it("still falls back for an unavailable custom-endpoint xAI account", async () => {
+		const customAcc = makeAccount({
+			id: "acc-custom",
+			name: "custom",
+			provider: "xai",
+			custom_endpoint: "https://xai.internal.example/v1",
+			paused: true,
+		});
+		const activeAcc = makeAccount({ id: "acc-active", name: "active" });
+		const ctx: ProxyContext = {
+			strategy: { select: mock(() => [activeAcc]) },
+			dbOps: {
+				getAllAccounts: mock(async () => [customAcc, activeAcc]),
+				getActiveComboForFamily: mock(async () => null),
+			},
+			refreshInFlight: new Map(),
+			asyncWriter: { enqueue: mock(() => {}) },
+		} as unknown as ProxyContext;
+		const meta = makeRequestMeta({
+			xaiCacheNativeActive: true,
+			headers: new Headers({
+				"x-better-ccflare-account-id": "acc-custom",
+			}),
+		});
+
+		const result = await selectAccountsForRequest(meta, ctx);
+		expect(result[0]?.id).toBe("acc-active");
+	});
+
+	it("still falls back for an unavailable non-xAI account", async () => {
+		const pausedAcc = makeAccount({
+			id: "acc-paused",
+			provider: "codex",
+			paused: true,
+		});
+		const activeAcc = makeAccount({ id: "acc-active", name: "active" });
+		const ctx: ProxyContext = {
+			strategy: { select: mock(() => [activeAcc]) },
+			dbOps: {
+				getAllAccounts: mock(async () => [pausedAcc, activeAcc]),
+				getActiveComboForFamily: mock(async () => null),
+			},
+			refreshInFlight: new Map(),
+			asyncWriter: { enqueue: mock(() => {}) },
+		} as unknown as ProxyContext;
+		const meta = makeRequestMeta({
+			xaiCacheNativeActive: true,
+			headers: new Headers({ "x-better-ccflare-account-id": "acc-paused" }),
+		});
+
+		const result = await selectAccountsForRequest(meta, ctx);
+		expect(result[0]?.id).toBe("acc-active");
+	});
+
+	it("still allows scheduler bypass for an official xAI account", async () => {
+		const rateLimitedAcc = makeAccount({
+			id: "acc-rl",
+			provider: "xai",
+			rate_limited_until: Date.now() + 3_600_000,
+		});
+		const activeAcc = makeAccount({ id: "acc-active", name: "active" });
+		const ctx = makeCtx({ accounts: [rateLimitedAcc, activeAcc] });
+		const meta = makeRequestMeta({
+			xaiCacheNativeActive: true,
+			headers: new Headers({
+				"x-better-ccflare-account-id": "acc-rl",
+				"x-better-ccflare-bypass-session": "true",
+			}),
+		});
+
+		const result = await selectAccountsForRequest(meta, ctx);
+		expect(result).toEqual([rateLimitedAcc]);
+	});
+
+	it("still falls back when feature is off", async () => {
+		const pausedAcc = makeAccount({
+			id: "acc-paused",
+			name: "paused",
+			provider: "xai",
+			paused: true,
+		});
+		const activeAcc = makeAccount({
+			id: "acc-active",
+			name: "active",
+			provider: "xai",
+		});
+		const ctx: ProxyContext = {
+			strategy: { select: mock(() => [activeAcc]) },
+			dbOps: {
+				getAllAccounts: mock(async () => [pausedAcc, activeAcc]),
+				getActiveComboForFamily: mock(async () => null),
+			},
+			refreshInFlight: new Map(),
+			asyncWriter: { enqueue: mock(() => {}) },
+			usageWorker: { postMessage: mock(() => {}) },
+		} as unknown as ProxyContext;
+		const meta = makeRequestMeta({
+			xaiCacheNativeActive: false,
+			headers: new Headers({ "x-better-ccflare-account-id": "acc-paused" }),
+		});
+		const result = await selectAccountsForRequest(meta, ctx);
 		expect(result[0]?.id).toBe("acc-active");
 	});
 });

@@ -5,9 +5,11 @@ import type {
 } from "@better-ccflare/database";
 import type { Provider } from "@better-ccflare/providers";
 import type { LoadBalancingStrategy } from "@better-ccflare/types";
+import type { CacheAffinityOrderer } from "../cache-affinity-orderer";
 
 export interface ProxyContext {
 	strategy: LoadBalancingStrategy;
+	cacheAffinityOrderer?: CacheAffinityOrderer;
 	dbOps: DatabaseOperations;
 	runtime: RuntimeConfig;
 	config: Config;

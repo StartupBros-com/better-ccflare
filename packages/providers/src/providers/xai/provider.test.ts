@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import type { Account } from "@better-ccflare/types";
+import { XAI_CACHE_NATIVE_ENV, XAI_CONV_ID_HEADER } from "./cache-native";
 import {
 	XAI_DEFAULT_ENDPOINT,
 	XAI_MODEL_MAPPINGS,
@@ -128,6 +129,46 @@ describe("XaiProvider", () => {
 		expect(body.stream_options).toEqual({ include_usage: true });
 	});
 
+	it("attaches x-grok-conv-id only when cache-native is enabled on official xAI", async () => {
+		const original = process.env[XAI_CACHE_NATIVE_ENV];
+		const provider = new XaiProvider();
+		const sessionBody = {
+			model: "claude-3-5-sonnet-20241022",
+			max_tokens: 32,
+			system: "stable system",
+			messages: [{ role: "user", content: "hello" }],
+			metadata: {
+				user_id: JSON.stringify({
+					session_id: "11111111-1111-4111-8111-111111111111",
+				}),
+			},
+		};
+		const makeReq = () =>
+			new Request("https://proxy.local/v1/messages", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(sessionBody),
+			});
+
+		delete process.env[XAI_CACHE_NATIVE_ENV];
+		const off = await provider.transformRequestBody(makeReq(), account());
+		expect(off.headers.get(XAI_CONV_ID_HEADER)).toBeNull();
+
+		process.env[XAI_CACHE_NATIVE_ENV] = "1";
+		const on = await provider.transformRequestBody(makeReq(), account());
+		const header = on.headers.get(XAI_CONV_ID_HEADER);
+		expect(header).toMatch(/^ccflare-xai-[0-9a-f]{48}$/);
+
+		const custom = await provider.transformRequestBody(
+			makeReq(),
+			account({ custom_endpoint: "https://proxy.example.com/v1" }),
+		);
+		expect(custom.headers.get(XAI_CONV_ID_HEADER)).toBeNull();
+
+		if (original === undefined) delete process.env[XAI_CACHE_NATIVE_ENV];
+		else process.env[XAI_CACHE_NATIVE_ENV] = original;
+	});
+
 	it("refreshes xAI OAuth tokens with the Grok client id", async () => {
 		const provider = new XaiProvider();
 		const fetchMock = mock(
@@ -155,5 +196,24 @@ describe("XaiProvider", () => {
 		expect(result.accessToken).toBe("new-access-token");
 		expect(result.refreshToken).toBe("new-refresh-token");
 		expect(result.expiresAt).toBeGreaterThan(Date.now());
+	});
+
+	it("extracts cached_tokens from non-stream OpenAI-compatible usage", async () => {
+		const provider = new XaiProvider();
+		const response = new Response(
+			JSON.stringify({
+				model: "grok-4.3",
+				usage: {
+					prompt_tokens: 100,
+					completion_tokens: 10,
+					total_tokens: 110,
+					prompt_tokens_details: { cached_tokens: 40 },
+				},
+			}),
+			{ status: 200, headers: { "content-type": "application/json" } },
+		);
+		const usage = await provider.extractUsageInfo(response);
+		expect(usage?.cacheReadInputTokens).toBe(40);
+		expect(usage?.inputTokens).toBe(100);
 	});
 });

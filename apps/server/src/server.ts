@@ -43,6 +43,7 @@ import {
 } from "@better-ccflare/providers/bedrock";
 import {
 	AutoRefreshScheduler,
+	CacheAffinityOrderer,
 	CacheKeepaliveScheduler,
 	drainUsageCollector,
 	getCachePacingRouteStats,
@@ -929,6 +930,9 @@ export default async function startServer(options?: {
 	// Proxy context
 	const proxyContext: ProxyContext = {
 		strategy,
+		cacheAffinityOrderer: new CacheAffinityOrderer(
+			runtimeConfig.sessionDurationMs,
+		),
 		dbOps,
 		runtime: runtimeConfig,
 		config,

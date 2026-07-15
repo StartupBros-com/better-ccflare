@@ -252,4 +252,58 @@ describe("SessionAffinityStrategy", () => {
 			).toBeNull();
 		});
 	});
+	it("prefers cacheAffinityKey over clientSessionId for sticky ownership", () => {
+		const accounts = [
+			makeAccount({ id: "a", provider: "xai" }),
+			makeAccount({ id: "b", provider: "xai" }),
+		];
+		const convoMeta = {
+			...metaFor("session-raw"),
+			cacheAffinityKey: "ccflare-xai-convo-1",
+			xaiCacheEligibleAccountIds: new Set(["a", "b"]),
+		} as RequestMeta;
+		const first = strategy.select(accounts, convoMeta)[0].id;
+		const second = strategy.select(accounts, {
+			...metaFor("session-raw"),
+			cacheAffinityKey: "ccflare-xai-convo-1",
+			xaiCacheEligibleAccountIds: new Set(["a", "b"]),
+		} as RequestMeta)[0].id;
+		expect(second).toBe(first);
+	});
+
+	it("does not let Grok affinity reorder ineligible accounts", () => {
+		const codex = makeAccount({ id: "codex", provider: "codex" });
+		const officialXai = makeAccount({ id: "xai", provider: "xai" });
+		store.setUtil("codex", 0);
+		store.setUtil("xai", 50);
+		const meta = {
+			...metaFor("session-raw"),
+			cacheAffinityKey: "ccflare-xai-convo-1",
+			xaiCacheEligibleAccountIds: new Set(["xai"]),
+		} as RequestMeta;
+
+		strategy.select([officialXai], meta);
+		const ordered = strategy.select([codex, officialXai], meta);
+
+		expect(ordered.map((account) => account.id)).toEqual(["codex", "xai"]);
+	});
+
+	it("keeps custom xAI accounts outside native conversation affinity", () => {
+		const customXai = makeAccount({ id: "custom", provider: "xai" });
+		const officialXai = makeAccount({ id: "official", provider: "xai" });
+		store.setUtil("custom", 0);
+		store.setUtil("official", 50);
+		const meta = {
+			...metaFor("session-raw"),
+			cacheAffinityKey: "ccflare-xai-convo-1",
+			xaiCacheEligibleAccountIds: new Set(["official"]),
+		} as RequestMeta;
+
+		strategy.select([officialXai], meta);
+		expect(
+			strategy
+				.select([customXai, officialXai], meta)
+				.map((account) => account.id),
+		).toEqual(["custom", "official"]);
+	});
 });

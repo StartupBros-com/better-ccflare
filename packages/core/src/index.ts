@@ -107,3 +107,10 @@ export {
 	getVersionSync,
 	trackClientVersion,
 } from "./version";
+export {
+	cacheOutcomeFromTokens,
+	formatXaiCacheCanary,
+	isOfficialXaiEndpoint,
+	type XaiCacheCanaryFields,
+	type XaiCacheOutcome,
+} from "./xai";

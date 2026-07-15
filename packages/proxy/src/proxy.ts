@@ -1,4 +1,5 @@
 import {
+	formatXaiCacheCanary,
 	requestEvents,
 	ServiceUnavailableError,
 	trackClientVersion,
@@ -6,7 +7,9 @@ import {
 import { DatabaseFactory } from "@better-ccflare/database";
 import { Logger } from "@better-ccflare/logger";
 import {
+	deriveXaiConversationIdentity,
 	estimateAnthropicAdmissionTokens,
+	isXaiCacheNativeEnabled,
 	usageCache,
 } from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
@@ -28,6 +31,7 @@ import {
 	createRequestMetadata,
 	createUsageThrottledResponse,
 	ERROR_MESSAGES,
+	ForceRouteUnavailableError,
 	getComboSlotInfo,
 	getUsageThrottleUntil,
 	interceptAndModifyRequest,
@@ -261,6 +265,21 @@ export async function handleProxy(
 	requestMeta.project = project;
 	requestMeta.projectAttributionSource = projectAttributionSource;
 	requestMeta.clientSessionId = requestBodyContext.getClientId();
+	if (isXaiCacheNativeEnabled()) {
+		const parsed = requestBodyContext.getParsedJson() as Record<
+			string,
+			unknown
+		> | null;
+		if (parsed) {
+			const identity = deriveXaiConversationIdentity(parsed);
+			if (identity) {
+				requestMeta.cacheAffinityKey = identity.affinityKey;
+				requestMeta.xaiCacheNativeActive = true;
+				requestMeta.xaiCacheIdentityFingerprint = identity.identityFingerprint;
+				requestMeta.xaiCachePrefixFingerprint = identity.prefixFingerprint;
+			}
+		}
+	}
 	requestMeta.originalModel = originalModel;
 	requestMeta.appliedModel = appliedModel;
 
@@ -319,11 +338,47 @@ export async function handleProxy(
 
 	// 6. Controls select after pacing. Candidates select here so the bypass
 	// decision can use the first actually available, usage-throttled account.
-	selectedAccounts = await selectAccountsForRequest(
-		requestMeta,
-		ctx,
-		effectiveModel ?? undefined,
-	);
+	try {
+		selectedAccounts = await selectAccountsForRequest(
+			requestMeta,
+			ctx,
+			effectiveModel ?? undefined,
+		);
+	} catch (error) {
+		if (error instanceof ForceRouteUnavailableError) {
+			log.warn(
+				`Grok cache canary ${formatXaiCacheCanary({
+					requestId: requestMeta.id,
+					accountId: error.accountId,
+					officialEndpoint: true,
+					keyPresent: false,
+					identityFingerprint:
+						requestMeta.xaiCacheIdentityFingerprint ?? undefined,
+					prefixFingerprint: requestMeta.xaiCachePrefixFingerprint ?? undefined,
+					cacheOutcome: "fail_closed",
+					failClosedReason: error.reason,
+				})}`,
+			);
+			return new Response(
+				JSON.stringify({
+					error: {
+						type: "force_route_unavailable",
+						message: error.message,
+						account_id: error.accountId,
+						reason: error.reason,
+					},
+				}),
+				{
+					status: 503,
+					headers: {
+						"content-type": "application/json",
+						"x-better-ccflare-force-route": "unavailable",
+					},
+				},
+			);
+		}
+		throw error;
+	}
 	const syntheticProbe =
 		req.headers.get("x-better-ccflare-keepalive") === "true";
 	const applyUsageThrottling = (accounts: Account[]) => {

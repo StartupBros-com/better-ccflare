@@ -61,6 +61,12 @@ export interface StartMessage {
 	apiKeyId: string | null;
 	apiKeyName: string | null;
 
+	// Grok cache-native canary context
+	xaiCacheIdentityFingerprint?: string | null;
+	xaiCachePrefixFingerprint?: string | null;
+	xaiCacheOfficialEndpoint?: boolean;
+	xaiCacheKeyPresent?: boolean;
+
 	// Retry info
 	retryAttempt: number;
 	failoverAttempts: number;
