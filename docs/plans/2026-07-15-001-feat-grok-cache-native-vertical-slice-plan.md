@@ -4,9 +4,10 @@ type: feat
 date: 2026-07-15
 topic: grok-cache-native-vertical-slice
 artifact_contract: ce-unified-plan/v1
-artifact_readiness: requirements-only
+artifact_readiness: implementation-ready
 product_contract_source: ce-brainstorm
 execution: code
+origin: docs/ideation/2026-07-15-native-grok-cache-routing-ideation.html
 ---
 
 # Grok Cache-Native Vertical Slice - Plan
@@ -14,8 +15,11 @@ execution: code
 ## Goal Capsule
 
 - **Objective:** Prove a correct, opt-in native Grok Chat cache path on official xAI: conversation-partitioned identity, sticky account ownership, fail-closed force-route, and fixture-backed cache-token telemetry.
-- **Product authority:** This Product Contract. Seeded from `docs/ideation/2026-07-15-native-grok-cache-routing-ideation.html` idea 1.
-- **Open blockers:** None. Ready for implementation planning.
+- **Product authority:** Product Contract below. Seeded from `docs/ideation/2026-07-15-native-grok-cache-routing-ideation.html` idea 1.
+- **Execution profile:** test-first for identity, transport, routing, and usage fixtures; no real Anthropic automated traffic.
+- **Stop conditions:** stop if official xAI rejects the Chat affinity header in smoke tests, or if Claude session metadata cannot yield a stable conversation seed for the request shapes better-ccflare already handles.
+- **Open blockers:** None.
+- **Product Contract preservation:** Product Contract unchanged from ce-brainstorm; planning only resolved Deferred-to-Planning questions into KTDs.
 
 ## Product Contract
 
@@ -149,6 +153,7 @@ The Codex path already solved the related failure mode where one Claude session 
 - Value-aware scheduling, working-set admission, or continuous policy tournaments.
 - Durable reasoning-history WAL beyond what is required to keep current Chat conversion correct.
 - Custom-endpoint enablement after capability verification.
+- Distinct telemetry for every temporary normal-path failover lineage break (v1 only requires force-route fail-closed telemetry).
 
 **Outside this product slice**
 
@@ -165,13 +170,12 @@ The Codex path already solved the related failure mode where one Claude session 
 
 ### Outstanding Questions
 
-**Deferred to Planning**
+**Deferred to Planning** — resolved in Planning Contract KTDs below.
 
-- Exact opt-in flag name and configuration surface.
-- Exact stable conversation-seed inputs and hashing details, reusing Codex lessons without copying OpenAI-specific wire constraints blindly.
-- Exact structured telemetry channel and field names for canary events.
-- Whether temporary normal-path failover should emit a distinct lineage-break event in v1 telemetry or only force-route fail-closed events.
-- How official-endpoint verification is represented for accounts with custom endpoint overrides that still resolve to official xAI.
+**Deferred to Implementation**
+
+- Exact smoke-test harness for optional live official xAI canary traffic on non-Anthropic accounts.
+- Whether a future second flag is needed for session-only identity mode; v1 ships conversation-partitioned only.
 
 ### Sources / Research
 
@@ -181,4 +185,215 @@ The Codex path already solved the related failure mode where one Claude session 
 - `packages/load-balancer/src/strategies/session-affinity.ts` — sticky account ownership and temporary failover restore semantics.
 - `packages/proxy/src/handlers/account-selector.ts` — current force-route fallback behavior for unavailable targets.
 - `packages/providers/src/providers/openai/provider.ts` and `packages/openai-formats/src/stream.ts` — existing `cached_tokens` translation path.
-- xAI prompt-caching documentation — automatic exact-prefix caching and Chat affinity control.
+- xAI prompt-caching documentation — automatic exact-prefix caching, Chat header `x-grok-conv-id`, usage `prompt_tokens_details.cached_tokens`.
+
+---
+
+## Planning Contract
+
+### High-Level Technical Design
+
+```mermaid
+flowchart TB
+  A[Claude /v1/messages request] --> B{CCFLARE_XAI_CACHE_NATIVE=1?}
+  B -->|no| Z[Existing XaiProvider path]
+  B -->|yes| C[Derive conversation identity]
+  C --> D{Official xAI endpoint?}
+  D -->|no| E[Omit native header]
+  D -->|yes| F[Sticky ownership via cache affinity key]
+  F --> G{Force-route unavailable?}
+  G -->|yes| H[Fail closed + telemetry]
+  G -->|no| I[Attach x-grok-conv-id header]
+  I --> J[Official xAI Chat Completions]
+  J --> K[Translate cached_tokens]
+  K --> L[Structured canary log]
+```
+
+Request-scoped identity is derived once from Claude metadata and a stable conversation seed, then projected into three places: sticky account ownership, the official Chat affinity header, and privacy-safe canary fields. Custom endpoints never receive the header. Force-route fail-closed is scoped to the feature and does not rewrite global auto-refresh bypass behavior.
+
+### Key Technical Decisions
+
+- **KTD1. Opt-in flag `CCFLARE_XAI_CACHE_NATIVE=1`.** Follow the Codex strict `"1"` env pattern. Default off. Request-time read so tests can toggle without process restarts where practical.
+- **KTD2. Native Chat control is HTTP header `x-grok-conv-id`.** Do not put OpenAI-style `prompt_cache_key` on Chat Completions for xAI. Value is a privacy-safe stable string derived from conversation identity, never raw session UUID or prompt text.
+- **KTD3. Conversation seed mirrors Codex partitioning lesson.** Validated Claude `metadata.user_id.session_id` plus a stable seed from system/instructions and the first conversation input item. Sibling conversations with different seeds get different IDs. Malformed metadata omits the header (R7).
+- **KTD4. Official endpoint gate uses resolved host allowlist.** Official when the account's resolved endpoint host is `api.x.ai` (or an explicit verified allowlist). Custom endpoints stay inert even when the flag is on. Accounts whose custom_endpoint still resolves to official xAI may attach.
+- **KTD5. Request-scoped post-conversion hook for headers.** Current `afterConvert(body)` cannot attach headers. Prefer a request-scoped hook or `transformRequestBody` override that can set `x-grok-conv-id` from the original body without mutable provider-instance state.
+- **KTD6. Sticky ownership uses a conversation affinity key when the feature is active.** Existing `SessionAffinityStrategy` keys on raw `metadata.user_id` (session-level). For feature-active Grok traffic, thread a conversation-level affinity key into account selection so sibling conversations do not forced-share ownership, while still reusing restore-preserving failover semantics.
+- **KTD7. Force-route fail-closed is feature-scoped.** When the flag is on and `x-better-ccflare-account-id` names an unavailable account, return an explicit unavailable result before combo/normal selection. Preserve authenticated auto-refresh / `x-better-ccflare-bypass-session` probe behavior. Default flag-off behavior remains today's silent fallback.
+- **KTD8. Usage proof rides shared OpenAI-compatible translation.** Continue mapping `usage.prompt_tokens_details.cached_tokens` into cache-read accounting. Add xAI-shaped fixtures for stream and non-stream. Distinguish absent cache details as unknown in canary telemetry when the response lacks the field.
+- **KTD9. Canary telemetry is compact structured logs.** Logger component such as `XaiCacheNative`. Fields: request id, account id/name, official-endpoint boolean, key-present, truncated identity fingerprint, prefix fingerprint, cache outcome (`hit`/`miss`/`unknown`/`fail_closed`), cached tokens, input tokens. No prompt bodies, raw session UUIDs, or auth material. Full Codex JSONL is out of scope.
+- **KTD10. No dashboard work in v1.** Request DB already has cache-read columns; if stream/non-stream translation already populates them, leave UI untouched.
+
+### Assumptions
+
+- xAI continues to honor `x-grok-conv-id` as a routing affinity hint and continues to emit `prompt_tokens_details.cached_tokens` on Chat Completions usage.
+- Conversation seed inputs available on current Claude Code request shapes are stable enough for turn-to-turn identity reuse.
+- Feature-scoped fail-closed force-route will not break keepalive or auto-refresh because those paths use the authenticated bypass header.
+- Sticky ownership can be layered without requiring every deployment to change global `LB_STRATEGY` permanently, though enabling the feature implies ownership semantics for active Grok conversations.
+
+### Sequencing
+
+1. Pure identity + official-endpoint helpers and tests.
+2. xAI transport attachment of `x-grok-conv-id`.
+3. Routing: conversation affinity key + force-route fail-closed.
+4. Usage fixtures and cache-outcome canary logging.
+5. End-to-end provider/proxy regression suite for AE1–AE5.
+
+### Risks
+
+- **Header rejection unknown:** xAI docs do not prove unknown-header behavior. Mitigate with official-only gate and optional live smoke on non-Anthropic xAI accounts.
+- **Affinity key collision with session governor:** changing stickiness key shape can alter pacing/session metrics. Mitigate by adding a dedicated field rather than overloading raw `clientSessionId` semantics globally.
+- **Fail-closed surprises operators:** force-route that previously fell back will start failing when the feature is on. Mitigate with explicit error/telemetry and docs note in config comments.
+- **Absent cached_tokens misread as zero hit:** mitigate with explicit `unknown` canary state.
+
+---
+
+## Implementation Units
+
+### U1. Conversation identity and official-endpoint helpers
+
+- **Goal:** Pure, testable helpers for opt-in detection, official xAI endpoint recognition, validated session extraction, conversation identity derivation, and privacy-safe fingerprints.
+- **Requirements:** R1, R2, R3, R6, R7
+- **Dependencies:** none
+- **Files:**
+  - create `packages/providers/src/providers/xai/cache-native.ts` (or equivalent pure helper module)
+  - create `packages/providers/src/providers/xai/cache-native.test.ts`
+  - modify `packages/providers/src/providers/xai/provider.ts` only if exporting constants
+- **Approach:** Export `CCFLARE_XAI_CACHE_NATIVE` constant and `isXaiCacheNativeEnabled()`. Parse Claude `metadata.user_id` like Codex (JSON + UUID validation). Derive conversation identity from session + stable seed (system/instructions + first input). Produce header value and truncated fingerprints without raw content. Resolve official endpoint from account custom_endpoint / default `https://api.x.ai/v1` host allowlist.
+- **Execution note:** Implement test-first for identity stability, sibling separation, malformed metadata, and endpoint gating.
+- **Patterns to follow:** Codex `derivePromptCacheKey` / session extraction and strict `"1"` env opt-in in `packages/providers/src/providers/codex/provider.ts`.
+- **Test scenarios:**
+  - Covers AE2. Same session, different seeds → different identities.
+  - Covers AE1. Same session and seed across turns → same identity.
+  - Flag unset or not `"1"` → feature disabled.
+  - Malformed/missing session metadata → no identity (omit, do not invent).
+  - Official host `api.x.ai` → allowed; custom host → disallowed.
+  - Identity and fingerprints never contain raw session UUID text.
+- **Verification:** helper unit tests pass; no network calls.
+
+### U2. Attach `x-grok-conv-id` on official xAI Chat transforms
+
+- **Goal:** When the feature is enabled and the account resolves to official xAI, attach `x-grok-conv-id` on the outbound Chat Completions request.
+- **Requirements:** R1, R2, R3, R6, R7
+- **Dependencies:** U1
+- **Files:**
+  - modify `packages/providers/src/providers/xai/provider.ts`
+  - modify `packages/providers/src/providers/openai/provider.ts` if a request-scoped post-convert hook is the cleanest shared extension
+  - modify `packages/providers/src/providers/xai/provider.test.ts`
+- **Approach:** Use a request-scoped path that can see original Anthropic body and final headers/body. Prefer not expanding mutable instance fields on `OpenAICompatibleProvider`. Attach header only when enabled + official endpoint + identity present. Keep existing `stream_options.include_usage` behavior.
+- **Execution note:** Start with failing provider tests for default-off, official attach, custom omit, sibling separation.
+- **Patterns to follow:** xAI `afterConvert` streaming usage injection; Codex endpoint gating spirit; OpenAICompatible `transformRequestBody` lifecycle.
+- **Test scenarios:**
+  - Covers AE4. Custom endpoint: no header even when flag on.
+  - Flag off: no header on official endpoint.
+  - Flag on + official + valid metadata: header present and stable across turns.
+  - Flag on + official + sibling seeds: different header values.
+  - Flag on + official + bad metadata: no header.
+  - Existing streaming `include_usage` still set.
+- **Verification:** xAI provider tests green; no real network required.
+
+### U3. Conversation sticky ownership for feature-active Grok traffic
+
+- **Goal:** When the feature is active, bind the conversation to sticky account ownership using a conversation-level affinity key while preserving restore-on-recovery failover semantics.
+- **Requirements:** R4
+- **Dependencies:** U1
+- **Files:**
+  - modify `packages/types/src/api.ts` (`RequestMeta` affinity field if needed)
+  - modify `packages/proxy/src/request-body-context.ts` and/or `packages/proxy/src/proxy.ts`
+  - modify `packages/load-balancer/src/strategies/session-affinity.ts` if it must prefer a dedicated affinity key
+  - modify `packages/load-balancer/src/strategies/__tests__/session-affinity.test.ts`
+  - targeted proxy tests as needed
+- **Approach:** Populate a conversation affinity key early from the same identity helper used for the header. Prefer a dedicated `RequestMeta` field over silently changing global `clientSessionId` semantics for all providers. SessionAffinity should sticky on that key for feature-active Grok requests and keep temporary failover restore behavior.
+- **Execution note:** Add characterization tests for current sticky restore behavior before changing key selection.
+- **Patterns to follow:** `SessionAffinityStrategy` temporary failover comments and tests; proxy population of `clientSessionId` today.
+- **Test scenarios:**
+  - Covers AE1. Two turns same conversation identity map to the same sticky owner when available.
+  - Sibling conversation identities can select independently rather than forced-sharing one owner solely because Claude session matches.
+  - Temporary owner unavailability preserves mapping for later restore (existing behavior retained).
+  - Feature off: no Grok-specific ownership override.
+- **Verification:** load-balancer and proxy selection tests pass.
+
+### U4. Feature-scoped force-route fail-closed
+
+- **Goal:** When the feature is active, force-routing to an unavailable account fails closed with explicit unavailable handling and telemetry, instead of silent fallback.
+- **Requirements:** R5, R9
+- **Dependencies:** U1
+- **Files:**
+  - modify `packages/proxy/src/handlers/account-selector.ts`
+  - modify `packages/proxy/src/handlers/__tests__/account-selector.test.ts`
+  - modify proxy response path as needed to surface explicit unavailable outcome
+- **Approach:** After forced-account lookup, if feature active and account missing/unavailable (outside authenticated auto-refresh bypass), stop normal fallback. Preserve `x-better-ccflare-bypass-session` probe allowances. Emit fail-closed canary reason. Flag-off keeps current fallback.
+- **Execution note:** Update existing tests that currently expect silent fallback so flag-off still passes and flag-on fails closed.
+- **Patterns to follow:** existing force-route availability matrix and pause-reason comments in `account-selector.ts`.
+- **Test scenarios:**
+  - Covers AE3. Flag on + forced unavailable account → no silent alternate account; explicit unavailable.
+  - Flag off + forced unavailable account → existing fallback retained.
+  - Flag on + forced available account → forced account used.
+  - Auto-refresh bypass cases still work for legitimate probe headers.
+- **Verification:** account-selector tests green; no accidental break of auto-refresh paths.
+
+### U5. Cached-token fixtures and canary telemetry
+
+- **Goal:** Prove stream and non-stream cached-token translation for xAI-shaped usage, and emit compact structured canary logs for mechanism proof.
+- **Requirements:** R8, R9, R10
+- **Dependencies:** U2, U3, U4
+- **Files:**
+  - modify `packages/providers/src/providers/xai/provider.test.ts`
+  - modify `packages/openai-formats/src/__tests__/converters.test.ts` and/or stream tests if response-side cache fields need coverage
+  - create or modify a small canary logger helper under `packages/providers/src/providers/xai/` or `packages/proxy/src/`
+  - optional: `packages/proxy/src/handlers/response-processor.ts` only if completion-side cache outcome logging needs a hook
+- **Approach:** Fixture OpenAI-compatible usage with `prompt_tokens_details.cached_tokens` for non-stream and final stream usage chunks. Confirm internal cache-read accounting populates. Log canary fields without prompt content. Represent missing cache details as `unknown` rather than forced zero-hit when distinguishable.
+- **Execution note:** Prefer unit/fixtures over live xAI. Optional manual smoke on real xAI non-Anthropic accounts is operator-side only.
+- **Patterns to follow:** shared OpenAI `extractUsageInfo` / stream usage parsing; Codex trace privacy field style without full JSONL.
+- **Test scenarios:**
+  - Covers AE5. Non-stream usage with `cached_tokens` → cache-read populated.
+  - Stream final usage chunk with `cached_tokens` → cache-read populated.
+  - Usage without `prompt_tokens_details` → canary outcome `unknown` (or documented equivalent).
+  - Canary log includes truncated identity fingerprint and account id, never raw session UUID/prompt.
+  - Fail-closed path logs distinct reason.
+- **Verification:** provider/format/proxy tests covering AE5 and telemetry fields pass; `bun run lint && bun run typecheck` clean for touched packages.
+
+### U6. End-to-end regression matrix for AE1–AE5
+
+- **Goal:** One focused suite or documented test set that maps directly to acceptance examples and prevents silent regression of the vertical slice.
+- **Requirements:** R1–R10
+- **Dependencies:** U1–U5
+- **Files:**
+  - modify/create `packages/providers/src/providers/xai/provider.test.ts`
+  - modify/create proxy account-selector and affinity tests as needed
+  - optional short note in `docs/configuration.md` or xAI provider docs for the opt-in flag only if docs are already the local pattern for env flags
+- **Approach:** Table-driven coverage for flag off/on, official/custom endpoint, same-conversation stability, sibling separation, force-route fail-closed, and cached-token stream/non-stream. Keep docs minimal.
+- **Execution note:** No automated Anthropic calls. Do not require live xAI for CI green.
+- **Patterns to follow:** Codex prompt_cache_key test matrix style in `provider.test.ts`.
+- **Test scenarios:**
+  - AE1–AE5 each have at least one automated test reference.
+  - Flag-off compatibility: existing xAI mapping and streaming usage behavior unchanged.
+- **Verification:** full targeted test set green; lint/typecheck/format for changed files.
+
+---
+
+## Verification Contract
+
+| Gate | Command / check | Applies to |
+|---|---|---|
+| Unit / package tests | `bun test packages/providers` and targeted proxy/load-balancer tests for changed files | U1–U6 |
+| Lint | `bun run lint` | all units |
+| Typecheck | `bun run typecheck` | all units |
+| Format | `bun run format` | all units |
+| Product acceptance | Automated coverage of AE1–AE5 without real Anthropic traffic | U6 |
+| Optional live smoke | Manual official xAI canary on non-Anthropic accounts only | operator, not CI |
+
+Never curl real Anthropic or force-route the `claude` account for scripted tests.
+
+## Definition of Done
+
+- Opt-in flag defaults off and enables the slice only when set to `"1"`.
+- Official xAI Chat requests can attach stable conversation-partitioned `x-grok-conv-id` values.
+- Custom endpoints never receive the native header under this slice.
+- Sticky conversation ownership is active for feature-enabled Grok traffic and preserves restore-capable temporary failover.
+- Force-route to unavailable accounts fails closed when the feature is on.
+- Stream and non-stream cached-token fixtures prove cache-read accounting.
+- Structured canary telemetry records identity fingerprint, account, prefix fingerprint, and cache outcome including unknown/fail-closed.
+- AE1–AE5 are covered by automated tests.
+- `bun run lint && bun run typecheck && bun run format` pass for the change set.
+- No dashboard, Responses API, compaction epochs, or scheduler work is required for this slice.
