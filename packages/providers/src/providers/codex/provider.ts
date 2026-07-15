@@ -817,20 +817,14 @@ export class CodexProvider extends BaseProvider {
 				.digest("hex")
 				.slice(0, 48)}`;
 		}
-		let firstItem = "";
-		try {
-			firstItem = JSON.stringify(input[0]) ?? "";
-		} catch {
-			// Non-serializable first item: fall back to instructions-only identity.
-		}
-		return `ccflare-convo-${createHash("sha256")
-			.update(sessionId)
-			.update("\0")
-			.update(instructions)
-			.update("\0")
-			.update(firstItem)
-			.digest("hex")
-			.slice(0, 48)}`;
+		const conversationId = deriveConversationIdentity(
+			sessionId,
+			instructions,
+			input,
+		);
+		return conversationId
+			? `ccflare-convo-${conversationId.slice(0, 48)}`
+			: undefined;
 	}
 
 	private convertToolChoice(
