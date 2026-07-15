@@ -1,17 +1,19 @@
 import { createHash } from "node:crypto";
-import { getEndpointUrl } from "@better-ccflare/core";
-import type { Account } from "@better-ccflare/types";
+import type {
+	XaiCacheCanaryFields,
+	XaiCacheOutcome,
+} from "@better-ccflare/core";
+import {
+	cacheOutcomeFromTokens,
+	formatXaiCacheCanary,
+	isOfficialXaiEndpoint,
+} from "@better-ccflare/core";
 
 /** Opt-in: set to "1" to enable the Grok Chat cache-native vertical slice. */
 export const XAI_CACHE_NATIVE_ENV = "CCFLARE_XAI_CACHE_NATIVE";
 
 /** Official Chat Completions affinity header (xAI docs). */
 export const XAI_CONV_ID_HEADER = "x-grok-conv-id";
-
-/** Keep aligned with XaiProvider default endpoint host. */
-const XAI_DEFAULT_ENDPOINT = "https://api.x.ai/v1";
-
-const OFFICIAL_XAI_HOSTS = new Set(["api.x.ai"]);
 
 const SESSION_UUID_RE =
 	/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -22,27 +24,8 @@ export function isXaiCacheNativeEnabled(
 	return env[XAI_CACHE_NATIVE_ENV] === "1";
 }
 
-/**
- * Resolve whether an account targets official xAI Chat Completions.
- * Invalid custom endpoints fall back to the default official host, matching
- * XaiProvider.buildUrl behaviour.
- */
-export function isOfficialXaiEndpoint(account?: Account | null): boolean {
-	let endpoint = XAI_DEFAULT_ENDPOINT;
-	try {
-		endpoint = account?.custom_endpoint
-			? getEndpointUrl(account)
-			: XAI_DEFAULT_ENDPOINT;
-	} catch {
-		endpoint = XAI_DEFAULT_ENDPOINT;
-	}
-	try {
-		const host = new URL(endpoint).hostname.toLowerCase();
-		return OFFICIAL_XAI_HOSTS.has(host);
-	} catch {
-		return false;
-	}
-}
+export type { XaiCacheCanaryFields, XaiCacheOutcome };
+export { cacheOutcomeFromTokens, formatXaiCacheCanary, isOfficialXaiEndpoint };
 
 export function extractClaudeSessionId(
 	body: Record<string, unknown>,
@@ -134,50 +117,4 @@ export function deriveXaiConversationIdentity(
 		prefixFingerprint,
 		affinityKey: headerValue,
 	};
-}
-
-export type XaiCacheOutcome = "hit" | "miss" | "unknown" | "fail_closed";
-
-export interface XaiCacheCanaryFields {
-	requestId?: string;
-	accountId?: string;
-	accountName?: string;
-	officialEndpoint: boolean;
-	keyPresent: boolean;
-	identityFingerprint?: string;
-	prefixFingerprint?: string;
-	cacheOutcome: XaiCacheOutcome;
-	cachedTokens?: number;
-	inputTokens?: number;
-	failClosedReason?: string;
-}
-
-/** Compact structured canary line for mechanism proof (no prompt content). */
-export function formatXaiCacheCanary(fields: XaiCacheCanaryFields): string {
-	const parts = [
-		`official=${fields.officialEndpoint ? "1" : "0"}`,
-		`key=${fields.keyPresent ? "1" : "0"}`,
-		`outcome=${fields.cacheOutcome}`,
-	];
-	if (fields.requestId) parts.push(`req=${fields.requestId}`);
-	if (fields.accountId) parts.push(`account=${fields.accountId}`);
-	if (fields.identityFingerprint)
-		parts.push(`id=${fields.identityFingerprint}`);
-	if (fields.prefixFingerprint)
-		parts.push(`prefix=${fields.prefixFingerprint}`);
-	if (fields.cachedTokens !== undefined)
-		parts.push(`cached=${fields.cachedTokens}`);
-	if (fields.inputTokens !== undefined)
-		parts.push(`input=${fields.inputTokens}`);
-	if (fields.failClosedReason) parts.push(`reason=${fields.failClosedReason}`);
-	return parts.join(" ");
-}
-
-export function cacheOutcomeFromTokens(
-	cachedTokens: number | undefined | null,
-	detailsPresent: boolean,
-): XaiCacheOutcome {
-	if (!detailsPresent) return "unknown";
-	if (typeof cachedTokens !== "number") return "unknown";
-	return cachedTokens > 0 ? "hit" : "miss";
 }

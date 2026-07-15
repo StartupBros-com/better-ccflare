@@ -1,4 +1,8 @@
-import { getModelFamily, isAccountAvailable } from "@better-ccflare/core";
+import {
+	getModelFamily,
+	isAccountAvailable,
+	isOfficialXaiEndpoint,
+} from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import type {
 	Account,
@@ -63,6 +67,16 @@ export async function getOrderedAccounts(
 ): Promise<Account[]> {
 	try {
 		const allAccounts = await ctx.dbOps.getAllAccounts();
+		if (meta.xaiCacheNativeActive) {
+			meta.xaiCacheEligibleAccountIds = new Set(
+				allAccounts
+					.filter(
+						(account) =>
+							account.provider === "xai" && isOfficialXaiEndpoint(account),
+					)
+					.map((account) => account.id),
+			);
+		}
 		// Return all accounts - the provider will be determined dynamically per account
 		return ctx.strategy.select(allAccounts, meta);
 	} catch (error) {
@@ -138,7 +152,11 @@ export async function selectAccountsForRequest(
 						return [forcedAccount];
 					}
 					// Feature-scoped fail-closed for official xAI force-routes only.
-					if (meta.xaiCacheNativeActive && forcedAccount.provider === "xai") {
+					if (
+						meta.xaiCacheNativeActive &&
+						forcedAccount.provider === "xai" &&
+						isOfficialXaiEndpoint(forcedAccount)
+					) {
 						throw new ForceRouteUnavailableError(
 							forcedAccountId,
 							forcedAccount.paused ? "paused" : "rate_limited_or_unavailable",

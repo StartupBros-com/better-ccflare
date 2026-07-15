@@ -82,8 +82,8 @@ function emitStreamEnd(
 	promptTokens: number,
 	completionTokens: number,
 	toolCallBlockIndices: Record<number, number> | null,
-	cacheReadInputTokens: number,
-	cacheCreationInputTokens: number,
+	cacheReadInputTokens: number | undefined,
+	cacheCreationInputTokens: number | undefined,
 	endTurnBlockIndex = 0,
 ) {
 	// Send content_block_stop for all blocks
@@ -131,8 +131,12 @@ function emitStreamEnd(
 		usage: {
 			input_tokens: promptTokens,
 			output_tokens: completionTokens,
-			cache_read_input_tokens: cacheReadInputTokens,
-			cache_creation_input_tokens: cacheCreationInputTokens,
+			...(cacheReadInputTokens !== undefined
+				? { cache_read_input_tokens: cacheReadInputTokens }
+				: {}),
+			...(cacheCreationInputTokens !== undefined
+				? { cache_creation_input_tokens: cacheCreationInputTokens }
+				: {}),
 		},
 	};
 	controller.enqueue(encoder.encode(`event: message_delta\n`));
@@ -183,8 +187,6 @@ export function transformStreamingResponse(response: Response): Response {
 					textBlockIndex: 0,
 					promptTokens: 0,
 					completionTokens: 0,
-					cacheReadInputTokens: 0,
-					cacheCreationInputTokens: 0,
 					encounteredToolCall: false,
 					toolCallAccumulators: {},
 					nextBlockIndex: 0,
@@ -301,11 +303,11 @@ export function transformStreamingResponse(response: Response): Response {
 										cache_creation_input_tokens?: number;
 										cached_tokens?: number;
 									};
-									if (details.cache_creation_input_tokens) {
+									if (details.cache_creation_input_tokens !== undefined) {
 										context.cacheCreationInputTokens =
 											details.cache_creation_input_tokens;
 									}
-									if (details.cached_tokens) {
+									if (details.cached_tokens !== undefined) {
 										context.cacheReadInputTokens = details.cached_tokens;
 									}
 								}

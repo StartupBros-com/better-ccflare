@@ -33,8 +33,14 @@ export interface RequestMeta {
 	 * When set, SessionAffinityStrategy prefers this over clientSessionId.
 	 */
 	cacheAffinityKey?: string | null;
-	/** True when the Grok cache-native vertical slice is active for this request. */
+	/** True when the Grok cache-native vertical slice has a valid request identity. */
 	xaiCacheNativeActive?: boolean;
+	/** Privacy-safe native identity fingerprint for cache canary telemetry. */
+	xaiCacheIdentityFingerprint?: string | null;
+	/** Privacy-safe stable-prefix fingerprint for cache canary telemetry. */
+	xaiCachePrefixFingerprint?: string | null;
+	/** Official xAI accounts eligible for conversation-level cache affinity. */
+	xaiCacheEligibleAccountIds?: ReadonlySet<string> | null;
 	/** Model the client originally requested, before any agent-preference rewrite. */
 	originalModel?: string | null;
 	/** Model actually forwarded upstream after an agent-preference rewrite (equal to originalModel when none occurred). */

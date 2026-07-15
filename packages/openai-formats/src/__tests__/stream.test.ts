@@ -240,6 +240,79 @@ describe("transformStreamingResponse — text responses", () => {
 		expect(parsed.usage.output_tokens).toBe(5);
 	});
 
+	it("forwards xAI cached tokens from prompt token details", async () => {
+		const upstream = makeOpenAIStream([
+			JSON.stringify({
+				id: "c1",
+				model: "grok-4",
+				choices: [{ index: 0, delta: { content: "Hi" }, finish_reason: null }],
+				usage: {
+					prompt_tokens: 20,
+					completion_tokens: 5,
+					prompt_tokens_details: { cached_tokens: 12 },
+				},
+			}),
+			"[DONE]",
+		]);
+		const transformed = transformStreamingResponse(upstream);
+		const raw = await readStream(transformed.body!);
+		const events = parseSSEEvents(raw);
+		const msgDelta = events.find((event) => event.event === "message_delta");
+		expect(msgDelta).toBeDefined();
+		if (!msgDelta) throw new Error("expected message_delta event");
+
+		expect(JSON.parse(msgDelta.data!).usage.cache_read_input_tokens).toBe(12);
+	});
+
+	it("preserves an explicit zero cached-token count", async () => {
+		const upstream = makeOpenAIStream([
+			JSON.stringify({
+				id: "c1",
+				model: "grok-4",
+				choices: [{ index: 0, delta: { content: "Hi" }, finish_reason: null }],
+				usage: {
+					prompt_tokens: 20,
+					completion_tokens: 5,
+					prompt_tokens_details: { cached_tokens: 0 },
+				},
+			}),
+			"[DONE]",
+		]);
+		const transformed = transformStreamingResponse(upstream);
+		const raw = await readStream(transformed.body!);
+		const events = parseSSEEvents(raw);
+		const msgDelta = events.find((event) => event.event === "message_delta");
+		expect(msgDelta).toBeDefined();
+		if (!msgDelta) throw new Error("expected message_delta event");
+
+		expect(JSON.parse(msgDelta.data!).usage).toHaveProperty(
+			"cache_read_input_tokens",
+			0,
+		);
+	});
+
+	it("omits cache usage when upstream cache details are absent", async () => {
+		const upstream = makeOpenAIStream([
+			JSON.stringify({
+				id: "c1",
+				model: "grok-4",
+				choices: [{ index: 0, delta: { content: "Hi" }, finish_reason: null }],
+				usage: { prompt_tokens: 20, completion_tokens: 5 },
+			}),
+			"[DONE]",
+		]);
+		const transformed = transformStreamingResponse(upstream);
+		const raw = await readStream(transformed.body!);
+		const events = parseSSEEvents(raw);
+		const msgDelta = events.find((event) => event.event === "message_delta");
+		expect(msgDelta).toBeDefined();
+		if (!msgDelta) throw new Error("expected message_delta event");
+
+		expect(JSON.parse(msgDelta.data!).usage).not.toHaveProperty(
+			"cache_read_input_tokens",
+		);
+	});
+
 	it("includes content_block_stop for text block", async () => {
 		const upstream = makeOpenAIStream([
 			JSON.stringify({

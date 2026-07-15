@@ -1,4 +1,5 @@
 import {
+	formatXaiCacheCanary,
 	requestEvents,
 	ServiceUnavailableError,
 	trackClientVersion,
@@ -274,6 +275,8 @@ export async function handleProxy(
 			if (identity) {
 				requestMeta.cacheAffinityKey = identity.affinityKey;
 				requestMeta.xaiCacheNativeActive = true;
+				requestMeta.xaiCacheIdentityFingerprint = identity.identityFingerprint;
+				requestMeta.xaiCachePrefixFingerprint = identity.prefixFingerprint;
 			}
 		}
 	}
@@ -344,7 +347,17 @@ export async function handleProxy(
 	} catch (error) {
 		if (error instanceof ForceRouteUnavailableError) {
 			log.warn(
-				`Grok cache-native force-route fail-closed: account=${error.accountId} reason=${error.reason}`,
+				`Grok cache canary ${formatXaiCacheCanary({
+					requestId: requestMeta.id,
+					accountId: error.accountId,
+					officialEndpoint: true,
+					keyPresent: false,
+					identityFingerprint:
+						requestMeta.xaiCacheIdentityFingerprint ?? undefined,
+					prefixFingerprint: requestMeta.xaiCachePrefixFingerprint ?? undefined,
+					cacheOutcome: "fail_closed",
+					failClosedReason: error.reason,
+				})}`,
 			);
 			return new Response(
 				JSON.stringify({

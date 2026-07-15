@@ -1,6 +1,8 @@
 import {
 	BUFFER_SIZES,
+	cacheOutcomeFromTokens,
 	estimateCostUSD,
+	formatXaiCacheCanary,
 	TIME_CONSTANTS,
 } from "@better-ccflare/core";
 import { AsyncDbWriter, DatabaseOperations } from "@better-ccflare/database";
@@ -35,6 +37,7 @@ interface RequestState {
 		model?: string;
 		inputTokens?: number;
 		cacheReadInputTokens?: number;
+		cacheReadInputTokensPresent?: boolean;
 		cacheCreationInputTokens?: number;
 		outputTokens?: number;
 		outputTokensComputed?: number;
@@ -158,7 +161,10 @@ function extractUsageFromJson(
 	state.usage.model = json.model ?? state.usage.model;
 
 	state.usage.inputTokens = usageObj.input_tokens ?? 0;
-	state.usage.cacheReadInputTokens = usageObj.cache_read_input_tokens ?? 0;
+	if (usageObj.cache_read_input_tokens !== undefined) {
+		state.usage.cacheReadInputTokens = usageObj.cache_read_input_tokens;
+		state.usage.cacheReadInputTokensPresent = true;
+	}
 	state.usage.cacheCreationInputTokens =
 		usageObj.cache_creation_input_tokens ?? 0;
 	state.usage.outputTokens = usageObj.output_tokens ?? 0;
@@ -188,7 +194,10 @@ function extractUsageFromData(
 			if (parsed.message?.usage) {
 				const usage = parsed.message.usage;
 				state.usage.inputTokens = usage.input_tokens || 0;
-				state.usage.cacheReadInputTokens = usage.cache_read_input_tokens || 0;
+				if (usage.cache_read_input_tokens !== undefined) {
+					state.usage.cacheReadInputTokens = usage.cache_read_input_tokens;
+					state.usage.cacheReadInputTokensPresent = true;
+				}
 				state.usage.cacheCreationInputTokens =
 					usage.cache_creation_input_tokens || 0;
 				state.usage.outputTokens = usage.output_tokens || 0;
@@ -221,6 +230,7 @@ function extractUsageFromData(
 				if (parsed.usage.cache_read_input_tokens !== undefined) {
 					state.usage.cacheReadInputTokens =
 						parsed.usage.cache_read_input_tokens;
+					state.usage.cacheReadInputTokensPresent = true;
 				}
 				return; // No further processing needed
 			}
@@ -240,6 +250,7 @@ function extractUsageFromData(
 			}
 			if (parsed.usage.cache_read_input_tokens !== undefined) {
 				state.usage.cacheReadInputTokens = parsed.usage.cache_read_input_tokens;
+				state.usage.cacheReadInputTokensPresent = true;
 			}
 			if (parsed.usage.cache_creation_input_tokens !== undefined) {
 				state.usage.cacheCreationInputTokens =
@@ -702,6 +713,28 @@ export class UsageCollector {
 					}
 				}
 			}
+		}
+
+		if (startMessage.xaiCacheIdentityFingerprint) {
+			const cacheOutcome = cacheOutcomeFromTokens(
+				state.usage.cacheReadInputTokens,
+				state.usage.cacheReadInputTokensPresent === true,
+			);
+			log.info(
+				`Grok cache canary ${formatXaiCacheCanary({
+					requestId: startMessage.requestId,
+					accountId: startMessage.accountId ?? undefined,
+					accountName: startMessage.accountName ?? undefined,
+					officialEndpoint: startMessage.xaiCacheOfficialEndpoint === true,
+					keyPresent: startMessage.xaiCacheKeyPresent === true,
+					identityFingerprint: startMessage.xaiCacheIdentityFingerprint,
+					prefixFingerprint:
+						startMessage.xaiCachePrefixFingerprint ?? undefined,
+					cacheOutcome,
+					cachedTokens: state.usage.cacheReadInputTokens,
+					inputTokens: state.usage.inputTokens,
+				})}`,
+			);
 		}
 
 		// Update request with final data

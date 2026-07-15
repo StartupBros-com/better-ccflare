@@ -177,6 +177,54 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 		return this.rankByLeastUsed(available, now)[0]?.id ?? null;
 	}
 
+	private applyCacheAffinity(
+		available: Account[],
+		meta: RequestMeta,
+		now: number,
+	): Account[] | null {
+		const cacheKey = meta.cacheAffinityKey;
+		const eligibleIds = meta.xaiCacheEligibleAccountIds;
+		if (!cacheKey || !eligibleIds || eligibleIds.size === 0) return null;
+
+		const baseOrder = this.rankByLeastUsed(available, now);
+		const eligible = available.filter((account) => eligibleIds.has(account.id));
+		if (eligible.length === 0) return baseOrder;
+
+		const mapping = this.affinity.get(cacheKey);
+		let eligibleOrder: Account[];
+		if (mapping) {
+			const mapped = eligible.find(
+				(account) => account.id === mapping.accountId,
+			);
+			if (mapped) {
+				mapping.assignedAt = now;
+				eligibleOrder = [
+					mapped,
+					...this.rankByLeastUsed(
+						eligible.filter((account) => account.id !== mapped.id),
+						now,
+					),
+				];
+			} else {
+				eligibleOrder = this.pickAndMark(eligible, now);
+			}
+		} else {
+			eligibleOrder = this.pickAndMark(eligible, now);
+			const chosen = eligibleOrder[0];
+			if (chosen) {
+				this.evictOldestIfFull();
+				this.affinity.set(cacheKey, { accountId: chosen.id, assignedAt: now });
+			}
+		}
+
+		let eligibleIndex = 0;
+		return baseOrder.map((account) =>
+			eligibleIds.has(account.id)
+				? (eligibleOrder[eligibleIndex++] ?? account)
+				: account,
+		);
+	}
+
 	select(accounts: Account[], meta: RequestMeta): Account[] {
 		const now = Date.now();
 
@@ -198,8 +246,10 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 			}
 		}
 
-		// Prefer conversation-level cache affinity when present (Grok cache-native).
-		const clientId = meta.cacheAffinityKey ?? meta.clientSessionId ?? null;
+		const cacheAffinityOrder = this.applyCacheAffinity(available, meta, now);
+		if (cacheAffinityOrder) return cacheAffinityOrder;
+
+		const clientId = meta.clientSessionId ?? null;
 
 		// Existing, non-expired client-session: try to honour its sticky mapping.
 		if (clientId !== null) {

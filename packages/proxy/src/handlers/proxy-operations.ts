@@ -1,6 +1,7 @@
 import {
 	getModelList,
 	getOverloadRetryConfig,
+	isOfficialXaiEndpoint,
 	logError,
 	ProviderError,
 	TIME_CONSTANTS,
@@ -949,6 +950,8 @@ export async function proxyWithAccount(
 		const internalRequestStream = transformedRequest.headers.get(
 			"x-better-ccflare-request-stream",
 		);
+		const xaiCacheKeyPresent = transformedRequest.headers.has("x-grok-conv-id");
+		const xaiCacheOfficialEndpoint = isOfficialXaiEndpoint(account);
 		// Defense-in-depth: providers normally consume these before returning,
 		// but transform fallbacks may return the original request.
 		transformedRequest = sanitizeInternalTransportHeaders(transformedRequest);
@@ -1683,6 +1686,11 @@ export async function proxyWithAccount(
 						comboName: requestMeta.comboName,
 						apiKeyId,
 						apiKeyName,
+						xaiCacheIdentityFingerprint:
+							requestMeta.xaiCacheIdentityFingerprint,
+						xaiCachePrefixFingerprint: requestMeta.xaiCachePrefixFingerprint,
+						xaiCacheOfficialEndpoint,
+						xaiCacheKeyPresent,
 					},
 					{ ...ctx, provider },
 				);
@@ -1713,6 +1721,10 @@ export async function proxyWithAccount(
 				comboName: requestMeta.comboName,
 				apiKeyId,
 				apiKeyName,
+				xaiCacheIdentityFingerprint: requestMeta.xaiCacheIdentityFingerprint,
+				xaiCachePrefixFingerprint: requestMeta.xaiCachePrefixFingerprint,
+				xaiCacheOfficialEndpoint,
+				xaiCacheKeyPresent,
 			},
 			{ ...ctx, provider },
 		);

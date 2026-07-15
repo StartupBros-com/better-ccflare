@@ -93,12 +93,13 @@ describe("xAI cache-native helpers", () => {
 		).toBe(true);
 	});
 
-	it("rejects custom hosts", () => {
+	it("rejects custom hosts and non-xAI accounts", () => {
 		expect(
 			isOfficialXaiEndpoint(
 				account({ custom_endpoint: "https://proxy.example.com/v1" }),
 			),
 		).toBe(false);
+		expect(isOfficialXaiEndpoint(account({ provider: "codex" }))).toBe(false);
 	});
 
 	it("extracts and lowercases a valid Claude session id", () => {

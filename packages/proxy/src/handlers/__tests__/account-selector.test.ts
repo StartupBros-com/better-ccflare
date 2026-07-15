@@ -234,6 +234,80 @@ describe("selectAccountsForRequest — Grok cache-native force-route fail-closed
 		);
 	});
 
+	it("still falls back for an unavailable custom-endpoint xAI account", async () => {
+		const customAcc = makeAccount({
+			id: "acc-custom",
+			name: "custom",
+			provider: "xai",
+			custom_endpoint: "https://xai.internal.example/v1",
+			paused: true,
+		});
+		const activeAcc = makeAccount({ id: "acc-active", name: "active" });
+		const ctx: ProxyContext = {
+			strategy: { select: mock(() => [activeAcc]) },
+			dbOps: {
+				getAllAccounts: mock(async () => [customAcc, activeAcc]),
+				getActiveComboForFamily: mock(async () => null),
+			},
+			refreshInFlight: new Map(),
+			asyncWriter: { enqueue: mock(() => {}) },
+		} as unknown as ProxyContext;
+		const meta = makeRequestMeta({
+			xaiCacheNativeActive: true,
+			headers: new Headers({
+				"x-better-ccflare-account-id": "acc-custom",
+			}),
+		});
+
+		const result = await selectAccountsForRequest(meta, ctx);
+		expect(result[0]?.id).toBe("acc-active");
+	});
+
+	it("still falls back for an unavailable non-xAI account", async () => {
+		const pausedAcc = makeAccount({
+			id: "acc-paused",
+			provider: "codex",
+			paused: true,
+		});
+		const activeAcc = makeAccount({ id: "acc-active", name: "active" });
+		const ctx: ProxyContext = {
+			strategy: { select: mock(() => [activeAcc]) },
+			dbOps: {
+				getAllAccounts: mock(async () => [pausedAcc, activeAcc]),
+				getActiveComboForFamily: mock(async () => null),
+			},
+			refreshInFlight: new Map(),
+			asyncWriter: { enqueue: mock(() => {}) },
+		} as unknown as ProxyContext;
+		const meta = makeRequestMeta({
+			xaiCacheNativeActive: true,
+			headers: new Headers({ "x-better-ccflare-account-id": "acc-paused" }),
+		});
+
+		const result = await selectAccountsForRequest(meta, ctx);
+		expect(result[0]?.id).toBe("acc-active");
+	});
+
+	it("still allows scheduler bypass for an official xAI account", async () => {
+		const rateLimitedAcc = makeAccount({
+			id: "acc-rl",
+			provider: "xai",
+			rate_limited_until: Date.now() + 3_600_000,
+		});
+		const activeAcc = makeAccount({ id: "acc-active", name: "active" });
+		const ctx = makeCtx({ accounts: [rateLimitedAcc, activeAcc] });
+		const meta = makeRequestMeta({
+			xaiCacheNativeActive: true,
+			headers: new Headers({
+				"x-better-ccflare-account-id": "acc-rl",
+				"x-better-ccflare-bypass-session": "true",
+			}),
+		});
+
+		const result = await selectAccountsForRequest(meta, ctx);
+		expect(result).toEqual([rateLimitedAcc]);
+	});
+
 	it("still falls back when feature is off", async () => {
 		const pausedAcc = makeAccount({
 			id: "acc-paused",
