@@ -37,6 +37,10 @@ import {
 	selectAccountsForRequest,
 	validateProviderPath,
 } from "./handlers";
+import {
+	completeRateLimitProbe,
+	getRateLimitProbeAdmission,
+} from "./handlers/rate-limit-cooldown";
 import { extractProjectAttributionFromRequest } from "./project-attribution";
 import {
 	clearSession,
@@ -585,22 +589,33 @@ export async function handleProxy(
 			continue;
 		}
 
+		const probeAdmission = getRateLimitProbeAdmission(accounts[i]);
+		if (probeAdmission === "suppressed") {
+			continue;
+		}
+
 		upstreamAttempts++;
-		response = await proxyWithAccount(
-			req,
-			url,
-			accounts[i],
-			requestMeta,
-			finalBodyBuffer,
-			finalCreateBodyStream,
-			i,
-			ctx,
-			modelOverride,
-			apiKeyId,
-			apiKeyName,
-			requestBodyContext,
-			!filteredComboInfo?.comboName && i === accounts.length - 1,
-		);
+		try {
+			response = await proxyWithAccount(
+				req,
+				url,
+				accounts[i],
+				requestMeta,
+				finalBodyBuffer,
+				finalCreateBodyStream,
+				i,
+				ctx,
+				modelOverride,
+				apiKeyId,
+				apiKeyName,
+				requestBodyContext,
+				!filteredComboInfo?.comboName && i === accounts.length - 1,
+			);
+		} finally {
+			if (probeAdmission === "admitted") {
+				completeRateLimitProbe(accounts[i], "abandoned");
+			}
+		}
 
 		if (response) {
 			recordCachePacingRoute(
@@ -665,22 +680,33 @@ export async function handleProxy(
 					pacingBypassed = false;
 					requestMeta.codexPacingAction = "crossover-paced";
 				}
+				const probeAdmission = getRateLimitProbeAdmission(fallbackAccounts[i]);
+				if (probeAdmission === "suppressed") {
+					continue;
+				}
+
 				upstreamAttempts++;
-				response = await proxyWithAccount(
-					req,
-					url,
-					fallbackAccounts[i],
-					requestMeta,
-					finalBodyBuffer,
-					finalCreateBodyStream,
-					i,
-					ctx,
-					undefined, // No model override for fallback path
-					apiKeyId,
-					apiKeyName,
-					requestBodyContext,
-					i === fallbackAccounts.length - 1,
-				);
+				try {
+					response = await proxyWithAccount(
+						req,
+						url,
+						fallbackAccounts[i],
+						requestMeta,
+						finalBodyBuffer,
+						finalCreateBodyStream,
+						i,
+						ctx,
+						undefined, // No model override for fallback path
+						apiKeyId,
+						apiKeyName,
+						requestBodyContext,
+						i === fallbackAccounts.length - 1,
+					);
+				} finally {
+					if (probeAdmission === "admitted") {
+						completeRateLimitProbe(fallbackAccounts[i], "abandoned");
+					}
+				}
 
 				if (response) {
 					recordCachePacingRoute(
