@@ -28,7 +28,7 @@ export const CODEX_TRACE_HMAC_KEY_ENV = "CCFLARE_CODEX_TRACE_HMAC_KEY";
 /** Warn when one response spawns at least this many subagents (0 disables). */
 export const CODEX_FANOUT_WARN_ENV = "CCFLARE_CODEX_FANOUT_WARN";
 
-const TRACE_SCHEMA_VERSION = 7;
+const TRACE_SCHEMA_VERSION = 8;
 const DEFAULT_FANOUT_WARN = 8;
 const MAX_INPUT_ITEM_FINGERPRINTS = 64;
 /**
@@ -181,7 +181,15 @@ interface TraceInputs {
 	 */
 	promptCacheKeyId?: string | null;
 	/** Key derivation mode: "conversation" | "session" (see provider). */
-	cacheKeyMode?: string | null;
+	cacheKeyMode?: "conversation" | "session" | null;
+	/** Intended experiment arm for eligible cache-key canary traffic. */
+	cacheKeyAssignment?: "conversation" | "session" | null;
+	/** Bounded, domain-separated session cohort digest. */
+	cacheKeyCohortId?: string | null;
+	/** Bounded digest of the logical conversation identity. */
+	conversationId?: string | null;
+	/** Why the effective cache-key mode was selected. */
+	cacheKeyAssignmentSource?: "canary" | "explicit_session_override" | null;
 	/** Pacing canary arm: "control" | "bypass". */
 	pacingCanary?: string | null;
 	/** Privacy-preserving conversation cohort digest for stability checks. */
@@ -293,6 +301,10 @@ export function writeCodexTrace(inputs: TraceInputs): void {
 		prompt_cache_key_set: inputs.promptCacheKeySet ?? false,
 		prompt_cache_key_id: inputs.promptCacheKeyId ?? null,
 		cache_key_mode: inputs.cacheKeyMode ?? null,
+		cache_key_assignment: inputs.cacheKeyAssignment ?? null,
+		cache_key_cohort_id: inputs.cacheKeyCohortId ?? null,
+		conversation_id: inputs.conversationId ?? null,
+		cache_key_assignment_source: inputs.cacheKeyAssignmentSource ?? null,
 		pacing_canary: inputs.pacingCanary ?? null,
 		pacing_cohort_id: inputs.pacingCohortId ?? null,
 		pacing_action: inputs.pacingAction ?? null,

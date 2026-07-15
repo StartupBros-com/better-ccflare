@@ -1,13 +1,72 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
+	CODEX_TRACE_DIR_ENV,
 	CODEX_TRACE_HMAC_KEY_ENV,
 	contextUtilizationPct,
 	summarizeCodexResponse,
 	summarizeCodexTransform,
+	writeCodexTrace,
 } from "./trace";
 
 afterEach(() => {
+	delete process.env[CODEX_TRACE_DIR_ENV];
 	delete process.env[CODEX_TRACE_HMAC_KEY_ENV];
+});
+
+describe("writeCodexTrace schema 8 cache-key decision", () => {
+	test("writes bounded decision fields without reconstructing their semantics", () => {
+		const dir = mkdtempSync(join(tmpdir(), "codex-trace-schema-"));
+		process.env[CODEX_TRACE_DIR_ENV] = dir;
+		try {
+			writeCodexTrace({
+				codexInput: [],
+				promptCacheKeySet: true,
+				promptCacheKeyId: "not-a-semantic-prefix",
+				cacheKeyMode: "session",
+				cacheKeyAssignment: "conversation",
+				cacheKeyCohortId: "0123456789abcdef",
+				conversationId: "fedcba9876543210",
+				cacheKeyAssignmentSource: "explicit_session_override",
+			});
+
+			const file = readdirSync(dir).find((name) => name.endsWith(".jsonl"));
+			const record = JSON.parse(
+				readFileSync(join(dir, file as string), "utf8").trim(),
+			);
+			expect(record).toMatchObject({
+				trace_schema_version: 8,
+				cache_key_assignment: "conversation",
+				cache_key_cohort_id: "0123456789abcdef",
+				conversation_id: "fedcba9876543210",
+				cache_key_assignment_source: "explicit_session_override",
+				cache_key_mode: "session",
+				prompt_cache_key_id: "not-a-semantic-prefix",
+			});
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("writes null decision fields for ineligible traffic", () => {
+		const dir = mkdtempSync(join(tmpdir(), "codex-trace-schema-"));
+		process.env[CODEX_TRACE_DIR_ENV] = dir;
+		try {
+			writeCodexTrace({ codexInput: [] });
+			const file = readdirSync(dir).find((name) => name.endsWith(".jsonl"));
+			const record = JSON.parse(
+				readFileSync(join(dir, file as string), "utf8").trim(),
+			);
+			expect(record.cache_key_assignment).toBeNull();
+			expect(record.cache_key_cohort_id).toBeNull();
+			expect(record.conversation_id).toBeNull();
+			expect(record.cache_key_assignment_source).toBeNull();
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("summarizeCodexTransform (request/history phase)", () => {

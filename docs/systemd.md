@@ -212,8 +212,86 @@ Environment=CCFLARE_CODEX_SINGLE_ORCHESTRATION_ROOT=0
 
 This switch disables root election only. Trusted descendant filtering and `CCFLARE_SESSION_MAX_REQUESTS_PER_HOUR` remain active. Remove the override to restore containment.
 
-Codex trace schema 7 records `orchestration_admission`, before/after tool counts, exact filtered tool names, terminal reasons, response usage, context utilization, and error metadata for true errors. The analyzer remains compatible with schema 6 and mixed schema files.
+### Codex prompt-cache-key canary
 
-The analyzer can report cache-key groups and usage without configuration changes. Prefix retention and instruction/tool stability require `CCFLARE_CODEX_TRACE_HMAC_KEY`, because summaries written without that key intentionally contain no HMACs. Those comparisons are reported as unavailable rather than changed when HMACs are absent. With a dedicated trace key, traces include bounded cumulative prefix-boundary HMACs and byte lengths, allowing an earlier full input to be compared with the corresponding prefix of a later turn. Old boundaries outside the bounded retention window are also reported as unavailable. The key itself is never written to the trace. Rotate or remove it after the observation window.
+The Codex prompt-cache-key canary compares the existing conversation-scoped key with a session-scoped key. Prompt cache keys are enabled by default for OpenAI-owned `chatgpt.com` and `api.openai.com` endpoints, while the session-mode treatment is off by default. The canary assigns each eligible Claude session deterministically, so every validated request in that session remains in the same arm across turns, sibling conversations, provider instances, and service restarts.
+
+Configure the canary percentage in the systemd environment:
+
+```ini
+Environment=CCFLARE_CODEX_CACHE_KEY_SESSION_PERCENT=0
+```
+
+`CCFLARE_CODEX_CACHE_KEY_SESSION_PERCENT` produces an effective percentage from 0 through 100. Parsing accepts only an unsigned base-10 integer with no sign, fraction, exponent, or surrounding whitespace. Missing, empty, malformed, signed, fractional, exponential, and whitespace-padded values become `0`. Valid integers above `100` clamp to `100`.
+
+Eligible requests must target an OpenAI-owned prompt-cache endpoint and contain valid Claude session metadata. The normalized session UUID is assigned through a domain-separated SHA-256 bucket. Requests outside the configured percentage use the `conversation` control arm, while requests inside it use the `session` treatment arm. Custom or self-hosted OpenAI-compatible endpoints and invalid or missing session metadata are not assigned and emit no prompt cache key.
+
+Configuration precedence is:
+
+1. `CCFLARE_CODEX_PROMPT_CACHE_KEY=0` is the explicit global opt-out. Unset or other values leave prompt cache keys enabled by default.
+2. The account selected for the transform must resolve to OpenAI's `chatgpt.com` or `api.openai.com` endpoint. Other endpoints are ineligible and emit no key or assignment.
+3. Missing or malformed Claude session metadata remains ineligible and emits no key.
+4. `CCFLARE_CODEX_CACHE_KEY_MODE=session` is an explicit all-session override. It produces a session key and records effective session behavior even if deterministic assignment would select conversation mode.
+5. Without the explicit override, the deterministic canary assignment selects the conversation or session key derivation. Empty transformed input retains the existing session-key fallback; other control requests use conversation mode.
+
+At `0`, eligible traffic retains the current conversation-key behavior. At `100`, all eligible sessions use session keys. Changing the percentage can reclassify sessions near the threshold, so keep it fixed throughout an observation window. Do not use repeated percentage changes as a ramping mechanism within one cohort window.
+
+#### Trace schema and analysis
+
+Codex trace schema 8 adds these nullable request fields:
+
+| Field | Meaning |
+|---|---|
+| `cache_key_assignment` | Intended `conversation` or `session` arm for eligible canary traffic |
+| `cache_key_cohort_id` | Short domain-separated digest of the normalized session UUID for assignment-stability checks |
+| `conversation_id` | Short digest of the logical conversation identity, independent of the outbound cache key |
+| `cache_key_assignment_source` | `canary`, `explicit_session_override`, or null |
+
+The existing `prompt_cache_key_set`, `prompt_cache_key_id`, and `cache_key_mode` fields remain authoritative for effective behavior. Assignment and effective mode are intentionally separate so the analyzer can report configuration crossovers rather than infer them from key prefixes. The analyzer joins request and response records only by `request_id`, retains schema 6 and 7 records in an explicit unassigned compatibility bucket, reports unjoined responses separately, and counts assigned requests without responses as missing terminals rather than client aborts.
+
+For each intended arm, the analyzer reports:
+
+- Assigned requests, joined terminal responses, missing-terminal requests, and cache-measured responses
+- Weighted cache reuse using only responses with numeric cache telemetry
+- Cache-positive response rate with its measured denominator
+- Input, output, and cache token totals
+- Terminal distributions, including errors, refusals, and `max_tokens`
+- Effective-mode distributions and explicit crossover counts
+- Model and account distributions
+- Logical conversation counts
+- First-request and cache-eligible follow-up statistics
+- Observed conversation-turn bands derived from all retained records for each `conversation_id`
+
+Use intention-to-treat arm comparisons as the primary result. Check effective-mode crossovers, model and account balance, missing terminals, and complete-session coverage before interpreting cache reuse.
+
+#### Privacy
+
+Schema 8 stores only bounded digests and enum values for the canary. It never stores raw session IDs, prompt material, or outbound cache keys. Internal experiment metadata is stripped before upstream transport. Cache token counts and serialized prefix-boundary byte lengths are different units, so trace analysis must not claim an exact provider token-cache boundary from HMAC boundary telemetry.
+
+Prefix retention and instruction/tool stability require `CCFLARE_CODEX_TRACE_HMAC_KEY`, because summaries written without that key intentionally contain no HMACs. Those comparisons are reported as unavailable rather than changed when HMACs are absent. With a dedicated trace key, traces include bounded cumulative prefix-boundary HMACs and byte lengths, allowing an earlier full input to be compared with the corresponding prefix of a later turn. Old boundaries outside the bounded retention window are also reported as unavailable. The key itself is never written to the trace. Rotate or remove it after the observation window.
+
+#### Rollout and stop conditions
+
+Use this bounded rollout after the schema 8 build is merged and deployed from `refs/heads/main`:
+
+1. Deploy with `CCFLARE_CODEX_CACHE_KEY_SESSION_PERCENT=0`. Do not change prompt-key, pacing, routing, model, or orchestration settings.
+2. Verify service health, schema 8 trace coverage, stable cohort IDs, distinct and stable conversation IDs, request-response joins, and zero unexpected effective-mode crossovers.
+3. Set a small treatment cohort, preferably `10` rather than `1` when an overnight window contains only about ten sessions. Keep the percentage fixed for the full observation window.
+4. Compare intention-to-treat weighted reuse, cache-positive rate, follow-up-only behavior, available request latency, terminal outcomes, missing-terminal rate, model and account balance, and orchestration containment indicators.
+
+Stop the canary and return the percentage to `0` if errors, refusals, `max_tokens` terminals, missing terminals, containment failures, or unexpected effective-mode crossovers worsen. Also stop if cache reuse shows no credible benefit after enough complete sessions have been observed. An immediate global switch to session mode is outside this rollout.
+
+Rollback requires only restoring conversation assignment and restarting the service:
+
+```ini
+Environment=CCFLARE_CODEX_CACHE_KEY_SESSION_PERCENT=0
+```
+
+```sh
+systemctl daemon-reload
+systemctl restart ccflare-stack.service
+```
+
+Leave `CCFLARE_CODEX_PROMPT_CACHE_KEY` unset to preserve the default-enabled conversation-scoped prompt-cache-key behavior, or retain any existing nonzero value. Remove `CCFLARE_CODEX_CACHE_KEY_MODE=session` if an explicit session override was present, because that override takes precedence over the percentage. If prompt cache keys themselves must be disabled, set `CCFLARE_CODEX_PROMPT_CACHE_KEY=0` as a separate rollback decision.
 
 Accounts with mature repeated 429 streaks use process-local single-flight recovery probes after cooldown expiry. Journal events are `cooldown_probe_admitted`, `cooldown_probe_suppressed`, `cooldown_probe_recovery_success`, and `cooldown_probe_reapplied`. The upstream reset time remains authoritative; probe gating prevents concurrent re-entry without imposing a longer fixed cooldown.

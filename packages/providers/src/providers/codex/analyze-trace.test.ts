@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { analyzeCodexTrace, parseTraceJsonl } from "./analyze-trace";
+import {
+	analyzeCodexTrace,
+	formatReport,
+	parseTraceJsonl,
+} from "./analyze-trace";
 
 describe("analyzeCodexTrace", () => {
 	test("separates request history load from response new fan-out", () => {
@@ -459,6 +463,280 @@ describe("analyzeCodexTrace", () => {
 		expect(report.request.prefixTransitions.unavailableAbsentFingerprints).toBe(
 			0,
 		);
+	});
+
+	test("compares schema 8 canary arms with measured denominators and turn statistics", () => {
+		const report = analyzeCodexTrace([
+			{
+				trace_schema_version: 8,
+				phase: "request",
+				request_id: "c1",
+				ts: "1",
+				cache_key_assignment: "conversation",
+				cache_key_assignment_source: "canary",
+				cache_key_mode: "conversation",
+				conversation_id: "conversation-a",
+				model_out: "gpt-control",
+				account: "account-control",
+			},
+			{
+				trace_schema_version: 8,
+				phase: "request",
+				request_id: "c2",
+				ts: "2",
+				cache_key_assignment: "conversation",
+				cache_key_assignment_source: "explicit_session_override",
+				cache_key_mode: "session",
+				conversation_id: "conversation-a",
+				model_out: "gpt-control",
+				account: "account-control",
+			},
+			{
+				trace_schema_version: 8,
+				phase: "request",
+				request_id: "s1",
+				ts: "3",
+				cache_key_assignment: "session",
+				cache_key_assignment_source: "canary",
+				cache_key_mode: "conversation",
+				conversation_id: "conversation-b",
+				model_out: "gpt-treatment",
+				account: "account-treatment",
+			},
+			{
+				trace_schema_version: 8,
+				phase: "request",
+				request_id: "s2",
+				ts: "4",
+				cache_key_assignment: "session",
+				cache_key_assignment_source: "canary",
+				cache_key_mode: "session",
+				conversation_id: "conversation-b",
+				model_out: "gpt-treatment",
+				account: "account-treatment",
+			},
+			{
+				phase: "response",
+				request_id: "c1",
+				stop_reason: "end_turn",
+				input_tokens: 100,
+				output_tokens: 10,
+				cache_read_input_tokens: 0,
+				cache_creation_input_tokens: 5,
+			},
+			{
+				phase: "response",
+				request_id: "c2",
+				stop_reason: "error",
+				input_tokens: 900,
+				output_tokens: 20,
+				cache_read_input_tokens: 900,
+			},
+			{
+				phase: "response",
+				request_id: "s1",
+				stop_reason: "refusal",
+				input_tokens: 200,
+				output_tokens: 30,
+			},
+			{
+				phase: "response",
+				request_id: "s2",
+				stop_reason: "max_tokens",
+				input_tokens: 300,
+				output_tokens: 40,
+				cache_read_input_tokens: 150,
+			},
+		]);
+
+		expect(report.canary.conversation.assignedRequests).toBe(2);
+		expect(report.canary.conversation.joinedTerminalResponses).toBe(2);
+		expect(report.canary.conversation.missingTerminalRequests).toBe(0);
+		expect(report.canary.conversation.cacheMeasuredResponses).toBe(2);
+		expect(report.canary.conversation.weightedCacheReusePct).toBe(90);
+		expect(report.canary.conversation.cachePositiveResponses).toBe(1);
+		expect(report.canary.conversation.cachePositiveRatePct).toBe(50);
+		expect(report.canary.conversation.usage).toEqual({
+			inputTokens: 1_000,
+			outputTokens: 30,
+			cacheReadInputTokens: 900,
+			cacheCreationInputTokens: 5,
+		});
+		expect(report.canary.conversation.terminals).toEqual({
+			end_turn: 1,
+			error: 1,
+		});
+		expect(report.canary.conversation.effectiveModes).toEqual({
+			conversation: 1,
+			session: 1,
+		});
+		expect(report.canary.conversation.explicitCrossovers).toEqual({
+			conversationToSession: 1,
+			sessionToConversation: 0,
+		});
+		expect(report.canary.conversation.models).toEqual({ "gpt-control": 2 });
+		expect(report.canary.conversation.accounts).toEqual({
+			"account-control": 2,
+		});
+		expect(report.canary.conversation.logicalConversations).toBe(1);
+		expect(report.canary.conversation.turns.first).toMatchObject({
+			requests: 1,
+			cacheMeasuredResponses: 1,
+			weightedCacheReusePct: 0,
+			cachePositiveRatePct: 0,
+		});
+		expect(report.canary.conversation.turns.followUp).toMatchObject({
+			requests: 1,
+			cacheMeasuredResponses: 1,
+			weightedCacheReusePct: 100,
+			cachePositiveRatePct: 100,
+		});
+		expect(report.canary.conversation.conversationTurnBands).toEqual({
+			"2": 2,
+		});
+		expect(report.canary.session.terminals).toEqual({
+			refusal: 1,
+			max_tokens: 1,
+		});
+		expect(report.canary.session.cacheMeasuredResponses).toBe(1);
+		expect(report.canary.session.weightedCacheReusePct).toBe(50);
+		expect(report.canary.session.cachePositiveRatePct).toBe(100);
+		expect(report.canary.session.effectiveModes).toEqual({
+			conversation: 1,
+			session: 1,
+		});
+		expect(report.canary.session.explicitCrossovers).toEqual({
+			conversationToSession: 0,
+			sessionToConversation: 1,
+		});
+		expect(report.canary.session.turns.first.cacheMeasuredResponses).toBe(0);
+		expect(report.canary.session.turns.followUp.weightedCacheReusePct).toBe(50);
+	});
+
+	test("uses retained conversation records for turn bands and mode-independent indexing", () => {
+		const report = analyzeCodexTrace([
+			{
+				trace_schema_version: 7,
+				phase: "request",
+				request_id: "old",
+				ts: "1",
+				conversation_id: "shared",
+			},
+			{
+				trace_schema_version: 8,
+				phase: "request",
+				request_id: "assigned-1",
+				ts: "2",
+				cache_key_assignment: "session",
+				cache_key_mode: "conversation",
+				conversation_id: "shared",
+			},
+			{
+				trace_schema_version: 8,
+				phase: "request",
+				request_id: "assigned-2",
+				ts: "3",
+				cache_key_assignment: "session",
+				cache_key_mode: "session",
+				conversation_id: "shared",
+			},
+			{
+				phase: "response",
+				request_id: "assigned-1",
+				input_tokens: 100,
+				cache_read_input_tokens: 25,
+			},
+		]);
+
+		expect(report.canary.session.turns.first.requests).toBe(0);
+		expect(report.canary.session.turns.followUp.requests).toBe(2);
+		expect(report.canary.session.conversationTurnBands).toEqual({ "3": 2 });
+		expect(report.canary.session.missingTerminalRequests).toBe(1);
+		expect(report.canary.unassigned.assignedRequests).toBe(1);
+	});
+
+	test("keeps compatibility traffic unassigned and reports orphan responses", () => {
+		const report = analyzeCodexTrace([
+			{ trace_schema_version: 6, phase: "request", request_id: "legacy-6" },
+			{ trace_schema_version: 7, phase: "request", request_id: "legacy-7" },
+			{ trace_schema_version: 7, phase: "request" },
+			{
+				trace_schema_version: 8,
+				phase: "request",
+				request_id: "eligible",
+				cache_key_assignment: "conversation",
+				cache_key_mode: "conversation",
+			},
+			{ phase: "response", request_id: "legacy-6", stop_reason: "end_turn" },
+			{ phase: "response", request_id: "orphan", stop_reason: "error" },
+		]);
+
+		expect(report.canary.unassigned.assignedRequests).toBe(3);
+		expect(report.canary.unassigned.joinedTerminalResponses).toBe(1);
+		expect(report.canary.unassigned.missingTerminalRequests).toBe(2);
+		expect(report.canary.conversation.missingTerminalRequests).toBe(1);
+		expect(report.canary.unjoinedResponses).toBe(1);
+	});
+
+	test("uses deterministic last-record map semantics for duplicate IDs", () => {
+		const report = analyzeCodexTrace([
+			{
+				phase: "request",
+				request_id: "duplicate",
+				cache_key_assignment: "conversation",
+				cache_key_mode: "conversation",
+			},
+			{
+				phase: "request",
+				request_id: "duplicate",
+				cache_key_assignment: "session",
+				cache_key_mode: "session",
+			},
+			{
+				phase: "response",
+				request_id: "duplicate",
+				input_tokens: 100,
+				cache_read_input_tokens: 0,
+			},
+			{
+				phase: "response",
+				request_id: "duplicate",
+				input_tokens: 100,
+				cache_read_input_tokens: 100,
+			},
+		]);
+
+		expect(report.canary.conversation.assignedRequests).toBe(0);
+		expect(report.canary.session.assignedRequests).toBe(1);
+		expect(report.canary.session.joinedTerminalResponses).toBe(1);
+		expect(report.canary.session.weightedCacheReusePct).toBe(100);
+		expect(report.canary.unjoinedResponses).toBe(0);
+	});
+
+	test("formats explicit canary denominators and crossover labels", () => {
+		const text = formatReport(
+			analyzeCodexTrace([
+				{
+					phase: "request",
+					request_id: "r1",
+					cache_key_assignment: "conversation",
+					cache_key_assignment_source: "explicit_session_override",
+					cache_key_mode: "session",
+				},
+				{
+					phase: "response",
+					request_id: "r1",
+					input_tokens: 100,
+					cache_read_input_tokens: 50,
+				},
+			]),
+		);
+
+		expect(text).toContain("CONVERSATION VS SESSION CANARY");
+		expect(text).toContain("cache positive: 1/1 measured (100%)");
+		expect(text).toContain("conversation->session=1");
+		expect(text).toContain("session->conversation=0");
+		expect(text).toContain("unjoined responses: 0");
 	});
 
 	test("handles request volumes above the engine argument limit", () => {

@@ -61,6 +61,27 @@ const CODEX_SYNTHETIC_RESPONSE_URL =
 export const CODEX_PROMPT_CACHE_KEY_ENV = "CCFLARE_CODEX_PROMPT_CACHE_KEY";
 /** "conversation" (default) or "session"; see derivePromptCacheKey. */
 export const CODEX_CACHE_KEY_MODE_ENV = "CCFLARE_CODEX_CACHE_KEY_MODE";
+export const CODEX_CACHE_KEY_SESSION_PERCENT_ENV =
+	"CCFLARE_CODEX_CACHE_KEY_SESSION_PERCENT";
+const CODEX_CACHE_KEY_SESSION_BUCKET_DOMAIN =
+	"better-ccflare:codex-cache-key-session-canary:v1\0";
+const CODEX_CACHE_KEY_COHORT_DOMAIN =
+	"better-ccflare:codex-cache-key-cohort:v1\0";
+
+export function readCodexCacheKeySessionPercent(
+	raw = process.env[CODEX_CACHE_KEY_SESSION_PERCENT_ENV],
+): number {
+	if (raw === undefined || !/^\d+$/.test(raw)) return 0;
+	return Math.min(Number.parseInt(raw, 10), 100);
+}
+
+export function deriveCodexCacheKeySessionBucket(sessionId: string): number {
+	const digest = createHash("sha256")
+		.update(CODEX_CACHE_KEY_SESSION_BUCKET_DOMAIN)
+		.update(sessionId.toLowerCase())
+		.digest();
+	return digest.readUInt32BE(0) % 100;
+}
 // Structured (non-text) tool_result blocks larger than this are replaced with
 // a size marker: replaying megabyte payloads (e.g. base64 documents) into
 // every subsequent turn bloats context and destroys prompt-cache reuse.
@@ -247,8 +268,18 @@ interface CodexRequest {
 	max_output_tokens?: number;
 }
 
+export interface CodexPromptCacheKeyDecision {
+	key: string | null;
+	assignment: "conversation" | "session" | null;
+	assignmentSource: "canary" | "explicit_session_override" | null;
+	effectiveMode: "conversation" | "session" | null;
+	cohortId: string | null;
+	conversationIdentity: string | null;
+}
+
 interface CodexConversionResult {
 	codexBody: CodexRequest;
+	cacheKeyDecision: CodexPromptCacheKeyDecision;
 	orchestrationAdmission: OrchestrationAdmission;
 	filteredToolNames: string[];
 }
@@ -530,13 +561,17 @@ export class CodexProvider extends BaseProvider {
 					ts: Date.now(),
 				});
 			}
-			const { codexBody, orchestrationAdmission, filteredToolNames } =
-				this.convertToCodexFormat(
-					body,
-					account,
-					requestId ?? undefined,
-					isAttributedAgent,
-				);
+			const {
+				codexBody,
+				cacheKeyDecision,
+				orchestrationAdmission,
+				filteredToolNames,
+			} = this.convertToCodexFormat(
+				body,
+				account,
+				requestId ?? undefined,
+				isAttributedAgent,
+			);
 			if (isSubscriptionEndpoint) {
 				// ChatGPT's subscription Responses endpoint rejects this API-only field.
 				delete codexBody.max_output_tokens;
@@ -554,11 +589,12 @@ export class CodexProvider extends BaseProvider {
 				promptCacheKeyId: codexBody.prompt_cache_key
 					? codexBody.prompt_cache_key.slice(-16)
 					: null,
-				cacheKeyMode: codexBody.prompt_cache_key
-					? codexBody.prompt_cache_key.startsWith("ccflare-convo-")
-						? "conversation"
-						: "session"
-					: null,
+				cacheKeyMode: cacheKeyDecision.effectiveMode,
+				cacheKeyAssignment: cacheKeyDecision.assignment,
+				cacheKeyCohortId: cacheKeyDecision.cohortId,
+				conversationId:
+					cacheKeyDecision.conversationIdentity?.slice(0, 16) ?? null,
+				cacheKeyAssignmentSource: cacheKeyDecision.assignmentSource,
 				pacingCanary: request.headers.get("x-better-ccflare-pacing-canary"),
 				pacingCohortId: request.headers.get(
 					"x-better-ccflare-pacing-cohort-id",
@@ -782,30 +818,59 @@ export class CodexProvider extends BaseProvider {
 		instructions: string,
 		input: readonly unknown[],
 		account?: Account,
-	): string | undefined {
-		if (process.env[CODEX_PROMPT_CACHE_KEY_ENV] === "0") return undefined;
-		if (!isOpenAiPromptCacheEndpoint(account)) return undefined;
+	): CodexPromptCacheKeyDecision {
+		const ineligible: CodexPromptCacheKeyDecision = {
+			key: null,
+			assignment: null,
+			assignmentSource: null,
+			effectiveMode: null,
+			cohortId: null,
+			conversationIdentity: null,
+		};
+		if (process.env[CODEX_PROMPT_CACHE_KEY_ENV] === "0") return ineligible;
+		if (!isOpenAiPromptCacheEndpoint(account)) return ineligible;
 		const sessionId = this.extractSessionId(body);
-		if (!sessionId) return undefined;
-		// Digests are truncated to 48 hex chars so the full key fits the API's
-		// 64-char key bound. Session ids and content never appear in the key.
-		if (
-			process.env[CODEX_CACHE_KEY_MODE_ENV] === "session" ||
-			input.length === 0
-		) {
-			return `ccflare-session-${createHash("sha256")
+		if (!sessionId) return ineligible;
+
+		const conversationIdentity =
+			deriveConversationIdentity(sessionId, instructions, input) ?? null;
+		const sessionPercent = readCodexCacheKeySessionPercent();
+		const assignment: "conversation" | "session" =
+			sessionPercent === 100 ||
+			(sessionPercent > 0 &&
+				deriveCodexCacheKeySessionBucket(sessionId) < sessionPercent)
+				? "session"
+				: "conversation";
+		const explicitSessionOverride =
+			process.env[CODEX_CACHE_KEY_MODE_ENV] === "session";
+		const effectiveMode =
+			explicitSessionOverride || assignment === "session" || input.length === 0
+				? "session"
+				: "conversation";
+		const key =
+			effectiveMode === "session"
+				? `ccflare-session-${createHash("sha256")
+						.update(sessionId)
+						.digest("hex")
+						.slice(0, 48)}`
+				: conversationIdentity
+					? `ccflare-convo-${conversationIdentity.slice(0, 48)}`
+					: null;
+
+		return {
+			key,
+			assignment,
+			assignmentSource: explicitSessionOverride
+				? "explicit_session_override"
+				: "canary",
+			effectiveMode: key ? effectiveMode : null,
+			cohortId: createHash("sha256")
+				.update(CODEX_CACHE_KEY_COHORT_DOMAIN)
 				.update(sessionId)
 				.digest("hex")
-				.slice(0, 48)}`;
-		}
-		const conversationId = deriveConversationIdentity(
-			sessionId,
-			instructions,
-			input,
-		);
-		return conversationId
-			? `ccflare-convo-${conversationId.slice(0, 48)}`
-			: undefined;
+				.slice(0, 16),
+			conversationIdentity,
+		};
 	}
 
 	private convertToolChoice(
@@ -1220,14 +1285,14 @@ export class CodexProvider extends BaseProvider {
 		};
 
 		codexRequest.instructions = finalInstructions;
-		const promptCacheKey = this.derivePromptCacheKey(
+		const cacheKeyDecision = this.derivePromptCacheKey(
 			body,
 			codexRequest.instructions,
 			input,
 			account,
 		);
-		if (promptCacheKey) {
-			codexRequest.prompt_cache_key = promptCacheKey;
+		if (cacheKeyDecision.key) {
+			codexRequest.prompt_cache_key = cacheKeyDecision.key;
 		}
 		const explicitToolChoice = this.convertToolChoice(
 			body.tool_choice,
@@ -1269,6 +1334,7 @@ export class CodexProvider extends BaseProvider {
 
 		return {
 			codexBody: codexRequest,
+			cacheKeyDecision,
 			orchestrationAdmission,
 			filteredToolNames,
 		};
