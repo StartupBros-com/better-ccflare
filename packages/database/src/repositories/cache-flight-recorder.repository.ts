@@ -73,55 +73,59 @@ export class CacheFlightRecorderRepository extends BaseRepository<Timeline> {
 	): Promise<void> {
 		this.assertPrivacySafeRecorderId(recorderConversationId);
 		this.assertPrivacySafeTurn(turn);
-		await this.run(
-			"DELETE FROM cache_flight_recorder_tombstones WHERE recorder_conversation_id = ?",
-			[recorderConversationId],
-		);
-		await this.run(
-			`INSERT INTO cache_flight_recorder_conversations (
-				recorder_conversation_id, created_at, updated_at, incomplete, dropped_events
-			) VALUES (?, ?, ?, ?, 0)
-			ON CONFLICT (recorder_conversation_id) DO UPDATE SET
-				updated_at = CASE
-					WHEN EXCLUDED.updated_at > cache_flight_recorder_conversations.updated_at
-					THEN EXCLUDED.updated_at
-					ELSE cache_flight_recorder_conversations.updated_at
-				END,
-				incomplete = CASE
-					WHEN EXCLUDED.incomplete = 1 THEN 1
-					ELSE cache_flight_recorder_conversations.incomplete
-				END`,
-			[
-				recorderConversationId,
-				recordedAt,
-				recordedAt,
-				turn.completeness === "complete" ? 0 : 1,
-			],
-		);
-		await this.run(
-			`INSERT INTO cache_flight_recorder_turns (
-				recorder_conversation_id, sequence, timestamp,
-				identity_fingerprint, serving_account_id, prefix_fingerprint,
-				cache_outcome, input_tokens, cached_tokens, completeness,
-				unavailable_dimensions, gap_before
-			) SELECT ?, COALESCE(MAX(sequence), -1) + 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-			FROM cache_flight_recorder_turns
-			WHERE recorder_conversation_id = ?`,
-			[
-				recorderConversationId,
-				turn.timestamp,
-				turn.identityFingerprint ?? null,
-				turn.servingAccountId ?? null,
-				turn.prefixFingerprint ?? null,
-				turn.cacheOutcome,
-				turn.inputTokens ?? null,
-				turn.cachedTokens ?? null,
-				turn.completeness,
-				JSON.stringify(turn.unavailableDimensions),
-				turn.gapBefore ? 1 : 0,
-				recorderConversationId,
-			],
-		);
+		// Keep tombstone removal, conversation upsert, and sequence allocation atomic so
+		// a partial failure cannot leave an expired tombstone without its live timeline.
+		await this.adapter.runBatchWithChanges([
+			{
+				sql: "DELETE FROM cache_flight_recorder_tombstones WHERE recorder_conversation_id = ?",
+				params: [recorderConversationId],
+			},
+			{
+				sql: `INSERT INTO cache_flight_recorder_conversations (
+					recorder_conversation_id, created_at, updated_at, incomplete, dropped_events
+				) VALUES (?, ?, ?, ?, 0)
+				ON CONFLICT (recorder_conversation_id) DO UPDATE SET
+					updated_at = CASE
+						WHEN EXCLUDED.updated_at > cache_flight_recorder_conversations.updated_at
+						THEN EXCLUDED.updated_at
+						ELSE cache_flight_recorder_conversations.updated_at
+					END,
+					incomplete = CASE
+						WHEN EXCLUDED.incomplete = 1 THEN 1
+						ELSE cache_flight_recorder_conversations.incomplete
+					END`,
+				params: [
+					recorderConversationId,
+					recordedAt,
+					recordedAt,
+					turn.completeness === "complete" ? 0 : 1,
+				],
+			},
+			{
+				sql: `INSERT INTO cache_flight_recorder_turns (
+					recorder_conversation_id, sequence, timestamp,
+					identity_fingerprint, serving_account_id, prefix_fingerprint,
+					cache_outcome, input_tokens, cached_tokens, completeness,
+					unavailable_dimensions, gap_before
+				) SELECT ?, COALESCE(MAX(sequence), -1) + 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+				FROM cache_flight_recorder_turns
+				WHERE recorder_conversation_id = ?`,
+				params: [
+					recorderConversationId,
+					turn.timestamp,
+					turn.identityFingerprint ?? null,
+					turn.servingAccountId ?? null,
+					turn.prefixFingerprint ?? null,
+					turn.cacheOutcome,
+					turn.inputTokens ?? null,
+					turn.cachedTokens ?? null,
+					turn.completeness,
+					JSON.stringify(turn.unavailableDimensions),
+					turn.gapBefore ? 1 : 0,
+					recorderConversationId,
+				],
+			},
+		]);
 	}
 
 	async loadTimeline(
