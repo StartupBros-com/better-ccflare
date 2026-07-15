@@ -259,7 +259,7 @@ async function createAdmissionScenario(): Promise<ScenarioContext> {
 		if (summarySeen && serialized.includes(triggerSentinel) && serialized.includes(summaryMarker)) {
 			return codexSuccessResponse("FINAL_REACTIVE_COMPACTION_SUCCESS");
 		}
-		return codexSuccessResponse(`warmup-response-${upstreamCalls.length}-${"context ".repeat(4000)}`);
+		return codexSuccessResponse(`warmup-response-${upstreamCalls.length}-${"context ".repeat(9000)}`);
 	}) as typeof fetch;
 	context.restoreFetch = () => {
 		globalThis.fetch = originalFetch;
@@ -418,7 +418,7 @@ describe("Claude Code 2.1.207 reactive compaction compatibility", () => {
 		const savedAdmission = process.env.CCFLARE_CONTEXT_ADMISSION;
 		const savedWindow = process.env.CCFLARE_CONTEXT_ADMISSION_TEST_EFFECTIVE_WINDOW;
 		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
-		process.env.CCFLARE_CONTEXT_ADMISSION_TEST_EFFECTIVE_WINDOW = "45000";
+		process.env.CCFLARE_CONTEXT_ADMISSION_TEST_EFFECTIVE_WINDOW = "90000";
 		try {
 			mock.module("../../../packages/database/src/inline-integrity-check-worker", () => ({ EMBEDDED_INTEGRITY_CHECK_WORKER_CODE: "" }));
 			mock.module("../../../packages/database/src/inline-vacuum-worker", () => ({ EMBEDDED_VACUUM_WORKER_CODE: "" }));
@@ -439,6 +439,7 @@ describe("Claude Code 2.1.207 reactive compaction compatibility", () => {
 			const sessionId = crypto.randomUUID();
 			await warmPersistedSession(context, sessionId);
 			const warmupUpstreamCalls = context.upstreamCalls?.length ?? 0;
+			expect(warmupUpstreamCalls).toBe(3);
 			const output = await runTurn(context, sessionId, `${triggerSentinel} answer only after recovering`, false);
 			expect(output).toContain("FINAL_REACTIVE_COMPACTION_SUCCESS");
 
