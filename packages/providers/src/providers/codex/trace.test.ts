@@ -191,6 +191,17 @@ describe("summarizeCodexResponse (response phase)", () => {
 		expect(contextUtilizationPct(1000, 0)).toBeNull();
 	});
 
+	test("keeps trace cache hit and context utilization based on total occupied input", () => {
+		const s = summarizeCodexResponse(
+			[],
+			{ input_tokens: 100, cache_read_input_tokens: 25 },
+			"end_turn",
+		);
+		expect(s.input_tokens).toBe(100);
+		expect(s.cache_hit_pct).toBe(25);
+		expect(contextUtilizationPct(s.input_tokens, 200)).toBe(50);
+	});
+
 	test("clamps malformed cached token counts to the total input", () => {
 		const s = summarizeCodexResponse(
 			[],

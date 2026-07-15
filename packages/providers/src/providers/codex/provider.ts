@@ -22,6 +22,7 @@ import {
 	writeCodexResponseTrace,
 	writeCodexTrace,
 } from "./trace";
+import { normalizeCodexInputUsage } from "./usage";
 
 const log = new Logger("CodexProvider");
 
@@ -145,9 +146,8 @@ const CODEX_ERROR_TYPE_BY_CODE: Record<string, string> = {
 };
 
 // Synced from the Codex CLI model cache (~/.codex/models_cache.json,
-// codex-cli 0.144.1). Missing entries mean no context_window block is
-// reported to the client, which disables its context gauge and compaction
-// triggers for that model.
+// codex-cli 0.144.1). Missing entries mean no context_window telemetry is
+// reported to the client, which disables its context gauge for that model.
 export const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
 	"gpt-5.3-codex": 272_000,
 	"gpt-5.3-codex-spark": 128_000,
@@ -161,9 +161,8 @@ export const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
 
 // Codex's model metadata declares an effective usable window below the raw
 // maximum (effective_context_window_percent, 95 for every current model).
-// When CCFLARE_CODEX_EFFECTIVE_CONTEXT=1, report the effective size so the
-// client's compaction triggers fire before the degradation zone instead of
-// at the hard limit.
+// When CCFLARE_CODEX_EFFECTIVE_CONTEXT=1, report that size as context-window
+// telemetry so the client's gauge reflects the effective degradation zone.
 export const CODEX_EFFECTIVE_CONTEXT_ENV = "CCFLARE_CODEX_EFFECTIVE_CONTEXT";
 const MODEL_EFFECTIVE_CONTEXT_PERCENT: Record<string, number> = {
 	"gpt-5.3-codex": 95,
@@ -354,6 +353,8 @@ interface StreamState {
 	hasSentMessageStart: boolean;
 	hasSentContentBlockStart: boolean;
 	hasSentTerminalEvents: boolean;
+	/** Total occupied upstream input, including cached tokens, for telemetry. */
+	totalInputTokens: number;
 	inputTokens: number;
 	outputTokens: number;
 	cacheReadInputTokens: number;
@@ -1055,17 +1056,15 @@ export class CodexProvider extends BaseProvider {
 		const inputTokenDetails = usageRecord?.input_tokens_details as
 			| Record<string, unknown>
 			| undefined;
-		const cachedTokens = inputTokenDetails?.cached_tokens;
+		const normalized = normalizeCodexInputUsage(
+			inputTokens,
+			inputTokenDetails?.cached_tokens,
+		);
 
 		return {
 			current_usage: {
-				input_tokens: inputTokens,
-				cache_read_input_tokens:
-					typeof cachedTokens === "number" &&
-					Number.isFinite(cachedTokens) &&
-					cachedTokens >= 0
-						? cachedTokens
-						: 0,
+				input_tokens: normalized.inputTokens,
+				cache_read_input_tokens: normalized.cacheReadInputTokens,
 				cache_creation_input_tokens:
 					typeof inputTokenDetails?.cache_creation_input_tokens === "number" &&
 					Number.isFinite(inputTokenDetails.cache_creation_input_tokens) &&
@@ -1593,6 +1592,7 @@ export class CodexProvider extends BaseProvider {
 			hasSentMessageStart: false,
 			hasSentContentBlockStart: false,
 			hasSentTerminalEvents: false,
+			totalInputTokens: 0,
 			inputTokens: 0,
 			outputTokens: 0,
 			cacheReadInputTokens: 0,
@@ -2140,22 +2140,27 @@ export class CodexProvider extends BaseProvider {
 					  }
 					| undefined;
 
-				// Extract cache fields from input_tokens_details (Codex format)
 				const inputTokenDetails = usage?.input_tokens_details;
-				const cacheRead =
-					typeof inputTokenDetails?.cached_tokens === "number" &&
-					inputTokenDetails.cached_tokens >= 0
-						? inputTokenDetails.cached_tokens
-						: 0;
+				const normalizedInput = normalizeCodexInputUsage(
+					usage?.input_tokens,
+					inputTokenDetails?.cached_tokens,
+				);
 				const cacheCreation =
 					typeof inputTokenDetails?.cache_creation_input_tokens === "number" &&
+					Number.isFinite(inputTokenDetails.cache_creation_input_tokens) &&
 					inputTokenDetails.cache_creation_input_tokens >= 0
 						? inputTokenDetails.cache_creation_input_tokens
 						: 0;
 
-				state.inputTokens = usage?.input_tokens || state.inputTokens;
-				state.outputTokens = usage?.output_tokens || state.outputTokens;
-				state.cacheReadInputTokens = cacheRead;
+				state.totalInputTokens = normalizedInput.totalInputTokens;
+				state.inputTokens = normalizedInput.inputTokens;
+				state.outputTokens =
+					typeof usage?.output_tokens === "number" &&
+					Number.isFinite(usage.output_tokens) &&
+					usage.output_tokens >= 0
+						? usage.output_tokens
+						: state.outputTokens;
+				state.cacheReadInputTokens = normalizedInput.cacheReadInputTokens;
 				state.cacheCreationInputTokens = cacheCreation;
 				state.contextWindow = this.extractContextWindow(resp, usage);
 				// Close any lingering content block
@@ -2224,7 +2229,7 @@ export class CodexProvider extends BaseProvider {
 					summary: summarizeCodexResponse(
 						state.traceNewToolCalls,
 						{
-							input_tokens: state.inputTokens,
+							input_tokens: state.totalInputTokens,
 							output_tokens: state.outputTokens,
 							cache_read_input_tokens: state.cacheReadInputTokens,
 							cache_creation_input_tokens: state.cacheCreationInputTokens,

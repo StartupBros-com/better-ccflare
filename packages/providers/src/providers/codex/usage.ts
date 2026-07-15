@@ -10,6 +10,39 @@ const DEFAULT_UTILIZATION = 0;
 const FIVE_HOUR_WINDOW_MINUTES = 5 * 60;
 const SEVEN_DAY_WINDOW_MINUTES = 7 * 24 * 60;
 
+export interface NormalizedCodexInputUsage {
+	/** Total context occupied upstream, including cached tokens. */
+	totalInputTokens: number;
+	/** Anthropic's additive, uncached input token field. */
+	inputTokens: number;
+	cacheReadInputTokens: number;
+}
+
+/** Convert Codex's inclusive input total to Anthropic's additive usage fields. */
+export function normalizeCodexInputUsage(
+	totalInputTokens: unknown,
+	cachedTokens: unknown,
+): NormalizedCodexInputUsage {
+	const total =
+		typeof totalInputTokens === "number" &&
+		Number.isFinite(totalInputTokens) &&
+		totalInputTokens >= 0
+			? totalInputTokens
+			: 0;
+	const cached =
+		typeof cachedTokens === "number" &&
+		Number.isFinite(cachedTokens) &&
+		cachedTokens >= 0
+			? Math.min(cachedTokens, total)
+			: 0;
+
+	return {
+		totalInputTokens: total,
+		inputTokens: total - cached,
+		cacheReadInputTokens: cached,
+	};
+}
+
 function parseNumber(value: string | null): number | null {
 	if (!value) return null;
 	const parsed = Number.parseFloat(value);
