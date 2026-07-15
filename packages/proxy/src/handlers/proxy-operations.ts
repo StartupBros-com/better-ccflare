@@ -9,8 +9,11 @@ import { withSanitizedProxyHeaders } from "@better-ccflare/http-common";
 import { Logger } from "@better-ccflare/logger";
 import { stripCacheControlFromOpenAIRequest } from "@better-ccflare/openai-formats";
 import {
+	decideContextAdmission,
 	getProvider,
 	isAnthropicOutOfCredits,
+	resolveCodexRequestModel,
+	resolveModelContextCapability,
 	usageCache,
 } from "@better-ccflare/providers";
 import type {
@@ -46,6 +49,141 @@ const INTERNAL_TRANSPORT_HEADERS = [
 	"x-better-ccflare-attributed-agent",
 ] as const;
 const ANTHROPIC_BILLING_HEADER = "x-anthropic-billing-header";
+const TEST_CONTEXT_WINDOW_ENV =
+	"CCFLARE_CONTEXT_ADMISSION_TEST_EFFECTIVE_WINDOW";
+
+function getTestContextWindowOverride(): number | undefined {
+	if (process.env.NODE_ENV !== "test") return undefined;
+	const value = Number(process.env[TEST_CONTEXT_WINDOW_ENV]);
+	return Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined;
+}
+
+export interface ContextAdmissionTracker {
+	inputTokens: number;
+	requestedMaxOutputTokens: number;
+	rejectedCount: number;
+	largestSafeLimit: number;
+	attemptedCount: number;
+	nonCapacitySkipCount: number;
+}
+
+export function createContextAdmissionTracker(
+	inputTokens: number,
+	requestedMaxOutputTokens: unknown,
+): ContextAdmissionTracker {
+	return {
+		inputTokens,
+		requestedMaxOutputTokens:
+			typeof requestedMaxOutputTokens === "number" &&
+			Number.isFinite(requestedMaxOutputTokens)
+				? Math.max(0, Math.floor(requestedMaxOutputTokens))
+				: 0,
+		rejectedCount: 0,
+		largestSafeLimit: 0,
+		attemptedCount: 0,
+		nonCapacitySkipCount: 0,
+	};
+}
+
+export function admitConcreteCodexModel(
+	account: Account,
+	model: string,
+	tracker?: ContextAdmissionTracker,
+): boolean {
+	if (
+		process.env.CCFLARE_CONTEXT_ADMISSION !== "1" ||
+		account.provider !== "codex" ||
+		!tracker
+	) {
+		return true;
+	}
+	const capability = resolveModelContextCapability("codex", model);
+	const effectiveContextWindow =
+		getTestContextWindowOverride() ?? capability?.effectiveContextWindow;
+	if (!effectiveContextWindow) {
+		log.debug("Codex context admission capacity unknown, failing open", {
+			accountId: account.id,
+			model,
+			outcome: "unknown",
+		});
+		return true;
+	}
+	const decision = decideContextAdmission({
+		inputTokens: tracker.inputTokens,
+		effectiveContextWindow,
+		requestedMaxOutputTokens: tracker.requestedMaxOutputTokens,
+		safetyReserveTokens: 0,
+	});
+	if (decision.status !== "reject") return true;
+
+	tracker.rejectedCount++;
+	tracker.largestSafeLimit = Math.max(
+		tracker.largestSafeLimit,
+		decision.safeLimitTokens ?? 0,
+	);
+	log.info("Codex context admission rejected attempt", {
+		accountId: account.id,
+		model,
+		outcome: "capacity_rejected",
+		occupiedTokens: decision.occupiedTokens,
+		safeLimitTokens: decision.safeLimitTokens,
+	});
+	return false;
+}
+
+function getConcreteCodexModelList(
+	account: Account,
+	requestedModel: string,
+): string[] {
+	const configuredModels = getModelList(requestedModel, account);
+	if (!configuredModels) {
+		return [resolveCodexRequestModel(requestedModel, account)];
+	}
+	return configuredModels.map((model) =>
+		resolveCodexRequestModel(model, account),
+	);
+}
+
+export function selectAdmittedCodexModel(
+	account: Account,
+	requestedModel: string | null,
+	tracker?: ContextAdmissionTracker,
+): { admitted: boolean; model: string | null } {
+	if (
+		process.env.CCFLARE_CONTEXT_ADMISSION !== "1" ||
+		account.provider !== "codex" ||
+		!tracker ||
+		!requestedModel
+	) {
+		return { admitted: true, model: requestedModel };
+	}
+	for (const model of getConcreteCodexModelList(account, requestedModel)) {
+		if (admitConcreteCodexModel(account, model, tracker)) {
+			return { admitted: true, model };
+		}
+	}
+	return { admitted: false, model: null };
+}
+
+export function createContextLengthExceededResponse(
+	tracker: ContextAdmissionTracker,
+): Response {
+	const occupied = tracker.inputTokens + tracker.requestedMaxOutputTokens;
+	return new Response(
+		JSON.stringify({
+			type: "error",
+			error: {
+				type: "invalid_request_error",
+				message: `prompt is too long: ${occupied} tokens > ${tracker.largestSafeLimit} tokens`,
+				code: "context_length_exceeded",
+			},
+		}),
+		{
+			status: 400,
+			headers: { "Content-Type": "application/json" },
+		},
+	);
+}
 
 function isBillingAttributedSubagent(headers: Headers): boolean {
 	const billing = headers.get(ANTHROPIC_BILLING_HEADER);
@@ -612,6 +750,7 @@ export async function proxyWithAccount(
 	apiKeyName?: string | null,
 	requestBodyContext?: RequestBodyContext | null,
 	returnRateLimitedResponseOnExhaustion = false,
+	contextAdmissionTracker?: ContextAdmissionTracker,
 ): Promise<Response | null> {
 	try {
 		if (
@@ -655,6 +794,36 @@ export async function proxyWithAccount(
 		// Get the provider for this account before applying the staging policy: the
 		// resolved provider (including ctx fallback) determines replay safety.
 		const provider = getProvider(account.provider) || ctx.provider;
+		const requestedModelBeforeAdmission = effectiveBodyContext.getModel();
+		const concreteCodexModels =
+			account.provider === "codex" && requestedModelBeforeAdmission
+				? getConcreteCodexModelList(account, requestedModelBeforeAdmission)
+				: [];
+		const admissionEnabledForAttempt =
+			url.pathname === "/v1/messages" &&
+			effectiveBodyContext.getParsedJson()?.max_tokens !== 0;
+		const attemptAdmissionTracker = admissionEnabledForAttempt
+			? contextAdmissionTracker
+			: undefined;
+		const admission = selectAdmittedCodexModel(
+			account,
+			requestedModelBeforeAdmission,
+			attemptAdmissionTracker,
+		);
+		if (!admission.admitted) return null;
+		const admittedModelIndex = admission.model
+			? concreteCodexModels.indexOf(admission.model)
+			: -1;
+		if (admission.model && admission.model !== requestedModelBeforeAdmission) {
+			const admittedContext = effectiveBodyContext.withPatchedModel(
+				admission.model,
+			);
+			if (admittedContext) {
+				effectiveBodyContext = admittedContext;
+				effectiveBodyBuffer = admittedContext.getBuffer();
+			}
+		}
+		if (attemptAdmissionTracker) attemptAdmissionTracker.attemptedCount++;
 
 		// Stage the original request body + headers for cache keepalive replay.
 		// Uses the pre-transform body (effectiveBodyBuffer may have a model override
@@ -987,8 +1156,13 @@ export async function proxyWithAccount(
 			}
 
 			if (requestedModel) {
-				const modelList = getModelList(requestedModel, account);
-				if (!modelList || modelList.length <= 1) {
+				const modelList = attemptAdmissionTracker
+					? concreteCodexModels
+					: getModelList(requestedModel, account);
+				const fallbackStartIndex = attemptAdmissionTracker
+					? admittedModelIndex + 1
+					: 1;
+				if (!modelList || fallbackStartIndex >= modelList.length) {
 					// No fallback models configured — fail over to the next account.
 					// 429s should never be forwarded to the client when other
 					// accounts are available; only genuine model-not-found
@@ -1084,8 +1258,17 @@ export async function proxyWithAccount(
 				}
 
 				finalAttemptModel = requestedModel;
-				for (let i = 1; i < modelList.length; i++) {
+				for (let i = fallbackStartIndex; i < modelList.length; i++) {
 					const nextModel = modelList[i];
+					if (
+						!admitConcreteCodexModel(
+							account,
+							nextModel,
+							attemptAdmissionTracker,
+						)
+					) {
+						continue;
+					}
 					log.info(
 						`Model '${modelList[i - 1]}' unavailable/rate-limited on account ${account.name}, ` +
 							`retrying with: ${nextModel} (${i}/${modelList.length - 1})`,

@@ -10,7 +10,13 @@ import {
 import { CodexProvider } from "@better-ccflare/providers";
 import type { Account, RequestMeta } from "@better-ccflare/types";
 import * as usageCollectorModule from "../../usage-collector";
-import { proxyWithAccount, sanitizeInternalHeaders } from "../proxy-operations";
+import {
+	createContextAdmissionTracker,
+	createContextLengthExceededResponse,
+	proxyWithAccount,
+	sanitizeInternalHeaders,
+	selectAdmittedCodexModel,
+} from "../proxy-operations";
 import type { ProxyContext } from "../proxy-types";
 
 function makeCodexAccount(overrides: Partial<Account> = {}): Account {
@@ -110,6 +116,7 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 
 	afterEach(() => {
 		globalThis.fetch = originalFetch;
+		delete process.env.CCFLARE_CONTEXT_ADMISSION;
 	});
 
 	it("returns a synthetic token count without fetching or refreshing Codex", async () => {
@@ -490,6 +497,494 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 		expect(
 			fetchedRequest?.headers.get("x-better-ccflare-synthetic-status"),
 		).toBeNull();
+	});
+
+	it("skips an undersized Codex model before fetch and uses a larger mapped fallback", async () => {
+		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
+		let fetchedModel: string | null = null;
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const request = input instanceof Request ? input : new Request(input);
+			fetchedModel =
+				((await request.clone().json()) as { model?: string }).model ?? null;
+			return new Response(JSON.stringify({ ok: true }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		});
+		const collectorSpy = spyOn(
+			usageCollectorModule,
+			"getUsageCollector",
+		).mockReturnValue({
+			handleStart: mock(() => {}),
+			handleChunk: mock(() => {}),
+			handleEnd: mock(() => Promise.resolve()),
+		} as unknown as usageCollectorModule.UsageCollector);
+		try {
+			const bodyBuffer = new TextEncoder().encode(
+				JSON.stringify({
+					model: "claude-sonnet-4-5",
+					messages: [{ role: "user", content: "summary" }],
+					max_tokens: 50_000,
+				}),
+			).buffer;
+			const tracker = createContextAdmissionTracker(110_000, 50_000);
+			const result = await proxyWithAccount(
+				makeMessagesRequest(bodyBuffer, { "Content-Type": "application/json" }),
+				new URL("https://proxy.local/v1/messages"),
+				makeCodexAccount({
+					access_token: "access-token",
+					expires_at: Date.now() + 60 * 60 * 1000,
+					model_mappings: JSON.stringify({
+						sonnet: ["gpt-5.3-codex-spark", "gpt-5.6-sol"],
+					}),
+				}),
+				makeRequestMeta("/v1/messages"),
+				bodyBuffer,
+				() => undefined,
+				0,
+				makeProxyContext(),
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				false,
+				tracker,
+			);
+			await result?.text();
+			expect(fetchedModel).toBe("gpt-5.6-sol");
+			expect(tracker.rejectedCount).toBe(1);
+			expect(tracker.attemptedCount).toBe(1);
+			expect(tracker.requestedMaxOutputTokens).toBe(50_000);
+		} finally {
+			collectorSpy.mockRestore();
+		}
+	});
+
+	it("admission uses the provider's default for a family missing from partial account mappings", () => {
+		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
+		const tracker = createContextAdmissionTracker(250_000, 20_000);
+		const result = selectAdmittedCodexModel(
+			makeCodexAccount({
+				model_mappings: JSON.stringify({ haiku: "gpt-5.4-mini" }),
+			}),
+			"claude-sonnet-4-5",
+			tracker,
+		);
+		expect(result).toEqual({ admitted: false, model: null });
+		expect(tracker.rejectedCount).toBe(1);
+		expect(tracker.largestSafeLimit).toBe(258_400);
+	});
+
+	it("reserves the full forwarded max_tokens and reports the exact occupied total", async () => {
+		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
+		const tracker = createContextAdmissionTracker(220_000, 50_000);
+		const result = selectAdmittedCodexModel(
+			makeCodexAccount({
+				model_mappings: JSON.stringify({ sonnet: "gpt-5.4" }),
+			}),
+			"claude-sonnet-4-5",
+			tracker,
+		);
+		expect(result).toEqual({ admitted: false, model: null });
+		expect(tracker.requestedMaxOutputTokens).toBe(50_000);
+		expect(tracker.largestSafeLimit).toBe(258_400);
+		const response = createContextLengthExceededResponse(tracker);
+		expect(response.status).toBe(400);
+		expect(await response.json()).toEqual({
+			type: "error",
+			error: {
+				type: "invalid_request_error",
+				message: "prompt is too long: 270000 tokens > 258400 tokens",
+				code: "context_length_exceeded",
+			},
+		});
+	});
+
+	it("excludes count_tokens from admission", async () => {
+		const path = "/v1/messages/count_tokens";
+		const extraHeaders = {};
+		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
+		const fetchMock = mock(
+			async () =>
+				new Response(JSON.stringify({ ok: true }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+		);
+		globalThis.fetch = fetchMock;
+		const collectorSpy = spyOn(
+			usageCollectorModule,
+			"getUsageCollector",
+		).mockReturnValue({
+			handleStart: mock(() => {}),
+			handleChunk: mock(() => {}),
+			handleEnd: mock(() => Promise.resolve()),
+		} as unknown as usageCollectorModule.UsageCollector);
+		try {
+			const bodyBuffer = new TextEncoder().encode(
+				JSON.stringify({
+					model: "gpt-5.3-codex-spark",
+					messages: [{ role: "user", content: "synthetic" }],
+					max_tokens: 20_000,
+				}),
+			).buffer;
+			const tracker = createContextAdmissionTracker(300_000, 20_000);
+			const req = new Request(`https://proxy.local${path}`, {
+				method: "POST",
+				body: bodyBuffer,
+				headers: { "Content-Type": "application/json", ...extraHeaders },
+			});
+			const result = await proxyWithAccount(
+				req,
+				new URL(`https://proxy.local${path}`),
+				makeCodexAccount({
+					access_token: "access-token",
+					expires_at: Date.now() + 60 * 60 * 1000,
+				}),
+				makeRequestMeta(path),
+				bodyBuffer,
+				() => undefined,
+				0,
+				makeProxyContext(),
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				false,
+				tracker,
+			);
+			await result?.text();
+			expect(tracker.rejectedCount).toBe(0);
+			expect(tracker.attemptedCount).toBe(0);
+		} finally {
+			collectorSpy.mockRestore();
+		}
+	});
+
+	it.each([
+		["x-better-ccflare-keepalive", "true"],
+		["x-better-ccflare-keepalive", "false"],
+		["x-better-ccflare-auto-refresh", "true"],
+		["x-better-ccflare-auto-refresh", "false"],
+	])("does not let client header %s=%s bypass admission", async (header, value) => {
+		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
+		const fetchMock = mock(async () => {
+			throw new Error("capacity rejection must happen before fetch");
+		});
+		globalThis.fetch = fetchMock;
+		const bodyBuffer = new TextEncoder().encode(
+			JSON.stringify({
+				model: "gpt-5.3-codex-spark",
+				messages: [{ role: "user", content: "internal-looking" }],
+				max_tokens: 20_000,
+			}),
+		).buffer;
+		const tracker = createContextAdmissionTracker(120_000, 20_000);
+		const result = await proxyWithAccount(
+			makeMessagesRequest(bodyBuffer, {
+				"Content-Type": "application/json",
+				[header]: value,
+			}),
+			new URL("https://proxy.local/v1/messages"),
+			makeCodexAccount({
+				access_token: "access-token",
+				expires_at: Date.now() + 60 * 60 * 1000,
+			}),
+			makeRequestMeta("/v1/messages"),
+			bodyBuffer,
+			() => undefined,
+			0,
+			makeProxyContext(),
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			false,
+			tracker,
+		);
+		expect(result).toBeNull();
+		expect(fetchMock).toHaveBeenCalledTimes(0);
+		expect(tracker.rejectedCount).toBe(1);
+		expect(tracker.attemptedCount).toBe(0);
+	});
+
+	it("excludes max_tokens zero cache-prewarm requests from admission", async () => {
+		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
+		const fetchMock = mock(async () => {
+			throw new Error("subscription prewarm should remain a local response");
+		});
+		globalThis.fetch = fetchMock;
+		const bodyBuffer = new TextEncoder().encode(
+			JSON.stringify({
+				model: "gpt-5.3-codex-spark",
+				messages: [{ role: "user", content: "prewarm" }],
+				max_tokens: 0,
+			}),
+		).buffer;
+		const tracker = createContextAdmissionTracker(300_000, 0);
+		const collectorSpy = spyOn(
+			usageCollectorModule,
+			"getUsageCollector",
+		).mockReturnValue({
+			handleStart: mock(() => {}),
+			handleChunk: mock(() => {}),
+			handleEnd: mock(() => Promise.resolve()),
+		} as unknown as usageCollectorModule.UsageCollector);
+		const result = await proxyWithAccount(
+			makeMessagesRequest(bodyBuffer, { "Content-Type": "application/json" }),
+			new URL("https://proxy.local/v1/messages"),
+			makeCodexAccount({
+				access_token: "access-token",
+				expires_at: Date.now() + 60 * 60 * 1000,
+			}),
+			makeRequestMeta("/v1/messages"),
+			bodyBuffer,
+			() => undefined,
+			0,
+			makeProxyContext(),
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			false,
+			tracker,
+		);
+		try {
+			expect(result?.status).toBe(400);
+			expect(fetchMock).toHaveBeenCalledTimes(0);
+			expect(tracker.rejectedCount).toBe(0);
+			expect(tracker.attemptedCount).toBe(0);
+		} finally {
+			collectorSpy.mockRestore();
+		}
+	});
+
+	it("preserves later mapped fallback traversal after preselecting the first safe model", async () => {
+		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
+		const fetchedModels: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const request = input instanceof Request ? input : new Request(input);
+			const model = ((await request.clone().json()) as { model: string }).model;
+			fetchedModels.push(model);
+			if (model === "gpt-5.4") {
+				return new Response(
+					JSON.stringify({ error: { code: "model_not_found" } }),
+					{
+						status: 429,
+						headers: { "content-type": "application/json" },
+					},
+				);
+			}
+			return new Response(JSON.stringify({ ok: true }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		});
+		const collectorSpy = spyOn(
+			usageCollectorModule,
+			"getUsageCollector",
+		).mockReturnValue({
+			handleStart: mock(() => {}),
+			handleChunk: mock(() => {}),
+			handleEnd: mock(() => Promise.resolve()),
+		} as unknown as usageCollectorModule.UsageCollector);
+		try {
+			const bodyBuffer = new TextEncoder().encode(
+				JSON.stringify({
+					model: "claude-sonnet-4-5",
+					messages: [{ role: "user", content: "fallback" }],
+					max_tokens: 20_000,
+				}),
+			).buffer;
+			const tracker = createContextAdmissionTracker(110_000, 20_000);
+			const result = await proxyWithAccount(
+				makeMessagesRequest(bodyBuffer, { "Content-Type": "application/json" }),
+				new URL("https://proxy.local/v1/messages"),
+				makeCodexAccount({
+					access_token: "access-token",
+					expires_at: Date.now() + 60 * 60 * 1000,
+					model_mappings: JSON.stringify({
+						sonnet: ["gpt-5.3-codex-spark", "gpt-5.4", "gpt-5.6-sol"],
+					}),
+				}),
+				makeRequestMeta("/v1/messages"),
+				bodyBuffer,
+				() => undefined,
+				0,
+				makeProxyContext(),
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				false,
+				tracker,
+			);
+			await result?.text();
+			expect(fetchedModels).toEqual(["gpt-5.4", "gpt-5.6-sol"]);
+			expect(tracker.rejectedCount).toBe(1);
+		} finally {
+			collectorSpy.mockRestore();
+		}
+	});
+
+	it("fails open for unknown Codex capacity", async () => {
+		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
+		const fetchMock = mock(
+			async () =>
+				new Response(JSON.stringify({ ok: true }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+		);
+		globalThis.fetch = fetchMock;
+		const collectorSpy = spyOn(
+			usageCollectorModule,
+			"getUsageCollector",
+		).mockReturnValue({
+			handleStart: mock(() => {}),
+			handleChunk: mock(() => {}),
+			handleEnd: mock(() => Promise.resolve()),
+		} as unknown as usageCollectorModule.UsageCollector);
+		try {
+			const bodyBuffer = new TextEncoder().encode(
+				JSON.stringify({
+					model: "unknown-codex-model",
+					messages: [{ role: "user", content: "summarize this conversation" }],
+					max_tokens: 10,
+				}),
+			).buffer;
+			const tracker = createContextAdmissionTracker(999_999, 10);
+			const result = await proxyWithAccount(
+				makeMessagesRequest(bodyBuffer, { "Content-Type": "application/json" }),
+				new URL("https://proxy.local/v1/messages"),
+				makeCodexAccount({
+					access_token: "access-token",
+					expires_at: Date.now() + 60 * 60 * 1000,
+				}),
+				makeRequestMeta("/v1/messages"),
+				bodyBuffer,
+				() => undefined,
+				0,
+				makeProxyContext(),
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				false,
+				tracker,
+			);
+			await result?.text();
+			expect(fetchMock).toHaveBeenCalledTimes(1);
+			expect(tracker.rejectedCount).toBe(0);
+		} finally {
+			collectorSpy.mockRestore();
+		}
+	});
+
+	it("leaves behavior unchanged when context admission is off", async () => {
+		const fetchMock = mock(
+			async () =>
+				new Response(JSON.stringify({ ok: true }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+		);
+		globalThis.fetch = fetchMock;
+		const collectorSpy = spyOn(
+			usageCollectorModule,
+			"getUsageCollector",
+		).mockReturnValue({
+			handleStart: mock(() => {}),
+			handleChunk: mock(() => {}),
+			handleEnd: mock(() => Promise.resolve()),
+		} as unknown as usageCollectorModule.UsageCollector);
+		try {
+			const bodyBuffer = new TextEncoder().encode(
+				JSON.stringify({
+					model: "gpt-5.3-codex-spark",
+					messages: [{ role: "user", content: "hello" }],
+					max_tokens: 20_000,
+				}),
+			).buffer;
+			const tracker = createContextAdmissionTracker(200_000, 20_000);
+			const result = await proxyWithAccount(
+				makeMessagesRequest(bodyBuffer, { "Content-Type": "application/json" }),
+				new URL("https://proxy.local/v1/messages"),
+				makeCodexAccount({
+					access_token: "access-token",
+					expires_at: Date.now() + 60 * 60 * 1000,
+				}),
+				makeRequestMeta("/v1/messages"),
+				bodyBuffer,
+				() => undefined,
+				0,
+				makeProxyContext(),
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				false,
+				tracker,
+			);
+			await result?.text();
+			expect(fetchMock).toHaveBeenCalledTimes(1);
+			expect(tracker.rejectedCount).toBe(0);
+		} finally {
+			collectorSpy.mockRestore();
+		}
+	});
+
+	it("rejects every undersized candidate without cooldown or account mutation", () => {
+		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
+		const account = makeCodexAccount({
+			model_mappings: JSON.stringify({
+				sonnet: ["gpt-5.3-codex-spark", "gpt-5.4"],
+			}),
+		});
+		const tracker = createContextAdmissionTracker(300_000, 20_000);
+		const result = selectAdmittedCodexModel(
+			account,
+			"claude-sonnet-4-5",
+			tracker,
+		);
+		expect(result).toEqual({ admitted: false, model: null });
+		expect(tracker.rejectedCount).toBe(2);
+		expect(tracker.attemptedCount).toBe(0);
+		expect(tracker.largestSafeLimit).toBe(258_400);
+		expect(account.rate_limited_until).toBeNull();
+		expect(account.consecutive_rate_limits).toBe(0);
+	});
+
+	it("preserves a meaningful attempted failure over later capacity skips", () => {
+		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
+		const tracker = createContextAdmissionTracker(300_000, 20_000);
+		tracker.attemptedCount = 1;
+		const result = selectAdmittedCodexModel(
+			makeCodexAccount({
+				model_mappings: JSON.stringify({ sonnet: "gpt-5.4" }),
+			}),
+			"claude-sonnet-4-5",
+			tracker,
+		);
+		expect(result.admitted).toBeFalse();
+		expect(tracker.rejectedCount).toBe(1);
+		expect(tracker.attemptedCount).toBe(1);
+	});
+
+	it("builds the exact pre-stream Anthropic context error using the largest safe limit", async () => {
+		const tracker = createContextAdmissionTracker(360_000, 50_000);
+		tracker.rejectedCount = 2;
+		tracker.largestSafeLimit = 353_400;
+		const response = createContextLengthExceededResponse(tracker);
+		expect(response.status).toBe(400);
+		expect(await response.json()).toEqual({
+			type: "error",
+			error: {
+				type: "invalid_request_error",
+				message: "prompt is too long: 410000 tokens > 353400 tokens",
+				code: "context_length_exceeded",
+			},
+		});
 	});
 
 	it("strips every internal transport header from passthrough headers", () => {

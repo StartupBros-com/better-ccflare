@@ -14,6 +14,8 @@ export {
 	isRewriteTargetServable,
 } from "./agent-interceptor";
 export {
+	createContextAdmissionTracker,
+	createContextLengthExceededResponse,
 	createPoolExhaustedResponse,
 	proxyUnauthenticated,
 	proxyWithAccount,

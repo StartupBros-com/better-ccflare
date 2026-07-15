@@ -17,6 +17,7 @@
 		"typecheck": "bunx tsc --noEmit",
 		"test": "bun test",
 		"test:cli": "bun test apps/cli/__tests__",
+		"test:compat:claude-2.1.207": "bun test tests/compat/claude-code-2.1.207/reactive-compaction.test.ts",
 		"build": "echo \"🏗️  Building better-ccflare v$(node -p \"require('./package.json').version\")\" && bun run build:dashboard && bun run build:cli",
 		"build:dashboard": "bun run --cwd packages/dashboard-web build",
 		"build:cli": "bun run --cwd apps/cli build",
