@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ideation: Native Grok Cache Routing</title>
+  <style>
+    :root{--bg:#0b1020;--panel:#11182b;--panel2:#17213a;--text:#e8edf7;--muted:#aab5ca;--line:#2c3958;--accent:#72d4c5;--accent2:#91b7ff;--warn:#ffc978;--good:#8de2aa;--bad:#ff9a9a;--code:#0a0f1d}*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:linear-gradient(180deg,#09101e,#0d1424 42%,#0b1020);color:var(--text);font:15px/1.65 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}main,header,footer{width:min(940px,calc(100% - 32px));margin-inline:auto}header{padding:64px 0 30px}h1{font-size:clamp(2rem,6vw,3.5rem);line-height:1.05;letter-spacing:-.04em;margin:.2rem 0 1rem;max-width:15ch}h2{font-size:1.55rem;letter-spacing:-.02em;margin:0 0 1.1rem}h3{font-size:1.3rem;line-height:1.25;margin:.25rem 0 1rem}p{max-width:74ch}a{color:var(--accent2);text-decoration-thickness:1px;text-underline-offset:3px}code{font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--code);padding:.12rem .35rem;border-radius:5px;color:#d8e4ff}.eyebrow{color:var(--accent);font-weight:750;text-transform:uppercase;letter-spacing:.15em;font-size:.72rem}.dek{font-size:1.1rem;color:var(--muted);max-width:69ch}.meta,.stats,.chips{display:flex;flex-wrap:wrap;gap:10px}.pill{padding:.35rem .65rem;border:1px solid var(--line);border-radius:999px;background:#15203a;color:#cad5e8;font-size:.8rem}.stats{margin-top:28px}.stat{flex:1;min-width:150px;padding:16px;border:1px solid var(--line);border-radius:14px;background:rgba(17,24,43,.75)}.stat b{display:block;font-size:1.65rem;line-height:1.1;color:var(--accent)}nav{margin:24px 0 34px;padding:14px 18px;border:1px solid var(--line);border-radius:14px;background:rgba(17,24,43,.7)}nav ul,.jump{display:flex;flex-wrap:wrap;gap:8px 18px;margin:0;padding:0;list-style:none}section{margin:30px 0;padding:26px;border:1px solid var(--line);border-radius:18px;background:rgba(17,24,43,.82);box-shadow:0 16px 50px rgba(0,0,0,.18)}.ground-grid,.axis-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}.note,.axis{padding:15px;border-radius:12px;background:var(--panel2);border:1px solid #334264}.axis strong{color:var(--accent2)}.idea{margin:24px 0;padding:24px;border:1px solid #354466;border-radius:16px;background:#121b31}.idea:first-of-type{border-color:#4d857d;background:#12222d}.rank{display:inline-grid;place-items:center;width:34px;height:34px;border-radius:50%;background:#20463f;color:#b8fff1;font-weight:800;margin-right:8px}.idea dl{display:grid;grid-template-columns:110px 1fr;gap:8px 16px;margin:18px 0}.idea dt{font-size:.72rem;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);font-weight:750}.idea dd{margin:0}.confidence{color:var(--good)}.diagram{margin:20px 0;padding:16px;border:1px solid var(--line);border-radius:14px;background:#0d1425;overflow-x:auto}.diagram svg{display:block;min-width:680px;width:100%;height:auto}.diagram text{font-family:Inter,ui-sans-serif,system-ui;fill:var(--text)}.diagram .muted{fill:var(--muted)}.diagram .box{fill:#17213a;stroke:#53698e;stroke-width:1.5}.diagram .hot{fill:#183b37;stroke:#72d4c5;stroke-width:2}.diagram .warn{fill:#3b2d1b;stroke:#ffc978;stroke-width:1.5}.diagram .line{stroke:#91b7ff;stroke-width:2;fill:none}.diagram .dash{stroke:#7887a5;stroke-width:2;stroke-dasharray:7 6;fill:none}.caption{color:var(--muted);font-size:.84rem;margin:.5rem 0 0}.trade{padding:14px;border-radius:12px;background:#2a2023;color:#f4c9c9;border:1px solid #594047}.basis{padding:14px;border-radius:12px;background:#14263a;color:#d4e5fa;border:1px solid #29445f}.rejections{width:100%;border-collapse:collapse;font-size:.9rem}.rejections th,.rejections td{text-align:left;vertical-align:top;padding:10px;border-bottom:1px solid var(--line)}.rejections th{color:var(--accent);font-size:.72rem;text-transform:uppercase;letter-spacing:.08em}.sequence{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;align-items:stretch}.sequence div{padding:11px 8px;border-radius:10px;background:var(--panel2);border:1px solid var(--line);font-size:.78rem;text-align:center}.sequence div:first-child{background:#183b37;border-color:#72d4c5}.callout{padding:18px;border-radius:14px;background:#17302d;border:1px solid #39766e;color:#d9fff8}footer{padding:22px 0 52px;color:var(--muted);font-size:.8rem}@media(max-width:650px){header{padding-top:38px}section{padding:18px}.idea{padding:18px}.idea dl{grid-template-columns:1fr;gap:3px}.idea dt{margin-top:8px}.sequence{grid-template-columns:1fr 1fr}.rejections{display:block;overflow-x:auto}}
+  </style>
+</head>
+<body>
+<header>
+  <div class="eyebrow">Deep ideation · Provider routing</div>
+  <h1>Native Grok Cache Routing</h1>
+  <p class="dek">A ranked set of directions for turning better-ccflare's xAI integration from a generic Chat Completions adapter into a cache-aware, measurable, continuity-safe Grok route.</p>
+  <div class="meta">
+    <span class="pill">Date: <time datetime="2026-07-15">2026-07-15</time></span>
+    <span class="pill">Topic: native-grok-cache-routing</span>
+    <span class="pill">Mode: repo-grounded</span>
+    <span class="pill">Depth: go deep</span>
+  </div>
+  <p><strong>Focus:</strong> Use the local fork's Codex routing lessons to optimize Grok caching and make it native, including selective Claude Code binary analysis where it changes the design.</p>
+  <div class="stats">
+    <div class="stat"><b>48</b>raw ideas</div>
+    <div class="stat"><b>22</b>deduplicated candidates</div>
+    <div class="stat"><b>6</b>survivors</div>
+    <div class="stat"><b>5</b>topic axes covered</div>
+  </div>
+</header>
+<main>
+<nav aria-label="Document navigation"><ul><li><a href="#grounding-context">Grounding Context</a></li><li><a href="#topic-axes">Topic Axes</a></li><li><a href="#ranked-ideas">Ranked Ideas</a></li><li><a href="#rejection-summary">Rejection Summary</a></li></ul></nav>
+
+<section id="grounding-context">
+  <div class="eyebrow">Evidence before direction</div>
+  <h2>Grounding Context</h2>
+  <div class="ground-grid">
+    <div class="note"><strong>Current xAI path</strong><p><code>XaiProvider</code> is a thin generic adapter: Messages becomes Chat Completions, every Claude family defaults to <code>grok-4.3</code>, and the only post-conversion specialization requests streaming usage. It emits no native Grok affinity identifier.</p></div>
+    <div class="note"><strong>Codex precedent</strong><p>The fork already derives conversation-partitioned <code>prompt_cache_key</code> values, gates them by real endpoint, traces cache outcomes, runs pacing canaries, and correctly separates cached from uncached input usage.</p></div>
+    <div class="note"><strong>Routing mismatch</strong><p>Session affinity can pin a Claude client session to an account and restore it after temporary failover, but force-route can silently fall back. Account locality and provider-native cache identity are not one contract.</p></div>
+    <div class="note"><strong>xAI native behavior</strong><p>xAI documents automatic exact-prefix caching. Chat Completions uses <code>x-grok-conv-id</code>; Responses uses <code>prompt_cache_key</code>. Chat continuation requires unchanged <code>reasoning_content</code>, and cached tokens have protocol-specific usage paths.</p></div>
+    <div class="note"><strong>Prefix risk</strong><p>The shared conversion path does not provide a versioned Grok prefix contract. Tool ordering, schema representation, compaction, session resume, reasoning replay, model fallback, and proxy mutations can each change a cacheable prefix.</p></div>
+    <div class="note"><strong>Forensic leverage</strong><p>Claude Code 2.1.207 and older local binaries are available for differential inspection, and the repo already contains compaction compatibility work. This can become a sanitized fixture corpus without scripted traffic to real Anthropic accounts.</p></div>
+  </div>
+  <p class="callout"><strong>Central finding:</strong> the immediate gap is not speculative cache tuning. The official xAI Chat affinity mechanism is documented, yet better-ccflare does not emit it or verify its cached-token result. The highest-value first move is therefore a narrow end-to-end proof, instrumented from day one.</p>
+</section>
+
+<section id="topic-axes">
+  <div class="eyebrow">Surface map</div>
+  <h2>Topic Axes</h2>
+  <div class="axis-grid">
+    <div class="axis"><strong>1. Native affinity and account locality</strong><br>One conversation identity, native Grok placement, and an explicit cache-owning account.</div>
+    <div class="axis"><strong>2. Exact-prefix fidelity</strong><br>Stable provider-visible request structure across turns, Claude releases, resume, and compaction.</div>
+    <div class="axis"><strong>3. Grok protocol adaptation</strong><br>Chat versus Responses, reasoning history, tools, native fields, and endpoint capabilities.</div>
+    <div class="axis"><strong>4. Cache observability</strong><br>Correct cached-token accounting, causal traces, controlled cohorts, and unknown-state handling.</div>
+    <div class="axis"><strong>5. Failover and continuation</strong><br>Warm ownership, cold migration, sticky restoration, partial streams, and explicit cache epochs.</div>
+  </div>
+</section>
+
+<section id="ranked-ideas">
+  <div class="eyebrow">Ranked survivors</div>
+  <h2>Ranked Ideas</h2>
+  <ul class="jump">
+    <li><a href="#idea-1">1. Vertical Slice</a></li><li><a href="#idea-2">2. Flight Recorder</a></li><li><a href="#idea-3">3. Compatibility Lab</a></li><li><a href="#idea-4">4. Lineage State Machine</a></li><li><a href="#idea-5">5. Responses Route</a></li><li><a href="#idea-6">6. Compaction Epochs</a></li>
+  </ul>
+
+  <article class="idea" id="idea-1">
+    <h3><span class="rank">1</span>Grok Cache-Native Vertical Slice</h3>
+    <p><strong>Description:</strong> Ship the smallest coherent native cache path on official xAI Chat: derive a privacy-safe conversation identity using the Codex conversation-partitioning lesson, attach it as <code>x-grok-conv-id</code>, bind it to the selected xAI account, and prove streaming and non-streaming <code>cached_tokens</code> translation with fixtures. Record native ID hash, serving account, prefix fingerprint, and cache outcome from the first canary. Keep custom endpoints gated off until capability is verified.</p>
+    <div class="diagram" aria-label="Vertical slice flow">
+      <svg viewBox="0 0 820 190" role="img">
+        <defs><marker id="arrow1" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#91b7ff"/></marker></defs>
+        <rect class="box" x="20" y="54" rx="12" width="135" height="72"/><text x="87" y="83" text-anchor="middle" font-size="14">Claude request</text><text class="muted" x="87" y="105" text-anchor="middle" font-size="12">session + seed</text>
+        <rect class="hot" x="185" y="42" rx="12" width="170" height="96"/><text x="270" y="76" text-anchor="middle" font-size="14">Conversation identity</text><text class="muted" x="270" y="99" text-anchor="middle" font-size="12">hash + partition</text><text class="muted" x="270" y="119" text-anchor="middle" font-size="12">account owner</text>
+        <rect class="box" x="385" y="54" rx="12" width="155" height="72"/><text x="462" y="83" text-anchor="middle" font-size="14">xAI Chat</text><text class="muted" x="462" y="105" text-anchor="middle" font-size="12">x-grok-conv-id</text>
+        <rect class="box" x="570" y="54" rx="12" width="105" height="72"/><text x="622" y="83" text-anchor="middle" font-size="14">Grok</text><text class="muted" x="622" y="105" text-anchor="middle" font-size="12">prefix cache</text>
+        <rect class="box" x="705" y="54" rx="12" width="95" height="72"/><text x="752" y="83" text-anchor="middle" font-size="14">Trace</text><text class="muted" x="752" y="105" text-anchor="middle" font-size="12">cached tokens</text>
+        <path class="line" marker-end="url(#arrow1)" d="M155 90H181"/><path class="line" marker-end="url(#arrow1)" d="M355 90H381"/><path class="line" marker-end="url(#arrow1)" d="M540 90H566"/><path class="line" marker-end="url(#arrow1)" d="M675 90H701"/>
+      </svg>
+      <p class="caption">One end-to-end path proves identity, locality, native transport, and measurement together.</p>
+    </div>
+    <dl><dt>Axis</dt><dd>Native affinity and account locality</dd><dt>Basis</dt><dd class="basis"><strong>direct:</strong> <code>packages/providers/src/providers/xai/provider.ts</code> has no Grok cache identity, while <code>packages/providers/src/providers/codex/provider.ts</code> already derives stable per-conversation keys and <code>session-affinity.ts</code> already models account locality. <strong>external:</strong> xAI documents <code>x-grok-conv-id</code> for Chat.</dd><dt>Rationale</dt><dd>This is the fastest route from documented provider capability to falsifiable production value. It avoids building generalized scheduling or protocol infrastructure before native mechanics are proven.</dd><dt>Downsides</dt><dd class="trade">Conversation partitioning must be specified carefully, official endpoint gating is required, and a useful hit-rate experiment needs enough repeated-prefix traffic. It does not yet solve compaction, Responses, or complex failover.</dd><dt>Confidence</dt><dd class="confidence">94%</dd><dt>Complexity</dt><dd>Medium</dd></dl>
+  </article>
+
+  <article class="idea" id="idea-2">
+    <h3><span class="rank">2</span>Grok Cache Flight Recorder and Experiment Plane</h3>
+    <p><strong>Description:</strong> Generalize the narrow, proven parts of the Codex cache trace into a provider-neutral event model, with Grok as the second implementation. Record conversation hash, native affinity hash, serving account, protocol, model, prefix-component fingerprints, cache epoch, cached and uncached tokens, first-token latency, failover state, and whether telemetry is absent rather than zero. Support deterministic conversation-level cohorts for affinity on/off, prefix variants, and later Chat versus Responses comparisons.</p>
+    <div class="diagram" aria-label="Cache diagnosis dimensions">
+      <svg viewBox="0 0 820 235" role="img">
+        <rect class="hot" x="305" y="80" rx="14" width="210" height="80"/><text x="410" y="112" text-anchor="middle" font-size="15">Cache outcome</text><text class="muted" x="410" y="137" text-anchor="middle" font-size="12">hit · miss · unknown</text>
+        <rect class="box" x="30" y="24" rx="10" width="170" height="58"/><text x="115" y="59" text-anchor="middle" font-size="13">Identity changed?</text>
+        <rect class="box" x="30" y="154" rx="10" width="170" height="58"/><text x="115" y="189" text-anchor="middle" font-size="13">Account moved?</text>
+        <rect class="box" x="620" y="24" rx="10" width="170" height="58"/><text x="705" y="59" text-anchor="middle" font-size="13">Prefix diverged?</text>
+        <rect class="box" x="620" y="154" rx="10" width="170" height="58"/><text x="705" y="189" text-anchor="middle" font-size="13">Protocol changed?</text>
+        <path class="dash" d="M200 53L305 103"/><path class="dash" d="M200 183L305 137"/><path class="dash" d="M620 53L515 103"/><path class="dash" d="M620 183L515 137"/>
+      </svg>
+      <p class="caption">The recorder turns one cache percentage into causal dimensions an operator can act on.</p>
+    </div>
+    <dl><dt>Axis</dt><dd>Cache observability and experimentation</dd><dt>Basis</dt><dd class="basis"><strong>direct:</strong> Codex already has JSONL traces, HMAC fingerprints, pacing canaries, and cohort analysis; shared request storage already separates cache-read and uncached input. xAI currently relies on the generic <code>cached_tokens</code> path, with no xAI-specific fixture or diagnosis.</dd><dt>Rationale</dt><dd>Every later optimization depends on distinguishing identity drift, account drift, prefix mutation, protocol change, and unavailable telemetry. This idea compounds by making both successful and failed experiments durable knowledge.</dd><dt>Downsides</dt><dd class="trade">Trace schemas can grow into a second analytics system. Privacy-safe fingerprinting, sampling, storage bounds, and statistical minimums need discipline. The first iteration should stay Grok-focused rather than redesign every provider.</dd><dt>Confidence</dt><dd class="confidence">91%</dd><dt>Complexity</dt><dd>Medium</dd></dl>
+  </article>
+
+  <article class="idea" id="idea-3">
+    <h3><span class="rank">3</span>Claude-to-Grok Cache Compatibility Lab</h3>
+    <p><strong>Description:</strong> Turn binary analysis into a bounded compatibility system, not an open-ended reverse-engineering project. Differentially inspect installed Claude Code versions and generate sanitized fixtures for normal turns, tools, sibling agents, subagents, resume, and compaction. Replay them through a versioned Grok Prefix ABI at the incoming Claude request, normalized representation, and final Grok wire stages; add a protocol capability matrix for official xAI Chat, official Responses, and unverified custom endpoints.</p>
+    <div class="diagram" aria-label="Compatibility lab stages">
+      <svg viewBox="0 0 820 205" role="img">
+        <defs><marker id="arrow3" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#91b7ff"/></marker></defs>
+        <rect class="box" x="20" y="55" rx="12" width="150" height="80"/><text x="95" y="86" text-anchor="middle" font-size="14">Claude versions</text><text class="muted" x="95" y="109" text-anchor="middle" font-size="12">sanitized captures</text>
+        <rect class="hot" x="215" y="38" rx="12" width="180" height="114"/><text x="305" y="72" text-anchor="middle" font-size="14">Versioned Prefix ABI</text><text class="muted" x="305" y="98" text-anchor="middle" font-size="12">input fingerprint</text><text class="muted" x="305" y="119" text-anchor="middle" font-size="12">normalized fingerprint</text><text class="muted" x="305" y="140" text-anchor="middle" font-size="12">wire fingerprint</text>
+        <rect class="box" x="440" y="55" rx="12" width="150" height="80"/><text x="515" y="86" text-anchor="middle" font-size="14">Protocol fixtures</text><text class="muted" x="515" y="109" text-anchor="middle" font-size="12">Chat · Responses</text>
+        <rect class="warn" x="635" y="55" rx="12" width="165" height="80"/><text x="717" y="86" text-anchor="middle" font-size="14">Compatibility gate</text><text class="muted" x="717" y="109" text-anchor="middle" font-size="12">intentional drift only</text>
+        <path class="line" marker-end="url(#arrow3)" d="M170 95H211"/><path class="line" marker-end="url(#arrow3)" d="M395 95H436"/><path class="line" marker-end="url(#arrow3)" d="M590 95H631"/>
+      </svg>
+      <p class="caption">Binary evidence becomes reusable fixtures, then a release gate for cache-relevant drift.</p>
+    </div>
+    <dl><dt>Axis</dt><dd>Exact-prefix fidelity and Claude Code request stability</dd><dt>Basis</dt><dd class="basis"><strong>direct:</strong> local Claude Code 2.1.207 and older binaries are available; compaction compatibility work already exists; the xAI test suite omits tools, reasoning, images, cache controls, unsupported parameters, and exact-prefix stability. <strong>external:</strong> xAI exact-prefix behavior and community cache-fix work make structural stability load-bearing.</dd><dt>Rationale</dt><dd>The lab converts one-time forensics into a compounding release corpus. It also prevents unsafe canonicalization by requiring every normalization to prove semantic equivalence against observed Claude behavior.</dd><dt>Downsides</dt><dd class="trade">Capturing behavior without real Anthropic calls requires careful local stubbing and fixture design. Binary formats can change, and the lab must not become an obligation to support every historical Claude release.</dd><dt>Confidence</dt><dd class="confidence">87%</dd><dt>Complexity</dt><dd>High</dd></dl>
+  </article>
+
+  <article class="idea" id="idea-4">
+    <h3><span class="rank">4</span>Cache Lineage State Machine</h3>
+    <p><strong>Description:</strong> Replace invisible best-effort cache continuity with explicit lineage states: warm owner, temporarily displaced, restored, cold migrated, and indeterminate after a partial stream. Offer bounded policies such as <code>strict</code>, <code>restore</code>, and <code>migrate</code>. Every transition states which account owns the lineage, whether native identity can be retained, whether the request is safe to retry, whether reasoning and tools are acknowledged, and what the operator sees.</p>
+    <div class="diagram" aria-label="Cache lineage states">
+      <svg viewBox="0 0 820 250" role="img">
+        <defs><marker id="arrow4" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#91b7ff"/></marker></defs>
+        <rect class="hot" x="35" y="82" rx="12" width="130" height="68"/><text x="100" y="111" text-anchor="middle" font-size="14">Warm owner</text><text class="muted" x="100" y="132" text-anchor="middle" font-size="12">account A</text>
+        <rect class="warn" x="230" y="30" rx="12" width="150" height="68"/><text x="305" y="60" text-anchor="middle" font-size="14">Displaced</text><text class="muted" x="305" y="81" text-anchor="middle" font-size="12">wait budget</text>
+        <rect class="box" x="455" y="30" rx="12" width="130" height="68"/><text x="520" y="60" text-anchor="middle" font-size="14">Restored</text><text class="muted" x="520" y="81" text-anchor="middle" font-size="12">account A</text>
+        <rect class="box" x="455" y="154" rx="12" width="145" height="68"/><text x="527" y="184" text-anchor="middle" font-size="14">Cold migrated</text><text class="muted" x="527" y="205" text-anchor="middle" font-size="12">new lineage, B</text>
+        <rect class="warn" x="665" y="91" rx="12" width="125" height="68"/><text x="727" y="121" text-anchor="middle" font-size="14">Indeterminate</text><text class="muted" x="727" y="142" text-anchor="middle" font-size="12">partial stream</text>
+        <path class="line" marker-end="url(#arrow4)" d="M165 103C192 90 198 72 226 68"/><path class="line" marker-end="url(#arrow4)" d="M380 64H451"/><path class="line" marker-end="url(#arrow4)" d="M340 98C377 131 405 169 451 184"/><path class="line" marker-end="url(#arrow4)" d="M600 188C634 180 646 155 665 144"/><path class="dash" marker-end="url(#arrow4)" d="M165 136C330 245 520 240 665 150"/>
+      </svg>
+      <p class="caption">Availability becomes an explicit continuity decision instead of a silent cache break.</p>
+    </div>
+    <dl><dt>Axis</dt><dd>Failover, continuation, and operational cache semantics</dd><dt>Basis</dt><dd class="basis"><strong>direct:</strong> account and model retries can move a request; session affinity preserves the original mapping after temporary failover; force-route can fall back; a started stream cannot transparently move. <strong>external:</strong> xAI Chat continuation depends on exact reasoning history.</dd><dt>Rationale</dt><dd>The proxy currently optimizes the next request while hiding the state cost to the rest of the agentic conversation. Explicit lineage semantics let availability and cache continuity become intentional policy choices.</dd><dt>Downsides</dt><dd class="trade">This changes observable routing behavior and may trade availability for continuity in strict mode. It cannot guarantee prevention of external tool duplication after an ambiguous partial response, so acknowledged boundaries must remain conservative.</dd><dt>Confidence</dt><dd class="confidence">84%</dd><dt>Complexity</dt><dd>High</dd></dl>
+  </article>
+
+  <article class="idea" id="idea-5">
+    <h3><span class="rank">5</span>Native Grok Responses Route</h3>
+    <p><strong>Description:</strong> Add a first-class official-xAI Responses path using the existing Responses adapter foundation, with <code>prompt_cache_key</code>, native usage mapping, reasoning and tool conformance fixtures, and protocol pinning for the life of a cache epoch. Keep Chat as the established baseline and as the compatibility path for custom endpoints. Compare matched cohorts only after the Chat vertical slice and recorder are trustworthy.</p>
+    <dl><dt>Axis</dt><dd>Grok protocol adaptation</dd><dt>Basis</dt><dd class="basis"><strong>direct:</strong> xAI currently routes only through Chat Completions, while the monorepo already has a Responses adapter and Codex demonstrates a production Responses conversion. <strong>external:</strong> xAI exposes <code>prompt_cache_key</code> for Responses and a different native identifier for Chat.</dd><dt>Rationale</dt><dd>Responses may offer cleaner native continuation and cache control than indefinite Chat emulation. Keeping both paths creates a measured protocol portfolio rather than a risky one-way migration.</dd><dt>Downsides</dt><dd class="trade">High conformance burden across tools, reasoning, images, stream events, usage, and custom endpoints. Protocol switching mid-conversation must be forbidden or treated as a cold epoch. This should not precede a measured Chat baseline.</dd><dt>Confidence</dt><dd class="confidence">79%</dd><dt>Complexity</dt><dd>High</dd></dl>
+  </article>
+
+  <article class="idea" id="idea-6">
+    <h3><span class="rank">6</span>Compaction-Aware Cache Epochs</h3>
+    <p><strong>Description:</strong> Detect reliably supported Claude Code compaction and resume boundaries, mark them as cache epochs, and classify the resulting prefix rewrite separately from ordinary misses. Rotate native identity only when evidence shows an epoch represents a different cache lineage, not simply because a compaction marker exists. Use the compatibility lab to compare versions and identify which stable prefix portions, if any, survive.</p>
+    <dl><dt>Axis</dt><dd>Exact-prefix fidelity and lifecycle</dd><dt>Basis</dt><dd class="basis"><strong>direct:</strong> the repository has Claude Code 2.1.207 compaction compatibility evidence and preserves the pre-transform request body; multiple local CLI versions permit differential study. <strong>external:</strong> compaction and resume are recurring exact-prefix breakpoints in Claude Code cache investigations.</dd><dt>Rationale</dt><dd>Compaction happens when prompts are large and misses are expensive. Explicit epochs make legitimate rewrites visible and prevent them from contaminating measurements of proxy-induced drift.</dd><dt>Downsides</dt><dd class="trade">The current evidence does not yet prove a reliable cross-version boundary signal. Premature key rotation could discard useful cache locality, so this remains research-led and ranks below the core path.</dd><dt>Confidence</dt><dd class="confidence">68%</dd><dt>Complexity</dt><dd>Medium</dd></dl>
+  </article>
+
+  <div class="callout"><strong>Recommended sequence:</strong><div class="sequence"><div>1 · Vertical slice</div><div>2 · Recorder core</div><div>3 · Compatibility lab</div><div>4 · Compaction epochs</div><div>5 · Lineage semantics</div><div>6 · Responses route</div></div><p>The ordering deliberately defers scheduler intelligence. Native mechanics, telemetry, prefix stability, and failover semantics must be trustworthy before the proxy optimizes cache value dynamically.</p></div>
+</section>
+
+<section id="rejection-summary">
+  <div class="eyebrow">Explicit cuts</div>
+  <h2>Rejection Summary</h2>
+  <table class="rejections"><thead><tr><th>Candidate</th><th>Reason rejected or merged</th></tr></thead><tbody>
+    <tr><td>Conversation Identity Plane alone</td><td>Sound, but a platform abstraction before proof. Merged into the end-to-end vertical slice.</td></tr>
+    <tr><td>Rendezvous Cache Lease</td><td>Lease ownership is useful; generations and rendezvous movement are premature. Minimum lease semantics merge into the vertical slice and lineage state machine.</td></tr>
+    <tr><td>Cache Value Scheduler / Working Set</td><td>Premature without reliable Grok cache telemetry, scope, TTL, partition, and retained-value estimates.</td></tr>
+    <tr><td>Prefix ABI alone</td><td>Strong basis, but it needs a fixture corpus and replay evidence. Merged into the Compatibility Lab.</td></tr>
+    <tr><td>Claude Code Corpus alone</td><td>Valuable evidence source, but incomplete without ABI fingerprints and conformance gates. Merged into the Compatibility Lab.</td></tr>
+    <tr><td>Protocol Autopilot</td><td>Per-conversation protocol pinning survives, but automated selection is premature. Merged into the Responses route.</td></tr>
+    <tr><td>Provider Cache Capability Contract</td><td>Useful as conformance metadata, but compiling a universal contract across routing and retries over-expands the first move. Folded into the lab and provider gates.</td></tr>
+    <tr><td>Durable Reasoning WAL</td><td>Exact replay matters, but a second sensitive conversation store is not yet justified. Keep only acknowledged-state invariants where failover requires them.</td></tr>
+    <tr><td>Prefix Drift Firewall alone</td><td>Strong diagnostic mechanism, but duplicates the flight recorder. Merged as component fingerprints and first-divergence attribution.</td></tr>
+    <tr><td>Cache Tomography alone</td><td>A strong experimental method rather than a standalone product. Run its first one-variable cohorts through the experiment plane.</td></tr>
+    <tr><td>Continuous Cache Tournament / Bandit</td><td>Too sophisticated before cache outcomes and policy interference are trustworthy. Bounded deterministic cohorts are sufficient now.</td></tr>
+    <tr><td>Continuation Capsule alone</td><td>An implementation mechanism within failover transitions; cannot promise prevention of duplicate external tool effects after ambiguous delivery.</td></tr>
+    <tr><td>Predictive Secondary Cache Insurance</td><td>Basis refuted: xAI has no cache-only warming primitive. Prewarming costs a real generation and may repeat tool side effects.</td></tr>
+    <tr><td>Operator Cache Surface alone</td><td>Needed, but it must derive from trustworthy events. Merged into the recorder rather than creating a confidence theater dashboard first.</td></tr>
+    <tr><td>Cache Continuity Kernel</td><td>Coherent but too broad: identity, WAL, state machine, capsule, routing, streaming, retries, and adapters become a subsystem rewrite. The lineage state machine is the bounded nucleus.</td></tr>
+    <tr><td>Adaptive Cache Scheduler</td><td>Observational sequencing is responsible, but the initiative still bundles inference, backtesting, and policy rollout ahead of native proof.</td></tr>
+  </tbody></table>
+</section>
+</main>
+<footer class="composition-signal">Composed 2026-07-15T00:00Z by ce-ideate from the user focus on native Grok cache routing, local Codex routing history, repository evidence, and current xAI documentation.</footer>
+</body>
+</html>
