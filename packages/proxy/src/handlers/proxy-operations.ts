@@ -49,6 +49,14 @@ const INTERNAL_TRANSPORT_HEADERS = [
 	"x-better-ccflare-attributed-agent",
 ] as const;
 const ANTHROPIC_BILLING_HEADER = "x-anthropic-billing-header";
+const TEST_CONTEXT_WINDOW_ENV =
+	"CCFLARE_CONTEXT_ADMISSION_TEST_EFFECTIVE_WINDOW";
+
+function getTestContextWindowOverride(): number | undefined {
+	if (process.env.NODE_ENV !== "test") return undefined;
+	const value = Number(process.env[TEST_CONTEXT_WINDOW_ENV]);
+	return Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined;
+}
 
 export interface ContextAdmissionTracker {
 	inputTokens: number;
@@ -90,7 +98,9 @@ export function admitConcreteCodexModel(
 		return true;
 	}
 	const capability = resolveModelContextCapability("codex", model);
-	if (!capability) {
+	const effectiveContextWindow =
+		getTestContextWindowOverride() ?? capability?.effectiveContextWindow;
+	if (!effectiveContextWindow) {
 		log.debug("Codex context admission capacity unknown, failing open", {
 			accountId: account.id,
 			model,
@@ -100,7 +110,7 @@ export function admitConcreteCodexModel(
 	}
 	const decision = decideContextAdmission({
 		inputTokens: tracker.inputTokens,
-		effectiveContextWindow: capability.effectiveContextWindow,
+		effectiveContextWindow,
 		requestedMaxOutputTokens: tracker.requestedMaxOutputTokens,
 		safetyReserveTokens: 0,
 	});

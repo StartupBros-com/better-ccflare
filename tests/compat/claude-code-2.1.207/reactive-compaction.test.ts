@@ -1,6 +1,8 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, mock, test } from "bun:test";
+import type { Account } from "@better-ccflare/types";
+import type { ProxyContext } from "../../../packages/proxy/src/handlers";
 import { chmod, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
-import { createServer, type Server } from "node:http";
+import { createServer, type IncomingMessage, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -31,13 +33,20 @@ interface ScenarioContext {
 	server: Server;
 	baseUrl: string;
 	requests: CapturedRequest[];
+	account?: Account;
+	upstreamCalls?: CapturedRequest[];
+	credentialReads?: { count: number };
+	rejectedCredentialReads?: number;
+	rejectedStatus?: number;
+	restoreFetch?: () => void;
 }
 
 const contexts: ScenarioContext[] = [];
 
 afterEach(async () => {
 	await Promise.all(
-		contexts.splice(0).map(async ({ server, root }) => {
+		contexts.splice(0).map(async ({ server, root, restoreFetch }) => {
+			restoreFetch?.();
 			await new Promise<void>((resolve) => server.close(() => resolve()));
 			await rm(root, { recursive: true, force: true });
 		}),
@@ -157,6 +166,157 @@ async function createScenario(mode: "http-400" | "sse-error"): Promise<ScenarioC
 	return context;
 }
 
+function makeCodexAccount(credentialReads: { count: number }): Account {
+	const account: Account = {
+		id: "compat-codex",
+		name: "compat-fake-codex",
+		provider: "codex",
+		api_key: null,
+		refresh_token: "unused-test-refresh-token",
+		access_token: "unused-test-access-token",
+		expires_at: Date.now() + 60 * 60 * 1000,
+		request_count: 0,
+		total_requests: 0,
+		last_used: null,
+		created_at: Date.now(),
+		rate_limited_until: null,
+		session_start: null,
+		session_request_count: 0,
+		paused: false,
+		rate_limit_reset: null,
+		rate_limit_status: null,
+		rate_limit_remaining: null,
+		priority: 0,
+		auto_fallback_enabled: false,
+		auto_refresh_enabled: false,
+		auto_pause_on_overage_enabled: false,
+		custom_endpoint: null,
+		model_mappings: JSON.stringify({ sonnet: "gpt-5.3-codex-spark" }),
+		cross_region_mode: null,
+		model_fallbacks: null,
+		billing_type: null,
+		pause_reason: null,
+		rate_limited_reason: null,
+		rate_limited_at: null,
+		consecutive_rate_limits: 0,
+		peak_hours_pause_enabled: false,
+		refresh_token_issued_at: null,
+	};
+	Object.defineProperty(account, "access_token", {
+		configurable: true,
+		get() {
+			credentialReads.count++;
+			return "unused-test-access-token";
+		},
+	});
+	return account;
+}
+
+function codexSuccessResponse(text: string): Response {
+	const lines = [
+		["response.created", { response: { id: crypto.randomUUID(), model: "gpt-5.3-codex-spark" } }],
+		["response.output_item.added", { item: { type: "message" }, output_index: 0 }],
+		["response.content_part.added", { part: { type: "output_text" } }],
+		["response.output_text.delta", { delta: text }],
+		["response.completed", { response: { model: "gpt-5.3-codex-spark", usage: { input_tokens: 100, output_tokens: 20 } } }],
+	].flatMap(([event, data]) => [`event: ${event}`, `data: ${JSON.stringify(data)}`, ""]);
+	return new Response(`${lines.join("\n")}\n`, {
+		status: 200,
+		headers: { "content-type": "text/event-stream" },
+	});
+}
+
+async function requestFromNode(request: IncomingMessage, baseUrl: string): Promise<Request> {
+	const chunks: Uint8Array[] = [];
+	for await (const chunk of request) chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+	return new Request(new URL(request.url ?? "/", baseUrl), {
+		method: request.method,
+		headers: request.headers as HeadersInit,
+		body: chunks.length > 0 ? Buffer.concat(chunks) : undefined,
+	});
+}
+
+async function createAdmissionScenario(): Promise<ScenarioContext> {
+	const context = await createScenario("http-400");
+	await new Promise<void>((resolve) => context.server.close(() => resolve()));
+	context.requests.length = 0;
+	const credentialReads = { count: 0 };
+	const account = makeCodexAccount(credentialReads);
+	const upstreamCalls: CapturedRequest[] = [];
+	let summarySeen = false;
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+		const request = input instanceof Request ? input : new Request(input);
+		if (!request.url.startsWith("https://chatgpt.com/backend-api/codex/responses")) return originalFetch(input);
+		const body = await request.clone().json() as Record<string, unknown>;
+		const serialized = JSON.stringify(body);
+		upstreamCalls.push({ body, serialized });
+		const isSummary = serialized.includes("Your task is to create a detailed summary");
+		if (isSummary) {
+			summarySeen = true;
+			return codexSuccessResponse(summaryMarker);
+		}
+		if (summarySeen && serialized.includes(triggerSentinel) && serialized.includes(summaryMarker)) {
+			return codexSuccessResponse("FINAL_REACTIVE_COMPACTION_SUCCESS");
+		}
+		return codexSuccessResponse(`warmup-response-${upstreamCalls.length}-${"context ".repeat(4000)}`);
+	}) as typeof fetch;
+	context.restoreFetch = () => {
+		globalThis.fetch = originalFetch;
+	};
+
+	const { handleProxy } = await import("../../../packages/proxy/src/proxy");
+	const ctx: ProxyContext = {
+		strategy: { select: () => [account] } as never,
+		dbOps: {
+			getAllAccounts: mock(async () => [account]),
+			getActiveComboForFamily: mock(async () => null),
+		} as never,
+		runtime: { port: 0, clientId: "compat-test" } as never,
+		config: {
+			getUsageThrottlingFiveHourEnabled: () => false,
+			getUsageThrottlingWeeklyEnabled: () => false,
+			getSystemPromptCacheTtl1h: () => false,
+			getAgentFrontmatterModelFallback: () => false,
+		} as never,
+		provider: { name: "codex", canHandle: () => true } as never,
+		refreshInFlight: new Map(),
+		asyncWriter: { enqueue: mock(() => {}) } as never,
+	};
+	const server = createServer(async (incoming, outgoing) => {
+		try {
+			const request = await requestFromNode(incoming, context.baseUrl);
+			const body = await request.clone().json() as Record<string, unknown>;
+			const serialized = JSON.stringify(body);
+			context.requests.push({ body, serialized });
+			const isRejectedTrigger = serialized.includes(triggerSentinel) && !summarySeen;
+			if (isRejectedTrigger) credentialReads.count = 0;
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			if (isRejectedTrigger) {
+				context.rejectedCredentialReads = credentialReads.count;
+				context.rejectedStatus = response.status;
+			}
+			outgoing.writeHead(response.status, Object.fromEntries(response.headers.entries()));
+			outgoing.end(Buffer.from(await response.arrayBuffer()));
+		} catch (error) {
+			outgoing.writeHead(500, { "content-type": "application/json" });
+			outgoing.end(JSON.stringify({ error: String(error) }));
+		}
+	});
+	await new Promise<void>((resolve, reject) => {
+		server.once("error", reject);
+		server.listen(0, "127.0.0.1", () => resolve());
+	});
+	const address = server.address();
+	if (!address || typeof address === "string") throw new Error("Proxy bridge did not bind a TCP port");
+	context.server = server;
+	context.baseUrl = `http://127.0.0.1:${address.port}`;
+	context.account = account;
+	context.upstreamCalls = upstreamCalls;
+	context.credentialReads = credentialReads;
+	return context;
+}
+
 function sanitizedEnvironment(context: ScenarioContext): NodeJS.ProcessEnv {
 	const env: NodeJS.ProcessEnv = {};
 	for (const [key, value] of Object.entries(process.env)) {
@@ -253,6 +413,61 @@ async function readTranscript(context: ScenarioContext): Promise<string> {
 }
 
 describe("Claude Code 2.1.207 reactive compaction compatibility", () => {
+	compatTest("recovers through actual better-ccflare context admission and a fake Codex upstream", async () => {
+		await assertCompatibleBinary();
+		const savedAdmission = process.env.CCFLARE_CONTEXT_ADMISSION;
+		const savedWindow = process.env.CCFLARE_CONTEXT_ADMISSION_TEST_EFFECTIVE_WINDOW;
+		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
+		process.env.CCFLARE_CONTEXT_ADMISSION_TEST_EFFECTIVE_WINDOW = "45000";
+		try {
+			mock.module("../../../packages/database/src/inline-integrity-check-worker", () => ({ EMBEDDED_INTEGRITY_CHECK_WORKER_CODE: "" }));
+			mock.module("../../../packages/database/src/inline-vacuum-worker", () => ({ EMBEDDED_VACUUM_WORKER_CODE: "" }));
+			mock.module("../../../packages/database/src/inline-incremental-vacuum-worker", () => ({ EMBEDDED_INCREMENTAL_VACUUM_WORKER_CODE: "" }));
+			const collector = {
+				handleStart: mock(() => {}),
+				handleChunk: mock(() => {}),
+				handleEnd: mock(() => Promise.resolve()),
+				drain: mock(() => Promise.resolve()),
+				getHealth: mock(() => ({ state: "ready" })),
+			};
+			mock.module("../../../packages/proxy/src/usage-collector", () => ({
+				getUsageCollector: () => collector,
+				tryGetUsageCollector: () => collector,
+				initUsageCollector: async () => collector,
+			}));
+			const context = await createAdmissionScenario();
+			const sessionId = crypto.randomUUID();
+			await warmPersistedSession(context, sessionId);
+			const warmupUpstreamCalls = context.upstreamCalls?.length ?? 0;
+			const output = await runTurn(context, sessionId, `${triggerSentinel} answer only after recovering`, false);
+			expect(output).toContain("FINAL_REACTIVE_COMPACTION_SUCCESS");
+
+			const triggerRequests = context.requests.filter(({ serialized }) => serialized.includes(triggerSentinel));
+			expect(triggerRequests.length).toBeGreaterThanOrEqual(2);
+			const rejected = triggerRequests.find(({ serialized }) => !serialized.includes(summaryMarker));
+			const summary = context.requests.find(({ serialized }) => serialized.includes("Your task is to create a detailed summary"));
+			expect(rejected).toBeDefined();
+			expect(summary).toBeDefined();
+			expect(summary!.serialized.length).toBeLessThan(rejected!.serialized.length);
+			expect(context.upstreamCalls?.length).toBe(warmupUpstreamCalls + 2);
+			expect(context.upstreamCalls?.some(({ serialized }) => serialized.includes(triggerSentinel) && !serialized.includes(summaryMarker))).toBe(false);
+			expect(context.rejectedStatus).toBe(400);
+			expect(context.rejectedCredentialReads).toBe(0);
+			expect(context.account?.rate_limited_until).toBeNull();
+			expect(context.account?.consecutive_rate_limits).toBe(0);
+
+			const hookLog = await readFile(context.hookLogPath, "utf8");
+			expect(hookLog).toContain('"hook_event_name":"PreCompact"');
+			expect(hookLog).toContain('"hook_event_name":"PostCompact"');
+			expect(await readTranscript(context)).toContain('"subtype":"compact_boundary"');
+		} finally {
+			if (savedAdmission === undefined) delete process.env.CCFLARE_CONTEXT_ADMISSION;
+			else process.env.CCFLARE_CONTEXT_ADMISSION = savedAdmission;
+			if (savedWindow === undefined) delete process.env.CCFLARE_CONTEXT_ADMISSION_TEST_EFFECTIVE_WINDOW;
+			else process.env.CCFLARE_CONTEXT_ADMISSION_TEST_EFFECTIVE_WINDOW = savedWindow;
+		}
+	}, 120_000);
+
 	compatTest("recovers when HTTP 400 admits compaction before response commitment", async () => {
 		await assertCompatibleBinary();
 		const context = await createScenario("http-400");
