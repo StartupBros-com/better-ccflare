@@ -27,6 +27,8 @@ export {
 	listProviders,
 	registerProvider,
 } from "./registry";
+// Export pure request capability and admission primitives
+export * from "./request-capabilities";
 export * from "./types";
 // Export usage fetcher
 export * from "./usage-fetcher";

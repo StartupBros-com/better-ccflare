@@ -9,6 +9,11 @@ import { Logger } from "@better-ccflare/logger";
 import { resolveReasoningEffort } from "@better-ccflare/openai-formats";
 import type { Account } from "@better-ccflare/types";
 import { BaseProvider } from "../../base";
+import {
+	estimateAnthropicRequestTokens,
+	MODEL_CONTEXT_WINDOWS,
+	resolveModelContextCapability,
+} from "../../request-capabilities";
 import type { RateLimitInfo, TokenRefreshResult } from "../../types";
 import {
 	CODEX_SINGLE_ORCHESTRATION_ROOT_ENV,
@@ -145,56 +150,11 @@ const CODEX_ERROR_TYPE_BY_CODE: Record<string, string> = {
 	usage_not_included: "permission_error",
 };
 
-// Synced from the Codex CLI model cache (~/.codex/models_cache.json,
-// codex-cli 0.144.1). Missing entries mean no context_window telemetry is
-// reported to the client, which disables its context gauge for that model.
-export const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
-	"gpt-5.3-codex": 272_000,
-	"gpt-5.3-codex-spark": 128_000,
-	"gpt-5.4": 272_000,
-	"gpt-5.4-mini": 272_000,
-	"gpt-5.5": 272_000,
-	"gpt-5.6-sol": 372_000,
-	"gpt-5.6-terra": 372_000,
-	"gpt-5.6-luna": 372_000,
-};
-
-// Codex's model metadata declares an effective usable window below the raw
-// maximum (effective_context_window_percent, 95 for every current model).
-// When CCFLARE_CODEX_EFFECTIVE_CONTEXT=1, report that size as context-window
-// telemetry so the client's gauge reflects the effective degradation zone.
+// When enabled, telemetry reports the effective Codex context capacity rather
+// than the raw model maximum.
 export const CODEX_EFFECTIVE_CONTEXT_ENV = "CCFLARE_CODEX_EFFECTIVE_CONTEXT";
-const MODEL_EFFECTIVE_CONTEXT_PERCENT: Record<string, number> = {
-	"gpt-5.3-codex": 95,
-	"gpt-5.3-codex-spark": 95,
-	"gpt-5.4": 95,
-	"gpt-5.4-mini": 95,
-	"gpt-5.5": 95,
-	"gpt-5.6-sol": 95,
-	"gpt-5.6-terra": 95,
-	"gpt-5.6-luna": 95,
-};
+export { MODEL_CONTEXT_WINDOWS } from "../../request-capabilities";
 
-/**
- * Exact lookup first, then longest-prefix fallback so dated or suffixed
- * variants the API may return (e.g. "gpt-5.6-sol-2026-05-13") still resolve
- * to their family's metadata instead of silently losing the client's context
- * gauge. Prefix matches require a "-" boundary so "gpt-5.55" cannot match
- * "gpt-5.5".
- */
-function lookupModelFamilyKey(model: string): string | undefined {
-	if (MODEL_CONTEXT_WINDOWS[model]) return model;
-	let bestKey: string | undefined;
-	for (const key of Object.keys(MODEL_CONTEXT_WINDOWS)) {
-		if (
-			model.startsWith(`${key}-`) &&
-			(bestKey === undefined || key.length > bestKey.length)
-		) {
-			bestKey = key;
-		}
-	}
-	return bestKey;
-}
 // ── Codex Responses API types ─────────────────────────────────────────────────
 
 interface CodexInputTextItem {
@@ -1033,16 +993,12 @@ export class CodexProvider extends BaseProvider {
 	): ContextWindow | null {
 		const model = response?.model;
 		if (typeof model !== "string") return null;
-		const familyKey = lookupModelFamilyKey(model);
-		if (!familyKey) return null;
-		let contextWindowSize = MODEL_CONTEXT_WINDOWS[familyKey];
-		if (!contextWindowSize) return null;
-		if (process.env[CODEX_EFFECTIVE_CONTEXT_ENV] === "1") {
-			const pct = MODEL_EFFECTIVE_CONTEXT_PERCENT[familyKey];
-			if (pct && pct > 0 && pct < 100) {
-				contextWindowSize = Math.floor((contextWindowSize * pct) / 100);
-			}
-		}
+		const capability = resolveModelContextCapability("codex", model);
+		if (!capability) return null;
+		const contextWindowSize =
+			process.env[CODEX_EFFECTIVE_CONTEXT_ENV] === "1"
+				? capability.effectiveContextWindow
+				: capability.rawContextWindow;
 
 		const inputTokens = usage?.input_tokens;
 		if (
@@ -1102,7 +1058,7 @@ export class CodexProvider extends BaseProvider {
 		body: unknown,
 	): Request {
 		return this.createSyntheticJsonResponse(request, 200, {
-			input_tokens: this.estimateCountTokensInput(body),
+			input_tokens: estimateAnthropicRequestTokens(body).tokens,
 		});
 	}
 
@@ -1116,85 +1072,6 @@ export class CodexProvider extends BaseProvider {
 			type: "error",
 			error: { type, message },
 		});
-	}
-
-	private estimateCountTokensInput(body: unknown): number {
-		const material = this.extractCountTokensMaterial(body);
-		let serialized = material.join("\n");
-		if (serialized.length === 0) {
-			try {
-				serialized = JSON.stringify(body) ?? "";
-			} catch {
-				serialized = String(body ?? "");
-			}
-		}
-
-		// Anthropic's count_tokens endpoint is advisory for client-side budgeting.
-		// Codex has no equivalent endpoint, so return a conservative local estimate
-		// instead of failing flows that ask for a token count between real messages.
-		// Estimate over prompt material rather than the entire request envelope so
-		// short prompts are not dominated by JSON field names and punctuation.
-		// Roughly 3 UTF-16 chars/token overestimates English text and gives clients a
-		// safe context-budget signal.
-		return Math.max(1, Math.ceil(serialized.length / 3));
-	}
-
-	private extractCountTokensMaterial(body: unknown): string[] {
-		if (!body || typeof body !== "object") return [];
-		const request = body as Record<string, unknown>;
-		const chunks: string[] = [];
-		this.appendCountTokensContent(chunks, request.system);
-		const messages = request.messages;
-		if (Array.isArray(messages)) {
-			for (const message of messages) {
-				if (!message || typeof message !== "object") continue;
-				const msg = message as Record<string, unknown>;
-				if (typeof msg.role === "string") chunks.push(msg.role);
-				this.appendCountTokensContent(chunks, msg.content);
-			}
-		}
-		const tools = request.tools;
-		if (Array.isArray(tools)) {
-			for (const tool of tools) {
-				this.appendCountTokensContent(chunks, tool);
-			}
-		}
-		return chunks;
-	}
-
-	private appendCountTokensContent(chunks: string[], value: unknown): void {
-		if (typeof value === "string") {
-			chunks.push(value);
-			return;
-		}
-		if (Array.isArray(value)) {
-			for (const item of value) {
-				this.appendCountTokensContent(chunks, item);
-			}
-			return;
-		}
-		if (!value || typeof value !== "object") return;
-		const record = value as Record<string, unknown>;
-		const before = chunks.length;
-		if (typeof record.text === "string") chunks.push(record.text);
-		if (typeof record.name === "string") chunks.push(record.name);
-		if (typeof record.description === "string") chunks.push(record.description);
-		if ("input" in record) this.appendCountTokensContent(chunks, record.input);
-		if ("content" in record)
-			this.appendCountTokensContent(chunks, record.content);
-		if ("input_schema" in record) {
-			this.appendCountTokensContent(chunks, record.input_schema);
-		}
-		if ("parameters" in record) {
-			this.appendCountTokensContent(chunks, record.parameters);
-		}
-		if (Object.keys(record).length > 0 && chunks.length === before) {
-			try {
-				chunks.push(JSON.stringify(record));
-			} catch {
-				// Ignore non-serializable objects; the caller has a request-level fallback.
-			}
-		}
 	}
 
 	private convertToCodexFormat(
