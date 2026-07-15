@@ -21,7 +21,7 @@ if (process.argv[1]) {
 
 // Try each possible .env location
 for (const envPath of possibleEnvPaths) {
-	const result = config({ path: envPath });
+	const result = config({ path: envPath, quiet: true });
 	if (result.parsed && Object.keys(result.parsed).length > 0) {
 		break; // Stop after finding the first .env with variables
 	}
@@ -48,6 +48,7 @@ import {
 	removeAccount,
 	resetAllStats,
 	resumeAccount,
+	runCacheFlightRecorderCommand,
 	runDoctor,
 	setAccountPriority,
 } from "@better-ccflare/cli-commands";
@@ -104,6 +105,9 @@ interface ParsedArgs {
 	doctor: boolean;
 	doctorFull: boolean;
 	doctorRecover: boolean;
+	cacheFlightRecorderReport: string | null;
+	cacheFlightRecorderHealth: boolean;
+	json: boolean;
 	resetStats: boolean;
 	clearHistory: boolean;
 	compact: boolean;
@@ -156,7 +160,7 @@ function startServerWithConfig(args: ParsedArgs, config: Config) {
 /**
  * Helper function to exit gracefully with proper cleanup
  */
-async function exitGracefully(code: 0 | 1 = 0): Promise<never> {
+async function exitGracefully(code: 0 | 1 | 2 = 0): Promise<never> {
 	try {
 		await shutdown();
 	} catch (error) {
@@ -168,7 +172,7 @@ async function exitGracefully(code: 0 | 1 = 0): Promise<never> {
 /**
  * Fast exit function for simple commands that don't need full cleanup
  */
-function fastExit(code: 0 | 1 = 0): never {
+function fastExit(code: 0 | 1 | 2 = 0): never {
 	process.exit(code);
 }
 
@@ -464,6 +468,9 @@ function parseArgs(args: string[]): ParsedArgs {
 		doctor: false,
 		doctorFull: false,
 		doctorRecover: false,
+		cacheFlightRecorderReport: null,
+		cacheFlightRecorderHealth: false,
+		json: false,
 		resetStats: false,
 		clearHistory: false,
 		compact: false,
@@ -741,6 +748,21 @@ function parseArgs(args: string[]): ParsedArgs {
 				parsed.doctorRecover = true;
 				parsed.doctor = true; // Base flag
 				break;
+			case "--cache-flight-recorder-report":
+				if (i + 1 >= args.length || args[i + 1].startsWith("--")) {
+					console.error(
+						"--cache-flight-recorder-report requires a recorder ID",
+					);
+					fastExit(2);
+				}
+				parsed.cacheFlightRecorderReport = args[++i];
+				break;
+			case "--cache-flight-recorder-health":
+				parsed.cacheFlightRecorderHealth = true;
+				break;
+			case "--json":
+				parsed.json = true;
+				break;
 			case "--reset-stats":
 				parsed.resetStats = true;
 				break;
@@ -830,6 +852,15 @@ async function main() {
 		return;
 	}
 
+	if (parsed.cacheFlightRecorderReport && parsed.cacheFlightRecorderHealth) {
+		console.error("Choose either recorder report or recorder health");
+		if (parsed.json) {
+			console.log(JSON.stringify({ kind: "error", status: "invalid_args" }));
+		}
+		fastExit(2);
+		return;
+	}
+
 	// Handle show-config - check before full DI initialization but after config
 	if (parsed.showConfig) {
 		const config = new Config();
@@ -883,6 +914,10 @@ Options:
   --doctor             Run database integrity check and storage diagnostics
   --doctor-full        Run exhaustive integrity check (slower)
   --doctor-recover     Generate recovery instructions for corrupted database
+  --cache-flight-recorder-report <id>  Report a retained recorder timeline
+    --json             Emit exactly one structured JSON object
+  --cache-flight-recorder-health       Show minimal recorder health
+    --json             Emit exactly one structured JSON object
   --reset-stats        Reset usage statistics
   --clear-history      Clear request history
   --compact            Compact database (WAL checkpoint + VACUUM)
@@ -1372,6 +1407,22 @@ Examples:
 			console.error(`❌ Failed to delete API key: ${errorMessage}`);
 			await exitGracefully(1);
 		}
+	}
+
+	if (parsed.cacheFlightRecorderReport || parsed.cacheFlightRecorderHealth) {
+		const config = container.resolve<Config>(SERVICE_KEYS.Config);
+		const options = parsed.cacheFlightRecorderReport
+			? {
+					action: "report" as const,
+					recorderConversationId: parsed.cacheFlightRecorderReport,
+					json: parsed.json,
+				}
+			: { action: "health" as const, json: parsed.json };
+		const { exitCode } = await runCacheFlightRecorderCommand(dbOps, options, {
+			enabled: process.env.CCFLARE_CACHE_FLIGHT_RECORDER === "1",
+			retentionHours: config.getCacheFlightRecorderRetentionHours(),
+		});
+		await exitGracefully(exitCode);
 	}
 
 	if (parsed.analyze) {

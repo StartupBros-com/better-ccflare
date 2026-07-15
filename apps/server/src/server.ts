@@ -261,9 +261,13 @@ async function runStartupMaintenance(
 		}
 		const recorderRetentionHours =
 			config.getCacheFlightRecorderRetentionHours();
+		const recorderNow = Date.now();
+		const recorderRetentionMs = recorderRetentionHours * 60 * 60 * 1000;
 		const expiredTimelines = await dbOps.expireCacheFlightRecorderTimelines(
-			Date.now() - recorderRetentionHours * 60 * 60 * 1000,
+			recorderNow - recorderRetentionMs,
+			recorderNow + recorderRetentionMs,
 		);
+		await dbOps.expireCacheFlightRecorderTombstones(recorderNow);
 		if (expiredTimelines > 0) {
 			log.info(
 				`Expired ${expiredTimelines} cache flight recorder timelines (retention=${recorderRetentionHours}h)`,
@@ -860,9 +864,13 @@ export default async function startServer(options?: {
 			}
 			const recorderRetentionHours =
 				config.getCacheFlightRecorderRetentionHours();
+			const recorderNow = Date.now();
+			const recorderRetentionMs = recorderRetentionHours * 60 * 60 * 1000;
 			const expiredTimelines = await dbOps.expireCacheFlightRecorderTimelines(
-				Date.now() - recorderRetentionHours * 60 * 60 * 1000,
+				recorderNow - recorderRetentionMs,
+				recorderNow + recorderRetentionMs,
 			);
+			await dbOps.expireCacheFlightRecorderTombstones(recorderNow);
 			if (expiredTimelines > 0) {
 				log.info(
 					`Expired ${expiredTimelines} cache flight recorder timelines (retention=${recorderRetentionHours}h)`,

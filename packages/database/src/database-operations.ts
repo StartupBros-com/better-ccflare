@@ -974,6 +974,10 @@ OAuth tokens will need to be re-authenticated.
 		return this.cacheFlightRecorder.loadTimeline(recorderConversationId);
 	}
 
+	async lookupCacheFlightRecorderTimeline(recorderConversationId: string) {
+		return this.cacheFlightRecorder.lookupTimeline(recorderConversationId);
+	}
+
 	async markCacheFlightRecorderIncomplete(
 		recorderConversationId: string,
 		options?: { dropped?: boolean; at?: number },
@@ -992,8 +996,18 @@ OAuth tokens will need to be re-authenticated.
 		return { retained, ...evidence };
 	}
 
-	async expireCacheFlightRecorderTimelines(cutoffTs: number): Promise<number> {
-		return this.cacheFlightRecorder.expireOlderThan(cutoffTs);
+	async expireCacheFlightRecorderTimelines(
+		cutoffTs: number,
+		tombstoneExpiresAt?: number,
+	): Promise<number> {
+		return this.cacheFlightRecorder.expireOlderThan(
+			cutoffTs,
+			tombstoneExpiresAt,
+		);
+	}
+
+	async expireCacheFlightRecorderTombstones(now: number): Promise<number> {
+		return this.cacheFlightRecorder.expireTombstonesOlderThan(now);
 	}
 
 	async forceResetAccountRateLimit(accountId: string): Promise<boolean> {

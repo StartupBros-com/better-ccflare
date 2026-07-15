@@ -394,6 +394,16 @@ export function ensureSchema(db: Database): void {
 		 ON cache_flight_recorder_conversations(updated_at)`,
 	);
 	db.run(`
+		CREATE TABLE IF NOT EXISTS cache_flight_recorder_tombstones (
+			recorder_conversation_id TEXT PRIMARY KEY,
+			expires_at INTEGER NOT NULL
+		)
+	`);
+	db.run(
+		`CREATE INDEX IF NOT EXISTS idx_cache_flight_recorder_tombstones_expires_at
+		 ON cache_flight_recorder_tombstones(expires_at)`,
+	);
+	db.run(`
 		CREATE TABLE IF NOT EXISTS cache_flight_recorder_turns (
 			recorder_conversation_id TEXT NOT NULL,
 			sequence INTEGER NOT NULL,

@@ -36,6 +36,10 @@ export interface CacheFlightRecorderTimeline extends Timeline {
 	droppedEvents: number;
 }
 
+export type CacheFlightRecorderLookup =
+	| { status: "found"; timeline: CacheFlightRecorderTimeline }
+	| { status: "expired" | "not_found" };
+
 const TURN_EVIDENCE_KEYS = new Set<keyof TurnEvidence>([
 	"sequence",
 	"timestamp",
@@ -152,6 +156,20 @@ export class CacheFlightRecorderRepository extends BaseRepository<Timeline> {
 		};
 	}
 
+	async lookupTimeline(
+		recorderConversationId: string,
+	): Promise<CacheFlightRecorderLookup> {
+		this.assertPrivacySafeRecorderId(recorderConversationId);
+		const timeline = await this.loadTimeline(recorderConversationId);
+		if (timeline) return { status: "found", timeline };
+		const tombstone = await this.get<{ found: number }>(
+			`SELECT 1 AS found FROM cache_flight_recorder_tombstones
+			 WHERE recorder_conversation_id = ?`,
+			[recorderConversationId],
+		);
+		return tombstone ? { status: "expired" } : { status: "not_found" };
+	}
+
 	async markIncomplete(
 		recorderConversationId: string,
 		options: MarkIncompleteOptions = {},
@@ -195,12 +213,35 @@ export class CacheFlightRecorderRepository extends BaseRepository<Timeline> {
 		};
 	}
 
-	async expireOlderThan(cutoffTs: number): Promise<number> {
+	async expireOlderThan(
+		cutoffTs: number,
+		tombstoneExpiresAt = Date.now(),
+	): Promise<number> {
+		await this.run(
+			`INSERT INTO cache_flight_recorder_tombstones (
+				recorder_conversation_id, expires_at
+			) SELECT recorder_conversation_id, ?
+			FROM cache_flight_recorder_conversations
+			WHERE updated_at < ?
+			ON CONFLICT (recorder_conversation_id) DO UPDATE SET
+				expires_at = EXCLUDED.expires_at`,
+			[tombstoneExpiresAt, cutoffTs],
+		);
 		const expired = await this.query<{ recorder_conversation_id: string }>(
 			`DELETE FROM cache_flight_recorder_conversations
 			 WHERE updated_at < ?
 			 RETURNING recorder_conversation_id`,
 			[cutoffTs],
+		);
+		return expired.length;
+	}
+
+	async expireTombstonesOlderThan(now: number): Promise<number> {
+		const expired = await this.query<{ recorder_conversation_id: string }>(
+			`DELETE FROM cache_flight_recorder_tombstones
+			 WHERE expires_at < ?
+			 RETURNING recorder_conversation_id`,
+			[now],
 		);
 		return expired.length;
 	}

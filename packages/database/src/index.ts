@@ -24,7 +24,9 @@ export {
 export { analyzeIndexUsage } from "./performance-indexes";
 export {
 	type CacheFlightRecorderCounts,
+	type CacheFlightRecorderLookup,
 	CacheFlightRecorderRepository,
+	type CacheFlightRecorderTimeline,
 	type MarkIncompleteOptions,
 } from "./repositories/cache-flight-recorder.repository";
 export type {
