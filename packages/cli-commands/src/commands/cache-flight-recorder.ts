@@ -41,7 +41,7 @@ export interface CacheFlightRecorderHealthDto {
 	retainedCount: number;
 	droppedCount: number;
 	incompleteCount: number;
-	persistenceHealth: "healthy";
+	persistenceHealth: "healthy" | "degraded" | "unhealthy";
 }
 
 export interface CacheFlightRecorderCommandDatabase {
@@ -63,6 +63,14 @@ export type CacheFlightRecorderCommandOptions =
 	| { action: "health"; json: boolean };
 
 const SAFE_RECORDER_ID = /^[A-Za-z0-9_-]{1,128}$/;
+
+export function isValidCacheFlightRecorderId(value: unknown): value is string {
+	return typeof value === "string" && SAFE_RECORDER_ID.test(value);
+}
+
+export function cacheFlightRecorderError(status: string): string {
+	return JSON.stringify({ kind: "error", status });
+}
 const causeLabels: Record<
 	NonNullable<CacheFlightRecorderReportDto["diagnosis"]["cause"]>,
 	string
@@ -125,7 +133,7 @@ export function buildCacheFlightRecorderReport(
 		gaps: diagnosis.gaps,
 		unavailableDimensions: diagnosis.unavailableDimensions,
 		completeness:
-			timeline.incomplete && diagnosis.completeness === "complete"
+			timeline.incomplete && diagnosis.completeness !== "contradictory"
 				? "incomplete"
 				: diagnosis.completeness,
 		droppedEvidence: timeline.droppedEvents,
@@ -138,9 +146,12 @@ export function renderCacheFlightRecorderReport(
 	const diagnosis = report.diagnosis.cause
 		? causeLabels[report.diagnosis.cause]
 		: "no continuity break observed";
+	const formatEvidence = (item: DiagnosisEvidence) =>
+		`kind=${item.kind} dimension=${item.dimension} fromSequence=${item.fromSequence ?? "unavailable"} toSequence=${item.toSequence} fromValue=${item.fromValue ?? "unavailable"} toValue=${item.toValue ?? "unavailable"} detail=${item.detail}`;
 	const lines = [
 		`Cache flight recorder: ${report.recorderConversationId}`,
 		`Diagnosis: ${diagnosis}`,
+		`Diagnosed sequence: ${report.diagnosis.diagnosedSequence ?? "unavailable"}`,
 		`Completeness: ${report.completeness}`,
 		`Baseline: ${report.baseline?.sequence ?? "unavailable"}`,
 		`Dropped evidence: ${report.droppedEvidence}`,
@@ -148,14 +159,14 @@ export function renderCacheFlightRecorderReport(
 	];
 	for (const turn of report.turns) {
 		lines.push(
-			`  ${turn.sequence}: cache=${turn.cacheOutcome} input=${turn.tokens.input ?? "unavailable"} cached=${turn.tokens.cached ?? "unavailable"} route=${turn.routing.servingAccountId ?? "unavailable"}`,
+			`  ${turn.sequence}: cache=${turn.cacheOutcome} input=${turn.tokens.input ?? "unavailable"} cached=${turn.tokens.cached ?? "unavailable"} route=${turn.routing.servingAccountId ?? "unavailable"} identity=${turn.identityFingerprint ?? "unavailable"} prefix=${turn.prefixFingerprint ?? "unavailable"} completeness=${turn.completeness} unavailable=${turn.unavailableDimensions.join("|") || "none"} gapBefore=${turn.gapBefore}`,
 		);
 	}
 	lines.push(
-		`Supporting transitions: ${report.diagnosis.supportingTransitions.map((item) => item.detail).join(", ") || "none"}`,
+		`Supporting transitions: ${report.diagnosis.supportingTransitions.map(formatEvidence).join(", ") || "none"}`,
 	);
 	lines.push(
-		`Continuity proof: ${report.diagnosis.continuityProof.map((item) => item.detail).join(", ") || "none"}`,
+		`Continuity proof: ${report.diagnosis.continuityProof.map(formatEvidence).join(", ") || "none"}`,
 	);
 	lines.push(`Gaps: ${report.gaps.join(", ") || "none"}`);
 	lines.push(
@@ -183,15 +194,19 @@ export async function runCacheFlightRecorderCommand(
 				retainedCount: counts.retained,
 				droppedCount: counts.dropped,
 				incompleteCount: counts.incomplete,
-				persistenceHealth: "healthy",
+				persistenceHealth:
+					counts.dropped > 0
+						? "unhealthy"
+						: counts.incomplete > 0
+							? "degraded"
+							: "healthy",
 			};
 			io.stdout(options.json ? JSON.stringify(health) : renderHealth(health));
 			return { exitCode: 0 };
 		}
-		if (!SAFE_RECORDER_ID.test(options.recorderConversationId)) {
+		if (!isValidCacheFlightRecorderId(options.recorderConversationId)) {
 			io.stderr("Invalid recorder ID");
-			if (options.json)
-				io.stdout(JSON.stringify({ kind: "error", status: "invalid_args" }));
+			if (options.json) io.stdout(cacheFlightRecorderError("invalid_args"));
 			return { exitCode: 2 };
 		}
 		const lookup = await db.lookupCacheFlightRecorderTimeline(
@@ -223,9 +238,7 @@ export async function runCacheFlightRecorderCommand(
 	} catch {
 		io.stderr("Cache flight recorder operation failed");
 		if (options.json)
-			io.stdout(
-				JSON.stringify({ kind: "error", status: "operational_failure" }),
-			);
+			io.stdout(cacheFlightRecorderError("operational_failure"));
 		return { exitCode: 1 };
 	}
 }

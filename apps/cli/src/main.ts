@@ -30,6 +30,7 @@ for (const envPath of possibleEnvPaths) {
 import {
 	addAccount,
 	analyzePerformance,
+	cacheFlightRecorderError,
 	clearRequestHistory,
 	compactDatabase,
 	deleteApiKey,
@@ -42,6 +43,7 @@ import {
 	getAccountsList,
 	getApiKeyStats,
 	handleRepairCommand,
+	isValidCacheFlightRecorderId,
 	listApiKeys,
 	pauseAccount,
 	reauthenticateAccount,
@@ -63,7 +65,10 @@ import {
 import { container, SERVICE_KEYS } from "@better-ccflare/core-di";
 import { DatabaseFactory } from "@better-ccflare/database";
 import { Logger } from "@better-ccflare/logger";
-import { parseBedrockConfig } from "@better-ccflare/providers";
+import {
+	isCacheFlightRecorderEnabled,
+	parseBedrockConfig,
+} from "@better-ccflare/providers";
 // Import server
 import startServer from "@better-ccflare/server";
 
@@ -750,10 +755,8 @@ function parseArgs(args: string[]): ParsedArgs {
 				break;
 			case "--cache-flight-recorder-report":
 				if (i + 1 >= args.length || args[i + 1].startsWith("--")) {
-					console.error(
-						"--cache-flight-recorder-report requires a recorder ID",
-					);
-					fastExit(2);
+					parsed.cacheFlightRecorderReport = "";
+					break;
 				}
 				parsed.cacheFlightRecorderReport = args[++i];
 				break;
@@ -839,9 +842,69 @@ function parseArgs(args: string[]): ParsedArgs {
 	return parsed;
 }
 
+function hasRecorderCommandConflict(args: string[]): boolean {
+	const allowed = new Set<number>();
+	for (let index = 0; index < args.length; index++) {
+		if (args[index] === "--json") allowed.add(index);
+		if (args[index] === "--cache-flight-recorder-health") allowed.add(index);
+		if (args[index] === "--cache-flight-recorder-report") {
+			allowed.add(index);
+			if (args[index + 1] && !args[index + 1].startsWith("--")) {
+				allowed.add(index + 1);
+			}
+		}
+	}
+	return args.some((_, index) => !allowed.has(index));
+}
+
 async function main() {
 	const args = process.argv.slice(2);
 	const parsed = parseArgs(args);
+	const recorderRequested =
+		args.includes("--cache-flight-recorder-report") ||
+		parsed.cacheFlightRecorderHealth;
+
+	if (recorderRequested) {
+		const invalidReportId =
+			args.includes("--cache-flight-recorder-report") &&
+			!isValidCacheFlightRecorderId(parsed.cacheFlightRecorderReport);
+		const conflicting =
+			(parsed.cacheFlightRecorderReport !== null &&
+				parsed.cacheFlightRecorderHealth) ||
+			hasRecorderCommandConflict(args);
+		if (invalidReportId || conflicting) {
+			console.error(
+				invalidReportId
+					? "Cache flight recorder report requires a valid recorder ID"
+					: "Cache flight recorder command cannot be combined with another command",
+			);
+			if (parsed.json) console.log(cacheFlightRecorderError("invalid_args"));
+			fastExit(2);
+		}
+
+		try {
+			const config = new Config();
+			DatabaseFactory.initialize(undefined, undefined, false);
+			const dbOps = await DatabaseFactory.getInstanceAsync(false);
+			const options = parsed.cacheFlightRecorderReport
+				? {
+						action: "report" as const,
+						recorderConversationId: parsed.cacheFlightRecorderReport,
+						json: parsed.json,
+					}
+				: { action: "health" as const, json: parsed.json };
+			const { exitCode } = await runCacheFlightRecorderCommand(dbOps, options, {
+				enabled: isCacheFlightRecorderEnabled(),
+				retentionHours: config.getCacheFlightRecorderRetentionHours(),
+			});
+			await exitGracefully(exitCode);
+		} catch {
+			console.error("Cache flight recorder operation failed");
+			if (parsed.json)
+				console.log(cacheFlightRecorderError("operational_failure"));
+			await exitGracefully(1);
+		}
+	}
 
 	// Handle version - check before any expensive initializations
 	if (parsed.version) {
@@ -849,15 +912,6 @@ async function main() {
 		const version = getVersionSync();
 		console.log(`better-ccflare v${version}`);
 		fastExit(0);
-		return;
-	}
-
-	if (parsed.cacheFlightRecorderReport && parsed.cacheFlightRecorderHealth) {
-		console.error("Choose either recorder report or recorder health");
-		if (parsed.json) {
-			console.log(JSON.stringify({ kind: "error", status: "invalid_args" }));
-		}
-		fastExit(2);
 		return;
 	}
 
@@ -1407,22 +1461,6 @@ Examples:
 			console.error(`❌ Failed to delete API key: ${errorMessage}`);
 			await exitGracefully(1);
 		}
-	}
-
-	if (parsed.cacheFlightRecorderReport || parsed.cacheFlightRecorderHealth) {
-		const config = container.resolve<Config>(SERVICE_KEYS.Config);
-		const options = parsed.cacheFlightRecorderReport
-			? {
-					action: "report" as const,
-					recorderConversationId: parsed.cacheFlightRecorderReport,
-					json: parsed.json,
-				}
-			: { action: "health" as const, json: parsed.json };
-		const { exitCode } = await runCacheFlightRecorderCommand(dbOps, options, {
-			enabled: process.env.CCFLARE_CACHE_FLIGHT_RECORDER === "1",
-			retentionHours: config.getCacheFlightRecorderRetentionHours(),
-		});
-		await exitGracefully(exitCode);
 	}
 
 	if (parsed.analyze) {

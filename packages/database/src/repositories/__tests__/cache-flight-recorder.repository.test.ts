@@ -199,6 +199,49 @@ describe("CacheFlightRecorderRepository", () => {
 		db.close();
 	});
 
+	it("removes stale tombstones when an expired ID is recreated", async () => {
+		const db = makeDb();
+		const repo = new CacheFlightRecorderRepository(new BunSqlAdapter(db));
+		await repo.appendTurn("recreated-id", turn(1), 1_000);
+		await repo.expireOlderThan(2_000, 7_000);
+		expect(await repo.lookupTimeline("recreated-id")).toEqual({
+			status: "expired",
+		});
+
+		await repo.appendTurn("recreated-id", turn(2), 3_000);
+		expect(await repo.lookupTimeline("recreated-id")).toMatchObject({
+			status: "found",
+		});
+		const tombstone = db
+			.query(
+				"SELECT recorder_conversation_id FROM cache_flight_recorder_tombstones WHERE recorder_conversation_id = ?",
+			)
+			.get("recreated-id");
+		expect(tombstone).toBeNull();
+		db.close();
+	});
+
+	it("rolls back tombstones when timeline deletion fails", async () => {
+		const db = makeDb();
+		const repo = new CacheFlightRecorderRepository(new BunSqlAdapter(db));
+		await repo.appendTurn("atomic-id", turn(1), 1_000);
+		db.exec(`CREATE TRIGGER reject_recorder_delete
+			BEFORE DELETE ON cache_flight_recorder_conversations
+			BEGIN SELECT RAISE(ABORT, 'reject delete'); END`);
+
+		await expect(repo.expireOlderThan(2_000, 7_000)).rejects.toThrow();
+		expect(await repo.lookupTimeline("atomic-id")).toMatchObject({
+			status: "found",
+		});
+		const tombstone = db
+			.query(
+				"SELECT recorder_conversation_id FROM cache_flight_recorder_tombstones WHERE recorder_conversation_id = ?",
+			)
+			.get("atomic-id");
+		expect(tombstone).toBeNull();
+		db.close();
+	});
+
 	it("rejects evidence objects with content-bearing or unsupported fields", async () => {
 		const db = makeDb();
 		const repo = new CacheFlightRecorderRepository(new BunSqlAdapter(db));
@@ -261,7 +304,9 @@ describe("DatabaseOperations cache flight recorder facade", () => {
 			expect(
 				await dbOps.loadCacheFlightRecorderTimeline("recorder-safe-id"),
 			).not.toBeNull();
-			expect(await dbOps.expireCacheFlightRecorderTimelines(2_000)).toBe(1);
+			expect(await dbOps.expireCacheFlightRecorderTimelines(2_000, 7_000)).toBe(
+				1,
+			);
 		} finally {
 			await dbOps.dispose();
 		}

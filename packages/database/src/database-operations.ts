@@ -998,7 +998,7 @@ OAuth tokens will need to be re-authenticated.
 
 	async expireCacheFlightRecorderTimelines(
 		cutoffTs: number,
-		tombstoneExpiresAt?: number,
+		tombstoneExpiresAt: number,
 	): Promise<number> {
 		return this.cacheFlightRecorder.expireOlderThan(
 			cutoffTs,

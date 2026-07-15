@@ -161,6 +161,52 @@ describe("cache flight recorder report", () => {
 		);
 	});
 
+	it("does not downgrade known timeline loss to partial", () => {
+		const dto = buildCacheFlightRecorderReport({
+			...hitTimeline,
+			incomplete: true,
+			turns: [
+				baselineTurn,
+				{
+					...hitTurn,
+					completeness: "partial",
+					unavailableDimensions: ["token_accounting"],
+				},
+			],
+		});
+
+		expect(dto.completeness).toBe("incomplete");
+	});
+
+	it("renders all privacy-safe diagnosis and turn evidence", () => {
+		const dto = buildCacheFlightRecorderReport({
+			...hitTimeline,
+			turns: [
+				baselineTurn,
+				{
+					...hitTurn,
+					identityFingerprint: "identity-b",
+					prefixFingerprint: "prefix-b",
+					cacheOutcome: "miss",
+					completeness: "partial",
+					unavailableDimensions: ["token_accounting"],
+					gapBefore: true,
+				},
+			],
+		});
+		const human = renderCacheFlightRecorderReport(dto);
+
+		expect(human).toContain("Diagnosed sequence: 1");
+		expect(human).toContain(
+			"kind=changed dimension=identity fromSequence=0 toSequence=1 fromValue=identity-a toValue=identity-b detail=identity_changed",
+		);
+		expect(human).toContain("identity=identity-b");
+		expect(human).toContain("prefix=prefix-b");
+		expect(human).toContain("completeness=partial");
+		expect(human).toContain("unavailable=token_accounting");
+		expect(human).toContain("gapBefore=true");
+	});
+
 	it("never includes raw content, rows, or errors", () => {
 		const serialized = JSON.stringify(
 			buildCacheFlightRecorderReport(hitTimeline),
@@ -225,16 +271,14 @@ describe("cache flight recorder command", () => {
 		expect(output.stderr.join("\n")).toContain(diagnostic);
 	});
 
-	it("reports minimal health without analytics", async () => {
+	it.each([
+		[{ retained: 4, dropped: 0, incomplete: 0 }, "healthy"],
+		[{ retained: 4, dropped: 0, incomplete: 1 }, "degraded"],
+		[{ retained: 4, dropped: 2, incomplete: 0 }, "unhealthy"],
+	] as const)("reports truthful minimal health for %j", async (counts, persistenceHealth) => {
 		const output = capture();
 		const result = await runCacheFlightRecorderCommand(
-			db({
-				getCacheFlightRecorderCounts: async () => ({
-					retained: 4,
-					dropped: 2,
-					incomplete: 1,
-				}),
-			}),
+			db({ getCacheFlightRecorderCounts: async () => counts }),
 			{ action: "health", json: true },
 			{ enabled: true, retentionHours: 72 },
 			output.io,
@@ -244,10 +288,10 @@ describe("cache flight recorder command", () => {
 			kind: "health",
 			enabled: true,
 			retentionHours: 72,
-			retainedCount: 4,
-			droppedCount: 2,
-			incompleteCount: 1,
-			persistenceHealth: "healthy",
+			retainedCount: counts.retained,
+			droppedCount: counts.dropped,
+			incompleteCount: counts.incomplete,
+			persistenceHealth,
 		});
 		expect(output.stdout[0]).not.toContain("causeRate");
 	});
