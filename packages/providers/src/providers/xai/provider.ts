@@ -4,8 +4,15 @@ import type { OpenAIRequest } from "@better-ccflare/openai-formats";
 import type { Account } from "@better-ccflare/types";
 import type { TokenRefreshResult } from "../../types";
 import { OpenAICompatibleProvider } from "../openai/provider";
+import {
+	deriveXaiConversationIdentity,
+	isOfficialXaiEndpoint,
+	isXaiCacheNativeEnabled,
+	XAI_CONV_ID_HEADER,
+} from "./cache-native";
 
 const log = new Logger("XaiProvider");
+const cacheLog = new Logger("XaiCacheNative");
 
 export const XAI_DEFAULT_ENDPOINT = "https://api.x.ai/v1";
 export const XAI_TOKEN_ENDPOINT = "https://auth.x.ai/oauth2/token";
@@ -140,5 +147,54 @@ export class XaiProvider extends OpenAICompatibleProvider {
 				include_usage: true,
 			};
 		}
+	}
+
+	/**
+	 * Attach official xAI Chat affinity (`x-grok-conv-id`) when the cache-native
+	 * feature is opted in. Header is derived from the original Anthropic body so
+	 * identity is request-scoped and does not require mutable provider state.
+	 */
+	override async transformRequestBody(
+		request: Request,
+		account?: Account,
+	): Promise<Request> {
+		if (!isXaiCacheNativeEnabled() || !isOfficialXaiEndpoint(account)) {
+			return super.transformRequestBody(request, account);
+		}
+
+		let originalBody: Record<string, unknown> | null = null;
+		try {
+			const contentType = request.headers.get("content-type");
+			if (contentType?.includes("application/json")) {
+				const clone = request.clone();
+				originalBody = (await clone.json()) as Record<string, unknown>;
+			}
+		} catch {
+			originalBody = null;
+		}
+
+		const transformed = await super.transformRequestBody(request, account);
+		if (!originalBody) return transformed;
+
+		const identity = deriveXaiConversationIdentity(originalBody);
+		if (!identity) {
+			cacheLog.debug(
+				"cache-native enabled but conversation identity omitted (bad metadata)",
+			);
+			return transformed;
+		}
+
+		const headers = new Headers(transformed.headers);
+		// Always overwrite any client-supplied value with the provider-derived one.
+		headers.set(XAI_CONV_ID_HEADER, identity.headerValue);
+		cacheLog.info(
+			`attach ${XAI_CONV_ID_HEADER} id=${identity.identityFingerprint} prefix=${identity.prefixFingerprint} account=${account?.id ?? "none"}`,
+		);
+
+		return new Request(transformed.url, {
+			method: transformed.method,
+			headers,
+			body: transformed.body,
+		});
 	}
 }
