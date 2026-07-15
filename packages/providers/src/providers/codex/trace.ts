@@ -28,7 +28,7 @@ export const CODEX_TRACE_HMAC_KEY_ENV = "CCFLARE_CODEX_TRACE_HMAC_KEY";
 /** Warn when one response spawns at least this many subagents (0 disables). */
 export const CODEX_FANOUT_WARN_ENV = "CCFLARE_CODEX_FANOUT_WARN";
 
-const TRACE_SCHEMA_VERSION = 8;
+const TRACE_SCHEMA_VERSION = 9;
 const DEFAULT_FANOUT_WARN = 8;
 const MAX_INPUT_ITEM_FINGERPRINTS = 64;
 /**
@@ -165,7 +165,19 @@ export function codexTraceEnabled(): boolean {
 }
 
 interface TraceInputs {
+	/** Logical client request identity, shared by all physical transports. */
 	requestId?: string;
+	/** Unique physical upstream transport identity. */
+	attemptId?: string;
+	/** One-based physical transport ordinal within the logical request. */
+	attemptOrdinal?: number;
+	attemptCause?:
+		| "initial"
+		| "model_fallback"
+		| "overload_529"
+		| "thinking_retry"
+		| "cache_control_retry"
+		| "other_retry";
 	account?: string;
 	modelIn?: string;
 	modelOut?: string;
@@ -216,6 +228,7 @@ interface TraceInputs {
 
 interface ResponseTraceInputs {
 	requestId?: string;
+	attemptId?: string;
 	modelOut?: string;
 	/** Raw model context window, for utilization telemetry. */
 	modelContextWindow?: number;
@@ -293,6 +306,9 @@ export function writeCodexTrace(inputs: TraceInputs): void {
 		phase: "request",
 		ts: new Date().toISOString(),
 		request_id: inputs.requestId ?? null,
+		attempt_id: inputs.attemptId ?? null,
+		attempt_ordinal: inputs.attemptOrdinal ?? null,
+		attempt_cause: inputs.attemptCause ?? null,
 		account: inputs.account ?? null,
 		model_in: inputs.modelIn ?? null,
 		model_out: inputs.modelOut ?? null,
@@ -351,6 +367,7 @@ export function writeCodexResponseTrace(inputs: ResponseTraceInputs): void {
 		phase: "response",
 		ts: new Date().toISOString(),
 		request_id: inputs.requestId ?? null,
+		attempt_id: inputs.attemptId ?? null,
 		model_out: inputs.modelOut ?? null,
 		context_utilization_pct: contextUtilizationPct(
 			inputs.summary.input_tokens,

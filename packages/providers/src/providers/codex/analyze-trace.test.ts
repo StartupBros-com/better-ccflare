@@ -678,39 +678,120 @@ describe("analyzeCodexTrace", () => {
 		expect(report.canary.unjoinedResponses).toBe(1);
 	});
 
-	test("uses deterministic last-record map semantics for duplicate IDs", () => {
+	test("retains duplicate logical IDs as distinct attempts without ambiguous joins", () => {
 		const report = analyzeCodexTrace([
 			{
 				phase: "request",
 				request_id: "duplicate",
+				attempt_id: "attempt-1",
+				attempt_ordinal: 1,
 				cache_key_assignment: "conversation",
 				cache_key_mode: "conversation",
 			},
 			{
 				phase: "request",
 				request_id: "duplicate",
+				attempt_id: "attempt-2",
+				attempt_ordinal: 2,
 				cache_key_assignment: "session",
 				cache_key_mode: "session",
 			},
 			{
 				phase: "response",
 				request_id: "duplicate",
+				attempt_id: "attempt-1",
 				input_tokens: 100,
 				cache_read_input_tokens: 0,
 			},
 			{
 				phase: "response",
 				request_id: "duplicate",
+				attempt_id: "attempt-2",
 				input_tokens: 100,
 				cache_read_input_tokens: 100,
 			},
 		]);
 
-		expect(report.canary.conversation.assignedRequests).toBe(0);
+		expect(report.logicalRequests).toBe(1);
+		expect(report.attempts).toBe(2);
+		expect(report.joins).toEqual({ missing: 0, ambiguous: 0 });
+		expect(report.canary.conversation.assignedRequests).toBe(1);
 		expect(report.canary.session.assignedRequests).toBe(1);
-		expect(report.canary.session.joinedTerminalResponses).toBe(1);
+		expect(report.canary.conversation.weightedCacheReusePct).toBe(0);
 		expect(report.canary.session.weightedCacheReusePct).toBe(100);
-		expect(report.canary.unjoinedResponses).toBe(0);
+		expect(report.cacheDenominators.attemptInclusive.measuredResponses).toBe(2);
+		expect(report.cacheDenominators.finalResponseOnly.measuredResponses).toBe(
+			1,
+		);
+		expect(
+			report.cacheDenominators.finalResponseOnly.weightedCacheReusePct,
+		).toBe(100);
+	});
+
+	test("reports experiment readiness and request-rate concentration", () => {
+		const records = Array.from({ length: 16 }, (_, index) => ({
+			phase: "request" as const,
+			request_id: `r-${index}`,
+			attempt_id: `a-${index}`,
+			ts: `2026-07-10T00:00:${String(index).padStart(2, "0")}Z`,
+			cache_key_assignment: "conversation" as const,
+			cache_key_mode:
+				index === 0 ? ("session" as const) : ("conversation" as const),
+			prompt_cache_key_id: "concentrated-key",
+		}));
+		const report = analyzeCodexTrace(records);
+		expect(report.readiness.treatmentAbsent).toBe(true);
+		expect(report.readiness.assignmentEffectiveCrossovers).toBe(1);
+		expect(report.readiness.keysOver15RequestsPerMinute).toBe(1);
+		expect(report.readiness.maxRequestsPerKeyMinute).toBe(16);
+	});
+
+	test("counts mixed schema 6-8 duplicate logical IDs as ambiguous joins", () => {
+		const report = analyzeCodexTrace([
+			{ trace_schema_version: 6, phase: "request", request_id: "legacy" },
+			{ trace_schema_version: 8, phase: "request", request_id: "legacy" },
+			{ trace_schema_version: 8, phase: "response", request_id: "legacy" },
+		]);
+		expect(report.logicalRequests).toBe(1);
+		expect(report.attempts).toBe(2);
+		expect(report.joins.ambiguous).toBe(1);
+	});
+
+	test("counts missing request and response sides without last-write-wins", () => {
+		const report = analyzeCodexTrace([
+			{
+				trace_schema_version: 9,
+				phase: "request",
+				request_id: "missing-response",
+				attempt_id: "request-only",
+			},
+			{
+				trace_schema_version: 9,
+				phase: "response",
+				request_id: "missing-request",
+				attempt_id: "response-only",
+			},
+			{
+				trace_schema_version: 9,
+				phase: "request",
+				request_id: "duplicate-attempt",
+				attempt_id: "duplicate-id",
+			},
+			{
+				trace_schema_version: 9,
+				phase: "request",
+				request_id: "duplicate-attempt",
+				attempt_id: "duplicate-id",
+			},
+			{
+				trace_schema_version: 9,
+				phase: "response",
+				request_id: "duplicate-attempt",
+				attempt_id: "duplicate-id",
+			},
+		]);
+		expect(report.joins).toEqual({ missing: 2, ambiguous: 1 });
+		expect(report.response.unjoinedResponses).toBe(2);
 	});
 
 	test("formats explicit canary denominators and crossover labels", () => {

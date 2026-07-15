@@ -23,6 +23,10 @@ describe("writeCodexTrace schema 8 cache-key decision", () => {
 		try {
 			writeCodexTrace({
 				codexInput: [],
+				requestId: "logical-1",
+				attemptId: "attempt-1",
+				attemptOrdinal: 2,
+				attemptCause: "model_fallback",
 				promptCacheKeySet: true,
 				promptCacheKeyId: "not-a-semantic-prefix",
 				cacheKeyMode: "session",
@@ -37,7 +41,11 @@ describe("writeCodexTrace schema 8 cache-key decision", () => {
 				readFileSync(join(dir, file as string), "utf8").trim(),
 			);
 			expect(record).toMatchObject({
-				trace_schema_version: 8,
+				trace_schema_version: 9,
+				request_id: "logical-1",
+				attempt_id: "attempt-1",
+				attempt_ordinal: 2,
+				attempt_cause: "model_fallback",
 				cache_key_assignment: "conversation",
 				cache_key_cohort_id: "0123456789abcdef",
 				conversation_id: "fedcba9876543210",

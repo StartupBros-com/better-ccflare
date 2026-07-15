@@ -17,6 +17,9 @@ export interface TraceRecord {
 	phase?: "request" | "response";
 	ts?: string;
 	request_id?: string | null;
+	attempt_id?: string | null;
+	attempt_ordinal?: number | null;
+	attempt_cause?: string | null;
 	model_in?: string | null;
 	model_out?: string | null;
 	account?: string | null;
@@ -124,6 +127,25 @@ export interface CanaryArmStats {
 export interface TraceReport {
 	requests: number;
 	responses: number;
+	logicalRequests: number;
+	attempts: number;
+	joins: { missing: number; ambiguous: number };
+	cacheDenominators: {
+		attemptInclusive: {
+			measuredResponses: number;
+			weightedCacheReusePct: number | null;
+		};
+		finalResponseOnly: {
+			measuredResponses: number;
+			weightedCacheReusePct: number | null;
+		};
+	};
+	readiness: {
+		treatmentAbsent: boolean;
+		assignmentEffectiveCrossovers: number;
+		maxRequestsPerKeyMinute: number;
+		keysOver15RequestsPerMinute: number;
+	};
 	span: { first?: string; last?: string };
 	canary: {
 		conversation: CanaryArmStats;
@@ -376,19 +398,39 @@ function analyzeCanary(
 	requestRecords: readonly TraceRecord[],
 	responseRecords: readonly TraceRecord[],
 ): TraceReport["canary"] {
-	const requestsById = new Map<string, TraceRecord>();
-	const responsesById = new Map<string, TraceRecord>();
-	const requestsWithoutId: TraceRecord[] = [];
+	const requestAttemptsById = new Map<string, TraceRecord>();
+	const responseAttemptsById = new Map<string, TraceRecord>();
+	const legacyRequestsByLogicalId = new Map<string, TraceRecord[]>();
+	const legacyResponsesByLogicalId = new Map<string, TraceRecord[]>();
 	let responsesWithoutId = 0;
 	for (const request of requestRecords) {
-		if (request.request_id) requestsById.set(request.request_id, request);
-		else requestsWithoutId.push(request);
+		if (request.attempt_id)
+			requestAttemptsById.set(request.attempt_id, request);
+		else if (request.request_id) {
+			const group = legacyRequestsByLogicalId.get(request.request_id) ?? [];
+			group.push(request);
+			legacyRequestsByLogicalId.set(request.request_id, group);
+		}
 	}
 	for (const response of responseRecords) {
-		if (response.request_id) responsesById.set(response.request_id, response);
-		else responsesWithoutId++;
+		if (response.attempt_id)
+			responseAttemptsById.set(response.attempt_id, response);
+		else if (response.request_id) {
+			const group = legacyResponsesByLogicalId.get(response.request_id) ?? [];
+			group.push(response);
+			legacyResponsesByLogicalId.set(response.request_id, group);
+		} else responsesWithoutId++;
 	}
-	const retainedRequests = [...requestsById.values(), ...requestsWithoutId];
+	const retainedRequests = [...requestRecords];
+	const responseFor = (request: TraceRecord): TraceRecord | undefined => {
+		if (request.attempt_id) return responseAttemptsById.get(request.attempt_id);
+		if (!request.request_id) return undefined;
+		const requests = legacyRequestsByLogicalId.get(request.request_id) ?? [];
+		const responses = legacyResponsesByLogicalId.get(request.request_id) ?? [];
+		return requests.length === 1 && responses.length === 1
+			? responses[0]
+			: undefined;
+	};
 
 	const conversationRequests = new Map<string, TraceRecord[]>();
 	for (const request of retainedRequests) {
@@ -442,9 +484,7 @@ function analyzeCanary(
 				? arm.turns.first
 				: arm.turns.followUp;
 		turn.requests++;
-		const response = request.request_id
-			? responsesById.get(request.request_id)
-			: undefined;
+		const response = responseFor(request);
 		if (!response) {
 			arm.missingTerminalRequests++;
 			continue;
@@ -475,8 +515,14 @@ function analyzeCanary(
 	}
 
 	let unjoinedResponses = responsesWithoutId;
-	for (const requestId of responsesById.keys())
-		if (!requestsById.has(requestId)) unjoinedResponses++;
+	for (const attemptId of responseAttemptsById.keys())
+		if (!requestAttemptsById.has(attemptId)) unjoinedResponses++;
+	for (const [requestId, responses] of legacyResponsesByLogicalId) {
+		const requests = legacyRequestsByLogicalId.get(requestId) ?? [];
+		if (requests.length !== 1 || responses.length !== 1) {
+			unjoinedResponses += responses.length;
+		}
+	}
 	return {
 		conversation: finishCanaryArm(arms.conversation),
 		session: finishCanaryArm(arms.session),
@@ -575,8 +621,115 @@ export function analyzeCodexTrace(
 	const responseRecords = records.filter(
 		(record) => record.phase === "response",
 	);
+	const logicalIds = new Set(
+		requestRecords
+			.map((record) => record.request_id)
+			.filter((id): id is string => Boolean(id)),
+	);
+	const requestsByLogicalId = new Map<string, TraceRecord[]>();
+	for (const request of requestRecords) {
+		if (!request.request_id) continue;
+		const group = requestsByLogicalId.get(request.request_id) ?? [];
+		group.push(request);
+		requestsByLogicalId.set(request.request_id, group);
+	}
+	const requestsByAttemptId = new Map<string, TraceRecord[]>();
+	const responsesByAttemptId = new Map<string, TraceRecord[]>();
+	const legacyRequestsByLogicalId = new Map<string, TraceRecord[]>();
+	const legacyResponsesByLogicalId = new Map<string, TraceRecord[]>();
+	for (const request of requestRecords) {
+		const map = request.attempt_id
+			? requestsByAttemptId
+			: legacyRequestsByLogicalId;
+		const id = request.attempt_id ?? request.request_id;
+		if (!id) continue;
+		const group = map.get(id) ?? [];
+		group.push(request);
+		map.set(id, group);
+	}
+	for (const response of responseRecords) {
+		const map = response.attempt_id
+			? responsesByAttemptId
+			: legacyResponsesByLogicalId;
+		const id = response.attempt_id ?? response.request_id;
+		if (!id) continue;
+		const group = map.get(id) ?? [];
+		group.push(response);
+		map.set(id, group);
+	}
+	let missingJoins = records.filter(
+		(record) => !record.request_id && !record.attempt_id,
+	).length;
+	let ambiguousJoins = 0;
+	const countJoinQuality = (
+		requests: ReadonlyMap<string, TraceRecord[]>,
+		responses: ReadonlyMap<string, TraceRecord[]>,
+	) => {
+		for (const id of new Set([...requests.keys(), ...responses.keys()])) {
+			const requestCount = requests.get(id)?.length ?? 0;
+			const responseCount = responses.get(id)?.length ?? 0;
+			if (requestCount === 0 || responseCount === 0) {
+				missingJoins += Math.max(requestCount, responseCount);
+			} else if (requestCount !== 1 || responseCount !== 1) {
+				ambiguousJoins++;
+			}
+		}
+	};
+	countJoinQuality(requestsByAttemptId, responsesByAttemptId);
+	countJoinQuality(legacyRequestsByLogicalId, legacyResponsesByLogicalId);
+	const measuredStats = (samples: readonly TraceRecord[]) => {
+		let input = 0;
+		let cacheRead = 0;
+		let measuredResponses = 0;
+		for (const sample of samples) {
+			if (typeof sample.cache_read_input_tokens !== "number") continue;
+			const sampleInput = sample.input_tokens ?? 0;
+			input += sampleInput;
+			cacheRead += Math.min(
+				Math.max(sample.cache_read_input_tokens, 0),
+				sampleInput,
+			);
+			measuredResponses++;
+		}
+		return {
+			measuredResponses,
+			weightedCacheReusePct:
+				input > 0 ? Math.round((1000 * cacheRead) / input) / 10 : null,
+		};
+	};
+	const finalResponses: TraceRecord[] = [];
+	for (const [logicalId, attempts] of requestsByLogicalId) {
+		const ordered = [...attempts].sort(
+			(a, b) =>
+				(a.attempt_ordinal ?? 0) - (b.attempt_ordinal ?? 0) ||
+				(a.ts ?? "").localeCompare(b.ts ?? ""),
+		);
+		const finalAttempt = ordered.at(-1);
+		const attemptResponses = finalAttempt?.attempt_id
+			? responsesByAttemptId.get(finalAttempt.attempt_id)
+			: undefined;
+		const joined = finalAttempt?.attempt_id
+			? attemptResponses?.length === 1
+				? attemptResponses[0]
+				: undefined
+			: attempts.length === 1 &&
+					(legacyResponsesByLogicalId.get(logicalId)?.length ?? 0) === 1
+				? legacyResponsesByLogicalId.get(logicalId)?.[0]
+				: undefined;
+		if (joined) finalResponses.push(joined);
+	}
+	const minuteCounts = new Map<string, number>();
+	for (const request of requestRecords) {
+		if (!request.prompt_cache_key_id || !request.ts) continue;
+		const timestamp = Date.parse(request.ts);
+		if (!Number.isFinite(timestamp)) continue;
+		const bucket = `${request.prompt_cache_key_id}:${Math.floor(timestamp / 60_000)}`;
+		minuteCounts.set(bucket, (minuteCounts.get(bucket) ?? 0) + 1);
+	}
+	const concentration = [...minuteCounts.values()];
 	const sessions = new Map<string, number>();
-	const requestKeySetById = new Map<string, boolean>();
+	const requestKeySetByAttemptId = new Map<string, boolean>();
+	const legacyRequestKeySetByLogicalId = new Map<string, boolean>();
 	let maxHistoryToolCalls = 0;
 	let maxInputItems = 0;
 	let maxApproxInputChars = 0;
@@ -593,11 +746,23 @@ export function analyzeCodexTrace(
 			request.approx_input_chars ?? 0,
 		);
 		totalNudges += request.nudge_count ?? 0;
-		if (request.request_id)
-			requestKeySetById.set(
-				request.request_id,
-				request.prompt_cache_key_set === true,
-			);
+		if (request.attempt_id) {
+			const requests = requestsByAttemptId.get(request.attempt_id) ?? [];
+			if (requests.length === 1) {
+				requestKeySetByAttemptId.set(
+					request.attempt_id,
+					request.prompt_cache_key_set === true,
+				);
+			}
+		} else if (request.request_id) {
+			const requests = legacyRequestsByLogicalId.get(request.request_id) ?? [];
+			if (requests.length === 1) {
+				legacyRequestKeySetByLogicalId.set(
+					request.request_id,
+					request.prompt_cache_key_set === true,
+				);
+			}
+		}
 		if (request.session_key_hash)
 			sessions.set(
 				request.session_key_hash,
@@ -711,9 +876,15 @@ export function analyzeCodexTrace(
 			contextBand.inputTokens += input;
 			contextBand.cacheReadInputTokens += cacheRead;
 		}
-		const keySet = response.request_id
-			? requestKeySetById.get(response.request_id)
-			: undefined;
+		const keySet = response.attempt_id
+			? (responsesByAttemptId.get(response.attempt_id)?.length ?? 0) === 1
+				? requestKeySetByAttemptId.get(response.attempt_id)
+				: undefined
+			: response.request_id &&
+					(legacyResponsesByLogicalId.get(response.request_id)?.length ?? 0) ===
+						1
+				? legacyRequestKeySetByLogicalId.get(response.request_id)
+				: undefined;
 		if (keySet === undefined) unjoinedResponses++;
 		else
 			cohortSamples[keySet ? "keyOn" : "keyOff"].push({
@@ -750,6 +921,31 @@ export function analyzeCodexTrace(
 	return {
 		requests: requestRecords.length,
 		responses: responseRecords.length,
+		logicalRequests:
+			logicalIds.size +
+			requestRecords.filter((record) => !record.request_id).length,
+		attempts: requestRecords.length,
+		joins: { missing: missingJoins, ambiguous: ambiguousJoins },
+		cacheDenominators: {
+			attemptInclusive: measuredStats(responseRecords),
+			finalResponseOnly: measuredStats(finalResponses),
+		},
+		readiness: {
+			treatmentAbsent: !requestRecords.some(
+				(request) => request.cache_key_assignment === "session",
+			),
+			assignmentEffectiveCrossovers: requestRecords.filter(
+				(request) =>
+					request.cache_key_assignment !== null &&
+					request.cache_key_assignment !== undefined &&
+					request.cache_key_mode !== null &&
+					request.cache_key_mode !== undefined &&
+					request.cache_key_assignment !== request.cache_key_mode,
+			).length,
+			maxRequestsPerKeyMinute: Math.max(0, ...concentration),
+			keysOver15RequestsPerMinute: concentration.filter((count) => count > 15)
+				.length,
+		},
 		span: { first: timestamps[0], last: timestamps.at(-1) },
 		canary: analyzeCanary(requestRecords, responseRecords),
 		request: {
@@ -844,8 +1040,14 @@ export function formatReport(report: TraceReport): string {
 	const lines = [
 		`FINGERPRINT AVAILABILITY: usable=${report.request.fingerprintCoverage.usable} missing=${report.request.fingerprintCoverage.missing} truncated=${report.request.fingerprintCoverage.truncated}`,
 		`span              : ${report.span.first ?? "?"} -> ${report.span.last ?? "?"}`,
+		`logical requests  : ${report.logicalRequests}`,
+		`physical attempts : ${report.attempts}`,
 		`request records   : ${report.requests}`,
 		`response records  : ${report.responses}`,
+		`joins             : missing=${report.joins.missing} ambiguous=${report.joins.ambiguous}`,
+		`cache denominators: final=${JSON.stringify(report.cacheDenominators.finalResponseOnly)} attempts=${JSON.stringify(report.cacheDenominators.attemptInclusive)}`,
+		`experiment ready  : treatment-absent=${report.readiness.treatmentAbsent} crossovers=${report.readiness.assignmentEffectiveCrossovers}`,
+		`key concentration : max=${report.readiness.maxRequestsPerKeyMinute}/min keys-over-15=${report.readiness.keysOver15RequestsPerMinute}`,
 		"",
 		"REQUEST (historical replay load, NOT new fan-out):",
 		`  max history tool calls/req : ${report.request.maxHistoryToolCalls}`,

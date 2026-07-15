@@ -32,6 +32,10 @@ const log = new Logger("CodexProvider");
 
 const INTERNAL_HEADERS = [
 	"x-better-ccflare-request-id",
+	"x-better-ccflare-attempt-id",
+	"x-better-ccflare-attempt-ordinal",
+	"x-better-ccflare-attempt-cause",
+	"x-better-ccflare-final-model",
 	"x-better-ccflare-request-stream",
 	"x-better-ccflare-pacing-canary",
 	"x-better-ccflare-pacing-cohort-id",
@@ -393,6 +397,7 @@ interface StreamState {
 	// Newly emitted tool calls from this response only (not historical replay).
 	traceNewToolCalls: ToolCallSummary[];
 	traceRequestId: string;
+	traceAttemptId?: string;
 }
 
 export class CodexProvider extends BaseProvider {
@@ -553,6 +558,15 @@ export class CodexProvider extends BaseProvider {
 			}
 
 			const requestId = request.headers.get("x-better-ccflare-request-id");
+			const attemptId = request.headers.get("x-better-ccflare-attempt-id");
+			const attemptOrdinal = Number.parseInt(
+				request.headers.get("x-better-ccflare-attempt-ordinal") ?? "",
+				10,
+			);
+			const attemptCause = request.headers.get(
+				"x-better-ccflare-attempt-cause",
+			) as Parameters<typeof writeCodexTrace>[0]["attemptCause"];
+			const finalModel = request.headers.get("x-better-ccflare-final-model");
 			const isAttributedAgent =
 				request.headers.get("x-better-ccflare-attributed-agent") === "true";
 			if (requestId) {
@@ -576,10 +590,18 @@ export class CodexProvider extends BaseProvider {
 				// ChatGPT's subscription Responses endpoint rejects this API-only field.
 				delete codexBody.max_output_tokens;
 			}
+			// Model fallback is selected after provider conversion. Apply the final wire
+			// model before tracing so the record and body describe the same transport.
+			if (finalModel) codexBody.model = finalModel;
 
 			// Best-effort, env-gated observability (no-op unless CCFLARE_CODEX_TRACE_DIR set).
 			writeCodexTrace({
 				requestId: requestId ?? undefined,
+				attemptId: attemptId ?? undefined,
+				attemptOrdinal: Number.isFinite(attemptOrdinal)
+					? attemptOrdinal
+					: undefined,
+				attemptCause: attemptCause ?? undefined,
 				account: account?.name,
 				modelIn: body.model,
 				modelOut: codexBody.model,
@@ -619,6 +641,10 @@ export class CodexProvider extends BaseProvider {
 			);
 
 			newHeaders.delete("x-better-ccflare-request-id");
+			newHeaders.delete("x-better-ccflare-attempt-id");
+			newHeaders.delete("x-better-ccflare-attempt-ordinal");
+			newHeaders.delete("x-better-ccflare-attempt-cause");
+			newHeaders.delete("x-better-ccflare-final-model");
 			newHeaders.delete("x-better-ccflare-attributed-agent");
 			newHeaders.delete("x-better-ccflare-pacing-canary");
 			newHeaders.delete("x-better-ccflare-pacing-cohort-id");
@@ -653,6 +679,7 @@ export class CodexProvider extends BaseProvider {
 	): Promise<Response> {
 		const contentType = response.headers.get("content-type");
 		const requestId = response.headers.get("x-better-ccflare-request-id");
+		const attemptId = response.headers.get("x-better-ccflare-attempt-id");
 		const headerRequestedStream = response.headers.get(
 			"x-better-ccflare-request-stream",
 		);
@@ -673,9 +700,14 @@ export class CodexProvider extends BaseProvider {
 				return this.transformStreamingResponse(
 					response,
 					requestId ?? undefined,
+					attemptId ?? undefined,
 				);
 			}
-			return this.transformSseResponseToJson(response, requestId ?? undefined);
+			return this.transformSseResponseToJson(
+				response,
+				requestId ?? undefined,
+				attemptId ?? undefined,
+			);
 		}
 
 		if (response.ok && response.body !== null && contentType === null) {
@@ -693,11 +725,13 @@ export class CodexProvider extends BaseProvider {
 				return this.transformStreamingResponse(
 					sseResponse,
 					requestId ?? undefined,
+					attemptId ?? undefined,
 				);
 			}
 			return this.transformSseResponseToJson(
 				sseResponse,
 				requestId ?? undefined,
+				attemptId ?? undefined,
 			);
 		}
 
@@ -1344,8 +1378,14 @@ export class CodexProvider extends BaseProvider {
 		response: Response,
 		requestId = response.headers.get("x-better-ccflare-request-id") ??
 			"unknown",
+		attemptId = response.headers.get("x-better-ccflare-attempt-id") ??
+			undefined,
 	): Promise<Response> {
-		const transformed = this.transformStreamingResponse(response, requestId);
+		const transformed = this.transformStreamingResponse(
+			response,
+			requestId,
+			attemptId,
+		);
 		const reader = transformed.body
 			?.pipeThrough(new TextDecoderStream())
 			.getReader();
@@ -1542,6 +1582,8 @@ export class CodexProvider extends BaseProvider {
 		response: Response,
 		requestId = response.headers.get("x-better-ccflare-request-id") ??
 			"unknown",
+		attemptId = response.headers.get("x-better-ccflare-attempt-id") ??
+			undefined,
 	): Response {
 		if (process.env.DEBUG?.includes("model") || process.env.DEBUG === "true") {
 			log.info(
@@ -1566,6 +1608,7 @@ export class CodexProvider extends BaseProvider {
 			sawToolUse: false,
 			traceNewToolCalls: [],
 			traceRequestId: requestId,
+			traceAttemptId: attemptId,
 		};
 
 		const headers = sanitizeResponseHeaders(response.headers);
@@ -1725,10 +1768,16 @@ export class CodexProvider extends BaseProvider {
 							stop_reason: stopReason,
 							stop_sequence: null,
 						},
-						usage: { output_tokens: state.outputTokens },
+						usage: {
+							input_tokens: state.inputTokens,
+							output_tokens: state.outputTokens,
+							cache_read_input_tokens: state.cacheReadInputTokens,
+							cache_creation_input_tokens: state.cacheCreationInputTokens,
+						},
 					});
 					writeCodexResponseTrace({
 						requestId,
+						attemptId: state.traceAttemptId,
 						modelOut: state.model,
 						modelContextWindow: resolveModelContextCapability(
 							"codex",
@@ -1736,7 +1785,12 @@ export class CodexProvider extends BaseProvider {
 						)?.rawContextWindow,
 						summary: summarizeCodexResponse(
 							state.traceNewToolCalls,
-							{ output_tokens: state.outputTokens },
+							{
+								input_tokens: state.totalInputTokens,
+								output_tokens: state.outputTokens,
+								cache_read_input_tokens: state.cacheReadInputTokens,
+								cache_creation_input_tokens: state.cacheCreationInputTokens,
+							},
 							stopReason,
 						),
 					});
@@ -1889,6 +1943,41 @@ export class CodexProvider extends BaseProvider {
 		switch (eventName) {
 			case "response.created": {
 				const resp = data.response as Record<string, unknown> | undefined;
+				const usage = resp?.usage as
+					| {
+							input_tokens?: number;
+							output_tokens?: number;
+							input_tokens_details?: {
+								cached_tokens?: number;
+								cache_creation_input_tokens?: number;
+							};
+					  }
+					| undefined;
+				if (usage) {
+					const normalized = normalizeCodexInputUsage(
+						usage.input_tokens,
+						usage.input_tokens_details?.cached_tokens,
+					);
+					state.totalInputTokens = normalized.totalInputTokens;
+					state.inputTokens = normalized.inputTokens;
+					state.cacheReadInputTokens = normalized.cacheReadInputTokens;
+					if (
+						typeof usage.output_tokens === "number" &&
+						Number.isFinite(usage.output_tokens) &&
+						usage.output_tokens >= 0
+					) {
+						state.outputTokens = usage.output_tokens;
+					}
+					const cacheCreation =
+						usage.input_tokens_details?.cache_creation_input_tokens;
+					if (
+						typeof cacheCreation === "number" &&
+						Number.isFinite(cacheCreation) &&
+						cacheCreation >= 0
+					) {
+						state.cacheCreationInputTokens = cacheCreation;
+					}
+				}
 				const respId = (resp?.id as string) || state.messageId;
 				state.messageId = respId;
 				state.model = (resp?.model as string) || state.model;
@@ -2112,6 +2201,7 @@ export class CodexProvider extends BaseProvider {
 					);
 					writeCodexResponseTrace({
 						requestId: state.traceRequestId,
+						attemptId: state.traceAttemptId,
 						modelOut: state.model,
 						modelContextWindow: resolveModelContextCapability(
 							"codex",
@@ -2233,6 +2323,7 @@ export class CodexProvider extends BaseProvider {
 				await writeSSE("message_delta", messageDelta);
 				writeCodexResponseTrace({
 					requestId: state.traceRequestId,
+					attemptId: state.traceAttemptId,
 					modelOut: state.model,
 					modelContextWindow: resolveModelContextCapability(
 						"codex",

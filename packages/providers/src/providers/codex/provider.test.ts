@@ -2134,6 +2134,59 @@ describe("CodexProvider.processResponse", () => {
 		expect(body.error.status).toBe("rate_limited");
 	});
 
+	it("preserves early usage in client and trace when the stream ends abruptly", async () => {
+		const provider = new CodexProvider();
+		const traceDir = mkdtempSync(join(tmpdir(), "codex-trace-"));
+		process.env[CODEX_TRACE_DIR_ENV] = traceDir;
+		try {
+			const upstreamBody = sseBody([
+				...eventLine("response.created", {
+					response: {
+						id: "resp_abrupt",
+						model: "gpt-5.5",
+						usage: {
+							input_tokens: 100,
+							output_tokens: 7,
+							input_tokens_details: {
+								cached_tokens: 60,
+								cache_creation_input_tokens: 5,
+							},
+						},
+					},
+				}),
+			]);
+			const response = new Response(upstreamBody, {
+				status: 200,
+				headers: {
+					"content-type": "text/event-stream",
+					"x-better-ccflare-request-id": "logical-abrupt",
+					"x-better-ccflare-attempt-id": "attempt-abrupt",
+				},
+			});
+
+			const body = await (
+				await provider.processResponse(response, null)
+			).text();
+			expect(body).toContain(
+				'"usage":{"input_tokens":40,"output_tokens":7,"cache_read_input_tokens":60,"cache_creation_input_tokens":5}',
+			);
+			const record = readTraceRecords(traceDir).find(
+				(candidate) => candidate.phase === "response",
+			);
+			expect(record).toMatchObject({
+				request_id: "logical-abrupt",
+				attempt_id: "attempt-abrupt",
+				input_tokens: 100,
+				output_tokens: 7,
+				cache_read_input_tokens: 60,
+				cache_creation_input_tokens: 5,
+			});
+		} finally {
+			delete process.env[CODEX_TRACE_DIR_ENV];
+			rmSync(traceDir, { recursive: true, force: true });
+		}
+	});
+
 	it("does not emit terminal events after response.failed when response.completed follows", async () => {
 		const provider = new CodexProvider();
 		const upstreamBody = sseBody([
@@ -2927,7 +2980,7 @@ describe("CodexProvider.transformRequestBody", () => {
 				(record) => record.phase === "request",
 			);
 			expect(requestTrace).toMatchObject({
-				trace_schema_version: 8,
+				trace_schema_version: 9,
 				orchestration_admission: "no_session",
 				is_descendant: true,
 				tools_before_count: 3,
