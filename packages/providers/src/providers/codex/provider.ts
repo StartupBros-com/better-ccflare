@@ -50,7 +50,8 @@ const TOKEN_URL = "https://auth.openai.com/oauth/token";
 const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 export const CODEX_DEFAULT_ENDPOINT =
 	"https://chatgpt.com/backend-api/codex/responses";
-export const CODEX_VERSION = "0.144.1";
+export const CODEX_VERSION = "0.144.4";
+const OPENAI_PROMPT_CACHE_HOSTS = new Set(["chatgpt.com", "api.openai.com"]);
 export const CODEX_USER_AGENT = `codex-cli/${CODEX_VERSION} (Windows 10.0.26100; x64)`;
 export const CODEX_PING_MODEL = "gpt-5-codex";
 const CODEX_SYNTHETIC_COUNT_TOKENS_URL =
@@ -121,6 +122,18 @@ export function isCodexSubscriptionEndpoint(endpoint: string): boolean {
 			candidate.origin === subscription.origin &&
 			normalizePath(candidate.pathname) === normalizePath(subscription.pathname)
 		);
+	} catch {
+		return false;
+	}
+}
+
+function isOpenAiPromptCacheEndpoint(account?: Account): boolean {
+	try {
+		const endpoint = resolveCodexEndpoint(
+			account?.custom_endpoint,
+			account?.name,
+		);
+		return OPENAI_PROMPT_CACHE_HOSTS.has(new URL(endpoint).hostname);
 	} catch {
 		return false;
 	}
@@ -804,6 +817,7 @@ export class CodexProvider extends BaseProvider {
 		body: AnthropicRequest,
 		instructions: string,
 		input: readonly unknown[],
+		account?: Account,
 	): CodexPromptCacheKeyDecision {
 		const ineligible: CodexPromptCacheKeyDecision = {
 			key: null,
@@ -813,7 +827,8 @@ export class CodexProvider extends BaseProvider {
 			cohortId: null,
 			conversationIdentity: null,
 		};
-		if (process.env[CODEX_PROMPT_CACHE_KEY_ENV] !== "1") return ineligible;
+		if (process.env[CODEX_PROMPT_CACHE_KEY_ENV] === "0") return ineligible;
+		if (!isOpenAiPromptCacheEndpoint(account)) return ineligible;
 		const sessionId = this.extractSessionId(body);
 		if (!sessionId) return ineligible;
 
@@ -1274,6 +1289,7 @@ export class CodexProvider extends BaseProvider {
 			body,
 			codexRequest.instructions,
 			input,
+			account,
 		);
 		if (cacheKeyDecision.key) {
 			codexRequest.prompt_cache_key = cacheKeyDecision.key;

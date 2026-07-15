@@ -214,25 +214,25 @@ This switch disables root election only. Trusted descendant filtering and `CCFLA
 
 ### Codex prompt-cache-key canary
 
-The Codex prompt-cache-key canary compares the existing conversation-scoped key with a session-scoped key. It is off by default and assigns each eligible Claude session deterministically, so every validated request in that session remains in the same arm across turns, sibling conversations, provider instances, and service restarts.
+The Codex prompt-cache-key canary compares the existing conversation-scoped key with a session-scoped key. Prompt cache keys are enabled by default for OpenAI-owned `chatgpt.com` and `api.openai.com` endpoints, while the session-mode treatment is off by default. The canary assigns each eligible Claude session deterministically, so every validated request in that session remains in the same arm across turns, sibling conversations, provider instances, and service restarts.
 
-Configure the canary in the systemd environment:
+Configure the canary percentage in the systemd environment:
 
 ```ini
-Environment=CCFLARE_CODEX_PROMPT_CACHE_KEY=1
 Environment=CCFLARE_CODEX_CACHE_KEY_SESSION_PERCENT=0
 ```
 
 `CCFLARE_CODEX_CACHE_KEY_SESSION_PERCENT` produces an effective percentage from 0 through 100. Parsing accepts only an unsigned base-10 integer with no sign, fraction, exponent, or surrounding whitespace. Missing, empty, malformed, signed, fractional, exponential, and whitespace-padded values become `0`. Valid integers above `100` clamp to `100`.
 
-Eligible requests must contain valid Claude session metadata. The normalized session UUID is assigned through a domain-separated SHA-256 bucket. Requests outside the configured percentage use the `conversation` control arm, while requests inside it use the `session` treatment arm. Invalid or missing session metadata is not assigned and emits no prompt cache key.
+Eligible requests must target an OpenAI-owned prompt-cache endpoint and contain valid Claude session metadata. The normalized session UUID is assigned through a domain-separated SHA-256 bucket. Requests outside the configured percentage use the `conversation` control arm, while requests inside it use the `session` treatment arm. Custom or self-hosted OpenAI-compatible endpoints and invalid or missing session metadata are not assigned and emit no prompt cache key.
 
 Configuration precedence is:
 
-1. `CCFLARE_CODEX_PROMPT_CACHE_KEY` is the feature gate. Unless it equals `1`, no prompt cache key or eligible experiment assignment is emitted.
-2. Missing or malformed Claude session metadata remains ineligible and emits no key.
-3. `CCFLARE_CODEX_CACHE_KEY_MODE=session` is an explicit all-session override. It produces a session key and records effective session behavior even if deterministic assignment would select conversation mode.
-4. Without the explicit override, the deterministic canary assignment selects the existing conversation or session key derivation.
+1. `CCFLARE_CODEX_PROMPT_CACHE_KEY=0` is the explicit global opt-out. Unset or other values leave prompt cache keys enabled by default.
+2. The account selected for the transform must resolve to OpenAI's `chatgpt.com` or `api.openai.com` endpoint. Other endpoints are ineligible and emit no key or assignment.
+3. Missing or malformed Claude session metadata remains ineligible and emits no key.
+4. `CCFLARE_CODEX_CACHE_KEY_MODE=session` is an explicit all-session override. It produces a session key and records effective session behavior even if deterministic assignment would select conversation mode.
+5. Without the explicit override, the deterministic canary assignment selects the conversation or session key derivation. Empty transformed input retains the existing session-key fallback; other control requests use conversation mode.
 
 At `0`, eligible traffic retains the current conversation-key behavior. At `100`, all eligible sessions use session keys. Changing the percentage can reclassify sessions near the threshold, so keep it fixed throughout an observation window. Do not use repeated percentage changes as a ramping mechanism within one cohort window.
 
@@ -292,6 +292,6 @@ systemctl daemon-reload
 systemctl restart ccflare-stack.service
 ```
 
-Leave `CCFLARE_CODEX_PROMPT_CACHE_KEY=1` unchanged to preserve the existing conversation-scoped prompt-cache-key behavior. Remove `CCFLARE_CODEX_CACHE_KEY_MODE=session` if an explicit session override was present, because that override takes precedence over the percentage. If prompt cache keys themselves must be disabled, set `CCFLARE_CODEX_PROMPT_CACHE_KEY=0` as a separate rollback decision.
+Leave `CCFLARE_CODEX_PROMPT_CACHE_KEY` unset to preserve the default-enabled conversation-scoped prompt-cache-key behavior, or retain any existing nonzero value. Remove `CCFLARE_CODEX_CACHE_KEY_MODE=session` if an explicit session override was present, because that override takes precedence over the percentage. If prompt cache keys themselves must be disabled, set `CCFLARE_CODEX_PROMPT_CACHE_KEY=0` as a separate rollback decision.
 
 Accounts with mature repeated 429 streaks use process-local single-flight recovery probes after cooldown expiry. Journal events are `cooldown_probe_admitted`, `cooldown_probe_suppressed`, `cooldown_probe_recovery_success`, and `cooldown_probe_reapplied`. The upstream reset time remains authoritative; probe gating prevents concurrent re-entry without imposing a longer fixed cooldown.

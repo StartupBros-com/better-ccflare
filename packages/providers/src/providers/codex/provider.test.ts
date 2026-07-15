@@ -12,6 +12,7 @@ import {
 	CODEX_CACHE_KEY_SESSION_PERCENT_ENV,
 	CODEX_DEFAULT_ENDPOINT,
 	CODEX_PROMPT_CACHE_KEY_ENV,
+	CODEX_VERSION,
 	CodexProvider,
 	deriveCodexCacheKeySessionBucket,
 	readCodexCacheKeySessionPercent,
@@ -2793,6 +2794,7 @@ describe("CodexProvider.transformRequestBody", () => {
 			return transformed.json();
 		};
 
+		process.env[CODEX_PROMPT_CACHE_KEY_ENV] = "0";
 		const root = await transform("root task");
 		await transform("tool-less turn", false);
 		const sibling = await transform("sibling task");
@@ -2998,6 +3000,7 @@ describe("CodexProvider.transformRequestBody", () => {
 			content = "task A",
 			system = "shared system prompt",
 			messages?: Array<Record<string, unknown>>,
+			account?: Parameters<CodexProvider["transformRequestBody"]>[1],
 		) => {
 			const request = new Request("https://example.com/v1/messages", {
 				method: "POST",
@@ -3011,7 +3014,7 @@ describe("CodexProvider.transformRequestBody", () => {
 				}),
 			});
 			return new CodexProvider()
-				.transformRequestBody(request)
+				.transformRequestBody(request, account)
 				.then((response) => response.json());
 		};
 
@@ -3112,20 +3115,46 @@ describe("CodexProvider.transformRequestBody", () => {
 			expect(body.prompt_cache_key).toMatch(/^ccflare-session-/);
 		});
 
-		it("does not assign malformed metadata or bypass the disabled feature gate", async () => {
+		it("keeps zero percent byte-for-byte compatible with the unset canary", async () => {
+			const baseline = await transform(sessionA);
+			process.env[CODEX_CACHE_KEY_SESSION_PERCENT_ENV] = "0";
+			const explicitZero = await transform(sessionA);
+			expect(explicitZero).toEqual(baseline);
+		});
+
+		it("re-evaluates endpoint eligibility for the selected account", async () => {
 			process.env[CODEX_CACHE_KEY_SESSION_PERCENT_ENV] = "100";
+			const eligible = await transform(sessionA);
+			const customAccount = {
+				name: "custom-codex",
+				custom_endpoint: "https://my-openai-proxy.example.com/v1/responses",
+			} as Parameters<CodexProvider["transformRequestBody"]>[1];
+			const ineligible = await transform(
+				sessionA,
+				"task A",
+				"shared system prompt",
+				undefined,
+				customAccount,
+			);
+			expect(eligible.prompt_cache_key).toMatch(/^ccflare-session-/);
+			expect(ineligible.prompt_cache_key).toBeUndefined();
+		});
+
+		it("does not assign malformed metadata or bypass explicit disable", async () => {
+			process.env[CODEX_CACHE_KEY_SESSION_PERCENT_ENV] = "100";
+			process.env[CODEX_PROMPT_CACHE_KEY_ENV] = "0";
 			const disabled = await transform(sessionA);
 			expect(disabled.prompt_cache_key).toBeUndefined();
 
-			process.env[CODEX_PROMPT_CACHE_KEY_ENV] = "1";
+			delete process.env[CODEX_PROMPT_CACHE_KEY_ENV];
 			const malformed = await transform("not-a-uuid");
 			expect(malformed.prompt_cache_key).toBeUndefined();
 		});
 	});
 
-	it("omits prompt_cache_key by default", async () => {
+	it("attaches prompt_cache_key by default", async () => {
 		const provider = new CodexProvider();
-		const request = new Request("https://example.com/v1/messages", {
+		const request = new Request(CODEX_DEFAULT_ENDPOINT, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify({
@@ -3141,6 +3170,59 @@ describe("CodexProvider.transformRequestBody", () => {
 		});
 
 		const transformed = await provider.transformRequestBody(request);
+		const body = await transformed.json();
+		expect(body.prompt_cache_key).toMatch(/^ccflare-convo-[0-9a-f]{48}$/);
+	});
+
+	it("omits prompt_cache_key when explicitly disabled", async () => {
+		process.env[CODEX_PROMPT_CACHE_KEY_ENV] = "0";
+		const provider = new CodexProvider();
+		const request = new Request(CODEX_DEFAULT_ENDPOINT, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				model: "claude-opus-4-8",
+				max_tokens: 10,
+				metadata: {
+					user_id: JSON.stringify({
+						session_id: "11111111-1111-4111-8111-111111111111",
+					}),
+				},
+				messages: [{ role: "user", content: "hello" }],
+			}),
+		});
+
+		const transformed = await provider.transformRequestBody(request);
+		const body = await transformed.json();
+		expect(body.prompt_cache_key).toBeUndefined();
+	});
+
+	it("omits prompt_cache_key for custom endpoints", async () => {
+		process.env[CODEX_PROMPT_CACHE_KEY_ENV] = "1";
+		const provider = new CodexProvider();
+		const account = {
+			name: "custom-codex",
+			custom_endpoint: "https://my-openai-proxy.example.com/v1/responses",
+		} as Parameters<typeof provider.buildUrl>[2];
+		const request = new Request(
+			"https://my-openai-proxy.example.com/v1/responses",
+			{
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					model: "claude-opus-4-8",
+					max_tokens: 10,
+					metadata: {
+						user_id: JSON.stringify({
+							session_id: "11111111-1111-4111-8111-111111111111",
+						}),
+					},
+					messages: [{ role: "user", content: "hello" }],
+				}),
+			},
+		);
+
+		const transformed = await provider.transformRequestBody(request, account);
 		const body = await transformed.json();
 		expect(body.prompt_cache_key).toBeUndefined();
 	});
@@ -3416,9 +3498,9 @@ describe("fetchCodexUsageOnDemand", () => {
 		const headersInit = recorded?.init.headers as Record<string, string>;
 		const headers = new Headers(headersInit);
 		expect(headers.get("Authorization")).toBe("Bearer test-token");
-		expect(headers.get("Version")).toBe("0.144.1");
+		expect(headers.get("Version")).toBe(CODEX_VERSION);
 		expect(headers.get("Openai-Beta")).toBe("responses=experimental");
-		expect(headers.get("User-Agent")).toContain("codex-cli/0.144.1");
+		expect(headers.get("User-Agent")).toContain(`codex-cli/${CODEX_VERSION}`);
 		expect(headers.get("originator")).toBe("codex_cli_rs");
 		expect(headers.get("Content-Type")).toBe("application/json");
 
