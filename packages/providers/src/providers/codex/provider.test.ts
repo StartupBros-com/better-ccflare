@@ -929,7 +929,7 @@ describe("CodexProvider.processResponse", () => {
 		expect(messageDeltaLine).not.toContain('"context_window"');
 		expect(messageDeltaLine).toContain('"usage":{');
 		expect(messageDeltaLine).toContain('"output_tokens":3');
-		expect(messageDeltaLine).toContain('"input_tokens":12');
+		expect(messageDeltaLine).toContain('"input_tokens":8');
 		expect(messageDeltaLine).toContain('"cache_read_input_tokens":4');
 	});
 
@@ -1294,7 +1294,34 @@ describe("CodexProvider.processResponse", () => {
 		]);
 	});
 
-	it("maps response.completed usage into Claude-compatible context_window using model metadata", async () => {
+	it.each([
+		{
+			label: "normal cached usage",
+			total: 100,
+			cached: 25,
+			uncached: 75,
+			cacheRead: 25,
+		},
+		{
+			label: "zero usage",
+			total: 0,
+			cached: 0,
+			uncached: 0,
+			cacheRead: 0,
+		},
+		{
+			label: "cached usage above total",
+			total: 10,
+			cached: 25,
+			uncached: 0,
+			cacheRead: 10,
+		},
+	])("maps response.completed $label into additive Anthropic usage", async ({
+		total,
+		cached,
+		uncached,
+		cacheRead,
+	}) => {
 		const provider = new CodexProvider();
 		const upstreamBody = sseBody([
 			...eventLine("response.created", {
@@ -1304,10 +1331,10 @@ describe("CodexProvider.processResponse", () => {
 				response: {
 					model: "gpt-5.3-codex",
 					usage: {
-						input_tokens: 100,
+						input_tokens: total,
 						output_tokens: 50,
 						input_tokens_details: {
-							cached_tokens: 25,
+							cached_tokens: cached,
 							cache_creation_input_tokens: 10,
 						},
 					},
@@ -1325,11 +1352,96 @@ describe("CodexProvider.processResponse", () => {
 		const messageDeltaLine = transformedBody
 			.split("\n")
 			.find((line) => line.includes('"type":"message_delta"'));
+		const messageDelta = JSON.parse(
+			(messageDeltaLine as string).slice("data: ".length),
+		);
 
-		expect(messageDeltaLine).toContain('"context_window"');
-		expect(messageDeltaLine).toContain('"cache_read_input_tokens":25');
-		expect(messageDeltaLine).toContain('"cache_creation_input_tokens":10');
-		expect(messageDeltaLine).toContain('"context_window_size":272000');
+		expect(messageDelta.usage.input_tokens).toBe(uncached);
+		expect(messageDelta.usage.cache_read_input_tokens).toBe(cacheRead);
+		expect(messageDelta.context_window.current_usage.input_tokens).toBe(
+			uncached,
+		);
+		expect(
+			messageDelta.context_window.current_usage.cache_read_input_tokens,
+		).toBe(cacheRead);
+		expect(messageDelta.context_window.context_window_size).toBe(272_000);
+	});
+
+	it.each([
+		{
+			label: "negative cached",
+			total: 12,
+			cached: -4,
+			input: 12,
+			cacheRead: 0,
+		},
+		{
+			label: "non-finite cached",
+			total: 12,
+			cached: Number.POSITIVE_INFINITY,
+			input: 12,
+			cacheRead: 0,
+		},
+	])("sanitizes $label usage", async ({ total, cached, input, cacheRead }) => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.3-codex",
+					usage: {
+						input_tokens: total,
+						output_tokens: 3,
+						input_tokens_details: { cached_tokens: cached },
+					},
+				},
+			}),
+		]);
+		const transformed = await provider.processResponse(
+			new Response(upstreamBody, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+		const messageDeltaLine = (await transformed.text())
+			.split("\n")
+			.find((line) => line.includes('"type":"message_delta"'));
+		const messageDelta = JSON.parse(
+			(messageDeltaLine as string).slice("data: ".length),
+		);
+
+		expect(messageDelta.usage.input_tokens).toBe(input);
+		expect(messageDelta.usage.cache_read_input_tokens).toBe(cacheRead);
+	});
+
+	it("maps cached usage for non-streaming clients", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.4",
+					usage: {
+						input_tokens: 20,
+						output_tokens: 3,
+						input_tokens_details: { cached_tokens: 8 },
+					},
+				},
+			}),
+		]);
+		const transformed = await provider.processResponse(
+			new Response(upstreamBody, {
+				status: 200,
+				headers: {
+					"content-type": "text/event-stream",
+					"x-better-ccflare-request-stream": "false",
+				},
+			}),
+			null,
+		);
+		const payload = JSON.parse(await transformed.text());
+
+		expect(payload.usage.input_tokens).toBe(12);
+		expect(payload.usage.cache_read_input_tokens).toBe(8);
 	});
 
 	it("reports the effective context window when CCFLARE_CODEX_EFFECTIVE_CONTEXT=1", async () => {
