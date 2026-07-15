@@ -715,9 +715,9 @@ describe("analyzeCodexTrace", () => {
 		expect(report.logicalRequests).toBe(1);
 		expect(report.attempts).toBe(2);
 		expect(report.joins).toEqual({ missing: 0, ambiguous: 0 });
-		expect(report.canary.conversation.assignedRequests).toBe(1);
+		expect(report.canary.conversation.assignedRequests).toBe(0);
 		expect(report.canary.session.assignedRequests).toBe(1);
-		expect(report.canary.conversation.weightedCacheReusePct).toBe(0);
+		expect(report.canary.conversation.weightedCacheReusePct).toBeNull();
 		expect(report.canary.session.weightedCacheReusePct).toBe(100);
 		expect(report.cacheDenominators.attemptInclusive.measuredResponses).toBe(2);
 		expect(report.cacheDenominators.finalResponseOnly.measuredResponses).toBe(
@@ -728,12 +728,14 @@ describe("analyzeCodexTrace", () => {
 		).toBe(100);
 	});
 
-	test("reports experiment readiness and request-rate concentration", () => {
+	test("reports experiment readiness with sliding request-rate concentration", () => {
 		const records = Array.from({ length: 16 }, (_, index) => ({
 			phase: "request" as const,
 			request_id: `r-${index}`,
 			attempt_id: `a-${index}`,
-			ts: `2026-07-10T00:00:${String(index).padStart(2, "0")}Z`,
+			ts: new Date(
+				Date.parse("2026-07-10T00:00:55Z") + index * 1000,
+			).toISOString(),
 			cache_key_assignment: "conversation" as const,
 			cache_key_mode:
 				index === 0 ? ("session" as const) : ("conversation" as const),
@@ -744,6 +746,100 @@ describe("analyzeCodexTrace", () => {
 		expect(report.readiness.assignmentEffectiveCrossovers).toBe(1);
 		expect(report.readiness.keysOver15RequestsPerMinute).toBe(1);
 		expect(report.readiness.maxRequestsPerKeyMinute).toBe(16);
+	});
+
+	test("counts one canary turn per logical request and selects its final joined attempt", () => {
+		const report = analyzeCodexTrace([
+			{
+				phase: "request",
+				request_id: "logical",
+				attempt_id: "first",
+				attempt_ordinal: 1,
+				ts: "2026-07-10T00:00:00Z",
+				conversation_id: "conversation",
+				cache_key_assignment: "conversation",
+				cache_key_mode: "conversation",
+			},
+			{
+				phase: "request",
+				request_id: "logical",
+				attempt_id: "final",
+				attempt_ordinal: 2,
+				ts: "2026-07-10T00:00:01Z",
+				conversation_id: "conversation",
+				cache_key_assignment: "session",
+				cache_key_mode: "session",
+			},
+			{
+				phase: "response",
+				request_id: "logical",
+				attempt_id: "first",
+				usage_measurement_available: true,
+				cache_measurement_available: true,
+				input_tokens: 100,
+				cache_read_input_tokens: 0,
+			},
+			{
+				phase: "response",
+				request_id: "logical",
+				attempt_id: "final",
+				usage_measurement_available: true,
+				cache_measurement_available: true,
+				input_tokens: 100,
+				cache_read_input_tokens: 80,
+			},
+		]);
+		expect(report.canary.conversation.assignedRequests).toBe(0);
+		expect(report.canary.session.assignedRequests).toBe(1);
+		expect(report.canary.session.turns.first.requests).toBe(1);
+		expect(report.canary.session.weightedCacheReusePct).toBe(80);
+	});
+
+	test("excludes ambiguous attempt IDs and unknown cache measurements", () => {
+		const report = analyzeCodexTrace([
+			{
+				phase: "request",
+				request_id: "ambiguous",
+				attempt_id: "duplicate",
+				cache_key_assignment: "session",
+			},
+			{
+				phase: "request",
+				request_id: "ambiguous",
+				attempt_id: "duplicate",
+				cache_key_assignment: "session",
+			},
+			{
+				phase: "response",
+				request_id: "ambiguous",
+				attempt_id: "duplicate",
+				usage_measurement_available: true,
+				cache_measurement_available: true,
+				input_tokens: 100,
+				cache_read_input_tokens: 100,
+			},
+			{
+				phase: "request",
+				request_id: "unknown-usage",
+				attempt_id: "unknown-attempt",
+				cache_key_assignment: "session",
+			},
+			{
+				phase: "response",
+				request_id: "unknown-usage",
+				attempt_id: "unknown-attempt",
+				usage_measurement_available: false,
+				cache_measurement_available: false,
+				input_tokens: null,
+				cache_read_input_tokens: null,
+			},
+		]);
+		expect(report.canary.session.assignedRequests).toBe(1);
+		expect(report.canary.session.cacheMeasuredResponses).toBe(0);
+		expect(report.cacheDenominators.attemptInclusive.measuredResponses).toBe(1);
+		expect(report.cacheDenominators.finalResponseOnly.measuredResponses).toBe(
+			1,
+		);
 	});
 
 	test("counts mixed schema 6-8 duplicate logical IDs as ambiguous joins", () => {

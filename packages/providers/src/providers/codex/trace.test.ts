@@ -278,10 +278,28 @@ describe("summarizeCodexResponse (response phase)", () => {
 		expect(s.cache_hit_pct).toBe(100);
 	});
 
-	test("null cache hit pct when no input tokens seen", () => {
+	test("preserves missing usage as unavailable rather than measured zero", () => {
 		const s = summarizeCodexResponse([], {}, "end_turn");
 		expect(s.new_tool_call_count).toBe(0);
+		expect(s.usage_measurement_available).toBe(false);
+		expect(s.cache_measurement_available).toBe(false);
+		expect(s.input_tokens).toBeNull();
+		expect(s.output_tokens).toBeNull();
+		expect(s.cache_read_input_tokens).toBeNull();
+		expect(s.cache_creation_input_tokens).toBeNull();
 		expect(s.cache_hit_pct).toBeNull();
+	});
+
+	test("distinguishes measured zero cache usage from unavailable cache usage", () => {
+		const s = summarizeCodexResponse(
+			[],
+			{ input_tokens: 10, output_tokens: 0, cache_read_input_tokens: 0 },
+			"end_turn",
+		);
+		expect(s.usage_measurement_available).toBe(true);
+		expect(s.cache_measurement_available).toBe(true);
+		expect(s.cache_read_input_tokens).toBe(0);
+		expect(s.cache_hit_pct).toBe(0);
 	});
 
 	test("carries normalized upstream error details", () => {

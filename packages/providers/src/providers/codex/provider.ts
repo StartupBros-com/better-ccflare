@@ -383,6 +383,8 @@ interface StreamState {
 	outputTokens: number;
 	cacheReadInputTokens: number;
 	cacheCreationInputTokens: number;
+	usageMeasurementAvailable: boolean;
+	cacheMeasurementAvailable: boolean;
 	// Anthropic clients expect stop_reason=tool_use when the assistant emitted a tool call.
 	sawToolUse: boolean;
 	contextWindow: ContextWindow | null;
@@ -680,6 +682,8 @@ export class CodexProvider extends BaseProvider {
 		const contentType = response.headers.get("content-type");
 		const requestId = response.headers.get("x-better-ccflare-request-id");
 		const attemptId = response.headers.get("x-better-ccflare-attempt-id");
+		const finalModel =
+			response.headers.get("x-better-ccflare-final-model") ?? undefined;
 		const headerRequestedStream = response.headers.get(
 			"x-better-ccflare-request-stream",
 		);
@@ -701,12 +705,14 @@ export class CodexProvider extends BaseProvider {
 					response,
 					requestId ?? undefined,
 					attemptId ?? undefined,
+					finalModel,
 				);
 			}
 			return this.transformSseResponseToJson(
 				response,
 				requestId ?? undefined,
 				attemptId ?? undefined,
+				finalModel,
 			);
 		}
 
@@ -726,15 +732,33 @@ export class CodexProvider extends BaseProvider {
 					sseResponse,
 					requestId ?? undefined,
 					attemptId ?? undefined,
+					finalModel,
 				);
 			}
 			return this.transformSseResponseToJson(
 				sseResponse,
 				requestId ?? undefined,
 				attemptId ?? undefined,
+				finalModel,
 			);
 		}
 
+		writeCodexResponseTrace({
+			requestId: requestId ?? "unknown",
+			attemptId: attemptId ?? undefined,
+			modelOut: finalModel ?? "unknown",
+			summary: summarizeCodexResponse(
+				[],
+				{},
+				response.ok ? "end_turn" : "error",
+				response.ok
+					? undefined
+					: {
+							type: `http_${response.status}`,
+							message: response.statusText || `HTTP ${response.status}`,
+						},
+			),
+		});
 		const headers = sanitizeResponseHeaders(response.headers);
 		return new Response(response.body, {
 			status: response.status,
@@ -1380,11 +1404,14 @@ export class CodexProvider extends BaseProvider {
 			"unknown",
 		attemptId = response.headers.get("x-better-ccflare-attempt-id") ??
 			undefined,
+		finalModel = response.headers.get("x-better-ccflare-final-model") ??
+			undefined,
 	): Promise<Response> {
 		const transformed = this.transformStreamingResponse(
 			response,
 			requestId,
 			attemptId,
+			finalModel,
 		);
 		const reader = transformed.body
 			?.pipeThrough(new TextDecoderStream())
@@ -1584,16 +1611,13 @@ export class CodexProvider extends BaseProvider {
 			"unknown",
 		attemptId = response.headers.get("x-better-ccflare-attempt-id") ??
 			undefined,
+		finalModel = response.headers.get("x-better-ccflare-final-model") ??
+			"unknown",
 	): Response {
-		if (process.env.DEBUG?.includes("model") || process.env.DEBUG === "true") {
-			log.info(
-				`[codex:model-debug] request_id=${requestId} transformStreamingResponse initial fallback model=gpt-5.4 until response.created arrives`,
-			);
-		}
 		const state: StreamState = {
 			buffer: "",
 			messageId: `msg_${crypto.randomUUID().replace(/-/g, "").substring(0, 24)}`,
-			model: "gpt-5.4",
+			model: finalModel,
 			contentBlockIndex: 0,
 			hasSentMessageStart: false,
 			hasSentContentBlockStart: false,
@@ -1603,6 +1627,8 @@ export class CodexProvider extends BaseProvider {
 			outputTokens: 0,
 			cacheReadInputTokens: 0,
 			cacheCreationInputTokens: 0,
+			usageMeasurementAvailable: false,
+			cacheMeasurementAvailable: false,
 			contextWindow: null,
 			functionCallBlocks: new Map(),
 			sawToolUse: false,
@@ -1614,11 +1640,18 @@ export class CodexProvider extends BaseProvider {
 		const headers = sanitizeResponseHeaders(response.headers);
 		headers.set("content-type", "text/event-stream");
 
-		const { readable, writable } = new TransformStream<
-			Uint8Array,
-			Uint8Array
-		>();
-		const writer = writable.getWriter();
+		const upstreamReader = response.body?.getReader();
+		let downstreamController: ReadableStreamDefaultController<Uint8Array>;
+		let cancelled = false;
+		const readable = new ReadableStream<Uint8Array>({
+			start(controller) {
+				downstreamController = controller;
+			},
+			async cancel(reason) {
+				cancelled = true;
+				await upstreamReader?.cancel(reason).catch(() => undefined);
+			},
+		});
 		const encoder = new TextEncoder();
 		const decoder = new TextDecoder();
 
@@ -1662,8 +1695,9 @@ export class CodexProvider extends BaseProvider {
 				}
 				payload.delta = delta;
 			}
+			if (cancelled) throw new Error("Downstream response was cancelled");
 			const line = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-			await writer.write(encoder.encode(line));
+			downstreamController.enqueue(encoder.encode(line));
 		};
 		const ensureMessageStart = async () => {
 			if (state.hasSentMessageStart) return;
@@ -1696,11 +1730,10 @@ export class CodexProvider extends BaseProvider {
 
 		const processEvents = async () => {
 			try {
-				const reader = response.body?.getReader();
-				if (!reader) throw new Error("Response body is not readable");
+				if (!upstreamReader) throw new Error("Response body is not readable");
 
 				while (true) {
-					const { value, done } = await reader.read();
+					const { value, done } = await upstreamReader.read();
 					if (done) break;
 
 					state.buffer += decoder.decode(value, { stream: true });
@@ -1759,21 +1792,16 @@ export class CodexProvider extends BaseProvider {
 					});
 				}
 
-				// Final message_delta + message_stop if upstream never sent response.completed
 				if (!state.hasSentTerminalEvents) {
-					const stopReason = state.sawToolUse ? "tool_use" : "end_turn";
-					await writeSSE("message_delta", {
-						type: "message_delta",
-						delta: {
-							stop_reason: stopReason,
-							stop_sequence: null,
-						},
-						usage: {
-							input_tokens: state.inputTokens,
-							output_tokens: state.outputTokens,
-							cache_read_input_tokens: state.cacheReadInputTokens,
-							cache_creation_input_tokens: state.cacheCreationInputTokens,
-						},
+					const abruptError = {
+						type: "abrupt_stream_eof",
+						message:
+							"Codex upstream stream ended before a terminal response event.",
+					};
+					await writeSSE("error", {
+						type: "error",
+						error: abruptError,
+						model: state.model,
 					});
 					writeCodexResponseTrace({
 						requestId,
@@ -1785,25 +1813,37 @@ export class CodexProvider extends BaseProvider {
 						)?.rawContextWindow,
 						summary: summarizeCodexResponse(
 							state.traceNewToolCalls,
-							{
-								input_tokens: state.totalInputTokens,
-								output_tokens: state.outputTokens,
-								cache_read_input_tokens: state.cacheReadInputTokens,
-								cache_creation_input_tokens: state.cacheCreationInputTokens,
-							},
-							stopReason,
+							state.usageMeasurementAvailable
+								? {
+										input_tokens: state.totalInputTokens,
+										output_tokens: state.outputTokens,
+										...(state.cacheMeasurementAvailable
+											? {
+													cache_read_input_tokens: state.cacheReadInputTokens,
+													cache_creation_input_tokens:
+														state.cacheCreationInputTokens,
+												}
+											: {}),
+									}
+								: {},
+							"error",
+							abruptError,
 						),
 					});
-					await writeSSE("message_stop", { type: "message_stop" });
+					state.hasSentTerminalEvents = true;
 				}
 			} catch (error) {
-				log.error("Error processing Codex SSE stream:", error);
+				if (!cancelled) log.error("Error processing Codex SSE stream:", error);
+				await upstreamReader?.cancel(error).catch(() => undefined);
 			} finally {
-				await writer.close();
+				upstreamReader?.releaseLock();
+				if (!cancelled) downstreamController.close();
 			}
 		};
 
-		processEvents();
+		void processEvents().catch((error) => {
+			log.error("Unhandled Codex SSE processing failure:", error);
+		});
 
 		return new Response(readable, {
 			status: response.status,
@@ -1954,6 +1994,11 @@ export class CodexProvider extends BaseProvider {
 					  }
 					| undefined;
 				if (usage) {
+					state.usageMeasurementAvailable =
+						typeof usage.input_tokens === "number";
+					state.cacheMeasurementAvailable =
+						state.usageMeasurementAvailable &&
+						typeof usage.input_tokens_details?.cached_tokens === "number";
 					const normalized = normalizeCodexInputUsage(
 						usage.input_tokens,
 						usage.input_tokens_details?.cached_tokens,
@@ -2240,6 +2285,11 @@ export class CodexProvider extends BaseProvider {
 					| undefined;
 
 				const inputTokenDetails = usage?.input_tokens_details;
+				state.usageMeasurementAvailable =
+					typeof usage?.input_tokens === "number";
+				state.cacheMeasurementAvailable =
+					state.usageMeasurementAvailable &&
+					typeof inputTokenDetails?.cached_tokens === "number";
 				const normalizedInput = normalizeCodexInputUsage(
 					usage?.input_tokens,
 					inputTokenDetails?.cached_tokens,

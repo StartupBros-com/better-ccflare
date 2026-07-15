@@ -1002,6 +1002,32 @@ export async function proxyWithAccount(
 		}
 		const transformedModel =
 			(transformedBodyJson?.model as string | undefined) ?? "";
+		let currentTransportModel = transformedModel;
+		const traceDiscardedCodexResponse = async (discarded: Response) => {
+			if (provider.name !== "codex") return;
+			const traceHeaders = new Headers(discarded.headers);
+			traceHeaders.set("x-better-ccflare-request-id", requestMeta.id);
+			traceHeaders.set("x-better-ccflare-request-stream", "false");
+			if (currentTransportAttemptId) {
+				traceHeaders.set(
+					"x-better-ccflare-attempt-id",
+					currentTransportAttemptId,
+				);
+			}
+			if (currentTransportModel) {
+				traceHeaders.set("x-better-ccflare-final-model", currentTransportModel);
+			}
+			const processed = await provider.processResponse(
+				new Response(discarded.clone().body, {
+					status: discarded.status,
+					statusText: discarded.statusText,
+					headers: traceHeaders,
+				}),
+				account,
+				req.headers,
+			);
+			await processed.arrayBuffer();
+		};
 		if (
 			transformedModel &&
 			cacheControlRejectors.has(
@@ -1055,6 +1081,7 @@ export async function proxyWithAccount(
 					duplex: "half",
 				};
 
+				await traceDiscardedCodexResponse(rawResponse);
 				stampCodexAttempt(headers, "thinking_retry");
 				const retryProviderRequest = new Request(targetUrl, retryRequestInit);
 
@@ -1097,6 +1124,7 @@ export async function proxyWithAccount(
 				stripCacheControlFromOpenAIRequest(retryBodyJson);
 				let retryRequest: Request;
 				if (provider.name === "codex" && provider.transformRequestBody) {
+					await traceDiscardedCodexResponse(rawResponse);
 					const retryHeaders = new Headers(providerRequest.headers);
 					stampCodexAttempt(retryHeaders, "cache_control_retry");
 					const retrySourceBody = await providerRequest.clone().json();
@@ -1405,7 +1433,9 @@ export async function proxyWithAccount(
 						duplex: "half",
 					};
 
+					await traceDiscardedCodexResponse(rawResponse);
 					stampCodexAttempt(headers, "model_fallback", nextModel);
+					currentTransportModel = nextModel;
 					const retryProviderRequest = new Request(targetUrl, retryRequestInit);
 					let retryTransformedRequest = provider.transformRequestBody
 						? await provider.transformRequestBody(retryProviderRequest, account)
@@ -1446,6 +1476,7 @@ export async function proxyWithAccount(
 					// Attribution advances only once a concrete request is ready to
 					// execute. A failed patch must leave it on the previous model.
 					finalAttemptModel = nextModel;
+					await traceDiscardedCodexResponse(rawResponse);
 					rawResponse = isSyntheticProviderResponse(retryTransformedRequest)
 						? materializeSyntheticResponse(retryTransformedRequest)
 						: await makeProxyRequest(retryTransportRequest);
@@ -1591,6 +1622,12 @@ export async function proxyWithAccount(
 				currentTransportAttemptId,
 			);
 		}
+		if (currentTransportModel) {
+			responseHeaders.set(
+				"x-better-ccflare-final-model",
+				currentTransportModel,
+			);
+		}
 		if (internalRequestStream === "true" || internalRequestStream === "false") {
 			responseHeaders.set(
 				"x-better-ccflare-request-stream",
@@ -1643,6 +1680,7 @@ export async function proxyWithAccount(
 						let retryTransport = transformedRequestForRetry.clone();
 						if (provider.name === "codex" && provider.transformRequestBody) {
 							const retryHeaders = new Headers(providerRequest.headers);
+							await response.arrayBuffer();
 							stampCodexAttempt(retryHeaders, "overload_529");
 							const retrySource = new Request(providerRequest.url, {
 								method: providerRequest.method,
@@ -1666,6 +1704,12 @@ export async function proxyWithAccount(
 							retryTaggedHeaders.set(
 								"x-better-ccflare-attempt-id",
 								currentTransportAttemptId,
+							);
+						}
+						if (currentTransportModel) {
+							retryTaggedHeaders.set(
+								"x-better-ccflare-final-model",
+								currentTransportModel,
 							);
 						}
 						const retryTaggedRaw = new Response(retryRaw.body, {

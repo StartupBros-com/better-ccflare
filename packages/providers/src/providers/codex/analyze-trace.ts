@@ -47,10 +47,12 @@ export interface TraceRecord {
 	new_tool_use_by_name?: Record<string, number>;
 	new_tool_calls?: ToolCall[];
 	stop_reason?: "tool_use" | "end_turn" | "max_tokens" | "refusal" | "error";
-	input_tokens?: number;
-	output_tokens?: number;
-	cache_read_input_tokens?: number;
-	cache_creation_input_tokens?: number;
+	usage_measurement_available?: boolean;
+	cache_measurement_available?: boolean;
+	input_tokens?: number | null;
+	output_tokens?: number | null;
+	cache_read_input_tokens?: number | null;
+	cache_creation_input_tokens?: number | null;
 	cache_hit_pct?: number | null;
 	context_utilization_pct?: number | null;
 	error_type?: string;
@@ -398,32 +400,69 @@ function analyzeCanary(
 	requestRecords: readonly TraceRecord[],
 	responseRecords: readonly TraceRecord[],
 ): TraceReport["canary"] {
-	const requestAttemptsById = new Map<string, TraceRecord>();
-	const responseAttemptsById = new Map<string, TraceRecord>();
+	const requestAttemptsById = new Map<string, TraceRecord[]>();
+	const responseAttemptsById = new Map<string, TraceRecord[]>();
 	const legacyRequestsByLogicalId = new Map<string, TraceRecord[]>();
 	const legacyResponsesByLogicalId = new Map<string, TraceRecord[]>();
 	let responsesWithoutId = 0;
+	const append = (
+		map: Map<string, TraceRecord[]>,
+		id: string,
+		record: TraceRecord,
+	) => {
+		const group = map.get(id) ?? [];
+		group.push(record);
+		map.set(id, group);
+	};
 	for (const request of requestRecords) {
 		if (request.attempt_id)
-			requestAttemptsById.set(request.attempt_id, request);
-		else if (request.request_id) {
-			const group = legacyRequestsByLogicalId.get(request.request_id) ?? [];
-			group.push(request);
-			legacyRequestsByLogicalId.set(request.request_id, group);
-		}
+			append(requestAttemptsById, request.attempt_id, request);
+		else if (request.request_id)
+			append(legacyRequestsByLogicalId, request.request_id, request);
 	}
 	for (const response of responseRecords) {
 		if (response.attempt_id)
-			responseAttemptsById.set(response.attempt_id, response);
-		else if (response.request_id) {
-			const group = legacyResponsesByLogicalId.get(response.request_id) ?? [];
-			group.push(response);
-			legacyResponsesByLogicalId.set(response.request_id, group);
-		} else responsesWithoutId++;
+			append(responseAttemptsById, response.attempt_id, response);
+		else if (response.request_id)
+			append(legacyResponsesByLogicalId, response.request_id, response);
+		else responsesWithoutId++;
 	}
-	const retainedRequests = [...requestRecords];
+	const requestsByLogicalId = new Map<string, TraceRecord[]>();
+	const anonymousRequests: TraceRecord[] = [];
+	for (const request of requestRecords) {
+		if (!request.request_id) {
+			anonymousRequests.push(request);
+			continue;
+		}
+		append(requestsByLogicalId, request.request_id, request);
+	}
+	const retainedRequests = [...requestsByLogicalId.values()]
+		.map((attempts) =>
+			[...attempts]
+				.filter((request) => {
+					if (!request.attempt_id) return attempts.length === 1;
+					return (
+						requestAttemptsById.get(request.attempt_id)?.length === 1 &&
+						responseAttemptsById.get(request.attempt_id)?.length === 1
+					);
+				})
+				.sort(
+					(a, b) =>
+						(a.attempt_ordinal ?? 0) - (b.attempt_ordinal ?? 0) ||
+						(a.ts ?? "").localeCompare(b.ts ?? ""),
+				)
+				.at(-1),
+		)
+		.filter((request): request is TraceRecord => Boolean(request));
+	retainedRequests.push(...anonymousRequests);
 	const responseFor = (request: TraceRecord): TraceRecord | undefined => {
-		if (request.attempt_id) return responseAttemptsById.get(request.attempt_id);
+		if (request.attempt_id) {
+			const requests = requestAttemptsById.get(request.attempt_id) ?? [];
+			const responses = responseAttemptsById.get(request.attempt_id) ?? [];
+			return requests.length === 1 && responses.length === 1
+				? responses[0]
+				: undefined;
+		}
 		if (!request.request_id) return undefined;
 		const requests = legacyRequestsByLogicalId.get(request.request_id) ?? [];
 		const responses = legacyResponsesByLogicalId.get(request.request_id) ?? [];
@@ -493,11 +532,18 @@ function analyzeCanary(
 		turn.joinedTerminalResponses++;
 		increment(arm.terminals, response.stop_reason ?? "unknown");
 		const inputTokens = response.input_tokens ?? 0;
-		arm.usage.inputTokens += inputTokens;
-		arm.usage.outputTokens += response.output_tokens ?? 0;
-		arm.usage.cacheCreationInputTokens +=
-			response.cache_creation_input_tokens ?? 0;
-		if (typeof response.cache_read_input_tokens !== "number") continue;
+		if (response.usage_measurement_available !== false) {
+			arm.usage.inputTokens += inputTokens;
+			arm.usage.outputTokens += response.output_tokens ?? 0;
+			arm.usage.cacheCreationInputTokens +=
+				response.cache_creation_input_tokens ?? 0;
+		}
+		if (
+			response.cache_measurement_available === false ||
+			typeof response.cache_read_input_tokens !== "number" ||
+			typeof response.input_tokens !== "number"
+		)
+			continue;
 		const cacheRead = Math.min(
 			Math.max(response.cache_read_input_tokens, 0),
 			inputTokens,
@@ -515,8 +561,12 @@ function analyzeCanary(
 	}
 
 	let unjoinedResponses = responsesWithoutId;
-	for (const attemptId of responseAttemptsById.keys())
-		if (!requestAttemptsById.has(attemptId)) unjoinedResponses++;
+	for (const [attemptId, responses] of responseAttemptsById)
+		if (
+			(requestAttemptsById.get(attemptId)?.length ?? 0) !== 1 ||
+			responses.length !== 1
+		)
+			unjoinedResponses += responses.length;
 	for (const [requestId, responses] of legacyResponsesByLogicalId) {
 		const requests = legacyRequestsByLogicalId.get(requestId) ?? [];
 		if (requests.length !== 1 || responses.length !== 1) {
@@ -682,8 +732,13 @@ export function analyzeCodexTrace(
 		let cacheRead = 0;
 		let measuredResponses = 0;
 		for (const sample of samples) {
-			if (typeof sample.cache_read_input_tokens !== "number") continue;
-			const sampleInput = sample.input_tokens ?? 0;
+			if (
+				sample.cache_measurement_available === false ||
+				typeof sample.cache_read_input_tokens !== "number" ||
+				typeof sample.input_tokens !== "number"
+			)
+				continue;
+			const sampleInput = sample.input_tokens;
 			input += sampleInput;
 			cacheRead += Math.min(
 				Math.max(sample.cache_read_input_tokens, 0),
@@ -718,15 +773,27 @@ export function analyzeCodexTrace(
 				: undefined;
 		if (joined) finalResponses.push(joined);
 	}
-	const minuteCounts = new Map<string, number>();
+	const timestampsByKey = new Map<string, number[]>();
 	for (const request of requestRecords) {
 		if (!request.prompt_cache_key_id || !request.ts) continue;
 		const timestamp = Date.parse(request.ts);
 		if (!Number.isFinite(timestamp)) continue;
-		const bucket = `${request.prompt_cache_key_id}:${Math.floor(timestamp / 60_000)}`;
-		minuteCounts.set(bucket, (minuteCounts.get(bucket) ?? 0) + 1);
+		const timestamps = timestampsByKey.get(request.prompt_cache_key_id) ?? [];
+		timestamps.push(timestamp);
+		timestampsByKey.set(request.prompt_cache_key_id, timestamps);
 	}
-	const concentration = [...minuteCounts.values()];
+	const concentration: number[] = [];
+	for (const timestamps of timestampsByKey.values()) {
+		timestamps.sort((a, b) => a - b);
+		let left = 0;
+		let maximum = 0;
+		for (let right = 0; right < timestamps.length; right++) {
+			while ((timestamps[right] ?? 0) - (timestamps[left] ?? 0) >= 60_000)
+				left++;
+			maximum = Math.max(maximum, right - left + 1);
+		}
+		concentration.push(maximum);
+	}
 	const sessions = new Map<string, number>();
 	const requestKeySetByAttemptId = new Map<string, boolean>();
 	const legacyRequestKeySetByLogicalId = new Map<string, boolean>();
@@ -846,7 +913,10 @@ export function analyzeCodexTrace(
 					(errorStatuses[response.error_status] ?? 0) + 1;
 		}
 		const input = response.input_tokens ?? 0;
-		const hasCacheRead = typeof response.cache_read_input_tokens === "number";
+		const hasCacheRead =
+			response.cache_measurement_available !== false &&
+			typeof response.input_tokens === "number" &&
+			typeof response.cache_read_input_tokens === "number";
 		const cacheRead = hasCacheRead
 			? Math.min(Math.max(response.cache_read_input_tokens ?? 0, 0), input)
 			: 0;

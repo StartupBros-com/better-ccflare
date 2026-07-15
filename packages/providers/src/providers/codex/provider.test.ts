@@ -1593,9 +1593,9 @@ describe("CodexProvider.processResponse", () => {
 		const messageStartLine = transformedBody
 			.split("\n")
 			.find((line) => line.includes('"type":"message_start"'));
-		const messageDeltaLine = transformedBody
+		const errorLine = transformedBody
 			.split("\n")
-			.find((line) => line.includes('"type":"message_delta"'));
+			.find((line) => line.includes('"type":"abrupt_stream_eof"'));
 
 		expect(messageStartLine).not.toBeUndefined();
 		const payload = JSON.parse(
@@ -1607,13 +1607,9 @@ describe("CodexProvider.processResponse", () => {
 		expect(payload.usage.cache_creation_input_tokens).toBe(0);
 		expect(payload.message.usage.input_tokens).toBe(0);
 		expect(payload.message.usage.output_tokens).toBe(0);
-		expect(messageDeltaLine).not.toBeUndefined();
-		expect(messageDeltaLine).toContain('"usage":{');
-		expect(messageDeltaLine).toContain('"input_tokens":0');
-		expect(messageDeltaLine).toContain('"output_tokens":0');
-		expect(messageDeltaLine).toContain(
-			'"delta":{"stop_reason":"end_turn","stop_sequence":null,"usage":{',
-		);
+		expect(errorLine).not.toBeUndefined();
+		expect(transformedBody).not.toContain('"type":"message_delta"');
+		expect(transformedBody).not.toContain('"type":"message_stop"');
 	});
 
 	it("includes cache_creation_input_tokens in synthesized context_window when present", async () => {
@@ -2134,7 +2130,7 @@ describe("CodexProvider.processResponse", () => {
 		expect(body.error.status).toBe("rate_limited");
 	});
 
-	it("preserves early usage in client and trace when the stream ends abruptly", async () => {
+	it("emits and traces abrupt_stream_eof while preserving known usage", async () => {
 		const provider = new CodexProvider();
 		const traceDir = mkdtempSync(join(tmpdir(), "codex-trace-"));
 		process.env[CODEX_TRACE_DIR_ENV] = traceDir;
@@ -2167,15 +2163,20 @@ describe("CodexProvider.processResponse", () => {
 			const body = await (
 				await provider.processResponse(response, null)
 			).text();
-			expect(body).toContain(
-				'"usage":{"input_tokens":40,"output_tokens":7,"cache_read_input_tokens":60,"cache_creation_input_tokens":5}',
-			);
+			expect(body).toContain("event: error");
+			expect(body).toContain('"type":"abrupt_stream_eof"');
+			expect(body).not.toContain("event: message_delta");
+			expect(body).not.toContain("event: message_stop");
 			const record = readTraceRecords(traceDir).find(
 				(candidate) => candidate.phase === "response",
 			);
 			expect(record).toMatchObject({
 				request_id: "logical-abrupt",
 				attempt_id: "attempt-abrupt",
+				stop_reason: "error",
+				error_type: "abrupt_stream_eof",
+				usage_measurement_available: true,
+				cache_measurement_available: true,
 				input_tokens: 100,
 				output_tokens: 7,
 				cache_read_input_tokens: 60,
@@ -2185,6 +2186,68 @@ describe("CodexProvider.processResponse", () => {
 			delete process.env[CODEX_TRACE_DIR_ENV];
 			rmSync(traceDir, { recursive: true, force: true });
 		}
+	});
+
+	it("keeps usage unavailable and uses final wire model on abrupt EOF", async () => {
+		const provider = new CodexProvider();
+		const traceDir = mkdtempSync(join(tmpdir(), "codex-trace-"));
+		process.env[CODEX_TRACE_DIR_ENV] = traceDir;
+		try {
+			const response = new Response(sseBody([]), {
+				status: 200,
+				headers: {
+					"content-type": "text/event-stream",
+					"x-better-ccflare-request-id": "logical-empty",
+					"x-better-ccflare-attempt-id": "attempt-empty",
+					"x-better-ccflare-final-model": "gpt-5.4-mini",
+				},
+			});
+
+			const body = await (
+				await provider.processResponse(response, null)
+			).text();
+			expect(body).toContain('"model":"gpt-5.4-mini"');
+			expect(body).toContain('"type":"abrupt_stream_eof"');
+			const record = readTraceRecords(traceDir).find(
+				(candidate) => candidate.phase === "response",
+			);
+			expect(record).toMatchObject({
+				model_out: "gpt-5.4-mini",
+				usage_measurement_available: false,
+				cache_measurement_available: false,
+				input_tokens: null,
+				output_tokens: null,
+				cache_read_input_tokens: null,
+			});
+		} finally {
+			delete process.env[CODEX_TRACE_DIR_ENV];
+			rmSync(traceDir, { recursive: true, force: true });
+		}
+	});
+
+	it("cancels the upstream stream when the downstream reader cancels", async () => {
+		const provider = new CodexProvider();
+		let cancelled = false;
+		const upstream = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(
+					new TextEncoder().encode("event: response.created\n"),
+				);
+			},
+			cancel() {
+				cancelled = true;
+			},
+		});
+		const transformed = await provider.processResponse(
+			new Response(upstream, {
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+		const reader = transformed.body?.getReader();
+		await reader?.cancel("client disconnected");
+		await Bun.sleep(0);
+		expect(cancelled).toBe(true);
 	});
 
 	it("does not emit terminal events after response.failed when response.completed follows", async () => {
