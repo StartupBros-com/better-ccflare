@@ -5,6 +5,7 @@ import type {
 	RequestMeta,
 } from "@better-ccflare/types";
 import {
+	ForceRouteUnavailableError,
 	getComboSlotInfo,
 	resolveEffectiveModel,
 	selectAccountsForRequest,
@@ -197,6 +198,69 @@ describe("selectAccountsForRequest — x-better-ccflare-account-id header", () =
 		const result = await selectAccountsForRequest(meta, ctx);
 		// Rate-limited forced account is skipped; falls back to strategy.select which returns activeAcc
 		expect(result).toHaveLength(1);
+		expect(result[0]?.id).toBe("acc-active");
+	});
+});
+
+describe("selectAccountsForRequest — Grok cache-native force-route fail-closed", () => {
+	it("throws when feature is active and forced xAI account is paused", async () => {
+		const pausedAcc = makeAccount({
+			id: "acc-paused",
+			name: "paused",
+			provider: "xai",
+			paused: true,
+		});
+		const activeAcc = makeAccount({
+			id: "acc-active",
+			name: "active",
+			provider: "xai",
+		});
+		const ctx: ProxyContext = {
+			strategy: { select: mock(() => [activeAcc]) },
+			dbOps: {
+				getAllAccounts: mock(async () => [pausedAcc, activeAcc]),
+				getActiveComboForFamily: mock(async () => null),
+			},
+			refreshInFlight: new Map(),
+			asyncWriter: { enqueue: mock(() => {}) },
+			usageWorker: { postMessage: mock(() => {}) },
+		} as unknown as ProxyContext;
+		const meta = makeRequestMeta({
+			xaiCacheNativeActive: true,
+			headers: new Headers({ "x-better-ccflare-account-id": "acc-paused" }),
+		});
+		await expect(selectAccountsForRequest(meta, ctx)).rejects.toBeInstanceOf(
+			ForceRouteUnavailableError,
+		);
+	});
+
+	it("still falls back when feature is off", async () => {
+		const pausedAcc = makeAccount({
+			id: "acc-paused",
+			name: "paused",
+			provider: "xai",
+			paused: true,
+		});
+		const activeAcc = makeAccount({
+			id: "acc-active",
+			name: "active",
+			provider: "xai",
+		});
+		const ctx: ProxyContext = {
+			strategy: { select: mock(() => [activeAcc]) },
+			dbOps: {
+				getAllAccounts: mock(async () => [pausedAcc, activeAcc]),
+				getActiveComboForFamily: mock(async () => null),
+			},
+			refreshInFlight: new Map(),
+			asyncWriter: { enqueue: mock(() => {}) },
+			usageWorker: { postMessage: mock(() => {}) },
+		} as unknown as ProxyContext;
+		const meta = makeRequestMeta({
+			xaiCacheNativeActive: false,
+			headers: new Headers({ "x-better-ccflare-account-id": "acc-paused" }),
+		});
+		const result = await selectAccountsForRequest(meta, ctx);
 		expect(result[0]?.id).toBe("acc-active");
 	});
 });

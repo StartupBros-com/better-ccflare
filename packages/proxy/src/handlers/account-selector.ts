@@ -10,6 +10,19 @@ import type { ProxyContext } from "./proxy-types";
 
 const log = new Logger("AccountSelector");
 
+/** Thrown when Grok cache-native is active and force-route cannot use the target. */
+export class ForceRouteUnavailableError extends Error {
+	readonly accountId: string;
+	readonly reason: string;
+
+	constructor(accountId: string, reason: string) {
+		super(`Force-routed account unavailable: ${reason}`);
+		this.name = "ForceRouteUnavailableError";
+		this.accountId = accountId;
+		this.reason = reason;
+	}
+}
+
 // Module-level WeakMap to store combo slot info per RequestMeta
 const comboSlotInfoMap = new WeakMap<RequestMeta, ComboSlotInfo>();
 
@@ -124,9 +137,17 @@ export async function selectAccountsForRequest(
 					if (allowThrough) {
 						return [forcedAccount];
 					}
+					// Feature-scoped fail-closed for official xAI force-routes only.
+					if (meta.xaiCacheNativeActive && forcedAccount.provider === "xai") {
+						throw new ForceRouteUnavailableError(
+							forcedAccountId,
+							forcedAccount.paused ? "paused" : "rate_limited_or_unavailable",
+						);
+					}
 				}
 				// If forced account not found or unavailable (paused/rate-limited), fall back to normal selection
 			} catch (error) {
+				if (error instanceof ForceRouteUnavailableError) throw error;
 				log.error(
 					"Failed to get accounts from database for forced account lookup:",
 					error,

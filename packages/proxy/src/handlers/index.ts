@@ -3,6 +3,7 @@ export {
 	type RequestJsonBody,
 } from "../request-body-context";
 export {
+	ForceRouteUnavailableError,
 	getComboSlotInfo,
 	resolveEffectiveModel,
 	selectAccountsForRequest,

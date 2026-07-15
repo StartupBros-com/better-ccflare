@@ -28,6 +28,13 @@ export interface RequestMeta {
 	comboSlotIndex?: number | null;
 	/** Per-client session id (from request body metadata.user_id) for session-affinity routing. */
 	clientSessionId?: string | null;
+	/**
+	 * Optional conversation-level sticky key (e.g. Grok cache-native affinity).
+	 * When set, SessionAffinityStrategy prefers this over clientSessionId.
+	 */
+	cacheAffinityKey?: string | null;
+	/** True when the Grok cache-native vertical slice is active for this request. */
+	xaiCacheNativeActive?: boolean;
 	/** Model the client originally requested, before any agent-preference rewrite. */
 	originalModel?: string | null;
 	/** Model actually forwarded upstream after an agent-preference rewrite (equal to originalModel when none occurred). */

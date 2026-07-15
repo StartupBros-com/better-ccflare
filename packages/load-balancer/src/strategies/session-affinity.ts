@@ -198,7 +198,8 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 			}
 		}
 
-		const clientId = meta.clientSessionId ?? null;
+		// Prefer conversation-level cache affinity when present (Grok cache-native).
+		const clientId = meta.cacheAffinityKey ?? meta.clientSessionId ?? null;
 
 		// Existing, non-expired client-session: try to honour its sticky mapping.
 		if (clientId !== null) {

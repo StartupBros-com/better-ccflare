@@ -252,4 +252,17 @@ describe("SessionAffinityStrategy", () => {
 			).toBeNull();
 		});
 	});
+	it("prefers cacheAffinityKey over clientSessionId for sticky ownership", () => {
+		const accounts = [makeAccount({ id: "a" }), makeAccount({ id: "b" })];
+		const convoMeta = {
+			...metaFor("session-raw"),
+			cacheAffinityKey: "ccflare-xai-convo-1",
+		} as RequestMeta;
+		const first = strategy.select(accounts, convoMeta)[0].id;
+		const second = strategy.select(accounts, {
+			...metaFor("session-raw"),
+			cacheAffinityKey: "ccflare-xai-convo-1",
+		} as RequestMeta)[0].id;
+		expect(second).toBe(first);
+	});
 });
