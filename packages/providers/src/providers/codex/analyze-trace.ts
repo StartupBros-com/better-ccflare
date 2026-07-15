@@ -112,6 +112,8 @@ export interface CanaryArmStats {
 		outputTokens: number;
 		cacheReadInputTokens: number;
 		cacheCreationInputTokens: number;
+		availableResponses: number;
+		unavailableResponses: number;
 	};
 	terminals: Record<string, number>;
 	effectiveModes: Record<string, number>;
@@ -201,6 +203,8 @@ export interface TraceReport {
 			outputTokens: number;
 			cacheReadInputTokens: number;
 			cacheCreationInputTokens: number;
+			availableResponses: number;
+			unavailableResponses: number;
 		};
 		respawnResponses: number;
 		worstRespawns: Array<{
@@ -321,6 +325,8 @@ function canaryArmAccumulator(): CanaryArmAccumulator {
 			outputTokens: 0,
 			cacheReadInputTokens: 0,
 			cacheCreationInputTokens: 0,
+			availableResponses: 0,
+			unavailableResponses: 0,
 		},
 		terminals: {},
 		effectiveModes: {},
@@ -525,11 +531,16 @@ function analyzeCanary(
 		turn.joinedTerminalResponses++;
 		increment(arm.terminals, response.stop_reason ?? "unknown");
 		const inputTokens = response.input_tokens ?? 0;
-		if (response.usage_measurement_available !== false) {
+		if (response.usage_measurement_available === false) {
+			arm.usage.unavailableResponses++;
+		} else if (typeof response.input_tokens === "number") {
+			arm.usage.availableResponses++;
 			arm.usage.inputTokens += inputTokens;
 			arm.usage.outputTokens += response.output_tokens ?? 0;
 			arm.usage.cacheCreationInputTokens +=
 				response.cache_creation_input_tokens ?? 0;
+		} else {
+			arm.usage.unavailableResponses++;
 		}
 		if (
 			response.cache_measurement_available === false ||
@@ -777,6 +788,7 @@ export function analyzeCodexTrace(
 		timestampsByKey.set(request.prompt_cache_key_id, timestamps);
 	}
 	const concentration: number[] = [];
+	let maxRequestsPerKeyMinute = 0;
 	for (const timestamps of timestampsByKey.values()) {
 		timestamps.sort((a, b) => a - b);
 		let left = 0;
@@ -787,7 +799,25 @@ export function analyzeCodexTrace(
 			maximum = Math.max(maximum, right - left + 1);
 		}
 		concentration.push(maximum);
+		maxRequestsPerKeyMinute = Math.max(maxRequestsPerKeyMinute, maximum);
 	}
+	const attemptInclusiveResponses: TraceRecord[] = [];
+	const collectUnambiguousJoins = (
+		requests: ReadonlyMap<string, TraceRecord[]>,
+		responses: ReadonlyMap<string, TraceRecord[]>,
+	) => {
+		for (const [id, requestGroup] of requests) {
+			const responseGroup = responses.get(id);
+			if (requestGroup.length === 1 && responseGroup?.length === 1) {
+				attemptInclusiveResponses.push(responseGroup[0]!);
+			}
+		}
+	};
+	collectUnambiguousJoins(requestsByAttemptId, responsesByAttemptId);
+	collectUnambiguousJoins(
+		legacyRequestsByLogicalId,
+		legacyResponsesByLogicalId,
+	);
 	const sessions = new Map<string, number>();
 	const requestKeySetByAttemptId = new Map<string, boolean>();
 	const legacyRequestKeySetByLogicalId = new Map<string, boolean>();
@@ -860,6 +890,8 @@ export function analyzeCodexTrace(
 		outputTokens: 0,
 		cacheReadInputTokens: 0,
 		cacheCreationInputTokens: 0,
+		availableResponses: 0,
+		unavailableResponses: 0,
 	};
 	let cacheMeasuredInputTokens = 0;
 	const cachePcts: number[] = [];
@@ -914,10 +946,18 @@ export function analyzeCodexTrace(
 		const cacheRead = hasCacheRead
 			? Math.min(Math.max(response.cache_read_input_tokens ?? 0, 0), input)
 			: 0;
-		usage.inputTokens += input;
-		usage.outputTokens += response.output_tokens ?? 0;
+		if (response.usage_measurement_available === false) {
+			usage.unavailableResponses++;
+		} else if (typeof response.input_tokens === "number") {
+			usage.availableResponses++;
+			usage.inputTokens += input;
+			usage.outputTokens += response.output_tokens ?? 0;
+			usage.cacheCreationInputTokens +=
+				response.cache_creation_input_tokens ?? 0;
+		} else {
+			usage.unavailableResponses++;
+		}
 		usage.cacheReadInputTokens += cacheRead;
-		usage.cacheCreationInputTokens += response.cache_creation_input_tokens ?? 0;
 		if (hasCacheRead) cacheMeasuredInputTokens += input;
 		if (hasCacheRead && cacheRead === 0) zeroCacheResponses++;
 		if (typeof response.cache_hit_pct === "number")
@@ -991,7 +1031,7 @@ export function analyzeCodexTrace(
 		attempts: requestRecords.length,
 		joins: { missing: missingJoins, ambiguous: ambiguousJoins },
 		cacheDenominators: {
-			attemptInclusive: measuredStats(responseRecords),
+			attemptInclusive: measuredStats(attemptInclusiveResponses),
 			finalResponseOnly: measuredStats(finalResponses),
 		},
 		readiness: {
@@ -1006,7 +1046,7 @@ export function analyzeCodexTrace(
 					request.cache_key_mode !== undefined &&
 					request.cache_key_assignment !== request.cache_key_mode,
 			).length,
-			maxRequestsPerKeyMinute: Math.max(0, ...concentration),
+			maxRequestsPerKeyMinute,
 			keysOver15RequestsPerMinute: concentration.filter((count) => count > 15)
 				.length,
 		},

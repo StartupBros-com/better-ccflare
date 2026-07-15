@@ -1643,12 +1643,61 @@ export class CodexProvider extends BaseProvider {
 		const upstreamReader = response.body?.getReader();
 		let downstreamController: ReadableStreamDefaultController<Uint8Array>;
 		let cancelled = false;
+		const writeTerminalTrace = (
+			error?: {
+				type: string;
+				message: string;
+				code?: string;
+				status?: string;
+			},
+			stopReason:
+				| "error"
+				| "end_turn"
+				| "tool_use"
+				| "max_tokens"
+				| "refusal" = "error",
+		) => {
+			if (state.hasSentTerminalEvents) return;
+			state.hasSentTerminalEvents = true;
+			writeCodexResponseTrace({
+				requestId,
+				attemptId: state.traceAttemptId,
+				modelOut: state.model,
+				modelContextWindow: resolveModelContextCapability("codex", state.model)
+					?.rawContextWindow,
+				summary: summarizeCodexResponse(
+					state.traceNewToolCalls,
+					state.usageMeasurementAvailable
+						? {
+								input_tokens: state.totalInputTokens,
+								output_tokens: state.outputTokens,
+								...(state.cacheMeasurementAvailable
+									? {
+											cache_read_input_tokens: state.cacheReadInputTokens,
+											cache_creation_input_tokens:
+												state.cacheCreationInputTokens,
+										}
+									: {}),
+							}
+						: {},
+					stopReason,
+					error,
+				),
+			});
+		};
 		const readable = new ReadableStream<Uint8Array>({
 			start(controller) {
 				downstreamController = controller;
 			},
 			async cancel(reason) {
 				cancelled = true;
+				writeTerminalTrace({
+					type: "downstream_cancelled",
+					message:
+						typeof reason === "string" && reason
+							? reason
+							: "Downstream response was cancelled",
+				});
 				await upstreamReader?.cancel(reason).catch(() => undefined);
 			},
 		});
@@ -1803,37 +1852,34 @@ export class CodexProvider extends BaseProvider {
 						error: abruptError,
 						model: state.model,
 					});
-					writeCodexResponseTrace({
-						requestId,
-						attemptId: state.traceAttemptId,
-						modelOut: state.model,
-						modelContextWindow: resolveModelContextCapability(
-							"codex",
-							state.model,
-						)?.rawContextWindow,
-						summary: summarizeCodexResponse(
-							state.traceNewToolCalls,
-							state.usageMeasurementAvailable
-								? {
-										input_tokens: state.totalInputTokens,
-										output_tokens: state.outputTokens,
-										...(state.cacheMeasurementAvailable
-											? {
-													cache_read_input_tokens: state.cacheReadInputTokens,
-													cache_creation_input_tokens:
-														state.cacheCreationInputTokens,
-												}
-											: {}),
-									}
-								: {},
-							"error",
-							abruptError,
-						),
-					});
-					state.hasSentTerminalEvents = true;
+					writeTerminalTrace(abruptError);
 				}
 			} catch (error) {
-				if (!cancelled) log.error("Error processing Codex SSE stream:", error);
+				if (!cancelled) {
+					log.error("Error processing Codex SSE stream:", error);
+					const streamError = {
+						type: "upstream_stream_read_error",
+						message:
+							error instanceof Error
+								? error.message
+								: "Codex upstream stream processing failed",
+					};
+					try {
+						if (!state.hasSentMessageStart) {
+							await ensureMessageStart();
+						}
+						if (!state.hasSentTerminalEvents) {
+							await writeSSE("error", {
+								type: "error",
+								error: streamError,
+								model: state.model,
+							});
+						}
+					} catch {
+						// Downstream may already be cancelled or closed.
+					}
+					writeTerminalTrace(streamError);
+				}
 				await upstreamReader?.cancel(error).catch(() => undefined);
 			} finally {
 				upstreamReader?.releaseLock();
@@ -2205,6 +2251,11 @@ export class CodexProvider extends BaseProvider {
 							};
 					  }
 					| undefined;
+				state.usageMeasurementAvailable =
+					typeof usage?.input_tokens === "number";
+				state.cacheMeasurementAvailable =
+					state.usageMeasurementAvailable &&
+					typeof usage?.input_tokens_details?.cached_tokens === "number";
 				if (usage) {
 					const details = usage.input_tokens_details;
 					const normalized = normalizeCodexInputUsage(
@@ -2254,12 +2305,19 @@ export class CodexProvider extends BaseProvider {
 						)?.rawContextWindow,
 						summary: summarizeCodexResponse(
 							state.traceNewToolCalls,
-							{
-								input_tokens: state.totalInputTokens,
-								output_tokens: state.outputTokens,
-								cache_read_input_tokens: state.cacheReadInputTokens,
-								cache_creation_input_tokens: state.cacheCreationInputTokens,
-							},
+							state.usageMeasurementAvailable
+								? {
+										input_tokens: state.totalInputTokens,
+										output_tokens: state.outputTokens,
+										...(state.cacheMeasurementAvailable
+											? {
+													cache_read_input_tokens: state.cacheReadInputTokens,
+													cache_creation_input_tokens:
+														state.cacheCreationInputTokens,
+												}
+											: {}),
+									}
+								: {},
 							"error",
 							state.upstreamError,
 						),
@@ -2381,12 +2439,19 @@ export class CodexProvider extends BaseProvider {
 					)?.rawContextWindow,
 					summary: summarizeCodexResponse(
 						state.traceNewToolCalls,
-						{
-							input_tokens: state.totalInputTokens,
-							output_tokens: state.outputTokens,
-							cache_read_input_tokens: state.cacheReadInputTokens,
-							cache_creation_input_tokens: state.cacheCreationInputTokens,
-						},
+						state.usageMeasurementAvailable
+							? {
+									input_tokens: state.totalInputTokens,
+									output_tokens: state.outputTokens,
+									...(state.cacheMeasurementAvailable
+										? {
+												cache_read_input_tokens: state.cacheReadInputTokens,
+												cache_creation_input_tokens:
+													state.cacheCreationInputTokens,
+											}
+										: {}),
+								}
+							: {},
 						messageDelta.delta.stop_reason,
 					),
 				});

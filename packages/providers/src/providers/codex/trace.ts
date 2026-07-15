@@ -179,6 +179,7 @@ interface TraceInputs {
 		| "overload_529"
 		| "thinking_retry"
 		| "cache_control_retry"
+		| "account_failover"
 		| "other_retry";
 	account?: string;
 	modelIn?: string;

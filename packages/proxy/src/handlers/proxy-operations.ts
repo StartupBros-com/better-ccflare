@@ -894,7 +894,9 @@ export async function proxyWithAccount(
 				| "model_fallback"
 				| "overload_529"
 				| "thinking_retry"
-				| "cache_control_retry",
+				| "cache_control_retry"
+				| "account_failover"
+				| "other_retry",
 			finalModel?: string,
 		) => {
 			if (provider.name !== "codex") return;
@@ -955,7 +957,10 @@ export async function proxyWithAccount(
 		} else {
 			headers.delete("x-better-ccflare-attributed-agent");
 		}
-		stampCodexAttempt(headers, "initial");
+		stampCodexAttempt(
+			headers,
+			transportAttemptOrdinal > 0 ? "account_failover" : "initial",
+		);
 		// Synthetic-response markers are internal provider-to-proxy signals. Strip
 		// client-supplied copies before providers transform the outbound request.
 		headers.delete(SYNTHETIC_RESPONSE_HEADER);
@@ -1008,29 +1013,37 @@ export async function proxyWithAccount(
 			if (provider.name !== "codex" || !currentTransportAttemptId) return;
 			const attemptId = currentTransportAttemptId;
 			if (finalizedCodexAttemptIds.has(attemptId)) return;
-			const traceHeaders = new Headers(discarded.headers);
-			traceHeaders.set("x-better-ccflare-request-id", requestMeta.id);
-			traceHeaders.set("x-better-ccflare-request-stream", "false");
-			if (currentTransportAttemptId) {
-				traceHeaders.set(
-					"x-better-ccflare-attempt-id",
-					currentTransportAttemptId,
+			// Mark finalized before draining so a rejecting body cannot abort the
+			// intended retry/failover path or cause repeated finalization work.
+			finalizedCodexAttemptIds.add(attemptId);
+			try {
+				const traceHeaders = new Headers(discarded.headers);
+				traceHeaders.set("x-better-ccflare-request-id", requestMeta.id);
+				traceHeaders.set("x-better-ccflare-request-stream", "false");
+				traceHeaders.set("x-better-ccflare-attempt-id", attemptId);
+				if (currentTransportModel) {
+					traceHeaders.set(
+						"x-better-ccflare-final-model",
+						currentTransportModel,
+					);
+				}
+				const processed = await provider.processResponse(
+					new Response(discarded.clone().body, {
+						status: discarded.status,
+						statusText: discarded.statusText,
+						headers: traceHeaders,
+					}),
+					account,
+					req.headers,
+				);
+				await processed.arrayBuffer();
+			} catch (error) {
+				log.debug(
+					`Codex attempt finalization failed for ${attemptId}: ${
+						error instanceof Error ? error.message : String(error)
+					}`,
 				);
 			}
-			if (currentTransportModel) {
-				traceHeaders.set("x-better-ccflare-final-model", currentTransportModel);
-			}
-			const processed = await provider.processResponse(
-				new Response(discarded.clone().body, {
-					status: discarded.status,
-					statusText: discarded.statusText,
-					headers: traceHeaders,
-				}),
-				account,
-				req.headers,
-			);
-			await processed.arrayBuffer();
-			finalizedCodexAttemptIds.add(attemptId);
 		};
 		if (
 			transformedModel &&
@@ -1399,6 +1412,7 @@ export async function proxyWithAccount(
 							requestMeta.timestamp,
 						);
 					}
+					await finalizeCurrentCodexTransport(rawResponse);
 					return withSanitizedProxyHeaders(rawResponse);
 				}
 

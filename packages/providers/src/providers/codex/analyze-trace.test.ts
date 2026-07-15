@@ -372,6 +372,8 @@ describe("analyzeCodexTrace", () => {
 			outputTokens: 10,
 			cacheReadInputTokens: 250,
 			cacheCreationInputTokens: 2,
+			availableResponses: 5,
+			unavailableResponses: 0,
 		});
 		expect(report.response.errors).toEqual({ rate_limit_error: 1 });
 		expect(report.response.errorCodes).toEqual({ rate_limit_exceeded: 1 });
@@ -561,6 +563,8 @@ describe("analyzeCodexTrace", () => {
 			outputTokens: 30,
 			cacheReadInputTokens: 900,
 			cacheCreationInputTokens: 5,
+			availableResponses: 2,
+			unavailableResponses: 0,
 		});
 		expect(report.canary.conversation.terminals).toEqual({
 			end_turn: 1,
@@ -836,10 +840,172 @@ describe("analyzeCodexTrace", () => {
 		]);
 		expect(report.canary.session.assignedRequests).toBe(2);
 		expect(report.canary.session.cacheMeasuredResponses).toBe(0);
-		expect(report.cacheDenominators.attemptInclusive.measuredResponses).toBe(1);
+		expect(report.cacheDenominators.attemptInclusive.measuredResponses).toBe(0);
 		expect(report.cacheDenominators.finalResponseOnly.measuredResponses).toBe(
 			0,
 		);
+	});
+
+	test("uses only unambiguous one-to-one joins for attempt-inclusive cache stats", () => {
+		const report = analyzeCodexTrace([
+			{
+				trace_schema_version: 9,
+				phase: "request",
+				request_id: "schema9-good",
+				attempt_id: "attempt-good",
+				attempt_ordinal: 1,
+			},
+			{
+				trace_schema_version: 9,
+				phase: "response",
+				request_id: "schema9-good",
+				attempt_id: "attempt-good",
+				cache_measurement_available: true,
+				input_tokens: 100,
+				cache_read_input_tokens: 50,
+			},
+			{
+				trace_schema_version: 8,
+				phase: "request",
+				request_id: "legacy-good",
+			},
+			{
+				trace_schema_version: 8,
+				phase: "response",
+				request_id: "legacy-good",
+				cache_measurement_available: true,
+				input_tokens: 100,
+				cache_read_input_tokens: 25,
+			},
+			{
+				trace_schema_version: 9,
+				phase: "response",
+				request_id: "orphan",
+				attempt_id: "orphan-attempt",
+				cache_measurement_available: true,
+				input_tokens: 100,
+				cache_read_input_tokens: 100,
+			},
+			{
+				trace_schema_version: 9,
+				phase: "request",
+				request_id: "duplicate-request",
+				attempt_id: "duplicate-attempt",
+			},
+			{
+				trace_schema_version: 9,
+				phase: "request",
+				request_id: "duplicate-request",
+				attempt_id: "duplicate-attempt",
+			},
+			{
+				trace_schema_version: 9,
+				phase: "response",
+				request_id: "duplicate-request",
+				attempt_id: "duplicate-attempt",
+				cache_measurement_available: true,
+				input_tokens: 100,
+				cache_read_input_tokens: 100,
+			},
+			{
+				trace_schema_version: 8,
+				phase: "request",
+				request_id: "duplicate-response",
+			},
+			{
+				trace_schema_version: 8,
+				phase: "response",
+				request_id: "duplicate-response",
+				cache_measurement_available: true,
+				input_tokens: 100,
+				cache_read_input_tokens: 100,
+			},
+			{
+				trace_schema_version: 8,
+				phase: "response",
+				request_id: "duplicate-response",
+				cache_measurement_available: true,
+				input_tokens: 100,
+				cache_read_input_tokens: 100,
+			},
+			{
+				trace_schema_version: 9,
+				phase: "request",
+				request_id: "request-only",
+				attempt_id: "request-only-attempt",
+			},
+		]);
+
+		expect(report.cacheDenominators.attemptInclusive.measuredResponses).toBe(2);
+		expect(
+			report.cacheDenominators.attemptInclusive.weightedCacheReusePct,
+		).toBe(37.5);
+	});
+
+	test("computes key concentration for large distinct key sets without spreading", () => {
+		const records = Array.from({ length: 150_000 }, (_, index) => ({
+			phase: "request" as const,
+			request_id: `r-${index}`,
+			ts: "2026-07-10T00:00:00Z",
+			prompt_cache_key_id: `key-${index}`,
+		}));
+		const report = analyzeCodexTrace(records);
+		expect(report.readiness.maxRequestsPerKeyMinute).toBe(1);
+		expect(report.readiness.keysOver15RequestsPerMinute).toBe(0);
+	});
+
+	test("reports usage availability counts that distinguish unavailable from measured zero", () => {
+		const report = analyzeCodexTrace([
+			{
+				phase: "request",
+				request_id: "available-zero",
+				attempt_id: "available-attempt",
+				cache_key_assignment: "conversation",
+				cache_key_mode: "conversation",
+			},
+			{
+				phase: "response",
+				request_id: "available-zero",
+				attempt_id: "available-attempt",
+				usage_measurement_available: true,
+				input_tokens: 0,
+				output_tokens: 0,
+				cache_creation_input_tokens: 0,
+			},
+			{
+				phase: "request",
+				request_id: "unavailable",
+				attempt_id: "unavailable-attempt",
+				cache_key_assignment: "conversation",
+				cache_key_mode: "conversation",
+			},
+			{
+				phase: "response",
+				request_id: "unavailable",
+				attempt_id: "unavailable-attempt",
+				usage_measurement_available: false,
+				input_tokens: null,
+				output_tokens: null,
+				cache_creation_input_tokens: null,
+			},
+		]);
+
+		expect(report.response.usage).toEqual({
+			inputTokens: 0,
+			outputTokens: 0,
+			cacheReadInputTokens: 0,
+			cacheCreationInputTokens: 0,
+			availableResponses: 1,
+			unavailableResponses: 1,
+		});
+		expect(report.canary.conversation.usage).toEqual({
+			inputTokens: 0,
+			outputTokens: 0,
+			cacheReadInputTokens: 0,
+			cacheCreationInputTokens: 0,
+			availableResponses: 1,
+			unavailableResponses: 1,
+		});
 	});
 
 	test("does not substitute an earlier joined retry when the final attempt is missing", () => {
