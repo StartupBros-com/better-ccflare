@@ -439,13 +439,6 @@ function analyzeCanary(
 	const retainedRequests = [...requestsByLogicalId.values()]
 		.map((attempts) =>
 			[...attempts]
-				.filter((request) => {
-					if (!request.attempt_id) return attempts.length === 1;
-					return (
-						requestAttemptsById.get(request.attempt_id)?.length === 1 &&
-						responseAttemptsById.get(request.attempt_id)?.length === 1
-					);
-				})
 				.sort(
 					(a, b) =>
 						(a.attempt_ordinal ?? 0) - (b.attempt_ordinal ?? 0) ||
@@ -764,7 +757,8 @@ export function analyzeCodexTrace(
 			? responsesByAttemptId.get(finalAttempt.attempt_id)
 			: undefined;
 		const joined = finalAttempt?.attempt_id
-			? attemptResponses?.length === 1
+			? (requestsByAttemptId.get(finalAttempt.attempt_id)?.length ?? 0) === 1 &&
+				attemptResponses?.length === 1
 				? attemptResponses[0]
 				: undefined
 			: attempts.length === 1 &&

@@ -1003,8 +1003,11 @@ export async function proxyWithAccount(
 		const transformedModel =
 			(transformedBodyJson?.model as string | undefined) ?? "";
 		let currentTransportModel = transformedModel;
-		const traceDiscardedCodexResponse = async (discarded: Response) => {
-			if (provider.name !== "codex") return;
+		const finalizedCodexAttemptIds = new Set<string>();
+		const finalizeCurrentCodexTransport = async (discarded: Response) => {
+			if (provider.name !== "codex" || !currentTransportAttemptId) return;
+			const attemptId = currentTransportAttemptId;
+			if (finalizedCodexAttemptIds.has(attemptId)) return;
 			const traceHeaders = new Headers(discarded.headers);
 			traceHeaders.set("x-better-ccflare-request-id", requestMeta.id);
 			traceHeaders.set("x-better-ccflare-request-stream", "false");
@@ -1027,6 +1030,7 @@ export async function proxyWithAccount(
 				req.headers,
 			);
 			await processed.arrayBuffer();
+			finalizedCodexAttemptIds.add(attemptId);
 		};
 		if (
 			transformedModel &&
@@ -1081,7 +1085,7 @@ export async function proxyWithAccount(
 					duplex: "half",
 				};
 
-				await traceDiscardedCodexResponse(rawResponse);
+				await finalizeCurrentCodexTransport(rawResponse);
 				stampCodexAttempt(headers, "thinking_retry");
 				const retryProviderRequest = new Request(targetUrl, retryRequestInit);
 
@@ -1124,7 +1128,7 @@ export async function proxyWithAccount(
 				stripCacheControlFromOpenAIRequest(retryBodyJson);
 				let retryRequest: Request;
 				if (provider.name === "codex" && provider.transformRequestBody) {
-					await traceDiscardedCodexResponse(rawResponse);
+					await finalizeCurrentCodexTransport(rawResponse);
 					const retryHeaders = new Headers(providerRequest.headers);
 					stampCodexAttempt(retryHeaders, "cache_control_retry");
 					const retrySourceBody = await providerRequest.clone().json();
@@ -1244,6 +1248,7 @@ export async function proxyWithAccount(
 			// NOT bench the account (no applyRateLimitCooldown, no consecutive increment):
 			// fail over per-request and leave the account in rotation for other models.
 			if (rawResponse.status === 429 && isAnthropicOutOfCredits(rawResponse)) {
+				await finalizeCurrentCodexTransport(rawResponse);
 				const isKeepalive =
 					req.headers.get("x-better-ccflare-keepalive") === "true";
 				if (isKeepalive) {
@@ -1319,6 +1324,7 @@ export async function proxyWithAccount(
 							log.warn(
 								`Keepalive replay for ${account.name} got 429 — skipping cooldown (synthetic burst, not a real per-account rate limit)`,
 							);
+							await finalizeCurrentCodexTransport(rawResponse);
 							return null;
 						}
 
@@ -1371,6 +1377,7 @@ export async function proxyWithAccount(
 								requestMeta.agentAttributionSource ?? null,
 							),
 						);
+						await finalizeCurrentCodexTransport(rawResponse);
 						return null;
 					}
 					// Model-not-found (404/400) is forwarded to the client so it can
@@ -1433,7 +1440,7 @@ export async function proxyWithAccount(
 						duplex: "half",
 					};
 
-					await traceDiscardedCodexResponse(rawResponse);
+					await finalizeCurrentCodexTransport(rawResponse);
 					stampCodexAttempt(headers, "model_fallback", nextModel);
 					currentTransportModel = nextModel;
 					const retryProviderRequest = new Request(targetUrl, retryRequestInit);
@@ -1476,7 +1483,6 @@ export async function proxyWithAccount(
 					// Attribution advances only once a concrete request is ready to
 					// execute. A failed patch must leave it on the previous model.
 					finalAttemptModel = nextModel;
-					await traceDiscardedCodexResponse(rawResponse);
 					rawResponse = isSyntheticProviderResponse(retryTransformedRequest)
 						? materializeSyntheticResponse(retryTransformedRequest)
 						: await makeProxyRequest(retryTransportRequest);
@@ -1491,6 +1497,7 @@ export async function proxyWithAccount(
 			// scoped classification against the final response/model before
 			// account-wide handling, otherwise one fallback benches the account.
 			if (rawResponse.status === 429 && isAnthropicOutOfCredits(rawResponse)) {
+				await finalizeCurrentCodexTransport(rawResponse);
 				if (req.headers.get("x-better-ccflare-keepalive") === "true") {
 					return null;
 				}
@@ -1608,6 +1615,7 @@ export async function proxyWithAccount(
 						);
 					}
 				}
+				await finalizeCurrentCodexTransport(rawResponse);
 				return null;
 			}
 		}
@@ -1646,6 +1654,9 @@ export async function proxyWithAccount(
 			account,
 			req.headers,
 		);
+		if (provider.name === "codex" && currentTransportAttemptId) {
+			finalizedCodexAttemptIds.add(currentTransportAttemptId);
+		}
 
 		// Failover to next account on upstream 401 — credentials are invalid/expired
 		if (response.status === 401) {

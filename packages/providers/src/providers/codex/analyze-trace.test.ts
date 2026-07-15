@@ -834,11 +834,46 @@ describe("analyzeCodexTrace", () => {
 				cache_read_input_tokens: null,
 			},
 		]);
-		expect(report.canary.session.assignedRequests).toBe(1);
+		expect(report.canary.session.assignedRequests).toBe(2);
 		expect(report.canary.session.cacheMeasuredResponses).toBe(0);
 		expect(report.cacheDenominators.attemptInclusive.measuredResponses).toBe(1);
 		expect(report.cacheDenominators.finalResponseOnly.measuredResponses).toBe(
-			1,
+			0,
+		);
+	});
+
+	test("does not substitute an earlier joined retry when the final attempt is missing", () => {
+		const report = analyzeCodexTrace([
+			{
+				phase: "request",
+				request_id: "logical-missing-final",
+				attempt_id: "joined-earlier",
+				attempt_ordinal: 1,
+				cache_key_assignment: "conversation",
+			},
+			{
+				phase: "response",
+				request_id: "logical-missing-final",
+				attempt_id: "joined-earlier",
+				input_tokens: 100,
+				cache_read_input_tokens: 90,
+			},
+			{
+				phase: "request",
+				request_id: "logical-missing-final",
+				attempt_id: "missing-final",
+				attempt_ordinal: 2,
+				cache_key_assignment: "session",
+			},
+		]);
+
+		expect(report.canary.conversation.assignedRequests).toBe(0);
+		expect(report.canary.session.assignedRequests).toBe(1);
+		expect(report.canary.session.joinedTerminalResponses).toBe(0);
+		expect(report.canary.session.missingTerminalRequests).toBe(1);
+		expect(report.canary.session.cacheMeasuredResponses).toBe(0);
+		expect(report.cacheDenominators.finalResponseOnly.measuredResponses).toBe(
+			0,
 		);
 	});
 
