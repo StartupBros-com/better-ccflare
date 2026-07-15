@@ -200,3 +200,18 @@ Set the database path in the unit file:
 ```ini
 Environment=BETTER_CCFLARE_DB_PATH=/var/lib/better-ccflare/better-ccflare.db
 ```
+## Codex orchestration safety
+
+Codex routing allows one orchestration-capable conversation per identified Claude Code session. The first conversation that offers `Agent` or `Task` becomes the session root. Other conversation identities in that session keep their normal tools but have current `Agent` and `Task` declarations removed. The election is process-local, expires after five hours of orchestration inactivity, and resets when the service restarts. Concurrent independent orchestration roots in one Claude Code session are intentionally unsupported.
+
+Containment is enabled by default. For emergency rollback only:
+
+```ini
+Environment=CCFLARE_CODEX_SINGLE_ORCHESTRATION_ROOT=0
+```
+
+This switch disables root election only. Trusted descendant filtering and `CCFLARE_SESSION_MAX_REQUESTS_PER_HOUR` remain active. Remove the override to restore containment.
+
+Codex trace schema 6 records `orchestration_admission`, before/after tool counts, and exact filtered tool names. To diagnose prompt-cache misses without storing prompts, set `CCFLARE_CODEX_TRACE_HMAC_KEY` to a dedicated trace key. Traces then include bounded per-input-item HMACs and byte lengths, allowing an earlier full input to be compared with the corresponding prefix of a later turn. The key itself is never written to the trace. Rotate or remove it after the bounded observation window.
+
+Accounts with mature repeated 429 streaks use process-local single-flight recovery probes after cooldown expiry. Journal events are `cooldown_probe_admitted`, `cooldown_probe_suppressed`, `cooldown_probe_recovery_success`, and `cooldown_probe_reapplied`. The upstream reset time remains authoritative; probe gating prevents concurrent re-entry without imposing a longer fixed cooldown.
