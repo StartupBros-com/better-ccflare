@@ -4,6 +4,7 @@ import type {
 	ComboWithSlots,
 	RequestMeta,
 } from "@better-ccflare/types";
+import { CacheAffinityOrderer } from "../../cache-affinity-orderer";
 import {
 	ForceRouteUnavailableError,
 	getComboSlotInfo,
@@ -199,6 +200,108 @@ describe("selectAccountsForRequest — x-better-ccflare-account-id header", () =
 		// Rate-limited forced account is skipped; falls back to strategy.select which returns activeAcc
 		expect(result).toHaveLength(1);
 		expect(result[0]?.id).toBe("acc-active");
+	});
+});
+
+describe("selectAccountsForRequest — Grok cache-native ownership", () => {
+	it("keeps the same owner when the configured strategy changes order", async () => {
+		const a = makeAccount({ id: "xai-a", provider: "xai" });
+		const b = makeAccount({ id: "xai-b", provider: "xai" });
+		let reverse = false;
+		const ctx = makeCtx({ accounts: [a, b] });
+		ctx.strategy.select = mock(() => {
+			reverse = !reverse;
+			return reverse ? [a, b] : [b, a];
+		});
+		ctx.cacheAffinityOrderer = new CacheAffinityOrderer(60_000);
+
+		const first = await selectAccountsForRequest(
+			makeRequestMeta({
+				xaiCacheNativeActive: true,
+				cacheAffinityKey: "conversation",
+			}),
+			ctx,
+		);
+		const second = await selectAccountsForRequest(
+			makeRequestMeta({
+				xaiCacheNativeActive: true,
+				cacheAffinityKey: "conversation",
+			}),
+			ctx,
+		);
+
+		expect(first[0]?.id).toBe("xai-a");
+		expect(second[0]?.id).toBe("xai-a");
+	});
+
+	it("keeps combo account and model slots aligned after affinity ordering", async () => {
+		const a = makeAccount({ id: "xai-a", provider: "xai" });
+		const b = makeAccount({ id: "xai-b", provider: "xai" });
+		const ctx = makeCtx({
+			accounts: [a, b],
+			activeCombo: makeCombo([
+				{
+					id: "slot-a",
+					combo_id: "combo-1",
+					account_id: "xai-a",
+					model: "grok-a",
+					priority: 0,
+					enabled: true,
+				},
+				{
+					id: "slot-b",
+					combo_id: "combo-1",
+					account_id: "xai-b",
+					model: "grok-b",
+					priority: 1,
+					enabled: true,
+				},
+			]),
+		});
+		ctx.cacheAffinityOrderer = new CacheAffinityOrderer(60_000);
+		const affinity = {
+			xaiCacheNativeActive: true,
+			cacheAffinityKey: "conversation",
+		};
+
+		await selectAccountsForRequest(
+			makeRequestMeta(affinity),
+			ctx,
+			"claude-sonnet-4-5",
+		);
+		const reversedCombo = makeCombo([
+			{
+				id: "slot-b",
+				combo_id: "combo-1",
+				account_id: "xai-b",
+				model: "grok-b",
+				priority: 0,
+				enabled: true,
+			},
+			{
+				id: "slot-a",
+				combo_id: "combo-1",
+				account_id: "xai-a",
+				model: "grok-a",
+				priority: 1,
+				enabled: true,
+			},
+		]);
+		(
+			ctx.dbOps.getActiveComboForFamily as ReturnType<typeof mock>
+		).mockImplementation(async () => reversedCombo);
+		const meta = makeRequestMeta(affinity);
+		const result = await selectAccountsForRequest(
+			meta,
+			ctx,
+			"claude-sonnet-4-5",
+		);
+
+		expect(result.map((account) => account.id)).toEqual(["xai-a", "xai-b"]);
+		expect(getComboSlotInfo(meta)?.slots).toEqual([
+			{ accountId: "xai-a", modelOverride: "grok-a" },
+			{ accountId: "xai-b", modelOverride: "grok-b" },
+		]);
 	});
 });
 

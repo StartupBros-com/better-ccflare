@@ -333,6 +333,40 @@ describe("UsageCollector request lifecycle", () => {
 		expect(canaryEvents[0]?.msg).toContain("cached=0");
 	});
 
+	it("does not count a custom or non-xAI serving route as an active Grok canary", async () => {
+		const { collector } = harness();
+		const canaryEvents: LogEvent[] = [];
+		const onLog = (event: LogEvent) => {
+			if (event.msg.startsWith("Grok cache canary ")) {
+				canaryEvents.push(event);
+			}
+		};
+		logBus.on("log", onLog);
+
+		try {
+			collector.handleStart(
+				makeStartMessage("cache-ineligible-route", {
+					accountId: "custom-account",
+					providerName: "xai",
+					xaiCacheIdentityFingerprint: "identity12345678",
+					xaiCacheOfficialEndpoint: false,
+					xaiCacheKeyPresent: false,
+				}),
+			);
+			collector.handleChunk("cache-ineligible-route", modelBearingChunk());
+			await collector.handleEnd({
+				type: "end",
+				requestId: "cache-ineligible-route",
+				success: true,
+			});
+			await collector.drain();
+		} finally {
+			logBus.off("log", onLog);
+		}
+
+		expect(canaryEvents).toHaveLength(0);
+	});
+
 	it("keeps an actively chunking stream beyond two minutes and persists it on end", async () => {
 		const { collector, saveRequestIds, summaries } = harness();
 		collector.handleStart(makeStartMessage("active-stream"));

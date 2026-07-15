@@ -10,6 +10,7 @@ export {
 	registerProvider,
 } from "@better-ccflare/providers";
 export { AutoRefreshScheduler } from "./auto-refresh-scheduler";
+export { CacheAffinityOrderer } from "./cache-affinity-orderer";
 export { handleCacheDiagnosisRequest } from "./cache-diagnosis";
 export { CacheKeepaliveScheduler } from "./cache-keepalive-scheduler";
 export {

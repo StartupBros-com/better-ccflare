@@ -715,7 +715,10 @@ export class UsageCollector {
 			}
 		}
 
-		if (startMessage.xaiCacheIdentityFingerprint) {
+		if (
+			startMessage.xaiCacheIdentityFingerprint &&
+			startMessage.xaiCacheOfficialEndpoint === true
+		) {
 			const cacheOutcome = cacheOutcomeFromTokens(
 				state.usage.cacheReadInputTokens,
 				state.usage.cacheReadInputTokensPresent === true,
