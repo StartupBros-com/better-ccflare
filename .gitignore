@@ -42,7 +42,6 @@ test_*.sh
 *.db.backup.*
 *.db-wal
 *.db-shm
-.gitnexus
 .worktrees/
 docs/superpowers/
 packages/database/src/inline-integrity-check-worker.ts
