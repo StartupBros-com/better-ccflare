@@ -115,8 +115,10 @@ describe("summarizeCodexTransform (request/history phase)", () => {
 			{ role: "user", content: "third" },
 		]);
 
-		expect(earlier.input_item_fingerprints).toEqual(
-			later.input_item_fingerprints.slice(0, earlierInput.length),
+		expect(earlier.input_item_fingerprints.at(-1)).toEqual(
+			later.input_item_fingerprints.find(
+				(fingerprint) => fingerprint.index === earlierInput.length - 1,
+			),
 		);
 		expect(earlier.input_item_total_count).toBe(2);
 		expect(earlier.input_item_fingerprints_truncated).toBe(false);
@@ -127,15 +129,16 @@ describe("summarizeCodexTransform (request/history phase)", () => {
 		expect(disabled.input_item_fingerprints).toEqual([]);
 
 		process.env[CODEX_TRACE_HMAC_KEY_ENV] = "test-only-key";
-		const many = summarizeCodexTransform(
-			Array.from({ length: 100 }, (_, index) => ({ index })),
+		const baseInput = Array.from({ length: 100 }, (_, index) => ({ index }));
+		const many = summarizeCodexTransform(baseInput);
+		const appended = summarizeCodexTransform([...baseInput, { index: 100 }]);
+		expect(many.input_item_fingerprints).toHaveLength(64);
+		expect(many.input_item_fingerprints[0]?.index).toBe(36);
+		expect(many.input_item_fingerprints.at(-1)).toEqual(
+			appended.input_item_fingerprints.find(
+				(fingerprint) => fingerprint.index === 99,
+			),
 		);
-		expect(many.input_item_fingerprints.length).toBeLessThan(100);
-		expect(many.input_item_fingerprints[0]).toEqual({
-			index: 0,
-			bytes: 11,
-			hmac: expect.any(String),
-		});
 		expect(many.input_item_total_count).toBe(100);
 		expect(many.input_item_fingerprints_truncated).toBe(true);
 	});

@@ -56,9 +56,9 @@ export interface CodexTransformSummary {
 	input_first_item_bytes: number | null;
 	input_first_item_hmac: string | null;
 	/**
-	 * Per-item keyed fingerprints preserve ordering and serialized byte length, so
-	 * traces can compare an earlier full input with the matching prefix of a later
-	 * input without retaining content. Empty unless the trace HMAC key is set.
+	 * Cumulative keyed fingerprints at input-item boundaries. Matching an earlier
+	 * final boundary to a later boundary proves the whole serialized item prefix is
+	 * identical without retaining content. Only the newest boundaries are retained.
 	 */
 	input_item_fingerprints: Array<{
 		index: number;
@@ -137,17 +137,7 @@ export function summarizeCodexTransform(
 		codexInput.length > 1 ? serializedMetrics(codexInput.slice(0, -1)) : null;
 	const firstInputItem =
 		codexInput.length > 0 ? serializedMetrics(codexInput[0]) : null;
-	const hmacKey = process.env[CODEX_TRACE_HMAC_KEY_ENV];
-	const inputItemFingerprints = hmacKey
-		? codexInput
-				.slice(0, MAX_INPUT_ITEM_FINGERPRINTS)
-				.flatMap((item, index) => {
-					const metrics = serializedMetrics(item);
-					return metrics.hmac
-						? [{ index, bytes: metrics.bytes, hmac: metrics.hmac }]
-						: [];
-				})
-		: [];
+	const inputItemFingerprints = prefixBoundaryFingerprints(codexInput);
 
 	return {
 		input_item_count: codexInput.length,
@@ -369,6 +359,39 @@ function appendTraceRecord(record: Record<string, unknown>): void {
 	} catch {
 		// best-effort: tracing must never break the request path
 	}
+}
+
+function prefixBoundaryFingerprints(
+	items: readonly unknown[],
+): CodexTransformSummary["input_item_fingerprints"] {
+	const key = process.env[CODEX_TRACE_HMAC_KEY_ENV];
+	if (!key) return [];
+
+	const fingerprints: CodexTransformSummary["input_item_fingerprints"] = [];
+	let chain = "";
+	let cumulativeBytes = 0;
+	for (const [index, item] of items.entries()) {
+		let serialized: string;
+		try {
+			serialized = JSON.stringify(item) ?? "";
+		} catch {
+			return [];
+		}
+		const itemBytes = Buffer.byteLength(serialized, "utf8");
+		cumulativeBytes += itemBytes;
+		chain = createHmac("sha256", key)
+			.update(chain, "utf8")
+			.update("\0")
+			.update(String(itemBytes), "utf8")
+			.update("\0")
+			.update(serialized, "utf8")
+			.digest("hex");
+		fingerprints.push({ index, bytes: cumulativeBytes, hmac: chain });
+		if (fingerprints.length > MAX_INPUT_ITEM_FINGERPRINTS) {
+			fingerprints.shift();
+		}
+	}
+	return fingerprints;
 }
 
 function serializedMetrics(value: unknown): {
