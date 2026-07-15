@@ -102,6 +102,46 @@ describe("summarizeCodexTransform (request/history phase)", () => {
 		expect(first.input_hmac).not.toBe(changed.input_hmac);
 		expect(first.input_first_item_hmac).toBe(changed.input_first_item_hmac);
 	});
+
+	test("emits per-item HMACs that prove an earlier full input is a later prefix", () => {
+		process.env[CODEX_TRACE_HMAC_KEY_ENV] = "test-only-key";
+		const earlierInput = [
+			{ role: "user", content: "first" },
+			{ role: "assistant", content: "second" },
+		];
+		const earlier = summarizeCodexTransform(earlierInput);
+		const later = summarizeCodexTransform([
+			...earlierInput,
+			{ role: "user", content: "third" },
+		]);
+
+		expect(earlier.input_item_fingerprints.at(-1)).toEqual(
+			later.input_item_fingerprints.find(
+				(fingerprint) => fingerprint.index === earlierInput.length - 1,
+			),
+		);
+		expect(earlier.input_item_total_count).toBe(2);
+		expect(earlier.input_item_fingerprints_truncated).toBe(false);
+	});
+
+	test("keeps per-item telemetry empty without a key and caps trace growth", () => {
+		const disabled = summarizeCodexTransform([{ value: "private" }]);
+		expect(disabled.input_item_fingerprints).toEqual([]);
+
+		process.env[CODEX_TRACE_HMAC_KEY_ENV] = "test-only-key";
+		const baseInput = Array.from({ length: 100 }, (_, index) => ({ index }));
+		const many = summarizeCodexTransform(baseInput);
+		const appended = summarizeCodexTransform([...baseInput, { index: 100 }]);
+		expect(many.input_item_fingerprints).toHaveLength(64);
+		expect(many.input_item_fingerprints[0]?.index).toBe(36);
+		expect(many.input_item_fingerprints.at(-1)).toEqual(
+			appended.input_item_fingerprints.find(
+				(fingerprint) => fingerprint.index === 99,
+			),
+		);
+		expect(many.input_item_total_count).toBe(100);
+		expect(many.input_item_fingerprints_truncated).toBe(true);
+	});
 });
 
 describe("summarizeCodexResponse (response phase)", () => {
@@ -166,13 +206,24 @@ describe("summarizeCodexResponse (response phase)", () => {
 		expect(s.cache_hit_pct).toBeNull();
 	});
 
-	test("carries upstream error type/message", () => {
+	test("carries normalized upstream error details", () => {
 		const s = summarizeCodexResponse([], { input_tokens: 10 }, "error", {
 			type: "rate_limit_error",
 			message: "429",
+			code: "rate_limit_exceeded",
+			status: "rate_limited",
 		});
 		expect(s.stop_reason).toBe("error");
 		expect(s.error_type).toBe("rate_limit_error");
 		expect(s.error_message).toBe("429");
+		expect(s.error_code).toBe("rate_limit_exceeded");
+		expect(s.error_status).toBe("rate_limited");
+	});
+
+	test("classifies metadata-free error stops without guessing a cause", () => {
+		const s = summarizeCodexResponse([], { input_tokens: 10 }, "error");
+		expect(s.stop_reason).toBe("error");
+		expect(s.error_type).toBe("unclassified_upstream_error");
+		expect(s.error_message).toBeUndefined();
 	});
 });

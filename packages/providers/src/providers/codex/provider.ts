@@ -11,6 +11,12 @@ import type { Account } from "@better-ccflare/types";
 import { BaseProvider } from "../../base";
 import type { RateLimitInfo, TokenRefreshResult } from "../../types";
 import {
+	CODEX_SINGLE_ORCHESTRATION_ROOT_ENV,
+	deriveConversationIdentity,
+	electOrchestrationRoot,
+	type OrchestrationAdmission,
+} from "./orchestration-election";
+import {
 	summarizeCodexResponse,
 	type ToolCallSummary,
 	writeCodexResponseTrace,
@@ -251,6 +257,12 @@ interface CodexRequest {
 		| { type: "function"; name: string };
 	parallel_tool_calls?: boolean;
 	max_output_tokens?: number;
+}
+
+interface CodexConversionResult {
+	codexBody: CodexRequest;
+	orchestrationAdmission: OrchestrationAdmission;
+	filteredToolNames: string[];
 }
 
 // ── Anthropic request types ───────────────────────────────────────────────────
@@ -528,12 +540,13 @@ export class CodexProvider extends BaseProvider {
 					ts: Date.now(),
 				});
 			}
-			const codexBody = this.convertToCodexFormat(
-				body,
-				account,
-				requestId ?? undefined,
-				isAttributedAgent,
-			);
+			const { codexBody, orchestrationAdmission, filteredToolNames } =
+				this.convertToCodexFormat(
+					body,
+					account,
+					requestId ?? undefined,
+					isAttributedAgent,
+				);
 			if (isSubscriptionEndpoint) {
 				// ChatGPT's subscription Responses endpoint rejects this API-only field.
 				delete codexBody.max_output_tokens;
@@ -562,12 +575,9 @@ export class CodexProvider extends BaseProvider {
 				),
 				pacingAction: request.headers.get("x-better-ccflare-pacing-action"),
 				isDescendant: isAttributedAgent,
+				orchestrationAdmission,
 				toolsBeforeCount: body.tools?.length ?? 0,
-				filteredToolNames: isAttributedAgent
-					? (body.tools
-							?.filter((tool) => tool.name === "Agent" || tool.name === "Task")
-							.map((tool) => tool.name) ?? [])
-					: [],
+				filteredToolNames,
 				instructions: codexBody.instructions,
 				tools: codexBody.tools,
 				codexInput: codexBody.input,
@@ -807,20 +817,14 @@ export class CodexProvider extends BaseProvider {
 				.digest("hex")
 				.slice(0, 48)}`;
 		}
-		let firstItem = "";
-		try {
-			firstItem = JSON.stringify(input[0]) ?? "";
-		} catch {
-			// Non-serializable first item: fall back to instructions-only identity.
-		}
-		return `ccflare-convo-${createHash("sha256")
-			.update(sessionId)
-			.update("\0")
-			.update(instructions)
-			.update("\0")
-			.update(firstItem)
-			.digest("hex")
-			.slice(0, 48)}`;
+		const conversationId = deriveConversationIdentity(
+			sessionId,
+			instructions,
+			input,
+		);
+		return conversationId
+			? `ccflare-convo-${conversationId.slice(0, 48)}`
+			: undefined;
 	}
 
 	private convertToolChoice(
@@ -1199,7 +1203,7 @@ export class CodexProvider extends BaseProvider {
 		account?: Account,
 		requestId?: string,
 		isAttributedAgent = false,
-	): CodexRequest {
+	): CodexConversionResult {
 		const model = this.mapModel(body.model, account);
 		if (process.env.DEBUG?.includes("model") || process.env.DEBUG === "true") {
 			log.info(
@@ -1248,13 +1252,46 @@ export class CodexProvider extends BaseProvider {
 			});
 		}
 
-		// Convert tools
+		const finalInstructions = instructions || "You are a helpful assistant.";
+		const orchestrationToolNames = new Set(["Agent", "Task"]);
+		const offersOrchestrationTools =
+			body.tools?.some((tool) => orchestrationToolNames.has(tool.name)) ??
+			false;
+		let orchestrationAdmission: OrchestrationAdmission;
+		if (!offersOrchestrationTools) {
+			orchestrationAdmission = "no_orchestration_tools";
+		} else if (process.env[CODEX_SINGLE_ORCHESTRATION_ROOT_ENV] === "0") {
+			orchestrationAdmission = "disabled";
+		} else {
+			const sessionId = this.extractSessionId(body);
+			if (!sessionId) {
+				orchestrationAdmission = "no_session";
+			} else {
+				const conversationId = deriveConversationIdentity(
+					sessionId,
+					finalInstructions,
+					input,
+				);
+				orchestrationAdmission = conversationId
+					? electOrchestrationRoot(sessionId, conversationId)
+					: "no_conversation";
+			}
+		}
+
+		// Descendants are always filtered. For ordinary requests, only the elected
+		// root retains current Agent and Task declarations. Historical calls and
+		// results are already represented in input and remain untouched.
+		const shouldFilterOrchestrationTools =
+			isAttributedAgent || orchestrationAdmission === "non_root";
+		const filteredToolNames = shouldFilterOrchestrationTools
+			? (body.tools ?? [])
+					.filter((tool) => orchestrationToolNames.has(tool.name))
+					.map((tool) => tool.name)
+			: [];
 		let tools: CodexTool[] | undefined;
 		if (body.tools && body.tools.length > 0) {
-			const currentTools = isAttributedAgent
-				? body.tools.filter(
-						(tool) => tool.name !== "Agent" && tool.name !== "Task",
-					)
+			const currentTools = shouldFilterOrchestrationTools
+				? body.tools.filter((tool) => !orchestrationToolNames.has(tool.name))
 				: body.tools;
 			tools = currentTools.map((t) => ({
 				type: "function" as const,
@@ -1286,7 +1323,7 @@ export class CodexProvider extends BaseProvider {
 			reasoning: { effort: reasoningResolution.effort ?? "medium" },
 		};
 
-		codexRequest.instructions = instructions || "You are a helpful assistant.";
+		codexRequest.instructions = finalInstructions;
 		const promptCacheKey = this.derivePromptCacheKey(
 			body,
 			codexRequest.instructions,
@@ -1333,7 +1370,11 @@ export class CodexProvider extends BaseProvider {
 			}
 		}
 
-		return codexRequest;
+		return {
+			codexBody: codexRequest,
+			orchestrationAdmission,
+			filteredToolNames,
+		};
 	}
 
 	private async transformSseResponseToJson(
@@ -1814,10 +1855,13 @@ export class CodexProvider extends BaseProvider {
 			type = rawType;
 		}
 		const upstreamMessage = error?.message || "Codex upstream failed.";
-		const message =
-			code === "context_length_exceeded"
-				? `Prompt is too long. Codex reported: ${upstreamMessage}`
-				: upstreamMessage;
+		const normalizedCode = code?.toLowerCase();
+		const isContextOverflow =
+			normalizedCode === "context_length_exceeded" ||
+			/^your input exceeds the context window\b/i.test(upstreamMessage);
+		const message = isContextOverflow
+			? `Prompt is too long. Codex reported: ${upstreamMessage}`
+			: upstreamMessage;
 		return {
 			type: "error",
 			error: {

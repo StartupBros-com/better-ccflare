@@ -2,6 +2,10 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+	CODEX_SINGLE_ORCHESTRATION_ROOT_ENV,
+	resetOrchestrationElectionForTest,
+} from "./orchestration-election";
 import { CodexProvider } from "./provider";
 import { CODEX_TRACE_DIR_ENV, CODEX_TRACE_FULL_ENV } from "./trace";
 
@@ -54,6 +58,8 @@ describe("Codex trace wiring (integration)", () => {
 	afterEach(() => {
 		delete process.env[CODEX_TRACE_DIR_ENV];
 		delete process.env[CODEX_TRACE_FULL_ENV];
+		delete process.env[CODEX_SINGLE_ORCHESTRATION_ROOT_ENV];
+		resetOrchestrationElectionForTest();
 		rmSync(dir, { recursive: true, force: true });
 	});
 
@@ -67,8 +73,9 @@ describe("Codex trace wiring (integration)", () => {
 		const files = readdirSync(dir).filter((f) => f.endsWith(".jsonl"));
 		expect(files.length).toBe(1);
 		const rec = JSON.parse(readFileSync(join(dir, files[0]), "utf8").trim());
-		expect(rec.trace_schema_version).toBe(5);
+		expect(rec.trace_schema_version).toBe(6);
 		expect(rec.phase).toBe("request");
+		expect(rec.orchestration_admission).toBe("no_orchestration_tools");
 		expect(rec.request_id).toBe("req_trace_1");
 		// Cache-key experiment is off by default in this test environment.
 		expect(rec.prompt_cache_key_set).toBe(false);
@@ -87,6 +94,104 @@ describe("Codex trace wiring (integration)", () => {
 		expect(transformed.headers.get("x-better-ccflare-request-id")).toBeNull();
 		// full bodies must be absent unless FULL is set
 		expect(rec.anthropic_request).toBeUndefined();
+	});
+
+	test("traces every orchestration admission status and exact removals", async () => {
+		process.env[CODEX_TRACE_DIR_ENV] = dir;
+		const provider = new CodexProvider();
+		const sessionId = "11111111-1111-4111-8111-111111111111";
+		const transform = async (
+			requestId: string,
+			content: string,
+			options: {
+				tools?: string[];
+				metadata?: unknown;
+				disabled?: boolean;
+			} = {},
+		) => {
+			if (options.disabled) {
+				process.env[CODEX_SINGLE_ORCHESTRATION_ROOT_ENV] = "0";
+			} else {
+				delete process.env[CODEX_SINGLE_ORCHESTRATION_ROOT_ENV];
+			}
+			await provider.transformRequestBody(
+				messagesRequest(
+					{
+						model: "claude-opus-4-8",
+						max_tokens: 10,
+						messages: [{ role: "user", content }],
+						...(options.metadata === undefined
+							? {}
+							: { metadata: options.metadata }),
+						...(options.tools
+							? {
+									tools: options.tools.map((name) => ({
+										name,
+										input_schema: { type: "object" },
+									})),
+								}
+							: {}),
+					},
+					requestId,
+				),
+			);
+		};
+
+		const metadata = { user_id: JSON.stringify({ session_id: sessionId }) };
+		await transform("root", "root", {
+			tools: ["Agent", "Task", "Read"],
+			metadata,
+		});
+		await transform("non-root", "sibling", {
+			tools: ["Agent", "Task", "Read"],
+			metadata,
+		});
+		await transform("no-session", "missing", { tools: ["Agent"] });
+		await provider.transformRequestBody(
+			messagesRequest(
+				{
+					model: "claude-opus-4-8",
+					max_tokens: 10,
+					messages: [],
+					metadata,
+					tools: [{ name: "Agent", input_schema: { type: "object" } }],
+				},
+				"no-conversation",
+			),
+		);
+		await transform("no-tools", "ordinary", { tools: ["Read"], metadata });
+		await transform("disabled", "disabled", {
+			tools: ["Task"],
+			metadata,
+			disabled: true,
+		});
+
+		const file = readdirSync(dir).find((f) => f.endsWith(".jsonl")) as string;
+		const records = readFileSync(join(dir, file), "utf8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line));
+		const byId = new Map(records.map((record) => [record.request_id, record]));
+		expect(byId.get("root")).toMatchObject({
+			orchestration_admission: "root",
+			tools_before_count: 3,
+			tools_after_count: 3,
+			filtered_tool_names: [],
+		});
+		expect(byId.get("non-root")).toMatchObject({
+			orchestration_admission: "non_root",
+			tools_before_count: 3,
+			tools_after_count: 1,
+			filtered_tool_names: ["Agent", "Task"],
+		});
+		expect(byId.get("no-session").orchestration_admission).toBe("no_session");
+		expect(byId.get("no-conversation").orchestration_admission).toBe(
+			"no_conversation",
+		);
+		expect(byId.get("no-tools").orchestration_admission).toBe(
+			"no_orchestration_tools",
+		);
+		expect(byId.get("disabled").orchestration_admission).toBe("disabled");
 	});
 
 	test("traces canary arm and cohort digest, then strips both headers", async () => {

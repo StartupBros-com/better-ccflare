@@ -28,8 +28,9 @@ export const CODEX_TRACE_HMAC_KEY_ENV = "CCFLARE_CODEX_TRACE_HMAC_KEY";
 /** Warn when one response spawns at least this many subagents (0 disables). */
 export const CODEX_FANOUT_WARN_ENV = "CCFLARE_CODEX_FANOUT_WARN";
 
-const TRACE_SCHEMA_VERSION = 5;
+const TRACE_SCHEMA_VERSION = 6;
 const DEFAULT_FANOUT_WARN = 8;
+const MAX_INPUT_ITEM_FINGERPRINTS = 64;
 /**
  * Tool names that spawn subagents in Claude Code ("Task" historically,
  * "Agent" in current clients). Fan-out through these compounds recursively,
@@ -54,6 +55,18 @@ export interface CodexTransformSummary {
 	input_except_last_item_hmac: string | null;
 	input_first_item_bytes: number | null;
 	input_first_item_hmac: string | null;
+	/**
+	 * Cumulative keyed fingerprints at input-item boundaries. Matching an earlier
+	 * final boundary to a later boundary proves the whole serialized item prefix is
+	 * identical without retaining content. Only the newest boundaries are retained.
+	 */
+	input_item_fingerprints: Array<{
+		index: number;
+		bytes: number;
+		hmac: string;
+	}>;
+	input_item_total_count: number;
+	input_item_fingerprints_truncated: boolean;
 	/** Historical tool calls replayed into this request, NOT newly emitted calls. */
 	history_function_call_count: number;
 	history_function_call_output_count: number;
@@ -78,6 +91,8 @@ export interface CodexResponseSummary {
 	cache_hit_pct: number | null;
 	error_type?: string;
 	error_message?: string;
+	error_code?: string;
+	error_status?: string;
 }
 
 /**
@@ -122,6 +137,7 @@ export function summarizeCodexTransform(
 		codexInput.length > 1 ? serializedMetrics(codexInput.slice(0, -1)) : null;
 	const firstInputItem =
 		codexInput.length > 0 ? serializedMetrics(codexInput[0]) : null;
+	const inputItemFingerprints = prefixBoundaryFingerprints(codexInput);
 
 	return {
 		input_item_count: codexInput.length,
@@ -131,6 +147,10 @@ export function summarizeCodexTransform(
 		input_except_last_item_hmac: inputExceptLastItem?.hmac ?? null,
 		input_first_item_bytes: firstInputItem?.bytes ?? null,
 		input_first_item_hmac: firstInputItem?.hmac ?? null,
+		input_item_fingerprints: inputItemFingerprints,
+		input_item_total_count: codexInput.length,
+		input_item_fingerprints_truncated:
+			codexInput.length > MAX_INPUT_ITEM_FINGERPRINTS,
 		history_function_call_count: function_call_count,
 		history_function_call_output_count: function_call_output_count,
 		history_empty_output_count: empty_output_count,
@@ -170,6 +190,13 @@ interface TraceInputs {
 	pacingAction?: string | null;
 	instructions?: string;
 	isDescendant?: boolean;
+	orchestrationAdmission?:
+		| "root"
+		| "non_root"
+		| "no_session"
+		| "no_conversation"
+		| "no_orchestration_tools"
+		| "disabled";
 	toolsBeforeCount?: number;
 	filteredToolNames?: readonly string[];
 	tools?: readonly unknown[];
@@ -205,7 +232,7 @@ export function summarizeCodexResponse(
 		cache_creation_input_tokens?: number;
 	},
 	stopReason: CodexResponseSummary["stop_reason"],
-	error?: { type?: string; message?: string },
+	error?: { type?: string; message?: string; code?: string; status?: string },
 ): CodexResponseSummary {
 	const newToolUseByName: Record<string, number> = {};
 	let subagentSpawnCount = 0;
@@ -234,8 +261,12 @@ export function summarizeCodexResponse(
 							inputTokens,
 					) / 10
 				: null,
-		...(error?.type ? { error_type: error.type } : {}),
+		...(stopReason === "error"
+			? { error_type: error?.type || "unclassified_upstream_error" }
+			: {}),
 		...(error?.message ? { error_message: error.message } : {}),
+		...(error?.code ? { error_code: error.code } : {}),
+		...(error?.status ? { error_status: error.status } : {}),
 	};
 }
 
@@ -264,6 +295,8 @@ export function writeCodexTrace(inputs: TraceInputs): void {
 		pacing_cohort_id: inputs.pacingCohortId ?? null,
 		pacing_action: inputs.pacingAction ?? null,
 		is_descendant: inputs.isDescendant ?? false,
+		orchestration_admission:
+			inputs.orchestrationAdmission ?? "no_orchestration_tools",
 		tools_before_count: inputs.toolsBeforeCount ?? inputs.tools?.length ?? 0,
 		tools_after_count: inputs.tools?.length ?? 0,
 		filtered_tool_names: inputs.filteredToolNames ?? [],
@@ -326,6 +359,39 @@ function appendTraceRecord(record: Record<string, unknown>): void {
 	} catch {
 		// best-effort: tracing must never break the request path
 	}
+}
+
+function prefixBoundaryFingerprints(
+	items: readonly unknown[],
+): CodexTransformSummary["input_item_fingerprints"] {
+	const key = process.env[CODEX_TRACE_HMAC_KEY_ENV];
+	if (!key) return [];
+
+	const fingerprints: CodexTransformSummary["input_item_fingerprints"] = [];
+	let chain = "";
+	let cumulativeBytes = 0;
+	for (const [index, item] of items.entries()) {
+		let serialized: string;
+		try {
+			serialized = JSON.stringify(item) ?? "";
+		} catch {
+			return [];
+		}
+		const itemBytes = Buffer.byteLength(serialized, "utf8");
+		cumulativeBytes += itemBytes;
+		chain = createHmac("sha256", key)
+			.update(chain, "utf8")
+			.update("\0")
+			.update(String(itemBytes), "utf8")
+			.update("\0")
+			.update(serialized, "utf8")
+			.digest("hex");
+		fingerprints.push({ index, bytes: cumulativeBytes, hmac: chain });
+		if (fingerprints.length > MAX_INPUT_ITEM_FINGERPRINTS) {
+			fingerprints.shift();
+		}
+	}
+	return fingerprints;
 }
 
 function serializedMetrics(value: unknown): {

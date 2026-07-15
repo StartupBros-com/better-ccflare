@@ -4,6 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fetchCodexUsageOnDemand } from "./on-demand-fetch";
 import {
+	CODEX_SINGLE_ORCHESTRATION_ROOT_ENV,
+	resetOrchestrationElectionForTest,
+} from "./orchestration-election";
+import {
 	CODEX_CACHE_KEY_MODE_ENV,
 	CODEX_DEFAULT_ENDPOINT,
 	CODEX_PROMPT_CACHE_KEY_ENV,
@@ -31,6 +35,8 @@ const readTraceRecords = (dir: string): Array<Record<string, unknown>> => {
 afterEach(() => {
 	delete process.env[CODEX_PROMPT_CACHE_KEY_ENV];
 	delete process.env[CODEX_CACHE_KEY_MODE_ENV];
+	delete process.env[CODEX_SINGLE_ORCHESTRATION_ROOT_ENV];
+	resetOrchestrationElectionForTest();
 });
 
 describe("CodexProvider request conversion", () => {
@@ -1550,7 +1556,10 @@ describe("CodexProvider.processResponse", () => {
 					closeUpstream = () => controller.close();
 				},
 			});
-			const headers = contentType ? { "content-type": contentType } : {};
+			const headers = new Headers();
+			if (contentType !== undefined) {
+				headers.set("content-type", contentType);
+			}
 			const response = new Response(upstreamBody, { status: 200, headers });
 
 			const transformed = await provider.processResponse(response, null);
@@ -1848,6 +1857,71 @@ describe("CodexProvider.processResponse", () => {
 			error: {
 				type: "invalid_request_error",
 				message: "Codex failed",
+			},
+		});
+	});
+
+	it("normalizes the subscription endpoint context-window message for streaming clients", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.failed", {
+				response: {
+					status: "failed",
+					error: {
+						type: "invalid_request_error",
+						message:
+							"Your input exceeds the context window of this model. Please adjust your input and try again.",
+					},
+				},
+			}),
+		]);
+
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const body = await transformed.text();
+
+		expect(body).toContain(
+			"Prompt is too long. Codex reported: Your input exceeds the context window of this model. Please adjust your input and try again.",
+		);
+	});
+
+	it("normalizes the subscription endpoint context-window message for non-streaming clients", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.failed", {
+				response: {
+					status: "failed",
+					error: {
+						type: "invalid_request_error",
+						message:
+							"Your input exceeds the context window of this model. Please adjust your input and try again.",
+					},
+				},
+			}),
+		]);
+
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: {
+				"content-type": "text/event-stream",
+				"x-better-ccflare-request-stream": "false",
+			},
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const body = await transformed.json();
+
+		expect(transformed.status).toBe(400);
+		expect(body).toEqual({
+			type: "error",
+			error: {
+				type: "invalid_request_error",
+				message:
+					"Prompt is too long. Codex reported: Your input exceeds the context window of this model. Please adjust your input and try again.",
 			},
 		});
 	});
@@ -2523,6 +2597,92 @@ describe("CodexProvider.transformRequestBody", () => {
 		);
 	});
 
+	it("elects one stable orchestration root per session independently of prompt caching", async () => {
+		const provider = new CodexProvider();
+		const sessionId = "11111111-1111-4111-8111-111111111111";
+		const transform = async (content: string, includeTools = true) => {
+			const transformed = await provider.transformRequestBody(
+				new Request("https://example.com/v1/messages", {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({
+						model: "claude-opus-4-8",
+						max_tokens: 10,
+						metadata: { user_id: JSON.stringify({ session_id: sessionId }) },
+						messages: [{ role: "user", content }],
+						...(includeTools
+							? {
+									tools: ["Agent", "Task", "Read"].map((name) => ({
+										name,
+										input_schema: { type: "object" },
+									})),
+								}
+							: {}),
+					}),
+				}),
+			);
+			return transformed.json();
+		};
+
+		const root = await transform("root task");
+		await transform("tool-less turn", false);
+		const sibling = await transform("sibling task");
+		const stableRoot = await transform("root task");
+		const stableSibling = await transform("sibling task");
+
+		expect(root.prompt_cache_key).toBeUndefined();
+		expect(root.tools.map((tool: { name: string }) => tool.name)).toEqual([
+			"Agent",
+			"Task",
+			"Read",
+		]);
+		expect(sibling.tools.map((tool: { name: string }) => tool.name)).toEqual([
+			"Read",
+		]);
+		expect(stableRoot.tools.map((tool: { name: string }) => tool.name)).toEqual(
+			["Agent", "Task", "Read"],
+		);
+		expect(
+			stableSibling.tools.map((tool: { name: string }) => tool.name),
+		).toEqual(["Read"]);
+	});
+
+	it("only an exact zero disables orchestration election", async () => {
+		const provider = new CodexProvider();
+		const sessionId = "22222222-2222-4222-8222-222222222222";
+		const transform = async (content: string) => {
+			const transformed = await provider.transformRequestBody(
+				new Request("https://example.com/v1/messages", {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({
+						model: "claude-opus-4-8",
+						max_tokens: 10,
+						metadata: { user_id: JSON.stringify({ session_id: sessionId }) },
+						messages: [{ role: "user", content }],
+						tools: ["Agent", "Task"].map((name) => ({
+							name,
+							input_schema: { type: "object" },
+						})),
+					}),
+				}),
+			);
+			return transformed.json();
+		};
+
+		process.env[CODEX_SINGLE_ORCHESTRATION_ROOT_ENV] = "0";
+		const disabledA = await transform("a");
+		const disabledB = await transform("b");
+		expect(disabledA.tools).toHaveLength(2);
+		expect(disabledB.tools).toHaveLength(2);
+
+		process.env[CODEX_SINGLE_ORCHESTRATION_ROOT_ENV] = "false";
+		const root = await transform("c");
+		const sibling = await transform("d");
+		expect(root.tools).toHaveLength(2);
+		expect(sibling.tools).toHaveLength(0);
+	});
+
 	it("filters current Agent and Task tools for attributed descendants only", async () => {
 		const provider = new CodexProvider();
 		const payload = {
@@ -2596,7 +2756,8 @@ describe("CodexProvider.transformRequestBody", () => {
 				(record) => record.phase === "request",
 			);
 			expect(requestTrace).toMatchObject({
-				trace_schema_version: 5,
+				trace_schema_version: 6,
+				orchestration_admission: "no_session",
 				is_descendant: true,
 				tools_before_count: 3,
 				tools_after_count: 1,
