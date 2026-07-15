@@ -2162,18 +2162,63 @@ describe("CodexProvider.processResponse", () => {
 		expect(body).not.toContain("event: message_stop");
 	});
 
+	it("traces failed response usage and context as a true error", async () => {
+		const provider = new CodexProvider();
+		const traceDir = mkdtempSync(join(tmpdir(), "codex-trace-"));
+		process.env[CODEX_TRACE_DIR_ENV] = traceDir;
+		try {
+			const upstreamBody = sseBody([
+				...eventLine("response.failed", {
+					response: {
+						model: "gpt-5.5-2026-07-14",
+						status: "failed",
+						error: {
+							type: "invalid_request_error",
+							message: "Context exceeded",
+						},
+						usage: {
+							input_tokens: 10000,
+							output_tokens: 4,
+							input_tokens_details: { cached_tokens: 7500 },
+						},
+					},
+				}),
+			]);
+			const response = new Response(upstreamBody, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			});
+
+			await (await provider.processResponse(response, null)).text();
+			const record = readTraceRecords(traceDir).find(
+				(candidate) => candidate.phase === "response",
+			);
+			expect(record?.stop_reason).toBe("error");
+			expect(record?.input_tokens).toBe(10000);
+			expect(record?.cache_read_input_tokens).toBe(7500);
+			expect(record?.output_tokens).toBe(4);
+			expect(record?.cache_hit_pct).toBe(75);
+			expect(record?.context_utilization_pct).toBeGreaterThan(0);
+		} finally {
+			delete process.env[CODEX_TRACE_DIR_ENV];
+			rmSync(traceDir, { recursive: true, force: true });
+		}
+	});
+
 	it("maps response.incomplete with a content_filter reason to a refusal stop_reason", async () => {
 		const provider = new CodexProvider();
+		const traceDir = mkdtempSync(join(tmpdir(), "codex-trace-"));
+		process.env[CODEX_TRACE_DIR_ENV] = traceDir;
 		const upstreamBody = sseBody([
 			...eventLine("response.created", {
-				response: { id: "resp_incomplete", model: "gpt-5.5" },
+				response: { id: "resp_incomplete", model: "gpt-5.5-2026-07-14" },
 			}),
 			...eventLine("response.incomplete", {
 				response: {
-					model: "gpt-5.5",
+					model: "gpt-5.5-2026-07-14",
 					status: "incomplete",
 					incomplete_details: { reason: "content_filter" },
-					usage: { input_tokens: 3, output_tokens: 1 },
+					usage: { input_tokens: 3000, output_tokens: 1 },
 				},
 			}),
 		]);
@@ -2188,7 +2233,15 @@ describe("CodexProvider.processResponse", () => {
 
 		expect(body).toContain('"stop_reason":"refusal"');
 		expect(body).toContain("event: message_delta");
+		const responseRecord = readTraceRecords(traceDir).find(
+			(r) => r.phase === "response",
+		);
+		expect(responseRecord?.stop_reason).toBe("refusal");
+		expect(responseRecord?.context_utilization_pct).toBeGreaterThan(0);
+		expect(responseRecord?.error_type).toBeUndefined();
 		expect(body).toContain("event: message_stop");
+		delete process.env[CODEX_TRACE_DIR_ENV];
+		rmSync(traceDir, { recursive: true, force: true });
 	});
 
 	it("maps response.incomplete with a non-content_filter reason to max_tokens", async () => {
@@ -2868,7 +2921,7 @@ describe("CodexProvider.transformRequestBody", () => {
 				(record) => record.phase === "request",
 			);
 			expect(requestTrace).toMatchObject({
-				trace_schema_version: 6,
+				trace_schema_version: 7,
 				orchestration_admission: "no_session",
 				is_descendant: true,
 				tools_before_count: 3,
