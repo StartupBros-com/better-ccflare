@@ -64,20 +64,38 @@ function getMidStreamRateLimitCooldownMs(): number {
 const MAX_REQUEST_BODY_BYTES = 4 * 1024 * 1024;
 
 const MODEL_REWRITE_HEADER = "x-better-ccflare-model-rewrite";
+const CACHE_FLIGHT_RECORDER_HEADER =
+	"x-better-ccflare-cache-flight-recorder-id";
 
 /**
  * Builds a Headers copy with the model-rewrite header set when an
  * agent-preference rewrite actually swapped the model (originalModel and
  * appliedModel both present and different). No-op copy otherwise.
  */
-function withModelRewriteHeader(
+function withResponseMetadataHeaders(
 	headers: Headers,
-	originalModel?: string | null,
-	appliedModel?: string | null,
+	options: {
+		originalModel?: string | null;
+		appliedModel?: string | null;
+		cacheFlightRecorderConversationId?: string | null;
+		cacheFlightRecorderEligible?: boolean;
+	},
 ): Headers {
 	const result = new Headers(headers);
-	if (isModelRewrite(originalModel, appliedModel)) {
-		result.set(MODEL_REWRITE_HEADER, `${originalModel}->${appliedModel}`);
+	if (isModelRewrite(options.originalModel, options.appliedModel)) {
+		result.set(
+			MODEL_REWRITE_HEADER,
+			`${options.originalModel}->${options.appliedModel}`,
+		);
+	}
+	if (
+		options.cacheFlightRecorderEligible === true &&
+		options.cacheFlightRecorderConversationId
+	) {
+		result.set(
+			CACHE_FLIGHT_RECORDER_HEADER,
+			options.cacheFlightRecorderConversationId,
+		);
 	}
 	return result;
 }
@@ -122,6 +140,9 @@ export interface ResponseHandlerOptions {
 	xaiCachePrefixFingerprint?: RequestMeta["xaiCachePrefixFingerprint"];
 	xaiCacheOfficialEndpoint?: boolean;
 	xaiCacheKeyPresent?: boolean;
+	cacheFlightRecorderConversationId?: RequestMeta["cacheFlightRecorderConversationId"];
+	cacheFlightRecorderEligible?: boolean;
+	cacheFlightRecorderNativeActive?: boolean;
 }
 
 /**
@@ -158,6 +179,9 @@ export async function forwardToClient(
 		xaiCachePrefixFingerprint,
 		xaiCacheOfficialEndpoint,
 		xaiCacheKeyPresent,
+		cacheFlightRecorderConversationId,
+		cacheFlightRecorderEligible,
+		cacheFlightRecorderNativeActive,
 	} = options;
 
 	// Record which account actually served this session's request, keyed on the
@@ -261,6 +285,15 @@ export async function forwardToClient(
 			xaiCachePrefixFingerprint,
 			xaiCacheOfficialEndpoint,
 			xaiCacheKeyPresent,
+			...(cacheFlightRecorderEligible === true &&
+			cacheFlightRecorderConversationId
+				? {
+						cacheFlightRecorderConversationId,
+						cacheFlightRecorderEligible: true,
+						cacheFlightRecorderNativeActive:
+							cacheFlightRecorderNativeActive === true,
+					}
+				: {}),
 			failoverAttempts,
 		};
 		getUsageCollector().handleStart(startMessage);
@@ -384,11 +417,12 @@ export async function forwardToClient(
 		return new Response(passthroughBody, {
 			status: response.status,
 			statusText: response.statusText,
-			headers: withModelRewriteHeader(
-				response.headers,
+			headers: withResponseMetadataHeaders(response.headers, {
 				originalModel,
 				appliedModel,
-			),
+				cacheFlightRecorderConversationId,
+				cacheFlightRecorderEligible,
+			}),
 		});
 	}
 
@@ -405,15 +439,20 @@ export async function forwardToClient(
 			});
 		}
 
-		if (isModelRewrite(originalModel, appliedModel)) {
+		if (
+			isModelRewrite(originalModel, appliedModel) ||
+			(cacheFlightRecorderEligible === true &&
+				Boolean(cacheFlightRecorderConversationId))
+		) {
 			return new Response(null, {
 				status: response.status,
 				statusText: response.statusText,
-				headers: withModelRewriteHeader(
-					response.headers,
+				headers: withResponseMetadataHeaders(response.headers, {
 					originalModel,
 					appliedModel,
-				),
+					cacheFlightRecorderConversationId,
+					cacheFlightRecorderEligible,
+				}),
 			});
 		}
 
@@ -463,10 +502,11 @@ export async function forwardToClient(
 	return new Response(passthroughBody, {
 		status: response.status,
 		statusText: response.statusText,
-		headers: withModelRewriteHeader(
-			response.headers,
+		headers: withResponseMetadataHeaders(response.headers, {
 			originalModel,
 			appliedModel,
-		),
+			cacheFlightRecorderConversationId,
+			cacheFlightRecorderEligible,
+		}),
 	});
 }

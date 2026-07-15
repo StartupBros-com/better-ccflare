@@ -49,6 +49,16 @@ const TURN_EVIDENCE_KEYS = new Set<keyof TurnEvidence>([
 	"unavailableDimensions",
 	"gapBefore",
 ]);
+const EVIDENCE_DIMENSIONS = new Set([
+	"identity",
+	"serving_account",
+	"cacheable_prefix",
+	"cache_outcome",
+	"token_accounting",
+	"timeline",
+]);
+const SAFE_IDENTIFIER = /^[A-Za-z0-9_-]{1,128}$/;
+const SAFE_FINGERPRINT = /^[A-Za-z0-9_-]{1,128}$/;
 
 /** Durable privacy-safe evidence store for cache flight recorder timelines. */
 export class CacheFlightRecorderRepository extends BaseRepository<Timeline> {
@@ -57,10 +67,8 @@ export class CacheFlightRecorderRepository extends BaseRepository<Timeline> {
 		turn: TurnEvidence,
 		recordedAt = Date.now(),
 	): Promise<void> {
+		this.assertPrivacySafeRecorderId(recorderConversationId);
 		this.assertPrivacySafeTurn(turn);
-		if (turn.sequence < 0 || !Number.isSafeInteger(turn.sequence)) {
-			throw new Error("turn sequence must be a non-negative safe integer");
-		}
 		await this.run(
 			`INSERT INTO cache_flight_recorder_conversations (
 				recorder_conversation_id, created_at, updated_at, incomplete, dropped_events
@@ -88,21 +96,11 @@ export class CacheFlightRecorderRepository extends BaseRepository<Timeline> {
 				identity_fingerprint, serving_account_id, prefix_fingerprint,
 				cache_outcome, input_tokens, cached_tokens, completeness,
 				unavailable_dimensions, gap_before
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT (recorder_conversation_id, sequence) DO UPDATE SET
-				timestamp = EXCLUDED.timestamp,
-				identity_fingerprint = EXCLUDED.identity_fingerprint,
-				serving_account_id = EXCLUDED.serving_account_id,
-				prefix_fingerprint = EXCLUDED.prefix_fingerprint,
-				cache_outcome = EXCLUDED.cache_outcome,
-				input_tokens = EXCLUDED.input_tokens,
-				cached_tokens = EXCLUDED.cached_tokens,
-				completeness = EXCLUDED.completeness,
-				unavailable_dimensions = EXCLUDED.unavailable_dimensions,
-				gap_before = EXCLUDED.gap_before`,
+			) SELECT ?, COALESCE(MAX(sequence), -1) + 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+			FROM cache_flight_recorder_turns
+			WHERE recorder_conversation_id = ?`,
 			[
 				recorderConversationId,
-				turn.sequence,
 				turn.timestamp,
 				turn.identityFingerprint ?? null,
 				turn.servingAccountId ?? null,
@@ -113,6 +111,7 @@ export class CacheFlightRecorderRepository extends BaseRepository<Timeline> {
 				turn.completeness,
 				JSON.stringify(turn.unavailableDimensions),
 				turn.gapBefore ? 1 : 0,
+				recorderConversationId,
 			],
 		);
 	}
@@ -206,6 +205,14 @@ export class CacheFlightRecorderRepository extends BaseRepository<Timeline> {
 		return expired.length;
 	}
 
+	private assertPrivacySafeRecorderId(recorderConversationId: string): void {
+		if (!SAFE_IDENTIFIER.test(recorderConversationId)) {
+			throw new Error(
+				"recorder conversation id must be a bounded safe identifier",
+			);
+		}
+	}
+
 	private assertPrivacySafeTurn(turn: TurnEvidence): void {
 		const unexpectedKeys = Object.keys(turn).filter(
 			(key) => !TURN_EVIDENCE_KEYS.has(key as keyof TurnEvidence),
@@ -214,6 +221,25 @@ export class CacheFlightRecorderRepository extends BaseRepository<Timeline> {
 			throw new Error(
 				`cache flight recorder turn contains unsupported fields: ${unexpectedKeys.join(", ")}`,
 			);
+		}
+		for (const value of [
+			turn.identityFingerprint,
+			turn.servingAccountId,
+			turn.prefixFingerprint,
+		]) {
+			if (value !== undefined && !SAFE_FINGERPRINT.test(value)) {
+				throw new Error(
+					"cache flight recorder identifiers must be bounded and safe",
+				);
+			}
+		}
+		if (
+			turn.unavailableDimensions.length > EVIDENCE_DIMENSIONS.size ||
+			turn.unavailableDimensions.some(
+				(dimension) => !EVIDENCE_DIMENSIONS.has(dimension),
+			)
+		) {
+			throw new Error("cache flight recorder dimensions must be allowlisted");
 		}
 	}
 

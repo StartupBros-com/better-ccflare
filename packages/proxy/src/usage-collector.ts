@@ -4,6 +4,7 @@ import {
 	estimateCostUSD,
 	formatXaiCacheCanary,
 	TIME_CONSTANTS,
+	type TurnEvidence,
 } from "@better-ccflare/core";
 import { AsyncDbWriter, DatabaseOperations } from "@better-ccflare/database";
 import { Logger } from "@better-ccflare/logger";
@@ -715,14 +716,17 @@ export class UsageCollector {
 			}
 		}
 
+		const xaiCacheOutcome = cacheOutcomeFromTokens(
+			state.usage.cacheReadInputTokens,
+			state.usage.cacheReadInputTokensPresent === true,
+		);
 		if (
 			startMessage.xaiCacheIdentityFingerprint &&
 			startMessage.xaiCacheOfficialEndpoint === true
 		) {
-			const cacheOutcome = cacheOutcomeFromTokens(
-				state.usage.cacheReadInputTokens,
-				state.usage.cacheReadInputTokensPresent === true,
-			);
+			const recorderSuffix = startMessage.cacheFlightRecorderConversationId
+				? ` recorder=${startMessage.cacheFlightRecorderConversationId}`
+				: "";
 			log.info(
 				`Grok cache canary ${formatXaiCacheCanary({
 					requestId: startMessage.requestId,
@@ -733,11 +737,91 @@ export class UsageCollector {
 					identityFingerprint: startMessage.xaiCacheIdentityFingerprint,
 					prefixFingerprint:
 						startMessage.xaiCachePrefixFingerprint ?? undefined,
-					cacheOutcome,
+					cacheOutcome: xaiCacheOutcome,
 					cachedTokens: state.usage.cacheReadInputTokens,
 					inputTokens: state.usage.inputTokens,
-				})}`,
+				})}${recorderSuffix}`,
 			);
+		}
+
+		const recorderCacheOutcome =
+			xaiCacheOutcome === "fail_closed" ? "unknown" : xaiCacheOutcome;
+		if (
+			startMessage.cacheFlightRecorderEligible === true &&
+			startMessage.cacheFlightRecorderConversationId &&
+			startMessage.providerName === "xai" &&
+			startMessage.xaiCacheOfficialEndpoint === true
+		) {
+			const recorderConversationId =
+				startMessage.cacheFlightRecorderConversationId;
+			const unavailableDimensions: string[] = [];
+			const nativeActive =
+				startMessage.cacheFlightRecorderNativeActive === true;
+			if (!nativeActive || !startMessage.xaiCacheIdentityFingerprint) {
+				unavailableDimensions.push("identity");
+			}
+			if (!startMessage.accountId) {
+				unavailableDimensions.push("serving_account");
+			}
+			if (!nativeActive || !startMessage.xaiCachePrefixFingerprint) {
+				unavailableDimensions.push("cacheable_prefix");
+			}
+			if (recorderCacheOutcome === "unknown") {
+				unavailableDimensions.push("cache_outcome");
+			}
+			const turn: TurnEvidence = {
+				// The repository allocates the durable sequence at the persistence boundary.
+				sequence: 0,
+				timestamp: new Date(Date.now()).toISOString(),
+				...(nativeActive && startMessage.xaiCacheIdentityFingerprint
+					? {
+							identityFingerprint: startMessage.xaiCacheIdentityFingerprint,
+						}
+					: {}),
+				...(startMessage.accountId
+					? { servingAccountId: startMessage.accountId }
+					: {}),
+				...(nativeActive && startMessage.xaiCachePrefixFingerprint
+					? {
+							prefixFingerprint: startMessage.xaiCachePrefixFingerprint,
+						}
+					: {}),
+				cacheOutcome: recorderCacheOutcome,
+				inputTokens:
+					(state.usage.inputTokens ?? 0) +
+					(state.usage.cacheReadInputTokens ?? 0) +
+					(state.usage.cacheCreationInputTokens ?? 0),
+				...(state.usage.cacheReadInputTokensPresent === true
+					? { cachedTokens: state.usage.cacheReadInputTokens ?? 0 }
+					: {}),
+				completeness:
+					unavailableDimensions.length === 0 ? "complete" : "partial",
+				unavailableDimensions,
+			};
+			const accepted = this.asyncWriter.enqueue(async () => {
+				try {
+					await this.dbOps.appendCacheFlightRecorderTurn(
+						recorderConversationId,
+						turn,
+					);
+				} catch {
+					log.warn("Cache flight recorder write failed", {
+						recorderConversationId,
+					});
+					try {
+						await this.dbOps.markCacheFlightRecorderIncomplete(
+							recorderConversationId,
+						);
+					} catch {
+						// Best effort only. The writer already contains and reports failures.
+					}
+				}
+			});
+			if (!accepted) {
+				log.warn("Cache flight recorder write dropped", {
+					recorderConversationId,
+				});
+			}
 		}
 
 		// Update request with final data

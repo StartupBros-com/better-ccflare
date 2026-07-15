@@ -952,6 +952,11 @@ export async function proxyWithAccount(
 		);
 		const xaiCacheKeyPresent = transformedRequest.headers.has("x-grok-conv-id");
 		const xaiCacheOfficialEndpoint = isOfficialXaiEndpoint(account);
+		const cacheFlightRecorderEligible =
+			provider.name === "xai" &&
+			url.pathname === "/v1/messages" &&
+			xaiCacheOfficialEndpoint &&
+			Boolean(requestMeta.cacheFlightRecorderConversationId);
 		// Defense-in-depth: providers normally consume these before returning,
 		// but transform fallbacks may return the original request.
 		transformedRequest = sanitizeInternalTransportHeaders(transformedRequest);
@@ -1691,6 +1696,11 @@ export async function proxyWithAccount(
 						xaiCachePrefixFingerprint: requestMeta.xaiCachePrefixFingerprint,
 						xaiCacheOfficialEndpoint,
 						xaiCacheKeyPresent,
+						cacheFlightRecorderConversationId:
+							requestMeta.cacheFlightRecorderConversationId,
+						cacheFlightRecorderEligible,
+						cacheFlightRecorderNativeActive:
+							requestMeta.xaiCacheNativeActive === true,
 					},
 					{ ...ctx, provider },
 				);
@@ -1725,6 +1735,11 @@ export async function proxyWithAccount(
 				xaiCachePrefixFingerprint: requestMeta.xaiCachePrefixFingerprint,
 				xaiCacheOfficialEndpoint,
 				xaiCacheKeyPresent,
+				cacheFlightRecorderConversationId:
+					requestMeta.cacheFlightRecorderConversationId,
+				cacheFlightRecorderEligible,
+				cacheFlightRecorderNativeActive:
+					requestMeta.xaiCacheNativeActive === true,
 			},
 			{ ...ctx, provider },
 		);

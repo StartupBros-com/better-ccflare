@@ -39,6 +39,8 @@ export interface RequestMeta {
 	xaiCacheIdentityFingerprint?: string | null;
 	/** Privacy-safe stable-prefix fingerprint for cache canary telemetry. */
 	xaiCachePrefixFingerprint?: string | null;
+	/** Stable privacy-safe lookup ID, derived before routing and emitted only after eligibility confirmation. */
+	cacheFlightRecorderConversationId?: string | null;
 	/** Official xAI accounts eligible for conversation-level cache affinity. */
 	xaiCacheEligibleAccountIds?: ReadonlySet<string> | null;
 	/** Model the client originally requested, before any agent-preference rewrite. */
