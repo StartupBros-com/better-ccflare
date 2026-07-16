@@ -350,11 +350,18 @@ export class DatabaseOperations implements StrategyStore, Disposable {
 		dbConfig?: DatabaseConfig,
 		retryConfig?: DatabaseRetryConfig,
 	) {
-		// Default database configuration optimized for distributed filesystems
+		// Default database configuration optimized for distributed filesystems.
+		// cacheSize kept in sync with the runtime-config default in
+		// packages/config/src/index.ts (256 MiB, negative = KiB): a big enough
+		// page cache keeps hot B-tree pages of large request tables resident
+		// instead of missing cache on cold pages -- synchronous disk I/O the
+		// AsyncDbWriter can't subdivide (one atomic db.run), which shows up as
+		// event-loop blips during write bursts. The runtime config normally
+		// overrides this fallback. (Source: d4rken/clankermux@763ffa72)
 		this.dbConfig = {
 			walMode: true,
 			busyTimeoutMs: 10000,
-			cacheSize: -5000,
+			cacheSize: -262144,
 			synchronous: "FULL",
 			mmapSize: 0,
 			pageSize: 2048,
