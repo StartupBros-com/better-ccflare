@@ -4,6 +4,7 @@ import {
 	estimateCostUSD,
 	formatXaiCacheCanary,
 	TIME_CONSTANTS,
+	type TurnEvidence,
 } from "@better-ccflare/core";
 import { AsyncDbWriter, DatabaseOperations } from "@better-ccflare/database";
 import { Logger } from "@better-ccflare/logger";
@@ -36,6 +37,7 @@ interface RequestState {
 	usage: {
 		model?: string;
 		inputTokens?: number;
+		inputTokensPresent?: boolean;
 		cacheReadInputTokens?: number;
 		cacheReadInputTokensPresent?: boolean;
 		cacheCreationInputTokens?: number;
@@ -68,6 +70,13 @@ const DEFAULT_PRICING_TIMEOUT_MS = 5_000;
 const MAX_PRICING_TIMEOUT_MS = 60_000;
 const MAX_RESPONSE_BODY_BYTES = 256 * 1024; // 256KB - cap stored response body
 const MAX_REQUEST_BODY_BYTES = 4 * 1024 * 1024; // 4MB - afterburn needs full conversation history
+// Bound on distinct conversation IDs buffered for dropped recorder evidence
+// markers. Beyond this, additional distinct drops are themselves dropped
+// (logged, not written) rather than allowed to grow the buffer unboundedly.
+const MAX_PENDING_DROPPED_MARKERS = 1024;
+// Debounce window before the buffered dropped-marker map is flushed. Keeps
+// the write off the request path entirely; drain() flushes immediately.
+const PENDING_DROPPED_MARKER_FLUSH_MS = 250;
 
 // Check if a request should be logged
 function shouldLogRequest(path: string, status: number): boolean {
@@ -160,7 +169,10 @@ function extractUsageFromJson(
 
 	state.usage.model = json.model ?? state.usage.model;
 
-	state.usage.inputTokens = usageObj.input_tokens ?? 0;
+	if (usageObj.input_tokens !== undefined) {
+		state.usage.inputTokens = usageObj.input_tokens;
+		state.usage.inputTokensPresent = true;
+	}
 	if (usageObj.cache_read_input_tokens !== undefined) {
 		state.usage.cacheReadInputTokens = usageObj.cache_read_input_tokens;
 		state.usage.cacheReadInputTokensPresent = true;
@@ -193,7 +205,10 @@ function extractUsageFromData(
 		if (isMessageStart) {
 			if (parsed.message?.usage) {
 				const usage = parsed.message.usage;
-				state.usage.inputTokens = usage.input_tokens || 0;
+				if (usage.input_tokens !== undefined) {
+					state.usage.inputTokens = usage.input_tokens;
+					state.usage.inputTokensPresent = true;
+				}
 				if (usage.cache_read_input_tokens !== undefined) {
 					state.usage.cacheReadInputTokens = usage.cache_read_input_tokens;
 					state.usage.cacheReadInputTokensPresent = true;
@@ -226,6 +241,7 @@ function extractUsageFromData(
 				}
 				if (parsed.usage.input_tokens !== undefined) {
 					state.usage.inputTokens = parsed.usage.input_tokens;
+					state.usage.inputTokensPresent = true;
 				}
 				if (parsed.usage.cache_read_input_tokens !== undefined) {
 					state.usage.cacheReadInputTokens =
@@ -244,6 +260,7 @@ function extractUsageFromData(
 		if (parsed.usage) {
 			if (parsed.usage.input_tokens !== undefined) {
 				state.usage.inputTokens = parsed.usage.input_tokens;
+				state.usage.inputTokensPresent = true;
 			}
 			if (parsed.usage.output_tokens !== undefined) {
 				state.usage.outputTokens = parsed.usage.output_tokens;
@@ -331,6 +348,14 @@ export class UsageCollector {
 	private readonly pendingHandleEnds = new Set<Promise<void>>();
 	private cleanupInterval: Timer | null = null;
 
+	// Bounded, coalescing buffer for dropped recorder evidence markers. Maps
+	// recorderConversationId to a summed drop count so N drops on one
+	// conversation become a single write. Never written on the request path.
+	private readonly pendingDroppedMarkers = new Map<string, number>();
+	private pendingDroppedMarkerOverflowCount = 0;
+	private pendingMarkerFlushTimer: Timer | null = null;
+	private pendingMarkerFlushInFlight: Promise<void> | null = null;
+
 	private readonly maxBufferSize: number;
 	private readonly pricingTimeoutMs: number;
 	private readonly timeoutMs: number;
@@ -382,6 +407,7 @@ export class UsageCollector {
 
 				for (let i = 0; i < toRemove; i++) {
 					const [id, state] = sortedByAge[i];
+					this.markEvictedRecorderState(state);
 					freeRequestState(state);
 					this.requests.delete(id);
 				}
@@ -538,11 +564,13 @@ export class UsageCollector {
 	}
 
 	/**
-	 * Await all in-flight handleEnd promises then flush the AsyncDbWriter
-	 * queue to completion before process exit.
+	 * Await all in-flight handleEnd promises, flush any buffered dropped
+	 * recorder evidence markers, then flush the AsyncDbWriter queue to
+	 * completion before process exit.
 	 */
 	async drain(): Promise<void> {
 		await Promise.allSettled([...this.pendingHandleEnds]);
+		await this.flushPendingDroppedMarkersNow();
 		await this.asyncWriter.dispose();
 	}
 
@@ -552,6 +580,10 @@ export class UsageCollector {
 
 	dispose(): void {
 		this.stopCleanupInterval();
+		if (this.pendingMarkerFlushTimer) {
+			clearTimeout(this.pendingMarkerFlushTimer);
+			this.pendingMarkerFlushTimer = null;
+		}
 	}
 
 	private async _handleEndInternal(msg: EndMessage): Promise<void> {
@@ -715,14 +747,17 @@ export class UsageCollector {
 			}
 		}
 
+		const xaiCacheOutcome = cacheOutcomeFromTokens(
+			state.usage.cacheReadInputTokens,
+			state.usage.cacheReadInputTokensPresent === true,
+		);
 		if (
 			startMessage.xaiCacheIdentityFingerprint &&
 			startMessage.xaiCacheOfficialEndpoint === true
 		) {
-			const cacheOutcome = cacheOutcomeFromTokens(
-				state.usage.cacheReadInputTokens,
-				state.usage.cacheReadInputTokensPresent === true,
-			);
+			const recorderSuffix = startMessage.cacheFlightRecorderConversationId
+				? ` recorder=${startMessage.cacheFlightRecorderConversationId}`
+				: "";
 			log.info(
 				`Grok cache canary ${formatXaiCacheCanary({
 					requestId: startMessage.requestId,
@@ -733,11 +768,106 @@ export class UsageCollector {
 					identityFingerprint: startMessage.xaiCacheIdentityFingerprint,
 					prefixFingerprint:
 						startMessage.xaiCachePrefixFingerprint ?? undefined,
-					cacheOutcome,
+					cacheOutcome: xaiCacheOutcome,
 					cachedTokens: state.usage.cacheReadInputTokens,
 					inputTokens: state.usage.inputTokens,
-				})}`,
+				})}${recorderSuffix}`,
 			);
+		}
+
+		const recorderCacheOutcome =
+			xaiCacheOutcome === "fail_closed" ? "unknown" : xaiCacheOutcome;
+		if (
+			startMessage.cacheFlightRecorderEligible === true &&
+			startMessage.cacheFlightRecorderConversationId &&
+			startMessage.providerName === "xai" &&
+			startMessage.xaiCacheOfficialEndpoint === true
+		) {
+			const recorderConversationId =
+				startMessage.cacheFlightRecorderConversationId;
+			const unavailableDimensions: string[] = [];
+			const nativeActive =
+				startMessage.cacheFlightRecorderNativeActive === true;
+			if (!nativeActive || !startMessage.xaiCacheIdentityFingerprint) {
+				unavailableDimensions.push("identity");
+			}
+			if (!startMessage.accountId) {
+				unavailableDimensions.push("serving_account");
+			}
+			if (!nativeActive || !startMessage.xaiCachePrefixFingerprint) {
+				unavailableDimensions.push("cacheable_prefix");
+			}
+			if (recorderCacheOutcome === "unknown") {
+				unavailableDimensions.push("cache_outcome");
+			}
+			// Token telemetry was only actually observed for this request if a
+			// provider payload set inputTokensPresent; otherwise a "0" total
+			// would be an invented number, not an honestly reported one.
+			const inputTokensObserved = state.usage.inputTokensPresent === true;
+			if (!inputTokensObserved) {
+				unavailableDimensions.push("token_accounting");
+			}
+			const turn: TurnEvidence = {
+				// The repository allocates the durable sequence at the persistence boundary.
+				sequence: 0,
+				timestamp: new Date(Date.now()).toISOString(),
+				...(nativeActive && startMessage.xaiCacheIdentityFingerprint
+					? {
+							identityFingerprint: startMessage.xaiCacheIdentityFingerprint,
+						}
+					: {}),
+				...(startMessage.accountId
+					? { servingAccountId: startMessage.accountId }
+					: {}),
+				...(nativeActive && startMessage.xaiCachePrefixFingerprint
+					? {
+							prefixFingerprint: startMessage.xaiCachePrefixFingerprint,
+						}
+					: {}),
+				cacheOutcome: recorderCacheOutcome,
+				...(inputTokensObserved
+					? {
+							inputTokens:
+								(state.usage.inputTokens ?? 0) +
+								(state.usage.cacheReadInputTokens ?? 0) +
+								(state.usage.cacheCreationInputTokens ?? 0),
+						}
+					: {}),
+				...(state.usage.cacheReadInputTokensPresent === true
+					? { cachedTokens: state.usage.cacheReadInputTokens ?? 0 }
+					: {}),
+				completeness:
+					unavailableDimensions.length === 0 ? "complete" : "partial",
+				unavailableDimensions,
+			};
+			const accepted = this.asyncWriter.enqueue(async () => {
+				try {
+					await this.dbOps.appendCacheFlightRecorderTurn(
+						recorderConversationId,
+						turn,
+					);
+				} catch {
+					log.warn("Cache flight recorder write failed", {
+						recorderConversationId,
+					});
+					// The turn is irrecoverably lost, so it is dropped evidence, not
+					// merely an incomplete dimension.
+					try {
+						await this.dbOps.markCacheFlightRecorderIncomplete(
+							recorderConversationId,
+							{ dropped: true },
+						);
+					} catch {
+						// Best effort only. The writer already contains and reports failures.
+					}
+				}
+			});
+			if (!accepted) {
+				log.warn("Cache flight recorder write dropped", {
+					recorderConversationId,
+				});
+				this.markRecorderEvidenceDropped(recorderConversationId);
+			}
 		}
 
 		// Update request with final data
@@ -951,6 +1081,105 @@ export class UsageCollector {
 		this.onSummary(summary);
 	}
 
+	/**
+	 * Buffer irrecoverably lost recorder evidence for a bounded, off-path
+	 * flush. This runs exactly when the queue is saturated or state is
+	 * force-evicted; it deliberately bypasses the AsyncDbWriter because
+	 * routing the marker through the same rejected queue would hide the
+	 * loss from health counts. The buffer itself never performs a DB call
+	 * on the request path: drops are coalesced per conversation ID in
+	 * memory and written by flushPendingDroppedMarkers() on a debounce
+	 * timer (or immediately, sequentially, during drain()).
+	 */
+	private markRecorderEvidenceDropped(recorderConversationId: string): void {
+		const current = this.pendingDroppedMarkers.get(recorderConversationId);
+		if (current === undefined) {
+			if (this.pendingDroppedMarkers.size >= MAX_PENDING_DROPPED_MARKERS) {
+				this.pendingDroppedMarkerOverflowCount++;
+				log.warn(
+					"Dropped recorder evidence marker buffer full; losing marker",
+					{
+						recorderConversationId,
+						bufferCap: MAX_PENDING_DROPPED_MARKERS,
+						lostSinceStart: this.pendingDroppedMarkerOverflowCount,
+					},
+				);
+				return;
+			}
+			this.pendingDroppedMarkers.set(recorderConversationId, 1);
+		} else {
+			this.pendingDroppedMarkers.set(recorderConversationId, current + 1);
+		}
+		this.schedulePendingMarkerFlush();
+	}
+
+	/** Debounce successive drops into one flush pass instead of a timer per drop. */
+	private schedulePendingMarkerFlush(): void {
+		if (this.pendingMarkerFlushTimer) return;
+		this.pendingMarkerFlushTimer = setTimeout(() => {
+			this.pendingMarkerFlushTimer = null;
+			this.pendingMarkerFlushInFlight =
+				this.flushPendingDroppedMarkers().finally(() => {
+					this.pendingMarkerFlushInFlight = null;
+				});
+		}, PENDING_DROPPED_MARKER_FLUSH_MS);
+		this.pendingMarkerFlushTimer.unref();
+	}
+
+	/**
+	 * Take and clear the current buffer, then write each entry sequentially
+	 * (await one at a time) so PostgreSQL never sees unbounded concurrency
+	 * from this path. Failures are best effort: log and continue with the
+	 * remaining entries, never throw.
+	 */
+	private async flushPendingDroppedMarkers(): Promise<void> {
+		if (this.pendingDroppedMarkers.size === 0) return;
+		const entries = [...this.pendingDroppedMarkers.entries()];
+		this.pendingDroppedMarkers.clear();
+		for (const [recorderConversationId, droppedCount] of entries) {
+			try {
+				await this.dbOps.markCacheFlightRecorderIncomplete(
+					recorderConversationId,
+					{ dropped: true, droppedCount },
+				);
+			} catch {
+				log.warn("Failed to flush dropped recorder evidence marker", {
+					recorderConversationId,
+					droppedCount,
+				});
+				// Best effort only; never disturb the response lifecycle.
+			}
+		}
+	}
+
+	/**
+	 * Shutdown path: cancel any pending debounce timer, wait for an
+	 * in-flight flush to finish (so writes stay sequential), then flush
+	 * whatever remains, including entries buffered during the wait.
+	 */
+	private async flushPendingDroppedMarkersNow(): Promise<void> {
+		if (this.pendingMarkerFlushTimer) {
+			clearTimeout(this.pendingMarkerFlushTimer);
+			this.pendingMarkerFlushTimer = null;
+		}
+		if (this.pendingMarkerFlushInFlight) {
+			await this.pendingMarkerFlushInFlight;
+		}
+		await this.flushPendingDroppedMarkers();
+	}
+
+	private markEvictedRecorderState(state: RequestState): void {
+		const start = state.startMessage;
+		if (
+			start.cacheFlightRecorderEligible === true &&
+			start.cacheFlightRecorderConversationId &&
+			start.providerName === "xai" &&
+			start.xaiCacheOfficialEndpoint === true
+		) {
+			this.markRecorderEvidenceDropped(start.cacheFlightRecorderConversationId);
+		}
+	}
+
 	private cleanupStaleRequests(): void {
 		const now = Date.now();
 		let removedCount = 0;
@@ -964,6 +1193,7 @@ export class UsageCollector {
 				log.warn(
 					`Request ${id} appears orphaned (no activity for ${Math.round(inactivity / 1000)}s), removing...`,
 				);
+				this.markEvictedRecorderState(state);
 				freeRequestState(state);
 				this.requests.delete(id);
 				removedCount++;
@@ -983,6 +1213,7 @@ export class UsageCollector {
 
 			for (let i = 0; i < excess; i++) {
 				const [id, state] = sortedByAge[i];
+				this.markEvictedRecorderState(state);
 				freeRequestState(state);
 				this.requests.delete(id);
 				removedCount++;
