@@ -3832,6 +3832,106 @@ describe("CodexProvider.transformRequestBody", () => {
 		).toEqual(["Read"]);
 	});
 
+	it("documents today's bug: a compaction-shaped follow-up turn loses Agent/Task at the provider boundary", async () => {
+		const provider = new CodexProvider();
+		const sessionId = "44444444-4444-4444-8444-444444444444";
+		const tools = ["Agent", "Task", "Read"].map((name) => ({
+			name,
+			input_schema: { type: "object" },
+		}));
+		const send = async (
+			messages: unknown[],
+			headers: Record<string, string> = {},
+		) => {
+			const transformed = await provider.transformRequestBody(
+				new Request("https://example.com/v1/messages", {
+					method: "POST",
+					headers: { "content-type": "application/json", ...headers },
+					body: JSON.stringify({
+						model: "claude-opus-4-8",
+						max_tokens: 10,
+						metadata: { user_id: JSON.stringify({ session_id: sessionId }) },
+						messages,
+						tools,
+					}),
+				}),
+			);
+			return transformed.json();
+		};
+
+		const originalMessages = [
+			{ role: "user", content: "start the task" },
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "tool_use",
+						id: "agent-1",
+						name: "Agent",
+						input: { prompt: "look into it" },
+					},
+				],
+			},
+			{
+				role: "user",
+				content: [
+					{ type: "tool_result", tool_use_id: "agent-1", content: "findings" },
+				],
+			},
+		];
+
+		const root = await send(originalMessages);
+		expect(root.tools.map((tool: { name: string }) => tool.name)).toEqual([
+			"Agent",
+			"Task",
+			"Read",
+		]);
+
+		// Compaction drops the earliest input item, keeps the tail, and appends
+		// a new turn. Same session and instructions, still the same logical
+		// conversation continuing, but the first surviving item is now what
+		// used to be item[1], so admission's derived identity changes anyway.
+		const compactedMessages = [
+			...originalMessages.slice(1),
+			{ role: "user", content: "continue the task" },
+		];
+
+		const traceDir = mkdtempSync(join(tmpdir(), "codex-trace-"));
+		process.env[CODEX_TRACE_DIR_ENV] = traceDir;
+		let compacted: { tools: Array<{ name: string }> };
+		try {
+			compacted = await send(compactedMessages, {
+				"x-better-ccflare-request-id": "compacted-follow-up",
+			});
+			const requestTrace = readTraceRecords(traceDir).find(
+				(record) =>
+					record.phase === "request" &&
+					record.request_id === "compacted-follow-up",
+			);
+			// BUG (documented, not fixed here): the demotion diagnostics confirm
+			// this was a session that already had an elected root.
+			expect(requestTrace).toMatchObject({
+				trace_schema_version: 9,
+				orchestration_admission: "non_root",
+				orchestration_demotion_observed: true,
+			});
+			expect(requestTrace?.elapsed_ms_since_root).toBeTypeOf("number");
+			expect(
+				requestTrace?.elapsed_ms_since_root as number,
+			).toBeGreaterThanOrEqual(0);
+		} finally {
+			delete process.env[CODEX_TRACE_DIR_ENV];
+			rmSync(traceDir, { recursive: true, force: true });
+		}
+
+		// BUG (documented, not fixed here): Agent/Task are incorrectly filtered
+		// out of the request for what is still logically the orchestrator's own
+		// session, purely because compaction reshaped the derived identity.
+		expect(compacted.tools.map((tool: { name: string }) => tool.name)).toEqual([
+			"Read",
+		]);
+	});
+
 	it("only an exact zero disables orchestration election", async () => {
 		const provider = new CodexProvider();
 		const sessionId = "22222222-2222-4222-8222-222222222222";
