@@ -327,4 +327,22 @@ describe("session-account endpoint auth exemption", () => {
 		);
 		expect(auth.isStaticPathExempt("/api/sessions/", "GET")).toBe(false);
 	});
+
+	it("cannot be widened by percent-encoded slashes in the id segment", () => {
+		// URL.pathname does not decode %2F, so an id containing an encoded
+		// slash still lands in a single path segment for both the exemption
+		// check and the router's own match: parity is preserved rather than
+		// the exemption matching a shape the router does not actually serve.
+		const encoded = "/api/sessions/abc%2Fdef/account";
+		expect(auth.isStaticPathExempt(encoded, "GET")).toBe(true);
+		expect(encoded.split("/").length).toBe(5);
+	});
+
+	it("does NOT exempt an encoded slash used to fake the trailing segment", () => {
+		// Attempting to smuggle "/account" via encoding still leaves a literal
+		// "%2Faccount" in the final segment, which does not equal "account".
+		expect(
+			auth.isStaticPathExempt("/api/sessions/abc123%2Faccount", "GET"),
+		).toBe(false);
+	});
 });

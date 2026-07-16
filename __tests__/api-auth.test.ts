@@ -182,11 +182,23 @@ describe("API Authentication", () => {
 			expect(extractedKey).toBe("btr-bearer-key-456");
 		});
 
-		test("should exempt dashboard paths from authentication", async () => {
-			expect(await authService.isPathExempt("/", "GET")).toBe(true);
-			expect(await authService.isPathExempt("/dashboard", "GET")).toBe(true);
+		test("should NOT exempt dashboard-shaped paths at the auth-service layer", async () => {
+			// The dashboard SPA and its static assets are served by
+			// apps/server/src/server.ts BEFORE the authentication-gated API
+			// router is ever consulted, so genuine dashboard navigation never
+			// reaches this code path in production. isPathExempt() must treat
+			// these as ordinary paths: exempting them here would let an
+			// unauthenticated request reach the upstream proxy whenever the
+			// dashboard is disabled or its assets are unavailable, since
+			// providers accept arbitrary paths.
+			expect(await authService.isPathExempt("/", "GET")).toBe(false);
+			expect(await authService.isPathExempt("/dashboard", "GET")).toBe(false);
+			// /health remains statically exempt (it is intentionally public).
 			expect(await authService.isPathExempt("/health", "GET")).toBe(true);
-			expect(await authService.isPathExempt("/api/oauth/init", "POST")).toBe(true);
+			// Token-mutating OAuth init is no longer blanket-exempt (hole #1).
+			expect(await authService.isPathExempt("/api/oauth/init", "POST")).toBe(
+				false,
+			);
 		});
 
 		test("should exempt /api/version/check from authentication", async () => {
@@ -215,19 +227,173 @@ describe("API Authentication", () => {
 			expect(result.error).toBeUndefined();
 		});
 
-		test("should exempt static assets from authentication", async () => {
-			expect(await authService.isPathExempt("/chunk-abc123.js", "GET")).toBe(true);
-			expect(await authService.isPathExempt("/chunk-abc123.css", "GET")).toBe(true);
-			expect(await authService.isPathExempt("/favicon-abc123.svg", "GET")).toBe(true);
-			expect(await authService.isPathExempt("/chunk-abc123.js.map", "GET")).toBe(true);
-			expect(await authService.isPathExempt("/static/logo.png", "GET")).toBe(true);
-			expect(await authService.isPathExempt("/assets/font.woff2", "GET")).toBe(true);
+		test("should NOT exempt asset-shaped paths at the auth-service layer", async () => {
+			// Real dashboard assets are served directly from the bundled
+			// manifest by apps/server/src/server.ts and never reach
+			// isPathExempt(). auth-service has no knowledge of the manifest, so
+			// it must not pattern-match on file extensions: doing so previously
+			// exempted ANY non-/api, non-/v1, non-/messages path (including
+			// arbitrary proxy targets like "/foo"), not just real assets.
+			expect(await authService.isPathExempt("/chunk-abc123.js", "GET")).toBe(
+				false,
+			);
+			expect(await authService.isPathExempt("/chunk-abc123.css", "GET")).toBe(
+				false,
+			);
+			expect(
+				await authService.isPathExempt("/favicon-abc123.svg", "GET"),
+			).toBe(false);
+			expect(
+				await authService.isPathExempt("/chunk-abc123.js.map", "GET"),
+			).toBe(false);
+			expect(await authService.isPathExempt("/static/logo.png", "GET")).toBe(
+				false,
+			);
+			expect(await authService.isPathExempt("/assets/font.woff2", "GET")).toBe(
+				false,
+			);
 		});
 
 		test("should require authentication for API paths", async () => {
 			expect(await authService.isPathExempt("/api/stats", "GET")).toBe(false);
 			expect(await authService.isPathExempt("/v1/messages", "POST")).toBe(false);
 			expect(await authService.isPathExempt("/api/accounts", "GET")).toBe(false);
+		});
+	});
+
+	describe("OAuth endpoint auth exemption (audit hole #1)", () => {
+		test("token-mutating OAuth routes are NOT statically exempt", () => {
+			expect(authService.isStaticPathExempt("/api/oauth/init", "POST")).toBe(
+				false,
+			);
+			expect(
+				authService.isStaticPathExempt("/api/oauth/callback", "POST"),
+			).toBe(false);
+			expect(
+				authService.isStaticPathExempt("/api/oauth/qwen/init", "POST"),
+			).toBe(false);
+			expect(
+				authService.isStaticPathExempt("/api/oauth/qwen/reauth", "POST"),
+			).toBe(false);
+			expect(
+				authService.isStaticPathExempt(
+					"/api/oauth/anthropic/reauth/init",
+					"POST",
+				),
+			).toBe(false);
+			expect(
+				authService.isStaticPathExempt(
+					"/api/oauth/anthropic/reauth/callback",
+					"POST",
+				),
+			).toBe(false);
+			expect(
+				authService.isStaticPathExempt("/api/oauth/codex/init", "POST"),
+			).toBe(false);
+			expect(
+				authService.isStaticPathExempt("/api/oauth/codex/reauth", "POST"),
+			).toBe(false);
+		});
+
+		test("token-mutating OAuth routes require an API key once auth is enabled", async () => {
+			await generateApiKey(dbOps, "oauth-hole-test-key", "admin");
+			expect(await authService.isAuthenticationEnabled()).toBe(true);
+
+			for (const path of [
+				"/api/oauth/init",
+				"/api/oauth/callback",
+				"/api/oauth/qwen/init",
+				"/api/oauth/qwen/reauth",
+				"/api/oauth/anthropic/reauth/init",
+				"/api/oauth/anthropic/reauth/callback",
+				"/api/oauth/codex/init",
+				"/api/oauth/codex/reauth",
+			]) {
+				const request = new Request(`http://localhost:8080${path}`, {
+					method: "POST",
+				});
+				const result = await authService.authenticateRequest(
+					request,
+					path,
+					"POST",
+				);
+				expect(result.isAuthenticated).toBe(false);
+			}
+		});
+
+		test("token-mutating OAuth routes still work with no API keys configured (initial setup)", async () => {
+			// No keys exist yet in this test's dbOps (beforeEach clears them).
+			expect(await authService.isAuthenticationEnabled()).toBe(false);
+
+			const request = new Request("http://localhost:8080/api/oauth/init", {
+				method: "POST",
+			});
+			const result = await authService.authenticateRequest(
+				request,
+				"/api/oauth/init",
+				"POST",
+			);
+			expect(result.isAuthenticated).toBe(true);
+		});
+
+		test("read-only OAuth status polling stays exempt even once auth is enabled", async () => {
+			await generateApiKey(dbOps, "oauth-status-test-key", "admin");
+			expect(await authService.isAuthenticationEnabled()).toBe(true);
+
+			for (const path of [
+				"/api/oauth/qwen/status/abc-123",
+				"/api/oauth/codex/status/xyz-789",
+			]) {
+				const request = new Request(`http://localhost:8080${path}`);
+				const result = await authService.authenticateRequest(
+					request,
+					path,
+					"GET",
+				);
+				expect(result.isAuthenticated).toBe(true);
+			}
+		});
+
+		test("read-only OAuth status polling requires GET (non-GET is not exempt)", async () => {
+			expect(
+				await authService.isPathExempt(
+					"/api/oauth/qwen/status/abc-123",
+					"POST",
+				),
+			).toBe(false);
+			expect(
+				await authService.isPathExempt(
+					"/api/oauth/codex/status/xyz-789",
+					"DELETE",
+				),
+			).toBe(false);
+		});
+	});
+
+	describe("Arbitrary path exemption (audit hole #2)", () => {
+		test("unknown/arbitrary paths are NOT statically exempt", () => {
+			expect(authService.isStaticPathExempt("/foo", "GET")).toBe(false);
+			expect(authService.isStaticPathExempt("/anything/else", "POST")).toBe(
+				false,
+			);
+			expect(authService.isStaticPathExempt("/robots.txt", "GET")).toBe(
+				false,
+			);
+		});
+
+		test("unknown/arbitrary paths require an API key once auth is enabled", async () => {
+			await generateApiKey(dbOps, "arbitrary-path-hole-test-key", "admin");
+			expect(await authService.isAuthenticationEnabled()).toBe(true);
+
+			for (const path of ["/foo", "/anything/else", "/robots.txt"]) {
+				const request = new Request(`http://localhost:8080${path}`);
+				const result = await authService.authenticateRequest(
+					request,
+					path,
+					"GET",
+				);
+				expect(result.isAuthenticated).toBe(false);
+			}
 		});
 	});
 
