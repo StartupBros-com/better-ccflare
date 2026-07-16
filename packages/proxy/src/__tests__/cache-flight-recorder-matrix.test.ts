@@ -519,7 +519,14 @@ describe("cache flight recorder product contract matrix", () => {
 					const dto = buildCacheFlightRecorderReport(lookup.timeline);
 					expect(dto.droppedEvidence).toBe(1);
 					expect(dto.completeness).toBe("incomplete");
-					assertPrivacySafe(renderCacheFlightRecorderReport(dto));
+					// The only retained turn is a hit, so the pure diagnosis has no
+					// cause. Evidence was still lost (the dropped turn could be the
+					// real break), so the report must not claim continuity is proven.
+					expect(dto.diagnosis.cause).toBe("telemetry_unknown");
+					const rendered = renderCacheFlightRecorderReport(dto);
+					expect(rendered).toContain("Diagnosis: telemetry unknown");
+					expect(rendered).not.toContain("no continuity break observed");
+					assertPrivacySafe(rendered);
 				}
 
 				const health = capture();

@@ -122,10 +122,7 @@ export function buildCacheFlightRecorderReport(
 	// diagnosis degrades to telemetry unknown rather than guessing.
 	const evidenceLost =
 		timeline.incomplete && diagnosis.completeness !== "contradictory";
-	const cause =
-		evidenceLost && diagnosis.cause !== null
-			? "telemetry_unknown"
-			: diagnosis.cause;
+	const cause = evidenceLost ? "telemetry_unknown" : diagnosis.cause;
 	return {
 		kind: "report",
 		recorderConversationId: timeline.recorderConversationId,

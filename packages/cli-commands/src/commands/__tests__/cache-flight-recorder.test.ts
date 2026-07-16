@@ -178,6 +178,25 @@ describe("cache flight recorder report", () => {
 		expect(dto.completeness).toBe("incomplete");
 	});
 
+	it("degrades a lost-evidence timeline to telemetry unknown even when retained turns are hit-only", () => {
+		// Both retained turns are hits, so the pure diagnosis has no cause to
+		// report. Evidence was still lost, so the headline must not claim
+		// continuity was proven: the dropped turns could hide the real break.
+		const dto = buildCacheFlightRecorderReport({
+			...hitTimeline,
+			incomplete: true,
+			droppedEvents: 1,
+			turns: [baselineTurn, hitTurn],
+		});
+
+		expect(dto.completeness).toBe("incomplete");
+		expect(dto.diagnosis.cause).toBe("telemetry_unknown");
+		const rendered = renderCacheFlightRecorderReport(dto);
+		expect(rendered).toContain("Diagnosis: telemetry unknown");
+		expect(rendered).not.toContain("no continuity break observed");
+		expect(JSON.parse(JSON.stringify(dto))).toEqual(dto);
+	});
+
 	it("degrades confident causes to telemetry unknown when evidence was lost", () => {
 		const dto = buildCacheFlightRecorderReport({
 			...hitTimeline,
