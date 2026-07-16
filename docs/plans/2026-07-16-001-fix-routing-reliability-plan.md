@@ -3,6 +3,7 @@ title: "Routing Reliability Recovery - Plan"
 type: fix
 date: 2026-07-16
 deepened: 2026-07-16
+revised: 2026-07-16
 topic: routing-reliability
 artifact_contract: ce-unified-plan/v1
 artifact_readiness: implementation-ready
@@ -14,11 +15,15 @@ incident_runtime_sha: f5b92292
 
 # Routing Reliability Recovery - Plan
 
+## Revision Note (2026-07-16)
+
+Adjusted after architecture review of PR #49: (1) fail-closed force-routing is new U3 work, not preserved behavior (the account selector falls back to normal selection today outside one narrow carve-out); (2) the adjacent OAuth control-plane hotfix is now a concrete implementation unit (U8, R22-R25); (3) PR sequencing lands the SSE fix first and the guard last, with a day-zero stopgap against guard amplification; (4) the guard rebuild is slimmed to retry narrowing plus versioning, deferring the lease/reservation admission-control system; (5) R9 visibility is resolved to awaiting the durable cooldown write; (6) the U2 benchmark's numeric merge gates are replaced by a deterministic bounded-memory test plus an informational benchmark; (7) tier preemption gains an anti-thrash suppression window.
+
 ## Goal Capsule
 
 - **Objective:** Restore reliable long-running Codex chats by accepting legitimate bounded SSE frames, converting native xAI capacity failures into ordinary account failover, making configured priority stronger than affinity, and replacing the unversioned production guard with a bounded, deploy-owned retry layer.
 - **Product authority:** The Product Contract below, synthesized from the 2026-07-16 production incident, current `origin/main`, and the user's decision to include guard hardening.
-- **Execution profile:** Test-first, four focused forward-fix PRs with independent rollback boundaries; no wholesale revert of PR #42 or the upstream xAI/session-affinity work.
+- **Execution profile:** Test-first, four focused forward-fix routing PRs plus one adjacent OAuth control-plane hotfix PR, each with independent rollback boundaries; no wholesale revert of PR #42 or the upstream xAI/session-affinity work.
 - **Safety boundary:** Never automate traffic against Anthropic or the configured Codex account. Use fixtures, fake upstreams, and explicitly force-routed non-Anthropic accounts; reserve a real Codex chat for operator-driven post-deploy dogfooding.
 - **Stop conditions:** Stop a unit if its change weakens an unrelated resource bound, makes generic OpenAI-compatible status handling provider-specific, lets affinity cross a priority tier, or cannot be deployed and identified from `refs/heads/main`.
 - **Open blockers:** No design blocker. WSL exec and the deployed `2c5a3fbd` service recovered during planning; Windows loopback currently depends on temporary SSH forwarding after the native WSL relay wedged. Re-verify WSL exec, direct 8789, guarded 8788, the deployed SHA, and the forwarding path before each deploy, and preserve active agents rather than terminating the distro as a shortcut.
@@ -53,10 +58,11 @@ After the routing incident, two Anthropic accounts repeatedly appeared to disabl
 
 - Generic Resume clears `paused` and `pause_reason` without replacing or validating credentials.
 - The roughly 90-second Anthropic usage poll then reaches the token-refresh chokepoint, observes the same `invalid_grant`, and pauses the account again.
+- Worse than a race: the poller's temporary-resume finally block calls `pauseAccount` without a reason argument, which defaults to `manual` and deterministically overwrites `oauth_invalid_grant` (or any other original reason) on every poll cycle, corrupting the metadata that auto-unpause and the dashboard depend on.
 - `/api/accounts` reads `pause_reason` for strategy prediction but omits it from `AccountResponse`, so the dashboard can show only generic `Paused` and a Resume action instead of `Re-authentication required`.
 - Successful reauthentication already replaces tokens and conditionally clears `oauth_invalid_grant`; both affected accounts completed that recovery during the incident and the live pool returned to two routable accounts.
 
-Keep the terminal-auth pause behavior. Implement its missing API/UI invariant as a small focused hotfix outside the four routing PRs: expose a safe typed `pauseReason`, reject generic Resume for `oauth_invalid_grant` with a typed reauthentication-required response, make reauthentication the primary dashboard action, and await any temporary paused-state restoration in usage polling so a generic/manual reason cannot race with the terminal reason. Test manual-pause resume, terminal-pause refusal, successful reauth auto-resume, dashboard copy/action selection, and the polling restoration race. This adjacent hotfix does not change the routing requirements or their rollout order.
+Keep the terminal-auth pause behavior. Implement its missing API/UI invariant as U8, a small focused hotfix PR outside the four routing PRs: expose a safe typed `pauseReason`, reject generic Resume for `oauth_invalid_grant` with a typed reauthentication-required response, make reauthentication the primary dashboard action, and await any temporary paused-state restoration in usage polling so a generic/manual reason cannot race with the terminal reason. Test manual-pause resume, terminal-pause refusal, successful reauth auto-resume, dashboard copy/action selection, and the polling restoration race. This adjacent hotfix does not change the routing requirements or their rollout order.
 
 ### Actors
 
@@ -83,7 +89,7 @@ Keep the terminal-auth pause behavior. Implement its missing API/UI invariant as
 - **F3. Explicit force-route remains explicit**
   - **Trigger:** An operator deliberately force-routes to one xAI account for diagnosis.
   - **Flow:** That account is the only candidate. A 402/429 updates its state but does not silently substitute a different account.
-  - **Terminal states:** The first directly observed capacity response is forwarded intact after classification; a later request that finds the forced account already cooled receives the existing force-route-unavailable response. Neither path selects another account.
+  - **Terminal states:** The first directly observed capacity response is forwarded intact after classification; a later request that finds the forced account already cooled receives a typed force-route-unavailable response. Neither path selects another account. Today only the xAI cache-native official-endpoint carve-out fails closed; every other forced-but-unavailable request falls back to normal selection, so U3 generalizes fail-closed force-routing as new work.
   - **Covered by:** R9-R10.
 
 - **F4. Better priority tier recovers**
@@ -100,8 +106,8 @@ Keep the terminal-auth pause behavior. Implement its missing API/UI invariant as
 
 - **F6. Guard receives explicit pool exhaustion**
   - **Trigger:** The proxy returns its typed pool-exhausted status before any upstream accepts the request.
-  - **Flow:** The guard consumes/cancels the error body, releases only its active-upstream lease, retains bounded pending/body reservations, waits within the absolute attempt/deadline budget, fairly reacquires an active lease, and retries.
-  - **Terminal states:** A successful proxy response, attempt/deadline/pending/body-budget exhaustion, or client abort with exact lease/reservation cleanup.
+  - **Flow:** The guard consumes/cancels the error body, waits within the absolute attempt/deadline budget, and retries. Backoff may retain the request's admission slot in this first cut because the 120-second absolute deadline bounds retention; the lease/reservation split is deferred (see Scope Boundaries).
+  - **Terminal states:** A successful proxy response, attempt/deadline exhaustion, or client abort with exact cleanup of timers and listeners.
   - **Covered by:** R16-R20.
 
 - **F7. Guard receives any other error**
@@ -116,7 +122,7 @@ Keep the terminal-auth pause behavior. Implement its missing API/UI invariant as
 
 - **R1.** Complete SSE transport frames up to 4 MiB are accepted; the exact observed 110,079-byte LF and CRLF cases must succeed, including delimiters split across chunks.
 - **R2.** Unterminated SSE tails remain independently capped at 4 MiB and retain the current fragment-based linear accumulation behavior.
-- **R3.** Tool-call arguments remain capped at 64 KiB per call in both translators. Codex retains its existing 64 KiB aggregate tool-argument cap. The OpenAI Responses adapter does not gain that stricter cap: all of its buffered translated output is instead bounded by one 4 MiB per-stream aggregate envelope, so several individually valid tool calls may exceed 64 KiB in total while the combined output remains bounded.
+- **R3.** Tool-call arguments remain capped at 64 KiB per call in both translators. Codex retains its existing 64 KiB aggregate tool-argument cap. The OpenAI Responses adapter does not gain that stricter cap: all of its buffered translated output is instead bounded by one 4 MiB per-stream aggregate envelope, so several individually valid tool calls may exceed 64 KiB in total while the combined output remains bounded. The Responses aggregate envelope is new policy, not preserved behavior: current code deliberately declines aggregate capping, and today valid translated text over 64 KiB fails at the tool-argument ceiling; this change fixes that latent defect while adding a deliberate bound.
 - **R4.** A true frame, tail, translated-output, or tool bound violation cancels upstream work and emits exactly one typed terminal failure; no response-completed event or account replay may follow client-visible stream bytes.
 
 **Native xAI availability**
@@ -125,25 +131,32 @@ Keep the terminal-auth pause behavior. Implement its missing API/UI invariant as
 - **R6.** Generic `OpenAICompatibleProvider` behavior is unchanged, including its deliberate inline treatment of generic 402/429 responses.
 - **R7.** The rate-limit result can carry a provider-supplied typed operational reason. Native xAI 402 uses a neutral xAI-capacity reason rather than being mislabeled as an upstream 429.
 - **R8.** A future cached xAI credit reset may enrich a direct 402 cooldown; missing, invalid, past, or stale reset evidence falls back to the existing bounded no-reset probe cooldown.
-- **R9.** On ordinary routing, a classified xAI response is discarded/cancelled before client bytes and the same request continues to the next candidate. If a directly observed 402/429 belongs to the final attempted candidate, classification runs on a clone and the original response is forwarded intact; a later request that finds all candidates already cooled receives the existing typed pool-exhausted response. Direct capacity evidence must become visible to selection before the request completes so an immediate retry cannot re-enter xAI through an async persistence window.
-- **R10.** Force-route remains single-account and fail-closed. A cooldown expiry admits a bounded recovery probe, and only a later successful upstream response clears the relevant cooldown/reason through existing success/probe behavior; a non-rate-limited error response is not recovery.
+- **R9.** On ordinary routing, a classified xAI response is discarded/cancelled before client bytes and the same request continues to the next candidate. If a directly observed 402/429 belongs to the final attempted candidate, classification runs on a clone and the original response is forwarded intact; a later request that finds all candidates already cooled receives the existing typed pool-exhausted response. Direct capacity evidence must become visible to selection before the request completes: the failover path awaits the durable cooldown write (a single-row UPDATE) instead of enqueueing it fire-and-forget, because selection reads fresh account state from the database on every request and an in-memory breaker would be invisible to any second process.
+- **R10.** Force-route becomes single-account and fail-closed for all providers: today only the xAI cache-native official-endpoint path fails closed, and every other forced-but-unavailable request falls back to normal selection, which can silently route to an Anthropic account. U3 generalizes the typed force-route-unavailable response to any forced account that is unknown or unavailable, preserving the existing auto-refresh bypass. A cooldown expiry admits a bounded recovery probe, and only a later successful upstream response clears the relevant cooldown/reason through existing success/probe behavior; a non-rate-limited error response is not recovery.
 
 **Priority and affinity**
 
 - **R11.** Lower numeric priority is the outer ordering invariant after availability, request exclusions, auto-unpause, and combo eligibility are applied.
 - **R12.** Session affinity may reorder accounts only inside the best currently routable priority tier. Same-tier affinity remains sticky, and lower tiers remain in the candidate list as priority-ordered reactive fallbacks rather than being truncated.
-- **R13.** When a better tier becomes routable, a lower-tier mapping is immediately preempted and replaced. When a better-tier owner is temporarily unavailable, lower-tier service does not overwrite that owner, preserving legal snapback.
+- **R13.** When a better tier becomes routable, a lower-tier mapping is preempted and replaced. When a better-tier owner is temporarily unavailable, lower-tier service does not overwrite that owner, preserving legal snapback. After an upgrade whose new owner fails within the anti-thrash window, further upgrades for that session are suppressed for the remainder of the window (default 5 minutes, matching prompt-cache lifetime), so a flapping better-tier account cannot capture and drop a session on every cooldown cycle.
 - **R14.** xAI conversation cache ownership has one authoritative owner store. The post-selection cache-affinity orderer cannot leapfrog account-priority tiers or combo-slot-priority tiers.
 - **R15.** Combo account/model associations, least-used same-tier spreading, TTL expiry, auto-unpause behavior, and the 10,000-entry affinity bound remain intact.
 
 **Guard ownership and retry policy**
 
-- **R16.** The guard, pure retry policy, and stack lifecycle runner are versioned in the repository, installed with a digest manifest as one content-addressed artifact, and pinned alongside the binary by the main-only deployment path.
+- **R16.** The guard, pure retry policy, and stack lifecycle runner are versioned in the repository, installed with recorded per-file SHA-256 digests and source commit, and pinned alongside the binary by the main-only deployment path.
 - **R17.** The guard consumes the proxy's existing stable `x-better-ccflare-pool-status: exhausted` header and retains bounded structured-body detection only as a rolling-upgrade fallback; the incident does not add a second pool-exhaustion protocol.
 - **R18.** The guard retries only explicit pool exhaustion. Generic 5xx, 402, 429, 529, governor rejections, and deterministic typed errors are final at the guard layer.
 - **R19.** Pool waiting is bounded by three total attempts and one absolute 120-second retry-decision deadline covering request admission/body read through pre-success response classification. The guard never sleeps past it, aborts pre-header work when it expires, and never starts a post-deadline fetch; a successful response stream is not cut off by that retry deadline.
-- **R20.** Backoff does not occupy an active-upstream lease but does retain bounded pending/body reservations. The deployed defaults are 12 active, 36 pending, 24 queued, 4 MiB per body, 64 MiB aggregate buffered bodies, and 64 KiB legacy error-body inspection. Client abort and queue handoff release/transfer every lease, reservation, byte, timer, and listener exactly once.
-- **R21.** Guard health and structured logs expose manifest-backed guard/runner identity, artifact path/digests, process start identity, upstream target, effective limits, lifecycle counts/high-water marks, attempts, final status, stop cause, and budget/cancellation counters. Only successful HTTP responses are logged as success.
+- **R20.** First-cut admission control preserves the legacy guard's existing behavior: 12 active slots and its existing queue. Backoff occupancy is bounded by the absolute retry deadline rather than by a lease/reservation split; the pending/queued/per-body/aggregate-body budget system is deferred until measured saturation data justifies specific numbers. Client abort and queue handoff release every slot, timer, and listener exactly once.
+- **R21.** Guard health and structured logs expose the pinned guard/runner digests and source commit, process start identity, upstream target, effective retry limits, attempt counts, final status, and stop cause. Only successful HTTP responses are logged as success.
+
+**OAuth control plane (adjacent hotfix, U8)**
+
+- **R22.** `AccountResponse` exposes a typed `pauseReason`; unknown or legacy reason strings remain safely renderable.
+- **R23.** Generic Resume rejects accounts paused with `oauth_invalid_grant` using a typed reauthentication-required response; manual-pause resume is unchanged.
+- **R24.** The usage poller's temporary resume/re-pause preserves the original `pause_reason` (today the finally-block re-pause defaults the reason to `manual`, deterministically overwriting `oauth_invalid_grant` every cycle) and awaits restoration so a generic reason cannot race with or replace the terminal reason.
+- **R25.** Successful reauthentication replaces tokens, clears `oauth_invalid_grant`, and auto-resumes; the dashboard shows reauthentication as the primary action for terminal-auth pauses.
 
 ### Acceptance Examples
 
@@ -165,7 +178,7 @@ Keep the terminal-auth pause behavior. Implement its missing API/UI invariant as
 - **AE4. xAI compatibility boundaries**
   - **Given:** Native xAI returns 429, generic OpenAI-compatible returns 402/429, and a force-routed native xAI account returns 402.
   - **When:** Each path executes.
-  - **Then:** Native xAI 429 enters failover; generic responses retain existing inline semantics; a direct forced response is preserved and a later already-cooled forced request returns the existing unavailable marker without switching accounts.
+  - **Then:** Native xAI 429 enters failover; generic responses retain existing inline semantics; a direct forced response is preserved and a later already-cooled forced request returns a typed force-route-unavailable response without switching accounts (generalized by U3 beyond today's xAI cache-native carve-out).
 
 - **AE4a. Final observed xAI capacity response**
   - **Given:** Native xAI is the final attempted candidate and returns 402 or 429 before client bytes.
@@ -190,20 +203,26 @@ Keep the terminal-auth pause behavior. Implement its missing API/UI invariant as
 - **AE8. Guard amplification stops**
   - **Given:** A fake upstream returns 402, generic 502, 429, 529, governor rejection, deterministic `sse_limit_exceeded`, or typed pool exhaustion.
   - **When:** Each response reaches the guard.
-  - **Then:** Only pool exhaustion is retried; it stops at attempt/deadline limits; active/pending/body invariants hold through backoff and abort races; every other response is forwarded once and logged as final/error.
+  - **Then:** Only pool exhaustion is retried; it stops at attempt/deadline limits; abort races leave timers, listeners, and slot counts exact; every other response is forwarded once and logged as final/error.
 
 - **AE9. Deploy identity**
   - **Given:** The four PRs have landed on `refs/heads/main` and the tree is clean.
   - **When:** The production deploy path installs and restarts the stack.
-  - **Then:** `/health` reports the deployed binary SHA prefix, `/_guard/health` reports the exact manifest commit/file digests, runner identity, artifact path, upstream target, and effective budgets, and every identity points to content produced from main.
+  - **Then:** `/health` reports the deployed binary SHA prefix, `/_guard/health` reports the pinned guard/runner digests, source commit, upstream target, and effective retry limits, and every identity points to content produced from main.
+
+- **AE10. Terminal OAuth pause is honest**
+  - **Given:** An account paused with `oauth_invalid_grant` and another paused manually.
+  - **When:** An operator presses Resume on each, then reauthenticates the first.
+  - **Then:** The manual account resumes; the terminal account returns a typed reauthentication-required refusal and shows reauthentication as the primary action; after successful reauth it auto-resumes; a concurrent usage-poll cycle never overwrites `oauth_invalid_grant` with `manual`.
 
 ### Success Criteria
 
 - A real operator-driven Codex chat with a rich tool registry completes without the observed SSE limit failure.
 - A fixture-backed xAI 402 transparently reaches a later account, while a forced xAI request and generic OpenAI-compatible response remain explicit.
 - Account and combo routing never return a lower-priority candidate ahead of a routable higher-priority tier because of affinity.
-- A deterministic proxy 502 is no longer replayed by the guard; pool-exhausted waiting is bounded, does not consume an active lease while asleep, and cannot create an unbounded pending/body population.
+- A deterministic proxy 502 is no longer replayed by the guard; pool-exhausted waiting is bounded to three attempts inside one absolute 120-second deadline.
 - The deployed guard and lifecycle runner are digest-bound to the same landed SHA discipline as the binary.
+- A terminal OAuth pause is visible as such through the API and dashboard, refuses generic Resume, and survives usage polling without reason corruption.
 
 ### Scope Boundaries
 
@@ -213,7 +232,9 @@ Keep the terminal-auth pause behavior. Implement its missing API/UI invariant as
 - Native xAI 402/429 provider classification, cooldown attribution, failover, recovery probe, API/dashboard reason display.
 - Session and xAI cache affinity priority enforcement, including combo-slot priority.
 - Repo-owned guard/policy/runner source, consumption of the explicit pool-exhausted response contract, bounded/fair retry, deployment pinning, health, and logs.
-- Four focused PRs and sequential main-only deployment verification.
+- Generalized fail-closed force-routing in the account selector (new behavior; closes the silent fallback that can route forced requests to Anthropic accounts).
+- OAuth control-plane hotfix: typed `pauseReason` exposure, Resume refusal for terminal auth, poller reason preservation (U8).
+- Four focused routing PRs plus the U8 OAuth hotfix PR, and sequential main-only deployment verification.
 
 **Deferred**
 
@@ -221,6 +242,8 @@ Keep the terminal-auth pause behavior. Implement its missing API/UI invariant as
 - Treating a polled xAI 100% snapshot as a hard routing exclusion. The current reverse-engineered usage shape cannot prove whether extra credits remain available.
 - General consolidation of every strategy's affinity implementation beyond the duplicated xAI conversation-owner path.
 - A general cross-provider retry-class protocol beyond the explicit local pool-exhausted header.
+- Guard admission-control accounting (pending/queued/per-body/aggregate-body budgets and the lease/reservation split); the first cut bounds retry occupancy with the absolute deadline and preserves legacy admission behavior. Revisit with measured saturation data from the versioned guard's health counters.
+- The staged manifest/atomic artifact-directory deploy transaction; the first cut extends the existing pin backup/verify/prune pattern with digest-pinned guard/runner files.
 
 **Out of scope**
 
@@ -287,7 +310,7 @@ flowchart TB
   E -->|"all candidates already unavailable"| PE["Typed pool_exhausted response"]
 
   PE --> G
-  G -->|"release slot, bounded wait, reacquire"| P
+  G -->|"bounded wait and retry (3 attempts / 120 s)"| P
   G -->|"any other non-success"| F["Forward once as final response"]
 ```
 
@@ -300,14 +323,14 @@ The priority tier is selected only after availability and request-specific exclu
 - **KTD3. Preserve amortized-linear frame extraction, not a particular fragment representation.** Retain LF/CRLF behavior and the carry-based no-rescan invariant. If tiny-chunk profiling shows unbounded fragment-object overhead, bounded fragment coalescing is allowed. Full lone-CR and multi-`data:` conformance remains a separate follow-up.
 - **KTD4. Classify capacity at the xAI provider boundary.** `XaiProvider` handles 402 and official 429; selecting provider `xai` opts an account (including a configured custom endpoint) into those semantics, while differently behaved compatible endpoints must use `openai-compatible`. `OpenAICompatibleProvider` remains deliberately generic. A provider-supplied reason flows through the existing response processor/cooldown seam instead of adding a second availability system.
 - **KTD5. Name 402 operationally, not as generic payment semantics.** Use a reason such as `xai_capacity_402` because RFC 9110 does not define a universal meaning. Dashboard copy can explain observed credits/entitlement exhaustion without teaching the whole proxy that every 402 is retryable.
-- **KTD6. Direct response evidence outranks polled utilization.** A native xAI 402/429 immediately changes availability. A valid direct `Retry-After`/reset from that response outranks a fresh future cached `credits.resets_at`, which outranks the bounded no-reset probe cooldown. A bare 100% snapshot remains advisory because extra credits may still permit requests. Concurrent already-started 402s may each fail over, but in-memory and durable cooldown writes must converge without shortening the latest active deadline.
+- **KTD6. Direct response evidence outranks polled utilization.** A native xAI 402/429 immediately changes availability. A valid direct `Retry-After`/reset from that response outranks a fresh future cached `credits.resets_at`, which outranks the bounded no-reset probe cooldown. A bare 100% snapshot remains advisory because extra credits may still permit requests. Concurrent already-started 402s may each fail over, but in-memory and durable cooldown writes must converge without shortening the latest active deadline. Resolved: the direct-evidence failover path awaits the durable cooldown write before returning; a process-local breaker is rejected because a second process reading account state from the database would never observe it.
 - **KTD7. Priority is an outer invariant, not another affinity score.** Determine the minimum currently routable numeric tier first. Sticky owners may lead only inside that tier. A mapping to a worse tier is replaced when a better tier recovers; a mapping to a better but temporarily unavailable tier is preserved for legal snapback.
 - **KTD8. Make `CacheAffinityOrderer` the sole xAI conversation-owner store.** Remove the duplicate cache-key ownership branch from `SessionAffinityStrategy`. Store only stable owner identity—account ID for normal routing and combo-slot ID for combo routing—and refresh its current tier from a request-local catalog on every selection; a stored tier is never authoritative after runtime edits.
 - **KTD9. Retry only the existing explicit proxy pool contract at the guard.** Consume `x-better-ccflare-pool-status: exhausted`; accept at most 64 KiB of the structured body as a rolling-upgrade fallback. Raw 402/429/529/5xx responses are final because provider/account failover belongs inside the proxy and arbitrary replay can amplify deterministic errors.
-- **KTD10. Separate pending reservations from active-upstream leases.** A request reserves pending capacity before body read and retains it through `reading + queued + active + backingOff + reacquiring`; it holds a revocable active lease only while fetching/streaming. The deployed profile preserves `maxActive=12`, sets `maxPending=36`, caps each request body at 4 MiB and aggregate buffered bodies at 64 MiB, and requires exact permit/byte conservation. With three attempts, one saturated admitted cohort can create at most 108 upstream attempts; that explicit ceiling is accepted instead of an unsafe unkeyed global gate whose pools may differ by route/model/combo/force-route.
-- **KTD11. Use one absolute retry-decision deadline.** The 120-second deadline starts at request acceptance and covers pending admission, body read, queueing, pre-header fetch, pool-error classification, backoff, and reacquisition. It aborts a fetch that has not produced headers by the deadline. Once a successful response begins streaming, the retry deadline is disarmed and normal client/shutdown cancellation owns the stream.
-- **KTD12. Deploy the complete lifecycle from one authority.** Source-control the guard policy, guard entrypoint, and stack runner. Install them with a manifest containing the full source commit and file digests, make the systemd pin execute the versioned runner, verify binary/guard/runner/config/process identity, and retain the previous complete artifact set for rollback.
-- **KTD13. Land focused forward fixes.** Use four PRs: guard containment/deployment, SSE limits, native xAI availability, and priority-aware affinity. Each must be independently revertible and deployed from main before moving to the next behavioral slice.
+- **KTD10. Defer the lease/reservation admission-control system.** The previously specified pending/queued/per-body/aggregate-body budgets were invented without traffic data, in a document that insists on evidence-based sizing for the SSE cap. First cut: preserve the legacy guard's admission behavior (12 active slots and its existing queue) and bound backoff occupancy with the absolute 120-second deadline; a saturated cohort is therefore bounded by 12 active slots times 3 attempts. Collect saturation data from the versioned guard's health counters before designing finer-grained budgets.
+- **KTD11. Use one absolute retry-decision deadline.** The 120-second deadline starts at request acceptance and covers body read, queueing, pre-header fetch, pool-error classification, and backoff. It aborts a fetch that has not produced headers by the deadline. Once a successful response begins streaming, the retry deadline is disarmed and normal client/shutdown cancellation owns the stream.
+- **KTD12. Deploy the guard and runner from the repository with recorded digests.** Source-control the guard policy, guard entrypoint, and stack runner. The deploy script stages them next to the binary under versioned SHA-suffixed names, records their SHA-256 digests and source commit as managed lines in the systemd drop-in, verifies digests and process identity after restart, and retains the previous files for rollback. The staged manifest/atomic artifact-directory transaction is deferred.
+- **KTD13. Land focused forward fixes.** Use four routing PRs, landed smallest-and-safest first: SSE limits, native xAI availability, priority-aware affinity, then guard containment/deployment; plus the adjacent U8 OAuth hotfix PR. A day-zero stopgap (see Sequencing) stops guard amplification before any PR lands.
 
 The stream policy is intentionally consumer-specific:
 
@@ -321,7 +344,7 @@ The stream policy is intentionally consumer-specific:
 
 ### Assumptions
 
-- Four MiB is a policy ceiling, not expected steady-state allocation. A quantitative concurrency/chunking profile must pass before rollout; the implementation may coalesce fragments if the current representation fails the retained-memory gate.
+- Four MiB is a policy ceiling, not expected steady-state allocation. A deterministic bounded-memory test gates rollout; an informational benchmark records the profile. The per-stream budget must include the pre-existing 4 MiB analytics request-body copy every in-flight request already retains, so a realistic post-change peak is 8-12 MiB per stream, not 4 MiB. The implementation may coalesce fragments if measurements show fragment-object overhead is itself a hazard.
 - A force-routed request intentionally names one account and therefore must not inherit ordinary next-account failover.
 - A 402 from native xAI is safe to treat as temporary operational unavailability, but not safe to assign universal HTTP semantics or an unbounded cooldown.
 - The current response-body cancellation work on `origin/main` remains the standard failover cleanup path.
@@ -329,37 +352,40 @@ The stream policy is intentionally consumer-specific:
 
 ### Sequencing and PR Boundaries
 
-1. **Guard containment and ownership (U6-U7):** Stop replay amplification first, establish the explicit pool contract, and make the deployed guard traceable.
-2. **SSE resource separation (U1-U2):** Remove the immediate rich-context chat killer while retaining every independent resource bound.
-3. **Native xAI availability (U3):** Convert 402/429 into durable account state and transparent ordinary failover.
-4. **Priority-aware affinity (U4-U5):** Enforce the scheduling invariant across session, cache-native, and combo routes.
+0. **Day-zero stopgap (before any PR):** Snapshot the currently running host guard script and systemd runner verbatim into `scripts/legacy/` (a read-only import commit that becomes U6's diff baseline), then apply a minimal operator patch to the running guard: retry only the explicit pool-exhausted contract, at most three attempts inside 120 seconds, and log terminal non-2xx statuses as final rather than `proxy_success`. The patch file lives in the repo; U6/U7 replace it properly.
+1. **SSE resource separation (U1-U2):** Remove the immediate rich-context chat killer first; it is the smallest well-precedented change with existing test seams.
+2. **Native xAI availability (U3):** Convert 402/429 into durable account state, transparent ordinary failover, and generalized fail-closed force-routing.
+3. **Priority-aware affinity (U4-U5):** Enforce the scheduling invariant across session, cache-native, and combo routes.
+4. **Guard containment and ownership (U6-U7):** Replace the stopgap with the versioned, narrowly retrying guard and digest-pinned deployment. Landing last lets the smaller units build deployed confidence first and gives U6 a repo-committed behavioral baseline to diff against.
+5. **OAuth control-plane hotfix (U8):** Independent of the routing sequence; lands after U3 (or rebases over it) because both edit `packages/http-api/src/handlers/accounts.ts` and `packages/types/src/account.ts`.
 
-Do not bundle these into one PR. They have distinct rollback signals and can be reviewed/deployed independently. Before each review, compare the branch merge base with current `origin/main` because all four touch high-churn request-path code.
+Do not bundle these into one PR. They have distinct rollback signals and can be reviewed/deployed independently. Before each review, compare the branch merge base with current `origin/main`: the four routing PRs touch high-churn request-path code, and U8 overlaps U3 in `accounts.ts`/`account.ts`.
 
 ### System-Wide Impact
 
-- **Interfaces:** `RateLimitInfo` gains an optional typed operational reason; the guard consumes the already-present pool-exhausted header; the cache orderer accepts routable candidates plus a request-local owner catalog rather than inferring every route from `Account.priority`.
+- **Interfaces:** `RateLimitInfo` gains an optional typed operational reason; the guard consumes the already-present pool-exhausted header; the cache orderer accepts routable candidates plus a request-local owner catalog rather than inferring every route from `Account.priority`; `AccountResponse` gains a typed `pauseReason` (U8).
 - **State lifecycle:** Direct xAI evidence writes the existing cooldown fields and reason. Expiry admits the existing guarded probe; success clears cooldown. No new table/column is required, so SQLite/PostgreSQL migrations are not involved.
 - **Failure propagation:** A middle-candidate pre-byte xAI failure stays inside the account loop; a final directly observed xAI 402/429 is classified on a clone and forwarded intact. Midstream stream-limit failures terminate once and never fail over. Guard retry is restricted to a response proving no upstream accepted the request.
 - **Caching:** Session affinity remains responsible for client-session locality. `CacheAffinityOrderer` alone owns xAI conversation locality after base selection. Both are subordinate to the active priority tier.
 - **Combo routing:** Candidate records must keep account, slot priority, and model override together through filtering and affinity ordering; parallel arrays or account-id-only maps are insufficient.
-- **Memory/performance:** The frame/output ceiling rises to 4 MiB, while parser tail, consumer-specific tool limits, pending bodies, affinity maps, attempts, and deadlines remain explicit. Profiling must show linear concurrency/byte scaling and stable post-GC retained heap under repeated tiny-chunk and near-limit waves.
-- **Operations:** Production gains manifest-backed guard and runner identity at `/_guard/health`. The deploy transaction stages and verifies an immutable artifact directory, atomically replaces the managed pin, verifies the new process pair, and cannot prune until commit.
+- **Memory/performance:** The frame/output ceiling rises to 4 MiB, while parser tail, consumer-specific tool limits, affinity maps, attempts, and deadlines remain explicit. Every in-flight request already retains a separate 4 MiB analytics request-body copy, so the realistic post-change peak is 8-12 MiB per stream (roughly 96-144 MiB at 12 active streams, 192-288 MiB at the 24-stream stress profile). The deterministic bounded-memory test budgets against that total; the informational benchmark records the profile.
+- **Operations:** Production gains digest-pinned guard and runner identity at `/_guard/health`. The deploy script stages versioned guard/runner files next to the binary, records digests in the pin, verifies the new process pair after restart, and retains the previous files for rollback.
 - **Dashboard/API:** The new xAI reason must survive the accounts API allowlist and receive provider-aware error/recovery copy. Unknown historical strings must remain safely handled.
 - **Security/privacy:** Logs expose limit kind, sizes, status, account identifier, request/upstream IDs, and stop cause, never prompt/tool bodies, raw tokens, or xAI response bodies.
 - **Agent behavior:** Long agent loops receive either a coherent completion or one prompt terminal failure. No new agent tool/API surface is needed.
 
 ### Risks and Mitigations
 
-- **Higher per-stream memory:** A 4 MiB frame may temporarily allocate decoded/encoded copies. Mitigate with explicit concurrency observation, aggregate semantic bounds, retained linear buffering, and a max-plus-one rejection test.
+- **Higher per-stream memory:** A 4 MiB frame may temporarily allocate decoded/encoded copies, with the budget including the pre-existing 4 MiB analytics request-body copy each in-flight request already holds. Mitigate with explicit concurrency observation, aggregate semantic bounds, retained linear buffering, and a max-plus-one rejection test.
 - **Incorrect 402 semantics:** xAI may use 402 for more than included-credit depletion. Mitigate with native-provider-only classification, neutral audit naming, bounded cooldown, and no global 402 behavior.
 - **Stale usage reset:** Cached reset data may be old. Mitigate by accepting only finite future values from the existing freshness-bounded cache and falling back to probe cooldown.
-- **Affinity oscillation:** Repeated recovery/failure can churn mappings. Mitigate by replacing only when a strictly better tier is routable and preserving better-tier mappings during temporary fallback.
+- **Affinity oscillation:** Repeated recovery/failure can churn mappings. Mitigate by replacing only when a strictly better tier is routable, preserving better-tier mappings during temporary fallback, and suppressing further upgrades for a session for the anti-thrash window after an upgrade whose owner promptly failed, so availability flapping on cooldown boundaries cannot remap a session every cycle.
 - **Combo model mismatch:** Reordering accounts separately from slots can send the wrong model. Mitigate by ordering candidate records atomically and asserting account/model pair preservation.
-- **Guard starvation or double-release:** Releasing during backoff changes admission lifecycle. Mitigate with fake-clock integration tests for acquire/release/reacquire, queue fairness, abort at every state, and active-count invariants.
-- **Guard sleeper/body amplification:** Releasing an active lease must not release the request's pending/body reservations. Mitigate with `pending <= maxPending`, `bufferedBodyBytes <= maxBufferedBodyBytes`, a 4 MiB per-body cap, exact lifecycle counters, and saturation tests.
+- **Guard behavioral parity:** The production guard is unversioned and its source is not in the repository, so a rewrite cannot be diffed against what actually runs. Mitigate by committing the verbatim snapshot (day-zero step) as the baseline, characterizing its observable behavior in tests before replacement, and keeping the legacy `GUARD_SCRIPT` pin as first-rollout rollback.
+- **Guard retry-state cleanup:** Bounded backoff still adds timers and listeners per attempt. Mitigate with injected-clock policy tests for attempt/deadline exhaustion and abort at every state, asserting exact timer/listener/slot cleanup.
 - **Deploy partial failure:** Binary and guard pins could diverge. Mitigate with one backed-up pin transaction, post-restart dual-SHA verification, and automatic restoration on failed verification.
 - **Formatting churn:** Repository-wide lint/format may touch unrelated files. Record the pre-run status, inspect the final diff, and stage only the plan unit's explicit files; never include protected generated files.
+- **Unbounded classification bodies:** Final-candidate 402/429 classification reads a clone of the upstream body. Mitigate by capping classification reads at 64 KiB, matching the guard's inspection cap; a larger body is forwarded without classification-driven enrichment.
 
 ### Resolved During Planning
 
@@ -367,10 +393,12 @@ Do not bundle these into one PR. They have distinct rollback signals and can be 
 - **xAI 100% behavior:** Advisory until direct failure; do not preemptively bench accounts that may have extra credits.
 - **402 reason:** Provider-specific neutral capacity reason; do not label it as a generic 429 or universal payment failure.
 - **Affinity authority:** Session affinity handles session mapping; the post-selection cache orderer exclusively handles xAI conversation mapping.
-- **Guard policy:** Retry typed pool exhaustion only; pass all other statuses through once; bound both active work and the larger pending/body population.
-- **Guard amplification ceiling:** Preserve 12 active upstream leases, admit at most 36 pending requests/64 MiB of buffered bodies, and allow three attempts per request (108 attempts for one saturated cohort). Do not add a global single-flight key in this incident.
+- **Guard policy:** Retry typed pool exhaustion only; pass all other statuses through once; bound retry occupancy by the absolute deadline rather than a separate pending/body reservation system.
+- **Guard amplification ceiling:** Bounded by 12 active slots times 3 attempts inside one 120-second deadline. The finer-grained pending/queued/body budgets are deferred until the versioned guard's health counters provide real saturation data. Do not add a global single-flight key in this incident.
 - **Lifecycle ownership:** Version and pin the stack runner with the guard because shutdown ordering and effective retry configuration are part of correctness.
-- **Delivery:** Forward-fix in four PRs rather than reverting merged work.
+- **Delivery:** Forward-fix in four routing PRs sequenced SSE, xAI, affinity, guard, plus the U8 OAuth hotfix, rather than reverting merged work.
+- **R9 visibility mechanism:** Await the durable cooldown write on the direct-evidence failover path; the in-memory breaker alternative is rejected as single-process-only.
+- **Force-route:** Fail-closed for all providers is new U3 work; the plan initially described it as existing behavior.
 
 ---
 
@@ -410,7 +438,7 @@ Do not bundle these into one PR. They have distinct rollback signals and can be 
   - modify `packages/openai-responses-adapter/src/stream-translator.ts`
   - modify `packages/openai-responses-adapter/src/__tests__/stream-translator.test.ts`
   - create `scripts/bench-sse-resource-limits.ts`
-- **Approach:** Point both frame parsers at the transport/tail policies. Keep Codex tool buffers at 64 KiB per call and 64 KiB across calls. In the Responses adapter, retain 64 KiB per tool call but track one 4 MiB logical translated-output total across buffered text and tool arguments; do not add Codex's 64 KiB aggregate-tool restriction. Remove completed block buffers when safe so maps do not retain duplicate strings beyond the output representation. Catch the shared resource-limit base and preserve terminal close/cancel sequencing.
+- **Approach:** Point both frame parsers at the transport/tail policies. Keep Codex tool buffers at 64 KiB per call and 64 KiB across calls. In the Responses adapter, retain 64 KiB per tool call but track one 4 MiB logical translated-output total across buffered text and tool arguments; do not add Codex's 64 KiB aggregate-tool restriction. Remove completed block buffers when safe so maps do not retain duplicate strings beyond the output representation. Catch the shared resource-limit base and preserve terminal close/cancel sequencing. The 4 MiB aggregate translated-output envelope is new policy for the Responses adapter (current code deliberately declines aggregate capping); label it as such in the PR and note it also fixes the latent failure of valid translated text over 64 KiB.
 - **Execution note:** Use fixture streams only. Never curl Codex or Anthropic.
 - **Patterns to follow:** Existing `closeOpenBlockAndWriteError`, `handleLimitError`, source-reader cancellation, and no-completed-after-error assertions.
 - **Test scenarios:**
@@ -421,8 +449,8 @@ Do not bundle these into one PR. They have distinct rollback signals and can be 
   - Translated text over 64 KiB and below the 4 MiB combined output total succeeds and appears intact in done/completed output.
   - Combined Responses text/tool output over 4 MiB fails once, cancels upstream, and never emits completed.
   - Frame and tail overflow retain one typed terminal event and source cancellation.
-  - The benchmark covers concurrency 1/12/24; the exact incident and near-4 MiB frames; whole-frame, 64 KiB, 256-byte, and pathological tiny chunks; and repeated waves under explicit GC.
-- **Verification:** Both translator suites pass. On the same host and Bun version, the median typical-frame throughput regression versus current main is at most 15%; peak heap delta is proportional to concurrency (24-stream delta no more than 2.25x the 12-stream delta after subtracting idle); and post-GC retained heap after repeated waves stays within 10% of the first settled wave rather than growing monotonically. Record raw benchmark output in the PR.
+  - A deterministic bounded-memory test drives 12 and 24 concurrent max-size fixture streams and asserts peak heap stays under an explicit per-stream budget that includes the pre-existing 4 MiB analytics request-body copy. The informational benchmark covers concurrency 1/12/24, the exact incident and near-4 MiB frames, whole-frame, 64 KiB, 256-byte, and pathological tiny chunks, and repeated waves under explicit GC.
+- **Verification:** Both translator suites pass, including the deterministic bounded-memory test. `scripts/bench-sse-resource-limits.ts` is informational, not a merge gate: run it on current main and the PR with the same Bun/host profile, record raw output in the PR, and flag anomalies for discussion rather than failing on numeric thresholds; single-digit-percent thresholds are noise on a WSL2 host.
 
 ### U3. Make native xAI capacity a first-class failover state
 
@@ -449,8 +477,10 @@ Do not bundle these into one PR. They have distinct rollback signals and can be 
   - modify `packages/http-api/src/handlers/__tests__/accounts-integration.test.ts`
   - modify `packages/dashboard-web/src/components/overview/system-status/errorCodeMeta.ts`
   - modify `packages/dashboard-web/src/components/overview/system-status/__tests__/errorCodeMeta.test.ts`
-- **Approach:** Add an optional provider-supplied cooldown reason. Override only `XaiProvider`: 402 uses `xai_capacity_402`; 429 uses standard rate-limit parsing. Preserve a direct valid `Retry-After`/reset first; only when it is absent may `response-processor.ts` enrich the 402 from a fresh future xAI credit reset in `usageCache`; otherwise use the normal no-reset backoff. Both reset and no-reset branches must pass through the provider reason. Route both through `applyRateLimitCooldown`, but make direct capacity evidence visible to process-local selection before failover returns—either await the durable update or install a process-wide direct-evidence breaker that converges with the DB write—so an immediate retry with the same conversation identity cannot re-enter xAI through the async writer window. Clamp a new cooldown against the account's current future deadline and make `markAccountRateLimited` atomically retain the later durable deadline/reason while still incrementing the audit counter, so concurrent writers cannot shorten recovery. Middle-candidate responses follow the existing discard loop; final-candidate 402/429 classification uses a clone so the original post-provider response can be forwarded through the existing final-rate-limited-response seam. Clear the cooldown/reason only after an actual provider-approved success, never merely because a later response is not classified as rate-limited. Expose the new reason through API/dashboard allowlists.
-- **Execution note:** Start with provider and failover regressions. No schema migration is needed because the reason column already stores strings. This unit touches `proxy-operations.ts`, which current main changed in PR #48; preserve its `clear_thinking` pre-strip/reactive retry and response-release behavior and run that regression suite after rebasing.
+  - modify `packages/proxy/src/handlers/account-selector.ts`
+  - modify `packages/proxy/src/handlers/__tests__/account-selector.test.ts`
+- **Approach:** Add an optional provider-supplied cooldown reason. Override only `XaiProvider`: 402 uses `xai_capacity_402`; 429 uses standard rate-limit parsing. Preserve a direct valid `Retry-After`/reset first; only when it is absent may `response-processor.ts` enrich the 402 from a fresh future xAI credit reset in `usageCache`; otherwise use the normal no-reset backoff. Both reset and no-reset branches must pass through the provider reason. Route both through `applyRateLimitCooldown`, and on the direct-evidence path await the durable cooldown write (a single-row UPDATE) before failover returns instead of enqueueing it through the async writer, so an immediate retry with the same conversation identity cannot re-enter xAI through the async-writer window; selection reads fresh account state from the database each request, so an in-memory-only update is not sufficient and a process-local breaker is rejected. Clamp a new cooldown against the account's current future deadline and make `markAccountRateLimited` atomically retain the later durable deadline/reason while still incrementing the audit counter, so concurrent writers cannot shorten recovery. Middle-candidate responses follow the existing discard loop; final-candidate 402/429 classification uses a clone so the original post-provider response can be forwarded through the existing final-rate-limited-response seam. Clear the cooldown/reason only after an actual provider-approved success, never merely because a later response is not classified as rate-limited. Expose the new reason through API/dashboard allowlists. Generalize fail-closed force-routing in `account-selector.ts`: a forced account that is unknown or unavailable returns the typed force-route-unavailable response for every provider instead of falling back to normal selection (today only the xAI cache-native official-endpoint carve-out fails closed); preserve the existing auto-refresh bypass. Cap final-candidate classification reads at 64 KiB of the cloned body, matching the guard's inspection cap.
+- **Execution note:** Start with provider and failover regressions. No schema migration is needed because the reason column already stores strings. This unit touches `proxy-operations.ts`, which current main changed in PR #48; preserve its `clear_thinking` pre-strip/reactive retry and response-release behavior and run that regression suite after rebasing. The `markAccountRateLimited` clamp is one adapter-agnostic UPDATE in the shared `AccountRepository` used by both SQLite and PostgreSQL; no `migrations-pg.ts` work is needed because there are no schema changes.
 - **Patterns to follow:** Anthropic/Zai provider-specific parsing, `applyRateLimitCooldown`, reset clamping, `discardUnusedResponse`, and provider-aware dashboard error metadata.
 - **Test scenarios:**
   - AE3: xAI 402 plus fallback 200 returns only the fallback response and cancels/releases the 402 body.
@@ -459,7 +489,8 @@ Do not bundle these into one PR. They have distinct rollback signals and can be 
   - A direct valid `Retry-After` outranks a conflicting cached xAI credit reset; both paths retain `xai_capacity_402` rather than being relabeled as 429.
   - Native xAI 429 classifies; native xAI 400/500 do not.
   - AE4: generic OpenAI-compatible 402/429 behavior is unchanged.
-  - AE4: force-routed xAI 402 does not select a different account.
+  - AE4: force-routed xAI 402 does not select a different account; a forced-but-unavailable account of any provider returns the typed force-route-unavailable response instead of falling back to normal selection; the auto-refresh bypass still works.
+  - Classification of an oversized error body stops at the 64 KiB cap and forwards the original response unenriched.
   - A later request that starts with all candidates already cooled produces the existing typed pool-exhausted outcome.
   - With the same conversation/cache identity, turn one receives a middle-candidate xAI 402 and succeeds through the next account; an immediate turn two skips xAI before affinity/cache ordering can select it again.
   - Cooldown expiry admits a probe; successful xAI response clears the relevant cooldown/reason path.
@@ -479,7 +510,8 @@ Do not bundle these into one PR. They have distinct rollback signals and can be 
 - **Files:**
   - modify `packages/load-balancer/src/strategies/session-affinity.ts`
   - modify `packages/load-balancer/src/strategies/__tests__/session-affinity.test.ts`
-- **Approach:** Resolve a mapped owner from the original account catalog before transient availability filtering so an unavailable priority-10 owner can be distinguished from an unavailable priority-50 owner. Read its current priority on every request, delete mappings whose account disappeared, then derive the minimum routable tier after auto-unpause/availability filtering. Honor a routable mapped account only inside that tier; preserve an unavailable owner only while its current tier is strictly better than the temporary fallback. Replace lower-tier mappings using existing least-used/recency selection inside the best tier, and keep the returned fallback list nondecreasing by priority.
+  - modify `packages/core/src/strategy.ts` (shared minimum-routable-tier helper next to `isAccountAvailable`)
+- **Approach:** Resolve a mapped owner from the original account catalog before transient availability filtering so an unavailable priority-10 owner can be distinguished from an unavailable priority-50 owner. Read its current priority on every request, delete mappings whose account disappeared, then derive the minimum routable tier after auto-unpause/availability filtering. Honor a routable mapped account only inside that tier; preserve an unavailable owner only while its current tier is strictly better than the temporary fallback. Replace lower-tier mappings using existing least-used/recency selection inside the best tier, and keep the returned fallback list nondecreasing by priority. Derive the minimum routable tier through one shared helper (exported from `packages/core` next to `isAccountAvailable`) that U5's catalog refresh also uses, so the two tier computations cannot drift. After an upgrade whose new owner becomes unavailable within the anti-thrash window (default 5 minutes, matching prompt-cache lifetime), suppress further upgrades for that session for the remainder of the window; deterministic first upgrades (AE5) are unaffected.
 - **Execution note:** Add characterization tests for same-tier stickiness, temporary fallback, spread, TTL, and map bounds before changing mapping logic.
 - **Patterns to follow:** `SessionStrategy` priority-before-stickiness precedent, `rankByLeastUsed`, `pickAndMark`, and `wouldAutoUnpause`.
 - **Test scenarios:**
@@ -491,6 +523,7 @@ Do not bundle these into one PR. They have distinct rollback signals and can be 
   - Two healthy accounts in the same priority tier remain sticky and spread new sessions via recency penalty.
   - Fallback order never decreases in preference after the sticky first element.
   - TTL expiration, no-client selection, and 10,000-entry eviction remain unchanged.
+  - A better-tier account that flaps on cooldown boundaries captures a session at most once per anti-thrash window; the session is not remapped on every cooldown cycle.
 - **Verification:** Session-affinity tests prove the invariant under recovery, edits, outage, concurrency spread, and bounded state.
 
 ### U5. Consolidate xAI cache ownership and preserve combo-slot priority
@@ -505,7 +538,7 @@ Do not bundle these into one PR. They have distinct rollback signals and can be 
   - modify `packages/proxy/src/handlers/account-selector.ts`
   - modify `packages/proxy/src/handlers/__tests__/account-selector.test.ts`
   - modify `packages/types/src/api.ts`
-- **Approach:** Remove `SessionAffinityStrategy`'s cache-key owner branch and delete the leaked `xaiCacheEligibleAccountIds`/stale ownership comment from `RequestMeta`. Keep the candidate type proxy-local: `{identity, slotId?, account, tier, modelOverride?}`. Normal identity/tier is account ID/`Account.priority`; combo identity/tier is slot ID/`ComboSlot.priority`. Pass the orderer both the ordered routable candidates and a request-local owner catalog built after structural route eligibility but before transient availability. Store identity only, refresh owner tier/eligibility from that catalog every request, remove missing/ineligible owners, reorder only inside one routable tier, and unwrap account/model pairs afterward.
+- **Approach:** Remove `SessionAffinityStrategy`'s cache-key owner branch and delete the leaked `xaiCacheEligibleAccountIds`/stale ownership comment from `RequestMeta`. Keep the candidate type proxy-local: `{identity, slotId?, account, tier, modelOverride?}`. Normal identity/tier is account ID/`Account.priority`; combo identity/tier is slot ID/`ComboSlot.priority`. Pass the orderer both the ordered routable candidates and a request-local owner catalog built after structural route eligibility but before transient availability. Store identity only, refresh owner tier/eligibility from that catalog every request, remove missing/ineligible owners, reorder only inside one routable tier, and unwrap account/model pairs afterward. Tier refresh uses the same shared minimum-routable-tier helper as U4.
 - **Execution note:** Prefer a proxy-local candidate type over adding mutable priority maps to `RequestMeta`; priority is a selection concern, not request identity.
 - **Patterns to follow:** Current `CacheAffinityOrderer` TTL/LRU behavior, account-selector exclusion order, and `ComboSlotInfo` model pairing.
 - **Test scenarios:**
@@ -522,10 +555,11 @@ Do not bundle these into one PR. They have distinct rollback signals and can be 
 
 ### U6. Source-control the guard and narrow its retry contract
 
-- **Goal:** Replace broad host-local replay with a bounded lifecycle controller whose retry, admission, buffering, cancellation, and shutdown invariants are testable.
+- **Goal:** Replace broad host-local replay with a versioned, narrowly retrying guard whose retry, cancellation, logging, and shutdown invariants are testable, using the day-zero verbatim snapshot as the behavioral baseline.
 - **Requirements:** R16-R21.
 - **Dependencies:** none.
 - **Files:**
+  - create `scripts/legacy/` verbatim snapshot of the running guard/runner (imported by the day-zero commit; read-only baseline)
   - create `scripts/ccflare-guard-policy.mjs`
   - create `scripts/ccflare-guard.mjs`
   - create `scripts/run-ccflare-stack.sh`
@@ -533,23 +567,21 @@ Do not bundle these into one PR. They have distinct rollback signals and can be 
   - create `scripts/__tests__/ccflare-guard.integration.test.ts`
   - create `scripts/__tests__/ccflare-stack-runner.test.ts`
   - modify `packages/proxy/src/__tests__/pool-exhausted.test.ts`
-- **Approach:** Extract response classification, retry-budget evaluation, and delay calculation into pure functions. Characterize the proxy's existing pool-exhausted header; the guard treats header confirmation or a body match within a 64 KiB inspection cap as the only retryable result. Reserve `pending` before body read and track `pending = reading + queued + active + backingOff + reacquiring`; reserve body bytes incrementally; use an explicit revocable active lease only during upstream fetch/streaming. Enforce `pending <= 36`, `queued <= 24`, `active <= 12`, `bufferedBodyBytes <= 64 MiB`, a 4 MiB body cap, three total attempts, 120 seconds, and at most 2 seconds of jitter. Before backoff, consume or cancel the pool response, release the active lease, retain the pending/body reservations, and fairly reacquire. One absolute deadline aborts every pre-success state/fetch and is disarmed after successful response headers. Every timer/listener/lease/reservation cleanup path is idempotent and exact, not counter clamping. Non-success responses use final/error logging.
-- **Execution note:** Test policy first, then process behavior against a fake local upstream. The guard must not require a real provider.
+- **Approach:** Extract response classification, retry-budget evaluation, and delay calculation into pure functions that take the clock and randomness as parameters (no ambient timers), starting from the snapshot's observed behavior. Characterize the proxy's existing pool-exhausted header; the guard treats header confirmation or a body match within a 64 KiB inspection cap as the only retryable result. Preserve the legacy guard's admission behavior (12 active slots and its existing queue); backoff may retain the request's slot because the absolute deadline bounds retention, and the lease/reservation split is deferred. Enforce three total attempts, 120 seconds, and at most 2 seconds of jitter. Before backoff, consume or cancel the pool response. One absolute deadline aborts every pre-success state/fetch and is disarmed after successful response headers. Every timer/listener cleanup path is idempotent and exact. Non-success responses use final/error logging.
+- **Execution note:** Test policy first, then process behavior against a fake local upstream. The guard must not require a real provider. Fake time means injected clock/timer parameters in the policy module, not global timer mocking; this repo has no fake-timer precedent. The runner's drain grace is env-parameterized (`GUARD_DRAIN_GRACE_SECONDS`); tests substitute a short value and assert the production default by inspecting the installed unit/env, not by waiting 75 real seconds.
 - **Patterns to follow:** Existing pool/governor/force-route markers, `Retry-After` parsing, queue abort listener cleanup, structured JSON logging, and systemd shutdown grace. The runner must stop admission and drain the guard first, keep upstream alive for the full configured guard grace, and only then terminate upstream/tunnel.
 - **Test scenarios:**
   - AE8: 402, generic 500/502/503/504, 429, 529, the governor marker, the force-route-unavailable marker, and typed deterministic errors are forwarded once.
   - Header-confirmed pool exhaustion retries; legacy structured-body pool exhaustion retries during rolling upgrade; body inspection never exceeds 64 KiB and every discarded body is consumed/cancelled.
-  - Attempt three is terminal; the absolute deadline covers admission/body read/queue/fetch/classification/backoff/reacquisition, aborts a never-returning pre-header fetch, and never starts a post-deadline fetch. A successful streaming response is not killed by the retry deadline.
-  - Active count drops during backoff, pending/body reservations remain, a queued unrelated request can run, and the retry fairly reacquires.
-  - Pending saturation, queue saturation, per-body overflow, and aggregate-body exhaustion reject deterministically without violating counters or becoming guard-retryable pool failures.
-  - Abort while reading, queued, fetching, classifying, backing off, or reacquiring—including races with queue handoff—leaves every state/permit/byte count exact and writes one final response at most.
+  - Attempt three is terminal; the absolute deadline covers admission/body read/queue/fetch/classification/backoff, aborts a never-returning pre-header fetch, and never starts a post-deadline fetch. A successful streaming response is not killed by the retry deadline.
+  - Abort while queued, fetching, classifying, or backing off leaves timers, listeners, and slot counts exact and writes one final response at most.
   - Repeated waits do not accumulate abort listeners after timers resolve.
   - Only 2xx is logged as success; terminal 402 records final status/reason rather than `proxy_success`.
-  - Health exposes immutable attempts/deadline/jitter/body limits, current lifecycle counts, buffered bytes, high-water marks, manifest identity, `startedAt`, and per-stop-cause counters.
-  - `/_guard/health` bypasses pending/active admission and remains responsive under full active, queue, and body-budget saturation.
-  - With the production profile (`maxActive=12`, `maxPending=36`) and a 24-active stress profile, maximum-size bodies and aborts at every state never exceed configured active/pending/byte limits.
+  - Health exposes immutable attempts/deadline/jitter limits, current active/queued counts, high-water marks, pinned digests and source commit, `startedAt`, and per-stop-cause counters.
+  - `/_guard/health` bypasses admission and remains responsive under full active and queue saturation.
+  - With the production profile (12 active slots) and a saturated queue, aborts at every state never leak slots, timers, or listeners.
   - A long-lived fake SSE shutdown proves the runner allows the guard to drain for its configured 75-second grace while upstream remains alive; tests use fake time and do not wait 75 real seconds.
-- **Verification:** Pure policy, fake-upstream, saturation, cancellation-race, and runner lifecycle suites pass deterministically on isolated non-production ports with fake time/randomness where needed.
+- **Verification:** Pure policy, fake-upstream, cancellation-race, and runner lifecycle suites pass deterministically on isolated non-production ports with injected clocks/randomness; a characterization suite over the snapshot's observable behavior documents any intentional divergence.
 
 ### U7. Install, pin, verify, and roll back the guard with the binary
 
@@ -560,20 +592,42 @@ Do not bundle these into one PR. They have distinct rollback signals and can be 
   - modify `scripts/deploy-ccflare.sh`
   - create `scripts/__tests__/deploy-ccflare.test.ts`
   - modify root `README.md` only if the production/deployment contract is documented there; do not touch `apps/cli/README.md`
-- **Approach:** Acquire a single-deployer `flock`. Stage the guard, policy, and runner in a temporary SHA-addressed directory; generate a manifest containing the full commit and SHA-256 digest of each file; verify modes, imports, and digests; then atomically publish the directory. Build one canonical drop-in that removes duplicate managed keys while preserving unrelated lines, resets/pins `ExecStart` to the versioned runner, pins the binary/artifact/manifest paths, and explicitly pins attempts/deadline/jitter/active/pending/queue/body budgets so no legacy 30-minute default leaks through. Atomically replace the pin under a rollback trap. Require a drain-safe guard (`pending=0`) before restart unless the operator supplies an explicit maintenance override. The first replacement cannot prove `pending=0` because the legacy guard exposes only active/queued state; require a documented quiet window with both legacy counts at zero followed by an explicit first-rollout maintenance override, or abort. Any reload/restart/process/health/identity/config failure is fatal: restore the prior pin, daemon-reload, restart the old pair, and verify both prior identities; if rollback verification fails, exit in a distinct hard-failure state. Commit the transaction only after verification, then prune artifacts while protecting every path parsed from the live and backup pins.
+- **Approach:** Acquire a single-deployer `flock`. Extend the existing pin backup/verify/prune pattern rather than replacing it: copy the guard, policy, and runner to versioned SHA-suffixed filenames next to the binary; record each file's SHA-256 digest and the source commit as managed lines in one canonical systemd drop-in that removes duplicate managed keys while preserving unrelated lines; point `ExecStart` at the versioned runner and explicitly pin attempts/deadline/jitter so no legacy 30-minute default leaks through. Keep the existing pin backup and restore-on-failure behavior: any reload/restart/process/health/identity/config failure restores the prior pin, daemon-reloads, restarts the old pair, and verifies both prior identities; if rollback verification fails, exit in a distinct hard-failure state. Restart during a documented quiet window; the legacy guard exposes only active/queued counts, so quiescence is operator-confirmed on first rollout. Prune old guard/runner versions with the same retention rule as binaries, protecting every path referenced by the live and backup pins. The staged SHA-addressed artifact directory, per-file manifest publication transaction, and `pending=0` drain protocol are deferred.
 - **Execution note:** Keep deployment host paths parameterizable inside the test harness so pin mutation, rollback, and pruning can run entirely in a temporary fixture.
 - **Patterns to follow:** Current ancestry/clean-tree/version gates, pin backup, health polling, SHA verification, and conservative artifact retention in `scripts/deploy-ccflare.sh`.
 - **Test scenarios:**
   - A pin without guard lines gains exactly one `GUARD_SCRIPT` and guard-SHA entry while preserving all other lines.
   - First rollout adds the `ExecStart` reset/versioned-runner pin while preserving the base host runner as rollback fallback; later rollouts replace only the managed lifecycle/identity/config lines.
-  - First-rollout tests prove the legacy active/queued quiet-window check cannot silently masquerade as `pending=0` and requires the explicit maintenance override.
   - Concurrent deploy attempts are excluded; interruption after pin mutation invokes rollback.
   - Simulated staging, digest, reload, restart, process, binary-health, guard-health, identity, or config failure restores/restarts/verifies the prior pair and never deletes its artifacts.
   - Rollback verification failure produces a distinct hard failure and no success/pruning output.
   - Pruning retains artifacts referenced by current and backup pins regardless of mtime and removes only excess unpinned versions after transaction commit.
   - `--check` remains read-only and enforces ancestry/tree/version gates without installing guard files.
-  - AE9: a successful fixture deploy requires a new process identity, guard listener on 8788, direct upstream health on 127.0.0.1:8789, guarded health, exact upstream target, binary short-SHA prefix match, exact manifest full commit/digests/path, runner identity, and all effective budgets.
+  - AE9: a successful fixture deploy requires a new process identity, guard listener on 8788, direct upstream health on 127.0.0.1:8789, guarded health, exact upstream target, binary short-SHA prefix match, the pinned guard/runner digests and source commit, runner identity, and the effective retry limits.
 - **Verification:** Deployment fixture tests and shell syntax validation pass before an actual main-only deployment. No fake-upstream test repoints production ports.
+
+### U8. OAuth control-plane hotfix (adjacent PR)
+
+- **Goal:** Make terminal OAuth pauses honest end to end: typed reason over the API, Resume refusal with reauthentication guidance, and a usage poller that cannot corrupt or race the terminal reason.
+- **Requirements:** R22-R25.
+- **Dependencies:** None functionally; lands after U3 (or rebases over it) because both edit `packages/http-api/src/handlers/accounts.ts` and `packages/types/src/account.ts`.
+- **Files:**
+  - modify `packages/types/src/account.ts`
+  - modify `packages/http-api/src/handlers/accounts.ts`
+  - modify `packages/http-api/src/handlers/__tests__/accounts-integration.test.ts`
+  - modify `apps/server/src/server.ts`
+  - modify `packages/database/src/database-operations.ts`
+  - modify the dashboard accounts view that renders pause state (locate the Paused badge/Resume action component under `packages/dashboard-web/src/components/`)
+  - create a poller reason-preservation test alongside the existing server tests
+- **Approach:** Add a typed `pauseReason` to `AccountResponse` and thread it from the repository read. Make the generic Resume handler return a typed reauthentication-required response for `pause_reason=oauth_invalid_grant` while leaving manual-pause resume unchanged; keep the guarded reauth path (`resumeAccountIfNeedsReauth`) and successful reauthentication as the only exits from a terminal pause. Fix the usage poller's temporary resume/re-pause: pass the original reason through (today the finally-block `pauseAccount(account.id)` defaults the reason to `manual`, deterministically overwriting `oauth_invalid_grant` every cycle) and await restoration so a concurrent manual action cannot interleave. Dashboard: render terminal-auth pauses as reauthentication-required with reauthentication as the primary action; unknown legacy reason strings fall back to the generic paused rendering.
+- **Execution note:** No schema change: `pause_reason` already exists as a string column. Both resume paths (public endpoint and poller-internal) share `dbOps.resumeAccount`; guard at that chokepoint rather than per caller.
+- **Test scenarios:**
+  - Manual-pause resume works unchanged.
+  - Terminal-pause Resume returns the typed reauthentication-required refusal.
+  - Successful reauthentication replaces tokens, clears the reason, and auto-resumes.
+  - Dashboard shows reauthentication as the primary action for `oauth_invalid_grant` and safe copy for unknown reasons.
+  - A poll cycle during a terminal pause preserves `oauth_invalid_grant` (never `manual`), with the restoration awaited so a race cannot interleave.
+- **Verification:** API integration, poller reason-preservation, and dashboard reason tests pass with no live OAuth traffic; fixture tokens only.
 
 ---
 
@@ -583,16 +637,17 @@ Do not bundle these into one PR. They have distinct rollback signals and can be 
 |---|---|---|
 | Core SSE policy | `bun test packages/core/src/__tests__/sse-frame-buffer.test.ts` | Exact incident frame accepted; independent max-plus-one failures typed correctly. |
 | Stream integrations | `bun test packages/providers/src/providers/codex/provider.test.ts packages/openai-responses-adapter/src/__tests__/stream-translator.test.ts` | Codex/Responses complete correctly; text/tool bounds and cancellation stay independent. |
-| Stream resource profile | `bun --expose-gc scripts/bench-sse-resource-limits.ts` on current main and the PR using the same Bun/host profile | Typical median throughput regression is at most 15%; peak heap scales linearly; repeated-wave retained heap stays within the recorded envelope. |
-| Native xAI | `bun test packages/providers/src/providers/xai/provider.test.ts packages/proxy/src/handlers/__tests__/response-processor.test.ts packages/proxy/src/handlers/__tests__/response-handler-midstream.test.ts packages/proxy/src/handlers/__tests__/proxy-operations-failover.test.ts packages/proxy/src/handlers/__tests__/proxy-operations-clear-thinking.test.ts packages/proxy/src/handlers/__tests__/response-body-cancel-on-failover.test.ts packages/proxy/src/handlers/__tests__/rate-limit-cooldown-reentry.test.ts packages/database/src/repositories/__tests__/account-rate-limit-audit.test.ts` | 402/429 fail over, direct/cached reset precedence holds, concurrent cooldowns cannot shorten, and forced/generic/midstream/PR-48 boundaries remain. |
+| Stream resource profile | Deterministic bounded-memory test inside the translator suites; `bun --expose-gc scripts/bench-sse-resource-limits.ts` run informationally on main and the PR | Peak heap stays under the explicit per-stream budget (including the 4 MiB analytics body copy); benchmark output recorded in the PR for reference, with no numeric merge gate. |
+| Native xAI | `bun test packages/providers/src/providers/xai/provider.test.ts packages/proxy/src/handlers/__tests__/response-processor.test.ts packages/proxy/src/handlers/__tests__/response-handler-midstream.test.ts packages/proxy/src/handlers/__tests__/proxy-operations-failover.test.ts packages/proxy/src/handlers/__tests__/proxy-operations-clear-thinking.test.ts packages/proxy/src/handlers/__tests__/response-body-cancel-on-failover.test.ts packages/proxy/src/handlers/__tests__/rate-limit-cooldown-reentry.test.ts packages/database/src/repositories/__tests__/account-rate-limit-audit.test.ts packages/proxy/src/handlers/__tests__/account-selector.test.ts` | 402/429 fail over, direct/cached reset precedence holds, concurrent cooldowns cannot shorten, and forced/generic/midstream/PR-48 boundaries remain. Force-route fails closed for all providers. |
 | xAI reason surfaces | `bun test packages/http-api/src/handlers/__tests__/accounts-integration.test.ts packages/dashboard-web/src/components/overview/system-status/__tests__/errorCodeMeta.test.ts` | New reason survives API allowlist and renders correct operator guidance. |
+| OAuth control plane (U8) | `bun test packages/http-api/src/handlers/__tests__/accounts-integration.test.ts` plus the poller reason-preservation test | Terminal-auth pause refuses generic Resume with a typed response, `pauseReason` survives the API, and polling cannot overwrite it. |
 | Priority and affinity | `bun test packages/load-balancer/src/strategies/__tests__/session-affinity.test.ts packages/proxy/src/__tests__/cache-affinity-orderer.test.ts packages/proxy/src/handlers/__tests__/account-selector.test.ts` | Priority tiers are monotonic; legal stickiness/snapback and combo model pairing remain. |
-| Guard policy/process | `bun test scripts/__tests__/ccflare-guard-policy.test.ts scripts/__tests__/ccflare-guard.integration.test.ts scripts/__tests__/ccflare-stack-runner.test.ts packages/proxy/src/__tests__/pool-exhausted.test.ts` | Only the existing pool contract retries; pending/active/body budgets, deadlines, shutdown, abort races, logs, and health are exact. |
-| Deploy path | `bun test scripts/__tests__/deploy-ccflare.test.ts` plus `bash -n scripts/deploy-ccflare.sh scripts/run-ccflare-stack.sh` | Locking, staging/manifest verification, atomic pin, fatal verification, rollback/restart verification, pruning, and check-only behavior are safe in fixtures. |
+| Guard policy/process | `bun test scripts/__tests__/ccflare-guard-policy.test.ts scripts/__tests__/ccflare-guard.integration.test.ts scripts/__tests__/ccflare-stack-runner.test.ts packages/proxy/src/__tests__/pool-exhausted.test.ts` | Only the existing pool contract retries; attempt/deadline budgets, shutdown, abort races, logs, and health are exact. |
+| Deploy path | `bun test scripts/__tests__/deploy-ccflare.test.ts` plus `bash -n scripts/deploy-ccflare.sh scripts/run-ccflare-stack.sh` | Locking, staging/digest verification, atomic pin, fatal verification, rollback/restart verification, pruning, and check-only behavior are safe in fixtures. |
 | Regression | `bun test` | Repository test suite passes without real upstream traffic. |
 | Required quality gates | `bun run lint && bun run typecheck && bun run format` | All required gates pass; inspect status afterward and keep only intended files. |
 | Protected-file audit | Inspect the final changed-file list | No generated inline worker or `apps/cli/README.md` is read, modified, staged, or committed. |
-| Main-only deploy | Run the repository deployment path only after each PR lands on `refs/heads/main` | New process identity reports the landed binary prefix and exact guard/runner manifest commit/digests/config. |
+| Main-only deploy | Run the repository deployment path only after each PR lands on `refs/heads/main` | New process identity reports the landed binary prefix and the pinned guard/runner digests, source commit, and config. |
 | Operator dogfood | Start one real Codex chat with a rich tool registry through `localhost:8788` | Chat reaches normal terminal events; no scripted/curl Codex traffic is used. |
 | Non-Anthropic smoke | Optional fake/local or force-routed non-Anthropic account only | Failover and pool contract work without risking Anthropic accounts. |
 
@@ -600,30 +655,32 @@ Do not bundle these into one PR. They have distinct rollback signals and can be 
 
 **Before each deploy**
 
-- Record the currently reported binary/manifest/runner identities, guard health/config, active/pending/lifecycle/body-byte counts, process `startedAt`, and recent guard stop-cause counters.
+- Record the currently reported binary/digest/runner identities, guard health/config, active/queued counts, process `startedAt`, and recent guard stop-cause counters.
 - Stop immediately if WSL cannot start a trivial process or if direct 8789 and guard 8788 health do not both answer; restoring host execution/transport is a prerequisite, not part of an application deploy.
 - Confirm the target commit is landed on `origin/main`, the deployment tree is clean, and only that PR's intended files changed from its merge base.
-- Require `pending=0` before restart, or record an explicit maintenance override acknowledging that in-flight chats may be terminated.
-- Preserve the current binary/guard/runner pin, manifest, and artifacts as the rollback set.
+- Restart during a documented quiet window (the legacy guard exposes only active/queued counts, so quiescence is operator-confirmed), or record an explicit maintenance override acknowledging that in-flight chats may be terminated.
+- Preserve the current binary/guard/runner pin, digests, and artifacts as the rollback set.
 - Stop if targeted/full tests or required quality gates fail, if a protected file changed, or if the guard fixture cannot prove exact acquire/release accounting.
 
 **Within five minutes after each deploy**
 
-- Verify new `startedAt`/PID identity, direct 8789 health, guarded `/health.git_sha`, and `/_guard/health` manifest/path/digests/config all match the target.
-- Guard PR: confirm effective active/pending/body/attempt/deadline budgets and that an isolated fake-upstream generic error is not replayed.
-- SSE PR: run fixtures/profile, then an operator-driven rich Codex chat; stop if any valid frame reports a resource-limit error, terminal events corrupt, or retained heap grows outside the benchmark envelope. Do not require RSS to return to baseline.
+- Verify new `startedAt`/PID identity, direct 8789 health, guarded `/health.git_sha`, and `/_guard/health` digests/source-commit/path/config all match the target.
+- Guard PR: confirm effective active/attempt/deadline budgets and that an isolated fake-upstream generic error is not replayed.
+- SSE PR: run fixtures/profile, then an operator-driven rich Codex chat; stop if any valid frame reports a resource-limit error, terminal events corrupt, or memory-pressure symptoms appear (the informational benchmark provides the reference envelope). Do not require RSS to return to baseline.
 - xAI PR: confirm a fixture/native non-Anthropic 402 records the xAI reason and either reaches the next account or produces one pool-exhausted outcome.
 - Affinity PR: confirm priority-10 accounts lead while routable and logs show a single remap when a better tier recovers.
+- OAuth PR (U8): confirm a terminally paused fixture account refuses generic Resume with the typed response, `pauseReason` appears in `/api/accounts`, and one observed poll cycle preserves the terminal reason.
 
-Do not advance to the next PR until the current slice has at least 15 minutes and 30 successfully routed ordinary requests under the new process identity, plus its slice-specific fixture/dogfood check. Do not manufacture Anthropic/Codex traffic to reach the sample.
+Do not advance to the next PR until the current slice has at least 15 minutes and 30 successfully routed ordinary requests under the new process identity, plus its slice-specific fixture/dogfood check. Do not manufacture Anthropic/Codex traffic to reach the sample. For the guard PR, which changes no routing behavior, the 30-request sample may be reached with force-routed non-Anthropic fixture traffic if ambient volume is insufficient. The U8 OAuth hotfix likewise changes no routing behavior; its gate is the OAuth slice check above plus ordinary traffic continuing to route, not a fresh 30-request sample.
 
 **Rollback triggers**
 
-- Any terminal-stream corruption, missing terminal event, or retained-memory growth outside the benchmark envelope.
+- Any terminal-stream corruption, missing terminal event, or sustained retained-memory growth corroborated by process RSS and pressure symptoms (informational benchmark envelope as reference).
 - Generic OpenAI-compatible responses begin failing over unexpectedly.
 - A lower priority tier leads while a higher tier is routable, or combo account/model associations diverge.
-- Any guard retry reason other than explicit pool exhaustion; more than three attempts; a post-deadline fetch; or active/pending/body/permit invariant violation.
-- Binary/guard/runner/pin/manifest identity mismatch, stale process identity after restart, or an unexpected service restart.
+- Any guard retry reason other than explicit pool exhaustion; more than three attempts; a post-deadline fetch; or a slot/timer/listener accounting violation.
+- Binary/guard/runner/pin/digest identity mismatch, stale process identity after restart, or an unexpected service restart.
+- Generic Resume clears a terminal `oauth_invalid_grant` pause, or a poll cycle overwrites a terminal `pause_reason` (U8 regression).
 
 **Rollback method**
 
@@ -638,10 +695,11 @@ For 24 hours after the final deploy, review at +1h, +4h, and +24h:
 - Counts of `sse_limit_exceeded` by limit kind and actual/limit bytes.
 - Native xAI 402/429 cooldown applications, fallback successes, pool-exhausted outcomes, and recovery probes.
 - Serving-account distribution by priority tier, plus priority-upgrade and temporary-fallback logs.
-- Guard attempts, pool waits, deadline/attempt stops, final non-2xx statuses, client aborts, active/pending/lifecycle/body-byte high-water marks, and process restarts.
-- Binary/guard/runner/manifest consistency after any service restart; key counter deltas by `startedAt`/process identity because health counters reset.
+- Guard attempts, pool waits, deadline/attempt stops, final non-2xx statuses, client aborts, active/queued high-water marks, and process restarts.
+- Binary/guard/runner/digest consistency after any service restart; key counter deltas by `startedAt`/process identity because health counters reset.
+- Terminal-pause Resume refusals, reauthentication completions, and any poll-cycle `pause_reason` transitions (which must be zero for terminal reasons).
 
-Alert when guard pending/body-capacity rejection exceeds 1% of requests or three events in five minutes, but treat that as a capacity signal rather than an automatic code rollback unless an invariant or identity check also fails. Likewise, genuine pool exhaustion/attempt exhaustion is operational capacity data, not by itself proof of a regression.
+Alert when guard queue rejection exceeds 1% of requests or three events in five minutes, but treat that as a capacity signal rather than an automatic code rollback unless an invariant or identity check also fails. Likewise, genuine pool exhaustion/attempt exhaustion is operational capacity data, not by itself proof of a regression.
 
 ## Definition of Done
 
@@ -652,7 +710,9 @@ Alert when guard pending/body-capacity rejection exceeds 1% of requests or three
 - The xAI reason is persisted and visible through the API/dashboard; recovery uses bounded cooldown/probe semantics and no database migration.
 - Session affinity, xAI cache ownership, and combo routing cannot invert their authoritative priority tier; same-tier stickiness and legal snapback remain.
 - xAI conversation ownership exists in one layer and combo account/model pairs remain atomic through ordering.
-- The guard/policy/runner are repo-owned and manifest-pinned; only explicit pool exhaustion retries for at most three attempts/120 seconds, and backoff holds bounded pending/body reservations but no active-upstream lease.
-- Guard health/logging accurately distinguishes success, final errors, attempts, lifecycle states, stop causes, cancellation, high-water marks, and manifest-backed build/config/process identity.
-- Four focused PRs land and deploy independently from `refs/heads/main`; each passes targeted/full tests and `bun run lint && bun run typecheck && bun run format`.
+- The guard/policy/runner are repo-owned and digest-pinned; only explicit pool exhaustion retries, for at most three attempts inside one absolute 120-second deadline, and backoff retention is bounded by that deadline.
+- Guard health/logging accurately distinguishes success, final errors, attempts, stop causes, cancellation, high-water marks, and digest-backed build/config/process identity.
+- Four focused routing PRs plus the U8 OAuth hotfix land and deploy independently from `refs/heads/main`; each passes targeted/full tests and `bun run lint && bun run typecheck && bun run format`.
 - Production reports matching binary/guard/runner identity, each PR clears its canary window, operator-driven Codex dogfooding completes, and the 24-hour monitoring window shows no recurrence or priority inversion.
+- Force-routed requests fail closed for every provider: an unknown or unavailable forced account returns the typed force-route-unavailable response and never silently selects another account.
+- Terminal OAuth pauses expose a typed `pauseReason`, refuse generic Resume with a reauthentication-required response, survive usage polling without reason corruption, and auto-resume after successful reauthentication.
