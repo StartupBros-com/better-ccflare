@@ -16,15 +16,15 @@ describe("resolveCooldownUntil", () => {
 		);
 	});
 
-	it("floors to backoff when resetTime is smaller than backoff", () => {
+	it("honors a resetTime sooner than the backoff instead of flooring it up (probe single-flight already guards short cooldowns)", () => {
 		const backoffMs = 30 * 1000; // 30s
 		const resetTime = now + 10 * 1000; // 10s out (sooner than backoff)
 		expect(
 			resolveCooldownUntil({ now, backoffMs, maxCooldownMs, resetTime }),
-		).toBe(now + backoffMs);
+		).toBe(resetTime);
 	});
 
-	it("honors resetTime when it sits between backoff floor and max ceiling", () => {
+	it("honors resetTime when it sits between backoff and max ceiling", () => {
 		const backoffMs = 30 * 1000; // 30s
 		const resetTime = now + 30 * 60 * 1000; // 30min out
 		expect(

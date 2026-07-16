@@ -105,10 +105,17 @@ export function getRateLimitMaxCooldownMs(): number {
  * Resolve how long an account should be benched after a 429.
  *
  * - No upstream reset hint → use the exponential backoff (probe interval).
- * - Upstream reset known → honor it, but bound it:
- *     - BELOW by the exponential backoff (never bench shorter than the streak ramp), and
- *     - ABOVE by `maxCooldownMs` (a far-future / stale hint can't idle the account
- *       indefinitely — e.g. Anthropic 5h/weekly usage-window resets).
+ * - Upstream reset known → honor it as the cooldown target, bounded ABOVE by
+ *   `maxCooldownMs` so a far-future / stale hint can't idle the account
+ *   indefinitely (e.g. Anthropic 5h/weekly usage-window resets).
+ *
+ * Deliberately does NOT floor a short resetTime at the exponential backoff:
+ * a reset that arrives sooner than the backoff streak ramp is honored as-is
+ * (see rate-limit-cooldown-reentry.test.ts "preserves a two-minute upstream
+ * reset hint instead of imposing a five-minute floor") — the streak-based
+ * probe single-flight gating (getRateLimitProbeAdmission) already guards
+ * against re-probe storms on short/expired cooldowns, so an artificial floor
+ * here would only delay legitimate quick recovery.
  *
  * Pure and unit-testable: callers pass a fixed `now`.
  */
@@ -120,10 +127,7 @@ export function resolveCooldownUntil(opts: {
 }): number {
 	const candidateUntil = opts.now + opts.backoffMs;
 	if (!opts.resetTime) return candidateUntil;
-	return Math.min(
-		Math.max(opts.resetTime, candidateUntil),
-		opts.now + opts.maxCooldownMs,
-	);
+	return Math.min(opts.resetTime, opts.now + opts.maxCooldownMs);
 }
 
 /**

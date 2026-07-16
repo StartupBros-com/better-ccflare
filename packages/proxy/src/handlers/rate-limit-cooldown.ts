@@ -91,8 +91,9 @@ export function resetRateLimitProbeGatesForTests(): void {
  *
  * @param account - The account that just received a 429 (mutated in place).
  * @param rateLimitInfo - `resetTime` (if known) is honored as the cooldown target,
- *   bounded below by the exponential backoff and above by the safety ceiling
- *   (CCFLARE_RATE_LIMIT_MAX_COOLDOWN_MS) — see resolveCooldownUntil.
+ *   bounded above by the safety ceiling (CCFLARE_RATE_LIMIT_MAX_COOLDOWN_MS) —
+ *   see resolveCooldownUntil. Falls back to the exponential backoff only when
+ *   no resetTime is provided.
  *   `remaining` is forwarded to the emitted RateLimitError. `reason` overrides the
  *   auto-derived audit reason.
  * @param ctx - The proxy context (provides asyncWriter + dbOps).
@@ -112,9 +113,9 @@ export function applyRateLimitCooldown(
 	// tier short, but the persisted counter still ramps correctly.
 	const nextCount = account.consecutive_rate_limits + 1;
 	const backoffMs = computeRateLimitBackoffMs(nextCount);
-	// When the upstream reset is known, bench until that reset (bounded below by
-	// the exponential backoff, above by the safety ceiling) instead of discarding
-	// a far-future reset and re-probing every ~5min — see resolveCooldownUntil.
+	// When the upstream reset is known, bench until that reset (bounded above by
+	// the safety ceiling) instead of discarding a far-future reset and
+	// re-probing every ~5min — see resolveCooldownUntil.
 	const cooldownUntil = resolveCooldownUntil({
 		now,
 		backoffMs,
