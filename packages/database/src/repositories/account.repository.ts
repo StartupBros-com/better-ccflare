@@ -191,6 +191,55 @@ export class AccountRepository extends BaseRepository<Account> {
 		);
 	}
 
+	/**
+	 * Pause only if currently active. Guarded on the account not already being
+	 * paused (e.g. by a manual pause, or a more specific auto-pause reason) so
+	 * it never overwrites the reason on an account the user (or another guard)
+	 * already paused. Returns true when the account was actually paused by
+	 * this call.
+	 *
+	 * When `expectedRefreshToken` is provided the pause is additionally gated on
+	 * the account still holding that exact refresh token. This guards the
+	 * OAuth-invalid-grant pause against a stale/in-flight refresh (using an old
+	 * token) re-pausing an account that was just re-authenticated, after reauth
+	 * the stored refresh token differs, so the guarded UPDATE no-ops.
+	 */
+	async pauseIfActive(
+		accountId: string,
+		reason: string,
+		expectedRefreshToken?: string | null,
+	): Promise<boolean> {
+		if (expectedRefreshToken != null) {
+			const changes = await this.runWithChanges(
+				`UPDATE accounts SET paused = 1, pause_reason = ? WHERE id = ? AND COALESCE(paused, 0) = 0 AND refresh_token = ?`,
+				[reason, accountId, expectedRefreshToken],
+			);
+			return changes > 0;
+		}
+		const changes = await this.runWithChanges(
+			`UPDATE accounts SET paused = 1, pause_reason = ? WHERE id = ? AND COALESCE(paused, 0) = 0`,
+			[reason, accountId],
+		);
+		return changes > 0;
+	}
+
+	/**
+	 * Resume an account only if it is currently paused for the exact given
+	 * reason. Used to auto-resume a specific auto-pause (e.g. needs-reauth)
+	 * after the underlying condition clears, without lifting a manual or
+	 * unrelated auto-pause. Returns true when this call resumed it.
+	 */
+	async resumeIfPausedWithReason(
+		accountId: string,
+		reason: string,
+	): Promise<boolean> {
+		const changes = await this.runWithChanges(
+			`UPDATE accounts SET paused = 0, pause_reason = NULL WHERE id = ? AND paused = 1 AND pause_reason = ?`,
+			[accountId, reason],
+		);
+		return changes > 0;
+	}
+
 	async resetSession(accountId: string, timestamp: number): Promise<void> {
 		await this.run(
 			`UPDATE accounts SET session_start = ?, session_request_count = 0 WHERE id = ?`,
