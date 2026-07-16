@@ -117,6 +117,15 @@ export function buildCacheFlightRecorderReport(
 	const turns = [...timeline.turns]
 		.sort((a, b) => a.sequence - b.sequence)
 		.map(toTurn);
+	// A timeline that lost evidence cannot support a confident cause: the
+	// missing turns could contain the real continuity break, so any strong
+	// diagnosis degrades to telemetry unknown rather than guessing.
+	const evidenceLost =
+		timeline.incomplete && diagnosis.completeness !== "contradictory";
+	const cause =
+		evidenceLost && diagnosis.cause !== null
+			? "telemetry_unknown"
+			: diagnosis.cause;
 	return {
 		kind: "report",
 		recorderConversationId: timeline.recorderConversationId,
@@ -125,17 +134,14 @@ export function buildCacheFlightRecorderReport(
 			null,
 		turns,
 		diagnosis: {
-			cause: diagnosis.cause,
+			cause,
 			diagnosedSequence: diagnosis.diagnosedSequence,
 			supportingTransitions: diagnosis.supportingEvidence,
 			continuityProof: diagnosis.continuityProof,
 		},
 		gaps: diagnosis.gaps,
 		unavailableDimensions: diagnosis.unavailableDimensions,
-		completeness:
-			timeline.incomplete && diagnosis.completeness !== "contradictory"
-				? "incomplete"
-				: diagnosis.completeness,
+		completeness: evidenceLost ? "incomplete" : diagnosis.completeness,
 		droppedEvidence: timeline.droppedEvents,
 	};
 }

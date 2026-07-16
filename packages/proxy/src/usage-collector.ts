@@ -383,6 +383,7 @@ export class UsageCollector {
 
 				for (let i = 0; i < toRemove; i++) {
 					const [id, state] = sortedByAge[i];
+					this.markEvictedRecorderState(state);
 					freeRequestState(state);
 					this.requests.delete(id);
 				}
@@ -808,9 +809,12 @@ export class UsageCollector {
 					log.warn("Cache flight recorder write failed", {
 						recorderConversationId,
 					});
+					// The turn is irrecoverably lost, so it is dropped evidence, not
+					// merely an incomplete dimension.
 					try {
 						await this.dbOps.markCacheFlightRecorderIncomplete(
 							recorderConversationId,
+							{ dropped: true },
 						);
 					} catch {
 						// Best effort only. The writer already contains and reports failures.
@@ -821,6 +825,7 @@ export class UsageCollector {
 				log.warn("Cache flight recorder write dropped", {
 					recorderConversationId,
 				});
+				this.markRecorderEvidenceDropped(recorderConversationId);
 			}
 		}
 
@@ -1035,6 +1040,34 @@ export class UsageCollector {
 		this.onSummary(summary);
 	}
 
+	/**
+	 * Record irrecoverably lost recorder evidence directly against the store.
+	 * This deliberately bypasses the async writer: it runs exactly when the
+	 * queue is saturated or state is force-evicted, and routing the marker
+	 * through the same rejected queue would hide the loss from health counts.
+	 */
+	private markRecorderEvidenceDropped(recorderConversationId: string): void {
+		void this.dbOps
+			.markCacheFlightRecorderIncomplete(recorderConversationId, {
+				dropped: true,
+			})
+			.catch(() => {
+				// Best effort only; never disturb the response lifecycle.
+			});
+	}
+
+	private markEvictedRecorderState(state: RequestState): void {
+		const start = state.startMessage;
+		if (
+			start.cacheFlightRecorderEligible === true &&
+			start.cacheFlightRecorderConversationId &&
+			start.providerName === "xai" &&
+			start.xaiCacheOfficialEndpoint === true
+		) {
+			this.markRecorderEvidenceDropped(start.cacheFlightRecorderConversationId);
+		}
+	}
+
 	private cleanupStaleRequests(): void {
 		const now = Date.now();
 		let removedCount = 0;
@@ -1048,6 +1081,7 @@ export class UsageCollector {
 				log.warn(
 					`Request ${id} appears orphaned (no activity for ${Math.round(inactivity / 1000)}s), removing...`,
 				);
+				this.markEvictedRecorderState(state);
 				freeRequestState(state);
 				this.requests.delete(id);
 				removedCount++;
@@ -1067,6 +1101,7 @@ export class UsageCollector {
 
 			for (let i = 0; i < excess; i++) {
 				const [id, state] = sortedByAge[i];
+				this.markEvictedRecorderState(state);
 				freeRequestState(state);
 				this.requests.delete(id);
 				removedCount++;

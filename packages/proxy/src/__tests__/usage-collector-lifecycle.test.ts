@@ -64,7 +64,7 @@ interface TestHarness {
 	saveRequestIds: string[];
 	payloads: Map<string, string>;
 	recorderWrites: RecorderWrite[];
-	markedIncomplete: string[];
+	markedIncomplete: Array<{ id: string; dropped: boolean }>;
 	summaryCosts: Map<string, number | undefined>;
 	summaries: string[];
 }
@@ -129,7 +129,7 @@ function createHarness(options: HarnessOptions | boolean = {}): TestHarness {
 	const saveRequestIds: string[] = [];
 	const payloads = new Map<string, string>();
 	const recorderWrites: RecorderWrite[] = [];
-	const markedIncomplete: string[] = [];
+	const markedIncomplete: Array<{ id: string; dropped: boolean }> = [];
 	const summaryCosts = new Map<string, number | undefined>();
 	const summaries: string[] = [];
 	const pendingWrites = new Set<Promise<void>>();
@@ -154,8 +154,12 @@ function createHarness(options: HarnessOptions | boolean = {}): TestHarness {
 		},
 		async markCacheFlightRecorderIncomplete(
 			recorderConversationId: string,
+			options?: { dropped?: boolean },
 		): Promise<void> {
-			markedIncomplete.push(recorderConversationId);
+			markedIncomplete.push({
+				id: recorderConversationId,
+				dropped: options?.dropped === true,
+			});
 		},
 	};
 
@@ -484,9 +488,10 @@ describe("UsageCollector request lifecycle", () => {
 	});
 
 	it("leaves the response lifecycle successful when recorder admission is rejected", async () => {
-		const { collector, recorderWrites, summaries } = createHarness({
-			acceptMetadata: false,
-		});
+		const { collector, markedIncomplete, recorderWrites, summaries } =
+			createHarness({
+				acceptMetadata: false,
+			});
 		collectors.push(collector);
 		collector.handleStart(
 			makeStartMessage("recorder-rejected", {
@@ -504,15 +509,20 @@ describe("UsageCollector request lifecycle", () => {
 			requestId: "recorder-rejected",
 			success: true,
 		});
+		await collector.drain();
 
 		expect(recorderWrites).toEqual([]);
 		expect(summaries).toContain("recorder-rejected");
+		expect(markedIncomplete).toEqual([
+			{ id: "cfr_dddddddddddddddddddddddddddddddd", dropped: true },
+		]);
 	});
 
 	it("warns without payload content and preserves success on repository failure", async () => {
-		const { collector, recorderWrites, summaries } = createHarness({
-			recorderFailure: new Error("repository unavailable"),
-		});
+		const { collector, markedIncomplete, recorderWrites, summaries } =
+			createHarness({
+				recorderFailure: new Error("repository unavailable"),
+			});
 		collectors.push(collector);
 		const warnings: LogEvent[] = [];
 		const onLog = (event: LogEvent) => {
@@ -547,6 +557,9 @@ describe("UsageCollector request lifecycle", () => {
 		expect(warnings).toHaveLength(1);
 		expect(JSON.stringify(warnings[0])).not.toContain("repository unavailable");
 		expect(JSON.stringify(warnings[0])).not.toContain("raw prompt");
+		expect(markedIncomplete).toEqual([
+			{ id: "cfr_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", dropped: true },
+		]);
 	});
 
 	it("treats explicit cache tokens from a generic usage event as present", async () => {
@@ -855,6 +868,30 @@ describe("UsageCollector request lifecycle", () => {
 		});
 		await collector.drain();
 		expect(saveRequestIds).toEqual([]);
+	});
+
+	it("marks an evicted recorder-eligible stream as dropped incomplete evidence", async () => {
+		const { collector, markedIncomplete, recorderWrites } = harness();
+		collector.handleStart(
+			makeStartMessage("recorder-evicted", {
+				accountId: "xai-account",
+				providerName: "xai",
+				xaiCacheOfficialEndpoint: true,
+				cacheFlightRecorderConversationId:
+					"cfr_ffffffffffffffffffffffffffffffff",
+				cacheFlightRecorderEligible: true,
+			}),
+		);
+
+		now += INACTIVITY_TIMEOUT_MS + 1;
+		testable(collector).cleanupStaleRequests();
+		await collector.drain();
+
+		expect(testable(collector).requests.has("recorder-evicted")).toBe(false);
+		expect(recorderWrites).toEqual([]);
+		expect(markedIncomplete).toEqual([
+			{ id: "cfr_ffffffffffffffffffffffffffffffff", dropped: true },
+		]);
 	});
 
 	it("retains the capacity safeguard and frees the oldest evicted state", () => {

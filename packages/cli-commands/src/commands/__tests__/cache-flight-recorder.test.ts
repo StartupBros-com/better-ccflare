@@ -178,6 +178,30 @@ describe("cache flight recorder report", () => {
 		expect(dto.completeness).toBe("incomplete");
 	});
 
+	it("degrades confident causes to telemetry unknown when evidence was lost", () => {
+		const dto = buildCacheFlightRecorderReport({
+			...hitTimeline,
+			incomplete: true,
+			droppedEvents: 2,
+			turns: [
+				...hitTimeline.turns,
+				{
+					...hitTurn,
+					sequence: 2,
+					identityFingerprint: "identity-b",
+					cacheOutcome: "miss",
+					cachedTokens: 0,
+				},
+			],
+		});
+
+		expect(dto.completeness).toBe("incomplete");
+		expect(dto.diagnosis.cause).toBe("telemetry_unknown");
+		expect(renderCacheFlightRecorderReport(dto)).toContain(
+			"Diagnosis: telemetry unknown",
+		);
+	});
+
 	it("renders all privacy-safe diagnosis and turn evidence", () => {
 		const dto = buildCacheFlightRecorderReport({
 			...hitTimeline,
