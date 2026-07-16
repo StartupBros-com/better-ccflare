@@ -555,7 +555,12 @@ export const WAL_SIZE_WARN_MIB = 256;
  * testable without spinning up the server.
  */
 export function formatWalCheckpointLog(
-	result: { ok: boolean; skipped: boolean; error?: string },
+	result: {
+		ok: boolean;
+		skipped: boolean;
+		error?: string;
+		durationMs?: number;
+	},
 	walBytes: number,
 	warnThresholdMiB: number = WAL_SIZE_WARN_MIB,
 ): { level: "warn" | "debug"; message: string } {
@@ -567,18 +572,24 @@ export function formatWalCheckpointLog(
 	}
 	// This tick is the sole WAL reclaimer, so surface the WAL size every tick:
 	// a WAL trending toward disk-fill (reader-starved TRUNCATE, or repeated
-	// skips) escalates to WARN; otherwise DEBUG.
+	// skips) escalates to WARN; otherwise DEBUG. Duration surfaces the
+	// optimize+checkpoint's writer-slot hold: a bounded ANALYZE (PRAGMA
+	// analysis_limit in the worker, see incremental-vacuum-worker.ts) keeps
+	// this in the single-digit/low-tens ms range, a spike back into the
+	// hundreds/seconds means ANALYZE is scanning unbounded again.
 	const walMiB = walBytes / (1024 * 1024);
 	const status = result.skipped ? "skipped (DB busy)" : "ran";
+	const timing =
+		result.durationMs != null ? ` in ${result.durationMs}ms` : "";
 	if (walMiB > warnThresholdMiB) {
 		return {
 			level: "warn",
-			message: `WAL checkpoint ${status}; WAL ${walMiB.toFixed(1)}MiB exceeds ${warnThresholdMiB}MiB, reclaim may be starved by a long-lived reader`,
+			message: `WAL checkpoint ${status}${timing}; WAL ${walMiB.toFixed(1)}MiB exceeds ${warnThresholdMiB}MiB, reclaim may be starved by a long-lived reader`,
 		};
 	}
 	return {
 		level: "debug",
-		message: `checkpoint/optimize ${status}; WAL ${walMiB.toFixed(1)}MiB`,
+		message: `checkpoint/optimize ${status}${timing}; WAL ${walMiB.toFixed(1)}MiB`,
 	};
 }
 

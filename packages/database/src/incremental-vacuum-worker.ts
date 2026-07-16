@@ -54,6 +54,19 @@ import { Database } from "bun:sqlite";
  * opens its own handle.
  */
 
+/**
+ * Row cap for `PRAGMA optimize`'s internal ANALYZE, set via `PRAGMA
+ * analysis_limit` before it. Without a limit (SQLite's default of 0 =
+ * unbounded) ANALYZE does a full index scan on every table it deems stale;
+ * on large tables that holds SQLite's single writer slot for seconds, during
+ * which every main-thread write parks in its busy handler, freezing the
+ * event loop. 400 is SQLite's documented value
+ * (https://sqlite.org/lang_analyze.html): it samples ~400 rows per index for
+ * near-identical planner statistics while bounding each ANALYZE to
+ * milliseconds.
+ */
+const ANALYZE_ANALYSIS_LIMIT = 400;
+
 export type IncrementalVacuumRequest =
 	| {
 			kind?: "vacuum";
@@ -140,6 +153,10 @@ function runOptimize(dbPath: string): void {
 		db.exec("PRAGMA busy_timeout = 0");
 		applyWorkerPragmas(db);
 
+		// Bound ANALYZE's writer-slot hold to ~ms. Must be set on THIS connection
+		// before `PRAGMA optimize` runs its internal ANALYZE. See
+		// ANALYZE_ANALYSIS_LIMIT above for the full rationale.
+		db.exec(`PRAGMA analysis_limit = ${ANALYZE_ANALYSIS_LIMIT}`);
 		db.exec("PRAGMA optimize");
 		// TRUNCATE (not PASSIVE): actively reclaim and zero the WAL off-thread so
 		// it stays bounded now that the main connection's autocheckpoint is

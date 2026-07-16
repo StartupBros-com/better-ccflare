@@ -58,4 +58,24 @@ describe("formatWalCheckpointLog", () => {
 		expect(message).not.toContain("NaN");
 		expect(message).toContain("0.0MiB");
 	});
+
+	it("surfaces the optimize/checkpoint duration when the worker reports one", () => {
+		// analysis_limit bounds PRAGMA optimize's ANALYZE to milliseconds; a
+		// regression back to an unbounded scan shows up here as durationMs
+		// climbing into the hundreds/thousands, so it must be visible in the log.
+		const { message } = formatWalCheckpointLog(
+			{ ok: true, skipped: false, durationMs: 42 },
+			1024 * 1024,
+		);
+		expect(message).toContain("in 42ms");
+	});
+
+	it("omits the duration segment when the worker didn't report one", () => {
+		const { message } = formatWalCheckpointLog(
+			{ ok: true, skipped: false },
+			1024 * 1024,
+		);
+		expect(message).not.toContain(" in ");
+		expect(message).not.toContain("undefinedms");
+	});
 });
