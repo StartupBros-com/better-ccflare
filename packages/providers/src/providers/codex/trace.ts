@@ -28,7 +28,7 @@ export const CODEX_TRACE_HMAC_KEY_ENV = "CCFLARE_CODEX_TRACE_HMAC_KEY";
 /** Warn when one response spawns at least this many subagents (0 disables). */
 export const CODEX_FANOUT_WARN_ENV = "CCFLARE_CODEX_FANOUT_WARN";
 
-const TRACE_SCHEMA_VERSION = 8;
+const TRACE_SCHEMA_VERSION = 9;
 const DEFAULT_FANOUT_WARN = 8;
 const MAX_INPUT_ITEM_FINGERPRINTS = 64;
 /**
@@ -84,10 +84,12 @@ export interface CodexResponseSummary {
 	new_tool_use_by_name: Record<string, number>;
 	new_tool_calls: ToolCallSummary[];
 	stop_reason: "tool_use" | "end_turn" | "max_tokens" | "refusal" | "error";
-	input_tokens: number;
-	output_tokens: number;
-	cache_read_input_tokens: number;
-	cache_creation_input_tokens: number;
+	usage_measurement_available: boolean;
+	cache_measurement_available: boolean;
+	input_tokens: number | null;
+	output_tokens: number | null;
+	cache_read_input_tokens: number | null;
+	cache_creation_input_tokens: number | null;
 	cache_hit_pct: number | null;
 	error_type?: string;
 	error_message?: string;
@@ -165,7 +167,20 @@ export function codexTraceEnabled(): boolean {
 }
 
 interface TraceInputs {
+	/** Logical client request identity, shared by all physical transports. */
 	requestId?: string;
+	/** Unique physical upstream transport identity. */
+	attemptId?: string;
+	/** One-based physical transport ordinal within the logical request. */
+	attemptOrdinal?: number;
+	attemptCause?:
+		| "initial"
+		| "model_fallback"
+		| "overload_529"
+		| "thinking_retry"
+		| "cache_control_retry"
+		| "account_failover"
+		| "other_retry";
 	account?: string;
 	modelIn?: string;
 	modelOut?: string;
@@ -216,6 +231,7 @@ interface TraceInputs {
 
 interface ResponseTraceInputs {
 	requestId?: string;
+	attemptId?: string;
 	modelOut?: string;
 	/** Raw model context window, for utilization telemetry. */
 	modelContextWindow?: number;
@@ -250,20 +266,25 @@ export function summarizeCodexResponse(
 			subagentSpawnCount++;
 		}
 	}
-	const inputTokens = usage.input_tokens ?? 0;
-	const cacheRead = usage.cache_read_input_tokens ?? 0;
+	const inputTokens = usage.input_tokens ?? null;
+	const cacheRead = usage.cache_read_input_tokens ?? null;
+	const usageMeasurementAvailable = typeof inputTokens === "number";
+	const cacheMeasurementAvailable =
+		usageMeasurementAvailable && typeof cacheRead === "number";
 	return {
 		new_tool_call_count: toolCalls.length,
 		new_subagent_spawn_count: subagentSpawnCount,
 		new_tool_use_by_name: newToolUseByName,
 		new_tool_calls: [...toolCalls],
 		stop_reason: stopReason,
+		usage_measurement_available: usageMeasurementAvailable,
+		cache_measurement_available: cacheMeasurementAvailable,
 		input_tokens: inputTokens,
-		output_tokens: usage.output_tokens ?? 0,
+		output_tokens: usage.output_tokens ?? null,
 		cache_read_input_tokens: cacheRead,
-		cache_creation_input_tokens: usage.cache_creation_input_tokens ?? 0,
+		cache_creation_input_tokens: usage.cache_creation_input_tokens ?? null,
 		cache_hit_pct:
-			inputTokens > 0
+			cacheMeasurementAvailable && inputTokens > 0
 				? Math.round(
 						(1000 * Math.min(Math.max(cacheRead, 0), inputTokens)) /
 							inputTokens,
@@ -293,6 +314,9 @@ export function writeCodexTrace(inputs: TraceInputs): void {
 		phase: "request",
 		ts: new Date().toISOString(),
 		request_id: inputs.requestId ?? null,
+		attempt_id: inputs.attemptId ?? null,
+		attempt_ordinal: inputs.attemptOrdinal ?? null,
+		attempt_cause: inputs.attemptCause ?? null,
 		account: inputs.account ?? null,
 		model_in: inputs.modelIn ?? null,
 		model_out: inputs.modelOut ?? null,
@@ -351,11 +375,15 @@ export function writeCodexResponseTrace(inputs: ResponseTraceInputs): void {
 		phase: "response",
 		ts: new Date().toISOString(),
 		request_id: inputs.requestId ?? null,
+		attempt_id: inputs.attemptId ?? null,
 		model_out: inputs.modelOut ?? null,
-		context_utilization_pct: contextUtilizationPct(
-			inputs.summary.input_tokens,
-			inputs.modelContextWindow,
-		),
+		context_utilization_pct:
+			typeof inputs.summary.input_tokens === "number"
+				? contextUtilizationPct(
+						inputs.summary.input_tokens,
+						inputs.modelContextWindow,
+					)
+				: null,
 		...inputs.summary,
 	});
 }

@@ -53,6 +53,8 @@ export interface RequestMeta {
 	codexPacingAction?: "paced" | "bypassed" | "crossover-paced" | null;
 	/** Privacy-preserving digest of the pacing-canary conversation identity. */
 	codexPacingCohortId?: string | null;
+	/** One-based physical Codex transport sequence for this logical request. */
+	codexTransportAttemptOrdinal?: number;
 }
 
 export interface AgentUpdatePayload {

@@ -23,6 +23,10 @@ describe("writeCodexTrace schema 8 cache-key decision", () => {
 		try {
 			writeCodexTrace({
 				codexInput: [],
+				requestId: "logical-1",
+				attemptId: "attempt-1",
+				attemptOrdinal: 2,
+				attemptCause: "model_fallback",
 				promptCacheKeySet: true,
 				promptCacheKeyId: "not-a-semantic-prefix",
 				cacheKeyMode: "session",
@@ -37,7 +41,11 @@ describe("writeCodexTrace schema 8 cache-key decision", () => {
 				readFileSync(join(dir, file as string), "utf8").trim(),
 			);
 			expect(record).toMatchObject({
-				trace_schema_version: 8,
+				trace_schema_version: 9,
+				request_id: "logical-1",
+				attempt_id: "attempt-1",
+				attempt_ordinal: 2,
+				attempt_cause: "model_fallback",
 				cache_key_assignment: "conversation",
 				cache_key_cohort_id: "0123456789abcdef",
 				conversation_id: "fedcba9876543210",
@@ -270,10 +278,28 @@ describe("summarizeCodexResponse (response phase)", () => {
 		expect(s.cache_hit_pct).toBe(100);
 	});
 
-	test("null cache hit pct when no input tokens seen", () => {
+	test("preserves missing usage as unavailable rather than measured zero", () => {
 		const s = summarizeCodexResponse([], {}, "end_turn");
 		expect(s.new_tool_call_count).toBe(0);
+		expect(s.usage_measurement_available).toBe(false);
+		expect(s.cache_measurement_available).toBe(false);
+		expect(s.input_tokens).toBeNull();
+		expect(s.output_tokens).toBeNull();
+		expect(s.cache_read_input_tokens).toBeNull();
+		expect(s.cache_creation_input_tokens).toBeNull();
 		expect(s.cache_hit_pct).toBeNull();
+	});
+
+	test("distinguishes measured zero cache usage from unavailable cache usage", () => {
+		const s = summarizeCodexResponse(
+			[],
+			{ input_tokens: 10, output_tokens: 0, cache_read_input_tokens: 0 },
+			"end_turn",
+		);
+		expect(s.usage_measurement_available).toBe(true);
+		expect(s.cache_measurement_available).toBe(true);
+		expect(s.cache_read_input_tokens).toBe(0);
+		expect(s.cache_hit_pct).toBe(0);
 	});
 
 	test("carries normalized upstream error details", () => {

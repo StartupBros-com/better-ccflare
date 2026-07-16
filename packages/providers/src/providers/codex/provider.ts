@@ -32,6 +32,10 @@ const log = new Logger("CodexProvider");
 
 const INTERNAL_HEADERS = [
 	"x-better-ccflare-request-id",
+	"x-better-ccflare-attempt-id",
+	"x-better-ccflare-attempt-ordinal",
+	"x-better-ccflare-attempt-cause",
+	"x-better-ccflare-final-model",
 	"x-better-ccflare-request-stream",
 	"x-better-ccflare-pacing-canary",
 	"x-better-ccflare-pacing-cohort-id",
@@ -379,6 +383,8 @@ interface StreamState {
 	outputTokens: number;
 	cacheReadInputTokens: number;
 	cacheCreationInputTokens: number;
+	usageMeasurementAvailable: boolean;
+	cacheMeasurementAvailable: boolean;
 	// Anthropic clients expect stop_reason=tool_use when the assistant emitted a tool call.
 	sawToolUse: boolean;
 	contextWindow: ContextWindow | null;
@@ -393,6 +399,48 @@ interface StreamState {
 	// Newly emitted tool calls from this response only (not historical replay).
 	traceNewToolCalls: ToolCallSummary[];
 	traceRequestId: string;
+	traceAttemptId?: string;
+	// One terminal response trace per physical attempt, across every terminal
+	// path (completed, failed, abrupt EOF, read error, downstream cancel).
+	terminalTraceWritten: boolean;
+}
+
+function writeCodexStreamTerminalTrace(
+	state: StreamState,
+	stopReason: "error" | "end_turn" | "tool_use" | "max_tokens" | "refusal",
+	error?: {
+		type: string;
+		message: string;
+		code?: string;
+		status?: string;
+	},
+): void {
+	if (state.terminalTraceWritten) return;
+	state.terminalTraceWritten = true;
+	writeCodexResponseTrace({
+		requestId: state.traceRequestId,
+		attemptId: state.traceAttemptId,
+		modelOut: state.model,
+		modelContextWindow: resolveModelContextCapability("codex", state.model)
+			?.rawContextWindow,
+		summary: summarizeCodexResponse(
+			state.traceNewToolCalls,
+			state.usageMeasurementAvailable
+				? {
+						input_tokens: state.totalInputTokens,
+						output_tokens: state.outputTokens,
+						...(state.cacheMeasurementAvailable
+							? {
+									cache_read_input_tokens: state.cacheReadInputTokens,
+									cache_creation_input_tokens: state.cacheCreationInputTokens,
+								}
+							: {}),
+					}
+				: {},
+			stopReason,
+			error,
+		),
+	});
 }
 
 export class CodexProvider extends BaseProvider {
@@ -553,6 +601,15 @@ export class CodexProvider extends BaseProvider {
 			}
 
 			const requestId = request.headers.get("x-better-ccflare-request-id");
+			const attemptId = request.headers.get("x-better-ccflare-attempt-id");
+			const attemptOrdinal = Number.parseInt(
+				request.headers.get("x-better-ccflare-attempt-ordinal") ?? "",
+				10,
+			);
+			const attemptCause = request.headers.get(
+				"x-better-ccflare-attempt-cause",
+			) as Parameters<typeof writeCodexTrace>[0]["attemptCause"];
+			const finalModel = request.headers.get("x-better-ccflare-final-model");
 			const isAttributedAgent =
 				request.headers.get("x-better-ccflare-attributed-agent") === "true";
 			if (requestId) {
@@ -576,10 +633,18 @@ export class CodexProvider extends BaseProvider {
 				// ChatGPT's subscription Responses endpoint rejects this API-only field.
 				delete codexBody.max_output_tokens;
 			}
+			// Model fallback is selected after provider conversion. Apply the final wire
+			// model before tracing so the record and body describe the same transport.
+			if (finalModel) codexBody.model = finalModel;
 
 			// Best-effort, env-gated observability (no-op unless CCFLARE_CODEX_TRACE_DIR set).
 			writeCodexTrace({
 				requestId: requestId ?? undefined,
+				attemptId: attemptId ?? undefined,
+				attemptOrdinal: Number.isFinite(attemptOrdinal)
+					? attemptOrdinal
+					: undefined,
+				attemptCause: attemptCause ?? undefined,
 				account: account?.name,
 				modelIn: body.model,
 				modelOut: codexBody.model,
@@ -619,6 +684,10 @@ export class CodexProvider extends BaseProvider {
 			);
 
 			newHeaders.delete("x-better-ccflare-request-id");
+			newHeaders.delete("x-better-ccflare-attempt-id");
+			newHeaders.delete("x-better-ccflare-attempt-ordinal");
+			newHeaders.delete("x-better-ccflare-attempt-cause");
+			newHeaders.delete("x-better-ccflare-final-model");
 			newHeaders.delete("x-better-ccflare-attributed-agent");
 			newHeaders.delete("x-better-ccflare-pacing-canary");
 			newHeaders.delete("x-better-ccflare-pacing-cohort-id");
@@ -653,6 +722,9 @@ export class CodexProvider extends BaseProvider {
 	): Promise<Response> {
 		const contentType = response.headers.get("content-type");
 		const requestId = response.headers.get("x-better-ccflare-request-id");
+		const attemptId = response.headers.get("x-better-ccflare-attempt-id");
+		const finalModel =
+			response.headers.get("x-better-ccflare-final-model") ?? undefined;
 		const headerRequestedStream = response.headers.get(
 			"x-better-ccflare-request-stream",
 		);
@@ -673,9 +745,16 @@ export class CodexProvider extends BaseProvider {
 				return this.transformStreamingResponse(
 					response,
 					requestId ?? undefined,
+					attemptId ?? undefined,
+					finalModel,
 				);
 			}
-			return this.transformSseResponseToJson(response, requestId ?? undefined);
+			return this.transformSseResponseToJson(
+				response,
+				requestId ?? undefined,
+				attemptId ?? undefined,
+				finalModel,
+			);
 		}
 
 		if (response.ok && response.body !== null && contentType === null) {
@@ -693,14 +772,34 @@ export class CodexProvider extends BaseProvider {
 				return this.transformStreamingResponse(
 					sseResponse,
 					requestId ?? undefined,
+					attemptId ?? undefined,
+					finalModel,
 				);
 			}
 			return this.transformSseResponseToJson(
 				sseResponse,
 				requestId ?? undefined,
+				attemptId ?? undefined,
+				finalModel,
 			);
 		}
 
+		writeCodexResponseTrace({
+			requestId: requestId ?? "unknown",
+			attemptId: attemptId ?? undefined,
+			modelOut: finalModel ?? "unknown",
+			summary: summarizeCodexResponse(
+				[],
+				{},
+				response.ok ? "end_turn" : "error",
+				response.ok
+					? undefined
+					: {
+							type: `http_${response.status}`,
+							message: response.statusText || `HTTP ${response.status}`,
+						},
+			),
+		});
 		const headers = sanitizeResponseHeaders(response.headers);
 		return new Response(response.body, {
 			status: response.status,
@@ -1344,8 +1443,17 @@ export class CodexProvider extends BaseProvider {
 		response: Response,
 		requestId = response.headers.get("x-better-ccflare-request-id") ??
 			"unknown",
+		attemptId = response.headers.get("x-better-ccflare-attempt-id") ??
+			undefined,
+		finalModel = response.headers.get("x-better-ccflare-final-model") ??
+			undefined,
 	): Promise<Response> {
-		const transformed = this.transformStreamingResponse(response, requestId);
+		const transformed = this.transformStreamingResponse(
+			response,
+			requestId,
+			attemptId,
+			finalModel,
+		);
 		const reader = transformed.body
 			?.pipeThrough(new TextDecoderStream())
 			.getReader();
@@ -1542,16 +1650,15 @@ export class CodexProvider extends BaseProvider {
 		response: Response,
 		requestId = response.headers.get("x-better-ccflare-request-id") ??
 			"unknown",
+		attemptId = response.headers.get("x-better-ccflare-attempt-id") ??
+			undefined,
+		finalModel = response.headers.get("x-better-ccflare-final-model") ??
+			"unknown",
 	): Response {
-		if (process.env.DEBUG?.includes("model") || process.env.DEBUG === "true") {
-			log.info(
-				`[codex:model-debug] request_id=${requestId} transformStreamingResponse initial fallback model=gpt-5.4 until response.created arrives`,
-			);
-		}
 		const state: StreamState = {
 			buffer: "",
 			messageId: `msg_${crypto.randomUUID().replace(/-/g, "").substring(0, 24)}`,
-			model: "gpt-5.4",
+			model: finalModel,
 			contentBlockIndex: 0,
 			hasSentMessageStart: false,
 			hasSentContentBlockStart: false,
@@ -1561,21 +1668,74 @@ export class CodexProvider extends BaseProvider {
 			outputTokens: 0,
 			cacheReadInputTokens: 0,
 			cacheCreationInputTokens: 0,
+			usageMeasurementAvailable: false,
+			cacheMeasurementAvailable: false,
 			contextWindow: null,
 			functionCallBlocks: new Map(),
 			sawToolUse: false,
 			traceNewToolCalls: [],
 			traceRequestId: requestId,
+			traceAttemptId: attemptId,
+			terminalTraceWritten: false,
 		};
 
 		const headers = sanitizeResponseHeaders(response.headers);
 		headers.set("content-type", "text/event-stream");
 
-		const { readable, writable } = new TransformStream<
-			Uint8Array,
-			Uint8Array
-		>();
-		const writer = writable.getWriter();
+		const upstreamReader = response.body?.getReader();
+		let downstreamController: ReadableStreamDefaultController<Uint8Array>;
+		let cancelled = false;
+		let pullWaiters: Array<() => void> = [];
+		const releasePullWaiters = () => {
+			const waiters = pullWaiters;
+			pullWaiters = [];
+			for (const waiter of waiters) waiter();
+		};
+		const awaitDownstreamCapacity = async () => {
+			while (!cancelled && (downstreamController.desiredSize ?? 1) <= 0) {
+				await new Promise<void>((resolve) => {
+					pullWaiters.push(resolve);
+				});
+			}
+		};
+		const writeTerminalTrace = (
+			error?: {
+				type: string;
+				message: string;
+				code?: string;
+				status?: string;
+			},
+			stopReason:
+				| "error"
+				| "end_turn"
+				| "tool_use"
+				| "max_tokens"
+				| "refusal" = "error",
+		) => {
+			if (state.terminalTraceWritten) return;
+			state.hasSentTerminalEvents = true;
+			writeCodexStreamTerminalTrace(state, stopReason, error);
+		};
+		const readable = new ReadableStream<Uint8Array>({
+			start(controller) {
+				downstreamController = controller;
+			},
+			pull() {
+				releasePullWaiters();
+			},
+			async cancel(reason) {
+				cancelled = true;
+				writeTerminalTrace({
+					type: "downstream_cancelled",
+					message:
+						typeof reason === "string" && reason
+							? reason
+							: "Downstream response was cancelled",
+				});
+				releasePullWaiters();
+				await upstreamReader?.cancel(reason).catch(() => undefined);
+			},
+		});
 		const encoder = new TextEncoder();
 		const decoder = new TextDecoder();
 
@@ -1619,8 +1779,10 @@ export class CodexProvider extends BaseProvider {
 				}
 				payload.delta = delta;
 			}
+			await awaitDownstreamCapacity();
+			if (cancelled) throw new Error("Downstream response was cancelled");
 			const line = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-			await writer.write(encoder.encode(line));
+			downstreamController.enqueue(encoder.encode(line));
 		};
 		const ensureMessageStart = async () => {
 			if (state.hasSentMessageStart) return;
@@ -1653,11 +1815,10 @@ export class CodexProvider extends BaseProvider {
 
 		const processEvents = async () => {
 			try {
-				const reader = response.body?.getReader();
-				if (!reader) throw new Error("Response body is not readable");
+				if (!upstreamReader) throw new Error("Response body is not readable");
 
 				while (true) {
-					const { value, done } = await reader.read();
+					const { value, done } = await upstreamReader.read();
 					if (done) break;
 
 					state.buffer += decoder.decode(value, { stream: true });
@@ -1716,40 +1877,55 @@ export class CodexProvider extends BaseProvider {
 					});
 				}
 
-				// Final message_delta + message_stop if upstream never sent response.completed
 				if (!state.hasSentTerminalEvents) {
-					const stopReason = state.sawToolUse ? "tool_use" : "end_turn";
-					await writeSSE("message_delta", {
-						type: "message_delta",
-						delta: {
-							stop_reason: stopReason,
-							stop_sequence: null,
-						},
-						usage: { output_tokens: state.outputTokens },
+					const abruptError = {
+						type: "abrupt_stream_eof",
+						message:
+							"Codex upstream stream ended before a terminal response event.",
+					};
+					await writeSSE("error", {
+						type: "error",
+						error: abruptError,
+						model: state.model,
 					});
-					writeCodexResponseTrace({
-						requestId,
-						modelOut: state.model,
-						modelContextWindow: resolveModelContextCapability(
-							"codex",
-							state.model,
-						)?.rawContextWindow,
-						summary: summarizeCodexResponse(
-							state.traceNewToolCalls,
-							{ output_tokens: state.outputTokens },
-							stopReason,
-						),
-					});
-					await writeSSE("message_stop", { type: "message_stop" });
+					writeTerminalTrace(abruptError);
 				}
 			} catch (error) {
-				log.error("Error processing Codex SSE stream:", error);
+				if (!cancelled) {
+					log.error("Error processing Codex SSE stream:", error);
+					const streamError = {
+						type: "upstream_stream_read_error",
+						message:
+							error instanceof Error
+								? error.message
+								: "Codex upstream stream processing failed",
+					};
+					try {
+						if (!state.hasSentMessageStart) {
+							await ensureMessageStart();
+						}
+						if (!state.hasSentTerminalEvents) {
+							await writeSSE("error", {
+								type: "error",
+								error: streamError,
+								model: state.model,
+							});
+						}
+					} catch {
+						// Downstream may already be cancelled or closed.
+					}
+					writeTerminalTrace(streamError);
+				}
+				await upstreamReader?.cancel(error).catch(() => undefined);
 			} finally {
-				await writer.close();
+				upstreamReader?.releaseLock();
+				if (!cancelled) downstreamController.close();
 			}
 		};
 
-		processEvents();
+		void processEvents().catch((error) => {
+			log.error("Unhandled Codex SSE processing failure:", error);
+		});
 
 		return new Response(readable, {
 			status: response.status,
@@ -1889,6 +2065,46 @@ export class CodexProvider extends BaseProvider {
 		switch (eventName) {
 			case "response.created": {
 				const resp = data.response as Record<string, unknown> | undefined;
+				const usage = resp?.usage as
+					| {
+							input_tokens?: number;
+							output_tokens?: number;
+							input_tokens_details?: {
+								cached_tokens?: number;
+								cache_creation_input_tokens?: number;
+							};
+					  }
+					| undefined;
+				if (usage) {
+					state.usageMeasurementAvailable =
+						typeof usage.input_tokens === "number";
+					state.cacheMeasurementAvailable =
+						state.usageMeasurementAvailable &&
+						typeof usage.input_tokens_details?.cached_tokens === "number";
+					const normalized = normalizeCodexInputUsage(
+						usage.input_tokens,
+						usage.input_tokens_details?.cached_tokens,
+					);
+					state.totalInputTokens = normalized.totalInputTokens;
+					state.inputTokens = normalized.inputTokens;
+					state.cacheReadInputTokens = normalized.cacheReadInputTokens;
+					if (
+						typeof usage.output_tokens === "number" &&
+						Number.isFinite(usage.output_tokens) &&
+						usage.output_tokens >= 0
+					) {
+						state.outputTokens = usage.output_tokens;
+					}
+					const cacheCreation =
+						usage.input_tokens_details?.cache_creation_input_tokens;
+					if (
+						typeof cacheCreation === "number" &&
+						Number.isFinite(cacheCreation) &&
+						cacheCreation >= 0
+					) {
+						state.cacheCreationInputTokens = cacheCreation;
+					}
+				}
 				const respId = (resp?.id as string) || state.messageId;
 				state.messageId = respId;
 				state.model = (resp?.model as string) || state.model;
@@ -2071,6 +2287,11 @@ export class CodexProvider extends BaseProvider {
 							};
 					  }
 					| undefined;
+				state.usageMeasurementAvailable =
+					typeof usage?.input_tokens === "number";
+				state.cacheMeasurementAvailable =
+					state.usageMeasurementAvailable &&
+					typeof usage?.input_tokens_details?.cached_tokens === "number";
 				if (usage) {
 					const details = usage.input_tokens_details;
 					const normalized = normalizeCodexInputUsage(
@@ -2098,6 +2319,9 @@ export class CodexProvider extends BaseProvider {
 				state.contextWindow = this.extractContextWindow(response, usage);
 				state.upstreamError = this.normalizeCodexStreamError(eventName, data);
 				if (!state.hasSentTerminalEvents) {
+					// Claim the terminal trace before awaiting downstream writes so a
+					// cancellation race cannot record two terminals for one attempt.
+					writeCodexStreamTerminalTrace(state, "error", state.upstreamError);
 					if (state.hasSentContentBlockStart) {
 						await writeSSE("content_block_stop", {
 							type: "content_block_stop",
@@ -2110,25 +2334,6 @@ export class CodexProvider extends BaseProvider {
 						"error",
 						this.toAnthropicErrorPayload(state.upstreamError),
 					);
-					writeCodexResponseTrace({
-						requestId: state.traceRequestId,
-						modelOut: state.model,
-						modelContextWindow: resolveModelContextCapability(
-							"codex",
-							state.model,
-						)?.rawContextWindow,
-						summary: summarizeCodexResponse(
-							state.traceNewToolCalls,
-							{
-								input_tokens: state.totalInputTokens,
-								output_tokens: state.outputTokens,
-								cache_read_input_tokens: state.cacheReadInputTokens,
-								cache_creation_input_tokens: state.cacheCreationInputTokens,
-							},
-							"error",
-							state.upstreamError,
-						),
-					});
 					state.hasSentTerminalEvents = true;
 				}
 				break;
@@ -2150,6 +2355,11 @@ export class CodexProvider extends BaseProvider {
 					| undefined;
 
 				const inputTokenDetails = usage?.input_tokens_details;
+				state.usageMeasurementAvailable =
+					typeof usage?.input_tokens === "number";
+				state.cacheMeasurementAvailable =
+					state.usageMeasurementAvailable &&
+					typeof inputTokenDetails?.cached_tokens === "number";
 				const normalizedInput = normalizeCodexInputUsage(
 					usage?.input_tokens,
 					inputTokenDetails?.cached_tokens,
@@ -2230,25 +2440,8 @@ export class CodexProvider extends BaseProvider {
 					messageDelta.context_window = state.contextWindow;
 				}
 
+				writeCodexStreamTerminalTrace(state, messageDelta.delta.stop_reason);
 				await writeSSE("message_delta", messageDelta);
-				writeCodexResponseTrace({
-					requestId: state.traceRequestId,
-					modelOut: state.model,
-					modelContextWindow: resolveModelContextCapability(
-						"codex",
-						state.model,
-					)?.rawContextWindow,
-					summary: summarizeCodexResponse(
-						state.traceNewToolCalls,
-						{
-							input_tokens: state.totalInputTokens,
-							output_tokens: state.outputTokens,
-							cache_read_input_tokens: state.cacheReadInputTokens,
-							cache_creation_input_tokens: state.cacheCreationInputTokens,
-						},
-						messageDelta.delta.stop_reason,
-					),
-				});
 				await writeSSE("message_stop", { type: "message_stop" });
 				state.hasSentTerminalEvents = true;
 				break;
