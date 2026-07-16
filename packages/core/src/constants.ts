@@ -201,8 +201,49 @@ export const BUFFER_SIZES = {
 	// size as the stream usage buffer, while an unterminated buffered tail
 	// (no delimiter seen yet) is allowed to grow up to the max request body
 	// size before it is treated as a runaway stream.
+	// Kept as-is for backward compatibility: some non-SSE-transport
+	// consumers still reuse this value as a tool-argument cap today. New
+	// code should use the explicitly named policy constants below instead
+	// of reusing SSE_FRAME_MAX_BYTES for a purpose other than the SSE
+	// transport frame cap it was originally sized for.
 	SSE_FRAME_MAX_BYTES: 64 * 1024, // Matches STREAM_USAGE_BUFFER_BYTES
 	SSE_BUFFER_MAX_BYTES: 4 * 1024 * 1024, // Matches MAX_REQUEST_BODY_BYTES (usage-collector.ts / response-handler.ts)
+
+	// Stream resource policies. Each cap below bounds one distinct kind of
+	// resource growth (see StreamResourceLimitKind in sse-frame-buffer.ts)
+	// and is set independently: they used to collapse onto a single 64KB
+	// constant by accident, which meant an ordinary large SSE transport
+	// frame (e.g. a 110KB+ frame seen from real upstream traffic) tripped
+	// the same cap meant for a runaway tool-call argument buffer.
+
+	// SSE transport frame cap: the size of a single complete SSE frame (the
+	// text between blank-line delimiters) as received from upstream. Sized
+	// with roughly 38x headroom over the largest complete frame observed in
+	// the field (110,079 bytes) so legitimate agent-context-sized frames are
+	// accepted, while still bounding worst-case memory for one frame.
+	SSE_TRANSPORT_FRAME_MAX_BYTES: 4 * 1024 * 1024, // 4MiB
+
+	// SSE transport tail cap: bytes buffered while a frame delimiter has not
+	// arrived yet. Tracked as its own policy, independent from the frame
+	// cap above, so a stalled/never-arriving delimiter and an oversized
+	// complete frame are attributed to distinct failure kinds even though
+	// they currently share the same byte ceiling.
+	SSE_TRANSPORT_TAIL_MAX_BYTES: 4 * 1024 * 1024, // 4MiB
+
+	// Tool call argument cap, per individual tool call: bounds the streamed
+	// argument JSON accumulated for one tool_use / function_call block.
+	TOOL_ARGUMENTS_PER_CALL_MAX_BYTES: 64 * 1024, // 64KiB
+
+	// Tool call argument cap, aggregated across every tool call in one
+	// response (used by the Codex provider, which can have several tool
+	// calls open concurrently that each individually stay under the
+	// per-call cap but together still grow buffered memory without bound).
+	TOOL_ARGUMENTS_TOTAL_MAX_BYTES: 64 * 1024, // 64KiB
+
+	// Translated output total cap: bounds the cumulative bytes of
+	// translated (post-SSE-parsing) text produced for a single response,
+	// independent of any individual frame or tail size.
+	TRANSLATED_OUTPUT_TOTAL_MAX_BYTES: 4 * 1024 * 1024, // 4MiB
 } as const;
 
 // Network constants

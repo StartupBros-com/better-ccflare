@@ -92,6 +92,8 @@ export {
 	SseFrameBuffer,
 	type SseFrameBufferOptions,
 	SseLimitError,
+	StreamResourceLimitError,
+	type StreamResourceLimitKind,
 } from "./sse-frame-buffer";
 export * from "./strategy";
 export {

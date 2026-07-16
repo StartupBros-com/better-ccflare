@@ -15,13 +15,62 @@ const FRAME_DELIMITER = /\r?\n\r?\n/;
 
 const encoder = new TextEncoder();
 
-export class SseLimitError extends Error {
+/**
+ * Discriminant for every kind of stream resource limit this codebase
+ * enforces. `sse_frame` and `sse_tail` are raised by SseFrameBuffer itself
+ * (the parser layer, see SseLimitError below); `translated_output_total`,
+ * `tool_arguments_per_call`, and `tool_arguments_total` are raised by
+ * translators accumulating semantic output derived from parsed frames, not
+ * by the parser. Keeping these as one shared discriminant lets a caller
+ * catch StreamResourceLimitError once and branch on `kind`, instead of
+ * needing separate catch clauses per limit.
+ */
+export type StreamResourceLimitKind =
+	| "sse_frame"
+	| "sse_tail"
+	| "translated_output_total"
+	| "tool_arguments_per_call"
+	| "tool_arguments_total";
+
+/**
+ * Shared base for every stream resource limit failure. Carries the exact
+ * kind of limit tripped plus its limit/actual byte counts, deliberately
+ * never the payload itself: the message and fields are safe to log without
+ * risking sensitive stream content leaking into logs or error reports.
+ */
+export class StreamResourceLimitError extends Error {
 	constructor(
 		message: string,
+		public readonly kind: StreamResourceLimitKind,
 		public readonly limitBytes: number,
 		public readonly actualBytes: number,
 	) {
 		super(message);
+		this.name = "StreamResourceLimitError";
+	}
+}
+
+/**
+ * Parser-specific compatibility surface: raised only by SseFrameBuffer, for
+ * a complete-frame (`sse_frame`) or unterminated-tail (`sse_tail`)
+ * violation. Kept as its own subclass of StreamResourceLimitError, rather
+ * than having callers catch the base directly, so existing
+ * `instanceof SseLimitError` catch sites and the historical 3-argument
+ * constructor keep working unchanged. `kind` defaults to `sse_frame` for
+ * compatibility with call sites written before this discriminant existed;
+ * SseFrameBuffer itself always passes it explicitly.
+ */
+export class SseLimitError extends StreamResourceLimitError {
+	constructor(
+		message: string,
+		limitBytes: number,
+		actualBytes: number,
+		kind: Extract<
+			StreamResourceLimitKind,
+			"sse_frame" | "sse_tail"
+		> = "sse_frame",
+	) {
+		super(message, kind, limitBytes, actualBytes);
 		this.name = "SseLimitError";
 	}
 }
@@ -135,6 +184,7 @@ export class SseFrameBuffer {
 					`SSE frame of ${frameBytes} bytes exceeds the ${this.maxFrameBytes} byte cap`,
 					this.maxFrameBytes,
 					frameBytes,
+					"sse_frame",
 				);
 			}
 
@@ -166,6 +216,7 @@ export class SseFrameBuffer {
 				`Unterminated SSE buffer of ${this.tailBytes} bytes exceeds the ${this.maxBufferBytes} byte cap`,
 				this.maxBufferBytes,
 				this.tailBytes,
+				"sse_tail",
 			);
 		}
 
@@ -177,12 +228,33 @@ export class SseFrameBuffer {
 	 * at stream EOF. This content was never a complete frame, so the
 	 * per-frame cap does not apply to it (the tail cap already bounded it on
 	 * the most recent push()).
+	 *
+	 * The tail cap IS rechecked here, after the decoder's final (non-
+	 * streaming) decode() call. That final call can append bytes that were
+	 * never seen by push(): a multi-byte UTF-8 sequence split by the
+	 * underlying transport so only its lead byte(s) arrived is held
+	 * internally by TextDecoder in streaming mode (decode() returns "" for
+	 * it, so push() never counts it against tailBytes) and is only
+	 * materialized, as a replacement character, once flush() calls
+	 * decode() without { stream: true }. Skipping the recheck here would
+	 * let those trailing bytes bypass the tail cap entirely.
 	 */
 	flush(): string {
 		const tail = this.decoder.decode();
 		if (tail.length > 0) {
+			this.tailBytes += encoder.encode(tail).length;
 			this.parts.push(tail);
 		}
+
+		if (this.tailBytes > this.maxBufferBytes) {
+			throw new SseLimitError(
+				`Unterminated SSE buffer of ${this.tailBytes} bytes exceeds the ${this.maxBufferBytes} byte cap`,
+				this.maxBufferBytes,
+				this.tailBytes,
+				"sse_tail",
+			);
+		}
+
 		const remainder = this.parts.join("");
 		this.parts = [];
 		this.carry = "";
