@@ -251,9 +251,18 @@ function configureSqlite(db: Database, config: DatabaseConfig): void {
 		db.run("PRAGMA temp_store = MEMORY");
 		db.run("PRAGMA foreign_keys = ON");
 
-		// Add checkpoint interval for WAL mode (1000 pages = ~4MB with 4KB pages)
-		// Higher threshold reduces checkpoint frequency for better throughput under high traffic
-		db.run("PRAGMA wal_autocheckpoint = 1000");
+		// WAL checkpointing is handled entirely OFF the main thread: disable
+		// autocheckpoint on this (the main, writer) connection. Autocheckpoint
+		// runs a synchronous PASSIVE checkpoint inside the committing connection
+		// whenever the WAL crosses the threshold; because PASSIVE can't reset the
+		// WAL while any reader (analytics worker, usage pollers) holds frames, the
+		// WAL grows large and each such checkpoint does hundreds of ms of
+		// synchronous I/O on the main thread, freezing the event loop (observed
+		// as ~250-290ms "Event loop blocked" WARNs). With autocheckpoint off, the
+		// off-thread optimize tick reclaims the WAL via wal_checkpoint(TRUNCATE)
+		// with busy_timeout=0, which never blocks the loop (see runOptimize in
+		// incremental-vacuum-worker.ts).
+		db.run("PRAGMA wal_autocheckpoint = 0");
 	} catch (error) {
 		console.error("Database configuration failed:", error);
 		throw new Error(`Failed to configure SQLite database: ${error}`);
@@ -1377,8 +1386,11 @@ OAuth tokens will need to be re-authenticated.
 	}
 
 	/**
-	 * Periodic `PRAGMA optimize` + `PRAGMA wal_checkpoint(PASSIVE)` (SQLite
+	 * Periodic `PRAGMA optimize` + `PRAGMA wal_checkpoint(TRUNCATE)` (SQLite
 	 * only), off-loaded to the incremental-vacuum worker (kind "optimize").
+	 * This is the sole WAL reclaimer: the main connection runs with
+	 * `wal_autocheckpoint = 0` (see `configureSqlite` above), so no checkpoint
+	 * I/O ever happens synchronously on the request hot path.
 	 *
 	 * Why a worker: the previous synchronous version ran both PRAGMAs on the
 	 * main thread via `sqliteDb.exec()`. When another connection (e.g. the
@@ -1390,7 +1402,7 @@ OAuth tokens will need to be re-authenticated.
 	 * that doesn't belong on the proxy's hot path.
 	 *
 	 * The worker connection uses `busy_timeout = 0`, so contention resolves
-	 * instantly as `{ ok: true, skipped: true }`, skipping one 5-minute
+	 * instantly as `{ ok: true, skipped: true }`, skipping one 60-second
 	 * cycle while maintenance contends is normal; the next tick retries.
 	 *
 	 * Never throws for worker-reported failures; they come back as

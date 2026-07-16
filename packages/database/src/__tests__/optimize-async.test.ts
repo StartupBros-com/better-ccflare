@@ -49,7 +49,7 @@ describe("DatabaseOperations.optimizeAsync", () => {
 	});
 
 	it("resolves ok (not skipped) on an idle DB and checkpoints the WAL", async () => {
-		// Grow the WAL a bit so the PASSIVE checkpoint has frames to flush.
+		// Grow the WAL a bit so the checkpoint has frames to flush.
 		const writer = new Database(dbPath);
 		try {
 			writer.exec(
@@ -68,6 +68,34 @@ describe("DatabaseOperations.optimizeAsync", () => {
 		expect(result.skipped).toBe(false);
 		expect(result.error).toBeUndefined();
 		expect(result.durationMs).toBeGreaterThanOrEqual(0);
+	});
+
+	it("checkpoints with TRUNCATE (not PASSIVE), zeroing the WAL on an idle DB", async () => {
+		// Regression for the wal_autocheckpoint=0 migration: the main
+		// connection no longer checkpoints on its own, so the off-thread
+		// optimize tick is the SOLE reclaimer and must actively zero the WAL
+		// (TRUNCATE) rather than merely flush frames without resetting the
+		// file (PASSIVE), or the WAL would grow unbounded.
+		const writer = new Database(dbPath);
+		try {
+			writer.exec(
+				"CREATE TABLE IF NOT EXISTS optimize_truncate_smoke (id INTEGER PRIMARY KEY, v TEXT)",
+			);
+			const ins = writer.prepare(
+				"INSERT INTO optimize_truncate_smoke (v) VALUES (?)",
+			);
+			for (let i = 0; i < 500; i++) ins.run(`val-${i}`);
+		} finally {
+			writer.close();
+		}
+		expect(await dbOps.getWalSizeBytes()).toBeGreaterThan(0);
+
+		// No open readers/writers at this point, so TRUNCATE can fully reclaim.
+		const result = await dbOps.optimizeAsync();
+		expect(result.ok).toBe(true);
+		expect(result.skipped).toBe(false);
+
+		expect(await dbOps.getWalSizeBytes()).toBe(0);
 	});
 
 	it("returns skipped:true quickly when another connection holds the write lock (regression: 10s event-loop freeze)", async () => {
