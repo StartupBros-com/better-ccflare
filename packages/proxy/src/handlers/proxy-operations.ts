@@ -408,6 +408,58 @@ function materializeSyntheticResponse(request: Request): Response {
 }
 
 /**
+ * Removes context-management edits that require thinking to be enabled,
+ * e.g. clear_thinking_20251015. Claude rejects requests that pair such an
+ * edit with thinking disabled:
+ * 400 "`clear_thinking_20251015` strategy requires `thinking` to be enabled or adaptive"
+ * @param body - Parsed request body, mutated in place (top-level key only)
+ * @returns True if any edit was removed
+ */
+function stripClearThinkingEdits(body: Record<string, unknown>): boolean {
+	const contextManagement = body.context_management;
+	if (!contextManagement || typeof contextManagement !== "object") {
+		return false;
+	}
+	const edits = (contextManagement as Record<string, unknown>).edits;
+	if (!Array.isArray(edits)) return false;
+
+	const keptEdits = edits.filter((edit) => {
+		const editType =
+			edit && typeof edit === "object"
+				? (edit as Record<string, unknown>).type
+				: undefined;
+		return (
+			typeof editType !== "string" || !editType.startsWith("clear_thinking")
+		);
+	});
+	if (keptEdits.length === edits.length) return false;
+
+	if (keptEdits.length > 0) {
+		body.context_management = { ...contextManagement, edits: keptEdits };
+	} else {
+		delete body.context_management;
+	}
+	return true;
+}
+
+/**
+ * Checks whether the request body explicitly disables thinking, for the
+ * purposes of clear_thinking context-management edits. Conservative on
+ * purpose: only `thinking.type === "disabled"` counts. An omitted thinking
+ * field is ambiguous, model families with default-on thinking accept
+ * clear_thinking edits without any thinking config, so those requests pass
+ * through untouched and the reactive clear_thinking retry handles the models
+ * that reject them.
+ */
+function isThinkingExplicitlyDisabled(
+	body: Readonly<Record<string, unknown>>,
+): boolean {
+	const thinking = body.thinking;
+	if (!thinking || typeof thinking !== "object") return false;
+	return (thinking as Record<string, unknown>).type === "disabled";
+}
+
+/**
  * Filters thinking blocks from request body
  * Used when Claude rejects thinking blocks with invalid signatures from other providers
  * @param requestBodyBuffer - The original request body buffer
@@ -525,6 +577,10 @@ function filterThinkingBlocks(
 				// This prevents Claude from requiring the final message to start with thinking
 				thinking: undefined,
 			};
+			// With thinking now disabled, any clear_thinking context-management
+			// edit would make Claude reject the retried request outright
+			// (400 "requires `thinking` to be enabled or adaptive"), so drop it too.
+			stripClearThinkingEdits(filteredBody);
 			return RequestBodyContext.fromParsed(
 				requestBodyBuffer,
 				filteredBody,
@@ -577,6 +633,76 @@ async function isInvalidThinkingSignatureError(
 	}
 
 	return false;
+}
+
+/**
+ * Checks if a 400 is Claude rejecting a clear_thinking context-management
+ * edit because thinking is not enabled on the request, e.g.
+ * "`clear_thinking_20251015` strategy requires `thinking` to be enabled or adaptive".
+ * Claude Code can send this combination after a mid-session model switch
+ * (safeguard fallback), and it repeats on every turn, wedging the session.
+ * @param response - The response to check
+ * @returns True if the error is the clear_thinking/thinking mismatch
+ */
+async function isClearThinkingRequiresThinkingError(
+	response: Response,
+): Promise<boolean> {
+	if (response.status !== 400) return false;
+
+	try {
+		const contentType = response.headers.get("content-type");
+		if (!contentType?.includes("application/json")) return false;
+
+		const json = await response.clone().json();
+
+		if (json.error?.message && typeof json.error.message === "string") {
+			const message = json.error.message;
+			return (
+				message.includes("clear_thinking") &&
+				message.includes("requires `thinking` to be enabled")
+			);
+		}
+	} catch {
+		// Ignore parse errors
+	}
+
+	return false;
+}
+
+/**
+ * Removes clear_thinking context-management edits from the request body
+ * without touching messages or the thinking config. Used when the client
+ * itself sent a clear_thinking edit on a request without thinking enabled.
+ * @param requestBody - The original request body buffer or context
+ * @returns New buffer without the edits, the original buffer if there was
+ * nothing to strip, or null if the body cannot be processed
+ */
+function filterClearThinkingEdits(
+	requestBody: ArrayBuffer | RequestBodyContext | null,
+): ArrayBuffer | null {
+	const bodyContext =
+		requestBody instanceof RequestBodyContext
+			? requestBody
+			: new RequestBodyContext(requestBody);
+	const requestBodyBuffer = bodyContext.getBuffer();
+	if (!requestBodyBuffer) return null;
+
+	try {
+		const body = bodyContext.getParsedJson();
+		if (!body) return null;
+
+		const strippedBody = { ...body };
+		if (!stripClearThinkingEdits(strippedBody)) {
+			return requestBodyBuffer;
+		}
+		return RequestBodyContext.fromParsed(
+			requestBodyBuffer,
+			strippedBody,
+		).getBuffer();
+	} catch (error) {
+		log.warn("Failed to filter clear_thinking context edits:", error);
+		return null;
+	}
 }
 
 /**
@@ -920,6 +1046,30 @@ export async function proxyWithAccount(
 		// Validate that the account-specific provider can handle this path
 		validateProviderPath(provider, url.pathname);
 
+		const isClaudeProvider =
+			provider.name === "anthropic" || account.provider === "claude-oauth";
+
+		// Pre-send guard: a clear_thinking context-management edit combined with
+		// explicit `thinking.type === "disabled"` is deterministically rejected
+		// by Claude with 400 "requires `thinking` to be enabled or adaptive", so
+		// strip the edit up front instead of paying a guaranteed rejection
+		// round-trip. An omitted thinking field is left alone: default-thinking
+		// model families accept the edit as-is, and the reactive retry further
+		// down unwedges the ones that reject it.
+		if (isClaudeProvider && effectiveBodyBuffer) {
+			const parsedBody = effectiveBodyContext.getParsedJson();
+			if (parsedBody && isThinkingExplicitlyDisabled(parsedBody)) {
+				const strippedBuffer = filterClearThinkingEdits(effectiveBodyContext);
+				if (strippedBuffer && strippedBuffer !== effectiveBodyBuffer) {
+					log.info(
+						`Stripped clear_thinking context edit sent without thinking enabled for account ${account.name}`,
+					);
+					effectiveBodyContext = new RequestBodyContext(strippedBuffer);
+					effectiveBodyBuffer = strippedBuffer;
+				}
+			}
+		}
+
 		const isSyntheticCodexCountTokens =
 			provider.name === "codex" && url.pathname === "/v1/messages/count_tokens";
 
@@ -1215,8 +1365,6 @@ export async function proxyWithAccount(
 			: await makeProxyRequest(transformedRequest);
 
 		// Check if this is a Claude provider and we got an invalid thinking signature error
-		const isClaudeProvider =
-			provider.name === "anthropic" || account.provider === "claude-oauth";
 		if (
 			isClaudeProvider &&
 			(await isInvalidThinkingSignatureError(rawResponse))
@@ -1260,6 +1408,53 @@ export async function proxyWithAccount(
 			} else {
 				log.warn(
 					"Failed to filter thinking blocks or no changes made, proceeding with original error response",
+				);
+			}
+		}
+
+		// Claude rejects requests that pair a clear_thinking context-management
+		// edit with thinking disabled (400 "`clear_thinking_20251015` strategy
+		// requires `thinking` to be enabled or adaptive"). Claude Code sends this
+		// combination after a mid-session model switch and repeats it on every
+		// turn, so the session stays wedged unless the edit is dropped. Retry
+		// once with the offending edits removed; everything else is preserved.
+		if (
+			isClaudeProvider &&
+			(await isClearThinkingRequiresThinkingError(rawResponse))
+		) {
+			const strippedBodyBuffer = filterClearThinkingEdits(effectiveBodyContext);
+
+			if (strippedBodyBuffer && strippedBodyBuffer !== effectiveBodyBuffer) {
+				log.info(
+					`Claude rejected clear_thinking context edit without thinking enabled for account ${account.name}, retrying with the edit removed`,
+				);
+				const retryRequestInit: RequestInit & { duplex?: "half" } = {
+					method: req.method,
+					headers,
+					body: new Uint8Array(strippedBodyBuffer),
+					duplex: "half",
+				};
+
+				await finalizeCurrentCodexTransport(rawResponse);
+				await discardUpstreamBody(rawResponse);
+				stampCodexAttempt(headers, "other_retry");
+				const retryProviderRequest = new Request(targetUrl, retryRequestInit);
+				retrySourceRequest = retryProviderRequest.clone();
+
+				const retryTransformedRequest = provider.transformRequestBody
+					? await provider.transformRequestBody(retryProviderRequest, account)
+					: retryProviderRequest;
+				retryTransformedTemplate = retryTransformedRequest.clone();
+
+				const retryTransportRequest = sanitizeInternalTransportHeaders(
+					retryTransformedTemplate.clone(),
+				);
+				rawResponse = isSyntheticProviderResponse(retryTransformedRequest)
+					? materializeSyntheticResponse(retryTransformedRequest)
+					: await makeProxyRequest(retryTransportRequest);
+			} else {
+				log.warn(
+					"No clear_thinking context edits to strip or filtering failed, proceeding with original error response",
 				);
 			}
 		}
