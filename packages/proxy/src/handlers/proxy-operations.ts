@@ -1,4 +1,5 @@
 import {
+	getInPlaceRetryDrainTimeoutMs,
 	getModelList,
 	getOverloadRetryConfig,
 	isOfficialXaiEndpoint,
@@ -699,9 +700,16 @@ export async function discardUpstreamBody(
 	const body = response?.body;
 	if (!body || body.locked) return;
 	try {
-		await body.cancel();
+		// Fire without awaiting settlement: per the Streams spec, cancelling
+		// one branch of a tee()'d body never settles until every sibling
+		// branch is cancelled or fully read, so awaiting here can hang
+		// forever if a sibling clone was abandoned (same rationale as
+		// discardUnusedResponse below).
+		body.cancel().catch(() => {
+			// Body already cancelled/errored -- nothing left to release.
+		});
 	} catch {
-		// Body already cancelled/errored -- nothing left to release.
+		// Body may already be locked/disturbed; ignore synchronous throws too.
 	}
 }
 
@@ -1098,6 +1106,77 @@ export async function proxyWithAccount(
 						error instanceof Error ? error.message : String(error)
 					}`,
 				);
+			}
+		};
+		// Some providers (currently Codex) return a `response` whose body is a
+		// live ReadableStream backed by a background task that pumps an
+		// upstream reader (see CodexProvider's transformStreamingResponse). If
+		// that response is discarded here without ever being read or
+		// cancelled, the background task parks forever waiting for downstream
+		// backpressure to clear, holding the upstream reader's lock open
+		// indefinitely. Calling body.cancel() unsticks that task the same way
+		// a well-behaved consumer aborting mid-stream would, and is a no-op
+		// (or a cheap connection-close) for providers whose response body is a
+		// plain, unread passthrough stream. Always call this before returning
+		// null / dropping a `response` reference at a failover point.
+		//
+		// IMPORTANT: `discarded.body` may be one branch of a tee()'d stream
+		// (e.g. earlier header-only `response.clone()` calls for
+		// parseRateLimit, or response-processor.ts's usage-extraction clone).
+		// Per the Streams spec, cancelling one tee branch never settles until
+		// every branch has been cancelled or fully read: awaiting an
+		// unbounded `cancel()` here can hang forever if any sibling branch was
+		// abandoned without being read or cancelled. Callers still get an
+		// awaitable promise (so existing call sites don't need to change),
+		// but this never itself awaits the underlying cancel: it fires it and
+		// returns, guaranteeing prompt resolution regardless of the state of
+		// any sibling tee branch. Sibling clones created in this file and in
+		// response-processor.ts are now cancelled at their own call sites
+		// once their header/usage-only use is done, so in the common case
+		// the cancellation still completes quickly in the background.
+		const discardUnusedResponse = async (
+			discarded: Response,
+			reason: string,
+		) => {
+			try {
+				discarded.body?.cancel(reason).catch(() => {
+					// Best effort only: the goal is to unstick any pending
+					// backpressure or release a held upstream connection, not
+					// to guarantee cancellation succeeds.
+				});
+			} catch {
+				// Body may already be locked/disturbed; ignore synchronous throws too.
+			}
+		};
+
+		// Drains a superseded in-place-retry response so its usage capture and
+		// attempt-trace finalization complete when the body ends promptly, while
+		// guaranteeing a never-closing body (e.g. a live SSE stream with no
+		// terminal frame) cannot hang the retry loop: past the bound the drain
+		// is abandoned and the reader is cancelled instead.
+		const drainSupersededResponse = async (discarded: Response) => {
+			const body = discarded.body;
+			if (!body) return;
+			const timeoutMs = getInPlaceRetryDrainTimeoutMs();
+			const reader = body.getReader();
+			const deadline = Date.now() + timeoutMs;
+			while (true) {
+				const remainingMs = deadline - Date.now();
+				if (remainingMs <= 0) {
+					reader.cancel("in_place_529_retry_drain_timeout").catch(() => {});
+					return;
+				}
+				const result = await Promise.race([
+					reader.read().catch(() => ({ done: true }) as const),
+					new Promise<"timeout">((resolve) =>
+						setTimeout(() => resolve("timeout"), remainingMs),
+					),
+				]);
+				if (result === "timeout") {
+					reader.cancel("in_place_529_retry_drain_timeout").catch(() => {});
+					return;
+				}
+				if (result.done) return;
 			}
 		};
 		if (
@@ -1738,7 +1817,7 @@ export async function proxyWithAccount(
 			log.warn(
 				`Authentication failed (401) for account ${account.name}, failing over to next account`,
 			);
-			await discardUpstreamBody(response);
+			await discardUnusedResponse(response, "auth_failed_401");
 			return null;
 		}
 
@@ -1747,7 +1826,16 @@ export async function proxyWithAccount(
 		// all accounts cooling simultaneously under concurrency spikes. Skipped for
 		// synthetic (keepalive / auto-refresh) requests to avoid loop amplification.
 		if (response.status === 529 && !isSyntheticInternal) {
-			const rlInfo = provider.parseRateLimit(response.clone());
+			const rlInfoClone = response.clone();
+			const rlInfo = provider.parseRateLimit(rlInfoClone);
+			// parseRateLimit only reads headers; it never touches the body. This
+			// clone is otherwise an abandoned tee branch that would block a later
+			// discardUnusedResponse/cancel() on `response` from ever settling (see
+			// the comment on discardUnusedResponse above). Reuse the same helper
+			// to release it: it is fire-and-forget internally, so calling it here
+			// (before `response` itself has been consumed or cancelled) cannot
+			// deadlock, unlike an unbounded cancel() would.
+			await discardUnusedResponse(rlInfoClone, "rate_limit_probe_clone");
 			if (rlInfo.isRateLimited && !rlInfo.resetTime) {
 				const retryCfg = getOverloadRetryConfig();
 				if (retryCfg.enabled && retryCfg.maxAttempts > 1) {
@@ -1769,7 +1857,7 @@ export async function proxyWithAccount(
 						);
 						if (provider.name === "codex" && provider.transformRequestBody) {
 							const retryHeaders = new Headers(retrySourceRequest.headers);
-							await response.arrayBuffer();
+							await drainSupersededResponse(response);
 							stampCodexAttempt(
 								retryHeaders,
 								"overload_529",
@@ -1792,6 +1880,16 @@ export async function proxyWithAccount(
 							}
 							retryTransport =
 								sanitizeInternalTransportHeaders(retryTransformed);
+						} else {
+							// Non-codex providers reach this loop too (the anthropic
+							// provider marks bare 529 overloaded_error responses as rate
+							// limited with no reset), and their superseded response would
+							// otherwise be abandoned with a live body when `response` is
+							// reassigned below.
+							await discardUnusedResponse(
+								response,
+								"in_place_529_retry_superseded",
+							);
 						}
 						const retryRaw = isSyntheticProviderResponse(retryTransport)
 							? materializeSyntheticResponse(retryTransport.clone())
@@ -1841,7 +1939,16 @@ export async function proxyWithAccount(
 							break;
 						}
 
-						const retryRlInfo = provider.parseRateLimit(retryResponse.clone());
+						const retryRlInfoClone = retryResponse.clone();
+						const retryRlInfo = provider.parseRateLimit(retryRlInfoClone);
+						// Same reasoning as the outer parseRateLimit clone above: this is a
+						// header-only read, and if the loop breaks out below without a
+						// further iteration to drain `retryResponse` via arrayBuffer(),
+						// nothing else would ever release this clone's tee branch.
+						await discardUnusedResponse(
+							retryRlInfoClone,
+							"rate_limit_probe_clone_retry",
+						);
 						if (!retryRlInfo.isRateLimited || retryRlInfo.resetTime) {
 							// Got a reset hint on retry — stop; let processProxyResponse apply cooldown
 							break;
@@ -1864,7 +1971,7 @@ export async function proxyWithAccount(
 			log.warn(
 				`Authentication failed (401) on 529 retry for account ${account.name}, failing over to next account`,
 			);
-			await discardUpstreamBody(response);
+			await discardUnusedResponse(response, "auth_failed_401_after_retry");
 			return null;
 		}
 
@@ -1883,6 +1990,15 @@ export async function proxyWithAccount(
 			requestMeta.id,
 			requestMeta,
 		);
+		if (responseForRateLimitCheck !== response) {
+			// The rate-limit check ran on a clone whose header-only use is done.
+			// Release its tee branch so it cannot keep the original body's
+			// cancellation pending elsewhere.
+			await discardUnusedResponse(
+				responseForRateLimitCheck,
+				"rate_limit_check_clone",
+			);
+		}
 		if (isRateLimited) {
 			if (returnRateLimitedResponseOnExhaustion && response.status === 529) {
 				log.warn(
@@ -1925,7 +2041,7 @@ export async function proxyWithAccount(
 					{ ...ctx, provider },
 				);
 			}
-			await discardUpstreamBody(response);
+			await discardUnusedResponse(response, "rate_limited_failover");
 			return null; // Signal to try next account
 		}
 

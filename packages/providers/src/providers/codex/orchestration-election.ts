@@ -27,11 +27,33 @@ interface ElectionStoreOptions {
 }
 
 /**
+ * Diagnostic-only, read-only view of a session's current entry. Taken before
+ * admit() would mutate it, so a caller can report how long the existing root
+ * had been idle and whether the instructions that won it still match.
+ */
+export interface ElectionSnapshot {
+	readonly conversationId: string;
+	readonly lastActiveAt: number;
+	/**
+	 * Instructions text last recorded for this session's root via
+	 * recordRootInstructions(). Empty string if never recorded.
+	 */
+	readonly instructions: string;
+}
+
+/**
  * Synchronous process-local election. JavaScript's run-to-completion semantics
  * make the first immediate caller the sole winner without an async race window.
  */
 export class OrchestrationElectionStore {
 	private readonly entries = new Map<string, ElectionEntry>();
+	/**
+	 * Diagnostic-only companion to entries, keyed by the same sessionId. Never
+	 * read by admit() and never influences an admission outcome; it exists
+	 * solely so peek() can report whether a later, non-matching turn's
+	 * instructions still line up with whatever last won the root.
+	 */
+	private readonly rootInstructions = new Map<string, string>();
 	private readonly clock: () => number;
 	private readonly ttlMs: number;
 	private readonly maxSessions: number;
@@ -61,12 +83,41 @@ export class OrchestrationElectionStore {
 
 	reset(): void {
 		this.entries.clear();
+		this.rootInstructions.clear();
+	}
+
+	/**
+	 * Diagnostic-only, read-only peek at a session's current entry. Never
+	 * mutates state and is not part of admit()'s decision path; callers use it
+	 * immediately before admit() to capture "this session already had an
+	 * elected root" for observability.
+	 */
+	peek(sessionId: string): ElectionSnapshot | undefined {
+		const existing = this.entries.get(sessionId);
+		if (!existing) return undefined;
+		return {
+			conversationId: existing.conversationId,
+			lastActiveAt: existing.lastActiveAt,
+			instructions: this.rootInstructions.get(sessionId) ?? "",
+		};
+	}
+
+	/**
+	 * Diagnostic-only. Records the instructions text observed alongside a
+	 * "root" admission for this session. Never called from admit() and never
+	 * consulted by it; exists purely so peek() can surface whether a later
+	 * turn's instructions still match what won the root.
+	 */
+	recordRootInstructions(sessionId: string, instructions: string): void {
+		this.rootInstructions.set(sessionId, instructions);
 	}
 
 	private pruneExpired(now: number): void {
 		for (const [sessionId, entry] of this.entries) {
-			if (now - entry.lastActiveAt >= this.ttlMs)
+			if (now - entry.lastActiveAt >= this.ttlMs) {
 				this.entries.delete(sessionId);
+				this.rootInstructions.delete(sessionId);
+			}
 		}
 	}
 
@@ -79,7 +130,10 @@ export class OrchestrationElectionStore {
 				oldestSession = sessionId;
 			}
 		}
-		if (oldestSession !== undefined) this.entries.delete(oldestSession);
+		if (oldestSession !== undefined) {
+			this.entries.delete(oldestSession);
+			this.rootInstructions.delete(oldestSession);
+		}
 	}
 }
 
@@ -113,6 +167,27 @@ export function electOrchestrationRoot(
 	conversationId: string,
 ): "root" | "non_root" {
 	return processElectionStore.admit(sessionId, conversationId);
+}
+
+/**
+ * Diagnostic-only, read-only peek at a session's current entry. See
+ * OrchestrationElectionStore.peek for the contract; never affects election
+ * outcomes.
+ */
+export function peekOrchestrationRoot(
+	sessionId: string,
+): ElectionSnapshot | undefined {
+	return processElectionStore.peek(sessionId);
+}
+
+/**
+ * Diagnostic-only. See OrchestrationElectionStore.recordRootInstructions.
+ */
+export function recordOrchestrationRootInstructions(
+	sessionId: string,
+	instructions: string,
+): void {
+	processElectionStore.recordRootInstructions(sessionId, instructions);
 }
 
 export function resetOrchestrationElectionForTest(): void {

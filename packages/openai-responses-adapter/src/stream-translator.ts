@@ -1,17 +1,24 @@
+import {
+	BUFFER_SIZES,
+	SseFrameBuffer,
+	SseLimitError,
+} from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 
 const log = new Logger("openai-responses-adapter");
 
 interface State {
-	lineBuffer: string;
 	hasSentCreated: boolean;
 	responseId: string;
 	model: string;
 	outputIndex: number;
 	sequenceNumber: number;
 	blockIndexToOutput: Map<number, number>;
-	textByBlock: Map<number, string>;
-	toolByBlock: Map<number, { callId: string; name: string; argsBuf: string }>;
+	textByBlock: Map<number, { text: string; bytes: number }>;
+	toolByBlock: Map<
+		number,
+		{ callId: string; name: string; argsBuf: string; bytes: number }
+	>;
 	inputTokens: number;
 	outputTokens: number;
 	doneSent: boolean;
@@ -20,6 +27,13 @@ interface State {
 }
 
 const encoder = new TextEncoder();
+
+// Per-block cap on accumulated bytes, shared by both tool-call arguments and
+// text output. Reuses the same constant as the SSE frame cap instead of
+// introducing a new arbitrary number. An aggregate cap across concurrently
+// open blocks is deliberately out of scope here, unlike the codex
+// provider's stricter aggregate accounting.
+const TOOL_ARGS_BYTE_CAP = BUFFER_SIZES.SSE_FRAME_MAX_BYTES;
 
 function emitSse(
 	controller: TransformStreamDefaultController,
@@ -121,7 +135,7 @@ function processEvent(
 		state.blockIndexToOutput.set(blockIndex, outputIdx);
 
 		if (contentBlock.type === "text") {
-			state.textByBlock.set(blockIndex, "");
+			state.textByBlock.set(blockIndex, { text: "", bytes: 0 });
 			emitSse(
 				controller,
 				"response.output_item.added",
@@ -155,6 +169,7 @@ function processEvent(
 				callId: contentBlock.id as string,
 				name: contentBlock.name as string,
 				argsBuf: "",
+				bytes: 0,
 			});
 			emitSse(
 				controller,
@@ -189,25 +204,43 @@ function processEvent(
 
 		if (delta.type === "text_delta") {
 			const text = delta.text as string;
-			const current = state.textByBlock.get(blockIndex) ?? "";
-			state.textByBlock.set(blockIndex, current + text);
+			const block = state.textByBlock.get(blockIndex);
+			if (block) {
+				block.bytes += encoder.encode(text).length;
+				if (block.bytes > TOOL_ARGS_BYTE_CAP) {
+					throw new SseLimitError(
+						`Text output for block index ${blockIndex} totaled ${block.bytes} bytes, exceeding the ${TOOL_ARGS_BYTE_CAP} byte cap`,
+						TOOL_ARGS_BYTE_CAP,
+						block.bytes,
+					);
+				}
+				block.text += text;
 
-			emitSse(
-				controller,
-				"response.output_text.delta",
-				{
-					type: "response.output_text.delta",
-					item_id: `${state.responseId}_msg_${outputIdx}`,
-					output_index: outputIdx,
-					content_index: 0,
-					delta: text,
-				},
-				state,
-			);
+				emitSse(
+					controller,
+					"response.output_text.delta",
+					{
+						type: "response.output_text.delta",
+						item_id: `${state.responseId}_msg_${outputIdx}`,
+						output_index: outputIdx,
+						content_index: 0,
+						delta: text,
+					},
+					state,
+				);
+			}
 		} else if (delta.type === "input_json_delta") {
 			const partial = (delta.partial_json as string) ?? "";
 			const tool = state.toolByBlock.get(blockIndex);
 			if (tool) {
+				tool.bytes += encoder.encode(partial).length;
+				if (tool.bytes > TOOL_ARGS_BYTE_CAP) {
+					throw new SseLimitError(
+						`Tool call arguments for call_id ${tool.callId} totaled ${tool.bytes} bytes, exceeding the ${TOOL_ARGS_BYTE_CAP} byte cap`,
+						TOOL_ARGS_BYTE_CAP,
+						tool.bytes,
+					);
+				}
 				tool.argsBuf += partial;
 				emitSse(
 					controller,
@@ -236,7 +269,7 @@ function processEvent(
 		}
 
 		if (state.textByBlock.has(blockIndex)) {
-			const fullText = state.textByBlock.get(blockIndex) ?? "";
+			const fullText = state.textByBlock.get(blockIndex)?.text ?? "";
 			emitSse(
 				controller,
 				"response.output_text.done",
@@ -363,40 +396,47 @@ function processEvent(
 	}
 }
 
-function parseAndProcessChunk(
-	chunk: string,
+/**
+ * Parse and process a single already-delimited SSE frame (the text between
+ * two blank-line delimiters, with the delimiters themselves stripped).
+ *
+ * Only JSON.parse failures are swallowed here (malformed upstream payload):
+ * any SseLimitError raised by processEvent (e.g. a tool-argument cap trip)
+ * is intentionally left to propagate to the caller, which routes it through
+ * the terminal error/cancellation path instead of being logged and ignored.
+ */
+function processSseFrame(
+	rawEvent: string,
 	controller: TransformStreamDefaultController,
 	state: State,
 ): void {
-	// Split on double newline to get complete SSE events
-	const rawEvents = chunk.split("\n\n");
+	if (!rawEvent.trim()) return;
 
-	for (const rawEvent of rawEvents) {
-		if (!rawEvent.trim()) continue;
+	const lines = rawEvent.split(/\r?\n/);
+	let eventType = "";
+	let dataStr = "";
 
-		const lines = rawEvent.split("\n");
-		let eventType = "";
-		let dataStr = "";
-
-		for (const line of lines) {
-			if (line.startsWith("event: ")) {
-				eventType = line.slice(7).trim();
-			} else if (line.startsWith("data: ")) {
-				dataStr = line.slice(6).trim();
-			}
-		}
-
-		if (!eventType || !dataStr) continue;
-
-		try {
-			const data = JSON.parse(dataStr) as Record<string, unknown>;
-			processEvent(eventType, data, controller, state);
-		} catch {
-			log.warn(
-				`Failed to parse SSE data for event ${eventType}: ${dataStr.slice(0, 200)}`,
-			);
+	for (const line of lines) {
+		if (line.startsWith("event: ")) {
+			eventType = line.slice(7).trim();
+		} else if (line.startsWith("data: ")) {
+			dataStr = line.slice(6).trim();
 		}
 	}
+
+	if (!eventType || !dataStr) return;
+
+	let data: Record<string, unknown>;
+	try {
+		data = JSON.parse(dataStr) as Record<string, unknown>;
+	} catch {
+		log.warn(
+			`Failed to parse SSE data for event ${eventType}: ${dataStr.slice(0, 200)}`,
+		);
+		return;
+	}
+
+	processEvent(eventType, data, controller, state);
 }
 
 export function translateAnthropicStreamToResponses(
@@ -408,12 +448,14 @@ export function translateAnthropicStreamToResponses(
 		return new Response(null, { status: anthropicResponse.status });
 	}
 
-	// Per-request decoder: TextDecoder is stateful (buffers incomplete UTF-8
-	// sequences across chunks), so a shared singleton would corrupt concurrent streams.
-	const decoder = new TextDecoder();
+	// Bounded, CRLF-tolerant frame buffer (see packages/core/src/sse-frame-buffer.ts).
+	// Owns its own TextDecoder internally, so no separate decoder is needed here.
+	const sseFrameBuffer = new SseFrameBuffer({
+		maxFrameBytes: BUFFER_SIZES.SSE_FRAME_MAX_BYTES,
+		maxBufferBytes: BUFFER_SIZES.SSE_BUFFER_MAX_BYTES,
+	});
 
 	const state: State = {
-		lineBuffer: "",
 		hasSentCreated: false,
 		responseId,
 		model,
@@ -429,39 +471,62 @@ export function translateAnthropicStreamToResponses(
 		streamError: null,
 	};
 
+	/**
+	 * Handle an SseLimitError raised while parsing or processing frames: emit
+	 * a terminal response.failed event, then actively terminate the
+	 * TransformStream. Terminating errors the writable side, which causes the
+	 * upstream pipeTo() (feeding anthropicResponse.body into this transform)
+	 * to cancel the source reader rather than leaving it dangling. A failed
+	 * stream must never emit response.completed afterward: emitDone() already
+	 * no-ops once state.doneSent is set by the "error" branch of
+	 * processEvent, and flush() never runs once the writable side is errored.
+	 */
+	function handleLimitError(
+		error: SseLimitError,
+		controller: TransformStreamDefaultController,
+	): void {
+		processEvent(
+			"error",
+			{
+				type: "error",
+				error: { type: "sse_limit_exceeded", message: error.message },
+			},
+			controller,
+			state,
+		);
+		controller.terminate();
+	}
+
 	const transformedBody = anthropicResponse.body.pipeThrough(
 		new TransformStream<Uint8Array, Uint8Array>({
 			transform(chunk, controller) {
 				try {
-					state.lineBuffer += decoder.decode(chunk, { stream: true });
-
-					// Process complete events (delimited by \n\n), keep remainder in buffer
-					const lastDoubleNewline = state.lineBuffer.lastIndexOf("\n\n");
-					if (lastDoubleNewline === -1) return;
-
-					const complete = state.lineBuffer.slice(0, lastDoubleNewline + 2);
-					state.lineBuffer = state.lineBuffer.slice(lastDoubleNewline + 2);
-
-					parseAndProcessChunk(complete, controller, state);
+					const frames = sseFrameBuffer.push(chunk);
+					for (const frame of frames) {
+						processSseFrame(frame, controller, state);
+					}
 				} catch (err) {
+					if (err instanceof SseLimitError) {
+						handleLimitError(err, controller);
+						return;
+					}
 					log.warn(`Stream transform error: ${String(err)}`);
 				}
 			},
 
 			flush(controller) {
 				try {
-					// Flush remaining buffered UTF-8 bytes and release decoder's internal buffer
-					const remaining = decoder.decode();
-					if (remaining) state.lineBuffer += remaining;
-
-					// Process any remaining buffered content
-					if (state.lineBuffer.trim()) {
-						parseAndProcessChunk(`${state.lineBuffer}\n\n`, controller, state);
-						state.lineBuffer = "";
+					const remaining = sseFrameBuffer.flush();
+					if (remaining.trim()) {
+						processSseFrame(remaining, controller, state);
 					}
 					// Ensure done event is always emitted
 					emitDone(controller, state);
 				} catch (err) {
+					if (err instanceof SseLimitError) {
+						handleLimitError(err, controller);
+						return;
+					}
 					log.warn(`Stream flush error: ${String(err)}`);
 				}
 			},

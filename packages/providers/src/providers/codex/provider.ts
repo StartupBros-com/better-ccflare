@@ -1,7 +1,10 @@
 import { createHash } from "node:crypto";
 import {
+	BUFFER_SIZES,
 	mapModelName,
 	OAuthRefreshTokenError,
+	SseFrameBuffer,
+	SseLimitError,
 	ValidationError,
 	validateEndpointUrl,
 } from "@better-ccflare/core";
@@ -20,6 +23,8 @@ import {
 	deriveConversationIdentity,
 	electOrchestrationRoot,
 	type OrchestrationAdmission,
+	peekOrchestrationRoot,
+	recordOrchestrationRootInstructions,
 } from "./orchestration-election";
 import {
 	summarizeCodexResponse,
@@ -205,6 +210,14 @@ const CODEX_ERROR_TYPE_BY_CODE: Record<string, string> = {
 	usage_not_included: "permission_error",
 };
 
+// Buffered tool-call argument bytes are capped by the same constant used for
+// a single SSE frame (packages/core/src/sse-frame-buffer.ts): both the
+// per-call buffer and the aggregate across every concurrently open
+// function-call buffer are checked against this one cap, reusing it rather
+// than introducing a second arbitrary threshold.
+const TOOL_ARGS_BYTE_CAP = BUFFER_SIZES.SSE_FRAME_MAX_BYTES;
+const byteEncoder = new TextEncoder();
+
 // When enabled, telemetry reports the effective Codex context capacity rather
 // than the raw model maximum.
 export const CODEX_EFFECTIVE_CONTEXT_ENV = "CCFLARE_CODEX_EFFECTIVE_CONTEXT";
@@ -287,6 +300,10 @@ interface CodexConversionResult {
 	cacheKeyDecision: CodexPromptCacheKeyDecision;
 	orchestrationAdmission: OrchestrationAdmission;
 	filteredToolNames: string[];
+	/** Diagnostic: see orchestrationDemotionObserved in trace.ts's TraceInputs. */
+	orchestrationDemotionObserved: boolean;
+	/** Diagnostic: see elapsedMsSinceRoot in trace.ts's TraceInputs. */
+	elapsedMsSinceRoot: number | null;
 }
 
 // ── Anthropic request types ───────────────────────────────────────────────────
@@ -357,6 +374,8 @@ interface FunctionCallBuffer {
 	contentBlockIndex: number;
 	name: string;
 	arguments: string[];
+	/** Running byte total of buffered argument deltas, capped by TOOL_ARGS_BYTE_CAP. */
+	bytes: number;
 }
 
 interface ContextWindowUsage {
@@ -371,7 +390,6 @@ interface ContextWindow {
 }
 
 interface StreamState {
-	buffer: string;
 	messageId: string;
 	model: string;
 	contentBlockIndex: number;
@@ -391,6 +409,8 @@ interface StreamState {
 	contextWindow: ContextWindow | null;
 	// Track function_call items: output_index → buffered arguments and block index
 	functionCallBlocks: Map<number, FunctionCallBuffer>;
+	/** Aggregate byte total across every entry in functionCallBlocks, capped by TOOL_ARGS_BYTE_CAP. */
+	functionCallBytesTotal: number;
 	upstreamError?: {
 		type: string;
 		message: string;
@@ -442,6 +462,46 @@ function writeCodexStreamTerminalTrace(
 			error,
 		),
 	});
+}
+
+/**
+ * Single source of truth for "does this Codex SSE event, on its own data,
+ * commit downstream output" at the four points where handleCodexEvent
+ * currently gates an inline `ensureMessageStart()` call on the event's data
+ * (not on stream state): response.created, response.output_item.added
+ * (function_call items only), response.content_part.added (output_text
+ * parts only), and response.output_text.delta (non-empty deltas only).
+ *
+ * Scope: only those four decision points are covered. output_item.done,
+ * error/response.failed, and response.completed/response.incomplete gate
+ * their writes on stream STATE (hasSentContentBlockStart,
+ * hasSentTerminalEvents, upstreamError) rather than on the event's own data,
+ * so a pure (eventName, data) function cannot answer for them the way it can
+ * for the four data-gated sites above; they keep their existing, independent
+ * gating in handleCodexEvent and fall through to `false` here.
+ */
+export function codexEventCommitsOutput(
+	eventName: string,
+	data: Record<string, unknown>,
+): boolean {
+	switch (eventName) {
+		case "response.created":
+			return true;
+		case "response.output_item.added": {
+			const item = data.item as Record<string, unknown> | undefined;
+			return (item?.type as string | undefined) === "function_call";
+		}
+		case "response.content_part.added": {
+			const part = data.part as Record<string, unknown> | undefined;
+			return (part?.type as string | undefined) === "output_text";
+		}
+		case "response.output_text.delta": {
+			const delta = data.delta as string | undefined;
+			return Boolean(delta);
+		}
+		default:
+			return false;
+	}
 }
 
 export class CodexProvider extends BaseProvider {
@@ -627,6 +687,8 @@ export class CodexProvider extends BaseProvider {
 				cacheKeyDecision,
 				orchestrationAdmission,
 				filteredToolNames,
+				orchestrationDemotionObserved,
+				elapsedMsSinceRoot,
 			} = this.convertToCodexFormat(
 				body,
 				account,
@@ -671,6 +733,8 @@ export class CodexProvider extends BaseProvider {
 				pacingAction: request.headers.get("x-better-ccflare-pacing-action"),
 				isDescendant: isAttributedAgent,
 				orchestrationAdmission,
+				orchestrationDemotionObserved,
+				elapsedMsSinceRoot,
 				toolsBeforeCount: body.tools?.length ?? 0,
 				filteredToolNames,
 				instructions: codexBody.instructions,
@@ -828,15 +892,24 @@ export class CodexProvider extends BaseProvider {
 		// Use the sooner (smallest) reset time
 		const resetTime = resets.length > 0 ? Math.min(...resets) : undefined;
 
-		if (response.status !== 429) {
-			// Return reset time for DB tracking even on successful responses
-			return { isRateLimited: false, resetTime };
+		if (response.status === 429) {
+			return {
+				isRateLimited: true,
+				resetTime: resetTime ?? Date.now() + 60 * 60 * 1000,
+			};
 		}
 
-		return {
-			isRateLimited: true,
-			resetTime: resetTime ?? Date.now() + 60 * 60 * 1000,
-		};
+		// 529 (overloaded_error) is rate limiting too, but unlike 429 we do not
+		// synthesize a resetTime when Codex doesn't send one. A missing resetTime
+		// here is the signal proxy-operations.ts uses to attempt bounded in-place
+		// retries before falling back to account cooldown; forcing a synthesized
+		// resetTime would skip that retry path entirely.
+		if (response.status === 529) {
+			return { isRateLimited: true, resetTime };
+		}
+
+		// Return reset time for DB tracking even on successful responses
+		return { isRateLimited: false, resetTime };
 	}
 
 	supportsOAuth(): boolean {
@@ -1322,6 +1395,8 @@ export class CodexProvider extends BaseProvider {
 			body.tools?.some((tool) => orchestrationToolNames.has(tool.name)) ??
 			false;
 		let orchestrationAdmission: OrchestrationAdmission;
+		let orchestrationDemotionObserved = false;
+		let elapsedMsSinceRoot: number | null = null;
 		if (!offersOrchestrationTools) {
 			orchestrationAdmission = "no_orchestration_tools";
 		} else if (process.env[CODEX_SINGLE_ORCHESTRATION_ROOT_ENV] === "0") {
@@ -1331,6 +1406,9 @@ export class CodexProvider extends BaseProvider {
 			if (!sessionId) {
 				orchestrationAdmission = "no_session";
 			} else {
+				// Captured before electOrchestrationRoot() mutates the entry, so a
+				// demotion below can still report how long the prior root was idle.
+				const priorRoot = peekOrchestrationRoot(sessionId);
 				const conversationId = deriveConversationIdentity(
 					sessionId,
 					finalInstructions,
@@ -1339,6 +1417,22 @@ export class CodexProvider extends BaseProvider {
 				orchestrationAdmission = conversationId
 					? electOrchestrationRoot(sessionId, conversationId)
 					: "no_conversation";
+				if (orchestrationAdmission === "root") {
+					recordOrchestrationRootInstructions(sessionId, finalInstructions);
+				} else if (orchestrationAdmission === "non_root" && priorRoot) {
+					// This session already had an elected root, and this turn's
+					// derived identity no longer matches it. Compaction that drops
+					// the earliest input item reshapes deriveConversationIdentity's
+					// hash for what is otherwise the same conversation, so this
+					// signal is diagnostic, not proof of a genuine sibling turn.
+					orchestrationDemotionObserved = true;
+					elapsedMsSinceRoot = Date.now() - priorRoot.lastActiveAt;
+					const instructionsMatchedPriorRoot =
+						finalInstructions === priorRoot.instructions;
+					log.warn(
+						`orchestration demotion observed: session=${sessionId} elapsed_ms_since_root=${elapsedMsSinceRoot} isAttributedAgent=${isAttributedAgent} instructionsMatchedPriorRoot=${instructionsMatchedPriorRoot}`,
+					);
+				}
 			}
 		}
 
@@ -1440,6 +1534,8 @@ export class CodexProvider extends BaseProvider {
 			cacheKeyDecision,
 			orchestrationAdmission,
 			filteredToolNames,
+			orchestrationDemotionObserved,
+			elapsedMsSinceRoot,
 		};
 	}
 
@@ -1660,7 +1756,6 @@ export class CodexProvider extends BaseProvider {
 			"unknown",
 	): Response {
 		const state: StreamState = {
-			buffer: "",
 			messageId: `msg_${crypto.randomUUID().replace(/-/g, "").substring(0, 24)}`,
 			model: finalModel,
 			contentBlockIndex: 0,
@@ -1676,6 +1771,7 @@ export class CodexProvider extends BaseProvider {
 			cacheMeasurementAvailable: false,
 			contextWindow: null,
 			functionCallBlocks: new Map(),
+			functionCallBytesTotal: 0,
 			sawToolUse: false,
 			traceNewToolCalls: [],
 			traceRequestId: requestId,
@@ -1741,7 +1837,10 @@ export class CodexProvider extends BaseProvider {
 			},
 		});
 		const encoder = new TextEncoder();
-		const decoder = new TextDecoder();
+		const sseFrameBuffer = new SseFrameBuffer({
+			maxFrameBytes: BUFFER_SIZES.SSE_FRAME_MAX_BYTES,
+			maxBufferBytes: BUFFER_SIZES.SSE_BUFFER_MAX_BYTES,
+		});
 
 		const writeSSE = async (event: string, data: unknown) => {
 			const payload =
@@ -1825,21 +1924,19 @@ export class CodexProvider extends BaseProvider {
 					const { value, done } = await upstreamReader.read();
 					if (done) break;
 
-					state.buffer += decoder.decode(value, { stream: true });
+					// Frame boundary detection and cap enforcement live in
+					// SseFrameBuffer (CRLF-tolerant, bounds both a single oversized
+					// frame and an unterminated tail). It may throw SseLimitError,
+					// which is handled by the dedicated branch in the catch below.
+					const frames = sseFrameBuffer.push(value);
 
-					// Process complete SSE events in buffer
-					while (true) {
-						const newlineIdx = state.buffer.indexOf("\n\n");
-						if (newlineIdx === -1) break;
-
-						const eventText = state.buffer.slice(0, newlineIdx);
-						state.buffer = state.buffer.slice(newlineIdx + 2);
-
+					// Process complete SSE events extracted from this chunk
+					for (const eventText of frames) {
 						const eventLine = eventText
-							.split("\n")
+							.split(/\r?\n/)
 							.find((l) => l.startsWith("event:"));
 						const dataLine = eventText
-							.split("\n")
+							.split(/\r?\n/)
 							.find((l) => l.startsWith("data:"));
 
 						if (!eventLine || !dataLine) continue;
@@ -1896,29 +1993,60 @@ export class CodexProvider extends BaseProvider {
 				}
 			} catch (error) {
 				if (!cancelled) {
-					log.error("Error processing Codex SSE stream:", error);
-					const streamError = {
-						type: "upstream_stream_read_error",
-						message:
-							error instanceof Error
-								? error.message
-								: "Codex upstream stream processing failed",
-					};
-					try {
-						if (!state.hasSentMessageStart) {
-							await ensureMessageStart();
+					if (error instanceof SseLimitError) {
+						// Cap trips are a distinct, expected failure mode (an
+						// oversized/unterminated SSE frame or tool-call argument
+						// buffer), not a generic stream read failure: route them
+						// through the same close-block-then-error helper the
+						// upstream error/response.failed handler uses instead of
+						// the generic branch below.
+						const capError = {
+							type: "sse_limit_exceeded",
+							message: error.message,
+						};
+						try {
+							await this.closeOpenBlockAndWriteError(
+								state,
+								writeSSE,
+								ensureMessageStart,
+								{
+									type: "error",
+									error: {
+										type: "api_error",
+										message: error.message,
+										code: "sse_limit_exceeded",
+									},
+								},
+							);
+						} catch {
+							// Downstream may already be cancelled or closed.
 						}
-						if (!state.hasSentTerminalEvents) {
-							await writeSSE("error", {
-								type: "error",
-								error: streamError,
-								model: state.model,
-							});
+						writeTerminalTrace(capError);
+					} else {
+						log.error("Error processing Codex SSE stream:", error);
+						const streamError = {
+							type: "upstream_stream_read_error",
+							message:
+								error instanceof Error
+									? error.message
+									: "Codex upstream stream processing failed",
+						};
+						try {
+							if (!state.hasSentMessageStart) {
+								await ensureMessageStart();
+							}
+							if (!state.hasSentTerminalEvents) {
+								await writeSSE("error", {
+									type: "error",
+									error: streamError,
+									model: state.model,
+								});
+							}
+						} catch {
+							// Downstream may already be cancelled or closed.
 						}
-					} catch {
-						// Downstream may already be cancelled or closed.
+						writeTerminalTrace(streamError);
 					}
-					writeTerminalTrace(streamError);
 				}
 				await upstreamReader?.cancel(error).catch(() => undefined);
 			} finally {
@@ -2059,6 +2187,33 @@ export class CodexProvider extends BaseProvider {
 		return { status: 502, statusText: "Bad Gateway" };
 	}
 
+	/**
+	 * Close any open content block, then write a terminal error event.
+	 * Shared by the upstream error/response.failed handler and by SSE/tool-arg
+	 * cap trips, so both paths emit the same well-formed event ordering:
+	 * message_start (if not already sent) → content_block_stop (if a block
+	 * was open) → error. No-op if a terminal event was already sent.
+	 */
+	private async closeOpenBlockAndWriteError(
+		state: StreamState,
+		writeSSE: (event: string, data: unknown) => Promise<void>,
+		ensureMessageStart: () => Promise<void>,
+		errorPayload: { type: "error"; error: Record<string, unknown> },
+	): Promise<void> {
+		if (state.hasSentTerminalEvents) return;
+		await ensureMessageStart();
+		if (state.hasSentContentBlockStart) {
+			await writeSSE("content_block_stop", {
+				type: "content_block_stop",
+				index: state.contentBlockIndex,
+			});
+			state.contentBlockIndex++;
+			state.hasSentContentBlockStart = false;
+		}
+		await writeSSE("error", errorPayload);
+		state.hasSentTerminalEvents = true;
+	}
+
 	private async handleCodexEvent(
 		eventName: string,
 		data: Record<string, unknown>,
@@ -2112,7 +2267,10 @@ export class CodexProvider extends BaseProvider {
 				const respId = (resp?.id as string) || state.messageId;
 				state.messageId = respId;
 				state.model = (resp?.model as string) || state.model;
-				if (state.hasSentMessageStart) {
+				if (
+					state.hasSentMessageStart ||
+					!codexEventCommitsOutput(eventName, data)
+				) {
 					break;
 				}
 
@@ -2123,12 +2281,11 @@ export class CodexProvider extends BaseProvider {
 			case "response.output_item.added": {
 				const item = data.item as Record<string, unknown> | undefined;
 				const outputIndex = data.output_index as number | undefined;
-				const itemType = item?.type as string | undefined;
 
-				if (itemType === "message") {
-					// Text content block will start on content_part.added
-					// Nothing to emit yet
-				} else if (itemType === "function_call") {
+				// Text content blocks start on content_part.added instead, so
+				// message items (and anything other than function_call) have
+				// nothing to emit here.
+				if (codexEventCommitsOutput(eventName, data)) {
 					const callId = item?.call_id as string;
 					const name = item?.name as string;
 					state.sawToolUse = true;
@@ -2155,6 +2312,7 @@ export class CodexProvider extends BaseProvider {
 							contentBlockIndex: blockIdx,
 							name,
 							arguments: [],
+							bytes: 0,
 						});
 					}
 				}
@@ -2162,10 +2320,7 @@ export class CodexProvider extends BaseProvider {
 			}
 
 			case "response.content_part.added": {
-				const part = data.part as Record<string, unknown> | undefined;
-				const partType = part?.type as string | undefined;
-
-				if (partType === "output_text") {
+				if (codexEventCommitsOutput(eventName, data)) {
 					await ensureMessageStart();
 					// Start a text content block
 					if (state.hasSentContentBlockStart) {
@@ -2196,7 +2351,7 @@ export class CodexProvider extends BaseProvider {
 
 			case "response.output_text.delta": {
 				const delta = data.delta as string | undefined;
-				if (delta) {
+				if (codexEventCommitsOutput(eventName, data)) {
 					await ensureMessageStart();
 					await writeSSE("content_block_delta", {
 						type: "content_block_delta",
@@ -2213,7 +2368,28 @@ export class CodexProvider extends BaseProvider {
 				if (delta && outputIndex !== undefined) {
 					const buffer = state.functionCallBlocks.get(outputIndex);
 					if (buffer) {
+						const deltaBytes = byteEncoder.encode(delta).length;
 						buffer.arguments.push(delta);
+						buffer.bytes += deltaBytes;
+						state.functionCallBytesTotal += deltaBytes;
+						// Per-call cap: guards a single runaway tool call.
+						if (buffer.bytes > TOOL_ARGS_BYTE_CAP) {
+							throw new SseLimitError(
+								`Tool call arguments for output_index ${outputIndex} totaled ${buffer.bytes} bytes, exceeding the ${TOOL_ARGS_BYTE_CAP} byte cap`,
+								TOOL_ARGS_BYTE_CAP,
+								buffer.bytes,
+							);
+						}
+						// Aggregate cap: guards many concurrently open tool calls that
+						// each individually stay under the per-call cap but together
+						// still grow the buffered byte total without bound.
+						if (state.functionCallBytesTotal > TOOL_ARGS_BYTE_CAP) {
+							throw new SseLimitError(
+								`Aggregate tool call arguments totaled ${state.functionCallBytesTotal} bytes, exceeding the ${TOOL_ARGS_BYTE_CAP} byte cap`,
+								TOOL_ARGS_BYTE_CAP,
+								state.functionCallBytesTotal,
+							);
+						}
 					}
 				}
 				break;
@@ -2251,6 +2427,7 @@ export class CodexProvider extends BaseProvider {
 							index: buffer.contentBlockIndex,
 						});
 						if (outputIndex !== undefined) {
+							state.functionCallBytesTotal -= buffer.bytes;
 							state.functionCallBlocks.delete(outputIndex);
 						}
 						if (
@@ -2326,19 +2503,15 @@ export class CodexProvider extends BaseProvider {
 					// Claim the terminal trace before awaiting downstream writes so a
 					// cancellation race cannot record two terminals for one attempt.
 					writeCodexStreamTerminalTrace(state, "error", state.upstreamError);
-					if (state.hasSentContentBlockStart) {
-						await writeSSE("content_block_stop", {
-							type: "content_block_stop",
-							index: state.contentBlockIndex,
-						});
-						state.contentBlockIndex++;
-						state.hasSentContentBlockStart = false;
-					}
-					await writeSSE(
-						"error",
+					// closeOpenBlockAndWriteError calls ensureMessageStart() first, so
+					// an error arriving as the literal first SSE event still emits
+					// message_start before error.
+					await this.closeOpenBlockAndWriteError(
+						state,
+						writeSSE,
+						ensureMessageStart,
 						this.toAnthropicErrorPayload(state.upstreamError),
 					);
-					state.hasSentTerminalEvents = true;
 				}
 				break;
 			}
