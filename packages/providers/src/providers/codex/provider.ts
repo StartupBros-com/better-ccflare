@@ -457,6 +457,46 @@ function writeCodexStreamTerminalTrace(
 	});
 }
 
+/**
+ * Single source of truth for "does this Codex SSE event, on its own data,
+ * commit downstream output" at the four points where handleCodexEvent
+ * currently gates an inline `ensureMessageStart()` call on the event's data
+ * (not on stream state): response.created, response.output_item.added
+ * (function_call items only), response.content_part.added (output_text
+ * parts only), and response.output_text.delta (non-empty deltas only).
+ *
+ * Scope: only those four decision points are covered. output_item.done,
+ * error/response.failed, and response.completed/response.incomplete gate
+ * their writes on stream STATE (hasSentContentBlockStart,
+ * hasSentTerminalEvents, upstreamError) rather than on the event's own data,
+ * so a pure (eventName, data) function cannot answer for them the way it can
+ * for the four data-gated sites above; they keep their existing, independent
+ * gating in handleCodexEvent and fall through to `false` here.
+ */
+export function codexEventCommitsOutput(
+	eventName: string,
+	data: Record<string, unknown>,
+): boolean {
+	switch (eventName) {
+		case "response.created":
+			return true;
+		case "response.output_item.added": {
+			const item = data.item as Record<string, unknown> | undefined;
+			return (item?.type as string | undefined) === "function_call";
+		}
+		case "response.content_part.added": {
+			const part = data.part as Record<string, unknown> | undefined;
+			return (part?.type as string | undefined) === "output_text";
+		}
+		case "response.output_text.delta": {
+			const delta = data.delta as string | undefined;
+			return Boolean(delta);
+		}
+		default:
+			return false;
+	}
+}
+
 export class CodexProvider extends BaseProvider {
 	name = "codex";
 	// Fallback map: proxy-operations.ts injects x-better-ccflare-request-id and
@@ -838,15 +878,24 @@ export class CodexProvider extends BaseProvider {
 		// Use the sooner (smallest) reset time
 		const resetTime = resets.length > 0 ? Math.min(...resets) : undefined;
 
-		if (response.status !== 429) {
-			// Return reset time for DB tracking even on successful responses
-			return { isRateLimited: false, resetTime };
+		if (response.status === 429) {
+			return {
+				isRateLimited: true,
+				resetTime: resetTime ?? Date.now() + 60 * 60 * 1000,
+			};
 		}
 
-		return {
-			isRateLimited: true,
-			resetTime: resetTime ?? Date.now() + 60 * 60 * 1000,
-		};
+		// 529 (overloaded_error) is rate limiting too, but unlike 429 we do not
+		// synthesize a resetTime when Codex doesn't send one. A missing resetTime
+		// here is the signal proxy-operations.ts uses to attempt bounded in-place
+		// retries before falling back to account cooldown; forcing a synthesized
+		// resetTime would skip that retry path entirely.
+		if (response.status === 529) {
+			return { isRateLimited: true, resetTime };
+		}
+
+		// Return reset time for DB tracking even on successful responses
+		return { isRateLimited: false, resetTime };
 	}
 
 	supportsOAuth(): boolean {
@@ -2181,7 +2230,10 @@ export class CodexProvider extends BaseProvider {
 				const respId = (resp?.id as string) || state.messageId;
 				state.messageId = respId;
 				state.model = (resp?.model as string) || state.model;
-				if (state.hasSentMessageStart) {
+				if (
+					state.hasSentMessageStart ||
+					!codexEventCommitsOutput(eventName, data)
+				) {
 					break;
 				}
 
@@ -2192,12 +2244,11 @@ export class CodexProvider extends BaseProvider {
 			case "response.output_item.added": {
 				const item = data.item as Record<string, unknown> | undefined;
 				const outputIndex = data.output_index as number | undefined;
-				const itemType = item?.type as string | undefined;
 
-				if (itemType === "message") {
-					// Text content block will start on content_part.added
-					// Nothing to emit yet
-				} else if (itemType === "function_call") {
+				// Text content blocks start on content_part.added instead, so
+				// message items (and anything other than function_call) have
+				// nothing to emit here.
+				if (codexEventCommitsOutput(eventName, data)) {
 					const callId = item?.call_id as string;
 					const name = item?.name as string;
 					state.sawToolUse = true;
@@ -2232,10 +2283,7 @@ export class CodexProvider extends BaseProvider {
 			}
 
 			case "response.content_part.added": {
-				const part = data.part as Record<string, unknown> | undefined;
-				const partType = part?.type as string | undefined;
-
-				if (partType === "output_text") {
+				if (codexEventCommitsOutput(eventName, data)) {
 					await ensureMessageStart();
 					// Start a text content block
 					if (state.hasSentContentBlockStart) {
@@ -2266,7 +2314,7 @@ export class CodexProvider extends BaseProvider {
 
 			case "response.output_text.delta": {
 				const delta = data.delta as string | undefined;
-				if (delta) {
+				if (codexEventCommitsOutput(eventName, data)) {
 					await ensureMessageStart();
 					await writeSSE("content_block_delta", {
 						type: "content_block_delta",

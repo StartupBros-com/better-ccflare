@@ -14,6 +14,39 @@ import {
 
 const log = new Logger("ResponseProcessor");
 
+/**
+ * Releases a `response.clone()` tee branch that a provider hook (parseUsage /
+ * extractUsageInfo) may resolve without ever reading. Per the Streams spec,
+ * cancelling one tee branch never settles until every sibling branch has
+ * been cancelled or fully read: an abandoned, never-touched clone left
+ * lying around can block cancellation of the ORIGINAL response elsewhere
+ * (e.g. proxy-operations.ts's discardUnusedResponse on rate-limited
+ * failover) forever. BaseProvider's default extractUsageInfo is exactly
+ * this case: it returns null without touching `_response` at all.
+ *
+ * Only acts when `bodyUsed` is still false, i.e. nothing ever started
+ * reading this exact clone. Providers that DO consume the body (directly,
+ * or via their own internal `response.clone()`) leave `bodyUsed` false on
+ * this outer clone too in the common "clone-then-read-the-inner-clone"
+ * pattern used by anthropic/openai/base-anthropic-compatible, but fully
+ * draining their inner clone also closes this one (tee branches close
+ * together once the shared underlying source reaches EOF), so cancelling an
+ * already-closed stream here is a harmless, immediately-resolved no-op.
+ * Never awaited by the caller: cancellation may itself stay pending on a
+ * still-unresolved sibling branch, and this function must never become
+ * another place a caller can get stuck waiting.
+ */
+function releaseUnconsumedClone(clone: Response): void {
+	if (clone.bodyUsed) return;
+	try {
+		clone.body?.cancel().catch(() => {
+			// Best effort only; see function doc above.
+		});
+	} catch {
+		// Body may already be locked/disturbed by the time we check; ignore.
+	}
+}
+
 function isSyntheticCountTokensRequest(
 	ctx: ProxyContext,
 	requestMeta?: { path?: string },
@@ -166,9 +199,10 @@ export function updateAccountMetadata(
 
 		if (isStream && ctx.provider.parseUsage) {
 			const parseUsage = ctx.provider.parseUsage.bind(ctx.provider);
+			const usageClone = response.clone() as Response;
 			(async () => {
 				try {
-					const usageInfo = await parseUsage(response.clone() as Response);
+					const usageInfo = await parseUsage(usageClone);
 					if (usageInfo) {
 						log.debug(
 							`Extracted streaming usage for account ${account.name}: ${JSON.stringify(usageInfo)}`,
@@ -187,15 +221,16 @@ export function updateAccountMetadata(
 						`Failed to extract streaming usage for account ${account.name}:`,
 						error,
 					);
+				} finally {
+					releaseUnconsumedClone(usageClone);
 				}
 			})();
 		} else if (ctx.provider.extractUsageInfo) {
 			const extractUsageInfo = ctx.provider.extractUsageInfo.bind(ctx.provider);
+			const usageClone = response.clone() as Response;
 			(async () => {
 				try {
-					const usageInfo = await extractUsageInfo(
-						response.clone() as Response,
-					);
+					const usageInfo = await extractUsageInfo(usageClone);
 					if (usageInfo) {
 						log.debug(
 							`Extracted usage info for account ${account.name}: ${JSON.stringify(usageInfo)}`,
@@ -214,6 +249,8 @@ export function updateAccountMetadata(
 						`Failed to extract usage info for account ${account.name}:`,
 						error,
 					);
+				} finally {
+					releaseUnconsumedClone(usageClone);
 				}
 			})();
 		}
