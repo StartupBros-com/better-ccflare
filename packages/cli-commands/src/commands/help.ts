@@ -60,6 +60,12 @@ Commands:
     Quick check for accounts that need re-authentication
     Shows only accounts that require immediate attention
 
+  --cache-flight-recorder-report <id> [--json]
+    Report a retained cache flight recorder timeline by opaque recorder ID
+
+  --cache-flight-recorder-health [--json]
+    Show recorder enabled state, retention, counts, and persistence health
+
   help
     Show this help message
 

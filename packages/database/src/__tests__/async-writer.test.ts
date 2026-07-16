@@ -61,9 +61,10 @@ describe("AsyncDbWriter", () => {
 	test("enqueue() backward-compatible runs job and drains queue", async () => {
 		writer = new AsyncDbWriter();
 		let counter = 0;
-		writer.enqueue(() => {
+		const accepted = writer.enqueue(() => {
 			counter++;
 		});
+		expect(accepted).toBe(true);
 
 		// Drain interval = 100 ms; processQueue is also kicked synchronously
 		// on enqueue, so this should be done almost immediately.
@@ -86,8 +87,9 @@ describe("AsyncDbWriter", () => {
 			await gate.wait();
 		});
 		// Fill the rest with no-ops; they won't run because the first awaits forever.
+		const admissions: boolean[] = [];
 		for (let i = 1; i < 2100; i++) {
-			writer.enqueue(() => {});
+			admissions.push(writer.enqueue(() => {}));
 		}
 
 		const h = writer.getHealth();
@@ -97,6 +99,9 @@ describe("AsyncDbWriter", () => {
 		// OR job #1 is still in queue depending on event-loop scheduling.
 		expect(h.metadataQueuedJobs).toBeLessThanOrEqual(2000);
 		expect(h.metadataDropped).toBeGreaterThanOrEqual(99);
+		expect(admissions.filter((accepted) => !accepted).length).toBe(
+			h.metadataDropped,
+		);
 	});
 
 	test("enqueuePayload accepts up to byte cap, then rejects", async () => {

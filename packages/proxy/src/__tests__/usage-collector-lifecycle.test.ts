@@ -54,12 +54,29 @@ type UsageCollectorInstance = InstanceType<typeof UsageCollector>;
 
 const INACTIVITY_TIMEOUT_MS = 2 * 60 * 1000;
 
+interface RecorderWrite {
+	recorderConversationId: string;
+	turn: import("@better-ccflare/core").TurnEvidence;
+}
+
 interface TestHarness {
 	collector: UsageCollectorInstance;
 	saveRequestIds: string[];
 	payloads: Map<string, string>;
+	recorderWrites: RecorderWrite[];
+	markedIncomplete: Array<{
+		id: string;
+		dropped: boolean;
+		droppedCount?: number;
+	}>;
 	summaryCosts: Map<string, number | undefined>;
 	summaries: string[];
+}
+
+interface HarnessOptions {
+	acceptMetadata?: boolean;
+	recorderFailure?: Error;
+	storePayloads?: boolean;
 }
 
 interface TestRequestState {
@@ -110,9 +127,17 @@ function makeStartMessage(
 	};
 }
 
-function createHarness(storePayloads = false): TestHarness {
+function createHarness(options: HarnessOptions | boolean = {}): TestHarness {
+	const resolved =
+		typeof options === "boolean" ? { storePayloads: options } : options;
 	const saveRequestIds: string[] = [];
 	const payloads = new Map<string, string>();
+	const recorderWrites: RecorderWrite[] = [];
+	const markedIncomplete: Array<{
+		id: string;
+		dropped: boolean;
+		droppedCount?: number;
+	}> = [];
 	const summaryCosts = new Map<string, number | undefined>();
 	const summaries: string[] = [];
 	const pendingWrites = new Set<Promise<void>>();
@@ -128,13 +153,32 @@ function createHarness(storePayloads = false): TestHarness {
 		): Promise<void> {
 			payloads.set(requestId, payload);
 		},
+		async appendCacheFlightRecorderTurn(
+			recorderConversationId: string,
+			turn: import("@better-ccflare/core").TurnEvidence,
+		): Promise<void> {
+			if (resolved.recorderFailure) throw resolved.recorderFailure;
+			recorderWrites.push({ recorderConversationId, turn });
+		},
+		async markCacheFlightRecorderIncomplete(
+			recorderConversationId: string,
+			options?: { dropped?: boolean; droppedCount?: number },
+		): Promise<void> {
+			markedIncomplete.push({
+				id: recorderConversationId,
+				dropped: options?.dropped === true,
+				droppedCount: options?.droppedCount,
+			});
+		},
 	};
 
 	const asyncWriter = {
-		enqueue(task: () => Promise<void> | void): void {
+		enqueue(task: () => Promise<void> | void): boolean {
+			if (resolved.acceptMetadata === false) return false;
 			const pending = Promise.resolve().then(task);
 			pendingWrites.add(pending);
 			void pending.finally(() => pendingWrites.delete(pending));
+			return true;
 		},
 		async dispose(): Promise<void> {
 			await Promise.allSettled([...pendingWrites]);
@@ -155,14 +199,22 @@ function createHarness(storePayloads = false): TestHarness {
 	const collector = new UsageCollector(
 		dbOps as never,
 		asyncWriter as never,
-		() => storePayloads,
+		() => resolved.storePayloads === true,
 		(summary) => {
 			summaries.push(summary.id);
 			summaryCosts.set(summary.id, summary.costUsd);
 		},
 	);
 
-	return { collector, saveRequestIds, payloads, summaries, summaryCosts };
+	return {
+		collector,
+		markedIncomplete,
+		payloads,
+		recorderWrites,
+		saveRequestIds,
+		summaries,
+		summaryCosts,
+	};
 }
 
 function testable(collector: UsageCollectorInstance): TestableCollector {
@@ -289,6 +341,307 @@ describe("UsageCollector request lifecycle", () => {
 		}
 		expect(message).not.toContain("session_id");
 		expect(message).not.toContain("raw prompt");
+	});
+
+	it("appends one full privacy-safe terminal turn while preserving the native canary", async () => {
+		const { collector, recorderWrites } = createHarness();
+		collectors.push(collector);
+		const canaryEvents: LogEvent[] = [];
+		const onLog = (event: LogEvent) => {
+			if (event.msg.startsWith("Grok cache canary ")) canaryEvents.push(event);
+		};
+		logBus.on("log", onLog);
+		try {
+			collector.handleStart(
+				makeStartMessage("recorder-full", {
+					accountId: "xai-account",
+					providerName: "xai",
+					xaiCacheIdentityFingerprint: "identity12345678",
+					xaiCachePrefixFingerprint: "prefix123456789",
+					xaiCacheOfficialEndpoint: true,
+					xaiCacheKeyPresent: true,
+					cacheFlightRecorderConversationId:
+						"cfr_0123456789abcdef0123456789abcdef",
+					cacheFlightRecorderEligible: true,
+					cacheFlightRecorderNativeActive: true,
+				}),
+			);
+			collector.handleChunk(
+				"recorder-full",
+				new TextEncoder().encode(
+					'event: message_start\ndata: {"type":"message_start","message":{"model":"grok-4","usage":{"input_tokens":20,"output_tokens":0}}}\n\nevent: message_delta\ndata: {"type":"message_delta","usage":{"input_tokens":20,"output_tokens":5,"cache_read_input_tokens":12}}\n\n',
+				),
+			);
+			await collector.handleEnd({
+				type: "end",
+				requestId: "recorder-full",
+				success: true,
+			});
+			await collector.drain();
+		} finally {
+			logBus.off("log", onLog);
+		}
+
+		expect(recorderWrites).toEqual([
+			{
+				recorderConversationId: "cfr_0123456789abcdef0123456789abcdef",
+				turn: {
+					sequence: 0,
+					timestamp: new Date(now).toISOString(),
+					identityFingerprint: "identity12345678",
+					servingAccountId: "xai-account",
+					prefixFingerprint: "prefix123456789",
+					cacheOutcome: "hit",
+					inputTokens: 32,
+					cachedTokens: 12,
+					completeness: "complete",
+					unavailableDimensions: [],
+				},
+			},
+		]);
+		expect(canaryEvents).toHaveLength(1);
+		expect(canaryEvents[0]?.msg).toContain(
+			"recorder=cfr_0123456789abcdef0123456789abcdef",
+		);
+	});
+
+	it("records partial recorder-only evidence without inventing native dimensions", async () => {
+		const { collector, recorderWrites } = createHarness();
+		collectors.push(collector);
+		collector.handleStart(
+			makeStartMessage("recorder-partial", {
+				accountId: "xai-account",
+				providerName: "xai",
+				xaiCacheOfficialEndpoint: true,
+				cacheFlightRecorderConversationId:
+					"cfr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				cacheFlightRecorderEligible: true,
+				cacheFlightRecorderNativeActive: false,
+			}),
+		);
+		collector.handleChunk(
+			"recorder-partial",
+			new TextEncoder().encode(
+				'event: message_start\ndata: {"type":"message_start","message":{"model":"grok-4","usage":{"input_tokens":20,"output_tokens":0}}}\n\nevent: message_delta\ndata: {"type":"message_delta","usage":{"input_tokens":20,"output_tokens":5,"cache_read_input_tokens":0}}\n\n',
+			),
+		);
+		await collector.handleEnd({
+			type: "end",
+			requestId: "recorder-partial",
+			success: true,
+		});
+		await collector.drain();
+
+		expect(recorderWrites[0]?.turn).toEqual({
+			sequence: 0,
+			timestamp: new Date(now).toISOString(),
+			servingAccountId: "xai-account",
+			cacheOutcome: "miss",
+			inputTokens: 20,
+			cachedTokens: 0,
+			completeness: "partial",
+			unavailableDimensions: ["identity", "cacheable_prefix"],
+		});
+	});
+
+	it("keeps missing cache telemetry unknown and omits cached tokens", async () => {
+		const { collector, recorderWrites } = createHarness();
+		collectors.push(collector);
+		collector.handleStart(
+			makeStartMessage("recorder-unknown", {
+				accountId: "xai-account",
+				providerName: "xai",
+				xaiCacheOfficialEndpoint: true,
+				cacheFlightRecorderConversationId:
+					"cfr_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+				cacheFlightRecorderEligible: true,
+				cacheFlightRecorderNativeActive: false,
+			}),
+		);
+		collector.handleChunk("recorder-unknown", modelBearingChunk());
+		await collector.handleEnd({
+			type: "end",
+			requestId: "recorder-unknown",
+			success: true,
+		});
+		await collector.drain();
+
+		expect(recorderWrites[0]?.turn.cacheOutcome).toBe("unknown");
+		expect(recorderWrites[0]?.turn.cachedTokens).toBeUndefined();
+		expect(recorderWrites[0]?.turn.unavailableDimensions).toContain(
+			"cache_outcome",
+		);
+	});
+
+	it("omits invented input tokens and marks the turn partial when no token telemetry was observed", async () => {
+		const { collector, recorderWrites } = createHarness();
+		collectors.push(collector);
+		collector.handleStart(
+			makeStartMessage("recorder-no-telemetry", {
+				accountId: "xai-account",
+				providerName: "xai",
+				xaiCacheOfficialEndpoint: true,
+				cacheFlightRecorderConversationId: "cfr_notelemetry000000000000000000",
+				cacheFlightRecorderEligible: true,
+				cacheFlightRecorderNativeActive: false,
+			}),
+		);
+		// No handleChunk call at all: no token usage telemetry is ever observed
+		// for this request, so no numeric total should be invented.
+		await collector.handleEnd({
+			type: "end",
+			requestId: "recorder-no-telemetry",
+			success: true,
+		});
+		await collector.drain();
+
+		const turn = recorderWrites[0]?.turn;
+		expect(turn).toBeDefined();
+		expect(turn && "inputTokens" in turn).toBe(false);
+		expect(turn?.inputTokens).toBeUndefined();
+		expect(turn?.cachedTokens).toBeUndefined();
+		expect(turn?.unavailableDimensions).toContain("token_accounting");
+		expect(turn?.completeness).toBe("partial");
+	});
+
+	it("keeps the normalized input token sum when telemetry was observed", async () => {
+		const { collector, recorderWrites } = createHarness();
+		collectors.push(collector);
+		collector.handleStart(
+			makeStartMessage("recorder-telemetry-observed", {
+				accountId: "xai-account",
+				providerName: "xai",
+				xaiCacheIdentityFingerprint: "identity12345678",
+				xaiCachePrefixFingerprint: "prefix123456789",
+				xaiCacheOfficialEndpoint: true,
+				cacheFlightRecorderConversationId: "cfr_observed0000000000000000000000",
+				cacheFlightRecorderEligible: true,
+				cacheFlightRecorderNativeActive: true,
+			}),
+		);
+		collector.handleChunk(
+			"recorder-telemetry-observed",
+			new TextEncoder().encode(
+				'event: message_start\ndata: {"type":"message_start","message":{"model":"grok-4","usage":{"input_tokens":20,"output_tokens":0}}}\n\nevent: message_delta\ndata: {"type":"message_delta","usage":{"input_tokens":20,"output_tokens":5,"cache_read_input_tokens":12}}\n\n',
+			),
+		);
+		await collector.handleEnd({
+			type: "end",
+			requestId: "recorder-telemetry-observed",
+			success: true,
+		});
+		await collector.drain();
+
+		const turn = recorderWrites[0]?.turn;
+		expect(turn?.inputTokens).toBe(32);
+		expect(turn?.cachedTokens).toBe(12);
+		expect(turn?.unavailableDimensions).not.toContain("token_accounting");
+		expect(turn?.completeness).toBe("complete");
+	});
+
+	it("does not collect non-official or non-xAI recorder metadata", async () => {
+		const { collector, recorderWrites } = createHarness();
+		collectors.push(collector);
+		for (const [requestId, providerName, official] of [
+			["custom-xai", "xai", false],
+			["other-provider", "codex", true],
+		] as const) {
+			collector.handleStart(
+				makeStartMessage(requestId, {
+					providerName,
+					xaiCacheOfficialEndpoint: official,
+					cacheFlightRecorderConversationId:
+						"cfr_cccccccccccccccccccccccccccccccc",
+					cacheFlightRecorderEligible: false,
+				}),
+			);
+			collector.handleChunk(requestId, modelBearingChunk());
+			await collector.handleEnd({ type: "end", requestId, success: true });
+		}
+		await collector.drain();
+		expect(recorderWrites).toEqual([]);
+	});
+
+	it("leaves the response lifecycle successful when recorder admission is rejected", async () => {
+		const { collector, markedIncomplete, recorderWrites, summaries } =
+			createHarness({
+				acceptMetadata: false,
+			});
+		collectors.push(collector);
+		collector.handleStart(
+			makeStartMessage("recorder-rejected", {
+				accountId: "xai-account",
+				providerName: "xai",
+				xaiCacheOfficialEndpoint: true,
+				cacheFlightRecorderConversationId:
+					"cfr_dddddddddddddddddddddddddddddddd",
+				cacheFlightRecorderEligible: true,
+			}),
+		);
+		collector.handleChunk("recorder-rejected", modelBearingChunk());
+		await collector.handleEnd({
+			type: "end",
+			requestId: "recorder-rejected",
+			success: true,
+		});
+		// The dropped marker is buffered off the request path, not written
+		// synchronously: it must not appear before an explicit flush.
+		expect(markedIncomplete).toEqual([]);
+		await collector.drain();
+
+		expect(recorderWrites).toEqual([]);
+		expect(summaries).toContain("recorder-rejected");
+		expect(markedIncomplete).toEqual([
+			{
+				id: "cfr_dddddddddddddddddddddddddddddddd",
+				dropped: true,
+				droppedCount: 1,
+			},
+		]);
+	});
+
+	it("warns without payload content and preserves success on repository failure", async () => {
+		const { collector, markedIncomplete, recorderWrites, summaries } =
+			createHarness({
+				recorderFailure: new Error("repository unavailable"),
+			});
+		collectors.push(collector);
+		const warnings: LogEvent[] = [];
+		const onLog = (event: LogEvent) => {
+			if (event.msg === "Cache flight recorder write failed")
+				warnings.push(event);
+		};
+		logBus.on("log", onLog);
+		try {
+			collector.handleStart(
+				makeStartMessage("recorder-failure", {
+					accountId: "xai-account",
+					providerName: "xai",
+					xaiCacheOfficialEndpoint: true,
+					cacheFlightRecorderConversationId:
+						"cfr_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+					cacheFlightRecorderEligible: true,
+				}),
+			);
+			collector.handleChunk("recorder-failure", modelBearingChunk());
+			await collector.handleEnd({
+				type: "end",
+				requestId: "recorder-failure",
+				success: true,
+			});
+			await collector.drain();
+		} finally {
+			logBus.off("log", onLog);
+		}
+
+		expect(recorderWrites).toEqual([]);
+		expect(summaries).toContain("recorder-failure");
+		expect(warnings).toHaveLength(1);
+		expect(JSON.stringify(warnings[0])).not.toContain("repository unavailable");
+		expect(JSON.stringify(warnings[0])).not.toContain("raw prompt");
+		expect(markedIncomplete).toEqual([
+			{ id: "cfr_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", dropped: true },
+		]);
 	});
 
 	it("treats explicit cache tokens from a generic usage event as present", async () => {
@@ -597,6 +950,117 @@ describe("UsageCollector request lifecycle", () => {
 		});
 		await collector.drain();
 		expect(saveRequestIds).toEqual([]);
+	});
+
+	it("marks an evicted recorder-eligible stream as dropped incomplete evidence", async () => {
+		const { collector, markedIncomplete, recorderWrites } = harness();
+		collector.handleStart(
+			makeStartMessage("recorder-evicted", {
+				accountId: "xai-account",
+				providerName: "xai",
+				xaiCacheOfficialEndpoint: true,
+				cacheFlightRecorderConversationId:
+					"cfr_ffffffffffffffffffffffffffffffff",
+				cacheFlightRecorderEligible: true,
+			}),
+		);
+
+		now += INACTIVITY_TIMEOUT_MS + 1;
+		testable(collector).cleanupStaleRequests();
+		await collector.drain();
+
+		expect(testable(collector).requests.has("recorder-evicted")).toBe(false);
+		expect(recorderWrites).toEqual([]);
+		expect(markedIncomplete).toEqual([
+			{
+				id: "cfr_ffffffffffffffffffffffffffffffff",
+				dropped: true,
+				droppedCount: 1,
+			},
+		]);
+	});
+
+	it("coalesces repeated drops for one conversation into a single summed marker", async () => {
+		const { collector, markedIncomplete, recorderWrites } = createHarness({
+			acceptMetadata: false,
+		});
+		collectors.push(collector);
+		const conversationId = "cfr_coalesce00000000000000000000";
+
+		for (let i = 0; i < 3; i++) {
+			collector.handleStart(
+				makeStartMessage(`recorder-coalesce-${i}`, {
+					accountId: "xai-account",
+					providerName: "xai",
+					xaiCacheOfficialEndpoint: true,
+					cacheFlightRecorderConversationId: conversationId,
+					cacheFlightRecorderEligible: true,
+				}),
+			);
+			collector.handleChunk(`recorder-coalesce-${i}`, modelBearingChunk());
+			await collector.handleEnd({
+				type: "end",
+				requestId: `recorder-coalesce-${i}`,
+				success: true,
+			});
+		}
+
+		// Still buffered: three drops for the same conversation have not yet
+		// produced any write, proving the hot path never calls the DB directly.
+		expect(markedIncomplete).toEqual([]);
+
+		await collector.drain();
+
+		expect(recorderWrites).toEqual([]);
+		expect(markedIncomplete).toEqual([
+			{ id: conversationId, dropped: true, droppedCount: 3 },
+		]);
+	});
+
+	it("caps the pending drop-marker buffer at 1024 distinct conversations and warns without throwing", async () => {
+		const { collector, markedIncomplete } = createHarness({
+			acceptMetadata: false,
+		});
+		collectors.push(collector);
+		const warnings: LogEvent[] = [];
+		const onLog = (event: LogEvent) => {
+			if (event.msg.includes("Dropped recorder evidence marker buffer full")) {
+				warnings.push(event);
+			}
+		};
+		logBus.on("log", onLog);
+
+		try {
+			for (let i = 0; i < 1025; i++) {
+				const conversationId = `cfr_overflow${String(i).padStart(21, "0")}`;
+				const requestId = `recorder-overflow-${i}`;
+				collector.handleStart(
+					makeStartMessage(requestId, {
+						accountId: "xai-account",
+						providerName: "xai",
+						xaiCacheOfficialEndpoint: true,
+						cacheFlightRecorderConversationId: conversationId,
+						cacheFlightRecorderEligible: true,
+					}),
+				);
+				collector.handleChunk(requestId, modelBearingChunk());
+				await collector.handleEnd({
+					type: "end",
+					requestId,
+					success: true,
+				});
+			}
+
+			expect(warnings.length).toBeGreaterThan(0);
+
+			await collector.drain();
+		} finally {
+			logBus.off("log", onLog);
+		}
+
+		// The buffer never grows past its cap; the 1025th distinct ID is lost
+		// (logged, not thrown) rather than allowed to write unboundedly.
+		expect(markedIncomplete.length).toBeLessThanOrEqual(1024);
 	});
 
 	it("retains the capacity safeguard and frees the oldest evicted state", () => {

@@ -91,7 +91,7 @@ export class AsyncDbWriter implements Disposable {
 		}, 30000);
 	}
 
-	enqueue(job: DbJob): void {
+	enqueue(job: DbJob): boolean {
 		if (this.metadataQueue.length >= this.METADATA_QUEUE_CAP) {
 			this.metadataDropped++;
 			this.droppedJobsSinceLastLog++;
@@ -100,7 +100,7 @@ export class AsyncDbWriter implements Disposable {
 					`Metadata queue at capacity (${this.METADATA_QUEUE_CAP}), dropping jobs. Total dropped: ${this.metadataDropped}`,
 				);
 			}
-			return;
+			return false;
 		}
 
 		this.metadataQueue.push({
@@ -108,6 +108,7 @@ export class AsyncDbWriter implements Disposable {
 			run: job,
 		});
 		void this.processQueue();
+		return true;
 	}
 
 	canAcceptPayload(estimatedBytes: number): boolean {
