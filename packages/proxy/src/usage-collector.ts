@@ -37,6 +37,7 @@ interface RequestState {
 	usage: {
 		model?: string;
 		inputTokens?: number;
+		inputTokensPresent?: boolean;
 		cacheReadInputTokens?: number;
 		cacheReadInputTokensPresent?: boolean;
 		cacheCreationInputTokens?: number;
@@ -168,7 +169,10 @@ function extractUsageFromJson(
 
 	state.usage.model = json.model ?? state.usage.model;
 
-	state.usage.inputTokens = usageObj.input_tokens ?? 0;
+	if (usageObj.input_tokens !== undefined) {
+		state.usage.inputTokens = usageObj.input_tokens;
+		state.usage.inputTokensPresent = true;
+	}
 	if (usageObj.cache_read_input_tokens !== undefined) {
 		state.usage.cacheReadInputTokens = usageObj.cache_read_input_tokens;
 		state.usage.cacheReadInputTokensPresent = true;
@@ -201,7 +205,10 @@ function extractUsageFromData(
 		if (isMessageStart) {
 			if (parsed.message?.usage) {
 				const usage = parsed.message.usage;
-				state.usage.inputTokens = usage.input_tokens || 0;
+				if (usage.input_tokens !== undefined) {
+					state.usage.inputTokens = usage.input_tokens;
+					state.usage.inputTokensPresent = true;
+				}
 				if (usage.cache_read_input_tokens !== undefined) {
 					state.usage.cacheReadInputTokens = usage.cache_read_input_tokens;
 					state.usage.cacheReadInputTokensPresent = true;
@@ -234,6 +241,7 @@ function extractUsageFromData(
 				}
 				if (parsed.usage.input_tokens !== undefined) {
 					state.usage.inputTokens = parsed.usage.input_tokens;
+					state.usage.inputTokensPresent = true;
 				}
 				if (parsed.usage.cache_read_input_tokens !== undefined) {
 					state.usage.cacheReadInputTokens =
@@ -252,6 +260,7 @@ function extractUsageFromData(
 		if (parsed.usage) {
 			if (parsed.usage.input_tokens !== undefined) {
 				state.usage.inputTokens = parsed.usage.input_tokens;
+				state.usage.inputTokensPresent = true;
 			}
 			if (parsed.usage.output_tokens !== undefined) {
 				state.usage.outputTokens = parsed.usage.output_tokens;
@@ -791,6 +800,13 @@ export class UsageCollector {
 			if (recorderCacheOutcome === "unknown") {
 				unavailableDimensions.push("cache_outcome");
 			}
+			// Token telemetry was only actually observed for this request if a
+			// provider payload set inputTokensPresent; otherwise a "0" total
+			// would be an invented number, not an honestly reported one.
+			const inputTokensObserved = state.usage.inputTokensPresent === true;
+			if (!inputTokensObserved) {
+				unavailableDimensions.push("token_accounting");
+			}
 			const turn: TurnEvidence = {
 				// The repository allocates the durable sequence at the persistence boundary.
 				sequence: 0,
@@ -809,10 +825,14 @@ export class UsageCollector {
 						}
 					: {}),
 				cacheOutcome: recorderCacheOutcome,
-				inputTokens:
-					(state.usage.inputTokens ?? 0) +
-					(state.usage.cacheReadInputTokens ?? 0) +
-					(state.usage.cacheCreationInputTokens ?? 0),
+				...(inputTokensObserved
+					? {
+							inputTokens:
+								(state.usage.inputTokens ?? 0) +
+								(state.usage.cacheReadInputTokens ?? 0) +
+								(state.usage.cacheCreationInputTokens ?? 0),
+						}
+					: {}),
 				...(state.usage.cacheReadInputTokensPresent === true
 					? { cachedTokens: state.usage.cacheReadInputTokens ?? 0 }
 					: {}),

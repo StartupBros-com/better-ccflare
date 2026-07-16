@@ -473,6 +473,72 @@ describe("UsageCollector request lifecycle", () => {
 		);
 	});
 
+	it("omits invented input tokens and marks the turn partial when no token telemetry was observed", async () => {
+		const { collector, recorderWrites } = createHarness();
+		collectors.push(collector);
+		collector.handleStart(
+			makeStartMessage("recorder-no-telemetry", {
+				accountId: "xai-account",
+				providerName: "xai",
+				xaiCacheOfficialEndpoint: true,
+				cacheFlightRecorderConversationId: "cfr_notelemetry000000000000000000",
+				cacheFlightRecorderEligible: true,
+				cacheFlightRecorderNativeActive: false,
+			}),
+		);
+		// No handleChunk call at all: no token usage telemetry is ever observed
+		// for this request, so no numeric total should be invented.
+		await collector.handleEnd({
+			type: "end",
+			requestId: "recorder-no-telemetry",
+			success: true,
+		});
+		await collector.drain();
+
+		const turn = recorderWrites[0]?.turn;
+		expect(turn).toBeDefined();
+		expect(turn && "inputTokens" in turn).toBe(false);
+		expect(turn?.inputTokens).toBeUndefined();
+		expect(turn?.cachedTokens).toBeUndefined();
+		expect(turn?.unavailableDimensions).toContain("token_accounting");
+		expect(turn?.completeness).toBe("partial");
+	});
+
+	it("keeps the normalized input token sum when telemetry was observed", async () => {
+		const { collector, recorderWrites } = createHarness();
+		collectors.push(collector);
+		collector.handleStart(
+			makeStartMessage("recorder-telemetry-observed", {
+				accountId: "xai-account",
+				providerName: "xai",
+				xaiCacheIdentityFingerprint: "identity12345678",
+				xaiCachePrefixFingerprint: "prefix123456789",
+				xaiCacheOfficialEndpoint: true,
+				cacheFlightRecorderConversationId: "cfr_observed0000000000000000000000",
+				cacheFlightRecorderEligible: true,
+				cacheFlightRecorderNativeActive: true,
+			}),
+		);
+		collector.handleChunk(
+			"recorder-telemetry-observed",
+			new TextEncoder().encode(
+				'event: message_start\ndata: {"type":"message_start","message":{"model":"grok-4","usage":{"input_tokens":20,"output_tokens":0}}}\n\nevent: message_delta\ndata: {"type":"message_delta","usage":{"input_tokens":20,"output_tokens":5,"cache_read_input_tokens":12}}\n\n',
+			),
+		);
+		await collector.handleEnd({
+			type: "end",
+			requestId: "recorder-telemetry-observed",
+			success: true,
+		});
+		await collector.drain();
+
+		const turn = recorderWrites[0]?.turn;
+		expect(turn?.inputTokens).toBe(32);
+		expect(turn?.cachedTokens).toBe(12);
+		expect(turn?.unavailableDimensions).not.toContain("token_accounting");
+		expect(turn?.completeness).toBe("complete");
+	});
+
 	it("does not collect non-official or non-xAI recorder metadata", async () => {
 		const { collector, recorderWrites } = createHarness();
 		collectors.push(collector);
