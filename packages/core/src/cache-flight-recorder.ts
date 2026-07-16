@@ -343,10 +343,7 @@ export function diagnoseTimeline(timeline: Timeline): DiagnosisReport {
 			diagnosedSequence: current.sequence,
 			cause,
 			completeness: integrity.completeness,
-			supportingEvidence: [
-				...(changed.length > 0 ? changed : lineageEvidence),
-				missEvidence,
-			],
+			supportingEvidence: [...lineageEvidence, missEvidence],
 			continuityProof: [],
 			gaps: integrity.gaps,
 			unavailableDimensions: integrity.unavailableDimensions,

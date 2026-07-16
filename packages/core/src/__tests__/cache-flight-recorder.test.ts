@@ -105,6 +105,14 @@ describe("diagnoseTimeline", () => {
 				kind: "changed",
 			}),
 		);
+		// The stable prerequisite must survive alongside the changed dimension:
+		// identity staying put is proof the miss isn't an identity break.
+		expect(report.supportingEvidence).toContainEqual(
+			expect.objectContaining({
+				dimension: "identity",
+				kind: "stable",
+			}),
+		);
 	});
 
 	it("diagnoses a cacheable prefix change when identity and account are stable", () => {
@@ -124,6 +132,20 @@ describe("diagnoseTimeline", () => {
 			expect.objectContaining({
 				dimension: "cacheable_prefix",
 				kind: "changed",
+			}),
+		);
+		// Stable prerequisites (identity and serving account) must remain so
+		// the report proves the break wasn't caused by either of them.
+		expect(report.supportingEvidence).toContainEqual(
+			expect.objectContaining({
+				dimension: "identity",
+				kind: "stable",
+			}),
+		);
+		expect(report.supportingEvidence).toContainEqual(
+			expect.objectContaining({
+				dimension: "serving_account",
+				kind: "stable",
 			}),
 		);
 	});
