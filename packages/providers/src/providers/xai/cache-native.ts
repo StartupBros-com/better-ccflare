@@ -12,6 +12,9 @@ import {
 /** Opt-in: set to "1" to enable the Grok Chat cache-native vertical slice. */
 export const XAI_CACHE_NATIVE_ENV = "CCFLARE_XAI_CACHE_NATIVE";
 
+/** Independent opt-in for privacy-safe cache flight recorder evidence. */
+export const CACHE_FLIGHT_RECORDER_ENV = "CCFLARE_CACHE_FLIGHT_RECORDER";
+
 /** Official Chat Completions affinity header (xAI docs). */
 export const XAI_CONV_ID_HEADER = "x-grok-conv-id";
 
@@ -22,6 +25,12 @@ export function isXaiCacheNativeEnabled(
 	env: NodeJS.ProcessEnv = process.env,
 ): boolean {
 	return env[XAI_CACHE_NATIVE_ENV] === "1";
+}
+
+export function isCacheFlightRecorderEnabled(
+	env: NodeJS.ProcessEnv = process.env,
+): boolean {
+	return env[CACHE_FLIGHT_RECORDER_ENV] === "1";
 }
 
 export type { XaiCacheCanaryFields, XaiCacheOutcome };
@@ -70,6 +79,69 @@ function firstMessageSeed(messages: unknown): string | undefined {
 	}
 }
 
+interface ConversationPartitionMaterial {
+	sessionId: string;
+	instructions: string;
+	firstMessage: string;
+}
+
+interface RecorderTimelineMaterial {
+	sessionId: string;
+	firstMessage: string;
+}
+
+function conversationPartitionMaterial(
+	body: Record<string, unknown>,
+): ConversationPartitionMaterial | undefined {
+	const sessionId = extractClaudeSessionId(body);
+	if (!sessionId) return undefined;
+	const firstMessage = firstMessageSeed(body.messages);
+	if (firstMessage === undefined) return undefined;
+	return {
+		sessionId,
+		instructions: systemSeed(body.system),
+		firstMessage,
+	};
+}
+
+function hashRecorderTimeline(
+	domain: string,
+	material: RecorderTimelineMaterial,
+): string {
+	return createHash("sha256")
+		.update(domain)
+		.update("\0")
+		.update(material.sessionId)
+		.update("\0")
+		.update(material.firstMessage)
+		.digest("hex");
+}
+
+/**
+ * Stable lookup ID for the recorder's append-only timeline.
+ *
+ * Deliberately excludes `instructions` from the key: instructions changes
+ * must surface as identity/prefix fingerprint transitions *inside* one
+ * timeline (that's what the recorder's identity_changed and
+ * cacheable_prefix_changed diagnoses observe), not as a split into a new
+ * timeline. sessionId and firstMessage stay in the key so sibling
+ * conversations sharing a Claude session ID (subagent traffic) still land
+ * on separate timelines.
+ *
+ * Never exposes the native affinity key or raw partition input.
+ */
+export function deriveCacheFlightRecorderId(
+	body: Record<string, unknown>,
+): string | undefined {
+	const material = conversationPartitionMaterial(body);
+	if (!material) return undefined;
+	const timelineMaterial: RecorderTimelineMaterial = {
+		sessionId: material.sessionId,
+		firstMessage: material.firstMessage,
+	};
+	return `cfr_${hashRecorderTimeline("better-ccflare/cache-flight-recorder/v2", timelineMaterial).slice(0, 32)}`;
+}
+
 export interface XaiConversationIdentity {
 	/** Full privacy-safe header value (no raw session UUID). */
 	headerValue: string;
@@ -88,12 +160,9 @@ export interface XaiConversationIdentity {
 export function deriveXaiConversationIdentity(
 	body: Record<string, unknown>,
 ): XaiConversationIdentity | undefined {
-	const sessionId = extractClaudeSessionId(body);
-	if (!sessionId) return undefined;
-
-	const instructions = systemSeed(body.system);
-	const firstMessage = firstMessageSeed(body.messages);
-	if (firstMessage === undefined) return undefined;
+	const material = conversationPartitionMaterial(body);
+	if (!material) return undefined;
+	const { sessionId, instructions, firstMessage } = material;
 
 	const digest = createHash("sha256")
 		.update(sessionId)

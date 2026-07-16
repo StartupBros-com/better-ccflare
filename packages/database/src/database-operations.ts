@@ -3,7 +3,7 @@ import { mkdirSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { RuntimeConfig } from "@better-ccflare/config";
-import type { Disposable } from "@better-ccflare/core";
+import type { Disposable, TurnEvidence } from "@better-ccflare/core";
 import { TIME_CONSTANTS } from "@better-ccflare/core";
 import type {
 	Account,
@@ -30,6 +30,10 @@ import { resolveDbPath } from "./paths";
 import { AccountRepository } from "./repositories/account.repository";
 import { AgentPreferenceRepository } from "./repositories/agent-preference.repository";
 import { ApiKeyRepository } from "./repositories/api-key.repository";
+import {
+	CacheFlightRecorderRepository,
+	type MarkIncompleteOptions,
+} from "./repositories/cache-flight-recorder.repository";
 import { ComboRepository } from "./repositories/combo.repository";
 import { OAuthRepository } from "./repositories/oauth.repository";
 import {
@@ -335,6 +339,7 @@ export class DatabaseOperations implements StrategyStore, Disposable {
 	private apiKeys: ApiKeyRepository;
 	private combo: ComboRepository;
 	private usageHistory: UsageHistoryRepository;
+	private cacheFlightRecorder: CacheFlightRecorderRepository;
 
 	constructor(
 		dbPath?: string,
@@ -475,6 +480,7 @@ export class DatabaseOperations implements StrategyStore, Disposable {
 		this.apiKeys = new ApiKeyRepository(this.adapter);
 		this.combo = new ComboRepository(this.adapter);
 		this.usageHistory = new UsageHistoryRepository(this.adapter);
+		this.cacheFlightRecorder = new CacheFlightRecorderRepository(this.adapter);
 	}
 
 	/**
@@ -949,6 +955,62 @@ OAuth tokens will need to be re-authenticated.
 
 	async pruneUsageSnapshots(cutoffTs: number): Promise<number> {
 		return this.usageHistory.deleteOlderThan(cutoffTs);
+	}
+
+	getCacheFlightRecorderRepository(): CacheFlightRecorderRepository {
+		return this.cacheFlightRecorder;
+	}
+
+	async appendCacheFlightRecorderTurn(
+		recorderConversationId: string,
+		turn: TurnEvidence,
+		recordedAt?: number,
+	): Promise<void> {
+		await this.cacheFlightRecorder.appendTurn(
+			recorderConversationId,
+			turn,
+			recordedAt,
+		);
+	}
+
+	async loadCacheFlightRecorderTimeline(recorderConversationId: string) {
+		return this.cacheFlightRecorder.loadTimeline(recorderConversationId);
+	}
+
+	async lookupCacheFlightRecorderTimeline(recorderConversationId: string) {
+		return this.cacheFlightRecorder.lookupTimeline(recorderConversationId);
+	}
+
+	async markCacheFlightRecorderIncomplete(
+		recorderConversationId: string,
+		options?: MarkIncompleteOptions,
+	): Promise<void> {
+		await this.cacheFlightRecorder.markIncomplete(
+			recorderConversationId,
+			options,
+		);
+	}
+
+	async getCacheFlightRecorderCounts() {
+		const [retained, evidence] = await Promise.all([
+			this.cacheFlightRecorder.countRetained(),
+			this.cacheFlightRecorder.countDroppedIncomplete(),
+		]);
+		return { retained, ...evidence };
+	}
+
+	async expireCacheFlightRecorderTimelines(
+		cutoffTs: number,
+		tombstoneExpiresAt: number,
+	): Promise<number> {
+		return this.cacheFlightRecorder.expireOlderThan(
+			cutoffTs,
+			tombstoneExpiresAt,
+		);
+	}
+
+	async expireCacheFlightRecorderTombstones(now: number): Promise<number> {
+		return this.cacheFlightRecorder.expireTombstonesOlderThan(now);
 	}
 
 	async forceResetAccountRateLimit(accountId: string): Promise<boolean> {

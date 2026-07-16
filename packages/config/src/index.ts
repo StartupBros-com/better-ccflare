@@ -56,6 +56,7 @@ export interface ConfigData {
 	data_retention_days?: number;
 	request_retention_days?: number;
 	usage_history_retention_days?: number;
+	cache_flight_recorder_retention_hours?: number;
 	store_payloads?: boolean;
 	usage_poll_interval_ms?: number;
 	cache_keepalive_ttl_minutes?: number;
@@ -343,6 +344,26 @@ export class Config extends EventEmitter {
 		this.set("usage_history_retention_days", clamped);
 	}
 
+	getCacheFlightRecorderRetentionHours(): number {
+		const fromEnv = process.env.CACHE_FLIGHT_RECORDER_RETENTION_HOURS;
+		if (fromEnv) {
+			const hours = Number(fromEnv);
+			if (Number.isFinite(hours)) return this.clamp(hours, 1, 14 * 24);
+		}
+		const fromFile = this.data.cache_flight_recorder_retention_hours;
+		if (typeof fromFile === "number" && Number.isFinite(fromFile)) {
+			return this.clamp(fromFile, 1, 14 * 24);
+		}
+		return 72;
+	}
+
+	setCacheFlightRecorderRetentionHours(hours: number): void {
+		this.set(
+			"cache_flight_recorder_retention_hours",
+			this.clamp(hours, 1, 14 * 24),
+		);
+	}
+
 	getStorePayloads(): boolean {
 		const fromEnv = process.env.STORE_PAYLOADS;
 		if (fromEnv) {
@@ -620,6 +641,8 @@ export class Config extends EventEmitter {
 			data_retention_days: this.getDataRetentionDays(),
 			request_retention_days: this.getRequestRetentionDays(),
 			usage_history_retention_days: this.getUsageHistoryRetentionDays(),
+			cache_flight_recorder_retention_hours:
+				this.getCacheFlightRecorderRetentionHours(),
 			store_payloads: this.getStorePayloads(),
 			usage_poll_interval_ms: this.getUsagePollIntervalMs(),
 			cache_keepalive_ttl_minutes: this.getCacheKeepaliveTtlMinutes(),

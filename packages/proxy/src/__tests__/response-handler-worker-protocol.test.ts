@@ -159,6 +159,81 @@ describe("forwardToClient usage-collector protocol", () => {
 		expect(starts[0].project).toBeNull();
 	});
 
+	it.each([
+		{ label: "streaming", streaming: true, body: "data: ok\n\n" },
+		{ label: "buffered", streaming: false, body: '{"ok":true}' },
+		{ label: "bodyless", streaming: false, body: null },
+	])("emits the recorder id for $label eligible responses", async ({
+		streaming,
+		body,
+	}) => {
+		const { starts } = createMockCollector();
+		const ctx = createCtx(false);
+		ctx.provider.name = "xai";
+		ctx.provider.isStreamingResponse = () => streaming;
+		const upstream = new Response(body, {
+			status: 200,
+			headers: {
+				"content-type": streaming ? "text/event-stream" : "application/json",
+			},
+		});
+
+		const response = await forwardToClient(
+			{
+				requestId: `req-recorder-${streaming ? "stream" : body ? "body" : "empty"}`,
+				method: "POST",
+				path: "/v1/messages",
+				account: null,
+				requestHeaders: new Headers(),
+				requestBody: null,
+				response: upstream,
+				timestamp: Date.now(),
+				retryAttempt: 0,
+				failoverAttempts: 0,
+				cacheFlightRecorderConversationId:
+					"cfr_0123456789abcdef0123456789abcdef",
+				cacheFlightRecorderEligible: true,
+			},
+			ctx,
+		);
+
+		expect(
+			response.headers.get("x-better-ccflare-cache-flight-recorder-id"),
+		).toBe("cfr_0123456789abcdef0123456789abcdef");
+		expect(starts[0]).toMatchObject({
+			cacheFlightRecorderConversationId: "cfr_0123456789abcdef0123456789abcdef",
+			cacheFlightRecorderEligible: true,
+		});
+		if (body !== null) await response.text();
+	});
+
+	it("does not emit or plumb recorder metadata for ineligible routes", async () => {
+		const { starts } = createMockCollector();
+		const response = await forwardToClient(
+			{
+				requestId: "req-recorder-ineligible",
+				method: "POST",
+				path: "/v1/messages",
+				account: null,
+				requestHeaders: new Headers(),
+				requestBody: null,
+				response: new Response("{}"),
+				timestamp: Date.now(),
+				retryAttempt: 0,
+				failoverAttempts: 0,
+				cacheFlightRecorderConversationId:
+					"cfr_0123456789abcdef0123456789abcdef",
+				cacheFlightRecorderEligible: false,
+			},
+			createCtx(false),
+		);
+
+		expect(
+			response.headers.get("x-better-ccflare-cache-flight-recorder-id"),
+		).toBeNull();
+		expect(starts[0].cacheFlightRecorderConversationId).toBeUndefined();
+	});
+
 	it("does not throw when usage collector call succeeds", async () => {
 		createMockCollector();
 		const ctx = createCtx();
