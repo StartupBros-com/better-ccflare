@@ -85,6 +85,11 @@ interface ConversationPartitionMaterial {
 	firstMessage: string;
 }
 
+interface RecorderTimelineMaterial {
+	sessionId: string;
+	firstMessage: string;
+}
+
 function conversationPartitionMaterial(
 	body: Record<string, unknown>,
 ): ConversationPartitionMaterial | undefined {
@@ -99,28 +104,42 @@ function conversationPartitionMaterial(
 	};
 }
 
-function hashConversationPartition(
+function hashRecorderTimeline(
 	domain: string,
-	material: ConversationPartitionMaterial,
+	material: RecorderTimelineMaterial,
 ): string {
 	return createHash("sha256")
 		.update(domain)
 		.update("\0")
 		.update(material.sessionId)
 		.update("\0")
-		.update(material.instructions)
-		.update("\0")
 		.update(material.firstMessage)
 		.digest("hex");
 }
 
-/** Stable lookup ID that never exposes the native affinity key or raw partition input. */
+/**
+ * Stable lookup ID for the recorder's append-only timeline.
+ *
+ * Deliberately excludes `instructions` from the key: instructions changes
+ * must surface as identity/prefix fingerprint transitions *inside* one
+ * timeline (that's what the recorder's identity_changed and
+ * cacheable_prefix_changed diagnoses observe), not as a split into a new
+ * timeline. sessionId and firstMessage stay in the key so sibling
+ * conversations sharing a Claude session ID (subagent traffic) still land
+ * on separate timelines.
+ *
+ * Never exposes the native affinity key or raw partition input.
+ */
 export function deriveCacheFlightRecorderId(
 	body: Record<string, unknown>,
 ): string | undefined {
 	const material = conversationPartitionMaterial(body);
 	if (!material) return undefined;
-	return `cfr_${hashConversationPartition("better-ccflare/cache-flight-recorder/v1", material).slice(0, 32)}`;
+	const timelineMaterial: RecorderTimelineMaterial = {
+		sessionId: material.sessionId,
+		firstMessage: material.firstMessage,
+	};
+	return `cfr_${hashRecorderTimeline("better-ccflare/cache-flight-recorder/v2", timelineMaterial).slice(0, 32)}`;
 }
 
 export interface XaiConversationIdentity {

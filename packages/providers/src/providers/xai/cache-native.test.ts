@@ -126,6 +126,84 @@ describe("xAI cache-native helpers", () => {
 		expect(otherSession).not.toBe(first);
 	});
 
+	it("keeps the same recorder timeline across an instructions change, while identity and prefix fingerprints diverge", () => {
+		const before = body({ system: "you are a helpful assistant" });
+		const after = body({ system: "you are a different assistant now" });
+
+		const recorderBefore = deriveCacheFlightRecorderId(before);
+		const recorderAfter = deriveCacheFlightRecorderId(after);
+		expect(recorderBefore).toBeDefined();
+		expect(recorderBefore).toBe(recorderAfter);
+
+		const identityBefore = deriveXaiConversationIdentity(before);
+		const identityAfter = deriveXaiConversationIdentity(after);
+		expect(identityBefore?.identityFingerprint).not.toBe(
+			identityAfter?.identityFingerprint,
+		);
+		expect(identityBefore?.prefixFingerprint).not.toBe(
+			identityAfter?.prefixFingerprint,
+		);
+	});
+
+	it("separates sibling conversations under the same session by first message", () => {
+		const main = deriveCacheFlightRecorderId(body());
+		const sibling = deriveCacheFlightRecorderId(
+			body({
+				system: "stable system",
+				messages: [{ role: "user", content: "subagent task" }],
+			}),
+		);
+		expect(sibling).toBeDefined();
+		expect(sibling).not.toBe(main);
+	});
+
+	it("changes the recorder id when the session id changes", () => {
+		const main = deriveCacheFlightRecorderId(body());
+		const otherSession = deriveCacheFlightRecorderId(
+			body({
+				metadata: { user_id: JSON.stringify({ session_id: SESSION_B }) },
+			}),
+		);
+		expect(otherSession).toBeDefined();
+		expect(otherSession).not.toBe(main);
+	});
+
+	it("omits the recorder id for malformed or missing metadata, matching identity derivation", () => {
+		expect(
+			deriveCacheFlightRecorderId(body({ metadata: { user_id: "not-json" } })),
+		).toBeUndefined();
+		expect(
+			deriveCacheFlightRecorderId(
+				body({
+					metadata: {
+						user_id: JSON.stringify({ session_id: "not-a-uuid" }),
+					},
+				}),
+			),
+		).toBeUndefined();
+		expect(
+			deriveCacheFlightRecorderId(body({ metadata: undefined })),
+		).toBeUndefined();
+		expect(deriveCacheFlightRecorderId(body({ messages: [] }))).toBeUndefined();
+	});
+
+	it("derives the recorder id the same way regardless of cache-native enablement", () => {
+		const originalNative = process.env[XAI_CACHE_NATIVE_ENV];
+		try {
+			delete process.env[XAI_CACHE_NATIVE_ENV];
+			const disabled = deriveCacheFlightRecorderId(body());
+			process.env[XAI_CACHE_NATIVE_ENV] = "1";
+			const enabled = deriveCacheFlightRecorderId(body());
+			expect(disabled).toBe(enabled);
+		} finally {
+			if (originalNative === undefined) {
+				delete process.env[XAI_CACHE_NATIVE_ENV];
+			} else {
+				process.env[XAI_CACHE_NATIVE_ENV] = originalNative;
+			}
+		}
+	});
+
 	it("treats default and api.x.ai endpoints as official", () => {
 		expect(isOfficialXaiEndpoint(account())).toBe(true);
 		expect(
