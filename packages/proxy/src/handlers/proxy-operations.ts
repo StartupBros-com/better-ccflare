@@ -443,18 +443,20 @@ function stripClearThinkingEdits(body: Record<string, unknown>): boolean {
 }
 
 /**
- * Checks whether the request body has thinking enabled for the purposes of
- * clear_thinking context-management edits. Conservative on purpose: only a
- * missing/invalid thinking config or an explicit "disabled" type counts as
- * disabled, so unknown future thinking types pass through untouched (the
- * reactive clear_thinking retry remains as the fallback for those).
+ * Checks whether the request body explicitly disables thinking, for the
+ * purposes of clear_thinking context-management edits. Conservative on
+ * purpose: only `thinking.type === "disabled"` counts. An omitted thinking
+ * field is ambiguous, model families with default-on thinking accept
+ * clear_thinking edits without any thinking config, so those requests pass
+ * through untouched and the reactive clear_thinking retry handles the models
+ * that reject them.
  */
-function isThinkingEnabledInBody(
+function isThinkingExplicitlyDisabled(
 	body: Readonly<Record<string, unknown>>,
 ): boolean {
 	const thinking = body.thinking;
 	if (!thinking || typeof thinking !== "object") return false;
-	return (thinking as Record<string, unknown>).type !== "disabled";
+	return (thinking as Record<string, unknown>).type === "disabled";
 }
 
 /**
@@ -1048,15 +1050,15 @@ export async function proxyWithAccount(
 			provider.name === "anthropic" || account.provider === "claude-oauth";
 
 		// Pre-send guard: a clear_thinking context-management edit combined with
-		// thinking disabled is deterministically rejected by Claude with
-		// 400 "requires `thinking` to be enabled or adaptive". Claude Code sends
-		// this combination after a mid-session model switch, on every turn, so
+		// explicit `thinking.type === "disabled"` is deterministically rejected
+		// by Claude with 400 "requires `thinking` to be enabled or adaptive", so
 		// strip the edit up front instead of paying a guaranteed rejection
-		// round-trip. The reactive retry further down stays as the fallback for
-		// combinations this static check cannot see.
+		// round-trip. An omitted thinking field is left alone: default-thinking
+		// model families accept the edit as-is, and the reactive retry further
+		// down unwedges the ones that reject it.
 		if (isClaudeProvider && effectiveBodyBuffer) {
 			const parsedBody = effectiveBodyContext.getParsedJson();
-			if (parsedBody && !isThinkingEnabledInBody(parsedBody)) {
+			if (parsedBody && isThinkingExplicitlyDisabled(parsedBody)) {
 				const strippedBuffer = filterClearThinkingEdits(effectiveBodyContext);
 				if (strippedBuffer && strippedBuffer !== effectiveBodyBuffer) {
 					log.info(

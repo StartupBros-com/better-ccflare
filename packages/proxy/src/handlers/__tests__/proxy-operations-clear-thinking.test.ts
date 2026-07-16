@@ -284,13 +284,12 @@ describe("proxyWithAccount clear_thinking context-management handling", () => {
 		}
 	});
 
-	it("strips clear_thinking edits before the first send when thinking is disabled", async () => {
+	it("strips clear_thinking edits before the first send when thinking is explicitly disabled", async () => {
 		const { upstreamBodies } = await runProxyCapturingBodies(
 			{
 				model: "claude-opus-4-8",
 				max_tokens: 100,
-				// No thinking config, e.g. Claude Code switched models mid-session
-				// and disabled thinking, but kept sending the clear_thinking edit.
+				thinking: { type: "disabled" },
 				context_management: {
 					edits: [
 						{ type: "clear_tool_uses_20250919" },
@@ -313,8 +312,68 @@ describe("proxyWithAccount clear_thinking context-management handling", () => {
 		});
 		// Messages (including historical thinking blocks) are untouched.
 		expect(sentBody.messages).toEqual(messagesWithThinkingHistory());
-		// Thinking config is not invented.
-		expect(sentBody.thinking).toBeUndefined();
+		// The explicit disabled config itself is preserved as sent.
+		expect(sentBody.thinking).toEqual({ type: "disabled" });
+	});
+
+	it("keeps clear_thinking edits pre-send when thinking is omitted (default-thinking models accept them)", async () => {
+		const { upstreamBodies } = await runProxyCapturingBodies(
+			{
+				model: "claude-sonnet-5",
+				max_tokens: 100,
+				// No thinking config: on model families where thinking defaults on
+				// (adaptive), Claude accepts the edit, so the guard must not strip.
+				context_management: {
+					edits: [{ type: "clear_thinking_20251015" }],
+				},
+				messages: messagesWithThinkingHistory(),
+			},
+			[successResponse("claude-sonnet-5")],
+		);
+
+		expect(upstreamBodies).toHaveLength(1);
+		expect(upstreamBodies[0].context_management).toEqual({
+			edits: [{ type: "clear_thinking_20251015" }],
+		});
+		expect(upstreamBodies[0].thinking).toBeUndefined();
+	});
+
+	it("reactively strips the edit when thinking is omitted and Claude rejects the combination", async () => {
+		const { upstreamBodies } = await runProxyCapturingBodies(
+			{
+				model: "claude-opus-4-8",
+				max_tokens: 100,
+				// No thinking config, e.g. Claude Code switched models mid-session
+				// to a family where omitted thinking means disabled, but kept
+				// sending the clear_thinking edit. The static guard cannot know the
+				// model's default, so the first send goes out intact and the
+				// reactive retry unwedges the session after the 400.
+				context_management: {
+					edits: [
+						{ type: "clear_tool_uses_20250919" },
+						{ type: "clear_thinking_20251015" },
+					],
+				},
+				messages: messagesWithThinkingHistory(),
+			},
+			[clearThinkingRejectionResponse(), successResponse("claude-opus-4-8")],
+		);
+
+		expect(upstreamBodies).toHaveLength(2);
+		// First send kept the client's request intact.
+		expect(upstreamBodies[0].context_management).toEqual({
+			edits: [
+				{ type: "clear_tool_uses_20250919" },
+				{ type: "clear_thinking_20251015" },
+			],
+		});
+		// Retry removed only the clear_thinking edit; other edits, messages,
+		// and the (absent) thinking config are untouched.
+		expect(upstreamBodies[1].context_management).toEqual({
+			edits: [{ type: "clear_tool_uses_20250919" }],
+		});
+		expect(upstreamBodies[1].messages).toEqual(messagesWithThinkingHistory());
+		expect(upstreamBodies[1].thinking).toBeUndefined();
 	});
 
 	it("drops context_management entirely when clear_thinking was its only edit", async () => {
