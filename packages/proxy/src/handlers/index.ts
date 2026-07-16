@@ -46,6 +46,7 @@ export {
 	type CodexUsageRefreshOutcome,
 	clearAccountRefreshCache,
 	getValidAccessToken,
+	pauseAccountForReauthIfInvalidGrant,
 	refreshCodexUsageForAccount,
 	registerCodexUsageRefresher,
 	registerPollingRestarter,

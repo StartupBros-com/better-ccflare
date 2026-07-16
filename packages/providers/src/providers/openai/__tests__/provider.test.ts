@@ -536,4 +536,93 @@ describe("OpenAICompatibleProvider", () => {
 			expect(body.model).toBe("custom/haiku-model");
 		});
 	});
+
+	describe("concurrent request isolation", () => {
+		// The provider is a long-lived singleton shared across every in-flight
+		// request. buildUrl() is called (setting up the target endpoint) before
+		// transformRequestBody() reads the request body, so a second request for
+		// a different account can legitimately interleave in between. Endpoint-
+		// and model-gated injections (Alibaba cache_control, DashScope
+		// enable_thinking) must be derived from *this* request's own
+		// account/body, never from whatever the last concurrent caller left
+		// behind on the provider instance.
+		it("does not leak endpoint/model state into a request suspended on its own JSON body", async () => {
+			const dashscopeAccount: Account = {
+				...mockAccount,
+				name: "dashscope-account",
+				custom_endpoint: JSON.stringify({
+					endpoint: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+				}),
+			};
+			const openrouterAccount: Account = {
+				...mockAccount,
+				name: "openrouter-account",
+				custom_endpoint: JSON.stringify({
+					endpoint: "https://api.openrouter.ai/api/v1",
+				}),
+			};
+
+			// Request A targets DashScope with a Qwen model, so its transformed
+			// body must end up with Alibaba cache_control + enable_thinking.
+			provider.buildUrl("/v1/messages", "", dashscopeAccount);
+
+			let resolveAJson!: (value: unknown) => void;
+			const aJsonPromise = new Promise((resolve) => {
+				resolveAJson = resolve;
+			});
+			const requestA = {
+				headers: new Headers({ "content-type": "application/json" }),
+				json: () => aJsonPromise,
+				url: "https://example.com/v1/messages",
+				method: "POST",
+			} as unknown as Request;
+
+			const transformAPromise = provider.transformRequestBody(
+				requestA,
+				dashscopeAccount,
+			);
+
+			// While request A is still suspended awaiting its own JSON body,
+			// request B (a different account, non-DashScope endpoint) runs to
+			// completion end-to-end.
+			provider.buildUrl("/v1/messages", "", openrouterAccount);
+			const requestB = new Request("https://example.com/v1/messages", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					model: "gpt-4o",
+					messages: [{ role: "user", content: "Hello" }],
+				}),
+			});
+			await provider.transformRequestBody(requestB, openrouterAccount);
+
+			// Now resume request A.
+			resolveAJson({
+				model: "qwen3.5-plus",
+				system: "You are a helpful assistant",
+				messages: [
+					{ role: "user", content: "Hi" },
+					{ role: "assistant", content: "Hello" },
+				],
+			});
+			const transformedA = await transformAPromise;
+			const openaiBodyA = (await transformedA.json()) as {
+				messages: Array<{
+					role: string;
+					content: unknown;
+				}>;
+				enable_thinking?: boolean;
+			};
+
+			const systemMsg = openaiBodyA.messages.find(
+				(msg) => msg.role === "system",
+			);
+			expect(systemMsg).toBeDefined();
+			expect(Array.isArray(systemMsg?.content)).toBe(true);
+			if (Array.isArray(systemMsg?.content)) {
+				expect(systemMsg.content[0]).toHaveProperty("cache_control");
+			}
+			expect(openaiBodyA.enable_thinking).toBe(true);
+		});
+	});
 });

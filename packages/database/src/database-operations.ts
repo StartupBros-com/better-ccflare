@@ -4,7 +4,10 @@ import { stat } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { RuntimeConfig } from "@better-ccflare/config";
 import type { Disposable, TurnEvidence } from "@better-ccflare/core";
-import { TIME_CONSTANTS } from "@better-ccflare/core";
+import {
+	PAUSE_REASON_NEEDS_REAUTH,
+	TIME_CONSTANTS,
+} from "@better-ccflare/core";
 import type {
 	Account,
 	AgentAttributionSource,
@@ -255,9 +258,18 @@ function configureSqlite(db: Database, config: DatabaseConfig): void {
 		db.run("PRAGMA temp_store = MEMORY");
 		db.run("PRAGMA foreign_keys = ON");
 
-		// Add checkpoint interval for WAL mode (1000 pages = ~4MB with 4KB pages)
-		// Higher threshold reduces checkpoint frequency for better throughput under high traffic
-		db.run("PRAGMA wal_autocheckpoint = 1000");
+		// WAL checkpointing is handled entirely OFF the main thread: disable
+		// autocheckpoint on this (the main, writer) connection. Autocheckpoint
+		// runs a synchronous PASSIVE checkpoint inside the committing connection
+		// whenever the WAL crosses the threshold; because PASSIVE can't reset the
+		// WAL while any reader (analytics worker, usage pollers) holds frames, the
+		// WAL grows large and each such checkpoint does hundreds of ms of
+		// synchronous I/O on the main thread, freezing the event loop (observed
+		// as ~250-290ms "Event loop blocked" WARNs). With autocheckpoint off, the
+		// off-thread optimize tick reclaims the WAL via wal_checkpoint(TRUNCATE)
+		// with busy_timeout=0, which never blocks the loop (see runOptimize in
+		// incremental-vacuum-worker.ts).
+		db.run("PRAGMA wal_autocheckpoint = 0");
 	} catch (error) {
 		console.error("Database configuration failed:", error);
 		throw new Error(`Failed to configure SQLite database: ${error}`);
@@ -346,11 +358,18 @@ export class DatabaseOperations implements StrategyStore, Disposable {
 		dbConfig?: DatabaseConfig,
 		retryConfig?: DatabaseRetryConfig,
 	) {
-		// Default database configuration optimized for distributed filesystems
+		// Default database configuration optimized for distributed filesystems.
+		// cacheSize kept in sync with the runtime-config default in
+		// packages/config/src/index.ts (256 MiB, negative = KiB): a big enough
+		// page cache keeps hot B-tree pages of large request tables resident
+		// instead of missing cache on cold pages -- synchronous disk I/O the
+		// AsyncDbWriter can't subdivide (one atomic db.run), which shows up as
+		// event-loop blips during write bursts. The runtime config normally
+		// overrides this fallback. (Source: d4rken/clankermux@763ffa72)
 		this.dbConfig = {
 			walMode: true,
 			busyTimeoutMs: 10000,
-			cacheSize: -5000,
+			cacheSize: -262144,
 			synchronous: "FULL",
 			mmapSize: 0,
 			pageSize: 2048,
@@ -745,16 +764,7 @@ export class DatabaseOperations implements StrategyStore, Disposable {
 		const dbBytes = await this.getDbSizeBytes();
 
 		// WAL file size (if exists)
-		let walBytes = 0;
-		if (this.resolvedDbPath) {
-			const walPath = `${this.resolvedDbPath}-wal`;
-			try {
-				const { size } = await stat(walPath);
-				walBytes = size;
-			} catch {
-				// WAL file doesn't exist or can't be accessed
-			}
-		}
+		const walBytes = await this.getWalSizeBytes();
 
 		// Orphan pages (freelist count) - only in SQLite mode
 		let orphanPages = 0;
@@ -1028,8 +1038,34 @@ OAuth tokens will need to be re-authenticated.
 		await this.accounts.pause(accountId, reason);
 	}
 
+	/**
+	 * Pause only if currently active; returns true when this call paused it.
+	 * When `expectedRefreshToken` is provided, also requires the account to still
+	 * hold that exact refresh token (guards against stale re-pauses after reauth).
+	 */
+	async pauseAccountIfActive(
+		accountId: string,
+		reason: string,
+		expectedRefreshToken?: string | null,
+	): Promise<boolean> {
+		return this.accounts.pauseIfActive(accountId, reason, expectedRefreshToken);
+	}
+
 	async resumeAccount(accountId: string): Promise<void> {
 		await this.accounts.resume(accountId);
+	}
+
+	/**
+	 * Resume an account only if it is paused specifically for needing re-auth
+	 * (`oauth_invalid_grant`). Called after a successful reauth so the account
+	 * returns to rotation automatically, without lifting a manual/overage/
+	 * subscription pause. Returns true when this call resumed it.
+	 */
+	async resumeAccountIfNeedsReauth(accountId: string): Promise<boolean> {
+		return this.accounts.resumeIfPausedWithReason(
+			accountId,
+			PAUSE_REASON_NEEDS_REAUTH,
+		);
 	}
 
 	async renameAccount(accountId: string, newName: string): Promise<void> {
@@ -1399,6 +1435,20 @@ OAuth tokens will need to be re-authenticated.
 		}
 	}
 
+	/** WAL file size in bytes (SQLite only). Returns 0 if the WAL file doesn't exist. */
+	async getWalSizeBytes(): Promise<number> {
+		if (!this.adapter.isSQLite || !this.resolvedDbPath) {
+			return 0;
+		}
+		try {
+			const { size } = await stat(`${this.resolvedDbPath}-wal`);
+			return size;
+		} catch (err) {
+			console.debug("[getWalSizeBytes] stat failed:", err);
+			return 0;
+		}
+	}
+
 	// Agent preference operations delegated to repository
 	async getAgentPreference(agentId: string): Promise<{ model: string } | null> {
 		return this.agentPreferences.getPreference(agentId);
@@ -1433,11 +1483,69 @@ OAuth tokens will need to be re-authenticated.
 		await this.close();
 	}
 
-	// Optimize database periodically to maintain performance (SQLite only)
-	optimize(): void {
-		if (this.sqliteDb) {
-			this.sqliteDb.exec("PRAGMA optimize");
-			this.sqliteDb.exec("PRAGMA wal_checkpoint(PASSIVE)");
+	/**
+	 * Periodic `PRAGMA optimize` + `PRAGMA wal_checkpoint(TRUNCATE)` (SQLite
+	 * only), off-loaded to the incremental-vacuum worker (kind "optimize").
+	 * This is the sole WAL reclaimer: the main connection runs with
+	 * `wal_autocheckpoint = 0` (see `configureSqlite` above), so no checkpoint
+	 * I/O ever happens synchronously on the request hot path.
+	 *
+	 * Why a worker: the previous synchronous version ran both PRAGMAs on the
+	 * main thread via `sqliteDb.exec()`. When another connection (e.g. the
+	 * hourly incremental-vacuum worker after a retention cleanup) held the
+	 * write lock, `PRAGMA optimize`'s internal ANALYZE parked inside SQLite's
+	 * C-level busy handler for the full busy_timeout (10 s), freezing the
+	 * entire event loop, and then threw "database is locked". Even
+	 * uncontended, a large ANALYZE or a fat-WAL checkpoint does real work
+	 * that doesn't belong on the proxy's hot path.
+	 *
+	 * The worker connection uses `busy_timeout = 0`, so contention resolves
+	 * instantly as `{ ok: true, skipped: true }`, skipping one 60-second
+	 * cycle while maintenance contends is normal; the next tick retries.
+	 *
+	 * Never throws for worker-reported failures; they come back as
+	 * `{ ok: false, error }` so the periodic tick can log without crashing.
+	 */
+	async optimizeAsync(): Promise<{
+		ok: boolean;
+		skipped: boolean;
+		durationMs?: number;
+		error?: string;
+	}> {
+		if (!this.sqliteDb || !this.resolvedDbPath) {
+			return { ok: true, skipped: true, durationMs: 0 };
+		}
+		const start = Date.now();
+		const worker = this.spawnIncrementalVacuumWorker();
+		try {
+			const result = await new Promise<
+				| { ok: true; skipped: boolean }
+				| { ok: true; mode: number }
+				| { ok: false; error: string }
+			>((resolve, reject) => {
+				worker.onmessage = (event: MessageEvent) => resolve(event.data);
+				worker.onerror = (event: ErrorEvent) =>
+					reject(new Error(event.message ?? "optimize worker error"));
+				worker.postMessage({ dbPath: this.resolvedDbPath, kind: "optimize" });
+			});
+			const durationMs = Date.now() - start;
+			if (!result.ok) {
+				return { ok: false, skipped: false, durationMs, error: result.error };
+			}
+			return {
+				ok: true,
+				skipped: "skipped" in result ? result.skipped : false,
+				durationMs,
+			};
+		} catch (err) {
+			return {
+				ok: false,
+				skipped: false,
+				durationMs: Date.now() - start,
+				error: err instanceof Error ? err.message : String(err),
+			};
+		} finally {
+			worker.terminate();
 		}
 	}
 
@@ -1644,6 +1752,27 @@ OAuth tokens will need to be re-authenticated.
 	}
 
 	/**
+	 * Spawn the incremental-vacuum worker (shared by `incrementalVacuum()`
+	 * (kind "vacuum") and `optimizeAsync()` (kind "optimize"). Uses the
+	 * embedded base64 bundle when available (production build), falling back
+	 * to the on-disk worker source (tests / fresh worktrees where the inline
+	 * file is an empty placeholder).
+	 */
+	private spawnIncrementalVacuumWorker(): Worker {
+		if (EMBEDDED_INCREMENTAL_VACUUM_WORKER_CODE) {
+			const workerCode = Buffer.from(
+				EMBEDDED_INCREMENTAL_VACUUM_WORKER_CODE,
+				"base64",
+			).toString("utf8");
+			const blob = new Blob([workerCode], { type: "text/javascript" });
+			return new Worker(URL.createObjectURL(blob), { smol: true });
+		}
+		return new Worker(
+			new URL("./incremental-vacuum-worker.ts", import.meta.url).href,
+		);
+	}
+
+	/**
 	 * Incremental vacuum — reclaims a bounded number of free pages back to the
 	 * OS. Off-loaded to a Worker thread so the main JS event loop stays free
 	 * while the operation holds the SQLite writer slot.
@@ -1699,19 +1828,7 @@ OAuth tokens will need to be re-authenticated.
 		}
 
 		const dbPath = this.resolvedDbPath;
-		let worker: Worker;
-		if (EMBEDDED_INCREMENTAL_VACUUM_WORKER_CODE) {
-			const workerCode = Buffer.from(
-				EMBEDDED_INCREMENTAL_VACUUM_WORKER_CODE,
-				"base64",
-			).toString("utf8");
-			const blob = new Blob([workerCode], { type: "text/javascript" });
-			worker = new Worker(URL.createObjectURL(blob), { smol: true });
-		} else {
-			worker = new Worker(
-				new URL("./incremental-vacuum-worker.ts", import.meta.url).href,
-			);
-		}
+		const worker = this.spawnIncrementalVacuumWorker();
 
 		try {
 			const result = await new Promise<
@@ -1720,7 +1837,7 @@ OAuth tokens will need to be re-authenticated.
 				worker.onmessage = (event: MessageEvent) => resolve(event.data);
 				worker.onerror = (event: ErrorEvent) =>
 					reject(new Error(event.message ?? "incremental-vacuum worker error"));
-				worker.postMessage({ dbPath, pages });
+				worker.postMessage({ dbPath, pages, kind: "vacuum" });
 			});
 			if (result.ok) {
 				this.incVacuumConsecutiveSkips = 0;

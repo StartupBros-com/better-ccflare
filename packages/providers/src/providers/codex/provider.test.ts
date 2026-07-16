@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { BUFFER_SIZES } from "@better-ccflare/core";
 import { fetchCodexUsageOnDemand } from "./on-demand-fetch";
 import {
 	CODEX_SINGLE_ORCHESTRATION_ROOT_ENV,
@@ -14,6 +15,7 @@ import {
 	CODEX_PROMPT_CACHE_KEY_ENV,
 	CODEX_VERSION,
 	CodexProvider,
+	codexEventCommitsOutput,
 	deriveCodexCacheKeySessionBucket,
 	readCodexCacheKeySessionPercent,
 } from "./provider";
@@ -617,6 +619,60 @@ describe("CodexProvider request conversion", () => {
 		const body = await transformed.json();
 
 		expect(body).not.toHaveProperty("max_output_tokens");
+	});
+});
+
+describe("CodexProvider.parseRateLimit", () => {
+	it("treats 529 with no reset headers as rate limited, with no synthesized resetTime", () => {
+		const provider = new CodexProvider();
+		const response = new Response(null, { status: 529 });
+
+		const info = provider.parseRateLimit(response);
+
+		expect(info.isRateLimited).toBeTrue();
+		expect(info.resetTime).toBeUndefined();
+	});
+
+	it("uses the soonest reset header when a 529 carries reset hints", () => {
+		const provider = new CodexProvider();
+		const secondaryResetSeconds = Math.floor(Date.now() / 1000) + 120;
+		const primaryResetSeconds = Math.floor(Date.now() / 1000) + 60;
+		const response = new Response(null, {
+			status: 529,
+			headers: {
+				"x-codex-primary-reset-at": String(primaryResetSeconds),
+				"x-codex-secondary-reset-at": String(secondaryResetSeconds),
+			},
+		});
+
+		const info = provider.parseRateLimit(response);
+
+		expect(info.isRateLimited).toBeTrue();
+		expect(info.resetTime).toBe(primaryResetSeconds * 1000);
+	});
+
+	it("still treats 429 with no reset headers as rate limited with a synthesized resetTime", () => {
+		const provider = new CodexProvider();
+		const response = new Response(null, { status: 429 });
+
+		const info = provider.parseRateLimit(response);
+
+		expect(info.isRateLimited).toBeTrue();
+		expect(info.resetTime).toBeGreaterThan(Date.now());
+	});
+
+	it("does not treat a plain 200 as rate limited even with reset headers present", () => {
+		const provider = new CodexProvider();
+		const resetSeconds = Math.floor(Date.now() / 1000) + 60;
+		const response = new Response(null, {
+			status: 200,
+			headers: { "x-codex-primary-reset-at": String(resetSeconds) },
+		});
+
+		const info = provider.parseRateLimit(response);
+
+		expect(info.isRateLimited).toBeFalse();
+		expect(info.resetTime).toBe(resetSeconds * 1000);
 	});
 });
 
@@ -2737,6 +2793,581 @@ describe("CodexProvider.processResponse", () => {
 	});
 });
 
+describe("codexEventCommitsOutput", () => {
+	// Wraps a downstream reader with a `drain(idleMs)` method that returns
+	// whatever SSE frames are currently available, stopping as soon as no
+	// further frame shows up within `idleMs`. Because the upstream is never
+	// closed in these fixtures, the transform's unconditional end-of-stream
+	// flush (which always calls ensureMessageStart, regardless of whether
+	// anything actually committed) never fires, so any frame observed here is
+	// provably caused by the event that was just pushed, not by
+	// stream-teardown bookkeeping.
+	//
+	// A single in-flight `read()` promise is kept across drain() calls
+	// (instead of issuing a fresh read() each time and abandoning whichever
+	// one didn't resolve before the idle timeout): ReadableStreamDefaultReader
+	// resolves concurrent read() calls in FIFO order, so abandoning a pending
+	// read and issuing a new one on the next drain() would queue the new read
+	// behind the abandoned one, silently misattributing the next chunk to the
+	// wrong drain() call.
+	const makeFrameReader = (reader: ReadableStreamDefaultReader<Uint8Array>) => {
+		const decoder = new TextDecoder();
+		let buffer = "";
+		let pending: ReturnType<typeof reader.read> | null = null;
+		const drain = async (idleMs = 40): Promise<string[]> => {
+			const frames: string[] = [];
+			while (true) {
+				if (!pending) pending = reader.read();
+				const inFlight = pending;
+				const winner = await Promise.race([
+					inFlight.then((r) => ({ timedOut: false as const, ...r })),
+					Bun.sleep(idleMs).then(() => ({ timedOut: true as const })),
+				]);
+				if (winner.timedOut) break;
+				pending = null;
+				if (winner.done) break;
+				buffer += decoder.decode(winner.value, { stream: true });
+				let idx = buffer.indexOf("\n\n");
+				while (idx !== -1) {
+					const frameText = buffer.slice(0, idx);
+					buffer = buffer.slice(idx + 2);
+					const eventLine = frameText
+						.split(/\r?\n/)
+						.find((l) => l.startsWith("event:"));
+					if (eventLine) frames.push(eventLine.slice("event:".length).trim());
+					idx = buffer.indexOf("\n\n");
+				}
+			}
+			return frames;
+		};
+		return { drain };
+	};
+
+	type PushableUpstream = {
+		response: Response;
+		push: (lines: string[]) => void;
+	};
+	const makePushableUpstream = (): PushableUpstream => {
+		let controller: ReadableStreamDefaultController<Uint8Array>;
+		const stream = new ReadableStream<Uint8Array>({
+			start(c) {
+				controller = c;
+			},
+		});
+		const encoder = new TextEncoder();
+		return {
+			response: new Response(stream, {
+				headers: {
+					"content-type": "text/event-stream",
+					"x-better-ccflare-request-id": "commit-predicate-corpus",
+				},
+			}),
+			push: (lines: string[]) => {
+				controller.enqueue(encoder.encode(`${lines.join("\n")}\n`));
+			},
+		};
+	};
+
+	// Runs `setupEvents` then `targetEvent` against a real transform, on a
+	// stream that is never closed, and returns whether the target event alone
+	// caused any new downstream frame to appear. Setup events are drained
+	// (and discarded) before the target event is pushed, so only the target's
+	// own marginal contribution is observed.
+	const targetEventCommittedOutput = async (
+		setupEvents: string[][],
+		targetEvent: string[],
+	): Promise<boolean> => {
+		const provider = new CodexProvider();
+		const upstream = makePushableUpstream();
+		const transformed = await provider.processResponse(upstream.response, null);
+		const reader = transformed.body?.getReader();
+		if (!reader) throw new Error("transformed response has no body reader");
+		const frameReader = makeFrameReader(reader);
+		try {
+			for (const setupEvent of setupEvents) {
+				upstream.push(setupEvent);
+			}
+			if (setupEvents.length > 0) {
+				await frameReader.drain();
+			}
+			upstream.push(targetEvent);
+			const framesAfterTarget = await frameReader.drain();
+			return framesAfterTarget.length > 0;
+		} finally {
+			await reader.cancel().catch(() => undefined);
+		}
+	};
+
+	it("response.created commits (eagerly emits message_start, not just at stream end)", async () => {
+		const committed = await targetEventCommittedOutput(
+			[],
+			eventLine("response.created", {
+				response: { id: "resp_1", model: "gpt-5.4" },
+			}),
+		);
+		expect(committed).toBe(
+			codexEventCommitsOutput("response.created", {
+				response: { id: "resp_1", model: "gpt-5.4" },
+			}),
+		);
+		expect(committed).toBeTrue();
+	});
+
+	it("response.output_item.added commits for function_call items", async () => {
+		const data = {
+			item: { type: "function_call", call_id: "call_1", name: "Bash" },
+		};
+		const committed = await targetEventCommittedOutput(
+			[eventLine("response.created", { response: { id: "resp_1" } })],
+			eventLine("response.output_item.added", data),
+		);
+		expect(committed).toBe(
+			codexEventCommitsOutput("response.output_item.added", data),
+		);
+		expect(committed).toBeTrue();
+	});
+
+	it("response.output_item.added does not commit for message items", async () => {
+		const data = { item: { type: "message" } };
+		const committed = await targetEventCommittedOutput(
+			[eventLine("response.created", { response: { id: "resp_1" } })],
+			eventLine("response.output_item.added", data),
+		);
+		expect(committed).toBe(
+			codexEventCommitsOutput("response.output_item.added", data),
+		);
+		expect(committed).toBeFalse();
+	});
+
+	it("response.content_part.added commits for output_text parts", async () => {
+		const data = { part: { type: "output_text" } };
+		const committed = await targetEventCommittedOutput(
+			[
+				eventLine("response.created", { response: { id: "resp_1" } }),
+				eventLine("response.output_item.added", { item: { type: "message" } }),
+			],
+			eventLine("response.content_part.added", data),
+		);
+		expect(committed).toBe(
+			codexEventCommitsOutput("response.content_part.added", data),
+		);
+		expect(committed).toBeTrue();
+	});
+
+	it("response.content_part.added does not commit for non-text parts", async () => {
+		const data = { part: { type: "refusal" } };
+		const committed = await targetEventCommittedOutput(
+			[
+				eventLine("response.created", { response: { id: "resp_1" } }),
+				eventLine("response.output_item.added", { item: { type: "message" } }),
+			],
+			eventLine("response.content_part.added", data),
+		);
+		expect(committed).toBe(
+			codexEventCommitsOutput("response.content_part.added", data),
+		);
+		expect(committed).toBeFalse();
+	});
+
+	it("response.output_text.delta commits when delta is non-empty", async () => {
+		const data = { delta: "Hello" };
+		const committed = await targetEventCommittedOutput(
+			[
+				eventLine("response.created", { response: { id: "resp_1" } }),
+				eventLine("response.output_item.added", { item: { type: "message" } }),
+				eventLine("response.content_part.added", {
+					part: { type: "output_text" },
+				}),
+			],
+			eventLine("response.output_text.delta", data),
+		);
+		expect(committed).toBe(
+			codexEventCommitsOutput("response.output_text.delta", data),
+		);
+		expect(committed).toBeTrue();
+	});
+
+	it("response.output_text.delta does not commit when delta is empty", async () => {
+		const data = { delta: "" };
+		const committed = await targetEventCommittedOutput(
+			[
+				eventLine("response.created", { response: { id: "resp_1" } }),
+				eventLine("response.output_item.added", { item: { type: "message" } }),
+				eventLine("response.content_part.added", {
+					part: { type: "output_text" },
+				}),
+			],
+			eventLine("response.output_text.delta", data),
+		);
+		expect(committed).toBe(
+			codexEventCommitsOutput("response.output_text.delta", data),
+		);
+		expect(committed).toBeFalse();
+	});
+
+	it("response.function_call_arguments.delta never commits", async () => {
+		const data = { delta: '{"command":', output_index: 0 };
+		const committed = await targetEventCommittedOutput(
+			[
+				eventLine("response.created", { response: { id: "resp_1" } }),
+				eventLine("response.output_item.added", {
+					item: { type: "function_call", call_id: "call_1", name: "Bash" },
+					output_index: 0,
+				}),
+			],
+			eventLine("response.function_call_arguments.delta", data),
+		);
+		expect(committed).toBe(
+			codexEventCommitsOutput("response.function_call_arguments.delta", data),
+		);
+		expect(committed).toBeFalse();
+	});
+
+	it("unknown event names never commit", async () => {
+		const data = { anything: true };
+		const committed = await targetEventCommittedOutput(
+			[eventLine("response.created", { response: { id: "resp_1" } })],
+			eventLine("response.some_future_event", data),
+		);
+		expect(committed).toBe(
+			codexEventCommitsOutput("response.some_future_event", data),
+		);
+		expect(committed).toBeFalse();
+	});
+
+	// The remaining switch cases (output_item.done, error/response.failed,
+	// response.completed/response.incomplete) gate their writes on stream
+	// STATE (hasSentContentBlockStart, hasSentTerminalEvents, upstreamError),
+	// not on the event's own data, so they cannot be answered by a pure
+	// (eventName, data) predicate the way the four ensureMessageStart() call
+	// sites can. They are intentionally outside codexEventCommitsOutput's
+	// scope (it only covers "the same decision points [the transform]
+	// currently uses inline") and keep their existing independent gating,
+	// verified separately by the pre-existing CodexProvider.processResponse
+	// suite above. Assert the documented default here so any future case
+	// added to the predicate without a matching corpus fixture is caught.
+	it("state-gated switch cases fall through to the documented false default", () => {
+		expect(
+			codexEventCommitsOutput("response.output_item.done", {
+				item: { type: "function_call" },
+			}),
+		).toBeFalse();
+		expect(
+			codexEventCommitsOutput("error", { error: { message: "boom" } }),
+		).toBeFalse();
+		expect(
+			codexEventCommitsOutput("response.failed", {
+				response: { error: { message: "boom" } },
+			}),
+		).toBeFalse();
+		expect(
+			codexEventCommitsOutput("response.completed", {
+				response: { status: "completed" },
+			}),
+		).toBeFalse();
+		expect(
+			codexEventCommitsOutput("response.incomplete", {
+				response: { status: "incomplete" },
+			}),
+		).toBeFalse();
+	});
+});
+
+describe("CodexProvider SSE frame bounds", () => {
+	const normalizeMessageId = (text: string) =>
+		text.replace(/msg_[0-9a-f]{24}/g, "msg_TEST");
+
+	const crlfSseBody = (events: Array<[string, unknown]>) =>
+		`${events
+			.map(
+				([name, data]) =>
+					`event: ${name}\r\ndata: ${typeof data === "string" ? data : JSON.stringify(data)}\r\n`,
+			)
+			.join("\r\n")}\r\n`;
+
+	it("produces identical output for CRLF-terminated frames as for LF-terminated frames", async () => {
+		const events: Array<[string, unknown]> = [
+			["response.created", { response: { id: "resp_crlf", model: "gpt-5.4" } }],
+			[
+				"response.output_item.added",
+				{ item: { type: "message" }, output_index: 0 },
+			],
+			["response.content_part.added", { part: { type: "output_text" } }],
+			["response.output_text.delta", { delta: "hello" }],
+			[
+				"response.completed",
+				{
+					response: {
+						model: "gpt-5.4",
+						usage: { input_tokens: 2, output_tokens: 1 },
+					},
+				},
+			],
+		];
+
+		const lfBody = sseBody(
+			events.flatMap(([name, data]) => eventLine(name, data)),
+		);
+		const lfResponse = new Response(lfBody, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+		const lfText = normalizeMessageId(
+			await (
+				await new CodexProvider().processResponse(lfResponse, null)
+			).text(),
+		);
+
+		const crlfResponse = new Response(crlfSseBody(events), {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+		const crlfText = normalizeMessageId(
+			await (
+				await new CodexProvider().processResponse(crlfResponse, null)
+			).text(),
+		);
+
+		expect(crlfText).toBe(lfText);
+	});
+
+	it("closes the open content block before an error when a single frame exceeds the per-frame cap", async () => {
+		const provider = new CodexProvider();
+		const encoder = new TextEncoder();
+		const upstreamBody = new ReadableStream<Uint8Array>({
+			start(controller) {
+				// First chunk: opens a text content block, fully processed on its own.
+				controller.enqueue(
+					encoder.encode(
+						sseBody([
+							...eventLine("response.created", {
+								response: { id: "resp_frame_cap", model: "gpt-5.4" },
+							}),
+							...eventLine("response.output_item.added", {
+								item: { type: "message" },
+								output_index: 0,
+							}),
+							...eventLine("response.content_part.added", {
+								part: { type: "output_text" },
+							}),
+							...eventLine("response.output_text.delta", { delta: "partial" }),
+						]),
+					),
+				);
+				// Second chunk: a single complete frame whose payload alone exceeds
+				// the per-frame cap.
+				const oversizedPayload = "x".repeat(
+					BUFFER_SIZES.SSE_FRAME_MAX_BYTES + 1024,
+				);
+				controller.enqueue(
+					encoder.encode(
+						sseBody(
+							eventLine("response.output_text.delta", {
+								delta: oversizedPayload,
+							}),
+						),
+					),
+				);
+				controller.close();
+			},
+		});
+
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const body = await transformed.text();
+
+		expect(body).toContain("event: error");
+		expect(body).toContain('"type":"api_error"');
+		expect(body).toContain('"code":"sse_limit_exceeded"');
+		const startPos = body.indexOf("event: message_start");
+		const stopPos = body.indexOf("event: content_block_stop");
+		const errorPos = body.indexOf("event: error");
+		expect(startPos).toBeGreaterThanOrEqual(0);
+		expect(stopPos).toBeGreaterThan(startPos);
+		expect(errorPos).toBeGreaterThan(stopPos);
+	});
+
+	it("closes the open content block before an error when an unterminated tail exceeds the buffer cap", async () => {
+		const provider = new CodexProvider();
+		const encoder = new TextEncoder();
+		const upstreamBody = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(
+					encoder.encode(
+						sseBody([
+							...eventLine("response.created", {
+								response: { id: "resp_buffer_cap", model: "gpt-5.4" },
+							}),
+							...eventLine("response.output_item.added", {
+								item: { type: "message" },
+								output_index: 0,
+							}),
+							...eventLine("response.content_part.added", {
+								part: { type: "output_text" },
+							}),
+							...eventLine("response.output_text.delta", { delta: "partial" }),
+						]),
+					),
+				);
+				// Never terminated: no blank-line delimiter arrives, so the tail
+				// keeps growing past the unterminated-buffer cap.
+				const runaway = `event: response.output_text.delta\ndata: {"delta":"${"y".repeat(
+					BUFFER_SIZES.SSE_BUFFER_MAX_BYTES + 1024,
+				)}`;
+				controller.enqueue(encoder.encode(runaway));
+				controller.close();
+			},
+		});
+
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const body = await transformed.text();
+
+		expect(body).toContain("event: error");
+		expect(body).toContain('"type":"api_error"');
+		expect(body).toContain('"code":"sse_limit_exceeded"');
+		const startPos = body.indexOf("event: message_start");
+		const stopPos = body.indexOf("event: content_block_stop");
+		const errorPos = body.indexOf("event: error");
+		expect(startPos).toBeGreaterThanOrEqual(0);
+		expect(stopPos).toBeGreaterThan(startPos);
+		expect(errorPos).toBeGreaterThan(stopPos);
+	});
+
+	it("trips the aggregate tool-args cap when five parallel calls each stay under the per-call cap but exceed it together", async () => {
+		const provider = new CodexProvider();
+		const perCallArgBytes = 15_000;
+		expect(perCallArgBytes).toBeLessThan(BUFFER_SIZES.SSE_FRAME_MAX_BYTES);
+		expect(perCallArgBytes * 5).toBeGreaterThan(
+			BUFFER_SIZES.SSE_FRAME_MAX_BYTES,
+		);
+
+		const lines: string[] = [
+			...eventLine("response.created", {
+				response: { id: "resp_aggregate_cap", model: "gpt-5.4" },
+			}),
+		];
+		for (let i = 0; i < 5; i++) {
+			lines.push(
+				...eventLine("response.output_item.added", {
+					item: {
+						type: "function_call",
+						call_id: `call_${i}`,
+						name: `tool_${i}`,
+					},
+					output_index: i,
+				}),
+			);
+		}
+		for (let i = 0; i < 5; i++) {
+			lines.push(
+				...eventLine("response.function_call_arguments.delta", {
+					delta: "a".repeat(perCallArgBytes),
+					output_index: i,
+				}),
+			);
+		}
+
+		const response = new Response(sseBody(lines), {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const body = await transformed.text();
+
+		expect(body).toContain("event: error");
+		expect(body).toContain('"type":"api_error"');
+		expect(body).toContain('"code":"sse_limit_exceeded"');
+		expect(body).not.toContain("event: message_delta");
+	});
+
+	it("trips the per-call tool-args cap when a single call's own arguments alone exceed it", async () => {
+		const provider = new CodexProvider();
+
+		// Each individual delta frame stays well under the per-frame SSE cap;
+		// only their accumulated total for this one call exceeds the per-call
+		// argument byte cap. This is distinct from the aggregate-cap test
+		// above, which requires several concurrently open calls that each
+		// individually stay under the per-call cap.
+		const chunkSize = 4096;
+		const chunkCount =
+			Math.ceil(BUFFER_SIZES.SSE_FRAME_MAX_BYTES / chunkSize) + 2;
+
+		const lines: string[] = [
+			...eventLine("response.created", {
+				response: { id: "resp_single_call_cap", model: "gpt-5.4" },
+			}),
+			...eventLine("response.output_item.added", {
+				item: {
+					type: "function_call",
+					call_id: "call_0",
+					name: "tool_0",
+				},
+				output_index: 0,
+			}),
+		];
+		for (let i = 0; i < chunkCount; i++) {
+			lines.push(
+				...eventLine("response.function_call_arguments.delta", {
+					delta: "a".repeat(chunkSize),
+					output_index: 0,
+				}),
+			);
+		}
+
+		const response = new Response(sseBody(lines), {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const body = await transformed.text();
+
+		expect(body).toContain("event: error");
+		expect(body).toContain('"type":"api_error"');
+		expect(body).toContain('"code":"sse_limit_exceeded"');
+		expect(body).toContain("Tool call arguments for output_index 0 totaled");
+		expect(body).not.toContain("Aggregate tool call arguments");
+	});
+
+	it("emits message_start before an error that arrives as the literal first SSE event", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody(
+			eventLine("response.failed", {
+				response: {
+					status: "failed",
+					error: {
+						type: "invalid_request_error",
+						message: "immediate failure",
+					},
+				},
+			}),
+		);
+
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const body = await transformed.text();
+
+		const messageStartPos = body.indexOf("event: message_start");
+		const errorPos = body.indexOf("event: error");
+		expect(messageStartPos).toBeGreaterThanOrEqual(0);
+		expect(errorPos).toBeGreaterThan(messageStartPos);
+	});
+});
+
 describe("CodexProvider upstream error code classification", () => {
 	const errorForCode = async (code: string) => {
 		const provider = new CodexProvider();
@@ -3199,6 +3830,106 @@ describe("CodexProvider.transformRequestBody", () => {
 		expect(
 			stableSibling.tools.map((tool: { name: string }) => tool.name),
 		).toEqual(["Read"]);
+	});
+
+	it("documents today's bug: a compaction-shaped follow-up turn loses Agent/Task at the provider boundary", async () => {
+		const provider = new CodexProvider();
+		const sessionId = "44444444-4444-4444-8444-444444444444";
+		const tools = ["Agent", "Task", "Read"].map((name) => ({
+			name,
+			input_schema: { type: "object" },
+		}));
+		const send = async (
+			messages: unknown[],
+			headers: Record<string, string> = {},
+		) => {
+			const transformed = await provider.transformRequestBody(
+				new Request("https://example.com/v1/messages", {
+					method: "POST",
+					headers: { "content-type": "application/json", ...headers },
+					body: JSON.stringify({
+						model: "claude-opus-4-8",
+						max_tokens: 10,
+						metadata: { user_id: JSON.stringify({ session_id: sessionId }) },
+						messages,
+						tools,
+					}),
+				}),
+			);
+			return transformed.json();
+		};
+
+		const originalMessages = [
+			{ role: "user", content: "start the task" },
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "tool_use",
+						id: "agent-1",
+						name: "Agent",
+						input: { prompt: "look into it" },
+					},
+				],
+			},
+			{
+				role: "user",
+				content: [
+					{ type: "tool_result", tool_use_id: "agent-1", content: "findings" },
+				],
+			},
+		];
+
+		const root = await send(originalMessages);
+		expect(root.tools.map((tool: { name: string }) => tool.name)).toEqual([
+			"Agent",
+			"Task",
+			"Read",
+		]);
+
+		// Compaction drops the earliest input item, keeps the tail, and appends
+		// a new turn. Same session and instructions, still the same logical
+		// conversation continuing, but the first surviving item is now what
+		// used to be item[1], so admission's derived identity changes anyway.
+		const compactedMessages = [
+			...originalMessages.slice(1),
+			{ role: "user", content: "continue the task" },
+		];
+
+		const traceDir = mkdtempSync(join(tmpdir(), "codex-trace-"));
+		process.env[CODEX_TRACE_DIR_ENV] = traceDir;
+		let compacted: { tools: Array<{ name: string }> };
+		try {
+			compacted = await send(compactedMessages, {
+				"x-better-ccflare-request-id": "compacted-follow-up",
+			});
+			const requestTrace = readTraceRecords(traceDir).find(
+				(record) =>
+					record.phase === "request" &&
+					record.request_id === "compacted-follow-up",
+			);
+			// BUG (documented, not fixed here): the demotion diagnostics confirm
+			// this was a session that already had an elected root.
+			expect(requestTrace).toMatchObject({
+				trace_schema_version: 9,
+				orchestration_admission: "non_root",
+				orchestration_demotion_observed: true,
+			});
+			expect(requestTrace?.elapsed_ms_since_root).toBeTypeOf("number");
+			expect(
+				requestTrace?.elapsed_ms_since_root as number,
+			).toBeGreaterThanOrEqual(0);
+		} finally {
+			delete process.env[CODEX_TRACE_DIR_ENV];
+			rmSync(traceDir, { recursive: true, force: true });
+		}
+
+		// BUG (documented, not fixed here): Agent/Task are incorrectly filtered
+		// out of the request for what is still logically the orchestrator's own
+		// session, purely because compaction reshaped the derived identity.
+		expect(compacted.tools.map((tool: { name: string }) => tool.name)).toEqual([
+			"Read",
+		]);
 	});
 
 	it("only an exact zero disables orchestration election", async () => {

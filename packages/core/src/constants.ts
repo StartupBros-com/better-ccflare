@@ -54,6 +54,13 @@ export const TIME_CONSTANTS = {
 	RATE_LIMIT_BACKOFF_BASE_MS: 30 * 1000, // 30s: cooldown for the 1st 429 in a streak
 	RATE_LIMIT_BACKOFF_MAX_MS: 5 * 60 * 1000, // 5min: ceiling for the exponential ramp
 	RATE_LIMIT_RESET_STABILITY_MS: 5 * 60 * 1000, // 5min: healthy operation needed to reset the streak counter
+
+	// Safety ceiling for an upstream-reset-driven cooldown. When a 429 ships a
+	// far-future reset (Anthropic 5h/weekly usage-window limits), we bench until
+	// that reset instead of re-probing every ~5min — but never longer than this,
+	// so a stale/oversized hint can't idle an account indefinitely.
+	// Override at runtime via CCFLARE_RATE_LIMIT_MAX_COOLDOWN_MS.
+	RATE_LIMIT_MAX_COOLDOWN_MS: 12 * 60 * 60 * 1000, // 12h
 } as const;
 
 /**
@@ -85,6 +92,45 @@ export function getRateLimitResetStabilityMs(): number {
 }
 
 /**
+ * Read the safety ceiling (ms) for an upstream-reset-driven cooldown.
+ * Reads CCFLARE_RATE_LIMIT_MAX_COOLDOWN_MS from env.
+ * Uses || (not ??) so 0/NaN env values fall through to the default.
+ */
+export function getRateLimitMaxCooldownMs(): number {
+	const raw = Number(process.env.CCFLARE_RATE_LIMIT_MAX_COOLDOWN_MS);
+	return raw || TIME_CONSTANTS.RATE_LIMIT_MAX_COOLDOWN_MS;
+}
+
+/**
+ * Resolve how long an account should be benched after a 429.
+ *
+ * - No upstream reset hint → use the exponential backoff (probe interval).
+ * - Upstream reset known → honor it as the cooldown target, bounded ABOVE by
+ *   `maxCooldownMs` so a far-future / stale hint can't idle the account
+ *   indefinitely (e.g. Anthropic 5h/weekly usage-window resets).
+ *
+ * Deliberately does NOT floor a short resetTime at the exponential backoff:
+ * a reset that arrives sooner than the backoff streak ramp is honored as-is
+ * (see rate-limit-cooldown-reentry.test.ts "preserves a two-minute upstream
+ * reset hint instead of imposing a five-minute floor") — the streak-based
+ * probe single-flight gating (getRateLimitProbeAdmission) already guards
+ * against re-probe storms on short/expired cooldowns, so an artificial floor
+ * here would only delay legitimate quick recovery.
+ *
+ * Pure and unit-testable: callers pass a fixed `now`.
+ */
+export function resolveCooldownUntil(opts: {
+	now: number;
+	backoffMs: number;
+	maxCooldownMs: number;
+	resetTime?: number;
+}): number {
+	const candidateUntil = opts.now + opts.backoffMs;
+	if (!opts.resetTime) return candidateUntil;
+	return Math.min(opts.resetTime, opts.now + opts.maxCooldownMs);
+}
+
+/**
  * Configuration for in-place retry of reset-less 529 (overloaded_error) responses.
  * Used by proxyWithAccount before applying account cooldown.
  *
@@ -112,6 +158,24 @@ export function getOverloadRetryConfig(): {
 	return { enabled, maxAttempts, baseMs, maxMs };
 }
 
+/**
+ * Timeout (ms) for draining the superseded response body before an
+ * in-place 529 (overloaded_error) retry reassigns `response` to the new
+ * attempt's result. A never-closing upstream body (e.g. a live SSE stream
+ * that never emits a terminal frame) must not be able to hang the retry
+ * loop forever: past this bound the drain is abandoned and the reader is
+ * cancelled instead.
+ * Override at runtime via CCFLARE_IN_PLACE_RETRY_DRAIN_TIMEOUT_MS.
+ * Falls back to TIME_CONSTANTS.STREAM_OPERATION_TIMEOUT_MS.
+ * Uses an explicit finite check (not ||) so 0 is a valid override for tests.
+ */
+export function getInPlaceRetryDrainTimeoutMs(): number {
+	const raw = Number(process.env.CCFLARE_IN_PLACE_RETRY_DRAIN_TIMEOUT_MS);
+	return Number.isFinite(raw) && raw >= 0
+		? raw
+		: TIME_CONSTANTS.STREAM_OPERATION_TIMEOUT_MS;
+}
+
 // Buffer sizes (in bytes unless specified)
 export const BUFFER_SIZES = {
 	// Stream usage buffer size in KB (multiplied by 1024 to get bytes)
@@ -130,6 +194,15 @@ export const BUFFER_SIZES = {
 
 	// Log file size
 	LOG_FILE_MAX_SIZE: 10 * 1024 * 1024, // 10MB
+
+	// SSE frame buffer caps (packages/core/src/sse-frame-buffer.ts).
+	// Deliberately reuse existing byte values instead of picking new
+	// arbitrary numbers: a single complete SSE frame is capped at the same
+	// size as the stream usage buffer, while an unterminated buffered tail
+	// (no delimiter seen yet) is allowed to grow up to the max request body
+	// size before it is treated as a runaway stream.
+	SSE_FRAME_MAX_BYTES: 64 * 1024, // Matches STREAM_USAGE_BUFFER_BYTES
+	SSE_BUFFER_MAX_BYTES: 4 * 1024 * 1024, // Matches MAX_REQUEST_BODY_BYTES (usage-collector.ts / response-handler.ts)
 } as const;
 
 // Network constants

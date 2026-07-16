@@ -3,17 +3,23 @@ export {
 	BUFFER_SIZES,
 	CACHE,
 	computeRateLimitBackoffMs,
+	getInPlaceRetryDrainTimeoutMs,
 	getOverloadRetryConfig,
+	getRateLimitMaxCooldownMs,
 	getRateLimitResetStabilityMs,
 	HTTP_STATUS,
 	LIMITS,
 	NETWORK,
+	resolveCooldownUntil,
 	TIME_CONSTANTS,
 } from "./constants";
 
 export {
+	isInvalidGrantMessage,
 	logError,
 	OAuthError,
+	OAuthRefreshTokenError,
+	PAUSE_REASON_NEEDS_REAUTH,
 	ProviderError,
 	RateLimitError,
 	ServiceUnavailableError,
@@ -82,6 +88,11 @@ export {
 	type TokenBreakdown,
 } from "./pricing";
 export * from "./request-events";
+export {
+	SseFrameBuffer,
+	type SseFrameBufferOptions,
+	SseLimitError,
+} from "./sse-frame-buffer";
 export * from "./strategy";
 export {
 	computeWindowStartMs,
