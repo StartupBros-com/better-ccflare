@@ -222,6 +222,17 @@ interface TraceInputs {
 		| "disabled";
 	toolsBeforeCount?: number;
 	filteredToolNames?: readonly string[];
+	/**
+	 * Diagnostic: this turn's derived conversation identity no longer matched
+	 * an already-elected root for its session (see orchestration-election.ts).
+	 * Additive on schema 9; a missing value writes null, not a version bump.
+	 */
+	orchestrationDemotionObserved?: boolean;
+	/**
+	 * Diagnostic: milliseconds since the demoted session's root was last
+	 * active. Only meaningful when orchestrationDemotionObserved is true.
+	 */
+	elapsedMsSinceRoot?: number | null;
 	tools?: readonly unknown[];
 	codexInput: readonly unknown[];
 	/** full bodies, only embedded when CCFLARE_CODEX_TRACE_FULL=1 */
@@ -335,6 +346,9 @@ export function writeCodexTrace(inputs: TraceInputs): void {
 		is_descendant: inputs.isDescendant ?? false,
 		orchestration_admission:
 			inputs.orchestrationAdmission ?? "no_orchestration_tools",
+		orchestration_demotion_observed:
+			inputs.orchestrationDemotionObserved ?? null,
+		elapsed_ms_since_root: inputs.elapsedMsSinceRoot ?? null,
 		tools_before_count: inputs.toolsBeforeCount ?? inputs.tools?.length ?? 0,
 		tools_after_count: inputs.tools?.length ?? 0,
 		filtered_tool_names: inputs.filteredToolNames ?? [],
