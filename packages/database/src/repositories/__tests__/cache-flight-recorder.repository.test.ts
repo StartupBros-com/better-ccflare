@@ -33,6 +33,10 @@ function turn(
 	};
 }
 
+function iso(ms: number): string {
+	return new Date(ms).toISOString();
+}
+
 describe("cache flight recorder schema", () => {
 	it("creates dedicated conversation and turn tables", () => {
 		const db = makeDb();
@@ -161,7 +165,11 @@ describe("CacheFlightRecorderRepository", () => {
 		const db = makeDb();
 		const repo = new CacheFlightRecorderRepository(new BunSqlAdapter(db));
 		await repo.appendTurn("old-id", turn(1), 1_000);
-		await repo.appendTurn("new-id", turn(1), 5_000);
+		// turn(1)'s default timestamp is derived from its sequence, not from
+		// recordedAt, so it must be overridden here to actually be recent:
+		// otherwise it collides with old-id's stale turn timestamp and would
+		// incorrectly trip the turn-granularity expiry predicate below.
+		await repo.appendTurn("new-id", turn(1, { timestamp: iso(5_000) }), 5_000);
 		await repo.markIncomplete("new-id", { dropped: true, at: 5_100 });
 
 		expect(await repo.expireOlderThan(3_000, 7_000)).toBe(1);
@@ -237,6 +245,142 @@ describe("CacheFlightRecorderRepository", () => {
 				"SELECT recorder_conversation_id FROM cache_flight_recorder_tombstones WHERE recorder_conversation_id = ?",
 			)
 			.get("atomic-id");
+		expect(tombstone).toBeNull();
+		db.close();
+	});
+
+	it("prunes stale turns from an active conversation and marks the truncation boundary with an explicit gap", async () => {
+		const db = makeDb();
+		const repo = new CacheFlightRecorderRepository(new BunSqlAdapter(db));
+		await repo.appendTurn(
+			"mixed-id",
+			turn(0, { timestamp: iso(1_000) }),
+			1_000,
+		);
+		await repo.appendTurn(
+			"mixed-id",
+			turn(1, { timestamp: iso(2_000) }),
+			2_000,
+		);
+		await repo.appendTurn(
+			"mixed-id",
+			turn(2, { timestamp: iso(10_000) }),
+			10_000,
+		);
+
+		const expired = await repo.expireOlderThan(5_000, 20_000);
+		expect(expired).toBe(0);
+
+		const lookup = await repo.lookupTimeline("mixed-id");
+		expect(lookup.status).toBe("found");
+		if (lookup.status !== "found") throw new Error("expected found");
+		expect(lookup.timeline.turns).toHaveLength(1);
+		expect(lookup.timeline.turns[0]).toMatchObject({
+			sequence: 2,
+			timestamp: iso(10_000),
+			gapBefore: true,
+		});
+		expect(await repo.countRetained()).toBe(1);
+		db.close();
+	});
+
+	it("expires an active conversation whose entire timeline predates the cutoff despite a recent updated_at", async () => {
+		const db = makeDb();
+		const repo = new CacheFlightRecorderRepository(new BunSqlAdapter(db));
+		await repo.appendTurn(
+			"stale-turns-id",
+			turn(0, { timestamp: iso(1_000) }),
+			1_000,
+		);
+		// Touch the conversation recently without recording a fresh turn (e.g.
+		// a dropped-event marker), so updated_at is recent but every turn on
+		// the timeline is stale: no retained-window evidence survives.
+		await repo.markIncomplete("stale-turns-id", { at: 10_000 });
+
+		const expired = await repo.expireOlderThan(5_000, 20_000);
+		expect(expired).toBe(1);
+		expect(await repo.lookupTimeline("stale-turns-id")).toEqual({
+			status: "expired",
+		});
+		expect(await repo.countRetained()).toBe(0);
+		db.close();
+	});
+
+	it("leaves a recently touched zero-turn conversation untouched by turn-granularity retention", async () => {
+		const db = makeDb();
+		const repo = new CacheFlightRecorderRepository(new BunSqlAdapter(db));
+		await repo.markIncomplete("zero-turns-id", { at: 10_000 });
+
+		const expired = await repo.expireOlderThan(5_000, 20_000);
+		expect(expired).toBe(0);
+		expect(await repo.lookupTimeline("zero-turns-id")).toMatchObject({
+			status: "found",
+			timeline: { turns: [] },
+		});
+		expect(await repo.countRetained()).toBe(1);
+		db.close();
+	});
+
+	it("continues sequence allocation after truncation without reusing freed sequences", async () => {
+		const db = makeDb();
+		const repo = new CacheFlightRecorderRepository(new BunSqlAdapter(db));
+		await repo.appendTurn(
+			"resume-id",
+			turn(0, { timestamp: iso(1_000) }),
+			1_000,
+		);
+		await repo.appendTurn(
+			"resume-id",
+			turn(1, { timestamp: iso(2_000) }),
+			2_000,
+		);
+		await repo.appendTurn(
+			"resume-id",
+			turn(2, { timestamp: iso(10_000) }),
+			10_000,
+		);
+
+		await repo.expireOlderThan(5_000, 20_000);
+		// Sequences 0 and 1 were pruned by truncation; surviving max is 2.
+
+		await repo.appendTurn(
+			"resume-id",
+			turn(3, { timestamp: iso(11_000) }),
+			11_000,
+		);
+		const timeline = await repo.loadTimeline("resume-id");
+		const sequences = timeline?.turns.map((t) => t.sequence) ?? [];
+		expect(sequences).toEqual([2, 3]);
+		db.close();
+	});
+
+	it("rolls back turn truncation and gap marking when deleting stale turns fails", async () => {
+		const db = makeDb();
+		const repo = new CacheFlightRecorderRepository(new BunSqlAdapter(db));
+		await repo.appendTurn(
+			"trunc-atomic-id",
+			turn(0, { timestamp: iso(1_000) }),
+			1_000,
+		);
+		await repo.appendTurn(
+			"trunc-atomic-id",
+			turn(1, { timestamp: iso(10_000) }),
+			10_000,
+		);
+		db.exec(`CREATE TRIGGER reject_recorder_turn_delete
+			BEFORE DELETE ON cache_flight_recorder_turns
+			BEGIN SELECT RAISE(ABORT, 'reject turn delete'); END`);
+
+		await expect(repo.expireOlderThan(5_000, 20_000)).rejects.toThrow();
+
+		const timeline = await repo.loadTimeline("trunc-atomic-id");
+		expect(timeline?.turns).toHaveLength(2);
+		expect(timeline?.turns.every((t) => !t.gapBefore)).toBe(true);
+		const tombstone = db
+			.query(
+				"SELECT recorder_conversation_id FROM cache_flight_recorder_tombstones WHERE recorder_conversation_id = ?",
+			)
+			.get("trunc-atomic-id");
 		expect(tombstone).toBeNull();
 		db.close();
 	});

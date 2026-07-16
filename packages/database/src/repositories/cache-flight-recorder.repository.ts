@@ -229,21 +229,87 @@ export class CacheFlightRecorderRepository extends BaseRepository<Timeline> {
 		cutoffTs: number,
 		tombstoneExpiresAt: number,
 	): Promise<number> {
+		// Turn timestamps are `new Date(...).toISOString()`: UTC Zulu
+		// ISO-8601, which sorts lexicographically the same as chronologically,
+		// so a plain string comparison works identically on SQLite and
+		// PostgreSQL without any date parsing in SQL.
+		const isoCutoff = new Date(cutoffTs).toISOString();
 		const [expired] = await this.adapter.runBatchWithChanges([
 			{
+				// Tombstone every conversation whose retention window has
+				// lapsed: either the conversation row itself has gone stale
+				// (updated_at < cutoff), or it was touched recently but every
+				// turn on its timeline predates the cutoff, so no
+				// retained-window evidence survives (conversations with zero
+				// turns fall back to the updated_at rule only, since
+				// MAX(timestamp) is NULL and `NULL < ?` is never true). One
+				// OR-predicate keeps this INSERT the sole source of the
+				// returned count, so the cascaded/explicit turn deletes below
+				// can never inflate it.
 				sql: `INSERT INTO cache_flight_recorder_tombstones (
 					recorder_conversation_id, expires_at
-				) SELECT recorder_conversation_id, ?
-				FROM cache_flight_recorder_conversations
-				WHERE updated_at < ?
+				) SELECT c.recorder_conversation_id, ?
+				FROM cache_flight_recorder_conversations c
+				WHERE c.updated_at < ?
+				   OR (
+						SELECT MAX(t.timestamp) FROM cache_flight_recorder_turns t
+						WHERE t.recorder_conversation_id = c.recorder_conversation_id
+					) < ?
 				ON CONFLICT (recorder_conversation_id) DO UPDATE SET
 					expires_at = EXCLUDED.expires_at`,
-				params: [tombstoneExpiresAt, cutoffTs],
+				params: [tombstoneExpiresAt, cutoffTs, isoCutoff],
 			},
 			{
 				sql: `DELETE FROM cache_flight_recorder_conversations
 				 WHERE updated_at < ?`,
 				params: [cutoffTs],
+			},
+			{
+				// Conversations touched recently but whose entire timeline
+				// predates the cutoff carry no retained-window evidence:
+				// expire them outright instead of leaving an empty timeline
+				// behind. Must run before the turn truncation below, since
+				// truncating first would empty the timeline and make this
+				// predicate unable to tell "only stale turns" apart from
+				// "no turns at all".
+				sql: `DELETE FROM cache_flight_recorder_conversations
+				 WHERE (
+						SELECT MAX(t.timestamp) FROM cache_flight_recorder_turns t
+						WHERE t.recorder_conversation_id = cache_flight_recorder_conversations.recorder_conversation_id
+					) < ?`,
+				params: [isoCutoff],
+			},
+			{
+				// For conversations that survive (still have at least one
+				// turn at or after the cutoff), mark the truncation as an
+				// explicit gap on the earliest turn that will remain after
+				// pruning, so the diagnosis layer sees a declared gap rather
+				// than silently missing evidence. Must run before the turn
+				// delete below so "lost a turn" can still be observed.
+				sql: `UPDATE cache_flight_recorder_turns
+				 SET gap_before = 1
+				 WHERE timestamp >= ?
+					AND sequence = (
+						SELECT MIN(t2.sequence) FROM cache_flight_recorder_turns t2
+						WHERE t2.recorder_conversation_id = cache_flight_recorder_turns.recorder_conversation_id
+						  AND t2.timestamp >= ?
+					)
+					AND EXISTS (
+						SELECT 1 FROM cache_flight_recorder_turns t3
+						WHERE t3.recorder_conversation_id = cache_flight_recorder_turns.recorder_conversation_id
+						  AND t3.timestamp < ?
+					)`,
+				params: [isoCutoff, isoCutoff, isoCutoff],
+			},
+			{
+				// Retention applies at turn granularity too: prune stale
+				// turns from conversations that remain active, so a
+				// conversation touched at least once per retention window
+				// cannot accumulate turns without bound. appendTurn allocates
+				// sequences via MAX(sequence)+1 scoped to the surviving rows,
+				// so pruning the oldest turns never causes sequence reuse.
+				sql: `DELETE FROM cache_flight_recorder_turns WHERE timestamp < ?`,
+				params: [isoCutoff],
 			},
 		]);
 		return expired ?? 0;
