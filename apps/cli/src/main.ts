@@ -21,7 +21,7 @@ if (process.argv[1]) {
 
 // Try each possible .env location
 for (const envPath of possibleEnvPaths) {
-	const result = config({ path: envPath });
+	const result = config({ path: envPath, quiet: true });
 	if (result.parsed && Object.keys(result.parsed).length > 0) {
 		break; // Stop after finding the first .env with variables
 	}
@@ -30,6 +30,7 @@ for (const envPath of possibleEnvPaths) {
 import {
 	addAccount,
 	analyzePerformance,
+	cacheFlightRecorderError,
 	clearRequestHistory,
 	compactDatabase,
 	deleteApiKey,
@@ -42,12 +43,14 @@ import {
 	getAccountsList,
 	getApiKeyStats,
 	handleRepairCommand,
+	isValidCacheFlightRecorderId,
 	listApiKeys,
 	pauseAccount,
 	reauthenticateAccount,
 	removeAccount,
 	resetAllStats,
 	resumeAccount,
+	runCacheFlightRecorderCommand,
 	runDoctor,
 	setAccountPriority,
 } from "@better-ccflare/cli-commands";
@@ -62,7 +65,10 @@ import {
 import { container, SERVICE_KEYS } from "@better-ccflare/core-di";
 import { DatabaseFactory } from "@better-ccflare/database";
 import { Logger } from "@better-ccflare/logger";
-import { parseBedrockConfig } from "@better-ccflare/providers";
+import {
+	isCacheFlightRecorderEnabled,
+	parseBedrockConfig,
+} from "@better-ccflare/providers";
 // Import server
 import startServer from "@better-ccflare/server";
 
@@ -104,6 +110,9 @@ interface ParsedArgs {
 	doctor: boolean;
 	doctorFull: boolean;
 	doctorRecover: boolean;
+	cacheFlightRecorderReport: string | null;
+	cacheFlightRecorderHealth: boolean;
+	json: boolean;
 	resetStats: boolean;
 	clearHistory: boolean;
 	compact: boolean;
@@ -156,7 +165,7 @@ function startServerWithConfig(args: ParsedArgs, config: Config) {
 /**
  * Helper function to exit gracefully with proper cleanup
  */
-async function exitGracefully(code: 0 | 1 = 0): Promise<never> {
+async function exitGracefully(code: 0 | 1 | 2 = 0): Promise<never> {
 	try {
 		await shutdown();
 	} catch (error) {
@@ -168,7 +177,7 @@ async function exitGracefully(code: 0 | 1 = 0): Promise<never> {
 /**
  * Fast exit function for simple commands that don't need full cleanup
  */
-function fastExit(code: 0 | 1 = 0): never {
+function fastExit(code: 0 | 1 | 2 = 0): never {
 	process.exit(code);
 }
 
@@ -464,6 +473,9 @@ function parseArgs(args: string[]): ParsedArgs {
 		doctor: false,
 		doctorFull: false,
 		doctorRecover: false,
+		cacheFlightRecorderReport: null,
+		cacheFlightRecorderHealth: false,
+		json: false,
 		resetStats: false,
 		clearHistory: false,
 		compact: false,
@@ -741,6 +753,19 @@ function parseArgs(args: string[]): ParsedArgs {
 				parsed.doctorRecover = true;
 				parsed.doctor = true; // Base flag
 				break;
+			case "--cache-flight-recorder-report":
+				if (i + 1 >= args.length || args[i + 1].startsWith("--")) {
+					parsed.cacheFlightRecorderReport = "";
+					break;
+				}
+				parsed.cacheFlightRecorderReport = args[++i];
+				break;
+			case "--cache-flight-recorder-health":
+				parsed.cacheFlightRecorderHealth = true;
+				break;
+			case "--json":
+				parsed.json = true;
+				break;
 			case "--reset-stats":
 				parsed.resetStats = true;
 				break;
@@ -817,9 +842,69 @@ function parseArgs(args: string[]): ParsedArgs {
 	return parsed;
 }
 
+function hasRecorderCommandConflict(args: string[]): boolean {
+	const allowed = new Set<number>();
+	for (let index = 0; index < args.length; index++) {
+		if (args[index] === "--json") allowed.add(index);
+		if (args[index] === "--cache-flight-recorder-health") allowed.add(index);
+		if (args[index] === "--cache-flight-recorder-report") {
+			allowed.add(index);
+			if (args[index + 1] && !args[index + 1].startsWith("--")) {
+				allowed.add(index + 1);
+			}
+		}
+	}
+	return args.some((_, index) => !allowed.has(index));
+}
+
 async function main() {
 	const args = process.argv.slice(2);
 	const parsed = parseArgs(args);
+	const recorderRequested =
+		args.includes("--cache-flight-recorder-report") ||
+		parsed.cacheFlightRecorderHealth;
+
+	if (recorderRequested) {
+		const invalidReportId =
+			args.includes("--cache-flight-recorder-report") &&
+			!isValidCacheFlightRecorderId(parsed.cacheFlightRecorderReport);
+		const conflicting =
+			(parsed.cacheFlightRecorderReport !== null &&
+				parsed.cacheFlightRecorderHealth) ||
+			hasRecorderCommandConflict(args);
+		if (invalidReportId || conflicting) {
+			console.error(
+				invalidReportId
+					? "Cache flight recorder report requires a valid recorder ID"
+					: "Cache flight recorder command cannot be combined with another command",
+			);
+			if (parsed.json) console.log(cacheFlightRecorderError("invalid_args"));
+			fastExit(2);
+		}
+
+		try {
+			const config = new Config();
+			DatabaseFactory.initialize(undefined, undefined, false);
+			const dbOps = await DatabaseFactory.getInstanceAsync(false);
+			const options = parsed.cacheFlightRecorderReport
+				? {
+						action: "report" as const,
+						recorderConversationId: parsed.cacheFlightRecorderReport,
+						json: parsed.json,
+					}
+				: { action: "health" as const, json: parsed.json };
+			const { exitCode } = await runCacheFlightRecorderCommand(dbOps, options, {
+				enabled: isCacheFlightRecorderEnabled(),
+				retentionHours: config.getCacheFlightRecorderRetentionHours(),
+			});
+			await exitGracefully(exitCode);
+		} catch {
+			console.error("Cache flight recorder operation failed");
+			if (parsed.json)
+				console.log(cacheFlightRecorderError("operational_failure"));
+			await exitGracefully(1);
+		}
+	}
 
 	// Handle version - check before any expensive initializations
 	if (parsed.version) {
@@ -883,6 +968,10 @@ Options:
   --doctor             Run database integrity check and storage diagnostics
   --doctor-full        Run exhaustive integrity check (slower)
   --doctor-recover     Generate recovery instructions for corrupted database
+  --cache-flight-recorder-report <id>  Report a retained recorder timeline
+    --json             Emit exactly one structured JSON object
+  --cache-flight-recorder-health       Show minimal recorder health
+    --json             Emit exactly one structured JSON object
   --reset-stats        Reset usage statistics
   --clear-history      Clear request history
   --compact            Compact database (WAL checkpoint + VACUUM)

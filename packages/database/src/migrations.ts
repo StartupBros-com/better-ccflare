@@ -377,6 +377,52 @@ export function ensureSchema(db: Database): void {
 	db.run(
 		`CREATE INDEX IF NOT EXISTS idx_usage_snapshots_ts ON usage_snapshots(timestamp)`,
 	);
+
+	// Dedicated privacy-safe cache flight recorder storage. Conversation rows
+	// carry retention and health metadata; turn rows contain only TurnEvidence.
+	db.run(`
+		CREATE TABLE IF NOT EXISTS cache_flight_recorder_conversations (
+			recorder_conversation_id TEXT PRIMARY KEY,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			incomplete INTEGER NOT NULL DEFAULT 0,
+			dropped_events INTEGER NOT NULL DEFAULT 0
+		)
+	`);
+	db.run(
+		`CREATE INDEX IF NOT EXISTS idx_cache_flight_recorder_conversations_updated_at
+		 ON cache_flight_recorder_conversations(updated_at)`,
+	);
+	db.run(`
+		CREATE TABLE IF NOT EXISTS cache_flight_recorder_tombstones (
+			recorder_conversation_id TEXT PRIMARY KEY,
+			expires_at INTEGER NOT NULL
+		)
+	`);
+	db.run(
+		`CREATE INDEX IF NOT EXISTS idx_cache_flight_recorder_tombstones_expires_at
+		 ON cache_flight_recorder_tombstones(expires_at)`,
+	);
+	db.run(`
+		CREATE TABLE IF NOT EXISTS cache_flight_recorder_turns (
+			recorder_conversation_id TEXT NOT NULL,
+			sequence INTEGER NOT NULL,
+			timestamp TEXT NOT NULL,
+			identity_fingerprint TEXT,
+			serving_account_id TEXT,
+			prefix_fingerprint TEXT,
+			cache_outcome TEXT NOT NULL,
+			input_tokens INTEGER,
+			cached_tokens INTEGER,
+			completeness TEXT NOT NULL,
+			unavailable_dimensions TEXT NOT NULL DEFAULT '[]',
+			gap_before INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (recorder_conversation_id, sequence),
+			FOREIGN KEY (recorder_conversation_id)
+				REFERENCES cache_flight_recorder_conversations(recorder_conversation_id)
+				ON DELETE CASCADE
+		)
+	`);
 }
 
 export function runMigrations(db: Database, dbPath?: string): void {
