@@ -1,3 +1,4 @@
+import { getEndpointUrl } from "@better-ccflare/core";
 import type { OpenAIRequest } from "@better-ccflare/openai-formats";
 import type { Account } from "@better-ccflare/types";
 import { OpenAICompatibleProvider } from "../providers/openai/provider";
@@ -48,8 +49,13 @@ describe("OpenAICompatibleProvider Alibaba Features", () => {
 				],
 			};
 
-			// Call afterConvert to inject caching
-			provider.afterConvert(openaiBody);
+			// Call afterConvert to inject caching, threading endpoint+model
+			// explicitly the same way transformRequestBody() derives them per-request
+			provider.afterConvert(
+				openaiBody,
+				getEndpointUrl(mockAccount),
+				"qwen3.5-plus",
+			);
 
 			// Verify system message has cache_control
 			const systemMsg = openaiBody.messages[0];
@@ -89,7 +95,7 @@ describe("OpenAICompatibleProvider Alibaba Features", () => {
 				],
 			};
 
-			provider.afterConvert(openaiBody);
+			provider.afterConvert(openaiBody, getEndpointUrl(mockAccount), "glm-5.1");
 
 			// Verify NO cache_control was injected
 			const systemMsg = openaiBody.messages[0];
@@ -117,7 +123,11 @@ describe("OpenAICompatibleProvider Alibaba Features", () => {
 				messages: [{ role: "user", content: "Hello" }],
 			};
 
-			provider.afterConvert(openaiBody);
+			provider.afterConvert(
+				openaiBody,
+				getEndpointUrl(mockAccount),
+				"qwen3.5-plus",
+			);
 
 			// Verify NO cache_control was injected (wrong endpoint)
 			const userMsg = openaiBody.messages[0];
@@ -143,10 +153,19 @@ describe("OpenAICompatibleProvider Alibaba Features", () => {
 			};
 
 			// Call afterConvert first (injects caching)
-			provider.afterConvert(openaiBody);
+			provider.afterConvert(
+				openaiBody,
+				getEndpointUrl(mockAccount),
+				"qwen3.5-plus",
+			);
 
 			// Then call injectDashScopeReasoning (as done in transformRequestBody)
-			(provider as any).injectDashScopeReasoning(openaiBody, anthropicBody);
+			(provider as any).injectDashScopeReasoning(
+				openaiBody,
+				anthropicBody,
+				getEndpointUrl(mockAccount),
+				"qwen3.5-plus",
+			);
 
 			// enable_thinking should be injected for Qwen reasoning models
 			expect((openaiBody as any).enable_thinking).toBe(true);
@@ -167,8 +186,17 @@ describe("OpenAICompatibleProvider Alibaba Features", () => {
 				messages: [{ role: "user", content: "Hello" }],
 			};
 
-			provider.afterConvert(openaiBody);
-			(provider as any).injectDashScopeReasoning(openaiBody, anthropicBody);
+			provider.afterConvert(
+				openaiBody,
+				getEndpointUrl(mockAccount),
+				"kimi-k2-thinking",
+			);
+			(provider as any).injectDashScopeReasoning(
+				openaiBody,
+				anthropicBody,
+				getEndpointUrl(mockAccount),
+				"kimi-k2-thinking",
+			);
 
 			expect((openaiBody as any).enable_thinking).toBeUndefined();
 		});
