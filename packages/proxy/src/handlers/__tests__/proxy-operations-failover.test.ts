@@ -938,6 +938,61 @@ describe("proxyWithAccount — 529 failover", () => {
 		}
 	});
 
+	it("releases the rate-limit-check clone on the final-attempt 529 passthrough", async () => {
+		const cancelReasons: string[] = [];
+		const originalStreamCancel = ReadableStream.prototype.cancel;
+		ReadableStream.prototype.cancel = function (
+			this: ReadableStream,
+			reason?: unknown,
+		) {
+			cancelReasons.push(String(reason));
+			return originalStreamCancel.call(this, reason);
+		};
+		globalThis.fetch = mock(
+			async () =>
+				new Response(
+					'{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}',
+					{
+						status: 529,
+						headers: { "content-type": "application/json" },
+					},
+				),
+		);
+
+		const bodyBuffer = makeRequestBody();
+		const req = makeRequest(bodyBuffer);
+		try {
+			await proxyWithAccount(
+				req,
+				new URL("https://proxy.local/v1/messages"),
+				makeAccount({
+					provider: "anthropic",
+					api_key: "test-key",
+					access_token: null,
+				}),
+				makeRequestMeta(),
+				bodyBuffer,
+				() => undefined,
+				0,
+				makeProxyContext(),
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				true,
+			);
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : String(e);
+			if (!msg.includes("UsageCollector not initialized")) throw e;
+		} finally {
+			ReadableStream.prototype.cancel = originalStreamCancel;
+		}
+
+		expect(
+			cancelReasons.filter((r) => r === "rate_limit_check_clone").length,
+		).toBe(1);
+	});
+
 	it("isModelUnavailableError returns false for 529 overloaded responses", async () => {
 		const response = new Response(
 			'{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}',
@@ -1134,6 +1189,92 @@ describe("proxyWithAccount — 529 in-place retry", () => {
 
 		// Keepalive — only the initial request, no in-place retries
 		expect(callCount).toBe(1);
+	});
+});
+
+describe("proxyWithAccount — non-codex 529 in-place retry releases superseded responses (P1)", () => {
+	let originalFetch: typeof globalThis.fetch;
+	let originalStreamCancel: typeof ReadableStream.prototype.cancel;
+	let cancelReasons: string[];
+
+	beforeEach(() => {
+		originalFetch = globalThis.fetch;
+		cancelReasons = [];
+		originalStreamCancel = ReadableStream.prototype.cancel;
+		ReadableStream.prototype.cancel = function (
+			this: ReadableStream,
+			reason?: unknown,
+		) {
+			cancelReasons.push(String(reason));
+			return originalStreamCancel.call(this, reason);
+		};
+		process.env.CCFLARE_OVERLOAD_RETRY_BASE_MS = "0";
+		process.env.CCFLARE_OVERLOAD_RETRY_MAX_MS = "0";
+		process.env.CCFLARE_OVERLOAD_RETRY_MAX_ATTEMPTS = "3";
+		delete process.env.CCFLARE_OVERLOAD_RETRY_ENABLED;
+	});
+
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+		ReadableStream.prototype.cancel = originalStreamCancel;
+		delete process.env.CCFLARE_OVERLOAD_RETRY_BASE_MS;
+		delete process.env.CCFLARE_OVERLOAD_RETRY_MAX_MS;
+		delete process.env.CCFLARE_OVERLOAD_RETRY_MAX_ATTEMPTS;
+		delete process.env.CCFLARE_OVERLOAD_RETRY_ENABLED;
+	});
+
+	it("cancels both superseded 529 response bodies for a non-codex (anthropic) account, and still forwards the eventual success to the client", async () => {
+		const overloadBody =
+			'{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}';
+		const successBody =
+			'{"id":"msg_1","type":"message","content":[],"model":"claude-sonnet-4-5","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}';
+		let callCount = 0;
+		globalThis.fetch = mock(async () => {
+			callCount++;
+			if (callCount <= 2) {
+				return new Response(overloadBody, {
+					status: 529,
+					headers: { "content-type": "application/json" },
+				});
+			}
+			return new Response(successBody, {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		});
+
+		const bodyBuffer = makeRequestBody();
+		const req = makeRequest(bodyBuffer);
+		// proxyWithAccount reaches forwardToClient on success, which requires
+		// UsageCollector initialization (not wired in unit tests). Catch that
+		// specific error while still verifying both superseded 529 responses
+		// were released.
+		try {
+			await proxyWithAccount(
+				req,
+				new URL("https://proxy.local/v1/messages"),
+				makeAccount({
+					provider: "anthropic",
+					api_key: "test-key",
+					access_token: null,
+				}),
+				makeRequestMeta(),
+				bodyBuffer,
+				() => undefined,
+				0,
+				makeProxyContext(),
+			);
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : String(e);
+			if (!msg.includes("UsageCollector not initialized")) throw e;
+		}
+
+		// Initial 529 + 2 in-place retries (the second retry succeeds).
+		expect(callCount).toBe(3);
+		const supersededCancels = cancelReasons.filter(
+			(r) => r === "in_place_529_retry_superseded",
+		);
+		expect(supersededCancels.length).toBe(2);
 	});
 });
 
@@ -1471,6 +1612,102 @@ describe("proxyWithAccount: Codex 529 rate-limited failover does not hang on aba
 		expect(
 			upstream.getCancelCalls() > 0 || upstream.getReleaseLockCalls() > 0,
 		).toBe(true);
+	}, 3000);
+});
+
+describe("proxyWithAccount: Codex 529 in-place retry drain is bounded by a timeout (P2)", () => {
+	let originalFetch: typeof globalThis.fetch;
+
+	beforeEach(() => {
+		originalFetch = globalThis.fetch;
+		process.env.CCFLARE_OVERLOAD_RETRY_BASE_MS = "0";
+		process.env.CCFLARE_OVERLOAD_RETRY_MAX_MS = "0";
+		process.env.CCFLARE_OVERLOAD_RETRY_MAX_ATTEMPTS = "2";
+		process.env.CCFLARE_IN_PLACE_RETRY_DRAIN_TIMEOUT_MS = "50";
+		delete process.env.CCFLARE_OVERLOAD_RETRY_ENABLED;
+	});
+
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+		delete process.env.CCFLARE_OVERLOAD_RETRY_BASE_MS;
+		delete process.env.CCFLARE_OVERLOAD_RETRY_MAX_MS;
+		delete process.env.CCFLARE_OVERLOAD_RETRY_MAX_ATTEMPTS;
+		delete process.env.CCFLARE_IN_PLACE_RETRY_DRAIN_TIMEOUT_MS;
+		delete process.env.CCFLARE_OVERLOAD_RETRY_ENABLED;
+	});
+
+	/**
+	 * A live Codex SSE upstream whose body deliberately never closes,
+	 * mirroring a real connection that never emits a terminal frame. Before
+	 * the fix, the retry loop's `await response.arrayBuffer()` drain of the
+	 * superseded response has no bound and would hang forever on a body
+	 * like this.
+	 */
+	function makeLiveNeverClosingCodexUpstream(status: number) {
+		const encoder = new TextEncoder();
+		const frame1 = encoder.encode(
+			`event: response.created\ndata: ${JSON.stringify({ response: { id: "resp_drain_hang", model: "gpt-5.4" } })}\n\n`,
+		);
+		const stream = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(frame1);
+				// Deliberately never close().
+			},
+		});
+		return new Response(stream, {
+			status,
+			headers: { "content-type": "text/event-stream" },
+		});
+	}
+
+	it("proceeds to the in-place retry instead of hanging when the superseded 529 body never closes", async () => {
+		let callCount = 0;
+		globalThis.fetch = mock(async () => {
+			callCount++;
+			return makeLiveNeverClosingCodexUpstream(529);
+		});
+
+		const bodyBuffer = new TextEncoder().encode(
+			JSON.stringify({
+				model: "claude-sonnet-4-5",
+				messages: [{ role: "user", content: "hello" }],
+				max_tokens: 10,
+				stream: true,
+			}),
+		).buffer;
+		const req = makeRequest(bodyBuffer);
+
+		const resultPromise = proxyWithAccount(
+			req,
+			new URL("https://proxy.local/v1/messages"),
+			makeAccount({
+				provider: "codex",
+				api_key: "test-key",
+				access_token: null,
+				refresh_token: "",
+			}),
+			makeRequestMeta(),
+			bodyBuffer,
+			() => undefined,
+			0,
+			makeProxyContext(),
+		).catch((e) => {
+			const msg = e instanceof Error ? e.message : String(e);
+			if (msg.includes("UsageCollector not initialized")) return null;
+			throw e;
+		});
+
+		const TIMEOUT = Symbol("timeout");
+		const timeoutPromise = new Promise<typeof TIMEOUT>((resolve) =>
+			setTimeout(() => resolve(TIMEOUT), 2000),
+		);
+		const outcome = await Promise.race([resultPromise, timeoutPromise]);
+
+		// Before the fix: `await response.arrayBuffer()` on the never-closing
+		// first 529 body blocks forever, so the retry loop never reaches its
+		// second fetch call and this races the 2s timeout and loses.
+		expect(outcome).not.toBe(TIMEOUT);
+		expect(callCount).toBe(2);
 	}, 3000);
 });
 

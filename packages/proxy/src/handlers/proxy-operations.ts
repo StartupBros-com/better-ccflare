@@ -1,4 +1,5 @@
 import {
+	getInPlaceRetryDrainTimeoutMs,
 	getModelList,
 	getOverloadRetryConfig,
 	isOfficialXaiEndpoint,
@@ -1112,6 +1113,37 @@ export async function proxyWithAccount(
 				// Body may already be locked/disturbed; ignore synchronous throws too.
 			}
 		};
+
+		// Drains a superseded in-place-retry response so its usage capture and
+		// attempt-trace finalization complete when the body ends promptly, while
+		// guaranteeing a never-closing body (e.g. a live SSE stream with no
+		// terminal frame) cannot hang the retry loop: past the bound the drain
+		// is abandoned and the reader is cancelled instead.
+		const drainSupersededResponse = async (discarded: Response) => {
+			const body = discarded.body;
+			if (!body) return;
+			const timeoutMs = getInPlaceRetryDrainTimeoutMs();
+			const reader = body.getReader();
+			const deadline = Date.now() + timeoutMs;
+			while (true) {
+				const remainingMs = deadline - Date.now();
+				if (remainingMs <= 0) {
+					reader.cancel("in_place_529_retry_drain_timeout").catch(() => {});
+					return;
+				}
+				const result = await Promise.race([
+					reader.read().catch(() => ({ done: true }) as const),
+					new Promise<"timeout">((resolve) =>
+						setTimeout(() => resolve("timeout"), remainingMs),
+					),
+				]);
+				if (result === "timeout") {
+					reader.cancel("in_place_529_retry_drain_timeout").catch(() => {});
+					return;
+				}
+				if (result.done) return;
+			}
+		};
 		if (
 			transformedModel &&
 			cacheControlRejectors.has(
@@ -1782,7 +1814,7 @@ export async function proxyWithAccount(
 						);
 						if (provider.name === "codex" && provider.transformRequestBody) {
 							const retryHeaders = new Headers(retrySourceRequest.headers);
-							await response.arrayBuffer();
+							await drainSupersededResponse(response);
 							stampCodexAttempt(
 								retryHeaders,
 								"overload_529",
@@ -1805,6 +1837,16 @@ export async function proxyWithAccount(
 							}
 							retryTransport =
 								sanitizeInternalTransportHeaders(retryTransformed);
+						} else {
+							// Non-codex providers reach this loop too (the anthropic
+							// provider marks bare 529 overloaded_error responses as rate
+							// limited with no reset), and their superseded response would
+							// otherwise be abandoned with a live body when `response` is
+							// reassigned below.
+							await discardUnusedResponse(
+								response,
+								"in_place_529_retry_superseded",
+							);
 						}
 						const retryRaw = isSyntheticProviderResponse(retryTransport)
 							? materializeSyntheticResponse(retryTransport.clone())
@@ -1904,6 +1946,15 @@ export async function proxyWithAccount(
 			requestMeta.id,
 			requestMeta,
 		);
+		if (responseForRateLimitCheck !== response) {
+			// The rate-limit check ran on a clone whose header-only use is done.
+			// Release its tee branch so it cannot keep the original body's
+			// cancellation pending elsewhere.
+			await discardUnusedResponse(
+				responseForRateLimitCheck,
+				"rate_limit_check_clone",
+			);
+		}
 		if (isRateLimited) {
 			if (returnRateLimitedResponseOnExhaustion && response.status === 529) {
 				log.warn(

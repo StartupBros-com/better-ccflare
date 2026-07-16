@@ -112,6 +112,24 @@ export function getOverloadRetryConfig(): {
 	return { enabled, maxAttempts, baseMs, maxMs };
 }
 
+/**
+ * Timeout (ms) for draining the superseded response body before an
+ * in-place 529 (overloaded_error) retry reassigns `response` to the new
+ * attempt's result. A never-closing upstream body (e.g. a live SSE stream
+ * that never emits a terminal frame) must not be able to hang the retry
+ * loop forever: past this bound the drain is abandoned and the reader is
+ * cancelled instead.
+ * Override at runtime via CCFLARE_IN_PLACE_RETRY_DRAIN_TIMEOUT_MS.
+ * Falls back to TIME_CONSTANTS.STREAM_OPERATION_TIMEOUT_MS.
+ * Uses an explicit finite check (not ||) so 0 is a valid override for tests.
+ */
+export function getInPlaceRetryDrainTimeoutMs(): number {
+	const raw = Number(process.env.CCFLARE_IN_PLACE_RETRY_DRAIN_TIMEOUT_MS);
+	return Number.isFinite(raw) && raw >= 0
+		? raw
+		: TIME_CONSTANTS.STREAM_OPERATION_TIMEOUT_MS;
+}
+
 // Buffer sizes (in bytes unless specified)
 export const BUFFER_SIZES = {
 	// Stream usage buffer size in KB (multiplied by 1024 to get bytes)
