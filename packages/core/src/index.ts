@@ -3,6 +3,7 @@ export {
 	BUFFER_SIZES,
 	CACHE,
 	computeRateLimitBackoffMs,
+	getInPlaceRetryDrainTimeoutMs,
 	getOverloadRetryConfig,
 	getRateLimitResetStabilityMs,
 	HTTP_STATUS,
