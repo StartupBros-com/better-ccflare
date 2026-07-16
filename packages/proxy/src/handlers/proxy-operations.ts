@@ -223,6 +223,28 @@ function sanitizeInternalTransportHeaders(request: Request): Request {
 	});
 }
 
+// transformRequestBody re-maps model names internally (mapModelName), which can
+// revert an explicitly selected fallback model. Force the selected model back
+// into an already-transformed request body.
+export async function forceModelInTransformedRequest(
+	request: Request,
+	model: string,
+): Promise<Request> {
+	try {
+		const text = await request.clone().text();
+		const body = JSON.parse(text);
+		if (body.model === model) return request;
+		body.model = model;
+		return new Request(request.url, {
+			method: request.method,
+			headers: new Headers(request.headers),
+			body: JSON.stringify(body),
+		});
+	} catch {
+		return request;
+	}
+}
+
 export type CacheBodyStagingAction = "stage" | "discard" | "skip";
 
 export interface CacheBodyStagingInput {
@@ -1069,6 +1091,11 @@ export async function proxyWithAccount(
 
 		// Capture a clone for in-place 529 retries before the body is consumed.
 		const transformedRequestForRetry = transformedRequest.clone();
+		// The 529 in-place retry must resend the CURRENT physical transport, not
+		// the original request: thinking/cache-control retries and model fallback
+		// all replace the outbound body, and reverting silently changes the model.
+		let retrySourceRequest = providerRequest;
+		let retryTransformedTemplate = transformedRequestForRetry;
 
 		// Make the request (or unwrap a synthetic provider response)
 		let rawResponse = isSyntheticProviderResponse(transformedRequest)
@@ -1101,15 +1128,17 @@ export async function proxyWithAccount(
 				await finalizeCurrentCodexTransport(rawResponse);
 				stampCodexAttempt(headers, "thinking_retry");
 				const retryProviderRequest = new Request(targetUrl, retryRequestInit);
+				retrySourceRequest = retryProviderRequest.clone();
 
 				const retryTransformedRequest = provider.transformRequestBody
 					? await provider.transformRequestBody(retryProviderRequest, account)
 					: retryProviderRequest;
+				retryTransformedTemplate = retryTransformedRequest.clone();
 
 				// Preserve internal metadata through the transform for tracing, then
 				// strip it from the concrete transport request.
 				const retryTransportRequest = sanitizeInternalTransportHeaders(
-					retryTransformedRequest,
+					retryTransformedTemplate.clone(),
 				);
 				// Make the retry request (or unwrap a synthetic provider response)
 				rawResponse = isSyntheticProviderResponse(retryTransformedRequest)
@@ -1151,8 +1180,14 @@ export async function proxyWithAccount(
 						headers: retryHeaders,
 						body: JSON.stringify(retrySourceBody),
 					});
+					retrySourceRequest = retrySource.clone();
+					const retryTransformed = await provider.transformRequestBody(
+						retrySource,
+						account,
+					);
+					retryTransformedTemplate = retryTransformed.clone();
 					retryRequest = sanitizeInternalTransportHeaders(
-						await provider.transformRequestBody(retrySource, account),
+						retryTransformedTemplate.clone(),
 					);
 				} else {
 					retryRequest = new Request(transformedRequest.url, {
@@ -1160,6 +1195,7 @@ export async function proxyWithAccount(
 						headers: transformedRequest.headers,
 						body: JSON.stringify(retryBodyJson),
 					});
+					retryTransformedTemplate = retryRequest.clone();
 				}
 				rawResponse = isSyntheticProviderResponse(retryRequest)
 					? materializeSyntheticResponse(retryRequest)
@@ -1458,6 +1494,7 @@ export async function proxyWithAccount(
 					stampCodexAttempt(headers, "model_fallback", nextModel);
 					currentTransportModel = nextModel;
 					const retryProviderRequest = new Request(targetUrl, retryRequestInit);
+					retrySourceRequest = retryProviderRequest.clone();
 					let retryTransformedRequest = provider.transformRequestBody
 						? await provider.transformRequestBody(retryProviderRequest, account)
 						: retryProviderRequest;
@@ -1466,28 +1503,11 @@ export async function proxyWithAccount(
 					// (e.g. convertAnthropicRequestToOpenAI) calls mapModelName which can
 					// remap nextModel back to the primary model if it has no Claude family
 					// pattern. Force nextModel into the final request body.
-					try {
-						const transformedText = await retryTransformedRequest
-							.clone()
-							.text();
-						const transformedBody = JSON.parse(transformedText);
-						if (transformedBody.model !== nextModel) {
-							transformedBody.model = nextModel;
-							const repatchedHeaders = new Headers(
-								retryTransformedRequest.headers,
-							);
-							retryTransformedRequest = new Request(
-								retryTransformedRequest.url,
-								{
-									method: retryTransformedRequest.method,
-									headers: repatchedHeaders,
-									body: JSON.stringify(transformedBody),
-								},
-							);
-						}
-					} catch {
-						// If re-patching fails, proceed with the transformed request as-is
-					}
+					retryTransformedRequest = await forceModelInTransformedRequest(
+						retryTransformedRequest,
+						nextModel,
+					);
+					retryTransformedTemplate = retryTransformedRequest.clone();
 
 					// Fallback transforms need internal correlation metadata, but the
 					// concrete transport request must never carry it upstream.
@@ -1702,19 +1722,34 @@ export async function proxyWithAccount(
 							`Account ${account.name}: in-place retry ${attempt}/${retryCfg.maxAttempts - 1} after ${Math.round(delayMs)}ms for 529 overloaded_error`,
 						);
 
-						let retryTransport = transformedRequestForRetry.clone();
+						let retryTransport = sanitizeInternalTransportHeaders(
+							retryTransformedTemplate.clone(),
+						);
 						if (provider.name === "codex" && provider.transformRequestBody) {
-							const retryHeaders = new Headers(providerRequest.headers);
+							const retryHeaders = new Headers(retrySourceRequest.headers);
 							await response.arrayBuffer();
-							stampCodexAttempt(retryHeaders, "overload_529");
-							const retrySource = new Request(providerRequest.url, {
-								method: providerRequest.method,
-								headers: retryHeaders,
-								body: await providerRequest.clone().arrayBuffer(),
-							});
-							retryTransport = sanitizeInternalTransportHeaders(
-								await provider.transformRequestBody(retrySource, account),
+							stampCodexAttempt(
+								retryHeaders,
+								"overload_529",
+								currentTransportModel ?? undefined,
 							);
+							const retrySource = new Request(retrySourceRequest.url, {
+								method: retrySourceRequest.method,
+								headers: retryHeaders,
+								body: await retrySourceRequest.clone().arrayBuffer(),
+							});
+							let retryTransformed = await provider.transformRequestBody(
+								retrySource,
+								account,
+							);
+							if (currentTransportModel) {
+								retryTransformed = await forceModelInTransformedRequest(
+									retryTransformed,
+									currentTransportModel,
+								);
+							}
+							retryTransport =
+								sanitizeInternalTransportHeaders(retryTransformed);
 						}
 						const retryRaw = isSyntheticProviderResponse(retryTransport)
 							? materializeSyntheticResponse(retryTransport.clone())

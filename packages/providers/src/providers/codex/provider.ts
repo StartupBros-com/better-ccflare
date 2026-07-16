@@ -400,6 +400,47 @@ interface StreamState {
 	traceNewToolCalls: ToolCallSummary[];
 	traceRequestId: string;
 	traceAttemptId?: string;
+	// One terminal response trace per physical attempt, across every terminal
+	// path (completed, failed, abrupt EOF, read error, downstream cancel).
+	terminalTraceWritten: boolean;
+}
+
+function writeCodexStreamTerminalTrace(
+	state: StreamState,
+	stopReason: "error" | "end_turn" | "tool_use" | "max_tokens" | "refusal",
+	error?: {
+		type: string;
+		message: string;
+		code?: string;
+		status?: string;
+	},
+): void {
+	if (state.terminalTraceWritten) return;
+	state.terminalTraceWritten = true;
+	writeCodexResponseTrace({
+		requestId: state.traceRequestId,
+		attemptId: state.traceAttemptId,
+		modelOut: state.model,
+		modelContextWindow: resolveModelContextCapability("codex", state.model)
+			?.rawContextWindow,
+		summary: summarizeCodexResponse(
+			state.traceNewToolCalls,
+			state.usageMeasurementAvailable
+				? {
+						input_tokens: state.totalInputTokens,
+						output_tokens: state.outputTokens,
+						...(state.cacheMeasurementAvailable
+							? {
+									cache_read_input_tokens: state.cacheReadInputTokens,
+									cache_creation_input_tokens: state.cacheCreationInputTokens,
+								}
+							: {}),
+					}
+				: {},
+			stopReason,
+			error,
+		),
+	});
 }
 
 export class CodexProvider extends BaseProvider {
@@ -1635,6 +1676,7 @@ export class CodexProvider extends BaseProvider {
 			traceNewToolCalls: [],
 			traceRequestId: requestId,
 			traceAttemptId: attemptId,
+			terminalTraceWritten: false,
 		};
 
 		const headers = sanitizeResponseHeaders(response.headers);
@@ -1643,6 +1685,19 @@ export class CodexProvider extends BaseProvider {
 		const upstreamReader = response.body?.getReader();
 		let downstreamController: ReadableStreamDefaultController<Uint8Array>;
 		let cancelled = false;
+		let pullWaiters: Array<() => void> = [];
+		const releasePullWaiters = () => {
+			const waiters = pullWaiters;
+			pullWaiters = [];
+			for (const waiter of waiters) waiter();
+		};
+		const awaitDownstreamCapacity = async () => {
+			while (!cancelled && (downstreamController.desiredSize ?? 1) <= 0) {
+				await new Promise<void>((resolve) => {
+					pullWaiters.push(resolve);
+				});
+			}
+		};
 		const writeTerminalTrace = (
 			error?: {
 				type: string;
@@ -1657,37 +1712,16 @@ export class CodexProvider extends BaseProvider {
 				| "max_tokens"
 				| "refusal" = "error",
 		) => {
-			if (state.hasSentTerminalEvents) return;
+			if (state.terminalTraceWritten) return;
 			state.hasSentTerminalEvents = true;
-			writeCodexResponseTrace({
-				requestId,
-				attemptId: state.traceAttemptId,
-				modelOut: state.model,
-				modelContextWindow: resolveModelContextCapability("codex", state.model)
-					?.rawContextWindow,
-				summary: summarizeCodexResponse(
-					state.traceNewToolCalls,
-					state.usageMeasurementAvailable
-						? {
-								input_tokens: state.totalInputTokens,
-								output_tokens: state.outputTokens,
-								...(state.cacheMeasurementAvailable
-									? {
-											cache_read_input_tokens: state.cacheReadInputTokens,
-											cache_creation_input_tokens:
-												state.cacheCreationInputTokens,
-										}
-									: {}),
-							}
-						: {},
-					stopReason,
-					error,
-				),
-			});
+			writeCodexStreamTerminalTrace(state, stopReason, error);
 		};
 		const readable = new ReadableStream<Uint8Array>({
 			start(controller) {
 				downstreamController = controller;
+			},
+			pull() {
+				releasePullWaiters();
 			},
 			async cancel(reason) {
 				cancelled = true;
@@ -1698,6 +1732,7 @@ export class CodexProvider extends BaseProvider {
 							? reason
 							: "Downstream response was cancelled",
 				});
+				releasePullWaiters();
 				await upstreamReader?.cancel(reason).catch(() => undefined);
 			},
 		});
@@ -1744,6 +1779,7 @@ export class CodexProvider extends BaseProvider {
 				}
 				payload.delta = delta;
 			}
+			await awaitDownstreamCapacity();
 			if (cancelled) throw new Error("Downstream response was cancelled");
 			const line = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
 			downstreamController.enqueue(encoder.encode(line));
@@ -2283,6 +2319,9 @@ export class CodexProvider extends BaseProvider {
 				state.contextWindow = this.extractContextWindow(response, usage);
 				state.upstreamError = this.normalizeCodexStreamError(eventName, data);
 				if (!state.hasSentTerminalEvents) {
+					// Claim the terminal trace before awaiting downstream writes so a
+					// cancellation race cannot record two terminals for one attempt.
+					writeCodexStreamTerminalTrace(state, "error", state.upstreamError);
 					if (state.hasSentContentBlockStart) {
 						await writeSSE("content_block_stop", {
 							type: "content_block_stop",
@@ -2295,33 +2334,6 @@ export class CodexProvider extends BaseProvider {
 						"error",
 						this.toAnthropicErrorPayload(state.upstreamError),
 					);
-					writeCodexResponseTrace({
-						requestId: state.traceRequestId,
-						attemptId: state.traceAttemptId,
-						modelOut: state.model,
-						modelContextWindow: resolveModelContextCapability(
-							"codex",
-							state.model,
-						)?.rawContextWindow,
-						summary: summarizeCodexResponse(
-							state.traceNewToolCalls,
-							state.usageMeasurementAvailable
-								? {
-										input_tokens: state.totalInputTokens,
-										output_tokens: state.outputTokens,
-										...(state.cacheMeasurementAvailable
-											? {
-													cache_read_input_tokens: state.cacheReadInputTokens,
-													cache_creation_input_tokens:
-														state.cacheCreationInputTokens,
-												}
-											: {}),
-									}
-								: {},
-							"error",
-							state.upstreamError,
-						),
-					});
 					state.hasSentTerminalEvents = true;
 				}
 				break;
@@ -2428,33 +2440,8 @@ export class CodexProvider extends BaseProvider {
 					messageDelta.context_window = state.contextWindow;
 				}
 
+				writeCodexStreamTerminalTrace(state, messageDelta.delta.stop_reason);
 				await writeSSE("message_delta", messageDelta);
-				writeCodexResponseTrace({
-					requestId: state.traceRequestId,
-					attemptId: state.traceAttemptId,
-					modelOut: state.model,
-					modelContextWindow: resolveModelContextCapability(
-						"codex",
-						state.model,
-					)?.rawContextWindow,
-					summary: summarizeCodexResponse(
-						state.traceNewToolCalls,
-						state.usageMeasurementAvailable
-							? {
-									input_tokens: state.totalInputTokens,
-									output_tokens: state.outputTokens,
-									...(state.cacheMeasurementAvailable
-										? {
-												cache_read_input_tokens: state.cacheReadInputTokens,
-												cache_creation_input_tokens:
-													state.cacheCreationInputTokens,
-											}
-										: {}),
-								}
-							: {},
-						messageDelta.delta.stop_reason,
-					),
-				});
 				await writeSSE("message_stop", { type: "message_stop" });
 				state.hasSentTerminalEvents = true;
 				break;

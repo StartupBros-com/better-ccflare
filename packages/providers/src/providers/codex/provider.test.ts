@@ -2383,6 +2383,100 @@ describe("CodexProvider.processResponse", () => {
 		}
 	});
 
+	it("writes one terminal trace when cancellation races completion", async () => {
+		const provider = new CodexProvider();
+		const traceDir = mkdtempSync(join(tmpdir(), "codex-trace-"));
+		process.env[CODEX_TRACE_DIR_ENV] = traceDir;
+		try {
+			const transformed = await provider.processResponse(
+				new Response(
+					sseBody(
+						eventLine("response.completed", {
+							response: {
+								model: "gpt-5.5",
+								status: "completed",
+								usage: {
+									input_tokens: 20,
+									output_tokens: 3,
+									input_tokens_details: { cached_tokens: 8 },
+								},
+							},
+						}),
+					),
+					{
+						status: 200,
+						headers: {
+							"content-type": "text/event-stream",
+							"x-better-ccflare-request-id": "logical-race",
+							"x-better-ccflare-attempt-id": "attempt-race",
+						},
+					},
+				),
+				null,
+			);
+			const reader = transformed.body?.getReader();
+			await reader?.read();
+			await reader?.cancel("client disconnected");
+			await Bun.sleep(10);
+
+			const records = readTraceRecords(traceDir).filter(
+				(candidate) =>
+					candidate.phase === "response" &&
+					candidate.attempt_id === "attempt-race",
+			);
+			expect(records).toHaveLength(1);
+		} finally {
+			delete process.env[CODEX_TRACE_DIR_ENV];
+			rmSync(traceDir, { recursive: true, force: true });
+		}
+	});
+
+	it("pauses upstream reads until the downstream consumer pulls", async () => {
+		const provider = new CodexProvider();
+		let upstreamReads = 0;
+		const chunk = (index: number) =>
+			new TextEncoder().encode(
+				[
+					"event: response.output_text.delta",
+					`data: {"delta":"chunk-${index}"}`,
+					"",
+					"",
+				].join("\n"),
+			);
+		const upstream = new ReadableStream<Uint8Array>({
+			pull(controller) {
+				upstreamReads++;
+				if (upstreamReads > 64) {
+					controller.close();
+					return;
+				}
+				controller.enqueue(chunk(upstreamReads));
+			},
+		});
+		const transformed = await provider.processResponse(
+			new Response(upstream, {
+				headers: {
+					"content-type": "text/event-stream",
+					"x-better-ccflare-request-id": "logical-backpressure",
+					"x-better-ccflare-attempt-id": "attempt-backpressure",
+				},
+			}),
+			null,
+		);
+
+		// No downstream reader yet: the transform must not drain the upstream.
+		await Bun.sleep(25);
+		const readsBeforeConsumption = upstreamReads;
+		expect(readsBeforeConsumption).toBeLessThan(16);
+
+		const reader = transformed.body?.getReader();
+		while (true) {
+			const { done } = (await reader?.read()) ?? { done: true };
+			if (done) break;
+		}
+		expect(upstreamReads).toBeGreaterThan(readsBeforeConsumption);
+	});
+
 	it("traces upstream stream read failures as terminal errors", async () => {
 		const provider = new CodexProvider();
 		const traceDir = mkdtempSync(join(tmpdir(), "codex-trace-"));

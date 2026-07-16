@@ -718,7 +718,11 @@ describe("analyzeCodexTrace", () => {
 
 		expect(report.logicalRequests).toBe(1);
 		expect(report.attempts).toBe(2);
-		expect(report.joins).toEqual({ missing: 0, ambiguous: 0 });
+		expect(report.joins).toEqual({
+			missing: 0,
+			ambiguous: 0,
+			schema9MissingAttemptId: 0,
+		});
 		expect(report.canary.conversation.assignedRequests).toBe(0);
 		expect(report.canary.session.assignedRequests).toBe(1);
 		expect(report.canary.conversation.weightedCacheReusePct).toBeNull();
@@ -942,6 +946,104 @@ describe("analyzeCodexTrace", () => {
 		).toBe(37.5);
 	});
 
+	test("does not legacy-join schema 9 records that lost their attempt identity", () => {
+		const report = analyzeCodexTrace([
+			{
+				trace_schema_version: 9,
+				phase: "request",
+				request_id: "schema9-degraded",
+				cache_key_assignment: "session",
+				cache_key_mode: "session",
+			},
+			{
+				trace_schema_version: 9,
+				phase: "response",
+				request_id: "schema9-degraded",
+				cache_measurement_available: true,
+				input_tokens: 100,
+				cache_read_input_tokens: 100,
+			},
+		]);
+
+		expect(report.joins.schema9MissingAttemptId).toBe(2);
+		expect(report.cacheDenominators.attemptInclusive.measuredResponses).toBe(0);
+		expect(report.canary.session.joinedTerminalResponses).toBe(0);
+		expect(report.canary.session.missingTerminalRequests).toBe(1);
+	});
+
+	test("attributes attempt-inclusive reuse to each canary arm", () => {
+		const report = analyzeCodexTrace([
+			{
+				trace_schema_version: 9,
+				phase: "request",
+				request_id: "session-request",
+				attempt_id: "session-attempt-1",
+				attempt_ordinal: 1,
+				cache_key_assignment: "session",
+				cache_key_mode: "session",
+			},
+			{
+				trace_schema_version: 9,
+				phase: "response",
+				request_id: "session-request",
+				attempt_id: "session-attempt-1",
+				cache_measurement_available: true,
+				input_tokens: 100,
+				cache_read_input_tokens: 0,
+			},
+			{
+				trace_schema_version: 9,
+				phase: "request",
+				request_id: "session-request",
+				attempt_id: "session-attempt-2",
+				attempt_ordinal: 2,
+				cache_key_assignment: "session",
+				cache_key_mode: "session",
+			},
+			{
+				trace_schema_version: 9,
+				phase: "response",
+				request_id: "session-request",
+				attempt_id: "session-attempt-2",
+				cache_measurement_available: true,
+				input_tokens: 100,
+				cache_read_input_tokens: 50,
+			},
+			{
+				trace_schema_version: 9,
+				phase: "request",
+				request_id: "conversation-request",
+				attempt_id: "conversation-attempt",
+				attempt_ordinal: 1,
+				cache_key_assignment: "conversation",
+				cache_key_mode: "conversation",
+			},
+			{
+				trace_schema_version: 9,
+				phase: "response",
+				request_id: "conversation-request",
+				attempt_id: "conversation-attempt",
+				cache_measurement_available: true,
+				input_tokens: 100,
+				cache_read_input_tokens: 90,
+			},
+		]);
+
+		expect(report.canary.session.attemptInclusive).toEqual({
+			attempts: 2,
+			joinedResponses: 2,
+			cacheMeasuredResponses: 2,
+			weightedCacheReusePct: 25,
+		});
+		expect(report.canary.conversation.attemptInclusive).toEqual({
+			attempts: 1,
+			joinedResponses: 1,
+			cacheMeasuredResponses: 1,
+			weightedCacheReusePct: 90,
+		});
+		expect(report.canary.session.joinedTerminalResponses).toBe(1);
+	});
+
 	test("computes key concentration for large distinct key sets without spreading", () => {
 		const records = Array.from({ length: 150_000 }, (_, index) => ({
 			phase: "request" as const,
@@ -1087,7 +1189,11 @@ describe("analyzeCodexTrace", () => {
 				attempt_id: "duplicate-id",
 			},
 		]);
-		expect(report.joins).toEqual({ missing: 2, ambiguous: 1 });
+		expect(report.joins).toEqual({
+			missing: 2,
+			ambiguous: 1,
+			schema9MissingAttemptId: 0,
+		});
 		expect(report.response.unjoinedResponses).toBe(2);
 	});
 

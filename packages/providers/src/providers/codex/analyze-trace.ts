@@ -126,6 +126,12 @@ export interface CanaryArmStats {
 	logicalConversations: number;
 	turns: { first: CanaryTurnStats; followUp: CanaryTurnStats };
 	conversationTurnBands: Record<string, number>;
+	attemptInclusive: {
+		attempts: number;
+		joinedResponses: number;
+		cacheMeasuredResponses: number;
+		weightedCacheReusePct: number | null;
+	};
 }
 
 export interface TraceReport {
@@ -133,7 +139,11 @@ export interface TraceReport {
 	responses: number;
 	logicalRequests: number;
 	attempts: number;
-	joins: { missing: number; ambiguous: number };
+	joins: {
+		missing: number;
+		ambiguous: number;
+		schema9MissingAttemptId: number;
+	};
 	cacheDenominators: {
 		attemptInclusive: {
 			measuredResponses: number;
@@ -289,9 +299,17 @@ interface CanaryTurnAccumulator extends CanaryTurnStats {
 	cacheReadInputTokens: number;
 }
 
-interface CanaryArmAccumulator extends Omit<CanaryArmStats, "turns"> {
+interface CanaryArmAccumulator
+	extends Omit<CanaryArmStats, "turns" | "attemptInclusive"> {
 	measuredInputTokens: number;
 	conversationIds: Set<string>;
+	attemptInclusive: {
+		attempts: number;
+		joinedResponses: number;
+		cacheMeasuredResponses: number;
+		measuredInputTokens: number;
+		cacheReadInputTokens: number;
+	};
 	turns: {
 		first: CanaryTurnAccumulator;
 		followUp: CanaryTurnAccumulator;
@@ -344,6 +362,13 @@ function canaryArmAccumulator(): CanaryArmAccumulator {
 		conversationTurnBands: {},
 		measuredInputTokens: 0,
 		conversationIds: new Set(),
+		attemptInclusive: {
+			attempts: 0,
+			joinedResponses: 0,
+			cacheMeasuredResponses: 0,
+			measuredInputTokens: 0,
+			cacheReadInputTokens: 0,
+		},
 	};
 }
 
@@ -399,7 +424,26 @@ function finishCanaryArm(arm: CanaryArmAccumulator): CanaryArmStats {
 			followUp: finishCanaryTurn(arm.turns.followUp),
 		},
 		conversationTurnBands: arm.conversationTurnBands,
+		attemptInclusive: {
+			attempts: arm.attemptInclusive.attempts,
+			joinedResponses: arm.attemptInclusive.joinedResponses,
+			cacheMeasuredResponses: arm.attemptInclusive.cacheMeasuredResponses,
+			weightedCacheReusePct:
+				arm.attemptInclusive.measuredInputTokens > 0
+					? Math.round(
+							(1000 * arm.attemptInclusive.cacheReadInputTokens) /
+								arm.attemptInclusive.measuredInputTokens,
+						) / 10
+					: null,
+		},
 	};
+}
+
+// Logical-ID joins are a compatibility path for schema 6-8 records only. A
+// schema-9 record without attempt_id is an instrumentation failure and must
+// surface as unjoinable rather than silently collapsing physical attempts.
+function isLegacyJoinEligible(record: TraceRecord): boolean {
+	return (record.trace_schema_version ?? 0) < 9;
 }
 
 function analyzeCanary(
@@ -423,13 +467,13 @@ function analyzeCanary(
 	for (const request of requestRecords) {
 		if (request.attempt_id)
 			append(requestAttemptsById, request.attempt_id, request);
-		else if (request.request_id)
+		else if (request.request_id && isLegacyJoinEligible(request))
 			append(legacyRequestsByLogicalId, request.request_id, request);
 	}
 	for (const response of responseRecords) {
 		if (response.attempt_id)
 			append(responseAttemptsById, response.attempt_id, response);
-		else if (response.request_id)
+		else if (response.request_id && isLegacyJoinEligible(response))
 			append(legacyResponsesByLogicalId, response.request_id, response);
 		else responsesWithoutId++;
 	}
@@ -462,7 +506,7 @@ function analyzeCanary(
 				? responses[0]
 				: undefined;
 		}
-		if (!request.request_id) return undefined;
+		if (!request.request_id || !isLegacyJoinEligible(request)) return undefined;
 		const requests = legacyRequestsByLogicalId.get(request.request_id) ?? [];
 		const responses = legacyResponsesByLogicalId.get(request.request_id) ?? [];
 		return requests.length === 1 && responses.length === 1
@@ -564,6 +608,52 @@ function analyzeCanary(
 		}
 	}
 
+	// Attempt-inclusive per-arm economics: every physical attempt joins under
+	// the arm of its own request record, so retry and failover costs are
+	// attributable to the treatment that incurred them.
+	const armFor = (request: TraceRecord) => {
+		const assignment = request.cache_key_assignment;
+		return assignment === "conversation" || assignment === "session"
+			? arms[assignment]
+			: arms.unassigned;
+	};
+	for (const request of requestRecords) {
+		armFor(request).attemptInclusive.attempts++;
+	}
+	const accumulateAttemptJoin = (
+		requests: readonly TraceRecord[],
+		responses: readonly TraceRecord[],
+	) => {
+		if (requests.length !== 1 || responses.length !== 1) return;
+		const request = requests[0];
+		const response = responses[0];
+		if (!request || !response) return;
+		const arm = armFor(request);
+		arm.attemptInclusive.joinedResponses++;
+		if (
+			response.cache_measurement_available === false ||
+			typeof response.cache_read_input_tokens !== "number" ||
+			typeof response.input_tokens !== "number"
+		)
+			return;
+		const inputTokens = response.input_tokens;
+		const cacheRead = Math.min(
+			Math.max(response.cache_read_input_tokens, 0),
+			inputTokens,
+		);
+		arm.attemptInclusive.cacheMeasuredResponses++;
+		arm.attemptInclusive.measuredInputTokens += inputTokens;
+		arm.attemptInclusive.cacheReadInputTokens += cacheRead;
+	};
+	for (const [attemptId, requests] of requestAttemptsById) {
+		accumulateAttemptJoin(requests, responseAttemptsById.get(attemptId) ?? []);
+	}
+	for (const [logicalId, requests] of legacyRequestsByLogicalId) {
+		accumulateAttemptJoin(
+			requests,
+			legacyResponsesByLogicalId.get(logicalId) ?? [],
+		);
+	}
 	let unjoinedResponses = responsesWithoutId;
 	for (const [attemptId, responses] of responseAttemptsById)
 		if (
@@ -691,7 +781,12 @@ export function analyzeCodexTrace(
 	const responsesByAttemptId = new Map<string, TraceRecord[]>();
 	const legacyRequestsByLogicalId = new Map<string, TraceRecord[]>();
 	const legacyResponsesByLogicalId = new Map<string, TraceRecord[]>();
+	let schema9MissingAttemptId = 0;
 	for (const request of requestRecords) {
+		if (!request.attempt_id && !isLegacyJoinEligible(request)) {
+			schema9MissingAttemptId++;
+			continue;
+		}
 		const map = request.attempt_id
 			? requestsByAttemptId
 			: legacyRequestsByLogicalId;
@@ -702,6 +797,10 @@ export function analyzeCodexTrace(
 		map.set(id, group);
 	}
 	for (const response of responseRecords) {
+		if (!response.attempt_id && !isLegacyJoinEligible(response)) {
+			schema9MissingAttemptId++;
+			continue;
+		}
 		const map = response.attempt_id
 			? responsesByAttemptId
 			: legacyResponsesByLogicalId;
@@ -711,9 +810,9 @@ export function analyzeCodexTrace(
 		group.push(response);
 		map.set(id, group);
 	}
-	let missingJoins = records.filter(
-		(record) => !record.request_id && !record.attempt_id,
-	).length;
+	let missingJoins =
+		records.filter((record) => !record.request_id && !record.attempt_id)
+			.length + schema9MissingAttemptId;
 	let ambiguousJoins = 0;
 	const countJoinQuality = (
 		requests: ReadonlyMap<string, TraceRecord[]>,
@@ -807,9 +906,10 @@ export function analyzeCodexTrace(
 		responses: ReadonlyMap<string, TraceRecord[]>,
 	) => {
 		for (const [id, requestGroup] of requests) {
-			const responseGroup = responses.get(id);
-			if (requestGroup.length === 1 && responseGroup?.length === 1) {
-				attemptInclusiveResponses.push(responseGroup[0]!);
+			const response =
+				responses.get(id)?.length === 1 ? responses.get(id)?.[0] : undefined;
+			if (requestGroup.length === 1 && response) {
+				attemptInclusiveResponses.push(response);
 			}
 		}
 	};
@@ -1029,7 +1129,11 @@ export function analyzeCodexTrace(
 			logicalIds.size +
 			requestRecords.filter((record) => !record.request_id).length,
 		attempts: requestRecords.length,
-		joins: { missing: missingJoins, ambiguous: ambiguousJoins },
+		joins: {
+			missing: missingJoins,
+			ambiguous: ambiguousJoins,
+			schema9MissingAttemptId,
+		},
 		cacheDenominators: {
 			attemptInclusive: measuredStats(attemptInclusiveResponses),
 			finalResponseOnly: measuredStats(finalResponses),
@@ -1126,6 +1230,7 @@ function formatCanaryArm(name: string, arm: CanaryArmStats): string[] {
 	return [
 		`  ${name}: assigned=${arm.assignedRequests} joined=${arm.joinedTerminalResponses} missing-terminal=${arm.missingTerminalRequests}`,
 		`    cache measured: ${arm.cacheMeasuredResponses}; weighted reuse: ${arm.weightedCacheReusePct ?? "n/a"}%`,
+		`    attempt-inclusive: attempts=${arm.attemptInclusive.attempts} joined=${arm.attemptInclusive.joinedResponses} measured=${arm.attemptInclusive.cacheMeasuredResponses} weighted reuse=${arm.attemptInclusive.weightedCacheReusePct ?? "n/a"}%`,
 		`    cache positive: ${arm.cachePositiveResponses}/${arm.cacheMeasuredResponses} measured (${arm.cachePositiveRatePct ?? "n/a"}%)`,
 		`    terminals: ${JSON.stringify(arm.terminals)}`,
 		`    effective modes: ${JSON.stringify(arm.effectiveModes)}`,
@@ -1148,7 +1253,7 @@ export function formatReport(report: TraceReport): string {
 		`physical attempts : ${report.attempts}`,
 		`request records   : ${report.requests}`,
 		`response records  : ${report.responses}`,
-		`joins             : missing=${report.joins.missing} ambiguous=${report.joins.ambiguous}`,
+		`joins             : missing=${report.joins.missing} ambiguous=${report.joins.ambiguous} schema9-missing-attempt-id=${report.joins.schema9MissingAttemptId}`,
 		`cache denominators: final=${JSON.stringify(report.cacheDenominators.finalResponseOnly)} attempts=${JSON.stringify(report.cacheDenominators.attemptInclusive)}`,
 		`experiment ready  : treatment-absent=${report.readiness.treatmentAbsent} crossovers=${report.readiness.assignmentEffectiveCrossovers}`,
 		`key concentration : max=${report.readiness.maxRequestsPerKeyMinute}/min keys-over-15=${report.readiness.keysOver15RequestsPerMinute}`,
