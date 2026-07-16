@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { BUFFER_SIZES } from "@better-ccflare/core";
 import { fetchCodexUsageOnDemand } from "./on-demand-fetch";
 import {
 	CODEX_SINGLE_ORCHESTRATION_ROOT_ENV,
@@ -2734,6 +2735,301 @@ describe("CodexProvider.processResponse", () => {
 
 		expect(processed.status).toBe(400);
 		expect(await processed.text()).toBe('{"error":"bad_request"}');
+	});
+});
+
+describe("CodexProvider SSE frame bounds", () => {
+	const normalizeMessageId = (text: string) =>
+		text.replace(/msg_[0-9a-f]{24}/g, "msg_TEST");
+
+	const crlfSseBody = (events: Array<[string, unknown]>) =>
+		`${events
+			.map(
+				([name, data]) =>
+					`event: ${name}\r\ndata: ${typeof data === "string" ? data : JSON.stringify(data)}\r\n`,
+			)
+			.join("\r\n")}\r\n`;
+
+	it("produces identical output for CRLF-terminated frames as for LF-terminated frames", async () => {
+		const events: Array<[string, unknown]> = [
+			["response.created", { response: { id: "resp_crlf", model: "gpt-5.4" } }],
+			[
+				"response.output_item.added",
+				{ item: { type: "message" }, output_index: 0 },
+			],
+			["response.content_part.added", { part: { type: "output_text" } }],
+			["response.output_text.delta", { delta: "hello" }],
+			[
+				"response.completed",
+				{
+					response: {
+						model: "gpt-5.4",
+						usage: { input_tokens: 2, output_tokens: 1 },
+					},
+				},
+			],
+		];
+
+		const lfBody = sseBody(
+			events.flatMap(([name, data]) => eventLine(name, data)),
+		);
+		const lfResponse = new Response(lfBody, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+		const lfText = normalizeMessageId(
+			await (
+				await new CodexProvider().processResponse(lfResponse, null)
+			).text(),
+		);
+
+		const crlfResponse = new Response(crlfSseBody(events), {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+		const crlfText = normalizeMessageId(
+			await (
+				await new CodexProvider().processResponse(crlfResponse, null)
+			).text(),
+		);
+
+		expect(crlfText).toBe(lfText);
+	});
+
+	it("closes the open content block before an error when a single frame exceeds the per-frame cap", async () => {
+		const provider = new CodexProvider();
+		const encoder = new TextEncoder();
+		const upstreamBody = new ReadableStream<Uint8Array>({
+			start(controller) {
+				// First chunk: opens a text content block, fully processed on its own.
+				controller.enqueue(
+					encoder.encode(
+						sseBody([
+							...eventLine("response.created", {
+								response: { id: "resp_frame_cap", model: "gpt-5.4" },
+							}),
+							...eventLine("response.output_item.added", {
+								item: { type: "message" },
+								output_index: 0,
+							}),
+							...eventLine("response.content_part.added", {
+								part: { type: "output_text" },
+							}),
+							...eventLine("response.output_text.delta", { delta: "partial" }),
+						]),
+					),
+				);
+				// Second chunk: a single complete frame whose payload alone exceeds
+				// the per-frame cap.
+				const oversizedPayload = "x".repeat(
+					BUFFER_SIZES.SSE_FRAME_MAX_BYTES + 1024,
+				);
+				controller.enqueue(
+					encoder.encode(
+						sseBody(
+							eventLine("response.output_text.delta", {
+								delta: oversizedPayload,
+							}),
+						),
+					),
+				);
+				controller.close();
+			},
+		});
+
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const body = await transformed.text();
+
+		expect(body).toContain("event: error");
+		expect(body).toContain('"type":"api_error"');
+		expect(body).toContain('"code":"sse_limit_exceeded"');
+		const startPos = body.indexOf("event: message_start");
+		const stopPos = body.indexOf("event: content_block_stop");
+		const errorPos = body.indexOf("event: error");
+		expect(startPos).toBeGreaterThanOrEqual(0);
+		expect(stopPos).toBeGreaterThan(startPos);
+		expect(errorPos).toBeGreaterThan(stopPos);
+	});
+
+	it("closes the open content block before an error when an unterminated tail exceeds the buffer cap", async () => {
+		const provider = new CodexProvider();
+		const encoder = new TextEncoder();
+		const upstreamBody = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(
+					encoder.encode(
+						sseBody([
+							...eventLine("response.created", {
+								response: { id: "resp_buffer_cap", model: "gpt-5.4" },
+							}),
+							...eventLine("response.output_item.added", {
+								item: { type: "message" },
+								output_index: 0,
+							}),
+							...eventLine("response.content_part.added", {
+								part: { type: "output_text" },
+							}),
+							...eventLine("response.output_text.delta", { delta: "partial" }),
+						]),
+					),
+				);
+				// Never terminated: no blank-line delimiter arrives, so the tail
+				// keeps growing past the unterminated-buffer cap.
+				const runaway = `event: response.output_text.delta\ndata: {"delta":"${"y".repeat(
+					BUFFER_SIZES.SSE_BUFFER_MAX_BYTES + 1024,
+				)}`;
+				controller.enqueue(encoder.encode(runaway));
+				controller.close();
+			},
+		});
+
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const body = await transformed.text();
+
+		expect(body).toContain("event: error");
+		expect(body).toContain('"type":"api_error"');
+		expect(body).toContain('"code":"sse_limit_exceeded"');
+		const startPos = body.indexOf("event: message_start");
+		const stopPos = body.indexOf("event: content_block_stop");
+		const errorPos = body.indexOf("event: error");
+		expect(startPos).toBeGreaterThanOrEqual(0);
+		expect(stopPos).toBeGreaterThan(startPos);
+		expect(errorPos).toBeGreaterThan(stopPos);
+	});
+
+	it("trips the aggregate tool-args cap when five parallel calls each stay under the per-call cap but exceed it together", async () => {
+		const provider = new CodexProvider();
+		const perCallArgBytes = 15_000;
+		expect(perCallArgBytes).toBeLessThan(BUFFER_SIZES.SSE_FRAME_MAX_BYTES);
+		expect(perCallArgBytes * 5).toBeGreaterThan(
+			BUFFER_SIZES.SSE_FRAME_MAX_BYTES,
+		);
+
+		const lines: string[] = [
+			...eventLine("response.created", {
+				response: { id: "resp_aggregate_cap", model: "gpt-5.4" },
+			}),
+		];
+		for (let i = 0; i < 5; i++) {
+			lines.push(
+				...eventLine("response.output_item.added", {
+					item: {
+						type: "function_call",
+						call_id: `call_${i}`,
+						name: `tool_${i}`,
+					},
+					output_index: i,
+				}),
+			);
+		}
+		for (let i = 0; i < 5; i++) {
+			lines.push(
+				...eventLine("response.function_call_arguments.delta", {
+					delta: "a".repeat(perCallArgBytes),
+					output_index: i,
+				}),
+			);
+		}
+
+		const response = new Response(sseBody(lines), {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const body = await transformed.text();
+
+		expect(body).toContain("event: error");
+		expect(body).toContain('"type":"api_error"');
+		expect(body).toContain('"code":"sse_limit_exceeded"');
+		expect(body).not.toContain("event: message_delta");
+	});
+
+	it("trips the per-call tool-args cap when a single call's own arguments alone exceed it", async () => {
+		const provider = new CodexProvider();
+
+		// Each individual delta frame stays well under the per-frame SSE cap;
+		// only their accumulated total for this one call exceeds the per-call
+		// argument byte cap. This is distinct from the aggregate-cap test
+		// above, which requires several concurrently open calls that each
+		// individually stay under the per-call cap.
+		const chunkSize = 4096;
+		const chunkCount =
+			Math.ceil(BUFFER_SIZES.SSE_FRAME_MAX_BYTES / chunkSize) + 2;
+
+		const lines: string[] = [
+			...eventLine("response.created", {
+				response: { id: "resp_single_call_cap", model: "gpt-5.4" },
+			}),
+			...eventLine("response.output_item.added", {
+				item: {
+					type: "function_call",
+					call_id: "call_0",
+					name: "tool_0",
+				},
+				output_index: 0,
+			}),
+		];
+		for (let i = 0; i < chunkCount; i++) {
+			lines.push(
+				...eventLine("response.function_call_arguments.delta", {
+					delta: "a".repeat(chunkSize),
+					output_index: 0,
+				}),
+			);
+		}
+
+		const response = new Response(sseBody(lines), {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const body = await transformed.text();
+
+		expect(body).toContain("event: error");
+		expect(body).toContain('"type":"api_error"');
+		expect(body).toContain('"code":"sse_limit_exceeded"');
+		expect(body).toContain("Tool call arguments for output_index 0 totaled");
+		expect(body).not.toContain("Aggregate tool call arguments");
+	});
+
+	it("emits message_start before an error that arrives as the literal first SSE event", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody(
+			eventLine("response.failed", {
+				response: {
+					status: "failed",
+					error: {
+						type: "invalid_request_error",
+						message: "immediate failure",
+					},
+				},
+			}),
+		);
+
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const body = await transformed.text();
+
+		const messageStartPos = body.indexOf("event: message_start");
+		const errorPos = body.indexOf("event: error");
+		expect(messageStartPos).toBeGreaterThanOrEqual(0);
+		expect(errorPos).toBeGreaterThan(messageStartPos);
 	});
 });
 
