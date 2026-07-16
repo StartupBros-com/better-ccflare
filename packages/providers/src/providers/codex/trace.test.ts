@@ -77,6 +77,69 @@ describe("writeCodexTrace schema 8 cache-key decision", () => {
 	});
 });
 
+describe("orchestration demotion diagnostics (additive on schema 9)", () => {
+	test("writes the demotion signal and elapsed time when supplied", () => {
+		const dir = mkdtempSync(join(tmpdir(), "codex-trace-schema-"));
+		process.env[CODEX_TRACE_DIR_ENV] = dir;
+		try {
+			writeCodexTrace({
+				codexInput: [],
+				orchestrationDemotionObserved: true,
+				elapsedMsSinceRoot: 4_242,
+			});
+
+			const file = readdirSync(dir).find((name) => name.endsWith(".jsonl"));
+			const record = JSON.parse(
+				readFileSync(join(dir, file as string), "utf8").trim(),
+			);
+			expect(record).toMatchObject({
+				trace_schema_version: 9,
+				orchestration_demotion_observed: true,
+				elapsed_ms_since_root: 4_242,
+			});
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("defaults both fields to null so the schema stays additive, not version-bumped", () => {
+		const dir = mkdtempSync(join(tmpdir(), "codex-trace-schema-"));
+		process.env[CODEX_TRACE_DIR_ENV] = dir;
+		try {
+			writeCodexTrace({ codexInput: [] });
+
+			const file = readdirSync(dir).find((name) => name.endsWith(".jsonl"));
+			const record = JSON.parse(
+				readFileSync(join(dir, file as string), "utf8").trim(),
+			);
+			expect(record.trace_schema_version).toBe(9);
+			expect(record.orchestration_demotion_observed).toBeNull();
+			expect(record.elapsed_ms_since_root).toBeNull();
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("preserves an explicit false without collapsing it to null", () => {
+		const dir = mkdtempSync(join(tmpdir(), "codex-trace-schema-"));
+		process.env[CODEX_TRACE_DIR_ENV] = dir;
+		try {
+			writeCodexTrace({
+				codexInput: [],
+				orchestrationDemotionObserved: false,
+			});
+
+			const file = readdirSync(dir).find((name) => name.endsWith(".jsonl"));
+			const record = JSON.parse(
+				readFileSync(join(dir, file as string), "utf8").trim(),
+			);
+			expect(record.orchestration_demotion_observed).toBe(false);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("summarizeCodexTransform (request/history phase)", () => {
 	test("counts historical tool calls, outputs, empties, and nudges", () => {
 		const s = summarizeCodexTransform([

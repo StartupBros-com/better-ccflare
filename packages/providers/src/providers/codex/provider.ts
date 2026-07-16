@@ -19,6 +19,8 @@ import {
 	deriveConversationIdentity,
 	electOrchestrationRoot,
 	type OrchestrationAdmission,
+	peekOrchestrationRoot,
+	recordOrchestrationRootInstructions,
 } from "./orchestration-election";
 import {
 	summarizeCodexResponse,
@@ -286,6 +288,10 @@ interface CodexConversionResult {
 	cacheKeyDecision: CodexPromptCacheKeyDecision;
 	orchestrationAdmission: OrchestrationAdmission;
 	filteredToolNames: string[];
+	/** Diagnostic: see orchestrationDemotionObserved in trace.ts's TraceInputs. */
+	orchestrationDemotionObserved: boolean;
+	/** Diagnostic: see elapsedMsSinceRoot in trace.ts's TraceInputs. */
+	elapsedMsSinceRoot: number | null;
 }
 
 // ── Anthropic request types ───────────────────────────────────────────────────
@@ -623,6 +629,8 @@ export class CodexProvider extends BaseProvider {
 				cacheKeyDecision,
 				orchestrationAdmission,
 				filteredToolNames,
+				orchestrationDemotionObserved,
+				elapsedMsSinceRoot,
 			} = this.convertToCodexFormat(
 				body,
 				account,
@@ -667,6 +675,8 @@ export class CodexProvider extends BaseProvider {
 				pacingAction: request.headers.get("x-better-ccflare-pacing-action"),
 				isDescendant: isAttributedAgent,
 				orchestrationAdmission,
+				orchestrationDemotionObserved,
+				elapsedMsSinceRoot,
 				toolsBeforeCount: body.tools?.length ?? 0,
 				filteredToolNames,
 				instructions: codexBody.instructions,
@@ -1318,6 +1328,8 @@ export class CodexProvider extends BaseProvider {
 			body.tools?.some((tool) => orchestrationToolNames.has(tool.name)) ??
 			false;
 		let orchestrationAdmission: OrchestrationAdmission;
+		let orchestrationDemotionObserved = false;
+		let elapsedMsSinceRoot: number | null = null;
 		if (!offersOrchestrationTools) {
 			orchestrationAdmission = "no_orchestration_tools";
 		} else if (process.env[CODEX_SINGLE_ORCHESTRATION_ROOT_ENV] === "0") {
@@ -1327,6 +1339,9 @@ export class CodexProvider extends BaseProvider {
 			if (!sessionId) {
 				orchestrationAdmission = "no_session";
 			} else {
+				// Captured before electOrchestrationRoot() mutates the entry, so a
+				// demotion below can still report how long the prior root was idle.
+				const priorRoot = peekOrchestrationRoot(sessionId);
 				const conversationId = deriveConversationIdentity(
 					sessionId,
 					finalInstructions,
@@ -1335,6 +1350,22 @@ export class CodexProvider extends BaseProvider {
 				orchestrationAdmission = conversationId
 					? electOrchestrationRoot(sessionId, conversationId)
 					: "no_conversation";
+				if (orchestrationAdmission === "root") {
+					recordOrchestrationRootInstructions(sessionId, finalInstructions);
+				} else if (orchestrationAdmission === "non_root" && priorRoot) {
+					// This session already had an elected root, and this turn's
+					// derived identity no longer matches it. Compaction that drops
+					// the earliest input item reshapes deriveConversationIdentity's
+					// hash for what is otherwise the same conversation, so this
+					// signal is diagnostic, not proof of a genuine sibling turn.
+					orchestrationDemotionObserved = true;
+					elapsedMsSinceRoot = Date.now() - priorRoot.lastActiveAt;
+					const instructionsMatchedPriorRoot =
+						finalInstructions === priorRoot.instructions;
+					log.warn(
+						`orchestration demotion observed: session=${sessionId} elapsed_ms_since_root=${elapsedMsSinceRoot} isAttributedAgent=${isAttributedAgent} instructionsMatchedPriorRoot=${instructionsMatchedPriorRoot}`,
+					);
+				}
 			}
 		}
 
@@ -1436,6 +1467,8 @@ export class CodexProvider extends BaseProvider {
 			cacheKeyDecision,
 			orchestrationAdmission,
 			filteredToolNames,
+			orchestrationDemotionObserved,
+			elapsedMsSinceRoot,
 		};
 	}
 
