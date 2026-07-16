@@ -209,5 +209,4 @@ describe("incremental-vacuum worker protocol: kind discriminator", () => {
 			worker.terminate();
 		}
 	});
-
 });

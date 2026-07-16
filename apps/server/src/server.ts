@@ -579,8 +579,7 @@ export function formatWalCheckpointLog(
 	// hundreds/seconds means ANALYZE is scanning unbounded again.
 	const walMiB = walBytes / (1024 * 1024);
 	const status = result.skipped ? "skipped (DB busy)" : "ran";
-	const timing =
-		result.durationMs != null ? ` in ${result.durationMs}ms` : "";
+	const timing = result.durationMs != null ? ` in ${result.durationMs}ms` : "";
 	if (walMiB > warnThresholdMiB) {
 		return {
 			level: "warn",

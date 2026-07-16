@@ -51,10 +51,7 @@ describe("formatWalCheckpointLog", () => {
 	});
 
 	it("does not divide by zero or produce NaN when walBytes is 0", () => {
-		const { message } = formatWalCheckpointLog(
-			{ ok: true, skipped: false },
-			0,
-		);
+		const { message } = formatWalCheckpointLog({ ok: true, skipped: false }, 0);
 		expect(message).not.toContain("NaN");
 		expect(message).toContain("0.0MiB");
 	});
