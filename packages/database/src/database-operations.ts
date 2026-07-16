@@ -4,7 +4,10 @@ import { stat } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { RuntimeConfig } from "@better-ccflare/config";
 import type { Disposable, TurnEvidence } from "@better-ccflare/core";
-import { TIME_CONSTANTS } from "@better-ccflare/core";
+import {
+	PAUSE_REASON_NEEDS_REAUTH,
+	TIME_CONSTANTS,
+} from "@better-ccflare/core";
 import type {
 	Account,
 	AgentAttributionSource,
@@ -1035,8 +1038,34 @@ OAuth tokens will need to be re-authenticated.
 		await this.accounts.pause(accountId, reason);
 	}
 
+	/**
+	 * Pause only if currently active; returns true when this call paused it.
+	 * When `expectedRefreshToken` is provided, also requires the account to still
+	 * hold that exact refresh token (guards against stale re-pauses after reauth).
+	 */
+	async pauseAccountIfActive(
+		accountId: string,
+		reason: string,
+		expectedRefreshToken?: string | null,
+	): Promise<boolean> {
+		return this.accounts.pauseIfActive(accountId, reason, expectedRefreshToken);
+	}
+
 	async resumeAccount(accountId: string): Promise<void> {
 		await this.accounts.resume(accountId);
+	}
+
+	/**
+	 * Resume an account only if it is paused specifically for needing re-auth
+	 * (`oauth_invalid_grant`). Called after a successful reauth so the account
+	 * returns to rotation automatically, without lifting a manual/overage/
+	 * subscription pause. Returns true when this call resumed it.
+	 */
+	async resumeAccountIfNeedsReauth(accountId: string): Promise<boolean> {
+		return this.accounts.resumeIfPausedWithReason(
+			accountId,
+			PAUSE_REASON_NEEDS_REAUTH,
+		);
 	}
 
 	async renameAccount(accountId: string, newName: string): Promise<void> {

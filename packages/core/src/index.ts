@@ -14,8 +14,11 @@ export {
 } from "./constants";
 
 export {
+	isInvalidGrantMessage,
 	logError,
 	OAuthError,
+	OAuthRefreshTokenError,
+	PAUSE_REASON_NEEDS_REAUTH,
 	ProviderError,
 	RateLimitError,
 	ServiceUnavailableError,
