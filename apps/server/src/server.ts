@@ -128,6 +128,55 @@ export function supportsRefreshBackedUsagePolling(
 	return provider === "anthropic" || provider === "xai";
 }
 
+/**
+ * Routing decision for a request against the dashboard SPA, decoupled from
+ * actual file I/O so the "never shadow an API route, the health endpoint,
+ * or a proxy request" invariant is unit testable without booting the
+ * server.
+ *
+ * The dashboard SPA + its static assets must be served BEFORE the
+ * authentication-gated API router is consulted: the initial browser
+ * navigation cannot carry an API key, so exempting dashboard-looking paths
+ * inside the shared authenticateRequest() path instead reopened an
+ * unauthenticated proxy bypass whenever the dashboard was disabled or its
+ * assets were unavailable (upstream providers accept arbitrary paths).
+ * Serving here, gated on the dashboard actually being available, means only
+ * genuine dashboard content skips auth; every other path (API and proxy)
+ * stays authenticated.
+ */
+export type DashboardRouteDecision =
+	| "static-asset"
+	| "spa-index"
+	| "pass-through";
+
+export function resolveDashboardRoute(
+	pathname: string,
+	method: string,
+	hasManifestEntry: boolean,
+): DashboardRouteDecision {
+	// Real bundled asset (hashed filename in the manifest): serve regardless
+	// of method, matching the original static-asset lookup semantics.
+	if (hasManifestEntry) {
+		return "static-asset";
+	}
+
+	// Client-side routing: only fall back to index.html for safe,
+	// body-less navigation methods, and never for a path that is actually
+	// an API route, the health endpoint, or a proxy request. Those must
+	// stay authenticated below.
+	const isApiOrProxyPath =
+		pathname.startsWith("/api/") ||
+		pathname === "/api" ||
+		pathname.startsWith("/v1/") ||
+		pathname.startsWith("/messages") ||
+		pathname === "/health";
+	if ((method === "GET" || method === "HEAD") && !isApiOrProxyPath) {
+		return "spa-index";
+	}
+
+	return "pass-through";
+}
+
 // Helper function to resolve dashboard assets with fallback
 function resolveDashboardAsset(assetPath: string): string | null {
 	try {
@@ -1167,7 +1216,37 @@ export default async function startServer(options?: {
 			async fetch(req: Request): Promise<Response> {
 				const url = new URL(req.url);
 
-				// Try API routes first
+				// Serve the dashboard SPA + static assets BEFORE the
+				// authentication-gated API router. The dashboard shell is
+				// public content and the initial browser navigation cannot
+				// carry an API key, so it must be reachable without auth.
+				// Auth-exempting these paths inside the SHARED
+				// authenticateRequest() path instead reopened an
+				// unauthenticated proxy bypass when the dashboard was
+				// disabled/unavailable (GET /foo fell through to the proxy,
+				// and providers accept arbitrary paths). Serving here, gated
+				// on the dashboard actually being available, means only
+				// genuine dashboard content skips auth; every other path
+				// (API and proxy) is still authenticated below.
+				if (withDashboard && dashboardManifest) {
+					const decision = resolveDashboardRoute(
+						url.pathname,
+						req.method,
+						Boolean(dashboardManifest[url.pathname]),
+					);
+					if (decision === "static-asset") {
+						return serveDashboardFile(
+							url.pathname,
+							undefined,
+							CACHE.CACHE_CONTROL_STATIC,
+						);
+					}
+					if (decision === "spa-index") {
+						return serveDashboardFile("/index.html", "text/html");
+					}
+				}
+
+				// API routes (authenticated inside the router)
 				const apiResponse = await apiRouter.handleRequest(url, req);
 				if (apiResponse) {
 					return apiResponse;
@@ -1193,27 +1272,6 @@ export default async function startServer(options?: {
 						families: getCachePacingStats(),
 						routes: getCachePacingRouteStats(),
 					});
-				}
-
-				// Dashboard routes (only if enabled and assets are available)
-				if (withDashboard && dashboardManifest) {
-					// Serve dashboard static assets
-					if (dashboardManifest[url.pathname]) {
-						return serveDashboardFile(
-							url.pathname,
-							undefined,
-							CACHE.CACHE_CONTROL_STATIC,
-						);
-					}
-
-					// For all non-API routes, serve the dashboard index.html (client-side routing)
-					// This allows React Router to handle all dashboard routes without maintaining a list
-					if (
-						!url.pathname.startsWith("/api/") &&
-						!url.pathname.startsWith("/v1/")
-					) {
-						return serveDashboardFile("/index.html", "text/html");
-					}
 				}
 
 				// All other paths go to proxy
