@@ -118,8 +118,8 @@ function jsonResponse(body: object, status: number) {
 const CLEAR_THINKING_ERROR_MESSAGE =
 	"`clear_thinking_20251015` strategy requires `thinking` to be enabled or adaptive";
 
-function clearThinkingRejectionResponse(): Response {
-	return jsonResponse(
+function clearThinkingRejectionResponse(onCancel?: () => void): Response {
+	const response = jsonResponse(
 		{
 			type: "error",
 			error: {
@@ -129,6 +129,16 @@ function clearThinkingRejectionResponse(): Response {
 		},
 		400,
 	);
+
+	if (onCancel && response.body) {
+		const cancel = response.body.cancel.bind(response.body);
+		response.body.cancel = (...args) => {
+			onCancel();
+			return cancel(...args);
+		};
+	}
+
+	return response;
 }
 
 function invalidSignatureResponse(): Response {
@@ -180,6 +190,7 @@ async function runProxyCapturingBodies(
 	responses: Response[],
 	account = makeAccount(),
 	ctx = makeProxyContext(),
+	cloneResponses = true,
 ): Promise<{
 	result: Response | null;
 	upstreamBodies: Array<Record<string, unknown>>;
@@ -191,7 +202,7 @@ async function runProxyCapturingBodies(
 		upstreamBodies.push(JSON.parse(bodyText));
 		const response =
 			responses[Math.min(upstreamBodies.length, responses.length) - 1];
-		return response.clone();
+		return cloneResponses ? response.clone() : response;
 	});
 
 	const bodyBuffer = encodeBody(requestBody);
@@ -327,6 +338,7 @@ describe("proxyWithAccount clear_thinking context-management handling", () => {
 	});
 
 	it("keeps the edit pre-send when thinking is enabled, but retries stripped if Claude still rejects it", async () => {
+		let rejectedBodyCancelled = false;
 		const { upstreamBodies } = await runProxyCapturingBodies(
 			{
 				model: "claude-opus-4-8",
@@ -340,10 +352,19 @@ describe("proxyWithAccount clear_thinking context-management handling", () => {
 				},
 				messages: [{ role: "user", content: "hello" }],
 			},
-			[clearThinkingRejectionResponse(), successResponse("claude-opus-4-8")],
+			[
+				clearThinkingRejectionResponse(() => {
+					rejectedBodyCancelled = true;
+				}),
+				successResponse("claude-opus-4-8"),
+			],
+			makeAccount(),
+			makeProxyContext(),
+			false,
 		);
 
 		expect(upstreamBodies).toHaveLength(2);
+		expect(rejectedBodyCancelled).toBe(true);
 		// First send kept the client's request intact.
 		expect(upstreamBodies[0].context_management).toBeDefined();
 		// Reactive retry stripped only the edit; thinking config is untouched.

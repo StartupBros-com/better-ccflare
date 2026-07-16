@@ -1434,6 +1434,7 @@ export async function proxyWithAccount(
 				};
 
 				await finalizeCurrentCodexTransport(rawResponse);
+				await discardUpstreamBody(rawResponse);
 				stampCodexAttempt(headers, "other_retry");
 				const retryProviderRequest = new Request(targetUrl, retryRequestInit);
 				retrySourceRequest = retryProviderRequest.clone();
