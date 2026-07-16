@@ -3290,6 +3290,55 @@ describe("CodexProvider SSE frame bounds", () => {
 		expect(body).not.toContain("event: message_delta");
 	});
 
+	it("trips the per-call tool-args cap when a single call's own arguments alone exceed it", async () => {
+		const provider = new CodexProvider();
+
+		// Each individual delta frame stays well under the per-frame SSE cap;
+		// only their accumulated total for this one call exceeds the per-call
+		// argument byte cap. This is distinct from the aggregate-cap test
+		// above, which requires several concurrently open calls that each
+		// individually stay under the per-call cap.
+		const chunkSize = 4096;
+		const chunkCount =
+			Math.ceil(BUFFER_SIZES.SSE_FRAME_MAX_BYTES / chunkSize) + 2;
+
+		const lines: string[] = [
+			...eventLine("response.created", {
+				response: { id: "resp_single_call_cap", model: "gpt-5.4" },
+			}),
+			...eventLine("response.output_item.added", {
+				item: {
+					type: "function_call",
+					call_id: "call_0",
+					name: "tool_0",
+				},
+				output_index: 0,
+			}),
+		];
+		for (let i = 0; i < chunkCount; i++) {
+			lines.push(
+				...eventLine("response.function_call_arguments.delta", {
+					delta: "a".repeat(chunkSize),
+					output_index: 0,
+				}),
+			);
+		}
+
+		const response = new Response(sseBody(lines), {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const body = await transformed.text();
+
+		expect(body).toContain("event: error");
+		expect(body).toContain('"type":"api_error"');
+		expect(body).toContain('"code":"sse_limit_exceeded"');
+		expect(body).toContain("Tool call arguments for output_index 0 totaled");
+		expect(body).not.toContain("Aggregate tool call arguments");
+	});
+
 	it("emits message_start before an error that arrives as the literal first SSE event", async () => {
 		const provider = new CodexProvider();
 		const upstreamBody = sseBody(

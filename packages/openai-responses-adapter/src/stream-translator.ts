@@ -14,7 +14,7 @@ interface State {
 	outputIndex: number;
 	sequenceNumber: number;
 	blockIndexToOutput: Map<number, number>;
-	textByBlock: Map<number, string>;
+	textByBlock: Map<number, { text: string; bytes: number }>;
 	toolByBlock: Map<
 		number,
 		{ callId: string; name: string; argsBuf: string; bytes: number }
@@ -28,13 +28,12 @@ interface State {
 
 const encoder = new TextEncoder();
 
-// Per-call cap on accumulated tool-call argument bytes. Reuses the same
-// constant as the SSE frame cap instead of introducing a new arbitrary
-// number. An aggregate cap across concurrently-open tool calls is
-// deliberately out of scope here, unlike the codex provider's stricter
-// aggregate accounting.
+// Per-block cap on accumulated bytes, shared by both tool-call arguments and
+// text output. Reuses the same constant as the SSE frame cap instead of
+// introducing a new arbitrary number. An aggregate cap across concurrently
+// open blocks is deliberately out of scope here, unlike the codex
+// provider's stricter aggregate accounting.
 const TOOL_ARGS_BYTE_CAP = BUFFER_SIZES.SSE_FRAME_MAX_BYTES;
-const byteEncoder = new TextEncoder();
 
 function emitSse(
 	controller: TransformStreamDefaultController,
@@ -136,7 +135,7 @@ function processEvent(
 		state.blockIndexToOutput.set(blockIndex, outputIdx);
 
 		if (contentBlock.type === "text") {
-			state.textByBlock.set(blockIndex, "");
+			state.textByBlock.set(blockIndex, { text: "", bytes: 0 });
 			emitSse(
 				controller,
 				"response.output_item.added",
@@ -205,26 +204,36 @@ function processEvent(
 
 		if (delta.type === "text_delta") {
 			const text = delta.text as string;
-			const current = state.textByBlock.get(blockIndex) ?? "";
-			state.textByBlock.set(blockIndex, current + text);
+			const block = state.textByBlock.get(blockIndex);
+			if (block) {
+				block.bytes += encoder.encode(text).length;
+				if (block.bytes > TOOL_ARGS_BYTE_CAP) {
+					throw new SseLimitError(
+						`Text output for block index ${blockIndex} totaled ${block.bytes} bytes, exceeding the ${TOOL_ARGS_BYTE_CAP} byte cap`,
+						TOOL_ARGS_BYTE_CAP,
+						block.bytes,
+					);
+				}
+				block.text += text;
 
-			emitSse(
-				controller,
-				"response.output_text.delta",
-				{
-					type: "response.output_text.delta",
-					item_id: `${state.responseId}_msg_${outputIdx}`,
-					output_index: outputIdx,
-					content_index: 0,
-					delta: text,
-				},
-				state,
-			);
+				emitSse(
+					controller,
+					"response.output_text.delta",
+					{
+						type: "response.output_text.delta",
+						item_id: `${state.responseId}_msg_${outputIdx}`,
+						output_index: outputIdx,
+						content_index: 0,
+						delta: text,
+					},
+					state,
+				);
+			}
 		} else if (delta.type === "input_json_delta") {
 			const partial = (delta.partial_json as string) ?? "";
 			const tool = state.toolByBlock.get(blockIndex);
 			if (tool) {
-				tool.bytes += byteEncoder.encode(partial).length;
+				tool.bytes += encoder.encode(partial).length;
 				if (tool.bytes > TOOL_ARGS_BYTE_CAP) {
 					throw new SseLimitError(
 						`Tool call arguments for call_id ${tool.callId} totaled ${tool.bytes} bytes, exceeding the ${TOOL_ARGS_BYTE_CAP} byte cap`,
@@ -260,7 +269,7 @@ function processEvent(
 		}
 
 		if (state.textByBlock.has(blockIndex)) {
-			const fullText = state.textByBlock.get(blockIndex) ?? "";
+			const fullText = state.textByBlock.get(blockIndex)?.text ?? "";
 			emitSse(
 				controller,
 				"response.output_text.done",
