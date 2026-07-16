@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import {
 	BUFFER_SIZES,
 	mapModelName,
+	OAuthRefreshTokenError,
 	SseFrameBuffer,
 	SseLimitError,
 	ValidationError,
@@ -563,9 +564,12 @@ export class CodexProvider extends BaseProvider {
 			const errorMessage =
 				errorData?.error_description || errorData?.error || response.statusText;
 
-			// Rotating refresh tokens: reuse → must re-auth
+			// Rotating refresh tokens: reuse → terminal, must re-auth. Throw the
+			// typed error so the refresh chokepoint pauses the account for reauth
+			// (detection is by type, not by message wording).
 			if (errorData?.error === "refresh_token_reused") {
-				throw new Error(
+				throw new OAuthRefreshTokenError(
+					account.id,
 					`Codex refresh token was reused for account ${account.name}. Please re-authenticate with: bun run cli --reauthenticate ${account.name}`,
 				);
 			}

@@ -679,6 +679,41 @@ export async function isModelUnavailableError(
 }
 
 /**
+ * Cancel an abandoned upstream response body so Bun releases its socket and
+ * native read buffer immediately.
+ *
+ * A `fetch()` Response body that is neither read to EOF nor cancelled keeps
+ * that memory committed indefinitely. On the proxy's failover/retry paths we
+ * obtain an upstream Response and then discard it: return `null` to try the
+ * next account, or overwrite `rawResponse`/`response` with a retry, without
+ * ever consuming its body. Each dropped body is an off-heap leak that
+ * ratchets up with every 429/401/529 failover under load. Calling this
+ * before every such drop releases the buffer.
+ *
+ * Safe to call with any Response/null: skips a `null`/locked body (locked
+ * means a reader already owns it, so it will be drained or was cloned) and
+ * swallows the harmless error from a body that is already cancelled/errored.
+ */
+export async function discardUpstreamBody(
+	response: Response | null | undefined,
+): Promise<void> {
+	const body = response?.body;
+	if (!body || body.locked) return;
+	try {
+		// Fire without awaiting settlement: per the Streams spec, cancelling
+		// one branch of a tee()'d body never settles until every sibling
+		// branch is cancelled or fully read, so awaiting here can hang
+		// forever if a sibling clone was abandoned (same rationale as
+		// discardUnusedResponse below).
+		body.cancel().catch(() => {
+			// Body already cancelled/errored -- nothing left to release.
+		});
+	} catch {
+		// Body may already be locked/disturbed; ignore synchronous throws too.
+	}
+}
+
+/**
  * Handles proxy request without authentication
  * @param req - The incoming request
  * @param url - The parsed URL
@@ -1203,6 +1238,7 @@ export async function proxyWithAccount(
 				};
 
 				await finalizeCurrentCodexTransport(rawResponse);
+				await discardUpstreamBody(rawResponse);
 				stampCodexAttempt(headers, "thinking_retry");
 				const retryProviderRequest = new Request(targetUrl, retryRequestInit);
 				retrySourceRequest = retryProviderRequest.clone();
@@ -1248,6 +1284,7 @@ export async function proxyWithAccount(
 				let retryRequest: Request;
 				if (provider.name === "codex" && provider.transformRequestBody) {
 					await finalizeCurrentCodexTransport(rawResponse);
+					await discardUpstreamBody(rawResponse);
 					const retryHeaders = new Headers(providerRequest.headers);
 					stampCodexAttempt(retryHeaders, "cache_control_retry");
 					const retrySourceBody = await providerRequest.clone().json();
@@ -1375,6 +1412,7 @@ export async function proxyWithAccount(
 			// fail over per-request and leave the account in rotation for other models.
 			if (rawResponse.status === 429 && isAnthropicOutOfCredits(rawResponse)) {
 				await finalizeCurrentCodexTransport(rawResponse);
+				await discardUpstreamBody(rawResponse);
 				const isKeepalive =
 					req.headers.get("x-better-ccflare-keepalive") === "true";
 				if (isKeepalive) {
@@ -1451,6 +1489,7 @@ export async function proxyWithAccount(
 								`Keepalive replay for ${account.name} got 429 — skipping cooldown (synthetic burst, not a real per-account rate limit)`,
 							);
 							await finalizeCurrentCodexTransport(rawResponse);
+							await discardUpstreamBody(rawResponse);
 							return null;
 						}
 
@@ -1504,6 +1543,7 @@ export async function proxyWithAccount(
 							),
 						);
 						await finalizeCurrentCodexTransport(rawResponse);
+						await discardUpstreamBody(rawResponse);
 						return null;
 					}
 					// Model-not-found (404/400) is forwarded to the client so it can
@@ -1568,6 +1608,7 @@ export async function proxyWithAccount(
 					};
 
 					await finalizeCurrentCodexTransport(rawResponse);
+					await discardUpstreamBody(rawResponse);
 					stampCodexAttempt(headers, "model_fallback", nextModel);
 					currentTransportModel = nextModel;
 					const retryProviderRequest = new Request(targetUrl, retryRequestInit);
@@ -1609,6 +1650,7 @@ export async function proxyWithAccount(
 			// account-wide handling, otherwise one fallback benches the account.
 			if (rawResponse.status === 429 && isAnthropicOutOfCredits(rawResponse)) {
 				await finalizeCurrentCodexTransport(rawResponse);
+				await discardUpstreamBody(rawResponse);
 				if (req.headers.get("x-better-ccflare-keepalive") === "true") {
 					return null;
 				}
@@ -1727,6 +1769,7 @@ export async function proxyWithAccount(
 					}
 				}
 				await finalizeCurrentCodexTransport(rawResponse);
+				await discardUpstreamBody(rawResponse);
 				return null;
 			}
 		}
@@ -1880,6 +1923,7 @@ export async function proxyWithAccount(
 							req.headers,
 						);
 
+						await discardUpstreamBody(response);
 						response = retryResponse;
 
 						// If credentials expired mid-retry, break out and let the 401

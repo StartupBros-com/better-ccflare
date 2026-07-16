@@ -1,5 +1,8 @@
 import { describe, expect, it } from "bun:test";
-import { supportsRefreshBackedUsagePolling } from "./server";
+import {
+	resolveDashboardRoute,
+	supportsRefreshBackedUsagePolling,
+} from "./server";
 
 describe("supportsRefreshBackedUsagePolling", () => {
 	it("includes pollable OAuth providers that need token refresh", () => {
@@ -96,5 +99,56 @@ describe("trackStreamForShutdown", () => {
 	it("passes non-stream responses through untouched", () => {
 		const plain = new Response(null, { status: 204 });
 		expect(trackStreamForShutdown(plain)).toBe(plain);
+	});
+});
+
+describe("resolveDashboardRoute", () => {
+	// Extracted from the fetch() handler so the "never shadow an API route,
+	// the health endpoint, or a proxy request" invariant is unit testable
+	// without booting the server. Dashboard SPA/static serving must happen
+	// BEFORE the authentication-gated API router (audit hole #2): exempting
+	// these paths inside the shared authenticateRequest() path instead let
+	// arbitrary paths reach the proxy unauthenticated when the dashboard was
+	// disabled or unavailable.
+
+	it("serves a real bundled asset regardless of method", () => {
+		expect(resolveDashboardRoute("/assets/index-abc123.js", "GET", true)).toBe(
+			"static-asset",
+		);
+		expect(resolveDashboardRoute("/assets/index-abc123.js", "POST", true)).toBe(
+			"static-asset",
+		);
+	});
+
+	it("falls back to the SPA index for GET/HEAD dashboard navigations", () => {
+		expect(resolveDashboardRoute("/", "GET", false)).toBe("spa-index");
+		expect(resolveDashboardRoute("/dashboard", "GET", false)).toBe("spa-index");
+		expect(resolveDashboardRoute("/dashboard/accounts", "HEAD", false)).toBe(
+			"spa-index",
+		);
+	});
+
+	it("never shadows /api, /v1, /messages, or /health", () => {
+		for (const pathname of [
+			"/api/stats",
+			"/api",
+			"/v1/messages",
+			"/messages",
+			"/health",
+		]) {
+			expect(resolveDashboardRoute(pathname, "GET", false)).toBe(
+				"pass-through",
+			);
+		}
+	});
+
+	it("passes through non-navigation methods on unknown paths", () => {
+		// POST/PUT/DELETE to an arbitrary path must stay authenticated (fall
+		// through to the router/proxy) rather than being treated as a
+		// dashboard SPA navigation.
+		expect(resolveDashboardRoute("/foo", "POST", false)).toBe("pass-through");
+		expect(resolveDashboardRoute("/anything/else", "DELETE", false)).toBe(
+			"pass-through",
+		);
 	});
 });

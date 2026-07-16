@@ -9,7 +9,10 @@ import { Logger } from "@better-ccflare/logger";
 import { fetchUsageData, getProvider } from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
 import { TOKEN_SAFETY_WINDOW_MS } from "./constants";
-import { getValidAccessToken } from "./handlers";
+import {
+	getValidAccessToken,
+	pauseAccountForReauthIfInvalidGrant,
+} from "./handlers";
 import type { ProxyContext } from "./proxy";
 
 const log = new Logger("AutoRefreshScheduler");
@@ -199,24 +202,25 @@ export class AutoRefreshScheduler {
 				this.shouldRefreshAccount(account, now),
 			);
 
-			if (accountsToRefresh.length === 0) {
-				return;
+			if (accountsToRefresh.length > 0) {
+				log.info(
+					`Found ${accountsToRefresh.length} account(s) with new windows for auto-refresh`,
+				);
+
+				// Send dummy message to each account. The sendDummyMessage method
+				// will update lastRefreshResetTime with the NEW rate_limit_reset
+				// from the API.
+				for (const accountRow of accountsToRefresh) {
+					await this.sendDummyMessage(accountRow);
+				}
 			}
 
-			log.info(
-				`Found ${accountsToRefresh.length} account(s) with new windows for auto-refresh`,
-			);
-
-			// Send dummy message to each account
-			// The sendDummyMessage method will update lastRefreshResetTime with the NEW rate_limit_reset from the API
-			for (const accountRow of accountsToRefresh) {
-				await this.sendDummyMessage(accountRow);
-			}
-
-			// Proactively refresh OpenAI-compatible OAuth tokens expiring within the safety window
+			// OpenAI-compatible + Codex proactive OAuth refresh must run
+			// regardless of usage-window probe candidates -- otherwise installs
+			// with only Qwen/xAI accounts, or with Codex tokens near expiry but
+			// no anthropic/zai windows currently due, would never refresh their
+			// access tokens even though the proactive-refresh code is present.
 			await this.checkAndRefreshOpenAICompatibleOAuthTokens();
-
-			// Proactively refresh Codex OAuth tokens expiring within the safety window
 			await this.checkAndRefreshCodexTokens();
 		} catch (error) {
 			if (error instanceof Error) {
@@ -714,20 +718,26 @@ export class AutoRefreshScheduler {
 		);
 
 		if (newFailures >= this.FAILURE_THRESHOLD) {
-			log.error(
-				`Account ${accountName} has failed ${newFailures} consecutive auto-refresh attempts — pausing account to prevent routing to a broken endpoint.`,
-			);
 			try {
-				await this.db.run(
-					`UPDATE accounts SET paused = 1, pause_reason = 'failure_threshold' WHERE id = ?`,
+				// Guarded on the account still being active so this generic
+				// failure_threshold reason never overwrites a more specific reason
+				// (e.g. oauth_invalid_grant) already set by the token-refresh chokepoint.
+				const changes = await this.db.runWithChanges(
+					`UPDATE accounts SET paused = 1, pause_reason = 'failure_threshold' WHERE id = ? AND COALESCE(paused, 0) = 0`,
 					[accountId],
 				);
-				// Clear the counter so subsequent scheduler cycles don't fire redundant DB
-				// writes and log entries — the account is already paused.
+				// Clear the counter regardless so subsequent scheduler cycles don't fire
+				// redundant DB writes and log entries — the account is paused either way.
 				this.consecutiveFailures.delete(accountId);
-				log.error(
-					`Account "${accountName}" has been PAUSED. Resume with: bun run cli --resume "${accountName}"`,
-				);
+				if (changes > 0) {
+					log.error(
+						`Account ${accountName} has failed ${newFailures} consecutive auto-refresh attempts — PAUSED (failure_threshold). Resume with: bun run cli --resume "${accountName}"`,
+					);
+				} else {
+					log.warn(
+						`Account "${accountName}" hit the auto-refresh failure threshold but was already paused — leaving the existing pause reason intact.`,
+					);
+				}
 			} catch (dbErr) {
 				log.error(`Failed to pause account ${accountName} in database:`, dbErr);
 			}
@@ -862,6 +872,17 @@ export class AutoRefreshScheduler {
 					`Failed to proactively refresh ${row.provider} token for ${row.name}:`,
 					error,
 				);
+				// This proactive path calls provider.refreshToken directly (bypassing
+				// refreshAccessTokenSafe), so pause-for-reauth on a revoked token here
+				// too. Harmless no-op for Qwen accounts, whose refreshToken currently
+				// echoes the stored token back rather than performing a real OAuth
+				// refresh, so it never throws an invalid_grant-shaped error; xAI's
+				// refreshToken performs a real OAuth refresh and can.
+				await pauseAccountForReauthIfInvalidGrant(
+					error,
+					{ id: row.id, name: row.name, refresh_token: row.refresh_token },
+					this.proxyContext.dbOps,
+				);
 			}
 		}
 	}
@@ -990,6 +1011,13 @@ export class AutoRefreshScheduler {
 				log.error(
 					`Failed to proactively refresh Codex token for ${row.name}:`,
 					error,
+				);
+				// This proactive path calls provider.refreshToken directly (bypassing
+				// refreshAccessTokenSafe), so pause-for-reauth on a revoked token here too.
+				await pauseAccountForReauthIfInvalidGrant(
+					error,
+					{ id: row.id, name: row.name, refresh_token: row.refresh_token },
+					this.proxyContext.dbOps,
 				);
 			}
 		}

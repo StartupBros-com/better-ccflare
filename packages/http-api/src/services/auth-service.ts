@@ -152,10 +152,14 @@ export class AuthService {
 			return true;
 		}
 
-		// OAuth endpoints are exempt (needed for account setup)
-		if (path.startsWith("/api/oauth")) {
-			return true;
-		}
+		// NOTE: OAuth endpoints are intentionally NOT blanket-exempt here.
+		// Every /api/oauth/**/init|reauth|callback route mutates stored account
+		// OAuth tokens (or overwrites them via reauth), and the dashboard's own
+		// API client already attaches x-api-key to every call it makes,
+		// including these. A blanket exemption let any unauthenticated caller
+		// overwrite a configured account's tokens (session takeover) once auth
+		// was enabled. Only read-only status polling stays exempt; see the
+		// method-aware gating in isPathExempt().
 
 		// Version check returns only the latest npm-published version. The
 		// dashboard's sidebar tile fires this on load with no API key in
@@ -181,16 +185,16 @@ export class AuthService {
 			return true;
 		}
 
-		// All other paths are dashboard routes (client-side routing) or static assets
-		// These should be exempt to allow serving the dashboard HTML and assets
-		// This matches the server logic that serves index.html for non-API routes
-		if (
-			!path.startsWith("/api") &&
-			!path.startsWith("/v1") &&
-			!path.startsWith("/messages")
-		) {
-			return true;
-		}
+		// IMPORTANT: do NOT blanket-exempt "any non-/api, non-/v1, non-/messages
+		// path". The dashboard SPA and its static assets are served directly by
+		// apps/server/src/server.ts BEFORE authentication is consulted, and
+		// only when the dashboard is actually available, so genuine dashboard
+		// requests never reach this code path. A broad "not an API path =>
+		// exempt" rule here instead let arbitrary paths (e.g. POST /foo) reach
+		// the upstream proxy without an API key whenever the dashboard was
+		// disabled or its assets were unavailable, since providers accept
+		// arbitrary paths. Only /health is statically exempt; OAuth read-only
+		// status polling is gated in isPathExempt().
 
 		return false;
 	}
@@ -203,6 +207,25 @@ export class AuthService {
 		// exemption is GET-only so a non-GET request can't be exempt-but-unmatched.
 		if (this.isStaticPathExempt(path, method)) {
 			return true;
+		}
+
+		// OAuth endpoints.
+		// Read-only status polling (GET /api/oauth/{qwen,codex}/status/*) stays
+		// exempt: it returns transient setup progress only (no secrets, no
+		// mutation), and the setup UI may poll it before an API key exists.
+		// Token-mutating endpoints (init / reauth / callback) are NOT exempt:
+		// when no API keys exist authenticateRequest() still allows them
+		// (initial account setup, via the isAuthenticationEnabled() check
+		// below); once authentication is enabled they fall through to
+		// API-key validation and authorizeEndpoint(), which only grants admin
+		// keys access to non-proxy paths. This closes the unauthenticated
+		// token-overwrite hole.
+		if (path.startsWith("/api/oauth")) {
+			return (
+				method === "GET" &&
+				(path.startsWith("/api/oauth/qwen/status/") ||
+					path.startsWith("/api/oauth/codex/status/"))
+			);
 		}
 
 		// API key management: Only allow initial key creation without auth if no keys exist
@@ -226,6 +249,16 @@ export class AuthService {
 			return false;
 		}
 
+		// Everything else requires authentication when it is enabled.
+		// NOTE: dashboard SPA + static assets are intentionally NOT exempt
+		// here. They are served directly by apps/server/src/server.ts BEFORE
+		// this authentication-gated path is ever reached, but only when the
+		// dashboard is actually available. Exempting them in this SHARED path
+		// (used by both the API router and the proxy fallback) previously let
+		// unauthenticated requests to arbitrary non-API paths reach the proxy
+		// when the dashboard was disabled or unavailable, since upstream
+		// providers accept arbitrary paths. Any request that reaches here is
+		// an API or proxy request and must be authenticated.
 		return false;
 	}
 

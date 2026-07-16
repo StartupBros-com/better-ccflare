@@ -118,6 +118,26 @@ describe("mature cooldown re-entry characterization", () => {
 		expect(calls.markRateLimited[0]?.until).toBe(NOW + 120_000);
 	});
 
+	it("honors a mature far-future upstream reset instead of the short exponential backoff", () => {
+		Date.now = () => NOW;
+		const account = makeAccount({ consecutive_rate_limits: 9 });
+		const { ctx, calls } = makeCtx({ rateLimited: true });
+		const farFutureReset = NOW + 5 * 60 * 60 * 1000; // 5h window reset
+
+		applyRateLimitCooldown(account, { resetTime: farFutureReset }, ctx);
+
+		// Honored as-is: well inside the 12h safety ceiling and past the ~5min backoff floor.
+		expect(account.rate_limited_until).toBe(farFutureReset);
+		expect(calls.markRateLimited[0]?.until).toBe(farFutureReset);
+
+		// A stale/oversized reset hint is still bounded by the safety ceiling.
+		const beyondCeiling = NOW + 3 * 24 * 60 * 60 * 1000; // 3 days out
+		const account2 = makeAccount({ consecutive_rate_limits: 9 });
+		const { ctx: ctx2 } = makeCtx({ rateLimited: true });
+		applyRateLimitCooldown(account2, { resetTime: beyondCeiling }, ctx2);
+		expect(account2.rate_limited_until).toBe(NOW + 12 * 60 * 60 * 1000);
+	});
+
 	it("does not gate multiple ordinary requests selected before their first 429 completes", () => {
 		Date.now = () => NOW;
 		const account = makeAccount({ consecutive_rate_limits: 0 });

@@ -23,6 +23,7 @@ import {
 	initiateDeviceFlow as initiateQwenDeviceFlow,
 	pollForToken as pollQwenForToken,
 } from "@better-ccflare/providers/qwen";
+import { clearAccountRefreshCache } from "@better-ccflare/proxy";
 
 const log = new Logger("OAuthHandler");
 
@@ -267,6 +268,20 @@ export function createQwenReauthHandler(dbOps: DatabaseOperations) {
 						],
 					);
 
+					// Auto-resume an oauth_invalid_grant pause and drop stale refresh
+					// backoff so the account returns to rotation immediately.
+					// Best-effort: the tokens were already updated, so a resume failure
+					// must not fail the reauth or skip the cache clear.
+					try {
+						await dbOps.resumeAccountIfNeedsReauth(account.id);
+					} catch (resumeErr) {
+						log.error(
+							`Failed to auto-resume needs-reauth pause for '${account.name}':`,
+							resumeErr,
+						);
+					}
+					clearAccountRefreshCache(account.id);
+
 					qwenSessions.set(sessionId, {
 						status: "complete",
 						accountName: account.name,
@@ -503,6 +518,20 @@ export function createCodexReauthHandler(dbOps: DatabaseOperations) {
 						],
 					);
 
+					// Auto-resume an oauth_invalid_grant pause and drop stale refresh
+					// backoff so the account returns to rotation immediately.
+					// Best-effort: the tokens were already updated, so a resume failure
+					// must not fail the reauth or skip the cache clear.
+					try {
+						await dbOps.resumeAccountIfNeedsReauth(account.id);
+					} catch (resumeErr) {
+						log.error(
+							`Failed to auto-resume needs-reauth pause for '${account.name}':`,
+							resumeErr,
+						);
+					}
+					clearAccountRefreshCache(account.id);
+
 					codexSessions.set(sessionId, {
 						status: "complete",
 						accountName: account.name,
@@ -725,6 +754,11 @@ export function createAnthropicReauthCallbackHandler(
 				);
 
 				dbOps.deleteOAuthSession(sessionId);
+
+				// Drop any stale refresh backoff/failure state so the just-installed
+				// token is used immediately instead of waiting out the backoff window
+				// (completeReauth already lifted any oauth_invalid_grant pause).
+				clearAccountRefreshCache(account.id);
 
 				log.info(`Successfully re-authenticated Anthropic account '${name}'`);
 
