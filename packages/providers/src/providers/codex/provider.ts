@@ -1,6 +1,9 @@
 import { createHash } from "node:crypto";
 import {
+	BUFFER_SIZES,
 	mapModelName,
+	SseFrameBuffer,
+	SseLimitError,
 	ValidationError,
 	validateEndpointUrl,
 } from "@better-ccflare/core";
@@ -204,6 +207,14 @@ const CODEX_ERROR_TYPE_BY_CODE: Record<string, string> = {
 	usage_not_included: "permission_error",
 };
 
+// Buffered tool-call argument bytes are capped by the same constant used for
+// a single SSE frame (packages/core/src/sse-frame-buffer.ts): both the
+// per-call buffer and the aggregate across every concurrently open
+// function-call buffer are checked against this one cap, reusing it rather
+// than introducing a second arbitrary threshold.
+const TOOL_ARGS_BYTE_CAP = BUFFER_SIZES.SSE_FRAME_MAX_BYTES;
+const byteEncoder = new TextEncoder();
+
 // When enabled, telemetry reports the effective Codex context capacity rather
 // than the raw model maximum.
 export const CODEX_EFFECTIVE_CONTEXT_ENV = "CCFLARE_CODEX_EFFECTIVE_CONTEXT";
@@ -356,6 +367,8 @@ interface FunctionCallBuffer {
 	contentBlockIndex: number;
 	name: string;
 	arguments: string[];
+	/** Running byte total of buffered argument deltas, capped by TOOL_ARGS_BYTE_CAP. */
+	bytes: number;
 }
 
 interface ContextWindowUsage {
@@ -370,7 +383,6 @@ interface ContextWindow {
 }
 
 interface StreamState {
-	buffer: string;
 	messageId: string;
 	model: string;
 	contentBlockIndex: number;
@@ -390,6 +402,8 @@ interface StreamState {
 	contextWindow: ContextWindow | null;
 	// Track function_call items: output_index → buffered arguments and block index
 	functionCallBlocks: Map<number, FunctionCallBuffer>;
+	/** Aggregate byte total across every entry in functionCallBlocks, capped by TOOL_ARGS_BYTE_CAP. */
+	functionCallBytesTotal: number;
 	upstreamError?: {
 		type: string;
 		message: string;
@@ -1656,7 +1670,6 @@ export class CodexProvider extends BaseProvider {
 			"unknown",
 	): Response {
 		const state: StreamState = {
-			buffer: "",
 			messageId: `msg_${crypto.randomUUID().replace(/-/g, "").substring(0, 24)}`,
 			model: finalModel,
 			contentBlockIndex: 0,
@@ -1672,6 +1685,7 @@ export class CodexProvider extends BaseProvider {
 			cacheMeasurementAvailable: false,
 			contextWindow: null,
 			functionCallBlocks: new Map(),
+			functionCallBytesTotal: 0,
 			sawToolUse: false,
 			traceNewToolCalls: [],
 			traceRequestId: requestId,
@@ -1737,7 +1751,10 @@ export class CodexProvider extends BaseProvider {
 			},
 		});
 		const encoder = new TextEncoder();
-		const decoder = new TextDecoder();
+		const sseFrameBuffer = new SseFrameBuffer({
+			maxFrameBytes: BUFFER_SIZES.SSE_FRAME_MAX_BYTES,
+			maxBufferBytes: BUFFER_SIZES.SSE_BUFFER_MAX_BYTES,
+		});
 
 		const writeSSE = async (event: string, data: unknown) => {
 			const payload =
@@ -1821,21 +1838,19 @@ export class CodexProvider extends BaseProvider {
 					const { value, done } = await upstreamReader.read();
 					if (done) break;
 
-					state.buffer += decoder.decode(value, { stream: true });
+					// Frame boundary detection and cap enforcement live in
+					// SseFrameBuffer (CRLF-tolerant, bounds both a single oversized
+					// frame and an unterminated tail). It may throw SseLimitError,
+					// which is handled by the dedicated branch in the catch below.
+					const frames = sseFrameBuffer.push(value);
 
-					// Process complete SSE events in buffer
-					while (true) {
-						const newlineIdx = state.buffer.indexOf("\n\n");
-						if (newlineIdx === -1) break;
-
-						const eventText = state.buffer.slice(0, newlineIdx);
-						state.buffer = state.buffer.slice(newlineIdx + 2);
-
+					// Process complete SSE events extracted from this chunk
+					for (const eventText of frames) {
 						const eventLine = eventText
-							.split("\n")
+							.split(/\r?\n/)
 							.find((l) => l.startsWith("event:"));
 						const dataLine = eventText
-							.split("\n")
+							.split(/\r?\n/)
 							.find((l) => l.startsWith("data:"));
 
 						if (!eventLine || !dataLine) continue;
@@ -1892,29 +1907,60 @@ export class CodexProvider extends BaseProvider {
 				}
 			} catch (error) {
 				if (!cancelled) {
-					log.error("Error processing Codex SSE stream:", error);
-					const streamError = {
-						type: "upstream_stream_read_error",
-						message:
-							error instanceof Error
-								? error.message
-								: "Codex upstream stream processing failed",
-					};
-					try {
-						if (!state.hasSentMessageStart) {
-							await ensureMessageStart();
+					if (error instanceof SseLimitError) {
+						// Cap trips are a distinct, expected failure mode (an
+						// oversized/unterminated SSE frame or tool-call argument
+						// buffer), not a generic stream read failure: route them
+						// through the same close-block-then-error helper the
+						// upstream error/response.failed handler uses instead of
+						// the generic branch below.
+						const capError = {
+							type: "sse_limit_exceeded",
+							message: error.message,
+						};
+						try {
+							await this.closeOpenBlockAndWriteError(
+								state,
+								writeSSE,
+								ensureMessageStart,
+								{
+									type: "error",
+									error: {
+										type: "api_error",
+										message: error.message,
+										code: "sse_limit_exceeded",
+									},
+								},
+							);
+						} catch {
+							// Downstream may already be cancelled or closed.
 						}
-						if (!state.hasSentTerminalEvents) {
-							await writeSSE("error", {
-								type: "error",
-								error: streamError,
-								model: state.model,
-							});
+						writeTerminalTrace(capError);
+					} else {
+						log.error("Error processing Codex SSE stream:", error);
+						const streamError = {
+							type: "upstream_stream_read_error",
+							message:
+								error instanceof Error
+									? error.message
+									: "Codex upstream stream processing failed",
+						};
+						try {
+							if (!state.hasSentMessageStart) {
+								await ensureMessageStart();
+							}
+							if (!state.hasSentTerminalEvents) {
+								await writeSSE("error", {
+									type: "error",
+									error: streamError,
+									model: state.model,
+								});
+							}
+						} catch {
+							// Downstream may already be cancelled or closed.
 						}
-					} catch {
-						// Downstream may already be cancelled or closed.
+						writeTerminalTrace(streamError);
 					}
-					writeTerminalTrace(streamError);
 				}
 				await upstreamReader?.cancel(error).catch(() => undefined);
 			} finally {
@@ -2055,6 +2101,33 @@ export class CodexProvider extends BaseProvider {
 		return { status: 502, statusText: "Bad Gateway" };
 	}
 
+	/**
+	 * Close any open content block, then write a terminal error event.
+	 * Shared by the upstream error/response.failed handler and by SSE/tool-arg
+	 * cap trips, so both paths emit the same well-formed event ordering:
+	 * message_start (if not already sent) → content_block_stop (if a block
+	 * was open) → error. No-op if a terminal event was already sent.
+	 */
+	private async closeOpenBlockAndWriteError(
+		state: StreamState,
+		writeSSE: (event: string, data: unknown) => Promise<void>,
+		ensureMessageStart: () => Promise<void>,
+		errorPayload: { type: "error"; error: Record<string, unknown> },
+	): Promise<void> {
+		if (state.hasSentTerminalEvents) return;
+		await ensureMessageStart();
+		if (state.hasSentContentBlockStart) {
+			await writeSSE("content_block_stop", {
+				type: "content_block_stop",
+				index: state.contentBlockIndex,
+			});
+			state.contentBlockIndex++;
+			state.hasSentContentBlockStart = false;
+		}
+		await writeSSE("error", errorPayload);
+		state.hasSentTerminalEvents = true;
+	}
+
 	private async handleCodexEvent(
 		eventName: string,
 		data: Record<string, unknown>,
@@ -2151,6 +2224,7 @@ export class CodexProvider extends BaseProvider {
 							contentBlockIndex: blockIdx,
 							name,
 							arguments: [],
+							bytes: 0,
 						});
 					}
 				}
@@ -2209,7 +2283,28 @@ export class CodexProvider extends BaseProvider {
 				if (delta && outputIndex !== undefined) {
 					const buffer = state.functionCallBlocks.get(outputIndex);
 					if (buffer) {
+						const deltaBytes = byteEncoder.encode(delta).length;
 						buffer.arguments.push(delta);
+						buffer.bytes += deltaBytes;
+						state.functionCallBytesTotal += deltaBytes;
+						// Per-call cap: guards a single runaway tool call.
+						if (buffer.bytes > TOOL_ARGS_BYTE_CAP) {
+							throw new SseLimitError(
+								`Tool call arguments for output_index ${outputIndex} totaled ${buffer.bytes} bytes, exceeding the ${TOOL_ARGS_BYTE_CAP} byte cap`,
+								TOOL_ARGS_BYTE_CAP,
+								buffer.bytes,
+							);
+						}
+						// Aggregate cap: guards many concurrently open tool calls that
+						// each individually stay under the per-call cap but together
+						// still grow the buffered byte total without bound.
+						if (state.functionCallBytesTotal > TOOL_ARGS_BYTE_CAP) {
+							throw new SseLimitError(
+								`Aggregate tool call arguments totaled ${state.functionCallBytesTotal} bytes, exceeding the ${TOOL_ARGS_BYTE_CAP} byte cap`,
+								TOOL_ARGS_BYTE_CAP,
+								state.functionCallBytesTotal,
+							);
+						}
 					}
 				}
 				break;
@@ -2247,6 +2342,7 @@ export class CodexProvider extends BaseProvider {
 							index: buffer.contentBlockIndex,
 						});
 						if (outputIndex !== undefined) {
+							state.functionCallBytesTotal -= buffer.bytes;
 							state.functionCallBlocks.delete(outputIndex);
 						}
 						if (
@@ -2322,19 +2418,15 @@ export class CodexProvider extends BaseProvider {
 					// Claim the terminal trace before awaiting downstream writes so a
 					// cancellation race cannot record two terminals for one attempt.
 					writeCodexStreamTerminalTrace(state, "error", state.upstreamError);
-					if (state.hasSentContentBlockStart) {
-						await writeSSE("content_block_stop", {
-							type: "content_block_stop",
-							index: state.contentBlockIndex,
-						});
-						state.contentBlockIndex++;
-						state.hasSentContentBlockStart = false;
-					}
-					await writeSSE(
-						"error",
+					// closeOpenBlockAndWriteError calls ensureMessageStart() first, so
+					// an error arriving as the literal first SSE event still emits
+					// message_start before error.
+					await this.closeOpenBlockAndWriteError(
+						state,
+						writeSSE,
+						ensureMessageStart,
 						this.toAnthropicErrorPayload(state.upstreamError),
 					);
-					state.hasSentTerminalEvents = true;
 				}
 				break;
 			}

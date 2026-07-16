@@ -81,6 +81,11 @@ export {
 	type TokenBreakdown,
 } from "./pricing";
 export * from "./request-events";
+export {
+	SseFrameBuffer,
+	type SseFrameBufferOptions,
+	SseLimitError,
+} from "./sse-frame-buffer";
 export * from "./strategy";
 export {
 	computeWindowStartMs,

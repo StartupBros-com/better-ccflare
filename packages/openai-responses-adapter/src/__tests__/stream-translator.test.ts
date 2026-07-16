@@ -1,4 +1,5 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, mock, test } from "bun:test";
+import { BUFFER_SIZES } from "@better-ccflare/core";
 import { translateAnthropicStreamToResponses } from "../stream-translator";
 
 async function collectSseEvents(
@@ -348,5 +349,247 @@ describe("translateAnthropicStreamToResponses", () => {
 		expect(resp.id).toBe("resp_004");
 		expect(resp.model).toBe("test-model");
 		expect(resp.status).toBe("completed");
+	});
+});
+
+describe("translateAnthropicStreamToResponses SSE frame bounds", () => {
+	const rawEncoder = new TextEncoder();
+
+	/**
+	 * Build an upstream Response backed by a custom ReadableStream that never
+	 * closes on its own, so any observed close/cancel is attributable to the
+	 * consumer side actively terminating it, not the source reaching EOF.
+	 */
+	function makeChunkedStream(chunks: string[]): {
+		response: Response;
+		cancelSpy: ReturnType<typeof mock>;
+	} {
+		const cancelSpy = mock((_reason?: unknown) => {});
+		const stream = new ReadableStream<Uint8Array>({
+			start(controller) {
+				for (const chunk of chunks) {
+					controller.enqueue(rawEncoder.encode(chunk));
+				}
+				// Deliberately left open: a real upstream connection just idles
+				// after the cap trip. The reader must be actively cancelled by
+				// the consumer rather than relying on EOF that never arrives.
+			},
+			cancel(reason) {
+				cancelSpy(reason);
+			},
+		});
+		return {
+			response: new Response(stream, {
+				headers: { "Content-Type": "text/event-stream" },
+			}),
+			cancelSpy,
+		};
+	}
+
+	/** Re-frame an array of LF-formatted sseEvent() strings as CRLF. */
+	function crlfSseBody(eventStrings: string[]): string {
+		return `${eventStrings
+			.map((event) => event.replace(/\n/g, "\r\n"))
+			.join("\r\n\r\n")}\r\n\r\n`;
+	}
+
+	test("CRLF-terminated stream produces the same event sequence and content as LF", async () => {
+		const events = [
+			sseEvent("message_start", {
+				type: "message_start",
+				message: {
+					id: "msg_crlf",
+					usage: { input_tokens: 10, output_tokens: 0 },
+				},
+			}),
+			sseEvent("content_block_start", {
+				type: "content_block_start",
+				index: 0,
+				content_block: { type: "text", text: "" },
+			}),
+			sseEvent("content_block_delta", {
+				type: "content_block_delta",
+				index: 0,
+				delta: { type: "text_delta", text: "Hello" },
+			}),
+			sseEvent("content_block_delta", {
+				type: "content_block_delta",
+				index: 0,
+				delta: { type: "text_delta", text: " world" },
+			}),
+			sseEvent("content_block_stop", { type: "content_block_stop", index: 0 }),
+			sseEvent("message_delta", {
+				type: "message_delta",
+				delta: { stop_reason: "end_turn" },
+				usage: { output_tokens: 5 },
+			}),
+			sseEvent("message_stop", { type: "message_stop" }),
+		];
+
+		const lfUpstream = makeAnthropicStream(events);
+		const lfResult = translateAnthropicStreamToResponses(
+			lfUpstream,
+			"resp_crlf_lf",
+			"claude-3-5-sonnet-20241022",
+		);
+		const lfParsed = await collectSseEvents(lfResult);
+
+		const crlfUpstream = new Response(crlfSseBody(events), {
+			headers: { "Content-Type": "text/event-stream" },
+		});
+		const crlfResult = translateAnthropicStreamToResponses(
+			crlfUpstream,
+			"resp_crlf_lf",
+			"claude-3-5-sonnet-20241022",
+		);
+		const crlfParsed = await collectSseEvents(crlfResult);
+
+		// This fails today: lineBuffer.lastIndexOf("\n\n") never matches inside
+		// a \r\n\r\n delimiter, so the CRLF stream never finds a frame boundary
+		// in transform() and only the flush() path (treating the entire
+		// buffered blob as one event) runs, producing a different event
+		// sequence than the LF stream.
+		expect(crlfParsed.map((e) => e.event)).toEqual(
+			lfParsed.map((e) => e.event),
+		);
+		expect(crlfParsed[crlfParsed.length - 1].event).toBe("response.completed");
+		const textDone = crlfParsed.find(
+			(e) => e.event === "response.output_text.done",
+		);
+		expect((textDone?.data as Record<string, unknown>).text).toBe(
+			"Hello world",
+		);
+	});
+
+	test("oversized single frame emits response.failed, no response.completed after, and cancels the upstream reader", async () => {
+		const messageStart = sseEvent("message_start", {
+			type: "message_start",
+			message: {
+				id: "msg_oversize",
+				usage: { input_tokens: 5, output_tokens: 0 },
+			},
+		});
+		const blockStart = sseEvent("content_block_start", {
+			type: "content_block_start",
+			index: 0,
+			content_block: { type: "text", text: "" },
+		});
+		const oversizedFrame = sseEvent("content_block_delta", {
+			type: "content_block_delta",
+			index: 0,
+			delta: {
+				type: "text_delta",
+				text: "x".repeat(BUFFER_SIZES.SSE_FRAME_MAX_BYTES + 1024),
+			},
+		});
+
+		const { response: upstream, cancelSpy } = makeChunkedStream([
+			`${messageStart}\n\n${blockStart}\n\n`,
+			`${oversizedFrame}\n\n`,
+		]);
+
+		const result = translateAnthropicStreamToResponses(
+			upstream,
+			"resp_oversize",
+			"claude-3-5-sonnet-20241022",
+		);
+		const parsed = await collectSseEvents(result);
+
+		const failedEvent = parsed.find((e) => e.event === "response.failed");
+		expect(failedEvent).toBeDefined();
+		expect(parsed.some((e) => e.event === "response.completed")).toBe(false);
+		expect(parsed[parsed.length - 1].event).toBe("response.failed");
+
+		// Allow the upstream cancellation (triggered via the writable side
+		// erroring from controller.terminate()) to propagate a task tick.
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(cancelSpy).toHaveBeenCalled();
+	});
+
+	test("unterminated oversized tail emits response.failed, no response.completed after, and cancels the upstream reader", async () => {
+		const messageStart = sseEvent("message_start", {
+			type: "message_start",
+			message: {
+				id: "msg_tail",
+				usage: { input_tokens: 5, output_tokens: 0 },
+			},
+		});
+		const blockStart = sseEvent("content_block_start", {
+			type: "content_block_start",
+			index: 0,
+			content_block: { type: "text", text: "" },
+		});
+		// No terminating "\n\n" anywhere in this chunk or after it: this
+		// exercises the unterminated-tail cap rather than the per-frame cap.
+		const unterminated = "x".repeat(BUFFER_SIZES.SSE_BUFFER_MAX_BYTES + 1024);
+
+		const { response: upstream, cancelSpy } = makeChunkedStream([
+			`${messageStart}\n\n${blockStart}\n\n`,
+			unterminated,
+		]);
+
+		const result = translateAnthropicStreamToResponses(
+			upstream,
+			"resp_tail",
+			"claude-3-5-sonnet-20241022",
+		);
+		const parsed = await collectSseEvents(result);
+
+		const failedEvent = parsed.find((e) => e.event === "response.failed");
+		expect(failedEvent).toBeDefined();
+		expect(parsed.some((e) => e.event === "response.completed")).toBe(false);
+
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(cancelSpy).toHaveBeenCalled();
+	});
+
+	test("per-call tool argument cap trip emits response.failed with no response.completed after", async () => {
+		const messageStart = sseEvent("message_start", {
+			type: "message_start",
+			message: {
+				id: "msg_tool_cap",
+				usage: { input_tokens: 5, output_tokens: 0 },
+			},
+		});
+		const blockStart = sseEvent("content_block_start", {
+			type: "content_block_start",
+			index: 0,
+			content_block: { type: "tool_use", id: "call_big", name: "write_file" },
+		});
+
+		// Each individual delta frame stays well under the per-frame SSE cap;
+		// only their accumulated total (tracked per tool call) exceeds the
+		// per-call argument byte cap.
+		const chunkSize = 4096;
+		const chunkCount =
+			Math.ceil(BUFFER_SIZES.SSE_FRAME_MAX_BYTES / chunkSize) + 2;
+		const deltaFrames = Array.from({ length: chunkCount }, () =>
+			sseEvent("content_block_delta", {
+				type: "content_block_delta",
+				index: 0,
+				delta: {
+					type: "input_json_delta",
+					partial_json: "a".repeat(chunkSize),
+				},
+			}),
+		)
+			.map((event) => `${event}\n\n`)
+			.join("");
+
+		const { response: upstream } = makeChunkedStream([
+			`${messageStart}\n\n${blockStart}\n\n`,
+			deltaFrames,
+		]);
+
+		const result = translateAnthropicStreamToResponses(
+			upstream,
+			"resp_tool_cap",
+			"claude-3-5-sonnet-20241022",
+		);
+		const parsed = await collectSseEvents(result);
+
+		const failedEvent = parsed.find((e) => e.event === "response.failed");
+		expect(failedEvent).toBeDefined();
+		expect(parsed.some((e) => e.event === "response.completed")).toBe(false);
 	});
 });
