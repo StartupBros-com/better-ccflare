@@ -30,7 +30,10 @@ import { resolveDbPath } from "./paths";
 import { AccountRepository } from "./repositories/account.repository";
 import { AgentPreferenceRepository } from "./repositories/agent-preference.repository";
 import { ApiKeyRepository } from "./repositories/api-key.repository";
-import { CacheFlightRecorderRepository } from "./repositories/cache-flight-recorder.repository";
+import {
+	CacheFlightRecorderRepository,
+	type MarkIncompleteOptions,
+} from "./repositories/cache-flight-recorder.repository";
 import { ComboRepository } from "./repositories/combo.repository";
 import { OAuthRepository } from "./repositories/oauth.repository";
 import {
@@ -980,7 +983,7 @@ OAuth tokens will need to be re-authenticated.
 
 	async markCacheFlightRecorderIncomplete(
 		recorderConversationId: string,
-		options?: { dropped?: boolean; at?: number },
+		options?: MarkIncompleteOptions,
 	): Promise<void> {
 		await this.cacheFlightRecorder.markIncomplete(
 			recorderConversationId,

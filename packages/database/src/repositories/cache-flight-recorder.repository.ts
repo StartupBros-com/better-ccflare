@@ -21,6 +21,9 @@ interface StoredTurn {
 
 export interface MarkIncompleteOptions {
 	dropped?: boolean;
+	/** Coalesced count of drops for one call. Defaults to 1 when `dropped`
+	 * is true and no explicit count is given, 0 otherwise. */
+	droppedCount?: number;
 	at?: number;
 }
 
@@ -187,6 +190,7 @@ export class CacheFlightRecorderRepository extends BaseRepository<Timeline> {
 		options: MarkIncompleteOptions = {},
 	): Promise<void> {
 		const at = options.at ?? Date.now();
+		const droppedCount = options.droppedCount ?? (options.dropped ? 1 : 0);
 		await this.run(
 			`INSERT INTO cache_flight_recorder_conversations (
 				recorder_conversation_id, created_at, updated_at, incomplete, dropped_events
@@ -199,7 +203,7 @@ export class CacheFlightRecorderRepository extends BaseRepository<Timeline> {
 				END,
 				incomplete = 1,
 				dropped_events = cache_flight_recorder_conversations.dropped_events + EXCLUDED.dropped_events`,
-			[recorderConversationId, at, at, options.dropped ? 1 : 0],
+			[recorderConversationId, at, at, droppedCount],
 		);
 	}
 

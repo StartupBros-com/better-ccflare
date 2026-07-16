@@ -64,7 +64,11 @@ interface TestHarness {
 	saveRequestIds: string[];
 	payloads: Map<string, string>;
 	recorderWrites: RecorderWrite[];
-	markedIncomplete: Array<{ id: string; dropped: boolean }>;
+	markedIncomplete: Array<{
+		id: string;
+		dropped: boolean;
+		droppedCount?: number;
+	}>;
 	summaryCosts: Map<string, number | undefined>;
 	summaries: string[];
 }
@@ -129,7 +133,11 @@ function createHarness(options: HarnessOptions | boolean = {}): TestHarness {
 	const saveRequestIds: string[] = [];
 	const payloads = new Map<string, string>();
 	const recorderWrites: RecorderWrite[] = [];
-	const markedIncomplete: Array<{ id: string; dropped: boolean }> = [];
+	const markedIncomplete: Array<{
+		id: string;
+		dropped: boolean;
+		droppedCount?: number;
+	}> = [];
 	const summaryCosts = new Map<string, number | undefined>();
 	const summaries: string[] = [];
 	const pendingWrites = new Set<Promise<void>>();
@@ -154,11 +162,12 @@ function createHarness(options: HarnessOptions | boolean = {}): TestHarness {
 		},
 		async markCacheFlightRecorderIncomplete(
 			recorderConversationId: string,
-			options?: { dropped?: boolean },
+			options?: { dropped?: boolean; droppedCount?: number },
 		): Promise<void> {
 			markedIncomplete.push({
 				id: recorderConversationId,
 				dropped: options?.dropped === true,
+				droppedCount: options?.droppedCount,
 			});
 		},
 	};
@@ -509,12 +518,19 @@ describe("UsageCollector request lifecycle", () => {
 			requestId: "recorder-rejected",
 			success: true,
 		});
+		// The dropped marker is buffered off the request path, not written
+		// synchronously: it must not appear before an explicit flush.
+		expect(markedIncomplete).toEqual([]);
 		await collector.drain();
 
 		expect(recorderWrites).toEqual([]);
 		expect(summaries).toContain("recorder-rejected");
 		expect(markedIncomplete).toEqual([
-			{ id: "cfr_dddddddddddddddddddddddddddddddd", dropped: true },
+			{
+				id: "cfr_dddddddddddddddddddddddddddddddd",
+				dropped: true,
+				droppedCount: 1,
+			},
 		]);
 	});
 
@@ -890,8 +906,95 @@ describe("UsageCollector request lifecycle", () => {
 		expect(testable(collector).requests.has("recorder-evicted")).toBe(false);
 		expect(recorderWrites).toEqual([]);
 		expect(markedIncomplete).toEqual([
-			{ id: "cfr_ffffffffffffffffffffffffffffffff", dropped: true },
+			{
+				id: "cfr_ffffffffffffffffffffffffffffffff",
+				dropped: true,
+				droppedCount: 1,
+			},
 		]);
+	});
+
+	it("coalesces repeated drops for one conversation into a single summed marker", async () => {
+		const { collector, markedIncomplete, recorderWrites } = createHarness({
+			acceptMetadata: false,
+		});
+		collectors.push(collector);
+		const conversationId = "cfr_coalesce00000000000000000000";
+
+		for (let i = 0; i < 3; i++) {
+			collector.handleStart(
+				makeStartMessage(`recorder-coalesce-${i}`, {
+					accountId: "xai-account",
+					providerName: "xai",
+					xaiCacheOfficialEndpoint: true,
+					cacheFlightRecorderConversationId: conversationId,
+					cacheFlightRecorderEligible: true,
+				}),
+			);
+			collector.handleChunk(`recorder-coalesce-${i}`, modelBearingChunk());
+			await collector.handleEnd({
+				type: "end",
+				requestId: `recorder-coalesce-${i}`,
+				success: true,
+			});
+		}
+
+		// Still buffered: three drops for the same conversation have not yet
+		// produced any write, proving the hot path never calls the DB directly.
+		expect(markedIncomplete).toEqual([]);
+
+		await collector.drain();
+
+		expect(recorderWrites).toEqual([]);
+		expect(markedIncomplete).toEqual([
+			{ id: conversationId, dropped: true, droppedCount: 3 },
+		]);
+	});
+
+	it("caps the pending drop-marker buffer at 1024 distinct conversations and warns without throwing", async () => {
+		const { collector, markedIncomplete } = createHarness({
+			acceptMetadata: false,
+		});
+		collectors.push(collector);
+		const warnings: LogEvent[] = [];
+		const onLog = (event: LogEvent) => {
+			if (event.msg.includes("Dropped recorder evidence marker buffer full")) {
+				warnings.push(event);
+			}
+		};
+		logBus.on("log", onLog);
+
+		try {
+			for (let i = 0; i < 1025; i++) {
+				const conversationId = `cfr_overflow${String(i).padStart(21, "0")}`;
+				const requestId = `recorder-overflow-${i}`;
+				collector.handleStart(
+					makeStartMessage(requestId, {
+						accountId: "xai-account",
+						providerName: "xai",
+						xaiCacheOfficialEndpoint: true,
+						cacheFlightRecorderConversationId: conversationId,
+						cacheFlightRecorderEligible: true,
+					}),
+				);
+				collector.handleChunk(requestId, modelBearingChunk());
+				await collector.handleEnd({
+					type: "end",
+					requestId,
+					success: true,
+				});
+			}
+
+			expect(warnings.length).toBeGreaterThan(0);
+
+			await collector.drain();
+		} finally {
+			logBus.off("log", onLog);
+		}
+
+		// The buffer never grows past its cap; the 1025th distinct ID is lost
+		// (logged, not thrown) rather than allowed to write unboundedly.
+		expect(markedIncomplete.length).toBeLessThanOrEqual(1024);
 	});
 
 	it("retains the capacity safeguard and frees the oldest evicted state", () => {

@@ -69,6 +69,13 @@ const DEFAULT_PRICING_TIMEOUT_MS = 5_000;
 const MAX_PRICING_TIMEOUT_MS = 60_000;
 const MAX_RESPONSE_BODY_BYTES = 256 * 1024; // 256KB - cap stored response body
 const MAX_REQUEST_BODY_BYTES = 4 * 1024 * 1024; // 4MB - afterburn needs full conversation history
+// Bound on distinct conversation IDs buffered for dropped recorder evidence
+// markers. Beyond this, additional distinct drops are themselves dropped
+// (logged, not written) rather than allowed to grow the buffer unboundedly.
+const MAX_PENDING_DROPPED_MARKERS = 1024;
+// Debounce window before the buffered dropped-marker map is flushed. Keeps
+// the write off the request path entirely; drain() flushes immediately.
+const PENDING_DROPPED_MARKER_FLUSH_MS = 250;
 
 // Check if a request should be logged
 function shouldLogRequest(path: string, status: number): boolean {
@@ -332,6 +339,14 @@ export class UsageCollector {
 	private readonly pendingHandleEnds = new Set<Promise<void>>();
 	private cleanupInterval: Timer | null = null;
 
+	// Bounded, coalescing buffer for dropped recorder evidence markers. Maps
+	// recorderConversationId to a summed drop count so N drops on one
+	// conversation become a single write. Never written on the request path.
+	private readonly pendingDroppedMarkers = new Map<string, number>();
+	private pendingDroppedMarkerOverflowCount = 0;
+	private pendingMarkerFlushTimer: Timer | null = null;
+	private pendingMarkerFlushInFlight: Promise<void> | null = null;
+
 	private readonly maxBufferSize: number;
 	private readonly pricingTimeoutMs: number;
 	private readonly timeoutMs: number;
@@ -540,11 +555,13 @@ export class UsageCollector {
 	}
 
 	/**
-	 * Await all in-flight handleEnd promises then flush the AsyncDbWriter
-	 * queue to completion before process exit.
+	 * Await all in-flight handleEnd promises, flush any buffered dropped
+	 * recorder evidence markers, then flush the AsyncDbWriter queue to
+	 * completion before process exit.
 	 */
 	async drain(): Promise<void> {
 		await Promise.allSettled([...this.pendingHandleEnds]);
+		await this.flushPendingDroppedMarkersNow();
 		await this.asyncWriter.dispose();
 	}
 
@@ -554,6 +571,10 @@ export class UsageCollector {
 
 	dispose(): void {
 		this.stopCleanupInterval();
+		if (this.pendingMarkerFlushTimer) {
+			clearTimeout(this.pendingMarkerFlushTimer);
+			this.pendingMarkerFlushTimer = null;
+		}
 	}
 
 	private async _handleEndInternal(msg: EndMessage): Promise<void> {
@@ -1041,19 +1062,90 @@ export class UsageCollector {
 	}
 
 	/**
-	 * Record irrecoverably lost recorder evidence directly against the store.
-	 * This deliberately bypasses the async writer: it runs exactly when the
-	 * queue is saturated or state is force-evicted, and routing the marker
-	 * through the same rejected queue would hide the loss from health counts.
+	 * Buffer irrecoverably lost recorder evidence for a bounded, off-path
+	 * flush. This runs exactly when the queue is saturated or state is
+	 * force-evicted; it deliberately bypasses the AsyncDbWriter because
+	 * routing the marker through the same rejected queue would hide the
+	 * loss from health counts. The buffer itself never performs a DB call
+	 * on the request path: drops are coalesced per conversation ID in
+	 * memory and written by flushPendingDroppedMarkers() on a debounce
+	 * timer (or immediately, sequentially, during drain()).
 	 */
 	private markRecorderEvidenceDropped(recorderConversationId: string): void {
-		void this.dbOps
-			.markCacheFlightRecorderIncomplete(recorderConversationId, {
-				dropped: true,
-			})
-			.catch(() => {
+		const current = this.pendingDroppedMarkers.get(recorderConversationId);
+		if (current === undefined) {
+			if (this.pendingDroppedMarkers.size >= MAX_PENDING_DROPPED_MARKERS) {
+				this.pendingDroppedMarkerOverflowCount++;
+				log.warn(
+					"Dropped recorder evidence marker buffer full; losing marker",
+					{
+						recorderConversationId,
+						bufferCap: MAX_PENDING_DROPPED_MARKERS,
+						lostSinceStart: this.pendingDroppedMarkerOverflowCount,
+					},
+				);
+				return;
+			}
+			this.pendingDroppedMarkers.set(recorderConversationId, 1);
+		} else {
+			this.pendingDroppedMarkers.set(recorderConversationId, current + 1);
+		}
+		this.schedulePendingMarkerFlush();
+	}
+
+	/** Debounce successive drops into one flush pass instead of a timer per drop. */
+	private schedulePendingMarkerFlush(): void {
+		if (this.pendingMarkerFlushTimer) return;
+		this.pendingMarkerFlushTimer = setTimeout(() => {
+			this.pendingMarkerFlushTimer = null;
+			this.pendingMarkerFlushInFlight =
+				this.flushPendingDroppedMarkers().finally(() => {
+					this.pendingMarkerFlushInFlight = null;
+				});
+		}, PENDING_DROPPED_MARKER_FLUSH_MS);
+		this.pendingMarkerFlushTimer.unref();
+	}
+
+	/**
+	 * Take and clear the current buffer, then write each entry sequentially
+	 * (await one at a time) so PostgreSQL never sees unbounded concurrency
+	 * from this path. Failures are best effort: log and continue with the
+	 * remaining entries, never throw.
+	 */
+	private async flushPendingDroppedMarkers(): Promise<void> {
+		if (this.pendingDroppedMarkers.size === 0) return;
+		const entries = [...this.pendingDroppedMarkers.entries()];
+		this.pendingDroppedMarkers.clear();
+		for (const [recorderConversationId, droppedCount] of entries) {
+			try {
+				await this.dbOps.markCacheFlightRecorderIncomplete(
+					recorderConversationId,
+					{ dropped: true, droppedCount },
+				);
+			} catch {
+				log.warn("Failed to flush dropped recorder evidence marker", {
+					recorderConversationId,
+					droppedCount,
+				});
 				// Best effort only; never disturb the response lifecycle.
-			});
+			}
+		}
+	}
+
+	/**
+	 * Shutdown path: cancel any pending debounce timer, wait for an
+	 * in-flight flush to finish (so writes stay sequential), then flush
+	 * whatever remains, including entries buffered during the wait.
+	 */
+	private async flushPendingDroppedMarkersNow(): Promise<void> {
+		if (this.pendingMarkerFlushTimer) {
+			clearTimeout(this.pendingMarkerFlushTimer);
+			this.pendingMarkerFlushTimer = null;
+		}
+		if (this.pendingMarkerFlushInFlight) {
+			await this.pendingMarkerFlushInFlight;
+		}
+		await this.flushPendingDroppedMarkers();
 	}
 
 	private markEvictedRecorderState(state: RequestState): void {

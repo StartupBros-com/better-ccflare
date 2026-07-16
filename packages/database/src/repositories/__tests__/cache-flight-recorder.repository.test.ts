@@ -161,6 +161,34 @@ describe("CacheFlightRecorderRepository", () => {
 		db.close();
 	});
 
+	it("sums a coalesced droppedCount into dropped_events in one call", async () => {
+		const db = makeDb();
+		const repo = new CacheFlightRecorderRepository(new BunSqlAdapter(db));
+		await repo.appendTurn("recorder-safe-id", turn(1), 1_000);
+		await repo.markIncomplete("recorder-safe-id", {
+			dropped: true,
+			droppedCount: 3,
+			at: 1_100,
+		});
+
+		expect(await repo.countDroppedIncomplete()).toEqual({
+			dropped: 3,
+			incomplete: 1,
+		});
+
+		// A second coalesced call accumulates on top of the first.
+		await repo.markIncomplete("recorder-safe-id", {
+			dropped: true,
+			droppedCount: 2,
+			at: 1_200,
+		});
+		expect(await repo.countDroppedIncomplete()).toEqual({
+			dropped: 5,
+			incomplete: 1,
+		});
+		db.close();
+	});
+
 	it("distinguishes bounded expired tombstones from never-observed IDs", async () => {
 		const db = makeDb();
 		const repo = new CacheFlightRecorderRepository(new BunSqlAdapter(db));
