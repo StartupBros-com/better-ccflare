@@ -678,7 +678,13 @@ export class Config extends EventEmitter {
 			database: {
 				walMode: true,
 				busyTimeoutMs: 5000,
-				cacheSize: -20000, // 20MB cache
+				// 256 MiB (negative = KiB). Big enough to keep the hot B-tree
+				// interior/overflow pages of large request tables resident. At 20
+				// MiB, a random-UUID INSERT into a large table misses cache on
+				// nearly every page -> synchronous disk reads, which the
+				// AsyncDbWriter can't subdivide (one atomic db.run) -> event-loop
+				// blips during write bursts. (Source: d4rken/clankermux@763ffa72)
+				cacheSize: -262144, // 256MB cache
 				synchronous: "NORMAL",
 				mmapSize: 268435456, // 256MB
 				retry: {
@@ -739,7 +745,7 @@ export class Config extends EventEmitter {
 			defaults.database = {
 				walMode: true,
 				busyTimeoutMs: 5000,
-				cacheSize: -20000,
+				cacheSize: -262144, // 256MB cache -- see the getRuntime default above
 				synchronous: "NORMAL",
 				mmapSize: 268435456,
 				retry: {

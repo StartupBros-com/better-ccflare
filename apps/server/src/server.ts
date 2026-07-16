@@ -615,6 +615,57 @@ function startUsagePollingWithRefresh(
 	}
 }
 
+// Above this WAL file size, the periodic checkpoint tick log escalates to WARN.
+// With the main connection at wal_autocheckpoint=0 (see database-operations.ts)
+// this tick is the SOLE WAL reclaimer, so a WAL that stays large means TRUNCATE
+// is being starved (a long-lived reader perpetually holding frames) and is
+// trending toward disk-fill, which must be visible, not buried at DEBUG. A
+// healthy sawtooth resets to ~0 each reader-idle tick.
+export const WAL_SIZE_WARN_MIB = 256;
+
+/**
+ * Pure formatter for the wal-checkpoint job's per-tick log line. Extracted
+ * from the `registerCleanup` callback so the level/threshold logic is unit
+ * testable without spinning up the server.
+ */
+export function formatWalCheckpointLog(
+	result: {
+		ok: boolean;
+		skipped: boolean;
+		error?: string;
+		durationMs?: number;
+	},
+	walBytes: number,
+	warnThresholdMiB: number = WAL_SIZE_WARN_MIB,
+): { level: "warn" | "debug"; message: string } {
+	if (!result.ok) {
+		return {
+			level: "warn",
+			message: `WAL checkpoint/optimize error: ${result.error}`,
+		};
+	}
+	// This tick is the sole WAL reclaimer, so surface the WAL size every tick:
+	// a WAL trending toward disk-fill (reader-starved TRUNCATE, or repeated
+	// skips) escalates to WARN; otherwise DEBUG. Duration surfaces the
+	// optimize+checkpoint's writer-slot hold: a bounded ANALYZE (PRAGMA
+	// analysis_limit in the worker, see incremental-vacuum-worker.ts) keeps
+	// this in the single-digit/low-tens ms range, a spike back into the
+	// hundreds/seconds means ANALYZE is scanning unbounded again.
+	const walMiB = walBytes / (1024 * 1024);
+	const status = result.skipped ? "skipped (DB busy)" : "ran";
+	const timing = result.durationMs != null ? ` in ${result.durationMs}ms` : "";
+	if (walMiB > warnThresholdMiB) {
+		return {
+			level: "warn",
+			message: `WAL checkpoint ${status}${timing}; WAL ${walMiB.toFixed(1)}MiB exceeds ${warnThresholdMiB}MiB, reclaim may be starved by a long-lived reader`,
+		};
+	}
+	return {
+		level: "debug",
+		message: `checkpoint/optimize ${status}${timing}; WAL ${walMiB.toFixed(1)}MiB`,
+	};
+}
+
 // Export for programmatic use
 let serverLifecycleOwned = false;
 
@@ -941,17 +992,30 @@ export default async function startServer(options?: {
 
 	stopDataCleanupJob = unregisterDataCleanup;
 
-	// Set up periodic WAL checkpoint every 5 minutes to prevent unbounded WAL growth
+	// Periodic WAL checkpoint every 60s to keep the WAL bounded. Runs PRAGMA
+	// optimize + PRAGMA wal_checkpoint(TRUNCATE) in a worker thread. This is the
+	// ONLY WAL reclaimer (the main connection has wal_autocheckpoint=0 so it never
+	// checkpoints synchronously on the request hot path). 60s (down from 5min)
+	// gives TRUNCATE many more chances to land in a reader-idle gap and zero the
+	// WAL; busy_timeout=0 means a tick that overlaps a reader just skips, never
+	// blocks. The old synchronous dbOps.optimize() parked the main thread in
+	// SQLite's busy handler for up to busy_timeout (10s) whenever the hourly
+	// vacuum worker held the write lock, freezing the event loop.
 	const unregisterWalCheckpoint = registerCleanup({
 		id: "wal-checkpoint",
 		callback: () => {
-			try {
-				dbOps.optimize(); // runs PRAGMA optimize + PRAGMA wal_checkpoint(PASSIVE)
-			} catch (err) {
-				log.error(`WAL checkpoint error: ${err}`);
-			}
+			dbOps
+				.optimizeAsync()
+				.then(async (result) => {
+					const walBytes = result.ok ? await dbOps.getWalSizeBytes() : 0;
+					const { level, message } = formatWalCheckpointLog(result, walBytes);
+					log[level](message);
+				})
+				.catch((err) => {
+					log.error(`WAL checkpoint error: ${err}`);
+				});
 		},
-		minutes: 5,
+		minutes: 1,
 		description: "WAL checkpoint to prevent unbounded WAL file growth",
 	});
 	stopWalCheckpointJob = unregisterWalCheckpoint;
