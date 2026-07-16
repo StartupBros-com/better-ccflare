@@ -238,7 +238,7 @@ At `0`, eligible traffic retains the current conversation-key behavior. At `100`
 
 #### Trace schema and analysis
 
-Codex trace schema 8 adds these nullable request fields:
+Codex trace schema 9 keeps the schema 8 canary fields and adds physical-attempt identity so retries and failover no longer collapse into one logical request:
 
 | Field | Meaning |
 |---|---|
@@ -246,38 +246,53 @@ Codex trace schema 8 adds these nullable request fields:
 | `cache_key_cohort_id` | Short domain-separated digest of the normalized session UUID for assignment-stability checks |
 | `conversation_id` | Short digest of the logical conversation identity, independent of the outbound cache key |
 | `cache_key_assignment_source` | `canary`, `explicit_session_override`, or null |
+| `attempt_id` | Unique physical upstream transport identity for one transport attempt |
+| `attempt_ordinal` | One-based physical transport ordinal within the logical `request_id` |
+| `attempt_cause` | Why the attempt was opened: `initial`, `model_fallback`, `overload_529`, `thinking_retry`, `cache_control_retry`, `other_retry`, or `account_failover` |
 
-The existing `prompt_cache_key_set`, `prompt_cache_key_id`, and `cache_key_mode` fields remain authoritative for effective behavior. Assignment and effective mode are intentionally separate so the analyzer can report configuration crossovers rather than infer them from key prefixes. The analyzer joins request and response records only by `request_id`, retains schema 6 and 7 records in an explicit unassigned compatibility bucket, reports unjoined responses separately, and counts assigned requests without responses as missing terminals rather than client aborts.
+The existing `prompt_cache_key_set`, `prompt_cache_key_id`, and `cache_key_mode` fields remain authoritative for effective behavior. Assignment and effective mode are intentionally separate so the analyzer can report configuration crossovers rather than infer them from key prefixes.
+
+Join rules for analysis:
+
+1. Prefer unambiguous one-to-one joins on `attempt_id` for schema 9 request/response pairs.
+2. Accept valid legacy schema 6-8 joins only when both sides lack `attempt_id` and there is exactly one request and one response for that `request_id`.
+3. Exclude orphan responses, duplicate request or response identities, and any ambiguous multi-record `request_id` groups from attempt-inclusive cache stats.
+4. Count assigned requests without a joined terminal as missing terminals rather than client aborts.
+
+Attempt-inclusive cache stats therefore measure every unambiguous physical transport, while final-response denominators still describe one terminal outcome per logical client request. Schema 6 and 7 records remain in an explicit unassigned compatibility bucket when canary assignment fields are absent.
 
 For each intended arm, the analyzer reports:
 
 - Assigned requests, joined terminal responses, missing-terminal requests, and cache-measured responses
-- Weighted cache reuse using only responses with numeric cache telemetry
+- Final-response and attempt-inclusive weighted cache reuse using only responses with numeric cache telemetry
 - Cache-positive response rate with its measured denominator
 - Input, output, and cache token totals
+- Aggregate usage availability counts so unavailable totals stay distinct from measured zero
 - Terminal distributions, including errors, refusals, and `max_tokens`
 - Effective-mode distributions and explicit crossover counts
 - Model and account distributions
 - Logical conversation counts
 - First-request and cache-eligible follow-up statistics
 - Observed conversation-turn bands derived from all retained records for each `conversation_id`
+- Rolling hot-key concentration for attempt-aware cache economics
 
-Use intention-to-treat arm comparisons as the primary result. Check effective-mode crossovers, model and account balance, missing terminals, and complete-session coverage before interpreting cache reuse.
+Use intention-to-treat arm comparisons as the primary result. Check effective-mode crossovers, model and account balance, missing terminals, attempt reconciliation, and complete-session coverage before interpreting cache reuse.
 
 #### Privacy
 
-Schema 8 stores only bounded digests and enum values for the canary. It never stores raw session IDs, prompt material, or outbound cache keys. Internal experiment metadata is stripped before upstream transport. Cache token counts and serialized prefix-boundary byte lengths are different units, so trace analysis must not claim an exact provider token-cache boundary from HMAC boundary telemetry.
+Schema 9 stores only bounded digests, enum values, and physical-attempt identifiers for the canary. It never stores raw session IDs, prompt material, or outbound cache keys. Internal experiment metadata is stripped before upstream transport. Cache token counts and serialized prefix-boundary byte lengths are different units, so trace analysis must not claim an exact provider token-cache boundary from HMAC boundary telemetry.
 
 Prefix retention and instruction/tool stability require `CCFLARE_CODEX_TRACE_HMAC_KEY`, because summaries written without that key intentionally contain no HMACs. Those comparisons are reported as unavailable rather than changed when HMACs are absent. With a dedicated trace key, traces include bounded cumulative prefix-boundary HMACs and byte lengths, allowing an earlier full input to be compared with the corresponding prefix of a later turn. Old boundaries outside the bounded retention window are also reported as unavailable. The key itself is never written to the trace. Rotate or remove it after the observation window.
 
 #### Rollout and stop conditions
 
-Use this bounded rollout after the schema 8 build is merged and deployed from `refs/heads/main`:
+Use this bounded rollout after the schema 9 build is merged and deployed from `refs/heads/main`:
 
 1. Deploy with `CCFLARE_CODEX_CACHE_KEY_SESSION_PERCENT=0`. Do not change prompt-key, pacing, routing, model, or orchestration settings.
-2. Verify service health, schema 8 trace coverage, stable cohort IDs, distinct and stable conversation IDs, request-response joins, and zero unexpected effective-mode crossovers.
-3. Set a small treatment cohort, preferably `10` rather than `1` when an overnight window contains only about ten sessions. Keep the percentage fixed for the full observation window.
-4. Compare intention-to-treat weighted reuse, cache-positive rate, follow-up-only behavior, available request latency, terminal outcomes, missing-terminal rate, model and account balance, and orchestration containment indicators.
+2. Verify service health, schema 9 trace coverage, stable cohort IDs, distinct and stable conversation IDs, attempt-aware request-response joins, increasing attempt ordinals across retries and failover, and zero unexpected effective-mode crossovers.
+3. Reconcile physical attempts against logical requests before reading attempt-inclusive reuse. Confirm unambiguous one-to-one joins, legacy compatibility joins, and exclusion of orphans or duplicates.
+4. Set a small treatment cohort, preferably `10` rather than `1` when an overnight window contains only about ten sessions. Keep the percentage fixed for the full observation window.
+5. Compare intention-to-treat weighted reuse for both final-response and attempt-inclusive denominators, cache-positive rate, follow-up-only behavior, available request latency, terminal outcomes, missing-terminal rate, model and account balance, and orchestration containment indicators.
 
 Stop the canary and return the percentage to `0` if errors, refusals, `max_tokens` terminals, missing terminals, containment failures, or unexpected effective-mode crossovers worsen. Also stop if cache reuse shows no credible benefit after enough complete sessions have been observed. An immediate global switch to session mode is outside this rollout.
 

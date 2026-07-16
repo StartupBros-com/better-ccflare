@@ -71,20 +71,30 @@ describe("Codex trace wiring (integration)", () => {
 		rmSync(dir, { recursive: true, force: true });
 	});
 
-	test("transformRequestBody traces and strips the internal request id", async () => {
+	test("transformRequestBody traces the physical attempt and strips internal identity", async () => {
 		process.env[CODEX_TRACE_DIR_ENV] = dir;
 		const transformed = await new CodexProvider().transformRequestBody(
-			messagesRequest(SAMPLE, "req_trace_1"),
+			messagesRequest(SAMPLE, "req_trace_1", {
+				"x-better-ccflare-attempt-id": "attempt-1",
+				"x-better-ccflare-attempt-ordinal": "2",
+				"x-better-ccflare-attempt-cause": "model_fallback",
+				"x-better-ccflare-final-model": "gpt-5.4-mini",
+			}),
 			undefined,
 		);
 
 		const files = readdirSync(dir).filter((f) => f.endsWith(".jsonl"));
 		expect(files.length).toBe(1);
 		const rec = JSON.parse(readFileSync(join(dir, files[0]), "utf8").trim());
-		expect(rec.trace_schema_version).toBe(8);
+		expect(rec.trace_schema_version).toBe(9);
 		expect(rec.phase).toBe("request");
 		expect(rec.orchestration_admission).toBe("no_orchestration_tools");
 		expect(rec.request_id).toBe("req_trace_1");
+		expect(rec.attempt_id).toBe("attempt-1");
+		expect(rec.attempt_ordinal).toBe(2);
+		expect(rec.attempt_cause).toBe("model_fallback");
+		expect(rec.model_out).toBe("gpt-5.4-mini");
+		expect((await transformed.clone().json()).model).toBe("gpt-5.4-mini");
 		// Cache-key experiment is off by default in this test environment.
 		expect(rec.prompt_cache_key_set).toBe(false);
 		expect(rec.prompt_cache_key_id).toBeNull();
@@ -99,7 +109,15 @@ describe("Codex trace wiring (integration)", () => {
 		expect(rec.instructions_hmac).toBeNull();
 		expect(rec.history_function_call_count).toBe(1);
 		expect(rec.history_tool_use_by_name).toEqual({ Task: 1 });
-		expect(transformed.headers.get("x-better-ccflare-request-id")).toBeNull();
+		for (const header of [
+			"x-better-ccflare-request-id",
+			"x-better-ccflare-attempt-id",
+			"x-better-ccflare-attempt-ordinal",
+			"x-better-ccflare-attempt-cause",
+			"x-better-ccflare-final-model",
+		]) {
+			expect(transformed.headers.get(header)).toBeNull();
+		}
 		// full bodies must be absent unless FULL is set
 		expect(rec.anthropic_request).toBeUndefined();
 	});
@@ -138,7 +156,7 @@ describe("Codex trace wiring (integration)", () => {
 			.trim()
 			.split("\n")
 			.map((line) => JSON.parse(line));
-		expect(records.every((record) => record.trace_schema_version === 8)).toBe(
+		expect(records.every((record) => record.trace_schema_version === 9)).toBe(
 			true,
 		);
 		expect(records.map((record) => record.cache_key_assignment)).toEqual([

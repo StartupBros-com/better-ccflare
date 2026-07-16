@@ -1593,9 +1593,9 @@ describe("CodexProvider.processResponse", () => {
 		const messageStartLine = transformedBody
 			.split("\n")
 			.find((line) => line.includes('"type":"message_start"'));
-		const messageDeltaLine = transformedBody
+		const errorLine = transformedBody
 			.split("\n")
-			.find((line) => line.includes('"type":"message_delta"'));
+			.find((line) => line.includes('"type":"abrupt_stream_eof"'));
 
 		expect(messageStartLine).not.toBeUndefined();
 		const payload = JSON.parse(
@@ -1607,13 +1607,9 @@ describe("CodexProvider.processResponse", () => {
 		expect(payload.usage.cache_creation_input_tokens).toBe(0);
 		expect(payload.message.usage.input_tokens).toBe(0);
 		expect(payload.message.usage.output_tokens).toBe(0);
-		expect(messageDeltaLine).not.toBeUndefined();
-		expect(messageDeltaLine).toContain('"usage":{');
-		expect(messageDeltaLine).toContain('"input_tokens":0');
-		expect(messageDeltaLine).toContain('"output_tokens":0');
-		expect(messageDeltaLine).toContain(
-			'"delta":{"stop_reason":"end_turn","stop_sequence":null,"usage":{',
-		);
+		expect(errorLine).not.toBeUndefined();
+		expect(transformedBody).not.toContain('"type":"message_delta"');
+		expect(transformedBody).not.toContain('"type":"message_stop"');
 	});
 
 	it("includes cache_creation_input_tokens in synthesized context_window when present", async () => {
@@ -2132,6 +2128,393 @@ describe("CodexProvider.processResponse", () => {
 		expect(transformed.status).toBe(429);
 		expect(body.error.type).toBe("rate_limit_error");
 		expect(body.error.status).toBe("rate_limited");
+	});
+
+	it.each([
+		["error", { type: "error", message: "Terminal error" }],
+		[
+			"response.failed",
+			{
+				response: {
+					status: "failed",
+					error: { type: "api_error", message: "Terminal failure" },
+				},
+			},
+		],
+		[
+			"response.completed",
+			{ response: { model: "gpt-5.5", status: "completed" } },
+		],
+		[
+			"response.incomplete",
+			{
+				response: {
+					model: "gpt-5.5",
+					status: "incomplete",
+					incomplete_details: { reason: "max_output_tokens" },
+				},
+			},
+		],
+	] as const)("keeps missing usage unavailable for %s", async (event, data) => {
+		const provider = new CodexProvider();
+		const traceDir = mkdtempSync(join(tmpdir(), "codex-trace-"));
+		process.env[CODEX_TRACE_DIR_ENV] = traceDir;
+		try {
+			const transformed = await provider.processResponse(
+				new Response(sseBody(eventLine(event, data)), {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				}),
+				null,
+			);
+			await transformed.text();
+			const record = readTraceRecords(traceDir).find(
+				(candidate) => candidate.phase === "response",
+			);
+
+			expect(record).toMatchObject({
+				usage_measurement_available: false,
+				cache_measurement_available: false,
+				input_tokens: null,
+				output_tokens: null,
+				cache_read_input_tokens: null,
+				cache_creation_input_tokens: null,
+			});
+		} finally {
+			delete process.env[CODEX_TRACE_DIR_ENV];
+			rmSync(traceDir, { recursive: true, force: true });
+		}
+	});
+
+	it.each([
+		"response.failed",
+		"response.completed",
+		"response.incomplete",
+	])("keeps missing cached-token usage unavailable for %s", async (event) => {
+		const provider = new CodexProvider();
+		const traceDir = mkdtempSync(join(tmpdir(), "codex-trace-"));
+		process.env[CODEX_TRACE_DIR_ENV] = traceDir;
+		try {
+			const responseData: Record<string, unknown> = {
+				model: "gpt-5.5",
+				status:
+					event === "response.failed"
+						? "failed"
+						: event === "response.incomplete"
+							? "incomplete"
+							: "completed",
+				usage: { input_tokens: 12, output_tokens: 3 },
+			};
+			if (event === "response.failed") {
+				responseData.error = { type: "api_error", message: "Failure" };
+			} else if (event === "response.incomplete") {
+				responseData.incomplete_details = { reason: "max_output_tokens" };
+			}
+			const transformed = await provider.processResponse(
+				new Response(sseBody(eventLine(event, { response: responseData })), {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				}),
+				null,
+			);
+			await transformed.text();
+			const record = readTraceRecords(traceDir).find(
+				(candidate) => candidate.phase === "response",
+			);
+
+			expect(record).toMatchObject({
+				usage_measurement_available: true,
+				cache_measurement_available: false,
+				input_tokens: 12,
+				output_tokens: 3,
+				cache_read_input_tokens: null,
+				cache_creation_input_tokens: null,
+			});
+		} finally {
+			delete process.env[CODEX_TRACE_DIR_ENV];
+			rmSync(traceDir, { recursive: true, force: true });
+		}
+	});
+
+	it("emits and traces abrupt_stream_eof while preserving known usage", async () => {
+		const provider = new CodexProvider();
+		const traceDir = mkdtempSync(join(tmpdir(), "codex-trace-"));
+		process.env[CODEX_TRACE_DIR_ENV] = traceDir;
+		try {
+			const upstreamBody = sseBody([
+				...eventLine("response.created", {
+					response: {
+						id: "resp_abrupt",
+						model: "gpt-5.5",
+						usage: {
+							input_tokens: 100,
+							output_tokens: 7,
+							input_tokens_details: {
+								cached_tokens: 60,
+								cache_creation_input_tokens: 5,
+							},
+						},
+					},
+				}),
+			]);
+			const response = new Response(upstreamBody, {
+				status: 200,
+				headers: {
+					"content-type": "text/event-stream",
+					"x-better-ccflare-request-id": "logical-abrupt",
+					"x-better-ccflare-attempt-id": "attempt-abrupt",
+				},
+			});
+
+			const body = await (
+				await provider.processResponse(response, null)
+			).text();
+			expect(body).toContain("event: error");
+			expect(body).toContain('"type":"abrupt_stream_eof"');
+			expect(body).not.toContain("event: message_delta");
+			expect(body).not.toContain("event: message_stop");
+			const record = readTraceRecords(traceDir).find(
+				(candidate) => candidate.phase === "response",
+			);
+			expect(record).toMatchObject({
+				request_id: "logical-abrupt",
+				attempt_id: "attempt-abrupt",
+				stop_reason: "error",
+				error_type: "abrupt_stream_eof",
+				usage_measurement_available: true,
+				cache_measurement_available: true,
+				input_tokens: 100,
+				output_tokens: 7,
+				cache_read_input_tokens: 60,
+				cache_creation_input_tokens: 5,
+			});
+		} finally {
+			delete process.env[CODEX_TRACE_DIR_ENV];
+			rmSync(traceDir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps usage unavailable and uses final wire model on abrupt EOF", async () => {
+		const provider = new CodexProvider();
+		const traceDir = mkdtempSync(join(tmpdir(), "codex-trace-"));
+		process.env[CODEX_TRACE_DIR_ENV] = traceDir;
+		try {
+			const response = new Response(sseBody([]), {
+				status: 200,
+				headers: {
+					"content-type": "text/event-stream",
+					"x-better-ccflare-request-id": "logical-empty",
+					"x-better-ccflare-attempt-id": "attempt-empty",
+					"x-better-ccflare-final-model": "gpt-5.4-mini",
+				},
+			});
+
+			const body = await (
+				await provider.processResponse(response, null)
+			).text();
+			expect(body).toContain('"model":"gpt-5.4-mini"');
+			expect(body).toContain('"type":"abrupt_stream_eof"');
+			const record = readTraceRecords(traceDir).find(
+				(candidate) => candidate.phase === "response",
+			);
+			expect(record).toMatchObject({
+				model_out: "gpt-5.4-mini",
+				usage_measurement_available: false,
+				cache_measurement_available: false,
+				input_tokens: null,
+				output_tokens: null,
+				cache_read_input_tokens: null,
+			});
+		} finally {
+			delete process.env[CODEX_TRACE_DIR_ENV];
+			rmSync(traceDir, { recursive: true, force: true });
+		}
+	});
+
+	it("cancels the upstream stream and traces downstream cancellation", async () => {
+		const provider = new CodexProvider();
+		const traceDir = mkdtempSync(join(tmpdir(), "codex-trace-"));
+		process.env[CODEX_TRACE_DIR_ENV] = traceDir;
+		let cancelled = false;
+		try {
+			const upstream = new ReadableStream<Uint8Array>({
+				start(controller) {
+					controller.enqueue(
+						new TextEncoder().encode(
+							[
+								"event: response.created",
+								'data: {"response":{"id":"resp_cancel","model":"gpt-5.5","usage":{"input_tokens":11,"output_tokens":2,"input_tokens_details":{"cached_tokens":4}}}}',
+								"",
+								"",
+							].join("\n"),
+						),
+					);
+				},
+				cancel() {
+					cancelled = true;
+				},
+			});
+			const transformed = await provider.processResponse(
+				new Response(upstream, {
+					headers: {
+						"content-type": "text/event-stream",
+						"x-better-ccflare-request-id": "logical-cancel",
+						"x-better-ccflare-attempt-id": "attempt-cancel",
+					},
+				}),
+				null,
+			);
+			const reader = transformed.body?.getReader();
+			await reader?.cancel("client disconnected");
+			await Bun.sleep(10);
+			expect(cancelled).toBe(true);
+			const record = readTraceRecords(traceDir).find(
+				(candidate) => candidate.phase === "response",
+			);
+			expect(record).toMatchObject({
+				request_id: "logical-cancel",
+				attempt_id: "attempt-cancel",
+				stop_reason: "error",
+				error_type: "downstream_cancelled",
+			});
+		} finally {
+			delete process.env[CODEX_TRACE_DIR_ENV];
+			rmSync(traceDir, { recursive: true, force: true });
+		}
+	});
+
+	it("writes one terminal trace when cancellation races completion", async () => {
+		const provider = new CodexProvider();
+		const traceDir = mkdtempSync(join(tmpdir(), "codex-trace-"));
+		process.env[CODEX_TRACE_DIR_ENV] = traceDir;
+		try {
+			const transformed = await provider.processResponse(
+				new Response(
+					sseBody(
+						eventLine("response.completed", {
+							response: {
+								model: "gpt-5.5",
+								status: "completed",
+								usage: {
+									input_tokens: 20,
+									output_tokens: 3,
+									input_tokens_details: { cached_tokens: 8 },
+								},
+							},
+						}),
+					),
+					{
+						status: 200,
+						headers: {
+							"content-type": "text/event-stream",
+							"x-better-ccflare-request-id": "logical-race",
+							"x-better-ccflare-attempt-id": "attempt-race",
+						},
+					},
+				),
+				null,
+			);
+			const reader = transformed.body?.getReader();
+			await reader?.read();
+			await reader?.cancel("client disconnected");
+			await Bun.sleep(10);
+
+			const records = readTraceRecords(traceDir).filter(
+				(candidate) =>
+					candidate.phase === "response" &&
+					candidate.attempt_id === "attempt-race",
+			);
+			expect(records).toHaveLength(1);
+		} finally {
+			delete process.env[CODEX_TRACE_DIR_ENV];
+			rmSync(traceDir, { recursive: true, force: true });
+		}
+	});
+
+	it("pauses upstream reads until the downstream consumer pulls", async () => {
+		const provider = new CodexProvider();
+		let upstreamReads = 0;
+		const chunk = (index: number) =>
+			new TextEncoder().encode(
+				[
+					"event: response.output_text.delta",
+					`data: {"delta":"chunk-${index}"}`,
+					"",
+					"",
+				].join("\n"),
+			);
+		const upstream = new ReadableStream<Uint8Array>({
+			pull(controller) {
+				upstreamReads++;
+				if (upstreamReads > 64) {
+					controller.close();
+					return;
+				}
+				controller.enqueue(chunk(upstreamReads));
+			},
+		});
+		const transformed = await provider.processResponse(
+			new Response(upstream, {
+				headers: {
+					"content-type": "text/event-stream",
+					"x-better-ccflare-request-id": "logical-backpressure",
+					"x-better-ccflare-attempt-id": "attempt-backpressure",
+				},
+			}),
+			null,
+		);
+
+		// No downstream reader yet: the transform must not drain the upstream.
+		await Bun.sleep(25);
+		const readsBeforeConsumption = upstreamReads;
+		expect(readsBeforeConsumption).toBeLessThan(16);
+
+		const reader = transformed.body?.getReader();
+		while (true) {
+			const { done } = (await reader?.read()) ?? { done: true };
+			if (done) break;
+		}
+		expect(upstreamReads).toBeGreaterThan(readsBeforeConsumption);
+	});
+
+	it("traces upstream stream read failures as terminal errors", async () => {
+		const provider = new CodexProvider();
+		const traceDir = mkdtempSync(join(tmpdir(), "codex-trace-"));
+		process.env[CODEX_TRACE_DIR_ENV] = traceDir;
+		try {
+			const upstream = new ReadableStream<Uint8Array>({
+				pull() {
+					throw new Error("upstream reset");
+				},
+			});
+			const transformed = await provider.processResponse(
+				new Response(upstream, {
+					headers: {
+						"content-type": "text/event-stream",
+						"x-better-ccflare-request-id": "logical-read-error",
+						"x-better-ccflare-attempt-id": "attempt-read-error",
+					},
+				}),
+				null,
+			);
+			const body = await transformed.text();
+			expect(body).toContain('"type":"upstream_stream_read_error"');
+			const record = readTraceRecords(traceDir).find(
+				(candidate) => candidate.phase === "response",
+			);
+			expect(record).toMatchObject({
+				request_id: "logical-read-error",
+				attempt_id: "attempt-read-error",
+				stop_reason: "error",
+				error_type: "upstream_stream_read_error",
+				usage_measurement_available: false,
+				cache_measurement_available: false,
+				input_tokens: null,
+			});
+		} finally {
+			delete process.env[CODEX_TRACE_DIR_ENV];
+			rmSync(traceDir, { recursive: true, force: true });
+		}
 	});
 
 	it("does not emit terminal events after response.failed when response.completed follows", async () => {
@@ -2927,7 +3310,7 @@ describe("CodexProvider.transformRequestBody", () => {
 				(record) => record.phase === "request",
 			);
 			expect(requestTrace).toMatchObject({
-				trace_schema_version: 8,
+				trace_schema_version: 9,
 				orchestration_admission: "no_session",
 				is_descendant: true,
 				tools_before_count: 3,
