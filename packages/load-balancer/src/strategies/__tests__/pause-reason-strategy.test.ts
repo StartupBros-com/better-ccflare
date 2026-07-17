@@ -69,8 +69,11 @@ class MockStrategyStore implements StrategyStore {
 		this.resetCalls.push({ accountId, timestamp });
 	}
 
-	resumeAccount(accountId: string): void {
+	async resumeAccount(
+		accountId: string,
+	): Promise<{ resumed: boolean; pauseReason: string | null }> {
 		this.resumeCalls.push(accountId);
+		return { resumed: true, pauseReason: null };
 	}
 
 	clear(): void {
@@ -115,7 +118,7 @@ describe("SessionStrategy — pause_reason auto-unpause logic", () => {
 	// -------------------------------------------------------------------------
 
 	describe("pause_reason='failure_threshold'", () => {
-		it("does not call resumeAccount and keeps paused=true", () => {
+		it("does not call resumeAccount and keeps paused=true", async () => {
 			const hotmail = makeAccount({
 				id: "hotmail",
 				name: "hotmail",
@@ -126,13 +129,13 @@ describe("SessionStrategy — pause_reason auto-unpause logic", () => {
 				priority: 0,
 			});
 
-			strategy.select([hotmail], meta);
+			await strategy.select([hotmail], meta);
 
 			expect(mockStore.hasResumeCall("hotmail")).toBe(false);
 			expect(hotmail.paused).toBe(true);
 		});
 
-		it("issue #139: does not auto-unpause a failure_threshold account even when the rate limit window resets", () => {
+		it("issue #139: does not auto-unpause a failure_threshold account even when the rate limit window resets", async () => {
 			const hotmail = makeAccount({
 				id: "hotmail",
 				name: "hotmail",
@@ -153,14 +156,14 @@ describe("SessionStrategy — pause_reason auto-unpause logic", () => {
 				priority: 1,
 			});
 
-			strategy.select([hotmail, gmail], meta);
+			await strategy.select([hotmail, gmail], meta);
 
 			// HOTMAIL must remain paused — resumeAccount must NOT have been called
 			expect(hotmail.paused).toBe(true);
 			expect(mockStore.hasResumeCall("hotmail")).toBe(false);
 		});
 
-		it("leaves the failure_threshold account paused regardless of rate_limit_reset", () => {
+		it("leaves the failure_threshold account paused regardless of rate_limit_reset", async () => {
 			const hotmail = makeAccount({
 				id: "hotmail",
 				name: "hotmail",
@@ -171,7 +174,7 @@ describe("SessionStrategy — pause_reason auto-unpause logic", () => {
 				priority: 0,
 			});
 
-			strategy.select([hotmail], meta);
+			await strategy.select([hotmail], meta);
 
 			// The account is found as an auto-fallback candidate but must NOT be unpaused
 			expect(hotmail.paused).toBe(true);
@@ -183,7 +186,7 @@ describe("SessionStrategy — pause_reason auto-unpause logic", () => {
 	// -------------------------------------------------------------------------
 
 	describe("pause_reason='manual'", () => {
-		it("does not call resumeAccount for a manually-paused account when rate limit window resets", () => {
+		it("does not call resumeAccount for a manually-paused account when rate limit window resets", async () => {
 			const account = makeAccount({
 				id: "manual-paused",
 				name: "manual-paused",
@@ -194,13 +197,13 @@ describe("SessionStrategy — pause_reason auto-unpause logic", () => {
 				priority: 0,
 			});
 
-			strategy.select([account], meta);
+			await strategy.select([account], meta);
 
 			expect(mockStore.hasResumeCall("manual-paused")).toBe(false);
 			expect(account.paused).toBe(true);
 		});
 
-		it("leaves the manually-paused account paused regardless of elapsed rate_limit_reset", () => {
+		it("leaves the manually-paused account paused regardless of elapsed rate_limit_reset", async () => {
 			const manual = makeAccount({
 				id: "manual-paused",
 				name: "manual-paused",
@@ -219,7 +222,7 @@ describe("SessionStrategy — pause_reason auto-unpause logic", () => {
 				priority: 1,
 			});
 
-			strategy.select([manual, healthy], meta);
+			await strategy.select([manual, healthy], meta);
 
 			expect(manual.paused).toBe(true);
 			expect(mockStore.hasResumeCall("manual-paused")).toBe(false);
@@ -231,7 +234,7 @@ describe("SessionStrategy — pause_reason auto-unpause logic", () => {
 	// -------------------------------------------------------------------------
 
 	describe("pause_reason='overage'", () => {
-		it("calls resumeAccount and clears paused flag when the rate limit window resets", () => {
+		it("calls resumeAccount and clears paused flag when the rate limit window resets", async () => {
 			const account = makeAccount({
 				id: "overage-paused",
 				name: "overage-paused",
@@ -242,14 +245,14 @@ describe("SessionStrategy — pause_reason auto-unpause logic", () => {
 				priority: 0,
 			});
 
-			const result = strategy.select([account], meta);
+			const result = await strategy.select([account], meta);
 
 			expect(mockStore.hasResumeCall("overage-paused")).toBe(true);
 			expect(account.paused).toBe(false);
 			expect(result[0]).toBe(account);
 		});
 
-		it("is returned as an available account after auto-unpause", () => {
+		it("is returned as an available account after auto-unpause", async () => {
 			const account = makeAccount({
 				id: "overage-paused",
 				name: "overage-paused",
@@ -260,7 +263,7 @@ describe("SessionStrategy — pause_reason auto-unpause logic", () => {
 				priority: 0,
 			});
 
-			strategy.select([account], meta);
+			await strategy.select([account], meta);
 
 			// After resumeAccount(), the account's in-memory paused flag is cleared
 			expect(account.paused).toBe(false);
@@ -272,7 +275,7 @@ describe("SessionStrategy — pause_reason auto-unpause logic", () => {
 	// -------------------------------------------------------------------------
 
 	describe("pause_reason=null", () => {
-		it("calls resumeAccount and clears paused flag for null-reason account", () => {
+		it("calls resumeAccount and clears paused flag for null-reason account", async () => {
 			const account = makeAccount({
 				id: "null-reason-paused",
 				name: "null-reason-paused",
@@ -283,7 +286,7 @@ describe("SessionStrategy — pause_reason auto-unpause logic", () => {
 				priority: 0,
 			});
 
-			const result = strategy.select([account], meta);
+			const result = await strategy.select([account], meta);
 
 			expect(mockStore.hasResumeCall("null-reason-paused")).toBe(true);
 			expect(account.paused).toBe(false);
@@ -296,7 +299,7 @@ describe("SessionStrategy — pause_reason auto-unpause logic", () => {
 	// -------------------------------------------------------------------------
 
 	describe("pause_reason='rate_limit_window'", () => {
-		it("calls resumeAccount and clears paused flag for rate_limit_window account", () => {
+		it("calls resumeAccount and clears paused flag for rate_limit_window account", async () => {
 			const account = makeAccount({
 				id: "rlw-paused",
 				name: "rlw-paused",
@@ -307,7 +310,7 @@ describe("SessionStrategy — pause_reason auto-unpause logic", () => {
 				priority: 0,
 			});
 
-			const result = strategy.select([account], meta);
+			const result = await strategy.select([account], meta);
 
 			expect(mockStore.hasResumeCall("rlw-paused")).toBe(true);
 			expect(account.paused).toBe(false);
@@ -323,7 +326,7 @@ describe("SessionStrategy — pause_reason auto-unpause logic", () => {
 	// -------------------------------------------------------------------------
 
 	describe("mixed pause_reason values", () => {
-		it("only unpauses the eligible (overage) account, leaves failure/manual paused", () => {
+		it("only unpauses the eligible (overage) account, leaves failure/manual paused", async () => {
 			const failureAcc = makeAccount({
 				id: "failure",
 				name: "failure",
@@ -356,7 +359,7 @@ describe("SessionStrategy — pause_reason auto-unpause logic", () => {
 			// Priority 0 = failure_threshold → cannot unpause, stays paused.
 			// So the candidate chosen is failure, and failure stays paused.
 			// Overage (priority 2) never gets to be a candidate in this call.
-			strategy.select([failureAcc, manualAcc, overageAcc], meta);
+			await strategy.select([failureAcc, manualAcc, overageAcc], meta);
 
 			// failure_threshold and manual must never be unpaused
 			expect(mockStore.hasResumeCall("failure")).toBe(false);
@@ -365,7 +368,7 @@ describe("SessionStrategy — pause_reason auto-unpause logic", () => {
 			expect(manualAcc.paused).toBe(true);
 		});
 
-		it("unpauses an overage account that is the highest-priority auto-fallback candidate", () => {
+		it("unpauses an overage account that is the highest-priority auto-fallback candidate", async () => {
 			// When overage account has the best (lowest) priority among auto-fallback
 			// eligible accounts, it IS the chosen fallback and gets unpaused.
 			const overageAcc = makeAccount({
@@ -387,7 +390,7 @@ describe("SessionStrategy — pause_reason auto-unpause logic", () => {
 				priority: 1,
 			});
 
-			const result = strategy.select([failureAcc, overageAcc], meta);
+			const result = await strategy.select([failureAcc, overageAcc], meta);
 
 			expect(mockStore.hasResumeCall("overage")).toBe(true);
 			expect(overageAcc.paused).toBe(false);
@@ -405,7 +408,7 @@ describe("SessionStrategy — pause_reason auto-unpause logic", () => {
 	// -------------------------------------------------------------------------
 
 	describe("backward compatibility — null pause_reason unpauses as before", () => {
-		it("existing auto-fallback behavior preserved when pause_reason is null", () => {
+		it("existing auto-fallback behavior preserved when pause_reason is null", async () => {
 			const now2 = Date.now();
 			const account1 = makeAccount({
 				id: "auto-fallback-reset",
@@ -427,7 +430,7 @@ describe("SessionStrategy — pause_reason auto-unpause logic", () => {
 				auto_fallback_enabled: true,
 			});
 
-			const result = strategy.select([account2, account1], meta);
+			const result = await strategy.select([account2, account1], meta);
 
 			expect(result[0]).toBe(account1);
 			expect(result).toHaveLength(1);
@@ -438,7 +441,7 @@ describe("SessionStrategy — pause_reason auto-unpause logic", () => {
 	});
 
 	describe("provider eligibility for auto-fallback", () => {
-		it("auto-unpauses codex account when reset window passed", () => {
+		it("auto-unpauses codex account when reset window passed", async () => {
 			const codex = makeAccount({
 				id: "codex",
 				name: "codex",
@@ -450,14 +453,14 @@ describe("SessionStrategy — pause_reason auto-unpause logic", () => {
 				priority: 0,
 			});
 
-			const result = strategy.select([codex], meta);
+			const result = await strategy.select([codex], meta);
 
 			expect(result[0]).toBe(codex);
 			expect(mockStore.hasResumeCall("codex")).toBe(true);
 			expect(codex.paused).toBe(false);
 		});
 
-		it("auto-unpauses zai account when reset window passed", () => {
+		it("auto-unpauses zai account when reset window passed", async () => {
 			const zai = makeAccount({
 				id: "zai",
 				name: "zai",
@@ -469,14 +472,14 @@ describe("SessionStrategy — pause_reason auto-unpause logic", () => {
 				priority: 0,
 			});
 
-			const result = strategy.select([zai], meta);
+			const result = await strategy.select([zai], meta);
 
 			expect(result[0]).toBe(zai);
 			expect(mockStore.hasResumeCall("zai")).toBe(true);
 			expect(zai.paused).toBe(false);
 		});
 
-		it("does not auto-unpause unsupported provider", () => {
+		it("does not auto-unpause unsupported provider", async () => {
 			const unsupported = makeAccount({
 				id: "openai-compatible",
 				name: "openai-compatible",
@@ -488,11 +491,41 @@ describe("SessionStrategy — pause_reason auto-unpause logic", () => {
 				priority: 0,
 			});
 
-			const result = strategy.select([unsupported], meta);
+			const result = await strategy.select([unsupported], meta);
 
 			expect(result).toHaveLength(0);
 			expect(mockStore.hasResumeCall("openai-compatible")).toBe(false);
 			expect(unsupported.paused).toBe(true);
+		});
+	});
+
+	describe("non-optimistic auto-unpause (StrategyStore.resumeAccount resumed:false)", () => {
+		it("does not select or unpause the account when the store refuses the resume", async () => {
+			const account = makeAccount({
+				id: "racy",
+				name: "racy",
+				paused: true,
+				pause_reason: "overage",
+				auto_fallback_enabled: true,
+				rate_limit_reset: expiredReset,
+				priority: 0,
+			});
+
+			const racyStore: StrategyStore = {
+				resetAccountSession() {},
+				resumeAccount: async () => ({
+					resumed: false,
+					pauseReason: "overage",
+				}),
+			};
+			strategy.initialize(racyStore);
+
+			const result = await strategy.select([account], meta);
+
+			// The DB refused the resume (e.g. lost a race to a concurrent pause) --
+			// the in-memory snapshot must not optimistically unpause or select it.
+			expect(account.paused).toBe(true);
+			expect(result).not.toContain(account);
 		});
 	});
 });

@@ -93,7 +93,7 @@ export class LeastUsedStrategy implements LoadBalancingStrategy {
 		return scored[0]?.account.id ?? null;
 	}
 
-	select(accounts: Account[], meta: RequestMeta): Account[] {
+	async select(accounts: Account[], meta: RequestMeta): Promise<Account[]> {
 		const now = Date.now();
 		const candidates = filterHardExcludedCandidates(
 			zipStrategyCandidates(accounts, meta),
@@ -104,7 +104,7 @@ export class LeastUsedStrategy implements LoadBalancingStrategy {
 		// Mirrors SessionStrategy's checkForAutoFallbackAccounts path so users
 		// who configured auto_fallback_enabled accounts get the same self-recovery
 		// behaviour regardless of which strategy they pick.
-		this.autoUnpauseElapsedAccounts(
+		await this.autoUnpauseElapsedAccounts(
 			candidates.map((candidate) => candidate.account),
 			now,
 		);
@@ -164,14 +164,19 @@ export class LeastUsedStrategy implements LoadBalancingStrategy {
 	 * Auto-unpause any account that {@link wouldAutoUnpause} reports as
 	 * eligible (auto_fallback_enabled + safe pause_reason + window elapsed).
 	 *
-	 * Mutates the in-memory account.paused flag to false on resume so the
-	 * subsequent isAccountAvailable check reflects the new state. Manual
+	 * Mutates the in-memory account.paused flag to false only once the store
+	 * confirms the resume actually happened (`resumed === true`), so the
+	 * subsequent isAccountAvailable check never reflects a resume the DB
+	 * refused (e.g. a blocked pause reason or a concurrent writer). Manual
 	 * pauses (pause_reason='manual' or 'failure_threshold') are not touched.
 	 *
 	 * Stays in sync with SessionStrategy.select() via the shared predicate —
 	 * keep changes there mirrored here.
 	 */
-	private autoUnpauseElapsedAccounts(accounts: Account[], now: number): void {
+	private async autoUnpauseElapsedAccounts(
+		accounts: Account[],
+		now: number,
+	): Promise<void> {
 		if (!this.store?.resumeAccount) return;
 
 		for (const account of accounts) {
@@ -180,8 +185,14 @@ export class LeastUsedStrategy implements LoadBalancingStrategy {
 			this.log.info(
 				`Auto-unpausing ${account.name} (pause_reason=${account.pause_reason ?? "null"}) — usage window has reset`,
 			);
-			this.store.resumeAccount(account.id);
-			account.paused = false;
+			const { resumed } = await this.store.resumeAccount(account.id);
+			if (resumed) {
+				account.paused = false;
+			} else {
+				this.log.info(
+					`Store refused to resume ${account.name} — leaving it paused for this pass`,
+				);
+			}
 		}
 	}
 }

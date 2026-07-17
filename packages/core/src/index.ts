@@ -22,6 +22,7 @@ export {
 	PAUSE_REASON_NEEDS_REAUTH,
 	ProviderError,
 	RateLimitError,
+	REAUTHENTICATION_REQUIRED_CODE,
 	ServiceUnavailableError,
 	TokenRefreshError,
 	ValidationError,

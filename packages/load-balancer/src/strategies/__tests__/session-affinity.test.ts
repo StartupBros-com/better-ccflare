@@ -52,8 +52,11 @@ class MockStore implements StrategyStore {
 	resetAccountSession(accountId: string, timestamp: number): void {
 		this.resetCalls.push({ accountId, timestamp });
 	}
-	resumeAccount(accountId: string): void {
+	async resumeAccount(
+		accountId: string,
+	): Promise<{ resumed: boolean; pauseReason: string | null }> {
 		this.resumeCalls.push(accountId);
+		return { resumed: true, pauseReason: null };
 	}
 	// Mirror the StrategyStore signature exactly (accountId, provider) so the
 	// mock can't silently diverge from the contract — provider is unused here.
@@ -86,37 +89,37 @@ describe("SessionAffinityStrategy", () => {
 		strategy.initialize(store);
 	});
 
-	it("assigns a new client an account and sticks it there (sticky)", () => {
+	it("assigns a new client an account and sticks it there (sticky)", async () => {
 		const accounts = [
 			makeAccount({ id: "x" }),
 			makeAccount({ id: "y" }),
 			makeAccount({ id: "z" }),
 		];
 
-		const first = strategy.select(accounts, metaFor("client-1"));
+		const first = await strategy.select(accounts, metaFor("client-1"));
 		const assigned = first[0].id;
 
 		// Subsequent selects with the same client id must keep returning the
 		// same account first, even though util/recency would otherwise rotate.
 		for (let i = 0; i < 5; i++) {
-			const next = strategy.select(accounts, metaFor("client-1"));
+			const next = await strategy.select(accounts, metaFor("client-1"));
 			expect(next[0].id).toBe(assigned);
 		}
 	});
 
-	it("spreads two different clients onto different accounts", () => {
+	it("spreads two different clients onto different accounts", async () => {
 		// Two equal accounts (priority 0, util 0). The recency penalty must push
 		// the second new client onto the other account.
 		const accounts = [makeAccount({ id: "x" }), makeAccount({ id: "y" })];
 
-		const a = strategy.select(accounts, metaFor("client-a"))[0].id;
-		const b = strategy.select(accounts, metaFor("client-b"))[0].id;
+		const a = (await strategy.select(accounts, metaFor("client-a")))[0].id;
+		const b = (await strategy.select(accounts, metaFor("client-b")))[0].id;
 
 		expect(a).not.toBe(b);
 		expect(new Set([a, b])).toEqual(new Set(["x", "y"]));
 	});
 
-	it("keeps independent Fable and Opus owners for the same client session", () => {
+	it("keeps independent Fable and Opus owners for the same client session", async () => {
 		const accounts = [makeAccount({ id: "x" }), makeAccount({ id: "y" })];
 		const fableMeta = {
 			...metaFor("same-client"),
@@ -127,15 +130,15 @@ describe("SessionAffinityStrategy", () => {
 			affinityLaneKey: "same-client:anthropic:opus",
 		} as RequestMeta;
 
-		const fableOwner = strategy.select(accounts, fableMeta)[0].id;
-		const opusOwner = strategy.select(accounts, opusMeta)[0].id;
+		const fableOwner = (await strategy.select(accounts, fableMeta))[0].id;
+		const opusOwner = (await strategy.select(accounts, opusMeta))[0].id;
 
 		expect(opusOwner).not.toBe(fableOwner);
-		expect(strategy.select(accounts, fableMeta)[0].id).toBe(fableOwner);
-		expect(strategy.select(accounts, opusMeta)[0].id).toBe(opusOwner);
+		expect((await strategy.select(accounts, fableMeta))[0].id).toBe(fableOwner);
+		expect((await strategy.select(accounts, opusMeta))[0].id).toBe(opusOwner);
 	});
 
-	it("replaces a sticky lower-priority owner when a better tier becomes routable", () => {
+	it("replaces a sticky lower-priority owner when a better tier becomes routable", async () => {
 		const low = makeAccount({ id: "low", priority: 1 });
 		const high = makeAccount({ id: "high", priority: 0 });
 		const laneMeta = {
@@ -143,14 +146,16 @@ describe("SessionAffinityStrategy", () => {
 			affinityLaneKey: "same-client:anthropic:opus",
 		} as RequestMeta;
 
-		expect(strategy.select([low], laneMeta)[0].id).toBe("low");
-		expect(strategy.select([low, high], laneMeta)[0].id).toBe("high");
+		expect((await strategy.select([low], laneMeta))[0].id).toBe("low");
+		expect((await strategy.select([low, high], laneMeta))[0].id).toBe("high");
 		// The better-tier owner replaces the old mapping; making the two accounts
 		// equal later must not resurrect the displaced lower-tier owner.
 		expect(
-			strategy.select(
-				[low, makeAccount({ id: "high", priority: 1 })],
-				laneMeta,
+			(
+				await strategy.select(
+					[low, makeAccount({ id: "high", priority: 1 })],
+					laneMeta,
+				)
 			)[0].id,
 		).toBe("high");
 
@@ -158,10 +163,12 @@ describe("SessionAffinityStrategy", () => {
 			...laneMeta,
 			hardExcludedAccountIds: new Set(["high"]),
 		} as RequestMeta;
-		expect(strategy.select([low, high], highExcluded)[0].id).toBe("low");
+		expect((await strategy.select([low, high], highExcluded))[0].id).toBe(
+			"low",
+		);
 	});
 
-	it("preserves a temporarily excluded owner only when its tier is strictly better", () => {
+	it("preserves a temporarily excluded owner only when its tier is strictly better", async () => {
 		const x = makeAccount({ id: "x", priority: 0 });
 		const y = makeAccount({ id: "y", priority: 1 });
 		const laneMeta = {
@@ -169,36 +176,38 @@ describe("SessionAffinityStrategy", () => {
 			affinityLaneKey: "same-client:anthropic:fable",
 		} as RequestMeta;
 
-		expect(strategy.select([x], laneMeta)[0].id).toBe("x");
+		expect((await strategy.select([x], laneMeta))[0].id).toBe("x");
 		expect(
-			strategy.select([y], {
-				...laneMeta,
-				routingCandidateCatalog: [
-					{
-						candidateId: "account:x",
-						accountId: "x",
-						tier: 0,
-						ordinal: 0,
-						comboSlotId: null,
-						modelOverride: "claude-fable-5",
-						quotaPressure: null,
-					},
-					{
-						candidateId: "account:y",
-						accountId: "y",
-						tier: 1,
-						ordinal: 1,
-						comboSlotId: null,
-						modelOverride: "claude-fable-5",
-						quotaPressure: null,
-					},
-				],
-			} as RequestMeta)[0].id,
+			(
+				await strategy.select([y], {
+					...laneMeta,
+					routingCandidateCatalog: [
+						{
+							candidateId: "account:x",
+							accountId: "x",
+							tier: 0,
+							ordinal: 0,
+							comboSlotId: null,
+							modelOverride: "claude-fable-5",
+							quotaPressure: null,
+						},
+						{
+							candidateId: "account:y",
+							accountId: "y",
+							tier: 1,
+							ordinal: 1,
+							comboSlotId: null,
+							modelOverride: "claude-fable-5",
+							quotaPressure: null,
+						},
+					],
+				} as RequestMeta)
+			)[0].id,
 		).toBe("y");
-		expect(strategy.select([x, y], laneMeta)[0].id).toBe("x");
+		expect((await strategy.select([x, y], laneMeta))[0].id).toBe("x");
 	});
 
-	it("remaps an unavailable equal-tier owner instead of snapping back", () => {
+	it("remaps an unavailable equal-tier owner instead of snapping back", async () => {
 		const x = makeAccount({ id: "x", priority: 0 });
 		const y = makeAccount({ id: "y", priority: 0 });
 		const laneMeta = {
@@ -206,17 +215,19 @@ describe("SessionAffinityStrategy", () => {
 			affinityLaneKey: "equal-tier-client:anthropic:fable",
 		} as RequestMeta;
 
-		expect(strategy.select([x], laneMeta)[0].id).toBe("x");
+		expect((await strategy.select([x], laneMeta))[0].id).toBe("x");
 		expect(
-			strategy.select([x, y], {
-				...laneMeta,
-				hardExcludedAccountIds: new Set(["x"]),
-			} as RequestMeta)[0].id,
+			(
+				await strategy.select([x, y], {
+					...laneMeta,
+					hardExcludedAccountIds: new Set(["x"]),
+				} as RequestMeta)
+			)[0].id,
 		).toBe("y");
-		expect(strategy.select([x, y], laneMeta)[0].id).toBe("y");
+		expect((await strategy.select([x, y], laneMeta))[0].id).toBe("y");
 	});
 
-	it("remaps an unavailable worse-tier owner", () => {
+	it("remaps an unavailable worse-tier owner", async () => {
 		const worse = makeAccount({ id: "worse", priority: 1 });
 		const better = makeAccount({ id: "better", priority: 0 });
 		const laneMeta = {
@@ -224,30 +235,34 @@ describe("SessionAffinityStrategy", () => {
 			affinityLaneKey: "worse-tier-client:anthropic:opus",
 		} as RequestMeta;
 
-		expect(strategy.select([worse], laneMeta)[0].id).toBe("worse");
+		expect((await strategy.select([worse], laneMeta))[0].id).toBe("worse");
 		expect(
-			strategy.select([worse, better], {
-				...laneMeta,
-				hardExcludedAccountIds: new Set(["worse"]),
-			} as RequestMeta)[0].id,
+			(
+				await strategy.select([worse, better], {
+					...laneMeta,
+					hardExcludedAccountIds: new Set(["worse"]),
+				} as RequestMeta)
+			)[0].id,
 		).toBe("better");
-		expect(strategy.select([worse, better], laneMeta)[0].id).toBe("better");
+		expect((await strategy.select([worse, better], laneMeta))[0].id).toBe(
+			"better",
+		);
 	});
 
-	it("does not create affinity when every account is hard-excluded", () => {
+	it("does not create affinity when every account is hard-excluded", async () => {
 		const requestMeta = {
 			...metaFor("same-client"),
 			affinityLaneKey: "same-client:anthropic:fable",
 			hardExcludedAccountIds: new Set(["x"]),
 		} as RequestMeta;
 
-		expect(strategy.select([makeAccount({ id: "x" })], requestMeta)).toEqual(
-			[],
-		);
+		expect(
+			await strategy.select([makeAccount({ id: "x" })], requestMeta),
+		).toEqual([]);
 		expect(strategy.affinityEntries).toBe(0);
 	});
 
-	it("replaces a sticky owner when comparable pressure outclasses it", () => {
+	it("replaces a sticky owner when comparable pressure outclasses it", async () => {
 		const cold = makeAccount({ id: "cold" });
 		const critical = makeAccount({ id: "critical" });
 		const baseMeta = {
@@ -255,7 +270,7 @@ describe("SessionAffinityStrategy", () => {
 			affinityLaneKey: "same-client:anthropic:fable",
 		} as RequestMeta;
 
-		expect(strategy.select([cold], baseMeta)[0].id).toBe("cold");
+		expect((await strategy.select([cold], baseMeta))[0].id).toBe("cold");
 		const pressureMeta = {
 			...baseMeta,
 			quotaPressureByAccountId: new Map([
@@ -263,28 +278,32 @@ describe("SessionAffinityStrategy", () => {
 				["critical", { band: "critical", comparisonKey: "same" }],
 			]),
 		} as RequestMeta;
-		expect(strategy.select([cold, critical], pressureMeta)[0].id).toBe(
+		expect((await strategy.select([cold, critical], pressureMeta))[0].id).toBe(
 			"critical",
 		);
 		expect(
-			strategy.select([cold, critical], {
-				...baseMeta,
-				quotaPressureByAccountId: new Map([
-					["cold", { band: "steady", comparisonKey: "same" }],
-					["critical", { band: "steady", comparisonKey: "same" }],
-				]),
-			} as RequestMeta)[0].id,
+			(
+				await strategy.select([cold, critical], {
+					...baseMeta,
+					quotaPressureByAccountId: new Map([
+						["cold", { band: "steady", comparisonKey: "same" }],
+						["critical", { band: "steady", comparisonKey: "same" }],
+					]),
+				} as RequestMeta)
+			)[0].id,
 		).toBe("critical");
 
 		expect(
-			strategy.select([cold, critical], {
-				...pressureMeta,
-				hardExcludedAccountIds: new Set(["critical"]),
-			} as RequestMeta)[0].id,
+			(
+				await strategy.select([cold, critical], {
+					...pressureMeta,
+					hardExcludedAccountIds: new Set(["critical"]),
+				} as RequestMeta)
+			)[0].id,
 		).toBe("cold");
 	});
 
-	it("temporarily fails over from a better-tier owner and snaps back", () => {
+	it("temporarily fails over from a better-tier owner and snaps back", async () => {
 		const x = makeAccount({ id: "x", priority: 0 });
 		const y = makeAccount({ id: "y", priority: 1 });
 		store.setUtil("x", 0);
@@ -293,7 +312,7 @@ describe("SessionAffinityStrategy", () => {
 		// Pin client-1 to whichever account it gets (force it to x via util).
 		store.setUtil("x", 0);
 		store.setUtil("y", 50);
-		const assigned = strategy.select([x, y], metaFor("client-1"))[0].id;
+		const assigned = (await strategy.select([x, y], metaFor("client-1")))[0].id;
 		expect(assigned).toBe("x");
 
 		// x becomes rate-limited.
@@ -301,37 +320,38 @@ describe("SessionAffinityStrategy", () => {
 			id: "x",
 			rate_limited_until: Date.now() + 60_000,
 		});
-		const failover = strategy.select([xDown, y], metaFor("client-1"));
+		const failover = await strategy.select([xDown, y], metaFor("client-1"));
 		// Must route to an available account (y), not the down one.
 		expect(failover[0].id).toBe("y");
 		expect(failover.every((a) => a.id !== "x")).toBe(true);
 
 		// x recovers → client snaps back to x (mapping was never deleted).
-		const recovered = strategy.select(
+		const recovered = await strategy.select(
 			[makeAccount({ id: "x" }), y],
 			metaFor("client-1"),
 		);
 		expect(recovered[0].id).toBe("x");
 	});
 
-	it("falls back to least-used when no clientSessionId is present", () => {
+	it("falls back to least-used when no clientSessionId is present", async () => {
 		store.setUtil("low", 10);
 		store.setUtil("high", 90);
 		const accounts = [makeAccount({ id: "high" }), makeAccount({ id: "low" })];
 
-		const ordered = strategy.select(accounts, metaFor(null));
+		const ordered = await strategy.select(accounts, metaFor(null));
 		expect(ordered[0].id).toBe("low");
 		expect(ordered.map((a) => a.id).sort()).toEqual(["high", "low"]);
 	});
 
-	it("GCs an expired affinity mapping and reassigns", () => {
+	it("GCs an expired affinity mapping and reassigns", async () => {
 		// Tiny TTL so the mapping expires between selects.
 		const ttlStrategy = new SessionAffinityStrategy(1);
 		ttlStrategy.initialize(store);
 
 		const accounts = [makeAccount({ id: "x" }), makeAccount({ id: "y" })];
 
-		const first = ttlStrategy.select(accounts, metaFor("client-1"))[0].id;
+		const first = (await ttlStrategy.select(accounts, metaFor("client-1")))[0]
+			.id;
 
 		// Let the TTL elapse.
 		const start = Date.now();
@@ -345,24 +365,25 @@ describe("SessionAffinityStrategy", () => {
 		store.setUtil(first, 90);
 		store.setUtil(other, 0);
 
-		const second = ttlStrategy.select(accounts, metaFor("client-1"))[0].id;
+		const second = (await ttlStrategy.select(accounts, metaFor("client-1")))[0]
+			.id;
 		expect(second).toBe(other);
 	});
 
-	it("returns [] when all accounts are unavailable", () => {
+	it("returns [] when all accounts are unavailable", async () => {
 		const accounts = [
 			makeAccount({ id: "p1", paused: true }),
 			makeAccount({ id: "rl1", rate_limited_until: Date.now() + 60_000 }),
 		];
-		expect(strategy.select(accounts, metaFor("client-1"))).toEqual([]);
+		expect(await strategy.select(accounts, metaFor("client-1"))).toEqual([]);
 	});
 
-	it("spreads concurrent failovers across backups instead of piling onto one", () => {
+	it("spreads concurrent failovers across backups instead of piling onto one", async () => {
 		// Pin two clients to the SAME account x (it's the only account at
 		// assignment time), then bring x down with two equal healthy backups.
 		const x = makeAccount({ id: "x" });
-		strategy.select([x], metaFor("c1"));
-		strategy.select([x], metaFor("c2"));
+		await strategy.select([x], metaFor("c1"));
+		await strategy.select([x], metaFor("c2"));
 
 		const xDown = makeAccount({
 			id: "x",
@@ -373,8 +394,8 @@ describe("SessionAffinityStrategy", () => {
 		store.setUtil("y", 0);
 		store.setUtil("z", 0);
 
-		const f1 = strategy.select([xDown, y, z], metaFor("c1"))[0].id;
-		const f2 = strategy.select([xDown, y, z], metaFor("c2"))[0].id;
+		const f1 = (await strategy.select([xDown, y, z], metaFor("c1")))[0].id;
+		const f2 = (await strategy.select([xDown, y, z], metaFor("c2")))[0].id;
 
 		// Both fail off the down account, and onto DIFFERENT backups — the
 		// failover path now marks lastPickedAt, so the second failover is steered
@@ -385,7 +406,7 @@ describe("SessionAffinityStrategy", () => {
 		expect(new Set([f1, f2])).toEqual(new Set(["y", "z"]));
 	});
 
-	it("caps the affinity map under a flood of unique client ids", () => {
+	it("caps the affinity map under a flood of unique client ids", async () => {
 		const cap = 5;
 		const capped = new SessionAffinityStrategy(60_000, cap);
 		capped.initialize(store);
@@ -394,7 +415,7 @@ describe("SessionAffinityStrategy", () => {
 		// Far more distinct client ids than the cap (simulates adversarial /
 		// buggy callers sending many metadata.user_id values).
 		for (let i = 0; i < cap * 4; i++) {
-			capped.select([x], metaFor(`client-${i}`));
+			await capped.select([x], metaFor(`client-${i}`));
 		}
 
 		expect(capped.affinityEntries).toBe(cap);
@@ -420,7 +441,7 @@ describe("SessionAffinityStrategy", () => {
 			).toBeNull();
 		});
 	});
-	it("does not own xAI cache affinity inside the generic session strategy", () => {
+	it("does not own xAI cache affinity inside the generic session strategy", async () => {
 		const accounts = [
 			makeAccount({ id: "a", provider: "xai" }),
 			makeAccount({ id: "b", provider: "xai" }),
@@ -431,13 +452,47 @@ describe("SessionAffinityStrategy", () => {
 			xaiCacheNativeActive: true,
 			xaiCacheEligibleAccountIds: new Set(["a", "b"]),
 		} as RequestMeta;
-		const first = strategy.select(accounts, convoMeta)[0].id;
-		const second = strategy.select(accounts, {
-			...metaFor(null),
-			cacheAffinityKey: "ccflare-xai-convo-1",
-			xaiCacheNativeActive: true,
-			xaiCacheEligibleAccountIds: new Set(["a", "b"]),
-		} as RequestMeta)[0].id;
+		const first = (await strategy.select(accounts, convoMeta))[0].id;
+		const second = (
+			await strategy.select(accounts, {
+				...metaFor(null),
+				cacheAffinityKey: "ccflare-xai-convo-1",
+				xaiCacheNativeActive: true,
+				xaiCacheEligibleAccountIds: new Set(["a", "b"]),
+			} as RequestMeta)
+		)[0].id;
 		expect(second).not.toBe(first);
+	});
+
+	describe("non-optimistic auto-unpause (wouldAutoUnpause path)", () => {
+		it("does not select or unpause an account when store.resumeAccount resolves resumed:false", async () => {
+			// Eligible-looking for wouldAutoUnpause: paused, auto_fallback_enabled,
+			// safe pause_reason, anthropic provider, elapsed rate_limit_reset. A
+			// racy store (e.g. it lost the resume to a concurrent guard, or the
+			// account was re-paused between the check and the write) reports
+			// resumed:false. autoUnpauseElapsedAccounts must not optimistically
+			// flip account.paused to false or select the account on this pass.
+			const account = makeAccount({
+				id: "racy",
+				paused: true,
+				pause_reason: "overage",
+				auto_fallback_enabled: true,
+				rate_limit_reset: Date.now() - 5_000,
+			});
+
+			const racyStore: StrategyStore = {
+				resetAccountSession() {},
+				resumeAccount: async () => ({
+					resumed: false,
+					pauseReason: "overage",
+				}),
+			};
+			strategy.initialize(racyStore);
+
+			const result = await strategy.select([account], metaFor("client-racy"));
+
+			expect(account.paused).toBe(true);
+			expect(result.find((a) => a.id === "racy")).toBeUndefined();
+		});
 	});
 });

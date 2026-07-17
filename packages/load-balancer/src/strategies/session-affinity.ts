@@ -200,7 +200,7 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 		);
 	}
 
-	select(accounts: Account[], meta: RequestMeta): Account[] {
+	async select(accounts: Account[], meta: RequestMeta): Promise<Account[]> {
 		const now = Date.now();
 		const configuredCandidates = zipStrategyCandidates(accounts, meta);
 		const candidates = filterHardExcludedCandidates(configuredCandidates, meta);
@@ -209,7 +209,7 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 		// Mirrors LeastUsedStrategy.autoUnpauseElapsedAccounts so users with
 		// auto_fallback_enabled accounts get the same self-recovery behaviour
 		// regardless of which strategy they pick.
-		this.autoUnpauseElapsedAccounts(
+		await this.autoUnpauseElapsedAccounts(
 			candidates.map((candidate) => candidate.account),
 			now,
 		);
@@ -341,14 +341,18 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 	/**
 	 * Auto-unpause any account that {@link wouldAutoUnpause} reports as eligible
 	 * (auto_fallback_enabled + safe pause_reason + window elapsed). Mutates the
-	 * in-memory account.paused flag to false on resume so the subsequent
-	 * isAccountAvailable check reflects the new state.
+	 * in-memory account.paused flag to false only once the store confirms the
+	 * resume actually happened (`resumed === true`), so the subsequent
+	 * isAccountAvailable check never reflects a resume the DB refused.
 	 *
 	 * Stays in sync with SessionStrategy.select() and
 	 * LeastUsedStrategy.autoUnpauseElapsedAccounts() via the shared predicate —
 	 * keep changes there mirrored here.
 	 */
-	private autoUnpauseElapsedAccounts(accounts: Account[], now: number): void {
+	private async autoUnpauseElapsedAccounts(
+		accounts: Account[],
+		now: number,
+	): Promise<void> {
 		if (!this.store?.resumeAccount) return;
 
 		for (const account of accounts) {
@@ -357,8 +361,14 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 			this.log.info(
 				`Auto-unpausing ${account.name} (pause_reason=${account.pause_reason ?? "null"}) — usage window has reset`,
 			);
-			this.store.resumeAccount(account.id);
-			account.paused = false;
+			const { resumed } = await this.store.resumeAccount(account.id);
+			if (resumed) {
+				account.paused = false;
+			} else {
+				this.log.info(
+					`Store refused to resume ${account.name} — leaving it paused for this pass`,
+				);
+			}
 		}
 	}
 }

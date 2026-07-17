@@ -52,8 +52,11 @@ class MockStrategyStore implements StrategyStore {
 		this.resetCalls.push({ accountId, timestamp });
 	}
 
-	resumeAccount(accountId: string): void {
+	async resumeAccount(
+		accountId: string,
+	): Promise<{ resumed: boolean; pauseReason: string | null }> {
 		this.resumeCalls.push(accountId);
+		return { resumed: true, pauseReason: null };
 	}
 
 	getAccountUtilization(accountId: string, _provider: string): number | null {
@@ -106,7 +109,7 @@ describe("SessionStrategy", () => {
 		mockStore.clear();
 	});
 
-	it("should reset session when rate limit window has reset", () => {
+	it("should reset session when rate limit window has reset", async () => {
 		const sessionStart = Date.now() - 2 * 60 * 60 * 1000;
 		const account = makeAccount({
 			id: "test-account-1",
@@ -116,7 +119,7 @@ describe("SessionStrategy", () => {
 			rate_limit_reset: Date.now() - 2000, // Reset 2s ago (expired, with 1s buffer)
 		});
 
-		const result = strategy.select([account], meta);
+		const result = await strategy.select([account], meta);
 
 		expect(result[0]).toBe(account);
 		expect(result).toHaveLength(1);
@@ -130,7 +133,7 @@ describe("SessionStrategy", () => {
 		expect(account.session_request_count).toBe(0);
 	});
 
-	it("should work normally for non-Anthropic providers without session duration tracking", () => {
+	it("should work normally for non-Anthropic providers without session duration tracking", async () => {
 		const account = makeAccount({
 			id: "test-account-2",
 			name: "test-account-2",
@@ -146,7 +149,7 @@ describe("SessionStrategy", () => {
 		const originalSessionStart = account.session_start;
 		const originalRequestCount = account.session_request_count;
 
-		const result = strategy.select([account], meta);
+		const result = await strategy.select([account], meta);
 
 		expect(result[0]).toBe(account);
 		expect(result).toHaveLength(1);
@@ -158,7 +161,7 @@ describe("SessionStrategy", () => {
 		expect(account.session_request_count).toBe(originalRequestCount);
 	});
 
-	it("should work normally when rate_limit_reset is in the future", () => {
+	it("should work normally when rate_limit_reset is in the future", async () => {
 		const account = makeAccount({
 			id: "test-account-3",
 			name: "test-account-3",
@@ -170,7 +173,7 @@ describe("SessionStrategy", () => {
 		const originalSessionStart = account.session_start;
 		const originalRequestCount = account.session_request_count;
 
-		const result = strategy.select([account], meta);
+		const result = await strategy.select([account], meta);
 
 		expect(result[0]).toBe(account);
 		expect(result).toHaveLength(1);
@@ -182,7 +185,7 @@ describe("SessionStrategy", () => {
 		expect(account.session_request_count).toBe(originalRequestCount);
 	});
 
-	it("should reset session when both fixed duration and rate limit have expired for Anthropic accounts", () => {
+	it("should reset session when both fixed duration and rate limit have expired for Anthropic accounts", async () => {
 		const sessionStart = Date.now() - 6 * 60 * 60 * 1000;
 		const account = makeAccount({
 			id: "test-account-4",
@@ -192,7 +195,7 @@ describe("SessionStrategy", () => {
 			rate_limit_reset: Date.now() - 2000, // expired
 		});
 
-		const result = strategy.select([account], meta);
+		const result = await strategy.select([account], meta);
 
 		expect(result[0]).toBe(account);
 		expect(result).toHaveLength(1);
@@ -206,7 +209,7 @@ describe("SessionStrategy", () => {
 		expect(account.session_request_count).toBe(0);
 	});
 
-	it("should reset session when fixed duration expired for Anthropic accounts", () => {
+	it("should reset session when fixed duration expired for Anthropic accounts", async () => {
 		const sessionStart = Date.now() - 6 * 60 * 60 * 1000;
 		const account = makeAccount({
 			id: "test-account-5-anthropic",
@@ -215,7 +218,7 @@ describe("SessionStrategy", () => {
 			session_request_count: 10,
 		});
 
-		const result = strategy.select([account], meta);
+		const result = await strategy.select([account], meta);
 
 		expect(result[0]).toBe(account);
 		expect(result).toHaveLength(1);
@@ -229,7 +232,7 @@ describe("SessionStrategy", () => {
 		expect(account.session_request_count).toBe(0);
 	});
 
-	it("should reset session when fixed duration expired for zai accounts (zai has session tracking)", () => {
+	it("should reset session when fixed duration expired for zai accounts (zai has session tracking)", async () => {
 		const sessionStart = Date.now() - 6 * 60 * 60 * 1000;
 		const account = makeAccount({
 			id: "test-account-6-non-anthropic",
@@ -243,7 +246,7 @@ describe("SessionStrategy", () => {
 			session_request_count: 10,
 		});
 
-		const result = strategy.select([account], meta);
+		const result = await strategy.select([account], meta);
 
 		expect(result[0]).toBe(account);
 		expect(result).toHaveLength(1);
@@ -257,7 +260,7 @@ describe("SessionStrategy", () => {
 		expect(account.session_request_count).toBe(0);
 	});
 
-	it("should work normally when rate_limit_reset is explicitly null", () => {
+	it("should work normally when rate_limit_reset is explicitly null", async () => {
 		const account = makeAccount({
 			id: "test-account-5",
 			name: "test-account-5",
@@ -268,7 +271,7 @@ describe("SessionStrategy", () => {
 		const originalSessionStart = account.session_start;
 		const originalRequestCount = account.session_request_count;
 
-		const result = strategy.select([account], meta);
+		const result = await strategy.select([account], meta);
 
 		expect(result[0]).toBe(account);
 		expect(result).toHaveLength(1);
@@ -280,7 +283,7 @@ describe("SessionStrategy", () => {
 		expect(account.session_request_count).toBe(originalRequestCount);
 	});
 
-	it("should not reset session when rate_limit_reset equals current time (boundary condition)", () => {
+	it("should not reset session when rate_limit_reset equals current time (boundary condition)", async () => {
 		const now = Date.now();
 		const account = makeAccount({
 			id: "test-account-boundary",
@@ -295,7 +298,7 @@ describe("SessionStrategy", () => {
 		const originalSessionStart = account.session_start;
 		const originalRequestCount = account.session_request_count;
 
-		const result = strategy.select([account], meta);
+		const result = await strategy.select([account], meta);
 
 		expect(result[0]).toBe(account);
 		expect(result).toHaveLength(1);
@@ -307,7 +310,7 @@ describe("SessionStrategy", () => {
 		expect(account.session_request_count).toBe(originalRequestCount);
 	});
 
-	it("should reset session when rate_limit_reset is just less than now - 1000 (boundary condition)", () => {
+	it("should reset session when rate_limit_reset is just less than now - 1000 (boundary condition)", async () => {
 		const now = Date.now();
 		const sessionStart = now - 2 * 60 * 60 * 1000;
 		const account = makeAccount({
@@ -320,7 +323,7 @@ describe("SessionStrategy", () => {
 			rate_limit_reset: now - 1001, // 1001ms ago
 		});
 
-		const result = strategy.select([account], meta);
+		const result = await strategy.select([account], meta);
 
 		expect(result[0]).toBe(account);
 		expect(result).toHaveLength(1);
@@ -334,7 +337,7 @@ describe("SessionStrategy", () => {
 		expect(account.session_request_count).toBe(0);
 	});
 
-	it("should handle multiple accounts with different rate limit reset scenarios", () => {
+	it("should handle multiple accounts with different rate limit reset scenarios", async () => {
 		const now = Date.now();
 
 		const account1 = makeAccount({
@@ -364,7 +367,7 @@ describe("SessionStrategy", () => {
 			priority: 2,
 		});
 
-		const result = strategy.select([account2, account3, account1], meta);
+		const result = await strategy.select([account2, account3, account1], meta);
 
 		expect(result[0]).toBe(account1);
 		expect(result).toHaveLength(3);
@@ -385,7 +388,7 @@ describe("SessionStrategy", () => {
 		expect(account3.session_request_count).toBe(0);
 	});
 
-	it("should handle auto-fallback with multiple accounts at boundary conditions", () => {
+	it("should handle auto-fallback with multiple accounts at boundary conditions", async () => {
 		const now = Date.now();
 
 		const account1 = makeAccount({
@@ -410,7 +413,7 @@ describe("SessionStrategy", () => {
 			auto_fallback_enabled: true,
 		});
 
-		const result = strategy.select([account2, account1], meta);
+		const result = await strategy.select([account2, account1], meta);
 
 		expect(result[0]).toBe(account1);
 		expect(result).toHaveLength(1);
@@ -420,7 +423,7 @@ describe("SessionStrategy", () => {
 		expect(account2.paused).toBe(true);
 	});
 
-	it("should handle unknown providers gracefully", () => {
+	it("should handle unknown providers gracefully", async () => {
 		const account = makeAccount({
 			id: "test-account-unknown",
 			name: "test-account-unknown",
@@ -436,7 +439,7 @@ describe("SessionStrategy", () => {
 		const originalSessionStart = account.session_start;
 		const originalRequestCount = account.session_request_count;
 
-		const result = strategy.select([account], meta);
+		const result = await strategy.select([account], meta);
 
 		expect(result[0]).toBe(account);
 		expect(result).toHaveLength(1);
@@ -448,7 +451,7 @@ describe("SessionStrategy", () => {
 		expect(account.session_request_count).toBe(originalRequestCount);
 	});
 
-	it("should not reset session for Claude console API accounts (pay-as-you-go, no session tracking)", () => {
+	it("should not reset session for Claude console API accounts (pay-as-you-go, no session tracking)", async () => {
 		const account = makeAccount({
 			id: "test-account-console-api",
 			name: "test-account-console-api",
@@ -465,7 +468,7 @@ describe("SessionStrategy", () => {
 		const originalSessionStart = account.session_start;
 		const originalRequestCount = account.session_request_count;
 
-		const result = strategy.select([account], meta);
+		const result = await strategy.select([account], meta);
 
 		expect(result[0]).toBe(account);
 		expect(result).toHaveLength(1);
@@ -492,7 +495,7 @@ describe("SessionStrategy", () => {
 	// the cached session naturally once the rate-limit window elapses.
 	// -------------------------------------------------------------------------
 
-	it("issue #115: yields session affinity when active account is currently rate-limited", () => {
+	it("issue #115: yields session affinity when active account is currently rate-limited", async () => {
 		const now = Date.now();
 
 		const throttled = makeAccount({
@@ -512,7 +515,7 @@ describe("SessionStrategy", () => {
 			expires_at: now + 3600_000,
 		});
 
-		const result = strategy.select([throttled, healthy], meta);
+		const result = await strategy.select([throttled, healthy], meta);
 
 		expect(result[0]).toBe(healthy);
 		expect(result.find((a) => a.id === throttled.id)).toBeUndefined();
@@ -522,7 +525,7 @@ describe("SessionStrategy", () => {
 		expect(throttled.session_request_count).toBe(50);
 	});
 
-	it("issue #115: resumes the original active session after rate-limit window elapses", () => {
+	it("issue #115: resumes the original active session after rate-limit window elapses", async () => {
 		const now = Date.now();
 
 		const recovered = makeAccount({
@@ -535,7 +538,7 @@ describe("SessionStrategy", () => {
 			session_request_count: 25,
 		});
 
-		const result = strategy.select([recovered], meta);
+		const result = await strategy.select([recovered], meta);
 
 		expect(result[0]).toBe(recovered);
 
@@ -546,7 +549,7 @@ describe("SessionStrategy", () => {
 		expect(recovered.session_request_count).toBe(25);
 	});
 
-	it("issue #115: throttled active account does not block lower-priority sibling", () => {
+	it("issue #115: throttled active account does not block lower-priority sibling", async () => {
 		const now = Date.now();
 
 		const throttledHighPriority = makeAccount({
@@ -568,7 +571,7 @@ describe("SessionStrategy", () => {
 			priority: 1,
 		});
 
-		const result = strategy.select(
+		const result = await strategy.select(
 			[throttledHighPriority, lowerPriority],
 			meta,
 		);
@@ -584,7 +587,7 @@ describe("SessionStrategy", () => {
 	// -------------------------------------------------------------------------
 
 	describe("usage-balanced tiebreaking for same-priority accounts", () => {
-		it("does not select or reset a hard-excluded active session", () => {
+		it("does not select or reset a hard-excluded active session", async () => {
 			const activeStart = Date.now() - 60_000;
 			const excludedActive = makeAccount({
 				id: "excluded-active",
@@ -599,17 +602,16 @@ describe("SessionStrategy", () => {
 				priority: 1,
 			});
 
-			expect(
-				strategy.select([excludedActive, eligible], {
-					...meta,
-					hardExcludedAccountIds: new Set(["excluded-active"]),
-				} as RequestMeta),
-			).toEqual([eligible]);
+			const result = await strategy.select([excludedActive, eligible], {
+				...meta,
+				hardExcludedAccountIds: new Set(["excluded-active"]),
+			} as RequestMeta);
+			expect(result).toEqual([eligible]);
 			expect(excludedActive.session_start).toBe(activeStart);
 			expect(mockStore.getResetCall("excluded-active")).toBeUndefined();
 		});
 
-		it("lets comparable quota pressure outclass an active same-priority session", () => {
+		it("lets comparable quota pressure outclass an active same-priority session", async () => {
 			const activeStart = Date.now() - 60_000;
 			const activeCold = makeAccount({
 				id: "active-cold",
@@ -631,20 +633,21 @@ describe("SessionStrategy", () => {
 				]),
 			} as RequestMeta;
 
-			expect(strategy.select([activeCold, critical], pressureMeta)[0]).toBe(
-				critical,
+			const pressureResult = await strategy.select(
+				[activeCold, critical],
+				pressureMeta,
 			);
+			expect(pressureResult[0]).toBe(critical);
 			expect(activeCold.session_start).toBe(activeStart);
 
-			expect(
-				strategy.select([activeCold, critical], {
-					...pressureMeta,
-					hardExcludedAccountIds: new Set(["critical"]),
-				} as RequestMeta)[0],
-			).toBe(activeCold);
+			const excludedResult = await strategy.select([activeCold, critical], {
+				...pressureMeta,
+				hardExcludedAccountIds: new Set(["critical"]),
+			} as RequestMeta);
+			expect(excludedResult[0]).toBe(activeCold);
 		});
 
-		it("selects account with lower utilization when priorities are equal", () => {
+		it("selects account with lower utilization when priorities are equal", async () => {
 			const now = Date.now();
 
 			const highUtil = makeAccount({
@@ -666,14 +669,14 @@ describe("SessionStrategy", () => {
 			mockStore.setUtilization("high-util", 80);
 			mockStore.setUtilization("low-util", 20);
 
-			const result = strategy.select([highUtil, lowUtil], meta);
+			const result = await strategy.select([highUtil, lowUtil], meta);
 
 			// low-util has more headroom → should be selected first
 			expect(result[0]).toBe(lowUtil);
 			expect(result[1]).toBe(highUtil);
 		});
 
-		it("sorts null-utilization accounts first (treated as 0%, fresh account)", () => {
+		it("sorts null-utilization accounts first (treated as 0%, fresh account)", async () => {
 			const now = Date.now();
 
 			const withData = makeAccount({
@@ -695,14 +698,14 @@ describe("SessionStrategy", () => {
 			mockStore.setUtilization("with-data", 50);
 			// no-data has no entry in utilizationMap → returns null → treated as 0
 
-			const result = strategy.select([withData, noData], meta);
+			const result = await strategy.select([withData, noData], meta);
 
 			// noData treated as 0% → selected first; withData (50%) sorts after
 			expect(result[0]).toBe(noData);
 			expect(result[1]).toBe(withData);
 		});
 
-		it("should treat null utilization as 0 (fresh account)", () => {
+		it("should treat null utilization as 0 (fresh account)", async () => {
 			const now = Date.now();
 
 			const accountA = makeAccount({
@@ -724,14 +727,14 @@ describe("SessionStrategy", () => {
 			mockStore.setUtilization("account-a-50pct", 50);
 			// account-b-null has no utilization data at all → null → treated as 0
 
-			const result = strategy.select([accountA, accountB], meta);
+			const result = await strategy.select([accountA, accountB], meta);
 
 			// account-b-null (null=0%) has more headroom than account-a-50pct (50%) → selected first
 			expect(result[0]).toBe(accountB);
 			expect(result[1]).toBe(accountA);
 		});
 
-		it("does not panic when both accounts have no utilization data", () => {
+		it("does not panic when both accounts have no utilization data", async () => {
 			const now = Date.now();
 
 			const a = makeAccount({
@@ -752,7 +755,7 @@ describe("SessionStrategy", () => {
 
 			// Neither account has utilization data
 
-			const result = strategy.select([a, b], meta);
+			const result = await strategy.select([a, b], meta);
 
 			// Both accounts are returned — order is stable (0 vs 0 → no swap)
 			expect(result).toHaveLength(2);
@@ -760,7 +763,7 @@ describe("SessionStrategy", () => {
 			expect(result).toContain(b);
 		});
 
-		it("priority still wins over utilization for different-priority accounts", () => {
+		it("priority still wins over utilization for different-priority accounts", async () => {
 			const now = Date.now();
 
 			// Higher priority (lower number) but higher utilization
@@ -784,7 +787,7 @@ describe("SessionStrategy", () => {
 			mockStore.setUtilization("high-pri-high-util", 90);
 			mockStore.setUtilization("low-pri-low-util", 10);
 
-			const result = strategy.select(
+			const result = await strategy.select(
 				[lowPriorityLowUtil, highPriorityHighUtil],
 				meta,
 			);
@@ -800,7 +803,7 @@ describe("SessionStrategy", () => {
 		// auto-fallback account with safe pause_reason and an elapsed
 		// rate_limit_reset window must surface as the would-be Primary
 		// in peek() too, otherwise the dashboard flags the wrong account.
-		it("returns the paused-but-auto-unpausable account that select() picks", () => {
+		it("returns the paused-but-auto-unpausable account that select() picks", async () => {
 			const past = Date.now() - 60_000;
 			const paused = makeAccount({
 				id: "p0-paused",
@@ -814,7 +817,7 @@ describe("SessionStrategy", () => {
 
 			expect(strategy.peek([paused, ready])).toBe("p0-paused");
 			// And select() agrees.
-			const selected = strategy.select([paused, ready], meta);
+			const selected = await strategy.select([paused, ready], meta);
 			expect(selected[0]?.id).toBe("p0-paused");
 		});
 

@@ -5,6 +5,8 @@ import { join } from "node:path";
 import type { Config } from "@better-ccflare/config";
 import type { ModelMapping } from "@better-ccflare/core";
 import {
+	PAUSE_REASON_NEEDS_REAUTH,
+	REAUTHENTICATION_REQUIRED_CODE,
 	validateAndSanitizeModelFallbacks,
 	validateAndSanitizeModelMappings,
 	validateApiKey,
@@ -1895,7 +1897,7 @@ async function toggleAccountPause(
 	dbOps: DatabaseOperations,
 	name: string,
 	shouldPause: boolean,
-): Promise<{ success: boolean; message: string }> {
+): Promise<{ success: boolean; message: string; code?: string }> {
 	const adapter = dbOps.getAdapter();
 
 	// Get account ID by name
@@ -1924,7 +1926,22 @@ async function toggleAccountPause(
 	if (shouldPause) {
 		await dbOps.pauseAccount(account.id);
 	} else {
-		await dbOps.resumeAccount(account.id);
+		const result = await dbOps.resumeAccount(account.id);
+		if (!result.resumed) {
+			if (result.pauseReason === PAUSE_REASON_NEEDS_REAUTH) {
+				return {
+					success: false,
+					message: `Account '${name}' needs reauthentication before it can be resumed: its stored refresh token was rejected by the provider`,
+					code: REAUTHENTICATION_REQUIRED_CODE,
+				};
+			}
+			// Guard declined for some other reason (e.g. a concurrent action
+			// already resumed it). Fall back to the generic message.
+			return {
+				success: false,
+				message: `Account '${name}' is already resumed`,
+			};
+		}
 	}
 
 	return {
@@ -1939,7 +1956,7 @@ async function toggleAccountPause(
 export async function pauseAccount(
 	dbOps: DatabaseOperations,
 	name: string,
-): Promise<{ success: boolean; message: string }> {
+): Promise<{ success: boolean; message: string; code?: string }> {
 	return toggleAccountPause(dbOps, name, true);
 }
 
@@ -1949,7 +1966,7 @@ export async function pauseAccount(
 export async function resumeAccount(
 	dbOps: DatabaseOperations,
 	name: string,
-): Promise<{ success: boolean; message: string }> {
+): Promise<{ success: boolean; message: string; code?: string }> {
 	return toggleAccountPause(dbOps, name, false);
 }
 

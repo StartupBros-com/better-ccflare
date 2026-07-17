@@ -73,8 +73,12 @@ export interface LoadBalancingStrategy {
 	 * Return a filtered & ordered list of candidate accounts.
 	 * Accounts that are rate-limited should be filtered out.
 	 * The first account in the list should be tried first.
+	 *
+	 * Async because implementations may need to await StrategyStore.resumeAccount
+	 * (auto-unpause) and only include an account once the DB confirms it actually
+	 * resumed it.
 	 */
-	select(accounts: Account[], meta: RequestMeta): Account[];
+	select(accounts: Account[], meta: RequestMeta): Promise<Account[]>;
 
 	/**
 	 * Side-effect-free preview: return the ID of the account that would

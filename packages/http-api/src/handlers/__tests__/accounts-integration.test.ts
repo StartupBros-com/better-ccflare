@@ -1,4 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import type { Config } from "@better-ccflare/config";
+import { DatabaseOperations } from "@better-ccflare/database";
+import {
+	createAccountResumeHandler,
+	createAccountsListHandler,
+} from "../accounts";
 
 // Mock the usage fetcher functions directly
 const mockUsageCache = {
@@ -1112,3 +1121,158 @@ function createMockAccountForceResetRateLimitHandler() {
 		}
 	};
 }
+
+/**
+ * OAuth control-plane hotfix (U8, R22-R23): unlike the hand-rolled mocks
+ * above, these tests exercise the REAL createAccountsListHandler and
+ * createAccountResumeHandler against a real DatabaseOperations instance
+ * backed by a temp SQLite file, so a regression in the guard chain
+ * (AccountRepository -> DatabaseOperations -> cli-commands -> HTTP handler)
+ * actually fails these tests. No network/OAuth traffic; fixture rows only.
+ */
+describe("Accounts Handler - OAuth control-plane hotfix (U8)", () => {
+	let tmpDir: string;
+	let dbOps: DatabaseOperations;
+	const config = {
+		getUsageThrottlingFiveHourEnabled: () => false,
+		getUsageThrottlingWeeklyEnabled: () => false,
+	} as unknown as Config;
+
+	beforeEach(() => {
+		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ccflare-oauth-hotfix-"));
+		dbOps = new DatabaseOperations(path.join(tmpDir, "test.db"));
+	});
+
+	afterEach(async () => {
+		await dbOps.close();
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	});
+
+	async function insertAccount(
+		id: string,
+		opts: { paused?: boolean; pauseReason?: string | null } = {},
+	): Promise<void> {
+		await dbOps.getAdapter().run(
+			`INSERT INTO accounts
+				(id, name, provider, refresh_token, access_token, expires_at, created_at, paused, pause_reason)
+			 VALUES (?, ?, 'anthropic', 'rt-fixture', 'at-fixture', ?, ?, ?, ?)`,
+			[
+				id,
+				id,
+				Date.now() + 60 * 60 * 1000,
+				Date.now(),
+				opts.paused ? 1 : 0,
+				opts.pauseReason ?? null,
+			],
+		);
+	}
+
+	async function getRow(
+		id: string,
+	): Promise<{ paused: number; pause_reason: string | null }> {
+		const row = await dbOps
+			.getAdapter()
+			.get<{ paused: number; pause_reason: string | null }>(
+				"SELECT paused, pause_reason FROM accounts WHERE id = ?",
+				[id],
+			);
+		if (!row) throw new Error(`account ${id} not found`);
+		return row;
+	}
+
+	it("R22: exposes pauseReason on every account in the list response", async () => {
+		await insertAccount("acct-manual", {
+			paused: true,
+			pauseReason: "manual",
+		});
+		await insertAccount("acct-reauth", {
+			paused: true,
+			pauseReason: "oauth_invalid_grant",
+		});
+		await insertAccount("acct-active");
+
+		const response = await createAccountsListHandler(dbOps, config)();
+		const payload = (await response.json()) as Array<{
+			id: string;
+			pauseReason: string | null;
+		}>;
+
+		expect(response.status).toBe(200);
+		const byId = new Map(payload.map((a) => [a.id, a.pauseReason]));
+		expect(byId.get("acct-manual")).toBe("manual");
+		expect(byId.get("acct-reauth")).toBe("oauth_invalid_grant");
+		expect(byId.get("acct-active")).toBeNull();
+	});
+
+	it("R23: manual-pause resume works unchanged", async () => {
+		await insertAccount("acct-manual-2", {
+			paused: true,
+			pauseReason: "manual",
+		});
+
+		const response = await createAccountResumeHandler(dbOps)(
+			new Request("http://localhost/api/accounts/acct-manual-2/resume", {
+				method: "POST",
+			}),
+			"acct-manual-2",
+		);
+		const payload = (await response.json()) as { success: boolean };
+
+		expect(response.status).toBe(200);
+		expect(payload.success).toBe(true);
+		const row = await getRow("acct-manual-2");
+		expect(row.paused).toBe(0);
+		expect(row.pause_reason).toBeNull();
+	});
+
+	it("R23: terminal-pause Resume is refused with a typed reauthentication-required response", async () => {
+		await insertAccount("acct-terminal", {
+			paused: true,
+			pauseReason: "oauth_invalid_grant",
+		});
+
+		const response = await createAccountResumeHandler(dbOps)(
+			new Request("http://localhost/api/accounts/acct-terminal/resume", {
+				method: "POST",
+			}),
+			"acct-terminal",
+		);
+		const payload = (await response.json()) as {
+			error: string;
+			details?: { code?: string; pauseReason?: string };
+		};
+
+		expect(response.status).toBe(400);
+		expect(payload.details?.code).toBe("reauthentication_required");
+		expect(payload.details?.pauseReason).toBe("oauth_invalid_grant");
+		// The account must still be paused for the terminal reason: Resume must
+		// never clear oauth_invalid_grant.
+		const row = await getRow("acct-terminal");
+		expect(row.paused).toBe(1);
+		expect(row.pause_reason).toBe("oauth_invalid_grant");
+	});
+
+	it("AE10: after successful reauthentication clears the terminal reason, the account auto-resumes and relists as unpaused", async () => {
+		await insertAccount("acct-reauthed", {
+			paused: true,
+			pauseReason: "oauth_invalid_grant",
+		});
+
+		// Simulate the reauth flow's existing guarded auto-resume (unchanged by
+		// U8 -- this is the ONLY legitimate exit from a terminal pause besides a
+		// fresh differently-reasoned pause).
+		const resumed = await dbOps.resumeAccountIfNeedsReauth("acct-reauthed");
+		expect(resumed).toBe(true);
+
+		const response = await createAccountsListHandler(dbOps, config)();
+		const payload = (await response.json()) as Array<{
+			id: string;
+			paused: boolean;
+			pauseReason: string | null;
+		}>;
+		const account = payload.find((a) => a.id === "acct-reauthed");
+
+		expect(account?.paused).toBe(false);
+		expect(account?.pauseReason).toBeNull();
+	});
+});

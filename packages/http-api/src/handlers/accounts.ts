@@ -5,7 +5,9 @@ import { join } from "node:path";
 import * as cliCommands from "@better-ccflare/cli-commands";
 import type { Config } from "@better-ccflare/config";
 import {
+	PAUSE_REASON_NEEDS_REAUTH,
 	patterns,
+	REAUTHENTICATION_REQUIRED_CODE,
 	sanitizers,
 	validateAndSanitizeModelMappings,
 	validateNumber,
@@ -550,6 +552,7 @@ export function createAccountsListHandler(
 						: null,
 					created: new Date(Number(account.created_at)).toISOString(),
 					paused: account.paused === 1,
+					pauseReason: account.pause_reason ?? null,
 					priority: Number(account.priority) || 0,
 					tokenStatus: account.token_valid ? "valid" : "expired",
 					tokenExpiresAt: account.expires_at
@@ -873,6 +876,14 @@ export function createAccountResumeHandler(dbOps: DatabaseOperations) {
 			const result = await cliCommands.resumeAccount(dbOps, account.name);
 
 			if (!result.success) {
+				if (result.code === REAUTHENTICATION_REQUIRED_CODE) {
+					return errorResponse(
+						BadRequest(result.message, {
+							code: REAUTHENTICATION_REQUIRED_CODE,
+							pauseReason: PAUSE_REASON_NEEDS_REAUTH,
+						}),
+					);
+				}
 				return errorResponse(BadRequest(result.message));
 			}
 

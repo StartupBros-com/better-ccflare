@@ -253,6 +253,11 @@ export interface AccountResponse {
 	lastUsed: string | null;
 	created: string;
 	paused: boolean;
+	// Typed pause reason (e.g. "manual", "overage", "oauth_invalid_grant").
+	// null when not paused. Unknown/legacy strings are always safely
+	// renderable: consumers must fall back to generic "Paused" copy for any
+	// value they don't specifically recognize.
+	pauseReason: string | null;
 	tokenStatus: "valid" | "expired";
 	tokenExpiresAt: string | null; // ISO timestamp of token expiration
 	rateLimitStatus: string;
@@ -475,6 +480,7 @@ export function toAccountResponse(account: Account): AccountResponse {
 			: null,
 		created: new Date(account.created_at).toISOString(),
 		paused: account.paused,
+		pauseReason: account.pause_reason,
 		tokenStatus,
 		tokenExpiresAt: account.expires_at
 			? new Date(account.expires_at).toISOString()

@@ -7,6 +7,17 @@ export enum StrategyName {
 }
 
 /**
+ * Outcome of a {@link StrategyStore.resumeAccount} call. `resumed: false`
+ * means the DB refused the resume (e.g. it is paused for a reason the guard
+ * blocks, or a concurrent writer already changed its state) -- callers must
+ * not treat the account as unpaused when this happens.
+ */
+export interface ResumeResult {
+	resumed: boolean;
+	pauseReason: string | null;
+}
+
+/**
  * Interface for strategy-specific database operations
  * Allows strategies to interact with the database without direct SQL access
  */
@@ -38,9 +49,14 @@ export interface StrategyStore {
 	pauseAccount?(accountId: string): void;
 
 	/**
-	 * Resume a paused account
+	 * Resume a paused account. Callers MUST await the result and only treat
+	 * the account as unpaused when `resumed === true` -- the DB may refuse
+	 * (e.g. blocked pause reason, or a concurrent writer already changed the
+	 * row), and optimistically flipping the in-memory `paused` flag anyway
+	 * would route a request through an account the DB just refused to
+	 * resume.
 	 */
-	resumeAccount?(accountId: string): void;
+	resumeAccount?(accountId: string): Promise<ResumeResult>;
 
 	/**
 	 * Get the representative utilization (0–100) for an account based on its
