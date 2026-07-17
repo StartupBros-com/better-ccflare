@@ -383,7 +383,8 @@ render_systemd_pin \
 	"$RUNNER_SCRIPT" \
 	"$GUARD_SCRIPT" \
 	"$GUARD_SOURCE_ID" \
-	"$GUARD_POLICY_ID"
+	"$GUARD_POLICY_ID" \
+	"$GUARD_POLICY"
 
 if ! CONFIGURED_DEPLOYMENT_TIMING="$(
 	validate_deployment_timing "$PIN_RENDERED"
@@ -410,6 +411,9 @@ for expected_line in \
 	"Environment=GUARD_SCRIPT=${GUARD_SCRIPT}" \
 	"Environment=GUARD_SOURCE_ID=${GUARD_SOURCE_ID}" \
 	"Environment=GUARD_POLICY_ID=${GUARD_POLICY_ID}" \
+	"Environment=GUARD_SHA256=${GUARD_SHA256}" \
+	"Environment=GUARD_POLICY_SHA256=${POLICY_SHA256}" \
+	"Environment=RUNNER_SHA256=${RUNNER_SHA256}" \
 	"ExecStart=" \
 	"ExecStart=${RUNNER_SCRIPT}"; do
 	if [[ "$(grep -Fxc "$expected_line" "$PIN")" -lt 1 ]]; then

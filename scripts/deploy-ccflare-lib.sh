@@ -5,16 +5,27 @@
 # exact reload, effective-policy check, and no-restart rollback can be mocked.
 
 render_systemd_pin() {
-	if [[ "$#" -ne 7 ]]; then
-		echo "render_systemd_pin requires: input output binary runner guard source-id policy-id" >&2
+	if [[ "$#" -ne 8 ]]; then
+		echo "render_systemd_pin requires: input output binary runner guard source-id policy-id guard-policy-script" >&2
 		return 2
 	fi
 
 	local input="$1" output="$2" binary="$3" runner="$4"
-	local guard_script="$5" source_id="$6" policy_id="$7"
+	local guard_script="$5" source_id="$6" policy_id="$7" guard_policy_script="$8"
 	local deadline_ms shutdown_grace_ms kill_mode stop_timeout status
 	local managed_begin="# BEGIN better-ccflare managed deployment"
 	local managed_end="# END better-ccflare managed deployment"
+
+	# Digests are computed at render time from the staged files (guard,
+	# policy, runner) so the pin itself records the identity of what it
+	# points at, alongside the existing GUARD_SOURCE_ID. This requires those
+	# three paths to already be real, existing files when this function runs
+	# — true in the real deploy flow, where they are staged before the pin is
+	# rendered.
+	local guard_sha256 guard_policy_sha256 runner_sha256
+	guard_sha256="$(sha256_file "$guard_script")" || return 2
+	guard_policy_sha256="$(sha256_file "$guard_policy_script")" || return 2
+	runner_sha256="$(sha256_file "$runner")" || return 2
 
 	deadline_ms="$(configured_systemd_environment_value "$input" GUARD_TOTAL_DEADLINE_MS)" || {
 		status="$?"
@@ -67,6 +78,9 @@ render_systemd_pin() {
 		printf 'Environment=%s\n' "GUARD_SCRIPT=$guard_script"
 		printf 'Environment=%s\n' "GUARD_SOURCE_ID=$source_id"
 		printf 'Environment=%s\n' "GUARD_POLICY_ID=$policy_id"
+		printf 'Environment=%s\n' "GUARD_SHA256=$guard_sha256"
+		printf 'Environment=%s\n' "GUARD_POLICY_SHA256=$guard_policy_sha256"
+		printf 'Environment=%s\n' "RUNNER_SHA256=$runner_sha256"
 		printf 'Environment=%s\n' "GUARD_TOTAL_DEADLINE_MS=$deadline_ms"
 		printf 'Environment=%s\n' "GUARD_SHUTDOWN_GRACE_MS=$shutdown_grace_ms"
 		printf 'KillMode=%s\n' "$kill_mode"
