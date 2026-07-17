@@ -316,7 +316,7 @@ describe("post-combo normal fallback", () => {
 	});
 
 	it("allows a sibling model after model-scoped exhaustion", async () => {
-		installUsageCollector();
+		const handleStart = installUsageCollector();
 		const shared = makeAccount("shared-account");
 		const combo: ComboWithSlots = {
 			id: "combo-models",
@@ -345,6 +345,10 @@ describe("post-combo normal fallback", () => {
 			],
 		};
 		const ctx = makeContext([shared], combo, (accounts) => accounts);
+		// out_of_credits is an Anthropic-only signal. PR #57 deliberately ignores
+		// the same header/body shape from arbitrary compatible providers, so keep
+		// this cross-slot regression on the provider that owns the contract.
+		ctx.provider.name = "anthropic";
 		const attemptedModels: string[] = [];
 		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
 			const request = input instanceof Request ? input : new Request(input);
@@ -364,6 +368,10 @@ describe("post-combo normal fallback", () => {
 
 		expect(response.status).toBe(200);
 		expect(attemptedModels).toEqual(["claude-opus-4-5", "claude-opus-4-8"]);
+		expect(
+			(handleStart.mock.calls[0]?.[0] as { failoverAttempts: number })
+				.failoverAttempts,
+		).toBe(1);
 	});
 
 	it.each([
