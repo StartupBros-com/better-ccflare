@@ -3077,6 +3077,12 @@ describe("CodexProvider SSE frame bounds", () => {
 	const normalizeMessageId = (text: string) =>
 		text.replace(/msg_[0-9a-f]{24}/g, "msg_TEST");
 
+	// Counts how many times a given SSE event name appears in a translated
+	// body, so cap-trip tests can assert exactly one terminal failure instead
+	// of only "at least one".
+	const countEventOccurrences = (body: string, eventName: string): number =>
+		(body.match(new RegExp(`event: ${eventName}\\n`, "g")) ?? []).length;
+
 	const crlfSseBody = (events: Array<[string, unknown]>) =>
 		`${events
 			.map(
@@ -3134,6 +3140,7 @@ describe("CodexProvider SSE frame bounds", () => {
 	it("closes the open content block before an error when a single frame exceeds the per-frame cap", async () => {
 		const provider = new CodexProvider();
 		const encoder = new TextEncoder();
+		let cancelReason: unknown;
 		const upstreamBody = new ReadableStream<Uint8Array>({
 			start(controller) {
 				// First chunk: opens a text content block, fully processed on its own.
@@ -3155,9 +3162,13 @@ describe("CodexProvider SSE frame bounds", () => {
 					),
 				);
 				// Second chunk: a single complete frame whose payload alone exceeds
-				// the per-frame cap.
+				// the per-frame cap. Sized against the new 4MiB transport frame
+				// cap (SSE_TRANSPORT_FRAME_MAX_BYTES), not the old 64KiB shared
+				// cap: a frame this size is now legal traffic well below the
+				// ceiling everywhere except right here where it is the ceiling
+				// itself that is being tripped.
 				const oversizedPayload = "x".repeat(
-					BUFFER_SIZES.SSE_FRAME_MAX_BYTES + 1024,
+					BUFFER_SIZES.SSE_TRANSPORT_FRAME_MAX_BYTES + 1024,
 				);
 				controller.enqueue(
 					encoder.encode(
@@ -3168,7 +3179,12 @@ describe("CodexProvider SSE frame bounds", () => {
 						),
 					),
 				);
-				controller.close();
+				// Deliberately left open: a real upstream connection just idles
+				// after the cap trip. The reader must be actively cancelled by
+				// the consumer rather than relying on EOF that never arrives.
+			},
+			cancel(reason) {
+				cancelReason = reason ?? "cancelled";
 			},
 		});
 
@@ -3183,17 +3199,73 @@ describe("CodexProvider SSE frame bounds", () => {
 		expect(body).toContain("event: error");
 		expect(body).toContain('"type":"api_error"');
 		expect(body).toContain('"code":"sse_limit_exceeded"');
+		expect(countEventOccurrences(body, "error")).toBe(1);
+		expect(body).not.toContain("event: message_delta");
 		const startPos = body.indexOf("event: message_start");
 		const stopPos = body.indexOf("event: content_block_stop");
 		const errorPos = body.indexOf("event: error");
 		expect(startPos).toBeGreaterThanOrEqual(0);
 		expect(stopPos).toBeGreaterThan(startPos);
 		expect(errorPos).toBeGreaterThan(stopPos);
+		// The upstream source is always cancelled on a cap trip, never left
+		// dangling for the caller to clean up.
+		expect(cancelReason).toBeDefined();
+	});
+
+	// AE1: this is the exact real-world scenario that motivated raising the
+	// SSE transport frame cap from 64KiB to 4MiB (see
+	// packages/core/src/constants.ts, SSE_TRANSPORT_FRAME_MAX_BYTES). Under
+	// the pre-U2 shared 64KiB cap this frame alone would have tripped the
+	// per-frame limit and the stream would never have reached
+	// response.completed; it must now translate successfully end to end,
+	// with no limit error and no early upstream cancellation.
+	it("accepts a 110,079-byte response.created frame (the largest complete frame observed in the field) and completes normally", async () => {
+		const provider = new CodexProvider();
+		const encoder = new TextEncoder();
+		const targetFrameBytes = 110_079;
+		const buildCreatedFrame = (padding: string) =>
+			`event: response.created\ndata: ${JSON.stringify({
+				response: {
+					id: "resp_incident",
+					model: "gpt-5.4",
+					instructions: padding,
+				},
+			})}`;
+		const baseBytes = encoder.encode(buildCreatedFrame("")).length;
+		const padLength = targetFrameBytes - baseBytes;
+		expect(padLength).toBeGreaterThan(0);
+		const createdFrame = buildCreatedFrame("x".repeat(padLength));
+		expect(encoder.encode(createdFrame).length).toBe(targetFrameBytes);
+
+		const upstreamBody = sseBody([
+			...createdFrame.split("\n"),
+			"",
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.4",
+					usage: { input_tokens: 2, output_tokens: 1 },
+				},
+			}),
+		]);
+
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const body = await transformed.text();
+
+		expect(body).not.toContain("event: error");
+		expect(body).not.toContain("sse_limit_exceeded");
+		expect(body).toContain("event: message_start");
+		expect(body).toContain("event: message_stop");
 	});
 
 	it("closes the open content block before an error when an unterminated tail exceeds the buffer cap", async () => {
 		const provider = new CodexProvider();
 		const encoder = new TextEncoder();
+		let cancelReason: unknown;
 		const upstreamBody = new ReadableStream<Uint8Array>({
 			start(controller) {
 				controller.enqueue(
@@ -3216,10 +3288,14 @@ describe("CodexProvider SSE frame bounds", () => {
 				// Never terminated: no blank-line delimiter arrives, so the tail
 				// keeps growing past the unterminated-buffer cap.
 				const runaway = `event: response.output_text.delta\ndata: {"delta":"${"y".repeat(
-					BUFFER_SIZES.SSE_BUFFER_MAX_BYTES + 1024,
+					BUFFER_SIZES.SSE_TRANSPORT_TAIL_MAX_BYTES + 1024,
 				)}`;
 				controller.enqueue(encoder.encode(runaway));
-				controller.close();
+				// Deliberately left open: see the frame-cap test above for why
+				// closing here would make cancellation a spec-mandated no-op.
+			},
+			cancel(reason) {
+				cancelReason = reason ?? "cancelled";
 			},
 		});
 
@@ -3234,20 +3310,25 @@ describe("CodexProvider SSE frame bounds", () => {
 		expect(body).toContain("event: error");
 		expect(body).toContain('"type":"api_error"');
 		expect(body).toContain('"code":"sse_limit_exceeded"');
+		expect(countEventOccurrences(body, "error")).toBe(1);
+		expect(body).not.toContain("event: message_delta");
 		const startPos = body.indexOf("event: message_start");
 		const stopPos = body.indexOf("event: content_block_stop");
 		const errorPos = body.indexOf("event: error");
 		expect(startPos).toBeGreaterThanOrEqual(0);
 		expect(stopPos).toBeGreaterThan(startPos);
 		expect(errorPos).toBeGreaterThan(stopPos);
+		expect(cancelReason).toBeDefined();
 	});
 
 	it("trips the aggregate tool-args cap when five parallel calls each stay under the per-call cap but exceed it together", async () => {
 		const provider = new CodexProvider();
 		const perCallArgBytes = 15_000;
-		expect(perCallArgBytes).toBeLessThan(BUFFER_SIZES.SSE_FRAME_MAX_BYTES);
+		expect(perCallArgBytes).toBeLessThan(
+			BUFFER_SIZES.TOOL_ARGUMENTS_PER_CALL_MAX_BYTES,
+		);
 		expect(perCallArgBytes * 5).toBeGreaterThan(
-			BUFFER_SIZES.SSE_FRAME_MAX_BYTES,
+			BUFFER_SIZES.TOOL_ARGUMENTS_TOTAL_MAX_BYTES,
 		);
 
 		const lines: string[] = [
@@ -3276,7 +3357,20 @@ describe("CodexProvider SSE frame bounds", () => {
 			);
 		}
 
-		const response = new Response(sseBody(lines), {
+		const encoder = new TextEncoder();
+		let cancelReason: unknown;
+		const upstreamBody = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(encoder.encode(sseBody(lines)));
+				// Deliberately left open: see the frame-cap test above for why
+				// closing here would make cancellation a spec-mandated no-op.
+			},
+			cancel(reason) {
+				cancelReason = reason ?? "cancelled";
+			},
+		});
+
+		const response = new Response(upstreamBody, {
 			status: 200,
 			headers: { "content-type": "text/event-stream" },
 		});
@@ -3287,20 +3381,28 @@ describe("CodexProvider SSE frame bounds", () => {
 		expect(body).toContain("event: error");
 		expect(body).toContain('"type":"api_error"');
 		expect(body).toContain('"code":"sse_limit_exceeded"');
+		expect(body).toContain("Aggregate tool call arguments totaled");
+		expect(countEventOccurrences(body, "error")).toBe(1);
 		expect(body).not.toContain("event: message_delta");
+		expect(cancelReason).toBeDefined();
 	});
 
+	// AE2: a single tool call's own arguments alone exceed the per-call cap,
+	// even though the frame ceiling is 4MiB and this call's individual delta
+	// frames are nowhere near it.
 	it("trips the per-call tool-args cap when a single call's own arguments alone exceed it", async () => {
 		const provider = new CodexProvider();
 
-		// Each individual delta frame stays well under the per-frame SSE cap;
-		// only their accumulated total for this one call exceeds the per-call
-		// argument byte cap. This is distinct from the aggregate-cap test
-		// above, which requires several concurrently open calls that each
-		// individually stay under the per-call cap.
+		// Each individual delta frame stays well under the per-frame SSE cap
+		// (now 4MiB); only their accumulated total for this one call exceeds
+		// the per-call argument byte cap (still 64KiB, but sourced from the
+		// dedicated TOOL_ARGUMENTS_PER_CALL_MAX_BYTES constant). This is
+		// distinct from the aggregate-cap test above, which requires several
+		// concurrently open calls that each individually stay under the
+		// per-call cap.
 		const chunkSize = 4096;
 		const chunkCount =
-			Math.ceil(BUFFER_SIZES.SSE_FRAME_MAX_BYTES / chunkSize) + 2;
+			Math.ceil(BUFFER_SIZES.TOOL_ARGUMENTS_PER_CALL_MAX_BYTES / chunkSize) + 2;
 
 		const lines: string[] = [
 			...eventLine("response.created", {
@@ -3324,7 +3426,20 @@ describe("CodexProvider SSE frame bounds", () => {
 			);
 		}
 
-		const response = new Response(sseBody(lines), {
+		const encoder = new TextEncoder();
+		let cancelReason: unknown;
+		const upstreamBody = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(encoder.encode(sseBody(lines)));
+				// Deliberately left open: see the frame-cap test above for why
+				// closing here would make cancellation a spec-mandated no-op.
+			},
+			cancel(reason) {
+				cancelReason = reason ?? "cancelled";
+			},
+		});
+
+		const response = new Response(upstreamBody, {
 			status: 200,
 			headers: { "content-type": "text/event-stream" },
 		});
@@ -3337,6 +3452,8 @@ describe("CodexProvider SSE frame bounds", () => {
 		expect(body).toContain('"code":"sse_limit_exceeded"');
 		expect(body).toContain("Tool call arguments for output_index 0 totaled");
 		expect(body).not.toContain("Aggregate tool call arguments");
+		expect(countEventOccurrences(body, "error")).toBe(1);
+		expect(cancelReason).toBeDefined();
 	});
 
 	it("emits message_start before an error that arrives as the literal first SSE event", async () => {

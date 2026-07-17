@@ -3,6 +3,7 @@ import {
 	BUFFER_SIZES,
 	SseFrameBuffer,
 	SseLimitError,
+	StreamResourceLimitError,
 } from "@better-ccflare/core";
 
 const encoder = new TextEncoder();
@@ -130,4 +131,174 @@ describe("SseFrameBuffer", () => {
 
 		expect(elapsedMs).toBeLessThan(2000);
 	}, 35_000);
+});
+
+/**
+ * Build ASCII frame content (prefix + repeated "a" filler) whose encoded
+ * byte length is exactly `targetBytes`. Every character here is ASCII, so
+ * string length and encoded byte length are always equal, which keeps the
+ * byte-accounting in these tests exact without re-encoding to check.
+ */
+function buildAsciiPayload(prefix: string, targetBytes: number): string {
+	const prefixBytes = encoder.encode(prefix).length;
+	if (prefixBytes > targetBytes) {
+		throw new Error(
+			`prefix of ${prefixBytes} bytes exceeds target of ${targetBytes} bytes`,
+		);
+	}
+	return prefix + "a".repeat(targetBytes - prefixBytes);
+}
+
+function catchError(fn: () => unknown): unknown {
+	try {
+		fn();
+		return undefined;
+	} catch (err) {
+		return err;
+	}
+}
+
+describe("SseFrameBuffer resource policies", () => {
+	// AE1: the exact incident-observed frame size (110,079 bytes), well
+	// under the new 4MiB transport frame policy, must succeed for both LF
+	// and CRLF delimiters, including a delimiter split across chunks.
+	const INCIDENT_FRAME_BYTES = 110_079;
+
+	it("accepts the exact 110,079-byte LF-delimited incident frame under the transport frame policy", () => {
+		const buf = makeBuffer({
+			maxFrameBytes: BUFFER_SIZES.SSE_TRANSPORT_FRAME_MAX_BYTES,
+			maxBufferBytes: BUFFER_SIZES.SSE_TRANSPORT_TAIL_MAX_BYTES,
+		});
+		const payload = buildAsciiPayload(
+			"event: incident\ndata: ",
+			INCIDENT_FRAME_BYTES,
+		);
+		const frames = buf.push(encoder.encode(`${payload}\n\n`));
+		expect(frames).toEqual([payload]);
+		expect(encoder.encode(frames[0]).length).toBe(INCIDENT_FRAME_BYTES);
+	});
+
+	it("accepts the exact 110,079-byte CRLF-delimited incident frame with the delimiter split across chunks", () => {
+		const buf = makeBuffer({
+			maxFrameBytes: BUFFER_SIZES.SSE_TRANSPORT_FRAME_MAX_BYTES,
+			maxBufferBytes: BUFFER_SIZES.SSE_TRANSPORT_TAIL_MAX_BYTES,
+		});
+		const payload = buildAsciiPayload(
+			"event: incident\r\ndata: ",
+			INCIDENT_FRAME_BYTES,
+		);
+		// Split right in the middle of the trailing \r\n\r\n delimiter, as in
+		// the existing split-delimiter test above.
+		const first = buf.push(encoder.encode(`${payload}\r\n\r`));
+		expect(first).toEqual([]);
+		const second = buf.push(encoder.encode("\n"));
+		expect(second).toEqual([payload]);
+		expect(encoder.encode(second[0]).length).toBe(INCIDENT_FRAME_BYTES);
+	});
+
+	it("accepts a complete frame at exactly the 4MiB transport frame policy cap", () => {
+		const buf = makeBuffer({
+			maxFrameBytes: BUFFER_SIZES.SSE_TRANSPORT_FRAME_MAX_BYTES,
+			maxBufferBytes: BUFFER_SIZES.SSE_TRANSPORT_TAIL_MAX_BYTES,
+		});
+		const payload = buildAsciiPayload(
+			"event: cap\ndata: ",
+			BUFFER_SIZES.SSE_TRANSPORT_FRAME_MAX_BYTES,
+		);
+		const frames = buf.push(encoder.encode(`${payload}\n\n`));
+		expect(frames).toEqual([payload]);
+		expect(encoder.encode(frames[0]).length).toBe(
+			BUFFER_SIZES.SSE_TRANSPORT_FRAME_MAX_BYTES,
+		);
+	});
+
+	it("rejects a complete frame one byte over the 4MiB transport frame policy cap with kind sse_frame", () => {
+		const buf = makeBuffer({
+			maxFrameBytes: BUFFER_SIZES.SSE_TRANSPORT_FRAME_MAX_BYTES,
+			maxBufferBytes: BUFFER_SIZES.SSE_TRANSPORT_TAIL_MAX_BYTES,
+		});
+		const targetBytes = BUFFER_SIZES.SSE_TRANSPORT_FRAME_MAX_BYTES + 1;
+		const payload = buildAsciiPayload("event: cap\ndata: ", targetBytes);
+		const err = catchError(() => buf.push(encoder.encode(`${payload}\n\n`)));
+		expect(err).toBeInstanceOf(SseLimitError);
+		const sseErr = err as SseLimitError;
+		expect(sseErr.kind).toBe("sse_frame");
+		expect(sseErr.limitBytes).toBe(BUFFER_SIZES.SSE_TRANSPORT_FRAME_MAX_BYTES);
+		expect(sseErr.actualBytes).toBe(targetBytes);
+	});
+
+	it("accepts an unterminated tail at exactly the 4MiB transport tail policy cap", () => {
+		const buf = makeBuffer({
+			maxFrameBytes: BUFFER_SIZES.SSE_TRANSPORT_FRAME_MAX_BYTES,
+			maxBufferBytes: BUFFER_SIZES.SSE_TRANSPORT_TAIL_MAX_BYTES,
+		});
+		const payload = "a".repeat(BUFFER_SIZES.SSE_TRANSPORT_TAIL_MAX_BYTES);
+		const frames = buf.push(encoder.encode(payload));
+		expect(frames).toEqual([]);
+		expect(buf.flush()).toBe(payload);
+	});
+
+	it("rejects an unterminated tail one byte over the 4MiB transport tail policy cap with kind sse_tail", () => {
+		const buf = makeBuffer({
+			maxFrameBytes: BUFFER_SIZES.SSE_TRANSPORT_FRAME_MAX_BYTES,
+			maxBufferBytes: BUFFER_SIZES.SSE_TRANSPORT_TAIL_MAX_BYTES,
+		});
+		const targetBytes = BUFFER_SIZES.SSE_TRANSPORT_TAIL_MAX_BYTES + 1;
+		const payload = "a".repeat(targetBytes);
+		const err = catchError(() => buf.push(encoder.encode(payload)));
+		expect(err).toBeInstanceOf(SseLimitError);
+		const sseErr = err as SseLimitError;
+		expect(sseErr.kind).toBe("sse_tail");
+		expect(sseErr.limitBytes).toBe(BUFFER_SIZES.SSE_TRANSPORT_TAIL_MAX_BYTES);
+		expect(sseErr.actualBytes).toBe(targetBytes);
+	});
+
+	it("rechecks the tail cap after decoder flush so a split multi-byte code point cannot bypass it", () => {
+		// Small cap so the test stays fast and the arithmetic stays readable.
+		const capBytes = 40;
+		const buf = makeBuffer({ maxFrameBytes: 1024, maxBufferBytes: capBytes });
+
+		// Fill the tail to exactly the cap with single-byte ASCII characters.
+		const filled = buf.push(encoder.encode("x".repeat(capBytes)));
+		expect(filled).toEqual([]);
+
+		// Push a single lead byte of a 3-byte UTF-8 sequence (U+2603 SNOWMAN
+		// is E2 98 83). TextDecoder in streaming mode buffers an incomplete
+		// trailing sequence internally and returns "" for it, so tailBytes
+		// stays at the cap and this push does not throw.
+		const incomplete = buf.push(new Uint8Array([0xe2]));
+		expect(incomplete).toEqual([]);
+
+		// flush()'s final (non-streaming) decode() call materializes the
+		// pending byte as a 3-byte replacement character, adding bytes that
+		// were never counted against the tail cap on push(). The cap must
+		// be rechecked here, or these bytes bypass it entirely.
+		const err = catchError(() => buf.flush());
+		expect(err).toBeInstanceOf(SseLimitError);
+		const sseErr = err as SseLimitError;
+		expect(sseErr.kind).toBe("sse_tail");
+		expect(sseErr.limitBytes).toBe(capBytes);
+		expect(sseErr.actualBytes).toBe(capBytes + 3);
+	});
+
+	it("reports kind, limitBytes, and actualBytes without including payload text in the message", () => {
+		const buf = makeBuffer({ maxFrameBytes: 16, maxBufferBytes: 1024 });
+		const secretPayload = "super-secret-token-value";
+		const oversized = `event: big\ndata: ${secretPayload}\n\n`;
+		const err = catchError(() => buf.push(encoder.encode(oversized)));
+		expect(err).toBeInstanceOf(SseLimitError);
+		const sseErr = err as SseLimitError;
+		expect(sseErr.kind).toBe("sse_frame");
+		expect(typeof sseErr.limitBytes).toBe("number");
+		expect(typeof sseErr.actualBytes).toBe("number");
+		expect(sseErr.message).not.toContain(secretPayload);
+	});
+
+	it("is an instance of StreamResourceLimitError so translators can catch the shared base", () => {
+		const buf = makeBuffer({ maxFrameBytes: 16, maxBufferBytes: 1024 });
+		const oversized = `event: big\ndata: ${"x".repeat(64)}\n\n`;
+		const err = catchError(() => buf.push(encoder.encode(oversized)));
+		expect(err).toBeInstanceOf(SseLimitError);
+		expect(err).toBeInstanceOf(StreamResourceLimitError);
+	});
 });
