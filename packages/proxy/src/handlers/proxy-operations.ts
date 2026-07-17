@@ -75,6 +75,16 @@ const TEST_CONTEXT_WINDOW_ENV =
 // forwarded to the client -- this only bounds the *classification* read.
 const MAX_FINAL_CANDIDATE_CLASSIFICATION_BODY_BYTES = 64 * 1024;
 
+type RawAttemptFailureScope = "not-classified" | "account" | "model" | "family";
+
+interface RawAttemptFailureClassification {
+	readonly scope: RawAttemptFailureScope;
+	readonly attemptedModel: string | null;
+	readonly family: string | null;
+	/** Stop this account attempt even when the evidence itself is model-scoped. */
+	readonly stopAccountAttempt: boolean;
+}
+
 function getTestContextWindowOverride(): number | undefined {
 	if (process.env.NODE_ENV !== "test") return undefined;
 	const value = Number(process.env[TEST_CONTEXT_WINDOW_ENV]);
@@ -1633,8 +1643,8 @@ export async function proxyWithAccount(
 		const handlePaymentRequired402 = async (
 			failureResponse: Response,
 			attemptedModel = currentTransportModel || effectiveBodyContext.getModel(),
-		): Promise<boolean> => {
-			if (failureResponse.status !== 402) return false;
+		): Promise<RawAttemptFailureClassification | null> => {
+			if (failureResponse.status !== 402) return null;
 			// Native xAI capacity signal (R5-R10): XaiProvider.parseRateLimit
 			// classifies a 402 as "xai_capacity_402" (more specific than this
 			// generic account-wide billing reason), and that classification path
@@ -1646,7 +1656,7 @@ export async function proxyWithAccount(
 			// branch (response-processor.ts) further down instead of being
 			// swallowed here with a fire-and-forget cooldown and a mislabeled
 			// reason. Every other provider's 402 handling is unaffected.
-			if (account.provider === "xai") return false;
+			if (account.provider === "xai") return null;
 			const reason: RateLimitReason = "upstream_402_payment_required";
 			const cooldownUntil = extractCooldownUntil(
 				failureResponse,
@@ -1700,14 +1710,13 @@ export async function proxyWithAccount(
 					requestMeta.agentAttributionSource ?? null,
 				),
 			);
-			await finalizeCurrentCodexTransport(failureResponse);
-			await discardUpstreamBody(failureResponse);
-			return true;
+			return {
+				scope: "account",
+				attemptedModel,
+				family: attemptedModel ? getModelFamily(attemptedModel) : null,
+				stopAccountAttempt: true,
+			};
 		};
-
-		if (await handlePaymentRequired402(rawResponse)) {
-			return null;
-		}
 
 		// ── extra_usage_exhausted: billing-policy rejection, NOT a rate limit (issue #293) ──
 		// Anthropic returns 400 invalid_request_error when a Claude OAuth account's
@@ -1771,14 +1780,14 @@ export async function proxyWithAccount(
 		const handleInferredFamily429 = async (
 			failureResponse: Response,
 			attemptedModel: string | null,
-		): Promise<boolean> => {
+		): Promise<RawAttemptFailureClassification | null> => {
 			if (
 				failureResponse.status !== 429 ||
 				!isClaudeProvider ||
 				isAnthropicOutOfCredits(failureResponse) ||
 				req.headers.get("x-better-ccflare-keepalive") === "true"
 			) {
-				return false;
+				return null;
 			}
 			const decision = classifyPreByte429({
 				isAnthropic: true,
@@ -1792,7 +1801,7 @@ export async function proxyWithAccount(
 				decision.markerExpiresAt === null ||
 				!attemptedModel
 			) {
-				return false;
+				return null;
 			}
 			if (
 				!usageCache.markFamilyScopedExhausted(
@@ -1801,7 +1810,7 @@ export async function proxyWithAccount(
 					decision.markerExpiresAt,
 				)
 			) {
-				return false;
+				return null;
 			}
 			recordRequestRateLimitOutcome(req, {
 				accountId: account.id,
@@ -1816,7 +1825,7 @@ export async function proxyWithAccount(
 			log.warn(
 				`Account ${account.name} generic 429 classified model-family scoped ` +
 					`(model=${attemptedModel}, family=${decision.family}, evidence_age_ms=${decision.snapshotAgeMs ?? "unknown"}) — ` +
-					"NOT benching account; failing over to next account",
+					"NOT benching account; pruning this family and trying a compatible fallback before account failover",
 			);
 			const responseTime = Date.now() - requestMeta.timestamp;
 			ctx.asyncWriter.enqueue(() =>
@@ -1847,9 +1856,12 @@ export async function proxyWithAccount(
 					requestMeta.agentAttributionSource ?? null,
 				),
 			);
-			await finalizeCurrentCodexTransport(failureResponse);
-			await discardUpstreamBody(failureResponse);
-			return true;
+			return {
+				scope: "family",
+				attemptedModel,
+				family: decision.family,
+				stopAccountAttempt: false,
+			};
 		};
 
 		/**
@@ -1881,6 +1893,139 @@ export async function proxyWithAccount(
 			});
 		};
 
+		/**
+		 * Classify the exact Anthropic out_of_credits signal before provider
+		 * transformation. The signal is model/beta scoped, so it must never reach
+		 * processProxyResponse's account-wide 429 cooldown path.
+		 */
+		const handleExactModel429 = async (
+			failureResponse: Response,
+			attemptedModel: string | null,
+		): Promise<RawAttemptFailureClassification | null> => {
+			if (
+				failureResponse.status !== 429 ||
+				!isClaudeProvider ||
+				!isAnthropicOutOfCredits(failureResponse)
+			) {
+				return null;
+			}
+
+			if (req.headers.get("x-better-ccflare-keepalive") === "true") {
+				return {
+					scope: "model",
+					attemptedModel,
+					family: attemptedModel ? getModelFamily(attemptedModel) : null,
+					stopAccountAttempt: true,
+				};
+			}
+
+			const reason: RateLimitReason = "out_of_credits";
+			if (attemptedModel) recordExactModelExhaustion(attemptedModel);
+			log.warn(
+				`Account ${account.name} out_of_credits (429${attemptedModel ? `, model=${attemptedModel}` : ""}) — ` +
+					"model/beta-scoped, NOT benching account; pruning this exact model and trying a compatible fallback before account failover",
+			);
+			const responseTime = Date.now() - requestMeta.timestamp;
+			ctx.asyncWriter.enqueue(() =>
+				ctx.dbOps.saveRequest(
+					crypto.randomUUID(),
+					req.method,
+					url.pathname,
+					account.id,
+					429,
+					false,
+					reason,
+					responseTime,
+					failoverAttempts,
+					attemptedModel ? { model: attemptedModel } : undefined,
+					requestMeta.agentUsed ?? undefined,
+					apiKeyId ?? undefined,
+					apiKeyName ?? undefined,
+					requestMeta.project ?? null,
+					undefined,
+					requestMeta.comboName ?? null,
+					isModelRewrite(requestMeta.originalModel, requestMeta.appliedModel)
+						? (requestMeta.originalModel ?? null)
+						: null,
+					isModelRewrite(requestMeta.originalModel, requestMeta.appliedModel)
+						? (requestMeta.appliedModel ?? null)
+						: null,
+					requestMeta.projectAttributionSource ?? null,
+					requestMeta.agentAttributionSource ?? null,
+				),
+			);
+			return {
+				scope: "model",
+				attemptedModel,
+				family: attemptedModel ? getModelFamily(attemptedModel) : null,
+				stopAccountAttempt: false,
+			};
+		};
+
+		/**
+		 * One raw-response classification boundary shared by the initial transport,
+		 * every same-account model fallback, and every in-place 529 retry. Classified
+		 * responses are finalized and drained exactly once here. Callers use the rich
+		 * scope to decide whether to fail the account or continue with a candidate
+		 * outside only the failed exact model / family.
+		 */
+		const handleRawAttemptFailure = async (
+			failureResponse: Response,
+			attemptedModel = currentTransportModel || effectiveBodyContext.getModel(),
+		): Promise<RawAttemptFailureClassification> => {
+			const classification =
+				(await handlePaymentRequired402(failureResponse, attemptedModel)) ??
+				(await handleExactModel429(failureResponse, attemptedModel)) ??
+				(await handleInferredFamily429(failureResponse, attemptedModel));
+			if (!classification) {
+				return {
+					scope: "not-classified",
+					attemptedModel,
+					family: attemptedModel ? getModelFamily(attemptedModel) : null,
+					stopAccountAttempt: false,
+				};
+			}
+			await finalizeCurrentCodexTransport(failureResponse);
+			await discardUpstreamBody(failureResponse);
+			return classification;
+		};
+
+		let rawFailureClassification = await handleRawAttemptFailure(rawResponse);
+		if (rawFailureClassification.stopAccountAttempt) {
+			return null;
+		}
+		const failedExactModels = new Set<string>();
+		const failedFamilies = new Set<string>();
+		const rememberScopedFailure = (
+			classification: RawAttemptFailureClassification,
+		): void => {
+			if (classification.scope === "model" && classification.attemptedModel) {
+				failedExactModels.add(classification.attemptedModel.toLowerCase());
+			}
+			if (classification.scope === "family" && classification.family) {
+				failedFamilies.add(classification.family);
+			}
+		};
+		const isScopedFailure = (
+			classification: RawAttemptFailureClassification,
+		): boolean =>
+			classification.scope === "model" || classification.scope === "family";
+		const candidateHasScopedFailure = (model: string): boolean => {
+			if (failedExactModels.has(model.toLowerCase())) return true;
+			const family = getModelFamily(model);
+			if (family && failedFamilies.has(family)) return true;
+			const betaSignature = req.headers.get("anthropic-beta");
+			return (
+				usageCache.getModelScopedExhaustion(
+					account.id,
+					model,
+					betaSignature,
+				) !== null ||
+				usageCache.getFamilyScopedExhaustion(account.id, model) !== null
+			);
+		};
+		rememberScopedFailure(rawFailureClassification);
+
 		// Native xAI capacity/rate-limit signals (R5-R10) are a first-class,
 		// account-level failover state, not a "try a different model" signal:
 		// XAI_MODEL_MAPPINGS routes every Claude model alias to the same
@@ -1905,10 +2050,6 @@ export async function proxyWithAccount(
 			!isNativeXaiCapacityOrRateLimitSignal &&
 			(await isModelUnavailableError(rawResponse))
 		) {
-			// Tracks the concrete model used by the last fallback attempt so a
-			// fallback out_of_credits response is scoped to that model, not the
-			// originally requested model or the whole account.
-			let finalAttemptModel: string | null = null;
 			// Log 429 response headers for debugging upstream rate-limit info
 			if (rawResponse.status === 429) {
 				const rlHeaders: Record<string, string> = {};
@@ -1932,61 +2073,6 @@ export async function proxyWithAccount(
 			let requestedModel: string | null = null;
 			if (effectiveBodyBuffer) requestedModel = effectiveBodyContext.getModel();
 
-			// ── out_of_credits: model/beta-scoped depletion, NOT account-wide (issue #261) ──
-			// Anthropic returns 429 + `overage-disabled-reason: out_of_credits` with no reset
-			// header. This is scoped to a specific model/beta (e.g. context-1m), not the
-			// account — opus/haiku/plain-sonnet still succeed on the same account. So we do
-			// NOT bench the account (no applyRateLimitCooldown, no consecutive increment):
-			// fail over per-request and leave the account in rotation for other models.
-			if (rawResponse.status === 429 && isAnthropicOutOfCredits(rawResponse)) {
-				await finalizeCurrentCodexTransport(rawResponse);
-				await discardUpstreamBody(rawResponse);
-				const isKeepalive =
-					req.headers.get("x-better-ccflare-keepalive") === "true";
-				if (isKeepalive) {
-					return null;
-				}
-				const reason: RateLimitReason = "out_of_credits";
-				const exactAttemptedModel = currentTransportModel || requestedModel;
-				if (exactAttemptedModel) {
-					recordExactModelExhaustion(exactAttemptedModel);
-				}
-				log.warn(
-					`Account ${account.name} out_of_credits (429${exactAttemptedModel ? `, model=${exactAttemptedModel}` : ""}) — ` +
-						`model/beta-scoped, NOT benching account; failing over to next account`,
-				);
-				const responseTime = Date.now() - requestMeta.timestamp;
-				ctx.asyncWriter.enqueue(() =>
-					ctx.dbOps.saveRequest(
-						crypto.randomUUID(),
-						req.method,
-						url.pathname,
-						account.id,
-						429,
-						false,
-						reason,
-						responseTime,
-						failoverAttempts,
-						exactAttemptedModel ? { model: exactAttemptedModel } : undefined,
-						requestMeta.agentUsed ?? undefined,
-						apiKeyId ?? undefined,
-						apiKeyName ?? undefined,
-						requestMeta.project ?? null,
-						undefined,
-						requestMeta.comboName ?? null,
-						isModelRewrite(requestMeta.originalModel, requestMeta.appliedModel)
-							? (requestMeta.originalModel ?? null)
-							: null,
-						isModelRewrite(requestMeta.originalModel, requestMeta.appliedModel)
-							? (requestMeta.appliedModel ?? null)
-							: null,
-						requestMeta.projectAttributionSource ?? null,
-						requestMeta.agentAttributionSource ?? null,
-					),
-				);
-				return null;
-			}
-
 			if (requestedModel) {
 				const modelList = attemptAdmissionTracker
 					? concreteCodexModels
@@ -1995,6 +2081,9 @@ export async function proxyWithAccount(
 					? admittedModelIndex + 1
 					: 1;
 				if (!modelList || fallbackStartIndex >= modelList.length) {
+					if (isScopedFailure(rawFailureClassification)) {
+						return null;
+					}
 					// No fallback models configured — fail over to the next account.
 					// 429s should never be forwarded to the client when other
 					// accounts are available; only genuine model-not-found
@@ -2017,14 +2106,6 @@ export async function proxyWithAccount(
 							await discardUpstreamBody(rawResponse);
 							return null;
 						}
-						const actualAttemptedModel =
-							currentTransportModel || requestedModel;
-						if (
-							await handleInferredFamily429(rawResponse, actualAttemptedModel)
-						) {
-							return null;
-						}
-
 						log.warn(
 							`Account ${account.name} rate-limited (429), no model fallbacks — failing over to next account`,
 						);
@@ -2101,9 +2182,14 @@ export async function proxyWithAccount(
 					return withSanitizedProxyHeaders(rawResponse);
 				}
 
-				finalAttemptModel = requestedModel;
 				for (let i = fallbackStartIndex; i < modelList.length; i++) {
 					const nextModel = modelList[i];
+					if (candidateHasScopedFailure(nextModel)) {
+						log.info(
+							`Skipping model ${nextModel} on account ${account.name} because the current request has scoped exhaustion evidence`,
+						);
+						continue;
+					}
 					if (
 						!admitConcreteCodexModel(
 							account,
@@ -2114,7 +2200,7 @@ export async function proxyWithAccount(
 						continue;
 					}
 					log.info(
-						`Model '${modelList[i - 1]}' unavailable/rate-limited on account ${account.name}, ` +
+						`Model '${currentTransportModel}' unavailable/rate-limited on account ${account.name}, ` +
 							`retrying with: ${nextModel} (${i}/${modelList.length - 1})`,
 					);
 
@@ -2139,8 +2225,10 @@ export async function proxyWithAccount(
 						duplex: "half",
 					};
 
-					await finalizeCurrentCodexTransport(rawResponse);
-					await discardUpstreamBody(rawResponse);
+					if (!isScopedFailure(rawFailureClassification)) {
+						await finalizeCurrentCodexTransport(rawResponse);
+						await discardUpstreamBody(rawResponse);
+					}
 					stampCodexAttempt(headers, "model_fallback", nextModel);
 					currentTransportModel = nextModel;
 					const retryProviderRequest = new Request(targetUrl, retryRequestInit);
@@ -2166,13 +2254,18 @@ export async function proxyWithAccount(
 					);
 					// Attribution advances only once a concrete request is ready to
 					// execute. A failed patch must leave it on the previous model.
-					finalAttemptModel = nextModel;
 					rawResponse = isSyntheticProviderResponse(retryTransformedRequest)
 						? materializeSyntheticResponse(retryTransformedRequest)
 						: await makeProxyRequest(retryTransportRequest);
-					if (await handlePaymentRequired402(rawResponse, nextModel)) {
+					rawFailureClassification = await handleRawAttemptFailure(
+						rawResponse,
+						nextModel,
+					);
+					if (rawFailureClassification.stopAccountAttempt) {
 						return null;
 					}
+					rememberScopedFailure(rawFailureClassification);
+					if (isScopedFailure(rawFailureClassification)) continue;
 
 					// isModelUnavailableError clones internally only when it must inspect a
 					// 400/404 body. Passing a caller-created clone for a header-only 429
@@ -2184,68 +2277,13 @@ export async function proxyWithAccount(
 				}
 			}
 
-			// A fallback model may itself return Anthropic out_of_credits. Re-run
-			// scoped classification against the final response/model before
-			// account-wide handling, otherwise one fallback benches the account.
-			if (rawResponse.status === 429 && isAnthropicOutOfCredits(rawResponse)) {
-				await finalizeCurrentCodexTransport(rawResponse);
-				await discardUpstreamBody(rawResponse);
-				if (req.headers.get("x-better-ccflare-keepalive") === "true") {
-					return null;
-				}
-				const exactAttemptedModel = finalAttemptModel || currentTransportModel;
-				if (exactAttemptedModel) {
-					recordExactModelExhaustion(exactAttemptedModel);
-				}
-				log.warn(
-					`Account ${account.name} out_of_credits (429${exactAttemptedModel ? `, model=${exactAttemptedModel}` : ""}) — model/beta-scoped after fallback, NOT benching account`,
-				);
-				const responseTime = Date.now() - requestMeta.timestamp;
-				ctx.asyncWriter.enqueue(() =>
-					ctx.dbOps.saveRequest(
-						crypto.randomUUID(),
-						req.method,
-						url.pathname,
-						account.id,
-						429,
-						false,
-						"out_of_credits",
-						responseTime,
-						failoverAttempts,
-						exactAttemptedModel ? { model: exactAttemptedModel } : undefined,
-						requestMeta.agentUsed ?? undefined,
-						apiKeyId ?? undefined,
-						apiKeyName ?? undefined,
-						requestMeta.project ?? null,
-						undefined,
-						requestMeta.comboName ?? null,
-						isModelRewrite(requestMeta.originalModel, requestMeta.appliedModel)
-							? (requestMeta.originalModel ?? null)
-							: null,
-						isModelRewrite(requestMeta.originalModel, requestMeta.appliedModel)
-							? (requestMeta.appliedModel ?? null)
-							: null,
-						requestMeta.projectAttributionSource ?? null,
-						requestMeta.agentAttributionSource ?? null,
-					),
-				);
-				return null;
-			}
-
-			if (
-				rawResponse.status === 429 &&
-				(await handleInferredFamily429(
-					rawResponse,
-					finalAttemptModel || currentTransportModel || requestedModel,
-				))
-			) {
-				return null;
-			}
-
 			// If still unavailable/rate-limited after exhausting the model list,
 			// failover to the next account. OpenAI-compatible providers never set
 			// isRateLimited:true in parseRateLimit, so we must handle it here.
 			if (await isModelUnavailableError(rawResponse)) {
+				if (isScopedFailure(rawFailureClassification)) {
+					return null;
+				}
 				log.warn(
 					`All models exhausted on account ${account.name}, failing over to next account`,
 				);
@@ -2440,12 +2478,11 @@ export async function proxyWithAccount(
 						const retryRaw = isSyntheticProviderResponse(retryTransport)
 							? materializeSyntheticResponse(retryTransport.clone())
 							: await makeProxyRequest(retryTransport);
-						if (
-							await handlePaymentRequired402(
-								retryRaw,
-								currentTransportModel || effectiveBodyContext.getModel(),
-							)
-						) {
+						const retryFailureClassification = await handleRawAttemptFailure(
+							retryRaw,
+							currentTransportModel || effectiveBodyContext.getModel(),
+						);
+						if (retryFailureClassification.scope !== "not-classified") {
 							return null;
 						}
 
