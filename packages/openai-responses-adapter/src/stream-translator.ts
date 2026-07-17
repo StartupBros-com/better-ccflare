@@ -112,6 +112,16 @@ function processEvent(
 	controller: TransformStreamDefaultController,
 	state: State,
 ): void {
+	// First terminal event wins, for every event type: once response.completed
+	// (or an earlier response.failed) has been emitted, nothing may follow it.
+	// A protocol-violating upstream that keeps sending framed events after
+	// message_stop, or a cap trip arriving at flush() time, must not make the
+	// terminal event non-terminal. Mirrors the Codex translator's
+	// hasSentTerminalEvents pattern; handleLimitError still terminates the
+	// stream unconditionally after this returns.
+	if (state.doneSent) {
+		return;
+	}
 	if (eventType === "message_start") {
 		const message = data.message as Record<string, unknown> | undefined;
 		const usage = message?.usage as Record<string, number> | undefined;
@@ -421,15 +431,6 @@ function processEvent(
 	}
 
 	if (eventType === "error") {
-		// First terminal event wins: once response.completed (or an earlier
-		// failure) has been emitted, a late cap trip, such as the tail-cap
-		// recheck in SseFrameBuffer.flush() throwing at stream EOF, must not
-		// emit a contradictory response.failed. Mirrors emitDone()'s doneSent
-		// guard and the Codex translator's hasSentTerminalEvents pattern;
-		// handleLimitError still terminates the stream unconditionally.
-		if (state.doneSent) {
-			return;
-		}
 		const err = data.error as Record<string, unknown> | undefined;
 		const errType = (err?.type as string) ?? "api_error";
 		const errMsg =

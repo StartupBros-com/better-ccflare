@@ -678,6 +678,70 @@ describe("translateAnthropicStreamToResponses SSE frame bounds", () => {
 		expect(cancelSpy).toHaveBeenCalled();
 	});
 
+	test("trailing content events after message_stop emit nothing after response.completed", async () => {
+		const messageStart = sseEvent("message_start", {
+			type: "message_start",
+			message: {
+				id: "msg_trailing_content",
+				usage: { input_tokens: 5, output_tokens: 0 },
+			},
+		});
+		const blockStart = sseEvent("content_block_start", {
+			type: "content_block_start",
+			index: 0,
+			content_block: { type: "text", text: "" },
+		});
+		const blockStop = sseEvent("content_block_stop", {
+			type: "content_block_stop",
+			index: 0,
+		});
+		const messageStop = sseEvent("message_stop", { type: "message_stop" });
+		// Protocol-violating upstream: after message_stop, it keeps sending
+		// well-framed content events. First terminal event wins: none of them
+		// may produce output after response.completed.
+		const trailingBlockStart = sseEvent("content_block_start", {
+			type: "content_block_start",
+			index: 1,
+			content_block: { type: "text", text: "" },
+		});
+		const trailingDelta = sseEvent("content_block_delta", {
+			type: "content_block_delta",
+			index: 1,
+			delta: { type: "text_delta", text: "late output" },
+		});
+
+		const upstream = makeAnthropicStream([
+			messageStart,
+			blockStart,
+			blockStop,
+			messageStop,
+			trailingBlockStart,
+			trailingDelta,
+		]);
+
+		const result = translateAnthropicStreamToResponses(
+			upstream,
+			"resp_trailing",
+			"claude-3-5-sonnet-20241022",
+		);
+		const parsed = await collectSseEvents(result);
+
+		expect(countEventOccurrences(parsed, "response.completed")).toBe(1);
+		expect(parsed[parsed.length - 1].event).toBe("response.completed");
+		expect(parsed.some((e) => e.event === "response.failed")).toBe(false);
+		const completedIndex = parsed.findIndex(
+			(e) => e.event === "response.completed",
+		);
+		expect(completedIndex).toBe(parsed.length - 1);
+		expect(
+			parsed.some(
+				(e) =>
+					e.event === "response.output_text.delta" &&
+					JSON.stringify(e.data).includes("late output"),
+			),
+		).toBe(false);
+	});
+
 	test("per-call tool argument cap trip emits response.failed with no response.completed after", async () => {
 		const messageStart = sseEvent("message_start", {
 			type: "message_start",
@@ -1139,6 +1203,15 @@ describe("translateAnthropicStreamToResponses bounded memory under concurrency",
 	// full measurement and accepting the minimum observed delta therefore
 	// filters out the runtime noise while still requiring the code to
 	// demonstrably hit the tight, meaningful budget below.
+	// Scope note: this suite gates RETAINED memory (leaks), not transient
+	// peak. Serialized output is a multiple of the semantic text bytes: the
+	// same text is re-emitted in output_text.done, content_part.done,
+	// output_item.done, and response.completed, so a near-4MiB block
+	// serializes to roughly 5x that on the wire, and per-delta SSE/JSON
+	// envelopes add overhead on top. That churn is transient and bounded by
+	// stream backpressure (a slow reader stalls the transform), so it is
+	// recorded by the informational benchmark's peak columns rather than
+	// gated here.
 	const PER_STREAM_BUDGET_BYTES = 20 * 1024 * 1024;
 	const MEASURE_RETRIES = 5;
 
