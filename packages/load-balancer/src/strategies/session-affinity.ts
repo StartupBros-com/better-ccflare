@@ -1,4 +1,9 @@
-import { isAccountAvailable, TIME_CONSTANTS } from "@better-ccflare/core";
+import {
+	getSessionAffinityAntiThrashWindowMs,
+	isAccountAvailable,
+	minimumRoutableTier,
+	TIME_CONSTANTS,
+} from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import type {
 	Account,
@@ -75,16 +80,36 @@ const MAX_AFFINITY_ENTRIES = 10_000;
  * only if its configured tier is strictly better than the fallback. Equal or
  * worse unavailable owners are replaced, as are routable owners outclassed by
  * a better tier (or comparable pressure class).
+ *
+ * Anti-thrash (R13): once a session's mapping is upgraded to a better tier,
+ * if that new owner fails (rate-limited/paused) within `antiThrashWindowMs`
+ * of the upgrade, further upgrades for the session are suppressed for the
+ * remainder of the window instead of re-attempting the flapping owner on
+ * every recovery. The deterministic FIRST upgrade for a session is never
+ * suppressed. Suppression is scoped per-session (per affinity-map entry),
+ * never global, and does not apply to request-scoped hard exclusions:
+ * only genuine account-level unavailability counts as a "failure".
  */
 export class SessionAffinityStrategy implements LoadBalancingStrategy {
 	private affinityTtlMs: number;
 	private maxAffinityEntries: number;
+	private antiThrashWindowMs: number;
 	private store: StrategyStore | null = null;
 	private log = new Logger("SessionAffinityStrategy");
 	/** clientId → which account it is stuck to (and when it was last touched). */
 	private affinity = new Map<
 		string,
-		{ candidateId: string; assignedAt: number }
+		{
+			candidateId: string;
+			assignedAt: number;
+			/** When the current candidateId was last installed via an upgrade
+			 * (branch: outclassed remap), or null if it was a fresh assignment or
+			 * a plain (non-upgrade) failover remap. */
+			upgradedAt: number | null;
+			/** If set and still in the future, further upgrades are suppressed
+			 * (anti-thrash) until this timestamp. */
+			suppressUpgradesUntil: number | null;
+		}
 	>();
 	/** accountId → last time it was freshly assigned to a NEW client-session. */
 	private lastPickedAt = new Map<string, number>();
@@ -92,9 +117,11 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 	constructor(
 		affinityTtlMs: number = TIME_CONSTANTS.ANTHROPIC_SESSION_DURATION_DEFAULT,
 		maxAffinityEntries: number = MAX_AFFINITY_ENTRIES,
+		antiThrashWindowMs: number = getSessionAffinityAntiThrashWindowMs(),
 	) {
 		this.affinityTtlMs = affinityTtlMs;
 		this.maxAffinityEntries = maxAffinityEntries;
+		this.antiThrashWindowMs = antiThrashWindowMs;
 	}
 
 	/** Live sticky-mapping count — read-only, for tests and ops metrics. */
@@ -271,6 +298,34 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 				}
 
 				if (mapped && best) {
+					const suppressed =
+						mapping.suppressUpgradesUntil !== null &&
+						now < mapping.suppressUpgradesUntil;
+					if (suppressed) {
+						// Anti-thrash: this session's mapping was upgraded recently and
+						// the new owner failed inside the window. Hold the current
+						// (worse-tier) owner steady for the remainder of the window
+						// instead of re-attempting the flapping better tier on every
+						// recovery.
+						mapping.assignedAt = now;
+						const others = this.rankByLeastUsed(
+							available.filter(
+								(candidate) =>
+									candidate.routing.candidateId !== mapped.routing.candidateId,
+							),
+							now,
+							meta,
+						);
+						this.log.info(
+							`Route ${affinityKey} upgrade to ${best.routing.candidateId} suppressed (anti-thrash until ${new Date(mapping.suppressUpgradesUntil as number).toISOString()}), keeping ${mapped.routing.candidateId}`,
+						);
+						return commitStrategyCandidateOrder(
+							[mapped, ...others],
+							meta,
+							best.routing.candidateId,
+						);
+					}
+
 					// A routable better tier (or comparable higher-pressure class inside
 					// the same tier) is authoritative and becomes the new sticky owner.
 					const ordered = this.pickAndMark(available, now, meta);
@@ -278,6 +333,8 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 					if (replacement) {
 						mapping.candidateId = replacement.routing.candidateId;
 						mapping.assignedAt = now;
+						mapping.upgradedAt = now;
+						mapping.suppressUpgradesUntil = null;
 					}
 					this.log.info(
 						`Route ${affinityKey} owner ${mapped.routing.candidateId} was outclassed — remapped to ${replacement?.routing.candidateId ?? best.routing.candidateId}`,
@@ -296,9 +353,62 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 						)?.routing.tier;
 					const ordered = this.pickAndMark(available, now, meta);
 					const fallback = ordered[0];
+					const bestTier =
+						minimumRoutableTier(
+							available.map((candidate) => candidate.routing.tier),
+						) ?? best.routing.tier;
+
+					// Anti-thrash fast-fail detection (R13): only genuine account-level
+					// unavailability counts as a "failure": the mapped owner is still
+					// structurally eligible (survived request-scoped hard exclusion) but
+					// absent from `available` (rate-limited/paused). A hard exclusion or
+					// a deleted account is not a flapping upstream and must not arm
+					// suppression.
+					//
+					// Structural eligibility must be read from
+					// `routingCandidateCatalog` (every configured candidate, independent
+					// of transient availability) rather than `candidates`: combo routing
+					// pre-filters paused/rate-limited slots out of `candidates` in
+					// account-selector.ts before the strategy ever runs, so a combo
+					// owner that just failed would otherwise look structurally removed
+					// and never arm suppression. `candidates` remains the fallback for
+					// callers that never populate a catalog.
+					const catalog = meta.routingCandidateCatalog;
+					const stillConfigured = catalog
+						? catalog.some(
+								(candidate) =>
+									candidate.candidateId === mapping.candidateId &&
+									!meta.hardExcludedAccountIds?.has(candidate.accountId),
+							)
+						: candidates.some(
+								(candidate) =>
+									candidate.routing.candidateId === mapping.candidateId,
+							);
+					const upgradedAt = mapping.upgradedAt;
+					const recentlyUpgraded =
+						upgradedAt !== null && now - upgradedAt < this.antiThrashWindowMs;
+					const fastFailAfterUpgrade = stillConfigured && recentlyUpgraded;
+
+					if (fastFailAfterUpgrade && upgradedAt !== null) {
+						// The owner this session was just upgraded to has already failed:
+						// arm suppression for the remainder of the window (measured from
+						// the original upgrade) and settle on the fallback instead of
+						// preserving/snapping back to the flapping owner.
+						mapping.suppressUpgradesUntil =
+							upgradedAt + this.antiThrashWindowMs;
+						if (fallback) {
+							mapping.candidateId = fallback.routing.candidateId;
+							mapping.assignedAt = now;
+							mapping.upgradedAt = null;
+							this.log.info(
+								`Route ${affinityKey} upgraded owner failed inside the anti-thrash window, suppressing further upgrades until ${new Date(mapping.suppressUpgradesUntil).toISOString()}, settled on ${fallback.routing.candidateId}`,
+							);
+						}
+						return commitStrategyCandidateOrder(ordered, meta);
+					}
+
 					const preserveForSnapback =
-						configuredOwnerTier !== undefined &&
-						configuredOwnerTier < best.routing.tier;
+						configuredOwnerTier !== undefined && configuredOwnerTier < bestTier;
 					if (preserveForSnapback) {
 						// Refresh while the client remains active so a legal temporary
 						// failover does not expire the better-tier owner mapping.
@@ -309,6 +419,7 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 					} else if (fallback) {
 						mapping.candidateId = fallback.routing.candidateId;
 						mapping.assignedAt = now;
+						mapping.upgradedAt = null;
 						this.log.info(
 							`Route ${affinityKey} unavailable equal/worse owner remapped to ${fallback.routing.candidateId}`,
 						);
@@ -329,6 +440,8 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 			this.affinity.set(affinityKey, {
 				candidateId: chosen.routing.candidateId,
 				assignedAt: now,
+				upgradedAt: null,
+				suppressUpgradesUntil: null,
 			});
 			this.log.debug(
 				`Assigned route ${affinityKey} → ${chosen.account.name}/${chosen.routing.candidateId} (least-used)`,

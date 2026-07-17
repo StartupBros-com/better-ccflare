@@ -1,3 +1,4 @@
+import { minimumRoutableTier } from "@better-ccflare/core";
 import type {
 	Account,
 	RequestMeta,
@@ -155,7 +156,10 @@ export class CacheAffinityOrderer {
 			const catalogOwner = meta.routingCandidateCatalog?.find(
 				(candidate) => candidate.candidateId === mapping?.candidateId,
 			);
-			if (catalogOwner && catalogOwner.tier < best.routing.tier) {
+			const bestTier =
+				minimumRoutableTier(eligible.map((pair) => pair.routing.tier)) ??
+				best.routing.tier;
+			if (catalogOwner && catalogOwner.tier < bestTier) {
 				// Legal snapback: only a configured strictly-better owner survives a
 				// transient absence. Refresh while the conversation remains active.
 				mapping.assignedAt = now;
@@ -174,6 +178,21 @@ export class CacheAffinityOrderer {
 			// A routable better tier, or a comparable higher-pressure candidate
 			// inside the same tier, replaces the old owner immediately.
 			mapping.candidateId = best.routing.candidateId;
+			mapping.assignedAt = now;
+			return accounts;
+		}
+
+		if (
+			meta.affinityUpgradeSuppressedCandidateId !== null &&
+			meta.affinityUpgradeSuppressedCandidateId !== undefined &&
+			owner.routing.candidateId === meta.affinityUpgradeSuppressedCandidateId
+		) {
+			// R13 anti-thrash: SessionAffinityStrategy already declined to
+			// promote this same candidate this request because it flapped
+			// inside the anti-thrash window. Honor that suppression instead of
+			// re-promoting it ahead of the already-committed first candidate;
+			// the mapping itself is left untouched so promotion resumes on its
+			// own once the window elapses and the annotation stops appearing.
 			mapping.assignedAt = now;
 			return accounts;
 		}

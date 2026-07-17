@@ -7,6 +7,7 @@ export {
 	getOverloadRetryConfig,
 	getRateLimitMaxCooldownMs,
 	getRateLimitResetStabilityMs,
+	getSessionAffinityAntiThrashWindowMs,
 	HTTP_STATUS,
 	LIMITS,
 	NETWORK,

@@ -441,6 +441,224 @@ describe("SessionAffinityStrategy", () => {
 			).toBeNull();
 		});
 	});
+	describe("anti-thrash suppression (R13)", () => {
+		it("keeps AE5's deterministic first upgrade immediate", async () => {
+			const low = makeAccount({ id: "low", priority: 1 });
+			const high = makeAccount({ id: "high", priority: 0 });
+			const laneMeta = {
+				...metaFor("anti-thrash-first-upgrade"),
+				affinityLaneKey: "anti-thrash-first-upgrade:anthropic:opus",
+			} as RequestMeta;
+
+			expect((await strategy.select([low], laneMeta))[0].id).toBe("low");
+			// The very first upgrade to a routable better tier is never suppressed.
+			expect((await strategy.select([low, high], laneMeta))[0].id).toBe("high");
+		});
+
+		it("does not remap a flapping better-tier owner a second time inside the anti-thrash window, and resumes upgrades once it elapses", async () => {
+			const windowMs = 40;
+			const flappy = new SessionAffinityStrategy(
+				undefined,
+				undefined,
+				windowMs,
+			);
+			flappy.initialize(store);
+
+			const low = makeAccount({ id: "low", priority: 1 });
+			const high = makeAccount({ id: "high", priority: 0 });
+			const laneMeta = {
+				...metaFor("flapping-client"),
+				affinityLaneKey: "flapping-client:anthropic:opus",
+			} as RequestMeta;
+
+			// Initial assignment lands on the only available (worse-tier) account.
+			expect((await flappy.select([low], laneMeta))[0].id).toBe("low");
+
+			// The better tier becomes routable: deterministic first upgrade, immediate.
+			expect((await flappy.select([low, high], laneMeta))[0].id).toBe("high");
+
+			// The newly-upgraded owner fails inside the window: falls back to low
+			// and arms suppression for the remainder of the window.
+			const highDown = makeAccount({
+				id: "high",
+				priority: 0,
+				rate_limited_until: Date.now() + 60_000,
+			});
+			expect((await flappy.select([low, highDown], laneMeta))[0].id).toBe(
+				"low",
+			);
+
+			// high "recovers" immediately, still well inside the window: must NOT
+			// remap the session a second time.
+			expect((await flappy.select([low, high], laneMeta))[0].id).toBe("low");
+			expect((await flappy.select([low, high], laneMeta))[0].id).toBe("low");
+
+			// Let the anti-thrash window elapse.
+			const start = Date.now();
+			while (Date.now() - start < windowMs + 20) {
+				/* busy-wait past the anti-thrash window */
+			}
+
+			// Upgrade resumes once the window has passed.
+			expect((await flappy.select([low, high], laneMeta))[0].id).toBe("high");
+		});
+
+		it("scopes suppression per-session, not globally", async () => {
+			const windowMs = 60_000; // long enough this test's own timing can't race it
+			const flappy = new SessionAffinityStrategy(
+				undefined,
+				undefined,
+				windowMs,
+			);
+			flappy.initialize(store);
+
+			const low = makeAccount({ id: "low", priority: 1 });
+			const high = makeAccount({ id: "high", priority: 0 });
+			const flappingMeta = {
+				...metaFor("flapping-client-2"),
+				affinityLaneKey: "flapping-client-2:anthropic:opus",
+			} as RequestMeta;
+			const otherMeta = {
+				...metaFor("other-client-2"),
+				affinityLaneKey: "other-client-2:anthropic:opus",
+			} as RequestMeta;
+
+			// Session A upgrades, then its new owner fails fast: suppression is
+			// armed for session A only.
+			expect((await flappy.select([low], flappingMeta))[0].id).toBe("low");
+			expect((await flappy.select([low, high], flappingMeta))[0].id).toBe(
+				"high",
+			);
+			const highDown = makeAccount({
+				id: "high",
+				priority: 0,
+				rate_limited_until: Date.now() + 60_000,
+			});
+			expect((await flappy.select([low, highDown], flappingMeta))[0].id).toBe(
+				"low",
+			);
+			expect((await flappy.select([low, high], flappingMeta))[0].id).toBe(
+				"low",
+			);
+
+			// Session B (a different client) still gets its own immediate upgrade
+			// to the very same physical "high" account: suppression never leaked
+			// across sessions.
+			expect((await flappy.select([low], otherMeta))[0].id).toBe("low");
+			expect((await flappy.select([low, high], otherMeta))[0].id).toBe("high");
+		});
+
+		it("does not treat a request-scoped hard exclusion of the upgraded owner as anti-thrash flapping", async () => {
+			const windowMs = 60_000;
+			const flappy = new SessionAffinityStrategy(
+				undefined,
+				undefined,
+				windowMs,
+			);
+			flappy.initialize(store);
+
+			const low = makeAccount({ id: "low", priority: 1 });
+			const high = makeAccount({ id: "high", priority: 0 });
+			const laneMeta = {
+				...metaFor("excluded-not-flapping-client"),
+				affinityLaneKey: "excluded-not-flapping-client:anthropic:opus",
+			} as RequestMeta;
+
+			expect((await flappy.select([low], laneMeta))[0].id).toBe("low");
+			expect((await flappy.select([low, high], laneMeta))[0].id).toBe("high");
+
+			// high is excluded for one request (e.g. model mismatch), not failing.
+			expect(
+				(
+					await flappy.select([low, high], {
+						...laneMeta,
+						hardExcludedAccountIds: new Set(["high"]),
+					} as RequestMeta)
+				)[0].id,
+			).toBe("low");
+
+			// Since that wasn't a genuine failure, no suppression should have been
+			// armed: high is immediately usable again next request.
+			expect((await flappy.select([low, high], laneMeta))[0].id).toBe("high");
+		});
+
+		it("arms suppression for a combo route whose owner fast-fails, even though combo pre-filtering removes it from `accounts` before select() runs", async () => {
+			// account-selector.ts's combo path always builds
+			// routingCandidateCatalog from every enabled slot regardless of
+			// availability, but it filters paused/rate-limited slots out of the
+			// `accounts` array it passes to select() -- unlike normal routing,
+			// where a failed account remains in `accounts` and is only excluded
+			// by the strategy's own isAccountAvailable check. Fast-fail detection
+			// must read structural eligibility from the catalog, not `accounts`.
+			const windowMs = 40;
+			const flappy = new SessionAffinityStrategy(
+				undefined,
+				undefined,
+				windowMs,
+			);
+			flappy.initialize(store);
+
+			const low = makeAccount({ id: "low", priority: 1 });
+			const high = makeAccount({ id: "high", priority: 0 });
+			const laneMeta = {
+				...metaFor("combo-flapping-client"),
+				affinityLaneKey: "combo-flapping-client:anthropic:opus",
+			} as RequestMeta;
+			const catalog = [
+				{
+					candidateId: "combo:c1:slot:low",
+					accountId: "low",
+					tier: 1,
+					ordinal: 0,
+					comboSlotId: "slot-low",
+					modelOverride: "claude-opus-4-8",
+					quotaPressure: null,
+				},
+				{
+					candidateId: "combo:c1:slot:high",
+					accountId: "high",
+					tier: 0,
+					ordinal: 1,
+					comboSlotId: "slot-high",
+					modelOverride: "claude-opus-4-8",
+					quotaPressure: null,
+				},
+			];
+			const comboMeta = (): RequestMeta =>
+				({ ...laneMeta, routingCandidateCatalog: catalog }) as RequestMeta;
+
+			// Initial assignment: high starts rate-limited and is pre-filtered
+			// out of `accounts` by account-selector's combo path.
+			expect((await flappy.select([low], comboMeta()))[0].id).toBe("low");
+
+			// high recovers and is passed through: deterministic first upgrade.
+			expect((await flappy.select([low, high], comboMeta()))[0].id).toBe(
+				"high",
+			);
+
+			// high fails again inside the window. The combo pre-filter removes
+			// it from `accounts` entirely -- it survives only in
+			// routingCandidateCatalog.
+			expect((await flappy.select([low], comboMeta()))[0].id).toBe("low");
+
+			// high recovers a second time, still well inside the anti-thrash
+			// window: must NOT remap the session a second time.
+			expect((await flappy.select([low, high], comboMeta()))[0].id).toBe("low");
+			expect((await flappy.select([low, high], comboMeta()))[0].id).toBe("low");
+
+			// Let the anti-thrash window elapse.
+			const start = Date.now();
+			while (Date.now() - start < windowMs + 20) {
+				/* busy-wait past the anti-thrash window */
+			}
+
+			// Upgrade resumes once the window has passed.
+			expect((await flappy.select([low, high], comboMeta()))[0].id).toBe(
+				"high",
+			);
+		});
+	});
+
 	it("does not own xAI cache affinity inside the generic session strategy", async () => {
 		const accounts = [
 			makeAccount({ id: "a", provider: "xai" }),

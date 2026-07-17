@@ -88,6 +88,15 @@ export interface RequestMeta {
 	/** Candidate metadata aligned index-for-index with the current account list. */
 	routingCandidates?: readonly RoutingCandidateMetadata[] | null;
 	/**
+	 * Set by SessionAffinityStrategy (R13 anti-thrash) when an active
+	 * suppression window prevents this request from upgrading to an
+	 * otherwise-routable better-tier candidate. Downstream orderers that
+	 * reorder the already-committed candidate list (e.g. CacheAffinityOrderer)
+	 * must not promote this candidate ahead of the committed first candidate.
+	 * Null whenever no upgrade is currently being suppressed.
+	 */
+	affinityUpgradeSuppressedCandidateId?: string | null;
+	/**
 	 * Optional conversation-level sticky key (e.g. Grok cache-native affinity).
 	 * Owned exclusively by the proxy's xAI CacheAffinityOrderer.
 	 */
