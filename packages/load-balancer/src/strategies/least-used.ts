@@ -8,8 +8,10 @@ import type {
 } from "@better-ccflare/types";
 import { isPeekAvailable, wouldAutoUnpause } from "./peek-availability";
 import {
-	compareRoutingMetadata,
-	filterHardExcludedAccounts,
+	commitStrategyCandidateOrder,
+	compareStrategyCandidates,
+	filterHardExcludedCandidates,
+	zipStrategyCandidates,
 } from "./routing-metadata";
 
 /**
@@ -93,53 +95,69 @@ export class LeastUsedStrategy implements LoadBalancingStrategy {
 
 	select(accounts: Account[], meta: RequestMeta): Account[] {
 		const now = Date.now();
-		const candidates = filterHardExcludedAccounts(accounts, meta);
+		const candidates = filterHardExcludedCandidates(
+			zipStrategyCandidates(accounts, meta),
+			meta,
+		);
 
 		// Auto-unpause eligible accounts whose upstream usage window has reset.
 		// Mirrors SessionStrategy's checkForAutoFallbackAccounts path so users
 		// who configured auto_fallback_enabled accounts get the same self-recovery
 		// behaviour regardless of which strategy they pick.
-		this.autoUnpauseElapsedAccounts(candidates, now);
+		this.autoUnpauseElapsedAccounts(
+			candidates.map((candidate) => candidate.account),
+			now,
+		);
 
-		const available = candidates.filter((a) => isAccountAvailable(a, now));
-		if (available.length === 0) return [];
+		const available = candidates.filter((candidate) =>
+			isAccountAvailable(candidate.account, now),
+		);
+		if (available.length === 0) {
+			return commitStrategyCandidateOrder([], meta);
+		}
 
 		// Score each account: priority is primary, then upstream utilization
 		// plus a recency penalty for accounts picked in the recent window.
 		// Treat null utilization as 0 so newly-added accounts (no usage data
 		// yet) are preferred over fully-utilized ones.
-		const scored = available.map((a) => {
-			const util = this.store?.getAccountUtilization?.(a.id, a.provider) ?? 0;
-			const lastPick = this.lastPickedAt.get(a.id) ?? 0;
+		const scored = available.map((candidate) => {
+			const { account } = candidate;
+			const util =
+				this.store?.getAccountUtilization?.(account.id, account.provider) ?? 0;
+			const lastPick = this.lastPickedAt.get(account.id) ?? 0;
 			const recencyPenalty =
 				now - lastPick < RECENT_PICK_WINDOW_MS ? RECENT_PICK_PENALTY : 0;
-			return { account: a, score: util + recencyPenalty };
+			return { candidate, score: util + recencyPenalty };
 		});
 
 		const sorted = scored
 			.sort((a, b) => {
-				const routingOrder = compareRoutingMetadata(a.account, b.account, meta);
+				const routingOrder = compareStrategyCandidates(
+					a.candidate,
+					b.candidate,
+					meta,
+				);
 				if (routingOrder !== 0) return routingOrder;
 				return a.score - b.score;
 			})
-			.map((s) => s.account);
+			.map((entry) => entry.candidate);
 
 		// Mark the primary as recently picked so the *next* concurrent
 		// select() within RECENT_PICK_WINDOW_MS prefers a different account.
 		// Opportunistic GC: prune entries older than 10× the window so the
 		// map doesn't grow unboundedly when accounts come and go.
 		const primary = sorted[0];
-		this.lastPickedAt.set(primary.id, now);
+		if (primary) this.lastPickedAt.set(primary.account.id, now);
 		const gcThreshold = now - RECENT_PICK_WINDOW_MS * 10;
 		for (const [id, ts] of this.lastPickedAt) {
 			if (ts < gcThreshold) this.lastPickedAt.delete(id);
 		}
 
 		this.log.debug(
-			`Selected ${sorted.length} account(s) by least-used (primary ${primary.name}): ${sorted.map((a) => a.name).join(", ")}`,
+			`Selected ${sorted.length} account(s) by least-used (primary ${primary?.account.name ?? "none"}): ${sorted.map((candidate) => candidate.account.name).join(", ")}`,
 		);
 
-		return sorted;
+		return commitStrategyCandidateOrder(sorted, meta);
 	}
 
 	/**

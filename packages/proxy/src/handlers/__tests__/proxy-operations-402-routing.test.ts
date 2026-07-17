@@ -390,7 +390,9 @@ describe("raw upstream HTTP 402 routing", () => {
 		expect(response.status).toBe(200);
 		expect(first.cancelReasons).toEqual([undefined]);
 		expect(harness.getActiveComboForFamily).toHaveBeenCalledTimes(1);
-		expect(harness.strategySelect).not.toHaveBeenCalled();
+		// Active combo candidates now flow through the configured strategy as one
+		// atomic candidate list before the request-local failover loop starts.
+		expect(harness.strategySelect).toHaveBeenCalledTimes(1);
 	});
 
 	it.each([

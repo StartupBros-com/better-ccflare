@@ -12,9 +12,12 @@ import {
 } from "@better-ccflare/types";
 import { isPeekAvailable } from "./peek-availability";
 import {
+	commitStrategyCandidateOrder,
 	compareRoutingMetadata,
-	filterHardExcludedAccounts,
-	isSameRoutingClass,
+	compareStrategyCandidates,
+	filterHardExcludedCandidates,
+	isSameStrategyCandidateClass,
+	zipStrategyCandidates,
 } from "./routing-metadata";
 
 export { LeastUsedStrategy } from "./least-used";
@@ -180,7 +183,10 @@ export class SessionStrategy implements LoadBalancingStrategy {
 
 	select(accounts: Account[], meta: RequestMeta): Account[] {
 		const now = Date.now();
-		const candidates = filterHardExcludedAccounts(accounts, meta);
+		const candidates = filterHardExcludedCandidates(
+			zipStrategyCandidates(accounts, meta),
+			meta,
+		);
 
 		// Check if session tracking should be bypassed (for auto-refresh messages)
 		const bypassHeader = meta.headers?.get("x-better-ccflare-bypass-session");
@@ -206,7 +212,7 @@ export class SessionStrategy implements LoadBalancingStrategy {
 		// Check for higher priority accounts that have become available due to rate limit reset.
 		// Iterate through all candidates in priority order to find the first usable one.
 		const fallbackCandidates = this.checkForAutoFallbackAccounts(
-			candidates,
+			candidates.map((candidate) => candidate.account),
 			now,
 			meta,
 		);
@@ -261,9 +267,10 @@ export class SessionStrategy implements LoadBalancingStrategy {
 			// Return all available accounts sorted by priority — chosenFallback will appear
 			// first naturally if it is the highest-priority available account, avoiding
 			// priority inversion when other accounts rank higher.
-			return candidates
-				.filter((a) => getCachedAvailability(a))
-				.sort((a, b) => compareRoutingMetadata(a, b, meta));
+			const ordered = candidates
+				.filter((candidate) => getCachedAvailability(candidate.account))
+				.sort((a, b) => compareStrategyCandidates(a, b, meta));
+			return commitStrategyCandidateOrder(ordered, meta);
 		}
 
 		// Find account with active session (most recent session_start within window)
@@ -271,7 +278,7 @@ export class SessionStrategy implements LoadBalancingStrategy {
 		let activeAccount: Account | null = null;
 		let mostRecentSessionStart = 0;
 
-		for (const account of candidates) {
+		for (const { account } of candidates) {
 			if (
 				this.hasActiveSession(account, now) &&
 				account.session_start &&
@@ -297,27 +304,37 @@ export class SessionStrategy implements LoadBalancingStrategy {
 		// remains inside the best immutable priority/pressure routing class.
 		if (activeAccount && getCachedAvailability(activeAccount)) {
 			const bestAvailable = candidates
-				.filter((a) => getCachedAvailability(a))
+				.filter((candidate) => getCachedAvailability(candidate.account))
 				.sort((a, b) => {
-					const routingOrder = compareRoutingMetadata(a, b, meta);
+					const routingOrder = compareStrategyCandidates(a, b, meta);
 					if (routingOrder !== 0) return routingOrder;
 					const utilA =
-						this.store?.getAccountUtilization?.(a.id, a.provider) ?? 0;
+						this.store?.getAccountUtilization?.(
+							a.account.id,
+							a.account.provider,
+						) ?? 0;
 					const utilB =
-						this.store?.getAccountUtilization?.(b.id, b.provider) ?? 0;
+						this.store?.getAccountUtilization?.(
+							b.account.id,
+							b.account.provider,
+						) ?? 0;
 					return utilA - utilB;
 				})[0];
+			const activeCandidate = candidates
+				.filter((candidate) => candidate.account.id === activeAccount.id)
+				.sort((a, b) => compareStrategyCandidates(a, b, meta))[0];
 
 			if (
 				bestAvailable &&
-				!isSameRoutingClass(activeAccount, bestAvailable, meta)
+				activeCandidate &&
+				!isSameStrategyCandidateClass(activeCandidate, bestAvailable, meta)
 			) {
 				this.log.info(
-					`Skipping session on account ${activeAccount.name} (priority: ${activeAccount.priority}) — account ${bestAvailable.name} is in a better routing class`,
+					`Skipping session on account ${activeAccount.name} (candidate: ${activeCandidate.routing.candidateId}) — candidate ${bestAvailable.routing.candidateId} is in a better routing class`,
 				);
 				// Fall through to normal priority/pressure selection without clearing
 				// session_start, so the owner can snap back when it is best again.
-			} else {
+			} else if (activeCandidate) {
 				// Reset session if expired (shouldn't happen but just in case)
 				if (!bypassSession) {
 					this.resetSessionIfExpired(activeAccount);
@@ -327,9 +344,14 @@ export class SessionStrategy implements LoadBalancingStrategy {
 				);
 				// Return active account first, then others as fallback (sorted by priority)
 				const others = candidates
-					.filter((a) => a.id !== activeAccount.id && getCachedAvailability(a))
-					.sort((a, b) => compareRoutingMetadata(a, b, meta));
-				return [activeAccount, ...others];
+					.filter(
+						(candidate) =>
+							candidate.routing.candidateId !==
+								activeCandidate.routing.candidateId &&
+							getCachedAvailability(candidate.account),
+					)
+					.sort((a, b) => compareStrategyCandidates(a, b, meta));
+				return commitStrategyCandidateOrder([activeCandidate, ...others], meta);
 			}
 		}
 
@@ -338,31 +360,38 @@ export class SessionStrategy implements LoadBalancingStrategy {
 		// Within the same priority, break ties by utilization (ascending) so that the
 		// account with the most remaining capacity is chosen first.
 		const available = candidates
-			.filter((a) => getCachedAvailability(a))
+			.filter((candidate) => getCachedAvailability(candidate.account))
 			.sort((a, b) => {
-				const routingOrder = compareRoutingMetadata(a, b, meta);
+				const routingOrder = compareStrategyCandidates(a, b, meta);
 				if (routingOrder !== 0) return routingOrder;
 				// Treat null as 0: an account with no usage data is assumed fresh
 				// (maximum remaining capacity). This prevents newly-added accounts
 				// from being permanently sidelined until all others expire.
 				const utilA =
-					this.store?.getAccountUtilization?.(a.id, a.provider) ?? 0;
+					this.store?.getAccountUtilization?.(
+						a.account.id,
+						a.account.provider,
+					) ?? 0;
 				const utilB =
-					this.store?.getAccountUtilization?.(b.id, b.provider) ?? 0;
+					this.store?.getAccountUtilization?.(
+						b.account.id,
+						b.account.provider,
+					) ?? 0;
 				return utilA - utilB;
 			});
 
-		if (available.length === 0) return [];
+		if (available.length === 0) {
+			return commitStrategyCandidateOrder([], meta);
+		}
 
 		// Pick the highest priority account (first in sorted list) and start a new session with it
 		const chosenAccount = available[0];
-		if (!bypassSession) {
-			this.resetSessionIfExpired(chosenAccount);
+		if (!bypassSession && chosenAccount) {
+			this.resetSessionIfExpired(chosenAccount.account);
 		}
 
 		// Return chosen account first, then others as fallback (already sorted by priority)
-		const others = available.filter((a) => a.id !== chosenAccount.id);
-		return [chosenAccount, ...others];
+		return commitStrategyCandidateOrder(available, meta);
 	}
 
 	/**
