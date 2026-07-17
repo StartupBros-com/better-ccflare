@@ -155,7 +155,7 @@ describe("incident 2026-07-09 — account-wide cooldown from a scoped upstream 4
 		expect(isAccountAvailable(account, T0)).toBe(false);
 	});
 
-	it("with every unpaused account benched, a new-session request gets 503 pool_exhausted", async () => {
+	it("with every unpaused account benched but no verified recovery, a new-session request gets non-retryable 503 route_unavailable", async () => {
 		Date.now = () => T0;
 		const alt3 = makeAccount({ id: "alt-3", name: "MAX_200_ALT_3" });
 		const alt2 = makeAccount({ id: "alt-2", name: "MAX_200_ALT_2" });
@@ -177,6 +177,9 @@ describe("incident 2026-07-09 — account-wide cooldown from a scoped upstream 4
 			// ALT_2, 429'd again — each attempt benched its account.
 			applyRateLimitCooldown(alt3, { reason: "model_fallback_429" }, ctx);
 			applyRateLimitCooldown(alt2, { reason: "model_fallback_429" }, ctx);
+			const expectedUntil = T0 + computeRateLimitBackoffMs(1);
+			expect(alt3.rate_limited_until).toBe(expectedUntil);
+			expect(alt2.rate_limited_until).toBe(expectedUntil);
 
 			const response = await handleProxy(
 				makeRequest(),
@@ -186,14 +189,13 @@ describe("incident 2026-07-09 — account-wide cooldown from a scoped upstream 4
 
 			expect(response.status).toBe(503);
 			const body = (await response.json()) as Record<string, unknown>;
+			expect(body.type).toBe("error");
 			const error = body.error as Record<string, unknown>;
-			expect(error.type).toBe("pool_exhausted");
-
-			// Recovery time advertised to the client = end of the 30s backoff …
-			const expectedUntil = T0 + computeRateLimitBackoffMs(1);
-			expect(error.next_available_at).toBe(
-				new Date(expectedUntil).toISOString(),
-			);
+			expect(error.type).toBe("service_unavailable");
+			expect(error.code).toBe("route_unavailable");
+			expect("next_available_at" in error).toBe(false);
+			expect(response.headers.get("Retry-After")).toBeNull();
+			expect(response.headers.get("x-better-ccflare-pool-status")).toBeNull();
 		} finally {
 			collectorSpy.mockRestore();
 		}

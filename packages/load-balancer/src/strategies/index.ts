@@ -11,6 +11,11 @@ import {
 	requiresSessionDurationTracking,
 } from "@better-ccflare/types";
 import { isPeekAvailable } from "./peek-availability";
+import {
+	compareRoutingMetadata,
+	filterHardExcludedAccounts,
+	isSameRoutingClass,
+} from "./routing-metadata";
 
 export { LeastUsedStrategy } from "./least-used";
 export { SessionAffinityStrategy } from "./session-affinity";
@@ -175,6 +180,7 @@ export class SessionStrategy implements LoadBalancingStrategy {
 
 	select(accounts: Account[], meta: RequestMeta): Account[] {
 		const now = Date.now();
+		const candidates = filterHardExcludedAccounts(accounts, meta);
 
 		// Check if session tracking should be bypassed (for auto-refresh messages)
 		const bypassHeader = meta.headers?.get("x-better-ccflare-bypass-session");
@@ -199,7 +205,11 @@ export class SessionStrategy implements LoadBalancingStrategy {
 
 		// Check for higher priority accounts that have become available due to rate limit reset.
 		// Iterate through all candidates in priority order to find the first usable one.
-		const fallbackCandidates = this.checkForAutoFallbackAccounts(accounts, now);
+		const fallbackCandidates = this.checkForAutoFallbackAccounts(
+			candidates,
+			now,
+			meta,
+		);
 		let chosenFallback: Account | null = null;
 		const skippedByReason = new Map<string, string[]>();
 		for (const candidate of fallbackCandidates) {
@@ -251,9 +261,9 @@ export class SessionStrategy implements LoadBalancingStrategy {
 			// Return all available accounts sorted by priority — chosenFallback will appear
 			// first naturally if it is the highest-priority available account, avoiding
 			// priority inversion when other accounts rank higher.
-			return accounts
+			return candidates
 				.filter((a) => getCachedAvailability(a))
-				.sort((a, b) => a.priority - b.priority);
+				.sort((a, b) => compareRoutingMetadata(a, b, meta));
 		}
 
 		// Find account with active session (most recent session_start within window)
@@ -261,7 +271,7 @@ export class SessionStrategy implements LoadBalancingStrategy {
 		let activeAccount: Account | null = null;
 		let mostRecentSessionStart = 0;
 
-		for (const account of accounts) {
+		for (const account of candidates) {
 			if (
 				this.hasActiveSession(account, now) &&
 				account.session_start &&
@@ -283,24 +293,30 @@ export class SessionStrategy implements LoadBalancingStrategy {
 			);
 		}
 
-		// If we have an active account and it's available, use it — unless a higher-priority
-		// non-session account is available (priority is more important than stickiness).
+		// If we have an active account and it's available, use it only while it
+		// remains inside the best immutable priority/pressure routing class.
 		if (activeAccount && getCachedAvailability(activeAccount)) {
-			// Check if any available account has strictly higher priority than the active session account
-			const higherPriorityAccount = accounts
-				.filter(
-					(a) =>
-						a.id !== activeAccount.id &&
-						getCachedAvailability(a) &&
-						a.priority < activeAccount.priority,
-				)
-				.sort((a, b) => a.priority - b.priority)[0];
+			const bestAvailable = candidates
+				.filter((a) => getCachedAvailability(a))
+				.sort((a, b) => {
+					const routingOrder = compareRoutingMetadata(a, b, meta);
+					if (routingOrder !== 0) return routingOrder;
+					const utilA =
+						this.store?.getAccountUtilization?.(a.id, a.provider) ?? 0;
+					const utilB =
+						this.store?.getAccountUtilization?.(b.id, b.provider) ?? 0;
+					return utilA - utilB;
+				})[0];
 
-			if (higherPriorityAccount) {
+			if (
+				bestAvailable &&
+				!isSameRoutingClass(activeAccount, bestAvailable, meta)
+			) {
 				this.log.info(
-					`Skipping session on account ${activeAccount.name} (priority: ${activeAccount.priority}) — higher-priority account ${higherPriorityAccount.name} (priority: ${higherPriorityAccount.priority}) is available`,
+					`Skipping session on account ${activeAccount.name} (priority: ${activeAccount.priority}) — account ${bestAvailable.name} is in a better routing class`,
 				);
-				// Fall through to normal priority-based selection below by nulling activeAccount
+				// Fall through to normal priority/pressure selection without clearing
+				// session_start, so the owner can snap back when it is best again.
 			} else {
 				// Reset session if expired (shouldn't happen but just in case)
 				if (!bypassSession) {
@@ -310,9 +326,9 @@ export class SessionStrategy implements LoadBalancingStrategy {
 					`Continuing session for account ${activeAccount.name} (${activeAccount.session_request_count} requests in session)`,
 				);
 				// Return active account first, then others as fallback (sorted by priority)
-				const others = accounts
+				const others = candidates
 					.filter((a) => a.id !== activeAccount.id && getCachedAvailability(a))
-					.sort((a, b) => a.priority - b.priority);
+					.sort((a, b) => compareRoutingMetadata(a, b, meta));
 				return [activeAccount, ...others];
 			}
 		}
@@ -321,10 +337,11 @@ export class SessionStrategy implements LoadBalancingStrategy {
 		// Filter available accounts and sort by priority (lower number = higher priority).
 		// Within the same priority, break ties by utilization (ascending) so that the
 		// account with the most remaining capacity is chosen first.
-		const available = accounts
+		const available = candidates
 			.filter((a) => getCachedAvailability(a))
 			.sort((a, b) => {
-				if (a.priority !== b.priority) return a.priority - b.priority;
+				const routingOrder = compareRoutingMetadata(a, b, meta);
+				if (routingOrder !== 0) return routingOrder;
 				// Treat null as 0: an account with no usage data is assumed fresh
 				// (maximum remaining capacity). This prevents newly-added accounts
 				// from being permanently sidelined until all others expire.
@@ -355,6 +372,7 @@ export class SessionStrategy implements LoadBalancingStrategy {
 	private checkForAutoFallbackAccounts(
 		accounts: Account[],
 		now: number,
+		meta?: RequestMeta,
 	): Account[] {
 		// Find accounts with auto-fallback enabled that:
 		// 1. Have an API reset time that has passed (usage window has reset)
@@ -385,6 +403,6 @@ export class SessionStrategy implements LoadBalancingStrategy {
 		if (resetAccounts.length === 0) return [];
 
 		// Sort by priority (lower number = higher priority)
-		return resetAccounts.sort((a, b) => a.priority - b.priority);
+		return resetAccounts.sort((a, b) => compareRoutingMetadata(a, b, meta));
 	}
 }

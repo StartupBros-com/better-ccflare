@@ -116,9 +116,177 @@ describe("SessionAffinityStrategy", () => {
 		expect(new Set([a, b])).toEqual(new Set(["x", "y"]));
 	});
 
-	it("temporarily fails over when the pinned account is unavailable but keeps the mapping (snap-back)", () => {
-		const x = makeAccount({ id: "x" });
-		const y = makeAccount({ id: "y" });
+	it("keeps independent Fable and Opus owners for the same client session", () => {
+		const accounts = [makeAccount({ id: "x" }), makeAccount({ id: "y" })];
+		const fableMeta = {
+			...metaFor("same-client"),
+			affinityLaneKey: "same-client:anthropic:fable",
+		} as RequestMeta;
+		const opusMeta = {
+			...metaFor("same-client"),
+			affinityLaneKey: "same-client:anthropic:opus",
+		} as RequestMeta;
+
+		const fableOwner = strategy.select(accounts, fableMeta)[0].id;
+		const opusOwner = strategy.select(accounts, opusMeta)[0].id;
+
+		expect(opusOwner).not.toBe(fableOwner);
+		expect(strategy.select(accounts, fableMeta)[0].id).toBe(fableOwner);
+		expect(strategy.select(accounts, opusMeta)[0].id).toBe(opusOwner);
+	});
+
+	it("replaces a sticky lower-priority owner when a better tier becomes routable", () => {
+		const low = makeAccount({ id: "low", priority: 1 });
+		const high = makeAccount({ id: "high", priority: 0 });
+		const laneMeta = {
+			...metaFor("same-client"),
+			affinityLaneKey: "same-client:anthropic:opus",
+		} as RequestMeta;
+
+		expect(strategy.select([low], laneMeta)[0].id).toBe("low");
+		expect(strategy.select([low, high], laneMeta)[0].id).toBe("high");
+		// The better-tier owner replaces the old mapping; making the two accounts
+		// equal later must not resurrect the displaced lower-tier owner.
+		expect(
+			strategy.select(
+				[low, makeAccount({ id: "high", priority: 1 })],
+				laneMeta,
+			)[0].id,
+		).toBe("high");
+
+		const highExcluded = {
+			...laneMeta,
+			hardExcludedAccountIds: new Set(["high"]),
+		} as RequestMeta;
+		expect(strategy.select([low, high], highExcluded)[0].id).toBe("low");
+	});
+
+	it("preserves a temporarily excluded owner only when its tier is strictly better", () => {
+		const x = makeAccount({ id: "x", priority: 0 });
+		const y = makeAccount({ id: "y", priority: 1 });
+		const laneMeta = {
+			...metaFor("same-client"),
+			affinityLaneKey: "same-client:anthropic:fable",
+		} as RequestMeta;
+
+		expect(strategy.select([x], laneMeta)[0].id).toBe("x");
+		expect(
+			strategy.select([y], {
+				...laneMeta,
+				routingCandidateCatalog: [
+					{
+						candidateId: "account:x",
+						accountId: "x",
+						tier: 0,
+						ordinal: 0,
+						comboSlotId: null,
+						modelOverride: "claude-fable-5",
+						quotaPressure: null,
+					},
+					{
+						candidateId: "account:y",
+						accountId: "y",
+						tier: 1,
+						ordinal: 1,
+						comboSlotId: null,
+						modelOverride: "claude-fable-5",
+						quotaPressure: null,
+					},
+				],
+			} as RequestMeta)[0].id,
+		).toBe("y");
+		expect(strategy.select([x, y], laneMeta)[0].id).toBe("x");
+	});
+
+	it("remaps an unavailable equal-tier owner instead of snapping back", () => {
+		const x = makeAccount({ id: "x", priority: 0 });
+		const y = makeAccount({ id: "y", priority: 0 });
+		const laneMeta = {
+			...metaFor("equal-tier-client"),
+			affinityLaneKey: "equal-tier-client:anthropic:fable",
+		} as RequestMeta;
+
+		expect(strategy.select([x], laneMeta)[0].id).toBe("x");
+		expect(
+			strategy.select([x, y], {
+				...laneMeta,
+				hardExcludedAccountIds: new Set(["x"]),
+			} as RequestMeta)[0].id,
+		).toBe("y");
+		expect(strategy.select([x, y], laneMeta)[0].id).toBe("y");
+	});
+
+	it("remaps an unavailable worse-tier owner", () => {
+		const worse = makeAccount({ id: "worse", priority: 1 });
+		const better = makeAccount({ id: "better", priority: 0 });
+		const laneMeta = {
+			...metaFor("worse-tier-client"),
+			affinityLaneKey: "worse-tier-client:anthropic:opus",
+		} as RequestMeta;
+
+		expect(strategy.select([worse], laneMeta)[0].id).toBe("worse");
+		expect(
+			strategy.select([worse, better], {
+				...laneMeta,
+				hardExcludedAccountIds: new Set(["worse"]),
+			} as RequestMeta)[0].id,
+		).toBe("better");
+		expect(strategy.select([worse, better], laneMeta)[0].id).toBe("better");
+	});
+
+	it("does not create affinity when every account is hard-excluded", () => {
+		const requestMeta = {
+			...metaFor("same-client"),
+			affinityLaneKey: "same-client:anthropic:fable",
+			hardExcludedAccountIds: new Set(["x"]),
+		} as RequestMeta;
+
+		expect(strategy.select([makeAccount({ id: "x" })], requestMeta)).toEqual(
+			[],
+		);
+		expect(strategy.affinityEntries).toBe(0);
+	});
+
+	it("replaces a sticky owner when comparable pressure outclasses it", () => {
+		const cold = makeAccount({ id: "cold" });
+		const critical = makeAccount({ id: "critical" });
+		const baseMeta = {
+			...metaFor("same-client"),
+			affinityLaneKey: "same-client:anthropic:fable",
+		} as RequestMeta;
+
+		expect(strategy.select([cold], baseMeta)[0].id).toBe("cold");
+		const pressureMeta = {
+			...baseMeta,
+			quotaPressureByAccountId: new Map([
+				["cold", { band: "cold", comparisonKey: "same" }],
+				["critical", { band: "critical", comparisonKey: "same" }],
+			]),
+		} as RequestMeta;
+		expect(strategy.select([cold, critical], pressureMeta)[0].id).toBe(
+			"critical",
+		);
+		expect(
+			strategy.select([cold, critical], {
+				...baseMeta,
+				quotaPressureByAccountId: new Map([
+					["cold", { band: "steady", comparisonKey: "same" }],
+					["critical", { band: "steady", comparisonKey: "same" }],
+				]),
+			} as RequestMeta)[0].id,
+		).toBe("critical");
+
+		expect(
+			strategy.select([cold, critical], {
+				...pressureMeta,
+				hardExcludedAccountIds: new Set(["critical"]),
+			} as RequestMeta)[0].id,
+		).toBe("cold");
+	});
+
+	it("temporarily fails over from a better-tier owner and snaps back", () => {
+		const x = makeAccount({ id: "x", priority: 0 });
+		const y = makeAccount({ id: "y", priority: 1 });
 		store.setUtil("x", 0);
 		store.setUtil("y", 0);
 
@@ -252,58 +420,24 @@ describe("SessionAffinityStrategy", () => {
 			).toBeNull();
 		});
 	});
-	it("prefers cacheAffinityKey over clientSessionId for sticky ownership", () => {
+	it("does not own xAI cache affinity inside the generic session strategy", () => {
 		const accounts = [
 			makeAccount({ id: "a", provider: "xai" }),
 			makeAccount({ id: "b", provider: "xai" }),
 		];
 		const convoMeta = {
-			...metaFor("session-raw"),
+			...metaFor(null),
 			cacheAffinityKey: "ccflare-xai-convo-1",
+			xaiCacheNativeActive: true,
 			xaiCacheEligibleAccountIds: new Set(["a", "b"]),
 		} as RequestMeta;
 		const first = strategy.select(accounts, convoMeta)[0].id;
 		const second = strategy.select(accounts, {
-			...metaFor("session-raw"),
+			...metaFor(null),
 			cacheAffinityKey: "ccflare-xai-convo-1",
+			xaiCacheNativeActive: true,
 			xaiCacheEligibleAccountIds: new Set(["a", "b"]),
 		} as RequestMeta)[0].id;
-		expect(second).toBe(first);
-	});
-
-	it("does not let Grok affinity reorder ineligible accounts", () => {
-		const codex = makeAccount({ id: "codex", provider: "codex" });
-		const officialXai = makeAccount({ id: "xai", provider: "xai" });
-		store.setUtil("codex", 0);
-		store.setUtil("xai", 50);
-		const meta = {
-			...metaFor("session-raw"),
-			cacheAffinityKey: "ccflare-xai-convo-1",
-			xaiCacheEligibleAccountIds: new Set(["xai"]),
-		} as RequestMeta;
-
-		strategy.select([officialXai], meta);
-		const ordered = strategy.select([codex, officialXai], meta);
-
-		expect(ordered.map((account) => account.id)).toEqual(["codex", "xai"]);
-	});
-
-	it("keeps custom xAI accounts outside native conversation affinity", () => {
-		const customXai = makeAccount({ id: "custom", provider: "xai" });
-		const officialXai = makeAccount({ id: "official", provider: "xai" });
-		store.setUtil("custom", 0);
-		store.setUtil("official", 50);
-		const meta = {
-			...metaFor("session-raw"),
-			cacheAffinityKey: "ccflare-xai-convo-1",
-			xaiCacheEligibleAccountIds: new Set(["official"]),
-		} as RequestMeta;
-
-		strategy.select([officialXai], meta);
-		expect(
-			strategy
-				.select([customXai, officialXai], meta)
-				.map((account) => account.id),
-		).toEqual(["custom", "official"]);
+		expect(second).not.toBe(first);
 	});
 });

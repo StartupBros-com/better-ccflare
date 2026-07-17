@@ -158,4 +158,89 @@ describe("UsageCache model-scoped depletion", () => {
 			usageCache.getModelScopedExhaustion(ACCOUNT, "claude-fable-5", null, NOW),
 		).toBeNull();
 	});
+
+	it("marks a bounded family lane that matches Fable versions but never Opus", () => {
+		usageCache.markFamilyScopedExhausted(
+			ACCOUNT,
+			"claude-fable-5",
+			NOW + 10_000,
+		);
+		expect(
+			usageCache.getFamilyScopedExhaustion(
+				ACCOUNT,
+				"claude-fable-5-20260701",
+				NOW,
+			),
+		).toEqual({
+			exhausted: true,
+			family: "fable",
+			markedAt: NOW,
+			expiresAt: NOW + 10_000,
+		});
+		expect(
+			usageCache.getFamilyScopedExhaustion(ACCOUNT, "claude-opus-4-8", NOW),
+		).toBeNull();
+	});
+
+	it("clears only the successful exact beta and matching family", () => {
+		usageCache.markModelScopedExhausted(
+			ACCOUNT,
+			"claude-fable-5",
+			"beta-a",
+			NOW + 10_000,
+		);
+		usageCache.markModelScopedExhausted(
+			ACCOUNT,
+			"claude-fable-5",
+			"beta-b",
+			NOW + 10_000,
+		);
+		usageCache.markFamilyScopedExhausted(
+			ACCOUNT,
+			"claude-fable-5",
+			NOW + 10_000,
+		);
+		usageCache.markFamilyScopedExhausted(
+			ACCOUNT,
+			"claude-opus-4-8",
+			NOW + 10_000,
+		);
+
+		expect(
+			usageCache.clearModelScopedExhaustion(
+				ACCOUNT,
+				"claude-fable-5",
+				"beta-a",
+			),
+		).toBe(true);
+		expect(
+			usageCache.clearFamilyScopedExhaustion(ACCOUNT, "claude-fable-5"),
+		).toBe(true);
+		expect(
+			usageCache.getModelScopedExhaustion(
+				ACCOUNT,
+				"claude-fable-5",
+				"beta-a",
+				NOW,
+			),
+		).toBeNull();
+		expect(
+			usageCache.getModelScopedExhaustion(
+				ACCOUNT,
+				"claude-fable-5",
+				"beta-b",
+				NOW,
+			),
+		).not.toBeNull();
+		expect(
+			usageCache.getFamilyScopedExhaustion(
+				ACCOUNT,
+				"claude-fable-5-20260701",
+				NOW,
+			),
+		).toBeNull();
+		expect(
+			usageCache.getFamilyScopedExhaustion(ACCOUNT, "claude-opus-4-8", NOW),
+		).not.toBeNull();
+	});
 });

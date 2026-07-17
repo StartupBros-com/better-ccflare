@@ -159,14 +159,16 @@ export class ComboRepository extends BaseRepository<Combo> {
 	async getSlots(comboId: string): Promise<ComboSlot[]> {
 		const rows = await this.query<ComboSlotRow>(
 			`SELECT id, combo_id, account_id, model, priority, enabled
-       FROM combo_slots WHERE combo_id = ? ORDER BY priority ASC`,
+       FROM combo_slots WHERE combo_id = ? ORDER BY priority ASC, id ASC`,
 			[comboId],
 		);
 		return rows.map(toComboSlot);
 	}
 
 	/**
-	 * Reorder slots by reassigning priority 0, 1, 2... matching the order of slotIds array.
+	 * Explicit legacy reorder action: reassign priority 0, 1, 2... matching the
+	 * order of slotIds. The dashboard warns that dragging converts equal-priority
+	 * dynamic tiers into a strict fallback chain; ordinary slot edits never call it.
 	 * slotIds must all belong to the same comboId.
 	 */
 	async reorderSlots(comboId: string, slotIds: string[]): Promise<void> {
@@ -235,7 +237,7 @@ export class ComboRepository extends BaseRepository<Combo> {
 			`SELECT id, combo_id, account_id, model, priority, enabled
        FROM combo_slots
        WHERE combo_id = ? AND enabled = 1
-       ORDER BY priority ASC`,
+       ORDER BY priority ASC, id ASC`,
 			[comboRow.id],
 		);
 

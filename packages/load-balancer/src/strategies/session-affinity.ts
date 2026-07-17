@@ -7,6 +7,11 @@ import type {
 	StrategyStore,
 } from "@better-ccflare/types";
 import { isPeekAvailable, wouldAutoUnpause } from "./peek-availability";
+import {
+	compareRoutingMetadata,
+	filterHardExcludedAccounts,
+	isSameRoutingClass,
+} from "./routing-metadata";
 
 /**
  * Window during which a freshly-picked account is deprioritized so that
@@ -63,11 +68,10 @@ const MAX_AFFINITY_ENTRIES = 10_000;
  *     loses prompt-cache reuse. SessionAffinity keeps a client glued to one
  *     account, trading some instantaneous load-evenness for cache hits.
  *
- * When the pinned account is temporarily unavailable (rate-limited), the
- * mapping is intentionally NOT deleted: we fail the client over to the
- * least-used available account for the duration, but snap it back to its
- * original account once that recovers (mirrors the SessionStrategy issue #115
- * reasoning — the prompt-cache window outlives the rate-limit window).
+ * When the pinned account is temporarily unavailable, snapback is retained
+ * only if its configured tier is strictly better than the fallback. Equal or
+ * worse unavailable owners are replaced, as are routable owners outclassed by
+ * a better tier (or comparable pressure class).
  */
 export class SessionAffinityStrategy implements LoadBalancingStrategy {
 	private affinityTtlMs: number;
@@ -105,7 +109,11 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 	 * Identical scoring to LeastUsedStrategy.select() so the two strategies pick
 	 * the same primary for a fresh session given the same state.
 	 */
-	private rankByLeastUsed(accounts: Account[], now: number): Account[] {
+	private rankByLeastUsed(
+		accounts: Account[],
+		now: number,
+		meta?: RequestMeta,
+	): Account[] {
 		const scored = accounts.map((a) => {
 			const util = this.store?.getAccountUtilization?.(a.id, a.provider) ?? 0;
 			const lastPick = this.lastPickedAt.get(a.id) ?? 0;
@@ -116,9 +124,8 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 
 		return scored
 			.sort((a, b) => {
-				if (a.account.priority !== b.account.priority) {
-					return a.account.priority - b.account.priority;
-				}
+				const routingOrder = compareRoutingMetadata(a.account, b.account, meta);
+				if (routingOrder !== 0) return routingOrder;
 				return a.score - b.score;
 			})
 			.map((s) => s.account);
@@ -136,8 +143,12 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 	 * overloading the next account during exactly the partial-outage scenario
 	 * where spreading matters most.
 	 */
-	private pickAndMark(available: Account[], now: number): Account[] {
-		const ranked = this.rankByLeastUsed(available, now);
+	private pickAndMark(
+		available: Account[],
+		now: number,
+		meta?: RequestMeta,
+	): Account[] {
+		const ranked = this.rankByLeastUsed(available, now, meta);
 		const chosen = ranked[0];
 		if (chosen) {
 			this.lastPickedAt.set(chosen.id, now);
@@ -177,64 +188,17 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 		return this.rankByLeastUsed(available, now)[0]?.id ?? null;
 	}
 
-	private applyCacheAffinity(
-		available: Account[],
-		meta: RequestMeta,
-		now: number,
-	): Account[] | null {
-		const cacheKey = meta.cacheAffinityKey;
-		const eligibleIds = meta.xaiCacheEligibleAccountIds;
-		if (!cacheKey || !eligibleIds || eligibleIds.size === 0) return null;
-
-		const baseOrder = this.rankByLeastUsed(available, now);
-		const eligible = available.filter((account) => eligibleIds.has(account.id));
-		if (eligible.length === 0) return baseOrder;
-
-		const mapping = this.affinity.get(cacheKey);
-		let eligibleOrder: Account[];
-		if (mapping) {
-			const mapped = eligible.find(
-				(account) => account.id === mapping.accountId,
-			);
-			if (mapped) {
-				mapping.assignedAt = now;
-				eligibleOrder = [
-					mapped,
-					...this.rankByLeastUsed(
-						eligible.filter((account) => account.id !== mapped.id),
-						now,
-					),
-				];
-			} else {
-				eligibleOrder = this.pickAndMark(eligible, now);
-			}
-		} else {
-			eligibleOrder = this.pickAndMark(eligible, now);
-			const chosen = eligibleOrder[0];
-			if (chosen) {
-				this.evictOldestIfFull();
-				this.affinity.set(cacheKey, { accountId: chosen.id, assignedAt: now });
-			}
-		}
-
-		let eligibleIndex = 0;
-		return baseOrder.map((account) =>
-			eligibleIds.has(account.id)
-				? (eligibleOrder[eligibleIndex++] ?? account)
-				: account,
-		);
-	}
-
 	select(accounts: Account[], meta: RequestMeta): Account[] {
 		const now = Date.now();
+		const candidates = filterHardExcludedAccounts(accounts, meta);
 
 		// Auto-unpause eligible accounts whose upstream usage window has reset.
 		// Mirrors LeastUsedStrategy.autoUnpauseElapsedAccounts so users with
 		// auto_fallback_enabled accounts get the same self-recovery behaviour
 		// regardless of which strategy they pick.
-		this.autoUnpauseElapsedAccounts(accounts, now);
+		this.autoUnpauseElapsedAccounts(candidates, now);
 
-		const available = accounts.filter((a) => isAccountAvailable(a, now));
+		const available = candidates.filter((a) => isAccountAvailable(a, now));
 		if (available.length === 0) return [];
 
 		// GC expired affinity entries so the map doesn't grow unboundedly and so
@@ -246,51 +210,99 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 			}
 		}
 
-		const cacheAffinityOrder = this.applyCacheAffinity(available, meta, now);
-		if (cacheAffinityOrder) return cacheAffinityOrder;
-
+		const laneKey = meta.affinityLaneKey ?? null;
 		const clientId = meta.clientSessionId ?? null;
+		const affinityKey =
+			laneKey !== null
+				? `lane:${laneKey}`
+				: clientId !== null
+					? `client:${clientId}`
+					: null;
 
 		// Existing, non-expired client-session: try to honour its sticky mapping.
-		if (clientId !== null) {
-			const mapping = this.affinity.get(clientId);
+		if (affinityKey !== null) {
+			const mapping = this.affinity.get(affinityKey);
 			if (mapping) {
 				const mapped = available.find((a) => a.id === mapping.accountId);
-				if (mapped) {
+				const ranked = this.rankByLeastUsed(available, now, meta);
+				const best = ranked[0];
+				if (mapped && best && isSameRoutingClass(mapped, best, meta)) {
 					// STICKY hit: keep the client on its account (prompt-cache reuse).
 					// Refresh assignedAt so an active session keeps its mapping alive.
 					mapping.assignedAt = now;
 					const others = this.rankByLeastUsed(
 						available.filter((a) => a.id !== mapped.id),
 						now,
+						meta,
 					);
 					this.log.debug(
-						`Sticky client ${clientId} → ${mapped.name} (${others.length} fallback(s))`,
+						`Sticky route ${affinityKey} → ${mapped.name} (${others.length} fallback(s))`,
 					);
 					return [mapped, ...others];
 				}
 
-				// Mapped account is currently unavailable (e.g. rate-limited). Do NOT
-				// delete the mapping — temporarily fail over to the least-used account
-				// and snap back to the original once it recovers (mirrors issue #115).
-				this.log.info(
-					`Client ${clientId} pinned account ${mapping.accountId} is unavailable — temporary failover to least-used`,
-				);
-				return this.pickAndMark(available, now);
+				if (mapped && best) {
+					// A routable better tier (or comparable higher-pressure class inside
+					// the same tier) is authoritative and becomes the new sticky owner.
+					const ordered = this.pickAndMark(available, now, meta);
+					const replacement = ordered[0];
+					if (replacement) {
+						mapping.accountId = replacement.id;
+						mapping.assignedAt = now;
+					}
+					this.log.info(
+						`Route ${affinityKey} owner ${mapped.name} was outclassed — remapped to ${replacement?.name ?? best.name}`,
+					);
+					return ordered;
+				}
+
+				if (best) {
+					const configuredOwnerTier =
+						meta.routingCandidateCatalog?.find(
+							(candidate) =>
+								candidate.comboSlotId === null &&
+								candidate.accountId === mapping.accountId,
+						)?.tier ??
+						accounts.find((account) => account.id === mapping.accountId)
+							?.priority;
+					const ordered = this.pickAndMark(available, now, meta);
+					const fallback = ordered[0];
+					const preserveForSnapback =
+						configuredOwnerTier !== undefined &&
+						configuredOwnerTier < best.priority;
+					if (preserveForSnapback) {
+						// Refresh while the client remains active so a legal temporary
+						// failover does not expire the better-tier owner mapping.
+						mapping.assignedAt = now;
+						this.log.info(
+							`Route ${affinityKey} better-tier owner ${mapping.accountId} is temporarily unavailable — preserving for snapback`,
+						);
+					} else if (fallback) {
+						mapping.accountId = fallback.id;
+						mapping.assignedAt = now;
+						this.log.info(
+							`Route ${affinityKey} unavailable equal/worse owner remapped to ${fallback.name}`,
+						);
+					}
+					return ordered;
+				}
 			}
 		}
 
 		// New (or expired) client-session, or a request with no client id: assign
 		// the least-loaded available account (marking it picked for spread) and
 		// stick the client to it.
-		const ranked = this.pickAndMark(available, now);
+		const ranked = this.pickAndMark(available, now, meta);
 		const chosen = ranked[0];
 
-		if (clientId !== null && chosen) {
+		if (affinityKey !== null && chosen) {
 			this.evictOldestIfFull();
-			this.affinity.set(clientId, { accountId: chosen.id, assignedAt: now });
+			this.affinity.set(affinityKey, {
+				accountId: chosen.id,
+				assignedAt: now,
+			});
 			this.log.debug(
-				`Assigned client ${clientId} → ${chosen.name} (least-used)`,
+				`Assigned route ${affinityKey} → ${chosen.name} (least-used)`,
 			);
 		}
 

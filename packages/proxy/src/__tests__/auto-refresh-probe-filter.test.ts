@@ -21,6 +21,7 @@ import {
 	applyCacheBodyStagingPolicy,
 	getCacheBodyStagingAction,
 } from "../handlers/proxy-operations";
+import { stampInternalAutoRefreshAuth } from "../internal-probe-auth";
 import * as usageCollectorModule from "../usage-collector";
 
 // ---------------------------------------------------------------------------
@@ -306,7 +307,7 @@ describe("proxy.ts — pool-exhausted path skips usageCollector for auto-refresh
 		const collector = { handleStart, handleEnd, handleChunk: mock(() => {}) };
 		const spy = spyOn(
 			usageCollectorModule,
-			"getUsageCollector",
+			"tryGetUsageCollector",
 		).mockReturnValue(
 			collector as unknown as usageCollectorModule.UsageCollector,
 		);
@@ -340,12 +341,14 @@ describe("proxy.ts — pool-exhausted path skips usageCollector for auto-refresh
 			asyncWriter: { enqueue: mock(() => {}) } as never,
 		};
 
+		const probeHeaders = new Headers({
+			"Content-Type": "application/json",
+			"x-better-ccflare-auto-refresh": "true",
+		});
+		stampInternalAutoRefreshAuth(probeHeaders);
 		const probeRequest = new Request("https://proxy.local/v1/messages", {
 			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-				"x-better-ccflare-auto-refresh": "true",
-			},
+			headers: probeHeaders,
 			body: JSON.stringify({
 				model: "claude-haiku-4-5",
 				messages: [{ role: "user", content: "hi" }],

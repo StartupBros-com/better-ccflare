@@ -1,4 +1,4 @@
-import { CLAUDE_CLI_VERSION } from "@better-ccflare/core";
+import { CLAUDE_CLI_VERSION, getModelFamily } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import { supportsUsageTracking } from "@better-ccflare/types";
 import {
@@ -36,11 +36,18 @@ const log = new Logger("UsageFetcher");
 
 /** Conservative fallback when direct out_of_credits evidence has no reset. */
 export const MODEL_SCOPED_DEPLETION_TTL_MS = 5 * 60 * 1000;
+/** Existing public cache freshness contract. Capacity policy may use a tighter bound. */
+export const USAGE_CACHE_MAX_AGE_MS = 10 * 60 * 1000;
 const MAX_MODEL_SCOPED_DEPLETIONS_PER_ACCOUNT = 64;
+const MAX_FAMILY_SCOPED_DEPLETIONS_PER_ACCOUNT = 8;
 
 interface ModelScopedDepletion {
 	expiresAt: number;
 	markedAt: number;
+}
+
+interface FamilyScopedDepletion extends ModelScopedDepletion {
+	family: string;
 }
 
 function normalizeModelScope(model: string): string {
@@ -137,6 +144,12 @@ export type AnyUsageData =
 	| KiloUsageData
 	| AlibabaCodingPlanUsageData
 	| XaiUsageData;
+
+/** A read-only view of one authoritative cache observation. */
+export interface UsageSnapshot {
+	readonly data: AnyUsageData;
+	readonly observedAt: number;
+}
 
 /**
  * Extract the primary window reset timestamp (ms) from usage data.
@@ -536,6 +549,10 @@ class UsageCache {
 		string,
 		Map<string, ModelScopedDepletion>
 	>();
+	private familyScopedDepletions = new Map<
+		string,
+		Map<string, FamilyScopedDepletion>
+	>();
 	private capacityRestoredCallbacks = new Map<
 		string,
 		(accountId: string) => void
@@ -744,6 +761,7 @@ class UsageCache {
 			this.cache.delete(accountId);
 			this.usageRateLimitedUntil.delete(accountId);
 			this.modelScopedDepletions.delete(accountId);
+			this.familyScopedDepletions.delete(accountId);
 			// Clear any in-flight fetch so it doesn't linger after polling stops.
 			this.inFlightFetches.delete(accountId);
 			log.info(
@@ -985,7 +1003,7 @@ class UsageCache {
 	/**
 	 * Clean up stale cache entries older than maxAgeMs
 	 */
-	cleanupStaleEntries(maxAgeMs: number = 10 * 60 * 1000): void {
+	cleanupStaleEntries(maxAgeMs: number = USAGE_CACHE_MAX_AGE_MS): void {
 		const now = Date.now();
 		let cleanedCount = 0;
 
@@ -1010,7 +1028,7 @@ class UsageCache {
 
 		// Clean up stale entries while accessing
 		const age = Date.now() - cached.timestamp;
-		if (age > 10 * 60 * 1000) {
+		if (age > USAGE_CACHE_MAX_AGE_MS) {
 			// 10 minutes max age
 			this.cache.delete(accountId);
 			log.debug(
@@ -1020,6 +1038,21 @@ class UsageCache {
 		}
 
 		return cached.data;
+	}
+
+	/**
+	 * Return the same fresh cache entry as get(), together with the time it was
+	 * observed. The wrapper is immutable so scheduling code cannot rewrite the
+	 * cache timestamp or swap its data. This deliberately retains get()'s
+	 * existing ten-minute maximum age; stricter capacity freshness is evaluated
+	 * by the pure routing policy.
+	 */
+	getSnapshot(accountId: string): UsageSnapshot | null {
+		const data = this.get(accountId);
+		if (data === null) return null;
+		const cached = this.cache.get(accountId);
+		if (!cached) return null;
+		return Object.freeze({ data, observedAt: cached.timestamp });
 	}
 
 	/** Mark direct upstream evidence that one account/model/beta candidate is depleted. */
@@ -1077,6 +1110,102 @@ class UsageCache {
 			return null;
 		}
 		return { exhausted: true, ...marker };
+	}
+
+	/** Clear only one exact model/client-beta depletion marker. */
+	clearModelScopedExhaustion(
+		accountId: string,
+		model: string,
+		betaSignature?: string | null,
+	): boolean {
+		const accountMarkers = this.modelScopedDepletions.get(accountId);
+		if (!accountMarkers) return false;
+		const cleared = accountMarkers.delete(
+			modelScopedDepletionKey(model, betaSignature),
+		);
+		if (accountMarkers.size === 0) {
+			this.modelScopedDepletions.delete(accountId);
+		}
+		return cleared;
+	}
+
+	/**
+	 * Mark direct/inferred evidence that one recognized Claude model family is
+	 * depleted. Family state is deliberately separate from exact model+beta
+	 * state so a generic Fable 429 can never erase or broaden an exact marker.
+	 */
+	markFamilyScopedExhausted(
+		accountId: string,
+		model: string,
+		expiresAt: number = Date.now() + MODEL_SCOPED_DEPLETION_TTL_MS,
+	): boolean {
+		const family = getModelFamily(model);
+		if (family === null) return false;
+		const now = Date.now();
+		const ttlCeiling = now + MODEL_SCOPED_DEPLETION_TTL_MS;
+		const safeExpiresAt =
+			Number.isFinite(expiresAt) && expiresAt > now
+				? Math.min(expiresAt, ttlCeiling)
+				: ttlCeiling;
+		let accountMarkers = this.familyScopedDepletions.get(accountId);
+		if (!accountMarkers) {
+			accountMarkers = new Map();
+			this.familyScopedDepletions.set(accountId, accountMarkers);
+		}
+		for (const [candidateFamily, marker] of accountMarkers) {
+			if (marker.expiresAt <= now) accountMarkers.delete(candidateFamily);
+		}
+		if (accountMarkers.has(family)) accountMarkers.delete(family);
+		if (accountMarkers.size >= MAX_FAMILY_SCOPED_DEPLETIONS_PER_ACCOUNT) {
+			const oldest = accountMarkers.keys().next().value;
+			if (oldest !== undefined) accountMarkers.delete(oldest);
+		}
+		accountMarkers.set(family, {
+			family,
+			expiresAt: safeExpiresAt,
+			markedAt: now,
+		});
+		return true;
+	}
+
+	/** Return active family evidence for the concrete model, if recognized. */
+	getFamilyScopedExhaustion(
+		accountId: string,
+		model: string,
+		now: number = Date.now(),
+	): {
+		exhausted: true;
+		family: string;
+		expiresAt: number;
+		markedAt: number;
+	} | null {
+		const family = getModelFamily(model);
+		if (family === null) return null;
+		const accountMarkers = this.familyScopedDepletions.get(accountId);
+		if (!accountMarkers) return null;
+		const marker = accountMarkers.get(family);
+		if (!marker) return null;
+		if (marker.expiresAt <= now) {
+			accountMarkers.delete(family);
+			if (accountMarkers.size === 0) {
+				this.familyScopedDepletions.delete(accountId);
+			}
+			return null;
+		}
+		return { exhausted: true, ...marker };
+	}
+
+	/** Clear only the recognized family matching one successful model. */
+	clearFamilyScopedExhaustion(accountId: string, model: string): boolean {
+		const family = getModelFamily(model);
+		if (family === null) return false;
+		const accountMarkers = this.familyScopedDepletions.get(accountId);
+		if (!accountMarkers) return false;
+		const cleared = accountMarkers.delete(family);
+		if (accountMarkers.size === 0) {
+			this.familyScopedDepletions.delete(accountId);
+		}
+		return cleared;
 	}
 
 	private setAuthoritative(accountId: string, data: AnyUsageData): void {
@@ -1154,7 +1283,7 @@ class UsageCache {
 
 		const age = Date.now() - cached.timestamp;
 		// Clean up if too old
-		if (age > 10 * 60 * 1000) {
+		if (age > USAGE_CACHE_MAX_AGE_MS) {
 			// 10 minutes max age
 			this.cache.delete(accountId);
 			return null;
@@ -1169,6 +1298,7 @@ class UsageCache {
 	delete(accountId: string): void {
 		this.cache.delete(accountId);
 		this.modelScopedDepletions.delete(accountId);
+		this.familyScopedDepletions.delete(accountId);
 		log.debug(`Cleared usage cache for account ${accountId}`);
 	}
 
@@ -1182,6 +1312,7 @@ class UsageCache {
 		this.cache.clear();
 		this.usageRateLimitedUntil.clear();
 		this.modelScopedDepletions.clear();
+		this.familyScopedDepletions.clear();
 		log.info("Cleared all usage cache and stopped polling");
 	}
 }

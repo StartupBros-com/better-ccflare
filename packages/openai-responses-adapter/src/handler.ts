@@ -163,20 +163,33 @@ export async function handleResponsesRequest(
 
 	// 7. Translate non-200 Anthropic errors to OpenAI error shape
 	if (anthropicResp.status !== 200) {
-		let errorBody: { error: { message: string; type: string; code: string } };
+		let errorBody: {
+			error: Record<string, unknown> & {
+				message: string;
+				type: string;
+				code: string;
+			};
+		};
+		let stableCode = "api_error";
 		const contentType = anthropicResp.headers.get("content-type") ?? "";
 		if (contentType.includes("application/json")) {
 			try {
 				const anthropicError = (await anthropicResp.json()) as {
 					type?: string;
-					error?: { type?: string; message?: string };
+					error?: Record<string, unknown> & {
+						type?: string;
+						code?: string;
+						message?: string;
+					};
 				};
 				const errType = anthropicError?.error?.type ?? "api_error";
+				stableCode = anthropicError?.error?.code ?? errType;
 				errorBody = {
 					error: {
+						...anthropicError?.error,
 						message: anthropicError?.error?.message ?? "Unknown error",
 						type: errType,
-						code: errType,
+						code: stableCode,
 					},
 				};
 			} catch {
@@ -197,9 +210,28 @@ export async function handleResponsesRequest(
 				},
 			};
 		}
+		const responseHeaders = new Headers({
+			"content-type": "application/json",
+		});
+		// The local guard must only hold requests for the narrow, positively
+		// recoverable whole-pool terminal. Preserve the marker pair atomically;
+		// never let model/route errors inherit retry semantics from stray headers.
+		const retryAfter = anthropicResp.headers.get("retry-after");
+		const poolStatus = anthropicResp.headers.get(
+			"x-better-ccflare-pool-status",
+		);
+		if (
+			stableCode === "pool_exhausted" &&
+			poolStatus === "exhausted" &&
+			retryAfter !== null &&
+			/^[1-9]\d*$/.test(retryAfter)
+		) {
+			responseHeaders.set("retry-after", retryAfter);
+			responseHeaders.set("x-better-ccflare-pool-status", "exhausted");
+		}
 		return new Response(JSON.stringify(errorBody), {
 			status: anthropicResp.status,
-			headers: { "Content-Type": "application/json" },
+			headers: responseHeaders,
 		});
 	}
 

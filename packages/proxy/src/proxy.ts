@@ -29,12 +29,15 @@ import { warnOnLookbackRisk } from "./cache-telemetry";
 import {
 	createContextAdmissionTracker,
 	createContextLengthExceededResponse,
-	createPoolExhaustedResponse,
+	createModelPoolExhaustedResponse,
 	createRequestMetadata,
+	createRoutingTerminalResponse,
 	createUsageThrottledResponse,
 	ERROR_MESSAGES,
 	ForceRouteUnavailableError,
+	filterRequestCompatibleAccounts,
 	getComboSlotInfo,
+	getRoutingCapacityContext,
 	getUsageThrottleUntil,
 	interceptAndModifyRequest,
 	isRefreshTokenLikelyExpired,
@@ -52,6 +55,8 @@ import {
 	completeRateLimitProbe,
 	getRateLimitProbeAdmission,
 } from "./handlers/rate-limit-cooldown";
+import { getRequestRateLimitOutcomes } from "./handlers/rate-limit-scope";
+import { consumeInternalAutoRefreshAuth } from "./internal-probe-auth";
 import { extractProjectAttributionFromRequest } from "./project-attribution";
 import {
 	clearSession,
@@ -62,7 +67,6 @@ import {
 	recordSessionRequest,
 } from "./session-governor";
 import {
-	getUsageCollector,
 	initUsageCollector,
 	tryGetUsageCollector,
 	type UsageCollectorHealth,
@@ -83,6 +87,11 @@ export function isReactivelyModelDepleted(opts: {
 			opts.accountId,
 			opts.model,
 			opts.betaSignature,
+			opts.now,
+		) != null ||
+		usageCache.getFamilyScopedExhaustion(
+			opts.accountId,
+			opts.model,
 			opts.now,
 		) != null
 	);
@@ -142,6 +151,17 @@ export async function handleProxy(
 	apiKeyId?: string | null,
 	apiKeyName?: string | null,
 ): Promise<Response> {
+	// Consume the private scheduler credential before any request inspection,
+	// metadata construction, logging, cache staging, or upstream forwarding.
+	const trustedInternalAutoRefresh = consumeInternalAutoRefreshAuth(
+		req.headers,
+	);
+	// The public marker is meaningful only after internal authentication. Remove
+	// spoofed markers so they cannot suppress pacing, analytics, or cache staging.
+	if (!trustedInternalAutoRefresh) {
+		req.headers.delete("x-better-ccflare-auto-refresh");
+	}
+
 	// 0. Silently ignore Claude Code internal endpoints (non-critical, not supported by all providers)
 	if (
 		url.pathname === "/api/event_logging/batch" ||
@@ -262,6 +282,7 @@ export async function handleProxy(
 
 	// 5. Create request metadata with agent info
 	const requestMeta = createRequestMetadata(req, url);
+	requestMeta.trustedInternalAutoRefresh = trustedInternalAutoRefresh;
 	requestMeta.agentUsed = agentUsed;
 	requestMeta.agentAttributionSource = agentAttributionSource;
 	requestMeta.project = project;
@@ -395,7 +416,8 @@ export async function handleProxy(
 			settings.fiveHourEnabled || settings.weeklyEnabled;
 		const now = Date.now();
 		const available: Account[] = [];
-		const throttled: Account[] = [];
+		const predictivelyThrottled: Account[] = [];
+		const reactivelyDepletedAccounts: Account[] = [];
 
 		// Model-aware throttling: a per-model weekly cap should only throttle
 		// requests for that model. Use the effective (post-intercept) request
@@ -424,24 +446,40 @@ export async function handleProxy(
 					syntheticProbe,
 					now,
 				});
-			if ((throttleUntil && throttleUntil > now) || reactivelyDepleted) {
-				throttled.push(account);
+			if (reactivelyDepleted) {
+				reactivelyDepletedAccounts.push(account);
+				continue;
+			}
+			if (throttleUntil && throttleUntil > now) {
+				predictivelyThrottled.push(account);
 				continue;
 			}
 			available.push(account);
 		}
 
-		if (throttled.length > 0) {
+		if (predictivelyThrottled.length > 0) {
 			log.info(
-				`Usage-throttled ${throttled.length} account(s): ${throttled.map((account) => account.name).join(", ")}`,
+				`Predictively usage-throttled ${predictivelyThrottled.length} account(s): ${predictivelyThrottled.map((account) => account.name).join(", ")}`,
+			);
+		}
+		if (reactivelyDepletedAccounts.length > 0) {
+			log.info(
+				`Reactively model-depleted ${reactivelyDepletedAccounts.length} account(s): ${reactivelyDepletedAccounts.map((account) => account.name).join(", ")}`,
 			);
 		}
 
-		return { available, throttled };
+		return {
+			available,
+			predictivelyThrottled,
+			reactivelyDepletedAccounts,
+		};
 	};
 
-	let { available: accounts, throttled: throttledAccounts } =
-		applyUsageThrottling(selectedAccounts);
+	let {
+		available: accounts,
+		predictivelyThrottled: throttledAccounts,
+		reactivelyDepletedAccounts,
+	} = applyUsageThrottling(selectedAccounts);
 
 	if (canaryCandidate && accounts[0]?.provider === "codex") {
 		pacingBypassed = true;
@@ -458,8 +496,11 @@ export async function handleProxy(
 			ctx,
 			effectiveModel ?? undefined,
 		);
-		({ available: accounts, throttled: throttledAccounts } =
-			applyUsageThrottling(selectedAccounts));
+		({
+			available: accounts,
+			predictivelyThrottled: throttledAccounts,
+			reactivelyDepletedAccounts,
+		} = applyUsageThrottling(selectedAccounts));
 	}
 	let pacingSlot = pacingObservation?.slot ?? null;
 	let crossoverPacingRestored = false;
@@ -482,6 +523,17 @@ export async function handleProxy(
 		// never reaches forwardToClient's null-account clear) — so no failure or
 		// throw below can leave a stale mapping (KTD-5).
 		if (sessionId) clearSession(sessionId, requestMeta.timestamp);
+
+		if (reactivelyDepletedAccounts.length > 0) {
+			return finishPacing(
+				pacingSlot,
+				createModelPoolExhaustedResponse({
+					capacityContext: getRoutingCapacityContext(requestMeta),
+					rateLimitOutcomes: getRequestRateLimitOutcomes(req),
+					now: Date.now(),
+				}),
+			);
+		}
 
 		if (throttledAccounts.length > 0) {
 			return finishPacing(
@@ -508,18 +560,26 @@ export async function handleProxy(
 			);
 		}
 
-		// Return 503 pool_exhausted response (default behavior)
-		log.error(ERROR_MESSAGES.POOL_EXHAUSTED);
-
-		// Log to request history via worker
-		// Re-fetch from DB — selectedAccounts is empty here (strategy already
-		// filtered out unavailable accounts), so we need fresh data to populate
-		// per-account cooldown info in the 503 body.
-		const allAccounts = (await ctx.dbOps.getAllAccounts()).filter(
-			(a) => a.provider === ctx.provider.name,
-		);
-
-		const poolExhaustedResponse = createPoolExhaustedResponse(allAccounts);
+		// Re-fetch request-compatible accounts because the strategy returns only
+		// usable routes. A DB read failure is deliberately incomplete evidence and
+		// therefore becomes route_unavailable rather than a retry-held pool marker.
+		let allAccounts: Account[] = [];
+		try {
+			allAccounts = filterRequestCompatibleAccounts(
+				await ctx.dbOps.getAllAccounts(),
+				req.headers,
+			);
+		} catch (error) {
+			log.error("Failed to load terminal account state", error);
+		}
+		const terminal = createRoutingTerminalResponse({
+			source: "selection",
+			accounts: allAccounts,
+			capacityContext: getRoutingCapacityContext(requestMeta),
+			rateLimitOutcomes: getRequestRateLimitOutcomes(req),
+			upstreamAttempts: 0,
+		});
+		log.error(`Routing terminal: ${terminal.kind}`);
 
 		// Skip request-log staging for synthetic auto-refresh probes that
 		// 503 because their target account is on a known cooldown. Logging
@@ -529,9 +589,10 @@ export async function handleProxy(
 		// header path; this brings auto-refresh in line.
 		const isAutoRefreshProbe =
 			req.headers.get("x-better-ccflare-auto-refresh") === "true";
-		if (!isAutoRefreshProbe) {
+		const usageCollector = tryGetUsageCollector();
+		if (!isAutoRefreshProbe && usageCollector) {
 			// Log to request history via usage collector
-			getUsageCollector().handleStart({
+			usageCollector.handleStart({
 				type: "start",
 				messageId: crypto.randomUUID(),
 				requestId: requestMeta.id,
@@ -546,7 +607,7 @@ export async function handleProxy(
 				agentAttributionSource: agentAttributionSource ?? "none",
 				responseStatus: 503,
 				responseHeaders: Object.fromEntries(
-					poolExhaustedResponse.headers.entries(),
+					terminal.response.headers.entries(),
 				),
 				isStream: false,
 				providerName: ctx.provider.name,
@@ -563,23 +624,23 @@ export async function handleProxy(
 				failoverAttempts: 0,
 			});
 
-			getUsageCollector()
+			usageCollector
 				.handleEnd({
 					type: "end",
 					requestId: requestMeta.id,
 					success: false,
-					error: "pool_exhausted",
+					error: terminal.kind,
 				})
 				.catch((err: unknown) => {
 					log.error(
-						`handleEnd failed for pool_exhausted request ${requestMeta.id}`,
+						`handleEnd failed for ${terminal.kind} request ${requestMeta.id}`,
 						err,
 					);
 				});
 		}
 
 		// (Session badge already cleared at the top of this block.)
-		return finishPacing(pacingSlot, poolExhaustedResponse);
+		return finishPacing(pacingSlot, terminal.response);
 	}
 
 	// 8. Log selected accounts
@@ -649,14 +710,14 @@ export async function handleProxy(
 		// Normal routes were filtered above. Combo slots need this attempt-level
 		// check because each slot may override the model independently.
 		if (
-			!syntheticProbe &&
 			filteredComboInfo &&
 			attemptModel &&
-			usageCache.getModelScopedExhaustion(
-				accounts[i].id,
-				attemptModel,
+			isReactivelyModelDepleted({
+				accountId: accounts[i].id,
+				model: attemptModel,
 				betaSignature,
-			)
+				syntheticProbe,
+			})
 		) {
 			reactiveDepletionSkips.push(accounts[i]);
 			if (contextAdmissionTracker) {
@@ -743,10 +804,13 @@ export async function handleProxy(
 		const selectedFallbackAccounts = await selectAccountsForRequest(
 			requestMeta,
 			ctx,
+			effectiveModel ?? undefined,
+			{ skipCombo: true },
 		);
 		const {
 			available: filteredFallbackAccounts,
-			throttled: throttledFallbackAccounts,
+			predictivelyThrottled: throttledFallbackAccounts,
+			reactivelyDepletedAccounts: reactivelyDepletedFallbackAccounts,
 		} = applyUsageThrottling(selectedFallbackAccounts);
 		fallbackAccounts = filteredFallbackAccounts;
 
@@ -823,6 +887,17 @@ export async function handleProxy(
 					return finishPacing(pacingSlot, response);
 				}
 			}
+		} else if (reactivelyDepletedFallbackAccounts.length > 0) {
+			cacheBodyStore.discardStaged(requestMeta.id);
+			if (sessionId) clearSession(sessionId, requestMeta.timestamp);
+			return finishPacing(
+				pacingSlot,
+				createModelPoolExhaustedResponse({
+					capacityContext: getRoutingCapacityContext(requestMeta),
+					rateLimitOutcomes: getRequestRateLimitOutcomes(req),
+					now: Date.now(),
+				}),
+			);
 		} else if (throttledFallbackAccounts.length > 0) {
 			cacheBodyStore.discardStaged(requestMeta.id);
 			// Combo fallback throttled, no account served — badge unknown (KTD-5).
@@ -835,15 +910,19 @@ export async function handleProxy(
 	}
 
 	// If routing skipped every remaining candidate using direct, short-lived
-	// model-scoped depletion evidence, report temporary usage throttling rather
-	// than a generic all-accounts failure. The account itself remains available
-	// for other model families and beta configurations.
+	// model-scoped depletion evidence, return a model-lane terminal. Predictive
+	// pacing alone owns HTTP 529; hard/reactive exclusions must not masquerade as
+	// a soft throttle or acquire retry-held whole-pool markers.
 	if (reactiveDepletionSkips.length > 0) {
 		if (upstreamAttempts === 0) {
 			cacheBodyStore.discardStaged(requestMeta.id);
 			return finishPacing(
 				pacingSlot,
-				createUsageThrottledResponse(reactiveDepletionSkips),
+				createModelPoolExhaustedResponse({
+					capacityContext: getRoutingCapacityContext(requestMeta),
+					rateLimitOutcomes: getRequestRateLimitOutcomes(req),
+					now: Date.now(),
+				}),
 			);
 		}
 	}
@@ -887,14 +966,27 @@ export async function handleProxy(
 		);
 	}
 
+	let terminalAccounts = allAttemptedAccounts;
+	try {
+		terminalAccounts = filterRequestCompatibleAccounts(
+			await ctx.dbOps.getAllAccounts(),
+			req.headers,
+		);
+	} catch (error) {
+		log.error("Failed to refresh terminal account state", error);
+	}
+	const terminal = createRoutingTerminalResponse({
+		source: "attempts",
+		accounts: terminalAccounts,
+		capacityContext: getRoutingCapacityContext(requestMeta),
+		rateLimitOutcomes: getRequestRateLimitOutcomes(req),
+		upstreamAttempts,
+		message: `${ERROR_MESSAGES.ALL_ACCOUNTS_FAILED} (${allAttemptedAccounts.length} attempted)`,
+	});
 	cacheBodyStore.discardStaged(requestMeta.id);
-	pacingSlot?.abandon();
 	// All candidates failed, no account served — degrade the badge (KTD-5).
 	if (sessionId) clearSession(sessionId, requestMeta.timestamp);
-	throw new ServiceUnavailableError(
-		`${ERROR_MESSAGES.ALL_ACCOUNTS_FAILED} (${allAttemptedAccounts.length} attempted)`,
-		ctx.provider.name,
-	);
+	return finishPacing(pacingSlot, terminal.response);
 }
 
 /**

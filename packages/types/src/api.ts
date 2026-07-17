@@ -4,12 +4,52 @@ import type {
 	ProjectAttributionSource,
 } from "./request";
 
-/** Combo slot routing info — maps each returned account to its slot's model override */
+/** Combo slot routing info indexed exactly like the returned account array. */
 export interface ComboSlotInfo {
 	/** The combo name (null when not using combo routing) */
 	comboName: string | null;
-	/** Ordered list of { accountId, modelOverride } for combo slots, indexed by position in the returned accounts array */
+	/** Account/model pairs, indexed by position in the returned accounts array. */
 	slots: Array<{ accountId: string; modelOverride: string }>;
+}
+
+/**
+ * Immutable routing identity for one configured candidate. Normal routes use
+ * one candidate per account; combos use one candidate per slot, so the same
+ * account can safely appear with multiple concrete models.
+ */
+export interface RoutingCandidateMetadata {
+	candidateId: string;
+	accountId: string;
+	/** Account.priority for normal routes; ComboSlot.priority for combo routes. */
+	tier: number;
+	/** Stable source order within one tier. */
+	ordinal: number;
+	comboSlotId: string | null;
+	modelOverride: string | null;
+	/** Model-lane pressure for this exact candidate, when safely comparable. */
+	quotaPressure: AccountQuotaPressure | null;
+}
+
+/**
+ * Coarse, stable quota-pressure buckets used to consume comparable
+ * subscription windows before they reset. Higher-pressure bands sort first.
+ */
+export type QuotaPressureBand =
+	| "critical"
+	| "urgent"
+	| "hot"
+	| "warm"
+	| "steady"
+	| "cold";
+
+/** Request-local quota pressure for one account and concrete model lane. */
+export interface AccountQuotaPressure {
+	band: QuotaPressureBand;
+	/**
+	 * Identifies snapshots whose provider, plan, source, and window shape are
+	 * comparable. A null key deliberately disables pressure-based reordering.
+	 */
+	comparisonKey: string | null;
 }
 
 export interface RequestMeta {
@@ -22,6 +62,8 @@ export interface RequestMeta {
 	projectAttributionSource?: ProjectAttributionSource | null;
 	agentAttributionSource?: AgentAttributionSource | null;
 	headers?: Headers;
+	/** Authenticated in-process auto-refresh probe; never derived from public hint headers. */
+	trustedInternalAutoRefresh?: boolean;
 	/** Active combo name (set when combo routing is used) */
 	comboName?: string | null;
 	/** Combo slot index being attempted (set per-iteration in proxy loop) */
@@ -29,8 +71,25 @@ export interface RequestMeta {
 	/** Per-client session id (from request body metadata.user_id) for session-affinity routing. */
 	clientSessionId?: string | null;
 	/**
+	 * Model- and feature-scoped affinity identity computed before account
+	 * selection. This takes precedence over clientSessionId so one conversation's
+	 * Fable and Opus traffic can have independent sticky owners.
+	 */
+	affinityLaneKey?: string | null;
+	/** Accounts that are hard-ineligible for this concrete request lane. */
+	hardExcludedAccountIds?: ReadonlySet<string> | null;
+	/** Comparable per-account quota pressure for this concrete request lane. */
+	quotaPressureByAccountId?: ReadonlyMap<string, AccountQuotaPressure> | null;
+	/**
+	 * Original configured candidates before transient availability/capacity
+	 * filtering. Affinity uses this to decide whether snapback is legal.
+	 */
+	routingCandidateCatalog?: readonly RoutingCandidateMetadata[] | null;
+	/** Candidate metadata aligned index-for-index with the current account list. */
+	routingCandidates?: readonly RoutingCandidateMetadata[] | null;
+	/**
 	 * Optional conversation-level sticky key (e.g. Grok cache-native affinity).
-	 * When set, SessionAffinityStrategy prefers this over clientSessionId.
+	 * Owned exclusively by the proxy's xAI CacheAffinityOrderer.
 	 */
 	cacheAffinityKey?: string | null;
 	/** True when the Grok cache-native vertical slice has a valid request identity. */

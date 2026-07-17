@@ -151,6 +151,73 @@ describe("handleProxy usage throttling", () => {
 		).toBe(false);
 	});
 
+	it("applies inferred family evidence to Fable siblings but never Opus or synthetic probes", () => {
+		const now = Date.now();
+		usageCache.markFamilyScopedExhausted(
+			"acc-1",
+			"claude-fable-5",
+			now + 60_000,
+		);
+		const base = {
+			accountId: "acc-1",
+			betaSignature: null,
+			syntheticProbe: false,
+			now,
+		};
+		expect(
+			isReactivelyModelDepleted({
+				...base,
+				model: "claude-fable-4-5-20260701",
+			}),
+		).toBe(true);
+		expect(
+			isReactivelyModelDepleted({
+				...base,
+				model: "claude-opus-4-8",
+			}),
+		).toBe(false);
+		expect(
+			isReactivelyModelDepleted({
+				...base,
+				model: "claude-fable-4-5-20260701",
+				syntheticProbe: true,
+			}),
+		).toBe(false);
+	});
+
+	it("returns model 503 when family evidence appears after selection", async () => {
+		const account = makeAccount({
+			provider: "anthropic",
+			name: "max-secondary",
+		});
+		const ctx = makeContext(account);
+		ctx.config.getUsageThrottlingFiveHourEnabled = () => false;
+		ctx.config.getUsageThrottlingWeeklyEnabled = () => false;
+		ctx.strategy.select = ((accounts: Account[]) => {
+			usageCache.markFamilyScopedExhausted(
+				account.id,
+				"claude-fable-5",
+				Date.now() + 60_000,
+			);
+			return accounts;
+		}) as never;
+		const request = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				model: "claude-fable-5",
+				messages: [{ role: "user", content: "hello" }],
+				max_tokens: 16,
+			}),
+		});
+
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		expect(response.status).toBe(503);
+		expect(response.headers.get("retry-after")).toBeNull();
+		expect(response.headers.get("x-better-ccflare-pool-status")).toBeNull();
+		expect((await response.json()).error.code).toBe("model_pool_exhausted");
+	});
+
 	it("proactively skips a reactively depleted same-model route", async () => {
 		const account = makeAccount({
 			provider: "anthropic",
@@ -170,7 +237,12 @@ describe("handleProxy usage throttling", () => {
 		try {
 			const request = new Request("https://proxy.local/v1/messages", {
 				method: "POST",
-				headers: { "Content-Type": "application/json" },
+				headers: {
+					"Content-Type": "application/json",
+					// The integration harness does not initialize the request-history
+					// collector; this header suppresses only terminal history logging.
+					"x-better-ccflare-auto-refresh": "true",
+				},
 				body: JSON.stringify({
 					model: "claude-fable-5",
 					messages: [{ role: "user", content: "hello" }],
@@ -183,7 +255,8 @@ describe("handleProxy usage throttling", () => {
 			ctx.config.getUsageThrottlingFiveHourEnabled = () => false;
 			ctx.config.getUsageThrottlingWeeklyEnabled = () => false;
 			const response = await handleProxy(request, new URL(request.url), ctx);
-			expect(response.status).toBe(529);
+			expect(response.status).toBe(503);
+			expect((await response.json()).error.code).toBe("model_pool_exhausted");
 			expect(fetchMock).toHaveBeenCalledTimes(0);
 		} finally {
 			globalThis.fetch = realFetch;

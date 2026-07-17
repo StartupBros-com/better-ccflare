@@ -1,5 +1,17 @@
 export type ComboFamily = "fable" | "opus" | "sonnet" | "haiku";
 
+export const COMBO_SLOT_PRIORITY_MIN = 0;
+export const COMBO_SLOT_PRIORITY_MAX = 100;
+
+export function isComboSlotPriority(value: unknown): value is number {
+	return (
+		typeof value === "number" &&
+		Number.isInteger(value) &&
+		value >= COMBO_SLOT_PRIORITY_MIN &&
+		value <= COMBO_SLOT_PRIORITY_MAX
+	);
+}
+
 // Database row types (snake_case, INTEGER booleans — match SQLite storage)
 export interface ComboRow {
 	id: string;
@@ -42,6 +54,19 @@ export interface ComboSlot {
 	model: string;
 	priority: number;
 	enabled: boolean;
+}
+
+export interface ComboSlotCreateInput {
+	account_id: string;
+	model: string;
+	priority?: number;
+	enabled?: boolean;
+}
+
+export interface ComboSlotUpdateInput {
+	model?: string;
+	priority?: number;
+	enabled?: boolean;
 }
 
 export interface ComboFamilyAssignment {

@@ -222,17 +222,17 @@ describe("KTD-5: clearSession on no-account-served exits", () => {
 		expect(getServedAccount(SESSION_ID)).toBe("healthy-account");
 	});
 
-	it("clears on the all-candidates-failed ServiceUnavailableError throw", async () => {
+	it("clears on the all-candidates-failed route_unavailable response", async () => {
 		// Force-route to an account whose provider is unregistered, so
 		// proxyWithAccount falls back to the minimal stub ctx.provider and throws
 		// inside prepareHeaders (no network) — every candidate fails, driving the
-		// post-loop generic throw. refresh_token is null so the reauth branch is
-		// skipped and the generic throw fires.
+		// post-loop routing terminal. refresh_token is null so the reauth branch is
+		// skipped and the generic route_unavailable response is returned.
 		const account = makeAccount({
 			id: "acc-force",
 			provider: "test-unregistered-provider",
 			// Falsy refresh_token so the reauth branch is skipped and the generic
-			// ServiceUnavailableError throw fires instead.
+			// routing terminal handles the failure instead.
 			refresh_token: "",
 			api_key: null,
 			access_token: "access-token",
@@ -244,18 +244,18 @@ describe("KTD-5: clearSession on no-account-served exits", () => {
 
 		expect(getServedAccount(SESSION_ID)).toBe("stale-account");
 
-		let threw = false;
-		try {
-			await handleProxy(
-				makeRequest({ "x-better-ccflare-account-id": account.id }),
-				new URL("https://proxy.local/v1/messages"),
-				ctx,
-			);
-		} catch {
-			threw = true;
-		}
+		const response = await handleProxy(
+			makeRequest({ "x-better-ccflare-account-id": account.id }),
+			new URL("https://proxy.local/v1/messages"),
+			ctx,
+		);
 
-		expect(threw).toBe(true);
+		expect(response.status).toBe(503);
+		const body = (await response.json()) as Record<string, unknown>;
+		expect(body.type).toBe("error");
+		const error = body.error as Record<string, unknown>;
+		expect(error.type).toBe("service_unavailable");
+		expect(error.code).toBe("route_unavailable");
 		expect(getServedAccount(SESSION_ID)).toBeUndefined();
 	});
 });

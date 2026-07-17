@@ -164,6 +164,126 @@ describe("LeastUsedStrategy", () => {
 		).toBeGreaterThanOrEqual(2);
 	});
 
+	describe("request-scoped routing metadata", () => {
+		it("never selects or auto-unpauses hard-excluded accounts", () => {
+			const excluded = makeAccount({
+				id: "excluded",
+				priority: 0,
+				paused: true,
+				pause_reason: "overage",
+				auto_fallback_enabled: true,
+				rate_limit_reset: Date.now() - 60_000,
+			});
+			const eligible = makeAccount({ id: "eligible", priority: 1 });
+			const requestMeta = {
+				...meta,
+				hardExcludedAccountIds: new Set(["excluded"]),
+			} as RequestMeta;
+
+			expect(
+				strategy.select([excluded, eligible], requestMeta).map((a) => a.id),
+			).toEqual(["eligible"]);
+			expect(excluded.paused).toBe(true);
+			expect(store.resumeCalls).not.toContain("excluded");
+		});
+
+		it("prefers higher comparable quota pressure within one priority", () => {
+			store.setUtil("critical", 90);
+			store.setUtil("cold", 10);
+			const requestMeta = {
+				...meta,
+				quotaPressureByAccountId: new Map([
+					[
+						"critical",
+						{ band: "critical", comparisonKey: "anthropic:max:weekly-fable" },
+					],
+					[
+						"cold",
+						{ band: "cold", comparisonKey: "anthropic:max:weekly-fable" },
+					],
+				]),
+			} as RequestMeta;
+
+			expect(
+				strategy
+					.select(
+						[
+							makeAccount({ id: "cold", priority: 0 }),
+							makeAccount({ id: "critical", priority: 0 }),
+						],
+						requestMeta,
+					)
+					.map((a) => a.id),
+			).toEqual(["critical", "cold"]);
+		});
+
+		it("never lets quota pressure cross numeric priority", () => {
+			const requestMeta = {
+				...meta,
+				quotaPressureByAccountId: new Map([
+					["priority-0", { band: "cold", comparisonKey: "same" }],
+					["priority-1", { band: "critical", comparisonKey: "same" }],
+				]),
+			} as RequestMeta;
+
+			expect(
+				strategy
+					.select(
+						[
+							makeAccount({ id: "priority-1", priority: 1 }),
+							makeAccount({ id: "priority-0", priority: 0 }),
+						],
+						requestMeta,
+					)
+					.map((a) => a.id),
+			).toEqual(["priority-0", "priority-1"]);
+		});
+
+		it("falls through to existing utilization order for incomparable pressure", () => {
+			store.setUtil("critical", 90);
+			store.setUtil("cold", 10);
+			const requestMeta = {
+				...meta,
+				quotaPressureByAccountId: new Map([
+					["critical", { band: "critical", comparisonKey: "plan-a" }],
+					["cold", { band: "cold", comparisonKey: "plan-b" }],
+				]),
+			} as RequestMeta;
+
+			expect(
+				strategy
+					.select(
+						[makeAccount({ id: "critical" }), makeAccount({ id: "cold" })],
+						requestMeta,
+					)
+					.map((a) => a.id),
+			).toEqual(["cold", "critical"]);
+		});
+
+		it("falls through to existing utilization order when pressure is missing", () => {
+			store.setUtil("with-pressure", 90);
+			store.setUtil("without-pressure", 10);
+			const requestMeta = {
+				...meta,
+				quotaPressureByAccountId: new Map([
+					["with-pressure", { band: "critical", comparisonKey: "same" }],
+				]),
+			} as RequestMeta;
+
+			expect(
+				strategy
+					.select(
+						[
+							makeAccount({ id: "with-pressure" }),
+							makeAccount({ id: "without-pressure" }),
+						],
+						requestMeta,
+					)
+					.map((a) => a.id),
+			).toEqual(["without-pressure", "with-pressure"]);
+		});
+	});
+
 	describe("auto-unpause", () => {
 		it("resumes overage-paused accounts whose rate_limit_reset has elapsed", () => {
 			const past = Date.now() - 60_000;

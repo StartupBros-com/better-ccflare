@@ -29,18 +29,18 @@
 #   2. `bun run build` -> apps/cli/dist/better-ccflare.
 #   3. Copy the binary to
 #      /home/will/.config/better-ccflare/better-ccflare-v<version>-<short-sha>
-#      and chmod +x it.
-#   4. Back up, then rewrite ONLY the CCFLARE_BIN= line in the systemd pin
+#      and install the source-controlled guard + policy as an immutable pair
+#      under guards/<full-sha>/.
+#   4. Back up, then atomically upsert the binary and guard identity lines in
+#      the systemd pin
 #      (/etc/systemd/system/ccflare-stack.service.d/50-pinned-build.conf),
 #      preserving every other Environment= line in that drop-in.
 #   5. `systemctl daemon-reload && systemctl restart ccflare-stack.service`.
-#   6. Poll the guard's health endpoint (passed through to the real server)
-#      until it responds, up to ~60s.
-#   7. Verify the running binary reports the deployed git SHA via the
-#      health endpoint's `git_sha` field; loudly warn on mismatch (the
-#      restart may not have picked up the new pin).
-#   8. Prune old binaries and pin backups, keeping a small safety margin.
-#      Never removes the binary that is currently pinned.
+#   6. Poll both proxy and guard health endpoints until they respond.
+#   7. Require exact binary SHA, guard source ID, and guard policy ID matches.
+#      Any failure after the pin backup restores the old pin and restarts it.
+#   8. Prune old binaries, guard pairs, and pin backups conservatively. Never
+#      removes the artifacts that are newly deployed or currently pinned.
 #
 # REQUIRES: git, node, bun, curl, sudo (for the systemd pin + restart).
 #
@@ -49,12 +49,119 @@ set -Eeuo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# shellcheck source=deploy-ccflare-lib.sh
+source "$REPO_ROOT/scripts/deploy-ccflare-lib.sh"
+
 DEST="/home/will/.config/better-ccflare"
 PIN="/etc/systemd/system/ccflare-stack.service.d/50-pinned-build.conf"
 HEALTH_URL="http://127.0.0.1:8788/health"
+GUARD_HEALTH_URL="http://127.0.0.1:8788/_guard/health"
 HEALTH_WAIT_SECS=60
 KEEP_BINARIES=5
+KEEP_GUARDS=5
+KEEP_RUNNERS=5
 KEEP_BACKUPS=3
+GUARD_POLICY_ID="pool-exhaustion-finite-recovery-v1"
+ROLLBACK_HARD_FAILURE=70
+
+PIN_BACKUP=""
+PIN_RENDERED=""
+PIN_STAGED=""
+PIN_ROLLBACK_ARMED=0
+GUARD_STAGE_DIR=""
+RUNNER_STAGE_DIR=""
+PRIOR_PROXY_HEALTH_JSON=""
+PRIOR_GUARD_HEALTH_JSON=""
+PROXY_HEALTH_JSON=""
+GUARD_HEALTH_JSON=""
+
+poll_stack_health() {
+	PROXY_HEALTH_JSON=""
+	GUARD_HEALTH_JSON=""
+	for _ in $(seq 1 "$HEALTH_WAIT_SECS"); do
+		PROXY_HEALTH_JSON="$(curl -sf "$HEALTH_URL" 2>/dev/null || true)"
+		GUARD_HEALTH_JSON="$(curl -sf "$GUARD_HEALTH_URL" 2>/dev/null || true)"
+		if [[ -n "$PROXY_HEALTH_JSON" && -n "$GUARD_HEALTH_JSON" ]]; then
+			return 0
+		fi
+		sleep 1
+	done
+	return 1
+}
+
+verify_service_process_identity() {
+	if [[ "$#" -ne 2 ]]; then
+		return 2
+	fi
+	local guard_json="$1" expected_runner="$2" main_pid health_runner_pid
+	main_pid="$(systemctl show ccflare-stack.service --property MainPID --value)" || return 1
+	health_runner_pid="$(
+		node -e '
+			try {
+				const value = JSON.parse(process.argv[1])?.runtime?.process?.runnerPid;
+				if (!Number.isSafeInteger(value)) process.exit(1);
+				process.stdout.write(String(value));
+			} catch { process.exit(1); }
+		' "$guard_json"
+	)" || return 1
+	[[ "$main_pid" == "$health_runner_pid" ]] || return 1
+	verify_process_start_identity "$main_pid" "$expected_runner" || return 1
+	printf '%s\n' "$main_pid"
+}
+
+rollback_on_failure() {
+	local status="$1"
+	trap - EXIT
+	set +e
+
+	[[ -n "$PIN_RENDERED" && -f "$PIN_RENDERED" ]] && rm -f "$PIN_RENDERED"
+	if [[ -n "$GUARD_STAGE_DIR" && -d "$GUARD_STAGE_DIR" ]]; then
+		rm -f \
+			"$GUARD_STAGE_DIR/ccflare-guard.mjs" \
+			"$GUARD_STAGE_DIR/ccflare-guard-policy.mjs"
+		rmdir "$GUARD_STAGE_DIR" 2>/dev/null
+	fi
+	if [[ -n "$RUNNER_STAGE_DIR" && -d "$RUNNER_STAGE_DIR" ]]; then
+		rm -f "$RUNNER_STAGE_DIR/run-ccflare-stack.sh"
+		rmdir "$RUNNER_STAGE_DIR" 2>/dev/null
+	fi
+
+	if [[ "$status" -ne 0 && "$PIN_ROLLBACK_ARMED" == "1" ]]; then
+		echo "ERROR: deployment failed; restoring systemd pin from $PIN_BACKUP" >&2
+		local rollback_stage="${PIN}.rollback-$$"
+		local restored_runner_path="" restored_main_pid=""
+		if ! sudo cp --preserve=all "$PIN_BACKUP" "$rollback_stage" \
+			|| ! sudo mv -f "$rollback_stage" "$PIN" \
+			|| ! sudo systemctl daemon-reload \
+			|| ! sudo systemctl restart ccflare-stack.service \
+			|| ! poll_stack_health \
+			|| ! restored_runner_path="$(
+				node -e '
+					try {
+						const value = JSON.parse(process.argv[1])?.runtime?.artifacts?.runner?.path;
+						if (typeof value !== "string" || value.length === 0) process.exit(1);
+						process.stdout.write(value);
+					} catch { process.exit(1); }
+				' "$GUARD_HEALTH_JSON"
+			)" \
+			|| ! restored_main_pid="$(verify_service_process_identity "$GUARD_HEALTH_JSON" "$restored_runner_path")" \
+			|| ! validate_rollback_health \
+				"$PRIOR_PROXY_HEALTH_JSON" \
+				"$PRIOR_GUARD_HEALTH_JSON" \
+				"$PROXY_HEALTH_JSON" \
+				"$GUARD_HEALTH_JSON"; then
+			echo "HARD FAILURE: restored binary/runner/guard/policy identity could not be proven" >&2
+			sudo rm -f "$rollback_stage" 2>/dev/null
+			exit "$ROLLBACK_HARD_FAILURE"
+		fi
+		echo "==> Rollback identity verified against captured prior runtime." >&2
+	fi
+
+	[[ -n "$PIN_STAGED" ]] && sudo rm -f "$PIN_STAGED" 2>/dev/null
+	exit "$status"
+}
+
+trap 'rollback_on_failure $?' EXIT
 
 CHECK_ONLY=0
 for arg in "$@"; do
@@ -139,10 +246,30 @@ if [[ "$ANCESTRY_OK" != "1" || "$TREE_OK" != "1" || "$VERSION_OK" != "1" ]]; the
 	exit 1
 fi
 
+# The check path exits above without opening a lock or invoking sudo. A full
+# deploy takes one non-blocking host lock before build or deployment mutation.
+DEPLOY_LOCK="${XDG_RUNTIME_DIR:-/tmp}/better-ccflare-deploy-${UID}.lock"
+exec 9>"$DEPLOY_LOCK"
+if ! flock -n 9; then
+	echo "refusing to deploy: another better-ccflare deployment holds $DEPLOY_LOCK" >&2
+	exit 75
+fi
+
 # ---------------------------------------------------------------------------
 # 2) Build
 # ---------------------------------------------------------------------------
 BIN_NAME="better-ccflare-v${VERSION}-${SHORT}"
+GUARDS_ROOT="${DEST}/guards"
+GUARD_DIR="${GUARDS_ROOT}/${HEAD_SHA}"
+GUARD_SCRIPT="${GUARD_DIR}/ccflare-guard.mjs"
+GUARD_POLICY="${GUARD_DIR}/ccflare-guard-policy.mjs"
+RUNNERS_ROOT="${DEST}/runners"
+RUNNER_DIR="${RUNNERS_ROOT}/${HEAD_SHA}"
+RUNNER_SCRIPT="${RUNNER_DIR}/run-ccflare-stack.sh"
+GUARD_SOURCE_ID="$HEAD_SHA"
+SOURCE_GUARD="$REPO_ROOT/scripts/ccflare-guard.mjs"
+SOURCE_GUARD_POLICY="$REPO_ROOT/scripts/ccflare-guard-policy.mjs"
+SOURCE_RUNNER="$REPO_ROOT/scripts/run-ccflare-stack.sh"
 
 echo "==> Building better-ccflare v${VERSION} (${SHORT})…"
 bun run build
@@ -160,21 +287,116 @@ mkdir -p "$DEST"
 DEST_BIN="${DEST}/${BIN_NAME}"
 cp "$BUILT_BIN" "$DEST_BIN"
 chmod +x "$DEST_BIN"
-echo "==> Installed $DEST_BIN"
-
-# ---------------------------------------------------------------------------
-# 4) Update the systemd pin, preserving every other Environment= line
-# ---------------------------------------------------------------------------
-echo "==> Updating systemd pin ($PIN)…"
-PIN_BACKUP="${PIN}.bak-$(date -u +%Y%m%dT%H%M%SZ)"
-sudo cp "$PIN" "$PIN_BACKUP"
-sudo sed -i.bak "s#^Environment=CCFLARE_BIN=.*#Environment=CCFLARE_BIN=${DEST_BIN}#" "$PIN"
-
-if ! grep -q "^Environment=CCFLARE_BIN=${DEST_BIN}$" "$PIN"; then
-	echo "ERROR: failed to update CCFLARE_BIN in $PIN — restoring from backup." >&2
-	sudo cp "$PIN_BACKUP" "$PIN"
+BUILT_BIN_SHA256="$(sha256_file "$BUILT_BIN")"
+DEST_BIN_SHA256="$(sha256_file "$DEST_BIN")"
+if [[ "$BUILT_BIN_SHA256" != "$DEST_BIN_SHA256" ]]; then
+	echo "ERROR: installed binary digest differs from build output" >&2
 	exit 1
 fi
+echo "==> Installed $DEST_BIN"
+
+# Install the guard and its policy together under a commit-addressed
+# directory. An existing directory at this SHA is immutable: reuse it only if
+# both files exactly match the checkout, otherwise refuse the deployment.
+if [[ ! -f "$SOURCE_GUARD" || ! -f "$SOURCE_GUARD_POLICY" || ! -f "$SOURCE_RUNNER" ]]; then
+	echo "ERROR: source-controlled runner/guard artifacts are missing" >&2
+	exit 1
+fi
+
+mkdir -p "$GUARDS_ROOT"
+if [[ -d "$GUARD_DIR" ]]; then
+	if ! cmp -s "$SOURCE_GUARD" "$GUARD_SCRIPT" \
+		|| ! cmp -s "$SOURCE_GUARD_POLICY" "$GUARD_POLICY"; then
+		echo "ERROR: immutable guard directory $GUARD_DIR does not match deployed source" >&2
+		exit 1
+	fi
+	echo "==> Reusing verified guard pair $GUARD_DIR"
+else
+	GUARD_STAGE_DIR="${GUARD_DIR}.tmp-$$"
+	mkdir "$GUARD_STAGE_DIR"
+	cp "$SOURCE_GUARD" "$GUARD_STAGE_DIR/ccflare-guard.mjs"
+	cp "$SOURCE_GUARD_POLICY" "$GUARD_STAGE_DIR/ccflare-guard-policy.mjs"
+	chmod 0555 "$GUARD_STAGE_DIR/ccflare-guard.mjs"
+	chmod 0444 "$GUARD_STAGE_DIR/ccflare-guard-policy.mjs"
+	mv "$GUARD_STAGE_DIR" "$GUARD_DIR"
+	GUARD_STAGE_DIR=""
+	echo "==> Installed immutable guard pair $GUARD_DIR"
+fi
+
+mkdir -p "$RUNNERS_ROOT"
+if [[ -d "$RUNNER_DIR" ]]; then
+	if ! cmp -s "$SOURCE_RUNNER" "$RUNNER_SCRIPT"; then
+		echo "ERROR: immutable runner directory $RUNNER_DIR does not match deployed source" >&2
+		exit 1
+	fi
+	echo "==> Reusing verified runner $RUNNER_DIR"
+else
+	RUNNER_STAGE_DIR="${RUNNER_DIR}.tmp-$$"
+	mkdir "$RUNNER_STAGE_DIR"
+	cp "$SOURCE_RUNNER" "$RUNNER_STAGE_DIR/run-ccflare-stack.sh"
+	chmod 0555 "$RUNNER_STAGE_DIR/run-ccflare-stack.sh"
+	mv "$RUNNER_STAGE_DIR" "$RUNNER_DIR"
+	RUNNER_STAGE_DIR=""
+	echo "==> Installed immutable runner $RUNNER_DIR"
+fi
+
+RUNNER_SHA256="$(sha256_file "$RUNNER_SCRIPT")"
+GUARD_SHA256="$(sha256_file "$GUARD_SCRIPT")"
+POLICY_SHA256="$(sha256_file "$GUARD_POLICY")"
+for digest_pair in \
+	"$(sha256_file "$SOURCE_RUNNER"):$RUNNER_SHA256:runner" \
+	"$(sha256_file "$SOURCE_GUARD"):$GUARD_SHA256:guard" \
+	"$(sha256_file "$SOURCE_GUARD_POLICY"):$POLICY_SHA256:policy"; do
+	IFS=: read -r source_digest installed_digest artifact_name <<<"$digest_pair"
+	if [[ "$source_digest" != "$installed_digest" ]]; then
+		echo "ERROR: installed $artifact_name digest differs from source" >&2
+		exit 1
+	fi
+done
+
+# ---------------------------------------------------------------------------
+# 4) Update the systemd pin atomically, preserving every other line
+# ---------------------------------------------------------------------------
+echo "==> Updating systemd pin ($PIN)…"
+# Capture the pre-deploy runtime before arming rollback. A legacy first
+# migration may not expose complete runtime identity; deployment can proceed,
+# but any later rollback will hard-fail rather than claim an unproven restore.
+PRIOR_PROXY_HEALTH_JSON="$(curl -sf "$HEALTH_URL" 2>/dev/null || true)"
+PRIOR_GUARD_HEALTH_JSON="$(curl -sf "$GUARD_HEALTH_URL" 2>/dev/null || true)"
+PIN_BACKUP="${PIN}.bak-$(date -u +%Y%m%dT%H%M%SZ)-${SHORT}"
+sudo cp --preserve=all "$PIN" "$PIN_BACKUP"
+PIN_ROLLBACK_ARMED=1
+
+PIN_RENDERED="$(mktemp)"
+render_systemd_pin \
+	"$PIN" \
+	"$PIN_RENDERED" \
+	"$DEST_BIN" \
+	"$RUNNER_SCRIPT" \
+	"$GUARD_SCRIPT" \
+	"$GUARD_SOURCE_ID" \
+	"$GUARD_POLICY_ID"
+
+PIN_STAGED="${PIN}.new-${SHORT}-$$"
+sudo cp --preserve=all "$PIN" "$PIN_STAGED"
+sudo tee "$PIN_STAGED" <"$PIN_RENDERED" >/dev/null
+sudo mv -f "$PIN_STAGED" "$PIN"
+PIN_STAGED=""
+rm -f "$PIN_RENDERED"
+PIN_RENDERED=""
+
+for expected_line in \
+	"Environment=CCFLARE_BIN=${DEST_BIN}" \
+	"Environment=GUARD_SCRIPT=${GUARD_SCRIPT}" \
+	"Environment=GUARD_SOURCE_ID=${GUARD_SOURCE_ID}" \
+	"Environment=GUARD_POLICY_ID=${GUARD_POLICY_ID}" \
+	"ExecStart=" \
+	"ExecStart=${RUNNER_SCRIPT}"; do
+	if [[ "$(grep -Fxc "$expected_line" "$PIN")" -ne 1 ]]; then
+		echo "ERROR: failed to atomically upsert '$expected_line' in $PIN" >&2
+		exit 1
+	fi
+done
 echo "==> Pin backed up to $PIN_BACKUP"
 
 # ---------------------------------------------------------------------------
@@ -185,55 +407,103 @@ sudo systemctl daemon-reload
 sudo systemctl restart ccflare-stack.service
 
 # ---------------------------------------------------------------------------
-# 6) Wait for health
+# 6) Wait for proxy and guard health
 # ---------------------------------------------------------------------------
-echo "==> Waiting for health at $HEALTH_URL…"
-HEALTH_OK=0
-for _ in $(seq 1 "$HEALTH_WAIT_SECS"); do
-	if curl -sf "$HEALTH_URL" >/dev/null 2>&1; then
-		HEALTH_OK=1
-		break
-	fi
-	sleep 1
-done
-
-if [[ "$HEALTH_OK" == "1" ]]; then
-	echo "==> Service is healthy."
+echo "==> Waiting for health at $HEALTH_URL and $GUARD_HEALTH_URL…"
+if poll_stack_health; then
+	echo "==> Proxy and guard health endpoints are responding."
 else
-	echo "WARNING: service did not respond healthy within ${HEALTH_WAIT_SECS}s at $HEALTH_URL" >&2
+	echo "ERROR: proxy and guard did not both respond within ${HEALTH_WAIT_SECS}s" >&2
+	exit 1
 fi
 
 # ---------------------------------------------------------------------------
-# 7) Verify the running binary is actually the SHA we just deployed
+# 7) Verify exact binary and guard deployment identities
 # ---------------------------------------------------------------------------
-REPORTED_SHA=""
-if [[ "$HEALTH_OK" == "1" ]]; then
-	REPORTED_SHA="$(curl -sf "$HEALTH_URL" 2>/dev/null | node -e '
-		let d = "";
-		process.stdin.on("data", (c) => { d += c; });
-		process.stdin.on("end", () => {
-			try {
-				const body = JSON.parse(d);
-				process.stdout.write(body.git_sha || "");
-			} catch {
-				process.stdout.write("");
-			}
-		});
-	' 2>/dev/null || true)"
+if ! MAIN_PID="$(verify_service_process_identity "$GUARD_HEALTH_JSON" "$RUNNER_SCRIPT")"; then
+	echo "ERROR: systemd MainPID=$MAIN_PID was not started from $RUNNER_SCRIPT" >&2
+	exit 1
 fi
 
-if [[ "$REPORTED_SHA" == "$SHORT" ]]; then
-	echo "==> Verified: running binary reports git_sha=$REPORTED_SHA (matches deployed $SHORT)."
-else
-	echo "WARNING: running binary reports git_sha='${REPORTED_SHA:-<empty>}', expected '${SHORT}'." >&2
-	echo "WARNING: the restart may not have picked up the new pin — do not assume this deploy is live." >&2
+EXPECTED_IDENTITY_JSON="$(
+	node - \
+		"$SHORT" \
+		"$GUARD_SOURCE_ID" \
+		"$GUARD_POLICY_ID" \
+		"$MAIN_PID" \
+		"$(readlink -f "$DEST_BIN")" "$DEST_BIN_SHA256" \
+		"$(readlink -f "$RUNNER_SCRIPT")" "$RUNNER_SHA256" \
+		"$(readlink -f "$GUARD_SCRIPT")" "$GUARD_SHA256" \
+		"$(readlink -f "$GUARD_POLICY")" "$POLICY_SHA256" <<'NODE'
+const [
+	proxyGitSha,
+	sourceId,
+	policyId,
+	runnerPid,
+	binaryPath,
+	binarySha256,
+	runnerPath,
+	runnerSha256,
+	guardPath,
+	guardSha256,
+	policyPath,
+	policySha256,
+] = process.argv.slice(2);
+process.stdout.write(JSON.stringify({
+	proxyGitSha,
+	sourceId,
+	policyId,
+	runnerPid: Number(runnerPid),
+	artifacts: {
+		binary: { path: binaryPath, sha256: binarySha256 },
+		runner: { path: runnerPath, sha256: runnerSha256 },
+		guard: { path: guardPath, sha256: guardSha256 },
+		policy: { path: policyPath, sha256: policySha256 },
+	},
+	limits: {
+		totalDeadlineMs: 120000,
+		maxAttempts: 3,
+		jitterMs: 2000,
+		maxInspectionBytes: 65536,
+	},
+}));
+NODE
+)"
+if ! validate_deploy_health \
+	"$PROXY_HEALTH_JSON" \
+	"$GUARD_HEALTH_JSON" \
+	"$EXPECTED_IDENTITY_JSON"; then
+	echo "ERROR: deployment health identity verification failed" >&2
+	exit 1
 fi
+echo "==> Verified binary, runner, guard, policy, process start, and effective guard limits."
 
 # ---------------------------------------------------------------------------
 # 8) Prune old artifacts. Conservative: never touch the binary we just
 #    pinned, and only remove things strictly beyond the keep window.
 # ---------------------------------------------------------------------------
-echo "==> Pruning old binaries and pin backups…"
+echo "==> Pruning old binaries, guard pairs, and pin backups…"
+
+PIN_DIR="$(dirname "$PIN")"
+mapfile -t PIN_REFERENCE_FILES < <(
+	find "$PIN_DIR" -maxdepth 1 -type f \
+		\( -name '50-pinned-build.conf' -o -name '50-pinned-build.conf.bak-*' \) \
+		-print 2>/dev/null
+)
+PROTECTED_BINARIES=("$DEST_BIN")
+PROTECTED_GUARD_DIRS=("$GUARD_DIR")
+PROTECTED_RUNNER_DIRS=("$RUNNER_DIR")
+for reference_pin in "${PIN_REFERENCE_FILES[@]:-}"; do
+	while IFS= read -r referenced_binary; do
+		[[ -n "$referenced_binary" ]] && PROTECTED_BINARIES+=("$referenced_binary")
+	done < <(sed -n 's/^Environment=CCFLARE_BIN=//p' "$reference_pin")
+	while IFS= read -r referenced_guard; do
+		[[ -n "$referenced_guard" ]] && PROTECTED_GUARD_DIRS+=("$(dirname "$referenced_guard")")
+	done < <(sed -n 's/^Environment=GUARD_SCRIPT=//p' "$reference_pin")
+	while IFS= read -r referenced_runner; do
+		[[ -n "$referenced_runner" ]] && PROTECTED_RUNNER_DIRS+=("$(dirname "$referenced_runner")")
+	done < <(sed -n 's/^ExecStart=\([^[:space:]].*run-ccflare-stack\.sh\)$/\1/p' "$reference_pin")
+done
 
 mapfile -t OLD_BINS < <(
 	find "$DEST" -maxdepth 1 -type f -name 'better-ccflare-v*' -printf '%T@ %p\n' 2>/dev/null \
@@ -242,13 +512,49 @@ mapfile -t OLD_BINS < <(
 		| tail -n "+$((KEEP_BINARIES + 1))"
 )
 for f in "${OLD_BINS[@]:-}"; do
-	if [[ -n "$f" && -f "$f" && "$f" != "$DEST_BIN" ]]; then
-		rm -f "$f"
-		echo "    removed $f"
-	fi
+	[[ -n "$f" && -f "$f" ]] || continue
+	for protected_binary in "${PROTECTED_BINARIES[@]}"; do
+		[[ "$f" == "$protected_binary" ]] && continue 2
+	done
+	rm -f "$f"
+	echo "    removed $f"
 done
 
-PIN_DIR="$(dirname "$PIN")"
+mapfile -t OLD_GUARD_DIRS < <(
+	artifact_prune_candidates "$GUARDS_ROOT" "$KEEP_GUARDS" "${PROTECTED_GUARD_DIRS[@]}"
+)
+for guard_dir in "${OLD_GUARD_DIRS[@]:-}"; do
+	[[ -n "$guard_dir" ]] || continue
+	if [[ "$guard_dir" != "$GUARDS_ROOT/"* \
+		|| ! -f "$guard_dir/ccflare-guard.mjs" \
+		|| ! -f "$guard_dir/ccflare-guard-policy.mjs" \
+		|| "$(find "$guard_dir" -mindepth 1 -maxdepth 1 | wc -l)" -ne 2 ]]; then
+		echo "    skipped non-standard guard directory $guard_dir" >&2
+		continue
+	fi
+	rm -f \
+		"$guard_dir/ccflare-guard.mjs" \
+		"$guard_dir/ccflare-guard-policy.mjs"
+	rmdir "$guard_dir"
+	echo "    removed $guard_dir"
+done
+
+mapfile -t OLD_RUNNER_DIRS < <(
+	artifact_prune_candidates "$RUNNERS_ROOT" "$KEEP_RUNNERS" "${PROTECTED_RUNNER_DIRS[@]}"
+)
+for runner_dir in "${OLD_RUNNER_DIRS[@]:-}"; do
+	[[ -n "$runner_dir" ]] || continue
+	if [[ "$runner_dir" != "$RUNNERS_ROOT/"* \
+		|| ! -f "$runner_dir/run-ccflare-stack.sh" \
+		|| "$(find "$runner_dir" -mindepth 1 -maxdepth 1 | wc -l)" -ne 1 ]]; then
+		echo "    skipped non-standard runner directory $runner_dir" >&2
+		continue
+	fi
+	rm -f "$runner_dir/run-ccflare-stack.sh"
+	rmdir "$runner_dir"
+	echo "    removed $runner_dir"
+done
+
 mapfile -t OLD_PIN_BAKS < <(
 	find "$PIN_DIR" -maxdepth 1 -type f -name '50-pinned-build.conf.bak-*' -printf '%T@ %p\n' 2>/dev/null \
 		| sort -rn \
@@ -277,7 +583,13 @@ echo "=== Deploy summary ==="
 echo "deployed sha:  $SHORT"
 echo "version:       $VERSION"
 echo "binary:        $DEST_BIN"
+echo "runner:        $RUNNER_SCRIPT"
+echo "guard:         $GUARD_SCRIPT"
 echo "pin:           $PIN"
 echo "  CCFLARE_BIN= $DEST_BIN"
-echo "health:        $([[ "$HEALTH_OK" == "1" ]] && echo "OK" || echo "UNVERIFIED (see warning above)")"
-echo "reported sha:  ${REPORTED_SHA:-<none>} $([[ "$REPORTED_SHA" == "$SHORT" ]] && echo "(match)" || echo "(MISMATCH — see warning above)")"
+echo "  ExecStart=   $RUNNER_SCRIPT"
+echo "  GUARD_SCRIPT=$GUARD_SCRIPT"
+echo "source id:     $GUARD_SOURCE_ID"
+echo "policy id:     $GUARD_POLICY_ID"
+echo "sha256:        binary=$DEST_BIN_SHA256 runner=$RUNNER_SHA256 guard=$GUARD_SHA256 policy=$POLICY_SHA256"
+echo "health:        VERIFIED"

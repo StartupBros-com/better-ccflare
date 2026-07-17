@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { usageCache } from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
 import type { ProxyContext } from "../handlers";
 import { handleProxy } from "../proxy";
@@ -17,6 +18,8 @@ function makeAccount(overrides: Partial<Account> = {}): Account {
 		last_used: null,
 		created_at: Date.now(),
 		rate_limited_until: null,
+		rate_limited_reason: null,
+		rate_limited_at: null,
 		session_start: null,
 		session_request_count: 0,
 		paused: false,
@@ -27,6 +30,7 @@ function makeAccount(overrides: Partial<Account> = {}): Account {
 		auto_fallback_enabled: false,
 		auto_refresh_enabled: false,
 		auto_pause_on_overage_enabled: false,
+		peak_hours_pause_enabled: false,
 		custom_endpoint: null,
 		model_mappings: null,
 		cross_region_mode: null,
@@ -34,6 +38,7 @@ function makeAccount(overrides: Partial<Account> = {}): Account {
 		billing_type: null,
 		pause_reason: null,
 		refresh_token_issued_at: null,
+		consecutive_rate_limits: 0,
 		...overrides,
 	};
 }
@@ -91,6 +96,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+	usageCache.delete("acc-resetless-capacity");
 	if (savedPassthrough === undefined) {
 		delete process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
 	} else {
@@ -98,8 +104,8 @@ afterEach(() => {
 	}
 });
 
-describe("pool exhausted — 503 response", () => {
-	it("returns 503 with pool_exhausted body when pool is empty", async () => {
+describe("routing terminal — 503 response", () => {
+	it("returns non-retryable route_unavailable when pool is empty", async () => {
 		const ctx = makeContext([]);
 		const response = await handleProxy(
 			makeRequest(),
@@ -113,14 +119,15 @@ describe("pool exhausted — 503 response", () => {
 		expect(body.type).toBe("error");
 
 		const error = body.error as Record<string, unknown>;
-		expect(error.type).toBe("pool_exhausted");
+		expect(error.type).toBe("service_unavailable");
+		expect(error.code).toBe("route_unavailable");
 		expect(typeof error.message).toBe("string");
 		expect((error.message as string).length).toBeGreaterThan(0);
-		expect("next_available_at" in error).toBe(true);
+		expect("next_available_at" in error).toBe(false);
 		expect(Array.isArray(error.accounts)).toBe(true);
 	});
 
-	it("returns Retry-After header when pool is empty", async () => {
+	it("does not return Retry-After when pool is empty", async () => {
 		const ctx = makeContext([]);
 		const response = await handleProxy(
 			makeRequest(),
@@ -129,12 +136,10 @@ describe("pool exhausted — 503 response", () => {
 		);
 
 		expect(response.status).toBe(503);
-		const retryAfter = response.headers.get("Retry-After");
-		expect(retryAfter).toBeDefined();
-		expect(Number(retryAfter)).toBeGreaterThan(0);
+		expect(response.headers.get("Retry-After")).toBeNull();
 	});
 
-	it("returns x-better-ccflare-pool-status: exhausted header", async () => {
+	it("does not return a whole-pool marker without recovery evidence", async () => {
 		const ctx = makeContext([]);
 		const response = await handleProxy(
 			makeRequest(),
@@ -143,9 +148,7 @@ describe("pool exhausted — 503 response", () => {
 		);
 
 		expect(response.status).toBe(503);
-		expect(response.headers.get("x-better-ccflare-pool-status")).toBe(
-			"exhausted",
-		);
+		expect(response.headers.get("x-better-ccflare-pool-status")).toBeNull();
 	});
 
 	it("returns Content-Type: application/json header", async () => {
@@ -170,6 +173,7 @@ describe("pool exhausted — 503 response", () => {
 			id: "acc-rl",
 			name: "rate-limited-account",
 			rate_limited_until: Date.now() + 60_000,
+			rate_limited_reason: "upstream_429_with_reset",
 		});
 
 		const ctx = makeContext([pausedAccount, rateLimitedAccount]);
@@ -197,6 +201,7 @@ describe("pool exhausted — 503 response", () => {
 			id: "acc-rl",
 			name: "rate-limited-account",
 			rate_limited_until: cooldownUntil,
+			rate_limited_reason: "upstream_429_with_reset",
 		});
 
 		const ctx = makeContext([rateLimitedAccount]);
@@ -223,6 +228,7 @@ describe("pool exhausted — 503 response", () => {
 			id: "acc-rl",
 			name: "rate-limited-account",
 			rate_limited_until: cooldownUntil,
+			rate_limited_reason: "upstream_429_with_reset",
 		});
 
 		const realDateNow = Date.now;
@@ -245,7 +251,7 @@ describe("pool exhausted — 503 response", () => {
 		}
 	});
 
-	it("sets Retry-After to 60 when no cooldown info (only paused accounts)", async () => {
+	it("does not set Retry-After when only manually paused accounts exist", async () => {
 		const pausedAccount = makeAccount({
 			id: "acc-paused",
 			name: "paused-account",
@@ -260,10 +266,40 @@ describe("pool exhausted — 503 response", () => {
 		);
 
 		expect(response.status).toBe(503);
-		expect(response.headers.get("Retry-After")).toBe("60");
+		expect(response.headers.get("Retry-After")).toBeNull();
 	});
 
-	it("filters accounts by provider in multi-provider setup", async () => {
+	it("keeps resetless session and weekly-all capacity terminal states non-retryable", async () => {
+		for (const kind of ["session", "weekly_all"] as const) {
+			const account = makeAccount({ id: "acc-resetless-capacity" });
+			usageCache.set(account.id, {
+				limits: [
+					{
+						kind,
+						percent: 100,
+						resets_at: null,
+						scope: null,
+					},
+				],
+			});
+
+			const response = await handleProxy(
+				makeRequest(),
+				new URL("https://proxy.local/v1/messages"),
+				makeContext([account]),
+			);
+
+			expect(response.status).toBe(503);
+			expect(response.headers.get("Retry-After")).toBeNull();
+			expect(response.headers.get("x-better-ccflare-pool-status")).toBeNull();
+			const payload = (await response.json()) as {
+				error: { code: string };
+			};
+			expect(payload.error.code).toBe("route_unavailable");
+		}
+	});
+
+	it("retains compatible dynamic providers in terminal inventory", async () => {
 		const codexAccount = makeAccount({
 			id: "acc-codex",
 			name: "codex-account",
@@ -279,7 +315,7 @@ describe("pool exhausted — 503 response", () => {
 			pause_reason: "manual",
 		});
 
-		// Both accounts in DB, but only codex accounts should appear in response
+		// Dynamic routing considers both providers for /v1/messages.
 		const ctx = makeContext([codexAccount, anthropicAccount]);
 		const response = await handleProxy(
 			makeRequest(),
@@ -293,9 +329,11 @@ describe("pool exhausted — 503 response", () => {
 		const error = body.error as Record<string, unknown>;
 		const accounts = error.accounts as Array<Record<string, unknown>>;
 
-		// Only codex account should appear
-		expect(accounts.length).toBe(1);
-		expect(accounts[0].name).toBe("codex-account");
+		expect(accounts.length).toBe(2);
+		expect(accounts.map((account) => account.name)).toEqual([
+			"codex-account",
+			"anthropic-account",
+		]);
 	});
 });
 

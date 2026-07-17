@@ -45,6 +45,17 @@ describe("getErrorMeta", () => {
 		expect(meta.severity).toBe("warning");
 	});
 
+	test("upstream_402_payment_required explains account-scoped billing failover", () => {
+		const meta = getErrorMeta("upstream_402_payment_required");
+		expect(meta.title).toBe("Account payment required");
+		expect(meta.severity).toBe("error");
+		expect(meta.description).toContain("402");
+		expect(meta.description).toContain("bounded probe cooldown");
+		expect(meta.description).toContain("fails over");
+		expect(meta.description).toContain("without disabling");
+		expect(meta.suggestion).toContain("billing or credits");
+	});
+
 	test("upstream_529_overloaded_with_reset returns provider overload warning", () => {
 		const meta = getErrorMeta("upstream_529_overloaded_with_reset");
 		expect(meta.title).toBe("Provider overload");

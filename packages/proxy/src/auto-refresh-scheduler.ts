@@ -13,6 +13,7 @@ import {
 	getValidAccessToken,
 	pauseAccountForReauthIfInvalidGrant,
 } from "./handlers";
+import { stampInternalAutoRefreshAuth } from "./internal-probe-auth";
 import type { ProxyContext } from "./proxy";
 
 const log = new Logger("AutoRefreshScheduler");
@@ -436,9 +437,13 @@ export class AutoRefreshScheduler {
 						`Auto-refresh headers: ${JSON.stringify(Object.fromEntries(headers.entries()), null, 2)}`,
 					);
 
+					// Add the process-private credential only after diagnostic logging.
+					// handleProxy consumes it at ingress before metadata or forwarding.
+					const authorizedHeaders = new Headers(headers);
+					stampInternalAutoRefreshAuth(authorizedHeaders);
 					response = await fetch(endpoint, {
 						method: "POST",
-						headers,
+						headers: authorizedHeaders,
 						body: JSON.stringify(requestBody),
 						signal: AbortSignal.timeout(30000),
 					});
