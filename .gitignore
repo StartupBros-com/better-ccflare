@@ -25,6 +25,7 @@ AGENTS.md
 **/*.sh
 !.github/scripts/*.sh
 !scripts/*.sh
+!scripts/legacy/*.sh
 
 # Build artifacts and test files
 better-ccflare-*
