@@ -577,12 +577,6 @@ describe("source-controlled guard", () => {
 			body: { error: { type: "service_unavailable" } },
 		},
 		{
-			name: "indefinite pool exhaustion",
-			status: 503,
-			headers: { "x-better-ccflare-pool-status": "exhausted" },
-			body: { error: { type: "pool_exhausted" } },
-		},
-		{
 			name: "raw 529 overload",
 			status: 529,
 			headers: { "retry-after": "0.01" },
@@ -610,6 +604,39 @@ describe("source-controlled guard", () => {
 		expect(response.status).toBe(status);
 		expect(await response.json()).toEqual(body);
 		expect(attempts).toBe(1);
+	});
+
+	// R17: the header alone is authoritative, so a 503 marked exhausted with no
+	// concrete recovery signal (no Retry-After, no next_available_at) is still
+	// retried rather than forwarded as final. Delay resolution falls back to
+	// no wait, and R19's bounded attempt count is what keeps this finite.
+	test("retries a header-confirmed pool exhaustion with no recovery signal at no delay until attempts are exhausted", async () => {
+		let attempts = 0;
+		const upstreamBase = await listen(
+			http.createServer((_req, res) => {
+				attempts += 1;
+				res.writeHead(503, {
+					"content-type": "application/json",
+					"x-better-ccflare-pool-status": "exhausted",
+				});
+				res.end(JSON.stringify({ error: { type: "pool_exhausted" } }));
+			}),
+		);
+		const { baseUrl } = await startGuard(upstreamBase, {
+			maxAttempts: 3,
+			totalDeadlineMs: 2_000,
+		});
+
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+
+		expect(response.status).toBe(503);
+		expect(await response.json()).toMatchObject({
+			error: { type: "guard_retry_attempts_exhausted" },
+		});
+		expect(attempts).toBe(3);
 	});
 
 	test("retains the active-request queue bound", async () => {
