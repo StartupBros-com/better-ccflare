@@ -14,7 +14,7 @@ interface State {
 	outputIndex: number;
 	sequenceNumber: number;
 	blockIndexToOutput: Map<number, number>;
-	textByBlock: Map<number, { text: string; bytes: number }>;
+	textByBlock: Map<number, { text: string }>;
 	toolByBlock: Map<
 		number,
 		{ callId: string; name: string; argsBuf: string; bytes: number }
@@ -161,7 +161,7 @@ function processEvent(
 		state.blockIndexToOutput.set(blockIndex, outputIdx);
 
 		if (contentBlock.type === "text") {
-			state.textByBlock.set(blockIndex, { text: "", bytes: 0 });
+			state.textByBlock.set(blockIndex, { text: "" });
 			emitSse(
 				controller,
 				"response.output_item.added",
@@ -232,11 +232,9 @@ function processEvent(
 			const text = delta.text as string;
 			const block = state.textByBlock.get(blockIndex);
 			if (block) {
-				const textBytes = encoder.encode(text).length;
-				block.bytes += textBytes;
 				// No per-block cap for text: only the cumulative
 				// translated-output total (checked below) bounds it.
-				state.translatedOutputBytesTotal += textBytes;
+				state.translatedOutputBytesTotal += encoder.encode(text).length;
 				if (
 					state.translatedOutputBytesTotal > TRANSLATED_OUTPUT_TOTAL_BYTE_CAP
 				) {
