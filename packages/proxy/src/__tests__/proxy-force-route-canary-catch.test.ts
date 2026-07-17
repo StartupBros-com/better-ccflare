@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import type { Account } from "@better-ccflare/types";
+import { observeCachePacing } from "../cache-pacing";
 import type { ProxyContext } from "../handlers";
 import { handleProxy } from "../proxy";
 
@@ -147,5 +148,103 @@ describe("handleProxy: force-route fail-closed at the pacing-canary reselect cal
 		expect(parsed.error.type).toBe("force_route_unavailable");
 		expect(parsed.error.account_id).toBe("forced-account");
 		expect(parsed.error.reason).toBe("paused");
+
+		// The canary reselect branch (~line 490) acquires a pacing leader slot
+		// for this session/model key immediately before the second select call
+		// that threw. The 503 catch must release that slot (finishPacing), not
+		// leave the leaders map entry dangling -- otherwise a fresh
+		// observeCachePacing call for the same key would be forced to wait as a
+		// follower instead of immediately becoming a new leader.
+		const followUp = await observeCachePacing({
+			sessionKey: "canary-session-1",
+			model: "claude-fable-4-5",
+		});
+		expect(followUp?.role).toBe("leader");
+	});
+});
+
+describe("handleProxy: force-route fail-closed at the control-cohort first select call site (P2)", () => {
+	beforeEach(() => {
+		// Force the control cohort (not the canary bypass candidate) so the
+		// FIRST selectAccountsForRequest call (~line 368) is the one that
+		// throws, exercising the original (non-canary) catch site rather than
+		// the pacing-canary reselect site covered above.
+		process.env[CODEX_PACING_BYPASS_PERCENT_ENV] = "0";
+	});
+
+	it("returns the typed 503 force_route_unavailable response and releases the pacing leader slot when the forced account does not exist", async () => {
+		let getAllAccountsCalls = 0;
+		const getAllAccounts = mock(async () => {
+			getAllAccountsCalls++;
+			return [];
+		});
+
+		const ctx = {
+			strategy: { select: mock(() => []) },
+			dbOps: {
+				getAllAccounts,
+				getActiveComboForFamily: mock(async () => null),
+				getAgentPreference: mock(async () => null),
+			},
+			runtime: { port: 8080, clientId: "test" },
+			config: {
+				getUsageThrottlingFiveHourEnabled: () => false,
+				getUsageThrottlingWeeklyEnabled: () => false,
+				getSystemPromptCacheTtl1h: () => false,
+				getAgentFrontmatterModelFallback: () => false,
+				getStorePayloads: () => false,
+			},
+			provider: {
+				name: "test-provider",
+				canHandle: () => true,
+				buildUrl: (_path: string, _search: string, account: Account) =>
+					`https://upstream.test/${account.id}`,
+				prepareHeaders: (headers: Headers) => new Headers(headers),
+				processResponse: async (response: Response) => response,
+				parseRateLimit: () => ({
+					isRateLimited: false,
+					resetTime: null,
+				}),
+			},
+			refreshInFlight: new Map(),
+			asyncWriter: { enqueue: mock(() => undefined) },
+		} as unknown as ProxyContext;
+
+		const request = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"x-better-ccflare-account-id": "missing-account",
+			},
+			body: JSON.stringify({
+				model: "claude-fable-4-5",
+				messages: [{ role: "user", content: "hello" }],
+				metadata: { user_id: "control-session-1" },
+				max_tokens: 16,
+			}),
+		});
+
+		const response = await handleProxy(request, new URL(request.url), ctx);
+
+		expect(getAllAccountsCalls).toBe(1);
+		expect(response.status).toBe(503);
+		expect(response.headers.get("x-better-ccflare-force-route")).toBe(
+			"unavailable",
+		);
+		const parsed = (await response.json()) as {
+			error: { type: string; account_id: string; reason: string };
+		};
+		expect(parsed.error.type).toBe("force_route_unavailable");
+		expect(parsed.error.account_id).toBe("missing-account");
+		expect(parsed.error.reason).toBe("not_found");
+
+		// The control cohort acquires its pacing leader slot (~line 350) before
+		// the first select call that threw. The 503 catch must release that
+		// slot too, matching the canary reselect site above.
+		const followUp = await observeCachePacing({
+			sessionKey: "control-session-1",
+			model: "claude-fable-4-5",
+		});
+		expect(followUp?.role).toBe("leader");
 	});
 });

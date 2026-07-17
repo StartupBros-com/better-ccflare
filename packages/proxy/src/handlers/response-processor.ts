@@ -371,10 +371,18 @@ export async function processProxyResponse(
 			// carries the provider-supplied classification through):
 			//   1. A direct resetTime from the response itself (Retry-After /
 			//      unified headers), handled above via rateLimitInfo.resetTime.
-			//   2. A fresh, future cached xAI credits.resets_at from usageCache
-			//      (missing/invalid/stale/past entries are ignored).
+			//   2. For a direct 402 (or a provider-classified xai_capacity_402)
+			//      only, a fresh, future cached xAI credits.resets_at from
+			//      usageCache (missing/invalid/stale/past entries are ignored).
+			//      Scoped to 402 because a transient 429 has no billing-window
+			//      semantics: inheriting the cached reset could bench an
+			//      otherwise-healthy account for hours on a short-lived blip.
 			//   3. The bounded no-reset probe cooldown (exponential backoff).
-			const cachedResetTime = resolveXaiCachedResetTime(account.id);
+			const isDirect402 =
+				response.status === 402 || rateLimitInfo.reason === "xai_capacity_402";
+			const cachedResetTime = isDirect402
+				? resolveXaiCachedResetTime(account.id)
+				: null;
 			await applyRateLimitCooldownAwaitingPersist(
 				account,
 				{

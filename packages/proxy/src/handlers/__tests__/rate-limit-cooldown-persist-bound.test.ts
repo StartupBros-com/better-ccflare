@@ -111,3 +111,127 @@ describe("applyRateLimitCooldownAwaitingPersist: bounded persist (P0)", () => {
 		expect(account.consecutive_rate_limits).toBe(4);
 	});
 });
+
+// Covers the pro-gate follow-up: under a stuck SQLite lock, each timed-out
+// awaited persist leaves its withBusyRetry loop running in the background.
+// Without coalescing, repeated requests for the same account would spawn
+// additional parallel write/retry loops piling up against the same lock.
+// These tests use account ids distinct from "acc-1" (the default id used by
+// the never-resolving stub above) so a permanently in-flight write left
+// behind by that test cannot leak into these.
+describe("applyRateLimitCooldownAwaitingPersist: per-account single-flight coalescing", () => {
+	it("coalesces two concurrent calls for the same account into a single markAccountRateLimited invocation", async () => {
+		Date.now = () => NOW;
+		const account = makeAccount({
+			id: "acc-coalesce-1",
+			consecutive_rate_limits: 3,
+		});
+		let callCount = 0;
+		let resolveWrite: ((value: number) => void) | undefined;
+		const ctx = {
+			dbOps: {
+				markAccountRateLimited: () => {
+					callCount++;
+					return new Promise<number>((resolve) => {
+						resolveWrite = resolve;
+					});
+				},
+			},
+		} as unknown as ProxyContext;
+
+		const p1 = applyRateLimitCooldownAwaitingPersist(
+			account,
+			{ reason: "xai_capacity_402" },
+			ctx,
+		);
+		const p2 = applyRateLimitCooldownAwaitingPersist(
+			account,
+			{ reason: "xai_capacity_402" },
+			ctx,
+		);
+
+		// Give both calls a chance to reach the write before either resolves.
+		await Promise.resolve();
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(callCount).toBe(1);
+
+		resolveWrite?.(7);
+		await Promise.all([p1, p2]);
+		expect(callCount).toBe(1);
+	});
+
+	it("invokes markAccountRateLimited again for the same account once the prior write has settled", async () => {
+		Date.now = () => NOW;
+		const account = makeAccount({
+			id: "acc-coalesce-2",
+			consecutive_rate_limits: 3,
+		});
+		let callCount = 0;
+		const ctx = {
+			dbOps: {
+				markAccountRateLimited: async () => {
+					callCount++;
+					return 10;
+				},
+			},
+		} as unknown as ProxyContext;
+
+		await applyRateLimitCooldownAwaitingPersist(
+			account,
+			{ reason: "xai_capacity_402" },
+			ctx,
+		);
+		expect(callCount).toBe(1);
+
+		await applyRateLimitCooldownAwaitingPersist(
+			account,
+			{ reason: "xai_capacity_402" },
+			ctx,
+		);
+		expect(callCount).toBe(2);
+	});
+
+	it("does not coalesce concurrent calls for different accounts", async () => {
+		Date.now = () => NOW;
+		const accountA = makeAccount({
+			id: "acc-coalesce-3a",
+			consecutive_rate_limits: 3,
+		});
+		const accountB = makeAccount({
+			id: "acc-coalesce-3b",
+			consecutive_rate_limits: 3,
+		});
+		let callCount = 0;
+		const resolvers: Array<(value: number) => void> = [];
+		const ctx = {
+			dbOps: {
+				markAccountRateLimited: () => {
+					callCount++;
+					return new Promise<number>((resolve) => {
+						resolvers.push(resolve);
+					});
+				},
+			},
+		} as unknown as ProxyContext;
+
+		const p1 = applyRateLimitCooldownAwaitingPersist(
+			accountA,
+			{ reason: "xai_capacity_402" },
+			ctx,
+		);
+		const p2 = applyRateLimitCooldownAwaitingPersist(
+			accountB,
+			{ reason: "xai_capacity_402" },
+			ctx,
+		);
+
+		await Promise.resolve();
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(callCount).toBe(2);
+
+		for (const resolve of resolvers) resolve(1);
+		await Promise.all([p1, p2]);
+	});
+});

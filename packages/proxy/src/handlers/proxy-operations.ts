@@ -908,9 +908,17 @@ export async function boundResponseBodyForClassification(
 		// stream doesn't stay half-read.
 		if (exceededCap) {
 			try {
-				await reader.cancel();
+				// Fire without awaiting settlement, mirroring discardUpstreamBody
+				// above: per the Streams spec, cancelling one branch of a tee()'d
+				// body never settles until every sibling branch is cancelled or
+				// fully read, so awaiting here could hang this helper indefinitely
+				// under any current-or-future Bun tee semantics for this reader.
+				reader.cancel().catch(() => {
+					// Already cancelled/errored -- nothing left to release.
+				});
 			} catch {
-				// Already cancelled/errored -- nothing left to release.
+				// Reader may already be released/disturbed; ignore synchronous
+				// throws too.
 			}
 		}
 		reader.releaseLock();

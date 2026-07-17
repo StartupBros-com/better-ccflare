@@ -203,6 +203,57 @@ export function applyRateLimitCooldown(
 }
 
 /**
+ * Per-account single-flight coalescing for the durable markAccountRateLimited
+ * write used by applyRateLimitCooldownAwaitingPersist. Under a stuck SQLite
+ * lock, withBusyRetry can legitimately block a write for minutes (see the doc
+ * comment on applyRateLimitCooldownAwaitingPersist below); once that write
+ * times out from the awaiting caller's perspective, its withBusyRetry loop
+ * keeps running in the background. Without coalescing, each additional
+ * request for the SAME account (e.g. rapid retries against a still
+ * rate-limited account) would spawn its own parallel write/retry loop, piling
+ * up concurrent SQLite writers against the same lock. Reusing the in-flight
+ * promise instead avoids the pile-up. This is safe regardless of which
+ * caller's cooldownUntil/reason "wins" the write: the monotonic SQL clamp on
+ * markAccountRateLimited (see database-operations.ts) means a later deadline
+ * always wins on the next call, coalesced or not. This intentionally adds no
+ * process-local selection breaker: selection still always reads fresh account
+ * state from the DB.
+ */
+const inFlightRateLimitWrites = new Map<string, Promise<number>>();
+
+function getOrStartMarkAccountRateLimited(
+	ctx: ProxyContext,
+	account: Account,
+	cooldownUntil: number,
+	reason: RateLimitReason,
+): Promise<number> {
+	const existing = inFlightRateLimitWrites.get(account.id);
+	if (existing) return existing;
+
+	const writePromise = ctx.dbOps.markAccountRateLimited(
+		account.id,
+		cooldownUntil,
+		reason,
+	);
+	inFlightRateLimitWrites.set(account.id, writePromise);
+	// Cleanup runs on a derived chain that can never itself reject (.catch
+	// swallows first), so this bookkeeping can never surface as an unhandled
+	// rejection. The original writePromise -- which may still reject -- is
+	// still returned to the caller below; attaching multiple independent
+	// .then/.catch/.finally subscribers to the same promise is standard, safe
+	// JS behavior.
+	writePromise
+		.catch(() => {})
+		.finally(() => {
+			if (inFlightRateLimitWrites.get(account.id) === writePromise) {
+				inFlightRateLimitWrites.delete(account.id);
+			}
+		});
+
+	return writePromise;
+}
+
+/**
  * Durable-write variant of applyRateLimitCooldown: identical in-memory cooldown
  * math and audit-reason derivation, but AWAITS the DB-side single-row UPDATE
  * directly instead of enqueueing it on the (fire-and-forget) async writer queue.
@@ -253,7 +304,7 @@ export async function applyRateLimitCooldownAwaitingPersist(
 	let persistedCount: number | null = null;
 	try {
 		persistedCount = await raceWithTimeout(
-			ctx.dbOps.markAccountRateLimited(account.id, cooldownUntil, reason),
+			getOrStartMarkAccountRateLimited(ctx, account, cooldownUntil, reason),
 			getRateLimitPersistAwaitTimeoutMs(),
 		);
 	} catch (err) {

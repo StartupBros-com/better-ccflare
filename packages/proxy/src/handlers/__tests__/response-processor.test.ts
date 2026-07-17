@@ -823,6 +823,38 @@ describe("processProxyResponse - native xAI capacity classification (R5-R10)", (
 		expect(calls.markRateLimited[0]?.reason).toBe("upstream_429_with_reset");
 	});
 
+	it("native xAI 429 with no direct resetTime does not inherit a cached xAI credits reset (R8 scope)", async () => {
+		// R8 scopes cache enrichment to direct 402 cooldowns only. A transient
+		// 429 with no direct resetTime and no provider-supplied reason must fall
+		// through to the bounded no-reset probe cooldown, not inherit a cached
+		// billing-window reset that could bench a healthy account for hours.
+		const account = makeXaiAccount({ id: "xai-1" });
+		const futureResetIso = new Date(Date.now() + 45 * 60_000).toISOString();
+		usageCache.set("xai-1", {
+			credits: { utilization: 100, resets_at: futureResetIso },
+		});
+		const before = Date.now();
+		const { ctx, calls } = makeXaiCtx({
+			rateLimitInfo: { isRateLimited: true },
+		});
+		const response = new Response('{"error":"rate limited"}', {
+			status: 429,
+			headers: { "content-type": "application/json" },
+		});
+
+		const result = await processProxyResponse(response, account, ctx);
+
+		expect(result).toBe(true);
+		expect(calls.markRateLimited).toHaveLength(1);
+		expect(calls.markRateLimited[0]?.reason).toBe(
+			"upstream_429_no_reset_probe_cooldown",
+		);
+		const THIRTY_SECONDS = 30 * 1000;
+		const reset = calls.markRateLimited[0]?.resetTime ?? 0;
+		expect(reset).toBeGreaterThanOrEqual(before + THIRTY_SECONDS - 1000);
+		expect(reset).toBeLessThanOrEqual(Date.now() + THIRTY_SECONDS + 1000);
+	});
+
 	it("native xAI 400 does not classify as rate-limited", async () => {
 		const account = makeXaiAccount({ id: "xai-1" });
 		const { ctx, calls } = makeXaiCtx({

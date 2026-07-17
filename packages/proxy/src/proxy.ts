@@ -385,22 +385,25 @@ export async function handleProxy(
 					failClosedReason: error.reason,
 				})}`,
 			);
-			return new Response(
-				JSON.stringify({
-					error: {
-						type: "force_route_unavailable",
-						message: error.message,
-						account_id: error.accountId,
-						reason: error.reason,
+			return finishPacing(
+				pacingObservation?.slot ?? null,
+				new Response(
+					JSON.stringify({
+						error: {
+							type: "force_route_unavailable",
+							message: error.message,
+							account_id: error.accountId,
+							reason: error.reason,
+						},
+					}),
+					{
+						status: 503,
+						headers: {
+							"content-type": "application/json",
+							"x-better-ccflare-force-route": "unavailable",
+						},
 					},
-				}),
-				{
-					status: 503,
-					headers: {
-						"content-type": "application/json",
-						"x-better-ccflare-force-route": "unavailable",
-					},
-				},
+				),
 			);
 		}
 		throw error;
@@ -513,22 +516,25 @@ export async function handleProxy(
 						failClosedReason: error.reason,
 					})}`,
 				);
-				return new Response(
-					JSON.stringify({
-						error: {
-							type: "force_route_unavailable",
-							message: error.message,
-							account_id: error.accountId,
-							reason: error.reason,
+				return finishPacing(
+					pacingObservation?.slot ?? null,
+					new Response(
+						JSON.stringify({
+							error: {
+								type: "force_route_unavailable",
+								message: error.message,
+								account_id: error.accountId,
+								reason: error.reason,
+							},
+						}),
+						{
+							status: 503,
+							headers: {
+								"content-type": "application/json",
+								"x-better-ccflare-force-route": "unavailable",
+							},
 						},
-					}),
-					{
-						status: 503,
-						headers: {
-							"content-type": "application/json",
-							"x-better-ccflare-force-route": "unavailable",
-						},
-					},
+					),
 				);
 			}
 			throw error;
