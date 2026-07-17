@@ -181,6 +181,21 @@ export class CacheAffinityOrderer {
 			mapping.assignedAt = now;
 			return accounts;
 		}
+
+		if (
+			meta.affinityUpgradeSuppressedCandidateId !== null &&
+			meta.affinityUpgradeSuppressedCandidateId !== undefined &&
+			owner.routing.candidateId === meta.affinityUpgradeSuppressedCandidateId
+		) {
+			// R13 anti-thrash: SessionAffinityStrategy already declined to
+			// promote this same candidate this request because it flapped
+			// inside the anti-thrash window. Honor that suppression instead of
+			// re-promoting it ahead of the already-committed first candidate;
+			// the mapping itself is left untouched so promotion resumes on its
+			// own once the window elapses and the annotation stops appearing.
+			mapping.assignedAt = now;
+			return accounts;
+		}
 		mapping.assignedAt = now;
 
 		const ownerIndex = eligible.indexOf(owner);

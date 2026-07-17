@@ -319,7 +319,11 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 						this.log.info(
 							`Route ${affinityKey} upgrade to ${best.routing.candidateId} suppressed (anti-thrash until ${new Date(mapping.suppressUpgradesUntil as number).toISOString()}), keeping ${mapped.routing.candidateId}`,
 						);
-						return commitStrategyCandidateOrder([mapped, ...others], meta);
+						return commitStrategyCandidateOrder(
+							[mapped, ...others],
+							meta,
+							best.routing.candidateId,
+						);
 					}
 
 					// A routable better tier (or comparable higher-pressure class inside
@@ -356,14 +360,30 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 
 					// Anti-thrash fast-fail detection (R13): only genuine account-level
 					// unavailability counts as a "failure": the mapped owner is still
-					// present in `candidates` (survived request-scoped hard exclusion)
-					// but absent from `available` (rate-limited/paused). A hard exclusion
-					// or a deleted account is not a flapping upstream and must not arm
+					// structurally eligible (survived request-scoped hard exclusion) but
+					// absent from `available` (rate-limited/paused). A hard exclusion or
+					// a deleted account is not a flapping upstream and must not arm
 					// suppression.
-					const stillConfigured = candidates.some(
-						(candidate) =>
-							candidate.routing.candidateId === mapping.candidateId,
-					);
+					//
+					// Structural eligibility must be read from
+					// `routingCandidateCatalog` (every configured candidate, independent
+					// of transient availability) rather than `candidates`: combo routing
+					// pre-filters paused/rate-limited slots out of `candidates` in
+					// account-selector.ts before the strategy ever runs, so a combo
+					// owner that just failed would otherwise look structurally removed
+					// and never arm suppression. `candidates` remains the fallback for
+					// callers that never populate a catalog.
+					const catalog = meta.routingCandidateCatalog;
+					const stillConfigured = catalog
+						? catalog.some(
+								(candidate) =>
+									candidate.candidateId === mapping.candidateId &&
+									!meta.hardExcludedAccountIds?.has(candidate.accountId),
+							)
+						: candidates.some(
+								(candidate) =>
+									candidate.routing.candidateId === mapping.candidateId,
+							);
 					const upgradedAt = mapping.upgradedAt;
 					const recentlyUpgraded =
 						upgradedAt !== null && now - upgradedAt < this.antiThrashWindowMs;

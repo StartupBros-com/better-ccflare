@@ -452,9 +452,7 @@ describe("SessionAffinityStrategy", () => {
 
 			expect((await strategy.select([low], laneMeta))[0].id).toBe("low");
 			// The very first upgrade to a routable better tier is never suppressed.
-			expect((await strategy.select([low, high], laneMeta))[0].id).toBe(
-				"high",
-			);
+			expect((await strategy.select([low, high], laneMeta))[0].id).toBe("high");
 		});
 
 		it("does not remap a flapping better-tier owner a second time inside the anti-thrash window, and resumes upgrades once it elapses", async () => {
@@ -477,9 +475,7 @@ describe("SessionAffinityStrategy", () => {
 			expect((await flappy.select([low], laneMeta))[0].id).toBe("low");
 
 			// The better tier becomes routable: deterministic first upgrade, immediate.
-			expect((await flappy.select([low, high], laneMeta))[0].id).toBe(
-				"high",
-			);
+			expect((await flappy.select([low, high], laneMeta))[0].id).toBe("high");
 
 			// The newly-upgraded owner fails inside the window: falls back to low
 			// and arms suppression for the remainder of the window.
@@ -504,9 +500,7 @@ describe("SessionAffinityStrategy", () => {
 			}
 
 			// Upgrade resumes once the window has passed.
-			expect((await flappy.select([low, high], laneMeta))[0].id).toBe(
-				"high",
-			);
+			expect((await flappy.select([low, high], laneMeta))[0].id).toBe("high");
 		});
 
 		it("scopes suppression per-session, not globally", async () => {
@@ -540,9 +534,9 @@ describe("SessionAffinityStrategy", () => {
 				priority: 0,
 				rate_limited_until: Date.now() + 60_000,
 			});
-			expect(
-				(await flappy.select([low, highDown], flappingMeta))[0].id,
-			).toBe("low");
+			expect((await flappy.select([low, highDown], flappingMeta))[0].id).toBe(
+				"low",
+			);
 			expect((await flappy.select([low, high], flappingMeta))[0].id).toBe(
 				"low",
 			);
@@ -551,9 +545,7 @@ describe("SessionAffinityStrategy", () => {
 			// to the very same physical "high" account: suppression never leaked
 			// across sessions.
 			expect((await flappy.select([low], otherMeta))[0].id).toBe("low");
-			expect((await flappy.select([low, high], otherMeta))[0].id).toBe(
-				"high",
-			);
+			expect((await flappy.select([low, high], otherMeta))[0].id).toBe("high");
 		});
 
 		it("does not treat a request-scoped hard exclusion of the upgraded owner as anti-thrash flapping", async () => {
@@ -573,9 +565,7 @@ describe("SessionAffinityStrategy", () => {
 			} as RequestMeta;
 
 			expect((await flappy.select([low], laneMeta))[0].id).toBe("low");
-			expect((await flappy.select([low, high], laneMeta))[0].id).toBe(
-				"high",
-			);
+			expect((await flappy.select([low, high], laneMeta))[0].id).toBe("high");
 
 			// high is excluded for one request (e.g. model mismatch), not failing.
 			expect(
@@ -589,9 +579,7 @@ describe("SessionAffinityStrategy", () => {
 
 			// Since that wasn't a genuine failure, no suppression should have been
 			// armed: high is immediately usable again next request.
-			expect((await flappy.select([low, high], laneMeta))[0].id).toBe(
-				"high",
-			);
+			expect((await flappy.select([low, high], laneMeta))[0].id).toBe("high");
 		});
 
 		it("arms suppression for a combo route whose owner fast-fails, even though combo pre-filtering removes it from `accounts` before select() runs", async () => {
@@ -655,12 +643,8 @@ describe("SessionAffinityStrategy", () => {
 
 			// high recovers a second time, still well inside the anti-thrash
 			// window: must NOT remap the session a second time.
-			expect((await flappy.select([low, high], comboMeta()))[0].id).toBe(
-				"low",
-			);
-			expect((await flappy.select([low, high], comboMeta()))[0].id).toBe(
-				"low",
-			);
+			expect((await flappy.select([low, high], comboMeta()))[0].id).toBe("low");
+			expect((await flappy.select([low, high], comboMeta()))[0].id).toBe("low");
 
 			// Let the anti-thrash window elapse.
 			const start = Date.now();

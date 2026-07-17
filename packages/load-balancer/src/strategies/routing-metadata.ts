@@ -96,13 +96,26 @@ export function filterHardExcludedCandidates(
 	return candidates.filter((candidate) => !excluded.has(candidate.account.id));
 }
 
-/** Commit one atomic candidate ordering back to the strategy's public API. */
+/**
+ * Commit one atomic candidate ordering back to the strategy's public API.
+ *
+ * `suppressedAffinityUpgradeCandidateId` annotates meta (R13 anti-thrash) when
+ * this commit deliberately declined to promote an otherwise-routable
+ * better-tier candidate because it recently flapped inside the anti-thrash
+ * window. Downstream post-selection orderers (e.g. CacheAffinityOrderer) read
+ * this to avoid re-promoting the same candidate and undoing the suppression.
+ * It is reset to null on every commit that isn't actively suppressing, so the
+ * annotation never survives past the request/commit that produced it.
+ */
 export function commitStrategyCandidateOrder(
 	candidates: StrategyCandidate[],
 	meta?: RequestMeta,
+	suppressedAffinityUpgradeCandidateId: string | null = null,
 ): Account[] {
 	if (meta) {
 		meta.routingCandidates = candidates.map((candidate) => candidate.routing);
+		meta.affinityUpgradeSuppressedCandidateId =
+			suppressedAffinityUpgradeCandidateId;
 	}
 	return candidates.map((candidate) => candidate.account);
 }

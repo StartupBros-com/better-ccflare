@@ -294,6 +294,47 @@ describe("CacheAffinityOrderer", () => {
 		]);
 	});
 
+	it("honors an active anti-thrash suppression instead of re-promoting the flapping owner over the committed fallback", () => {
+		const orderer = new CacheAffinityOrderer(60_000);
+		const fallback = account("xai-a");
+		const flapping = account("xai-b");
+		fallback.priority = 1;
+		flapping.priority = 0;
+		const catalog = [
+			candidate("account:xai-a", fallback.id, 1, 0),
+			candidate("account:xai-b", flapping.id, 0, 1),
+		];
+
+		// Establish ownership on the better-tier account, as an earlier
+		// successful upgrade would have done.
+		expect(
+			orderer.order(
+				[flapping, fallback],
+				candidateMeta("conversation", catalog),
+			)[0]?.id,
+		).toBe("xai-b");
+
+		// SessionAffinityStrategy has committed a fallback-first order this
+		// request because R13 anti-thrash is actively suppressing an upgrade
+		// back to "xai-b" (it flapped inside the anti-thrash window). The
+		// orderer must not undo that by promoting the suppressed candidate.
+		const suppressedMeta = candidateMeta("conversation", catalog);
+		suppressedMeta.affinityUpgradeSuppressedCandidateId = "account:xai-b";
+		expect(
+			orderer
+				.order([fallback, flapping], suppressedMeta)
+				.map((entry) => entry.id),
+		).toEqual(["xai-a", "xai-b"]);
+
+		// Once the window elapses, SessionAffinityStrategy stops annotating the
+		// suppression and promotion resumes as normal.
+		expect(
+			orderer
+				.order([fallback, flapping], candidateMeta("conversation", catalog))
+				.map((entry) => entry.id),
+		).toEqual(["xai-b", "xai-a"]);
+	});
+
 	it("does nothing outside an active xAI cache-native route", () => {
 		const orderer = new CacheAffinityOrderer(60_000);
 		const a = account("xai-a");
