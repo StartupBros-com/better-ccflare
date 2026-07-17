@@ -713,6 +713,17 @@ export async function handleProxy(
 	let response: Response | null = null;
 	let upstreamAttempts = 0;
 	const routingAttemptLedger = new RoutingAttemptLedger();
+	const deliverRetainedTerminalResponse =
+		async (): Promise<Response | null> => {
+			const retainedTerminalResponse =
+				routingAttemptLedger.takeTerminalResponse();
+			if (!retainedTerminalResponse) return null;
+			const terminalFailoverAttempts = Math.max(
+				0,
+				routingAttemptLedger.attemptedCount - 1,
+			);
+			return retainedTerminalResponse.deliver(terminalFailoverAttempts);
+		};
 	const reactiveDepletionSkips: Account[] = [];
 	const betaSignature = req.headers.get("anthropic-beta");
 
@@ -864,6 +875,15 @@ export async function handleProxy(
 			reactivelyDepletedAccounts: reactivelyDepletedFallbackAccounts,
 		} = applyUsageThrottling(selectedFallbackAccounts);
 		fallbackAccounts = filteredFallbackAccounts;
+		if (fallbackAccounts.length === 0) {
+			// The combo already reached a concrete upstream terminal and fallback
+			// selection found no new unique route to attempt. Surface that upstream
+			// response before synthesizing model-depleted or usage-throttled output.
+			const retainedTerminalResponse = await deliverRetainedTerminalResponse();
+			if (retainedTerminalResponse) {
+				return finishPacing(pacingSlot, retainedTerminalResponse);
+			}
+		}
 
 		if (fallbackAccounts.length > 0) {
 			log.info(
@@ -961,16 +981,9 @@ export async function handleProxy(
 		}
 	}
 
-	const retainedTerminalResponse = routingAttemptLedger.takeTerminalResponse();
+	const retainedTerminalResponse = await deliverRetainedTerminalResponse();
 	if (retainedTerminalResponse) {
-		const terminalFailoverAttempts = Math.max(
-			0,
-			routingAttemptLedger.attemptedCount - 1,
-		);
-		return finishPacing(
-			pacingSlot,
-			await retainedTerminalResponse.deliver(terminalFailoverAttempts),
-		);
+		return finishPacing(pacingSlot, retainedTerminalResponse);
 	}
 
 	// If routing skipped every remaining candidate using direct, short-lived

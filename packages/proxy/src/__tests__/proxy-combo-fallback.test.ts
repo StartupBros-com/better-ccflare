@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
+import { usageCache } from "@better-ccflare/providers";
 import type { Account, ComboWithSlots } from "@better-ccflare/types";
 import type { ProxyContext } from "../handlers";
 import { handleProxy } from "../proxy";
@@ -44,10 +45,13 @@ function makeAccount(id: string): Account {
 
 const originalFetch = globalThis.fetch;
 let restoreUsageCollector = (): void => {};
+const cachedUsageAccountIds = new Set<string>();
 
 afterEach(() => {
 	restoreUsageCollector();
 	restoreUsageCollector = (): void => {};
+	for (const accountId of cachedUsageAccountIds) usageCache.delete(accountId);
+	cachedUsageAccountIds.clear();
 	globalThis.fetch = originalFetch;
 });
 
@@ -771,6 +775,189 @@ describe("post-combo normal fallback", () => {
 				message: "insufficient credits",
 			},
 		});
+		expect(ctx.dbOps.markAccountRateLimited).toHaveBeenCalledTimes(1);
+	});
+
+	it("prefers a retained 529 when fallback accounts become reactively depleted before throttling", async () => {
+		const handleStart = installUsageCollector();
+		const comboAccount = makeAccount("retained-529-reactive-combo");
+		const depletedFallback = makeAccount("reactive-fallback");
+		const combo: ComboWithSlots = {
+			id: "combo-retained-529-reactive",
+			name: "Retained overload before reactive terminal",
+			description: null,
+			enabled: true,
+			created_at: 0,
+			updated_at: 0,
+			slots: [
+				{
+					id: "slot-retained-529-reactive",
+					combo_id: "combo-retained-529-reactive",
+					account_id: comboAccount.id,
+					model: "claude-opus-4-5",
+					priority: 0,
+					enabled: true,
+				},
+			],
+		};
+		const ctx = makeContext(
+			[comboAccount, depletedFallback],
+			combo,
+			(accounts, meta) => {
+				const isComboPass = (
+					meta as {
+						routingCandidates?: readonly { comboSlotId?: string | null }[];
+					}
+				).routingCandidates?.some((candidate) => candidate.comboSlotId != null);
+				if (isComboPass) return accounts;
+
+				// Model a marker arriving after normal selection evaluated hard
+				// capacity but before the outer proxy applies its final throttle pass.
+				usageCache.markModelScopedExhausted(
+					depletedFallback.id,
+					"claude-opus-4-5",
+					null,
+					Date.now() + 60_000,
+				);
+				cachedUsageAccountIds.add(depletedFallback.id);
+				return accounts.filter((account) => account.id === depletedFallback.id);
+			},
+		);
+		ctx.provider.parseRateLimit = (response) => ({
+			isRateLimited: response.status === 529,
+			resetTime: null,
+		});
+
+		let fetchCount = 0;
+		globalThis.fetch = mock(async () => {
+			fetchCount++;
+			return new Response(
+				'{"type":"error","error":{"type":"overloaded_error","message":"retained reactive proof"}}',
+				{
+					status: 529,
+					headers: {
+						"content-type": "application/json",
+						"x-upstream-proof": "retained-reactive-529",
+					},
+				},
+			);
+		}) as unknown as typeof fetch;
+
+		const previousRetrySetting = process.env.CCFLARE_OVERLOAD_RETRY_ENABLED;
+		process.env.CCFLARE_OVERLOAD_RETRY_ENABLED = "false";
+		try {
+			const request = makeProxyRequest("claude-opus-4-5", false);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+
+			expect(fetchCount).toBe(1);
+			expect(response.status).toBe(529);
+			expect(response.headers.get("x-upstream-proof")).toBe(
+				"retained-reactive-529",
+			);
+			expect(await response.json()).toEqual({
+				type: "error",
+				error: {
+					type: "overloaded_error",
+					message: "retained reactive proof",
+				},
+			});
+			expect(handleStart).toHaveBeenCalledTimes(1);
+			expect(
+				(handleStart.mock.calls[0]?.[0] as { failoverAttempts: number })
+					.failoverAttempts,
+			).toBe(0);
+		} finally {
+			if (previousRetrySetting === undefined) {
+				delete process.env.CCFLARE_OVERLOAD_RETRY_ENABLED;
+			} else {
+				process.env.CCFLARE_OVERLOAD_RETRY_ENABLED = previousRetrySetting;
+			}
+		}
+	});
+
+	it("prefers a retained native xAI 402 when every fallback account is predictively throttled", async () => {
+		const handleStart = installUsageCollector();
+		const xaiAccount = makeAccount("retained-xai-predictive-combo");
+		xaiAccount.provider = "xai";
+		xaiAccount.custom_endpoint = null;
+		xaiAccount.model_mappings = null;
+		const throttledFallback = makeAccount("predictive-fallback");
+		const combo: ComboWithSlots = {
+			id: "combo-retained-xai-predictive",
+			name: "Retained xAI before predictive terminal",
+			description: null,
+			enabled: true,
+			created_at: 0,
+			updated_at: 0,
+			slots: [
+				{
+					id: "slot-retained-xai-predictive",
+					combo_id: "combo-retained-xai-predictive",
+					account_id: xaiAccount.id,
+					model: "claude-opus-4-5",
+					priority: 0,
+					enabled: true,
+				},
+			],
+		};
+		const ctx = makeContext(
+			[xaiAccount, throttledFallback],
+			combo,
+			(accounts, meta) =>
+				(
+					meta as {
+						routingCandidates?: readonly { comboSlotId?: string | null }[];
+					}
+				).routingCandidates?.some((candidate) => candidate.comboSlotId != null)
+					? accounts
+					: accounts.filter((account) => account.id === throttledFallback.id),
+		);
+		ctx.config.getUsageThrottlingFiveHourEnabled = () => true;
+		ctx.dbOps.markAccountRateLimited = mock(async () => 1);
+		usageCache.set(throttledFallback.id, {
+			five_hour: {
+				utilization: 80,
+				resets_at: new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(),
+			},
+			seven_day: { utilization: 10, resets_at: null },
+		});
+		cachedUsageAccountIds.add(throttledFallback.id);
+
+		let fetchCount = 0;
+		globalThis.fetch = mock(async () => {
+			fetchCount++;
+			return new Response(
+				'{"error":{"type":"rate_limit_error","message":"retained predictive proof","code":"xai_402"}}',
+				{
+					status: 402,
+					headers: {
+						"content-type": "application/json",
+						"x-upstream-proof": "retained-predictive-xai",
+					},
+				},
+			);
+		}) as unknown as typeof fetch;
+
+		const request = makeProxyRequest("claude-opus-4-5", false);
+		const response = await handleProxy(request, new URL(request.url), ctx);
+
+		expect(fetchCount).toBe(1);
+		expect(response.status).toBe(402);
+		expect(response.headers.get("x-upstream-proof")).toBe(
+			"retained-predictive-xai",
+		);
+		expect(await response.json()).toEqual({
+			type: "error",
+			error: {
+				type: "rate_limit_error",
+				message: "retained predictive proof",
+			},
+		});
+		expect(handleStart).toHaveBeenCalledTimes(1);
+		expect(
+			(handleStart.mock.calls[0]?.[0] as { failoverAttempts: number })
+				.failoverAttempts,
+		).toBe(0);
 		expect(ctx.dbOps.markAccountRateLimited).toHaveBeenCalledTimes(1);
 	});
 });
