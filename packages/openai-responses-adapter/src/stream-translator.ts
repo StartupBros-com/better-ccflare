@@ -1,7 +1,7 @@
 import {
 	BUFFER_SIZES,
 	SseFrameBuffer,
-	SseLimitError,
+	StreamResourceLimitError,
 } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 
@@ -24,16 +24,42 @@ interface State {
 	doneSent: boolean;
 	outputItems: Array<Record<string, unknown>>;
 	streamError: { type: string; message: string } | null;
+	/**
+	 * Monotonic cumulative byte total of translated output (every text delta
+	 * plus every tool-argument delta actually emitted downstream) produced
+	 * for this stream so far. Unlike the per-block byte counts in
+	 * textByBlock/toolByBlock, this total is never decremented when a
+	 * block's buffer is freed after it closes (see the content_block_stop
+	 * handling below): it bounds the whole stream's cumulative translated
+	 * output, not any single block's peak size, so freeing one block's
+	 * buffer must never let the total shrink back below where a later
+	 * block could smuggle additional bytes past the cap.
+	 */
+	translatedOutputBytesTotal: number;
 }
 
 const encoder = new TextEncoder();
 
-// Per-block cap on accumulated bytes, shared by both tool-call arguments and
-// text output. Reuses the same constant as the SSE frame cap instead of
-// introducing a new arbitrary number. An aggregate cap across concurrently
-// open blocks is deliberately out of scope here, unlike the codex
-// provider's stricter aggregate accounting.
-const TOOL_ARGS_BYTE_CAP = BUFFER_SIZES.SSE_FRAME_MAX_BYTES;
+// Per-call cap on accumulated tool-call argument bytes for a single
+// tool_use block. Text output has no per-block cap of its own: a long,
+// legitimately large translated response routinely exceeds this size, so
+// bounding it per block would reject ordinary traffic. See
+// TRANSLATED_OUTPUT_TOTAL_BYTE_CAP below for the cap that does apply to
+// text.
+const TOOL_ARGS_PER_CALL_BYTE_CAP =
+	BUFFER_SIZES.TOOL_ARGUMENTS_PER_CALL_MAX_BYTES;
+
+// Cumulative cap across the whole stream's translated output (every text
+// delta plus every tool-argument delta actually emitted downstream),
+// independent of any per-block accounting. This is the adapter's analogue
+// of the codex provider's aggregate tool-argument cap, but scoped to all
+// translated output rather than tool calls only: unlike the codex
+// provider, which can have several tool calls open concurrently and no
+// long-form text output, this translator's dominant unbounded-growth risk
+// is a single very long text block, so the aggregate cap here is
+// deliberately not tool-call-specific.
+const TRANSLATED_OUTPUT_TOTAL_BYTE_CAP =
+	BUFFER_SIZES.TRANSLATED_OUTPUT_TOTAL_MAX_BYTES;
 
 function emitSse(
 	controller: TransformStreamDefaultController,
@@ -206,12 +232,19 @@ function processEvent(
 			const text = delta.text as string;
 			const block = state.textByBlock.get(blockIndex);
 			if (block) {
-				block.bytes += encoder.encode(text).length;
-				if (block.bytes > TOOL_ARGS_BYTE_CAP) {
-					throw new SseLimitError(
-						`Text output for block index ${blockIndex} totaled ${block.bytes} bytes, exceeding the ${TOOL_ARGS_BYTE_CAP} byte cap`,
-						TOOL_ARGS_BYTE_CAP,
-						block.bytes,
+				const textBytes = encoder.encode(text).length;
+				block.bytes += textBytes;
+				// No per-block cap for text: only the cumulative
+				// translated-output total (checked below) bounds it.
+				state.translatedOutputBytesTotal += textBytes;
+				if (
+					state.translatedOutputBytesTotal > TRANSLATED_OUTPUT_TOTAL_BYTE_CAP
+				) {
+					throw new StreamResourceLimitError(
+						`Translated output total of ${state.translatedOutputBytesTotal} bytes exceeds the ${TRANSLATED_OUTPUT_TOTAL_BYTE_CAP} byte cap`,
+						"translated_output_total",
+						TRANSLATED_OUTPUT_TOTAL_BYTE_CAP,
+						state.translatedOutputBytesTotal,
 					);
 				}
 				block.text += text;
@@ -233,12 +266,29 @@ function processEvent(
 			const partial = (delta.partial_json as string) ?? "";
 			const tool = state.toolByBlock.get(blockIndex);
 			if (tool) {
-				tool.bytes += encoder.encode(partial).length;
-				if (tool.bytes > TOOL_ARGS_BYTE_CAP) {
-					throw new SseLimitError(
-						`Tool call arguments for call_id ${tool.callId} totaled ${tool.bytes} bytes, exceeding the ${TOOL_ARGS_BYTE_CAP} byte cap`,
-						TOOL_ARGS_BYTE_CAP,
+				const partialBytes = encoder.encode(partial).length;
+				tool.bytes += partialBytes;
+				// Per-call cap: guards a single runaway tool call.
+				if (tool.bytes > TOOL_ARGS_PER_CALL_BYTE_CAP) {
+					throw new StreamResourceLimitError(
+						`Tool call arguments for call_id ${tool.callId} totaled ${tool.bytes} bytes, exceeding the ${TOOL_ARGS_PER_CALL_BYTE_CAP} byte cap`,
+						"tool_arguments_per_call",
+						TOOL_ARGS_PER_CALL_BYTE_CAP,
 						tool.bytes,
+					);
+				}
+				// Aggregate cap: guards the whole stream's cumulative
+				// translated output (text and tool arguments together), not
+				// just this one tool call.
+				state.translatedOutputBytesTotal += partialBytes;
+				if (
+					state.translatedOutputBytesTotal > TRANSLATED_OUTPUT_TOTAL_BYTE_CAP
+				) {
+					throw new StreamResourceLimitError(
+						`Translated output total of ${state.translatedOutputBytesTotal} bytes exceeds the ${TRANSLATED_OUTPUT_TOTAL_BYTE_CAP} byte cap`,
+						"translated_output_total",
+						TRANSLATED_OUTPUT_TOTAL_BYTE_CAP,
+						state.translatedOutputBytesTotal,
 					);
 				}
 				tool.argsBuf += partial;
@@ -312,6 +362,11 @@ function processEvent(
 				},
 				state,
 			);
+			// Free this block's buffered text now that it has been captured in
+			// doneItem/outputItems above. translatedOutputBytesTotal is
+			// deliberately left unchanged: it tracks cumulative stream output,
+			// not currently-buffered memory.
+			state.textByBlock.delete(blockIndex);
 		} else if (state.toolByBlock.has(blockIndex)) {
 			const tool = state.toolByBlock.get(blockIndex)!;
 			emitSse(
@@ -346,6 +401,10 @@ function processEvent(
 				},
 				state,
 			);
+			// Free this call's buffered arguments now that they have been
+			// captured in doneItem/outputItems above, mirroring the text-block
+			// case just above.
+			state.toolByBlock.delete(blockIndex);
 		}
 		return;
 	}
@@ -401,9 +460,10 @@ function processEvent(
  * two blank-line delimiters, with the delimiters themselves stripped).
  *
  * Only JSON.parse failures are swallowed here (malformed upstream payload):
- * any SseLimitError raised by processEvent (e.g. a tool-argument cap trip)
- * is intentionally left to propagate to the caller, which routes it through
- * the terminal error/cancellation path instead of being logged and ignored.
+ * any StreamResourceLimitError raised by processEvent (e.g. a tool-argument
+ * or translated-output-total cap trip) is intentionally left to propagate to
+ * the caller, which routes it through the terminal error/cancellation path
+ * instead of being logged and ignored.
  */
 function processSseFrame(
 	rawEvent: string,
@@ -451,8 +511,8 @@ export function translateAnthropicStreamToResponses(
 	// Bounded, CRLF-tolerant frame buffer (see packages/core/src/sse-frame-buffer.ts).
 	// Owns its own TextDecoder internally, so no separate decoder is needed here.
 	const sseFrameBuffer = new SseFrameBuffer({
-		maxFrameBytes: BUFFER_SIZES.SSE_FRAME_MAX_BYTES,
-		maxBufferBytes: BUFFER_SIZES.SSE_BUFFER_MAX_BYTES,
+		maxFrameBytes: BUFFER_SIZES.SSE_TRANSPORT_FRAME_MAX_BYTES,
+		maxBufferBytes: BUFFER_SIZES.SSE_TRANSPORT_TAIL_MAX_BYTES,
 	});
 
 	const state: State = {
@@ -469,11 +529,14 @@ export function translateAnthropicStreamToResponses(
 		doneSent: false,
 		outputItems: [],
 		streamError: null,
+		translatedOutputBytesTotal: 0,
 	};
 
 	/**
-	 * Handle an SseLimitError raised while parsing or processing frames: emit
-	 * a terminal response.failed event, then actively terminate the
+	 * Handle a StreamResourceLimitError (SseLimitError, or a
+	 * tool_arguments_per_call/translated_output_total violation raised
+	 * directly by processEvent) raised while parsing or processing frames:
+	 * emit a terminal response.failed event, then actively terminate the
 	 * TransformStream. Terminating errors the writable side, which causes the
 	 * upstream pipeTo() (feeding anthropicResponse.body into this transform)
 	 * to cancel the source reader rather than leaving it dangling. A failed
@@ -482,7 +545,7 @@ export function translateAnthropicStreamToResponses(
 	 * processEvent, and flush() never runs once the writable side is errored.
 	 */
 	function handleLimitError(
-		error: SseLimitError,
+		error: StreamResourceLimitError,
 		controller: TransformStreamDefaultController,
 	): void {
 		processEvent(
@@ -506,7 +569,7 @@ export function translateAnthropicStreamToResponses(
 						processSseFrame(frame, controller, state);
 					}
 				} catch (err) {
-					if (err instanceof SseLimitError) {
+					if (err instanceof StreamResourceLimitError) {
 						handleLimitError(err, controller);
 						return;
 					}
@@ -523,7 +586,7 @@ export function translateAnthropicStreamToResponses(
 					// Ensure done event is always emitted
 					emitDone(controller, state);
 				} catch (err) {
-					if (err instanceof SseLimitError) {
+					if (err instanceof StreamResourceLimitError) {
 						handleLimitError(err, controller);
 						return;
 					}

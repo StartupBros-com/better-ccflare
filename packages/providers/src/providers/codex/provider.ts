@@ -4,7 +4,7 @@ import {
 	mapModelName,
 	OAuthRefreshTokenError,
 	SseFrameBuffer,
-	SseLimitError,
+	StreamResourceLimitError,
 	ValidationError,
 	validateEndpointUrl,
 } from "@better-ccflare/core";
@@ -210,12 +210,16 @@ const CODEX_ERROR_TYPE_BY_CODE: Record<string, string> = {
 	usage_not_included: "permission_error",
 };
 
-// Buffered tool-call argument bytes are capped by the same constant used for
-// a single SSE frame (packages/core/src/sse-frame-buffer.ts): both the
-// per-call buffer and the aggregate across every concurrently open
-// function-call buffer are checked against this one cap, reusing it rather
-// than introducing a second arbitrary threshold.
-const TOOL_ARGS_BYTE_CAP = BUFFER_SIZES.SSE_FRAME_MAX_BYTES;
+// Buffered tool-call argument bytes are bounded by two independent policies
+// (packages/core/src/constants.ts): a per-call cap on any single function
+// call's accumulated argument buffer, and a separate aggregate cap across
+// every concurrently open function-call buffer, since several calls can each
+// individually stay under the per-call cap but together still grow buffered
+// memory without bound. Each trip is attributed to its own
+// StreamResourceLimitKind so callers can tell the two failure modes apart.
+const TOOL_ARGS_PER_CALL_BYTE_CAP =
+	BUFFER_SIZES.TOOL_ARGUMENTS_PER_CALL_MAX_BYTES;
+const TOOL_ARGS_TOTAL_BYTE_CAP = BUFFER_SIZES.TOOL_ARGUMENTS_TOTAL_MAX_BYTES;
 const byteEncoder = new TextEncoder();
 
 // When enabled, telemetry reports the effective Codex context capacity rather
@@ -374,7 +378,7 @@ interface FunctionCallBuffer {
 	contentBlockIndex: number;
 	name: string;
 	arguments: string[];
-	/** Running byte total of buffered argument deltas, capped by TOOL_ARGS_BYTE_CAP. */
+	/** Running byte total of buffered argument deltas, capped by TOOL_ARGS_PER_CALL_BYTE_CAP. */
 	bytes: number;
 }
 
@@ -409,7 +413,7 @@ interface StreamState {
 	contextWindow: ContextWindow | null;
 	// Track function_call items: output_index → buffered arguments and block index
 	functionCallBlocks: Map<number, FunctionCallBuffer>;
-	/** Aggregate byte total across every entry in functionCallBlocks, capped by TOOL_ARGS_BYTE_CAP. */
+	/** Aggregate byte total across every entry in functionCallBlocks, capped by TOOL_ARGS_TOTAL_BYTE_CAP. */
 	functionCallBytesTotal: number;
 	upstreamError?: {
 		type: string;
@@ -1838,8 +1842,8 @@ export class CodexProvider extends BaseProvider {
 		});
 		const encoder = new TextEncoder();
 		const sseFrameBuffer = new SseFrameBuffer({
-			maxFrameBytes: BUFFER_SIZES.SSE_FRAME_MAX_BYTES,
-			maxBufferBytes: BUFFER_SIZES.SSE_BUFFER_MAX_BYTES,
+			maxFrameBytes: BUFFER_SIZES.SSE_TRANSPORT_FRAME_MAX_BYTES,
+			maxBufferBytes: BUFFER_SIZES.SSE_TRANSPORT_TAIL_MAX_BYTES,
 		});
 
 		const writeSSE = async (event: string, data: unknown) => {
@@ -1926,8 +1930,9 @@ export class CodexProvider extends BaseProvider {
 
 					// Frame boundary detection and cap enforcement live in
 					// SseFrameBuffer (CRLF-tolerant, bounds both a single oversized
-					// frame and an unterminated tail). It may throw SseLimitError,
-					// which is handled by the dedicated branch in the catch below.
+					// frame and an unterminated tail). It may throw a
+					// StreamResourceLimitError (SseLimitError), which is handled by
+					// the dedicated branch in the catch below.
 					const frames = sseFrameBuffer.push(value);
 
 					// Process complete SSE events extracted from this chunk
@@ -1993,7 +1998,7 @@ export class CodexProvider extends BaseProvider {
 				}
 			} catch (error) {
 				if (!cancelled) {
-					if (error instanceof SseLimitError) {
+					if (error instanceof StreamResourceLimitError) {
 						// Cap trips are a distinct, expected failure mode (an
 						// oversized/unterminated SSE frame or tool-call argument
 						// buffer), not a generic stream read failure: route them
@@ -2373,20 +2378,22 @@ export class CodexProvider extends BaseProvider {
 						buffer.bytes += deltaBytes;
 						state.functionCallBytesTotal += deltaBytes;
 						// Per-call cap: guards a single runaway tool call.
-						if (buffer.bytes > TOOL_ARGS_BYTE_CAP) {
-							throw new SseLimitError(
-								`Tool call arguments for output_index ${outputIndex} totaled ${buffer.bytes} bytes, exceeding the ${TOOL_ARGS_BYTE_CAP} byte cap`,
-								TOOL_ARGS_BYTE_CAP,
+						if (buffer.bytes > TOOL_ARGS_PER_CALL_BYTE_CAP) {
+							throw new StreamResourceLimitError(
+								`Tool call arguments for output_index ${outputIndex} totaled ${buffer.bytes} bytes, exceeding the ${TOOL_ARGS_PER_CALL_BYTE_CAP} byte cap`,
+								"tool_arguments_per_call",
+								TOOL_ARGS_PER_CALL_BYTE_CAP,
 								buffer.bytes,
 							);
 						}
 						// Aggregate cap: guards many concurrently open tool calls that
 						// each individually stay under the per-call cap but together
 						// still grow the buffered byte total without bound.
-						if (state.functionCallBytesTotal > TOOL_ARGS_BYTE_CAP) {
-							throw new SseLimitError(
-								`Aggregate tool call arguments totaled ${state.functionCallBytesTotal} bytes, exceeding the ${TOOL_ARGS_BYTE_CAP} byte cap`,
-								TOOL_ARGS_BYTE_CAP,
+						if (state.functionCallBytesTotal > TOOL_ARGS_TOTAL_BYTE_CAP) {
+							throw new StreamResourceLimitError(
+								`Aggregate tool call arguments totaled ${state.functionCallBytesTotal} bytes, exceeding the ${TOOL_ARGS_TOTAL_BYTE_CAP} byte cap`,
+								"tool_arguments_total",
+								TOOL_ARGS_TOTAL_BYTE_CAP,
 								state.functionCallBytesTotal,
 							);
 						}
