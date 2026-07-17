@@ -65,6 +65,10 @@ const RATE_LIMIT_REASONS = new Set<RateLimitReason>([
 	"upstream_529_overloaded_no_reset",
 	"out_of_credits",
 	"extra_usage_exhausted",
+	// Native xAI capacity signal (R5-R10): XaiProvider.parseRateLimit classifies
+	// an upstream 402 (Grok Build credits exhausted) with this typed reason
+	// instead of relabeling it as a generic 429.
+	"xai_capacity_402",
 ]);
 
 function toRateLimitReason(v: string | null): RateLimitReason | null {

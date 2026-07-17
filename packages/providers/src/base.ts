@@ -1,6 +1,38 @@
 import type { Account } from "@better-ccflare/types";
 import type { Provider, RateLimitInfo, TokenRefreshResult } from "./types";
 
+/**
+ * Standard 429 + Retry-After classification, shared by any provider whose
+ * rate-limit signal is a bare HTTP 429 plus an optional Retry-After header
+ * (seconds or HTTP-date). Extracted from BaseProvider.parseRateLimit so it
+ * can be reused by providers whose parseRateLimit override shadows
+ * BaseProvider in the prototype chain (e.g. XaiProvider extends
+ * OpenAICompatibleProvider extends BaseProvider, so a naive
+ * `super.parseRateLimit()` from XaiProvider would hit
+ * OpenAICompatibleProvider's always-false override, not this logic).
+ */
+export function parseStandardRetryAfter429(response: Response): RateLimitInfo {
+	if (response.status !== 429) {
+		return { isRateLimited: false };
+	}
+
+	// Try to extract reset time from headers
+	const retryAfter = response.headers.get("retry-after");
+	let resetTime: number | undefined;
+
+	if (retryAfter) {
+		// Retry-After can be seconds or HTTP date
+		const seconds = Number(retryAfter);
+		if (!Number.isNaN(seconds)) {
+			resetTime = Date.now() + seconds * 1000;
+		} else {
+			resetTime = new Date(retryAfter).getTime();
+		}
+	}
+
+	return { isRateLimited: true, resetTime };
+}
+
 export abstract class BaseProvider implements Provider {
 	abstract name: string;
 
@@ -92,25 +124,7 @@ export abstract class BaseProvider implements Provider {
 		}
 
 		// Fall back to traditional 429 check
-		if (response.status !== 429) {
-			return { isRateLimited: false };
-		}
-
-		// Try to extract reset time from headers
-		const retryAfter = response.headers.get("retry-after");
-		let resetTime: number | undefined;
-
-		if (retryAfter) {
-			// Retry-After can be seconds or HTTP date
-			const seconds = Number(retryAfter);
-			if (!Number.isNaN(seconds)) {
-				resetTime = Date.now() + seconds * 1000;
-			} else {
-				resetTime = new Date(retryAfter).getTime();
-			}
-		}
-
-		return { isRateLimited: true, resetTime };
+		return parseStandardRetryAfter429(response);
 	}
 
 	/**

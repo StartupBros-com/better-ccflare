@@ -122,6 +122,20 @@ export class AccountRepository extends BaseRepository<Account> {
 		);
 	}
 
+	/**
+	 * Atomically records a rate-limit observation. `consecutive_rate_limits`
+	 * always increments (audit trail of every observed 429/402), but
+	 * `rate_limited_until` / `rate_limited_reason` only advance when the new
+	 * `until` is strictly later than whatever is already persisted (a
+	 * portable MAX-style clamp, expressed as CASE so it works identically on
+	 * SQLite and PostgreSQL). This guards against a stale/delayed concurrent
+	 * writer (e.g. a slow retry of an earlier observation) landing after a
+	 * fresher, longer cooldown and shortening it back down. The reason stays
+	 * paired with whichever `until` value wins the clamp, never overwritten
+	 * by a discarded write's reason. `rate_limited_at` always updates to the
+	 * current observation time regardless of clamp outcome, since it is an
+	 * audit timestamp ("last observed"), not a leading-edge value.
+	 */
 	async markAccountRateLimited(
 		accountId: string,
 		until: number,
@@ -130,11 +144,17 @@ export class AccountRepository extends BaseRepository<Account> {
 		await this.run(
 			`UPDATE accounts
            SET consecutive_rate_limits = COALESCE(consecutive_rate_limits, 0) + 1,
-               rate_limited_until      = ?,
-               rate_limited_reason     = ?,
+               rate_limited_until      = CASE
+                   WHEN rate_limited_until IS NULL OR ? > rate_limited_until THEN ?
+                   ELSE rate_limited_until
+               END,
+               rate_limited_reason     = CASE
+                   WHEN rate_limited_until IS NULL OR ? > rate_limited_until THEN ?
+                   ELSE rate_limited_reason
+               END,
                rate_limited_at         = ?
          WHERE id = ?`,
-			[until, reason, Date.now(), accountId],
+			[until, until, until, reason, Date.now(), accountId],
 		);
 		const row = await this.get<{ consecutive_rate_limits: number }>(
 			`SELECT consecutive_rate_limits FROM accounts WHERE id = ?`,

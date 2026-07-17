@@ -260,6 +260,43 @@ describe("routing terminal responses", () => {
 		expect(parsed.error.next_available_at).toBe(new Date(next).toISOString());
 	});
 
+	it("marks a pool exhausted purely by xai_capacity_402 cooldowns as retryable pool exhaustion (R5-R10)", async () => {
+		const now = Date.UTC(2026, 6, 17, 12);
+		const next = now + 3_600_000;
+		const terminal = createRoutingTerminalResponse({
+			source: "selection",
+			accounts: [
+				makeAccount({
+					provider: "xai",
+					rate_limited_until: next,
+					rate_limited_reason: "xai_capacity_402",
+				}),
+			],
+			capacityContext: null,
+			rateLimitOutcomes: [],
+			upstreamAttempts: 0,
+			now,
+		});
+
+		expect(terminal.kind).toBe("pool_exhausted");
+		expect(terminal.response.headers.get("retry-after")).toBe("3600");
+		const parsed = await body(terminal.response);
+		expect(parsed.error.type).toBe("pool_exhausted");
+		expect(parsed.error.code).toBe("pool_exhausted");
+		expect(parsed.error.next_available_at).toBe(new Date(next).toISOString());
+		const accounts = parsed.error.accounts as Array<{
+			name: string;
+			reason: string;
+		}>;
+		expect(accounts).toEqual([
+			{
+				name: "account-1",
+				reason: "rate_limited",
+				available_at: new Date(next).toISOString(),
+			},
+		]);
+	});
+
 	it("accepts complete account-wide snapshot recovery as pool exhaustion", () => {
 		const now = Date.UTC(2026, 6, 17, 12);
 		const terminal = createRoutingTerminalResponse({

@@ -2,7 +2,8 @@ import { getEndpointUrl, validateEndpointUrl } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import type { OpenAIRequest } from "@better-ccflare/openai-formats";
 import type { Account } from "@better-ccflare/types";
-import type { TokenRefreshResult } from "../../types";
+import { parseStandardRetryAfter429 } from "../../base";
+import type { RateLimitInfo, TokenRefreshResult } from "../../types";
 import { OpenAICompatibleProvider } from "../openai/provider";
 import {
 	deriveXaiConversationIdentity,
@@ -119,6 +120,32 @@ export class XaiProvider extends OpenAICompatibleProvider {
 
 	override supportsUsageTracking(): boolean {
 		return true;
+	}
+
+	/**
+	 * Native xAI capacity classification (R5-R7). Unlike the generic
+	 * OpenAICompatibleProvider (which always reports isRateLimited:false so
+	 * pool-wide model-fallback logic is not tripped by ordinary upstream
+	 * errors), xAI's own 402 and 429 responses are meaningful operational
+	 * signals worth attributing to a first-class failover state:
+	 *  - 402 (payment/capacity): xAI's neutral signal for capacity
+	 *    exhaustion, not a billing failure. Tagged with the typed reason
+	 *    `xai_capacity_402` so downstream cooldown/reason plumbing can tell
+	 *    it apart from ordinary upstream 429s.
+	 *  - 429: standard Retry-After based classification, matching
+	 *    BaseProvider's own fallback (reused via parseStandardRetryAfter429
+	 *    since a naive `super.parseRateLimit()` here would hit
+	 *    OpenAICompatibleProvider's always-false override instead).
+	 *  - Every other status (including 400/500): not rate-limited.
+	 */
+	override parseRateLimit(response: Response): RateLimitInfo {
+		if (response.status === 402) {
+			return { isRateLimited: true, reason: "xai_capacity_402" };
+		}
+		if (response.status === 429) {
+			return parseStandardRetryAfter429(response);
+		}
+		return { isRateLimited: false };
 	}
 
 	override beforeConvert(

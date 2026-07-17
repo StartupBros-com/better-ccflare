@@ -1,4 +1,5 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
+import { usageCache } from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
 import type { ProxyContext } from "../proxy-types";
 import {
@@ -516,6 +517,437 @@ describe("processProxyResponse — in-memory cooldown mutation", () => {
 		await processProxyResponse(response, account, ctx);
 
 		// No mutation needed — already null
+		expect(account.rate_limited_until).toBeNull();
+	});
+});
+
+describe("handleRateLimitResponse - provider-supplied reason override", () => {
+	it("prefers rateLimitInfo.reason over the status-derived default", () => {
+		const account = makeAccount();
+		const resetTime = Date.now() + 30 * 60_000;
+		const { ctx, calls } = makeCtxWithReason({
+			isStream: false,
+			rateLimited: true,
+			resetTime,
+		});
+		const rateLimitInfo = {
+			isRateLimited: true,
+			resetTime,
+			statusHeader: "rate_limited",
+			remaining: undefined,
+			reason: "xai_capacity_402" as const,
+		};
+
+		handleRateLimitResponse(account, rateLimitInfo, ctx, 429);
+
+		expect(calls.markRateLimited).toHaveLength(1);
+		expect(calls.markRateLimited[0]?.reason).toBe("xai_capacity_402");
+	});
+
+	it("falls back to the status-derived default when no reason is supplied", () => {
+		const account = makeAccount();
+		const resetTime = Date.now() + 30 * 60_000;
+		const { ctx, calls } = makeCtxWithReason({
+			isStream: false,
+			rateLimited: true,
+			resetTime,
+		});
+		const rateLimitInfo = {
+			isRateLimited: true,
+			resetTime,
+			statusHeader: "rate_limited",
+			remaining: undefined,
+		};
+
+		handleRateLimitResponse(account, rateLimitInfo, ctx, 429);
+
+		expect(calls.markRateLimited).toHaveLength(1);
+		expect(calls.markRateLimited[0]?.reason).toBe("upstream_429_with_reset");
+	});
+});
+
+// Native xAI account fixture - provider must be "xai" for the response
+// processor's xAI-specific direct-evidence cooldown path (R5-R10) to engage.
+function makeXaiAccount(overrides: Partial<Account> = {}): Account {
+	return makeAccount({ provider: "xai", ...overrides });
+}
+
+/**
+ * Spy ProxyContext builder for the native xAI direct-evidence cooldown path.
+ * Unlike makeCtx/makeCtxWithReason, this allows the caller to control the
+ * exact rateLimitInfo (including `reason`) returned by parseRateLimit, and to
+ * delay dbOps.markAccountRateLimited's resolution so tests can assert the
+ * awaited-persist behavior required by R9.
+ */
+function makeXaiCtx(opts: {
+	rateLimitInfo: {
+		isRateLimited: boolean;
+		resetTime?: number;
+		remaining?: number;
+		reason?: "xai_capacity_402";
+	};
+	dbWriteDelay?: Promise<void>;
+}) {
+	const calls = {
+		markRateLimited: [] as Array<{
+			accountId: string;
+			resetTime: number;
+			reason: string;
+		}>,
+		enqueueCount: 0,
+	};
+	let dbWriteCompleted = false;
+
+	const ctx = {
+		provider: {
+			name: "xai",
+			isStreamingResponse: () => false,
+			parseRateLimit: () => opts.rateLimitInfo,
+			parseUsage: undefined,
+			extractUsageInfo: undefined,
+		},
+		dbOps: {
+			markAccountRateLimited: async (
+				accountId: string,
+				resetTime: number,
+				reason: string,
+			) => {
+				if (opts.dbWriteDelay) {
+					await opts.dbWriteDelay;
+				}
+				dbWriteCompleted = true;
+				calls.markRateLimited.push({ accountId, resetTime, reason });
+				return 1;
+			},
+			updateAccountUsage: () => {},
+			updateAccountRateLimitMeta: () => {},
+			getAdapter: () => ({
+				get: async () => ({ rate_limited_until: null }),
+				run: async () => {},
+			}),
+			updateRequestUsage: async () => {},
+		},
+		asyncWriter: {
+			enqueue: (job: () => void | Promise<void>) => {
+				calls.enqueueCount++;
+				void job();
+				return true;
+			},
+		},
+	} as unknown as ProxyContext;
+
+	return { ctx, calls, isDbWriteCompleted: () => dbWriteCompleted };
+}
+
+describe("processProxyResponse - native xAI capacity classification (R5-R10)", () => {
+	afterEach(() => {
+		usageCache.delete("xai-1");
+	});
+
+	it("passes reason='xai_capacity_402' through to the durable cooldown write on a direct 402", async () => {
+		const account = makeXaiAccount({ id: "xai-1" });
+		const { ctx, calls } = makeXaiCtx({
+			rateLimitInfo: { isRateLimited: true, reason: "xai_capacity_402" },
+		});
+		const response = new Response('{"error":"insufficient credits"}', {
+			status: 402,
+			headers: { "content-type": "application/json" },
+		});
+
+		const result = await processProxyResponse(response, account, ctx);
+
+		expect(result).toBe(true);
+		expect(calls.markRateLimited).toHaveLength(1);
+		expect(calls.markRateLimited[0]?.reason).toBe("xai_capacity_402");
+	});
+
+	it("awaits the durable cooldown write before resolving (R9)", async () => {
+		// Ordering-based assertion rather than tick-counting: a fire-and-forget
+		// write (the old behavior) resolves processProxyResponse's promise
+		// before the DB write's own "complete" event has been recorded, since
+		// nothing forces the write to finish first. The awaited-persist path
+		// must record "db-write-complete" strictly before
+		// "process-response-resolved".
+		const events: string[] = [];
+		const account = makeXaiAccount({ id: "xai-1" });
+		let resolveDbWrite: (() => void) | undefined;
+		const dbWriteDelay = new Promise<void>((resolve) => {
+			resolveDbWrite = resolve;
+		}).then(() => {
+			events.push("db-write-complete");
+		});
+		const { ctx } = makeXaiCtx({
+			rateLimitInfo: { isRateLimited: true, reason: "xai_capacity_402" },
+			dbWriteDelay,
+		});
+		const response = new Response('{"error":"insufficient credits"}', {
+			status: 402,
+			headers: { "content-type": "application/json" },
+		});
+
+		const resultPromise = processProxyResponse(response, account, ctx).then(
+			(result) => {
+				events.push("process-response-resolved");
+				return result;
+			},
+		);
+
+		// Give the write's microtask chain a few ticks to run to completion
+		// if nothing is blocking it, then resolve it, then observe the order.
+		await Promise.resolve();
+		await Promise.resolve();
+		await Promise.resolve();
+		resolveDbWrite?.();
+		const result = await resultPromise;
+
+		expect(result).toBe(true);
+		expect(events).toEqual(["db-write-complete", "process-response-resolved"]);
+	});
+
+	it("uses a fresh future cached xAI credits.resets_at when the 402 carries no direct resetTime", async () => {
+		const account = makeXaiAccount({ id: "xai-1" });
+		const futureResetIso = new Date(Date.now() + 20 * 60_000).toISOString();
+		usageCache.set("xai-1", {
+			credits: { utilization: 100, resets_at: futureResetIso },
+		});
+		const { ctx, calls } = makeXaiCtx({
+			rateLimitInfo: { isRateLimited: true, reason: "xai_capacity_402" },
+		});
+		const response = new Response('{"error":"insufficient credits"}', {
+			status: 402,
+			headers: { "content-type": "application/json" },
+		});
+
+		await processProxyResponse(response, account, ctx);
+
+		expect(calls.markRateLimited).toHaveLength(1);
+		expect(calls.markRateLimited[0]?.reason).toBe("xai_capacity_402");
+		expect(calls.markRateLimited[0]?.resetTime).toBe(
+			new Date(futureResetIso).getTime(),
+		);
+	});
+
+	it("falls back to the bounded no-reset cooldown when the cached xAI reset is in the past", async () => {
+		const account = makeXaiAccount({ id: "xai-1" });
+		const pastResetIso = new Date(Date.now() - 60_000).toISOString();
+		usageCache.set("xai-1", {
+			credits: { utilization: 100, resets_at: pastResetIso },
+		});
+		const before = Date.now();
+		const { ctx, calls } = makeXaiCtx({
+			rateLimitInfo: { isRateLimited: true, reason: "xai_capacity_402" },
+		});
+		const response = new Response('{"error":"insufficient credits"}', {
+			status: 402,
+			headers: { "content-type": "application/json" },
+		});
+
+		await processProxyResponse(response, account, ctx);
+
+		expect(calls.markRateLimited).toHaveLength(1);
+		expect(calls.markRateLimited[0]?.reason).toBe("xai_capacity_402");
+		const THIRTY_SECONDS = 30 * 1000;
+		const reset = calls.markRateLimited[0]?.resetTime ?? 0;
+		expect(reset).toBeGreaterThanOrEqual(before + THIRTY_SECONDS - 1000);
+		expect(reset).toBeLessThanOrEqual(Date.now() + THIRTY_SECONDS + 1000);
+	});
+
+	it("falls back to the bounded no-reset cooldown when there is no cached xAI usage at all", async () => {
+		const account = makeXaiAccount({ id: "xai-1" });
+		const before = Date.now();
+		const { ctx, calls } = makeXaiCtx({
+			rateLimitInfo: { isRateLimited: true, reason: "xai_capacity_402" },
+		});
+		const response = new Response('{"error":"insufficient credits"}', {
+			status: 402,
+			headers: { "content-type": "application/json" },
+		});
+
+		await processProxyResponse(response, account, ctx);
+
+		expect(calls.markRateLimited).toHaveLength(1);
+		expect(calls.markRateLimited[0]?.reason).toBe("xai_capacity_402");
+		const THIRTY_SECONDS = 30 * 1000;
+		const reset = calls.markRateLimited[0]?.resetTime ?? 0;
+		expect(reset).toBeGreaterThanOrEqual(before + THIRTY_SECONDS - 1000);
+		expect(reset).toBeLessThanOrEqual(Date.now() + THIRTY_SECONDS + 1000);
+	});
+
+	it("a direct valid Retry-After resetTime outranks a conflicting cached xAI credits reset", async () => {
+		const account = makeXaiAccount({ id: "xai-1" });
+		const directResetTime = Date.now() + 5 * 60_000;
+		const conflictingCachedResetIso = new Date(
+			Date.now() + 45 * 60_000,
+		).toISOString();
+		usageCache.set("xai-1", {
+			credits: { utilization: 100, resets_at: conflictingCachedResetIso },
+		});
+		const { ctx, calls } = makeXaiCtx({
+			rateLimitInfo: {
+				isRateLimited: true,
+				resetTime: directResetTime,
+				reason: "xai_capacity_402",
+			},
+		});
+		const response = new Response('{"error":"insufficient credits"}', {
+			status: 402,
+			headers: { "content-type": "application/json" },
+		});
+
+		await processProxyResponse(response, account, ctx);
+
+		expect(calls.markRateLimited).toHaveLength(1);
+		expect(calls.markRateLimited[0]?.reason).toBe("xai_capacity_402");
+		// cooldownUntil = Math.min(resetTime, now+backoff) - direct resetTime wins, never
+		// the larger cached value.
+		expect(calls.markRateLimited[0]?.resetTime).toBeLessThanOrEqual(
+			directResetTime,
+		);
+	});
+
+	it("native xAI 429 classifies and is not relabeled as xai_capacity_402", async () => {
+		const account = makeXaiAccount({ id: "xai-1" });
+		const resetTime = Date.now() + 30_000;
+		const { ctx, calls } = makeXaiCtx({
+			rateLimitInfo: { isRateLimited: true, resetTime },
+		});
+		const response = new Response('{"error":"rate limited"}', {
+			status: 429,
+			headers: { "content-type": "application/json" },
+		});
+
+		const result = await processProxyResponse(response, account, ctx);
+
+		expect(result).toBe(true);
+		expect(calls.markRateLimited).toHaveLength(1);
+		expect(calls.markRateLimited[0]?.reason).toBe("upstream_429_with_reset");
+	});
+
+	it("native xAI 429 with no direct resetTime does not inherit a cached xAI credits reset (R8 scope)", async () => {
+		// R8 scopes cache enrichment to direct 402 cooldowns only. A transient
+		// 429 with no direct resetTime and no provider-supplied reason must fall
+		// through to the bounded no-reset probe cooldown, not inherit a cached
+		// billing-window reset that could bench a healthy account for hours.
+		const account = makeXaiAccount({ id: "xai-1" });
+		const futureResetIso = new Date(Date.now() + 45 * 60_000).toISOString();
+		usageCache.set("xai-1", {
+			credits: { utilization: 100, resets_at: futureResetIso },
+		});
+		const before = Date.now();
+		const { ctx, calls } = makeXaiCtx({
+			rateLimitInfo: { isRateLimited: true },
+		});
+		const response = new Response('{"error":"rate limited"}', {
+			status: 429,
+			headers: { "content-type": "application/json" },
+		});
+
+		const result = await processProxyResponse(response, account, ctx);
+
+		expect(result).toBe(true);
+		expect(calls.markRateLimited).toHaveLength(1);
+		expect(calls.markRateLimited[0]?.reason).toBe(
+			"upstream_429_no_reset_probe_cooldown",
+		);
+		const THIRTY_SECONDS = 30 * 1000;
+		const reset = calls.markRateLimited[0]?.resetTime ?? 0;
+		expect(reset).toBeGreaterThanOrEqual(before + THIRTY_SECONDS - 1000);
+		expect(reset).toBeLessThanOrEqual(Date.now() + THIRTY_SECONDS + 1000);
+	});
+
+	it("native xAI 400 does not classify as rate-limited", async () => {
+		const account = makeXaiAccount({ id: "xai-1" });
+		const { ctx, calls } = makeXaiCtx({
+			rateLimitInfo: { isRateLimited: false },
+		});
+		const response = new Response('{"error":"bad request"}', {
+			status: 400,
+			headers: { "content-type": "application/json" },
+		});
+
+		const result = await processProxyResponse(response, account, ctx);
+
+		expect(result).toBe(false);
+		expect(calls.markRateLimited).toHaveLength(0);
+	});
+
+	it("native xAI 500 does not classify as rate-limited", async () => {
+		const account = makeXaiAccount({ id: "xai-1" });
+		const { ctx, calls } = makeXaiCtx({
+			rateLimitInfo: { isRateLimited: false },
+		});
+		const response = new Response('{"error":"internal error"}', {
+			status: 500,
+			headers: { "content-type": "application/json" },
+		});
+
+		const result = await processProxyResponse(response, account, ctx);
+
+		expect(result).toBe(false);
+		expect(calls.markRateLimited).toHaveLength(0);
+	});
+});
+
+describe("processProxyResponse - cooldown clearing gated on response.ok (root-cause fix)", () => {
+	it("does NOT clear rate_limited_until on a non-rate-limited 400 error response", async () => {
+		const account = makeAccount({
+			rate_limited_until: Date.now() + 60_000,
+		});
+		const { ctx } = makeCtx({ isStream: false, rateLimited: false });
+		const response = new Response('{"error":"bad request"}', {
+			status: 400,
+			headers: { "content-type": "application/json" },
+		});
+
+		await processProxyResponse(response, account, ctx);
+
+		expect(account.rate_limited_until).not.toBeNull();
+	});
+
+	it("does NOT clear rate_limited_until on a non-rate-limited 500 error response", async () => {
+		const account = makeAccount({
+			rate_limited_until: Date.now() + 60_000,
+		});
+		const { ctx } = makeCtx({ isStream: false, rateLimited: false });
+		const response = new Response('{"error":"internal error"}', {
+			status: 500,
+			headers: { "content-type": "application/json" },
+		});
+
+		await processProxyResponse(response, account, ctx);
+
+		expect(account.rate_limited_until).not.toBeNull();
+	});
+
+	it("does NOT reset consecutive_rate_limits stability counter on a non-ok error response", async () => {
+		const account = makeAccount({
+			rate_limited_at: Date.now() - 999_999_999, // well past the stability window
+			consecutive_rate_limits: 3,
+		});
+		const { ctx } = makeCtx({ isStream: false, rateLimited: false });
+		const response = new Response('{"error":"bad request"}', {
+			status: 404,
+			headers: { "content-type": "application/json" },
+		});
+
+		await processProxyResponse(response, account, ctx);
+
+		expect(account.consecutive_rate_limits).toBe(3);
+		expect(account.rate_limited_at).not.toBeNull();
+	});
+
+	it("still clears rate_limited_until on a genuine 2xx success (regression)", async () => {
+		const account = makeAccount({
+			rate_limited_until: Date.now() + 60_000,
+		});
+		const { ctx } = makeCtx({ isStream: false, rateLimited: false });
+		const response = new Response('{"id":"msg_1"}', {
+			status: 200,
+			headers: { "content-type": "application/json" },
+		});
+
+		await processProxyResponse(response, account, ctx);
+
 		expect(account.rate_limited_until).toBeNull();
 	});
 });

@@ -84,4 +84,12 @@ describe("getErrorMeta", () => {
 		expect(meta.description).toContain("out_of_credits");
 		expect(meta.suggestion).toContain("credits");
 	});
+
+	test("xai_capacity_402 surfaces native xAI capacity exhaustion with recovery guidance (R5-R10)", () => {
+		const meta = getErrorMeta("xai_capacity_402");
+		expect(meta.title).not.toBe("xai_capacity_402");
+		expect(meta.severity).toBe("error");
+		expect(meta.description.toLowerCase()).toContain("402");
+		expect(meta.suggestion.length).toBeGreaterThan(0);
+	});
 });

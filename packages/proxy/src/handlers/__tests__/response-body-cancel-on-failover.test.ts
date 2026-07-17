@@ -124,16 +124,22 @@ function makeRequest(body: ArrayBuffer, headers: Record<string, string> = {}) {
  * Build an error Response whose body is a ReadableStream we can observe. The
  * returned `state.cancelled` ref flips true if the proxy cancels the body
  * (the fix); it stays false if the body is dropped on the floor (the leak).
+ * `state.pulled` flips true the moment anything actually reads from the
+ * stream (including a discarded provider clone) -- a body that is read
+ * anywhere in its tee graph is not abandoned, even if a *sibling* branch's
+ * later cancel() call never resolves at the tee level (see the native xAI
+ * tests below for why that distinction matters).
  */
 function observableBodyResponse(
 	status: number,
 	json: string,
 	headers: Record<string, string> = {},
-): { response: Response; state: { cancelled: boolean } } {
-	const state = { cancelled: false };
+): { response: Response; state: { cancelled: boolean; pulled: boolean } } {
+	const state = { cancelled: false, pulled: false };
 	const payload = new TextEncoder().encode(json);
 	const body = new ReadableStream<Uint8Array>({
 		pull(controller) {
+			state.pulled = true;
 			controller.enqueue(payload);
 			controller.close();
 		},
@@ -313,6 +319,94 @@ describe("proxyWithAccount — cancels abandoned upstream body on failover", () 
 		expect(call).toBe(2);
 		expect(bodies).toHaveLength(1);
 		expect(bodies[0].cancelled).toBe(true);
+	});
+
+	it("does not abandon the native xAI 402 body on the middle-candidate failover (return null, AE3)", async () => {
+		// Native xAI account: provider "xai" resolves to the real registered
+		// XaiProvider via getProvider() inside proxyWithAccount (importing
+		// proxy-operations.ts transitively registers all built-in providers),
+		// not the ctx.provider "openai-compatible" fixture used by the other
+		// tests in this file.
+		//
+		// This path does not exercise state.cancelled the way the other
+		// tests in this file do, and that is expected, not a regression.
+		// Unlike the no-fallback/auth-failure/model-fallback paths above
+		// (which discard rawResponse directly, before any provider hook
+		// touches it), the native xAI middle-candidate path always runs the
+		// response through provider.processResponse() for classification and
+		// then through updateAccountMetadata() -> extractUsageInfo(), which
+		// unconditionally clones and reads the body (response-processor.ts).
+		// Per the WHATWG ReadableStreamTee cancel algorithm, once ANY
+		// sibling in a tee graph is read to completion (not cancelled), a
+		// cancel() on another sibling can never propagate to the real
+		// underlying source -- it stays permanently pending at the tee
+		// level. That is intentional per this codebase's own
+		// releaseUnconsumedClone doc comment ("fully draining their inner
+		// clone also closes this one ... cancelling an already-closed
+		// stream here is a harmless, immediately-resolved no-op"): once a
+		// body is read anywhere in its tee graph the underlying resource is
+		// released via normal consumption, and a later cancel() elsewhere
+		// in that graph is correctly a no-op, not a leak. So the meaningful
+		// invariant to protect here is that the body actually gets READ
+		// (never silently dropped without being touched at all), which
+		// state.pulled verifies.
+		const { response, state } = observableBodyResponse(
+			402,
+			JSON.stringify({ error: { message: "insufficient credits" } }),
+		);
+		globalThis.fetch = mock(async () => response);
+
+		const bodyBuffer = makeRequestBody();
+		const req = makeRequest(bodyBuffer);
+		const result = await proxyWithAccount(
+			req,
+			new URL("https://proxy.local/v1/messages"),
+			makeAccount({
+				provider: "xai",
+				custom_endpoint: null,
+				model_mappings: null,
+			}),
+			makeRequestMeta(),
+			bodyBuffer,
+			() => undefined,
+			0,
+			makeProxyContext(),
+		);
+
+		expect(result).toBeNull();
+		expect(state.pulled).toBe(true);
+	});
+
+	it("does not abandon the native xAI 429 body on the middle-candidate failover (return null)", async () => {
+		// Same reasoning as the 402 test directly above: the body is
+		// consumed via provider.processResponse() / extractUsageInfo(), not
+		// via an explicit cancel() on `response` itself, so state.pulled
+		// (not state.cancelled) is the correct no-leak signal here.
+		const { response, state } = observableBodyResponse(
+			429,
+			JSON.stringify({ error: { message: "rate limited" } }),
+		);
+		globalThis.fetch = mock(async () => response);
+
+		const bodyBuffer = makeRequestBody();
+		const req = makeRequest(bodyBuffer);
+		const result = await proxyWithAccount(
+			req,
+			new URL("https://proxy.local/v1/messages"),
+			makeAccount({
+				provider: "xai",
+				custom_endpoint: null,
+				model_mappings: null,
+			}),
+			makeRequestMeta(),
+			bodyBuffer,
+			() => undefined,
+			0,
+			makeProxyContext(),
+		);
+
+		expect(result).toBeNull();
+		expect(state.pulled).toBe(true);
 	});
 
 	it("does NOT cancel a pass-through response returned to the client (extra_usage_exhausted)", async () => {
