@@ -61,6 +61,15 @@ export const TIME_CONSTANTS = {
 	// so a stale/oversized hint can't idle an account indefinitely.
 	// Override at runtime via CCFLARE_RATE_LIMIT_MAX_COOLDOWN_MS.
 	RATE_LIMIT_MAX_COOLDOWN_MS: 12 * 60 * 60 * 1000, // 12h
+
+	// Anti-thrash window for session/cache affinity upgrades (matches the
+	// Anthropic prompt-cache lifetime). When a session's mapping is upgraded
+	// to a better priority tier and that new owner fails (rate-limited/paused)
+	// within this window, further upgrades for the session are suppressed for
+	// the remainder of the window instead of re-attempting the flapping owner
+	// on every cooldown cycle. Override at runtime via
+	// CCFLARE_SESSION_AFFINITY_ANTI_THRASH_WINDOW_MS.
+	SESSION_AFFINITY_ANTI_THRASH_WINDOW_MS: 5 * 60 * 1000, // 5min
 } as const;
 
 /**
@@ -99,6 +108,18 @@ export function getRateLimitResetStabilityMs(): number {
 export function getRateLimitMaxCooldownMs(): number {
 	const raw = Number(process.env.CCFLARE_RATE_LIMIT_MAX_COOLDOWN_MS);
 	return raw || TIME_CONSTANTS.RATE_LIMIT_MAX_COOLDOWN_MS;
+}
+
+/**
+ * Read the anti-thrash suppression window (ms) for session/cache affinity
+ * upgrades. Reads CCFLARE_SESSION_AFFINITY_ANTI_THRASH_WINDOW_MS from env.
+ * Uses || (not ??) so 0/NaN env values fall through to the default.
+ */
+export function getSessionAffinityAntiThrashWindowMs(): number {
+	const raw = Number(
+		process.env.CCFLARE_SESSION_AFFINITY_ANTI_THRASH_WINDOW_MS,
+	);
+	return raw || TIME_CONSTANTS.SESSION_AFFINITY_ANTI_THRASH_WINDOW_MS;
 }
 
 /**
