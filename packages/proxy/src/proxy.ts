@@ -491,11 +491,48 @@ export async function handleProxy(
 			sessionKey: requestMeta.clientSessionId,
 			model: effectiveModel,
 		});
-		selectedAccounts = await selectAccountsForRequest(
-			requestMeta,
-			ctx,
-			effectiveModel ?? undefined,
-		);
+		try {
+			selectedAccounts = await selectAccountsForRequest(
+				requestMeta,
+				ctx,
+				effectiveModel ?? undefined,
+			);
+		} catch (error) {
+			if (error instanceof ForceRouteUnavailableError) {
+				log.warn(
+					`Grok cache canary ${formatXaiCacheCanary({
+						requestId: requestMeta.id,
+						accountId: error.accountId,
+						officialEndpoint: true,
+						keyPresent: false,
+						identityFingerprint:
+							requestMeta.xaiCacheIdentityFingerprint ?? undefined,
+						prefixFingerprint:
+							requestMeta.xaiCachePrefixFingerprint ?? undefined,
+						cacheOutcome: "fail_closed",
+						failClosedReason: error.reason,
+					})}`,
+				);
+				return new Response(
+					JSON.stringify({
+						error: {
+							type: "force_route_unavailable",
+							message: error.message,
+							account_id: error.accountId,
+							reason: error.reason,
+						},
+					}),
+					{
+						status: 503,
+						headers: {
+							"content-type": "application/json",
+							"x-better-ccflare-force-route": "unavailable",
+						},
+					},
+				);
+			}
+			throw error;
+		}
 		({
 			available: accounts,
 			predictivelyThrottled: throttledAccounts,

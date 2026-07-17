@@ -32,6 +32,7 @@ import {
 	recordServedAccount,
 	sessionIdForObservation,
 } from "../session-account-observer";
+import { combineChunks } from "../stream-tee";
 import { isModelRewrite } from "../worker-messages";
 import { ERROR_MESSAGES, type ProxyContext } from "./proxy-types";
 import { applyRateLimitCooldown } from "./rate-limit-cooldown";
@@ -878,6 +879,7 @@ export async function boundResponseBodyForClassification(
 	const chunks: Uint8Array[] = [];
 	let totalBytes = 0;
 	let exceededCap = false;
+	let readFailed = false;
 
 	try {
 		while (true) {
@@ -894,6 +896,12 @@ export async function boundResponseBodyForClassification(
 				chunks.push(value);
 			}
 		}
+	} catch {
+		// Classification is entirely status/header-based (see the exceeded-cap
+		// branch below), so a mid-read failure on this clone must not surface as
+		// a thrown error and take down the request path. Fall back to the same
+		// headers-only Response used when the body exceeds the cap.
+		readFailed = true;
 	} finally {
 		// Whether we finished normally or bailed out early on the cap, release
 		// the reader's lock. If we bailed early, cancel the remainder so the
@@ -908,7 +916,7 @@ export async function boundResponseBodyForClassification(
 		reader.releaseLock();
 	}
 
-	if (exceededCap) {
+	if (exceededCap || readFailed) {
 		return new Response(null, {
 			status: clone.status,
 			statusText: clone.statusText,
@@ -916,14 +924,14 @@ export async function boundResponseBodyForClassification(
 		});
 	}
 
-	const merged = new Uint8Array(totalBytes);
-	let offset = 0;
-	for (const chunk of chunks) {
-		merged.set(chunk, offset);
-		offset += chunk.byteLength;
-	}
+	const merged = combineChunks(chunks);
+	// combineChunks returns a Node Buffer, whose .buffer is typed as
+	// ArrayBufferLike (not the concrete ArrayBuffer TS's BodyInit expects for a
+	// typed-array view). Copy into a plain Uint8Array<ArrayBuffer> instead of
+	// viewing merged.buffer directly.
+	const mergedView = new Uint8Array(merged);
 
-	return new Response(merged, {
+	return new Response(mergedView, {
 		status: clone.status,
 		statusText: clone.statusText,
 		headers: clone.headers,
@@ -1622,7 +1630,7 @@ export async function proxyWithAccount(
 			// Native xAI capacity signal (R5-R10): XaiProvider.parseRateLimit
 			// classifies a 402 as "xai_capacity_402" (more specific than this
 			// generic account-wide billing reason), and that classification path
-			// awaits the durable cooldown write before returning (R9 — avoids a
+			// awaits the durable cooldown write before returning (R9: avoids a
 			// fast follow-up request racing ahead of the write) and forwards the
 			// original response intact on the final candidate (AE4a) instead of
 			// unconditionally failing over. Skip this generic handler for xAI so

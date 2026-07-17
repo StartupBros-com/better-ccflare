@@ -1,4 +1,4 @@
-import type { Account } from "@better-ccflare/types";
+import type { Account, RateLimitReason } from "@better-ccflare/types";
 import type { RoutingCapacityContext } from "./account-selector";
 import type { RequestRateLimitOutcome } from "./rate-limit-scope";
 
@@ -28,13 +28,21 @@ interface AutomaticRecovery {
 	readonly reason: "account_capacity" | "account_cooldown";
 }
 
-const GLOBAL_COOLDOWN_REASONS = new Set<string>([
+// Set<RateLimitReason> (not Set<string>) so a future RateLimitReason rename
+// or removal fails typecheck here instead of silently drifting out of sync.
+const GLOBAL_COOLDOWN_REASONS = new Set<RateLimitReason>([
 	"upstream_429_with_reset",
 	"upstream_429_no_reset_default_5h",
 	"upstream_429_no_reset_probe_cooldown",
 	"all_models_exhausted_429",
 	"upstream_529_overloaded_with_reset",
 	"upstream_529_overloaded_no_reset",
+	// Native xAI capacity exhaustion (R5-R10) is an account-wide cooldown like
+	// any other global rate limit reason, not a model-lane-scoped one: xAI
+	// routes every Claude model alias to the same underlying grok model, so a
+	// pool exhausted purely by xai_capacity_402 cooldowns is retryable
+	// pool_exhausted, not route_unavailable.
+	"xai_capacity_402",
 ]);
 
 function isFiniteFuture(

@@ -2167,4 +2167,26 @@ describe("boundResponseBodyForClassification (64 KiB final-candidate classificat
 		const text = await bounded.text();
 		expect(text).toBe("");
 	});
+
+	it("falls back to a headers-only response when the body stream rejects mid-read", async () => {
+		const failingStream = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(new TextEncoder().encode('{"partial":'));
+			},
+			pull() {
+				throw new Error("simulated read failure");
+			},
+		});
+		const original = new Response(failingStream, {
+			status: 402,
+			headers: { "content-type": "application/json", "x-test": "3" },
+		});
+
+		const bounded = await boundResponseBodyForClassification(original);
+
+		expect(bounded.status).toBe(402);
+		expect(bounded.headers.get("x-test")).toBe("3");
+		const text = await bounded.text();
+		expect(text).toBe("");
+	});
 });

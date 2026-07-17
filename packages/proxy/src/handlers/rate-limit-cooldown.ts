@@ -16,6 +16,22 @@ const PROBE_LEASE_MS = 2 * 60 * 1000;
 const MAX_PROBE_GATES = 10_000;
 const probeLeases = new Map<string, number>();
 
+const DEFAULT_RATE_LIMIT_PERSIST_AWAIT_TIMEOUT_MS = 3000;
+
+/**
+ * Read the bound (ms) on how long applyRateLimitCooldownAwaitingPersist will
+ * await the durable markAccountRateLimited write before falling back to the
+ * in-memory-only cooldown. Reads CCFLARE_RATE_LIMIT_PERSIST_AWAIT_TIMEOUT_MS
+ * from env. Uses an explicit finite check (not ||) so 0 is a valid override
+ * for tests.
+ */
+function getRateLimitPersistAwaitTimeoutMs(): number {
+	const raw = Number(process.env.CCFLARE_RATE_LIMIT_PERSIST_AWAIT_TIMEOUT_MS);
+	return Number.isFinite(raw) && raw >= 0
+		? raw
+		: DEFAULT_RATE_LIMIT_PERSIST_AWAIT_TIMEOUT_MS;
+}
+
 export type RateLimitProbeAdmission =
 	| "not_required"
 	| "admitted"
@@ -219,16 +235,45 @@ export async function applyRateLimitCooldownAwaitingPersist(
 		rateLimitInfo,
 	);
 
-	const persistedCount = await ctx.dbOps.markAccountRateLimited(
-		account.id,
-		cooldownUntil,
-		reason,
-	);
-	// Reconcile in-memory counter with the authoritative DB value (may differ
-	// under concurrent 402/429s for the same account).
-	account.consecutive_rate_limits = persistedCount;
+	// The durable single-row UPDATE is awaited (not enqueued) so failover
+	// selection -- which reads fresh account state from the DB on every request,
+	// see the class doc comment above -- observes it before this promise
+	// resolves. But on SQLite, withBusyRetry can legitimately stall a write for
+	// up to 10 minutes while another process holds an exclusive VACUUM lock:
+	// the same accepted tradeoff documented on async-writer.ts's
+	// runJobWithWatchdog ("DB job failed" logging, un-cancellable background
+	// writes bounded only by the process-level shutdown watchdog). Blocking the
+	// request path on that stall would be worse than the race this await exists
+	// to prevent, so it is bounded here: past the timeout, or on an outright
+	// rejection, fall back to the in-memory-only cooldown already computed by
+	// applyRateLimitCooldownInMemory above and let the write converge in the
+	// background. Do not try to abort/cancel the underlying SQLite call --
+	// there is nothing to cancel it with, and a second timer layered on top
+	// would only orphan the original promise without shortening the real wait.
+	let persistedCount: number | null = null;
+	try {
+		persistedCount = await raceWithTimeout(
+			ctx.dbOps.markAccountRateLimited(account.id, cooldownUntil, reason),
+			getRateLimitPersistAwaitTimeoutMs(),
+		);
+	} catch (err) {
+		log.error(
+			`[ccflare] account=${account.name} id=${account.id} cooldown_persist_failed reason=${reason}`,
+			err,
+		);
+	}
+
+	if (persistedCount !== null) {
+		// Reconcile in-memory counter with the authoritative DB value (may differ
+		// under concurrent 402/429s for the same account).
+		account.consecutive_rate_limits = persistedCount;
+	} else {
+		log.warn(
+			`[ccflare] account=${account.name} cooldown_persist_deferred reason=${reason} -- proceeding with in-memory streak=${account.consecutive_rate_limits}`,
+		);
+	}
 	log.warn(
-		`[ccflare] account=${account.name} cooldown_applied reason=${reason} until=${new Date(cooldownUntil).toISOString()} consecutive=${persistedCount}`,
+		`[ccflare] account=${account.name} cooldown_applied reason=${reason} until=${new Date(cooldownUntil).toISOString()} consecutive=${account.consecutive_rate_limits}`,
 	);
 
 	const rateLimitError = new RateLimitError(
@@ -237,4 +282,25 @@ export async function applyRateLimitCooldownAwaitingPersist(
 		rateLimitInfo.remaining,
 	);
 	logError(rateLimitError, log);
+}
+
+/**
+ * Awaits `promise`, but resolves with null instead once `timeoutMs` elapses.
+ * The timer is always cleared once either side settles, so a fast-resolving
+ * `promise` does not leave a dangling timer keeping the event loop alive.
+ * The losing side (whichever settles second) is left to settle on its own;
+ * Promise.race already attaches a rejection handler to both inputs, so a late
+ * rejection from the losing promise never surfaces as an unhandled rejection.
+ */
+function raceWithTimeout<T>(
+	promise: Promise<T>,
+	timeoutMs: number,
+): Promise<T | null> {
+	let timer: ReturnType<typeof setTimeout>;
+	const timeout = new Promise<null>((resolve) => {
+		timer = setTimeout(() => resolve(null), timeoutMs);
+	});
+	return Promise.race([promise, timeout]).finally(() => {
+		clearTimeout(timer);
+	});
 }
