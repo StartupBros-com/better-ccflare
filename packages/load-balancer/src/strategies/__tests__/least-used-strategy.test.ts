@@ -52,8 +52,11 @@ class MockStore implements StrategyStore {
 	resetAccountSession(accountId: string, timestamp: number): void {
 		this.resetCalls.push({ accountId, timestamp });
 	}
-	resumeAccount(accountId: string): void {
+	async resumeAccount(
+		accountId: string,
+	): Promise<{ resumed: boolean; pauseReason: string | null }> {
 		this.resumeCalls.push(accountId);
+		return { resumed: true, pauseReason: null };
 	}
 	getAccountUtilization(accountId: string): number | null {
 		return this.utilization.has(accountId)
@@ -81,7 +84,7 @@ describe("LeastUsedStrategy", () => {
 		strategy.initialize(store);
 	});
 
-	it("returns [] when all accounts are unavailable", () => {
+	it("returns [] when all accounts are unavailable", async () => {
 		const accounts = [
 			makeAccount({ id: "p1", paused: true }),
 			makeAccount({
@@ -89,20 +92,20 @@ describe("LeastUsedStrategy", () => {
 				rate_limited_until: Date.now() + 60_000,
 			}),
 		];
-		expect(strategy.select(accounts, meta)).toEqual([]);
+		expect(await strategy.select(accounts, meta)).toEqual([]);
 	});
 
-	it("orders by priority ASC (lower number first)", () => {
+	it("orders by priority ASC (lower number first)", async () => {
 		const accounts = [
 			makeAccount({ id: "p2", priority: 2 }),
 			makeAccount({ id: "p0", priority: 0 }),
 			makeAccount({ id: "p1", priority: 1 }),
 		];
-		const ordered = strategy.select(accounts, meta);
+		const ordered = await strategy.select(accounts, meta);
 		expect(ordered.map((a) => a.id)).toEqual(["p0", "p1", "p2"]);
 	});
 
-	it("breaks priority ties by utilization ASC", () => {
+	it("breaks priority ties by utilization ASC", async () => {
 		store.setUtil("low", 10);
 		store.setUtil("med", 50);
 		store.setUtil("high", 90);
@@ -111,32 +114,32 @@ describe("LeastUsedStrategy", () => {
 			makeAccount({ id: "low" }),
 			makeAccount({ id: "med" }),
 		];
-		const ordered = strategy.select(accounts, meta);
+		const ordered = await strategy.select(accounts, meta);
 		expect(ordered.map((a) => a.id)).toEqual(["low", "med", "high"]);
 	});
 
-	it("treats null utilization as 0 (newly-added accounts win ties)", () => {
+	it("treats null utilization as 0 (newly-added accounts win ties)", async () => {
 		// 'fresh' has no utilization data; 'used' is at 30%.
 		store.setUtil("used", 30);
 		const accounts = [
 			makeAccount({ id: "used" }),
 			makeAccount({ id: "fresh" }),
 		];
-		const ordered = strategy.select(accounts, meta);
+		const ordered = await strategy.select(accounts, meta);
 		expect(ordered[0].id).toBe("fresh");
 	});
 
-	it("falls back to priority-only ordering when initialize() was not called", () => {
+	it("falls back to priority-only ordering when initialize() was not called", async () => {
 		const noStoreStrategy = new LeastUsedStrategy();
 		const accounts = [
 			makeAccount({ id: "low", priority: 5 }),
 			makeAccount({ id: "high", priority: 0 }),
 		];
-		const ordered = noStoreStrategy.select(accounts, meta);
+		const ordered = await noStoreStrategy.select(accounts, meta);
 		expect(ordered.map((a) => a.id)).toEqual(["high", "low"]);
 	});
 
-	it("rotates concurrent picks via the recency penalty", () => {
+	it("rotates concurrent picks via the recency penalty", async () => {
 		// Three equal accounts (priority 0, util 0) — without the recency
 		// penalty, every select() would pick the same first-in-array account.
 		// The penalty must shift the picked account to the back of subsequent
@@ -147,9 +150,9 @@ describe("LeastUsedStrategy", () => {
 			makeAccount({ id: "z" }),
 		];
 
-		const first = strategy.select(accounts, meta);
-		const second = strategy.select(accounts, meta);
-		const third = strategy.select(accounts, meta);
+		const first = await strategy.select(accounts, meta);
+		const second = await strategy.select(accounts, meta);
+		const third = await strategy.select(accounts, meta);
 
 		const firstPrimary = first[0].id;
 		const secondPrimary = second[0].id;
@@ -165,7 +168,7 @@ describe("LeastUsedStrategy", () => {
 	});
 
 	describe("request-scoped routing metadata", () => {
-		it("never selects or auto-unpauses hard-excluded accounts", () => {
+		it("never selects or auto-unpauses hard-excluded accounts", async () => {
 			const excluded = makeAccount({
 				id: "excluded",
 				priority: 0,
@@ -180,14 +183,13 @@ describe("LeastUsedStrategy", () => {
 				hardExcludedAccountIds: new Set(["excluded"]),
 			} as RequestMeta;
 
-			expect(
-				strategy.select([excluded, eligible], requestMeta).map((a) => a.id),
-			).toEqual(["eligible"]);
+			const ordered = await strategy.select([excluded, eligible], requestMeta);
+			expect(ordered.map((a) => a.id)).toEqual(["eligible"]);
 			expect(excluded.paused).toBe(true);
 			expect(store.resumeCalls).not.toContain("excluded");
 		});
 
-		it("prefers higher comparable quota pressure within one priority", () => {
+		it("prefers higher comparable quota pressure within one priority", async () => {
 			store.setUtil("critical", 90);
 			store.setUtil("cold", 10);
 			const requestMeta = {
@@ -204,20 +206,17 @@ describe("LeastUsedStrategy", () => {
 				]),
 			} as RequestMeta;
 
-			expect(
-				strategy
-					.select(
-						[
-							makeAccount({ id: "cold", priority: 0 }),
-							makeAccount({ id: "critical", priority: 0 }),
-						],
-						requestMeta,
-					)
-					.map((a) => a.id),
-			).toEqual(["critical", "cold"]);
+			const ordered = await strategy.select(
+				[
+					makeAccount({ id: "cold", priority: 0 }),
+					makeAccount({ id: "critical", priority: 0 }),
+				],
+				requestMeta,
+			);
+			expect(ordered.map((a) => a.id)).toEqual(["critical", "cold"]);
 		});
 
-		it("never lets quota pressure cross numeric priority", () => {
+		it("never lets quota pressure cross numeric priority", async () => {
 			const requestMeta = {
 				...meta,
 				quotaPressureByAccountId: new Map([
@@ -226,20 +225,17 @@ describe("LeastUsedStrategy", () => {
 				]),
 			} as RequestMeta;
 
-			expect(
-				strategy
-					.select(
-						[
-							makeAccount({ id: "priority-1", priority: 1 }),
-							makeAccount({ id: "priority-0", priority: 0 }),
-						],
-						requestMeta,
-					)
-					.map((a) => a.id),
-			).toEqual(["priority-0", "priority-1"]);
+			const ordered = await strategy.select(
+				[
+					makeAccount({ id: "priority-1", priority: 1 }),
+					makeAccount({ id: "priority-0", priority: 0 }),
+				],
+				requestMeta,
+			);
+			expect(ordered.map((a) => a.id)).toEqual(["priority-0", "priority-1"]);
 		});
 
-		it("falls through to existing utilization order for incomparable pressure", () => {
+		it("falls through to existing utilization order for incomparable pressure", async () => {
 			store.setUtil("critical", 90);
 			store.setUtil("cold", 10);
 			const requestMeta = {
@@ -250,17 +246,14 @@ describe("LeastUsedStrategy", () => {
 				]),
 			} as RequestMeta;
 
-			expect(
-				strategy
-					.select(
-						[makeAccount({ id: "critical" }), makeAccount({ id: "cold" })],
-						requestMeta,
-					)
-					.map((a) => a.id),
-			).toEqual(["cold", "critical"]);
+			const ordered = await strategy.select(
+				[makeAccount({ id: "critical" }), makeAccount({ id: "cold" })],
+				requestMeta,
+			);
+			expect(ordered.map((a) => a.id)).toEqual(["cold", "critical"]);
 		});
 
-		it("falls through to existing utilization order when pressure is missing", () => {
+		it("falls through to existing utilization order when pressure is missing", async () => {
 			store.setUtil("with-pressure", 90);
 			store.setUtil("without-pressure", 10);
 			const requestMeta = {
@@ -270,22 +263,22 @@ describe("LeastUsedStrategy", () => {
 				]),
 			} as RequestMeta;
 
-			expect(
-				strategy
-					.select(
-						[
-							makeAccount({ id: "with-pressure" }),
-							makeAccount({ id: "without-pressure" }),
-						],
-						requestMeta,
-					)
-					.map((a) => a.id),
-			).toEqual(["without-pressure", "with-pressure"]);
+			const ordered = await strategy.select(
+				[
+					makeAccount({ id: "with-pressure" }),
+					makeAccount({ id: "without-pressure" }),
+				],
+				requestMeta,
+			);
+			expect(ordered.map((a) => a.id)).toEqual([
+				"without-pressure",
+				"with-pressure",
+			]);
 		});
 	});
 
 	describe("auto-unpause", () => {
-		it("resumes overage-paused accounts whose rate_limit_reset has elapsed", () => {
+		it("resumes overage-paused accounts whose rate_limit_reset has elapsed", async () => {
 			const past = Date.now() - 60_000;
 			const account = makeAccount({
 				id: "ovg",
@@ -294,13 +287,13 @@ describe("LeastUsedStrategy", () => {
 				auto_fallback_enabled: true,
 				rate_limit_reset: past,
 			});
-			const ordered = strategy.select([account], meta);
+			const ordered = await strategy.select([account], meta);
 			expect(account.paused).toBe(false);
 			expect(store.resumeCalls).toContain("ovg");
 			expect(ordered.map((a) => a.id)).toEqual(["ovg"]);
 		});
 
-		it("does NOT resume manually-paused accounts", () => {
+		it("does NOT resume manually-paused accounts", async () => {
 			const past = Date.now() - 60_000;
 			const account = makeAccount({
 				id: "manual",
@@ -309,13 +302,13 @@ describe("LeastUsedStrategy", () => {
 				auto_fallback_enabled: true,
 				rate_limit_reset: past,
 			});
-			const ordered = strategy.select([account], meta);
+			const ordered = await strategy.select([account], meta);
 			expect(account.paused).toBe(true);
 			expect(store.resumeCalls).not.toContain("manual");
 			expect(ordered).toEqual([]);
 		});
 
-		it("does NOT resume accounts without auto_fallback_enabled", () => {
+		it("does NOT resume accounts without auto_fallback_enabled", async () => {
 			const past = Date.now() - 60_000;
 			const account = makeAccount({
 				id: "no-flag",
@@ -324,12 +317,12 @@ describe("LeastUsedStrategy", () => {
 				auto_fallback_enabled: false,
 				rate_limit_reset: past,
 			});
-			strategy.select([account], meta);
+			await strategy.select([account], meta);
 			expect(account.paused).toBe(true);
 			expect(store.resumeCalls).not.toContain("no-flag");
 		});
 
-		it("does NOT resume when rate_limit_reset is still in the future", () => {
+		it("does NOT resume when rate_limit_reset is still in the future", async () => {
 			const future = Date.now() + 60_000;
 			const account = makeAccount({
 				id: "future",
@@ -338,9 +331,33 @@ describe("LeastUsedStrategy", () => {
 				auto_fallback_enabled: true,
 				rate_limit_reset: future,
 			});
-			strategy.select([account], meta);
+			await strategy.select([account], meta);
 			expect(account.paused).toBe(true);
 			expect(store.resumeCalls).not.toContain("future");
+		});
+
+		it("does not unpause or select the account when the store refuses the resume (resumed:false)", async () => {
+			const past = Date.now() - 60_000;
+			const account = makeAccount({
+				id: "racy",
+				paused: true,
+				pause_reason: "overage",
+				auto_fallback_enabled: true,
+				rate_limit_reset: past,
+			});
+			const racyStore: StrategyStore = {
+				resetAccountSession() {},
+				resumeAccount: async () => ({
+					resumed: false,
+					pauseReason: "overage",
+				}),
+			};
+			strategy.initialize(racyStore);
+
+			const ordered = await strategy.select([account], meta);
+
+			expect(account.paused).toBe(true);
+			expect(ordered).toEqual([]);
 		});
 	});
 
@@ -354,14 +371,14 @@ describe("LeastUsedStrategy", () => {
 			).toBeNull();
 		});
 
-		it("returns the same primary that select() returns when no auto-unpause is needed", () => {
+		it("returns the same primary that select() returns when no auto-unpause is needed", async () => {
 			const accounts = [
 				makeAccount({ id: "p2", priority: 2 }),
 				makeAccount({ id: "p0", priority: 0 }),
 				makeAccount({ id: "p1", priority: 1 }),
 			];
 			const peeked = strategy.peek(accounts);
-			const selected = strategy.select(accounts, meta);
+			const selected = await strategy.select(accounts, meta);
 			expect(peeked).toBe("p0");
 			expect(selected[0]?.id).toBe("p0");
 		});

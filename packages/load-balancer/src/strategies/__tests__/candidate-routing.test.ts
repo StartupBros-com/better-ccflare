@@ -87,14 +87,16 @@ function meta(
 
 const store: StrategyStore = {
 	resetAccountSession() {},
-	resumeAccount() {},
+	async resumeAccount() {
+		return { resumed: true, pauseReason: null };
+	},
 	getAccountUtilization() {
 		return 0;
 	},
 };
 
 describe("atomic strategy candidates", () => {
-	it("LeastUsedStrategy orders candidate metadata with duplicate accounts", () => {
+	it("LeastUsedStrategy orders candidate metadata with duplicate accounts", async () => {
 		const strategy = new LeastUsedStrategy();
 		strategy.initialize(store);
 		const shared = account("shared", 99);
@@ -103,7 +105,7 @@ describe("atomic strategy candidates", () => {
 			candidate("slot-critical", "shared", 0, 1, "critical"),
 		]);
 
-		const ordered = strategy.select([shared, shared], requestMeta);
+		const ordered = await strategy.select([shared, shared], requestMeta);
 
 		expect(ordered).toEqual([shared, shared]);
 		expect(
@@ -111,7 +113,7 @@ describe("atomic strategy candidates", () => {
 		).toEqual(["slot-critical", "slot-cold"]);
 	});
 
-	it("SessionStrategy uses candidate tiers and keeps metadata aligned", () => {
+	it("SessionStrategy uses candidate tiers and keeps metadata aligned", async () => {
 		const strategy = new SessionStrategy();
 		strategy.initialize(store);
 		const highAccountPriority = account("account-a", 50);
@@ -121,7 +123,7 @@ describe("atomic strategy candidates", () => {
 			candidate("slot-b", "account-b", 10, 1),
 		]);
 
-		const ordered = strategy.select(
+		const ordered = await strategy.select(
 			[highAccountPriority, lowAccountPriority],
 			requestMeta,
 		);
@@ -132,7 +134,7 @@ describe("atomic strategy candidates", () => {
 		).toEqual(["slot-a", "slot-b"]);
 	});
 
-	it("SessionAffinityStrategy sticks to candidate identity for duplicate-account slots", () => {
+	it("SessionAffinityStrategy sticks to candidate identity for duplicate-account slots", async () => {
 		const strategy = new SessionAffinityStrategy();
 		strategy.initialize(store);
 		const shared = account("shared");
@@ -140,7 +142,7 @@ describe("atomic strategy candidates", () => {
 			candidate("slot-a", "shared", 0, 0),
 			candidate("slot-b", "shared", 0, 1),
 		]);
-		strategy.select([shared, shared], firstMeta);
+		await strategy.select([shared, shared], firstMeta);
 		expect(firstMeta.routingCandidates?.[0]?.candidateId).toBe("slot-a");
 
 		const reorderedMeta = meta(
@@ -150,19 +152,19 @@ describe("atomic strategy candidates", () => {
 			],
 			"lane",
 		);
-		strategy.select([shared, shared], reorderedMeta);
+		await strategy.select([shared, shared], reorderedMeta);
 
 		expect(
 			reorderedMeta.routingCandidates?.map((item) => item.candidateId),
 		).toEqual(["slot-a", "slot-b"]);
 	});
 
-	it("SessionAffinityStrategy preempts on candidate pressure and retains the new owner", () => {
+	it("SessionAffinityStrategy preempts on candidate pressure and retains the new owner", async () => {
 		const strategy = new SessionAffinityStrategy();
 		strategy.initialize(store);
 		const cold = account("cold");
 		const hot = account("hot");
-		strategy.select(
+		await strategy.select(
 			[cold],
 			meta([candidate("cold-slot", "cold", 0, 0, "cold")]),
 		);
@@ -171,17 +173,17 @@ describe("atomic strategy candidates", () => {
 			candidate("cold-slot", "cold", 0, 0, "cold"),
 			candidate("hot-slot", "hot", 0, 1, "critical"),
 		]);
-		expect(strategy.select([cold, hot], pressured)[0]?.id).toBe("hot");
+		expect((await strategy.select([cold, hot], pressured))[0]?.id).toBe("hot");
 		expect(pressured.routingCandidates?.[0]?.candidateId).toBe("hot-slot");
 
 		const equalized = meta([
 			candidate("cold-slot", "cold", 0, 0),
 			candidate("hot-slot", "hot", 0, 1),
 		]);
-		expect(strategy.select([cold, hot], equalized)[0]?.id).toBe("hot");
+		expect((await strategy.select([cold, hot], equalized))[0]?.id).toBe("hot");
 	});
 
-	it("SessionAffinityStrategy preserves a missing better-tier candidate for snapback", () => {
+	it("SessionAffinityStrategy preserves a missing better-tier candidate for snapback", async () => {
 		const strategy = new SessionAffinityStrategy();
 		strategy.initialize(store);
 		const preferred = account("preferred");
@@ -190,16 +192,18 @@ describe("atomic strategy candidates", () => {
 			candidate("preferred-slot", "preferred", 0, 0),
 			candidate("fallback-slot", "fallback", 10, 1),
 		];
-		strategy.select([preferred, fallback], meta(catalog));
+		await strategy.select([preferred, fallback], meta(catalog));
 
 		const failoverMeta = meta([catalog[1] as RoutingCandidateMetadata]);
 		failoverMeta.routingCandidateCatalog = catalog;
-		expect(strategy.select([fallback], failoverMeta)[0]?.id).toBe("fallback");
+		expect((await strategy.select([fallback], failoverMeta))[0]?.id).toBe(
+			"fallback",
+		);
 
 		const recoveredMeta = meta(catalog);
-		expect(strategy.select([preferred, fallback], recoveredMeta)[0]?.id).toBe(
-			"preferred",
-		);
+		expect(
+			(await strategy.select([preferred, fallback], recoveredMeta))[0]?.id,
+		).toBe("preferred");
 		expect(recoveredMeta.routingCandidates?.[0]?.candidateId).toBe(
 			"preferred-slot",
 		);

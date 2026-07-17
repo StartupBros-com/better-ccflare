@@ -489,9 +489,9 @@ export async function getOrderedAccounts(
 		);
 		const hardExcluded = meta.hardExcludedAccountIds;
 		// Return all accounts - the provider will be determined dynamically per account.
-		const ordered = ctx.strategy
-			.select(eligibleAccounts, meta)
-			.filter((account) => !hardExcluded?.has(account.id));
+		const ordered = (await ctx.strategy.select(eligibleAccounts, meta)).filter(
+			(account) => !hardExcluded?.has(account.id),
+		);
 		const catalog = meta.routingCandidateCatalog ?? [];
 		meta.routingCandidates = ordered
 			.map((account) =>
@@ -897,7 +897,7 @@ export async function selectAccountsForRequest(
 								);
 						};
 
-						const strategyAccounts = ctx.strategy.select(
+						const strategyAccounts = await ctx.strategy.select(
 							eligibleEntries.map((entry) => entry.account),
 							meta,
 						);

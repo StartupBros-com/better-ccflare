@@ -1,19 +1,37 @@
 import { describe, expect, it } from "bun:test";
+import type { TokenRefreshResult } from "@better-ccflare/providers";
 import type { Account, RateLimitReason } from "@better-ccflare/types";
-import { refreshTokenWithTemporaryResume } from "./server";
+import { refreshPollingAccessToken } from "./server";
 
 /**
- * R24 (OAuth control-plane hotfix, U8): the usage poller's temporary
- * resume/re-pause must preserve the account's original pause_reason instead
- * of defaulting the re-pause to "manual" (which silently overwrote a
- * terminal oauth_invalid_grant pause every polling cycle), and it must
- * genuinely await both the resume and the restore so a generic resume
- * cannot race with or clobber the terminal reason.
+ * R25 (OAuth control-plane hotfix, U8 pro-gate): refreshPollingAccessToken
+ * (formerly refreshTokenWithTemporaryResume) no longer temporarily resumes a
+ * paused account before refreshing its token, nor restores the pause
+ * afterward -- see the JSDoc above the function in server.ts for the full
+ * investigation (neither getValidAccessToken nor anything it calls ever
+ * reads or gates on `paused`, and auto-refresh-scheduler.ts's proactive
+ * Codex/OpenAI-compatible refreshers already refresh tokens on paused rows
+ * directly with no resume/restore dance).
  *
- * The fixture account carries a valid, far-future-expiring access token so
- * getValidAccessToken's fast path (packages/proxy/src/handlers/token-manager.ts)
- * returns immediately without touching the DB or network at all -- this lets
- * the test use the real getValidAccessToken with no mock.module needed.
+ * These tests prove the resulting invariant: refreshPollingAccessToken never
+ * reads or writes `paused`/`pause_reason` at all, regardless of what
+ * getValidAccessToken does internally -- including rotating the refresh
+ * token, which is exactly what defeated the old restore's refresh-token
+ * equality guard (a manually- or overage-paused account was left wrongly
+ * active after any refresh that happened to rotate the token, not just a
+ * concurrent-reauth clobber). dbOps.resumeAccount / pauseAccountIfActive /
+ * pauseAccount are spied to throw if ever called, so a regression that
+ * reintroduces any form of the resume/restore dance fails loudly instead of
+ * passing by coincidence.
+ *
+ * The "untouched" tests use a fixture account with a valid, far-future-
+ * expiring access token so getValidAccessToken's fast path
+ * (packages/proxy/src/handlers/token-manager.ts) returns immediately
+ * without touching the network. The rotation test needs the slow (refresh)
+ * path, so it uses an expired access token and an unregistered provider
+ * name so packages/providers' getProvider() returns undefined and the real
+ * refreshAccessTokenSafe falls back to the stubbed proxyContext.provider
+ * instead of a real OAuth provider -- no network involved.
  */
 
 function makeAccount(overrides: Partial<Account> = {}): Account {
@@ -56,242 +74,201 @@ function makeAccount(overrides: Partial<Account> = {}): Account {
 }
 
 /**
- * Records call order and timing so the test can prove the restore is
- * genuinely awaited (not fire-and-forget) before the function's returned
- * promise settles: pauseAccountIfActive is given an artificial delay, and
- * the test asserts the "restore" call is observed complete before the outer
- * await resolves. pauseAccountIfActive always succeeds here (no
- * expectedRefreshToken mismatch simulated) since these tests cover the
- * non-race preservation behavior; the race itself is covered separately
- * below by makeRaceDbOpsStub.
+ * Spies for the three DB mutators the old temporary-resume/restore dance
+ * used to call. Throwing (rather than silently no-oping) makes any
+ * regression that reintroduces resume/restore behavior fail the test
+ * immediately and loudly instead of passing by coincidence.
  */
-function makeDbOpsStub(currentAccount: Account) {
-	const calls: string[] = [];
-	let pauseAccountIfActiveResolved = false;
-
-	const dbOps = {
-		getAccount: async (_id: string) => {
-			calls.push("getAccount");
-			return currentAccount;
-		},
+function makeNeverCalledPauseSpies() {
+	return {
 		resumeAccount: async (_id: string) => {
-			calls.push("resumeAccount");
-			return { resumed: true, pauseReason: null };
+			throw new Error(
+				"resumeAccount must never be called by refreshPollingAccessToken",
+			);
 		},
 		pauseAccountIfActive: async (
 			_id: string,
-			reason: string,
+			_reason: string,
 			_expectedRefreshToken?: string | null,
 		) => {
-			calls.push(`pauseAccountIfActive:${reason}`);
-			// Artificial delay to prove the caller genuinely awaits this before
-			// returning, not just fires-and-forgets it.
-			await new Promise((resolve) => setTimeout(resolve, 20));
-			pauseAccountIfActiveResolved = true;
-			return true;
+			throw new Error(
+				"pauseAccountIfActive must never be called by refreshPollingAccessToken",
+			);
 		},
-	};
-
-	return {
-		dbOps,
-		calls,
-		isPauseAccountIfActiveResolved: () => pauseAccountIfActiveResolved,
+		pauseAccount: async (_id: string, _reason?: string) => {
+			throw new Error(
+				"pauseAccount must never be called by refreshPollingAccessToken",
+			);
+		},
 	};
 }
 
-describe("refreshTokenWithTemporaryResume (R24 poller reason preservation)", () => {
-	it("restores the account's original terminal pause_reason instead of defaulting to manual", async () => {
-		const account = makeAccount({ paused: true });
-		const currentAccount = makeAccount({
+describe("refreshPollingAccessToken (R25: no temporary resume/restore)", () => {
+	it("leaves a terminally-paused account's pause state completely untouched (fast path, no refresh needed)", async () => {
+		const account = makeAccount({
 			paused: true,
 			pause_reason: "oauth_invalid_grant",
 		});
-		const { dbOps, calls, isPauseAccountIfActiveResolved } =
-			makeDbOpsStub(currentAccount);
+		const calls: string[] = [];
+		const dbOps = {
+			getAccount: async (_id: string) => {
+				calls.push("getAccount");
+				return account;
+			},
+			...makeNeverCalledPauseSpies(),
+		};
 		const proxyContext = {
 			dbOps,
-		} as unknown as Parameters<typeof refreshTokenWithTemporaryResume>[1];
+		} as unknown as Parameters<typeof refreshPollingAccessToken>[1];
 
-		const token = await refreshTokenWithTemporaryResume(account, proxyContext);
+		const token = await refreshPollingAccessToken(account, proxyContext);
 
 		expect(token).toBe("at-fixture-valid");
-		// The restore (pauseAccountIfActive) call must have been awaited to
-		// completion before refreshTokenWithTemporaryResume's own promise resolved.
-		expect(isPauseAccountIfActiveResolved()).toBe(true);
-		// The re-pause must preserve the ORIGINAL reason, never default to "manual".
-		expect(calls).toEqual([
-			"getAccount",
-			"resumeAccount",
-			"pauseAccountIfActive:oauth_invalid_grant",
-		]);
-		// In-memory account state must be restored to paused afterward.
+		expect(calls).toEqual(["getAccount"]);
 		expect(account.paused).toBe(true);
+		expect(account.pause_reason).toBe("oauth_invalid_grant");
 	});
 
-	it("preserves a manual pause reason unchanged (non-terminal reasons are unaffected)", async () => {
-		const account = makeAccount({ paused: true });
-		const currentAccount = makeAccount({
-			paused: true,
-			pause_reason: "manual",
-		});
-		const { dbOps, calls } = makeDbOpsStub(currentAccount);
+	it("leaves an active (non-paused) account's state untouched and refreshes normally", async () => {
+		const account = makeAccount({ paused: false, pause_reason: null });
+		const calls: string[] = [];
+		const dbOps = {
+			getAccount: async (_id: string) => {
+				calls.push("getAccount");
+				return account;
+			},
+			...makeNeverCalledPauseSpies(),
+		};
 		const proxyContext = {
 			dbOps,
-		} as unknown as Parameters<typeof refreshTokenWithTemporaryResume>[1];
+		} as unknown as Parameters<typeof refreshPollingAccessToken>[1];
 
-		await refreshTokenWithTemporaryResume(account, proxyContext);
+		const token = await refreshPollingAccessToken(account, proxyContext);
 
-		expect(calls).toEqual([
-			"getAccount",
-			"resumeAccount",
-			"pauseAccountIfActive:manual",
-		]);
-	});
-
-	it("does not temporarily resume or re-pause an account that isn't currently paused", async () => {
-		const account = makeAccount({ paused: false });
-		const currentAccount = makeAccount({
-			paused: false,
-			pause_reason: null,
-		});
-		const { dbOps, calls } = makeDbOpsStub(currentAccount);
-		const proxyContext = {
-			dbOps,
-		} as unknown as Parameters<typeof refreshTokenWithTemporaryResume>[1];
-
-		await refreshTokenWithTemporaryResume(account, proxyContext);
-
+		expect(token).toBe("at-fixture-valid");
 		expect(calls).toEqual(["getAccount"]);
 		expect(account.paused).toBe(false);
-	});
-
-	it("falls back to manual when the original pause_reason is null on a paused row (legacy data)", async () => {
-		const account = makeAccount({ paused: true });
-		const currentAccount = makeAccount({
-			paused: true,
-			pause_reason: null,
-		});
-		const { dbOps, calls } = makeDbOpsStub(currentAccount);
-		const proxyContext = {
-			dbOps,
-		} as unknown as Parameters<typeof refreshTokenWithTemporaryResume>[1];
-
-		await refreshTokenWithTemporaryResume(account, proxyContext);
-
-		expect(calls).toEqual([
-			"getAccount",
-			"resumeAccount",
-			"pauseAccountIfActive:manual",
-		]);
 	});
 });
 
 /**
- * P1 review fix: a successful concurrent reauthentication (fresh tokens
- * stored, oauth_invalid_grant cleared, account genuinely resumed via
- * resumeAccountIfNeedsReauth from the http-api oauth callback) can complete
- * during the poller's temporary-resume window. Before this fix, the
- * finally-block restore called dbOps.pauseAccount(id, originalPauseReason)
- * unconditionally, with no guard at all, so it clobbered the fresh reauth
- * straight back to paused/oauth_invalid_grant even though valid tokens were
- * now stored. Since oauth_invalid_grant is excluded from auto-unpause, the
- * account would then be stuck paused forever under a stale terminal
- * classification.
+ * The rotation bug this fix eliminates: getValidAccessToken can legitimately
+ * ROTATE the refresh token as part of a normal, successful refresh (some
+ * providers rotate on every refresh). The now-deleted restore guard compared
+ * the account's post-refresh refresh_token against the value captured before
+ * the temporary resume, and skipped restoring the pause on any mismatch --
+ * including this entirely benign rotation, not just a concurrent-reauth
+ * clobber. That left a manually-paused account wrongly active forever. A red
+ * run of this exact scenario against the pre-fix refreshTokenWithTemporaryResume
+ * (recorded before this fix landed) confirmed the bug: calls sequenced as
+ * getAccount -> resumeAccount -> provider.refreshToken -> updateAccountTokens
+ * -> pauseAccountIfActive("manual", "rt-old"), with the guard checked against
+ * the now-stale "rt-old" while the DB row's refresh_token had already
+ * rotated to "rt-rotated", so pauseAccountIfActive returned false and the
+ * account was left paused:false.
  *
- * The stub below models the DB row as mutable state so the "concurrent
- * reauth" can be injected as a side effect that lands inside the temporary-
- * resume window (right after our own resumeAccount call, before
- * getValidAccessToken/the finally-block restore run), and implements
- * pauseAccountIfActive with the same COALESCE(paused,0)=0 AND
- * refresh_token=? guard semantics as the real
- * AccountRepository.pauseIfActive, so the fix under test can be exercised
- * against faithful guard behavior.
+ * This models the full round trip through the REAL getValidAccessToken /
+ * refreshAccessTokenSafe (packages/proxy/src/handlers/token-manager.ts) via
+ * a fake, unregistered provider name so packages/providers' getProvider()
+ * returns undefined and refreshAccessTokenSafe falls back to
+ * proxyContext.provider -- a fully stubbed provider whose refreshToken
+ * resolves immediately with a rotated refresh token, no network involved.
+ * proxyContext.asyncWriter.enqueue runs its job synchronously so the token
+ * persistence (dbOps.updateAccountTokens) that would normally happen via the
+ * async writer lands deterministically, modeling the worst-case timing the
+ * bug depended on.
  */
-function makeRaceDbOpsStub(initial: {
+function makeRotationProxyContext(state: {
 	paused: boolean;
 	pause_reason: string | null;
 	refresh_token: string;
+	access_token: string | null;
+	expires_at: number | null;
 }) {
-	const state = { ...initial };
 	const calls: string[] = [];
 
 	const dbOps = {
 		getAccount: async (_id: string) => {
 			calls.push("getAccount");
-			return {
-				paused: state.paused,
-				pause_reason: state.pause_reason,
-				refresh_token: state.refresh_token,
-				access_token: "at-fixture-valid",
-				expires_at: Date.now() + 60 * 60 * 1000,
-			} as unknown as Account;
+			return { ...state } as unknown as Account;
 		},
-		resumeAccount: async (_id: string) => {
-			calls.push("resumeAccount");
-			// Our own attempt to temporarily resume an oauth_invalid_grant-paused
-			// account is refused by the R23 guard (resumeUnlessPausedForReason) --
-			// it never actually flips the row. Meanwhile, independently and
-			// concurrently, a real reauthentication completes: fresh tokens are
-			// stored and the account is genuinely resumed via
-			// resumeAccountIfNeedsReauth. This models that landing inside the
-			// temporary-resume window, before our restore runs.
-			state.paused = false;
-			state.pause_reason = null;
-			state.refresh_token = "rt-new-after-reauth";
-			return { resumed: false, pauseReason: "oauth_invalid_grant" };
-		},
-		pauseAccount: async (_id: string, reason?: string) => {
-			calls.push(`pauseAccount:${reason}`);
-			// OLD (buggy) unconditional restore.
-			state.paused = true;
-			state.pause_reason = reason ?? "manual";
-		},
-		pauseAccountIfActive: async (
+		updateAccountTokens: async (
 			_id: string,
-			reason: string,
-			expectedRefreshToken?: string | null,
+			accessToken: string,
+			expiresAt: number,
+			refreshToken?: string,
 		) => {
-			calls.push(`pauseAccountIfActive:${reason}:${expectedRefreshToken}`);
-			if (state.paused) return false;
-			if (
-				expectedRefreshToken != null &&
-				state.refresh_token !== expectedRefreshToken
-			) {
-				return false;
-			}
-			state.paused = true;
-			state.pause_reason = reason;
-			return true;
+			calls.push("updateAccountTokens");
+			state.access_token = accessToken;
+			state.expires_at = expiresAt;
+			if (refreshToken) state.refresh_token = refreshToken;
+		},
+		...makeNeverCalledPauseSpies(),
+	};
+
+	const provider = {
+		name: "fixture-rotating-provider",
+		refreshToken: async (): Promise<TokenRefreshResult> => {
+			calls.push("provider.refreshToken");
+			return {
+				accessToken: "at-rotated",
+				expiresAt: Date.now() + 60 * 60 * 1000,
+				refreshToken: "rt-rotated",
+			};
 		},
 	};
 
-	return { dbOps, calls, state };
+	const proxyContext = {
+		dbOps,
+		provider,
+		runtime: { clientId: "test-client" },
+		refreshInFlight: new Map<string, Promise<string>>(),
+		asyncWriter: {
+			enqueue: (job: () => unknown) => {
+				job();
+				return true;
+			},
+		},
+	} as unknown as Parameters<typeof refreshPollingAccessToken>[1];
+
+	return { proxyContext, calls, state };
 }
 
-describe("refreshTokenWithTemporaryResume (P1 review: concurrent reauth must not be clobbered)", () => {
-	it("does not clobber a successful concurrent reauthentication that lands during the temporary-resume window", async () => {
+describe("refreshPollingAccessToken (R25: rotation no longer defeats the pause)", () => {
+	it("leaves a manually-paused account paused even when the refresh rotates the refresh token", async () => {
 		const account = makeAccount({
 			paused: true,
-			pause_reason: "oauth_invalid_grant",
+			pause_reason: "manual",
 			refresh_token: "rt-old",
+			access_token: null,
+			expires_at: null,
+			// Unregistered provider name so packages/providers' getProvider()
+			// returns undefined and the real refreshAccessTokenSafe falls back to
+			// proxyContext.provider (our stub) instead of a real OAuth provider.
+			provider: "fixture-rotating-provider",
 		});
-		const { dbOps, state } = makeRaceDbOpsStub({
+		const { proxyContext, calls, state } = makeRotationProxyContext({
 			paused: true,
-			pause_reason: "oauth_invalid_grant",
+			pause_reason: "manual",
 			refresh_token: "rt-old",
+			access_token: null,
+			expires_at: null,
 		});
-		const proxyContext = {
-			dbOps,
-		} as unknown as Parameters<typeof refreshTokenWithTemporaryResume>[1];
 
-		await refreshTokenWithTemporaryResume(account, proxyContext);
+		const token = await refreshPollingAccessToken(account, proxyContext);
 
-		// A genuine, freshly-reauthenticated account must remain resumed: the
-		// restore must never clobber it back to paused/oauth_invalid_grant just
-		// because we captured the original (now stale) pause reason before the
-		// concurrent reauth landed.
-		expect(state.paused).toBe(false);
-		expect(state.pause_reason).toBeNull();
-		expect(state.refresh_token).toBe("rt-new-after-reauth");
+		expect(token).toBe("at-rotated");
+		// The refresh really did rotate the token -- this is not a no-op fixture.
+		expect(state.refresh_token).toBe("rt-rotated");
+		// The pause must survive the refresh untouched: refreshPollingAccessToken
+		// never reads or writes `paused`/`pause_reason`, so there is nothing left
+		// for the rotation to defeat.
+		expect(state.paused).toBe(true);
+		expect(state.pause_reason).toBe("manual");
+		expect(calls).toEqual([
+			"getAccount",
+			"provider.refreshToken",
+			"updateAccountTokens",
+		]);
 	});
 });

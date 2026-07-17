@@ -181,7 +181,7 @@ export class SessionStrategy implements LoadBalancingStrategy {
 		return available[0]?.id ?? null;
 	}
 
-	select(accounts: Account[], meta: RequestMeta): Account[] {
+	async select(accounts: Account[], meta: RequestMeta): Promise<Account[]> {
 		const now = Date.now();
 		const candidates = filterHardExcludedCandidates(
 			zipStrategyCandidates(accounts, meta),
@@ -231,10 +231,22 @@ export class SessionStrategy implements LoadBalancingStrategy {
 					this.log.info(
 						`Unpausing account ${candidate.name} due to auto-fallback reactivation`,
 					);
-					this.store.resumeAccount(candidate.id);
-					candidate.paused = false;
-					// Invalidate the cache so getCachedAvailability reflects the unpause
-					availabilityCache.delete(candidate.id);
+					const { resumed } = await this.store.resumeAccount(candidate.id);
+					if (resumed) {
+						candidate.paused = false;
+						// Invalidate the cache so getCachedAvailability reflects the unpause
+						availabilityCache.delete(candidate.id);
+					} else {
+						this.log.info(
+							`Store refused to resume ${candidate.name} — leaving it paused for this pass`,
+						);
+						const reason = candidate.pause_reason || "unknown";
+						if (!skippedByReason.has(reason)) {
+							skippedByReason.set(reason, []);
+						}
+						skippedByReason.get(reason)?.push(candidate.name);
+						continue;
+					}
 				} else {
 					const reason = candidate.pause_reason || "unknown";
 					if (!skippedByReason.has(reason)) {
