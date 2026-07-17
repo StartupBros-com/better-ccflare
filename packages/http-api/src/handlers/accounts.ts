@@ -58,6 +58,7 @@ const RATE_LIMIT_REASONS = new Set<RateLimitReason>([
 	// new code emits `upstream_429_no_reset_probe_cooldown` instead.
 	"upstream_429_no_reset_default_5h",
 	"upstream_429_no_reset_probe_cooldown",
+	"upstream_402_payment_required",
 	"model_fallback_429",
 	"all_models_exhausted_429",
 	"upstream_529_overloaded_with_reset",

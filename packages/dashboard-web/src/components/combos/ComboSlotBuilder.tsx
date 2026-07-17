@@ -14,13 +14,14 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { GripVertical, Plus, Trash2 } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
 	useAccounts,
 	useAddComboSlot,
 	useFamilies,
 	useRemoveComboSlot,
 	useReorderComboSlots,
+	useUpdateComboSlot,
 } from "../../hooks/queries";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
@@ -34,14 +35,21 @@ import {
 	SelectTrigger,
 	SelectValue,
 } from "../ui/select";
+import {
+	COMBO_REORDER_WARNING,
+	getDefaultComboSlotPriority,
+	handleComboSlotPriorityKeyDown,
+	parseComboSlotPriority,
+} from "./combo-slot-priority";
 
 interface SortableSlotRowProps {
 	slot: ComboSlot;
-	comboId: string;
 	index: number;
 	accountName: string;
 	provider: string;
+	onPriorityChange: (priority: number) => void;
 	onRemove: () => void;
+	isUpdatingPriority: boolean;
 	isRemoving: boolean;
 }
 
@@ -50,9 +58,17 @@ function SortableSlotRow({
 	index,
 	accountName,
 	provider,
+	onPriorityChange,
 	onRemove,
+	isUpdatingPriority,
 	isRemoving,
 }: SortableSlotRowProps) {
+	const [priorityText, setPriorityText] = useState(String(slot.priority));
+
+	useEffect(() => {
+		setPriorityText(String(slot.priority));
+	}, [slot.priority]);
+
 	const {
 		attributes,
 		listeners,
@@ -67,6 +83,14 @@ function SortableSlotRow({
 		transition,
 		opacity: isDragging ? 0.5 : 1,
 	};
+	const savePriority = () => {
+		const priority = parseComboSlotPriority(priorityText);
+		if (priority === null) {
+			setPriorityText(String(slot.priority));
+			return;
+		}
+		if (priority !== slot.priority) onPriorityChange(priority);
+	};
 
 	return (
 		<div
@@ -79,6 +103,7 @@ function SortableSlotRow({
 			</span>
 			<button
 				type="button"
+				aria-label={`Reorder ${accountName}`}
 				className="cursor-grab text-muted-foreground hover:text-foreground active:cursor-grabbing"
 				{...attributes}
 				{...listeners}
@@ -97,9 +122,38 @@ function SortableSlotRow({
 				{slot.model}
 			</span>
 
+			<div className="flex shrink-0 items-center gap-1">
+				<Label
+					htmlFor={`combo-slot-priority-${slot.id}`}
+					className="text-[10px] text-muted-foreground"
+				>
+					Tier
+				</Label>
+				<Input
+					id={`combo-slot-priority-${slot.id}`}
+					aria-label={`Priority tier for ${accountName}`}
+					type="number"
+					min={0}
+					max={100}
+					step={1}
+					value={priorityText}
+					onChange={(event) => setPriorityText(event.target.value)}
+					onBlur={savePriority}
+					onKeyDown={(event) => {
+						handleComboSlotPriorityKeyDown(event.key, slot.priority, {
+							reset: setPriorityText,
+							requestCommit: () => event.currentTarget.blur(),
+						});
+					}}
+					disabled={isUpdatingPriority}
+					className="h-7 w-16 px-2 text-xs"
+				/>
+			</div>
+
 			<Button
 				variant="ghost"
 				size="sm"
+				aria-label={`Remove ${accountName}`}
 				onClick={onRemove}
 				disabled={isRemoving}
 				className="shrink-0 text-destructive hover:text-destructive"
@@ -118,10 +172,12 @@ export function ComboSlotBuilder({ combo }: ComboSlotBuilderProps) {
 	const [showAddForm, setShowAddForm] = useState(false);
 	const [newAccountId, setNewAccountId] = useState("");
 	const [newModel, setNewModel] = useState("");
+	const [newPriority, setNewPriority] = useState("0");
 
 	const accountsQuery = useAccounts();
 	const familiesQuery = useFamilies();
 	const addSlot = useAddComboSlot();
+	const updateSlot = useUpdateComboSlot();
 	const removeSlot = useRemoveComboSlot();
 	const reorderSlots = useReorderComboSlots();
 
@@ -160,38 +216,62 @@ export function ComboSlotBuilder({ combo }: ComboSlotBuilderProps) {
 	};
 
 	const handleAddSlot = () => {
-		if (!newAccountId || !newModel.trim()) return;
+		const priority = parseComboSlotPriority(newPriority);
+		if (!newAccountId || !newModel.trim() || priority === null) return;
 		addSlot.mutate(
 			{
 				comboId: combo.id,
-				params: { account_id: newAccountId, model: newModel.trim() },
+				params: {
+					account_id: newAccountId,
+					model: newModel.trim(),
+					priority,
+				},
 			},
 			{
 				onSuccess: () => {
 					setNewAccountId("");
 					setNewModel("");
+					setNewPriority("0");
 					setShowAddForm(false);
 				},
 			},
 		);
 	};
 
+	const closeAddForm = () => {
+		setShowAddForm(false);
+		setNewAccountId("");
+		setNewModel("");
+		setNewPriority("0");
+	};
+
+	const toggleAddForm = () => {
+		if (showAddForm) {
+			closeAddForm();
+			return;
+		}
+		setNewPriority(String(getDefaultComboSlotPriority(combo.slots)));
+		setShowAddForm(true);
+	};
+
+	const parsedNewPriority = parseComboSlotPriority(newPriority);
+
 	return (
 		<Card>
 			<CardHeader className="pb-2">
 				<div className="flex items-center justify-between">
 					<CardTitle className="text-sm">Slots</CardTitle>
-					<Button
-						variant="outline"
-						size="sm"
-						onClick={() => setShowAddForm((v) => !v)}
-					>
+					<Button variant="outline" size="sm" onClick={toggleAddForm}>
 						<Plus className="mr-1 h-3 w-3" />
 						Add Slot
 					</Button>
 				</div>
 			</CardHeader>
 			<CardContent className="space-y-2">
+				<div className="rounded-md bg-muted/50 px-3 py-2 text-xs text-muted-foreground">
+					Lower-numbered tiers route first. Slots sharing a tier dynamically
+					balance by comparable quota pressure. {COMBO_REORDER_WARNING}
+				</div>
 				{assignedFamily && (
 					<div className="flex items-center gap-2 text-xs text-muted-foreground">
 						<span>Assigned to:</span>
@@ -237,23 +317,34 @@ export function ComboSlotBuilder({ combo }: ComboSlotBuilderProps) {
 								placeholder="claude-3-opus"
 							/>
 						</div>
+						<div className="space-y-1.5">
+							<Label htmlFor="new-combo-slot-priority">Priority tier</Label>
+							<Input
+								id="new-combo-slot-priority"
+								type="number"
+								min={0}
+								max={100}
+								step={1}
+								value={newPriority}
+								onChange={(event) => setNewPriority(event.target.value)}
+							/>
+							<p className="text-xs text-muted-foreground">
+								Use the same tier for accounts that should dynamically share
+								this lane.
+							</p>
+						</div>
 						<div className="flex justify-end gap-2">
-							<Button
-								variant="outline"
-								size="sm"
-								onClick={() => {
-									setShowAddForm(false);
-									setNewAccountId("");
-									setNewModel("");
-								}}
-							>
+							<Button variant="outline" size="sm" onClick={closeAddForm}>
 								Cancel
 							</Button>
 							<Button
 								size="sm"
 								onClick={handleAddSlot}
 								disabled={
-									!newAccountId || !newModel.trim() || addSlot.isPending
+									!newAccountId ||
+									!newModel.trim() ||
+									parsedNewPriority === null ||
+									addSlot.isPending
 								}
 							>
 								{addSlot.isPending ? "Adding..." : "Add"}
@@ -285,10 +376,16 @@ export function ComboSlotBuilder({ combo }: ComboSlotBuilderProps) {
 										<SortableSlotRow
 											key={slot.id}
 											slot={slot}
-											comboId={combo.id}
 											accountName={name}
 											provider={provider}
 											index={index + 1}
+											onPriorityChange={(priority) =>
+												updateSlot.mutate({
+													comboId: combo.id,
+													slotId: slot.id,
+													params: { priority },
+												})
+											}
 											onRemove={() =>
 												removeSlot.mutate({
 													comboId: combo.id,
@@ -296,6 +393,7 @@ export function ComboSlotBuilder({ combo }: ComboSlotBuilderProps) {
 												})
 											}
 											isRemoving={removeSlot.isPending}
+											isUpdatingPriority={updateSlot.isPending}
 										/>
 									);
 								})}

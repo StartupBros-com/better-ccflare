@@ -5,6 +5,7 @@ export {
 export {
 	ForceRouteUnavailableError,
 	getComboSlotInfo,
+	getRoutingCapacityContext,
 	resolveEffectiveModel,
 	selectAccountsForRequest,
 	setComboSlotInfo,
@@ -28,6 +29,13 @@ export {
 	validateProviderPath,
 } from "./request-handler";
 export { handleProxyError } from "./response-processor";
+export {
+	createModelPoolExhaustedResponse,
+	createRoutingTerminalResponse,
+	filterRequestCompatibleAccounts,
+	type RoutingTerminalKind,
+	type RoutingTerminalResult,
+} from "./routing-terminal";
 export {
 	checkAllAccountsHealth,
 	checkRefreshTokenHealth,

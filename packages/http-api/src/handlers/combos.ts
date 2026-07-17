@@ -5,6 +5,10 @@ import type {
 	ComboFamilyAssignment,
 	ComboWithSlots,
 } from "@better-ccflare/types";
+import {
+	COMBO_SLOT_PRIORITY_MAX,
+	isComboSlotPriority,
+} from "@better-ccflare/types";
 import { errorResponse } from "../utils/http-error";
 
 /**
@@ -191,7 +195,7 @@ export function createSlotAddHandler(dbOps: DatabaseOperations) {
 			}
 
 			const body = await req.json();
-			const { account_id, model } = body;
+			const { account_id, model, priority } = body;
 
 			if (
 				!account_id ||
@@ -205,8 +209,15 @@ export function createSlotAddHandler(dbOps: DatabaseOperations) {
 				return errorResponse(BadRequest("account_id and model are required"));
 			}
 
+			if (priority !== undefined && !isComboSlotPriority(priority)) {
+				return errorResponse(
+					BadRequest("priority must be an integer between 0 and 100"),
+				);
+			}
+
 			const existingSlots = await dbOps.getComboSlots(comboId);
-			const nextPriority = existingSlots.length;
+			const nextPriority =
+				priority ?? Math.min(existingSlots.length, COMBO_SLOT_PRIORITY_MAX);
 			const newSlot = await dbOps.addComboSlot(
 				comboId,
 				account_id,
@@ -225,7 +236,7 @@ export function createSlotAddHandler(dbOps: DatabaseOperations) {
 }
 
 /**
- * PUT /api/combos/:id/slots/:slotId — Update a slot's model or enabled status
+ * PUT /api/combos/:id/slots/:slotId — Update a slot's model, priority, or enabled status
  */
 export function createSlotUpdateHandler(dbOps: DatabaseOperations) {
 	return async (
@@ -235,10 +246,11 @@ export function createSlotUpdateHandler(dbOps: DatabaseOperations) {
 	): Promise<Response> => {
 		try {
 			const body = await req.json();
-			const { model, enabled } = body;
+			const { model, priority, enabled } = body;
 
 			const fields: Partial<{
 				model: string;
+				priority: number;
 				enabled: boolean;
 			}> = {};
 
@@ -254,6 +266,15 @@ export function createSlotUpdateHandler(dbOps: DatabaseOperations) {
 					return errorResponse(BadRequest("enabled must be a boolean"));
 				}
 				fields.enabled = enabled;
+			}
+
+			if (priority !== undefined) {
+				if (!isComboSlotPriority(priority)) {
+					return errorResponse(
+						BadRequest("priority must be an integer between 0 and 100"),
+					);
+				}
+				fields.priority = priority;
 			}
 
 			const updatedSlot = await dbOps.updateComboSlot(slotId, fields);

@@ -4,6 +4,7 @@ import {
 	withSanitizedProxyHeaders,
 } from "@better-ccflare/http-common";
 import { Logger } from "@better-ccflare/logger";
+import { usageCache } from "@better-ccflare/providers";
 import type {
 	Account,
 	AgentAttributionSource,
@@ -17,6 +18,7 @@ import {
 } from "./anthropic-terminal-recovery";
 import type { ProxyContext } from "./handlers";
 import { applyRateLimitCooldown } from "./handlers/rate-limit-cooldown";
+import { classifyPreByte429 } from "./handlers/rate-limit-scope";
 import { createSseRateLimitSniffer } from "./handlers/sse-rate-limit-sniffer";
 import { ingestModelsListing } from "./model-catalog";
 import {
@@ -55,6 +57,80 @@ function getMidStreamRateLimitCooldownMs(): number {
 	return (
 		Number(process.env.CCFLARE_DEFAULT_COOLDOWN_NO_RESET_MS) ||
 		TIME_CONSTANTS.DEFAULT_RATE_LIMIT_NO_RESET_COOLDOWN_MS
+	);
+}
+
+/**
+ * Scope an Anthropic `rate_limit_error` discovered only after SSE bytes have
+ * already been forwarded. A fresh, internally consistent usage snapshot can
+ * prove that the concrete attempted family alone is exhausted; everything
+ * ambiguous retains the existing account-wide cooldown.
+ *
+ * This intentionally does not replay the current stream. Once bytes have been
+ * emitted, retrying another account would splice two upstream responses into
+ * one protocol stream. The marker affects only subsequent routing decisions.
+ */
+function handleMidStreamRateLimit(
+	account: Account,
+	attemptedModel: string | null,
+	firedReason: "rate_limit_error" | "overloaded_error",
+	response: Response,
+	requestId: string,
+	ctx: ProxyContext,
+): void {
+	if (firedReason === "rate_limit_error") {
+		// Reuse the same conservative policy as a pre-byte generic 429. The SSE
+		// response itself is 200, so synthesize only the status while preserving
+		// upstream headers that may positively prove an account-wide limit.
+		const classificationResponse = new Response(null, {
+			status: 429,
+			headers: response.headers,
+		});
+		const decision = classifyPreByte429({
+			isAnthropic:
+				ctx.provider.name === "anthropic" ||
+				account.provider === "claude-oauth",
+			response: classificationResponse,
+			attemptedModel,
+			snapshot: usageCache.getSnapshot(account.id),
+		});
+		if (
+			decision.scope === "family" &&
+			decision.family !== null &&
+			decision.markerExpiresAt !== null &&
+			attemptedModel &&
+			usageCache.markFamilyScopedExhausted(
+				account.id,
+				attemptedModel,
+				decision.markerExpiresAt,
+			)
+		) {
+			log.warn("midstream_model_scoped_429", {
+				requestId,
+				accountId: account.id,
+				accountName: account.name,
+				attemptedModel,
+				family: decision.family,
+				markerExpiresAt: decision.markerExpiresAt,
+				evidenceAgeMs: decision.snapshotAgeMs,
+				accountBenched: false,
+				streamReplayed: false,
+			});
+			return;
+		}
+	}
+
+	const midStreamReason: RateLimitReason =
+		firedReason === "overloaded_error"
+			? "upstream_529_overloaded_with_reset"
+			: "upstream_429_with_reset";
+	applyRateLimitCooldown(
+		account,
+		{
+			resetTime: Date.now() + getMidStreamRateLimitCooldownMs(),
+			reason: midStreamReason,
+		},
+		ctx,
 	);
 }
 
@@ -143,6 +219,8 @@ export interface ResponseHandlerOptions {
 	cacheFlightRecorderConversationId?: RequestMeta["cacheFlightRecorderConversationId"];
 	cacheFlightRecorderEligible?: boolean;
 	cacheFlightRecorderNativeActive?: boolean;
+	/** Concrete provider model used for this final upstream attempt. */
+	attemptedModel?: string | null;
 }
 
 /**
@@ -182,6 +260,7 @@ export async function forwardToClient(
 		cacheFlightRecorderConversationId,
 		cacheFlightRecorderEligible,
 		cacheFlightRecorderNativeActive,
+		attemptedModel = null,
 	} = options;
 
 	// Record which account actually served this session's request, keyed on the
@@ -333,21 +412,17 @@ export async function forwardToClient(
 			// Mid-stream rate-limit detection. The sniffer
 			// fires exactly once; after that feed() is a no-op.
 			if (account && rateLimitSniffer?.feed(value)) {
-				// Map firedReason to the correct RateLimitReason:
-				//   "overloaded_error" → upstream_529_overloaded_with_reset
-				//   "rate_limit_error" → upstream_429_with_reset
-				const midStreamReason: RateLimitReason =
-					rateLimitSniffer.firedReason === "overloaded_error"
-						? "upstream_529_overloaded_with_reset"
-						: "upstream_429_with_reset";
-				applyRateLimitCooldown(
-					account,
-					{
-						resetTime: Date.now() + getMidStreamRateLimitCooldownMs(),
-						reason: midStreamReason,
-					},
-					ctx,
-				);
+				const firedReason = rateLimitSniffer.firedReason;
+				if (firedReason) {
+					handleMidStreamRateLimit(
+						account,
+						attemptedModel,
+						firedReason,
+						response,
+						requestId,
+						ctx,
+					);
+				}
 			}
 		};
 

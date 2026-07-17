@@ -584,6 +584,66 @@ describe("SessionStrategy", () => {
 	// -------------------------------------------------------------------------
 
 	describe("usage-balanced tiebreaking for same-priority accounts", () => {
+		it("does not select or reset a hard-excluded active session", () => {
+			const activeStart = Date.now() - 60_000;
+			const excludedActive = makeAccount({
+				id: "excluded-active",
+				name: "excluded-active",
+				priority: 0,
+				session_start: activeStart,
+				session_request_count: 4,
+			});
+			const eligible = makeAccount({
+				id: "eligible",
+				name: "eligible",
+				priority: 1,
+			});
+
+			expect(
+				strategy.select([excludedActive, eligible], {
+					...meta,
+					hardExcludedAccountIds: new Set(["excluded-active"]),
+				} as RequestMeta),
+			).toEqual([eligible]);
+			expect(excludedActive.session_start).toBe(activeStart);
+			expect(mockStore.getResetCall("excluded-active")).toBeUndefined();
+		});
+
+		it("lets comparable quota pressure outclass an active same-priority session", () => {
+			const activeStart = Date.now() - 60_000;
+			const activeCold = makeAccount({
+				id: "active-cold",
+				name: "active-cold",
+				priority: 0,
+				session_start: activeStart,
+				session_request_count: 4,
+			});
+			const critical = makeAccount({
+				id: "critical",
+				name: "critical",
+				priority: 0,
+			});
+			const pressureMeta = {
+				...meta,
+				quotaPressureByAccountId: new Map([
+					["active-cold", { band: "cold", comparisonKey: "same" }],
+					["critical", { band: "critical", comparisonKey: "same" }],
+				]),
+			} as RequestMeta;
+
+			expect(strategy.select([activeCold, critical], pressureMeta)[0]).toBe(
+				critical,
+			);
+			expect(activeCold.session_start).toBe(activeStart);
+
+			expect(
+				strategy.select([activeCold, critical], {
+					...pressureMeta,
+					hardExcludedAccountIds: new Set(["critical"]),
+				} as RequestMeta)[0],
+			).toBe(activeCold);
+		});
+
 		it("selects account with lower utilization when priorities are equal", () => {
 			const now = Date.now();
 

@@ -7,6 +7,10 @@ import type {
 	StrategyStore,
 } from "@better-ccflare/types";
 import { isPeekAvailable, wouldAutoUnpause } from "./peek-availability";
+import {
+	compareRoutingMetadata,
+	filterHardExcludedAccounts,
+} from "./routing-metadata";
 
 /**
  * Window during which a freshly-picked account is deprioritized so
@@ -87,16 +91,17 @@ export class LeastUsedStrategy implements LoadBalancingStrategy {
 		return scored[0]?.account.id ?? null;
 	}
 
-	select(accounts: Account[], _meta: RequestMeta): Account[] {
+	select(accounts: Account[], meta: RequestMeta): Account[] {
 		const now = Date.now();
+		const candidates = filterHardExcludedAccounts(accounts, meta);
 
 		// Auto-unpause eligible accounts whose upstream usage window has reset.
 		// Mirrors SessionStrategy's checkForAutoFallbackAccounts path so users
 		// who configured auto_fallback_enabled accounts get the same self-recovery
 		// behaviour regardless of which strategy they pick.
-		this.autoUnpauseElapsedAccounts(accounts, now);
+		this.autoUnpauseElapsedAccounts(candidates, now);
 
-		const available = accounts.filter((a) => isAccountAvailable(a, now));
+		const available = candidates.filter((a) => isAccountAvailable(a, now));
 		if (available.length === 0) return [];
 
 		// Score each account: priority is primary, then upstream utilization
@@ -113,9 +118,8 @@ export class LeastUsedStrategy implements LoadBalancingStrategy {
 
 		const sorted = scored
 			.sort((a, b) => {
-				if (a.account.priority !== b.account.priority) {
-					return a.account.priority - b.account.priority;
-				}
+				const routingOrder = compareRoutingMetadata(a.account, b.account, meta);
+				if (routingOrder !== 0) return routingOrder;
 				return a.score - b.score;
 			})
 			.map((s) => s.account);

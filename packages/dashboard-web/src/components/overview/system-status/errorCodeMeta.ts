@@ -32,6 +32,14 @@ const KNOWN_ERROR_META: Record<
 			"Cooldown defaults to 60s. Set `CCFLARE_DEFAULT_COOLDOWN_NO_RESET_MS` in your environment to change it.",
 		severity: "warning",
 	},
+	upstream_402_payment_required: {
+		title: "Account payment required",
+		description:
+			"The upstream provider returned 402 for this account. The proxy applies a bounded probe cooldown and fails over without disabling the account.",
+		suggestion:
+			"Restore this account's billing or credits; other eligible accounts remain available for traffic.",
+		severity: "error",
+	},
 	upstream_429_no_reset_default_5h: {
 		title: "Provider rate limit (legacy 5h ban)",
 		description:
@@ -44,6 +52,14 @@ const KNOWN_ERROR_META: Record<
 		description: "Every fallback model also returned 429.",
 		suggestion: "Wait for cooldown, or add more diverse fallback models.",
 		severity: "error",
+	},
+	model_scoped_429: {
+		title: "Model family capacity exhausted",
+		description:
+			"Fresh Anthropic usage evidence proved this 429 is limited to the attempted model family. The account remains available for other families.",
+		suggestion:
+			"No action needed — matching traffic will fail over until the scoped reset or evidence expiry, while other models continue using this account.",
+		severity: "warning",
 	},
 	upstream_529_overloaded_with_reset: {
 		title: "Provider overload",

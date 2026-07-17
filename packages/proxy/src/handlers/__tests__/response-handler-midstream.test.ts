@@ -8,8 +8,11 @@
  * headers were already sent to the client. It only prevents future requests
  * from being routed to the overloaded account until the cooldown expires.
  */
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, mock, spyOn } from "bun:test";
+import { usageCache } from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
+import { forwardToClient } from "../../response-handler";
+import * as usageCollectorModule from "../../usage-collector";
 import type { ProxyContext } from "../proxy-types";
 import { handleRateLimitResponse } from "../response-processor";
 import { createSseRateLimitSniffer } from "../sse-rate-limit-sniffer";
@@ -64,6 +67,9 @@ function makeCtxWithReason() {
 	};
 
 	const ctx = {
+		config: {
+			getStorePayloads: () => false,
+		},
 		provider: {
 			name: "anthropic",
 			isStreamingResponse: () => true,
@@ -102,6 +108,101 @@ function makeCtxWithReason() {
 	} as unknown as ProxyContext;
 
 	return { ctx, calls };
+}
+
+function setFreshScopedUsage(accountId: string, family = "Fable"): void {
+	usageCache.set(accountId, {
+		limits: [
+			{
+				kind: "session",
+				percent: 10,
+				resets_at: new Date(Date.now() + 60 * 60_000).toISOString(),
+				is_active: true,
+			},
+			{
+				kind: "weekly_all",
+				percent: 72,
+				resets_at: new Date(Date.now() + 6 * 24 * 60 * 60_000).toISOString(),
+				is_active: true,
+			},
+			{
+				kind: "weekly_scoped",
+				percent: 100,
+				resets_at: new Date(Date.now() + 60 * 60_000).toISOString(),
+				scope: { model: { id: null, display_name: family } },
+				is_active: true,
+			},
+		],
+	});
+}
+
+function midStreamErrorResponse(
+	errorType: "rate_limit_error" | "overloaded_error" = "rate_limit_error",
+	headers: HeadersInit = {},
+): Response {
+	const encoder = new TextEncoder();
+	const responseHeaders = new Headers(headers);
+	responseHeaders.set("content-type", "text/event-stream");
+	return new Response(
+		new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(
+					encoder.encode(
+						'event: content_block_delta\ndata: {"type":"content_block_delta"}\n\n',
+					),
+				);
+				controller.enqueue(
+					encoder.encode(
+						`event: error\ndata: {"type":"error","error":{"type":"${errorType}","message":"limited"}}\n\n`,
+					),
+				);
+				controller.close();
+			},
+		}),
+		{ status: 200, headers: responseHeaders },
+	);
+}
+
+async function forwardAndConsumeMidStream(
+	account: Account,
+	ctx: ProxyContext,
+	response: Response,
+	attemptedModel: string | null,
+): Promise<string> {
+	const collector = {
+		handleStart: mock(() => undefined),
+		handleChunk: mock(() => undefined),
+		handleEnd: mock(() => Promise.resolve()),
+	};
+	const collectorSpy = spyOn(
+		usageCollectorModule,
+		"getUsageCollector",
+	).mockReturnValue(
+		collector as unknown as usageCollectorModule.UsageCollector,
+	);
+	try {
+		const forwarded = await forwardToClient(
+			{
+				requestId: `req-${account.id}`,
+				method: "POST",
+				path: "/v1/messages",
+				account,
+				requestHeaders: new Headers({
+					"content-type": "application/json",
+				}),
+				requestBody: null,
+				response,
+				timestamp: Date.now(),
+				retryAttempt: 0,
+				failoverAttempts: 0,
+				attemptedModel,
+			},
+			ctx,
+		);
+		return await forwarded.text();
+	} finally {
+		collectorSpy.mockRestore();
+	}
 }
 
 describe("handleRateLimitResponse — mid-stream 529 overload", () => {
@@ -186,5 +287,92 @@ describe("production sniffer integration — overloaded_error mid-stream", () =>
 			'event: error\ndata: {"type":"error","error":{"type":"overloaded_error"}}\n\n',
 		);
 		expect(sniffer.feed(frame)).toBe(false);
+	});
+});
+
+describe("forwardToClient — model-scoped Anthropic 429 after SSE bytes", () => {
+	it("marks only the exhausted Fable family and leaves the account and Opus routable", async () => {
+		const account = makeAccount({ id: "acct-mid-fable-scoped" });
+		const { ctx, calls } = makeCtxWithReason();
+		setFreshScopedUsage(account.id);
+
+		try {
+			const body = await forwardAndConsumeMidStream(
+				account,
+				ctx,
+				midStreamErrorResponse(),
+				"claude-fable-5-20260701",
+			);
+
+			// The already-started stream is not replayed; its upstream error reaches
+			// the caller and closes normally.
+			expect(body).toContain('"type":"content_block_delta"');
+			expect(body).toContain('"type":"rate_limit_error"');
+			expect(calls.markRateLimited).toHaveLength(0);
+			expect(account.rate_limited_until).toBeNull();
+			expect(
+				usageCache.getFamilyScopedExhaustion(
+					account.id,
+					"claude-fable-5-20260701",
+				),
+			).not.toBeNull();
+			expect(
+				usageCache.getFamilyScopedExhaustion(account.id, "claude-opus-4-8"),
+			).toBeNull();
+		} finally {
+			usageCache.delete(account.id);
+		}
+	});
+
+	it("keeps ambiguous rate_limit_error evidence account-wide", async () => {
+		const account = makeAccount({ id: "acct-mid-no-usage" });
+		const { ctx, calls } = makeCtxWithReason();
+
+		try {
+			await forwardAndConsumeMidStream(
+				account,
+				ctx,
+				midStreamErrorResponse(),
+				"claude-fable-5-20260701",
+			);
+
+			expect(calls.markRateLimited).toHaveLength(1);
+			expect(calls.markRateLimited[0]?.reason).toBe("upstream_429_with_reset");
+			expect(account.rate_limited_until).not.toBeNull();
+			expect(
+				usageCache.getFamilyScopedExhaustion(
+					account.id,
+					"claude-fable-5-20260701",
+				),
+			).toBeNull();
+		} finally {
+			usageCache.delete(account.id);
+		}
+	});
+
+	it("lets a hard response header override fresh family usage evidence", async () => {
+		const account = makeAccount({ id: "acct-mid-hard-signal" });
+		const { ctx, calls } = makeCtxWithReason();
+		setFreshScopedUsage(account.id);
+
+		try {
+			await forwardAndConsumeMidStream(
+				account,
+				ctx,
+				midStreamErrorResponse("rate_limit_error", { "retry-after": "60" }),
+				"claude-fable-5-20260701",
+			);
+
+			expect(calls.markRateLimited).toHaveLength(1);
+			expect(account.rate_limited_until).not.toBeNull();
+			expect(
+				usageCache.getFamilyScopedExhaustion(
+					account.id,
+					"claude-fable-5-20260701",
+				),
+			).toBeNull();
+		} finally {
+			usageCache.delete(account.id);
+		}
 	});
 });

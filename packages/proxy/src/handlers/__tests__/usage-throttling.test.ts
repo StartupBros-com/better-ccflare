@@ -1,9 +1,12 @@
 import { describe, expect, it } from "bun:test";
 import type { Account } from "@better-ccflare/types";
 import {
+	compareQuotaPressure,
 	createUsageThrottledResponse,
+	evaluateHardCapacity,
 	getUsageThrottleStatus,
 	getUsageThrottleUntil,
+	getWeeklyQuotaPressure,
 } from "../usage-throttling";
 
 function makeAccount(overrides: Partial<Account> = {}): Account {
@@ -347,6 +350,338 @@ describe("review fixes (codex/grok/fable)", () => {
 				scopedMode: "match",
 			}),
 		).not.toBeNull();
+	});
+});
+
+describe("always-on hard capacity", () => {
+	const NOW = Date.UTC(2026, 6, 17, 12, 0, 0);
+	const OBSERVED_AT = NOW - 30_000;
+	const futureReset = new Date(NOW + 60 * 60 * 1000).toISOString();
+
+	it("blocks every model for an exhausted session or weekly-all window", () => {
+		for (const kind of ["session", "weekly_all"] as const) {
+			const result = evaluateHardCapacity(
+				{
+					limits: [{ kind, percent: 100, resets_at: futureReset, scope: null }],
+				} as never,
+				{
+					requestModel: "claude-opus-4-8",
+					observedAt: OBSERVED_AT,
+					now: NOW,
+				},
+			);
+
+			expect(result.eligible).toBe(false);
+			expect(result.exclusions).toHaveLength(1);
+			expect(result.exclusions[0]?.scope).toBe("account");
+		}
+	});
+
+	it("blocks only the matching family for an exhausted scoped window", () => {
+		const data = {
+			limits: [
+				{
+					kind: "weekly_scoped",
+					percent: 100,
+					resets_at: futureReset,
+					scope: { model: { display_name: "Fable" } },
+				},
+			],
+		} as never;
+
+		const fable = evaluateHardCapacity(data, {
+			requestModel: "claude-fable-5",
+			observedAt: OBSERVED_AT,
+			now: NOW,
+		});
+		const opus = evaluateHardCapacity(data, {
+			requestModel: "claude-opus-4-8",
+			observedAt: OBSERVED_AT,
+			now: NOW,
+		});
+
+		expect(fable.eligible).toBe(false);
+		expect(fable.exclusions[0]).toMatchObject({
+			scope: "family",
+			modelFamily: "fable",
+		});
+		expect(opus).toMatchObject({ eligible: true, exclusions: [] });
+	});
+
+	it("fails open for unrelated and unknown scoped families", () => {
+		const limits = [
+			{
+				kind: "weekly_scoped",
+				percent: 100,
+				resets_at: futureReset,
+				scope: { model: { display_name: "Fable" } },
+			},
+			{
+				kind: "weekly_scoped",
+				percent: 100,
+				resets_at: futureReset,
+				scope: { model: { display_name: "Mystery Model" } },
+			},
+		];
+
+		expect(
+			evaluateHardCapacity({ limits } as never, {
+				requestModel: "claude-opus-4-8",
+				observedAt: OBSERVED_AT,
+				now: NOW,
+			}),
+		).toMatchObject({ eligible: true, exclusions: [] });
+	});
+
+	it("ignores resets in the past", () => {
+		const result = evaluateHardCapacity(
+			{
+				limits: [
+					{
+						kind: "weekly_all",
+						percent: 100,
+						resets_at: new Date(NOW - 1).toISOString(),
+						scope: null,
+					},
+				],
+			} as never,
+			{
+				requestModel: "claude-opus-4-8",
+				observedAt: OBSERVED_AT,
+				now: NOW,
+			},
+		);
+
+		expect(result).toMatchObject({ eligible: true, exclusions: [] });
+	});
+
+	it("bounds reset-less exhaustion by snapshot freshness", () => {
+		const data = {
+			limits: [
+				{ kind: "weekly_all", percent: 100, resets_at: null, scope: null },
+			],
+		} as never;
+		const options = {
+			requestModel: "claude-opus-4-8",
+			observedAt: NOW,
+			snapshotFreshnessMs: 180_000,
+		};
+
+		expect(
+			evaluateHardCapacity(data, { ...options, now: NOW + 179_999 }),
+		).toMatchObject({ eligible: false, snapshotFresh: true });
+		expect(
+			evaluateHardCapacity(data, { ...options, now: NOW + 180_000 }),
+		).toMatchObject({ eligible: true, snapshotFresh: false });
+	});
+
+	it("ignores inactive account-wide and model-scoped limit rows", () => {
+		const data = {
+			limits: [
+				{
+					kind: "weekly_all",
+					percent: 100,
+					resets_at: futureReset,
+					is_active: false,
+					scope: null,
+				},
+				{
+					kind: "weekly_scoped",
+					percent: 100,
+					resets_at: futureReset,
+					is_active: false,
+					scope: { model: { display_name: "Fable" } },
+				},
+			],
+		} as never;
+
+		expect(
+			evaluateHardCapacity(data, {
+				requestModel: "claude-fable-5",
+				observedAt: OBSERVED_AT,
+				now: NOW,
+			}),
+		).toMatchObject({ eligible: true, exclusions: [] });
+		expect(
+			getWeeklyQuotaPressure(data, {
+				requestModel: "claude-fable-5",
+				observedAt: OBSERVED_AT,
+				provider: "anthropic",
+				billingClass: "oauth-subscription",
+				now: NOW,
+			}),
+		).toBeNull();
+	});
+});
+
+describe("model-relevant weekly quota pressure", () => {
+	const NOW = Date.UTC(2026, 6, 17, 12, 0, 0);
+	const baseOptions = {
+		requestModel: "claude-fable-5",
+		observedAt: NOW,
+		provider: "codex",
+		billingClass: "max",
+		now: NOW,
+	};
+
+	function pressureAt(rate: number) {
+		return getWeeklyQuotaPressure(
+			{
+				limits: [
+					{
+						kind: "weekly_scoped",
+						percent: 100 - rate,
+						resets_at: new Date(NOW + 60 * 60 * 1000).toISOString(),
+						scope: { model: { display_name: "Fable" } },
+					},
+				],
+			} as never,
+			baseOptions,
+		);
+	}
+
+	it("uses a matching weekly-scoped window ahead of weekly-all and session", () => {
+		const pressure = getWeeklyQuotaPressure(
+			{
+				limits: [
+					{
+						kind: "session",
+						percent: 1,
+						resets_at: new Date(NOW + 5 * 60 * 1000).toISOString(),
+						scope: null,
+					},
+					{
+						kind: "weekly_all",
+						percent: 99,
+						resets_at: new Date(NOW + 100 * 60 * 60 * 1000).toISOString(),
+						scope: null,
+					},
+					{
+						kind: "weekly_scoped",
+						percent: 80,
+						resets_at: new Date(NOW + 5 * 60 * 60 * 1000).toISOString(),
+						scope: { model: { display_name: "Fable" } },
+					},
+				],
+			} as never,
+			baseOptions,
+		);
+
+		expect(pressure).toMatchObject({
+			windowKind: "weekly_scoped",
+			modelFamily: "fable",
+			requiredBurnRate: 4,
+			band: "critical",
+			comparator: {
+				provider: "codex",
+				billingClass: "max",
+				windowKind: "weekly_scoped",
+			},
+		});
+	});
+
+	it("falls back to weekly-all when no matching scoped window exists", () => {
+		const pressure = getWeeklyQuotaPressure(
+			{
+				limits: [
+					{
+						kind: "weekly_all",
+						percent: 98,
+						resets_at: new Date(NOW + 60 * 60 * 1000).toISOString(),
+						scope: null,
+					},
+				],
+			} as never,
+			baseOptions,
+		);
+
+		expect(pressure).toMatchObject({
+			windowKind: "weekly_all",
+			requiredBurnRate: 2,
+			band: "urgent",
+		});
+	});
+
+	it("assigns the fixed pressure bands at their exact lower boundaries", () => {
+		expect(pressureAt(4)?.band).toBe("critical");
+		expect(pressureAt(2)?.band).toBe("urgent");
+		expect(pressureAt(1)?.band).toBe("hot");
+		expect(pressureAt(0.5)?.band).toBe("warm");
+		expect(pressureAt(0.25)?.band).toBe("steady");
+		expect(pressureAt(0.2)?.band).toBe("cold");
+	});
+
+	it("returns no pressure for stale snapshots, past resets, or exhausted lanes", () => {
+		const data = {
+			limits: [
+				{
+					kind: "weekly_all",
+					percent: 100,
+					resets_at: new Date(NOW + 60 * 60 * 1000).toISOString(),
+					scope: null,
+				},
+			],
+		} as never;
+		expect(getWeeklyQuotaPressure(data, baseOptions)).toBeNull();
+		expect(
+			getWeeklyQuotaPressure(data, {
+				...baseOptions,
+				observedAt: NOW - 180_001,
+				snapshotFreshnessMs: 180_000,
+			}),
+		).toBeNull();
+		expect(
+			getWeeklyQuotaPressure(
+				{
+					limits: [
+						{
+							kind: "weekly_all",
+							percent: 50,
+							resets_at: new Date(NOW - 1).toISOString(),
+							scope: null,
+						},
+					],
+				} as never,
+				baseOptions,
+			),
+		).toBeNull();
+	});
+
+	it("compares only matching provider, billing class, and weekly window kind", () => {
+		const critical = pressureAt(4);
+		const urgent = pressureAt(2);
+		expect(compareQuotaPressure(critical, urgent)).toBe(1);
+		expect(compareQuotaPressure(urgent, critical)).toBe(-1);
+		expect(compareQuotaPressure(critical, pressureAt(5))).toBe(0);
+
+		const data = {
+			limits: [
+				{
+					kind: "weekly_all",
+					percent: 96,
+					resets_at: new Date(NOW + 60 * 60 * 1000).toISOString(),
+					scope: null,
+				},
+			],
+		} as never;
+		const otherWindow = getWeeklyQuotaPressure(data, baseOptions);
+		const otherProvider = getWeeklyQuotaPressure(data, {
+			...baseOptions,
+			provider: "anthropic",
+		});
+		const otherBilling = getWeeklyQuotaPressure(data, {
+			...baseOptions,
+			billingClass: "pro",
+		});
+		const unknownBilling = getWeeklyQuotaPressure(data, {
+			...baseOptions,
+			billingClass: null,
+		});
+
+		expect(compareQuotaPressure(critical, otherWindow)).toBeNull();
+		expect(compareQuotaPressure(otherWindow, otherProvider)).toBeNull();
+		expect(compareQuotaPressure(otherWindow, otherBilling)).toBeNull();
+		expect(compareQuotaPressure(unknownBilling, unknownBilling)).toBeNull();
 	});
 });
 

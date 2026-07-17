@@ -159,6 +159,87 @@ describe("handleResponsesRequest", () => {
 		expect(resp.status).toBe(429);
 	});
 
+	test("preserves stable routing error codes and only finite pool recovery headers", async () => {
+		const request = () =>
+			new Request("http://localhost/v1/responses", {
+				method: "POST",
+				body: JSON.stringify({
+					model: "claude-fable-4-5",
+					input: "Hi",
+				}),
+				headers: { "Content-Type": "application/json" },
+			});
+
+		const poolResp = await handleResponsesRequest(
+			request(),
+			new URL("http://localhost/v1/responses"),
+			async () =>
+				new Response(
+					JSON.stringify({
+						type: "error",
+						error: {
+							type: "pool_exhausted",
+							code: "pool_exhausted",
+							message: "Temporarily unavailable",
+							next_available_at: "2026-07-17T12:01:00.000Z",
+						},
+					}),
+					{
+						status: 503,
+						headers: {
+							"content-type": "application/json",
+							"retry-after": "60",
+							"x-better-ccflare-pool-status": "exhausted",
+						},
+					},
+				),
+			{},
+		);
+		const poolBody = (await poolResp.json()) as {
+			error: { type: string; code: string };
+		};
+		expect(poolBody.error.type).toBe("pool_exhausted");
+		expect(poolBody.error.code).toBe("pool_exhausted");
+		expect(poolResp.headers.get("retry-after")).toBe("60");
+		expect(poolResp.headers.get("x-better-ccflare-pool-status")).toBe(
+			"exhausted",
+		);
+
+		const modelResp = await handleResponsesRequest(
+			request(),
+			new URL("http://localhost/v1/responses"),
+			async () =>
+				new Response(
+					JSON.stringify({
+						type: "error",
+						error: {
+							type: "service_unavailable",
+							code: "model_pool_exhausted",
+							message: "Fable exhausted",
+						},
+					}),
+					{
+						status: 503,
+						headers: {
+							"content-type": "application/json",
+							// Malicious/accidental upstream headers must not make a
+							// model-only terminal look like whole-pool recovery.
+							"retry-after": "60",
+							"x-better-ccflare-pool-status": "exhausted",
+						},
+					},
+				),
+			{},
+		);
+		const modelBody = (await modelResp.json()) as {
+			error: { type: string; code: string };
+		};
+		expect(modelBody.error.type).toBe("service_unavailable");
+		expect(modelBody.error.code).toBe("model_pool_exhausted");
+		expect(modelResp.headers.get("retry-after")).toBeNull();
+		expect(modelResp.headers.get("x-better-ccflare-pool-status")).toBeNull();
+	});
+
 	test("Test 4: streaming path → returns a text/event-stream response", async () => {
 		const sseBody =
 			"event: message_start\ndata: " +

@@ -6,8 +6,11 @@ export type RateLimitReason =
 	 *  value for history. */
 	| "upstream_429_no_reset_default_5h"
 	| "upstream_429_no_reset_probe_cooldown"
+	| "upstream_402_payment_required"
 	| "model_fallback_429"
 	| "all_models_exhausted_429"
+	/** Fresh usage proves a generic Anthropic 429 is isolated to one model family. */
+	| "model_scoped_429"
 	/** Anthropic 529 overloaded_error with a Retry-After reset time. */
 	| "upstream_529_overloaded_with_reset"
 	/** Anthropic 529 overloaded_error with no Retry-After header; probe cooldown applied. */

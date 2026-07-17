@@ -1,5 +1,9 @@
 import { getModelDisplayName } from "@better-ccflare/core";
-import type { AgentUpdatePayload } from "@better-ccflare/types";
+import type {
+	AgentUpdatePayload,
+	ComboSlotCreateInput,
+	ComboSlotUpdateInput,
+} from "@better-ccflare/types";
 import { COMMON_MODELS } from "@better-ccflare/types";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type RequestPayload, type RequestSummary } from "../api";
@@ -605,7 +609,7 @@ export const useAddComboSlot = () => {
 			params,
 		}: {
 			comboId: string;
-			params: { account_id: string; model: string; enabled?: boolean };
+			params: ComboSlotCreateInput;
 		}) => api.addComboSlot(comboId, params),
 		onSuccess: (_data, { comboId }) => {
 			queryClient.invalidateQueries({ queryKey: queryKeys.combos() });
@@ -624,7 +628,7 @@ export const useUpdateComboSlot = () => {
 		}: {
 			comboId: string;
 			slotId: string;
-			params: { model?: string; enabled?: boolean };
+			params: ComboSlotUpdateInput;
 		}) => api.updateComboSlot(comboId, slotId, params),
 		onSuccess: (_data, { comboId }) => {
 			queryClient.invalidateQueries({ queryKey: queryKeys.combos() });

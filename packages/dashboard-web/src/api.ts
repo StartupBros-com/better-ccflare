@@ -13,6 +13,8 @@ import type {
 	Combo,
 	ComboFamilyAssignment,
 	ComboSlot,
+	ComboSlotCreateInput,
+	ComboSlotUpdateInput,
 	ComboWithSlots,
 	ContextInsightsResponse,
 	LogEvent,
@@ -2047,7 +2049,7 @@ class API extends HttpClient {
 
 	async addComboSlot(
 		comboId: string,
-		params: { account_id: string; model: string; enabled?: boolean },
+		params: ComboSlotCreateInput,
 	): Promise<{ slot: ComboSlot }> {
 		const res = await this.post<{ success: boolean; data: ComboSlot }>(
 			`/api/combos/${comboId}/slots`,
@@ -2059,7 +2061,7 @@ class API extends HttpClient {
 	async updateComboSlot(
 		comboId: string,
 		slotId: string,
-		params: { model?: string; enabled?: boolean },
+		params: ComboSlotUpdateInput,
 	): Promise<{ slot: ComboSlot }> {
 		const res = await this.put<{ success: boolean; data: ComboSlot }>(
 			`/api/combos/${comboId}/slots/${slotId}`,

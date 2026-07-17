@@ -1,4 +1,5 @@
-import { describe, expect, it, mock } from "bun:test";
+import { afterEach, describe, expect, it, mock } from "bun:test";
+import { usageCache } from "@better-ccflare/providers";
 import type {
 	Account,
 	ComboWithSlots,
@@ -8,6 +9,8 @@ import { CacheAffinityOrderer } from "../../cache-affinity-orderer";
 import {
 	ForceRouteUnavailableError,
 	getComboSlotInfo,
+	getReactiveModelCapacityBlocker,
+	getRoutingCapacityContext,
 	resolveEffectiveModel,
 	selectAccountsForRequest,
 	setComboSlotInfo,
@@ -88,6 +91,18 @@ function makeCtx(
 	} as unknown as ProxyContext;
 }
 
+const cachedUsageAccountIds = new Set<string>();
+
+function cacheUsage(accountId: string, data: unknown): void {
+	usageCache.set(accountId, data as never);
+	cachedUsageAccountIds.add(accountId);
+}
+
+afterEach(() => {
+	for (const accountId of cachedUsageAccountIds) usageCache.delete(accountId);
+	cachedUsageAccountIds.clear();
+});
+
 // ── setComboSlotInfo / getComboSlotInfo ───────────────────────────────────────
 
 describe("setComboSlotInfo / getComboSlotInfo", () => {
@@ -133,20 +148,21 @@ describe("selectAccountsForRequest — x-better-ccflare-account-id header", () =
 		expect(result[0]?.id).toBe("acc-2");
 	});
 
-	it("falls through to normal selection when forced account id is not found", async () => {
+	it("fails closed when the forced account id is not found", async () => {
 		const acc = makeAccount({ id: "acc-1" });
 		const ctx = makeCtx({ accounts: [acc] });
 		const meta = makeRequestMeta({
 			headers: new Headers({ "x-better-ccflare-account-id": "nonexistent" }),
 		});
 
-		const result = await selectAccountsForRequest(meta, ctx);
-		// Falls back to strategy.select result
-		expect(result).toHaveLength(1);
-		expect(result[0]?.id).toBe("acc-1");
+		await expect(selectAccountsForRequest(meta, ctx)).rejects.toMatchObject({
+			accountId: "nonexistent",
+			reason: "not_found",
+		});
+		expect(ctx.strategy.select).not.toHaveBeenCalled();
 	});
 
-	it("falls through to normal selection when forced account is paused", async () => {
+	it("fails closed when the forced account is paused", async () => {
 		const pausedAcc = makeAccount({
 			id: "acc-paused",
 			name: "paused",
@@ -168,13 +184,14 @@ describe("selectAccountsForRequest — x-better-ccflare-account-id header", () =
 			headers: new Headers({ "x-better-ccflare-account-id": "acc-paused" }),
 		});
 
-		const result = await selectAccountsForRequest(meta, ctx);
-		// Paused forced account is skipped; falls back to strategy.select which returns activeAcc
-		expect(result).toHaveLength(1);
-		expect(result[0]?.id).toBe("acc-active");
+		await expect(selectAccountsForRequest(meta, ctx)).rejects.toMatchObject({
+			accountId: "acc-paused",
+			reason: "paused",
+		});
+		expect(ctx.strategy.select).not.toHaveBeenCalled();
 	});
 
-	it("falls through to normal selection when forced account is rate-limited", async () => {
+	it("fails closed when the forced account is rate-limited", async () => {
 		const rateLimitedAcc = makeAccount({
 			id: "acc-rl",
 			name: "rate-limited",
@@ -196,10 +213,30 @@ describe("selectAccountsForRequest — x-better-ccflare-account-id header", () =
 			headers: new Headers({ "x-better-ccflare-account-id": "acc-rl" }),
 		});
 
-		const result = await selectAccountsForRequest(meta, ctx);
-		// Rate-limited forced account is skipped; falls back to strategy.select which returns activeAcc
-		expect(result).toHaveLength(1);
-		expect(result[0]?.id).toBe("acc-active");
+		await expect(selectAccountsForRequest(meta, ctx)).rejects.toMatchObject({
+			accountId: "acc-rl",
+			reason: "rate_limited_or_unavailable",
+		});
+		expect(ctx.strategy.select).not.toHaveBeenCalled();
+	});
+
+	it("fails closed when the forced-account database lookup fails", async () => {
+		const active = makeAccount({ id: "acc-active" });
+		const ctx = makeCtx({ accounts: [active] });
+		ctx.dbOps.getAllAccounts = mock(async () => {
+			throw new Error("database offline");
+		});
+		const meta = makeRequestMeta({
+			headers: new Headers({
+				"x-better-ccflare-account-id": "acc-forced",
+			}),
+		});
+
+		await expect(selectAccountsForRequest(meta, ctx)).rejects.toMatchObject({
+			accountId: "acc-forced",
+			reason: "lookup_failed",
+		});
+		expect(ctx.strategy.select).not.toHaveBeenCalled();
 	});
 });
 
@@ -234,7 +271,7 @@ describe("selectAccountsForRequest — Grok cache-native ownership", () => {
 		expect(second[0]?.id).toBe("xai-a");
 	});
 
-	it("keeps combo account and model slots aligned after affinity ordering", async () => {
+	it("replaces combo ownership when a better slot tier becomes routable", async () => {
 		const a = makeAccount({ id: "xai-a", provider: "xai" });
 		const b = makeAccount({ id: "xai-b", provider: "xai" });
 		const ctx = makeCtx({
@@ -297,10 +334,114 @@ describe("selectAccountsForRequest — Grok cache-native ownership", () => {
 			"claude-sonnet-4-5",
 		);
 
-		expect(result.map((account) => account.id)).toEqual(["xai-a", "xai-b"]);
+		expect(result.map((account) => account.id)).toEqual(["xai-b", "xai-a"]);
 		expect(getComboSlotInfo(meta)?.slots).toEqual([
-			{ accountId: "xai-a", modelOverride: "grok-a" },
-			{ accountId: "xai-b", modelOverride: "grok-b" },
+			{
+				accountId: "xai-b",
+				modelOverride: "grok-b",
+			},
+			{
+				accountId: "xai-a",
+				modelOverride: "grok-a",
+			},
+		]);
+		expect(
+			meta.routingCandidates?.map(
+				({ comboSlotId, accountId, modelOverride, tier, ordinal }) => ({
+					comboSlotId,
+					accountId,
+					modelOverride,
+					tier,
+					ordinal,
+				}),
+			),
+		).toEqual([
+			{
+				comboSlotId: "slot-b",
+				accountId: "xai-b",
+				modelOverride: "grok-b",
+				tier: 0,
+				ordinal: 0,
+			},
+			{
+				comboSlotId: "slot-a",
+				accountId: "xai-a",
+				modelOverride: "grok-a",
+				tier: 1,
+				ordinal: 1,
+			},
+		]);
+	});
+
+	it("reorders repeated-account xAI slots atomically by slot identity", async () => {
+		const account = makeAccount({ id: "xai-a", provider: "xai" });
+		const initialCombo = makeCombo([
+			{
+				id: "slot-opus",
+				combo_id: "combo-1",
+				account_id: account.id,
+				model: "claude-opus-4-8",
+				priority: 0,
+				enabled: true,
+			},
+			{
+				id: "slot-fable",
+				combo_id: "combo-1",
+				account_id: account.id,
+				model: "claude-fable-5",
+				priority: 0,
+				enabled: true,
+			},
+		]);
+		const ctx = makeCtx({ accounts: [account], activeCombo: initialCombo });
+		ctx.cacheAffinityOrderer = new CacheAffinityOrderer(60_000);
+		const affinity = {
+			xaiCacheNativeActive: true,
+			cacheAffinityKey: "repeated-slot-conversation",
+		};
+
+		await selectAccountsForRequest(
+			makeRequestMeta(affinity),
+			ctx,
+			"claude-sonnet-4-5",
+		);
+		(
+			ctx.dbOps.getActiveComboForFamily as ReturnType<typeof mock>
+		).mockImplementation(async () =>
+			makeCombo([initialCombo.slots[1], initialCombo.slots[0]]),
+		);
+		const meta = makeRequestMeta(affinity);
+		const result = await selectAccountsForRequest(
+			meta,
+			ctx,
+			"claude-sonnet-4-5",
+		);
+
+		expect(result.map((entry) => entry.id)).toEqual([account.id, account.id]);
+		expect(getComboSlotInfo(meta)?.slots).toEqual([
+			{ accountId: account.id, modelOverride: "claude-opus-4-8" },
+			{ accountId: account.id, modelOverride: "claude-fable-5" },
+		]);
+		expect(
+			meta.routingCandidates?.map((candidate) => ({
+				comboSlotId: candidate.comboSlotId,
+				modelOverride: candidate.modelOverride,
+				tier: candidate.tier,
+				ordinal: candidate.ordinal,
+			})),
+		).toEqual([
+			{
+				comboSlotId: "slot-opus",
+				modelOverride: "claude-opus-4-8",
+				tier: 0,
+				ordinal: 1,
+			},
+			{
+				comboSlotId: "slot-fable",
+				modelOverride: "claude-fable-5",
+				tier: 0,
+				ordinal: 0,
+			},
 		]);
 	});
 });
@@ -337,7 +478,7 @@ describe("selectAccountsForRequest — Grok cache-native force-route fail-closed
 		);
 	});
 
-	it("still falls back for an unavailable custom-endpoint xAI account", async () => {
+	it("fails closed for an unavailable custom-endpoint xAI account", async () => {
 		const customAcc = makeAccount({
 			id: "acc-custom",
 			name: "custom",
@@ -362,11 +503,14 @@ describe("selectAccountsForRequest — Grok cache-native force-route fail-closed
 			}),
 		});
 
-		const result = await selectAccountsForRequest(meta, ctx);
-		expect(result[0]?.id).toBe("acc-active");
+		await expect(selectAccountsForRequest(meta, ctx)).rejects.toMatchObject({
+			accountId: "acc-custom",
+			reason: "paused",
+		});
+		expect(ctx.strategy.select).not.toHaveBeenCalled();
 	});
 
-	it("still falls back for an unavailable non-xAI account", async () => {
+	it("fails closed for an unavailable non-xAI account", async () => {
 		const pausedAcc = makeAccount({
 			id: "acc-paused",
 			provider: "codex",
@@ -387,11 +531,14 @@ describe("selectAccountsForRequest — Grok cache-native force-route fail-closed
 			headers: new Headers({ "x-better-ccflare-account-id": "acc-paused" }),
 		});
 
-		const result = await selectAccountsForRequest(meta, ctx);
-		expect(result[0]?.id).toBe("acc-active");
+		await expect(selectAccountsForRequest(meta, ctx)).rejects.toMatchObject({
+			accountId: "acc-paused",
+			reason: "paused",
+		});
+		expect(ctx.strategy.select).not.toHaveBeenCalled();
 	});
 
-	it("still allows scheduler bypass for an official xAI account", async () => {
+	it("still allows an authenticated scheduler probe for an official xAI account", async () => {
 		const rateLimitedAcc = makeAccount({
 			id: "acc-rl",
 			provider: "xai",
@@ -401,6 +548,7 @@ describe("selectAccountsForRequest — Grok cache-native force-route fail-closed
 		const ctx = makeCtx({ accounts: [rateLimitedAcc, activeAcc] });
 		const meta = makeRequestMeta({
 			xaiCacheNativeActive: true,
+			trustedInternalAutoRefresh: true,
 			headers: new Headers({
 				"x-better-ccflare-account-id": "acc-rl",
 				"x-better-ccflare-bypass-session": "true",
@@ -411,7 +559,7 @@ describe("selectAccountsForRequest — Grok cache-native force-route fail-closed
 		expect(result).toEqual([rateLimitedAcc]);
 	});
 
-	it("still falls back when feature is off", async () => {
+	it("remains fail-closed when the cache-native feature is off", async () => {
 		const pausedAcc = makeAccount({
 			id: "acc-paused",
 			name: "paused",
@@ -437,8 +585,11 @@ describe("selectAccountsForRequest — Grok cache-native force-route fail-closed
 			xaiCacheNativeActive: false,
 			headers: new Headers({ "x-better-ccflare-account-id": "acc-paused" }),
 		});
-		const result = await selectAccountsForRequest(meta, ctx);
-		expect(result[0]?.id).toBe("acc-active");
+		await expect(selectAccountsForRequest(meta, ctx)).rejects.toMatchObject({
+			accountId: "acc-paused",
+			reason: "paused",
+		});
+		expect(ctx.strategy.select).not.toHaveBeenCalled();
 	});
 });
 
@@ -522,6 +673,49 @@ describe("selectAccountsForRequest — combo routing", () => {
 
 		await selectAccountsForRequest(meta, ctx, "claude-haiku-4-5");
 		expect((meta as any).comboName).toBe("Test Combo");
+	});
+
+	it("performs one combo pass, then an explicit normal fallback without stale sidecar metadata", async () => {
+		const comboAccount = makeAccount({ id: "acc-combo" });
+		const normalAccount = makeAccount({ id: "acc-normal" });
+		const combo = makeCombo([
+			{
+				id: "slot-1",
+				combo_id: "combo-1",
+				account_id: comboAccount.id,
+				model: "claude-opus-4-5",
+				priority: 0,
+				enabled: true,
+			},
+		]);
+		const ctx = makeCtx({
+			accounts: [comboAccount, normalAccount],
+			activeCombo: combo,
+		});
+		ctx.strategy.select = mock(() => [normalAccount]);
+		const meta = makeRequestMeta();
+
+		expect(
+			(await selectAccountsForRequest(meta, ctx, "claude-opus-4-5")).map(
+				(account) => account.id,
+			),
+		).toEqual([comboAccount.id]);
+		expect(getComboSlotInfo(meta)?.comboName).toBe("Test Combo");
+		meta.comboSlotIndex = 3;
+
+		const fallback = await selectAccountsForRequest(
+			meta,
+			ctx,
+			"claude-opus-4-5",
+			{ skipCombo: true },
+		);
+
+		expect(fallback.map((account) => account.id)).toEqual([normalAccount.id]);
+		expect(ctx.dbOps.getActiveComboForFamily).toHaveBeenCalledTimes(1);
+		expect(ctx.strategy.select).toHaveBeenCalledTimes(1);
+		expect(getComboSlotInfo(meta)).toBeNull();
+		expect(meta.comboName).toBeNull();
+		expect(meta.comboSlotIndex).toBeNull();
 	});
 
 	it("skips disabled slots", async () => {
@@ -675,14 +869,13 @@ describe("selectAccountsForRequest — combo routing", () => {
 
 // ── selectAccountsForRequest — auto-refresh bypass for overage-paused accounts ─
 
-describe("selectAccountsForRequest — auto-refresh bypass (overage-paused accounts)", () => {
+describe("selectAccountsForRequest — trusted auto-refresh bypass", () => {
 	/**
 	 * The auto-refresh scheduler intentionally refreshes accounts that are paused
-	 * due to auto_pause_on_overage. It sends x-better-ccflare-bypass-session: true
-	 * alongside x-better-ccflare-account-id. The selector must allow these through
-	 * so the scheduler can hit the real endpoint and trigger auto-resume.
+	 * due to auto_pause_on_overage. Only the authenticated in-process credential,
+	 * not caller-controlled routing hints, may grant that narrow exception.
 	 */
-	it("allows overage-paused account when bypass-session header is present", async () => {
+	it("rejects spoofed public auto-refresh headers for an overage-paused account", async () => {
 		const overagePausedAcc = makeAccount({
 			id: "acc-overage",
 			name: "overage-paused",
@@ -705,16 +898,38 @@ describe("selectAccountsForRequest — auto-refresh bypass (overage-paused accou
 			headers: new Headers({
 				"x-better-ccflare-account-id": "acc-overage",
 				"x-better-ccflare-bypass-session": "true",
+				"x-better-ccflare-auto-refresh": "true",
 			}),
 		});
 
-		const result = await selectAccountsForRequest(meta, ctx);
-		// Overage-paused account must be returned directly — bypass-session overrides the guard
-		expect(result).toHaveLength(1);
-		expect(result[0]?.id).toBe("acc-overage");
+		await expect(selectAccountsForRequest(meta, ctx)).rejects.toMatchObject({
+			accountId: "acc-overage",
+			reason: "paused",
+		});
 	});
 
-	it("still blocks overage-paused account without the bypass-session header", async () => {
+	it("allows an authenticated internal probe through an overage pause", async () => {
+		const overagePausedAcc = makeAccount({
+			id: "acc-overage",
+			paused: true,
+			auto_pause_on_overage_enabled: true,
+			pause_reason: "overage",
+		});
+		const ctx = makeCtx({ accounts: [overagePausedAcc] });
+		const meta = makeRequestMeta({
+			headers: new Headers({
+				"x-better-ccflare-account-id": "acc-overage",
+				"x-better-ccflare-bypass-session": "true",
+				"x-better-ccflare-auto-refresh": "true",
+			}),
+			trustedInternalAutoRefresh: true,
+		});
+
+		const result = await selectAccountsForRequest(meta, ctx);
+		expect(result).toEqual([overagePausedAcc]);
+	});
+
+	it("blocks an overage-paused account without trusted internal authentication", async () => {
 		const overagePausedAcc = makeAccount({
 			id: "acc-overage",
 			name: "overage-paused",
@@ -735,17 +950,18 @@ describe("selectAccountsForRequest — auto-refresh bypass (overage-paused accou
 		const meta = makeRequestMeta({
 			headers: new Headers({
 				"x-better-ccflare-account-id": "acc-overage",
-				// No bypass-session header — normal user traffic should still be blocked
+				// Public traffic has no trustedInternalAutoRefresh bit.
 			}),
 		});
 
-		const result = await selectAccountsForRequest(meta, ctx);
-		// Without bypass header the account is unavailable; falls back to strategy
-		expect(result).toHaveLength(1);
-		expect(result[0]?.id).toBe("acc-active");
+		await expect(selectAccountsForRequest(meta, ctx)).rejects.toMatchObject({
+			accountId: "acc-overage",
+			reason: "paused",
+		});
+		expect(ctx.strategy.select).not.toHaveBeenCalled();
 	});
 
-	it("blocks manually-paused overage-enabled account even with bypass-session header", async () => {
+	it("blocks a manually-paused account even for an authenticated internal probe", async () => {
 		// A manual pause must win even when auto_pause_on_overage_enabled is set:
 		// the auto-resume guard would never un-pause it, so admitting it on a
 		// bypass-session force-route just produces an endless probe loop. Mirrors
@@ -773,15 +989,17 @@ describe("selectAccountsForRequest — auto-refresh bypass (overage-paused accou
 				"x-better-ccflare-account-id": "acc-manual",
 				"x-better-ccflare-bypass-session": "true",
 			}),
+			trustedInternalAutoRefresh: true,
 		});
 
-		const result = await selectAccountsForRequest(meta, ctx);
-		// Manual pause is not overage → not allowed through; falls back to strategy
-		expect(result).toHaveLength(1);
-		expect(result[0]?.id).toBe("acc-active");
+		await expect(selectAccountsForRequest(meta, ctx)).rejects.toMatchObject({
+			accountId: "acc-manual",
+			reason: "paused",
+		});
+		expect(ctx.strategy.select).not.toHaveBeenCalled();
 	});
 
-	it("allows rate-limited (non-paused) account when bypass-session header is present", async () => {
+	it("allows an authenticated internal probe through an account cooldown", async () => {
 		// The scheduler probes rate-limited accounts to detect when the window has reset.
 		// Without this fix the account selector falls through to SessionStrategy and routes
 		// to a *different* account, corrupting the intended account's rate_limit_reset row.
@@ -807,6 +1025,7 @@ describe("selectAccountsForRequest — auto-refresh bypass (overage-paused accou
 				"x-better-ccflare-account-id": "acc-rl",
 				"x-better-ccflare-bypass-session": "true",
 			}),
+			trustedInternalAutoRefresh: true,
 		});
 
 		const result = await selectAccountsForRequest(meta, ctx);
@@ -815,7 +1034,7 @@ describe("selectAccountsForRequest — auto-refresh bypass (overage-paused accou
 		expect(result[0]?.id).toBe("acc-rl");
 	});
 
-	it("blocks failure-paused account even with bypass-session header", async () => {
+	it("blocks a failure-paused account even for an authenticated internal probe", async () => {
 		// A failure-paused account: paused=true, auto_pause_on_overage_enabled=false
 		const failurePausedAcc = makeAccount({
 			id: "acc-broken",
@@ -839,12 +1058,14 @@ describe("selectAccountsForRequest — auto-refresh bypass (overage-paused accou
 				"x-better-ccflare-account-id": "acc-broken",
 				"x-better-ccflare-bypass-session": "true",
 			}),
+			trustedInternalAutoRefresh: true,
 		});
 
-		const result = await selectAccountsForRequest(meta, ctx);
-		// Failure-paused accounts must NOT be bypassed — the endpoint is broken
-		expect(result).toHaveLength(1);
-		expect(result[0]?.id).toBe("acc-active");
+		await expect(selectAccountsForRequest(meta, ctx)).rejects.toMatchObject({
+			accountId: "acc-broken",
+			reason: "paused",
+		});
+		expect(ctx.strategy.select).not.toHaveBeenCalled();
 	});
 });
 
@@ -952,5 +1173,657 @@ describe("selectAccountsForRequest — routes on effective model, not the client
 		const slotInfo = getComboSlotInfo(meta);
 		expect(slotInfo?.comboName).toBe("Test Combo");
 		expect(slotInfo?.slots[0]?.modelOverride).toBe("claude-opus-4-5");
+	});
+});
+
+// ── model-lane capacity planning ─────────────────────────────────────────────
+
+describe("selectAccountsForRequest — model-lane hard capacity", () => {
+	function weeklyScoped(
+		displayName: string | null,
+		percent = 100,
+		resetAt = Date.now() + 60 * 60 * 1000,
+	) {
+		return {
+			limits: [
+				{
+					kind: "weekly_scoped",
+					percent,
+					resets_at: new Date(resetAt).toISOString(),
+					scope:
+						displayName === null
+							? null
+							: {
+									model: { id: null, display_name: displayName },
+									surface: null,
+								},
+				},
+			],
+		};
+	}
+
+	it("excludes a Fable-full account before strategy selection but keeps it eligible for Opus", async () => {
+		const preferred = makeAccount({ id: "capacity-preferred", priority: 0 });
+		const fallback = makeAccount({ id: "capacity-fallback", priority: 1 });
+		cacheUsage(preferred.id, weeklyScoped("Fable"));
+
+		const strategy = mock((_accounts: Account[]) => [preferred, fallback]);
+		const ctx = makeCtx({ accounts: [preferred, fallback] });
+		ctx.strategy.select = strategy;
+		const fableMeta = makeRequestMeta({ clientSessionId: "conversation-1" });
+
+		const fable = await selectAccountsForRequest(
+			fableMeta,
+			ctx,
+			"claude-fable-5",
+		);
+		const candidatesSeenByStrategy = strategy.mock.calls[0]?.[0] as Account[];
+		expect(candidatesSeenByStrategy.map((account) => account.id)).toEqual([
+			fallback.id,
+		]);
+		// Defensive filtering still wins if a strategy returns an account that was
+		// not present in its candidate input.
+		expect(fable.map((account) => account.id)).toEqual([fallback.id]);
+		expect(fableMeta.hardExcludedAccountIds?.has(preferred.id)).toBe(true);
+		expect(fableMeta.routingCandidateCatalog).toMatchObject([
+			{ accountId: preferred.id, tier: 0, comboSlotId: null },
+			{ accountId: fallback.id, tier: 1, comboSlotId: null },
+		]);
+
+		const context = getRoutingCapacityContext(fableMeta);
+		expect(context?.effectiveModel).toBe("claude-fable-5");
+		expect(context?.exclusions).toHaveLength(1);
+		expect(context?.exclusions[0]?.accountId).toBe(preferred.id);
+		expect(context?.exclusions[0]?.modelFamily).toBe("fable");
+		expect(context?.exclusions[0]?.exclusions[0]?.scope).toBe("family");
+		expect(context?.blockedUntil).toBeGreaterThan(Date.now());
+
+		strategy.mockClear();
+		strategy.mockImplementation((_accounts: Account[]) => [
+			preferred,
+			fallback,
+		]);
+		const opus = await selectAccountsForRequest(
+			makeRequestMeta({ clientSessionId: "conversation-1" }),
+			ctx,
+			"claude-opus-4-8",
+		);
+		expect(opus.map((account) => account.id)).toEqual([
+			preferred.id,
+			fallback.id,
+		]);
+		expect(
+			((strategy.mock.calls[0]?.[0] ?? []) as Account[]).map(
+				(account) => account.id,
+			),
+		).toEqual([preferred.id, fallback.id]);
+	});
+
+	it("fails open for a 100% weekly-scoped cap whose family is unknown", async () => {
+		const account = makeAccount({ id: "capacity-unknown-scope" });
+		cacheUsage(account.id, weeklyScoped(null));
+		const ctx = makeCtx({ accounts: [account] });
+
+		const result = await selectAccountsForRequest(
+			makeRequestMeta(),
+			ctx,
+			"claude-fable-5",
+		);
+
+		expect(result).toEqual([account]);
+	});
+
+	it("fails a forced exhausted model lane closed without substituting another account", async () => {
+		const forced = makeAccount({ id: "forced-capacity" });
+		const substitute = makeAccount({ id: "forced-substitute" });
+		cacheUsage(forced.id, weeklyScoped("Fable"));
+		const ctx = makeCtx({ accounts: [forced, substitute] });
+		const meta = makeRequestMeta({
+			headers: new Headers({
+				"x-better-ccflare-account-id": forced.id,
+			}),
+		});
+
+		try {
+			await selectAccountsForRequest(meta, ctx, "claude-fable-5");
+			expect.unreachable("expected force-route capacity failure");
+		} catch (error) {
+			expect(error).toBeInstanceOf(ForceRouteUnavailableError);
+			expect((error as ForceRouteUnavailableError).accountId).toBe(forced.id);
+			expect((error as ForceRouteUnavailableError).reason).toBe(
+				"model_capacity_exhausted",
+			);
+		}
+		expect(ctx.strategy.select).not.toHaveBeenCalled();
+		expect(getRoutingCapacityContext(meta)?.exclusions[0]?.accountId).toBe(
+			forced.id,
+		);
+
+		const opus = await selectAccountsForRequest(
+			makeRequestMeta({
+				headers: new Headers({
+					"x-better-ccflare-account-id": forced.id,
+				}),
+			}),
+			ctx,
+			"claude-opus-4-8",
+		);
+		expect(opus).toEqual([forced]);
+	});
+
+	it("still enforces hard model capacity for an authenticated internal probe", async () => {
+		const forced = makeAccount({
+			id: "forced-refresh-capacity",
+			paused: true,
+			auto_pause_on_overage_enabled: true,
+			pause_reason: "overage",
+		});
+		cacheUsage(forced.id, weeklyScoped("Fable"));
+		const ctx = makeCtx({ accounts: [forced] });
+		const meta = makeRequestMeta({
+			headers: new Headers({
+				"x-better-ccflare-account-id": forced.id,
+				"x-better-ccflare-bypass-session": "true",
+				"x-better-ccflare-auto-refresh": "true",
+			}),
+			trustedInternalAutoRefresh: true,
+		});
+
+		await expect(
+			selectAccountsForRequest(meta, ctx, "claude-fable-5"),
+		).rejects.toMatchObject({
+			accountId: forced.id,
+			reason: "model_capacity_exhausted",
+		});
+	});
+
+	it("uses exact reactive model+beta evidence across normal routing and leaves Opus usable", async () => {
+		const preferred = makeAccount({ id: "reactive-preferred", priority: 0 });
+		const fallback = makeAccount({ id: "reactive-fallback", priority: 1 });
+		usageCache.markModelScopedExhausted(
+			preferred.id,
+			"claude-fable-5",
+			"beta-b,context-1m",
+			Date.now() + 60_000,
+		);
+		cachedUsageAccountIds.add(preferred.id);
+		const ctx = makeCtx({ accounts: [preferred, fallback] });
+		const fableMeta = makeRequestMeta({
+			headers: new Headers({
+				"anthropic-beta": "CONTEXT-1M, beta-b",
+			}),
+		});
+
+		const fable = await selectAccountsForRequest(
+			fableMeta,
+			ctx,
+			"claude-fable-5",
+		);
+		expect(fable.map((account) => account.id)).toEqual([fallback.id]);
+		expect(
+			getRoutingCapacityContext(fableMeta)?.exclusions[0]?.exclusions[0]
+				?.source,
+		).toBe("reactive_marker");
+
+		const opus = await selectAccountsForRequest(
+			makeRequestMeta({
+				headers: new Headers({
+					"anthropic-beta": "beta-b,context-1m",
+				}),
+			}),
+			ctx,
+			"claude-opus-4-8",
+		);
+		expect(opus.map((account) => account.id)).toEqual([
+			preferred.id,
+			fallback.id,
+		]);
+	});
+
+	it("uses inferred family evidence for every Fable version while leaving Opus usable", async () => {
+		const preferred = makeAccount({
+			id: "reactive-family-preferred",
+			priority: 0,
+		});
+		const fallback = makeAccount({
+			id: "reactive-family-fallback",
+			priority: 1,
+		});
+		usageCache.markFamilyScopedExhausted(
+			preferred.id,
+			"claude-fable-5",
+			Date.now() + 60_000,
+		);
+		cachedUsageAccountIds.add(preferred.id);
+		const ctx = makeCtx({ accounts: [preferred, fallback] });
+		const fableMeta = makeRequestMeta();
+
+		const fable = await selectAccountsForRequest(
+			fableMeta,
+			ctx,
+			"claude-fable-5-20260701",
+		);
+		expect(fable.map((account) => account.id)).toEqual([fallback.id]);
+		expect(
+			getRoutingCapacityContext(fableMeta)?.exclusions[0]?.exclusions[0],
+		).toMatchObject({
+			source: "reactive_marker",
+			scope: "family",
+			window: "reactive_family",
+			modelFamily: "fable",
+		});
+
+		const opus = await selectAccountsForRequest(
+			makeRequestMeta(),
+			ctx,
+			"claude-opus-4-8",
+		);
+		expect(opus.map((account) => account.id)).toEqual([
+			preferred.id,
+			fallback.id,
+		]);
+	});
+
+	it("keeps exact model+beta evidence ahead of a matching family marker", () => {
+		const accountId = "reactive-exact-precedence";
+		const now = Date.now();
+		usageCache.markModelScopedExhausted(
+			accountId,
+			"claude-fable-5",
+			"beta-a",
+			now + 30_000,
+		);
+		usageCache.markFamilyScopedExhausted(
+			accountId,
+			"claude-fable-5",
+			now + 60_000,
+		);
+		cachedUsageAccountIds.add(accountId);
+
+		expect(
+			getReactiveModelCapacityBlocker(
+				accountId,
+				"claude-fable-5",
+				"beta-a",
+				now,
+			),
+		).toMatchObject({
+			scope: "model",
+			window: "reactive_model",
+			evidenceExpiresAt: now + 30_000,
+		});
+	});
+
+	it("preserves legacy selection when no concrete model is available", async () => {
+		const account = makeAccount({ id: "capacity-no-model" });
+		cacheUsage(account.id, {
+			limits: [
+				{
+					kind: "session",
+					percent: 100,
+					resets_at: new Date(Date.now() + 60_000).toISOString(),
+					scope: null,
+				},
+			],
+		});
+		const ctx = makeCtx({ accounts: [account] });
+		const meta = makeRequestMeta();
+
+		expect(await selectAccountsForRequest(meta, ctx)).toEqual([account]);
+		expect(meta.hardExcludedAccountIds).toBeNull();
+		expect(meta.affinityLaneKey).toBeNull();
+	});
+});
+
+describe("selectAccountsForRequest — lane identity and quota pressure", () => {
+	function weeklyAll(
+		percent: number,
+		hoursUntilReset: number,
+	): Record<string, unknown> {
+		return {
+			limits: [
+				{
+					kind: "weekly_all",
+					percent,
+					resets_at: new Date(
+						Date.now() + hoursUntilReset * 60 * 60 * 1000,
+					).toISOString(),
+					scope: null,
+				},
+			],
+		};
+	}
+
+	it("isolates Fable and Opus affinity while canonicalizing client beta order", async () => {
+		const account = makeAccount({ id: "lane-account" });
+		const ctx = makeCtx({ accounts: [account] });
+		const fableA = makeRequestMeta({
+			clientSessionId: "conversation-2",
+			headers: new Headers({
+				"anthropic-beta": "context-1m, beta-b,context-1m",
+			}),
+		});
+		const fableB = makeRequestMeta({
+			clientSessionId: "conversation-2",
+			headers: new Headers({
+				"anthropic-beta": "BETA-B, context-1m",
+			}),
+		});
+		const opus = makeRequestMeta({
+			clientSessionId: "conversation-2",
+			headers: new Headers({
+				"anthropic-beta": "context-1m,beta-b",
+			}),
+		});
+
+		await selectAccountsForRequest(fableA, ctx, "claude-fable-5");
+		await selectAccountsForRequest(fableB, ctx, "claude-fable-5");
+		await selectAccountsForRequest(opus, ctx, "claude-opus-4-8");
+
+		expect(fableA.affinityLaneKey).toBe(fableB.affinityLaneKey);
+		expect(fableA.affinityLaneKey).not.toBe(opus.affinityLaneKey);
+		expect(fableA.affinityLaneKey).toContain("/v1/messages");
+		expect(fableA.affinityLaneKey).toContain("fable");
+	});
+
+	it("derives comparable quota metadata for OAuth subscription accounts with null billing_type", async () => {
+		const urgent = makeAccount({
+			id: "pressure-urgent",
+			priority: 0,
+			billing_type: null,
+			refresh_token: "oauth-token-a",
+		});
+		const steady = makeAccount({
+			id: "pressure-steady",
+			priority: 0,
+			billing_type: null,
+			refresh_token: "oauth-token-b",
+		});
+		cacheUsage(urgent.id, weeklyAll(90, 2));
+		cacheUsage(steady.id, weeklyAll(50, 200));
+		const ctx = makeCtx({ accounts: [urgent, steady] });
+		const meta = makeRequestMeta();
+
+		await selectAccountsForRequest(meta, ctx, "claude-opus-4-8");
+
+		const urgentPressure = meta.quotaPressureByAccountId?.get(urgent.id);
+		const steadyPressure = meta.quotaPressureByAccountId?.get(steady.id);
+		expect(urgentPressure?.band).toBe("critical");
+		expect(steadyPressure?.band).toBe("steady");
+		expect(urgentPressure?.comparisonKey).not.toBeNull();
+		expect(urgentPressure?.comparisonKey).toBe(steadyPressure?.comparisonKey);
+	});
+
+	it("does not invent a pressure comparison class for an unclassified API-key account", async () => {
+		const account = makeAccount({
+			id: "pressure-api-unknown",
+			billing_type: null,
+			refresh_token: "",
+			api_key: "secret",
+		});
+		cacheUsage(account.id, weeklyAll(80, 20));
+		const ctx = makeCtx({ accounts: [account] });
+		const meta = makeRequestMeta();
+
+		await selectAccountsForRequest(meta, ctx, "claude-opus-4-8");
+
+		expect(
+			meta.quotaPressureByAccountId?.get(account.id)?.comparisonKey,
+		).toBeNull();
+	});
+});
+
+describe("selectAccountsForRequest — atomic combo capacity", () => {
+	it("removes only an exhausted duplicate-account slot and keeps each model sidecar aligned", async () => {
+		const preferred = makeAccount({ id: "combo-preferred", priority: 0 });
+		const fallback = makeAccount({ id: "combo-fallback", priority: 1 });
+		cacheUsage(preferred.id, {
+			limits: [
+				{
+					kind: "weekly_scoped",
+					percent: 100,
+					resets_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+					scope: {
+						model: { id: null, display_name: "Fable" },
+						surface: null,
+					},
+				},
+			],
+		});
+		const combo = makeCombo([
+			{
+				id: "slot-preferred-fable",
+				combo_id: "combo-1",
+				account_id: preferred.id,
+				model: "claude-fable-5",
+				priority: 0,
+				enabled: true,
+			},
+			{
+				id: "slot-preferred-opus",
+				combo_id: "combo-1",
+				account_id: preferred.id,
+				model: "claude-opus-4-8",
+				priority: 1,
+				enabled: true,
+			},
+			{
+				id: "slot-fallback-fable",
+				combo_id: "combo-1",
+				account_id: fallback.id,
+				model: "claude-fable-5",
+				priority: 2,
+				enabled: true,
+			},
+		]);
+		const ctx = makeCtx({
+			accounts: [preferred, fallback],
+			activeCombo: combo,
+		});
+		const meta = makeRequestMeta();
+
+		const result = await selectAccountsForRequest(meta, ctx, "claude-fable-5");
+
+		expect(result.map((account) => account.id)).toEqual([
+			preferred.id,
+			fallback.id,
+		]);
+		expect(getComboSlotInfo(meta)?.slots).toEqual([
+			{
+				accountId: preferred.id,
+				modelOverride: "claude-opus-4-8",
+			},
+			{
+				accountId: fallback.id,
+				modelOverride: "claude-fable-5",
+			},
+		]);
+		expect(
+			meta.routingCandidates?.map(
+				({ comboSlotId, accountId, modelOverride, tier, ordinal }) => ({
+					comboSlotId,
+					accountId,
+					modelOverride,
+					tier,
+					ordinal,
+				}),
+			),
+		).toEqual([
+			{
+				comboSlotId: "slot-preferred-opus",
+				accountId: preferred.id,
+				modelOverride: "claude-opus-4-8",
+				tier: 1,
+				ordinal: 1,
+			},
+			{
+				comboSlotId: "slot-fallback-fable",
+				accountId: fallback.id,
+				modelOverride: "claude-fable-5",
+				tier: 2,
+				ordinal: 2,
+			},
+		]);
+		expect(getRoutingCapacityContext(meta)?.exclusions).toMatchObject([
+			{
+				accountId: preferred.id,
+				model: "claude-fable-5",
+				modelFamily: "fable",
+			},
+		]);
+	});
+
+	it("uses slot priority and repository order independently of account priority", async () => {
+		const accountHigh = makeAccount({ id: "combo-account-high", priority: 9 });
+		const accountLow = makeAccount({ id: "combo-account-low", priority: 0 });
+		const combo = makeCombo([
+			{
+				id: "slot-high-late-tier",
+				combo_id: "combo-1",
+				account_id: accountHigh.id,
+				model: "claude-opus-4-8",
+				priority: 2,
+				enabled: true,
+			},
+			{
+				id: "slot-low-first-in-tier",
+				combo_id: "combo-1",
+				account_id: accountLow.id,
+				model: "claude-opus-4-8",
+				priority: 1,
+				enabled: true,
+			},
+			{
+				id: "slot-high-second-in-tier",
+				combo_id: "combo-1",
+				account_id: accountHigh.id,
+				model: "claude-opus-4-5",
+				priority: 1,
+				enabled: true,
+			},
+		]);
+		const ctx = makeCtx({
+			accounts: [accountHigh, accountLow],
+			activeCombo: combo,
+		});
+		const meta = makeRequestMeta();
+
+		const result = await selectAccountsForRequest(meta, ctx, "claude-opus-4-8");
+
+		expect(result.map((account) => account.id)).toEqual([
+			accountLow.id,
+			accountHigh.id,
+			accountHigh.id,
+		]);
+		expect(getComboSlotInfo(meta)?.slots).toEqual([
+			{
+				accountId: accountLow.id,
+				modelOverride: "claude-opus-4-8",
+			},
+			{
+				accountId: accountHigh.id,
+				modelOverride: "claude-opus-4-5",
+			},
+			{
+				accountId: accountHigh.id,
+				modelOverride: "claude-opus-4-8",
+			},
+		]);
+		expect(
+			meta.routingCandidates?.map(
+				({ comboSlotId, accountId, modelOverride, tier, ordinal }) => ({
+					comboSlotId,
+					accountId,
+					modelOverride,
+					tier,
+					ordinal,
+				}),
+			),
+		).toEqual([
+			{
+				comboSlotId: "slot-low-first-in-tier",
+				accountId: accountLow.id,
+				modelOverride: "claude-opus-4-8",
+				tier: 1,
+				ordinal: 1,
+			},
+			{
+				comboSlotId: "slot-high-second-in-tier",
+				accountId: accountHigh.id,
+				modelOverride: "claude-opus-4-5",
+				tier: 1,
+				ordinal: 2,
+			},
+			{
+				comboSlotId: "slot-high-late-tier",
+				accountId: accountHigh.id,
+				modelOverride: "claude-opus-4-8",
+				tier: 2,
+				ordinal: 0,
+			},
+		]);
+	});
+
+	it("uses only same-family quota pressure inside an equal slot tier", async () => {
+		const expiringFable = makeAccount({
+			id: "combo-expiring-fable",
+			priority: 99,
+		});
+		const expiringOpus = makeAccount({
+			id: "combo-expiring-opus",
+			priority: 0,
+		});
+		const resetAt = (hours: number) =>
+			new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
+		const scoped = (displayName: string, percent: number, hours: number) => ({
+			kind: "weekly_scoped",
+			percent,
+			resets_at: resetAt(hours),
+			scope: {
+				model: { id: null, display_name: displayName },
+				surface: null,
+			},
+		});
+		cacheUsage(expiringFable.id, {
+			limits: [scoped("Fable", 90, 2), scoped("Opus", 10, 200)],
+		});
+		cacheUsage(expiringOpus.id, {
+			limits: [scoped("Fable", 50, 200), scoped("Opus", 90, 2)],
+		});
+		const combo = makeCombo([
+			{
+				id: "slot-opus-pressure-first",
+				combo_id: "combo-1",
+				account_id: expiringOpus.id,
+				model: "claude-fable-5",
+				priority: 0,
+				enabled: true,
+			},
+			{
+				id: "slot-fable-pressure-second",
+				combo_id: "combo-1",
+				account_id: expiringFable.id,
+				model: "claude-fable-5",
+				priority: 0,
+				enabled: true,
+			},
+		]);
+		const ctx = makeCtx({
+			accounts: [expiringFable, expiringOpus],
+			activeCombo: combo,
+		});
+
+		const result = await selectAccountsForRequest(
+			makeRequestMeta(),
+			ctx,
+			"claude-fable-5",
+		);
+
+		// Fable pressure outranks repository order. Account.priority and the
+		// opposite Opus scoped pressure must not participate in this lane.
+		expect(result.map((account) => account.id)).toEqual([
+			expiringFable.id,
+			expiringOpus.id,
+		]);
 	});
 });

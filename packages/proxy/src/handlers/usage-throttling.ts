@@ -7,11 +7,16 @@ import type { AnyUsageData } from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
 
 const RETRY_AFTER_SECONDS = 60;
+/** Two default 90-second usage polls; independent from the cache's 10m maximum. */
+export const DEFAULT_CAPACITY_SNAPSHOT_FRESHNESS_MS = 3 * 60 * 1000;
+
+type CapacityWindowKind = "session" | "weekly_all" | "weekly_scoped" | "other";
 
 interface UsageWindowSnapshot {
 	utilization: number;
-	resetAtMs: number;
+	resetAtMs: number | null;
 	window: string;
+	kind: CapacityWindowKind;
 	/** Set for per-model weekly caps (weekly_scoped); drives model-aware throttling. */
 	modelFamily?: string;
 	/** True for a weekly_scoped (per-model) cap — even when its family is unknown. */
@@ -23,7 +28,10 @@ interface AnthropicLimit {
 	kind?: string;
 	percent?: number | null;
 	resets_at?: string | null;
-	scope?: { model?: { display_name?: string } | null } | null;
+	is_active?: boolean | null;
+	scope?: {
+		model?: { id?: string | null; display_name?: string | null } | null;
+	} | null;
 }
 
 export interface UsageThrottleSettings {
@@ -47,20 +55,21 @@ function collectWindows(data: AnyUsageData | null): UsageWindowSnapshot[] {
 		resetAtMs: number | null | undefined,
 		modelFamily?: string,
 		scoped?: boolean,
+		kind: CapacityWindowKind = "other",
 	) => {
-		if (
-			typeof utilization !== "number" ||
-			!Number.isFinite(utilization) ||
-			typeof resetAtMs !== "number" ||
-			!Number.isFinite(resetAtMs)
-		) {
+		if (typeof utilization !== "number" || !Number.isFinite(utilization)) {
 			return;
 		}
+		const normalizedResetAtMs =
+			typeof resetAtMs === "number" && Number.isFinite(resetAtMs)
+				? resetAtMs
+				: null;
 
 		windows.push({
 			utilization,
-			resetAtMs,
+			resetAtMs: normalizedResetAtMs,
 			window,
+			kind,
 			modelFamily,
 			scoped,
 		});
@@ -75,23 +84,41 @@ function collectWindows(data: AnyUsageData | null): UsageWindowSnapshot[] {
 		let hasSession = false;
 		let hasWeeklyAll = false;
 		for (const l of limits) {
-			if (!l || typeof l.percent !== "number") continue;
+			if (!l || l.is_active === false || typeof l.percent !== "number") {
+				continue;
+			}
 			const resetMs = l.resets_at ? new Date(l.resets_at).getTime() : null;
 			if (l.kind === "session") {
-				pushWindow("five_hour", l.percent, resetMs);
-				hasSession = true;
-			} else if (l.kind === "weekly_all") {
-				pushWindow("seven_day", l.percent, resetMs);
-				hasWeeklyAll = true;
-			} else if (l.kind === "weekly_scoped") {
-				const name = l.scope?.model?.display_name?.trim();
-				if (!name) continue;
 				pushWindow(
-					weeklyScopedWindowKey(name),
+					"five_hour",
 					l.percent,
 					resetMs,
-					getModelFamily(name) ?? undefined,
+					undefined,
+					false,
+					"session",
+				);
+				hasSession = true;
+			} else if (l.kind === "weekly_all") {
+				pushWindow(
+					"seven_day",
+					l.percent,
+					resetMs,
+					undefined,
+					false,
+					"weekly_all",
+				);
+				hasWeeklyAll = true;
+			} else if (l.kind === "weekly_scoped") {
+				const displayName = l.scope?.model?.display_name?.trim();
+				const modelId = l.scope?.model?.id?.trim();
+				const name = displayName || modelId || null;
+				pushWindow(
+					name ? weeklyScopedWindowKey(name) : "seven_day_scoped_unknown",
+					l.percent,
+					resetMs,
+					name ? (getModelFamily(name) ?? undefined) : undefined,
 					true,
+					"weekly_scoped",
 				);
 			}
 		}
@@ -110,6 +137,9 @@ function collectWindows(data: AnyUsageData | null): UsageWindowSnapshot[] {
 				flat.five_hour.resets_at
 					? new Date(flat.five_hour.resets_at).getTime()
 					: null,
+				undefined,
+				false,
+				"session",
 			);
 		}
 		if (!hasWeeklyAll && flat.seven_day) {
@@ -119,6 +149,9 @@ function collectWindows(data: AnyUsageData | null): UsageWindowSnapshot[] {
 				flat.seven_day.resets_at
 					? new Date(flat.seven_day.resets_at).getTime()
 					: null,
+				undefined,
+				false,
+				"weekly_all",
 			);
 		}
 		// Return unless nothing usable was collected (empty limits[] AND no flat
@@ -138,6 +171,10 @@ function collectWindows(data: AnyUsageData | null): UsageWindowSnapshot[] {
 				utilization?: number | null;
 				resets_at?: string | null;
 			};
+			seven_day_fable?: {
+				utilization?: number | null;
+				resets_at?: string | null;
+			};
 		};
 
 		pushWindow(
@@ -146,6 +183,9 @@ function collectWindows(data: AnyUsageData | null): UsageWindowSnapshot[] {
 			anthropicLike.five_hour?.resets_at
 				? new Date(anthropicLike.five_hour.resets_at).getTime()
 				: null,
+			undefined,
+			false,
+			"session",
 		);
 		pushWindow(
 			"seven_day",
@@ -153,6 +193,9 @@ function collectWindows(data: AnyUsageData | null): UsageWindowSnapshot[] {
 			anthropicLike.seven_day?.resets_at
 				? new Date(anthropicLike.seven_day.resets_at).getTime()
 				: null,
+			undefined,
+			false,
+			"weekly_all",
 		);
 		pushWindow(
 			"seven_day_opus",
@@ -160,6 +203,9 @@ function collectWindows(data: AnyUsageData | null): UsageWindowSnapshot[] {
 			anthropicLike.seven_day_opus?.resets_at
 				? new Date(anthropicLike.seven_day_opus.resets_at).getTime()
 				: null,
+			"opus",
+			true,
+			"weekly_scoped",
 		);
 		pushWindow(
 			"seven_day_sonnet",
@@ -167,6 +213,19 @@ function collectWindows(data: AnyUsageData | null): UsageWindowSnapshot[] {
 			anthropicLike.seven_day_sonnet?.resets_at
 				? new Date(anthropicLike.seven_day_sonnet.resets_at).getTime()
 				: null,
+			"sonnet",
+			true,
+			"weekly_scoped",
+		);
+		pushWindow(
+			"seven_day_fable",
+			anthropicLike.seven_day_fable?.utilization,
+			anthropicLike.seven_day_fable?.resets_at
+				? new Date(anthropicLike.seven_day_fable.resets_at).getTime()
+				: null,
+			"fable",
+			true,
+			"weekly_scoped",
 		);
 		return windows;
 	}
@@ -248,6 +307,301 @@ function isWindowThrottlingEnabled(
 	return settings.weeklyEnabled;
 }
 
+export type HardCapacityScope = "account" | "family";
+
+export interface HardCapacityExclusion {
+	readonly scope: HardCapacityScope;
+	readonly window: string;
+	readonly windowKind: "session" | "weekly_all" | "weekly_scoped";
+	readonly modelFamily: string | null;
+	readonly utilization: number;
+	readonly resetAtMs: number | null;
+	/** The earlier of reset and evidence freshness expiry. */
+	readonly evidenceExpiresAt: number;
+}
+
+export interface HardCapacityStatus {
+	readonly eligible: boolean;
+	readonly exclusions: readonly HardCapacityExclusion[];
+	readonly snapshotAgeMs: number | null;
+	readonly snapshotFresh: boolean;
+	/** When all simultaneous exclusions for this candidate can have cleared. */
+	readonly blockedUntil: number | null;
+}
+
+export interface HardCapacityOptions {
+	readonly requestModel: string | null;
+	readonly observedAt: number;
+	readonly now?: number;
+	readonly snapshotFreshnessMs?: number;
+}
+
+interface SnapshotFreshness {
+	ageMs: number | null;
+	expiresAt: number | null;
+	fresh: boolean;
+}
+
+function evaluateSnapshotFreshness(
+	observedAt: number,
+	now: number,
+	maxAgeMs: number,
+): SnapshotFreshness {
+	if (
+		!Number.isFinite(observedAt) ||
+		!Number.isFinite(now) ||
+		!Number.isFinite(maxAgeMs) ||
+		maxAgeMs <= 0
+	) {
+		return { ageMs: null, expiresAt: null, fresh: false };
+	}
+	const ageMs = Math.max(0, now - observedAt);
+	const expiresAt = observedAt + maxAgeMs;
+	return { ageMs, expiresAt, fresh: now < expiresAt };
+}
+
+/**
+ * Evaluate hard provider capacity for one concrete request model. This policy is
+ * intentionally independent from the optional predictive pacing flags.
+ */
+export function evaluateHardCapacity(
+	data: AnyUsageData | null,
+	options: HardCapacityOptions,
+): HardCapacityStatus {
+	const now = options.now ?? Date.now();
+	const freshness = evaluateSnapshotFreshness(
+		options.observedAt,
+		now,
+		options.snapshotFreshnessMs ?? DEFAULT_CAPACITY_SNAPSHOT_FRESHNESS_MS,
+	);
+	if (!freshness.fresh || freshness.expiresAt === null) {
+		return {
+			eligible: true,
+			exclusions: [],
+			snapshotAgeMs: freshness.ageMs,
+			snapshotFresh: false,
+			blockedUntil: null,
+		};
+	}
+
+	const requestFamily = options.requestModel
+		? getModelFamily(options.requestModel)
+		: null;
+	const exclusions: HardCapacityExclusion[] = [];
+	for (const window of collectWindows(data)) {
+		if (
+			window.kind !== "session" &&
+			window.kind !== "weekly_all" &&
+			window.kind !== "weekly_scoped"
+		) {
+			continue;
+		}
+		if (window.utilization < 100) continue;
+		if (window.resetAtMs !== null && window.resetAtMs <= now) continue;
+
+		let scope: HardCapacityScope;
+		if (window.kind === "weekly_scoped") {
+			// Unknown/malformed and unrelated scopes fail open proactively.
+			if (
+				requestFamily === null ||
+				window.modelFamily == null ||
+				window.modelFamily !== requestFamily
+			) {
+				continue;
+			}
+			scope = "family";
+		} else {
+			scope = "account";
+		}
+
+		const evidenceExpiresAt =
+			window.resetAtMs === null
+				? freshness.expiresAt
+				: Math.min(window.resetAtMs, freshness.expiresAt);
+		if (evidenceExpiresAt <= now) continue;
+		exclusions.push({
+			scope,
+			window: window.window,
+			windowKind: window.kind,
+			modelFamily: window.modelFamily ?? null,
+			utilization: window.utilization,
+			resetAtMs: window.resetAtMs,
+			evidenceExpiresAt,
+		});
+	}
+
+	return {
+		eligible: exclusions.length === 0,
+		exclusions,
+		snapshotAgeMs: freshness.ageMs,
+		snapshotFresh: true,
+		blockedUntil:
+			exclusions.length === 0
+				? null
+				: Math.max(...exclusions.map((entry) => entry.evidenceExpiresAt)),
+	};
+}
+
+export type QuotaPressureBand =
+	| "critical"
+	| "urgent"
+	| "hot"
+	| "warm"
+	| "steady"
+	| "cold";
+
+export interface QuotaPressureComparatorMetadata {
+	readonly provider: string | null;
+	readonly billingClass: string | null;
+	readonly windowKind: "weekly_scoped" | "weekly_all";
+}
+
+export interface WeeklyQuotaPressure {
+	readonly window: string;
+	readonly windowKind: "weekly_scoped" | "weekly_all";
+	readonly modelFamily: string | null;
+	readonly utilization: number;
+	readonly resetAtMs: number;
+	readonly remainingHours: number;
+	readonly requiredBurnRate: number;
+	readonly band: QuotaPressureBand;
+	readonly comparator: QuotaPressureComparatorMetadata;
+}
+
+export interface WeeklyQuotaPressureOptions {
+	readonly requestModel: string | null;
+	readonly observedAt: number;
+	readonly provider: string | null;
+	readonly billingClass: string | null;
+	readonly now?: number;
+	readonly snapshotFreshnessMs?: number;
+}
+
+const PRESSURE_BAND_RANK: Readonly<Record<QuotaPressureBand, number>> = {
+	cold: 0,
+	steady: 1,
+	warm: 2,
+	hot: 3,
+	urgent: 4,
+	critical: 5,
+};
+
+function quotaPressureBand(requiredBurnRate: number): QuotaPressureBand {
+	if (requiredBurnRate >= 4) return "critical";
+	if (requiredBurnRate >= 2) return "urgent";
+	if (requiredBurnRate >= 1) return "hot";
+	if (requiredBurnRate >= 0.5) return "warm";
+	if (requiredBurnRate >= 0.25) return "steady";
+	return "cold";
+}
+
+function normalizeComparatorPart(value: string | null): string | null {
+	const normalized = value?.trim().toLowerCase();
+	return normalized ? normalized : null;
+}
+
+/**
+ * Return model-relevant weekly pressure from a fresh subscription snapshot.
+ * Matching scoped quota wins; otherwise the account-wide weekly quota is used.
+ * Session/five-hour windows are deliberately excluded from this comparator.
+ */
+export function getWeeklyQuotaPressure(
+	data: AnyUsageData | null,
+	options: WeeklyQuotaPressureOptions,
+): WeeklyQuotaPressure | null {
+	const now = options.now ?? Date.now();
+	const freshness = evaluateSnapshotFreshness(
+		options.observedAt,
+		now,
+		options.snapshotFreshnessMs ?? DEFAULT_CAPACITY_SNAPSHOT_FRESHNESS_MS,
+	);
+	if (!freshness.fresh) return null;
+
+	const requestFamily = options.requestModel
+		? getModelFamily(options.requestModel)
+		: null;
+	const windows = collectWindows(data);
+	const matchingScoped =
+		requestFamily === null
+			? []
+			: windows.filter(
+					(window) =>
+						window.kind === "weekly_scoped" &&
+						window.modelFamily === requestFamily,
+				);
+	const selected =
+		matchingScoped.length > 0
+			? matchingScoped
+			: windows.filter((window) => window.kind === "weekly_all");
+	const windowKind = matchingScoped.length > 0 ? "weekly_scoped" : "weekly_all";
+
+	let best: WeeklyQuotaPressure | null = null;
+	for (const window of selected) {
+		if (
+			window.utilization < 0 ||
+			window.utilization >= 100 ||
+			window.resetAtMs === null ||
+			window.resetAtMs <= now
+		) {
+			continue;
+		}
+		const remainingHours = (window.resetAtMs - now) / (60 * 60 * 1000);
+		if (!Number.isFinite(remainingHours) || remainingHours <= 0) continue;
+		const requiredBurnRate = (100 - window.utilization) / remainingHours;
+		if (!Number.isFinite(requiredBurnRate) || requiredBurnRate < 0) continue;
+
+		const pressure: WeeklyQuotaPressure = {
+			window: window.window,
+			windowKind,
+			modelFamily: window.modelFamily ?? requestFamily,
+			utilization: window.utilization,
+			resetAtMs: window.resetAtMs,
+			remainingHours,
+			requiredBurnRate,
+			band: quotaPressureBand(requiredBurnRate),
+			comparator: {
+				provider: normalizeComparatorPart(options.provider),
+				billingClass: normalizeComparatorPart(options.billingClass),
+				windowKind,
+			},
+		};
+		if (
+			best === null ||
+			PRESSURE_BAND_RANK[pressure.band] > PRESSURE_BAND_RANK[best.band]
+		) {
+			best = pressure;
+		}
+	}
+	return best;
+}
+
+/**
+ * Compare pressure bands only when provider, plan class, and weekly-window kind
+ * are positively known and identical. Positive means the left side is preferred.
+ */
+export function compareQuotaPressure(
+	left: WeeklyQuotaPressure | null,
+	right: WeeklyQuotaPressure | null,
+): -1 | 0 | 1 | null {
+	if (left === null || right === null) return null;
+	const a = left.comparator;
+	const b = right.comparator;
+	if (
+		a.provider === null ||
+		a.billingClass === null ||
+		b.provider === null ||
+		b.billingClass === null ||
+		a.provider !== b.provider ||
+		a.billingClass !== b.billingClass ||
+		a.windowKind !== b.windowKind
+	) {
+		return null;
+	}
+	const difference =
+		PRESSURE_BAND_RANK[left.band] - PRESSURE_BAND_RANK[right.band];
+	return difference === 0 ? 0 : difference > 0 ? 1 : -1;
+}
+
 export function getUsageThrottleStatus(
 	data: AnyUsageData | null,
 	settings: UsageThrottleSettings,
@@ -277,6 +631,7 @@ export function getUsageThrottleStatus(
 			continue;
 		}
 		if (!isWindowThrottlingEnabled(window.window, settings)) continue;
+		if (window.resetAtMs === null) continue;
 		if (window.resetAtMs <= now) continue;
 		const startMs = computeWindowStartMs(window.resetAtMs, window.window);
 		if (startMs === null || startMs >= window.resetAtMs) continue;
