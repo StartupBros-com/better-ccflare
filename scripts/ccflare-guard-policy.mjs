@@ -98,14 +98,53 @@ function collectDelayCandidates(headers, body, nowMs) {
 }
 
 /**
+ * Classifies the proxy's stable x-better-ccflare-pool-status header for a
+ * response, independent of any body I/O (R17/P1). This is deliberately the
+ * ONLY signal evaluated at header time: an oversized, stalled, or malformed
+ * body must never cost a header-confirmed retry its authorization, and must
+ * never silently grant one either. Callers should settle retry authority
+ * from this result alone before touching the response body; the body may
+ * only be consulted afterwards, as a bounded, best-effort delay hint.
+ *
+ * Returns:
+ * - "confirmed": a 503 whose header explicitly says the whole pool is
+ *   exhausted. Sufficient on its own to authorize a retry.
+ * - "denied": a 503 whose header is present but says something else (e.g.
+ *   "available"). Never retryable, regardless of body.
+ * - "absent": a 503 with no pool-status header at all, e.g. from an older,
+ *   not-yet-redeployed proxy. Retry authority falls to the caller's
+ *   rolling-upgrade policy (see allowLegacyBody on evaluateGuardRetry).
+ * - "not_applicable": any non-503 status. Never retryable.
+ */
+export function poolHeaderStatus({ status, headers }) {
+	if (status !== 503) return "not_applicable";
+	const poolStatus = headerValue(
+		headers,
+		"x-better-ccflare-pool-status",
+	)?.trim();
+	if (poolStatus === "exhausted") return "confirmed";
+	if (poolStatus == null || poolStatus === "") return "absent";
+	return "denied";
+}
+
+/**
  * The guard consumes the proxy's stable x-better-ccflare-pool-status:
  * exhausted header as the primary, sufficient whole-pool-exhaustion signal
- * (R17). Bounded structured-body detection (already capped by the caller's
- * 64 KiB inspection limit) is only a rolling-upgrade fallback for when that
- * header is absent, e.g. against an older proxy that has not yet been
- * redeployed. Once a response is classified retryable, an unparseable,
- * absent, or non-finite recovery body degrades the wait, not the decision:
- * delay resolution falls back to Retry-After, or to no delay at all, so the
+ * (R17), evaluated at header time via poolHeaderStatus, before any body I/O.
+ * Bounded structured-body detection (already capped by the caller's 64 KiB
+ * inspection limit) is only a TEMPORARY rolling-upgrade escape hatch for
+ * when that header is absent, e.g. against an older proxy that has not yet
+ * been redeployed. It is OFF by default (allowLegacyBody = false): any
+ * upstream 503 body can be shaped like a pool_exhausted error, and trusting
+ * it without the header would let a spoofed or coincidentally-shaped body
+ * authorize replays of a possibly non-idempotent request. Operators who
+ * need the fallback during a rolling upgrade must opt in explicitly (e.g.
+ * via GUARD_ALLOW_LEGACY_POOL_BODY=1) and should disable it again once all
+ * proxies are current.
+ *
+ * Once a response is classified retryable, an unparseable, absent, or
+ * non-finite recovery body degrades the wait, not the decision: delay
+ * resolution falls back to Retry-After, or to no delay at all, so the
  * guard's own bounded attempts/deadline own worst-case exposure. All other
  * responses are forwarded exactly once so model-scoped and provider-specific
  * errors remain visible to the caller and the router can own fallback
@@ -116,6 +155,7 @@ export function evaluateGuardRetry({
 	headers,
 	bodyText,
 	nowMs = Date.now(),
+	allowLegacyBody = false,
 }) {
 	if (status !== 503) return noRetry("status_not_retryable");
 
@@ -130,6 +170,7 @@ export function evaluateGuardRetry({
 
 	if (!headerConfirmed) {
 		if (!headerAbsent) return noRetry("pool_not_exhausted");
+		if (!allowLegacyBody) return noRetry("header_absent_legacy_body_disabled");
 		if (!bodyConfirmsPoolExhausted(body)) {
 			return noRetry(body == null ? "malformed_body" : "not_pool_exhausted_terminal");
 		}

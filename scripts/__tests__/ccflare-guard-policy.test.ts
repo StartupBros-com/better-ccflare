@@ -4,6 +4,7 @@ import {
 	DEFAULT_GUARD_POLICY_ID,
 	evaluateGuardRetry,
 	parseRetryAfterMs,
+	poolHeaderStatus,
 } from "../ccflare-guard-policy.mjs";
 
 const NOW = Date.parse("2026-07-17T12:00:00.000Z");
@@ -15,16 +16,19 @@ function evaluate({
 		type: "error",
 		error: { type: "pool_exhausted" },
 	},
+	allowLegacyBody = false,
 }: {
 	status?: number;
 	headers?: Record<string, string>;
 	body?: unknown;
+	allowLegacyBody?: boolean;
 }) {
 	return evaluateGuardRetry({
 		status,
 		headers: new Headers(headers),
 		bodyText: typeof body === "string" ? body : JSON.stringify(body),
 		nowMs: NOW,
+		allowLegacyBody,
 	});
 }
 
@@ -50,6 +54,44 @@ describe("parseRetryAfterMs", () => {
 		expect(
 			parseRetryAfterMs("Fri, 17 Jul 2026 11:59:59 GMT", NOW),
 		).toBeNull();
+	});
+});
+
+// P1 ordering: the header must be classifiable at HEADER time, before any
+// body I/O, so retry authorization for a confirmed-exhausted 503 can never
+// be lost to an oversized, stalled, or malformed body.
+describe("poolHeaderStatus", () => {
+	test("confirms exhaustion only for a 503 with the exhausted header", () => {
+		expect(
+			poolHeaderStatus({
+				status: 503,
+				headers: new Headers({ "x-better-ccflare-pool-status": "exhausted" }),
+			}),
+		).toBe("confirmed");
+	});
+
+	test("denies when the header is present but not exhausted", () => {
+		expect(
+			poolHeaderStatus({
+				status: 503,
+				headers: new Headers({ "x-better-ccflare-pool-status": "available" }),
+			}),
+		).toBe("denied");
+	});
+
+	test("reports absent when the header is missing entirely", () => {
+		expect(
+			poolHeaderStatus({ status: 503, headers: new Headers({}) }),
+		).toBe("absent");
+	});
+
+	test("is not applicable to non-503 statuses regardless of the header", () => {
+		expect(
+			poolHeaderStatus({
+				status: 500,
+				headers: new Headers({ "x-better-ccflare-pool-status": "exhausted" }),
+			}),
+		).toBe("not_applicable");
 	});
 });
 
@@ -135,16 +177,34 @@ describe("evaluateGuardRetry", () => {
 		});
 	});
 
-	test("the rolling-upgrade fallback retries a legacy pool_exhausted body when the header is absent", () => {
+	test("the rolling-upgrade fallback retries a legacy pool_exhausted body when the header is absent AND explicitly enabled", () => {
 		const decision = evaluate({
 			headers: { "retry-after": "5" },
 			body: { type: "error", error: { type: "pool_exhausted" } },
+			allowLegacyBody: true,
 		});
 		expect(decision).toMatchObject({
 			retry: true,
 			reason: "pool_exhausted",
 			delayMs: 5_000,
 			recoverySource: "retry-after",
+		});
+	});
+
+	// P1 spoofing (guard side): any upstream 503 body can be shaped like
+	// pool_exhausted, which would otherwise authorize up to maxAttempts
+	// replays of a possibly non-idempotent request. The legacy body-only
+	// fallback is OFF by default; only the header may authorize a retry
+	// unless an operator has explicitly opted into the rolling-upgrade
+	// escape hatch.
+	test("a legacy pool_exhausted body with the header absent never retries by default", () => {
+		const decision = evaluate({
+			headers: { "retry-after": "5" },
+			body: { type: "error", error: { type: "pool_exhausted" } },
+		});
+		expect(decision).toMatchObject({
+			retry: false,
+			reason: "header_absent_legacy_body_disabled",
 		});
 	});
 

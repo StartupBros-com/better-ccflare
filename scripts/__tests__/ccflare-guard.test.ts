@@ -415,6 +415,55 @@ describe("source-controlled guard", () => {
 		}
 	});
 
+	// P2: a response that begins (status 200 sent) but whose body then stalls
+	// past the idle watchdog must not be recorded as a success -- the guard
+	// only knows the response actually completed once sendFinalResponse
+	// resolves. Recording success before that (as the pre-fix code did)
+	// would mislabel a client-visible failure as a success in the guard's
+	// own logs and health counters.
+	test("does not record outcome success for a 200 whose body delivery fails via the idle watchdog", async () => {
+		const events: Array<Record<string, unknown>> = [];
+		let cancelCalls = 0;
+		const { baseUrl, guard } = await startGuard("http://127.0.0.1:8789", {
+			totalDeadlineMs: 200,
+			responseIdleTimeoutMs: 30,
+			logger: (line: string) => events.push(JSON.parse(line)),
+			fetchImpl: async () =>
+				new Response(
+					new ReadableStream<Uint8Array>({
+						start(controller) {
+							controller.enqueue(Buffer.from("partial"));
+							// Never enqueues again or closes; the idle watchdog must
+							// trip instead of the body ever completing.
+						},
+						cancel() {
+							cancelCalls += 1;
+						},
+					}),
+					{ status: 200 },
+				),
+		});
+
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+		expect(response.status).toBe(200);
+		const bodyResult = await response.text().catch((error) => error);
+		expect(bodyResult).toBeInstanceOf(Error);
+
+		await waitFor(() => guard.state.active === 0);
+		expect(cancelCalls).toBe(1);
+		expect(guard.state.counters.responseBodyIdleTimeouts).toBe(1);
+		expect(guard.state.counters.success).toBe(0);
+		expect(
+			events.some(
+				(event) =>
+					event.event === "proxy_response" && event.outcome === "success",
+			),
+		).toBe(false);
+	});
+
 	test("resets the response idle watchdog for each healthy chunk", async () => {
 		let timer: ReturnType<typeof setTimeout> | null = null;
 		const chunks = ["one-", "two-", "three-", "done"];
@@ -461,7 +510,13 @@ describe("source-controlled guard", () => {
 		expect(health.runtime.limits.responseIdleTimeoutMs).toBe(35);
 	});
 
-	test("bounds a stalled partially inspected oversized response body", async () => {
+	// P1 spoofing (guard side): the legacy body-only fallback (no header) is
+	// opt-in via allowLegacyPoolBody. This test exercises that fallback's
+	// oversized/stalled-body bounding, which is otherwise identical to the
+	// pre-R17-header-time behavior. A header-confirmed 503 no longer buffers
+	// the body at all before authorizing retry (see the retry-focused tests
+	// below), so this scenario is only reachable with the header absent.
+	test("bounds a stalled partially inspected oversized response body (legacy body-only fallback)", async () => {
 		let fetchCalls = 0;
 		let cancelCalls = 0;
 		let stalledController: ReadableStreamDefaultController<Uint8Array> | null =
@@ -471,6 +526,7 @@ describe("source-controlled guard", () => {
 			maxInspectionBytes: 8,
 			totalDeadlineMs: 200,
 			responseIdleTimeoutMs: 30,
+			allowLegacyPoolBody: true,
 			fetchImpl: async () => {
 				fetchCalls += 1;
 				if (fetchCalls === 1) {
@@ -488,7 +544,6 @@ describe("source-controlled guard", () => {
 							status: 503,
 							headers: {
 								"content-type": "application/json",
-								"x-better-ccflare-pool-status": "exhausted",
 							},
 						},
 					);
@@ -567,6 +622,39 @@ describe("source-controlled guard", () => {
 		expect(response.status).toBe(200);
 		expect(await response.text()).toBe("stream-ok");
 		expect(attempts).toBe(2);
+	});
+
+	// P1 spoofing (guard side, default posture): any upstream 503 body can be
+	// shaped like pool_exhausted. Without the header, and without the
+	// operator explicitly opting into the rolling-upgrade escape hatch, that
+	// body-only shape must never authorize a retry -- it is forwarded to the
+	// client exactly once, unmodified, never replayed.
+	test("forwards a body-only pool_exhausted 503 exactly once when the header is absent and the legacy flag is off by default", async () => {
+		let attempts = 0;
+		const responseBody = JSON.stringify({
+			type: "error",
+			error: {
+				type: "pool_exhausted",
+				next_available_at: new Date(Date.now() + 100).toISOString(),
+			},
+		});
+		const upstreamBase = await listen(
+			http.createServer((_req, res) => {
+				attempts += 1;
+				res.writeHead(503, { "content-type": "application/json" });
+				res.end(responseBody);
+			}),
+		);
+		const { baseUrl } = await startGuard(upstreamBase);
+
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+
+		expect(response.status).toBe(503);
+		expect(await response.text()).toBe(responseBody);
+		expect(attempts).toBe(1);
 	});
 
 	test.each([
@@ -1068,7 +1156,13 @@ describe("source-controlled guard", () => {
 		expect(attempts).toBe(1);
 	});
 
-	test("streams an oversized marked 503 once instead of buffering or retrying it", async () => {
+	// P1 ordering: the header alone settles retry authorization at header
+	// time, before any body I/O. An oversized body (beyond the inspection
+	// cap) must never cost a header-confirmed retry its authorization -- it
+	// can only fail to enrich the delay hint. This replaces the prior
+	// behavior, where an oversized body caused a header-confirmed 503 to be
+	// forwarded as final (losing the retry the header explicitly granted).
+	test("retries a header-confirmed 503 despite an oversized body, degrading to no delay hint", async () => {
 		let attempts = 0;
 		const body = JSON.stringify({
 			error: {
@@ -1092,6 +1186,8 @@ describe("source-controlled guard", () => {
 		);
 		const { baseUrl } = await startGuard(upstreamBase, {
 			maxInspectionBytes: 64 * 1_024,
+			maxAttempts: 2,
+			totalDeadlineMs: 2_000,
 		});
 
 		const response = await fetch(`${baseUrl}/v1/messages`, {
@@ -1100,8 +1196,54 @@ describe("source-controlled guard", () => {
 		});
 
 		expect(response.status).toBe(503);
-		expect(await response.text()).toBe(body);
-		expect(attempts).toBe(1);
+		expect(await response.json()).toMatchObject({
+			error: { type: "guard_retry_attempts_exhausted" },
+		});
+		expect(attempts).toBe(2);
+	});
+
+	// P1 ordering: a body that stalls past the bounded delay-inspection
+	// timeout must not cost the header-confirmed retry, and must not burn
+	// the request's overall deadline either -- only the short inspection
+	// timeout is spent before the guard degrades to a zero delay hint and
+	// retries.
+	test("retries a header-confirmed 503 without waiting out a stalled body", async () => {
+		let attempts = 0;
+		const upstreamBase = await listen(
+			http.createServer((_req, res) => {
+				attempts += 1;
+				if (attempts === 1) {
+					res.writeHead(503, {
+						"content-type": "application/json",
+						"x-better-ccflare-pool-status": "exhausted",
+					});
+					res.write('{"error":{"type":"pool_exhausted"}');
+					// Never completes within the test's lifetime; the socket is
+					// destroyed by afterEach's server cleanup.
+					return;
+				}
+				res.end("second-ok");
+			}),
+		);
+		const { baseUrl } = await startGuard(upstreamBase, {
+			maxAttempts: 2,
+			totalDeadlineMs: 2_000,
+			delayInspectionTimeoutMs: 40,
+		});
+
+		const startedAt = Date.now();
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+		const elapsedMs = Date.now() - startedAt;
+
+		expect(response.status).toBe(200);
+		expect(await response.text()).toBe("second-ok");
+		expect(attempts).toBe(2);
+		// Well under the 2s deadline: proves the retry didn't wait for the
+		// stalled body or the overall deadline, only the short peek timeout.
+		expect(elapsedMs).toBeLessThan(500);
 	});
 
 	test("releases its active slot when a production Node client disconnects", async () => {

@@ -17,6 +17,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import {
 	DEFAULT_GUARD_POLICY_ID,
 	evaluateGuardRetry,
+	poolHeaderStatus,
 } from "./ccflare-guard-policy.mjs";
 
 export const DEFAULT_GUARD_SOURCE_ID = "better-ccflare-source-guard-v1";
@@ -25,6 +26,17 @@ export const DEFAULT_GUARD_TOTAL_DEADLINE_MS = 600_000;
 export const DEFAULT_GUARD_RETRY_JITTER_MS = 2_000;
 export const DEFAULT_GUARD_MAX_INSPECTION_BYTES = 64 * 1_024;
 export const DEFAULT_GUARD_RESPONSE_IDLE_TIMEOUT_MS = 120_000;
+// P1 ordering: once the x-better-ccflare-pool-status header confirms whole-
+// pool exhaustion, retry is already authorized (see poolHeaderStatus). Any
+// further body read is purely a bounded, best-effort delay hint, capped
+// short so a stalled or slow body can never meaningfully erode the
+// request's overall deadline.
+export const DEFAULT_GUARD_DELAY_INSPECTION_TIMEOUT_MS = 5_000;
+// P1 spoofing (guard side): the legacy body-only pool_exhausted fallback is
+// a temporary rolling-upgrade escape hatch, OFF by default. See
+// evaluateGuardRetry's docstring in ccflare-guard-policy.mjs for the
+// rationale.
+export const DEFAULT_GUARD_ALLOW_LEGACY_POOL_BODY = false;
 
 const HOP_BY_HOP_HEADERS = new Set([
 	"connection",
@@ -116,6 +128,15 @@ function configuredNumber(value, fallback) {
 	if (value == null || value === "") return fallback;
 	const parsed = Number(value);
 	return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function configuredBoolean(value, fallback) {
+	if (value == null || value === "") return fallback;
+	if (typeof value === "boolean") return value;
+	const normalized = String(value).trim().toLowerCase();
+	if (["1", "true", "yes", "on"].includes(normalized)) return true;
+	if (["0", "false", "no", "off"].includes(normalized)) return false;
+	return fallback;
 }
 
 function abortError() {
@@ -319,7 +340,17 @@ async function sendBufferedResponse(
 	res.end(buffer);
 }
 
-async function readResponseForInspection(response, maxBytes, signal) {
+// signal aborting rejects a pending read only when it is the SAME signal
+// that was passed to the original fetch() call (undici couples a fetch's
+// signal to its response body for the request's whole lifecycle); an
+// unrelated AbortController never does. softSignal exists for exactly that
+// case: a bounded, best-effort peek (P1 ordering) that must be able to give
+// up on a stalled body on its OWN short timeout, without that timeout being
+// mistaken for the caller's real deadline/client abort. Cancelling the
+// reader directly unblocks a pending read by resolving it with
+// {done: true}, which this function reports as an ordinary (truncated)
+// completion rather than an error, letting the caller degrade gracefully.
+async function readResponseForInspection(response, maxBytes, signal, softSignal) {
 	if (!response.body) {
 		return { oversized: false, buffer: Buffer.alloc(0) };
 	}
@@ -332,6 +363,16 @@ async function readResponseForInspection(response, maxBytes, signal) {
 	const reader = response.body.getReader();
 	const chunks = [];
 	let bytes = 0;
+	const onSoftAbort = () => {
+		reader.cancel().catch(() => {
+			// Best-effort: a concurrent real cancel/error may already be
+			// tearing the reader down.
+		});
+	};
+	if (softSignal) {
+		if (softSignal.aborted) onSoftAbort();
+		else softSignal.addEventListener("abort", onSoftAbort, { once: true });
+	}
 	try {
 		while (true) {
 			if (signal?.aborted) throw signal.reason || abortError();
@@ -363,6 +404,8 @@ async function readResponseForInspection(response, maxBytes, signal) {
 			// Preserve the original read/abort failure.
 		}
 		throw error;
+	} finally {
+		softSignal?.removeEventListener("abort", onSoftAbort);
 	}
 }
 
@@ -504,6 +547,20 @@ export function createGuard(options = {}) {
 				DEFAULT_GUARD_RESPONSE_IDLE_TIMEOUT_MS,
 			),
 		),
+	);
+	const delayInspectionTimeoutMs = Math.max(
+		1,
+		Math.floor(
+			configuredNumber(
+				options.delayInspectionTimeoutMs ??
+					env.GUARD_DELAY_INSPECTION_TIMEOUT_MS,
+				DEFAULT_GUARD_DELAY_INSPECTION_TIMEOUT_MS,
+			),
+		),
+	);
+	const allowLegacyPoolBody = configuredBoolean(
+		options.allowLegacyPoolBody ?? env.GUARD_ALLOW_LEGACY_POOL_BODY,
+		DEFAULT_GUARD_ALLOW_LEGACY_POOL_BODY,
 	);
 	const shutdownGraceMs = configuredNumber(
 		options.shutdownGraceMs ?? env.GUARD_SHUTDOWN_GRACE_MS,
@@ -890,10 +947,24 @@ export function createGuard(options = {}) {
 
 				// Only a 503 can satisfy the narrow whole-pool policy. Every other
 				// status, including raw 402/429/529 and generic 5xx, is streamed
-				// through without buffering or a second upstream request.
+				// through without buffering or a second upstream request. R21/P2:
+				// the outcome is counted and logged only after the send actually
+				// resolves, so a response that begins but then fails mid-stream
+				// (e.g. the idle watchdog) is never mislabeled a success; on
+				// failure, the outer catch below records the real stop cause.
 				if (upstreamResponse.status !== 503) {
 					recordForwardedStatus(upstreamResponse.status);
 					const outcome = outcomeForStatus(upstreamResponse.status);
+					try {
+						await sendFinalResponse(
+							res,
+							upstreamResponse,
+							context.beginResponse,
+							responseIdleTimeoutMs,
+						);
+					} finally {
+						lease.release();
+					}
 					if (outcome === "success") {
 						counters.success += 1;
 					} else {
@@ -907,105 +978,228 @@ export function createGuard(options = {}) {
 						queuedMs: lease.queuedMs,
 						elapsedMs: now() - context.acceptedAt,
 					});
-					try {
-						await sendFinalResponse(
-							res,
-							upstreamResponse,
-							context.beginResponse,
-							responseIdleTimeoutMs,
-						);
-					} finally {
-						lease.release();
-					}
 					return;
 				}
 
-				let inspection;
-				try {
-					inspection = await readResponseForInspection(
-						upstreamResponse,
-						maxInspectionBytes,
-						context.signal,
-					);
-				} catch (error) {
-					lease.release();
-					throw error;
-				}
-				if (inspection.oversized) {
-					counters.oversizedInspectionBodies += 1;
-					counters.finalError += 1;
-					log("proxy_final_error", {
-						id,
-						attempt,
-						status: upstreamResponse.status,
-						outcome: outcomeForStatus(upstreamResponse.status),
-						reason: "inspection_body_too_large",
-						elapsedMs: now() - context.acceptedAt,
-					});
-					try {
-						await sendPartiallyReadResponse(
-							res,
-							upstreamResponse,
-							inspection,
-							context.beginResponse,
-							responseIdleTimeoutMs,
-						);
-					} finally {
-						lease.release();
-					}
-					return;
-				}
-
-				lease.release();
-				const buffer = inspection.buffer;
-				const decision = evaluateGuardRetry({
+				// P1 ordering/spoofing: the header is classified at HEADER time,
+				// before any body I/O, and settles retry authority on its own.
+				// An oversized, stalled, or malformed body must never cost a
+				// header-confirmed retry its authorization (ordering), and a
+				// header-absent body must never silently grant one unless the
+				// operator has explicitly opted into the legacy fallback
+				// (spoofing).
+				const headerStatus = poolHeaderStatus({
 					status: upstreamResponse.status,
 					headers: upstreamResponse.headers,
-					bodyText: buffer.toString("utf8"),
-					nowMs: now(),
 				});
-				const elapsedMs = now() - context.acceptedAt;
-				if (!decision.retry) {
-					counters.finalError += 1;
-					log("proxy_final_error", {
+
+				if (headerStatus === "confirmed") {
+					// Retry is already authorized. Release the slot immediately:
+					// nothing past this point should hold a concurrency permit
+					// hostage to upstream body I/O.
+					lease.release();
+
+					let delayMs = 0;
+					let recoverySource = null;
+					const peekController = new AbortController();
+					const peekTimer = setTimeout(
+						() => peekController.abort(),
+						delayInspectionTimeoutMs,
+					);
+					peekTimer.unref?.();
+					try {
+						const inspection = await readResponseForInspection(
+							upstreamResponse,
+							maxInspectionBytes,
+							context.signal,
+							peekController.signal,
+						);
+						if (inspection.oversized) {
+							counters.oversizedInspectionBodies += 1;
+							if (inspection.reader) {
+								try {
+									await inspection.reader.cancel();
+								} catch {
+									// Best-effort: the retry is already authorized.
+								}
+							} else {
+								try {
+									await upstreamResponse.body?.cancel();
+								} catch {
+									// Best-effort.
+								}
+							}
+						} else {
+							const hint = evaluateGuardRetry({
+								status: upstreamResponse.status,
+								headers: upstreamResponse.headers,
+								bodyText: inspection.buffer.toString("utf8"),
+								nowMs: now(),
+								allowLegacyBody: allowLegacyPoolBody,
+							});
+							delayMs = hint.delayMs;
+							recoverySource = hint.recoverySource;
+						}
+					} catch (error) {
+						// A genuine deadline/client abort must still propagate; the
+						// bounded peek's own short timeout (or any other body-read
+						// error) degrades silently to no delay hint instead -- the
+						// reader has already been cancelled by
+						// readResponseForInspection.
+						if (context.signal.aborted) throw error;
+					} finally {
+						clearTimeout(peekTimer);
+					}
+
+					counters.poolExhausted += 1;
+					if (attempt >= maxAttempts) {
+						sendAttemptsExhausted(res, context, attempt);
+						return;
+					}
+					context.ensureBudget();
+					counters.retried += 1;
+					const jitter = Math.floor(random() * jitterMs);
+					const boundedDelayMs = Math.min(
+						delayMs + jitter,
+						context.remainingMs(),
+					);
+					log("proxy_retry_wait", {
 						id,
 						attempt,
 						status: upstreamResponse.status,
-						outcome: outcomeForStatus(upstreamResponse.status),
-						reason: decision.reason,
-						elapsedMs,
+						reason: "pool_exhausted",
+						recoverySource,
+						delayMs: boundedDelayMs,
+						elapsedMs: now() - context.acceptedAt,
 					});
-					await sendBufferedResponse(
-						res,
-						upstreamResponse,
-						buffer,
-						context.beginResponse,
-					);
-					return;
+					await sleep(boundedDelayMs, context.signal);
+					continue;
 				}
 
-				counters.poolExhausted += 1;
-				if (attempt >= maxAttempts) {
-					sendAttemptsExhausted(res, context, attempt);
-					return;
+				if (headerStatus === "absent" && allowLegacyPoolBody) {
+					// Rolling-upgrade escape hatch: the header is absent (e.g. an
+					// older, not-yet-redeployed proxy), and the operator has
+					// explicitly opted into trusting a bounded, buffered body-shape
+					// check instead. Unlike the confirmed-header path, no header
+					// has authorized retry yet, so this read is governed by the
+					// real deadline, not a short best-effort peek.
+					let inspection;
+					try {
+						inspection = await readResponseForInspection(
+							upstreamResponse,
+							maxInspectionBytes,
+							context.signal,
+						);
+					} catch (error) {
+						lease.release();
+						throw error;
+					}
+					if (inspection.oversized) {
+						counters.oversizedInspectionBodies += 1;
+						counters.finalError += 1;
+						log("proxy_final_error", {
+							id,
+							attempt,
+							status: upstreamResponse.status,
+							outcome: outcomeForStatus(upstreamResponse.status),
+							reason: "inspection_body_too_large",
+							elapsedMs: now() - context.acceptedAt,
+						});
+						try {
+							await sendPartiallyReadResponse(
+								res,
+								upstreamResponse,
+								inspection,
+								context.beginResponse,
+								responseIdleTimeoutMs,
+							);
+						} finally {
+							lease.release();
+						}
+						return;
+					}
+
+					lease.release();
+					const buffer = inspection.buffer;
+					const decision = evaluateGuardRetry({
+						status: upstreamResponse.status,
+						headers: upstreamResponse.headers,
+						bodyText: buffer.toString("utf8"),
+						nowMs: now(),
+						allowLegacyBody: allowLegacyPoolBody,
+					});
+					const elapsedMs = now() - context.acceptedAt;
+					if (!decision.retry) {
+						counters.finalError += 1;
+						log("proxy_final_error", {
+							id,
+							attempt,
+							status: upstreamResponse.status,
+							outcome: outcomeForStatus(upstreamResponse.status),
+							reason: decision.reason,
+							elapsedMs,
+						});
+						await sendBufferedResponse(
+							res,
+							upstreamResponse,
+							buffer,
+							context.beginResponse,
+						);
+						return;
+					}
+
+					counters.poolExhausted += 1;
+					if (attempt >= maxAttempts) {
+						sendAttemptsExhausted(res, context, attempt);
+						return;
+					}
+					context.ensureBudget();
+					counters.retried += 1;
+					const jitter = Math.floor(random() * jitterMs);
+					const delayMs = Math.min(
+						decision.delayMs + jitter,
+						context.remainingMs(),
+					);
+					log("proxy_retry_wait", {
+						id,
+						attempt,
+						status: upstreamResponse.status,
+						reason: decision.reason,
+						recoverySource: decision.recoverySource,
+						delayMs,
+						elapsedMs,
+					});
+					await sleep(delayMs, context.signal);
+					continue;
 				}
-				context.ensureBudget();
-				counters.retried += 1;
-				const jitter = Math.floor(random() * jitterMs);
-				const delayMs = Math.min(
-					decision.delayMs + jitter,
-					context.remainingMs(),
-				);
-				log("proxy_retry_wait", {
+
+				// Header denies exhaustion, or is absent and the legacy body-only
+				// fallback is disabled (default): the retry decision needs no
+				// body at all, so stream the response straight through rather
+				// than buffering it under the inspection cap for nothing.
+				counters.finalError += 1;
+				log("proxy_final_error", {
 					id,
 					attempt,
 					status: upstreamResponse.status,
-					reason: decision.reason,
-					recoverySource: decision.recoverySource,
-					delayMs,
-					elapsedMs,
+					outcome: outcomeForStatus(upstreamResponse.status),
+					reason:
+						headerStatus === "denied"
+							? "pool_not_exhausted"
+							: "header_absent_legacy_body_disabled",
+					elapsedMs: now() - context.acceptedAt,
 				});
-				await sleep(delayMs, context.signal);
+				try {
+					await sendFinalResponse(
+						res,
+						upstreamResponse,
+						context.beginResponse,
+						responseIdleTimeoutMs,
+					);
+				} finally {
+					lease.release();
+				}
+				return;
 			}
 		} catch (error) {
 			if (handleResponseBodyIdleTimeout(error, res, context, attempt)) return;
@@ -1076,6 +1270,8 @@ export function createGuard(options = {}) {
 					jitterMs,
 					maxInspectionBytes,
 					responseIdleTimeoutMs,
+					delayInspectionTimeoutMs,
+					allowLegacyPoolBody,
 					shutdownGraceMs,
 					runtime: {
 						...runtimeIdentity,
@@ -1085,6 +1281,8 @@ export function createGuard(options = {}) {
 							jitterMs,
 							maxInspectionBytes,
 							responseIdleTimeoutMs,
+							delayInspectionTimeoutMs,
+							allowLegacyPoolBody,
 							shutdownGraceMs,
 							maxActive,
 							maxQueue,
@@ -1168,6 +1366,8 @@ export function createGuard(options = {}) {
 					totalDeadlineMs,
 					maxInspectionBytes,
 					responseIdleTimeoutMs,
+					delayInspectionTimeoutMs,
+					allowLegacyPoolBody,
 				});
 				resolve(address);
 			});
