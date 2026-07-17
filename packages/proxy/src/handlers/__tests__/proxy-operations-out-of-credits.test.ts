@@ -7,11 +7,22 @@ import {
 	mock,
 	spyOn,
 } from "bun:test";
-import { usageCache } from "@better-ccflare/providers";
 import type { Account, RequestMeta } from "@better-ccflare/types";
-import { proxyWithAccount } from "../proxy-operations";
 import type { ProxyContext } from "../proxy-types";
-import { getRequestRateLimitOutcomes } from "../rate-limit-scope";
+
+// Source worktrees intentionally exclude generated database worker bundles.
+// This focused proxy harness supplies dbOps directly and never constructs these
+// classes, so keep the unit test independent from generated build artifacts.
+mock.module("@better-ccflare/database", () => ({
+	AsyncDbWriter: class AsyncDbWriter {},
+	DatabaseFactory: class DatabaseFactory {},
+	DatabaseOperations: class DatabaseOperations {},
+	ModelTranslationRepository: class ModelTranslationRepository {},
+}));
+
+const { usageCache } = await import("@better-ccflare/providers");
+const { proxyWithAccount } = await import("../proxy-operations");
+const { getRequestRateLimitOutcomes } = await import("../rate-limit-scope");
 
 // Anthropic account fixture — the out_of_credits header is Anthropic-specific.
 function makeAccount(overrides: Partial<Account> = {}): Account {
@@ -504,6 +515,51 @@ function generic429Response(headers: HeadersInit = {}): Response {
 	);
 }
 
+function successfulClaudeResponse(model: string): Response {
+	return new Response(
+		JSON.stringify({
+			id: "msg-success",
+			type: "message",
+			role: "assistant",
+			content: [{ type: "text", text: "ok" }],
+			model,
+			stop_reason: "end_turn",
+			usage: { input_tokens: 1, output_tokens: 1 },
+		}),
+		{ status: 200, headers: { "content-type": "application/json" } },
+	);
+}
+
+async function proxyUntilSuccessfulTransport(
+	req: Request,
+	account: Account,
+	ctx: ProxyContext,
+	bodyBuffer: ArrayBuffer,
+): Promise<Response | null> {
+	try {
+		return await proxyWithAccount(
+			req,
+			new URL(req.url),
+			account,
+			makeRequestMeta(),
+			bodyBuffer,
+			() => undefined,
+			0,
+			ctx,
+		);
+	} catch (error) {
+		// A successful transport reaches forwardToClient, whose global collector is
+		// intentionally not initialized by this focused unit-test harness.
+		if (
+			!(error instanceof Error) ||
+			!error.message.includes("UsageCollector not initialized")
+		) {
+			throw error;
+		}
+		return null;
+	}
+}
+
 describe("proxyWithAccount — generic Anthropic 429 scope", () => {
 	let originalFetch: typeof globalThis.fetch;
 	let realDateNow: typeof Date.now;
@@ -854,6 +910,267 @@ interface ObservableErrorResponse {
 	response: Response;
 	cancelCount: () => number;
 }
+
+describe("proxyWithAccount — scoped same-account model continuation", () => {
+	let originalFetch: typeof globalThis.fetch;
+	let realDateNow: typeof Date.now;
+
+	beforeEach(() => {
+		originalFetch = globalThis.fetch;
+		realDateNow = Date.now;
+		Date.now = () => INCIDENT_NOW;
+	});
+
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+		Date.now = realDateNow;
+		usageCache.delete("acc-anthropic-1");
+	});
+
+	it("continues from an initial Fable family failure to distinct Opus", async () => {
+		cacheIncidentUsage("acc-anthropic-1", INCIDENT_NOW - 120_000);
+		const scopedFable = observableErrorResponse(429);
+		const attemptedModels: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const request = input instanceof Request ? input : new Request(input);
+			const body = (await request.clone().json()) as { model?: string };
+			const model = body.model ?? "missing";
+			attemptedModels.push(model);
+			return attemptedModels.length === 1
+				? scopedFable.response
+				: successfulClaudeResponse(model);
+		});
+		const ctx = makeProxyContextWithAsyncExec();
+		const account = makeAccount({
+			model_mappings: JSON.stringify({
+				fable: ["claude-fable-5", "claude-opus-4-8"],
+			}),
+		});
+		const bodyBuffer = makeRequestBody("claude-fable-5");
+		const req = makeRequest(bodyBuffer);
+
+		await proxyUntilSuccessfulTransport(req, account, ctx, bodyBuffer);
+
+		expect(attemptedModels).toEqual(["claude-fable-5", "claude-opus-4-8"]);
+		expect(scopedFable.cancelCount()).toBe(1);
+		expect(account.rate_limited_until).toBeNull();
+		expect(ctx.dbOps.markAccountRateLimited).not.toHaveBeenCalled();
+		expect(getRequestRateLimitOutcomes(req)).toEqual([
+			expect.objectContaining({
+				scope: "family",
+				family: "fable",
+				attemptedModel: "claude-fable-5",
+			}),
+		]);
+	});
+
+	it("continues past an intermediate Fable family failure to Opus", async () => {
+		cacheIncidentUsage("acc-anthropic-1", INCIDENT_NOW - 120_000);
+		const scopedFable = observableErrorResponse(429);
+		const attemptedModels: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const request = input instanceof Request ? input : new Request(input);
+			const body = (await request.clone().json()) as { model?: string };
+			const model = body.model ?? "missing";
+			attemptedModels.push(model);
+			if (attemptedModels.length === 1) {
+				return new Response(
+					JSON.stringify({
+						type: "error",
+						error: { type: "not_found_error", message: "model not found" },
+					}),
+					{ status: 404, headers: { "content-type": "application/json" } },
+				);
+			}
+			return attemptedModels.length === 2
+				? scopedFable.response
+				: successfulClaudeResponse(model);
+		});
+		const ctx = makeProxyContextWithAsyncExec();
+		const account = makeAccount({
+			model_mappings: JSON.stringify({
+				sonnet: ["claude-sonnet-4-5", "claude-fable-5", "claude-opus-4-8"],
+			}),
+		});
+		const bodyBuffer = makeRequestBody("claude-sonnet-4-5");
+		const req = makeRequest(bodyBuffer);
+
+		await proxyUntilSuccessfulTransport(req, account, ctx, bodyBuffer);
+
+		expect(attemptedModels).toEqual([
+			"claude-sonnet-4-5",
+			"claude-fable-5",
+			"claude-opus-4-8",
+		]);
+		expect(scopedFable.cancelCount()).toBe(1);
+		expect(account.rate_limited_until).toBeNull();
+		expect(ctx.dbOps.markAccountRateLimited).not.toHaveBeenCalled();
+		expect(getRequestRateLimitOutcomes(req)).toEqual([
+			expect.objectContaining({
+				scope: "family",
+				family: "fable",
+				attemptedModel: "claude-fable-5",
+			}),
+		]);
+	});
+
+	it("an exact-model failure still permits a distinct model in the same family", async () => {
+		const exactFable = observableErrorResponse(429, {
+			"anthropic-ratelimit-unified-overage-disabled-reason": "out_of_credits",
+		});
+		const attemptedModels: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const request = input instanceof Request ? input : new Request(input);
+			const body = (await request.clone().json()) as { model?: string };
+			const model = body.model ?? "missing";
+			attemptedModels.push(model);
+			return attemptedModels.length === 1
+				? exactFable.response
+				: successfulClaudeResponse(model);
+		});
+		const ctx = makeProxyContextWithAsyncExec();
+		const account = makeAccount({
+			model_mappings: JSON.stringify({
+				fable: ["claude-fable-5", "claude-fable-5-20260701", "claude-opus-4-8"],
+			}),
+		});
+		const bodyBuffer = makeRequestBody("claude-fable-5");
+		const req = makeRequest(bodyBuffer);
+
+		await proxyUntilSuccessfulTransport(req, account, ctx, bodyBuffer);
+
+		expect(attemptedModels).toEqual([
+			"claude-fable-5",
+			"claude-fable-5-20260701",
+		]);
+		expect(exactFable.cancelCount()).toBe(1);
+		expect(account.rate_limited_until).toBeNull();
+		expect(ctx.dbOps.markAccountRateLimited).not.toHaveBeenCalled();
+		expect(getRequestRateLimitOutcomes(req)).toEqual([
+			expect.objectContaining({
+				scope: "model",
+				family: "fable",
+				attemptedModel: "claude-fable-5",
+			}),
+		]);
+	});
+
+	it("preserves keepalive termination without probing a configured fallback", async () => {
+		const exactFable = observableErrorResponse(429, {
+			"anthropic-ratelimit-unified-overage-disabled-reason": "out_of_credits",
+		});
+		const attemptedModels: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const request = input instanceof Request ? input : new Request(input);
+			const body = (await request.clone().json()) as { model?: string };
+			attemptedModels.push(body.model ?? "missing");
+			return exactFable.response;
+		});
+		const ctx = makeProxyContextWithAsyncExec();
+		const account = makeAccount({
+			model_mappings: JSON.stringify({
+				fable: ["claude-fable-5", "claude-opus-4-8"],
+			}),
+		});
+		const bodyBuffer = makeRequestBody("claude-fable-5");
+		const req = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			body: bodyBuffer,
+			headers: {
+				"content-type": "application/json",
+				"x-better-ccflare-keepalive": "true",
+			},
+		});
+
+		const result = await proxyWithAccount(
+			req,
+			new URL(req.url),
+			account,
+			makeRequestMeta(),
+			bodyBuffer,
+			() => undefined,
+			0,
+			ctx,
+		);
+
+		expect(result).toBeNull();
+		expect(attemptedModels).toEqual(["claude-fable-5"]);
+		expect(exactFable.cancelCount()).toBe(1);
+		expect(account.rate_limited_until).toBeNull();
+		expect(ctx.dbOps.markAccountRateLimited).not.toHaveBeenCalled();
+		expect(getRequestRateLimitOutcomes(req)).toEqual([]);
+		expect(
+			usageCache.getModelScopedExhaustion(account.id, "claude-fable-5", null),
+		).toBeNull();
+	});
+
+	it("a family marker skips later same-family candidates before trying Opus", async () => {
+		cacheIncidentUsage("acc-anthropic-1", INCIDENT_NOW - 120_000);
+		const scopedFable = observableErrorResponse(429);
+		const attemptedModels: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const request = input instanceof Request ? input : new Request(input);
+			const body = (await request.clone().json()) as { model?: string };
+			const model = body.model ?? "missing";
+			attemptedModels.push(model);
+			return attemptedModels.length === 1
+				? scopedFable.response
+				: successfulClaudeResponse(model);
+		});
+		const ctx = makeProxyContextWithAsyncExec();
+		const account = makeAccount({
+			model_mappings: JSON.stringify({
+				fable: ["claude-fable-5", "claude-fable-5-20260701", "claude-opus-4-8"],
+			}),
+		});
+		const bodyBuffer = makeRequestBody("claude-fable-5");
+		const req = makeRequest(bodyBuffer);
+
+		await proxyUntilSuccessfulTransport(req, account, ctx, bodyBuffer);
+
+		expect(attemptedModels).toEqual(["claude-fable-5", "claude-opus-4-8"]);
+		expect(scopedFable.cancelCount()).toBe(1);
+		expect(account.rate_limited_until).toBeNull();
+		expect(ctx.dbOps.markAccountRateLimited).not.toHaveBeenCalled();
+	});
+
+	it("fails over without account cooldown when family pruning leaves no candidate", async () => {
+		cacheIncidentUsage("acc-anthropic-1", INCIDENT_NOW - 120_000);
+		const scopedFable = observableErrorResponse(429);
+		const attemptedModels: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const request = input instanceof Request ? input : new Request(input);
+			const body = (await request.clone().json()) as { model?: string };
+			attemptedModels.push(body.model ?? "missing");
+			return scopedFable.response;
+		});
+		const ctx = makeProxyContextWithAsyncExec();
+		const account = makeAccount({
+			model_mappings: JSON.stringify({
+				fable: ["claude-fable-5", "claude-fable-5-20260701"],
+			}),
+		});
+		const bodyBuffer = makeRequestBody("claude-fable-5");
+		const req = makeRequest(bodyBuffer);
+
+		const result = await proxyWithAccount(
+			req,
+			new URL(req.url),
+			account,
+			makeRequestMeta(),
+			bodyBuffer,
+			() => undefined,
+			0,
+			ctx,
+		);
+
+		expect(result).toBeNull();
+		expect(attemptedModels).toEqual(["claude-fable-5"]);
+		expect(scopedFable.cancelCount()).toBe(1);
+		expect(account.rate_limited_until).toBeNull();
+		expect(ctx.dbOps.markAccountRateLimited).not.toHaveBeenCalled();
+	});
+});
 
 function observableErrorResponse(
 	status: number,
