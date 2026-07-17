@@ -116,6 +116,101 @@ async function allocatePort(): Promise<number> {
 	return address.port;
 }
 
+async function startGatewayFixture(rawResponse: string): Promise<{
+	port: number;
+	close: () => Promise<void>;
+}> {
+	const server = createServer((socket) => {
+		socket.end(rawResponse);
+	});
+	await new Promise<void>((resolve, reject) => {
+		server.once("error", reject);
+		server.listen(0, "127.0.0.1", () => resolve());
+	});
+	const address = server.address();
+	if (!address || typeof address === "string") {
+		server.close();
+		throw new Error("failed to start gateway fixture");
+	}
+	return {
+		port: address.port,
+		close: () =>
+			new Promise<void>((resolve, reject) => {
+				server.close((error) => (error ? reject(error) : resolve()));
+			}),
+	};
+}
+
+function gatewayHttpResponse(status: number): string {
+	const body =
+		status === 401
+			? '{"type":"auth_error","error":{"message":"No API key provided"}}'
+			: "{}";
+	return [
+		`HTTP/1.1 ${status} Fixture`,
+		"Content-Type: application/json",
+		`Content-Length: ${Buffer.byteLength(body)}`,
+		"Connection: close",
+		"",
+		body,
+	].join("\r\n");
+}
+
+async function runRunnerGatewayProbe(
+	port: number,
+	required = true,
+): Promise<{ exitCode: number | null; stdout: string; stderr: string }> {
+	const upstreamPort = await allocatePort();
+	const guardPort = await allocatePort();
+	const child = spawn(
+		"bash",
+		[
+			"-c",
+			`exec bash ${shellQuote(shellPath(runnerScript))}`,
+		],
+		{
+			cwd: repoRoot,
+			env: bashChildEnv({
+				CCFLARE_BIN: "/bin/false",
+				GUARD_SCRIPT: "/bin/true",
+				NODE_BIN: "/bin/true",
+				CCFLARE_UPSTREAM_PORT: String(upstreamPort),
+				GUARD_PORT: String(guardPort),
+				AI_GATEWAY_TUNNEL_ENABLED: "1",
+				AI_GATEWAY_TUNNEL_REQUIRED: required ? "1" : "0",
+				AI_GATEWAY_LOCAL_PORT: String(port),
+				// If the local probe is rejected, make the attempted SSH child fail
+				// locally and immediately instead of touching the network.
+				AI_GATEWAY_SSH_HOST: "-Z",
+			}),
+			stdio: ["ignore", "pipe", "pipe"],
+		},
+	);
+	let stdout = "";
+	let stderr = "";
+	child.stdout.on("data", (chunk) => {
+		stdout += chunk.toString();
+	});
+	child.stderr.on("data", (chunk) => {
+		stderr += chunk.toString();
+	});
+	try {
+		const exitCode = await Promise.race([
+			new Promise<number | null>((resolve) => child.once("exit", resolve)),
+			Bun.sleep(5_000).then(() => {
+				throw new Error(
+					`runner gateway probe timed out:\n${stdout}\n${stderr}`,
+				);
+			}),
+		]);
+		return { exitCode, stdout, stderr };
+	} finally {
+		if (child.exitCode === null && child.signalCode === null) {
+			child.kill("SIGKILL");
+		}
+	}
+}
+
 async function waitFor(
 	predicate: () => boolean,
 	timeoutMs: number,
@@ -396,12 +491,64 @@ describe("source-controlled stack runner", () => {
 		);
 	});
 
-	test("requires an HTTP-success response from gateway health", () => {
-		const source = readFileSync(runnerScript, "utf8");
-		expect(source).toContain(
-			'curl -fsS --max-time 2 -o /dev/null "http://127.0.0.1:${AI_GATEWAY_LOCAL_PORT}/health"',
+	test("accepts only 2xx and the unauthenticated 401 gateway boundary", async () => {
+		for (const status of [200, 299, 401]) {
+			const fixture = await startGatewayFixture(gatewayHttpResponse(status));
+			try {
+				const result = await runRunnerGatewayProbe(fixture.port);
+				expect(result.stdout).toContain(
+					`ai-gateway tunnel already ready at 127.0.0.1:${fixture.port}`,
+				);
+				expect(result.stdout).toContain("starting better-ccflare upstream");
+			} finally {
+				await fixture.close();
+			}
+		}
+	}, 15_000);
+
+	test("rejects redirects, other errors, malformed HTTP, and connection failure", async () => {
+		for (const response of [
+			gatewayHttpResponse(302),
+			gatewayHttpResponse(403),
+			gatewayHttpResponse(503),
+			"not an HTTP response\r\n",
+		]) {
+			const fixture = await startGatewayFixture(response);
+			try {
+				const result = await runRunnerGatewayProbe(fixture.port);
+				expect(result.stdout).toContain(
+					"ai-gateway tunnel is required; exiting",
+				);
+				expect(result.stdout).not.toContain(
+					"starting better-ccflare upstream",
+				);
+			} finally {
+				await fixture.close();
+			}
+		}
+
+		const closedPort = await allocatePort();
+		const connectionFailure = await runRunnerGatewayProbe(closedPort);
+		expect(connectionFailure.stdout).toContain(
+			"ai-gateway tunnel is required; exiting",
 		);
-	});
+		expect(connectionFailure.stdout).not.toContain(
+			"starting better-ccflare upstream",
+		);
+	}, 15_000);
+
+	test("retains optional-tunnel startup when gateway liveness is rejected", async () => {
+		const fixture = await startGatewayFixture(gatewayHttpResponse(503));
+		try {
+			const result = await runRunnerGatewayProbe(fixture.port, false);
+			expect(result.stdout).toContain(
+				"ai-gateway tunnel unavailable; continuing without last-resort fallback",
+			);
+			expect(result.stdout).toContain("starting better-ccflare upstream");
+		} finally {
+			await fixture.close();
+		}
+	}, 5_000);
 
 	test("gives the guard its configured drain plus cushion before short child shutdowns", async () => {
 		const dir = tempDir();

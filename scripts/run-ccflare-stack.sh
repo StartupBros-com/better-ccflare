@@ -118,7 +118,14 @@ wait_for_url() {
 }
 
 ai_gateway_tunnel_ready() {
-	curl -fsS --max-time 2 -o /dev/null "http://127.0.0.1:${AI_GATEWAY_LOCAL_PORT}/health" >/dev/null 2>&1
+	local http_status
+	if ! http_status=$(curl -sS --max-time 2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:${AI_GATEWAY_LOCAL_PORT}/health" 2>/dev/null); then
+		return 1
+	fi
+	case "$http_status" in
+		2[0-9][0-9] | 401) return 0 ;;
+		*) return 1 ;;
+	esac
 }
 
 start_ai_gateway_tunnel() {
