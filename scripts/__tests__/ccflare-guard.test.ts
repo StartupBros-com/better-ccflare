@@ -639,6 +639,108 @@ describe("source-controlled guard", () => {
 		expect(attempts).toBe(3);
 	});
 
+	// R21: the guard's own proxy_response/proxy_final_error log events and
+	// counters must label a terminal upstream error unambiguously, unlike the
+	// legacy guard's `proxy_success` event, which fired for any status outside
+	// a specific retry-candidate list (including 400/402/403/404), so a 402
+	// insufficient-balance error could be mistaken for a success in the logs.
+	test("logs and counts a terminal client error as outcome final_error, never success", async () => {
+		const events: Array<Record<string, unknown>> = [];
+		const upstreamBase = await listen(
+			http.createServer((_req, res) => {
+				res.writeHead(402, { "content-type": "application/json" });
+				res.end(JSON.stringify({ error: { type: "insufficient_balance" } }));
+			}),
+		);
+		const { baseUrl, guard } = await startGuard(upstreamBase, {
+			logger: (line: string) => events.push(JSON.parse(line)),
+		});
+
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+
+		expect(response.status).toBe(402);
+		const proxyResponseEvents = events.filter(
+			(event) => event.event === "proxy_response",
+		);
+		expect(proxyResponseEvents).toHaveLength(1);
+		expect(proxyResponseEvents[0]).toMatchObject({
+			status: 402,
+			outcome: "final_error",
+		});
+		expect(events.some((event) => event.outcome === "success")).toBe(false);
+		expect(guard.state.counters.finalError).toBe(1);
+		expect(guard.state.counters.success).toBe(0);
+	});
+
+	test("logs and counts a 2xx response as outcome success", async () => {
+		const events: Array<Record<string, unknown>> = [];
+		const upstreamBase = await listen(
+			http.createServer((_req, res) => {
+				res.writeHead(200, { "content-type": "application/json" });
+				res.end(JSON.stringify({ ok: true }));
+			}),
+		);
+		const { baseUrl, guard } = await startGuard(upstreamBase, {
+			logger: (line: string) => events.push(JSON.parse(line)),
+		});
+
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+
+		expect(response.status).toBe(200);
+		const proxyResponseEvents = events.filter(
+			(event) => event.event === "proxy_response",
+		);
+		expect(proxyResponseEvents).toHaveLength(1);
+		expect(proxyResponseEvents[0]).toMatchObject({
+			status: 200,
+			outcome: "success",
+		});
+		expect(events.some((event) => event.outcome === "final_error")).toBe(
+			false,
+		);
+		expect(guard.state.counters.success).toBe(1);
+		expect(guard.state.counters.finalError).toBe(0);
+	});
+
+	// R21: a non-retryable 503 (the header/body do not confirm pool
+	// exhaustion) is forwarded exactly once via proxy_final_error, and that
+	// path must be labeled final_error too, not just the proxy_response path.
+	test("logs and counts a non-retryable 503 as outcome final_error via proxy_final_error", async () => {
+		const events: Array<Record<string, unknown>> = [];
+		const upstreamBase = await listen(
+			http.createServer((_req, res) => {
+				res.writeHead(503, { "content-type": "application/json" });
+				res.end(JSON.stringify({ error: { type: "service_unavailable" } }));
+			}),
+		);
+		const { baseUrl, guard } = await startGuard(upstreamBase, {
+			logger: (line: string) => events.push(JSON.parse(line)),
+		});
+
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+
+		expect(response.status).toBe(503);
+		const finalErrorEvents = events.filter(
+			(event) => event.event === "proxy_final_error",
+		);
+		expect(finalErrorEvents).toHaveLength(1);
+		expect(finalErrorEvents[0]).toMatchObject({
+			status: 503,
+			outcome: "final_error",
+		});
+		expect(guard.state.counters.finalError).toBe(1);
+		expect(guard.state.counters.success).toBe(0);
+	});
+
 	test("retains the active-request queue bound", async () => {
 		let active = 0;
 		let peakActive = 0;

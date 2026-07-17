@@ -429,6 +429,15 @@ function resolveUpstreamTarget(requestTarget, upstreamUrl) {
 	}
 }
 
+// R21: terminal upstream-driven responses are labeled unambiguously so a
+// forwarded client error (e.g. a 402) can never be mistaken for a success in
+// the guard's own logs and health counters, unlike the legacy guard's
+// `proxy_success` event, which used to fire for any status outside a
+// specific retry-candidate list, including 400/402/403/404.
+export function outcomeForStatus(status) {
+	return status >= 200 && status < 300 ? "success" : "final_error";
+}
+
 export function createGuard(options = {}) {
 	const env = options.env || process.env;
 	const listenHost = options.listenHost ?? env.GUARD_HOST ?? "127.0.0.1";
@@ -531,6 +540,10 @@ export function createGuard(options = {}) {
 		attemptsExhausted: 0,
 		oversizedInspectionBodies: 0,
 		responseBodyIdleTimeouts: 0,
+		// R21: per-outcome counts for terminal upstream-driven responses logged
+		// via proxy_response/proxy_final_error (see outcomeForStatus above).
+		success: 0,
+		finalError: 0,
 	};
 	let active = 0;
 	const queue = [];
@@ -880,10 +893,17 @@ export function createGuard(options = {}) {
 				// through without buffering or a second upstream request.
 				if (upstreamResponse.status !== 503) {
 					recordForwardedStatus(upstreamResponse.status);
+					const outcome = outcomeForStatus(upstreamResponse.status);
+					if (outcome === "success") {
+						counters.success += 1;
+					} else {
+						counters.finalError += 1;
+					}
 					log("proxy_response", {
 						id,
 						attempt,
 						status: upstreamResponse.status,
+						outcome,
 						queuedMs: lease.queuedMs,
 						elapsedMs: now() - context.acceptedAt,
 					});
@@ -913,10 +933,12 @@ export function createGuard(options = {}) {
 				}
 				if (inspection.oversized) {
 					counters.oversizedInspectionBodies += 1;
+					counters.finalError += 1;
 					log("proxy_final_error", {
 						id,
 						attempt,
 						status: upstreamResponse.status,
+						outcome: outcomeForStatus(upstreamResponse.status),
 						reason: "inspection_body_too_large",
 						elapsedMs: now() - context.acceptedAt,
 					});
@@ -944,10 +966,12 @@ export function createGuard(options = {}) {
 				});
 				const elapsedMs = now() - context.acceptedAt;
 				if (!decision.retry) {
+					counters.finalError += 1;
 					log("proxy_final_error", {
 						id,
 						attempt,
 						status: upstreamResponse.status,
+						outcome: outcomeForStatus(upstreamResponse.status),
 						reason: decision.reason,
 						elapsedMs,
 					});
