@@ -42,7 +42,8 @@ function makeDb(): { db: Database; repo: AccountRepository } {
 			cross_region_mode TEXT,
 			model_fallbacks TEXT,
 			billing_type TEXT,
-			pause_reason TEXT
+			pause_reason TEXT,
+			consecutive_rate_limits INTEGER DEFAULT 0
 		)
 	`);
 
@@ -166,5 +167,183 @@ describe("AccountRepository — setRateLimited with reason audit (issue #178)", 
 			expect(row.rate_limited_until).toBe(until2);
 			expect(row.rate_limited_reason).toBe("model_fallback_429");
 		});
+	});
+});
+
+interface RawConsecutiveAudit extends RawRateLimitAudit {
+	consecutive_rate_limits: number;
+}
+
+function getFullAudit(db: Database, id: string): RawConsecutiveAudit {
+	return db
+		.query<RawConsecutiveAudit, [string]>(
+			"SELECT rate_limited_until, rate_limited_reason, rate_limited_at, consecutive_rate_limits FROM accounts WHERE id = ?",
+		)
+		.get(id) as RawConsecutiveAudit;
+}
+
+describe("AccountRepository - markAccountRateLimited MAX-style clamp under concurrent writers", () => {
+	let db: Database;
+	let repo: AccountRepository;
+
+	beforeEach(() => {
+		({ db, repo } = makeDb());
+	});
+
+	afterEach(() => {
+		db.close();
+	});
+
+	it("applies the first-ever write unconditionally (until was NULL)", async () => {
+		insertAccount(db, "acc-clamp-1");
+		const until = Date.now() + 1000;
+
+		const count = await repo.markAccountRateLimited(
+			"acc-clamp-1",
+			until,
+			"xai_capacity_402",
+		);
+
+		const row = getFullAudit(db, "acc-clamp-1");
+		expect(row.rate_limited_until).toBe(until);
+		expect(row.rate_limited_reason).toBe("xai_capacity_402");
+		expect(count).toBe(1);
+		expect(row.consecutive_rate_limits).toBe(1);
+	});
+
+	it("always increments consecutive_rate_limits regardless of clamp outcome", async () => {
+		insertAccount(db, "acc-clamp-2");
+		const now = Date.now();
+
+		await repo.markAccountRateLimited(
+			"acc-clamp-2",
+			now + 10_000,
+			"xai_capacity_402",
+		);
+		// Later call with a SMALLER until (would be discarded by the clamp).
+		const count = await repo.markAccountRateLimited(
+			"acc-clamp-2",
+			now + 1_000,
+			"xai_capacity_402",
+		);
+
+		expect(count).toBe(2);
+		const row = getFullAudit(db, "acc-clamp-2");
+		expect(row.consecutive_rate_limits).toBe(2);
+	});
+
+	it("retains the later deadline when a stale write with an earlier until arrives after", async () => {
+		insertAccount(db, "acc-clamp-3");
+		const now = Date.now();
+		const laterUntil = now + 10_000;
+		const earlierUntil = now + 1_000;
+
+		// Write the far-future deadline first...
+		await repo.markAccountRateLimited(
+			"acc-clamp-3",
+			laterUntil,
+			"xai_capacity_402",
+		);
+		// ...then a stale/delayed concurrent writer arrives with a SHORTER
+		// deadline. The clamp must not shorten the already-persisted cooldown.
+		await repo.markAccountRateLimited(
+			"acc-clamp-3",
+			earlierUntil,
+			"xai_capacity_402",
+		);
+
+		const row = getFullAudit(db, "acc-clamp-3");
+		expect(row.rate_limited_until).toBe(laterUntil);
+	});
+
+	it("advances the deadline when a genuinely later until arrives", async () => {
+		insertAccount(db, "acc-clamp-4");
+		const now = Date.now();
+		const earlierUntil = now + 1_000;
+		const laterUntil = now + 10_000;
+
+		await repo.markAccountRateLimited(
+			"acc-clamp-4",
+			earlierUntil,
+			"xai_capacity_402",
+		);
+		await repo.markAccountRateLimited(
+			"acc-clamp-4",
+			laterUntil,
+			"xai_capacity_402",
+		);
+
+		const row = getFullAudit(db, "acc-clamp-4");
+		expect(row.rate_limited_until).toBe(laterUntil);
+	});
+
+	it("pairs the retained reason with the retained (winning) deadline, not the discarded write's reason", async () => {
+		insertAccount(db, "acc-clamp-5");
+		const now = Date.now();
+		const laterUntil = now + 10_000;
+		const earlierUntil = now + 1_000;
+
+		await repo.markAccountRateLimited(
+			"acc-clamp-5",
+			laterUntil,
+			"xai_capacity_402",
+		);
+		// Stale writer carries a DIFFERENT reason paired with its (losing) shorter until.
+		await repo.markAccountRateLimited(
+			"acc-clamp-5",
+			earlierUntil,
+			"upstream_429_with_reset",
+		);
+
+		const row = getFullAudit(db, "acc-clamp-5");
+		expect(row.rate_limited_until).toBe(laterUntil);
+		// The reason must stay paired with the deadline that actually won the
+		// clamp (xai_capacity_402), never overwritten by the discarded write.
+		expect(row.rate_limited_reason).toBe("xai_capacity_402");
+	});
+
+	it("updates the reason together with the deadline when the new write wins", async () => {
+		insertAccount(db, "acc-clamp-6");
+		const now = Date.now();
+		const earlierUntil = now + 1_000;
+		const laterUntil = now + 10_000;
+
+		await repo.markAccountRateLimited(
+			"acc-clamp-6",
+			earlierUntil,
+			"upstream_429_with_reset",
+		);
+		await repo.markAccountRateLimited(
+			"acc-clamp-6",
+			laterUntil,
+			"xai_capacity_402",
+		);
+
+		const row = getFullAudit(db, "acc-clamp-6");
+		expect(row.rate_limited_until).toBe(laterUntil);
+		expect(row.rate_limited_reason).toBe("xai_capacity_402");
+	});
+
+	it("returns the authoritative persisted consecutive_rate_limits count", async () => {
+		insertAccount(db, "acc-clamp-7");
+		const now = Date.now();
+
+		await repo.markAccountRateLimited(
+			"acc-clamp-7",
+			now + 1_000,
+			"xai_capacity_402",
+		);
+		await repo.markAccountRateLimited(
+			"acc-clamp-7",
+			now + 2_000,
+			"xai_capacity_402",
+		);
+		const thirdCount = await repo.markAccountRateLimited(
+			"acc-clamp-7",
+			now + 3_000,
+			"xai_capacity_402",
+		);
+
+		expect(thirdCount).toBe(3);
 	});
 });

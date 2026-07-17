@@ -24,7 +24,13 @@ export type RateLimitReason =
 	 *  model-scoped in the rate-limit sense — the account is not benched, and by
 	 *  the time this is detected the response has typically already been passed
 	 *  through to the client. */
-	| "extra_usage_exhausted";
+	| "extra_usage_exhausted"
+	/** Native xAI 402 (payment/capacity) response. A neutral operational reason,
+	 *  not generic payment semantics: xAI returns 402 for capacity exhaustion,
+	 *  not billing failure. Distinct from `upstream_429_with_reset`/
+	 *  `upstream_429_no_reset_probe_cooldown` so operators can tell native xAI
+	 *  capacity cooldowns apart from ordinary upstream rate limiting. */
+	| "xai_capacity_402";
 
 // Usage data types for Anthropic accounts
 export interface UsageWindowData {

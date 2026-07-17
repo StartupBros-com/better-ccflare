@@ -82,31 +82,20 @@ export function resetRateLimitProbeGatesForTests(): void {
 }
 
 /**
- * Single entry point for applying a 429-driven cooldown to an account.
- * Computes exponential-backoff cooldown capped by upstream reset (if any), updates
- * in-memory state, and enqueues the DB-side atomic increment.
- *
- * Must be called from every 429 path (response-processor, model_fallback_429,
- * all_models_exhausted_429, mid-stream sniffer) — never reach into rate_limited_until manually.
- *
- * @param account - The account that just received a 429 (mutated in place).
- * @param rateLimitInfo - `resetTime` (if known) is honored as the cooldown target,
- *   bounded above by the safety ceiling (CCFLARE_RATE_LIMIT_MAX_COOLDOWN_MS) —
- *   see resolveCooldownUntil. Falls back to the exponential backoff only when
- *   no resetTime is provided.
- *   `remaining` is forwarded to the emitted RateLimitError. `reason` overrides the
- *   auto-derived audit reason.
- * @param ctx - The proxy context (provides asyncWriter + dbOps).
+ * In-memory half of applyRateLimitCooldown / applyRateLimitCooldownAwaitingPersist:
+ * computes the exponential-backoff cooldown (capped by upstream reset, if any) and
+ * mutates the account in place. Shared so both the fire-and-forget and the
+ * awaited-persist variants apply identical cooldown math and audit-reason
+ * derivation.
  */
-export function applyRateLimitCooldown(
+function applyRateLimitCooldownInMemory(
 	account: Account,
 	rateLimitInfo: {
 		resetTime?: number;
 		remaining?: number;
 		reason?: RateLimitReason;
 	},
-	ctx: ProxyContext,
-): void {
+): { cooldownUntil: number; reason: RateLimitReason } {
 	const now = Date.now();
 	// Best-effort in-memory computation. The DB write does the authoritative atomic
 	// increment; under parallel 429s the second concurrent request may compute one
@@ -140,6 +129,40 @@ export function applyRateLimitCooldown(
 		);
 	}
 
+	return { cooldownUntil, reason };
+}
+
+/**
+ * Single entry point for applying a 429-driven cooldown to an account.
+ * Computes exponential-backoff cooldown capped by upstream reset (if any), updates
+ * in-memory state, and enqueues the DB-side atomic increment.
+ *
+ * Must be called from every 429 path (response-processor, model_fallback_429,
+ * all_models_exhausted_429, mid-stream sniffer): never reach into rate_limited_until manually.
+ *
+ * @param account - The account that just received a 429 (mutated in place).
+ * @param rateLimitInfo - `resetTime` (if known) is honored as the cooldown target,
+ *   bounded above by the safety ceiling (CCFLARE_RATE_LIMIT_MAX_COOLDOWN_MS),
+ *   see resolveCooldownUntil. Falls back to the exponential backoff only when
+ *   no resetTime is provided.
+ *   `remaining` is forwarded to the emitted RateLimitError. `reason` overrides the
+ *   auto-derived audit reason.
+ * @param ctx - The proxy context (provides asyncWriter + dbOps).
+ */
+export function applyRateLimitCooldown(
+	account: Account,
+	rateLimitInfo: {
+		resetTime?: number;
+		remaining?: number;
+		reason?: RateLimitReason;
+	},
+	ctx: ProxyContext,
+): void {
+	const { cooldownUntil, reason } = applyRateLimitCooldownInMemory(
+		account,
+		rateLimitInfo,
+	);
+
 	ctx.asyncWriter.enqueue(async () => {
 		const persistedCount = await ctx.dbOps.markAccountRateLimited(
 			account.id,
@@ -154,6 +177,59 @@ export function applyRateLimitCooldown(
 			`[ccflare] account=${account.name} cooldown_applied reason=${reason} until=${new Date(cooldownUntil).toISOString()} consecutive=${persistedCount}`,
 		);
 	});
+
+	const rateLimitError = new RateLimitError(
+		account.id,
+		cooldownUntil,
+		rateLimitInfo.remaining,
+	);
+	logError(rateLimitError, log);
+}
+
+/**
+ * Durable-write variant of applyRateLimitCooldown: identical in-memory cooldown
+ * math and audit-reason derivation, but AWAITS the DB-side single-row UPDATE
+ * directly instead of enqueueing it on the (fire-and-forget) async writer queue.
+ *
+ * Required for the native xAI direct-evidence failover path (R9): account
+ * selection reads fresh account state from the DB on every request rather than
+ * consulting a process-local breaker, so a fire-and-forget write could let a
+ * fast follow-up request (e.g. an immediate next turn in the same conversation)
+ * race ahead of the durable cooldown and reselect the same still-cooling-down
+ * account. Callers on this path must await this function before treating
+ * failover as safe to proceed.
+ *
+ * @param account - The account that just received a directly-observed rate
+ *   limit / capacity signal (mutated in place).
+ * @param rateLimitInfo - Same shape and semantics as applyRateLimitCooldown.
+ * @param ctx - The proxy context (provides dbOps; asyncWriter is intentionally
+ *   bypassed for this path).
+ */
+export async function applyRateLimitCooldownAwaitingPersist(
+	account: Account,
+	rateLimitInfo: {
+		resetTime?: number;
+		remaining?: number;
+		reason?: RateLimitReason;
+	},
+	ctx: ProxyContext,
+): Promise<void> {
+	const { cooldownUntil, reason } = applyRateLimitCooldownInMemory(
+		account,
+		rateLimitInfo,
+	);
+
+	const persistedCount = await ctx.dbOps.markAccountRateLimited(
+		account.id,
+		cooldownUntil,
+		reason,
+	);
+	// Reconcile in-memory counter with the authoritative DB value (may differ
+	// under concurrent 402/429s for the same account).
+	account.consecutive_rate_limits = persistedCount;
+	log.warn(
+		`[ccflare] account=${account.name} cooldown_applied reason=${reason} until=${new Date(cooldownUntil).toISOString()} consecutive=${persistedCount}`,
+	);
 
 	const rateLimitError = new RateLimitError(
 		account.id,

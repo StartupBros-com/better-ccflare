@@ -584,6 +584,15 @@ export async function selectAccountsForRequest(
 						!available &&
 						!forcedAccount.paused &&
 						!!forcedAccount.rate_limited_until;
+					// Fail closed for every provider: a client that explicitly
+					// force-routes to a specific account id must never be silently
+					// redirected to a *different* account it did not ask for, and must
+					// never be silently downgraded into normal pool selection. This
+					// used to be scoped to the xAI cache-native official-endpoint
+					// carve-out only (meta.xaiCacheNativeActive && provider === "xai"
+					// && isOfficialXaiEndpoint); it now applies unconditionally to any
+					// unavailable or capacity-exhausted forced account, regardless of
+					// provider, custom-endpoint status, or the xaiCacheNativeActive flag.
 					const mayProbeUnavailableAccount =
 						isAutoRefreshBypass && (isOveragePaused || isRateLimited);
 					if (!available && !mayProbeUnavailableAccount) {
@@ -632,6 +641,11 @@ export async function selectAccountsForRequest(
 					}
 					return [forcedAccount];
 				}
+				// Forced account id does not exist in the database at all. Fail
+				// closed here too instead of silently falling back to normal
+				// selection, which would route the request to an account the
+				// caller never asked for. (Handled above via the `!forcedAccount`
+				// early throw before this try block's inner logic runs.)
 			} catch (error) {
 				if (error instanceof ForceRouteUnavailableError) throw error;
 				log.error(

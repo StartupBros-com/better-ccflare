@@ -1,4 +1,4 @@
-import type { Account } from "@better-ccflare/types";
+import type { Account, RateLimitReason } from "@better-ccflare/types";
 
 export interface TokenRefreshResult {
 	accessToken: string;
@@ -11,6 +11,14 @@ export interface RateLimitInfo {
 	resetTime?: number;
 	statusHeader?: string;
 	remaining?: number;
+	/**
+	 * Optional provider-supplied typed operational reason. Overrides the
+	 * status-derived default reason downstream (response-processor.ts,
+	 * rate-limit-cooldown.ts) so a provider can attribute a cooldown to a
+	 * more specific cause than a generic upstream 429/529, e.g. XaiProvider's
+	 * `xai_capacity_402` for native xAI capacity responses.
+	 */
+	reason?: RateLimitReason;
 }
 
 export interface Provider {

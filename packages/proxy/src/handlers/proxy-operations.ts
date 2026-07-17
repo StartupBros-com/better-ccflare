@@ -63,6 +63,16 @@ const INTERNAL_TRANSPORT_HEADERS = [
 const ANTHROPIC_BILLING_HEADER = "x-anthropic-billing-header";
 const TEST_CONTEXT_WINDOW_ENV =
 	"CCFLARE_CONTEXT_ADMISSION_TEST_EFFECTIVE_WINDOW";
+// Cap on how much of a final-candidate rate-limit/capacity response body we
+// buffer before running provider classification (processProxyResponse). Some
+// providers' classification reads the body without a size cap of their own
+// (e.g. ZaiProvider.parseRateLimitFromBody calls clone.json() unconditionally),
+// so this cap is enforced generically here rather than per-provider. A body
+// at or under the cap is preserved byte-for-byte; a larger body is replaced
+// with a headers-only response so classification proceeds on status/headers
+// alone. Either way the ORIGINAL (untouched) response is what actually gets
+// forwarded to the client -- this only bounds the *classification* read.
+const MAX_FINAL_CANDIDATE_CLASSIFICATION_BODY_BYTES = 64 * 1024;
 
 function getTestContextWindowOverride(): number | undefined {
 	if (process.env.NODE_ENV !== "test") return undefined;
@@ -845,6 +855,82 @@ export async function discardUpstreamBody(
 }
 
 /**
+ * Reads a response clone's body up to MAX_FINAL_CANDIDATE_CLASSIFICATION_BODY_BYTES
+ * and returns an equivalent Response for provider classification
+ * (processProxyResponse). This is only ever applied to a *clone* used for
+ * final-candidate rate-limit/capacity classification (529, or native xAI
+ * 402/429) -- the original response, untouched, is always what gets
+ * forwarded to the client.
+ *
+ * - Body at or under the cap: returned intact, byte-for-byte.
+ * - Body over the cap: replaced with a headers-only Response (no body), so
+ *   classification proceeds on status/headers alone without an unbounded
+ *   read. Callers must not rely on body-driven enrichment when this happens.
+ * - No body: passed through unchanged.
+ */
+export async function boundResponseBodyForClassification(
+	clone: Response,
+): Promise<Response> {
+	const body = clone.body;
+	if (!body) return clone;
+
+	const reader = body.getReader();
+	const chunks: Uint8Array[] = [];
+	let totalBytes = 0;
+	let exceededCap = false;
+
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			if (value) {
+				totalBytes += value.byteLength;
+				if (totalBytes > MAX_FINAL_CANDIDATE_CLASSIFICATION_BODY_BYTES) {
+					exceededCap = true;
+					// Stop buffering further chunks, but keep draining/cancelling
+					// below so the underlying stream is released cleanly.
+					break;
+				}
+				chunks.push(value);
+			}
+		}
+	} finally {
+		// Whether we finished normally or bailed out early on the cap, release
+		// the reader's lock. If we bailed early, cancel the remainder so the
+		// stream doesn't stay half-read.
+		if (exceededCap) {
+			try {
+				await reader.cancel();
+			} catch {
+				// Already cancelled/errored -- nothing left to release.
+			}
+		}
+		reader.releaseLock();
+	}
+
+	if (exceededCap) {
+		return new Response(null, {
+			status: clone.status,
+			statusText: clone.statusText,
+			headers: clone.headers,
+		});
+	}
+
+	const merged = new Uint8Array(totalBytes);
+	let offset = 0;
+	for (const chunk of chunks) {
+		merged.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+
+	return new Response(merged, {
+		status: clone.status,
+		statusText: clone.statusText,
+		headers: clone.headers,
+	});
+}
+
+/**
  * Handles proxy request without authentication
  * @param req - The incoming request
  * @param url - The parsed URL
@@ -1533,6 +1619,18 @@ export async function proxyWithAccount(
 			attemptedModel = currentTransportModel || effectiveBodyContext.getModel(),
 		): Promise<boolean> => {
 			if (failureResponse.status !== 402) return false;
+			// Native xAI capacity signal (R5-R10): XaiProvider.parseRateLimit
+			// classifies a 402 as "xai_capacity_402" (more specific than this
+			// generic account-wide billing reason), and that classification path
+			// awaits the durable cooldown write before returning (R9 — avoids a
+			// fast follow-up request racing ahead of the write) and forwards the
+			// original response intact on the final candidate (AE4a) instead of
+			// unconditionally failing over. Skip this generic handler for xAI so
+			// the response falls through to processProxyResponse's xAI-specific
+			// branch (response-processor.ts) further down instead of being
+			// swallowed here with a fire-and-forget cooldown and a mislabeled
+			// reason. Every other provider's 402 handling is unaffected.
+			if (account.provider === "xai") return false;
 			const reason: RateLimitReason = "upstream_402_payment_required";
 			const cooldownUntil = extractCooldownUntil(
 				failureResponse,
@@ -1767,11 +1865,30 @@ export async function proxyWithAccount(
 			});
 		};
 
+		// Native xAI capacity/rate-limit signals (R5-R10) are a first-class,
+		// account-level failover state, not a "try a different model" signal:
+		// XAI_MODEL_MAPPINGS routes every Claude model alias to the same
+		// underlying grok model, so cycling through the model list here would
+		// never find a working alternative anyway. A 402 already bypasses the
+		// isModelUnavailableError block below (402 is not in its checked status
+		// list); this keeps 429 symmetric with 402 for xAI specifically, so both
+		// fall through uniformly to the account-specific classification further
+		// down (which awaits the durable cooldown write per R9 and honors
+		// returnRateLimitedResponseOnExhaustion per AE4a), instead of being
+		// consumed here by the generic fire-and-forget "all_models_exhausted_429"
+		// path that unconditionally returns null. Every other provider's 429
+		// handling (Qwen, OpenRouter, etc.) is unaffected.
+		const isNativeXaiCapacityOrRateLimitSignal =
+			account.provider === "xai" && rawResponse.status === 429;
+
 		// On model unavailable / rate-limited: cycle through the model list for
 		// this account. getModelList returns [primary, ...fallbacks] merged from
 		// model_mappings arrays and legacy model_fallbacks. We already tried index 0
 		// (the primary), so start at index 1.
-		if (await isModelUnavailableError(rawResponse)) {
+		if (
+			!isNativeXaiCapacityOrRateLimitSignal &&
+			(await isModelUnavailableError(rawResponse))
+		) {
 			// Tracks the concrete model used by the last fallback attempt so a
 			// fallback out_of_credits response is scoped to that model, not the
 			// originally requested model or the whole account.
@@ -2396,11 +2513,20 @@ export async function proxyWithAccount(
 			return null;
 		}
 
-		// Check for rate limit using account-specific provider
-		const responseForRateLimitCheck =
-			returnRateLimitedResponseOnExhaustion && response.status === 529
-				? response.clone()
-				: response;
+		// Check for rate limit using account-specific provider. On the final
+		// candidate account, a 529 (any provider) or a native xAI 402/429
+		// (R5-R10: capacity/rate-limit signals surfaced by XaiProvider.parseRateLimit)
+		// is classified from a clone so the ORIGINAL response can still be
+		// forwarded to the client intact instead of being replaced by
+		// pool_exhausted (see the forward-intact branch below).
+		const isFinalCandidateRateLimitStatus =
+			returnRateLimitedResponseOnExhaustion &&
+			(response.status === 529 ||
+				(account.provider === "xai" &&
+					(response.status === 402 || response.status === 429)));
+		const responseForRateLimitCheck = isFinalCandidateRateLimitStatus
+			? await boundResponseBodyForClassification(response.clone())
+			: response;
 		const isRateLimited = await processProxyResponse(
 			responseForRateLimitCheck,
 			account,
@@ -2421,9 +2547,9 @@ export async function proxyWithAccount(
 			);
 		}
 		if (isRateLimited) {
-			if (returnRateLimitedResponseOnExhaustion && response.status === 529) {
+			if (isFinalCandidateRateLimitStatus) {
 				log.warn(
-					`Account ${account.name} returned final 529 overload response — forwarding upstream response instead of pool_exhausted`,
+					`Account ${account.name} returned final ${response.status} rate-limit/capacity response, forwarding upstream response instead of pool_exhausted`,
 				);
 				return forwardToClient(
 					{

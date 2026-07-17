@@ -216,4 +216,135 @@ describe("XaiProvider", () => {
 		expect(usage?.cacheReadInputTokens).toBe(40);
 		expect(usage?.inputTokens).toBe(100);
 	});
+
+	describe("parseRateLimit - native xAI capacity classification (R5-R7)", () => {
+		it("classifies 402 as rate-limited with reason xai_capacity_402, no resetTime", () => {
+			const provider = new XaiProvider();
+			const response = new Response(
+				JSON.stringify({ error: "insufficient credits" }),
+				{ status: 402, headers: { "content-type": "application/json" } },
+			);
+
+			const info = provider.parseRateLimit(response);
+
+			expect(info.isRateLimited).toBe(true);
+			expect(info.reason).toBe("xai_capacity_402");
+			expect(info.resetTime).toBeUndefined();
+		});
+
+		it("classifies 429 as rate-limited using standard Retry-After parsing (seconds)", () => {
+			const provider = new XaiProvider();
+			const response = new Response(JSON.stringify({ error: "rate limited" }), {
+				status: 429,
+				headers: {
+					"content-type": "application/json",
+					"retry-after": "30",
+				},
+			});
+			const before = Date.now();
+
+			const info = provider.parseRateLimit(response);
+
+			expect(info.isRateLimited).toBe(true);
+			expect(info.reason).toBeUndefined();
+			expect(info.resetTime).toBeGreaterThanOrEqual(before + 30_000 - 1000);
+			expect(info.resetTime).toBeLessThanOrEqual(Date.now() + 30_000 + 1000);
+		});
+
+		it("classifies 429 as rate-limited with no resetTime when Retry-After is absent", () => {
+			const provider = new XaiProvider();
+			const response = new Response(JSON.stringify({ error: "rate limited" }), {
+				status: 429,
+				headers: { "content-type": "application/json" },
+			});
+
+			const info = provider.parseRateLimit(response);
+
+			expect(info.isRateLimited).toBe(true);
+			expect(info.resetTime).toBeUndefined();
+		});
+
+		it("parses an HTTP-date Retry-After header on 429", () => {
+			const provider = new XaiProvider();
+			const future = new Date(Date.now() + 60_000).toUTCString();
+			const response = new Response(JSON.stringify({ error: "rate limited" }), {
+				status: 429,
+				headers: {
+					"content-type": "application/json",
+					"retry-after": future,
+				},
+			});
+
+			const info = provider.parseRateLimit(response);
+
+			expect(info.isRateLimited).toBe(true);
+			expect(info.resetTime).toBe(new Date(future).getTime());
+		});
+
+		it("does not classify 400 as rate-limited", () => {
+			const provider = new XaiProvider();
+			const response = new Response(JSON.stringify({ error: "bad request" }), {
+				status: 400,
+				headers: { "content-type": "application/json" },
+			});
+
+			const info = provider.parseRateLimit(response);
+
+			expect(info.isRateLimited).toBe(false);
+		});
+
+		it("does not classify 500 as rate-limited", () => {
+			const provider = new XaiProvider();
+			const response = new Response(
+				JSON.stringify({ error: "internal error" }),
+				{ status: 500, headers: { "content-type": "application/json" } },
+			);
+
+			const info = provider.parseRateLimit(response);
+
+			expect(info.isRateLimited).toBe(false);
+		});
+
+		it("does not classify 200 as rate-limited", () => {
+			const provider = new XaiProvider();
+			const response = new Response(JSON.stringify({ ok: true }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+
+			const info = provider.parseRateLimit(response);
+
+			expect(info.isRateLimited).toBe(false);
+		});
+	});
+});
+
+describe("OpenAICompatibleProvider.parseRateLimit - unchanged for generic providers (R6)", () => {
+	it("still reports isRateLimited:false on a generic OpenAI-compatible 402", async () => {
+		const { OpenAICompatibleProvider } = await import("../openai/provider");
+		const provider = new OpenAICompatibleProvider();
+		const response = new Response(JSON.stringify({ error: "payment" }), {
+			status: 402,
+			headers: { "content-type": "application/json" },
+		});
+
+		const info = provider.parseRateLimit(response);
+
+		expect(info.isRateLimited).toBe(false);
+		expect(info.statusHeader).toBe("allowed");
+	});
+
+	it("still reports isRateLimited:false on a generic OpenAI-compatible 429", async () => {
+		const { OpenAICompatibleProvider } = await import("../openai/provider");
+		const provider = new OpenAICompatibleProvider();
+		const response = new Response(JSON.stringify({ error: "rate limited" }), {
+			status: 429,
+			headers: { "content-type": "application/json", "retry-after": "30" },
+		});
+
+		const info = provider.parseRateLimit(response);
+
+		expect(info.isRateLimited).toBe(false);
+		expect(info.statusHeader).toBe("allowed");
+	});
 });

@@ -99,6 +99,19 @@ const KNOWN_ERROR_META: Record<
 			"stays in rotation and the request is passed through unchanged.",
 		severity: "error",
 	},
+	xai_capacity_402: {
+		title: "xAI capacity exhausted",
+		description:
+			"xAI returned 402 (Grok Build credits exhausted) on this account. " +
+			"XaiProvider classifies this distinctly from a generic 429 so it " +
+			"cannot be mistaken for a Retry-After rate limit; the account is " +
+			"cooled down and the request fails over to another account.",
+		suggestion:
+			"Add Grok Build credits or raise the account's spending limit at " +
+			"console.x.ai/team/billing. The account stays in rotation and " +
+			"recovers automatically on the next successful request.",
+		severity: "error",
+	},
 };
 
 function getModelFallbackMeta(context?: ErrorContext): ErrorMeta {

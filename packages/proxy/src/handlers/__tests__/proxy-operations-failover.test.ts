@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import type { Account, RequestMeta } from "@better-ccflare/types";
-import { isModelUnavailableError, proxyWithAccount } from "../proxy-operations";
+import {
+	boundResponseBodyForClassification,
+	isModelUnavailableError,
+	proxyWithAccount,
+} from "../proxy-operations";
 import type { ProxyContext } from "../proxy-types";
 
 // Minimal Account fixture for openai-compatible provider
@@ -41,6 +45,21 @@ function makeAccount(overrides: Partial<Account> = {}): Account {
 		consecutive_rate_limits: 0,
 		...overrides,
 	};
+}
+
+// Native xAI account fixture (R5-R10): provider "xai" resolves to the real
+// registered XaiProvider via getProvider() inside proxyWithAccount (not the
+// ctx.provider override used by the generic/anthropic fixtures above), since
+// importing proxy-operations.ts transitively registers all built-in
+// providers. custom_endpoint/model_mappings are left unset so XaiProvider's
+// beforeConvert() supplies its own xAI defaults.
+function makeXaiAccount(overrides: Partial<Account> = {}): Account {
+	return makeAccount({
+		provider: "xai",
+		custom_endpoint: null,
+		model_mappings: null,
+		...overrides,
+	});
 }
 
 function makeRequestMeta(overrides: Partial<RequestMeta> = {}): RequestMeta {
@@ -1793,5 +1812,359 @@ describe("proxyWithAccount — 401 failover", () => {
 			// itself proves the success path was taken and no failover (null) occurred.
 			expect(threwUsageCollectorError).toBe(true);
 		}
+	});
+});
+
+describe("proxyWithAccount - native xAI capacity failover (R5-R10, AE3/AE4a)", () => {
+	let originalFetch: typeof globalThis.fetch;
+
+	beforeEach(() => {
+		originalFetch = globalThis.fetch;
+	});
+
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+	});
+
+	it("AE3: middle-candidate xAI 402 releases the body, persists cooldown with reason=xai_capacity_402, and fails over (returns null)", async () => {
+		globalThis.fetch = mock(
+			async () =>
+				new Response('{"error":"insufficient credits"}', {
+					status: 402,
+					headers: { "content-type": "application/json" },
+				}),
+		);
+
+		const bodyBuffer = makeRequestBody();
+		const req = makeRequest(bodyBuffer);
+		const ctx = makeProxyContext();
+
+		const result = await proxyWithAccount(
+			req,
+			new URL("https://proxy.local/v1/messages"),
+			makeXaiAccount(),
+			makeRequestMeta(),
+			bodyBuffer,
+			() => undefined,
+			0,
+			ctx,
+			// modelOverride, apiKeyId, apiKeyName, requestBodyContext,
+			// returnRateLimitedResponseOnExhaustion left at defaults: this is a
+			// MIDDLE candidate (not the final one), matching AE3's "candidate two
+			// serves the request" setup.
+		);
+
+		expect(result).toBeNull();
+		const markMock = ctx.dbOps.markAccountRateLimited as ReturnType<
+			typeof mock<
+				(id: string, until: number, reason: string) => Promise<number>
+			>
+		>;
+		expect(markMock).toHaveBeenCalled();
+		const [, , reason] = markMock.mock.calls[0];
+		expect(reason).toBe("xai_capacity_402");
+	});
+
+	it("middle-candidate xAI 429 also fails over and persists the standard reason (never relabeled as xai_capacity_402)", async () => {
+		globalThis.fetch = mock(
+			async () =>
+				new Response('{"error":"rate limited"}', {
+					status: 429,
+					headers: { "content-type": "application/json" },
+				}),
+		);
+
+		const bodyBuffer = makeRequestBody();
+		const req = makeRequest(bodyBuffer);
+		const ctx = makeProxyContext();
+
+		const result = await proxyWithAccount(
+			req,
+			new URL("https://proxy.local/v1/messages"),
+			makeXaiAccount(),
+			makeRequestMeta(),
+			bodyBuffer,
+			() => undefined,
+			0,
+			ctx,
+		);
+
+		expect(result).toBeNull();
+		const markMock = ctx.dbOps.markAccountRateLimited as ReturnType<
+			typeof mock<
+				(id: string, until: number, reason: string) => Promise<number>
+			>
+		>;
+		expect(markMock).toHaveBeenCalled();
+		const [, , reason] = markMock.mock.calls[0];
+		expect(reason).toBe("upstream_429_no_reset_probe_cooldown");
+	});
+
+	it("AE4a: final-candidate xAI 402 updates cooldown from a clone and forwards the original status/headers/body intact", async () => {
+		globalThis.fetch = mock(
+			async () =>
+				new Response('{"error":"insufficient credits","code":"xai_402"}', {
+					status: 402,
+					headers: {
+						"content-type": "application/json",
+						"x-upstream-marker": "xai-402-original",
+					},
+				}),
+		);
+
+		const bodyBuffer = makeRequestBody();
+		const req = makeRequest(bodyBuffer);
+		const ctx = makeProxyContext();
+
+		let result: Response | null = null;
+		let threwUsageCollectorError = false;
+		try {
+			result = await proxyWithAccount(
+				req,
+				new URL("https://proxy.local/v1/messages"),
+				makeXaiAccount(),
+				makeRequestMeta(),
+				bodyBuffer,
+				() => undefined,
+				0,
+				ctx,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				true, // returnRateLimitedResponseOnExhaustion: final candidate
+			);
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : String(e);
+			if (!msg.includes("UsageCollector not initialized")) throw e;
+			threwUsageCollectorError = true;
+		}
+
+		if (result) {
+			expect(result.status).toBe(402);
+			expect(result.headers.get("x-upstream-marker")).toBe("xai-402-original");
+			const body = (await result.json()) as { error: string; code: string };
+			expect(body.error).toBe("insufficient credits");
+			expect(body.code).toBe("xai_402");
+		} else {
+			// Reaching forwardToClient (which throws UsageCollector not initialized)
+			// itself proves the final-candidate passthrough was taken, not the
+			// middle-candidate discard/failover (which returns null without
+			// reaching forwardToClient).
+			expect(threwUsageCollectorError).toBe(true);
+		}
+
+		const markMock = ctx.dbOps.markAccountRateLimited as ReturnType<
+			typeof mock<
+				(id: string, until: number, reason: string) => Promise<number>
+			>
+		>;
+		expect(markMock).toHaveBeenCalled();
+		const [, , reason] = markMock.mock.calls[0];
+		expect(reason).toBe("xai_capacity_402");
+	});
+
+	it("AE4a: final-candidate xAI 429 forwards the original status/headers/body intact", async () => {
+		globalThis.fetch = mock(
+			async () =>
+				new Response('{"error":"rate limited"}', {
+					status: 429,
+					headers: {
+						"content-type": "application/json",
+						"retry-after": "30",
+					},
+				}),
+		);
+
+		const bodyBuffer = makeRequestBody();
+		const req = makeRequest(bodyBuffer);
+		const ctx = makeProxyContext();
+
+		let result: Response | null = null;
+		let threwUsageCollectorError = false;
+		try {
+			result = await proxyWithAccount(
+				req,
+				new URL("https://proxy.local/v1/messages"),
+				makeXaiAccount(),
+				makeRequestMeta(),
+				bodyBuffer,
+				() => undefined,
+				0,
+				ctx,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				true,
+			);
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : String(e);
+			if (!msg.includes("UsageCollector not initialized")) throw e;
+			threwUsageCollectorError = true;
+		}
+
+		if (result) {
+			expect(result.status).toBe(429);
+			const body = (await result.json()) as { error: string };
+			expect(body.error).toBe("rate limited");
+		} else {
+			expect(threwUsageCollectorError).toBe(true);
+		}
+	});
+
+	it("does not fail over on a native xAI 400 (not classified as rate-limited)", async () => {
+		globalThis.fetch = mock(
+			async () =>
+				new Response('{"error":"bad request"}', {
+					status: 400,
+					headers: { "content-type": "application/json" },
+				}),
+		);
+
+		const bodyBuffer = makeRequestBody();
+		const req = makeRequest(bodyBuffer);
+		const ctx = makeProxyContext();
+
+		let result: Response | null = null;
+		let threwUsageCollectorError = false;
+		try {
+			result = await proxyWithAccount(
+				req,
+				new URL("https://proxy.local/v1/messages"),
+				makeXaiAccount(),
+				makeRequestMeta(),
+				bodyBuffer,
+				() => undefined,
+				0,
+				ctx,
+			);
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : String(e);
+			if (!msg.includes("UsageCollector not initialized")) throw e;
+			threwUsageCollectorError = true;
+		}
+
+		// A 400 is not a rate limit signal for xAI: it must be forwarded as-is
+		// (or reach forwardToClient), never treated as a failover trigger.
+		if (result) {
+			expect(result.status).toBe(400);
+		} else {
+			expect(threwUsageCollectorError).toBe(true);
+		}
+		const markMock = ctx.dbOps.markAccountRateLimited as ReturnType<
+			typeof mock<
+				(id: string, until: number, reason: string) => Promise<number>
+			>
+		>;
+		expect(markMock).not.toHaveBeenCalled();
+	});
+
+	it("64 KiB cap: an oversized final-candidate xAI 402 body is still forwarded to the client byte-for-byte, unenriched", async () => {
+		// One byte over the 64 KiB classification cap.
+		const oversizedPayload = `{"error":"${"x".repeat(64 * 1024 + 1)}"}`;
+		globalThis.fetch = mock(
+			async () =>
+				new Response(oversizedPayload, {
+					status: 402,
+					headers: { "content-type": "application/json" },
+				}),
+		);
+
+		const bodyBuffer = makeRequestBody();
+		const req = makeRequest(bodyBuffer);
+		const ctx = makeProxyContext();
+
+		let result: Response | null = null;
+		let threwUsageCollectorError = false;
+		try {
+			result = await proxyWithAccount(
+				req,
+				new URL("https://proxy.local/v1/messages"),
+				makeXaiAccount(),
+				makeRequestMeta(),
+				bodyBuffer,
+				() => undefined,
+				0,
+				ctx,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				true,
+			);
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : String(e);
+			if (!msg.includes("UsageCollector not initialized")) throw e;
+			threwUsageCollectorError = true;
+		}
+
+		if (result) {
+			expect(result.status).toBe(402);
+			const text = await result.text();
+			expect(text).toBe(oversizedPayload);
+			expect(text.length).toBeGreaterThan(64 * 1024);
+		} else {
+			expect(threwUsageCollectorError).toBe(true);
+		}
+		// Classification still ran (status-only for xAI) and still persisted a
+		// cooldown despite the oversized body exceeding the classification cap.
+		const markMock = ctx.dbOps.markAccountRateLimited as ReturnType<
+			typeof mock<
+				(id: string, until: number, reason: string) => Promise<number>
+			>
+		>;
+		expect(markMock).toHaveBeenCalled();
+	});
+});
+
+describe("boundResponseBodyForClassification (64 KiB final-candidate classification cap)", () => {
+	it("returns a response whose body is preserved byte-for-byte when under the cap", async () => {
+		const original = new Response('{"error":"small body"}', {
+			status: 402,
+			headers: { "content-type": "application/json", "x-test": "1" },
+		});
+
+		const bounded = await boundResponseBodyForClassification(original);
+
+		expect(bounded.status).toBe(402);
+		expect(bounded.headers.get("x-test")).toBe("1");
+		const text = await bounded.text();
+		expect(text).toBe('{"error":"small body"}');
+	});
+
+	it("returns a headers-only (no body) response when the body exceeds the 64 KiB cap", async () => {
+		const oversized = "x".repeat(64 * 1024 + 1);
+		const original = new Response(oversized, {
+			status: 402,
+			headers: { "content-type": "application/json", "x-test": "2" },
+		});
+
+		const bounded = await boundResponseBodyForClassification(original);
+
+		expect(bounded.status).toBe(402);
+		expect(bounded.headers.get("x-test")).toBe("2");
+		const text = await bounded.text();
+		expect(text).toBe("");
+	});
+
+	it("preserves a body exactly at the 64 KiB boundary", async () => {
+		const exact = "y".repeat(64 * 1024);
+		const original = new Response(exact, { status: 429 });
+
+		const bounded = await boundResponseBodyForClassification(original);
+
+		const text = await bounded.text();
+		expect(text).toBe(exact);
+	});
+
+	it("passes through a response with no body unchanged", async () => {
+		const original = new Response(null, { status: 402 });
+
+		const bounded = await boundResponseBodyForClassification(original);
+
+		expect(bounded.status).toBe(402);
+		const text = await bounded.text();
+		expect(text).toBe("");
 	});
 });

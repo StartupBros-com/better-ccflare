@@ -3,7 +3,7 @@
 // Export Alibaba Coding Plan usage fetcher
 export * from "./alibaba-coding-plan-usage-fetcher";
 // Export base provider class
-export { BaseProvider } from "./base";
+export { BaseProvider, parseStandardRetryAfter429 } from "./base";
 // Export Kilo usage fetcher
 export * from "./kilo-usage-fetcher";
 // Export NanoGPT usage fetcher
