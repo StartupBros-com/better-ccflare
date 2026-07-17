@@ -19,6 +19,7 @@ export {
 	createContextAdmissionTracker,
 	createContextLengthExceededResponse,
 	createPoolExhaustedResponse,
+	type ModelFallbackExecutionPolicy,
 	proxyUnauthenticated,
 	proxyWithAccount,
 } from "./proxy-operations";
