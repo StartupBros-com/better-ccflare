@@ -421,6 +421,15 @@ function processEvent(
 	}
 
 	if (eventType === "error") {
+		// First terminal event wins: once response.completed (or an earlier
+		// failure) has been emitted, a late cap trip, such as the tail-cap
+		// recheck in SseFrameBuffer.flush() throwing at stream EOF, must not
+		// emit a contradictory response.failed. Mirrors emitDone()'s doneSent
+		// guard and the Codex translator's hasSentTerminalEvents pattern;
+		// handleLimitError still terminates the stream unconditionally.
+		if (state.doneSent) {
+			return;
+		}
 		const err = data.error as Record<string, unknown> | undefined;
 		const errType = (err?.type as string) ?? "api_error";
 		const errMsg =

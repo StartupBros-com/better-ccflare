@@ -630,6 +630,54 @@ describe("translateAnthropicStreamToResponses SSE frame bounds", () => {
 		expect(cancelSpy).toHaveBeenCalled();
 	});
 
+	test("late cap trip after response.completed does not emit a contradictory response.failed", async () => {
+		const messageStart = sseEvent("message_start", {
+			type: "message_start",
+			message: {
+				id: "msg_late_trip",
+				usage: { input_tokens: 5, output_tokens: 0 },
+			},
+		});
+		const blockStart = sseEvent("content_block_start", {
+			type: "content_block_start",
+			index: 0,
+			content_block: { type: "text", text: "" },
+		});
+		const blockStop = sseEvent("content_block_stop", {
+			type: "content_block_stop",
+			index: 0,
+		});
+		const messageStop = sseEvent("message_stop", { type: "message_stop" });
+		// A complete, valid conversation first: response.completed is emitted
+		// and doneSent becomes true. The upstream then keeps sending
+		// undelimited junk (no frame delimiter anywhere) until the tail cap
+		// trips during transform. First terminal event wins: the late cap trip
+		// must terminate the stream without emitting a contradictory
+		// response.failed after the response already completed.
+		const trailingJunk = "x".repeat(
+			BUFFER_SIZES.SSE_TRANSPORT_TAIL_MAX_BYTES + 1024,
+		);
+
+		const { response: upstream, cancelSpy } = makeChunkedStream([
+			`${messageStart}\n\n${blockStart}\n\n${blockStop}\n\n${messageStop}\n\n`,
+			trailingJunk,
+		]);
+
+		const result = translateAnthropicStreamToResponses(
+			upstream,
+			"resp_late_trip",
+			"claude-3-5-sonnet-20241022",
+		);
+		const parsed = await collectSseEvents(result);
+
+		expect(countEventOccurrences(parsed, "response.completed")).toBe(1);
+		expect(parsed.some((e) => e.event === "response.failed")).toBe(false);
+		expect(parsed[parsed.length - 1].event).toBe("response.completed");
+
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(cancelSpy).toHaveBeenCalled();
+	});
+
 	test("per-call tool argument cap trip emits response.failed with no response.completed after", async () => {
 		const messageStart = sseEvent("message_start", {
 			type: "message_start",

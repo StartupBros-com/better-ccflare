@@ -64,6 +64,29 @@ function heapUsedMiB(): number {
 	return process.memoryUsage().heapUsed / 1024 / 1024;
 }
 
+/**
+ * Tick the event loop and force a GC repeatedly until heapUsed stops
+ * changing (within a small tolerance) or maxIters is hit, then return the
+ * settled reading in MiB. A single forceGc() immediately after
+ * stream-heavy work is not sufficient for heapUsed to settle; see the
+ * settleUntilStable rationale in stream-translator.test.ts. Uses the
+ * forceGc() wrapper (not raw Bun.gc) so the script keeps degrading
+ * gracefully off-Bun.
+ */
+async function settleHeapMiB(maxIters: number): Promise<number> {
+	let last = -1;
+	for (let i = 0; i < maxIters; i++) {
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		forceGc();
+		const cur = heapUsedMiB();
+		if (last !== -1 && Math.abs(cur - last) < 0.25) {
+			return cur;
+		}
+		last = cur;
+	}
+	return last;
+}
+
 // ---------------------------------------------------------------------------
 // Fixture construction
 // ---------------------------------------------------------------------------
@@ -303,15 +326,21 @@ async function benchConfig(
 	let peakHeapMiB = 0;
 	let settledHeapMiB = 0;
 
+	// Stabilized pre-config baseline so the heap columns report deltas
+	// attributable to this config rather than absolute process heap, which
+	// accumulates noise from every previously run config. Settled once per
+	// config, not per wave, to keep the full matrix runtime sane.
+	const baselineHeapMiB = await settleHeapMiB(10);
+
 	for (let wave = 0; wave < waves; wave++) {
 		forceGc();
 		const start = performance.now();
 		await runConcurrent(translator, chunks, concurrency);
 		const elapsedMs = performance.now() - start;
 		durationsMs.push(elapsedMs);
-		peakHeapMiB = Math.max(peakHeapMiB, heapUsedMiB());
+		peakHeapMiB = Math.max(peakHeapMiB, heapUsedMiB() - baselineHeapMiB);
 		forceGc();
-		settledHeapMiB = Math.max(settledHeapMiB, heapUsedMiB());
+		settledHeapMiB = Math.max(settledHeapMiB, heapUsedMiB() - baselineHeapMiB);
 	}
 
 	durationsMs.sort((a, b) => a - b);
@@ -339,8 +368,8 @@ function printTable(results: Result[]): void {
 		"concurrency",
 		"median ms",
 		"median MB/s",
-		"peak heap MiB",
-		"settled heap MiB",
+		"peak heap delta MiB",
+		"settled heap delta MiB",
 	];
 	const rows = results.map((r) => [
 		r.translator,

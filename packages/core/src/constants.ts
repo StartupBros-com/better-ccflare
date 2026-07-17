@@ -201,11 +201,11 @@ export const BUFFER_SIZES = {
 	// size as the stream usage buffer, while an unterminated buffered tail
 	// (no delimiter seen yet) is allowed to grow up to the max request body
 	// size before it is treated as a runaway stream.
-	// Kept as-is for backward compatibility: some non-SSE-transport
-	// consumers still reuse this value as a tool-argument cap today. New
-	// code should use the explicitly named policy constants below instead
-	// of reusing SSE_FRAME_MAX_BYTES for a purpose other than the SSE
-	// transport frame cap it was originally sized for.
+	// Legacy values with no remaining production consumer: the last two
+	// call sites (the Codex provider and the OpenAI Responses adapter)
+	// migrated to the explicitly named policy constants below. Kept only
+	// as the historical defaults exercised by sse-frame-buffer.test.ts's
+	// base-behavior tests; new code must use the policy constants below.
 	SSE_FRAME_MAX_BYTES: 64 * 1024, // Matches STREAM_USAGE_BUFFER_BYTES
 	SSE_BUFFER_MAX_BYTES: 4 * 1024 * 1024, // Matches MAX_REQUEST_BODY_BYTES (usage-collector.ts / response-handler.ts)
 
