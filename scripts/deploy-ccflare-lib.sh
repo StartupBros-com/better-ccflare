@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 
-# Pure helpers for deploy-ccflare.sh. Keep these functions free of sudo,
-# systemd, and host-specific mutation so deployment contracts can be tested
-# against temporary files.
+# Helpers for deploy-ccflare.sh. File rendering and validation stay deterministic;
+# the one pre-restart activation helper isolates its sudo/systemd mutation so the
+# exact reload, effective-policy check, and no-restart rollback can be mocked.
 
 render_systemd_pin() {
 	if [[ "$#" -ne 7 ]]; then
@@ -10,50 +10,421 @@ render_systemd_pin() {
 		return 2
 	fi
 
-	local input="$1"
-	local output="$2"
-	local binary="$3"
-	local runner="$4"
-	local guard_script="$5"
-	local source_id="$6"
-	local policy_id="$7"
+	local input="$1" output="$2" binary="$3" runner="$4"
+	local guard_script="$5" source_id="$6" policy_id="$7"
+	local deadline_ms shutdown_grace_ms kill_mode stop_timeout status
+	local managed_begin="# BEGIN better-ccflare managed deployment"
+	local managed_end="# END better-ccflare managed deployment"
 
-	awk \
-		-v binary="$binary" \
-		-v runner="$runner" \
-		-v guard_script="$guard_script" \
-		-v source_id="$source_id" \
-		-v policy_id="$policy_id" '
-		function emit(key, value) {
-			print "Environment=" key "=" value
+	deadline_ms="$(configured_systemd_environment_value "$input" GUARD_TOTAL_DEADLINE_MS)" || {
+		status="$?"
+		[[ "$status" == "1" ]] || return "$status"
+		deadline_ms=""
+	}
+	shutdown_grace_ms="$(configured_systemd_environment_value "$input" GUARD_SHUTDOWN_GRACE_MS)" || {
+		status="$?"
+		[[ "$status" == "1" ]] || return "$status"
+		shutdown_grace_ms=""
+	}
+	kill_mode="$(configured_systemd_directive_value "$input" KillMode)" || {
+		status="$?"
+		[[ "$status" == "1" ]] || return "$status"
+		kill_mode=""
+	}
+	stop_timeout="$(configured_systemd_directive_value "$input" TimeoutStopSec)" || {
+		status="$?"
+		[[ "$status" == "1" ]] || return "$status"
+		stop_timeout=""
+	}
+
+	# Migrate only source-controlled legacy defaults known to be unsafe for the
+	# long guard deadline. Unknown or incomplete operator overrides are retained
+	# and rejected by validate_deployment_timing instead of silently rewritten.
+	case "$deadline_ms" in
+		"" | 120000) deadline_ms=600000 ;;
+	esac
+	case "$shutdown_grace_ms" in
+		"" | 75000) shutdown_grace_ms=600000 ;;
+	esac
+	[[ -n "$kill_mode" ]] || kill_mode=mixed
+	case "$stop_timeout" in
+		"" | 90 | 90s | "1min 30s") stop_timeout=720s ;;
+	esac
+
+	awk -v begin="$managed_begin" -v end="$managed_end" '
+		$0 == begin { managed = 1; next }
+		$0 == end { managed = 0; next }
+		!managed { print }
+		END { if (managed) exit 2 }
+	' "$input" >"$output" || return 2
+	if [[ -s "$output" && "$(tail -c 1 "$output" | wc -l)" -eq 0 ]]; then
+		printf '\n' >>"$output"
+	fi
+	{
+		printf '%s\n' "$managed_begin"
+		printf '%s\n' "[Service]"
+		printf 'Environment=%s\n' "CCFLARE_BIN=$binary"
+		printf 'Environment=%s\n' "GUARD_SCRIPT=$guard_script"
+		printf 'Environment=%s\n' "GUARD_SOURCE_ID=$source_id"
+		printf 'Environment=%s\n' "GUARD_POLICY_ID=$policy_id"
+		printf 'Environment=%s\n' "GUARD_TOTAL_DEADLINE_MS=$deadline_ms"
+		printf 'Environment=%s\n' "GUARD_SHUTDOWN_GRACE_MS=$shutdown_grace_ms"
+		printf 'KillMode=%s\n' "$kill_mode"
+		printf 'TimeoutStopSec=%s\n' "$stop_timeout"
+		printf '%s\n' "ExecStart="
+		printf 'ExecStart=%s\n' "$runner"
+		printf '%s\n' "$managed_end"
+	} >>"$output"
+}
+
+_configured_systemd_value() {
+	if [[ "$#" -ne 3 || ! -f "$1" ]]; then
+		return 2
+	fi
+	node - "$1" "$2" "$3" <<'NODE'
+const fs = require("node:fs");
+const [file, kind, key] = process.argv.slice(2);
+if (!["environment", "directive"].includes(kind)) process.exit(2);
+if (kind === "environment" && !/^[A-Z_][A-Z0-9_]*$/.test(key)) process.exit(2);
+if (kind === "directive" && !/^[A-Za-z][A-Za-z0-9]*$/.test(key)) process.exit(2);
+
+let text;
+try {
+	text = fs.readFileSync(file, "utf8");
+} catch {
+	process.exit(2);
+}
+
+const logicalLines = [];
+let continued = "";
+for (const physical of text.split(/\r?\n/)) {
+	const current = continued + physical;
+	let slashCount = 0;
+	for (let i = current.length - 1; i >= 0 && current[i] === "\\"; i -= 1) {
+		slashCount += 1;
+	}
+	if (slashCount % 2 === 1) {
+		continued = current.slice(0, -1) + " ";
+		continue;
+	}
+	logicalLines.push(current);
+	continued = "";
+}
+if (continued.length > 0) logicalLines.push(continued);
+
+const splitWords = (input) => {
+	const words = [];
+	let word = "";
+	let quote = null;
+	let started = false;
+	for (let i = 0; i < input.length; i += 1) {
+		const char = input[i];
+		if (quote !== null) {
+			if (char === quote) {
+				quote = null;
+			} else if (char === "\\" && quote === '"' && i + 1 < input.length) {
+				word += input[++i];
+			} else {
+				word += char;
+			}
+			started = true;
+			continue;
 		}
-		/^Environment=CCFLARE_BIN=/ {
-			if (!seen_binary++) emit("CCFLARE_BIN", binary)
-			next
+		if (char === "'" || char === '"') {
+			quote = char;
+			started = true;
+		} else if (/\s/.test(char)) {
+			if (started) {
+				words.push(word);
+				word = "";
+				started = false;
+			}
+		} else if (char === "\\" && i + 1 < input.length) {
+			word += input[++i];
+			started = true;
+		} else {
+			word += char;
+			started = true;
 		}
-		/^Environment=GUARD_SCRIPT=/ {
-			if (!seen_guard++) emit("GUARD_SCRIPT", guard_script)
-			next
+	}
+	if (quote !== null) throw new Error("unterminated quote");
+	if (started) words.push(word);
+	return words;
+};
+
+let section = "";
+const environment = new Map();
+let directiveFound = false;
+let directiveValue = "";
+try {
+	for (const line of logicalLines) {
+		const trimmed = line.trim();
+		if (trimmed.length === 0 || trimmed.startsWith("#") || trimmed.startsWith(";")) {
+			continue;
 		}
-		/^Environment=GUARD_SOURCE_ID=/ {
-			if (!seen_source++) emit("GUARD_SOURCE_ID", source_id)
-			next
+		const sectionMatch = trimmed.match(/^\[([^\]]+)\]$/);
+		if (sectionMatch) {
+			section = sectionMatch[1];
+			continue;
 		}
-		/^Environment=GUARD_POLICY_ID=/ {
-			if (!seen_policy++) emit("GUARD_POLICY_ID", policy_id)
-			next
+		if (section !== "Service") continue;
+		const assignment = line.match(/^\s*([A-Za-z][A-Za-z0-9]*)\s*=(.*)$/);
+		if (!assignment) continue;
+		const [, name, raw] = assignment;
+		if (kind === "environment" && name === "Environment") {
+			if (raw.trim().length === 0) {
+				environment.clear();
+				continue;
+			}
+			for (const item of splitWords(raw)) {
+				const equals = item.indexOf("=");
+				if (equals <= 0) continue;
+				const name = item.slice(0, equals);
+				if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) continue;
+				environment.set(name, item.slice(equals + 1));
+			}
+		} else if (kind === "directive" && name === key) {
+			directiveValue = splitWords(raw).join(" ");
+			directiveFound = true;
 		}
-		/^ExecStart=/ { next }
-		{ print }
-		END {
-			if (!seen_binary) emit("CCFLARE_BIN", binary)
-			if (!seen_guard) emit("GUARD_SCRIPT", guard_script)
-			if (!seen_source) emit("GUARD_SOURCE_ID", source_id)
-			if (!seen_policy) emit("GUARD_POLICY_ID", policy_id)
-			print "ExecStart="
-			print "ExecStart=" runner
+	}
+} catch (error) {
+	console.error("invalid systemd drop-in syntax: " + error.message);
+	process.exit(2);
+}
+
+if (kind === "environment") {
+	if (!environment.has(key)) process.exit(1);
+	process.stdout.write(environment.get(key) + "\n");
+} else {
+	if (!directiveFound) process.exit(1);
+	process.stdout.write(directiveValue + "\n");
+}
+NODE
+}
+
+configured_systemd_environment_value() {
+	if [[ "$#" -ne 2 ]]; then
+		echo "configured_systemd_environment_value requires: existing-pin ENV_NAME" >&2
+		return 2
+	fi
+	_configured_systemd_value "$1" environment "$2"
+}
+
+configured_systemd_directive_value() {
+	if [[ "$#" -ne 2 ]]; then
+		echo "configured_systemd_directive_value requires: existing-pin DirectiveName" >&2
+		return 2
+	fi
+	_configured_systemd_value "$1" directive "$2"
+}
+
+systemd_duration_to_microseconds() {
+	if [[ "$#" -ne 1 || -z "$1" ]]; then
+		return 1
+	fi
+	local parsed usec
+	parsed="$(LC_ALL=C systemd-analyze timespan -- "$1" 2>/dev/null)" || return 1
+	usec="$(printf '%s\n' "$parsed" | awk 'NR == 2 { print $2 }')"
+	if [[ ! "$usec" =~ ^[0-9]{1,16}$ ]]; then
+		return 1
+	fi
+	printf '%s\n' "$usec"
+}
+
+systemd_duration_to_milliseconds() {
+	local usec
+	usec="$(systemd_duration_to_microseconds "$1")" || return 1
+	printf '%s\n' "$((usec / 1000))"
+}
+
+validate_deployment_timing() {
+	if [[ "$#" -ne 1 || ! -f "$1" ]]; then
+		echo "validate_deployment_timing requires one existing systemd pin" >&2
+		return 2
+	fi
+
+	local pin="$1" deadline_ms shutdown_grace_ms kill_mode stop_timeout
+	local stop_timeout_usec stop_timeout_ms minimum_stop_timeout_usec
+	deadline_ms="$(
+		configured_systemd_environment_value "$pin" GUARD_TOTAL_DEADLINE_MS
+	)" || {
+		echo "systemd pin is missing GUARD_TOTAL_DEADLINE_MS" >&2
+		return 1
+	}
+	shutdown_grace_ms="$(
+		configured_systemd_environment_value "$pin" GUARD_SHUTDOWN_GRACE_MS
+	)" || {
+		echo "systemd pin is missing GUARD_SHUTDOWN_GRACE_MS" >&2
+		return 1
+	}
+	kill_mode="$(configured_systemd_directive_value "$pin" KillMode)" || {
+		echo "systemd pin is missing KillMode" >&2
+		return 1
+	}
+	stop_timeout="$(configured_systemd_directive_value "$pin" TimeoutStopSec)" || {
+		echo "systemd pin is missing TimeoutStopSec" >&2
+		return 1
+	}
+
+	for value in "$deadline_ms" "$shutdown_grace_ms"; do
+		if [[ ! "$value" =~ ^[1-9][0-9]{0,9}$ ]] \
+			|| ((value < 600000 || value > 2147483647)); then
+			echo "unsafe deployment timing value ${value}; expected 600000..2147483647ms" >&2
+			return 1
+		fi
+	done
+	if ((shutdown_grace_ms < deadline_ms)); then
+		echo "unsafe shutdown grace ${shutdown_grace_ms}ms; expected at least deadline ${deadline_ms}ms" >&2
+		return 1
+	fi
+	if [[ "$kill_mode" != "mixed" ]]; then
+		echo "unsafe KillMode=${kill_mode}; expected mixed" >&2
+		return 1
+	fi
+	stop_timeout_usec="$(systemd_duration_to_microseconds "$stop_timeout")" || {
+		echo "unsupported TimeoutStopSec=${stop_timeout}" >&2
+		return 1
+	}
+	minimum_stop_timeout_usec=$(((shutdown_grace_ms + 120000) * 1000))
+	if ((stop_timeout_usec < minimum_stop_timeout_usec)); then
+		echo "unsafe TimeoutStopSec=${stop_timeout}; expected at least ${minimum_stop_timeout_usec}us" >&2
+		return 1
+	fi
+	stop_timeout_ms=$((stop_timeout_usec / 1000))
+
+	printf '%s %s %s\n' "$deadline_ms" "$shutdown_grace_ms" "$stop_timeout_ms"
+}
+
+systemd_environment_text_value() {
+	if [[ "$#" -ne 2 || ! "$2" =~ ^[A-Z_][A-Z0-9_]*$ ]]; then
+		return 2
+	fi
+	node - "$1" "$2" <<'NODE'
+const [input, key] = process.argv.slice(2);
+const words = [];
+let word = "";
+let quote = null;
+let started = false;
+for (let i = 0; i < input.length; i += 1) {
+	const char = input[i];
+	if (quote !== null) {
+		if (char === quote) {
+			quote = null;
+		} else if (char === "\\" && quote === '"' && i + 1 < input.length) {
+			word += input[++i];
+		} else {
+			word += char;
 		}
-	' "$input" >"$output"
+		started = true;
+	} else if (char === "'" || char === '"') {
+		quote = char;
+		started = true;
+	} else if (/\s/.test(char)) {
+		if (started) {
+			words.push(word);
+			word = "";
+			started = false;
+		}
+	} else if (char === "\\" && i + 1 < input.length) {
+		word += input[++i];
+		started = true;
+	} else {
+		word += char;
+		started = true;
+	}
+}
+if (quote !== null) process.exit(2);
+if (started) words.push(word);
+let value;
+for (const item of words) {
+	const equals = item.indexOf("=");
+	if (item.slice(0, equals) === key) value = item.slice(equals + 1);
+}
+if (value === undefined) process.exit(1);
+process.stdout.write(value);
+NODE
+}
+
+validate_effective_systemd_policy() {
+	if [[ "$#" -ne 1 ]]; then
+		echo "validate_effective_systemd_policy requires one service name" >&2
+		return 2
+	fi
+	local service="$1"
+	local kill_mode stop_timeout effective_environment effective_deadline_ms
+	local effective_shutdown_grace_ms stop_timeout_usec stop_timeout_ms
+	local minimum_stop_timeout_usec value
+
+	kill_mode="$(systemctl show "$service" --property=KillMode --value)" || return 1
+	stop_timeout="$(systemctl show "$service" --property=TimeoutStopUSec --value)" || return 1
+	effective_environment="$(systemctl show "$service" --property=Environment --value)" || return 1
+	effective_deadline_ms="$(
+		systemd_environment_text_value "$effective_environment" GUARD_TOTAL_DEADLINE_MS
+	)" || {
+		echo "effective systemd environment is missing GUARD_TOTAL_DEADLINE_MS" >&2
+		return 1
+	}
+	effective_shutdown_grace_ms="$(
+		systemd_environment_text_value "$effective_environment" GUARD_SHUTDOWN_GRACE_MS
+	)" || {
+		echo "effective systemd environment is missing GUARD_SHUTDOWN_GRACE_MS" >&2
+		return 1
+	}
+
+	if [[ "$kill_mode" != "mixed" ]]; then
+		echo "effective KillMode=${kill_mode}; expected mixed" >&2
+		return 1
+	fi
+	for value in "$effective_deadline_ms" "$effective_shutdown_grace_ms"; do
+		if [[ ! "$value" =~ ^[1-9][0-9]{0,9}$ ]] \
+			|| ((value < 600000 || value > 2147483647)); then
+			echo "unsafe effective guard timing value ${value}" >&2
+			return 1
+		fi
+	done
+	if ((effective_shutdown_grace_ms < effective_deadline_ms)); then
+		echo "effective shutdown grace is shorter than the guard deadline" >&2
+		return 1
+	fi
+	stop_timeout_usec="$(systemd_duration_to_microseconds "$stop_timeout")" || {
+		echo "unsupported effective TimeoutStopUSec=${stop_timeout}" >&2
+		return 1
+	}
+	minimum_stop_timeout_usec=$(((effective_shutdown_grace_ms + 120000) * 1000))
+	if ((stop_timeout_usec < minimum_stop_timeout_usec)); then
+		echo "effective TimeoutStopUSec=${stop_timeout}; expected at least ${minimum_stop_timeout_usec}us" >&2
+		return 1
+	fi
+	stop_timeout_ms=$((stop_timeout_usec / 1000))
+	printf '%s %s %s\n' \
+		"$effective_deadline_ms" \
+		"$effective_shutdown_grace_ms" \
+		"$stop_timeout_ms"
+}
+
+reload_validate_or_restore_systemd_policy() {
+	if [[ "$#" -ne 3 || ! -f "$1" || ! -f "$2" ]]; then
+		echo "reload_validate_or_restore_systemd_policy requires: pin backup service" >&2
+		return 2
+	fi
+	local pin="$1" backup="$2" service="$3"
+	local rollback_stage="${pin}.pre-restart-rollback-$$"
+
+	if sudo systemctl daemon-reload \
+		&& validate_effective_systemd_policy "$service"; then
+		return 0
+	fi
+
+	echo "ERROR: effective systemd policy is unsafe; restoring the prior pin before restart" >&2
+	if ! sudo cp --preserve=all "$backup" "$rollback_stage" \
+		|| ! sudo mv -f "$rollback_stage" "$pin" \
+		|| ! sudo systemctl daemon-reload; then
+		echo "HARD FAILURE: pre-restart systemd pin restoration failed" >&2
+		sudo rm -f "$rollback_stage" 2>/dev/null || true
+		return 70
+	fi
+	return 1
 }
 
 validate_deploy_health() {
@@ -101,6 +472,7 @@ for (const name of ["binary", "runner", "guard", "policy"]) {
 }
 for (const name of [
 	"totalDeadlineMs",
+	"shutdownGraceMs",
 	"maxAttempts",
 	"jitterMs",
 	"maxInspectionBytes",
