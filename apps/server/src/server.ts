@@ -397,10 +397,6 @@ async function prewarmBedrockCache(account: Account, region: string) {
 }
 
 /**
- * Start usage polling for an account with automatic token refresh
- * Temporarily resumes paused accounts for token refresh, then restores original state
- */
-/**
  * Get a valid access token for `account`, temporarily resuming it in the DB
  * first if it is currently paused (so getValidAccessToken's refresh path can
  * run), then restoring its paused state afterward.
@@ -413,6 +409,20 @@ async function prewarmBedrockCache(account: Account, region: string) {
  * about why the account is actually paused. Both the resume and the restore
  * are genuinely awaited so a generic resume cannot race with or replace the
  * terminal reason before this function's promise settles.
+ *
+ * P1 review fix: the restore is guarded via pauseAccountIfActive with the
+ * refresh_token captured before the temporary resume, mirroring
+ * pauseAccountForReauthIfInvalidGrant's use of the same primitive in
+ * token-manager.ts. A successful concurrent reauthentication (fresh tokens
+ * stored, oauth_invalid_grant cleared via resumeAccountIfNeedsReauth) can
+ * complete during the window this function holds the account temporarily
+ * resumed. An unconditional restore would clobber that fresh reauth straight
+ * back to paused/oauth_invalid_grant, and since oauth_invalid_grant is
+ * excluded from auto-unpause, the account would then be stuck paused forever
+ * under a stale terminal classification even though valid tokens are stored.
+ * The guard only re-pauses when the account is still active AND still holds
+ * the exact refresh token we started with, so a concurrent reauth (which
+ * always rotates the refresh token) is detected and left alone.
  */
 export async function refreshTokenWithTemporaryResume(
 	account: Account,
@@ -424,6 +434,7 @@ export async function refreshTokenWithTemporaryResume(
 	const currentAccount = await proxyContext.dbOps.getAccount(account.id);
 	const wasTemporarilyResumed = currentAccount?.paused === true;
 	const originalPauseReason = currentAccount?.pause_reason ?? "manual";
+	const originalRefreshToken = currentAccount?.refresh_token ?? null;
 
 	// Update in-memory account with fresh token data from DB
 	// This prevents using stale tokens after re-authentication
@@ -447,15 +458,35 @@ export async function refreshTokenWithTemporaryResume(
 		return await getValidAccessToken(account, proxyContext);
 	} finally {
 		// Restore paused state ONLY if we temporarily resumed it above, using
-		// the ORIGINAL pause reason so a terminal reason is never clobbered.
+		// the ORIGINAL pause reason so a terminal reason is never clobbered --
+		// and ONLY if the account is still active and still holds the refresh
+		// token we started with, so a concurrent successful reauthentication
+		// (which stores a fresh token and resumes the account) is never
+		// clobbered back to paused.
 		if (wasTemporarilyResumed) {
-			logger.debug(`Restoring paused state for account ${account.name}`);
-			await proxyContext.dbOps.pauseAccount(account.id, originalPauseReason);
-			account.paused = true;
+			const restored = await proxyContext.dbOps.pauseAccountIfActive(
+				account.id,
+				originalPauseReason,
+				originalRefreshToken,
+			);
+			if (restored) {
+				logger.debug(`Restoring paused state for account ${account.name}`);
+				account.paused = true;
+			} else {
+				logger.debug(
+					`Skipped restoring paused state for account ${account.name}: account is no longer in the state it was temporarily resumed from (e.g. reauthenticated concurrently)`,
+				);
+			}
 		}
 	}
 }
 
+/**
+ * Start recurring usage polling for `account`, refreshing its access token
+ * (via refreshTokenWithTemporaryResume, above) each cycle. Retries with
+ * backoff up to MAX_RETRY_ATTEMPTS on failure; a permanently-failing account
+ * simply stops polling rather than crashing the server.
+ */
 function startUsagePollingWithRefresh(
 	account: Account,
 	proxyContext: ProxyContext,

@@ -268,9 +268,13 @@ export class AccountRepository extends BaseRepository<Account> {
 	 * credential pause that only successful reauthentication
 	 * (resumeIfPausedWithReason, above) is allowed to clear.
 	 *
-	 * `IS NOT` (rather than `!=`) is required so a legacy row that is paused
-	 * with a NULL reason is still treated as resumable instead of being
-	 * NULL-swallowed by a plain inequality comparison.
+	 * `IS DISTINCT FROM` (rather than `!=`) is required so a legacy row that
+	 * is paused with a NULL reason is still treated as resumable instead of
+	 * being NULL-swallowed by a plain inequality comparison. `IS DISTINCT
+	 * FROM` is NULL-safe on both backends: SQLite >= 3.39 and PostgreSQL.
+	 * Plain `IS NOT` is SQLite-only syntax (a unary null-check operator
+	 * there) and is a hard syntax error against PostgreSQL, so it cannot be
+	 * used here now that this guard also runs against the PG adapter.
 	 *
 	 * Returns `resumed: true` when this call cleared the pause, or
 	 * `resumed: false` with the account's current `pause_reason` (null when
@@ -282,7 +286,7 @@ export class AccountRepository extends BaseRepository<Account> {
 		blockedReason: string,
 	): Promise<{ resumed: boolean; pauseReason: string | null }> {
 		const changes = await this.runWithChanges(
-			`UPDATE accounts SET paused = 0, pause_reason = NULL WHERE id = ? AND COALESCE(paused, 0) = 1 AND pause_reason IS NOT ?`,
+			`UPDATE accounts SET paused = 0, pause_reason = NULL WHERE id = ? AND COALESCE(paused, 0) = 1 AND pause_reason IS DISTINCT FROM ?`,
 			[accountId, blockedReason],
 		);
 		if (changes > 0) {

@@ -6,6 +6,7 @@ import type { Config } from "@better-ccflare/config";
 import type { ModelMapping } from "@better-ccflare/core";
 import {
 	PAUSE_REASON_NEEDS_REAUTH,
+	REAUTHENTICATION_REQUIRED_CODE,
 	validateAndSanitizeModelFallbacks,
 	validateAndSanitizeModelMappings,
 	validateApiKey,
@@ -1931,7 +1932,7 @@ async function toggleAccountPause(
 				return {
 					success: false,
 					message: `Account '${name}' needs reauthentication before it can be resumed: its stored refresh token was rejected by the provider`,
-					code: "reauthentication_required",
+					code: REAUTHENTICATION_REQUIRED_CODE,
 				};
 			}
 			// Guard declined for some other reason (e.g. a concurrent action

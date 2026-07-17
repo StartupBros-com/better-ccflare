@@ -39,6 +39,15 @@ export interface StrategyStore {
 
 	/**
 	 * Resume a paused account
+	 *
+	 * Declared `void` for the widest implementer compatibility, but a real
+	 * implementer (e.g. DatabaseOperations.resumeAccount) may return a richer
+	 * async result such as `Promise<{ resumed: boolean; pauseReason: string
+	 * | null }>` -- TypeScript's void-return covariance allows that, but
+	 * callers going through this interface type only ever see `void` and
+	 * silently discard the richer result. Callers that need the resumed/
+	 * pauseReason outcome (e.g. the R23 guard) must call the concrete
+	 * DatabaseOperations method directly rather than through StrategyStore.
 	 */
 	resumeAccount?(accountId: string): void;
 

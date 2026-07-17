@@ -7,6 +7,7 @@ import type { Config } from "@better-ccflare/config";
 import {
 	PAUSE_REASON_NEEDS_REAUTH,
 	patterns,
+	REAUTHENTICATION_REQUIRED_CODE,
 	sanitizers,
 	validateAndSanitizeModelMappings,
 	validateNumber,
@@ -875,10 +876,10 @@ export function createAccountResumeHandler(dbOps: DatabaseOperations) {
 			const result = await cliCommands.resumeAccount(dbOps, account.name);
 
 			if (!result.success) {
-				if (result.code === "reauthentication_required") {
+				if (result.code === REAUTHENTICATION_REQUIRED_CODE) {
 					return errorResponse(
 						BadRequest(result.message, {
-							code: "reauthentication_required",
+							code: REAUTHENTICATION_REQUIRED_CODE,
 							pauseReason: PAUSE_REASON_NEEDS_REAUTH,
 						}),
 					);

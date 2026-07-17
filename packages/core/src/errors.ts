@@ -62,6 +62,16 @@ export class TokenRefreshError extends AuthError {
 export const PAUSE_REASON_NEEDS_REAUTH = "oauth_invalid_grant";
 
 /**
+ * Canonical error `code` returned by the Resume endpoint/CLI when a resume
+ * is refused because the account is paused for PAUSE_REASON_NEEDS_REAUTH
+ * (R23). Kept here, next to PAUSE_REASON_NEEDS_REAUTH, so producers
+ * (cli-commands account.ts's toggleAccountPause) and consumers (the
+ * http-api resume handler, and any future client) agree on the exact
+ * string instead of each hardcoding their own copy of the literal.
+ */
+export const REAUTHENTICATION_REQUIRED_CODE = "reauthentication_required";
+
+/**
  * Terminal OAuth markers returned by a token endpoint when a refresh token has
  * been revoked, rotated, or invalidated. These are NOT retryable network
  * conditions, the only fix is re-authentication.

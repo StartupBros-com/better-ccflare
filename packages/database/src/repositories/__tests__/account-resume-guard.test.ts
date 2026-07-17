@@ -82,7 +82,7 @@ function getAccount(db: Database, id: string): RawAccount {
 		.get(id) as RawAccount;
 }
 
-describe("AccountRepository — resumeUnlessPausedForReason", () => {
+describe("AccountRepository: resumeUnlessPausedForReason", () => {
 	let db: Database;
 	let repo: AccountRepository;
 
