@@ -42,6 +42,7 @@ import {
 } from "./rate-limit-scope";
 import { makeProxyRequest, validateProviderPath } from "./request-handler";
 import { handleProxyError, processProxyResponse } from "./response-processor";
+import type { RoutingAttemptLedger } from "./routing-attempt-ledger";
 import { getValidAccessToken } from "./token-manager";
 
 const log = new Logger("ProxyOperations");
@@ -1058,6 +1059,7 @@ export async function proxyWithAccount(
 	requestBodyContext?: RequestBodyContext | null,
 	returnRateLimitedResponseOnExhaustion = false,
 	contextAdmissionTracker?: ContextAdmissionTracker,
+	routingAttemptLedger?: RoutingAttemptLedger,
 ): Promise<Response | null> {
 	try {
 		if (
@@ -1130,26 +1132,12 @@ export async function proxyWithAccount(
 				effectiveBodyBuffer = admittedContext.getBuffer();
 			}
 		}
-		if (attemptAdmissionTracker) attemptAdmissionTracker.attemptedCount++;
-
-		// Stage the original request body + headers for cache keepalive replay.
-		// Uses the pre-transform body (effectiveBodyBuffer may have a model override
-		// patched in, so use the original requestBodyBuffer for a faithful replay).
-		// Headers are stored because Anthropic's prepareHeaders() copies incoming
-		// client headers (anthropic-version, anthropic-beta, x-stainless-*, etc.)
-		// and augments them — providers that build headers from scratch ignore them.
-		// Skip staging for internal synthetic requests:
-		//   - keepalive replays — prevent infinite loop
-		//   - auto-refresh probes — same loop-prevention concern, plus these
-		//     hit known-cooled accounts and shouldn't pollute the staged-body cache
-		//     (issue #199, bug 2).
-		// Ordinary Codex attempts also cannot be staged: the subscription endpoint
-		// does not support the output cap used by keepalive replays. Discard instead
-		// so failover from an earlier provider cannot leave promotable residue.
-		// For non-Codex providers, both header checks are truthy (not
-		// strict-equality) to preserve the original keepalive guard's behaviour:
-		// any non-empty value skips staging, matching what
-		// `!req.headers.get(...)` returned before.
+		const admittedRequestModel =
+			admission.model ?? requestedModelBeforeAdmission ?? null;
+		const concreteAttemptModel =
+			account.provider === "codex" && admittedRequestModel
+				? resolveCodexRequestModel(admittedRequestModel, account)
+				: admittedRequestModel;
 		const isSyntheticInternal = isSyntheticInternalRequest(req.headers);
 		applyCacheBodyStagingPolicy({
 			requestId: requestMeta.id,
@@ -1337,7 +1325,32 @@ export async function proxyWithAccount(
 		}
 		const transformedModel =
 			(transformedBodyJson?.model as string | undefined) ?? "";
-		let currentTransportModel = transformedModel;
+		let currentTransportModel = transformedModel || concreteAttemptModel;
+		if (
+			routingAttemptLedger &&
+			!routingAttemptLedger.claim(account.id, currentTransportModel)
+		) {
+			if (attemptAdmissionTracker) {
+				attemptAdmissionTracker.nonCapacitySkipCount++;
+			}
+			log.debug(
+				`Skipping duplicate request-local route account=${account.name} model=${currentTransportModel ?? "unknown"}`,
+			);
+			return null;
+		}
+		if (routingAttemptLedger) {
+			// A later unique upstream route supersedes any deferred terminal response
+			// from the previous route. Duplicate skips return above and deliberately
+			// preserve it so the request can still surface that upstream terminal once
+			// every unique route has been exhausted.
+			await routingAttemptLedger.discardTerminalResponse();
+			failoverAttempts = Math.max(
+				failoverAttempts,
+				routingAttemptLedger.attemptedCount - 1,
+			);
+		}
+		if (attemptAdmissionTracker) attemptAdmissionTracker.attemptedCount++;
+
 		const finalizedCodexAttemptIds = new Set<string>();
 		const finalizeCurrentCodexTransport = async (discarded: Response) => {
 			if (provider.name !== "codex" || !currentTransportAttemptId) return;
@@ -1668,6 +1681,7 @@ export async function proxyWithAccount(
 				{ resetTime: cooldownUntil, reason },
 				ctx,
 			);
+			routingAttemptLedger?.blockAccount(account.id);
 			recordRequestRateLimitOutcome(req, {
 				accountId: account.id,
 				status: 402,
@@ -2120,6 +2134,7 @@ export async function proxyWithAccount(
 							{ resetTime: cooldownUntil, reason },
 							ctx,
 						);
+						routingAttemptLedger?.blockAccount(account.id);
 						const responseTime = Date.now() - requestMeta.timestamp;
 						ctx.asyncWriter.enqueue(() =>
 							ctx.dbOps.saveRequest(
@@ -2217,7 +2232,27 @@ export async function proxyWithAccount(
 						log.warn("Failed to patch request body for model retry");
 						break;
 					}
-
+					// getModelList returns concrete provider models, and the transformed
+					// request is force-patched to this exact value below. Claim before
+					// retry tracing/finalization so a duplicate skip has no side effects.
+					if (
+						routingAttemptLedger &&
+						!routingAttemptLedger.claim(account.id, nextModel)
+					) {
+						if (attemptAdmissionTracker) {
+							attemptAdmissionTracker.nonCapacitySkipCount++;
+						}
+						log.debug(
+							`Skipping duplicate request-local model fallback account=${account.name} model=${nextModel}`,
+						);
+						continue;
+					}
+					if (routingAttemptLedger) {
+						failoverAttempts = Math.max(
+							failoverAttempts,
+							routingAttemptLedger.attemptedCount - 1,
+						);
+					}
 					const retryRequestInit: RequestInit & { duplex?: "half" } = {
 						method: req.method,
 						headers,
@@ -2315,6 +2350,7 @@ export async function proxyWithAccount(
 							{ resetTime: cooldownUntil, reason },
 							ctx,
 						);
+						routingAttemptLedger?.blockAccount(account.id);
 						const responseTime = Date.now() - requestMeta.timestamp;
 						ctx.asyncWriter.enqueue(() =>
 							ctx.dbOps.saveRequest(
@@ -2401,6 +2437,7 @@ export async function proxyWithAccount(
 			log.warn(
 				`Authentication failed (401) for account ${account.name}, failing over to next account`,
 			);
+			routingAttemptLedger?.blockAccount(account.id);
 			await discardUnusedResponse(response, "auth_failed_401");
 			return null;
 		}
@@ -2562,22 +2599,24 @@ export async function proxyWithAccount(
 			log.warn(
 				`Authentication failed (401) on 529 retry for account ${account.name}, failing over to next account`,
 			);
+			routingAttemptLedger?.blockAccount(account.id);
 			await discardUnusedResponse(response, "auth_failed_401_after_retry");
 			return null;
 		}
 
-		// Check for rate limit using account-specific provider. On the final
-		// candidate account, a 529 (any provider) or a native xAI 402/429
-		// (R5-R10: capacity/rate-limit signals surfaced by XaiProvider.parseRateLimit)
-		// is classified from a clone so the ORIGINAL response can still be
-		// forwarded to the client intact instead of being replaced by
-		// pool_exhausted (see the forward-intact branch below).
-		const isFinalCandidateRateLimitStatus =
-			returnRateLimitedResponseOnExhaustion &&
-			(response.status === 529 ||
-				(account.provider === "xai" &&
-					(response.status === 402 || response.status === 429)));
-		const responseForRateLimitCheck = isFinalCandidateRateLimitStatus
+		// Check for rate limit using account-specific provider. A terminal response
+		// that may be delivered now or deferred in the request-local ledger is
+		// classified from a bounded clone so the original headers/body remain
+		// untouched for the client. Native xAI treats 402/429 as capacity signals;
+		// every provider retains the established 529 terminal contract.
+		const isTerminalRateLimitStatus =
+			response.status === 529 ||
+			(account.provider === "xai" &&
+				(response.status === 402 || response.status === 429));
+		const shouldPreserveTerminalRateLimitResponse =
+			isTerminalRateLimitStatus &&
+			(returnRateLimitedResponseOnExhaustion || Boolean(routingAttemptLedger));
+		const responseForRateLimitCheck = shouldPreserveTerminalRateLimitResponse
 			? await boundResponseBodyForClassification(response.clone())
 			: response;
 		const isRateLimited = await processProxyResponse(
@@ -2600,11 +2639,12 @@ export async function proxyWithAccount(
 			);
 		}
 		if (isRateLimited) {
-			if (isFinalCandidateRateLimitStatus) {
-				log.warn(
-					`Account ${account.name} returned final ${response.status} rate-limit/capacity response, forwarding upstream response instead of pool_exhausted`,
-				);
-				return forwardToClient(
+			const comboNameAtAttempt = requestMeta.comboName ?? null;
+			const forwardTerminalRateLimitResponse = (
+				terminalResponse: Response,
+				terminalFailoverAttempts: number,
+			) =>
+				forwardToClient(
 					{
 						requestId: requestMeta.id,
 						method: req.method,
@@ -2616,16 +2656,16 @@ export async function proxyWithAccount(
 						query: url.search || null,
 						projectAttributionSource:
 							requestMeta.projectAttributionSource ?? null,
-						response,
+						response: terminalResponse,
 						timestamp: requestMeta.timestamp,
 						retryAttempt: 0,
-						failoverAttempts,
+						failoverAttempts: terminalFailoverAttempts,
 						agentUsed: requestMeta.agentUsed,
 						originalModel: requestMeta.originalModel,
 						appliedModel: requestMeta.appliedModel,
 						attemptedModel: currentTransportModel,
 						agentAttributionSource: requestMeta.agentAttributionSource ?? null,
-						comboName: requestMeta.comboName,
+						comboName: comboNameAtAttempt,
 						apiKeyId,
 						apiKeyName,
 						xaiCacheIdentityFingerprint:
@@ -2641,6 +2681,39 @@ export async function proxyWithAccount(
 					},
 					{ ...ctx, provider },
 				);
+			if (req.headers.get("x-better-ccflare-keepalive") !== "true") {
+				routingAttemptLedger?.blockAccount(account.id);
+			}
+			if (returnRateLimitedResponseOnExhaustion && isTerminalRateLimitStatus) {
+				log.warn(
+					`Account ${account.name} returned final ${response.status} rate-limit/capacity response, forwarding upstream response instead of pool_exhausted`,
+				);
+				return forwardTerminalRateLimitResponse(response, failoverAttempts);
+			}
+			if (isTerminalRateLimitStatus && routingAttemptLedger) {
+				const retainedResponse = response;
+				await routingAttemptLedger.retainTerminalResponse({
+					deliver: async (terminalFailoverAttempts) => {
+						try {
+							return await forwardTerminalRateLimitResponse(
+								retainedResponse,
+								terminalFailoverAttempts,
+							);
+						} catch (error) {
+							await discardUnusedResponse(
+								retainedResponse,
+								"retained_terminal_delivery_failed",
+							);
+							throw error;
+						}
+					},
+					discard: () =>
+						discardUnusedResponse(
+							retainedResponse,
+							"retained_terminal_superseded",
+						),
+				});
+				return null;
 			}
 			await discardUnusedResponse(response, "rate_limited_failover");
 			return null; // Signal to try next account

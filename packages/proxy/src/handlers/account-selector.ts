@@ -851,31 +851,87 @@ export async function selectAccountsForRequest(
 								entry,
 							]),
 						);
-						applyXaiCacheAffinity(
+						const reconcileEntries = (
+							orderedAccounts: Account[],
+							routingSidecar: readonly RoutingCandidateMetadata[] | null,
+						): typeof eligibleEntries => {
+							if (
+								routingSidecar?.length === orderedAccounts.length &&
+								routingSidecar.every(
+									(candidate, index) =>
+										candidate.accountId === orderedAccounts[index]?.id &&
+										entryByCandidateId.has(candidate.candidateId),
+								)
+							) {
+								const seen = new Set<string>();
+								const aligned = routingSidecar
+									.map((candidate) => {
+										if (seen.has(candidate.candidateId)) return undefined;
+										seen.add(candidate.candidateId);
+										return entryByCandidateId.get(candidate.candidateId);
+									})
+									.filter(
+										(entry): entry is (typeof eligibleEntries)[number] =>
+											entry !== undefined,
+									);
+								if (aligned.length === orderedAccounts.length) return aligned;
+							}
+
+							// Account-only custom strategies cannot express which repeated slot
+							// moved. Reconcile each returned occurrence to the next unused source
+							// candidate for that account, preserving as much identity as possible.
+							const used = new Set<string>();
+							return orderedAccounts
+								.map((account) => {
+									const entry = eligibleEntries.find(
+										(candidate) =>
+											candidate.account.id === account.id &&
+											!used.has(candidate.routing.candidateId),
+									);
+									if (entry) used.add(entry.routing.candidateId);
+									return entry;
+								})
+								.filter(
+									(entry): entry is (typeof eligibleEntries)[number] =>
+										entry !== undefined,
+								);
+						};
+
+						const strategyAccounts = ctx.strategy.select(
 							eligibleEntries.map((entry) => entry.account),
+							meta,
+						);
+						let orderedEntries = reconcileEntries(
+							strategyAccounts,
+							meta.routingCandidates ?? null,
+						);
+						meta.routingCandidates = orderedEntries.map(
+							(entry) => entry.routing,
+						);
+						const affinityAccounts = applyXaiCacheAffinity(
+							orderedEntries.map((entry) => entry.account),
 							meta,
 							ctx,
 						);
-						const affinityOrderedEntries = (meta.routingCandidates ?? [])
-							.map((candidate) => entryByCandidateId.get(candidate.candidateId))
-							.filter(
-								(entry): entry is (typeof eligibleEntries)[number] =>
-									entry !== undefined,
-							);
-						const orderedEntries =
-							affinityOrderedEntries.length === eligibleEntries.length
-								? affinityOrderedEntries
-								: eligibleEntries;
-						const slotInfo: ComboSlotInfo = {
-							comboName: combo.name,
-							slots: orderedEntries.map((entry) => ({
-								accountId: entry.account.id,
-								modelOverride: entry.modelOverride,
-							})),
-						};
-						setComboSlotInfo(meta, slotInfo);
-						meta.comboName = combo.name;
-						return orderedEntries.map((entry) => entry.account);
+						orderedEntries = reconcileEntries(
+							affinityAccounts,
+							meta.routingCandidates ?? null,
+						);
+						meta.routingCandidates = orderedEntries.map(
+							(entry) => entry.routing,
+						);
+						if (orderedEntries.length > 0) {
+							const slotInfo: ComboSlotInfo = {
+								comboName: combo.name,
+								slots: orderedEntries.map((entry) => ({
+									accountId: entry.account.id,
+									modelOverride: entry.modelOverride,
+								})),
+							};
+							setComboSlotInfo(meta, slotInfo);
+							meta.comboName = combo.name;
+							return orderedEntries.map((entry) => entry.account);
+						}
 					}
 
 					// All slots unavailable — fall back to normal routing

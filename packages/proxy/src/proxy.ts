@@ -47,6 +47,7 @@ import {
 	proxyWithAccount,
 	RequestBodyContext,
 	type RequestJsonBody,
+	RoutingAttemptLedger,
 	resolveEffectiveModel,
 	selectAccountsForRequest,
 	validateProviderPath,
@@ -711,6 +712,18 @@ export async function handleProxy(
 		: null;
 	let response: Response | null = null;
 	let upstreamAttempts = 0;
+	const routingAttemptLedger = new RoutingAttemptLedger();
+	const deliverRetainedTerminalResponse =
+		async (): Promise<Response | null> => {
+			const retainedTerminalResponse =
+				routingAttemptLedger.takeTerminalResponse();
+			if (!retainedTerminalResponse) return null;
+			const terminalFailoverAttempts = Math.max(
+				0,
+				routingAttemptLedger.attemptedCount - 1,
+			);
+			return retainedTerminalResponse.deliver(terminalFailoverAttempts);
+		};
 	const reactiveDepletionSkips: Account[] = [];
 	const betaSignature = req.headers.get("anthropic-beta");
 
@@ -780,7 +793,7 @@ export async function handleProxy(
 			continue;
 		}
 
-		const attemptedBefore = contextAdmissionTracker?.attemptedCount ?? 0;
+		const attemptedBefore = routingAttemptLedger.attemptedCount;
 		try {
 			response = await proxyWithAccount(
 				req,
@@ -789,7 +802,7 @@ export async function handleProxy(
 				requestMeta,
 				finalBodyBuffer,
 				finalCreateBodyStream,
-				i,
+				upstreamAttempts,
 				ctx,
 				modelOverride,
 				apiKeyId,
@@ -797,20 +810,20 @@ export async function handleProxy(
 				requestBodyContext,
 				!filteredComboInfo?.comboName && i === accounts.length - 1,
 				contextAdmissionTracker,
+				routingAttemptLedger,
 			);
+		} catch (error) {
+			await routingAttemptLedger.discardTerminalResponse();
+			throw error;
 		} finally {
 			if (probeAdmission === "admitted") {
 				completeRateLimitProbe(accounts[i], "abandoned");
 			}
 		}
-		if (
-			!contextAdmissionTracker ||
-			contextAdmissionTracker.attemptedCount > attemptedBefore
-		) {
-			upstreamAttempts++;
-		}
+		upstreamAttempts += routingAttemptLedger.attemptedCount - attemptedBefore;
 
 		if (response) {
+			await routingAttemptLedger.discardTerminalResponse();
 			recordCachePacingRoute(
 				pacingObservation,
 				{
@@ -844,18 +857,33 @@ export async function handleProxy(
 		// Clear combo info and retry with normal routing
 		requestMeta.comboName = null;
 		requestMeta.comboSlotIndex = null;
-		const selectedFallbackAccounts = await selectAccountsForRequest(
-			requestMeta,
-			ctx,
-			effectiveModel ?? undefined,
-			{ skipCombo: true },
-		);
+		let selectedFallbackAccounts: Account[];
+		try {
+			selectedFallbackAccounts = await selectAccountsForRequest(
+				requestMeta,
+				ctx,
+				effectiveModel ?? undefined,
+				{ skipCombo: true },
+			);
+		} catch (error) {
+			await routingAttemptLedger.discardTerminalResponse();
+			throw error;
+		}
 		const {
 			available: filteredFallbackAccounts,
 			predictivelyThrottled: throttledFallbackAccounts,
 			reactivelyDepletedAccounts: reactivelyDepletedFallbackAccounts,
 		} = applyUsageThrottling(selectedFallbackAccounts);
 		fallbackAccounts = filteredFallbackAccounts;
+		if (fallbackAccounts.length === 0) {
+			// The combo already reached a concrete upstream terminal and fallback
+			// selection found no new unique route to attempt. Surface that upstream
+			// response before synthesizing model-depleted or usage-throttled output.
+			const retainedTerminalResponse = await deliverRetainedTerminalResponse();
+			if (retainedTerminalResponse) {
+				return finishPacing(pacingSlot, retainedTerminalResponse);
+			}
+		}
 
 		if (fallbackAccounts.length > 0) {
 			log.info(
@@ -884,7 +912,7 @@ export async function handleProxy(
 					continue;
 				}
 
-				const attemptedBefore = contextAdmissionTracker?.attemptedCount ?? 0;
+				const attemptedBefore = routingAttemptLedger.attemptedCount;
 				try {
 					response = await proxyWithAccount(
 						req,
@@ -893,7 +921,7 @@ export async function handleProxy(
 						requestMeta,
 						finalBodyBuffer,
 						finalCreateBodyStream,
-						i,
+						upstreamAttempts,
 						ctx,
 						undefined, // No model override for fallback path
 						apiKeyId,
@@ -901,20 +929,21 @@ export async function handleProxy(
 						requestBodyContext,
 						i === fallbackAccounts.length - 1,
 						contextAdmissionTracker,
+						routingAttemptLedger,
 					);
+				} catch (error) {
+					await routingAttemptLedger.discardTerminalResponse();
+					throw error;
 				} finally {
 					if (probeAdmission === "admitted") {
 						completeRateLimitProbe(fallbackAccounts[i], "abandoned");
 					}
 				}
-				if (
-					!contextAdmissionTracker ||
-					contextAdmissionTracker.attemptedCount > attemptedBefore
-				) {
-					upstreamAttempts++;
-				}
+				upstreamAttempts +=
+					routingAttemptLedger.attemptedCount - attemptedBefore;
 
 				if (response) {
+					await routingAttemptLedger.discardTerminalResponse();
 					recordCachePacingRoute(
 						pacingObservation,
 						{
@@ -950,6 +979,11 @@ export async function handleProxy(
 				createUsageThrottledResponse(throttledFallbackAccounts),
 			);
 		}
+	}
+
+	const retainedTerminalResponse = await deliverRetainedTerminalResponse();
+	if (retainedTerminalResponse) {
+		return finishPacing(pacingSlot, retainedTerminalResponse);
 	}
 
 	// If routing skipped every remaining candidate using direct, short-lived

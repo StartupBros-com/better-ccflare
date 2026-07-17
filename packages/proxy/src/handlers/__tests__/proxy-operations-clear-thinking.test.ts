@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import type { Account, RequestMeta } from "@better-ccflare/types";
 import { proxyWithAccount } from "../proxy-operations";
 import type { ProxyContext } from "../proxy-types";
+import { RoutingAttemptLedger } from "../routing-attempt-ledger";
 
 // Anthropic account fixture: clear_thinking context management is
 // Anthropic-specific (Claude Code sends it on newer model families).
@@ -191,6 +192,7 @@ async function runProxyCapturingBodies(
 	account = makeAccount(),
 	ctx = makeProxyContext(),
 	cloneResponses = true,
+	routingAttemptLedger?: RoutingAttemptLedger,
 ): Promise<{
 	result: Response | null;
 	upstreamBodies: Array<Record<string, unknown>>;
@@ -223,6 +225,13 @@ async function runProxyCapturingBodies(
 			() => undefined,
 			0,
 			ctx,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			false,
+			undefined,
+			routingAttemptLedger,
 		);
 	} catch (e) {
 		const msg = e instanceof Error ? e.message : String(e);
@@ -244,6 +253,7 @@ describe("proxyWithAccount clear_thinking context-management handling", () => {
 	});
 
 	it("thinking-signature retry also strips clear_thinking edits when disabling thinking", async () => {
+		const routingAttemptLedger = new RoutingAttemptLedger();
 		const { upstreamBodies } = await runProxyCapturingBodies(
 			{
 				model: "claude-opus-4-8",
@@ -255,6 +265,10 @@ describe("proxyWithAccount clear_thinking context-management handling", () => {
 				messages: messagesWithThinkingHistory(),
 			},
 			[invalidSignatureResponse(), successResponse("claude-opus-4-8")],
+			makeAccount(),
+			makeProxyContext(),
+			true,
+			routingAttemptLedger,
 		);
 
 		expect(upstreamBodies).toHaveLength(2);
@@ -282,6 +296,65 @@ describe("proxyWithAccount clear_thinking context-management handling", () => {
 				expect(msg.content.some((b) => b.type === "thinking")).toBe(false);
 			}
 		}
+		expect(routingAttemptLedger.attemptedCount).toBe(1);
+	});
+
+	it("cache_control retry reuses the claimed physical route", async () => {
+		const routingAttemptLedger = new RoutingAttemptLedger();
+		const { upstreamBodies } = await runProxyCapturingBodies(
+			{
+				model: "claude-cache-retry-test",
+				max_tokens: 100,
+				messages: [
+					{
+						role: "user",
+						content: [
+							{
+								type: "text",
+								text: "hello",
+								cache_control: { type: "ephemeral" },
+							},
+						],
+					},
+				],
+			},
+			[
+				jsonResponse(
+					{
+						error: {
+							message: "cache_control: Extra inputs are not permitted",
+						},
+					},
+					400,
+				),
+				successResponse("claude-cache-retry-test"),
+			],
+			makeAccount({ id: "acc-cache-retry-test" }),
+			makeProxyContext(),
+			true,
+			routingAttemptLedger,
+		);
+
+		expect(upstreamBodies).toHaveLength(2);
+		expect(
+			(
+				(
+					upstreamBodies[0].messages as Array<{
+						content: Array<Record<string, unknown>>;
+					}>
+				)[0]?.content[0] as Record<string, unknown>
+			).cache_control,
+		).toEqual({ type: "ephemeral" });
+		expect(
+			(
+				(
+					upstreamBodies[1].messages as Array<{
+						content: Array<Record<string, unknown>>;
+					}>
+				)[0]?.content[0] as Record<string, unknown>
+			).cache_control,
+		).toBeUndefined();
+		expect(routingAttemptLedger.attemptedCount).toBe(1);
 	});
 
 	it("strips clear_thinking edits before the first send when thinking is explicitly disabled", async () => {

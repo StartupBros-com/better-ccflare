@@ -8,9 +8,12 @@ import type {
 } from "@better-ccflare/types";
 import { isPeekAvailable, wouldAutoUnpause } from "./peek-availability";
 import {
-	compareRoutingMetadata,
-	filterHardExcludedAccounts,
-	isSameRoutingClass,
+	commitStrategyCandidateOrder,
+	compareStrategyCandidates,
+	filterHardExcludedCandidates,
+	isSameStrategyCandidateClass,
+	type StrategyCandidate,
+	zipStrategyCandidates,
 } from "./routing-metadata";
 
 /**
@@ -81,7 +84,7 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 	/** clientId → which account it is stuck to (and when it was last touched). */
 	private affinity = new Map<
 		string,
-		{ accountId: string; assignedAt: number }
+		{ candidateId: string; assignedAt: number }
 	>();
 	/** accountId → last time it was freshly assigned to a NEW client-session. */
 	private lastPickedAt = new Map<string, number>();
@@ -110,25 +113,31 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 	 * the same primary for a fresh session given the same state.
 	 */
 	private rankByLeastUsed(
-		accounts: Account[],
+		candidates: StrategyCandidate[],
 		now: number,
 		meta?: RequestMeta,
-	): Account[] {
-		const scored = accounts.map((a) => {
-			const util = this.store?.getAccountUtilization?.(a.id, a.provider) ?? 0;
-			const lastPick = this.lastPickedAt.get(a.id) ?? 0;
+	): StrategyCandidate[] {
+		const scored = candidates.map((candidate) => {
+			const { account } = candidate;
+			const util =
+				this.store?.getAccountUtilization?.(account.id, account.provider) ?? 0;
+			const lastPick = this.lastPickedAt.get(account.id) ?? 0;
 			const recencyPenalty =
 				now - lastPick < RECENT_PICK_WINDOW_MS ? RECENT_PICK_PENALTY : 0;
-			return { account: a, score: util + recencyPenalty };
+			return { candidate, score: util + recencyPenalty };
 		});
 
 		return scored
 			.sort((a, b) => {
-				const routingOrder = compareRoutingMetadata(a.account, b.account, meta);
+				const routingOrder = compareStrategyCandidates(
+					a.candidate,
+					b.candidate,
+					meta,
+				);
 				if (routingOrder !== 0) return routingOrder;
 				return a.score - b.score;
 			})
-			.map((s) => s.account);
+			.map((entry) => entry.candidate);
 	}
 
 	/**
@@ -144,14 +153,14 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 	 * where spreading matters most.
 	 */
 	private pickAndMark(
-		available: Account[],
+		available: StrategyCandidate[],
 		now: number,
 		meta?: RequestMeta,
-	): Account[] {
+	): StrategyCandidate[] {
 		const ranked = this.rankByLeastUsed(available, now, meta);
 		const chosen = ranked[0];
 		if (chosen) {
-			this.lastPickedAt.set(chosen.id, now);
+			this.lastPickedAt.set(chosen.account.id, now);
 			// Opportunistic GC of entries older than 10× the window.
 			const gcThreshold = now - RECENT_PICK_WINDOW_MS * 10;
 			for (const [id, ts] of this.lastPickedAt) {
@@ -185,21 +194,32 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 		// next call surface as candidates here, matching LeastUsedStrategy.peek().
 		const available = accounts.filter((a) => isPeekAvailable(a, now));
 		if (available.length === 0) return null;
-		return this.rankByLeastUsed(available, now)[0]?.id ?? null;
+		return (
+			this.rankByLeastUsed(zipStrategyCandidates(available), now)[0]?.account
+				.id ?? null
+		);
 	}
 
 	select(accounts: Account[], meta: RequestMeta): Account[] {
 		const now = Date.now();
-		const candidates = filterHardExcludedAccounts(accounts, meta);
+		const configuredCandidates = zipStrategyCandidates(accounts, meta);
+		const candidates = filterHardExcludedCandidates(configuredCandidates, meta);
 
 		// Auto-unpause eligible accounts whose upstream usage window has reset.
 		// Mirrors LeastUsedStrategy.autoUnpauseElapsedAccounts so users with
 		// auto_fallback_enabled accounts get the same self-recovery behaviour
 		// regardless of which strategy they pick.
-		this.autoUnpauseElapsedAccounts(candidates, now);
+		this.autoUnpauseElapsedAccounts(
+			candidates.map((candidate) => candidate.account),
+			now,
+		);
 
-		const available = candidates.filter((a) => isAccountAvailable(a, now));
-		if (available.length === 0) return [];
+		const available = candidates.filter((candidate) =>
+			isAccountAvailable(candidate.account, now),
+		);
+		if (available.length === 0) {
+			return commitStrategyCandidateOrder([], meta);
+		}
 
 		// GC expired affinity entries so the map doesn't grow unboundedly and so
 		// long-idle clients are re-balanced onto the currently least-loaded
@@ -223,22 +243,31 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 		if (affinityKey !== null) {
 			const mapping = this.affinity.get(affinityKey);
 			if (mapping) {
-				const mapped = available.find((a) => a.id === mapping.accountId);
+				const mapped = available.find(
+					(candidate) => candidate.routing.candidateId === mapping.candidateId,
+				);
 				const ranked = this.rankByLeastUsed(available, now, meta);
 				const best = ranked[0];
-				if (mapped && best && isSameRoutingClass(mapped, best, meta)) {
+				if (
+					mapped &&
+					best &&
+					isSameStrategyCandidateClass(mapped, best, meta)
+				) {
 					// STICKY hit: keep the client on its account (prompt-cache reuse).
 					// Refresh assignedAt so an active session keeps its mapping alive.
 					mapping.assignedAt = now;
 					const others = this.rankByLeastUsed(
-						available.filter((a) => a.id !== mapped.id),
+						available.filter(
+							(candidate) =>
+								candidate.routing.candidateId !== mapped.routing.candidateId,
+						),
 						now,
 						meta,
 					);
 					this.log.debug(
-						`Sticky route ${affinityKey} → ${mapped.name} (${others.length} fallback(s))`,
+						`Sticky route ${affinityKey} → ${mapped.account.name}/${mapped.routing.candidateId} (${others.length} fallback(s))`,
 					);
-					return [mapped, ...others];
+					return commitStrategyCandidateOrder([mapped, ...others], meta);
 				}
 
 				if (mapped && best) {
@@ -247,44 +276,44 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 					const ordered = this.pickAndMark(available, now, meta);
 					const replacement = ordered[0];
 					if (replacement) {
-						mapping.accountId = replacement.id;
+						mapping.candidateId = replacement.routing.candidateId;
 						mapping.assignedAt = now;
 					}
 					this.log.info(
-						`Route ${affinityKey} owner ${mapped.name} was outclassed — remapped to ${replacement?.name ?? best.name}`,
+						`Route ${affinityKey} owner ${mapped.routing.candidateId} was outclassed — remapped to ${replacement?.routing.candidateId ?? best.routing.candidateId}`,
 					);
-					return ordered;
+					return commitStrategyCandidateOrder(ordered, meta);
 				}
 
 				if (best) {
 					const configuredOwnerTier =
 						meta.routingCandidateCatalog?.find(
-							(candidate) =>
-								candidate.comboSlotId === null &&
-								candidate.accountId === mapping.accountId,
+							(candidate) => candidate.candidateId === mapping.candidateId,
 						)?.tier ??
-						accounts.find((account) => account.id === mapping.accountId)
-							?.priority;
+						configuredCandidates.find(
+							(candidate) =>
+								candidate.routing.candidateId === mapping.candidateId,
+						)?.routing.tier;
 					const ordered = this.pickAndMark(available, now, meta);
 					const fallback = ordered[0];
 					const preserveForSnapback =
 						configuredOwnerTier !== undefined &&
-						configuredOwnerTier < best.priority;
+						configuredOwnerTier < best.routing.tier;
 					if (preserveForSnapback) {
 						// Refresh while the client remains active so a legal temporary
 						// failover does not expire the better-tier owner mapping.
 						mapping.assignedAt = now;
 						this.log.info(
-							`Route ${affinityKey} better-tier owner ${mapping.accountId} is temporarily unavailable — preserving for snapback`,
+							`Route ${affinityKey} better-tier owner ${mapping.candidateId} is temporarily unavailable — preserving for snapback`,
 						);
 					} else if (fallback) {
-						mapping.accountId = fallback.id;
+						mapping.candidateId = fallback.routing.candidateId;
 						mapping.assignedAt = now;
 						this.log.info(
-							`Route ${affinityKey} unavailable equal/worse owner remapped to ${fallback.name}`,
+							`Route ${affinityKey} unavailable equal/worse owner remapped to ${fallback.routing.candidateId}`,
 						);
 					}
-					return ordered;
+					return commitStrategyCandidateOrder(ordered, meta);
 				}
 			}
 		}
@@ -298,15 +327,15 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 		if (affinityKey !== null && chosen) {
 			this.evictOldestIfFull();
 			this.affinity.set(affinityKey, {
-				accountId: chosen.id,
+				candidateId: chosen.routing.candidateId,
 				assignedAt: now,
 			});
 			this.log.debug(
-				`Assigned route ${affinityKey} → ${chosen.name} (least-used)`,
+				`Assigned route ${affinityKey} → ${chosen.account.name}/${chosen.routing.candidateId} (least-used)`,
 			);
 		}
 
-		return ranked;
+		return commitStrategyCandidateOrder(ranked, meta);
 	}
 
 	/**

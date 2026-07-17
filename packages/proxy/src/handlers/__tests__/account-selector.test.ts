@@ -80,7 +80,7 @@ function makeCtx(
 	const accounts = opts.accounts ?? [makeAccount()];
 	return {
 		strategy: {
-			select: mock((_all: Account[], _meta: RequestMeta) => accounts),
+			select: mock((_all: Account[], _meta: RequestMeta) => _all),
 		},
 		dbOps: {
 			getAllAccounts: mock(async () => accounts),
@@ -692,7 +692,13 @@ describe("selectAccountsForRequest — combo routing", () => {
 			accounts: [comboAccount, normalAccount],
 			activeCombo: combo,
 		});
-		ctx.strategy.select = mock(() => [normalAccount]);
+		ctx.strategy.select = mock((accounts: Account[], meta: RequestMeta) =>
+			meta.routingCandidates?.some(
+				(candidate) => candidate.comboSlotId !== null,
+			)
+				? accounts
+				: [normalAccount],
+		);
 		const meta = makeRequestMeta();
 
 		expect(
@@ -712,7 +718,7 @@ describe("selectAccountsForRequest — combo routing", () => {
 
 		expect(fallback.map((account) => account.id)).toEqual([normalAccount.id]);
 		expect(ctx.dbOps.getActiveComboForFamily).toHaveBeenCalledTimes(1);
-		expect(ctx.strategy.select).toHaveBeenCalledTimes(1);
+		expect(ctx.strategy.select).toHaveBeenCalledTimes(2);
 		expect(getComboSlotInfo(meta)).toBeNull();
 		expect(meta.comboName).toBeNull();
 		expect(meta.comboSlotIndex).toBeNull();
@@ -1574,6 +1580,90 @@ describe("selectAccountsForRequest — lane identity and quota pressure", () => 
 });
 
 describe("selectAccountsForRequest — atomic combo capacity", () => {
+	it("flows eligible combo candidates through the configured strategy atomically", async () => {
+		const first = makeAccount({ id: "combo-first", priority: 99 });
+		const second = makeAccount({ id: "combo-second", priority: 0 });
+		const combo = makeCombo([
+			{
+				id: "slot-first",
+				combo_id: "combo-1",
+				account_id: first.id,
+				model: "claude-opus-4-8",
+				priority: 0,
+				enabled: true,
+			},
+			{
+				id: "slot-second",
+				combo_id: "combo-1",
+				account_id: second.id,
+				model: "claude-opus-4-5",
+				priority: 0,
+				enabled: true,
+			},
+		]);
+		const ctx = makeCtx({ accounts: [first, second], activeCombo: combo });
+		ctx.strategy.select = mock((accounts: Account[], meta: RequestMeta) => {
+			expect(
+				meta.routingCandidates?.map((candidate) => candidate.candidateId),
+			).toEqual([
+				"combo:combo-1:slot:slot-first",
+				"combo:combo-1:slot:slot-second",
+			]);
+			meta.routingCandidates = [...(meta.routingCandidates ?? [])].reverse();
+			return [...accounts].reverse();
+		});
+		const meta = makeRequestMeta({
+			clientSessionId: "conversation-1",
+		});
+
+		const result = await selectAccountsForRequest(meta, ctx, "claude-opus-4-8");
+
+		expect(ctx.strategy.select).toHaveBeenCalledTimes(1);
+		expect(result.map((account) => account.id)).toEqual([second.id, first.id]);
+		expect(
+			meta.routingCandidates?.map((candidate) => candidate.comboSlotId),
+		).toEqual(["slot-second", "slot-first"]);
+		expect(getComboSlotInfo(meta)?.slots).toEqual([
+			{ accountId: second.id, modelOverride: "claude-opus-4-5" },
+			{ accountId: first.id, modelOverride: "claude-opus-4-8" },
+		]);
+	});
+
+	it("reconciles a custom account-only strategy by unused occurrence", async () => {
+		const first = makeAccount({ id: "custom-first" });
+		const second = makeAccount({ id: "custom-second" });
+		const combo = makeCombo([
+			{
+				id: "custom-slot-first",
+				combo_id: "combo-1",
+				account_id: first.id,
+				model: "claude-fable-5",
+				priority: 0,
+				enabled: true,
+			},
+			{
+				id: "custom-slot-second",
+				combo_id: "combo-1",
+				account_id: second.id,
+				model: "claude-fable-5",
+				priority: 0,
+				enabled: true,
+			},
+		]);
+		const ctx = makeCtx({ accounts: [first, second], activeCombo: combo });
+		ctx.strategy.select = mock((accounts: Account[]) =>
+			[...accounts].reverse(),
+		);
+		const meta = makeRequestMeta();
+
+		const result = await selectAccountsForRequest(meta, ctx, "claude-fable-5");
+
+		expect(result.map((account) => account.id)).toEqual([second.id, first.id]);
+		expect(
+			meta.routingCandidates?.map((candidate) => candidate.comboSlotId),
+		).toEqual(["custom-slot-second", "custom-slot-first"]);
+	});
+
 	it("removes only an exhausted duplicate-account slot and keeps each model sidecar aligned", async () => {
 		const preferred = makeAccount({ id: "combo-preferred", priority: 0 });
 		const fallback = makeAccount({ id: "combo-fallback", priority: 1 });

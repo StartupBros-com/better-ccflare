@@ -6,6 +6,7 @@ import {
 	proxyWithAccount,
 } from "../proxy-operations";
 import type { ProxyContext } from "../proxy-types";
+import { RoutingAttemptLedger } from "../routing-attempt-ledger";
 
 // Minimal Account fixture for openai-compatible provider
 function makeAccount(overrides: Partial<Account> = {}): Account {
@@ -350,6 +351,72 @@ describe("proxyWithAccount — 429 failover", () => {
 		expect(fetchCalls[0]).toBe("qwen/qwen3.6-plus:free");
 		expect(fetchCalls[1]).toBe("bytedance-seed/dola-seed-2.0-pro:free");
 		expect(fetchCalls[2]).toBe("meta-llama/llama-3.3-70b:free");
+	});
+
+	it("skips a preclaimed fallback model and reaches the next distinct model", async () => {
+		const fetchCalls: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const request =
+				input instanceof Request ? input : new Request(String(input));
+			const body = (await request.json()) as { model: string };
+			fetchCalls.push(body.model);
+			return fetchCalls.length === 1
+				? jsonResponse({ error: { message: "rate limited" } }, 429)
+				: jsonResponse(
+						{
+							id: "msg_ledger",
+							type: "message",
+							role: "assistant",
+							content: [{ type: "text", text: "ok" }],
+							model: body.model,
+							stop_reason: "end_turn",
+							usage: { input_tokens: 1, output_tokens: 1 },
+						},
+						200,
+					);
+		});
+
+		const account = makeAccount({
+			model_mappings: JSON.stringify({
+				sonnet: [
+					"qwen/qwen3.6-plus:free",
+					"bytedance-seed/dola-seed-2.0-pro:free",
+					"meta-llama/llama-3.3-70b:free",
+				],
+			}),
+		});
+		const ledger = new RoutingAttemptLedger();
+		expect(
+			ledger.claim(account.id, "bytedance-seed/dola-seed-2.0-pro:free"),
+		).toBe(true);
+		const bodyBuffer = makeRequestBody();
+		try {
+			await proxyWithAccount(
+				makeRequest(bodyBuffer),
+				new URL("https://proxy.local/v1/messages"),
+				account,
+				makeRequestMeta(),
+				bodyBuffer,
+				() => undefined,
+				0,
+				makeProxyContext(),
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				false,
+				undefined,
+				ledger,
+			);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			if (!message.includes("UsageCollector not initialized")) throw error;
+		}
+
+		expect(fetchCalls).toEqual([
+			"qwen/qwen3.6-plus:free",
+			"meta-llama/llama-3.3-70b:free",
+		]);
 	});
 
 	it("returns null when all models in the array are exhausted", async () => {
@@ -1078,6 +1145,7 @@ describe("proxyWithAccount — 529 in-place retry", () => {
 		process.env.CCFLARE_OVERLOAD_RETRY_MAX_ATTEMPTS = "2";
 		const ctx = make529NoResetCtx();
 		const bodyBuffer = makeRequestBody();
+		const attemptLedger = new RoutingAttemptLedger();
 		// proxyWithAccount reaches forwardToClient on success, which requires
 		// UsageCollector initialization (not wired in unit tests). Catch that
 		// specific error while still verifying the retry fired.
@@ -1095,6 +1163,13 @@ describe("proxyWithAccount — 529 in-place retry", () => {
 				() => undefined,
 				0,
 				ctx,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				false,
+				undefined,
+				attemptLedger,
 			);
 		} catch (e) {
 			const msg = e instanceof Error ? e.message : String(e);
@@ -1103,6 +1178,7 @@ describe("proxyWithAccount — 529 in-place retry", () => {
 
 		// fetch was called twice: initial 529 + 1 in-place retry
 		expect(callCount).toBe(2);
+		expect(attemptLedger.attemptedCount).toBe(1);
 		// markAccountRateLimited should NOT have been called — no cooldown on successful retry
 		expect(ctx.dbOps.markAccountRateLimited).not.toHaveBeenCalled();
 	});
