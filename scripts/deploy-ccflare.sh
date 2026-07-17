@@ -42,7 +42,8 @@
 #   8. Prune old binaries, guard pairs, and pin backups conservatively. Never
 #      removes the artifacts that are newly deployed or currently pinned.
 #
-# REQUIRES: git, node, bun, curl, sudo (for the systemd pin + restart).
+# REQUIRES: git, node, bun, curl, systemctl, systemd-analyze, and sudo
+# (for the systemd pin + restart).
 #
 set -Eeuo pipefail
 
@@ -68,6 +69,7 @@ PIN_BACKUP=""
 PIN_RENDERED=""
 PIN_STAGED=""
 PIN_ROLLBACK_ARMED=0
+SERVICE_RESTART_ATTEMPTED=0
 GUARD_STAGE_DIR=""
 RUNNER_STAGE_DIR=""
 PRIOR_PROXY_HEALTH_JSON=""
@@ -132,8 +134,14 @@ rollback_on_failure() {
 		local restored_runner_path="" restored_main_pid=""
 		if ! sudo cp --preserve=all "$PIN_BACKUP" "$rollback_stage" \
 			|| ! sudo mv -f "$rollback_stage" "$PIN" \
-			|| ! sudo systemctl daemon-reload \
-			|| ! sudo systemctl restart ccflare-stack.service \
+			|| ! sudo systemctl daemon-reload; then
+			echo "HARD FAILURE: systemd pin restoration failed" >&2
+			sudo rm -f "$rollback_stage" 2>/dev/null
+			exit "$ROLLBACK_HARD_FAILURE"
+		fi
+		if [[ "$SERVICE_RESTART_ATTEMPTED" == "0" ]]; then
+			echo "==> Restored prior pin before any service restart; live process was left untouched." >&2
+		elif ! sudo systemctl restart ccflare-stack.service \
 			|| ! poll_stack_health \
 			|| ! restored_runner_path="$(
 				node -e '
@@ -153,8 +161,9 @@ rollback_on_failure() {
 			echo "HARD FAILURE: restored binary/runner/guard/policy identity could not be proven" >&2
 			sudo rm -f "$rollback_stage" 2>/dev/null
 			exit "$ROLLBACK_HARD_FAILURE"
+		else
+			echo "==> Rollback identity verified against captured prior runtime." >&2
 		fi
-		echo "==> Rollback identity verified against captured prior runtime." >&2
 	fi
 
 	[[ -n "$PIN_STAGED" ]] && sudo rm -f "$PIN_STAGED" 2>/dev/null
@@ -365,7 +374,6 @@ PRIOR_PROXY_HEALTH_JSON="$(curl -sf "$HEALTH_URL" 2>/dev/null || true)"
 PRIOR_GUARD_HEALTH_JSON="$(curl -sf "$GUARD_HEALTH_URL" 2>/dev/null || true)"
 PIN_BACKUP="${PIN}.bak-$(date -u +%Y%m%dT%H%M%SZ)-${SHORT}"
 sudo cp --preserve=all "$PIN" "$PIN_BACKUP"
-PIN_ROLLBACK_ARMED=1
 
 PIN_RENDERED="$(mktemp)"
 render_systemd_pin \
@@ -377,9 +385,21 @@ render_systemd_pin \
 	"$GUARD_SOURCE_ID" \
 	"$GUARD_POLICY_ID"
 
+if ! CONFIGURED_DEPLOYMENT_TIMING="$(
+	validate_deployment_timing "$PIN_RENDERED"
+)"; then
+	echo "ERROR: rendered systemd pin has an unsafe guard deadline or stop policy" >&2
+	exit 1
+fi
+read -r \
+	CONFIGURED_GUARD_TOTAL_DEADLINE_MS \
+	CONFIGURED_GUARD_SHUTDOWN_GRACE_MS \
+	CONFIGURED_STOP_TIMEOUT_MS <<<"$CONFIGURED_DEPLOYMENT_TIMING"
+
 PIN_STAGED="${PIN}.new-${SHORT}-$$"
 sudo cp --preserve=all "$PIN" "$PIN_STAGED"
 sudo tee "$PIN_STAGED" <"$PIN_RENDERED" >/dev/null
+PIN_ROLLBACK_ARMED=1
 sudo mv -f "$PIN_STAGED" "$PIN"
 PIN_STAGED=""
 rm -f "$PIN_RENDERED"
@@ -392,7 +412,7 @@ for expected_line in \
 	"Environment=GUARD_POLICY_ID=${GUARD_POLICY_ID}" \
 	"ExecStart=" \
 	"ExecStart=${RUNNER_SCRIPT}"; do
-	if [[ "$(grep -Fxc "$expected_line" "$PIN")" -ne 1 ]]; then
+	if [[ "$(grep -Fxc "$expected_line" "$PIN")" -lt 1 ]]; then
 		echo "ERROR: failed to atomically upsert '$expected_line' in $PIN" >&2
 		exit 1
 	fi
@@ -400,10 +420,32 @@ done
 echo "==> Pin backed up to $PIN_BACKUP"
 
 # ---------------------------------------------------------------------------
-# 5) Restart
+# 5) Reload and validate the effective unit before restarting. A later drop-in
+#    can override the rendered 50-pin, so the merged systemd policy is the
+#    authority. Validation failure restores the old pin and reloads it without
+#    touching the still-running service.
 # ---------------------------------------------------------------------------
+PRE_RESTART_POLICY_STATUS=0
+EFFECTIVE_DEPLOYMENT_TIMING="$(
+	reload_validate_or_restore_systemd_policy \
+		"$PIN" \
+		"$PIN_BACKUP" \
+		ccflare-stack.service
+)" \
+	|| PRE_RESTART_POLICY_STATUS="$?"
+if [[ "$PRE_RESTART_POLICY_STATUS" -ne 0 ]]; then
+	if [[ "$PRE_RESTART_POLICY_STATUS" == "1" ]]; then
+		PIN_ROLLBACK_ARMED=0
+	fi
+	exit "$PRE_RESTART_POLICY_STATUS"
+fi
+read -r \
+	CONFIGURED_GUARD_TOTAL_DEADLINE_MS \
+	CONFIGURED_GUARD_SHUTDOWN_GRACE_MS \
+	CONFIGURED_STOP_TIMEOUT_MS <<<"$EFFECTIVE_DEPLOYMENT_TIMING"
+
 echo "==> Restarting ccflare-stack.service…"
-sudo systemctl daemon-reload
+SERVICE_RESTART_ATTEMPTED=1
 sudo systemctl restart ccflare-stack.service
 
 # ---------------------------------------------------------------------------
@@ -431,6 +473,8 @@ EXPECTED_IDENTITY_JSON="$(
 		"$GUARD_SOURCE_ID" \
 		"$GUARD_POLICY_ID" \
 		"$MAIN_PID" \
+		"$CONFIGURED_GUARD_TOTAL_DEADLINE_MS" \
+		"$CONFIGURED_GUARD_SHUTDOWN_GRACE_MS" \
 		"$(readlink -f "$DEST_BIN")" "$DEST_BIN_SHA256" \
 		"$(readlink -f "$RUNNER_SCRIPT")" "$RUNNER_SHA256" \
 		"$(readlink -f "$GUARD_SCRIPT")" "$GUARD_SHA256" \
@@ -440,6 +484,8 @@ const [
 	sourceId,
 	policyId,
 	runnerPid,
+	guardTotalDeadlineMs,
+	guardShutdownGraceMs,
 	binaryPath,
 	binarySha256,
 	runnerPath,
@@ -461,7 +507,8 @@ process.stdout.write(JSON.stringify({
 		policy: { path: policyPath, sha256: policySha256 },
 	},
 	limits: {
-		totalDeadlineMs: 120000,
+		totalDeadlineMs: Number(guardTotalDeadlineMs),
+		shutdownGraceMs: Number(guardShutdownGraceMs),
 		maxAttempts: 3,
 		jitterMs: 2000,
 		maxInspectionBytes: 65536,

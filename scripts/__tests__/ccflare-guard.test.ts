@@ -261,13 +261,14 @@ describe("source-controlled guard", () => {
 			},
 			limits: {
 				totalDeadlineMs: 1_000,
+				shutdownGraceMs: 600_000,
 				maxAttempts: 3,
 				jitterMs: 0,
 				maxInspectionBytes: 64 * 1_024,
 			},
 		});
 		expect(DEFAULT_GUARD_MAX_ATTEMPTS).toBe(3);
-		expect(DEFAULT_GUARD_TOTAL_DEADLINE_MS).toBe(120_000);
+		expect(DEFAULT_GUARD_TOTAL_DEADLINE_MS).toBe(600_000);
 		expect(DEFAULT_GUARD_RETRY_JITTER_MS).toBe(2_000);
 		expect(DEFAULT_GUARD_MAX_INSPECTION_BYTES).toBe(64 * 1_024);
 		expect(DEFAULT_GUARD_RESPONSE_IDLE_TIMEOUT_MS).toBe(120_000);

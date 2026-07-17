@@ -267,15 +267,401 @@ describe("render_systemd_pin", () => {
 			[
 				"[Service]",
 				"Environment=KEEP_ME=unchanged",
+				"Environment=CCFLARE_BIN=/old/bin",
+				"Environment=GUARD_SCRIPT=/old/guard.mjs",
+				"Environment=GUARD_SCRIPT=/duplicate/guard.mjs",
+				"ExecStart=/home/will/legacy-runner.sh",
+				"# BEGIN better-ccflare managed deployment",
+				"[Service]",
 				"Environment=CCFLARE_BIN=/new/bin",
 				"Environment=GUARD_SCRIPT=/new/guards/abc/ccflare-guard.mjs",
 				"Environment=GUARD_SOURCE_ID=abc123",
 				"Environment=GUARD_POLICY_ID=pool-exhaustion-finite-recovery-v1",
+				"Environment=GUARD_TOTAL_DEADLINE_MS=600000",
+				"Environment=GUARD_SHUTDOWN_GRACE_MS=600000",
+				"KillMode=mixed",
+				"TimeoutStopSec=720s",
 				"ExecStart=",
 				"ExecStart=/new/runners/abc/run-ccflare-stack.sh",
+				"# END better-ccflare managed deployment",
 				"",
 			].join("\n"),
 		);
+
+		const secondOutput = join(dir, "pin.second-render.conf");
+		const second = bash(
+			[
+				`source ${shellQuote(helperScriptForShell)}`,
+				`render_systemd_pin ${shellQuote(shellPath(output))} ${shellQuote(shellPath(secondOutput))} /new/bin /new/runners/abc/run-ccflare-stack.sh /new/guards/abc/ccflare-guard.mjs abc123 pool-exhaustion-finite-recovery-v1`,
+			].join("\n"),
+		);
+		expect(second.exitCode).toBe(0);
+		expect(readFileSync(secondOutput, "utf8")).toBe(
+			readFileSync(output, "utf8"),
+		);
+	});
+
+	test("preserves operator deadline and graceful-stop overrides", () => {
+		const dir = tempDir();
+		const input = join(dir, "pin.conf");
+		const output = join(dir, "pin.rendered.conf");
+		writeFileSync(
+			input,
+			[
+				"[Service]",
+				'Environment="GUARD_TOTAL_DEADLINE_MS=900000"',
+				"Environment=GUARD_SHUTDOWN_GRACE_MS=900000",
+				"KillMode=mixed",
+				"TimeoutStopSec=1020s",
+				"ExecStart=/old/runner",
+				"",
+			].join("\n"),
+		);
+
+		const result = bash(
+			[
+				`source ${shellQuote(helperScriptForShell)}`,
+				`render_systemd_pin ${shellQuote(shellPath(input))} ${shellQuote(shellPath(output))} /new/bin /new/runner /new/guard abc123 policy-v1`,
+			].join("\n"),
+		);
+
+		expect(result.exitCode).toBe(0);
+		const rendered = readFileSync(output, "utf8");
+		expect(rendered).toContain(
+			'Environment="GUARD_TOTAL_DEADLINE_MS=900000"',
+		);
+		expect(rendered).toContain(
+			"Environment=GUARD_SHUTDOWN_GRACE_MS=900000",
+		);
+		expect(rendered).toContain("KillMode=mixed");
+		expect(rendered).toContain("TimeoutStopSec=1020s");
+		expect(rendered.match(/GUARD_TOTAL_DEADLINE_MS/g)).toHaveLength(2);
+		expect(rendered.match(/GUARD_SHUTDOWN_GRACE_MS/g)).toHaveLength(2);
+		expect(rendered.match(/^KillMode=/gm)).toHaveLength(2);
+		expect(rendered.match(/^TimeoutStopSec=/gm)).toHaveLength(2);
+	});
+
+	test("migrates the exact live legacy pin to a deployable safe policy", () => {
+		const dir = tempDir();
+		const input = join(dir, "50-pinned-build.conf");
+		const output = join(dir, "pin.rendered.conf");
+		writeFileSync(
+			input,
+			[
+				"[Service]",
+				"Environment=CCFLARE_BIN=/home/will/.config/better-ccflare/better-ccflare-v3.5.39-ea71c502",
+				"Environment=CCFLARE_CODEX_TRACE_DIR=/home/will/.config/better-ccflare/codex-traces",
+				"Environment=CCFLARE_SHUTDOWN_DRAIN_MS=60000",
+				"Environment=GUARD_SHUTDOWN_GRACE_MS=75000",
+				"TimeoutStopSec=90",
+				"Environment=GUARD_SCRIPT=/home/will/.config/better-ccflare/guards/ea71c502/ccflare-guard.mjs",
+				"Environment=GUARD_SOURCE_ID=ea71c502",
+				"Environment=GUARD_POLICY_ID=pool-exhaustion-finite-recovery-v1",
+				"ExecStart=",
+				"ExecStart=/home/will/.config/better-ccflare/runners/ea71c502/run-ccflare-stack.sh",
+				"",
+			].join("\n"),
+		);
+
+		const result = bash(
+			[
+				`source ${shellQuote(helperScriptForShell)}`,
+				`render_systemd_pin ${shellQuote(shellPath(input))} ${shellQuote(shellPath(output))} /new/bin /new/runner /new/guard abc123 policy-v1`,
+				`validate_deployment_timing ${shellQuote(shellPath(output))}`,
+			].join("\n"),
+		);
+
+		expect(result.exitCode).toBe(0);
+		expect(result.stdout.toString().trim()).toBe("600000 600000 720000");
+		const rendered = readFileSync(output, "utf8");
+		expect(rendered).toContain("Environment=GUARD_TOTAL_DEADLINE_MS=600000");
+		expect(rendered).toContain("Environment=GUARD_SHUTDOWN_GRACE_MS=600000");
+		expect(rendered).toContain("KillMode=mixed");
+		expect(rendered).toContain("TimeoutStopSec=720s");
+	});
+
+	test("does not silently rewrite unknown unsafe operator timing", () => {
+		const dir = tempDir();
+		const input = join(dir, "pin.conf");
+		const output = join(dir, "pin.rendered.conf");
+		writeFileSync(
+			input,
+			[
+				"[Service]",
+				"Environment=GUARD_TOTAL_DEADLINE_MS=600000",
+				"Environment=GUARD_SHUTDOWN_GRACE_MS=76000",
+				"KillMode=mixed",
+				"TimeoutStopSec=91s",
+				"",
+			].join("\n"),
+		);
+		const result = bash(
+			[
+				`source ${shellQuote(helperScriptForShell)}`,
+				`render_systemd_pin ${shellQuote(shellPath(input))} ${shellQuote(shellPath(output))} /new/bin /new/runner /new/guard abc123 policy-v1`,
+				`validate_deployment_timing ${shellQuote(shellPath(output))}`,
+			].join("\n"),
+		);
+		expect(result.exitCode).not.toBe(0);
+		const rendered = readFileSync(output, "utf8");
+		expect(rendered).toContain("Environment=GUARD_SHUTDOWN_GRACE_MS=76000");
+		expect(rendered).toContain("TimeoutStopSec=91s");
+	});
+});
+
+describe("configured_systemd_environment_value", () => {
+	test("reads the last plain or quoted numeric operator value", () => {
+		const dir = tempDir();
+		const pin = join(dir, "pin.conf");
+		writeFileSync(
+			pin,
+			[
+				"[Service]",
+				"Environment=GUARD_TOTAL_DEADLINE_MS=600000",
+				'Environment="GUARD_TOTAL_DEADLINE_MS=900000"',
+				"",
+			].join("\n"),
+		);
+		const result = bash(
+			[
+				`source ${shellQuote(helperScriptForShell)}`,
+				`configured_systemd_environment_value ${shellQuote(shellPath(pin))} GUARD_TOTAL_DEADLINE_MS`,
+			].join("\n"),
+		);
+		expect(result.exitCode).toBe(0);
+		expect(result.stdout.toString().trim()).toBe("900000");
+	});
+
+	test("matches systemd Service-section, reset, continuation, and last-wins semantics", () => {
+		const dir = tempDir();
+		const pin = join(dir, "pin.conf");
+		writeFileSync(
+			pin,
+			[
+				"[Unit]",
+				"  Environment='GUARD_TOTAL_DEADLINE_MS=111111'",
+				"[Service]",
+				"  Environment=KEEP=before 'GUARD_TOTAL_DEADLINE_MS=700000' OTHER=value",
+				'  Environment="GUARD_TOTAL_DEADLINE_MS=800000" \\',
+				"    'GUARD_SHUTDOWN_GRACE_MS=800000'",
+				"  Environment=",
+				"  Environment='KEEP=after reset' \\",
+				'    "GUARD_TOTAL_DEADLINE_MS=900000" \'GUARD_SHUTDOWN_GRACE_MS=900000\'',
+				"  Environment=GUARD_TOTAL_DEADLINE_MS=950000",
+				"  Environment='GUARD_TOTAL_DEADLINE_MS=900000'",
+				"[Install]",
+				"Environment=GUARD_TOTAL_DEADLINE_MS=222222",
+				"",
+			].join("\n"),
+		);
+		const result = bash(
+			[
+				`source ${shellQuote(helperScriptForShell)}`,
+				`configured_systemd_environment_value ${shellQuote(shellPath(pin))} GUARD_TOTAL_DEADLINE_MS`,
+				`configured_systemd_environment_value ${shellQuote(shellPath(pin))} GUARD_SHUTDOWN_GRACE_MS`,
+			].join("\n"),
+		);
+		expect(result.exitCode).toBe(0);
+		expect(result.stdout.toString().trim().split("\n")).toEqual([
+			"900000",
+			"900000",
+		]);
+	});
+});
+
+describe("validate_deployment_timing", () => {
+	test("accepts the safe defaults and larger coherent operator overrides", () => {
+		for (const [deadline, grace, timeout, expected] of [
+			["600000", "600000", "720s", "600000 600000 720000"],
+			["900000", "900000", "17min", "900000 900000 1020000"],
+		] as const) {
+			const dir = tempDir();
+			const pin = join(dir, "pin.conf");
+			writeFileSync(
+				pin,
+				[
+					"[Service]",
+					`Environment=GUARD_TOTAL_DEADLINE_MS=${deadline}`,
+					`Environment=GUARD_SHUTDOWN_GRACE_MS=${grace}`,
+					"KillMode=mixed",
+					`TimeoutStopSec=${timeout}`,
+					"",
+				].join("\n"),
+			);
+			const result = bash(
+				[
+					`source ${shellQuote(helperScriptForShell)}`,
+					`validate_deployment_timing ${shellQuote(shellPath(pin))}`,
+				].join("\n"),
+			);
+			expect(result.exitCode).toBe(0);
+			expect(result.stdout.toString().trim()).toBe(expected);
+		}
+	});
+
+	test("rejects unsafe deadline, drain, kill mode, or stop timeout", () => {
+		for (const lines of [
+			[
+				"Environment=GUARD_TOTAL_DEADLINE_MS=120000",
+				"Environment=GUARD_SHUTDOWN_GRACE_MS=600000",
+				"KillMode=mixed",
+				"TimeoutStopSec=720s",
+			],
+			[
+				"Environment=GUARD_TOTAL_DEADLINE_MS=600000",
+				"Environment=GUARD_SHUTDOWN_GRACE_MS=75000",
+				"KillMode=mixed",
+				"TimeoutStopSec=720s",
+			],
+			[
+				"Environment=GUARD_TOTAL_DEADLINE_MS=600000",
+				"Environment=GUARD_SHUTDOWN_GRACE_MS=600000",
+				"KillMode=control-group",
+				"TimeoutStopSec=720s",
+			],
+			[
+				"Environment=GUARD_TOTAL_DEADLINE_MS=600000",
+				"Environment=GUARD_SHUTDOWN_GRACE_MS=600000",
+				"KillMode=mixed",
+				"TimeoutStopSec=619s",
+			],
+			[
+				"Environment=GUARD_TOTAL_DEADLINE_MS=900000",
+				"Environment=GUARD_SHUTDOWN_GRACE_MS=600000",
+				"KillMode=mixed",
+				"TimeoutStopSec=1020s",
+			],
+		] as const) {
+			const dir = tempDir();
+			const pin = join(dir, "pin.conf");
+			writeFileSync(pin, ["[Service]", ...lines, ""].join("\n"));
+			const result = bash(
+				[
+					`source ${shellQuote(helperScriptForShell)}`,
+					`validate_deployment_timing ${shellQuote(shellPath(pin))}`,
+				].join("\n"),
+			);
+			expect(result.exitCode).not.toBe(0);
+		}
+	});
+});
+
+describe("effective systemd policy validation", () => {
+	function writeSystemctlMock(dir: string): { binDir: string; log: string } {
+		const binDir = join(dir, "bin");
+		const log = join(dir, "systemctl.log");
+		mkdirSync(binDir);
+		const mock = join(binDir, "systemctl");
+		writeFileSync(
+			mock,
+			[
+				"#!/usr/bin/env bash",
+				'printf \'systemctl:%s\\n\' "$*" >>"$CCFLARE_TEST_SYSTEMCTL_LOG"',
+				'if [[ "$*" == *"daemon-reload"* ]]; then exit 0; fi',
+				'if [[ "$*" == *"--property=KillMode"* ]]; then printf \'%s\\n\' "$CCFLARE_TEST_KILL_MODE"; exit 0; fi',
+				'if [[ "$*" == *"--property=TimeoutStopUSec"* ]]; then printf \'%s\\n\' "$CCFLARE_TEST_TIMEOUT"; exit 0; fi',
+				'if [[ "$*" == *"--property=Environment"* ]]; then printf \'%s\\n\' "$CCFLARE_TEST_ENVIRONMENT"; exit 0; fi',
+				"exit 2",
+				"",
+			].join("\n"),
+		);
+		chmodSync(mock, 0o755);
+		writeFileSync(log, "");
+		return { binDir, log };
+	}
+
+	test("requires the daemon-reloaded effective policy, including environment", () => {
+		const dir = tempDir();
+		const { binDir, log } = writeSystemctlMock(dir);
+		const base = [
+			`export PATH=${shellQuote(shellPath(binDir))}:$PATH`,
+			`export CCFLARE_TEST_SYSTEMCTL_LOG=${shellQuote(shellPath(log))}`,
+			"export CCFLARE_TEST_KILL_MODE=mixed",
+			"export CCFLARE_TEST_TIMEOUT=12min",
+			"export CCFLARE_TEST_ENVIRONMENT='KEEP=1 GUARD_TOTAL_DEADLINE_MS=600000 GUARD_SHUTDOWN_GRACE_MS=600000'",
+			`source ${shellQuote(helperScriptForShell)}`,
+		];
+		const good = bash(
+			[
+				...base,
+				"validate_effective_systemd_policy ccflare-stack.service",
+			].join("\n"),
+		);
+		expect(good.exitCode).toBe(0);
+		expect(good.stdout.toString().trim()).toBe("600000 600000 720000");
+
+		const safeOperatorOverride = bash(
+			[
+				...base,
+				"export CCFLARE_TEST_TIMEOUT='17min'",
+				"export CCFLARE_TEST_ENVIRONMENT='GUARD_TOTAL_DEADLINE_MS=900000 GUARD_SHUTDOWN_GRACE_MS=900000'",
+				"validate_effective_systemd_policy ccflare-stack.service",
+			].join("\n"),
+		);
+		expect(safeOperatorOverride.exitCode).toBe(0);
+		expect(safeOperatorOverride.stdout.toString().trim()).toBe(
+			"900000 900000 1020000",
+		);
+
+		const overridden = bash(
+			[
+				...base,
+				"export CCFLARE_TEST_TIMEOUT='10min'",
+				"validate_effective_systemd_policy ccflare-stack.service",
+			].join("\n"),
+		);
+		expect(overridden.exitCode).not.toBe(0);
+	});
+
+	test("restores and reloads the prior pin without restarting on effective-policy failure", () => {
+		const dir = tempDir();
+		const { binDir, log } = writeSystemctlMock(dir);
+		const sudo = join(binDir, "sudo");
+		writeFileSync(
+			sudo,
+			[
+				"#!/usr/bin/env bash",
+				'printf \'sudo:%s\\n\' "$*" >>"$CCFLARE_TEST_SYSTEMCTL_LOG"',
+				'exec "$@"',
+				"",
+			].join("\n"),
+		);
+		chmodSync(sudo, 0o755);
+		const pin = join(dir, "pin.conf");
+		const backup = join(dir, "pin.conf.bak");
+		writeFileSync(pin, "new pin\n");
+		writeFileSync(backup, "old pin\n");
+		const result = bash(
+			[
+				`export PATH=${shellQuote(shellPath(binDir))}:$PATH`,
+				`export CCFLARE_TEST_SYSTEMCTL_LOG=${shellQuote(shellPath(log))}`,
+				"export CCFLARE_TEST_KILL_MODE=control-group",
+				"export CCFLARE_TEST_TIMEOUT=12min",
+				"export CCFLARE_TEST_ENVIRONMENT='GUARD_TOTAL_DEADLINE_MS=600000 GUARD_SHUTDOWN_GRACE_MS=600000'",
+				`source ${shellQuote(helperScriptForShell)}`,
+				`reload_validate_or_restore_systemd_policy ${shellQuote(shellPath(pin))} ${shellQuote(shellPath(backup))} ccflare-stack.service`,
+			].join("\n"),
+		);
+		expect(result.exitCode).toBe(1);
+		expect(readFileSync(pin, "utf8")).toBe("old pin\n");
+		const events = readFileSync(log, "utf8").trim().split("\n");
+		expect(events[0]).toBe("sudo:systemctl daemon-reload");
+		const effectiveCheck = events.findIndex((event) =>
+			event.includes("--property=KillMode"),
+		);
+		const restoreCopy = events.findIndex((event) =>
+			event.startsWith("sudo:cp --preserve=all"),
+		);
+		const restoreMove = events.findIndex((event) =>
+			event.startsWith("sudo:mv -f"),
+		);
+		expect(effectiveCheck).toBeGreaterThan(0);
+		expect(restoreCopy).toBeGreaterThan(effectiveCheck);
+		expect(restoreMove).toBeGreaterThan(restoreCopy);
+		expect(events.at(-1)).toBe("systemctl:daemon-reload");
+		expect(
+			events.some((event) => event.includes("systemctl restart")),
+		).toBe(false);
 	});
 });
 
@@ -293,7 +679,8 @@ describe("validate_deploy_health", () => {
 				policy: { path: "/artifacts/policy", sha256: "policy-digest" },
 			},
 			limits: {
-				totalDeadlineMs: 120_000,
+				totalDeadlineMs: 900_000,
+				shutdownGraceMs: 900_000,
 				maxAttempts: 3,
 				jitterMs: 2_000,
 				maxInspectionBytes: 65_536,
@@ -318,7 +705,8 @@ describe("validate_deploy_health", () => {
 					},
 				},
 				limits: {
-					totalDeadlineMs: 120_000,
+					totalDeadlineMs: 900_000,
+					shutdownGraceMs: 900_000,
 					maxAttempts: 3,
 					jitterMs: 2_000,
 					maxInspectionBytes: 65_536,
@@ -471,12 +859,52 @@ describe("source-controlled stack runner", () => {
 		const zero = bash(
 			`GUARD_SHUTDOWN_GRACE_MS=0 CCFLARE_BIN=/bin/true GUARD_SCRIPT=/bin/true NODE_BIN=/bin/true AI_GATEWAY_TUNNEL_ENABLED=0 bash ${shellQuote(shellPath(runnerScript))}`,
 		);
-		expect(zero.exitCode).not.toBe(64);
+		expect(zero.exitCode).toBe(64);
 	});
 
-	test("pins bounded guard limits and retains tunnel and lifecycle supervision", () => {
+	test("rejects a zero deadline instead of letting the guard clamp it to 1ms", () => {
+		const result = bash(
+			`GUARD_TOTAL_DEADLINE_MS=0 CCFLARE_BIN=/bin/true GUARD_SCRIPT=/bin/true NODE_BIN=/bin/true AI_GATEWAY_TUNNEL_ENABLED=0 bash ${shellQuote(shellPath(runnerScript))}`,
+		);
+		expect(result.exitCode).toBe(64);
+		expect(result.stdout.toString()).toContain(
+			"invalid GUARD_TOTAL_DEADLINE_MS=0",
+		);
+	});
+
+	test("rejects shutdown grace shorter than the total request deadline", () => {
+		const result = bash(
+			`GUARD_TOTAL_DEADLINE_MS=900000 GUARD_SHUTDOWN_GRACE_MS=600000 CCFLARE_BIN=/bin/true GUARD_SCRIPT=/bin/true NODE_BIN=/bin/true AI_GATEWAY_TUNNEL_ENABLED=0 bash ${shellQuote(shellPath(runnerScript))}`,
+		);
+		expect(result.exitCode).toBe(64);
+		expect(result.stdout.toString()).toContain(
+			"GUARD_SHUTDOWN_GRACE_MS=600000 must be at least GUARD_TOTAL_DEADLINE_MS=900000",
+		);
+	});
+
+	test("defaults the guard deadline to 600s while preserving an inherited value", () => {
 		const source = readFileSync(runnerScript, "utf8");
-		expect(source).toContain("GUARD_TOTAL_DEADLINE_MS=120000");
+		expect(source).toContain(
+			"GUARD_TOTAL_DEADLINE_MS=${GUARD_TOTAL_DEADLINE_MS:-600000}",
+		);
+		expect(source).toContain(
+			'validate_bounded_ms GUARD_TOTAL_DEADLINE_MS "$GUARD_TOTAL_DEADLINE_MS" 1 2147483647',
+		);
+		expect(source).toContain(
+			'GUARD_TOTAL_DEADLINE_MS="$GUARD_TOTAL_DEADLINE_MS"',
+		);
+		expect(source).not.toContain("GUARD_TOTAL_DEADLINE_MS=120000");
+	});
+
+	test("defaults the guard shutdown grace to 600s", () => {
+		const source = readFileSync(runnerScript, "utf8");
+		expect(source).toContain(
+			"GUARD_SHUTDOWN_GRACE_MS=${GUARD_SHUTDOWN_GRACE_MS:-600000}",
+		);
+	});
+
+	test("pins the remaining guard limits and retains tunnel and lifecycle supervision", () => {
+		const source = readFileSync(runnerScript, "utf8");
 		expect(source).toContain("GUARD_MAX_ATTEMPTS=3");
 		expect(source).toContain("GUARD_RETRY_JITTER_MS=2000");
 		expect(source).toContain("GUARD_MAX_INSPECTION_BYTES=65536");
@@ -566,7 +994,13 @@ const port = Number(role === "guard" ? process.env.GUARD_PORT : process.env.PORT
 const eventsFile = process.env.FIXTURE_EVENTS;
 const record = (event) => appendFileSync(
   eventsFile,
-  [role, event, Date.now(), process.env.GUARD_SHUTDOWN_GRACE_MS || ""].join(":") + "\\n",
+  [
+    role,
+    event,
+    Date.now(),
+    process.env.GUARD_SHUTDOWN_GRACE_MS || "",
+    process.env.GUARD_TOTAL_DEADLINE_MS || "",
+  ].join(":") + "\\n",
 );
 
 const server = http.createServer((_req, res) => {
@@ -606,6 +1040,7 @@ process.on("SIGTERM", () => {
 					GUARD_PORT: String(guardPort),
 					AI_GATEWAY_TUNNEL_ENABLED: "0",
 					AI_GATEWAY_TUNNEL_REQUIRED: "0",
+					GUARD_TOTAL_DEADLINE_MS: "240",
 					GUARD_SHUTDOWN_GRACE_MS: "240",
 					GUARD_SHUTDOWN_CUSHION_MS: "120",
 					FIXTURE_EVENTS: shellPath(eventsFile),
@@ -665,8 +1100,8 @@ process.on("SIGTERM", () => {
 				.trim()
 				.split("\n")
 				.map((line) => {
-					const [role, event, timestamp, grace] = line.split(":");
-					return { role, event, timestamp: Number(timestamp), grace };
+					const [role, event, timestamp, grace, deadline] = line.split(":");
+					return { role, event, timestamp: Number(timestamp), grace, deadline };
 				});
 			const guardStart = events.find(
 				(entry) => entry.role === "guard" && entry.event === "start",
@@ -678,6 +1113,7 @@ process.on("SIGTERM", () => {
 				(entry) => entry.role === "upstream" && entry.event === "term",
 			);
 			expect(guardStart?.grace).toBe("240");
+			expect(guardStart?.deadline).toBe("240");
 			expect(guardTerm).toBeDefined();
 			expect(upstreamTerm).toBeDefined();
 			const guardStopMs =
@@ -731,6 +1167,14 @@ describe("deployment flow safety contracts", () => {
 
 	test("full deployment has rollback and exact dual-health verification", () => {
 		const source = readFileSync(deployScript, "utf8");
+		expect(source).toContain('validate_deployment_timing "$PIN_RENDERED"');
+		expect(source).toContain(
+			"totalDeadlineMs: Number(guardTotalDeadlineMs)",
+		);
+		expect(source).toContain(
+			"shutdownGraceMs: Number(guardShutdownGraceMs)",
+		);
+		expect(source).not.toContain("totalDeadlineMs: 120000");
 		expect(source).toContain('GUARD_DIR="${GUARDS_ROOT}/${HEAD_SHA}"');
 		expect(source).toContain('RUNNER_DIR="${RUNNERS_ROOT}/${HEAD_SHA}"');
 		expect(source).toContain(
@@ -755,21 +1199,47 @@ describe("deployment flow safety contracts", () => {
 		expect(source).toContain("verify_process_start_identity");
 		expect(source).toContain("ROLLBACK_HARD_FAILURE=70");
 		expect(source).toContain('exit "$ROLLBACK_HARD_FAILURE"');
+		expect(source).toContain("reload_validate_or_restore_systemd_policy");
+		expect(source).toContain("SERVICE_RESTART_ATTEMPTED=1");
+		expect(source).toContain(
+			'if [[ "$SERVICE_RESTART_ATTEMPTED" == "0" ]]',
+		);
 
 		const backup = source.indexOf(
 			'sudo cp --preserve=all "$PIN" "$PIN_BACKUP"',
 		);
 		const rollbackArmed = source.indexOf("PIN_ROLLBACK_ARMED=1", backup);
-		const pinRender = source.indexOf("render_systemd_pin", rollbackArmed);
+		const pinRender = source.indexOf("render_systemd_pin", backup);
+		const timingValidation = source.indexOf(
+			'validate_deployment_timing "$PIN_RENDERED"',
+			pinRender,
+		);
+		const pinWrite = source.indexOf(
+			'sudo tee "$PIN_STAGED" <"$PIN_RENDERED"',
+			timingValidation,
+		);
 		const restart = source.indexOf(
 			"sudo systemctl restart ccflare-stack.service",
 			pinRender,
 		);
+		const effectivePolicy = source.indexOf(
+			"reload_validate_or_restore_systemd_policy",
+			pinWrite,
+		);
+		const restartAttempted = source.indexOf(
+			"SERVICE_RESTART_ATTEMPTED=1",
+			effectivePolicy,
+		);
 		const verify = source.indexOf("if ! validate_deploy_health", restart);
 		const hardFailure = source.indexOf("exit 1", verify);
 		expect(backup).toBeGreaterThan(0);
-		expect(rollbackArmed).toBeGreaterThan(backup);
-		expect(pinRender).toBeGreaterThan(rollbackArmed);
+		expect(pinRender).toBeGreaterThan(backup);
+		expect(timingValidation).toBeGreaterThan(pinRender);
+		expect(pinWrite).toBeGreaterThan(timingValidation);
+		expect(rollbackArmed).toBeGreaterThan(pinWrite);
+		expect(effectivePolicy).toBeGreaterThan(rollbackArmed);
+		expect(restartAttempted).toBeGreaterThan(effectivePolicy);
+		expect(restart).toBeGreaterThan(restartAttempted);
 		expect(restart).toBeGreaterThan(pinRender);
 		expect(verify).toBeGreaterThan(restart);
 		expect(hardFailure).toBeGreaterThan(verify);

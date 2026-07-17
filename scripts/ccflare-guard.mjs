@@ -21,7 +21,7 @@ import {
 
 export const DEFAULT_GUARD_SOURCE_ID = "better-ccflare-source-guard-v1";
 export const DEFAULT_GUARD_MAX_ATTEMPTS = 3;
-export const DEFAULT_GUARD_TOTAL_DEADLINE_MS = 120_000;
+export const DEFAULT_GUARD_TOTAL_DEADLINE_MS = 600_000;
 export const DEFAULT_GUARD_RETRY_JITTER_MS = 2_000;
 export const DEFAULT_GUARD_MAX_INSPECTION_BYTES = 64 * 1_024;
 export const DEFAULT_GUARD_RESPONSE_IDLE_TIMEOUT_MS = 120_000;
@@ -498,7 +498,7 @@ export function createGuard(options = {}) {
 	);
 	const shutdownGraceMs = configuredNumber(
 		options.shutdownGraceMs ?? env.GUARD_SHUTDOWN_GRACE_MS,
-		75_000,
+		600_000,
 	);
 	const sourceId =
 		options.sourceId ?? env.GUARD_SOURCE_ID ?? DEFAULT_GUARD_SOURCE_ID;
@@ -1052,6 +1052,7 @@ export function createGuard(options = {}) {
 					jitterMs,
 					maxInspectionBytes,
 					responseIdleTimeoutMs,
+					shutdownGraceMs,
 					runtime: {
 						...runtimeIdentity,
 						limits: {
@@ -1060,6 +1061,7 @@ export function createGuard(options = {}) {
 							jitterMs,
 							maxInspectionBytes,
 							responseIdleTimeoutMs,
+							shutdownGraceMs,
 							maxActive,
 							maxQueue,
 						},
