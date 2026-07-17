@@ -260,6 +260,41 @@ export class AccountRepository extends BaseRepository<Account> {
 		return changes > 0;
 	}
 
+	/**
+	 * Resume an account unless it is currently paused specifically for
+	 * `blockedReason` (e.g. `oauth_invalid_grant`). This is the shared
+	 * chokepoint for generic Resume (public API/CLI) and the usage poller's
+	 * temporary resume, so neither caller can silently clear a terminal
+	 * credential pause that only successful reauthentication
+	 * (resumeIfPausedWithReason, above) is allowed to clear.
+	 *
+	 * `IS NOT` (rather than `!=`) is required so a legacy row that is paused
+	 * with a NULL reason is still treated as resumable instead of being
+	 * NULL-swallowed by a plain inequality comparison.
+	 *
+	 * Returns `resumed: true` when this call cleared the pause, or
+	 * `resumed: false` with the account's current `pause_reason` (null when
+	 * it wasn't paused at all) when the guard blocked it or there was
+	 * nothing to resume.
+	 */
+	async resumeUnlessPausedForReason(
+		accountId: string,
+		blockedReason: string,
+	): Promise<{ resumed: boolean; pauseReason: string | null }> {
+		const changes = await this.runWithChanges(
+			`UPDATE accounts SET paused = 0, pause_reason = NULL WHERE id = ? AND COALESCE(paused, 0) = 1 AND pause_reason IS NOT ?`,
+			[accountId, blockedReason],
+		);
+		if (changes > 0) {
+			return { resumed: true, pauseReason: null };
+		}
+		const row = await this.get<{ pause_reason: string | null }>(
+			`SELECT pause_reason FROM accounts WHERE id = ?`,
+			[accountId],
+		);
+		return { resumed: false, pauseReason: row?.pause_reason ?? null };
+	}
+
 	async resetSession(accountId: string, timestamp: number): Promise<void> {
 		await this.run(
 			`UPDATE accounts SET session_start = ?, session_request_count = 0 WHERE id = ?`,

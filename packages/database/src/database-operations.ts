@@ -1051,8 +1051,20 @@ OAuth tokens will need to be re-authenticated.
 		return this.accounts.pauseIfActive(accountId, reason, expectedRefreshToken);
 	}
 
-	async resumeAccount(accountId: string): Promise<void> {
-		await this.accounts.resume(accountId);
+	/**
+	 * Resume a paused account, refusing when it is paused specifically for
+	 * needing reauthentication (`oauth_invalid_grant`). Shared by the public
+	 * Resume endpoint/CLI and the usage poller's temporary resume so neither
+	 * caller can clear a terminal credential pause; only successful
+	 * reauthentication (resumeAccountIfNeedsReauth, below) can do that.
+	 */
+	async resumeAccount(
+		accountId: string,
+	): Promise<{ resumed: boolean; pauseReason: string | null }> {
+		return this.accounts.resumeUnlessPausedForReason(
+			accountId,
+			PAUSE_REASON_NEEDS_REAUTH,
+		);
 	}
 
 	/**
