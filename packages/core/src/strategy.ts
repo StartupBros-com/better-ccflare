@@ -21,5 +21,21 @@ export function isAccountAvailable(
 	);
 }
 
+/**
+ * The minimum (best) numeric tier among a set of currently-routable
+ * candidates. Lower numeric priority is the outer routing invariant:
+ * session/cache affinity may only reorder within this best-currently-routable
+ * tier, never leapfrog it. Shared by SessionAffinityStrategy and
+ * CacheAffinityOrderer's legal-snapback checks so the two independent tier
+ * computations cannot drift apart. Returns null for an empty input.
+ */
+export function minimumRoutableTier(tiers: Iterable<number>): number | null {
+	let min: number | null = null;
+	for (const tier of tiers) {
+		if (min === null || tier < min) min = tier;
+	}
+	return min;
+}
+
 // Re-export from types package for backwards compatibility
 export { StrategyName } from "@better-ccflare/types";

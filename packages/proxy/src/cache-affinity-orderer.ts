@@ -1,3 +1,4 @@
+import { minimumRoutableTier } from "@better-ccflare/core";
 import type {
 	Account,
 	RequestMeta,
@@ -155,7 +156,10 @@ export class CacheAffinityOrderer {
 			const catalogOwner = meta.routingCandidateCatalog?.find(
 				(candidate) => candidate.candidateId === mapping?.candidateId,
 			);
-			if (catalogOwner && catalogOwner.tier < best.routing.tier) {
+			const bestTier =
+				minimumRoutableTier(eligible.map((pair) => pair.routing.tier)) ??
+				best.routing.tier;
+			if (catalogOwner && catalogOwner.tier < bestTier) {
 				// Legal snapback: only a configured strictly-better owner survives a
 				// transient absence. Refresh while the conversation remains active.
 				mapping.assignedAt = now;
