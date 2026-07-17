@@ -101,6 +101,23 @@ export interface ContextAdmissionTracker {
 	nonCapacitySkipCount: number;
 }
 
+/**
+ * Request-orchestrator boundary for implicit account-local model fallbacks.
+ * The global executor can defer a cross-family fallback, or any fallback that
+ * cannot be proven same-family, until every selected requested-family route
+ * has run. A deferred route is later re-entered with implicit fallbacks
+ * disabled so one planned candidate cannot jump ahead of the remaining queue.
+ */
+export interface ModelFallbackExecutionPolicy {
+	readonly deferImplicitFallback?: (
+		model: string,
+		fallbackRank: number,
+	) => void;
+	readonly implicitFallbacksEnabled?: boolean;
+	/** A planned non-final candidate must not terminate the global route queue. */
+	readonly forwardModelUnavailableResponse?: boolean;
+}
+
 export function createContextAdmissionTracker(
 	inputTokens: number,
 	requestedMaxOutputTokens: unknown,
@@ -182,6 +199,7 @@ export function selectAdmittedCodexModel(
 	account: Account,
 	requestedModel: string | null,
 	tracker?: ContextAdmissionTracker,
+	candidateModels?: readonly string[],
 ): { admitted: boolean; model: string | null } {
 	if (
 		process.env.CCFLARE_CONTEXT_ADMISSION !== "1" ||
@@ -191,7 +209,8 @@ export function selectAdmittedCodexModel(
 	) {
 		return { admitted: true, model: requestedModel };
 	}
-	for (const model of getConcreteCodexModelList(account, requestedModel)) {
+	for (const model of candidateModels ??
+		getConcreteCodexModelList(account, requestedModel)) {
 		if (admitConcreteCodexModel(account, model, tracker)) {
 			return { admitted: true, model };
 		}
@@ -1060,6 +1079,7 @@ export async function proxyWithAccount(
 	returnRateLimitedResponseOnExhaustion = false,
 	contextAdmissionTracker?: ContextAdmissionTracker,
 	routingAttemptLedger?: RoutingAttemptLedger,
+	modelFallbackPolicy?: ModelFallbackExecutionPolicy,
 ): Promise<Response | null> {
 	try {
 		if (
@@ -1114,10 +1134,33 @@ export async function proxyWithAccount(
 		const attemptAdmissionTracker = admissionEnabledForAttempt
 			? contextAdmissionTracker
 			: undefined;
+		const requestedFamilyBeforeAdmission = requestedModelBeforeAdmission
+			? getModelFamily(requestedModelBeforeAdmission)
+			: null;
+		let deferredAdmissionRank = 0;
+		const admissionCandidates = modelFallbackPolicy?.deferImplicitFallback
+			? concreteCodexModels.filter((model, index) => {
+					const candidateFamily = getModelFamily(model);
+					const isProvablySameFamily =
+						requestedFamilyBeforeAdmission !== null &&
+						candidateFamily === requestedFamilyBeforeAdmission;
+					const isPrimaryProviderMapping =
+						index === 0 && candidateFamily === null;
+					if (!isProvablySameFamily && !isPrimaryProviderMapping) {
+						modelFallbackPolicy.deferImplicitFallback?.(
+							model,
+							deferredAdmissionRank++,
+						);
+						return false;
+					}
+					return true;
+				})
+			: undefined;
 		const admission = selectAdmittedCodexModel(
 			account,
 			requestedModelBeforeAdmission,
 			attemptAdmissionTracker,
+			admissionCandidates,
 		);
 		if (!admission.admitted) return null;
 		const admittedModelIndex = admission.model
@@ -1839,7 +1882,7 @@ export async function proxyWithAccount(
 			log.warn(
 				`Account ${account.name} generic 429 classified model-family scoped ` +
 					`(model=${attemptedModel}, family=${decision.family}, evidence_age_ms=${decision.snapshotAgeMs ?? "unknown"}) — ` +
-					"NOT benching account; pruning this family and trying a compatible fallback before account failover",
+					"NOT benching account; pruning this family from request-local routing",
 			);
 			const responseTime = Date.now() - requestMeta.timestamp;
 			ctx.asyncWriter.enqueue(() =>
@@ -1937,7 +1980,7 @@ export async function proxyWithAccount(
 			if (attemptedModel) recordExactModelExhaustion(attemptedModel);
 			log.warn(
 				`Account ${account.name} out_of_credits (429${attemptedModel ? `, model=${attemptedModel}` : ""}) — ` +
-					"model/beta-scoped, NOT benching account; pruning this exact model and trying a compatible fallback before account failover",
+					"model/beta-scoped, NOT benching account; pruning this exact model from request-local routing",
 			);
 			const responseTime = Date.now() - requestMeta.timestamp;
 			ctx.asyncWriter.enqueue(() =>
@@ -2088,9 +2131,12 @@ export async function proxyWithAccount(
 			if (effectiveBodyBuffer) requestedModel = effectiveBodyContext.getModel();
 
 			if (requestedModel) {
-				const modelList = attemptAdmissionTracker
-					? concreteCodexModels
-					: getModelList(requestedModel, account);
+				const modelList =
+					modelFallbackPolicy?.implicitFallbacksEnabled === false
+						? null
+						: attemptAdmissionTracker
+							? concreteCodexModels
+							: getModelList(requestedModel, account);
 				const fallbackStartIndex = attemptAdmissionTracker
 					? admittedModelIndex + 1
 					: 1;
@@ -2185,6 +2231,37 @@ export async function proxyWithAccount(
 					// badge here too — otherwise a force-routed request that ends in
 					// model-not-found leaves the badge showing a previously-served
 					// account (skips synthetic keepalive/auto-refresh traffic).
+					if (modelFallbackPolicy?.forwardModelUnavailableResponse === false) {
+						log.warn(
+							`Planned model ${requestedModel} unavailable on account ${account.name}; continuing the global model-first queue`,
+						);
+						await finalizeCurrentCodexTransport(rawResponse);
+						if (routingAttemptLedger) {
+							const retainedModelUnavailableResponse = rawResponse;
+							await routingAttemptLedger.retainTerminalResponse({
+								deliver: async () => {
+									const retainedSessionId = sessionIdForObservation(
+										req.headers,
+									);
+									if (retainedSessionId) {
+										recordServedAccount(
+											retainedSessionId,
+											account.id,
+											requestMeta.timestamp,
+										);
+									}
+									return withSanitizedProxyHeaders(
+										retainedModelUnavailableResponse,
+									);
+								},
+								discard: () =>
+									discardUpstreamBody(retainedModelUnavailableResponse),
+							});
+						} else {
+							await discardUpstreamBody(rawResponse);
+						}
+						return null;
+					}
 					const observedSessionId = sessionIdForObservation(req.headers);
 					if (observedSessionId) {
 						recordServedAccount(
@@ -2197,11 +2274,28 @@ export async function proxyWithAccount(
 					return withSanitizedProxyHeaders(rawResponse);
 				}
 
+				let deferredFallbackRank = 0;
 				for (let i = fallbackStartIndex; i < modelList.length; i++) {
 					const nextModel = modelList[i];
 					if (candidateHasScopedFailure(nextModel)) {
 						log.info(
 							`Skipping model ${nextModel} on account ${account.name} because the current request has scoped exhaustion evidence`,
+						);
+						continue;
+					}
+					const requestedFamily = getModelFamily(requestedModel);
+					const nextFamily = getModelFamily(nextModel);
+					if (
+						modelFallbackPolicy?.deferImplicitFallback &&
+						(requestedFamily === null || nextFamily !== requestedFamily)
+					) {
+						modelFallbackPolicy.deferImplicitFallback(
+							nextModel,
+							deferredFallbackRank++,
+						);
+						log.info(
+							`Deferring implicit model fallback on account ${account.name}: ` +
+								`requested_family=${requestedFamily ?? "unknown"} candidate_family=${nextFamily ?? "unknown"} model=${nextModel} until requested-family routes are exhausted`,
 						);
 						continue;
 					}

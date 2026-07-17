@@ -1,5 +1,6 @@
 import {
 	formatXaiCacheCanary,
+	getModelFamily,
 	requestEvents,
 	ServiceUnavailableError,
 	trackClientVersion,
@@ -41,6 +42,7 @@ import {
 	getUsageThrottleUntil,
 	interceptAndModifyRequest,
 	isRefreshTokenLikelyExpired,
+	type ModelFallbackExecutionPolicy,
 	type ProxyContext,
 	prepareRequestBody,
 	proxyUnauthenticated,
@@ -713,6 +715,62 @@ export async function handleProxy(
 	let response: Response | null = null;
 	let upstreamAttempts = 0;
 	const routingAttemptLedger = new RoutingAttemptLedger();
+	type DeferredModelRoute = {
+		readonly account: Account;
+		readonly model: string;
+		readonly candidateId: string;
+		readonly comboName: string | null;
+		readonly comboSlotIndex: number | null;
+		readonly fallbackWave: number;
+		readonly sequence: number;
+	};
+	const deferredModelRoutes: DeferredModelRoute[] = [];
+	const deferredModelRouteKeys = new Set<string>();
+	const deferredFallbackWaves = new Map<string, number>();
+	const candidateIdFor = (
+		account: Account,
+		index: number,
+		phase: "selected" | "fallback",
+	): string => {
+		const routingCandidate = requestMeta.routingCandidates?.[index];
+		return routingCandidate?.accountId === account.id
+			? routingCandidate.candidateId
+			: `${phase}:${index}:${account.id}`;
+	};
+	const modelFallbackPolicyFor = (
+		account: Account,
+		candidateId: string,
+		forwardModelUnavailableResponse: boolean,
+	): ModelFallbackExecutionPolicy => {
+		const comboName = requestMeta.comboName ?? null;
+		const comboSlotIndex = requestMeta.comboSlotIndex ?? null;
+		return {
+			forwardModelUnavailableResponse,
+			deferImplicitFallback: (model, fallbackRank) => {
+				const key = JSON.stringify([account.id, model.trim().toLowerCase()]);
+				if (deferredModelRouteKeys.has(key)) return;
+				deferredModelRouteKeys.add(key);
+				const targetFamily = getModelFamily(model);
+				const waveKey = targetFamily
+					? `family:${targetFamily}`
+					: `fallback-rank:${fallbackRank}`;
+				let fallbackWave = deferredFallbackWaves.get(waveKey);
+				if (fallbackWave === undefined) {
+					fallbackWave = deferredFallbackWaves.size;
+					deferredFallbackWaves.set(waveKey, fallbackWave);
+				}
+				deferredModelRoutes.push({
+					account,
+					model,
+					candidateId,
+					comboName,
+					comboSlotIndex,
+					fallbackWave,
+					sequence: deferredModelRoutes.length,
+				});
+			},
+		};
+	};
 	const deliverRetainedTerminalResponse =
 		async (): Promise<Response | null> => {
 			const retainedTerminalResponse =
@@ -794,6 +852,11 @@ export async function handleProxy(
 		}
 
 		const attemptedBefore = routingAttemptLedger.attemptedCount;
+		const candidateId = candidateIdFor(accounts[i], i, "selected");
+		const isFinalSelectedCandidate =
+			!filteredComboInfo?.comboName &&
+			i === accounts.length - 1 &&
+			deferredModelRoutes.length === 0;
 		try {
 			response = await proxyWithAccount(
 				req,
@@ -808,9 +871,14 @@ export async function handleProxy(
 				apiKeyId,
 				apiKeyName,
 				requestBodyContext,
-				!filteredComboInfo?.comboName && i === accounts.length - 1,
+				isFinalSelectedCandidate,
 				contextAdmissionTracker,
 				routingAttemptLedger,
+				modelFallbackPolicyFor(
+					accounts[i],
+					candidateId,
+					isFinalSelectedCandidate,
+				),
 			);
 		} catch (error) {
 			await routingAttemptLedger.discardTerminalResponse();
@@ -850,6 +918,9 @@ export async function handleProxy(
 	// 10. Combo fallback: if combo routing was active and all slots failed,
 	//     fall back to normal SessionStrategy routing (REQ-14)
 	let fallbackAccounts: Account[] | null = null;
+	let reactivelyDepletedFallbackAccounts: Account[] = [];
+	let throttledFallbackAccounts: Account[] = [];
+	let fallbackSelectionHadNoAvailable = false;
 	if (filteredComboInfo?.comboName) {
 		log.warn(
 			`All combo slots failed for combo "${filteredComboInfo.comboName}", falling back to SessionStrategy routing`,
@@ -869,19 +940,23 @@ export async function handleProxy(
 			await routingAttemptLedger.discardTerminalResponse();
 			throw error;
 		}
-		const {
-			available: filteredFallbackAccounts,
-			predictivelyThrottled: throttledFallbackAccounts,
-			reactivelyDepletedAccounts: reactivelyDepletedFallbackAccounts,
-		} = applyUsageThrottling(selectedFallbackAccounts);
+		const fallbackSelection = applyUsageThrottling(selectedFallbackAccounts);
+		const filteredFallbackAccounts = fallbackSelection.available;
+		throttledFallbackAccounts = fallbackSelection.predictivelyThrottled;
+		reactivelyDepletedFallbackAccounts =
+			fallbackSelection.reactivelyDepletedAccounts;
 		fallbackAccounts = filteredFallbackAccounts;
+		fallbackSelectionHadNoAvailable = fallbackAccounts.length === 0;
 		if (fallbackAccounts.length === 0) {
 			// The combo already reached a concrete upstream terminal and fallback
 			// selection found no new unique route to attempt. Surface that upstream
 			// response before synthesizing model-depleted or usage-throttled output.
-			const retainedTerminalResponse = await deliverRetainedTerminalResponse();
-			if (retainedTerminalResponse) {
-				return finishPacing(pacingSlot, retainedTerminalResponse);
+			if (deferredModelRoutes.length === 0) {
+				const retainedTerminalResponse =
+					await deliverRetainedTerminalResponse();
+				if (retainedTerminalResponse) {
+					return finishPacing(pacingSlot, retainedTerminalResponse);
+				}
 			}
 		}
 
@@ -913,6 +988,9 @@ export async function handleProxy(
 				}
 
 				const attemptedBefore = routingAttemptLedger.attemptedCount;
+				const candidateId = candidateIdFor(fallbackAccounts[i], i, "fallback");
+				const isFinalFallbackCandidate =
+					i === fallbackAccounts.length - 1 && deferredModelRoutes.length === 0;
 				try {
 					response = await proxyWithAccount(
 						req,
@@ -927,9 +1005,14 @@ export async function handleProxy(
 						apiKeyId,
 						apiKeyName,
 						requestBodyContext,
-						i === fallbackAccounts.length - 1,
+						isFinalFallbackCandidate,
 						contextAdmissionTracker,
 						routingAttemptLedger,
+						modelFallbackPolicyFor(
+							fallbackAccounts[i],
+							candidateId,
+							isFinalFallbackCandidate,
+						),
 					);
 				} catch (error) {
 					await routingAttemptLedger.discardTerminalResponse();
@@ -959,7 +1042,10 @@ export async function handleProxy(
 					return finishPacing(pacingSlot, response);
 				}
 			}
-		} else if (reactivelyDepletedFallbackAccounts.length > 0) {
+		} else if (
+			deferredModelRoutes.length === 0 &&
+			reactivelyDepletedFallbackAccounts.length > 0
+		) {
 			cacheBodyStore.discardStaged(requestMeta.id);
 			if (sessionId) clearSession(sessionId, requestMeta.timestamp);
 			return finishPacing(
@@ -970,7 +1056,10 @@ export async function handleProxy(
 					now: Date.now(),
 				}),
 			);
-		} else if (throttledFallbackAccounts.length > 0) {
+		} else if (
+			deferredModelRoutes.length === 0 &&
+			throttledFallbackAccounts.length > 0
+		) {
 			cacheBodyStore.discardStaged(requestMeta.id);
 			// Combo fallback throttled, no account served — badge unknown (KTD-5).
 			if (sessionId) clearSession(sessionId, requestMeta.timestamp);
@@ -981,9 +1070,146 @@ export async function handleProxy(
 		}
 	}
 
+	// Global model-first boundary: account-local mappings may describe a
+	// degradation to another Claude family or an opaque provider model that
+	// cannot be proven same-family. Those implicit routes execute only after
+	// every explicit combo/normal candidate and known same-family sibling. Each
+	// re-entry is constrained to exactly the queued model.
+	if (deferredModelRoutes.length > 0) {
+		const orderedDeferredModelRoutes = [...deferredModelRoutes].sort(
+			(a, b) => a.fallbackWave - b.fallbackWave || a.sequence - b.sequence,
+		);
+		log.info(
+			`Requested-family routes exhausted; trying ${orderedDeferredModelRoutes.length} deferred degradation route(s)`,
+		);
+		for (let i = 0; i < orderedDeferredModelRoutes.length; i++) {
+			const route = orderedDeferredModelRoutes[i];
+			requestMeta.comboName = route.comboName;
+			requestMeta.comboSlotIndex = route.comboSlotIndex;
+
+			if (
+				isReactivelyModelDepleted({
+					accountId: route.account.id,
+					model: route.model,
+					betaSignature,
+					syntheticProbe,
+				})
+			) {
+				reactiveDepletionSkips.push(route.account);
+				if (contextAdmissionTracker) {
+					contextAdmissionTracker.nonCapacitySkipCount++;
+				}
+				continue;
+			}
+
+			if (
+				pacingBypassed &&
+				!crossoverPacingRestored &&
+				route.account.provider !== "codex"
+			) {
+				pacingObservation = await observeCachePacing({
+					sessionKey: requestMeta.clientSessionId,
+					model: effectiveModel,
+				});
+				pacingSlot = pacingObservation?.slot ?? null;
+				crossoverPacingRestored = true;
+				pacingBypassed = false;
+				requestMeta.codexPacingAction = "crossover-paced";
+			}
+
+			const probeAdmission = getRateLimitProbeAdmission(route.account);
+			if (probeAdmission === "suppressed") {
+				if (contextAdmissionTracker) {
+					contextAdmissionTracker.nonCapacitySkipCount++;
+				}
+				continue;
+			}
+
+			log.info(
+				`Attempting deferred route candidate=${route.candidateId} account=${route.account.name} model=${route.model}`,
+			);
+			const attemptedBefore = routingAttemptLedger.attemptedCount;
+			try {
+				response = await proxyWithAccount(
+					req,
+					url,
+					route.account,
+					requestMeta,
+					finalBodyBuffer,
+					finalCreateBodyStream,
+					upstreamAttempts,
+					ctx,
+					route.model,
+					apiKeyId,
+					apiKeyName,
+					requestBodyContext,
+					i === orderedDeferredModelRoutes.length - 1,
+					contextAdmissionTracker,
+					routingAttemptLedger,
+					{
+						implicitFallbacksEnabled: false,
+						forwardModelUnavailableResponse:
+							i === orderedDeferredModelRoutes.length - 1,
+					},
+				);
+			} catch (error) {
+				await routingAttemptLedger.discardTerminalResponse();
+				throw error;
+			} finally {
+				if (probeAdmission === "admitted") {
+					completeRateLimitProbe(route.account, "abandoned");
+				}
+			}
+			upstreamAttempts += routingAttemptLedger.attemptedCount - attemptedBefore;
+
+			if (response) {
+				await routingAttemptLedger.discardTerminalResponse();
+				recordCachePacingRoute(
+					pacingObservation,
+					{
+						accountId: route.account.id,
+						accountName: route.account.name,
+						provider: route.account.provider,
+					},
+					{
+						candidate: pacingEligible,
+						assignedBypass: assignedCodexPacingBypass,
+					},
+				);
+				return finishPacing(pacingSlot, response);
+			}
+		}
+		requestMeta.comboName = null;
+		requestMeta.comboSlotIndex = null;
+	}
+
 	const retainedTerminalResponse = await deliverRetainedTerminalResponse();
 	if (retainedTerminalResponse) {
 		return finishPacing(pacingSlot, retainedTerminalResponse);
+	}
+
+	if (
+		fallbackSelectionHadNoAvailable &&
+		reactivelyDepletedFallbackAccounts.length > 0
+	) {
+		cacheBodyStore.discardStaged(requestMeta.id);
+		if (sessionId) clearSession(sessionId, requestMeta.timestamp);
+		return finishPacing(
+			pacingSlot,
+			createModelPoolExhaustedResponse({
+				capacityContext: getRoutingCapacityContext(requestMeta),
+				rateLimitOutcomes: getRequestRateLimitOutcomes(req),
+				now: Date.now(),
+			}),
+		);
+	}
+	if (fallbackSelectionHadNoAvailable && throttledFallbackAccounts.length > 0) {
+		cacheBodyStore.discardStaged(requestMeta.id);
+		if (sessionId) clearSession(sessionId, requestMeta.timestamp);
+		return finishPacing(
+			pacingSlot,
+			createUsageThrottledResponse(throttledFallbackAccounts),
+		);
 	}
 
 	// If routing skipped every remaining candidate using direct, short-lived
