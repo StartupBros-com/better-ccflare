@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
 	chmodSync,
 	mkdirSync,
@@ -235,11 +236,43 @@ function repoRootDeployTestArtifacts(): string[] {
 		.sort();
 }
 
+function sha256Of(path: string): string {
+	return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+// render_systemd_pin computes digests from the staged guard/policy/runner
+// files at render time, so any test invoking it needs real, existing files
+// at those paths, even when the test itself does not care about the
+// resulting digest values.
+function writeDigestFixtures(dir: string): {
+	guard: string;
+	policy: string;
+	runner: string;
+} {
+	const guard = join(dir, "ccflare-guard.mjs");
+	const policy = join(dir, "ccflare-guard-policy.mjs");
+	const runner = join(dir, "run-ccflare-stack.sh");
+	writeFileSync(guard, "// guard fixture\n");
+	writeFileSync(policy, "// policy fixture\n");
+	writeFileSync(runner, "#!/usr/bin/env bash\n# runner fixture\n");
+	return { guard, policy, runner };
+}
+
 describe("render_systemd_pin", () => {
-	test("atomically-rendered content upserts deploy-owned keys and preserves all others", () => {
+	test("atomically-rendered content upserts deploy-owned keys, preserves all others, and records artifact digests", () => {
 		const dir = tempDir();
 		const input = join(dir, "pin.conf");
 		const output = join(dir, "pin.rendered.conf");
+		// The digest lines are computed from the staged files at render time, so
+		// the guard, policy, and runner arguments must be real, existing files
+		// (as they are in the real deploy flow, by the time render_systemd_pin
+		// runs). The binary argument is not hashed by this function; it stays a
+		// symbolic path.
+		const {
+			guard: guardScript,
+			policy: guardPolicyScript,
+			runner: runnerScriptFixture,
+		} = writeDigestFixtures(dir);
 		writeFileSync(
 			input,
 			[
@@ -248,6 +281,15 @@ describe("render_systemd_pin", () => {
 				"Environment=CCFLARE_BIN=/old/bin",
 				"Environment=GUARD_SCRIPT=/old/guard.mjs",
 				"Environment=GUARD_SCRIPT=/duplicate/guard.mjs",
+				// Stray lines that happen to share a name with a key the managed
+				// block below will also emit. render_systemd_pin regenerates the
+				// whole managed block from scratch on every render rather than
+				// patching known keys in place, so anything outside the
+				// BEGIN/END markers -- including these -- is untouched legacy
+				// content, not something upserted.
+				"Environment=GUARD_SHA256=oldguardsha",
+				"Environment=GUARD_POLICY_SHA256=oldpolicysha",
+				"Environment=RUNNER_SHA256=oldrunnersha",
 				"ExecStart=/home/will/legacy-runner.sh",
 				"",
 			].join("\n"),
@@ -256,13 +298,13 @@ describe("render_systemd_pin", () => {
 		const result = bash(
 			[
 				`source ${shellQuote(helperScriptForShell)}`,
-				`render_systemd_pin ${shellQuote(shellPath(input))} ${shellQuote(shellPath(output))} /new/bin /new/runners/abc/run-ccflare-stack.sh /new/guards/abc/ccflare-guard.mjs abc123 pool-exhaustion-finite-recovery-v1`,
+				`render_systemd_pin ${shellQuote(shellPath(input))} ${shellQuote(shellPath(output))} /new/bin ${shellQuote(shellPath(runnerScriptFixture))} ${shellQuote(shellPath(guardScript))} abc123 pool-exhaustion-finite-recovery-v1 ${shellQuote(shellPath(guardPolicyScript))}`,
 			].join("\n"),
 		);
 
 		expect(repoRootDeployTestArtifacts()).toEqual([]);
-		expect(result.exitCode).toBe(0);
 		expect(result.stderr.toString()).toBe("");
+		expect(result.exitCode).toBe(0);
 		expect(readFileSync(output, "utf8")).toBe(
 			[
 				"[Service]",
@@ -270,19 +312,25 @@ describe("render_systemd_pin", () => {
 				"Environment=CCFLARE_BIN=/old/bin",
 				"Environment=GUARD_SCRIPT=/old/guard.mjs",
 				"Environment=GUARD_SCRIPT=/duplicate/guard.mjs",
+				"Environment=GUARD_SHA256=oldguardsha",
+				"Environment=GUARD_POLICY_SHA256=oldpolicysha",
+				"Environment=RUNNER_SHA256=oldrunnersha",
 				"ExecStart=/home/will/legacy-runner.sh",
 				"# BEGIN better-ccflare managed deployment",
 				"[Service]",
 				"Environment=CCFLARE_BIN=/new/bin",
-				"Environment=GUARD_SCRIPT=/new/guards/abc/ccflare-guard.mjs",
+				`Environment=GUARD_SCRIPT=${guardScript}`,
 				"Environment=GUARD_SOURCE_ID=abc123",
 				"Environment=GUARD_POLICY_ID=pool-exhaustion-finite-recovery-v1",
+				`Environment=GUARD_SHA256=${sha256Of(guardScript)}`,
+				`Environment=GUARD_POLICY_SHA256=${sha256Of(guardPolicyScript)}`,
+				`Environment=RUNNER_SHA256=${sha256Of(runnerScriptFixture)}`,
 				"Environment=GUARD_TOTAL_DEADLINE_MS=600000",
 				"Environment=GUARD_SHUTDOWN_GRACE_MS=600000",
 				"KillMode=mixed",
 				"TimeoutStopSec=720s",
 				"ExecStart=",
-				"ExecStart=/new/runners/abc/run-ccflare-stack.sh",
+				`ExecStart=${runnerScriptFixture}`,
 				"# END better-ccflare managed deployment",
 				"",
 			].join("\n"),
@@ -292,7 +340,7 @@ describe("render_systemd_pin", () => {
 		const second = bash(
 			[
 				`source ${shellQuote(helperScriptForShell)}`,
-				`render_systemd_pin ${shellQuote(shellPath(output))} ${shellQuote(shellPath(secondOutput))} /new/bin /new/runners/abc/run-ccflare-stack.sh /new/guards/abc/ccflare-guard.mjs abc123 pool-exhaustion-finite-recovery-v1`,
+				`render_systemd_pin ${shellQuote(shellPath(output))} ${shellQuote(shellPath(secondOutput))} /new/bin ${shellQuote(shellPath(runnerScriptFixture))} ${shellQuote(shellPath(guardScript))} abc123 pool-exhaustion-finite-recovery-v1 ${shellQuote(shellPath(guardPolicyScript))}`,
 			].join("\n"),
 		);
 		expect(second.exitCode).toBe(0);
@@ -301,10 +349,27 @@ describe("render_systemd_pin", () => {
 		);
 	});
 
+	test("fails clearly when a digest input file does not exist", () => {
+		const dir = tempDir();
+		const input = join(dir, "pin.conf");
+		const output = join(dir, "pin.rendered.conf");
+		writeFileSync(input, "[Service]\n");
+
+		const result = bash(
+			[
+				`source ${shellQuote(helperScriptForShell)}`,
+				`render_systemd_pin ${shellQuote(shellPath(input))} ${shellQuote(shellPath(output))} /new/bin /missing/runner.sh /missing/guard.mjs abc123 pool-exhaustion-finite-recovery-v1 /missing/policy.mjs`,
+			].join("\n"),
+		);
+
+		expect(result.exitCode).not.toBe(0);
+	});
+
 	test("preserves operator deadline and graceful-stop overrides", () => {
 		const dir = tempDir();
 		const input = join(dir, "pin.conf");
 		const output = join(dir, "pin.rendered.conf");
+		const { guard, policy, runner } = writeDigestFixtures(dir);
 		writeFileSync(
 			input,
 			[
@@ -321,7 +386,7 @@ describe("render_systemd_pin", () => {
 		const result = bash(
 			[
 				`source ${shellQuote(helperScriptForShell)}`,
-				`render_systemd_pin ${shellQuote(shellPath(input))} ${shellQuote(shellPath(output))} /new/bin /new/runner /new/guard abc123 policy-v1`,
+				`render_systemd_pin ${shellQuote(shellPath(input))} ${shellQuote(shellPath(output))} /new/bin ${shellQuote(shellPath(runner))} ${shellQuote(shellPath(guard))} abc123 policy-v1 ${shellQuote(shellPath(policy))}`,
 			].join("\n"),
 		);
 
@@ -345,6 +410,7 @@ describe("render_systemd_pin", () => {
 		const dir = tempDir();
 		const input = join(dir, "50-pinned-build.conf");
 		const output = join(dir, "pin.rendered.conf");
+		const { guard, policy, runner } = writeDigestFixtures(dir);
 		writeFileSync(
 			input,
 			[
@@ -366,7 +432,7 @@ describe("render_systemd_pin", () => {
 		const result = bash(
 			[
 				`source ${shellQuote(helperScriptForShell)}`,
-				`render_systemd_pin ${shellQuote(shellPath(input))} ${shellQuote(shellPath(output))} /new/bin /new/runner /new/guard abc123 policy-v1`,
+				`render_systemd_pin ${shellQuote(shellPath(input))} ${shellQuote(shellPath(output))} /new/bin ${shellQuote(shellPath(runner))} ${shellQuote(shellPath(guard))} abc123 policy-v1 ${shellQuote(shellPath(policy))}`,
 				`validate_deployment_timing ${shellQuote(shellPath(output))}`,
 			].join("\n"),
 		);
@@ -384,6 +450,7 @@ describe("render_systemd_pin", () => {
 		const dir = tempDir();
 		const input = join(dir, "pin.conf");
 		const output = join(dir, "pin.rendered.conf");
+		const { guard, policy, runner } = writeDigestFixtures(dir);
 		writeFileSync(
 			input,
 			[
@@ -398,7 +465,7 @@ describe("render_systemd_pin", () => {
 		const result = bash(
 			[
 				`source ${shellQuote(helperScriptForShell)}`,
-				`render_systemd_pin ${shellQuote(shellPath(input))} ${shellQuote(shellPath(output))} /new/bin /new/runner /new/guard abc123 policy-v1`,
+				`render_systemd_pin ${shellQuote(shellPath(input))} ${shellQuote(shellPath(output))} /new/bin ${shellQuote(shellPath(runner))} ${shellQuote(shellPath(guard))} abc123 policy-v1 ${shellQuote(shellPath(policy))}`,
 				`validate_deployment_timing ${shellQuote(shellPath(output))}`,
 			].join("\n"),
 		);
@@ -662,6 +729,22 @@ describe("effective systemd policy validation", () => {
 		expect(
 			events.some((event) => event.includes("systemctl restart")),
 		).toBe(false);
+	});
+
+	test("fails clearly when a digest input file does not exist", () => {
+		const dir = tempDir();
+		const input = join(dir, "pin.conf");
+		const output = join(dir, "pin.rendered.conf");
+		writeFileSync(input, "[Service]\n");
+
+		const result = bash(
+			[
+				`source ${shellQuote(helperScriptForShell)}`,
+				`render_systemd_pin ${shellQuote(shellPath(input))} ${shellQuote(shellPath(output))} /new/bin /missing/runner.sh /missing/guard.mjs abc123 pool-exhaustion-finite-recovery-v1 /missing/policy.mjs`,
+			].join("\n"),
+		);
+
+		expect(result.exitCode).not.toBe(0);
 	});
 });
 
@@ -1163,6 +1246,41 @@ describe("deployment flow safety contracts", () => {
 		]) {
 			expect(source.indexOf(marker, checkExit + 1)).toBeGreaterThan(checkExit);
 		}
+	});
+
+	// A genuine dynamic test would need two real, overlapping full-deploy
+	// invocations (git ancestry gate passing, `bun run build`, `sudo cp` into
+	// /home/will/.config/better-ccflare, and `systemctl restart
+	// ccflare-stack.service`) racing for the same lock. That means mutating
+	// production host paths from a fixture, which is out of bounds here — so
+	// this stays a static structural check: the lock is a single non-blocking
+	// flock on a UID-scoped file, acquired only after the CHECK_ONLY exit (and
+	// therefore only on the full-deploy path) and before any build or host
+	// mutation, with a distinct exit code so a losing invocation is
+	// unambiguous rather than aliasing another failure mode.
+	test("full deploy takes a single non-blocking, UID-scoped lock before any mutation", () => {
+		const source = readFileSync(deployScript, "utf8");
+		const checkExit = source.indexOf('if [[ "$CHECK_ONLY" == "1" ]]');
+		const lockPath = source.indexOf(
+			'DEPLOY_LOCK="${XDG_RUNTIME_DIR:-/tmp}/better-ccflare-deploy-${UID}.lock"',
+		);
+		const lockOpen = source.indexOf('exec 9>"$DEPLOY_LOCK"', lockPath);
+		const lockAcquire = source.indexOf('if ! flock -n 9; then', lockOpen);
+		const lockExitCode = source.indexOf("exit 75", lockAcquire);
+		const buildMarker = source.indexOf("bun run build", lockExitCode);
+
+		expect(checkExit).toBeGreaterThan(0);
+		expect(lockPath).toBeGreaterThan(checkExit);
+		expect(lockOpen).toBeGreaterThan(lockPath);
+		expect(lockAcquire).toBeGreaterThan(lockOpen);
+		expect(lockExitCode).toBeGreaterThan(lockAcquire);
+		expect(buildMarker).toBeGreaterThan(lockExitCode);
+
+		// The exit code on a lost race must be used exactly once in the whole
+		// script, and only for this lock failure, so a losing invocation can
+		// never be confused with rollback hard-failure (70), usage/validation
+		// errors (64), or the generic refusal path (1).
+		expect(source.match(/\bexit 75\b/g)).toHaveLength(1);
 	});
 
 	test("full deployment has rollback and exact dual-health verification", () => {
