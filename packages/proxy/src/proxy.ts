@@ -100,6 +100,43 @@ export function isReactivelyModelDepleted(opts: {
 	);
 }
 
+/**
+ * Reconcile an account-only filtered/reordered route list to its immutable
+ * routing-candidate sidecar. Matching is occurrence-safe: repeated combo slots
+ * backed by one account consume distinct candidate IDs in their source order.
+ */
+export function alignRouteCandidateIds(
+	accounts: readonly Account[],
+	candidates:
+		| readonly { readonly accountId: string; readonly candidateId: string }[]
+		| null
+		| undefined,
+): string[] {
+	const usedCandidateIndexes = new Set<number>();
+	return accounts.map((account, accountIndex) => {
+		const indexedCandidate = candidates?.[accountIndex];
+		if (
+			indexedCandidate?.accountId === account.id &&
+			!usedCandidateIndexes.has(accountIndex)
+		) {
+			usedCandidateIndexes.add(accountIndex);
+			return indexedCandidate.candidateId;
+		}
+
+		const matchedIndex =
+			candidates?.findIndex(
+				(candidate, candidateIndex) =>
+					candidate.accountId === account.id &&
+					!usedCandidateIndexes.has(candidateIndex),
+			) ?? -1;
+		if (matchedIndex >= 0 && candidates) {
+			usedCandidateIndexes.add(matchedIndex);
+			return candidates[matchedIndex].candidateId;
+		}
+		return `account:${account.id}`;
+	});
+}
+
 const log = new Logger("Proxy");
 
 // ===== USAGE COLLECTOR MANAGEMENT =====
@@ -727,16 +764,10 @@ export async function handleProxy(
 	const deferredModelRoutes: DeferredModelRoute[] = [];
 	const deferredModelRouteKeys = new Set<string>();
 	const deferredFallbackWaves = new Map<string, number>();
-	const candidateIdFor = (
-		account: Account,
-		index: number,
-		phase: "selected" | "fallback",
-	): string => {
-		const routingCandidate = requestMeta.routingCandidates?.[index];
-		return routingCandidate?.accountId === account.id
-			? routingCandidate.candidateId
-			: `${phase}:${index}:${account.id}`;
-	};
+	const selectedRouteCandidateIds = alignRouteCandidateIds(
+		accounts,
+		requestMeta.routingCandidates,
+	);
 	const modelFallbackPolicyFor = (
 		account: Account,
 		candidateId: string,
@@ -745,6 +776,7 @@ export async function handleProxy(
 		const comboName = requestMeta.comboName ?? null;
 		const comboSlotIndex = requestMeta.comboSlotIndex ?? null;
 		return {
+			routeCandidateId: candidateId,
 			forwardModelUnavailableResponse,
 			deferImplicitFallback: (model, fallbackRank) => {
 				const key = JSON.stringify([account.id, model.trim().toLowerCase()]);
@@ -852,7 +884,8 @@ export async function handleProxy(
 		}
 
 		const attemptedBefore = routingAttemptLedger.attemptedCount;
-		const candidateId = candidateIdFor(accounts[i], i, "selected");
+		const candidateId =
+			selectedRouteCandidateIds[i] ?? `account:${accounts[i].id}`;
 		const isFinalSelectedCandidate =
 			!filteredComboInfo?.comboName &&
 			i === accounts.length - 1 &&
@@ -961,6 +994,10 @@ export async function handleProxy(
 		}
 
 		if (fallbackAccounts.length > 0) {
+			const fallbackRouteCandidateIds = alignRouteCandidateIds(
+				fallbackAccounts,
+				requestMeta.routingCandidates,
+			);
 			log.info(
 				`Fallback: trying ${fallbackAccounts.length} SessionStrategy accounts`,
 			);
@@ -988,7 +1025,8 @@ export async function handleProxy(
 				}
 
 				const attemptedBefore = routingAttemptLedger.attemptedCount;
-				const candidateId = candidateIdFor(fallbackAccounts[i], i, "fallback");
+				const candidateId =
+					fallbackRouteCandidateIds[i] ?? `account:${fallbackAccounts[i].id}`;
 				const isFinalFallbackCandidate =
 					i === fallbackAccounts.length - 1 && deferredModelRoutes.length === 0;
 				try {
@@ -1147,6 +1185,7 @@ export async function handleProxy(
 					contextAdmissionTracker,
 					routingAttemptLedger,
 					{
+						routeCandidateId: route.candidateId,
 						implicitFallbacksEnabled: false,
 						forwardModelUnavailableResponse:
 							i === orderedDeferredModelRoutes.length - 1,

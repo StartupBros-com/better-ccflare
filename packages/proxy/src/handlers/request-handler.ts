@@ -3,6 +3,7 @@ import { TIME_CONSTANTS, ValidationError } from "@better-ccflare/core";
 import type { Provider } from "@better-ccflare/providers";
 import type { RequestMeta } from "@better-ccflare/types";
 import { chatGptCloudflareCookieJar } from "../chatgpt-cloudflare-cookies";
+import { getGuardRequestId } from "./internal-transport-headers";
 import { ERROR_MESSAGES } from "./proxy-types";
 
 /**
@@ -13,7 +14,7 @@ import { ERROR_MESSAGES } from "./proxy-types";
  */
 export function createRequestMetadata(req: Request, url: URL): RequestMeta {
 	return {
-		id: crypto.randomUUID(),
+		id: getGuardRequestId(req.headers) ?? crypto.randomUUID(),
 		method: req.method,
 		path: url.pathname,
 		timestamp: Date.now(),
@@ -81,19 +82,18 @@ export async function makeProxyRequest(
 	hasBody?: boolean,
 	signal?: AbortSignal,
 ): Promise<Response> {
-	let timeoutId: ReturnType<typeof setTimeout> | null = null;
-	let internalController: AbortController | null = null;
-
+	const headerTimeoutController = new AbortController();
+	const timeoutId = setTimeout(
+		() => headerTimeoutController.abort(),
+		TIME_CONSTANTS.PROXY_REQUEST_TIMEOUT_MS,
+	);
+	const signals = [
+		...(signal ? [signal] : []),
+		...(target instanceof Request ? [target.signal] : []),
+		headerTimeoutController.signal,
+	];
 	const effectiveSignal =
-		signal ??
-		(() => {
-			internalController = new AbortController();
-			timeoutId = setTimeout(
-				() => internalController?.abort(),
-				TIME_CONSTANTS.PROXY_REQUEST_TIMEOUT_MS,
-			);
-			return internalController.signal;
-		})();
+		signals.length === 1 ? signals[0] : AbortSignal.any(signals);
 
 	try {
 		if (target instanceof Request) {
@@ -124,6 +124,6 @@ export async function makeProxyRequest(
 		chatGptCloudflareCookieJar.captureFromResponse(target, response);
 		return response;
 	} finally {
-		if (timeoutId) clearTimeout(timeoutId);
+		clearTimeout(timeoutId);
 	}
 }

@@ -6,6 +6,8 @@ import http, { type Server } from "node:http";
 import net from "node:net";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
+import { GUARD_REQUEST_ID_HEADER } from "../../packages/proxy/src/handlers/internal-transport-headers";
+import { createRequestMetadata } from "../../packages/proxy/src/handlers/request-handler";
 
 import {
 	DEFAULT_GUARD_MAX_ATTEMPTS,
@@ -349,6 +351,45 @@ describe("source-controlled guard", () => {
 		]);
 	});
 
+	test("overwrites client correlation metadata and joins guard and proxy request IDs", async () => {
+		const spoofedId = "11111111-1111-4111-8111-111111111111";
+		const events: Array<Record<string, unknown>> = [];
+		let forwardedId: string | null = null;
+		let proxyRequestId: string | null = null;
+		const { baseUrl } = await startGuard("http://127.0.0.1:8789", {
+			logger: (line: string) => events.push(JSON.parse(line)),
+			fetchImpl: async (url: URL, init: RequestInit) => {
+				const headers = new Headers(init.headers);
+				forwardedId = headers.get(GUARD_REQUEST_ID_HEADER);
+				const request = new Request(url, {
+					method: init.method,
+					headers,
+				});
+				proxyRequestId = createRequestMetadata(request, new URL(url)).id;
+				return new Response("forwarded", { status: 200 });
+			},
+		});
+
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				[GUARD_REQUEST_ID_HEADER]: spoofedId,
+			},
+			body: "{}",
+		});
+		expect(await response.text()).toBe("forwarded");
+
+		const guardEvent = events.find((event) => event.event === "proxy_response");
+		expect(forwardedId).not.toBe(spoofedId);
+		expect(forwardedId).toMatch(
+			/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+		);
+		expect(proxyRequestId).toBe(forwardedId);
+		expect(guardEvent?.id).toBe(forwardedId);
+		expect(response.headers.get(GUARD_REQUEST_ID_HEADER)).toBeNull();
+	});
+
 	test("aborts a stalled response body and releases its active lease", async () => {
 		let fetchCalls = 0;
 		let cancelCalls = 0;
@@ -508,6 +549,219 @@ describe("source-controlled guard", () => {
 		);
 		expect(health.responseIdleTimeoutMs).toBe(35);
 		expect(health.runtime.limits.responseIdleTimeoutMs).toBe(35);
+	});
+
+	test("logs privacy-safe raw chunk telemetry and treats ping-shaped chunks as watchdog activity", async () => {
+		const events: Array<Record<string, unknown>> = [];
+		const chunks = [": ping\n\n", ": ping\n\n", "data: final\n\n"];
+		let fetchCalls = 0;
+		const { baseUrl, guard } = await startGuard("http://127.0.0.1:8789", {
+			responseIdleTimeoutMs: 35,
+			logger: (line: string) => events.push(JSON.parse(line)),
+			fetchImpl: async () => {
+				fetchCalls += 1;
+				let index = 0;
+				return new Response(
+					new ReadableStream<Uint8Array>({
+						async pull(controller) {
+							if (index > 0) {
+								await new Promise((resolve) => setTimeout(resolve, 20));
+							}
+							controller.enqueue(Buffer.from(chunks[index]));
+							index += 1;
+							if (index === chunks.length) controller.close();
+						},
+					}),
+					{ status: 200, headers: { "content-type": "text/event-stream" } },
+				);
+			},
+		});
+
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+		expect(await response.text()).toBe(chunks.join(""));
+		await waitFor(() => guard.state.active === 0);
+
+		const completion = events.find(
+			(event) => event.event === "proxy_response",
+		);
+		const firstBodyByteMs = completion?.firstBodyByteMs;
+		const maxInterChunkGapMs = completion?.maxInterChunkGapMs;
+		const lastChunkAgeMs = completion?.lastChunkAgeMs;
+		expect(completion).toMatchObject({
+			attempt: 1,
+			status: 200,
+			outcome: "success",
+			rawResponseChunkCount: chunks.length,
+			rawResponseBytes: Buffer.byteLength(chunks.join("")),
+			firstBodyByteMs: expect.any(Number),
+			maxInterChunkGapMs: expect.any(Number),
+			lastChunkAgeMs: expect.any(Number),
+		});
+		expect(Number(firstBodyByteMs)).toBeGreaterThanOrEqual(0);
+		expect(Number(maxInterChunkGapMs)).toBeGreaterThanOrEqual(10);
+		expect(Number(lastChunkAgeMs)).toBeGreaterThanOrEqual(0);
+		expect(fetchCalls).toBe(1);
+		expect(guard.state.counters.retried).toBe(0);
+		expect(guard.state.counters.responseBodyIdleTimeouts).toBe(0);
+	});
+
+	test("logs the last raw chunk age when the response body idle watchdog fires", async () => {
+		const events: Array<Record<string, unknown>> = [];
+		const partial = "partial-before-stall";
+		const { baseUrl, guard } = await startGuard("http://127.0.0.1:8789", {
+			responseIdleTimeoutMs: 30,
+			logger: (line: string) => events.push(JSON.parse(line)),
+			fetchImpl: async () =>
+				new Response(
+					new ReadableStream<Uint8Array>({
+						start(controller) {
+							controller.enqueue(Buffer.from(partial));
+						},
+					}),
+					{ status: 200 },
+				),
+		});
+
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+		await response.text().catch(() => null);
+		await waitFor(() => guard.state.active === 0);
+
+		const timeout = events.find(
+			(event) => event.event === "response_body_idle_timeout",
+		);
+		const lastChunkAgeMs = timeout?.lastChunkAgeMs;
+		expect(timeout).toMatchObject({
+			attempt: 1,
+			rawResponseChunkCount: 1,
+			rawResponseBytes: Buffer.byteLength(partial),
+			firstBodyByteMs: expect.any(Number),
+			maxInterChunkGapMs: 0,
+			lastChunkAgeMs: expect.any(Number),
+		});
+		expect(Number(lastChunkAgeMs)).toBeGreaterThanOrEqual(25);
+	});
+
+	test("logs raw body telemetry on client abort without replaying the committed response", async () => {
+		let fetchCalls = 0;
+		const partial = "committed-partial";
+		const upstreamBase = await listen(
+			http.createServer((_req, res) => {
+				fetchCalls += 1;
+				res.writeHead(200, { "content-type": "text/plain" });
+				res.write(partial);
+			}),
+		);
+		const { baseUrl, waitForEvent } =
+			await startProductionNodeGuard(upstreamBase);
+		const guardUrl = new URL(baseUrl);
+		const socket = await openRawRequest(
+			baseUrl,
+			"POST /v1/messages HTTP/1.1\r\n" +
+				`Host: ${guardUrl.host}\r\n` +
+				"Content-Length: 2\r\n\r\n" +
+				"{}",
+		);
+		await new Promise<void>((resolve, reject) => {
+			const timer = setTimeout(
+				() => reject(new Error("timed out waiting for committed response")),
+				500,
+			);
+			const onData = (chunk: Buffer) => {
+				if (!chunk.toString().includes(partial)) return;
+				clearTimeout(timer);
+				socket.off("data", onData);
+				resolve();
+			};
+			socket.on("data", onData);
+		});
+		socket.destroy();
+		const clientAbort = await waitForEvent("client_aborted");
+		expect(clientAbort).toMatchObject({
+			attempt: 1,
+			rawResponseChunkCount: 1,
+			rawResponseBytes: Buffer.byteLength(partial),
+			firstBodyByteMs: expect.any(Number),
+			maxInterChunkGapMs: 0,
+			lastChunkAgeMs: expect.any(Number),
+		});
+		expect(fetchCalls).toBe(1);
+	});
+
+	test("logs empty raw body telemetry on an upstream error without replaying", async () => {
+		const events: Array<Record<string, unknown>> = [];
+		let fetchCalls = 0;
+		const { baseUrl, guard } = await startGuard("http://127.0.0.1:8789", {
+			logger: (line: string) => events.push(JSON.parse(line)),
+			fetchImpl: async () => {
+				fetchCalls += 1;
+				throw new Error("test upstream error before headers");
+			},
+		});
+
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+		expect(response.status).toBe(502);
+		await waitFor(() => guard.state.active === 0);
+
+		const upstreamError = events.find(
+			(event) => event.event === "proxy_exception",
+		);
+		expect(upstreamError).toMatchObject({
+			attempt: 1,
+			message: "test upstream error before headers",
+			rawResponseChunkCount: 0,
+			rawResponseBytes: 0,
+			firstBodyByteMs: null,
+			maxInterChunkGapMs: 0,
+			lastChunkAgeMs: null,
+		});
+		expect(fetchCalls).toBe(1);
+		expect(guard.state.counters.retried).toBe(0);
+	});
+
+	test("resets raw body telemetry for each authorized retry attempt", async () => {
+		const events: Array<Record<string, unknown>> = [];
+		let fetchCalls = 0;
+		const { baseUrl, guard } = await startGuard("http://127.0.0.1:8789", {
+			maxAttempts: 2,
+			logger: (line: string) => events.push(JSON.parse(line)),
+			fetchImpl: async () => {
+				fetchCalls += 1;
+				if (fetchCalls === 1) {
+					return new Response("retry-body-that-must-not-leak", {
+						status: 503,
+						headers: { "x-better-ccflare-pool-status": "exhausted" },
+					});
+				}
+				return new Response("ok", { status: 200 });
+			},
+		});
+
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+		expect(await response.text()).toBe("ok");
+		await waitFor(() => guard.state.active === 0);
+
+		const completion = events.find(
+			(event) => event.event === "proxy_response",
+		);
+		expect(completion).toMatchObject({
+			attempt: 2,
+			rawResponseChunkCount: 1,
+			rawResponseBytes: 2,
+		});
+		expect(fetchCalls).toBe(2);
+		expect(guard.state.counters.retried).toBe(1);
 	});
 
 	// P1 spoofing (guard side): the legacy body-only fallback (no header) is

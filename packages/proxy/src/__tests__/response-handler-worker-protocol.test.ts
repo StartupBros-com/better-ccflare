@@ -1,6 +1,11 @@
 import { describe, expect, it, mock, spyOn } from "bun:test";
 import { requestEvents } from "@better-ccflare/core";
 import type { Account } from "@better-ccflare/types";
+import { ANTHROPIC_SEMANTIC_LIVENESS_ERROR_FRAME } from "../anthropic-semantic-liveness";
+import {
+	ANTHROPIC_PRE_COMMIT_TIMEOUT_ENV,
+	ANTHROPIC_TERMINAL_GRACE_ENV,
+} from "../anthropic-semantic-preflight";
 import * as modelCatalogModule from "../model-catalog";
 import { forwardToClient } from "../response-handler";
 import { clearSession, getServedAccount } from "../session-account-observer";
@@ -315,6 +320,582 @@ describe("forwardToClient usage-collector protocol", () => {
 		} finally {
 			Response.prototype.clone = originalClone;
 		}
+	});
+
+	it("records one failed end with partial usage when the downstream cancels", async () => {
+		const { chunks, ends } = createMockCollector();
+		const ctx = createCtx();
+		ctx.provider.isStreamingResponse = () => true;
+		const upstreamCancel = mock(() => undefined);
+		let emitted = false;
+		const body = new ReadableStream<Uint8Array>({
+			pull(controller) {
+				if (!emitted) {
+					emitted = true;
+					controller.enqueue(new TextEncoder().encode("data: partial\n\n"));
+					return;
+				}
+				return new Promise(() => undefined);
+			},
+			cancel: upstreamCancel,
+		});
+
+		const response = await forwardToClient(
+			{
+				requestId: "req-stream-cancel",
+				method: "POST",
+				path: "/v1/messages",
+				account: null,
+				requestHeaders: new Headers({ "content-type": "application/json" }),
+				requestBody: new TextEncoder().encode("{}"),
+				response: new Response(body, {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				}),
+				timestamp: Date.now(),
+				retryAttempt: 0,
+				failoverAttempts: 0,
+			},
+			ctx,
+		);
+
+		expect(response.status).toBe(200);
+		if (!response.body) throw new Error("Expected a streaming response body");
+		const reader = response.body.getReader();
+		const first = await reader.read();
+		expect(new TextDecoder().decode(first.value)).toBe("data: partial\n\n");
+		await reader.cancel("client disconnected");
+		await waitFor(() => ends.length > 0);
+		await Promise.resolve();
+
+		expect(chunks).toHaveLength(1);
+		expect(upstreamCancel).toHaveBeenCalledTimes(1);
+		expect(ends).toHaveLength(1);
+		expect(ends[0]).toMatchObject({
+			type: "end",
+			requestId: "req-stream-cancel",
+			success: false,
+			error: "downstream_cancelled",
+		});
+	});
+
+	async function forwardNativeAnthropicStream(
+		requestId: string,
+		body: string,
+	): Promise<{
+		responseText: string;
+		ends: Record<string, unknown>[];
+	}> {
+		const { ends } = createMockCollector();
+		const ctx = createCtx();
+		ctx.provider.isStreamingResponse = () => true;
+		const response = await forwardToClient(
+			{
+				requestId,
+				method: "POST",
+				path: "/v1/messages",
+				account: null,
+				requestHeaders: new Headers({
+					"anthropic-version": "2023-06-01",
+					"content-type": "application/json",
+				}),
+				requestBody: new TextEncoder().encode("{}"),
+				response: new Response(body, {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				}),
+				timestamp: Date.now(),
+				retryAttempt: 0,
+				failoverAttempts: 0,
+			},
+			ctx,
+		);
+
+		const responseText = await response.text();
+		await waitFor(() => ends.length > 0);
+		return { responseText, ends };
+	}
+
+	async function withTerminalGrace<T>(
+		graceMs: number,
+		run: () => Promise<T>,
+	): Promise<T> {
+		const previous = process.env[ANTHROPIC_TERMINAL_GRACE_ENV];
+		process.env[ANTHROPIC_TERMINAL_GRACE_ENV] = String(graceMs);
+		try {
+			return await run();
+		} finally {
+			if (previous === undefined) {
+				delete process.env[ANTHROPIC_TERMINAL_GRACE_ENV];
+			} else {
+				process.env[ANTHROPIC_TERMINAL_GRACE_ENV] = previous;
+			}
+		}
+	}
+
+	async function withSemanticTimeout<T>(
+		timeoutMs: number,
+		run: () => Promise<T>,
+	): Promise<T> {
+		const previous = process.env[ANTHROPIC_PRE_COMMIT_TIMEOUT_ENV];
+		process.env[ANTHROPIC_PRE_COMMIT_TIMEOUT_ENV] = String(timeoutMs);
+		try {
+			return await run();
+		} finally {
+			if (previous === undefined) {
+				delete process.env[ANTHROPIC_PRE_COMMIT_TIMEOUT_ENV];
+			} else {
+				process.env[ANTHROPIC_PRE_COMMIT_TIMEOUT_ENV] = previous;
+			}
+		}
+	}
+
+	async function forwardOpenNativeAnthropicStream(
+		requestId: string,
+		initialBody: string,
+	): Promise<{
+		response: Response;
+		chunks: Array<{ requestId: string; data: Uint8Array }>;
+		ends: Record<string, unknown>[];
+		upstreamCancel: ReturnType<typeof mock>;
+	}> {
+		const { chunks, ends } = createMockCollector();
+		const ctx = createCtx();
+		ctx.provider.isStreamingResponse = () => true;
+		const upstreamCancel = mock(() => undefined);
+		let emitted = false;
+		const body = new ReadableStream<Uint8Array>({
+			pull(controller) {
+				if (!emitted) {
+					emitted = true;
+					controller.enqueue(new TextEncoder().encode(initialBody));
+					return;
+				}
+				return new Promise(() => undefined);
+			},
+			cancel: upstreamCancel,
+		});
+
+		const response = await forwardToClient(
+			{
+				requestId,
+				method: "POST",
+				path: "/v1/messages",
+				account: null,
+				requestHeaders: new Headers({
+					"anthropic-version": "2023-06-01",
+					"content-type": "application/json",
+				}),
+				requestBody: new TextEncoder().encode("{}"),
+				response: new Response(body, {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				}),
+				timestamp: Date.now(),
+				retryAttempt: 0,
+				failoverAttempts: 0,
+			},
+			ctx,
+		);
+
+		return { response, chunks, ends, upstreamCancel };
+	}
+
+	async function forwardFailingNativeAnthropicStream(
+		requestId: string,
+		initialBody: string,
+		transportError: Error,
+	): Promise<{
+		response: Response;
+		ends: Record<string, unknown>[];
+	}> {
+		const { ends } = createMockCollector();
+		const ctx = createCtx();
+		ctx.provider.isStreamingResponse = () => true;
+		let emitted = false;
+		const body = new ReadableStream<Uint8Array>({
+			pull(controller) {
+				if (!emitted) {
+					emitted = true;
+					controller.enqueue(new TextEncoder().encode(initialBody));
+					return;
+				}
+				controller.error(transportError);
+			},
+		});
+
+		const response = await forwardToClient(
+			{
+				requestId,
+				method: "POST",
+				path: "/v1/messages",
+				account: null,
+				requestHeaders: new Headers({
+					"anthropic-version": "2023-06-01",
+					"content-type": "application/json",
+				}),
+				requestBody: new TextEncoder().encode("{}"),
+				response: new Response(body, {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				}),
+				timestamp: Date.now(),
+				retryAttempt: 0,
+				failoverAttempts: 0,
+			},
+			ctx,
+		);
+
+		return { response, ends };
+	}
+
+	it("records terminal protocol success when the client cancels after message_stop but before transport EOF", async () => {
+		const body =
+			'event: message_start\ndata: {"type":"message_start","message":{"content":[]}}\n\n' +
+			'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+		const { response, chunks, ends, upstreamCancel } =
+			await forwardOpenNativeAnthropicStream(
+				"req-anthropic-stop-then-cancel",
+				body,
+			);
+
+		if (!response.body) throw new Error("Expected a streaming response body");
+		const reader = response.body.getReader();
+		const first = await reader.read();
+		expect(new TextDecoder().decode(first.value)).toBe(body);
+		await reader.cancel("client closed after terminal event");
+		await waitFor(() => ends.length > 0);
+		await Promise.resolve();
+
+		expect(chunks).toHaveLength(1);
+		expect(upstreamCancel).toHaveBeenCalledTimes(1);
+		expect(ends).toHaveLength(1);
+		expect(ends[0]).toMatchObject({
+			type: "end",
+			requestId: "req-anthropic-stop-then-cancel",
+			success: true,
+		});
+		expect(ends[0].error).toBeUndefined();
+	});
+
+	it("records downstream cancellation when the client cancels before message_stop", async () => {
+		const body =
+			'event: message_start\ndata: {"type":"message_start","message":{"content":[]}}\n\n' +
+			'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"partial"}}\n\n';
+		const { response, chunks, ends, upstreamCancel } =
+			await forwardOpenNativeAnthropicStream(
+				"req-anthropic-cancel-before-stop",
+				body,
+			);
+
+		if (!response.body) throw new Error("Expected a streaming response body");
+		const reader = response.body.getReader();
+		const first = await reader.read();
+		expect(new TextDecoder().decode(first.value)).toBe(body);
+		await reader.cancel("client closed before terminal event");
+		await waitFor(() => ends.length > 0);
+		await Promise.resolve();
+
+		expect(chunks).toHaveLength(1);
+		expect(upstreamCancel).toHaveBeenCalledTimes(1);
+		expect(ends).toHaveLength(1);
+		expect(ends[0]).toMatchObject({
+			type: "end",
+			requestId: "req-anthropic-cancel-before-stop",
+			success: false,
+			error: "downstream_cancelled",
+		});
+	});
+
+	it("does not accept an unterminated message_stop tail when the client cancels", async () => {
+		const unterminatedStop =
+			'event: message_stop\ndata: {"type":"message_stop"}';
+		const { response, chunks, ends, upstreamCancel } =
+			await forwardOpenNativeAnthropicStream(
+				"req-anthropic-unterminated-stop-cancel",
+				unterminatedStop,
+			);
+
+		if (!response.body) throw new Error("Expected a streaming response body");
+		const reader = response.body.getReader();
+		expect(new TextDecoder().decode((await reader.read()).value)).toBe(
+			unterminatedStop,
+		);
+		await reader.cancel("client closed after truncated terminal-looking tail");
+		await waitFor(() => ends.length > 0);
+
+		expect(chunks).toHaveLength(1);
+		expect(upstreamCancel).toHaveBeenCalledTimes(1);
+		expect(ends).toHaveLength(1);
+		expect(ends[0]).toMatchObject({
+			type: "end",
+			requestId: "req-anthropic-unterminated-stop-cancel",
+			success: false,
+			error: "downstream_cancelled",
+		});
+	});
+
+	it("records one end when message_stop cancellation races a pending transport read", async () => {
+		const body =
+			'event: message_start\ndata: {"type":"message_start","message":{"content":[]}}\n\n' +
+			'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+		const { response, chunks, ends, upstreamCancel } =
+			await forwardOpenNativeAnthropicStream(
+				"req-anthropic-stop-cancel-race",
+				body,
+			);
+
+		if (!response.body) throw new Error("Expected a streaming response body");
+		const reader = response.body.getReader();
+		const first = await reader.read();
+		expect(new TextDecoder().decode(first.value)).toBe(body);
+		const pendingRead = reader.read();
+		await reader.cancel("client closed during pending transport read");
+		await expect(pendingRead).resolves.toMatchObject({ done: true });
+		await waitFor(() => ends.length > 0);
+		await Promise.resolve();
+
+		expect(chunks).toHaveLength(1);
+		expect(upstreamCancel).toHaveBeenCalledTimes(1);
+		expect(ends).toHaveLength(1);
+		expect(ends[0]).toMatchObject({
+			type: "end",
+			requestId: "req-anthropic-stop-cancel-race",
+			success: true,
+		});
+		expect(ends[0].error).toBeUndefined();
+	});
+
+	it("records one successful end when the transport errors after message_stop", async () => {
+		const body =
+			'event: message_start\ndata: {"type":"message_start","message":{"content":[]}}\n\n' +
+			'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+		const transportError = new Error(
+			"upstream socket reset after terminal event",
+		);
+		const { response, ends } = await forwardFailingNativeAnthropicStream(
+			"req-anthropic-stop-then-error",
+			body,
+			transportError,
+		);
+
+		await expect(response.text()).rejects.toThrow(transportError.message);
+		await waitFor(() => ends.length > 0);
+
+		expect(ends).toHaveLength(1);
+		expect(ends[0]).toMatchObject({
+			type: "end",
+			requestId: "req-anthropic-stop-then-error",
+			success: true,
+		});
+		expect(ends[0].error).toBeUndefined();
+	});
+
+	it("records one failed end when the transport errors before message_stop", async () => {
+		const body =
+			'event: message_start\ndata: {"type":"message_start","message":{"content":[]}}\n\n' +
+			'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"partial"}}\n\n';
+		const transportError = new Error("upstream socket reset mid-stream");
+		const { response, ends } = await forwardFailingNativeAnthropicStream(
+			"req-anthropic-error-before-stop",
+			body,
+			transportError,
+		);
+
+		await expect(response.text()).rejects.toThrow(transportError.message);
+		await waitFor(() => ends.length > 0);
+
+		expect(ends).toHaveLength(1);
+		expect(ends[0]).toMatchObject({
+			type: "end",
+			requestId: "req-anthropic-error-before-stop",
+			success: false,
+			error: transportError.message,
+		});
+	});
+
+	it("does not accept an unterminated message_stop tail before a transport error", async () => {
+		const unterminatedStop =
+			'event: message_stop\ndata: {"type":"message_stop"}';
+		const transportError = new Error(
+			"upstream socket reset after truncated terminal-looking tail",
+		);
+		const { response, ends } = await forwardFailingNativeAnthropicStream(
+			"req-anthropic-unterminated-stop-error",
+			unterminatedStop,
+			transportError,
+		);
+
+		await expect(response.text()).rejects.toThrow(transportError.message);
+		await waitFor(() => ends.length > 0);
+
+		expect(ends).toHaveLength(1);
+		expect(ends[0]).toMatchObject({
+			type: "end",
+			requestId: "req-anthropic-unterminated-stop-error",
+			success: false,
+			error: transportError.message,
+		});
+	});
+
+	it("records the safe SSE error when an error event precedes a transport error", async () => {
+		const body =
+			'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"private upstream message"}}\n\n';
+		const transportError = new Error("private transport failure");
+		const { response, ends } = await forwardFailingNativeAnthropicStream(
+			"req-anthropic-sse-error-then-transport-error",
+			body,
+			transportError,
+		);
+
+		// A valid SSE error is itself terminal: the current bytes are forwarded,
+		// then semantic liveness closes and cancels upstream before a later raw
+		// transport failure can keep the response open.
+		expect(await response.text()).toBe(body);
+		await waitFor(() => ends.length > 0);
+
+		expect(ends).toHaveLength(1);
+		expect(ends[0]).toMatchObject({
+			type: "end",
+			requestId: "req-anthropic-sse-error-then-transport-error",
+			success: false,
+			error: "anthropic_midstream_error:overloaded_error",
+		});
+		expect(JSON.stringify(ends[0])).not.toContain("private upstream message");
+		expect(JSON.stringify(ends[0])).not.toContain(transportError.message);
+	});
+
+	it("records a later SSE error as failure even after message_stop", async () => {
+		const body =
+			'event: message_stop\ndata: {"type":"message_stop"}\n\n' +
+			'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"private late error"}}\n\n';
+		const { responseText, ends } = await forwardNativeAnthropicStream(
+			"req-anthropic-stop-then-sse-error",
+			body,
+		);
+
+		expect(responseText).toBe(body);
+		expect(ends).toHaveLength(1);
+		expect(ends[0]).toMatchObject({
+			type: "end",
+			requestId: "req-anthropic-stop-then-sse-error",
+			success: false,
+			error: "anthropic_midstream_error:api_error",
+		});
+		expect(JSON.stringify(ends[0])).not.toContain("private late error");
+	});
+
+	it("records one successful end for a native Anthropic stream with message_stop", async () => {
+		const body =
+			'event: message_start\ndata: {"type":"message_start","message":{"content":[]}}\n\n' +
+			'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+		const { responseText, ends } = await forwardNativeAnthropicStream(
+			"req-anthropic-real-stop",
+			body,
+		);
+
+		expect(responseText).toBe(body);
+		expect(ends).toHaveLength(1);
+		expect(ends[0]).toMatchObject({
+			type: "end",
+			requestId: "req-anthropic-real-stop",
+			success: true,
+		});
+		expect(ends[0].error).toBeUndefined();
+	});
+
+	it("records one successful end when terminal recovery synthesizes message_stop", async () => {
+		const terminalDelta =
+			'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\n';
+		const { responseText, ends } = await withTerminalGrace(5, () =>
+			forwardNativeAnthropicStream(
+				"req-anthropic-recovered-stop",
+				terminalDelta,
+			),
+		);
+
+		expect(responseText).toBe(
+			`${terminalDelta}event: message_stop\ndata: {"type":"message_stop"}\n\n`,
+		);
+		expect(ends).toHaveLength(1);
+		expect(ends[0]).toMatchObject({
+			type: "end",
+			requestId: "req-anthropic-recovered-stop",
+			success: true,
+		});
+		expect(ends[0].error).toBeUndefined();
+	});
+
+	it("records one failed end when native Anthropic SSE reaches EOF without message_stop", async () => {
+		const body =
+			'event: message_start\ndata: {"type":"message_start","message":{"content":[]}}\n\n' +
+			'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"partial"}}\n\n';
+		const { responseText, ends } = await forwardNativeAnthropicStream(
+			"req-anthropic-incomplete-eof",
+			body,
+		);
+
+		expect(responseText).toBe(body);
+		expect(ends).toHaveLength(1);
+		expect(ends[0]).toMatchObject({
+			type: "end",
+			requestId: "req-anthropic-incomplete-eof",
+			success: false,
+			error: "anthropic_incomplete_eof",
+		});
+	});
+
+	it("records one failed end with only the safe Anthropic SSE error type", async () => {
+		const body =
+			'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"private upstream message"}}\n\n';
+		const { responseText, ends } = await forwardNativeAnthropicStream(
+			"req-anthropic-midstream-error",
+			body,
+		);
+
+		expect(responseText).toBe(body);
+		expect(ends).toHaveLength(1);
+		expect(ends[0]).toMatchObject({
+			type: "end",
+			requestId: "req-anthropic-midstream-error",
+			success: false,
+			error: "anthropic_midstream_error:overloaded_error",
+		});
+		expect(JSON.stringify(ends[0])).not.toContain("private upstream message");
+	});
+
+	it("records a postcommit semantic timeout as one sanitized failed outcome", async () => {
+		const body =
+			'event: message_start\ndata: {"type":"message_start","message":{"content":[]}}\n\n' +
+			'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"partial"}}\n\n' +
+			'event: ping\ndata: {"type":"ping"}\n\n';
+		const { response, ends, upstreamCancel } = await withSemanticTimeout(
+			15,
+			() =>
+				forwardOpenNativeAnthropicStream(
+					"req-anthropic-postcommit-timeout",
+					body,
+				),
+		);
+
+		const responseText = await withSemanticTimeout(15, () => response.text());
+		await waitFor(() => ends.length > 0);
+
+		expect(responseText).toBe(
+			`${body}${ANTHROPIC_SEMANTIC_LIVENESS_ERROR_FRAME}`,
+		);
+		expect(upstreamCancel).toHaveBeenCalledTimes(1);
+		expect(ends).toHaveLength(1);
+		expect(ends[0]).toMatchObject({
+			type: "end",
+			requestId: "req-anthropic-postcommit-timeout",
+			success: false,
+			error: "anthropic_midstream_error:api_error",
+		});
+		expect(JSON.stringify(ends[0])).not.toContain("partial");
+		expect(JSON.stringify(ends[0])).not.toContain(
+			"Response stalled after partial output",
+		);
 	});
 
 	it("tees non-streaming responses instead of cloning analytics body", async () => {

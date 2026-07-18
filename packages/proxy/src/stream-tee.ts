@@ -10,6 +10,7 @@ export function teeStream(
 		onChunk?: (chunk: Uint8Array) => void;
 		onClose?: (buffered: Uint8Array[]) => void;
 		onError?: (error: Error) => void;
+		onCancel?: (reason: unknown) => void;
 		maxBytes?: number; // Max bytes to buffer (default: 1MB)
 	} = {},
 ): ReadableStream<Uint8Array> {
@@ -17,20 +18,32 @@ export function teeStream(
 		onChunk,
 		onClose,
 		onError,
+		onCancel,
 		maxBytes = BUFFER_SIZES.STREAM_TEE_MAX_BYTES,
 	} = options;
 	const reader = upstream.getReader();
 	const buffered: Uint8Array[] = [];
 	let totalBytes = 0;
 	let truncated = false;
+	let terminalState: "active" | "closed" | "errored" | "cancelled" = "active";
+
+	const runTerminalCallback = (callback: () => void): void => {
+		try {
+			callback();
+		} catch {
+			// Analytics callbacks must not change or block stream termination.
+		}
+	};
 
 	return new ReadableStream({
 		async pull(controller) {
 			try {
 				const { value, done } = await reader.read();
+				if (terminalState !== "active") return;
 
 				if (done) {
-					onClose?.(buffered);
+					terminalState = "closed";
+					runTerminalCallback(() => onClose?.(buffered));
 					controller.close();
 					return;
 				}
@@ -55,12 +68,17 @@ export function teeStream(
 				// Notify chunk handler
 				onChunk?.(value);
 			} catch (error) {
-				onError?.(error as Error);
+				if (terminalState !== "active") return;
+				terminalState = "errored";
+				runTerminalCallback(() => onError?.(error as Error));
 				controller.error(error);
 			}
 		},
 
 		cancel(reason) {
+			if (terminalState !== "active") return;
+			terminalState = "cancelled";
+			runTerminalCallback(() => onCancel?.(reason));
 			return reader.cancel(reason);
 		},
 	});

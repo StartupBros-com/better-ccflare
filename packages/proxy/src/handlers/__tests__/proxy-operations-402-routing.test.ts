@@ -142,6 +142,22 @@ function successResponse(model: string): Response {
 	);
 }
 
+function modelUnavailableResponse(status: 400 | 404): Response {
+	return new Response(
+		JSON.stringify({
+			error: {
+				type: "not_found_error",
+				code: "model_not_found",
+				message: "model not found",
+			},
+		}),
+		{
+			status,
+			headers: { "content-type": "application/json" },
+		},
+	);
+}
+
 interface ContextHarness {
 	ctx: ProxyContext;
 	markAccountRateLimited: ReturnType<typeof mock>;
@@ -396,8 +412,8 @@ describe("raw upstream HTTP 402 routing", () => {
 	});
 
 	it.each([
-		400, 404, 429,
-	])("fails over to the next ComboSlot when an initial %i model error is followed by fallback 402", async (initialStatus) => {
+		400, 404,
+	] as const)("tries every requested-family ComboSlot before deferred fallbacks after an initial %i model error", async (initialStatus) => {
 		const firstAccount = makeAccount("first", {
 			model_mappings: JSON.stringify({
 				opus: ["first-primary", "first-fallback", "first-never"],
@@ -436,24 +452,23 @@ describe("raw upstream HTTP 402 routing", () => {
 		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
 			const request = input instanceof Request ? input : new Request(input);
 			const body = (await request.clone().json()) as { model?: string };
-			attempts.push({ url: request.url, model: body.model ?? "missing" });
-			if (attempts.length === 1) {
-				return new Response(
-					JSON.stringify({
-						error: {
-							type: "not_found_error",
-							code: "model_not_found",
-							message: "model not found",
-						},
-					}),
-					{
-						status: initialStatus,
-						headers: { "content-type": "application/json" },
-					},
-				);
+			const model = body.model ?? "missing";
+			attempts.push({ url: request.url, model });
+
+			const account = new URL(request.url).hostname;
+			if (account === "first.test" && model === "first-primary") {
+				return modelUnavailableResponse(initialStatus);
 			}
-			if (attempts.length === 2) return fallback402.response;
-			return successResponse(body.model ?? "later-primary");
+			if (account === "later.test" && model === "later-primary") {
+				return modelUnavailableResponse(initialStatus);
+			}
+			if (account === "first.test" && model === "first-fallback") {
+				return fallback402.response;
+			}
+			if (account === "later.test" && model === "later-fallback") {
+				return successResponse(model);
+			}
+			throw new Error(`Unexpected upstream route: ${account} ${model}`);
 		}) as unknown as typeof fetch;
 		const request = makeRequest();
 
@@ -464,10 +479,16 @@ describe("raw upstream HTTP 402 routing", () => {
 		);
 		await harness.flush();
 
-		expect(attempts).toEqual([
-			expect.objectContaining({ model: "first-primary" }),
-			expect.objectContaining({ model: "first-fallback" }),
-			expect.objectContaining({ model: "later-primary" }),
+		expect(
+			attempts.map(({ url, model }) => ({
+				account: new URL(url).hostname,
+				model,
+			})),
+		).toEqual([
+			{ account: "first.test", model: "first-primary" },
+			{ account: "later.test", model: "later-primary" },
+			{ account: "first.test", model: "first-fallback" },
+			{ account: "later.test", model: "later-fallback" },
 		]);
 		expect(response.status).toBe(200);
 		expect(attempts.some(({ model }) => model === "first-never")).toBe(false);
@@ -495,6 +516,110 @@ describe("raw upstream HTTP 402 routing", () => {
 				availableAt: null,
 			}),
 		]);
+	});
+
+	it("treats an ambiguous 429 as account-scoped before trying the next ComboSlot", async () => {
+		const firstAccount = makeAccount("first", {
+			model_mappings: JSON.stringify({
+				opus: ["first-primary", "first-fallback"],
+			}),
+		});
+		const laterAccount = makeAccount("later");
+		const combo: ComboWithSlots = {
+			id: "combo-opus-account-429",
+			name: "Priority Opus account 429",
+			description: null,
+			enabled: true,
+			created_at: NOW,
+			updated_at: NOW,
+			slots: [
+				{
+					id: "slot-first",
+					combo_id: "combo-opus-account-429",
+					account_id: firstAccount.id,
+					model: "claude-opus-4-8",
+					priority: 0,
+					enabled: true,
+				},
+				{
+					id: "slot-later",
+					combo_id: "combo-opus-account-429",
+					account_id: laterAccount.id,
+					model: "claude-opus-4-8",
+					priority: 10,
+					enabled: true,
+				},
+			],
+		};
+		const harness = makeContext([firstAccount, laterAccount], { combo });
+		const attempts: Array<{ account: string; model: string }> = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const request = input instanceof Request ? input : new Request(input);
+			const body = (await request.clone().json()) as { model?: string };
+			const attempt = {
+				account: new URL(request.url).hostname,
+				model: body.model ?? "missing",
+			};
+			attempts.push(attempt);
+
+			if (
+				attempt.account === "first.test" &&
+				attempt.model === "first-primary"
+			) {
+				return new Response(
+					JSON.stringify({
+						type: "error",
+						error: {
+							type: "rate_limit_error",
+							message: "rate limited",
+						},
+					}),
+					{
+						status: 429,
+						headers: {
+							"content-type": "application/json",
+							"retry-after": "60",
+						},
+					},
+				);
+			}
+			if (
+				attempt.account === "later.test" &&
+				attempt.model === "later-primary"
+			) {
+				return successResponse(attempt.model);
+			}
+			throw new Error(
+				`Unexpected upstream route: ${attempt.account} ${attempt.model}`,
+			);
+		}) as unknown as typeof fetch;
+		const request = makeRequest();
+
+		const response = await handleProxy(
+			request,
+			new URL(request.url),
+			harness.ctx,
+		);
+		await harness.flush();
+
+		expect(attempts).toEqual([
+			{ account: "first.test", model: "first-primary" },
+			{ account: "later.test", model: "later-primary" },
+		]);
+		expect(response.status).toBe(200);
+		expect(firstAccount.rate_limited_until).toBeGreaterThan(NOW);
+		expect(harness.markAccountRateLimited).toHaveBeenCalledTimes(1);
+		expect(harness.markAccountRateLimited.mock.calls[0]?.[0]).toBe(
+			firstAccount.id,
+		);
+		expect(harness.markAccountRateLimited.mock.calls[0]?.[2]).toBe(
+			"all_models_exhausted_429",
+		);
+		expect(harness.saveRequest).toHaveBeenCalledTimes(1);
+		expect(harness.saveRequest.mock.calls[0]?.[4]).toBe(429);
+		expect(harness.saveRequest.mock.calls[0]?.[6]).toBe(
+			"all_models_exhausted_429",
+		);
 	});
 
 	it("handles a raw 402 returned by an in-place 529 retry before provider processing", async () => {
@@ -633,7 +758,7 @@ describe("raw upstream HTTP 402 routing", () => {
 			}),
 		).toEqual({
 			retry: false,
-			reason: "pool_not_exhausted",
+			reason: "header_absent_legacy_body_disabled",
 			delayMs: 0,
 			recoverySource: null,
 		});
