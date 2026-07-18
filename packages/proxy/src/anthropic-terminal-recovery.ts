@@ -1,3 +1,6 @@
+import { BUFFER_SIZES, SseFrameBuffer } from "@better-ccflare/core";
+import { classifyAnthropicSseFrame } from "./anthropic-sse-frame-classifier";
+
 export const ANTHROPIC_MESSAGE_STOP_FRAME =
 	'event: message_stop\ndata: {"type":"message_stop"}\n\n';
 
@@ -18,10 +21,6 @@ export interface AnthropicTerminalRecoveryOptions {
 	) => void;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null;
-}
-
 /**
  * Observe a native Anthropic SSE stream without rewriting its upstream bytes.
  *
@@ -38,11 +37,14 @@ export function createAnthropicTerminalRecoveryStream(
 	const gracePeriodMs =
 		options.gracePeriodMs ?? ANTHROPIC_TERMINAL_RECOVERY_GRACE_MS;
 	const reader = upstream.getReader();
-	const decoder = new TextDecoder();
+	let frames: SseFrameBuffer | null = new SseFrameBuffer({
+		maxFrameBytes: BUFFER_SIZES.SSE_TRANSPORT_FRAME_MAX_BYTES,
+		maxBufferBytes: BUFFER_SIZES.SSE_TRANSPORT_TAIL_MAX_BYTES,
+	});
 
-	let eventBuffer = "";
 	let terminalDeltaSeen = false;
 	let messageStopSeen = false;
+	let recoveryDisabled = false;
 	let finalized = false;
 	let upstreamCancelPromise: Promise<void> | null = null;
 	let recoveryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -54,6 +56,15 @@ export function createAnthropicTerminalRecoveryStream(
 		if (recoveryTimer === null) return;
 		clearTimeout(recoveryTimer);
 		recoveryTimer = null;
+	};
+
+	const disableRecovery = (): void => {
+		recoveryDisabled = true;
+		terminalDeltaSeen = false;
+		clearRecoveryTimer();
+		// Drop the parser reference immediately. In particular, a limit failure
+		// must not retain the over-policy tail for the lifetime of the stream.
+		frames = null;
 	};
 
 	const cancelUpstream = (reason: unknown): Promise<void> => {
@@ -104,10 +115,18 @@ export function createAnthropicTerminalRecoveryStream(
 		reason: AnthropicTerminalRecoveryReason,
 		missingEventDelimiter = "",
 	): void => {
-		if (finalized || messageStopSeen || !downstreamController) return;
+		if (
+			finalized ||
+			messageStopSeen ||
+			recoveryDisabled ||
+			!downstreamController
+		) {
+			return;
+		}
 
 		finalized = true;
 		clearRecoveryTimer();
+		frames = null;
 		appendMissingEventDelimiter(missingEventDelimiter);
 		downstreamController.enqueue(messageStopBytes.slice());
 		downstreamController.close();
@@ -119,55 +138,48 @@ export function createAnthropicTerminalRecoveryStream(
 	};
 
 	const inspectEvent = (rawEvent: string): void => {
-		let eventType: string | undefined;
-		const dataLines: string[] = [];
-
-		for (const line of rawEvent.split(/\r?\n/)) {
-			if (line.length === 0 || line.startsWith(":")) continue;
-
-			const colon = line.indexOf(":");
-			const field = colon === -1 ? line : line.slice(0, colon);
-			let value = colon === -1 ? "" : line.slice(colon + 1);
-			if (value.startsWith(" ")) value = value.slice(1);
-
-			if (field === "event") eventType = value;
-			if (field === "data") dataLines.push(value);
-		}
-
-		if (dataLines.length === 0) return;
-
-		let parsed: unknown;
-		try {
-			parsed = JSON.parse(dataLines.join("\n")) as unknown;
-		} catch {
-			return;
-		}
-		if (!isRecord(parsed)) return;
-
-		const isMessageStop =
-			eventType === "message_stop" || parsed.type === "message_stop";
-		if (isMessageStop) {
-			messageStopSeen = true;
-			clearRecoveryTimer();
-			return;
-		}
-
-		const isMessageDelta =
-			eventType === "message_delta" || parsed.type === "message_delta";
-		const stopReason = isRecord(parsed.delta)
-			? parsed.delta.stop_reason
-			: undefined;
-		if (isMessageDelta && stopReason !== null && stopReason !== undefined) {
-			terminalDeltaSeen = true;
-			armRecoveryTimer();
+		const classification = classifyAnthropicSseFrame(rawEvent);
+		switch (classification.kind) {
+			case "message_stop":
+				messageStopSeen = true;
+				clearRecoveryTimer();
+				frames = null;
+				return;
+			case "error":
+				// A protocol error is terminal and authoritative. Never turn it into a
+				// successful-looking message_stop, even if a terminal delta came first.
+				disableRecovery();
+				return;
+			case "terminal_delta":
+				terminalDeltaSeen = true;
+				armRecoveryTimer();
+				return;
+			case "malformed":
+			case "unknown":
+				// Unknown or malformed protocol bytes make semantic recovery uncertain.
+				// Preserve the upstream stream verbatim and fail open.
+				disableRecovery();
+				return;
+			case "keepalive":
+			case "structural":
+			case "meaningful":
+				return;
 		}
 	};
 
 	const takeBufferedEventDelimiter = (): string => {
-		if (eventBuffer.length === 0) return "";
-		const bufferedEvent = eventBuffer;
-		eventBuffer = "";
+		if (!frames || recoveryDisabled) return "";
+		let bufferedEvent: string;
+		try {
+			bufferedEvent = frames.flush();
+		} catch {
+			disableRecovery();
+			return "";
+		}
+		frames = null;
+		if (bufferedEvent.length === 0) return "";
 		inspectEvent(bufferedEvent);
+		if (recoveryDisabled) return "";
 		return bufferedEvent.endsWith("\r\n")
 			? "\r\n"
 			: bufferedEvent.endsWith("\n")
@@ -181,6 +193,7 @@ export function createAnthropicTerminalRecoveryStream(
 		if (finalized || !downstreamController) return;
 		finalized = true;
 		clearRecoveryTimer();
+		frames = null;
 		appendMissingEventDelimiter(missingEventDelimiter);
 		downstreamController.close();
 		cancelAfterForcedClose(
@@ -191,8 +204,9 @@ export function createAnthropicTerminalRecoveryStream(
 
 	const handleRecoveryTimeout = (): void => {
 		recoveryTimer = null;
-		if (finalized) return;
+		if (finalized || recoveryDisabled) return;
 		const missingEventDelimiter = takeBufferedEventDelimiter();
+		if (recoveryDisabled) return;
 		if (messageStopSeen) {
 			finalizeBufferedMessageStopAtTimeout(missingEventDelimiter);
 			return;
@@ -201,19 +215,30 @@ export function createAnthropicTerminalRecoveryStream(
 	};
 
 	const armRecoveryTimer = (): void => {
-		if (recoveryTimer !== null || finalized || messageStopSeen) return;
+		if (
+			recoveryTimer !== null ||
+			finalized ||
+			messageStopSeen ||
+			recoveryDisabled
+		) {
+			return;
+		}
 		recoveryTimer = setTimeout(handleRecoveryTimeout, gracePeriodMs);
 	};
 
 	const inspectChunk = (chunk: Uint8Array): void => {
-		eventBuffer += decoder.decode(chunk, { stream: true });
-
-		let delimiter = /\r?\n\r?\n/.exec(eventBuffer);
-		while (delimiter?.index !== undefined) {
-			const rawEvent = eventBuffer.slice(0, delimiter.index);
-			eventBuffer = eventBuffer.slice(delimiter.index + delimiter[0].length);
-			inspectEvent(rawEvent);
-			delimiter = /\r?\n\r?\n/.exec(eventBuffer);
+		if (!frames || recoveryDisabled) return;
+		const activeFrames = frames;
+		try {
+			for (const frame of activeFrames.push(chunk)) {
+				inspectEvent(frame);
+				if (!frames || recoveryDisabled || messageStopSeen) break;
+			}
+		} catch {
+			// Resource-limit and parser failures are not protocol evidence. Keep the
+			// raw bytes already enqueued downstream, disable semantic recovery, and
+			// release all parser-retained memory.
+			disableRecovery();
 		}
 	};
 
@@ -230,15 +255,15 @@ export function createAnthropicTerminalRecoveryStream(
 				if (finalized) return;
 
 				if (done) {
-					eventBuffer += decoder.decode();
 					const missingEventDelimiter = takeBufferedEventDelimiter();
-					if (terminalDeltaSeen && !messageStopSeen) {
+					if (terminalDeltaSeen && !messageStopSeen && !recoveryDisabled) {
 						recover("eof", missingEventDelimiter);
 						return;
 					}
 
 					finalized = true;
 					clearRecoveryTimer();
+					frames = null;
 					if (messageStopSeen) {
 						appendMissingEventDelimiter(missingEventDelimiter);
 					}
@@ -252,6 +277,7 @@ export function createAnthropicTerminalRecoveryStream(
 				if (finalized) return;
 				finalized = true;
 				clearRecoveryTimer();
+				frames = null;
 				controller.error(error);
 			}
 		},
@@ -260,6 +286,7 @@ export function createAnthropicTerminalRecoveryStream(
 			if (finalized) return;
 			finalized = true;
 			clearRecoveryTimer();
+			frames = null;
 			return cancelUpstream(reason);
 		},
 	});

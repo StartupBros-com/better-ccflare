@@ -1,7 +1,9 @@
 import { beforeEach, describe, expect, it } from "bun:test";
 import { SessionAffinityStrategy } from "@better-ccflare/load-balancer";
+import { logBus } from "@better-ccflare/logger";
 import type {
 	Account,
+	LogEvent,
 	RequestMeta,
 	StrategyStore,
 } from "@better-ccflare/types";
@@ -136,6 +138,234 @@ describe("SessionAffinityStrategy", () => {
 		expect(opusOwner).not.toBe(fableOwner);
 		expect((await strategy.select(accounts, fableMeta))[0].id).toBe(fableOwner);
 		expect((await strategy.select(accounts, opusMeta))[0].id).toBe(opusOwner);
+	});
+
+	describe("lane-scoped candidate failure suppression", () => {
+		it("never logs caller-derived affinity values while preserving suppression and fail-open", async () => {
+			const secret = "session-secret/path?model=opus&beta=private";
+			const primary = makeAccount({ id: "primary", priority: 0 });
+			const fallback = makeAccount({ id: "fallback", priority: 1 });
+			const laneMeta = {
+				...metaFor(secret),
+				affinityLaneKey: `${secret}:anthropic:opus`,
+			} as RequestMeta;
+			const events: LogEvent[] = [];
+			const capture = (event: LogEvent) => events.push(event);
+			logBus.on("log", capture);
+
+			try {
+				expect(
+					(await strategy.select([primary, fallback], laneMeta))[0].id,
+				).toBe("primary");
+				strategy.reportCandidateFailure(laneMeta, {
+					candidateId: "account:primary",
+					reason: "semantic_stream_stall",
+					suppressForMs: 60_000,
+				});
+				expect(
+					(await strategy.select([primary, fallback], laneMeta))[0].id,
+				).toBe("fallback");
+				strategy.reportCandidateFailure(laneMeta, {
+					candidateId: "account:fallback",
+					reason: "semantic_stream_stall",
+					suppressForMs: 60_000,
+				});
+
+				// With every candidate suppressed, availability still wins and the
+				// strategy deliberately fails open using its normal candidate order.
+				expect(
+					(await strategy.select([primary, fallback], laneMeta)).map(
+						(account) => account.id,
+					),
+				).toEqual(["primary", "fallback"]);
+			} finally {
+				logBus.off("log", capture);
+			}
+
+			expect(strategy.routeSuppressionEntries).toBe(2);
+			expect(events.length).toBeGreaterThanOrEqual(3);
+			expect(JSON.stringify(events)).not.toContain(secret);
+		});
+
+		it("temporarily omits the failed candidate for the same affinity lane", async () => {
+			const primary = makeAccount({ id: "primary", priority: 0 });
+			const fallback = makeAccount({ id: "fallback", priority: 1 });
+			const laneMeta = {
+				...metaFor("same-client"),
+				affinityLaneKey: "same-client:anthropic:opus",
+			} as RequestMeta;
+
+			expect((await strategy.select([primary, fallback], laneMeta))[0].id).toBe(
+				"primary",
+			);
+
+			strategy.reportCandidateFailure(laneMeta, {
+				candidateId: "account:primary",
+				reason: "semantic_stream_stall",
+				suppressForMs: 60_000,
+			});
+
+			expect((await strategy.select([primary, fallback], laneMeta))[0].id).toBe(
+				"fallback",
+			);
+		});
+
+		it("does not suppress the failed candidate in another model lane", async () => {
+			const primary = makeAccount({ id: "primary", priority: 0 });
+			const fallback = makeAccount({ id: "fallback", priority: 1 });
+			const opusMeta = {
+				...metaFor("same-client"),
+				affinityLaneKey: "same-client:anthropic:opus",
+			} as RequestMeta;
+			const fableMeta = {
+				...metaFor("same-client"),
+				affinityLaneKey: "same-client:anthropic:fable",
+			} as RequestMeta;
+
+			await strategy.select([primary, fallback], opusMeta);
+			strategy.reportCandidateFailure(opusMeta, {
+				candidateId: "account:primary",
+				reason: "semantic_stream_stall",
+				suppressForMs: 60_000,
+			});
+
+			expect(
+				(await strategy.select([primary, fallback], fableMeta))[0].id,
+			).toBe("primary");
+		});
+
+		it("suppresses only the failed combo candidate when a sibling uses the same account", async () => {
+			const shared = makeAccount({ id: "shared" });
+			const laneMeta = {
+				...metaFor("same-client"),
+				affinityLaneKey: "same-client:anthropic:opus",
+				routingCandidates: [
+					{
+						candidateId: "combo:c1:slot:primary",
+						accountId: "shared",
+						tier: 0,
+						ordinal: 0,
+						comboSlotId: "slot-primary",
+						modelOverride: "claude-opus-4-8",
+						quotaPressure: null,
+					},
+					{
+						candidateId: "combo:c1:slot:sibling",
+						accountId: "shared",
+						tier: 1,
+						ordinal: 1,
+						comboSlotId: "slot-sibling",
+						modelOverride: "claude-opus-4-8",
+						quotaPressure: null,
+					},
+				],
+			} as RequestMeta;
+
+			await strategy.select([shared, shared], laneMeta);
+			strategy.reportCandidateFailure(laneMeta, {
+				candidateId: "combo:c1:slot:primary",
+				reason: "semantic_stream_stall",
+				suppressForMs: 60_000,
+			});
+			await strategy.select([shared, shared], laneMeta);
+
+			expect(laneMeta.routingCandidates?.[0]?.candidateId).toBe(
+				"combo:c1:slot:sibling",
+			);
+		});
+
+		it("restores the preferred candidate after suppression expires", async () => {
+			const primary = makeAccount({ id: "primary", priority: 0 });
+			const fallback = makeAccount({ id: "fallback", priority: 1 });
+			const laneMeta = {
+				...metaFor("same-client"),
+				affinityLaneKey: "same-client:anthropic:opus",
+			} as RequestMeta;
+
+			await strategy.select([primary, fallback], laneMeta);
+			strategy.reportCandidateFailure(laneMeta, {
+				candidateId: "account:primary",
+				reason: "semantic_stream_stall",
+				suppressForMs: 40,
+			});
+			expect((await strategy.select([primary, fallback], laneMeta))[0].id).toBe(
+				"fallback",
+			);
+
+			const startedAt = Date.now();
+			while (Date.now() - startedAt < 60) {
+				/* wait past the deliberately tiny suppression window */
+			}
+
+			expect((await strategy.select([primary, fallback], laneMeta))[0].id).toBe(
+				"primary",
+			);
+		});
+
+		it("fails open when every otherwise-available candidate is suppressed", async () => {
+			const primary = makeAccount({ id: "primary", priority: 0 });
+			const fallback = makeAccount({ id: "fallback", priority: 1 });
+			const laneMeta = {
+				...metaFor("same-client"),
+				affinityLaneKey: "same-client:anthropic:opus",
+			} as RequestMeta;
+
+			await strategy.select([primary, fallback], laneMeta);
+			for (const candidateId of ["account:primary", "account:fallback"]) {
+				strategy.reportCandidateFailure(laneMeta, {
+					candidateId,
+					reason: "semantic_stream_stall",
+					suppressForMs: 60_000,
+				});
+			}
+
+			const result = await strategy.select([primary, fallback], laneMeta);
+			expect(result.map((account) => account.id)).toEqual([
+				"primary",
+				"fallback",
+			]);
+		});
+
+		it("does nothing when the request has no affinity key", async () => {
+			const primary = makeAccount({ id: "primary", priority: 0 });
+			const fallback = makeAccount({ id: "fallback", priority: 1 });
+			const unscopedMeta = metaFor(null);
+
+			strategy.reportCandidateFailure(unscopedMeta, {
+				candidateId: "account:primary",
+				reason: "semantic_stream_stall",
+				suppressForMs: 60_000,
+			});
+
+			expect(strategy.routeSuppressionEntries).toBe(0);
+			expect(
+				(await strategy.select([primary, fallback], unscopedMeta))[0].id,
+			).toBe("primary");
+		});
+
+		it("bounds retained suppression state", () => {
+			const bounded = new SessionAffinityStrategy(
+				undefined,
+				undefined,
+				undefined,
+				2,
+			);
+			for (let index = 0; index < 5; index++) {
+				bounded.reportCandidateFailure(
+					{
+						...metaFor(`client-${index}`),
+						affinityLaneKey: `client-${index}:anthropic:opus`,
+					} as RequestMeta,
+					{
+						candidateId: `account:${index}`,
+						reason: "semantic_stream_stall",
+						suppressForMs: 60_000,
+					},
+				);
+			}
+
+			expect(bounded.routeSuppressionEntries).toBe(2);
+		});
 	});
 
 	it("replaces a sticky lower-priority owner when a better tier becomes routable", async () => {

@@ -25,15 +25,26 @@ import type {
 	RateLimitReason,
 	RequestMeta,
 } from "@better-ccflare/types";
+import {
+	AnthropicPreCommitAbortedError,
+	AnthropicPreCommitStallError,
+	gateAnthropicSsePreCommit,
+	getAnthropicStreamRuntimeConfig,
+	isNativeAnthropicMessagesSse,
+} from "../anthropic-semantic-preflight";
 import { cacheBodyStore } from "../cache-body-store";
 import { RequestBodyContext } from "../request-body-context";
-import { forwardToClient } from "../response-handler";
+import {
+	forwardToClient,
+	handleAnthropicSseRateLimit,
+} from "../response-handler";
 import {
 	recordServedAccount,
 	sessionIdForObservation,
 } from "../session-account-observer";
 import { combineChunks } from "../stream-tee";
 import { isModelRewrite } from "../worker-messages";
+import { GUARD_REQUEST_ID_HEADER } from "./internal-transport-headers";
 import { ERROR_MESSAGES, type ProxyContext } from "./proxy-types";
 import { applyRateLimitCooldown } from "./rate-limit-cooldown";
 import {
@@ -51,6 +62,7 @@ const SYNTHETIC_RESPONSE_HEADER = "x-better-ccflare-synthetic-response";
 const SYNTHETIC_STATUS_HEADER = "x-better-ccflare-synthetic-status";
 const SYNTHETIC_RESPONSE_URL_PREFIX = "https://better-ccflare.local/";
 const INTERNAL_TRANSPORT_HEADERS = [
+	GUARD_REQUEST_ID_HEADER,
 	"x-better-ccflare-request-id",
 	"x-better-ccflare-attempt-id",
 	"x-better-ccflare-attempt-ordinal",
@@ -109,6 +121,8 @@ export interface ContextAdmissionTracker {
  * disabled so one planned candidate cannot jump ahead of the remaining queue.
  */
 export interface ModelFallbackExecutionPolicy {
+	/** Immutable ID of the exact route candidate being executed. */
+	readonly routeCandidateId: string;
 	readonly deferImplicitFallback?: (
 		model: string,
 		fallbackRank: number,
@@ -1011,6 +1025,7 @@ export async function proxyUnauthenticated(
 			headers,
 			createBodyStream,
 			!!req.body,
+			req.signal,
 		);
 
 		return forwardToClient(
@@ -1039,6 +1054,7 @@ export async function proxyUnauthenticated(
 			ctx,
 		);
 	} catch (error) {
+		if (req.signal.aborted) throw error;
 		logError(error, log);
 		throw new ProviderError(
 			ERROR_MESSAGES.UNAUTHENTICATED_FAILED,
@@ -1081,6 +1097,15 @@ export async function proxyWithAccount(
 	routingAttemptLedger?: RoutingAttemptLedger,
 	modelFallbackPolicy?: ModelFallbackExecutionPolicy,
 ): Promise<Response | null> {
+	const makeAttemptRequest = (request: Request): Promise<Response> =>
+		makeProxyRequest(
+			request,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			req.signal,
+		);
 	try {
 		if (
 			process.env.DEBUG?.includes("proxy") ||
@@ -1535,7 +1560,7 @@ export async function proxyWithAccount(
 		// Make the request (or unwrap a synthetic provider response)
 		let rawResponse = isSyntheticProviderResponse(transformedRequest)
 			? materializeSyntheticResponse(transformedRequest)
-			: await makeProxyRequest(transformedRequest);
+			: await makeAttemptRequest(transformedRequest);
 
 		// Check if this is a Claude provider and we got an invalid thinking signature error
 		if (
@@ -1577,7 +1602,7 @@ export async function proxyWithAccount(
 				// Make the retry request (or unwrap a synthetic provider response)
 				rawResponse = isSyntheticProviderResponse(retryTransformedRequest)
 					? materializeSyntheticResponse(retryTransformedRequest)
-					: await makeProxyRequest(retryTransportRequest);
+					: await makeAttemptRequest(retryTransportRequest);
 			} else {
 				log.warn(
 					"Failed to filter thinking blocks or no changes made, proceeding with original error response",
@@ -1624,7 +1649,7 @@ export async function proxyWithAccount(
 				);
 				rawResponse = isSyntheticProviderResponse(retryTransformedRequest)
 					? materializeSyntheticResponse(retryTransformedRequest)
-					: await makeProxyRequest(retryTransportRequest);
+					: await makeAttemptRequest(retryTransportRequest);
 			} else {
 				log.warn(
 					"No clear_thinking context edits to strip or filtering failed, proceeding with original error response",
@@ -1681,7 +1706,7 @@ export async function proxyWithAccount(
 				}
 				rawResponse = isSyntheticProviderResponse(retryRequest)
 					? materializeSyntheticResponse(retryRequest)
-					: await makeProxyRequest(retryRequest);
+					: await makeAttemptRequest(retryRequest);
 			} catch (err) {
 				log.warn("Failed to retry without cache_control:", err);
 			}
@@ -2385,7 +2410,7 @@ export async function proxyWithAccount(
 					// execute. A failed patch must leave it on the previous model.
 					rawResponse = isSyntheticProviderResponse(retryTransformedRequest)
 						? materializeSyntheticResponse(retryTransformedRequest)
-						: await makeProxyRequest(retryTransportRequest);
+						: await makeAttemptRequest(retryTransportRequest);
 					rawFailureClassification = await handleRawAttemptFailure(
 						rawResponse,
 						nextModel,
@@ -2608,7 +2633,7 @@ export async function proxyWithAccount(
 						}
 						const retryRaw = isSyntheticProviderResponse(retryTransport)
 							? materializeSyntheticResponse(retryTransport.clone())
-							: await makeProxyRequest(retryTransport);
+							: await makeAttemptRequest(retryTransport);
 						const retryFailureClassification = await handleRawAttemptFailure(
 							retryRaw,
 							currentTransportModel || effectiveBodyContext.getModel(),
@@ -2696,6 +2721,102 @@ export async function proxyWithAccount(
 			routingAttemptLedger?.blockAccount(account.id);
 			await discardUnusedResponse(response, "auth_failed_401_after_retry");
 			return null;
+		}
+
+		// Native Anthropic can return HTTP 200 and a structural SSE prelude, then
+		// stop before producing any user-visible content. Classify its rate-limit
+		// headers first, without cloning the body: processProxyResponse starts a
+		// background usage clone for successful streams, and that tee sibling would
+		// make cancellation of a pre-commit stall wait indefinitely. Keep the body
+		// accessor lazy too: in Bun, merely reading Response.body before a later
+		// classification clone can disturb the retained original branch. Once the
+		// header-only predicate proves this is eligible, hold the structural prelude
+		// behind the only safe replay boundary. A real content/thinking/tool delta
+		// releases the original bytes unchanged and commits this route.
+		const isNativeAnthropicMessagesStream = isNativeAnthropicMessagesSse({
+			method: req.method,
+			path: url.pathname,
+			providerName: provider.name,
+			requestHeaders: req.headers,
+			response,
+		});
+		const nativeAnthropicResponseBody = isNativeAnthropicMessagesStream
+			? response.body
+			: null;
+		const nativeAnthropicHeadersAreRateLimited =
+			isNativeAnthropicMessagesStream &&
+			provider.parseRateLimit(response).isRateLimited;
+		if (
+			isNativeAnthropicMessagesStream &&
+			!nativeAnthropicHeadersAreRateLimited &&
+			nativeAnthropicResponseBody
+		) {
+			const streamConfig = getAnthropicStreamRuntimeConfig();
+			try {
+				const gatedBody = await gateAnthropicSsePreCommit(
+					nativeAnthropicResponseBody,
+					{
+						semanticTimeoutMs: streamConfig.semanticTimeoutMs,
+						terminalGraceMs: streamConfig.terminalGraceMs,
+						maxBufferedBytes: streamConfig.maxBufferedBytes,
+						signal: req.signal,
+					},
+				);
+				response = new Response(gatedBody, {
+					status: response.status,
+					statusText: response.statusText,
+					headers: response.headers,
+				});
+			} catch (error) {
+				if (
+					req.signal.aborted ||
+					error instanceof AnthropicPreCommitAbortedError
+				) {
+					throw error;
+				}
+				if (!(error instanceof AnthropicPreCommitStallError)) throw error;
+
+				const candidateId = modelFallbackPolicy?.routeCandidateId ?? null;
+				const failureReason = error.errorType
+					? `anthropic_precommit_${error.reason}:${error.errorType}`
+					: `anthropic_precommit_${error.reason}`;
+				log.warn("anthropic_precommit_stall", {
+					requestId: requestMeta.id,
+					accountId: account.id,
+					candidateId,
+					attemptedModel: currentTransportModel,
+					affinityLanePresent: requestMeta.affinityLaneKey != null,
+					reason: error.reason,
+					errorType: error.errorType ?? null,
+					bufferedBytes: error.bufferedBytes,
+					framesSeen: error.framesSeen,
+					terminalEvidenceSeen: error.terminalEvidenceSeen,
+					limitBytes: error.limitBytes ?? null,
+					semanticTimeoutMs: streamConfig.semanticTimeoutMs,
+					terminalGraceMs: streamConfig.terminalGraceMs,
+				});
+				if (
+					error.errorType === "rate_limit_error" ||
+					error.errorType === "overloaded_error"
+				) {
+					handleAnthropicSseRateLimit(
+						account,
+						currentTransportModel,
+						error.errorType,
+						response,
+						requestMeta.id,
+						{ ...ctx, provider },
+					);
+				}
+				if (candidateId) {
+					ctx.strategy.reportCandidateFailure?.(requestMeta, {
+						candidateId,
+						reason: failureReason,
+						suppressForMs: streamConfig.routeSuppressionMs,
+					});
+				}
+				return null;
+			}
 		}
 
 		// Check for rate limit using account-specific provider. A terminal response
@@ -2857,10 +2978,15 @@ export async function proxyWithAccount(
 				cacheFlightRecorderEligible,
 				cacheFlightRecorderNativeActive:
 					requestMeta.xaiCacheNativeActive === true,
+				routeCandidateId: modelFallbackPolicy?.routeCandidateId ?? null,
+				routingMeta: requestMeta,
 			},
 			{ ...ctx, provider },
 		);
 	} catch (err) {
+		if (req.signal.aborted || err instanceof AnthropicPreCommitAbortedError) {
+			throw err;
+		}
 		handleProxyError(err, account, log);
 		return null;
 	}

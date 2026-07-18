@@ -249,7 +249,7 @@ export function updateAccountMetadata(
 					releaseUnconsumedClone(usageClone);
 				}
 			})();
-		} else if (ctx.provider.extractUsageInfo) {
+		} else if (!isStream && ctx.provider.extractUsageInfo) {
 			const extractUsageInfo = ctx.provider.extractUsageInfo.bind(ctx.provider);
 			const usageClone = response.clone() as Response;
 			(async () => {

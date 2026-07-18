@@ -1,10 +1,14 @@
+/** Private hop-by-hop request correlation installed by ccflare-guard. */
+export const GUARD_REQUEST_ID_HEADER =
+	"x-better-ccflare-guard-request-id" as const;
+
 /**
  * Sanitizes proxy headers by removing hop-by-hop headers that should not be forwarded
  * after Bun has automatically decompressed the response body, and reserved,
  * guard-trusted headers that must never originate from an upstream provider.
  *
  * Removes: content-encoding, content-length, transfer-encoding,
- * x-better-ccflare-pool-status
+ * x-better-ccflare-pool-status, x-better-ccflare-guard-request-id
  */
 export function sanitizeProxyHeaders(original: Headers): Headers {
 	const sanitized = new Headers(original);
@@ -23,6 +27,11 @@ export function sanitizeProxyHeaders(original: Headers): Headers {
 	// request, or falsely deny an actual pool-exhaustion retry.
 	sanitized.delete("x-better-ccflare-pool-status");
 
+	// Defense in depth: the proxy does not intentionally put the guard's private
+	// request header on responses, and an upstream must not be able to introduce
+	// a same-named value that the client or guard could mistake for internal state.
+	sanitized.delete(GUARD_REQUEST_ID_HEADER);
+
 	return sanitized;
 }
 
@@ -32,7 +41,7 @@ export function sanitizeProxyHeaders(original: Headers): Headers {
  * analytics.
  *
  * Removes: accept-encoding, content-encoding, transfer-encoding, content-length,
- * authorization, x-api-key, cookie
+ * authorization, x-api-key, cookie, x-better-ccflare-guard-request-id
  */
 export function sanitizeRequestHeaders(original: Headers): Headers {
 	const h = new Headers(original);
@@ -44,6 +53,9 @@ export function sanitizeRequestHeaders(original: Headers): Headers {
 	h.delete("authorization");
 	h.delete("x-api-key");
 	h.delete("cookie");
+	// This hop-local join key is useful in live structured logs only. Persisting it
+	// with request payload metadata would unnecessarily widen its trust boundary.
+	h.delete(GUARD_REQUEST_ID_HEADER);
 	return h;
 }
 

@@ -1,4 +1,5 @@
 import { describe, expect, it, mock } from "bun:test";
+import { BUFFER_SIZES } from "@better-ccflare/core";
 import {
 	ANTHROPIC_MESSAGE_STOP_FRAME,
 	createAnthropicTerminalRecoveryStream,
@@ -40,6 +41,8 @@ const terminalDelta =
 	'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":42}}\n\n';
 const messageStop = 'event: message_stop\ndata: {"type":"message_stop"}\n\n';
 const ping = 'event: ping\ndata: {"type":"ping"}\n\n';
+const error =
+	'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"upstream failed"}}\n\n';
 
 describe("createAnthropicTerminalRecoveryStream", () => {
 	it("leaves a healthy stream byte-for-byte unchanged", async () => {
@@ -166,6 +169,77 @@ describe("createAnthropicTerminalRecoveryStream", () => {
 		source.controller().close();
 
 		await expect(result).resolves.toBe(`${terminalDelta}${messageStop}`);
+		expect(onRecovery).not.toHaveBeenCalled();
+		expect(source.cancel).not.toHaveBeenCalled();
+	});
+
+	it("disables recovery after an over-policy undelimited tail", async () => {
+		const source = controllableStream();
+		const onRecovery = mock(() => undefined);
+		const oversizedTail = "x".repeat(
+			BUFFER_SIZES.SSE_TRANSPORT_TAIL_MAX_BYTES + 1,
+		);
+		const original = `${terminalDelta}${oversizedTail}`;
+		const body = createAnthropicTerminalRecoveryStream(source.stream, {
+			gracePeriodMs: 40,
+			onRecovery,
+		});
+		const result = new Response(body).text();
+
+		source.controller().enqueue(bytes(terminalDelta));
+		for (let offset = 0; offset < oversizedTail.length; offset += 16 * 1024) {
+			source
+				.controller()
+				.enqueue(bytes(oversizedTail.slice(offset, offset + 16 * 1024)));
+		}
+		setTimeout(() => {
+			try {
+				source.controller().close();
+			} catch {
+				// A broken implementation may close/cancel early; keep this regression
+				// isolated so its timer cannot fail a later test.
+			}
+		}, 80);
+
+		await expect(result).resolves.toBe(original);
+		expect(onRecovery).not.toHaveBeenCalled();
+		expect(source.cancel).not.toHaveBeenCalled();
+	}, 10_000);
+
+	it("treats an SSE error after terminal delta as terminal at EOF", async () => {
+		const original = `${terminalDelta}${error}`;
+		const onRecovery = mock(() => undefined);
+		const body = createAnthropicTerminalRecoveryStream(
+			immediateStream([bytes(original)]),
+			{ gracePeriodMs: 5, onRecovery },
+		);
+
+		await expect(new Response(body).text()).resolves.toBe(original);
+		expect(onRecovery).not.toHaveBeenCalled();
+	});
+
+	it("recognizes a split SSE error and keeps recovery disabled past grace", async () => {
+		const source = controllableStream();
+		const onRecovery = mock(() => undefined);
+		const body = createAnthropicTerminalRecoveryStream(source.stream, {
+			gracePeriodMs: 20,
+			onRecovery,
+		});
+		const result = new Response(body).text();
+
+		source.controller().enqueue(bytes(terminalDelta));
+		for (const byte of bytes(error)) {
+			source.controller().enqueue(new Uint8Array([byte]));
+		}
+		setTimeout(() => {
+			try {
+				source.controller().close();
+			} catch {
+				// See the over-policy test above.
+			}
+		}, 40);
+
+		await expect(result).resolves.toBe(`${terminalDelta}${error}`);
 		expect(onRecovery).not.toHaveBeenCalled();
 		expect(source.cancel).not.toHaveBeenCalled();
 	});

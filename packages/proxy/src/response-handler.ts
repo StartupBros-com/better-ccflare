@@ -12,10 +12,13 @@ import type {
 	RateLimitReason,
 	RequestMeta,
 } from "@better-ccflare/types";
+import { createAnthropicSemanticLivenessStream } from "./anthropic-semantic-liveness";
 import {
-	ANTHROPIC_TERMINAL_RECOVERY_GRACE_MS,
-	createAnthropicTerminalRecoveryStream,
-} from "./anthropic-terminal-recovery";
+	getAnthropicStreamRuntimeConfig,
+	isNativeAnthropicMessagesSse,
+} from "./anthropic-semantic-preflight";
+import { AnthropicStreamOutcomeTracker } from "./anthropic-stream-outcome";
+import { createAnthropicTerminalRecoveryStream } from "./anthropic-terminal-recovery";
 import type { ProxyContext } from "./handlers";
 import { applyRateLimitCooldown } from "./handlers/rate-limit-cooldown";
 import { classifyPreByte429 } from "./handlers/rate-limit-scope";
@@ -70,7 +73,7 @@ function getMidStreamRateLimitCooldownMs(): number {
  * emitted, retrying another account would splice two upstream responses into
  * one protocol stream. The marker affects only subsequent routing decisions.
  */
-function handleMidStreamRateLimit(
+export function handleAnthropicSseRateLimit(
 	account: Account,
 	attemptedModel: string | null,
 	firedReason: "rate_limit_error" | "overloaded_error",
@@ -221,6 +224,10 @@ export interface ResponseHandlerOptions {
 	cacheFlightRecorderNativeActive?: boolean;
 	/** Concrete provider model used for this final upstream attempt. */
 	attemptedModel?: string | null;
+	/** Immutable identity of the exact route that produced this response. */
+	routeCandidateId?: string | null;
+	/** Internal routing context used only for lane-local failure suppression. */
+	routingMeta?: RequestMeta;
 }
 
 /**
@@ -261,6 +268,8 @@ export async function forwardToClient(
 		cacheFlightRecorderEligible,
 		cacheFlightRecorderNativeActive,
 		attemptedModel = null,
+		routeCandidateId = null,
+		routingMeta,
 	} = options;
 
 	// Record which account actually served this session's request, keyed on the
@@ -403,72 +412,58 @@ export async function forwardToClient(
 		const rateLimitSniffer = account
 			? createSseRateLimitSniffer({ provider: account.provider })
 			: null;
-
-		const onChunk = (value: Uint8Array): void => {
-			if (shouldProcessRequest) {
-				getUsageCollector().handleChunk(requestId, value);
-			}
-
-			// Mid-stream rate-limit detection. The sniffer
-			// fires exactly once; after that feed() is a no-op.
-			if (account && rateLimitSniffer?.feed(value)) {
-				const firedReason = rateLimitSniffer.firedReason;
-				if (firedReason) {
-					handleMidStreamRateLimit(
-						account,
-						attemptedModel,
-						firedReason,
-						response,
-						requestId,
-						ctx,
-					);
-				}
-			}
-		};
-
-		const onClose = (_buffered: Uint8Array[]): void => {
-			if (shouldProcessRequest) {
-				const endMsg: EndMessage = {
-					type: "end",
-					requestId,
-					success: isExpectedResponse(path, response),
-				};
-				// Fire-and-forget: handleEnd is async for DB writes but we don't block streaming
-				fireAndForgetEnd(endMsg);
-			}
-		};
-
-		const onError = (err: Error): void => {
-			if (shouldProcessRequest) {
-				const endMsg: EndMessage = {
-					type: "end",
-					requestId,
-					success: false,
-					error: err.message,
-				};
-				fireAndForgetEnd(endMsg);
-			}
-		};
-
-		const isNativeAnthropicMessagesStream =
-			method === "POST" &&
-			path === "/v1/messages" &&
-			ctx.provider.name === "anthropic" &&
-			requestHeaders.has("anthropic-version") &&
-			response.ok &&
-			response.headers
-				.get("content-type")
-				?.toLowerCase()
-				.includes("text/event-stream");
+		const isNativeAnthropicMessagesStream = isNativeAnthropicMessagesSse({
+			method,
+			path,
+			providerName: ctx.provider.name,
+			requestHeaders,
+			response,
+		});
+		const anthropicStreamConfig = isNativeAnthropicMessagesStream
+			? getAnthropicStreamRuntimeConfig()
+			: null;
+		const semanticallyBoundedBody =
+			isNativeAnthropicMessagesStream && anthropicStreamConfig
+				? createAnthropicSemanticLivenessStream(response.body, {
+						semanticTimeoutMs: anthropicStreamConfig.semanticTimeoutMs,
+						onTimeout() {
+							log.warn("anthropic_postcommit_semantic_timeout", {
+								requestId,
+								accountId: account?.id ?? null,
+								candidateId: routeCandidateId,
+								attemptedModel,
+								affinityLanePresent: routingMeta?.affinityLaneKey != null,
+								semanticTimeoutMs: anthropicStreamConfig.semanticTimeoutMs,
+								streamReplayed: false,
+							});
+							if (routeCandidateId && routingMeta) {
+								ctx.strategy.reportCandidateFailure?.(routingMeta, {
+									candidateId: routeCandidateId,
+									reason: "anthropic_postcommit_semantic_timeout",
+									suppressForMs: anthropicStreamConfig.routeSuppressionMs,
+								});
+							}
+						},
+						onCancelError(error) {
+							log.warn("anthropic_postcommit_upstream_cancel_failed", {
+								requestId,
+								accountId: account?.id ?? null,
+								candidateId: routeCandidateId,
+								errorType: error instanceof Error ? error.name : typeof error,
+							});
+						},
+					})
+				: response.body;
 		const responseBody = isNativeAnthropicMessagesStream
-			? createAnthropicTerminalRecoveryStream(response.body, {
+			? createAnthropicTerminalRecoveryStream(semanticallyBoundedBody, {
+					gracePeriodMs: anthropicStreamConfig?.terminalGraceMs,
 					onRecovery(reason) {
 						log.warn("anthropic_terminal_message_stop_recovered", {
 							requestId,
 							accountId: account?.id ?? null,
 							provider: ctx.provider.name,
 							reason,
-							gracePeriodMs: ANTHROPIC_TERMINAL_RECOVERY_GRACE_MS,
+							gracePeriodMs: anthropicStreamConfig?.terminalGraceMs,
 						});
 					},
 					onCancelError(error, reason) {
@@ -481,12 +476,137 @@ export async function forwardToClient(
 						});
 					},
 				})
-			: response.body;
+			: semanticallyBoundedBody;
+		// Observe the recovered stream so a safely synthesized message_stop is
+		// terminal evidence just like the real upstream event it replaces.
+		const anthropicOutcomeTracker = isNativeAnthropicMessagesStream
+			? new AnthropicStreamOutcomeTracker()
+			: null;
+
+		const onChunk = (value: Uint8Array): void => {
+			anthropicOutcomeTracker?.push(value);
+			if (shouldProcessRequest) {
+				getUsageCollector().handleChunk(requestId, value);
+			}
+
+			// Mid-stream rate-limit detection. The sniffer
+			// fires exactly once; after that feed() is a no-op.
+			if (account && rateLimitSniffer?.feed(value)) {
+				const firedReason = rateLimitSniffer.firedReason;
+				if (firedReason) {
+					handleAnthropicSseRateLimit(
+						account,
+						attemptedModel,
+						firedReason,
+						response,
+						requestId,
+						ctx,
+					);
+				}
+			}
+		};
+
+		let streamTerminalHandled = false;
+		const finishStream = (
+			termination:
+				| { kind: "close" }
+				| { kind: "error"; error: Error }
+				| { kind: "cancel" },
+		): void => {
+			if (streamTerminalHandled) return;
+			streamTerminalHandled = true;
+
+			const anthropicOutcome = anthropicOutcomeTracker?.finish();
+			if (shouldProcessRequest) {
+				let success: boolean;
+				let error: string | undefined;
+
+				// Protocol evidence is authoritative for native Anthropic streams:
+				// an SSE error event always fails safely, while message_stop completes
+				// the response even if the still-open transport later errors or is
+				// cancelled. Before either boundary, preserve the transport outcome.
+				if (anthropicOutcome?.status === "midstream_error") {
+					success = false;
+					error = `anthropic_midstream_error:${anthropicOutcome.errorType ?? "unknown_error"}`;
+				} else if (anthropicOutcome?.status === "completed") {
+					success = true;
+					error = undefined;
+				} else if (termination.kind === "error") {
+					success = false;
+					error = termination.error.message;
+				} else if (termination.kind === "cancel") {
+					success = false;
+					error = "downstream_cancelled";
+				} else {
+					success = anthropicOutcome
+						? false
+						: isExpectedResponse(path, response);
+					error =
+						anthropicOutcome?.status === "incomplete_eof"
+							? "anthropic_incomplete_eof"
+							: undefined;
+				}
+
+				const endMsg: EndMessage = {
+					type: "end",
+					requestId,
+					success,
+					...(error ? { error } : {}),
+				};
+				// Fire-and-forget: handleEnd is async for DB writes but we don't block streaming
+				fireAndForgetEnd(endMsg);
+			}
+
+			if (anthropicOutcome) {
+				const outcomeLog = {
+					requestId,
+					accountId: account?.id ?? null,
+					provider: ctx.provider.name,
+					transportTermination: termination.kind,
+					status: anthropicOutcome.status,
+					terminalEvidence: anthropicOutcome.terminalEvidence,
+					parseState: anthropicOutcome.parseState,
+					limitKind: anthropicOutcome.limitKind ?? null,
+					errorType: anthropicOutcome.errorType ?? null,
+					messageStopSeen: anthropicOutcome.messageStopSeen,
+					errorEventSeen: anthropicOutcome.errorEventSeen,
+					truncatedTailSeen: anthropicOutcome.truncatedTailSeen,
+					chunkCount: anthropicOutcome.chunkCount,
+					rawByteCount: anthropicOutcome.rawByteCount,
+					frameCount: anthropicOutcome.frameCount,
+					eventCount: anthropicOutcome.eventCount,
+					commentFrameCount: anthropicOutcome.commentFrameCount,
+					pingEventCount: anthropicOutcome.pingEventCount,
+					unknownEventCount: anthropicOutcome.unknownEventCount,
+					malformedEventCount: anthropicOutcome.malformedEventCount,
+					messageStopCount: anthropicOutcome.messageStopCount,
+					errorEventCount: anthropicOutcome.errorEventCount,
+				};
+				if (anthropicOutcome.status === "completed") {
+					log.info("anthropic_stream_terminal_outcome", outcomeLog);
+				} else {
+					log.warn("anthropic_stream_terminal_outcome", outcomeLog);
+				}
+			}
+		};
+
+		const onClose = (_buffered: Uint8Array[]): void => {
+			finishStream({ kind: "close" });
+		};
+
+		const onError = (err: Error): void => {
+			finishStream({ kind: "error", error: err });
+		};
+
+		const onCancel = (_reason: unknown): void => {
+			finishStream({ kind: "cancel" });
+		};
 
 		const passthroughBody = teeStream(responseBody, {
 			onChunk,
 			onClose,
 			onError,
+			onCancel,
 		});
 
 		return new Response(passthroughBody, {
@@ -570,6 +690,15 @@ export async function forwardToClient(
 				requestId,
 				success: false,
 				error: err.message,
+			});
+		},
+		onCancel() {
+			if (!shouldProcessRequest) return;
+			fireAndForgetEnd({
+				type: "end",
+				requestId,
+				success: false,
+				error: "downstream_cancelled",
 			});
 		},
 	});

@@ -274,10 +274,12 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 					],
 				}),
 			).buffer;
-			await proxyWithAccount(
+			const response = await proxyWithAccount(
 				makeMessagesRequest(bodyBuffer, {
 					"Content-Type": "application/json",
 					"x-better-ccflare-attributed-agent": "false",
+					"x-better-ccflare-guard-request-id":
+						"76110a75-9e91-4ab9-89a7-3e5d25a318fc",
 				}),
 				new URL("https://proxy.local/v1/messages"),
 				makeCodexAccount({
@@ -293,6 +295,9 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 				0,
 				makeProxyContext(),
 			);
+			expect(
+				response?.headers.get("x-better-ccflare-guard-request-id"),
+			).toBeNull();
 		} finally {
 			collectorSpy.mockRestore();
 		}
@@ -301,6 +306,9 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 		expect(fetchedRequest).not.toBeNull();
 		expect(
 			fetchedRequest?.headers.get("x-better-ccflare-attributed-agent"),
+		).toBeNull();
+		expect(
+			fetchedRequest?.headers.get("x-better-ccflare-guard-request-id"),
 		).toBeNull();
 		const upstreamBody = await fetchedRequest?.clone().json();
 		expect(upstreamBody.tools).toEqual([]);
@@ -990,6 +998,8 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 	it("strips every internal transport header from passthrough headers", () => {
 		const headers = new Headers({
 			authorization: "Bearer public-upstream-token",
+			"x-better-ccflare-guard-request-id":
+				"76110a75-9e91-4ab9-89a7-3e5d25a318fc",
 			"x-better-ccflare-request-id": "req-internal",
 			"x-better-ccflare-pacing-canary": "bypass",
 			"x-better-ccflare-pacing-cohort-id": "cohort",
@@ -1000,6 +1010,7 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 		const sanitized = sanitizeInternalHeaders(headers);
 		expect(sanitized.get("authorization")).toBe("Bearer public-upstream-token");
 		for (const name of [
+			"x-better-ccflare-guard-request-id",
 			"x-better-ccflare-request-id",
 			"x-better-ccflare-pacing-canary",
 			"x-better-ccflare-pacing-cohort-id",

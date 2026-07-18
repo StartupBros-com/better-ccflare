@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 
-import { sanitizeProxyHeaders, withSanitizedProxyHeaders } from "../headers";
+import {
+	sanitizeProxyHeaders,
+	sanitizeRequestHeaders,
+	withSanitizedProxyHeaders,
+} from "../headers";
 
 // P1 spoofing (proxy side): x-better-ccflare-pool-status is a reserved,
 // guard-trusted signal. If an upstream provider response could carry it
@@ -47,5 +51,32 @@ describe("withSanitizedProxyHeaders", () => {
 
 		expect(sanitized.headers.has("x-better-ccflare-pool-status")).toBe(false);
 		expect(sanitized.status).toBe(503);
+	});
+});
+
+describe("guard request correlation privacy", () => {
+	const header = "x-better-ccflare-guard-request-id";
+	const guardId = "76110a75-9e91-4ab9-89a7-3e5d25a318fc";
+
+	test("does not persist the private guard ID in request analytics", () => {
+		const original = new Headers({
+			"content-type": "application/json",
+			[header]: guardId,
+		});
+
+		const sanitized = sanitizeRequestHeaders(original);
+
+		expect(sanitized.has(header)).toBe(false);
+		expect(sanitized.get("content-type")).toBe("application/json");
+	});
+
+	test("does not expose a same-named upstream response header to clients", () => {
+		const upstream = new Response("body", {
+			headers: { [header]: guardId },
+		});
+
+		const sanitized = withSanitizedProxyHeaders(upstream);
+
+		expect(sanitized.headers.has(header)).toBe(false);
 	});
 });

@@ -37,6 +37,7 @@ export const DEFAULT_GUARD_DELAY_INSPECTION_TIMEOUT_MS = 5_000;
 // evaluateGuardRetry's docstring in ccflare-guard-policy.mjs for the
 // rationale.
 export const DEFAULT_GUARD_ALLOW_LEGACY_POOL_BODY = false;
+export const GUARD_REQUEST_ID_HEADER = "x-better-ccflare-guard-request-id";
 
 const HOP_BY_HOP_HEADERS = new Set([
 	"connection",
@@ -178,7 +179,7 @@ function combineAbortSignals(signals) {
 	};
 }
 
-function requestHeaders(req, bodyLength) {
+function requestHeaders(req, bodyLength, guardRequestId) {
 	const headers = new Headers();
 	for (const [key, value] of Object.entries(req.headers)) {
 		const lower = key.toLowerCase();
@@ -192,6 +193,9 @@ function requestHeaders(req, bodyLength) {
 		if (Array.isArray(value)) headers.set(key, value.join(", "));
 		else if (value != null) headers.set(key, String(value));
 	}
+	// This listener is the trust boundary for the private correlation header.
+	// Always overwrite a client-supplied value with this request's UUID.
+	headers.set(GUARD_REQUEST_ID_HEADER, guardRequestId);
 	if (bodyLength > 0) headers.set("content-length", String(bodyLength));
 	return headers;
 }
@@ -257,6 +261,65 @@ function responseBodyIdleTimeoutError() {
 	const error = new Error("upstream response body idle timeout");
 	error.code = "GUARD_RESPONSE_IDLE_TIMEOUT";
 	return error;
+}
+
+function createRawResponseTelemetry(attemptStartedAt, now) {
+	let rawResponseChunkCount = 0;
+	let rawResponseBytes = 0;
+	let firstChunkAt = null;
+	let lastChunkAt = null;
+	let maxInterChunkGapMs = 0;
+
+	return {
+		record(chunk) {
+			const observedAt = now();
+			if (firstChunkAt == null) firstChunkAt = observedAt;
+			if (lastChunkAt != null) {
+				maxInterChunkGapMs = Math.max(
+					maxInterChunkGapMs,
+					Math.max(0, observedAt - lastChunkAt),
+				);
+			}
+			lastChunkAt = observedAt;
+			rawResponseChunkCount += 1;
+			rawResponseBytes += chunk?.byteLength ?? chunk?.length ?? 0;
+		},
+		snapshot() {
+			const observedAt = now();
+			return {
+				rawResponseChunkCount,
+				rawResponseBytes,
+				firstBodyByteMs:
+					firstChunkAt == null
+						? null
+						: Math.max(0, firstChunkAt - attemptStartedAt),
+				maxInterChunkGapMs,
+				lastChunkAgeMs:
+					lastChunkAt == null ? null : Math.max(0, observedAt - lastChunkAt),
+			};
+		},
+	};
+}
+
+function withRawResponseTelemetry(response, telemetry) {
+	if (!response.body) return response;
+	const body = response.body.pipeThrough(
+		new TransformStream({
+			transform(chunk, controller) {
+				telemetry.record(chunk);
+				controller.enqueue(chunk);
+			},
+		}),
+	);
+	return new Response(body, {
+		status: response.status,
+		statusText: response.statusText,
+		headers: response.headers,
+	});
+}
+
+function rawResponseTelemetryFields(telemetry) {
+	return telemetry ? telemetry.snapshot() : {};
 }
 
 function responseBodyIdleWatchdog(timeoutMs, onTimeout) {
@@ -713,10 +776,16 @@ export function createGuard(options = {}) {
 		});
 	}
 
-	async function fetchUpstream(req, body, signal, upstreamTarget) {
+	async function fetchUpstream(
+		req,
+		body,
+		signal,
+		upstreamTarget,
+		guardRequestId,
+	) {
 		const init = {
 			method: req.method,
-			headers: requestHeaders(req, body.length),
+			headers: requestHeaders(req, body.length, guardRequestId),
 			redirect: "manual",
 			signal,
 		};
@@ -823,7 +892,7 @@ export function createGuard(options = {}) {
 		);
 	}
 
-	function handleAbort(error, res, context, attempt) {
+	function handleAbort(error, res, context, attempt, responseTelemetry) {
 		const elapsedMs = now() - context.acceptedAt;
 		if (
 			context.abortCause === "deadline" ||
@@ -854,13 +923,20 @@ export function createGuard(options = {}) {
 				id: context.id,
 				attempt,
 				elapsedMs,
+				...rawResponseTelemetryFields(responseTelemetry),
 			});
 			return true;
 		}
 		return false;
 	}
 
-	function handleResponseBodyIdleTimeout(error, res, context, attempt) {
+	function handleResponseBodyIdleTimeout(
+		error,
+		res,
+		context,
+		attempt,
+		responseTelemetry,
+	) {
 		if (error?.code !== "GUARD_RESPONSE_IDLE_TIMEOUT") return false;
 		counters.responseBodyIdleTimeouts += 1;
 		log("response_body_idle_timeout", {
@@ -868,6 +944,7 @@ export function createGuard(options = {}) {
 			attempt,
 			elapsedMs: now() - context.acceptedAt,
 			responseIdleTimeoutMs,
+			...rawResponseTelemetryFields(responseTelemetry),
 		});
 		if (!res.destroyed) res.destroy(error);
 		return true;
@@ -904,6 +981,7 @@ export function createGuard(options = {}) {
 		const { id } = context;
 		counters.total += 1;
 		let attempt = 0;
+		let responseTelemetry = null;
 		try {
 			while (true) {
 				context.ensureBudget();
@@ -934,11 +1012,16 @@ export function createGuard(options = {}) {
 						return;
 					}
 					attempt += 1;
-					upstreamResponse = await fetchUpstream(
-						req,
-						body,
-						context.signal,
-						upstreamTarget,
+					responseTelemetry = createRawResponseTelemetry(now(), now);
+					upstreamResponse = withRawResponseTelemetry(
+						await fetchUpstream(
+							req,
+							body,
+							context.signal,
+							upstreamTarget,
+							id,
+						),
+						responseTelemetry,
 					);
 				} catch (error) {
 					lease.release();
@@ -977,6 +1060,7 @@ export function createGuard(options = {}) {
 						outcome,
 						queuedMs: lease.queuedMs,
 						elapsedMs: now() - context.acceptedAt,
+						...rawResponseTelemetryFields(responseTelemetry),
 					});
 					return;
 				}
@@ -1202,9 +1286,24 @@ export function createGuard(options = {}) {
 				return;
 			}
 		} catch (error) {
-			if (handleResponseBodyIdleTimeout(error, res, context, attempt)) return;
-			if (handleAbort(error, res, context, attempt)) return;
-			log("proxy_exception", { id, attempt, message: error.message });
+			if (
+				handleResponseBodyIdleTimeout(
+					error,
+					res,
+					context,
+					attempt,
+					responseTelemetry,
+				)
+			) {
+				return;
+			}
+			if (handleAbort(error, res, context, attempt, responseTelemetry)) return;
+			log("proxy_exception", {
+				id,
+				attempt,
+				message: error.message,
+				...rawResponseTelemetryFields(responseTelemetry),
+			});
 			if (res.headersSent) {
 				res.destroy(error);
 			} else {
@@ -1220,13 +1319,19 @@ export function createGuard(options = {}) {
 	}
 
 	async function handlePassthrough(req, res, body, context, upstreamTarget) {
+		let responseTelemetry = null;
 		try {
 			context.ensureBudget();
-			const upstreamResponse = await fetchUpstream(
-				req,
-				body,
-				context.signal,
-				upstreamTarget,
+			responseTelemetry = createRawResponseTelemetry(now(), now);
+			const upstreamResponse = withRawResponseTelemetry(
+				await fetchUpstream(
+					req,
+					body,
+					context.signal,
+					upstreamTarget,
+					context.id,
+				),
+				responseTelemetry,
 			);
 			await sendFinalResponse(
 				res,
@@ -1235,8 +1340,24 @@ export function createGuard(options = {}) {
 				responseIdleTimeoutMs,
 			);
 		} catch (error) {
-			if (handleResponseBodyIdleTimeout(error, res, context, 1)) return;
-			if (handleAbort(error, res, context, 1)) return;
+			if (
+				handleResponseBodyIdleTimeout(
+					error,
+					res,
+					context,
+					1,
+					responseTelemetry,
+				)
+			) {
+				return;
+			}
+			if (handleAbort(error, res, context, 1, responseTelemetry)) return;
+			log("proxy_exception", {
+				id: context.id,
+				attempt: 1,
+				message: error.message,
+				...rawResponseTelemetryFields(responseTelemetry),
+			});
 			if (res.headersSent) {
 				res.destroy(error);
 			} else {
@@ -1315,7 +1436,7 @@ export function createGuard(options = {}) {
 		try {
 			body = await readBody(req, context.signal);
 		} catch (error) {
-			if (!handleAbort(error, res, context, 0)) {
+			if (!handleAbort(error, res, context, 0, null)) {
 				sendJsonError(
 					res,
 					context,

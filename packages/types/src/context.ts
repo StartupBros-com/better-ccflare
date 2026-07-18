@@ -10,6 +10,19 @@ import type { ApiKey } from "./api-key";
 import type { IntegrityStatus } from "./stats";
 import type { StrategyStore } from "./strategy";
 
+/**
+ * A request-lane-local failure of one exact routing candidate.
+ *
+ * `candidateId` deliberately identifies the immutable route candidate rather
+ * than its backing account: combo slots may share one account while carrying
+ * different models, tiers, or quota policy.
+ */
+export interface RoutingCandidateFailureReport {
+	candidateId: string;
+	reason: string;
+	suppressForMs: number;
+}
+
 // API context for HTTP handlers
 export interface APIContext {
 	db: BunSqlAdapter;
@@ -87,6 +100,15 @@ export interface LoadBalancingStrategy {
 	 * no resumeAccount, no resetSession, no internal counters).
 	 */
 	peek(accounts: Account[]): string | null;
+
+	/**
+	 * Optionally suppress one exact routing candidate for the request's affinity
+	 * lane. Implementations must not turn this into global account health state.
+	 */
+	reportCandidateFailure?(
+		meta: RequestMeta,
+		failure: RoutingCandidateFailureReport,
+	): void;
 
 	/**
 	 * Optional initialization method to inject dependencies

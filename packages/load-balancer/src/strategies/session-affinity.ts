@@ -9,6 +9,7 @@ import type {
 	Account,
 	LoadBalancingStrategy,
 	RequestMeta,
+	RoutingCandidateFailureReport,
 	StrategyStore,
 } from "@better-ccflare/types";
 import { isPeekAvailable, wouldAutoUnpause } from "./peek-availability";
@@ -47,6 +48,13 @@ const RECENT_PICK_PENALTY = 100;
  * this; the cap only ever bites pathological input.
  */
 const MAX_AFFINITY_ENTRIES = 10_000;
+
+/**
+ * Hard cap for transient lane→candidate suppressions. A caller-controlled
+ * lane key must not be able to grow process memory without bound.
+ */
+const MAX_ROUTE_SUPPRESSION_ENTRIES = 10_000;
+const MAX_DATE_TIME_MS = 8_640_000_000_000_000;
 
 /**
  * SessionAffinityStrategy — a hybrid of SessionStrategy and LeastUsedStrategy.
@@ -94,6 +102,7 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 	private affinityTtlMs: number;
 	private maxAffinityEntries: number;
 	private antiThrashWindowMs: number;
+	private maxRouteSuppressionEntries: number;
 	private store: StrategyStore | null = null;
 	private log = new Logger("SessionAffinityStrategy");
 	/** clientId → which account it is stuck to (and when it was last touched). */
@@ -113,15 +122,28 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 	>();
 	/** accountId → last time it was freshly assigned to a NEW client-session. */
 	private lastPickedAt = new Map<string, number>();
+	/** Exact lane+candidate failures; intentionally separate from account health. */
+	private routeSuppressions = new Map<
+		string,
+		{
+			affinityKey: string;
+			candidateId: string;
+			reason: string;
+			reportedAt: number;
+			expiresAt: number;
+		}
+	>();
 
 	constructor(
 		affinityTtlMs: number = TIME_CONSTANTS.ANTHROPIC_SESSION_DURATION_DEFAULT,
 		maxAffinityEntries: number = MAX_AFFINITY_ENTRIES,
 		antiThrashWindowMs: number = getSessionAffinityAntiThrashWindowMs(),
+		maxRouteSuppressionEntries: number = MAX_ROUTE_SUPPRESSION_ENTRIES,
 	) {
 		this.affinityTtlMs = affinityTtlMs;
 		this.maxAffinityEntries = maxAffinityEntries;
 		this.antiThrashWindowMs = antiThrashWindowMs;
+		this.maxRouteSuppressionEntries = maxRouteSuppressionEntries;
 	}
 
 	/** Live sticky-mapping count — read-only, for tests and ops metrics. */
@@ -129,8 +151,88 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 		return this.affinity.size;
 	}
 
+	/** Live lane-scoped candidate suppression count — read-only for tests/ops. */
+	get routeSuppressionEntries(): number {
+		return this.routeSuppressions.size;
+	}
+
 	initialize(store: StrategyStore): void {
 		this.store = store;
+	}
+
+	private affinityKey(meta: RequestMeta): string | null {
+		const laneKey = meta.affinityLaneKey ?? null;
+		if (laneKey !== null) return `lane:${laneKey}`;
+		const clientId = meta.clientSessionId ?? null;
+		return clientId !== null ? `client:${clientId}` : null;
+	}
+
+	private routeSuppressionKey(
+		affinityKey: string,
+		candidateId: string,
+	): string {
+		// JSON tuple encoding prevents separator collisions in caller-controlled ids.
+		return JSON.stringify([affinityKey, candidateId]);
+	}
+
+	private gcExpiredRouteSuppressions(now: number): void {
+		for (const [key, suppression] of this.routeSuppressions) {
+			if (now >= suppression.expiresAt) this.routeSuppressions.delete(key);
+		}
+	}
+
+	private evictOldestRouteSuppressionIfFull(): void {
+		if (this.routeSuppressions.size < this.maxRouteSuppressionEntries) return;
+		let oldestKey: string | null = null;
+		let oldestAt = Number.POSITIVE_INFINITY;
+		for (const [key, suppression] of this.routeSuppressions) {
+			if (suppression.reportedAt < oldestAt) {
+				oldestAt = suppression.reportedAt;
+				oldestKey = key;
+			}
+		}
+		if (oldestKey !== null) this.routeSuppressions.delete(oldestKey);
+	}
+
+	reportCandidateFailure(
+		meta: RequestMeta,
+		failure: RoutingCandidateFailureReport,
+	): void {
+		const affinityKey = this.affinityKey(meta);
+		if (
+			affinityKey === null ||
+			failure.candidateId.length === 0 ||
+			!Number.isFinite(failure.suppressForMs) ||
+			failure.suppressForMs <= 0 ||
+			this.maxRouteSuppressionEntries <= 0
+		) {
+			return;
+		}
+
+		const now = Date.now();
+		this.gcExpiredRouteSuppressions(now);
+		const key = this.routeSuppressionKey(affinityKey, failure.candidateId);
+		if (!this.routeSuppressions.has(key)) {
+			this.evictOldestRouteSuppressionIfFull();
+		}
+		const expiresAt = Math.min(
+			MAX_DATE_TIME_MS,
+			now + Math.max(1, Math.floor(failure.suppressForMs)),
+		);
+		this.routeSuppressions.set(key, {
+			affinityKey,
+			candidateId: failure.candidateId,
+			reason: failure.reason,
+			reportedAt: now,
+			expiresAt,
+		});
+		this.log.info("Route candidate temporarily suppressed", {
+			candidateId: failure.candidateId,
+			reason: failure.reason,
+			expiresAt: new Date(expiresAt).toISOString(),
+			routeSuppressionCount: this.routeSuppressions.size,
+			affinityLanePresent: meta.affinityLaneKey != null,
+		});
 	}
 
 	/**
@@ -229,6 +331,8 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 
 	async select(accounts: Account[], meta: RequestMeta): Promise<Account[]> {
 		const now = Date.now();
+		this.gcExpiredRouteSuppressions(now);
+		const affinityKey = this.affinityKey(meta);
 		const configuredCandidates = zipStrategyCandidates(accounts, meta);
 		const candidates = filterHardExcludedCandidates(configuredCandidates, meta);
 
@@ -241,11 +345,44 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 			now,
 		);
 
-		const available = candidates.filter((candidate) =>
+		const otherwiseAvailable = candidates.filter((candidate) =>
 			isAccountAvailable(candidate.account, now),
 		);
-		if (available.length === 0) {
+		if (otherwiseAvailable.length === 0) {
 			return commitStrategyCandidateOrder([], meta);
+		}
+
+		const unsuppressedAvailable =
+			affinityKey === null
+				? otherwiseAvailable
+				: otherwiseAvailable.filter(
+						(candidate) =>
+							!this.routeSuppressions.has(
+								this.routeSuppressionKey(
+									affinityKey,
+									candidate.routing.candidateId,
+								),
+							),
+					);
+		// Availability wins over suppression: if every candidate in this lane has
+		// failed recently, retry the normal ordering rather than manufacture a 503.
+		const available =
+			unsuppressedAvailable.length > 0
+				? unsuppressedAvailable
+				: otherwiseAvailable;
+		if (
+			affinityKey !== null &&
+			unsuppressedAvailable.length === 0 &&
+			otherwiseAvailable.length > 0
+		) {
+			this.log.info(
+				"Every available route candidate is suppressed; failing open",
+				{
+					availableCandidateCount: otherwiseAvailable.length,
+					routeSuppressionCount: this.routeSuppressions.size,
+					affinityLanePresent: meta.affinityLaneKey != null,
+				},
+			);
 		}
 
 		// GC expired affinity entries so the map doesn't grow unboundedly and so
@@ -256,15 +393,6 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 				this.affinity.delete(clientId);
 			}
 		}
-
-		const laneKey = meta.affinityLaneKey ?? null;
-		const clientId = meta.clientSessionId ?? null;
-		const affinityKey =
-			laneKey !== null
-				? `lane:${laneKey}`
-				: clientId !== null
-					? `client:${clientId}`
-					: null;
 
 		// Existing, non-expired client-session: try to honour its sticky mapping.
 		if (affinityKey !== null) {
@@ -291,9 +419,11 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 						now,
 						meta,
 					);
-					this.log.debug(
-						`Sticky route ${affinityKey} → ${mapped.account.name}/${mapped.routing.candidateId} (${others.length} fallback(s))`,
-					);
+					this.log.debug("Sticky route selected", {
+						candidateId: mapped.routing.candidateId,
+						fallbackCount: others.length,
+						affinityLanePresent: meta.affinityLaneKey != null,
+					});
 					return commitStrategyCandidateOrder([mapped, ...others], meta);
 				}
 
@@ -316,9 +446,14 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 							now,
 							meta,
 						);
-						this.log.info(
-							`Route ${affinityKey} upgrade to ${best.routing.candidateId} suppressed (anti-thrash until ${new Date(mapping.suppressUpgradesUntil as number).toISOString()}), keeping ${mapped.routing.candidateId}`,
-						);
+						this.log.info("Route upgrade suppressed by anti-thrash window", {
+							upgradeCandidateId: best.routing.candidateId,
+							currentCandidateId: mapped.routing.candidateId,
+							suppressUpgradesUntil: new Date(
+								mapping.suppressUpgradesUntil as number,
+							).toISOString(),
+							affinityLanePresent: meta.affinityLaneKey != null,
+						});
 						return commitStrategyCandidateOrder(
 							[mapped, ...others],
 							meta,
@@ -336,9 +471,11 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 						mapping.upgradedAt = now;
 						mapping.suppressUpgradesUntil = null;
 					}
-					this.log.info(
-						`Route ${affinityKey} owner ${mapped.routing.candidateId} was outclassed — remapped to ${replacement?.routing.candidateId ?? best.routing.candidateId}`,
-					);
+					this.log.info("Outclassed route owner remapped", {
+						candidateId:
+							replacement?.routing.candidateId ?? best.routing.candidateId,
+						affinityLanePresent: meta.affinityLaneKey != null,
+					});
 					return commitStrategyCandidateOrder(ordered, meta);
 				}
 
@@ -401,7 +538,14 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 							mapping.assignedAt = now;
 							mapping.upgradedAt = null;
 							this.log.info(
-								`Route ${affinityKey} upgraded owner failed inside the anti-thrash window, suppressing further upgrades until ${new Date(mapping.suppressUpgradesUntil).toISOString()}, settled on ${fallback.routing.candidateId}`,
+								"Upgraded route owner failed inside anti-thrash window",
+								{
+									candidateId: fallback.routing.candidateId,
+									suppressUpgradesUntil: new Date(
+										mapping.suppressUpgradesUntil,
+									).toISOString(),
+									affinityLanePresent: meta.affinityLaneKey != null,
+								},
 							);
 						}
 						return commitStrategyCandidateOrder(ordered, meta);
@@ -414,15 +558,20 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 						// failover does not expire the better-tier owner mapping.
 						mapping.assignedAt = now;
 						this.log.info(
-							`Route ${affinityKey} better-tier owner ${mapping.candidateId} is temporarily unavailable — preserving for snapback`,
+							"Better-tier route owner unavailable; preserving for snapback",
+							{
+								candidateId: mapping.candidateId,
+								affinityLanePresent: meta.affinityLaneKey != null,
+							},
 						);
 					} else if (fallback) {
 						mapping.candidateId = fallback.routing.candidateId;
 						mapping.assignedAt = now;
 						mapping.upgradedAt = null;
-						this.log.info(
-							`Route ${affinityKey} unavailable equal/worse owner remapped to ${fallback.routing.candidateId}`,
-						);
+						this.log.info("Unavailable equal/worse route owner remapped", {
+							candidateId: fallback.routing.candidateId,
+							affinityLanePresent: meta.affinityLaneKey != null,
+						});
 					}
 					return commitStrategyCandidateOrder(ordered, meta);
 				}
@@ -443,9 +592,10 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 				upgradedAt: null,
 				suppressUpgradesUntil: null,
 			});
-			this.log.debug(
-				`Assigned route ${affinityKey} → ${chosen.account.name}/${chosen.routing.candidateId} (least-used)`,
-			);
+			this.log.debug("Least-used route owner assigned", {
+				candidateId: chosen.routing.candidateId,
+				affinityLanePresent: meta.affinityLaneKey != null,
+			});
 		}
 
 		return commitStrategyCandidateOrder(ranked, meta);
