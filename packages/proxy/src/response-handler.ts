@@ -15,7 +15,7 @@ import type {
 import { createAnthropicSemanticLivenessStream } from "./anthropic-semantic-liveness";
 import {
 	getAnthropicStreamRuntimeConfig,
-	isNativeAnthropicMessagesSse,
+	isDownstreamAnthropicMessagesSse,
 } from "./anthropic-semantic-preflight";
 import { AnthropicStreamOutcomeTracker } from "./anthropic-stream-outcome";
 import { createAnthropicTerminalRecoveryStream } from "./anthropic-terminal-recovery";
@@ -412,18 +412,19 @@ export async function forwardToClient(
 		const rateLimitSniffer = account
 			? createSseRateLimitSniffer({ provider: account.provider })
 			: null;
-		const isNativeAnthropicMessagesStream = isNativeAnthropicMessagesSse({
-			method,
-			path,
-			providerName: ctx.provider.name,
-			requestHeaders,
-			response,
-		});
-		const anthropicStreamConfig = isNativeAnthropicMessagesStream
+		const isDownstreamAnthropicMessagesStream =
+			isDownstreamAnthropicMessagesSse({
+				method,
+				path,
+				requestHeaders,
+				response,
+			});
+		const anthropicStreamConfig = isDownstreamAnthropicMessagesStream
 			? getAnthropicStreamRuntimeConfig()
 			: null;
+		let anthropicCleanTerminalSuccessSeen = false;
 		const semanticallyBoundedBody =
-			isNativeAnthropicMessagesStream && anthropicStreamConfig
+			isDownstreamAnthropicMessagesStream && anthropicStreamConfig
 				? createAnthropicSemanticLivenessStream(response.body, {
 						semanticTimeoutMs: anthropicStreamConfig.semanticTimeoutMs,
 						onTimeout() {
@@ -444,6 +445,29 @@ export async function forwardToClient(
 								});
 							}
 						},
+						onTransientUpstreamError(errorType) {
+							log.warn("anthropic_postcommit_transient_sse_error", {
+								requestId,
+								accountId: account?.id ?? null,
+								candidateId: routeCandidateId,
+								attemptedModel,
+								affinityLanePresent: routingMeta?.affinityLaneKey != null,
+								errorType,
+								streamReplayed: false,
+							});
+							if (routeCandidateId && routingMeta) {
+								ctx.strategy.reportCandidateFailure?.(routingMeta, {
+									candidateId: routeCandidateId,
+									reason: `anthropic_postcommit_transient_sse_error:${errorType}`,
+									suppressForMs: anthropicStreamConfig.routeSuppressionMs,
+								});
+							}
+						},
+						onTerminalSuccess() {
+							// This is evidence from the pre-recovery stream: a real,
+							// well-formed message_stop followed by clean upstream EOF.
+							anthropicCleanTerminalSuccessSeen = true;
+						},
 						onCancelError(error) {
 							log.warn("anthropic_postcommit_upstream_cancel_failed", {
 								requestId,
@@ -454,7 +478,7 @@ export async function forwardToClient(
 						},
 					})
 				: response.body;
-		const responseBody = isNativeAnthropicMessagesStream
+		const responseBody = isDownstreamAnthropicMessagesStream
 			? createAnthropicTerminalRecoveryStream(semanticallyBoundedBody, {
 					gracePeriodMs: anthropicStreamConfig?.terminalGraceMs,
 					onRecovery(reason) {
@@ -479,7 +503,7 @@ export async function forwardToClient(
 			: semanticallyBoundedBody;
 		// Observe the recovered stream so a safely synthesized message_stop is
 		// terminal evidence just like the real upstream event it replaces.
-		const anthropicOutcomeTracker = isNativeAnthropicMessagesStream
+		const anthropicOutcomeTracker = isDownstreamAnthropicMessagesStream
 			? new AnthropicStreamOutcomeTracker()
 			: null;
 
@@ -517,6 +541,19 @@ export async function forwardToClient(
 			streamTerminalHandled = true;
 
 			const anthropicOutcome = anthropicOutcomeTracker?.finish();
+			if (
+				termination.kind === "close" &&
+				anthropicCleanTerminalSuccessSeen &&
+				anthropicOutcome?.status === "completed" &&
+				anthropicOutcome.parseState === "clean" &&
+				!anthropicOutcome.truncatedTailSeen &&
+				routeCandidateId &&
+				routingMeta
+			) {
+				ctx.strategy.reportCandidateSuccess?.(routingMeta, {
+					candidateId: routeCandidateId,
+				});
+			}
 			if (shouldProcessRequest) {
 				let success: boolean;
 				let error: string | undefined;

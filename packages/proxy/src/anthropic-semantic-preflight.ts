@@ -42,12 +42,16 @@ export interface AnthropicStreamRuntimeConfig {
 	routeSuppressionMs: number;
 }
 
-export interface NativeAnthropicMessagesSseInput {
+export interface DownstreamAnthropicMessagesSseInput {
 	method: string;
 	path: string;
-	providerName: string;
 	requestHeaders: Headers;
 	response: Response;
+}
+
+export interface NativeAnthropicMessagesSseInput
+	extends DownstreamAnthropicMessagesSseInput {
+	providerName: string;
 }
 
 function boundedEnvInteger(
@@ -94,24 +98,39 @@ export function getAnthropicStreamRuntimeConfig(): AnthropicStreamRuntimeConfig 
 	};
 }
 
-/** One shared protocol predicate for both the pre-commit gate and recovery. */
-export function isNativeAnthropicMessagesSse({
+/**
+ * Whether the response exposed to the client speaks Anthropic Messages SSE.
+ *
+ * This deliberately describes the downstream protocol, not the upstream
+ * provider. OpenAI-compatible providers transform their raw SSE before this
+ * boundary, so their transformed streams need the same semantic commitment
+ * and liveness guarantees as native Anthropic streams.
+ */
+export function isDownstreamAnthropicMessagesSse({
 	method,
 	path,
-	providerName,
 	requestHeaders,
 	response,
-}: NativeAnthropicMessagesSseInput): boolean {
+}: DownstreamAnthropicMessagesSseInput): boolean {
 	return (
 		method === "POST" &&
 		path === "/v1/messages" &&
-		providerName === "anthropic" &&
 		requestHeaders.has("anthropic-version") &&
 		response.ok &&
 		response.headers
 			.get("content-type")
 			?.toLowerCase()
 			.includes("text/event-stream") === true
+	);
+}
+
+/** Native-provider refinement for raw-response header/cooldown policy only. */
+export function isNativeAnthropicMessagesSse(
+	input: NativeAnthropicMessagesSseInput,
+): boolean {
+	return (
+		input.providerName === "anthropic" &&
+		isDownstreamAnthropicMessagesSse(input)
 	);
 }
 

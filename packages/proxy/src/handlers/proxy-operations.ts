@@ -25,11 +25,13 @@ import type {
 	RateLimitReason,
 	RequestMeta,
 } from "@better-ccflare/types";
+import type { AnthropicPreCommitRescueRouteContext } from "../anthropic-precommit-rescue";
 import {
 	AnthropicPreCommitAbortedError,
 	AnthropicPreCommitStallError,
 	gateAnthropicSsePreCommit,
 	getAnthropicStreamRuntimeConfig,
+	isDownstreamAnthropicMessagesSse,
 	isNativeAnthropicMessagesSse,
 } from "../anthropic-semantic-preflight";
 import { cacheBodyStore } from "../cache-body-store";
@@ -123,6 +125,8 @@ export interface ContextAdmissionTracker {
 export interface ModelFallbackExecutionPolicy {
 	/** Immutable ID of the exact route candidate being executed. */
 	readonly routeCandidateId: string;
+	/** Request-scoped Anthropic downstream rescue; absent for ordinary routing. */
+	readonly anthropicPreCommitRescue?: AnthropicPreCommitRescueRouteContext;
 	readonly deferImplicitFallback?: (
 		model: string,
 		fallbackRank: number,
@@ -1097,15 +1101,23 @@ export async function proxyWithAccount(
 	routingAttemptLedger?: RoutingAttemptLedger,
 	modelFallbackPolicy?: ModelFallbackExecutionPolicy,
 ): Promise<Response | null> {
-	const makeAttemptRequest = (request: Request): Promise<Response> =>
-		makeProxyRequest(
+	const routingSignal =
+		modelFallbackPolicy?.anthropicPreCommitRescue?.signal ?? req.signal;
+	const makeAttemptRequest = (request: Request): Promise<Response> => {
+		// The outer context exists only for an Anthropic-shaped downstream request.
+		// Any real provider transport can hang before headers (including transformed
+		// OpenAI-compatible routes), so start rescue immediately before every fetch.
+		// Synthetic provider responses never call this wrapper and remain synchronous.
+		modelFallbackPolicy?.anthropicPreCommitRescue?.activate();
+		return makeProxyRequest(
 			request,
 			undefined,
 			undefined,
 			undefined,
 			undefined,
-			req.signal,
+			routingSignal,
 		);
+	};
 	try {
 		if (
 			process.env.DEBUG?.includes("proxy") ||
@@ -1558,7 +1570,8 @@ export async function proxyWithAccount(
 		let retryTransformedTemplate = transformedRequestForRetry;
 
 		// Make the request (or unwrap a synthetic provider response)
-		let rawResponse = isSyntheticProviderResponse(transformedRequest)
+		const isSyntheticResponse = isSyntheticProviderResponse(transformedRequest);
+		let rawResponse = isSyntheticResponse
 			? materializeSyntheticResponse(transformedRequest)
 			: await makeAttemptRequest(transformedRequest);
 
@@ -2723,16 +2736,24 @@ export async function proxyWithAccount(
 			return null;
 		}
 
-		// Native Anthropic can return HTTP 200 and a structural SSE prelude, then
-		// stop before producing any user-visible content. Classify its rate-limit
-		// headers first, without cloning the body: processProxyResponse starts a
-		// background usage clone for successful streams, and that tee sibling would
-		// make cancellation of a pre-commit stall wait indefinitely. Keep the body
-		// accessor lazy too: in Bun, merely reading Response.body before a later
-		// classification clone can disturb the retained original branch. Once the
-		// header-only predicate proves this is eligible, hold the structural prelude
-		// behind the only safe replay boundary. A real content/thinking/tool delta
-		// releases the original bytes unchanged and commits this route.
+		// At this boundary provider.processResponse has already converted any
+		// OpenAI-compatible upstream stream to downstream Anthropic Messages SSE.
+		// Hold every such stream behind the same semantic replay boundary: a
+		// transformed message_start/ping prelude is no more safe to expose than a
+		// native one. Raw provider SSE is never parsed by the Anthropic classifier.
+		//
+		// Keep native Anthropic header-based rate-limit policy separate and ahead of
+		// body access. processProxyResponse starts a background usage clone for
+		// successful streams, and that tee sibling would make cancellation of a
+		// pre-commit stall wait indefinitely. In Bun, merely reading Response.body
+		// before a later classification clone can also disturb the retained branch.
+		const isDownstreamAnthropicMessagesStream =
+			isDownstreamAnthropicMessagesSse({
+				method: req.method,
+				path: url.pathname,
+				requestHeaders: req.headers,
+				response,
+			});
 		const isNativeAnthropicMessagesStream = isNativeAnthropicMessagesSse({
 			method: req.method,
 			path: url.pathname,
@@ -2740,26 +2761,27 @@ export async function proxyWithAccount(
 			requestHeaders: req.headers,
 			response,
 		});
-		const nativeAnthropicResponseBody = isNativeAnthropicMessagesStream
+		const downstreamAnthropicResponseBody = isDownstreamAnthropicMessagesStream
 			? response.body
 			: null;
 		const nativeAnthropicHeadersAreRateLimited =
 			isNativeAnthropicMessagesStream &&
 			provider.parseRateLimit(response).isRateLimited;
 		if (
-			isNativeAnthropicMessagesStream &&
+			isDownstreamAnthropicMessagesStream &&
 			!nativeAnthropicHeadersAreRateLimited &&
-			nativeAnthropicResponseBody
+			downstreamAnthropicResponseBody
 		) {
 			const streamConfig = getAnthropicStreamRuntimeConfig();
+			modelFallbackPolicy?.anthropicPreCommitRescue?.activate();
 			try {
 				const gatedBody = await gateAnthropicSsePreCommit(
-					nativeAnthropicResponseBody,
+					downstreamAnthropicResponseBody,
 					{
 						semanticTimeoutMs: streamConfig.semanticTimeoutMs,
 						terminalGraceMs: streamConfig.terminalGraceMs,
 						maxBufferedBytes: streamConfig.maxBufferedBytes,
-						signal: req.signal,
+						signal: routingSignal,
 					},
 				);
 				response = new Response(gatedBody, {
@@ -2769,6 +2791,7 @@ export async function proxyWithAccount(
 				});
 			} catch (error) {
 				if (
+					routingSignal.aborted ||
 					req.signal.aborted ||
 					error instanceof AnthropicPreCommitAbortedError
 				) {
@@ -2984,7 +3007,11 @@ export async function proxyWithAccount(
 			{ ...ctx, provider },
 		);
 	} catch (err) {
-		if (req.signal.aborted || err instanceof AnthropicPreCommitAbortedError) {
+		if (
+			routingSignal.aborted ||
+			req.signal.aborted ||
+			err instanceof AnthropicPreCommitAbortedError
+		) {
 			throw err;
 		}
 		handleProxyError(err, account, log);
