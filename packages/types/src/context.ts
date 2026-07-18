@@ -23,6 +23,11 @@ export interface RoutingCandidateFailureReport {
 	suppressForMs: number;
 }
 
+/** A proven complete success for one exact request-lane route candidate. */
+export interface RoutingCandidateSuccessReport {
+	candidateId: string;
+}
+
 // API context for HTTP handlers
 export interface APIContext {
 	db: BunSqlAdapter;
@@ -108,6 +113,17 @@ export interface LoadBalancingStrategy {
 	reportCandidateFailure?(
 		meta: RequestMeta,
 		failure: RoutingCandidateFailureReport,
+	): void;
+
+	/**
+	 * Optionally close the circuit for one exact routing candidate in the
+	 * request's affinity lane. Callers must report only a proven complete
+	 * response (for Anthropic SSE, after a clean terminal `message_stop`), never
+	 * merely an HTTP 200 or a stream that emitted partial bytes.
+	 */
+	reportCandidateSuccess?(
+		meta: RequestMeta,
+		success: RoutingCandidateSuccessReport,
 	): void;
 
 	/**

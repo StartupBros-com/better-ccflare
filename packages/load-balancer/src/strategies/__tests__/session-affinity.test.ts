@@ -141,7 +141,7 @@ describe("SessionAffinityStrategy", () => {
 	});
 
 	describe("lane-scoped candidate failure suppression", () => {
-		it("never logs caller-derived affinity values while preserving suppression and fail-open", async () => {
+		it("never logs caller-derived affinity values while preserving suppression and a single half-open probe", async () => {
 			const secret = "session-secret/path?model=opus&beta=private";
 			const primary = makeAccount({ id: "primary", priority: 0 });
 			const fallback = makeAccount({ id: "fallback", priority: 1 });
@@ -168,16 +168,16 @@ describe("SessionAffinityStrategy", () => {
 				strategy.reportCandidateFailure(laneMeta, {
 					candidateId: "account:fallback",
 					reason: "semantic_stream_stall",
-					suppressForMs: 60_000,
+					suppressForMs: 120_000,
 				});
 
-				// With every candidate suppressed, availability still wins and the
-				// strategy deliberately fails open using its normal candidate order.
+				// With every candidate open, probe only the deterministic candidate
+				// whose circuit expires first. Never leak the full failed ordering.
 				expect(
 					(await strategy.select([primary, fallback], laneMeta)).map(
 						(account) => account.id,
 					),
-				).toEqual(["primary", "fallback"]);
+				).toEqual(["primary"]);
 			} finally {
 				logBus.off("log", capture);
 			}
@@ -274,56 +274,503 @@ describe("SessionAffinityStrategy", () => {
 			);
 		});
 
-		it("restores the preferred candidate after suppression expires", async () => {
+		it("single-flights an expired higher-priority probe ahead of a healthy fallback", async () => {
 			const primary = makeAccount({ id: "primary", priority: 0 });
 			const fallback = makeAccount({ id: "fallback", priority: 1 });
+			let now = Date.now();
+			const clocked = new SessionAffinityStrategy(
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				() => now,
+			);
+			clocked.initialize(store);
 			const laneMeta = {
 				...metaFor("same-client"),
 				affinityLaneKey: "same-client:anthropic:opus",
 			} as RequestMeta;
 
-			await strategy.select([primary, fallback], laneMeta);
-			strategy.reportCandidateFailure(laneMeta, {
+			await clocked.select([primary, fallback], laneMeta);
+			clocked.reportCandidateFailure(laneMeta, {
 				candidateId: "account:primary",
 				reason: "semantic_stream_stall",
-				suppressForMs: 40,
+				suppressForMs: 100,
 			});
-			expect((await strategy.select([primary, fallback], laneMeta))[0].id).toBe(
-				"fallback",
+			expect(
+				(await clocked.select([primary, fallback], laneMeta)).map(
+					(account) => account.id,
+				),
+			).toEqual(["fallback"]);
+			clocked.reportCandidateSuccess(laneMeta, {
+				candidateId: "account:fallback",
+			});
+
+			now += 100;
+			// The expired primary is strictly better than the healthy fallback. Its
+			// single-flight probe must be the first executable attempt, with fallback
+			// retained behind it so this same request can still recover.
+			expect(
+				(await clocked.select([primary, fallback], laneMeta)).map(
+					(account) => account.id,
+				),
+			).toEqual(["primary", "fallback"]);
+			// While that probe owns the lease, another request can still use the healthy
+			// fallback but must not launch a second primary probe.
+			expect(
+				(await clocked.select([primary, fallback], { ...laneMeta })).map(
+					(account) => account.id,
+				),
+			).toEqual(["fallback"]);
+
+			// A failed probe reopens only the primary at base x2; fallback remains
+			// executable both for this request and throughout the renewed backoff.
+			clocked.reportCandidateFailure(laneMeta, {
+				candidateId: "account:primary",
+				reason: "semantic_stream_stall",
+				suppressForMs: 100,
+			});
+			clocked.reportCandidateSuccess(laneMeta, {
+				candidateId: "account:fallback",
+			});
+			expect(
+				(await clocked.select([primary, fallback], laneMeta)).map(
+					(account) => account.id,
+				),
+			).toEqual(["fallback"]);
+			now += 199;
+			expect(
+				(await clocked.select([primary, fallback], laneMeta)).map(
+					(account) => account.id,
+				),
+			).toEqual(["fallback"]);
+			now += 1;
+			expect(
+				(await clocked.select([primary, fallback], laneMeta)).map(
+					(account) => account.id,
+				),
+			).toEqual(["primary", "fallback"]);
+
+			// Only a proven clean primary success closes its exact circuit. Normal
+			// priority/sticky routing then resumes without waiting for retained-state GC.
+			clocked.reportCandidateSuccess(laneMeta, {
+				candidateId: "account:primary",
+			});
+			expect(
+				(await clocked.select([primary, fallback], laneMeta)).map(
+					(account) => account.id,
+				),
+			).toEqual(["primary", "fallback"]);
+			expect(clocked.routeSuppressionEntries).toBe(0);
+		});
+
+		it("leases exactly one deterministic half-open probe across concurrent selects", async () => {
+			const primary = makeAccount({ id: "primary", priority: 0 });
+			const fallback = makeAccount({ id: "fallback", priority: 1 });
+			let now = Date.now();
+			const clocked = new SessionAffinityStrategy(
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				() => now,
+			);
+			clocked.initialize(store);
+			const laneMeta = {
+				...metaFor("same-client"),
+				affinityLaneKey: "same-client:anthropic:opus",
+			} as RequestMeta;
+
+			await clocked.select([primary, fallback], laneMeta);
+			clocked.reportCandidateFailure(laneMeta, {
+				candidateId: "account:primary",
+				reason: "semantic_stream_stall",
+				suppressForMs: 30 * 60_000,
+			});
+			clocked.reportCandidateFailure(laneMeta, {
+				candidateId: "account:fallback",
+				reason: "semantic_stream_stall",
+				suppressForMs: 60 * 60_000,
+			});
+
+			const results = await Promise.all([
+				clocked.select([primary, fallback], { ...laneMeta }),
+				clocked.select([primary, fallback], { ...laneMeta }),
+				clocked.select([primary, fallback], { ...laneMeta }),
+			]);
+			expect(
+				results.map((result) => result.map((account) => account.id)),
+			).toEqual([["primary"], [], []]);
+			expect(
+				await clocked.select([primary, fallback], { ...laneMeta }),
+			).toEqual([]);
+
+			// A lost request cannot hold the lane forever. The finite lease admits
+			// one new probe after ten minutes, still without exposing the full pool.
+			now += 10 * 60_000 - 1;
+			expect(
+				await clocked.select([primary, fallback], { ...laneMeta }),
+			).toEqual([]);
+			now += 1;
+			expect(
+				(await clocked.select([primary, fallback], { ...laneMeta })).map(
+					(account) => account.id,
+				),
+			).toEqual(["primary"]);
+		});
+
+		it("does not phantom-lease an eligible probe behind a closed sticky route", async () => {
+			const probeCandidate = makeAccount({ id: "probe-a", priority: 1 });
+			const stickyCandidate = makeAccount({ id: "sticky-b", priority: 0 });
+			let now = Date.now();
+			const clocked = new SessionAffinityStrategy(
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				() => now,
+			);
+			clocked.initialize(store);
+			const laneMeta = {
+				...metaFor("phantom-lease-client"),
+				affinityLaneKey: "phantom-lease-client:anthropic:opus",
+			} as RequestMeta;
+
+			// Establish B as the sticky healthy owner, then let A's circuit reach its
+			// half-open boundary while B remains closed and succeeds first.
+			expect(
+				(await clocked.select([probeCandidate, stickyCandidate], laneMeta))[0]
+					?.id,
+			).toBe(stickyCandidate.id);
+			clocked.reportCandidateFailure(laneMeta, {
+				candidateId: `account:${probeCandidate.id}`,
+				reason: "semantic_stream_stall",
+				suppressForMs: 100,
+			});
+			now += 100;
+			expect(
+				(await clocked.select([probeCandidate, stickyCandidate], laneMeta))[0]
+					?.id,
+			).toBe(stickyCandidate.id);
+
+			// Once B fails too, A must still be immediately leaseable because the
+			// prior successful B selection never executed A. Only that executable
+			// all-open selection may acquire the single-flight lease.
+			clocked.reportCandidateFailure(laneMeta, {
+				candidateId: `account:${stickyCandidate.id}`,
+				reason: "semantic_stream_stall",
+				suppressForMs: 100,
+			});
+			expect(
+				(await clocked.select([probeCandidate, stickyCandidate], laneMeta)).map(
+					(account) => account.id,
+				),
+			).toEqual([probeCandidate.id]);
+			const concurrentRepeats = await Promise.all([
+				clocked.select([probeCandidate, stickyCandidate], { ...laneMeta }),
+				clocked.select([probeCandidate, stickyCandidate], { ...laneMeta }),
+			]);
+			expect(concurrentRepeats).toEqual([[], []]);
+		});
+
+		it("does not lease an expired equal-class circuit behind a healthy sticky route", async () => {
+			const probeCandidate = makeAccount({ id: "equal-probe", priority: 0 });
+			const stickyCandidate = makeAccount({ id: "equal-sticky", priority: 0 });
+			let now = Date.now();
+			const clocked = new SessionAffinityStrategy(
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				() => now,
+			);
+			clocked.initialize(store);
+			const laneMeta = {
+				...metaFor("equal-class-phantom-client"),
+				affinityLaneKey: "equal-class-phantom-client:anthropic:opus",
+			} as RequestMeta;
+
+			// Establish the healthy equal-class candidate as owner. Expiry alone must
+			// not let its sibling steal a probe ahead of that viable sticky route.
+			expect(
+				(await clocked.select([stickyCandidate, probeCandidate], laneMeta))[0]
+					?.id,
+			).toBe(stickyCandidate.id);
+			clocked.reportCandidateFailure(laneMeta, {
+				candidateId: `account:${probeCandidate.id}`,
+				reason: "semantic_stream_stall",
+				suppressForMs: 100,
+			});
+			now += 100;
+			expect(
+				(await clocked.select([probeCandidate, stickyCandidate], laneMeta))[0]
+					?.id,
+			).toBe(stickyCandidate.id);
+
+			// If the prior selection had phantom-leased the equal candidate, opening
+			// the sticky owner now would leave the all-open lane empty for ten minutes.
+			clocked.reportCandidateFailure(laneMeta, {
+				candidateId: `account:${stickyCandidate.id}`,
+				reason: "semantic_stream_stall",
+				suppressForMs: 100,
+			});
+			expect(
+				(await clocked.select([probeCandidate, stickyCandidate], laneMeta)).map(
+					(account) => account.id,
+				),
+			).toEqual([probeCandidate.id]);
+		});
+
+		it("uses oldest failure as the deterministic tie-break for equal expiry", async () => {
+			const primary = makeAccount({ id: "primary", priority: 0 });
+			const fallback = makeAccount({ id: "fallback", priority: 1 });
+			let now = Date.now();
+			const clocked = new SessionAffinityStrategy(
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				() => now,
+			);
+			clocked.initialize(store);
+			const laneMeta = {
+				...metaFor("oldest-tie-client"),
+				affinityLaneKey: "oldest-tie-client:anthropic:opus",
+			} as RequestMeta;
+
+			clocked.reportCandidateFailure(laneMeta, {
+				candidateId: "account:primary",
+				reason: "semantic_stream_stall",
+				suppressForMs: 1_000,
+			});
+			now += 500;
+			clocked.reportCandidateFailure(laneMeta, {
+				candidateId: "account:fallback",
+				reason: "semantic_stream_stall",
+				suppressForMs: 500,
+			});
+
+			expect(
+				(await clocked.select([fallback, primary], laneMeta)).map(
+					(account) => account.id,
+				),
+			).toEqual(["primary"]);
+		});
+
+		it("a failed half-open probe reopens until the extended backoff expires", async () => {
+			const primary = makeAccount({ id: "primary", priority: 0 });
+			let now = Date.now();
+			const clocked = new SessionAffinityStrategy(
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				() => now,
+			);
+			clocked.initialize(store);
+			const laneMeta = {
+				...metaFor("backoff-client"),
+				affinityLaneKey: "backoff-client:anthropic:opus",
+			} as RequestMeta;
+
+			clocked.reportCandidateFailure(laneMeta, {
+				candidateId: "account:primary",
+				reason: "semantic_stream_stall",
+				suppressForMs: 100,
+			});
+			expect((await clocked.select([primary], laneMeta))[0]?.id).toBe(
+				"primary",
 			);
 
-			const startedAt = Date.now();
-			while (Date.now() - startedAt < 60) {
-				/* wait past the deliberately tiny suppression window */
-			}
-
-			expect((await strategy.select([primary, fallback], laneMeta))[0].id).toBe(
+			clocked.reportCandidateFailure(laneMeta, {
+				candidateId: "account:primary",
+				reason: "semantic_stream_stall",
+				suppressForMs: 100,
+			});
+			expect(await clocked.select([primary], laneMeta)).toEqual([]);
+			now += 199;
+			expect(await clocked.select([primary], laneMeta)).toEqual([]);
+			now += 1;
+			expect((await clocked.select([primary], laneMeta))[0]?.id).toBe(
 				"primary",
 			);
 		});
 
-		it("fails open when every otherwise-available candidate is suppressed", async () => {
+		it("caps repeated-failure backoff at base x16 on the exact boundary", async () => {
+			const primary = makeAccount({ id: "primary", priority: 0 });
+			let now = Date.now();
+			const clocked = new SessionAffinityStrategy(
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				() => now,
+			);
+			clocked.initialize(store);
+			const laneMeta = {
+				...metaFor("bounded-backoff-client"),
+				affinityLaneKey: "bounded-backoff-client:anthropic:opus",
+			} as RequestMeta;
+
+			for (let attempt = 0; attempt < 8; attempt++) {
+				clocked.reportCandidateFailure(laneMeta, {
+					candidateId: "account:primary",
+					reason: "semantic_stream_stall",
+					suppressForMs: 100,
+				});
+			}
+
+			now += 1_599;
+			expect(await clocked.select([primary], laneMeta)).toEqual([]);
+			now += 1;
+			expect((await clocked.select([primary], laneMeta))[0]?.id).toBe(
+				"primary",
+			);
+		});
+
+		it("a proven success resets only the exact lane candidate", async () => {
 			const primary = makeAccount({ id: "primary", priority: 0 });
 			const fallback = makeAccount({ id: "fallback", priority: 1 });
+			let now = Date.now();
+			const clocked = new SessionAffinityStrategy(
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				() => now,
+			);
+			clocked.initialize(store);
+			const laneMeta = {
+				...metaFor("success-reset-client"),
+				affinityLaneKey: "success-reset-client:anthropic:opus",
+			} as RequestMeta;
+			const siblingLaneMeta = {
+				...metaFor("success-reset-client"),
+				affinityLaneKey: "success-reset-client:anthropic:fable",
+			} as RequestMeta;
+
+			for (let attempt = 0; attempt < 2; attempt++) {
+				clocked.reportCandidateFailure(laneMeta, {
+					candidateId: "account:primary",
+					reason: "semantic_stream_stall",
+					suppressForMs: 100,
+				});
+			}
+			clocked.reportCandidateFailure(siblingLaneMeta, {
+				candidateId: "account:primary",
+				reason: "semantic_stream_stall",
+				suppressForMs: 60_000,
+			});
+			clocked.reportCandidateSuccess(laneMeta, {
+				candidateId: "account:primary",
+			});
+			expect(clocked.routeSuppressionEntries).toBe(1);
+			expect(
+				(await clocked.select([primary, fallback], siblingLaneMeta))[0]?.id,
+			).toBe("fallback");
+
+			clocked.reportCandidateFailure(laneMeta, {
+				candidateId: "account:primary",
+				reason: "semantic_stream_stall",
+				suppressForMs: 100,
+			});
+			now += 99;
+			expect((await clocked.select([primary, fallback], laneMeta))[0]?.id).toBe(
+				"fallback",
+			);
+			now += 1;
+			expect(
+				(await clocked.select([primary, fallback], laneMeta)).map(
+					(account) => account.id,
+				),
+			).toEqual(["primary", "fallback"]);
+			clocked.reportCandidateSuccess(laneMeta, {
+				candidateId: "account:primary",
+			});
+			expect(
+				(await clocked.select([primary, fallback], laneMeta)).map(
+					(account) => account.id,
+				),
+			).toEqual(["primary", "fallback"]);
+			expect(clocked.routeSuppressionEntries).toBe(1);
+		});
+
+		it("keeps same-lane sibling candidate circuits independent on success", async () => {
+			const shared = makeAccount({ id: "shared" });
 			const laneMeta = {
 				...metaFor("same-client"),
 				affinityLaneKey: "same-client:anthropic:opus",
+				routingCandidates: [
+					{
+						candidateId: "combo:c1:slot:primary",
+						accountId: "shared",
+						tier: 0,
+						ordinal: 0,
+						comboSlotId: "slot-primary",
+						modelOverride: "claude-opus-4-8",
+						quotaPressure: null,
+					},
+					{
+						candidateId: "combo:c1:slot:sibling",
+						accountId: "shared",
+						tier: 1,
+						ordinal: 1,
+						comboSlotId: "slot-sibling",
+						modelOverride: "claude-opus-4-8",
+						quotaPressure: null,
+					},
+				],
 			} as RequestMeta;
 
-			await strategy.select([primary, fallback], laneMeta);
-			for (const candidateId of ["account:primary", "account:fallback"]) {
+			for (const candidateId of [
+				"combo:c1:slot:primary",
+				"combo:c1:slot:sibling",
+			]) {
 				strategy.reportCandidateFailure(laneMeta, {
 					candidateId,
 					reason: "semantic_stream_stall",
 					suppressForMs: 60_000,
 				});
 			}
+			strategy.reportCandidateSuccess(laneMeta, {
+				candidateId: "combo:c1:slot:primary",
+			});
 
-			const result = await strategy.select([primary, fallback], laneMeta);
-			expect(result.map((account) => account.id)).toEqual([
-				"primary",
-				"fallback",
+			expect(strategy.routeSuppressionEntries).toBe(1);
+			const result = await strategy.select([shared, shared], laneMeta);
+			expect(result).toHaveLength(1);
+			expect(
+				laneMeta.routingCandidates?.map((candidate) => candidate.candidateId),
+			).toEqual(["combo:c1:slot:primary"]);
+		});
+
+		it("leases probes independently across different affinity lanes", async () => {
+			const primary = makeAccount({ id: "primary", priority: 0 });
+			const opusMeta = {
+				...metaFor("same-client"),
+				affinityLaneKey: "same-client:anthropic:opus",
+			} as RequestMeta;
+			const fableMeta = {
+				...metaFor("same-client"),
+				affinityLaneKey: "same-client:anthropic:fable",
+			} as RequestMeta;
+
+			for (const meta of [opusMeta, fableMeta]) {
+				strategy.reportCandidateFailure(meta, {
+					candidateId: "account:primary",
+					reason: "semantic_stream_stall",
+					suppressForMs: 60_000,
+				});
+			}
+
+			const [opusProbe, fableProbe] = await Promise.all([
+				strategy.select([primary], opusMeta),
+				strategy.select([primary], fableMeta),
 			]);
+			expect(opusProbe[0]?.id).toBe("primary");
+			expect(fableProbe[0]?.id).toBe("primary");
+			expect(await strategy.select([primary], opusMeta)).toEqual([]);
+			expect(await strategy.select([primary], fableMeta)).toEqual([]);
 		});
 
 		it("does nothing when the request has no affinity key", async () => {
@@ -365,6 +812,103 @@ describe("SessionAffinityStrategy", () => {
 			}
 
 			expect(bounded.routeSuppressionEntries).toBe(2);
+		});
+
+		it("amortizes circuit GC while preserving the 24-hour retention boundary", async () => {
+			const account = makeAccount({ id: "gc-account" });
+			let now = Date.now();
+			const clocked = new SessionAffinityStrategy(
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				() => now,
+			);
+			clocked.initialize(store);
+			const laneMeta = {
+				...metaFor("gc-client"),
+				affinityLaneKey: "gc-client:anthropic:opus",
+			} as RequestMeta;
+
+			clocked.reportCandidateFailure(laneMeta, {
+				candidateId: `account:${account.id}`,
+				reason: "semantic_stream_stall",
+				suppressForMs: 100,
+			});
+			expect(clocked.routeSuppressionGcSweeps).toBe(1);
+
+			for (let request = 0; request < 100; request++) {
+				await clocked.select([account], { ...laneMeta });
+			}
+			expect(clocked.routeSuppressionGcSweeps).toBe(1);
+
+			now += 60_000 - 1;
+			await clocked.select([account], laneMeta);
+			expect(clocked.routeSuppressionGcSweeps).toBe(1);
+			now += 1;
+			await clocked.select([account], laneMeta);
+			expect(clocked.routeSuppressionGcSweeps).toBe(2);
+
+			// Use a separate instance so a deliberately recent periodic sweep cannot
+			// defer observation of the exact retention threshold.
+			const boundaryClocked = new SessionAffinityStrategy(
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				() => now,
+			);
+			boundaryClocked.initialize(store);
+			boundaryClocked.reportCandidateFailure(laneMeta, {
+				candidateId: `account:${account.id}`,
+				reason: "semantic_stream_stall",
+				suppressForMs: 100,
+			});
+			const boundaryReportedAt = now;
+			now = boundaryReportedAt + 24 * 60 * 60 * 1000 - 1;
+			expect(boundaryClocked.routeSuppressionEntries).toBe(1);
+			now += 1;
+			await boundaryClocked.select([account], laneMeta);
+			expect(boundaryClocked.routeSuppressionEntries).toBe(0);
+		});
+
+		it("moves an updated circuit state to newest before O(1) oldest eviction", async () => {
+			const a = makeAccount({ id: "eviction-a" });
+			const b = makeAccount({ id: "eviction-b" });
+			const c = makeAccount({ id: "eviction-c" });
+			let now = Date.now();
+			const bounded = new SessionAffinityStrategy(
+				undefined,
+				undefined,
+				undefined,
+				2,
+				() => now,
+			);
+			bounded.initialize(store);
+			const laneMeta = {
+				...metaFor("eviction-client"),
+				affinityLaneKey: "eviction-client:anthropic:opus",
+			} as RequestMeta;
+			const fail = (account: Account): void => {
+				bounded.reportCandidateFailure(laneMeta, {
+					candidateId: `account:${account.id}`,
+					reason: "semantic_stream_stall",
+					suppressForMs: 60_000,
+				});
+				now += 1;
+			};
+
+			fail(a);
+			fail(b);
+			fail(a); // Refresh A: B is now the oldest reported state.
+			fail(c); // Capacity eviction must remove B in insertion order.
+
+			expect(bounded.routeSuppressionEntries).toBe(2);
+			expect(
+				(await bounded.select([a, b, c], laneMeta)).map(
+					(account) => account.id,
+				),
+			).toEqual([b.id]);
 		});
 	});
 

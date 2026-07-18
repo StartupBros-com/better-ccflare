@@ -84,7 +84,7 @@ async function forwardClosedStream({
 }
 
 describe("forwardToClient Anthropic terminal recovery integration", () => {
-	it("recovers only native Anthropic Messages SSE responses", async () => {
+	it("recovers native Anthropic Messages SSE responses", async () => {
 		const requestHeaders = new Headers({
 			"anthropic-version": "2023-06-01",
 			"x-better-ccflare-auto-refresh": "true",
@@ -95,7 +95,22 @@ describe("forwardToClient Anthropic terminal recovery integration", () => {
 		);
 	});
 
-	it("leaves non-native, non-Anthropic, and non-Messages streams unchanged", async () => {
+	it("recovers provider-transformed downstream Anthropic Messages SSE exactly once", async () => {
+		const requestHeaders = new Headers({
+			"anthropic-version": "2023-06-01",
+			"x-better-ccflare-auto-refresh": "true",
+		});
+
+		const body = await forwardClosedStream({
+			requestHeaders,
+			providerName: "anthropic-compatible",
+		});
+
+		expect(body).toBe(`${terminalDelta}${ANTHROPIC_MESSAGE_STOP_FRAME}`);
+		expect(body.match(/event: message_stop/g)).toHaveLength(1);
+	});
+
+	it("leaves non-Anthropic request protocols and non-Messages streams unchanged", async () => {
 		const filteredHeaders = new Headers({
 			"x-better-ccflare-auto-refresh": "true",
 		});
@@ -104,12 +119,6 @@ describe("forwardToClient Anthropic terminal recovery integration", () => {
 
 		await expect(
 			forwardClosedStream({ requestHeaders: filteredHeaders }),
-		).resolves.toBe(terminalDelta);
-		await expect(
-			forwardClosedStream({
-				requestHeaders: nativeHeaders,
-				providerName: "anthropic-compatible",
-			}),
 		).resolves.toBe(terminalDelta);
 		await expect(
 			forwardClosedStream({

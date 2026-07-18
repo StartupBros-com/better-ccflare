@@ -18,6 +18,11 @@ const comment = ": keepalive\n\n";
 const messageStop = 'event: message_stop\ndata: {"type":"message_stop"}\n\n';
 const apiError =
 	'event: error\ndata: {"type":"error","error":{"type":"api_error"}}\n\n';
+const transientError = (errorType: string) =>
+	`event: error\ndata: ${JSON.stringify({
+		type: "error",
+		error: { type: errorType, message: "private upstream detail" },
+	})}\n\n`;
 
 function delay(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
@@ -99,6 +104,87 @@ describe("createAnthropicSemanticLivenessStream", () => {
 		expect(await reader.read()).toMatchObject({ done: true });
 		expect(onTimeout).not.toHaveBeenCalled();
 		expect(source.cancel).not.toHaveBeenCalled();
+	});
+
+	it("reports terminal success exactly once only after a clean upstream EOF following message_stop", async () => {
+		const source = controllableStream();
+		const onTerminalSuccess = mock(() => undefined);
+		const reader = createAnthropicSemanticLivenessStream(source.stream, {
+			semanticTimeoutMs: 50,
+			onTerminalSuccess,
+		}).getReader();
+
+		const terminalDelta =
+			'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\n';
+		const complete = `${content("complete")}${terminalDelta}${messageStop}`;
+		source.controller().enqueue(encoder.encode(complete));
+		expect(decoder.decode((await reader.read()).value)).toBe(complete);
+		expect(onTerminalSuccess).not.toHaveBeenCalled();
+
+		source.controller().close();
+		expect(await reader.read()).toMatchObject({ done: true });
+		expect(onTerminalSuccess).toHaveBeenCalledTimes(1);
+		expect(await reader.read()).toMatchObject({ done: true });
+		expect(onTerminalSuccess).toHaveBeenCalledTimes(1);
+	});
+
+	it("never reports terminal success when a message_stop stream is cancelled or errors", async () => {
+		for (const termination of [
+			"downstream_cancel",
+			"transport_error",
+			"sse_error",
+		] as const) {
+			const source = controllableStream();
+			const onTerminalSuccess = mock(() => undefined);
+			const reader = createAnthropicSemanticLivenessStream(source.stream, {
+				semanticTimeoutMs: 50,
+				onTerminalSuccess,
+			}).getReader();
+
+			source.controller().enqueue(encoder.encode(messageStop));
+			expect(decoder.decode((await reader.read()).value)).toBe(messageStop);
+
+			if (termination === "downstream_cancel") {
+				await reader.cancel("client disconnected after terminal bytes");
+			} else if (termination === "transport_error") {
+				source.controller().error(new Error("upstream transport failed"));
+				await expect(reader.read()).rejects.toThrow(
+					"upstream transport failed",
+				);
+			} else {
+				source.controller().enqueue(encoder.encode(apiError));
+				expect(decoder.decode((await reader.read()).value)).toBe(apiError);
+				expect(await reader.read()).toMatchObject({ done: true });
+			}
+
+			expect(onTerminalSuccess).not.toHaveBeenCalled();
+		}
+	});
+
+	it("never reports terminal success for incomplete, recovery-eligible, malformed, or truncated EOF", async () => {
+		const terminalDelta =
+			'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\n';
+		const malformed = "event: future_event\ndata: {not-json}\n\n";
+		const truncatedStop = 'event: message_stop\ndata: {"type":"message_stop"}';
+		for (const body of [
+			content("incomplete"),
+			terminalDelta,
+			`${malformed}${messageStop}`,
+			truncatedStop,
+		]) {
+			const source = controllableStream();
+			const onTerminalSuccess = mock(() => undefined);
+			const reader = createAnthropicSemanticLivenessStream(source.stream, {
+				semanticTimeoutMs: 50,
+				onTerminalSuccess,
+			}).getReader();
+
+			source.controller().enqueue(encoder.encode(body));
+			expect(decoder.decode((await reader.read()).value)).toBe(body);
+			source.controller().close();
+			expect(await reader.read()).toMatchObject({ done: true });
+			expect(onTerminalSuccess).not.toHaveBeenCalled();
+		}
 	});
 
 	it("pauses the semantic budget under downstream backpressure and resumes observation safely", async () => {
@@ -267,6 +353,89 @@ describe("createAnthropicSemanticLivenessStream", () => {
 		expect(settled).toMatchObject({ done: true });
 		expect(onTimeout).not.toHaveBeenCalled();
 		expect(source.cancel).toHaveBeenCalledTimes(1);
+	});
+
+	for (const errorType of [
+		"api_error",
+		"overloaded_error",
+		"rate_limit_error",
+	] as const) {
+		it(`reports a sanitized committed ${errorType} exactly once`, async () => {
+			const source = controllableStream();
+			const onTransientUpstreamError = mock(
+				(_reportedType: string) => undefined,
+			);
+			const reader = createAnthropicSemanticLivenessStream(source.stream, {
+				semanticTimeoutMs: 50,
+				onTransientUpstreamError,
+			}).getReader();
+
+			source.controller().enqueue(encoder.encode(content("partial")));
+			await reader.read();
+
+			const terminalChunk = `${transientError(errorType)}${transientError(
+				errorType,
+			)}`;
+			source.controller().enqueue(encoder.encode(terminalChunk));
+			expect(decoder.decode((await reader.read()).value)).toBe(terminalChunk);
+			expect(await reader.read()).toMatchObject({ done: true });
+			expect(onTransientUpstreamError).toHaveBeenCalledTimes(1);
+			expect(onTransientUpstreamError).toHaveBeenCalledWith(errorType);
+		});
+	}
+
+	it("does not report malformed, non-transient, or precommit SSE errors", async () => {
+		for (const frame of [
+			'event: error\ndata: {"type":"error","error":{}}\n\n',
+			transientError("authentication_error"),
+			transientError("api_error"),
+		]) {
+			const source = controllableStream();
+			const onTransientUpstreamError = mock(
+				(_reportedType: string) => undefined,
+			);
+			const reader = createAnthropicSemanticLivenessStream(source.stream, {
+				semanticTimeoutMs: 20,
+				onTransientUpstreamError,
+			}).getReader();
+
+			if (frame !== transientError("api_error")) {
+				source.controller().enqueue(encoder.encode(content("partial")));
+				await reader.read();
+			}
+			source.controller().enqueue(encoder.encode(frame));
+			await reader.read();
+			if (frame.includes('"type":"error","error":{}')) {
+				source.controller().close();
+			}
+			expect(await reader.read()).toMatchObject({ done: true });
+			expect(onTransientUpstreamError).not.toHaveBeenCalled();
+		}
+	});
+
+	it("does not report a transient route failure for timeout, cancel, or EOF", async () => {
+		for (const termination of ["timeout", "cancel", "eof"] as const) {
+			const source = controllableStream();
+			const onTransientUpstreamError = mock(
+				(_reportedType: string) => undefined,
+			);
+			const reader = createAnthropicSemanticLivenessStream(source.stream, {
+				semanticTimeoutMs: 15,
+				onTransientUpstreamError,
+			}).getReader();
+			source.controller().enqueue(encoder.encode(content(termination)));
+			await reader.read();
+
+			if (termination === "timeout") {
+				await reader.read();
+			} else if (termination === "cancel") {
+				await reader.cancel("downstream done");
+			} else {
+				source.controller().close();
+				expect(await reader.read()).toMatchObject({ done: true });
+			}
+			expect(onTransientUpstreamError).not.toHaveBeenCalled();
+		}
 	});
 
 	it("clears without timeout suppression on downstream cancel, EOF, or upstream error", async () => {

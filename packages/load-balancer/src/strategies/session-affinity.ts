@@ -10,6 +10,7 @@ import type {
 	LoadBalancingStrategy,
 	RequestMeta,
 	RoutingCandidateFailureReport,
+	RoutingCandidateSuccessReport,
 	StrategyStore,
 } from "@better-ccflare/types";
 import { isPeekAvailable, wouldAutoUnpause } from "./peek-availability";
@@ -55,6 +56,36 @@ const MAX_AFFINITY_ENTRIES = 10_000;
  */
 const MAX_ROUTE_SUPPRESSION_ENTRIES = 10_000;
 const MAX_DATE_TIME_MS = 8_640_000_000_000_000;
+/** Cap repeated-failure growth at base × 16 until a proven success resets it. */
+const MAX_ROUTE_FAILURE_BACKOFF_EXPONENT = 4;
+const MAX_ROUTE_CONSECUTIVE_FAILURES = MAX_ROUTE_FAILURE_BACKOFF_EXPONENT + 1;
+/** Forget inactive circuit history eventually while retaining half-open state. */
+const ROUTE_FAILURE_STATE_RETENTION_MS = 24 * 60 * 60 * 1000;
+/** Amortize retained-state sweeping off the per-request hot path. */
+const ROUTE_FAILURE_GC_INTERVAL_MS = 60 * 1000;
+/**
+ * A half-open request may disappear without reporting success or failure (for
+ * example, a client disconnect). Keep its single-flight lease longer than the
+ * proxy's bounded Anthropic commitment window, then permit one replacement
+ * probe so a lost reporter cannot wedge the lane forever.
+ */
+const ROUTE_HALF_OPEN_PROBE_LEASE_MS = 10 * 60 * 1000;
+
+interface RouteFailureState {
+	affinityKey: string;
+	candidateId: string;
+	reason: string;
+	reportedAt: number;
+	expiresAt: number;
+	baseSuppressForMs: number;
+	consecutiveFailures: number;
+	/** Earliest ordinary half-open retry after the current backoff. */
+	nextProbeAt: number;
+	/** One in-flight half-open probe for this exact lane candidate. */
+	probeLeaseUntil: number | null;
+	/** One bounded early probe when every candidate in the lane is open. */
+	earlyProbeAvailable: boolean;
+}
 
 /**
  * SessionAffinityStrategy — a hybrid of SessionStrategy and LeastUsedStrategy.
@@ -122,23 +153,17 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 	>();
 	/** accountId → last time it was freshly assigned to a NEW client-session. */
 	private lastPickedAt = new Map<string, number>();
-	/** Exact lane+candidate failures; intentionally separate from account health. */
-	private routeSuppressions = new Map<
-		string,
-		{
-			affinityKey: string;
-			candidateId: string;
-			reason: string;
-			reportedAt: number;
-			expiresAt: number;
-		}
-	>();
+	/** Exact lane+candidate circuit state; never promoted to account health. */
+	private routeFailureStates = new Map<string, RouteFailureState>();
+	private nextRouteFailureGcAt = Number.NEGATIVE_INFINITY;
+	private routeFailureGcSweepCount = 0;
 
 	constructor(
 		affinityTtlMs: number = TIME_CONSTANTS.ANTHROPIC_SESSION_DURATION_DEFAULT,
 		maxAffinityEntries: number = MAX_AFFINITY_ENTRIES,
 		antiThrashWindowMs: number = getSessionAffinityAntiThrashWindowMs(),
 		maxRouteSuppressionEntries: number = MAX_ROUTE_SUPPRESSION_ENTRIES,
+		private readonly now: () => number = Date.now,
 	) {
 		this.affinityTtlMs = affinityTtlMs;
 		this.maxAffinityEntries = maxAffinityEntries;
@@ -151,9 +176,14 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 		return this.affinity.size;
 	}
 
-	/** Live lane-scoped candidate suppression count — read-only for tests/ops. */
+	/** Retained lane-scoped candidate circuit count — read-only for tests/ops. */
 	get routeSuppressionEntries(): number {
-		return this.routeSuppressions.size;
+		return this.routeFailureStates.size;
+	}
+
+	/** Amortized full-sweep count — useful for tests and runtime diagnostics. */
+	get routeSuppressionGcSweeps(): number {
+		return this.routeFailureGcSweepCount;
 	}
 
 	initialize(store: StrategyStore): void {
@@ -175,23 +205,27 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 		return JSON.stringify([affinityKey, candidateId]);
 	}
 
-	private gcExpiredRouteSuppressions(now: number): void {
-		for (const [key, suppression] of this.routeSuppressions) {
-			if (now >= suppression.expiresAt) this.routeSuppressions.delete(key);
+	private gcStaleRouteFailureStates(now: number): void {
+		if (now < this.nextRouteFailureGcAt) return;
+		this.routeFailureGcSweepCount++;
+		this.nextRouteFailureGcAt = Math.min(
+			MAX_DATE_TIME_MS,
+			now + ROUTE_FAILURE_GC_INTERVAL_MS,
+		);
+		for (const [key, state] of this.routeFailureStates) {
+			if (
+				now >= state.expiresAt &&
+				now - state.reportedAt >= ROUTE_FAILURE_STATE_RETENTION_MS
+			) {
+				this.routeFailureStates.delete(key);
+			}
 		}
 	}
 
 	private evictOldestRouteSuppressionIfFull(): void {
-		if (this.routeSuppressions.size < this.maxRouteSuppressionEntries) return;
-		let oldestKey: string | null = null;
-		let oldestAt = Number.POSITIVE_INFINITY;
-		for (const [key, suppression] of this.routeSuppressions) {
-			if (suppression.reportedAt < oldestAt) {
-				oldestAt = suppression.reportedAt;
-				oldestKey = key;
-			}
-		}
-		if (oldestKey !== null) this.routeSuppressions.delete(oldestKey);
+		if (this.routeFailureStates.size < this.maxRouteSuppressionEntries) return;
+		const oldestKey = this.routeFailureStates.keys().next().value;
+		if (oldestKey !== undefined) this.routeFailureStates.delete(oldestKey);
 	}
 
 	reportCandidateFailure(
@@ -209,30 +243,149 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 			return;
 		}
 
-		const now = Date.now();
-		this.gcExpiredRouteSuppressions(now);
+		const now = this.now();
+		this.gcStaleRouteFailureStates(now);
 		const key = this.routeSuppressionKey(affinityKey, failure.candidateId);
-		if (!this.routeSuppressions.has(key)) {
+		const previous = this.routeFailureStates.get(key);
+		if (!previous) {
 			this.evictOldestRouteSuppressionIfFull();
+		} else {
+			// Map iteration order is the reported-at order used for O(1) eviction.
+			// Updating in place would retain the old insertion position, so move the
+			// refreshed state to the newest slot explicitly before replacing it.
+			this.routeFailureStates.delete(key);
 		}
-		const expiresAt = Math.min(
-			MAX_DATE_TIME_MS,
-			now + Math.max(1, Math.floor(failure.suppressForMs)),
+		const consecutiveFailures = Math.min(
+			MAX_ROUTE_CONSECUTIVE_FAILURES,
+			(previous?.consecutiveFailures ?? 0) + 1,
 		);
-		this.routeSuppressions.set(key, {
+		const baseSuppressForMs = Math.max(
+			previous?.baseSuppressForMs ?? 0,
+			Math.max(1, Math.floor(failure.suppressForMs)),
+		);
+		const backoffMultiplier =
+			2 **
+			Math.min(consecutiveFailures - 1, MAX_ROUTE_FAILURE_BACKOFF_EXPONENT);
+		const openForMs = Math.min(
+			MAX_DATE_TIME_MS - now,
+			baseSuppressForMs * backoffMultiplier,
+		);
+		const expiresAt = Math.min(MAX_DATE_TIME_MS, now + openForMs);
+		this.routeFailureStates.set(key, {
 			affinityKey,
 			candidateId: failure.candidateId,
 			reason: failure.reason,
 			reportedAt: now,
 			expiresAt,
+			baseSuppressForMs,
+			consecutiveFailures,
+			nextProbeAt: expiresAt,
+			probeLeaseUntil: null,
+			earlyProbeAvailable: previous === undefined,
 		});
-		this.log.info("Route candidate temporarily suppressed", {
+		this.log.info("Route candidate circuit opened", {
 			candidateId: failure.candidateId,
 			reason: failure.reason,
 			expiresAt: new Date(expiresAt).toISOString(),
-			routeSuppressionCount: this.routeSuppressions.size,
+			consecutiveFailures,
+			openForMs,
+			routeSuppressionCount: this.routeFailureStates.size,
 			affinityLanePresent: meta.affinityLaneKey != null,
 		});
+	}
+
+	reportCandidateSuccess(
+		meta: RequestMeta,
+		success: RoutingCandidateSuccessReport,
+	): void {
+		const affinityKey = this.affinityKey(meta);
+		if (affinityKey === null || success.candidateId.length === 0) return;
+
+		const key = this.routeSuppressionKey(affinityKey, success.candidateId);
+		if (!this.routeFailureStates.delete(key)) return;
+		this.log.info("Route candidate circuit closed after complete success", {
+			candidateId: success.candidateId,
+			routeSuppressionCount: this.routeFailureStates.size,
+			affinityLanePresent: meta.affinityLaneKey != null,
+		});
+	}
+
+	private routeFailureState(
+		affinityKey: string,
+		candidateId: string,
+	): RouteFailureState | undefined {
+		return this.routeFailureStates.get(
+			this.routeSuppressionKey(affinityKey, candidateId),
+		);
+	}
+
+	private acquireHalfOpenProbe(
+		candidates: StrategyCandidate[],
+		affinityKey: string,
+		now: number,
+		allowEarlyProbe: boolean,
+		isEligibleCandidate: (candidate: StrategyCandidate) => boolean = () => true,
+		compareEligibleCandidates?: (
+			a: StrategyCandidate,
+			b: StrategyCandidate,
+		) => number,
+	): StrategyCandidate | null {
+		const candidateStates = candidates.flatMap((candidate) => {
+			const state = this.routeFailureState(
+				affinityKey,
+				candidate.routing.candidateId,
+			);
+			return state ? [{ candidate, state }] : [];
+		});
+		if (
+			candidateStates.some(
+				({ state }) =>
+					state.probeLeaseUntil !== null && now < state.probeLeaseUntil,
+			)
+		) {
+			return null;
+		}
+
+		const eligible = candidateStates.filter(
+			({ candidate, state }) =>
+				isEligibleCandidate(candidate) &&
+				(now >= state.nextProbeAt ||
+					(allowEarlyProbe && state.earlyProbeAvailable)),
+		);
+		const selected = [...eligible].sort((a, b) => {
+			const candidateOrder = compareEligibleCandidates?.(
+				a.candidate,
+				b.candidate,
+			);
+			if (candidateOrder !== undefined && candidateOrder !== 0) {
+				return candidateOrder;
+			}
+			const stateA = a.state;
+			const stateB = b.state;
+			const expiryOrder = stateA.expiresAt - stateB.expiresAt;
+			if (expiryOrder !== 0) return expiryOrder;
+			const ageOrder = stateA.reportedAt - stateB.reportedAt;
+			if (ageOrder !== 0) return ageOrder;
+			const ordinalOrder =
+				a.candidate.routing.ordinal - b.candidate.routing.ordinal;
+			if (ordinalOrder !== 0) return ordinalOrder;
+			return a.candidate.routing.candidateId.localeCompare(
+				b.candidate.routing.candidateId,
+			);
+		})[0];
+		if (!selected) return null;
+
+		const leaseUntil = Math.min(
+			MAX_DATE_TIME_MS,
+			now + ROUTE_HALF_OPEN_PROBE_LEASE_MS,
+		);
+		selected.state.probeLeaseUntil = leaseUntil;
+		selected.state.nextProbeAt = Math.min(
+			selected.state.nextProbeAt,
+			leaseUntil,
+		);
+		selected.state.earlyProbeAvailable = false;
+		return selected.candidate;
 	}
 
 	/**
@@ -318,7 +471,7 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 	}
 
 	peek(accounts: Account[]): string | null {
-		const now = Date.now();
+		const now = this.now();
 		// Use isPeekAvailable so accounts that select() would auto-unpause on its
 		// next call surface as candidates here, matching LeastUsedStrategy.peek().
 		const available = accounts.filter((a) => isPeekAvailable(a, now));
@@ -330,8 +483,8 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 	}
 
 	async select(accounts: Account[], meta: RequestMeta): Promise<Account[]> {
-		const now = Date.now();
-		this.gcExpiredRouteSuppressions(now);
+		const now = this.now();
+		this.gcStaleRouteFailureStates(now);
 		const affinityKey = this.affinityKey(meta);
 		const configuredCandidates = zipStrategyCandidates(accounts, meta);
 		const candidates = filterHardExcludedCandidates(configuredCandidates, meta);
@@ -352,37 +505,78 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 			return commitStrategyCandidateOrder([], meta);
 		}
 
-		const unsuppressedAvailable =
-			affinityKey === null
-				? otherwiseAvailable
-				: otherwiseAvailable.filter(
-						(candidate) =>
-							!this.routeSuppressions.has(
-								this.routeSuppressionKey(
-									affinityKey,
-									candidate.routing.candidateId,
-								),
-							),
-					);
-		// Availability wins over suppression: if every candidate in this lane has
-		// failed recently, retry the normal ordering rather than manufacture a 503.
-		const available =
-			unsuppressedAvailable.length > 0
-				? unsuppressedAvailable
-				: otherwiseAvailable;
-		if (
-			affinityKey !== null &&
-			unsuppressedAvailable.length === 0 &&
-			otherwiseAvailable.length > 0
-		) {
-			this.log.info(
-				"Every available route candidate is suppressed; failing open",
-				{
-					availableCandidateCount: otherwiseAvailable.length,
-					routeSuppressionCount: this.routeSuppressions.size,
-					affinityLanePresent: meta.affinityLaneKey != null,
-				},
+		let available = otherwiseAvailable;
+		let forcedPriorityProbe: StrategyCandidate | null = null;
+		let forcedPriorityFallbacks: StrategyCandidate[] = [];
+		if (affinityKey !== null) {
+			const closedCandidates = otherwiseAvailable.filter(
+				(candidate) =>
+					this.routeFailureState(affinityKey, candidate.routing.candidateId) ===
+					undefined,
 			);
+			const circuitCandidates = otherwiseAvailable.filter(
+				(candidate) =>
+					this.routeFailureState(affinityKey, candidate.routing.candidateId) !==
+					undefined,
+			);
+			const rankedClosedCandidates = this.rankByLeastUsed(
+				closedCandidates,
+				now,
+				meta,
+			);
+			const bestClosedCandidate = rankedClosedCandidates[0];
+			const mapping = this.affinity.get(affinityKey);
+			const upgradeSuppressed =
+				mapping !== undefined &&
+				now - mapping.assignedAt < this.affinityTtlMs &&
+				mapping.suppressUpgradesUntil !== null &&
+				now < mapping.suppressUpgradesUntil;
+
+			// A recovered better routing class must get one real chance to reclaim its
+			// configured priority. Lease it only when it will be returned as the first
+			// executable attempt, with every healthy closed route retained behind it.
+			// Equal/worse circuits stay dormant while a better-or-equal closed route is
+			// available, preserving stickiness and preventing phantom probe leases.
+			if (bestClosedCandidate && !upgradeSuppressed) {
+				forcedPriorityProbe = this.acquireHalfOpenProbe(
+					circuitCandidates,
+					affinityKey,
+					now,
+					false,
+					(candidate) =>
+						compareStrategyCandidates(candidate, bestClosedCandidate, meta) < 0,
+					(a, b) => compareStrategyCandidates(a, b, meta),
+				);
+				if (forcedPriorityProbe) {
+					forcedPriorityFallbacks = rankedClosedCandidates;
+				}
+			}
+
+			// With no healthy closed route, preserve the deterministic all-open single
+			// probe. This is the only path allowed to consume a first-failure early
+			// probe before its ordinary backoff boundary.
+			const allOpenProbe =
+				closedCandidates.length === 0
+					? this.acquireHalfOpenProbe(circuitCandidates, affinityKey, now, true)
+					: null;
+			// If every route is circuit-open and no probe can be leased, preserve
+			// the strategy's existing [] no-route contract. The proxy returns its
+			// retryable 503 instead of letting concurrent retries stampede a route
+			// already proven unhealthy.
+			available = allOpenProbe ? [allOpenProbe] : closedCandidates;
+			if (closedCandidates.length === 0 && circuitCandidates.length > 0) {
+				this.log.info(
+					allOpenProbe
+						? "Every available route candidate circuit is open; probing one"
+						: "Every available route candidate circuit is open; probe already leased or backing off",
+					{
+						candidateId: allOpenProbe?.routing.candidateId ?? null,
+						availableCandidateCount: otherwiseAvailable.length,
+						routeSuppressionCount: this.routeFailureStates.size,
+						affinityLanePresent: meta.affinityLaneKey != null,
+					},
+				);
+			}
 		}
 
 		// GC expired affinity entries so the map doesn't grow unboundedly and so
@@ -392,6 +586,21 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 			if (now - entry.assignedAt >= this.affinityTtlMs) {
 				this.affinity.delete(clientId);
 			}
+		}
+
+		if (forcedPriorityProbe) {
+			this.log.info(
+				"Expired higher-priority route circuit selected for a half-open probe",
+				{
+					candidateId: forcedPriorityProbe.routing.candidateId,
+					fallbackCount: forcedPriorityFallbacks.length,
+					affinityLanePresent: meta.affinityLaneKey != null,
+				},
+			);
+			return commitStrategyCandidateOrder(
+				[forcedPriorityProbe, ...forcedPriorityFallbacks],
+				meta,
+			);
 		}
 
 		// Existing, non-expired client-session: try to honour its sticky mapping.

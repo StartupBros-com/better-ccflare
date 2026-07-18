@@ -1,5 +1,8 @@
 import { BUFFER_SIZES, SseFrameBuffer } from "@better-ccflare/core";
-import { classifyAnthropicSseFrame } from "./anthropic-sse-frame-classifier";
+import {
+	type AnthropicTransientSseErrorType,
+	classifyAnthropicSseFrame,
+} from "./anthropic-sse-frame-classifier";
 
 export const ANTHROPIC_SEMANTIC_LIVENESS_ERROR_FRAME =
 	'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"Response stalled after partial output"}}\n\n';
@@ -14,6 +17,16 @@ export interface AnthropicSemanticLivenessOptions {
 	semanticTimeoutMs: number;
 	/** Called once only for a semantic timeout, never for transport termination. */
 	onTimeout?: () => void;
+	/** Called once with a sanitized transient upstream error type after commitment. */
+	onTransientUpstreamError?: (
+		errorType: AnthropicTransientSseErrorType,
+	) => void;
+	/**
+	 * Called once only after a real, clean `message_stop` is followed by upstream
+	 * EOF. Synthetic recovery, truncation, cancellation, and transport/SSE errors
+	 * never produce this evidence.
+	 */
+	onTerminalSuccess?: () => void;
 	onCancelError?: (error: unknown) => void;
 }
 
@@ -48,6 +61,10 @@ export function createAnthropicSemanticLivenessStream(
 	let semanticCommitted = false;
 	let semanticMonitoringEnded = false;
 	let errorBoundarySeen = false;
+	let transientUpstreamErrorReported = false;
+	let messageStopSeen = false;
+	let terminalSuccessReported = false;
+	let protocolClean = true;
 	let parserDisabled = false;
 	let remainingObservationMs = semanticTimeoutMs;
 	let observationStartedAt: number | null = null;
@@ -99,6 +116,28 @@ export function createAnthropicSemanticLivenessStream(
 		}
 	};
 
+	const reportTransientUpstreamError = (
+		errorType: AnthropicTransientSseErrorType,
+	): void => {
+		if (transientUpstreamErrorReported) return;
+		transientUpstreamErrorReported = true;
+		try {
+			options.onTransientUpstreamError?.(errorType);
+		} catch {
+			// Routing/observability callbacks cannot corrupt the client stream.
+		}
+	};
+
+	const reportTerminalSuccess = (): void => {
+		if (terminalSuccessReported) return;
+		terminalSuccessReported = true;
+		try {
+			options.onTerminalSuccess?.();
+		} catch {
+			// Routing/observability callbacks cannot corrupt the client stream.
+		}
+	};
+
 	const handleSemanticTimeout = (): void => {
 		livenessTimer = null;
 		if (
@@ -142,8 +181,21 @@ export function createAnthropicSemanticLivenessStream(
 
 	const inspectFrame = (frame: string): void => {
 		const classification = classifyAnthropicSseFrame(frame);
+		if (classification.kind === "malformed") protocolClean = false;
 		if (classification.kind === "error") {
+			if (semanticCommitted && classification.transientErrorType) {
+				reportTransientUpstreamError(classification.transientErrorType);
+			}
 			errorBoundarySeen = true;
+			semanticMonitoringEnded = true;
+			pauseActiveObservation();
+			return;
+		}
+		if (classification.kind === "message_stop") {
+			// A normal stream announces terminal intent with message_delta first.
+			// Continue observing that terminal sequence so only the real upstream
+			// message_stop can later qualify a clean EOF as route success.
+			messageStopSeen = true;
 			semanticMonitoringEnded = true;
 			pauseActiveObservation();
 			return;
@@ -157,7 +209,6 @@ export function createAnthropicSemanticLivenessStream(
 				remainingObservationMs = semanticTimeoutMs;
 				return;
 			case "terminal_delta":
-			case "message_stop":
 				// Terminal recovery and upstream terminal events own these paths.
 				// They must never be misreported as a semantic-liveness failure.
 				semanticMonitoringEnded = true;
@@ -179,6 +230,7 @@ export function createAnthropicSemanticLivenessStream(
 			// Disable enforcement rather than turning parser uncertainty into a false
 			// route-health signal.
 			parserDisabled = true;
+			protocolClean = false;
 			semanticMonitoringEnded = true;
 			pauseActiveObservation();
 		}
@@ -198,6 +250,14 @@ export function createAnthropicSemanticLivenessStream(
 				if (finalized) return;
 				if (done) {
 					finalized = true;
+					if (
+						messageStopSeen &&
+						!errorBoundarySeen &&
+						protocolClean &&
+						!parserDisabled
+					) {
+						reportTerminalSuccess();
+					}
 					controller.close();
 					return;
 				}

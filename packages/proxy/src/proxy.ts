@@ -16,6 +16,13 @@ import {
 	usageCache,
 } from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
+import {
+	type AnthropicPreCommitRescueRouteContext,
+	coordinateAnthropicPreCommitRescue,
+	createAnthropicPreCommitRescueActivation,
+	getAnthropicPreCommitRescueConfig,
+	isPotentialDownstreamAnthropicMessagesRequest,
+} from "./anthropic-precommit-rescue";
 import { cacheBodyStore } from "./cache-body-store";
 import { recordDiagnosisCandidate } from "./cache-diagnosis";
 import {
@@ -191,6 +198,43 @@ export async function handleProxy(
 	apiKeyId?: string | null,
 	apiKeyName?: string | null,
 ): Promise<Response> {
+	const rescueRequestStartedAt = Date.now();
+	if (!isPotentialDownstreamAnthropicMessagesRequest(req, url)) {
+		return handleProxyCore(req, url, ctx, apiKeyId, apiKeyName);
+	}
+
+	const activation = createAnthropicPreCommitRescueActivation();
+	const routingAbortController = new AbortController();
+	const routingSignal = AbortSignal.any([
+		req.signal,
+		routingAbortController.signal,
+	]);
+	const routedResponse = handleProxyCore(req, url, ctx, apiKeyId, apiKeyName, {
+		activate: activation.activate,
+		signal: routingSignal,
+	});
+
+	return coordinateAnthropicPreCommitRescue({
+		response: routedResponse,
+		activation: activation.promise,
+		config: getAnthropicPreCommitRescueConfig(),
+		requestStartedAt: rescueRequestStartedAt,
+		abortRouting(reason) {
+			if (!routingAbortController.signal.aborted) {
+				routingAbortController.abort(reason);
+			}
+		},
+	});
+}
+
+async function handleProxyCore(
+	req: Request,
+	url: URL,
+	ctx: ProxyContext,
+	apiKeyId?: string | null,
+	apiKeyName?: string | null,
+	anthropicPreCommitRescue?: AnthropicPreCommitRescueRouteContext,
+): Promise<Response> {
 	// Consume the private scheduler credential before any request inspection,
 	// metadata construction, logging, cache staging, or upstream forwarding.
 	const trustedInternalAutoRefresh = consumeInternalAutoRefreshAuth(
@@ -233,6 +277,12 @@ export async function handleProxy(
 	const { buffer: requestBodyBuffer } = await prepareRequestBody(req);
 	const requestBodyContext = new RequestBodyContext(requestBodyBuffer);
 	const originalParsedBody = requestBodyContext.getParsedJson();
+	// Scheduler auth has already been consumed above. Only an explicitly
+	// streaming Anthropic Messages request may activate the outer SSE rescue;
+	// non-streaming callers must retain their eventual JSON status/headers/body,
+	// even when a provider takes longer than the rescue activation grace.
+	const activeAnthropicPreCommitRescue =
+		originalParsedBody?.stream === true ? anthropicPreCommitRescue : undefined;
 	const contextAdmissionTracker =
 		process.env.CCFLARE_CONTEXT_ADMISSION === "1" &&
 		url.pathname === "/v1/messages" &&
@@ -778,6 +828,7 @@ export async function handleProxy(
 		return {
 			routeCandidateId: candidateId,
 			forwardModelUnavailableResponse,
+			anthropicPreCommitRescue: activeAnthropicPreCommitRescue,
 			deferImplicitFallback: (model, fallbackRank) => {
 				const key = JSON.stringify([account.id, model.trim().toLowerCase()]);
 				if (deferredModelRouteKeys.has(key)) return;
@@ -1189,6 +1240,7 @@ export async function handleProxy(
 						implicitFallbacksEnabled: false,
 						forwardModelUnavailableResponse:
 							i === orderedDeferredModelRoutes.length - 1,
+						anthropicPreCommitRescue: activeAnthropicPreCommitRescue,
 					},
 				);
 			} catch (error) {
