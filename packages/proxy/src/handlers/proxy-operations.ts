@@ -35,6 +35,11 @@ import {
 	isNativeAnthropicMessagesSse,
 } from "../anthropic-semantic-preflight";
 import { cacheBodyStore } from "../cache-body-store";
+import {
+	getPreTransportDeadlineConfig,
+	PreTransportPhaseTimeoutError,
+	runWithPreTransportDeadline,
+} from "../pre-transport-deadline";
 import { RequestBodyContext } from "../request-body-context";
 import {
 	forwardToClient,
@@ -1260,9 +1265,26 @@ export async function proxyWithAccount(
 
 		// Synthetic Codex count_tokens never calls upstream, so it should not require
 		// or refresh OAuth credentials just to return an advisory local estimate.
-		const accessToken = isSyntheticCodexCountTokens
-			? ""
-			: await getValidAccessToken(account, ctx);
+		let accessToken = "";
+		if (!isSyntheticCodexCountTokens) {
+			try {
+				accessToken = await runWithPreTransportDeadline({
+					phase: "credential_resolution",
+					timeoutMs:
+						getPreTransportDeadlineConfig().credentialResolutionTimeoutMs,
+					signal: routingSignal,
+					operation: () => getValidAccessToken(account, ctx),
+				});
+			} catch (error) {
+				if (error instanceof PreTransportPhaseTimeoutError) {
+					// No provider request exists yet, so this candidate can be skipped
+					// without pausing the account or poisoning its route circuit. The
+					// deadline helper consumes any late credential settlement.
+					return null;
+				}
+				throw error;
+			}
+		}
 
 		// Pre-process request if provider supports it (e.g., to extract model for URL)
 		if (provider.prepareRequest) {
@@ -2779,6 +2801,8 @@ export async function proxyWithAccount(
 					downstreamAnthropicResponseBody,
 					{
 						semanticTimeoutMs: streamConfig.semanticTimeoutMs,
+						meaningfulProgressTimeoutMs:
+							streamConfig.meaningfulProgressTimeoutMs,
 						terminalGraceMs: streamConfig.terminalGraceMs,
 						maxBufferedBytes: streamConfig.maxBufferedBytes,
 						signal: routingSignal,
@@ -2803,6 +2827,9 @@ export async function proxyWithAccount(
 				const failureReason = error.errorType
 					? `anthropic_precommit_${error.reason}:${error.errorType}`
 					: `anthropic_precommit_${error.reason}`;
+				const routeCircuitPenalized =
+					error.reason !== "semantic_timeout" &&
+					error.reason !== "meaningful_progress_timeout";
 				log.warn("anthropic_precommit_stall", {
 					requestId: requestMeta.id,
 					accountId: account.id,
@@ -2813,10 +2840,15 @@ export async function proxyWithAccount(
 					errorType: error.errorType ?? null,
 					bufferedBytes: error.bufferedBytes,
 					framesSeen: error.framesSeen,
+					validProtocolFramesSeen: error.validProtocolFramesSeen,
+					frameKindCounts: error.frameKindCounts,
+					lastValidProtocolActivityAgeMs: error.lastValidProtocolActivityAgeMs,
 					terminalEvidenceSeen: error.terminalEvidenceSeen,
 					limitBytes: error.limitBytes ?? null,
 					semanticTimeoutMs: streamConfig.semanticTimeoutMs,
+					meaningfulProgressTimeoutMs: streamConfig.meaningfulProgressTimeoutMs,
 					terminalGraceMs: streamConfig.terminalGraceMs,
+					routeCircuitPenalized,
 				});
 				if (
 					error.errorType === "rate_limit_error" ||
@@ -2831,7 +2863,7 @@ export async function proxyWithAccount(
 						{ ...ctx, provider },
 					);
 				}
-				if (candidateId) {
+				if (candidateId && routeCircuitPenalized) {
 					ctx.strategy.reportCandidateFailure?.(requestMeta, {
 						candidateId,
 						reason: failureReason,

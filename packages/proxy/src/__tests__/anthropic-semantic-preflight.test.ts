@@ -56,6 +56,10 @@ const messageStart =
 	'event: message_start\ndata: {"type":"message_start","message":{"content":[]},"usage":{"output_tokens":1}}\n\n';
 const ping = 'event: ping\ndata: {"type":"ping"}\n\n';
 const comment = ": keepalive\n\n";
+const contentBlockStart =
+	'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n';
+const usageDelta =
+	'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":null},"usage":{"output_tokens":2}}\n\n';
 const terminalDelta =
 	'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n';
 const messageStop = 'event: message_stop\ndata: {"type":"message_stop"}\n\n';
@@ -68,27 +72,105 @@ describe("gateAnthropicSsePreCommit", () => {
 		);
 	});
 
-	it("times out ping/comment-only streams without exposing buffered bytes", async () => {
+	it("refreshes precommit idle on complete ping, structural, and usage frames without exposing them", async () => {
 		const source = controllableStream();
 		let released = false;
 		const result = gateAnthropicSsePreCommit(source.stream, {
-			semanticTimeoutMs: 35,
+			semanticTimeoutMs: 250,
 			terminalGraceMs: 10,
-			maxBufferedBytes: 1024,
+			maxBufferedBytes: 4096,
 		}).then((stream) => {
 			released = true;
 			return stream;
 		});
 
-		source.controller().enqueue(bytes(comment));
+		source.controller().enqueue(bytes(messageStart));
+		await new Promise((resolve) => setTimeout(resolve, 100));
 		source.controller().enqueue(bytes(ping));
-		await new Promise((resolve) => setTimeout(resolve, 5));
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		source.controller().enqueue(bytes(contentBlockStart));
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		source.controller().enqueue(bytes(usageDelta));
+		await new Promise((resolve) => setTimeout(resolve, 100));
 		expect(released).toBe(false);
 
+		const contentDelta =
+			'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"commit"}}\n\n';
+		source.controller().enqueue(bytes(contentDelta));
+		const releasedStream = await result;
+		source.controller().close();
+		await expect(new Response(releasedStream).text()).resolves.toBe(
+			`${messageStart}${ping}${contentBlockStart}${usageDelta}${contentDelta}`,
+		);
+		expect(source.cancel).not.toHaveBeenCalled();
+	});
+
+	it("bounds a precommit stream that emits valid protocol activity without meaningful progress", async () => {
+		const source = controllableStream();
+		const result = gateAnthropicSsePreCommit(source.stream, {
+			semanticTimeoutMs: 100,
+			meaningfulProgressTimeoutMs: 220,
+			terminalGraceMs: 20,
+			maxBufferedBytes: 4096,
+		});
+
+		source.controller().enqueue(bytes(messageStart));
+		const pump = (async () => {
+			for (let index = 0; index < 6; index += 1) {
+				await new Promise((resolve) => setTimeout(resolve, 40));
+				if (source.cancel.mock.calls.length > 0) return;
+				source
+					.controller()
+					.enqueue(bytes(index % 2 === 0 ? ping : contentBlockStart));
+			}
+			if (source.cancel.mock.calls.length === 0) source.controller().close();
+		})();
+
 		const error = await stallFrom(result);
+		await pump;
+		expect(error.reason).toBe("meaningful_progress_timeout");
+		expect(error.validProtocolFramesSeen).toBeGreaterThan(1);
+		expect(error.lastValidProtocolActivityAgeMs).toBeLessThan(100);
+		expect(source.cancel).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not refresh precommit idle for comments, malformed frames, or an incomplete tail", async () => {
+		const source = controllableStream();
+		const result = gateAnthropicSsePreCommit(source.stream, {
+			semanticTimeoutMs: 180,
+			terminalGraceMs: 10,
+			maxBufferedBytes: 4096,
+		});
+		const malformed = "event: future_event\ndata: {not-json}\n\n";
+		const incomplete = 'event: ping\ndata: {"type":"ping"}';
+
+		source.controller().enqueue(bytes(messageStart));
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		source.controller().enqueue(bytes(`${comment}${malformed}${incomplete}`));
+
+		const settled = await Promise.race([
+			result.catch((error: unknown) => error),
+			new Promise<"invalid_activity_reset_idle">((resolve) =>
+				setTimeout(() => resolve("invalid_activity_reset_idle"), 130),
+			),
+		]);
+		expect(settled).not.toBe("invalid_activity_reset_idle");
+		expect(settled).toBeInstanceOf(AnthropicPreCommitStallError);
+		const error = settled as AnthropicPreCommitStallError;
 		expect(error.reason).toBe("semantic_timeout");
-		expect(error.bufferedBytes).toBe(bytes(`${comment}${ping}`).byteLength);
-		expect(error.framesSeen).toBe(2);
+		expect(error.framesSeen).toBe(3);
+		expect(error.validProtocolFramesSeen).toBe(1);
+		expect(error.frameKindCounts).toEqual({
+			keepalive: 1,
+			structural: 1,
+			meaningful: 0,
+			terminal_delta: 0,
+			message_stop: 0,
+			error: 0,
+			malformed: 1,
+			unknown: 0,
+		});
+		expect(error.lastValidProtocolActivityAgeMs).toBeGreaterThanOrEqual(150);
 		expect(source.cancel).toHaveBeenCalledTimes(1);
 	});
 

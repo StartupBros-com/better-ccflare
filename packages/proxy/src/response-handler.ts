@@ -427,7 +427,9 @@ export async function forwardToClient(
 			isDownstreamAnthropicMessagesStream && anthropicStreamConfig
 				? createAnthropicSemanticLivenessStream(response.body, {
 						semanticTimeoutMs: anthropicStreamConfig.semanticTimeoutMs,
-						onTimeout() {
+						meaningfulProgressTimeoutMs:
+							anthropicStreamConfig.postCommitMeaningfulProgressTimeoutMs,
+						onTimeout(livenessTimeout) {
 							log.warn("anthropic_postcommit_semantic_timeout", {
 								requestId,
 								accountId: account?.id ?? null,
@@ -435,15 +437,20 @@ export async function forwardToClient(
 								attemptedModel,
 								affinityLanePresent: routingMeta?.affinityLaneKey != null,
 								semanticTimeoutMs: anthropicStreamConfig.semanticTimeoutMs,
+								postCommitMeaningfulProgressTimeoutMs:
+									anthropicStreamConfig.postCommitMeaningfulProgressTimeoutMs,
+								timeoutReason: livenessTimeout.reason,
+								framesSeen: livenessTimeout.framesSeen,
+								validProtocolFramesSeen:
+									livenessTimeout.validProtocolFramesSeen,
+								frameKindCounts: livenessTimeout.frameKindCounts,
+								lastValidProtocolActivityAgeMs:
+									livenessTimeout.lastValidProtocolActivityAgeMs,
+								lastMeaningfulProgressAgeMs:
+									livenessTimeout.lastMeaningfulProgressAgeMs,
+								routeCircuitPenalized: false,
 								streamReplayed: false,
 							});
-							if (routeCandidateId && routingMeta) {
-								ctx.strategy.reportCandidateFailure?.(routingMeta, {
-									candidateId: routeCandidateId,
-									reason: "anthropic_postcommit_semantic_timeout",
-									suppressForMs: anthropicStreamConfig.routeSuppressionMs,
-								});
-							}
 						},
 						onTransientUpstreamError(errorType) {
 							log.warn("anthropic_postcommit_transient_sse_error", {

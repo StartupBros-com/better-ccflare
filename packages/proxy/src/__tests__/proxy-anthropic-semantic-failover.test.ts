@@ -23,6 +23,10 @@ import {
 	getAnthropicPreCommitRescueConfig,
 } from "../anthropic-precommit-rescue";
 import {
+	ANTHROPIC_MEANINGFUL_PROGRESS_TIMEOUT_ENV,
+	ANTHROPIC_MEANINGFUL_PROGRESS_TIMEOUT_MS,
+	ANTHROPIC_POST_COMMIT_MEANINGFUL_PROGRESS_TIMEOUT_ENV,
+	ANTHROPIC_POST_COMMIT_MEANINGFUL_PROGRESS_TIMEOUT_MS,
 	ANTHROPIC_PRE_COMMIT_MAX_BUFFERED_BYTES,
 	ANTHROPIC_PRE_COMMIT_ROUTE_SUPPRESSION_MS,
 	ANTHROPIC_PRE_COMMIT_SEMANTIC_TIMEOUT_MS,
@@ -49,6 +53,9 @@ const { alignRouteCandidateIds, handleProxy } = await import("../proxy");
 const MODEL = "claude-opus-4-8";
 const SESSION = "semantic-failover-session";
 const TIMEOUT_ENV = "CCFLARE_ANTHROPIC_PRECOMMIT_TIMEOUT_MS";
+const MEANINGFUL_PROGRESS_ENV = ANTHROPIC_MEANINGFUL_PROGRESS_TIMEOUT_ENV;
+const POST_COMMIT_MEANINGFUL_PROGRESS_ENV =
+	ANTHROPIC_POST_COMMIT_MEANINGFUL_PROGRESS_TIMEOUT_ENV;
 const TERMINAL_GRACE_ENV = "CCFLARE_ANTHROPIC_TERMINAL_GRACE_MS";
 const BUFFER_ENV = "CCFLARE_ANTHROPIC_PRECOMMIT_MAX_BUFFER_BYTES";
 const SUPPRESSION_ENV = "CCFLARE_ANTHROPIC_ROUTE_SUPPRESSION_MS";
@@ -60,6 +67,8 @@ const originalFetch = globalThis.fetch;
 const originalEnv = new Map(
 	[
 		TIMEOUT_ENV,
+		MEANINGFUL_PROGRESS_ENV,
+		POST_COMMIT_MEANINGFUL_PROGRESS_ENV,
 		TERMINAL_GRACE_ENV,
 		BUFFER_ENV,
 		SUPPRESSION_ENV,
@@ -226,6 +235,46 @@ function stalledStream(onCancel: () => void): ReadableStream<Uint8Array> {
 	});
 }
 
+function protocolActivityOnlyStream(
+	onCancel: () => void,
+): ReadableStream<Uint8Array> {
+	let activityTimer: ReturnType<typeof setInterval> | undefined;
+	return new ReadableStream({
+		start(controller) {
+			controller.enqueue(encoder.encode(PRELUDE));
+			activityTimer = setInterval(() => {
+				controller.enqueue(
+					encoder.encode('event: ping\ndata: {"type":"ping"}\n\n'),
+				);
+			}, 20);
+		},
+		cancel() {
+			if (activityTimer !== undefined) clearInterval(activityTimer);
+			onCancel();
+		},
+	});
+}
+
+function postcommitProtocolActivityOnlyStream(
+	onCancel: () => void,
+): ReadableStream<Uint8Array> {
+	let activityTimer: ReturnType<typeof setInterval> | undefined;
+	return new ReadableStream({
+		start(controller) {
+			controller.enqueue(encoder.encode(POSTCOMMIT_STALL));
+			activityTimer = setInterval(() => {
+				controller.enqueue(
+					encoder.encode('event: ping\ndata: {"type":"ping"}\n\n'),
+				);
+			}, 20);
+		},
+		cancel() {
+			if (activityTimer !== undefined) clearInterval(activityTimer);
+			onCancel();
+		},
+	});
+}
+
 function stalledOpenAiStream(
 	chunks: readonly string[],
 	onCancel: () => void,
@@ -380,6 +429,120 @@ afterEach(() => {
 });
 
 describe("downstream Anthropic Messages SSE routing", () => {
+	it("starts precommit rescue while account selection is still blocked", async () => {
+		process.env[RESCUE_ACTIVATION_ENV] = "5";
+		process.env[RESCUE_PING_ENV] = "5";
+		process.env[RESCUE_DEADLINE_ENV] = "100";
+		const account = makeAccount("selection-blocked-a");
+		const { ctx } = makeContext([account]);
+		const strategySelect = mock(() => new Promise<Account[]>(() => undefined));
+		ctx.strategy.select = strategySelect;
+		const providerFetch = mock(async () => sseResponse(byteStream(SUCCESS)));
+		globalThis.fetch = providerFetch as unknown as typeof fetch;
+
+		const request = makeRequest();
+		const routedResponse = handleProxy(request, new URL(request.url), ctx);
+		const rescueDidNotStart = Symbol("rescue did not start");
+		const first = await Promise.race([
+			routedResponse,
+			new Promise<typeof rescueDidNotStart>((resolve) =>
+				setTimeout(() => resolve(rescueDidNotStart), 30),
+			),
+		]);
+
+		expect(strategySelect).toHaveBeenCalledTimes(1);
+		expect(first).toBeInstanceOf(Response);
+		if (!(first instanceof Response)) return;
+		expect(first.headers.get("x-better-ccflare-precommit-rescue")).toBe(
+			"active",
+		);
+		expect(providerFetch).not.toHaveBeenCalled();
+		const reader = first.body?.getReader();
+		const ping = await reader?.read();
+		expect(decoder.decode(ping?.value)).toBe(
+			ANTHROPIC_PRECOMMIT_RESCUE_PING_FRAME,
+		);
+		await reader?.cancel("test complete");
+	});
+
+	it("preserves stream:false exactly when account selection outlives rescue grace", async () => {
+		process.env[RESCUE_ACTIVATION_ENV] = "5";
+		const account = makeAccount("non-stream-selection-blocked-a");
+		const { ctx } = makeContext([account]);
+		ctx.strategy.select = mock(async () => {
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			return [account];
+		});
+		const expectedBody = JSON.stringify({ exact: "non-stream" });
+		globalThis.fetch = mock(
+			async () =>
+				new Response(expectedBody, {
+					status: 202,
+					statusText: "Selection completed",
+					headers: {
+						"content-type": "application/json; charset=utf-8",
+						"x-selection-path": "preserved",
+					},
+				}),
+		) as unknown as typeof fetch;
+
+		const request = makeRequest(undefined, undefined, false);
+		const response = await handleProxy(request, new URL(request.url), ctx);
+
+		expect(response.status).toBe(202);
+		expect(response.statusText).toBe("Selection completed");
+		expect(response.headers.get("x-selection-path")).toBe("preserved");
+		expect(
+			response.headers.get("x-better-ccflare-precommit-rescue"),
+		).toBeNull();
+		expect(await response.text()).toBe(expectedBody);
+	});
+
+	it("preserves non-Messages routes exactly even when their body requests streaming", async () => {
+		process.env[RESCUE_ACTIVATION_ENV] = "5";
+		const account = makeAccount("non-messages-selection-blocked-a");
+		const { ctx } = makeContext([account]);
+		ctx.strategy.select = mock(async () => {
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			return [account];
+		});
+		const expectedBody = JSON.stringify({ exact: "non-messages" });
+		globalThis.fetch = mock(
+			async () =>
+				new Response(expectedBody, {
+					status: 207,
+					statusText: "Route preserved",
+					headers: {
+						"content-type": "application/json; charset=utf-8",
+						"x-non-messages-path": "preserved",
+					},
+				}),
+		) as unknown as typeof fetch;
+		const request = new Request("https://proxy.local/v1/complete", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"anthropic-version": "2023-06-01",
+			},
+			body: JSON.stringify({
+				model: MODEL,
+				prompt: "hello",
+				max_tokens: 16,
+				stream: true,
+			}),
+		});
+
+		const response = await handleProxy(request, new URL(request.url), ctx);
+
+		expect(response.status).toBe(207);
+		expect(response.statusText).toBe("Route preserved");
+		expect(response.headers.get("x-non-messages-path")).toBe("preserved");
+		expect(
+			response.headers.get("x-better-ccflare-precommit-rescue"),
+		).toBeNull();
+		expect(await response.text()).toBe(expectedBody);
+	});
+
 	it("distinguishes downstream Anthropic Messages SSE from native upstream Anthropic SSE", () => {
 		const response = sseResponse(byteStream(SUCCESS));
 		const shared = {
@@ -430,7 +593,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		).toBe(false);
 	});
 
-	it("keeps a transformed xAI structural-only prelude private and routes to the next account", async () => {
+	it("keeps a transformed xAI structural-only prelude private and reroutes without poisoning its circuit", async () => {
 		const first = makeXaiAccount("xai-stall-a");
 		const second = makeXaiAccount("xai-healthy-b");
 		const third = makeXaiAccount("must-not-run-c");
@@ -465,12 +628,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		expect(body).toContain('"text":"xai recovered"');
 		expect(body.match(/event: message_start/g)).toHaveLength(1);
 		expect(body.match(/event: ping/g)).toHaveLength(1);
-		expect(reportCandidateFailure).toHaveBeenCalledTimes(1);
-		expect(reportCandidateFailure.mock.calls[0][1]).toEqual({
-			candidateId: "combo:semantic-combo:slot:semantic-slot-0",
-			reason: "anthropic_precommit_semantic_timeout",
-			suppressForMs: 12345,
-		});
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
 		expect(usageHandleStart).toHaveBeenCalledTimes(1);
 		expect(usageHandleEnd).toHaveBeenCalledTimes(1);
 		const accountedBody = usageHandleChunk.mock.calls
@@ -478,6 +636,49 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			.join("");
 		expect(accountedBody).toContain('"text":"xai recovered"');
 		expect(accountedBody.match(/event: message_start/g)).toHaveLength(1);
+		expect(reportCandidateSuccess).toHaveBeenCalledTimes(1);
+		expect(reportCandidateSuccess.mock.calls[0][1]).toEqual({
+			candidateId: "combo:semantic-combo:slot:semantic-slot-1",
+		});
+	});
+
+	it("fails over endless valid precommit activity before the outer rescue cap", async () => {
+		process.env[TIMEOUT_ENV] = "100";
+		process.env[MEANINGFUL_PROGRESS_ENV] = "80";
+		process.env[RESCUE_ACTIVATION_ENV] = "5";
+		process.env[RESCUE_PING_ENV] = "10";
+		process.env[RESCUE_DEADLINE_ENV] = "500";
+		const first = makeAccount("protocol-live-no-progress-a");
+		const second = makeAccount("healthy-b");
+		const { ctx, reportCandidateFailure, reportCandidateSuccess } = makeContext(
+			[first, second],
+			makeCombo([first, second]),
+		);
+		const fetchedAccounts: string[] = [];
+		let firstCancelCount = 0;
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			const accountId =
+				upstreamRequest.headers.get("x-api-key")?.slice(4) ?? "";
+			fetchedAccounts.push(accountId);
+			return sseResponse(
+				accountId === first.id
+					? protocolActivityOnlyStream(() => firstCancelCount++)
+					: byteStream(SUCCESS),
+			);
+		}) as unknown as typeof fetch;
+
+		const request = makeRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.text();
+
+		expect(fetchedAccounts).toEqual([first.id, second.id]);
+		expect(firstCancelCount).toBe(1);
+		expect(body).toEndWith(SUCCESS);
+		expect(body).not.toContain("msg-stalled");
+		expect(body.match(/event: message_start/g)).toHaveLength(1);
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
 		expect(reportCandidateSuccess).toHaveBeenCalledTimes(1);
 		expect(reportCandidateSuccess.mock.calls[0][1]).toEqual({
 			candidateId: "combo:semantic-combo:slot:semantic-slot-1",
@@ -514,7 +715,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		});
 	});
 
-	it("terminates a transformed xAI postcommit stall without replay and suppresses the exact route", async () => {
+	it("terminates a transformed xAI postcommit idle without replay or circuit poisoning", async () => {
 		const first = makeXaiAccount("xai-postcommit-a");
 		const second = makeXaiAccount("must-not-splice-b");
 		const { ctx, reportCandidateFailure, reportCandidateSuccess } = makeContext(
@@ -544,12 +745,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		expect(body).toEndWith(
 			'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"Response stalled after partial output"}}\n\n',
 		);
-		expect(reportCandidateFailure).toHaveBeenCalledTimes(1);
-		expect(reportCandidateFailure.mock.calls[0][1]).toEqual({
-			candidateId: "combo:semantic-combo:slot:semantic-slot-0",
-			reason: "anthropic_postcommit_semantic_timeout",
-			suppressForMs: 12345,
-		});
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
 		expect(reportCandidateSuccess).not.toHaveBeenCalled();
 	});
 
@@ -648,7 +844,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		expect(reportCandidateFailure).toHaveBeenCalledTimes(2);
 	});
 
-	it("cancels a stalled prelude once and reroutes without leaking its bytes", async () => {
+	it("cancels a stalled prelude once and reroutes without leaking bytes or poisoning its circuit", async () => {
 		const first = makeAccount("anthropic-a");
 		const second = makeAccount("anthropic-b");
 		const { ctx, reportCandidateFailure } = makeContext(
@@ -673,18 +869,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		expect(await response.text()).toBe(SUCCESS);
 		expect(fetchedAccounts).toEqual([first.id, second.id]);
 		expect(firstCancelCount).toBe(1);
-		expect(reportCandidateFailure).toHaveBeenCalledTimes(1);
-		const [reportedMeta, failure] = reportCandidateFailure.mock.calls[0];
-		expect(failure).toEqual({
-			candidateId: "combo:semantic-combo:slot:semantic-slot-0",
-			reason: "anthropic_precommit_semantic_timeout",
-			suppressForMs: 12345,
-		});
-		const lane = JSON.parse(
-			reportedMeta.affinityLaneKey ?? "null",
-		) as unknown[];
-		expect(lane[1]).toBe(SESSION);
-		expect(lane[5]).toBe(MODEL);
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
 	});
 
 	it("keeps sequential failover alive beyond the client watchdog window and exposes only the gated winner", async () => {
@@ -1147,7 +1332,9 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		expect(reportCandidateFailure).not.toHaveBeenCalled();
 	});
 
-	it("never retries after content commitment and suppresses the exact route for the next turn", async () => {
+	it("keeps a postcommit meaningful-progress timeout circuit-neutral across turns", async () => {
+		process.env[TIMEOUT_ENV] = "50";
+		process.env[POST_COMMIT_MEANINGFUL_PROGRESS_ENV] = "90";
 		const first = makeAccount("postcommit-a");
 		const second = makeAccount("must-not-splice-b");
 		const { ctx, reportCandidateFailure, reportCandidateSuccess } = makeContext(
@@ -1156,40 +1343,46 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		);
 		let fetchCount = 0;
 		let cancelCount = 0;
-		globalThis.fetch = mock(async () => {
+		const fetchedAccounts: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
 			fetchCount++;
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			fetchedAccounts.push(
+				upstreamRequest.headers.get("x-api-key")?.slice(4) ?? "",
+			);
 			return sseResponse(
-				new ReadableStream<Uint8Array>({
-					start(controller) {
-						controller.enqueue(encoder.encode(POSTCOMMIT_STALL));
-					},
-					cancel() {
-						cancelCount++;
-					},
-				}),
+				postcommitProtocolActivityOnlyStream(() => cancelCount++),
 			);
 		}) as unknown as typeof fetch;
 
 		const request = makeRequest();
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const responseText = await response.text();
+		const nextRequest = makeRequest();
+		const nextResponse = await handleProxy(
+			nextRequest,
+			new URL(nextRequest.url),
+			ctx,
+		);
+		const nextResponseText = await nextResponse.text();
 		const cancelDeadline = Date.now() + 250;
-		while (cancelCount === 0 && Date.now() < cancelDeadline) {
+		while (cancelCount < 2 && Date.now() < cancelDeadline) {
 			await new Promise((resolve) => setTimeout(resolve, 1));
 		}
 
-		expect(fetchCount).toBe(1);
-		expect(cancelCount).toBe(1);
+		expect(fetchCount).toBe(2);
+		expect(fetchedAccounts).toEqual([first.id, first.id]);
+		expect(cancelCount).toBe(2);
 		expect(responseText).toStartWith(POSTCOMMIT_STALL);
 		expect(responseText).toEndWith(
 			'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"Response stalled after partial output"}}\n\n',
 		);
-		expect(reportCandidateFailure).toHaveBeenCalledTimes(1);
-		expect(reportCandidateFailure.mock.calls[0][1]).toEqual({
-			candidateId: "combo:semantic-combo:slot:semantic-slot-0",
-			reason: "anthropic_postcommit_semantic_timeout",
-			suppressForMs: 12345,
-		});
+		expect(nextResponseText).toStartWith(POSTCOMMIT_STALL);
+		expect(nextResponseText).toEndWith(
+			'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"Response stalled after partial output"}}\n\n',
+		);
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
 		expect(reportCandidateSuccess).not.toHaveBeenCalled();
 	});
 
@@ -1256,30 +1449,40 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		expect(reportCandidateSuccess).not.toHaveBeenCalled();
 	});
 
-	it("returns route_unavailable after every candidate stalls", async () => {
+	it("returns route_unavailable after every candidate idles without poisoning circuits", async () => {
 		const first = makeAccount("stall-a");
 		const second = makeAccount("stall-b");
 		const { ctx, reportCandidateFailure } = makeContext([first, second]);
 		let cancelCount = 0;
-		globalThis.fetch = mock(async () =>
-			sseResponse(stalledStream(() => cancelCount++)),
-		) as unknown as typeof fetch;
+		const fetchedAccounts: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			fetchedAccounts.push(
+				upstreamRequest.headers.get("x-api-key")?.slice(4) ?? "",
+			);
+			return sseResponse(stalledStream(() => cancelCount++));
+		}) as unknown as typeof fetch;
 
-		const request = makeRequest();
-		const response = await handleProxy(request, new URL(request.url), ctx);
-		const payload = (await response.json()) as {
-			error: { type: string; code: string };
-		};
+		for (let turn = 0; turn < 2; turn += 1) {
+			const request = makeRequest();
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			const payload = (await response.json()) as {
+				error: { type: string; code: string };
+			};
 
-		expect(response.status).toBe(503);
-		expect(payload.error.type).toBe("service_unavailable");
-		expect(payload.error.code).toBe("route_unavailable");
-		expect(response.headers.get("x-better-ccflare-pool-status")).toBeNull();
-		expect(cancelCount).toBe(2);
-		expect(reportCandidateFailure).toHaveBeenCalledTimes(2);
+			expect(response.status).toBe(503);
+			expect(payload.error.type).toBe("service_unavailable");
+			expect(payload.error.code).toBe("route_unavailable");
+			expect(response.headers.get("x-better-ccflare-pool-status")).toBeNull();
+		}
+
+		expect(fetchedAccounts).toEqual([first.id, second.id, first.id, second.id]);
+		expect(cancelCount).toBe(4);
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
 	});
 
-	it("never escapes an explicitly forced account after a semantic stall", async () => {
+	it("never escapes an explicitly forced account after protocol idle or poisons its circuit", async () => {
 		const forced = makeAccount("forced-a");
 		const unrelated = makeAccount("must-not-run-b");
 		const { ctx, reportCandidateFailure } = makeContext([forced, unrelated]);
@@ -1300,19 +1503,28 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		expect(payload.error.type).toBe("service_unavailable");
 		expect(payload.error.code).toBe("route_unavailable");
 		expect(fetchedAccounts).toEqual([forced.id]);
-		expect(reportCandidateFailure).toHaveBeenCalledTimes(1);
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
 	});
 });
 
 describe("Anthropic stream runtime configuration", () => {
 	it("falls back to module defaults for invalid values", () => {
 		process.env[TIMEOUT_ENV] = "0";
+		process.env[MEANINGFUL_PROGRESS_ENV] = "not-a-number";
+		process.env[POST_COMMIT_MEANINGFUL_PROGRESS_ENV] = "not-a-number";
 		process.env[TERMINAL_GRACE_ENV] = "not-a-number";
 		process.env[BUFFER_ENV] = "-1";
 		process.env[SUPPRESSION_ENV] = "1.5";
 
+		expect(ANTHROPIC_PRE_COMMIT_SEMANTIC_TIMEOUT_MS).toBe(120_000);
+		expect(ANTHROPIC_POST_COMMIT_MEANINGFUL_PROGRESS_TIMEOUT_MS).toBe(
+			8 * 60 * 1000,
+		);
 		expect(getAnthropicStreamRuntimeConfig()).toEqual({
 			semanticTimeoutMs: ANTHROPIC_PRE_COMMIT_SEMANTIC_TIMEOUT_MS,
+			meaningfulProgressTimeoutMs: ANTHROPIC_MEANINGFUL_PROGRESS_TIMEOUT_MS,
+			postCommitMeaningfulProgressTimeoutMs:
+				ANTHROPIC_POST_COMMIT_MEANINGFUL_PROGRESS_TIMEOUT_MS,
 			terminalGraceMs: ANTHROPIC_PRE_COMMIT_TERMINAL_GRACE_MS,
 			maxBufferedBytes: ANTHROPIC_PRE_COMMIT_MAX_BUFFERED_BYTES,
 			routeSuppressionMs: ANTHROPIC_PRE_COMMIT_ROUTE_SUPPRESSION_MS,
@@ -1321,12 +1533,18 @@ describe("Anthropic stream runtime configuration", () => {
 
 	it("clamps oversized values to finite operational bounds", () => {
 		process.env[TIMEOUT_ENV] = String(Number.MAX_SAFE_INTEGER);
+		process.env[MEANINGFUL_PROGRESS_ENV] = String(Number.MAX_SAFE_INTEGER);
+		process.env[POST_COMMIT_MEANINGFUL_PROGRESS_ENV] = String(
+			Number.MAX_SAFE_INTEGER,
+		);
 		process.env[TERMINAL_GRACE_ENV] = String(Number.MAX_SAFE_INTEGER);
 		process.env[BUFFER_ENV] = String(Number.MAX_SAFE_INTEGER);
 		process.env[SUPPRESSION_ENV] = String(Number.MAX_SAFE_INTEGER);
 
 		expect(getAnthropicStreamRuntimeConfig()).toEqual({
 			semanticTimeoutMs: 10 * 60 * 1000,
+			meaningfulProgressTimeoutMs: 7 * 60 * 1000,
+			postCommitMeaningfulProgressTimeoutMs: 9 * 60 * 1000,
 			terminalGraceMs: 60 * 1000,
 			maxBufferedBytes: 16 * 1024 * 1024,
 			routeSuppressionMs: 24 * 60 * 60 * 1000,

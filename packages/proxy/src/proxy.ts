@@ -35,6 +35,7 @@ import {
 } from "./cache-pacing";
 import { warnOnLookbackRisk } from "./cache-telemetry";
 import {
+	type AgentInterceptResult,
 	createContextAdmissionTracker,
 	createContextLengthExceededResponse,
 	createModelPoolExhaustedResponse,
@@ -67,6 +68,11 @@ import {
 } from "./handlers/rate-limit-cooldown";
 import { getRequestRateLimitOutcomes } from "./handlers/rate-limit-scope";
 import { consumeInternalAutoRefreshAuth } from "./internal-probe-auth";
+import {
+	getPreTransportDeadlineConfig,
+	PreTransportPhaseTimeoutError,
+	runWithPreTransportDeadline,
+} from "./pre-transport-deadline";
 import { extractProjectAttributionFromRequest } from "./project-attribution";
 import {
 	clearSession,
@@ -283,6 +289,12 @@ async function handleProxyCore(
 	// even when a provider takes longer than the rescue activation grace.
 	const activeAnthropicPreCommitRescue =
 		originalParsedBody?.stream === true ? anthropicPreCommitRescue : undefined;
+	// Arm the watchdog bridge as soon as a parsed streaming Messages request is
+	// known. Account selection, pacing, credential acquisition, and the first
+	// provider fetch can all stall before the lower transport hooks run.
+	activeAnthropicPreCommitRescue?.activate();
+	const routingSignal = activeAnthropicPreCommitRescue?.signal ?? req.signal;
+	const preTransportDeadlines = getPreTransportDeadlineConfig();
 	const contextAdmissionTracker =
 		process.env.CCFLARE_CONTEXT_ADMISSION === "1" &&
 		url.pathname === "/v1/messages" &&
@@ -342,23 +354,56 @@ async function handleProxyCore(
 	}
 
 	// 4. Intercept and modify request for agent model preferences
+	let agentInterception: AgentInterceptResult;
+	try {
+		// Isolate the interceptor's mutable body context. If its dependencies settle
+		// after our fail-open deadline, they cannot rewrite the request now routing.
+		const interceptionBodyContext = new RequestBodyContext(
+			requestBodyContext.getBuffer(),
+		);
+		agentInterception = await runWithPreTransportDeadline({
+			phase: "agent_interception",
+			timeoutMs: preTransportDeadlines.agentInterceptionTimeoutMs,
+			signal: routingSignal,
+			operation: () =>
+				interceptAndModifyRequest(
+					interceptionBodyContext,
+					ctx.dbOps,
+					req.headers,
+					{
+						frontmatterModelFallback:
+							ctx.config.getAgentFrontmatterModelFallback(),
+					},
+				),
+		});
+	} catch (error) {
+		if (!(error instanceof PreTransportPhaseTimeoutError)) throw error;
+		const originalModel = requestBodyContext.getModel();
+		agentInterception = {
+			modifiedBody: requestBodyContext.getBuffer(),
+			agentUsed: null,
+			originalModel,
+			appliedModel: originalModel,
+			agentAttributionSource: "none" as const,
+		};
+	}
 	const {
 		modifiedBody,
 		agentUsed,
 		originalModel,
 		appliedModel,
 		agentAttributionSource,
-	} = await interceptAndModifyRequest(
-		requestBodyContext,
-		ctx.dbOps,
-		req.headers,
-		{
-			frontmatterModelFallback: ctx.config.getAgentFrontmatterModelFallback(),
-		},
-	);
+	} = agentInterception;
 
 	// Use modified body if available
 	const finalBodyBuffer = modifiedBody || requestBodyContext.getBuffer();
+	// proxyWithAccount prefers the parsed context over its raw buffer argument.
+	// Keep that context aligned with the interceptor result while retaining the
+	// original isolated context if the deadline failed open.
+	const finalRequestBodyContext =
+		finalBodyBuffer === requestBodyContext.getBuffer()
+			? requestBodyContext
+			: new RequestBodyContext(finalBodyBuffer);
 	const finalCreateBodyStream = () => {
 		if (!finalBodyBuffer) return undefined;
 		return new Response(finalBodyBuffer).body ?? undefined;
@@ -430,6 +475,38 @@ async function handleProxyCore(
 	const canaryCandidate = isCodexPacingBypassCandidate(pacingCohortKey);
 	requestMeta.codexPacingCohortId = pacingCohortKey?.slice(0, 16) ?? null;
 	const effectiveModel = resolveEffectiveModel(appliedModel, requestModel);
+	const selectAccountsWithDeadline = (
+		options?: Parameters<typeof selectAccountsForRequest>[3],
+	) =>
+		runWithPreTransportDeadline({
+			phase: "account_selection",
+			timeoutMs: preTransportDeadlines.accountSelectionTimeoutMs,
+			signal: routingSignal,
+			operation: () =>
+				selectAccountsForRequest(
+					requestMeta,
+					ctx,
+					effectiveModel ?? undefined,
+					options,
+				),
+		});
+	const accountSelectionTimeoutResponse = (
+		pacingSlot: Parameters<typeof finishPacing>[0],
+	): Response => {
+		cacheBodyStore.discardStaged(requestMeta.id);
+		if (sessionId) clearSession(sessionId, requestMeta.timestamp);
+		const terminal = createRoutingTerminalResponse({
+			source: "selection",
+			accounts: [],
+			capacityContext: null,
+			rateLimitOutcomes: [],
+			upstreamAttempts: 0,
+		});
+		// A phase timeout is transient incomplete evidence, so keep the canonical
+		// route_unavailable body while explicitly inviting a bounded client retry.
+		terminal.response.headers.set("retry-after", "1");
+		return finishPacing(pacingSlot, terminal.response);
+	};
 	let pacingObservation: CachePacingObservation | null = null;
 	let pacingBypassed = false;
 	// Immutable assignment. Effective action may become crossover-paced, but
@@ -455,12 +532,11 @@ async function handleProxyCore(
 	// 6. Controls select after pacing. Candidates select here so the bypass
 	// decision can use the first actually available, usage-throttled account.
 	try {
-		selectedAccounts = await selectAccountsForRequest(
-			requestMeta,
-			ctx,
-			effectiveModel ?? undefined,
-		);
+		selectedAccounts = await selectAccountsWithDeadline();
 	} catch (error) {
+		if (error instanceof PreTransportPhaseTimeoutError) {
+			return accountSelectionTimeoutResponse(pacingObservation?.slot ?? null);
+		}
 		if (error instanceof ForceRouteUnavailableError) {
 			log.warn(
 				`Grok cache canary ${formatXaiCacheCanary({
@@ -585,12 +661,11 @@ async function handleProxyCore(
 			model: effectiveModel,
 		});
 		try {
-			selectedAccounts = await selectAccountsForRequest(
-				requestMeta,
-				ctx,
-				effectiveModel ?? undefined,
-			);
+			selectedAccounts = await selectAccountsWithDeadline();
 		} catch (error) {
+			if (error instanceof PreTransportPhaseTimeoutError) {
+				return accountSelectionTimeoutResponse(pacingObservation?.slot ?? null);
+			}
 			if (error instanceof ForceRouteUnavailableError) {
 				log.warn(
 					`Grok cache canary ${formatXaiCacheCanary({
@@ -954,7 +1029,7 @@ async function handleProxyCore(
 				modelOverride,
 				apiKeyId,
 				apiKeyName,
-				requestBodyContext,
+				finalRequestBodyContext,
 				isFinalSelectedCandidate,
 				contextAdmissionTracker,
 				routingAttemptLedger,
@@ -1014,14 +1089,14 @@ async function handleProxyCore(
 		requestMeta.comboSlotIndex = null;
 		let selectedFallbackAccounts: Account[];
 		try {
-			selectedFallbackAccounts = await selectAccountsForRequest(
-				requestMeta,
-				ctx,
-				effectiveModel ?? undefined,
-				{ skipCombo: true },
-			);
+			selectedFallbackAccounts = await selectAccountsWithDeadline({
+				skipCombo: true,
+			});
 		} catch (error) {
 			await routingAttemptLedger.discardTerminalResponse();
+			if (error instanceof PreTransportPhaseTimeoutError) {
+				return accountSelectionTimeoutResponse(pacingSlot);
+			}
 			throw error;
 		}
 		const fallbackSelection = applyUsageThrottling(selectedFallbackAccounts);
@@ -1093,7 +1168,7 @@ async function handleProxyCore(
 						undefined, // No model override for fallback path
 						apiKeyId,
 						apiKeyName,
-						requestBodyContext,
+						finalRequestBodyContext,
 						isFinalFallbackCandidate,
 						contextAdmissionTracker,
 						routingAttemptLedger,
@@ -1231,7 +1306,7 @@ async function handleProxyCore(
 					route.model,
 					apiKeyId,
 					apiKeyName,
-					requestBodyContext,
+					finalRequestBodyContext,
 					i === orderedDeferredModelRoutes.length - 1,
 					contextAdmissionTracker,
 					routingAttemptLedger,

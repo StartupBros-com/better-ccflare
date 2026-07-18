@@ -14,18 +14,46 @@ const transientErrorTypes = new Set<string>(
 	ANTHROPIC_TRANSIENT_SSE_ERROR_TYPES,
 );
 
-export type AnthropicSseFrameKind =
-	| "keepalive"
-	| "structural"
-	| "meaningful"
-	| "terminal_delta"
-	| "message_stop"
-	| "error"
-	| "malformed"
-	| "unknown";
+export const ANTHROPIC_SSE_FRAME_KINDS = [
+	"keepalive",
+	"structural",
+	"meaningful",
+	"terminal_delta",
+	"message_stop",
+	"error",
+	"malformed",
+	"unknown",
+] as const;
+
+export type AnthropicSseFrameKind = (typeof ANTHROPIC_SSE_FRAME_KINDS)[number];
+
+/** Fixed-key, saturating counters safe to attach to structured logs. */
+export type AnthropicSseFrameKindCounts = Record<AnthropicSseFrameKind, number>;
+
+export function createAnthropicSseFrameKindCounts(): AnthropicSseFrameKindCounts {
+	return {
+		keepalive: 0,
+		structural: 0,
+		meaningful: 0,
+		terminal_delta: 0,
+		message_stop: 0,
+		error: 0,
+		malformed: 0,
+		unknown: 0,
+	};
+}
+
+export function incrementAnthropicSseFrameKindCount(
+	counts: AnthropicSseFrameKindCounts,
+	kind: AnthropicSseFrameKind,
+): void {
+	counts[kind] = Math.min(Number.MAX_SAFE_INTEGER, counts[kind] + 1);
+}
 
 export interface AnthropicSseFrameClassification {
 	kind: AnthropicSseFrameKind;
+	/** True only for a complete, parsed Anthropic protocol event. */
+	validProtocolActivity?: true;
 	/** Sanitized nested `error.type`; upstream messages are never retained. */
 	errorType?: string;
 	transientErrorType?: AnthropicTransientSseErrorType;
@@ -141,32 +169,43 @@ export function classifyAnthropicSseFrame(
 
 	switch (resolvedType) {
 		case "ping":
-			return { kind: "keepalive" };
+			return { kind: "keepalive", validProtocolActivity: true };
 		case "content_block_start":
+			return isRecord(parsed.content_block)
+				? { kind: "structural", validProtocolActivity: true }
+				: { kind: "malformed" };
 		case "content_block_stop":
-			return { kind: "structural" };
+			return { kind: "structural", validProtocolActivity: true };
 		case "message_start": {
 			const message = isRecord(parsed.message) ? parsed.message : undefined;
+			if (!message) return { kind: "malformed" };
 			return {
 				kind:
-					message?.stop_reason !== null && message?.stop_reason !== undefined
+					message.stop_reason !== null && message.stop_reason !== undefined
 						? "terminal_delta"
 						: "structural",
+				validProtocolActivity: true,
 			};
 		}
-		case "message_delta":
+		case "message_delta": {
+			if (!isRecord(parsed.delta)) return { kind: "malformed" };
 			return {
 				kind:
-					isRecord(parsed.delta) &&
 					parsed.delta.stop_reason !== null &&
 					parsed.delta.stop_reason !== undefined
 						? "terminal_delta"
 						: "structural",
+				validProtocolActivity: true,
 			};
-		case "content_block_delta":
-			return { kind: classifyContentDelta(parsed) };
+		}
+		case "content_block_delta": {
+			const kind = classifyContentDelta(parsed);
+			return kind === "malformed"
+				? { kind }
+				: { kind, validProtocolActivity: true };
+		}
 		case "message_stop":
-			return { kind: "message_stop" };
+			return { kind: "message_stop", validProtocolActivity: true };
 		case "error": {
 			const nestedError = isRecord(parsed.error) ? parsed.error : undefined;
 			if (
@@ -183,11 +222,12 @@ export function classifyAnthropicSseFrame(
 					: undefined;
 			return {
 				kind: "error",
+				validProtocolActivity: true,
 				...(errorType ? { errorType } : {}),
 				...(transientErrorType ? { transientErrorType } : {}),
 			};
 		}
 		default:
-			return { kind: "unknown" };
+			return { kind: "unknown", validProtocolActivity: true };
 	}
 }
