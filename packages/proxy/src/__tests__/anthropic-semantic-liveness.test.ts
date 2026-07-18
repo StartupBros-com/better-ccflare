@@ -15,6 +15,10 @@ const content = (text: string) =>
 	})}\n\n`;
 const ping = 'event: ping\ndata: {"type":"ping"}\n\n';
 const comment = ": keepalive\n\n";
+const contentBlockStart =
+	'event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}\n\n';
+const usageDelta =
+	'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":null},"usage":{"output_tokens":2}}\n\n';
 const messageStop = 'event: message_stop\ndata: {"type":"message_stop"}\n\n';
 const apiError =
 	'event: error\ndata: {"type":"error","error":{"type":"api_error"}}\n\n';
@@ -43,9 +47,117 @@ function controllableStream(
 }
 
 describe("createAnthropicSemanticLivenessStream", () => {
-	it("ignores repeated ping/comment bytes after content, emits one stable error, and cancels upstream once", async () => {
+	it("refreshes postcommit idle on complete ping, structural, and usage frames", async () => {
 		const source = controllableStream();
 		const onTimeout = mock(() => undefined);
+		const reader = createAnthropicSemanticLivenessStream(source.stream, {
+			semanticTimeoutMs: 250,
+			onTimeout,
+		}).getReader();
+
+		source.controller().enqueue(encoder.encode(content("first")));
+		expect(decoder.decode((await reader.read()).value)).toBe(content("first"));
+
+		for (const validActivity of [ping, contentBlockStart, usageDelta]) {
+			await delay(100);
+			source.controller().enqueue(encoder.encode(validActivity));
+			expect(decoder.decode((await reader.read()).value)).toBe(validActivity);
+		}
+		await delay(100);
+		expect(onTimeout).not.toHaveBeenCalled();
+
+		source.controller().enqueue(encoder.encode(messageStop));
+		source.controller().close();
+		expect(decoder.decode((await reader.read()).value)).toBe(messageStop);
+		expect(await reader.read()).toMatchObject({ done: true });
+		expect(onTimeout).not.toHaveBeenCalled();
+		expect(source.cancel).not.toHaveBeenCalled();
+	});
+
+	it("bounds postcommit ping and structural activity without meaningful progress", async () => {
+		let activityTimer: ReturnType<typeof setInterval> | undefined;
+		let activityIndex = 0;
+		const cancel = mock(() => {
+			if (activityTimer !== undefined) clearInterval(activityTimer);
+		});
+		const source = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(encoder.encode(content("first")));
+				activityTimer = setInterval(() => {
+					controller.enqueue(
+						encoder.encode(
+							activityIndex++ % 2 === 0 ? ping : contentBlockStart,
+						),
+					);
+				}, 30);
+			},
+			cancel,
+		});
+		const onTimeout = mock((_metadata: unknown) => undefined);
+		const reader = createAnthropicSemanticLivenessStream(source, {
+			semanticTimeoutMs: 100,
+			meaningfulProgressTimeoutMs: 180,
+			onTimeout,
+		}).getReader();
+
+		expect(decoder.decode((await reader.read()).value)).toBe(content("first"));
+		let terminal: ReadableStreamReadResult<Uint8Array> | "hard_cap_missing" =
+			"hard_cap_missing";
+		const deadline = delay(350).then(() => "hard_cap_missing" as const);
+		while (terminal === "hard_cap_missing") {
+			const next = await Promise.race([reader.read(), deadline]);
+			if (next === "hard_cap_missing") break;
+			if (
+				decoder.decode(next.value) === ANTHROPIC_SEMANTIC_LIVENESS_ERROR_FRAME
+			) {
+				terminal = next;
+			}
+		}
+		if (terminal === "hard_cap_missing") {
+			await reader.cancel("test timed out");
+		}
+
+		expect(terminal).not.toBe("hard_cap_missing");
+		expect(onTimeout).toHaveBeenCalledTimes(1);
+		expect(onTimeout.mock.calls[0][0]).toMatchObject({
+			reason: "meaningful_progress_timeout",
+		});
+		expect(cancel).toHaveBeenCalledTimes(1);
+		if (activityTimer !== undefined) clearInterval(activityTimer);
+	});
+
+	it("resets the postcommit meaningful-progress cap on a later meaningful delta", async () => {
+		const source = controllableStream();
+		const onTimeout = mock((_metadata: unknown) => undefined);
+		const reader = createAnthropicSemanticLivenessStream(source.stream, {
+			semanticTimeoutMs: 100,
+			meaningfulProgressTimeoutMs: 160,
+			onTimeout,
+		}).getReader();
+
+		source.controller().enqueue(encoder.encode(content("first")));
+		expect(decoder.decode((await reader.read()).value)).toBe(content("first"));
+		await delay(70);
+		source.controller().enqueue(encoder.encode(ping));
+		expect(decoder.decode((await reader.read()).value)).toBe(ping);
+		await delay(70);
+		source.controller().enqueue(encoder.encode(content("second")));
+		expect(decoder.decode((await reader.read()).value)).toBe(content("second"));
+		await delay(70);
+		source.controller().enqueue(encoder.encode(ping));
+		expect(decoder.decode((await reader.read()).value)).toBe(ping);
+		await delay(70);
+		source.controller().enqueue(encoder.encode(messageStop));
+		source.controller().close();
+		expect(decoder.decode((await reader.read()).value)).toBe(messageStop);
+		expect(await reader.read()).toMatchObject({ done: true });
+		expect(onTimeout).not.toHaveBeenCalled();
+		expect(source.cancel).not.toHaveBeenCalled();
+	});
+
+	it("ignores repeated comment bytes after content, emits one stable error, and cancels upstream once", async () => {
+		const source = controllableStream();
+		const onTimeout = mock((_metadata: unknown) => undefined);
 		const semanticTimeoutMs = 400;
 		const reader = createAnthropicSemanticLivenessStream(source.stream, {
 			semanticTimeoutMs,
@@ -55,28 +167,31 @@ describe("createAnthropicSemanticLivenessStream", () => {
 		source.controller().enqueue(encoder.encode(content("first")));
 		expect(decoder.decode((await reader.read()).value)).toBe(content("first"));
 
-		for (const keepalive of [ping, comment, ping, comment]) {
+		for (const keepalive of [comment, comment, comment, comment]) {
 			await delay(35);
 			source.controller().enqueue(encoder.encode(keepalive));
 			expect(decoder.decode((await reader.read()).value)).toBe(keepalive);
 		}
 
-		// The original content deadline should fire before this bound. If a ping
-		// or comment incorrectly reset liveness, its later deadline would lose
-		// this race instead.
+		// The original content deadline should fire before this bound. If a comment
+		// incorrectly reset protocol liveness, its later deadline would lose this
+		// race instead.
 		const timeoutEvent = await Promise.race([
 			reader.read(),
-			delay(330).then(() => "keepalive_reset_the_deadline" as const),
+			delay(330).then(() => "comment_reset_the_deadline" as const),
 		]);
-		expect(timeoutEvent).not.toBe("keepalive_reset_the_deadline");
-		if (timeoutEvent === "keepalive_reset_the_deadline") {
-			throw new Error("keepalive bytes reset the semantic deadline");
+		expect(timeoutEvent).not.toBe("comment_reset_the_deadline");
+		if (timeoutEvent === "comment_reset_the_deadline") {
+			throw new Error("comment bytes reset the protocol-idle deadline");
 		}
 		expect(decoder.decode(timeoutEvent.value)).toBe(
 			ANTHROPIC_SEMANTIC_LIVENESS_ERROR_FRAME,
 		);
 		expect(await reader.read()).toMatchObject({ done: true });
 		expect(onTimeout).toHaveBeenCalledTimes(1);
+		expect(onTimeout.mock.calls[0][0]).toMatchObject({
+			reason: "protocol_idle_timeout",
+		});
 		expect(source.cancel).toHaveBeenCalledTimes(1);
 	});
 
@@ -264,7 +379,7 @@ describe("createAnthropicSemanticLivenessStream", () => {
 
 	it("does not let repeated malformed complete frames postpone semantic timeout", async () => {
 		const source = controllableStream();
-		const onTimeout = mock(() => undefined);
+		const onTimeout = mock((_metadata: unknown) => undefined);
 		const semanticTimeoutMs = 400;
 		const reader = createAnthropicSemanticLivenessStream(source.stream, {
 			semanticTimeoutMs,
@@ -295,6 +410,27 @@ describe("createAnthropicSemanticLivenessStream", () => {
 			ANTHROPIC_SEMANTIC_LIVENESS_ERROR_FRAME,
 		);
 		expect(onTimeout).toHaveBeenCalledTimes(1);
+		expect(onTimeout.mock.calls[0][0]).toMatchObject({
+			framesSeen: 5,
+			validProtocolFramesSeen: 1,
+			frameKindCounts: {
+				keepalive: 0,
+				structural: 0,
+				meaningful: 1,
+				terminal_delta: 0,
+				message_stop: 0,
+				error: 0,
+				malformed: 4,
+				unknown: 0,
+			},
+		});
+		expect(
+			(
+				onTimeout.mock.calls[0][0] as {
+					lastValidProtocolActivityAgeMs: number;
+				}
+			).lastValidProtocolActivityAgeMs,
+		).toBeGreaterThanOrEqual(350);
 	});
 
 	it("treats a structurally valid unknown extension as conservative progress", async () => {

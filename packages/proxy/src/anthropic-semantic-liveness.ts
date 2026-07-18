@@ -1,7 +1,11 @@
 import { BUFFER_SIZES, SseFrameBuffer } from "@better-ccflare/core";
+import { ANTHROPIC_POST_COMMIT_MEANINGFUL_PROGRESS_TIMEOUT_MS } from "./anthropic-semantic-preflight";
 import {
+	type AnthropicSseFrameKindCounts,
 	type AnthropicTransientSseErrorType,
 	classifyAnthropicSseFrame,
+	createAnthropicSseFrameKindCounts,
+	incrementAnthropicSseFrameKindCount,
 } from "./anthropic-sse-frame-classifier";
 
 export const ANTHROPIC_SEMANTIC_LIVENESS_ERROR_FRAME =
@@ -13,10 +17,12 @@ const semanticTimeoutBytes = encoder.encode(
 );
 
 export interface AnthropicSemanticLivenessOptions {
-	/** Idle time after committed semantic output before terminating safely. */
+	/** Idle time after committed valid protocol activity before terminating. */
 	semanticTimeoutMs: number;
-	/** Called once only for a semantic timeout, never for transport termination. */
-	onTimeout?: () => void;
+	/** Maximum active time without a meaningful delta after commitment. */
+	meaningfulProgressTimeoutMs?: number;
+	/** Called once only for bounded liveness, never for transport termination. */
+	onTimeout?: (metadata: AnthropicLivenessTimeoutMetadata) => void;
 	/** Called once with a sanitized transient upstream error type after commitment. */
 	onTransientUpstreamError?: (
 		errorType: AnthropicTransientSseErrorType,
@@ -30,6 +36,19 @@ export interface AnthropicSemanticLivenessOptions {
 	onCancelError?: (error: unknown) => void;
 }
 
+export type AnthropicLivenessTimeoutReason =
+	| "protocol_idle_timeout"
+	| "meaningful_progress_timeout";
+
+export interface AnthropicLivenessTimeoutMetadata {
+	reason: AnthropicLivenessTimeoutReason;
+	framesSeen: number;
+	validProtocolFramesSeen: number;
+	frameKindCounts: AnthropicSseFrameKindCounts;
+	lastValidProtocolActivityAgeMs: number | null;
+	lastMeaningfulProgressAgeMs: number | null;
+}
+
 function positiveInteger(value: number, optionName: string): number {
 	if (!Number.isSafeInteger(value) || value <= 0) {
 		throw new RangeError(`${optionName} must be a positive safe integer`);
@@ -37,11 +56,21 @@ function positiveInteger(value: number, optionName: string): number {
 	return value;
 }
 
+function boundedAgeMs(timestamp: number | null): number | null {
+	if (timestamp === null) return null;
+	return Math.min(
+		Number.MAX_SAFE_INTEGER,
+		Math.max(0, performance.now() - timestamp),
+	);
+}
+
 /**
- * Enforce semantic (not byte) liveness after the first committed Anthropic
- * text/thinking/tool delta. Transport keepalives remain byte-identical but do
- * not postpone the deadline. The wrapper never retries or splices a response:
- * after commitment it emits one standard Anthropic error event and closes.
+ * Enforce protocol (not raw-byte) liveness after the first committed Anthropic
+ * text/thinking/tool delta. Complete parsed protocol events refresh the idle
+ * window, but only meaningful progress refreshes the separate hard progress
+ * budget. Comments, incomplete tails, and malformed frames refresh neither.
+ * The wrapper never retries or splices a response: after commitment it emits
+ * one standard Anthropic error event and closes.
  */
 export function createAnthropicSemanticLivenessStream(
 	upstream: ReadableStream<Uint8Array>,
@@ -50,6 +79,11 @@ export function createAnthropicSemanticLivenessStream(
 	const semanticTimeoutMs = positiveInteger(
 		options.semanticTimeoutMs,
 		"semanticTimeoutMs",
+	);
+	const meaningfulProgressTimeoutMs = positiveInteger(
+		options.meaningfulProgressTimeoutMs ??
+			ANTHROPIC_POST_COMMIT_MEANINGFUL_PROGRESS_TIMEOUT_MS,
+		"meaningfulProgressTimeoutMs",
 	);
 	const reader = upstream.getReader();
 	const frames = new SseFrameBuffer({
@@ -66,8 +100,15 @@ export function createAnthropicSemanticLivenessStream(
 	let terminalSuccessReported = false;
 	let protocolClean = true;
 	let parserDisabled = false;
-	let remainingObservationMs = semanticTimeoutMs;
+	let framesSeen = 0;
+	let validProtocolFramesSeen = 0;
+	const frameKindCounts = createAnthropicSseFrameKindCounts();
+	let lastValidProtocolActivityAt: number | null = null;
+	let lastMeaningfulProgressAt: number | null = null;
+	let remainingProtocolIdleMs = semanticTimeoutMs;
+	let remainingMeaningfulProgressMs = meaningfulProgressTimeoutMs;
 	let observationStartedAt: number | null = null;
+	let scheduledTimeoutReason: AnthropicLivenessTimeoutReason | null = null;
 	let livenessTimer: ReturnType<typeof setTimeout> | null = null;
 	let downstreamController:
 		| ReadableStreamDefaultController<Uint8Array>
@@ -83,11 +124,14 @@ export function createAnthropicSemanticLivenessStream(
 	const pauseActiveObservation = (): void => {
 		clearLivenessTimer();
 		if (observationStartedAt === null) return;
-		remainingObservationMs = Math.max(
+		const elapsedMs = performance.now() - observationStartedAt;
+		remainingProtocolIdleMs = Math.max(0, remainingProtocolIdleMs - elapsedMs);
+		remainingMeaningfulProgressMs = Math.max(
 			0,
-			remainingObservationMs - (performance.now() - observationStartedAt),
+			remainingMeaningfulProgressMs - elapsedMs,
 		);
 		observationStartedAt = null;
+		scheduledTimeoutReason = null;
 	};
 
 	const cancelOnce = (reason: unknown): Promise<void> => {
@@ -100,9 +144,18 @@ export function createAnthropicSemanticLivenessStream(
 		return cancelPromise;
 	};
 
-	const reportTimeout = (): void => {
+	const reportTimeout = (reason: AnthropicLivenessTimeoutReason): void => {
 		try {
-			options.onTimeout?.();
+			options.onTimeout?.({
+				reason,
+				framesSeen,
+				validProtocolFramesSeen,
+				frameKindCounts: { ...frameKindCounts },
+				lastValidProtocolActivityAgeMs: boundedAgeMs(
+					lastValidProtocolActivityAt,
+				),
+				lastMeaningfulProgressAgeMs: boundedAgeMs(lastMeaningfulProgressAt),
+			});
 		} catch {
 			// Routing/observability callbacks cannot corrupt the client stream.
 		}
@@ -138,7 +191,7 @@ export function createAnthropicSemanticLivenessStream(
 		}
 	};
 
-	const handleSemanticTimeout = (): void => {
+	const handleLivenessTimeout = (): void => {
 		livenessTimer = null;
 		if (
 			finalized ||
@@ -150,15 +203,28 @@ export function createAnthropicSemanticLivenessStream(
 			return;
 		}
 
+		const elapsedMs = performance.now() - observationStartedAt;
+		remainingProtocolIdleMs = Math.max(0, remainingProtocolIdleMs - elapsedMs);
+		remainingMeaningfulProgressMs = Math.max(
+			0,
+			remainingMeaningfulProgressMs - elapsedMs,
+		);
 		observationStartedAt = null;
-		remainingObservationMs = 0;
+		const timeoutReason =
+			scheduledTimeoutReason ??
+			(remainingMeaningfulProgressMs <= remainingProtocolIdleMs
+				? "meaningful_progress_timeout"
+				: "protocol_idle_timeout");
+		scheduledTimeoutReason = null;
 		finalized = true;
 		const timeoutError = new Error(
-			"Anthropic stream stopped making semantic progress after commitment",
+			timeoutReason === "meaningful_progress_timeout"
+				? "Anthropic stream stopped producing meaningful progress after commitment"
+				: "Anthropic stream stopped producing valid protocol activity after commitment",
 		);
 		downstreamController.enqueue(semanticTimeoutBytes.slice());
 		downstreamController.close();
-		reportTimeout();
+		reportTimeout(timeoutReason);
 		void cancelOnce(timeoutError).catch(reportCancelError);
 	};
 
@@ -173,14 +239,32 @@ export function createAnthropicSemanticLivenessStream(
 		}
 		observationStartedAt = performance.now();
 		clearLivenessTimer();
+		scheduledTimeoutReason =
+			remainingMeaningfulProgressMs <= remainingProtocolIdleMs
+				? "meaningful_progress_timeout"
+				: "protocol_idle_timeout";
 		livenessTimer = setTimeout(
-			handleSemanticTimeout,
-			Math.max(0, Math.ceil(remainingObservationMs)),
+			handleLivenessTimeout,
+			Math.max(
+				0,
+				Math.ceil(
+					Math.min(remainingProtocolIdleMs, remainingMeaningfulProgressMs),
+				),
+			),
 		);
 	};
 
 	const inspectFrame = (frame: string): void => {
 		const classification = classifyAnthropicSseFrame(frame);
+		framesSeen = Math.min(Number.MAX_SAFE_INTEGER, framesSeen + 1);
+		incrementAnthropicSseFrameKindCount(frameKindCounts, classification.kind);
+		if (classification.validProtocolActivity) {
+			validProtocolFramesSeen = Math.min(
+				Number.MAX_SAFE_INTEGER,
+				validProtocolFramesSeen + 1,
+			);
+			lastValidProtocolActivityAt = performance.now();
+		}
 		if (classification.kind === "malformed") protocolClean = false;
 		if (classification.kind === "error") {
 			if (semanticCommitted && classification.transientErrorType) {
@@ -206,7 +290,9 @@ export function createAnthropicSemanticLivenessStream(
 			case "meaningful":
 			case "unknown":
 				semanticCommitted = true;
-				remainingObservationMs = semanticTimeoutMs;
+				remainingProtocolIdleMs = semanticTimeoutMs;
+				remainingMeaningfulProgressMs = meaningfulProgressTimeoutMs;
+				lastMeaningfulProgressAt = performance.now();
 				return;
 			case "terminal_delta":
 				// Terminal recovery and upstream terminal events own these paths.
@@ -216,6 +302,10 @@ export function createAnthropicSemanticLivenessStream(
 				return;
 			case "keepalive":
 			case "structural":
+				if (semanticCommitted && classification.validProtocolActivity) {
+					remainingProtocolIdleMs = semanticTimeoutMs;
+				}
+				return;
 			case "malformed":
 				return;
 		}

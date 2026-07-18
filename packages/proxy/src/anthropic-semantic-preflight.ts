@@ -4,12 +4,25 @@ import {
 	SseLimitError,
 } from "@better-ccflare/core";
 import {
+	type AnthropicSseFrameKindCounts,
 	type AnthropicTransientSseErrorType,
 	classifyAnthropicSseFrame,
+	createAnthropicSseFrameKindCounts,
+	incrementAnthropicSseFrameKindCount,
 } from "./anthropic-sse-frame-classifier";
 import { ANTHROPIC_TERMINAL_RECOVERY_GRACE_MS } from "./anthropic-terminal-recovery";
 
 export const ANTHROPIC_PRE_COMMIT_SEMANTIC_TIMEOUT_MS = 120_000;
+// A live transport may legitimately emit pings while extended thinking is
+// hidden. Give that path twice the former idle window, but keep it at half the
+// whole-request rescue cap so one non-productive route cannot consume all 8m.
+export const ANTHROPIC_MEANINGFUL_PROGRESS_TIMEOUT_MS = 4 * 60 * 1000;
+// Once bytes are committed, replay is unsafe and long agent/tool workflows can
+// legitimately stay heartbeat-active while hidden work continues. Keep that
+// finite budget below the guard's ten-minute absolute request deadline, but do
+// not reuse the shorter precommit failover budget.
+export const ANTHROPIC_POST_COMMIT_MEANINGFUL_PROGRESS_TIMEOUT_MS =
+	8 * 60 * 1000;
 export const ANTHROPIC_PRE_COMMIT_TERMINAL_GRACE_MS =
 	ANTHROPIC_TERMINAL_RECOVERY_GRACE_MS;
 // This is a total retention budget, distinct from either parser limit. A
@@ -23,6 +36,10 @@ export const ANTHROPIC_PRE_COMMIT_ROUTE_SUPPRESSION_MS = 5 * 60 * 1000;
 
 export const ANTHROPIC_PRE_COMMIT_TIMEOUT_ENV =
 	"CCFLARE_ANTHROPIC_PRECOMMIT_TIMEOUT_MS";
+export const ANTHROPIC_MEANINGFUL_PROGRESS_TIMEOUT_ENV =
+	"CCFLARE_ANTHROPIC_MEANINGFUL_PROGRESS_TIMEOUT_MS";
+export const ANTHROPIC_POST_COMMIT_MEANINGFUL_PROGRESS_TIMEOUT_ENV =
+	"CCFLARE_ANTHROPIC_POSTCOMMIT_MEANINGFUL_PROGRESS_TIMEOUT_MS";
 export const ANTHROPIC_TERMINAL_GRACE_ENV =
 	"CCFLARE_ANTHROPIC_TERMINAL_GRACE_MS";
 export const ANTHROPIC_PRE_COMMIT_MAX_BUFFER_ENV =
@@ -31,12 +48,16 @@ export const ANTHROPIC_ROUTE_SUPPRESSION_ENV =
 	"CCFLARE_ANTHROPIC_ROUTE_SUPPRESSION_MS";
 
 const MAX_SEMANTIC_TIMEOUT_MS = 10 * 60 * 1000;
+const MAX_MEANINGFUL_PROGRESS_TIMEOUT_MS = 7 * 60 * 1000;
+const MAX_POST_COMMIT_MEANINGFUL_PROGRESS_TIMEOUT_MS = 9 * 60 * 1000;
 const MAX_TERMINAL_GRACE_MS = 60 * 1000;
 const MAX_PRE_COMMIT_BUFFERED_BYTES = 16 * 1024 * 1024;
 const MAX_ROUTE_SUPPRESSION_MS = 24 * 60 * 60 * 1000;
 
 export interface AnthropicStreamRuntimeConfig {
 	semanticTimeoutMs: number;
+	meaningfulProgressTimeoutMs: number;
+	postCommitMeaningfulProgressTimeoutMs: number;
 	terminalGraceMs: number;
 	maxBufferedBytes: number;
 	routeSuppressionMs: number;
@@ -79,6 +100,16 @@ export function getAnthropicStreamRuntimeConfig(): AnthropicStreamRuntimeConfig 
 			ANTHROPIC_PRE_COMMIT_TIMEOUT_ENV,
 			ANTHROPIC_PRE_COMMIT_SEMANTIC_TIMEOUT_MS,
 			MAX_SEMANTIC_TIMEOUT_MS,
+		),
+		meaningfulProgressTimeoutMs: boundedEnvInteger(
+			ANTHROPIC_MEANINGFUL_PROGRESS_TIMEOUT_ENV,
+			ANTHROPIC_MEANINGFUL_PROGRESS_TIMEOUT_MS,
+			MAX_MEANINGFUL_PROGRESS_TIMEOUT_MS,
+		),
+		postCommitMeaningfulProgressTimeoutMs: boundedEnvInteger(
+			ANTHROPIC_POST_COMMIT_MEANINGFUL_PROGRESS_TIMEOUT_ENV,
+			ANTHROPIC_POST_COMMIT_MEANINGFUL_PROGRESS_TIMEOUT_MS,
+			MAX_POST_COMMIT_MEANINGFUL_PROGRESS_TIMEOUT_MS,
 		),
 		terminalGraceMs: boundedEnvInteger(
 			ANTHROPIC_TERMINAL_GRACE_ENV,
@@ -136,6 +167,7 @@ export function isNativeAnthropicMessagesSse(
 
 export type AnthropicPreCommitStallReason =
 	| "semantic_timeout"
+	| "meaningful_progress_timeout"
 	| "terminal_grace_timeout"
 	| "buffer_limit"
 	| "upstream_eof"
@@ -146,6 +178,9 @@ export interface AnthropicPreCommitStallMetadata {
 	reason: AnthropicPreCommitStallReason;
 	bufferedBytes: number;
 	framesSeen: number;
+	validProtocolFramesSeen: number;
+	frameKindCounts: AnthropicSseFrameKindCounts;
+	lastValidProtocolActivityAgeMs: number | null;
 	terminalEvidenceSeen: boolean;
 	limitBytes?: number;
 	errorType?: AnthropicTransientSseErrorType;
@@ -161,6 +196,9 @@ export class AnthropicPreCommitStallError extends Error {
 	readonly reason: AnthropicPreCommitStallReason;
 	readonly bufferedBytes: number;
 	readonly framesSeen: number;
+	readonly validProtocolFramesSeen: number;
+	readonly frameKindCounts: AnthropicSseFrameKindCounts;
+	readonly lastValidProtocolActivityAgeMs: number | null;
 	readonly terminalEvidenceSeen: boolean;
 	readonly limitBytes?: number;
 	readonly errorType?: AnthropicTransientSseErrorType;
@@ -173,6 +211,10 @@ export class AnthropicPreCommitStallError extends Error {
 		this.reason = metadata.reason;
 		this.bufferedBytes = metadata.bufferedBytes;
 		this.framesSeen = metadata.framesSeen;
+		this.validProtocolFramesSeen = metadata.validProtocolFramesSeen;
+		this.frameKindCounts = metadata.frameKindCounts;
+		this.lastValidProtocolActivityAgeMs =
+			metadata.lastValidProtocolActivityAgeMs;
 		this.terminalEvidenceSeen = metadata.terminalEvidenceSeen;
 		this.limitBytes = metadata.limitBytes;
 		this.errorType = metadata.errorType;
@@ -206,6 +248,9 @@ export class AnthropicPreCommitTransientError extends AnthropicPreCommitStallErr
 export class AnthropicPreCommitAbortedError extends Error {
 	readonly bufferedBytes: number;
 	readonly framesSeen: number;
+	readonly validProtocolFramesSeen: number;
+	readonly frameKindCounts: AnthropicSseFrameKindCounts;
+	readonly lastValidProtocolActivityAgeMs: number | null;
 	readonly terminalEvidenceSeen: boolean;
 
 	constructor(
@@ -215,13 +260,19 @@ export class AnthropicPreCommitAbortedError extends Error {
 		this.name = "AnthropicPreCommitAbortedError";
 		this.bufferedBytes = metadata.bufferedBytes;
 		this.framesSeen = metadata.framesSeen;
+		this.validProtocolFramesSeen = metadata.validProtocolFramesSeen;
+		this.frameKindCounts = metadata.frameKindCounts;
+		this.lastValidProtocolActivityAgeMs =
+			metadata.lastValidProtocolActivityAgeMs;
 		this.terminalEvidenceSeen = metadata.terminalEvidenceSeen;
 	}
 }
 
 export interface AnthropicSemanticPreflightOptions {
-	/** Absolute time allowed before the first content-bearing event. */
+	/** Maximum idle time between valid complete protocol events before content. */
 	semanticTimeoutMs?: number;
+	/** Maximum total time without content-bearing progress before commitment. */
+	meaningfulProgressTimeoutMs?: number;
 	/** Time allowed for message_stop after a terminal message_delta. */
 	terminalGraceMs?: number;
 	/** Hard cap on all raw bytes retained before semantic commitment. */
@@ -242,6 +293,11 @@ function positiveInteger(value: number, optionName: string): number {
 		throw new RangeError(`${optionName} must be a positive safe integer`);
 	}
 	return value;
+}
+
+function boundedAgeMs(timestamp: number | null): number | null {
+	if (timestamp === null) return null;
+	return Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Date.now() - timestamp));
 }
 
 function createReleasedStream(
@@ -356,6 +412,11 @@ export async function gateAnthropicSsePreCommit(
 		options.semanticTimeoutMs ?? ANTHROPIC_PRE_COMMIT_SEMANTIC_TIMEOUT_MS,
 		"semanticTimeoutMs",
 	);
+	const meaningfulProgressTimeoutMs = positiveInteger(
+		options.meaningfulProgressTimeoutMs ??
+			ANTHROPIC_MEANINGFUL_PROGRESS_TIMEOUT_MS,
+		"meaningfulProgressTimeoutMs",
+	);
 	const terminalGraceMs = positiveInteger(
 		options.terminalGraceMs ?? ANTHROPIC_PRE_COMMIT_TERMINAL_GRACE_MS,
 		"terminalGraceMs",
@@ -372,10 +433,14 @@ export async function gateAnthropicSsePreCommit(
 	});
 	const bufferedChunks: Uint8Array[] = [];
 	const startedAt = Date.now();
-	const semanticDeadline = startedAt + semanticTimeoutMs;
+	let protocolIdleDeadline = startedAt + semanticTimeoutMs;
+	const meaningfulProgressDeadline = startedAt + meaningfulProgressTimeoutMs;
 
 	let bufferedBytes = 0;
 	let framesSeen = 0;
+	let validProtocolFramesSeen = 0;
+	const frameKindCounts = createAnthropicSseFrameKindCounts();
+	let lastValidProtocolActivityAt: number | null = null;
 	let terminalEvidenceSeen = false;
 	let terminalDeadline: number | undefined;
 	let cancelPromise: Promise<void> | null = null;
@@ -388,6 +453,9 @@ export async function gateAnthropicSsePreCommit(
 		reason,
 		bufferedBytes,
 		framesSeen,
+		validProtocolFramesSeen,
+		frameKindCounts: { ...frameKindCounts },
+		lastValidProtocolActivityAgeMs: boundedAgeMs(lastValidProtocolActivityAt),
 		terminalEvidenceSeen,
 		...(limitBytes === undefined ? {} : { limitBytes }),
 		...(errorType === undefined ? {} : { errorType }),
@@ -406,7 +474,8 @@ export async function gateAnthropicSsePreCommit(
 	const cancelBestEffort = (reason: unknown): void => {
 		void cancelOnce(reason).catch(() => {
 			// Transport cleanup is best-effort. It must never delay a semantic
-			// deadline or caller cancellation, including when cancel never settles.
+			// protocol-idle deadline or caller cancellation, including when cancel
+			// never settles.
 		});
 	};
 
@@ -425,6 +494,9 @@ export async function gateAnthropicSsePreCommit(
 		const error = new AnthropicPreCommitAbortedError({
 			bufferedBytes,
 			framesSeen,
+			validProtocolFramesSeen,
+			frameKindCounts: { ...frameKindCounts },
+			lastValidProtocolActivityAgeMs: boundedAgeMs(lastValidProtocolActivityAt),
 			terminalEvidenceSeen,
 		});
 		cancelBestEffort(error);
@@ -436,6 +508,11 @@ export async function gateAnthropicSsePreCommit(
 			{
 				bufferedBytes,
 				framesSeen,
+				validProtocolFramesSeen,
+				frameKindCounts: { ...frameKindCounts },
+				lastValidProtocolActivityAgeMs: boundedAgeMs(
+					lastValidProtocolActivityAt,
+				),
 				terminalEvidenceSeen,
 			},
 			errorType,
@@ -445,8 +522,19 @@ export async function gateAnthropicSsePreCommit(
 	};
 
 	const applyFrameDecision = (frame: string): boolean => {
-		framesSeen += 1;
+		framesSeen = Math.min(Number.MAX_SAFE_INTEGER, framesSeen + 1);
 		const classification = classifyAnthropicSseFrame(frame);
+		incrementAnthropicSseFrameKindCount(frameKindCounts, classification.kind);
+		if (classification.validProtocolActivity) {
+			validProtocolFramesSeen = Math.min(
+				Number.MAX_SAFE_INTEGER,
+				validProtocolFramesSeen + 1,
+			);
+			lastValidProtocolActivityAt = Date.now();
+			if (terminalDeadline === undefined) {
+				protocolIdleDeadline = lastValidProtocolActivityAt + semanticTimeoutMs;
+			}
+		}
 		if (classification.transientErrorType) {
 			return failTransient(classification.transientErrorType);
 		}
@@ -466,8 +554,17 @@ export async function gateAnthropicSsePreCommit(
 	while (true) {
 		if (options.signal?.aborted) return abort();
 		// Terminal protocol evidence starts a fresh, bounded grace window. It
-		// supersedes the generic semantic deadline whether that is sooner or later.
-		const activeDeadline = terminalDeadline ?? semanticDeadline;
+		// supersedes the generic protocol-idle deadline whether that is sooner or
+		// later.
+		const activeTimeoutReason: AnthropicPreCommitStallReason =
+			terminalDeadline !== undefined
+				? "terminal_grace_timeout"
+				: meaningfulProgressDeadline <= protocolIdleDeadline
+					? "meaningful_progress_timeout"
+					: "semantic_timeout";
+		const activeDeadline =
+			terminalDeadline ??
+			Math.min(protocolIdleDeadline, meaningfulProgressDeadline);
 		let readResult: ByteReadResult | typeof READ_TIMEOUT | typeof READ_ABORTED;
 		try {
 			readResult = await readBefore(
@@ -482,11 +579,7 @@ export async function gateAnthropicSsePreCommit(
 		if (readResult === READ_ABORTED) return abort();
 
 		if (readResult === READ_TIMEOUT) {
-			return fail(
-				terminalDeadline === undefined
-					? "semantic_timeout"
-					: "terminal_grace_timeout",
-			);
+			return fail(activeTimeoutReason);
 		}
 
 		if (readResult.done) {
