@@ -42,7 +42,7 @@ describe("AnthropicProvider — streaming.test.ts", () => {
 	// ─────────────────────────────────────────────
 	describe("parseRateLimit", () => {
 		it("rate_limited status + reset header → isRateLimited:true and resetTime in ms", () => {
-			const unixSeconds = 1_700_000_000;
+			const unixSeconds = Math.floor(Date.now() / 1000) + 60;
 			const response = new Response(null, {
 				status: 200,
 				headers: {
@@ -104,7 +104,7 @@ describe("AnthropicProvider — streaming.test.ts", () => {
 		});
 
 		it("resetTime present but status is not rate_limited → isRateLimited:false", () => {
-			const unixSeconds = 1_700_000_000;
+			const unixSeconds = Math.floor(Date.now() / 1000) + 60;
 			const response = new Response(null, {
 				status: 200,
 				headers: {

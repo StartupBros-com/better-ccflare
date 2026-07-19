@@ -21,8 +21,13 @@ mock.module("@better-ccflare/database", () => ({
 }));
 
 const { usageCache } = await import("@better-ccflare/providers");
+const { AnthropicProvider } = await import(
+	"../../../../providers/src/providers/anthropic/provider"
+);
 const { proxyWithAccount } = await import("../proxy-operations");
-const { getRequestRateLimitOutcomes } = await import("../rate-limit-scope");
+const { getAnthropicRateLimitResetAt, getRequestRateLimitOutcomes } =
+	await import("../rate-limit-scope");
+const { RoutingAttemptLedger } = await import("../routing-attempt-ledger");
 
 // Anthropic account fixture — the out_of_credits header is Anthropic-specific.
 function makeAccount(overrides: Partial<Account> = {}): Account {
@@ -460,7 +465,11 @@ const INCIDENT_NOW = 1_800_000_000_000;
 function cacheIncidentUsage(
 	accountId: string,
 	observedAt: number,
-	overrides: { weeklyAll?: number; family?: string } = {},
+	overrides: {
+		weeklyAll?: number;
+		family?: string;
+		accountWindowsActive?: boolean;
+	} = {},
 ): void {
 	const realDateNow = Date.now;
 	Date.now = () => observedAt;
@@ -471,7 +480,7 @@ function cacheIncidentUsage(
 					kind: "session",
 					percent: 0,
 					resets_at: new Date(INCIDENT_NOW + 60 * 60 * 1000).toISOString(),
-					is_active: true,
+					is_active: overrides.accountWindowsActive ?? true,
 				},
 				{
 					kind: "weekly_all",
@@ -479,7 +488,7 @@ function cacheIncidentUsage(
 					resets_at: new Date(
 						INCIDENT_NOW + 6 * 24 * 60 * 60 * 1000,
 					).toISOString(),
-					is_active: true,
+					is_active: overrides.accountWindowsActive ?? true,
 				},
 				{
 					kind: "weekly_scoped",
@@ -576,6 +585,53 @@ describe("proxyWithAccount — generic Anthropic 429 scope", () => {
 		usageCache.delete("acc-anthropic-1");
 	});
 
+	for (const fixture of [
+		{ name: "numeric delay", headers: { "retry-after": "45" } },
+		{
+			name: "HTTP-date",
+			headers: {
+				"retry-after": new Date(INCIDENT_NOW + 45_000).toUTCString(),
+			},
+		},
+		{ name: "invalid value", headers: { "retry-after": "not-a-reset" } },
+		{
+			name: "past value",
+			headers: { "x-ratelimit-reset": String(INCIDENT_NOW / 1000 - 1) },
+		},
+		{
+			name: "x-ratelimit reset",
+			headers: { "x-ratelimit-reset": String(INCIDENT_NOW / 1000 + 45) },
+		},
+		{
+			name: "unified reset",
+			headers: {
+				"anthropic-ratelimit-unified-reset": String(INCIDENT_NOW / 1000 + 45),
+			},
+		},
+		{
+			name: "earliest precedence",
+			headers: {
+				"retry-after": "90",
+				"x-ratelimit-reset": String(INCIDENT_NOW / 1000 + 30),
+				"anthropic-ratelimit-unified-reset": String(INCIDENT_NOW / 1000 + 60),
+			},
+		},
+	] as const) {
+		it(`keeps provider and proxy reset parsing aligned for ${fixture.name}`, () => {
+			const rateLimitResponse = new Response(null, {
+				status: 529,
+				headers: fixture.headers,
+			});
+			const proxyReset = getAnthropicRateLimitResetAt(
+				rateLimitResponse,
+				INCIDENT_NOW,
+			);
+			expect(
+				new AnthropicProvider().parseRateLimit(rateLimitResponse).resetTime,
+			).toBe(proxyReset ?? undefined);
+		});
+	}
+
 	it("isolates the Fable100 / weekly-all72 incident without benching Opus", async () => {
 		cacheIncidentUsage("acc-anthropic-1", INCIDENT_NOW - 120_000);
 		globalThis.fetch = mock(async () => generic429Response());
@@ -626,6 +682,126 @@ describe("proxyWithAccount — generic Anthropic 429 scope", () => {
 		expect(saveMock.mock.calls[0]?.[9]).toEqual({ model: "claude-fable-5" });
 	});
 
+	it("isolates the exact inactive-account-window live fixture to Fable", async () => {
+		cacheIncidentUsage("acc-anthropic-1", INCIDENT_NOW - 120_000, {
+			weeklyAll: 84,
+			accountWindowsActive: false,
+		});
+		globalThis.fetch = mock(async () =>
+			generic429Response({ "retry-after": "120" }),
+		);
+		const ctx = makeProxyContextWithAsyncExec();
+		const account = makeAccount();
+		const bodyBuffer = makeRequestBody("claude-fable-5");
+		const req = makeRequest(bodyBuffer);
+
+		const result = await proxyWithAccount(
+			req,
+			new URL(req.url),
+			account,
+			makeRequestMeta(),
+			bodyBuffer,
+			() => undefined,
+			0,
+			ctx,
+		);
+
+		expect(result).toBeNull();
+		expect(account.rate_limited_until).toBeNull();
+		expect(ctx.dbOps.markAccountRateLimited).not.toHaveBeenCalled();
+		expect(
+			usageCache.getFamilyScopedExhaustion(
+				account.id,
+				"claude-fable-5",
+				INCIDENT_NOW,
+			),
+		).toMatchObject({ family: "fable", expiresAt: INCIDENT_NOW + 60_000 });
+		expect(
+			usageCache.getFamilyScopedExhaustion(
+				account.id,
+				"claude-opus-4-8",
+				INCIDENT_NOW,
+			),
+		).toBeNull();
+		expect(getRequestRateLimitOutcomes(req)).toEqual([
+			expect.objectContaining({
+				scope: "family",
+				family: "fable",
+				reason: "matching_scoped_limit",
+				availableAt: INCIDENT_NOW + 60_000,
+			}),
+		]);
+	});
+
+	it("keeps the live startup-empty generic 429 exact to Fable and leaves Opus eligible", async () => {
+		usageCache.delete("acc-anthropic-1");
+		globalThis.fetch = mock(async () =>
+			generic429Response({ "retry-after": "120" }),
+		);
+		const ctx = makeProxyContextWithAsyncExec();
+		const account = makeAccount();
+		const bodyBuffer = makeRequestBody("claude-fable-5");
+		const req = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			body: bodyBuffer,
+			headers: {
+				"Content-Type": "application/json",
+				"anthropic-beta": "feature-b,feature-a",
+			},
+		});
+
+		const result = await proxyWithAccount(
+			req,
+			new URL(req.url),
+			account,
+			makeRequestMeta(),
+			bodyBuffer,
+			() => undefined,
+			0,
+			ctx,
+		);
+
+		expect(result).toBeNull();
+		expect(account.rate_limited_until).toBeNull();
+		expect(account.consecutive_rate_limits).toBe(0);
+		expect(ctx.dbOps.markAccountRateLimited).not.toHaveBeenCalled();
+		const marker = usageCache.getModelScopedExhaustion(
+			account.id,
+			"claude-fable-5",
+			"feature-a,feature-b",
+			INCIDENT_NOW,
+		);
+		expect(marker).toMatchObject({ expiresAt: INCIDENT_NOW + 120_000 });
+		expect(
+			usageCache.getModelScopedExhaustion(
+				account.id,
+				"claude-opus-4-8",
+				"feature-a,feature-b",
+				INCIDENT_NOW,
+			),
+		).toBeNull();
+		expect(
+			usageCache.getFamilyScopedExhaustion(
+				account.id,
+				"claude-opus-4-8",
+				INCIDENT_NOW,
+			),
+		).toBeNull();
+		expect(getRequestRateLimitOutcomes(req)).toEqual([
+			expect.objectContaining({
+				accountId: account.id,
+				scope: "model",
+				family: "fable",
+				attemptedModel: "claude-fable-5",
+				reason: "missing_usage",
+				availableAt: INCIDENT_NOW + 120_000,
+			}),
+		]);
+		const saveMock = ctx.dbOps.saveRequest as ReturnType<typeof mock>;
+		expect(saveMock.mock.calls[0]?.[6]).toBe("model_scoped_429");
+		expect(saveMock.mock.calls[0]?.[9]).toEqual({ model: "claude-fable-5" });
+	});
+
 	it("cancels the discarded body for a model-scoped no-fallback 429", async () => {
 		cacheIncidentUsage("acc-anthropic-1", INCIDENT_NOW - 120_000);
 		const state = { cancelled: false };
@@ -658,7 +834,7 @@ describe("proxyWithAccount — generic Anthropic 429 scope", () => {
 		expect(state.cancelled).toBe(true);
 	});
 
-	it("keeps the same fixture global when its snapshot is 181 seconds old", async () => {
+	it("keeps the same fixture exact-model scoped when its snapshot is 181 seconds old", async () => {
 		cacheIncidentUsage("acc-anthropic-1", INCIDENT_NOW - 181_000);
 		globalThis.fetch = mock(async () => generic429Response());
 		const ctx = makeProxyContextWithAsyncExec();
@@ -676,8 +852,8 @@ describe("proxyWithAccount — generic Anthropic 429 scope", () => {
 			ctx,
 		);
 
-		expect(account.rate_limited_until).not.toBeNull();
-		expect(ctx.dbOps.markAccountRateLimited).toHaveBeenCalledTimes(1);
+		expect(account.rate_limited_until).toBeNull();
+		expect(ctx.dbOps.markAccountRateLimited).not.toHaveBeenCalled();
 		expect(
 			usageCache.getFamilyScopedExhaustion(
 				account.id,
@@ -685,6 +861,14 @@ describe("proxyWithAccount — generic Anthropic 429 scope", () => {
 				INCIDENT_NOW,
 			),
 		).toBeNull();
+		expect(
+			usageCache.getModelScopedExhaustion(
+				account.id,
+				"claude-fable-5",
+				null,
+				INCIDENT_NOW,
+			),
+		).not.toBeNull();
 	});
 
 	it("keeps weekly-all100 and a hard response signal account-scoped", async () => {
@@ -925,6 +1109,82 @@ describe("proxyWithAccount — scoped same-account model continuation", () => {
 		globalThis.fetch = originalFetch;
 		Date.now = realDateNow;
 		usageCache.delete("acc-anthropic-1");
+	});
+
+	it("stops before a sibling-model fallback when the first 429 proves account exhaustion", async () => {
+		cacheIncidentUsage("acc-anthropic-1", INCIDENT_NOW - 120_000);
+		const hardAccount429 = observableErrorResponse(429, {
+			"anthropic-ratelimit-unified-status": "rate_limited",
+			"retry-after": "120",
+		});
+		const attemptedModels: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const request = input instanceof Request ? input : new Request(input);
+			const body = (await request.clone().json()) as { model?: string };
+			const model = body.model ?? "missing";
+			attemptedModels.push(model);
+			return attemptedModels.length === 1
+				? hardAccount429.response
+				: generic429Response();
+		});
+		const ctx = makeProxyContextWithAsyncExec();
+		const account = makeAccount({
+			model_mappings: JSON.stringify({
+				fable: ["claude-fable-5", "claude-opus-4-8"],
+			}),
+		});
+		const bodyBuffer = makeRequestBody("claude-fable-5");
+		const req = makeRequest(bodyBuffer);
+		const routingAttemptLedger = new RoutingAttemptLedger();
+
+		const result = await proxyWithAccount(
+			req,
+			new URL(req.url),
+			account,
+			makeRequestMeta(),
+			bodyBuffer,
+			() => undefined,
+			0,
+			ctx,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			false,
+			undefined,
+			routingAttemptLedger,
+		);
+
+		expect(result).toBeNull();
+		expect(attemptedModels).toEqual(["claude-fable-5"]);
+		expect(hardAccount429.cancelCount()).toBe(1);
+		expect(account.rate_limited_until).toBe(INCIDENT_NOW + 120_000);
+		expect(ctx.dbOps.markAccountRateLimited).toHaveBeenCalledTimes(1);
+		expect(getRequestRateLimitOutcomes(req)).toEqual([
+			expect.objectContaining({
+				accountId: account.id,
+				status: 429,
+				scope: "account",
+				family: "fable",
+				attemptedModel: "claude-fable-5",
+				reason: "hard_response_signal",
+				availableAt: INCIDENT_NOW + 120_000,
+			}),
+		]);
+		const saveMock = ctx.dbOps.saveRequest as ReturnType<typeof mock>;
+		expect(saveMock).toHaveBeenCalledTimes(1);
+		expect(saveMock.mock.calls[0]?.[6]).toBe("model_fallback_429");
+		expect(routingAttemptLedger.claim(account.id, "claude-opus-4-8")).toBe(
+			false,
+		);
+		expect(
+			usageCache.getModelScopedExhaustion(
+				account.id,
+				"claude-opus-4-8",
+				null,
+				INCIDENT_NOW,
+			),
+		).toBeNull();
 	});
 
 	it("continues from an initial Fable family failure to distinct Opus", async () => {
@@ -1351,14 +1611,19 @@ describe("proxyWithAccount — scoped failures returned by a 529 retry", () => {
 		expect(familySave.mock.calls[0]?.[9]).toEqual({ model: "claude-fable-5" });
 	});
 
-	it("keeps stale usage and hard Anthropic signals account-scoped after a 529", async () => {
+	it("keeps stale usage model-scoped but explicit hard signals account-scoped after a 529", async () => {
 		for (const fixture of [
-			{ observedAt: INCIDENT_NOW - 181_000, headers: {} },
+			{
+				observedAt: INCIDENT_NOW - 181_000,
+				headers: {},
+				expectAccountCooldown: false,
+			},
 			{
 				observedAt: INCIDENT_NOW - 120_000,
 				headers: {
 					"anthropic-ratelimit-unified-status": "rate_limited",
 				},
+				expectAccountCooldown: true,
 			},
 		]) {
 			usageCache.delete("acc-anthropic-1");
@@ -1387,8 +1652,34 @@ describe("proxyWithAccount — scoped failures returned by a 529 retry", () => {
 
 			expect(result).toBeNull();
 			expect(calls).toBe(2);
-			expect(account.rate_limited_until).not.toBeNull();
-			expect(ctx.dbOps.markAccountRateLimited).toHaveBeenCalledTimes(1);
+			if (fixture.expectAccountCooldown) {
+				expect(account.rate_limited_until).not.toBeNull();
+				expect(ctx.dbOps.markAccountRateLimited).toHaveBeenCalledTimes(1);
+				expect(getRequestRateLimitOutcomes(req)).toEqual([
+					expect.objectContaining({
+						scope: "account",
+						reason: "hard_response_signal",
+						availableAt: account.rate_limited_until,
+					}),
+				]);
+			} else {
+				expect(account.rate_limited_until).toBeNull();
+				expect(ctx.dbOps.markAccountRateLimited).not.toHaveBeenCalled();
+				expect(
+					usageCache.getModelScopedExhaustion(
+						account.id,
+						"claude-fable-5",
+						null,
+						INCIDENT_NOW,
+					),
+				).not.toBeNull();
+				expect(getRequestRateLimitOutcomes(req)).toEqual([
+					expect.objectContaining({
+						scope: "model",
+						reason: "stale_usage",
+					}),
+				]);
+			}
 			expect(
 				usageCache.getFamilyScopedExhaustion(
 					account.id,
@@ -1396,7 +1687,6 @@ describe("proxyWithAccount — scoped failures returned by a 529 retry", () => {
 					INCIDENT_NOW,
 				),
 			).toBeNull();
-			expect(getRequestRateLimitOutcomes(req)).toEqual([]);
 		}
 	});
 });

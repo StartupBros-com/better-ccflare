@@ -49,6 +49,7 @@ mock.module("@better-ccflare/database", () => ({
 }));
 
 const usageCollectorModule = await import("../usage-collector");
+const { usageCache } = await import("@better-ccflare/providers");
 const { alignRouteCandidateIds, handleProxy } = await import("../proxy");
 
 const MODEL = "claude-opus-4-8";
@@ -1142,7 +1143,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		});
 	});
 
-	it("reuses account cooldown policy for a precommit rate_limit_error", async () => {
+	it("preserves canonical beta scope for a precommit rate_limit_error", async () => {
 		const first = makeAccount("limited-a");
 		const second = makeAccount("healthy-b");
 		const { ctx } = makeContext([first, second], makeCombo([first, second]));
@@ -1158,13 +1159,27 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			);
 		}) as unknown as typeof fetch;
 
-		const before = Date.now();
 		const request = makeRequest();
-		const response = await handleProxy(request, new URL(request.url), ctx);
+		request.headers.set("anthropic-beta", "feature-b, feature-a,feature-b");
+		try {
+			const response = await handleProxy(request, new URL(request.url), ctx);
 
-		expect(await response.text()).toBe(SUCCESS);
-		expect(first.rate_limited_until).toBeGreaterThan(before);
-		expect(first.consecutive_rate_limits).toBe(1);
+			expect(await response.text()).toBe(SUCCESS);
+			expect(first.rate_limited_until).toBeNull();
+			expect(first.consecutive_rate_limits).toBe(0);
+			expect(
+				usageCache.getModelScopedExhaustion(
+					first.id,
+					MODEL,
+					"feature-a,feature-b",
+				),
+			).not.toBeNull();
+			expect(
+				usageCache.getModelScopedExhaustion(first.id, MODEL, null),
+			).toBeNull();
+		} finally {
+			usageCache.delete(first.id);
+		}
 	});
 
 	it("commits nonretryable SSE errors byte-identically without trying another route", async () => {

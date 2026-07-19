@@ -2780,7 +2780,7 @@ export function createAccountForceResetRateLimitHandler(
 				return errorResponse(NotFound("Account not found"));
 			}
 
-			const resetSuccess = dbOps.forceResetAccountRateLimit(accountId);
+			const resetSuccess = await dbOps.forceResetAccountRateLimit(accountId);
 			if (!resetSuccess) {
 				return errorResponse(
 					new Error(
@@ -2788,6 +2788,7 @@ export function createAccountForceResetRateLimitHandler(
 					),
 				);
 			}
+			usageCache.clearReactiveScopedDepletions(accountId);
 			clearAccountRefreshCache(accountId);
 
 			// Trigger immediate poll if this server has a polling token provider for the account.

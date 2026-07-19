@@ -1,6 +1,7 @@
 import { getModelFamily } from "@better-ccflare/core";
 import {
 	MODEL_SCOPED_DEPLETION_TTL_MS,
+	parseAnthropicRateLimitResetAt,
 	type UsageSnapshot,
 } from "@better-ccflare/providers";
 
@@ -73,6 +74,23 @@ function accountDecision(
 	};
 }
 
+function modelDecision(
+	options: ClassifyPreByte429Options,
+	reason: RateLimitScopeReason,
+	family: string,
+	snapshotAgeMs: number | null,
+	now: number,
+): RateLimitScopeDecision {
+	return {
+		scope: "model",
+		family,
+		attemptedModel: options.attemptedModel,
+		reason,
+		markerExpiresAt: getScoped429MarkerExpiry(options.response, now),
+		snapshotAgeMs,
+	};
+}
+
 function finitePercent(value: unknown): number | null {
 	return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
@@ -96,6 +114,25 @@ function limitFamily(limit: AnthropicLimitLike): string | null {
 	return displayFamily ?? idFamily;
 }
 
+/**
+ * Read an upstream timing hint without inferring anything about failure scope.
+ * Multiple usable hints resolve to the earliest recovery time.
+ */
+export function getAnthropicRateLimitResetAt(
+	response: Response,
+	now: number = Date.now(),
+): number | null {
+	return parseAnthropicRateLimitResetAt(response.headers, now);
+}
+
+function getScoped429MarkerExpiry(response: Response, now: number): number {
+	const ttlCeiling = now + MODEL_SCOPED_DEPLETION_TTL_MS;
+	const upstreamReset = getAnthropicRateLimitResetAt(response, now);
+	return upstreamReset === null
+		? ttlCeiling
+		: Math.min(ttlCeiling, upstreamReset);
+}
+
 /** Headers that positively establish an account-level Anthropic rate limit. */
 export function hasHardAnthropicAccountSignal(response: Response): boolean {
 	const status = response.headers
@@ -103,17 +140,10 @@ export function hasHardAnthropicAccountSignal(response: Response): boolean {
 		?.trim()
 		.toLowerCase();
 	if (status && HARD_UNIFIED_STATUSES.has(status)) return true;
-	for (const header of [
-		"retry-after",
-		"x-ratelimit-reset",
-		"anthropic-ratelimit-unified-reset",
-	]) {
-		if (response.headers.has(header)) return true;
-	}
 	const remaining = response.headers.get(
 		"anthropic-ratelimit-unified-remaining",
 	);
-	if (remaining !== null) {
+	if (remaining !== null && remaining.trim() !== "") {
 		const parsed = Number(remaining);
 		if (Number.isFinite(parsed) && parsed <= 0) return true;
 	}
@@ -121,8 +151,10 @@ export function hasHardAnthropicAccountSignal(response: Response): boolean {
 }
 
 /**
- * Conservatively infer whether a generic pre-byte Anthropic 429 is isolated to
- * one model family. Every required fact is positive; ambiguity remains global.
+ * Scope a generic Anthropic 429 using only positive capacity evidence. Explicit
+ * account-wide exhaustion stays account scoped; fresh matching scoped usage is
+ * family scoped; every ambiguous recognized-Claude case is isolated to the
+ * exact model + client-beta candidate by the caller.
  */
 export function classifyPreByte429(
 	options: ClassifyPreByte429Options,
@@ -144,7 +176,7 @@ export function classifyPreByte429(
 		return accountDecision(options, "unknown_model", null, null);
 	}
 	if (options.snapshot === null) {
-		return accountDecision(options, "missing_usage", family, null);
+		return modelDecision(options, "missing_usage", family, null, now);
 	}
 
 	const maxAgeMs = options.maxUsageAgeMs ?? REACTIVE_429_MAX_USAGE_AGE_MS;
@@ -154,61 +186,72 @@ export function classifyPreByte429(
 		snapshotAgeMs < 0 ||
 		snapshotAgeMs > maxAgeMs
 	) {
-		return accountDecision(options, "stale_usage", family, snapshotAgeMs);
+		return modelDecision(options, "stale_usage", family, snapshotAgeMs, now);
 	}
 
 	const rawLimits = (options.snapshot.data as { limits?: unknown }).limits;
 	if (!Array.isArray(rawLimits)) {
-		return accountDecision(
+		return modelDecision(
 			options,
 			"missing_account_headroom",
 			family,
 			snapshotAgeMs,
+			now,
 		);
 	}
 	const limits = (rawLimits as AnthropicLimitLike[]).filter(
-		(limit) => limit && limit.is_active !== false,
+		(limit) => limit != null,
 	);
+	const activeLimits = limits.filter((limit) => limit.is_active !== false);
+	const activeAccountLimits = activeLimits.filter(
+		(limit) => limit.kind === "session" || limit.kind === "weekly_all",
+	);
+	for (const limit of activeAccountLimits) {
+		const percent = finitePercent(limit.percent);
+		if (percent !== null && percent >= 100) {
+			return accountDecision(
+				options,
+				"account_capacity_signal",
+				family,
+				snapshotAgeMs,
+			);
+		}
+	}
 	for (const kind of ["session", "weekly_all"] as const) {
 		const matching = limits.filter((limit) => limit.kind === kind);
 		if (matching.length === 0) {
-			return accountDecision(
+			return modelDecision(
 				options,
 				"missing_account_headroom",
 				family,
 				snapshotAgeMs,
+				now,
 			);
 		}
 		for (const limit of matching) {
 			const percent = finitePercent(limit.percent);
 			if (percent === null || percent < 0) {
-				return accountDecision(
+				return modelDecision(
 					options,
 					"conflicting_usage",
 					family,
 					snapshotAgeMs,
-				);
-			}
-			if (percent >= 100) {
-				return accountDecision(
-					options,
-					"account_capacity_signal",
-					family,
-					snapshotAgeMs,
+					now,
 				);
 			}
 		}
 	}
 
-	const scoped = limits.filter(
+	const scoped = activeLimits.filter(
 		(limit) => limit.kind === "weekly_scoped" && limitFamily(limit) === family,
 	);
 	if (scoped.length === 0) {
-		return accountDecision(
+		return modelDecision(
 			options,
 			"missing_matching_scoped_limit",
 			family,
 			snapshotAgeMs,
+			now,
 		);
 	}
 	const futureResets: number[] = [];
@@ -221,11 +264,12 @@ export function classifyPreByte429(
 			reset === "invalid" ||
 			(typeof reset === "number" && reset <= now)
 		) {
-			return accountDecision(
+			return modelDecision(
 				options,
 				"conflicting_usage",
 				family,
 				snapshotAgeMs,
+				now,
 			);
 		}
 		if (typeof reset === "number") futureResets.push(reset);
@@ -233,12 +277,18 @@ export function classifyPreByte429(
 
 	const evidenceExpiresAt = options.snapshot.observedAt + maxAgeMs;
 	const markerExpiresAt = Math.min(
-		now + MODEL_SCOPED_DEPLETION_TTL_MS,
+		getScoped429MarkerExpiry(options.response, now),
 		evidenceExpiresAt,
 		...(futureResets.length > 0 ? futureResets : [Number.POSITIVE_INFINITY]),
 	);
 	if (!Number.isFinite(markerExpiresAt) || markerExpiresAt <= now) {
-		return accountDecision(options, "conflicting_usage", family, snapshotAgeMs);
+		return modelDecision(
+			options,
+			"conflicting_usage",
+			family,
+			snapshotAgeMs,
+			now,
+		);
 	}
 	return {
 		scope: "family",

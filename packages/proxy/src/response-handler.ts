@@ -21,7 +21,10 @@ import { AnthropicStreamOutcomeTracker } from "./anthropic-stream-outcome";
 import { createAnthropicTerminalRecoveryStream } from "./anthropic-terminal-recovery";
 import type { ProxyContext } from "./handlers";
 import { applyRateLimitCooldown } from "./handlers/rate-limit-cooldown";
-import { classifyPreByte429 } from "./handlers/rate-limit-scope";
+import {
+	classifyPreByte429,
+	getAnthropicRateLimitResetAt,
+} from "./handlers/rate-limit-scope";
 import { createSseRateLimitSniffer } from "./handlers/sse-rate-limit-sniffer";
 import { ingestModelsListing } from "./model-catalog";
 import {
@@ -65,9 +68,9 @@ function getMidStreamRateLimitCooldownMs(): number {
 
 /**
  * Scope an Anthropic `rate_limit_error` discovered only after SSE bytes have
- * already been forwarded. A fresh, internally consistent usage snapshot can
- * prove that the concrete attempted family alone is exhausted; everything
- * ambiguous retains the existing account-wide cooldown.
+ * already been forwarded. Fresh positive usage can prove a family or account
+ * limit; missing, stale, or ambiguous usage is isolated to the exact model +
+ * client-beta candidate.
  *
  * This intentionally does not replay the current stream. Once bytes have been
  * emitted, retrying another account would splice two upstream responses into
@@ -80,6 +83,7 @@ export function handleAnthropicSseRateLimit(
 	response: Response,
 	requestId: string,
 	ctx: ProxyContext,
+	betaSignature: string | null = null,
 ): void {
 	if (firedReason === "rate_limit_error") {
 		// Reuse the same conservative policy as a pre-byte generic 429. The SSE
@@ -97,23 +101,44 @@ export function handleAnthropicSseRateLimit(
 			attemptedModel,
 			snapshot: usageCache.getSnapshot(account.id),
 		});
+		let markerApplied = false;
 		if (
 			decision.scope === "family" &&
-			decision.family !== null &&
 			decision.markerExpiresAt !== null &&
-			attemptedModel &&
-			usageCache.markFamilyScopedExhausted(
+			attemptedModel
+		) {
+			markerApplied = usageCache.markFamilyScopedExhausted(
 				account.id,
 				attemptedModel,
 				decision.markerExpiresAt,
-			)
+			);
+		} else if (
+			decision.scope === "model" &&
+			decision.markerExpiresAt !== null &&
+			attemptedModel
 		) {
+			usageCache.markModelScopedExhausted(
+				account.id,
+				attemptedModel,
+				betaSignature,
+				decision.markerExpiresAt,
+			);
+			markerApplied =
+				usageCache.getModelScopedExhaustion(
+					account.id,
+					attemptedModel,
+					betaSignature,
+				) !== null;
+		}
+		if (markerApplied) {
 			log.warn("midstream_model_scoped_429", {
 				requestId,
 				accountId: account.id,
 				accountName: account.name,
 				attemptedModel,
 				family: decision.family,
+				scope: decision.scope,
+				reason: decision.reason,
 				markerExpiresAt: decision.markerExpiresAt,
 				evidenceAgeMs: decision.snapshotAgeMs,
 				accountBenched: false,
@@ -123,14 +148,23 @@ export function handleAnthropicSseRateLimit(
 		}
 	}
 
-	const midStreamReason: RateLimitReason =
-		firedReason === "overloaded_error"
-			? "upstream_529_overloaded_with_reset"
-			: "upstream_429_with_reset";
+	const now = Date.now();
+	const isOverload = firedReason === "overloaded_error";
+	// The original HTTP 200 headers can describe a long-lived account quota
+	// window even when the later SSE frame is only a transient overload. Never
+	// let that unrelated quota hint turn a 529 into a multi-hour account bench.
+	// A genuine rate_limit_error still honors those headers exactly as before.
+	const resetTime = isOverload
+		? now + getMidStreamRateLimitCooldownMs()
+		: (getAnthropicRateLimitResetAt(response, now) ??
+			now + getMidStreamRateLimitCooldownMs());
+	const midStreamReason: RateLimitReason = isOverload
+		? "upstream_529_overloaded_no_reset"
+		: "upstream_429_with_reset";
 	applyRateLimitCooldown(
 		account,
 		{
-			resetTime: Date.now() + getMidStreamRateLimitCooldownMs(),
+			resetTime,
 			reason: midStreamReason,
 		},
 		ctx,
@@ -532,6 +566,7 @@ export async function forwardToClient(
 						response,
 						requestId,
 						ctx,
+						requestHeaders.get("anthropic-beta"),
 					);
 				}
 			}

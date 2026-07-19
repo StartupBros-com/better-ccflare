@@ -2,7 +2,8 @@
  * Mid-stream overloaded_error test.
  *
  * Tests that when an SSE stream contains an overloaded_error frame mid-stream,
- * the account gets marked rate-limited with reason "upstream_529_overloaded_with_reset".
+ * the account gets a short probe cooldown without inheriting unrelated quota
+ * reset headers from the original HTTP response.
  *
  * Note: Mid-stream detection cannot rescue the current response — the stream
  * headers were already sent to the client. It only prevents future requests
@@ -136,6 +137,32 @@ function setFreshScopedUsage(accountId: string, family = "Fable"): void {
 	});
 }
 
+function setLiveInactiveAccountWindowUsage(accountId: string): void {
+	usageCache.set(accountId, {
+		limits: [
+			{
+				kind: "session",
+				percent: 0,
+				resets_at: new Date(Date.now() + 60 * 60_000).toISOString(),
+				is_active: false,
+			},
+			{
+				kind: "weekly_all",
+				percent: 84,
+				resets_at: new Date(Date.now() + 6 * 24 * 60 * 60_000).toISOString(),
+				is_active: false,
+			},
+			{
+				kind: "weekly_scoped",
+				percent: 100,
+				resets_at: new Date(Date.now() + 60 * 60_000).toISOString(),
+				scope: { model: { id: null, display_name: "Fable" } },
+				is_active: true,
+			},
+		],
+	});
+}
+
 function midStreamErrorResponse(
 	errorType: "rate_limit_error" | "overloaded_error" = "rate_limit_error",
 	headers: HeadersInit = {},
@@ -168,6 +195,7 @@ async function forwardAndConsumeMidStream(
 	ctx: ProxyContext,
 	response: Response,
 	attemptedModel: string | null,
+	betaSignature: string | null = null,
 ): Promise<string> {
 	const collector = {
 		handleStart: mock(() => undefined),
@@ -181,15 +209,17 @@ async function forwardAndConsumeMidStream(
 		collector as unknown as usageCollectorModule.UsageCollector,
 	);
 	try {
+		const requestHeaders = new Headers({
+			"content-type": "application/json",
+		});
+		if (betaSignature) requestHeaders.set("anthropic-beta", betaSignature);
 		const forwarded = await forwardToClient(
 			{
 				requestId: `req-${account.id}`,
 				method: "POST",
 				path: "/v1/messages",
 				account,
-				requestHeaders: new Headers({
-					"content-type": "application/json",
-				}),
+				requestHeaders,
 				requestBody: null,
 				response,
 				timestamp: Date.now(),
@@ -288,6 +318,44 @@ describe("production sniffer integration — overloaded_error mid-stream", () =>
 		);
 		expect(sniffer.feed(frame)).toBe(false);
 	});
+
+	it("ignores unrelated quota reset headers and uses the short overload cooldown", async () => {
+		const now = 1_800_000_000_000;
+		const realDateNow = Date.now;
+		const originalCooldown = process.env.CCFLARE_DEFAULT_COOLDOWN_NO_RESET_MS;
+		Date.now = () => now;
+		process.env.CCFLARE_DEFAULT_COOLDOWN_NO_RESET_MS = "15000";
+		const account = makeAccount({ id: "acct-mid-overload-quota-reset" });
+		const { ctx, calls } = makeCtxWithReason();
+
+		try {
+			await forwardAndConsumeMidStream(
+				account,
+				ctx,
+				midStreamErrorResponse("overloaded_error", {
+					"anthropic-ratelimit-unified-reset": String(now / 1000 + 6 * 60 * 60),
+					"x-ratelimit-reset": String(now / 1000 + 4 * 60 * 60),
+				}),
+				"claude-opus-4-8",
+			);
+
+			expect(calls.markRateLimited).toEqual([
+				{
+					accountId: account.id,
+					resetTime: now + 15_000,
+					reason: "upstream_529_overloaded_no_reset",
+				},
+			]);
+			expect(account.rate_limited_until).toBe(now + 15_000);
+		} finally {
+			Date.now = realDateNow;
+			if (originalCooldown === undefined) {
+				delete process.env.CCFLARE_DEFAULT_COOLDOWN_NO_RESET_MS;
+			} else {
+				process.env.CCFLARE_DEFAULT_COOLDOWN_NO_RESET_MS = originalCooldown;
+			}
+		}
+	});
 });
 
 describe("forwardToClient — model-scoped Anthropic 429 after SSE bytes", () => {
@@ -324,7 +392,45 @@ describe("forwardToClient — model-scoped Anthropic 429 after SSE bytes", () =>
 		}
 	});
 
-	it("keeps ambiguous rate_limit_error evidence account-wide", async () => {
+	it("isolates the exact inactive-account-window live fixture to Fable", async () => {
+		const now = 1_800_000_000_000;
+		const realDateNow = Date.now;
+		Date.now = () => now;
+		const account = makeAccount({ id: "acct-mid-live-inactive-windows" });
+		const { ctx, calls } = makeCtxWithReason();
+		setLiveInactiveAccountWindowUsage(account.id);
+
+		try {
+			await forwardAndConsumeMidStream(
+				account,
+				ctx,
+				midStreamErrorResponse("rate_limit_error", { "retry-after": "120" }),
+				"claude-fable-5-20260701",
+			);
+
+			expect(calls.markRateLimited).toHaveLength(0);
+			expect(account.rate_limited_until).toBeNull();
+			expect(
+				usageCache.getFamilyScopedExhaustion(
+					account.id,
+					"claude-fable-5-20260701",
+					now,
+				),
+			).toMatchObject({ family: "fable", expiresAt: now + 120_000 });
+			expect(
+				usageCache.getFamilyScopedExhaustion(
+					account.id,
+					"claude-opus-4-8",
+					now,
+				),
+			).toBeNull();
+		} finally {
+			usageCache.delete(account.id);
+			Date.now = realDateNow;
+		}
+	});
+
+	it("keeps startup-empty rate_limit_error evidence exact-model scoped", async () => {
 		const account = makeAccount({ id: "acct-mid-no-usage" });
 		const { ctx, calls } = makeCtxWithReason();
 
@@ -332,17 +438,25 @@ describe("forwardToClient — model-scoped Anthropic 429 after SSE bytes", () =>
 			await forwardAndConsumeMidStream(
 				account,
 				ctx,
-				midStreamErrorResponse(),
+				midStreamErrorResponse("rate_limit_error", { "retry-after": "120" }),
 				"claude-fable-5-20260701",
+				"feature-b,feature-a",
 			);
 
-			expect(calls.markRateLimited).toHaveLength(1);
-			expect(calls.markRateLimited[0]?.reason).toBe("upstream_429_with_reset");
-			expect(account.rate_limited_until).not.toBeNull();
+			expect(calls.markRateLimited).toHaveLength(0);
+			expect(account.rate_limited_until).toBeNull();
 			expect(
-				usageCache.getFamilyScopedExhaustion(
+				usageCache.getModelScopedExhaustion(
 					account.id,
 					"claude-fable-5-20260701",
+					"feature-a,feature-b",
+				),
+			).not.toBeNull();
+			expect(
+				usageCache.getModelScopedExhaustion(
+					account.id,
+					"claude-opus-4-8",
+					"feature-a,feature-b",
 				),
 			).toBeNull();
 		} finally {
@@ -350,7 +464,7 @@ describe("forwardToClient — model-scoped Anthropic 429 after SSE bytes", () =>
 		}
 	});
 
-	it("lets a hard response header override fresh family usage evidence", async () => {
+	it("uses Retry-After as family marker timing without benching the account", async () => {
 		const account = makeAccount({ id: "acct-mid-hard-signal" });
 		const { ctx, calls } = makeCtxWithReason();
 		setFreshScopedUsage(account.id);
@@ -363,8 +477,42 @@ describe("forwardToClient — model-scoped Anthropic 429 after SSE bytes", () =>
 				"claude-fable-5-20260701",
 			);
 
+			expect(calls.markRateLimited).toHaveLength(0);
+			expect(account.rate_limited_until).toBeNull();
+			expect(
+				usageCache.getFamilyScopedExhaustion(
+					account.id,
+					"claude-fable-5-20260701",
+				),
+			).not.toBeNull();
+		} finally {
+			usageCache.delete(account.id);
+		}
+	});
+
+	it("preserves account cooldown for an explicit unified hard status", async () => {
+		const now = 1_800_000_000_000;
+		const realDateNow = Date.now;
+		Date.now = () => now;
+		const account = makeAccount({ id: "acct-mid-explicit-hard-signal" });
+		const { ctx, calls } = makeCtxWithReason();
+		setFreshScopedUsage(account.id);
+
+		try {
+			await forwardAndConsumeMidStream(
+				account,
+				ctx,
+				midStreamErrorResponse("rate_limit_error", {
+					"anthropic-ratelimit-unified-status": "rate_limited",
+					"retry-after": "60",
+				}),
+				"claude-fable-5-20260701",
+			);
+
 			expect(calls.markRateLimited).toHaveLength(1);
+			expect(calls.markRateLimited[0]?.resetTime).toBe(now + 60_000);
 			expect(account.rate_limited_until).not.toBeNull();
+			expect(account.rate_limited_until).toBe(now + 60_000);
 			expect(
 				usageCache.getFamilyScopedExhaustion(
 					account.id,
@@ -373,6 +521,7 @@ describe("forwardToClient — model-scoped Anthropic 429 after SSE bytes", () =>
 			).toBeNull();
 		} finally {
 			usageCache.delete(account.id);
+			Date.now = realDateNow;
 		}
 	});
 });

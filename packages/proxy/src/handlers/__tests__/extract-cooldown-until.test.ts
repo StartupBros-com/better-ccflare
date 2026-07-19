@@ -47,15 +47,52 @@ describe("extractCooldownUntil", () => {
 		expect(result).toBeGreaterThanOrEqual(futureDateSec);
 	});
 
-	it("falls through stale unix timestamp to usageCache", () => {
+	it("falls through stale x-ratelimit-reset timestamp to usageCache", () => {
 		const staleTs = Math.floor((Date.now() - 60 * 1000) / 1000);
 		const cacheReset = Date.now() + 30 * 60 * 1000;
 		const result = extractCooldownUntil(
-			makeResponse({ "retry-after": String(staleTs) }),
+			makeResponse({ "x-ratelimit-reset": String(staleTs) }),
 			ACCOUNT_ID,
 			() => cacheReset,
 		);
 		expect(result).toBe(cacheReset);
+	});
+
+	it("treats every numeric retry-after as delay-seconds and caps it at 24 hours", () => {
+		const now = 1_800_000_000_000;
+		const realDateNow = Date.now;
+		Date.now = () => now;
+		try {
+			const epochLookingDelay = String(now / 1000 + 45);
+			const result = extractCooldownUntil(
+				makeResponse({ "retry-after": epochLookingDelay }),
+				ACCOUNT_ID,
+				noCache,
+			);
+			expect(result).toBe(now + 24 * 60 * 60 * 1000);
+		} finally {
+			Date.now = realDateNow;
+		}
+	});
+
+	it("ignores an invalid retry-after and chooses the earliest usable reset header", () => {
+		const now = 1_800_000_000_000;
+		const realDateNow = Date.now;
+		Date.now = () => now;
+		try {
+			const result = extractCooldownUntil(
+				makeResponse({
+					"retry-after": "not-a-reset",
+					"x-ratelimit-reset": String(now / 1000 + 120),
+					"anthropic-ratelimit-unified-reset": String(now / 1000 + 90),
+				}),
+				ACCOUNT_ID,
+				noCache,
+			);
+			expect(result).toBe(now + 90_000);
+		} finally {
+			Date.now = realDateNow;
+		}
 	});
 
 	it("falls through stale HTTP-date to usageCache", () => {

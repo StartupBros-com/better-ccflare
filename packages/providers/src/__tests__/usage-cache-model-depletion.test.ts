@@ -243,4 +243,64 @@ describe("UsageCache model-scoped depletion", () => {
 			usageCache.getFamilyScopedExhaustion(ACCOUNT, "claude-opus-4-8", NOW),
 		).not.toBeNull();
 	});
+
+	it("clears all reactive scoped depletions without discarding the usage snapshot", () => {
+		const usage = {
+			five_hour: { utilization: 12, resets_at: null },
+			seven_day: { utilization: 34, resets_at: null },
+		};
+		usageCache.set(ACCOUNT, usage);
+		usageCache.markModelScopedExhausted(
+			ACCOUNT,
+			"claude-fable-5",
+			"beta-a",
+			NOW + 10_000,
+		);
+		usageCache.markModelScopedExhausted(
+			ACCOUNT,
+			"claude-opus-4-8",
+			null,
+			NOW + 10_000,
+		);
+		usageCache.markFamilyScopedExhausted(
+			ACCOUNT,
+			"claude-fable-5",
+			NOW + 10_000,
+		);
+		usageCache.markFamilyScopedExhausted(
+			ACCOUNT,
+			"claude-opus-4-8",
+			NOW + 10_000,
+		);
+
+		usageCache.clearReactiveScopedDepletions(ACCOUNT);
+
+		expect(
+			usageCache.getModelScopedExhaustion(
+				ACCOUNT,
+				"claude-fable-5",
+				"beta-a",
+				NOW,
+			),
+		).toBeNull();
+		expect(
+			usageCache.getModelScopedExhaustion(
+				ACCOUNT,
+				"claude-opus-4-8",
+				null,
+				NOW,
+			),
+		).toBeNull();
+		expect(
+			usageCache.getFamilyScopedExhaustion(ACCOUNT, "claude-fable-5", NOW),
+		).toBeNull();
+		expect(
+			usageCache.getFamilyScopedExhaustion(ACCOUNT, "claude-opus-4-8", NOW),
+		).toBeNull();
+		expect(usageCache.get(ACCOUNT)).toBe(usage);
+		expect(usageCache.getSnapshot(ACCOUNT)).toEqual({
+			data: usage,
+			observedAt: NOW,
+		});
+	});
 });

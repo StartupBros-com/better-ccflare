@@ -6,6 +6,7 @@ export {
 	isAnthropicExtraUsageExhausted,
 	isAnthropicOutOfCredits,
 	OUT_OF_CREDITS_REASON,
+	parseAnthropicRateLimitResetAt,
 } from "./anthropic/index";
 export {
 	type AnthropicCompatibleConfig,

@@ -182,6 +182,81 @@ function getFullAudit(db: Database, id: string): RawConsecutiveAudit {
 		.get(id) as RawConsecutiveAudit;
 }
 
+describe("AccountRepository - clearRateLimitState", () => {
+	let db: Database;
+	let repo: AccountRepository;
+
+	beforeEach(() => {
+		({ db, repo } = makeDb());
+	});
+
+	afterEach(() => {
+		db.close();
+	});
+
+	it("clears every persisted cooldown, audit, metadata, and backoff field", async () => {
+		insertAccount(db, "acc-force-reset");
+		db.run(
+			`UPDATE accounts
+			 SET rate_limited_until = ?,
+			     rate_limited_reason = ?,
+			     rate_limited_at = ?,
+			     rate_limit_reset = ?,
+			     rate_limit_status = ?,
+			     rate_limit_remaining = ?,
+			     consecutive_rate_limits = ?
+			 WHERE id = ?`,
+			[
+				Date.now() + 60_000,
+				"model_fallback_429",
+				Date.now(),
+				Date.now() + 60_000,
+				"rate_limited",
+				0,
+				4,
+				"acc-force-reset",
+			],
+		);
+
+		const changes = await repo.clearRateLimitState("acc-force-reset");
+		const row = db
+			.query<
+				{
+					rate_limited_until: number | null;
+					rate_limited_reason: string | null;
+					rate_limited_at: number | null;
+					rate_limit_reset: number | null;
+					rate_limit_status: string | null;
+					rate_limit_remaining: number | null;
+					consecutive_rate_limits: number;
+				},
+				[string]
+			>(
+				`SELECT rate_limited_until,
+				        rate_limited_reason,
+				        rate_limited_at,
+				        rate_limit_reset,
+				        rate_limit_status,
+				        rate_limit_remaining,
+				        consecutive_rate_limits
+				 FROM accounts
+				 WHERE id = ?`,
+			)
+			.get("acc-force-reset");
+
+		expect(changes).toBe(1);
+		expect(row).toEqual({
+			rate_limited_until: null,
+			rate_limited_reason: null,
+			rate_limited_at: null,
+			rate_limit_reset: null,
+			rate_limit_status: null,
+			rate_limit_remaining: null,
+			consecutive_rate_limits: 0,
+		});
+	});
+});
+
 describe("AccountRepository - markAccountRateLimited MAX-style clamp under concurrent writers", () => {
 	let db: Database;
 	let repo: AccountRepository;

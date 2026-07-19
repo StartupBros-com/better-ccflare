@@ -56,6 +56,7 @@ import { ERROR_MESSAGES, type ProxyContext } from "./proxy-types";
 import { applyRateLimitCooldown } from "./rate-limit-cooldown";
 import {
 	classifyPreByte429,
+	getAnthropicRateLimitResetAt,
 	recordRequestRateLimitOutcome,
 } from "./rate-limit-scope";
 import { makeProxyRequest, validateProviderPath } from "./request-handler";
@@ -378,7 +379,9 @@ export function applyCacheBodyStagingPolicy(
 /**
  * Determines the absolute epoch timestamp (ms since epoch) until which an account
  * should be marked rate-limited after model exhaustion. Priority:
- *   1. retry-after / x-ratelimit-reset response header (actual upstream backoff)
+ *   1. retry-after / x-ratelimit-reset / unified reset response headers
+ *      (shared Anthropic parser: RFC delay-seconds or HTTP-date for Retry-After,
+ *      epoch-seconds for reset headers, earliest usable hint, 24-hour cap)
  *   2. getRateLimitedUntil — usage-window reset time if known
  *   3. probe-cooldown default (TIME_CONSTANTS.DEFAULT_RATE_LIMIT_NO_RESET_COOLDOWN_MS,
  *      60s by default, overridable via CCFLARE_DEFAULT_COOLDOWN_NO_RESET_MS) as
@@ -410,28 +413,12 @@ export function extractCooldownUntil(
 		TIME_CONSTANTS.DEFAULT_RATE_LIMIT_NO_RESET_COOLDOWN_MS;
 	const now = Date.now();
 
-	// 1. Check retry-after / x-ratelimit-reset headers
-	const retryAfter =
-		response.headers.get("retry-after") ??
-		response.headers.get("x-ratelimit-reset");
-	if (retryAfter) {
-		const parsed = Number(retryAfter);
-		if (!Number.isNaN(parsed) && parsed > 0) {
-			// Unix timestamp (seconds) if value looks like an epoch (> 1 billion)
-			const isUnixTimestamp = parsed > 1_000_000_000;
-			const epochMs = isUnixTimestamp ? parsed * 1000 : now + parsed * 1000;
-			if (epochMs > now) {
-				return Math.max(epochMs, now + MIN_COOLDOWN_MS);
-			}
-			// epochMs <= now: stale/already-past timestamp — fall through to next priority
-		} else {
-			// Try HTTP-date format (RFC 7231), e.g. "Wed, 21 Oct 2026 07:28:00 GMT"
-			const dateMs = new Date(retryAfter).getTime();
-			if (!Number.isNaN(dateMs) && dateMs > now) {
-				return Math.max(dateMs, now + MIN_COOLDOWN_MS);
-			}
-			// Invalid or past date — fall through to next priority
-		}
+	// 1. Parse every upstream reset hint with the same semantics used by the
+	// Anthropic provider and scoped-429 classifier. Invalid hints do not mask a
+	// valid sibling header, and numeric Retry-After is always delay-seconds.
+	const upstreamReset = getAnthropicRateLimitResetAt(response, now);
+	if (upstreamReset !== null) {
+		return Math.max(upstreamReset, now + MIN_COOLDOWN_MS);
 	}
 
 	// 2. Fall back to usage-window reset time if available
@@ -440,7 +427,7 @@ export function extractCooldownUntil(
 		return Math.max(rateLimitedUntil, now + MIN_COOLDOWN_MS);
 	}
 
-	// 3. Last resort: 1 hour
+	// 3. Last resort: short probe cooldown
 	return now + DEFAULT_COOLDOWN_MS;
 }
 
@@ -2191,12 +2178,12 @@ export async function proxyWithAccount(
 		}
 
 		/**
-		 * Infer and persist a generic Anthropic 429 only when fresh positive usage
-		 * evidence proves the concrete attempted family is exhausted while both
-		 * account-wide windows retain headroom. Ambiguous outcomes deliberately
-		 * fall through to the existing account-wide cooldown paths below.
+		 * Scope every generic Anthropic 429 before account cooldown. Fresh positive
+		 * scoped usage can mark a family; missing, stale, or ambiguous usage marks
+		 * only the exact model + client-beta candidate. Positive account-wide
+		 * evidence and unrecognized models fall through to account cooldown below.
 		 */
-		const handleInferredFamily429 = async (
+		const handleScopedAnthropic429 = async (
 			failureResponse: Response,
 			attemptedModel: string | null,
 		): Promise<RawAttemptFailureClassification | null> => {
@@ -2214,37 +2201,124 @@ export async function proxyWithAccount(
 				attemptedModel,
 				snapshot: usageCache.getSnapshot(account.id),
 			});
+			if (decision.scope === "account") {
+				const cooldownUntil = extractCooldownUntil(
+					failureResponse,
+					account.id,
+					usageCache.getRateLimitedUntil.bind(usageCache),
+				);
+				const auditReason: RateLimitReason = "model_fallback_429";
+				applyRateLimitCooldown(
+					account,
+					{ resetTime: cooldownUntil, reason: auditReason },
+					ctx,
+				);
+				routingAttemptLedger?.blockAccount(account.id);
+				recordRequestRateLimitOutcome(req, {
+					accountId: account.id,
+					status: 429,
+					scope: "account",
+					family: decision.family,
+					attemptedModel,
+					reason: decision.reason,
+					// applyRateLimitCooldown may enforce its configured safety ceiling;
+					// record the actual in-memory route marker, not the raw hint.
+					availableAt: account.rate_limited_until,
+				});
+				log.warn(
+					`Account ${account.name} generic 429 classified account scoped ` +
+						`(model=${attemptedModel ?? "unknown"}, family=${decision.family ?? "unknown"}, reason=${decision.reason}) — ` +
+						"benching account and stopping same-account model fallback",
+				);
+				const responseTime = Date.now() - requestMeta.timestamp;
+				ctx.asyncWriter.enqueue(() =>
+					ctx.dbOps.saveRequest(
+						crypto.randomUUID(),
+						req.method,
+						url.pathname,
+						account.id,
+						429,
+						false,
+						auditReason,
+						responseTime,
+						failoverAttempts,
+						attemptedModel ? { model: attemptedModel } : undefined,
+						requestMeta.agentUsed ?? undefined,
+						apiKeyId ?? undefined,
+						apiKeyName ?? undefined,
+						requestMeta.project ?? null,
+						undefined,
+						requestMeta.comboName ?? null,
+						isModelRewrite(requestMeta.originalModel, requestMeta.appliedModel)
+							? (requestMeta.originalModel ?? null)
+							: null,
+						isModelRewrite(requestMeta.originalModel, requestMeta.appliedModel)
+							? (requestMeta.appliedModel ?? null)
+							: null,
+						requestMeta.projectAttributionSource ?? null,
+						requestMeta.agentAttributionSource ?? null,
+					),
+				);
+				return {
+					scope: "account",
+					attemptedModel,
+					family: decision.family,
+					stopAccountAttempt: true,
+				};
+			}
 			if (
-				decision.scope !== "family" ||
 				decision.family === null ||
 				decision.markerExpiresAt === null ||
 				!attemptedModel
 			) {
 				return null;
 			}
-			if (
-				!usageCache.markFamilyScopedExhausted(
+
+			let availableAt: number | null = null;
+			if (decision.scope === "family") {
+				if (
+					!usageCache.markFamilyScopedExhausted(
+						account.id,
+						attemptedModel,
+						decision.markerExpiresAt,
+					)
+				) {
+					return null;
+				}
+				availableAt =
+					usageCache.getFamilyScopedExhaustion(account.id, attemptedModel)
+						?.expiresAt ?? null;
+			} else {
+				const betaSignature = req.headers.get("anthropic-beta");
+				usageCache.markModelScopedExhausted(
 					account.id,
 					attemptedModel,
+					betaSignature,
 					decision.markerExpiresAt,
-				)
-			) {
-				return null;
+				);
+				availableAt =
+					usageCache.getModelScopedExhaustion(
+						account.id,
+						attemptedModel,
+						betaSignature,
+					)?.expiresAt ?? null;
 			}
+			if (availableAt === null) return null;
+
 			recordRequestRateLimitOutcome(req, {
 				accountId: account.id,
 				status: 429,
-				scope: "family",
+				scope: decision.scope,
 				family: decision.family,
 				attemptedModel,
 				reason: decision.reason,
-				availableAt: decision.markerExpiresAt,
+				availableAt,
 			});
 			const reason: RateLimitReason = "model_scoped_429";
 			log.warn(
-				`Account ${account.name} generic 429 classified model-family scoped ` +
+				`Account ${account.name} generic 429 classified ${decision.scope} scoped ` +
 					`(model=${attemptedModel}, family=${decision.family}, evidence_age_ms=${decision.snapshotAgeMs ?? "unknown"}) — ` +
-					"NOT benching account; pruning this family from request-local routing",
+					"NOT benching account; pruning only the evidenced route scope",
 			);
 			const responseTime = Date.now() - requestMeta.timestamp;
 			ctx.asyncWriter.enqueue(() =>
@@ -2276,7 +2350,7 @@ export async function proxyWithAccount(
 				),
 			);
 			return {
-				scope: "family",
+				scope: decision.scope,
 				attemptedModel,
 				family: decision.family,
 				stopAccountAttempt: false,
@@ -2395,7 +2469,7 @@ export async function proxyWithAccount(
 			const classification =
 				(await handlePaymentRequired402(failureResponse, attemptedModel)) ??
 				(await handleExactModel429(failureResponse, attemptedModel)) ??
-				(await handleInferredFamily429(failureResponse, attemptedModel));
+				(await handleScopedAnthropic429(failureResponse, attemptedModel));
 			if (!classification) {
 				return {
 					scope: "not-classified",
@@ -3197,6 +3271,7 @@ export async function proxyWithAccount(
 						response,
 						requestMeta.id,
 						{ ...ctx, provider },
+						req.headers.get("anthropic-beta"),
 					);
 				}
 				if (candidateId && routeCircuitPenalized) {

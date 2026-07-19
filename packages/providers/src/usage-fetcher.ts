@@ -1208,6 +1208,15 @@ class UsageCache {
 		return cleared;
 	}
 
+	/**
+	 * Clear all short-lived reactive route exclusions for one account while
+	 * preserving its authoritative usage snapshot and polling configuration.
+	 */
+	clearReactiveScopedDepletions(accountId: string): void {
+		this.modelScopedDepletions.delete(accountId);
+		this.familyScopedDepletions.delete(accountId);
+	}
+
 	private setAuthoritative(accountId: string, data: AnyUsageData): void {
 		this.cache.set(accountId, { data, timestamp: Date.now() });
 		// Ordinary usage snapshots do not prove a recent model+client-beta-specific
