@@ -35,6 +35,7 @@ import {
 	recordCachePacingRoute,
 } from "./cache-pacing";
 import { warnOnLookbackRisk } from "./cache-telemetry";
+import { adaptAnthropicSsePingsForClaudeCode } from "./claude-code-ping-compat";
 import {
 	type AgentInterceptResult,
 	createContextAdmissionTracker,
@@ -232,7 +233,7 @@ export async function handleProxy(
 		routeContext,
 	);
 
-	return coordinateAnthropicPreCommitRescue({
+	const coordinatedResponse = await coordinateAnthropicPreCommitRescue({
 		response: routedResponse,
 		activation: activation.promise,
 		config: rescueConfig,
@@ -244,6 +245,7 @@ export async function handleProxy(
 			}
 		},
 	});
+	return adaptAnthropicSsePingsForClaudeCode(req, url, coordinatedResponse);
 }
 
 async function handleProxyCore(
