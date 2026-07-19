@@ -1,8 +1,13 @@
 import { describe, expect, it } from "bun:test";
-import type { UsageSnapshot } from "@better-ccflare/providers";
+import {
+	MODEL_SCOPED_DEPLETION_TTL_MS,
+	type UsageSnapshot,
+} from "@better-ccflare/providers";
 import {
 	classifyPreByte429,
+	getAnthropicRateLimitResetAt,
 	getRequestRateLimitOutcomes,
+	hasHardAnthropicAccountSignal,
 	recordRequestRateLimitOutcome,
 } from "../rate-limit-scope";
 
@@ -79,7 +84,40 @@ describe("classifyPreByte429", () => {
 		expect(decision.markerExpiresAt).toBe(NOW + 60_000);
 	});
 
-	it("does not let a Fable-only cap scope an Opus failure", () => {
+	it("classifies the exact inactive-account-window live fixture as Fable-only", () => {
+		const liveFixture = snapshot(NOW - 120_000, { weeklyAll: 84 });
+		const limits = (
+			liveFixture.data as {
+				limits: Array<{
+					kind: string;
+					percent: number;
+					is_active?: boolean;
+				}>;
+			}
+		).limits;
+		for (const limit of limits) {
+			if (limit.kind === "session" || limit.kind === "weekly_all") {
+				limit.is_active = false;
+			}
+		}
+
+		const decision = classifyPreByte429({
+			isAnthropic: true,
+			response: response({ "retry-after": "120" }),
+			attemptedModel: "claude-fable-5-20260701",
+			snapshot: liveFixture,
+			now: NOW,
+		});
+
+		expect(decision).toMatchObject({
+			scope: "family",
+			family: "fable",
+			reason: "matching_scoped_limit",
+			markerExpiresAt: NOW + 60_000,
+		});
+	});
+
+	it("keeps a generic Opus failure exact-model scoped when only Fable is capped", () => {
 		const decision = classifyPreByte429({
 			isAnthropic: true,
 			response: response(),
@@ -87,11 +125,15 @@ describe("classifyPreByte429", () => {
 			snapshot: snapshot(NOW - 120_000),
 			now: NOW,
 		});
-		expect(decision.scope).toBe("account");
-		expect(decision.reason).toBe("missing_matching_scoped_limit");
+		expect(decision).toMatchObject({
+			scope: "model",
+			family: "opus",
+			reason: "missing_matching_scoped_limit",
+			markerExpiresAt: NOW + MODEL_SCOPED_DEPLETION_TTL_MS,
+		});
 	});
 
-	it("treats evidence at 181 seconds as stale and account-scoped", () => {
+	it("treats evidence at 181 seconds as stale without benching the account", () => {
 		const decision = classifyPreByte429({
 			isAnthropic: true,
 			response: response(),
@@ -100,9 +142,61 @@ describe("classifyPreByte429", () => {
 			now: NOW,
 		});
 		expect(decision).toMatchObject({
-			scope: "account",
+			scope: "model",
 			reason: "stale_usage",
 			snapshotAgeMs: 181_000,
+			markerExpiresAt: NOW + MODEL_SCOPED_DEPLETION_TTL_MS,
+		});
+	});
+
+	it("keeps a recognized Claude model exact-scoped while startup usage is empty", () => {
+		const decision = classifyPreByte429({
+			isAnthropic: true,
+			response: response(),
+			attemptedModel: "claude-fable-5-20260701",
+			snapshot: null,
+			now: NOW,
+		});
+
+		expect(decision).toMatchObject({
+			scope: "model",
+			family: "fable",
+			reason: "missing_usage",
+			markerExpiresAt: NOW + MODEL_SCOPED_DEPLETION_TTL_MS,
+		});
+	});
+
+	it("uses Retry-After only to shorten marker expiry, never to broaden scope", () => {
+		const timedResponse = response({ "retry-after": "90" });
+		expect(hasHardAnthropicAccountSignal(timedResponse)).toBe(false);
+
+		const decision = classifyPreByte429({
+			isAnthropic: true,
+			response: timedResponse,
+			attemptedModel: "claude-fable-5-20260701",
+			snapshot: null,
+			now: NOW,
+		});
+
+		expect(decision).toMatchObject({
+			scope: "model",
+			reason: "missing_usage",
+			markerExpiresAt: NOW + 90_000,
+		});
+	});
+
+	it("caps far-future timing headers at the five-minute model marker TTL", () => {
+		const decision = classifyPreByte429({
+			isAnthropic: true,
+			response: response({ "x-ratelimit-reset": String(NOW / 1000 + 3600) }),
+			attemptedModel: "claude-fable-5-20260701",
+			snapshot: null,
+			now: NOW,
+		});
+
+		expect(decision).toMatchObject({
+			scope: "model",
+			markerExpiresAt: NOW + MODEL_SCOPED_DEPLETION_TTL_MS,
 		});
 	});
 
@@ -132,6 +226,45 @@ describe("classifyPreByte429", () => {
 		expect(decision.reason).toBe("hard_response_signal");
 	});
 
+	it("treats explicit unified remaining zero as account-wide evidence", () => {
+		const decision = classifyPreByte429({
+			isAnthropic: true,
+			response: response({
+				"anthropic-ratelimit-unified-remaining": "0",
+				"retry-after": "30",
+			}),
+			attemptedModel: "claude-fable-5",
+			snapshot: null,
+			now: NOW,
+		});
+
+		expect(decision).toMatchObject({
+			scope: "account",
+			reason: "hard_response_signal",
+			markerExpiresAt: null,
+		});
+	});
+
+	it("does not treat an empty unified remaining header as explicit zero", () => {
+		const ambiguousResponse = response({
+			"anthropic-ratelimit-unified-remaining": "",
+			"retry-after": "30",
+		});
+		expect(hasHardAnthropicAccountSignal(ambiguousResponse)).toBe(false);
+		const decision = classifyPreByte429({
+			isAnthropic: true,
+			response: ambiguousResponse,
+			attemptedModel: "claude-fable-5",
+			snapshot: null,
+			now: NOW,
+		});
+		expect(decision).toMatchObject({
+			scope: "model",
+			reason: "missing_usage",
+			markerExpiresAt: NOW + 30_000,
+		});
+	});
+
 	it("keeps unknown models and other providers account-scoped", () => {
 		const unknown = classifyPreByte429({
 			isAnthropic: true,
@@ -158,7 +291,7 @@ describe("classifyPreByte429", () => {
 		});
 	});
 
-	it("requires positive session and weekly-all headroom evidence", () => {
+	it("keeps missing account-headroom evidence exact-model scoped", () => {
 		const base = snapshot(NOW - 120_000);
 		const data = base.data as { limits: Array<{ kind: string }> };
 		data.limits = data.limits.filter((limit) => limit.kind !== "session");
@@ -169,8 +302,35 @@ describe("classifyPreByte429", () => {
 			snapshot: base,
 			now: NOW,
 		});
-		expect(decision.scope).toBe("account");
-		expect(decision.reason).toBe("missing_account_headroom");
+		expect(decision).toMatchObject({
+			scope: "model",
+			reason: "missing_account_headroom",
+			markerExpiresAt: NOW + MODEL_SCOPED_DEPLETION_TTL_MS,
+		});
+	});
+
+	it("ignores inactive account-wide 100% rows when deciding account scope", () => {
+		const base = snapshot(NOW - 120_000);
+		const data = base.data as {
+			limits: Array<{ kind: string; percent: number; is_active?: boolean }>;
+		};
+		const weekly = data.limits.find((limit) => limit.kind === "weekly_all");
+		if (!weekly) throw new Error("fixture weekly_all missing");
+		weekly.percent = 100;
+		weekly.is_active = false;
+
+		const decision = classifyPreByte429({
+			isAnthropic: true,
+			response: response(),
+			attemptedModel: "claude-opus-4-8",
+			snapshot: base,
+			now: NOW,
+		});
+
+		expect(decision).toMatchObject({
+			scope: "model",
+			reason: "missing_matching_scoped_limit",
+		});
 	});
 
 	it("uses the earliest scoped reset when it precedes freshness and TTL", () => {
@@ -183,6 +343,114 @@ describe("classifyPreByte429", () => {
 		});
 		expect(decision.scope).toBe("family");
 		expect(decision.markerExpiresAt).toBe(NOW + 10_000);
+	});
+
+	it("uses a response timing header as the earlier family-marker expiry", () => {
+		const decision = classifyPreByte429({
+			isAnthropic: true,
+			response: response({ "retry-after": "15" }),
+			attemptedModel: "claude-fable-5",
+			snapshot: snapshot(NOW - 30_000),
+			now: NOW,
+		});
+		expect(decision.scope).toBe("family");
+		expect(decision.markerExpiresAt).toBe(NOW + 15_000);
+	});
+});
+
+describe("getAnthropicRateLimitResetAt", () => {
+	const validCases: Array<{
+		name: string;
+		headers: HeadersInit;
+		expected: number;
+	}> = [
+		{
+			name: "Retry-After delay seconds",
+			headers: { "retry-after": "45" },
+			expected: NOW + 45_000,
+		},
+		{
+			name: "Retry-After HTTP-date",
+			headers: { "retry-after": new Date(NOW + 45_000).toUTCString() },
+			expected: NOW + 45_000,
+		},
+		{
+			name: "x-ratelimit-reset epoch seconds",
+			headers: { "x-ratelimit-reset": String(NOW / 1000 + 45) },
+			expected: NOW + 45_000,
+		},
+		{
+			name: "Anthropic unified reset epoch seconds",
+			headers: {
+				"anthropic-ratelimit-unified-reset": String(NOW / 1000 + 45),
+			},
+			expected: NOW + 45_000,
+		},
+	];
+
+	for (const fixture of validCases) {
+		it(`parses ${fixture.name}`, () => {
+			expect(getAnthropicRateLimitResetAt(response(fixture.headers), NOW)).toBe(
+				fixture.expected,
+			);
+		});
+	}
+
+	it("treats every numeric Retry-After as delay-seconds and clamps it", () => {
+		expect(
+			getAnthropicRateLimitResetAt(
+				response({ "retry-after": String(NOW / 1000 + 45) }),
+				NOW,
+			),
+		).toBe(NOW + 24 * 60 * 60 * 1000);
+	});
+
+	const invalidCases: Array<{ name: string; headers: HeadersInit }> = [
+		{ name: "invalid text", headers: { "retry-after": "not-a-reset" } },
+		{ name: "zero", headers: { "retry-after": "0" } },
+		{ name: "negative", headers: { "retry-after": "-1" } },
+		{
+			name: "past epoch seconds",
+			headers: { "x-ratelimit-reset": String(NOW / 1000 - 1) },
+		},
+		{ name: "invalid reset epoch", headers: { "x-ratelimit-reset": "nope" } },
+		{
+			name: "zero unified reset",
+			headers: { "anthropic-ratelimit-unified-reset": "0" },
+		},
+	];
+
+	for (const fixture of invalidCases) {
+		it(`rejects ${fixture.name}`, () => {
+			expect(
+				getAnthropicRateLimitResetAt(response(fixture.headers), NOW),
+			).toBeNull();
+		});
+	}
+
+	it("ignores invalid hints when another reset is usable", () => {
+		expect(
+			getAnthropicRateLimitResetAt(
+				response({
+					"retry-after": "not-a-reset",
+					"x-ratelimit-reset": String(NOW / 1000 + 30),
+				}),
+				NOW,
+			),
+		).toBe(NOW + 30_000);
+	});
+
+	it("uses the earliest of multiple usable reset hints", () => {
+		expect(
+			getAnthropicRateLimitResetAt(
+				response({
+					"retry-after": "90",
+					"x-ratelimit-reset": String(NOW / 1000 + 30),
+					"anthropic-ratelimit-unified-reset": String(NOW / 1000 + 60),
+				}),
+				NOW,
+			),
+		).toBe(NOW + 30_000);
 	});
 });
 
