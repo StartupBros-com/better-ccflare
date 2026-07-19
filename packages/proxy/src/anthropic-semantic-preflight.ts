@@ -6,7 +6,6 @@ import {
 import {
 	ANTHROPIC_PRECOMMIT_COMMITMENT_TIMEOUT_ENV,
 	ANTHROPIC_PRECOMMIT_RESCUE_COMMITMENT_DEADLINE_MS,
-	CLAUDE_CODE_SEMANTIC_WATCHDOG_HEADROOM_MS,
 } from "./anthropic-precommit-rescue";
 import {
 	type AnthropicSseFrameKindCounts,
@@ -18,18 +17,15 @@ import {
 import { ANTHROPIC_TERMINAL_RECOVERY_GRACE_MS } from "./anthropic-terminal-recovery";
 
 export const ANTHROPIC_PRE_COMMIT_SEMANTIC_TIMEOUT_MS = 120_000;
-const CLAUDE_CODE_POST_COMMIT_WATCHDOG_MS = 300_000;
 // Standalone callers retain the same finite default. Routed requests replace
 // this per-call origin with the request-wide absolute boundary created at
 // handleProxy entry, so serial candidates can never restart the clock.
 export const ANTHROPIC_MEANINGFUL_PROGRESS_TIMEOUT_MS =
 	ANTHROPIC_PRECOMMIT_RESCUE_COMMITMENT_DEADLINE_MS;
-// After commitment, Claude Code's semantic-stall watchdog fires at roughly
-// 300s. This independent finite operator cap remains necessary because the
-// transport guard clears its absolute deadline after response start.
-export const ANTHROPIC_POST_COMMIT_MEANINGFUL_PROGRESS_TIMEOUT_MS =
-	CLAUDE_CODE_POST_COMMIT_WATCHDOG_MS -
-	CLAUDE_CODE_SEMANTIC_WATCHDOG_HEADROOM_MS;
+// Valid protocol events keep Claude Code's own stream watchdog alive, including
+// pings emitted while Opus thinking is hidden. A postcommit progress ceiling is
+// therefore operator opt-in; protocol-idle liveness remains enabled separately.
+export const ANTHROPIC_POST_COMMIT_MEANINGFUL_PROGRESS_TIMEOUT_MS: null = null;
 export const ANTHROPIC_PRE_COMMIT_TERMINAL_GRACE_MS =
 	ANTHROPIC_TERMINAL_RECOVERY_GRACE_MS;
 // This is a total retention budget, distinct from either parser limit. A
@@ -69,7 +65,7 @@ const MAX_ROUTE_SUPPRESSION_MS = 24 * 60 * 60 * 1000;
 export interface AnthropicStreamRuntimeConfig {
 	semanticTimeoutMs: number;
 	meaningfulProgressTimeoutMs: number;
-	postCommitMeaningfulProgressTimeoutMs: number;
+	postCommitMeaningfulProgressTimeoutMs: number | null;
 	terminalGraceMs: number;
 	maxBufferedBytes: number;
 	routeSuppressionMs: number;
@@ -99,12 +95,24 @@ function boundedEnvInteger(
 	return Math.min(parsed, maximum);
 }
 
+function boundedOptionalEnvInteger(
+	name: string,
+	maximum: number,
+): number | null {
+	const raw = process.env[name];
+	if (raw === undefined || raw.trim() === "") return null;
+	const parsed = Number(raw);
+	if (!Number.isSafeInteger(parsed) || parsed <= 0) return null;
+	return Math.min(parsed, maximum);
+}
+
 /**
  * Read the stream-lifecycle knobs at request time so operators can tune them
  * without rebuilding and focused tests can use deterministic short windows.
- * Invalid values fail closed to known-safe defaults; oversized values clamp to
- * finite bounds so a typo cannot retain unbounded memory or suppress a route
- * indefinitely.
+ * Invalid values fail closed to known-safe defaults, except the optional
+ * postcommit progress ceiling, where absence or invalid input means disabled.
+ * Oversized values clamp to finite bounds so a typo cannot retain unbounded
+ * memory or suppress a route indefinitely.
  */
 export function getAnthropicStreamRuntimeConfig(): AnthropicStreamRuntimeConfig {
 	return {
@@ -118,9 +126,8 @@ export function getAnthropicStreamRuntimeConfig(): AnthropicStreamRuntimeConfig 
 			ANTHROPIC_MEANINGFUL_PROGRESS_TIMEOUT_MS,
 			MAX_MEANINGFUL_PROGRESS_TIMEOUT_MS,
 		),
-		postCommitMeaningfulProgressTimeoutMs: boundedEnvInteger(
+		postCommitMeaningfulProgressTimeoutMs: boundedOptionalEnvInteger(
 			ANTHROPIC_POST_COMMIT_MEANINGFUL_PROGRESS_TIMEOUT_ENV,
-			ANTHROPIC_POST_COMMIT_MEANINGFUL_PROGRESS_TIMEOUT_MS,
 			MAX_POST_COMMIT_MEANINGFUL_PROGRESS_TIMEOUT_MS,
 		),
 		terminalGraceMs: boundedEnvInteger(
