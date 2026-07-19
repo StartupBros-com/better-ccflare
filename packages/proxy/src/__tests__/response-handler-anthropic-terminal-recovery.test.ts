@@ -17,6 +17,17 @@ const { forwardToClient } = await import("../response-handler");
 const encoder = new TextEncoder();
 const terminalDelta =
 	'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":42}}\n\n';
+const committedPartial = [
+	"event: message_start",
+	'data: {"type":"message_start","message":{"content":[]}}',
+	"",
+	"event: content_block_delta",
+	'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}',
+	"",
+	"",
+].join("\n");
+const semanticTimeoutFrame =
+	'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"Response stalled after partial output"}}\n\n';
 
 function bytes(text: string): Uint8Array {
 	return encoder.encode(text);
@@ -27,6 +38,19 @@ function immediateStream(chunk: Uint8Array): ReadableStream<Uint8Array> {
 		start(controller) {
 			controller.enqueue(chunk);
 			controller.close();
+		},
+	});
+}
+
+function stalledCommittedStream(
+	onCancel: () => void,
+): ReadableStream<Uint8Array> {
+	return new ReadableStream<Uint8Array>({
+		start(controller) {
+			controller.enqueue(bytes(committedPartial));
+		},
+		cancel() {
+			onCancel();
 		},
 	});
 }
@@ -146,5 +170,59 @@ describe("forwardToClient Anthropic terminal recovery integration", () => {
 				contentType: "application/json",
 			}),
 		).resolves.toBe(terminalDelta);
+	});
+
+	it("terminates safely without a route penalty when routing metadata is absent", async () => {
+		const timeoutEnv = "CCFLARE_ANTHROPIC_PRECOMMIT_TIMEOUT_MS";
+		const progressEnv =
+			"CCFLARE_ANTHROPIC_POSTCOMMIT_MEANINGFUL_PROGRESS_TIMEOUT_MS";
+		const originalTimeout = process.env[timeoutEnv];
+		const originalProgress = process.env[progressEnv];
+		process.env[timeoutEnv] = "10";
+		process.env[progressEnv] = "20";
+		const reportCandidateFailure = mock(() => undefined);
+		const ctx = nativeAnthropicCtx();
+		ctx.strategy.reportCandidateFailure = reportCandidateFailure;
+		let cancelCount = 0;
+
+		try {
+			const response = await forwardToClient(
+				{
+					requestId: crypto.randomUUID(),
+					method: "POST",
+					path: "/v1/messages",
+					account: null,
+					requestHeaders: new Headers({
+						"anthropic-version": "2023-06-01",
+						"x-better-ccflare-auto-refresh": "true",
+					}),
+					requestBody: bytes("{}"),
+					response: new Response(
+						stalledCommittedStream(() => cancelCount++),
+						{
+							status: 200,
+							headers: { "content-type": "text/event-stream" },
+						},
+					),
+					timestamp: Date.now(),
+					retryAttempt: 0,
+					failoverAttempts: 0,
+					attemptedModel: "claude-opus-4-8",
+					routeCandidateId: "account:route-without-metadata",
+				},
+				ctx,
+			);
+
+			expect(await response.text()).toBe(
+				`${committedPartial}${semanticTimeoutFrame}`,
+			);
+			expect(cancelCount).toBe(1);
+			expect(reportCandidateFailure).not.toHaveBeenCalled();
+		} finally {
+			if (originalTimeout === undefined) delete process.env[timeoutEnv];
+			else process.env[timeoutEnv] = originalTimeout;
+			if (originalProgress === undefined) delete process.env[progressEnv];
+			else process.env[progressEnv] = originalProgress;
+		}
 	});
 });

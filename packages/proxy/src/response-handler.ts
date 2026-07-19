@@ -464,6 +464,19 @@ export async function forwardToClient(
 						meaningfulProgressTimeoutMs:
 							anthropicStreamConfig.postCommitMeaningfulProgressTimeoutMs,
 						onTimeout(livenessTimeout) {
+							let routeCircuitPenalized = false;
+							if (
+								routeCandidateId &&
+								routingMeta &&
+								ctx.strategy.reportCandidateFailure
+							) {
+								ctx.strategy.reportCandidateFailure(routingMeta, {
+									candidateId: routeCandidateId,
+									reason: `anthropic_postcommit_${livenessTimeout.reason}`,
+									suppressForMs: anthropicStreamConfig.routeSuppressionMs,
+								});
+								routeCircuitPenalized = true;
+							}
 							log.warn("anthropic_postcommit_semantic_timeout", {
 								requestId,
 								accountId: account?.id ?? null,
@@ -482,7 +495,7 @@ export async function forwardToClient(
 									livenessTimeout.lastValidProtocolActivityAgeMs,
 								lastMeaningfulProgressAgeMs:
 									livenessTimeout.lastMeaningfulProgressAgeMs,
-								routeCircuitPenalized: false,
+								routeCircuitPenalized,
 								streamReplayed: false,
 							});
 						},
