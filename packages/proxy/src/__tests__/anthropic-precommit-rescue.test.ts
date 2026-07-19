@@ -5,6 +5,7 @@ import {
 	ANTHROPIC_PRECOMMIT_RESCUE_PING_FRAME,
 	coordinateAnthropicPreCommitRescue,
 	createAnthropicPreCommitRescueActivation,
+	createAnthropicPreCommitRescueRouteContext,
 } from "../anthropic-precommit-rescue";
 
 const encoder = new TextEncoder();
@@ -38,6 +39,32 @@ function successfulSse(body: string): Response {
 }
 
 describe("coordinateAnthropicPreCommitRescue", () => {
+	it("derives final and fallback-reserved attempt deadlines from one request boundary", () => {
+		const context = createAnthropicPreCommitRescueRouteContext({
+			activate: () => undefined,
+			signal: new AbortController().signal,
+			requestStartedAt: 1_000,
+			commitmentDeadlineMs: 150,
+		});
+
+		expect(context.commitmentDeadlineAt).toBe(1_150);
+		expect(context.getAttemptCommitmentDeadlineAt(false)).toBe(1_120);
+		expect(context.getAttemptCommitmentDeadlineAt(true)).toBe(1_150);
+	});
+
+	it("scales the fallback handoff slice inside deliberately tiny deadlines", () => {
+		const context = createAnthropicPreCommitRescueRouteContext({
+			activate: () => undefined,
+			signal: new AbortController().signal,
+			requestStartedAt: 1_000,
+			commitmentDeadlineMs: 20,
+		});
+
+		expect(context.commitmentDeadlineAt).toBe(1_020);
+		expect(context.getAttemptCommitmentDeadlineAt(false)).toBe(1_016);
+		expect(context.getAttemptCommitmentDeadlineAt(true)).toBe(1_020);
+	});
+
 	it("returns a response that settles before activation byte-for-byte with its status and headers", async () => {
 		const activation = createAnthropicPreCommitRescueActivation();
 		const original = new Response("fast", {

@@ -139,6 +139,12 @@ export interface ModelFallbackExecutionPolicy {
 	readonly implicitFallbacksEnabled?: boolean;
 	/** A planned non-final candidate must not terminate the global route queue. */
 	readonly forwardModelUnavailableResponse?: boolean;
+	/**
+	 * Request-semantic finality is independent of response forwarding. Evaluate
+	 * immediately before each transport/gate because deferred work may be
+	 * discovered while proxyWithAccount is already running.
+	 */
+	readonly isFinalSemanticAttempt?: () => boolean;
 }
 
 export function createContextAdmissionTracker(
@@ -668,37 +674,44 @@ function filterThinkingBlocks(
  * @param response - The response to check
  * @returns True if the error is about invalid thinking blocks
  */
+type ResponseJsonReader = (response: Response) => Promise<unknown | null>;
+
+async function readResponseCloneJson(
+	response: Response,
+): Promise<unknown | null> {
+	try {
+		return await response.clone().json();
+	} catch {
+		return null;
+	}
+}
+
 async function isInvalidThinkingSignatureError(
 	response: Response,
+	readJson: ResponseJsonReader = readResponseCloneJson,
 ): Promise<boolean> {
 	if (response.status !== 400) return false;
+	const contentType = response.headers.get("content-type");
+	if (!contentType?.includes("application/json")) return false;
 
-	try {
-		const clone = response.clone();
-		const contentType = response.headers.get("content-type");
-
-		if (!contentType?.includes("application/json")) return false;
-
-		const json = await clone.json();
-
-		// Check for Claude's thinking-related errors
-		if (json.error?.message && typeof json.error.message === "string") {
-			const message = json.error.message;
-			// Check for invalid signature error
-			if (message.includes("Invalid `signature` in `thinking` block")) {
-				return true;
-			}
-			// Check for final message must start with thinking block error
-			if (
-				message.includes(
-					"final `assistant` message must start with a thinking block",
-				)
-			) {
-				return true;
-			}
+	const json = (await readJson(response)) as {
+		error?: { message?: unknown };
+	} | null;
+	// Check for Claude's thinking-related errors
+	if (json?.error?.message && typeof json.error.message === "string") {
+		const message = json.error.message;
+		// Check for invalid signature error
+		if (message.includes("Invalid `signature` in `thinking` block")) {
+			return true;
 		}
-	} catch {
-		// Ignore parse errors
+		// Check for final message must start with thinking block error
+		if (
+			message.includes(
+				"final `assistant` message must start with a thinking block",
+			)
+		) {
+			return true;
+		}
 	}
 
 	return false;
@@ -715,24 +728,21 @@ async function isInvalidThinkingSignatureError(
  */
 async function isClearThinkingRequiresThinkingError(
 	response: Response,
+	readJson: ResponseJsonReader = readResponseCloneJson,
 ): Promise<boolean> {
 	if (response.status !== 400) return false;
+	const contentType = response.headers.get("content-type");
+	if (!contentType?.includes("application/json")) return false;
 
-	try {
-		const contentType = response.headers.get("content-type");
-		if (!contentType?.includes("application/json")) return false;
-
-		const json = await response.clone().json();
-
-		if (json.error?.message && typeof json.error.message === "string") {
-			const message = json.error.message;
-			return (
-				message.includes("clear_thinking") &&
-				message.includes("requires `thinking` to be enabled")
-			);
-		}
-	} catch {
-		// Ignore parse errors
+	const json = (await readJson(response)) as {
+		error?: { message?: unknown };
+	} | null;
+	if (json?.error?.message && typeof json.error.message === "string") {
+		const message = json.error.message;
+		return (
+			message.includes("clear_thinking") &&
+			message.includes("requires `thinking` to be enabled")
+		);
 	}
 
 	return false;
@@ -790,25 +800,23 @@ function cacheControlRejectorKey(accountId: string, model: string): string {
  */
 async function isCacheControlRejectionError(
 	response: Response,
+	readJson: ResponseJsonReader = readResponseCloneJson,
 ): Promise<boolean> {
 	if (response.status !== 400) return false;
+	const contentType = response.headers.get("content-type");
+	if (!contentType?.includes("application/json")) return false;
 
-	try {
-		const clone = response.clone();
-		const contentType = response.headers.get("content-type");
-		if (!contentType?.includes("application/json")) return false;
-
-		const json = await clone.json();
-		const message: string = json.error?.message ?? json.message ?? "";
-		return (
-			typeof message === "string" &&
-			message.includes("cache_control") &&
-			(message.includes("Extra inputs are not permitted") ||
-				message.includes("unknown field"))
-		);
-	} catch {
-		return false;
-	}
+	const json = (await readJson(response)) as {
+		error?: { message?: unknown };
+		message?: unknown;
+	} | null;
+	const message = json?.error?.message ?? json?.message ?? "";
+	return (
+		typeof message === "string" &&
+		message.includes("cache_control") &&
+		(message.includes("Extra inputs are not permitted") ||
+			message.includes("unknown field"))
+	);
 }
 
 /**
@@ -818,6 +826,7 @@ async function isCacheControlRejectionError(
  */
 export async function isModelUnavailableError(
 	response: Response,
+	readJson: ResponseJsonReader = readResponseCloneJson,
 ): Promise<boolean> {
 	if (
 		response.status !== 404 &&
@@ -835,39 +844,28 @@ export async function isModelUnavailableError(
 		return true;
 	}
 
-	try {
-		const clone = response.clone();
-		const contentType = response.headers.get("content-type");
-		if (!contentType?.includes("application/json")) return false;
+	const contentType = response.headers.get("content-type");
+	if (!contentType?.includes("application/json")) return false;
 
-		const json = await clone.json();
+	const json = (await readJson(response)) as {
+		error?: { type?: unknown; code?: unknown; message?: unknown };
+	} | null;
+	// Anthropic native format
+	if (json?.error?.type === "not_found_error") return true;
 
-		// Anthropic native format
-		if (json.error?.type === "not_found_error") return true;
+	// OpenAI-compat format
+	if (json?.error?.code === "model_not_found") return true;
 
-		// OpenAI-compat format
-		if (json.error?.code === "model_not_found") return true;
-
-		// Generic: message contains "model not found" or "does not exist"
+	// Generic: message contains "model not found" or "does not exist"
+	if (typeof json?.error?.message === "string") {
+		const message = json.error.message;
 		if (
-			json.error?.message &&
-			typeof json.error.message === "string" &&
-			(json.error.message.toLowerCase().includes("model not found") ||
-				json.error.message.toLowerCase().includes("does not exist"))
+			message.toLowerCase().includes("model not found") ||
+			message.toLowerCase().includes("does not exist") ||
+			message.includes("ResourceNotFoundException")
 		) {
 			return true;
 		}
-
-		// Bedrock: ResourceNotFoundException
-		if (
-			json.error?.message &&
-			typeof json.error.message === "string" &&
-			json.error.message.includes("ResourceNotFoundException")
-		) {
-			return true;
-		}
-	} catch {
-		// Ignore parse errors
 	}
 
 	return false;
@@ -999,6 +997,148 @@ export async function boundResponseBodyForClassification(
 	});
 }
 
+class AnthropicPreCommitAttemptDeadlineError extends Error {
+	constructor(
+		readonly deadlineAt: number,
+		readonly budgetMs: number,
+	) {
+		super("Anthropic route attempt exceeded its private precommit deadline");
+		this.name = "AnthropicPreCommitAttemptDeadlineError";
+	}
+}
+
+interface AnthropicAttemptCommitmentTiming {
+	readonly deadlineAt: number;
+	readonly startedAt: number;
+	readonly budgetMs: number;
+}
+
+/**
+ * One transport attempt's precommit lifetime. Unlike a fetch-only timeout, the
+ * scope remains armed after response headers so every body classifier and the
+ * semantic gate share the same absolute boundary.
+ */
+class AnthropicPreCommitAttemptScope {
+	readonly deadlineError: AnthropicPreCommitAttemptDeadlineError;
+	readonly signal: AbortSignal;
+	readonly abortPromise: Promise<never>;
+	private readonly deadlineController = new AbortController();
+	private readonly onAbort: () => void;
+	private deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+
+	constructor(
+		private readonly routingSignal: AbortSignal,
+		readonly timing: AnthropicAttemptCommitmentTiming,
+	) {
+		this.deadlineError = new AnthropicPreCommitAttemptDeadlineError(
+			timing.deadlineAt,
+			timing.budgetMs,
+		);
+		this.signal = AbortSignal.any([
+			routingSignal,
+			this.deadlineController.signal,
+		]);
+		let rejectAbort!: (reason: unknown) => void;
+		this.abortPromise = new Promise<never>((_resolve, reject) => {
+			rejectAbort = reject;
+		});
+		this.onAbort = () => rejectAbort(this.abortReason());
+		if (this.signal.aborted) {
+			this.onAbort();
+		} else {
+			this.signal.addEventListener("abort", this.onAbort, { once: true });
+		}
+		// The promise is raced only while precommit work is pending. Keep a rejection
+		// handler attached after disposal so a later downstream abort is never noisy.
+		void this.abortPromise.catch(() => undefined);
+
+		if (timing.budgetMs <= 0) {
+			this.deadlineController.abort(this.deadlineError);
+		} else {
+			this.deadlineTimer = setTimeout(
+				() => this.deadlineController.abort(this.deadlineError),
+				timing.budgetMs,
+			);
+		}
+	}
+
+	private abortReason(): unknown {
+		if (this.routingSignal.aborted) {
+			return (
+				this.routingSignal.reason ??
+				new DOMException("routing aborted", "AbortError")
+			);
+		}
+		return this.deadlineError;
+	}
+
+	isPrivateDeadline(): boolean {
+		return (
+			!this.routingSignal.aborted && this.deadlineController.signal.aborted
+		);
+	}
+
+	/** Read a classification clone without allowing its tee branch to outlive the attempt. */
+	async readJson(response: Response): Promise<unknown | null> {
+		let clone: Response;
+		try {
+			clone = response.clone();
+		} catch {
+			return null;
+		}
+		if (!clone.body) return null;
+
+		const reader = clone.body.getReader();
+		const chunks: Uint8Array[] = [];
+		try {
+			while (true) {
+				const readPromise = reader.read();
+				void readPromise.catch(() => undefined);
+				const result = await Promise.race([readPromise, this.abortPromise]);
+				if (result.done) break;
+				if (result.value) chunks.push(result.value);
+			}
+			reader.releaseLock();
+		} catch (error) {
+			if (!this.signal.aborted) {
+				// A rejected read leaves the classifier clone's reader locked even
+				// though the stream has already errored. Release that branch explicitly
+				// so it cannot retain tee bookkeeping after classification gives up.
+				try {
+					reader.releaseLock();
+				} catch {
+					// The errored reader may already have detached itself.
+				}
+				return null;
+			}
+			const reason = this.abortReason();
+			try {
+				void reader.cancel(reason).catch(() => undefined);
+			} catch {
+				// The reader may already have errored from the fetch abort.
+			}
+			// Cancel the untouched original branch too. Tee cancellation reaches the
+			// upstream source once both branches are released.
+			void discardUpstreamBody(response);
+			throw reason ?? error;
+		}
+
+		try {
+			return JSON.parse(new TextDecoder().decode(combineChunks(chunks)));
+		} catch {
+			return null;
+		}
+	}
+
+	dispose(): void {
+		if (this.deadlineTimer !== undefined) {
+			clearTimeout(this.deadlineTimer);
+			this.deadlineTimer = undefined;
+		}
+		this.signal.removeEventListener("abort", this.onAbort);
+	}
+}
+
 /**
  * Handles proxy request without authentication
  * @param req - The incoming request
@@ -1019,6 +1159,7 @@ export async function proxyUnauthenticated(
 	ctx: ProxyContext,
 	apiKeyId?: string | null,
 	apiKeyName?: string | null,
+	anthropicPreCommitRescue?: AnthropicPreCommitRescueRouteContext,
 ): Promise<Response> {
 	log.warn(ERROR_MESSAGES.NO_ACCOUNTS);
 
@@ -1026,16 +1167,60 @@ export async function proxyUnauthenticated(
 	const headers = sanitizeInternalHeaders(
 		ctx.provider.prepareHeaders(req.headers, undefined, undefined),
 	);
+	const routingSignal = anthropicPreCommitRescue?.signal ?? req.signal;
+	let attemptCommitment: AnthropicPreCommitAttemptScope | undefined;
 
 	try {
-		const response = await makeProxyRequest(
+		anthropicPreCommitRescue?.activate();
+		if (anthropicPreCommitRescue) {
+			const startedAt = Date.now();
+			const deadlineAt =
+				anthropicPreCommitRescue.getAttemptCommitmentDeadlineAt(true);
+			attemptCommitment = new AnthropicPreCommitAttemptScope(routingSignal, {
+				deadlineAt,
+				startedAt,
+				budgetMs: Math.max(0, deadlineAt - startedAt),
+			});
+			if (attemptCommitment.timing.budgetMs <= 0) {
+				throw attemptCommitment.deadlineError;
+			}
+		}
+
+		let response = await makeProxyRequest(
 			targetUrl,
 			req.method,
 			headers,
 			createBodyStream,
 			!!req.body,
-			req.signal,
+			attemptCommitment?.signal ?? routingSignal,
 		);
+
+		if (
+			attemptCommitment &&
+			response.body &&
+			isNativeAnthropicMessagesSse({
+				method: req.method,
+				path: url.pathname,
+				providerName: ctx.provider.name,
+				requestHeaders: req.headers,
+				response,
+			})
+		) {
+			const streamConfig = getAnthropicStreamRuntimeConfig();
+			const gatedBody = await gateAnthropicSsePreCommit(response.body, {
+				semanticTimeoutMs: streamConfig.semanticTimeoutMs,
+				meaningfulProgressTimeoutMs: streamConfig.meaningfulProgressTimeoutMs,
+				commitmentDeadlineAt: attemptCommitment.timing.deadlineAt,
+				terminalGraceMs: streamConfig.terminalGraceMs,
+				maxBufferedBytes: streamConfig.maxBufferedBytes,
+				signal: routingSignal,
+			});
+			response = new Response(gatedBody, {
+				status: response.status,
+				statusText: response.statusText,
+				headers: response.headers,
+			});
+		}
 
 		return forwardToClient(
 			{
@@ -1063,7 +1248,14 @@ export async function proxyUnauthenticated(
 			ctx,
 		);
 	} catch (error) {
-		if (req.signal.aborted) throw error;
+		if (
+			routingSignal.aborted ||
+			attemptCommitment?.isPrivateDeadline() ||
+			error instanceof AnthropicPreCommitAttemptDeadlineError ||
+			error instanceof AnthropicPreCommitAbortedError
+		) {
+			throw error;
+		}
 		logError(error, log);
 		throw new ProviderError(
 			ERROR_MESSAGES.UNAUTHENTICATED_FAILED,
@@ -1073,6 +1265,8 @@ export async function proxyUnauthenticated(
 				originalError: error instanceof Error ? error.message : String(error),
 			},
 		);
+	} finally {
+		attemptCommitment?.dispose();
 	}
 }
 
@@ -1106,22 +1300,88 @@ export async function proxyWithAccount(
 	routingAttemptLedger?: RoutingAttemptLedger,
 	modelFallbackPolicy?: ModelFallbackExecutionPolicy,
 ): Promise<Response | null> {
-	const routingSignal =
-		modelFallbackPolicy?.anthropicPreCommitRescue?.signal ?? req.signal;
-	const makeAttemptRequest = (request: Request): Promise<Response> => {
+	const preCommitRescue = modelFallbackPolicy?.anthropicPreCommitRescue;
+	const routingSignal = preCommitRescue?.signal ?? req.signal;
+	let implicitFallbackDiscoveryPossible =
+		modelFallbackPolicy?.deferImplicitFallback !== undefined;
+	const isFinalSemanticAttempt = (): boolean =>
+		(modelFallbackPolicy?.isFinalSemanticAttempt?.() ??
+			modelFallbackPolicy?.forwardModelUnavailableResponse === true) &&
+		!implicitFallbackDiscoveryPossible;
+	const resolveAttemptCommitmentDeadline = ():
+		| {
+				readonly deadlineAt: number;
+				readonly startedAt: number;
+				readonly budgetMs: number;
+		  }
+		| undefined => {
+		if (!preCommitRescue) return undefined;
+		const startedAt = Date.now();
+		const deadlineAt = preCommitRescue.getAttemptCommitmentDeadlineAt(
+			isFinalSemanticAttempt(),
+		);
+		return {
+			deadlineAt,
+			startedAt,
+			budgetMs: Math.max(0, deadlineAt - startedAt),
+		};
+	};
+	let latestTransportCommitment:
+		| ReturnType<typeof resolveAttemptCommitmentDeadline>
+		| undefined;
+	let activeAttemptCommitment: AnthropicPreCommitAttemptScope | undefined;
+	const readAttemptBoundJson: ResponseJsonReader = (response) =>
+		activeAttemptCommitment?.readJson(response) ??
+		readResponseCloneJson(response);
+	const isAttemptControlError = (error: unknown): boolean =>
+		error instanceof AnthropicPreCommitAttemptDeadlineError ||
+		routingSignal.aborted ||
+		activeAttemptCommitment?.signal.aborted === true;
+	const makeAttemptRequest = async (request: Request): Promise<Response> => {
 		// The outer context exists only for an Anthropic-shaped downstream request.
 		// Any real provider transport can hang before headers (including transformed
 		// OpenAI-compatible routes), so start rescue immediately before every fetch.
 		// Synthetic provider responses never call this wrapper and remain synchronous.
-		modelFallbackPolicy?.anthropicPreCommitRescue?.activate();
-		return makeProxyRequest(
-			request,
-			undefined,
-			undefined,
-			undefined,
-			undefined,
+		preCommitRescue?.activate();
+		const commitment = resolveAttemptCommitmentDeadline();
+		latestTransportCommitment = commitment;
+		activeAttemptCommitment?.dispose();
+		activeAttemptCommitment = undefined;
+		if (!commitment) {
+			return makeProxyRequest(
+				request,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				routingSignal,
+			);
+		}
+
+		const attemptCommitment = new AnthropicPreCommitAttemptScope(
 			routingSignal,
+			commitment,
 		);
+		activeAttemptCommitment = attemptCommitment;
+		if (commitment.budgetMs <= 0) {
+			throw attemptCommitment.deadlineError;
+		}
+
+		try {
+			return await makeProxyRequest(
+				request,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				attemptCommitment.signal,
+			);
+		} catch (error) {
+			if (attemptCommitment.isPrivateDeadline()) {
+				throw attemptCommitment.deadlineError;
+			}
+			throw error;
+		}
 	};
 	try {
 		if (
@@ -1176,28 +1436,31 @@ export async function proxyWithAccount(
 		const attemptAdmissionTracker = admissionEnabledForAttempt
 			? contextAdmissionTracker
 			: undefined;
+		const usesCodexAdmissionPlan =
+			account.provider === "codex" && attemptAdmissionTracker !== undefined;
 		const requestedFamilyBeforeAdmission = requestedModelBeforeAdmission
 			? getModelFamily(requestedModelBeforeAdmission)
 			: null;
 		let deferredAdmissionRank = 0;
-		const admissionCandidates = modelFallbackPolicy?.deferImplicitFallback
-			? concreteCodexModels.filter((model, index) => {
-					const candidateFamily = getModelFamily(model);
-					const isProvablySameFamily =
-						requestedFamilyBeforeAdmission !== null &&
-						candidateFamily === requestedFamilyBeforeAdmission;
-					const isPrimaryProviderMapping =
-						index === 0 && candidateFamily === null;
-					if (!isProvablySameFamily && !isPrimaryProviderMapping) {
-						modelFallbackPolicy.deferImplicitFallback?.(
-							model,
-							deferredAdmissionRank++,
-						);
-						return false;
-					}
-					return true;
-				})
-			: undefined;
+		const admissionCandidates =
+			modelFallbackPolicy?.deferImplicitFallback && usesCodexAdmissionPlan
+				? concreteCodexModels.filter((model, index) => {
+						const candidateFamily = getModelFamily(model);
+						const isProvablySameFamily =
+							requestedFamilyBeforeAdmission !== null &&
+							candidateFamily === requestedFamilyBeforeAdmission;
+						const isPrimaryProviderMapping =
+							index === 0 && candidateFamily === null;
+						if (!isProvablySameFamily && !isPrimaryProviderMapping) {
+							modelFallbackPolicy.deferImplicitFallback?.(
+								model,
+								deferredAdmissionRank++,
+							);
+							return false;
+						}
+						return true;
+					})
+				: undefined;
 		const admission = selectAdmittedCodexModel(
 			account,
 			requestedModelBeforeAdmission,
@@ -1208,6 +1471,41 @@ export async function proxyWithAccount(
 		const admittedModelIndex = admission.model
 			? concreteCodexModels.indexOf(admission.model)
 			: -1;
+		if (modelFallbackPolicy?.deferImplicitFallback) {
+			const discoveryModels =
+				modelFallbackPolicy.implicitFallbacksEnabled === false ||
+				!requestedModelBeforeAdmission
+					? []
+					: usesCodexAdmissionPlan
+						? concreteCodexModels
+						: (getModelList(requestedModelBeforeAdmission, account) ?? []);
+			const discoveryStartIndex = usesCodexAdmissionPlan
+				? admittedModelIndex + 1
+				: 1;
+			let deferredDiscoveryRank = 0;
+			implicitFallbackDiscoveryPossible = false;
+			for (const candidateModel of discoveryModels.slice(
+				Math.max(0, discoveryStartIndex),
+			)) {
+				const candidateFamily = getModelFamily(candidateModel);
+				if (
+					requestedFamilyBeforeAdmission !== null &&
+					candidateFamily === requestedFamilyBeforeAdmission
+				) {
+					continue;
+				}
+				implicitFallbackDiscoveryPossible = true;
+				// Plan the route before any transport can consume the reserved slice.
+				// The request-level callback is occurrence-safe and de-duplicates the
+				// later reactive discovery in the model-unavailable loop.
+				modelFallbackPolicy.deferImplicitFallback(
+					candidateModel,
+					deferredDiscoveryRank++,
+				);
+			}
+		} else {
+			implicitFallbackDiscoveryPossible = false;
+		}
 		if (admission.model && admission.model !== requestedModelBeforeAdmission) {
 			const admittedContext = effectiveBodyContext.withPatchedModel(
 				admission.model,
@@ -1600,7 +1898,7 @@ export async function proxyWithAccount(
 		// Check if this is a Claude provider and we got an invalid thinking signature error
 		if (
 			isClaudeProvider &&
-			(await isInvalidThinkingSignatureError(rawResponse))
+			(await isInvalidThinkingSignatureError(rawResponse, readAttemptBoundJson))
 		) {
 			log.info(
 				`Detected invalid thinking block signature error for account ${account.name}, retrying with thinking blocks filtered`,
@@ -1653,7 +1951,10 @@ export async function proxyWithAccount(
 		// once with the offending edits removed; everything else is preserved.
 		if (
 			isClaudeProvider &&
-			(await isClearThinkingRequiresThinkingError(rawResponse))
+			(await isClearThinkingRequiresThinkingError(
+				rawResponse,
+				readAttemptBoundJson,
+			))
 		) {
 			const strippedBodyBuffer = filterClearThinkingEdits(effectiveBodyContext);
 
@@ -1694,7 +1995,7 @@ export async function proxyWithAccount(
 
 		// Retry without cache_control if provider rejected it (e.g. GLM-5.1 strict validation).
 		// Mark (accountId, model) so subsequent requests skip cache_control immediately.
-		if (await isCacheControlRejectionError(rawResponse)) {
+		if (await isCacheControlRejectionError(rawResponse, readAttemptBoundJson)) {
 			const rejectorKey = cacheControlRejectorKey(account.id, transformedModel);
 			if (!cacheControlRejectors.has(rejectorKey)) {
 				// Mark before retry so subsequent requests pre-strip without a round-trip.
@@ -1743,6 +2044,7 @@ export async function proxyWithAccount(
 					? materializeSyntheticResponse(retryRequest)
 					: await makeAttemptRequest(retryRequest);
 			} catch (err) {
+				if (isAttemptControlError(err)) throw err;
 				log.warn("Failed to retry without cache_control:", err);
 			}
 		}
@@ -2165,7 +2467,7 @@ export async function proxyWithAccount(
 		// (the primary), so start at index 1.
 		if (
 			!isNativeXaiCapacityOrRateLimitSignal &&
-			(await isModelUnavailableError(rawResponse))
+			(await isModelUnavailableError(rawResponse, readAttemptBoundJson))
 		) {
 			// Log 429 response headers for debugging upstream rate-limit info
 			if (rawResponse.status === 429) {
@@ -2194,10 +2496,10 @@ export async function proxyWithAccount(
 				const modelList =
 					modelFallbackPolicy?.implicitFallbacksEnabled === false
 						? null
-						: attemptAdmissionTracker
+						: usesCodexAdmissionPlan
 							? concreteCodexModels
 							: getModelList(requestedModel, account);
-				const fallbackStartIndex = attemptAdmissionTracker
+				const fallbackStartIndex = usesCodexAdmissionPlan
 					? admittedModelIndex + 1
 					: 1;
 				if (!modelList || fallbackStartIndex >= modelList.length) {
@@ -2460,7 +2762,9 @@ export async function proxyWithAccount(
 					// 400/404 body. Passing a caller-created clone for a header-only 429
 					// would strand a tee branch and prevent the later failover discard from
 					// cancelling the upstream socket.
-					if (!(await isModelUnavailableError(rawResponse))) {
+					if (
+						!(await isModelUnavailableError(rawResponse, readAttemptBoundJson))
+					) {
 						break; // Success — stop cycling
 					}
 				}
@@ -2469,7 +2773,7 @@ export async function proxyWithAccount(
 			// If still unavailable/rate-limited after exhausting the model list,
 			// failover to the next account. OpenAI-compatible providers never set
 			// isRateLimited:true in parseRateLimit, so we must handle it here.
-			if (await isModelUnavailableError(rawResponse)) {
+			if (await isModelUnavailableError(rawResponse, readAttemptBoundJson)) {
 				if (isScopedFailure(rawFailureClassification)) {
 					return null;
 				}
@@ -2795,7 +3099,30 @@ export async function proxyWithAccount(
 			downstreamAnthropicResponseBody
 		) {
 			const streamConfig = getAnthropicStreamRuntimeConfig();
-			modelFallbackPolicy?.anthropicPreCommitRescue?.activate();
+			preCommitRescue?.activate();
+			// Re-evaluate semantic finality at the gate, but never extend the
+			// absolute deadline chosen before the corresponding real fetch.
+			const gateCommitment = resolveAttemptCommitmentDeadline();
+			let attemptCommitmentDeadlineAt = gateCommitment?.deadlineAt;
+			if (latestTransportCommitment?.deadlineAt !== undefined) {
+				attemptCommitmentDeadlineAt =
+					attemptCommitmentDeadlineAt === undefined
+						? latestTransportCommitment.deadlineAt
+						: Math.min(
+								attemptCommitmentDeadlineAt,
+								latestTransportCommitment.deadlineAt,
+							);
+			}
+			const attemptCommitmentStartedAt =
+				latestTransportCommitment?.startedAt ?? gateCommitment?.startedAt;
+			const attemptCommitmentBudgetMs =
+				attemptCommitmentDeadlineAt === undefined ||
+				attemptCommitmentStartedAt === undefined
+					? streamConfig.meaningfulProgressTimeoutMs
+					: Math.max(
+							0,
+							attemptCommitmentDeadlineAt - attemptCommitmentStartedAt,
+						);
 			try {
 				const gatedBody = await gateAnthropicSsePreCommit(
 					downstreamAnthropicResponseBody,
@@ -2803,9 +3130,10 @@ export async function proxyWithAccount(
 						semanticTimeoutMs: streamConfig.semanticTimeoutMs,
 						meaningfulProgressTimeoutMs:
 							streamConfig.meaningfulProgressTimeoutMs,
+						commitmentDeadlineAt: attemptCommitmentDeadlineAt,
 						terminalGraceMs: streamConfig.terminalGraceMs,
 						maxBufferedBytes: streamConfig.maxBufferedBytes,
-						signal: routingSignal,
+						signal: activeAttemptCommitment?.signal ?? routingSignal,
 					},
 				);
 				response = new Response(gatedBody, {
@@ -2814,6 +3142,13 @@ export async function proxyWithAccount(
 					headers: response.headers,
 				});
 			} catch (error) {
+				if (activeAttemptCommitment?.isPrivateDeadline()) {
+					// The fetch and semantic gate share this candidate's private
+					// commitment signal. Preserve that control-flow identity even when
+					// aborting the transport makes reader.read() reject first; otherwise
+					// the gate would report upstream_error and poison a healthy route.
+					throw activeAttemptCommitment.deadlineError;
+				}
 				if (
 					routingSignal.aborted ||
 					req.signal.aborted ||
@@ -2846,7 +3181,8 @@ export async function proxyWithAccount(
 					terminalEvidenceSeen: error.terminalEvidenceSeen,
 					limitBytes: error.limitBytes ?? null,
 					semanticTimeoutMs: streamConfig.semanticTimeoutMs,
-					meaningfulProgressTimeoutMs: streamConfig.meaningfulProgressTimeoutMs,
+					meaningfulProgressTimeoutMs: attemptCommitmentBudgetMs,
+					commitmentDeadlineAt: attemptCommitmentDeadlineAt ?? null,
 					terminalGraceMs: streamConfig.terminalGraceMs,
 					routeCircuitPenalized,
 				});
@@ -3046,8 +3382,23 @@ export async function proxyWithAccount(
 		) {
 			throw err;
 		}
+		if (err instanceof AnthropicPreCommitAttemptDeadlineError) {
+			// This private candidate exhausted only its reserved slice of the shared
+			// request budget. Fail over without pausing the account or reporting a
+			// route-circuit failure.
+			log.warn("anthropic_precommit_attempt_deadline", {
+				requestId: requestMeta.id,
+				accountId: account.id,
+				candidateId: modelFallbackPolicy?.routeCandidateId ?? null,
+				deadlineAt: err.deadlineAt,
+				attemptCommitmentBudgetMs: err.budgetMs,
+			});
+			return null;
+		}
 		handleProxyError(err, account, log);
 		return null;
+	} finally {
+		activeAttemptCommitment?.dispose();
 	}
 }
 

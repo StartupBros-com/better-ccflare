@@ -5,12 +5,27 @@ export const ANTHROPIC_PRECOMMIT_RESCUE_ERROR_FRAME =
 export const ANTHROPIC_PRECOMMIT_RESCUE_PARTIAL_ERROR_FRAME =
 	'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"Response failed after partial output"}}\n\n';
 
+export const CLAUDE_CODE_PRECOMMIT_WATCHDOG_MS = 180_000;
+export const CLAUDE_CODE_SEMANTIC_WATCHDOG_HEADROOM_MS = 30_000;
+export const ANTHROPIC_PRECOMMIT_RESCUE_COMMITMENT_DEADLINE_MS =
+	CLAUDE_CODE_PRECOMMIT_WATCHDOG_MS - CLAUDE_CODE_SEMANTIC_WATCHDOG_HEADROOM_MS;
+// A non-final stalled route cannot consume the entire request budget. Preserve
+// 30s at the production default and scale the reserve down for focused tests or
+// deliberately shorter operator overrides.
+export const ANTHROPIC_PRECOMMIT_FALLBACK_RESERVE_MAX_MS = 30_000;
+export const ANTHROPIC_PRECOMMIT_FALLBACK_RESERVE_DIVISOR = 5;
+
 // Live direct-route tail reaches roughly 132s. Measured from handleProxy entry,
-// this starts rescue just beyond that observation while retaining about 45s of
-// margin before Claude's ~180s watchdog, including request setup/header latency.
+// this starts rescue just beyond that observation while retaining 15s before
+// the proxy's 150s commitment boundary. The coordinator emits an immediate ping
+// on activation; the interval controls only subsequent keepalives.
 export const ANTHROPIC_PRECOMMIT_RESCUE_ACTIVATION_MS = 135_000;
 export const ANTHROPIC_PRECOMMIT_RESCUE_PING_INTERVAL_MS = 25_000;
-export const ANTHROPIC_PRECOMMIT_RESCUE_COMMITMENT_DEADLINE_MS = 8 * 60 * 1000;
+
+// Canonical request-wide commitment override. The semantic preflight module
+// retains its existing public alias for compatibility.
+export const ANTHROPIC_PRECOMMIT_COMMITMENT_TIMEOUT_ENV =
+	"CCFLARE_ANTHROPIC_MEANINGFUL_PROGRESS_TIMEOUT_MS";
 
 export const ANTHROPIC_PRECOMMIT_RESCUE_ACTIVATION_ENV =
 	"CCFLARE_ANTHROPIC_PRECOMMIT_RESCUE_ACTIVATION_MS";
@@ -38,6 +53,10 @@ export interface AnthropicPreCommitRescueActivation {
 export interface AnthropicPreCommitRescueRouteContext {
 	readonly activate: () => void;
 	readonly signal: AbortSignal;
+	/** Absolute request-wide boundary measured from handleProxy entry. */
+	readonly commitmentDeadlineAt: number;
+	/** Reserve fallback capacity only for a route known not to be final. */
+	getAttemptCommitmentDeadlineAt(isFinalAttempt: boolean): number;
 }
 
 export interface AnthropicPreCommitRescueOptions {
@@ -50,6 +69,8 @@ export interface AnthropicPreCommitRescueOptions {
 	config: AnthropicPreCommitRescueConfig;
 	/** Whole-request origin; defaults to coordinator entry for isolated callers. */
 	requestStartedAt?: number;
+	/** Exact shared boundary used by every route gate in the request. */
+	commitmentDeadlineAt?: number;
 }
 
 type ResponseOutcome =
@@ -72,8 +93,13 @@ function boundedEnvInteger(
 	return Math.min(parsed, maximum);
 }
 
+function hasConfiguredEnvValue(name: string): boolean {
+	const raw = process.env[name];
+	return raw !== undefined && raw.trim() !== "";
+}
+
 export function getAnthropicPreCommitRescueConfig(): AnthropicPreCommitRescueConfig {
-	const activationGraceMs = boundedEnvInteger(
+	const configuredActivationGraceMs = boundedEnvInteger(
 		ANTHROPIC_PRECOMMIT_RESCUE_ACTIVATION_ENV,
 		ANTHROPIC_PRECOMMIT_RESCUE_ACTIVATION_MS,
 		MAX_RESCUE_ACTIVATION_MS,
@@ -83,20 +109,82 @@ export function getAnthropicPreCommitRescueConfig(): AnthropicPreCommitRescueCon
 		ANTHROPIC_PRECOMMIT_RESCUE_PING_INTERVAL_MS,
 		MAX_RESCUE_PING_INTERVAL_MS,
 	);
-	const configuredDeadlineMs = boundedEnvInteger(
-		ANTHROPIC_PRECOMMIT_RESCUE_DEADLINE_ENV,
+	const canonicalConfigured = hasConfiguredEnvValue(
+		ANTHROPIC_PRECOMMIT_COMMITMENT_TIMEOUT_ENV,
+	);
+	const canonicalDeadlineMs = boundedEnvInteger(
+		ANTHROPIC_PRECOMMIT_COMMITMENT_TIMEOUT_ENV,
 		ANTHROPIC_PRECOMMIT_RESCUE_COMMITMENT_DEADLINE_MS,
 		MAX_RESCUE_COMMITMENT_DEADLINE_MS,
 	);
+	// The rescue-specific variable predates the client-watchdog policy. Treat it
+	// only as a deprecated fallback, and never let an inherited long value undo
+	// the safe 150s default. A deliberately longer-client budget must use the
+	// canonical meaningful-progress variable, which also wins when both are set.
+	const commitmentDeadlineMs = canonicalConfigured
+		? canonicalDeadlineMs
+		: Math.min(
+				boundedEnvInteger(
+					ANTHROPIC_PRECOMMIT_RESCUE_DEADLINE_ENV,
+					ANTHROPIC_PRECOMMIT_RESCUE_COMMITMENT_DEADLINE_MS,
+					MAX_RESCUE_COMMITMENT_DEADLINE_MS,
+				),
+				ANTHROPIC_PRECOMMIT_RESCUE_COMMITMENT_DEADLINE_MS,
+			);
 
 	return {
-		activationGraceMs,
-		pingIntervalMs,
-		// A typo cannot make the rescue expire before its first keepalive.
-		commitmentDeadlineMs: Math.max(
-			configuredDeadlineMs,
-			activationGraceMs + pingIntervalMs,
+		// Rescue writes its first ping immediately on activation. Keep activation
+		// inside even a deliberately tiny commitment window instead of silently
+		// extending the request-wide deadline.
+		activationGraceMs: Math.min(
+			configuredActivationGraceMs,
+			Math.max(0, commitmentDeadlineMs - 1),
 		),
+		pingIntervalMs,
+		commitmentDeadlineMs,
+	};
+}
+
+export function getAnthropicPreCommitFallbackReserveMs(
+	commitmentDeadlineMs: number,
+): number {
+	return Math.min(
+		ANTHROPIC_PRECOMMIT_FALLBACK_RESERVE_MAX_MS,
+		Math.floor(
+			commitmentDeadlineMs / ANTHROPIC_PRECOMMIT_FALLBACK_RESERVE_DIVISOR,
+		),
+	);
+}
+
+export function createAnthropicPreCommitRescueRouteContext(options: {
+	activate: () => void;
+	signal: AbortSignal;
+	requestStartedAt: number;
+	commitmentDeadlineMs: number;
+}): AnthropicPreCommitRescueRouteContext {
+	if (
+		!Number.isSafeInteger(options.commitmentDeadlineMs) ||
+		options.commitmentDeadlineMs <= 0
+	) {
+		throw new RangeError(
+			"commitmentDeadlineMs must be a positive safe integer",
+		);
+	}
+	const commitmentDeadlineAt =
+		options.requestStartedAt + options.commitmentDeadlineMs;
+	const fallbackReserveMs = getAnthropicPreCommitFallbackReserveMs(
+		options.commitmentDeadlineMs,
+	);
+
+	return {
+		activate: options.activate,
+		signal: options.signal,
+		commitmentDeadlineAt,
+		getAttemptCommitmentDeadlineAt(isFinalAttempt) {
+			return isFinalAttempt
+				? commitmentDeadlineAt
+				: commitmentDeadlineAt - fallbackReserveMs;
+		},
 	};
 }
 
@@ -188,7 +276,10 @@ function createRescueResponse(
 	outcomePromise: Promise<ResponseOutcome>,
 	abortRouting: (reason?: unknown) => void,
 	pingIntervalMs: number,
-	remainingDeadlineMs: number,
+	deadline: {
+		readonly promise: Promise<typeof DEADLINE_ELAPSED>;
+		cancel(): void;
+	},
 ): Response {
 	const encoder = new TextEncoder();
 	let cancelled = false;
@@ -198,7 +289,6 @@ function createRescueResponse(
 	let winnerChunkForwarded = false;
 	let winnerReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
 	let pingTimer: ReturnType<typeof setInterval> | undefined;
-	const deadline = timer(DEADLINE_ELAPSED, remainingDeadlineMs);
 	const routedResult = Promise.race([outcomePromise, deadline.promise]);
 	let settledResult: ResponseOutcome | typeof DEADLINE_ELAPSED | undefined;
 
@@ -365,21 +455,45 @@ export async function coordinateAnthropicPreCommitRescue(
 	options: AnthropicPreCommitRescueOptions,
 ): Promise<Response> {
 	const requestStartedAt = options.requestStartedAt ?? Date.now();
+	const commitmentDeadlineAt =
+		options.commitmentDeadlineAt ??
+		requestStartedAt + options.config.commitmentDeadlineMs;
+	const deadline = timer(DEADLINE_ELAPSED, commitmentDeadlineAt - Date.now());
 	const outcomePromise = responseOutcome(options.response);
+	// Start measuring at handleProxy entry, but do not race/translate the deadline
+	// until parsed `stream:true` activates rescue. A slow stream:false request must
+	// retain its native JSON status, headers, and body even if this timer elapsed.
 	const first = await Promise.race([
 		outcomePromise,
 		options.activation.then((): typeof ACTIVATED => ACTIVATED),
 	]);
-	if (first !== ACTIVATED) return unwrapOutcome(first);
+	if (first !== ACTIVATED) {
+		deadline.cancel();
+		return unwrapOutcome(first);
+	}
 
 	const elapsedBeforeGraceMs = Math.max(0, Date.now() - requestStartedAt);
 	const grace = timer(
 		GRACE_ELAPSED,
 		Math.max(0, options.config.activationGraceMs - elapsedBeforeGraceMs),
 	);
-	const afterActivation = await Promise.race([outcomePromise, grace.promise]);
+	const afterActivation = await Promise.race([
+		outcomePromise,
+		grace.promise,
+		deadline.promise,
+	]);
+	if (afterActivation === DEADLINE_ELAPSED) {
+		grace.cancel();
+		return createRescueResponse(
+			outcomePromise,
+			options.abortRouting,
+			options.config.pingIntervalMs,
+			deadline,
+		);
+	}
 	if (afterActivation !== GRACE_ELAPSED) {
 		grace.cancel();
+		deadline.cancel();
 		return unwrapOutcome(afterActivation);
 	}
 
@@ -387,10 +501,6 @@ export async function coordinateAnthropicPreCommitRescue(
 		outcomePromise,
 		options.abortRouting,
 		options.config.pingIntervalMs,
-		Math.max(
-			1,
-			options.config.commitmentDeadlineMs -
-				Math.max(0, Date.now() - requestStartedAt),
-		),
+		deadline,
 	);
 }

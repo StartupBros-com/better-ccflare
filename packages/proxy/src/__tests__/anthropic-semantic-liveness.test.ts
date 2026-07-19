@@ -19,6 +19,8 @@ const contentBlockStart =
 	'event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}\n\n';
 const usageDelta =
 	'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":null},"usage":{"output_tokens":2}}\n\n';
+const signatureDelta =
+	'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"opaque-integrity-metadata"}}\n\n';
 const messageStop = 'event: message_stop\ndata: {"type":"message_stop"}\n\n';
 const apiError =
 	'event: error\ndata: {"type":"error","error":{"type":"api_error"}}\n\n';
@@ -86,7 +88,7 @@ describe("createAnthropicSemanticLivenessStream", () => {
 				activityTimer = setInterval(() => {
 					controller.enqueue(
 						encoder.encode(
-							activityIndex++ % 2 === 0 ? ping : contentBlockStart,
+							[ping, contentBlockStart, signatureDelta][activityIndex++ % 3],
 						),
 					);
 				}, 30);

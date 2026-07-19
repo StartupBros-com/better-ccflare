@@ -593,6 +593,62 @@ describe("global model-first routing", () => {
 		}
 	});
 
+	for (const [provider, contextAdmissionEnabled] of [
+		["anthropic", false],
+		["anthropic", true],
+		["codex", false],
+		["codex", true],
+	] as const) {
+		it(`discovers deferred work for provider=${provider} with context admission=${contextAdmissionEnabled ? "on" : "off"}`, async () => {
+			const previousAdmission = process.env.CCFLARE_CONTEXT_ADMISSION;
+			if (contextAdmissionEnabled) {
+				process.env.CCFLARE_CONTEXT_ADMISSION = "1";
+			} else {
+				delete process.env.CCFLARE_CONTEXT_ADMISSION;
+			}
+			try {
+				const account = makeAccount(
+					`discovery-${provider}-${contextAdmissionEnabled ? "on" : "off"}`,
+				);
+				account.provider = provider;
+				let expectedModels: string[];
+				if (provider === "codex") {
+					account.api_key = null;
+					account.access_token = `token-${account.id}`;
+					account.expires_at = Date.now() + 60 * 60 * 1000;
+					expectedModels = ["gpt-5.3-codex", "gpt-5.4-mini"];
+					account.model_mappings = JSON.stringify({
+						fable: expectedModels,
+					});
+				} else {
+					expectedModels = [FABLE, OPUS];
+				}
+				const ctx = makeContext([account], makeCombo({ account }));
+				const attemptedModels: string[] = [];
+				globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+					const request = input instanceof Request ? input : new Request(input);
+					attemptedModels.push(
+						((await request.clone().json()) as { model: string }).model,
+					);
+					return attemptedModels.length === 1
+						? modelNotFound("discovery")
+						: success();
+				}) as unknown as typeof fetch;
+
+				const response = await run(ctx);
+
+				expect(attemptedModels).toEqual(expectedModels);
+				expect(response.status).toBe(200);
+			} finally {
+				if (previousAdmission === undefined) {
+					delete process.env.CCFLARE_CONTEXT_ADMISSION;
+				} else {
+					process.env.CCFLARE_CONTEXT_ADMISSION = previousAdmission;
+				}
+			}
+		});
+	}
+
 	it("allows an exact-failure same-family sibling before accounts but defers cross-family", async () => {
 		const accountA = makeAccount("exact-a", [FABLE, FABLE_SIBLING, OPUS]);
 		const accountB = makeAccount("exact-b");

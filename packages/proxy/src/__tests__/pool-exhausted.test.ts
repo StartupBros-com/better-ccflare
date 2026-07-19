@@ -1,8 +1,83 @@
-import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
-import { usageCache } from "@better-ccflare/providers";
+import {
+	afterEach,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	mock,
+	spyOn,
+} from "bun:test";
 import type { Account } from "@better-ccflare/types";
+import {
+	ANTHROPIC_PRECOMMIT_RESCUE_ERROR_FRAME,
+	ANTHROPIC_PRECOMMIT_RESCUE_PING_FRAME,
+} from "../anthropic-precommit-rescue";
 import type { ProxyContext } from "../handlers";
-import { handleProxy } from "../proxy";
+
+// Loading proxy.ts in a focused unit test must not require ignored embedded
+// worker artifacts from the CLI build.
+mock.module("@better-ccflare/database", () => ({
+	AsyncDbWriter: class AsyncDbWriter {},
+	DatabaseFactory: class DatabaseFactory {},
+	DatabaseOperations: class DatabaseOperations {},
+	ModelTranslationRepository: class ModelTranslationRepository {},
+}));
+
+const { usageCache } = await import("@better-ccflare/providers");
+const usageCollectorModule = await import("../usage-collector");
+const { handleProxy } = await import("../proxy");
+
+const originalFetch = globalThis.fetch;
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+const MEANINGFUL_PROGRESS_ENV =
+	"CCFLARE_ANTHROPIC_MEANINGFUL_PROGRESS_TIMEOUT_MS";
+const RESCUE_ACTIVATION_ENV =
+	"CCFLARE_ANTHROPIC_PRECOMMIT_RESCUE_ACTIVATION_MS";
+const RESCUE_PING_ENV = "CCFLARE_ANTHROPIC_PRECOMMIT_RESCUE_PING_INTERVAL_MS";
+const FAST_SUCCESS = [
+	"event: message_start",
+	'data: {"type":"message_start","message":{"id":"msg-pass","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-5","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}}',
+	"",
+	"event: content_block_start",
+	'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+	"",
+	"event: content_block_delta",
+	'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"passthrough"}}',
+	"",
+	"event: content_block_stop",
+	'data: {"type":"content_block_stop","index":0}',
+	"",
+	"event: message_delta",
+	'data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}',
+	"",
+	"event: message_stop",
+	'data: {"type":"message_stop"}',
+	"",
+	"",
+].join("\n");
+const STRUCTURAL_PRELUDE = [
+	"event: message_start",
+	'data: {"type":"message_start","message":{"id":"msg-private","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-5","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}}',
+	"",
+	"event: ping",
+	'data: {"type":"ping"}',
+	"",
+	"",
+].join("\n");
+
+function delay(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function byteStream(body: string): ReadableStream<Uint8Array> {
+	return new ReadableStream({
+		start(controller) {
+			controller.enqueue(encoder.encode(body));
+			controller.close();
+		},
+	});
+}
 
 function makeAccount(overrides: Partial<Account> = {}): Account {
 	return {
@@ -43,7 +118,10 @@ function makeAccount(overrides: Partial<Account> = {}): Account {
 	};
 }
 
-function makeContext(accounts: Account[]): ProxyContext {
+function makeContext(
+	accounts: Account[],
+	providerName = "codex",
+): ProxyContext {
 	return {
 		strategy: {
 			select: (accs: Account[]) => {
@@ -68,8 +146,12 @@ function makeContext(accounts: Account[]): ProxyContext {
 			getAgentFrontmatterModelFallback: () => false,
 		} as never,
 		provider: {
-			name: "codex",
+			name: providerName,
 			canHandle: () => true,
+			buildUrl: () => "https://upstream.test/v1/messages",
+			prepareHeaders: (headers: Headers) => new Headers(headers),
+			processResponse: async (response: Response) => response,
+			parseRateLimit: () => ({ isRateLimited: false, resetTime: null }),
 		} as never,
 		refreshInFlight: new Map(),
 		asyncWriter: { enqueue: mock(() => {}) } as never,
@@ -88,19 +170,63 @@ function makeRequest(): Request {
 	});
 }
 
+function makeAnthropicRequest(stream: boolean, signal?: AbortSignal): Request {
+	return new Request("https://proxy.local/v1/messages", {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json",
+			"anthropic-version": "2023-06-01",
+		},
+		body: JSON.stringify({
+			model: "claude-sonnet-4-5",
+			messages: [{ role: "user", content: "hello" }],
+			max_tokens: 16,
+			stream,
+		}),
+		signal,
+	});
+}
+
 let savedPassthrough: string | undefined;
+let savedMeaningfulProgress: string | undefined;
+let savedRescueActivation: string | undefined;
+let savedRescuePing: string | undefined;
+let restoreUsageCollector = (): void => {};
 
 beforeEach(() => {
 	savedPassthrough = process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
+	savedMeaningfulProgress = process.env[MEANINGFUL_PROGRESS_ENV];
+	savedRescueActivation = process.env[RESCUE_ACTIVATION_ENV];
+	savedRescuePing = process.env[RESCUE_PING_ENV];
 	delete process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
+	const collectorSpy = spyOn(
+		usageCollectorModule,
+		"getUsageCollector",
+	).mockReturnValue({
+		handleStart: mock(() => undefined),
+		handleChunk: mock(() => undefined),
+		handleEnd: mock(async () => undefined),
+	} as never);
+	restoreUsageCollector = () => collectorSpy.mockRestore();
 });
 
 afterEach(() => {
+	restoreUsageCollector();
+	restoreUsageCollector = (): void => {};
+	globalThis.fetch = originalFetch;
 	usageCache.delete("acc-resetless-capacity");
 	if (savedPassthrough === undefined) {
 		delete process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
 	} else {
 		process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL = savedPassthrough;
+	}
+	for (const [name, value] of [
+		[MEANINGFUL_PROGRESS_ENV, savedMeaningfulProgress],
+		[RESCUE_ACTIVATION_ENV, savedRescueActivation],
+		[RESCUE_PING_ENV, savedRescuePing],
+	] as const) {
+		if (value === undefined) delete process.env[name];
+		else process.env[name] = value;
 	}
 });
 
@@ -338,29 +464,186 @@ describe("routing terminal — 503 response", () => {
 });
 
 describe("pool exhausted — CCFLARE_PASSTHROUGH_ON_EMPTY_POOL=1 escape hatch", () => {
-	it("does NOT return 503 when CCFLARE_PASSTHROUGH_ON_EMPTY_POOL=1 and pool is empty", async () => {
+	it("bounds an unauthenticated pre-header stall with the shared rescue signal", async () => {
 		process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL = "1";
+		process.env[MEANINGFUL_PROGRESS_ENV] = "80";
+		process.env[RESCUE_ACTIVATION_ENV] = "1";
+		process.env[RESCUE_PING_ENV] = "5";
+		let abortCount = 0;
+		let abortElapsedMs: number | null = null;
+		const startedAt = Date.now();
+		globalThis.fetch = mock((input: RequestInfo | URL, init?: RequestInit) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input, init);
+			return new Promise<Response>((_resolve, reject) => {
+				const rejectOnAbort = () => {
+					abortCount++;
+					abortElapsedMs = Date.now() - startedAt;
+					reject(upstreamRequest.signal.reason);
+				};
+				if (upstreamRequest.signal.aborted) rejectOnAbort();
+				else {
+					upstreamRequest.signal.addEventListener("abort", rejectOnAbort, {
+						once: true,
+					});
+				}
+			});
+		}) as unknown as typeof fetch;
 
-		const ctx = makeContext([]);
-		// proxyUnauthenticated will try to make a real request and fail —
-		// we just check it doesn't return 503 with our pool_exhausted body.
-		// It will throw or return a different status.
-		try {
-			const response = await handleProxy(
-				makeRequest(),
-				new URL("https://proxy.local/v1/messages"),
-				ctx,
-			);
-			// If it returns, it should NOT be our 503 pool_exhausted
-			if (response.status === 503) {
-				const body = (await response.json()) as Record<string, unknown>;
-				const error = body.error as Record<string, unknown> | undefined;
-				expect(error?.type).not.toBe("pool_exhausted");
-			}
-			// Any other status means passthrough was attempted
-		} catch {
-			// Expected: proxyUnauthenticated throws when no real provider configured
-			// This is fine — it means we went through the passthrough path
-		}
+		const response = await handleProxy(
+			makeAnthropicRequest(true),
+			new URL("https://proxy.local/v1/messages"),
+			makeContext([], "anthropic"),
+		);
+		const body = await response.text();
+
+		expect(body).toEndWith(ANTHROPIC_PRECOMMIT_RESCUE_ERROR_FRAME);
+		expect(abortCount).toBe(1);
+		expect(abortElapsedMs).not.toBeNull();
+		if (abortElapsedMs === null) return;
+		expect(abortElapsedMs).toBeLessThan(100);
+	});
+
+	it("terminates a structural-only unauthenticated stream before the shared boundary", async () => {
+		process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL = "1";
+		process.env[MEANINGFUL_PROGRESS_ENV] = "80";
+		process.env[RESCUE_ACTIVATION_ENV] = "1";
+		process.env[RESCUE_PING_ENV] = "5";
+		let cancelCount = 0;
+		globalThis.fetch = mock(
+			async () =>
+				new Response(
+					new ReadableStream<Uint8Array>({
+						start(controller) {
+							controller.enqueue(encoder.encode(STRUCTURAL_PRELUDE));
+						},
+						cancel() {
+							cancelCount++;
+						},
+					}),
+					{
+						status: 200,
+						headers: { "content-type": "text/event-stream" },
+					},
+				),
+		) as unknown as typeof fetch;
+
+		const startedAt = Date.now();
+		const response = await handleProxy(
+			makeAnthropicRequest(true),
+			new URL("https://proxy.local/v1/messages"),
+			makeContext([], "anthropic"),
+		);
+		const stalled = Symbol("passthrough stream remained open");
+		const body = await Promise.race([
+			response.text(),
+			delay(120).then((): typeof stalled => stalled),
+		]);
+
+		expect(body).not.toBe(stalled);
+		if (body === stalled) return;
+		expect(body).toEndWith(ANTHROPIC_PRECOMMIT_RESCUE_ERROR_FRAME);
+		expect(body).not.toContain("msg-private");
+		expect(Date.now() - startedAt).toBeLessThan(120);
+		expect(cancelCount).toBe(1);
+	});
+
+	it("forwards a fast meaningful unauthenticated stream byte-for-byte", async () => {
+		process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL = "1";
+		process.env[MEANINGFUL_PROGRESS_ENV] = "80";
+		process.env[RESCUE_ACTIVATION_ENV] = "40";
+		globalThis.fetch = mock(
+			async () =>
+				new Response(byteStream(FAST_SUCCESS), {
+					status: 200,
+					headers: {
+						"content-type": "text/event-stream",
+						"x-upstream-fast": "preserved",
+					},
+				}),
+		) as unknown as typeof fetch;
+
+		const response = await handleProxy(
+			makeAnthropicRequest(true),
+			new URL("https://proxy.local/v1/messages"),
+			makeContext([], "anthropic"),
+		);
+
+		expect(response.status).toBe(200);
+		expect(response.headers.get("x-upstream-fast")).toBe("preserved");
+		expect(
+			response.headers.get("x-better-ccflare-precommit-rescue"),
+		).toBeNull();
+		expect(await response.text()).toBe(FAST_SUCCESS);
+	});
+
+	it("propagates rescued downstream cancellation to unauthenticated fetch", async () => {
+		process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL = "1";
+		process.env[MEANINGFUL_PROGRESS_ENV] = "100";
+		process.env[RESCUE_ACTIVATION_ENV] = "1";
+		process.env[RESCUE_PING_ENV] = "5";
+		let abortCount = 0;
+		globalThis.fetch = mock((input: RequestInfo | URL, init?: RequestInit) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input, init);
+			return new Promise<Response>((_resolve, reject) => {
+				upstreamRequest.signal.addEventListener(
+					"abort",
+					() => {
+						abortCount++;
+						reject(upstreamRequest.signal.reason);
+					},
+					{ once: true },
+				);
+			});
+		}) as unknown as typeof fetch;
+
+		const response = await handleProxy(
+			makeAnthropicRequest(true),
+			new URL("https://proxy.local/v1/messages"),
+			makeContext([], "anthropic"),
+		);
+		const reader = response.body?.getReader();
+		const first = await reader?.read();
+		expect(decoder.decode(first?.value)).toBe(
+			ANTHROPIC_PRECOMMIT_RESCUE_PING_FRAME,
+		);
+		await reader?.cancel("downstream left");
+		const deadline = Date.now() + 50;
+		while (abortCount === 0 && Date.now() < deadline) await delay(1);
+
+		expect(abortCount).toBe(1);
+	});
+
+	it("leaves a slow stream:false unauthenticated response native", async () => {
+		process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL = "1";
+		process.env[MEANINGFUL_PROGRESS_ENV] = "20";
+		process.env[RESCUE_ACTIVATION_ENV] = "1";
+		const expectedBody = JSON.stringify({ passthrough: "native" });
+		globalThis.fetch = mock(async () => {
+			await delay(60);
+			return new Response(expectedBody, {
+				status: 202,
+				statusText: "Native passthrough",
+				headers: {
+					"content-type": "application/json",
+					"x-native-passthrough": "preserved",
+				},
+			});
+		}) as unknown as typeof fetch;
+
+		const response = await handleProxy(
+			makeAnthropicRequest(false),
+			new URL("https://proxy.local/v1/messages"),
+			makeContext([], "anthropic"),
+		);
+
+		expect(response.status).toBe(202);
+		expect(response.statusText).toBe("Native passthrough");
+		expect(response.headers.get("x-native-passthrough")).toBe("preserved");
+		expect(
+			response.headers.get("x-better-ccflare-precommit-rescue"),
+		).toBeNull();
+		expect(await response.text()).toBe(expectedBody);
 	});
 });
