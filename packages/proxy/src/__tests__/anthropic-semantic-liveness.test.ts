@@ -1,4 +1,4 @@
-import { describe, expect, it, mock } from "bun:test";
+import { describe, expect, it, mock, spyOn } from "bun:test";
 import {
 	ANTHROPIC_SEMANTIC_LIVENESS_ERROR_FRAME,
 	createAnthropicSemanticLivenessStream,
@@ -17,8 +17,6 @@ const ping = 'event: ping\ndata: {"type":"ping"}\n\n';
 const comment = ": keepalive\n\n";
 const contentBlockStart =
 	'event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}\n\n';
-const usageDelta =
-	'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":null},"usage":{"output_tokens":2}}\n\n';
 const signatureDelta =
 	'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"opaque-integrity-metadata"}}\n\n';
 const messageStop = 'event: message_stop\ndata: {"type":"message_stop"}\n\n';
@@ -49,31 +47,46 @@ function controllableStream(
 }
 
 describe("createAnthropicSemanticLivenessStream", () => {
-	it("refreshes postcommit idle on complete ping, structural, and usage frames", async () => {
-		const source = controllableStream();
-		const onTimeout = mock(() => undefined);
-		const reader = createAnthropicSemanticLivenessStream(source.stream, {
-			semanticTimeoutMs: 250,
-			onTimeout,
-		}).getReader();
+	it("schedules only protocol-idle liveness when the progress cap is omitted or null", async () => {
+		const protocolIdleTimeoutMs = 300_000;
 
-		source.controller().enqueue(encoder.encode(content("first")));
-		expect(decoder.decode((await reader.read()).value)).toBe(content("first"));
+		for (const configuration of ["omitted", "null"] as const) {
+			const source = controllableStream();
+			const setTimeoutSpy = spyOn(globalThis, "setTimeout");
+			const reader = createAnthropicSemanticLivenessStream(
+				source.stream,
+				configuration === "omitted"
+					? { semanticTimeoutMs: protocolIdleTimeoutMs }
+					: {
+							semanticTimeoutMs: protocolIdleTimeoutMs,
+							meaningfulProgressTimeoutMs: null,
+						},
+			).getReader();
+			let pendingRead: Promise<ReadableStreamReadResult<Uint8Array>> | null =
+				null;
 
-		for (const validActivity of [ping, contentBlockStart, usageDelta]) {
-			await delay(100);
-			source.controller().enqueue(encoder.encode(validActivity));
-			expect(decoder.decode((await reader.read()).value)).toBe(validActivity);
+			try {
+				source.controller().enqueue(encoder.encode(content("first")));
+				expect(decoder.decode((await reader.read()).value)).toBe(
+					content("first"),
+				);
+
+				pendingRead = reader.read();
+				await Promise.resolve();
+				const scheduledDelays = setTimeoutSpy.mock.calls.map(
+					([, delayMs]) => delayMs,
+				);
+				expect(scheduledDelays).toContain(protocolIdleTimeoutMs);
+				expect(scheduledDelays).not.toContain(270_000);
+			} finally {
+				try {
+					await reader.cancel("scheduler assertion complete");
+					if (pendingRead) await pendingRead;
+				} finally {
+					setTimeoutSpy.mockRestore();
+				}
+			}
 		}
-		await delay(100);
-		expect(onTimeout).not.toHaveBeenCalled();
-
-		source.controller().enqueue(encoder.encode(messageStop));
-		source.controller().close();
-		expect(decoder.decode((await reader.read()).value)).toBe(messageStop);
-		expect(await reader.read()).toMatchObject({ done: true });
-		expect(onTimeout).not.toHaveBeenCalled();
-		expect(source.cancel).not.toHaveBeenCalled();
 	});
 
 	it("bounds postcommit ping and structural activity without meaningful progress", async () => {

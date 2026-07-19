@@ -153,6 +153,27 @@ const POSTCOMMIT_STALL = [
 	"",
 	"",
 ].join("\n");
+const POSTCOMMIT_TERMINAL = [
+	"event: content_block_delta",
+	'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"complete"}}',
+	"",
+	"event: content_block_stop",
+	'data: {"type":"content_block_stop","index":0}',
+	"",
+	"event: message_delta",
+	'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}',
+	"",
+	"event: message_stop",
+	'data: {"type":"message_stop"}',
+	"",
+	"",
+].join("\n");
+const POSTCOMMIT_PROTOCOL_ACTIVITY = [
+	'event: ping\ndata: {"type":"ping"}\n\n',
+	'event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}\n\n',
+	'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"opaque"}}\n\n',
+	'event: ping\ndata: {"type":"ping"}\n\n',
+];
 
 const OPENAI_STRUCTURAL_CHUNK = JSON.stringify({
 	id: "chatcmpl-structural",
@@ -274,6 +295,34 @@ function postcommitProtocolActivityOnlyStream(
 					encoder.encode('event: ping\ndata: {"type":"ping"}\n\n'),
 				);
 			}, 20);
+		},
+		cancel() {
+			if (activityTimer !== undefined) clearInterval(activityTimer);
+			onCancel();
+		},
+	});
+}
+
+function postcommitProtocolActivityThenSuccessStream(
+	onCancel: () => void,
+): ReadableStream<Uint8Array> {
+	let activityTimer: ReturnType<typeof setInterval> | undefined;
+	let activityIndex = 0;
+	return new ReadableStream({
+		start(controller) {
+			controller.enqueue(encoder.encode(POSTCOMMIT_STALL));
+			activityTimer = setInterval(() => {
+				if (activityIndex < POSTCOMMIT_PROTOCOL_ACTIVITY.length) {
+					controller.enqueue(
+						encoder.encode(POSTCOMMIT_PROTOCOL_ACTIVITY[activityIndex++]),
+					);
+					return;
+				}
+				if (activityTimer !== undefined) clearInterval(activityTimer);
+				activityTimer = undefined;
+				controller.enqueue(encoder.encode(POSTCOMMIT_TERMINAL));
+				controller.close();
+			}, 30);
 		},
 		cancel() {
 			if (activityTimer !== undefined) clearInterval(activityTimer);
@@ -451,6 +500,7 @@ function makeRequest(
 
 beforeEach(() => {
 	process.env[TIMEOUT_ENV] = "20";
+	delete process.env[POST_COMMIT_MEANINGFUL_PROGRESS_ENV];
 	process.env[TERMINAL_GRACE_ENV] = "10";
 	process.env[BUFFER_ENV] = "1048576";
 	process.env[SUPPRESSION_ENV] = "12345";
@@ -1781,6 +1831,34 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		expect(reportCandidateFailure).not.toHaveBeenCalled();
 	});
 
+	it("keeps a committed route alive by default while valid protocol activity continues", async () => {
+		process.env[TIMEOUT_ENV] = "70";
+		delete process.env[POST_COMMIT_MEANINGFUL_PROGRESS_ENV];
+		const account = makeAccount("postcommit-active-a");
+		const { ctx, reportCandidateFailure, reportCandidateSuccess } = makeContext(
+			[account],
+		);
+		let fetchCount = 0;
+		let cancelCount = 0;
+		globalThis.fetch = mock(async () => {
+			fetchCount++;
+			return sseResponse(
+				postcommitProtocolActivityThenSuccessStream(() => cancelCount++),
+			);
+		}) as unknown as typeof fetch;
+
+		const request = makeRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.text();
+
+		expect(fetchCount).toBe(1);
+		expect(cancelCount).toBe(0);
+		expect(body).toStartWith(POSTCOMMIT_STALL);
+		expect(body).toEndWith(POSTCOMMIT_TERMINAL);
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+		expect(reportCandidateSuccess).toHaveBeenCalledTimes(1);
+	});
+
 	it("reroutes the next same-lane turn after a postcommit meaningful-progress timeout while leaving sibling lanes isolated", async () => {
 		process.env[TIMEOUT_ENV] = "50";
 		process.env[POST_COMMIT_MEANINGFUL_PROGRESS_ENV] = "90";
@@ -1789,14 +1867,8 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		const { ctx } = makeContext([first, second], makeCombo([first, second]));
 		const strategy = new SessionAffinityStrategy();
 		strategy.initialize({ resetAccountSession: () => undefined });
-		const reportCandidateFailure = spyOn(
-			strategy,
-			"reportCandidateFailure",
-		);
-		const reportCandidateSuccess = spyOn(
-			strategy,
-			"reportCandidateSuccess",
-		);
+		const reportCandidateFailure = spyOn(strategy, "reportCandidateFailure");
+		const reportCandidateSuccess = spyOn(strategy, "reportCandidateSuccess");
 		ctx.strategy = strategy;
 		let fetchCount = 0;
 		let cancelCount = 0;
@@ -1809,9 +1881,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 				upstreamRequest.headers.get("x-api-key")?.slice(4) ?? "",
 			);
 			return fetchCount === 1
-				? sseResponse(
-						postcommitProtocolActivityOnlyStream(() => cancelCount++),
-					)
+				? sseResponse(postcommitProtocolActivityOnlyStream(() => cancelCount++))
 				: sseResponse(byteStream(SUCCESS));
 		}) as unknown as typeof fetch;
 
@@ -1997,7 +2067,12 @@ describe("downstream Anthropic Messages SSE routing", () => {
 });
 
 describe("Anthropic stream runtime configuration", () => {
-	it("falls back to module defaults for invalid values", () => {
+	it("disables the postcommit progress cap when absent or invalid", () => {
+		delete process.env[POST_COMMIT_MEANINGFUL_PROGRESS_ENV];
+		expect(
+			getAnthropicStreamRuntimeConfig().postCommitMeaningfulProgressTimeoutMs,
+		).toBeNull();
+
 		process.env[TIMEOUT_ENV] = "0";
 		process.env[MEANINGFUL_PROGRESS_ENV] = "not-a-number";
 		process.env[POST_COMMIT_MEANINGFUL_PROGRESS_ENV] = "not-a-number";
@@ -2007,12 +2082,11 @@ describe("Anthropic stream runtime configuration", () => {
 
 		expect(ANTHROPIC_PRE_COMMIT_SEMANTIC_TIMEOUT_MS).toBe(120_000);
 		expect(ANTHROPIC_MEANINGFUL_PROGRESS_TIMEOUT_MS).toBe(150_000);
-		expect(ANTHROPIC_POST_COMMIT_MEANINGFUL_PROGRESS_TIMEOUT_MS).toBe(270_000);
+		expect(ANTHROPIC_POST_COMMIT_MEANINGFUL_PROGRESS_TIMEOUT_MS).toBeNull();
 		expect(getAnthropicStreamRuntimeConfig()).toEqual({
 			semanticTimeoutMs: ANTHROPIC_PRE_COMMIT_SEMANTIC_TIMEOUT_MS,
 			meaningfulProgressTimeoutMs: ANTHROPIC_MEANINGFUL_PROGRESS_TIMEOUT_MS,
-			postCommitMeaningfulProgressTimeoutMs:
-				ANTHROPIC_POST_COMMIT_MEANINGFUL_PROGRESS_TIMEOUT_MS,
+			postCommitMeaningfulProgressTimeoutMs: null,
 			terminalGraceMs: ANTHROPIC_PRE_COMMIT_TERMINAL_GRACE_MS,
 			maxBufferedBytes: ANTHROPIC_PRE_COMMIT_MAX_BUFFERED_BYTES,
 			routeSuppressionMs: ANTHROPIC_PRE_COMMIT_ROUTE_SUPPRESSION_MS,
