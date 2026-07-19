@@ -7,6 +7,7 @@ import {
 	mock,
 	spyOn,
 } from "bun:test";
+import { SessionAffinityStrategy } from "@better-ccflare/load-balancer";
 import type {
 	Account,
 	ComboWithSlots,
@@ -425,6 +426,7 @@ function makeRequest(
 	signal?: AbortSignal,
 	forcedAccountId?: string,
 	stream = true,
+	model = MODEL,
 ): Request {
 	const headers: Record<string, string> = {
 		"content-type": "application/json",
@@ -437,7 +439,7 @@ function makeRequest(
 		method: "POST",
 		headers,
 		body: JSON.stringify({
-			model: MODEL,
+			model,
 			messages: [{ role: "user", content: "hello" }],
 			metadata: { user_id: SESSION },
 			max_tokens: 16,
@@ -1079,7 +1081,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		});
 	});
 
-	it("terminates a transformed xAI postcommit idle without replay or circuit poisoning", async () => {
+	it("suppresses only the exact transformed route after a postcommit protocol idle without replay", async () => {
 		const first = makeXaiAccount("xai-postcommit-a");
 		const second = makeXaiAccount("must-not-splice-b");
 		const { ctx, reportCandidateFailure, reportCandidateSuccess } = makeContext(
@@ -1109,7 +1111,24 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		expect(body).toEndWith(
 			'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"Response stalled after partial output"}}\n\n',
 		);
-		expect(reportCandidateFailure).not.toHaveBeenCalled();
+		expect(reportCandidateFailure).toHaveBeenCalledTimes(1);
+		const [reportedMeta, failure] = reportCandidateFailure.mock.calls[0];
+		expect(failure).toEqual({
+			candidateId: "combo:semantic-combo:slot:semantic-slot-0",
+			reason: "anthropic_postcommit_protocol_idle_timeout",
+			suppressForMs: 12345,
+		});
+		const lane = JSON.parse(
+			reportedMeta.affinityLaneKey ?? "null",
+		) as unknown[];
+		expect(lane[1]).toBe(SESSION);
+		expect(lane[5]).toBe(MODEL);
+		expect(first.paused).toBe(false);
+		expect(first.rate_limited_until).toBeNull();
+		expect(first.consecutive_rate_limits).toBe(0);
+		expect(
+			usageCache.getModelScopedExhaustion(first.id, MODEL, null),
+		).toBeNull();
 		expect(reportCandidateSuccess).not.toHaveBeenCalled();
 	});
 
@@ -1762,15 +1781,23 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		expect(reportCandidateFailure).not.toHaveBeenCalled();
 	});
 
-	it("keeps a postcommit meaningful-progress timeout circuit-neutral across turns", async () => {
+	it("reroutes the next same-lane turn after a postcommit meaningful-progress timeout while leaving sibling lanes isolated", async () => {
 		process.env[TIMEOUT_ENV] = "50";
 		process.env[POST_COMMIT_MEANINGFUL_PROGRESS_ENV] = "90";
 		const first = makeAccount("postcommit-a");
-		const second = makeAccount("must-not-splice-b");
-		const { ctx, reportCandidateFailure, reportCandidateSuccess } = makeContext(
-			[first, second],
-			makeCombo([first, second]),
+		const second = makeAccount("postcommit-b");
+		const { ctx } = makeContext([first, second], makeCombo([first, second]));
+		const strategy = new SessionAffinityStrategy();
+		strategy.initialize({ resetAccountSession: () => undefined });
+		const reportCandidateFailure = spyOn(
+			strategy,
+			"reportCandidateFailure",
 		);
+		const reportCandidateSuccess = spyOn(
+			strategy,
+			"reportCandidateSuccess",
+		);
+		ctx.strategy = strategy;
 		let fetchCount = 0;
 		let cancelCount = 0;
 		const fetchedAccounts: string[] = [];
@@ -1781,39 +1808,71 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			fetchedAccounts.push(
 				upstreamRequest.headers.get("x-api-key")?.slice(4) ?? "",
 			);
-			return sseResponse(
-				postcommitProtocolActivityOnlyStream(() => cancelCount++),
-			);
+			return fetchCount === 1
+				? sseResponse(
+						postcommitProtocolActivityOnlyStream(() => cancelCount++),
+					)
+				: sseResponse(byteStream(SUCCESS));
 		}) as unknown as typeof fetch;
 
 		const request = makeRequest();
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const responseText = await response.text();
+		const cancelDeadline = Date.now() + 250;
+		while (cancelCount < 1 && Date.now() < cancelDeadline) {
+			await new Promise((resolve) => setTimeout(resolve, 1));
+		}
+
+		expect(fetchCount).toBe(1);
+		expect(fetchedAccounts).toEqual([first.id]);
+		expect(cancelCount).toBe(1);
+		expect(responseText).toStartWith(POSTCOMMIT_STALL);
+		expect(responseText).toEndWith(
+			'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"Response stalled after partial output"}}\n\n',
+		);
+		expect(reportCandidateFailure).toHaveBeenCalledTimes(1);
+		const [reportedMeta, failure] = reportCandidateFailure.mock.calls[0];
+		expect(failure).toEqual({
+			candidateId: "combo:semantic-combo:slot:semantic-slot-0",
+			reason: "anthropic_postcommit_meaningful_progress_timeout",
+			suppressForMs: 12345,
+		});
+		const lane = JSON.parse(
+			reportedMeta.affinityLaneKey ?? "null",
+		) as unknown[];
+		expect(lane[1]).toBe(SESSION);
+		expect(lane[5]).toBe(MODEL);
+		expect(first.paused).toBe(false);
+		expect(first.rate_limited_until).toBeNull();
+		expect(first.consecutive_rate_limits).toBe(0);
+		expect(
+			usageCache.getModelScopedExhaustion(first.id, MODEL, null),
+		).toBeNull();
+		expect(reportCandidateSuccess).not.toHaveBeenCalled();
+
 		const nextRequest = makeRequest();
 		const nextResponse = await handleProxy(
 			nextRequest,
 			new URL(nextRequest.url),
 			ctx,
 		);
-		const nextResponseText = await nextResponse.text();
-		const cancelDeadline = Date.now() + 250;
-		while (cancelCount < 2 && Date.now() < cancelDeadline) {
-			await new Promise((resolve) => setTimeout(resolve, 1));
-		}
+		expect(await nextResponse.text()).toBe(SUCCESS);
+		expect(fetchedAccounts).toEqual([first.id, second.id]);
 
-		expect(fetchCount).toBe(2);
-		expect(fetchedAccounts).toEqual([first.id, first.id]);
-		expect(cancelCount).toBe(2);
-		expect(responseText).toStartWith(POSTCOMMIT_STALL);
-		expect(responseText).toEndWith(
-			'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"Response stalled after partial output"}}\n\n',
+		const siblingRequest = makeRequest(
+			undefined,
+			undefined,
+			true,
+			OPUS_SIBLING,
 		);
-		expect(nextResponseText).toStartWith(POSTCOMMIT_STALL);
-		expect(nextResponseText).toEndWith(
-			'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"Response stalled after partial output"}}\n\n',
+		const siblingResponse = await handleProxy(
+			siblingRequest,
+			new URL(siblingRequest.url),
+			ctx,
 		);
-		expect(reportCandidateFailure).not.toHaveBeenCalled();
-		expect(reportCandidateSuccess).not.toHaveBeenCalled();
+		expect(await siblingResponse.text()).toBe(SUCCESS);
+		expect(fetchedAccounts).toEqual([first.id, second.id, first.id]);
+		expect(strategy.routeSuppressionEntries).toBe(1);
 	});
 
 	it("suppresses the exact route once for a committed upstream transient SSE error without replay", async () => {
