@@ -37,6 +37,7 @@ import {
 	isDownstreamAnthropicMessagesSse,
 	isNativeAnthropicMessagesSse,
 } from "../anthropic-semantic-preflight";
+import { AnthropicStreamOutcomeTracker } from "../anthropic-stream-outcome";
 import type { ProxyContext } from "../handlers";
 import type { UsageCollector } from "../usage-collector";
 
@@ -476,6 +477,7 @@ function makeRequest(
 	forcedAccountId?: string,
 	stream = true,
 	model = MODEL,
+	userAgent?: string,
 ): Request {
 	const headers: Record<string, string> = {
 		"content-type": "application/json",
@@ -484,6 +486,7 @@ function makeRequest(
 	if (forcedAccountId) {
 		headers["x-better-ccflare-account-id"] = forcedAccountId;
 	}
+	if (userAgent) headers["user-agent"] = userAgent;
 	return new Request("https://proxy.local/v1/messages", {
 		method: "POST",
 		headers,
@@ -532,6 +535,73 @@ afterEach(() => {
 });
 
 describe("downstream Anthropic Messages SSE routing", () => {
+	it("adapts the outer coordinator's rescue ping for the Claude Code stream iterator", async () => {
+		process.env[RESCUE_ACTIVATION_ENV] = "5";
+		process.env[RESCUE_PING_ENV] = "1000";
+		process.env[RESCUE_DEADLINE_ENV] = "100";
+		const account = makeAccount("selection-blocked-claude-ping");
+		const { ctx } = makeContext([account]);
+		ctx.strategy.select = mock(() => new Promise<Account[]>(() => undefined));
+
+		const request = makeRequest(
+			undefined,
+			undefined,
+			true,
+			MODEL,
+			"claude-cli/2.1.212 (external, cli)",
+		);
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const reader = response.body?.getReader();
+		const first = await reader?.read();
+		await reader?.cancel("test complete");
+
+		expect(response.headers.get("x-better-ccflare-precommit-rescue")).toBe(
+			"active",
+		);
+		expect(decoder.decode(first?.value)).toBe(
+			'event: message\ndata: {"type":"ping"}\n\n',
+		);
+	});
+
+	it("keeps analytics on canonical pings while adapting only downstream Claude Code bytes", async () => {
+		const account = makeAccount("canonical-analytics-ping");
+		const { ctx } = makeContext([account]);
+		const canonicalPing = 'event: ping\ndata: {"type":"ping"}\n\n';
+		globalThis.fetch = mock(async () =>
+			sseResponse(byteStream(canonicalPing + SUCCESS)),
+		) as unknown as typeof fetch;
+
+		const request = makeRequest(
+			undefined,
+			undefined,
+			true,
+			MODEL,
+			"claude-cli/2.1.212 (external, cli)",
+		);
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const downstreamBody = await response.text();
+		const accountedChunks = usageHandleChunk.mock.calls.map(
+			([, bytes]) => bytes,
+		);
+		const accountedBody = accountedChunks
+			.map((bytes) => decoder.decode(bytes))
+			.join("");
+		const outcome = new AnthropicStreamOutcomeTracker();
+		for (const bytes of accountedChunks) outcome.push(bytes);
+
+		expect(downstreamBody).toStartWith(
+			'event: message\ndata: {"type":"ping"}\n\n',
+		);
+		expect(downstreamBody).not.toContain(canonicalPing);
+		expect(accountedBody).toStartWith(canonicalPing);
+		expect(outcome.finish()).toMatchObject({
+			status: "completed",
+			parseState: "clean",
+			pingEventCount: 1,
+			malformedEventCount: 0,
+		});
+	});
+
 	it("starts precommit rescue while account selection is still blocked", async () => {
 		process.env[RESCUE_ACTIVATION_ENV] = "5";
 		process.env[RESCUE_PING_ENV] = "5";
