@@ -60,6 +60,10 @@ const contentBlockStart =
 	'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n';
 const usageDelta =
 	'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":null},"usage":{"output_tokens":2}}\n\n';
+const omittedThinkingDelta =
+	'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}\n\n';
+const signatureDelta =
+	'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"opaque-integrity-metadata"}}\n\n';
 const terminalDelta =
 	'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n';
 const messageStop = 'event: message_stop\ndata: {"type":"message_stop"}\n\n';
@@ -131,6 +135,30 @@ describe("gateAnthropicSsePreCommit", () => {
 		expect(error.reason).toBe("meaningful_progress_timeout");
 		expect(error.validProtocolFramesSeen).toBeGreaterThan(1);
 		expect(error.lastValidProtocolActivityAgeMs).toBeLessThan(100);
+		expect(source.cancel).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not commit omitted thinking when only its signature arrives", async () => {
+		const source = controllableStream();
+		const result = gateAnthropicSsePreCommit(source.stream, {
+			semanticTimeoutMs: 100,
+			meaningfulProgressTimeoutMs: 45,
+			terminalGraceMs: 20,
+			maxBufferedBytes: 4096,
+		});
+
+		source
+			.controller()
+			.enqueue(
+				bytes(`${messageStart}${omittedThinkingDelta}${signatureDelta}`),
+			);
+
+		const error = await stallFrom(result);
+		expect(error.reason).toBe("meaningful_progress_timeout");
+		expect(error.frameKindCounts).toMatchObject({
+			structural: 3,
+			meaningful: 0,
+		});
 		expect(source.cancel).toHaveBeenCalledTimes(1);
 	});
 
@@ -250,6 +278,24 @@ describe("gateAnthropicSsePreCommit", () => {
 		expect(settled).toBeInstanceOf(AnthropicPreCommitStallError);
 		const error = settled as AnthropicPreCommitStallError;
 		expect(error.reason).toBe("terminal_grace_timeout");
+		expect(error.terminalEvidenceSeen).toBe(true);
+		expect(source.cancel).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not let terminal grace extend a shared request commitment deadline", async () => {
+		const source = controllableStream();
+		const result = gateAnthropicSsePreCommit(source.stream, {
+			semanticTimeoutMs: 500,
+			meaningfulProgressTimeoutMs: 500,
+			commitmentDeadlineAt: Date.now() + 40,
+			terminalGraceMs: 200,
+			maxBufferedBytes: 2048,
+		});
+
+		source.controller().enqueue(bytes(`${messageStart}${terminalDelta}`));
+
+		const error = await stallFrom(result);
+		expect(error.reason).toBe("meaningful_progress_timeout");
 		expect(error.terminalEvidenceSeen).toBe(true);
 		expect(source.cancel).toHaveBeenCalledTimes(1);
 	});

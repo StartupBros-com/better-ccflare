@@ -17,6 +17,7 @@ import {
 	ANTHROPIC_PRECOMMIT_RESCUE_ACTIVATION_MS,
 	ANTHROPIC_PRECOMMIT_RESCUE_COMMITMENT_DEADLINE_MS,
 	ANTHROPIC_PRECOMMIT_RESCUE_DEADLINE_ENV,
+	ANTHROPIC_PRECOMMIT_RESCUE_ERROR_FRAME,
 	ANTHROPIC_PRECOMMIT_RESCUE_PING_FRAME,
 	ANTHROPIC_PRECOMMIT_RESCUE_PING_INTERVAL_ENV,
 	ANTHROPIC_PRECOMMIT_RESCUE_PING_INTERVAL_MS,
@@ -51,6 +52,8 @@ const usageCollectorModule = await import("../usage-collector");
 const { alignRouteCandidateIds, handleProxy } = await import("../proxy");
 
 const MODEL = "claude-opus-4-8";
+const OPUS_SIBLING = "claude-opus-4-8-20260701";
+const FABLE = "claude-fable-5";
 const SESSION = "semantic-failover-session";
 const TIMEOUT_ENV = "CCFLARE_ANTHROPIC_PRECOMMIT_TIMEOUT_MS";
 const MEANINGFUL_PROGRESS_ENV = ANTHROPIC_MEANINGFUL_PROGRESS_TIMEOUT_ENV;
@@ -62,6 +65,7 @@ const SUPPRESSION_ENV = "CCFLARE_ANTHROPIC_ROUTE_SUPPRESSION_MS";
 const RESCUE_ACTIVATION_ENV = ANTHROPIC_PRECOMMIT_RESCUE_ACTIVATION_ENV;
 const RESCUE_PING_ENV = ANTHROPIC_PRECOMMIT_RESCUE_PING_INTERVAL_ENV;
 const RESCUE_DEADLINE_ENV = ANTHROPIC_PRECOMMIT_RESCUE_DEADLINE_ENV;
+const CONTEXT_ADMISSION_ENV = "CCFLARE_CONTEXT_ADMISSION";
 
 const originalFetch = globalThis.fetch;
 const originalEnv = new Map(
@@ -75,6 +79,7 @@ const originalEnv = new Map(
 		RESCUE_ACTIVATION_ENV,
 		RESCUE_PING_ENV,
 		RESCUE_DEADLINE_ENV,
+		CONTEXT_ADMISSION_ENV,
 	].map((name) => [name, process.env[name]] as const),
 );
 let restoreUsageCollector = (): void => {};
@@ -306,6 +311,51 @@ function sseResponse(body: ReadableStream<Uint8Array>): Response {
 	});
 }
 
+function exactModelExhaustedResponse(): Response {
+	return new Response(
+		JSON.stringify({
+			type: "error",
+			error: { type: "rate_limit_error", message: "An error occurred" },
+		}),
+		{
+			status: 429,
+			headers: {
+				"content-type": "application/json",
+				"anthropic-ratelimit-unified-overage-disabled-reason": "out_of_credits",
+			},
+		},
+	);
+}
+
+function cacheControlRejectionResponse(): Response {
+	return new Response(
+		JSON.stringify({
+			error: {
+				message:
+					"cache_control: Extra inputs are not permitted for this provider",
+			},
+		}),
+		{
+			status: 400,
+			headers: { "content-type": "application/json" },
+		},
+	);
+}
+
+function neverEndingJsonResponse(onCancel: () => void): Response {
+	return new Response(
+		new ReadableStream<Uint8Array>({
+			cancel() {
+				onCancel();
+			},
+		}),
+		{
+			status: 400,
+			headers: { "content-type": "application/json" },
+		},
+	);
+}
+
 function makeCombo(accounts: readonly Account[]): ComboWithSlots {
 	return {
 		id: "semantic-combo",
@@ -498,6 +548,37 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		expect(await response.text()).toBe(expectedBody);
 	});
 
+	it("does not translate a slow stream:false response when the streaming deadline elapses", async () => {
+		process.env[MEANINGFUL_PROGRESS_ENV] = "20";
+		process.env[RESCUE_ACTIVATION_ENV] = "1";
+		delete process.env[RESCUE_DEADLINE_ENV];
+		const account = makeAccount("non-stream-beyond-deadline-a");
+		const { ctx } = makeContext([account]);
+		const expectedBody = JSON.stringify({ exact: "slow-non-stream" });
+		globalThis.fetch = mock(async () => {
+			await new Promise((resolve) => setTimeout(resolve, 60));
+			return new Response(expectedBody, {
+				status: 202,
+				statusText: "Slow response preserved",
+				headers: {
+					"content-type": "application/json; charset=utf-8",
+					"x-slow-non-stream": "preserved",
+				},
+			});
+		}) as unknown as typeof fetch;
+
+		const request = makeRequest(undefined, undefined, false);
+		const response = await handleProxy(request, new URL(request.url), ctx);
+
+		expect(response.status).toBe(202);
+		expect(response.statusText).toBe("Slow response preserved");
+		expect(response.headers.get("x-slow-non-stream")).toBe("preserved");
+		expect(
+			response.headers.get("x-better-ccflare-precommit-rescue"),
+		).toBeNull();
+		expect(await response.text()).toBe(expectedBody);
+	});
+
 	it("preserves non-Messages routes exactly even when their body requests streaming", async () => {
 		process.env[RESCUE_ACTIVATION_ENV] = "5";
 		const account = makeAccount("non-messages-selection-blocked-a");
@@ -683,6 +764,288 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		expect(reportCandidateSuccess.mock.calls[0][1]).toEqual({
 			candidateId: "combo:semantic-combo:slot:semantic-slot-1",
 		});
+	});
+
+	it("commits a fallback or emits its terminal error before the client semantic watchdog", async () => {
+		// Scale Claude Code's observed 180s watchdog to 180ms. The shared proxy
+		// commitment boundary is 150ms, preserving the same 30/180 headroom ratio.
+		process.env[MEANINGFUL_PROGRESS_ENV] = "150";
+		process.env[RESCUE_ACTIVATION_ENV] = "5";
+		process.env[RESCUE_PING_ENV] = "10";
+		delete process.env[RESCUE_DEADLINE_ENV];
+		const first = makeAccount("request-budget-stalled-a");
+		const second = makeAccount("request-budget-delayed-b");
+		const { ctx } = makeContext([first, second], makeCombo([first, second]));
+		const fetchedAccounts: string[] = [];
+		let firstCancelCount = 0;
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			const accountId =
+				upstreamRequest.headers.get("x-api-key")?.slice(4) ?? "";
+			fetchedAccounts.push(accountId);
+			if (accountId === first.id) {
+				return sseResponse(
+					protocolActivityOnlyStream(() => firstCancelCount++),
+				);
+			}
+			await new Promise((resolve) => setTimeout(resolve, 60));
+			return sseResponse(byteStream(SUCCESS));
+		}) as unknown as typeof fetch;
+
+		const request = makeRequest();
+		const terminalBody = handleProxy(request, new URL(request.url), ctx).then(
+			(response) => response.text(),
+		);
+		const clientStalled = Symbol("client semantic watchdog elapsed");
+		const outcome = await Promise.race([
+			terminalBody,
+			new Promise<typeof clientStalled>((resolve) =>
+				setTimeout(() => resolve(clientStalled), 180),
+			),
+		]);
+
+		expect(outcome).not.toBe(clientStalled);
+		if (outcome === clientStalled) return;
+		expect(
+			outcome.endsWith(SUCCESS) ||
+				outcome.endsWith(ANTHROPIC_PRECOMMIT_RESCUE_ERROR_FRAME),
+		).toBe(true);
+		expect(fetchedAccounts).toEqual([first.id, second.id]);
+		expect(firstCancelCount).toBe(1);
+	});
+
+	it("reserves fallback time when a non-final route never returns response headers", async () => {
+		process.env[MEANINGFUL_PROGRESS_ENV] = "150";
+		process.env[RESCUE_ACTIVATION_ENV] = "5";
+		process.env[RESCUE_PING_ENV] = "10";
+		delete process.env[RESCUE_DEADLINE_ENV];
+		const first = makeAccount("header-stalled-a");
+		const second = makeAccount("header-fallback-b");
+		const { ctx, reportCandidateFailure } = makeContext([first, second]);
+		const fetchedAccounts: string[] = [];
+		let firstAbortElapsedMs: number | null = null;
+		const startedAt = Date.now();
+		globalThis.fetch = mock((input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			const accountId =
+				upstreamRequest.headers.get("x-api-key")?.slice(4) ?? "";
+			fetchedAccounts.push(accountId);
+			if (accountId === second.id) {
+				return Promise.resolve(sseResponse(byteStream(SUCCESS)));
+			}
+			return new Promise<Response>((_resolve, reject) => {
+				const rejectOnAbort = () => {
+					firstAbortElapsedMs = Date.now() - startedAt;
+					reject(
+						upstreamRequest.signal.reason ??
+							new DOMException("aborted", "AbortError"),
+					);
+				};
+				if (upstreamRequest.signal.aborted) rejectOnAbort();
+				else {
+					upstreamRequest.signal.addEventListener("abort", rejectOnAbort, {
+						once: true,
+					});
+				}
+			});
+		}) as unknown as typeof fetch;
+
+		const request = makeRequest();
+		const body = await (
+			await handleProxy(request, new URL(request.url), ctx)
+		).text();
+
+		expect(fetchedAccounts).toEqual([first.id, second.id]);
+		expect(body).toEndWith(SUCCESS);
+		expect(firstAbortElapsedMs).not.toBeNull();
+		if (firstAbortElapsedMs === null) return;
+		expect(firstAbortElapsedMs).toBeGreaterThanOrEqual(100);
+		expect(firstAbortElapsedMs).toBeLessThan(150);
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+	});
+
+	it("does not let a cache-control retry swallow its private attempt deadline", async () => {
+		process.env[MEANINGFUL_PROGRESS_ENV] = "150";
+		process.env[RESCUE_ACTIVATION_ENV] = "5";
+		process.env[RESCUE_PING_ENV] = "10";
+		delete process.env[RESCUE_DEADLINE_ENV];
+		const first = makeAccount("cache-retry-stalled-a");
+		const second = makeAccount("cache-retry-fallback-b");
+		const { ctx, reportCandidateFailure } = makeContext([first, second]);
+		const fetchedAccounts: string[] = [];
+		let firstAttemptCount = 0;
+		let retryAbortElapsedMs: number | null = null;
+		const startedAt = Date.now();
+		globalThis.fetch = mock((input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			const accountId =
+				upstreamRequest.headers.get("x-api-key")?.slice(4) ?? "";
+			fetchedAccounts.push(accountId);
+			if (accountId === second.id) {
+				return Promise.resolve(sseResponse(byteStream(SUCCESS)));
+			}
+			firstAttemptCount++;
+			if (firstAttemptCount === 1) {
+				return Promise.resolve(cacheControlRejectionResponse());
+			}
+			return new Promise<Response>((_resolve, reject) => {
+				const rejectOnAbort = () => {
+					retryAbortElapsedMs = Date.now() - startedAt;
+					reject(
+						upstreamRequest.signal.reason ??
+							new DOMException("aborted", "AbortError"),
+					);
+				};
+				if (upstreamRequest.signal.aborted) rejectOnAbort();
+				else {
+					upstreamRequest.signal.addEventListener("abort", rejectOnAbort, {
+						once: true,
+					});
+				}
+			});
+		}) as unknown as typeof fetch;
+
+		const request = makeRequest();
+		const body = await (
+			await handleProxy(request, new URL(request.url), ctx)
+		).text();
+
+		expect(fetchedAccounts).toEqual([first.id, first.id, second.id]);
+		expect(body).toEndWith(SUCCESS);
+		expect(retryAbortElapsedMs).not.toBeNull();
+		if (retryAbortElapsedMs === null) return;
+		expect(retryAbortElapsedMs).toBeGreaterThanOrEqual(100);
+		expect(retryAbortElapsedMs).toBeLessThan(150);
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+	});
+
+	it("bounds hanging JSON classifiers inside the same private attempt deadline", async () => {
+		process.env[MEANINGFUL_PROGRESS_ENV] = "150";
+		process.env[RESCUE_ACTIVATION_ENV] = "5";
+		process.env[RESCUE_PING_ENV] = "10";
+		delete process.env[RESCUE_DEADLINE_ENV];
+		const first = makeAccount("classifier-stalled-a");
+		const second = makeAccount("classifier-fallback-b");
+		const { ctx, reportCandidateFailure } = makeContext([first, second]);
+		const fetchedAccounts: string[] = [];
+		let firstBodyCancelCount = 0;
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			const accountId =
+				upstreamRequest.headers.get("x-api-key")?.slice(4) ?? "";
+			fetchedAccounts.push(accountId);
+			return accountId === first.id
+				? neverEndingJsonResponse(() => firstBodyCancelCount++)
+				: sseResponse(byteStream(SUCCESS));
+		}) as unknown as typeof fetch;
+
+		const startedAt = Date.now();
+		const request = makeRequest();
+		const body = await (
+			await handleProxy(request, new URL(request.url), ctx)
+		).text();
+		const elapsedMs = Date.now() - startedAt;
+
+		expect(fetchedAccounts).toEqual([first.id, second.id]);
+		expect(body).toEndWith(SUCCESS);
+		expect(firstBodyCancelCount).toBe(1);
+		expect(elapsedMs).toBeGreaterThanOrEqual(100);
+		expect(elapsedMs).toBeLessThan(150);
+		expect(first.paused).toBe(false);
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+	});
+
+	it("releases classifier clone readers after an ordinary body read rejection", async () => {
+		const account = makeAccount("classifier-read-error-a");
+		const { ctx } = makeContext([account]);
+		const probeReader = new ReadableStream<Uint8Array>().getReader();
+		const readerPrototype = Object.getPrototypeOf(probeReader) as {
+			releaseLock: () => void;
+		};
+		probeReader.releaseLock();
+		const releaseLock = spyOn(readerPrototype, "releaseLock");
+		globalThis.fetch = mock(async () => {
+			let controller!: ReadableStreamDefaultController<Uint8Array>;
+			const body = new ReadableStream<Uint8Array>({
+				start(nextController) {
+					controller = nextController;
+				},
+			});
+			queueMicrotask(() =>
+				controller.error(new Error("classifier read failed")),
+			);
+			return new Response(body, {
+				status: 400,
+				headers: { "content-type": "application/json" },
+			});
+		}) as unknown as typeof fetch;
+
+		try {
+			const request = makeRequest();
+			const response = await handleProxy(request, new URL(request.url), ctx);
+
+			expect(response.status).toBe(400);
+			expect(releaseLock).toHaveBeenCalled();
+		} finally {
+			releaseLock.mockRestore();
+		}
+	});
+
+	it("reserves while a final account can discover deferred model work, then gives the deferred route the final boundary", async () => {
+		process.env[MEANINGFUL_PROGRESS_ENV] = "150";
+		process.env[RESCUE_ACTIVATION_ENV] = "5";
+		process.env[RESCUE_PING_ENV] = "10";
+		process.env[CONTEXT_ADMISSION_ENV] = "1";
+		delete process.env[RESCUE_DEADLINE_ENV];
+		const account = makeAccount("dynamic-finality-a");
+		account.model_mappings = JSON.stringify({
+			opus: [MODEL, OPUS_SIBLING, FABLE],
+		});
+		const { ctx, reportCandidateFailure } = makeContext([account]);
+		const attemptedModels: string[] = [];
+		let siblingAbortElapsedMs: number | null = null;
+		const startedAt = Date.now();
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			const body = (await upstreamRequest.clone().json()) as { model: string };
+			attemptedModels.push(body.model);
+			if (body.model === MODEL) return exactModelExhaustedResponse();
+			if (body.model === FABLE) {
+				return sseResponse(byteStream(SUCCESS));
+			}
+			return new Promise<Response>((_resolve, reject) => {
+				const rejectOnAbort = () => {
+					siblingAbortElapsedMs = Date.now() - startedAt;
+					reject(
+						upstreamRequest.signal.reason ??
+							new DOMException("aborted", "AbortError"),
+					);
+				};
+				if (upstreamRequest.signal.aborted) rejectOnAbort();
+				else {
+					upstreamRequest.signal.addEventListener("abort", rejectOnAbort, {
+						once: true,
+					});
+				}
+			});
+		}) as unknown as typeof fetch;
+
+		const request = makeRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const responseBody = await response.text();
+
+		expect(responseBody).toEndWith(SUCCESS);
+		expect(attemptedModels).toEqual([MODEL, OPUS_SIBLING, FABLE]);
+		expect(siblingAbortElapsedMs).not.toBeNull();
+		if (siblingAbortElapsedMs === null) return;
+		expect(siblingAbortElapsedMs).toBeGreaterThanOrEqual(100);
+		expect(siblingAbortElapsedMs).toBeLessThan(150);
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
 	});
 
 	it("commits a transformed xAI meaningful delta without opening another route", async () => {
@@ -1104,11 +1467,14 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		expect(reportCandidateSuccess).not.toHaveBeenCalled();
 	});
 
-	it("propagates the bounded rescue deadline through the combined signal without penalizing the route", async () => {
+	it("propagates the shared deadline through a reserved fallback without penalizing either route", async () => {
 		process.env[TIMEOUT_ENV] = "1000";
 		process.env[RESCUE_ACTIVATION_ENV] = "1";
 		process.env[RESCUE_PING_ENV] = "5";
-		process.env[RESCUE_DEADLINE_ENV] = "20";
+		// Keep the wall-clock integration budget above Bun's cold-start/JIT stalls.
+		// Exact 20ms proportional allocation is covered synchronously by the route
+		// context unit test; this case proves the routed handoff and shared boundary.
+		process.env[RESCUE_DEADLINE_ENV] = "100";
 		const first = makeAccount("deadline-a");
 		const second = makeAccount("must-not-run-b");
 		const { ctx, reportCandidateFailure, reportCandidateSuccess } = makeContext(
@@ -1126,10 +1492,59 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		const body = await response.text();
 
 		expect(body.match(/event: error/g)).toHaveLength(1);
-		expect(fetchCount).toBe(1);
-		expect(cancelCount).toBe(1);
+		expect(fetchCount).toBe(2);
+		expect(cancelCount).toBe(2);
 		expect(reportCandidateFailure).not.toHaveBeenCalled();
 		expect(reportCandidateSuccess).not.toHaveBeenCalled();
+	});
+
+	it("keeps a transport-aborted private deadline circuit-neutral and fails over", async () => {
+		process.env[TIMEOUT_ENV] = "1000";
+		process.env[RESCUE_ACTIVATION_ENV] = "1";
+		process.env[RESCUE_PING_ENV] = "5";
+		process.env[RESCUE_DEADLINE_ENV] = "100";
+		const first = makeAccount("transport-deadline-a");
+		const second = makeAccount("transport-deadline-b");
+		const { ctx, reportCandidateFailure, reportCandidateSuccess } = makeContext(
+			[first, second],
+		);
+		const fetchedAccounts: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			const accountId =
+				upstreamRequest.headers.get("x-api-key")?.slice(4) ?? "";
+			fetchedAccounts.push(accountId);
+			if (accountId === second.id) {
+				return sseResponse(byteStream(SUCCESS));
+			}
+			return sseResponse(
+				new ReadableStream<Uint8Array>({
+					start(controller) {
+						const failOnTransportAbort = () =>
+							controller.error(new Error("transport aborted response body"));
+						if (upstreamRequest.signal.aborted) failOnTransportAbort();
+						else {
+							upstreamRequest.signal.addEventListener(
+								"abort",
+								failOnTransportAbort,
+								{ once: true },
+							);
+						}
+					},
+				}),
+			);
+		}) as unknown as typeof fetch;
+
+		const request = makeRequest();
+		const body = await (
+			await handleProxy(request, new URL(request.url), ctx)
+		).text();
+
+		expect(fetchedAccounts).toEqual([first.id, second.id]);
+		expect(body).toEndWith(SUCCESS);
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+		expect(reportCandidateSuccess).toHaveBeenCalledTimes(1);
 	});
 
 	it("propagates rescued downstream cancellation through the combined signal exactly once", async () => {
@@ -1517,9 +1932,8 @@ describe("Anthropic stream runtime configuration", () => {
 		process.env[SUPPRESSION_ENV] = "1.5";
 
 		expect(ANTHROPIC_PRE_COMMIT_SEMANTIC_TIMEOUT_MS).toBe(120_000);
-		expect(ANTHROPIC_POST_COMMIT_MEANINGFUL_PROGRESS_TIMEOUT_MS).toBe(
-			8 * 60 * 1000,
-		);
+		expect(ANTHROPIC_MEANINGFUL_PROGRESS_TIMEOUT_MS).toBe(150_000);
+		expect(ANTHROPIC_POST_COMMIT_MEANINGFUL_PROGRESS_TIMEOUT_MS).toBe(270_000);
 		expect(getAnthropicStreamRuntimeConfig()).toEqual({
 			semanticTimeoutMs: ANTHROPIC_PRE_COMMIT_SEMANTIC_TIMEOUT_MS,
 			meaningfulProgressTimeoutMs: ANTHROPIC_MEANINGFUL_PROGRESS_TIMEOUT_MS,
@@ -1565,27 +1979,54 @@ describe("Anthropic precommit rescue runtime configuration", () => {
 		});
 	});
 
-	it("clamps oversized rescue values and keeps the commitment deadline bounded", () => {
+	it("clamps a legacy-only rescue deadline to the Claude-safe default", () => {
+		delete process.env[MEANINGFUL_PROGRESS_ENV];
 		process.env[RESCUE_ACTIVATION_ENV] = String(Number.MAX_SAFE_INTEGER);
 		process.env[RESCUE_PING_ENV] = String(Number.MAX_SAFE_INTEGER);
 		process.env[RESCUE_DEADLINE_ENV] = String(Number.MAX_SAFE_INTEGER);
 
 		expect(getAnthropicPreCommitRescueConfig()).toEqual({
-			activationGraceMs: 150_000,
+			activationGraceMs: ANTHROPIC_PRECOMMIT_RESCUE_COMMITMENT_DEADLINE_MS - 1,
 			pingIntervalMs: 30_000,
-			commitmentDeadlineMs: 15 * 60 * 1000,
+			commitmentDeadlineMs: ANTHROPIC_PRECOMMIT_RESCUE_COMMITMENT_DEADLINE_MS,
 		});
 	});
 
-	it("never lets a configured deadline expire before the first rescue keepalive", () => {
+	it("clamps rescue activation inside a deliberately tiny shared deadline", () => {
 		process.env[RESCUE_ACTIVATION_ENV] = "100";
 		process.env[RESCUE_PING_ENV] = "20";
 		process.env[RESCUE_DEADLINE_ENV] = "1";
 
 		expect(getAnthropicPreCommitRescueConfig()).toEqual({
-			activationGraceMs: 100,
+			activationGraceMs: 0,
 			pingIntervalMs: 20,
-			commitmentDeadlineMs: 120,
+			commitmentDeadlineMs: 1,
+		});
+	});
+
+	it("uses the existing meaningful-progress override as the shared request deadline", () => {
+		delete process.env[RESCUE_ACTIVATION_ENV];
+		delete process.env[RESCUE_PING_ENV];
+		delete process.env[RESCUE_DEADLINE_ENV];
+		process.env[MEANINGFUL_PROGRESS_ENV] = "420000";
+
+		expect(getAnthropicPreCommitRescueConfig()).toEqual({
+			activationGraceMs: ANTHROPIC_PRECOMMIT_RESCUE_ACTIVATION_MS,
+			pingIntervalMs: ANTHROPIC_PRECOMMIT_RESCUE_PING_INTERVAL_MS,
+			commitmentDeadlineMs: 420_000,
+		});
+	});
+
+	it("lets the canonical override win over the deprecated rescue deadline", () => {
+		delete process.env[RESCUE_ACTIVATION_ENV];
+		delete process.env[RESCUE_PING_ENV];
+		process.env[MEANINGFUL_PROGRESS_ENV] = "420000";
+		process.env[RESCUE_DEADLINE_ENV] = "1";
+
+		expect(getAnthropicPreCommitRescueConfig()).toEqual({
+			activationGraceMs: ANTHROPIC_PRECOMMIT_RESCUE_ACTIVATION_MS,
+			pingIntervalMs: ANTHROPIC_PRECOMMIT_RESCUE_PING_INTERVAL_MS,
+			commitmentDeadlineMs: 420_000,
 		});
 	});
 });

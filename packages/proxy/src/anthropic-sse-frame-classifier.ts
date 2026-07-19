@@ -99,6 +99,12 @@ function classifyContentDelta(
 				parsed.delta.partial_json.length > 0
 				? "meaningful"
 				: "structural";
+		case "signature_delta":
+			// Anthropic emits this integrity signature immediately before the
+			// thinking block stops. With `display=omitted`, Opus can emit an empty
+			// thinking delta followed only by this metadata, so it proves protocol
+			// activity but not client-visible/commit-worthy model progress.
+			return "structural";
 		default: {
 			// Future content delta types are a conservative commitment/progress
 			// boundary when they carry any non-empty field. This avoids timing out a

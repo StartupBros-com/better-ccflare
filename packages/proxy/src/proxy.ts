@@ -20,6 +20,7 @@ import {
 	type AnthropicPreCommitRescueRouteContext,
 	coordinateAnthropicPreCommitRescue,
 	createAnthropicPreCommitRescueActivation,
+	createAnthropicPreCommitRescueRouteContext,
 	getAnthropicPreCommitRescueConfig,
 	isPotentialDownstreamAnthropicMessagesRequest,
 } from "./anthropic-precommit-rescue";
@@ -210,21 +211,33 @@ export async function handleProxy(
 	}
 
 	const activation = createAnthropicPreCommitRescueActivation();
+	const rescueConfig = getAnthropicPreCommitRescueConfig();
 	const routingAbortController = new AbortController();
 	const routingSignal = AbortSignal.any([
 		req.signal,
 		routingAbortController.signal,
 	]);
-	const routedResponse = handleProxyCore(req, url, ctx, apiKeyId, apiKeyName, {
+	const routeContext = createAnthropicPreCommitRescueRouteContext({
 		activate: activation.activate,
 		signal: routingSignal,
+		requestStartedAt: rescueRequestStartedAt,
+		commitmentDeadlineMs: rescueConfig.commitmentDeadlineMs,
 	});
+	const routedResponse = handleProxyCore(
+		req,
+		url,
+		ctx,
+		apiKeyId,
+		apiKeyName,
+		routeContext,
+	);
 
 	return coordinateAnthropicPreCommitRescue({
 		response: routedResponse,
 		activation: activation.promise,
-		config: getAnthropicPreCommitRescueConfig(),
+		config: rescueConfig,
 		requestStartedAt: rescueRequestStartedAt,
+		commitmentDeadlineAt: routeContext.commitmentDeadlineAt,
 		abortRouting(reason) {
 			if (!routingAbortController.signal.aborted) {
 				routingAbortController.abort(reason);
@@ -764,6 +777,7 @@ async function handleProxyCore(
 					ctx,
 					apiKeyId,
 					apiKeyName,
+					activeAnthropicPreCommitRescue,
 				),
 			);
 		}
@@ -897,12 +911,18 @@ async function handleProxyCore(
 		account: Account,
 		candidateId: string,
 		forwardModelUnavailableResponse: boolean,
+		currentlyFinalSemanticRoute: boolean,
 	): ModelFallbackExecutionPolicy => {
 		const comboName = requestMeta.comboName ?? null;
 		const comboSlotIndex = requestMeta.comboSlotIndex ?? null;
 		return {
 			routeCandidateId: candidateId,
 			forwardModelUnavailableResponse,
+			// proxyWithAccount combines this currently-known queue finality with its
+			// account/model-specific implicit-fallback discovery state immediately
+			// before each real fetch and semantic gate.
+			isFinalSemanticAttempt: () =>
+				currentlyFinalSemanticRoute && deferredModelRoutes.length === 0,
 			anthropicPreCommitRescue: activeAnthropicPreCommitRescue,
 			deferImplicitFallback: (model, fallbackRank) => {
 				const key = JSON.stringify([account.id, model.trim().toLowerCase()]);
@@ -1016,6 +1036,8 @@ async function handleProxyCore(
 			!filteredComboInfo?.comboName &&
 			i === accounts.length - 1 &&
 			deferredModelRoutes.length === 0;
+		const isFinalSelectedSemanticRoute =
+			i === accounts.length - 1 && deferredModelRoutes.length === 0;
 		try {
 			response = await proxyWithAccount(
 				req,
@@ -1037,6 +1059,7 @@ async function handleProxyCore(
 					accounts[i],
 					candidateId,
 					isFinalSelectedCandidate,
+					isFinalSelectedSemanticRoute,
 				),
 			);
 		} catch (error) {
@@ -1176,6 +1199,7 @@ async function handleProxyCore(
 							fallbackAccounts[i],
 							candidateId,
 							isFinalFallbackCandidate,
+							isFinalFallbackCandidate,
 						),
 					);
 				} catch (error) {
@@ -1314,6 +1338,8 @@ async function handleProxyCore(
 						routeCandidateId: route.candidateId,
 						implicitFallbacksEnabled: false,
 						forwardModelUnavailableResponse:
+							i === orderedDeferredModelRoutes.length - 1,
+						isFinalSemanticAttempt: () =>
 							i === orderedDeferredModelRoutes.length - 1,
 						anthropicPreCommitRescue: activeAnthropicPreCommitRescue,
 					},

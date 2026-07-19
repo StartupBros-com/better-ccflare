@@ -4,6 +4,11 @@ import {
 	SseLimitError,
 } from "@better-ccflare/core";
 import {
+	ANTHROPIC_PRECOMMIT_COMMITMENT_TIMEOUT_ENV,
+	ANTHROPIC_PRECOMMIT_RESCUE_COMMITMENT_DEADLINE_MS,
+	CLAUDE_CODE_SEMANTIC_WATCHDOG_HEADROOM_MS,
+} from "./anthropic-precommit-rescue";
+import {
 	type AnthropicSseFrameKindCounts,
 	type AnthropicTransientSseErrorType,
 	classifyAnthropicSseFrame,
@@ -13,16 +18,18 @@ import {
 import { ANTHROPIC_TERMINAL_RECOVERY_GRACE_MS } from "./anthropic-terminal-recovery";
 
 export const ANTHROPIC_PRE_COMMIT_SEMANTIC_TIMEOUT_MS = 120_000;
-// A live transport may legitimately emit pings while extended thinking is
-// hidden. Give that path twice the former idle window, but keep it at half the
-// whole-request rescue cap so one non-productive route cannot consume all 8m.
-export const ANTHROPIC_MEANINGFUL_PROGRESS_TIMEOUT_MS = 4 * 60 * 1000;
-// Once bytes are committed, replay is unsafe and long agent/tool workflows can
-// legitimately stay heartbeat-active while hidden work continues. Keep that
-// finite budget below the guard's ten-minute absolute request deadline, but do
-// not reuse the shorter precommit failover budget.
+const CLAUDE_CODE_POST_COMMIT_WATCHDOG_MS = 300_000;
+// Standalone callers retain the same finite default. Routed requests replace
+// this per-call origin with the request-wide absolute boundary created at
+// handleProxy entry, so serial candidates can never restart the clock.
+export const ANTHROPIC_MEANINGFUL_PROGRESS_TIMEOUT_MS =
+	ANTHROPIC_PRECOMMIT_RESCUE_COMMITMENT_DEADLINE_MS;
+// After commitment, Claude Code's semantic-stall watchdog fires at roughly
+// 300s. This independent finite operator cap remains necessary because the
+// transport guard clears its absolute deadline after response start.
 export const ANTHROPIC_POST_COMMIT_MEANINGFUL_PROGRESS_TIMEOUT_MS =
-	8 * 60 * 1000;
+	CLAUDE_CODE_POST_COMMIT_WATCHDOG_MS -
+	CLAUDE_CODE_SEMANTIC_WATCHDOG_HEADROOM_MS;
 export const ANTHROPIC_PRE_COMMIT_TERMINAL_GRACE_MS =
 	ANTHROPIC_TERMINAL_RECOVERY_GRACE_MS;
 // This is a total retention budget, distinct from either parser limit. A
@@ -37,7 +44,7 @@ export const ANTHROPIC_PRE_COMMIT_ROUTE_SUPPRESSION_MS = 5 * 60 * 1000;
 export const ANTHROPIC_PRE_COMMIT_TIMEOUT_ENV =
 	"CCFLARE_ANTHROPIC_PRECOMMIT_TIMEOUT_MS";
 export const ANTHROPIC_MEANINGFUL_PROGRESS_TIMEOUT_ENV =
-	"CCFLARE_ANTHROPIC_MEANINGFUL_PROGRESS_TIMEOUT_MS";
+	ANTHROPIC_PRECOMMIT_COMMITMENT_TIMEOUT_ENV;
 export const ANTHROPIC_POST_COMMIT_MEANINGFUL_PROGRESS_TIMEOUT_ENV =
 	"CCFLARE_ANTHROPIC_POSTCOMMIT_MEANINGFUL_PROGRESS_TIMEOUT_MS";
 export const ANTHROPIC_TERMINAL_GRACE_ENV =
@@ -48,7 +55,12 @@ export const ANTHROPIC_ROUTE_SUPPRESSION_ENV =
 	"CCFLARE_ANTHROPIC_ROUTE_SUPPRESSION_MS";
 
 const MAX_SEMANTIC_TIMEOUT_MS = 10 * 60 * 1000;
+// Explicit overrides may target clients with longer watchdogs. Routed requests
+// resolve the override once into their shared absolute commitment boundary;
+// standalone gate callers retain this finite per-call cap.
 const MAX_MEANINGFUL_PROGRESS_TIMEOUT_MS = 7 * 60 * 1000;
+// Postcommit liveness is independent of the transport guard: after response
+// start the guard no longer has an absolute deadline, so keep a separate cap.
 const MAX_POST_COMMIT_MEANINGFUL_PROGRESS_TIMEOUT_MS = 9 * 60 * 1000;
 const MAX_TERMINAL_GRACE_MS = 60 * 1000;
 const MAX_PRE_COMMIT_BUFFERED_BYTES = 16 * 1024 * 1024;
@@ -271,8 +283,10 @@ export class AnthropicPreCommitAbortedError extends Error {
 export interface AnthropicSemanticPreflightOptions {
 	/** Maximum idle time between valid complete protocol events before content. */
 	semanticTimeoutMs?: number;
-	/** Maximum total time without content-bearing progress before commitment. */
+	/** Per-call progress cap for standalone gates without a shared deadline. */
 	meaningfulProgressTimeoutMs?: number;
+	/** Absolute request-wide commitment boundary shared across serial routes. */
+	commitmentDeadlineAt?: number;
 	/** Time allowed for message_stop after a terminal message_delta. */
 	terminalGraceMs?: number;
 	/** Hard cap on all raw bytes retained before semantic commitment. */
@@ -412,11 +426,18 @@ export async function gateAnthropicSsePreCommit(
 		options.semanticTimeoutMs ?? ANTHROPIC_PRE_COMMIT_SEMANTIC_TIMEOUT_MS,
 		"semanticTimeoutMs",
 	);
-	const meaningfulProgressTimeoutMs = positiveInteger(
-		options.meaningfulProgressTimeoutMs ??
-			ANTHROPIC_MEANINGFUL_PROGRESS_TIMEOUT_MS,
-		"meaningfulProgressTimeoutMs",
-	);
+	const meaningfulProgressDeadlineAt =
+		options.commitmentDeadlineAt === undefined
+			? undefined
+			: positiveInteger(options.commitmentDeadlineAt, "commitmentDeadlineAt");
+	const meaningfulProgressTimeoutMs =
+		meaningfulProgressDeadlineAt === undefined
+			? positiveInteger(
+					options.meaningfulProgressTimeoutMs ??
+						ANTHROPIC_MEANINGFUL_PROGRESS_TIMEOUT_MS,
+					"meaningfulProgressTimeoutMs",
+				)
+			: undefined;
 	const terminalGraceMs = positiveInteger(
 		options.terminalGraceMs ?? ANTHROPIC_PRE_COMMIT_TERMINAL_GRACE_MS,
 		"terminalGraceMs",
@@ -434,7 +455,10 @@ export async function gateAnthropicSsePreCommit(
 	const bufferedChunks: Uint8Array[] = [];
 	const startedAt = Date.now();
 	let protocolIdleDeadline = startedAt + semanticTimeoutMs;
-	const meaningfulProgressDeadline = startedAt + meaningfulProgressTimeoutMs;
+	const meaningfulProgressDeadline =
+		meaningfulProgressDeadlineAt ??
+		startedAt +
+			(meaningfulProgressTimeoutMs ?? ANTHROPIC_MEANINGFUL_PROGRESS_TIMEOUT_MS);
 
 	let bufferedBytes = 0;
 	let framesSeen = 0;
@@ -553,18 +577,21 @@ export async function gateAnthropicSsePreCommit(
 
 	while (true) {
 		if (options.signal?.aborted) return abort();
-		// Terminal protocol evidence starts a fresh, bounded grace window. It
-		// supersedes the generic protocol-idle deadline whether that is sooner or
-		// later.
+		// Terminal evidence supersedes the protocol-idle window, but never the
+		// request-wide commitment boundary. A late/final route therefore cannot
+		// restart the clock by opening a fresh terminal grace period.
 		const activeTimeoutReason: AnthropicPreCommitStallReason =
 			terminalDeadline !== undefined
-				? "terminal_grace_timeout"
+				? meaningfulProgressDeadline <= terminalDeadline
+					? "meaningful_progress_timeout"
+					: "terminal_grace_timeout"
 				: meaningfulProgressDeadline <= protocolIdleDeadline
 					? "meaningful_progress_timeout"
 					: "semantic_timeout";
 		const activeDeadline =
-			terminalDeadline ??
-			Math.min(protocolIdleDeadline, meaningfulProgressDeadline);
+			terminalDeadline !== undefined
+				? Math.min(terminalDeadline, meaningfulProgressDeadline)
+				: Math.min(protocolIdleDeadline, meaningfulProgressDeadline);
 		let readResult: ByteReadResult | typeof READ_TIMEOUT | typeof READ_ABORTED;
 		try {
 			readResult = await readBefore(

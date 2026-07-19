@@ -36,4 +36,14 @@ describe("classifyAnthropicSseFrame protocol activity", () => {
 		incrementAnthropicSseFrameKindCount(counts, "unknown");
 		expect(counts.unknown).toBe(Number.MAX_SAFE_INTEGER);
 	});
+
+	it("treats signature_delta as structural integrity metadata", () => {
+		const frame =
+			'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"opaque-integrity-metadata"}}\n\n';
+
+		expect(classifyAnthropicSseFrame(frame)).toEqual({
+			kind: "structural",
+			validProtocolActivity: true,
+		});
+	});
 });
