@@ -191,7 +191,8 @@ export class AccountRepository extends BaseRepository<Account> {
 			 	rate_limited_at = NULL,
 			 	rate_limit_reset = NULL,
 			 	rate_limit_status = NULL,
-			 	rate_limit_remaining = NULL
+				rate_limit_remaining = NULL,
+				consecutive_rate_limits = 0
 			 WHERE id = ?`,
 			[accountId],
 		);
