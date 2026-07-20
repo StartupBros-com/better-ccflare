@@ -1080,12 +1080,14 @@ export function createGuard(options = {}) {
 		attemptsExhausted: 0,
 		oversizedInspectionBodies: 0,
 		responseBodyIdleTimeouts: 0,
+		drainingRejected: 0,
 		// R21: per-outcome counts for terminal upstream-driven responses logged
 		// via proxy_response/proxy_final_error (see outcomeForStatus above).
 		success: 0,
 		finalError: 0,
 	};
 	let active = 0;
+	let draining = false;
 	const queue = [];
 
 	function log(event, data = {}) {
@@ -1928,6 +1930,30 @@ export function createGuard(options = {}) {
 	}
 
 	const server = http.createServer(async (req, res) => {
+		// server.close() stops accepting new TCP connections, but a connection
+		// with an in-flight request can still present another keep-alive request.
+		// Gate admission before reading its body or acquiring a concurrency lease
+		// so shutdown cannot be prolonged by work accepted after the signal.
+		if (draining) {
+			const context = createRequestContext(req, res);
+			counters.drainingRejected += 1;
+			log("guard_draining", { id: context.id });
+			req.resume();
+			sendJsonError(
+				res,
+				context,
+				503,
+				"guard_draining",
+				"local guard is draining",
+				{
+					"retry-after": "1",
+					connection: "close",
+				},
+			);
+			context.dispose();
+			return;
+		}
+
 		if (req.url === "/_guard/health") {
 			res.writeHead(200, { "content-type": "application/json" });
 			res.end(
@@ -1950,6 +1976,7 @@ export function createGuard(options = {}) {
 					delayInspectionTimeoutMs,
 					allowLegacyPoolBody,
 					shutdownGraceMs,
+					draining,
 					runtime: {
 						...runtimeIdentity,
 						limits: {
@@ -2054,6 +2081,9 @@ export function createGuard(options = {}) {
 	}
 
 	function shutdown(signal, { exitProcess = false } = {}) {
+		// This state transition must precede server.close(): already-open sockets
+		// may otherwise admit fresh work during the close/drain race.
+		draining = true;
 		log("guard_shutdown", { signal, openSockets: sockets.size });
 		server.close(() => {
 			if (exitProcess) process.exit(0);
@@ -2078,6 +2108,9 @@ export function createGuard(options = {}) {
 		shutdown,
 		state: {
 			counters,
+			get draining() {
+				return draining;
+			},
 			get active() {
 				return active;
 			},

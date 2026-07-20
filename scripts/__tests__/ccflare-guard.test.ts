@@ -114,6 +114,7 @@ async function startProductionNodeGuard(upstreamBase: string) {
 	await waitForEvent("guard_started");
 	return {
 		baseUrl: `http://127.0.0.1:${listenPort}`,
+		child,
 		waitForEvent,
 	};
 }
@@ -192,6 +193,38 @@ async function readRawResponse(socket: net.Socket, timeoutMs = 1_000) {
 		const onData = (chunk: Buffer) => {
 			response += chunk.toString();
 			if (response.includes("guard_deadline_exceeded")) {
+				cleanup();
+				resolve(response);
+			}
+		};
+		const onClose = () => {
+			cleanup();
+			resolve(response);
+		};
+		const cleanup = () => {
+			clearTimeout(timer);
+			socket.off("data", onData);
+			socket.off("close", onClose);
+		};
+		socket.on("data", onData);
+		socket.on("close", onClose);
+	});
+}
+
+async function readRawResponsesUntil(
+	socket: net.Socket,
+	marker: string,
+	timeoutMs = 2_000,
+) {
+	let response = "";
+	return new Promise<string>((resolve, reject) => {
+		const timer = setTimeout(() => {
+			cleanup();
+			reject(new Error(`timed out reading raw responses: ${response}`));
+		}, timeoutMs);
+		const onData = (chunk: Buffer) => {
+			response += chunk.toString();
+			if (response.includes(marker)) {
 				cleanup();
 				resolve(response);
 			}
@@ -2453,6 +2486,118 @@ describe("source-controlled guard", () => {
 		expect(health.active).toBe(0);
 		expect(health.queued).toBe(0);
 		expect(health.counters.aborted).toBe(1);
+	});
+
+	test("rejects a keep-alive request admitted after shutdown without forwarding it", async () => {
+		const upstreamBodies: string[] = [];
+		let releaseFirst: (() => void) | undefined;
+		const firstCanFinish = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		const upstreamBase = await listen(
+			http.createServer(async (req, res) => {
+				let body = "";
+				for await (const chunk of req) body += chunk.toString();
+				upstreamBodies.push(body);
+				if (upstreamBodies.length === 1) {
+					await firstCanFinish;
+					res.end("first-ok");
+					return;
+				}
+				res.end("unexpected-second");
+			}),
+		);
+		const { baseUrl, child, waitForEvent } =
+			await startProductionNodeGuard(upstreamBase);
+		const guardUrl = new URL(baseUrl);
+		const socket = await openRawRequest(
+			baseUrl,
+			"POST /v1/messages HTTP/1.1\r\n" +
+				`Host: ${guardUrl.host}\r\n` +
+				"Content-Length: 5\r\n" +
+				"Connection: keep-alive\r\n\r\n" +
+				"first",
+		);
+		const rawResponses = readRawResponsesUntil(
+			socket,
+			'"message":"local guard is draining"',
+		);
+
+		await waitFor(() => upstreamBodies.length === 1);
+		expect(child.kill("SIGTERM")).toBe(true);
+		await waitForEvent("guard_shutdown");
+		socket.write(
+			"POST /v1/messages HTTP/1.1\r\n" +
+				`Host: ${guardUrl.host}\r\n` +
+				"Content-Length: 6\r\n" +
+				"Connection: keep-alive\r\n\r\n" +
+				"second",
+		);
+		const rejection = await waitForEvent("guard_draining");
+		expect(upstreamBodies).toEqual(["first"]);
+		expect(rejection).toMatchObject({
+			event: "guard_draining",
+			id: expect.any(String),
+		});
+		expect(JSON.stringify(rejection)).not.toContain("second");
+
+		releaseFirst?.();
+		const response = await rawResponses;
+
+		expect(upstreamBodies).toEqual(["first"]);
+		expect(response.match(/HTTP\/1\.1 /g)).toHaveLength(2);
+		expect(response).toContain("HTTP/1.1 200");
+		expect(response).toContain("first-ok");
+		expect(response).toContain("HTTP/1.1 503");
+		expect(response.toLowerCase()).toContain("retry-after: 1");
+		expect(response.toLowerCase()).toContain("connection: close");
+		expect(response).toContain('"type":"guard_draining"');
+	});
+
+	test("allows active and queued requests accepted before shutdown to drain", async () => {
+		let attempts = 0;
+		let releaseFirst: (() => void) | undefined;
+		const firstCanFinish = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		const upstreamBase = await listen(
+			http.createServer(async (_req, res) => {
+				attempts += 1;
+				if (attempts === 1) await firstCanFinish;
+				res.end(`upstream-${attempts}`);
+			}),
+		);
+		const { guard, baseUrl } = await startGuard(upstreamBase, {
+			maxActive: 1,
+			shutdownGraceMs: 5_000,
+		});
+
+		const activeResponse = fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "active",
+		});
+		await waitFor(() => attempts === 1);
+		const queuedResponse = fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "queued",
+		});
+		await waitFor(() => guard.state.queued === 1);
+
+		guard.shutdown("SIGTERM");
+		expect(guard.state.active).toBe(1);
+		expect(guard.state.queued).toBe(1);
+		releaseFirst?.();
+
+		const [active, queued] = await Promise.all([
+			activeResponse,
+			queuedResponse,
+		]);
+		expect(active.status).toBe(200);
+		expect(queued.status).toBe(200);
+		expect(await active.text()).toBe("upstream-1");
+		expect(await queued.text()).toBe("upstream-2");
+		expect(attempts).toBe(2);
+		await waitFor(() => guard.state.active === 0 && guard.state.queued === 0);
 	});
 
 });
