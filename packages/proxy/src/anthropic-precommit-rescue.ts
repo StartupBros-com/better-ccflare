@@ -1,3 +1,5 @@
+import { extractClaudeVersion } from "@better-ccflare/core";
+
 export const ANTHROPIC_PRECOMMIT_RESCUE_PING_FRAME =
 	'event: ping\ndata: {"type":"ping"}\n\n';
 export const ANTHROPIC_PRECOMMIT_RESCUE_ERROR_FRAME =
@@ -9,6 +11,12 @@ export const CLAUDE_CODE_PRECOMMIT_WATCHDOG_MS = 180_000;
 export const CLAUDE_CODE_SEMANTIC_WATCHDOG_HEADROOM_MS = 30_000;
 export const ANTHROPIC_PRECOMMIT_RESCUE_COMMITMENT_DEADLINE_MS =
 	CLAUDE_CODE_PRECOMMIT_WATCHDOG_MS - CLAUDE_CODE_SEMANTIC_WATCHDOG_HEADROOM_MS;
+// PR #70 makes rescue pings visible to Claude Code's stream iterator, so its
+// local watchdog no longer requires the proxy to terminate a protocol-live
+// response at 150s. Restore the former finite request budget for that client;
+// the independent 120s protocol-idle timer still fails truly silent streams.
+export const CLAUDE_CODE_PRECOMMIT_RESCUE_COMMITMENT_DEADLINE_MS =
+	8 * 60 * 1000;
 // A non-final stalled route cannot consume the entire request budget. Preserve
 // 30s at the production default and scale the reserve down for focused tests or
 // deliberately shorter operator overrides.
@@ -98,7 +106,13 @@ function hasConfiguredEnvValue(name: string): boolean {
 	return raw !== undefined && raw.trim() !== "";
 }
 
-export function getAnthropicPreCommitRescueConfig(): AnthropicPreCommitRescueConfig {
+export function getAnthropicPreCommitRescueConfig(
+	request?: Request,
+): AnthropicPreCommitRescueConfig {
+	const defaultCommitmentDeadlineMs =
+		extractClaudeVersion(request?.headers.get("user-agent") ?? null) === null
+			? ANTHROPIC_PRECOMMIT_RESCUE_COMMITMENT_DEADLINE_MS
+			: CLAUDE_CODE_PRECOMMIT_RESCUE_COMMITMENT_DEADLINE_MS;
 	const configuredActivationGraceMs = boundedEnvInteger(
 		ANTHROPIC_PRECOMMIT_RESCUE_ACTIVATION_ENV,
 		ANTHROPIC_PRECOMMIT_RESCUE_ACTIVATION_MS,
@@ -114,22 +128,22 @@ export function getAnthropicPreCommitRescueConfig(): AnthropicPreCommitRescueCon
 	);
 	const canonicalDeadlineMs = boundedEnvInteger(
 		ANTHROPIC_PRECOMMIT_COMMITMENT_TIMEOUT_ENV,
-		ANTHROPIC_PRECOMMIT_RESCUE_COMMITMENT_DEADLINE_MS,
+		defaultCommitmentDeadlineMs,
 		MAX_RESCUE_COMMITMENT_DEADLINE_MS,
 	);
 	// The rescue-specific variable predates the client-watchdog policy. Treat it
 	// only as a deprecated fallback, and never let an inherited long value undo
-	// the safe 150s default. A deliberately longer-client budget must use the
-	// canonical meaningful-progress variable, which also wins when both are set.
+	// the client-specific safe default. A deliberate operator override must use
+	// the canonical meaningful-progress variable, which wins when both are set.
 	const commitmentDeadlineMs = canonicalConfigured
 		? canonicalDeadlineMs
 		: Math.min(
 				boundedEnvInteger(
 					ANTHROPIC_PRECOMMIT_RESCUE_DEADLINE_ENV,
-					ANTHROPIC_PRECOMMIT_RESCUE_COMMITMENT_DEADLINE_MS,
+					defaultCommitmentDeadlineMs,
 					MAX_RESCUE_COMMITMENT_DEADLINE_MS,
 				),
-				ANTHROPIC_PRECOMMIT_RESCUE_COMMITMENT_DEADLINE_MS,
+				defaultCommitmentDeadlineMs,
 			);
 
 	return {

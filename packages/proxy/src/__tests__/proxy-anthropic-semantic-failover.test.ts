@@ -2185,6 +2185,39 @@ describe("Anthropic stream runtime configuration", () => {
 });
 
 describe("Anthropic precommit rescue runtime configuration", () => {
+	it("restores the bounded eight-minute commitment only for Claude Code clients", () => {
+		delete process.env[MEANINGFUL_PROGRESS_ENV];
+		delete process.env[RESCUE_ACTIVATION_ENV];
+		delete process.env[RESCUE_PING_ENV];
+		delete process.env[RESCUE_DEADLINE_ENV];
+
+		const claudeCodeRequest = makeRequest(
+			undefined,
+			undefined,
+			true,
+			MODEL,
+			"claude-cli/2.1.212 (external, cli)",
+		);
+		const genericRequest = makeRequest(
+			undefined,
+			undefined,
+			true,
+			MODEL,
+			"curl/8.0",
+		);
+
+		expect(getAnthropicPreCommitRescueConfig(claudeCodeRequest)).toEqual({
+			activationGraceMs: ANTHROPIC_PRECOMMIT_RESCUE_ACTIVATION_MS,
+			pingIntervalMs: ANTHROPIC_PRECOMMIT_RESCUE_PING_INTERVAL_MS,
+			commitmentDeadlineMs: 8 * 60 * 1000,
+		});
+		expect(getAnthropicPreCommitRescueConfig(genericRequest)).toEqual({
+			activationGraceMs: ANTHROPIC_PRECOMMIT_RESCUE_ACTIVATION_MS,
+			pingIntervalMs: ANTHROPIC_PRECOMMIT_RESCUE_PING_INTERVAL_MS,
+			commitmentDeadlineMs: ANTHROPIC_PRECOMMIT_RESCUE_COMMITMENT_DEADLINE_MS,
+		});
+	});
+
 	it("falls back to watchdog-safe defaults for invalid values", () => {
 		process.env[RESCUE_ACTIVATION_ENV] = "0";
 		process.env[RESCUE_PING_ENV] = "not-a-number";
@@ -2197,7 +2230,7 @@ describe("Anthropic precommit rescue runtime configuration", () => {
 		});
 	});
 
-	it("clamps a legacy-only rescue deadline to the Claude-safe default", () => {
+	it("clamps a legacy-only rescue deadline to the generic-client default", () => {
 		delete process.env[MEANINGFUL_PROGRESS_ENV];
 		process.env[RESCUE_ACTIVATION_ENV] = String(Number.MAX_SAFE_INTEGER);
 		process.env[RESCUE_PING_ENV] = String(Number.MAX_SAFE_INTEGER);

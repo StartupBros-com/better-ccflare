@@ -212,7 +212,7 @@ export async function handleProxy(
 	}
 
 	const activation = createAnthropicPreCommitRescueActivation();
-	const rescueConfig = getAnthropicPreCommitRescueConfig();
+	const rescueConfig = getAnthropicPreCommitRescueConfig(req);
 	const routingAbortController = new AbortController();
 	const routingSignal = AbortSignal.any([
 		req.signal,
