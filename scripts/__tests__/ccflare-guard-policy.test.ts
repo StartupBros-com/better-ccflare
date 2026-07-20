@@ -135,6 +135,42 @@ describe("evaluateGuardRetry", () => {
 		});
 	});
 
+	test("treats Retry-After as a minimum while allowing a later body blocker", () => {
+		const earlierBody = evaluate({
+			headers: {
+				"x-better-ccflare-pool-status": "exhausted",
+				"retry-after": "5",
+			},
+			body: {
+				error: {
+					type: "pool_exhausted",
+					next_available_at: "2026-07-17T12:00:04.000Z",
+				},
+			},
+		});
+		expect(earlierBody).toMatchObject({
+			delayMs: 5_000,
+			recoverySource: "retry-after",
+		});
+
+		const laterBody = evaluate({
+			headers: {
+				"x-better-ccflare-pool-status": "exhausted",
+				"retry-after": "5",
+			},
+			body: {
+				error: {
+					type: "pool_exhausted",
+					next_available_at: "2026-07-17T12:00:09.000Z",
+				},
+			},
+		});
+		expect(laterBody).toMatchObject({
+			delayMs: 9_000,
+			recoverySource: "error.next_available_at",
+		});
+	});
+
 	// R17: the guard's stable x-better-ccflare-pool-status: exhausted header is
 	// the primary, sufficient signal. Bounded structured-body detection is only
 	// a rolling-upgrade fallback for when that header is absent from an older

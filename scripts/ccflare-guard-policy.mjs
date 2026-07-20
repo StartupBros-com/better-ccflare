@@ -47,10 +47,12 @@ function bodyConfirmsPoolExhausted(body) {
 
 /**
  * Collect finite future recovery-delay candidates from whatever signals are
- * present, independent of whether the body's error type matches. Once a
- * response is classified retryable, any hint (Retry-After, a per-request
- * next_available_at, or a per-account available_at) may narrow the wait; the
- * absence of any valid hint is not itself a reason to refuse the retry.
+ * present, independent of whether the body's error type matches. Retry-After
+ * is an authoritative minimum: body metadata may extend that wait, never
+ * shorten it. Among body signals, the earliest available account remains the
+ * useful pool-recovery candidate because only one compatible account needs to
+ * recover. The absence of any valid hint is not itself a reason to refuse the
+ * retry.
  */
 function collectDelayCandidates(headers, body, nowMs) {
 	const candidates = [];
@@ -180,12 +182,23 @@ export function evaluateGuardRetry({
 	if (candidates.length === 0) {
 		return { retry: true, reason: "pool_exhausted", delayMs: 0, recoverySource: null };
 	}
-	candidates.sort((left, right) => left.delayMs - right.delayMs);
-	const earliest = candidates[0];
+	const retryAfter = candidates.find(
+		(candidate) => candidate.source === "retry-after",
+	);
+	const bodyCandidates = candidates
+		.filter((candidate) => candidate.source !== "retry-after")
+		.sort((left, right) => left.delayMs - right.delayMs);
+	const earliestBody = bodyCandidates[0];
+	const recovery =
+		retryAfter == null
+			? earliestBody
+			: earliestBody == null || retryAfter.delayMs >= earliestBody.delayMs
+				? retryAfter
+				: earliestBody;
 	return {
 		retry: true,
 		reason: "pool_exhausted",
-		delayMs: earliest.delayMs,
-		recoverySource: earliest.source,
+		delayMs: recovery.delayMs,
+		recoverySource: recovery.source,
 	};
 }
