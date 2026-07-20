@@ -777,6 +777,7 @@ export class AutoRefreshScheduler {
 			WHERE
 				provider IN ('qwen', 'xai')
 				AND refresh_token IS NOT NULL
+				AND COALESCE(paused, 0) = 0
 				AND (
 					access_token IS NULL
 					OR expires_at IS NULL
@@ -888,7 +889,12 @@ export class AutoRefreshScheduler {
 				// refreshToken performs a real OAuth refresh and can.
 				await pauseAccountForReauthIfInvalidGrant(
 					error,
-					{ id: row.id, name: row.name, refresh_token: row.refresh_token },
+					{
+						id: row.id,
+						name: row.name,
+						provider: row.provider,
+						refresh_token: row.refresh_token,
+					},
 					this.proxyContext.dbOps,
 				);
 			}
@@ -920,6 +926,7 @@ export class AutoRefreshScheduler {
 			WHERE
 				provider = 'codex'
 				AND refresh_token IS NOT NULL
+				AND COALESCE(paused, 0) = 0
 				AND (
 					access_token IS NULL
 					OR expires_at IS NULL
@@ -1025,7 +1032,12 @@ export class AutoRefreshScheduler {
 				// refreshAccessTokenSafe), so pause-for-reauth on a revoked token here too.
 				await pauseAccountForReauthIfInvalidGrant(
 					error,
-					{ id: row.id, name: row.name, refresh_token: row.refresh_token },
+					{
+						id: row.id,
+						name: row.name,
+						provider: row.provider,
+						refresh_token: row.refresh_token,
+					},
 					this.proxyContext.dbOps,
 				);
 			}

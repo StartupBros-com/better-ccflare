@@ -2471,6 +2471,16 @@ export async function reauthenticateAccount(
 					[apiKey, apiKey, account.id],
 				);
 
+				// Lift only the terminal-auth pause after credentials have been
+				// replaced. Manual, overage, and future pause reasons remain intact.
+				try {
+					await dbOps.resumeAccountIfNeedsReauth(account.id);
+				} catch (resumeError) {
+					console.error(
+						`Failed to auto-resume needs-reauth pause for Anthropic account '${name}': ${resumeError instanceof Error ? resumeError.message : String(resumeError)}`,
+					);
+				}
+
 				console.log("API key created and updated.");
 				return await showSuccessMessage(name, "API key", account.id);
 			} catch (dbError) {
@@ -2507,6 +2517,16 @@ export async function reauthenticateAccount(
 				account.id,
 			],
 		);
+
+		// Lift only the terminal-auth pause after credentials have been replaced.
+		// Manual, overage, and future pause reasons remain authoritative.
+		try {
+			await dbOps.resumeAccountIfNeedsReauth(account.id);
+		} catch (resumeError) {
+			console.error(
+				`Failed to auto-resume needs-reauth pause for Anthropic account '${name}': ${resumeError instanceof Error ? resumeError.message : String(resumeError)}`,
+			);
+		}
 
 		console.log("OAuth tokens updated.");
 		return await showSuccessMessage(name, "OAuth tokens", account.id);

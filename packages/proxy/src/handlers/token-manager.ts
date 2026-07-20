@@ -1,4 +1,5 @@
 import {
+	authFailureEvents,
 	isInvalidGrantMessage,
 	OAuthRefreshTokenError,
 	PAUSE_REASON_NEEDS_REAUTH,
@@ -44,7 +45,12 @@ interface ReauthPauser {
  */
 export async function pauseAccountForReauthIfInvalidGrant(
 	error: unknown,
-	account: { id: string; name: string; refresh_token: string | null },
+	account: {
+		id: string;
+		name: string;
+		provider: string;
+		refresh_token: string | null;
+	},
 	dbOps: ReauthPauser,
 ): Promise<boolean> {
 	const message = error instanceof Error ? error.message : String(error);
@@ -61,6 +67,21 @@ export async function pauseAccountForReauthIfInvalidGrant(
 			log.error(
 				`Account "${account.name}" PAUSED — OAuth refresh token rejected (needs re-authentication). Reauthenticate the account; it will auto-resume on success.`,
 			);
+			try {
+				authFailureEvents.emit("event", {
+					accountId: account.id,
+					accountName: account.name,
+					provider: account.provider,
+					reason: PAUSE_REASON_NEEDS_REAUTH,
+				});
+			} catch (eventErr) {
+				// Alerting is best-effort and must not change the result of a pause
+				// that has already committed successfully.
+				log.error(
+					`Failed to publish auth-failure event for account ${account.name}:`,
+					eventErr,
+				);
+			}
 		}
 		return paused;
 	} catch (pauseErr) {

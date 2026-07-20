@@ -31,7 +31,6 @@ import { Logger, setConsoleLogging } from "@better-ccflare/logger";
 import { handleResponsesRequest } from "@better-ccflare/openai-responses-adapter";
 import {
 	CODEX_DEFAULT_ENDPOINT,
-	extractWeeklyResetTime,
 	fetchCodexUsageOnDemand,
 	getProvider,
 	getRepresentativeUtilizationForProvider,
@@ -1070,13 +1069,6 @@ export default async function startServer(options?: {
 			const data = usageCache.get(accountId);
 			if (!data) return null;
 			return getRepresentativeUtilizationForProvider(data, provider);
-		},
-		getAccountWeeklyReset(accountId: string, provider: string): number | null {
-			const data = usageCache.get(accountId);
-			if (!data) return null;
-			const resetAt = extractWeeklyResetTime(data, provider);
-			if (resetAt == null || resetAt <= Date.now()) return null;
-			return resetAt;
 		},
 	});
 

@@ -539,23 +539,15 @@ export class AlertService {
 		webhookUrl: string,
 	): Promise<void> {
 		try {
-			// Check if a row with this cooldown-bucket ID already exists before inserting.
-			// If it does, the alert is within its cooldown window — skip emission entirely
-			// to avoid SSE storms and duplicate webhook deliveries.
-			const existing = await this.db.get<{ id: string }>(
-				`SELECT id FROM alerts WHERE id = ?`,
-				[alert.id],
-			);
-			if (existing) return;
-
 			// INSERT OR IGNORE is SQLite-only; PostgreSQL uses ON CONFLICT DO NOTHING.
-			// The pre-check above makes the conflict clause functionally redundant, but
-			// keeping it defends against a race between the SELECT and INSERT.
 			const conflictClause = this.db.isSQLite ? "INSERT OR IGNORE" : "INSERT";
 			const onConflictClause = this.db.isSQLite
 				? ""
 				: "ON CONFLICT (id) DO NOTHING";
-			await this.db.run(
+			// The unique alert ID is the cooldown guard. Only the caller whose insert
+			// actually wins may emit SSE or deliver the webhook; checking first would
+			// leave a race in which concurrent duplicates both deliver notifications.
+			const inserted = await this.db.runWithChanges(
 				`
 				${conflictClause} INTO alerts (
 					id, timestamp, type, severity, title, message, value, threshold,
@@ -579,6 +571,7 @@ export class AlertService {
 					alert.acknowledged ? 1 : 0,
 				],
 			);
+			if (inserted === 0) return;
 		} catch (error) {
 			// Alerts are best-effort telemetry — a persistence failure must not
 			// terminate the proxy (the listener is invoked from an async event

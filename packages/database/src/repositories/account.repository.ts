@@ -87,13 +87,6 @@ export class AccountRepository extends BaseRepository<Account> {
 		}
 	}
 
-	async setRequiresReauth(accountId: string, value: boolean): Promise<void> {
-		await this.run(`UPDATE accounts SET requires_reauth = ? WHERE id = ?`, [
-			value ? 1 : 0,
-			accountId,
-		]);
-	}
-
 	async incrementUsage(
 		accountId: string,
 		sessionDurationMs: number,

@@ -64,22 +64,6 @@ describe("AccountRepository requires_reauth", () => {
 		db.close();
 	});
 
-	it("persists the compatibility flag without creating a second terminal state", async () => {
-		await repository.setRequiresReauth("account-1", true);
-
-		expect(rawRequiresReauth()).toBe(1);
-		expect((await repository.findById("account-1"))?.requires_reauth).toBe(
-			false,
-		);
-
-		await repository.setRequiresReauth("account-1", false);
-
-		expect(rawRequiresReauth()).toBe(0);
-		expect((await repository.findById("account-1"))?.requires_reauth).toBe(
-			false,
-		);
-	});
-
 	it("derives terminal authentication state from oauth_invalid_grant", async () => {
 		db.run(
 			"UPDATE accounts SET paused = 1, pause_reason = 'oauth_invalid_grant', requires_reauth = 0 WHERE id = 'account-1'",
@@ -92,7 +76,7 @@ describe("AccountRepository requires_reauth", () => {
 	});
 
 	it("clears requires_reauth when tokens are updated without rotation", async () => {
-		await repository.setRequiresReauth("account-1", true);
+		db.run("UPDATE accounts SET requires_reauth = 1 WHERE id = 'account-1'");
 
 		await repository.updateTokens("account-1", "new-token", 2);
 
@@ -100,7 +84,7 @@ describe("AccountRepository requires_reauth", () => {
 	});
 
 	it("clears requires_reauth when tokens are updated with refresh-token rotation", async () => {
-		await repository.setRequiresReauth("account-1", true);
+		db.run("UPDATE accounts SET requires_reauth = 1 WHERE id = 'account-1'");
 
 		await repository.updateTokens("account-1", "new-token", 2, "new-refresh");
 

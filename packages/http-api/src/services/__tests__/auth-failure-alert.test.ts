@@ -34,6 +34,24 @@ function makeConfig(
 	}) as unknown as Config;
 }
 
+class SynchronizedDuplicateReadSqliteAdapter extends BunSqlAdapter {
+	private duplicateReads = 0;
+	private releaseDuplicateReads!: () => void;
+	private readonly duplicateReadsComplete = new Promise<void>((resolve) => {
+		this.releaseDuplicateReads = resolve;
+	});
+
+	override async get<T>(sql: string, params?: unknown[]): Promise<T | null> {
+		const result = await super.get<T>(sql, params);
+		if (/SELECT id FROM alerts WHERE id = \?/i.test(sql)) {
+			this.duplicateReads++;
+			if (this.duplicateReads === 2) this.releaseDuplicateReads();
+			await this.duplicateReadsComplete;
+		}
+		return result;
+	}
+}
+
 describe("AlertService auth_failure events", () => {
 	let sqlite: Database;
 	let service: AlertService;
@@ -94,12 +112,58 @@ describe("AlertService auth_failure events", () => {
 		expect(fetchMock).toHaveBeenCalledTimes(1);
 		expect(emitted).toHaveLength(1);
 	});
+
+	it("atomically emits one alert for synchronized concurrent duplicate writes", async () => {
+		const fetchMock = mock(
+			async () => new Response(null, { status: 204 }),
+		) as unknown as typeof fetch;
+		globalThis.fetch = fetchMock;
+		const emitted: unknown[] = [];
+		alertListener = (event) => emitted.push(event);
+		alertEvents.on("event", alertListener);
+		service = new AlertService(
+			new SynchronizedDuplicateReadSqliteAdapter(sqlite),
+			makeConfig({ requestTokens: 1 }),
+		);
+		service.start();
+
+		const request: RequestResponse = {
+			id: "duplicate-request",
+			timestamp: new Date().toISOString(),
+			method: "POST",
+			path: "/v1/messages",
+			accountUsed: "account-1",
+			statusCode: 200,
+			success: true,
+			errorMessage: null,
+			responseTimeMs: 100,
+			failoverAttempts: 0,
+			model: "claude-3",
+			totalTokens: 1_000_000,
+			inputTokens: 1_000_000,
+			cacheReadInputTokens: 0,
+			cacheCreationInputTokens: 0,
+			outputTokens: 0,
+			costUsd: 0,
+			project: null,
+		};
+
+		await Promise.all([
+			service.evaluateRequest(request),
+			service.evaluateRequest(request),
+		]);
+		await waitFor(() => fetchMock.mock.calls.length >= 1);
+
+		expect(await service.listAlerts()).toHaveLength(1);
+		expect(emitted).toHaveLength(1);
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+	});
 });
 
 /**
- * Fake adapter that records the SQL sent to `.run()`. Simulates the PostgreSQL
- * dialect (isSQLite === false) so we can assert the dialect-aware conflict
- * clause without a live PG server.
+ * Fake adapter that records the SQL sent to `.runWithChanges()`. Simulates the
+ * PostgreSQL dialect (isSQLite === false) so we can assert the dialect-aware
+ * conflict clause without a live PG server.
  */
 class RecordingPgAdapter implements BunSqlAdapterType {
 	readonly isSQLite = false;
@@ -118,25 +182,30 @@ class RecordingPgAdapter implements BunSqlAdapterType {
 			throw new Error('syntax error at or near "OR"');
 		}
 	}
-}
-
-/**
- * Fake adapter that always fails on `.run()`, to verify a persistence failure
- * is swallowed and never rejects the event-handler promise (which would crash
- * the proxy — the original v3.5.40 incident).
- */
-class FailingPgAdapter extends RecordingPgAdapter {
-	async run(_sql: string, _params?: unknown[]): Promise<void> {
-		throw new Error("simulated PG outage");
+	async runWithChanges(sql: string, _params?: unknown[]): Promise<number> {
+		this.runStatements.push(sql);
+		// Reject if the caller sent SQLite-only syntax — mirrors PG's behavior.
+		if (/INSERT OR IGNORE/i.test(sql)) {
+			throw new Error('syntax error at or near "OR"');
+		}
+		return 1;
 	}
 }
 
-class FailingGetPgAdapter extends RecordingPgAdapter {
-	getAttempts = 0;
+/**
+ * Fake adapter that always fails on `.runWithChanges()`, to verify a
+ * persistence failure is swallowed and never rejects the event-handler promise
+ * (which would crash the proxy — the original v3.5.40 incident).
+ */
+class FailingPgAdapter extends RecordingPgAdapter {
+	writeAttempts = 0;
 
-	async get<T>(_sql: string, _params?: unknown[]): Promise<T | null> {
-		this.getAttempts++;
-		throw new Error("simulated PG read outage");
+	override async runWithChanges(
+		_sql: string,
+		_params?: unknown[],
+	): Promise<number> {
+		this.writeAttempts++;
+		throw new Error("simulated PG outage");
 	}
 }
 
@@ -215,8 +284,8 @@ describe("AlertService persistAndEmit (issue #326)", () => {
 		}
 	});
 
-	it("swallows dedup read failures without emitting or delivering a webhook", async () => {
-		const adapter = new FailingGetPgAdapter();
+	it("swallows auth-failure insert failures without emitting or delivering a webhook", async () => {
+		const adapter = new FailingPgAdapter();
 		const service = new AlertService(
 			adapter as unknown as BunSqlAdapterType,
 			makeConfig(),
@@ -235,12 +304,12 @@ describe("AlertService persistAndEmit (issue #326)", () => {
 
 		try {
 			authFailureEvents.emit("event", {
-				accountId: "account-read-failure",
-				accountName: "Read failure account",
+				accountId: "account-write-failure",
+				accountName: "Write failure account",
 				provider: "anthropic",
 				reason: "invalid_grant",
 			});
-			await waitFor(() => adapter.getAttempts === 1);
+			await waitFor(() => adapter.writeAttempts === 1);
 			await Bun.sleep(20);
 
 			expect(unhandledRejection).not.toHaveBeenCalled();
