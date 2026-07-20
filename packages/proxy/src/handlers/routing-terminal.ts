@@ -96,22 +96,24 @@ function modelOnlyCapacity(
 	);
 }
 
-function hasUnpausedModelCapacityEvidence(
-	context: RoutingCapacityContext | null,
-	accounts: readonly Account[],
-): boolean {
-	const unpausedIds = new Set(
-		accounts.filter((account) => !account.paused).map((account) => account.id),
-	);
-	return Boolean(
-		context?.exclusions.some(
-			(candidate) =>
-				unpausedIds.has(candidate.accountId) &&
-				candidate.exclusions.some(
-					(blocker) => blocker.scope === "family" || blocker.scope === "model",
-				),
-		),
-	);
+function finiteCandidateRecovery(
+	candidate: RoutingCapacityContext["exclusions"][number],
+	now: number,
+): number | null {
+	if (candidate.exclusions.length === 0) return null;
+	if (
+		candidate.exclusions.some(
+			(blocker) =>
+				blocker.scope === "account" && blocker.source !== "usage_snapshot",
+		)
+	) {
+		return null;
+	}
+	const resetTimes = candidate.exclusions.map((blocker) => blocker.resetAtMs);
+	if (!resetTimes.every((resetAtMs) => isFiniteFuture(resetAtMs, now))) {
+		return null;
+	}
+	return Math.max(...resetTimes);
 }
 
 function everyAttemptWasModelLaneScoped(
@@ -140,72 +142,82 @@ function earliestFuture(
 function findAutomaticRecoveries(
 	accounts: readonly Account[],
 	capacityContext: RoutingCapacityContext | null,
+	attemptRouteRecoveries: ReadonlyMap<string, readonly (number | null)[]>,
 	now: number,
 ): AutomaticRecovery[] {
-	const accountById = new Map(accounts.map((account) => [account.id, account]));
-	const recoveries = new Map<string, AutomaticRecovery>();
-	const accountsWithUnknownCapacityRecovery = new Set<string>();
+	// Capacity context is candidate-local: one account may expose more than one
+	// compatible route (for example, Combo slots). Keep every candidate until
+	// its complete blocker set is validated, then collapse to the first route on
+	// that account that can become eligible.
+	const exclusionsByAccount = new Map<
+		string,
+		RoutingCapacityContext["exclusions"]
+	>();
+	for (const candidate of capacityContext?.exclusions ?? []) {
+		const existing = exclusionsByAccount.get(candidate.accountId) ?? [];
+		exclusionsByAccount.set(candidate.accountId, [...existing, candidate]);
+	}
 
+	const recoveries: AutomaticRecovery[] = [];
 	for (const account of accounts) {
-		if (
-			account.paused ||
-			!isFiniteFuture(account.rate_limited_until, now) ||
-			!account.rate_limited_reason ||
-			!GLOBAL_COOLDOWN_REASONS.has(account.rate_limited_reason)
-		) {
+		if (account.paused) continue;
+		let accountCooldown: number | null = null;
+		if (isFiniteFuture(account.rate_limited_until, now)) {
+			if (
+				!account.rate_limited_reason ||
+				!GLOBAL_COOLDOWN_REASONS.has(account.rate_limited_reason)
+			) {
+				// A live but unverified account marker is itself an unknown blocker.
+				continue;
+			}
+			accountCooldown = account.rate_limited_until;
+		}
+
+		const candidates = exclusionsByAccount.get(account.id) ?? [];
+		const requestAttemptRecoveries =
+			attemptRouteRecoveries.get(account.id) ?? [];
+		if (candidates.length === 0 && requestAttemptRecoveries.length === 0) {
+			if (accountCooldown !== null) {
+				recoveries.push({
+					accountId: account.id,
+					availableAt: accountCooldown,
+					reason: "account_cooldown",
+				});
+			}
 			continue;
 		}
-		recoveries.set(account.id, {
+
+		const candidateRecoveries = [
+			...candidates.map((candidate) => finiteCandidateRecovery(candidate, now)),
+			...requestAttemptRecoveries,
+		];
+		if (
+			!candidateRecoveries.every(
+				(recovery): recovery is number => recovery !== null,
+			)
+		) {
+			// Evidence freshness is not provider recovery. One resetless or invalid
+			// blocker makes the route's eligibility unknown, including when a finite
+			// account cooldown also exists for the same route.
+			continue;
+		}
+		const routeRecoveries = candidateRecoveries.map((capacityRecovery) =>
+			accountCooldown === null
+				? capacityRecovery
+				: Math.max(accountCooldown, capacityRecovery),
+		);
+		const availableAt = Math.min(...routeRecoveries);
+		recoveries.push({
 			accountId: account.id,
-			availableAt: account.rate_limited_until,
-			reason: "account_cooldown",
+			availableAt,
+			reason:
+				accountCooldown !== null && availableAt === accountCooldown
+					? "account_cooldown"
+					: "account_capacity",
 		});
 	}
 
-	for (const candidate of capacityContext?.exclusions ?? []) {
-		const account = accountById.get(candidate.accountId);
-		if (
-			!account ||
-			account.paused ||
-			candidate.exclusions.length === 0 ||
-			!candidate.exclusions.every((blocker) => blocker.scope === "account")
-		) {
-			continue;
-		}
-		const hasCompleteProviderResets = candidate.exclusions.every(
-			(blocker) =>
-				blocker.source === "usage_snapshot" &&
-				isFiniteFuture(blocker.resetAtMs, now),
-		);
-		if (!hasCompleteProviderResets) {
-			// Evidence freshness only says when to re-check. It is not proof that
-			// provider capacity will recover, and it must invalidate a DB cooldown
-			// that would otherwise make this account look completely recoverable.
-			accountsWithUnknownCapacityRecovery.add(account.id);
-			continue;
-		}
-		const availableAt = Math.max(
-			...candidate.exclusions
-				.map((blocker) => blocker.resetAtMs)
-				.filter((resetAtMs): resetAtMs is number => resetAtMs !== null),
-		);
-		const existing = recoveries.get(account.id);
-		// A candidate with multiple simultaneous global blockers becomes eligible
-		// only when all clear. Preserve the later recovery when DB cooldown and
-		// request-local capacity evidence coexist for the same account.
-		if (!existing || availableAt > existing.availableAt) {
-			recoveries.set(account.id, {
-				accountId: account.id,
-				availableAt,
-				reason: "account_capacity",
-			});
-		}
-	}
-	for (const accountId of accountsWithUnknownCapacityRecovery) {
-		recoveries.delete(accountId);
-	}
-
-	return [...recoveries.values()];
+	return recoveries;
 }
 
 function accountReason(
@@ -387,16 +399,15 @@ export function createRoutingTerminalResponse(
 			}),
 		};
 	}
-	const ambiguousModelEvidence =
-		options.source === "selection"
-			? hasUnpausedModelCapacityEvidence(
-					options.capacityContext,
-					options.accounts,
-				)
-			: options.rateLimitOutcomes.some(
-					(outcome) => outcome.scope === "family" || outcome.scope === "model",
-				);
-	if (ambiguousModelEvidence) {
+	const hasAttemptModelEvidence =
+		options.source === "attempts" &&
+		options.rateLimitOutcomes.some(
+			(outcome) => outcome.scope === "family" || outcome.scope === "model",
+		);
+	if (
+		hasAttemptModelEvidence &&
+		options.rateLimitOutcomes.length !== options.upstreamAttempts
+	) {
 		return {
 			kind: "route_unavailable",
 			response: createRouteUnavailableResponse({
@@ -409,10 +420,22 @@ export function createRoutingTerminalResponse(
 			}),
 		};
 	}
+	const attemptRouteRecoveries = new Map<string, (number | null)[]>();
+	if (hasAttemptModelEvidence) {
+		for (const outcome of options.rateLimitOutcomes) {
+			if (outcome.scope !== "family" && outcome.scope !== "model") continue;
+			const existing = attemptRouteRecoveries.get(outcome.accountId) ?? [];
+			existing.push(
+				isFiniteFuture(outcome.availableAt, now) ? outcome.availableAt : null,
+			);
+			attemptRouteRecoveries.set(outcome.accountId, existing);
+		}
+	}
 
 	const recoveries = findAutomaticRecoveries(
 		options.accounts,
 		options.capacityContext,
+		attemptRouteRecoveries,
 		now,
 	);
 	const recoveredIds = new Set(
