@@ -62,7 +62,7 @@ describe("OpenAICompatibleProvider Alibaba Features", () => {
 			expect(systemMsg.role).toBe("system");
 			if (Array.isArray(systemMsg.content)) {
 				expect(systemMsg.content[0]).toHaveProperty("cache_control");
-				expect((systemMsg.content[0] as any).cache_control).toEqual({
+				expect(systemMsg.content[0].cache_control).toEqual({
 					type: "ephemeral",
 				});
 			}
@@ -160,6 +160,7 @@ describe("OpenAICompatibleProvider Alibaba Features", () => {
 			);
 
 			// Then call injectDashScopeReasoning (as done in transformRequestBody)
+			// biome-ignore lint/suspicious/noExplicitAny: private method has no public test seam
 			(provider as any).injectDashScopeReasoning(
 				openaiBody,
 				anthropicBody,
@@ -168,7 +169,10 @@ describe("OpenAICompatibleProvider Alibaba Features", () => {
 			);
 
 			// enable_thinking should be injected for Qwen reasoning models
-			expect((openaiBody as any).enable_thinking).toBe(true);
+			expect(
+				(openaiBody as OpenAIRequest & { enable_thinking?: boolean })
+					.enable_thinking,
+			).toBe(true);
 		});
 
 		it("should NOT inject enable_thinking for kimi-k2-thinking", async () => {
@@ -191,6 +195,7 @@ describe("OpenAICompatibleProvider Alibaba Features", () => {
 				getEndpointUrl(mockAccount),
 				"kimi-k2-thinking",
 			);
+			// biome-ignore lint/suspicious/noExplicitAny: private method has no public test seam
 			(provider as any).injectDashScopeReasoning(
 				openaiBody,
 				anthropicBody,
@@ -198,7 +203,10 @@ describe("OpenAICompatibleProvider Alibaba Features", () => {
 				"kimi-k2-thinking",
 			);
 
-			expect((openaiBody as any).enable_thinking).toBeUndefined();
+			expect(
+				(openaiBody as OpenAIRequest & { enable_thinking?: boolean })
+					.enable_thinking,
+			).toBeUndefined();
 		});
 	});
 });

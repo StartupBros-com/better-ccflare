@@ -20,6 +20,7 @@ import {
 	providerSupportsCustomBilling,
 } from "../../utils/provider-utils";
 import { OAuthTokenStatusWithBoundary } from "../OAuthTokenStatus";
+import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { Switch } from "../ui/switch";
 import { pauseStatusDisplay } from "./pause-status";
@@ -29,6 +30,21 @@ function formatTokenCount(n: number): string {
 	if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
 	if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
 	return String(n);
+}
+
+function formatPauseReason(reason: string | null): string | null {
+	// Keep internal/future pause reasons private and safely renderable. Only
+	// reasons with intentional operator-facing copy are expanded here.
+	switch (reason) {
+		case "manual":
+			return "manual";
+		case "failure_threshold":
+			return "failure threshold";
+		case "overage":
+			return "overage";
+		default:
+			return null;
+	}
 }
 
 interface AccountListItemProps {
@@ -75,6 +91,9 @@ export function AccountListItem({
 	const [isRefreshingUsage, setIsRefreshingUsage] = useState(false);
 	const presenter = new AccountPresenter(account);
 	const pauseStatus = pauseStatusDisplay(account.pauseReason);
+	// requiresReauth is derived from the authoritative oauth_invalid_grant
+	// pause reason by the API. The OR keeps older API payloads compatible.
+	const reauthRequired = account.requiresReauth || pauseStatus.reauthRequired;
 	// Only hard-limit statuses mean the account is actually blocked; soft warnings
 	// like "allowed_warning" / "queueing_soft" mean the account is still usable.
 	const HARD_LIMIT_PREFIXES = [
@@ -254,16 +273,22 @@ export function AccountListItem({
 						<span className="text-sm text-muted-foreground">
 							{presenter.sessionInfo}
 						</span>
-						{presenter.isPaused && (
-							<span
-								className={`text-sm ${
-									pauseStatus.reauthRequired
-										? "text-destructive font-medium"
-										: "text-muted-foreground"
-								}`}
+						{reauthRequired ? (
+							<Badge
+								variant="destructive"
+								title="Refresh token invalid — re-authenticate"
 							>
-								{pauseStatus.label}
-							</span>
+								Re-authentication required
+							</Badge>
+						) : (
+							presenter.isPaused && (
+								<span className="text-sm text-muted-foreground">
+									Paused
+									{formatPauseReason(account.pauseReason)
+										? ` (${formatPauseReason(account.pauseReason)})`
+										: ""}
+								</span>
+							)
 						)}
 						{!presenter.isPaused && presenter.rateLimitStatus !== "OK" && (
 							<span
@@ -355,40 +380,40 @@ export function AccountListItem({
 					)}
 					{account.provider === "qwen" && onReauth && (
 						<Button
-							variant={pauseStatus.reauthRequired ? "default" : "ghost"}
+							variant={reauthRequired ? "default" : "ghost"}
 							size="sm"
-							className={pauseStatus.reauthRequired ? "gap-1 text-xs" : ""}
+							className={reauthRequired ? "gap-1 text-xs" : ""}
 							onClick={() => onReauth(account)}
 							title="Re-authenticate this Qwen account (preserves all metadata)"
 						>
 							<KeyRound className="h-4 w-4" />
-							{pauseStatus.reauthRequired && "Re-authenticate"}
+							{reauthRequired && "Re-authenticate"}
 						</Button>
 					)}
 					{account.provider === "anthropic" &&
 						account.hasRefreshToken &&
 						onAnthropicReauth && (
 							<Button
-								variant={pauseStatus.reauthRequired ? "default" : "ghost"}
+								variant={reauthRequired ? "default" : "ghost"}
 								size="sm"
-								className={pauseStatus.reauthRequired ? "gap-1 text-xs" : ""}
+								className={reauthRequired ? "gap-1 text-xs" : ""}
 								onClick={() => onAnthropicReauth(account)}
 								title="Re-authenticate this Anthropic account (preserves all metadata)"
 							>
 								<KeyRound className="h-4 w-4" />
-								{pauseStatus.reauthRequired && "Re-authenticate"}
+								{reauthRequired && "Re-authenticate"}
 							</Button>
 						)}
 					{account.provider === "codex" && onCodexReauth && (
 						<Button
-							variant={pauseStatus.reauthRequired ? "default" : "ghost"}
+							variant={reauthRequired ? "default" : "ghost"}
 							size="sm"
-							className={pauseStatus.reauthRequired ? "gap-1 text-xs" : ""}
+							className={reauthRequired ? "gap-1 text-xs" : ""}
 							onClick={() => onCodexReauth(account)}
 							title="Re-authenticate this Codex account (preserves all metadata)"
 						>
 							<KeyRound className="h-4 w-4" />
-							{pauseStatus.reauthRequired && "Re-authenticate"}
+							{reauthRequired && "Re-authenticate"}
 						</Button>
 					)}
 					{(account.provider === "anthropic" ||

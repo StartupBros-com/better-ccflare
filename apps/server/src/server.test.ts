@@ -50,7 +50,12 @@ describe("readShutdownDrainMs", () => {
 });
 
 describe("trackStreamForShutdown", () => {
-	const { trackStreamForShutdown, abortInflightStreams } = require("./server");
+	const {
+		trackStreamForShutdown,
+		abortInflightStreams,
+		waitForForceCloseSettlement,
+		FORCE_CLOSE_SETTLEMENT_BUDGET_MS,
+	} = require("./server");
 
 	const endlessResponse = () =>
 		new Response(
@@ -68,7 +73,9 @@ describe("trackStreamForShutdown", () => {
 		const reader = wrapped.body?.getReader();
 		if (!reader) throw new Error("wrapped response lost its body");
 		await reader.read(); // stream is live
-		expect(abortInflightStreams()).toBe(1);
+		const first = abortInflightStreams();
+		expect(first.aborted).toBe(1);
+		await first.settled;
 		await expect(
 			(async () => {
 				while (true) {
@@ -78,7 +85,9 @@ describe("trackStreamForShutdown", () => {
 			})(),
 		).rejects.toThrow(/drain deadline/);
 		// Registry is drained; a second sweep has nothing to abort.
-		expect(abortInflightStreams()).toBe(0);
+		const second = abortInflightStreams();
+		expect(second.aborted).toBe(0);
+		await second.settled;
 	});
 
 	it("unregisters streams that complete normally", async () => {
@@ -93,12 +102,106 @@ describe("trackStreamForShutdown", () => {
 			),
 		);
 		expect(await wrapped.text()).toBe("done");
-		expect(abortInflightStreams()).toBe(0);
+		const result = abortInflightStreams();
+		expect(result.aborted).toBe(0);
+		await result.settled;
 	});
 
 	it("passes non-stream responses through untouched", () => {
 		const plain = new Response(null, { status: 204 });
 		expect(trackStreamForShutdown(plain)).toBe(plain);
+	});
+
+	it("settles aborts after source cancellation instead of a fixed sleep", async () => {
+		let cancelResolved = false;
+		const wrapped = trackStreamForShutdown(
+			new Response(
+				new ReadableStream<Uint8Array>({
+					async pull(controller) {
+						controller.enqueue(new TextEncoder().encode("tick\n"));
+						await new Promise((resolve) => setTimeout(resolve, 20));
+					},
+					async cancel() {
+						await new Promise((resolve) => setTimeout(resolve, 30));
+						cancelResolved = true;
+					},
+				}),
+				{ headers: { "content-type": "text/event-stream" } },
+			),
+		);
+		const reader = wrapped.body?.getReader();
+		if (!reader) throw new Error("wrapped response lost its body");
+		await reader.read();
+
+		const { aborted, settled } = abortInflightStreams();
+		expect(aborted).toBe(1);
+		expect(cancelResolved).toBe(false);
+		await settled;
+		expect(cancelResolved).toBe(true);
+		void reader.cancel().catch(() => {});
+	});
+
+	it("waits for cancellation that settles after the graceful drain expires", async () => {
+		let cancelResolved = false;
+		let pendingRequests = 1;
+		const wrapped = trackStreamForShutdown(
+			new Response(
+				new ReadableStream<Uint8Array>({
+					pull(controller) {
+						controller.enqueue(new TextEncoder().encode("tick\n"));
+					},
+					async cancel() {
+						await new Promise((resolve) => setTimeout(resolve, 30));
+						cancelResolved = true;
+						pendingRequests = 0;
+					},
+				}),
+			),
+		);
+		const reader = wrapped.body?.getReader();
+		if (!reader) throw new Error("wrapped response lost its body");
+		await reader.read();
+
+		const { settled } = abortInflightStreams();
+		await waitForForceCloseSettlement(settled, () => pendingRequests, 100);
+
+		expect(cancelResolved).toBe(true);
+		expect(pendingRequests).toBe(0);
+	});
+
+	it("bounds a hung cancellation by the explicit settlement budget", async () => {
+		expect(FORCE_CLOSE_SETTLEMENT_BUDGET_MS).toBe(1_000);
+		const neverSettles = new Promise<void>(() => {});
+		const startedAt = performance.now();
+
+		await waitForForceCloseSettlement(neverSettles, () => 1, 30);
+
+		const elapsedMs = performance.now() - startedAt;
+		expect(elapsedMs).toBeGreaterThanOrEqual(25);
+		expect(elapsedMs).toBeLessThan(250);
+	});
+
+	it("settles aborts even when source cancellation rejects", async () => {
+		const wrapped = trackStreamForShutdown(
+			new Response(
+				new ReadableStream<Uint8Array>({
+					pull(controller) {
+						controller.enqueue(new TextEncoder().encode("tick\n"));
+					},
+					cancel() {
+						throw new Error("source cancel failed");
+					},
+				}),
+			),
+		);
+		const reader = wrapped.body?.getReader();
+		if (!reader) throw new Error("wrapped response lost its body");
+		await reader.read();
+
+		const result = abortInflightStreams();
+		expect(result.aborted).toBe(1);
+		await expect(result.settled).resolves.toBeUndefined();
+		await expect(reader.read()).rejects.toThrow(/drain deadline/);
 	});
 });
 

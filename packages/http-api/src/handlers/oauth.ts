@@ -251,22 +251,27 @@ export function createQwenReauthHandler(dbOps: DatabaseOperations) {
 					const resourceUrl = tokens.resource_url
 						? normalizeQwenBaseUrl(tokens.resource_url)
 						: account.custom_endpoint;
+					const refreshedAt = Date.now();
 
 					await dbOps.getAdapter().run(
 						`UPDATE accounts SET
 							refresh_token = ?,
 							access_token = ?,
 							expires_at = ?,
-							custom_endpoint = ?
+							custom_endpoint = ?,
+							refresh_token_issued_at = ?,
+							requires_reauth = 0
 						WHERE id = ?`,
 						[
 							tokens.refresh_token,
 							tokens.access_token,
-							Date.now() + tokens.expires_in * 1000,
+							refreshedAt + tokens.expires_in * 1000,
 							resourceUrl,
+							refreshedAt,
 							account.id,
 						],
 					);
+					clearAccountRefreshCache(account.id);
 
 					// Auto-resume an oauth_invalid_grant pause and drop stale refresh
 					// backoff so the account returns to rotation immediately.
@@ -508,7 +513,8 @@ export function createCodexReauthHandler(dbOps: DatabaseOperations) {
 						`UPDATE accounts SET
 							refresh_token = ?,
 							access_token = ?,
-							expires_at = ?
+							expires_at = ?,
+							requires_reauth = 0
 						WHERE id = ?`,
 						[
 							tokens.refresh_token,
@@ -517,6 +523,7 @@ export function createCodexReauthHandler(dbOps: DatabaseOperations) {
 							account.id,
 						],
 					);
+					clearAccountRefreshCache(account.id);
 
 					// Auto-resume an oauth_invalid_grant pause and drop stale refresh
 					// backoff so the account returns to rotation immediately.
@@ -752,6 +759,7 @@ export function createAnthropicReauthCallbackHandler(
 					{ sessionId, code, name, id: account.id },
 					flowData,
 				);
+				clearAccountRefreshCache(account.id);
 
 				dbOps.deleteOAuthSession(sessionId);
 
@@ -914,13 +922,13 @@ export function createOAuthCallbackHandler(dbOps: DatabaseOperations) {
 			const sessionId = validateString(body.sessionId, "sessionId", {
 				required: true,
 				pattern: patterns.uuid,
-			})!;
+			});
 
 			// Validate code - validateString throws ValidationError if invalid
 			const code = validateString(body.code, "code", {
 				required: true,
 				minLength: 1,
-			})!;
+			});
 
 			// Get stored PKCE verifier from database
 			const oauthSession = await dbOps.getOAuthSession(sessionId);

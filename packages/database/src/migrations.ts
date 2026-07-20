@@ -122,7 +122,8 @@ export function ensureSchema(db: Database): void {
 			request_count INTEGER DEFAULT 0,
 			total_requests INTEGER DEFAULT 0,
 			priority INTEGER DEFAULT 0,
-			consecutive_rate_limits INTEGER NOT NULL DEFAULT 0
+			consecutive_rate_limits INTEGER NOT NULL DEFAULT 0,
+			requires_reauth INTEGER DEFAULT 0
 		)
 	`);
 
@@ -743,6 +744,13 @@ export function runMigrations(db: Database, dbPath?: string): void {
 			log.info("Backfilled pause_reason for existing paused accounts");
 		}
 
+		if (!initialAccountsColumnNames.includes("requires_reauth")) {
+			db.prepare(
+				"ALTER TABLE accounts ADD COLUMN requires_reauth INTEGER DEFAULT 0",
+			).run();
+			log.info("Added requires_reauth column to accounts table");
+		}
+
 		if (!initialAccountsColumnNames.includes("rate_limited_reason")) {
 			db.prepare(
 				"ALTER TABLE accounts ADD COLUMN rate_limited_reason TEXT",
@@ -798,7 +806,8 @@ export function runMigrations(db: Database, dbPath?: string): void {
 					cross_region_mode TEXT DEFAULT 'geographic',
 					model_fallbacks TEXT,
 					auto_pause_on_overage_enabled INTEGER DEFAULT 0,
-					pause_reason TEXT
+					pause_reason TEXT,
+					requires_reauth INTEGER DEFAULT 0
 				)
 			`).run();
 
@@ -814,7 +823,7 @@ export function runMigrations(db: Database, dbPath?: string): void {
 					paused, rate_limit_reset, rate_limit_status, rate_limit_remaining,
 					auto_fallback_enabled, custom_endpoint, auto_refresh_enabled,
 					model_mappings, cross_region_mode, model_fallbacks,
-					auto_pause_on_overage_enabled, pause_reason
+					auto_pause_on_overage_enabled, pause_reason, requires_reauth
 				FROM accounts
 			`).run();
 
@@ -1073,7 +1082,7 @@ export function runMigrations(db: Database, dbPath?: string): void {
 			       rate_limit_reset, rate_limit_status, rate_limit_remaining,
 			       auto_fallback_enabled, custom_endpoint, auto_refresh_enabled, model_mappings,
 			       cross_region_mode, model_fallbacks, billing_type, auto_pause_on_overage_enabled,
-			       pause_reason
+			       pause_reason, requires_reauth
 			FROM accounts
 		`).run();
 

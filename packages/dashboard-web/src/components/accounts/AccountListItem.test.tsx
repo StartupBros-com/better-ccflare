@@ -28,6 +28,7 @@ function makeAccount(overrides: Partial<Account> = {}): Account {
 		lastUsed: null,
 		created: new Date().toISOString(),
 		paused: true,
+		requiresReauth: false,
 		pauseReason: null,
 		tokenStatus: "valid",
 		tokenExpiresAt: null,
@@ -69,6 +70,25 @@ const requiredHandlers = {
 };
 
 describe("AccountListItem (P2 review: pause-reason rendering)", () => {
+	it("renders the derived requiresReauth signal as the same primary recovery action", () => {
+		const account = makeAccount({
+			requiresReauth: true,
+			pauseReason: "oauth_invalid_grant",
+		});
+		const html = renderToStaticMarkup(
+			<AccountListItem
+				account={account}
+				{...requiredHandlers}
+				onAnthropicReauth={noop}
+			/>,
+		);
+
+		expect(html).toContain("Re-authentication required");
+		expect(html).toContain("Refresh token invalid — re-authenticate");
+		expect(html).toContain(">Re-authenticate<");
+		expect(html).toContain("bg-primary text-primary-foreground");
+	});
+
 	it("renders reauth-required copy and a primary Re-authenticate button for oauth_invalid_grant", () => {
 		const account = makeAccount({ pauseReason: "oauth_invalid_grant" });
 		const html = renderToStaticMarkup(
@@ -111,6 +131,18 @@ describe("AccountListItem (P2 review: pause-reason rendering)", () => {
 		expect(html).not.toContain("bg-primary text-primary-foreground");
 	});
 
+	it("shows a human-readable known automatic pause reason", () => {
+		const html = renderToStaticMarkup(
+			<AccountListItem
+				account={makeAccount({ pauseReason: "failure_threshold" })}
+				{...requiredHandlers}
+				onAnthropicReauth={noop}
+			/>,
+		);
+
+		expect(html).toContain("Paused (failure threshold)");
+	});
+
 	it("renders generic Paused copy with no reauth emphasis for an unrecognized pause reason", () => {
 		const account = makeAccount({
 			pauseReason: "some_future_reason_this_build_does_not_know_about",
@@ -124,6 +156,9 @@ describe("AccountListItem (P2 review: pause-reason rendering)", () => {
 		);
 
 		expect(html).toContain("Paused");
+		expect(html).not.toContain(
+			"some future reason this build does not know about",
+		);
 		expect(html).not.toContain("Re-authentication required");
 		expect(html).not.toContain(">Re-authenticate<");
 		expect(html).not.toContain("bg-primary text-primary-foreground");

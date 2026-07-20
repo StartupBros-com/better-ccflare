@@ -332,8 +332,59 @@ export interface HardCapacityStatus {
 export interface HardCapacityOptions {
 	readonly requestModel: string | null;
 	readonly observedAt: number;
+	/** Provider is used only for provider-specific billing/overage semantics. */
+	readonly provider?: string | null;
 	readonly now?: number;
 	readonly snapshotFreshnessMs?: number;
+}
+
+export type CapacityOverageStatus = "available" | "unavailable" | "unknown";
+
+/**
+ * Resolve Anthropic's current and legacy overage signals without guessing.
+ * A missing signal is unknown: falsely excluding an overage-enabled account
+ * is worse than paying for one reactive upstream rejection.
+ */
+export function resolveCapacityOverageStatus(
+	data: AnyUsageData | null,
+): CapacityOverageStatus {
+	const billing = data as {
+		spend?: { enabled?: boolean } | null;
+		extra_usage?: { is_enabled?: boolean } | null;
+	} | null;
+	if (typeof billing?.spend?.enabled === "boolean") {
+		return billing.spend.enabled ? "available" : "unavailable";
+	}
+	if (typeof billing?.extra_usage?.is_enabled === "boolean") {
+		return billing.extra_usage.is_enabled ? "available" : "unavailable";
+	}
+	return "unknown";
+}
+
+/**
+ * Count every active raw scoped row for a family, including rows the normalizer
+ * must drop because percent/reset evidence is incomplete. Comparing this with
+ * normalized rows prevents proving exhaustion by omission.
+ */
+function countRawScopedFamilyRows(
+	data: AnyUsageData | null,
+	family: string,
+): number {
+	const limits = (data as { limits?: unknown[] } | null)?.limits;
+	if (!Array.isArray(limits)) return 0;
+	let count = 0;
+	for (const value of limits) {
+		const row = value as AnthropicLimit | null;
+		if (!row || row.is_active === false || row.kind !== "weekly_scoped") {
+			continue;
+		}
+		const name =
+			row.scope?.model?.display_name?.trim() ||
+			row.scope?.model?.id?.trim() ||
+			null;
+		if (name && getModelFamily(name) === family) count++;
+	}
+	return count;
 }
 
 interface SnapshotFreshness {
@@ -387,8 +438,37 @@ export function evaluateHardCapacity(
 	const requestFamily = options.requestModel
 		? getModelFamily(options.requestModel)
 		: null;
+	const windows = collectWindows(data);
+	const matchingScopedRows = requestFamily
+		? windows.filter(
+				(window) =>
+					window.kind === "weekly_scoped" &&
+					window.modelFamily === requestFamily,
+			)
+		: [];
+	const rawScopedRowCount = requestFamily
+		? countRawScopedFamilyRows(data, requestFamily)
+		: 0;
+	const everyScopedRowProvesExhaustion =
+		matchingScopedRows.length > 0 &&
+		rawScopedRowCount === matchingScopedRows.length &&
+		matchingScopedRows.every(
+			(window) =>
+				window.utilization >= 100 &&
+				window.resetAtMs !== null &&
+				window.resetAtMs > now,
+		);
+	// Anthropic can continue serving a 100% scoped allowance through paid
+	// overage. Only a confirmed-disabled billing signal makes that cap hard.
+	// Other providers do not expose these Anthropic-specific fields, so their
+	// existing subscription-cap routing remains authoritative.
+	const scopedFamilyHardBlocked =
+		everyScopedRowProvesExhaustion &&
+		(options.provider !== "anthropic" ||
+			resolveCapacityOverageStatus(data) === "unavailable");
+
 	const exclusions: HardCapacityExclusion[] = [];
-	for (const window of collectWindows(data)) {
+	for (const window of windows) {
 		if (
 			window.kind !== "session" &&
 			window.kind !== "weekly_all" &&
@@ -405,7 +485,8 @@ export function evaluateHardCapacity(
 			if (
 				requestFamily === null ||
 				window.modelFamily == null ||
-				window.modelFamily !== requestFamily
+				window.modelFamily !== requestFamily ||
+				!scopedFamilyHardBlocked
 			) {
 				continue;
 			}

@@ -177,6 +177,7 @@ export interface AccountRow {
 	session_start?: number | null;
 	session_request_count?: number;
 	paused?: boolean | number | null;
+	requires_reauth?: boolean | number | null;
 	rate_limit_reset?: number | null;
 	rate_limit_status?: string | null;
 	rate_limit_remaining?: number | null;
@@ -214,6 +215,7 @@ export interface Account {
 	session_start: number | null;
 	session_request_count: number;
 	paused: boolean;
+	requires_reauth: boolean;
 	rate_limit_reset: number | null;
 	rate_limit_status: string | null;
 	rate_limit_remaining: number | null;
@@ -253,6 +255,7 @@ export interface AccountResponse {
 	lastUsed: string | null;
 	created: string;
 	paused: boolean;
+	requiresReauth: boolean;
 	// Typed pause reason (e.g. "manual", "overage", "oauth_invalid_grant").
 	// null when not paused. Unknown/legacy strings are always safely
 	// renderable: consumers must fall back to generic "Paused" copy for any
@@ -322,6 +325,7 @@ export interface AccountListItem {
 	requestCount: number;
 	totalRequests: number;
 	paused: boolean;
+	requiresReauth: boolean;
 	tokenStatus: "valid" | "expired";
 	rateLimitStatus: string;
 	sessionInfo: string;
@@ -402,6 +406,9 @@ export function toAccount(row: AccountRow): Account {
 		session_start: toNumOrNull(row.session_start),
 		session_request_count: toNum(row.session_request_count),
 		paused: !!row.paused,
+		// pause_reason is canonical; requires_reauth is retained only as a
+		// compatibility column for upstream writers/migrations.
+		requires_reauth: row.pause_reason === "oauth_invalid_grant",
 		rate_limit_reset: toNumOrNull(row.rate_limit_reset),
 		rate_limit_status: row.rate_limit_status || null,
 		rate_limit_remaining: toNumOrNull(row.rate_limit_remaining),
@@ -480,6 +487,9 @@ export function toAccountResponse(account: Account): AccountResponse {
 			: null,
 		created: new Date(account.created_at).toISOString(),
 		paused: account.paused,
+		// pause_reason remains the authoritative terminal-auth state in the fork.
+		// The compatibility field must not become an independent second state.
+		requiresReauth: account.pause_reason === "oauth_invalid_grant",
 		pauseReason: account.pause_reason,
 		tokenStatus,
 		tokenExpiresAt: account.expires_at

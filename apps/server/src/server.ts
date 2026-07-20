@@ -31,6 +31,7 @@ import { Logger, setConsoleLogging } from "@better-ccflare/logger";
 import { handleResponsesRequest } from "@better-ccflare/openai-responses-adapter";
 import {
 	CODEX_DEFAULT_ENDPOINT,
+	extractWeeklyResetTime,
 	fetchCodexUsageOnDemand,
 	getProvider,
 	getRepresentativeUtilizationForProvider,
@@ -1070,6 +1071,13 @@ export default async function startServer(options?: {
 			if (!data) return null;
 			return getRepresentativeUtilizationForProvider(data, provider);
 		},
+		getAccountWeeklyReset(accountId: string, provider: string): number | null {
+			const data = usageCache.get(accountId);
+			if (!data) return null;
+			const resetAt = extractWeeklyResetTime(data, provider);
+			if (resetAt == null || resetAt <= Date.now()) return null;
+			return resetAt;
+		},
 	});
 
 	strategy.initialize?.(strategyStore);
@@ -1139,8 +1147,8 @@ export default async function startServer(options?: {
 	// Register this server's codex on-demand usage refresher. Codex does not
 	// expose a free usage endpoint (unlike Anthropic's /api/oauth/usage), so
 	// each call sends a tiny upstream request and parses the x-codex-* headers
-	// from the response, then aborts/cancels immediately after capturing them.
-	// Custom API-compatible endpoints retain the legacy one-token output cap.
+	// from the response. The subscription endpoint rejects output-token caps,
+	// so fetchCodexUsageOnDemand aborts and cancels immediately after headers.
 	registerCodexUsageRefresher(serverId, async (accountId: string) => {
 		const account = await dbOps.getAccount(accountId);
 		if (!account) {
@@ -1828,40 +1836,62 @@ Available endpoints:
 // (verified empirically on Bun 1.3.5). To force-close still-streaming
 // responses at the drain deadline, every proxied response is wrapped in a
 // pass-through whose controller can be errored explicitly.
-const inflightStreamAborts = new Set<() => void>();
+//
+// Each tracked stream also exposes a settlement promise. Force-close must
+// await those settlements before usage-collector drain / DB disposal, or
+// close/error finalizers that record the last usage events can still be
+// racing the shutdown path.
+type TrackedInflightStream = {
+	abort: () => void;
+	settled: Promise<void>;
+};
+
+const inflightStreams = new Set<TrackedInflightStream>();
 
 export function trackStreamForShutdown(response: Response): Response {
 	const body = response.body;
 	if (!body) return response;
 	const reader = body.getReader();
-	let abort: (() => void) | null = null;
-	const unregister = () => {
-		if (abort) inflightStreamAborts.delete(abort);
+	let tracked: TrackedInflightStream | null = null;
+	let settle!: () => void;
+	const settled = new Promise<void>((resolve) => {
+		settle = resolve;
+	});
+	const finish = () => {
+		if (!tracked) return;
+		inflightStreams.delete(tracked);
+		tracked = null;
+		settle();
 	};
 	const stream = new ReadableStream<Uint8Array>({
 		start(controller) {
-			abort = () => {
-				unregister();
+			const abort = () => {
 				try {
 					controller.error(new Error("server shutdown: drain deadline"));
 				} catch {
 					// already closed or errored
 				}
-				reader.cancel().catch(() => {});
+				// Settlement waits for source cancellation so shutdown can
+				// observe the terminal path even when no pull is scheduled.
+				void reader
+					.cancel()
+					.catch(() => {})
+					.finally(() => finish());
 			};
-			inflightStreamAborts.add(abort);
+			tracked = { abort, settled };
+			inflightStreams.add(tracked);
 		},
 		async pull(controller) {
 			try {
 				const { done, value } = await reader.read();
 				if (done) {
-					unregister();
+					finish();
 					controller.close();
 				} else {
 					controller.enqueue(value);
 				}
 			} catch (error) {
-				unregister();
+				finish();
 				try {
 					controller.error(error);
 				} catch {
@@ -1870,8 +1900,10 @@ export function trackStreamForShutdown(response: Response): Response {
 			}
 		},
 		cancel(reason) {
-			unregister();
-			return reader.cancel(reason).catch(() => {});
+			return reader
+				.cancel(reason)
+				.catch(() => {})
+				.finally(() => finish());
 		},
 	});
 	return new Response(stream, {
@@ -1881,12 +1913,24 @@ export function trackStreamForShutdown(response: Response): Response {
 	});
 }
 
-/** Error every tracked in-flight stream; returns how many were aborted. */
-export function abortInflightStreams(): number {
-	const aborts = [...inflightStreamAborts];
-	inflightStreamAborts.clear();
-	for (const abort of aborts) abort();
-	return aborts.length;
+/**
+ * Error every tracked in-flight stream and return both the abort count and a
+ * promise that settles once every aborted stream has finished its terminal
+ * close/error path.
+ */
+export function abortInflightStreams(): {
+	aborted: number;
+	settled: Promise<void>;
+} {
+	const streams = [...inflightStreams];
+	inflightStreams.clear();
+	for (const stream of streams) stream.abort();
+	return {
+		aborted: streams.length,
+		settled: Promise.allSettled(streams.map((stream) => stream.settled)).then(
+			() => undefined,
+		),
+	};
 }
 
 export const SHUTDOWN_DRAIN_MS_ENV = "CCFLARE_SHUTDOWN_DRAIN_MS";
@@ -1900,6 +1944,45 @@ const DEFAULT_SHUTDOWN_DRAIN_MS = 60_000;
 export const MAX_SHUTDOWN_DRAIN_MS = 15 * 60 * 1000;
 /** Budget for post-drain cleanup (DB writer, disposables) before force exit. */
 const SHUTDOWN_WATCHDOG_MARGIN_MS = 15_000;
+/**
+ * Portion of the watchdog cleanup margin reserved for force-close terminal
+ * callbacks. The graceful drain deadline is already exhausted when this runs,
+ * so it needs its own small budget before usage/DB cleanup begins.
+ */
+export const FORCE_CLOSE_SETTLEMENT_BUDGET_MS = 1_000;
+
+/**
+ * Await aborted stream settlement and Bun's pending-request counter within a
+ * dedicated post-force-close budget. Exported so the shutdown timing contract
+ * is testable without invoking the process-level signal handler.
+ */
+export async function waitForForceCloseSettlement(
+	settled: Promise<void>,
+	getPendingRequests: () => number,
+	budgetMs: number = FORCE_CLOSE_SETTLEMENT_BUDGET_MS,
+): Promise<void> {
+	const boundedBudgetMs = Number.isFinite(budgetMs)
+		? Math.max(0, budgetMs)
+		: FORCE_CLOSE_SETTLEMENT_BUDGET_MS;
+	const deadline = Date.now() + boundedBudgetMs;
+	let timeoutId: ReturnType<typeof setTimeout> | undefined;
+	const budgetExpired = new Promise<void>((resolve) => {
+		timeoutId = setTimeout(resolve, boundedBudgetMs);
+	});
+
+	try {
+		await Promise.race([settled.catch(() => {}), budgetExpired]);
+	} finally {
+		if (timeoutId !== undefined) clearTimeout(timeoutId);
+	}
+
+	while (getPendingRequests() > 0 && Date.now() < deadline) {
+		const remainingMs = deadline - Date.now();
+		await new Promise((resolve) =>
+			setTimeout(resolve, Math.min(50, Math.max(0, remainingMs))),
+		);
+	}
+}
 
 export function readShutdownDrainMs(): number {
 	const raw = process.env[SHUTDOWN_DRAIN_MS_ENV];
@@ -2047,16 +2130,19 @@ async function handleGracefulShutdown(signal: string) {
 				// directly; the call stays as belt-and-braces for Bun versions
 				// where escalation works.
 				serverInstance.stop(true);
-				const aborted = abortInflightStreams();
+				const { aborted, settled } = abortInflightStreams();
 				if (aborted > 0) {
 					console.error(`Errored ${aborted} tracked response stream(s)`);
 				}
-				// Force-cancelled streams still have queued close/error handlers
-				// that record their final usage. Yield briefly so those callbacks
-				// run before the usage collector drains and the async DB writer
-				// is disposed; otherwise the cancelled streams' last usage events
-				// are lost.
-				await new Promise((resolve) => setTimeout(resolve, 250));
+				// Force-cancelled streams still have close/error handlers that
+				// record final usage. The graceful drain deadline is exhausted at
+				// this point, so use a dedicated 1s slice of the 15s watchdog
+				// cleanup margin. A hung source cancel cannot consume the ~14s
+				// left for usage-collector drain and DB disposal.
+				await waitForForceCloseSettlement(
+					settled,
+					() => serverInstance?.pendingRequests ?? 0,
+				);
 			}
 		}
 

@@ -67,7 +67,7 @@ The configuration file is stored at:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `lb_strategy` | string | `"session"` | Load balancing strategy. Only `"session"` is supported (using other strategies risks account bans) |
+| `lb_strategy` | string | `"session"` | Load balancing strategy. Supported values are `"session"` (default), `"session-affinity"`, and `"least-used"`. Prefer a session-based strategy for OAuth accounts; per-request spreading can trigger provider anti-abuse systems |
 | `client_id` | string | `"9d1c250a-e61b-44d9-88ed-5944d1962f5e"` | OAuth client ID for authentication |
 | `retry_attempts` | number | `3` | Maximum number of retry attempts for failed requests |
 | `retry_delay_ms` | number | `1000` | Initial delay in milliseconds between retry attempts |
@@ -77,11 +77,13 @@ The configuration file is stored at:
 
 ### Load Balancing Strategy
 
-⚠️ **WARNING**: Only use the `session` strategy. Other strategies can trigger Claude's anti-abuse systems and result in account bans.
+⚠️ **WARNING**: Prefer `session` or `session-affinity` for Anthropic OAuth traffic because they preserve account stickiness. `least-used` can spread individual requests across accounts and may trigger Claude's anti-abuse systems; reserve it for providers and credentials where per-request balancing is safe.
 
 | Strategy | Description | Use Case |
 |----------|-------------|----------|
-| `session` | Maintains client-account affinity for session duration, with automatic alignment to Anthropic OAuth usage window resets | Only supported strategy - mimics natural usage patterns and optimizes resource utilization |
+| `session` | Maintains client-account affinity for session duration, with automatic alignment to Anthropic OAuth usage window resets | Default and recommended - mimics natural usage patterns and optimizes resource utilization |
+| `session-affinity` | Maintains independent client-to-account affinity while preserving automatic failover and session expiry | Multiple concurrent clients that need sticky routing without sharing one global active account |
+| `least-used` | Orders available accounts by utilization rather than maintaining sticky OAuth sessions | API-key and compatible-provider pools where per-request spreading is explicitly acceptable |
 
 ### Logging Configuration (Environment Only)
 
@@ -121,6 +123,7 @@ These environment variables are not stored in the configuration file and must be
 | `DATABASE_URL` | Use PostgreSQL instead of SQLite. Set to a `postgresql://` or `postgres://` connection string. When set, `better-ccflare_DB_PATH` is ignored. | - | `DATABASE_URL=postgresql://user:pass@localhost:5432/ccflare` |
 | `CF_PRICING_REFRESH_HOURS` | Hours between pricing data refreshes | `24` | `CF_PRICING_REFRESH_HOURS=12` |
 | `CF_PRICING_OFFLINE` | Disable online pricing updates | - | `CF_PRICING_OFFLINE=1` |
+| `CF_PRICING_TIMEOUT_MS` | Pricing estimate deadline in milliseconds. Accepts integers from `1` through `60000`; unset or invalid values fall back to `5000` | `5000` | `CF_PRICING_TIMEOUT_MS=10000` |
 | `BETTER_CCFLARE_MODELS_REFRESH_HOURS` | Hours between scheduled model catalog refreshes; `0` disables scheduled refresh entirely | `168` (7 days) | `BETTER_CCFLARE_MODELS_REFRESH_HOURS=48` |
 | `BETTER_CCFLARE_MODELS_OFFLINE` | Disable scheduled/manual model catalog refresh **and** passive `/v1/models` capture | - | `BETTER_CCFLARE_MODELS_OFFLINE=1` |
 | `BETTER_CCFLARE_MODELS_CACHE_DIR` | Directory for the persisted model catalog cache file. Use a persistent directory (not a tmpdir that's wiped on restart) to keep the refresh schedule stable across restarts | Platform tmp dir | `BETTER_CCFLARE_MODELS_CACHE_DIR=/var/lib/better-ccflare` |
@@ -143,6 +146,26 @@ These environment variables are not stored in the configuration file and must be
 | `CCFLARE_CODEX_CACHE_KEY_SESSION_PERCENT` | Deterministic session-level canary percentage for comparing conversation and session cache-key modes on eligible OpenAI endpoints. Only unsigned base-10 integers are accepted; malformed values become `0`, and valid values above `100` clamp to `100`. `0` preserves conversation assignment, while `100` assigns every eligible session to session mode. An explicit `CCFLARE_CODEX_CACHE_KEY_MODE=session` still takes precedence | `0` | `CCFLARE_CODEX_CACHE_KEY_SESSION_PERCENT=10` |
 | `CF_STREAM_USAGE_BUFFER_KB` | Stream usage buffer size in KB | `64` | `CF_STREAM_USAGE_BUFFER_KB=128` |
 | `CF_STREAM_TIMEOUT_MS` | Stream processing timeout in milliseconds | `60000` (1 minute) | `CF_STREAM_TIMEOUT_MS=120000` |
+
+Model-family capacity handling is integrated into account selection and does not require a standalone feature flag. Fresh Anthropic `limits[]` telemetry is interpreted by scope: exhausted `session` and `weekly_all` windows exclude the account, while an exhausted `weekly_scoped` row excludes only requests for the matching model family when paid overage is confirmed unavailable. Stale, malformed, unrelated, or incomplete scoped telemetry fails open, and observed upstream capacity responses provide short-lived reactive evidence while telemetry catches up.
+
+## Alerts
+
+better-ccflare can emit threshold and anomaly alerts and deliver them via webhook and the dashboard. Alerts are persisted to the same database as requests and deduplicated per cooldown bucket; persistence is best-effort — a database failure is logged and skipped rather than failing the request or crashing the proxy. All `ALERT_*` env vars have equivalent config-file fields (`alert_daily_spend_usd`, `alert_tokens_per_hour`, `alert_request_tokens`, `alert_anomaly_enabled`, `alert_anomaly_interval_minutes`, `alert_cooldown_minutes`, `alert_webhook_url`); env vars take precedence.
+
+| Variable | Purpose | Default | Example |
+|----------|---------|---------|---------|
+| `ALERT_DAILY_SPEND_USD` | Fire a warning alert when aggregate spend since local midnight meets or exceeds this USD amount. Clamped to `[0, 1000000]`; `0` disables | `0` | `ALERT_DAILY_SPEND_USD=25` |
+| `ALERT_TOKENS_PER_HOUR` | Fire a warning alert when total tokens consumed in the trailing hour meets or exceeds this count. `0` disables | `0` | `ALERT_TOKENS_PER_HOUR=500000` |
+| `ALERT_REQUEST_TOKENS` | Fire a critical alert when a single request's total token count meets or exceeds this value. `0` disables | `0` | `ALERT_REQUEST_TOKENS=200000` |
+| `ALERT_ANOMALY_ENABLED` | Run periodic anomaly detection over recent requests (token outliers, output blowups, runaway loops, model misrouting). Accepts `1`/`true`/`0`/`false` | `false` | `ALERT_ANOMALY_ENABLED=true` |
+| `ALERT_ANOMALY_INTERVAL_MINUTES` | Cadence of anomaly-detection sweeps, in minutes. Clamped to `[5, 1440]` | `15` | `ALERT_ANOMALY_INTERVAL_MINUTES=30` |
+| `ALERT_COOLDOWN_MINUTES` | Per-alert-type-and-scope cooldown bucket size in minutes — within a bucket, only the first alert is persisted and delivered (no SSE storms or duplicate webhooks). Clamped to `[1, 1440]` | `60` | `ALERT_COOLDOWN_MINUTES=120` |
+| `ALERT_WEBHOOK_URL` | `http(s)` URL to receive `POST` deliveries of `{ type: "alert", alert: { ... } }`. Unset = no webhook delivery. Must be a valid URL or the setter rejects it | unset | `ALERT_WEBHOOK_URL=https://example.com/alerts` |
+
+In addition to threshold alerts, an `auth_failure` alert (severity `critical`) fires automatically when an OAuth account's refresh token fails definitively (e.g. `invalid_grant`) and the account is marked `requires_reauth`. It is deduplicated by the same cooldown bucket as the threshold alerts.
+
+Alerts are listed on the dashboard and via the API; unacknowledged counts surface in `/health`. Persistence uses dialect-appropriate conflict handling (`INSERT OR IGNORE` on SQLite, `ON CONFLICT (id) DO NOTHING` on PostgreSQL), so alerts work identically on both backends.
 
 ## Database Configuration
 
