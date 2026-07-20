@@ -12,6 +12,8 @@ export {
 	CODEX_USER_AGENT,
 	CODEX_VERSION,
 	CodexProvider,
+	isCodexSubscriptionEndpoint,
+	resolveCodexEndpoint,
 	resolveCodexRequestModel,
 } from "./provider";
 export { parseCodexUsageHeaders } from "./usage";

@@ -535,7 +535,7 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 					max_tokens: 50_000,
 				}),
 			).buffer;
-			const tracker = createContextAdmissionTracker(110_000, 50_000);
+			const tracker = createContextAdmissionTracker(130_000, 50_000);
 			const result = await proxyWithAccount(
 				makeMessagesRequest(bodyBuffer, { "Content-Type": "application/json" }),
 				new URL("https://proxy.local/v1/messages"),
@@ -573,6 +573,7 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 		const tracker = createContextAdmissionTracker(250_000, 20_000);
 		const result = selectAdmittedCodexModel(
 			makeCodexAccount({
+				custom_endpoint: "https://api.openai.com/v1/responses",
 				model_mappings: JSON.stringify({ haiku: "gpt-5.4-mini" }),
 			}),
 			"claude-sonnet-4-5",
@@ -583,11 +584,12 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 		expect(tracker.largestSafeLimit).toBe(258_400);
 	});
 
-	it("reserves the full forwarded max_tokens and reports the exact occupied total", async () => {
+	it("reserves the full forwarded max_tokens for custom/API endpoints", async () => {
 		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
 		const tracker = createContextAdmissionTracker(220_000, 50_000);
 		const result = selectAdmittedCodexModel(
 			makeCodexAccount({
+				custom_endpoint: "https://api.openai.com/v1/responses",
 				model_mappings: JSON.stringify({ sonnet: "gpt-5.4" }),
 			}),
 			"claude-sonnet-4-5",
@@ -606,6 +608,66 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 				code: "context_length_exceeded",
 			},
 		});
+	});
+
+	it("uses zero output reserve for the ChatGPT subscription wire contract", async () => {
+		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
+		const tracker = createContextAdmissionTracker(250_000, 50_000);
+		const result = selectAdmittedCodexModel(
+			makeCodexAccount({
+				model_mappings: JSON.stringify({ sonnet: "gpt-5.4" }),
+			}),
+			"claude-sonnet-4-5",
+			tracker,
+		);
+		expect(result).toEqual({ admitted: true, model: "gpt-5.4" });
+		expect(tracker.rejectedCount).toBe(0);
+	});
+
+	it("reports occupied tokens paired with the largest safe rejected candidate", async () => {
+		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
+		const tracker = createContextAdmissionTracker(360_000, 50_000);
+		selectAdmittedCodexModel(
+			makeCodexAccount({
+				custom_endpoint: "https://api.openai.com/v1/responses",
+				model_mappings: JSON.stringify({ sonnet: "gpt-5.4" }),
+			}),
+			"claude-sonnet-4-5",
+			tracker,
+		);
+		selectAdmittedCodexModel(
+			makeCodexAccount({
+				model_mappings: JSON.stringify({ sonnet: "gpt-5.6-sol" }),
+			}),
+			"claude-sonnet-4-5",
+			tracker,
+		);
+
+		expect(tracker.largestSafeLimit).toBe(353_400);
+		expect(tracker.terminalOccupiedTokens).toBe(360_000);
+		const response = createContextLengthExceededResponse(tracker);
+		expect(await response.json()).toMatchObject({
+			error: {
+				message: "prompt is too long: 360000 tokens > 353400 tokens",
+			},
+		});
+	});
+
+	it("uses the smaller occupied total to break equal-safe-limit ties", async () => {
+		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
+		const tracker = createContextAdmissionTracker(260_000, 10_000);
+		const custom = makeCodexAccount({
+			custom_endpoint: "https://api.openai.com/v1/responses",
+			model_mappings: JSON.stringify({ sonnet: "gpt-5.4" }),
+		});
+		const subscription = makeCodexAccount({
+			model_mappings: JSON.stringify({ sonnet: "gpt-5.4" }),
+		});
+		selectAdmittedCodexModel(custom, "claude-sonnet-4-5", tracker);
+		selectAdmittedCodexModel(subscription, "claude-sonnet-4-5", tracker);
+
+		expect(tracker.largestSafeLimit).toBe(258_400);
+		expect(tracker.terminalOccupiedTokens).toBe(260_000);
 	});
 
 	it("excludes count_tokens from admission", async () => {
@@ -687,7 +749,7 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 				max_tokens: 20_000,
 			}),
 		).buffer;
-		const tracker = createContextAdmissionTracker(120_000, 20_000);
+		const tracker = createContextAdmissionTracker(130_000, 20_000);
 		const result = await proxyWithAccount(
 			makeMessagesRequest(bodyBuffer, {
 				"Content-Type": "application/json",
@@ -804,7 +866,7 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 					max_tokens: 20_000,
 				}),
 			).buffer;
-			const tracker = createContextAdmissionTracker(110_000, 20_000);
+			const tracker = createContextAdmissionTracker(130_000, 20_000);
 			const result = await proxyWithAccount(
 				makeMessagesRequest(bodyBuffer, { "Content-Type": "application/json" }),
 				new URL("https://proxy.local/v1/messages"),
@@ -983,6 +1045,7 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 		const tracker = createContextAdmissionTracker(360_000, 50_000);
 		tracker.rejectedCount = 2;
 		tracker.largestSafeLimit = 353_400;
+		tracker.terminalOccupiedTokens = 410_000;
 		const response = createContextLengthExceededResponse(tracker);
 		expect(response.status).toBe(400);
 		expect(await response.json()).toEqual({

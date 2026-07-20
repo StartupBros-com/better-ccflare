@@ -34,6 +34,7 @@ const originalOverloadRetry = process.env.CCFLARE_OVERLOAD_RETRY_ENABLED;
 const cachedUsageAccountIds = new Set<string>();
 let restoreUsageCollector = (): void => {};
 let usageHandleStart = mock(() => undefined);
+let usageHandleEnd = mock(async () => undefined);
 
 function makeAccount(id: string, fallbacks: string[] = [FABLE, OPUS]): Account {
 	return {
@@ -96,15 +97,24 @@ function makeCombo(
 
 function installUsageCollector(): void {
 	usageHandleStart = mock(() => undefined);
+	usageHandleEnd = mock(async () => undefined);
+	const collector = {
+		handleStart: usageHandleStart,
+		handleChunk: mock(() => undefined),
+		handleEnd: usageHandleEnd,
+	} as unknown as UsageCollector;
 	const collectorSpy = spyOn(
 		usageCollectorModule,
 		"getUsageCollector",
-	).mockReturnValue({
-		handleStart: usageHandleStart,
-		handleChunk: mock(() => undefined),
-		handleEnd: mock(async () => undefined),
-	} as unknown as UsageCollector);
-	restoreUsageCollector = () => collectorSpy.mockRestore();
+	).mockReturnValue(collector);
+	const tryCollectorSpy = spyOn(
+		usageCollectorModule,
+		"tryGetUsageCollector",
+	).mockReturnValue(collector);
+	restoreUsageCollector = () => {
+		collectorSpy.mockRestore();
+		tryCollectorSpy.mockRestore();
+	};
 }
 
 function makeContext(accounts: Account[], combo: ComboWithSlots): ProxyContext {
@@ -592,6 +602,119 @@ describe("global model-first routing", () => {
 			}
 		}
 	});
+
+	for (const requestedModel of [FABLE, OPUS]) {
+		it(`forwards a large ${requestedModel} combo request to the ChatGPT subscription endpoint`, async () => {
+			const previousAdmission = process.env.CCFLARE_CONTEXT_ADMISSION;
+			process.env.CCFLARE_CONTEXT_ADMISSION = "1";
+			try {
+				const account = makeAccount(`subscription-${requestedModel}`);
+				account.provider = "codex";
+				account.api_key = null;
+				account.access_token = `token-${requestedModel}`;
+				account.expires_at = Date.now() + 60 * 60 * 1000;
+				account.model_mappings = JSON.stringify({
+					fable: "gpt-5.6-sol",
+					opus: "gpt-5.6-sol",
+				});
+				const ctx = makeContext(
+					[account],
+					makeCombo({ account, model: requestedModel }),
+				);
+				const fetchedBodies: Array<Record<string, unknown>> = [];
+				globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+					const request = input instanceof Request ? input : new Request(input);
+					fetchedBodies.push(
+						(await request.clone().json()) as Record<string, unknown>,
+					);
+					return new Response('{"ok":true}', {
+						status: 200,
+						headers: { "content-type": "application/json" },
+					});
+				}) as unknown as typeof fetch;
+				const request = new Request("https://proxy.local/v1/messages", {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({
+						model: requestedModel,
+						messages: [{ role: "user", content: "x".repeat(660_000) }],
+						max_tokens: 50_000,
+					}),
+				});
+
+				const response = await handleProxy(request, new URL(request.url), ctx);
+
+				expect(response.status).toBe(200);
+				expect(fetchedBodies).toHaveLength(1);
+				expect(fetchedBodies[0]?.model).toBe("gpt-5.6-sol");
+				expect(fetchedBodies[0]).not.toHaveProperty("max_output_tokens");
+			} finally {
+				if (previousAdmission === undefined) {
+					delete process.env.CCFLARE_CONTEXT_ADMISSION;
+				} else {
+					process.env.CCFLARE_CONTEXT_ADMISSION = previousAdmission;
+				}
+			}
+		});
+
+		it(`keeps the output reserve for a large ${requestedModel} custom-endpoint combo request`, async () => {
+			const previousAdmission = process.env.CCFLARE_CONTEXT_ADMISSION;
+			process.env.CCFLARE_CONTEXT_ADMISSION = "1";
+			try {
+				const account = makeAccount(`custom-${requestedModel}`);
+				account.provider = "codex";
+				account.api_key = null;
+				account.access_token = `token-${requestedModel}`;
+				account.expires_at = Date.now() + 60 * 60 * 1000;
+				account.custom_endpoint = "https://api.openai.com/v1/responses";
+				account.model_mappings = JSON.stringify({
+					fable: "gpt-5.6-sol",
+					opus: "gpt-5.6-sol",
+				});
+				const ctx = makeContext(
+					[account],
+					makeCombo({ account, model: requestedModel }),
+				);
+				const fetchMock = mock(async () => {
+					throw new Error("custom endpoint must be rejected before fetch");
+				});
+				globalThis.fetch = fetchMock as unknown as typeof fetch;
+				const request = new Request("https://proxy.local/v1/messages", {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({
+						model: requestedModel,
+						messages: [{ role: "user", content: "x".repeat(660_000) }],
+						max_tokens: 50_000,
+					}),
+				});
+
+				const response = await handleProxy(request, new URL(request.url), ctx);
+
+				expect(response.status).toBe(400);
+				expect(fetchMock).toHaveBeenCalledTimes(0);
+				expect(await response.clone().json()).toMatchObject({
+					error: { code: "context_length_exceeded" },
+				});
+				expect(usageHandleStart).toHaveBeenCalledTimes(1);
+				expect(usageHandleStart.mock.calls[0]?.[0]).toMatchObject({
+					accountId: null,
+					responseStatus: 400,
+				});
+				expect(usageHandleEnd).toHaveBeenCalledTimes(1);
+				expect(usageHandleEnd.mock.calls[0]?.[0]).toMatchObject({
+					success: false,
+					error: "context_length_exceeded",
+				});
+			} finally {
+				if (previousAdmission === undefined) {
+					delete process.env.CCFLARE_CONTEXT_ADMISSION;
+				} else {
+					process.env.CCFLARE_CONTEXT_ADMISSION = previousAdmission;
+				}
+			}
+		});
+	}
 
 	for (const [provider, contextAdmissionEnabled] of [
 		["anthropic", false],

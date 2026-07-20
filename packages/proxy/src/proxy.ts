@@ -1447,7 +1447,28 @@ async function handleProxyCore(
 		cacheBodyStore.discardStaged(requestMeta.id);
 		pacingSlot?.abandon();
 		if (sessionId) clearSession(sessionId, requestMeta.timestamp);
-		return createContextLengthExceededResponse(contextAdmissionTracker);
+		const terminalResponse = createContextLengthExceededResponse(
+			contextAdmissionTracker,
+		);
+		void recordRoutingTerminalRequest({
+			collector: tryGetUsageCollector(),
+			requestMeta,
+			requestHeaders: req.headers,
+			response: terminalResponse,
+			providerName: ctx.provider.name,
+			terminalKind: "context_length_exceeded",
+			upstreamAttempts: 0,
+			apiKeyId,
+			apiKeyName,
+			skip: trustedInternalAutoRefresh,
+			onError: (error) => {
+				log.error(
+					`handleEnd failed for context_length_exceeded request ${requestMeta.id}`,
+					error,
+				);
+			},
+		});
+		return terminalResponse;
 	}
 
 	// 11. All accounts failed - check if OAuth token issues are the cause

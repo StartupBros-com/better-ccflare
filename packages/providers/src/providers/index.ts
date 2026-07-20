@@ -19,7 +19,9 @@ export {
 	CodexOAuthProvider,
 	CodexProvider,
 	fetchCodexUsageOnDemand,
+	isCodexSubscriptionEndpoint,
 	parseCodexUsageHeaders,
+	resolveCodexEndpoint,
 	resolveCodexRequestModel,
 } from "./codex/index";
 export { KiloProvider } from "./kilo/index";
