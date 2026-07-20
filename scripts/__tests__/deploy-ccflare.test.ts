@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import {
 	chmodSync,
 	copyFileSync,
+	existsSync,
 	mkdirSync,
 	mkdtempSync,
 	readdirSync,
@@ -329,7 +330,7 @@ function writeDigestFixtures(dir: string): {
 }
 
 describe("render_systemd_pin", () => {
-	test("atomically-rendered content upserts deploy-owned keys, preserves all others, and records artifact digests", () => {
+	test("renders only deploy-owned content, removes stale managed values, and is byte-idempotent", () => {
 		const dir = tempDir();
 		const input = join(dir, "pin.conf");
 		const output = join(dir, "pin.rendered.conf");
@@ -346,22 +347,25 @@ describe("render_systemd_pin", () => {
 		writeFileSync(
 			input,
 			[
+				"# Comments outside the managed block are tolerated but not retained.",
+				"",
+				"# BEGIN better-ccflare managed deployment",
 				"[Service]",
 				"Environment=KEEP_ME=unchanged",
 				"Environment=CCFLARE_BIN=/old/bin",
 				"Environment=GUARD_SCRIPT=/old/guard.mjs",
 				"Environment=GUARD_SCRIPT=/duplicate/guard.mjs",
-				// Stray lines that happen to share a name with a key the managed
-				// block below will also emit. render_systemd_pin regenerates the
-				// whole managed block from scratch on every render rather than
-				// patching known keys in place, so anything outside the
-				// BEGIN/END markers -- including these -- is untouched legacy
-				// content, not something upserted.
 				"Environment=GUARD_SHA256=oldguardsha",
 				"Environment=GUARD_POLICY_SHA256=oldpolicysha",
 				"Environment=RUNNER_SHA256=oldrunnersha",
+				"Environment=GUARD_TOTAL_DEADLINE_MS=900000",
+				"Environment=OPERATOR_OVERRIDE=must-not-survive",
+				"KillMode=control-group",
+				"TimeoutStopSec=999s",
 				"ExecStart=/home/will/legacy-runner.sh",
+				"# END better-ccflare managed deployment",
 				"",
+				"; A systemd semicolon comment is also tolerated.",
 			].join("\n"),
 		);
 
@@ -377,15 +381,6 @@ describe("render_systemd_pin", () => {
 		expect(result.exitCode).toBe(0);
 		expect(readFileSync(output, "utf8")).toBe(
 			[
-				"[Service]",
-				"Environment=KEEP_ME=unchanged",
-				"Environment=CCFLARE_BIN=/old/bin",
-				"Environment=GUARD_SCRIPT=/old/guard.mjs",
-				"Environment=GUARD_SCRIPT=/duplicate/guard.mjs",
-				"Environment=GUARD_SHA256=oldguardsha",
-				"Environment=GUARD_POLICY_SHA256=oldpolicysha",
-				"Environment=RUNNER_SHA256=oldrunnersha",
-				"ExecStart=/home/will/legacy-runner.sh",
 				"# BEGIN better-ccflare managed deployment",
 				"[Service]",
 				"Environment=CCFLARE_BIN=/new/bin",
@@ -419,11 +414,52 @@ describe("render_systemd_pin", () => {
 		);
 	});
 
+	test("rejects meaningful unmanaged content with an actionable operator-policy migration error", () => {
+		const dir = tempDir();
+		const input = join(dir, "50-pinned-build.conf");
+		const output = join(dir, "pin.rendered.conf");
+		const { guard, policy, runner } = writeDigestFixtures(dir);
+		writeFileSync(
+			input,
+			[
+				"# legacy unowned pin",
+				"[Service]",
+				"Environment=CCFLARE_BIN=/stale/bin",
+				"ExecStart=/stale/runner",
+				"",
+			].join("\n"),
+		);
+
+		const mutationLog = join(dir, "systemd-mutation.log");
+		const result = bash(
+			[
+				`source ${shellQuote(helperScriptForShell)}`,
+				`if render_systemd_pin ${shellQuote(shellPath(input))} ${shellQuote(shellPath(output))} /new/bin ${shellQuote(shellPath(runner))} ${shellQuote(shellPath(guard))} abc123 policy-v1 ${shellQuote(shellPath(policy))}; then`,
+				`  printf mutation >${shellQuote(shellPath(mutationLog))}`,
+				"else",
+				"  exit $?",
+				"fi",
+			].join("\n"),
+		);
+
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr.toString()).toContain(
+			"contains unmanaged systemd configuration outside",
+		);
+		expect(result.stderr.toString()).toContain("line 2: [Service]");
+		expect(result.stderr.toString()).toContain(
+			"Migrate operator policy to a later drop-in",
+		);
+		expect(result.stderr.toString()).toContain("90-operator-policy.conf");
+		expect(existsSync(output)).toBe(false);
+		expect(existsSync(mutationLog)).toBe(false);
+	});
+
 	test("fails clearly when a digest input file does not exist", () => {
 		const dir = tempDir();
 		const input = join(dir, "pin.conf");
 		const output = join(dir, "pin.rendered.conf");
-		writeFileSync(input, "[Service]\n");
+		writeFileSync(input, "# deploy-owned placeholder\n");
 
 		const result = bash(
 			[
@@ -433,24 +469,19 @@ describe("render_systemd_pin", () => {
 		);
 
 		expect(result.exitCode).not.toBe(0);
+		expect(result.stderr.toString()).toContain(
+			"sha256_file requires one existing file",
+		);
 	});
 
-	test("preserves operator deadline and graceful-stop overrides", () => {
+	test("accepts an empty or comment-only legacy file and replaces it from scratch", () => {
 		const dir = tempDir();
 		const input = join(dir, "pin.conf");
 		const output = join(dir, "pin.rendered.conf");
 		const { guard, policy, runner } = writeDigestFixtures(dir);
 		writeFileSync(
 			input,
-			[
-				"[Service]",
-				'Environment="GUARD_TOTAL_DEADLINE_MS=900000"',
-				"Environment=GUARD_SHUTDOWN_GRACE_MS=900000",
-				"KillMode=mixed",
-				"TimeoutStopSec=1020s",
-				"ExecStart=/old/runner",
-				"",
-			].join("\n"),
+			"\n  # deployment note\n\t; another comment\n\n",
 		);
 
 		const result = bash(
@@ -462,61 +493,18 @@ describe("render_systemd_pin", () => {
 
 		expect(result.exitCode).toBe(0);
 		const rendered = readFileSync(output, "utf8");
-		expect(rendered).toContain(
-			'Environment="GUARD_TOTAL_DEADLINE_MS=900000"',
+		expect(rendered.startsWith("# BEGIN better-ccflare managed deployment\n")).toBe(
+			true,
 		);
-		expect(rendered).toContain(
-			"Environment=GUARD_SHUTDOWN_GRACE_MS=900000",
-		);
-		expect(rendered).toContain("KillMode=mixed");
-		expect(rendered).toContain("TimeoutStopSec=1020s");
-		expect(rendered.match(/GUARD_TOTAL_DEADLINE_MS/g)).toHaveLength(2);
-		expect(rendered.match(/GUARD_SHUTDOWN_GRACE_MS/g)).toHaveLength(2);
-		expect(rendered.match(/^KillMode=/gm)).toHaveLength(2);
-		expect(rendered.match(/^TimeoutStopSec=/gm)).toHaveLength(2);
-	});
-
-	test("migrates the exact live legacy pin to a deployable safe policy", () => {
-		const dir = tempDir();
-		const input = join(dir, "50-pinned-build.conf");
-		const output = join(dir, "pin.rendered.conf");
-		const { guard, policy, runner } = writeDigestFixtures(dir);
-		writeFileSync(
-			input,
-			[
-				"[Service]",
-				"Environment=CCFLARE_BIN=/home/will/.config/better-ccflare/better-ccflare-v3.5.39-ea71c502",
-				"Environment=CCFLARE_CODEX_TRACE_DIR=/home/will/.config/better-ccflare/codex-traces",
-				"Environment=CCFLARE_SHUTDOWN_DRAIN_MS=60000",
-				"Environment=GUARD_SHUTDOWN_GRACE_MS=75000",
-				"TimeoutStopSec=90",
-				"Environment=GUARD_SCRIPT=/home/will/.config/better-ccflare/guards/ea71c502/ccflare-guard.mjs",
-				"Environment=GUARD_SOURCE_ID=ea71c502",
-				"Environment=GUARD_POLICY_ID=pool-exhaustion-finite-recovery-v1",
-				"ExecStart=",
-				"ExecStart=/home/will/.config/better-ccflare/runners/ea71c502/run-ccflare-stack.sh",
-				"",
-			].join("\n"),
-		);
-
-		const result = bash(
-			[
-				`source ${shellQuote(helperScriptForShell)}`,
-				`render_systemd_pin ${shellQuote(shellPath(input))} ${shellQuote(shellPath(output))} /new/bin ${shellQuote(shellPath(runner))} ${shellQuote(shellPath(guard))} abc123 policy-v1 ${shellQuote(shellPath(policy))}`,
-				`validate_deployment_timing ${shellQuote(shellPath(output))}`,
-			].join("\n"),
-		);
-
-		expect(result.exitCode).toBe(0);
-		expect(result.stdout.toString().trim()).toBe("600000 600000 720000");
-		const rendered = readFileSync(output, "utf8");
+		expect(rendered).not.toContain("deployment note");
+		expect(rendered).not.toContain("another comment");
 		expect(rendered).toContain("Environment=GUARD_TOTAL_DEADLINE_MS=600000");
 		expect(rendered).toContain("Environment=GUARD_SHUTDOWN_GRACE_MS=600000");
 		expect(rendered).toContain("KillMode=mixed");
 		expect(rendered).toContain("TimeoutStopSec=720s");
 	});
 
-	test("does not silently rewrite unknown unsafe operator timing", () => {
+	test("rejects duplicate or unbalanced ownership markers", () => {
 		const dir = tempDir();
 		const input = join(dir, "pin.conf");
 		const output = join(dir, "pin.rendered.conf");
@@ -524,25 +512,22 @@ describe("render_systemd_pin", () => {
 		writeFileSync(
 			input,
 			[
+				"# BEGIN better-ccflare managed deployment",
 				"[Service]",
-				"Environment=GUARD_TOTAL_DEADLINE_MS=600000",
-				"Environment=GUARD_SHUTDOWN_GRACE_MS=76000",
-				"KillMode=mixed",
-				"TimeoutStopSec=91s",
-				"",
+				"# BEGIN better-ccflare managed deployment",
+				"# END better-ccflare managed deployment",
 			].join("\n"),
 		);
+
 		const result = bash(
 			[
 				`source ${shellQuote(helperScriptForShell)}`,
 				`render_systemd_pin ${shellQuote(shellPath(input))} ${shellQuote(shellPath(output))} /new/bin ${shellQuote(shellPath(runner))} ${shellQuote(shellPath(guard))} abc123 policy-v1 ${shellQuote(shellPath(policy))}`,
-				`validate_deployment_timing ${shellQuote(shellPath(output))}`,
 			].join("\n"),
 		);
+
 		expect(result.exitCode).not.toBe(0);
-		const rendered = readFileSync(output, "utf8");
-		expect(rendered).toContain("Environment=GUARD_SHUTDOWN_GRACE_MS=76000");
-		expect(rendered).toContain("TimeoutStopSec=91s");
+		expect(result.stderr.toString()).toContain("invalid managed marker structure");
 	});
 });
 
@@ -805,7 +790,7 @@ describe("effective systemd policy validation", () => {
 		const dir = tempDir();
 		const input = join(dir, "pin.conf");
 		const output = join(dir, "pin.rendered.conf");
-		writeFileSync(input, "[Service]\n");
+		writeFileSync(input, "# deploy-owned placeholder\n");
 
 		const result = bash(
 			[
@@ -815,6 +800,9 @@ describe("effective systemd policy validation", () => {
 		);
 
 		expect(result.exitCode).not.toBe(0);
+		expect(result.stderr.toString()).toContain(
+			"sha256_file requires one existing file",
+		);
 	});
 });
 
@@ -1518,6 +1506,41 @@ describe("deployment flow safety contracts", () => {
 		expect(source.match(/\bexit 75\b/g)).toHaveLength(1);
 	});
 
+	test("rejects unmanaged pin content before build or host/systemd mutation", () => {
+		const source = readFileSync(deployScript, "utf8");
+		const lockAcquire = source.indexOf('if ! flock -n 9; then');
+		const preflight = source.indexOf(
+			'validate_deploy_owned_systemd_pin "$PIN"',
+			lockAcquire,
+		);
+		const snapshot = source.indexOf(
+			'create_verified_source_snapshot "$REPO_ROOT"',
+			lockAcquire,
+		);
+		const build = source.indexOf("bun run build", lockAcquire);
+		const binaryInstall = source.indexOf('cp "$BUILT_BIN" "$DEST_BIN"', lockAcquire);
+		const pinBackup = source.indexOf(
+			'sudo cp --preserve=all "$PIN" "$PIN_BACKUP"',
+			lockAcquire,
+		);
+		const effectivePolicyMutation = source.indexOf(
+			"reload_validate_or_restore_systemd_policy",
+			lockAcquire,
+		);
+		const restart = source.indexOf(
+			"sudo systemctl restart ccflare-stack.service",
+			lockAcquire,
+		);
+
+		expect(preflight).toBeGreaterThan(lockAcquire);
+		expect(snapshot).toBeGreaterThan(preflight);
+		expect(build).toBeGreaterThan(preflight);
+		expect(binaryInstall).toBeGreaterThan(preflight);
+		expect(pinBackup).toBeGreaterThan(preflight);
+		expect(effectivePolicyMutation).toBeGreaterThan(preflight);
+		expect(restart).toBeGreaterThan(preflight);
+	});
+
 	test("build and copied runtime artifacts come only from the verified snapshot", () => {
 		const source = readFileSync(deployScript, "utf8");
 		expect(source).toContain(
@@ -1585,7 +1608,10 @@ describe("deployment flow safety contracts", () => {
 			'sudo cp --preserve=all "$PIN" "$PIN_BACKUP"',
 		);
 		const rollbackArmed = source.indexOf("PIN_ROLLBACK_ARMED=1", backup);
-		const pinRender = source.indexOf("render_systemd_pin", backup);
+		const preflight = source.indexOf(
+			'validate_deploy_owned_systemd_pin "$PIN"',
+		);
+		const pinRender = source.indexOf("render_systemd_pin", preflight);
 		const timingValidation = source.indexOf(
 			'validate_deployment_timing "$PIN_RENDERED"',
 			pinRender,
@@ -1609,9 +1635,12 @@ describe("deployment flow safety contracts", () => {
 		const verify = source.indexOf("if ! validate_deploy_health", restart);
 		const hardFailure = source.indexOf("exit 1", verify);
 		expect(backup).toBeGreaterThan(0);
-		expect(pinRender).toBeGreaterThan(backup);
+		expect(preflight).toBeGreaterThan(0);
+		expect(pinRender).toBeGreaterThan(preflight);
 		expect(timingValidation).toBeGreaterThan(pinRender);
+		expect(backup).toBeGreaterThan(timingValidation);
 		expect(pinWrite).toBeGreaterThan(timingValidation);
+		expect(pinWrite).toBeGreaterThan(backup);
 		expect(rollbackArmed).toBeGreaterThan(pinWrite);
 		expect(effectivePolicy).toBeGreaterThan(rollbackArmed);
 		expect(restartAttempted).toBeGreaterThan(effectivePolicy);

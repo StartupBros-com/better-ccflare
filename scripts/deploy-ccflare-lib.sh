@@ -86,6 +86,54 @@ remove_verified_source_snapshot() {
 	git -C "$repository" worktree remove --force "$registered_path"
 }
 
+validate_deploy_owned_systemd_pin() {
+	if [[ "$#" -ne 1 || ! -f "$1" ]]; then
+		echo "validate_deploy_owned_systemd_pin requires an existing systemd drop-in" >&2
+		return 2
+	fi
+
+	local input="$1"
+	local managed_begin="# BEGIN better-ccflare managed deployment"
+	local managed_end="# END better-ccflare managed deployment"
+	awk \
+		-v input="$input" \
+		-v begin="$managed_begin" \
+		-v end="$managed_end" '
+		function guidance() {
+			print "Migrate operator policy to a later drop-in such as /etc/systemd/system/ccflare-stack.service.d/90-operator-policy.conf, then leave 50-pinned-build.conf deploy-owned." > "/dev/stderr"
+		}
+		function fail(message) {
+			print message > "/dev/stderr"
+			guidance()
+			failed = 1
+			exit 1
+		}
+		$0 == begin {
+			if (managed || blocks > 0) {
+				fail("refusing to deploy: " input " has invalid managed marker structure at line " NR ".")
+			}
+			managed = 1
+			blocks += 1
+			next
+		}
+		$0 == end {
+			if (!managed) {
+				fail("refusing to deploy: " input " has invalid managed marker structure at line " NR ".")
+			}
+			managed = 0
+			next
+		}
+		!managed && $0 !~ /^[[:space:]]*([#;].*)?$/ {
+			fail("refusing to deploy: " input " contains unmanaged systemd configuration outside \047" begin "\047 and \047" end "\047 (line " NR ": " $0 ").")
+		}
+		END {
+			if (!failed && managed) {
+				fail("refusing to deploy: " input " has invalid managed marker structure: missing \047" end "\047.")
+			}
+		}
+	' "$input"
+}
+
 render_systemd_pin() {
 	if [[ "$#" -ne 8 ]]; then
 		echo "render_systemd_pin requires: input output binary runner guard source-id policy-id guard-policy-script" >&2
@@ -94,9 +142,15 @@ render_systemd_pin() {
 
 	local input="$1" output="$2" binary="$3" runner="$4"
 	local guard_script="$5" source_id="$6" policy_id="$7" guard_policy_script="$8"
-	local deadline_ms shutdown_grace_ms kill_mode stop_timeout status
+	local deadline_ms=600000 shutdown_grace_ms=600000
+	local kill_mode=mixed stop_timeout=720s
 	local managed_begin="# BEGIN better-ccflare managed deployment"
 	local managed_end="# END better-ccflare managed deployment"
+
+	# This drop-in is a deploy-owned identity document. Operator policy belongs
+	# in a later drop-in, where systemd can merge it explicitly without leaving
+	# stale artifact identity or ExecStart lines beside this managed block.
+	validate_deploy_owned_systemd_pin "$input" || return "$?"
 
 	# Digests are computed at render time from the staged files (guard,
 	# policy, runner) so the pin itself records the identity of what it
@@ -109,50 +163,6 @@ render_systemd_pin() {
 	guard_policy_sha256="$(sha256_file "$guard_policy_script")" || return 2
 	runner_sha256="$(sha256_file "$runner")" || return 2
 
-	deadline_ms="$(configured_systemd_environment_value "$input" GUARD_TOTAL_DEADLINE_MS)" || {
-		status="$?"
-		[[ "$status" == "1" ]] || return "$status"
-		deadline_ms=""
-	}
-	shutdown_grace_ms="$(configured_systemd_environment_value "$input" GUARD_SHUTDOWN_GRACE_MS)" || {
-		status="$?"
-		[[ "$status" == "1" ]] || return "$status"
-		shutdown_grace_ms=""
-	}
-	kill_mode="$(configured_systemd_directive_value "$input" KillMode)" || {
-		status="$?"
-		[[ "$status" == "1" ]] || return "$status"
-		kill_mode=""
-	}
-	stop_timeout="$(configured_systemd_directive_value "$input" TimeoutStopSec)" || {
-		status="$?"
-		[[ "$status" == "1" ]] || return "$status"
-		stop_timeout=""
-	}
-
-	# Migrate only source-controlled legacy defaults known to be unsafe for the
-	# long guard deadline. Unknown or incomplete operator overrides are retained
-	# and rejected by validate_deployment_timing instead of silently rewritten.
-	case "$deadline_ms" in
-		"" | 120000) deadline_ms=600000 ;;
-	esac
-	case "$shutdown_grace_ms" in
-		"" | 75000) shutdown_grace_ms=600000 ;;
-	esac
-	[[ -n "$kill_mode" ]] || kill_mode=mixed
-	case "$stop_timeout" in
-		"" | 90 | 90s | "1min 30s") stop_timeout=720s ;;
-	esac
-
-	awk -v begin="$managed_begin" -v end="$managed_end" '
-		$0 == begin { managed = 1; next }
-		$0 == end { managed = 0; next }
-		!managed { print }
-		END { if (managed) exit 2 }
-	' "$input" >"$output" || return 2
-	if [[ -s "$output" && "$(tail -c 1 "$output" | wc -l)" -eq 0 ]]; then
-		printf '\n' >>"$output"
-	fi
 	{
 		printf '%s\n' "$managed_begin"
 		printf '%s\n' "[Service]"
@@ -170,7 +180,7 @@ render_systemd_pin() {
 		printf '%s\n' "ExecStart="
 		printf 'ExecStart=%s\n' "$runner"
 		printf '%s\n' "$managed_end"
-	} >>"$output"
+	} >"$output"
 }
 
 _configured_systemd_value() {

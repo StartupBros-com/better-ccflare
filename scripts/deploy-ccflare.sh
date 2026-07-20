@@ -27,17 +27,19 @@
 #      checkout is refs/heads/main exactly at refs/remotes/origin/main, HEAD is
 #      an ancestor of that remote tip, the working tree is clean, and package
 #      versions are not behind the highest v* tag already contained in HEAD.
-#   2. Create a detached worktree at the verified SHA, install its locked
-#      dependencies, and build there. The shared checkout is never a build
-#      or runtime-artifact source after verification.
+#   2. Require the pinned-build drop-in to contain no operator policy outside
+#      its deploy-owned markers, then create a detached worktree at the
+#      verified SHA, install its locked dependencies, and build there. The
+#      shared checkout is never a build or runtime-artifact source after
+#      verification.
 #   3. Copy the binary to
 #      /home/will/.config/better-ccflare/better-ccflare-v<version>-<short-sha>
 #      and install the source-controlled guard + policy as an immutable pair
 #      under guards/<full-sha>/.
-#   4. Back up, then atomically upsert the binary and guard identity lines in
-#      the systemd pin
-#      (/etc/systemd/system/ccflare-stack.service.d/50-pinned-build.conf),
-#      preserving every other Environment= line in that drop-in.
+#   4. Back up, then atomically replace the deploy-owned systemd pin
+#      (/etc/systemd/system/ccflare-stack.service.d/50-pinned-build.conf).
+#      Operator policy must live in a later drop-in such as
+#      90-operator-policy.conf.
 #   5. `systemctl daemon-reload && systemctl restart ccflare-stack.service`.
 #   6. Poll both proxy and guard health endpoints until they respond.
 #   7. Require exact binary SHA, guard source ID, and guard policy ID matches.
@@ -302,6 +304,12 @@ if ! flock -n 9; then
 	exit 75
 fi
 
+# Validate ownership before an expensive build or any host artifact/systemd
+# mutation. render_systemd_pin repeats this validation immediately before the
+# pin backup so a change made while the immutable source snapshot builds is
+# also rejected rather than silently discarded.
+validate_deploy_owned_systemd_pin "$PIN"
+
 # ---------------------------------------------------------------------------
 # 2) Build
 # ---------------------------------------------------------------------------
@@ -413,16 +421,14 @@ for digest_pair in \
 done
 
 # ---------------------------------------------------------------------------
-# 4) Update the systemd pin atomically, preserving every other line
+# 4) Replace the deploy-owned systemd pin atomically
 # ---------------------------------------------------------------------------
 echo "==> Updating systemd pin ($PIN)…"
 # Capture the pre-deploy runtime before arming rollback. A legacy first
-# migration may not expose complete runtime identity; deployment can proceed,
-# but any later rollback will hard-fail rather than claim an unproven restore.
+# deployment may not expose complete runtime identity; any later rollback will
+# hard-fail rather than claim an unproven restore.
 PRIOR_PROXY_HEALTH_JSON="$(curl -sf "$HEALTH_URL" 2>/dev/null || true)"
 PRIOR_GUARD_HEALTH_JSON="$(curl -sf "$GUARD_HEALTH_URL" 2>/dev/null || true)"
-PIN_BACKUP="${PIN}.bak-$(date -u +%Y%m%dT%H%M%SZ)-${SHORT}"
-sudo cp --preserve=all "$PIN" "$PIN_BACKUP"
 
 PIN_RENDERED="$(mktemp)"
 render_systemd_pin \
@@ -445,6 +451,9 @@ read -r \
 	CONFIGURED_GUARD_TOTAL_DEADLINE_MS \
 	CONFIGURED_GUARD_SHUTDOWN_GRACE_MS \
 	CONFIGURED_STOP_TIMEOUT_MS <<<"$CONFIGURED_DEPLOYMENT_TIMING"
+
+PIN_BACKUP="${PIN}.bak-$(date -u +%Y%m%dT%H%M%SZ)-${SHORT}"
+sudo cp --preserve=all "$PIN" "$PIN_BACKUP"
 
 PIN_STAGED="${PIN}.new-${SHORT}-$$"
 sudo cp --preserve=all "$PIN" "$PIN_STAGED"
