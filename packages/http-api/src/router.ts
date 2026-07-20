@@ -1,6 +1,12 @@
 import { validateNumber } from "@better-ccflare/core";
 import { BadRequest, Unauthorized } from "@better-ccflare/errors";
 import {
+	getCachePacingRouteStats,
+	getCachePacingStats,
+	handleCacheDiagnosisRequest,
+	readCachePacingMs,
+} from "@better-ccflare/proxy";
+import {
 	createAccountAddHandler,
 	createAccountAutoFallbackHandler,
 	createAccountAutoPauseOnOverageHandler,
@@ -443,6 +449,16 @@ export class APIRouter {
 		this.handlers.set("GET:/api/debug/heap", () => heapStatsHandler());
 		this.handlers.set("GET:/api/debug/snapshot", () => heapSnapshotHandler());
 		this.handlers.set("GET:/api/debug/rss", () => rssHandler());
+		this.handlers.set("POST:/api/debug/cache-diagnosis", (req) =>
+			handleCacheDiagnosisRequest(req),
+		);
+		this.handlers.set("GET:/api/debug/cache-pacing", () =>
+			Response.json({
+				pacing_ms: readCachePacingMs(),
+				families: getCachePacingStats(),
+				routes: getCachePacingRouteStats(),
+			}),
+		);
 
 		// API Key routes
 		this.handlers.set("GET:/api/api-keys", () => apiKeysListHandler());

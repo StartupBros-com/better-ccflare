@@ -139,6 +139,45 @@ describe("Codex pacing bypass cohort", () => {
 });
 
 describe("acquireCachePacing", () => {
+	test("uses an opaque coordination key and exposes no raw session material", async () => {
+		process.env[CACHE_PACING_MS_ENV] = "5000";
+		const rawSession = "raw-private-session-key";
+		const rawModel = "claude-private-model-marker";
+		const observation = await observeCachePacing({
+			sessionKey: rawSession,
+			model: rawModel,
+		});
+
+		expect(observation?.key).toMatch(/^pacing_[a-f0-9]{64}$/);
+		expect(observation?.key).not.toContain(rawSession);
+		expect(observation?.key).not.toContain(rawModel);
+		expect(observation?.slot?.key).toBe(observation?.key);
+		expect(JSON.stringify(getCachePacingStats())).not.toContain(rawSession);
+		expect(JSON.stringify(getCachePacingRouteStats())).not.toContain(
+			rawSession,
+		);
+		observation?.slot?.abandon();
+	});
+
+	test("preserves one coordination cohort for omitted, null, and empty models", async () => {
+		process.env[CACHE_PACING_MS_ENV] = "5000";
+		const omitted = await observeCachePacing({ sessionKey: "same-session" });
+		omitted?.slot?.abandon();
+		const nullModel = await observeCachePacing({
+			sessionKey: "same-session",
+			model: null,
+		});
+		nullModel?.slot?.abandon();
+		const emptyModel = await observeCachePacing({
+			sessionKey: "same-session",
+			model: "",
+		});
+		emptyModel?.slot?.abandon();
+
+		expect(omitted?.key).toBe(nullModel?.key);
+		expect(nullModel?.key).toBe(emptyModel?.key);
+	});
+
 	test("returns null when disabled or session missing", async () => {
 		expect(
 			await acquireCachePacing({ sessionKey: "s1", model: "m" }),

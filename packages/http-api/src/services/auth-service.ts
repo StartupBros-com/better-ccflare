@@ -3,7 +3,7 @@ import {
 	type ApiKey,
 	type ApiKeyRole,
 	NodeCryptoUtils,
-} from "@better-ccflare/types";
+} from "@better-ccflare/types/api-key";
 import { extractApiKey } from "./extract-api-key";
 
 export interface AuthenticationResult {

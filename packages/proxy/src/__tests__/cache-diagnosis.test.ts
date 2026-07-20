@@ -1,11 +1,10 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, mock, test } from "bun:test";
 import {
-	buildDiagnosisReplay,
 	CACHE_DIAG_ENV,
+	handleCacheDiagnosisRequest,
 	listDiagnosisSessions,
 	recordDiagnosisCandidate,
 	resetCacheDiagnosis,
-	runCacheDiagnosis,
 } from "../cache-diagnosis";
 
 afterEach(() => {
@@ -32,109 +31,108 @@ function capture(session: string, marker: string): void {
 		}),
 		new Headers({
 			"anthropic-version": "2023-06-01",
-			"anthropic-beta": "existing-beta",
+			"anthropic-beta": "sensitive-beta",
 			authorization: "Bearer secret",
-			"x-better-ccflare-request-id": "internal",
+			"x-raw-session": session,
 		}),
 	);
 }
 
-describe("recordDiagnosisCandidate", () => {
-	test("no capture when disabled", () => {
-		capture("s1", "a");
+describe("privacy-safe cache diagnosis metadata", () => {
+	test("does not retain anything when disabled", () => {
+		capture("raw-session-key", "raw prompt body");
 		expect(listDiagnosisSessions()).toEqual([]);
 	});
 
-	test("captures pairs, shifting last to prev", () => {
+	test("tracks only opaque bounded metadata, never request material", () => {
 		process.env[CACHE_DIAG_ENV] = "1";
-		capture("s1", "first");
-		expect(listDiagnosisSessions()[0].has_pair).toBe(false);
-		capture("s1", "second");
-		expect(listDiagnosisSessions()[0].has_pair).toBe(true);
-	});
+		const rawSession = "raw-session-key-that-must-not-be-retained";
+		const rawBody = "private prompt that must not be retained";
 
-	test("evicts oldest session beyond the cap", () => {
-		process.env[CACHE_DIAG_ENV] = "1";
-		for (let i = 0; i < 9; i++) capture(`session-${i}`, "x");
+		capture(rawSession, rawBody);
+		capture(rawSession, `${rawBody} second turn`);
+
 		const sessions = listDiagnosisSessions();
-		expect(sessions.length).toBe(8);
-		expect(
-			sessions.some((s) => s.session_preview.startsWith("session-0")),
-		).toBe(false);
+		expect(sessions).toHaveLength(1);
+		expect(sessions[0]?.session_id).toMatch(/^diag_[a-f0-9]{64}$/);
+		expect(sessions[0]?.request_count).toBe(2);
+		expect(sessions[0]?.has_pair).toBe(true);
+
+		const exposed = JSON.stringify(sessions);
+		expect(exposed).not.toContain(rawSession);
+		expect(exposed).not.toContain(rawBody);
+		expect(exposed).not.toContain("Bearer secret");
+		expect(exposed).not.toContain("sensitive-beta");
+	});
+
+	test("evicts the least-recent session beyond the fixed cap", () => {
+		process.env[CACHE_DIAG_ENV] = "1";
+		capture("session-0", "first");
+		const evictedId = listDiagnosisSessions()[0]?.session_id;
+		for (let i = 1; i < 9; i++) capture(`session-${i}`, `prompt-${i}`);
+
+		const sessions = listDiagnosisSessions();
+		expect(sessions).toHaveLength(8);
+		expect(sessions.some((session) => session.session_id === evictedId)).toBe(
+			false,
+		);
+	});
+
+	test("reset removes all retained metadata", () => {
+		process.env[CACHE_DIAG_ENV] = "1";
+		capture("session", "prompt");
+		expect(listDiagnosisSessions()).toHaveLength(1);
+		resetCacheDiagnosis();
+		expect(listDiagnosisSessions()).toEqual([]);
 	});
 });
 
-describe("buildDiagnosisReplay", () => {
-	test("patches replay fields and strips secrets while merging betas", () => {
+describe("cache diagnosis debug endpoint", () => {
+	test("is metadata-only and never performs an inference replay", async () => {
 		process.env[CACHE_DIAG_ENV] = "1";
-		capture("s1", "first");
-		const replay = buildDiagnosisReplay(
-			{
-				body: encode({ model: "m", max_tokens: 5, stream: true }),
-				headers: [
-					["anthropic-version", "2023-06-01"],
-					["anthropic-beta", "existing-beta"],
-				],
-				capturedAt: Date.now(),
-			},
-			"msg_prev",
-		);
-		expect(replay).not.toBeNull();
-		if (!replay) throw new Error("unreachable");
-		const body = JSON.parse(replay.body);
-		expect(body.max_tokens).toBe(1);
-		expect(body.stream).toBe(false);
-		expect(body.diagnostics).toEqual({ previous_message_id: "msg_prev" });
-		expect(replay.headers.get("anthropic-beta")).toBe(
-			"existing-beta,cache-diagnosis-2026-04-07",
-		);
-		expect(replay.headers.get("x-better-ccflare-keepalive")).toBe("true");
-		expect(replay.headers.get("authorization")).toBeNull();
-	});
-});
+		const rawSession = "session-that-must-stay-private";
+		const rawBody = "prompt-that-must-stay-private";
+		capture(rawSession, rawBody);
 
-describe("runCacheDiagnosis", () => {
-	test("chains previous_message_id and returns diagnostics", async () => {
-		process.env[CACHE_DIAG_ENV] = "1";
-		capture("s1", "first");
-		capture("s1", "second");
-
-		const seen: Array<Record<string, unknown>> = [];
-		const fetchImpl = (async (_url: unknown, init?: RequestInit) => {
-			const body = JSON.parse(String(init?.body));
-			seen.push(body);
-			const isSecond = seen.length === 2;
-			return new Response(
-				JSON.stringify({
-					id: isSecond ? "msg_2" : "msg_1",
-					usage: { input_tokens: 10 },
-					diagnostics: isSecond ? { verdict: "prefix-divergence" } : null,
+		const originalFetch = globalThis.fetch;
+		const fetchSpy = mock(async () => {
+			throw new Error("cache diagnosis must never call fetch");
+		}) as unknown as typeof fetch;
+		globalThis.fetch = fetchSpy;
+		try {
+			const response = await handleCacheDiagnosisRequest(
+				new Request("http://localhost/api/debug/cache-diagnosis", {
+					method: "POST",
+					body: JSON.stringify({ session: rawSession, body: rawBody }),
 				}),
-				{ status: 200 },
 			);
-		}) as typeof fetch;
+			expect(response.status).toBe(200);
+			const payload = await response.json();
+			expect(payload.status).toBe("metadata_only");
+			expect(payload.replay_enabled).toBe(false);
+			expect(payload.sessions).toHaveLength(1);
+			expect(fetchSpy).not.toHaveBeenCalled();
 
-		const result = await runCacheDiagnosis({ port: 1234, fetchImpl });
-		expect(seen.length).toBe(2);
-		expect(seen[0].diagnostics).toEqual({ previous_message_id: null });
-		expect(seen[1].diagnostics).toEqual({ previous_message_id: "msg_1" });
-		// First replay uses the older snapshot, second the newer.
-		expect((seen[0].messages as Array<{ content: string }>)[0].content).toBe(
-			"first",
-		);
-		expect((seen[1].messages as Array<{ content: string }>)[0].content).toBe(
-			"second",
-		);
-		expect(result.pair).toBe(true);
-		expect(result.second.diagnostics).toEqual({
-			verdict: "prefix-divergence",
-		});
+			const exposed = JSON.stringify(payload);
+			expect(exposed).not.toContain(rawSession);
+			expect(exposed).not.toContain(rawBody);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
 	});
 
-	test("throws a helpful error with nothing captured", async () => {
-		process.env[CACHE_DIAG_ENV] = "1";
-		await expect(runCacheDiagnosis({ port: 1 })).rejects.toThrow(
-			/no captured session/,
+	test("reports disabled without reading or replaying the request", async () => {
+		const response = await handleCacheDiagnosisRequest(
+			new Request("http://localhost/api/debug/cache-diagnosis", {
+				method: "POST",
+				body: "not-json-and-must-not-be-read",
+			}),
 		);
+		expect(response.status).toBe(409);
+		expect(await response.json()).toEqual({
+			status: "disabled",
+			replay_enabled: false,
+			sessions: [],
+		});
 	});
 });
