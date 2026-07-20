@@ -39,6 +39,23 @@ export const DEFAULT_GUARD_DELAY_INSPECTION_TIMEOUT_MS = 5_000;
 export const DEFAULT_GUARD_ALLOW_LEGACY_POOL_BODY = false;
 export const GUARD_REQUEST_ID_HEADER = "x-better-ccflare-guard-request-id";
 
+// Bound the only response-content state retained by the guard. The observer
+// never logs event data (which can include provider or user content); it emits
+// only the fixed event name and a strictly validated error-type token.
+const MAX_SSE_OUTCOME_EVENT_BYTES = 16 * 1_024;
+const SAFE_SSE_ERROR_TYPES = new Set([
+	"api_error",
+	"authentication_error",
+	"billing_error",
+	"invalid_request_error",
+	"not_found_error",
+	"overloaded_error",
+	"permission_error",
+	"rate_limit_error",
+	"service_unavailable_error",
+	"timeout_error",
+]);
+
 const HOP_BY_HOP_HEADERS = new Set([
 	"connection",
 	"keep-alive",
@@ -257,10 +274,222 @@ function isLimitedPath(req) {
 	);
 }
 
+function requiresAnthropicMessageStop(req) {
+	return (req.url || "").split("?", 1)[0] === "/v1/messages";
+}
+
 function responseBodyIdleTimeoutError() {
 	const error = new Error("upstream response body idle timeout");
 	error.code = "GUARD_RESPONSE_IDLE_TIMEOUT";
 	return error;
+}
+
+function isEventStreamResponse(response) {
+	return (
+		response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase() ===
+		"text/event-stream"
+	);
+}
+
+function semanticErrorTypeFromData(data) {
+	try {
+		const payload = JSON.parse(data);
+		const candidate = payload?.error?.type ?? payload?.type;
+		return typeof candidate === "string" && SAFE_SSE_ERROR_TYPES.has(candidate)
+			? candidate
+			: "unknown_error";
+	} catch {
+		return "unknown_error";
+	}
+}
+
+/**
+ * Incrementally recognizes SSE field framing without retaining response
+ * content beyond one bounded event. A string such as "event: error" inside a
+ * data field cannot trigger this observer: only an actual `event` field on a
+ * dispatched SSE event is considered.
+ */
+function createSseOutcomeObserver({ requireMessageStop = false } = {}) {
+	const decoder = new TextDecoder();
+	let pendingLine = "";
+	let eventName = "";
+	let eventData = "";
+	let eventBytes = 0;
+	let dataLineSeen = false;
+	let parserDisabled = false;
+	let malformedSeen = false;
+	let limitExceeded = false;
+	let messageStopSeen = false;
+	let errorType = null;
+	let finished = false;
+
+	const resetEvent = () => {
+		eventName = "";
+		eventData = "";
+		eventBytes = 0;
+		dataLineSeen = false;
+	};
+
+	const disableParserForLimit = () => {
+		parserDisabled = true;
+		limitExceeded = true;
+		pendingLine = "";
+		resetEvent();
+	};
+
+	const dispatchEvent = () => {
+		let payload;
+		let payloadType;
+		if (dataLineSeen) {
+			try {
+				payload = JSON.parse(eventData);
+				payloadType =
+					typeof payload === "object" && payload !== null
+						? payload.type
+						: undefined;
+			} catch {
+				malformedSeen = true;
+			}
+		}
+		if (
+			eventName !== "" &&
+			typeof payloadType === "string" &&
+			eventName !== payloadType
+		) {
+			malformedSeen = true;
+		}
+		const resolvedType =
+			eventName || (typeof payloadType === "string" ? payloadType : "");
+
+		if (eventName === "error") {
+			errorType ??= semanticErrorTypeFromData(eventData);
+		} else if (resolvedType === "message_stop") {
+			const validMessageStop =
+				dataLineSeen &&
+				typeof payload === "object" &&
+				payload !== null &&
+				payloadType === "message_stop" &&
+				(eventName === "" || eventName === "message_stop");
+			if (validMessageStop) messageStopSeen = true;
+			else malformedSeen = true;
+		}
+		resetEvent();
+	};
+
+	const consumeLine = (rawLine) => {
+		const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+		if (line === "") {
+			dispatchEvent();
+			return;
+		}
+		if (line.startsWith(":")) return;
+
+		const colon = line.indexOf(":");
+		const field = colon === -1 ? line : line.slice(0, colon);
+		let value = colon === -1 ? "" : line.slice(colon + 1);
+		if (value.startsWith(" ")) value = value.slice(1);
+		if (field === "event") {
+			const valueBytes = Buffer.byteLength(value);
+			if (eventBytes + valueBytes > MAX_SSE_OUTCOME_EVENT_BYTES) {
+				disableParserForLimit();
+				return;
+			}
+			eventName = value;
+			eventBytes += valueBytes;
+			return;
+		}
+		if (field !== "data") return;
+
+		const separatorBytes = dataLineSeen ? 1 : 0;
+		const valueBytes = Buffer.byteLength(value);
+		if (
+			eventBytes + separatorBytes + valueBytes >
+			MAX_SSE_OUTCOME_EVENT_BYTES
+		) {
+			disableParserForLimit();
+			return;
+		}
+		eventData += `${dataLineSeen ? "\n" : ""}${value}`;
+		dataLineSeen = true;
+		eventBytes += separatorBytes + valueBytes;
+	};
+
+	const consumeText = (text) => {
+		if (parserDisabled) return;
+		let start = 0;
+		while (true) {
+			const newline = text.indexOf("\n", start);
+			if (newline === -1) break;
+			const fragment = text.slice(start, newline);
+			const completeLine = pendingLine + fragment;
+			pendingLine = "";
+			if (Buffer.byteLength(completeLine) > MAX_SSE_OUTCOME_EVENT_BYTES) {
+				disableParserForLimit();
+				return;
+			}
+			consumeLine(completeLine);
+			if (parserDisabled) return;
+			start = newline + 1;
+		}
+
+		const tail = text.slice(start);
+		if (tail === "") return;
+		if (
+			Buffer.byteLength(pendingLine) + Buffer.byteLength(tail) >
+			MAX_SSE_OUTCOME_EVENT_BYTES
+		) {
+			disableParserForLimit();
+			return;
+		}
+		pendingLine += tail;
+	};
+
+	return {
+		record(chunk) {
+			if (parserDisabled) return;
+			consumeText(decoder.decode(chunk, { stream: true }));
+		},
+		finish() {
+			finished = true;
+			if (!parserDisabled) consumeText(decoder.decode());
+			// A terminal-looking tail is not protocol evidence: SSE dispatch requires
+			// a blank line. Retain only the fact that framing was incomplete.
+			if (
+				!parserDisabled &&
+				(pendingLine.trim() !== "" ||
+					eventName !== "" ||
+					dataLineSeen)
+			) {
+				malformedSeen = true;
+			}
+			pendingLine = "";
+			resetEvent();
+		},
+		snapshot() {
+			const semanticParseState = limitExceeded
+				? "limit_exceeded"
+				: malformedSeen
+					? "malformed"
+					: "clean";
+			if (errorType !== null) {
+				return {
+						semanticEvent: "error",
+						semanticErrorType: errorType,
+						semanticParseState,
+					};
+			}
+			if (requireMessageStop && finished && !messageStopSeen) {
+				return {
+					semanticEvent: "incomplete_eof",
+					semanticErrorType: "anthropic_incomplete_eof",
+					semanticParseState,
+				};
+			}
+			return semanticParseState === "clean"
+				? {}
+				: { semanticParseState };
+		},
+	};
 }
 
 function createRawResponseTelemetry(attemptStartedAt, now) {
@@ -269,8 +498,12 @@ function createRawResponseTelemetry(attemptStartedAt, now) {
 	let firstChunkAt = null;
 	let lastChunkAt = null;
 	let maxInterChunkGapMs = 0;
+	let sseOutcomeObserver = null;
 
 	return {
+		enableSseOutcomeObservation(options) {
+			sseOutcomeObserver ??= createSseOutcomeObserver(options);
+		},
 		record(chunk) {
 			const observedAt = now();
 			if (firstChunkAt == null) firstChunkAt = observedAt;
@@ -283,6 +516,10 @@ function createRawResponseTelemetry(attemptStartedAt, now) {
 			lastChunkAt = observedAt;
 			rawResponseChunkCount += 1;
 			rawResponseBytes += chunk?.byteLength ?? chunk?.length ?? 0;
+			sseOutcomeObserver?.record(chunk);
+		},
+		finish() {
+			sseOutcomeObserver?.finish();
 		},
 		snapshot() {
 			const observedAt = now();
@@ -296,18 +533,28 @@ function createRawResponseTelemetry(attemptStartedAt, now) {
 				maxInterChunkGapMs,
 				lastChunkAgeMs:
 					lastChunkAt == null ? null : Math.max(0, observedAt - lastChunkAt),
+				...sseOutcomeObserver?.snapshot(),
 			};
 		},
 	};
 }
 
-function withRawResponseTelemetry(response, telemetry) {
-	if (!response.body) return response;
+function withRawResponseTelemetry(response, telemetry, options = {}) {
+	if (isEventStreamResponse(response)) {
+		telemetry.enableSseOutcomeObservation(options);
+	}
+	if (!response.body) {
+		telemetry.finish();
+		return response;
+	}
 	const body = response.body.pipeThrough(
 		new TransformStream({
 			transform(chunk, controller) {
 				telemetry.record(chunk);
 				controller.enqueue(chunk);
+			},
+			flush() {
+				telemetry.finish();
 			},
 		}),
 	);
@@ -1022,6 +1269,9 @@ export function createGuard(options = {}) {
 							id,
 						),
 						responseTelemetry,
+						{
+							requireMessageStop: requiresAnthropicMessageStop(req),
+						},
 					);
 				} catch (error) {
 					lease.release();
@@ -1037,7 +1287,6 @@ export function createGuard(options = {}) {
 				// failure, the outer catch below records the real stop cause.
 				if (upstreamResponse.status !== 503) {
 					recordForwardedStatus(upstreamResponse.status);
-					const outcome = outcomeForStatus(upstreamResponse.status);
 					try {
 						await sendFinalResponse(
 							res,
@@ -1048,6 +1297,13 @@ export function createGuard(options = {}) {
 					} finally {
 						lease.release();
 					}
+					const telemetryFields =
+						rawResponseTelemetryFields(responseTelemetry);
+					const outcome =
+						telemetryFields.semanticEvent === "error" ||
+						telemetryFields.semanticEvent === "incomplete_eof"
+							? "final_error"
+							: outcomeForStatus(upstreamResponse.status);
 					if (outcome === "success") {
 						counters.success += 1;
 					} else {
@@ -1060,7 +1316,7 @@ export function createGuard(options = {}) {
 						outcome,
 						queuedMs: lease.queuedMs,
 						elapsedMs: now() - context.acceptedAt,
-						...rawResponseTelemetryFields(responseTelemetry),
+						...telemetryFields,
 					});
 					return;
 				}

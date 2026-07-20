@@ -21,8 +21,22 @@ export interface RateLimitInfo {
 	reason?: RateLimitReason;
 }
 
+/**
+ * Describes how a provider carries the selected physical model into transport.
+ *
+ * Cache keepalive replays always retain the normalized, pre-transform source
+ * body. Providers that put the model in that source-derived transport (for
+ * example a URL path) need no additional mutation. Providers whose transform
+ * writes a model into the final JSON body may remap a previously selected
+ * fallback and therefore require the proxy to re-assert it after transform.
+ */
+export type CacheReplayModelStrategy = "normalized-source" | "transformed-body";
+
 export interface Provider {
 	name: string;
+
+	/** How exact physical models are preserved during cache keepalive replay. */
+	readonly cacheReplayModelStrategy?: CacheReplayModelStrategy;
 
 	/**
 	 * Check if this provider can handle the given request path

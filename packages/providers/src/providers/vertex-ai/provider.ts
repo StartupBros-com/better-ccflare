@@ -40,6 +40,7 @@ function convertToVertexAIModel(anthropicModel: string): string {
 }
 
 export class VertexAIProvider extends BaseAnthropicCompatibleProvider {
+	override readonly cacheReplayModelStrategy = "normalized-source" as const;
 	private auth: GoogleAuth;
 
 	constructor(config?: Partial<AnthropicCompatibleConfig>) {

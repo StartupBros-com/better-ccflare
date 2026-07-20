@@ -177,8 +177,9 @@ function extractUsageFromJson(
 		state.usage.cacheReadInputTokens = usageObj.cache_read_input_tokens;
 		state.usage.cacheReadInputTokensPresent = true;
 	}
-	state.usage.cacheCreationInputTokens =
-		usageObj.cache_creation_input_tokens ?? 0;
+	if (usageObj.cache_creation_input_tokens !== undefined) {
+		state.usage.cacheCreationInputTokens = usageObj.cache_creation_input_tokens;
+	}
 	state.usage.outputTokens = usageObj.output_tokens ?? 0;
 
 	// Calculate total tokens
@@ -213,8 +214,10 @@ function extractUsageFromData(
 					state.usage.cacheReadInputTokens = usage.cache_read_input_tokens;
 					state.usage.cacheReadInputTokensPresent = true;
 				}
-				state.usage.cacheCreationInputTokens =
-					usage.cache_creation_input_tokens || 0;
+				if (usage.cache_creation_input_tokens !== undefined) {
+					state.usage.cacheCreationInputTokens =
+						usage.cache_creation_input_tokens;
+				}
 				state.usage.outputTokens = usage.output_tokens || 0;
 			}
 			if (parsed.message?.model) {
@@ -247,6 +250,10 @@ function extractUsageFromData(
 					state.usage.cacheReadInputTokens =
 						parsed.usage.cache_read_input_tokens;
 					state.usage.cacheReadInputTokensPresent = true;
+				}
+				if (parsed.usage.cache_creation_input_tokens !== undefined) {
+					state.usage.cacheCreationInputTokens =
+						parsed.usage.cache_creation_input_tokens;
 				}
 				return; // No further processing needed
 			}
@@ -883,6 +890,11 @@ export class UsageCollector {
 			startMessage.originalModel,
 			startMessage.appliedModel,
 		);
+		const inclusivePromptTokens = state.usage.inputTokensPresent
+			? (state.usage.inputTokens ?? 0) +
+				(state.usage.cacheReadInputTokens ?? 0) +
+				(state.usage.cacheCreationInputTokens ?? 0)
+			: undefined;
 		// No preliminary INSERT needed — dashboard tracks pending requests via SSE events, not DB queries.
 		this.asyncWriter.enqueue(async () => {
 			try {
@@ -899,10 +911,7 @@ export class UsageCollector {
 					state.usage.model
 						? {
 								model: state.usage.model,
-								promptTokens:
-									(state.usage.inputTokens || 0) +
-									(state.usage.cacheReadInputTokens || 0) +
-									(state.usage.cacheCreationInputTokens || 0),
+								promptTokens: inclusivePromptTokens,
 								completionTokens: state.usage.outputTokens,
 								totalTokens: state.usage.totalTokens,
 								costUsd: state.usage.costUsd,
@@ -1052,7 +1061,7 @@ export class UsageCollector {
 			responseTimeMs: responseTime,
 			failoverAttempts: startMessage.failoverAttempts,
 			model: state.usage.model,
-			promptTokens: state.usage.inputTokens,
+			promptTokens: inclusivePromptTokens,
 			completionTokens: state.usage.outputTokens,
 			totalTokens: state.usage.totalTokens,
 			inputTokens: state.usage.inputTokens,
@@ -1077,6 +1086,8 @@ export class UsageCollector {
 		cacheBodyStore.onSummary(
 			startMessage.requestId,
 			state.usage.cacheCreationInputTokens,
+			msg.success,
+			state.usage.cacheReadInputTokens,
 		);
 		this.onSummary(summary);
 	}

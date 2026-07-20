@@ -1,5 +1,10 @@
 import type { Account } from "@better-ccflare/types";
-import type { Provider, RateLimitInfo, TokenRefreshResult } from "./types";
+import type {
+	CacheReplayModelStrategy,
+	Provider,
+	RateLimitInfo,
+	TokenRefreshResult,
+} from "./types";
 
 /**
  * Standard 429 + Retry-After classification, shared by any provider whose
@@ -35,6 +40,13 @@ export function parseStandardRetryAfter429(response: Response): RateLimitInfo {
 
 export abstract class BaseProvider implements Provider {
 	abstract name: string;
+
+	/**
+	 * Safe default: the normalized source already carries the selected model.
+	 * Body-model providers opt in to post-transform exact-model enforcement.
+	 */
+	readonly cacheReplayModelStrategy: CacheReplayModelStrategy =
+		"normalized-source";
 
 	/**
 	 * Check if this provider can handle the given request path

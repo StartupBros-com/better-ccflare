@@ -8,6 +8,7 @@ import {
 	convertAnthropicPathToOpenAI,
 	convertAnthropicRequestToOpenAI,
 	convertOpenAIResponseToAnthropic,
+	normalizeOpenAIInputUsage,
 	type OpenAIRequest,
 	sanitizeHeaders,
 	transformStreamingResponse,
@@ -20,6 +21,7 @@ const log = new Logger("OpenAICompatibleProvider");
 
 export class OpenAICompatibleProvider extends BaseProvider {
 	name = "openai-compatible";
+	override readonly cacheReplayModelStrategy = "transformed-body" as const;
 
 	canHandle(_path: string): boolean {
 		return true;
@@ -263,10 +265,8 @@ export class OpenAICompatibleProvider extends BaseProvider {
 
 				if (!json.usage) return null;
 
-				const promptTokens = json.usage.prompt_tokens || 0;
-				const completionTokens = json.usage.completion_tokens || 0;
-				const totalTokens =
-					json.usage.total_tokens || promptTokens + completionTokens;
+				const rawPromptTokens = json.usage.prompt_tokens;
+				const completionTokens = json.usage.completion_tokens ?? 0;
 
 				// Extract cache statistics from prompt_tokens_details (Qwen/DashScope)
 				const promptTokensDetails = json.usage.prompt_tokens_details as
@@ -276,9 +276,14 @@ export class OpenAICompatibleProvider extends BaseProvider {
 					  }
 					| undefined;
 
-				const cacheCreationInputTokens =
-					promptTokensDetails?.cache_creation_input_tokens || 0;
-				const cacheReadInputTokens = promptTokensDetails?.cached_tokens || 0;
+				const normalizedInput = normalizeOpenAIInputUsage(
+					rawPromptTokens,
+					promptTokensDetails?.cached_tokens,
+					promptTokensDetails?.cache_creation_input_tokens,
+				);
+				const promptTokens = normalizedInput.totalInputTokens;
+				const totalTokens =
+					json.usage.total_tokens ?? promptTokens + completionTokens;
 
 				// Calculate cost using OpenAI-compatible pricing
 				const costUsd = this.calculateCost(
@@ -293,10 +298,10 @@ export class OpenAICompatibleProvider extends BaseProvider {
 					completionTokens,
 					totalTokens,
 					costUsd,
-					inputTokens: promptTokens,
+					inputTokens: normalizedInput.inputTokens,
 					outputTokens: completionTokens,
-					cacheReadInputTokens,
-					cacheCreationInputTokens,
+					cacheReadInputTokens: normalizedInput.cacheReadInputTokens,
+					cacheCreationInputTokens: normalizedInput.cacheCreationInputTokens,
 				};
 			}
 		} catch {

@@ -285,7 +285,43 @@ describe("transformStreamingResponse — text responses", () => {
 		expect(msgDelta).toBeDefined();
 		if (!msgDelta) throw new Error("expected message_delta event");
 
-		expect(parseEventData(msgDelta).usage.cache_read_input_tokens).toBe(12);
+		expect(parseEventData(msgDelta).usage).toEqual({
+			input_tokens: 8,
+			output_tokens: 5,
+			cache_read_input_tokens: 12,
+		});
+	});
+
+	it("normalizes cache reads and writes out of inclusive prompt tokens", async () => {
+		const upstream = makeOpenAIStream([
+			JSON.stringify({
+				id: "c1",
+				model: "qwen-plus",
+				choices: [{ index: 0, delta: { content: "Hi" }, finish_reason: null }],
+				usage: {
+					prompt_tokens: 20,
+					completion_tokens: 5,
+					prompt_tokens_details: {
+						cached_tokens: 12,
+						cache_creation_input_tokens: 3,
+					},
+				},
+			}),
+			"[DONE]",
+		]);
+		const transformed = transformStreamingResponse(upstream);
+		const raw = await readStream(transformed.body);
+		const events = parseSSEEvents(raw);
+		const msgDelta = events.find((event) => event.event === "message_delta");
+		expect(msgDelta).toBeDefined();
+		if (!msgDelta) throw new Error("expected message_delta event");
+
+		expect(parseEventData(msgDelta).usage).toEqual({
+			input_tokens: 5,
+			output_tokens: 5,
+			cache_read_input_tokens: 12,
+			cache_creation_input_tokens: 3,
+		});
 	});
 
 	it("preserves an explicit zero cached-token count", async () => {
@@ -313,6 +349,7 @@ describe("transformStreamingResponse — text responses", () => {
 			"cache_read_input_tokens",
 			0,
 		);
+		expect(parseEventData(msgDelta).usage.input_tokens).toBe(20);
 	});
 
 	it("omits cache usage when upstream cache details are absent", async () => {
@@ -335,6 +372,42 @@ describe("transformStreamingResponse — text responses", () => {
 		expect(parseEventData(msgDelta).usage).not.toHaveProperty(
 			"cache_read_input_tokens",
 		);
+	});
+
+	it.each([
+		{ label: "missing", promptTokens: undefined },
+		{ label: "invalid", promptTokens: -1 },
+	])("keeps positive cache details unknown when prompt tokens are $label", async ({
+		promptTokens,
+	}) => {
+		const usage: Record<string, unknown> = {
+			completion_tokens: 5,
+			prompt_tokens_details: {
+				cached_tokens: 12,
+				cache_creation_input_tokens: 3,
+			},
+		};
+		if (promptTokens !== undefined) usage.prompt_tokens = promptTokens;
+		const upstream = makeOpenAIStream([
+			JSON.stringify({
+				id: "c1",
+				model: "qwen-plus",
+				choices: [{ index: 0, delta: { content: "Hi" }, finish_reason: null }],
+				usage,
+			}),
+			"[DONE]",
+		]);
+		const transformed = transformStreamingResponse(upstream);
+		const raw = await readStream(transformed.body);
+		const events = parseSSEEvents(raw);
+		const msgDelta = events.find((event) => event.event === "message_delta");
+		expect(msgDelta).toBeDefined();
+		if (!msgDelta) throw new Error("expected message_delta event");
+
+		expect(parseEventData(msgDelta).usage).toEqual({
+			input_tokens: 0,
+			output_tokens: 5,
+		});
 	});
 
 	it("includes content_block_stop for text block", async () => {

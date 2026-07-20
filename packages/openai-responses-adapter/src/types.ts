@@ -16,6 +16,8 @@ export interface ResponsesRequest {
 	store?: boolean;
 	/** Codex CLI's stable conversation identity for prompt-cache routing. */
 	prompt_cache_key?: string;
+	/** Optional Claude-compatible session envelope accepted by proxy clients. */
+	metadata?: { user_id?: string };
 }
 
 // ResponseItem union — all item types codex can send

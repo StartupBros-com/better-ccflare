@@ -7,6 +7,52 @@ import type { HandleProxyFn, ResponseItem, ResponsesRequest } from "./types";
 
 const log = new Logger("openai-responses-adapter");
 
+const SESSION_UUID_RE =
+	/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const RESPONSES_SESSION_ID_DOMAIN =
+	"better-ccflare:responses-session-identity:v1\0";
+
+function validSessionMetadataUserId(value: unknown): string | undefined {
+	if (typeof value !== "string" || value.length === 0) return undefined;
+	try {
+		const parsed = JSON.parse(value) as unknown;
+		if (!parsed || typeof parsed !== "object") return undefined;
+		const sessionId = (parsed as Record<string, unknown>).session_id;
+		return typeof sessionId === "string" && SESSION_UUID_RE.test(sessionId)
+			? value
+			: undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Bridge opaque Responses identities into the Claude metadata contract already
+ * consumed by routing affinity and provider-native cache-key derivation.
+ *
+ * UUIDv8 is used because this is a private, SHA-256-derived identifier rather
+ * than an RFC UUIDv5 (which specifically prescribes SHA-1). The source value is
+ * never copied into the translated body.
+ */
+function canonicalSessionUuid(value: string): string {
+	const bytes = crypto
+		.createHash("sha256")
+		.update(RESPONSES_SESSION_ID_DOMAIN)
+		.update(value)
+		.digest()
+		.subarray(0, 16);
+	bytes[6] = (bytes[6] & 0x0f) | 0x80;
+	bytes[8] = (bytes[8] & 0x3f) | 0x80;
+	const hex = bytes.toString("hex");
+	return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function firstNonEmptyString(...values: unknown[]): string | undefined {
+	return values.find(
+		(value): value is string => typeof value === "string" && value.length > 0,
+	);
+}
+
 export async function handleResponsesRequest(
 	req: Request,
 	url: URL,
@@ -92,18 +138,29 @@ export async function handleResponsesRequest(
 		body as typeof body & { input: ResponseItem[] },
 	);
 
-	// 4b. Preserve the client's session identity. Codex CLI identifies its
-	// conversation via prompt_cache_key (some versions also send a session_id
-	// header); the translated Anthropic body would otherwise carry no
-	// metadata, leaving this traffic anonymous to downstream per-session
-	// accounting (session governor, load-balancer session affinity).
-	const sessionKey =
-		(typeof body.prompt_cache_key === "string" && body.prompt_cache_key) ||
-		req.headers.get("session_id") ||
-		req.headers.get("x-session-id") ||
-		null;
-	if (sessionKey && !anthropicBody.metadata) {
-		anthropicBody.metadata = { user_id: `codex-responses-${sessionKey}` };
+	// 4b. Preserve an existing valid Claude session envelope. Otherwise bridge
+	// the Responses identity into that envelope with documented precedence.
+	// Downstream routing and the Codex/xAI native cache implementations consume
+	// this same metadata shape. Hashing prevents opaque client identifiers from
+	// leaking into persisted payloads, logs, or provider requests.
+	const existingMetadataUserId =
+		validSessionMetadataUserId(anthropicBody.metadata?.user_id) ??
+		validSessionMetadataUserId(body.metadata?.user_id);
+	if (existingMetadataUserId) {
+		anthropicBody.metadata = { user_id: existingMetadataUserId };
+	} else {
+		const sourceIdentity = firstNonEmptyString(
+			body.prompt_cache_key,
+			req.headers.get("session_id"),
+			req.headers.get("x-session-id"),
+		);
+		if (sourceIdentity) {
+			anthropicBody.metadata = {
+				user_id: JSON.stringify({
+					session_id: canonicalSessionUuid(sourceIdentity),
+				}),
+			};
+		}
 	}
 
 	// 5. Build synthetic request targeting /v1/messages
@@ -112,6 +169,10 @@ export async function handleResponsesRequest(
 	const syntheticHeaders = new Headers(req.headers);
 	syntheticHeaders.set("content-type", "application/json");
 	syntheticHeaders.delete("content-length");
+	// The canonical body identity replaces these raw client identifiers. Keeping
+	// them would widen their trust boundary and could forward them upstream.
+	syntheticHeaders.delete("session_id");
+	syntheticHeaders.delete("x-session-id");
 	// Body is now decompressed plain JSON — remove the original encoding hint.
 	syntheticHeaders.delete("content-encoding");
 	// Required by Anthropic API — Codex CLI doesn't send this header.

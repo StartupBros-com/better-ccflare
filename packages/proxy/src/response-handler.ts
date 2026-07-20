@@ -28,6 +28,10 @@ import {
 import { createSseRateLimitSniffer } from "./handlers/sse-rate-limit-sniffer";
 import { ingestModelsListing } from "./model-catalog";
 import {
+	getRequestLifecycleCoordinator,
+	type RequestLifecycleCoordinator,
+} from "./routing-terminal-recorder";
+import {
 	clearSession,
 	recordServedAccount,
 	sessionIdForObservation,
@@ -42,12 +46,16 @@ import {
 
 const log = new Logger("ResponseHandler");
 
-function fireAndForgetEnd(msg: EndMessage): void {
-	getUsageCollector()
-		.handleEnd(msg)
-		.catch((err: unknown) => {
-			log.error(`handleEnd failed for request ${msg.requestId}`, err);
-		});
+function fireAndForgetEnd(
+	msg: EndMessage,
+	lifecycleCoordinator: RequestLifecycleCoordinator | null,
+): void {
+	const completion = lifecycleCoordinator
+		? lifecycleCoordinator.finalize(msg)
+		: getUsageCollector().handleEnd(msg);
+	completion.catch((err: unknown) => {
+		log.error(`handleEnd failed for request ${msg.requestId}`, err);
+	});
 }
 
 // Default cooldown for rate-limit errors detected mid-stream. SSE error
@@ -355,7 +363,13 @@ export async function forwardToClient(
 		path === "/v1/messages/count_tokens" &&
 		(ctx.provider.name === "openai-compatible" ||
 			ctx.provider.name === "codex");
-	const shouldProcessRequest = !isSyntheticCountTokens && !isAutoRefreshProbe;
+	const lifecycleCoordinator = routingMeta
+		? getRequestLifecycleCoordinator(routingMeta)
+		: null;
+	let shouldProcessRequest =
+		!isSyntheticCountTokens &&
+		!isAutoRefreshProbe &&
+		(!lifecycleCoordinator || lifecycleCoordinator.state === "unclaimed");
 
 	// Send START message immediately if not filtered
 	if (shouldProcessRequest) {
@@ -418,7 +432,18 @@ export async function forwardToClient(
 				: {}),
 			failoverAttempts,
 		};
-		getUsageCollector().handleStart(startMessage);
+		const collector = getUsageCollector();
+		if (lifecycleCoordinator) {
+			shouldProcessRequest = lifecycleCoordinator.start({
+				collector,
+				message: startMessage,
+				onError: (error) => {
+					log.error(`usage lifecycle failed for request ${requestId}`, error);
+				},
+			});
+		} else {
+			collector.handleStart(startMessage);
+		}
 	}
 
 	// Emit request start event for real-time dashboard
@@ -646,7 +671,7 @@ export async function forwardToClient(
 					...(error ? { error } : {}),
 				};
 				// Fire-and-forget: handleEnd is async for DB writes but we don't block streaming
-				fireAndForgetEnd(endMsg);
+				fireAndForgetEnd(endMsg, lifecycleCoordinator);
 			}
 
 			if (anthropicOutcome) {
@@ -718,12 +743,15 @@ export async function forwardToClient(
 	 *********************************************************************/
 	if (!response.body) {
 		if (shouldProcessRequest) {
-			fireAndForgetEnd({
-				type: "end",
-				requestId,
-				responseBody: null,
-				success: isExpectedResponse(path, response),
-			});
+			fireAndForgetEnd(
+				{
+					type: "end",
+					requestId,
+					responseBody: null,
+					success: isExpectedResponse(path, response),
+				},
+				lifecycleCoordinator,
+			);
 		}
 
 		if (
@@ -767,31 +795,40 @@ export async function forwardToClient(
 			}
 
 			if (!shouldProcessRequest) return;
-			fireAndForgetEnd({
-				type: "end",
-				requestId,
-				responseBody:
-					cappedBuf.byteLength > 0 ? cappedBuf.toString("base64") : null,
-				success: isExpectedResponse(path, response),
-			});
+			fireAndForgetEnd(
+				{
+					type: "end",
+					requestId,
+					responseBody:
+						cappedBuf.byteLength > 0 ? cappedBuf.toString("base64") : null,
+					success: isExpectedResponse(path, response),
+				},
+				lifecycleCoordinator,
+			);
 		},
 		onError(err) {
 			if (!shouldProcessRequest) return;
-			fireAndForgetEnd({
-				type: "end",
-				requestId,
-				success: false,
-				error: err.message,
-			});
+			fireAndForgetEnd(
+				{
+					type: "end",
+					requestId,
+					success: false,
+					error: err.message,
+				},
+				lifecycleCoordinator,
+			);
 		},
 		onCancel() {
 			if (!shouldProcessRequest) return;
-			fireAndForgetEnd({
-				type: "end",
-				requestId,
-				success: false,
-				error: "downstream_cancelled",
-			});
+			fireAndForgetEnd(
+				{
+					type: "end",
+					requestId,
+					success: false,
+					error: "downstream_cancelled",
+				},
+				lifecycleCoordinator,
+			);
 		},
 	});
 

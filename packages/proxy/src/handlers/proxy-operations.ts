@@ -34,7 +34,22 @@ import {
 	isDownstreamAnthropicMessagesSse,
 	isNativeAnthropicMessagesSse,
 } from "../anthropic-semantic-preflight";
-import { cacheBodyStore } from "../cache-body-store";
+import {
+	CACHE_REPLAY_MODEL_HEADER,
+	hasCacheControlHintInJsonText,
+	stageCacheBodyForTransportAttempt,
+	stripCacheControlFromReplayBody,
+} from "../cache-transport-staging";
+
+export type {
+	CacheBodyStagingAction,
+	CacheBodyStagingInput,
+} from "../cache-transport-staging";
+export {
+	applyCacheBodyStagingPolicy,
+	getCacheBodyStagingAction,
+} from "../cache-transport-staging";
+
 import {
 	getPreTransportDeadlineConfig,
 	PreTransportPhaseTimeoutError,
@@ -66,6 +81,13 @@ import { getValidAccessToken } from "./token-manager";
 
 const log = new Logger("ProxyOperations");
 
+function isSyntheticInternalRequest(headers: Headers): boolean {
+	return (
+		!!headers.get("x-better-ccflare-keepalive") ||
+		!!headers.get("x-better-ccflare-auto-refresh")
+	);
+}
+
 const SYNTHETIC_RESPONSE_HEADER = "x-better-ccflare-synthetic-response";
 const SYNTHETIC_STATUS_HEADER = "x-better-ccflare-synthetic-status";
 const SYNTHETIC_RESPONSE_URL_PREFIX = "https://better-ccflare.local/";
@@ -81,6 +103,7 @@ const INTERNAL_TRANSPORT_HEADERS = [
 	"x-better-ccflare-pacing-action",
 	"x-better-ccflare-request-stream",
 	"x-better-ccflare-attributed-agent",
+	CACHE_REPLAY_MODEL_HEADER,
 ] as const;
 const ANTHROPIC_BILLING_HEADER = "x-anthropic-billing-header";
 const TEST_CONTEXT_WINDOW_ENV =
@@ -320,60 +343,6 @@ export async function forceModelInTransformedRequest(
 	} catch {
 		return request;
 	}
-}
-
-export type CacheBodyStagingAction = "stage" | "discard" | "skip";
-
-export interface CacheBodyStagingInput {
-	requestId: string;
-	accountId: string | null;
-	providerName: string;
-	body: ArrayBuffer | null;
-	headers: Headers;
-	path: string;
-}
-
-function isSyntheticInternalRequest(headers: Headers): boolean {
-	return (
-		!!headers.get("x-better-ccflare-keepalive") ||
-		!!headers.get("x-better-ccflare-auto-refresh")
-	);
-}
-
-/**
- * Chooses how one provider attempt should affect cache-keepalive staging.
- * Synthetic non-Codex requests retain the historical truthy-header skip
- * semantics. Every Codex attempt discards any entry staged by an earlier
- * provider so a later response summary cannot promote stale failover residue.
- */
-export function getCacheBodyStagingAction(
-	headers: Headers,
-	providerName: string,
-): CacheBodyStagingAction {
-	if (providerName === "codex") return "discard";
-	if (isSyntheticInternalRequest(headers)) return "skip";
-	return "stage";
-}
-
-/** Applies the cache-body staging policy for one account/provider attempt. */
-export function applyCacheBodyStagingPolicy(
-	input: CacheBodyStagingInput,
-): CacheBodyStagingAction {
-	const action = getCacheBodyStagingAction(input.headers, input.providerName);
-
-	if (action === "stage") {
-		cacheBodyStore.stageRequest(
-			input.requestId,
-			input.accountId,
-			input.body,
-			input.headers,
-			input.path,
-		);
-	} else if (action === "discard") {
-		cacheBodyStore.discardStaged(input.requestId);
-	}
-
-	return action;
 }
 
 /**
@@ -1231,6 +1200,7 @@ export async function proxyUnauthenticated(
 				comboName: requestMeta.comboName,
 				apiKeyId,
 				apiKeyName,
+				routingMeta: requestMeta,
 			},
 			ctx,
 		);
@@ -1509,14 +1479,6 @@ export async function proxyWithAccount(
 				? resolveCodexRequestModel(admittedRequestModel, account)
 				: admittedRequestModel;
 		const isSyntheticInternal = isSyntheticInternalRequest(req.headers);
-		applyCacheBodyStagingPolicy({
-			requestId: requestMeta.id,
-			accountId: account.id,
-			providerName: provider.name,
-			body: baseBodyContext.getBuffer(),
-			headers: req.headers,
-			path: url.pathname,
-		});
 
 		// Validate that the account-specific provider can handle this path
 		validateProviderPath(provider, url.pathname);
@@ -1544,6 +1506,7 @@ export async function proxyWithAccount(
 				}
 			}
 		}
+		let currentReplayBody = effectiveBodyBuffer;
 
 		const isSyntheticCodexCountTokens =
 			provider.name === "codex" && url.pathname === "/v1/messages/count_tokens";
@@ -1577,11 +1540,16 @@ export async function proxyWithAccount(
 		}
 
 		// Prepare request using account-specific provider
+		const replayResolvedModel =
+			provider.cacheReplayModelStrategy === "transformed-body"
+				? req.headers.get(CACHE_REPLAY_MODEL_HEADER)
+				: null;
 		const headers = provider.prepareHeaders(
 			req.headers,
 			accessToken,
 			account.api_key || undefined,
 		);
+		headers.delete(CACHE_REPLAY_MODEL_HEADER);
 		// Codex request tracing and stream-intent correlation need the proxy request
 		// ID during transformRequestBody. The Codex provider consumes and strips this
 		// internal header before the request is sent upstream.
@@ -1666,6 +1634,45 @@ export async function proxyWithAccount(
 		headers.delete(SYNTHETIC_RESPONSE_HEADER);
 		headers.delete(SYNTHETIC_STATUS_HEADER);
 		const targetUrl = provider.buildUrl(url.pathname, url.search, account);
+		const executeCacheAwareProviderAttempt = async (
+			transportRequest: Request,
+			replayBody: ArrayBuffer | null,
+			cacheIdentityHasCacheControl?: boolean,
+			resolvedModel?: string | null,
+		): Promise<Response> => {
+			const isSynthetic = isSyntheticProviderResponse(transportRequest);
+			await stageCacheBodyForTransportAttempt({
+				requestId: requestMeta.id,
+				accountId: account.id,
+				providerName: provider.name,
+				replayBody,
+				transportRequest,
+				clientHeaders: req.headers,
+				path: url.pathname,
+				cacheIdentityHasCacheControl,
+				isSyntheticProviderTransport: isSynthetic,
+				resolvedModel:
+					provider.cacheReplayModelStrategy === "transformed-body"
+						? resolvedModel
+						: null,
+			});
+			return isSynthetic
+				? materializeSyntheticResponse(transportRequest)
+				: makeAttemptRequest(transportRequest);
+		};
+		const enforcePhysicalModelAfterTransform = async (
+			transportRequest: Request,
+			physicalModel: string | null | undefined,
+		): Promise<Request> => {
+			if (
+				!physicalModel ||
+				provider.cacheReplayModelStrategy !== "transformed-body" ||
+				isSyntheticProviderResponse(transportRequest)
+			) {
+				return transportRequest;
+			}
+			return forceModelInTransformedRequest(transportRequest, physicalModel);
+		};
 
 		const requestInit: RequestInit & { duplex?: "half" } = {
 			method: req.method,
@@ -1685,6 +1692,10 @@ export async function proxyWithAccount(
 		let transformedRequest = provider.transformRequestBody
 			? await provider.transformRequestBody(providerRequest, account)
 			: providerRequest;
+		transformedRequest = await enforcePhysicalModelAfterTransform(
+			transformedRequest,
+			replayResolvedModel,
+		);
 		// Provider-local stream intent must reach processResponse, not upstream.
 		// Capture it before transport sanitization and reattach only to the local
 		// response object below.
@@ -1701,9 +1712,18 @@ export async function proxyWithAccount(
 		// Defense-in-depth: providers normally consume these before returning,
 		// but transform fallbacks may return the original request.
 		transformedRequest = sanitizeInternalTransportHeaders(transformedRequest);
+		const isSyntheticResponse = isSyntheticProviderResponse(transformedRequest);
 
 		// Pre-strip cache_control for (account, model) pairs known to reject it
-		const transformedBodyText = await transformedRequest.clone().text();
+		// Synthetic transports (notably Bedrock) contain the upstream RESPONSE:
+		// never clone/buffer that response as though it were an outbound body.
+		const transformedBodyText = isSyntheticResponse
+			? ""
+			: await transformedRequest.clone().text();
+		let currentCacheIdentityHasCacheControl: boolean | undefined =
+			isSyntheticResponse
+				? undefined
+				: hasCacheControlHintInJsonText(transformedBodyText);
 		let transformedBodyJson: Record<string, unknown> | null = null;
 		try {
 			transformedBodyJson = JSON.parse(transformedBodyText);
@@ -1711,7 +1731,8 @@ export async function proxyWithAccount(
 			// ignore
 		}
 		const transformedModel =
-			(transformedBodyJson?.model as string | undefined) ?? "";
+			(transformedBodyJson?.model as string | undefined) ??
+			(isSyntheticResponse ? (concreteAttemptModel ?? "") : "");
 		let currentTransportModel = transformedModel || concreteAttemptModel;
 		if (
 			routingAttemptLedger &&
@@ -1847,6 +1868,7 @@ export async function proxyWithAccount(
 			}
 		};
 		if (
+			!isSyntheticResponse &&
 			transformedModel &&
 			cacheControlRejectors.has(
 				cacheControlRejectorKey(account.id, transformedModel),
@@ -1858,29 +1880,37 @@ export async function proxyWithAccount(
 					typeof stripCacheControlFromOpenAIRequest
 				>[0],
 			);
+			const strippedBodyText = JSON.stringify(transformedBodyJson);
 			transformedRequest = new Request(transformedRequest.url, {
 				method: transformedRequest.method,
 				headers: transformedRequest.headers,
-				body: JSON.stringify(transformedBodyJson),
+				body: strippedBodyText,
 			});
+			currentCacheIdentityHasCacheControl =
+				hasCacheControlHintInJsonText(strippedBodyText);
 			log.debug(
 				`Pre-stripped cache_control for known rejector: account=${account.name} model=${transformedModel}`,
 			);
 		}
 
 		// Capture a clone for in-place 529 retries before the body is consumed.
-		const transformedRequestForRetry = transformedRequest.clone();
+		const transformedRequestForRetry = isSyntheticResponse
+			? transformedRequest
+			: transformedRequest.clone();
 		// The 529 in-place retry must resend the CURRENT physical transport, not
 		// the original request: thinking/cache-control retries and model fallback
 		// all replace the outbound body, and reverting silently changes the model.
 		let retrySourceRequest = providerRequest;
 		let retryTransformedTemplate = transformedRequestForRetry;
 
-		// Make the request (or unwrap a synthetic provider response)
-		const isSyntheticResponse = isSyntheticProviderResponse(transformedRequest);
-		let rawResponse = isSyntheticResponse
-			? materializeSyntheticResponse(transformedRequest)
-			: await makeAttemptRequest(transformedRequest);
+		// Make the request, or unwrap a provider response produced during transform.
+		// Both paths first replace/discard cache staging for this physical attempt.
+		let rawResponse = await executeCacheAwareProviderAttempt(
+			transformedRequest,
+			currentReplayBody,
+			currentCacheIdentityHasCacheControl,
+			currentTransportModel,
+		);
 
 		// Check if this is a Claude provider and we got an invalid thinking signature error
 		if (
@@ -1909,9 +1939,13 @@ export async function proxyWithAccount(
 				const retryProviderRequest = new Request(targetUrl, retryRequestInit);
 				retrySourceRequest = retryProviderRequest.clone();
 
-				const retryTransformedRequest = provider.transformRequestBody
+				let retryTransformedRequest = provider.transformRequestBody
 					? await provider.transformRequestBody(retryProviderRequest, account)
 					: retryProviderRequest;
+				retryTransformedRequest = await enforcePhysicalModelAfterTransform(
+					retryTransformedRequest,
+					currentTransportModel,
+				);
 				retryTransformedTemplate = retryTransformedRequest.clone();
 
 				// Preserve internal metadata through the transform for tracing, then
@@ -1919,10 +1953,15 @@ export async function proxyWithAccount(
 				const retryTransportRequest = sanitizeInternalTransportHeaders(
 					retryTransformedTemplate.clone(),
 				);
+				currentReplayBody = filteredBodyBuffer;
+				currentCacheIdentityHasCacheControl = undefined;
 				// Make the retry request (or unwrap a synthetic provider response)
-				rawResponse = isSyntheticProviderResponse(retryTransformedRequest)
-					? materializeSyntheticResponse(retryTransformedRequest)
-					: await makeAttemptRequest(retryTransportRequest);
+				rawResponse = await executeCacheAwareProviderAttempt(
+					retryTransportRequest,
+					currentReplayBody,
+					currentCacheIdentityHasCacheControl,
+					currentTransportModel,
+				);
 			} else {
 				log.warn(
 					"Failed to filter thinking blocks or no changes made, proceeding with original error response",
@@ -1962,17 +2001,26 @@ export async function proxyWithAccount(
 				const retryProviderRequest = new Request(targetUrl, retryRequestInit);
 				retrySourceRequest = retryProviderRequest.clone();
 
-				const retryTransformedRequest = provider.transformRequestBody
+				let retryTransformedRequest = provider.transformRequestBody
 					? await provider.transformRequestBody(retryProviderRequest, account)
 					: retryProviderRequest;
+				retryTransformedRequest = await enforcePhysicalModelAfterTransform(
+					retryTransformedRequest,
+					currentTransportModel,
+				);
 				retryTransformedTemplate = retryTransformedRequest.clone();
 
 				const retryTransportRequest = sanitizeInternalTransportHeaders(
 					retryTransformedTemplate.clone(),
 				);
-				rawResponse = isSyntheticProviderResponse(retryTransformedRequest)
-					? materializeSyntheticResponse(retryTransformedRequest)
-					: await makeAttemptRequest(retryTransportRequest);
+				currentReplayBody = strippedBodyBuffer;
+				currentCacheIdentityHasCacheControl = undefined;
+				rawResponse = await executeCacheAwareProviderAttempt(
+					retryTransportRequest,
+					currentReplayBody,
+					currentCacheIdentityHasCacheControl,
+					currentTransportModel,
+				);
 			} else {
 				log.warn(
 					"No clear_thinking context edits to strip or filtering failed, proceeding with original error response",
@@ -2005,11 +2053,14 @@ export async function proxyWithAccount(
 					stampCodexAttempt(retryHeaders, "cache_control_retry");
 					const retrySourceBody = await providerRequest.clone().json();
 					stripCacheControlFromOpenAIRequest(retrySourceBody);
+					const retrySourceText = JSON.stringify(retrySourceBody);
 					const retrySource = new Request(providerRequest.url, {
 						method: providerRequest.method,
 						headers: retryHeaders,
-						body: JSON.stringify(retrySourceBody),
+						body: retrySourceText,
 					});
+					currentReplayBody = new TextEncoder().encode(retrySourceText).buffer;
+					currentCacheIdentityHasCacheControl = undefined;
 					retrySourceRequest = retrySource.clone();
 					const retryTransformed = await provider.transformRequestBody(
 						retrySource,
@@ -2020,16 +2071,28 @@ export async function proxyWithAccount(
 						retryTransformedTemplate.clone(),
 					);
 				} else {
+					const retryBodyText = JSON.stringify(retryBodyJson);
 					retryRequest = new Request(transformedRequest.url, {
 						method: transformedRequest.method,
 						headers: transformedRequest.headers,
-						body: JSON.stringify(retryBodyJson),
+						body: retryBodyText,
 					});
+					// The physical retry is already provider-transformed, but keepalive
+					// must re-enter from the normalized source and receive exactly one
+					// transform. Strip rejected markers from that source projection rather
+					// than persisting the OpenAI/Vertex transport shape.
+					currentReplayBody =
+						stripCacheControlFromReplayBody(currentReplayBody);
+					currentCacheIdentityHasCacheControl =
+						hasCacheControlHintInJsonText(retryBodyText);
 					retryTransformedTemplate = retryRequest.clone();
 				}
-				rawResponse = isSyntheticProviderResponse(retryRequest)
-					? materializeSyntheticResponse(retryRequest)
-					: await makeAttemptRequest(retryRequest);
+				rawResponse = await executeCacheAwareProviderAttempt(
+					retryRequest,
+					currentReplayBody,
+					currentCacheIdentityHasCacheControl,
+					currentTransportModel,
+				);
 			} catch (err) {
 				if (isAttemptControlError(err)) throw err;
 				log.warn("Failed to retry without cache_control:", err);
@@ -2796,17 +2859,29 @@ export async function proxyWithAccount(
 					}
 					stampCodexAttempt(headers, "model_fallback", nextModel);
 					currentTransportModel = nextModel;
-					const retryProviderRequest = new Request(targetUrl, retryRequestInit);
+					// URL-model providers derive their physical transport from the
+					// normalized retry source, so prepare and rebuild the URL for every
+					// concrete fallback rather than reusing the primary model's URL.
+					if (provider.prepareRequest) {
+						provider.prepareRequest(req, patchedBody, account);
+					}
+					const retryTargetUrl = provider.buildUrl(
+						url.pathname,
+						url.search,
+						account,
+					);
+					const retryProviderRequest = new Request(
+						retryTargetUrl,
+						retryRequestInit,
+					);
 					retrySourceRequest = retryProviderRequest.clone();
 					let retryTransformedRequest = provider.transformRequestBody
 						? await provider.transformRequestBody(retryProviderRequest, account)
 						: retryProviderRequest;
 
-					// Re-patch model after transformRequestBody — the provider's conversion
-					// (e.g. convertAnthropicRequestToOpenAI) calls mapModelName which can
-					// remap nextModel back to the primary model if it has no Claude family
-					// pattern. Force nextModel into the final request body.
-					retryTransformedRequest = await forceModelInTransformedRequest(
+					// Body-model conversions can remap nextModel back to the primary;
+					// source/URL providers already resolved it during prepare/build above.
+					retryTransformedRequest = await enforcePhysicalModelAfterTransform(
 						retryTransformedRequest,
 						nextModel,
 					);
@@ -2817,11 +2892,16 @@ export async function proxyWithAccount(
 					const retryTransportRequest = sanitizeInternalTransportHeaders(
 						retryTransformedRequest,
 					);
+					currentReplayBody = patchedBody;
+					currentCacheIdentityHasCacheControl = undefined;
 					// Attribution advances only once a concrete request is ready to
 					// execute. A failed patch must leave it on the previous model.
-					rawResponse = isSyntheticProviderResponse(retryTransformedRequest)
-						? materializeSyntheticResponse(retryTransformedRequest)
-						: await makeAttemptRequest(retryTransportRequest);
+					rawResponse = await executeCacheAwareProviderAttempt(
+						retryTransportRequest,
+						currentReplayBody,
+						currentCacheIdentityHasCacheControl,
+						currentTransportModel,
+					);
 					rawFailureClassification = await handleRawAttemptFailure(
 						rawResponse,
 						nextModel,
@@ -3044,9 +3124,12 @@ export async function proxyWithAccount(
 								"in_place_529_retry_superseded",
 							);
 						}
-						const retryRaw = isSyntheticProviderResponse(retryTransport)
-							? materializeSyntheticResponse(retryTransport.clone())
-							: await makeAttemptRequest(retryTransport);
+						const retryRaw = await executeCacheAwareProviderAttempt(
+							retryTransport,
+							currentReplayBody,
+							currentCacheIdentityHasCacheControl,
+							currentTransportModel,
+						);
 						const retryFailureClassification = await handleRawAttemptFailure(
 							retryRaw,
 							currentTransportModel || effectiveBodyContext.getModel(),
@@ -3359,6 +3442,7 @@ export async function proxyWithAccount(
 						cacheFlightRecorderEligible,
 						cacheFlightRecorderNativeActive:
 							requestMeta.xaiCacheNativeActive === true,
+						routingMeta: requestMeta,
 					},
 					{ ...ctx, provider },
 				);
@@ -3510,32 +3594,20 @@ export function createPoolExhaustedResponse(accounts: Account[]): Response {
 	const rateLimitedAccounts = accounts.filter(
 		(account) => account.rate_limited_until && account.rate_limited_until > now,
 	);
+	const rateLimitedUntil = rateLimitedAccounts
+		.map((account) => account.rate_limited_until)
+		.filter((until): until is number => typeof until === "number");
+	const earliestRateLimitedUntil =
+		rateLimitedUntil.length > 0 ? Math.min(...rateLimitedUntil) : null;
 	const nextAvailableAt =
-		rateLimitedAccounts.length > 0
-			? new Date(
-					Math.min(
-						...rateLimitedAccounts.map(
-							(account) => account.rate_limited_until!,
-						),
-					),
-				).toISOString()
+		earliestRateLimitedUntil !== null
+			? new Date(earliestRateLimitedUntil).toISOString()
 			: null;
 
 	// Calculate Retry-After header (seconds) directly from numeric min
 	const retryAfterSeconds =
-		rateLimitedAccounts.length > 0
-			? Math.max(
-					1,
-					Math.round(
-						(Math.min(
-							...rateLimitedAccounts.map(
-								(account) => account.rate_limited_until!,
-							),
-						) -
-							now) /
-							1000,
-					),
-				)
+		earliestRateLimitedUntil !== null
+			? Math.max(1, Math.round((earliestRateLimitedUntil - now) / 1000))
 			: 60; // Default 60s if no cooldown info
 
 	return new Response(

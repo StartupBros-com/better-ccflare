@@ -9,7 +9,11 @@ import { sanitizeProxyHeaders } from "@better-ccflare/http-common";
 import { Logger } from "@better-ccflare/logger";
 import type { Account } from "@better-ccflare/types";
 import { BaseProvider } from "../../base";
-import type { RateLimitInfo, TokenRefreshResult } from "../../types";
+import type {
+	CacheReplayModelStrategy,
+	RateLimitInfo,
+	TokenRefreshResult,
+} from "../../types";
 import { transformRequestBodyModel } from "../../utils/model-mapping";
 import { parseAnthropicRateLimitResetAt } from "./rate-limit-reset";
 
@@ -80,6 +84,8 @@ const log = new Logger("AnthropicProvider");
 
 export class AnthropicProvider extends BaseProvider {
 	name = "anthropic";
+	override readonly cacheReplayModelStrategy: CacheReplayModelStrategy =
+		"transformed-body";
 
 	canHandle(_path: string): boolean {
 		// Handle all paths for now since this is Anthropic-specific

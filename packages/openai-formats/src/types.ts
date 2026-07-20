@@ -161,7 +161,7 @@ export interface TransformStreamContext {
 	thinkingBlockIndex: number;
 	/** Index of the text content block in the Anthropic stream (assigned by nextBlockIndex). */
 	textBlockIndex: number;
-	promptTokens: number;
+	promptTokens?: number;
 	completionTokens: number;
 	cacheReadInputTokens?: number;
 	cacheCreationInputTokens?: number;
@@ -226,6 +226,8 @@ export interface AnthropicResponse {
 	usage?: {
 		input_tokens: number;
 		output_tokens: number;
+		cache_read_input_tokens?: number;
+		cache_creation_input_tokens?: number;
 	};
 	error?: {
 		type: string;

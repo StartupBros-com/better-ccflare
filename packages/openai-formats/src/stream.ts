@@ -1,5 +1,6 @@
 import { Logger } from "@better-ccflare/logger";
 import type { TransformStreamContext } from "./types";
+import { normalizeOpenAIInputUsage } from "./usage";
 import { repairTruncatedToolJson } from "./utils";
 
 const log = new Logger("openai-formats");
@@ -79,13 +80,19 @@ function emitStreamEnd(
 	controller: TransformStreamDefaultController,
 	encoder: TextEncoder,
 	stopReason: "tool_use" | "end_turn",
-	promptTokens: number,
+	promptTokens: number | undefined,
 	completionTokens: number,
 	toolCallBlockIndices: Record<number, number> | null,
 	cacheReadInputTokens: number | undefined,
 	cacheCreationInputTokens: number | undefined,
 	endTurnBlockIndex = 0,
 ) {
+	const normalizedInput = normalizeOpenAIInputUsage(
+		promptTokens,
+		cacheReadInputTokens,
+		cacheCreationInputTokens,
+	);
+
 	// Send content_block_stop for all blocks
 	if (toolCallBlockIndices) {
 		// Tool call blocks — use Anthropic block indices (not OpenAI tool_call indices)
@@ -129,13 +136,16 @@ function emitStreamEnd(
 			stop_sequence: null,
 		},
 		usage: {
-			input_tokens: promptTokens,
+			input_tokens: normalizedInput.inputTokens,
 			output_tokens: completionTokens,
-			...(cacheReadInputTokens !== undefined
-				? { cache_read_input_tokens: cacheReadInputTokens }
+			...(normalizedInput.cacheReadInputTokens !== undefined
+				? { cache_read_input_tokens: normalizedInput.cacheReadInputTokens }
 				: {}),
-			...(cacheCreationInputTokens !== undefined
-				? { cache_creation_input_tokens: cacheCreationInputTokens }
+			...(normalizedInput.cacheCreationInputTokens !== undefined
+				? {
+						cache_creation_input_tokens:
+							normalizedInput.cacheCreationInputTokens,
+					}
 				: {}),
 		},
 	};
@@ -189,7 +199,7 @@ export function transformStreamingResponse(response: Response): Response {
 					textBlockClosed: false,
 					thinkingBlockIndex: 0,
 					textBlockIndex: 0,
-					promptTokens: 0,
+					promptTokens: undefined,
 					completionTokens: 0,
 					encounteredToolCall: false,
 					toolCallAccumulators: {},
@@ -300,10 +310,10 @@ export function transformStreamingResponse(response: Response): Response {
 
 							// Extract usage data if present (typically in last chunk before [DONE])
 							if (data.usage) {
-								if (data.usage.prompt_tokens) {
+								if (data.usage.prompt_tokens !== undefined) {
 									context.promptTokens = data.usage.prompt_tokens;
 								}
-								if (data.usage.completion_tokens) {
+								if (data.usage.completion_tokens !== undefined) {
 									context.completionTokens = data.usage.completion_tokens;
 								}
 								// Extract cache statistics from prompt_tokens_details (Qwen/DashScope)

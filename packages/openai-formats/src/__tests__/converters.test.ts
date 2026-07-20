@@ -738,6 +738,78 @@ describe("convertOpenAIResponseToAnthropic — success cases", () => {
 		expect(result.usage?.output_tokens).toBe(5);
 	});
 
+	it("normalizes cache reads and writes out of inclusive prompt tokens", () => {
+		const result = convertOpenAIResponseToAnthropic(
+			openaiTextResponse({
+				usage: {
+					prompt_tokens: 100,
+					completion_tokens: 5,
+					total_tokens: 105,
+					prompt_tokens_details: {
+						cached_tokens: 40,
+						cache_creation_input_tokens: 10,
+					},
+				},
+			}),
+		);
+
+		expect(result.usage).toEqual({
+			input_tokens: 50,
+			output_tokens: 5,
+			cache_read_input_tokens: 40,
+			cache_creation_input_tokens: 10,
+		});
+	});
+
+	it("preserves explicit zero cache telemetry but omits missing telemetry", () => {
+		const explicitZero = convertOpenAIResponseToAnthropic(
+			openaiTextResponse({
+				usage: {
+					prompt_tokens: 10,
+					completion_tokens: 5,
+					total_tokens: 15,
+					prompt_tokens_details: {
+						cached_tokens: 0,
+						cache_creation_input_tokens: 0,
+					},
+				},
+			}),
+		);
+		const missing = convertOpenAIResponseToAnthropic(openaiTextResponse());
+
+		expect(explicitZero.usage).toMatchObject({
+			cache_read_input_tokens: 0,
+			cache_creation_input_tokens: 0,
+		});
+		expect(missing.usage).not.toHaveProperty("cache_read_input_tokens");
+		expect(missing.usage).not.toHaveProperty("cache_creation_input_tokens");
+	});
+
+	it.each([
+		{ label: "missing", promptTokens: undefined },
+		{ label: "invalid", promptTokens: -1 },
+	])("keeps positive cache details unknown when prompt tokens are $label", ({
+		promptTokens,
+	}) => {
+		const result = convertOpenAIResponseToAnthropic(
+			openaiTextResponse({
+				usage: {
+					prompt_tokens: promptTokens,
+					completion_tokens: 5,
+					prompt_tokens_details: {
+						cached_tokens: 40,
+						cache_creation_input_tokens: 10,
+					},
+				},
+			}),
+		);
+
+		expect(result.usage).toEqual({
+			input_tokens: 0,
+			output_tokens: 5,
+		});
+	});
+
 	it("passes through the response id", () => {
 		const result = convertOpenAIResponseToAnthropic(
 			openaiTextResponse({ id: "chatcmpl-xyz" }),

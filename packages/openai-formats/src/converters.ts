@@ -15,6 +15,7 @@ import type {
 	OpenAIRequest,
 	OpenAIResponse,
 } from "./types";
+import { normalizeOpenAIInputUsage } from "./usage";
 import { mapOpenAIFinishReason, removeUriFormat } from "./utils";
 
 const log = new Logger("openai-formats/converters");
@@ -360,6 +361,13 @@ export function convertOpenAIResponseToAnthropic(
 		});
 	}
 
+	const promptTokenDetails = openaiData.usage?.prompt_tokens_details;
+	const normalizedInput = normalizeOpenAIInputUsage(
+		openaiData.usage?.prompt_tokens,
+		promptTokenDetails?.cached_tokens,
+		promptTokenDetails?.cache_creation_input_tokens,
+	);
+
 	return {
 		id: openaiData.id || `msg_${Date.now()}`,
 		type: "message",
@@ -369,8 +377,17 @@ export function convertOpenAIResponseToAnthropic(
 		stop_reason: mapOpenAIFinishReason(choice.finish_reason),
 		stop_sequence: undefined,
 		usage: {
-			input_tokens: openaiData.usage?.prompt_tokens || 0,
-			output_tokens: openaiData.usage?.completion_tokens || 0,
+			input_tokens: normalizedInput.inputTokens,
+			output_tokens: openaiData.usage?.completion_tokens ?? 0,
+			...(normalizedInput.cacheReadInputTokens !== undefined
+				? { cache_read_input_tokens: normalizedInput.cacheReadInputTokens }
+				: {}),
+			...(normalizedInput.cacheCreationInputTokens !== undefined
+				? {
+						cache_creation_input_tokens:
+							normalizedInput.cacheCreationInputTokens,
+					}
+				: {}),
 		},
 	};
 }

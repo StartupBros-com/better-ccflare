@@ -239,7 +239,9 @@ describe("XaiProvider", () => {
 		);
 		const usage = await provider.extractUsageInfo(response);
 		expect(usage?.cacheReadInputTokens).toBe(40);
-		expect(usage?.inputTokens).toBe(100);
+		expect(usage?.inputTokens).toBe(60);
+		expect(usage?.promptTokens).toBe(100);
+		expect(usage?.totalTokens).toBe(110);
 	});
 
 	describe("parseRateLimit - native xAI capacity classification (R5-R7)", () => {

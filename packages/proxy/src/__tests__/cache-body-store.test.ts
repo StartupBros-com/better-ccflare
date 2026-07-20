@@ -331,6 +331,45 @@ describe("CacheBodyStore", () => {
 			expect(entry?.headers["content-type"]).toBe("application/json");
 		});
 
+		it("promotes and refreshes the latest staged body on a cache-read-only hit", () => {
+			const realDateNow = Date.now;
+			let now = 1_700_000_000_000;
+			Date.now = () => now;
+			try {
+				cacheBodyStore.stageRequest(
+					"req-created",
+					"account-read-hit",
+					makeBodyWithModel("claude-created"),
+					makeHeaders(),
+					"/v1/messages",
+				);
+				cacheBodyStore.onSummary("req-created", 7, true, 0);
+				const created = cacheBodyStore.getLastCachedRequest("account-read-hit");
+				expect(created?.timestamp).toBe(now);
+
+				now += 60_000;
+				cacheBodyStore.stageRequest(
+					"req-read-hit",
+					"account-read-hit",
+					makeBodyWithModel("claude-read-hit"),
+					makeHeaders(),
+					"/v1/messages",
+				);
+				now += 5_000;
+				cacheBodyStore.onSummary("req-read-hit", undefined, true, 23);
+
+				const refreshed =
+					cacheBodyStore.getLastCachedRequest("account-read-hit");
+				expect(Buffer.from(refreshed?.body ?? []).toString()).toContain(
+					"claude-read-hit",
+				);
+				expect(refreshed?.timestamp).toBe(now);
+				expect(refreshed?.timestamp).toBeGreaterThan(created?.timestamp ?? 0);
+			} finally {
+				Date.now = realDateNow;
+			}
+		});
+
 		it("does NOT promote when cacheCreationInputTokens is 0", () => {
 			cacheBodyStore.stageRequest(
 				"req-no-promote-zero",
@@ -352,6 +391,36 @@ describe("CacheBodyStore", () => {
 				"/v1/messages",
 			);
 			cacheBodyStore.onSummary("req-no-promote-undef", undefined);
+			expect(cacheBodyStore.getLastCachedRequest("account-a")).toBeNull();
+		});
+
+		it("does NOT promote a failed response even when it reports cache creation", () => {
+			cacheBodyStore.stageRequest(
+				"req-failed-create",
+				"account-a",
+				makeBody(),
+				makeHeaders(),
+				"/v1/messages",
+			);
+			cacheBodyStore.onSummary("req-failed-create", 10, false);
+
+			expect(cacheBodyStore.getLastCachedRequest("account-a")).toBeNull();
+			// Failure handling must still consume staging; a duplicate late summary
+			// cannot resurrect the failed transport.
+			cacheBodyStore.onSummary("req-failed-create", 10, true);
+			expect(cacheBodyStore.getLastCachedRequest("account-a")).toBeNull();
+		});
+
+		it("does NOT promote a failed cache-read-only response", () => {
+			cacheBodyStore.stageRequest(
+				"req-failed-read",
+				"account-a",
+				makeBody(),
+				makeHeaders(),
+				"/v1/messages",
+			);
+			cacheBodyStore.onSummary("req-failed-read", 0, false, 10);
+
 			expect(cacheBodyStore.getLastCachedRequest("account-a")).toBeNull();
 		});
 
