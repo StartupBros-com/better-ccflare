@@ -1,5 +1,8 @@
 import { describe, expect, it, mock } from "bun:test";
-import { RoutingAttemptLedger } from "../routing-attempt-ledger";
+import {
+	formatRoutingAttemptMessage,
+	RoutingAttemptLedger,
+} from "../routing-attempt-ledger";
 
 describe("RoutingAttemptLedger", () => {
 	it("claims each account and normalized concrete model only once", () => {
@@ -31,6 +34,23 @@ describe("RoutingAttemptLedger", () => {
 		expect(ledger.claim("account-a", "claude-haiku-4-5")).toBe(false);
 		expect(ledger.claim("account-b", "claude-haiku-4-5")).toBe(true);
 		expect(ledger.attemptedCount).toBe(3);
+	});
+
+	it("counts deferred concrete routes while excluding pretransport, duplicate, and blocked skips", () => {
+		const ledger = new RoutingAttemptLedger();
+
+		// Pretransport/cooldown skips never claim a route and therefore contribute
+		// nothing. The initial transport and its deferred concrete-model route do.
+		expect(ledger.claim("account-a", "claude-opus-4-8")).toBe(true);
+		expect(ledger.claim("account-a", "provider-opus-fallback")).toBe(true);
+		expect(ledger.claim("account-a", "provider-opus-fallback")).toBe(false);
+		ledger.blockAccount("account-a");
+		expect(ledger.claim("account-a", "provider-second-fallback")).toBe(false);
+
+		expect(ledger.attemptedCount).toBe(2);
+		expect(formatRoutingAttemptMessage("All accounts failed", ledger)).toBe(
+			"All accounts failed (2 attempted)",
+		);
 	});
 
 	it("transfers one retained terminal response and disposes replacements exactly once", async () => {

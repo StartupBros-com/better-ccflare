@@ -30,7 +30,10 @@ export {
 	validateProviderPath,
 } from "./request-handler";
 export { handleProxyError } from "./response-processor";
-export { RoutingAttemptLedger } from "./routing-attempt-ledger";
+export {
+	formatRoutingAttemptMessage,
+	RoutingAttemptLedger,
+} from "./routing-attempt-ledger";
 export {
 	createModelPoolExhaustedResponse,
 	createRoutingTerminalResponse,

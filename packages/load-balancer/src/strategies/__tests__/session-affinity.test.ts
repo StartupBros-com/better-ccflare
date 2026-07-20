@@ -141,6 +141,68 @@ describe("SessionAffinityStrategy", () => {
 	});
 
 	describe("lane-scoped candidate failure suppression", () => {
+		it("leases two all-open account routes on sequential independent selects", async () => {
+			const primary = makeAccount({ id: "primary", priority: 0 });
+			const fallback = makeAccount({ id: "fallback", priority: 1 });
+			const laneMeta = {
+				...metaFor("sequential-probe-client"),
+				affinityLaneKey: "sequential-probe-client:anthropic:opus",
+			} as RequestMeta;
+
+			for (const candidateId of ["account:primary", "account:fallback"]) {
+				strategy.reportCandidateFailure(laneMeta, {
+					candidateId,
+					reason: "semantic_stream_stall",
+					suppressForMs: 60_000,
+				});
+			}
+
+			const first = await strategy.select([primary, fallback], laneMeta);
+			expect(first.map((account) => account.id)).toEqual(["primary"]);
+			expect(strategy.getRouteCircuitRecoveryHint(laneMeta)).toMatchObject({
+				allCandidatesOpen: true,
+				candidateCount: 2,
+				probeLeased: true,
+				reason: "semantic_stream_stall",
+			});
+
+			// The first selection owns only primary. A separate client retry can lease
+			// the independent fallback instead of being blocked lane-wide.
+			const second = await strategy.select([primary, fallback], {
+				...laneMeta,
+			});
+			expect(second.map((account) => account.id)).toEqual(["fallback"]);
+			expect(
+				await strategy.select([primary, fallback], { ...laneMeta }),
+			).toEqual([]);
+		});
+
+		it("isolates concurrent half-open leases per exact candidate", async () => {
+			const primary = makeAccount({ id: "primary", priority: 0 });
+			const fallback = makeAccount({ id: "fallback", priority: 1 });
+			const laneMeta = {
+				...metaFor("concurrent-probe-client"),
+				affinityLaneKey: "concurrent-probe-client:anthropic:opus",
+			} as RequestMeta;
+
+			for (const candidateId of ["account:primary", "account:fallback"]) {
+				strategy.reportCandidateFailure(laneMeta, {
+					candidateId,
+					reason: "semantic_stream_stall",
+					suppressForMs: 60_000,
+				});
+			}
+
+			const results = await Promise.all([
+				strategy.select([primary, fallback], { ...laneMeta }),
+				strategy.select([primary, fallback], { ...laneMeta }),
+				strategy.select([primary, fallback], { ...laneMeta }),
+			]);
+			expect(
+				results.map((result) => result.map((account) => account.id)),
+			).toEqual([["primary"], ["fallback"], []]);
+		});
+
 		it("never logs caller-derived affinity values while preserving suppression and a single half-open probe", async () => {
 			const secret = "session-secret/path?model=opus&beta=private";
 			const primary = makeAccount({ id: "primary", priority: 0 });
@@ -364,7 +426,7 @@ describe("SessionAffinityStrategy", () => {
 			expect(clocked.routeSuppressionEntries).toBe(0);
 		});
 
-		it("leases exactly one deterministic half-open probe across concurrent selects", async () => {
+		it("leases at most one deterministic half-open probe per candidate across concurrent selects", async () => {
 			const primary = makeAccount({ id: "primary", priority: 0 });
 			const fallback = makeAccount({ id: "fallback", priority: 1 });
 			let now = Date.now();
@@ -400,7 +462,7 @@ describe("SessionAffinityStrategy", () => {
 			]);
 			expect(
 				results.map((result) => result.map((account) => account.id)),
-			).toEqual([["primary"], [], []]);
+			).toEqual([["primary"], ["fallback"], []]);
 			expect(
 				await clocked.select([primary, fallback], { ...laneMeta }),
 			).toEqual([]);
@@ -470,7 +532,9 @@ describe("SessionAffinityStrategy", () => {
 				clocked.select([probeCandidate, stickyCandidate], { ...laneMeta }),
 				clocked.select([probeCandidate, stickyCandidate], { ...laneMeta }),
 			]);
-			expect(concurrentRepeats).toEqual([[], []]);
+			expect(
+				concurrentRepeats.map((result) => result.map((account) => account.id)),
+			).toEqual([[stickyCandidate.id], []]);
 		});
 
 		it("does not lease an expired equal-class circuit behind a healthy sticky route", async () => {
@@ -587,6 +651,13 @@ describe("SessionAffinityStrategy", () => {
 				reason: "semantic_stream_stall",
 				suppressForMs: 100,
 			});
+			expect(clocked.getRouteCircuitRecoveryHint(laneMeta)).toMatchObject({
+				allCandidatesOpen: true,
+				candidateCount: 1,
+				probeLeased: false,
+				retryAt: now + 200,
+				reason: "semantic_stream_stall",
+			});
 			expect(await clocked.select([primary], laneMeta)).toEqual([]);
 			now += 199;
 			expect(await clocked.select([primary], laneMeta)).toEqual([]);
@@ -649,6 +720,7 @@ describe("SessionAffinityStrategy", () => {
 				affinityLaneKey: "success-reset-client:anthropic:fable",
 			} as RequestMeta;
 
+			await clocked.select([primary], laneMeta);
 			for (let attempt = 0; attempt < 2; attempt++) {
 				clocked.reportCandidateFailure(laneMeta, {
 					candidateId: "account:primary",
@@ -663,6 +735,11 @@ describe("SessionAffinityStrategy", () => {
 			});
 			clocked.reportCandidateSuccess(laneMeta, {
 				candidateId: "account:primary",
+			});
+			expect(clocked.getRouteCircuitRecoveryHint(laneMeta)).toMatchObject({
+				allCandidatesOpen: false,
+				candidateCount: 1,
+				retryAt: null,
 			});
 			expect(clocked.routeSuppressionEntries).toBe(1);
 			expect(

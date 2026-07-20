@@ -69,3 +69,11 @@ export class RoutingAttemptLedger {
 		if (retained) await retained.discard();
 	}
 }
+
+/** Build user-facing attempt telemetry from the authoritative transport ledger. */
+export function formatRoutingAttemptMessage(
+	message: string,
+	ledger: Pick<RoutingAttemptLedger, "attemptedCount">,
+): string {
+	return `${message} (${ledger.attemptedCount} attempted)`;
+}

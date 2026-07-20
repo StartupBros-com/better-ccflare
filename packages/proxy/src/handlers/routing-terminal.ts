@@ -1,4 +1,8 @@
-import type { Account, RateLimitReason } from "@better-ccflare/types";
+import type {
+	Account,
+	RateLimitReason,
+	RouteCircuitRecoveryHint,
+} from "@better-ccflare/types";
 import type { RoutingCapacityContext } from "./account-selector";
 import type { RequestRateLimitOutcome } from "./rate-limit-scope";
 
@@ -20,6 +24,7 @@ export interface RoutingTerminalOptions {
 	readonly upstreamAttempts: number;
 	readonly now?: number;
 	readonly message?: string;
+	readonly routeCircuitRecoveryHint?: RouteCircuitRecoveryHint | null;
 }
 
 interface AutomaticRecovery {
@@ -305,26 +310,48 @@ function createRouteUnavailableResponse(options: {
 	accounts: readonly Account[];
 	now: number;
 	message?: string;
+	routeCircuitRecoveryHint?: RouteCircuitRecoveryHint | null;
 }): Response {
 	const { accounts, now } = options;
+	const recovery = options.routeCircuitRecoveryHint;
+	const error: Record<string, unknown> = {
+		type: "service_unavailable",
+		code: "route_unavailable",
+		message:
+			options.message || "No compatible account route is currently available.",
+		accounts: accounts.map((account) => ({
+			name: account.name,
+			reason: accountReason(account, undefined, now),
+		})),
+	};
+	const headers = new Headers({ "content-type": "application/json" });
+	if (
+		recovery?.allCandidatesOpen &&
+		recovery.retryAt !== null &&
+		Number.isFinite(recovery.retryAt)
+	) {
+		const effectiveRetryAt = Math.max(now, recovery.retryAt);
+		error.next_available_at = new Date(effectiveRetryAt).toISOString();
+		error.route_circuit = {
+			all_candidates_open: recovery.allCandidatesOpen,
+			candidate_count: recovery.candidateCount,
+			probe_leased: recovery.probeLeased,
+			reason: recovery.reason,
+		};
+		headers.set(
+			"retry-after",
+			String(Math.max(1, Math.ceil((effectiveRetryAt - now) / 1000))),
+		);
+		headers.set("x-better-ccflare-route-status", "circuit-open");
+	}
 	return new Response(
 		JSON.stringify({
 			type: "error",
-			error: {
-				type: "service_unavailable",
-				code: "route_unavailable",
-				message:
-					options.message ||
-					"No compatible account route is currently available.",
-				accounts: accounts.map((account) => ({
-					name: account.name,
-					reason: accountReason(account, undefined, now),
-				})),
-			},
+			error,
 		}),
 		{
 			status: 503,
-			headers: { "content-type": "application/json" },
+			headers,
 		},
 	);
 }
@@ -372,6 +399,7 @@ export function createRoutingTerminalResponse(
 				accounts: options.accounts,
 				now,
 				message: options.message,
+				routeCircuitRecoveryHint: options.routeCircuitRecoveryHint,
 			}),
 		};
 	}
@@ -407,6 +435,7 @@ export function createRoutingTerminalResponse(
 			accounts: options.accounts,
 			now,
 			message: options.message,
+			routeCircuitRecoveryHint: options.routeCircuitRecoveryHint,
 		}),
 	};
 }
