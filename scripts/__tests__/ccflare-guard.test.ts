@@ -707,6 +707,131 @@ describe("source-controlled guard", () => {
 		expect(guard.state.counters.finalError).toBe(0);
 	});
 
+	test("accepts only the Claude Code message/ping compatibility alias with bounded privacy-safe telemetry", async () => {
+		const events: Array<Record<string, unknown>> = [];
+		const privateAliasValue = "private-compat-ping-value";
+		const privateMismatchValue = "private-mismatched-event-value";
+		const aliasFrame = `event: message\ndata: {"type":"ping","private":"${privateAliasValue}"}\n\n`;
+		const messageStop =
+			'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+		const bodies = [
+			`${aliasFrame.repeat(300)}${messageStop}`,
+			`event: message\ndata: {"type":"content_block_delta","private":"${privateMismatchValue}"}\n\n${messageStop}`,
+			aliasFrame,
+		];
+		let fetchIndex = 0;
+		const { baseUrl, guard } = await startGuard("http://127.0.0.1:8789", {
+			logger: (line: string) => events.push(JSON.parse(line)),
+			fetchImpl: async () =>
+				new Response(bodies[fetchIndex++], {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				}),
+		});
+
+		for (const expectedBody of bodies) {
+			const response = await fetch(`${baseUrl}/v1/messages`, {
+				method: "POST",
+				body: "{}",
+			});
+			expect(await response.text()).toBe(expectedBody);
+		}
+		await waitFor(() => guard.state.active === 0);
+
+		const completions = events.filter(
+			(event) => event.event === "proxy_response",
+		);
+		expect(completions).toHaveLength(3);
+		expect(completions[0]).toMatchObject({
+			status: 200,
+			outcome: "success",
+			semanticCompatibilityAlias: "message_ping",
+			semanticCompatibilityAliasCount: 255,
+		});
+		expect(completions[0]).not.toHaveProperty("semanticParseState");
+		expect(completions[0]).not.toHaveProperty("semanticParseReason");
+		expect(completions[1]).toMatchObject({
+			status: 200,
+			outcome: "success",
+			semanticParseState: "malformed",
+			semanticParseReason: "event_type_mismatch",
+		});
+		expect(completions[1]).not.toHaveProperty(
+			"semanticCompatibilityAliasCount",
+		);
+		expect(completions[2]).toMatchObject({
+			status: 200,
+			outcome: "final_error",
+			semanticEvent: "incomplete_eof",
+			semanticErrorType: "anthropic_incomplete_eof",
+			semanticParseState: "clean",
+			semanticCompatibilityAlias: "message_ping",
+			semanticCompatibilityAliasCount: 1,
+		});
+		expect(JSON.stringify(completions)).not.toContain(privateAliasValue);
+		expect(JSON.stringify(completions)).not.toContain(privateMismatchValue);
+		expect(guard.state.counters.success).toBe(2);
+		expect(guard.state.counters.finalError).toBe(1);
+	});
+
+	test("reports only fixed privacy-safe malformed SSE reasons", async () => {
+		const events: Array<Record<string, unknown>> = [];
+		const privateValues = [
+			"private-invalid-json",
+			"private-event-mismatch",
+			"private-invalid-message-stop",
+			"private-unterminated-event",
+		];
+		const messageStop =
+			'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+		const bodies = [
+			`event: ping\ndata: {"type":"ping","private":"${privateValues[0]}"\n\n${messageStop}`,
+			`event: message\ndata: {"type":"content_block_delta","private":"${privateValues[1]}"}\n\n${messageStop}`,
+			`event: message_stop\ndata: {"type":"ping","private":"${privateValues[2]}"}\n\n${messageStop}`,
+			`event: ping\ndata: {"type":"ping","private":"${privateValues[3]}"}`,
+		];
+		let fetchIndex = 0;
+		const { baseUrl, guard } = await startGuard("http://127.0.0.1:8789", {
+			logger: (line: string) => events.push(JSON.parse(line)),
+			fetchImpl: async () =>
+				new Response(bodies[fetchIndex++], {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				}),
+		});
+
+		for (const expectedBody of bodies) {
+			const response = await fetch(`${baseUrl}/v1/messages`, {
+				method: "POST",
+				body: "{}",
+			});
+			expect(await response.text()).toBe(expectedBody);
+		}
+		await waitFor(() => guard.state.active === 0);
+
+		const completions = events.filter(
+			(event) => event.event === "proxy_response",
+		);
+		expect(completions.map((event) => event.semanticParseReason)).toEqual([
+			"invalid_json",
+			"event_type_mismatch",
+			"invalid_message_stop",
+			"unterminated_event",
+		]);
+		for (const completion of completions) {
+			expect(completion.semanticParseState).toBe("malformed");
+			expect([
+				"invalid_json",
+				"event_type_mismatch",
+				"invalid_message_stop",
+				"unterminated_event",
+			]).toContain(completion.semanticParseReason);
+		}
+		for (const privateValue of privateValues) {
+			expect(JSON.stringify(completions)).not.toContain(privateValue);
+		}
+	});
+
 	test("accepts a bare DONE sentinel after message_stop without marking the stream malformed", async () => {
 		const events: Array<Record<string, unknown>> = [];
 		const body =

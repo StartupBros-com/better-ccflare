@@ -41,8 +41,10 @@ export const GUARD_REQUEST_ID_HEADER = "x-better-ccflare-guard-request-id";
 
 // Bound the only response-content state retained by the guard. The observer
 // never logs event data (which can include provider or user content); it emits
-// only the fixed event name and a strictly validated error-type token.
+// only fixed classification tokens, bounded counters, and a strictly validated
+// error-type token.
 const MAX_SSE_OUTCOME_EVENT_BYTES = 16 * 1_024;
+const MAX_SSE_COMPATIBILITY_ALIAS_COUNT = 255;
 const SAFE_SSE_ERROR_TYPES = new Set([
 	"api_error",
 	"authentication_error",
@@ -318,10 +320,24 @@ function createSseOutcomeObserver({ requireMessageStop = false } = {}) {
 	let dataLineSeen = false;
 	let parserDisabled = false;
 	let malformedSeen = false;
+	let malformedReason = null;
 	let limitExceeded = false;
 	let messageStopSeen = false;
 	let errorType = null;
+	let compatibilityAliasCount = 0;
 	let finished = false;
+
+	const markMalformed = (reason) => {
+		malformedSeen = true;
+		malformedReason ??= reason;
+	};
+
+	const recordCompatibilityAlias = () => {
+		compatibilityAliasCount = Math.min(
+			MAX_SSE_COMPATIBILITY_ALIAS_COUNT,
+			compatibilityAliasCount + 1,
+		);
+	};
 
 	const resetEvent = () => {
 		eventName = "";
@@ -354,20 +370,24 @@ function createSseOutcomeObserver({ requireMessageStop = false } = {}) {
 						? payload.type
 						: undefined;
 			} catch {
-				malformedSeen = true;
+				markMalformed("invalid_json");
 			}
 		}
-		if (
+		const isCompatibilityPing =
+			eventName === "message" &&
+			dataLineSeen &&
+			typeof payload === "object" &&
+			payload !== null &&
+			payloadType === "ping";
+		const eventTypeMismatch =
 			eventName !== "" &&
 			typeof payloadType === "string" &&
-			eventName !== payloadType
-		) {
-			malformedSeen = true;
-		}
+			eventName !== payloadType;
 		const resolvedType =
 			eventName || (typeof payloadType === "string" ? payloadType : "");
 
 		if (eventName === "error") {
+			if (eventTypeMismatch) markMalformed("event_type_mismatch");
 			errorType ??= semanticErrorTypeFromData(eventData);
 		} else if (resolvedType === "message_stop") {
 			const validMessageStop =
@@ -377,7 +397,11 @@ function createSseOutcomeObserver({ requireMessageStop = false } = {}) {
 				payloadType === "message_stop" &&
 				(eventName === "" || eventName === "message_stop");
 			if (validMessageStop) messageStopSeen = true;
-			else malformedSeen = true;
+			else markMalformed("invalid_message_stop");
+		} else if (isCompatibilityPing) {
+			recordCompatibilityAlias();
+		} else if (eventTypeMismatch) {
+			markMalformed("event_type_mismatch");
 		}
 		resetEvent();
 	};
@@ -466,7 +490,7 @@ function createSseOutcomeObserver({ requireMessageStop = false } = {}) {
 					eventName !== "" ||
 					dataLineSeen)
 			) {
-				malformedSeen = true;
+				markMalformed("unterminated_event");
 			}
 			pendingLine = "";
 			resetEvent();
@@ -477,11 +501,24 @@ function createSseOutcomeObserver({ requireMessageStop = false } = {}) {
 				: malformedSeen
 					? "malformed"
 					: "clean";
+			const parseReasonFields =
+				malformedReason === null
+					? {}
+					: { semanticParseReason: malformedReason };
+			const compatibilityFields =
+				compatibilityAliasCount === 0
+					? {}
+					: {
+							semanticCompatibilityAlias: "message_ping",
+							semanticCompatibilityAliasCount: compatibilityAliasCount,
+						};
 			if (errorType !== null) {
 				return {
 						semanticEvent: "error",
 						semanticErrorType: errorType,
 						semanticParseState,
+						...parseReasonFields,
+						...compatibilityFields,
 					};
 			}
 			// Once bounded observation stops, absence of message_stop is unknown,
@@ -497,11 +534,17 @@ function createSseOutcomeObserver({ requireMessageStop = false } = {}) {
 					semanticEvent: "incomplete_eof",
 					semanticErrorType: "anthropic_incomplete_eof",
 					semanticParseState,
+					...parseReasonFields,
+					...compatibilityFields,
 				};
 			}
 			return semanticParseState === "clean"
-				? {}
-				: { semanticParseState };
+				? compatibilityFields
+				: {
+						semanticParseState,
+						...parseReasonFields,
+						...compatibilityFields,
+					};
 		},
 	};
 }
