@@ -707,6 +707,69 @@ describe("source-controlled guard", () => {
 		expect(guard.state.counters.finalError).toBe(0);
 	});
 
+	test("accepts a bare DONE sentinel after message_stop without marking the stream malformed", async () => {
+		const events: Array<Record<string, unknown>> = [];
+		const body =
+			'event: message_stop\ndata: {"type":"message_stop"}\n\ndata: [DONE]\n\n';
+		const { baseUrl, guard } = await startGuard("http://127.0.0.1:8789", {
+			logger: (line: string) => events.push(JSON.parse(line)),
+			fetchImpl: async () =>
+				new Response(body, {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				}),
+		});
+
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+		expect(await response.text()).toBe(body);
+		await waitFor(() => guard.state.active === 0);
+
+		const completion = events.find(
+			(event) => event.event === "proxy_response",
+		);
+		expect(completion).toMatchObject({ status: 200, outcome: "success" });
+		expect(completion).not.toHaveProperty("semanticParseState");
+		expect(completion).not.toHaveProperty("semanticEvent");
+		expect(guard.state.counters.success).toBe(1);
+		expect(guard.state.counters.finalError).toBe(0);
+	});
+
+	test("does not treat a bare DONE sentinel as Anthropic completion evidence", async () => {
+		const events: Array<Record<string, unknown>> = [];
+		const body = "data: [DONE]\n\n";
+		const { baseUrl, guard } = await startGuard("http://127.0.0.1:8789", {
+			logger: (line: string) => events.push(JSON.parse(line)),
+			fetchImpl: async () =>
+				new Response(body, {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				}),
+		});
+
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+		expect(await response.text()).toBe(body);
+		await waitFor(() => guard.state.active === 0);
+
+		const completion = events.find(
+			(event) => event.event === "proxy_response",
+		);
+		expect(completion).toMatchObject({
+			status: 200,
+			outcome: "final_error",
+			semanticEvent: "incomplete_eof",
+			semanticErrorType: "anthropic_incomplete_eof",
+			semanticParseState: "clean",
+		});
+		expect(guard.state.counters.success).toBe(0);
+		expect(guard.state.counters.finalError).toBe(1);
+	});
+
 	test("classifies clean Anthropic Messages EOF without a dispatched message_stop as incomplete", async () => {
 		const events: Array<Record<string, unknown>> = [];
 		const privateTail = "unterminated-private-terminal-tail";
@@ -815,11 +878,12 @@ describe("source-controlled guard", () => {
 		expect(guard.state.counters.success).toBe(1);
 	});
 
-	test("bounds complete SSE lines and never retains an oversized event value", async () => {
+	test("treats a valid oversized SSE event as inconclusive instead of manufacturing incomplete EOF", async () => {
 		const events: Array<Record<string, unknown>> = [];
 		const privateOversizedValue = `private-${"x".repeat(20_000)}`;
 		const body =
-			`event: ${privateOversizedValue}\n\n` +
+			"event: content_block_delta\n" +
+			`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"${privateOversizedValue}"}}\n\n` +
 			'event: message_stop\ndata: {"type":"message_stop"}\n\n';
 		const { baseUrl, guard } = await startGuard("http://127.0.0.1:8789", {
 			logger: (line: string) => events.push(JSON.parse(line)),
@@ -842,12 +906,52 @@ describe("source-controlled guard", () => {
 		);
 		expect(completion).toMatchObject({
 			status: 200,
+			outcome: "success",
+			semanticParseState: "limit_exceeded",
+		});
+		expect(completion).not.toHaveProperty("semanticEvent");
+		expect(completion).not.toHaveProperty("semanticErrorType");
+		expect(JSON.stringify(completion)).not.toContain(privateOversizedValue);
+		expect(guard.state.counters.success).toBe(1);
+		expect(guard.state.counters.finalError).toBe(0);
+	});
+
+	test("preserves an observed SSE error if a later event exceeds the observer limit", async () => {
+		const events: Array<Record<string, unknown>> = [];
+		const privateOversizedValue = `private-${"x".repeat(20_000)}`;
+		const body =
+			'event: error\ndata: {"type":"error","error":{"type":"service_unavailable_error"}}\n\n' +
+			"event: content_block_delta\n" +
+			`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"${privateOversizedValue}"}}\n\n`;
+		const { baseUrl, guard } = await startGuard("http://127.0.0.1:8789", {
+			logger: (line: string) => events.push(JSON.parse(line)),
+			fetchImpl: async () =>
+				new Response(body, {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				}),
+		});
+
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+		expect(await response.text()).toBe(body);
+		await waitFor(() => guard.state.active === 0);
+
+		const completion = events.find(
+			(event) => event.event === "proxy_response",
+		);
+		expect(completion).toMatchObject({
+			status: 200,
 			outcome: "final_error",
-			semanticEvent: "incomplete_eof",
-			semanticErrorType: "anthropic_incomplete_eof",
+			semanticEvent: "error",
+			semanticErrorType: "service_unavailable_error",
 			semanticParseState: "limit_exceeded",
 		});
 		expect(JSON.stringify(completion)).not.toContain(privateOversizedValue);
+		expect(guard.state.counters.success).toBe(0);
+		expect(guard.state.counters.finalError).toBe(1);
 	});
 
 	test("maps an unrecognized provider error type to an opaque safe category", async () => {

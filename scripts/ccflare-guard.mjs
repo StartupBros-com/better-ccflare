@@ -338,6 +338,12 @@ function createSseOutcomeObserver({ requireMessageStop = false } = {}) {
 	};
 
 	const dispatchEvent = () => {
+		// The Anthropic provider deliberately passes through this transport
+		// sentinel. It is benign framing, but it is not message_stop evidence.
+		if (eventName === "" && dataLineSeen && eventData === "[DONE]") {
+			resetEvent();
+			return;
+		}
 		let payload;
 		let payloadType;
 		if (dataLineSeen) {
@@ -478,7 +484,15 @@ function createSseOutcomeObserver({ requireMessageStop = false } = {}) {
 						semanticParseState,
 					};
 			}
-			if (requireMessageStop && finished && !messageStopSeen) {
+			// Once bounded observation stops, absence of message_stop is unknown,
+			// not evidence that the upstream omitted it. Preserve any error already
+			// observed above, but never manufacture incomplete_eof after the cap.
+			if (
+				requireMessageStop &&
+				finished &&
+				!messageStopSeen &&
+				!limitExceeded
+			) {
 				return {
 					semanticEvent: "incomplete_eof",
 					semanticErrorType: "anthropic_incomplete_eof",
