@@ -169,6 +169,24 @@ const POSTCOMMIT_TERMINAL = [
 	"",
 	"",
 ].join("\n");
+const PRECOMMIT_SUCCESS_AFTER_WATCHDOG = [
+	"event: content_block_start",
+	'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+	"",
+	"event: content_block_delta",
+	'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"survived-180s"}}',
+	"",
+	"event: content_block_stop",
+	'data: {"type":"content_block_stop","index":0}',
+	"",
+	"event: message_delta",
+	'data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":3}}',
+	"",
+	"event: message_stop",
+	'data: {"type":"message_stop"}',
+	"",
+	"",
+].join("\n");
 const POSTCOMMIT_PROTOCOL_ACTIVITY = [
 	'event: ping\ndata: {"type":"ping"}\n\n',
 	'event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}\n\n',
@@ -279,6 +297,53 @@ function protocolActivityOnlyStream(
 		},
 		cancel() {
 			if (activityTimer !== undefined) clearInterval(activityTimer);
+			onCancel();
+		},
+	});
+}
+
+function productionCadenceStructuralStream(options: {
+	onCancel: () => void;
+	succeedAfterMs?: number;
+}): ReadableStream<Uint8Array> {
+	let activityTimer: ReturnType<typeof setInterval> | undefined;
+	let successTimer: ReturnType<typeof setTimeout> | undefined;
+	const stopTimers = () => {
+		if (activityTimer !== undefined) clearInterval(activityTimer);
+		if (successTimer !== undefined) clearTimeout(successTimer);
+		activityTimer = undefined;
+		successTimer = undefined;
+	};
+	return new ReadableStream({
+		start(controller) {
+			controller.enqueue(encoder.encode(PRELUDE));
+			// Stay well inside the independent 120s protocol-idle limit without
+			// producing text/tool progress that would commit the route.
+			activityTimer = setInterval(() => {
+				controller.enqueue(
+					encoder.encode('event: ping\ndata: {"type":"ping"}\n\n'),
+				);
+			}, 50_000);
+			if (options.succeedAfterMs !== undefined) {
+				successTimer = setTimeout(() => {
+					stopTimers();
+					controller.enqueue(encoder.encode(PRECOMMIT_SUCCESS_AFTER_WATCHDOG));
+					controller.close();
+				}, options.succeedAfterMs);
+			}
+		},
+		cancel() {
+			stopTimers();
+			options.onCancel();
+		},
+	});
+}
+
+function silentPrecommitStream(
+	onCancel: () => void,
+): ReadableStream<Uint8Array> {
+	return new ReadableStream({
+		cancel() {
 			onCancel();
 		},
 	});
@@ -535,6 +600,130 @@ afterEach(() => {
 });
 
 describe("downstream Anthropic Messages SSE routing", () => {
+	it("keeps recognized Claude Code protocol-live past 180s while generic commitment and true-silence limits remain bounded", async () => {
+		delete process.env[TIMEOUT_ENV];
+		delete process.env[MEANINGFUL_PROGRESS_ENV];
+		delete process.env[RESCUE_ACTIVATION_ENV];
+		delete process.env[RESCUE_PING_ENV];
+		delete process.env[RESCUE_DEADLINE_ENV];
+
+		// Preserve production ordering while reducing 120s/135s/150s/180s/210s
+		// to 1.2s/1.35s/1.5s/1.8s/2.1s. The application still receives the
+		// unmodified production configuration; only timer scheduling is scaled.
+		const timerScale = 100;
+		const realSetTimeout = globalThis.setTimeout.bind(globalThis);
+		const realSetInterval = globalThis.setInterval.bind(globalThis);
+		const timeoutSpy = spyOn(globalThis, "setTimeout").mockImplementation(
+			(callback, delay = 0, ...args) =>
+				realSetTimeout(callback, Math.max(0, delay / timerScale), ...args),
+		);
+		const intervalSpy = spyOn(globalThis, "setInterval").mockImplementation(
+			(callback, delay = 0, ...args) =>
+				realSetInterval(callback, Math.max(0, delay / timerScale), ...args),
+		);
+
+		const claudeAccount = makeAccount("long-precommit-claude");
+		const genericAccount = makeAccount("generic-precommit-deadline");
+		const silentAccount = makeAccount("true-silence-idle");
+		const claudeContext = makeContext([claudeAccount]).ctx;
+		const genericContext = makeContext([genericAccount]).ctx;
+		const silentContext = makeContext([silentAccount]).ctx;
+		let claudeCancelCount = 0;
+		let genericCancelCount = 0;
+		let silentCancelCount = 0;
+
+		try {
+			globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+				const upstreamRequest =
+					input instanceof Request ? input : new Request(input);
+				const accountId = upstreamRequest.headers.get("x-api-key")?.slice(4);
+				if (accountId === claudeAccount.id) {
+					return sseResponse(
+						productionCadenceStructuralStream({
+							onCancel: () => claudeCancelCount++,
+							succeedAfterMs: 210_000,
+						}),
+					);
+				}
+				if (accountId === genericAccount.id) {
+					return sseResponse(
+						productionCadenceStructuralStream({
+							onCancel: () => genericCancelCount++,
+						}),
+					);
+				}
+				return sseResponse(silentPrecommitStream(() => silentCancelCount++));
+			}) as unknown as typeof fetch;
+
+			const claudeRequest = makeRequest(
+				undefined,
+				undefined,
+				true,
+				MODEL,
+				"claude-cli/2.1.212 (external, cli)",
+			);
+			const genericRequest = makeRequest(
+				undefined,
+				undefined,
+				true,
+				MODEL,
+				"curl/8.0",
+			);
+			const silentRequest = makeRequest(
+				undefined,
+				undefined,
+				true,
+				MODEL,
+				"claude-cli/2.1.212 (external, cli)",
+			);
+
+			const [claude, generic, silent] = await Promise.all(
+				[
+					[claudeRequest, claudeContext],
+					[genericRequest, genericContext],
+					[silentRequest, silentContext],
+				].map(async ([request, context]) => {
+					const response = await handleProxy(
+						request as Request,
+						new URL((request as Request).url),
+						context as ProxyContext,
+					);
+					return { response, body: await response.text() };
+				}),
+			);
+
+			expect(claude.response.status).toBe(200);
+			expect(
+				claude.response.headers.get("x-better-ccflare-precommit-rescue"),
+			).toBe("active");
+			expect(claude.body).toContain("survived-180s");
+			expect(claude.body).not.toContain(ANTHROPIC_PRECOMMIT_RESCUE_ERROR_FRAME);
+			expect(claude.body).toContain(
+				'event: message\ndata: {"type":"ping"}\n\n',
+			);
+			expect(claude.body).not.toContain("event: ping");
+			expect(claudeCancelCount).toBe(0);
+
+			expect(generic.response.status).toBe(200);
+			expect(
+				generic.response.headers.get("x-better-ccflare-precommit-rescue"),
+			).toBe("active");
+			expect(generic.body).toContain(ANTHROPIC_PRECOMMIT_RESCUE_ERROR_FRAME);
+			expect(generic.body).toContain(ANTHROPIC_PRECOMMIT_RESCUE_PING_FRAME);
+			expect(genericCancelCount).toBe(1);
+
+			expect(silent.response.status).toBe(503);
+			expect(
+				silent.response.headers.get("x-better-ccflare-precommit-rescue"),
+			).toBeNull();
+			expect(silent.body).not.toContain(ANTHROPIC_PRECOMMIT_RESCUE_ERROR_FRAME);
+			expect(silentCancelCount).toBe(1);
+		} finally {
+			timeoutSpy.mockRestore();
+			intervalSpy.mockRestore();
+		}
+	}, 10_000);
+
 	it("adapts the outer coordinator's rescue ping for the Claude Code stream iterator", async () => {
 		process.env[RESCUE_ACTIVATION_ENV] = "5";
 		process.env[RESCUE_PING_ENV] = "1000";
@@ -2185,6 +2374,39 @@ describe("Anthropic stream runtime configuration", () => {
 });
 
 describe("Anthropic precommit rescue runtime configuration", () => {
+	it("restores the bounded eight-minute commitment only for Claude Code clients", () => {
+		delete process.env[MEANINGFUL_PROGRESS_ENV];
+		delete process.env[RESCUE_ACTIVATION_ENV];
+		delete process.env[RESCUE_PING_ENV];
+		delete process.env[RESCUE_DEADLINE_ENV];
+
+		const claudeCodeRequest = makeRequest(
+			undefined,
+			undefined,
+			true,
+			MODEL,
+			"claude-cli/2.1.212 (external, cli)",
+		);
+		const genericRequest = makeRequest(
+			undefined,
+			undefined,
+			true,
+			MODEL,
+			"curl/8.0",
+		);
+
+		expect(getAnthropicPreCommitRescueConfig(claudeCodeRequest)).toEqual({
+			activationGraceMs: ANTHROPIC_PRECOMMIT_RESCUE_ACTIVATION_MS,
+			pingIntervalMs: ANTHROPIC_PRECOMMIT_RESCUE_PING_INTERVAL_MS,
+			commitmentDeadlineMs: 8 * 60 * 1000,
+		});
+		expect(getAnthropicPreCommitRescueConfig(genericRequest)).toEqual({
+			activationGraceMs: ANTHROPIC_PRECOMMIT_RESCUE_ACTIVATION_MS,
+			pingIntervalMs: ANTHROPIC_PRECOMMIT_RESCUE_PING_INTERVAL_MS,
+			commitmentDeadlineMs: ANTHROPIC_PRECOMMIT_RESCUE_COMMITMENT_DEADLINE_MS,
+		});
+	});
+
 	it("falls back to watchdog-safe defaults for invalid values", () => {
 		process.env[RESCUE_ACTIVATION_ENV] = "0";
 		process.env[RESCUE_PING_ENV] = "not-a-number";
@@ -2197,7 +2419,7 @@ describe("Anthropic precommit rescue runtime configuration", () => {
 		});
 	});
 
-	it("clamps a legacy-only rescue deadline to the Claude-safe default", () => {
+	it("clamps a legacy-only rescue deadline to the generic-client default", () => {
 		delete process.env[MEANINGFUL_PROGRESS_ENV];
 		process.env[RESCUE_ACTIVATION_ENV] = String(Number.MAX_SAFE_INTEGER);
 		process.env[RESCUE_PING_ENV] = String(Number.MAX_SAFE_INTEGER);
