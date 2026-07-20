@@ -142,7 +142,7 @@ render_systemd_pin() {
 
 	local input="$1" output="$2" binary="$3" runner="$4"
 	local guard_script="$5" source_id="$6" policy_id="$7" guard_policy_script="$8"
-	local deadline_ms=600000 shutdown_grace_ms=600000
+	local deadline_ms=600000 retry_attempt_headroom_ms=30000 shutdown_grace_ms=600000
 	local kill_mode=mixed stop_timeout=720s
 	local managed_begin="# BEGIN better-ccflare managed deployment"
 	local managed_end="# END better-ccflare managed deployment"
@@ -174,6 +174,7 @@ render_systemd_pin() {
 		printf 'Environment=%s\n' "GUARD_POLICY_SHA256=$guard_policy_sha256"
 		printf 'Environment=%s\n' "RUNNER_SHA256=$runner_sha256"
 		printf 'Environment=%s\n' "GUARD_TOTAL_DEADLINE_MS=$deadline_ms"
+		printf 'Environment=%s\n' "GUARD_RETRY_ATTEMPT_HEADROOM_MS=$retry_attempt_headroom_ms"
 		printf 'Environment=%s\n' "GUARD_SHUTDOWN_GRACE_MS=$shutdown_grace_ms"
 		printf 'KillMode=%s\n' "$kill_mode"
 		printf 'TimeoutStopSec=%s\n' "$stop_timeout"
@@ -384,12 +385,18 @@ validate_deployment_timing() {
 		return 2
 	fi
 
-	local pin="$1" deadline_ms shutdown_grace_ms kill_mode stop_timeout
+	local pin="$1" deadline_ms retry_attempt_headroom_ms shutdown_grace_ms kill_mode stop_timeout
 	local stop_timeout_usec stop_timeout_ms minimum_stop_timeout_usec
 	deadline_ms="$(
 		configured_systemd_environment_value "$pin" GUARD_TOTAL_DEADLINE_MS
 	)" || {
 		echo "systemd pin is missing GUARD_TOTAL_DEADLINE_MS" >&2
+		return 1
+	}
+	retry_attempt_headroom_ms="$(
+		configured_systemd_environment_value "$pin" GUARD_RETRY_ATTEMPT_HEADROOM_MS
+	)" || {
+		echo "systemd pin is missing GUARD_RETRY_ATTEMPT_HEADROOM_MS" >&2
 		return 1
 	}
 	shutdown_grace_ms="$(
@@ -414,6 +421,11 @@ validate_deployment_timing() {
 			return 1
 		fi
 	done
+	if [[ ! "$retry_attempt_headroom_ms" =~ ^[1-9][0-9]{0,9}$ ]] \
+		|| ((retry_attempt_headroom_ms >= deadline_ms)); then
+		echo "unsafe retry-attempt headroom ${retry_attempt_headroom_ms}ms; expected 1..$((deadline_ms - 1))ms" >&2
+		return 1
+	fi
 	if ((shutdown_grace_ms < deadline_ms)); then
 		echo "unsafe shutdown grace ${shutdown_grace_ms}ms; expected at least deadline ${deadline_ms}ms" >&2
 		return 1
@@ -433,7 +445,11 @@ validate_deployment_timing() {
 	fi
 	stop_timeout_ms=$((stop_timeout_usec / 1000))
 
-	printf '%s %s %s\n' "$deadline_ms" "$shutdown_grace_ms" "$stop_timeout_ms"
+	printf '%s %s %s %s\n' \
+		"$deadline_ms" \
+		"$retry_attempt_headroom_ms" \
+		"$shutdown_grace_ms" \
+		"$stop_timeout_ms"
 }
 
 systemd_environment_text_value() {
@@ -487,14 +503,22 @@ NODE
 }
 
 validate_effective_systemd_policy() {
-	if [[ "$#" -ne 1 ]]; then
-		echo "validate_effective_systemd_policy requires one service name" >&2
+	if [[ "$#" -lt 1 || "$#" -gt 2 ]]; then
+		echo "validate_effective_systemd_policy requires: service [allow-missing-retry-headroom]" >&2
 		return 2
 	fi
-	local service="$1"
+	local service="$1" allow_missing_retry_headroom=0
 	local kill_mode stop_timeout effective_environment effective_deadline_ms
-	local effective_shutdown_grace_ms stop_timeout_usec stop_timeout_ms
+	local effective_retry_attempt_headroom_ms effective_shutdown_grace_ms
+	local stop_timeout_usec stop_timeout_ms
 	local minimum_stop_timeout_usec value
+	if [[ "$#" -eq 2 ]]; then
+		allow_missing_retry_headroom="$2"
+	fi
+	if [[ "$allow_missing_retry_headroom" != "0" && "$allow_missing_retry_headroom" != "1" ]]; then
+		echo "allow-missing-retry-headroom must be 0 or 1" >&2
+		return 2
+	fi
 
 	kill_mode="$(systemctl show "$service" --property=KillMode --value)" || return 1
 	stop_timeout="$(systemctl show "$service" --property=TimeoutStopUSec --value)" || return 1
@@ -505,6 +529,20 @@ validate_effective_systemd_policy() {
 		echo "effective systemd environment is missing GUARD_TOTAL_DEADLINE_MS" >&2
 		return 1
 	}
+	if ! effective_retry_attempt_headroom_ms="$(
+		systemd_environment_text_value "$effective_environment" GUARD_RETRY_ATTEMPT_HEADROOM_MS
+	)"; then
+		if [[ "$allow_missing_retry_headroom" == "1" ]]; then
+			# Rollback compatibility: a pin installed before retry headroom existed
+			# cannot publish this environment key. Use the new guard's safe default
+			# only to validate the restored timing tuple; strict pre-restart
+			# validation of the newly rendered pin still requires the explicit key.
+			effective_retry_attempt_headroom_ms=30000
+		else
+			echo "effective systemd environment is missing GUARD_RETRY_ATTEMPT_HEADROOM_MS" >&2
+			return 1
+		fi
+	fi
 	effective_shutdown_grace_ms="$(
 		systemd_environment_text_value "$effective_environment" GUARD_SHUTDOWN_GRACE_MS
 	)" || {
@@ -523,6 +561,11 @@ validate_effective_systemd_policy() {
 			return 1
 		fi
 	done
+	if [[ ! "$effective_retry_attempt_headroom_ms" =~ ^[1-9][0-9]{0,9}$ ]] \
+		|| ((effective_retry_attempt_headroom_ms >= effective_deadline_ms)); then
+		echo "unsafe effective retry-attempt headroom ${effective_retry_attempt_headroom_ms}ms" >&2
+		return 1
+	fi
 	if ((effective_shutdown_grace_ms < effective_deadline_ms)); then
 		echo "effective shutdown grace is shorter than the guard deadline" >&2
 		return 1
@@ -537,8 +580,9 @@ validate_effective_systemd_policy() {
 		return 1
 	fi
 	stop_timeout_ms=$((stop_timeout_usec / 1000))
-	printf '%s %s %s\n' \
+	printf '%s %s %s %s\n' \
 		"$effective_deadline_ms" \
+		"$effective_retry_attempt_headroom_ms" \
 		"$effective_shutdown_grace_ms" \
 		"$stop_timeout_ms"
 }
@@ -564,7 +608,7 @@ reload_validate_or_restore_systemd_policy() {
 		sudo rm -f "$rollback_stage" 2>/dev/null || true
 		return 70
 	fi
-	if ! validate_effective_systemd_policy "$service" >/dev/null; then
+	if ! validate_effective_systemd_policy "$service" 1 >/dev/null; then
 		echo "HARD FAILURE: operator drop-ins still produce an unsafe effective systemd policy after restoring the prior deploy pin" >&2
 		echo "Correct the later operator drop-ins (for example /etc/systemd/system/ccflare-stack.service.d/90-operator-policy.conf) before restarting the service." >&2
 		return 70
@@ -617,6 +661,7 @@ for (const name of ["binary", "runner", "guard", "policy"]) {
 }
 for (const name of [
 	"totalDeadlineMs",
+	"retryAttemptHeadroomMs",
 	"shutdownGraceMs",
 	"maxAttempts",
 	"jitterMs",

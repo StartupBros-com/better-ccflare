@@ -12,6 +12,7 @@ import { createRequestMetadata } from "../../packages/proxy/src/handlers/request
 import {
 	DEFAULT_GUARD_MAX_ATTEMPTS,
 	DEFAULT_GUARD_MAX_INSPECTION_BYTES,
+	DEFAULT_GUARD_RETRY_ATTEMPT_HEADROOM_MS,
 	DEFAULT_GUARD_RESPONSE_IDLE_TIMEOUT_MS,
 	DEFAULT_GUARD_RETRY_JITTER_MS,
 	DEFAULT_GUARD_SOURCE_ID,
@@ -74,6 +75,7 @@ async function startProductionNodeGuard(upstreamBase: string) {
 			GUARD_MAX_ACTIVE: "1",
 			GUARD_MAX_QUEUE: "10",
 			GUARD_MAX_WAIT_MS: "2000",
+			GUARD_RETRY_ATTEMPT_HEADROOM_MS: "10",
 			GUARD_RETRY_JITTER_MS: "0",
 		},
 		stdio: ["ignore", "pipe", "pipe"],
@@ -141,6 +143,7 @@ async function startGuard(
 		maxActive: 4,
 		maxQueue: 10,
 		maxWaitMs: 1_000,
+		retryAttemptHeadroomMs: 10,
 		jitterMs: 0,
 		logger: () => {},
 		...overrides,
@@ -263,6 +266,7 @@ describe("source-controlled guard", () => {
 			},
 			limits: {
 				totalDeadlineMs: 1_000,
+				retryAttemptHeadroomMs: 10,
 				shutdownGraceMs: 600_000,
 				maxAttempts: 3,
 				jitterMs: 0,
@@ -271,6 +275,7 @@ describe("source-controlled guard", () => {
 		});
 		expect(DEFAULT_GUARD_MAX_ATTEMPTS).toBe(3);
 		expect(DEFAULT_GUARD_TOTAL_DEADLINE_MS).toBe(600_000);
+		expect(DEFAULT_GUARD_RETRY_ATTEMPT_HEADROOM_MS).toBe(30_000);
 		expect(DEFAULT_GUARD_RETRY_JITTER_MS).toBe(2_000);
 		expect(DEFAULT_GUARD_MAX_INSPECTION_BYTES).toBe(64 * 1_024);
 		expect(DEFAULT_GUARD_RESPONSE_IDLE_TIMEOUT_MS).toBe(120_000);
@@ -1725,6 +1730,7 @@ describe("source-controlled guard", () => {
 	});
 
 	test("bounds marked pool retries by the configured attempt count", async () => {
+		const events: Array<Record<string, unknown>> = [];
 		let attempts = 0;
 		const upstreamBase = await listen(
 			http.createServer((_req, res) => {
@@ -1743,8 +1749,10 @@ describe("source-controlled guard", () => {
 				);
 			}),
 		);
-		const { baseUrl } = await startGuard(upstreamBase, {
+		const { baseUrl, guard } = await startGuard(upstreamBase, {
+			logger: (line: string) => events.push(JSON.parse(line)),
 			maxAttempts: 3,
+			retryAttemptHeadroomMs: 50,
 			totalDeadlineMs: 2_000,
 		});
 
@@ -1760,6 +1768,13 @@ describe("source-controlled guard", () => {
 			error: { type: "guard_retry_attempts_exhausted" },
 		});
 		expect(attempts).toBe(3);
+		expect(
+			events.filter((event) => event.event === "proxy_retry_wait"),
+		).toHaveLength(2);
+		expect(guard.state.counters.poolExhausted).toBe(3);
+		expect(guard.state.counters.retried).toBe(2);
+		expect(guard.state.counters.attemptsExhausted).toBe(1);
+		expect(guard.state.counters.recoveryBeyondDeadline).toBe(0);
 	});
 
 	test("the absolute deadline covers a slow inbound request body", async () => {
@@ -1907,13 +1922,13 @@ describe("source-controlled guard", () => {
 				attempts += 1;
 				res.writeHead(503, {
 					"content-type": "application/json",
-					"x-better-ccflare-pool-status": "exhausted",
 				});
 				res.write('{"error":{"type":"pool_exhausted"},"padding":"');
 				setTimeout(() => res.end('later"}'), 180);
 			}),
 		);
 		const { baseUrl, guard } = await startGuard(upstreamBase, {
+			allowLegacyPoolBody: true,
 			totalDeadlineMs: 50,
 		});
 
@@ -1930,28 +1945,85 @@ describe("source-controlled guard", () => {
 		await waitFor(() => guard.state.active === 0);
 	});
 
-	test("does not start another attempt when retry sleep reaches the deadline", async () => {
+	test("immediately preserves an infeasible Retry-After response instead of waiting to the deadline", async () => {
+		const events: Array<Record<string, unknown>> = [];
 		let attempts = 0;
+		const body = JSON.stringify({
+			error: { type: "pool_exhausted" },
+			padding: "x".repeat(4_096),
+		});
+		const upstreamBase = await listen(
+			http.createServer((_req, res) => {
+				attempts += 1;
+				if (attempts === 1) {
+					res.writeHead(503, {
+						"content-type": "application/json",
+						"retry-after": "1",
+						"x-better-ccflare-pool-status": "exhausted",
+					});
+					res.write(body.slice(0, 64));
+					setTimeout(() => res.end(body.slice(64)), 20);
+					return;
+				}
+				res.end("recovered");
+			}),
+		);
+		const { baseUrl, guard } = await startGuard(upstreamBase, {
+			logger: (line: string) => events.push(JSON.parse(line)),
+			maxAttempts: 3,
+			maxInspectionBytes: 1_024,
+			retryAttemptHeadroomMs: 100,
+			totalDeadlineMs: 300,
+		});
+
+		const startedAt = Date.now();
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+
+		expect(response.status).toBe(503);
+		expect(response.headers.get("retry-after")).toBe("1");
+		expect(response.headers.get("x-better-ccflare-pool-status")).toBe(
+			"exhausted",
+		);
+		expect(await response.text()).toBe(body);
+		expect(Date.now() - startedAt).toBeLessThan(250);
+		expect(attempts).toBe(1);
+		expect(
+			events.find((event) => event.event === "proxy_final_error"),
+		).toMatchObject({
+			status: 503,
+			outcome: "final_error",
+			reason: "recovery_beyond_deadline",
+			recoverySource: "retry-after",
+		});
+		expect(guard.state.counters.poolExhausted).toBe(1);
+		expect(guard.state.counters.retried).toBe(0);
+		expect(guard.state.counters.deadlineExceeded).toBe(0);
+		expect(guard.state.counters.finalError).toBe(1);
+	});
+
+	test("preserves an infeasible original 503 before applying a one-attempt cap", async () => {
+		let attempts = 0;
+		const body = JSON.stringify({
+			error: { type: "pool_exhausted", message: "retry later" },
+		});
 		const upstreamBase = await listen(
 			http.createServer((_req, res) => {
 				attempts += 1;
 				res.writeHead(503, {
 					"content-type": "application/json",
+					"retry-after": "1",
 					"x-better-ccflare-pool-status": "exhausted",
 				});
-				res.end(
-					JSON.stringify({
-						error: {
-							type: "pool_exhausted",
-							next_available_at: new Date(Date.now() + 1_000).toISOString(),
-						},
-					}),
-				);
+				res.end(body);
 			}),
 		);
-		const { baseUrl } = await startGuard(upstreamBase, {
-			totalDeadlineMs: 60,
-			maxAttempts: 3,
+		const { baseUrl, guard } = await startGuard(upstreamBase, {
+			maxAttempts: 1,
+			retryAttemptHeadroomMs: 100,
+			totalDeadlineMs: 300,
 		});
 
 		const response = await fetch(`${baseUrl}/v1/messages`, {
@@ -1959,11 +2031,277 @@ describe("source-controlled guard", () => {
 			body: "{}",
 		});
 
-		expect(response.status).toBe(504);
-		expect(await response.json()).toMatchObject({
-			error: { type: "guard_deadline_exceeded" },
-		});
+		expect(response.status).toBe(503);
+		expect(response.headers.get("retry-after")).toBe("1");
+		expect(response.headers.get("x-better-ccflare-pool-status")).toBe(
+			"exhausted",
+		);
+		expect(await response.text()).toBe(body);
 		expect(attempts).toBe(1);
+		expect(guard.state.counters.recoveryBeyondDeadline).toBe(1);
+		expect(guard.state.counters.attemptsExhausted).toBe(0);
+		expect(guard.state.counters.retried).toBe(0);
+	});
+
+	test.each([
+		{ name: "trusted header", headers: true, allowLegacyPoolBody: false },
+		{ name: "legacy body", headers: false, allowLegacyPoolBody: true },
+	])(
+		"immediately preserves an infeasible body recovery hint on the $name path",
+		async ({ headers, allowLegacyPoolBody }) => {
+			const events: Array<Record<string, unknown>> = [];
+			let attempts = 0;
+			const body = JSON.stringify({
+				error: {
+					type: "pool_exhausted",
+					next_available_at: new Date(Date.now() + 1_000).toISOString(),
+				},
+			});
+			const upstreamBase = await listen(
+				http.createServer((_req, res) => {
+					attempts += 1;
+					if (attempts === 1) {
+						res.writeHead(503, {
+							"content-type": "application/json",
+							...(headers
+								? { "x-better-ccflare-pool-status": "exhausted" }
+								: {}),
+						});
+						res.end(body);
+						return;
+					}
+					res.end("recovered");
+				}),
+			);
+			const { baseUrl, guard } = await startGuard(upstreamBase, {
+				allowLegacyPoolBody,
+				logger: (line: string) => events.push(JSON.parse(line)),
+				maxAttempts: 3,
+				retryAttemptHeadroomMs: 100,
+				totalDeadlineMs: 300,
+			});
+
+			const startedAt = Date.now();
+			const response = await fetch(`${baseUrl}/v1/messages`, {
+				method: "POST",
+				body: "{}",
+			});
+
+			expect(response.status).toBe(503);
+			expect(await response.text()).toBe(body);
+			expect(Date.now() - startedAt).toBeLessThan(250);
+			expect(attempts).toBe(1);
+			expect(
+				events.find((event) => event.event === "proxy_final_error"),
+			).toMatchObject({
+				status: 503,
+				outcome: "final_error",
+				reason: "recovery_beyond_deadline",
+				recoverySource: "error.next_available_at",
+			});
+			expect(guard.state.counters.poolExhausted).toBe(1);
+			expect(guard.state.counters.retried).toBe(0);
+			expect(guard.state.counters.deadlineExceeded).toBe(0);
+			expect(guard.state.counters.finalError).toBe(1);
+		},
+	);
+
+	test("reserves retry headroom and caps only optional jitter for a feasible recovery hint", async () => {
+		const events: Array<Record<string, unknown>> = [];
+		let attempts = 0;
+		const upstreamBase = await listen(
+			http.createServer((_req, res) => {
+				attempts += 1;
+				if (attempts === 1) {
+					res.writeHead(503, {
+						"content-type": "application/json",
+						"x-better-ccflare-pool-status": "exhausted",
+					});
+					res.end(
+						JSON.stringify({
+							error: {
+								type: "pool_exhausted",
+								next_available_at: new Date(
+									Date.now() + 50,
+								).toISOString(),
+							},
+						}),
+					);
+					return;
+				}
+				res.end("recovered");
+			}),
+		);
+		const { baseUrl, guard } = await startGuard(upstreamBase, {
+			jitterMs: 500,
+			logger: (line: string) => events.push(JSON.parse(line)),
+			maxAttempts: 3,
+			random: () => 0.999,
+			retryAttemptHeadroomMs: 150,
+			totalDeadlineMs: 400,
+		});
+
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+
+		expect(response.status).toBe(200);
+		expect(await response.text()).toBe("recovered");
+		expect(attempts).toBe(2);
+		const retryWait = events.find(
+			(event) => event.event === "proxy_retry_wait",
+		);
+		expect(retryWait).toMatchObject({
+			attempt: 1,
+			recoverySource: "error.next_available_at",
+		});
+		expect(Number(retryWait?.delayMs)).toBeLessThanOrEqual(250);
+		expect(guard.state.counters.retried).toBe(1);
+		expect(guard.state.counters.deadlineExceeded).toBe(0);
+		expect(guard.state.counters.success).toBe(1);
+	});
+
+	test("does not let an earlier body hint shorten the authoritative Retry-After minimum", async () => {
+		const events: Array<Record<string, unknown>> = [];
+		let attempts = 0;
+		const upstreamBase = await listen(
+			http.createServer((_req, res) => {
+				attempts += 1;
+				if (attempts === 1) {
+					res.writeHead(503, {
+						"content-type": "application/json",
+						"retry-after": "1",
+						"x-better-ccflare-pool-status": "exhausted",
+					});
+					res.end(
+						JSON.stringify({
+							error: {
+								type: "pool_exhausted",
+								next_available_at: new Date(
+									Date.now() + 50,
+								).toISOString(),
+							},
+						}),
+					);
+					return;
+				}
+				res.end("recovered");
+			}),
+		);
+		const { baseUrl } = await startGuard(upstreamBase, {
+			logger: (line: string) => events.push(JSON.parse(line)),
+			maxAttempts: 2,
+			retryAttemptHeadroomMs: 300,
+			totalDeadlineMs: 1_500,
+		});
+
+		const startedAt = Date.now();
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+
+		expect(response.status).toBe(200);
+		expect(await response.text()).toBe("recovered");
+		expect(Date.now() - startedAt).toBeGreaterThanOrEqual(900);
+		expect(Date.now() - startedAt).toBeLessThan(1_400);
+		expect(attempts).toBe(2);
+		expect(
+			events.find((event) => event.event === "proxy_retry_wait"),
+		).toMatchObject({ recoverySource: "retry-after", delayMs: 1_000 });
+	});
+
+	test("retains a feasible Retry-After delay when the bounded body peek times out", async () => {
+		const events: Array<Record<string, unknown>> = [];
+		let attempts = 0;
+		const upstreamBase = await listen(
+			http.createServer((_req, res) => {
+				attempts += 1;
+				if (attempts === 1) {
+					res.writeHead(503, {
+						"content-type": "application/json",
+						"retry-after": "1",
+						"x-better-ccflare-pool-status": "exhausted",
+					});
+					res.write('{"error":{"type":"pool_exhausted"}');
+					return;
+				}
+				res.end("recovered");
+			}),
+		);
+		const { baseUrl } = await startGuard(upstreamBase, {
+			delayInspectionTimeoutMs: 30,
+			logger: (line: string) => events.push(JSON.parse(line)),
+			maxAttempts: 2,
+			retryAttemptHeadroomMs: 300,
+			totalDeadlineMs: 1_600,
+		});
+
+		const startedAt = Date.now();
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+		const elapsedMs = Date.now() - startedAt;
+
+		expect(response.status).toBe(200);
+		expect(await response.text()).toBe("recovered");
+		expect(attempts).toBe(2);
+		expect(elapsedMs).toBeGreaterThanOrEqual(900);
+		expect(elapsedMs).toBeLessThan(1_500);
+		expect(
+			events.find((event) => event.event === "proxy_retry_wait"),
+		).toMatchObject({
+			recoverySource: "retry-after",
+			delayMs: 1_000,
+		});
+	});
+
+	test("reconstructs the exact original 503 stream when a timed-out peek becomes infeasible", async () => {
+		let attempts = 0;
+		let clockSkewMs = 0;
+		const body = "partial-prefix-late-tail";
+		const upstreamBase = await listen(
+			http.createServer((_req, res) => {
+				attempts += 1;
+				res.writeHead(503, {
+					"content-type": "text/plain",
+					"retry-after": "1",
+					"x-better-ccflare-pool-status": "exhausted",
+				});
+				res.write("partial-prefix");
+				setTimeout(() => {
+					clockSkewMs = 400;
+				}, 40);
+				setTimeout(() => res.end("-late-tail"), 150);
+			}),
+		);
+		const { baseUrl, guard } = await startGuard(upstreamBase, {
+			delayInspectionTimeoutMs: 100,
+			maxAttempts: 2,
+			now: () => Date.now() + clockSkewMs,
+			responseIdleTimeoutMs: 500,
+			retryAttemptHeadroomMs: 300,
+			totalDeadlineMs: 1_600,
+		});
+
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+
+		expect(response.status).toBe(503);
+		expect(response.headers.get("content-type")).toBe("text/plain");
+		expect(response.headers.get("retry-after")).toBe("1");
+		expect(response.headers.get("x-better-ccflare-pool-status")).toBe(
+			"exhausted",
+		);
+		expect(await response.text()).toBe(body);
+		expect(attempts).toBe(1);
+		expect(guard.state.counters.recoveryBeyondDeadline).toBe(1);
+		expect(guard.state.counters.retried).toBe(0);
+		expect(guard.state.counters.deadlineExceeded).toBe(0);
 	});
 
 	// P1 ordering: the header alone settles retry authorization at header

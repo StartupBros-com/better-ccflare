@@ -23,6 +23,7 @@ import {
 export const DEFAULT_GUARD_SOURCE_ID = "better-ccflare-source-guard-v1";
 export const DEFAULT_GUARD_MAX_ATTEMPTS = 3;
 export const DEFAULT_GUARD_TOTAL_DEADLINE_MS = 600_000;
+export const DEFAULT_GUARD_RETRY_ATTEMPT_HEADROOM_MS = 30_000;
 export const DEFAULT_GUARD_RETRY_JITTER_MS = 2_000;
 export const DEFAULT_GUARD_MAX_INSPECTION_BYTES = 64 * 1_024;
 export const DEFAULT_GUARD_RESPONSE_IDLE_TIMEOUT_MS = 120_000;
@@ -707,16 +708,18 @@ async function sendBufferedResponse(
 	res.end(buffer);
 }
 
+const SOFT_INSPECTION_TIMEOUT = Symbol("soft-inspection-timeout");
+
 // signal aborting rejects a pending read only when it is the SAME signal
 // that was passed to the original fetch() call (undici couples a fetch's
 // signal to its response body for the request's whole lifecycle); an
 // unrelated AbortController never does. softSignal exists for exactly that
 // case: a bounded, best-effort peek (P1 ordering) that must be able to give
 // up on a stalled body on its OWN short timeout, without that timeout being
-// mistaken for the caller's real deadline/client abort. Cancelling the
-// reader directly unblocks a pending read by resolving it with
-// {done: true}, which this function reports as an ordinary (truncated)
-// completion rather than an error, letting the caller degrade gracefully.
+// mistaken for the caller's real deadline/client abort. The soft timeout
+// races, but never cancels, the in-flight read: ownership of the prefix,
+// pending read, and tail is returned together so a terminal response can be
+// reconstructed byte-for-byte or a retry can explicitly cancel it.
 async function readResponseForInspection(response, maxBytes, signal, softSignal) {
 	if (!response.body) {
 		return { oversized: false, buffer: Buffer.alloc(0) };
@@ -730,11 +733,14 @@ async function readResponseForInspection(response, maxBytes, signal, softSignal)
 	const reader = response.body.getReader();
 	const chunks = [];
 	let bytes = 0;
+	let resolveSoftAbort;
+	const softAbortPromise = softSignal
+		? new Promise((resolve) => {
+			resolveSoftAbort = resolve;
+		})
+		: null;
 	const onSoftAbort = () => {
-		reader.cancel().catch(() => {
-			// Best-effort: a concurrent real cancel/error may already be
-			// tearing the reader down.
-		});
+		resolveSoftAbort?.(SOFT_INSPECTION_TIMEOUT);
 	};
 	if (softSignal) {
 		if (softSignal.aborted) onSoftAbort();
@@ -743,7 +749,39 @@ async function readResponseForInspection(response, maxBytes, signal, softSignal)
 	try {
 		while (true) {
 			if (signal?.aborted) throw signal.reason || abortError();
-			const { done, value } = await reader.read();
+			if (softSignal?.aborted) {
+				if (bytes === 0) {
+					reader.releaseLock();
+					return {
+						oversized: false,
+						incomplete: true,
+						untouched: true,
+					};
+				}
+				return {
+					oversized: false,
+					incomplete: true,
+					untouched: false,
+					reader,
+					prefix: chunks,
+					pendingRead: null,
+				};
+			}
+			const pendingRead = reader.read();
+			const result = softAbortPromise
+				? await Promise.race([pendingRead, softAbortPromise])
+				: await pendingRead;
+			if (result === SOFT_INSPECTION_TIMEOUT) {
+				return {
+					oversized: false,
+					incomplete: true,
+					untouched: false,
+					reader,
+					prefix: chunks,
+					pendingRead,
+				};
+			}
+			const { done, value } = result;
 			if (done) {
 				reader.releaseLock();
 				return {
@@ -770,9 +808,40 @@ async function readResponseForInspection(response, maxBytes, signal, softSignal)
 		} catch {
 			// Preserve the original read/abort failure.
 		}
+		try {
+			reader.releaseLock();
+		} catch {
+			// A concurrent stream failure may already have released ownership.
+		}
 		throw error;
 	} finally {
 		softSignal?.removeEventListener("abort", onSoftAbort);
+	}
+}
+
+async function cancelInspectedResponse(response, inspection) {
+	if (inspection?.reader) {
+		try {
+			await inspection.reader.cancel();
+		} catch {
+			// Best-effort: the fetch signal may already have cancelled the body.
+		}
+		try {
+			await inspection.pendingRead;
+		} catch {
+			// Settling the saved read prevents an unhandled rejection after cancel.
+		}
+		try {
+			inspection.reader.releaseLock();
+		} catch {
+			// The reader may already have released after a concurrent failure.
+		}
+		return;
+	}
+	try {
+		await response.body?.cancel();
+	} catch {
+		// Best-effort: a completed or concurrently cancelled body needs no cleanup.
 	}
 }
 
@@ -794,16 +863,36 @@ async function sendPartiallyReadResponse(
 	}
 
 	async function* chunks() {
+		let completed = false;
+		let pendingRead = inspection.pendingRead;
 		try {
-			for (const chunk of inspection.prefix) yield chunk;
-			yield inspection.overflow;
+			for (const chunk of inspection.prefix || []) yield chunk;
+			if (inspection.overflow) yield inspection.overflow;
 			while (true) {
-				const { done, value } = await inspection.reader.read();
-				if (done) return;
+				const result = pendingRead
+					? await pendingRead
+					: await inspection.reader.read();
+				pendingRead = null;
+				const { done, value } = result;
+				if (done) {
+					completed = true;
+					return;
+				}
 				yield Buffer.from(value.buffer, value.byteOffset, value.byteLength);
 			}
 		} finally {
-			inspection.reader.releaseLock();
+			if (!completed) {
+				try {
+					await inspection.reader.cancel();
+				} catch {
+					// The idle watchdog/client may already have cancelled the stream.
+				}
+			}
+			try {
+				inspection.reader.releaseLock();
+			} catch {
+				// The stream may already have released ownership after an error.
+			}
 		}
 	}
 
@@ -848,6 +937,22 @@ export function outcomeForStatus(status) {
 	return status >= 200 && status < 300 ? "success" : "final_error";
 }
 
+function planRetryDelay({
+	recoveryDelayMs,
+	remainingMs,
+	retryAttemptHeadroomMs,
+	jitterMs,
+	random,
+}) {
+	const availableDelayMs = remainingMs - retryAttemptHeadroomMs;
+	if (availableDelayMs < 0 || recoveryDelayMs > availableDelayMs) return null;
+	const requestedJitter = Math.max(0, Math.floor(random() * jitterMs));
+	return (
+		recoveryDelayMs +
+		Math.min(requestedJitter, availableDelayMs - recoveryDelayMs)
+	);
+}
+
 export function createGuard(options = {}) {
 	const env = options.env || process.env;
 	const listenHost = options.listenHost ?? env.GUARD_HOST ?? "127.0.0.1";
@@ -878,6 +983,16 @@ export function createGuard(options = {}) {
 				options.maxWaitMs ??
 				env.GUARD_MAX_WAIT_MS,
 			DEFAULT_GUARD_TOTAL_DEADLINE_MS,
+		),
+	);
+	const retryAttemptHeadroomMs = Math.max(
+		1,
+		Math.floor(
+			configuredNumber(
+				options.retryAttemptHeadroomMs ??
+					env.GUARD_RETRY_ATTEMPT_HEADROOM_MS,
+				DEFAULT_GUARD_RETRY_ATTEMPT_HEADROOM_MS,
+			),
 		),
 	);
 	const maxAttempts = Math.max(
@@ -961,6 +1076,7 @@ export function createGuard(options = {}) {
 		queueFull: 0,
 		aborted: 0,
 		deadlineExceeded: 0,
+		recoveryBeyondDeadline: 0,
 		attemptsExhausted: 0,
 		oversizedInspectionBodies: 0,
 		responseBodyIdleTimeouts: 0,
@@ -1281,6 +1397,58 @@ export function createGuard(options = {}) {
 		);
 	}
 
+	async function forwardRecoveryBeyondDeadline(
+		res,
+		context,
+		attempt,
+		upstreamResponse,
+		{
+			buffer,
+			inspection,
+			recoveryDelayMs,
+			recoverySource,
+			remainingMs,
+		},
+	) {
+		if (inspection?.oversized || inspection?.incomplete) {
+			await sendPartiallyReadResponse(
+				res,
+				upstreamResponse,
+				inspection,
+				context.beginResponse,
+				responseIdleTimeoutMs,
+			);
+		} else if (buffer === undefined) {
+			await sendFinalResponse(
+				res,
+				upstreamResponse,
+				context.beginResponse,
+				responseIdleTimeoutMs,
+			);
+		} else {
+			await sendBufferedResponse(
+				res,
+				upstreamResponse,
+				buffer,
+				context.beginResponse,
+			);
+		}
+		counters.recoveryBeyondDeadline += 1;
+		counters.finalError += 1;
+		log("proxy_final_error", {
+			id: context.id,
+			attempt,
+			status: upstreamResponse.status,
+			outcome: outcomeForStatus(upstreamResponse.status),
+			reason: "recovery_beyond_deadline",
+			recoverySource,
+			recoveryDelayMs,
+			remainingMs,
+			retryAttemptHeadroomMs,
+			elapsedMs: now() - context.acceptedAt,
+		});
+	}
+
 	async function handleLimited(req, res, body, context, upstreamTarget) {
 		const { id } = context;
 		counters.total += 1;
@@ -1396,70 +1564,126 @@ export function createGuard(options = {}) {
 					// hostage to upstream body I/O.
 					lease.release();
 
-					let delayMs = 0;
-					let recoverySource = null;
-					const peekController = new AbortController();
-					const peekTimer = setTimeout(
-						() => peekController.abort(),
-						delayInspectionTimeoutMs,
-					);
-					peekTimer.unref?.();
-					try {
-						const inspection = await readResponseForInspection(
+					const headerHint = evaluateGuardRetry({
+						status: upstreamResponse.status,
+						headers: upstreamResponse.headers,
+						bodyText: "",
+						nowMs: now(),
+						allowLegacyBody: allowLegacyPoolBody,
+					});
+					let delayMs = headerHint.delayMs;
+					let recoverySource = headerHint.recoverySource;
+					let inspection;
+					const headerRemainingMs = context.remainingMs();
+					const headerDelayBudgetMs =
+						headerRemainingMs - retryAttemptHeadroomMs;
+
+					// If even the header-time recovery floor (including zero delay)
+					// cannot leave one attempt's headroom, preserve the untouched 503
+					// immediately instead of consuming its body.
+					if (delayMs > headerDelayBudgetMs) {
+						counters.poolExhausted += 1;
+						await forwardRecoveryBeyondDeadline(
+							res,
+							context,
+							attempt,
 							upstreamResponse,
-							maxInspectionBytes,
-							context.signal,
-							peekController.signal,
+							{
+								recoveryDelayMs: delayMs,
+								recoverySource,
+								remainingMs: headerRemainingMs,
+							},
 						);
-						if (inspection.oversized) {
-							counters.oversizedInspectionBodies += 1;
-							if (inspection.reader) {
-								try {
-									await inspection.reader.cancel();
-								} catch {
-									// Best-effort: the retry is already authorized.
-								}
-							} else {
-								try {
-									await upstreamResponse.body?.cancel();
-								} catch {
-									// Best-effort.
-								}
+						return;
+					}
+
+					// Preserve at least half of all spare retry budget during the
+					// bounded peek. A complete body may reveal a later blocker, but
+					// can never shorten the authoritative Retry-After minimum; an
+					// incomplete body cannot change the seeded header-time hint.
+					const inspectionSlackMs = headerDelayBudgetMs - delayMs;
+					const peekTimeoutMs = Math.min(
+						delayInspectionTimeoutMs,
+						Math.max(0, Math.floor(inspectionSlackMs / 2)),
+					);
+					if (peekTimeoutMs > 0) {
+						const peekController = new AbortController();
+						const peekTimer = setTimeout(
+							() => peekController.abort(),
+							peekTimeoutMs,
+						);
+						peekTimer.unref?.();
+						try {
+							inspection = await readResponseForInspection(
+								upstreamResponse,
+								maxInspectionBytes,
+								context.signal,
+								peekController.signal,
+							);
+							if (inspection.oversized) {
+								counters.oversizedInspectionBodies += 1;
+							} else if (!inspection.incomplete) {
+								const hint = evaluateGuardRetry({
+									status: upstreamResponse.status,
+									headers: upstreamResponse.headers,
+									bodyText: inspection.buffer.toString("utf8"),
+									nowMs: now(),
+									allowLegacyBody: allowLegacyPoolBody,
+								});
+								delayMs = hint.delayMs;
+								recoverySource = hint.recoverySource;
 							}
-						} else {
-							const hint = evaluateGuardRetry({
-								status: upstreamResponse.status,
-								headers: upstreamResponse.headers,
-								bodyText: inspection.buffer.toString("utf8"),
-								nowMs: now(),
-								allowLegacyBody: allowLegacyPoolBody,
-							});
-							delayMs = hint.delayMs;
-							recoverySource = hint.recoverySource;
+						} catch (error) {
+							// A genuine deadline/client abort must still propagate; the
+							// bounded peek's own short timeout (or any other body-read
+							// error) keeps the seeded header hint.
+							if (context.signal.aborted) throw error;
+						} finally {
+							clearTimeout(peekTimer);
 						}
-					} catch (error) {
-						// A genuine deadline/client abort must still propagate; the
-						// bounded peek's own short timeout (or any other body-read
-						// error) degrades silently to no delay hint instead -- the
-						// reader has already been cancelled by
-						// readResponseForInspection.
-						if (context.signal.aborted) throw error;
-					} finally {
-						clearTimeout(peekTimer);
 					}
 
 					counters.poolExhausted += 1;
+					try {
+						context.ensureBudget();
+					} catch (error) {
+						await cancelInspectedResponse(upstreamResponse, inspection);
+						throw error;
+					}
+					const remainingMs = context.remainingMs();
+					const boundedDelayMs = planRetryDelay({
+						recoveryDelayMs: delayMs,
+						remainingMs,
+						retryAttemptHeadroomMs,
+						jitterMs,
+						random,
+					});
+					if (boundedDelayMs === null) {
+						await forwardRecoveryBeyondDeadline(
+							res,
+							context,
+							attempt,
+							upstreamResponse,
+							{
+								buffer:
+									inspection?.oversized || inspection?.incomplete
+									? undefined
+									: inspection?.buffer,
+								inspection,
+								recoveryDelayMs: delayMs,
+								recoverySource,
+								remainingMs,
+							},
+						);
+						return;
+					}
 					if (attempt >= maxAttempts) {
+						await cancelInspectedResponse(upstreamResponse, inspection);
 						sendAttemptsExhausted(res, context, attempt);
 						return;
 					}
-					context.ensureBudget();
+					await cancelInspectedResponse(upstreamResponse, inspection);
 					counters.retried += 1;
-					const jitter = Math.floor(random() * jitterMs);
-					const boundedDelayMs = Math.min(
-						delayMs + jitter,
-						context.remainingMs(),
-					);
 					log("proxy_retry_wait", {
 						id,
 						attempt,
@@ -1546,17 +1770,35 @@ export function createGuard(options = {}) {
 					}
 
 					counters.poolExhausted += 1;
+					context.ensureBudget();
+					const remainingMs = context.remainingMs();
+					const delayMs = planRetryDelay({
+						recoveryDelayMs: decision.delayMs,
+						remainingMs,
+						retryAttemptHeadroomMs,
+						jitterMs,
+						random,
+					});
+					if (delayMs === null) {
+						await forwardRecoveryBeyondDeadline(
+							res,
+							context,
+							attempt,
+							upstreamResponse,
+							{
+								buffer,
+								recoveryDelayMs: decision.delayMs,
+								recoverySource: decision.recoverySource,
+								remainingMs,
+							},
+						);
+						return;
+					}
 					if (attempt >= maxAttempts) {
 						sendAttemptsExhausted(res, context, attempt);
 						return;
 					}
-					context.ensureBudget();
 					counters.retried += 1;
-					const jitter = Math.floor(random() * jitterMs);
-					const delayMs = Math.min(
-						decision.delayMs + jitter,
-						context.remainingMs(),
-					);
 					log("proxy_retry_wait", {
 						id,
 						attempt,
@@ -1701,6 +1943,7 @@ export function createGuard(options = {}) {
 					maxActive,
 					maxAttempts,
 					totalDeadlineMs,
+					retryAttemptHeadroomMs,
 					jitterMs,
 					maxInspectionBytes,
 					responseIdleTimeoutMs,
@@ -1711,6 +1954,7 @@ export function createGuard(options = {}) {
 						...runtimeIdentity,
 						limits: {
 							totalDeadlineMs,
+							retryAttemptHeadroomMs,
 							maxAttempts,
 							jitterMs,
 							maxInspectionBytes,
@@ -1798,6 +2042,7 @@ export function createGuard(options = {}) {
 					maxQueue,
 					maxAttempts,
 					totalDeadlineMs,
+					retryAttemptHeadroomMs,
 					maxInspectionBytes,
 					responseIdleTimeoutMs,
 					delayInspectionTimeoutMs,
