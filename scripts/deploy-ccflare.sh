@@ -11,21 +11,22 @@
 #   binaries (better-ccflare-v*-drill-*, -logfix-*, -progate-*, ...) in
 #   /home/will/.config/better-ccflare. This script replaces that process
 #   with one command, and — the actual point — it REFUSES to build/deploy
-#   any commit that is not an ancestor of origin/main. Production may only
-#   ever run code that has landed on main.
+#   unless the checkout is the local `main` branch at the exact freshly
+#   fetched origin/main tip. Production may only run current main.
 #
 # USAGE
 #   scripts/deploy-ccflare.sh            Build, deploy, restart, verify.
-#   scripts/deploy-ccflare.sh --check    Run ONLY the main-ancestry gate,
+#   scripts/deploy-ccflare.sh --check    Run ONLY the main-source gate,
 #                                        print OK/refuse, and exit. Builds
 #                                        and deploys nothing. Safe to run
 #                                        any time, from any branch, to test
 #                                        the gate itself.
 #
 # WHAT A FULL RUN DOES
-#   1. `git fetch origin` (quiet), then refuse unless HEAD is an ancestor
-#      of origin/main, the working tree is clean, and package versions are not
-#      behind the highest v* tag already contained in HEAD.
+#   1. Fetch the explicit refs/heads/main ref (quiet), then refuse unless the
+#      checkout is refs/heads/main exactly at refs/remotes/origin/main, HEAD is
+#      an ancestor of that remote tip, the working tree is clean, and package
+#      versions are not behind the highest v* tag already contained in HEAD.
 #   2. `bun run build` -> apps/cli/dist/better-ccflare.
 #   3. Copy the binary to
 #      /home/will/.config/better-ccflare/better-ccflare-v<version>-<short-sha>
@@ -182,20 +183,36 @@ for arg in "$@"; do
 done
 
 # ---------------------------------------------------------------------------
-# 1) Ancestry gate — the actual guardrail. Everything else is convenience.
+# 1) Main source gate — the actual guardrail. Everything else is convenience.
 # ---------------------------------------------------------------------------
-echo "==> Fetching origin…"
-git fetch origin --quiet
+echo "==> Fetching refs/heads/main from origin…"
+# The repository also has a local tag named `main`. Use fully qualified refs
+# for fetch, branch identity, and comparison so the tag can never satisfy (or
+# make ambiguous) the production source gate.
+git fetch origin refs/heads/main:refs/remotes/origin/main --quiet
 
 HEAD_SHA="$(git rev-parse HEAD)"
 SHORT="$(git rev-parse --short HEAD)"
+ORIGIN_MAIN_SHA="$(git rev-parse refs/remotes/origin/main)"
+CURRENT_BRANCH_REF="$(git symbolic-ref -q HEAD 2>/dev/null || true)"
 
+MAIN_SOURCE_OK=0
+if validate_main_deploy_source \
+	"$CURRENT_BRANCH_REF" \
+	"$HEAD_SHA" \
+	"$ORIGIN_MAIN_SHA"; then
+	MAIN_SOURCE_OK=1
+fi
+
+# Retain the historical ancestry proof as a separate defense-in-depth check.
+# Exact tip equality above is stricter, but this also makes the intended Git
+# relationship explicit if the gate evolves later.
 ANCESTRY_OK=0
-if git merge-base --is-ancestor "$HEAD_SHA" origin/main; then
+if git merge-base --is-ancestor "$HEAD_SHA" refs/remotes/origin/main; then
 	ANCESTRY_OK=1
-	echo "OK: $SHORT is an ancestor of origin/main."
+	echo "OK: $SHORT is an ancestor of refs/remotes/origin/main."
 else
-	echo "refusing to deploy: $SHORT is not an ancestor of origin/main (deploy only code that is on main)" >&2
+	echo "refusing to deploy: $SHORT is not an ancestor of refs/remotes/origin/main" >&2
 fi
 
 # Clean-tree gate: the ancestry check verifies the committed HEAD, but the
@@ -248,10 +265,10 @@ else
 fi
 
 if [[ "$CHECK_ONLY" == "1" ]]; then
-	{ [[ "$ANCESTRY_OK" == "1" && "$TREE_OK" == "1" && "$VERSION_OK" == "1" ]]; } && exit 0 || exit 1
+	{ [[ "$MAIN_SOURCE_OK" == "1" && "$ANCESTRY_OK" == "1" && "$TREE_OK" == "1" && "$VERSION_OK" == "1" ]]; } && exit 0 || exit 1
 fi
 
-if [[ "$ANCESTRY_OK" != "1" || "$TREE_OK" != "1" || "$VERSION_OK" != "1" ]]; then
+if [[ "$MAIN_SOURCE_OK" != "1" || "$ANCESTRY_OK" != "1" || "$TREE_OK" != "1" || "$VERSION_OK" != "1" ]]; then
 	exit 1
 fi
 

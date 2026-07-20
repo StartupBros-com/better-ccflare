@@ -4,6 +4,34 @@
 # the one pre-restart activation helper isolates its sudo/systemd mutation so the
 # exact reload, effective-policy check, and no-restart rollback can be mocked.
 
+validate_main_deploy_source() {
+	if [[ "$#" -ne 3 ]]; then
+		echo "validate_main_deploy_source requires: checkout-ref HEAD-SHA origin-main-SHA" >&2
+		return 2
+	fi
+
+	local checkout_ref="$1" head_sha="$2" origin_main_sha="$3"
+	if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ || ! "$origin_main_sha" =~ ^[0-9a-f]{40}$ ]]; then
+		echo "validate_main_deploy_source requires full lowercase Git SHAs" >&2
+		return 2
+	fi
+
+	if [[ -z "$checkout_ref" ]]; then
+		echo "refusing to deploy: checkout has detached HEAD; checkout must be refs/heads/main" >&2
+		return 1
+	fi
+	if [[ "$checkout_ref" != "refs/heads/main" ]]; then
+		echo "refusing to deploy: checkout is $checkout_ref; checkout must be refs/heads/main" >&2
+		return 1
+	fi
+	if [[ "$head_sha" != "$origin_main_sha" ]]; then
+		echo "refusing to deploy: refs/heads/main at ${head_sha:0:12} does not exactly match refs/remotes/origin/main at ${origin_main_sha:0:12}" >&2
+		return 1
+	fi
+
+	echo "OK: ${head_sha:0:12} is refs/heads/main at refs/remotes/origin/main."
+}
+
 render_systemd_pin() {
 	if [[ "$#" -ne 8 ]]; then
 		echo "render_systemd_pin requires: input output binary runner guard source-id policy-id guard-policy-script" >&2

@@ -1232,7 +1232,81 @@ process.on("SIGTERM", () => {
 	}, 20_000);
 });
 
+describe("validate_main_deploy_source", () => {
+	function runSourceGate(
+		branchRef: string,
+		headSha: string,
+		originMainSha: string,
+	) {
+		return bash(
+			[
+				`source ${shellQuote(helperScriptForShell)}`,
+				`validate_main_deploy_source ${shellQuote(branchRef)} ${shellQuote(headSha)} ${shellQuote(originMainSha)}`,
+			].join("\n"),
+		);
+	}
+
+	test("accepts only refs/heads/main at the fetched origin/main tip", () => {
+		const sha = "a".repeat(40);
+		const result = runSourceGate("refs/heads/main", sha, sha);
+
+		expect(result.exitCode).toBe(0);
+		expect(result.stderr.toString()).toBe("");
+		expect(result.stdout.toString()).toContain(
+			"is refs/heads/main at refs/remotes/origin/main",
+		);
+	});
+
+	test("rejects a feature branch even when it points at origin/main", () => {
+		const sha = "a".repeat(40);
+		const result = runSourceGate(
+			"refs/heads/codex/example",
+			sha,
+			sha,
+		);
+
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr.toString()).toContain(
+			"checkout must be refs/heads/main",
+		);
+	});
+
+	test("rejects detached HEAD even when it points at origin/main", () => {
+		const sha = "a".repeat(40);
+		const result = runSourceGate("", sha, sha);
+
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr.toString()).toContain("checkout has detached HEAD");
+	});
+
+	test("rejects local main whenever it differs from fetched origin/main", () => {
+		const result = runSourceGate(
+			"refs/heads/main",
+			"1111111111111111111111111111111111111111",
+			"2222222222222222222222222222222222222222",
+		);
+
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr.toString()).toContain(
+			"does not exactly match refs/remotes/origin/main",
+		);
+	});
+});
+
 describe("deployment flow safety contracts", () => {
+	test("fetches and validates exact unambiguous main refs", () => {
+		const source = readFileSync(deployScript, "utf8");
+		expect(source).toContain(
+			"git fetch origin refs/heads/main:refs/remotes/origin/main --quiet",
+		);
+		expect(source).toContain("git symbolic-ref -q HEAD");
+		expect(source).toContain("git rev-parse refs/remotes/origin/main");
+		expect(source).toContain("validate_main_deploy_source");
+		expect(source).toContain(
+			'git merge-base --is-ancestor "$HEAD_SHA" refs/remotes/origin/main',
+		);
+	});
+
 	test("check-only exits before build, sudo, artifact installation, or restart", () => {
 		const source = readFileSync(deployScript, "utf8");
 		const checkExit = source.indexOf('if [[ "$CHECK_ONLY" == "1" ]]');
