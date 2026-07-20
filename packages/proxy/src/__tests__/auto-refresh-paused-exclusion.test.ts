@@ -7,27 +7,10 @@
  * retries forever, while a manual pause unexpectedly keeps contacting upstream.
  */
 import { Database } from "bun:sqlite";
-import { describe, expect, it, mock } from "bun:test";
+import { describe, expect, it, mock, spyOn } from "bun:test";
+import { getProvider } from "@better-ccflare/providers";
 import { BunSqlAdapter } from "../../../database/src/adapters/bun-sql-adapter";
 import { ensureSchema, runMigrations } from "../../../database/src/migrations";
-
-interface RefreshProvider {
-	refreshToken(account: { id: string }): Promise<{
-		accessToken: string;
-		expiresAt: number;
-		refreshToken: string;
-	}>;
-}
-
-const providers = new Map<string, RefreshProvider>();
-mock.module("@better-ccflare/providers", () => ({
-	fetchUsageData: mock(async () => ({ data: null, retryAfterMs: null })),
-	getProvider: (name: string) => providers.get(name),
-}));
-mock.module("../handlers", () => ({
-	getValidAccessToken: mock(async () => null),
-	pauseAccountForReauthIfInvalidGrant: mock(async () => false),
-}));
 
 interface AccountSeed {
 	id: string;
@@ -75,7 +58,6 @@ async function makeScheduler(sqliteDb: Database) {
 
 describe("AutoRefreshScheduler proactive OAuth refresh pause exclusion", () => {
 	it("skips terminally and manually paused accounts while refreshing active accounts", async () => {
-		providers.clear();
 		const db = new Database(":memory:");
 		ensureSchema(db);
 		runMigrations(db);
@@ -113,23 +95,37 @@ describe("AutoRefreshScheduler proactive OAuth refresh pause exclusion", () => {
 				refreshToken: `new-refresh-${account.id}`,
 			};
 		});
-		providers.set("xai", { refreshToken });
-		providers.set("codex", { refreshToken });
-
-		const scheduler = await makeScheduler(db);
-		for (let tick = 0; tick < 2; tick++) {
-			await scheduler.checkAndRefreshOpenAICompatibleOAuthTokens();
-			await scheduler.checkAndRefreshCodexTokens();
+		const xaiProvider = getProvider("xai");
+		const codexProvider = getProvider("codex");
+		if (!xaiProvider || !codexProvider) {
+			throw new Error("Expected built-in xAI and Codex providers");
 		}
+		const xaiRefreshSpy = spyOn(xaiProvider, "refreshToken").mockImplementation(
+			refreshToken as never,
+		);
+		const codexRefreshSpy = spyOn(
+			codexProvider,
+			"refreshToken",
+		).mockImplementation(refreshToken as never);
 
-		expect(
-			refreshAttempts.filter((id) => id.includes("oauth-invalid")),
-		).toEqual([]);
-		expect(refreshAttempts.filter((id) => id.includes("manual"))).toEqual([]);
-		expect(
-			refreshAttempts.filter((id) => id.endsWith("-active")).sort(),
-		).toEqual(["codex-active", "xai-active"]);
+		try {
+			const scheduler = await makeScheduler(db);
+			for (let tick = 0; tick < 2; tick++) {
+				await scheduler.checkAndRefreshOpenAICompatibleOAuthTokens();
+				await scheduler.checkAndRefreshCodexTokens();
+			}
 
-		db.close();
+			expect(
+				refreshAttempts.filter((id) => id.includes("oauth-invalid")),
+			).toEqual([]);
+			expect(refreshAttempts.filter((id) => id.includes("manual"))).toEqual([]);
+			expect(
+				refreshAttempts.filter((id) => id.endsWith("-active")).sort(),
+			).toEqual(["codex-active", "xai-active"]);
+		} finally {
+			xaiRefreshSpy.mockRestore();
+			codexRefreshSpy.mockRestore();
+			db.close();
+		}
 	});
 });
