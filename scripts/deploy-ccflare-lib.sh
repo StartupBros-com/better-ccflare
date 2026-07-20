@@ -4,6 +4,136 @@
 # the one pre-restart activation helper isolates its sudo/systemd mutation so the
 # exact reload, effective-policy check, and no-restart rollback can be mocked.
 
+validate_main_deploy_source() {
+	if [[ "$#" -ne 3 ]]; then
+		echo "validate_main_deploy_source requires: checkout-ref HEAD-SHA origin-main-SHA" >&2
+		return 2
+	fi
+
+	local checkout_ref="$1" head_sha="$2" origin_main_sha="$3"
+	if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ || ! "$origin_main_sha" =~ ^[0-9a-f]{40}$ ]]; then
+		echo "validate_main_deploy_source requires full lowercase Git SHAs" >&2
+		return 2
+	fi
+
+	if [[ -z "$checkout_ref" ]]; then
+		echo "refusing to deploy: checkout has detached HEAD; checkout must be refs/heads/main" >&2
+		return 1
+	fi
+	if [[ "$checkout_ref" != "refs/heads/main" ]]; then
+		echo "refusing to deploy: checkout is $checkout_ref; checkout must be refs/heads/main" >&2
+		return 1
+	fi
+	if [[ "$head_sha" != "$origin_main_sha" ]]; then
+		echo "refusing to deploy: refs/heads/main at ${head_sha:0:12} does not exactly match refs/remotes/origin/main at ${origin_main_sha:0:12}" >&2
+		return 1
+	fi
+
+	echo "OK: ${head_sha:0:12} is refs/heads/main at refs/remotes/origin/main."
+}
+
+create_verified_source_snapshot() {
+	if [[ "$#" -ne 3 ]]; then
+		echo "create_verified_source_snapshot requires: repository snapshot-path HEAD-SHA" >&2
+		return 2
+	fi
+
+	local repository="$1" snapshot_path="$2" head_sha="$3"
+	local snapshot_head snapshot_ref
+	if [[ ! -d "$repository" || ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+		echo "create_verified_source_snapshot requires a Git repository and full lowercase HEAD SHA" >&2
+		return 2
+	fi
+	if [[ -e "$snapshot_path" ]]; then
+		echo "refusing to create verified source snapshot over existing path $snapshot_path" >&2
+		return 2
+	fi
+
+	git -C "$repository" worktree add --detach --quiet "$snapshot_path" "$head_sha" \
+		|| return 1
+	snapshot_head="$(git -C "$snapshot_path" rev-parse HEAD 2>/dev/null || true)"
+	snapshot_ref="$(git -C "$snapshot_path" symbolic-ref -q HEAD 2>/dev/null || true)"
+	if [[ "$snapshot_head" != "$head_sha" || -n "$snapshot_ref" ]]; then
+		echo "verified source snapshot did not resolve to detached $head_sha" >&2
+		git -C "$repository" worktree remove --force "$snapshot_path" 2>/dev/null || true
+		return 1
+	fi
+}
+
+remove_verified_source_snapshot() {
+	if [[ "$#" -ne 2 ]]; then
+		echo "remove_verified_source_snapshot requires: repository snapshot-path" >&2
+		return 2
+	fi
+
+	local repository="$1" snapshot_path="$2" registered_path
+	if [[ ! -d "$repository" || -z "$snapshot_path" ]]; then
+		echo "remove_verified_source_snapshot requires a Git repository and snapshot path" >&2
+		return 2
+	fi
+	registered_path="$(
+		git -C "$repository" worktree list --porcelain 2>/dev/null \
+			| awk -v target="$snapshot_path" '$0 == "worktree " target { print target; exit }'
+	)"
+	if [[ -z "$registered_path" ]]; then
+		if [[ -e "$snapshot_path" ]]; then
+			echo "refusing to remove unregistered source snapshot path $snapshot_path" >&2
+			return 1
+		fi
+		return 0
+	fi
+
+	git -C "$repository" worktree remove --force "$registered_path"
+}
+
+validate_deploy_owned_systemd_pin() {
+	if [[ "$#" -ne 1 || ! -f "$1" ]]; then
+		echo "validate_deploy_owned_systemd_pin requires an existing systemd drop-in" >&2
+		return 2
+	fi
+
+	local input="$1"
+	local managed_begin="# BEGIN better-ccflare managed deployment"
+	local managed_end="# END better-ccflare managed deployment"
+	awk \
+		-v input="$input" \
+		-v begin="$managed_begin" \
+		-v end="$managed_end" '
+		function guidance() {
+			print "Migrate operator policy to a later drop-in such as /etc/systemd/system/ccflare-stack.service.d/90-operator-policy.conf, then leave 50-pinned-build.conf deploy-owned." > "/dev/stderr"
+		}
+		function fail(message) {
+			print message > "/dev/stderr"
+			guidance()
+			failed = 1
+			exit 1
+		}
+		$0 == begin {
+			if (managed || blocks > 0) {
+				fail("refusing to deploy: " input " has invalid managed marker structure at line " NR ".")
+			}
+			managed = 1
+			blocks += 1
+			next
+		}
+		$0 == end {
+			if (!managed) {
+				fail("refusing to deploy: " input " has invalid managed marker structure at line " NR ".")
+			}
+			managed = 0
+			next
+		}
+		!managed && $0 !~ /^[[:space:]]*([#;].*)?$/ {
+			fail("refusing to deploy: " input " contains unmanaged systemd configuration outside \047" begin "\047 and \047" end "\047 (line " NR ": " $0 ").")
+		}
+		END {
+			if (!failed && managed) {
+				fail("refusing to deploy: " input " has invalid managed marker structure: missing \047" end "\047.")
+			}
+		}
+	' "$input"
+}
+
 render_systemd_pin() {
 	if [[ "$#" -ne 8 ]]; then
 		echo "render_systemd_pin requires: input output binary runner guard source-id policy-id guard-policy-script" >&2
@@ -12,9 +142,15 @@ render_systemd_pin() {
 
 	local input="$1" output="$2" binary="$3" runner="$4"
 	local guard_script="$5" source_id="$6" policy_id="$7" guard_policy_script="$8"
-	local deadline_ms shutdown_grace_ms kill_mode stop_timeout status
+	local deadline_ms=600000 shutdown_grace_ms=600000
+	local kill_mode=mixed stop_timeout=720s
 	local managed_begin="# BEGIN better-ccflare managed deployment"
 	local managed_end="# END better-ccflare managed deployment"
+
+	# This drop-in is a deploy-owned identity document. Operator policy belongs
+	# in a later drop-in, where systemd can merge it explicitly without leaving
+	# stale artifact identity or ExecStart lines beside this managed block.
+	validate_deploy_owned_systemd_pin "$input" || return "$?"
 
 	# Digests are computed at render time from the staged files (guard,
 	# policy, runner) so the pin itself records the identity of what it
@@ -27,50 +163,6 @@ render_systemd_pin() {
 	guard_policy_sha256="$(sha256_file "$guard_policy_script")" || return 2
 	runner_sha256="$(sha256_file "$runner")" || return 2
 
-	deadline_ms="$(configured_systemd_environment_value "$input" GUARD_TOTAL_DEADLINE_MS)" || {
-		status="$?"
-		[[ "$status" == "1" ]] || return "$status"
-		deadline_ms=""
-	}
-	shutdown_grace_ms="$(configured_systemd_environment_value "$input" GUARD_SHUTDOWN_GRACE_MS)" || {
-		status="$?"
-		[[ "$status" == "1" ]] || return "$status"
-		shutdown_grace_ms=""
-	}
-	kill_mode="$(configured_systemd_directive_value "$input" KillMode)" || {
-		status="$?"
-		[[ "$status" == "1" ]] || return "$status"
-		kill_mode=""
-	}
-	stop_timeout="$(configured_systemd_directive_value "$input" TimeoutStopSec)" || {
-		status="$?"
-		[[ "$status" == "1" ]] || return "$status"
-		stop_timeout=""
-	}
-
-	# Migrate only source-controlled legacy defaults known to be unsafe for the
-	# long guard deadline. Unknown or incomplete operator overrides are retained
-	# and rejected by validate_deployment_timing instead of silently rewritten.
-	case "$deadline_ms" in
-		"" | 120000) deadline_ms=600000 ;;
-	esac
-	case "$shutdown_grace_ms" in
-		"" | 75000) shutdown_grace_ms=600000 ;;
-	esac
-	[[ -n "$kill_mode" ]] || kill_mode=mixed
-	case "$stop_timeout" in
-		"" | 90 | 90s | "1min 30s") stop_timeout=720s ;;
-	esac
-
-	awk -v begin="$managed_begin" -v end="$managed_end" '
-		$0 == begin { managed = 1; next }
-		$0 == end { managed = 0; next }
-		!managed { print }
-		END { if (managed) exit 2 }
-	' "$input" >"$output" || return 2
-	if [[ -s "$output" && "$(tail -c 1 "$output" | wc -l)" -eq 0 ]]; then
-		printf '\n' >>"$output"
-	fi
 	{
 		printf '%s\n' "$managed_begin"
 		printf '%s\n' "[Service]"
@@ -88,7 +180,41 @@ render_systemd_pin() {
 		printf '%s\n' "ExecStart="
 		printf 'ExecStart=%s\n' "$runner"
 		printf '%s\n' "$managed_end"
-	} >>"$output"
+	} >"$output"
+}
+
+replace_systemd_pin_if_snapshot_current() {
+	if [[ "$#" -ne 4 || ! -f "$1" || ! -f "$2" || ! -f "$3" ]]; then
+		echo "replace_systemd_pin_if_snapshot_current requires: pin backup rendered staged" >&2
+		return 2
+	fi
+
+	local pin="$1" backup="$2" rendered="$3" staged="$4"
+	if ! sudo cp --preserve=all "$backup" "$staged" \
+		|| ! sudo tee "$staged" <"$rendered" >/dev/null; then
+		echo "ERROR: failed to stage the rendered systemd pin" >&2
+		sudo rm -f "$staged" 2>/dev/null || true
+		return 1
+	fi
+
+	# The deploy lock serializes deployers, not operators. Treat the backup as
+	# a compare-and-swap snapshot: if the live file changed while artifacts
+	# were being rendered/staged, preserve that edit instead of overwriting it.
+	# Keep this comparison directly adjacent to the atomic rename so there is
+	# no intervening deployment work in the check/use window.
+	if ! sudo cmp -s "$pin" "$backup"; then
+		echo "ERROR: $pin changed after the deployment snapshot was captured; preserving the concurrent operator edit" >&2
+		sudo rm -f "$staged" 2>/dev/null || true
+		return 1
+	fi
+	# Arm rollback before the rename: if the shell is interrupted while mv is
+	# in flight, the exit trap must treat the live pin as potentially replaced.
+	PIN_ROLLBACK_ARMED=1
+	if ! sudo mv -f "$staged" "$pin"; then
+		echo "ERROR: failed to atomically install the rendered systemd pin" >&2
+		sudo rm -f "$staged" 2>/dev/null || true
+		return 1
+	fi
 }
 
 _configured_systemd_value() {
@@ -436,6 +562,11 @@ reload_validate_or_restore_systemd_policy() {
 		|| ! sudo systemctl daemon-reload; then
 		echo "HARD FAILURE: pre-restart systemd pin restoration failed" >&2
 		sudo rm -f "$rollback_stage" 2>/dev/null || true
+		return 70
+	fi
+	if ! validate_effective_systemd_policy "$service" >/dev/null; then
+		echo "HARD FAILURE: operator drop-ins still produce an unsafe effective systemd policy after restoring the prior deploy pin" >&2
+		echo "Correct the later operator drop-ins (for example /etc/systemd/system/ccflare-stack.service.d/90-operator-policy.conf) before restarting the service." >&2
 		return 70
 	fi
 	return 1

@@ -11,30 +11,35 @@
 #   binaries (better-ccflare-v*-drill-*, -logfix-*, -progate-*, ...) in
 #   /home/will/.config/better-ccflare. This script replaces that process
 #   with one command, and — the actual point — it REFUSES to build/deploy
-#   any commit that is not an ancestor of origin/main. Production may only
-#   ever run code that has landed on main.
+#   unless the checkout is the local `main` branch at the exact freshly
+#   fetched origin/main tip. Production may only run current main.
 #
 # USAGE
 #   scripts/deploy-ccflare.sh            Build, deploy, restart, verify.
-#   scripts/deploy-ccflare.sh --check    Run ONLY the main-ancestry gate,
+#   scripts/deploy-ccflare.sh --check    Run ONLY the main-source gate,
 #                                        print OK/refuse, and exit. Builds
 #                                        and deploys nothing. Safe to run
 #                                        any time, from any branch, to test
 #                                        the gate itself.
 #
 # WHAT A FULL RUN DOES
-#   1. `git fetch origin` (quiet), then refuse unless HEAD is an ancestor
-#      of origin/main, the working tree is clean, and package versions are not
-#      behind the highest v* tag already contained in HEAD.
-#   2. `bun run build` -> apps/cli/dist/better-ccflare.
+#   1. Fetch the explicit refs/heads/main ref (quiet), then refuse unless the
+#      checkout is refs/heads/main exactly at refs/remotes/origin/main, HEAD is
+#      an ancestor of that remote tip, the working tree is clean, and package
+#      versions are not behind the highest v* tag already contained in HEAD.
+#   2. Require the pinned-build drop-in to contain no operator policy outside
+#      its deploy-owned markers, then create a detached worktree at the
+#      verified SHA, install its locked dependencies, and build there. The
+#      shared checkout is never a build or runtime-artifact source after
+#      verification.
 #   3. Copy the binary to
 #      /home/will/.config/better-ccflare/better-ccflare-v<version>-<short-sha>
 #      and install the source-controlled guard + policy as an immutable pair
 #      under guards/<full-sha>/.
-#   4. Back up, then atomically upsert the binary and guard identity lines in
-#      the systemd pin
-#      (/etc/systemd/system/ccflare-stack.service.d/50-pinned-build.conf),
-#      preserving every other Environment= line in that drop-in.
+#   4. Back up, then atomically replace the deploy-owned systemd pin
+#      (/etc/systemd/system/ccflare-stack.service.d/50-pinned-build.conf).
+#      Operator policy must live in a later drop-in such as
+#      90-operator-policy.conf.
 #   5. `systemctl daemon-reload && systemctl restart ccflare-stack.service`.
 #   6. Poll both proxy and guard health endpoints until they respond.
 #   7. Require exact binary SHA, guard source ID, and guard policy ID matches.
@@ -72,6 +77,9 @@ PIN_ROLLBACK_ARMED=0
 SERVICE_RESTART_ATTEMPTED=0
 GUARD_STAGE_DIR=""
 RUNNER_STAGE_DIR=""
+BUILD_SNAPSHOT_PARENT=""
+BUILD_SOURCE_ROOT=""
+BUILD_SOURCE_REGISTERED=0
 PRIOR_PROXY_HEALTH_JSON=""
 PRIOR_GUARD_HEALTH_JSON=""
 PROXY_HEALTH_JSON=""
@@ -115,6 +123,19 @@ rollback_on_failure() {
 	local status="$1"
 	trap - EXIT
 	set +e
+
+	if [[ "$BUILD_SOURCE_REGISTERED" == "1" && -n "$BUILD_SOURCE_ROOT" ]]; then
+		if ! remove_verified_source_snapshot "$REPO_ROOT" "$BUILD_SOURCE_ROOT"; then
+			echo "WARNING: could not remove verified source snapshot $BUILD_SOURCE_ROOT" >&2
+		else
+			BUILD_SOURCE_REGISTERED=0
+		fi
+	fi
+	if [[ -n "$BUILD_SNAPSHOT_PARENT" && -d "$BUILD_SNAPSHOT_PARENT" ]]; then
+		if ! rmdir "$BUILD_SNAPSHOT_PARENT" 2>/dev/null; then
+			echo "WARNING: verified source snapshot parent was not empty: $BUILD_SNAPSHOT_PARENT" >&2
+		fi
+	fi
 
 	[[ -n "$PIN_RENDERED" && -f "$PIN_RENDERED" ]] && rm -f "$PIN_RENDERED"
 	if [[ -n "$GUARD_STAGE_DIR" && -d "$GUARD_STAGE_DIR" ]]; then
@@ -182,27 +203,41 @@ for arg in "$@"; do
 done
 
 # ---------------------------------------------------------------------------
-# 1) Ancestry gate — the actual guardrail. Everything else is convenience.
+# 1) Main source gate — the actual guardrail. Everything else is convenience.
 # ---------------------------------------------------------------------------
-echo "==> Fetching origin…"
-git fetch origin --quiet
+echo "==> Fetching refs/heads/main from origin…"
+# The repository also has a local tag named `main`. Use fully qualified refs
+# for fetch, branch identity, and comparison so the tag can never satisfy (or
+# make ambiguous) the production source gate.
+git fetch origin refs/heads/main:refs/remotes/origin/main --quiet
 
 HEAD_SHA="$(git rev-parse HEAD)"
-SHORT="$(git rev-parse --short HEAD)"
+SHORT="$(git rev-parse --short "$HEAD_SHA")"
+ORIGIN_MAIN_SHA="$(git rev-parse refs/remotes/origin/main)"
+CURRENT_BRANCH_REF="$(git symbolic-ref -q HEAD 2>/dev/null || true)"
 
-ANCESTRY_OK=0
-if git merge-base --is-ancestor "$HEAD_SHA" origin/main; then
-	ANCESTRY_OK=1
-	echo "OK: $SHORT is an ancestor of origin/main."
-else
-	echo "refusing to deploy: $SHORT is not an ancestor of origin/main (deploy only code that is on main)" >&2
+MAIN_SOURCE_OK=0
+if validate_main_deploy_source \
+	"$CURRENT_BRANCH_REF" \
+	"$HEAD_SHA" \
+	"$ORIGIN_MAIN_SHA"; then
+	MAIN_SOURCE_OK=1
 fi
 
-# Clean-tree gate: the ancestry check verifies the committed HEAD, but the
-# build compiles the working tree. Uncommitted changes would ship code that is
-# NOT on the verified commit, silently bypassing the main-ancestry guarantee.
-# (git status --porcelain ignores gitignored build artifacts, so generated
-# inline workers / dist do not trip this.)
+# Retain the historical ancestry proof as a separate defense-in-depth check.
+# Exact tip equality above is stricter, but this also makes the intended Git
+# relationship explicit if the gate evolves later.
+ANCESTRY_OK=0
+if git merge-base --is-ancestor "$HEAD_SHA" refs/remotes/origin/main; then
+	ANCESTRY_OK=1
+	echo "OK: $SHORT is an ancestor of refs/remotes/origin/main."
+else
+	echo "refusing to deploy: $SHORT is not an ancestor of refs/remotes/origin/main" >&2
+fi
+
+# Clean-tree gate: the build below uses an immutable snapshot, so a later edit
+# cannot change what ships. Still require a clean operator checkout to make the
+# deploy invocation intentional and keep the canonical main checkout auditable.
 TREE_OK=0
 if [[ -z "$(git status --porcelain)" ]]; then
 	TREE_OK=1
@@ -215,8 +250,14 @@ fi
 # silently keep a fork's older package.json while absorbing a newer tagged
 # release, and the binary name/health endpoint would then lie about the
 # release lineage even though the code is present.
-VERSION="$(node -p "require('./apps/cli/package.json').version")"
-ROOT_VERSION="$(node -p "require('./package.json').version")"
+VERSION="$(
+	git show "${HEAD_SHA}:apps/cli/package.json" \
+		| node -e 'let input=""; process.stdin.on("data", chunk => input += chunk); process.stdin.on("end", () => process.stdout.write(JSON.parse(input).version));'
+)"
+ROOT_VERSION="$(
+	git show "${HEAD_SHA}:package.json" \
+		| node -e 'let input=""; process.stdin.on("data", chunk => input += chunk); process.stdin.on("end", () => process.stdout.write(JSON.parse(input).version));'
+)"
 VERSION_OK=0
 if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 	echo "refusing to deploy: apps/cli/package.json version '$VERSION' is not a plain semver x.y.z" >&2
@@ -224,9 +265,8 @@ elif [[ "$ROOT_VERSION" != "$VERSION" ]]; then
 	echo "refusing to deploy: root package.json version '$ROOT_VERSION' does not match apps/cli version '$VERSION'" >&2
 else
 	LATEST_CONTAINED_VERSION="$(
-		git tag --list 'v[0-9]*' --merged HEAD 2>/dev/null \
-			| sed -n 's/^v//p' \
-			| grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+		git tag --list 'v[0-9]*' --merged "$HEAD_SHA" 2>/dev/null \
+			| sed -nE 's/^v([0-9]+\.[0-9]+\.[0-9]+)$/\1/p' \
 			| sort -V \
 			| tail -n 1
 	)"
@@ -248,10 +288,10 @@ else
 fi
 
 if [[ "$CHECK_ONLY" == "1" ]]; then
-	{ [[ "$ANCESTRY_OK" == "1" && "$TREE_OK" == "1" && "$VERSION_OK" == "1" ]]; } && exit 0 || exit 1
+	{ [[ "$MAIN_SOURCE_OK" == "1" && "$ANCESTRY_OK" == "1" && "$TREE_OK" == "1" && "$VERSION_OK" == "1" ]]; } && exit 0 || exit 1
 fi
 
-if [[ "$ANCESTRY_OK" != "1" || "$TREE_OK" != "1" || "$VERSION_OK" != "1" ]]; then
+if [[ "$MAIN_SOURCE_OK" != "1" || "$ANCESTRY_OK" != "1" || "$TREE_OK" != "1" || "$VERSION_OK" != "1" ]]; then
 	exit 1
 fi
 
@@ -264,9 +304,22 @@ if ! flock -n 9; then
 	exit 75
 fi
 
+# Validate ownership before an expensive build or any host artifact/systemd
+# mutation. render_systemd_pin repeats this validation against the exact backup
+# snapshot after the immutable source build, and installation compares that
+# snapshot with the live pin so a later edit is rejected rather than discarded.
+validate_deploy_owned_systemd_pin "$PIN"
+
 # ---------------------------------------------------------------------------
 # 2) Build
 # ---------------------------------------------------------------------------
+BUILD_SNAPSHOT_PARENT="$(
+	mktemp -d "${TMPDIR:-/tmp}/better-ccflare-deploy-${SHORT}.XXXXXX"
+)"
+BUILD_SOURCE_ROOT="$BUILD_SNAPSHOT_PARENT/source"
+create_verified_source_snapshot "$REPO_ROOT" "$BUILD_SOURCE_ROOT" "$HEAD_SHA"
+BUILD_SOURCE_REGISTERED=1
+
 BIN_NAME="better-ccflare-v${VERSION}-${SHORT}"
 GUARDS_ROOT="${DEST}/guards"
 GUARD_DIR="${GUARDS_ROOT}/${HEAD_SHA}"
@@ -276,14 +329,18 @@ RUNNERS_ROOT="${DEST}/runners"
 RUNNER_DIR="${RUNNERS_ROOT}/${HEAD_SHA}"
 RUNNER_SCRIPT="${RUNNER_DIR}/run-ccflare-stack.sh"
 GUARD_SOURCE_ID="$HEAD_SHA"
-SOURCE_GUARD="$REPO_ROOT/scripts/ccflare-guard.mjs"
-SOURCE_GUARD_POLICY="$REPO_ROOT/scripts/ccflare-guard-policy.mjs"
-SOURCE_RUNNER="$REPO_ROOT/scripts/run-ccflare-stack.sh"
+SOURCE_GUARD="$BUILD_SOURCE_ROOT/scripts/ccflare-guard.mjs"
+SOURCE_GUARD_POLICY="$BUILD_SOURCE_ROOT/scripts/ccflare-guard-policy.mjs"
+SOURCE_RUNNER="$BUILD_SOURCE_ROOT/scripts/run-ccflare-stack.sh"
 
-echo "==> Building better-ccflare v${VERSION} (${SHORT})…"
-bun run build
+echo "==> Building better-ccflare v${VERSION} (${SHORT}) from verified source snapshot…"
+(
+	cd "$BUILD_SOURCE_ROOT"
+	bun install --frozen-lockfile
+	bun run build
+)
 
-BUILT_BIN="apps/cli/dist/better-ccflare"
+BUILT_BIN="$BUILD_SOURCE_ROOT/apps/cli/dist/better-ccflare"
 if [[ ! -f "$BUILT_BIN" ]]; then
 	echo "ERROR: build did not produce $BUILT_BIN" >&2
 	exit 1
@@ -364,20 +421,24 @@ for digest_pair in \
 done
 
 # ---------------------------------------------------------------------------
-# 4) Update the systemd pin atomically, preserving every other line
+# 4) Replace the deploy-owned systemd pin atomically
 # ---------------------------------------------------------------------------
 echo "==> Updating systemd pin ($PIN)…"
 # Capture the pre-deploy runtime before arming rollback. A legacy first
-# migration may not expose complete runtime identity; deployment can proceed,
-# but any later rollback will hard-fail rather than claim an unproven restore.
+# deployment may not expose complete runtime identity; any later rollback will
+# hard-fail rather than claim an unproven restore.
 PRIOR_PROXY_HEALTH_JSON="$(curl -sf "$HEALTH_URL" 2>/dev/null || true)"
 PRIOR_GUARD_HEALTH_JSON="$(curl -sf "$GUARD_HEALTH_URL" 2>/dev/null || true)"
+
 PIN_BACKUP="${PIN}.bak-$(date -u +%Y%m%dT%H%M%SZ)-${SHORT}"
 sudo cp --preserve=all "$PIN" "$PIN_BACKUP"
 
+# Render from the exact backup snapshot, not the mutable live path. This binds
+# the proposed pin to the file revision that rollback will restore and that the
+# compare-and-swap installation below requires to remain current.
 PIN_RENDERED="$(mktemp)"
 render_systemd_pin \
-	"$PIN" \
+	"$PIN_BACKUP" \
 	"$PIN_RENDERED" \
 	"$DEST_BIN" \
 	"$RUNNER_SCRIPT" \
@@ -398,10 +459,11 @@ read -r \
 	CONFIGURED_STOP_TIMEOUT_MS <<<"$CONFIGURED_DEPLOYMENT_TIMING"
 
 PIN_STAGED="${PIN}.new-${SHORT}-$$"
-sudo cp --preserve=all "$PIN" "$PIN_STAGED"
-sudo tee "$PIN_STAGED" <"$PIN_RENDERED" >/dev/null
-PIN_ROLLBACK_ARMED=1
-sudo mv -f "$PIN_STAGED" "$PIN"
+replace_systemd_pin_if_snapshot_current \
+	"$PIN" \
+	"$PIN_BACKUP" \
+	"$PIN_RENDERED" \
+	"$PIN_STAGED"
 PIN_STAGED=""
 rm -f "$PIN_RENDERED"
 PIN_RENDERED=""

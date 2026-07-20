@@ -3,6 +3,8 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
 	chmodSync,
+	copyFileSync,
+	existsSync,
 	mkdirSync,
 	mkdtempSync,
 	readdirSync,
@@ -39,6 +41,75 @@ function bash(script: string) {
 		stdout: "pipe",
 		stderr: "pipe",
 	});
+}
+
+function bashAt(cwd: string, script: string) {
+	return Bun.spawnSync(["bash", "-c", script], {
+		cwd,
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+}
+
+function gitAt(cwd: string, ...args: string[]) {
+	return Bun.spawnSync(["git", ...args], {
+		cwd,
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+}
+
+function expectCommandOk(result: ReturnType<typeof Bun.spawnSync>): void {
+	if (result.exitCode !== 0) {
+		throw new Error(
+			`command failed (${result.exitCode}):\n${result.stdout.toString()}\n${result.stderr.toString()}`,
+		);
+	}
+}
+
+function createDisposableDeployRepo(): {
+	checkout: string;
+	remote: string;
+} {
+	const root = tempDir();
+	const remote = join(root, "origin.git");
+	const checkout = join(root, "checkout");
+	mkdirSync(remote);
+	mkdirSync(checkout);
+	expectCommandOk(gitAt(remote, "init", "--bare"));
+	expectCommandOk(gitAt(checkout, "init", "-b", "main"));
+	expectCommandOk(gitAt(checkout, "config", "user.name", "Deploy Test"));
+	expectCommandOk(
+		gitAt(checkout, "config", "user.email", "deploy-test@example.invalid"),
+	);
+	mkdirSync(join(checkout, "scripts"));
+	copyFileSync(deployScript, join(checkout, "scripts", "deploy-ccflare.sh"));
+	copyFileSync(
+		join(repoRoot, helperScriptForShell),
+		join(checkout, helperScriptForShell),
+	);
+	writeFileSync(
+		join(checkout, "package.json"),
+		'{"name":"deploy-fixture","version":"1.0.0"}\n',
+	);
+	mkdirSync(join(checkout, "apps", "cli"), { recursive: true });
+	writeFileSync(
+		join(checkout, "apps", "cli", "package.json"),
+		'{"name":"deploy-fixture-cli","version":"1.0.0"}\n',
+	);
+	expectCommandOk(gitAt(checkout, "add", "scripts", "package.json", "apps"));
+	expectCommandOk(gitAt(checkout, "commit", "-m", "fixture"));
+	expectCommandOk(gitAt(checkout, "remote", "add", "origin", remote));
+	expectCommandOk(
+		gitAt(
+			checkout,
+			"push",
+			"--set-upstream",
+			"origin",
+			"refs/heads/main:refs/heads/main",
+		),
+	);
+	return { checkout, remote };
 }
 
 function shellQuote(value: string): string {
@@ -259,7 +330,7 @@ function writeDigestFixtures(dir: string): {
 }
 
 describe("render_systemd_pin", () => {
-	test("atomically-rendered content upserts deploy-owned keys, preserves all others, and records artifact digests", () => {
+	test("renders only deploy-owned content, removes stale managed values, and is byte-idempotent", () => {
 		const dir = tempDir();
 		const input = join(dir, "pin.conf");
 		const output = join(dir, "pin.rendered.conf");
@@ -276,22 +347,25 @@ describe("render_systemd_pin", () => {
 		writeFileSync(
 			input,
 			[
+				"# Comments outside the managed block are tolerated but not retained.",
+				"",
+				"# BEGIN better-ccflare managed deployment",
 				"[Service]",
 				"Environment=KEEP_ME=unchanged",
 				"Environment=CCFLARE_BIN=/old/bin",
 				"Environment=GUARD_SCRIPT=/old/guard.mjs",
 				"Environment=GUARD_SCRIPT=/duplicate/guard.mjs",
-				// Stray lines that happen to share a name with a key the managed
-				// block below will also emit. render_systemd_pin regenerates the
-				// whole managed block from scratch on every render rather than
-				// patching known keys in place, so anything outside the
-				// BEGIN/END markers -- including these -- is untouched legacy
-				// content, not something upserted.
 				"Environment=GUARD_SHA256=oldguardsha",
 				"Environment=GUARD_POLICY_SHA256=oldpolicysha",
 				"Environment=RUNNER_SHA256=oldrunnersha",
+				"Environment=GUARD_TOTAL_DEADLINE_MS=900000",
+				"Environment=OPERATOR_OVERRIDE=must-not-survive",
+				"KillMode=control-group",
+				"TimeoutStopSec=999s",
 				"ExecStart=/home/will/legacy-runner.sh",
+				"# END better-ccflare managed deployment",
 				"",
+				"; A systemd semicolon comment is also tolerated.",
 			].join("\n"),
 		);
 
@@ -307,15 +381,6 @@ describe("render_systemd_pin", () => {
 		expect(result.exitCode).toBe(0);
 		expect(readFileSync(output, "utf8")).toBe(
 			[
-				"[Service]",
-				"Environment=KEEP_ME=unchanged",
-				"Environment=CCFLARE_BIN=/old/bin",
-				"Environment=GUARD_SCRIPT=/old/guard.mjs",
-				"Environment=GUARD_SCRIPT=/duplicate/guard.mjs",
-				"Environment=GUARD_SHA256=oldguardsha",
-				"Environment=GUARD_POLICY_SHA256=oldpolicysha",
-				"Environment=RUNNER_SHA256=oldrunnersha",
-				"ExecStart=/home/will/legacy-runner.sh",
 				"# BEGIN better-ccflare managed deployment",
 				"[Service]",
 				"Environment=CCFLARE_BIN=/new/bin",
@@ -349,11 +414,52 @@ describe("render_systemd_pin", () => {
 		);
 	});
 
+	test("rejects meaningful unmanaged content with an actionable operator-policy migration error", () => {
+		const dir = tempDir();
+		const input = join(dir, "50-pinned-build.conf");
+		const output = join(dir, "pin.rendered.conf");
+		const { guard, policy, runner } = writeDigestFixtures(dir);
+		writeFileSync(
+			input,
+			[
+				"# legacy unowned pin",
+				"[Service]",
+				"Environment=CCFLARE_BIN=/stale/bin",
+				"ExecStart=/stale/runner",
+				"",
+			].join("\n"),
+		);
+
+		const mutationLog = join(dir, "systemd-mutation.log");
+		const result = bash(
+			[
+				`source ${shellQuote(helperScriptForShell)}`,
+				`if render_systemd_pin ${shellQuote(shellPath(input))} ${shellQuote(shellPath(output))} /new/bin ${shellQuote(shellPath(runner))} ${shellQuote(shellPath(guard))} abc123 policy-v1 ${shellQuote(shellPath(policy))}; then`,
+				`  printf mutation >${shellQuote(shellPath(mutationLog))}`,
+				"else",
+				"  exit $?",
+				"fi",
+			].join("\n"),
+		);
+
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr.toString()).toContain(
+			"contains unmanaged systemd configuration outside",
+		);
+		expect(result.stderr.toString()).toContain("line 2: [Service]");
+		expect(result.stderr.toString()).toContain(
+			"Migrate operator policy to a later drop-in",
+		);
+		expect(result.stderr.toString()).toContain("90-operator-policy.conf");
+		expect(existsSync(output)).toBe(false);
+		expect(existsSync(mutationLog)).toBe(false);
+	});
+
 	test("fails clearly when a digest input file does not exist", () => {
 		const dir = tempDir();
 		const input = join(dir, "pin.conf");
 		const output = join(dir, "pin.rendered.conf");
-		writeFileSync(input, "[Service]\n");
+		writeFileSync(input, "# deploy-owned placeholder\n");
 
 		const result = bash(
 			[
@@ -363,24 +469,19 @@ describe("render_systemd_pin", () => {
 		);
 
 		expect(result.exitCode).not.toBe(0);
+		expect(result.stderr.toString()).toContain(
+			"sha256_file requires one existing file",
+		);
 	});
 
-	test("preserves operator deadline and graceful-stop overrides", () => {
+	test("accepts an empty or comment-only legacy file and replaces it from scratch", () => {
 		const dir = tempDir();
 		const input = join(dir, "pin.conf");
 		const output = join(dir, "pin.rendered.conf");
 		const { guard, policy, runner } = writeDigestFixtures(dir);
 		writeFileSync(
 			input,
-			[
-				"[Service]",
-				'Environment="GUARD_TOTAL_DEADLINE_MS=900000"',
-				"Environment=GUARD_SHUTDOWN_GRACE_MS=900000",
-				"KillMode=mixed",
-				"TimeoutStopSec=1020s",
-				"ExecStart=/old/runner",
-				"",
-			].join("\n"),
+			"\n  # deployment note\n\t; another comment\n\n",
 		);
 
 		const result = bash(
@@ -392,61 +493,18 @@ describe("render_systemd_pin", () => {
 
 		expect(result.exitCode).toBe(0);
 		const rendered = readFileSync(output, "utf8");
-		expect(rendered).toContain(
-			'Environment="GUARD_TOTAL_DEADLINE_MS=900000"',
+		expect(rendered.startsWith("# BEGIN better-ccflare managed deployment\n")).toBe(
+			true,
 		);
-		expect(rendered).toContain(
-			"Environment=GUARD_SHUTDOWN_GRACE_MS=900000",
-		);
-		expect(rendered).toContain("KillMode=mixed");
-		expect(rendered).toContain("TimeoutStopSec=1020s");
-		expect(rendered.match(/GUARD_TOTAL_DEADLINE_MS/g)).toHaveLength(2);
-		expect(rendered.match(/GUARD_SHUTDOWN_GRACE_MS/g)).toHaveLength(2);
-		expect(rendered.match(/^KillMode=/gm)).toHaveLength(2);
-		expect(rendered.match(/^TimeoutStopSec=/gm)).toHaveLength(2);
-	});
-
-	test("migrates the exact live legacy pin to a deployable safe policy", () => {
-		const dir = tempDir();
-		const input = join(dir, "50-pinned-build.conf");
-		const output = join(dir, "pin.rendered.conf");
-		const { guard, policy, runner } = writeDigestFixtures(dir);
-		writeFileSync(
-			input,
-			[
-				"[Service]",
-				"Environment=CCFLARE_BIN=/home/will/.config/better-ccflare/better-ccflare-v3.5.39-ea71c502",
-				"Environment=CCFLARE_CODEX_TRACE_DIR=/home/will/.config/better-ccflare/codex-traces",
-				"Environment=CCFLARE_SHUTDOWN_DRAIN_MS=60000",
-				"Environment=GUARD_SHUTDOWN_GRACE_MS=75000",
-				"TimeoutStopSec=90",
-				"Environment=GUARD_SCRIPT=/home/will/.config/better-ccflare/guards/ea71c502/ccflare-guard.mjs",
-				"Environment=GUARD_SOURCE_ID=ea71c502",
-				"Environment=GUARD_POLICY_ID=pool-exhaustion-finite-recovery-v1",
-				"ExecStart=",
-				"ExecStart=/home/will/.config/better-ccflare/runners/ea71c502/run-ccflare-stack.sh",
-				"",
-			].join("\n"),
-		);
-
-		const result = bash(
-			[
-				`source ${shellQuote(helperScriptForShell)}`,
-				`render_systemd_pin ${shellQuote(shellPath(input))} ${shellQuote(shellPath(output))} /new/bin ${shellQuote(shellPath(runner))} ${shellQuote(shellPath(guard))} abc123 policy-v1 ${shellQuote(shellPath(policy))}`,
-				`validate_deployment_timing ${shellQuote(shellPath(output))}`,
-			].join("\n"),
-		);
-
-		expect(result.exitCode).toBe(0);
-		expect(result.stdout.toString().trim()).toBe("600000 600000 720000");
-		const rendered = readFileSync(output, "utf8");
+		expect(rendered).not.toContain("deployment note");
+		expect(rendered).not.toContain("another comment");
 		expect(rendered).toContain("Environment=GUARD_TOTAL_DEADLINE_MS=600000");
 		expect(rendered).toContain("Environment=GUARD_SHUTDOWN_GRACE_MS=600000");
 		expect(rendered).toContain("KillMode=mixed");
 		expect(rendered).toContain("TimeoutStopSec=720s");
 	});
 
-	test("does not silently rewrite unknown unsafe operator timing", () => {
+	test("rejects duplicate or unbalanced ownership markers", () => {
 		const dir = tempDir();
 		const input = join(dir, "pin.conf");
 		const output = join(dir, "pin.rendered.conf");
@@ -454,25 +512,22 @@ describe("render_systemd_pin", () => {
 		writeFileSync(
 			input,
 			[
+				"# BEGIN better-ccflare managed deployment",
 				"[Service]",
-				"Environment=GUARD_TOTAL_DEADLINE_MS=600000",
-				"Environment=GUARD_SHUTDOWN_GRACE_MS=76000",
-				"KillMode=mixed",
-				"TimeoutStopSec=91s",
-				"",
+				"# BEGIN better-ccflare managed deployment",
+				"# END better-ccflare managed deployment",
 			].join("\n"),
 		);
+
 		const result = bash(
 			[
 				`source ${shellQuote(helperScriptForShell)}`,
 				`render_systemd_pin ${shellQuote(shellPath(input))} ${shellQuote(shellPath(output))} /new/bin ${shellQuote(shellPath(runner))} ${shellQuote(shellPath(guard))} abc123 policy-v1 ${shellQuote(shellPath(policy))}`,
-				`validate_deployment_timing ${shellQuote(shellPath(output))}`,
 			].join("\n"),
 		);
+
 		expect(result.exitCode).not.toBe(0);
-		const rendered = readFileSync(output, "utf8");
-		expect(rendered).toContain("Environment=GUARD_SHUTDOWN_GRACE_MS=76000");
-		expect(rendered).toContain("TimeoutStopSec=91s");
+		expect(result.stderr.toString()).toContain("invalid managed marker structure");
 	});
 });
 
@@ -625,7 +680,14 @@ describe("effective systemd policy validation", () => {
 				"#!/usr/bin/env bash",
 				'printf \'systemctl:%s\\n\' "$*" >>"$CCFLARE_TEST_SYSTEMCTL_LOG"',
 				'if [[ "$*" == *"daemon-reload"* ]]; then exit 0; fi',
-				'if [[ "$*" == *"--property=KillMode"* ]]; then printf \'%s\\n\' "$CCFLARE_TEST_KILL_MODE"; exit 0; fi',
+				'if [[ "$*" == *"--property=KillMode"* ]]; then',
+				'  if [[ -n "${CCFLARE_TEST_SAFE_POLICY_PIN:-}" && -n "${CCFLARE_TEST_SAFE_POLICY_BACKUP:-}" ]] && cmp -s "$CCFLARE_TEST_SAFE_POLICY_PIN" "$CCFLARE_TEST_SAFE_POLICY_BACKUP"; then',
+				"    printf 'mixed\\n'",
+				"  else",
+				'    printf \'%s\\n\' "$CCFLARE_TEST_KILL_MODE"',
+				"  fi",
+				"  exit 0",
+				"fi",
 				'if [[ "$*" == *"--property=TimeoutStopUSec"* ]]; then printf \'%s\\n\' "$CCFLARE_TEST_TIMEOUT"; exit 0; fi',
 				'if [[ "$*" == *"--property=Environment"* ]]; then printf \'%s\\n\' "$CCFLARE_TEST_ENVIRONMENT"; exit 0; fi',
 				"exit 2",
@@ -705,6 +767,8 @@ describe("effective systemd policy validation", () => {
 				"export CCFLARE_TEST_KILL_MODE=control-group",
 				"export CCFLARE_TEST_TIMEOUT=12min",
 				"export CCFLARE_TEST_ENVIRONMENT='GUARD_TOTAL_DEADLINE_MS=600000 GUARD_SHUTDOWN_GRACE_MS=600000'",
+				`export CCFLARE_TEST_SAFE_POLICY_PIN=${shellQuote(shellPath(pin))}`,
+				`export CCFLARE_TEST_SAFE_POLICY_BACKUP=${shellQuote(shellPath(backup))}`,
 				`source ${shellQuote(helperScriptForShell)}`,
 				`reload_validate_or_restore_systemd_policy ${shellQuote(shellPath(pin))} ${shellQuote(shellPath(backup))} ccflare-stack.service`,
 			].join("\n"),
@@ -725,17 +789,141 @@ describe("effective systemd policy validation", () => {
 		expect(effectiveCheck).toBeGreaterThan(0);
 		expect(restoreCopy).toBeGreaterThan(effectiveCheck);
 		expect(restoreMove).toBeGreaterThan(restoreCopy);
-		expect(events.at(-1)).toBe("systemctl:daemon-reload");
+		const restoreReload = events.findIndex(
+			(event, index) =>
+				index > restoreMove && event === "systemctl:daemon-reload",
+		);
+		const restoredEffectiveCheck = events.findIndex(
+			(event, index) =>
+				index > restoreReload && event.includes("--property=KillMode"),
+		);
+		expect(restoreReload).toBeGreaterThan(restoreMove);
+		expect(restoredEffectiveCheck).toBeGreaterThan(restoreReload);
 		expect(
 			events.some((event) => event.includes("systemctl restart")),
 		).toBe(false);
+	});
+
+	test("hard-fails when a later operator drop-in remains unsafe after pin restoration", () => {
+		const dir = tempDir();
+		const { binDir, log } = writeSystemctlMock(dir);
+		const sudo = join(binDir, "sudo");
+		writeFileSync(
+			sudo,
+			[
+				"#!/usr/bin/env bash",
+				'printf \'sudo:%s\\n\' "$*" >>"$CCFLARE_TEST_SYSTEMCTL_LOG"',
+				'exec "$@"',
+				"",
+			].join("\n"),
+		);
+		chmodSync(sudo, 0o755);
+		const pin = join(dir, "pin.conf");
+		const backup = join(dir, "pin.conf.bak");
+		writeFileSync(pin, "new pin\n");
+		writeFileSync(backup, "old pin\n");
+		const result = bash(
+			[
+				`export PATH=${shellQuote(shellPath(binDir))}:$PATH`,
+				`export CCFLARE_TEST_SYSTEMCTL_LOG=${shellQuote(shellPath(log))}`,
+				"export CCFLARE_TEST_KILL_MODE=control-group",
+				"export CCFLARE_TEST_TIMEOUT=12min",
+				"export CCFLARE_TEST_ENVIRONMENT='GUARD_TOTAL_DEADLINE_MS=600000 GUARD_SHUTDOWN_GRACE_MS=600000'",
+				`source ${shellQuote(helperScriptForShell)}`,
+				`reload_validate_or_restore_systemd_policy ${shellQuote(shellPath(pin))} ${shellQuote(shellPath(backup))} ccflare-stack.service`,
+			].join("\n"),
+		);
+		expect(result.exitCode).toBe(70);
+		expect(readFileSync(pin, "utf8")).toBe("old pin\n");
+		expect(result.stderr.toString()).toContain(
+			"operator drop-ins still produce an unsafe effective systemd policy",
+		);
+		expect(result.stderr.toString()).toContain("90-operator-policy.conf");
+		const events = readFileSync(log, "utf8").trim().split("\n");
+		expect(
+			events.filter((event) => event === "systemctl:daemon-reload"),
+		).toHaveLength(2);
+		expect(
+			events.filter((event) => event.includes("--property=KillMode")),
+		).toHaveLength(2);
+		expect(
+			events.some((event) => event.includes("systemctl restart")),
+		).toBe(false);
+	});
+
+	test("replaces an unchanged pin from its exact backup snapshot", () => {
+		const dir = tempDir();
+		const binDir = join(dir, "bin");
+		mkdirSync(binDir);
+		const sudo = join(binDir, "sudo");
+		writeFileSync(sudo, ["#!/usr/bin/env bash", 'exec "$@"', ""].join("\n"));
+		chmodSync(sudo, 0o755);
+		const pin = join(dir, "pin.conf");
+		const backup = join(dir, "pin.conf.bak");
+		const rendered = join(dir, "pin.rendered.conf");
+		const staged = join(dir, "pin.staged.conf");
+		writeFileSync(pin, "original pin\n");
+		writeFileSync(backup, "original pin\n");
+		writeFileSync(rendered, "new deploy pin\n");
+		const result = bash(
+			[
+				`export PATH=${shellQuote(shellPath(binDir))}:$PATH`,
+				`source ${shellQuote(helperScriptForShell)}`,
+				`replace_systemd_pin_if_snapshot_current ${shellQuote(shellPath(pin))} ${shellQuote(shellPath(backup))} ${shellQuote(shellPath(rendered))} ${shellQuote(shellPath(staged))}`,
+				'printf "%s" "$PIN_ROLLBACK_ARMED"',
+			].join("\n"),
+		);
+		expect(result.exitCode).toBe(0);
+		expect(result.stdout.toString()).toBe("1");
+		expect(readFileSync(pin, "utf8")).toBe("new deploy pin\n");
+		expect(readFileSync(backup, "utf8")).toBe("original pin\n");
+		expect(existsSync(staged)).toBe(false);
+	});
+
+	test("preserves a concurrent operator pin edit instead of replacing it", () => {
+		const dir = tempDir();
+		const binDir = join(dir, "bin");
+		mkdirSync(binDir);
+		const sudo = join(binDir, "sudo");
+		writeFileSync(
+			sudo,
+			[
+				"#!/usr/bin/env bash",
+				'if [[ "$1" == "cmp" ]]; then',
+				'  printf \'operator edit\\n\' >"$3"',
+				"fi",
+				'exec "$@"',
+				"",
+			].join("\n"),
+		);
+		chmodSync(sudo, 0o755);
+		const pin = join(dir, "pin.conf");
+		const backup = join(dir, "pin.conf.bak");
+		const rendered = join(dir, "pin.rendered.conf");
+		const staged = join(dir, "pin.staged.conf");
+		writeFileSync(pin, "original pin\n");
+		writeFileSync(backup, "original pin\n");
+		writeFileSync(rendered, "new deploy pin\n");
+		const result = bash(
+			[
+				`export PATH=${shellQuote(shellPath(binDir))}:$PATH`,
+				`source ${shellQuote(helperScriptForShell)}`,
+				`replace_systemd_pin_if_snapshot_current ${shellQuote(shellPath(pin))} ${shellQuote(shellPath(backup))} ${shellQuote(shellPath(rendered))} ${shellQuote(shellPath(staged))}`,
+			].join("\n"),
+		);
+		expect(result.exitCode).toBe(1);
+		expect(readFileSync(pin, "utf8")).toBe("operator edit\n");
+		expect(existsSync(staged)).toBe(false);
+		expect(result.stderr.toString()).toContain(
+			"changed after the deployment snapshot was captured",
+		);
 	});
 
 	test("fails clearly when a digest input file does not exist", () => {
 		const dir = tempDir();
 		const input = join(dir, "pin.conf");
 		const output = join(dir, "pin.rendered.conf");
-		writeFileSync(input, "[Service]\n");
+		writeFileSync(input, "# deploy-owned placeholder\n");
 
 		const result = bash(
 			[
@@ -745,6 +933,9 @@ describe("effective systemd policy validation", () => {
 		);
 
 		expect(result.exitCode).not.toBe(0);
+		expect(result.stderr.toString()).toContain(
+			"sha256_file requires one existing file",
+		);
 	});
 });
 
@@ -1232,7 +1423,172 @@ process.on("SIGTERM", () => {
 	}, 20_000);
 });
 
+describe("validate_main_deploy_source", () => {
+	function runSourceGate(
+		branchRef: string,
+		headSha: string,
+		originMainSha: string,
+	) {
+		return bash(
+			[
+				`source ${shellQuote(helperScriptForShell)}`,
+				`validate_main_deploy_source ${shellQuote(branchRef)} ${shellQuote(headSha)} ${shellQuote(originMainSha)}`,
+			].join("\n"),
+		);
+	}
+
+	test("accepts only refs/heads/main at the fetched origin/main tip", () => {
+		const sha = "a".repeat(40);
+		const result = runSourceGate("refs/heads/main", sha, sha);
+
+		expect(result.exitCode).toBe(0);
+		expect(result.stderr.toString()).toBe("");
+		expect(result.stdout.toString()).toContain(
+			"is refs/heads/main at refs/remotes/origin/main",
+		);
+	});
+
+	test("rejects a feature branch even when it points at origin/main", () => {
+		const sha = "a".repeat(40);
+		const result = runSourceGate(
+			"refs/heads/codex/example",
+			sha,
+			sha,
+		);
+
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr.toString()).toContain(
+			"checkout must be refs/heads/main",
+		);
+	});
+
+	test("rejects detached HEAD even when it points at origin/main", () => {
+		const sha = "a".repeat(40);
+		const result = runSourceGate("", sha, sha);
+
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr.toString()).toContain("checkout has detached HEAD");
+	});
+
+	test("rejects local main whenever it differs from fetched origin/main", () => {
+		const result = runSourceGate(
+			"refs/heads/main",
+			"1111111111111111111111111111111111111111",
+			"2222222222222222222222222222222222222222",
+		);
+
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr.toString()).toContain(
+			"does not exactly match refs/remotes/origin/main",
+		);
+	});
+});
+
+describe("deploy source gate in disposable repositories", () => {
+	test("--check accepts only the checked-out refs/heads/main at the current origin tip", () => {
+		const accepted = createDisposableDeployRepo();
+		const pass = bashAt(
+			accepted.checkout,
+			"bash scripts/deploy-ccflare.sh --check",
+		);
+		expect(pass.exitCode).toBe(0);
+		expect(pass.stdout.toString()).toContain(
+			"is refs/heads/main at refs/remotes/origin/main",
+		);
+		expect(pass.stdout.toString()).toContain("no merged v* tags to compare");
+
+		const feature = createDisposableDeployRepo();
+		expectCommandOk(gitAt(feature.checkout, "switch", "-c", "feature"));
+		const wrongBranch = bashAt(
+			feature.checkout,
+			"bash scripts/deploy-ccflare.sh --check",
+		);
+		expect(wrongBranch.exitCode).toBe(1);
+		expect(wrongBranch.stderr.toString()).toContain(
+			"checkout must be refs/heads/main",
+		);
+
+		const staleMain = createDisposableDeployRepo();
+		const oldSha = gitAt(staleMain.checkout, "rev-parse", "HEAD")
+			.stdout.toString()
+			.trim();
+		writeFileSync(join(staleMain.checkout, "remote-change.txt"), "new tip\n");
+		expectCommandOk(gitAt(staleMain.checkout, "add", "remote-change.txt"));
+		expectCommandOk(
+			gitAt(staleMain.checkout, "commit", "-m", "advance remote"),
+		);
+		expectCommandOk(
+			gitAt(
+				staleMain.checkout,
+				"push",
+				"origin",
+				"refs/heads/main:refs/heads/main",
+			),
+		);
+		expectCommandOk(gitAt(staleMain.checkout, "reset", "--hard", oldSha));
+		const behind = bashAt(
+			staleMain.checkout,
+			"bash scripts/deploy-ccflare.sh --check",
+		);
+		expect(behind.exitCode).toBe(1);
+		expect(behind.stderr.toString()).toContain(
+			"does not exactly match refs/remotes/origin/main",
+		);
+	});
+
+	test("verified source snapshot remains at the captured commit after the shared checkout changes", () => {
+		const { checkout } = createDisposableDeployRepo();
+		const snapshotParent = tempDir();
+		const snapshot = join(snapshotParent, "source");
+		const headSha = gitAt(checkout, "rev-parse", "HEAD")
+			.stdout.toString()
+			.trim();
+		const create = bashAt(
+			checkout,
+			[
+				`source ${shellQuote(join(checkout, helperScriptForShell))}`,
+				`create_verified_source_snapshot ${shellQuote(checkout)} ${shellQuote(snapshot)} ${shellQuote(headSha)}`,
+			].join("\n"),
+		);
+		expect(create.exitCode).toBe(0);
+
+		writeFileSync(join(checkout, "package.json"), '{"version":"9.9.9"}\n');
+		expect(readFileSync(join(snapshot, "package.json"), "utf8")).toBe(
+			'{"name":"deploy-fixture","version":"1.0.0"}\n',
+		);
+		expect(
+			gitAt(snapshot, "rev-parse", "HEAD").stdout.toString().trim(),
+		).toBe(headSha);
+		expect(gitAt(snapshot, "symbolic-ref", "-q", "HEAD").exitCode).toBe(1);
+		mkdirSync(join(snapshot, "node_modules"));
+		writeFileSync(join(snapshot, "node_modules", "build-output"), "ignored\n");
+
+		const cleanup = bashAt(
+			checkout,
+			[
+				`source ${shellQuote(join(checkout, helperScriptForShell))}`,
+				`remove_verified_source_snapshot ${shellQuote(checkout)} ${shellQuote(snapshot)}`,
+			].join("\n"),
+		);
+		expect(cleanup.exitCode).toBe(0);
+		expect(gitAt(checkout, "worktree", "list", "--porcelain").stdout.toString()).not.toContain(snapshot);
+	});
+});
+
 describe("deployment flow safety contracts", () => {
+	test("fetches and validates exact unambiguous main refs", () => {
+		const source = readFileSync(deployScript, "utf8");
+		expect(source).toContain(
+			"git fetch origin refs/heads/main:refs/remotes/origin/main --quiet",
+		);
+		expect(source).toContain("git symbolic-ref -q HEAD");
+		expect(source).toContain("git rev-parse refs/remotes/origin/main");
+		expect(source).toContain("validate_main_deploy_source");
+		expect(source).toContain(
+			'git merge-base --is-ancestor "$HEAD_SHA" refs/remotes/origin/main',
+		);
+	});
+
 	test("check-only exits before build, sudo, artifact installation, or restart", () => {
 		const source = readFileSync(deployScript, "utf8");
 		const checkExit = source.indexOf('if [[ "$CHECK_ONLY" == "1" ]]');
@@ -1283,8 +1639,70 @@ describe("deployment flow safety contracts", () => {
 		expect(source.match(/\bexit 75\b/g)).toHaveLength(1);
 	});
 
+	test("rejects unmanaged pin content before build or host/systemd mutation", () => {
+		const source = readFileSync(deployScript, "utf8");
+		const lockAcquire = source.indexOf('if ! flock -n 9; then');
+		const preflight = source.indexOf(
+			'validate_deploy_owned_systemd_pin "$PIN"',
+			lockAcquire,
+		);
+		const snapshot = source.indexOf(
+			'create_verified_source_snapshot "$REPO_ROOT"',
+			lockAcquire,
+		);
+		const build = source.indexOf("bun run build", lockAcquire);
+		const binaryInstall = source.indexOf('cp "$BUILT_BIN" "$DEST_BIN"', lockAcquire);
+		const pinBackup = source.indexOf(
+			'sudo cp --preserve=all "$PIN" "$PIN_BACKUP"',
+			lockAcquire,
+		);
+		const effectivePolicyMutation = source.indexOf(
+			"reload_validate_or_restore_systemd_policy",
+			lockAcquire,
+		);
+		const restart = source.indexOf(
+			"sudo systemctl restart ccflare-stack.service",
+			lockAcquire,
+		);
+
+		expect(preflight).toBeGreaterThan(lockAcquire);
+		expect(snapshot).toBeGreaterThan(preflight);
+		expect(build).toBeGreaterThan(preflight);
+		expect(binaryInstall).toBeGreaterThan(preflight);
+		expect(pinBackup).toBeGreaterThan(preflight);
+		expect(effectivePolicyMutation).toBeGreaterThan(preflight);
+		expect(restart).toBeGreaterThan(preflight);
+	});
+
+	test("build and copied runtime artifacts come only from the verified snapshot", () => {
+		const source = readFileSync(deployScript, "utf8");
+		expect(source).toContain(
+			'create_verified_source_snapshot "$REPO_ROOT" "$BUILD_SOURCE_ROOT" "$HEAD_SHA"',
+		);
+		expect(source).toContain('cd "$BUILD_SOURCE_ROOT"');
+		expect(source).toContain('BUILT_BIN="$BUILD_SOURCE_ROOT/apps/cli/dist/better-ccflare"');
+		expect(source).toContain(
+			'SOURCE_GUARD="$BUILD_SOURCE_ROOT/scripts/ccflare-guard.mjs"',
+		);
+		expect(source).toContain(
+			'SOURCE_GUARD_POLICY="$BUILD_SOURCE_ROOT/scripts/ccflare-guard-policy.mjs"',
+		);
+		expect(source).toContain(
+			'SOURCE_RUNNER="$BUILD_SOURCE_ROOT/scripts/run-ccflare-stack.sh"',
+		);
+		expect(source).not.toContain('SOURCE_GUARD="$REPO_ROOT/');
+		expect(source).not.toContain('SOURCE_RUNNER="$REPO_ROOT/');
+		expect(source).toContain(
+			'remove_verified_source_snapshot "$REPO_ROOT" "$BUILD_SOURCE_ROOT"',
+		);
+	});
+
 	test("full deployment has rollback and exact dual-health verification", () => {
 		const source = readFileSync(deployScript, "utf8");
+		const helperSource = readFileSync(
+			join(repoRoot, helperScriptForShell),
+			"utf8",
+		);
 		expect(source).toContain('validate_deployment_timing "$PIN_RENDERED"');
 		expect(source).toContain(
 			"totalDeadlineMs: Number(guardTotalDeadlineMs)",
@@ -1296,14 +1714,15 @@ describe("deployment flow safety contracts", () => {
 		expect(source).toContain('GUARD_DIR="${GUARDS_ROOT}/${HEAD_SHA}"');
 		expect(source).toContain('RUNNER_DIR="${RUNNERS_ROOT}/${HEAD_SHA}"');
 		expect(source).toContain(
-			'SOURCE_RUNNER="$REPO_ROOT/scripts/run-ccflare-stack.sh"',
+			'SOURCE_RUNNER="$BUILD_SOURCE_ROOT/scripts/run-ccflare-stack.sh"',
 		);
 		expect(source).toContain('GUARD_SOURCE_ID="$HEAD_SHA"');
 		expect(source).toContain(
 			'GUARD_POLICY_ID="pool-exhaustion-finite-recovery-v1"',
 		);
 		expect(source).toContain('PIN_STAGED="${PIN}.new-${SHORT}-$$"');
-		expect(source).toContain('sudo mv -f "$PIN_STAGED" "$PIN"');
+		expect(source).toContain("replace_systemd_pin_if_snapshot_current");
+		expect(source).toContain('render_systemd_pin \\\n\t"$PIN_BACKUP"');
 		expect(source).toContain(
 			'cp "$SOURCE_GUARD_POLICY" "$GUARD_STAGE_DIR/ccflare-guard-policy.mjs"',
 		);
@@ -1326,14 +1745,16 @@ describe("deployment flow safety contracts", () => {
 		const backup = source.indexOf(
 			'sudo cp --preserve=all "$PIN" "$PIN_BACKUP"',
 		);
-		const rollbackArmed = source.indexOf("PIN_ROLLBACK_ARMED=1", backup);
-		const pinRender = source.indexOf("render_systemd_pin", backup);
+		const preflight = source.indexOf(
+			'validate_deploy_owned_systemd_pin "$PIN"',
+		);
+		const pinRender = source.indexOf("render_systemd_pin", preflight);
 		const timingValidation = source.indexOf(
 			'validate_deployment_timing "$PIN_RENDERED"',
 			pinRender,
 		);
 		const pinWrite = source.indexOf(
-			'sudo tee "$PIN_STAGED" <"$PIN_RENDERED"',
+			"replace_systemd_pin_if_snapshot_current",
 			timingValidation,
 		);
 		const restart = source.indexOf(
@@ -1350,12 +1771,28 @@ describe("deployment flow safety contracts", () => {
 		);
 		const verify = source.indexOf("if ! validate_deploy_health", restart);
 		const hardFailure = source.indexOf("exit 1", verify);
+		const snapshotCompare = helperSource.indexOf(
+			'if ! sudo cmp -s "$pin" "$backup"',
+		);
+		const rollbackArmed = helperSource.indexOf(
+			"PIN_ROLLBACK_ARMED=1",
+			snapshotCompare,
+		);
+		const atomicRename = helperSource.indexOf(
+			'if ! sudo mv -f "$staged" "$pin"',
+			rollbackArmed,
+		);
 		expect(backup).toBeGreaterThan(0);
-		expect(pinRender).toBeGreaterThan(backup);
+		expect(preflight).toBeGreaterThan(0);
+		expect(pinRender).toBeGreaterThan(preflight);
 		expect(timingValidation).toBeGreaterThan(pinRender);
+		expect(backup).toBeLessThan(pinRender);
 		expect(pinWrite).toBeGreaterThan(timingValidation);
-		expect(rollbackArmed).toBeGreaterThan(pinWrite);
-		expect(effectivePolicy).toBeGreaterThan(rollbackArmed);
+		expect(pinWrite).toBeGreaterThan(backup);
+		expect(snapshotCompare).toBeGreaterThan(0);
+		expect(rollbackArmed).toBeGreaterThan(snapshotCompare);
+		expect(atomicRename).toBeGreaterThan(rollbackArmed);
+		expect(effectivePolicy).toBeGreaterThan(pinWrite);
 		expect(restartAttempted).toBeGreaterThan(effectivePolicy);
 		expect(restart).toBeGreaterThan(restartAttempted);
 		expect(restart).toBeGreaterThan(pinRender);
