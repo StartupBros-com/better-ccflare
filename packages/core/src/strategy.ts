@@ -1,4 +1,5 @@
 import { type Account, StrategyName } from "@better-ccflare/types";
+import { PAUSE_REASON_NEEDS_REAUTH } from "./errors";
 
 // Array of all strategies for backwards compatibility
 export const STRATEGIES = Object.values(StrategyName);
@@ -16,6 +17,7 @@ export function isAccountAvailable(
 	now = Date.now(),
 ): boolean {
 	return (
+		account.pause_reason !== PAUSE_REASON_NEEDS_REAUTH &&
 		!account.paused &&
 		(!account.rate_limited_until || account.rate_limited_until < now)
 	);

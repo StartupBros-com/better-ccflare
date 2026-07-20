@@ -379,6 +379,7 @@ describe("always-on hard capacity", () => {
 
 	it("blocks only the matching family for an exhausted scoped window", () => {
 		const data = {
+			spend: { enabled: false },
 			limits: [
 				{
 					kind: "weekly_scoped",
@@ -392,11 +393,13 @@ describe("always-on hard capacity", () => {
 		const fable = evaluateHardCapacity(data, {
 			requestModel: "claude-fable-5",
 			observedAt: OBSERVED_AT,
+			provider: "anthropic",
 			now: NOW,
 		});
 		const opus = evaluateHardCapacity(data, {
 			requestModel: "claude-opus-4-8",
 			observedAt: OBSERVED_AT,
+			provider: "anthropic",
 			now: NOW,
 		});
 
@@ -406,6 +409,86 @@ describe("always-on hard capacity", () => {
 			modelFamily: "fable",
 		});
 		expect(opus).toMatchObject({ eligible: true, exclusions: [] });
+	});
+
+	it("fails open for Anthropic scoped caps when overage is enabled or unknown", () => {
+		const limit = {
+			kind: "weekly_scoped",
+			percent: 100,
+			resets_at: futureReset,
+			scope: { model: { display_name: "Fable" } },
+		};
+		for (const data of [
+			{ spend: { enabled: true }, limits: [limit] },
+			{ limits: [limit] },
+		]) {
+			expect(
+				evaluateHardCapacity(data as never, {
+					requestModel: "claude-fable-5",
+					observedAt: OBSERVED_AT,
+					provider: "anthropic",
+					now: NOW,
+				}),
+			).toMatchObject({ eligible: true, exclusions: [] });
+		}
+	});
+
+	it("fails open unless every raw row for the family proves exhaustion", () => {
+		const data = {
+			spend: { enabled: false },
+			limits: [
+				{
+					kind: "weekly_scoped",
+					percent: 100,
+					resets_at: futureReset,
+					scope: { model: { display_name: "Fable" } },
+				},
+				{
+					kind: "weekly_scoped",
+					percent: null,
+					resets_at: null,
+					scope: { model: { display_name: "Fable" } },
+				},
+			],
+		} as never;
+
+		expect(
+			evaluateHardCapacity(data, {
+				requestModel: "claude-fable-5",
+				observedAt: OBSERVED_AT,
+				provider: "anthropic",
+				now: NOW,
+			}),
+		).toMatchObject({ eligible: true, exclusions: [] });
+	});
+
+	it("fails open when one of several scoped surfaces still has capacity", () => {
+		const data = {
+			spend: { enabled: false },
+			limits: [
+				{
+					kind: "weekly_scoped",
+					percent: 100,
+					resets_at: futureReset,
+					scope: { model: { display_name: "Fable" } },
+				},
+				{
+					kind: "weekly_scoped",
+					percent: 75,
+					resets_at: futureReset,
+					scope: { model: { display_name: "Fable" } },
+				},
+			],
+		} as never;
+
+		expect(
+			evaluateHardCapacity(data, {
+				requestModel: "claude-fable-5",
+				observedAt: OBSERVED_AT,
+				provider: "anthropic",
+				now: NOW,
+			}),
+		).toMatchObject({ eligible: true, exclusions: [] });
 	});
 
 	it("fails open for unrelated and unknown scoped families", () => {

@@ -281,6 +281,7 @@ export function createAccountsListHandler(
 								id: a.id,
 								provider: a.provider ?? "",
 								paused: !!a.paused,
+								requires_reauth: a.pause_reason === PAUSE_REASON_NEEDS_REAUTH,
 								// pause_reason and rate_limit_reset feed wouldAutoUnpause —
 								// without them peek() can't simulate the auto-unpause that
 								// select() performs on safe-reason paused accounts whose
@@ -552,6 +553,8 @@ export function createAccountsListHandler(
 						: null,
 					created: new Date(Number(account.created_at)).toISOString(),
 					paused: account.paused === 1,
+					// pause_reason is the fork's authoritative terminal-auth state.
+					requiresReauth: account.pause_reason === PAUSE_REASON_NEEDS_REAUTH,
 					pauseReason: account.pause_reason ?? null,
 					priority: Number(account.priority) || 0,
 					tokenStatus: account.token_valid ? "valid" : "expired",

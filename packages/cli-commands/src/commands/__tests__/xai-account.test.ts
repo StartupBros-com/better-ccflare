@@ -107,6 +107,12 @@ describe("CLI xAI account import", () => {
 			priority: 50,
 			adapter: quietAdapter,
 		});
+		await dbOps.getAdapter().run(
+			`UPDATE accounts
+			 SET paused = 1, pause_reason = 'oauth_invalid_grant', requires_reauth = 1
+			 WHERE name = ?`,
+			["xai-reauth"],
+		);
 
 		writeGrokAuth({
 			key: "access-token-reauth",
@@ -121,10 +127,18 @@ describe("CLI xAI account import", () => {
 		const account = dbOps
 			.getDatabase()
 			.query<
-				{ access_token: string; refresh_token: string; expires_at: number },
+				{
+					access_token: string;
+					refresh_token: string;
+					expires_at: number;
+					refresh_token_issued_at: number | null;
+					requires_reauth: number;
+					paused: number;
+					pause_reason: string | null;
+				},
 				[string]
 			>(
-				"SELECT access_token, refresh_token, expires_at FROM accounts WHERE name = ?",
+				"SELECT access_token, refresh_token, expires_at, refresh_token_issued_at, requires_reauth, paused, pause_reason FROM accounts WHERE name = ?",
 			)
 			.get("xai-reauth");
 
@@ -137,6 +151,50 @@ describe("CLI xAI account import", () => {
 		expect(account?.expires_at).toBeLessThanOrEqual(
 			after + DEFAULT_XAI_TOKEN_TTL_MS,
 		);
+		expect(account?.requires_reauth).toBe(0);
+		expect(account?.paused).toBe(0);
+		expect(account?.pause_reason).toBeNull();
+		expect(account?.refresh_token_issued_at).toBeGreaterThanOrEqual(before);
+		expect(account?.refresh_token_issued_at).toBeLessThanOrEqual(after);
+	});
+
+	it("preserves a manual pause after successful credential re-import", async () => {
+		writeGrokAuth({
+			key: "access-token-original",
+			refresh_token: "refresh-token-original",
+		});
+		await addAccount(dbOps, config, {
+			name: "xai-manual-pause",
+			mode: "xai",
+			priority: 50,
+			adapter: quietAdapter,
+		});
+		await dbOps.getAdapter().run(
+			`UPDATE accounts
+			 SET paused = 1, pause_reason = 'manual', requires_reauth = 1
+			 WHERE name = ?`,
+			["xai-manual-pause"],
+		);
+
+		writeGrokAuth({
+			key: "access-token-reauth",
+			refresh_token: "refresh-token-reauth",
+		});
+		const result = await reauthenticateAccount(
+			dbOps,
+			config,
+			"xai-manual-pause",
+		);
+		expect(result.success).toBe(true);
+
+		const account = dbOps
+			.getDatabase()
+			.query<{ paused: number; pause_reason: string | null }, [string]>(
+				"SELECT paused, pause_reason FROM accounts WHERE name = ?",
+			)
+			.get("xai-manual-pause");
+		expect(account?.paused).toBe(1);
+		expect(account?.pause_reason).toBe("manual");
 	});
 
 	function writeGrokAuth(entry: {

@@ -18,7 +18,14 @@ export interface NormalizedCodexInputUsage {
 	cacheReadInputTokens: number;
 }
 
-/** Convert Codex's inclusive input total to Anthropic's additive usage fields. */
+/**
+ * Convert Codex's cache-inclusive input total to Anthropic's additive usage
+ * fields. OpenAI's usage.input_tokens counts cached tokens toward the total;
+ * Anthropic's input_tokens is additive and excludes tokens already reported
+ * via cache_read_input_tokens. Copying the inclusive total into both fields
+ * double-counts cached tokens for clients and billing that expect Anthropic
+ * semantics.
+ */
 export function normalizeCodexInputUsage(
 	totalInputTokens: unknown,
 	cachedTokens: unknown,

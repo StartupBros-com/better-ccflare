@@ -1,6 +1,7 @@
 import {
 	CLAUDE_MODEL_IDS,
 	getClientVersion,
+	PAUSE_REASON_NEEDS_REAUTH,
 	registerHeartbeat,
 	requestEvents,
 } from "@better-ccflare/core";
@@ -311,6 +312,7 @@ export class AutoRefreshScheduler {
 				session_start: null,
 				session_request_count: 0,
 				paused: false,
+				requires_reauth: accountRow.pause_reason === PAUSE_REASON_NEEDS_REAUTH,
 				rate_limit_reset: accountRow.rate_limit_reset
 					? Number(accountRow.rate_limit_reset)
 					: null,
@@ -775,6 +777,7 @@ export class AutoRefreshScheduler {
 			WHERE
 				provider IN ('qwen', 'xai')
 				AND refresh_token IS NOT NULL
+				AND COALESCE(paused, 0) = 0
 				AND (
 					access_token IS NULL
 					OR expires_at IS NULL
@@ -828,6 +831,7 @@ export class AutoRefreshScheduler {
 					session_start: null,
 					session_request_count: 0,
 					paused: false,
+					requires_reauth: false,
 					rate_limit_reset: null,
 					rate_limit_status: null,
 					rate_limit_remaining: null,
@@ -885,7 +889,12 @@ export class AutoRefreshScheduler {
 				// refreshToken performs a real OAuth refresh and can.
 				await pauseAccountForReauthIfInvalidGrant(
 					error,
-					{ id: row.id, name: row.name, refresh_token: row.refresh_token },
+					{
+						id: row.id,
+						name: row.name,
+						provider: row.provider,
+						refresh_token: row.refresh_token,
+					},
 					this.proxyContext.dbOps,
 				);
 			}
@@ -917,6 +926,7 @@ export class AutoRefreshScheduler {
 			WHERE
 				provider = 'codex'
 				AND refresh_token IS NOT NULL
+				AND COALESCE(paused, 0) = 0
 				AND (
 					access_token IS NULL
 					OR expires_at IS NULL
@@ -968,6 +978,7 @@ export class AutoRefreshScheduler {
 					session_start: null,
 					session_request_count: 0,
 					paused: false,
+					requires_reauth: false,
 					rate_limit_reset: null,
 					rate_limit_status: null,
 					rate_limit_remaining: null,
@@ -1021,7 +1032,12 @@ export class AutoRefreshScheduler {
 				// refreshAccessTokenSafe), so pause-for-reauth on a revoked token here too.
 				await pauseAccountForReauthIfInvalidGrant(
 					error,
-					{ id: row.id, name: row.name, refresh_token: row.refresh_token },
+					{
+						id: row.id,
+						name: row.name,
+						provider: row.provider,
+						refresh_token: row.refresh_token,
+					},
 					this.proxyContext.dbOps,
 				);
 			}

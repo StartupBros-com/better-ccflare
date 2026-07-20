@@ -296,6 +296,7 @@ function evaluateCandidateCapacity(
 		const hardCapacity = evaluateHardCapacity(snapshot.data, {
 			requestModel: model,
 			observedAt: snapshot.observedAt,
+			provider: account.provider,
 			now,
 		});
 		blockers.push(...hardCapacity.exclusions.map(snapshotBlocker));

@@ -1,7 +1,9 @@
 import type { Config } from "@better-ccflare/config";
 import {
 	type AlertEvt,
+	type AuthFailureEvt,
 	alertEvents,
+	authFailureEvents,
 	getModelRates,
 	type RequestEvt,
 	requestEvents,
@@ -184,6 +186,7 @@ export class AlertService {
 	private readonly db: BunSqlAdapter;
 	private readonly config: Config;
 	private readonly requestListener: (event: RequestEvt) => void;
+	private readonly authFailureListener: (event: AuthFailureEvt) => void;
 	private readonly configChangeListener: ({ key }: { key: string }) => void;
 	private anomalyTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -194,6 +197,9 @@ export class AlertService {
 			if (event.type === "summary") {
 				void this.evaluateRequest(event.payload);
 			}
+		};
+		this.authFailureListener = (event) => {
+			void this.handleAuthFailure(event);
 		};
 		this.configChangeListener = ({ key }: { key: string }) => {
 			if (
@@ -208,16 +214,44 @@ export class AlertService {
 	start(): void {
 		requestEvents.on("event", this.requestListener);
 		this.config.on("change", this.configChangeListener);
+		authFailureEvents.on("event", this.authFailureListener);
 		this.restartAnomalyTimer();
 	}
 
 	stop(): void {
 		requestEvents.off("event", this.requestListener);
 		this.config.off("change", this.configChangeListener);
+		authFailureEvents.off("event", this.authFailureListener);
 		if (this.anomalyTimer) {
 			clearInterval(this.anomalyTimer);
 			this.anomalyTimer = null;
 		}
+	}
+
+	private async handleAuthFailure(event: AuthFailureEvt): Promise<void> {
+		const timestamp = Date.now();
+		const config = getAlertsConfig(this.config);
+		const alert: AlertEvent = {
+			id: buildThresholdAlertId(
+				"auth_failure",
+				event.accountId,
+				timestamp,
+				config.cooldownMinutes,
+			),
+			timestamp,
+			type: "auth_failure",
+			severity: "critical",
+			title: "Account authentication failed",
+			message: `Account ${event.accountName} (${event.provider}) requires re-authentication: ${event.reason}`,
+			value: null,
+			threshold: null,
+			account: event.accountName,
+			model: null,
+			project: null,
+			requestId: null,
+			acknowledged: false,
+		};
+		await this.persistAndEmit(alert, config.webhookUrl);
 	}
 
 	private restartAnomalyTimer(): void {
@@ -504,38 +538,49 @@ export class AlertService {
 		alert: AlertEvent,
 		webhookUrl: string,
 	): Promise<void> {
-		// Check if a row with this cooldown-bucket ID already exists before inserting.
-		// If it does, the alert is within its cooldown window — skip emission entirely
-		// to avoid SSE storms and duplicate webhook deliveries.
-		const existing = await this.db.get<{ id: string }>(
-			`SELECT id FROM alerts WHERE id = ?`,
-			[alert.id],
-		);
-		if (existing) return;
-
-		await this.db.run(
-			`
-			INSERT OR IGNORE INTO alerts (
-				id, timestamp, type, severity, title, message, value, threshold,
-				account, model, project, request_id, acknowledged
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`,
-			[
-				alert.id,
-				alert.timestamp,
-				alert.type,
-				alert.severity,
-				alert.title,
-				alert.message,
-				alert.value,
-				alert.threshold,
-				alert.account,
-				alert.model,
-				alert.project,
-				alert.requestId,
-				alert.acknowledged ? 1 : 0,
-			],
-		);
+		try {
+			// INSERT OR IGNORE is SQLite-only; PostgreSQL uses ON CONFLICT DO NOTHING.
+			const conflictClause = this.db.isSQLite ? "INSERT OR IGNORE" : "INSERT";
+			const onConflictClause = this.db.isSQLite
+				? ""
+				: "ON CONFLICT (id) DO NOTHING";
+			// The unique alert ID is the cooldown guard. Only the caller whose insert
+			// actually wins may emit SSE or deliver the webhook; checking first would
+			// leave a race in which concurrent duplicates both deliver notifications.
+			const inserted = await this.db.runWithChanges(
+				`
+				${conflictClause} INTO alerts (
+					id, timestamp, type, severity, title, message, value, threshold,
+					account, model, project, request_id, acknowledged
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				${onConflictClause}
+			`,
+				[
+					alert.id,
+					alert.timestamp,
+					alert.type,
+					alert.severity,
+					alert.title,
+					alert.message,
+					alert.value,
+					alert.threshold,
+					alert.account,
+					alert.model,
+					alert.project,
+					alert.requestId,
+					alert.acknowledged ? 1 : 0,
+				],
+			);
+			if (inserted === 0) return;
+		} catch (error) {
+			// Alerts are best-effort telemetry — a persistence failure must not
+			// terminate the proxy (the listener is invoked from an async event
+			// handler, so an unhandled rejection crashes Bun with exit code 1).
+			log.error(
+				`Failed to persist ${alert.type} alert: ${(error as Error).message}`,
+			);
+			return;
+		}
 		const event: AlertEvt = { type: "alert", payload: alert };
 		alertEvents.emit("event", event);
 		if (webhookUrl) {

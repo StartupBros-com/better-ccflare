@@ -123,6 +123,7 @@ describe("OAuthFlow.completeReauth", () => {
 		expect(sql).toMatch(/refresh_token/i);
 		expect(sql).toMatch(/access_token/i);
 		expect(sql).toMatch(/expires_at/i);
+		expect(sql).toMatch(/requires_reauth\s*=\s*0/i);
 		// Params: [refreshToken, accessToken, expiresAt, refreshTokenIssuedAt, accountId]
 		expect(params[0]).toBe("new-refresh-token");
 		expect(params[1]).toBe("new-access-token");
@@ -150,7 +151,8 @@ describe("OAuthFlow.completeReauth", () => {
 		) as unknown as typeof fetch;
 
 		try {
-			const flow = new OAuthFlow(makeDbOps(runSpy), makeConfig());
+			const resumeSpy = mock(async () => true);
+			const flow = new OAuthFlow(makeDbOps(runSpy, resumeSpy), makeConfig());
 			const accountId = "bbbbbbbb-0000-0000-0000-000000000002";
 
 			const consoleFlowData = { ...testFlowData, mode: "console" as const };
@@ -170,8 +172,11 @@ describe("OAuthFlow.completeReauth", () => {
 			const [sql, params] = runSpy.mock.calls[0];
 			expect(sql).toMatch(/UPDATE\s+accounts/i);
 			expect(sql).toMatch(/api_key/i);
+			expect(sql).toMatch(/requires_reauth\s*=\s*0/i);
 			expect(params[0]).toBe("sk-console-api-key");
 			expect(params[1]).toBe(accountId);
+			expect(resumeSpy).toHaveBeenCalledTimes(1);
+			expect(resumeSpy.mock.calls[0][0]).toBe(accountId);
 		} finally {
 			globalThis.fetch = origFetch;
 		}
@@ -182,7 +187,8 @@ describe("OAuthFlow.completeReauth", () => {
 			throw new Error("token exchange failed");
 		});
 
-		const flow = new OAuthFlow(makeDbOps(runSpy), makeConfig());
+		const resumeSpy = mock(async () => true);
+		const flow = new OAuthFlow(makeDbOps(runSpy, resumeSpy), makeConfig());
 
 		await expect(
 			flow.completeReauth(
@@ -193,6 +199,7 @@ describe("OAuthFlow.completeReauth", () => {
 
 		// No DB write should have happened
 		expect(runSpy).not.toHaveBeenCalled();
+		expect(resumeSpy).not.toHaveBeenCalled();
 	});
 
 	it("auto-resumes a needs-reauth pause after claude-oauth reauth", async () => {

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import {
 	BUFFER_SIZES,
+	isInvalidGrantMessage,
 	mapModelName,
 	OAuthRefreshTokenError,
 	SseFrameBuffer,
@@ -565,8 +566,13 @@ export class CodexProvider extends BaseProvider {
 				// ignore
 			}
 
+			// Preserve the RFC-6749 machine code ahead of its human-readable
+			// description. Terminal-auth detection must not lose markers such as
+			// invalid_grant or refresh_token_reused when a description is present.
 			const errorMessage =
-				errorData?.error_description || errorData?.error || response.statusText;
+				[errorData?.error, errorData?.error_description]
+					.filter(Boolean)
+					.join(": ") || response.statusText;
 
 			// Rotating refresh tokens: reuse → terminal, must re-auth. Throw the
 			// typed error so the refresh chokepoint pauses the account for reauth
@@ -574,13 +580,15 @@ export class CodexProvider extends BaseProvider {
 			if (errorData?.error === "refresh_token_reused") {
 				throw new OAuthRefreshTokenError(
 					account.id,
-					`Codex refresh token was reused for account ${account.name}. Please re-authenticate with: bun run cli --reauthenticate ${account.name}`,
+					`Codex refresh_token_reused for account ${account.name}. Please re-authenticate with: bun run cli --reauthenticate ${account.name}`,
 				);
 			}
 
-			throw new Error(
-				`Failed to refresh Codex token for account ${account.name}: ${errorMessage}`,
-			);
+			const failureMessage = `Failed to refresh Codex token for account ${account.name}: ${errorMessage}`;
+			if (isInvalidGrantMessage(errorMessage)) {
+				throw new OAuthRefreshTokenError(account.id, failureMessage);
+			}
+			throw new Error(failureMessage);
 		}
 
 		const json = (await response.json()) as {
@@ -659,12 +667,16 @@ export class CodexProvider extends BaseProvider {
 				return this.createSyntheticCountTokensResponse(request, body);
 			}
 			const isSubscriptionEndpoint = isCodexSubscriptionEndpoint(request.url);
-			if (isSubscriptionEndpoint && body.max_tokens === 0) {
+			if (
+				isSubscriptionEndpoint &&
+				typeof body.max_tokens === "number" &&
+				body.max_tokens <= 0
+			) {
 				return this.createSyntheticErrorResponse(
 					request,
 					400,
 					"invalid_request_error",
-					"Codex subscription requests do not support max_tokens: 0.",
+					`Codex subscription requests do not support max_tokens: ${body.max_tokens}.`,
 				);
 			}
 
@@ -1104,7 +1116,7 @@ export class CodexProvider extends BaseProvider {
 			}
 			let serialized: string;
 			try {
-				serialized = JSON.stringify(block) ?? "";
+				serialized = JSON.stringify(block);
 			} catch {
 				continue;
 			}
@@ -1499,23 +1511,23 @@ export class CodexProvider extends BaseProvider {
 			body.tool_choice,
 			tools ?? [],
 		);
+		if (explicitToolChoice) {
+			codexRequest.tool_choice = explicitToolChoice;
+		} else if (tools?.some((t) => t.name === "StructuredOutput")) {
+			// Claude Code schema agents provide a StructuredOutput tool but do not set
+			// Anthropic tool_choice. Native Claude reliably follows the hidden schema
+			// instruction; Codex models often end_turn with text instead. Force the
+			// function when this sentinel tool is present to preserve workflow semantics.
+			codexRequest.tool_choice = {
+				type: "function",
+				name: "StructuredOutput",
+			};
+		}
+		if (body.tool_choice?.disable_parallel_tool_use === true) {
+			codexRequest.parallel_tool_calls = false;
+		}
 		if (tools) {
 			codexRequest.tools = tools;
-			if (explicitToolChoice) {
-				codexRequest.tool_choice = explicitToolChoice;
-			} else if (tools.some((t) => t.name === "StructuredOutput")) {
-				// Claude Code schema agents provide a StructuredOutput tool but do not set
-				// Anthropic tool_choice. Native Claude reliably follows the hidden schema
-				// instruction; Codex models often end_turn with text instead. Force the
-				// function when this sentinel tool is present to preserve workflow semantics.
-				codexRequest.tool_choice = {
-					type: "function",
-					name: "StructuredOutput",
-				};
-			}
-			if (body.tool_choice?.disable_parallel_tool_use === true) {
-				codexRequest.parallel_tool_calls = false;
-			}
 		}
 
 		if (
@@ -2139,6 +2151,9 @@ export class CodexProvider extends BaseProvider {
 		const isContextOverflow =
 			normalizedCode === "context_length_exceeded" ||
 			/^your input exceeds the context window\b/i.test(upstreamMessage);
+		if (isContextOverflow) {
+			type = "invalid_request_error";
+		}
 		const message = isContextOverflow
 			? `Prompt is too long. Codex reported: ${upstreamMessage}`
 			: upstreamMessage;

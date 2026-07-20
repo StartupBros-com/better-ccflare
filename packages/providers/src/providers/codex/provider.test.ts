@@ -596,6 +596,36 @@ describe("CodexProvider request conversion", () => {
 		});
 	});
 
+	it("rejects negative max_tokens locally for the subscription endpoint", async () => {
+		const provider = new CodexProvider();
+		const request = new Request(CODEX_DEFAULT_ENDPOINT, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				model: "claude-3-5-sonnet-20241022",
+				max_tokens: -1,
+				messages: [{ role: "user", content: "Hello" }],
+			}),
+		});
+
+		const transformed = await provider.transformRequestBody(request);
+		const body = await transformed.json();
+
+		expect(transformed.headers.get("x-better-ccflare-synthetic-response")).toBe(
+			"true",
+		);
+		expect(transformed.headers.get("x-better-ccflare-synthetic-status")).toBe(
+			"400",
+		);
+		expect(body).toEqual({
+			type: "error",
+			error: {
+				type: "invalid_request_error",
+				message: "Codex subscription requests do not support max_tokens: -1.",
+			},
+		});
+	});
+
 	it("falls back from an invalid custom endpoint and applies subscription rules", async () => {
 		const provider = new CodexProvider();
 		const account = {
@@ -2092,6 +2122,37 @@ describe("CodexProvider.processResponse", () => {
 				message:
 					"Prompt is too long. Codex reported: Your input exceeds the context window of this model. Please adjust your input and try again.",
 			},
+		});
+	});
+
+	it("forces message-detected context overflow to a non-retryable invalid request", async () => {
+		const provider = new CodexProvider();
+		const upstreamMessage =
+			"Your input exceeds the context window of this model. Please adjust your input and try again.";
+		const upstreamBody = sseBody([
+			...eventLine("response.failed", {
+				response: {
+					status: "failed",
+					error: { type: "api_error", message: upstreamMessage },
+				},
+			}),
+		]);
+
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: {
+				"content-type": "text/event-stream",
+				"x-better-ccflare-request-stream": "false",
+			},
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const body = await transformed.json();
+
+		expect(transformed.status).toBe(400);
+		expect(body.error).toEqual({
+			type: "invalid_request_error",
+			message: `Prompt is too long. Codex reported: ${upstreamMessage}`,
 		});
 	});
 
@@ -3846,6 +3907,27 @@ describe("CodexProvider.transformRequestBody", () => {
 		const transformed = await provider.transformRequestBody(request);
 		const body = await transformed.json();
 		expect(body.tool_choice).toEqual(expected);
+	});
+
+	it("preserves tool-choice controls even when no tools are declared", async () => {
+		const provider = new CodexProvider();
+		const request = new Request("https://example.com/v1/messages", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				model: "claude-opus-4-8",
+				max_tokens: 10,
+				messages: [{ role: "user", content: "answer directly" }],
+				tool_choice: { type: "auto", disable_parallel_tool_use: true },
+			}),
+		});
+
+		const transformed = await provider.transformRequestBody(request);
+		const body = await transformed.json();
+
+		expect(body.tools).toBeUndefined();
+		expect(body.tool_choice).toBe("auto");
+		expect(body.parallel_tool_calls).toBe(false);
 	});
 
 	it("preserves explicit tool_choice precedence over StructuredOutput fallback", async () => {
