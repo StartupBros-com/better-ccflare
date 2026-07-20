@@ -28,6 +28,20 @@ export interface RoutingCandidateSuccessReport {
 	candidateId: string;
 }
 
+/**
+ * Request-local recovery evidence for a lane whose viable candidates are all
+ * protected by route circuits. This is deliberately separate from account
+ * cooldown/capacity evidence: it may justify Retry-After, but never authorizes
+ * a whole-pool-exhausted classification.
+ */
+export interface RouteCircuitRecoveryHint {
+	allCandidatesOpen: boolean;
+	candidateCount: number;
+	probeLeased: boolean;
+	retryAt: number | null;
+	reason: string | null;
+}
+
 // API context for HTTP handlers
 export interface APIContext {
 	db: BunSqlAdapter;
@@ -125,6 +139,14 @@ export interface LoadBalancingStrategy {
 		meta: RequestMeta,
 		success: RoutingCandidateSuccessReport,
 	): void;
+
+	/**
+	 * Optional finite lane-circuit recovery evidence from the strategy that owns
+	 * the corresponding route failure state.
+	 */
+	getRouteCircuitRecoveryHint?(
+		meta: RequestMeta,
+	): RouteCircuitRecoveryHint | null;
 
 	/**
 	 * Optional initialization method to inject dependencies

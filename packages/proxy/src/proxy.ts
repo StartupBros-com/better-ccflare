@@ -47,6 +47,7 @@ import {
 	ERROR_MESSAGES,
 	ForceRouteUnavailableError,
 	filterRequestCompatibleAccounts,
+	formatRoutingAttemptMessage,
 	getComboSlotInfo,
 	getRoutingCapacityContext,
 	getUsageThrottleUntil,
@@ -505,6 +506,8 @@ async function handleProxyCore(
 					options,
 				),
 		});
+	const getRouteCircuitRecoveryHint = () =>
+		ctx.strategy.getRouteCircuitRecoveryHint?.(requestMeta) ?? null;
 	const accountSelectionTimeoutResponse = (
 		pacingSlot: Parameters<typeof finishPacing>[0],
 	): Response => {
@@ -802,6 +805,7 @@ async function handleProxyCore(
 			capacityContext: getRoutingCapacityContext(requestMeta),
 			rateLimitOutcomes: getRequestRateLimitOutcomes(req),
 			upstreamAttempts: 0,
+			routeCircuitRecoveryHint: getRouteCircuitRecoveryHint(),
 		});
 		log.error(`Routing terminal: ${terminal.kind}`);
 
@@ -1472,13 +1476,18 @@ async function handleProxyCore(
 	} catch (error) {
 		log.error("Failed to refresh terminal account state", error);
 	}
+	const actualUpstreamAttempts = routingAttemptLedger.attemptedCount;
 	const terminal = createRoutingTerminalResponse({
 		source: "attempts",
 		accounts: terminalAccounts,
 		capacityContext: getRoutingCapacityContext(requestMeta),
 		rateLimitOutcomes: getRequestRateLimitOutcomes(req),
-		upstreamAttempts,
-		message: `${ERROR_MESSAGES.ALL_ACCOUNTS_FAILED} (${allAttemptedAccounts.length} attempted)`,
+		upstreamAttempts: actualUpstreamAttempts,
+		message: formatRoutingAttemptMessage(
+			ERROR_MESSAGES.ALL_UPSTREAM_ROUTES_FAILED,
+			routingAttemptLedger,
+		),
+		routeCircuitRecoveryHint: getRouteCircuitRecoveryHint(),
 	});
 	cacheBodyStore.discardStaged(requestMeta.id);
 	// All candidates failed, no account served — degrade the badge (KTD-5).

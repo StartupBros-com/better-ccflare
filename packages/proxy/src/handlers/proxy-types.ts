@@ -25,7 +25,8 @@ export const ERROR_MESSAGES = {
 	PROVIDER_CANNOT_HANDLE: "Provider cannot handle path",
 	REFRESH_NOT_FOUND: "Refresh promise not found for account",
 	UNAUTHENTICATED_FAILED: "Failed to forward unauthenticated request",
-	ALL_ACCOUNTS_FAILED: "All accounts failed to proxy the request",
+	ALL_UPSTREAM_ROUTES_FAILED:
+		"All compatible upstream routes failed to proxy the request",
 	TOKEN_REFRESH_FAILED: "Failed to refresh access token",
 	PROXY_REQUEST_FAILED: "Failed to proxy request with account",
 	POOL_EXHAUSTED: "All accounts are temporarily unavailable",

@@ -123,6 +123,46 @@ async function body(response: Response) {
 }
 
 describe("routing terminal responses", () => {
+	it("advertises finite route-circuit recovery without claiming whole-pool exhaustion", async () => {
+		const now = Date.UTC(2026, 6, 17, 12);
+		const retryAt = now + 30_001;
+		const terminal = createRoutingTerminalResponse({
+			source: "selection",
+			accounts: [makeAccount(), makeAccount({ id: "account-2" })],
+			capacityContext: null,
+			rateLimitOutcomes: [],
+			upstreamAttempts: 0,
+			now,
+			routeCircuitRecoveryHint: {
+				allCandidatesOpen: true,
+				candidateCount: 2,
+				probeLeased: true,
+				retryAt,
+				reason: "semantic_stream_stall",
+			},
+		});
+
+		expect(terminal.kind).toBe("route_unavailable");
+		expect(terminal.response.headers.get("retry-after")).toBe("31");
+		expect(terminal.response.headers.get("x-better-ccflare-route-status")).toBe(
+			"circuit-open",
+		);
+		expect(
+			terminal.response.headers.get("x-better-ccflare-pool-status"),
+		).toBeNull();
+		const parsed = await body(terminal.response);
+		expect(parsed.error.code).toBe("route_unavailable");
+		expect(parsed.error.next_available_at).toBe(
+			new Date(retryAt).toISOString(),
+		);
+		expect(parsed.error.route_circuit).toEqual({
+			all_candidates_open: true,
+			candidate_count: 2,
+			probe_leased: true,
+			reason: "semantic_stream_stall",
+		});
+	});
+
 	it("returns model_pool_exhausted without retry markers for model-only capacity", async () => {
 		const now = Date.UTC(2026, 6, 17, 12);
 		const next = now + 60_000;
@@ -230,6 +270,7 @@ describe("routing terminal responses", () => {
 		expect(terminal.kind).toBe("route_unavailable");
 		const parsed = await body(terminal.response);
 		expect(parsed.error.code).toBe("route_unavailable");
+		expect(parsed.error.attempted_routes).toBe(2);
 	});
 
 	it("marks a finite unpaused global cooldown as retryable pool exhaustion", async () => {

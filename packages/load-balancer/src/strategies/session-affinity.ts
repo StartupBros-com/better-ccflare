@@ -9,6 +9,7 @@ import type {
 	Account,
 	LoadBalancingStrategy,
 	RequestMeta,
+	RouteCircuitRecoveryHint,
 	RoutingCandidateFailureReport,
 	RoutingCandidateSuccessReport,
 	StrategyStore,
@@ -87,6 +88,11 @@ interface RouteFailureState {
 	earlyProbeAvailable: boolean;
 }
 
+interface RouteCircuitSelection {
+	/** Exact viable candidate ids observed during the owning select call. */
+	candidateIds: readonly string[];
+}
+
 /**
  * SessionAffinityStrategy — a hybrid of SessionStrategy and LeastUsedStrategy.
  *
@@ -155,6 +161,11 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 	private lastPickedAt = new Map<string, number>();
 	/** Exact lane+candidate circuit state; never promoted to account health. */
 	private routeFailureStates = new Map<string, RouteFailureState>();
+	/** Request-local view used to expose finite circuit recovery at termination. */
+	private routeCircuitSelections = new WeakMap<
+		RequestMeta,
+		RouteCircuitSelection
+	>();
 	private nextRouteFailureGcAt = Number.NEGATIVE_INFINITY;
 	private routeFailureGcSweepCount = 0;
 
@@ -319,6 +330,59 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 		);
 	}
 
+	getRouteCircuitRecoveryHint(
+		meta: RequestMeta,
+	): RouteCircuitRecoveryHint | null {
+		const selection = this.routeCircuitSelections.get(meta);
+		const affinityKey = this.affinityKey(meta);
+		if (
+			!selection ||
+			affinityKey === null ||
+			selection.candidateIds.length === 0
+		) {
+			return null;
+		}
+
+		const now = this.now();
+		const states = selection.candidateIds
+			.map((candidateId) => this.routeFailureState(affinityKey, candidateId))
+			.filter((state): state is RouteFailureState => state !== undefined);
+		const allCandidatesOpen = states.length === selection.candidateIds.length;
+		if (states.length === 0) {
+			return {
+				allCandidatesOpen: false,
+				candidateCount: selection.candidateIds.length,
+				probeLeased: false,
+				retryAt: null,
+				reason: null,
+			};
+		}
+
+		const recoveries = states.map((state) => {
+			const leaseActive =
+				state.probeLeaseUntil !== null && now < state.probeLeaseUntil;
+			const retryAt = leaseActive
+				? (state.probeLeaseUntil as number)
+				: now >= state.nextProbeAt || state.earlyProbeAvailable
+					? now
+					: state.nextProbeAt;
+			return { state, retryAt, leaseActive };
+		});
+		const earliest = [...recoveries].sort(
+			(a, b) =>
+				a.retryAt - b.retryAt ||
+				a.state.candidateId.localeCompare(b.state.candidateId),
+		)[0];
+
+		return {
+			allCandidatesOpen,
+			candidateCount: selection.candidateIds.length,
+			probeLeased: recoveries.some((recovery) => recovery.leaseActive),
+			retryAt: earliest?.retryAt ?? null,
+			reason: earliest?.state.reason ?? null,
+		};
+	}
+
 	private acquireHalfOpenProbe(
 		candidates: StrategyCandidate[],
 		affinityKey: string,
@@ -337,18 +401,10 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 			);
 			return state ? [{ candidate, state }] : [];
 		});
-		if (
-			candidateStates.some(
-				({ state }) =>
-					state.probeLeaseUntil !== null && now < state.probeLeaseUntil,
-			)
-		) {
-			return null;
-		}
-
 		const eligible = candidateStates.filter(
 			({ candidate, state }) =>
 				isEligibleCandidate(candidate) &&
+				(state.probeLeaseUntil === null || now >= state.probeLeaseUntil) &&
 				(now >= state.nextProbeAt ||
 					(allowEarlyProbe && state.earlyProbeAvailable)),
 		);
@@ -485,6 +541,7 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 	async select(accounts: Account[], meta: RequestMeta): Promise<Account[]> {
 		const now = this.now();
 		this.gcStaleRouteFailureStates(now);
+		this.routeCircuitSelections.delete(meta);
 		const affinityKey = this.affinityKey(meta);
 		const configuredCandidates = zipStrategyCandidates(accounts, meta);
 		const candidates = filterHardExcludedCandidates(configuredCandidates, meta);
@@ -509,6 +566,15 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 		let forcedPriorityProbe: StrategyCandidate | null = null;
 		let forcedPriorityFallbacks: StrategyCandidate[] = [];
 		if (affinityKey !== null) {
+			this.routeCircuitSelections.set(meta, {
+				candidateIds: [
+					...new Set(
+						otherwiseAvailable.map(
+							(candidate) => candidate.routing.candidateId,
+						),
+					),
+				],
+			});
 			const closedCandidates = otherwiseAvailable.filter(
 				(candidate) =>
 					this.routeFailureState(affinityKey, candidate.routing.candidateId) ===
