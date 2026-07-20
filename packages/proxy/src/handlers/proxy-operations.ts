@@ -16,6 +16,8 @@ import {
 	getProvider,
 	isAnthropicExtraUsageExhausted,
 	isAnthropicOutOfCredits,
+	isCodexSubscriptionEndpoint,
+	resolveCodexEndpoint,
 	resolveCodexRequestModel,
 	resolveModelContextCapability,
 	usageCache,
@@ -139,7 +141,9 @@ export interface ContextAdmissionTracker {
 	inputTokens: number;
 	requestedMaxOutputTokens: number;
 	rejectedCount: number;
+	/** Safe limit and occupied total are always retained from the same rejection. */
 	largestSafeLimit: number;
+	terminalOccupiedTokens: number;
 	attemptedCount: number;
 	nonCapacitySkipCount: number;
 }
@@ -175,15 +179,17 @@ export function createContextAdmissionTracker(
 	inputTokens: number,
 	requestedMaxOutputTokens: unknown,
 ): ContextAdmissionTracker {
+	const sanitizedRequestedMaxOutputTokens =
+		typeof requestedMaxOutputTokens === "number" &&
+		Number.isFinite(requestedMaxOutputTokens)
+			? Math.max(0, Math.floor(requestedMaxOutputTokens))
+			: 0;
 	return {
 		inputTokens,
-		requestedMaxOutputTokens:
-			typeof requestedMaxOutputTokens === "number" &&
-			Number.isFinite(requestedMaxOutputTokens)
-				? Math.max(0, Math.floor(requestedMaxOutputTokens))
-				: 0,
+		requestedMaxOutputTokens: sanitizedRequestedMaxOutputTokens,
 		rejectedCount: 0,
 		largestSafeLimit: 0,
+		terminalOccupiedTokens: inputTokens + sanitizedRequestedMaxOutputTokens,
 		attemptedCount: 0,
 		nonCapacitySkipCount: 0,
 	};
@@ -212,23 +218,40 @@ export function admitConcreteCodexModel(
 		});
 		return true;
 	}
+	const resolvedEndpoint = resolveCodexEndpoint(
+		account.custom_endpoint,
+		account.name,
+	);
+	// Match CodexProvider.transformRequestBody's concrete wire contract. The
+	// ChatGPT subscription endpoint deletes max_output_tokens; API-compatible
+	// custom endpoints retain the sanitized Anthropic max_tokens value.
+	const outputReserveTokens = isCodexSubscriptionEndpoint(resolvedEndpoint)
+		? 0
+		: tracker.requestedMaxOutputTokens;
 	const decision = decideContextAdmission({
 		inputTokens: tracker.inputTokens,
 		effectiveContextWindow,
-		requestedMaxOutputTokens: tracker.requestedMaxOutputTokens,
+		requestedMaxOutputTokens: outputReserveTokens,
 		safetyReserveTokens: 0,
 	});
 	if (decision.status !== "reject") return true;
 
+	const safeLimitTokens = decision.safeLimitTokens ?? 0;
+	const shouldReplaceTerminalDecision =
+		tracker.rejectedCount === 0 ||
+		safeLimitTokens > tracker.largestSafeLimit ||
+		(safeLimitTokens === tracker.largestSafeLimit &&
+			decision.occupiedTokens < tracker.terminalOccupiedTokens);
 	tracker.rejectedCount++;
-	tracker.largestSafeLimit = Math.max(
-		tracker.largestSafeLimit,
-		decision.safeLimitTokens ?? 0,
-	);
+	if (shouldReplaceTerminalDecision) {
+		tracker.largestSafeLimit = safeLimitTokens;
+		tracker.terminalOccupiedTokens = decision.occupiedTokens;
+	}
 	log.info("Codex context admission rejected attempt", {
 		accountId: account.id,
 		model,
 		outcome: "capacity_rejected",
+		outputReserveTokens: decision.outputReserveTokens,
 		occupiedTokens: decision.occupiedTokens,
 		safeLimitTokens: decision.safeLimitTokens,
 	});
@@ -274,7 +297,7 @@ export function selectAdmittedCodexModel(
 export function createContextLengthExceededResponse(
 	tracker: ContextAdmissionTracker,
 ): Response {
-	const occupied = tracker.inputTokens + tracker.requestedMaxOutputTokens;
+	const occupied = tracker.terminalOccupiedTokens;
 	return new Response(
 		JSON.stringify({
 			type: "error",
