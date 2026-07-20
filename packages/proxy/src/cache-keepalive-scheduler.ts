@@ -3,6 +3,8 @@ import type { Config } from "@better-ccflare/config";
 import { registerHeartbeat } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import { cacheBodyStore } from "./cache-body-store";
+import { CACHE_REPLAY_MODEL_HEADER } from "./cache-transport-staging";
+import { stampInternalAutoRefreshAuth } from "./internal-probe-auth";
 import type { ProxyContext } from "./proxy";
 
 const log = new Logger("CacheKeepaliveScheduler");
@@ -168,6 +170,12 @@ export class CacheKeepaliveScheduler {
 			//  1. Visibility: request logger can identify synthetic requests
 			//  2. Loop prevention: proxy skips staging to avoid infinite replay cycle
 			replayHeaders.set("x-better-ccflare-keepalive", "true");
+			if (cached.resolvedModel) {
+				replayHeaders.set(CACHE_REPLAY_MODEL_HEADER, cached.resolvedModel);
+			}
+			// The model directive is privileged: authenticate this localhost hop so
+			// proxy ingress can distinguish it from a caller-forged header.
+			stampInternalAutoRefreshAuth(replayHeaders);
 			const proxyPort = this.proxyContext.runtime.port;
 			const protocol =
 				process.env.SSL_KEY_PATH && process.env.SSL_CERT_PATH

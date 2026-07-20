@@ -220,6 +220,7 @@ describe("coordinateAnthropicPreCommitRescue", () => {
 		it(`sanitizes a delayed ${terminal} without leaking its error, headers, or body`, async () => {
 			const activation = createAnthropicPreCommitRescueActivation();
 			const eventual = deferred<Response>();
+			const reportedTerminals: string[] = [];
 			activation.activate();
 			const responsePromise = coordinateAnthropicPreCommitRescue({
 				response: eventual.promise,
@@ -229,6 +230,10 @@ describe("coordinateAnthropicPreCommitRescue", () => {
 					activationGraceMs: 1,
 					pingIntervalMs: 5,
 					commitmentDeadlineMs: 100,
+				},
+				onRescueTerminal(kind) {
+					reportedTerminals.push(kind);
+					throw new Error("observer failure must stay isolated");
 				},
 			});
 			await delay(5);
@@ -252,6 +257,11 @@ describe("coordinateAnthropicPreCommitRescue", () => {
 			expect(body.match(/event: error/g)).toHaveLength(1);
 			expect(body).toEndWith(ANTHROPIC_PRECOMMIT_RESCUE_ERROR_FRAME);
 			expect(body).not.toContain("private");
+			expect(reportedTerminals).toEqual([
+				terminal === "rejection"
+					? "anthropic_rescue_routing_error"
+					: "anthropic_rescue_non_sse_response",
+			]);
 		});
 	}
 
@@ -554,6 +564,7 @@ describe("coordinateAnthropicPreCommitRescue", () => {
 		const activation = createAnthropicPreCommitRescueActivation();
 		const eventual = deferred<Response>();
 		const abortRouting = mock((_reason?: unknown) => undefined);
+		const onRescueTerminal = mock((_kind: string) => undefined);
 		activation.activate();
 
 		const response = await coordinateAnthropicPreCommitRescue({
@@ -565,11 +576,16 @@ describe("coordinateAnthropicPreCommitRescue", () => {
 				pingIntervalMs: 5,
 				commitmentDeadlineMs: 20,
 			},
+			onRescueTerminal,
 		});
 		const body = await response.text();
 
 		expect(body).toEndWith(ANTHROPIC_PRECOMMIT_RESCUE_ERROR_FRAME);
 		expect(abortRouting).toHaveBeenCalledTimes(1);
+		expect(onRescueTerminal).toHaveBeenCalledTimes(1);
+		expect(onRescueTerminal).toHaveBeenCalledWith(
+			"anthropic_rescue_commitment_deadline",
+		);
 	});
 
 	it("cancels a response that resolves after the rescue deadline exactly once", async () => {

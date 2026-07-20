@@ -80,7 +80,7 @@ describe("handleResponsesRequest", () => {
 		expect(body.output[0].type).toBe("message");
 	});
 
-	test("surfaces Codex CLI session identity as metadata.user_id", async () => {
+	test("surfaces a privacy-safe Codex CLI session identity as metadata.user_id", async () => {
 		let forwardedBody: Record<string, unknown> | null = null;
 		const mockHandleProxy: HandleProxyFn = async (req2) => {
 			forwardedBody = (await req2.json()) as Record<string, unknown>;
@@ -113,10 +113,13 @@ describe("handleResponsesRequest", () => {
 		// governor and load-balancer session affinity.
 		const req = makeReq({ prompt_cache_key: "conv-abc123" });
 		await handleResponsesRequest(req, new URL(req.url), mockHandleProxy, {});
-		expect(
-			(forwardedBody as unknown as { metadata?: { user_id?: string } })
-				?.metadata?.user_id,
-		).toBe("codex-responses-conv-abc123");
+		const forwardedUserId = (
+			forwardedBody as unknown as { metadata?: { user_id?: string } }
+		)?.metadata?.user_id;
+		expect(forwardedUserId).not.toContain("conv-abc123");
+		expect(JSON.parse(forwardedUserId ?? "{}").session_id).toMatch(
+			/^[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+		);
 
 		// Without any identity the body stays metadata-free (anonymous).
 		const anonReq = makeReq({});

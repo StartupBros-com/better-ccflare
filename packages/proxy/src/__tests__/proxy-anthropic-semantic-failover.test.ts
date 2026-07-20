@@ -92,6 +92,50 @@ let usageHandleChunk = mock(
 );
 let usageHandleEnd = mock(async (_message: unknown) => undefined);
 
+function installPersistingUsageCollector() {
+	const savedRequests: unknown[][] = [];
+	const pendingWrites = new Set<Promise<void>>();
+	const collector = new usageCollectorModule.UsageCollector(
+		{
+			async saveRequest(...args: unknown[]): Promise<void> {
+				savedRequests.push(args);
+			},
+			async updateAccountUsage(): Promise<void> {},
+		} as never,
+		{
+			enqueue(task: () => Promise<void> | void): boolean {
+				const pending = Promise.resolve().then(task);
+				pendingWrites.add(pending);
+				void pending.finally(() => pendingWrites.delete(pending));
+				return true;
+			},
+			enqueuePayload(): boolean {
+				return false;
+			},
+			canAcceptPayload(): boolean {
+				return false;
+			},
+			async dispose(): Promise<void> {
+				await Promise.allSettled([...pendingWrites]);
+			},
+		} as never,
+		() => false,
+		() => undefined,
+	);
+	const handleStart = spyOn(collector, "handleStart");
+	const handleEnd = spyOn(collector, "handleEnd");
+	restoreUsageCollector();
+	const collectorSpy = spyOn(
+		usageCollectorModule,
+		"getUsageCollector",
+	).mockReturnValue(collector);
+	restoreUsageCollector = () => {
+		collectorSpy.mockRestore();
+		collector.dispose();
+	};
+	return { collector, handleStart, handleEnd, savedRequests };
+}
+
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const PRELUDE = [
@@ -1902,6 +1946,56 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		expect(body).not.toContain("service_unavailable");
 		expect(reportCandidateSuccess).not.toHaveBeenCalled();
 	});
+
+	for (const responseBody of [
+		{ label: "with a body", body: '{"private":"must-not-forward"}' },
+		{ label: "with a null body", body: null },
+	] as const) {
+		it(`records a delayed HTTP-200 non-SSE response ${responseBody.label} once as the rescue terminal`, async () => {
+			process.env[TIMEOUT_ENV] = "1000";
+			process.env[RESCUE_ACTIVATION_ENV] = "1";
+			process.env[RESCUE_PING_ENV] = "5";
+			process.env[RESCUE_DEADLINE_ENV] = "100";
+			const persistence = installPersistingUsageCollector();
+			const account = makeAccount(
+				`non-sse-${responseBody.body === null ? "null" : "body"}`,
+			);
+			const { ctx } = makeContext([account]);
+			globalThis.fetch = mock(async () => {
+				await new Promise((resolve) => setTimeout(resolve, 10));
+				return new Response(responseBody.body, {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}) as unknown as typeof fetch;
+
+			const request = makeRequest();
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			const body = await response.text();
+			await persistence.collector.drain();
+
+			expect(response.status).toBe(200);
+			expect(response.headers.get("content-type")).toContain(
+				"text/event-stream",
+			);
+			expect(body).toEndWith(ANTHROPIC_PRECOMMIT_RESCUE_ERROR_FRAME);
+			expect(body).not.toContain("must-not-forward");
+			expect(persistence.handleStart).toHaveBeenCalledTimes(1);
+			expect(persistence.handleEnd).toHaveBeenCalledTimes(1);
+			expect(persistence.handleEnd).toHaveBeenCalledWith({
+				type: "end",
+				requestId: expect.any(String),
+				success: false,
+				error: "anthropic_rescue_non_sse_response",
+			});
+			expect(persistence.savedRequests).toHaveLength(1);
+			expect(persistence.savedRequests[0]?.[4]).toBe(200);
+			expect(persistence.savedRequests[0]?.[5]).toBe(false);
+			expect(persistence.savedRequests[0]?.[6]).toBe(
+				"anthropic_rescue_non_sse_response",
+			);
+		});
+	}
 
 	it("propagates the shared deadline through a reserved fallback without penalizing either route", async () => {
 		process.env[TIMEOUT_ENV] = "1000";

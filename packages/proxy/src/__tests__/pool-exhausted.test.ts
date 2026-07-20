@@ -35,6 +35,7 @@ const MEANINGFUL_PROGRESS_ENV =
 const RESCUE_ACTIVATION_ENV =
 	"CCFLARE_ANTHROPIC_PRECOMMIT_RESCUE_ACTIVATION_MS";
 const RESCUE_PING_ENV = "CCFLARE_ANTHROPIC_PRECOMMIT_RESCUE_PING_INTERVAL_MS";
+const ACCOUNT_SELECTION_TIMEOUT_ENV = "CCFLARE_ACCOUNT_SELECTION_TIMEOUT_MS";
 const FAST_SUCCESS = [
 	"event: message_start",
 	'data: {"type":"message_start","message":{"id":"msg-pass","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-5","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}}',
@@ -191,23 +192,41 @@ let savedPassthrough: string | undefined;
 let savedMeaningfulProgress: string | undefined;
 let savedRescueActivation: string | undefined;
 let savedRescuePing: string | undefined;
+let savedAccountSelectionTimeout: string | undefined;
 let restoreUsageCollector = (): void => {};
+let usageStarts: Array<Record<string, unknown>> = [];
+let usageEnds: Array<Record<string, unknown>> = [];
 
 beforeEach(() => {
 	savedPassthrough = process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
 	savedMeaningfulProgress = process.env[MEANINGFUL_PROGRESS_ENV];
 	savedRescueActivation = process.env[RESCUE_ACTIVATION_ENV];
 	savedRescuePing = process.env[RESCUE_PING_ENV];
+	savedAccountSelectionTimeout = process.env[ACCOUNT_SELECTION_TIMEOUT_ENV];
 	delete process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
-	const collectorSpy = spyOn(
+	usageStarts = [];
+	usageEnds = [];
+	const collector = {
+		handleStart: mock((message: Record<string, unknown>) => {
+			usageStarts.push(message);
+		}),
+		handleChunk: mock(() => undefined),
+		handleEnd: mock(async (message: Record<string, unknown>) => {
+			usageEnds.push(message);
+		}),
+	};
+	const requiredCollectorSpy = spyOn(
 		usageCollectorModule,
 		"getUsageCollector",
-	).mockReturnValue({
-		handleStart: mock(() => undefined),
-		handleChunk: mock(() => undefined),
-		handleEnd: mock(async () => undefined),
-	} as never);
-	restoreUsageCollector = () => collectorSpy.mockRestore();
+	).mockReturnValue(collector as never);
+	const optionalCollectorSpy = spyOn(
+		usageCollectorModule,
+		"tryGetUsageCollector",
+	).mockReturnValue(collector as never);
+	restoreUsageCollector = () => {
+		requiredCollectorSpy.mockRestore();
+		optionalCollectorSpy.mockRestore();
+	};
 });
 
 afterEach(() => {
@@ -224,6 +243,7 @@ afterEach(() => {
 		[MEANINGFUL_PROGRESS_ENV, savedMeaningfulProgress],
 		[RESCUE_ACTIVATION_ENV, savedRescueActivation],
 		[RESCUE_PING_ENV, savedRescuePing],
+		[ACCOUNT_SELECTION_TIMEOUT_ENV, savedAccountSelectionTimeout],
 	] as const) {
 		if (value === undefined) delete process.env[name];
 		else process.env[name] = value;
@@ -231,6 +251,179 @@ afterEach(() => {
 });
 
 describe("routing terminal — 503 response", () => {
+	it("records the direct native terminal lifecycle exactly once", async () => {
+		const response = await handleProxy(
+			makeRequest(),
+			new URL("https://proxy.local/v1/messages"),
+			makeContext([]),
+		);
+
+		expect(response.status).toBe(503);
+		expect(usageStarts).toHaveLength(1);
+		expect(usageEnds).toHaveLength(1);
+		expect(usageStarts[0]).toMatchObject({
+			requestId: usageEnds[0].requestId,
+			accountId: null,
+			responseStatus: 503,
+			isStream: false,
+		});
+		expect(usageEnds[0]).toMatchObject({
+			success: false,
+			error: "route_unavailable",
+		});
+	});
+
+	it("records a delayed final-attempt 503 before rescue translates it to SSE", async () => {
+		process.env[MEANINGFUL_PROGRESS_ENV] = "100";
+		process.env[RESCUE_ACTIVATION_ENV] = "1";
+		process.env[RESCUE_PING_ENV] = "5";
+		const account = makeAccount({
+			id: "acc-rescued-terminal",
+			provider: "anthropic",
+			access_token: "test-access-token",
+			refresh_token: "test-refresh-token",
+			expires_at: Date.now() + 60_000,
+		});
+		globalThis.fetch = mock(async () => {
+			await delay(10);
+			throw new Error("simulated upstream connection failure");
+		}) as unknown as typeof fetch;
+
+		const response = await handleProxy(
+			makeAnthropicRequest(true),
+			new URL("https://proxy.local/v1/messages"),
+			makeContext([account], "anthropic"),
+		);
+		const body = await response.text();
+
+		expect(response.status).toBe(200);
+		expect(body).toEndWith(ANTHROPIC_PRECOMMIT_RESCUE_ERROR_FRAME);
+		expect(usageStarts).toHaveLength(1);
+		expect(usageEnds).toHaveLength(1);
+		expect(usageStarts[0]).toMatchObject({
+			requestId: usageEnds[0].requestId,
+			accountId: null,
+			responseStatus: 503,
+			isStream: false,
+		});
+		expect(usageEnds[0]).toMatchObject({
+			success: false,
+			error: "route_unavailable",
+		});
+	});
+
+	it("records an outer-rescue routing rejection once as the HTTP-200 terminal it emitted", async () => {
+		process.env[MEANINGFUL_PROGRESS_ENV] = "100";
+		process.env[RESCUE_ACTIVATION_ENV] = "1";
+		process.env[RESCUE_PING_ENV] = "5";
+		const account = makeAccount({
+			id: "acc-rescue-routing-rejection",
+			provider: "anthropic",
+			access_token: "test-access-token",
+			refresh_token: "test-refresh-token",
+			expires_at: Date.now() + 60_000,
+		});
+		const ctx = makeContext([account], "anthropic");
+		ctx.strategy.getRouteCircuitRecoveryHint = () => {
+			throw new Error("simulated terminal routing rejection");
+		};
+		globalThis.fetch = mock(async () => {
+			await delay(10);
+			throw new Error("simulated upstream connection failure");
+		}) as unknown as typeof fetch;
+
+		const response = await handleProxy(
+			makeAnthropicRequest(true),
+			new URL("https://proxy.local/v1/messages"),
+			ctx,
+		);
+		const body = await response.text();
+
+		expect(response.status).toBe(200);
+		expect(body).toEndWith(ANTHROPIC_PRECOMMIT_RESCUE_ERROR_FRAME);
+		expect(usageStarts).toHaveLength(1);
+		expect(usageEnds).toHaveLength(1);
+		expect(usageStarts[0]).toMatchObject({
+			requestId: usageEnds[0].requestId,
+			accountId: null,
+			responseStatus: 200,
+			isStream: true,
+		});
+		expect(usageEnds[0]).toMatchObject({
+			success: false,
+			error: "anthropic_rescue_routing_error",
+		});
+	});
+
+	it("records a delayed local non-SSE terminal only when the outer rescue owns its translation", async () => {
+		process.env[MEANINGFUL_PROGRESS_ENV] = "100";
+		process.env[RESCUE_ACTIVATION_ENV] = "1";
+		process.env[RESCUE_PING_ENV] = "5";
+		process.env[ACCOUNT_SELECTION_TIMEOUT_ENV] = "5";
+		const ctx = makeContext([], "anthropic");
+		ctx.strategy = {
+			select: async () => {
+				await delay(30);
+				return [];
+			},
+		} as never;
+
+		const response = await handleProxy(
+			makeAnthropicRequest(true),
+			new URL("https://proxy.local/v1/messages"),
+			ctx,
+		);
+		const body = await response.text();
+
+		expect(response.status).toBe(200);
+		expect(body).toEndWith(ANTHROPIC_PRECOMMIT_RESCUE_ERROR_FRAME);
+		expect(usageStarts).toHaveLength(1);
+		expect(usageEnds).toHaveLength(1);
+		expect(usageStarts[0]).toMatchObject({
+			requestId: usageEnds[0].requestId,
+			accountId: null,
+			responseStatus: 200,
+			isStream: true,
+		});
+		expect(usageEnds[0]).toMatchObject({
+			success: false,
+			error: "anthropic_rescue_non_sse_response",
+		});
+	});
+
+	it("records the outer commitment deadline once when routing never settles", async () => {
+		process.env[MEANINGFUL_PROGRESS_ENV] = "30";
+		process.env[RESCUE_ACTIVATION_ENV] = "1";
+		process.env[RESCUE_PING_ENV] = "5";
+		process.env[ACCOUNT_SELECTION_TIMEOUT_ENV] = "100";
+		const ctx = makeContext([], "anthropic");
+		ctx.strategy = {
+			select: () => new Promise<Account[]>(() => undefined),
+		} as never;
+
+		const response = await handleProxy(
+			makeAnthropicRequest(true),
+			new URL("https://proxy.local/v1/messages"),
+			ctx,
+		);
+		const body = await response.text();
+
+		expect(response.status).toBe(200);
+		expect(body).toEndWith(ANTHROPIC_PRECOMMIT_RESCUE_ERROR_FRAME);
+		expect(usageStarts).toHaveLength(1);
+		expect(usageEnds).toHaveLength(1);
+		expect(usageStarts[0]).toMatchObject({
+			requestId: usageEnds[0].requestId,
+			accountId: null,
+			responseStatus: 200,
+			isStream: true,
+		});
+		expect(usageEnds[0]).toMatchObject({
+			success: false,
+			error: "anthropic_rescue_commitment_deadline",
+		});
+	});
+
 	it("returns non-retryable route_unavailable when pool is empty", async () => {
 		const ctx = makeContext([]);
 		const response = await handleProxy(
@@ -500,6 +693,18 @@ describe("pool exhausted — CCFLARE_PASSTHROUGH_ON_EMPTY_POOL=1 escape hatch", 
 		expect(body).toEndWith(ANTHROPIC_PRECOMMIT_RESCUE_ERROR_FRAME);
 		expect(abortCount).toBe(1);
 		expect(abortElapsedMs).not.toBeNull();
+		expect(usageStarts).toHaveLength(1);
+		expect(usageEnds).toHaveLength(1);
+		expect(usageStarts[0]).toMatchObject({
+			requestId: usageEnds[0].requestId,
+			accountId: null,
+			responseStatus: 200,
+			isStream: true,
+		});
+		expect(usageEnds[0]).toMatchObject({
+			success: false,
+			error: "anthropic_rescue_commitment_deadline",
+		});
 		if (abortElapsedMs === null) return;
 		expect(abortElapsedMs).toBeLessThan(100);
 	});

@@ -49,6 +49,11 @@ mock.module("@better-ccflare/core", () => ({
 import { cacheBodyStore } from "../cache-body-store";
 // Import AFTER mock.module so the scheduler gets the mocked registerHeartbeat.
 import { CacheKeepaliveScheduler } from "../cache-keepalive-scheduler";
+import { CACHE_REPLAY_MODEL_HEADER } from "../cache-transport-staging";
+import {
+	consumeInternalAutoRefreshAuth,
+	INTERNAL_AUTO_REFRESH_HEADER,
+} from "../internal-probe-auth";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -101,11 +106,21 @@ function seedCacheEntry(
 	accountId: string,
 	path = "/v1/messages",
 	bodyText = '{"model":"claude-opus-4-5","messages":[],"system":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}]}',
+	resolvedModel: string | null = null,
+	sourceHeaders = new Headers({ "content-type": "application/json" }),
 ): void {
 	const requestId = `req-${accountId}-${Date.now()}`;
 	const bodyBuffer = new TextEncoder().encode(bodyText).buffer;
-	const headers = new Headers({ "content-type": "application/json" });
-	cacheBodyStore.stageRequest(requestId, accountId, bodyBuffer, headers, path);
+	cacheBodyStore.stageRequest(
+		requestId,
+		accountId,
+		bodyBuffer,
+		sourceHeaders,
+		path,
+		undefined,
+		undefined,
+		resolvedModel,
+	);
 	// Promote by simulating a successful cache creation (cacheCreationInputTokens > 0).
 	cacheBodyStore.onSummary(requestId, 42);
 }
@@ -442,6 +457,66 @@ describe("CacheKeepaliveScheduler", () => {
 			expect(decoded.model).toBe("claude-opus-4-5");
 			expect(decoded.messages).toEqual([{ role: "user", content: "hello" }]);
 			expect(decoded.max_tokens).toBe(1);
+
+			scheduler.stop();
+		});
+
+		it("replays the resolved physical fallback model with trusted internal wiring and no retained credentials", async () => {
+			let capturedHeaders: Headers | null = null;
+			let capturedBodyText: string | null = null;
+			globalThis.fetch = mock(
+				async (_input: RequestInfo | URL, init?: RequestInit) => {
+					capturedHeaders = new Headers(init?.headers);
+					capturedBodyText = String(init?.body ?? "");
+					return new Response("", { status: 200 });
+				},
+			) as unknown as typeof fetch;
+
+			const { config } = makeConfig(5);
+			const scheduler = new CacheKeepaliveScheduler(makeProxyContext(), config);
+			scheduler.start();
+
+			const sourceBody = JSON.stringify({
+				model: "provider-alias-remapped-to-primary",
+				messages: [{ role: "user", content: "hello" }],
+				system: [
+					{
+						type: "text",
+						text: "stable",
+						cache_control: { type: "ephemeral" },
+					},
+				],
+			});
+			seedCacheEntry(
+				"acc-physical-fallback",
+				"/v1/messages",
+				sourceBody,
+				"physical-fallback-model",
+				new Headers({
+					"content-type": "application/json",
+					authorization: "Bearer must-not-survive",
+					"x-api-key": "must-not-survive",
+					"x-better-ccflare-request-id": "must-not-survive",
+				}),
+			);
+
+			await capturedCallback?.();
+
+			if (!capturedHeaders || capturedBodyText === null) {
+				throw new Error("expected keepalive replay");
+			}
+			expect(capturedHeaders.get(CACHE_REPLAY_MODEL_HEADER)).toBe(
+				"physical-fallback-model",
+			);
+			expect(capturedHeaders.has(INTERNAL_AUTO_REFRESH_HEADER)).toBe(true);
+			expect(consumeInternalAutoRefreshAuth(capturedHeaders)).toBe(true);
+			expect(capturedHeaders.has(INTERNAL_AUTO_REFRESH_HEADER)).toBe(false);
+			expect(capturedHeaders.has("authorization")).toBe(false);
+			expect(capturedHeaders.has("x-api-key")).toBe(false);
+			expect(capturedHeaders.has("x-better-ccflare-request-id")).toBe(false);
+			expect(JSON.parse(capturedBodyText).model).toBe(
+				"provider-alias-remapped-to-primary",
+			);
 
 			scheduler.stop();
 		});

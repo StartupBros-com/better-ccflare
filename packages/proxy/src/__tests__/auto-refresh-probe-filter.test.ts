@@ -20,7 +20,7 @@ import { cacheBodyStore } from "../cache-body-store";
 import {
 	applyCacheBodyStagingPolicy,
 	getCacheBodyStagingAction,
-} from "../handlers/proxy-operations";
+} from "../cache-transport-staging";
 import { stampInternalAutoRefreshAuth } from "../internal-probe-auth";
 import * as usageCollectorModule from "../usage-collector";
 

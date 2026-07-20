@@ -57,6 +57,16 @@ export interface AnthropicPreCommitRescueActivation {
 	activate(): void;
 }
 
+export type AnthropicPreCommitRescueTerminalKind =
+	| "anthropic_rescue_commitment_deadline"
+	| "anthropic_rescue_routing_error"
+	| "anthropic_rescue_non_sse_response";
+
+export interface AnthropicPreCommitRescueRequestLifecycle {
+	deferFinalization(): void;
+	releaseFinalization(): Promise<void>;
+}
+
 /** Request-scoped control seam shared by routing and the rescue coordinator. */
 export interface AnthropicPreCommitRescueRouteContext {
 	readonly activate: () => void;
@@ -65,6 +75,18 @@ export interface AnthropicPreCommitRescueRouteContext {
 	readonly commitmentDeadlineAt: number;
 	/** Reserve fallback capacity only for a route known not to be final. */
 	getAttemptCommitmentDeadlineAt(isFinalAttempt: boolean): number;
+	/** Registers the request-history fallback once RequestMeta exists. */
+	registerTerminalRecorder(
+		recorder: (kind: AnthropicPreCommitRescueTerminalKind) => void,
+	): void;
+	/** Holds inner response completion until the outer response decision is made. */
+	registerRequestLifecycle(
+		lifecycle: AnthropicPreCommitRescueRequestLifecycle,
+	): void;
+	/** Releases a forwarded native/SSE response to own its normal terminal. */
+	releaseResponseLifecycle(): void;
+	/** Reports a terminal owned by the committed outer rescue stream. */
+	reportTerminal(kind: AnthropicPreCommitRescueTerminalKind): void;
 }
 
 export interface AnthropicPreCommitRescueOptions {
@@ -79,6 +101,10 @@ export interface AnthropicPreCommitRescueOptions {
 	requestStartedAt?: number;
 	/** Exact shared boundary used by every route gate in the request. */
 	commitmentDeadlineAt?: number;
+	/** Called only when the committed rescue itself translates a terminal. */
+	onRescueTerminal?: (kind: AnthropicPreCommitRescueTerminalKind) => void;
+	/** Called once when the native response is accepted rather than translated. */
+	onResponseAccepted?: () => void;
 }
 
 type ResponseOutcome =
@@ -189,6 +215,22 @@ export function createAnthropicPreCommitRescueRouteContext(options: {
 	const fallbackReserveMs = getAnthropicPreCommitFallbackReserveMs(
 		options.commitmentDeadlineMs,
 	);
+	let terminalRecorder:
+		| ((kind: AnthropicPreCommitRescueTerminalKind) => void)
+		| undefined;
+	let pendingTerminal: AnthropicPreCommitRescueTerminalKind | undefined;
+	let terminalReported = false;
+	let requestLifecycle: AnthropicPreCommitRescueRequestLifecycle | undefined;
+	let responseLifecycleReleased = false;
+	const deliverPendingTerminal = (): void => {
+		if (terminalReported || !terminalRecorder || !pendingTerminal) return;
+		terminalReported = true;
+		try {
+			terminalRecorder(pendingTerminal);
+		} catch {
+			// Request-history telemetry can never corrupt rescue delivery.
+		}
+	};
 
 	return {
 		activate: options.activate,
@@ -198,6 +240,33 @@ export function createAnthropicPreCommitRescueRouteContext(options: {
 			return isFinalAttempt
 				? commitmentDeadlineAt
 				: commitmentDeadlineAt - fallbackReserveMs;
+		},
+		registerTerminalRecorder(recorder) {
+			terminalRecorder ??= recorder;
+			deliverPendingTerminal();
+		},
+		registerRequestLifecycle(lifecycle) {
+			if (requestLifecycle) return;
+			requestLifecycle = lifecycle;
+			try {
+				lifecycle.deferFinalization();
+				if (responseLifecycleReleased) void lifecycle.releaseFinalization();
+			} catch {
+				// Request-history telemetry cannot affect response coordination.
+			}
+		},
+		releaseResponseLifecycle() {
+			if (responseLifecycleReleased) return;
+			responseLifecycleReleased = true;
+			try {
+				void requestLifecycle?.releaseFinalization();
+			} catch {
+				// Request-history telemetry cannot affect response coordination.
+			}
+		},
+		reportTerminal(kind) {
+			pendingTerminal ??= kind;
+			deliverPendingTerminal();
 		},
 	};
 }
@@ -242,6 +311,14 @@ function responseOutcome(
 function unwrapOutcome(outcome: ResponseOutcome): Response {
 	if (outcome.kind === "error") throw outcome.error;
 	return outcome.response;
+}
+
+function reportResponseAcceptedSafely(callback?: () => void): void {
+	try {
+		callback?.();
+	} catch {
+		// Request-history telemetry cannot affect response coordination.
+	}
 }
 
 function timer<T>(
@@ -294,6 +371,9 @@ function createRescueResponse(
 		readonly promise: Promise<typeof DEADLINE_ELAPSED>;
 		cancel(): void;
 	},
+	commitmentDeadlineAt: number,
+	onRescueTerminal?: (kind: AnthropicPreCommitRescueTerminalKind) => void,
+	onResponseAccepted?: () => void,
 ): Response {
 	const encoder = new TextEncoder();
 	let cancelled = false;
@@ -303,6 +383,8 @@ function createRescueResponse(
 	let winnerChunkForwarded = false;
 	let winnerReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
 	let pingTimer: ReturnType<typeof setInterval> | undefined;
+	let rescueTerminalReported = false;
+	let responseAcceptedReported = false;
 	const routedResult = Promise.race([outcomePromise, deadline.promise]);
 	let settledResult: ResponseOutcome | typeof DEADLINE_ELAPSED | undefined;
 
@@ -342,6 +424,26 @@ function createRescueResponse(
 				void cancelResolvedResponseOnce(lateOutcome.response, reason);
 			}
 		});
+	};
+	const reportRescueTerminal = (
+		kind: AnthropicPreCommitRescueTerminalKind,
+	): void => {
+		if (rescueTerminalReported) return;
+		rescueTerminalReported = true;
+		try {
+			onRescueTerminal?.(kind);
+		} catch {
+			// Observability is isolated from the committed response stream.
+		}
+	};
+	const reportResponseAccepted = (): void => {
+		if (responseAcceptedReported) return;
+		responseAcceptedReported = true;
+		try {
+			onResponseAccepted?.();
+		} catch {
+			// Observability is isolated from the committed response stream.
+		}
 	};
 
 	void routedResult.then((result) => {
@@ -390,10 +492,18 @@ function createRescueResponse(
 			if (cancelled || closed) return;
 
 			if (result === DEADLINE_ELAPSED || result.kind === "error") {
+				const commitmentDeadlineElapsed =
+					result === DEADLINE_ELAPSED || Date.now() >= commitmentDeadlineAt;
+				reportRescueTerminal(
+					commitmentDeadlineElapsed
+						? "anthropic_rescue_commitment_deadline"
+						: "anthropic_rescue_routing_error",
+				);
 				closeWithSanitizedError();
 				return;
 			}
 			if (!isSuccessfulSse(result.response)) {
+				reportRescueTerminal("anthropic_rescue_non_sse_response");
 				closeWithSanitizedError();
 				void cancelResolvedResponseOnce(
 					result.response,
@@ -401,6 +511,7 @@ function createRescueResponse(
 				);
 				return;
 			}
+			reportResponseAccepted();
 
 			// A queued rescue ping already satisfies downstream demand. Do not read a
 			// winner chunk until the queue has capacity again.
@@ -483,6 +594,9 @@ export async function coordinateAnthropicPreCommitRescue(
 	]);
 	if (first !== ACTIVATED) {
 		deadline.cancel();
+		if (first.kind === "response") {
+			reportResponseAcceptedSafely(options.onResponseAccepted);
+		}
 		return unwrapOutcome(first);
 	}
 
@@ -503,11 +617,17 @@ export async function coordinateAnthropicPreCommitRescue(
 			options.abortRouting,
 			options.config.pingIntervalMs,
 			deadline,
+			commitmentDeadlineAt,
+			options.onRescueTerminal,
+			options.onResponseAccepted,
 		);
 	}
 	if (afterActivation !== GRACE_ELAPSED) {
 		grace.cancel();
 		deadline.cancel();
+		if (afterActivation.kind === "response") {
+			reportResponseAcceptedSafely(options.onResponseAccepted);
+		}
 		return unwrapOutcome(afterActivation);
 	}
 
@@ -516,5 +636,8 @@ export async function coordinateAnthropicPreCommitRescue(
 		options.abortRouting,
 		options.config.pingIntervalMs,
 		deadline,
+		commitmentDeadlineAt,
+		options.onRescueTerminal,
+		options.onResponseAccepted,
 	);
 }

@@ -481,7 +481,10 @@ describe("source-controlled guard", () => {
 							cancelCalls += 1;
 						},
 					}),
-					{ status: 200 },
+					{
+						status: 200,
+						headers: { "content-type": "text/event-stream" },
+					},
 				),
 		});
 
@@ -497,6 +500,9 @@ describe("source-controlled guard", () => {
 		expect(cancelCalls).toBe(1);
 		expect(guard.state.counters.responseBodyIdleTimeouts).toBe(1);
 		expect(guard.state.counters.success).toBe(0);
+		expect(
+			events.find((event) => event.event === "response_body_idle_timeout"),
+		).not.toHaveProperty("semanticEvent");
 		expect(
 			events.some(
 				(event) =>
@@ -551,7 +557,7 @@ describe("source-controlled guard", () => {
 		expect(health.runtime.limits.responseIdleTimeoutMs).toBe(35);
 	});
 
-	test("logs privacy-safe raw chunk telemetry and treats ping-shaped chunks as watchdog activity", async () => {
+	test("logs privacy-safe raw chunk telemetry while treating pings as activity, not completion", async () => {
 		const events: Array<Record<string, unknown>> = [];
 		const chunks = [": ping\n\n", ": ping\n\n", "data: final\n\n"];
 		let fetchCalls = 0;
@@ -593,7 +599,9 @@ describe("source-controlled guard", () => {
 		expect(completion).toMatchObject({
 			attempt: 1,
 			status: 200,
-			outcome: "success",
+			outcome: "final_error",
+			semanticEvent: "incomplete_eof",
+			semanticErrorType: "anthropic_incomplete_eof",
 			rawResponseChunkCount: chunks.length,
 			rawResponseBytes: Buffer.byteLength(chunks.join("")),
 			firstBodyByteMs: expect.any(Number),
@@ -604,8 +612,323 @@ describe("source-controlled guard", () => {
 		expect(Number(maxInterChunkGapMs)).toBeGreaterThanOrEqual(10);
 		expect(Number(lastChunkAgeMs)).toBeGreaterThanOrEqual(0);
 		expect(fetchCalls).toBe(1);
+		expect(guard.state.counters.success).toBe(0);
+		expect(guard.state.counters.finalError).toBe(1);
 		expect(guard.state.counters.retried).toBe(0);
 		expect(guard.state.counters.responseBodyIdleTimeouts).toBe(0);
+	});
+
+	test("classifies a split Anthropic SSE error event as a final error without logging its raw message", async () => {
+		const events: Array<Record<string, unknown>> = [];
+		const privateMessage = "private-upstream-details-must-not-be-logged";
+		const chunks = [
+			"event: er",
+			'ror\r\ndata: {"type":"error","error":{"type":"service_unavailable_error","message":"',
+			`${privateMessage}"}}\r\n\r\n`,
+		];
+		const { baseUrl, guard } = await startGuard("http://127.0.0.1:8789", {
+			logger: (line: string) => events.push(JSON.parse(line)),
+			fetchImpl: async () => {
+				let index = 0;
+				return new Response(
+					new ReadableStream<Uint8Array>({
+						pull(controller) {
+							controller.enqueue(Buffer.from(chunks[index]));
+							index += 1;
+							if (index === chunks.length) controller.close();
+						},
+					}),
+					{
+						status: 200,
+						headers: { "content-type": "text/event-stream; charset=utf-8" },
+					},
+				);
+			},
+		});
+
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+		expect(response.status).toBe(200);
+		expect(await response.text()).toBe(chunks.join(""));
+		await waitFor(() => guard.state.active === 0);
+
+		const completion = events.find(
+			(event) => event.event === "proxy_response",
+		);
+		expect(completion).toMatchObject({
+			status: 200,
+			outcome: "final_error",
+			semanticEvent: "error",
+			semanticErrorType: "service_unavailable_error",
+			rawResponseChunkCount: chunks.length,
+			rawResponseBytes: Buffer.byteLength(chunks.join("")),
+		});
+		expect(JSON.stringify(completion)).not.toContain(privateMessage);
+		expect(completion).not.toHaveProperty("semanticErrorMessage");
+		expect(guard.state.counters.success).toBe(0);
+		expect(guard.state.counters.finalError).toBe(1);
+	});
+
+	test("keeps ping and message_stop Anthropic SSE responses successful", async () => {
+		const events: Array<Record<string, unknown>> = [];
+		const body = [
+			": ping",
+			"",
+			"event: ping",
+			'data: {"type":"ping"}',
+			"",
+			"event: message_stop",
+			'data: {"type":"message_stop"}',
+			"",
+			"",
+		].join("\n");
+		const { baseUrl, guard } = await startGuard("http://127.0.0.1:8789", {
+			logger: (line: string) => events.push(JSON.parse(line)),
+			fetchImpl: async () =>
+				new Response(body, {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				}),
+		});
+
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+		expect(await response.text()).toBe(body);
+		await waitFor(() => guard.state.active === 0);
+
+		expect(
+			events.find((event) => event.event === "proxy_response"),
+		).toMatchObject({ status: 200, outcome: "success" });
+		expect(guard.state.counters.success).toBe(1);
+		expect(guard.state.counters.finalError).toBe(0);
+	});
+
+	test("classifies clean Anthropic Messages EOF without a dispatched message_stop as incomplete", async () => {
+		const events: Array<Record<string, unknown>> = [];
+		const privateTail = "unterminated-private-terminal-tail";
+		const bodies = [
+			"",
+			': ping\n\nevent: ping\ndata: {"type":"ping"}\n\n',
+			'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"partial"}}\n\n',
+			`event: message_stop\ndata: {"type":"message_stop","private":"${privateTail}"}`,
+		];
+		let fetchIndex = 0;
+		const { baseUrl, guard } = await startGuard("http://127.0.0.1:8789", {
+			logger: (line: string) => events.push(JSON.parse(line)),
+			fetchImpl: async () =>
+				new Response(bodies[fetchIndex++], {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				}),
+		});
+
+		for (const expectedBody of bodies) {
+			const response = await fetch(`${baseUrl}/v1/messages`, {
+				method: "POST",
+				body: "{}",
+			});
+			expect(await response.text()).toBe(expectedBody);
+		}
+		await waitFor(() => guard.state.active === 0);
+
+		const completions = events.filter(
+			(event) => event.event === "proxy_response",
+		);
+		expect(completions).toHaveLength(bodies.length);
+		for (const completion of completions) {
+			expect(completion).toMatchObject({
+				status: 200,
+				outcome: "final_error",
+				semanticEvent: "incomplete_eof",
+				semanticErrorType: "anthropic_incomplete_eof",
+			});
+		}
+		expect(JSON.stringify(completions)).not.toContain(privateTail);
+		expect(guard.state.counters.success).toBe(0);
+		expect(guard.state.counters.finalError).toBe(bodies.length);
+	});
+
+	test("does not require message_stop for the legacy complete SSE path", async () => {
+		const events: Array<Record<string, unknown>> = [];
+		const body = 'event: ping\ndata: {"type":"ping"}\n\n';
+		const { baseUrl, guard } = await startGuard("http://127.0.0.1:8789", {
+			logger: (line: string) => events.push(JSON.parse(line)),
+			fetchImpl: async () =>
+				new Response(body, {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				}),
+		});
+
+		const response = await fetch(`${baseUrl}/v1/complete`, {
+			method: "POST",
+			body: "{}",
+		});
+		expect(await response.text()).toBe(body);
+		await waitFor(() => guard.state.active === 0);
+
+		expect(
+			events.find((event) => event.event === "proxy_response"),
+		).toMatchObject({ status: 200, outcome: "success" });
+		expect(guard.state.counters.success).toBe(1);
+	});
+
+	test("recognizes a CRLF message_stop across arbitrary UTF-8 byte splits", async () => {
+		const events: Array<Record<string, unknown>> = [];
+		const body =
+			': ping 🌍\r\n\r\nevent: message_stop\r\ndata: {"type":"message_stop"}\r\n\r\n';
+		const bytes = new TextEncoder().encode(body);
+		const { baseUrl, guard } = await startGuard("http://127.0.0.1:8789", {
+			logger: (line: string) => events.push(JSON.parse(line)),
+			fetchImpl: async () => {
+				let offset = 0;
+				return new Response(
+					new ReadableStream<Uint8Array>({
+						pull(controller) {
+							controller.enqueue(bytes.slice(offset, offset + 1));
+							offset += 1;
+							if (offset === bytes.length) controller.close();
+						},
+					}),
+					{
+						status: 200,
+						headers: { "content-type": "text/event-stream" },
+					},
+				);
+			},
+		});
+
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+		expect(await response.text()).toBe(body);
+		await waitFor(() => guard.state.active === 0);
+
+		expect(
+			events.find((event) => event.event === "proxy_response"),
+		).toMatchObject({ status: 200, outcome: "success" });
+		expect(guard.state.counters.success).toBe(1);
+	});
+
+	test("bounds complete SSE lines and never retains an oversized event value", async () => {
+		const events: Array<Record<string, unknown>> = [];
+		const privateOversizedValue = `private-${"x".repeat(20_000)}`;
+		const body =
+			`event: ${privateOversizedValue}\n\n` +
+			'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+		const { baseUrl, guard } = await startGuard("http://127.0.0.1:8789", {
+			logger: (line: string) => events.push(JSON.parse(line)),
+			fetchImpl: async () =>
+				new Response(body, {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				}),
+		});
+
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+		expect(await response.text()).toBe(body);
+		await waitFor(() => guard.state.active === 0);
+
+		const completion = events.find(
+			(event) => event.event === "proxy_response",
+		);
+		expect(completion).toMatchObject({
+			status: 200,
+			outcome: "final_error",
+			semanticEvent: "incomplete_eof",
+			semanticErrorType: "anthropic_incomplete_eof",
+			semanticParseState: "limit_exceeded",
+		});
+		expect(JSON.stringify(completion)).not.toContain(privateOversizedValue);
+	});
+
+	test("maps an unrecognized provider error type to an opaque safe category", async () => {
+		const events: Array<Record<string, unknown>> = [];
+		const privateType = "customer_secret_123";
+		const body = `event: error\ndata: {"type":"error","error":{"type":"${privateType}"}}\n\n`;
+		const { baseUrl, guard } = await startGuard("http://127.0.0.1:8789", {
+			logger: (line: string) => events.push(JSON.parse(line)),
+			fetchImpl: async () =>
+				new Response(body, {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				}),
+		});
+
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+		expect(await response.text()).toBe(body);
+		await waitFor(() => guard.state.active === 0);
+
+		const completion = events.find(
+			(event) => event.event === "proxy_response",
+		);
+		expect(completion).toMatchObject({
+			status: 200,
+			outcome: "final_error",
+			semanticEvent: "error",
+			semanticErrorType: "unknown_error",
+		});
+		expect(JSON.stringify(completion)).not.toContain(privateType);
+	});
+
+	test("does not treat error-shaped text inside SSE data or a non-SSE body as an error event", async () => {
+		const events: Array<Record<string, unknown>> = [];
+		let fetchCalls = 0;
+		const sseBody = [
+			"event: content_block_delta",
+			'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"event: error"}}',
+			"",
+			"event: message_stop",
+			'data: {"type":"message_stop"}',
+			"",
+			"",
+		].join("\n");
+		const nonSseBody = 'event: error\ndata: {"type":"error"}\n\n';
+		const { baseUrl, guard } = await startGuard("http://127.0.0.1:8789", {
+			logger: (line: string) => events.push(JSON.parse(line)),
+			fetchImpl: async () => {
+				fetchCalls += 1;
+				return fetchCalls === 1
+					? new Response(sseBody, {
+							status: 200,
+							headers: { "content-type": "text/event-stream" },
+						})
+					: new Response(nonSseBody, {
+							status: 200,
+							headers: { "content-type": "text/plain" },
+						});
+			},
+		});
+
+		for (const expectedBody of [sseBody, nonSseBody]) {
+			const response = await fetch(`${baseUrl}/v1/messages`, {
+				method: "POST",
+				body: "{}",
+			});
+			expect(await response.text()).toBe(expectedBody);
+		}
+		await waitFor(() => guard.state.active === 0);
+
+		const completions = events.filter(
+			(event) => event.event === "proxy_response",
+		);
+		expect(completions).toHaveLength(2);
+		expect(completions.every((event) => event.outcome === "success")).toBe(
+			true,
+		);
+		expect(guard.state.counters.success).toBe(2);
+		expect(guard.state.counters.finalError).toBe(0);
 	});
 
 	test("logs the last raw chunk age when the response body idle watchdog fires", async () => {

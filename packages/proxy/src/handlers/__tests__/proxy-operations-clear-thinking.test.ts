@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import type { Provider } from "@better-ccflare/providers";
 import type { Account, RequestMeta } from "@better-ccflare/types";
+import { CACHE_REPLAY_MODEL_HEADER } from "../../cache-transport-staging";
 import { proxyWithAccount } from "../proxy-operations";
 import type { ProxyContext } from "../proxy-types";
 import { RoutingAttemptLedger } from "../routing-attempt-ledger";
@@ -55,7 +57,10 @@ function makeRequestMeta(): RequestMeta {
 	};
 }
 
-function makeProxyContext(providerName = "anthropic"): ProxyContext {
+function makeProxyContext(
+	providerName = "anthropic",
+	providerOverrides: Partial<Provider> = {},
+): ProxyContext {
 	return {
 		strategy: { getNextAccount: () => null } as never,
 		dbOps: {
@@ -86,6 +91,7 @@ function makeProxyContext(providerName = "anthropic"): ProxyContext {
 				remaining: undefined,
 			}),
 			isStreamingResponse: () => false,
+			...providerOverrides,
 		} as never,
 		refreshInFlight: new Map(),
 		asyncWriter: { enqueue: mock(() => {}) } as never,
@@ -93,11 +99,13 @@ function makeProxyContext(providerName = "anthropic"): ProxyContext {
 	};
 }
 
-function makeRequest(body: ArrayBuffer) {
+function makeRequest(body: ArrayBuffer, headers?: Headers) {
+	const requestHeaders = new Headers(headers);
+	requestHeaders.set("content-type", "application/json");
 	return new Request("https://proxy.local/v1/messages", {
 		method: "POST",
 		body,
-		headers: { "Content-Type": "application/json" },
+		headers: requestHeaders,
 	});
 }
 
@@ -193,6 +201,7 @@ async function runProxyCapturingBodies(
 	ctx = makeProxyContext(),
 	cloneResponses = true,
 	routingAttemptLedger?: RoutingAttemptLedger,
+	requestHeaders?: Headers,
 ): Promise<{
 	result: Response | null;
 	upstreamBodies: Array<Record<string, unknown>>;
@@ -208,7 +217,7 @@ async function runProxyCapturingBodies(
 	});
 
 	const bodyBuffer = encodeBody(requestBody);
-	const req = makeRequest(bodyBuffer);
+	const req = makeRequest(bodyBuffer, requestHeaders);
 
 	// proxyWithAccount reaches forwardToClient on success, which requires
 	// UsageCollector initialization (not wired in unit tests). Catch that
@@ -297,6 +306,45 @@ describe("proxyWithAccount clear_thinking context-management handling", () => {
 			}
 		}
 		expect(routingAttemptLedger.attemptedCount).toBe(1);
+	});
+
+	it("thinking-signature retry preserves a trusted transformed-body replay model after provider remapping", async () => {
+		const ctx = makeProxyContext("anthropic", {
+			cacheReplayModelStrategy: "transformed-body",
+			transformRequestBody: async (request: Request) => {
+				const body = (await request.json()) as Record<string, unknown>;
+				body.model = "physical-primary-model";
+				return new Request(request.url, {
+					method: request.method,
+					headers: request.headers,
+					body: JSON.stringify(body),
+				});
+			},
+		});
+		const headers = new Headers({
+			[CACHE_REPLAY_MODEL_HEADER]: "physical-fallback-model",
+		});
+
+		const { upstreamBodies } = await runProxyCapturingBodies(
+			{
+				model: "physical-fallback-model",
+				max_tokens: 100,
+				thinking: { type: "adaptive" },
+				messages: messagesWithThinkingHistory(),
+			},
+			[invalidSignatureResponse(), successResponse("physical-fallback-model")],
+			makeAccount(),
+			ctx,
+			true,
+			undefined,
+			headers,
+		);
+
+		expect(upstreamBodies).toHaveLength(2);
+		expect(upstreamBodies.map((body) => body.model)).toEqual([
+			"physical-fallback-model",
+			"physical-fallback-model",
+		]);
 	});
 
 	it("cache_control retry reuses the claimed physical route", async () => {
@@ -447,6 +495,50 @@ describe("proxyWithAccount clear_thinking context-management handling", () => {
 		});
 		expect(upstreamBodies[1].messages).toEqual(messagesWithThinkingHistory());
 		expect(upstreamBodies[1].thinking).toBeUndefined();
+	});
+
+	it("clear_thinking retry preserves a trusted transformed-body replay model after provider remapping", async () => {
+		const ctx = makeProxyContext("anthropic", {
+			cacheReplayModelStrategy: "transformed-body",
+			transformRequestBody: async (request: Request) => {
+				const body = (await request.json()) as Record<string, unknown>;
+				body.model = "physical-primary-model";
+				return new Request(request.url, {
+					method: request.method,
+					headers: request.headers,
+					body: JSON.stringify(body),
+				});
+			},
+		});
+		const headers = new Headers({
+			[CACHE_REPLAY_MODEL_HEADER]: "physical-fallback-model",
+		});
+
+		const { upstreamBodies } = await runProxyCapturingBodies(
+			{
+				model: "physical-fallback-model",
+				max_tokens: 100,
+				context_management: {
+					edits: [{ type: "clear_thinking_20251015" }],
+				},
+				messages: [{ role: "user", content: "hello" }],
+			},
+			[
+				clearThinkingRejectionResponse(),
+				successResponse("physical-fallback-model"),
+			],
+			makeAccount(),
+			ctx,
+			true,
+			undefined,
+			headers,
+		);
+
+		expect(upstreamBodies).toHaveLength(2);
+		expect(upstreamBodies.map((body) => body.model)).toEqual([
+			"physical-fallback-model",
+			"physical-fallback-model",
+		]);
 	});
 
 	it("drops context_management entirely when clear_thinking was its only edit", async () => {

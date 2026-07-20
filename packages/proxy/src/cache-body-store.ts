@@ -3,13 +3,14 @@ import { Logger } from "@better-ccflare/logger";
 const log = new Logger("CacheBodyStore");
 
 /**
- * In-memory store for the last request body per account that created a cache entry.
+ * In-memory store for the last request body per account that created or read a
+ * cache entry.
  *
  * Flow:
  *  1. When a request body is buffered in the proxy, stageRequest() is called.
  *  2. When the post-processor emits a summary, onSummary() is called.
- *     - If cacheCreationInputTokens > 0, the staged entry is promoted to the
- *       per-account "last cached request" slot.
+ *     - If cache creation or read tokens are positive, the staged entry is
+ *       promoted to the per-account "last cached request" slot.
  *     - The staging entry is always deleted (request is complete).
  *  3. The keepalive scheduler reads getLastCachedRequest() at tick time and
  *     replays the body through the proxy.
@@ -61,13 +62,13 @@ function containsBytes(haystack: Uint8Array, needle: Uint8Array): boolean {
 	return false;
 }
 
-function hasCacheControlHint(body: ArrayBuffer): boolean {
+export function hasCacheControlHint(body: ArrayBuffer): boolean {
 	const bytes = new Uint8Array(body);
 	return CACHE_CONTROL_HINTS.some((hint) => containsBytes(bytes, hint));
 }
 
 export interface CachedRequestEntry {
-	/** Original client request body, as-received (pre-transform). */
+	/** Replay-safe source body after route/model selection, before provider transform. */
 	body: Buffer;
 	/** Sanitized original client headers (no auth, no internal proxy headers). */
 	headers: Record<string, string>;
@@ -75,6 +76,8 @@ export interface CachedRequestEntry {
 	path: string;
 	/** Unix timestamp when this entry was recorded. */
 	timestamp: number;
+	/** Exact physical model used by the cache-writing transport. */
+	resolvedModel: string | null;
 }
 
 // Strip sensitive and internal headers before storing.
@@ -83,6 +86,9 @@ export interface CachedRequestEntry {
 const STRIP_HEADERS = new Set([
 	"authorization",
 	"x-api-key",
+	"api-key",
+	"x-goog-api-key",
+	"x-amz-security-token",
 	"cookie",
 	"x-better-ccflare-account-id",
 	"x-better-ccflare-bypass-session",
@@ -107,7 +113,7 @@ class CacheBodyStore {
 		{ accountId: string; entry: CachedRequestEntry }
 	>();
 
-	/** accountId → last request that created a cache entry. */
+	/** accountId → last request that created or read a cache entry. */
 	private lastCachedRequest = new Map<string, CachedRequestEntry>();
 
 	/** Whether the feature is enabled — skip staging entirely when false. */
@@ -121,6 +127,10 @@ class CacheBodyStore {
 		}
 	}
 
+	isEnabled(): boolean {
+		return this.enabled;
+	}
+
 	/**
 	 * Called when a request body has been buffered.
 	 * Only stages if the feature is enabled and we have a body.
@@ -131,19 +141,41 @@ class CacheBodyStore {
 		body: ArrayBuffer | null,
 		headers: Headers,
 		path: string,
+		cacheIdentityBody: ArrayBuffer | null = body,
+		cacheIdentityHasCacheControl?: boolean,
+		resolvedModel: string | null = null,
 	): void {
-		if (!this.enabled || !accountId || !body || body.byteLength === 0) return;
+		if (!this.enabled) return;
+
+		// A request can execute multiple physical transports through in-place retry,
+		// model fallback, or account failover. Each new attempt replaces the prior
+		// projection, even when the new transport is not cacheable, so a later
+		// response summary can never promote stale residue from a failed route.
+		this.staging.delete(requestId);
+
+		if (!accountId || !body || body.byteLength === 0) return;
 
 		// Only cache prompt-cache-relevant endpoint.
 		if (path !== CACHEABLE_PATH) return;
 
 		// Only stage if the body contains a cache_control hint — requests without
 		// prompt-cache markers won't create cache entries, nothing to keep alive.
-		if (!hasCacheControlHint(body)) return;
+		const cacheable =
+			cacheIdentityHasCacheControl ??
+			(cacheIdentityBody !== null &&
+				cacheIdentityBody.byteLength > 0 &&
+				hasCacheControlHint(cacheIdentityBody));
+		if (!cacheable) {
+			return;
+		}
 
 		const sanitizedHeaders: Record<string, string> = {};
 		headers.forEach((value, key) => {
-			if (!STRIP_HEADERS.has(key.toLowerCase())) {
+			const normalizedKey = key.toLowerCase();
+			if (
+				!STRIP_HEADERS.has(normalizedKey) &&
+				!normalizedKey.startsWith("x-better-ccflare-")
+			) {
 				sanitizedHeaders[key] = value;
 			}
 		});
@@ -155,6 +187,7 @@ class CacheBodyStore {
 				headers: sanitizedHeaders,
 				path,
 				timestamp: Date.now(),
+				resolvedModel,
 			},
 		});
 
@@ -216,20 +249,27 @@ class CacheBodyStore {
 	onSummary(
 		requestId: string,
 		cacheCreationInputTokens: number | undefined,
+		success = true,
+		cacheReadInputTokens?: number,
 	): void {
 		const staged = this.staging.get(requestId);
 		this.staging.delete(requestId);
 
 		if (!staged) return;
 
-		if (cacheCreationInputTokens && cacheCreationInputTokens > 0) {
-			this.lastCachedRequest.set(staged.accountId, staged.entry);
+		const cacheWasUsed =
+			(cacheCreationInputTokens ?? 0) > 0 || (cacheReadInputTokens ?? 0) > 0;
+		if (success && cacheWasUsed) {
+			this.lastCachedRequest.set(staged.accountId, {
+				...staged.entry,
+				timestamp: Date.now(),
+			});
 		}
 	}
 
 	/**
-	 * Returns the last request body that created a cache entry for this account,
-	 * or null if none is recorded.
+	 * Returns the last request body that created or read a cache entry for this
+	 * account, or null if none is recorded.
 	 */
 	getLastCachedRequest(accountId: string): CachedRequestEntry | null {
 		return this.lastCachedRequest.get(accountId) ?? null;

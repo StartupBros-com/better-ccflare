@@ -8,7 +8,11 @@ import { sanitizeProxyHeaders } from "@better-ccflare/http-common";
 import { Logger } from "@better-ccflare/logger";
 import type { Account } from "@better-ccflare/types";
 import { BaseProvider } from "../base";
-import type { RateLimitInfo, TokenRefreshResult } from "../types";
+import type {
+	CacheReplayModelStrategy,
+	RateLimitInfo,
+	TokenRefreshResult,
+} from "../types";
 import { transformRequestBodyModel } from "../utils/model-mapping";
 
 // Configuration interface for Anthropic-compatible providers
@@ -42,6 +46,8 @@ const HARD_LIMIT_STATUSES = new Set([
 const log = new Logger("BaseAnthropicCompatibleProvider");
 
 export abstract class BaseAnthropicCompatibleProvider extends BaseProvider {
+	override readonly cacheReplayModelStrategy: CacheReplayModelStrategy =
+		"transformed-body";
 	protected config: AnthropicCompatibleConfig;
 	name: string; // Make name concrete instead of abstract
 

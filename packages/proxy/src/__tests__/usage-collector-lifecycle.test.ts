@@ -7,6 +7,7 @@ import {
 	cacheOutcomeFromTokens,
 	formatXaiCacheCanary,
 } from "../../../core/src/xai";
+import { cacheBodyStore } from "../cache-body-store";
 import type { StartMessage } from "../worker-messages";
 
 interface PricingTokens {
@@ -62,6 +63,7 @@ interface RecorderWrite {
 interface TestHarness {
 	collector: UsageCollectorInstance;
 	saveRequestIds: string[];
+	savedUsages: Map<string, Record<string, number | undefined>>;
 	payloads: Map<string, string>;
 	recorderWrites: RecorderWrite[];
 	markedIncomplete: Array<{
@@ -71,6 +73,7 @@ interface TestHarness {
 	}>;
 	summaryCosts: Map<string, number | undefined>;
 	summaries: string[];
+	summaryDetails: import("@better-ccflare/types").RequestResponse[];
 }
 
 interface HarnessOptions {
@@ -131,6 +134,7 @@ function createHarness(options: HarnessOptions | boolean = {}): TestHarness {
 	const resolved =
 		typeof options === "boolean" ? { storePayloads: options } : options;
 	const saveRequestIds: string[] = [];
+	const savedUsages = new Map<string, Record<string, number | undefined>>();
 	const payloads = new Map<string, string>();
 	const recorderWrites: RecorderWrite[] = [];
 	const markedIncomplete: Array<{
@@ -140,12 +144,17 @@ function createHarness(options: HarnessOptions | boolean = {}): TestHarness {
 	}> = [];
 	const summaryCosts = new Map<string, number | undefined>();
 	const summaries: string[] = [];
+	const summaryDetails: import("@better-ccflare/types").RequestResponse[] = [];
 	const pendingWrites = new Set<Promise<void>>();
 
 	const dbOps = {
 		async updateAccountUsage(): Promise<void> {},
-		async saveRequest(requestId: string): Promise<void> {
+		async saveRequest(requestId: string, ...args: unknown[]): Promise<void> {
 			saveRequestIds.push(requestId);
+			const usage = args[8];
+			if (usage && typeof usage === "object") {
+				savedUsages.set(requestId, usage as Record<string, number | undefined>);
+			}
 		},
 		async saveRequestPayloadRaw(
 			requestId: string,
@@ -203,6 +212,7 @@ function createHarness(options: HarnessOptions | boolean = {}): TestHarness {
 		(summary) => {
 			summaries.push(summary.id);
 			summaryCosts.set(summary.id, summary.costUsd);
+			summaryDetails.push(summary);
 		},
 	);
 
@@ -212,7 +222,9 @@ function createHarness(options: HarnessOptions | boolean = {}): TestHarness {
 		payloads,
 		recorderWrites,
 		saveRequestIds,
+		savedUsages,
 		summaries,
+		summaryDetails,
 		summaryCosts,
 	};
 }
@@ -341,6 +353,166 @@ describe("UsageCollector request lifecycle", () => {
 		}
 		expect(message).not.toContain("session_id");
 		expect(message).not.toContain("raw prompt");
+	});
+
+	it("persists and promotes cache creation reported only in the terminal message_delta", async () => {
+		const { collector, savedUsages, summaryDetails } = harness();
+		const requestId = "terminal-cache-creation";
+		const accountId = "anthropic-cache-account";
+		const bodyBytes = new TextEncoder().encode(
+			'{"model":"claude-sonnet-4-5","cache_control":{"type":"ephemeral"}}',
+		);
+		const body = bodyBytes.buffer.slice(
+			bodyBytes.byteOffset,
+			bodyBytes.byteOffset + bodyBytes.byteLength,
+		) as ArrayBuffer;
+
+		cacheBodyStore.setEnabled(false);
+		cacheBodyStore.setEnabled(true);
+		try {
+			cacheBodyStore.stageRequest(
+				requestId,
+				accountId,
+				body,
+				new Headers({ "content-type": "application/json" }),
+				"/v1/messages",
+			);
+			collector.handleStart(
+				makeStartMessage(requestId, {
+					accountId,
+					accountName: "Anthropic Cache Account",
+				}),
+			);
+			collector.handleChunk(
+				requestId,
+				new TextEncoder().encode(
+					'event: message_start\ndata: {"type":"message_start","message":{"model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":20,"output_tokens":0}}}\n\nevent: message_delta\ndata: {"type":"message_delta","usage":{"input_tokens":20,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":7}}\n\n',
+				),
+			);
+			await collector.handleEnd({ type: "end", requestId, success: true });
+			await collector.drain();
+
+			expect(savedUsages.get(requestId)).toMatchObject({
+				promptTokens: 27,
+				inputTokens: 20,
+				cacheReadInputTokens: 0,
+				cacheCreationInputTokens: 7,
+				totalTokens: 32,
+			});
+			expect(
+				summaryDetails.find((summary) => summary.id === requestId),
+			).toMatchObject({
+				promptTokens: 27,
+				inputTokens: 20,
+				cacheReadInputTokens: 0,
+				cacheCreationInputTokens: 7,
+				totalTokens: 32,
+			});
+			expect(cacheBodyStore.getLastCachedRequest(accountId)).not.toBeNull();
+		} finally {
+			cacheBodyStore.setEnabled(false);
+		}
+	});
+
+	it("forwards terminal cache-read usage so a read-only hit refreshes the staged body", async () => {
+		const { collector, summaryDetails } = harness();
+		const requestId = "terminal-cache-read";
+		const accountId = "anthropic-cache-read-account";
+		const bodyBytes = new TextEncoder().encode(
+			'{"model":"claude-sonnet-4-5","system":[{"type":"text","text":"latest","cache_control":{"type":"ephemeral"}}]}',
+		);
+		const body = bodyBytes.buffer.slice(
+			bodyBytes.byteOffset,
+			bodyBytes.byteOffset + bodyBytes.byteLength,
+		) as ArrayBuffer;
+
+		cacheBodyStore.setEnabled(false);
+		cacheBodyStore.setEnabled(true);
+		try {
+			cacheBodyStore.stageRequest(
+				requestId,
+				accountId,
+				body,
+				new Headers({ "content-type": "application/json" }),
+				"/v1/messages",
+			);
+			collector.handleStart(
+				makeStartMessage(requestId, {
+					accountId,
+					accountName: "Anthropic Cache Read Account",
+				}),
+			);
+			collector.handleChunk(
+				requestId,
+				new TextEncoder().encode(
+					'event: message_start\ndata: {"type":"message_start","message":{"model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":20,"output_tokens":0}}}\n\nevent: message_delta\ndata: {"type":"message_delta","usage":{"input_tokens":20,"output_tokens":5,"cache_read_input_tokens":13,"cache_creation_input_tokens":0}}\n\n',
+				),
+			);
+			await collector.handleEnd({ type: "end", requestId, success: true });
+			await collector.drain();
+
+			expect(
+				summaryDetails.find((summary) => summary.id === requestId),
+			).toMatchObject({
+				cacheReadInputTokens: 13,
+				cacheCreationInputTokens: 0,
+			});
+			const promoted = cacheBodyStore.getLastCachedRequest(accountId);
+			expect(promoted).not.toBeNull();
+			expect(Buffer.from(promoted?.body ?? []).toString()).toContain("latest");
+		} finally {
+			cacheBodyStore.setEnabled(false);
+		}
+	});
+
+	it("keeps prompt tokens unknown for a model-only stream with no usage telemetry", async () => {
+		const { collector, savedUsages, summaryDetails } = harness();
+		const requestId = "model-only-no-usage";
+		collector.handleStart(makeStartMessage(requestId));
+		collector.handleChunk(
+			requestId,
+			new TextEncoder().encode(
+				'event: message_start\ndata: {"type":"message_start","message":{"model":"claude-sonnet-4-5-20250929"}}\n\n',
+			),
+		);
+
+		await collector.handleEnd({ type: "end", requestId, success: true });
+		await collector.drain();
+
+		expect(savedUsages.get(requestId)?.promptTokens).toBeUndefined();
+		expect(
+			summaryDetails.find((summary) => summary.id === requestId)?.promptTokens,
+		).toBeUndefined();
+	});
+
+	it("preserves an authoritative explicit-zero inclusive prompt total", async () => {
+		const { collector, savedUsages, summaryDetails } = harness();
+		const requestId = "explicit-zero-usage";
+		collector.handleStart(makeStartMessage(requestId));
+		collector.handleChunk(
+			requestId,
+			new TextEncoder().encode(
+				'event: message_start\ndata: {"type":"message_start","message":{"model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}\n\n',
+			),
+		);
+
+		await collector.handleEnd({ type: "end", requestId, success: true });
+		await collector.drain();
+
+		expect(savedUsages.get(requestId)).toMatchObject({
+			promptTokens: 0,
+			inputTokens: 0,
+			cacheReadInputTokens: 0,
+			cacheCreationInputTokens: 0,
+		});
+		expect(
+			summaryDetails.find((summary) => summary.id === requestId),
+		).toMatchObject({
+			promptTokens: 0,
+			inputTokens: 0,
+			cacheReadInputTokens: 0,
+			cacheCreationInputTokens: 0,
+		});
 	});
 
 	it("appends one full privacy-safe terminal turn while preserving the native canary", async () => {

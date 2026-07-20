@@ -35,6 +35,7 @@ import {
 	recordCachePacingRoute,
 } from "./cache-pacing";
 import { warnOnLookbackRisk } from "./cache-telemetry";
+import { CACHE_REPLAY_MODEL_HEADER } from "./cache-transport-staging";
 import { adaptAnthropicSsePingsForClaudeCode } from "./claude-code-ping-compat";
 import {
 	type AgentInterceptResult,
@@ -77,6 +78,10 @@ import {
 	runWithPreTransportDeadline,
 } from "./pre-transport-deadline";
 import { extractProjectAttributionFromRequest } from "./project-attribution";
+import {
+	getRequestLifecycleCoordinator,
+	recordRoutingTerminalRequest,
+} from "./routing-terminal-recorder";
 import {
 	clearSession,
 	sessionIdForObservation,
@@ -240,6 +245,8 @@ export async function handleProxy(
 		config: rescueConfig,
 		requestStartedAt: rescueRequestStartedAt,
 		commitmentDeadlineAt: routeContext.commitmentDeadlineAt,
+		onRescueTerminal: routeContext.reportTerminal,
+		onResponseAccepted: routeContext.releaseResponseLifecycle,
 		abortRouting(reason) {
 			if (!routingAbortController.signal.aborted) {
 				routingAbortController.abort(reason);
@@ -259,13 +266,21 @@ async function handleProxyCore(
 ): Promise<Response> {
 	// Consume the private scheduler credential before any request inspection,
 	// metadata construction, logging, cache staging, or upstream forwarding.
-	const trustedInternalAutoRefresh = consumeInternalAutoRefreshAuth(
-		req.headers,
-	);
+	const trustedInternalScheduler = consumeInternalAutoRefreshAuth(req.headers);
+	const trustedInternalAutoRefresh =
+		trustedInternalScheduler &&
+		req.headers.get("x-better-ccflare-auto-refresh") === "true";
+	const trustedInternalKeepalive =
+		trustedInternalScheduler &&
+		req.headers.get("x-better-ccflare-keepalive") === "true";
 	// The public marker is meaningful only after internal authentication. Remove
 	// spoofed markers so they cannot suppress pacing, analytics, or cache staging.
 	if (!trustedInternalAutoRefresh) {
 		req.headers.delete("x-better-ccflare-auto-refresh");
+	}
+	if (!trustedInternalKeepalive) {
+		req.headers.delete("x-better-ccflare-keepalive");
+		req.headers.delete(CACHE_REPLAY_MODEL_HEADER);
 	}
 
 	// 0. Silently ignore Claude Code internal endpoints (non-critical, not supported by all providers)
@@ -305,6 +320,38 @@ async function handleProxyCore(
 	// even when a provider takes longer than the rescue activation grace.
 	const activeAnthropicPreCommitRescue =
 		originalParsedBody?.stream === true ? anthropicPreCommitRescue : undefined;
+	// Create the shared request identity before activating rescue so any outer
+	// terminal can join the same one-shot lifecycle as forwardToClient and local
+	// routing terminals, even if routing later rejects before producing a Response.
+	const requestMeta = createRequestMetadata(req, url);
+	requestMeta.trustedInternalAutoRefresh = trustedInternalAutoRefresh;
+	const routingAttemptLedger = new RoutingAttemptLedger();
+	activeAnthropicPreCommitRescue?.registerRequestLifecycle(
+		getRequestLifecycleCoordinator(requestMeta),
+	);
+	activeAnthropicPreCommitRescue?.registerTerminalRecorder((terminalKind) => {
+		void recordRoutingTerminalRequest({
+			collector: tryGetUsageCollector(),
+			requestMeta,
+			requestHeaders: req.headers,
+			response: new Response(null, {
+				status: 200,
+				headers: { "content-type": "text/event-stream; charset=utf-8" },
+			}),
+			providerName: ctx.provider.name,
+			terminalKind,
+			upstreamAttempts: routingAttemptLedger.attemptedCount,
+			apiKeyId,
+			apiKeyName,
+			skip: trustedInternalAutoRefresh,
+			onError: (error) => {
+				log.error(
+					`handleEnd failed for ${terminalKind} request ${requestMeta.id}`,
+					error,
+				);
+			},
+		});
+	});
 	// Arm the watchdog bridge as soon as a parsed streaming Messages request is
 	// known. Account selection, pacing, credential acquisition, and the first
 	// provider fetch can all stall before the lower transport hooks run.
@@ -431,9 +478,7 @@ async function handleProxyCore(
 		);
 	}
 
-	// 5. Create request metadata with agent info
-	const requestMeta = createRequestMetadata(req, url);
-	requestMeta.trustedInternalAutoRefresh = trustedInternalAutoRefresh;
+	// 5. Complete request metadata with agent info
 	requestMeta.agentUsed = agentUsed;
 	requestMeta.agentAttributionSource = agentAttributionSource;
 	requestMeta.project = project;
@@ -483,8 +528,8 @@ async function handleProxyCore(
 	// reselected afterward so Anthropic never receives stale or unpaced traffic.
 	const pacingEligible =
 		url.pathname === "/v1/messages" &&
-		!req.headers.get("x-better-ccflare-keepalive") &&
-		!req.headers.get("x-better-ccflare-auto-refresh");
+		!trustedInternalKeepalive &&
+		!trustedInternalAutoRefresh;
 	const pacingCohortKey = pacingEligible
 		? derivePacingCohortKey(requestMeta.clientSessionId, parsedBody)
 		: null;
@@ -592,8 +637,7 @@ async function handleProxyCore(
 		}
 		throw error;
 	}
-	const syntheticProbe =
-		req.headers.get("x-better-ccflare-keepalive") === "true";
+	const syntheticProbe = trustedInternalKeepalive;
 	const applyUsageThrottling = (accounts: Account[]) => {
 		const settings = {
 			fiveHourEnabled: ctx.config.getUsageThrottlingFiveHourEnabled(),
@@ -815,57 +859,24 @@ async function handleProxyCore(
 		// reflecting any real client impact (issue #199, bug 2). The keepalive
 		// scheduler already gets the equivalent treatment via its loop-prevention
 		// header path; this brings auto-refresh in line.
-		const isAutoRefreshProbe =
-			req.headers.get("x-better-ccflare-auto-refresh") === "true";
-		const usageCollector = tryGetUsageCollector();
-		if (!isAutoRefreshProbe && usageCollector) {
-			// Log to request history via usage collector
-			usageCollector.handleStart({
-				type: "start",
-				messageId: crypto.randomUUID(),
-				requestId: requestMeta.id,
-				accountId: null,
-				method: req.method,
-				path: url.pathname,
-				timestamp: requestMeta.timestamp,
-				requestHeaders: Object.fromEntries(req.headers.entries()),
-				requestBody: null,
-				project: project ?? null,
-				projectAttributionSource: projectAttributionSource ?? "none",
-				agentAttributionSource: agentAttributionSource ?? "none",
-				responseStatus: 503,
-				responseHeaders: Object.fromEntries(
-					terminal.response.headers.entries(),
-				),
-				isStream: false,
-				providerName: ctx.provider.name,
-				accountBillingType: null,
-				accountAutoPauseOnOverageEnabled: 0,
-				accountName: null,
-				agentUsed: agentUsed || null,
-				originalModel: originalModel || null,
-				appliedModel: appliedModel || null,
-				comboName: null,
-				apiKeyId: apiKeyId || null,
-				apiKeyName: apiKeyName || null,
-				retryAttempt: 0,
-				failoverAttempts: 0,
-			});
-
-			usageCollector
-				.handleEnd({
-					type: "end",
-					requestId: requestMeta.id,
-					success: false,
-					error: terminal.kind,
-				})
-				.catch((err: unknown) => {
-					log.error(
-						`handleEnd failed for ${terminal.kind} request ${requestMeta.id}`,
-						err,
-					);
-				});
-		}
+		void recordRoutingTerminalRequest({
+			collector: tryGetUsageCollector(),
+			requestMeta,
+			requestHeaders: req.headers,
+			response: terminal.response,
+			providerName: ctx.provider.name,
+			terminalKind: terminal.kind,
+			upstreamAttempts: 0,
+			apiKeyId,
+			apiKeyName,
+			skip: trustedInternalAutoRefresh,
+			onError: (error) => {
+				log.error(
+					`handleEnd failed for ${terminal.kind} request ${requestMeta.id}`,
+					error,
+				);
+			},
+		});
 
 		// (Session badge already cleared at the top of this block.)
 		return finishPacing(pacingSlot, terminal.response);
@@ -896,7 +907,6 @@ async function handleProxyCore(
 		: null;
 	let response: Response | null = null;
 	let upstreamAttempts = 0;
-	const routingAttemptLedger = new RoutingAttemptLedger();
 	type DeferredModelRoute = {
 		readonly account: Account;
 		readonly model: string;
@@ -1492,6 +1502,27 @@ async function handleProxyCore(
 	cacheBodyStore.discardStaged(requestMeta.id);
 	// All candidates failed, no account served — degrade the badge (KTD-5).
 	if (sessionId) clearSession(sessionId, requestMeta.timestamp);
+	// Record the native terminal before the outer Anthropic rescue can translate
+	// a delayed JSON 503 into an HTTP-200 SSE error. This path previously bypassed
+	// forwardToClient entirely, leaving no durable request-history row.
+	void recordRoutingTerminalRequest({
+		collector: tryGetUsageCollector(),
+		requestMeta,
+		requestHeaders: req.headers,
+		response: terminal.response,
+		providerName: ctx.provider.name,
+		terminalKind: terminal.kind,
+		upstreamAttempts: actualUpstreamAttempts,
+		apiKeyId,
+		apiKeyName,
+		skip: trustedInternalAutoRefresh,
+		onError: (error) => {
+			log.error(
+				`handleEnd failed for ${terminal.kind} request ${requestMeta.id}`,
+				error,
+			);
+		},
+	});
 	return finishPacing(pacingSlot, terminal.response);
 }
 

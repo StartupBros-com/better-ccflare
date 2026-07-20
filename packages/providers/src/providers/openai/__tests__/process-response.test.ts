@@ -476,6 +476,60 @@ describe("processResponse – other content types (fallback)", () => {
 // ---------------------------------------------------------------------------
 
 describe("extractUsageInfo", () => {
+	it("keeps cache telemetry unknown when inclusive prompt usage is missing", async () => {
+		const provider = makeProvider();
+		const response = openaiJsonResponse({
+			model: "qwen-plus",
+			usage: {
+				completion_tokens: 10,
+				prompt_tokens_details: {
+					cached_tokens: 40,
+					cache_creation_input_tokens: 10,
+				},
+			},
+		});
+
+		const info = await provider.extractUsageInfo(response);
+
+		expect(info?.inputTokens).toBe(0);
+		expect(info?.cacheReadInputTokens).toBeUndefined();
+		expect(info?.cacheCreationInputTokens).toBeUndefined();
+	});
+
+	it("normalizes cache reads and writes without changing inclusive totals", async () => {
+		const provider = makeProvider();
+		const response = openaiJsonResponse({
+			id: "chatcmpl-cache",
+			model: "qwen-plus",
+			choices: [
+				{
+					message: { role: "assistant", content: "hi" },
+					finish_reason: "stop",
+				},
+			],
+			usage: {
+				prompt_tokens: 100,
+				completion_tokens: 10,
+				total_tokens: 110,
+				prompt_tokens_details: {
+					cached_tokens: 40,
+					cache_creation_input_tokens: 10,
+				},
+			},
+		});
+
+		const info = await provider.extractUsageInfo(response);
+
+		expect(info).toMatchObject({
+			promptTokens: 100,
+			inputTokens: 50,
+			cacheReadInputTokens: 40,
+			cacheCreationInputTokens: 10,
+			completionTokens: 10,
+			totalTokens: 110,
+		});
+	});
+
 	it("calculates cost correctly for known model gpt-4o", async () => {
 		const provider = makeProvider();
 		const response = openaiJsonResponse({
