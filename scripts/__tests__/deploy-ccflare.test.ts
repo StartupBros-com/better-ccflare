@@ -680,7 +680,14 @@ describe("effective systemd policy validation", () => {
 				"#!/usr/bin/env bash",
 				'printf \'systemctl:%s\\n\' "$*" >>"$CCFLARE_TEST_SYSTEMCTL_LOG"',
 				'if [[ "$*" == *"daemon-reload"* ]]; then exit 0; fi',
-				'if [[ "$*" == *"--property=KillMode"* ]]; then printf \'%s\\n\' "$CCFLARE_TEST_KILL_MODE"; exit 0; fi',
+				'if [[ "$*" == *"--property=KillMode"* ]]; then',
+				'  if [[ -n "${CCFLARE_TEST_SAFE_POLICY_PIN:-}" && -n "${CCFLARE_TEST_SAFE_POLICY_BACKUP:-}" ]] && cmp -s "$CCFLARE_TEST_SAFE_POLICY_PIN" "$CCFLARE_TEST_SAFE_POLICY_BACKUP"; then',
+				"    printf 'mixed\\n'",
+				"  else",
+				'    printf \'%s\\n\' "$CCFLARE_TEST_KILL_MODE"',
+				"  fi",
+				"  exit 0",
+				"fi",
 				'if [[ "$*" == *"--property=TimeoutStopUSec"* ]]; then printf \'%s\\n\' "$CCFLARE_TEST_TIMEOUT"; exit 0; fi',
 				'if [[ "$*" == *"--property=Environment"* ]]; then printf \'%s\\n\' "$CCFLARE_TEST_ENVIRONMENT"; exit 0; fi',
 				"exit 2",
@@ -760,6 +767,8 @@ describe("effective systemd policy validation", () => {
 				"export CCFLARE_TEST_KILL_MODE=control-group",
 				"export CCFLARE_TEST_TIMEOUT=12min",
 				"export CCFLARE_TEST_ENVIRONMENT='GUARD_TOTAL_DEADLINE_MS=600000 GUARD_SHUTDOWN_GRACE_MS=600000'",
+				`export CCFLARE_TEST_SAFE_POLICY_PIN=${shellQuote(shellPath(pin))}`,
+				`export CCFLARE_TEST_SAFE_POLICY_BACKUP=${shellQuote(shellPath(backup))}`,
 				`source ${shellQuote(helperScriptForShell)}`,
 				`reload_validate_or_restore_systemd_policy ${shellQuote(shellPath(pin))} ${shellQuote(shellPath(backup))} ccflare-stack.service`,
 			].join("\n"),
@@ -780,10 +789,134 @@ describe("effective systemd policy validation", () => {
 		expect(effectiveCheck).toBeGreaterThan(0);
 		expect(restoreCopy).toBeGreaterThan(effectiveCheck);
 		expect(restoreMove).toBeGreaterThan(restoreCopy);
-		expect(events.at(-1)).toBe("systemctl:daemon-reload");
+		const restoreReload = events.findIndex(
+			(event, index) =>
+				index > restoreMove && event === "systemctl:daemon-reload",
+		);
+		const restoredEffectiveCheck = events.findIndex(
+			(event, index) =>
+				index > restoreReload && event.includes("--property=KillMode"),
+		);
+		expect(restoreReload).toBeGreaterThan(restoreMove);
+		expect(restoredEffectiveCheck).toBeGreaterThan(restoreReload);
 		expect(
 			events.some((event) => event.includes("systemctl restart")),
 		).toBe(false);
+	});
+
+	test("hard-fails when a later operator drop-in remains unsafe after pin restoration", () => {
+		const dir = tempDir();
+		const { binDir, log } = writeSystemctlMock(dir);
+		const sudo = join(binDir, "sudo");
+		writeFileSync(
+			sudo,
+			[
+				"#!/usr/bin/env bash",
+				'printf \'sudo:%s\\n\' "$*" >>"$CCFLARE_TEST_SYSTEMCTL_LOG"',
+				'exec "$@"',
+				"",
+			].join("\n"),
+		);
+		chmodSync(sudo, 0o755);
+		const pin = join(dir, "pin.conf");
+		const backup = join(dir, "pin.conf.bak");
+		writeFileSync(pin, "new pin\n");
+		writeFileSync(backup, "old pin\n");
+		const result = bash(
+			[
+				`export PATH=${shellQuote(shellPath(binDir))}:$PATH`,
+				`export CCFLARE_TEST_SYSTEMCTL_LOG=${shellQuote(shellPath(log))}`,
+				"export CCFLARE_TEST_KILL_MODE=control-group",
+				"export CCFLARE_TEST_TIMEOUT=12min",
+				"export CCFLARE_TEST_ENVIRONMENT='GUARD_TOTAL_DEADLINE_MS=600000 GUARD_SHUTDOWN_GRACE_MS=600000'",
+				`source ${shellQuote(helperScriptForShell)}`,
+				`reload_validate_or_restore_systemd_policy ${shellQuote(shellPath(pin))} ${shellQuote(shellPath(backup))} ccflare-stack.service`,
+			].join("\n"),
+		);
+		expect(result.exitCode).toBe(70);
+		expect(readFileSync(pin, "utf8")).toBe("old pin\n");
+		expect(result.stderr.toString()).toContain(
+			"operator drop-ins still produce an unsafe effective systemd policy",
+		);
+		expect(result.stderr.toString()).toContain("90-operator-policy.conf");
+		const events = readFileSync(log, "utf8").trim().split("\n");
+		expect(
+			events.filter((event) => event === "systemctl:daemon-reload"),
+		).toHaveLength(2);
+		expect(
+			events.filter((event) => event.includes("--property=KillMode")),
+		).toHaveLength(2);
+		expect(
+			events.some((event) => event.includes("systemctl restart")),
+		).toBe(false);
+	});
+
+	test("replaces an unchanged pin from its exact backup snapshot", () => {
+		const dir = tempDir();
+		const binDir = join(dir, "bin");
+		mkdirSync(binDir);
+		const sudo = join(binDir, "sudo");
+		writeFileSync(sudo, ["#!/usr/bin/env bash", 'exec "$@"', ""].join("\n"));
+		chmodSync(sudo, 0o755);
+		const pin = join(dir, "pin.conf");
+		const backup = join(dir, "pin.conf.bak");
+		const rendered = join(dir, "pin.rendered.conf");
+		const staged = join(dir, "pin.staged.conf");
+		writeFileSync(pin, "original pin\n");
+		writeFileSync(backup, "original pin\n");
+		writeFileSync(rendered, "new deploy pin\n");
+		const result = bash(
+			[
+				`export PATH=${shellQuote(shellPath(binDir))}:$PATH`,
+				`source ${shellQuote(helperScriptForShell)}`,
+				`replace_systemd_pin_if_snapshot_current ${shellQuote(shellPath(pin))} ${shellQuote(shellPath(backup))} ${shellQuote(shellPath(rendered))} ${shellQuote(shellPath(staged))}`,
+				'printf "%s" "$PIN_ROLLBACK_ARMED"',
+			].join("\n"),
+		);
+		expect(result.exitCode).toBe(0);
+		expect(result.stdout.toString()).toBe("1");
+		expect(readFileSync(pin, "utf8")).toBe("new deploy pin\n");
+		expect(readFileSync(backup, "utf8")).toBe("original pin\n");
+		expect(existsSync(staged)).toBe(false);
+	});
+
+	test("preserves a concurrent operator pin edit instead of replacing it", () => {
+		const dir = tempDir();
+		const binDir = join(dir, "bin");
+		mkdirSync(binDir);
+		const sudo = join(binDir, "sudo");
+		writeFileSync(
+			sudo,
+			[
+				"#!/usr/bin/env bash",
+				'if [[ "$1" == "cmp" ]]; then',
+				'  printf \'operator edit\\n\' >"$3"',
+				"fi",
+				'exec "$@"',
+				"",
+			].join("\n"),
+		);
+		chmodSync(sudo, 0o755);
+		const pin = join(dir, "pin.conf");
+		const backup = join(dir, "pin.conf.bak");
+		const rendered = join(dir, "pin.rendered.conf");
+		const staged = join(dir, "pin.staged.conf");
+		writeFileSync(pin, "original pin\n");
+		writeFileSync(backup, "original pin\n");
+		writeFileSync(rendered, "new deploy pin\n");
+		const result = bash(
+			[
+				`export PATH=${shellQuote(shellPath(binDir))}:$PATH`,
+				`source ${shellQuote(helperScriptForShell)}`,
+				`replace_systemd_pin_if_snapshot_current ${shellQuote(shellPath(pin))} ${shellQuote(shellPath(backup))} ${shellQuote(shellPath(rendered))} ${shellQuote(shellPath(staged))}`,
+			].join("\n"),
+		);
+		expect(result.exitCode).toBe(1);
+		expect(readFileSync(pin, "utf8")).toBe("operator edit\n");
+		expect(existsSync(staged)).toBe(false);
+		expect(result.stderr.toString()).toContain(
+			"changed after the deployment snapshot was captured",
+		);
 	});
 
 	test("fails clearly when a digest input file does not exist", () => {
@@ -1566,6 +1699,10 @@ describe("deployment flow safety contracts", () => {
 
 	test("full deployment has rollback and exact dual-health verification", () => {
 		const source = readFileSync(deployScript, "utf8");
+		const helperSource = readFileSync(
+			join(repoRoot, helperScriptForShell),
+			"utf8",
+		);
 		expect(source).toContain('validate_deployment_timing "$PIN_RENDERED"');
 		expect(source).toContain(
 			"totalDeadlineMs: Number(guardTotalDeadlineMs)",
@@ -1584,7 +1721,8 @@ describe("deployment flow safety contracts", () => {
 			'GUARD_POLICY_ID="pool-exhaustion-finite-recovery-v1"',
 		);
 		expect(source).toContain('PIN_STAGED="${PIN}.new-${SHORT}-$$"');
-		expect(source).toContain('sudo mv -f "$PIN_STAGED" "$PIN"');
+		expect(source).toContain("replace_systemd_pin_if_snapshot_current");
+		expect(source).toContain('render_systemd_pin \\\n\t"$PIN_BACKUP"');
 		expect(source).toContain(
 			'cp "$SOURCE_GUARD_POLICY" "$GUARD_STAGE_DIR/ccflare-guard-policy.mjs"',
 		);
@@ -1607,7 +1745,6 @@ describe("deployment flow safety contracts", () => {
 		const backup = source.indexOf(
 			'sudo cp --preserve=all "$PIN" "$PIN_BACKUP"',
 		);
-		const rollbackArmed = source.indexOf("PIN_ROLLBACK_ARMED=1", backup);
 		const preflight = source.indexOf(
 			'validate_deploy_owned_systemd_pin "$PIN"',
 		);
@@ -1617,7 +1754,7 @@ describe("deployment flow safety contracts", () => {
 			pinRender,
 		);
 		const pinWrite = source.indexOf(
-			'sudo tee "$PIN_STAGED" <"$PIN_RENDERED"',
+			"replace_systemd_pin_if_snapshot_current",
 			timingValidation,
 		);
 		const restart = source.indexOf(
@@ -1634,15 +1771,28 @@ describe("deployment flow safety contracts", () => {
 		);
 		const verify = source.indexOf("if ! validate_deploy_health", restart);
 		const hardFailure = source.indexOf("exit 1", verify);
+		const snapshotCompare = helperSource.indexOf(
+			'if ! sudo cmp -s "$pin" "$backup"',
+		);
+		const rollbackArmed = helperSource.indexOf(
+			"PIN_ROLLBACK_ARMED=1",
+			snapshotCompare,
+		);
+		const atomicRename = helperSource.indexOf(
+			'if ! sudo mv -f "$staged" "$pin"',
+			rollbackArmed,
+		);
 		expect(backup).toBeGreaterThan(0);
 		expect(preflight).toBeGreaterThan(0);
 		expect(pinRender).toBeGreaterThan(preflight);
 		expect(timingValidation).toBeGreaterThan(pinRender);
-		expect(backup).toBeGreaterThan(timingValidation);
+		expect(backup).toBeLessThan(pinRender);
 		expect(pinWrite).toBeGreaterThan(timingValidation);
 		expect(pinWrite).toBeGreaterThan(backup);
-		expect(rollbackArmed).toBeGreaterThan(pinWrite);
-		expect(effectivePolicy).toBeGreaterThan(rollbackArmed);
+		expect(snapshotCompare).toBeGreaterThan(0);
+		expect(rollbackArmed).toBeGreaterThan(snapshotCompare);
+		expect(atomicRename).toBeGreaterThan(rollbackArmed);
+		expect(effectivePolicy).toBeGreaterThan(pinWrite);
 		expect(restartAttempted).toBeGreaterThan(effectivePolicy);
 		expect(restart).toBeGreaterThan(restartAttempted);
 		expect(restart).toBeGreaterThan(pinRender);

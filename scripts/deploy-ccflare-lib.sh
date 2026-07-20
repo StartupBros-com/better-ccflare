@@ -183,6 +183,40 @@ render_systemd_pin() {
 	} >"$output"
 }
 
+replace_systemd_pin_if_snapshot_current() {
+	if [[ "$#" -ne 4 || ! -f "$1" || ! -f "$2" || ! -f "$3" ]]; then
+		echo "replace_systemd_pin_if_snapshot_current requires: pin backup rendered staged" >&2
+		return 2
+	fi
+
+	local pin="$1" backup="$2" rendered="$3" staged="$4"
+	if ! sudo cp --preserve=all "$backup" "$staged" \
+		|| ! sudo tee "$staged" <"$rendered" >/dev/null; then
+		echo "ERROR: failed to stage the rendered systemd pin" >&2
+		sudo rm -f "$staged" 2>/dev/null || true
+		return 1
+	fi
+
+	# The deploy lock serializes deployers, not operators. Treat the backup as
+	# a compare-and-swap snapshot: if the live file changed while artifacts
+	# were being rendered/staged, preserve that edit instead of overwriting it.
+	# Keep this comparison directly adjacent to the atomic rename so there is
+	# no intervening deployment work in the check/use window.
+	if ! sudo cmp -s "$pin" "$backup"; then
+		echo "ERROR: $pin changed after the deployment snapshot was captured; preserving the concurrent operator edit" >&2
+		sudo rm -f "$staged" 2>/dev/null || true
+		return 1
+	fi
+	# Arm rollback before the rename: if the shell is interrupted while mv is
+	# in flight, the exit trap must treat the live pin as potentially replaced.
+	PIN_ROLLBACK_ARMED=1
+	if ! sudo mv -f "$staged" "$pin"; then
+		echo "ERROR: failed to atomically install the rendered systemd pin" >&2
+		sudo rm -f "$staged" 2>/dev/null || true
+		return 1
+	fi
+}
+
 _configured_systemd_value() {
 	if [[ "$#" -ne 3 || ! -f "$1" ]]; then
 		return 2
@@ -528,6 +562,11 @@ reload_validate_or_restore_systemd_policy() {
 		|| ! sudo systemctl daemon-reload; then
 		echo "HARD FAILURE: pre-restart systemd pin restoration failed" >&2
 		sudo rm -f "$rollback_stage" 2>/dev/null || true
+		return 70
+	fi
+	if ! validate_effective_systemd_policy "$service" >/dev/null; then
+		echo "HARD FAILURE: operator drop-ins still produce an unsafe effective systemd policy after restoring the prior deploy pin" >&2
+		echo "Correct the later operator drop-ins (for example /etc/systemd/system/ccflare-stack.service.d/90-operator-policy.conf) before restarting the service." >&2
 		return 70
 	fi
 	return 1

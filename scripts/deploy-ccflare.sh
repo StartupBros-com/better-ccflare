@@ -305,9 +305,9 @@ if ! flock -n 9; then
 fi
 
 # Validate ownership before an expensive build or any host artifact/systemd
-# mutation. render_systemd_pin repeats this validation immediately before the
-# pin backup so a change made while the immutable source snapshot builds is
-# also rejected rather than silently discarded.
+# mutation. render_systemd_pin repeats this validation against the exact backup
+# snapshot after the immutable source build, and installation compares that
+# snapshot with the live pin so a later edit is rejected rather than discarded.
 validate_deploy_owned_systemd_pin "$PIN"
 
 # ---------------------------------------------------------------------------
@@ -430,9 +430,15 @@ echo "==> Updating systemd pin ($PIN)…"
 PRIOR_PROXY_HEALTH_JSON="$(curl -sf "$HEALTH_URL" 2>/dev/null || true)"
 PRIOR_GUARD_HEALTH_JSON="$(curl -sf "$GUARD_HEALTH_URL" 2>/dev/null || true)"
 
+PIN_BACKUP="${PIN}.bak-$(date -u +%Y%m%dT%H%M%SZ)-${SHORT}"
+sudo cp --preserve=all "$PIN" "$PIN_BACKUP"
+
+# Render from the exact backup snapshot, not the mutable live path. This binds
+# the proposed pin to the file revision that rollback will restore and that the
+# compare-and-swap installation below requires to remain current.
 PIN_RENDERED="$(mktemp)"
 render_systemd_pin \
-	"$PIN" \
+	"$PIN_BACKUP" \
 	"$PIN_RENDERED" \
 	"$DEST_BIN" \
 	"$RUNNER_SCRIPT" \
@@ -452,14 +458,12 @@ read -r \
 	CONFIGURED_GUARD_SHUTDOWN_GRACE_MS \
 	CONFIGURED_STOP_TIMEOUT_MS <<<"$CONFIGURED_DEPLOYMENT_TIMING"
 
-PIN_BACKUP="${PIN}.bak-$(date -u +%Y%m%dT%H%M%SZ)-${SHORT}"
-sudo cp --preserve=all "$PIN" "$PIN_BACKUP"
-
 PIN_STAGED="${PIN}.new-${SHORT}-$$"
-sudo cp --preserve=all "$PIN" "$PIN_STAGED"
-sudo tee "$PIN_STAGED" <"$PIN_RENDERED" >/dev/null
-PIN_ROLLBACK_ARMED=1
-sudo mv -f "$PIN_STAGED" "$PIN"
+replace_systemd_pin_if_snapshot_current \
+	"$PIN" \
+	"$PIN_BACKUP" \
+	"$PIN_RENDERED" \
+	"$PIN_STAGED"
 PIN_STAGED=""
 rm -f "$PIN_RENDERED"
 PIN_RENDERED=""
