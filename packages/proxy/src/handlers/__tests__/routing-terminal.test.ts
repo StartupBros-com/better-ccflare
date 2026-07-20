@@ -115,6 +115,53 @@ function accountCapacityContext(
 	};
 }
 
+function mixedFamilyCapacityContext(
+	now: number,
+	routes: readonly {
+		accountId: string;
+		resetAtMs: number | null;
+	}[],
+): RoutingCapacityContext {
+	const exclusions = routes.map(({ accountId, resetAtMs }) => {
+		const evidenceExpiresAt =
+			typeof resetAtMs === "number" &&
+			Number.isFinite(resetAtMs) &&
+			resetAtMs > now
+				? resetAtMs
+				: now + 5 * 60_000;
+		return {
+			accountId,
+			accountName: accountId,
+			model: "claude-fable-4-5",
+			modelFamily: "fable",
+			source: "normal" as const,
+			comboSlotId: null,
+			comboSlotOrdinal: null,
+			blockedUntil: evidenceExpiresAt,
+			exclusions: [
+				{
+					source: "usage_snapshot" as const,
+					scope: "family" as const,
+					window: "seven_day_fable",
+					windowKind: "weekly_scoped" as const,
+					modelFamily: "fable",
+					utilization: 100,
+					resetAtMs,
+					evidenceExpiresAt,
+				},
+			],
+		};
+	});
+	return {
+		effectiveModel: "claude-fable-4-5",
+		effectiveModelFamily: "fable",
+		exclusions,
+		blockedUntil: Math.min(
+			...exclusions.map((candidate) => candidate.blockedUntil ?? Infinity),
+		),
+	};
+}
+
 async function body(response: Response) {
 	return (await response.json()) as {
 		type: string;
@@ -271,6 +318,102 @@ describe("routing terminal responses", () => {
 		const parsed = await body(terminal.response);
 		expect(parsed.error.code).toBe("route_unavailable");
 		expect(parsed.error.attempted_routes).toBe(2);
+	});
+
+	it("aggregates complete finite global and family recovery from attempted routes", async () => {
+		const now = Date.UTC(2026, 6, 20, 12);
+		const terminal = createRoutingTerminalResponse({
+			source: "attempts",
+			accounts: [
+				makeAccount({
+					id: "primary",
+					name: "primary",
+					rate_limited_until: now + 60_000,
+					rate_limited_reason: "upstream_429_with_reset",
+				}),
+				makeAccount({ id: "secondary", name: "secondary" }),
+			],
+			capacityContext: null,
+			rateLimitOutcomes: [
+				{
+					accountId: "primary",
+					status: 429,
+					scope: "account",
+					family: "fable",
+					attemptedModel: "claude-fable-4-5",
+					reason: "hard_response_signal",
+					availableAt: now + 60_000,
+				},
+				{
+					accountId: "secondary",
+					status: 429,
+					scope: "family",
+					family: "fable",
+					attemptedModel: "claude-fable-4-5",
+					reason: "matching_scoped_limit",
+					availableAt: now + 120_000,
+				},
+			],
+			upstreamAttempts: 2,
+			now,
+		});
+
+		expect(terminal.kind).toBe("pool_exhausted");
+		expect(terminal.response.headers.get("retry-after")).toBe("60");
+		expect(terminal.response.headers.get("x-better-ccflare-pool-status")).toBe(
+			"exhausted",
+		);
+	});
+
+	it.each([
+		["NaN", Number.NaN],
+		["Infinity", Number.POSITIVE_INFINITY],
+		["expired", Date.UTC(2026, 6, 20, 12) - 1],
+	])("keeps mixed attempted recovery non-retryable when a model reset is %s", async (_label, invalidRecovery) => {
+		const now = Date.UTC(2026, 6, 20, 12);
+		const terminal = createRoutingTerminalResponse({
+			source: "attempts",
+			accounts: [
+				makeAccount({
+					id: "primary",
+					name: "primary",
+					rate_limited_until: now + 60_000,
+					rate_limited_reason: "upstream_429_with_reset",
+				}),
+				makeAccount({ id: "secondary", name: "secondary" }),
+			],
+			capacityContext: null,
+			rateLimitOutcomes: [
+				{
+					accountId: "primary",
+					status: 429,
+					scope: "account",
+					family: "fable",
+					attemptedModel: "claude-fable-4-5",
+					reason: "hard_response_signal",
+					availableAt: now + 60_000,
+				},
+				{
+					accountId: "secondary",
+					status: 429,
+					scope: "family",
+					family: "fable",
+					attemptedModel: "claude-fable-4-5",
+					reason: "matching_scoped_limit",
+					availableAt: invalidRecovery,
+				},
+			],
+			upstreamAttempts: 2,
+			now,
+		});
+
+		expect(terminal.kind).toBe("route_unavailable");
+		expect(terminal.response.headers.get("retry-after")).toBeNull();
+		expect(
+			terminal.response.headers.get("x-better-ccflare-pool-status"),
+		).toBeNull();
+		const parsed = await body(terminal.response);
+		expect(parsed.error.code).toBe("route_unavailable");
 	});
 
 	it("marks a finite unpaused global cooldown as retryable pool exhaustion", async () => {
@@ -482,7 +625,7 @@ describe("routing terminal responses", () => {
 		expect(terminal.kind).toBe("model_pool_exhausted");
 	});
 
-	it("treats incomplete or mixed unpaused model inventory conservatively", () => {
+	it("aggregates complete mixed unpaused model inventory", () => {
 		const now = Date.UTC(2026, 6, 17, 12);
 		const terminal = createRoutingTerminalResponse({
 			source: "selection",
@@ -500,8 +643,125 @@ describe("routing terminal responses", () => {
 			now,
 		});
 
+		expect(terminal.kind).toBe("pool_exhausted");
+		expect(terminal.response.headers.get("retry-after")).toBe("30");
+	});
+
+	it("aggregates finite recovery across mixed global and family-blocked routes", async () => {
+		const now = Date.UTC(2026, 6, 20, 12);
+		const primaryRecovery = now + 60_000;
+		const secondaryRecovery = now + 120_000;
+		const tertiaryRecovery = now + 180_000;
+		const terminal = createRoutingTerminalResponse({
+			source: "selection",
+			accounts: [
+				makeAccount({
+					id: "primary",
+					name: "primary",
+					rate_limited_until: primaryRecovery,
+					rate_limited_reason: "upstream_429_with_reset",
+				}),
+				makeAccount({ id: "secondary", name: "secondary" }),
+				makeAccount({ id: "tertiary", name: "tertiary" }),
+			],
+			capacityContext: mixedFamilyCapacityContext(now, [
+				{ accountId: "secondary", resetAtMs: secondaryRecovery },
+				{ accountId: "tertiary", resetAtMs: tertiaryRecovery },
+			]),
+			rateLimitOutcomes: [],
+			upstreamAttempts: 0,
+			now,
+		});
+
+		expect(terminal.kind).toBe("pool_exhausted");
+		expect(terminal.response.headers.get("retry-after")).toBe("60");
+		expect(terminal.response.headers.get("x-better-ccflare-pool-status")).toBe(
+			"exhausted",
+		);
+		const parsed = await body(terminal.response);
+		expect(parsed.error.code).toBe("pool_exhausted");
+		expect(parsed.error.next_available_at).toBe(
+			new Date(primaryRecovery).toISOString(),
+		);
+		expect(parsed.error.accounts).toEqual([
+			{
+				name: "primary",
+				reason: "rate_limited",
+				available_at: new Date(primaryRecovery).toISOString(),
+			},
+			{
+				name: "secondary",
+				reason: "capacity_exhausted",
+				available_at: new Date(secondaryRecovery).toISOString(),
+			},
+			{
+				name: "tertiary",
+				reason: "capacity_exhausted",
+				available_at: new Date(tertiaryRecovery).toISOString(),
+			},
+		]);
+	});
+
+	it("waits for both the account cooldown and model-lane blocker on the same route", async () => {
+		const now = Date.UTC(2026, 6, 20, 12);
+		const routeRecovery = now + 120_000;
+		const terminal = createRoutingTerminalResponse({
+			source: "selection",
+			accounts: [
+				makeAccount({
+					rate_limited_until: now + 60_000,
+					rate_limited_reason: "upstream_429_with_reset",
+				}),
+			],
+			capacityContext: mixedFamilyCapacityContext(now, [
+				{ accountId: "account-1", resetAtMs: routeRecovery },
+			]),
+			rateLimitOutcomes: [],
+			upstreamAttempts: 0,
+			now,
+		});
+
+		expect(terminal.kind).toBe("pool_exhausted");
+		expect(terminal.response.headers.get("retry-after")).toBe("120");
+		const parsed = await body(terminal.response);
+		expect(parsed.error.next_available_at).toBe(
+			new Date(routeRecovery).toISOString(),
+		);
+	});
+
+	it.each([
+		null,
+		Number.NaN,
+	])("keeps mixed recovery non-retryable when one family reset is unknown (%p)", async (unknownReset) => {
+		const now = Date.UTC(2026, 6, 20, 12);
+		const terminal = createRoutingTerminalResponse({
+			source: "selection",
+			accounts: [
+				makeAccount({
+					id: "primary",
+					name: "primary",
+					rate_limited_until: now + 60_000,
+					rate_limited_reason: "upstream_429_with_reset",
+				}),
+				makeAccount({ id: "secondary", name: "secondary" }),
+				makeAccount({ id: "tertiary", name: "tertiary" }),
+			],
+			capacityContext: mixedFamilyCapacityContext(now, [
+				{ accountId: "secondary", resetAtMs: now + 120_000 },
+				{ accountId: "tertiary", resetAtMs: unknownReset },
+			]),
+			rateLimitOutcomes: [],
+			upstreamAttempts: 0,
+			now,
+		});
+
 		expect(terminal.kind).toBe("route_unavailable");
 		expect(terminal.response.headers.get("retry-after")).toBeNull();
+		expect(
+			terminal.response.headers.get("x-better-ccflare-pool-status"),
+		).toBeNull();
+		const parsed = await body(terminal.response);
+		expect(parsed.error.code).toBe("route_unavailable");
 	});
 
 	it("keeps manually paused accounts non-retryable unless another route has finite automatic recovery", () => {

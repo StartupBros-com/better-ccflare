@@ -1293,7 +1293,7 @@ describe("source-controlled guard", () => {
 				setTimeout(() => res.end("ok"), 5);
 			}),
 		);
-		const { baseUrl } = await startGuard(upstreamBase);
+		const { baseUrl, guard } = await startGuard(upstreamBase);
 
 		const response = await fetch(`${baseUrl}/v1/messages`, {
 			method: "POST",
@@ -1303,6 +1303,10 @@ describe("source-controlled guard", () => {
 		expect(response.status).toBe(200);
 		expect(await response.text()).toBe("stream-ok");
 		expect(attempts).toBe(2);
+		expect(guard.state.counters.poolExhausted).toBe(1);
+		expect(guard.state.counters.retried).toBe(1);
+		expect(guard.state.counters.success).toBe(1);
+		expect(guard.state.counters.finalError).toBe(0);
 	});
 
 	// P1 spoofing (guard side, default posture): any upstream 503 body can be

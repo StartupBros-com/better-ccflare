@@ -234,6 +234,8 @@ afterEach(() => {
 	restoreUsageCollector = (): void => {};
 	globalThis.fetch = originalFetch;
 	usageCache.delete("acc-resetless-capacity");
+	usageCache.delete("acc-fable-secondary");
+	usageCache.delete("acc-fable-tertiary");
 	if (savedPassthrough === undefined) {
 		delete process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
 	} else {
@@ -615,6 +617,73 @@ describe("routing terminal — 503 response", () => {
 				error: { code: string };
 			};
 			expect(payload.error.code).toBe("route_unavailable");
+		}
+	});
+
+	it("returns retryable pool exhaustion for mixed finite global and Fable route recovery without an upstream attempt", async () => {
+		const now = Date.UTC(2026, 6, 20, 12);
+		const primary = makeAccount({
+			id: "acc-global-primary",
+			name: "primary",
+			rate_limited_until: now + 60_000,
+			rate_limited_reason: "upstream_429_with_reset",
+		});
+		const secondary = makeAccount({
+			id: "acc-fable-secondary",
+			name: "secondary",
+		});
+		const tertiary = makeAccount({
+			id: "acc-fable-tertiary",
+			name: "tertiary",
+		});
+		const realDateNow = Date.now;
+		Date.now = () => now;
+		let upstreamAttempts = 0;
+		globalThis.fetch = mock(async () => {
+			upstreamAttempts += 1;
+			throw new Error("upstream must not be called");
+		}) as unknown as typeof fetch;
+		try {
+			for (const [account, resetAt] of [
+				[secondary, now + 120_000],
+				[tertiary, now + 180_000],
+			] as const) {
+				usageCache.set(account.id, {
+					limits: [
+						{
+							kind: "weekly_scoped",
+							percent: 100,
+							resets_at: new Date(resetAt).toISOString(),
+							scope: { model: { id: null, display_name: "Fable" } },
+							is_active: true,
+						},
+					],
+				});
+			}
+			const request = new Request("https://proxy.local/v1/messages", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					model: "claude-fable-4-5",
+					messages: [{ role: "user", content: "hello" }],
+					max_tokens: 16,
+				}),
+			});
+			const response = await handleProxy(
+				request,
+				new URL(request.url),
+				makeContext([primary, secondary, tertiary]),
+			);
+
+			expect(response.status).toBe(503);
+			expect(response.headers.get("x-better-ccflare-pool-status")).toBe(
+				"exhausted",
+			);
+			expect(response.headers.get("retry-after")).toBe("60");
+			expect(upstreamAttempts).toBe(0);
+			expect((await response.json()).error.code).toBe("pool_exhausted");
+		} finally {
+			Date.now = realDateNow;
 		}
 	});
 
