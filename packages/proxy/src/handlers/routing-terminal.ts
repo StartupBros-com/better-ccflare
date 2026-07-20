@@ -310,6 +310,7 @@ function createRouteUnavailableResponse(options: {
 	accounts: readonly Account[];
 	now: number;
 	message?: string;
+	attemptedRoutes?: number;
 	routeCircuitRecoveryHint?: RouteCircuitRecoveryHint | null;
 }): Response {
 	const { accounts, now } = options;
@@ -324,6 +325,9 @@ function createRouteUnavailableResponse(options: {
 			reason: accountReason(account, undefined, now),
 		})),
 	};
+	if (options.attemptedRoutes !== undefined) {
+		error.attempted_routes = options.attemptedRoutes;
+	}
 	const headers = new Headers({ "content-type": "application/json" });
 	if (
 		recovery?.allCandidatesOpen &&
@@ -399,6 +403,8 @@ export function createRoutingTerminalResponse(
 				accounts: options.accounts,
 				now,
 				message: options.message,
+				attemptedRoutes:
+					options.source === "attempts" ? options.upstreamAttempts : undefined,
 				routeCircuitRecoveryHint: options.routeCircuitRecoveryHint,
 			}),
 		};
@@ -435,6 +441,8 @@ export function createRoutingTerminalResponse(
 			accounts: options.accounts,
 			now,
 			message: options.message,
+			attemptedRoutes:
+				options.source === "attempts" ? options.upstreamAttempts : undefined,
 			routeCircuitRecoveryHint: options.routeCircuitRecoveryHint,
 		}),
 	};

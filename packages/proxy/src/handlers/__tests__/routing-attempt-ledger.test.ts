@@ -48,8 +48,27 @@ describe("RoutingAttemptLedger", () => {
 		expect(ledger.claim("account-a", "provider-second-fallback")).toBe(false);
 
 		expect(ledger.attemptedCount).toBe(2);
-		expect(formatRoutingAttemptMessage("All accounts failed", ledger)).toBe(
-			"All accounts failed (2 attempted)",
+		expect(
+			formatRoutingAttemptMessage(
+				"All compatible upstream routes failed to proxy the request",
+				ledger,
+			),
+		).toBe(
+			"All compatible upstream routes failed to proxy the request (2 unique account/model routes attempted)",
+		);
+	});
+
+	it("uses singular route wording for one concrete transport", () => {
+		const ledger = new RoutingAttemptLedger();
+		expect(ledger.claim("account-a", "claude-opus-4-8")).toBe(true);
+
+		expect(
+			formatRoutingAttemptMessage(
+				"All compatible upstream routes failed to proxy the request",
+				ledger,
+			),
+		).toBe(
+			"All compatible upstream routes failed to proxy the request (1 unique account/model route attempted)",
 		);
 	});
 

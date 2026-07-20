@@ -1350,15 +1350,108 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		const request = makeRequest();
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		const payload = (await response.json()) as {
-			error: { type: string; code: string };
+			error: {
+				type: string;
+				code: string;
+				message: string;
+				attempted_routes: number;
+			};
 		};
 
 		expect(response.status).toBe(503);
 		expect(payload.error).toMatchObject({
 			type: "service_unavailable",
 			code: "route_unavailable",
+			attempted_routes: 2,
+			message:
+				"All compatible upstream routes failed to proxy the request (2 unique account/model routes attempted)",
 		});
 		expect(reportCandidateFailure).toHaveBeenCalledTimes(2);
+	});
+
+	it("reports only ledger-claimed transports when a deferred route follows a duplicate candidate skip", async () => {
+		const account = makeAccount("deferred-ledger-a");
+		account.model_mappings = JSON.stringify({
+			opus: [MODEL, OPUS_SIBLING],
+		});
+		const { ctx } = makeContext([account]);
+		ctx.strategy.select = mock(async () => [account, account]);
+		const attemptedModels: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			const body = (await upstreamRequest.clone().json()) as { model: string };
+			attemptedModels.push(body.model);
+			return body.model === MODEL
+				? exactModelExhaustedResponse()
+				: sseResponse(byteStream(TRANSIENT_ERROR));
+		}) as unknown as typeof fetch;
+
+		const request = makeRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const payload = (await response.json()) as {
+			error: {
+				code: string;
+				message: string;
+				attempted_routes: number;
+			};
+		};
+
+		expect(response.status).toBe(503);
+		expect(attemptedModels).toEqual([MODEL, OPUS_SIBLING]);
+		expect(payload.error).toMatchObject({
+			code: "route_unavailable",
+			attempted_routes: 2,
+			message:
+				"All compatible upstream routes failed to proxy the request (2 unique account/model routes attempted)",
+		});
+	});
+
+	it("carries a route-circuit recovery hint through handleProxy without a pool-exhausted marker", async () => {
+		const account = makeAccount("circuit-open-a");
+		const { ctx } = makeContext([account]);
+		const retryAt = Date.now() + 30_000;
+		ctx.strategy.select = mock(async () => []);
+		ctx.strategy.getRouteCircuitRecoveryHint = mock(() => ({
+			allCandidatesOpen: true,
+			candidateCount: 2,
+			probeLeased: true,
+			retryAt,
+			reason: "semantic_stream_stall",
+		}));
+		let fetchCount = 0;
+		globalThis.fetch = mock(async () => {
+			fetchCount += 1;
+			return sseResponse(byteStream(SUCCESS));
+		}) as unknown as typeof fetch;
+
+		const request = makeRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const payload = (await response.json()) as {
+			error: {
+				code: string;
+				next_available_at: string;
+				route_circuit: Record<string, unknown>;
+			};
+		};
+
+		expect(fetchCount).toBe(0);
+		expect(response.status).toBe(503);
+		expect(response.headers.get("retry-after")).toBe("30");
+		expect(response.headers.get("x-better-ccflare-route-status")).toBe(
+			"circuit-open",
+		);
+		expect(response.headers.get("x-better-ccflare-pool-status")).toBeNull();
+		expect(payload.error).toMatchObject({
+			code: "route_unavailable",
+			next_available_at: new Date(retryAt).toISOString(),
+			route_circuit: {
+				all_candidates_open: true,
+				candidate_count: 2,
+				probe_leased: true,
+				reason: "semantic_stream_stall",
+			},
+		});
 	});
 
 	it("cancels a stalled prelude once and reroutes without leaking bytes or poisoning its circuit", async () => {

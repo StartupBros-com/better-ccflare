@@ -1484,7 +1484,7 @@ async function handleProxyCore(
 		rateLimitOutcomes: getRequestRateLimitOutcomes(req),
 		upstreamAttempts: actualUpstreamAttempts,
 		message: formatRoutingAttemptMessage(
-			ERROR_MESSAGES.ALL_ACCOUNTS_FAILED,
+			ERROR_MESSAGES.ALL_UPSTREAM_ROUTES_FAILED,
 			routingAttemptLedger,
 		),
 		routeCircuitRecoveryHint: getRouteCircuitRecoveryHint(),

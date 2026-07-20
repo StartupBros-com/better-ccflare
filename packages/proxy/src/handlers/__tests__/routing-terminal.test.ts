@@ -270,6 +270,7 @@ describe("routing terminal responses", () => {
 		expect(terminal.kind).toBe("route_unavailable");
 		const parsed = await body(terminal.response);
 		expect(parsed.error.code).toBe("route_unavailable");
+		expect(parsed.error.attempted_routes).toBe(2);
 	});
 
 	it("marks a finite unpaused global cooldown as retryable pool exhaustion", async () => {
