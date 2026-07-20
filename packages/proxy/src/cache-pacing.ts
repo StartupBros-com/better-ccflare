@@ -13,6 +13,7 @@
  */
 import { createHash } from "node:crypto";
 import { Logger } from "@better-ccflare/logger";
+import { opaqueRuntimeId } from "./opaque-runtime-id";
 
 const log = new Logger("CachePacing");
 export const CACHE_PACING_MS_ENV = "CCFLARE_CACHE_PACING_MS";
@@ -250,7 +251,9 @@ export async function observeCachePacing(opts: {
 	const maxHoldMs = readCachePacingMs();
 	if (maxHoldMs <= 0 || !opts.sessionKey) return null;
 	const nowFn = opts.now ?? Date.now;
-	const key = `${opts.sessionKey}::${opts.model ?? ""}`;
+	// Only the keyed digest is retained in the leader map or exposed to callers.
+	// Raw session/model material lives only on this stack frame.
+	const key = opaqueRuntimeId("pacing", opts.sessionKey, opts.model ?? "");
 	const stats = familyStats(opts.model);
 
 	const existing = leaders.get(key);
@@ -271,7 +274,7 @@ export async function observeCachePacing(opts: {
 		stats.followerWaitMsTotal += waitedMs;
 		stats.followerWaitMsMax = Math.max(stats.followerWaitMsMax, waitedMs);
 		log.info(
-			`held follower ${waitedMs}ms behind leader for ${previewKey(key)}`,
+			`held follower ${waitedMs}ms behind leader for ${previewOpaqueId(key)}`,
 		);
 		return {
 			key,
@@ -362,6 +365,6 @@ export function resetCachePacing(): void {
 	statsByRoute.clear();
 }
 
-function previewKey(key: string): string {
-	return key.length <= 40 ? key : `${key.slice(0, 40)}...`;
+function previewOpaqueId(key: string): string {
+	return key.slice(0, 23);
 }

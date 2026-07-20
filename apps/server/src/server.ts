@@ -46,17 +46,13 @@ import {
 	CacheAffinityOrderer,
 	CacheKeepaliveScheduler,
 	drainUsageCollector,
-	getCachePacingRouteStats,
-	getCachePacingStats,
 	getModelCatalog,
 	getUsageCollectorHealth,
 	getValidAccessToken,
-	handleCacheDiagnosisRequest,
 	handleProxy,
 	initModelCatalogRefresh,
 	initProxy,
 	type ProxyContext,
-	readCachePacingMs,
 	refreshModelCatalog,
 	registerCodexUsageRefresher,
 	registerPollingRestarter,
@@ -1325,28 +1321,6 @@ export default async function startServer(options?: {
 				const apiResponse = await apiRouter.handleRequest(url, req);
 				if (apiResponse) {
 					return apiResponse;
-				}
-
-				// On-demand prompt-cache forensics (env-gated; see cache-diagnosis.ts)
-				if (
-					req.method === "POST" &&
-					url.pathname === "/api/debug/cache-diagnosis"
-				) {
-					return await handleCacheDiagnosisRequest(req, serverPort ?? port);
-				}
-
-				// Rolling fan-out pacing counters (see cache-pacing.ts). Production
-				// runs at WARN log level, so this is the only always-on view of
-				// follower hold behavior.
-				if (
-					req.method === "GET" &&
-					url.pathname === "/api/debug/cache-pacing"
-				) {
-					return Response.json({
-						pacing_ms: readCachePacingMs(),
-						families: getCachePacingStats(),
-						routes: getCachePacingRouteStats(),
-					});
 				}
 
 				// All other paths go to proxy
