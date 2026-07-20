@@ -27,7 +27,9 @@
 #      checkout is refs/heads/main exactly at refs/remotes/origin/main, HEAD is
 #      an ancestor of that remote tip, the working tree is clean, and package
 #      versions are not behind the highest v* tag already contained in HEAD.
-#   2. `bun run build` -> apps/cli/dist/better-ccflare.
+#   2. Create a detached worktree at the verified SHA, install its locked
+#      dependencies, and build there. The shared checkout is never a build
+#      or runtime-artifact source after verification.
 #   3. Copy the binary to
 #      /home/will/.config/better-ccflare/better-ccflare-v<version>-<short-sha>
 #      and install the source-controlled guard + policy as an immutable pair
@@ -73,6 +75,9 @@ PIN_ROLLBACK_ARMED=0
 SERVICE_RESTART_ATTEMPTED=0
 GUARD_STAGE_DIR=""
 RUNNER_STAGE_DIR=""
+BUILD_SNAPSHOT_PARENT=""
+BUILD_SOURCE_ROOT=""
+BUILD_SOURCE_REGISTERED=0
 PRIOR_PROXY_HEALTH_JSON=""
 PRIOR_GUARD_HEALTH_JSON=""
 PROXY_HEALTH_JSON=""
@@ -116,6 +121,19 @@ rollback_on_failure() {
 	local status="$1"
 	trap - EXIT
 	set +e
+
+	if [[ "$BUILD_SOURCE_REGISTERED" == "1" && -n "$BUILD_SOURCE_ROOT" ]]; then
+		if ! remove_verified_source_snapshot "$REPO_ROOT" "$BUILD_SOURCE_ROOT"; then
+			echo "WARNING: could not remove verified source snapshot $BUILD_SOURCE_ROOT" >&2
+		else
+			BUILD_SOURCE_REGISTERED=0
+		fi
+	fi
+	if [[ -n "$BUILD_SNAPSHOT_PARENT" && -d "$BUILD_SNAPSHOT_PARENT" ]]; then
+		if ! rmdir "$BUILD_SNAPSHOT_PARENT" 2>/dev/null; then
+			echo "WARNING: verified source snapshot parent was not empty: $BUILD_SNAPSHOT_PARENT" >&2
+		fi
+	fi
 
 	[[ -n "$PIN_RENDERED" && -f "$PIN_RENDERED" ]] && rm -f "$PIN_RENDERED"
 	if [[ -n "$GUARD_STAGE_DIR" && -d "$GUARD_STAGE_DIR" ]]; then
@@ -192,7 +210,7 @@ echo "==> Fetching refs/heads/main from origin…"
 git fetch origin refs/heads/main:refs/remotes/origin/main --quiet
 
 HEAD_SHA="$(git rev-parse HEAD)"
-SHORT="$(git rev-parse --short HEAD)"
+SHORT="$(git rev-parse --short "$HEAD_SHA")"
 ORIGIN_MAIN_SHA="$(git rev-parse refs/remotes/origin/main)"
 CURRENT_BRANCH_REF="$(git symbolic-ref -q HEAD 2>/dev/null || true)"
 
@@ -215,11 +233,9 @@ else
 	echo "refusing to deploy: $SHORT is not an ancestor of refs/remotes/origin/main" >&2
 fi
 
-# Clean-tree gate: the ancestry check verifies the committed HEAD, but the
-# build compiles the working tree. Uncommitted changes would ship code that is
-# NOT on the verified commit, silently bypassing the main-ancestry guarantee.
-# (git status --porcelain ignores gitignored build artifacts, so generated
-# inline workers / dist do not trip this.)
+# Clean-tree gate: the build below uses an immutable snapshot, so a later edit
+# cannot change what ships. Still require a clean operator checkout to make the
+# deploy invocation intentional and keep the canonical main checkout auditable.
 TREE_OK=0
 if [[ -z "$(git status --porcelain)" ]]; then
 	TREE_OK=1
@@ -232,8 +248,14 @@ fi
 # silently keep a fork's older package.json while absorbing a newer tagged
 # release, and the binary name/health endpoint would then lie about the
 # release lineage even though the code is present.
-VERSION="$(node -p "require('./apps/cli/package.json').version")"
-ROOT_VERSION="$(node -p "require('./package.json').version")"
+VERSION="$(
+	git show "${HEAD_SHA}:apps/cli/package.json" \
+		| node -e 'let input=""; process.stdin.on("data", chunk => input += chunk); process.stdin.on("end", () => process.stdout.write(JSON.parse(input).version));'
+)"
+ROOT_VERSION="$(
+	git show "${HEAD_SHA}:package.json" \
+		| node -e 'let input=""; process.stdin.on("data", chunk => input += chunk); process.stdin.on("end", () => process.stdout.write(JSON.parse(input).version));'
+)"
 VERSION_OK=0
 if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 	echo "refusing to deploy: apps/cli/package.json version '$VERSION' is not a plain semver x.y.z" >&2
@@ -241,9 +263,8 @@ elif [[ "$ROOT_VERSION" != "$VERSION" ]]; then
 	echo "refusing to deploy: root package.json version '$ROOT_VERSION' does not match apps/cli version '$VERSION'" >&2
 else
 	LATEST_CONTAINED_VERSION="$(
-		git tag --list 'v[0-9]*' --merged HEAD 2>/dev/null \
-			| sed -n 's/^v//p' \
-			| grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+		git tag --list 'v[0-9]*' --merged "$HEAD_SHA" 2>/dev/null \
+			| sed -nE 's/^v([0-9]+\.[0-9]+\.[0-9]+)$/\1/p' \
 			| sort -V \
 			| tail -n 1
 	)"
@@ -284,6 +305,13 @@ fi
 # ---------------------------------------------------------------------------
 # 2) Build
 # ---------------------------------------------------------------------------
+BUILD_SNAPSHOT_PARENT="$(
+	mktemp -d "${TMPDIR:-/tmp}/better-ccflare-deploy-${SHORT}.XXXXXX"
+)"
+BUILD_SOURCE_ROOT="$BUILD_SNAPSHOT_PARENT/source"
+create_verified_source_snapshot "$REPO_ROOT" "$BUILD_SOURCE_ROOT" "$HEAD_SHA"
+BUILD_SOURCE_REGISTERED=1
+
 BIN_NAME="better-ccflare-v${VERSION}-${SHORT}"
 GUARDS_ROOT="${DEST}/guards"
 GUARD_DIR="${GUARDS_ROOT}/${HEAD_SHA}"
@@ -293,14 +321,18 @@ RUNNERS_ROOT="${DEST}/runners"
 RUNNER_DIR="${RUNNERS_ROOT}/${HEAD_SHA}"
 RUNNER_SCRIPT="${RUNNER_DIR}/run-ccflare-stack.sh"
 GUARD_SOURCE_ID="$HEAD_SHA"
-SOURCE_GUARD="$REPO_ROOT/scripts/ccflare-guard.mjs"
-SOURCE_GUARD_POLICY="$REPO_ROOT/scripts/ccflare-guard-policy.mjs"
-SOURCE_RUNNER="$REPO_ROOT/scripts/run-ccflare-stack.sh"
+SOURCE_GUARD="$BUILD_SOURCE_ROOT/scripts/ccflare-guard.mjs"
+SOURCE_GUARD_POLICY="$BUILD_SOURCE_ROOT/scripts/ccflare-guard-policy.mjs"
+SOURCE_RUNNER="$BUILD_SOURCE_ROOT/scripts/run-ccflare-stack.sh"
 
-echo "==> Building better-ccflare v${VERSION} (${SHORT})…"
-bun run build
+echo "==> Building better-ccflare v${VERSION} (${SHORT}) from verified source snapshot…"
+(
+	cd "$BUILD_SOURCE_ROOT"
+	bun install --frozen-lockfile
+	bun run build
+)
 
-BUILT_BIN="apps/cli/dist/better-ccflare"
+BUILT_BIN="$BUILD_SOURCE_ROOT/apps/cli/dist/better-ccflare"
 if [[ ! -f "$BUILT_BIN" ]]; then
 	echo "ERROR: build did not produce $BUILT_BIN" >&2
 	exit 1

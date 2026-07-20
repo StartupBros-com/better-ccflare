@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
 	chmodSync,
+	copyFileSync,
 	mkdirSync,
 	mkdtempSync,
 	readdirSync,
@@ -39,6 +40,75 @@ function bash(script: string) {
 		stdout: "pipe",
 		stderr: "pipe",
 	});
+}
+
+function bashAt(cwd: string, script: string) {
+	return Bun.spawnSync(["bash", "-c", script], {
+		cwd,
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+}
+
+function gitAt(cwd: string, ...args: string[]) {
+	return Bun.spawnSync(["git", ...args], {
+		cwd,
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+}
+
+function expectCommandOk(result: ReturnType<typeof Bun.spawnSync>): void {
+	if (result.exitCode !== 0) {
+		throw new Error(
+			`command failed (${result.exitCode}):\n${result.stdout.toString()}\n${result.stderr.toString()}`,
+		);
+	}
+}
+
+function createDisposableDeployRepo(): {
+	checkout: string;
+	remote: string;
+} {
+	const root = tempDir();
+	const remote = join(root, "origin.git");
+	const checkout = join(root, "checkout");
+	mkdirSync(remote);
+	mkdirSync(checkout);
+	expectCommandOk(gitAt(remote, "init", "--bare"));
+	expectCommandOk(gitAt(checkout, "init", "-b", "main"));
+	expectCommandOk(gitAt(checkout, "config", "user.name", "Deploy Test"));
+	expectCommandOk(
+		gitAt(checkout, "config", "user.email", "deploy-test@example.invalid"),
+	);
+	mkdirSync(join(checkout, "scripts"));
+	copyFileSync(deployScript, join(checkout, "scripts", "deploy-ccflare.sh"));
+	copyFileSync(
+		join(repoRoot, helperScriptForShell),
+		join(checkout, helperScriptForShell),
+	);
+	writeFileSync(
+		join(checkout, "package.json"),
+		'{"name":"deploy-fixture","version":"1.0.0"}\n',
+	);
+	mkdirSync(join(checkout, "apps", "cli"), { recursive: true });
+	writeFileSync(
+		join(checkout, "apps", "cli", "package.json"),
+		'{"name":"deploy-fixture-cli","version":"1.0.0"}\n',
+	);
+	expectCommandOk(gitAt(checkout, "add", "scripts", "package.json", "apps"));
+	expectCommandOk(gitAt(checkout, "commit", "-m", "fixture"));
+	expectCommandOk(gitAt(checkout, "remote", "add", "origin", remote));
+	expectCommandOk(
+		gitAt(
+			checkout,
+			"push",
+			"--set-upstream",
+			"origin",
+			"refs/heads/main:refs/heads/main",
+		),
+	);
+	return { checkout, remote };
 }
 
 function shellQuote(value: string): string {
@@ -1293,6 +1363,97 @@ describe("validate_main_deploy_source", () => {
 	});
 });
 
+describe("deploy source gate in disposable repositories", () => {
+	test("--check accepts only the checked-out refs/heads/main at the current origin tip", () => {
+		const accepted = createDisposableDeployRepo();
+		const pass = bashAt(
+			accepted.checkout,
+			"bash scripts/deploy-ccflare.sh --check",
+		);
+		expect(pass.exitCode).toBe(0);
+		expect(pass.stdout.toString()).toContain(
+			"is refs/heads/main at refs/remotes/origin/main",
+		);
+		expect(pass.stdout.toString()).toContain("no merged v* tags to compare");
+
+		const feature = createDisposableDeployRepo();
+		expectCommandOk(gitAt(feature.checkout, "switch", "-c", "feature"));
+		const wrongBranch = bashAt(
+			feature.checkout,
+			"bash scripts/deploy-ccflare.sh --check",
+		);
+		expect(wrongBranch.exitCode).toBe(1);
+		expect(wrongBranch.stderr.toString()).toContain(
+			"checkout must be refs/heads/main",
+		);
+
+		const staleMain = createDisposableDeployRepo();
+		const oldSha = gitAt(staleMain.checkout, "rev-parse", "HEAD")
+			.stdout.toString()
+			.trim();
+		writeFileSync(join(staleMain.checkout, "remote-change.txt"), "new tip\n");
+		expectCommandOk(gitAt(staleMain.checkout, "add", "remote-change.txt"));
+		expectCommandOk(
+			gitAt(staleMain.checkout, "commit", "-m", "advance remote"),
+		);
+		expectCommandOk(
+			gitAt(
+				staleMain.checkout,
+				"push",
+				"origin",
+				"refs/heads/main:refs/heads/main",
+			),
+		);
+		expectCommandOk(gitAt(staleMain.checkout, "reset", "--hard", oldSha));
+		const behind = bashAt(
+			staleMain.checkout,
+			"bash scripts/deploy-ccflare.sh --check",
+		);
+		expect(behind.exitCode).toBe(1);
+		expect(behind.stderr.toString()).toContain(
+			"does not exactly match refs/remotes/origin/main",
+		);
+	});
+
+	test("verified source snapshot remains at the captured commit after the shared checkout changes", () => {
+		const { checkout } = createDisposableDeployRepo();
+		const snapshotParent = tempDir();
+		const snapshot = join(snapshotParent, "source");
+		const headSha = gitAt(checkout, "rev-parse", "HEAD")
+			.stdout.toString()
+			.trim();
+		const create = bashAt(
+			checkout,
+			[
+				`source ${shellQuote(join(checkout, helperScriptForShell))}`,
+				`create_verified_source_snapshot ${shellQuote(checkout)} ${shellQuote(snapshot)} ${shellQuote(headSha)}`,
+			].join("\n"),
+		);
+		expect(create.exitCode).toBe(0);
+
+		writeFileSync(join(checkout, "package.json"), '{"version":"9.9.9"}\n');
+		expect(readFileSync(join(snapshot, "package.json"), "utf8")).toBe(
+			'{"name":"deploy-fixture","version":"1.0.0"}\n',
+		);
+		expect(
+			gitAt(snapshot, "rev-parse", "HEAD").stdout.toString().trim(),
+		).toBe(headSha);
+		expect(gitAt(snapshot, "symbolic-ref", "-q", "HEAD").exitCode).toBe(1);
+		mkdirSync(join(snapshot, "node_modules"));
+		writeFileSync(join(snapshot, "node_modules", "build-output"), "ignored\n");
+
+		const cleanup = bashAt(
+			checkout,
+			[
+				`source ${shellQuote(join(checkout, helperScriptForShell))}`,
+				`remove_verified_source_snapshot ${shellQuote(checkout)} ${shellQuote(snapshot)}`,
+			].join("\n"),
+		);
+		expect(cleanup.exitCode).toBe(0);
+		expect(gitAt(checkout, "worktree", "list", "--porcelain").stdout.toString()).not.toContain(snapshot);
+	});
+});
+
 describe("deployment flow safety contracts", () => {
 	test("fetches and validates exact unambiguous main refs", () => {
 		const source = readFileSync(deployScript, "utf8");
@@ -1357,6 +1518,29 @@ describe("deployment flow safety contracts", () => {
 		expect(source.match(/\bexit 75\b/g)).toHaveLength(1);
 	});
 
+	test("build and copied runtime artifacts come only from the verified snapshot", () => {
+		const source = readFileSync(deployScript, "utf8");
+		expect(source).toContain(
+			'create_verified_source_snapshot "$REPO_ROOT" "$BUILD_SOURCE_ROOT" "$HEAD_SHA"',
+		);
+		expect(source).toContain('cd "$BUILD_SOURCE_ROOT"');
+		expect(source).toContain('BUILT_BIN="$BUILD_SOURCE_ROOT/apps/cli/dist/better-ccflare"');
+		expect(source).toContain(
+			'SOURCE_GUARD="$BUILD_SOURCE_ROOT/scripts/ccflare-guard.mjs"',
+		);
+		expect(source).toContain(
+			'SOURCE_GUARD_POLICY="$BUILD_SOURCE_ROOT/scripts/ccflare-guard-policy.mjs"',
+		);
+		expect(source).toContain(
+			'SOURCE_RUNNER="$BUILD_SOURCE_ROOT/scripts/run-ccflare-stack.sh"',
+		);
+		expect(source).not.toContain('SOURCE_GUARD="$REPO_ROOT/');
+		expect(source).not.toContain('SOURCE_RUNNER="$REPO_ROOT/');
+		expect(source).toContain(
+			'remove_verified_source_snapshot "$REPO_ROOT" "$BUILD_SOURCE_ROOT"',
+		);
+	});
+
 	test("full deployment has rollback and exact dual-health verification", () => {
 		const source = readFileSync(deployScript, "utf8");
 		expect(source).toContain('validate_deployment_timing "$PIN_RENDERED"');
@@ -1370,7 +1554,7 @@ describe("deployment flow safety contracts", () => {
 		expect(source).toContain('GUARD_DIR="${GUARDS_ROOT}/${HEAD_SHA}"');
 		expect(source).toContain('RUNNER_DIR="${RUNNERS_ROOT}/${HEAD_SHA}"');
 		expect(source).toContain(
-			'SOURCE_RUNNER="$REPO_ROOT/scripts/run-ccflare-stack.sh"',
+			'SOURCE_RUNNER="$BUILD_SOURCE_ROOT/scripts/run-ccflare-stack.sh"',
 		);
 		expect(source).toContain('GUARD_SOURCE_ID="$HEAD_SHA"');
 		expect(source).toContain(

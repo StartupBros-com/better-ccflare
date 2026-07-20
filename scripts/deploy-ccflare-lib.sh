@@ -32,6 +32,60 @@ validate_main_deploy_source() {
 	echo "OK: ${head_sha:0:12} is refs/heads/main at refs/remotes/origin/main."
 }
 
+create_verified_source_snapshot() {
+	if [[ "$#" -ne 3 ]]; then
+		echo "create_verified_source_snapshot requires: repository snapshot-path HEAD-SHA" >&2
+		return 2
+	fi
+
+	local repository="$1" snapshot_path="$2" head_sha="$3"
+	local snapshot_head snapshot_ref
+	if [[ ! -d "$repository" || ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+		echo "create_verified_source_snapshot requires a Git repository and full lowercase HEAD SHA" >&2
+		return 2
+	fi
+	if [[ -e "$snapshot_path" ]]; then
+		echo "refusing to create verified source snapshot over existing path $snapshot_path" >&2
+		return 2
+	fi
+
+	git -C "$repository" worktree add --detach --quiet "$snapshot_path" "$head_sha" \
+		|| return 1
+	snapshot_head="$(git -C "$snapshot_path" rev-parse HEAD 2>/dev/null || true)"
+	snapshot_ref="$(git -C "$snapshot_path" symbolic-ref -q HEAD 2>/dev/null || true)"
+	if [[ "$snapshot_head" != "$head_sha" || -n "$snapshot_ref" ]]; then
+		echo "verified source snapshot did not resolve to detached $head_sha" >&2
+		git -C "$repository" worktree remove --force "$snapshot_path" 2>/dev/null || true
+		return 1
+	fi
+}
+
+remove_verified_source_snapshot() {
+	if [[ "$#" -ne 2 ]]; then
+		echo "remove_verified_source_snapshot requires: repository snapshot-path" >&2
+		return 2
+	fi
+
+	local repository="$1" snapshot_path="$2" registered_path
+	if [[ ! -d "$repository" || -z "$snapshot_path" ]]; then
+		echo "remove_verified_source_snapshot requires a Git repository and snapshot path" >&2
+		return 2
+	fi
+	registered_path="$(
+		git -C "$repository" worktree list --porcelain 2>/dev/null \
+			| awk -v target="$snapshot_path" '$0 == "worktree " target { print target; exit }'
+	)"
+	if [[ -z "$registered_path" ]]; then
+		if [[ -e "$snapshot_path" ]]; then
+			echo "refusing to remove unregistered source snapshot path $snapshot_path" >&2
+			return 1
+		fi
+		return 0
+	fi
+
+	git -C "$repository" worktree remove --force "$registered_path"
+}
+
 render_systemd_pin() {
 	if [[ "$#" -ne 8 ]]; then
 		echo "render_systemd_pin requires: input output binary runner guard source-id policy-id guard-policy-script" >&2
