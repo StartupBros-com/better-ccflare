@@ -57,6 +57,8 @@ export interface AnthropicSseFrameClassification {
 	/** Sanitized nested `error.type`; upstream messages are never retained. */
 	errorType?: string;
 	transientErrorType?: AnthropicTransientSseErrorType;
+	/** Sanitized boolean only; no upstream error text leaves the classifier. */
+	contextOverflow?: true;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -226,11 +228,17 @@ export function classifyAnthropicSseFrame(
 				errorType && transientErrorTypes.has(errorType)
 					? (errorType as AnthropicTransientSseErrorType)
 					: undefined;
+			const errorCode = safeErrorType(nestedError.code);
+			const contextOverflow =
+				errorCode?.toLowerCase() === "context_length_exceeded" ||
+				(typeof nestedError.message === "string" &&
+					/^Prompt is too long\. Codex reported:/i.test(nestedError.message));
 			return {
 				kind: "error",
 				validProtocolActivity: true,
 				...(errorType ? { errorType } : {}),
 				...(transientErrorType ? { transientErrorType } : {}),
+				...(contextOverflow ? { contextOverflow: true as const } : {}),
 			};
 		}
 		default:

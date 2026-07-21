@@ -362,6 +362,26 @@ function getConcreteCodexModelList(
 	);
 }
 
+function isKnownLargerCodexCandidate(
+	currentModel: string,
+	candidateModel: string,
+): boolean {
+	const currentCapability = resolveModelContextCapability(
+		"codex",
+		currentModel,
+	);
+	if (!currentCapability) return false;
+	const candidateCapability = resolveModelContextCapability(
+		"codex",
+		candidateModel,
+	);
+	return (
+		candidateCapability !== undefined &&
+		candidateCapability.effectiveContextWindow >
+			currentCapability.effectiveContextWindow
+	);
+}
+
 export function selectAdmittedCodexModel(
 	account: Account,
 	requestedModel: string | null,
@@ -1542,6 +1562,13 @@ export async function proxyWithAccount(
 		const admittedModelIndex = admission.model
 			? concreteCodexModels.indexOf(admission.model)
 			: -1;
+		const mayPlanCodexContextOverflowFallback =
+			usesCodexAdmissionPlan &&
+			attemptAdmissionTracker?.estimateConfidence === "low" &&
+			modelFallbackPolicy?.deferImplicitFallback !== undefined &&
+			modelFallbackPolicy.implicitFallbacksEnabled !== false &&
+			admission.model !== null;
+		let codexContextOverflowFallbackPlanned = false;
 		if (modelFallbackPolicy?.deferImplicitFallback) {
 			const discoveryModels =
 				modelFallbackPolicy.implicitFallbacksEnabled === false ||
@@ -1573,6 +1600,15 @@ export async function proxyWithAccount(
 					candidateModel,
 					deferredDiscoveryRank++,
 				);
+				if (
+					mayPlanCodexContextOverflowFallback &&
+					admission.model &&
+					isKnownLargerCodexCandidate(admission.model, candidateModel)
+				) {
+					// Set only after the request-level queue accepts this route (or
+					// de-duplicates it against the same route queued during admission).
+					codexContextOverflowFallbackPlanned = true;
+				}
 			}
 		} else {
 			implicitFallbackDiscoveryPossible = false;
@@ -3432,6 +3468,7 @@ export async function proxyWithAccount(
 						commitmentDeadlineAt: semanticCommitmentDeadlineAt,
 						terminalGraceMs: streamConfig.terminalGraceMs,
 						maxBufferedBytes: streamConfig.maxBufferedBytes,
+						failOnContextOverflow: codexContextOverflowFallbackPlanned,
 						signal: activeAttemptCommitment?.signal ?? routingSignal,
 					},
 				);
@@ -3457,6 +3494,24 @@ export async function proxyWithAccount(
 					throw error;
 				}
 				if (!(error instanceof AnthropicPreCommitStallError)) throw error;
+				if (
+					error.reason === "context_length_exceeded" &&
+					codexContextOverflowFallbackPlanned
+				) {
+					log.info("codex_context_overflow_fallback", {
+						requestId: requestMeta.id,
+						accountId: account.id,
+						attemptedModel: currentTransportModel,
+						bufferedBytes: error.bufferedBytes,
+						framesSeen: error.framesSeen,
+					});
+					// The larger model was already queued by deferImplicitFallback.
+					// Codex records the terminal trace before emitting this downstream
+					// error frame; the gate's one-shot reader cancellation then propagates
+					// through the transformed stream to the raw upstream reader. This is
+					// request/model capacity, not unhealthy account evidence.
+					return null;
+				}
 				const isZeroMeaningfulCodexStall =
 					error.errorType === undefined &&
 					(error.reason === "semantic_timeout" ||

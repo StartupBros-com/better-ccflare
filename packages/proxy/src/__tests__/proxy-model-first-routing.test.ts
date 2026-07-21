@@ -207,6 +207,66 @@ function success(): Response {
 	});
 }
 
+function codexEventStream(
+	events: readonly { event: string; data: unknown }[],
+): Response {
+	const body = `${events
+		.map(
+			({ event, data }) =>
+				`event: ${event}\ndata: ${JSON.stringify({ type: event, ...data })}\n\n`,
+		)
+		.join("")}data: [DONE]\n\n`;
+	return new Response(body, {
+		status: 200,
+		headers: { "content-type": "text/event-stream" },
+	});
+}
+
+function codexContextOverflow(model: string): Response {
+	return codexEventStream([
+		{
+			event: "response.created",
+			data: { response: { id: `resp-${model}`, model } },
+		},
+		{
+			event: "response.failed",
+			data: {
+				response: {
+					status: "failed",
+					error: {
+						type: "invalid_request_error",
+						code: "context_length_exceeded",
+						message: "Input is too large",
+					},
+				},
+			},
+		},
+	]);
+}
+
+function codexStreamingSuccess(model: string): Response {
+	return codexEventStream([
+		{
+			event: "response.created",
+			data: { response: { id: `resp-${model}`, model } },
+		},
+		{
+			event: "response.output_text.delta",
+			data: { delta: "larger model recovered" },
+		},
+		{
+			event: "response.completed",
+			data: {
+				response: {
+					id: `resp-${model}`,
+					model,
+					usage: { input_tokens: 10, output_tokens: 3 },
+				},
+			},
+		},
+	]);
+}
+
 function cacheFreshFableExhaustion(accountId: string): void {
 	const now = Date.now();
 	const realDateNow = Date.now;
@@ -597,6 +657,117 @@ describe("global model-first routing", () => {
 					model: "gpt-5.3-codex-spark",
 				},
 			]);
+		} finally {
+			if (previousAdmission === undefined) {
+				delete process.env.CCFLARE_CONTEXT_ADMISSION;
+			} else {
+				process.env.CCFLARE_CONTEXT_ADMISSION = previousAdmission;
+			}
+		}
+	});
+
+	it("routes a pre-content Codex context overflow to a known larger deferred model", async () => {
+		const previousAdmission = process.env.CCFLARE_CONTEXT_ADMISSION;
+		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
+		try {
+			const account = makeAccount("admission-context-fallback", [
+				"gpt-5.3-codex-spark",
+				"gpt-5.6-sol",
+			]);
+			account.provider = "codex";
+			account.api_key = null;
+			account.access_token = "token-context-fallback";
+			account.expires_at = Date.now() + 60 * 60 * 1000;
+			const ctx = makeContext([account], makeCombo({ account }));
+			const reportCandidateFailure = mock(() => undefined);
+			ctx.strategy.reportCandidateFailure = reportCandidateFailure;
+			const fetchedModels: string[] = [];
+			globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+				const request = input instanceof Request ? input : new Request(input);
+				const model = ((await request.clone().json()) as { model: string })
+					.model;
+				fetchedModels.push(model);
+				return model === "gpt-5.3-codex-spark"
+					? codexContextOverflow(model)
+					: codexStreamingSuccess(model);
+			}) as unknown as typeof fetch;
+			const request = new Request("https://proxy.local/v1/messages", {
+				method: "POST",
+				headers: {
+					"content-type": "application/json",
+					"anthropic-version": "2023-06-01",
+				},
+				body: JSON.stringify({
+					model: FABLE,
+					messages: [{ role: "user", content: "x".repeat(440_000) }],
+					max_tokens: 50_000,
+					stream: true,
+				}),
+			});
+
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			const body = await response.text();
+
+			expect(fetchedModels).toEqual(["gpt-5.3-codex-spark", "gpt-5.6-sol"]);
+			expect(response.status).toBe(200);
+			expect(body).toContain("larger model recovered");
+			expect(reportCandidateFailure).toHaveBeenCalledTimes(0);
+			expect(account.rate_limited_until).toBeNull();
+			expect(account.consecutive_rate_limits).toBe(0);
+		} finally {
+			if (previousAdmission === undefined) {
+				delete process.env.CCFLARE_CONTEXT_ADMISSION;
+			} else {
+				process.env.CCFLARE_CONTEXT_ADMISSION = previousAdmission;
+			}
+		}
+	});
+
+	it("preserves a Codex context overflow when no larger model is configured", async () => {
+		const previousAdmission = process.env.CCFLARE_CONTEXT_ADMISSION;
+		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
+		try {
+			const account = makeAccount("admission-context-terminal", [
+				"gpt-5.3-codex-spark",
+			]);
+			account.provider = "codex";
+			account.api_key = null;
+			account.access_token = "token-context-terminal";
+			account.expires_at = Date.now() + 60 * 60 * 1000;
+			const ctx = makeContext([account], makeCombo({ account }));
+			const reportCandidateFailure = mock(() => undefined);
+			ctx.strategy.reportCandidateFailure = reportCandidateFailure;
+			const fetchedModels: string[] = [];
+			globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+				const request = input instanceof Request ? input : new Request(input);
+				const model = ((await request.clone().json()) as { model: string })
+					.model;
+				fetchedModels.push(model);
+				return codexContextOverflow(model);
+			}) as unknown as typeof fetch;
+			const request = new Request("https://proxy.local/v1/messages", {
+				method: "POST",
+				headers: {
+					"content-type": "application/json",
+					"anthropic-version": "2023-06-01",
+				},
+				body: JSON.stringify({
+					model: FABLE,
+					messages: [{ role: "user", content: "x".repeat(440_000) }],
+					max_tokens: 50_000,
+					stream: true,
+				}),
+			});
+
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			const body = await response.text();
+
+			expect(fetchedModels).toEqual(["gpt-5.3-codex-spark"]);
+			expect(response.status).toBe(200);
+			expect(body).toContain("context_length_exceeded");
+			expect(reportCandidateFailure).toHaveBeenCalledTimes(0);
+			expect(account.rate_limited_until).toBeNull();
+			expect(account.consecutive_rate_limits).toBe(0);
 		} finally {
 			if (previousAdmission === undefined) {
 				delete process.env.CCFLARE_CONTEXT_ADMISSION;
