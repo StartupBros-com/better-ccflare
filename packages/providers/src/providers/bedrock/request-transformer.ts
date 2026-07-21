@@ -340,8 +340,7 @@ function transformImageToolResult(
 	const format =
 		typeof item.source.media_type === "string"
 			? IMAGE_FORMAT_BY_MEDIA_TYPE[
-					item.source
-						.media_type as keyof typeof IMAGE_FORMAT_BY_MEDIA_TYPE
+					item.source.media_type as keyof typeof IMAGE_FORMAT_BY_MEDIA_TYPE
 				]
 			: undefined;
 	const bytes = decodeBase64(item.source.data);
@@ -377,8 +376,7 @@ function transformDocumentToolResult(
 	const format =
 		typeof item.source.media_type === "string"
 			? DOCUMENT_FORMAT_BY_MEDIA_TYPE[
-					item.source
-						.media_type as keyof typeof DOCUMENT_FORMAT_BY_MEDIA_TYPE
+					item.source.media_type as keyof typeof DOCUMENT_FORMAT_BY_MEDIA_TYPE
 				]
 			: undefined;
 	const bytes = decodeBase64(item.source.data);
@@ -509,14 +507,10 @@ function isValidToolName(value: unknown): value is string {
 }
 
 function transformClaudeCitation(citation: unknown): Citation | null {
-	if (
-		!isRecord(citation) ||
-		!isNonEmptyString(citation.cited_text)
-	) {
+	if (!isRecord(citation) || !isNonEmptyString(citation.cited_text)) {
 		return null;
 	}
-	const title =
-		citation.document_title ?? citation.title ?? undefined;
+	const title = citation.document_title ?? citation.title ?? undefined;
 	if (title !== undefined && title !== null && typeof title !== "string") {
 		return null;
 	}
@@ -701,7 +695,10 @@ function collectValidToolPairIds(
 		}
 
 		const resultMessage = messages[messageIndex + 1];
-		if (resultMessage?.role !== "user" || !Array.isArray(resultMessage.content)) {
+		if (
+			resultMessage?.role !== "user" ||
+			!Array.isArray(resultMessage.content)
+		) {
 			continue;
 		}
 
@@ -778,16 +775,11 @@ function transformMessageContentBlock(
 
 	if (block.type === "redacted_thinking") {
 		const redactedContent = decodeBase64(block.data);
-		return redactedContent
-			? { reasoningContent: { redactedContent } }
-			: null;
+		return redactedContent ? { reasoningContent: { redactedContent } } : null;
 	}
 
 	if (block.type === "tool_use") {
-		if (
-			isValidToolUseBlock(block) &&
-			context.validToolPairIds.has(block.id)
-		) {
+		if (isValidToolUseBlock(block) && context.validToolPairIds.has(block.id)) {
 			context.emittedToolUseIds.add(block.id);
 			return {
 				toolUse: {
@@ -920,7 +912,9 @@ export function transformMessagesRequest(
 				(block) => block.type !== "tool_result",
 			);
 			const normalizedLeadingToolResultCount =
-				leadingToolResultCount < 0 ? msg.content.length : leadingToolResultCount;
+				leadingToolResultCount < 0
+					? msg.content.length
+					: leadingToolResultCount;
 			const deferredToolUseCachePoints: CachePointBlock[] = [];
 			const deferredToolResultCachePoints: CachePointBlock[] = [];
 			for (const [blockIndex, block] of msg.content.entries()) {

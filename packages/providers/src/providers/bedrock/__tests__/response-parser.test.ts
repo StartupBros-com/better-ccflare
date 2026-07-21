@@ -322,14 +322,8 @@ describe("Bedrock usage normalization", () => {
 	});
 
 	it.each([
-		[
-			"char",
-			{ documentChar: { documentIndex: 0, start: 0, end: 1 } },
-		],
-		[
-			"page",
-			{ documentPage: { documentIndex: 0, start: 1, end: 2 } },
-		],
+		["char", { documentChar: { documentIndex: 0, start: 0, end: 1 } }],
+		["page", { documentPage: { documentIndex: 0, start: 1, end: 2 } }],
 		[
 			"content block",
 			{ documentChunk: { documentIndex: 0, start: 0, end: 1 } },

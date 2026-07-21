@@ -54,9 +54,7 @@ async function collectSseEvents(
 	return events;
 }
 
-function createAnthropicStream(
-	events: ConverseStreamOutput[],
-): ReadableStream {
+function createAnthropicStream(events: ConverseStreamOutput[]): ReadableStream {
 	const provider = new BedrockProvider();
 	return (
 		provider as unknown as {
@@ -508,7 +506,11 @@ describe("BedrockProvider.createAnthropicCompatibleStream", () => {
 
 	it("releases redacted-reasoning state on block stop and protocol abort", async () => {
 		const sequentialBlocks: ConverseStreamOutput[] = [];
-		for (let contentBlockIndex = 0; contentBlockIndex < 17; contentBlockIndex++) {
+		for (
+			let contentBlockIndex = 0;
+			contentBlockIndex < 17;
+			contentBlockIndex++
+		) {
 			sequentialBlocks.push(
 				{
 					contentBlockDelta: {
@@ -531,9 +533,9 @@ describe("BedrockProvider.createAnthropicCompatibleStream", () => {
 				{ messageStop: { stopReason: "end_turn" } },
 			]),
 		);
-		expect(
-			sequentialEvents.some((event) => event.event === "error"),
-		).toBe(false);
+		expect(sequentialEvents.some((event) => event.event === "error")).toBe(
+			false,
+		);
 		expect(
 			sequentialEvents.some((event) => event.event === "message_stop"),
 		).toBe(true);
@@ -563,9 +565,7 @@ describe("BedrockProvider.createAnthropicCompatibleStream", () => {
 			(
 				provider as unknown as {
 					createAnthropicCompatibleStream: (
-						bedrockStream:
-							| AsyncIterable<ConverseStreamOutput>
-							| undefined,
+						bedrockStream: AsyncIterable<ConverseStreamOutput> | undefined,
 						clientModelName: string,
 					) => ReadableStream;
 				}
@@ -578,9 +578,9 @@ describe("BedrockProvider.createAnthropicCompatibleStream", () => {
 		expect(
 			abortedEvents.filter((event) => event.event === "error"),
 		).toHaveLength(1);
-		expect(
-			abortedEvents.some((event) => event.event === "message_stop"),
-		).toBe(false);
+		expect(abortedEvents.some((event) => event.event === "message_stop")).toBe(
+			false,
+		);
 	});
 
 	it("preserves visible text but omits citation metadata split across events", async () => {
@@ -953,7 +953,7 @@ describe("BedrockProvider.createAnthropicCompatibleStream", () => {
 			{
 				contentBlockDelta: {
 					contentBlockIndex: 2,
-					delta: { toolUse: { input: "{\"bad\":true}" } },
+					delta: { toolUse: { input: '{"bad":true}' } },
 				},
 			},
 			{
@@ -980,10 +980,7 @@ describe("BedrockProvider.createAnthropicCompatibleStream", () => {
 		const events = await collectSseEvents(stream);
 		const deltas = events
 			.filter((event) => event.event === "content_block_delta")
-			.map(
-				(event) =>
-					(event.data as { delta: { type: string } }).delta.type,
-			);
+			.map((event) => (event.data as { delta: { type: string } }).delta.type);
 
 		expect(deltas).toEqual([
 			"input_json_delta",
