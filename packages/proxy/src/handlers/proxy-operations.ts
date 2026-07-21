@@ -3265,12 +3265,14 @@ export async function proxyWithAccount(
 		// successful streams, and that tee sibling would make cancellation of a
 		// pre-commit stall wait indefinitely. In Bun, merely reading Response.body
 		// before a later classification clone can also disturb the retained branch.
-		const officialCodexPrecommitRetryEligible =
+		const officialCodexPrecommitSseRetryRouteEligible =
 			provider.name === "codex" &&
 			account.provider === "codex" &&
 			url.pathname === "/v1/messages" &&
 			!isSyntheticInternal &&
-			isCodexSubscriptionEndpoint(targetUrl) &&
+			isCodexSubscriptionEndpoint(targetUrl);
+		const officialCodexCacheLaneRescueEligible =
+			officialCodexPrecommitSseRetryRouteEligible &&
 			typeof transformedBodyJson?.prompt_cache_key === "string" &&
 			transformedBodyJson.prompt_cache_key.length > 0;
 		let codexPrecommitRetryAttempted = false;
@@ -3330,7 +3332,7 @@ export async function proxyWithAccount(
 			// deadline and any global fallback reserve remain unchanged, while the
 			// first cache lane cannot consume the retry's bounded share.
 			const cacheLaneRescueReserveMs =
-				officialCodexPrecommitRetryEligible &&
+				officialCodexCacheLaneRescueEligible &&
 				!codexPrecommitRetryAttempted &&
 				attemptCommitmentDeadlineAt !== undefined
 					? getCodexCacheLaneRescueReserveMs(attemptCommitmentBudgetMs)
@@ -3404,7 +3406,10 @@ export async function proxyWithAccount(
 					codexPrecommitRetryCause = "precommit_sse_retry";
 				}
 				if (
-					officialCodexPrecommitRetryEligible &&
+					((codexPrecommitRetryCause === "cache_lane_rescue" &&
+						officialCodexCacheLaneRescueEligible) ||
+						(codexPrecommitRetryCause === "precommit_sse_retry" &&
+							officialCodexPrecommitSseRetryRouteEligible)) &&
 					!codexPrecommitRetryAttempted &&
 					codexPrecommitRetryCause
 				) {

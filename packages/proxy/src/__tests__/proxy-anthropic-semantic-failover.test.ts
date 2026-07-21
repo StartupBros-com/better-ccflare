@@ -70,6 +70,7 @@ const RESCUE_ACTIVATION_ENV = ANTHROPIC_PRECOMMIT_RESCUE_ACTIVATION_ENV;
 const RESCUE_PING_ENV = ANTHROPIC_PRECOMMIT_RESCUE_PING_INTERVAL_ENV;
 const RESCUE_DEADLINE_ENV = ANTHROPIC_PRECOMMIT_RESCUE_DEADLINE_ENV;
 const CONTEXT_ADMISSION_ENV = "CCFLARE_CONTEXT_ADMISSION";
+const CODEX_PROMPT_CACHE_KEY_ENV = "CCFLARE_CODEX_PROMPT_CACHE_KEY";
 
 const originalFetch = globalThis.fetch;
 const originalEnv = new Map(
@@ -84,6 +85,7 @@ const originalEnv = new Map(
 		RESCUE_PING_ENV,
 		RESCUE_DEADLINE_ENV,
 		CONTEXT_ADMISSION_ENV,
+		CODEX_PROMPT_CACHE_KEY_ENV,
 	].map((name) => [name, process.env[name]] as const),
 );
 let restoreUsageCollector = (): void => {};
@@ -715,17 +717,24 @@ function makeRequest(
 	});
 }
 
-function makeCodexRequest(): Request {
+function makeCodexRequest(
+	options: { includeSessionMetadata?: boolean } = {},
+): Request {
 	const request = makeRequest();
+	const includeSessionMetadata = options.includeSessionMetadata ?? true;
 	return new Request(request.url, {
 		method: request.method,
 		headers: request.headers,
 		body: JSON.stringify({
 			model: MODEL,
 			messages: [{ role: "user", content: "hello" }],
-			metadata: {
-				user_id: JSON.stringify({ session_id: CODEX_SESSION }),
-			},
+			...(includeSessionMetadata
+				? {
+						metadata: {
+							user_id: JSON.stringify({ session_id: CODEX_SESSION }),
+						},
+					}
+				: {}),
 			max_tokens: 16,
 			stream: true,
 		}),
@@ -820,6 +829,108 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		expect(reportCandidateSuccess).toHaveBeenCalledTimes(1);
 		expect(usageHandleStart).toHaveBeenCalledTimes(1);
 		expect(usageHandleEnd).toHaveBeenCalledTimes(1);
+	});
+
+	it.each([
+		"cache_disabled",
+		"session_metadata_absent",
+	] as const)("retries one official Codex precommit api_error with no cache key when %s", async (scenario) => {
+		if (scenario === "cache_disabled") {
+			process.env[CODEX_PROMPT_CACHE_KEY_ENV] = "0";
+		}
+		const account = makeCodexAccount(`codex-no-key-${scenario}`);
+		const { ctx, reportCandidateFailure, reportCandidateSuccess } = makeContext(
+			[account],
+			makeCombo([account]),
+		);
+		const outboundBodies: Array<{
+			model: string;
+			prompt_cache_key?: string;
+			[key: string]: unknown;
+		}> = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			outboundBodies.push(
+				(await upstreamRequest
+					.clone()
+					.json()) as (typeof outboundBodies)[number],
+			);
+			return sseResponse(
+				byteStream(
+					outboundBodies.length === 1
+						? codexFailureStream("api_error")
+						: CODEX_SUCCESS_STREAM,
+				),
+			);
+		}) as unknown as typeof fetch;
+
+		const request = makeCodexRequest({
+			includeSessionMetadata: scenario !== "session_metadata_absent",
+		});
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.text();
+
+		expect(response.status).toBe(200);
+		expect(outboundBodies).toHaveLength(2);
+		expect(outboundBodies[0].prompt_cache_key).toBeUndefined();
+		expect(outboundBodies[1].prompt_cache_key).toBeUndefined();
+		expect(outboundBodies[1]).toEqual(outboundBodies[0]);
+		expect(body).toContain('"text":"codex recovered"');
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+		expect(reportCandidateSuccess).toHaveBeenCalledTimes(1);
+		expect(usageHandleStart).toHaveBeenCalledTimes(1);
+		expect(usageHandleEnd).toHaveBeenCalledTimes(1);
+	});
+
+	it("keeps timeout cache-lane rescue disabled when no cache key exists", async () => {
+		process.env[CODEX_PROMPT_CACHE_KEY_ENV] = "0";
+		process.env[TIMEOUT_ENV] = "20";
+		process.env[MEANINGFUL_PROGRESS_ENV] = "500";
+		const account = makeCodexAccount("codex-timeout-no-key");
+		const { ctx } = makeContext([account]);
+		let fetchCount = 0;
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			fetchCount++;
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			const body = (await upstreamRequest.clone().json()) as {
+				prompt_cache_key?: string;
+			};
+			expect(body.prompt_cache_key).toBeUndefined();
+			return sseResponse(stalledCodexStream(() => undefined));
+		}) as unknown as typeof fetch;
+
+		const request = makeCodexRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		await response.text();
+
+		expect(response.status).toBe(503);
+		expect(fetchCount).toBe(1);
+	});
+
+	it("shares one retry cap between timeout rescue and precommit SSE retry", async () => {
+		process.env[TIMEOUT_ENV] = "20";
+		process.env[MEANINGFUL_PROGRESS_ENV] = "500";
+		const account = makeCodexAccount("codex-shared-precommit-retry-cap");
+		const { ctx } = makeContext([account]);
+		let fetchCount = 0;
+		globalThis.fetch = mock(async () => {
+			fetchCount++;
+			return fetchCount === 1
+				? sseResponse(stalledCodexStream(() => undefined))
+				: sseResponse(byteStream(codexFailureStream("api_error")));
+		}) as unknown as typeof fetch;
+
+		const request = makeCodexRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const payload = (await response.json()) as {
+			error: { attempted_routes: number };
+		};
+
+		expect(response.status).toBe(503);
+		expect(fetchCount).toBe(2);
+		expect(payload.error.attempted_routes).toBe(1);
 	});
 
 	it("stops after one Codex precommit api_error retry and reports one logical route failure", async () => {
