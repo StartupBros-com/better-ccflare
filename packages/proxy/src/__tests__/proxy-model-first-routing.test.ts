@@ -543,7 +543,7 @@ describe("global model-first routing", () => {
 		});
 	});
 
-	it("keeps Codex context admission inside the requested-family account wave", async () => {
+	it("defers low-confidence capacity to the first requested-family Codex route", async () => {
 		const previousAdmission = process.env.CCFLARE_CONTEXT_ADMISSION;
 		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
 		try {
@@ -592,7 +592,10 @@ describe("global model-first routing", () => {
 
 			expect(response.status).toBe(200);
 			expect(fetched).toEqual([
-				{ authorization: "Bearer token-b", model: "gpt-5.6-sol" },
+				{
+					authorization: "Bearer token-a",
+					model: "gpt-5.3-codex-spark",
+				},
 			]);
 		} finally {
 			if (previousAdmission === undefined) {
@@ -657,7 +660,7 @@ describe("global model-first routing", () => {
 			}
 		});
 
-		it(`keeps the output reserve for a large ${requestedModel} custom-endpoint combo request`, async () => {
+		it(`fails open and keeps the output reserve for a large ${requestedModel} custom-endpoint combo request`, async () => {
 			const previousAdmission = process.env.CCFLARE_CONTEXT_ADMISSION;
 			process.env.CCFLARE_CONTEXT_ADMISSION = "1";
 			try {
@@ -675,8 +678,16 @@ describe("global model-first routing", () => {
 					[account],
 					makeCombo({ account, model: requestedModel }),
 				);
-				const fetchMock = mock(async () => {
-					throw new Error("custom endpoint must be rejected before fetch");
+				const fetchedBodies: Array<Record<string, unknown>> = [];
+				const fetchMock = mock(async (input: RequestInfo | URL) => {
+					const request = input instanceof Request ? input : new Request(input);
+					fetchedBodies.push(
+						(await request.clone().json()) as Record<string, unknown>,
+					);
+					return new Response('{"ok":true}', {
+						status: 200,
+						headers: { "content-type": "application/json" },
+					});
 				});
 				globalThis.fetch = fetchMock as unknown as typeof fetch;
 				const request = new Request("https://proxy.local/v1/messages", {
@@ -691,21 +702,11 @@ describe("global model-first routing", () => {
 
 				const response = await handleProxy(request, new URL(request.url), ctx);
 
-				expect(response.status).toBe(400);
-				expect(fetchMock).toHaveBeenCalledTimes(0);
-				expect(await response.clone().json()).toMatchObject({
-					error: { code: "context_length_exceeded" },
-				});
-				expect(usageHandleStart).toHaveBeenCalledTimes(1);
-				expect(usageHandleStart.mock.calls[0]?.[0]).toMatchObject({
-					accountId: null,
-					responseStatus: 400,
-				});
-				expect(usageHandleEnd).toHaveBeenCalledTimes(1);
-				expect(usageHandleEnd.mock.calls[0]?.[0]).toMatchObject({
-					success: false,
-					error: "context_length_exceeded",
-				});
+				expect(response.status).toBe(200);
+				expect(fetchMock).toHaveBeenCalledTimes(1);
+				expect(fetchedBodies).toHaveLength(1);
+				expect(fetchedBodies[0]?.model).toBe("gpt-5.6-sol");
+				expect(fetchedBodies[0]?.max_output_tokens).toBe(50_000);
 			} finally {
 				if (previousAdmission === undefined) {
 					delete process.env.CCFLARE_CONTEXT_ADMISSION;

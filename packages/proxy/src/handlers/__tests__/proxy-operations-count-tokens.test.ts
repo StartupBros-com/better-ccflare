@@ -7,17 +7,31 @@ import {
 	mock,
 	spyOn,
 } from "bun:test";
-import { CodexProvider } from "@better-ccflare/providers";
+import { logBus } from "@better-ccflare/logger";
 import type { Account, RequestMeta } from "@better-ccflare/types";
-import * as usageCollectorModule from "../../usage-collector";
-import {
+import type { ProxyContext } from "../proxy-types";
+
+// Source worktrees intentionally exclude generated database worker bundles.
+// This focused proxy harness supplies dbOps directly and never constructs these
+// classes, so keep the unit test independent from generated build artifacts.
+mock.module("@better-ccflare/database", () => ({
+	AsyncDbWriter: class AsyncDbWriter {},
+	DatabaseFactory: class DatabaseFactory {},
+	DatabaseOperations: class DatabaseOperations {},
+	ModelTranslationRepository: class ModelTranslationRepository {},
+}));
+
+const { CodexProvider, estimateAnthropicAdmissionTokens } = await import(
+	"@better-ccflare/providers"
+);
+const usageCollectorModule = await import("../../usage-collector");
+const {
 	createContextAdmissionTracker,
 	createContextLengthExceededResponse,
 	proxyWithAccount,
 	sanitizeInternalHeaders,
 	selectAdmittedCodexModel,
-} from "../proxy-operations";
-import type { ProxyContext } from "../proxy-types";
+} = await import("../proxy-operations");
 
 function makeCodexAccount(overrides: Partial<Account> = {}): Account {
 	return {
@@ -105,6 +119,14 @@ function makeMessagesRequest(
 		body,
 		headers,
 	});
+}
+
+function calibratedAdmissionEstimate(tokens: number) {
+	return {
+		tokens,
+		method: "test-calibrated",
+		confidence: "calibrated" as const,
+	};
 }
 
 describe("proxyWithAccount — Codex count_tokens", () => {
@@ -507,6 +529,148 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 		).toBeNull();
 	});
 
+	it("fails open for a low-confidence oversized official-subscription request", async () => {
+		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
+		let fetchedRequest: Request | null = null;
+		const fetchMock = mock(async (input: RequestInfo | URL) => {
+			fetchedRequest = input instanceof Request ? input : new Request(input);
+			return new Response(JSON.stringify({ ok: true }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		});
+		globalThis.fetch = fetchMock;
+		const collectorSpy = spyOn(
+			usageCollectorModule,
+			"getUsageCollector",
+		).mockReturnValue({
+			handleStart: mock(() => {}),
+			handleChunk: mock(() => {}),
+			handleEnd: mock(() => Promise.resolve()),
+		} as unknown as usageCollectorModule.UsageCollector);
+
+		try {
+			const requestBody = {
+				model: "claude-opus-4-8",
+				messages: [
+					{
+						role: "user",
+						content: "const value = source?.field ?? fallback;\n".repeat(
+							18_000,
+						),
+					},
+				],
+				max_tokens: 50_000,
+			};
+			const serializedBody = JSON.stringify(requestBody);
+			const bodyBuffer = new TextEncoder().encode(serializedBody).buffer;
+			const estimate = estimateAnthropicAdmissionTokens(requestBody);
+			expect(serializedBody.length).toBeGreaterThan(706_800);
+			expect(estimate.tokens).toBeGreaterThan(353_400);
+			const tracker = createContextAdmissionTracker(estimate, 50_000);
+
+			const result = await proxyWithAccount(
+				makeMessagesRequest(bodyBuffer, { "Content-Type": "application/json" }),
+				new URL("https://proxy.local/v1/messages"),
+				makeCodexAccount({
+					access_token: "access-token",
+					expires_at: Date.now() + 60 * 60 * 1000,
+					model_mappings: JSON.stringify({ opus: "gpt-5.6-sol" }),
+				}),
+				makeRequestMeta("/v1/messages"),
+				bodyBuffer,
+				() => undefined,
+				0,
+				makeProxyContext(),
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				false,
+				tracker,
+			);
+
+			expect(result?.status).toBe(200);
+			await result?.text();
+			expect(fetchMock).toHaveBeenCalledTimes(1);
+			expect(tracker.inputTokens).toBe(estimate.tokens);
+			expect(tracker.estimateMethod).toBe("request-envelope-bytes");
+			expect(tracker.estimateConfidence).toBe("low");
+			expect(tracker.rejectedCount).toBe(0);
+			const upstreamBody = (await fetchedRequest?.clone().json()) as {
+				max_output_tokens?: number;
+			};
+			expect(upstreamBody.max_output_tokens).toBeUndefined();
+		} finally {
+			collectorSpy.mockRestore();
+		}
+	});
+
+	it("logs a privacy-safe low-confidence admission defer decision", () => {
+		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
+		const events: Array<{ msg?: string; data?: Record<string, unknown> }> = [];
+		const listener = (event: {
+			msg?: string;
+			data?: Record<string, unknown>;
+		}) => events.push(event);
+		logBus.on("log", listener);
+		try {
+			const result = selectAdmittedCodexModel(
+				makeCodexAccount({
+					model_mappings: JSON.stringify({ opus: "gpt-5.6-sol" }),
+				}),
+				"claude-opus-4-8",
+				createContextAdmissionTracker(
+					{
+						tokens: 378_049,
+						method: "request-envelope-bytes",
+						confidence: "low",
+					},
+					50_000,
+					"req-admission",
+				),
+			);
+			expect(result).toEqual({ admitted: true, model: "gpt-5.6-sol" });
+		} finally {
+			logBus.off("log", listener);
+		}
+
+		const decision = events.find(
+			(event) => event.msg === "context_admission_decision",
+		);
+		expect(decision?.data).toEqual({
+			requestId: "req-admission",
+			accountId: "codex-1",
+			model: "gpt-5.6-sol",
+			endpointClass: "subscription",
+			estimateMethod: "request-envelope-bytes",
+			estimateConfidence: "low",
+			estimatedInputTokens: 378_049,
+			outputReserveTokens: 0,
+			occupiedTokens: 378_049,
+			safeLimitTokens: 353_400,
+			outcome: "defer_low_confidence",
+		});
+	});
+
+	it("still rejects a calibrated over-limit estimate", () => {
+		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
+		const tracker = createContextAdmissionTracker(
+			calibratedAdmissionEstimate(360_000),
+			50_000,
+		);
+		const result = selectAdmittedCodexModel(
+			makeCodexAccount({
+				model_mappings: JSON.stringify({ opus: "gpt-5.6-sol" }),
+			}),
+			"claude-opus-4-8",
+			tracker,
+		);
+		expect(result).toEqual({ admitted: false, model: null });
+		expect(tracker.rejectedCount).toBe(1);
+		expect(tracker.largestSafeLimit).toBe(353_400);
+	});
+
 	it("skips an undersized Codex model before fetch and uses a larger mapped fallback", async () => {
 		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
 		let fetchedModel: string | null = null;
@@ -535,7 +699,10 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 					max_tokens: 50_000,
 				}),
 			).buffer;
-			const tracker = createContextAdmissionTracker(130_000, 50_000);
+			const tracker = createContextAdmissionTracker(
+				calibratedAdmissionEstimate(130_000),
+				50_000,
+			);
 			const result = await proxyWithAccount(
 				makeMessagesRequest(bodyBuffer, { "Content-Type": "application/json" }),
 				new URL("https://proxy.local/v1/messages"),
@@ -570,7 +737,10 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 
 	it("admission uses the provider's default for a family missing from partial account mappings", () => {
 		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
-		const tracker = createContextAdmissionTracker(250_000, 20_000);
+		const tracker = createContextAdmissionTracker(
+			calibratedAdmissionEstimate(250_000),
+			20_000,
+		);
 		const result = selectAdmittedCodexModel(
 			makeCodexAccount({
 				custom_endpoint: "https://api.openai.com/v1/responses",
@@ -586,7 +756,10 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 
 	it("reserves the full forwarded max_tokens for custom/API endpoints", async () => {
 		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
-		const tracker = createContextAdmissionTracker(220_000, 50_000);
+		const tracker = createContextAdmissionTracker(
+			calibratedAdmissionEstimate(220_000),
+			50_000,
+		);
 		const result = selectAdmittedCodexModel(
 			makeCodexAccount({
 				custom_endpoint: "https://api.openai.com/v1/responses",
@@ -612,7 +785,10 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 
 	it("uses zero output reserve for the ChatGPT subscription wire contract", async () => {
 		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
-		const tracker = createContextAdmissionTracker(250_000, 50_000);
+		const tracker = createContextAdmissionTracker(
+			calibratedAdmissionEstimate(250_000),
+			50_000,
+		);
 		const result = selectAdmittedCodexModel(
 			makeCodexAccount({
 				model_mappings: JSON.stringify({ sonnet: "gpt-5.4" }),
@@ -626,7 +802,10 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 
 	it("reports occupied tokens paired with the largest safe rejected candidate", async () => {
 		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
-		const tracker = createContextAdmissionTracker(360_000, 50_000);
+		const tracker = createContextAdmissionTracker(
+			calibratedAdmissionEstimate(360_000),
+			50_000,
+		);
 		selectAdmittedCodexModel(
 			makeCodexAccount({
 				custom_endpoint: "https://api.openai.com/v1/responses",
@@ -655,7 +834,10 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 
 	it("uses the smaller occupied total to break equal-safe-limit ties", async () => {
 		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
-		const tracker = createContextAdmissionTracker(260_000, 10_000);
+		const tracker = createContextAdmissionTracker(
+			calibratedAdmissionEstimate(260_000),
+			10_000,
+		);
 		const custom = makeCodexAccount({
 			custom_endpoint: "https://api.openai.com/v1/responses",
 			model_mappings: JSON.stringify({ sonnet: "gpt-5.4" }),
@@ -698,7 +880,10 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 					max_tokens: 20_000,
 				}),
 			).buffer;
-			const tracker = createContextAdmissionTracker(300_000, 20_000);
+			const tracker = createContextAdmissionTracker(
+				calibratedAdmissionEstimate(300_000),
+				20_000,
+			);
 			const req = new Request(`https://proxy.local${path}`, {
 				method: "POST",
 				body: bodyBuffer,
@@ -749,7 +934,10 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 				max_tokens: 20_000,
 			}),
 		).buffer;
-		const tracker = createContextAdmissionTracker(130_000, 20_000);
+		const tracker = createContextAdmissionTracker(
+			calibratedAdmissionEstimate(130_000),
+			20_000,
+		);
 		const result = await proxyWithAccount(
 			makeMessagesRequest(bodyBuffer, {
 				"Content-Type": "application/json",
@@ -791,7 +979,10 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 				max_tokens: 0,
 			}),
 		).buffer;
-		const tracker = createContextAdmissionTracker(300_000, 0);
+		const tracker = createContextAdmissionTracker(
+			calibratedAdmissionEstimate(300_000),
+			0,
+		);
 		const collectorSpy = spyOn(
 			usageCollectorModule,
 			"getUsageCollector",
@@ -866,7 +1057,10 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 					max_tokens: 20_000,
 				}),
 			).buffer;
-			const tracker = createContextAdmissionTracker(130_000, 20_000);
+			const tracker = createContextAdmissionTracker(
+				calibratedAdmissionEstimate(130_000),
+				20_000,
+			);
 			const result = await proxyWithAccount(
 				makeMessagesRequest(bodyBuffer, { "Content-Type": "application/json" }),
 				new URL("https://proxy.local/v1/messages"),
@@ -923,7 +1117,10 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 					max_tokens: 10,
 				}),
 			).buffer;
-			const tracker = createContextAdmissionTracker(999_999, 10);
+			const tracker = createContextAdmissionTracker(
+				calibratedAdmissionEstimate(999_999),
+				10,
+			);
 			const result = await proxyWithAccount(
 				makeMessagesRequest(bodyBuffer, { "Content-Type": "application/json" }),
 				new URL("https://proxy.local/v1/messages"),
@@ -976,7 +1173,10 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 					max_tokens: 20_000,
 				}),
 			).buffer;
-			const tracker = createContextAdmissionTracker(200_000, 20_000);
+			const tracker = createContextAdmissionTracker(
+				calibratedAdmissionEstimate(200_000),
+				20_000,
+			);
 			const result = await proxyWithAccount(
 				makeMessagesRequest(bodyBuffer, { "Content-Type": "application/json" }),
 				new URL("https://proxy.local/v1/messages"),
@@ -1011,7 +1211,10 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 				sonnet: ["gpt-5.3-codex-spark", "gpt-5.4"],
 			}),
 		});
-		const tracker = createContextAdmissionTracker(300_000, 20_000);
+		const tracker = createContextAdmissionTracker(
+			calibratedAdmissionEstimate(300_000),
+			20_000,
+		);
 		const result = selectAdmittedCodexModel(
 			account,
 			"claude-sonnet-4-5",
@@ -1027,7 +1230,10 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 
 	it("preserves a meaningful attempted failure over later capacity skips", () => {
 		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
-		const tracker = createContextAdmissionTracker(300_000, 20_000);
+		const tracker = createContextAdmissionTracker(
+			calibratedAdmissionEstimate(300_000),
+			20_000,
+		);
 		tracker.attemptedCount = 1;
 		const result = selectAdmittedCodexModel(
 			makeCodexAccount({
@@ -1042,7 +1248,10 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 	});
 
 	it("builds the exact pre-stream Anthropic context error using the largest safe limit", async () => {
-		const tracker = createContextAdmissionTracker(360_000, 50_000);
+		const tracker = createContextAdmissionTracker(
+			calibratedAdmissionEstimate(360_000),
+			50_000,
+		);
 		tracker.rejectedCount = 2;
 		tracker.largestSafeLimit = 353_400;
 		tracker.terminalOccupiedTokens = 410_000;
