@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { Logger } from "@better-ccflare/logger";
 import { chatGptCloudflareCookieJar } from "./chatgpt-cloudflare-cookies";
 import {
@@ -101,6 +102,8 @@ interface ActiveRequest {
 	streamQueuedByteLengths: number[];
 	streamQueuedBytes: number;
 	streamClosePending: boolean;
+	rawIngressFrames: number;
+	rawIngressBytes: number;
 	firstTimer?: ReturnType<typeof setTimeout>;
 	messageChain: Promise<void>;
 	resolveFirst: (result: Response | null) => void;
@@ -121,6 +124,7 @@ interface PoolEntry {
 	lastUsedAt: number;
 	busy: boolean;
 	closed: boolean;
+	retireAfterActive: boolean;
 	lastResponseId: string | null;
 	active?: ActiveRequest;
 	messageListener: (event: Event) => void;
@@ -464,6 +468,7 @@ export class CodexWebSocketTransport {
 			lastUsedAt: now,
 			busy: false,
 			closed: false,
+			retireAfterActive: false,
 			lastResponseId: null,
 			messageListener: () => undefined,
 			errorListener: () => undefined,
@@ -561,7 +566,23 @@ export class CodexWebSocketTransport {
 					this.counters.postWriteFailures++;
 				}
 				const activeRequest = entry.active;
-				if (activeRequest && !activeRequest.closed) {
+				if (
+					activeRequest &&
+					!activeRequest.closed &&
+					activeRequest.receipt !== receipt
+				) {
+					// The completed response body can be cancelled after a later turn has
+					// already reused this socket. Preserve the old turn's sticky/no-replay
+					// decision, but never resolve, close, or attribute the newer turn.
+					entry.retireAfterActive = true;
+					this.recordReceiptFailure(accountId, model, entry, receipt, category);
+					return;
+				}
+				if (
+					activeRequest &&
+					!activeRequest.closed &&
+					activeRequest.receipt === receipt
+				) {
 					if (!activeRequest.firstSettled) {
 						activeRequest.firstSettled = true;
 						const status =
@@ -621,6 +642,8 @@ export class CodexWebSocketTransport {
 			streamQueuedByteLengths: [],
 			streamQueuedBytes: 0,
 			streamClosePending: false,
+			rawIngressFrames: 0,
+			rawIngressBytes: 0,
 			messageChain: Promise.resolve(),
 			resolveFirst,
 			rejectFirst,
@@ -701,106 +724,141 @@ export class CodexWebSocketTransport {
 	private onMessage(entry: PoolEntry, event: Event): void {
 		const active = entry.active;
 		if (!active || active.closed || entry.closed) return;
+		const data = (event as MessageEvent<unknown>).data;
+		const ingressBytes = this.rawIngressByteLength(data);
+		if (
+			ingressBytes > MAX_BUFFERED_BYTES ||
+			active.rawIngressFrames +
+				active.pendingFrames.length +
+				active.streamQueuedByteLengths.length >=
+				MAX_BUFFERED_FRAMES ||
+			active.rawIngressBytes +
+				active.pendingBytes +
+				active.streamQueuedBytes +
+				ingressBytes >
+				MAX_BUFFERED_BYTES
+		) {
+			this.failAfterWrite(
+				entry,
+				active,
+				entry.stickyKey,
+				"buffer_overflow",
+				502,
+			);
+			return;
+		}
+		active.rawIngressFrames++;
+		active.rawIngressBytes += ingressBytes;
 		active.messageChain = active.messageChain
 			.then(async () => {
-				if (entry.active !== active || active.closed) return;
-				const raw = await codexWebSocketMessageText(
-					(event as MessageEvent<unknown>).data,
-				);
-				let parsed: Record<string, unknown>;
 				try {
-					parsed = JSON.parse(raw) as Record<string, unknown>;
-				} catch {
-					this.failAfterWrite(
-						entry,
-						active,
-						entry.stickyKey,
-						"malformed_frame",
-						502,
-					);
-					return;
-				}
-				const type = typeof parsed.type === "string" ? parsed.type : "";
-				if (!type) {
-					this.failAfterWrite(
-						entry,
-						active,
-						entry.stickyKey,
-						"malformed_frame",
-						502,
-					);
-					return;
-				}
-				const responseId = getCodexWebSocketResponseId(parsed);
-				if (
-					responseId &&
-					entry.lastResponseId === responseId &&
-					active.responseId === null
-				) {
-					return;
-				}
-				if (
-					active.responseId &&
-					responseId &&
-					active.responseId !== responseId
-				) {
-					return;
-				}
-				if (type === "response.created" && responseId) {
-					active.responseId = responseId;
-				}
+					if (entry.active !== active || active.closed) return;
+					const raw = await codexWebSocketMessageText(data);
+					if (entry.active !== active || active.closed) return;
+					let parsed: Record<string, unknown>;
+					try {
+						parsed = JSON.parse(raw) as Record<string, unknown>;
+					} catch {
+						this.failAfterWrite(
+							entry,
+							active,
+							entry.stickyKey,
+							"malformed_frame",
+							502,
+						);
+						return;
+					}
+					const type = typeof parsed.type === "string" ? parsed.type : "";
+					if (!type) {
+						this.failAfterWrite(
+							entry,
+							active,
+							entry.stickyKey,
+							"malformed_frame",
+							502,
+						);
+						return;
+					}
+					const responseId = getCodexWebSocketResponseId(parsed);
+					if (
+						responseId &&
+						entry.lastResponseId === responseId &&
+						active.responseId === null
+					) {
+						return;
+					}
+					if (
+						active.responseId &&
+						responseId &&
+						active.responseId !== responseId
+					) {
+						return;
+					}
+					if (type === "response.created" && responseId) {
+						active.responseId = responseId;
+					}
 
-				const elapsed = this.now() - active.frameWrittenAt;
-				if (active.firstEventMs === null) active.firstEventMs = elapsed;
-				if (type === "response.created" && active.createdMs === null) {
-					active.createdMs = elapsed;
-				}
-				if (
-					isCodexWebSocketOutputEvent(type) &&
-					active.firstOutputMs === null
-				) {
-					active.firstOutputMs = elapsed;
-				}
-				if (
-					!this.enqueueActiveFrame(
-						entry,
-						active,
-						encodeCodexWebSocketSseEvent(type, parsed),
-					)
-				) {
-					return;
-				}
-				if (!active.firstSettled) {
-					active.firstSettled = true;
-					if (active.firstTimer) clearTimeout(active.firstTimer);
-					active.resolveFirst(null);
-				}
-				if (CODEX_WEBSOCKET_TERMINAL_EVENT_TYPES.has(type)) {
-					active.terminalMs = elapsed;
-					entry.lastResponseId = active.responseId ?? responseId;
-					this.counters.terminals++;
-					let terminalFailure: string | null = null;
-					if (CODEX_WEBSOCKET_ERROR_EVENT_TYPES.has(type)) {
-						terminalFailure = type;
-						if (!active.receipt.stickyHttp) {
-							this.markSticky(entry.stickyKey);
-							active.receipt.stickyHttp = true;
-							this.counters.postWriteFailures++;
+					const elapsed = this.now() - active.frameWrittenAt;
+					if (active.firstEventMs === null) active.firstEventMs = elapsed;
+					if (type === "response.created" && active.createdMs === null) {
+						active.createdMs = elapsed;
+					}
+					if (
+						isCodexWebSocketOutputEvent(type) &&
+						active.firstOutputMs === null
+					) {
+						active.firstOutputMs = elapsed;
+					}
+					if (
+						!this.enqueueActiveFrame(
+							entry,
+							active,
+							encodeCodexWebSocketSseEvent(type, parsed),
+						)
+					) {
+						return;
+					}
+					if (!active.firstSettled) {
+						active.firstSettled = true;
+						if (active.firstTimer) clearTimeout(active.firstTimer);
+						active.resolveFirst(null);
+					}
+					if (CODEX_WEBSOCKET_TERMINAL_EVENT_TYPES.has(type)) {
+						active.terminalMs = elapsed;
+						entry.lastResponseId = active.responseId ?? responseId;
+						this.counters.terminals++;
+						let terminalFailure: string | null = null;
+						if (CODEX_WEBSOCKET_ERROR_EVENT_TYPES.has(type)) {
+							terminalFailure = type;
+							if (!active.receipt.stickyHttp) {
+								this.markSticky(entry.stickyKey);
+								active.receipt.stickyHttp = true;
+								this.counters.postWriteFailures++;
+							}
+						}
+						this.finishActive(entry, active, true, true);
+						this.recordActive(entry, active, terminalFailure);
+						if (
+							CODEX_WEBSOCKET_ERROR_EVENT_TYPES.has(type) ||
+							readCodexWebSocketPercent() <= 0 ||
+							entry.retireAfterActive
+						) {
+							this.evict(
+								entry,
+								CODEX_WEBSOCKET_ERROR_EVENT_TYPES.has(type)
+									? type
+									: entry.retireAfterActive
+										? "retire_after_active"
+										: "kill_switch",
+							);
 						}
 					}
-					this.finishActive(entry, active, true, true);
-					this.recordActive(entry, active, terminalFailure);
-					if (
-						CODEX_WEBSOCKET_ERROR_EVENT_TYPES.has(type) ||
-						readCodexWebSocketPercent() <= 0
-					) {
-						this.evict(
-							entry,
-							CODEX_WEBSOCKET_ERROR_EVENT_TYPES.has(type)
-								? type
-								: "kill_switch",
-						);
-					}
+				} finally {
+					active.rawIngressFrames = Math.max(0, active.rawIngressFrames - 1);
+					active.rawIngressBytes = Math.max(
+						0,
+						active.rawIngressBytes - ingressBytes,
+					);
 				}
 			})
 			.catch(() => {
@@ -814,6 +872,16 @@ export class CodexWebSocketTransport {
 					);
 				}
 			});
+	}
+
+	private rawIngressByteLength(data: unknown): number {
+		if (typeof data === "string") return Buffer.byteLength(data, "utf8");
+		if (data instanceof ArrayBuffer) return data.byteLength;
+		if (ArrayBuffer.isView(data)) return data.byteLength;
+		if (typeof Blob !== "undefined" && data instanceof Blob) return data.size;
+		// Unsupported frame types still reserve one frame slot and are rejected by
+		// codexWebSocketMessageText when their turn reaches the decode chain.
+		return 0;
 	}
 
 	private onSocketFailure(

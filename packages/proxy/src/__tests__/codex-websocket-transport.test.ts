@@ -78,6 +78,10 @@ class FakeWebSocket extends EventTarget implements CodexWebSocketLike {
 		this.dispatchEvent(new MessageEvent("message", { data: value }));
 	}
 
+	emitData(value: unknown): void {
+		this.dispatchEvent(new MessageEvent("message", { data: value }));
+	}
+
 	emitError(): void {
 		this.dispatchEvent(new Event("error"));
 	}
@@ -814,6 +818,141 @@ describe("CodexWebSocketTransport replay boundary", () => {
 				attemptId: "attempt-flood-retry",
 			}),
 		).toBeNull();
+	});
+
+	test("bounds raw WebSocket ingress before delayed frame decoding", async () => {
+		enableCanary({ CCFLARE_CODEX_WS_FIRST_EVENT_TIMEOUT_MS: "10" });
+		let releaseDecode!: () => void;
+		const decodeGate = new Promise<void>((resolve) => {
+			releaseDecode = resolve;
+		});
+		class HeldBlob extends Blob {
+			override async text(): Promise<string> {
+				await decodeGate;
+				return super.text();
+			}
+		}
+		const heldEvent = JSON.stringify({
+			type: "response.output_text.delta",
+			delta: "held",
+		});
+		const h = harness({
+			configureSocket(socket) {
+				socket.onSend = (ws) =>
+					queueMicrotask(() => {
+						for (let index = 0; index < 257; index++) {
+							ws.emitData(new HeldBlob([heldEvent]));
+						}
+					});
+			},
+		});
+
+		const result = await attempt(h.transport, request(), {
+			requestId: "request-raw-ingress",
+			attemptId: "attempt-raw-ingress",
+		});
+		releaseDecode();
+		await Bun.sleep(0);
+
+		expect(result?.response.status).toBe(502);
+		expect(result?.receipt.stickyHttp).toBe(true);
+		expect(h.transport.getStats().poolSize).toBe(0);
+		expect(h.observations).toContainEqual(
+			expect.objectContaining({
+				requestId: "request-raw-ingress",
+				attemptId: "attempt-raw-ingress",
+				fallbackReason: "buffer_overflow",
+				fallbackAllowedBeforeWrite: false,
+				stickyHttp: true,
+			}),
+		);
+	});
+
+	test("defers retirement when a completed turn is cancelled during a reused turn", async () => {
+		enableCanary();
+		const h = harness({
+			configureSocket(socket) {
+				socket.onSend = (ws) => {
+					if (ws.sent.length !== 1) return;
+					queueMicrotask(() => {
+						ws.emitJson({
+							type: "response.created",
+							response: { id: "turn-a" },
+						});
+						ws.emitJson({
+							type: "response.completed",
+							response: { id: "turn-a" },
+						});
+					});
+				};
+			},
+		});
+		const first = await attempt(h.transport, request(), {
+			requestId: "request-turn-a",
+			attemptId: "attempt-turn-a",
+		});
+		for (
+			let index = 0;
+			index < 20 &&
+			h.observations.every(
+				(observation) => observation.attemptId !== "attempt-turn-a",
+			);
+			index++
+		) {
+			await Bun.sleep(0);
+		}
+
+		const secondPromise = attempt(h.transport, request(), {
+			requestId: "request-turn-b",
+			attemptId: "attempt-turn-b",
+		});
+		let secondSettled = false;
+		void secondPromise.then(
+			() => {
+				secondSettled = true;
+			},
+			() => {
+				secondSettled = true;
+			},
+		);
+		await Bun.sleep(0);
+		expect(h.sockets[0].sent).toHaveLength(2);
+
+		await first?.response.body?.cancel();
+		await Bun.sleep(0);
+		expect(secondSettled).toBe(false);
+		expect(h.sockets[0].closes).toHaveLength(0);
+
+		h.sockets[0].emitJson({
+			type: "response.created",
+			response: { id: "turn-b" },
+		});
+		h.sockets[0].emitJson({
+			type: "response.completed",
+			response: { id: "turn-b" },
+		});
+		const second = await secondPromise;
+		expect(second?.response.status).toBe(200);
+		await second?.response.text();
+		expect(h.sockets[0].closes).toHaveLength(1);
+		expect(h.transport.getStats().poolSize).toBe(0);
+		expect(
+			h.observations.filter(
+				(observation) => observation.attemptId === "attempt-turn-a",
+			),
+		).toHaveLength(1);
+		expect(
+			h.observations.filter(
+				(observation) => observation.attemptId === "attempt-turn-b",
+			),
+		).toHaveLength(1);
+		expect(
+			await attempt(h.transport, request(), {
+				requestId: "request-turn-c",
+				attemptId: "attempt-turn-c",
+			}),
+		).toBeNull();
+		expect(h.sockets).toHaveLength(1);
 	});
 
 	test("records at most one terminal observation per transport attempt", async () => {
