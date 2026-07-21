@@ -364,8 +364,9 @@ async function handleProxyCore(
 		originalParsedBody &&
 		originalParsedBody.max_tokens !== 0
 			? createContextAdmissionTracker(
-					estimateAnthropicAdmissionTokens(originalParsedBody).tokens,
+					estimateAnthropicAdmissionTokens(originalParsedBody),
 					originalParsedBody.max_tokens,
+					requestMeta.id,
 				)
 			: undefined;
 

@@ -191,6 +191,7 @@ export type AnthropicPreCommitStallReason =
 	| "buffer_limit"
 	| "upstream_eof"
 	| "upstream_error"
+	| "context_length_exceeded"
 	| "transient_sse_error";
 
 export interface AnthropicPreCommitStallMetadata {
@@ -298,6 +299,8 @@ export interface AnthropicSemanticPreflightOptions {
 	terminalGraceMs?: number;
 	/** Hard cap on all raw bytes retained before semantic commitment. */
 	maxBufferedBytes?: number;
+	/** Raise a sanitized pre-commit signal for a provider-scoped context fallback. */
+	failOnContextOverflow?: boolean;
 	/** Cancel preflight without reporting a provider/account route failure. */
 	signal?: AbortSignal;
 }
@@ -568,6 +571,9 @@ export async function gateAnthropicSsePreCommit(
 		}
 		if (classification.transientErrorType) {
 			return failTransient(classification.transientErrorType);
+		}
+		if (options.failOnContextOverflow && classification.contextOverflow) {
+			return fail("context_length_exceeded");
 		}
 		if (classification.kind === "terminal_delta") {
 			terminalEvidenceSeen = true;

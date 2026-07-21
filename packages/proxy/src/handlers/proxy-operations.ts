@@ -149,6 +149,9 @@ function getTestContextWindowOverride(): number | undefined {
 
 export interface ContextAdmissionTracker {
 	inputTokens: number;
+	estimateMethod: string;
+	estimateConfidence: ContextAdmissionEstimateConfidence;
+	requestId?: string;
 	requestedMaxOutputTokens: number;
 	rejectedCount: number;
 	/** Safe limit and occupied total are always retained from the same rejection. */
@@ -156,6 +159,17 @@ export interface ContextAdmissionTracker {
 	terminalOccupiedTokens: number;
 	attemptedCount: number;
 	nonCapacitySkipCount: number;
+}
+
+export type ContextAdmissionEstimateConfidence =
+	| "low"
+	| "calibrated"
+	| "authoritative";
+
+export interface ContextAdmissionEstimate {
+	readonly tokens: number;
+	readonly method: string;
+	readonly confidence: ContextAdmissionEstimateConfidence;
 }
 
 /**
@@ -186,9 +200,14 @@ export interface ModelFallbackExecutionPolicy {
 }
 
 export function createContextAdmissionTracker(
-	inputTokens: number,
+	estimate: ContextAdmissionEstimate,
 	requestedMaxOutputTokens: unknown,
+	requestId?: string,
 ): ContextAdmissionTracker {
+	const inputTokens =
+		typeof estimate.tokens === "number" && Number.isFinite(estimate.tokens)
+			? Math.max(0, Math.floor(estimate.tokens))
+			: 0;
 	const sanitizedRequestedMaxOutputTokens =
 		typeof requestedMaxOutputTokens === "number" &&
 		Number.isFinite(requestedMaxOutputTokens)
@@ -196,6 +215,9 @@ export function createContextAdmissionTracker(
 			: 0;
 	return {
 		inputTokens,
+		estimateMethod: estimate.method,
+		estimateConfidence: estimate.confidence,
+		...(requestId && { requestId }),
 		requestedMaxOutputTokens: sanitizedRequestedMaxOutputTokens,
 		rejectedCount: 0,
 		largestSafeLimit: 0,
@@ -203,6 +225,39 @@ export function createContextAdmissionTracker(
 		attemptedCount: 0,
 		nonCapacitySkipCount: 0,
 	};
+}
+
+type ContextAdmissionOutcome =
+	| "admit"
+	| "capacity_rejected"
+	| "defer_low_confidence";
+
+function logContextAdmissionDecision(input: {
+	account: Account;
+	model: string;
+	endpointClass: "subscription" | "custom";
+	tracker: ContextAdmissionTracker;
+	decision: ReturnType<typeof decideContextAdmission>;
+	outcome: ContextAdmissionOutcome;
+}): void {
+	const data = {
+		...(input.tracker.requestId && { requestId: input.tracker.requestId }),
+		accountId: input.account.id,
+		model: input.model,
+		endpointClass: input.endpointClass,
+		estimateMethod: input.tracker.estimateMethod,
+		estimateConfidence: input.tracker.estimateConfidence,
+		estimatedInputTokens: input.decision.inputTokens,
+		outputReserveTokens: input.decision.outputReserveTokens,
+		occupiedTokens: input.decision.occupiedTokens,
+		safeLimitTokens: input.decision.safeLimitTokens ?? 0,
+		outcome: input.outcome,
+	};
+	if (input.outcome === "admit") {
+		log.debug("context_admission_decision", data);
+		return;
+	}
+	log.info("context_admission_decision", data);
 }
 
 export function admitConcreteCodexModel(
@@ -232,19 +287,45 @@ export function admitConcreteCodexModel(
 		account.custom_endpoint,
 		account.name,
 	);
+	const subscriptionEndpoint = isCodexSubscriptionEndpoint(resolvedEndpoint);
 	// Match CodexProvider.transformRequestBody's concrete wire contract. The
 	// ChatGPT subscription endpoint deletes max_output_tokens; API-compatible
 	// custom endpoints retain the sanitized Anthropic max_tokens value.
-	const outputReserveTokens = isCodexSubscriptionEndpoint(resolvedEndpoint)
+	const outputReserveTokens = subscriptionEndpoint
 		? 0
 		: tracker.requestedMaxOutputTokens;
+	const endpointClass = subscriptionEndpoint ? "subscription" : "custom";
 	const decision = decideContextAdmission({
 		inputTokens: tracker.inputTokens,
 		effectiveContextWindow,
 		requestedMaxOutputTokens: outputReserveTokens,
 		safetyReserveTokens: 0,
 	});
-	if (decision.status !== "reject") return true;
+	if (decision.status !== "reject") {
+		logContextAdmissionDecision({
+			account,
+			model,
+			endpointClass,
+			tracker,
+			decision,
+			outcome: "admit",
+		});
+		return true;
+	}
+	// A low-confidence estimate is useful for ordering and telemetry, but it is
+	// not a safe local rejection bound. Defer ambiguous capacity decisions to
+	// the concrete provider, which can return an authoritative context error.
+	if (tracker.estimateConfidence === "low") {
+		logContextAdmissionDecision({
+			account,
+			model,
+			endpointClass,
+			tracker,
+			decision,
+			outcome: "defer_low_confidence",
+		});
+		return true;
+	}
 
 	const safeLimitTokens = decision.safeLimitTokens ?? 0;
 	const shouldReplaceTerminalDecision =
@@ -257,13 +338,13 @@ export function admitConcreteCodexModel(
 		tracker.largestSafeLimit = safeLimitTokens;
 		tracker.terminalOccupiedTokens = decision.occupiedTokens;
 	}
-	log.info("Codex context admission rejected attempt", {
-		accountId: account.id,
+	logContextAdmissionDecision({
+		account,
 		model,
+		endpointClass,
+		tracker,
+		decision,
 		outcome: "capacity_rejected",
-		outputReserveTokens: decision.outputReserveTokens,
-		occupiedTokens: decision.occupiedTokens,
-		safeLimitTokens: decision.safeLimitTokens,
 	});
 	return false;
 }
@@ -278,6 +359,26 @@ function getConcreteCodexModelList(
 	}
 	return configuredModels.map((model) =>
 		resolveCodexRequestModel(model, account),
+	);
+}
+
+function isKnownLargerCodexCandidate(
+	currentModel: string,
+	candidateModel: string,
+): boolean {
+	const currentCapability = resolveModelContextCapability(
+		"codex",
+		currentModel,
+	);
+	if (!currentCapability) return false;
+	const candidateCapability = resolveModelContextCapability(
+		"codex",
+		candidateModel,
+	);
+	return (
+		candidateCapability !== undefined &&
+		candidateCapability.effectiveContextWindow >
+			currentCapability.effectiveContextWindow
 	);
 }
 
@@ -1461,6 +1562,13 @@ export async function proxyWithAccount(
 		const admittedModelIndex = admission.model
 			? concreteCodexModels.indexOf(admission.model)
 			: -1;
+		const mayPlanCodexContextOverflowFallback =
+			usesCodexAdmissionPlan &&
+			attemptAdmissionTracker?.estimateConfidence === "low" &&
+			modelFallbackPolicy?.deferImplicitFallback !== undefined &&
+			modelFallbackPolicy.implicitFallbacksEnabled !== false &&
+			admission.model !== null;
+		let codexContextOverflowFallbackPlanned = false;
 		if (modelFallbackPolicy?.deferImplicitFallback) {
 			const discoveryModels =
 				modelFallbackPolicy.implicitFallbacksEnabled === false ||
@@ -1492,6 +1600,15 @@ export async function proxyWithAccount(
 					candidateModel,
 					deferredDiscoveryRank++,
 				);
+				if (
+					mayPlanCodexContextOverflowFallback &&
+					admission.model &&
+					isKnownLargerCodexCandidate(admission.model, candidateModel)
+				) {
+					// Set only after the request-level queue accepts this route (or
+					// de-duplicates it against the same route queued during admission).
+					codexContextOverflowFallbackPlanned = true;
+				}
 			}
 		} else {
 			implicitFallbackDiscoveryPossible = false;
@@ -3351,6 +3468,7 @@ export async function proxyWithAccount(
 						commitmentDeadlineAt: semanticCommitmentDeadlineAt,
 						terminalGraceMs: streamConfig.terminalGraceMs,
 						maxBufferedBytes: streamConfig.maxBufferedBytes,
+						failOnContextOverflow: codexContextOverflowFallbackPlanned,
 						signal: activeAttemptCommitment?.signal ?? routingSignal,
 					},
 				);
@@ -3376,6 +3494,24 @@ export async function proxyWithAccount(
 					throw error;
 				}
 				if (!(error instanceof AnthropicPreCommitStallError)) throw error;
+				if (
+					error.reason === "context_length_exceeded" &&
+					codexContextOverflowFallbackPlanned
+				) {
+					log.info("codex_context_overflow_fallback", {
+						requestId: requestMeta.id,
+						accountId: account.id,
+						attemptedModel: currentTransportModel,
+						bufferedBytes: error.bufferedBytes,
+						framesSeen: error.framesSeen,
+					});
+					// The larger model was already queued by deferImplicitFallback.
+					// Codex records the terminal trace before emitting this downstream
+					// error frame; the gate's one-shot reader cancellation then propagates
+					// through the transformed stream to the raw upstream reader. This is
+					// request/model capacity, not unhealthy account evidence.
+					return null;
+				}
 				const isZeroMeaningfulCodexStall =
 					error.errorType === undefined &&
 					(error.reason === "semantic_timeout" ||
