@@ -4623,7 +4623,7 @@ describe("CodexProvider.transformRequestBody", () => {
 			// BUG (documented, not fixed here): the demotion diagnostics confirm
 			// this was a session that already had an elected root.
 			expect(requestTrace).toMatchObject({
-				trace_schema_version: 9,
+				trace_schema_version: 10,
 				orchestration_admission: "non_root",
 				orchestration_demotion_observed: true,
 			});
@@ -4753,7 +4753,7 @@ describe("CodexProvider.transformRequestBody", () => {
 				(record) => record.phase === "request",
 			);
 			expect(requestTrace).toMatchObject({
-				trace_schema_version: 9,
+				trace_schema_version: 10,
 				orchestration_admission: "no_session",
 				is_descendant: true,
 				tools_before_count: 3,

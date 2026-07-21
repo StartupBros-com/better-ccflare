@@ -16,13 +16,19 @@ export { BedrockProvider, parseBedrockConfig } from "./bedrock/index";
 export type { CodexUsageRefreshFetchResult } from "./codex/index";
 export {
 	CODEX_DEFAULT_ENDPOINT,
+	CODEX_EXPLICIT_CACHE_BREAKPOINT_PERCENT_ENV,
 	CodexOAuthProvider,
 	CodexProvider,
+	deriveCodexExplicitBreakpointBucket,
 	fetchCodexUsageOnDemand,
+	isCodexExplicitCacheBreakpointSuppressed,
 	isCodexSubscriptionEndpoint,
 	parseCodexUsageHeaders,
+	readCodexExplicitCacheBreakpointPercent,
+	resetCodexExplicitBreakpointSuppressionsForTest,
 	resolveCodexEndpoint,
 	resolveCodexRequestModel,
+	suppressCodexExplicitCacheBreakpoint,
 } from "./codex/index";
 export { KiloProvider } from "./kilo/index";
 export { MinimaxProvider } from "./minimax/index";

@@ -20,6 +20,7 @@ import {
 	resolveCodexEndpoint,
 	resolveCodexRequestModel,
 	resolveModelContextCapability,
+	suppressCodexExplicitCacheBreakpoint,
 	usageCache,
 } from "@better-ccflare/providers";
 import type {
@@ -923,6 +924,67 @@ async function isCacheControlRejectionError(
 }
 
 /**
+ * Match only a JSON 400 that explicitly rejects the experimental OpenAI
+ * breakpoint field. Generic validation failures must not consume a replay.
+ */
+async function isCodexExplicitCacheBreakpointRejectionError(
+	response: Response,
+	transformedRequestHadMarker: boolean,
+	readJson: ResponseJsonReader = readResponseCloneJson,
+): Promise<boolean> {
+	if (!transformedRequestHadMarker || response.status !== 400) return false;
+	const contentType = response.headers.get("content-type");
+	if (!contentType?.includes("application/json")) return false;
+	const json = (await readJson(response)) as {
+		error?: { message?: unknown; param?: unknown };
+		message?: unknown;
+	} | null;
+	const candidate = [json?.error?.message, json?.error?.param, json?.message]
+		.filter((value): value is string => typeof value === "string")
+		.join(" ")
+		.toLowerCase();
+	if (
+		!candidate.includes("prompt_cache_breakpoint") &&
+		!candidate.includes("prompt_cache_options")
+	) {
+		return false;
+	}
+	return (
+		candidate.includes("unknown") ||
+		candidate.includes("unsupported") ||
+		candidate.includes("not supported") ||
+		candidate.includes("extra input") ||
+		candidate.includes("invalid")
+	);
+}
+
+function hasCodexExplicitCacheBreakpoint(body: unknown): boolean {
+	if (!body || typeof body !== "object") return false;
+	const input = (body as Record<string, unknown>).input;
+	if (!Array.isArray(input)) return false;
+	for (const item of input) {
+		if (!item || typeof item !== "object") continue;
+		const content = (item as Record<string, unknown>).content;
+		if (!Array.isArray(content)) continue;
+		for (const block of content) {
+			if (!block || typeof block !== "object") continue;
+			if (!Object.hasOwn(block, "prompt_cache_breakpoint")) {
+				continue;
+			}
+			const marker = (block as Record<string, unknown>).prompt_cache_breakpoint;
+			if (
+				marker &&
+				typeof marker === "object" &&
+				(marker as Record<string, unknown>).mode === "explicit"
+			) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+/**
  * Checks if a response error indicates the requested model is unavailable.
  * Covers Anthropic (not_found_error), OpenAI-compat (model_not_found),
  * generic messages, and Bedrock (ResourceNotFoundException).
@@ -1736,6 +1798,7 @@ export async function proxyWithAccount(
 				| "overload_529"
 				| "thinking_retry"
 				| "cache_control_retry"
+				| "prompt_cache_breakpoint_retry"
 				| "cache_lane_rescue"
 				| "precommit_sse_retry"
 				| "account_failover"
@@ -1803,6 +1866,7 @@ export async function proxyWithAccount(
 		stampCodexAttempt(
 			headers,
 			transportAttemptOrdinal > 0 ? "account_failover" : "initial",
+			replayResolvedModel ?? undefined,
 		);
 		// Synthetic-response markers are internal provider-to-proxy signals. Strip
 		// client-supplied copies before providers transform the outbound request.
@@ -2223,6 +2287,79 @@ export async function proxyWithAccount(
 			} else {
 				log.warn(
 					"No clear_thinking context edits to strip or filtering failed, proceeding with original error response",
+				);
+			}
+		}
+
+		// GPT-5.6 explicit breakpoints are a dark canary on the private Codex
+		// subscription route as well as the documented public Responses route. If
+		// that exact field is rejected, always learn the account/model/endpoint
+		// capability. Only a pre-content attempt may transparently retry the
+		// unchanged normalized source once; a post-frame rejection must flow through
+		// without replay while future turns skip the known-unsupported marker.
+		const transformedRequestHadExplicitBreakpoint =
+			hasCodexExplicitCacheBreakpoint(transformedBodyJson);
+		const explicitBreakpointRejection =
+			provider.name === "codex" &&
+			(await isCodexExplicitCacheBreakpointRejectionError(
+				rawResponse,
+				transformedRequestHadExplicitBreakpoint,
+				readAttemptBoundJson,
+			));
+		if (explicitBreakpointRejection) {
+			suppressCodexExplicitCacheBreakpoint(
+				account.id,
+				transformedModel,
+				transformedRequest.url,
+			);
+			const transformRequestBody =
+				provider.transformRequestBody?.bind(provider);
+			const replayBody = currentReplayBody;
+			if (
+				transformRequestBody !== undefined &&
+				replayBody !== null &&
+				!getCurrentCodexWebSocketReceipt()?.frameWritten
+			) {
+				log.info(
+					`Codex rejected prompt_cache_breakpoint for account=${account.name} model=${transformedModel}; retrying once without it`,
+				);
+				await finalizeCurrentCodexTransport(rawResponse);
+				await discardUpstreamBody(rawResponse);
+				const retryHeaders = new Headers(providerRequest.headers);
+				stampCodexAttempt(
+					retryHeaders,
+					"prompt_cache_breakpoint_retry",
+					currentTransportModel ?? undefined,
+				);
+				const retrySource = new Request(providerRequest.url, {
+					method: providerRequest.method,
+					headers: retryHeaders,
+					body: new Uint8Array(replayBody),
+				});
+				retrySourceRequest = retrySource.clone();
+				let retryTransformed = await transformRequestBody(retrySource, account);
+				retryTransformed = await enforcePhysicalModelAfterTransform(
+					retryTransformed,
+					currentTransportModel,
+				);
+				// Materialize two independent requests. Reusing nested clone branches here
+				// can leave Bun waiting on tee bookkeeping after the compatibility probe.
+				const retryTransformedBody = await retryTransformed.text();
+				retryTransformedTemplate = new Request(retryTransformed.url, {
+					method: retryTransformed.method,
+					headers: retryTransformed.headers,
+					body: retryTransformedBody,
+				});
+				const retryTransport = new Request(retryTransformed.url, {
+					method: retryTransformed.method,
+					headers: sanitizeInternalHeaders(retryTransformed.headers),
+					body: retryTransformedBody,
+				});
+				rawResponse = await executeCacheAwareProviderAttempt(
+					retryTransport,
+					replayBody,
+					currentCacheIdentityHasCacheControl,
+					currentTransportModel,
 				);
 			}
 		}
