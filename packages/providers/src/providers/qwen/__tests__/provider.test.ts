@@ -3,6 +3,82 @@ import type { OpenAIRequest } from "@better-ccflare/openai-formats";
 import type { Account } from "@better-ccflare/types";
 import { QwenProvider } from "../provider";
 
+type CacheControl = { type: string };
+type CacheableTool = NonNullable<OpenAIRequest["tools"]>[number] & {
+	cache_control?: CacheControl;
+};
+
+function countEphemeralCacheMarkers(body: OpenAIRequest): number {
+	let count = 0;
+	for (const message of body.messages) {
+		if (!Array.isArray(message.content)) continue;
+		for (const part of message.content) {
+			if (part.cache_control?.type === "ephemeral") count += 1;
+		}
+	}
+	for (const tool of (body.tools ?? []) as CacheableTool[]) {
+		if (tool.cache_control?.type === "ephemeral") count += 1;
+	}
+	return count;
+}
+
+function makeOverBudgetCacheRequest(): OpenAIRequest {
+	return {
+		model: "coder-model",
+		stream: true,
+		messages: [
+			{
+				role: "system",
+				content: [
+					{
+						type: "text",
+						text: "Inherited stable boundary",
+						cache_control: { type: "ephemeral" },
+					},
+					{ type: "text", text: "Canonical system boundary" },
+				],
+			},
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "text",
+						text: "Inherited response boundary one",
+						cache_control: { type: "ephemeral" },
+					},
+					{
+						type: "text",
+						text: "Inherited response boundary two",
+						cache_control: { type: "ephemeral" },
+					},
+				],
+			},
+			{
+				role: "user",
+				content: [
+					{
+						type: "text",
+						text: "Inherited latest boundary",
+						cache_control: { type: "ephemeral" },
+					},
+					{ type: "text", text: "Canonical latest boundary" },
+				],
+			},
+		],
+		tools: [
+			{
+				type: "function",
+				function: { name: "inherited_tool" },
+				cache_control: { type: "ephemeral" },
+			} as CacheableTool,
+			{
+				type: "function",
+				function: { name: "canonical_tool" },
+			},
+		],
+	};
+}
+
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
@@ -471,10 +547,10 @@ describe("QwenProvider", () => {
 		});
 
 		// -----------------------------------------------------------------------
-		// i) Leaves string system content alone
+		// i) Marks string system content for DashScope caching
 		// -----------------------------------------------------------------------
-		describe("leaves string system content unchanged", () => {
-			it("does not modify string system content", () => {
+		describe("marks string system content", () => {
+			it("normalizes the first string system message and marks its final block", () => {
 				const body: OpenAIRequest = {
 					model: "coder-model",
 					messages: [
@@ -483,7 +559,13 @@ describe("QwenProvider", () => {
 					],
 				};
 				provider.afterConvert(body);
-				expect(body.messages[0].content).toBe("You are a helpful assistant.");
+				expect(body.messages[0].content).toEqual([
+					{
+						type: "text",
+						text: "You are a helpful assistant.",
+						cache_control: { type: "ephemeral" },
+					},
+				]);
 			});
 		});
 
@@ -567,6 +649,450 @@ describe("QwenProvider", () => {
 					"To report a bug or provide feedback, please use the /bug command",
 				);
 				expect(content[1].text).toContain("Get help with using Qwen Code");
+			});
+		});
+
+		// -----------------------------------------------------------------------
+		// GLM tool-less request guard (mirrors Qwen Code's DashScope provider)
+		// -----------------------------------------------------------------------
+		describe("handles tool-less GLM requests", () => {
+			it("flattens text arrays and skips cache markers when non-streaming", () => {
+				const body: OpenAIRequest = {
+					model: "glm-5.2",
+					stream: false,
+					messages: [
+						{
+							role: "system",
+							content: [
+								{
+									type: "text",
+									text: "First system block",
+									cache_control: { type: "ephemeral" },
+								},
+								{ type: "text", text: "Second system block" },
+							],
+						},
+						{
+							role: "user",
+							content: [{ type: "text", text: "Summarize this page." }],
+						},
+					],
+				};
+
+				provider.afterConvert(body);
+
+				expect(body.messages[0].content).toBe(
+					"First system block\n\nSecond system block",
+				);
+				expect(body.messages[1].content).toBe("Summarize this page.");
+				expect(countEphemeralCacheMarkers(body)).toBe(0);
+			});
+
+			it("flattens the latest text array and skips markers when streaming", () => {
+				const body: OpenAIRequest = {
+					model: "GLM-4.7",
+					stream: true,
+					messages: [
+						{ role: "system", content: "System prompt" },
+						{
+							role: "user",
+							content: [
+								{ type: "text", text: "First prompt block" },
+								{ type: "text", text: "Second prompt block" },
+							],
+						},
+					],
+				};
+
+				provider.afterConvert(body);
+
+				expect(body.messages[0].content).toBe("System prompt");
+				expect(body.messages[1].content).toBe(
+					"First prompt block\n\nSecond prompt block",
+				);
+				expect(countEphemeralCacheMarkers(body)).toBe(0);
+			});
+
+			it("leaves media arrays structured but removes inherited markers", () => {
+				const body: OpenAIRequest = {
+					model: "glm-5.2",
+					stream: true,
+					messages: [
+						{
+							role: "user",
+							content: [
+								{
+									type: "text",
+									text: "What is this?",
+									cache_control: { type: "ephemeral" },
+								},
+								{ type: "image_url" },
+							],
+						},
+					],
+				};
+
+				provider.afterConvert(body);
+
+				expect(body.messages[0].content).toEqual([
+					{ type: "text", text: "What is this?" },
+					{ type: "image_url" },
+				]);
+				expect(countEphemeralCacheMarkers(body)).toBe(0);
+			});
+
+			it.each([
+				{
+					name: "declares tools",
+					extraMessages: [],
+					tools: [
+						{
+							type: "function" as const,
+							function: { name: "noop" },
+						},
+					],
+				},
+				{
+					name: "has assistant tool calls",
+					extraMessages: [
+						{
+							role: "assistant" as const,
+							content: null,
+							tool_calls: [
+								{
+									id: "call-1",
+									type: "function" as const,
+									function: { name: "noop", arguments: "{}" },
+								},
+							],
+						},
+					],
+				},
+				{
+					name: "has tool-result history",
+					extraMessages: [
+						{
+							role: "tool" as const,
+							content: "result",
+							tool_call_id: "call-1",
+						},
+					],
+				},
+			])("keeps structured content when it $name", ({
+				extraMessages,
+				tools,
+			}) => {
+				const body: OpenAIRequest = {
+					model: "glm-5.2",
+					stream: false,
+					messages: [
+						{ role: "system", content: "System prompt" },
+						...extraMessages,
+						{
+							role: "user",
+							content: [{ type: "text", text: "Keep this structured" }],
+						},
+					],
+					...(tools ? { tools } : {}),
+				};
+
+				provider.afterConvert(body);
+
+				expect(Array.isArray(body.messages[0].content)).toBe(true);
+				expect(Array.isArray(body.messages.at(-1)?.content)).toBe(true);
+				expect(countEphemeralCacheMarkers(body)).toBeGreaterThan(0);
+			});
+		});
+
+		// -----------------------------------------------------------------------
+		// Cache marker placement (mirrors Qwen Code's DashScope provider)
+		// -----------------------------------------------------------------------
+		describe("places DashScope cache markers", () => {
+			it("marks only the first system message for a non-streaming request", () => {
+				const tools: CacheableTool[] = [
+					{
+						type: "function",
+						function: { name: "first" },
+					},
+					{
+						type: "function",
+						function: { name: "last" },
+					},
+				];
+				const body: OpenAIRequest = {
+					model: "coder-model",
+					stream: false,
+					messages: [
+						{ role: "system", content: "First system" },
+						{ role: "system", content: "Second system" },
+						{ role: "user", content: "Latest message" },
+					],
+					tools,
+				};
+
+				provider.afterConvert(body);
+
+				expect(body.messages[0].content).toEqual([
+					{
+						type: "text",
+						text: "First system",
+						cache_control: { type: "ephemeral" },
+					},
+				]);
+				expect(body.messages[1].content).toBe("Second system");
+				expect(body.messages[2].content).toBe("Latest message");
+				expect(tools[0].cache_control).toBeUndefined();
+				expect(tools[1].cache_control).toBeUndefined();
+			});
+
+			it("also marks the latest message's final content block when streaming", () => {
+				const priorContent = [{ type: "text", text: "Prior response" }];
+				const firstLatestBlock = { type: "text", text: "Latest prompt" };
+				const finalLatestBlock = { type: "image_url" };
+				const body: OpenAIRequest = {
+					model: "coder-model",
+					stream: true,
+					messages: [
+						{
+							role: "system",
+							content: [
+								{ type: "text", text: "Stable prefix" },
+								{ type: "text", text: "System boundary" },
+							],
+						},
+						{ role: "assistant", content: priorContent },
+						{
+							role: "user",
+							content: [firstLatestBlock, finalLatestBlock],
+						},
+					],
+				};
+
+				provider.afterConvert(body);
+
+				const systemContent = body.messages[0].content;
+				expect(Array.isArray(systemContent)).toBe(true);
+				if (!Array.isArray(systemContent)) throw new Error("expected blocks");
+				expect(systemContent[0].cache_control).toBeUndefined();
+				expect(systemContent[1].cache_control).toEqual({ type: "ephemeral" });
+				expect(body.messages[1].content).toBe(priorContent);
+
+				const latestContent = body.messages[2].content;
+				expect(Array.isArray(latestContent)).toBe(true);
+				if (!Array.isArray(latestContent)) throw new Error("expected blocks");
+				expect(latestContent[0]).toBe(firstLatestBlock);
+				expect(latestContent[1]).toEqual({
+					type: "image_url",
+					cache_control: { type: "ephemeral" },
+				});
+				expect(finalLatestBlock).toEqual({ type: "image_url" });
+			});
+
+			it("marks only the final tool definition when streaming", () => {
+				const firstTool: CacheableTool = {
+					type: "function",
+					function: { name: "first" },
+				};
+				const finalTool: CacheableTool = {
+					type: "function",
+					function: { name: "final" },
+				};
+				const body: OpenAIRequest = {
+					model: "coder-model",
+					stream: true,
+					messages: [{ role: "user", content: "Run a tool" }],
+					tools: [firstTool, finalTool],
+				};
+
+				provider.afterConvert(body);
+
+				const tools = body.tools as CacheableTool[];
+				expect(tools[0]).toBe(firstTool);
+				expect(tools[0].cache_control).toBeUndefined();
+				expect(tools[1]).not.toBe(finalTool);
+				expect(tools[1]).toEqual({
+					type: "function",
+					function: { name: "final" },
+					cache_control: { type: "ephemeral" },
+				});
+				expect(finalTool.cache_control).toBeUndefined();
+			});
+
+			it("places the system marker after sanitization on the final surviving block", () => {
+				const body = makeOpenAIRequest([
+					{ type: "text", text: "x-anthropic-billing: remove me" },
+					{
+						type: "text",
+						text: "You are Claude Code, Anthropic's official CLI for Claude.",
+					},
+					{ type: "text", text: "Read CLAUDE.md before acting." },
+				]);
+
+				provider.afterConvert(body);
+
+				const content = body.messages[0].content;
+				expect(Array.isArray(content)).toBe(true);
+				if (!Array.isArray(content)) throw new Error("expected blocks");
+				expect(content).toHaveLength(2);
+				expect(content[0]).toEqual({
+					type: "text",
+					text: "You are Qwen Code, an interactive CLI agent developed by Alibaba Group, specializing in software engineering tasks.",
+				});
+				expect(content[1]).toEqual({
+					type: "text",
+					text: "Read QWEN.md before acting.",
+					cache_control: { type: "ephemeral" },
+				});
+			});
+
+			it("preserves valid markers and is idempotent", () => {
+				const systemCacheControl = { type: "ephemeral" };
+				const existingToolCacheControl = { type: "ephemeral" };
+				const tools: CacheableTool[] = [
+					{
+						type: "function",
+						function: { name: "already-cached" },
+						cache_control: existingToolCacheControl,
+					},
+					{
+						type: "function",
+						function: { name: "new-boundary" },
+					},
+				];
+				const body: OpenAIRequest = {
+					model: "coder-model",
+					stream: true,
+					messages: [
+						{
+							role: "system",
+							content: [
+								{
+									type: "text",
+									text: "Stable system",
+									cache_control: systemCacheControl,
+								},
+							],
+						},
+						{
+							role: "user",
+							content: [
+								{
+									type: "text",
+									text: "Latest prompt",
+								},
+							],
+						},
+					],
+					tools,
+				};
+
+				provider.afterConvert(body);
+				const latestContentAfterFirstPass = body.messages[1].content;
+				const toolsAfterFirstPass = body.tools as CacheableTool[];
+				expect(Array.isArray(latestContentAfterFirstPass)).toBe(true);
+				if (!Array.isArray(latestContentAfterFirstPass)) {
+					throw new Error("expected blocks");
+				}
+				expect(latestContentAfterFirstPass[0].cache_control).toEqual({
+					type: "ephemeral",
+				});
+				expect(toolsAfterFirstPass[1].cache_control).toEqual({
+					type: "ephemeral",
+				});
+				const latestBoundaryAfterFirstPass = latestContentAfterFirstPass[0];
+				const finalToolAfterFirstPass = toolsAfterFirstPass[1];
+				const afterFirstPass = structuredClone(body);
+				provider.afterConvert(body);
+
+				expect(body).toEqual(afterFirstPass);
+				const systemContent = body.messages[0].content;
+				const latestContent = body.messages[1].content;
+				expect(Array.isArray(systemContent)).toBe(true);
+				expect(Array.isArray(latestContent)).toBe(true);
+				if (!Array.isArray(systemContent) || !Array.isArray(latestContent)) {
+					throw new Error("expected blocks");
+				}
+				expect(systemContent[0].cache_control).toBe(systemCacheControl);
+				expect(latestContent[0]).toBe(latestBoundaryAfterFirstPass);
+				const finalTools = body.tools as CacheableTool[];
+				expect(finalTools[0].cache_control).toBe(existingToolCacheControl);
+				expect(finalTools[1]).toBe(finalToolAfterFirstPass);
+			});
+
+			it("skips empty and missing message content without inventing blocks", () => {
+				const body: OpenAIRequest = {
+					model: "coder-model",
+					stream: true,
+					messages: [
+						{ role: "system", content: "" },
+						{ role: "assistant", content: null },
+						{ role: "user", content: [] },
+					],
+					tools: [],
+				};
+
+				provider.afterConvert(body);
+
+				expect(body.messages[0].content).toBe("");
+				expect(body.messages[1].content).toBeNull();
+				expect(body.messages[2].content).toEqual([]);
+				expect(body.tools).toEqual([]);
+			});
+
+			it("does not double-mark a system-only streaming request", () => {
+				const body: OpenAIRequest = {
+					model: "coder-model",
+					stream: true,
+					messages: [{ role: "system", content: "Only system" }],
+				};
+
+				provider.afterConvert(body);
+
+				expect(body.messages[0].content).toEqual([
+					{
+						type: "text",
+						text: "Only system",
+						cache_control: { type: "ephemeral" },
+					},
+				]);
+			});
+
+			it("caps markers at four while reserving canonical boundaries", () => {
+				const body = makeOverBudgetCacheRequest();
+
+				provider.afterConvert(body);
+
+				expect(countEphemeralCacheMarkers(body)).toBe(4);
+				const system = body.messages[0].content;
+				const prior = body.messages[1].content;
+				const latest = body.messages[2].content;
+				if (
+					!Array.isArray(system) ||
+					!Array.isArray(prior) ||
+					!Array.isArray(latest)
+				) {
+					throw new Error("expected structured content");
+				}
+				expect(system[0].cache_control).toEqual({ type: "ephemeral" });
+				expect(system[1].cache_control).toEqual({ type: "ephemeral" });
+				expect(prior[0].cache_control).toBeUndefined();
+				expect(prior[1].cache_control).toBeUndefined();
+				expect(latest[0].cache_control).toBeUndefined();
+				expect(latest[1].cache_control).toEqual({ type: "ephemeral" });
+				const tools = body.tools as CacheableTool[];
+				expect(tools[0].cache_control).toBeUndefined();
+				expect(tools[1].cache_control).toEqual({ type: "ephemeral" });
+			});
+
+			it("is idempotent after pruning an over-budget request", () => {
+				const body = makeOverBudgetCacheRequest();
+
+				provider.afterConvert(body);
+				const afterFirstPass = structuredClone(body);
+				provider.afterConvert(body);
+
+				expect(body).toEqual(afterFirstPass);
+				expect(countEphemeralCacheMarkers(body)).toBe(4);
 			});
 		});
 	});
