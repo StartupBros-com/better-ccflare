@@ -118,6 +118,7 @@ describe("upstream response header sanitization (P1 spoofing defense)", () => {
 					headers: {
 						"content-type": "application/json",
 						"x-better-ccflare-pool-status": "exhausted",
+						"x-better-ccflare-recovery-scope": "model",
 					},
 				},
 			);
@@ -138,5 +139,6 @@ describe("upstream response header sanitization (P1 spoofing defense)", () => {
 		expect(fetchCalls).toBe(1);
 		expect(response.status).toBe(503);
 		expect(response.headers.has("x-better-ccflare-pool-status")).toBe(false);
+		expect(response.headers.has("x-better-ccflare-recovery-scope")).toBe(false);
 	});
 });

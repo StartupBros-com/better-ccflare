@@ -1,3 +1,8 @@
+import {
+	RECOVERY_SCOPE_HEADER,
+	RECOVERY_STATUS_HEADER,
+} from "@better-ccflare/types/routing-recovery";
+
 /** Private hop-by-hop request correlation installed by ccflare-guard. */
 export const GUARD_REQUEST_ID_HEADER =
 	"x-better-ccflare-guard-request-id" as const;
@@ -8,7 +13,8 @@ export const GUARD_REQUEST_ID_HEADER =
  * guard-trusted headers that must never originate from an upstream provider.
  *
  * Removes: content-encoding, content-length, transfer-encoding,
- * x-better-ccflare-pool-status, x-better-ccflare-guard-request-id
+ * x-better-ccflare-pool-status, x-better-ccflare-recovery-scope,
+ * x-better-ccflare-guard-request-id
  */
 export function sanitizeProxyHeaders(original: Headers): Headers {
 	const sanitized = new Headers(original);
@@ -25,7 +31,10 @@ export function sanitizeProxyHeaders(original: Headers): Headers {
 	// to the client: doing so would let a spoofed (or merely misconfigured)
 	// upstream force the guard into replaying a possibly non-idempotent
 	// request, or falsely deny an actual pool-exhaustion retry.
-	sanitized.delete("x-better-ccflare-pool-status");
+	sanitized.delete(RECOVERY_STATUS_HEADER);
+	// Scope is part of the same atomic trust contract. Never preserve it without
+	// the proxy's own synthesized marker and stable routing error code.
+	sanitized.delete(RECOVERY_SCOPE_HEADER);
 
 	// Defense in depth: the proxy does not intentionally put the guard's private
 	// request header on responses, and an upstream must not be able to introduce

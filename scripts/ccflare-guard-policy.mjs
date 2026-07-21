@@ -1,5 +1,14 @@
 export const DEFAULT_GUARD_POLICY_ID = "pool-exhaustion-finite-recovery-v1";
 
+// This file is copied beside the standalone production guard and therefore
+// cannot import workspace packages at runtime. Keep these compatibility
+// literals in parity with packages/types/src/routing-recovery.ts; policy tests
+// exercise both recognized scopes and reject every other value.
+export const RECOVERY_STATUS_HEADER = "x-better-ccflare-pool-status";
+export const RECOVERY_STATUS_EXHAUSTED = "exhausted";
+export const RECOVERY_SCOPE_HEADER = "x-better-ccflare-recovery-scope";
+export const RECOVERY_SCOPES = Object.freeze(["pool", "model"]);
+
 function headerValue(headers, name) {
 	if (typeof headers?.get === "function") return headers.get(name);
 	if (!headers || typeof headers !== "object") return null;
@@ -29,16 +38,24 @@ function parseFutureTimestampMs(value, nowMs) {
 export function parseRetryAfterMs(value, nowMs = Date.now()) {
 	if (typeof value !== "string" || value.trim() === "") return null;
 	const normalized = value.trim();
-	if (/^\d+$/.test(normalized)) {
+	if (/^[1-9]\d*$/.test(normalized)) {
 		const seconds = Number(normalized);
 		const delayMs = seconds * 1_000;
-		return Number.isFinite(delayMs) && delayMs > 0 ? delayMs : null;
+		return Number.isSafeInteger(seconds) && Number.isSafeInteger(delayMs)
+			? delayMs
+			: null;
 	}
 	return parseFutureTimestampMs(normalized, nowMs);
 }
 
 function noRetry(reason) {
-	return { retry: false, reason, delayMs: 0, recoverySource: null };
+	return {
+		retry: false,
+		reason,
+		delayMs: 0,
+		recoverySource: null,
+		recoveryScope: null,
+	};
 }
 
 function bodyConfirmsPoolExhausted(body) {
@@ -100,7 +117,7 @@ function collectDelayCandidates(headers, body, nowMs) {
 }
 
 /**
- * Classifies the proxy's stable x-better-ccflare-pool-status header for a
+ * Classifies the proxy's stable recovery marker and scope headers for a
  * response, independent of any body I/O (R17/P1). This is deliberately the
  * ONLY signal evaluated at header time: an oversized, stalled, or malformed
  * body must never cost a header-confirmed retry its authorization, and must
@@ -108,9 +125,9 @@ function collectDelayCandidates(headers, body, nowMs) {
  * from this result alone before touching the response body; the body may
  * only be consulted afterwards, as a bounded, best-effort delay hint.
  *
- * Returns:
- * - "confirmed": a 503 whose header explicitly says the whole pool is
- *   exhausted. Sufficient on its own to authorize a retry.
+ * Returns an object whose kind is:
+ * - "confirmed": a 503 whose marker authorizes finite recovery. The scope is
+ *   pool, model, or legacy for a marker emitted before scoped metadata existed.
  * - "denied": a 503 whose header is present but says something else (e.g.
  *   "available"). Never retryable, regardless of body.
  * - "absent": a 503 with no pool-status header at all, e.g. from an older,
@@ -118,21 +135,37 @@ function collectDelayCandidates(headers, body, nowMs) {
  *   rolling-upgrade policy (see allowLegacyBody on evaluateGuardRetry).
  * - "not_applicable": any non-503 status. Never retryable.
  */
-export function poolHeaderStatus({ status, headers }) {
-	if (status !== 503) return "not_applicable";
-	const poolStatus = headerValue(
-		headers,
-		"x-better-ccflare-pool-status",
-	)?.trim();
-	if (poolStatus === "exhausted") return "confirmed";
-	if (poolStatus == null || poolStatus === "") return "absent";
-	return "denied";
+export function recoveryHeaderStatus({ status, headers }) {
+	if (status !== 503) return { kind: "not_applicable", scope: null };
+	const recoveryStatus = headerValue(headers, RECOVERY_STATUS_HEADER)?.trim();
+	const rawScope = headerValue(headers, RECOVERY_SCOPE_HEADER)?.trim();
+	if (recoveryStatus == null || recoveryStatus === "") {
+		if (rawScope != null && rawScope !== "") {
+			return { kind: "denied", scope: null };
+		}
+		return { kind: "absent", scope: null };
+	}
+	if (recoveryStatus !== RECOVERY_STATUS_EXHAUSTED) {
+		return { kind: "denied", scope: null };
+	}
+	if (rawScope == null || rawScope === "") {
+		return { kind: "confirmed", scope: "legacy" };
+	}
+	if (!RECOVERY_SCOPES.includes(rawScope)) {
+		return { kind: "denied", scope: null };
+	}
+	return { kind: "confirmed", scope: rawScope };
+}
+
+/** Compatibility classifier retained for callers that only need the state. */
+export function poolHeaderStatus(input) {
+	return recoveryHeaderStatus(input).kind;
 }
 
 /**
- * The guard consumes the proxy's stable x-better-ccflare-pool-status:
- * exhausted header as the primary, sufficient whole-pool-exhaustion signal
- * (R17), evaluated at header time via poolHeaderStatus, before any body I/O.
+ * The guard consumes the proxy's stable recovery marker and scope as the
+ * primary, sufficient finite-recovery signal, evaluated at header time via
+ * recoveryHeaderStatus before any body I/O.
  * Bounded structured-body detection (already capped by the caller's 64 KiB
  * inspection limit) is only a TEMPORARY rolling-upgrade escape hatch for
  * when that header is absent, e.g. against an older proxy that has not yet
@@ -149,8 +182,7 @@ export function poolHeaderStatus({ status, headers }) {
  * resolution falls back to Retry-After, or to no delay at all, so the
  * guard's own bounded attempts/deadline own worst-case exposure. All other
  * responses are forwarded exactly once so model-scoped and provider-specific
- * errors remain visible to the caller and the router can own fallback
- * policy.
+ * errors remain visible to the caller and the router can own fallback policy.
  */
 export function evaluateGuardRetry({
 	status,
@@ -161,17 +193,14 @@ export function evaluateGuardRetry({
 }) {
 	if (status !== 503) return noRetry("status_not_retryable");
 
-	const poolStatus = headerValue(
-		headers,
-		"x-better-ccflare-pool-status",
-	)?.trim();
-	const headerConfirmed = poolStatus === "exhausted";
-	const headerAbsent = poolStatus == null || poolStatus === "";
+	const headerDecision = recoveryHeaderStatus({ status, headers });
+	const headerConfirmed = headerDecision.kind === "confirmed";
+	const headerAbsent = headerDecision.kind === "absent";
 
 	const body = parseJson(bodyText);
 
 	if (!headerConfirmed) {
-		if (!headerAbsent) return noRetry("pool_not_exhausted");
+		if (!headerAbsent) return noRetry("recovery_not_authorized");
 		if (!allowLegacyBody) return noRetry("header_absent_legacy_body_disabled");
 		if (!bodyConfirmsPoolExhausted(body)) {
 			return noRetry(body == null ? "malformed_body" : "not_pool_exhausted_terminal");
@@ -180,7 +209,13 @@ export function evaluateGuardRetry({
 
 	const candidates = collectDelayCandidates(headers, body, nowMs);
 	if (candidates.length === 0) {
-		return { retry: true, reason: "pool_exhausted", delayMs: 0, recoverySource: null };
+		return {
+			retry: true,
+			reason: "trusted_finite_recovery",
+			delayMs: 0,
+			recoverySource: null,
+			recoveryScope: headerConfirmed ? headerDecision.scope : "legacy",
+		};
 	}
 	const retryAfter = candidates.find(
 		(candidate) => candidate.source === "retry-after",
@@ -197,8 +232,9 @@ export function evaluateGuardRetry({
 				: earliestBody;
 	return {
 		retry: true,
-		reason: "pool_exhausted",
+		reason: "trusted_finite_recovery",
 		delayMs: recovery.delayMs,
 		recoverySource: recovery.source,
+		recoveryScope: headerConfirmed ? headerDecision.scope : "legacy",
 	};
 }

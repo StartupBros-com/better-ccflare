@@ -213,8 +213,10 @@ describe("handleProxy usage throttling", () => {
 
 		const response = await handleProxy(request, new URL(request.url), ctx);
 		expect(response.status).toBe(503);
-		expect(response.headers.get("retry-after")).toBeNull();
-		expect(response.headers.get("x-better-ccflare-pool-status")).toBeNull();
+		expect(response.headers.get("retry-after")).toBe("60");
+		expect(response.headers.get("x-better-ccflare-pool-status")).toBe(
+			"exhausted",
+		);
 		expect((await response.json()).error.code).toBe("model_pool_exhausted");
 	});
 
@@ -256,6 +258,10 @@ describe("handleProxy usage throttling", () => {
 			ctx.config.getUsageThrottlingWeeklyEnabled = () => false;
 			const response = await handleProxy(request, new URL(request.url), ctx);
 			expect(response.status).toBe(503);
+			expect(response.headers.get("retry-after")).toBe("60");
+			expect(response.headers.get("x-better-ccflare-pool-status")).toBe(
+				"exhausted",
+			);
 			expect((await response.json()).error.code).toBe("model_pool_exhausted");
 			expect(fetchMock).toHaveBeenCalledTimes(0);
 		} finally {

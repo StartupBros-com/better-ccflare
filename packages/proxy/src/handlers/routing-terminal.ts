@@ -3,6 +3,11 @@ import type {
 	RateLimitReason,
 	RouteCircuitRecoveryHint,
 } from "@better-ccflare/types";
+import {
+	RECOVERY_SCOPE_HEADER,
+	RECOVERY_STATUS_EXHAUSTED,
+	RECOVERY_STATUS_HEADER,
+} from "@better-ccflare/types/routing-recovery";
 import type { RoutingCapacityContext } from "./account-selector";
 import type { RequestRateLimitOutcome } from "./rate-limit-scope";
 
@@ -264,9 +269,19 @@ export function createModelPoolExhaustedResponse(options: {
 	if (nextAvailableAt !== null) {
 		error.next_available_at = new Date(nextAvailableAt).toISOString();
 	}
+	const headers = new Headers({ "content-type": "application/json" });
+	if (nextAvailableAt !== null) {
+		const retryAfterSeconds = Math.max(
+			1,
+			Math.ceil((nextAvailableAt - now) / 1000),
+		);
+		headers.set("retry-after", String(retryAfterSeconds));
+		headers.set(RECOVERY_STATUS_HEADER, RECOVERY_STATUS_EXHAUSTED);
+		headers.set(RECOVERY_SCOPE_HEADER, "model");
+	}
 	return new Response(JSON.stringify({ type: "error", error }), {
 		status: 503,
-		headers: { "content-type": "application/json" },
+		headers,
 	});
 }
 
@@ -312,7 +327,8 @@ function createPoolExhaustedResponse(options: {
 			headers: {
 				"content-type": "application/json",
 				"retry-after": String(retryAfterSeconds),
-				"x-better-ccflare-pool-status": "exhausted",
+				[RECOVERY_STATUS_HEADER]: RECOVERY_STATUS_EXHAUSTED,
+				[RECOVERY_SCOPE_HEADER]: "pool",
 			},
 		},
 	);
@@ -374,7 +390,7 @@ function createRouteUnavailableResponse(options: {
 
 /**
  * Build the terminal response from positively-known routing state. Retryable
- * whole-pool exhaustion is deliberately the narrow case; absent complete,
+ * pool- or model-scoped recovery is deliberately narrow; absent complete,
  * finite automatic recovery evidence, requests fail once as route_unavailable.
  */
 export function createRoutingTerminalResponse(

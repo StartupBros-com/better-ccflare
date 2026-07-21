@@ -1,10 +1,21 @@
 import { describe, expect, test } from "bun:test";
+import {
+	RECOVERY_SCOPE_HEADER as SHARED_RECOVERY_SCOPE_HEADER,
+	RECOVERY_SCOPES as SHARED_RECOVERY_SCOPES,
+	RECOVERY_STATUS_EXHAUSTED as SHARED_RECOVERY_STATUS_EXHAUSTED,
+	RECOVERY_STATUS_HEADER as SHARED_RECOVERY_STATUS_HEADER,
+} from "../../packages/types/src/routing-recovery";
 
 import {
 	DEFAULT_GUARD_POLICY_ID,
 	evaluateGuardRetry,
 	parseRetryAfterMs,
 	poolHeaderStatus,
+	RECOVERY_SCOPE_HEADER,
+	RECOVERY_SCOPES,
+	RECOVERY_STATUS_EXHAUSTED,
+	RECOVERY_STATUS_HEADER,
+	recoveryHeaderStatus,
 } from "../ccflare-guard-policy.mjs";
 
 const NOW = Date.parse("2026-07-17T12:00:00.000Z");
@@ -36,6 +47,15 @@ describe("guard retry policy identity", () => {
 	test("has a stable, source-controlled policy id", () => {
 		expect(DEFAULT_GUARD_POLICY_ID).toBe("pool-exhaustion-finite-recovery-v1");
 	});
+
+	test("keeps standalone policy literals in parity with the shared TypeScript contract", () => {
+		expect(RECOVERY_STATUS_HEADER).toBe(SHARED_RECOVERY_STATUS_HEADER);
+		expect(RECOVERY_STATUS_EXHAUSTED).toBe(
+			SHARED_RECOVERY_STATUS_EXHAUSTED,
+		);
+		expect(RECOVERY_SCOPE_HEADER).toBe(SHARED_RECOVERY_SCOPE_HEADER);
+		expect(RECOVERY_SCOPES).toEqual([...SHARED_RECOVERY_SCOPES]);
+	});
 });
 
 describe("parseRetryAfterMs", () => {
@@ -50,6 +70,8 @@ describe("parseRetryAfterMs", () => {
 		expect(parseRetryAfterMs("0", NOW)).toBeNull();
 		expect(parseRetryAfterMs("-1", NOW)).toBeNull();
 		expect(parseRetryAfterMs("2.5", NOW)).toBeNull();
+		expect(parseRetryAfterMs("01", NOW)).toBeNull();
+		expect(parseRetryAfterMs("9007199254741", NOW)).toBeNull();
 		expect(parseRetryAfterMs("later", NOW)).toBeNull();
 		expect(
 			parseRetryAfterMs("Fri, 17 Jul 2026 11:59:59 GMT", NOW),
@@ -95,7 +117,74 @@ describe("poolHeaderStatus", () => {
 	});
 });
 
+describe("recoveryHeaderStatus", () => {
+	test.each(["pool", "model"] as const)(
+		"confirms a trusted finite %s recovery scope",
+		(scope) => {
+			expect(
+				recoveryHeaderStatus({
+					status: 503,
+					headers: new Headers({
+						"x-better-ccflare-pool-status": "exhausted",
+						"x-better-ccflare-recovery-scope": scope,
+					}),
+				}),
+			).toEqual({ kind: "confirmed", scope });
+		},
+	);
+
+	test("keeps marker-only responses as explicit legacy compatibility", () => {
+		expect(
+			recoveryHeaderStatus({
+				status: 503,
+				headers: new Headers({
+					"x-better-ccflare-pool-status": "exhausted",
+				}),
+			}),
+		).toEqual({ kind: "confirmed", scope: "legacy" });
+	});
+
+	test("denies an unrecognized recovery scope instead of widening trust", () => {
+		expect(
+			recoveryHeaderStatus({
+				status: 503,
+				headers: new Headers({
+					"x-better-ccflare-pool-status": "exhausted",
+					"x-better-ccflare-recovery-scope": "provider",
+				}),
+			}),
+		).toEqual({ kind: "denied", scope: null });
+	});
+
+	test("denies a scope without its trusted status marker", () => {
+		expect(
+			recoveryHeaderStatus({
+				status: 503,
+				headers: new Headers({
+					"x-better-ccflare-recovery-scope": "model",
+				}),
+			}),
+		).toEqual({ kind: "denied", scope: null });
+	});
+});
+
 describe("evaluateGuardRetry", () => {
+	test("reports the trusted model recovery scope", () => {
+		const decision = evaluate({
+			headers: {
+				"x-better-ccflare-pool-status": "exhausted",
+				"x-better-ccflare-recovery-scope": "model",
+				"retry-after": "5",
+			},
+		});
+
+		expect(decision).toMatchObject({
+			retry: true,
+			reason: "trusted_finite_recovery",
+			recoveryScope: "model",
+		});
+	});
+
 	test("retries an explicitly exhausted whole pool with Retry-After", () => {
 		const decision = evaluate({
 			headers: {
@@ -106,7 +195,8 @@ describe("evaluateGuardRetry", () => {
 
 		expect(decision).toMatchObject({
 			retry: true,
-			reason: "pool_exhausted",
+			reason: "trusted_finite_recovery",
+			recoveryScope: "legacy",
 			delayMs: 5_000,
 			recoverySource: "retry-after",
 		});
@@ -181,7 +271,10 @@ describe("evaluateGuardRetry", () => {
 			headers: { "x-better-ccflare-pool-status": "exhausted" },
 			body: "not-json",
 		});
-		expect(decision).toMatchObject({ retry: true, reason: "pool_exhausted" });
+		expect(decision).toMatchObject({
+			retry: true,
+			reason: "trusted_finite_recovery",
+		});
 	});
 
 	test("a confirmed header retries even with no body at all", () => {
@@ -189,7 +282,10 @@ describe("evaluateGuardRetry", () => {
 			headers: { "x-better-ccflare-pool-status": "exhausted" },
 			body: "",
 		});
-		expect(decision).toMatchObject({ retry: true, reason: "pool_exhausted" });
+		expect(decision).toMatchObject({
+			retry: true,
+			reason: "trusted_finite_recovery",
+		});
 	});
 
 	test("a confirmed header retries even when the body disagrees, falling back to no delay", () => {
@@ -207,7 +303,7 @@ describe("evaluateGuardRetry", () => {
 		});
 		expect(decision).toMatchObject({
 			retry: true,
-			reason: "pool_exhausted",
+			reason: "trusted_finite_recovery",
 			delayMs: 0,
 			recoverySource: null,
 		});
@@ -221,7 +317,8 @@ describe("evaluateGuardRetry", () => {
 		});
 		expect(decision).toMatchObject({
 			retry: true,
-			reason: "pool_exhausted",
+			reason: "trusted_finite_recovery",
+			recoveryScope: "legacy",
 			delayMs: 5_000,
 			recoverySource: "retry-after",
 		});

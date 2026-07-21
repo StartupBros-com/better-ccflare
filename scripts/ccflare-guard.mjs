@@ -17,18 +17,20 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import {
 	DEFAULT_GUARD_POLICY_ID,
 	evaluateGuardRetry,
-	poolHeaderStatus,
+	recoveryHeaderStatus,
 } from "./ccflare-guard-policy.mjs";
 
 export const DEFAULT_GUARD_SOURCE_ID = "better-ccflare-source-guard-v1";
 export const DEFAULT_GUARD_MAX_ATTEMPTS = 3;
 export const DEFAULT_GUARD_TOTAL_DEADLINE_MS = 600_000;
 export const DEFAULT_GUARD_RETRY_ATTEMPT_HEADROOM_MS = 30_000;
+export const DEFAULT_GUARD_MAX_RECOVERY_SLEEP_MS = 120_000;
+export const MAX_GUARD_RECOVERY_SILENCE_MS = 120_000;
 export const DEFAULT_GUARD_RETRY_JITTER_MS = 2_000;
 export const DEFAULT_GUARD_MAX_INSPECTION_BYTES = 64 * 1_024;
 export const DEFAULT_GUARD_RESPONSE_IDLE_TIMEOUT_MS = 120_000;
-// P1 ordering: once the x-better-ccflare-pool-status header confirms whole-
-// pool exhaustion, retry is already authorized (see poolHeaderStatus). Any
+// P1 ordering: once the reserved marker confirms a trusted finite recovery,
+// retry is already authorized (see recoveryHeaderStatus). Any
 // further body read is purely a bounded, best-effort delay hint, capped
 // short so a stalled or slow body can never meaningfully erode the
 // request's overall deadline.
@@ -149,6 +151,15 @@ function configuredNumber(value, fallback) {
 	if (value == null || value === "") return fallback;
 	const parsed = Number(value);
 	return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function configuredBoundedInteger(value, fallback, { name, min, max }) {
+	if (value == null || value === "") return fallback;
+	const parsed = Number(value);
+	if (!Number.isSafeInteger(parsed) || parsed < min || parsed > max) {
+		throw new RangeError(`${name} must be an integer from ${min} through ${max}`);
+	}
+	return parsed;
 }
 
 function configuredBoolean(value, fallback) {
@@ -937,20 +948,42 @@ export function outcomeForStatus(status) {
 	return status >= 200 && status < 300 ? "success" : "final_error";
 }
 
-function planRetryDelay({
+export function planRecoveryAction({
 	recoveryDelayMs,
+	elapsedMs,
 	remainingMs,
 	retryAttemptHeadroomMs,
+	recoverySilenceBudgetMs,
 	jitterMs,
 	random,
 }) {
-	const availableDelayMs = remainingMs - retryAttemptHeadroomMs;
-	if (availableDelayMs < 0 || recoveryDelayMs > availableDelayMs) return null;
-	const requestedJitter = Math.max(0, Math.floor(random() * jitterMs));
-	return (
-		recoveryDelayMs +
-		Math.min(requestedJitter, availableDelayMs - recoveryDelayMs)
+	if (!Number.isFinite(recoveryDelayMs) || recoveryDelayMs < 0) {
+		return { kind: "forward", reason: "recovery_delay_invalid" };
+	}
+	const silenceRemainingMs = recoverySilenceBudgetMs - elapsedMs;
+	const deadlineDelayBudgetMs = remainingMs - retryAttemptHeadroomMs;
+	const silenceDelayBudgetMs = silenceRemainingMs - retryAttemptHeadroomMs;
+	if (silenceDelayBudgetMs < 0 || recoveryDelayMs > silenceDelayBudgetMs) {
+		return {
+			kind: "forward",
+			reason: "recovery_silence_budget_exceeded",
+		};
+	}
+	if (deadlineDelayBudgetMs < 0 || recoveryDelayMs > deadlineDelayBudgetMs) {
+		return { kind: "forward", reason: "recovery_beyond_deadline" };
+	}
+	const availableDelayMs = Math.min(
+		deadlineDelayBudgetMs,
+		silenceDelayBudgetMs,
 	);
+	const requestedJitter = Math.max(0, Math.floor(random() * jitterMs));
+	return {
+		kind: "retry",
+		availableDelayMs,
+		delayMs:
+			recoveryDelayMs +
+			Math.min(requestedJitter, availableDelayMs - recoveryDelayMs),
+	};
 }
 
 export function createGuard(options = {}) {
@@ -975,6 +1008,15 @@ export function createGuard(options = {}) {
 			configuredNumber(options.maxQueue ?? env.GUARD_MAX_QUEUE, 500),
 		),
 	);
+	const maxRecoveryWaits = configuredBoundedInteger(
+		options.maxRecoveryWaits ?? env.GUARD_MAX_RECOVERY_WAITS,
+		maxActive,
+		{
+			name: "GUARD_MAX_RECOVERY_WAITS",
+			min: 1,
+			max: 1_000_000,
+		},
+	);
 	const totalDeadlineMs = Math.max(
 		1,
 		configuredNumber(
@@ -994,6 +1036,15 @@ export function createGuard(options = {}) {
 				DEFAULT_GUARD_RETRY_ATTEMPT_HEADROOM_MS,
 			),
 		),
+	);
+	const maxRecoverySleepMs = configuredBoundedInteger(
+		options.maxRecoverySleepMs ?? env.GUARD_MAX_RECOVERY_SLEEP_MS,
+		DEFAULT_GUARD_MAX_RECOVERY_SLEEP_MS,
+		{
+			name: "GUARD_MAX_RECOVERY_SLEEP_MS",
+			min: 1,
+			max: MAX_GUARD_RECOVERY_SILENCE_MS,
+		},
 	);
 	const maxAttempts = Math.max(
 		1,
@@ -1077,6 +1128,14 @@ export function createGuard(options = {}) {
 		aborted: 0,
 		deadlineExceeded: 0,
 		recoveryBeyondDeadline: 0,
+		recoverySleepCapExceeded: 0,
+		recoverySilenceBudgetExceeded: 0,
+		recoveryWaitCapacityFull: 0,
+		recoveryWaitAdmitted: 0,
+		recoveryWaitReleased: 0,
+		recoveryByScope: { pool: 0, model: 0, legacy: 0 },
+		recoveryWaitAdmittedByScope: { pool: 0, model: 0, legacy: 0 },
+		recoveryWaitRejectedByScope: { pool: 0, model: 0, legacy: 0 },
 		attemptsExhausted: 0,
 		oversizedInspectionBodies: 0,
 		responseBodyIdleTimeouts: 0,
@@ -1087,6 +1146,8 @@ export function createGuard(options = {}) {
 		finalError: 0,
 	};
 	let active = 0;
+	let activeRecoveryWaits = 0;
+	let peakRecoveryWaits = 0;
 	let draining = false;
 	const queue = [];
 
@@ -1097,6 +1158,7 @@ export function createGuard(options = {}) {
 				event,
 				active,
 				queue: queue.length,
+				recoveryWaits: activeRecoveryWaits,
 				sourceId,
 				policyId,
 				...data,
@@ -1172,6 +1234,36 @@ export function createGuard(options = {}) {
 			}
 			queue.push(entry);
 		});
+	}
+
+	function recoveryScopeKey(scope) {
+		return scope === "pool" || scope === "model" ? scope : "legacy";
+	}
+
+	function recordTrustedRecovery(scope) {
+		counters.recoveryByScope[recoveryScopeKey(scope)] += 1;
+	}
+
+	function tryAcquireRecoveryWait(scope) {
+		const key = recoveryScopeKey(scope);
+		if (activeRecoveryWaits >= maxRecoveryWaits) {
+			counters.recoveryWaitCapacityFull += 1;
+			counters.recoveryWaitRejectedByScope[key] += 1;
+			return null;
+		}
+		activeRecoveryWaits += 1;
+		peakRecoveryWaits = Math.max(peakRecoveryWaits, activeRecoveryWaits);
+		counters.recoveryWaitAdmitted += 1;
+		counters.recoveryWaitAdmittedByScope[key] += 1;
+		let released = false;
+		return {
+			release() {
+				if (released) return;
+				released = true;
+				activeRecoveryWaits = Math.max(0, activeRecoveryWaits - 1);
+				counters.recoveryWaitReleased += 1;
+			},
+		};
 	}
 
 	function sleep(ms, signal) {
@@ -1399,7 +1491,7 @@ export function createGuard(options = {}) {
 		);
 	}
 
-	async function forwardRecoveryBeyondDeadline(
+	async function forwardRecoveryWithoutRetry(
 		res,
 		context,
 		attempt,
@@ -1410,6 +1502,7 @@ export function createGuard(options = {}) {
 			recoveryDelayMs,
 			recoverySource,
 			remainingMs,
+			reason,
 		},
 	) {
 		if (inspection?.oversized || inspection?.incomplete) {
@@ -1435,18 +1528,33 @@ export function createGuard(options = {}) {
 				context.beginResponse,
 			);
 		}
-		counters.recoveryBeyondDeadline += 1;
+		switch (reason) {
+			case "recovery_silence_budget_exceeded":
+				counters.recoverySilenceBudgetExceeded += 1;
+				// Compatibility counter retained for existing dashboards.
+				counters.recoverySleepCapExceeded += 1;
+				break;
+			case "recovery_beyond_deadline":
+				counters.recoveryBeyondDeadline += 1;
+				break;
+			case "recovery_wait_capacity_full":
+			case "recovery_delay_invalid":
+				break;
+			default:
+				throw new Error(`unknown recovery forward reason: ${reason}`);
+		}
 		counters.finalError += 1;
 		log("proxy_final_error", {
 			id: context.id,
 			attempt,
 			status: upstreamResponse.status,
 			outcome: outcomeForStatus(upstreamResponse.status),
-			reason: "recovery_beyond_deadline",
+			reason,
 			recoverySource,
 			recoveryDelayMs,
 			remainingMs,
 			retryAttemptHeadroomMs,
+			maxRecoverySleepMs,
 			elapsedMs: now() - context.acceptedAt,
 		});
 	}
@@ -1505,7 +1613,7 @@ export function createGuard(options = {}) {
 					throw error;
 				}
 
-				// Only a 503 can satisfy the narrow whole-pool policy. Every other
+				// Only a 503 can satisfy the narrow trusted finite-recovery policy. Every other
 				// status, including raw 402/429/529 and generic 5xx, is streamed
 				// through without buffering or a second upstream request. R21/P2:
 				// the outcome is counted and logged only after the send actually
@@ -1555,10 +1663,11 @@ export function createGuard(options = {}) {
 				// header-absent body must never silently grant one unless the
 				// operator has explicitly opted into the legacy fallback
 				// (spoofing).
-				const headerStatus = poolHeaderStatus({
+				const headerDecision = recoveryHeaderStatus({
 					status: upstreamResponse.status,
 					headers: upstreamResponse.headers,
 				});
+				const headerStatus = headerDecision.kind;
 
 				if (headerStatus === "confirmed") {
 					// Retry is already authorized. Release the slot immediately:
@@ -1575,17 +1684,25 @@ export function createGuard(options = {}) {
 					});
 					let delayMs = headerHint.delayMs;
 					let recoverySource = headerHint.recoverySource;
+					const recoveryScope = headerDecision.scope;
 					let inspection;
 					const headerRemainingMs = context.remainingMs();
-					const headerDelayBudgetMs =
-						headerRemainingMs - retryAttemptHeadroomMs;
+					const headerAction = planRecoveryAction({
+						recoveryDelayMs: delayMs,
+						elapsedMs: now() - context.acceptedAt,
+						remainingMs: headerRemainingMs,
+						retryAttemptHeadroomMs,
+						recoverySilenceBudgetMs: maxRecoverySleepMs,
+						jitterMs,
+						random,
+					});
+					counters.poolExhausted += 1;
+					recordTrustedRecovery(recoveryScope);
 
-					// If even the header-time recovery floor (including zero delay)
-					// cannot leave one attempt's headroom, preserve the untouched 503
-					// immediately instead of consuming its body.
-					if (delayMs > headerDelayBudgetMs) {
-						counters.poolExhausted += 1;
-						await forwardRecoveryBeyondDeadline(
+					// Preserve an infeasible trusted terminal untouched. The caller then
+					// owns the visible retry cadence instead of timing out in guard silence.
+					if (headerAction.kind === "forward") {
+						await forwardRecoveryWithoutRetry(
 							res,
 							context,
 							attempt,
@@ -1594,6 +1711,7 @@ export function createGuard(options = {}) {
 								recoveryDelayMs: delayMs,
 								recoverySource,
 								remainingMs: headerRemainingMs,
+								reason: headerAction.reason,
 							},
 						);
 						return;
@@ -1603,7 +1721,8 @@ export function createGuard(options = {}) {
 					// bounded peek. A complete body may reveal a later blocker, but
 					// can never shorten the authoritative Retry-After minimum; an
 					// incomplete body cannot change the seeded header-time hint.
-					const inspectionSlackMs = headerDelayBudgetMs - delayMs;
+					const inspectionSlackMs =
+						headerAction.availableDelayMs - delayMs;
 					const peekTimeoutMs = Math.min(
 						delayInspectionTimeoutMs,
 						Math.max(0, Math.floor(inspectionSlackMs / 2)),
@@ -1645,7 +1764,6 @@ export function createGuard(options = {}) {
 						}
 					}
 
-					counters.poolExhausted += 1;
 					try {
 						context.ensureBudget();
 					} catch (error) {
@@ -1653,15 +1771,17 @@ export function createGuard(options = {}) {
 						throw error;
 					}
 					const remainingMs = context.remainingMs();
-					const boundedDelayMs = planRetryDelay({
+					const action = planRecoveryAction({
 						recoveryDelayMs: delayMs,
+						elapsedMs: now() - context.acceptedAt,
 						remainingMs,
 						retryAttemptHeadroomMs,
+						recoverySilenceBudgetMs: maxRecoverySleepMs,
 						jitterMs,
 						random,
 					});
-					if (boundedDelayMs === null) {
-						await forwardRecoveryBeyondDeadline(
+					if (action.kind === "forward") {
+						await forwardRecoveryWithoutRetry(
 							res,
 							context,
 							attempt,
@@ -1675,6 +1795,7 @@ export function createGuard(options = {}) {
 								recoveryDelayMs: delayMs,
 								recoverySource,
 								remainingMs,
+								reason: action.reason,
 							},
 						);
 						return;
@@ -1684,18 +1805,44 @@ export function createGuard(options = {}) {
 						sendAttemptsExhausted(res, context, attempt);
 						return;
 					}
-					await cancelInspectedResponse(upstreamResponse, inspection);
-					counters.retried += 1;
-					log("proxy_retry_wait", {
-						id,
-						attempt,
-						status: upstreamResponse.status,
-						reason: "pool_exhausted",
-						recoverySource,
-						delayMs: boundedDelayMs,
-						elapsedMs: now() - context.acceptedAt,
-					});
-					await sleep(boundedDelayMs, context.signal);
+					const waitLease = tryAcquireRecoveryWait(recoveryScope);
+					if (waitLease === null) {
+						await forwardRecoveryWithoutRetry(
+							res,
+							context,
+							attempt,
+							upstreamResponse,
+							{
+								buffer:
+									inspection?.oversized || inspection?.incomplete
+										? undefined
+										: inspection?.buffer,
+								inspection,
+								recoveryDelayMs: delayMs,
+								recoverySource,
+								remainingMs,
+								reason: "recovery_wait_capacity_full",
+							},
+						);
+						return;
+					}
+					try {
+						await cancelInspectedResponse(upstreamResponse, inspection);
+						counters.retried += 1;
+						log("proxy_retry_wait", {
+							id,
+							attempt,
+							status: upstreamResponse.status,
+							reason: "trusted_finite_recovery",
+							recoveryScope,
+							recoverySource,
+							delayMs: action.delayMs,
+							elapsedMs: now() - context.acceptedAt,
+						});
+						await sleep(action.delayMs, context.signal);
+					} finally {
+						waitLease.release();
+					}
 					continue;
 				}
 
@@ -1772,17 +1919,20 @@ export function createGuard(options = {}) {
 					}
 
 					counters.poolExhausted += 1;
+					recordTrustedRecovery(decision.recoveryScope);
 					context.ensureBudget();
 					const remainingMs = context.remainingMs();
-					const delayMs = planRetryDelay({
+					const action = planRecoveryAction({
 						recoveryDelayMs: decision.delayMs,
+						elapsedMs: now() - context.acceptedAt,
 						remainingMs,
 						retryAttemptHeadroomMs,
+						recoverySilenceBudgetMs: maxRecoverySleepMs,
 						jitterMs,
 						random,
 					});
-					if (delayMs === null) {
-						await forwardRecoveryBeyondDeadline(
+					if (action.kind === "forward") {
+						await forwardRecoveryWithoutRetry(
 							res,
 							context,
 							attempt,
@@ -1792,6 +1942,7 @@ export function createGuard(options = {}) {
 								recoveryDelayMs: decision.delayMs,
 								recoverySource: decision.recoverySource,
 								remainingMs,
+								reason: action.reason,
 							},
 						);
 						return;
@@ -1800,17 +1951,39 @@ export function createGuard(options = {}) {
 						sendAttemptsExhausted(res, context, attempt);
 						return;
 					}
-					counters.retried += 1;
-					log("proxy_retry_wait", {
-						id,
-						attempt,
-						status: upstreamResponse.status,
-						reason: decision.reason,
-						recoverySource: decision.recoverySource,
-						delayMs,
-						elapsedMs,
-					});
-					await sleep(delayMs, context.signal);
+					const waitLease = tryAcquireRecoveryWait(decision.recoveryScope);
+					if (waitLease === null) {
+						await forwardRecoveryWithoutRetry(
+							res,
+							context,
+							attempt,
+							upstreamResponse,
+							{
+								buffer,
+								recoveryDelayMs: decision.delayMs,
+								recoverySource: decision.recoverySource,
+								remainingMs,
+								reason: "recovery_wait_capacity_full",
+							},
+						);
+						return;
+					}
+					try {
+						counters.retried += 1;
+						log("proxy_retry_wait", {
+							id,
+							attempt,
+							status: upstreamResponse.status,
+							reason: decision.reason,
+							recoveryScope: decision.recoveryScope,
+							recoverySource: decision.recoverySource,
+							delayMs: action.delayMs,
+							elapsedMs,
+						});
+						await sleep(action.delayMs, context.signal);
+					} finally {
+						waitLease.release();
+					}
 					continue;
 				}
 
@@ -1826,7 +1999,7 @@ export function createGuard(options = {}) {
 					outcome: outcomeForStatus(upstreamResponse.status),
 					reason:
 						headerStatus === "denied"
-							? "pool_not_exhausted"
+							? "recovery_not_authorized"
 							: "header_absent_legacy_body_disabled",
 					elapsedMs: now() - context.acceptedAt,
 				});
@@ -1967,9 +2140,12 @@ export function createGuard(options = {}) {
 					listenPort,
 					upstreamBase,
 					maxActive,
+					maxRecoveryWaits,
 					maxAttempts,
 					totalDeadlineMs,
 					retryAttemptHeadroomMs,
+					maxRecoverySleepMs,
+					recoverySilenceBudgetMs: maxRecoverySleepMs,
 					jitterMs,
 					maxInspectionBytes,
 					responseIdleTimeoutMs,
@@ -1982,6 +2158,8 @@ export function createGuard(options = {}) {
 						limits: {
 							totalDeadlineMs,
 							retryAttemptHeadroomMs,
+							maxRecoverySleepMs,
+							recoverySilenceBudgetMs: maxRecoverySleepMs,
 							maxAttempts,
 							jitterMs,
 							maxInspectionBytes,
@@ -1991,10 +2169,16 @@ export function createGuard(options = {}) {
 							shutdownGraceMs,
 							maxActive,
 							maxQueue,
+							maxRecoveryWaits,
 						},
 					},
 					active,
 					queued: queue.length,
+					recoveryWaits: {
+						configured: maxRecoveryWaits,
+						current: activeRecoveryWaits,
+						peak: peakRecoveryWaits,
+					},
 					counters,
 				}),
 			);
@@ -2067,9 +2251,11 @@ export function createGuard(options = {}) {
 					upstreamBase,
 					maxActive,
 					maxQueue,
+					maxRecoveryWaits,
 					maxAttempts,
 					totalDeadlineMs,
 					retryAttemptHeadroomMs,
+					maxRecoverySleepMs,
 					maxInspectionBytes,
 					responseIdleTimeoutMs,
 					delayInspectionTimeoutMs,
@@ -2116,6 +2302,13 @@ export function createGuard(options = {}) {
 			},
 			get queued() {
 				return queue.length;
+			},
+			get recoveryWaits() {
+				return {
+					configured: maxRecoveryWaits,
+					current: activeRecoveryWaits,
+					peak: peakRecoveryWaits,
+				};
 			},
 		},
 	};

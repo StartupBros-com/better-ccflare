@@ -18,11 +18,13 @@ describe("sanitizeProxyHeaders", () => {
 		const original = new Headers({
 			"content-type": "application/json",
 			"x-better-ccflare-pool-status": "exhausted",
+			"x-better-ccflare-recovery-scope": "model",
 		});
 
 		const sanitized = sanitizeProxyHeaders(original);
 
 		expect(sanitized.has("x-better-ccflare-pool-status")).toBe(false);
+		expect(sanitized.has("x-better-ccflare-recovery-scope")).toBe(false);
 		expect(sanitized.get("content-type")).toBe("application/json");
 	});
 
@@ -44,12 +46,16 @@ describe("withSanitizedProxyHeaders", () => {
 			headers: {
 				"content-type": "application/json",
 				"x-better-ccflare-pool-status": "exhausted",
+				"x-better-ccflare-recovery-scope": "pool",
 			},
 		});
 
 		const sanitized = withSanitizedProxyHeaders(upstream);
 
 		expect(sanitized.headers.has("x-better-ccflare-pool-status")).toBe(false);
+		expect(sanitized.headers.has("x-better-ccflare-recovery-scope")).toBe(
+			false,
+		);
 		expect(sanitized.status).toBe(503);
 	});
 });
