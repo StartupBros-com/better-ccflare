@@ -7,6 +7,7 @@ import {
 	type CodexWebSocketCounters,
 	type CodexWebSocketFactory,
 	type CodexWebSocketFailureCategory,
+	type CodexWebSocketFallbackReason,
 	type CodexWebSocketLike,
 	type CodexWebSocketObservation,
 	type CodexWebSocketOptions,
@@ -18,6 +19,7 @@ import {
 	isOfficialCodexSubscriptionUrl,
 	readCodexWebSocketPercent,
 	readCodexWebSocketRuntimeConfig,
+	readCodexWebSocketTelemetryWarn,
 } from "./codex-websocket-contract";
 import {
 	buildCodexWebSocketHandshakeHeaders,
@@ -41,6 +43,7 @@ export type {
 	CodexWebSocketCounters,
 	CodexWebSocketFactory,
 	CodexWebSocketFailureCategory,
+	CodexWebSocketFallbackReason,
 	CodexWebSocketLike,
 	CodexWebSocketObservation,
 	CodexWebSocketOptions,
@@ -56,7 +59,9 @@ export {
 	CODEX_WS_MAX_PER_ACCOUNT_ENV,
 	CODEX_WS_MODELS_ENV,
 	CODEX_WS_PERCENT_ENV,
+	CODEX_WS_TELEMETRY_WARN_ENV,
 	isCodexWebSocketAssigned,
+	readCodexWebSocketTelemetryWarn,
 } from "./codex-websocket-contract";
 export { createCodexWebSocketNoReplayResponse } from "./codex-websocket-wire";
 
@@ -64,14 +69,26 @@ const log = new Logger("CodexWebSocketTransport");
 
 const MAX_STICKY_HTTP = 2_048;
 const MAX_RECENT_OBSERVATIONS = 128;
+// Keep the WebSocket reader from outrunning a paused or abandoned HTTP client.
+// These are intentionally internal until the canary provides enough evidence to
+// justify widening or exposing them as operational knobs.
+const MAX_BUFFERED_FRAMES = 256;
+const MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
+
+interface InternalCodexWebSocketReceipt extends CodexWebSocketReceipt {
+	readonly requestId: string;
+	readonly attemptId: string;
+	observationRecorded: boolean;
+}
 
 interface ActiveRequest {
-	receipt: CodexWebSocketReceipt;
+	receipt: InternalCodexWebSocketReceipt;
 	signal: AbortSignal;
 	controller: ReadableStreamDefaultController<Uint8Array>;
 	stream: ReadableStream<Uint8Array>;
 	startedAt: number;
 	frameWrittenAt: number;
+	handshakeMs: number | null;
 	firstSettled: boolean;
 	closed: boolean;
 	responseId: string | null;
@@ -79,6 +96,11 @@ interface ActiveRequest {
 	createdMs: number | null;
 	firstOutputMs: number | null;
 	terminalMs: number | null;
+	pendingFrames: Uint8Array[];
+	pendingBytes: number;
+	streamQueuedByteLengths: number[];
+	streamQueuedBytes: number;
+	streamClosePending: boolean;
 	firstTimer?: ReturnType<typeof setTimeout>;
 	messageChain: Promise<void>;
 	resolveFirst: (result: Response | null) => void;
@@ -116,6 +138,7 @@ export interface CodexWebSocketTransportOptionsForTests {
 export class CodexWebSocketTransport {
 	private readonly pool = new Map<string, PoolEntry>();
 	private readonly openingLanes = new Set<string>();
+	private readonly openingReservations = new Map<string, string>();
 	private readonly stickyHttp = new Map<string, number>();
 	private readonly recent: CodexWebSocketObservation[] = [];
 	private readonly createWebSocket: CodexWebSocketFactory;
@@ -163,6 +186,10 @@ export class CodexWebSocketTransport {
 			return null;
 		}
 		if (input.signal.aborted) throw input.signal.reason;
+		// Run lifecycle cleanup before request/allowlist/body eligibility can
+		// return. This makes config disablement effective even when the current
+		// request is no longer eligible for the lane it is retiring.
+		this.sweepExpired(config);
 		if (
 			input.providerName !== "codex" ||
 			input.request.method !== "POST" ||
@@ -173,10 +200,14 @@ export class CodexWebSocketTransport {
 
 		const parsed = await this.parseRequest(input, config);
 		if (!parsed) return null;
-		this.sweepExpired(config);
 		if (this.stickyHttp.has(parsed.stickyKey)) {
 			this.touchSticky(parsed.stickyKey);
 			this.counters.stickyHttpBypass++;
+			this.record({
+				...this.emptyObservation(input, parsed.model, parsed.cohortId),
+				fallbackReason: "sticky_http",
+				stickyHttp: true,
+			});
 			return null;
 		}
 		if (
@@ -188,11 +219,7 @@ export class CodexWebSocketTransport {
 		) {
 			this.counters.controls++;
 			this.record({
-				...this.emptyObservation(
-					input.accountId,
-					parsed.model,
-					parsed.cohortId,
-				),
+				...this.emptyObservation(input, parsed.model, parsed.cohortId),
 				assignment: "control",
 				fallbackReason: "cohort_control",
 			});
@@ -202,11 +229,7 @@ export class CodexWebSocketTransport {
 		if (this.openingLanes.has(parsed.laneKey)) {
 			this.counters.busyHttpBypass++;
 			this.record({
-				...this.emptyObservation(
-					input.accountId,
-					parsed.model,
-					parsed.cohortId,
-				),
+				...this.emptyObservation(input, parsed.model, parsed.cohortId),
 				busy: true,
 				fallbackReason: "connection_opening",
 			});
@@ -221,11 +244,7 @@ export class CodexWebSocketTransport {
 		if (entry?.busy) {
 			this.counters.busyHttpBypass++;
 			this.record({
-				...this.emptyObservation(
-					input.accountId,
-					parsed.model,
-					parsed.cohortId,
-				),
+				...this.emptyObservation(input, parsed.model, parsed.cohortId),
 				connectionId: entry.connectionId,
 				connectionNew: false,
 				connectionReused: false,
@@ -243,6 +262,15 @@ export class CodexWebSocketTransport {
 			) {
 				if (candidate.busy) {
 					this.counters.busyHttpBypass++;
+					this.record({
+						...this.emptyObservation(input, parsed.model, parsed.cohortId),
+						connectionId: candidate.connectionId,
+						connectionNew: false,
+						connectionReused: false,
+						connectionAgeMs: this.now() - candidate.createdAt,
+						busy: true,
+						fallbackReason: "lane_identity_busy",
+					});
 					return null;
 				}
 				this.evict(candidate, "lane_identity_changed");
@@ -253,6 +281,16 @@ export class CodexWebSocketTransport {
 		let reused = true;
 		if (!entry) {
 			reused = false;
+			const capFallback = this.reserveOpening(input.accountId, parsed, config);
+			if (capFallback) {
+				this.counters.preWriteHttpFallbacks++;
+				this.record({
+					...this.emptyObservation(input, parsed.model, parsed.cohortId),
+					fallbackReason: capFallback,
+					fallbackAllowedBeforeWrite: true,
+				});
+				return null;
+			}
 			const openedAt = this.now();
 			this.openingLanes.add(parsed.laneKey);
 			try {
@@ -266,11 +304,7 @@ export class CodexWebSocketTransport {
 						: "handshake_error";
 				this.counters.preWriteHttpFallbacks++;
 				this.record({
-					...this.emptyObservation(
-						input.accountId,
-						parsed.model,
-						parsed.cohortId,
-					),
+					...this.emptyObservation(input, parsed.model, parsed.cohortId),
 					handshakeMs: this.now() - openedAt,
 					handshakeFailure: category,
 					fallbackReason: category,
@@ -279,10 +313,7 @@ export class CodexWebSocketTransport {
 				return null;
 			} finally {
 				this.openingLanes.delete(parsed.laneKey);
-			}
-			if (!this.enforcePoolCaps(config, entry)) {
-				this.counters.preWriteHttpFallbacks++;
-				return null;
+				this.openingReservations.delete(parsed.laneKey);
 			}
 			this.counters.connectionsOpened++;
 		} else {
@@ -361,8 +392,8 @@ export class CodexWebSocketTransport {
 		const authorization = input.request.headers.get("authorization") ?? "";
 		if (!authorization) return null;
 		const authFingerprint = opaqueRuntimeId("codex-ws-auth", authorization);
-		const websocketPayload = { ...payload };
-		delete websocketPayload.previous_response_id;
+		const framePayload = { ...payload };
+		delete framePayload.previous_response_id;
 		const laneKey = opaqueRuntimeId(
 			"codex-ws-lane",
 			input.accountId,
@@ -390,7 +421,9 @@ export class CodexWebSocketTransport {
 				input.accountId,
 				promptCacheKey,
 			),
-			frame: JSON.stringify({ ...websocketPayload, type: "response.create" }),
+			// Delay the only full-history reserialization until after cohort, sticky,
+			// busy, identity, and capacity fallbacks have all been ruled out.
+			framePayload,
 		};
 	}
 
@@ -512,7 +545,10 @@ export class CodexWebSocketTransport {
 			rejectFirst = reject;
 		});
 		let controller!: ReadableStreamDefaultController<Uint8Array>;
-		const receipt: CodexWebSocketReceipt = {
+		const receipt: InternalCodexWebSocketReceipt = {
+			requestId: input.requestId,
+			attemptId: input.attemptId,
+			observationRecorded: false,
 			connectionId: entry.connectionId,
 			cohortId,
 			reused,
@@ -544,21 +580,35 @@ export class CodexWebSocketTransport {
 				this.evict(entry, category, true);
 			},
 		};
-		const stream = new ReadableStream<Uint8Array>({
-			start(streamController) {
-				controller = streamController;
+		let active!: ActiveRequest;
+		const stream = new ReadableStream<Uint8Array>(
+			{
+				start(streamController) {
+					controller = streamController;
+				},
+				pull: () => {
+					if (active) {
+						// A pull after enqueue means the previously queued chunk has been
+						// consumed (or an empty stream is awaiting its first chunk).
+						const consumed = active.streamQueuedByteLengths.shift();
+						if (consumed !== undefined) active.streamQueuedBytes -= consumed;
+						this.flushActive(active);
+					}
+				},
+				cancel: () => {
+					receipt.markPostWriteFailure("stream_cancelled");
+				},
 			},
-			cancel: () => {
-				receipt.markPostWriteFailure("stream_cancelled");
-			},
-		});
-		const active: ActiveRequest = {
+			{ highWaterMark: 1 },
+		);
+		active = {
 			receipt,
 			signal: input.signal,
 			controller,
 			stream,
 			startedAt: this.now(),
 			frameWrittenAt: this.now(),
+			handshakeMs,
 			firstSettled: false,
 			closed: false,
 			responseId: null,
@@ -566,6 +616,11 @@ export class CodexWebSocketTransport {
 			createdMs: null,
 			firstOutputMs: null,
 			terminalMs: null,
+			pendingFrames: [],
+			pendingBytes: 0,
+			streamQueuedByteLengths: [],
+			streamQueuedBytes: 0,
+			streamClosePending: false,
 			messageChain: Promise.resolve(),
 			resolveFirst,
 			rejectFirst,
@@ -592,16 +647,20 @@ export class CodexWebSocketTransport {
 		});
 		entry.active = active;
 		try {
-			entry.socket.send(parsed.frame);
+			const frame = JSON.stringify({
+				...parsed.framePayload,
+				type: "response.create",
+			});
+			entry.socket.send(frame);
 			// WebSocket.send() synchronously queues/copies the frame. Drop the only
 			// canary-owned full-history serialization before awaiting the first event.
-			parsed.frame = "";
+			parsed.framePayload = {};
 		} catch {
 			this.finishActive(entry, active, true);
 			this.evict(entry, "send_failed");
 			this.counters.preWriteHttpFallbacks++;
 			this.record({
-				...this.emptyObservation(accountId, model, cohortId),
+				...this.emptyObservation(input, model, cohortId),
 				connectionId: entry.connectionId,
 				connectionNew: !reused,
 				connectionReused: reused,
@@ -702,7 +761,15 @@ export class CodexWebSocketTransport {
 				) {
 					active.firstOutputMs = elapsed;
 				}
-				active.controller.enqueue(encodeCodexWebSocketSseEvent(type, parsed));
+				if (
+					!this.enqueueActiveFrame(
+						entry,
+						active,
+						encodeCodexWebSocketSseEvent(type, parsed),
+					)
+				) {
+					return;
+				}
 				if (!active.firstSettled) {
 					active.firstSettled = true;
 					if (active.firstTimer) clearTimeout(active.firstTimer);
@@ -721,7 +788,7 @@ export class CodexWebSocketTransport {
 							this.counters.postWriteFailures++;
 						}
 					}
-					this.finishActive(entry, active, true);
+					this.finishActive(entry, active, true, true);
 					this.recordActive(entry, active, terminalFailure);
 					if (
 						CODEX_WEBSOCKET_ERROR_EVENT_TYPES.has(type) ||
@@ -790,6 +857,7 @@ export class CodexWebSocketTransport {
 		entry: PoolEntry,
 		active: ActiveRequest,
 		closeStream: boolean,
+		drainQueuedFrames = false,
 	): void {
 		if (active.closed) return;
 		active.closed = true;
@@ -798,23 +866,95 @@ export class CodexWebSocketTransport {
 		if (entry.active === active) entry.active = undefined;
 		entry.busy = false;
 		entry.lastUsedAt = this.now();
-		try {
-			if (closeStream) active.controller.close();
-		} catch {
-			// The downstream may already have cancelled this stream.
+		if (closeStream && drainQueuedFrames) {
+			active.streamClosePending = true;
+			this.flushActive(active);
+		} else if (closeStream) {
+			active.pendingFrames = [];
+			active.pendingBytes = 0;
+			active.streamQueuedByteLengths = [];
+			active.streamQueuedBytes = 0;
+			try {
+				active.controller.close();
+			} catch {
+				// The downstream may already have cancelled this stream.
+			}
 		}
 		this.touchEntry(entry);
+	}
+
+	private enqueueActiveFrame(
+		entry: PoolEntry,
+		active: ActiveRequest,
+		frame: Uint8Array,
+	): boolean {
+		if (
+			frame.byteLength > MAX_BUFFERED_BYTES ||
+			active.pendingFrames.length + active.streamQueuedByteLengths.length >=
+				MAX_BUFFERED_FRAMES ||
+			active.pendingBytes + active.streamQueuedBytes + frame.byteLength >
+				MAX_BUFFERED_BYTES
+		) {
+			this.failAfterWrite(
+				entry,
+				active,
+				entry.stickyKey,
+				"buffer_overflow",
+				502,
+			);
+			return false;
+		}
+		active.pendingFrames.push(frame);
+		active.pendingBytes += frame.byteLength;
+		this.flushActive(active);
+		return !active.closed;
+	}
+
+	private flushActive(active: ActiveRequest): void {
+		try {
+			while (
+				active.pendingFrames.length > 0 &&
+				(active.controller.desiredSize ?? 0) > 0
+			) {
+				const frame = active.pendingFrames.shift();
+				if (!frame) break;
+				active.pendingBytes -= frame.byteLength;
+				active.controller.enqueue(frame);
+				active.streamQueuedByteLengths.push(frame.byteLength);
+				active.streamQueuedBytes += frame.byteLength;
+			}
+			if (active.streamClosePending && active.pendingFrames.length === 0) {
+				active.streamClosePending = false;
+				active.controller.close();
+			}
+		} catch {
+			active.pendingFrames = [];
+			active.pendingBytes = 0;
+			active.streamQueuedByteLengths = [];
+			active.streamQueuedBytes = 0;
+			active.streamClosePending = false;
+		}
 	}
 
 	private recordReceiptFailure(
 		accountId: string,
 		model: string,
 		entry: PoolEntry,
-		receipt: CodexWebSocketReceipt,
+		receipt: InternalCodexWebSocketReceipt,
 		failure: CodexWebSocketFailureCategory,
 	): void {
+		if (receipt.observationRecorded) return;
+		receipt.observationRecorded = true;
 		this.record({
-			...this.emptyObservation(accountId, model, receipt.cohortId),
+			...this.emptyObservation(
+				{
+					requestId: receipt.requestId,
+					attemptId: receipt.attemptId,
+					accountId,
+				},
+				model,
+				receipt.cohortId,
+			),
 			effectiveTransport: "websocket",
 			connectionId: receipt.connectionId,
 			connectionNew: !receipt.reused,
@@ -833,7 +973,11 @@ export class CodexWebSocketTransport {
 		failure: string | null,
 		code: number | null = null,
 	): void {
+		if (active.receipt.observationRecorded) return;
+		active.receipt.observationRecorded = true;
 		this.record({
+			requestId: active.receipt.requestId,
+			attemptId: active.receipt.attemptId,
 			assignment: "treatment",
 			effectiveTransport: "websocket",
 			accountId: entry.accountId,
@@ -845,7 +989,7 @@ export class CodexWebSocketTransport {
 			connectionAgeMs: this.now() - entry.createdAt,
 			poolSize: this.pool.size,
 			busy: false,
-			handshakeMs: null,
+			handshakeMs: active.handshakeMs,
 			handshakeFailure: null,
 			frameWritten: active.receipt.frameWritten,
 			firstEventMs: active.firstEventMs,
@@ -854,21 +998,26 @@ export class CodexWebSocketTransport {
 			terminalMs: active.terminalMs,
 			closeCode: code,
 			closeCategory: failure,
-			fallbackReason: failure,
+			fallbackReason: this.normalizeTerminalFallback(failure),
 			fallbackAllowedBeforeWrite: false,
 			stickyHttp: active.receipt.stickyHttp,
 		});
 	}
 
 	private emptyObservation(
-		accountId: string,
+		input: Pick<
+			CodexWebSocketAttemptInput,
+			"requestId" | "attemptId" | "accountId"
+		>,
 		model: string,
 		cohortId: string,
 	): CodexWebSocketObservation {
 		return {
+			requestId: input.requestId,
+			attemptId: input.attemptId,
 			assignment: "treatment",
 			effectiveTransport: "http",
-			accountId,
+			accountId: input.accountId,
 			model,
 			cohortId,
 			connectionId: null,
@@ -892,12 +1041,31 @@ export class CodexWebSocketTransport {
 		};
 	}
 
+	private normalizeTerminalFallback(
+		failure: string | null,
+	): CodexWebSocketFallbackReason | null {
+		if (failure === null) return null;
+		if (
+			failure === "error" ||
+			failure === "response.failed" ||
+			failure === "response.incomplete"
+		) {
+			return "upstream_terminal_error";
+		}
+		return failure as CodexWebSocketFailureCategory;
+	}
+
 	private record(observation: CodexWebSocketObservation): void {
 		this.recent.push({ ...observation, poolSize: this.pool.size });
 		if (this.recent.length > MAX_RECENT_OBSERVATIONS) this.recent.shift();
 		try {
 			if (this.observe) this.observe(observation);
-			else log.info("codex_ws_transport", observation);
+			else if (readCodexWebSocketTelemetryWarn()) {
+				// Production dogfood runs commonly pin LOG_LEVEL=warn. This explicit,
+				// default-off escalation keeps canary records joinable without widening
+				// logging for any other subsystem.
+				log.warn("codex_ws_transport", observation);
+			} else log.info("codex_ws_transport", observation);
 		} catch {
 			// Canary telemetry is best-effort and must never alter routing semantics.
 		}
@@ -930,7 +1098,12 @@ export class CodexWebSocketTransport {
 		const now = this.now();
 		for (const entry of [...this.pool.values()]) {
 			if (entry.busy) continue;
-			if (now - entry.createdAt >= config.maxAgeMs) {
+			if (
+				!config.accountIds.has(entry.accountId) ||
+				!config.models.has(entry.model.toLowerCase())
+			) {
+				this.evict(entry, "allowlist_removed");
+			} else if (now - entry.createdAt >= config.maxAgeMs) {
 				this.evict(entry, "max_age");
 			} else if (now - entry.lastUsedAt >= config.idleTtlMs) {
 				this.evict(entry, "idle_ttl");
@@ -944,10 +1117,11 @@ export class CodexWebSocketTransport {
 		}
 	}
 
-	private enforcePoolCaps(
+	private reserveOpening(
+		accountId: string,
+		parsed: CodexWebSocketParsedRequest,
 		config: CodexWebSocketRuntimeConfig,
-		opened: PoolEntry,
-	): boolean {
+	): "global_cap" | "per_account_cap" | null {
 		const evictOldestIdle = (accountId?: string): boolean => {
 			const candidate = [...this.pool.values()]
 				.filter(
@@ -959,17 +1133,23 @@ export class CodexWebSocketTransport {
 			this.evict(candidate, accountId ? "per_account_lru" : "global_lru");
 			return true;
 		};
-		while (
-			[...this.pool.values()].filter(
-				(entry) => entry.accountId === opened.accountId,
-			).length > config.maxPerAccount
-		) {
-			if (!evictOldestIdle(opened.accountId)) break;
+		const accountOccupancy = () =>
+			[...this.pool.values()].filter((entry) => entry.accountId === accountId)
+				.length +
+			[...this.openingReservations.values()].filter(
+				(reservedAccountId) => reservedAccountId === accountId,
+			).length;
+		const globalOccupancy = () =>
+			this.pool.size + this.openingReservations.size;
+
+		while (accountOccupancy() >= config.maxPerAccount) {
+			if (!evictOldestIdle(accountId)) return "per_account_cap";
 		}
-		while (this.pool.size > config.maxGlobal) {
-			if (!evictOldestIdle()) break;
+		while (globalOccupancy() >= config.maxGlobal) {
+			if (!evictOldestIdle()) return "global_cap";
 		}
-		return this.pool.has(opened.poolKey);
+		this.openingReservations.set(parsed.laneKey, accountId);
+		return null;
 	}
 
 	private evict(entry: PoolEntry, _reason: string, force = false): void {

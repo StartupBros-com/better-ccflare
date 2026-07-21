@@ -1830,7 +1830,14 @@ export async function proxyWithAccount(
 			return makeAttemptRequest(transportRequest, async (signal) => {
 				currentCodexWebSocketReceipt = null;
 				if (provider.name !== "codex") return null;
+				// Capture the concrete stamped attempt before any later retry mutates the
+				// surrounding attempt variable. These are the same join keys written to
+				// Codex usage/cache traces during response finalization.
+				const websocketAttemptId = currentTransportAttemptId;
+				if (!websocketAttemptId) return null;
 				const websocketAttempt = await codexWebSocketTransport.tryRequest({
+					requestId: requestMeta.id,
+					attemptId: websocketAttemptId,
 					accountId: account.id,
 					providerName: provider.name,
 					request: transportRequest,

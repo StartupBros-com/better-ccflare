@@ -12,6 +12,7 @@ export const CODEX_WS_MAX_GLOBAL_ENV = "CCFLARE_CODEX_WS_MAX_GLOBAL";
 export const CODEX_WS_MAX_PER_ACCOUNT_ENV = "CCFLARE_CODEX_WS_MAX_PER_ACCOUNT";
 export const CODEX_WS_IDLE_TTL_MS_ENV = "CCFLARE_CODEX_WS_IDLE_TTL_MS";
 export const CODEX_WS_MAX_AGE_MS_ENV = "CCFLARE_CODEX_WS_MAX_AGE_MS";
+export const CODEX_WS_TELEMETRY_WARN_ENV = "CCFLARE_CODEX_WS_TELEMETRY_WARN";
 const CODEX_WS_HANDSHAKE_TIMEOUT_MS_ENV =
 	"CCFLARE_CODEX_WS_HANDSHAKE_TIMEOUT_MS";
 const CODEX_WS_FIRST_EVENT_TIMEOUT_MS_ENV =
@@ -47,6 +48,7 @@ export type CodexWebSocketFactory = (
 
 export type CodexWebSocketFailureCategory =
 	| "abort"
+	| "buffer_overflow"
 	| "handshake_close"
 	| "handshake_error"
 	| "handshake_timeout"
@@ -57,7 +59,21 @@ export type CodexWebSocketFailureCategory =
 	| "semantic_stall"
 	| "stream_cancelled";
 
+export type CodexWebSocketFallbackReason =
+	| CodexWebSocketFailureCategory
+	| "cohort_control"
+	| "connection_busy"
+	| "connection_opening"
+	| "global_cap"
+	| "lane_identity_busy"
+	| "per_account_cap"
+	| "send_failed_before_write"
+	| "sticky_http"
+	| "upstream_terminal_error";
+
 export interface CodexWebSocketObservation {
+	requestId: string;
+	attemptId: string;
 	assignment: "treatment" | "control";
 	effectiveTransport: "websocket" | "http";
 	accountId: string;
@@ -78,7 +94,7 @@ export interface CodexWebSocketObservation {
 	terminalMs: number | null;
 	closeCode: number | null;
 	closeCategory: string | null;
-	fallbackReason: string | null;
+	fallbackReason: CodexWebSocketFallbackReason | null;
 	fallbackAllowedBeforeWrite: boolean;
 	stickyHttp: boolean;
 }
@@ -131,6 +147,10 @@ export interface CodexWebSocketAttemptResult {
 }
 
 export interface CodexWebSocketAttemptInput {
+	/** Proxy request correlation ID also written to Codex usage/cache traces. */
+	requestId: string;
+	/** Concrete transport attempt ID also written to Codex usage/cache traces. */
+	attemptId: string;
 	accountId: string;
 	providerName: string;
 	request: Request;
@@ -146,7 +166,7 @@ export interface CodexWebSocketParsedRequest {
 	poolKey: string;
 	stickyKey: string;
 	cohortId: string;
-	frame: string;
+	framePayload: Record<string, unknown>;
 }
 
 export interface CodexWebSocketRuntimeConfig {
@@ -176,6 +196,11 @@ export function readCodexWebSocketPercent(): number {
 	const raw = process.env[CODEX_WS_PERCENT_ENV];
 	if (raw === undefined || !/^\d+$/.test(raw)) return 0;
 	return Math.min(Number.parseInt(raw, 10), 100);
+}
+
+export function readCodexWebSocketTelemetryWarn(): boolean {
+	const raw = process.env[CODEX_WS_TELEMETRY_WARN_ENV];
+	return raw === "1" || raw?.toLowerCase() === "true";
 }
 
 function csvSet(raw: string | undefined, lowercase = false): Set<string> {

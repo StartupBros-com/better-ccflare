@@ -243,6 +243,11 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 		);
 
 		expect(websocketAttempt).toHaveBeenCalledTimes(1);
+		const websocketInput = websocketAttempt.mock.calls[0]?.[0];
+		expect(websocketInput?.requestId).toBe("codex-ws-request");
+		expect(websocketInput?.attemptId).toMatch(
+			/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+		);
 		expect(httpCalls).toBe(0);
 		expect(postWriteMarks).toBe(1);
 		expect(receipt.stickyHttp).toBe(true);

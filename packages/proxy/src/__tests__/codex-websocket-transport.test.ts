@@ -8,11 +8,13 @@ import {
 	CODEX_WS_MAX_PER_ACCOUNT_ENV,
 	CODEX_WS_MODELS_ENV,
 	CODEX_WS_PERCENT_ENV,
+	CODEX_WS_TELEMETRY_WARN_ENV,
 	type CodexWebSocketLike,
 	type CodexWebSocketObservation,
 	type CodexWebSocketOptions,
 	CodexWebSocketTransport,
 	isCodexWebSocketAssigned,
+	readCodexWebSocketTelemetryWarn,
 } from "../codex-websocket-transport";
 
 const ENV_NAMES = [
@@ -23,6 +25,7 @@ const ENV_NAMES = [
 	CODEX_WS_MAX_PER_ACCOUNT_ENV,
 	CODEX_WS_IDLE_TTL_MS_ENV,
 	CODEX_WS_MAX_AGE_MS_ENV,
+	CODEX_WS_TELEMETRY_WARN_ENV,
 	"CCFLARE_CODEX_WS_HANDSHAKE_TIMEOUT_MS",
 	"CCFLARE_CODEX_WS_FIRST_EVENT_TIMEOUT_MS",
 ] as const;
@@ -196,6 +199,8 @@ function attempt(
 		accountId?: string;
 		providerName?: string;
 		signal?: AbortSignal;
+		requestId?: string;
+		attemptId?: string;
 	} = {},
 ) {
 	return transport.tryRequest({
@@ -203,6 +208,8 @@ function attempt(
 		providerName: opts.providerName ?? "codex",
 		request: req,
 		signal: opts.signal ?? new AbortController().signal,
+		requestId: opts.requestId ?? "request-default",
+		attemptId: opts.attemptId ?? "attempt-default",
 	});
 }
 
@@ -234,6 +241,18 @@ describe("CodexWebSocketTransport eligibility", () => {
 		expect(assignments).toEqual(new Set([false, true]));
 	});
 
+	test("only escalates canary telemetry for explicit boolean opt-in values", () => {
+		expect(readCodexWebSocketTelemetryWarn()).toBe(false);
+		for (const enabled of ["1", "true", "TRUE"]) {
+			process.env[CODEX_WS_TELEMETRY_WARN_ENV] = enabled;
+			expect(readCodexWebSocketTelemetryWarn()).toBe(true);
+		}
+		for (const disabled of ["0", "false", "yes", " 1", "1 ", "garbage"]) {
+			process.env[CODEX_WS_TELEMETRY_WARN_ENV] = disabled;
+			expect(readCodexWebSocketTelemetryWarn()).toBe(false);
+		}
+	});
+
 	test("percent zero retires idle sockets and creates no new pool state", async () => {
 		enableCanary();
 		const h = harness({
@@ -254,6 +273,56 @@ describe("CodexWebSocketTransport eligibility", () => {
 		expect(await attempt(h.transport)).toBeNull();
 		expect(h.sockets[0].closes).toHaveLength(1);
 		expect(h.transport.getStats().poolSize).toBe(0);
+	});
+
+	test("retire sockets removed from the account or model allowlist", async () => {
+		enableCanary();
+		const h = harness({
+			configureSocket(socket) {
+				socket.onSend = (ws) =>
+					queueMicrotask(() => {
+						ws.emitJson({ type: "response.created", response: { id: "r1" } });
+						ws.emitJson({ type: "response.completed", response: { id: "r1" } });
+					});
+			},
+		});
+		const first = await attempt(h.transport);
+		await first?.response.text();
+		expect(h.transport.getStats().poolSize).toBe(1);
+
+		process.env[CODEX_WS_ACCOUNT_IDS_ENV] = "some-other-account";
+		expect(await attempt(h.transport)).toBeNull();
+		expect(h.sockets[0].closes).toHaveLength(1);
+		expect(h.transport.getStats().poolSize).toBe(0);
+	});
+
+	test("emits joinable control observations with normalized outcomes", async () => {
+		enableCanary({ [CODEX_WS_PERCENT_ENV]: "50" });
+		const h = harness();
+		let cacheKey = "";
+		for (let index = 0; index < 1_000; index++) {
+			const candidate = `control-${index}`;
+			if (!isCodexWebSocketAssigned("acct-pro", candidate, 50)) {
+				cacheKey = candidate;
+				break;
+			}
+		}
+		expect(cacheKey).not.toBe("");
+		expect(
+			await attempt(h.transport, request({ cacheKey }), {
+				requestId: "request-control",
+				attemptId: "attempt-control",
+			}),
+		).toBeNull();
+		expect(h.observations).toEqual([
+			expect.objectContaining({
+				requestId: "request-control",
+				attemptId: "attempt-control",
+				assignment: "control",
+				effectiveTransport: "http",
+				fallbackReason: "cohort_control",
+			}),
+		]);
 	});
 });
 
@@ -307,6 +376,17 @@ describe("CodexWebSocketTransport wire contract", () => {
 		expect(stream?.indexOf("response.created")).toBeLessThan(
 			stream?.indexOf("response.completed") ?? -1,
 		);
+		expect(h.observations).toContainEqual(
+			expect.objectContaining({
+				requestId: "request-default",
+				attemptId: "attempt-default",
+				assignment: "treatment",
+				effectiveTransport: "websocket",
+				handshakeMs: expect.any(Number),
+				frameWritten: true,
+				fallbackReason: null,
+			}),
+		);
 	});
 
 	test("rejects non-exact subscription URLs, non-streaming, and non-POST requests", async () => {
@@ -342,33 +422,121 @@ describe("CodexWebSocketTransport wire contract", () => {
 });
 
 describe("CodexWebSocketTransport replay boundary", () => {
+	test("reserves per-account and global capacity before concurrent handshakes", async () => {
+		enableCanary({
+			[CODEX_WS_MAX_GLOBAL_ENV]: "4",
+			[CODEX_WS_MAX_PER_ACCOUNT_ENV]: "1",
+		});
+		const perAccount = harness({ autoOpen: false });
+		const firstPerAccount = attempt(
+			perAccount.transport,
+			request({ cacheKey: "lane-1" }),
+			{ requestId: "request-cap-1", attemptId: "attempt-cap-1" },
+		);
+		await Bun.sleep(0);
+		expect(
+			await attempt(perAccount.transport, request({ cacheKey: "lane-2" }), {
+				requestId: "request-cap-2",
+				attemptId: "attempt-cap-2",
+			}),
+		).toBeNull();
+		expect(perAccount.sockets).toHaveLength(1);
+		expect(perAccount.observations).toContainEqual(
+			expect.objectContaining({
+				requestId: "request-cap-2",
+				attemptId: "attempt-cap-2",
+				fallbackReason: "per_account_cap",
+			}),
+		);
+		perAccount.sockets[0].emitError();
+		expect(await firstPerAccount).toBeNull();
+
+		enableCanary({
+			[CODEX_WS_ACCOUNT_IDS_ENV]: "acct-pro,acct-two",
+			[CODEX_WS_MAX_GLOBAL_ENV]: "1",
+			[CODEX_WS_MAX_PER_ACCOUNT_ENV]: "2",
+		});
+		const global = harness({ autoOpen: false });
+		const firstGlobal = attempt(
+			global.transport,
+			request({ cacheKey: "global-lane-1" }),
+			{ requestId: "request-global-1", attemptId: "attempt-global-1" },
+		);
+		await Bun.sleep(0);
+		expect(
+			await attempt(global.transport, request({ cacheKey: "global-lane-2" }), {
+				accountId: "acct-two",
+				requestId: "request-global-2",
+				attemptId: "attempt-global-2",
+			}),
+		).toBeNull();
+		expect(global.sockets).toHaveLength(1);
+		expect(global.observations).toContainEqual(
+			expect.objectContaining({
+				requestId: "request-global-2",
+				attemptId: "attempt-global-2",
+				fallbackReason: "global_cap",
+			}),
+		);
+		global.sockets[0].emitError();
+		expect(await firstGlobal).toBeNull();
+	});
+
 	test("bypasses a concurrent request while the same lane handshake is pending", async () => {
 		enableCanary();
 		const h = harness({ autoOpen: false });
-		const first = attempt(h.transport);
+		const first = attempt(h.transport, request(), {
+			requestId: "request-opening-1",
+			attemptId: "attempt-opening-1",
+		});
 		await Bun.sleep(0);
-		const second = attempt(h.transport);
+		const second = attempt(h.transport, request(), {
+			requestId: "request-opening-2",
+			attemptId: "attempt-opening-2",
+		});
 		await Bun.sleep(0);
 
 		for (const socket of h.sockets) socket.emitError();
 		expect(await Promise.all([first, second])).toEqual([null, null]);
 		expect(h.sockets).toHaveLength(1);
 		expect(h.transport.getStats().counters.busyHttpBypass).toBe(1);
+		expect(h.observations).toContainEqual(
+			expect.objectContaining({
+				requestId: "request-opening-2",
+				attemptId: "attempt-opening-2",
+				fallbackReason: "connection_opening",
+			}),
+		);
 	});
 
 	test("reuses sequentially but sends busy traffic to HTTP without queueing", async () => {
 		enableCanary();
 		const h = harness();
-		const firstPromise = attempt(h.transport);
+		const firstPromise = attempt(h.transport, request(), {
+			requestId: "request-busy-1",
+			attemptId: "attempt-busy-1",
+		});
 		await Bun.sleep(0);
 		h.sockets[0].onSend = () => {};
 		// The send happens immediately after open; provide only a structural first frame.
 		h.sockets[0].emitJson({ type: "response.created", response: { id: "r1" } });
 		const first = await firstPromise;
 		expect(first).not.toBeNull();
-		expect(await attempt(h.transport)).toBeNull();
+		expect(
+			await attempt(h.transport, request(), {
+				requestId: "request-busy-2",
+				attemptId: "attempt-busy-2",
+			}),
+		).toBeNull();
 		expect(h.sockets).toHaveLength(1);
 		expect(h.transport.getStats().counters.busyHttpBypass).toBe(1);
+		expect(h.observations).toContainEqual(
+			expect.objectContaining({
+				requestId: "request-busy-2",
+				attemptId: "attempt-busy-2",
+				fallbackReason: "connection_busy",
+			}),
+		);
 
 		h.sockets[0].emitJson({
 			type: "response.completed",
@@ -387,6 +555,41 @@ describe("CodexWebSocketTransport replay boundary", () => {
 		expect(h.sockets[0].sent).toHaveLength(2);
 	});
 
+	test("observes a busy lane identity change instead of silently bypassing", async () => {
+		enableCanary();
+		const h = harness({
+			configureSocket(socket) {
+				socket.onSend = () => undefined;
+			},
+		});
+		const firstPending = attempt(h.transport, request(), {
+			requestId: "request-identity-1",
+			attemptId: "attempt-identity-1",
+		});
+		await Bun.sleep(0);
+		h.sockets[0].emitJson({ type: "response.created", response: { id: "r1" } });
+		const first = await firstPending;
+		expect(first).not.toBeNull();
+		expect(
+			await attempt(h.transport, request({ auth: "rotated-token" }), {
+				requestId: "request-identity-2",
+				attemptId: "attempt-identity-2",
+			}),
+		).toBeNull();
+		expect(h.observations).toContainEqual(
+			expect.objectContaining({
+				requestId: "request-identity-2",
+				attemptId: "attempt-identity-2",
+				fallbackReason: "lane_identity_busy",
+			}),
+		);
+		h.sockets[0].emitJson({
+			type: "response.completed",
+			response: { id: "r1" },
+		});
+		await first?.response.text();
+	});
+
 	test("allows HTTP fallback only when handshake fails before response.create", async () => {
 		enableCanary();
 		const h = harness({ autoOpen: false });
@@ -396,6 +599,8 @@ describe("CodexWebSocketTransport replay boundary", () => {
 			providerName: "codex",
 			request: request(),
 			signal: new AbortController().signal,
+			requestId: "request-handshake",
+			attemptId: "attempt-handshake",
 			onFrameWritten: () => {
 				frameWrittenCallbacks++;
 			},
@@ -406,6 +611,36 @@ describe("CodexWebSocketTransport replay boundary", () => {
 		expect(frameWrittenCallbacks).toBe(0);
 		expect(h.transport.getStats().counters.preWriteHttpFallbacks).toBe(1);
 		expect(h.observations.at(-1)?.fallbackAllowedBeforeWrite).toBe(true);
+		expect(h.observations.at(-1)).toMatchObject({
+			requestId: "request-handshake",
+			attemptId: "attempt-handshake",
+			fallbackReason: "handshake_error",
+		});
+	});
+
+	test("observes send failures as joinable pre-write HTTP fallbacks", async () => {
+		enableCanary();
+		const h = harness({
+			configureSocket(socket) {
+				socket.onSend = () => {
+					throw new Error("send failed");
+				};
+			},
+		});
+		expect(
+			await attempt(h.transport, request(), {
+				requestId: "request-send",
+				attemptId: "attempt-send",
+			}),
+		).toBeNull();
+		expect(h.observations).toContainEqual(
+			expect.objectContaining({
+				requestId: "request-send",
+				attemptId: "attempt-send",
+				fallbackReason: "send_failed_before_write",
+				fallbackAllowedBeforeWrite: true,
+			}),
+		);
 	});
 
 	test("never treats a local post-send callback failure as HTTP-fallback-safe", async () => {
@@ -420,6 +655,8 @@ describe("CodexWebSocketTransport replay boundary", () => {
 			providerName: "codex",
 			request: request(),
 			signal: new AbortController().signal,
+			requestId: "request-callback",
+			attemptId: "attempt-callback",
 			onFrameWritten: () => {
 				throw new Error("local callback failed");
 			},
@@ -444,6 +681,8 @@ describe("CodexWebSocketTransport replay boundary", () => {
 			providerName: "codex",
 			request: request(),
 			signal: new AbortController().signal,
+			requestId: "request-veto",
+			attemptId: "attempt-veto",
 			onFrameWritten: (receipt) => {
 				queueMicrotask(() => receipt.markPostWriteFailure("semantic_stall"));
 			},
@@ -481,10 +720,127 @@ describe("CodexWebSocketTransport replay boundary", () => {
 		});
 		expect(result?.receipt.frameWritten).toBe(true);
 		expect(result?.receipt.stickyHttp).toBe(true);
-		expect(await attempt(h.transport)).toBeNull();
+		expect(
+			await attempt(h.transport, request(), {
+				requestId: "request-sticky",
+				attemptId: "attempt-sticky",
+			}),
+		).toBeNull();
 		expect(h.sockets).toHaveLength(1);
 		expect(h.transport.getStats().counters.postWriteFailures).toBe(1);
 		expect(h.observations.at(-1)?.fallbackAllowedBeforeWrite).toBe(false);
+		expect(h.observations.at(-1)).toMatchObject({
+			requestId: "request-sticky",
+			attemptId: "attempt-sticky",
+			fallbackReason: "sticky_http",
+		});
+	});
+
+	test("normalizes upstream terminal error observations without losing the exact category", async () => {
+		enableCanary();
+		const h = harness({
+			configureSocket(socket) {
+				socket.onSend = (ws) =>
+					queueMicrotask(() => {
+						ws.emitJson({
+							type: "response.created",
+							response: { id: "failed" },
+						});
+						ws.emitJson({
+							type: "response.failed",
+							response: { id: "failed" },
+						});
+					});
+			},
+		});
+		const result = await attempt(h.transport, request(), {
+			requestId: "request-terminal-error",
+			attemptId: "attempt-terminal-error",
+		});
+		await result?.response.text();
+		expect(h.observations).toContainEqual(
+			expect.objectContaining({
+				requestId: "request-terminal-error",
+				attemptId: "attempt-terminal-error",
+				closeCategory: "response.failed",
+				fallbackReason: "upstream_terminal_error",
+				stickyHttp: true,
+			}),
+		);
+	});
+
+	test("bounds queued WebSocket output and never replays a flooded slow reader", async () => {
+		enableCanary();
+		const h = harness({
+			configureSocket(socket) {
+				socket.onSend = (ws) =>
+					queueMicrotask(() =>
+						ws.emitJson({
+							type: "response.created",
+							response: { id: "flood" },
+						}),
+					);
+			},
+		});
+		const result = await attempt(h.transport, request(), {
+			requestId: "request-flood",
+			attemptId: "attempt-flood",
+		});
+		expect(result).not.toBeNull();
+		for (let index = 0; index < 300; index++) {
+			h.sockets[0].emitJson({
+				type: "response.output_text.delta",
+				delta: "x",
+				sequence_number: index,
+			});
+		}
+		for (let index = 0; index < 20 && !result?.receipt.stickyHttp; index++) {
+			await Bun.sleep(0);
+		}
+		expect(result?.receipt.stickyHttp).toBe(true);
+		expect(h.transport.getStats().poolSize).toBe(0);
+		expect(h.observations).toContainEqual(
+			expect.objectContaining({
+				requestId: "request-flood",
+				attemptId: "attempt-flood",
+				fallbackReason: "buffer_overflow",
+				fallbackAllowedBeforeWrite: false,
+				stickyHttp: true,
+			}),
+		);
+		expect(
+			await attempt(h.transport, request(), {
+				requestId: "request-flood-retry",
+				attemptId: "attempt-flood-retry",
+			}),
+		).toBeNull();
+	});
+
+	test("records at most one terminal observation per transport attempt", async () => {
+		enableCanary();
+		const h = harness({
+			configureSocket(socket) {
+				socket.onSend = (ws) =>
+					queueMicrotask(() => {
+						ws.emitJson({ type: "response.created", response: { id: "once" } });
+						ws.emitJson({
+							type: "response.completed",
+							response: { id: "once" },
+						});
+					});
+			},
+		});
+		const result = await attempt(h.transport, request(), {
+			requestId: "request-once",
+			attemptId: "attempt-once",
+		});
+		await result?.response.text();
+		result?.receipt.markPostWriteFailure("semantic_stall");
+		expect(
+			h.observations.filter(
+				(observation) => observation.attemptId === "attempt-once",
+			),
+		).toHaveLength(1);
 	});
 
 	test("post-write timeout is final and sticky with no replay", async () => {
@@ -516,6 +872,8 @@ describe("CodexWebSocketTransport replay boundary", () => {
 				providerName: "codex",
 				request: request(),
 				signal: controller.signal,
+				requestId: "request-abort",
+				attemptId: "attempt-abort",
 				onFrameWritten: (receipt) => {
 					writtenReceipt = receipt;
 				},
