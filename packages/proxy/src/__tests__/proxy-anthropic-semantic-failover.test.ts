@@ -595,6 +595,23 @@ function exactModelExhaustedResponse(): Response {
 	);
 }
 
+function extraUsageExhaustedResponse(): Response {
+	return new Response(
+		JSON.stringify({
+			type: "error",
+			error: {
+				type: "invalid_request_error",
+				message:
+					"Third-party apps now draw from your extra usage, not your plan limits. Add more at claude.ai/settings/usage and keep going.",
+			},
+		}),
+		{
+			status: 400,
+			headers: { "content-type": "application/json" },
+		},
+	);
+}
+
 function cacheControlRejectionResponse(): Response {
 	return new Response(
 		JSON.stringify({
@@ -2040,6 +2057,167 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		} finally {
 			releaseLock.mockRestore();
 		}
+	});
+
+	it("fails over a request-local extra-usage 400 to a later account and disposes the retained body", async () => {
+		const first = makeAccount("extra-usage-a");
+		const second = makeAccount("healthy-b");
+		const { ctx } = makeContext([first, second]);
+		const fetchedAccounts: string[] = [];
+		let firstResponse: Response | null = null;
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			const accountId =
+				upstreamRequest.headers.get("x-api-key")?.slice(4) ?? "";
+			fetchedAccounts.push(accountId);
+			if (accountId === first.id) {
+				firstResponse = extraUsageExhaustedResponse();
+				return firstResponse;
+			}
+			return sseResponse(byteStream(SUCCESS));
+		}) as unknown as typeof fetch;
+
+		const request = makeRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+
+		expect(await response.text()).toEndWith(SUCCESS);
+		expect(fetchedAccounts).toEqual([first.id, second.id]);
+		expect(firstResponse?.bodyUsed).toBe(true);
+		expect(first.rate_limited_until).toBeNull();
+		expect(first.consecutive_rate_limits).toBe(0);
+		expect(
+			usageCache.getModelScopedExhaustion(first.id, MODEL, null),
+		).toBeNull();
+	});
+
+	it("continues from extra-usage rejection to a distinct model slot on the same account", async () => {
+		const account = makeAccount("extra-usage-model-slots");
+		account.model_mappings = JSON.stringify({
+			opus: [MODEL, OPUS_SIBLING],
+		});
+		const { ctx } = makeContext([account]);
+		const attemptedModels: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			const body = (await upstreamRequest.clone().json()) as { model: string };
+			attemptedModels.push(body.model);
+			return body.model === MODEL
+				? extraUsageExhaustedResponse()
+				: sseResponse(byteStream(SUCCESS));
+		}) as unknown as typeof fetch;
+
+		const request = makeRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+
+		expect(await response.text()).toEndWith(SUCCESS);
+		expect(attemptedModels).toEqual([MODEL, OPUS_SIBLING]);
+		expect(account.rate_limited_until).toBeNull();
+		expect(account.consecutive_rate_limits).toBe(0);
+		expect(
+			usageCache.getModelScopedExhaustion(account.id, MODEL, null),
+		).toBeNull();
+	});
+
+	it("classifies extra-usage returned by an intermediate model fallback before continuing", async () => {
+		const account = makeAccount("extra-usage-intermediate-fallback");
+		account.model_mappings = JSON.stringify({
+			opus: [MODEL, OPUS_SIBLING, FABLE],
+		});
+		const { ctx } = makeContext([account]);
+		const attemptedModels: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			const body = (await upstreamRequest.clone().json()) as { model: string };
+			attemptedModels.push(body.model);
+			if (body.model === MODEL) {
+				return new Response(
+					JSON.stringify({
+						type: "error",
+						error: { type: "not_found_error", message: "model not found" },
+					}),
+					{ status: 404, headers: { "content-type": "application/json" } },
+				);
+			}
+			return body.model === OPUS_SIBLING
+				? extraUsageExhaustedResponse()
+				: sseResponse(byteStream(SUCCESS));
+		}) as unknown as typeof fetch;
+
+		const request = makeRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+
+		expect(await response.text()).toEndWith(SUCCESS);
+		expect(attemptedModels).toEqual([MODEL, OPUS_SIBLING, FABLE]);
+		expect(account.rate_limited_until).toBeNull();
+		expect(account.consecutive_rate_limits).toBe(0);
+	});
+
+	it("returns a retained upstream extra-usage 400 after every route is exhausted", async () => {
+		const first = makeAccount("extra-usage-a");
+		const second = makeAccount("extra-usage-b");
+		const { ctx } = makeContext([first, second]);
+		const fetchedAccounts: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			fetchedAccounts.push(
+				upstreamRequest.headers.get("x-api-key")?.slice(4) ?? "",
+			);
+			return extraUsageExhaustedResponse();
+		}) as unknown as typeof fetch;
+
+		const request = makeRequest(undefined, undefined, false);
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const payload = (await response.json()) as {
+			error?: { type?: string; message?: string };
+		};
+
+		expect(fetchedAccounts).toEqual([first.id, second.id]);
+		expect(response.status).toBe(400);
+		expect(payload.error).toEqual({
+			type: "invalid_request_error",
+			message:
+				"Third-party apps now draw from your extra usage, not your plan limits. Add more at claude.ai/settings/usage and keep going.",
+		});
+	});
+
+	it("preserves an earlier extra-usage 400 when a later route fails without retaining a terminal", async () => {
+		const first = makeAccount("extra-usage-retained-a");
+		const second = makeAccount("payment-required-b");
+		const { ctx } = makeContext([first, second]);
+		const fetchedAccounts: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			const accountId =
+				upstreamRequest.headers.get("x-api-key")?.slice(4) ?? "";
+			fetchedAccounts.push(accountId);
+			if (accountId === first.id) return extraUsageExhaustedResponse();
+			return new Response(
+				JSON.stringify({
+					type: "error",
+					error: { type: "billing_error", message: "payment required" },
+				}),
+				{ status: 402, headers: { "content-type": "application/json" } },
+			);
+		}) as unknown as typeof fetch;
+
+		const request = makeRequest(undefined, undefined, false);
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const payload = (await response.json()) as {
+			error?: { type?: string; message?: string };
+		};
+
+		expect(fetchedAccounts).toEqual([first.id, second.id]);
+		expect(response.status).toBe(400);
+		expect(payload.error).toEqual({
+			type: "invalid_request_error",
+			message:
+				"Third-party apps now draw from your extra usage, not your plan limits. Add more at claude.ai/settings/usage and keep going.",
+		});
 	});
 
 	it("reserves while a final account can discover deferred model work, then gives the deferred route the final boundary", async () => {

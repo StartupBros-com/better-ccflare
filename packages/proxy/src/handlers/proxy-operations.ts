@@ -153,6 +153,10 @@ interface RawAttemptFailureClassification {
 	readonly family: string | null;
 	/** Stop this account attempt even when the evidence itself is model-scoped. */
 	readonly stopAccountAttempt: boolean;
+	/** The caller or request ledger owns this response body until delivery/discard. */
+	readonly retainedTerminalResponse?: boolean;
+	/** Preserve the legacy direct-call contract when no request ledger is supplied. */
+	readonly returnOriginalResponse?: boolean;
 }
 
 function getTestContextWindowOverride(): number | undefined {
@@ -2010,11 +2014,11 @@ export async function proxyWithAccount(
 			return null;
 		}
 		if (routingAttemptLedger) {
-			// A later unique upstream route supersedes any deferred terminal response
-			// from the previous route. Duplicate skips return above and deliberately
-			// preserve it so the request can still surface that upstream terminal once
-			// every unique route has been exhausted.
-			await routingAttemptLedger.discardTerminalResponse();
+			// Merely attempting another unique route does not supersede a retained
+			// upstream terminal. A later retained terminal replaces it through the
+			// ledger, while the outer routing loop releases it after success or throw.
+			// If this route fails without retaining a replacement, the earlier response
+			// remains available once every unique route is exhausted.
 			failoverAttempts = Math.max(
 				failoverAttempts,
 				routingAttemptLedger.attemptedCount - 1,
@@ -2523,32 +2527,30 @@ export async function proxyWithAccount(
 			};
 		};
 
-		// ── extra_usage_exhausted: billing-policy rejection, NOT a rate limit (issue #293) ──
-		// Anthropic returns 400 invalid_request_error when a Claude OAuth account's
-		// "extra usage" credit balance is depleted for third-party-app traffic (e.g.
-		// OpenCode). This is a billing rejection, not account exhaustion — we do NOT
-		// bench the account and we do NOT change what's returned to the client; the
-		// 400 is passed through unchanged. We only log/record it for dashboard visibility.
-		// Checked before isModelUnavailableError since this 400 shape (invalid_request_error
-		// mentioning "extra usage") is not a "model unavailable" condition and would
-		// otherwise never be reached — isModelUnavailableError only matches not_found_error,
-		// model_not_found, "model not found"/"does not exist", or ResourceNotFoundException.
-		// Gated to Anthropic/Claude-OAuth accounts only — the body-shape match
-		// (invalid_request_error + "extra usage") is specific enough for Anthropic's
-		// API but could otherwise coincidentally match an arbitrary OpenAI-compatible
-		// provider's error text and mislabel its billing state.
-		if (
-			isClaudeProvider &&
-			rawResponse.status === 400 &&
-			(await isAnthropicExtraUsageExhausted(rawResponse.clone()))
-		) {
-			let requestedModel: string | null = null;
-			if (effectiveBodyBuffer) requestedModel = effectiveBodyContext.getModel();
+		/**
+		 * Classify Anthropic's extra-usage billing rejection as request-local route
+		 * exhaustion. It must not create a cooldown or durable usage marker: another
+		 * account, or a distinct concrete model slot on the same account, may still
+		 * serve this request. Keep one original upstream 400 in the request ledger so
+		 * total route exhaustion returns the real billing response instead of a
+		 * synthetic 503.
+		 */
+		const handleExtraUsageExhausted400 = async (
+			failureResponse: Response,
+			attemptedModel: string | null,
+		): Promise<RawAttemptFailureClassification | null> => {
+			if (
+				failureResponse.status !== 400 ||
+				!isClaudeProvider ||
+				!(await isAnthropicExtraUsageExhausted(failureResponse))
+			) {
+				return null;
+			}
 
 			const reason: RateLimitReason = "extra_usage_exhausted";
 			log.warn(
-				`Account ${account.name} extra_usage_exhausted (400${requestedModel ? `, model=${requestedModel}` : ""}) — ` +
-					`Anthropic extra-usage credits depleted for this OAuth account; NOT benching, response passed through to client`,
+				`Account ${account.name} extra_usage_exhausted (400${attemptedModel ? `, model=${attemptedModel}` : ""}) — ` +
+					"retaining the original response and continuing request-local failover without a global cooldown",
 			);
 			const responseTime = Date.now() - requestMeta.timestamp;
 			ctx.asyncWriter.enqueue(() =>
@@ -2562,19 +2564,48 @@ export async function proxyWithAccount(
 					reason,
 					responseTime,
 					failoverAttempts,
-					requestedModel ? { model: requestedModel } : undefined,
+					attemptedModel ? { model: attemptedModel } : undefined,
 					requestMeta.agentUsed ?? undefined,
 					apiKeyId ?? undefined,
 					apiKeyName ?? undefined,
 					requestMeta.project ?? null,
 					undefined,
 					requestMeta.comboName ?? null,
+					isModelRewrite(requestMeta.originalModel, requestMeta.appliedModel)
+						? (requestMeta.originalModel ?? null)
+						: null,
+					isModelRewrite(requestMeta.originalModel, requestMeta.appliedModel)
+						? (requestMeta.appliedModel ?? null)
+						: null,
+					requestMeta.projectAttributionSource ?? null,
+					requestMeta.agentAttributionSource ?? null,
 				),
 			);
-			// Do not bench the account or fail over — pass Anthropic's real error
-			// through to the client unchanged, same as any other 400 today.
-			return withSanitizedProxyHeaders(rawResponse);
-		}
+
+			if (!routingAttemptLedger) {
+				return {
+					scope: "not-classified",
+					attemptedModel,
+					family: attemptedModel ? getModelFamily(attemptedModel) : null,
+					stopAccountAttempt: false,
+					retainedTerminalResponse: true,
+					returnOriginalResponse: true,
+				};
+			}
+
+			const retainedResponse = failureResponse;
+			await routingAttemptLedger.retainTerminalResponse({
+				deliver: async () => withSanitizedProxyHeaders(retainedResponse),
+				discard: () => discardUpstreamBody(retainedResponse),
+			});
+			return {
+				scope: "model",
+				attemptedModel,
+				family: attemptedModel ? getModelFamily(attemptedModel) : null,
+				stopAccountAttempt: false,
+				retainedTerminalResponse: true,
+			};
+		};
 
 		/**
 		 * Scope every generic Anthropic 429 before account cooldown. Fresh positive
@@ -2866,6 +2897,7 @@ export async function proxyWithAccount(
 			attemptedModel = currentTransportModel || effectiveBodyContext.getModel(),
 		): Promise<RawAttemptFailureClassification> => {
 			const classification =
+				(await handleExtraUsageExhausted400(failureResponse, attemptedModel)) ??
 				(await handlePaymentRequired402(failureResponse, attemptedModel)) ??
 				(await handleExactModel429(failureResponse, attemptedModel)) ??
 				(await handleScopedAnthropic429(failureResponse, attemptedModel));
@@ -2878,11 +2910,16 @@ export async function proxyWithAccount(
 				};
 			}
 			await finalizeCurrentCodexTransport(failureResponse);
-			await discardUpstreamBody(failureResponse);
+			if (!classification.retainedTerminalResponse) {
+				await discardUpstreamBody(failureResponse);
+			}
 			return classification;
 		};
 
 		let rawFailureClassification = await handleRawAttemptFailure(rawResponse);
+		if (rawFailureClassification.returnOriginalResponse) {
+			return withSanitizedProxyHeaders(rawResponse);
+		}
 		if (rawFailureClassification.stopAccountAttempt) {
 			return null;
 		}
@@ -2940,7 +2977,8 @@ export async function proxyWithAccount(
 		// (the primary), so start at index 1.
 		if (
 			!isNativeXaiCapacityOrRateLimitSignal &&
-			(await isModelUnavailableError(rawResponse, readAttemptBoundJson))
+			(isScopedFailure(rawFailureClassification) ||
+				(await isModelUnavailableError(rawResponse, readAttemptBoundJson)))
 		) {
 			// Log 429 response headers for debugging upstream rate-limit info
 			if (rawResponse.status === 429) {
@@ -3340,7 +3378,10 @@ export async function proxyWithAccount(
 			// If still unavailable/rate-limited after exhausting the model list,
 			// failover to the next account. OpenAI-compatible providers never set
 			// isRateLimited:true in parseRateLimit, so we must handle it here.
-			if (await isModelUnavailableError(rawResponse, readAttemptBoundJson)) {
+			if (
+				isScopedFailure(rawFailureClassification) ||
+				(await isModelUnavailableError(rawResponse, readAttemptBoundJson))
+			) {
 				if (isScopedFailure(rawFailureClassification)) {
 					return null;
 				}
