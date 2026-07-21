@@ -93,6 +93,22 @@ interface RouteCircuitSelection {
 	candidateIds: readonly string[];
 }
 
+interface SessionAffinityEntry {
+	/** Preferred/current owner retained for ordinary stickiness and snapback. */
+	candidateId: string;
+	/**
+	 * Temporary owner used while a strictly-better preferred owner is absent.
+	 * Kept separately so fallback turns stay cache-sticky without forfeiting the
+	 * preferred owner's immediate recovery/probe semantics.
+	 */
+	fallbackCandidateId: string | null;
+	assignedAt: number;
+	/** When the current candidateId was last installed via an upgrade. */
+	upgradedAt: number | null;
+	/** If set, further upgrades are suppressed until this timestamp. */
+	suppressUpgradesUntil: number | null;
+}
+
 /**
  * SessionAffinityStrategy — a hybrid of SessionStrategy and LeastUsedStrategy.
  *
@@ -142,21 +158,8 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 	private maxRouteSuppressionEntries: number;
 	private store: StrategyStore | null = null;
 	private log = new Logger("SessionAffinityStrategy");
-	/** clientId → which account it is stuck to (and when it was last touched). */
-	private affinity = new Map<
-		string,
-		{
-			candidateId: string;
-			assignedAt: number;
-			/** When the current candidateId was last installed via an upgrade
-			 * (branch: outclassed remap), or null if it was a fresh assignment or
-			 * a plain (non-upgrade) failover remap. */
-			upgradedAt: number | null;
-			/** If set and still in the future, further upgrades are suppressed
-			 * (anti-thrash) until this timestamp. */
-			suppressUpgradesUntil: number | null;
-		}
-	>();
+	/** Affinity lane → preferred/current owner plus any temporary fallback. */
+	private affinity = new Map<string, SessionAffinityEntry>();
 	/** accountId → last time it was freshly assigned to a NEW client-session. */
 	private lastPickedAt = new Map<string, number>();
 	/** Exact lane+candidate circuit state; never promoted to account health. */
@@ -509,6 +512,49 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 	}
 
 	/**
+	 * Keep a legal temporary fallback first without replacing the preferred
+	 * owner. If the old fallback disappeared, became unavailable/hard-excluded,
+	 * or is outclassed by the best current routing class, choose and remember a
+	 * new least-used fallback. The fallback lives inside the already-bounded
+	 * affinity entry, so this adds no caller-controlled side map.
+	 */
+	private orderWithActiveFallback(
+		available: StrategyCandidate[],
+		mapping: SessionAffinityEntry,
+		now: number,
+		meta: RequestMeta,
+	): StrategyCandidate[] {
+		// The lane is active even while its preferred owner is absent/probing.
+		mapping.assignedAt = now;
+		const ranked = this.rankByLeastUsed(available, now, meta);
+		const best = ranked[0];
+		const fallback = mapping.fallbackCandidateId
+			? available.find(
+					(candidate) =>
+						candidate.routing.candidateId === mapping.fallbackCandidateId,
+				)
+			: undefined;
+
+		if (
+			fallback &&
+			best &&
+			isSameStrategyCandidateClass(fallback, best, meta)
+		) {
+			return [
+				fallback,
+				...ranked.filter(
+					(candidate) =>
+						candidate.routing.candidateId !== fallback.routing.candidateId,
+				),
+			];
+		}
+
+		const ordered = this.pickAndMark(available, now, meta);
+		mapping.fallbackCandidateId = ordered[0]?.routing.candidateId ?? null;
+		return ordered;
+	}
+
+	/**
 	 * Bound the affinity map: when it is full, evict the least-recently-touched
 	 * entry (smallest assignedAt) before inserting a new one. O(n) only when at
 	 * capacity, which only happens under pathological unique-clientId input.
@@ -592,11 +638,14 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 			);
 			const bestClosedCandidate = rankedClosedCandidates[0];
 			const mapping = this.affinity.get(affinityKey);
+			const activeMapping =
+				mapping && now - mapping.assignedAt < this.affinityTtlMs
+					? mapping
+					: undefined;
 			const upgradeSuppressed =
-				mapping !== undefined &&
-				now - mapping.assignedAt < this.affinityTtlMs &&
-				mapping.suppressUpgradesUntil !== null &&
-				now < mapping.suppressUpgradesUntil;
+				activeMapping !== undefined &&
+				activeMapping.suppressUpgradesUntil !== null &&
+				now < activeMapping.suppressUpgradesUntil;
 
 			// A recovered better routing class must get one real chance to reclaim its
 			// configured priority. Lease it only when it will be returned as the first
@@ -614,7 +663,14 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 					(a, b) => compareStrategyCandidates(a, b, meta),
 				);
 				if (forcedPriorityProbe) {
-					forcedPriorityFallbacks = rankedClosedCandidates;
+					forcedPriorityFallbacks = activeMapping
+						? this.orderWithActiveFallback(
+								closedCandidates,
+								activeMapping,
+								now,
+								meta,
+							)
+						: rankedClosedCandidates;
 				}
 			}
 
@@ -686,6 +742,7 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 					// STICKY hit: keep the client on its account (prompt-cache reuse).
 					// Refresh assignedAt so an active session keeps its mapping alive.
 					mapping.assignedAt = now;
+					mapping.fallbackCandidateId = null;
 					const others = this.rankByLeastUsed(
 						available.filter(
 							(candidate) =>
@@ -713,6 +770,7 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 						// instead of re-attempting the flapping better tier on every
 						// recovery.
 						mapping.assignedAt = now;
+						mapping.fallbackCandidateId = null;
 						const others = this.rankByLeastUsed(
 							available.filter(
 								(candidate) =>
@@ -742,6 +800,7 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 					const replacement = ordered[0];
 					if (replacement) {
 						mapping.candidateId = replacement.routing.candidateId;
+						mapping.fallbackCandidateId = null;
 						mapping.assignedAt = now;
 						mapping.upgradedAt = now;
 						mapping.suppressUpgradesUntil = null;
@@ -763,8 +822,6 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 							(candidate) =>
 								candidate.routing.candidateId === mapping.candidateId,
 						)?.routing.tier;
-					const ordered = this.pickAndMark(available, now, meta);
-					const fallback = ordered[0];
 					const bestTier =
 						minimumRoutableTier(
 							available.map((candidate) => candidate.routing.tier),
@@ -802,6 +859,8 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 					const fastFailAfterUpgrade = stillConfigured && recentlyUpgraded;
 
 					if (fastFailAfterUpgrade && upgradedAt !== null) {
+						const ordered = this.pickAndMark(available, now, meta);
+						const fallback = ordered[0];
 						// The owner this session was just upgraded to has already failed:
 						// arm suppression for the remainder of the window (measured from
 						// the original upgrade) and settle on the fallback instead of
@@ -810,6 +869,7 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 							upgradedAt + this.antiThrashWindowMs;
 						if (fallback) {
 							mapping.candidateId = fallback.routing.candidateId;
+							mapping.fallbackCandidateId = null;
 							mapping.assignedAt = now;
 							mapping.upgradedAt = null;
 							this.log.info(
@@ -829,18 +889,28 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 					const preserveForSnapback =
 						configuredOwnerTier !== undefined && configuredOwnerTier < bestTier;
 					if (preserveForSnapback) {
-						// Refresh while the client remains active so a legal temporary
-						// failover does not expire the better-tier owner mapping.
-						mapping.assignedAt = now;
+						const ordered = this.orderWithActiveFallback(
+							available,
+							mapping,
+							now,
+							meta,
+						);
 						this.log.info(
 							"Better-tier route owner unavailable; preserving for snapback",
 							{
 								candidateId: mapping.candidateId,
+								fallbackCandidateId: mapping.fallbackCandidateId,
 								affinityLanePresent: meta.affinityLaneKey != null,
 							},
 						);
-					} else if (fallback) {
+						return commitStrategyCandidateOrder(ordered, meta);
+					}
+
+					const ordered = this.pickAndMark(available, now, meta);
+					const fallback = ordered[0];
+					if (fallback) {
 						mapping.candidateId = fallback.routing.candidateId;
+						mapping.fallbackCandidateId = null;
 						mapping.assignedAt = now;
 						mapping.upgradedAt = null;
 						this.log.info("Unavailable equal/worse route owner remapped", {
@@ -863,6 +933,7 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 			this.evictOldestIfFull();
 			this.affinity.set(affinityKey, {
 				candidateId: chosen.routing.candidateId,
+				fallbackCandidateId: null,
 				assignedAt: now,
 				upgradedAt: null,
 				suppressUpgradesUntil: null,
