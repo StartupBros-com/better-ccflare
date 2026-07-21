@@ -213,14 +213,112 @@ export function applyRateLimitCooldown(
  * request for the SAME account (e.g. rapid retries against a still
  * rate-limited account) would spawn its own parallel write/retry loop, piling
  * up concurrent SQLite writers against the same lock. Reusing the in-flight
- * promise instead avoids the pile-up. This is safe regardless of which
- * caller's cooldownUntil/reason "wins" the write: the monotonic SQL clamp on
- * markAccountRateLimited (see database-operations.ts) means a later deadline
- * always wins on the next call, coalesced or not. This intentionally adds no
- * process-local selection breaker: selection still always reads fresh account
- * state from the DB.
+ * promise instead avoids the pile-up. Calls whose deadline is already covered
+ * by the active write reuse it. Calls with a later deadline share one pending
+ * follow-up write, whose payload is updated to the maximum observed deadline;
+ * equal deadlines retain the first observed reason, matching the database's
+ * strict-greater monotonic clamp. This intentionally adds no process-local
+ * selection breaker: selection still always reads fresh account state from
+ * the DB.
  */
-const inFlightRateLimitWrites = new Map<string, Promise<number>>();
+interface RateLimitPersistPayload {
+	ctx: ProxyContext;
+	cooldownUntil: number;
+	reason: RateLimitReason;
+}
+
+interface PendingRateLimitWrite extends RateLimitPersistPayload {
+	promise: Promise<number>;
+	resolve: (persistedCount: number) => void;
+	reject: (error: unknown) => void;
+}
+
+interface RateLimitWriteState {
+	active: RateLimitPersistPayload;
+	activePromise: Promise<number>;
+	pending: PendingRateLimitWrite | null;
+}
+
+const inFlightRateLimitWrites = new Map<string, RateLimitWriteState>();
+
+function invokeMarkAccountRateLimited(
+	accountId: string,
+	payload: RateLimitPersistPayload,
+): Promise<number> {
+	try {
+		return Promise.resolve(
+			payload.ctx.dbOps.markAccountRateLimited(
+				accountId,
+				payload.cooldownUntil,
+				payload.reason,
+			),
+		);
+	} catch (error) {
+		return Promise.reject(error);
+	}
+}
+
+function observeRateLimitWrite(
+	accountId: string,
+	state: RateLimitWriteState,
+	writePromise: Promise<number>,
+	completion?: PendingRateLimitWrite,
+): void {
+	void writePromise
+		.then(
+			(persistedCount) => {
+				completion?.resolve(persistedCount);
+				advanceRateLimitWrite(accountId, state, writePromise);
+			},
+			(error) => {
+				completion?.reject(error);
+				advanceRateLimitWrite(accountId, state, writePromise);
+			},
+		)
+		.catch((error) => {
+			log.error(
+				`[ccflare] account_id=${accountId} cooldown_persist_bookkeeping_failed`,
+				error,
+			);
+		});
+}
+
+function advanceRateLimitWrite(
+	accountId: string,
+	state: RateLimitWriteState,
+	settledPromise: Promise<number>,
+): void {
+	if (
+		inFlightRateLimitWrites.get(accountId) !== state ||
+		state.activePromise !== settledPromise
+	) {
+		return;
+	}
+
+	const pending = state.pending;
+	if (!pending) {
+		inFlightRateLimitWrites.delete(accountId);
+		return;
+	}
+
+	state.pending = null;
+	state.active = pending;
+	const writePromise = invokeMarkAccountRateLimited(accountId, pending);
+	state.activePromise = writePromise;
+	observeRateLimitWrite(accountId, state, writePromise, pending);
+}
+
+function createPendingRateLimitWrite(
+	payload: RateLimitPersistPayload,
+): PendingRateLimitWrite {
+	let resolve!: (persistedCount: number) => void;
+	let reject!: (error: unknown) => void;
+	const promise = new Promise<number>((resolvePromise, rejectPromise) => {
+		resolve = resolvePromise;
+		reject = rejectPromise;
+	});
+	return { ...payload, promise, resolve, reject };
+}
 
 function getOrStartMarkAccountRateLimited(
 	ctx: ProxyContext,
@@ -228,29 +326,31 @@ function getOrStartMarkAccountRateLimited(
 	cooldownUntil: number,
 	reason: RateLimitReason,
 ): Promise<number> {
+	const payload = { ctx, cooldownUntil, reason };
 	const existing = inFlightRateLimitWrites.get(account.id);
-	if (existing) return existing;
+	if (existing) {
+		if (cooldownUntil <= existing.active.cooldownUntil) {
+			return existing.activePromise;
+		}
 
-	const writePromise = ctx.dbOps.markAccountRateLimited(
-		account.id,
-		cooldownUntil,
-		reason,
-	);
-	inFlightRateLimitWrites.set(account.id, writePromise);
-	// Cleanup runs on a derived chain that can never itself reject (.catch
-	// swallows first), so this bookkeeping can never surface as an unhandled
-	// rejection. The original writePromise -- which may still reject -- is
-	// still returned to the caller below; attaching multiple independent
-	// .then/.catch/.finally subscribers to the same promise is standard, safe
-	// JS behavior.
-	writePromise
-		.catch(() => {})
-		.finally(() => {
-			if (inFlightRateLimitWrites.get(account.id) === writePromise) {
-				inFlightRateLimitWrites.delete(account.id);
-			}
-		});
+		if (!existing.pending) {
+			existing.pending = createPendingRateLimitWrite(payload);
+		} else if (cooldownUntil > existing.pending.cooldownUntil) {
+			existing.pending.ctx = ctx;
+			existing.pending.cooldownUntil = cooldownUntil;
+			existing.pending.reason = reason;
+		}
+		return existing.pending.promise;
+	}
 
+	const writePromise = invokeMarkAccountRateLimited(account.id, payload);
+	const state: RateLimitWriteState = {
+		active: payload,
+		activePromise: writePromise,
+		pending: null,
+	};
+	inFlightRateLimitWrites.set(account.id, state);
+	observeRateLimitWrite(account.id, state, writePromise);
 	return writePromise;
 }
 

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, mock } from "bun:test";
 import type { Account } from "@better-ccflare/types";
 import type { ProxyContext } from "../proxy-types";
 import { applyRateLimitCooldownAwaitingPersist } from "../rate-limit-cooldown";
@@ -173,12 +173,12 @@ describe("applyRateLimitCooldownAwaitingPersist: per-account single-flight coale
 
 		const p1 = applyRateLimitCooldownAwaitingPersist(
 			account,
-			{ reason: "xai_capacity_402" },
+			{ resetTime: NOW + 60_000, reason: "xai_capacity_402" },
 			ctx,
 		);
 		const p2 = applyRateLimitCooldownAwaitingPersist(
 			account,
-			{ reason: "xai_capacity_402" },
+			{ resetTime: NOW + 60_000, reason: "xai_capacity_402" },
 			ctx,
 		);
 
@@ -191,6 +191,163 @@ describe("applyRateLimitCooldownAwaitingPersist: per-account single-flight coale
 		resolveWrite?.(7);
 		await Promise.all([p1, p2]);
 		expect(callCount).toBe(1);
+	});
+
+	it("raises an already-pending intermediate deadline to the maximum and keeps the maximum's paired reason", async () => {
+		Date.now = () => NOW;
+		const account = makeAccount({
+			id: "acc-coalesce-pending-max",
+			consecutive_rate_limits: 3,
+		});
+		const calls: Array<{
+			until: number;
+			reason: string;
+			resolve: (value: number) => void;
+		}> = [];
+		const ctx = {
+			dbOps: {
+				markAccountRateLimited: (
+					_accountId: string,
+					until: number,
+					reason: string,
+				) =>
+					new Promise<number>((resolve) => {
+						calls.push({ until, reason, resolve });
+					}),
+			},
+		} as unknown as ProxyContext;
+
+		const first = applyRateLimitCooldownAwaitingPersist(
+			account,
+			{
+				resetTime: NOW + 60_000,
+				reason: "upstream_402_payment_required",
+			},
+			ctx,
+		);
+		const intermediate = applyRateLimitCooldownAwaitingPersist(
+			account,
+			{
+				resetTime: NOW + 90_000,
+				reason: "model_fallback_429",
+			},
+			ctx,
+		);
+		const maximum = applyRateLimitCooldownAwaitingPersist(
+			account,
+			{
+				resetTime: NOW + 120_000,
+				reason: "all_models_exhausted_429",
+			},
+			ctx,
+		);
+		const tiedMaximum = applyRateLimitCooldownAwaitingPersist(
+			account,
+			{
+				resetTime: NOW + 120_000,
+				reason: "upstream_429_with_reset",
+			},
+			ctx,
+		);
+		let intermediateSettled = false;
+		void intermediate.then(() => {
+			intermediateSettled = true;
+		});
+
+		expect(calls).toHaveLength(1);
+		expect(calls[0]).toMatchObject({
+			until: NOW + 60_000,
+			reason: "upstream_402_payment_required",
+		});
+
+		calls[0]?.resolve(7);
+		await first;
+		await Promise.resolve();
+
+		expect(calls).toHaveLength(2);
+		expect(intermediateSettled).toBe(false);
+		expect(calls[1]).toMatchObject({
+			until: NOW + 120_000,
+			reason: "all_models_exhausted_429",
+		});
+
+		calls[1]?.resolve(8);
+		await Promise.all([intermediate, maximum, tiedMaximum]);
+		expect(calls).toHaveLength(2);
+	});
+
+	it("advances exactly once to pending after an active rejection and ties the pending caller to the follow-up", async () => {
+		Date.now = () => NOW;
+		const account = makeAccount({
+			id: "acc-coalesce-rejected-active",
+			consecutive_rate_limits: 3,
+		});
+		const calls: Array<{
+			until: number;
+			reason: string;
+			resolve: (value: number) => void;
+			reject: (error: unknown) => void;
+		}> = [];
+		const ctx = {
+			dbOps: {
+				markAccountRateLimited: (
+					_accountId: string,
+					until: number,
+					reason: string,
+				) =>
+					new Promise<number>((resolve, reject) => {
+						calls.push({ until, reason, resolve, reject });
+					}),
+			},
+		} as unknown as ProxyContext;
+		const unhandledRejection = mock(
+			(_reason: unknown, _promise: Promise<unknown>) => undefined,
+		);
+		process.on("unhandledRejection", unhandledRejection);
+
+		try {
+			const first = applyRateLimitCooldownAwaitingPersist(
+				account,
+				{
+					resetTime: NOW + 60_000,
+					reason: "upstream_402_payment_required",
+				},
+				ctx,
+			);
+			const pending = applyRateLimitCooldownAwaitingPersist(
+				account,
+				{
+					resetTime: NOW + 120_000,
+					reason: "model_fallback_429",
+				},
+				ctx,
+			);
+			let pendingSettled = false;
+			void pending.then(() => {
+				pendingSettled = true;
+			});
+
+			expect(calls).toHaveLength(1);
+			calls[0]?.reject(new Error("active write failed"));
+			await first;
+			await Promise.resolve();
+
+			expect(calls).toHaveLength(2);
+			expect(pendingSettled).toBe(false);
+			expect(calls[1]).toMatchObject({
+				until: NOW + 120_000,
+				reason: "model_fallback_429",
+			});
+
+			calls[1]?.resolve(11);
+			await pending;
+			await new Promise((resolve) => setTimeout(resolve, 5));
+			expect(account.consecutive_rate_limits).toBe(11);
+			expect(calls).toHaveLength(2);
+			expect(unhandledRejection).not.toHaveBeenCalled();
+		} finally {
+			process.off("unhandledRejection", unhandledRejection);
+		}
 	});
 
 	it("invokes markAccountRateLimited again for the same account once the prior write has settled", async () => {

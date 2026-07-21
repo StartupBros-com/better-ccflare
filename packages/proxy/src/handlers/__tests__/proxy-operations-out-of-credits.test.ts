@@ -88,6 +88,14 @@ function makeRequestBody(model = "claude-sonnet-4-5") {
 	return new TextEncoder().encode(body).buffer;
 }
 
+function deferred<T>() {
+	let resolve!: (value: T | PromiseLike<T>) => void;
+	const promise = new Promise<T>((resolvePromise) => {
+		resolve = resolvePromise;
+	});
+	return { promise, resolve };
+}
+
 function makeProxyContextWithAsyncExec(): ProxyContext {
 	const markAccountRateLimited = mock(
 		(_accountId: string, _until: number, _reason: string) => Promise.resolve(1),
@@ -1094,6 +1102,122 @@ interface ObservableErrorResponse {
 	response: Response;
 	cancelCount: () => number;
 }
+
+describe("proxyWithAccount — durable account cooldown ordering", () => {
+	let originalFetch: typeof globalThis.fetch;
+
+	beforeEach(() => {
+		originalFetch = globalThis.fetch;
+	});
+
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+		usageCache.delete("acc-anthropic-1");
+	});
+
+	it("waits for generic non-xAI 402 cooldown persistence while request audit stays async", async () => {
+		const cooldownPersist = deferred<number>();
+		const cooldownStarted = deferred<void>();
+		const auditPersist = deferred<void>();
+		const ctx = makeProxyContextWithAsyncExec();
+		ctx.dbOps.markAccountRateLimited = mock(() => {
+			cooldownStarted.resolve();
+			return cooldownPersist.promise;
+		});
+		ctx.dbOps.saveRequest = mock(() => auditPersist.promise);
+		const paymentRequired = observableErrorResponse(402);
+		globalThis.fetch = mock(async () => paymentRequired.response);
+		const account = makeAccount();
+		const bodyBuffer = makeRequestBody();
+		const req = makeRequest(bodyBuffer);
+
+		const operation = proxyWithAccount(
+			req,
+			new URL(req.url),
+			account,
+			makeRequestMeta(),
+			bodyBuffer,
+			() => undefined,
+			0,
+			ctx,
+		);
+		let operationSettled = false;
+		void operation.then(() => {
+			operationSettled = true;
+		});
+
+		await cooldownStarted.promise;
+		await Promise.resolve();
+		expect(operationSettled).toBe(false);
+		expect(ctx.dbOps.saveRequest).not.toHaveBeenCalled();
+
+		cooldownPersist.resolve(1);
+		await expect(operation).resolves.toBeNull();
+		expect(ctx.dbOps.saveRequest).toHaveBeenCalledTimes(1);
+		let auditSettled = false;
+		void auditPersist.promise.then(() => {
+			auditSettled = true;
+		});
+		await Promise.resolve();
+		expect(auditSettled).toBe(false);
+
+		auditPersist.resolve();
+		await auditPersist.promise;
+	});
+
+	it("waits for hard account-scoped Anthropic 429 cooldown persistence while request audit stays async", async () => {
+		const cooldownPersist = deferred<number>();
+		const cooldownStarted = deferred<void>();
+		const auditPersist = deferred<void>();
+		const ctx = makeProxyContextWithAsyncExec();
+		ctx.dbOps.markAccountRateLimited = mock(() => {
+			cooldownStarted.resolve();
+			return cooldownPersist.promise;
+		});
+		ctx.dbOps.saveRequest = mock(() => auditPersist.promise);
+		const hardAccount429 = observableErrorResponse(429, {
+			"anthropic-ratelimit-unified-status": "rate_limited",
+			"retry-after": "120",
+		});
+		globalThis.fetch = mock(async () => hardAccount429.response);
+		const account = makeAccount();
+		const bodyBuffer = makeRequestBody();
+		const req = makeRequest(bodyBuffer);
+
+		const operation = proxyWithAccount(
+			req,
+			new URL(req.url),
+			account,
+			makeRequestMeta(),
+			bodyBuffer,
+			() => undefined,
+			0,
+			ctx,
+		);
+		let operationSettled = false;
+		void operation.then(() => {
+			operationSettled = true;
+		});
+
+		await cooldownStarted.promise;
+		await Promise.resolve();
+		expect(operationSettled).toBe(false);
+		expect(ctx.dbOps.saveRequest).not.toHaveBeenCalled();
+
+		cooldownPersist.resolve(1);
+		await expect(operation).resolves.toBeNull();
+		expect(ctx.dbOps.saveRequest).toHaveBeenCalledTimes(1);
+		let auditSettled = false;
+		void auditPersist.promise.then(() => {
+			auditSettled = true;
+		});
+		await Promise.resolve();
+		expect(auditSettled).toBe(false);
+
+		auditPersist.resolve();
+		await auditPersist.promise;
+	});
+});
 
 describe("proxyWithAccount — scoped same-account model continuation", () => {
 	let originalFetch: typeof globalThis.fetch;
