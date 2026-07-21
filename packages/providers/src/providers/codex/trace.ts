@@ -180,6 +180,7 @@ interface TraceInputs {
 		| "thinking_retry"
 		| "cache_control_retry"
 		| "cache_lane_rescue"
+		| "precommit_sse_retry"
 		| "account_failover"
 		| "other_retry";
 	account?: string;
