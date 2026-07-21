@@ -348,7 +348,8 @@ export class BedrockProvider extends BaseProvider implements Provider {
 									}
 
 									const pending = existing ?? { byteLength: 0, chunks: [] };
-									const byteLength = pending.byteLength + redactedContent.byteLength;
+									const byteLength =
+										pending.byteLength + redactedContent.byteLength;
 									const totalByteLength =
 										totalRedactedReasoningBytes + redactedContent.byteLength;
 									if (

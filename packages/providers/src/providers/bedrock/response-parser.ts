@@ -1,7 +1,4 @@
-import type {
-	Citation,
-	ContentBlock,
-} from "@aws-sdk/client-bedrock-runtime";
+import type { Citation, ContentBlock } from "@aws-sdk/client-bedrock-runtime";
 import { Logger } from "@better-ccflare/logger";
 
 const log = new Logger("BedrockResponseParser");
@@ -170,7 +167,8 @@ function isCanonicalBedrockUsage(value: unknown): value is BedrockUsage {
 	}
 
 	return ["cacheReadInputTokens", "cacheWriteInputTokens"].every(
-		(field) => value[field] === undefined || isCanonicalTokenCount(value[field]),
+		(field) =>
+			value[field] === undefined || isCanonicalTokenCount(value[field]),
 	);
 }
 
@@ -369,12 +367,14 @@ function transformResponseContentBlock(
 		) {
 			return {
 				valid: true,
-				blocks: [{
-					type: "tool_use",
-					id: toolUseId,
-					name,
-					input: input as Record<string, unknown>,
-				}],
+				blocks: [
+					{
+						type: "tool_use",
+						id: toolUseId,
+						name,
+						input: input as Record<string, unknown>,
+					},
+				],
 			};
 		}
 		return { valid: false };
@@ -392,11 +392,13 @@ function transformResponseContentBlock(
 			}
 			return {
 				valid: true,
-				blocks: [{
-					type: "thinking",
-					thinking: text,
-					signature,
-				}],
+				blocks: [
+					{
+						type: "thinking",
+						thinking: text,
+						signature,
+					},
+				],
 			};
 		}
 		if ("redactedContent" in reasoning) {
@@ -584,8 +586,7 @@ export async function transformNonStreamingResponse(
 				input_tokens: normalizedUsage.inputTokens,
 				output_tokens: normalizedUsage.outputTokens,
 				cache_read_input_tokens: normalizedUsage.cacheReadInputTokens,
-				cache_creation_input_tokens:
-					normalizedUsage.cacheCreationInputTokens,
+				cache_creation_input_tokens: normalizedUsage.cacheCreationInputTokens,
 			},
 		};
 
