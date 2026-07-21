@@ -8,6 +8,77 @@ type CacheableTool = NonNullable<OpenAIRequest["tools"]>[number] & {
 	cache_control?: CacheControl;
 };
 
+function countEphemeralCacheMarkers(body: OpenAIRequest): number {
+	let count = 0;
+	for (const message of body.messages) {
+		if (!Array.isArray(message.content)) continue;
+		for (const part of message.content) {
+			if (part.cache_control?.type === "ephemeral") count += 1;
+		}
+	}
+	for (const tool of (body.tools ?? []) as CacheableTool[]) {
+		if (tool.cache_control?.type === "ephemeral") count += 1;
+	}
+	return count;
+}
+
+function makeOverBudgetCacheRequest(): OpenAIRequest {
+	return {
+		model: "coder-model",
+		stream: true,
+		messages: [
+			{
+				role: "system",
+				content: [
+					{
+						type: "text",
+						text: "Inherited stable boundary",
+						cache_control: { type: "ephemeral" },
+					},
+					{ type: "text", text: "Canonical system boundary" },
+				],
+			},
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "text",
+						text: "Inherited response boundary one",
+						cache_control: { type: "ephemeral" },
+					},
+					{
+						type: "text",
+						text: "Inherited response boundary two",
+						cache_control: { type: "ephemeral" },
+					},
+				],
+			},
+			{
+				role: "user",
+				content: [
+					{
+						type: "text",
+						text: "Inherited latest boundary",
+						cache_control: { type: "ephemeral" },
+					},
+					{ type: "text", text: "Canonical latest boundary" },
+				],
+			},
+		],
+		tools: [
+			{
+				type: "function",
+				function: { name: "inherited_tool" },
+				cache_control: { type: "ephemeral" },
+			} as CacheableTool,
+			{
+				type: "function",
+				function: { name: "canonical_tool" },
+			},
+		],
+	};
+}
+
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
@@ -582,6 +653,158 @@ describe("QwenProvider", () => {
 		});
 
 		// -----------------------------------------------------------------------
+		// GLM tool-less request guard (mirrors Qwen Code's DashScope provider)
+		// -----------------------------------------------------------------------
+		describe("handles tool-less GLM requests", () => {
+			it("flattens text arrays and skips cache markers when non-streaming", () => {
+				const body: OpenAIRequest = {
+					model: "glm-5.2",
+					stream: false,
+					messages: [
+						{
+							role: "system",
+							content: [
+								{
+									type: "text",
+									text: "First system block",
+									cache_control: { type: "ephemeral" },
+								},
+								{ type: "text", text: "Second system block" },
+							],
+						},
+						{
+							role: "user",
+							content: [{ type: "text", text: "Summarize this page." }],
+						},
+					],
+				};
+
+				provider.afterConvert(body);
+
+				expect(body.messages[0].content).toBe(
+					"First system block\n\nSecond system block",
+				);
+				expect(body.messages[1].content).toBe("Summarize this page.");
+				expect(countEphemeralCacheMarkers(body)).toBe(0);
+			});
+
+			it("flattens the latest text array and skips markers when streaming", () => {
+				const body: OpenAIRequest = {
+					model: "GLM-4.7",
+					stream: true,
+					messages: [
+						{ role: "system", content: "System prompt" },
+						{
+							role: "user",
+							content: [
+								{ type: "text", text: "First prompt block" },
+								{ type: "text", text: "Second prompt block" },
+							],
+						},
+					],
+				};
+
+				provider.afterConvert(body);
+
+				expect(body.messages[0].content).toBe("System prompt");
+				expect(body.messages[1].content).toBe(
+					"First prompt block\n\nSecond prompt block",
+				);
+				expect(countEphemeralCacheMarkers(body)).toBe(0);
+			});
+
+			it("leaves media arrays structured but removes inherited markers", () => {
+				const body: OpenAIRequest = {
+					model: "glm-5.2",
+					stream: true,
+					messages: [
+						{
+							role: "user",
+							content: [
+								{
+									type: "text",
+									text: "What is this?",
+									cache_control: { type: "ephemeral" },
+								},
+								{ type: "image_url" },
+							],
+						},
+					],
+				};
+
+				provider.afterConvert(body);
+
+				expect(body.messages[0].content).toEqual([
+					{ type: "text", text: "What is this?" },
+					{ type: "image_url" },
+				]);
+				expect(countEphemeralCacheMarkers(body)).toBe(0);
+			});
+
+			it.each([
+				{
+					name: "declares tools",
+					extraMessages: [],
+					tools: [
+						{
+							type: "function" as const,
+							function: { name: "noop" },
+						},
+					],
+				},
+				{
+					name: "has assistant tool calls",
+					extraMessages: [
+						{
+							role: "assistant" as const,
+							content: null,
+							tool_calls: [
+								{
+									id: "call-1",
+									type: "function" as const,
+									function: { name: "noop", arguments: "{}" },
+								},
+							],
+						},
+					],
+				},
+				{
+					name: "has tool-result history",
+					extraMessages: [
+						{
+							role: "tool" as const,
+							content: "result",
+							tool_call_id: "call-1",
+						},
+					],
+				},
+			])("keeps structured content when it $name", ({
+				extraMessages,
+				tools,
+			}) => {
+				const body: OpenAIRequest = {
+					model: "glm-5.2",
+					stream: false,
+					messages: [
+						{ role: "system", content: "System prompt" },
+						...extraMessages,
+						{
+							role: "user",
+							content: [{ type: "text", text: "Keep this structured" }],
+						},
+					],
+					...(tools ? { tools } : {}),
+				};
+
+				provider.afterConvert(body);
+
+				expect(Array.isArray(body.messages[0].content)).toBe(true);
+				expect(Array.isArray(body.messages.at(-1)?.content)).toBe(true);
+				expect(countEphemeralCacheMarkers(body)).toBeGreaterThan(0);
+			});
+		});
+
+		// -----------------------------------------------------------------------
 		// Cache marker placement (mirrors Qwen Code's DashScope provider)
 		// -----------------------------------------------------------------------
 		describe("places DashScope cache markers", () => {
@@ -832,6 +1055,44 @@ describe("QwenProvider", () => {
 						cache_control: { type: "ephemeral" },
 					},
 				]);
+			});
+
+			it("caps markers at four while reserving canonical boundaries", () => {
+				const body = makeOverBudgetCacheRequest();
+
+				provider.afterConvert(body);
+
+				expect(countEphemeralCacheMarkers(body)).toBe(4);
+				const system = body.messages[0].content;
+				const prior = body.messages[1].content;
+				const latest = body.messages[2].content;
+				if (
+					!Array.isArray(system) ||
+					!Array.isArray(prior) ||
+					!Array.isArray(latest)
+				) {
+					throw new Error("expected structured content");
+				}
+				expect(system[0].cache_control).toEqual({ type: "ephemeral" });
+				expect(system[1].cache_control).toEqual({ type: "ephemeral" });
+				expect(prior[0].cache_control).toBeUndefined();
+				expect(prior[1].cache_control).toBeUndefined();
+				expect(latest[0].cache_control).toBeUndefined();
+				expect(latest[1].cache_control).toEqual({ type: "ephemeral" });
+				const tools = body.tools as CacheableTool[];
+				expect(tools[0].cache_control).toBeUndefined();
+				expect(tools[1].cache_control).toEqual({ type: "ephemeral" });
+			});
+
+			it("is idempotent after pruning an over-budget request", () => {
+				const body = makeOverBudgetCacheRequest();
+
+				provider.afterConvert(body);
+				const afterFirstPass = structuredClone(body);
+				provider.afterConvert(body);
+
+				expect(body).toEqual(afterFirstPass);
+				expect(countEphemeralCacheMarkers(body)).toBe(4);
 			});
 		});
 	});
