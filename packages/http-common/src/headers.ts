@@ -1,7 +1,7 @@
 import {
 	RECOVERY_SCOPE_HEADER,
 	RECOVERY_STATUS_HEADER,
-} from "@better-ccflare/types";
+} from "@better-ccflare/types/routing-recovery";
 
 /** Private hop-by-hop request correlation installed by ccflare-guard. */
 export const GUARD_REQUEST_ID_HEADER =

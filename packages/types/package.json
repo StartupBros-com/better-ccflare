@@ -6,7 +6,8 @@
 	"exports": {
 		".": "./src/index.ts",
 		"./api-key": "./src/api-key.ts",
-		"./combo": "./src/combo.ts"
+		"./combo": "./src/combo.ts",
+		"./routing-recovery": "./src/routing-recovery.ts"
 	},
 	"scripts": {
 		"typecheck": "bunx tsc --noEmit"

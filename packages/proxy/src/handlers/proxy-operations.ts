@@ -31,7 +31,7 @@ import {
 	RECOVERY_SCOPE_HEADER,
 	RECOVERY_STATUS_EXHAUSTED,
 	RECOVERY_STATUS_HEADER,
-} from "@better-ccflare/types";
+} from "@better-ccflare/types/routing-recovery";
 import type { AnthropicPreCommitRescueRouteContext } from "../anthropic-precommit-rescue";
 import {
 	AnthropicPreCommitAbortedError,

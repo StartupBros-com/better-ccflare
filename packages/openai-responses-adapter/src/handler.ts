@@ -5,7 +5,7 @@ import {
 	RECOVERY_STATUS_EXHAUSTED,
 	RECOVERY_STATUS_HEADER,
 	recoveryScopeForCode,
-} from "@better-ccflare/types";
+} from "@better-ccflare/types/routing-recovery";
 import { translateRequestToAnthropic } from "./request-translator";
 import { translateAnthropicResponseToResponses } from "./response-translator";
 import { translateAnthropicStreamToResponses } from "./stream-translator";
