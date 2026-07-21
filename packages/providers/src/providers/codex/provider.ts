@@ -74,6 +74,8 @@ export const CODEX_PROMPT_CACHE_KEY_ENV = "CCFLARE_CODEX_PROMPT_CACHE_KEY";
 export const CODEX_CACHE_KEY_MODE_ENV = "CCFLARE_CODEX_CACHE_KEY_MODE";
 export const CODEX_CACHE_KEY_SESSION_PERCENT_ENV =
 	"CCFLARE_CODEX_CACHE_KEY_SESSION_PERCENT";
+export const CODEX_EXPLICIT_CACHE_BREAKPOINT_PERCENT_ENV =
+	"CCFLARE_CODEX_GPT56_EXPLICIT_CACHE_BREAKPOINT_PERCENT";
 const CODEX_CACHE_KEY_SESSION_BUCKET_DOMAIN =
 	"better-ccflare:codex-cache-key-session-canary:v1\0";
 const CODEX_CACHE_KEY_COHORT_DOMAIN =
@@ -81,6 +83,64 @@ const CODEX_CACHE_KEY_COHORT_DOMAIN =
 const CODEX_CACHE_LANE_RESCUE_DOMAIN =
 	"better-ccflare:codex-cache-lane-rescue:v1\0";
 const CODEX_CACHE_LANE_RESCUE_SALT_MAX_CHARS = 128;
+const CODEX_EXPLICIT_BREAKPOINT_BUCKET_DOMAIN =
+	"better-ccflare:codex-gpt56-explicit-breakpoint-canary:v1\0";
+const CODEX_EXPLICIT_BREAKPOINT_COHORT_DOMAIN =
+	"better-ccflare:codex-gpt56-explicit-breakpoint-cohort:v1\0";
+const MAX_CODEX_EXPLICIT_BREAKPOINT_SUPPRESSIONS = 2_048;
+const codexExplicitBreakpointSuppressions = new Map<string, true>();
+
+function codexExplicitBreakpointSuppressionKey(
+	accountId: string,
+	model: string,
+	endpoint: string,
+): string {
+	return `${accountId}:${model.toLowerCase()}:${endpoint}`;
+}
+
+/** Remember an upstream 400 capability rejection for this process lifetime. */
+export function suppressCodexExplicitCacheBreakpoint(
+	accountId: string,
+	model: string,
+	endpoint = CODEX_DEFAULT_ENDPOINT,
+): void {
+	const normalizedEndpoint =
+		normalizeCodexExplicitBreakpointEligibleEndpoint(endpoint);
+	if (!accountId || !model || !normalizedEndpoint) return;
+	const key = codexExplicitBreakpointSuppressionKey(
+		accountId,
+		model,
+		normalizedEndpoint,
+	);
+	// Refresh insertion order so the bounded map behaves as a small LRU.
+	codexExplicitBreakpointSuppressions.delete(key);
+	codexExplicitBreakpointSuppressions.set(key, true);
+	while (
+		codexExplicitBreakpointSuppressions.size >
+		MAX_CODEX_EXPLICIT_BREAKPOINT_SUPPRESSIONS
+	) {
+		const oldest = codexExplicitBreakpointSuppressions.keys().next().value;
+		if (typeof oldest !== "string") break;
+		codexExplicitBreakpointSuppressions.delete(oldest);
+	}
+}
+
+export function isCodexExplicitCacheBreakpointSuppressed(
+	accountId: string,
+	model: string,
+	endpoint = CODEX_DEFAULT_ENDPOINT,
+): boolean {
+	const normalizedEndpoint =
+		normalizeCodexExplicitBreakpointEligibleEndpoint(endpoint);
+	if (!normalizedEndpoint) return false;
+	return codexExplicitBreakpointSuppressions.has(
+		codexExplicitBreakpointSuppressionKey(accountId, model, normalizedEndpoint),
+	);
+}
+
+export function resetCodexExplicitBreakpointSuppressionsForTest(): void {
+	codexExplicitBreakpointSuppressions.clear();
+}
 
 export function readCodexCacheKeySessionPercent(
 	raw = process.env[CODEX_CACHE_KEY_SESSION_PERCENT_ENV],
@@ -93,6 +153,23 @@ export function deriveCodexCacheKeySessionBucket(sessionId: string): number {
 	const digest = createHash("sha256")
 		.update(CODEX_CACHE_KEY_SESSION_BUCKET_DOMAIN)
 		.update(sessionId.toLowerCase())
+		.digest();
+	return digest.readUInt32BE(0) % 100;
+}
+
+export function readCodexExplicitCacheBreakpointPercent(
+	raw = process.env[CODEX_EXPLICIT_CACHE_BREAKPOINT_PERCENT_ENV],
+): number {
+	if (raw === undefined || !/^\d+$/.test(raw)) return 0;
+	return Math.min(Number.parseInt(raw, 10), 100);
+}
+
+export function deriveCodexExplicitBreakpointBucket(
+	conversationIdentity: string,
+): number {
+	const digest = createHash("sha256")
+		.update(CODEX_EXPLICIT_BREAKPOINT_BUCKET_DOMAIN)
+		.update(conversationIdentity)
 		.digest();
 	return digest.readUInt32BE(0) % 100;
 }
@@ -150,6 +227,37 @@ function isOpenAiPromptCacheEndpoint(account?: Account): boolean {
 		return OPENAI_PROMPT_CACHE_HOSTS.has(new URL(endpoint).hostname);
 	} catch {
 		return false;
+	}
+}
+
+/**
+ * Exact canary endpoints. The public OpenAI Responses path documents the
+ * field; the private ChatGPT Codex path is inferred and protected by the dark
+ * default plus a capability-rejection fallback.
+ */
+function normalizeCodexExplicitBreakpointEligibleEndpoint(
+	endpoint: string,
+): string | null {
+	try {
+		const url = new URL(endpoint);
+		if (
+			url.protocol !== "https:" ||
+			url.username !== "" ||
+			url.password !== "" ||
+			url.port !== "" ||
+			url.search !== "" ||
+			url.hash !== ""
+		) {
+			return null;
+		}
+		const pathname = url.pathname.replace(/\/+$/, "") || "/";
+		const official =
+			(url.hostname === "chatgpt.com" &&
+				pathname === "/backend-api/codex/responses") ||
+			(url.hostname === "api.openai.com" && pathname === "/v1/responses");
+		return official ? `${url.origin}${pathname}` : null;
+	} catch {
+		return null;
 	}
 }
 
@@ -233,9 +341,15 @@ export { MODEL_CONTEXT_WINDOWS } from "../../request-capabilities";
 
 // ── Codex Responses API types ─────────────────────────────────────────────────
 
+const SOURCE_CACHE_MARKED = Symbol("codex-source-cache-marked");
+const SOURCE_MESSAGE_INDEX = Symbol("codex-source-message-index");
+
 interface CodexInputTextItem {
 	type: "input_text";
 	text: string;
+	prompt_cache_breakpoint?: { mode: "explicit" };
+	[SOURCE_CACHE_MARKED]?: boolean;
+	[SOURCE_MESSAGE_INDEX]?: number;
 }
 
 interface CodexOutputTextItem {
@@ -303,9 +417,28 @@ export interface CodexPromptCacheKeyDecision {
 	conversationIdentity: string | null;
 }
 
+export type CodexExplicitBreakpointAction =
+	| "placed_source_marker"
+	| "placed_first_user_text"
+	| "skip_percent_control"
+	| "skip_non_gpt56"
+	| "skip_non_eligible_endpoint"
+	| "skip_no_prompt_cache_key"
+	| "skip_no_conversation"
+	| "skip_known_unsupported"
+	| "skip_rotated_cache_key_attempt"
+	| "skip_no_eligible_block";
+
+export interface CodexExplicitBreakpointDecision {
+	canary: "treatment" | "control" | "ineligible";
+	cohortId: string | null;
+	action: CodexExplicitBreakpointAction;
+}
+
 interface CodexConversionResult {
 	codexBody: CodexRequest;
 	cacheKeyDecision: CodexPromptCacheKeyDecision;
+	explicitBreakpointDecision: CodexExplicitBreakpointDecision;
 	orchestrationAdmission: OrchestrationAdmission;
 	filteredToolNames: string[];
 	/** Diagnostic: see orchestrationDemotionObserved in trace.ts's TraceInputs. */
@@ -319,6 +452,7 @@ interface CodexConversionResult {
 interface AnthropicTextContent {
 	type: "text";
 	text: string;
+	cache_control?: { type?: string; ttl?: string };
 }
 
 interface AnthropicToolUse {
@@ -367,7 +501,13 @@ interface AnthropicRequest {
 	model: string;
 	max_tokens: number;
 	messages: AnthropicMessage[];
-	system?: string | { type: string; text: string }[];
+	system?:
+		| string
+		| {
+				type: string;
+				text: string;
+				cache_control?: { type?: string; ttl?: string };
+		  }[];
 	stream?: boolean;
 	tools?: AnthropicTool[];
 	tool_choice?: AnthropicToolChoice;
@@ -520,6 +660,7 @@ export function codexEventCommitsOutput(
 
 export class CodexProvider extends BaseProvider {
 	name = "codex";
+	override readonly cacheReplayModelStrategy = "transformed-body" as const;
 	// Fallback map: proxy-operations.ts injects x-better-ccflare-request-id and
 	// x-better-ccflare-request-stream into the upstream response before calling
 	// processResponse, so headerRequestedStream is normally set. This map covers
@@ -710,6 +851,7 @@ export class CodexProvider extends BaseProvider {
 			const {
 				codexBody,
 				cacheKeyDecision,
+				explicitBreakpointDecision,
 				orchestrationAdmission,
 				filteredToolNames,
 				orchestrationDemotionObserved,
@@ -725,15 +867,13 @@ export class CodexProvider extends BaseProvider {
 					requestId
 					? requestId.slice(0, CODEX_CACHE_LANE_RESCUE_SALT_MAX_CHARS)
 					: undefined,
+				request.url,
+				finalModel ?? undefined,
 			);
 			if (isSubscriptionEndpoint) {
 				// ChatGPT's subscription Responses endpoint rejects this API-only field.
 				delete codexBody.max_output_tokens;
 			}
-			// Model fallback is selected after provider conversion. Apply the final wire
-			// model before tracing so the record and body describe the same transport.
-			if (finalModel) codexBody.model = finalModel;
-
 			// Best-effort, env-gated observability (no-op unless CCFLARE_CODEX_TRACE_DIR set).
 			writeCodexTrace({
 				requestId: requestId ?? undefined,
@@ -757,6 +897,9 @@ export class CodexProvider extends BaseProvider {
 				conversationId:
 					cacheKeyDecision.conversationIdentity?.slice(0, 16) ?? null,
 				cacheKeyAssignmentSource: cacheKeyDecision.assignmentSource,
+				explicitBreakpointCanary: explicitBreakpointDecision.canary,
+				explicitBreakpointCohortId: explicitBreakpointDecision.cohortId,
+				explicitBreakpointAction: explicitBreakpointDecision.action,
 				pacingCanary: request.headers.get("x-better-ccflare-pacing-canary"),
 				pacingCohortId: request.headers.get(
 					"x-better-ccflare-pacing-cohort-id",
@@ -1192,6 +1335,140 @@ export class CodexProvider extends BaseProvider {
 		};
 	}
 
+	private applyExplicitCacheBreakpoint(
+		request: CodexRequest,
+		cacheKeyDecision: CodexPromptCacheKeyDecision,
+		account: Account | undefined,
+		endpoint: string,
+		sourceMessageCount: number,
+		hasSourceSystemCacheMarker: boolean,
+		rotatedCacheKeyAttempt: boolean,
+	): CodexExplicitBreakpointDecision {
+		const ineligible = (
+			action: Extract<
+				CodexExplicitBreakpointAction,
+				| "skip_non_gpt56"
+				| "skip_non_eligible_endpoint"
+				| "skip_no_prompt_cache_key"
+				| "skip_no_conversation"
+			>,
+		): CodexExplicitBreakpointDecision => ({
+			canary: "ineligible",
+			cohortId: null,
+			action,
+		});
+
+		if (!/^gpt-5\.6(?:$|-)/i.test(request.model)) {
+			return ineligible("skip_non_gpt56");
+		}
+		if (!normalizeCodexExplicitBreakpointEligibleEndpoint(endpoint)) {
+			return ineligible("skip_non_eligible_endpoint");
+		}
+		if (!request.prompt_cache_key) {
+			return ineligible("skip_no_prompt_cache_key");
+		}
+		const conversationIdentity = cacheKeyDecision.conversationIdentity;
+		if (!conversationIdentity) {
+			return ineligible("skip_no_conversation");
+		}
+		// cacheKeyDecision.cohortId is a bounded session-derived digest. Assigning
+		// over it keeps one Claude chat (including its compacted history) in one arm;
+		// conversationIdentity is still required for cache-key eligibility but can
+		// change when compaction drops the earliest input item.
+		const stableAssignmentIdentity = cacheKeyDecision.cohortId;
+		if (!stableAssignmentIdentity) {
+			return ineligible("skip_no_conversation");
+		}
+
+		const cohortId = createHash("sha256")
+			.update(CODEX_EXPLICIT_BREAKPOINT_COHORT_DOMAIN)
+			.update(stableAssignmentIdentity)
+			.digest("hex")
+			.slice(0, 16);
+		const percent = readCodexExplicitCacheBreakpointPercent();
+		const treatment =
+			percent === 100 ||
+			(percent > 0 &&
+				deriveCodexExplicitBreakpointBucket(stableAssignmentIdentity) <
+					percent);
+		if (!treatment) {
+			return {
+				canary: "control",
+				cohortId,
+				action: "skip_percent_control",
+			};
+		}
+		if (rotatedCacheKeyAttempt) {
+			return {
+				canary: "treatment",
+				cohortId,
+				action: "skip_rotated_cache_key_attempt",
+			};
+		}
+
+		if (
+			account?.id &&
+			isCodexExplicitCacheBreakpointSuppressed(
+				account.id,
+				request.model,
+				endpoint,
+			)
+		) {
+			return {
+				canary: "treatment",
+				cohortId,
+				action: "skip_known_unsupported",
+			};
+		}
+
+		let firstUserText: CodexInputTextItem | undefined;
+		let firstSourceMarkedText: CodexInputTextItem | undefined;
+		for (const item of request.input) {
+			if (!("role" in item) || item.role !== "user") continue;
+			for (const content of item.content) {
+				if (
+					content.type !== "input_text" ||
+					typeof content.text !== "string" ||
+					content.text.trim().length === 0
+				) {
+					continue;
+				}
+				const sourceMessageIndex = content[SOURCE_MESSAGE_INDEX];
+				// The default implicit policy already marks the latest message. Only
+				// historical source text is stable enough to justify an extra billable
+				// GPT-5.6 cache write.
+				if (
+					typeof sourceMessageIndex !== "number" ||
+					sourceMessageIndex >= sourceMessageCount - 1
+				) {
+					continue;
+				}
+				firstUserText ??= content;
+				if (content[SOURCE_CACHE_MARKED] === true) {
+					firstSourceMarkedText ??= content;
+				}
+			}
+		}
+
+		const selected = firstSourceMarkedText ?? firstUserText;
+		if (!selected) {
+			return {
+				canary: "treatment",
+				cohortId,
+				action: "skip_no_eligible_block",
+			};
+		}
+		selected.prompt_cache_breakpoint = { mode: "explicit" };
+		return {
+			canary: "treatment",
+			cohortId,
+			action:
+				firstSourceMarkedText || hasSourceSystemCacheMarker
+					? "placed_source_marker"
+					: "placed_first_user_text",
+		};
+	}
+
 	private convertToolChoice(
 		choice: AnthropicToolChoice | undefined,
 		tools: readonly CodexTool[],
@@ -1260,6 +1537,7 @@ export class CodexProvider extends BaseProvider {
 
 	private convertMessage(
 		msg: AnthropicMessage,
+		sourceMessageIndex: number,
 	): (CodexMessage | CodexFunctionCallItem | CodexFunctionCallOutputItem)[] {
 		const items: (
 			| CodexMessage
@@ -1273,10 +1551,21 @@ export class CodexProvider extends BaseProvider {
 
 		if (typeof msg.content === "string") {
 			const contentType = role === "assistant" ? "output_text" : "input_text";
-			items.push({
+			const contentItem = {
+				type: contentType,
+				text: msg.content,
+			} as CodexContentItem;
+			if (role === "user" && contentType === "input_text") {
+				Object.defineProperty(contentItem, SOURCE_MESSAGE_INDEX, {
+					value: sourceMessageIndex,
+					enumerable: false,
+				});
+			}
+			const textItem = {
 				role,
-				content: [{ type: contentType, text: msg.content } as CodexContentItem],
-			} as CodexMessage);
+				content: [contentItem],
+			} as CodexMessage;
+			items.push(textItem);
 			return items;
 		}
 
@@ -1296,10 +1585,27 @@ export class CodexProvider extends BaseProvider {
 			if (!block || typeof block !== "object") continue;
 			if (block.type === "text") {
 				const contentType = role === "assistant" ? "output_text" : "input_text";
-				pendingText.push({
+				const textItem = {
 					type: contentType,
 					text: block.text,
-				} as CodexContentItem);
+				} as CodexContentItem;
+				if (role === "user" && contentType === "input_text") {
+					Object.defineProperty(textItem, SOURCE_MESSAGE_INDEX, {
+						value: sourceMessageIndex,
+						enumerable: false,
+					});
+				}
+				if (
+					role === "user" &&
+					contentType === "input_text" &&
+					block.cache_control?.type === "ephemeral"
+				) {
+					Object.defineProperty(textItem, SOURCE_CACHE_MARKED, {
+						value: true,
+						enumerable: false,
+					});
+				}
+				pendingText.push(textItem);
 			} else if (block.type === "tool_use") {
 				flushText();
 				items.push({
@@ -1479,6 +1785,8 @@ export class CodexProvider extends BaseProvider {
 		requestId?: string,
 		isAttributedAgent = false,
 		cacheLaneRescueSalt?: string,
+		endpoint = CODEX_DEFAULT_ENDPOINT,
+		finalModel?: string,
 	): CodexConversionResult {
 		const model = this.mapModel(body.model, account);
 		if (process.env.DEBUG?.includes("model") || process.env.DEBUG === "true") {
@@ -1493,7 +1801,7 @@ export class CodexProvider extends BaseProvider {
 		const skillCallIds = new Set<string>();
 		let skillCompletedInFinalMessage = false;
 		for (const [msgIndex, msg] of body.messages.entries()) {
-			for (const item of this.convertMessage(msg)) {
+			for (const item of this.convertMessage(msg, msgIndex)) {
 				input.push(item);
 				if ("type" in item && item.type === "function_call") {
 					if (item.name === "Skill") {
@@ -1613,7 +1921,7 @@ export class CodexProvider extends BaseProvider {
 		// Codex always requires streaming upstream; non-streaming clients are handled
 		// on the response side via transformSseResponseToJson.
 		const codexRequest: CodexRequest = {
-			model,
+			model: finalModel || model,
 			input,
 			stream: true,
 			store: false,
@@ -1631,6 +1939,16 @@ export class CodexProvider extends BaseProvider {
 		if (cacheKeyDecision.key) {
 			codexRequest.prompt_cache_key = cacheKeyDecision.key;
 		}
+		const explicitBreakpointDecision = this.applyExplicitCacheBreakpoint(
+			codexRequest,
+			cacheKeyDecision,
+			account,
+			endpoint,
+			body.messages.length,
+			Array.isArray(body.system) &&
+				body.system.some((block) => block.cache_control?.type === "ephemeral"),
+			Boolean(cacheLaneRescueSalt),
+		);
 		const explicitToolChoice = this.convertToolChoice(
 			body.tool_choice,
 			tools ?? [],
@@ -1672,6 +1990,7 @@ export class CodexProvider extends BaseProvider {
 		return {
 			codexBody: codexRequest,
 			cacheKeyDecision,
+			explicitBreakpointDecision,
 			orchestrationAdmission,
 			filteredToolNames,
 			orchestrationDemotionObserved,

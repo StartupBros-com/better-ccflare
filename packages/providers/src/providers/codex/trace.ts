@@ -28,7 +28,7 @@ export const CODEX_TRACE_HMAC_KEY_ENV = "CCFLARE_CODEX_TRACE_HMAC_KEY";
 /** Warn when one response spawns at least this many subagents (0 disables). */
 export const CODEX_FANOUT_WARN_ENV = "CCFLARE_CODEX_FANOUT_WARN";
 
-const TRACE_SCHEMA_VERSION = 9;
+const TRACE_SCHEMA_VERSION = 10;
 const DEFAULT_FANOUT_WARN = 8;
 const MAX_INPUT_ITEM_FINGERPRINTS = 64;
 /**
@@ -179,6 +179,7 @@ interface TraceInputs {
 		| "overload_529"
 		| "thinking_retry"
 		| "cache_control_retry"
+		| "prompt_cache_breakpoint_retry"
 		| "cache_lane_rescue"
 		| "precommit_sse_retry"
 		| "account_failover"
@@ -207,6 +208,12 @@ interface TraceInputs {
 	conversationId?: string | null;
 	/** Why the effective cache-key mode was selected. */
 	cacheKeyAssignmentSource?: "canary" | "explicit_session_override" | null;
+	/** Explicit GPT-5.6 breakpoint experiment arm; contains no prompt/key data. */
+	explicitBreakpointCanary?: "treatment" | "control" | "ineligible";
+	/** Domain-separated conversation cohort digest. */
+	explicitBreakpointCohortId?: string | null;
+	/** Placement or skip reason; contains no prompt/key data. */
+	explicitBreakpointAction?: string;
 	/** Pacing canary arm: "control" | "bypass". */
 	pacingCanary?: string | null;
 	/** Privacy-preserving conversation cohort digest for stability checks. */
@@ -227,7 +234,7 @@ interface TraceInputs {
 	/**
 	 * Diagnostic: this turn's derived conversation identity no longer matched
 	 * an already-elected root for its session (see orchestration-election.ts).
-	 * Additive on schema 9; a missing value writes null, not a version bump.
+	 * Preserved in schema 10; a missing value writes null.
 	 */
 	orchestrationDemotionObserved?: boolean;
 	/**
@@ -348,6 +355,9 @@ export function writeCodexTrace(inputs: TraceInputs): void {
 		cache_key_cohort_id: inputs.cacheKeyCohortId ?? null,
 		conversation_id: inputs.conversationId ?? null,
 		cache_key_assignment_source: inputs.cacheKeyAssignmentSource ?? null,
+		explicit_breakpoint_canary: inputs.explicitBreakpointCanary ?? null,
+		explicit_breakpoint_cohort_id: inputs.explicitBreakpointCohortId ?? null,
+		explicit_breakpoint_action: inputs.explicitBreakpointAction ?? null,
 		pacing_canary: inputs.pacingCanary ?? null,
 		pacing_cohort_id: inputs.pacingCohortId ?? null,
 		pacing_action: inputs.pacingAction ?? null,

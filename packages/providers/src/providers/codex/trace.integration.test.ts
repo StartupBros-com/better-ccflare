@@ -86,7 +86,7 @@ describe("Codex trace wiring (integration)", () => {
 		const files = readdirSync(dir).filter((f) => f.endsWith(".jsonl"));
 		expect(files.length).toBe(1);
 		const rec = JSON.parse(readFileSync(join(dir, files[0]), "utf8").trim());
-		expect(rec.trace_schema_version).toBe(9);
+		expect(rec.trace_schema_version).toBe(10);
 		expect(rec.phase).toBe("request");
 		expect(rec.orchestration_admission).toBe("no_orchestration_tools");
 		expect(rec.request_id).toBe("req_trace_1");
@@ -156,7 +156,7 @@ describe("Codex trace wiring (integration)", () => {
 			.trim()
 			.split("\n")
 			.map((line) => JSON.parse(line));
-		expect(records.every((record) => record.trace_schema_version === 9)).toBe(
+		expect(records.every((record) => record.trace_schema_version === 10)).toBe(
 			true,
 		);
 		expect(records.map((record) => record.cache_key_assignment)).toEqual([
