@@ -2458,8 +2458,8 @@ export async function proxyWithAccount(
 			// unconditionally failing over. Skip this generic handler for xAI so
 			// the response falls through to processProxyResponse's xAI-specific
 			// branch (response-processor.ts) further down instead of being
-			// swallowed here with a fire-and-forget cooldown and a mislabeled
-			// reason. Every other provider's 402 handling is unaffected.
+			// mislabeled with this generic reason. Every other provider's 402
+			// handling awaits the same bounded durable cooldown persistence here.
 			if (account.provider === "xai") return null;
 			const reason: RateLimitReason = "upstream_402_payment_required";
 			const cooldownUntil = extractCooldownUntil(
@@ -2467,7 +2467,7 @@ export async function proxyWithAccount(
 				account.id,
 				usageCache.getRateLimitedUntil.bind(usageCache),
 			);
-			applyRateLimitCooldown(
+			await applyRateLimitCooldownAwaitingPersist(
 				account,
 				{ resetTime: cooldownUntil, reason },
 				ctx,
@@ -2607,7 +2607,7 @@ export async function proxyWithAccount(
 					usageCache.getRateLimitedUntil.bind(usageCache),
 				);
 				const auditReason: RateLimitReason = "model_fallback_429";
-				applyRateLimitCooldown(
+				await applyRateLimitCooldownAwaitingPersist(
 					account,
 					{ resetTime: cooldownUntil, reason: auditReason },
 					ctx,
