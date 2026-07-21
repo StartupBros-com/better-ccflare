@@ -1184,6 +1184,274 @@ describe("SessionAffinityStrategy", () => {
 		expect(recovered[0].id).toBe("x");
 	});
 
+	it("keeps a temporary fallback sticky while preserving the better-tier owner for snapback", async () => {
+		const primary = makeAccount({ id: "primary", priority: 0 });
+		const fallbackA = makeAccount({ id: "fallback-a", priority: 1 });
+		const fallbackB = makeAccount({ id: "fallback-b", priority: 1 });
+		const laneMeta = {
+			...metaFor("sticky-fallback-client"),
+			affinityLaneKey: "sticky-fallback-client:anthropic:opus",
+		} as RequestMeta;
+
+		expect(
+			(await strategy.select([primary, fallbackA, fallbackB], laneMeta))[0].id,
+		).toBe("primary");
+
+		const primaryDown = makeAccount({
+			id: "primary",
+			priority: 0,
+			rate_limited_until: Date.now() + 60_000,
+		});
+		store.setUtil(fallbackA.id, 0);
+		store.setUtil(fallbackB.id, 50);
+		expect(
+			(await strategy.select([primaryDown, fallbackA, fallbackB], laneMeta))[0]
+				.id,
+		).toBe("fallback-a");
+
+		// Least-used now strongly prefers B. The session must nevertheless keep
+		// using A so its warmed prompt prefix survives the primary outage.
+		store.setUtil(fallbackA.id, 99);
+		store.setUtil(fallbackB.id, 0);
+		expect(
+			(
+				await strategy.select([primaryDown, fallbackA, fallbackB], laneMeta)
+			).map((account) => account.id),
+		).toEqual(["fallback-a", "fallback-b"]);
+
+		// The preferred owner remains separate and snaps back immediately once
+		// it is safely routable again.
+		expect(
+			(await strategy.select([primary, fallbackA, fallbackB], laneMeta))[0].id,
+		).toBe("primary");
+	});
+
+	it("replaces an eligible active fallback when a better tier appears and keeps the replacement sticky", async () => {
+		const primary = makeAccount({ id: "primary", priority: 0 });
+		const fallbackA = makeAccount({ id: "fallback-a", priority: 1 });
+		const fallbackB = makeAccount({ id: "fallback-b", priority: 1 });
+		const laneMeta = (): RequestMeta =>
+			({
+				...metaFor("fallback-tier-outclass-client"),
+				affinityLaneKey: "fallback-tier-outclass-client:anthropic:opus",
+			}) as RequestMeta;
+
+		await strategy.select([primary, fallbackA, fallbackB], laneMeta());
+		const primaryDown = makeAccount({
+			id: primary.id,
+			priority: 0,
+			rate_limited_until: Date.now() + 60_000,
+		});
+		store.setUtil(fallbackA.id, 0);
+		store.setUtil(fallbackB.id, 50);
+		expect(
+			(
+				await strategy.select([primaryDown, fallbackA, fallbackB], laneMeta())
+			)[0].id,
+		).toBe("fallback-a");
+
+		// A remains eligible, but its lower routing tier now makes B authoritative.
+		const fallbackAOutclassed = makeAccount({
+			id: fallbackA.id,
+			priority: 2,
+		});
+		expect(
+			(
+				await strategy.select(
+					[primaryDown, fallbackAOutclassed, fallbackB],
+					laneMeta(),
+				)
+			)[0].id,
+		).toBe("fallback-b");
+
+		// Once A rejoins B's class, least-used prefers A again. B must remain the
+		// warmed fallback owner rather than oscillating back.
+		store.setUtil(fallbackA.id, 0);
+		store.setUtil(fallbackB.id, 99);
+		expect(
+			(
+				await strategy.select([primaryDown, fallbackA, fallbackB], laneMeta())
+			)[0].id,
+		).toBe("fallback-b");
+	});
+
+	it("replaces an eligible active fallback when comparable quota pressure outclasses it", async () => {
+		const primary = makeAccount({ id: "primary", priority: 0 });
+		const fallbackA = makeAccount({ id: "fallback-a", priority: 1 });
+		const fallbackB = makeAccount({ id: "fallback-b", priority: 1 });
+		const laneMeta = (): RequestMeta =>
+			({
+				...metaFor("fallback-pressure-outclass-client"),
+				affinityLaneKey: "fallback-pressure-outclass-client:anthropic:fable",
+			}) as RequestMeta;
+
+		await strategy.select([primary, fallbackA, fallbackB], laneMeta());
+		const primaryDown = makeAccount({
+			id: primary.id,
+			priority: 0,
+			rate_limited_until: Date.now() + 60_000,
+		});
+		store.setUtil(fallbackA.id, 0);
+		store.setUtil(fallbackB.id, 50);
+		const samePressureClass = (): RequestMeta =>
+			({
+				...laneMeta(),
+				quotaPressureByAccountId: new Map([
+					[fallbackA.id, { band: "steady", comparisonKey: "same" }],
+					[fallbackB.id, { band: "steady", comparisonKey: "same" }],
+				]),
+			}) as RequestMeta;
+		expect(
+			(
+				await strategy.select(
+					[primaryDown, fallbackA, fallbackB],
+					samePressureClass(),
+				)
+			)[0].id,
+		).toBe("fallback-a");
+
+		const outclassedPressure = (): RequestMeta =>
+			({
+				...laneMeta(),
+				quotaPressureByAccountId: new Map([
+					[fallbackA.id, { band: "cold", comparisonKey: "same" }],
+					[fallbackB.id, { band: "critical", comparisonKey: "same" }],
+				]),
+			}) as RequestMeta;
+		expect(
+			(
+				await strategy.select(
+					[primaryDown, fallbackA, fallbackB],
+					outclassedPressure(),
+				)
+			)[0].id,
+		).toBe("fallback-b");
+
+		// Returning to one pressure class must retain the warmed replacement even
+		// when raw least-used utilization would choose A.
+		store.setUtil(fallbackA.id, 0);
+		store.setUtil(fallbackB.id, 99);
+		expect(
+			(
+				await strategy.select(
+					[primaryDown, fallbackA, fallbackB],
+					samePressureClass(),
+				)
+			)[0].id,
+		).toBe("fallback-b");
+	});
+
+	it("replaces an active fallback when it becomes ineligible and sticks to the replacement", async () => {
+		const primary = makeAccount({ id: "primary", priority: 0 });
+		const fallbackA = makeAccount({ id: "fallback-a", priority: 1 });
+		const fallbackB = makeAccount({ id: "fallback-b", priority: 1 });
+		const laneMeta = {
+			...metaFor("fallback-invalidation-client"),
+			affinityLaneKey: "fallback-invalidation-client:anthropic:fable",
+		} as RequestMeta;
+		await strategy.select([primary, fallbackA, fallbackB], laneMeta);
+
+		const primaryDown = makeAccount({
+			id: "primary",
+			priority: 0,
+			rate_limited_until: Date.now() + 60_000,
+		});
+		store.setUtil(fallbackA.id, 0);
+		store.setUtil(fallbackB.id, 50);
+		expect(
+			(await strategy.select([primaryDown, fallbackA, fallbackB], laneMeta))[0]
+				.id,
+		).toBe("fallback-a");
+
+		// Pausing A makes the old fallback illegal. It must be replaced, never
+		// pinned through account-level unavailability.
+		const fallbackAPaused = makeAccount({
+			id: fallbackA.id,
+			priority: 1,
+			paused: true,
+		});
+		expect(
+			(
+				await strategy.select(
+					[primaryDown, fallbackAPaused, fallbackB],
+					laneMeta,
+				)
+			)[0].id,
+		).toBe("fallback-b");
+
+		// A recovers, but B is now request-scoped hard-excluded (for example, an
+		// exhausted model lane), so ownership moves back to the only legal route.
+		expect(
+			(
+				await strategy.select([primaryDown, fallbackA, fallbackB], {
+					...laneMeta,
+					hardExcludedAccountIds: new Set([fallbackB.id]),
+				} as RequestMeta)
+			)[0].id,
+		).toBe("fallback-a");
+
+		// Once both are eligible, least-used prefers B, but replacement A remains
+		// the active fallback owner for this outage.
+		store.setUtil(fallbackA.id, 99);
+		store.setUtil(fallbackB.id, 0);
+		expect(
+			(await strategy.select([primaryDown, fallbackA, fallbackB], laneMeta))[0]
+				.id,
+		).toBe("fallback-a");
+		expect(strategy.affinityEntries).toBe(1);
+	});
+
+	it("keeps the active fallback directly behind a half-open preferred-owner probe", async () => {
+		let now = Date.now();
+		const clocked = new SessionAffinityStrategy(
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			() => now,
+		);
+		clocked.initialize(store);
+		const primary = makeAccount({ id: "primary", priority: 0 });
+		const fallbackA = makeAccount({ id: "fallback-a", priority: 1 });
+		const fallbackB = makeAccount({ id: "fallback-b", priority: 1 });
+		const laneMeta = {
+			...metaFor("probe-fallback-client"),
+			affinityLaneKey: "probe-fallback-client:anthropic:opus",
+		} as RequestMeta;
+
+		await clocked.select([primary, fallbackA, fallbackB], laneMeta);
+		clocked.reportCandidateFailure(laneMeta, {
+			candidateId: "account:primary",
+			reason: "semantic_stream_stall",
+			suppressForMs: 100,
+		});
+		store.setUtil(fallbackA.id, 0);
+		store.setUtil(fallbackB.id, 50);
+		expect(
+			(await clocked.select([primary, fallbackA, fallbackB], laneMeta)).map(
+				(account) => account.id,
+			),
+		).toEqual(["fallback-a", "fallback-b"]);
+
+		store.setUtil(fallbackA.id, 99);
+		store.setUtil(fallbackB.id, 0);
+		now += 100;
+		// The preferred probe still runs first, but if it fails this same request
+		// immediately falls through to the warmed fallback A, not least-used B.
+		expect(
+			(await clocked.select([primary, fallbackA, fallbackB], laneMeta)).map(
+				(account) => account.id,
+			),
+		).toEqual(["primary", "fallback-a", "fallback-b"]);
+		// While the single-flight probe lease is held, concurrent turns continue
+		// straight through the same warmed fallback.
+		expect(
+			(
+				await clocked.select([primary, fallbackA, fallbackB], { ...laneMeta })
+			).map((account) => account.id),
+		).toEqual(["fallback-a", "fallback-b"]);
+	});
+
 	it("falls back to least-used when no clientSessionId is present", async () => {
 		store.setUtil("low", 10);
 		store.setUtil("high", 90);
