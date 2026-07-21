@@ -3,6 +3,7 @@ import type { Account } from "@better-ccflare/types";
 import type { RoutingCapacityContext } from "../account-selector";
 import type { RequestRateLimitOutcome } from "../rate-limit-scope";
 import {
+	createModelPoolExhaustedResponse,
 	createRoutingTerminalResponse,
 	filterRequestCompatibleAccounts,
 } from "../routing-terminal";
@@ -210,9 +211,9 @@ describe("routing terminal responses", () => {
 		});
 	});
 
-	it("returns model_pool_exhausted without retry markers for model-only capacity", async () => {
+	it("returns retryable model_pool_exhausted for finite model-only capacity", async () => {
 		const now = Date.UTC(2026, 6, 17, 12);
-		const next = now + 60_000;
+		const next = now + 60_001;
 		const terminal = createRoutingTerminalResponse({
 			source: "selection",
 			accounts: [makeAccount()],
@@ -224,10 +225,10 @@ describe("routing terminal responses", () => {
 
 		expect(terminal.kind).toBe("model_pool_exhausted");
 		expect(terminal.response.status).toBe(503);
-		expect(terminal.response.headers.get("retry-after")).toBeNull();
-		expect(
-			terminal.response.headers.get("x-better-ccflare-pool-status"),
-		).toBeNull();
+		expect(terminal.response.headers.get("retry-after")).toBe("61");
+		expect(terminal.response.headers.get("x-better-ccflare-pool-status")).toBe(
+			"exhausted",
+		);
 		const parsed = await body(terminal.response);
 		expect(parsed.type).toBe("error");
 		expect(parsed.error.type).toBe("service_unavailable");
@@ -235,6 +236,38 @@ describe("routing terminal responses", () => {
 		expect(parsed.error.model).toBe("claude-fable-4-5");
 		expect(parsed.error.family).toBe("fable");
 		expect(parsed.error.next_available_at).toBe(new Date(next).toISOString());
+	});
+
+	it("keeps unknown, past, and non-finite model recovery unmarked", async () => {
+		const now = Date.UTC(2026, 6, 17, 12);
+		for (const availableAt of [
+			null,
+			now - 1,
+			Number.NaN,
+			Number.POSITIVE_INFINITY,
+		]) {
+			const response = createModelPoolExhaustedResponse({
+				capacityContext: null,
+				rateLimitOutcomes: [
+					{
+						accountId: "account-1",
+						status: 429,
+						scope: "model",
+						family: "fable",
+						attemptedModel: "claude-fable-4-5",
+						reason: "matching_scoped_limit",
+						availableAt,
+					},
+				],
+				now,
+			});
+
+			expect(response.headers.get("retry-after")).toBeNull();
+			expect(response.headers.get("x-better-ccflare-pool-status")).toBeNull();
+			const parsed = await body(response);
+			expect(parsed.error.code).toBe("model_pool_exhausted");
+			expect("next_available_at" in parsed.error).toBe(false);
+		}
 	});
 
 	it("omits an unknown model recovery instead of fabricating Retry-After", async () => {
@@ -249,6 +282,9 @@ describe("routing terminal responses", () => {
 		const parsed = await body(terminal.response);
 		expect("next_available_at" in parsed.error).toBe(false);
 		expect(terminal.response.headers.get("retry-after")).toBeNull();
+		expect(
+			terminal.response.headers.get("x-better-ccflare-pool-status"),
+		).toBeNull();
 	});
 
 	it("returns model_pool_exhausted when every attempted failure was model-lane scoped", async () => {
@@ -290,6 +326,10 @@ describe("routing terminal responses", () => {
 		expect(parsed.error.code).toBe("model_pool_exhausted");
 		expect(parsed.error.next_available_at).toBe(
 			new Date(now + 90_000).toISOString(),
+		);
+		expect(terminal.response.headers.get("retry-after")).toBe("90");
+		expect(terminal.response.headers.get("x-better-ccflare-pool-status")).toBe(
+			"exhausted",
 		);
 	});
 

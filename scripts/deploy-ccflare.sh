@@ -456,6 +456,7 @@ fi
 read -r \
 	CONFIGURED_GUARD_TOTAL_DEADLINE_MS \
 	CONFIGURED_GUARD_RETRY_ATTEMPT_HEADROOM_MS \
+	CONFIGURED_GUARD_MAX_RECOVERY_SLEEP_MS \
 	CONFIGURED_GUARD_SHUTDOWN_GRACE_MS \
 	CONFIGURED_STOP_TIMEOUT_MS <<<"$CONFIGURED_DEPLOYMENT_TIMING"
 
@@ -509,6 +510,7 @@ fi
 read -r \
 	CONFIGURED_GUARD_TOTAL_DEADLINE_MS \
 	CONFIGURED_GUARD_RETRY_ATTEMPT_HEADROOM_MS \
+	CONFIGURED_GUARD_MAX_RECOVERY_SLEEP_MS \
 	CONFIGURED_GUARD_SHUTDOWN_GRACE_MS \
 	CONFIGURED_STOP_TIMEOUT_MS <<<"$EFFECTIVE_DEPLOYMENT_TIMING"
 
@@ -543,6 +545,7 @@ EXPECTED_IDENTITY_JSON="$(
 		"$MAIN_PID" \
 		"$CONFIGURED_GUARD_TOTAL_DEADLINE_MS" \
 		"$CONFIGURED_GUARD_RETRY_ATTEMPT_HEADROOM_MS" \
+		"$CONFIGURED_GUARD_MAX_RECOVERY_SLEEP_MS" \
 		"$CONFIGURED_GUARD_SHUTDOWN_GRACE_MS" \
 		"$(readlink -f "$DEST_BIN")" "$DEST_BIN_SHA256" \
 		"$(readlink -f "$RUNNER_SCRIPT")" "$RUNNER_SHA256" \
@@ -555,6 +558,7 @@ const [
 	runnerPid,
 	guardTotalDeadlineMs,
 	guardRetryAttemptHeadroomMs,
+	guardMaxRecoverySleepMs,
 	guardShutdownGraceMs,
 	binaryPath,
 	binarySha256,
@@ -579,6 +583,7 @@ process.stdout.write(JSON.stringify({
 	limits: {
 		totalDeadlineMs: Number(guardTotalDeadlineMs),
 		retryAttemptHeadroomMs: Number(guardRetryAttemptHeadroomMs),
+		maxRecoverySleepMs: Number(guardMaxRecoverySleepMs),
 		shutdownGraceMs: Number(guardShutdownGraceMs),
 		maxAttempts: 3,
 		jitterMs: 2000,

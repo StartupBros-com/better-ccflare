@@ -142,7 +142,7 @@ render_systemd_pin() {
 
 	local input="$1" output="$2" binary="$3" runner="$4"
 	local guard_script="$5" source_id="$6" policy_id="$7" guard_policy_script="$8"
-	local deadline_ms=600000 retry_attempt_headroom_ms=30000 shutdown_grace_ms=600000
+	local deadline_ms=600000 retry_attempt_headroom_ms=30000 max_recovery_sleep_ms=120000 shutdown_grace_ms=600000
 	local kill_mode=mixed stop_timeout=720s
 	local managed_begin="# BEGIN better-ccflare managed deployment"
 	local managed_end="# END better-ccflare managed deployment"
@@ -175,6 +175,7 @@ render_systemd_pin() {
 		printf 'Environment=%s\n' "RUNNER_SHA256=$runner_sha256"
 		printf 'Environment=%s\n' "GUARD_TOTAL_DEADLINE_MS=$deadline_ms"
 		printf 'Environment=%s\n' "GUARD_RETRY_ATTEMPT_HEADROOM_MS=$retry_attempt_headroom_ms"
+		printf 'Environment=%s\n' "GUARD_MAX_RECOVERY_SLEEP_MS=$max_recovery_sleep_ms"
 		printf 'Environment=%s\n' "GUARD_SHUTDOWN_GRACE_MS=$shutdown_grace_ms"
 		printf 'KillMode=%s\n' "$kill_mode"
 		printf 'TimeoutStopSec=%s\n' "$stop_timeout"
@@ -385,7 +386,7 @@ validate_deployment_timing() {
 		return 2
 	fi
 
-	local pin="$1" deadline_ms retry_attempt_headroom_ms shutdown_grace_ms kill_mode stop_timeout
+	local pin="$1" deadline_ms retry_attempt_headroom_ms max_recovery_sleep_ms shutdown_grace_ms kill_mode stop_timeout
 	local stop_timeout_usec stop_timeout_ms minimum_stop_timeout_usec
 	deadline_ms="$(
 		configured_systemd_environment_value "$pin" GUARD_TOTAL_DEADLINE_MS
@@ -397,6 +398,12 @@ validate_deployment_timing() {
 		configured_systemd_environment_value "$pin" GUARD_RETRY_ATTEMPT_HEADROOM_MS
 	)" || {
 		echo "systemd pin is missing GUARD_RETRY_ATTEMPT_HEADROOM_MS" >&2
+		return 1
+	}
+	max_recovery_sleep_ms="$(
+		configured_systemd_environment_value "$pin" GUARD_MAX_RECOVERY_SLEEP_MS
+	)" || {
+		echo "systemd pin is missing GUARD_MAX_RECOVERY_SLEEP_MS" >&2
 		return 1
 	}
 	shutdown_grace_ms="$(
@@ -426,6 +433,11 @@ validate_deployment_timing() {
 		echo "unsafe retry-attempt headroom ${retry_attempt_headroom_ms}ms; expected 1..$((deadline_ms - 1))ms" >&2
 		return 1
 	fi
+	if [[ ! "$max_recovery_sleep_ms" =~ ^[1-9][0-9]{0,9}$ ]] \
+		|| ((max_recovery_sleep_ms > deadline_ms - retry_attempt_headroom_ms)); then
+		echo "unsafe max recovery sleep ${max_recovery_sleep_ms}ms; expected 1..$((deadline_ms - retry_attempt_headroom_ms))ms" >&2
+		return 1
+	fi
 	if ((shutdown_grace_ms < deadline_ms)); then
 		echo "unsafe shutdown grace ${shutdown_grace_ms}ms; expected at least deadline ${deadline_ms}ms" >&2
 		return 1
@@ -445,9 +457,10 @@ validate_deployment_timing() {
 	fi
 	stop_timeout_ms=$((stop_timeout_usec / 1000))
 
-	printf '%s %s %s %s\n' \
+	printf '%s %s %s %s %s\n' \
 		"$deadline_ms" \
 		"$retry_attempt_headroom_ms" \
+		"$max_recovery_sleep_ms" \
 		"$shutdown_grace_ms" \
 		"$stop_timeout_ms"
 }
@@ -504,19 +517,19 @@ NODE
 
 validate_effective_systemd_policy() {
 	if [[ "$#" -lt 1 || "$#" -gt 2 ]]; then
-		echo "validate_effective_systemd_policy requires: service [allow-missing-retry-headroom]" >&2
+		echo "validate_effective_systemd_policy requires: service [allow-missing-new-guard-limits]" >&2
 		return 2
 	fi
-	local service="$1" allow_missing_retry_headroom=0
+	local service="$1" allow_missing_new_guard_limits=0
 	local kill_mode stop_timeout effective_environment effective_deadline_ms
-	local effective_retry_attempt_headroom_ms effective_shutdown_grace_ms
+	local effective_retry_attempt_headroom_ms effective_max_recovery_sleep_ms effective_shutdown_grace_ms
 	local stop_timeout_usec stop_timeout_ms
 	local minimum_stop_timeout_usec value
 	if [[ "$#" -eq 2 ]]; then
-		allow_missing_retry_headroom="$2"
+		allow_missing_new_guard_limits="$2"
 	fi
-	if [[ "$allow_missing_retry_headroom" != "0" && "$allow_missing_retry_headroom" != "1" ]]; then
-		echo "allow-missing-retry-headroom must be 0 or 1" >&2
+	if [[ "$allow_missing_new_guard_limits" != "0" && "$allow_missing_new_guard_limits" != "1" ]]; then
+		echo "allow-missing-new-guard-limits must be 0 or 1" >&2
 		return 2
 	fi
 
@@ -532,7 +545,7 @@ validate_effective_systemd_policy() {
 	if ! effective_retry_attempt_headroom_ms="$(
 		systemd_environment_text_value "$effective_environment" GUARD_RETRY_ATTEMPT_HEADROOM_MS
 	)"; then
-		if [[ "$allow_missing_retry_headroom" == "1" ]]; then
+		if [[ "$allow_missing_new_guard_limits" == "1" ]]; then
 			# Rollback compatibility: a pin installed before retry headroom existed
 			# cannot publish this environment key. Use the new guard's safe default
 			# only to validate the restored timing tuple; strict pre-restart
@@ -540,6 +553,18 @@ validate_effective_systemd_policy() {
 			effective_retry_attempt_headroom_ms=30000
 		else
 			echo "effective systemd environment is missing GUARD_RETRY_ATTEMPT_HEADROOM_MS" >&2
+			return 1
+		fi
+	fi
+	if ! effective_max_recovery_sleep_ms="$(
+		systemd_environment_text_value "$effective_environment" GUARD_MAX_RECOVERY_SLEEP_MS
+	)"; then
+		if [[ "$allow_missing_new_guard_limits" == "1" ]]; then
+			# Rollback compatibility for pins installed before the sleep cap was
+			# explicit. Strict validation of a newly rendered pin still requires it.
+			effective_max_recovery_sleep_ms=120000
+		else
+			echo "effective systemd environment is missing GUARD_MAX_RECOVERY_SLEEP_MS" >&2
 			return 1
 		fi
 	fi
@@ -566,6 +591,11 @@ validate_effective_systemd_policy() {
 		echo "unsafe effective retry-attempt headroom ${effective_retry_attempt_headroom_ms}ms" >&2
 		return 1
 	fi
+	if [[ ! "$effective_max_recovery_sleep_ms" =~ ^[1-9][0-9]{0,9}$ ]] \
+		|| ((effective_max_recovery_sleep_ms > effective_deadline_ms - effective_retry_attempt_headroom_ms)); then
+		echo "unsafe effective max recovery sleep ${effective_max_recovery_sleep_ms}ms" >&2
+		return 1
+	fi
 	if ((effective_shutdown_grace_ms < effective_deadline_ms)); then
 		echo "effective shutdown grace is shorter than the guard deadline" >&2
 		return 1
@@ -580,9 +610,10 @@ validate_effective_systemd_policy() {
 		return 1
 	fi
 	stop_timeout_ms=$((stop_timeout_usec / 1000))
-	printf '%s %s %s %s\n' \
+	printf '%s %s %s %s %s\n' \
 		"$effective_deadline_ms" \
 		"$effective_retry_attempt_headroom_ms" \
+		"$effective_max_recovery_sleep_ms" \
 		"$effective_shutdown_grace_ms" \
 		"$stop_timeout_ms"
 }
@@ -662,6 +693,7 @@ for (const name of ["binary", "runner", "guard", "policy"]) {
 for (const name of [
 	"totalDeadlineMs",
 	"retryAttemptHeadroomMs",
+	"maxRecoverySleepMs",
 	"shutdownGraceMs",
 	"maxAttempts",
 	"jitterMs",

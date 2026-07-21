@@ -12,6 +12,7 @@ import { createRequestMetadata } from "../../packages/proxy/src/handlers/request
 import {
 	DEFAULT_GUARD_MAX_ATTEMPTS,
 	DEFAULT_GUARD_MAX_INSPECTION_BYTES,
+	DEFAULT_GUARD_MAX_RECOVERY_SLEEP_MS,
 	DEFAULT_GUARD_RETRY_ATTEMPT_HEADROOM_MS,
 	DEFAULT_GUARD_RESPONSE_IDLE_TIMEOUT_MS,
 	DEFAULT_GUARD_RETRY_JITTER_MS,
@@ -300,6 +301,7 @@ describe("source-controlled guard", () => {
 			limits: {
 				totalDeadlineMs: 1_000,
 				retryAttemptHeadroomMs: 10,
+				maxRecoverySleepMs: 120_000,
 				shutdownGraceMs: 600_000,
 				maxAttempts: 3,
 				jitterMs: 0,
@@ -309,6 +311,7 @@ describe("source-controlled guard", () => {
 		expect(DEFAULT_GUARD_MAX_ATTEMPTS).toBe(3);
 		expect(DEFAULT_GUARD_TOTAL_DEADLINE_MS).toBe(600_000);
 		expect(DEFAULT_GUARD_RETRY_ATTEMPT_HEADROOM_MS).toBe(30_000);
+		expect(DEFAULT_GUARD_MAX_RECOVERY_SLEEP_MS).toBe(120_000);
 		expect(DEFAULT_GUARD_RETRY_JITTER_MS).toBe(2_000);
 		expect(DEFAULT_GUARD_MAX_INSPECTION_BYTES).toBe(64 * 1_024);
 		expect(DEFAULT_GUARD_RESPONSE_IDLE_TIMEOUT_MS).toBe(120_000);
@@ -2035,6 +2038,135 @@ describe("source-controlled guard", () => {
 		expect(guard.state.counters.retried).toBe(0);
 		expect(guard.state.counters.deadlineExceeded).toBe(0);
 		expect(guard.state.counters.finalError).toBe(1);
+	});
+
+	test("forwards a finite model recovery above the single-sleep cap without leaking its permit", async () => {
+		const events: Array<Record<string, unknown>> = [];
+		let attempts = 0;
+		const modelBody = JSON.stringify({
+			type: "error",
+			error: {
+				type: "service_unavailable",
+				code: "model_pool_exhausted",
+				message: "Sonnet capacity is temporarily exhausted",
+				next_available_at: new Date(Date.now() + 300_000).toISOString(),
+			},
+		});
+		const upstreamBase = await listen(
+			http.createServer((_req, res) => {
+				attempts += 1;
+				if (attempts === 1) {
+					res.writeHead(503, {
+						"content-type": "application/json",
+						"retry-after": "300",
+						"x-better-ccflare-pool-status": "exhausted",
+					});
+					res.end(modelBody);
+					return;
+				}
+				res.end("next request admitted");
+			}),
+		);
+		const { baseUrl, guard } = await startGuard(upstreamBase, {
+			logger: (line: string) => events.push(JSON.parse(line)),
+			maxActive: 1,
+			maxRecoverySleepMs: 120_000,
+			retryAttemptHeadroomMs: 30_000,
+			totalDeadlineMs: 600_000,
+		});
+
+		const startedAt = Date.now();
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+			signal: AbortSignal.timeout(500),
+		});
+		expect(response.status).toBe(503);
+		expect(response.headers.get("retry-after")).toBe("300");
+		expect(response.headers.get("x-better-ccflare-pool-status")).toBe(
+			"exhausted",
+		);
+		expect(await response.text()).toBe(modelBody);
+		expect(Date.now() - startedAt).toBeLessThan(500);
+		expect(attempts).toBe(1);
+		await waitFor(() => guard.state.active === 0);
+
+		const next = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+			signal: AbortSignal.timeout(500),
+		});
+		expect(await next.text()).toBe("next request admitted");
+		expect(attempts).toBe(2);
+		expect(guard.state.active).toBe(0);
+		expect(guard.state.queued).toBe(0);
+		expect(guard.state.counters.retried).toBe(0);
+		expect(guard.state.counters.recoverySleepCapExceeded).toBe(1);
+		expect(guard.state.counters.recoveryBeyondDeadline).toBe(0);
+		expect(
+			events.find((event) => event.event === "proxy_final_error"),
+		).toMatchObject({
+			status: 503,
+			reason: "recovery_sleep_cap_exceeded",
+			recoverySource: "retry-after",
+			recoveryDelayMs: 300_000,
+			maxRecoverySleepMs: 120_000,
+		});
+	});
+
+	test("retries a trusted finite model recovery below the single-sleep cap", async () => {
+		const events: Array<Record<string, unknown>> = [];
+		let attempts = 0;
+		const upstreamBase = await listen(
+			http.createServer((_req, res) => {
+				attempts += 1;
+				if (attempts === 1) {
+					res.writeHead(503, {
+						"content-type": "application/json",
+						"retry-after": "1",
+						"x-better-ccflare-pool-status": "exhausted",
+					});
+					res.end(
+						JSON.stringify({
+							type: "error",
+							error: {
+								type: "service_unavailable",
+								code: "model_pool_exhausted",
+								next_available_at: new Date(
+									Date.now() + 1_000,
+								).toISOString(),
+							},
+						}),
+					);
+					return;
+				}
+				res.end("recovered");
+			}),
+		);
+		const { baseUrl, guard } = await startGuard(upstreamBase, {
+			logger: (line: string) => events.push(JSON.parse(line)),
+			maxAttempts: 2,
+			maxRecoverySleepMs: 1_500,
+			retryAttemptHeadroomMs: 300,
+			totalDeadlineMs: 2_000,
+		});
+
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+		expect(response.status).toBe(200);
+		expect(await response.text()).toBe("recovered");
+		expect(attempts).toBe(2);
+		expect(guard.state.counters.retried).toBe(1);
+		expect(guard.state.counters.recoverySleepCapExceeded).toBe(0);
+		expect(guard.state.active).toBe(0);
+		expect(
+			events.find((event) => event.event === "proxy_retry_wait"),
+		).toMatchObject({
+			recoverySource: "retry-after",
+			delayMs: 1_000,
+		});
 	});
 
 	test("preserves an infeasible original 503 before applying a one-attempt cap", async () => {

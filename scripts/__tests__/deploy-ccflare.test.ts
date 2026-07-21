@@ -392,6 +392,7 @@ describe("render_systemd_pin", () => {
 				`Environment=RUNNER_SHA256=${sha256Of(runnerScriptFixture)}`,
 				"Environment=GUARD_TOTAL_DEADLINE_MS=600000",
 				"Environment=GUARD_RETRY_ATTEMPT_HEADROOM_MS=30000",
+				"Environment=GUARD_MAX_RECOVERY_SLEEP_MS=120000",
 				"Environment=GUARD_SHUTDOWN_GRACE_MS=600000",
 				"KillMode=mixed",
 				"TimeoutStopSec=720s",
@@ -503,6 +504,9 @@ describe("render_systemd_pin", () => {
 		expect(rendered).toContain(
 			"Environment=GUARD_RETRY_ATTEMPT_HEADROOM_MS=30000",
 		);
+		expect(rendered).toContain(
+			"Environment=GUARD_MAX_RECOVERY_SLEEP_MS=120000",
+		);
 		expect(rendered).toContain("Environment=GUARD_SHUTDOWN_GRACE_MS=600000");
 		expect(rendered).toContain("KillMode=mixed");
 		expect(rendered).toContain("TimeoutStopSec=720s");
@@ -597,9 +601,23 @@ describe("configured_systemd_environment_value", () => {
 
 describe("validate_deployment_timing", () => {
 	test("accepts the safe defaults and larger coherent operator overrides", () => {
-		for (const [deadline, headroom, grace, timeout, expected] of [
-			["600000", "30000", "600000", "720s", "600000 30000 600000 720000"],
-			["900000", "45000", "900000", "17min", "900000 45000 900000 1020000"],
+		for (const [deadline, headroom, maxSleep, grace, timeout, expected] of [
+			[
+				"600000",
+				"30000",
+				"120000",
+				"600000",
+				"720s",
+				"600000 30000 120000 600000 720000",
+			],
+			[
+				"900000",
+				"45000",
+				"180000",
+				"900000",
+				"17min",
+				"900000 45000 180000 900000 1020000",
+			],
 		] as const) {
 			const dir = tempDir();
 			const pin = join(dir, "pin.conf");
@@ -609,6 +627,7 @@ describe("validate_deployment_timing", () => {
 					"[Service]",
 					`Environment=GUARD_TOTAL_DEADLINE_MS=${deadline}`,
 					`Environment=GUARD_RETRY_ATTEMPT_HEADROOM_MS=${headroom}`,
+					`Environment=GUARD_MAX_RECOVERY_SLEEP_MS=${maxSleep}`,
 					`Environment=GUARD_SHUTDOWN_GRACE_MS=${grace}`,
 					"KillMode=mixed",
 					`TimeoutStopSec=${timeout}`,
@@ -673,6 +692,7 @@ describe("validate_deployment_timing", () => {
 				[
 					"[Service]",
 					"Environment=GUARD_RETRY_ATTEMPT_HEADROOM_MS=30000",
+					"Environment=GUARD_MAX_RECOVERY_SLEEP_MS=120000",
 					...lines,
 					"",
 				].join("\n"),
@@ -734,7 +754,7 @@ describe("effective systemd policy validation", () => {
 			`export CCFLARE_TEST_SYSTEMCTL_LOG=${shellQuote(shellPath(log))}`,
 			"export CCFLARE_TEST_KILL_MODE=mixed",
 			"export CCFLARE_TEST_TIMEOUT=12min",
-			"export CCFLARE_TEST_ENVIRONMENT='KEEP=1 GUARD_TOTAL_DEADLINE_MS=600000 GUARD_RETRY_ATTEMPT_HEADROOM_MS=30000 GUARD_SHUTDOWN_GRACE_MS=600000'",
+			"export CCFLARE_TEST_ENVIRONMENT='KEEP=1 GUARD_TOTAL_DEADLINE_MS=600000 GUARD_RETRY_ATTEMPT_HEADROOM_MS=30000 GUARD_MAX_RECOVERY_SLEEP_MS=120000 GUARD_SHUTDOWN_GRACE_MS=600000'",
 			`source ${shellQuote(helperScriptForShell)}`,
 		];
 		const good = bash(
@@ -745,20 +765,20 @@ describe("effective systemd policy validation", () => {
 		);
 		expect(good.exitCode).toBe(0);
 		expect(good.stdout.toString().trim()).toBe(
-			"600000 30000 600000 720000",
+			"600000 30000 120000 600000 720000",
 		);
 
 		const safeOperatorOverride = bash(
 			[
 				...base,
 				"export CCFLARE_TEST_TIMEOUT='17min'",
-				"export CCFLARE_TEST_ENVIRONMENT='GUARD_TOTAL_DEADLINE_MS=900000 GUARD_RETRY_ATTEMPT_HEADROOM_MS=45000 GUARD_SHUTDOWN_GRACE_MS=900000'",
+				"export CCFLARE_TEST_ENVIRONMENT='GUARD_TOTAL_DEADLINE_MS=900000 GUARD_RETRY_ATTEMPT_HEADROOM_MS=45000 GUARD_MAX_RECOVERY_SLEEP_MS=180000 GUARD_SHUTDOWN_GRACE_MS=900000'",
 				"validate_effective_systemd_policy ccflare-stack.service",
 			].join("\n"),
 		);
 		expect(safeOperatorOverride.exitCode).toBe(0);
 		expect(safeOperatorOverride.stdout.toString().trim()).toBe(
-			"900000 45000 900000 1020000",
+			"900000 45000 180000 900000 1020000",
 		);
 
 		const overridden = bash(
@@ -804,7 +824,7 @@ describe("effective systemd policy validation", () => {
 				`export CCFLARE_TEST_SYSTEMCTL_LOG=${shellQuote(shellPath(log))}`,
 				"export CCFLARE_TEST_KILL_MODE=control-group",
 				"export CCFLARE_TEST_TIMEOUT=12min",
-				"export CCFLARE_TEST_ENVIRONMENT='GUARD_TOTAL_DEADLINE_MS=600000 GUARD_RETRY_ATTEMPT_HEADROOM_MS=30000 GUARD_SHUTDOWN_GRACE_MS=600000'",
+				"export CCFLARE_TEST_ENVIRONMENT='GUARD_TOTAL_DEADLINE_MS=600000 GUARD_RETRY_ATTEMPT_HEADROOM_MS=30000 GUARD_MAX_RECOVERY_SLEEP_MS=120000 GUARD_SHUTDOWN_GRACE_MS=600000'",
 				"export CCFLARE_TEST_RESTORED_ENVIRONMENT='GUARD_TOTAL_DEADLINE_MS=600000 GUARD_SHUTDOWN_GRACE_MS=600000'",
 				`export CCFLARE_TEST_SAFE_POLICY_PIN=${shellQuote(shellPath(pin))}`,
 				`export CCFLARE_TEST_SAFE_POLICY_BACKUP=${shellQuote(shellPath(backup))}`,
@@ -867,7 +887,7 @@ describe("effective systemd policy validation", () => {
 				`export CCFLARE_TEST_SYSTEMCTL_LOG=${shellQuote(shellPath(log))}`,
 				"export CCFLARE_TEST_KILL_MODE=control-group",
 				"export CCFLARE_TEST_TIMEOUT=12min",
-				"export CCFLARE_TEST_ENVIRONMENT='GUARD_TOTAL_DEADLINE_MS=600000 GUARD_RETRY_ATTEMPT_HEADROOM_MS=30000 GUARD_SHUTDOWN_GRACE_MS=600000'",
+				"export CCFLARE_TEST_ENVIRONMENT='GUARD_TOTAL_DEADLINE_MS=600000 GUARD_RETRY_ATTEMPT_HEADROOM_MS=30000 GUARD_MAX_RECOVERY_SLEEP_MS=120000 GUARD_SHUTDOWN_GRACE_MS=600000'",
 				`source ${shellQuote(helperScriptForShell)}`,
 				`reload_validate_or_restore_systemd_policy ${shellQuote(shellPath(pin))} ${shellQuote(shellPath(backup))} ccflare-stack.service`,
 			].join("\n"),
@@ -994,6 +1014,7 @@ describe("validate_deploy_health", () => {
 			limits: {
 				totalDeadlineMs: 900_000,
 				retryAttemptHeadroomMs: 45_000,
+				maxRecoverySleepMs: 180_000,
 				shutdownGraceMs: 900_000,
 				maxAttempts: 3,
 				jitterMs: 2_000,
@@ -1021,6 +1042,7 @@ describe("validate_deploy_health", () => {
 				limits: {
 					totalDeadlineMs: 900_000,
 					retryAttemptHeadroomMs: 45_000,
+					maxRecoverySleepMs: 180_000,
 					shutdownGraceMs: 900_000,
 					maxAttempts: 3,
 					jitterMs: 2_000,
@@ -1045,6 +1067,7 @@ describe("validate_deploy_health", () => {
 				'"retryAttemptHeadroomMs":45000',
 				'"retryAttemptHeadroomMs":1',
 			],
+			['"maxRecoverySleepMs":180000', '"maxRecoverySleepMs":300000'],
 		] as const) {
 			const bad = bash(
 				[
@@ -1201,6 +1224,24 @@ describe("source-controlled stack runner", () => {
 		);
 	});
 
+	test("rejects an invalid or infeasible recovery sleep cap before starting children", () => {
+		const invalid = bash(
+			`GUARD_MAX_RECOVERY_SLEEP_MS=0 CCFLARE_BIN=/bin/true GUARD_SCRIPT=/bin/true NODE_BIN=/bin/true AI_GATEWAY_TUNNEL_ENABLED=0 bash ${shellQuote(shellPath(runnerScript))}`,
+		);
+		expect(invalid.exitCode).toBe(64);
+		expect(invalid.stdout.toString()).toContain(
+			"invalid GUARD_MAX_RECOVERY_SLEEP_MS=0",
+		);
+
+		const infeasible = bash(
+			`GUARD_TOTAL_DEADLINE_MS=100 GUARD_RETRY_ATTEMPT_HEADROOM_MS=40 GUARD_MAX_RECOVERY_SLEEP_MS=61 GUARD_SHUTDOWN_GRACE_MS=100 CCFLARE_BIN=/bin/true GUARD_SCRIPT=/bin/true NODE_BIN=/bin/true AI_GATEWAY_TUNNEL_ENABLED=0 bash ${shellQuote(shellPath(runnerScript))}`,
+		);
+		expect(infeasible.exitCode).toBe(64);
+		expect(infeasible.stdout.toString()).toContain(
+			"GUARD_MAX_RECOVERY_SLEEP_MS=61 must fit within",
+		);
+	});
+
 	test("rejects shutdown grace shorter than the total request deadline", () => {
 		const result = bash(
 			`GUARD_TOTAL_DEADLINE_MS=900000 GUARD_SHUTDOWN_GRACE_MS=600000 CCFLARE_BIN=/bin/true GUARD_SCRIPT=/bin/true NODE_BIN=/bin/true AI_GATEWAY_TUNNEL_ENABLED=0 bash ${shellQuote(shellPath(runnerScript))}`,
@@ -1230,6 +1271,15 @@ describe("source-controlled stack runner", () => {
 		);
 		expect(source).toContain(
 			'GUARD_RETRY_ATTEMPT_HEADROOM_MS="$GUARD_RETRY_ATTEMPT_HEADROOM_MS"',
+		);
+		expect(source).toContain(
+			"GUARD_MAX_RECOVERY_SLEEP_MS=${GUARD_MAX_RECOVERY_SLEEP_MS:-120000}",
+		);
+		expect(source).toContain(
+			'validate_bounded_ms GUARD_MAX_RECOVERY_SLEEP_MS "$GUARD_MAX_RECOVERY_SLEEP_MS" 1 2147483647',
+		);
+		expect(source).toContain(
+			'GUARD_MAX_RECOVERY_SLEEP_MS="$GUARD_MAX_RECOVERY_SLEEP_MS"',
 		);
 		expect(source).not.toContain("GUARD_TOTAL_DEADLINE_MS=120000");
 	});
@@ -1381,6 +1431,7 @@ process.on("SIGTERM", () => {
 					AI_GATEWAY_TUNNEL_REQUIRED: "0",
 					GUARD_TOTAL_DEADLINE_MS: "240",
 					GUARD_RETRY_ATTEMPT_HEADROOM_MS: "40",
+					GUARD_MAX_RECOVERY_SLEEP_MS: "120",
 					GUARD_SHUTDOWN_GRACE_MS: "240",
 					GUARD_SHUTDOWN_CUSHION_MS: "120",
 					FIXTURE_EVENTS: shellPath(eventsFile),

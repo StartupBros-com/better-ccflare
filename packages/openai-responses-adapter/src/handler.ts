@@ -274,15 +274,18 @@ export async function handleResponsesRequest(
 		const responseHeaders = new Headers({
 			"content-type": "application/json",
 		});
-		// The local guard must only hold requests for the narrow, positively
-		// recoverable whole-pool terminal. Preserve the marker pair atomically;
-		// never let model/route errors inherit retry semantics from stray headers.
+		// The local guard must only hold requests for positively recoverable
+		// terminals. A finite model lane can recover on a different compatible
+		// account just like the whole pool can. Preserve the trusted marker pair
+		// atomically; never let unmarked errors inherit retry semantics from stray
+		// headers.
 		const retryAfter = anthropicResp.headers.get("retry-after");
 		const poolStatus = anthropicResp.headers.get(
 			"x-better-ccflare-pool-status",
 		);
 		if (
-			stableCode === "pool_exhausted" &&
+			(stableCode === "pool_exhausted" ||
+				stableCode === "model_pool_exhausted") &&
 			poolStatus === "exhausted" &&
 			retryAfter !== null &&
 			/^[1-9]\d*$/.test(retryAfter)

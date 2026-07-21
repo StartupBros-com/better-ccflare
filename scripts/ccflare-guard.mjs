@@ -24,6 +24,7 @@ export const DEFAULT_GUARD_SOURCE_ID = "better-ccflare-source-guard-v1";
 export const DEFAULT_GUARD_MAX_ATTEMPTS = 3;
 export const DEFAULT_GUARD_TOTAL_DEADLINE_MS = 600_000;
 export const DEFAULT_GUARD_RETRY_ATTEMPT_HEADROOM_MS = 30_000;
+export const DEFAULT_GUARD_MAX_RECOVERY_SLEEP_MS = 120_000;
 export const DEFAULT_GUARD_RETRY_JITTER_MS = 2_000;
 export const DEFAULT_GUARD_MAX_INSPECTION_BYTES = 64 * 1_024;
 export const DEFAULT_GUARD_RESPONSE_IDLE_TIMEOUT_MS = 120_000;
@@ -941,10 +942,14 @@ function planRetryDelay({
 	recoveryDelayMs,
 	remainingMs,
 	retryAttemptHeadroomMs,
+	maxRecoverySleepMs,
 	jitterMs,
 	random,
 }) {
-	const availableDelayMs = remainingMs - retryAttemptHeadroomMs;
+	const availableDelayMs = Math.min(
+		remainingMs - retryAttemptHeadroomMs,
+		maxRecoverySleepMs,
+	);
 	if (availableDelayMs < 0 || recoveryDelayMs > availableDelayMs) return null;
 	const requestedJitter = Math.max(0, Math.floor(random() * jitterMs));
 	return (
@@ -992,6 +997,15 @@ export function createGuard(options = {}) {
 				options.retryAttemptHeadroomMs ??
 					env.GUARD_RETRY_ATTEMPT_HEADROOM_MS,
 				DEFAULT_GUARD_RETRY_ATTEMPT_HEADROOM_MS,
+			),
+		),
+	);
+	const maxRecoverySleepMs = Math.max(
+		1,
+		Math.floor(
+			configuredNumber(
+				options.maxRecoverySleepMs ?? env.GUARD_MAX_RECOVERY_SLEEP_MS,
+				DEFAULT_GUARD_MAX_RECOVERY_SLEEP_MS,
 			),
 		),
 	);
@@ -1077,6 +1091,7 @@ export function createGuard(options = {}) {
 		aborted: 0,
 		deadlineExceeded: 0,
 		recoveryBeyondDeadline: 0,
+		recoverySleepCapExceeded: 0,
 		attemptsExhausted: 0,
 		oversizedInspectionBodies: 0,
 		responseBodyIdleTimeouts: 0,
@@ -1399,7 +1414,7 @@ export function createGuard(options = {}) {
 		);
 	}
 
-	async function forwardRecoveryBeyondDeadline(
+	async function forwardRecoveryWithoutRetry(
 		res,
 		context,
 		attempt,
@@ -1410,6 +1425,7 @@ export function createGuard(options = {}) {
 			recoveryDelayMs,
 			recoverySource,
 			remainingMs,
+			reason = "recovery_beyond_deadline",
 		},
 	) {
 		if (inspection?.oversized || inspection?.incomplete) {
@@ -1435,18 +1451,23 @@ export function createGuard(options = {}) {
 				context.beginResponse,
 			);
 		}
-		counters.recoveryBeyondDeadline += 1;
+		if (reason === "recovery_sleep_cap_exceeded") {
+			counters.recoverySleepCapExceeded += 1;
+		} else {
+			counters.recoveryBeyondDeadline += 1;
+		}
 		counters.finalError += 1;
 		log("proxy_final_error", {
 			id: context.id,
 			attempt,
 			status: upstreamResponse.status,
 			outcome: outcomeForStatus(upstreamResponse.status),
-			reason: "recovery_beyond_deadline",
+			reason,
 			recoverySource,
 			recoveryDelayMs,
 			remainingMs,
 			retryAttemptHeadroomMs,
+			maxRecoverySleepMs,
 			elapsedMs: now() - context.acceptedAt,
 		});
 	}
@@ -1580,12 +1601,32 @@ export function createGuard(options = {}) {
 					const headerDelayBudgetMs =
 						headerRemainingMs - retryAttemptHeadroomMs;
 
+					// Claude Code commonly abandons a single silent wait near 180s.
+					// Preserve longer authoritative recovery markers immediately so
+					// the client remains in charge of its own visible retry cadence.
+					if (delayMs > maxRecoverySleepMs) {
+						counters.poolExhausted += 1;
+						await forwardRecoveryWithoutRetry(
+							res,
+							context,
+							attempt,
+							upstreamResponse,
+							{
+								recoveryDelayMs: delayMs,
+								recoverySource,
+								remainingMs: headerRemainingMs,
+								reason: "recovery_sleep_cap_exceeded",
+							},
+						);
+						return;
+					}
+
 					// If even the header-time recovery floor (including zero delay)
 					// cannot leave one attempt's headroom, preserve the untouched 503
 					// immediately instead of consuming its body.
 					if (delayMs > headerDelayBudgetMs) {
 						counters.poolExhausted += 1;
-						await forwardRecoveryBeyondDeadline(
+						await forwardRecoveryWithoutRetry(
 							res,
 							context,
 							attempt,
@@ -1646,6 +1687,26 @@ export function createGuard(options = {}) {
 					}
 
 					counters.poolExhausted += 1;
+					if (delayMs > maxRecoverySleepMs) {
+						await forwardRecoveryWithoutRetry(
+							res,
+							context,
+							attempt,
+							upstreamResponse,
+							{
+								buffer:
+									inspection?.oversized || inspection?.incomplete
+										? undefined
+										: inspection?.buffer,
+								inspection,
+								recoveryDelayMs: delayMs,
+								recoverySource,
+								remainingMs: context.remainingMs(),
+								reason: "recovery_sleep_cap_exceeded",
+							},
+						);
+						return;
+					}
 					try {
 						context.ensureBudget();
 					} catch (error) {
@@ -1657,11 +1718,12 @@ export function createGuard(options = {}) {
 						recoveryDelayMs: delayMs,
 						remainingMs,
 						retryAttemptHeadroomMs,
+						maxRecoverySleepMs,
 						jitterMs,
 						random,
 					});
 					if (boundedDelayMs === null) {
-						await forwardRecoveryBeyondDeadline(
+						await forwardRecoveryWithoutRetry(
 							res,
 							context,
 							attempt,
@@ -1774,15 +1836,32 @@ export function createGuard(options = {}) {
 					counters.poolExhausted += 1;
 					context.ensureBudget();
 					const remainingMs = context.remainingMs();
+					if (decision.delayMs > maxRecoverySleepMs) {
+						await forwardRecoveryWithoutRetry(
+							res,
+							context,
+							attempt,
+							upstreamResponse,
+							{
+								buffer,
+								recoveryDelayMs: decision.delayMs,
+								recoverySource: decision.recoverySource,
+								remainingMs,
+								reason: "recovery_sleep_cap_exceeded",
+							},
+						);
+						return;
+					}
 					const delayMs = planRetryDelay({
 						recoveryDelayMs: decision.delayMs,
 						remainingMs,
 						retryAttemptHeadroomMs,
+						maxRecoverySleepMs,
 						jitterMs,
 						random,
 					});
 					if (delayMs === null) {
-						await forwardRecoveryBeyondDeadline(
+						await forwardRecoveryWithoutRetry(
 							res,
 							context,
 							attempt,
@@ -1970,6 +2049,7 @@ export function createGuard(options = {}) {
 					maxAttempts,
 					totalDeadlineMs,
 					retryAttemptHeadroomMs,
+					maxRecoverySleepMs,
 					jitterMs,
 					maxInspectionBytes,
 					responseIdleTimeoutMs,
@@ -1982,6 +2062,7 @@ export function createGuard(options = {}) {
 						limits: {
 							totalDeadlineMs,
 							retryAttemptHeadroomMs,
+							maxRecoverySleepMs,
 							maxAttempts,
 							jitterMs,
 							maxInspectionBytes,
@@ -2070,6 +2151,7 @@ export function createGuard(options = {}) {
 					maxAttempts,
 					totalDeadlineMs,
 					retryAttemptHeadroomMs,
+					maxRecoverySleepMs,
 					maxInspectionBytes,
 					responseIdleTimeoutMs,
 					delayInspectionTimeoutMs,

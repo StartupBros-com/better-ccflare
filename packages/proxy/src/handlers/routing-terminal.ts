@@ -264,9 +264,18 @@ export function createModelPoolExhaustedResponse(options: {
 	if (nextAvailableAt !== null) {
 		error.next_available_at = new Date(nextAvailableAt).toISOString();
 	}
+	const headers = new Headers({ "content-type": "application/json" });
+	if (nextAvailableAt !== null) {
+		const retryAfterSeconds = Math.max(
+			1,
+			Math.ceil((nextAvailableAt - now) / 1000),
+		);
+		headers.set("retry-after", String(retryAfterSeconds));
+		headers.set("x-better-ccflare-pool-status", "exhausted");
+	}
 	return new Response(JSON.stringify({ type: "error", error }), {
 		status: 503,
-		headers: { "content-type": "application/json" },
+		headers,
 	});
 }
 
