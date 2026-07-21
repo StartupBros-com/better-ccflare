@@ -80,7 +80,10 @@ import { combineChunks } from "../stream-tee";
 import { isModelRewrite } from "../worker-messages";
 import { GUARD_REQUEST_ID_HEADER } from "./internal-transport-headers";
 import { ERROR_MESSAGES, type ProxyContext } from "./proxy-types";
-import { applyRateLimitCooldown } from "./rate-limit-cooldown";
+import {
+	applyRateLimitCooldown,
+	applyRateLimitCooldownAwaitingPersist,
+} from "./rate-limit-cooldown";
 import {
 	classifyPreByte429,
 	getAnthropicRateLimitResetAt,
@@ -2824,6 +2827,83 @@ export async function proxyWithAccount(
 			}
 			let requestedModel: string | null = null;
 			if (effectiveBodyBuffer) requestedModel = effectiveBodyContext.getModel();
+
+			if (rawResponse.status === 429) {
+				const isKeepalive =
+					req.headers.get("x-better-ccflare-keepalive") === "true";
+
+				// Preserve verified Codex recovery provenance before the generic 429
+				// model-fallback path can replace it with model_fallback_429 and a
+				// fabricated probe cooldown. The provider only supplies
+				// upstream_429_with_reset for a plausible direct reset hint or for a
+				// reset paired with the exact exhausted usage window; routine quota
+				// telemetry alone is not trusted. The cooldown helper applies the shared
+				// safety ceiling before persisting the verified deadline.
+				const codexRateLimitInfo =
+					provider.name === "codex" && !isKeepalive
+						? provider.parseRateLimit(rawResponse)
+						: null;
+				const verifiedCodexReset =
+					codexRateLimitInfo?.isRateLimited === true &&
+					codexRateLimitInfo.reason === "upstream_429_with_reset" &&
+					typeof codexRateLimitInfo.resetTime === "number" &&
+					Number.isFinite(codexRateLimitInfo.resetTime) &&
+					codexRateLimitInfo.resetTime > Date.now();
+				if (verifiedCodexReset) {
+					const reason: RateLimitReason = "upstream_429_with_reset";
+					log.warn(
+						`Account ${account.name} received a verified Codex quota reset — persisting account cooldown before failover`,
+					);
+					await applyRateLimitCooldownAwaitingPersist(
+						account,
+						{
+							resetTime: codexRateLimitInfo.resetTime,
+							remaining: codexRateLimitInfo.remaining,
+							reason,
+						},
+						ctx,
+					);
+					routingAttemptLedger?.blockAccount(account.id);
+					const responseTime = Date.now() - requestMeta.timestamp;
+					ctx.asyncWriter.enqueue(() =>
+						ctx.dbOps.saveRequest(
+							crypto.randomUUID(),
+							req.method,
+							url.pathname,
+							account.id,
+							429,
+							false,
+							reason,
+							responseTime,
+							failoverAttempts,
+							requestedModel ? { model: requestedModel } : undefined,
+							requestMeta.agentUsed ?? undefined,
+							apiKeyId ?? undefined,
+							apiKeyName ?? undefined,
+							requestMeta.project ?? null,
+							undefined,
+							requestMeta.comboName ?? null,
+							isModelRewrite(
+								requestMeta.originalModel,
+								requestMeta.appliedModel,
+							)
+								? (requestMeta.originalModel ?? null)
+								: null,
+							isModelRewrite(
+								requestMeta.originalModel,
+								requestMeta.appliedModel,
+							)
+								? (requestMeta.appliedModel ?? null)
+								: null,
+							requestMeta.projectAttributionSource ?? null,
+							requestMeta.agentAttributionSource ?? null,
+						),
+					);
+					await finalizeCurrentCodexTransport(rawResponse);
+					await discardUpstreamBody(rawResponse);
+					return null;
+				}
+			}
 
 			if (requestedModel) {
 				const modelList =

@@ -36,6 +36,8 @@ const RESCUE_ACTIVATION_ENV =
 	"CCFLARE_ANTHROPIC_PRECOMMIT_RESCUE_ACTIVATION_MS";
 const RESCUE_PING_ENV = "CCFLARE_ANTHROPIC_PRECOMMIT_RESCUE_PING_INTERVAL_MS";
 const ACCOUNT_SELECTION_TIMEOUT_ENV = "CCFLARE_ACCOUNT_SELECTION_TIMEOUT_MS";
+const RATE_LIMIT_PERSIST_TIMEOUT_ENV =
+	"CCFLARE_RATE_LIMIT_PERSIST_AWAIT_TIMEOUT_MS";
 const FAST_SUCCESS = [
 	"event: message_start",
 	'data: {"type":"message_start","message":{"id":"msg-pass","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-5","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}}',
@@ -193,6 +195,7 @@ let savedMeaningfulProgress: string | undefined;
 let savedRescueActivation: string | undefined;
 let savedRescuePing: string | undefined;
 let savedAccountSelectionTimeout: string | undefined;
+let savedRateLimitPersistTimeout: string | undefined;
 let restoreUsageCollector = (): void => {};
 let usageStarts: Array<Record<string, unknown>> = [];
 let usageEnds: Array<Record<string, unknown>> = [];
@@ -203,6 +206,7 @@ beforeEach(() => {
 	savedRescueActivation = process.env[RESCUE_ACTIVATION_ENV];
 	savedRescuePing = process.env[RESCUE_PING_ENV];
 	savedAccountSelectionTimeout = process.env[ACCOUNT_SELECTION_TIMEOUT_ENV];
+	savedRateLimitPersistTimeout = process.env[RATE_LIMIT_PERSIST_TIMEOUT_ENV];
 	delete process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
 	usageStarts = [];
 	usageEnds = [];
@@ -246,6 +250,7 @@ afterEach(() => {
 		[RESCUE_ACTIVATION_ENV, savedRescueActivation],
 		[RESCUE_PING_ENV, savedRescuePing],
 		[ACCOUNT_SELECTION_TIMEOUT_ENV, savedAccountSelectionTimeout],
+		[RATE_LIMIT_PERSIST_TIMEOUT_ENV, savedRateLimitPersistTimeout],
 	] as const) {
 		if (value === undefined) delete process.env[name];
 		else process.env[name] = value;
@@ -253,6 +258,80 @@ afterEach(() => {
 });
 
 describe("routing terminal — 503 response", () => {
+	it.each([
+		"reject",
+		"timeout",
+	] as const)("keeps verified Codex recovery retryable when cooldown persistence %s and the terminal DB refresh is stale", async (failureMode) => {
+		process.env[RATE_LIMIT_PERSIST_TIMEOUT_ENV] = "25";
+		const startedAt = Date.now();
+		const resetSeconds = Math.floor(startedAt / 1000) + 120;
+		const account = makeAccount({
+			id: `acc-stale-refresh-${failureMode}`,
+			name: `stale-refresh-${failureMode}`,
+			access_token: "test-access-token",
+			expires_at: startedAt + 60 * 60 * 1000,
+			custom_endpoint: "https://api.openai.com/v1/responses",
+		});
+		const staleRow = { ...account };
+		let upstreamReturned = false;
+		let fetchCalls = 0;
+		const ctx = makeContext([account]);
+		ctx.dbOps.getAllAccounts = mock(async () =>
+			upstreamReturned ? [{ ...staleRow }] : [account],
+		) as never;
+		ctx.dbOps.markAccountRateLimited =
+			failureMode === "reject"
+				? (mock(async () => {
+						throw new Error("simulated cooldown write rejection");
+					}) as never)
+				: (mock(() => new Promise<number>(() => {})) as never);
+		globalThis.fetch = mock(async () => {
+			fetchCalls++;
+			upstreamReturned = true;
+			return new Response(
+				JSON.stringify({ error: { message: "rate limited" } }),
+				{
+					status: 429,
+					headers: {
+						"content-type": "application/json",
+						"x-codex-primary-used-percent": "100",
+						"x-codex-primary-window-minutes": "300",
+						"x-codex-primary-reset-at": String(resetSeconds),
+					},
+				},
+			);
+		}) as unknown as typeof fetch;
+
+		const responseStartedAt = performance.now();
+		const request = makeRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const elapsed = performance.now() - responseStartedAt;
+
+		expect(fetchCalls).toBe(1);
+		expect(ctx.dbOps.getAllAccounts).toHaveBeenCalledTimes(2);
+		expect(ctx.dbOps.markAccountRateLimited).toHaveBeenCalledTimes(1);
+		expect(account.rate_limited_reason).toBe("upstream_429_with_reset");
+		expect(account.rate_limited_until).toBeGreaterThan(startedAt);
+		expect(elapsed).toBeLessThan(1000);
+		expect(response.status).toBe(503);
+		expect(response.headers.get("x-better-ccflare-pool-status")).toBe(
+			"exhausted",
+		);
+		expect(response.headers.get("x-better-ccflare-recovery-scope")).toBe(
+			"pool",
+		);
+		const retryAfter = Number(response.headers.get("retry-after"));
+		expect(retryAfter).toBeGreaterThan(0);
+		expect(retryAfter).toBeLessThanOrEqual(120);
+		const payload = (await response.json()) as {
+			error: { code: string; next_available_at?: string };
+		};
+		expect(payload.error.code).toBe("pool_exhausted");
+		expect(
+			new Date(payload.error.next_available_at ?? "invalid").getTime(),
+		).toBeGreaterThan(startedAt);
+	});
+
 	it("records the direct native terminal lifecycle exactly once", async () => {
 		const response = await handleProxy(
 			makeRequest(),

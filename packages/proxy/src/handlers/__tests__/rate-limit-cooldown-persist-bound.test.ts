@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import type { Account } from "@better-ccflare/types";
 import type { ProxyContext } from "../proxy-types";
 import { applyRateLimitCooldownAwaitingPersist } from "../rate-limit-cooldown";
+import { createRoutingTerminalResponse } from "../routing-terminal";
 
 // Covers the P0 review fix: applyRateLimitCooldownAwaitingPersist must never let
 // a slow or failing ctx.dbOps.markAccountRateLimited call stall or crash the
@@ -33,6 +34,7 @@ function makeAccount(overrides: Partial<Account> = {}): Account {
 		created_at: NOW,
 		rate_limited_until: null,
 		rate_limited_at: null,
+		rate_limited_reason: null,
 		session_start: null,
 		session_request_count: 0,
 		paused: false,
@@ -50,6 +52,26 @@ function makeAccount(overrides: Partial<Account> = {}): Account {
 		consecutive_rate_limits: 3,
 		...overrides,
 	} as Account;
+}
+
+function expectRetryablePoolExhaustion(account: Account): void {
+	const terminal = createRoutingTerminalResponse({
+		source: "attempts",
+		accounts: [account],
+		capacityContext: null,
+		rateLimitOutcomes: [],
+		upstreamAttempts: 1,
+		now: NOW,
+	});
+
+	expect(terminal.kind).toBe("pool_exhausted");
+	expect(terminal.response.headers.get("retry-after")).not.toBeNull();
+	expect(terminal.response.headers.get("x-better-ccflare-pool-status")).toBe(
+		"exhausted",
+	);
+	expect(terminal.response.headers.get("x-better-ccflare-recovery-scope")).toBe(
+		"pool",
+	);
 }
 
 afterEach(() => {
@@ -73,7 +95,10 @@ describe("applyRateLimitCooldownAwaitingPersist: bounded persist (P0)", () => {
 		await expect(
 			applyRateLimitCooldownAwaitingPersist(
 				account,
-				{ reason: "xai_capacity_402" },
+				{
+					resetTime: NOW + 120_000,
+					reason: "upstream_429_with_reset",
+				},
 				ctx,
 			),
 		).resolves.toBeUndefined();
@@ -83,6 +108,8 @@ describe("applyRateLimitCooldownAwaitingPersist: bounded persist (P0)", () => {
 		// by a DB-authoritative persistedCount that never arrived.
 		expect(account.consecutive_rate_limits).toBe(4);
 		expect(account.rate_limited_until).toBeGreaterThan(NOW);
+		expect(account.rate_limited_reason).toBe("upstream_429_with_reset");
+		expectRetryablePoolExhaustion(account);
 	});
 
 	it("resolves within the timeout bound when markAccountRateLimited hangs forever", async () => {
@@ -100,7 +127,10 @@ describe("applyRateLimitCooldownAwaitingPersist: bounded persist (P0)", () => {
 		const start = performance.now();
 		await applyRateLimitCooldownAwaitingPersist(
 			account,
-			{ reason: "xai_capacity_402" },
+			{
+				resetTime: NOW + 120_000,
+				reason: "upstream_429_with_reset",
+			},
 			ctx,
 		);
 		const elapsed = performance.now() - start;
@@ -109,6 +139,8 @@ describe("applyRateLimitCooldownAwaitingPersist: bounded persist (P0)", () => {
 		// never-resolving stub.
 		expect(elapsed).toBeLessThan(1000);
 		expect(account.consecutive_rate_limits).toBe(4);
+		expect(account.rate_limited_reason).toBe("upstream_429_with_reset");
+		expectRetryablePoolExhaustion(account);
 	});
 });
 

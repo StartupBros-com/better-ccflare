@@ -6,6 +6,7 @@ import {
 	createModelPoolExhaustedResponse,
 	createRoutingTerminalResponse,
 	filterRequestCompatibleAccounts,
+	mergeTerminalAccountState,
 } from "../routing-terminal";
 
 function makeAccount(overrides: Partial<Account> = {}): Account {
@@ -879,5 +880,103 @@ describe("request-compatible terminal inventory", () => {
 				(account) => account.id,
 			),
 		).toEqual(["anthropic-key", "codex"]);
+	});
+});
+
+describe("terminal account refresh merge", () => {
+	const observedAt = Date.UTC(2026, 6, 21, 12);
+
+	it("retains a newer request-local cooldown over a stale refreshed row", () => {
+		const local = makeAccount({
+			rate_limited_at: observedAt,
+			rate_limited_until: observedAt + 120_000,
+			rate_limited_reason: "upstream_429_with_reset",
+			consecutive_rate_limits: 4,
+		});
+		const refreshed = makeAccount({
+			paused: true,
+			pause_reason: "manual",
+			rate_limited_at: null,
+			rate_limited_until: null,
+			rate_limited_reason: null,
+			consecutive_rate_limits: 3,
+		});
+
+		const [merged] = mergeTerminalAccountState([refreshed], [local]);
+
+		expect(merged).toMatchObject({
+			paused: true,
+			pause_reason: "manual",
+			rate_limited_at: observedAt,
+			rate_limited_until: observedAt + 120_000,
+			rate_limited_reason: "upstream_429_with_reset",
+			consecutive_rate_limits: 4,
+		});
+	});
+
+	it("preserves a genuinely newer refreshed cooldown observation", () => {
+		const local = makeAccount({
+			rate_limited_at: observedAt,
+			rate_limited_until: observedAt + 120_000,
+			rate_limited_reason: "upstream_429_with_reset",
+			consecutive_rate_limits: 4,
+		});
+		const refreshed = makeAccount({
+			rate_limited_at: observedAt + 1,
+			rate_limited_until: observedAt + 60_000,
+			rate_limited_reason: "model_fallback_429",
+			consecutive_rate_limits: 5,
+		});
+
+		expect(mergeTerminalAccountState([refreshed], [local])).toEqual([
+			refreshed,
+		]);
+	});
+
+	it.each([
+		null,
+		"model_fallback_429",
+	] as const)("keeps a newer verified local deadline/reason atomic over an older longer refreshed deadline with reason %s", (refreshedReason) => {
+		const local = makeAccount({
+			rate_limited_at: observedAt,
+			rate_limited_until: observedAt + 120_000,
+			rate_limited_reason: "upstream_429_with_reset",
+			consecutive_rate_limits: 4,
+		});
+		const refreshed = makeAccount({
+			rate_limited_at: observedAt - 1,
+			rate_limited_until: observedAt + 300_000,
+			rate_limited_reason: refreshedReason,
+			consecutive_rate_limits: 7,
+		});
+
+		const [merged] = mergeTerminalAccountState([refreshed], [local]);
+
+		expect(merged).toMatchObject({
+			rate_limited_at: observedAt,
+			rate_limited_until: observedAt + 120_000,
+			rate_limited_reason: "upstream_429_with_reset",
+			consecutive_rate_limits: 7,
+		});
+	});
+
+	it("does not resurrect a refreshed row removed by DB state or request compatibility", () => {
+		const local = makeAccount({
+			id: "codex-local",
+			provider: "codex",
+			rate_limited_at: observedAt,
+			rate_limited_until: observedAt + 120_000,
+			rate_limited_reason: "upstream_429_with_reset",
+		});
+		const refreshed = makeAccount({ id: local.id, provider: "codex" });
+		const excluded = filterRequestCompatibleAccounts(
+			[refreshed],
+			new Headers({
+				"x-better-ccflare-exclude-providers": "codex",
+			}),
+		);
+
+		expect(mergeTerminalAccountState([], [local])).toEqual([]);
+		expect(mergeTerminalAccountState(excluded, [local])).toEqual([]);
 	});
 });
