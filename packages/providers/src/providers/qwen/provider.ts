@@ -9,6 +9,12 @@ const _log = new Logger("QwenProvider");
 const _DEFAULT_ENDPOINT = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 const QWEN_USER_AGENT = "QwenCode/sdk-typescript-v0.1.7 (darwin; arm64)";
 
+type OpenAIMessage = OpenAIRequest["messages"][number];
+type CacheControl = { type: string };
+type CacheableTool = NonNullable<OpenAIRequest["tools"]>[number] & {
+	cache_control?: CacheControl;
+};
+
 // Stainless SDK headers injected by the official OpenAI Node SDK (v5.x).
 // portal.qwen.ai validates these to confirm the official client is being used.
 const STAINLESS_HEADERS: Record<string, string> = {
@@ -79,6 +85,78 @@ function sanitizeForQwen(text: string): string {
 		out.push(l);
 	}
 	return out.join("\n");
+}
+
+function hasEphemeralCacheControl(value: {
+	cache_control?: CacheControl;
+}): boolean {
+	return value.cache_control?.type === "ephemeral";
+}
+
+/**
+ * Put a DashScope cache boundary on the final content block of a message.
+ * Existing valid boundaries are left intact so this remains idempotent.
+ */
+function markMessageForCaching(message: OpenAIMessage): void {
+	if (typeof message.content === "string") {
+		if (message.content.length === 0) return;
+
+		message.content = [
+			{
+				type: "text",
+				text: message.content,
+				cache_control: { type: "ephemeral" },
+			},
+		];
+		return;
+	}
+
+	if (!Array.isArray(message.content) || message.content.length === 0) return;
+
+	const lastIndex = message.content.length - 1;
+	const lastPart = message.content[lastIndex];
+	if (hasEphemeralCacheControl(lastPart)) return;
+
+	const updatedContent = [...message.content];
+	updatedContent[lastIndex] = {
+		...lastPart,
+		cache_control: { type: "ephemeral" },
+	};
+	message.content = updatedContent;
+}
+
+/**
+ * Mirror Qwen Code's DashScope cache policy: always mark the first system
+ * message; for streaming requests, also mark the latest message and final tool.
+ */
+function addDashScopeCacheControl(body: OpenAIRequest): void {
+	const firstSystemMessage = body.messages.find(
+		(message) => message.role === "system",
+	);
+	if (firstSystemMessage) {
+		markMessageForCaching(firstSystemMessage);
+	}
+
+	if (!body.stream) return;
+
+	const latestMessage = body.messages[body.messages.length - 1];
+	if (latestMessage && latestMessage !== firstSystemMessage) {
+		markMessageForCaching(latestMessage);
+	}
+
+	const tools = body.tools as CacheableTool[] | undefined;
+	if (!tools || tools.length === 0) return;
+
+	const lastIndex = tools.length - 1;
+	const finalTool = tools[lastIndex];
+	if (hasEphemeralCacheControl(finalTool)) return;
+
+	const updatedTools = [...tools];
+	updatedTools[lastIndex] = {
+		...finalTool,
+		cache_control: { type: "ephemeral" },
+	};
+	body.tools = updatedTools;
 }
 
 export class QwenProvider extends OpenAICompatibleProvider {
@@ -193,6 +271,10 @@ export class QwenProvider extends OpenAICompatibleProvider {
 				}
 			}
 		}
+
+		// Apply cache boundaries only after the system prompt has been sanitized,
+		// so the marker always lands on the final content actually sent upstream.
+		addDashScopeCacheControl(body);
 
 		// Enable vision support (coder-model supports vision)
 		(body as unknown as Record<string, unknown>).vl_high_resolution_images =
