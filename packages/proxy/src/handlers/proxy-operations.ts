@@ -108,8 +108,18 @@ const INTERNAL_TRANSPORT_HEADERS = [
 	CACHE_REPLAY_MODEL_HEADER,
 ] as const;
 const ANTHROPIC_BILLING_HEADER = "x-anthropic-billing-header";
+const CODEX_CACHE_LANE_RESCUE_RESERVE_MAX_MS = 30_000;
+const CODEX_CACHE_LANE_RESCUE_RESERVE_DIVISOR = 4;
 const TEST_CONTEXT_WINDOW_ENV =
 	"CCFLARE_CONTEXT_ADMISSION_TEST_EFFECTIVE_WINDOW";
+
+function getCodexCacheLaneRescueReserveMs(candidateBudgetMs: number): number {
+	if (!Number.isFinite(candidateBudgetMs) || candidateBudgetMs <= 0) return 0;
+	return Math.min(
+		CODEX_CACHE_LANE_RESCUE_RESERVE_MAX_MS,
+		Math.floor(candidateBudgetMs / CODEX_CACHE_LANE_RESCUE_RESERVE_DIVISOR),
+	);
+}
 // Cap on how much of a final-candidate rate-limit/capacity response body we
 // buffer before running provider classification (processProxyResponse). Some
 // providers' classification reads the body without a size cap of their own
@@ -1586,6 +1596,7 @@ export async function proxyWithAccount(
 				| "overload_529"
 				| "thinking_retry"
 				| "cache_control_retry"
+				| "cache_lane_rescue"
 				| "account_failover"
 				| "other_retry",
 			finalModel?: string,
@@ -3253,31 +3264,42 @@ export async function proxyWithAccount(
 		// successful streams, and that tee sibling would make cancellation of a
 		// pre-commit stall wait indefinitely. In Bun, merely reading Response.body
 		// before a later classification clone can also disturb the retained branch.
-		const isDownstreamAnthropicMessagesStream =
-			isDownstreamAnthropicMessagesSse({
+		const officialCodexCacheLaneRescueEligible =
+			provider.name === "codex" &&
+			account.provider === "codex" &&
+			url.pathname === "/v1/messages" &&
+			!isSyntheticInternal &&
+			isCodexSubscriptionEndpoint(targetUrl) &&
+			typeof transformedBodyJson?.prompt_cache_key === "string" &&
+			transformedBodyJson.prompt_cache_key.length > 0;
+		let codexCacheLaneRescueAttempted = false;
+		while (true) {
+			const isDownstreamAnthropicMessagesStream =
+				isDownstreamAnthropicMessagesSse({
+					method: req.method,
+					path: url.pathname,
+					requestHeaders: req.headers,
+					response,
+				});
+			const isNativeAnthropicMessagesStream = isNativeAnthropicMessagesSse({
 				method: req.method,
 				path: url.pathname,
+				providerName: provider.name,
 				requestHeaders: req.headers,
 				response,
 			});
-		const isNativeAnthropicMessagesStream = isNativeAnthropicMessagesSse({
-			method: req.method,
-			path: url.pathname,
-			providerName: provider.name,
-			requestHeaders: req.headers,
-			response,
-		});
-		const downstreamAnthropicResponseBody = isDownstreamAnthropicMessagesStream
-			? response.body
-			: null;
-		const nativeAnthropicHeadersAreRateLimited =
-			isNativeAnthropicMessagesStream &&
-			provider.parseRateLimit(response).isRateLimited;
-		if (
-			isDownstreamAnthropicMessagesStream &&
-			!nativeAnthropicHeadersAreRateLimited &&
-			downstreamAnthropicResponseBody
-		) {
+			const downstreamAnthropicResponseBody =
+				isDownstreamAnthropicMessagesStream ? response.body : null;
+			const nativeAnthropicHeadersAreRateLimited =
+				isNativeAnthropicMessagesStream &&
+				provider.parseRateLimit(response).isRateLimited;
+			if (
+				!isDownstreamAnthropicMessagesStream ||
+				nativeAnthropicHeadersAreRateLimited ||
+				!downstreamAnthropicResponseBody
+			) {
+				break;
+			}
 			const streamConfig = getAnthropicStreamRuntimeConfig();
 			preCommitRescue?.activate();
 			// Re-evaluate semantic finality at the gate, but never extend the
@@ -3303,6 +3325,19 @@ export async function proxyWithAccount(
 							0,
 							attemptCommitmentDeadlineAt - attemptCommitmentStartedAt,
 						);
+			// Split only this already-allocated candidate slice. The request-wide
+			// deadline and any global fallback reserve remain unchanged, while the
+			// first cache lane cannot consume the retry's bounded share.
+			const cacheLaneRescueReserveMs =
+				officialCodexCacheLaneRescueEligible &&
+				!codexCacheLaneRescueAttempted &&
+				attemptCommitmentDeadlineAt !== undefined
+					? getCodexCacheLaneRescueReserveMs(attemptCommitmentBudgetMs)
+					: 0;
+			const semanticCommitmentDeadlineAt =
+				attemptCommitmentDeadlineAt === undefined
+					? undefined
+					: attemptCommitmentDeadlineAt - cacheLaneRescueReserveMs;
 			try {
 				const gatedBody = await gateAnthropicSsePreCommit(
 					downstreamAnthropicResponseBody,
@@ -3310,7 +3345,7 @@ export async function proxyWithAccount(
 						semanticTimeoutMs: streamConfig.semanticTimeoutMs,
 						meaningfulProgressTimeoutMs:
 							streamConfig.meaningfulProgressTimeoutMs,
-						commitmentDeadlineAt: attemptCommitmentDeadlineAt,
+						commitmentDeadlineAt: semanticCommitmentDeadlineAt,
 						terminalGraceMs: streamConfig.terminalGraceMs,
 						maxBufferedBytes: streamConfig.maxBufferedBytes,
 						signal: activeAttemptCommitment?.signal ?? routingSignal,
@@ -3321,6 +3356,7 @@ export async function proxyWithAccount(
 					statusText: response.statusText,
 					headers: response.headers,
 				});
+				break;
 			} catch (error) {
 				if (activeAttemptCommitment?.isPrivateDeadline()) {
 					// The fetch and semantic gate share this candidate's private
@@ -3337,6 +3373,139 @@ export async function proxyWithAccount(
 					throw error;
 				}
 				if (!(error instanceof AnthropicPreCommitStallError)) throw error;
+				const isZeroMeaningfulCodexStall =
+					error.errorType === undefined &&
+					(error.reason === "semantic_timeout" ||
+						error.reason === "meaningful_progress_timeout");
+				const remainingCandidateBudgetMs =
+					attemptCommitmentDeadlineAt === undefined
+						? Number.POSITIVE_INFINITY
+						: attemptCommitmentDeadlineAt - Date.now();
+				const hasBoundedCacheLaneRescueBudget =
+					remainingCandidateBudgetMs > 0 &&
+					(error.reason === "semantic_timeout" || cacheLaneRescueReserveMs > 0);
+				if (
+					officialCodexCacheLaneRescueEligible &&
+					!codexCacheLaneRescueAttempted &&
+					isZeroMeaningfulCodexStall &&
+					hasBoundedCacheLaneRescueBudget
+				) {
+					codexCacheLaneRescueAttempted = true;
+					log.warn("codex_precommit_cache_lane_rescue", {
+						requestId: requestMeta.id,
+						accountId: account.id,
+						attemptedModel: currentTransportModel,
+						reason: error.reason,
+						bufferedBytes: error.bufferedBytes,
+						framesSeen: error.framesSeen,
+						validProtocolFramesSeen: error.validProtocolFramesSeen,
+						commitmentDeadlineAt: semanticCommitmentDeadlineAt ?? null,
+						transportCommitmentDeadlineAt: attemptCommitmentDeadlineAt ?? null,
+						cacheLaneRescueReserveMs,
+					});
+
+					// gateAnthropicSsePreCommit already cancelled its reader. This extra
+					// best-effort cancel covers response implementations whose transformed
+					// wrapper did not propagate reader cancellation synchronously.
+					await discardUnusedResponse(
+						response,
+						"codex_precommit_cache_lane_rescue_superseded",
+					);
+					const rescueHeaders = new Headers(retrySourceRequest.headers);
+					stampCodexAttempt(
+						rescueHeaders,
+						"cache_lane_rescue",
+						currentTransportModel ?? undefined,
+					);
+					const rescueRequestInit: RequestInit & { duplex?: "half" } = {
+						method: retrySourceRequest.method,
+						headers: rescueHeaders,
+					};
+					if (currentReplayBody) {
+						rescueRequestInit.body = new Uint8Array(currentReplayBody);
+						rescueRequestInit.duplex = "half";
+					}
+					const rescueSourceRequest = new Request(
+						retrySourceRequest.url,
+						rescueRequestInit,
+					);
+					retrySourceRequest = rescueSourceRequest.clone();
+					let rescueTransformedRequest = provider.transformRequestBody
+						? await provider.transformRequestBody(rescueSourceRequest, account)
+						: rescueSourceRequest;
+					rescueTransformedRequest = await enforcePhysicalModelAfterTransform(
+						rescueTransformedRequest,
+						currentTransportModel,
+					);
+					retryTransformedTemplate = rescueTransformedRequest.clone();
+					const rescueBodyText = await rescueTransformedRequest.clone().text();
+					currentCacheIdentityHasCacheControl =
+						hasCacheControlHintInJsonText(rescueBodyText);
+					const rescueTransportRequest = sanitizeInternalTransportHeaders(
+						rescueTransformedRequest,
+					);
+					rawResponse = await executeCacheAwareProviderAttempt(
+						rescueTransportRequest,
+						currentReplayBody,
+						currentCacheIdentityHasCacheControl,
+						currentTransportModel,
+					);
+					rawFailureClassification = await handleRawAttemptFailure(
+						rawResponse,
+						currentTransportModel,
+					);
+					if (rawFailureClassification.stopAccountAttempt) return null;
+					rememberScopedFailure(rawFailureClassification);
+					if (isScopedFailure(rawFailureClassification)) return null;
+
+					const rescueResponseHeaders = new Headers(rawResponse.headers);
+					rescueResponseHeaders.set(
+						"x-better-ccflare-request-id",
+						requestMeta.id,
+					);
+					if (currentTransportAttemptId) {
+						rescueResponseHeaders.set(
+							"x-better-ccflare-attempt-id",
+							currentTransportAttemptId,
+						);
+					}
+					if (currentTransportModel) {
+						rescueResponseHeaders.set(
+							"x-better-ccflare-final-model",
+							currentTransportModel,
+						);
+					}
+					if (
+						internalRequestStream === "true" ||
+						internalRequestStream === "false"
+					) {
+						rescueResponseHeaders.set(
+							"x-better-ccflare-request-stream",
+							internalRequestStream,
+						);
+					}
+					response = await provider.processResponse(
+						new Response(rawResponse.body, {
+							status: rawResponse.status,
+							statusText: rawResponse.statusText,
+							headers: rescueResponseHeaders,
+						}),
+						account,
+						req.headers,
+					);
+					if (currentTransportAttemptId) {
+						finalizedCodexAttemptIds.add(currentTransportAttemptId);
+					}
+					if (response.status === 401) {
+						routingAttemptLedger?.blockAccount(account.id);
+						await discardUnusedResponse(
+							response,
+							"auth_failed_401_after_cache_lane_rescue",
+						);
+						return null;
+					}
+					continue;
+				}
 
 				const candidateId = modelFallbackPolicy?.routeCandidateId ?? null;
 				const failureReason = error.errorType
@@ -3362,7 +3531,9 @@ export async function proxyWithAccount(
 					limitBytes: error.limitBytes ?? null,
 					semanticTimeoutMs: streamConfig.semanticTimeoutMs,
 					meaningfulProgressTimeoutMs: attemptCommitmentBudgetMs,
-					commitmentDeadlineAt: attemptCommitmentDeadlineAt ?? null,
+					commitmentDeadlineAt: semanticCommitmentDeadlineAt ?? null,
+					transportCommitmentDeadlineAt: attemptCommitmentDeadlineAt ?? null,
+					cacheLaneRescueReserveMs,
 					terminalGraceMs: streamConfig.terminalGraceMs,
 					routeCircuitPenalized,
 				});
