@@ -105,6 +105,13 @@ describe("BedrockProvider request model integration", () => {
 			body: JSON.stringify({
 				model: "claude-sonnet-4-5",
 				max_tokens: 32,
+				system: [
+					{
+						type: "text",
+						text: "Stable instructions",
+						cache_control: { type: "ephemeral", ttl: "1h" },
+					},
+				],
 				messages: [{ role: "user", content: "Hello" }],
 			}),
 		});
@@ -112,6 +119,10 @@ describe("BedrockProvider request model integration", () => {
 		await provider.transformRequestBody(request, account(inferenceProfileArn));
 
 		expect(capturedInput?.modelId).toBe(inferenceProfileArn);
+		expect(capturedInput?.system).toEqual([
+			{ text: "Stable instructions" },
+			{ cachePoint: { type: "default", ttl: "1h" } },
+		]);
 		expect(profileSend).not.toHaveBeenCalled();
 	});
 });

@@ -1,5 +1,6 @@
 import {
 	BedrockRuntimeClient,
+	type CitationsDelta,
 	ConverseCommand,
 	type ConverseCommandInput,
 	ConverseStreamCommand,
@@ -36,11 +37,97 @@ import {
 import {
 	type BedrockConverseResponse,
 	type BedrockUsage,
+	type ClaudeCitation,
 	normalizeBedrockUsage,
+	transformBedrockCitation,
 	transformNonStreamingResponse,
 } from "./response-parser";
 
 const log = new Logger("BedrockProvider");
+
+function encodeBase64Chunks(chunks: readonly Uint8Array[]): string {
+	let binary = "";
+	for (const chunk of chunks) {
+		for (const byte of chunk) {
+			binary += String.fromCharCode(byte);
+		}
+	}
+	return btoa(binary);
+}
+
+const MAX_PENDING_STREAM_CITATIONS = 64;
+const MAX_PENDING_CITATION_TEXT_LENGTH = 64 * 1024;
+const MAX_PENDING_REDACTED_REASONING_BYTES = 1024 * 1024;
+const MAX_PENDING_REDACTED_REASONING_CHUNKS = 256;
+const MAX_TOTAL_REDACTED_REASONING_BYTES = 4 * 1024 * 1024;
+const MAX_ACTIVE_REDACTED_REASONING_BLOCKS = 16;
+
+interface PendingStreamCitation {
+	citation: ClaudeCitation;
+	locationKey: string;
+	textLength: number;
+}
+
+interface PendingStreamCitationBlock {
+	citations: PendingStreamCitation[];
+	locationKeys: Set<string>;
+	textLength: number;
+}
+
+interface PendingRedactedReasoning {
+	byteLength: number;
+	chunks: Uint8Array[];
+}
+
+function streamCitationLocationKey(citation: ClaudeCitation): string {
+	switch (citation.type) {
+		case "char_location":
+			return `${citation.type}:${citation.document_index}:${citation.start_char_index}:${citation.end_char_index}`;
+		case "page_location":
+			return `${citation.type}:${citation.document_index}:${citation.start_page_number}:${citation.end_page_number}`;
+		case "content_block_location":
+			return `${citation.type}:${citation.document_index}:${citation.start_block_index}:${citation.end_block_index}`;
+		case "search_result_location":
+			return `${citation.type}:${citation.search_result_index}:${citation.start_block_index}:${citation.end_block_index}`;
+	}
+}
+
+/**
+ * Bedrock does not identify citation boundaries in its stream. Only a delta
+ * carrying every field needed for one citation is safe to translate. Partial
+ * deltas are intentionally omitted rather than guessed across event boundaries.
+ */
+function transformSelfContainedStreamCitation(
+	delta: CitationsDelta,
+): PendingStreamCitation | null {
+	if (
+		typeof delta.title !== "string" ||
+		!Array.isArray(delta.sourceContent) ||
+		delta.location === undefined
+	) {
+		return null;
+	}
+
+	let textLength = 0;
+	for (const content of delta.sourceContent) {
+		if (!content || typeof content.text !== "string") {
+			return null;
+		}
+		textLength += content.text.length;
+		if (textLength > MAX_PENDING_CITATION_TEXT_LENGTH) {
+			return null;
+		}
+	}
+
+	const citation = transformBedrockCitation(delta);
+	return citation
+		? {
+				citation,
+				locationKey: streamCitationLocationKey(citation),
+				textLength,
+			}
+		: null;
+}
 
 /**
  * AWS Bedrock provider for better-ccflare
@@ -99,7 +186,22 @@ export class BedrockProvider extends BaseProvider implements Provider {
 		return new ReadableStream({
 			async start(controller) {
 				try {
-					const startedBlocks = new Set<number>();
+					type StreamBlockKind =
+						| "redacted_thinking"
+						| "text"
+						| "thinking"
+						| "tool_use";
+					const blockKinds = new Map<number, StreamBlockKind>();
+					const pendingCitations = new Map<
+						number,
+						PendingStreamCitationBlock
+					>();
+					const ambiguousCitationBlocks = new Set<number>();
+					const pendingRedactedReasoning = new Map<
+						number,
+						PendingRedactedReasoning
+					>();
+					let totalRedactedReasoningBytes = 0;
 					let sentMessageStart = false;
 					let stopReason: string | null = "end_turn";
 					let usage = {
@@ -114,6 +216,50 @@ export class BedrockProvider extends BaseProvider implements Provider {
 						controller.enqueue(
 							encoder.encode(`data: ${JSON.stringify(payload)}\n\n`),
 						);
+					};
+					const emitPendingCitations = (index: number) => {
+						const pending = pendingCitations.get(index);
+						if (!pending) return;
+						for (const { citation } of pending.citations) {
+							emit("content_block_delta", {
+								type: "content_block_delta",
+								index,
+								delta: {
+									type: "citations_delta",
+									citation,
+								},
+							});
+						}
+						pendingCitations.delete(index);
+					};
+					const clearStreamState = () => {
+						blockKinds.clear();
+						pendingCitations.clear();
+						ambiguousCitationBlocks.clear();
+						pendingRedactedReasoning.clear();
+					};
+					const failRedactedReasoningProtocol = () => {
+						clearStreamState();
+						emit("error", {
+							type: "error",
+							error: {
+								type: "api_error",
+								message: "Bedrock returned invalid redacted reasoning data.",
+							},
+						});
+						controller.close();
+					};
+					const emitBlockStart = (
+						index: number,
+						kind: StreamBlockKind,
+						contentBlock: Record<string, unknown>,
+					) => {
+						blockKinds.set(index, kind);
+						emit("content_block_start", {
+							type: "content_block_start",
+							index,
+							content_block: contentBlock,
+						});
 					};
 
 					if (bedrockStream) {
@@ -142,24 +288,31 @@ export class BedrockProvider extends BaseProvider implements Provider {
 
 							if (event.contentBlockStart) {
 								const index = event.contentBlockStart.contentBlockIndex ?? 0;
-								startedBlocks.add(index);
+								if (pendingRedactedReasoning.has(index)) {
+									failRedactedReasoningProtocol();
+									return;
+								}
+								if (blockKinds.has(index)) {
+									continue;
+								}
 								const startBlock = event.contentBlockStart.start;
-								if (startBlock?.toolUse) {
-									emit("content_block_start", {
-										type: "content_block_start",
-										index,
-										content_block: {
-											type: "tool_use",
-											id: startBlock.toolUse.toolUseId,
-											name: startBlock.toolUse.name,
-											input: {},
-										},
+								if (
+									startBlock?.toolUse &&
+									typeof startBlock.toolUse.toolUseId === "string" &&
+									startBlock.toolUse.toolUseId.length > 0 &&
+									typeof startBlock.toolUse.name === "string" &&
+									startBlock.toolUse.name.length > 0
+								) {
+									emitBlockStart(index, "tool_use", {
+										type: "tool_use",
+										id: startBlock.toolUse.toolUseId,
+										name: startBlock.toolUse.name,
+										input: {},
 									});
-								} else {
-									emit("content_block_start", {
-										type: "content_block_start",
-										index,
-										content_block: { type: "text", text: "" },
+								} else if (!startBlock) {
+									emitBlockStart(index, "text", {
+										type: "text",
+										text: "",
 									});
 								}
 								continue;
@@ -167,17 +320,111 @@ export class BedrockProvider extends BaseProvider implements Provider {
 
 							if (event.contentBlockDelta) {
 								const index = event.contentBlockDelta.contentBlockIndex ?? 0;
-								if (!startedBlocks.has(index)) {
-									startedBlocks.add(index);
-									emit("content_block_start", {
-										type: "content_block_start",
-										index,
-										content_block: { type: "text", text: "" },
-									});
+								const delta = event.contentBlockDelta.delta;
+								const reasoning = delta?.reasoningContent;
+								if (reasoning && "redactedContent" in reasoning) {
+									const redactedContent = reasoning.redactedContent;
+									if (
+										!(redactedContent instanceof Uint8Array) ||
+										"text" in reasoning ||
+										"signature" in reasoning ||
+										delta?.text !== undefined ||
+										delta?.toolUse !== undefined ||
+										delta?.citation !== undefined ||
+										blockKinds.has(index)
+									) {
+										failRedactedReasoningProtocol();
+										return;
+									}
+
+									const existing = pendingRedactedReasoning.get(index);
+									if (
+										!existing &&
+										pendingRedactedReasoning.size >=
+											MAX_ACTIVE_REDACTED_REASONING_BLOCKS
+									) {
+										failRedactedReasoningProtocol();
+										return;
+									}
+
+									const pending = existing ?? { byteLength: 0, chunks: [] };
+									const byteLength = pending.byteLength + redactedContent.byteLength;
+									const totalByteLength =
+										totalRedactedReasoningBytes + redactedContent.byteLength;
+									if (
+										byteLength > MAX_PENDING_REDACTED_REASONING_BYTES ||
+										pending.chunks.length + 1 >
+											MAX_PENDING_REDACTED_REASONING_CHUNKS ||
+										totalByteLength > MAX_TOTAL_REDACTED_REASONING_BYTES
+									) {
+										failRedactedReasoningProtocol();
+										return;
+									}
+
+									pending.chunks.push(redactedContent);
+									pending.byteLength = byteLength;
+									pendingRedactedReasoning.set(index, pending);
+									totalRedactedReasoningBytes = totalByteLength;
+									continue;
+								}
+								if (pendingRedactedReasoning.has(index)) {
+									failRedactedReasoningProtocol();
+									return;
 								}
 
-								const delta = event.contentBlockDelta.delta;
-								if (delta?.text) {
+								if (!blockKinds.has(index)) {
+									if (
+										reasoning &&
+										("text" in reasoning || "signature" in reasoning)
+									) {
+										emitBlockStart(index, "thinking", {
+											type: "thinking",
+											thinking: "",
+											signature: "",
+										});
+									} else if (
+										typeof delta?.text === "string" ||
+										delta?.citation
+									) {
+										emitBlockStart(index, "text", {
+											type: "text",
+											text: "",
+										});
+									} else {
+										continue;
+									}
+								}
+
+								const kind = blockKinds.get(index);
+								if (
+									kind === "thinking" &&
+									reasoning &&
+									"text" in reasoning &&
+									typeof reasoning.text === "string"
+								) {
+									emit("content_block_delta", {
+										type: "content_block_delta",
+										index,
+										delta: {
+											type: "thinking_delta",
+											thinking: reasoning.text,
+										},
+									});
+								} else if (
+									kind === "thinking" &&
+									reasoning &&
+									"signature" in reasoning &&
+									typeof reasoning.signature === "string"
+								) {
+									emit("content_block_delta", {
+										type: "content_block_delta",
+										index,
+										delta: {
+											type: "signature_delta",
+											signature: reasoning.signature,
+										},
+									});
+								} else if (kind === "text" && typeof delta?.text === "string") {
 									emit("content_block_delta", {
 										type: "content_block_delta",
 										index,
@@ -186,7 +433,10 @@ export class BedrockProvider extends BaseProvider implements Provider {
 											text: delta.text,
 										},
 									});
-								} else if (delta?.toolUse?.input) {
+								} else if (
+									kind === "tool_use" &&
+									typeof delta?.toolUse?.input === "string"
+								) {
 									emit("content_block_delta", {
 										type: "content_block_delta",
 										index,
@@ -195,19 +445,72 @@ export class BedrockProvider extends BaseProvider implements Provider {
 											partial_json: delta.toolUse.input,
 										},
 									});
+								} else if (
+									kind === "text" &&
+									delta?.citation &&
+									!ambiguousCitationBlocks.has(index)
+								) {
+									const citation = transformSelfContainedStreamCitation(
+										delta.citation,
+									);
+									const pending = pendingCitations.get(index) ?? {
+										citations: [],
+										locationKeys: new Set<string>(),
+										textLength: 0,
+									};
+									if (
+										!citation ||
+										pending.citations.length >= MAX_PENDING_STREAM_CITATIONS ||
+										pending.textLength + citation.textLength >
+											MAX_PENDING_CITATION_TEXT_LENGTH ||
+										pending.locationKeys.has(citation.locationKey)
+									) {
+										pendingCitations.delete(index);
+										ambiguousCitationBlocks.add(index);
+										continue;
+									}
+
+									pending.citations.push(citation);
+									pending.locationKeys.add(citation.locationKey);
+									pending.textLength += citation.textLength;
+									pendingCitations.set(index, pending);
 								}
 								continue;
 							}
 
 							if (event.contentBlockStop) {
-								emit("content_block_stop", {
-									type: "content_block_stop",
-									index: event.contentBlockStop.contentBlockIndex ?? 0,
-								});
+								const index = event.contentBlockStop.contentBlockIndex ?? 0;
+								const redactedReasoning = pendingRedactedReasoning.get(index);
+								if (redactedReasoning && !blockKinds.has(index)) {
+									emitBlockStart(index, "redacted_thinking", {
+										type: "redacted_thinking",
+										data: encodeBase64Chunks(redactedReasoning.chunks),
+									});
+								}
+								if (
+									blockKinds.get(index) === "text" &&
+									!ambiguousCitationBlocks.has(index)
+								) {
+									emitPendingCitations(index);
+								}
+								if (blockKinds.has(index)) {
+									emit("content_block_stop", {
+										type: "content_block_stop",
+										index,
+									});
+								}
+								pendingRedactedReasoning.delete(index);
+								pendingCitations.delete(index);
+								ambiguousCitationBlocks.delete(index);
+								blockKinds.delete(index);
 								continue;
 							}
 
 							if (event.messageStop) {
+								if (pendingRedactedReasoning.size > 0) {
+									failRedactedReasoningProtocol();
+									return;
+								}
 								stopReason = normalizeStopReason(event.messageStop.stopReason);
 								continue;
 							}
@@ -225,6 +528,11 @@ export class BedrockProvider extends BaseProvider implements Provider {
 						}
 					}
 
+					if (pendingRedactedReasoning.size > 0) {
+						failRedactedReasoningProtocol();
+						return;
+					}
+
 					if (sentMessageStart) {
 						emit("message_delta", {
 							type: "message_delta",
@@ -237,6 +545,7 @@ export class BedrockProvider extends BaseProvider implements Provider {
 						emit("message_stop", { type: "message_stop" });
 					}
 
+					clearStreamState();
 					controller.close();
 				} catch (error) {
 					controller.error(error);

@@ -1,5 +1,6 @@
 import type {
 	CachePointBlock,
+	Citation,
 	ContentBlock,
 	ConverseStreamCommandInput,
 	Message,
@@ -98,7 +99,15 @@ const PROMPT_CACHE_MODELS: ReadonlyArray<{
 		supportsOneHourTtl: true,
 	},
 	{
+		modelIdFragment: "anthropic.claude-opus-4-1-20250805-v1:0",
+		supportsOneHourTtl: false,
+	},
+	{
 		modelIdFragment: "anthropic.claude-opus-4-20250514-v1:0",
+		supportsOneHourTtl: false,
+	},
+	{
+		modelIdFragment: "anthropic.claude-sonnet-4-20250514-v1:0",
 		supportsOneHourTtl: false,
 	},
 	{
@@ -106,10 +115,23 @@ const PROMPT_CACHE_MODELS: ReadonlyArray<{
 		supportsOneHourTtl: false,
 	},
 	{
+		modelIdFragment: "anthropic.claude-3-5-haiku-20241022-v1:0",
+		supportsOneHourTtl: false,
+	},
+	{
 		modelIdFragment: "anthropic.claude-3-5-sonnet-20241022-v2:0",
 		supportsOneHourTtl: false,
 	},
 ];
+
+const SEARCH_RESULT_MODELS = [
+	"anthropic.claude-opus-4-1-20250805-v1:0",
+	"anthropic.claude-opus-4-20250514-v1:0",
+	"anthropic.claude-sonnet-4-5-20250929-v1:0",
+	"anthropic.claude-sonnet-4-20250514-v1:0",
+	"anthropic.claude-3-7-sonnet-20250219-v1:0",
+	"anthropic.claude-3-5-haiku-20241022-v1:0",
+] as const;
 
 function getPromptCacheCapability(
 	modelId: string,
@@ -122,6 +144,22 @@ function getPromptCacheCapability(
 	return supportedModel
 		? { supportsOneHourTtl: supportedModel.supportsOneHourTtl }
 		: null;
+}
+
+function supportsSearchResults(modelId: string): boolean {
+	const normalizedModelId = modelId.toLowerCase();
+	return SEARCH_RESULT_MODELS.some((physicalModelId) => {
+		if (!normalizedModelId.endsWith(physicalModelId)) {
+			return false;
+		}
+
+		const prefixLength = normalizedModelId.length - physicalModelId.length;
+		return (
+			prefixLength === 0 ||
+			normalizedModelId[prefixLength - 1] === "." ||
+			normalizedModelId[prefixLength - 1] === "/"
+		);
+	});
 }
 
 /**
@@ -185,8 +223,7 @@ function transformTools(
 	for (const tool of tools) {
 		if (
 			!tool ||
-			typeof tool.name !== "string" ||
-			tool.name.trim().length === 0 ||
+			!isValidToolName(tool.name) ||
 			!tool.input_schema ||
 			typeof tool.input_schema !== "object" ||
 			Array.isArray(tool.input_schema)
@@ -219,6 +256,10 @@ function isNonEmptyString(value: unknown): value is string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isSafeIndex(value: unknown, minimum = 0): value is number {
+	return Number.isSafeInteger(value) && (value as number) >= minimum;
 }
 
 type JsonValue =
@@ -385,7 +426,8 @@ function transformSearchResultToolResult(
 
 function transformToolResultContent(
 	content: unknown,
-): ToolResultContentBlock[] {
+	supportsSearchResult: boolean,
+): ToolResultContentBlock[] | null {
 	if (typeof content === "string") {
 		return [{ text: content }];
 	}
@@ -394,14 +436,18 @@ function transformToolResultContent(
 		return [{ json: content }];
 	}
 
-	if (!Array.isArray(content) || content.length === 0) {
+	if (!Array.isArray(content)) {
+		return null;
+	}
+
+	if (content.length === 0) {
 		return [{ text: "" }];
 	}
 
 	const transformedContent: ToolResultContentBlock[] = [];
 	for (const item of content) {
 		if (!isRecord(item)) {
-			continue;
+			return null;
 		}
 
 		if (item.type === "text" && typeof item.text === "string") {
@@ -414,48 +460,364 @@ function transformToolResultContent(
 			continue;
 		}
 
-		const transformedItem =
-			item.type === "image"
-				? transformImageToolResult(item)
-				: item.type === "document"
-					? transformDocumentToolResult(item)
-					: item.type === "search_result"
-						? transformSearchResultToolResult(item)
-						: null;
-		if (transformedItem) {
-			transformedContent.push(transformedItem);
+		let transformedItem: ToolResultContentBlock | null = null;
+		if (item.type === "image") {
+			transformedItem = transformImageToolResult(item);
+		} else if (item.type === "document") {
+			transformedItem = transformDocumentToolResult(item);
+		} else if (item.type === "search_result") {
+			const searchResult = transformSearchResultToolResult(item);
+			if (searchResult) {
+				transformedItem = supportsSearchResult
+					? searchResult
+					: { text: JSON.stringify(item) };
+			}
 		}
+
+		if (!transformedItem) {
+			return null;
+		}
+		transformedContent.push(transformedItem);
 	}
 
-	return transformedContent.length > 0 ? transformedContent : [{ text: "" }];
+	return transformedContent;
 }
 
-function transformMessageContentBlock(
-	block: ClaudeContentBlock,
-): ContentBlock | null {
-	if (block.type === "text" && isNonEmptyString(block.text)) {
-		return { text: block.text.trim() };
+interface MessageTransformContext {
+	validToolPairIds: Set<string>;
+	emittedToolUseIds: Set<string>;
+	supportsSearchResult: boolean;
+}
+
+const TOOL_USE_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
+const TOOL_NAME_PATTERN = /^[A-Za-z0-9_-]+$/;
+
+function isValidToolUseId(value: unknown): value is string {
+	return (
+		typeof value === "string" &&
+		value.length <= 64 &&
+		TOOL_USE_ID_PATTERN.test(value)
+	);
+}
+
+function isValidToolName(value: unknown): value is string {
+	return (
+		typeof value === "string" &&
+		value.length <= 64 &&
+		TOOL_NAME_PATTERN.test(value)
+	);
+}
+
+function transformClaudeCitation(citation: unknown): Citation | null {
+	if (
+		!isRecord(citation) ||
+		!isNonEmptyString(citation.cited_text)
+	) {
+		return null;
 	}
+	const title =
+		citation.document_title ?? citation.title ?? undefined;
+	if (title !== undefined && title !== null && typeof title !== "string") {
+		return null;
+	}
+	const common = {
+		...(typeof title === "string" ? { title } : {}),
+		sourceContent: [{ text: citation.cited_text }],
+	};
 
 	if (
-		block.type === "tool_use" &&
-		isNonEmptyString(block.id) &&
-		isNonEmptyString(block.name) &&
-		typeof block.input === "object" &&
-		block.input !== null &&
-		!Array.isArray(block.input)
+		citation.type === "char_location" &&
+		citation.file_id === null &&
+		isSafeIndex(citation.document_index) &&
+		isSafeIndex(citation.start_char_index) &&
+		isSafeIndex(citation.end_char_index) &&
+		citation.end_char_index > citation.start_char_index
 	) {
 		return {
-			toolUse: {
-				toolUseId: block.id,
-				name: block.name,
-				input: block.input as NonNullable<ToolUseBlock["input"]>,
+			...common,
+			location: {
+				documentChar: {
+					documentIndex: citation.document_index,
+					start: citation.start_char_index,
+					end: citation.end_char_index,
+				},
 			},
 		};
 	}
 
+	if (
+		citation.type === "page_location" &&
+		citation.file_id === null &&
+		isSafeIndex(citation.document_index) &&
+		isSafeIndex(citation.start_page_number, 1) &&
+		isSafeIndex(citation.end_page_number, 1) &&
+		citation.end_page_number > citation.start_page_number
+	) {
+		return {
+			...common,
+			location: {
+				documentPage: {
+					documentIndex: citation.document_index,
+					start: citation.start_page_number,
+					end: citation.end_page_number,
+				},
+			},
+		};
+	}
+
+	if (
+		citation.type === "content_block_location" &&
+		citation.file_id === null &&
+		isSafeIndex(citation.document_index) &&
+		isSafeIndex(citation.start_block_index) &&
+		isSafeIndex(citation.end_block_index) &&
+		citation.end_block_index > citation.start_block_index
+	) {
+		return {
+			...common,
+			location: {
+				documentChunk: {
+					documentIndex: citation.document_index,
+					start: citation.start_block_index,
+					end: citation.end_block_index,
+				},
+			},
+		};
+	}
+
+	if (
+		citation.type === "search_result_location" &&
+		isNonEmptyString(citation.source) &&
+		isSafeIndex(citation.search_result_index) &&
+		isSafeIndex(citation.start_block_index) &&
+		isSafeIndex(citation.end_block_index) &&
+		citation.end_block_index > citation.start_block_index
+	) {
+		return {
+			...common,
+			source: citation.source,
+			location: {
+				searchResultLocation: {
+					searchResultIndex: citation.search_result_index,
+					start: citation.start_block_index,
+					end: citation.end_block_index,
+				},
+			},
+		};
+	}
+
+	return null;
+}
+
+function transformTextBlock(block: ClaudeContentBlock): ContentBlock | null {
+	if (block.type !== "text" || typeof block.text !== "string") {
+		return null;
+	}
+	if (block.text.length === 0) {
+		return null;
+	}
+	if (block.citations === undefined) {
+		return { text: block.text };
+	}
+	if (!Array.isArray(block.citations) || block.citations.length === 0) {
+		return { text: block.text };
+	}
+
+	const citations = block.citations.map(transformClaudeCitation);
+	if (citations.some((citation) => citation === null)) {
+		return { text: block.text };
+	}
+	return {
+		citationsContent: {
+			content: [{ text: block.text }],
+			citations: citations as Citation[],
+		},
+	};
+}
+
+function isValidToolUseBlock(
+	block: ClaudeContentBlock,
+): block is ClaudeContentBlock & {
+	id: string;
+	input: Record<string, JsonValue>;
+	name: string;
+	type: "tool_use";
+} {
+	return (
+		block.type === "tool_use" &&
+		isValidToolUseId(block.id) &&
+		isValidToolName(block.name) &&
+		isRecord(block.input) &&
+		isJsonValue(block.input)
+	);
+}
+
+function isValidToolResultBlock(
+	block: ClaudeContentBlock,
+	supportsSearchResult: boolean,
+): boolean {
+	return (
+		block.type === "tool_result" &&
+		isValidToolUseId(block.tool_use_id) &&
+		(block.is_error === undefined || typeof block.is_error === "boolean") &&
+		transformToolResultContent(block.content, supportsSearchResult) !== null
+	);
+}
+
+/**
+ * Bedrock rejects dangling or ambiguous tool history. Preflight the complete
+ * conversation so a tool use and its result are either both emitted exactly
+ * once, in order, or both omitted. This also prevents cache points attached to
+ * a rejected half-pair from consuming the global checkpoint budget.
+ */
+function collectValidToolPairIds(
+	messages: ClaudeRequest["messages"],
+	supportsSearchResult: boolean,
+): Set<string> {
+	const candidateGroups: string[][] = [];
+
+	for (const [messageIndex, assistantMessage] of messages.entries()) {
+		if (
+			assistantMessage.role !== "assistant" ||
+			!Array.isArray(assistantMessage.content)
+		) {
+			continue;
+		}
+
+		const firstToolUseIndex = assistantMessage.content.findIndex(
+			(block) => block.type === "tool_use",
+		);
+		if (firstToolUseIndex < 0) {
+			continue;
+		}
+
+		const toolUses = assistantMessage.content.slice(firstToolUseIndex);
+		if (
+			toolUses.length === 0 ||
+			toolUses.some((block) => block.type !== "tool_use") ||
+			toolUses.some((block) => !isValidToolUseBlock(block))
+		) {
+			continue;
+		}
+
+		const resultMessage = messages[messageIndex + 1];
+		if (resultMessage?.role !== "user" || !Array.isArray(resultMessage.content)) {
+			continue;
+		}
+
+		let resultPrefixLength = 0;
+		while (resultMessage.content[resultPrefixLength]?.type === "tool_result") {
+			resultPrefixLength += 1;
+		}
+		const toolResults = resultMessage.content.slice(0, resultPrefixLength);
+		if (
+			toolResults.length !== toolUses.length ||
+			resultMessage.content
+				.slice(resultPrefixLength)
+				.some((block) => block.type === "tool_result") ||
+			toolResults.some(
+				(block) => !isValidToolResultBlock(block, supportsSearchResult),
+			)
+		) {
+			continue;
+		}
+
+		const toolUseIds = toolUses.map((block) => block.id as string);
+		const toolResultIds = toolResults.map(
+			(block) => block.tool_use_id as string,
+		);
+		if (
+			new Set(toolUseIds).size !== toolUseIds.length ||
+			new Set(toolResultIds).size !== toolResultIds.length ||
+			toolUseIds.some((id, index) => id !== toolResultIds[index])
+		) {
+			continue;
+		}
+
+		candidateGroups.push(toolUseIds);
+	}
+
+	const idCounts = new Map<string, number>();
+	for (const group of candidateGroups) {
+		for (const id of group) {
+			idCounts.set(id, (idCounts.get(id) ?? 0) + 1);
+		}
+	}
+
+	return new Set(
+		candidateGroups.flatMap((group) =>
+			group.every((id) => idCounts.get(id) === 1) ? group : [],
+		),
+	);
+}
+
+function transformMessageContentBlock(
+	block: ClaudeContentBlock,
+	context: MessageTransformContext,
+): ContentBlock | null {
+	if (block.type === "text") {
+		return transformTextBlock(block);
+	}
+
+	if (block.type === "thinking") {
+		if (
+			typeof block.thinking === "string" &&
+			isNonEmptyString(block.signature)
+		) {
+			return {
+				reasoningContent: {
+					reasoningText: {
+						text: block.thinking,
+						signature: block.signature,
+					},
+				},
+			};
+		}
+		return null;
+	}
+
+	if (block.type === "redacted_thinking") {
+		const redactedContent = decodeBase64(block.data);
+		return redactedContent
+			? { reasoningContent: { redactedContent } }
+			: null;
+	}
+
+	if (block.type === "tool_use") {
+		if (
+			isValidToolUseBlock(block) &&
+			context.validToolPairIds.has(block.id)
+		) {
+			context.emittedToolUseIds.add(block.id);
+			return {
+				toolUse: {
+					toolUseId: block.id,
+					name: block.name,
+					input: block.input as NonNullable<ToolUseBlock["input"]>,
+				},
+			};
+		}
+		return null;
+	}
+
 	if (block.type === "tool_result" && isNonEmptyString(block.tool_use_id)) {
-		const content = transformToolResultContent(block.content);
+		if (
+			!context.validToolPairIds.has(block.tool_use_id) ||
+			!context.emittedToolUseIds.delete(block.tool_use_id)
+		) {
+			log.warn(
+				`Dropping orphan Bedrock tool result for tool_use_id ${block.tool_use_id}`,
+			);
+			return null;
+		}
+
+		const content = transformToolResultContent(
+			block.content,
+			context.supportsSearchResult,
+		);
+		if (!content) {
+			return null;
+		}
 		return {
 			toolResult: {
 				toolUseId: block.tool_use_id,
@@ -503,6 +865,15 @@ export function transformMessagesRequest(
 	const cachePolicy = new PromptCachePolicy(
 		getPromptCacheCapability(bedrockModelId),
 	);
+	const supportsSearchResult = supportsSearchResults(bedrockModelId);
+	const messageTransformContext: MessageTransformContext = {
+		validToolPairIds: collectValidToolPairIds(
+			claudeRequest.messages,
+			supportsSearchResult,
+		),
+		emittedToolUseIds: new Set<string>(),
+		supportsSearchResult,
+	};
 
 	// Bedrock processes cache checkpoints in tools -> system -> messages order.
 	const toolConfig = transformTools(claudeRequest.tools, cachePolicy);
@@ -539,15 +910,33 @@ export function transformMessagesRequest(
 
 		if (typeof msg.content === "string") {
 			// Simple string content
-			const text = msg.content.trim();
-			if (text.length > 0) {
-				content = [{ text }];
+			if (msg.content.length > 0) {
+				content = [{ text: msg.content }];
 			}
 		} else if (Array.isArray(msg.content)) {
-			// Transform supported content blocks and place
-			// cache points immediately after their marked source block.
-			for (const block of msg.content) {
-				const transformedBlock = transformMessageContentBlock(block);
+			// Keep Bedrock's required parallel tool suffix/prefix contiguous. Cache
+			// points follow the complete group instead of splitting tool blocks.
+			const leadingToolResultCount = msg.content.findIndex(
+				(block) => block.type !== "tool_result",
+			);
+			const normalizedLeadingToolResultCount =
+				leadingToolResultCount < 0 ? msg.content.length : leadingToolResultCount;
+			const deferredToolUseCachePoints: CachePointBlock[] = [];
+			const deferredToolResultCachePoints: CachePointBlock[] = [];
+			for (const [blockIndex, block] of msg.content.entries()) {
+				if (blockIndex === normalizedLeadingToolResultCount) {
+					content.push(
+						...deferredToolResultCachePoints.map((cachePoint) => ({
+							cachePoint,
+						})),
+					);
+					deferredToolResultCachePoints.length = 0;
+				}
+
+				const transformedBlock = transformMessageContentBlock(
+					block,
+					messageTransformContext,
+				);
 				if (!transformedBlock) {
 					continue;
 				}
@@ -555,9 +944,24 @@ export function transformMessagesRequest(
 				content.push(transformedBlock);
 				const cachePoint = cachePolicy.createCachePoint(block.cache_control);
 				if (cachePoint) {
-					content.push({ cachePoint });
+					if (block.type === "tool_use") {
+						deferredToolUseCachePoints.push(cachePoint);
+					} else if (
+						block.type === "tool_result" &&
+						blockIndex < normalizedLeadingToolResultCount
+					) {
+						deferredToolResultCachePoints.push(cachePoint);
+					} else {
+						content.push({ cachePoint });
+					}
 				}
 			}
+			content.push(
+				...deferredToolResultCachePoints.map((cachePoint) => ({ cachePoint })),
+			);
+			content.push(
+				...deferredToolUseCachePoints.map((cachePoint) => ({ cachePoint })),
+			);
 		} else {
 			log.warn(
 				`Unexpected message content type at index ${index}: ${typeof msg.content}, dropping message`,
