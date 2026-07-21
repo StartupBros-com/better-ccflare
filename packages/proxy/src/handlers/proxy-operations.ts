@@ -1597,6 +1597,7 @@ export async function proxyWithAccount(
 				| "thinking_retry"
 				| "cache_control_retry"
 				| "cache_lane_rescue"
+				| "precommit_sse_retry"
 				| "account_failover"
 				| "other_retry",
 			finalModel?: string,
@@ -3264,7 +3265,7 @@ export async function proxyWithAccount(
 		// successful streams, and that tee sibling would make cancellation of a
 		// pre-commit stall wait indefinitely. In Bun, merely reading Response.body
 		// before a later classification clone can also disturb the retained branch.
-		const officialCodexCacheLaneRescueEligible =
+		const officialCodexPrecommitRetryEligible =
 			provider.name === "codex" &&
 			account.provider === "codex" &&
 			url.pathname === "/v1/messages" &&
@@ -3272,7 +3273,7 @@ export async function proxyWithAccount(
 			isCodexSubscriptionEndpoint(targetUrl) &&
 			typeof transformedBodyJson?.prompt_cache_key === "string" &&
 			transformedBodyJson.prompt_cache_key.length > 0;
-		let codexCacheLaneRescueAttempted = false;
+		let codexPrecommitRetryAttempted = false;
 		while (true) {
 			const isDownstreamAnthropicMessagesStream =
 				isDownstreamAnthropicMessagesSse({
@@ -3329,8 +3330,8 @@ export async function proxyWithAccount(
 			// deadline and any global fallback reserve remain unchanged, while the
 			// first cache lane cannot consume the retry's bounded share.
 			const cacheLaneRescueReserveMs =
-				officialCodexCacheLaneRescueEligible &&
-				!codexCacheLaneRescueAttempted &&
+				officialCodexPrecommitRetryEligible &&
+				!codexPrecommitRetryAttempted &&
 				attemptCommitmentDeadlineAt !== undefined
 					? getCodexCacheLaneRescueReserveMs(attemptCommitmentBudgetMs)
 					: 0;
@@ -3377,6 +3378,9 @@ export async function proxyWithAccount(
 					error.errorType === undefined &&
 					(error.reason === "semantic_timeout" ||
 						error.reason === "meaningful_progress_timeout");
+				const isRetryableCodexPrecommitSseError =
+					error.reason === "transient_sse_error" &&
+					error.errorType === "api_error";
 				const remainingCandidateBudgetMs =
 					attemptCommitmentDeadlineAt === undefined
 						? Number.POSITIVE_INFINITY
@@ -3384,37 +3388,62 @@ export async function proxyWithAccount(
 				const hasBoundedCacheLaneRescueBudget =
 					remainingCandidateBudgetMs > 0 &&
 					(error.reason === "semantic_timeout" || cacheLaneRescueReserveMs > 0);
-				if (
-					officialCodexCacheLaneRescueEligible &&
-					!codexCacheLaneRescueAttempted &&
-					isZeroMeaningfulCodexStall &&
-					hasBoundedCacheLaneRescueBudget
+				const hasBoundedPrecommitSseRetryBudget =
+					attemptCommitmentDeadlineAt !== undefined &&
+					remainingCandidateBudgetMs > 0;
+				let codexPrecommitRetryCause:
+					| "cache_lane_rescue"
+					| "precommit_sse_retry"
+					| null = null;
+				if (isZeroMeaningfulCodexStall && hasBoundedCacheLaneRescueBudget) {
+					codexPrecommitRetryCause = "cache_lane_rescue";
+				} else if (
+					isRetryableCodexPrecommitSseError &&
+					hasBoundedPrecommitSseRetryBudget
 				) {
-					codexCacheLaneRescueAttempted = true;
-					log.warn("codex_precommit_cache_lane_rescue", {
-						requestId: requestMeta.id,
-						accountId: account.id,
-						attemptedModel: currentTransportModel,
-						reason: error.reason,
-						bufferedBytes: error.bufferedBytes,
-						framesSeen: error.framesSeen,
-						validProtocolFramesSeen: error.validProtocolFramesSeen,
-						commitmentDeadlineAt: semanticCommitmentDeadlineAt ?? null,
-						transportCommitmentDeadlineAt: attemptCommitmentDeadlineAt ?? null,
-						cacheLaneRescueReserveMs,
-					});
+					codexPrecommitRetryCause = "precommit_sse_retry";
+				}
+				if (
+					officialCodexPrecommitRetryEligible &&
+					!codexPrecommitRetryAttempted &&
+					codexPrecommitRetryCause
+				) {
+					codexPrecommitRetryAttempted = true;
+					const isPrecommitSseRetry =
+						codexPrecommitRetryCause === "precommit_sse_retry";
+					log.warn(
+						isPrecommitSseRetry
+							? "codex_precommit_sse_retry"
+							: "codex_precommit_cache_lane_rescue",
+						{
+							requestId: requestMeta.id,
+							accountId: account.id,
+							attemptedModel: currentTransportModel,
+							attemptCause: codexPrecommitRetryCause,
+							reason: error.reason,
+							bufferedBytes: error.bufferedBytes,
+							framesSeen: error.framesSeen,
+							validProtocolFramesSeen: error.validProtocolFramesSeen,
+							commitmentDeadlineAt: semanticCommitmentDeadlineAt ?? null,
+							transportCommitmentDeadlineAt:
+								attemptCommitmentDeadlineAt ?? null,
+							cacheLaneRescueReserveMs,
+						},
+					);
 
 					// gateAnthropicSsePreCommit already cancelled its reader. This extra
 					// best-effort cancel covers response implementations whose transformed
 					// wrapper did not propagate reader cancellation synchronously.
 					await discardUnusedResponse(
 						response,
-						"codex_precommit_cache_lane_rescue_superseded",
+						isPrecommitSseRetry
+							? "codex_precommit_sse_retry_superseded"
+							: "codex_precommit_cache_lane_rescue_superseded",
 					);
 					const rescueHeaders = new Headers(retrySourceRequest.headers);
 					stampCodexAttempt(
 						rescueHeaders,
-						"cache_lane_rescue",
+						codexPrecommitRetryCause,
 						currentTransportModel ?? undefined,
 					);
 					const rescueRequestInit: RequestInit & { duplex?: "half" } = {
@@ -3500,7 +3529,9 @@ export async function proxyWithAccount(
 						routingAttemptLedger?.blockAccount(account.id);
 						await discardUnusedResponse(
 							response,
-							"auth_failed_401_after_cache_lane_rescue",
+							isPrecommitSseRetry
+								? "auth_failed_401_after_precommit_sse_retry"
+								: "auth_failed_401_after_cache_lane_rescue",
 						);
 						return null;
 					}

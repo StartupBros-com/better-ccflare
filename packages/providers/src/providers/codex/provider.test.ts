@@ -4775,6 +4775,67 @@ describe("CodexProvider.transformRequestBody", () => {
 		}
 	});
 
+	it("rotates and traces a precommit SSE retry under its own attempt cause", async () => {
+		const traceDir = mkdtempSync(join(tmpdir(), "codex-trace-"));
+		process.env[CODEX_TRACE_DIR_ENV] = traceDir;
+		const payload = JSON.stringify({
+			model: "claude-opus-4-8",
+			max_tokens: 10,
+			metadata: {
+				user_id: JSON.stringify({
+					session_id: "11111111-1111-4111-8111-111111111111",
+				}),
+			},
+			messages: [{ role: "user", content: "hello" }],
+		});
+		const transform = async (
+			cause: "initial" | "precommit_sse_retry",
+			attemptId: string,
+		) => {
+			const request = new Request(CODEX_DEFAULT_ENDPOINT, {
+				method: "POST",
+				headers: {
+					"content-type": "application/json",
+					"x-better-ccflare-request-id": "logical-sse-retry",
+					"x-better-ccflare-attempt-id": attemptId,
+					"x-better-ccflare-attempt-ordinal": cause === "initial" ? "1" : "2",
+					"x-better-ccflare-attempt-cause": cause,
+				},
+				body: payload,
+			});
+			return (await new CodexProvider()
+				.transformRequestBody(request)
+				.then((response) => response.json())) as {
+				prompt_cache_key?: string;
+			};
+		};
+
+		try {
+			const initial = await transform("initial", "physical-initial");
+			const retry = await transform(
+				"precommit_sse_retry",
+				"physical-sse-retry",
+			);
+
+			expect(initial.prompt_cache_key).toMatch(/^ccflare-convo-[0-9a-f]{48}$/);
+			expect(retry.prompt_cache_key).toMatch(/^ccflare-rescue-[0-9a-f]{48}$/);
+			expect(retry.prompt_cache_key).not.toBe(initial.prompt_cache_key);
+			const retryRecord = readTraceRecords(traceDir).find(
+				(candidate) => candidate.attempt_id === "physical-sse-retry",
+			);
+			expect(retryRecord).toMatchObject({
+				request_id: "logical-sse-retry",
+				attempt_id: "physical-sse-retry",
+				attempt_ordinal: 2,
+				attempt_cause: "precommit_sse_retry",
+				prompt_cache_key_set: true,
+			});
+		} finally {
+			delete process.env[CODEX_TRACE_DIR_ENV];
+			rmSync(traceDir, { recursive: true, force: true });
+		}
+	});
+
 	it("omits prompt_cache_key when explicitly disabled", async () => {
 		process.env[CODEX_PROMPT_CACHE_KEY_ENV] = "0";
 		const provider = new CodexProvider();

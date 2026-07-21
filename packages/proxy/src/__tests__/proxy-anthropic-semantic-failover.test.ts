@@ -39,6 +39,7 @@ import {
 } from "../anthropic-semantic-preflight";
 import { AnthropicStreamOutcomeTracker } from "../anthropic-stream-outcome";
 import type { ProxyContext } from "../handlers";
+import { stampInternalAutoRefreshAuth } from "../internal-probe-auth";
 import type { UsageCollector } from "../usage-collector";
 
 // Loading proxy.ts in a focused unit test must not require ignored embedded
@@ -297,6 +298,29 @@ const CODEX_SUCCESS_STREAM = codexEventStream(
 	],
 	true,
 );
+
+function codexFailureStream(
+	errorType: "api_error" | "rate_limit_error" | "overloaded_error",
+): string {
+	return codexEventStream(
+		[
+			CODEX_STRUCTURAL_FRAMES[0],
+			{
+				event: "response.failed",
+				data: {
+					response: {
+						status: "failed",
+						error: {
+							type: errorType,
+							message: "bounded test failure",
+						},
+					},
+				},
+			},
+		],
+		true,
+	);
+}
 
 function openAiContentChunk(text: string): string {
 	return JSON.stringify({
@@ -742,6 +766,234 @@ afterEach(() => {
 });
 
 describe("downstream Anthropic Messages SSE routing", () => {
+	it("retries one official Codex precommit api_error on the same account and model", async () => {
+		const account = makeCodexAccount("codex-precommit-api-error");
+		const { ctx, reportCandidateFailure, reportCandidateSuccess } = makeContext(
+			[account],
+			makeCombo([account]),
+		);
+		const outboundBodies: Array<{
+			model: string;
+			prompt_cache_key: string;
+			[key: string]: unknown;
+		}> = [];
+		const outboundAccounts: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			outboundAccounts.push(upstreamRequest.headers.get("authorization") ?? "");
+			outboundBodies.push(
+				(await upstreamRequest
+					.clone()
+					.json()) as (typeof outboundBodies)[number],
+			);
+			return sseResponse(
+				byteStream(
+					outboundBodies.length === 1
+						? codexFailureStream("api_error")
+						: CODEX_SUCCESS_STREAM,
+				),
+			);
+		}) as unknown as typeof fetch;
+
+		const request = makeCodexRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.text();
+
+		expect(response.status).toBe(200);
+		expect(outboundAccounts).toEqual([
+			`Bearer access-${account.id}`,
+			`Bearer access-${account.id}`,
+		]);
+		expect(outboundBodies).toHaveLength(2);
+		const [first, retry] = outboundBodies;
+		expect(first.prompt_cache_key).toMatch(/^ccflare-convo-[0-9a-f]{48}$/);
+		expect(retry.prompt_cache_key).toMatch(/^ccflare-rescue-[0-9a-f]{48}$/);
+		expect(retry.prompt_cache_key).not.toBe(first.prompt_cache_key);
+		const { prompt_cache_key: _firstKey, ...firstPayload } = first;
+		const { prompt_cache_key: _retryKey, ...retryPayload } = retry;
+		expect(retryPayload).toEqual(firstPayload);
+		expect(retry.model).toBe(first.model);
+		expect(body).toContain('"text":"codex recovered"');
+		expect(body.match(/event: message_start/g)).toHaveLength(1);
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+		expect(reportCandidateSuccess).toHaveBeenCalledTimes(1);
+		expect(usageHandleStart).toHaveBeenCalledTimes(1);
+		expect(usageHandleEnd).toHaveBeenCalledTimes(1);
+	});
+
+	it("stops after one Codex precommit api_error retry and reports one logical route failure", async () => {
+		const account = makeCodexAccount("codex-precommit-api-error-twice");
+		const { ctx, reportCandidateFailure, reportCandidateSuccess } = makeContext(
+			[account],
+			makeCombo([account]),
+		);
+		const outboundKeys: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			const body = (await upstreamRequest.clone().json()) as {
+				prompt_cache_key: string;
+			};
+			outboundKeys.push(body.prompt_cache_key);
+			return sseResponse(byteStream(codexFailureStream("api_error")));
+		}) as unknown as typeof fetch;
+
+		const request = makeCodexRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const payload = (await response.json()) as {
+			error: { code: string; attempted_routes: number };
+		};
+
+		expect(response.status).toBe(503);
+		expect(outboundKeys).toHaveLength(2);
+		expect(outboundKeys[0]).toMatch(/^ccflare-convo-/);
+		expect(outboundKeys[1]).toMatch(/^ccflare-rescue-/);
+		expect(payload.error).toMatchObject({
+			code: "route_unavailable",
+			attempted_routes: 1,
+		});
+		expect(reportCandidateFailure).toHaveBeenCalledTimes(1);
+		expect(reportCandidateFailure.mock.calls[0][1]).toMatchObject({
+			reason: "anthropic_precommit_transient_sse_error:api_error",
+		});
+		expect(reportCandidateSuccess).not.toHaveBeenCalled();
+		expect(usageHandleStart).not.toHaveBeenCalled();
+		expect(usageHandleEnd).not.toHaveBeenCalled();
+	});
+
+	it("does not retry a Codex precommit api_error after its candidate budget expires", async () => {
+		process.env[MEANINGFUL_PROGRESS_ENV] = "1000";
+		process.env[RESCUE_DEADLINE_ENV] = "1000";
+		const account = makeCodexAccount("codex-precommit-api-error-expired");
+		const { ctx, reportCandidateFailure } = makeContext([account]);
+		const realDateNow = Date.now;
+		let fetchCount = 0;
+		globalThis.fetch = mock(async () => {
+			fetchCount++;
+			return sseResponse(
+				new ReadableStream<Uint8Array>(
+					{
+						pull(controller) {
+							Date.now = () => realDateNow() + 60_000;
+							controller.enqueue(
+								encoder.encode(codexFailureStream("api_error")),
+							);
+							controller.close();
+						},
+					},
+					{ highWaterMark: 0 },
+				),
+			);
+		}) as unknown as typeof fetch;
+
+		let status = 0;
+		try {
+			const request = makeCodexRequest();
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			status = response.status;
+			await response.text();
+		} finally {
+			Date.now = realDateNow;
+		}
+
+		expect(status).toBe(503);
+		expect(fetchCount).toBe(1);
+		expect(reportCandidateFailure).toHaveBeenCalledTimes(1);
+		expect(reportCandidateFailure.mock.calls[0][1]).toMatchObject({
+			reason: "anthropic_precommit_transient_sse_error:api_error",
+		});
+	});
+
+	it("does not in-place retry a native Anthropic precommit api_error", async () => {
+		const account = makeAccount("anthropic-precommit-api-error");
+		const { ctx } = makeContext([account]);
+		let fetchCount = 0;
+		globalThis.fetch = mock(async () => {
+			fetchCount++;
+			return sseResponse(byteStream(TRANSIENT_ERROR));
+		}) as unknown as typeof fetch;
+
+		const request = makeRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		await response.text();
+
+		expect(response.status).toBe(503);
+		expect(fetchCount).toBe(1);
+	});
+
+	it.each([
+		"custom_endpoint",
+		"synthetic_internal",
+	] as const)("does not in-place retry a Codex precommit api_error for %s traffic", async (scenario) => {
+		const account = makeCodexAccount(
+			`codex-precommit-api-error-${scenario}`,
+			scenario === "custom_endpoint"
+				? "https://custom-codex.example.com/v1/responses"
+				: null,
+		);
+		const { ctx } = makeContext([account]);
+		let fetchCount = 0;
+		globalThis.fetch = mock(async () => {
+			fetchCount++;
+			return sseResponse(byteStream(codexFailureStream("api_error")));
+		}) as unknown as typeof fetch;
+
+		const request = makeCodexRequest();
+		if (scenario === "synthetic_internal") {
+			request.headers.set("x-better-ccflare-keepalive", "true");
+			stampInternalAutoRefreshAuth(request.headers);
+		}
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		await response.text();
+
+		expect(response.status).toBe(503);
+		expect(fetchCount).toBe(1);
+	});
+
+	it("does not retry a Codex api_error after meaningful output commits", async () => {
+		const account = makeCodexAccount("codex-postcommit-api-error");
+		const { ctx } = makeContext([account]);
+		let fetchCount = 0;
+		globalThis.fetch = mock(async () => {
+			fetchCount++;
+			return sseResponse(
+				byteStream(
+					codexEventStream(
+						[
+							CODEX_STRUCTURAL_FRAMES[0],
+							{
+								event: "response.output_text.delta",
+								data: { delta: "committed before failure" },
+							},
+							{
+								event: "response.failed",
+								data: {
+									response: {
+										status: "failed",
+										error: {
+											type: "api_error",
+											message: "failed after commit",
+										},
+									},
+								},
+							},
+						],
+						true,
+					),
+				),
+			);
+		}) as unknown as typeof fetch;
+
+		const request = makeCodexRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.text();
+
+		expect(fetchCount).toBe(1);
+		expect(body).toContain('"text":"committed before failure"');
+		expect(body).toContain("failed after commit");
+	});
+
 	it("retries one official Codex precommit stall on the same route with a rotated cache lane", async () => {
 		process.env[MEANINGFUL_PROGRESS_ENV] = "80";
 		const account = makeCodexAccount("codex-stall-a");
@@ -922,36 +1174,15 @@ describe("downstream Anthropic Messages SSE routing", () => {
 	});
 
 	it.each([
-		"api_error",
 		"rate_limit_error",
-	] as const)("does not cache-lane retry a Codex %s SSE error", async (errorType) => {
+		"overloaded_error",
+	] as const)("does not in-place retry a Codex %s SSE error", async (errorType) => {
 		const account = makeCodexAccount(`codex-${errorType}`);
 		const { ctx } = makeContext([account]);
 		let fetchCount = 0;
 		globalThis.fetch = mock(async () => {
 			fetchCount++;
-			return sseResponse(
-				byteStream(
-					codexEventStream(
-						[
-							CODEX_STRUCTURAL_FRAMES[0],
-							{
-								event: "response.failed",
-								data: {
-									response: {
-										status: "failed",
-										error: {
-											type: errorType,
-											message: "bounded test failure",
-										},
-									},
-								},
-							},
-						],
-						true,
-					),
-				),
-			);
+			return sseResponse(byteStream(codexFailureStream(errorType)));
 		}) as unknown as typeof fetch;
 
 		const request = makeCodexRequest();

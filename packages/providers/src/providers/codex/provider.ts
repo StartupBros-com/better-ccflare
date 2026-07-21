@@ -720,7 +720,8 @@ export class CodexProvider extends BaseProvider {
 				requestId ?? undefined,
 				isAttributedAgent,
 				isSubscriptionEndpoint &&
-					attemptCause === "cache_lane_rescue" &&
+					(attemptCause === "cache_lane_rescue" ||
+						attemptCause === "precommit_sse_retry") &&
 					requestId
 					? requestId.slice(0, CODEX_CACHE_LANE_RESCUE_SALT_MAX_CHARS)
 					: undefined,
