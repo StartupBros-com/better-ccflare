@@ -34,26 +34,12 @@ import {
 } from "./request-transformer";
 import {
 	type BedrockConverseResponse,
+	type BedrockUsage,
+	normalizeBedrockUsage,
 	transformNonStreamingResponse,
 } from "./response-parser";
 
 const log = new Logger("BedrockProvider");
-
-/**
- * Usage payload as it may appear in a Bedrock SSE stream event.
- * Bedrock's native streaming events use camelCase field names, but some
- * Claude-format passthrough events may use snake_case, so both are checked.
- */
-interface BedrockStreamUsage {
-	inputTokens?: number;
-	outputTokens?: number;
-	cacheWriteInputTokens?: number;
-	cacheReadInputTokens?: number;
-	input_tokens?: number;
-	output_tokens?: number;
-	cache_write_input_tokens?: number;
-	cache_read_input_tokens?: number;
-}
 
 /**
  * AWS Bedrock provider for better-ccflare
@@ -606,8 +592,8 @@ export class BedrockProvider extends BaseProvider implements Provider {
 
 		// Step 6: Transform request based on streaming mode
 		const converseInput = isStreaming
-			? transformStreamingRequest(body)
-			: transformMessagesRequest(body);
+			? transformStreamingRequest(body, transformedModelId)
+			: transformMessagesRequest(body, transformedModelId);
 
 		// Step 7: Create client
 		const credentials = createBedrockCredentialChain(account);
@@ -672,7 +658,7 @@ export class BedrockProvider extends BaseProvider implements Provider {
 				// Retry without streaming
 				const command = new ConverseCommand({
 					modelId: transformedModelId,
-					...transformMessagesRequest(body),
+					...transformMessagesRequest(body, transformedModelId),
 				} as ConverseCommandInput);
 
 				const response = await client.send(command);
@@ -709,6 +695,8 @@ export class BedrockProvider extends BaseProvider implements Provider {
 		completionTokens?: number;
 		totalTokens?: number;
 		inputTokens?: number;
+		cacheReadInputTokens?: number;
+		cacheCreationInputTokens?: number;
 		outputTokens?: number;
 		costUsd?: number;
 	} | null> {
@@ -727,22 +715,16 @@ export class BedrockProvider extends BaseProvider implements Provider {
 				return null;
 			}
 
-			// Calculate token counts
-			const inputTokens = json.usage.inputTokens || 0;
-			const cacheWriteTokens = json.usage.cacheWriteInputTokens || 0;
-			const cacheReadTokens = json.usage.cacheReadInputTokens || 0;
-			const outputTokens = json.usage.outputTokens || 0;
-			const promptTokens = inputTokens + cacheWriteTokens + cacheReadTokens;
-			const totalTokens = promptTokens + outputTokens;
+			const normalizedUsage = normalizeBedrockUsage(json.usage);
 
 			// Calculate cost (graceful degradation if cost calculation fails)
 			let costUsd: number | undefined;
 			try {
 				costUsd = await estimateCostUSD("bedrock", {
-					inputTokens: inputTokens,
-					outputTokens: outputTokens,
-					cacheReadInputTokens: cacheReadTokens,
-					cacheCreationInputTokens: cacheWriteTokens,
+					inputTokens: normalizedUsage.inputTokens,
+					outputTokens: normalizedUsage.outputTokens,
+					cacheReadInputTokens: normalizedUsage.cacheReadInputTokens,
+					cacheCreationInputTokens: normalizedUsage.cacheCreationInputTokens,
 				});
 			} catch (error) {
 				log.warn(
@@ -751,11 +733,7 @@ export class BedrockProvider extends BaseProvider implements Provider {
 			}
 
 			return {
-				promptTokens,
-				completionTokens: outputTokens,
-				totalTokens,
-				inputTokens,
-				outputTokens,
+				...normalizedUsage,
 				costUsd,
 			};
 		} catch (error) {
@@ -788,6 +766,8 @@ export class BedrockProvider extends BaseProvider implements Provider {
 		completionTokens?: number;
 		totalTokens?: number;
 		inputTokens?: number;
+		cacheReadInputTokens?: number;
+		cacheCreationInputTokens?: number;
 		outputTokens?: number;
 		costUsd?: number;
 	} | null> {
@@ -814,7 +794,7 @@ export class BedrockProvider extends BaseProvider implements Provider {
 
 			const decoder = new TextDecoder();
 			let buffer = "";
-			let usage: BedrockStreamUsage | null = null;
+			let usage: BedrockUsage | null = null;
 
 			try {
 				while (true) {
@@ -856,24 +836,16 @@ export class BedrockProvider extends BaseProvider implements Provider {
 				return null;
 			}
 
-			// Calculate token counts (same logic as extractUsageInfo)
-			const inputTokens = usage.inputTokens || usage.input_tokens || 0;
-			const cacheWriteTokens =
-				usage.cacheWriteInputTokens || usage.cache_write_input_tokens || 0;
-			const cacheReadTokens =
-				usage.cacheReadInputTokens || usage.cache_read_input_tokens || 0;
-			const outputTokens = usage.outputTokens || usage.output_tokens || 0;
-			const promptTokens = inputTokens + cacheWriteTokens + cacheReadTokens;
-			const totalTokens = promptTokens + outputTokens;
+			const normalizedUsage = normalizeBedrockUsage(usage);
 
 			// Calculate cost immediately (per CONTEXT.md: "Calculate cost immediately when usage is extracted")
 			let costUsd: number | undefined;
 			try {
 				costUsd = await estimateCostUSD("bedrock", {
-					inputTokens,
-					outputTokens,
-					cacheReadInputTokens: cacheReadTokens,
-					cacheCreationInputTokens: cacheWriteTokens,
+					inputTokens: normalizedUsage.inputTokens,
+					outputTokens: normalizedUsage.outputTokens,
+					cacheReadInputTokens: normalizedUsage.cacheReadInputTokens,
+					cacheCreationInputTokens: normalizedUsage.cacheCreationInputTokens,
 				});
 			} catch (error) {
 				log.warn(
@@ -882,11 +854,7 @@ export class BedrockProvider extends BaseProvider implements Provider {
 			}
 
 			return {
-				promptTokens,
-				completionTokens: outputTokens,
-				totalTokens,
-				inputTokens,
-				outputTokens,
+				...normalizedUsage,
 				costUsd,
 			};
 		} catch (error) {

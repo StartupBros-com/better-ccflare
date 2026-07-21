@@ -2,6 +2,71 @@ import { Logger } from "@better-ccflare/logger";
 
 const log = new Logger("BedrockResponseParser");
 
+export interface BedrockUsage {
+	inputTokens?: number;
+	outputTokens?: number;
+	cacheReadInputTokens?: number;
+	cacheWriteInputTokens?: number;
+	input_tokens?: number;
+	output_tokens?: number;
+	cache_read_input_tokens?: number;
+	cache_write_input_tokens?: number;
+	cache_creation_input_tokens?: number;
+}
+
+export interface NormalizedBedrockUsage {
+	inputTokens: number;
+	outputTokens: number;
+	cacheReadInputTokens: number;
+	cacheCreationInputTokens: number;
+	promptTokens: number;
+	completionTokens: number;
+	totalTokens: number;
+}
+
+function normalizeTokenCount(value: number | undefined): number {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0
+		? value
+		: 0;
+}
+
+/**
+ * Normalize native Bedrock and Claude-compatible usage payloads into one
+ * cache-aware contract. Bedrock inputTokens contains uncached input only when
+ * prompt caching is active, so cache reads and writes must be added exactly
+ * once to obtain promptTokens.
+ */
+export function normalizeBedrockUsage(
+	usage: BedrockUsage,
+): NormalizedBedrockUsage {
+	const inputTokens = normalizeTokenCount(
+		usage.inputTokens ?? usage.input_tokens,
+	);
+	const outputTokens = normalizeTokenCount(
+		usage.outputTokens ?? usage.output_tokens,
+	);
+	const cacheReadInputTokens = normalizeTokenCount(
+		usage.cacheReadInputTokens ?? usage.cache_read_input_tokens,
+	);
+	const cacheCreationInputTokens = normalizeTokenCount(
+		usage.cacheWriteInputTokens ??
+			usage.cache_write_input_tokens ??
+			usage.cache_creation_input_tokens,
+	);
+	const promptTokens =
+		inputTokens + cacheReadInputTokens + cacheCreationInputTokens;
+
+	return {
+		inputTokens,
+		outputTokens,
+		cacheReadInputTokens,
+		cacheCreationInputTokens,
+		promptTokens,
+		completionTokens: outputTokens,
+		totalTokens: promptTokens + outputTokens,
+	};
+}
+
 /**
  * Bedrock Converse API response structure
  *
@@ -16,13 +81,7 @@ export interface BedrockConverseResponse {
 		};
 	};
 	stopReason: string;
-	usage?: {
-		inputTokens: number;
-		outputTokens: number;
-		totalTokens: number;
-		cacheReadInputTokens?: number;
-		cacheWriteInputTokens?: number;
-	};
+	usage?: BedrockUsage;
 	model?: string;
 }
 
@@ -87,6 +146,7 @@ export async function transformNonStreamingResponse(
 		const content = json.output?.message?.content || [];
 		const stopReason = json.stopReason;
 		const usage = json.usage;
+		const normalizedUsage = usage ? normalizeBedrockUsage(usage) : undefined;
 
 		// Transform to Claude Messages API format
 		const claudeResponse = {
@@ -96,10 +156,13 @@ export async function transformNonStreamingResponse(
 			content: content, // 1:1 mapping, preserve as-is
 			model: json.model || "claude-bedrock",
 			stop_reason: stopReason,
-			usage: usage
+			usage: normalizedUsage
 				? {
-						input_tokens: usage.inputTokens,
-						output_tokens: usage.outputTokens,
+						input_tokens: normalizedUsage.inputTokens,
+						output_tokens: normalizedUsage.outputTokens,
+						cache_read_input_tokens: normalizedUsage.cacheReadInputTokens,
+						cache_creation_input_tokens:
+							normalizedUsage.cacheCreationInputTokens,
 					}
 				: undefined,
 		};
