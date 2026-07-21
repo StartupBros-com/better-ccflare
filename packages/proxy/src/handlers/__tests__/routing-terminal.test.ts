@@ -229,6 +229,9 @@ describe("routing terminal responses", () => {
 		expect(terminal.response.headers.get("x-better-ccflare-pool-status")).toBe(
 			"exhausted",
 		);
+		expect(
+			terminal.response.headers.get("x-better-ccflare-recovery-scope"),
+		).toBe("model");
 		const parsed = await body(terminal.response);
 		expect(parsed.type).toBe("error");
 		expect(parsed.error.type).toBe("service_unavailable");
@@ -331,6 +334,9 @@ describe("routing terminal responses", () => {
 		expect(terminal.response.headers.get("x-better-ccflare-pool-status")).toBe(
 			"exhausted",
 		);
+		expect(
+			terminal.response.headers.get("x-better-ccflare-recovery-scope"),
+		).toBe("model");
 	});
 
 	it("does not call mixed or incomplete attempted failures model exhaustion", async () => {
@@ -478,6 +484,9 @@ describe("routing terminal responses", () => {
 		expect(terminal.response.headers.get("x-better-ccflare-pool-status")).toBe(
 			"exhausted",
 		);
+		expect(
+			terminal.response.headers.get("x-better-ccflare-recovery-scope"),
+		).toBe("pool");
 		const parsed = await body(terminal.response);
 		expect(parsed.error.type).toBe("pool_exhausted");
 		expect(parsed.error.code).toBe("pool_exhausted");

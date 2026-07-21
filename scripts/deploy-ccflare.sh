@@ -453,12 +453,12 @@ if ! CONFIGURED_DEPLOYMENT_TIMING="$(
 	echo "ERROR: rendered systemd pin has an unsafe guard deadline or stop policy" >&2
 	exit 1
 fi
-read -r \
-	CONFIGURED_GUARD_TOTAL_DEADLINE_MS \
-	CONFIGURED_GUARD_RETRY_ATTEMPT_HEADROOM_MS \
-	CONFIGURED_GUARD_MAX_RECOVERY_SLEEP_MS \
-	CONFIGURED_GUARD_SHUTDOWN_GRACE_MS \
-	CONFIGURED_STOP_TIMEOUT_MS <<<"$CONFIGURED_DEPLOYMENT_TIMING"
+CONFIGURED_GUARD_TOTAL_DEADLINE_MS="$(deployment_timing_value "$CONFIGURED_DEPLOYMENT_TIMING" guard_total_deadline_ms)"
+CONFIGURED_GUARD_RETRY_ATTEMPT_HEADROOM_MS="$(deployment_timing_value "$CONFIGURED_DEPLOYMENT_TIMING" guard_retry_attempt_headroom_ms)"
+CONFIGURED_GUARD_MAX_RECOVERY_SLEEP_MS="$(deployment_timing_value "$CONFIGURED_DEPLOYMENT_TIMING" guard_max_recovery_sleep_ms)"
+CONFIGURED_GUARD_SHUTDOWN_GRACE_MS="$(deployment_timing_value "$CONFIGURED_DEPLOYMENT_TIMING" guard_shutdown_grace_ms)"
+CONFIGURED_GUARD_MAX_RECOVERY_WAITS="$(deployment_timing_value "$CONFIGURED_DEPLOYMENT_TIMING" guard_max_recovery_waits)"
+CONFIGURED_STOP_TIMEOUT_MS="$(deployment_timing_value "$CONFIGURED_DEPLOYMENT_TIMING" stop_timeout_ms)"
 
 PIN_STAGED="${PIN}.new-${SHORT}-$$"
 replace_systemd_pin_if_snapshot_current \
@@ -507,12 +507,12 @@ if [[ "$PRE_RESTART_POLICY_STATUS" -ne 0 ]]; then
 	fi
 	exit "$PRE_RESTART_POLICY_STATUS"
 fi
-read -r \
-	CONFIGURED_GUARD_TOTAL_DEADLINE_MS \
-	CONFIGURED_GUARD_RETRY_ATTEMPT_HEADROOM_MS \
-	CONFIGURED_GUARD_MAX_RECOVERY_SLEEP_MS \
-	CONFIGURED_GUARD_SHUTDOWN_GRACE_MS \
-	CONFIGURED_STOP_TIMEOUT_MS <<<"$EFFECTIVE_DEPLOYMENT_TIMING"
+CONFIGURED_GUARD_TOTAL_DEADLINE_MS="$(deployment_timing_value "$EFFECTIVE_DEPLOYMENT_TIMING" guard_total_deadline_ms)"
+CONFIGURED_GUARD_RETRY_ATTEMPT_HEADROOM_MS="$(deployment_timing_value "$EFFECTIVE_DEPLOYMENT_TIMING" guard_retry_attempt_headroom_ms)"
+CONFIGURED_GUARD_MAX_RECOVERY_SLEEP_MS="$(deployment_timing_value "$EFFECTIVE_DEPLOYMENT_TIMING" guard_max_recovery_sleep_ms)"
+CONFIGURED_GUARD_SHUTDOWN_GRACE_MS="$(deployment_timing_value "$EFFECTIVE_DEPLOYMENT_TIMING" guard_shutdown_grace_ms)"
+CONFIGURED_GUARD_MAX_RECOVERY_WAITS="$(deployment_timing_value "$EFFECTIVE_DEPLOYMENT_TIMING" guard_max_recovery_waits)"
+CONFIGURED_STOP_TIMEOUT_MS="$(deployment_timing_value "$EFFECTIVE_DEPLOYMENT_TIMING" stop_timeout_ms)"
 
 echo "==> Restarting ccflare-stack.service…"
 SERVICE_RESTART_ATTEMPTED=1
@@ -546,6 +546,7 @@ EXPECTED_IDENTITY_JSON="$(
 		"$CONFIGURED_GUARD_TOTAL_DEADLINE_MS" \
 		"$CONFIGURED_GUARD_RETRY_ATTEMPT_HEADROOM_MS" \
 		"$CONFIGURED_GUARD_MAX_RECOVERY_SLEEP_MS" \
+		"$CONFIGURED_GUARD_MAX_RECOVERY_WAITS" \
 		"$CONFIGURED_GUARD_SHUTDOWN_GRACE_MS" \
 		"$(readlink -f "$DEST_BIN")" "$DEST_BIN_SHA256" \
 		"$(readlink -f "$RUNNER_SCRIPT")" "$RUNNER_SHA256" \
@@ -559,6 +560,7 @@ const [
 	guardTotalDeadlineMs,
 	guardRetryAttemptHeadroomMs,
 	guardMaxRecoverySleepMs,
+	guardMaxRecoveryWaits,
 	guardShutdownGraceMs,
 	binaryPath,
 	binarySha256,
@@ -584,6 +586,7 @@ process.stdout.write(JSON.stringify({
 		totalDeadlineMs: Number(guardTotalDeadlineMs),
 		retryAttemptHeadroomMs: Number(guardRetryAttemptHeadroomMs),
 		maxRecoverySleepMs: Number(guardMaxRecoverySleepMs),
+		maxRecoveryWaits: Number(guardMaxRecoveryWaits),
 		shutdownGraceMs: Number(guardShutdownGraceMs),
 		maxAttempts: 3,
 		jitterMs: 2000,

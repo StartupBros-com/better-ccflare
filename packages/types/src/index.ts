@@ -13,6 +13,7 @@ export * from "./conversation";
 export * from "./insights";
 export * from "./logging";
 export * from "./request";
+export * from "./routing-recovery";
 export * from "./stats";
 export * from "./strategy";
 export * from "./usage-history";

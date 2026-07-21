@@ -27,6 +27,11 @@ import type {
 	RateLimitReason,
 	RequestMeta,
 } from "@better-ccflare/types";
+import {
+	RECOVERY_SCOPE_HEADER,
+	RECOVERY_STATUS_EXHAUSTED,
+	RECOVERY_STATUS_HEADER,
+} from "@better-ccflare/types";
 import type { AnthropicPreCommitRescueRouteContext } from "../anthropic-precommit-rescue";
 import {
 	AnthropicPreCommitAbortedError,
@@ -4059,7 +4064,8 @@ export function createPoolExhaustedResponse(accounts: Account[]): Response {
 			headers: {
 				"Content-Type": "application/json",
 				"Retry-After": String(retryAfterSeconds),
-				"x-better-ccflare-pool-status": "exhausted",
+				[RECOVERY_STATUS_HEADER]: RECOVERY_STATUS_EXHAUSTED,
+				[RECOVERY_SCOPE_HEADER]: "pool",
 			},
 		},
 	);

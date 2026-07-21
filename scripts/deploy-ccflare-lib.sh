@@ -142,7 +142,7 @@ render_systemd_pin() {
 
 	local input="$1" output="$2" binary="$3" runner="$4"
 	local guard_script="$5" source_id="$6" policy_id="$7" guard_policy_script="$8"
-	local deadline_ms=600000 retry_attempt_headroom_ms=30000 max_recovery_sleep_ms=120000 shutdown_grace_ms=600000
+	local deadline_ms=600000 retry_attempt_headroom_ms=30000 max_recovery_sleep_ms=120000 shutdown_grace_ms=600000 max_recovery_waits=12
 	local kill_mode=mixed stop_timeout=720s
 	local managed_begin="# BEGIN better-ccflare managed deployment"
 	local managed_end="# END better-ccflare managed deployment"
@@ -176,6 +176,7 @@ render_systemd_pin() {
 		printf 'Environment=%s\n' "GUARD_TOTAL_DEADLINE_MS=$deadline_ms"
 		printf 'Environment=%s\n' "GUARD_RETRY_ATTEMPT_HEADROOM_MS=$retry_attempt_headroom_ms"
 		printf 'Environment=%s\n' "GUARD_MAX_RECOVERY_SLEEP_MS=$max_recovery_sleep_ms"
+		printf 'Environment=%s\n' "GUARD_MAX_RECOVERY_WAITS=$max_recovery_waits"
 		printf 'Environment=%s\n' "GUARD_SHUTDOWN_GRACE_MS=$shutdown_grace_ms"
 		printf 'KillMode=%s\n' "$kill_mode"
 		printf 'TimeoutStopSec=%s\n' "$stop_timeout"
@@ -380,13 +381,67 @@ systemd_duration_to_milliseconds() {
 	printf '%s\n' "$((usec / 1000))"
 }
 
+validate_guard_timing_values() {
+	if [[ "$#" -ne 6 ]]; then
+		echo "validate_guard_timing_values requires: deadline headroom recovery-silence grace recovery-waits label" >&2
+		return 2
+	fi
+	local deadline_ms="$1" retry_attempt_headroom_ms="$2" max_recovery_sleep_ms="$3"
+	local shutdown_grace_ms="$4" max_recovery_waits="$5" label="$6" value
+	for value in "$deadline_ms" "$shutdown_grace_ms"; do
+		if [[ ! "$value" =~ ^[1-9][0-9]{0,9}$ ]] \
+			|| ((value < 600000 || value > 2147483647)); then
+			echo "unsafe ${label}guard timing value ${value}; expected 600000..2147483647ms" >&2
+			return 1
+		fi
+	done
+	if [[ ! "$retry_attempt_headroom_ms" =~ ^[1-9][0-9]{0,9}$ ]] \
+		|| ((retry_attempt_headroom_ms >= deadline_ms)); then
+		echo "unsafe ${label}retry-attempt headroom ${retry_attempt_headroom_ms}ms" >&2
+		return 1
+	fi
+	if [[ ! "$max_recovery_sleep_ms" =~ ^[1-9][0-9]{0,9}$ ]] \
+		|| ((max_recovery_sleep_ms > 120000)) \
+		|| ((max_recovery_sleep_ms > deadline_ms - retry_attempt_headroom_ms)); then
+		echo "unsafe ${label}max recovery silence ${max_recovery_sleep_ms}ms; expected 1..120000ms within deadline headroom" >&2
+		return 1
+	fi
+	if [[ ! "$max_recovery_waits" =~ ^[1-9][0-9]{0,6}$ ]] \
+		|| ((max_recovery_waits > 1000000)); then
+		echo "unsafe ${label}max recovery waits ${max_recovery_waits}; expected 1..1000000" >&2
+		return 1
+	fi
+	if ((shutdown_grace_ms < deadline_ms)); then
+		echo "unsafe ${label}shutdown grace ${shutdown_grace_ms}ms; expected at least deadline ${deadline_ms}ms" >&2
+		return 1
+	fi
+}
+
+emit_deployment_timing() {
+	if [[ "$#" -ne 6 ]]; then return 2; fi
+	printf 'guard_total_deadline_ms=%s\n' "$1"
+	printf 'guard_retry_attempt_headroom_ms=%s\n' "$2"
+	printf 'guard_max_recovery_sleep_ms=%s\n' "$3"
+	printf 'guard_shutdown_grace_ms=%s\n' "$4"
+	printf 'guard_max_recovery_waits=%s\n' "$5"
+	printf 'stop_timeout_ms=%s\n' "$6"
+}
+
+deployment_timing_value() {
+	if [[ "$#" -ne 2 || ! "$2" =~ ^[a-z_]+$ ]]; then return 2; fi
+	printf '%s\n' "$1" | awk -F= -v key="$2" '
+		$1 == key { value = substr($0, length(key) + 2); count += 1 }
+		END { if (count != 1 || value == "") exit 1; print value }
+	'
+}
+
 validate_deployment_timing() {
 	if [[ "$#" -ne 1 || ! -f "$1" ]]; then
 		echo "validate_deployment_timing requires one existing systemd pin" >&2
 		return 2
 	fi
 
-	local pin="$1" deadline_ms retry_attempt_headroom_ms max_recovery_sleep_ms shutdown_grace_ms kill_mode stop_timeout
+	local pin="$1" deadline_ms retry_attempt_headroom_ms max_recovery_sleep_ms shutdown_grace_ms max_recovery_waits kill_mode stop_timeout
 	local stop_timeout_usec stop_timeout_ms minimum_stop_timeout_usec
 	deadline_ms="$(
 		configured_systemd_environment_value "$pin" GUARD_TOTAL_DEADLINE_MS
@@ -406,6 +461,12 @@ validate_deployment_timing() {
 		echo "systemd pin is missing GUARD_MAX_RECOVERY_SLEEP_MS" >&2
 		return 1
 	}
+	max_recovery_waits="$(
+		configured_systemd_environment_value "$pin" GUARD_MAX_RECOVERY_WAITS
+	)" || {
+		echo "systemd pin is missing GUARD_MAX_RECOVERY_WAITS" >&2
+		return 1
+	}
 	shutdown_grace_ms="$(
 		configured_systemd_environment_value "$pin" GUARD_SHUTDOWN_GRACE_MS
 	)" || {
@@ -421,27 +482,13 @@ validate_deployment_timing() {
 		return 1
 	}
 
-	for value in "$deadline_ms" "$shutdown_grace_ms"; do
-		if [[ ! "$value" =~ ^[1-9][0-9]{0,9}$ ]] \
-			|| ((value < 600000 || value > 2147483647)); then
-			echo "unsafe deployment timing value ${value}; expected 600000..2147483647ms" >&2
-			return 1
-		fi
-	done
-	if [[ ! "$retry_attempt_headroom_ms" =~ ^[1-9][0-9]{0,9}$ ]] \
-		|| ((retry_attempt_headroom_ms >= deadline_ms)); then
-		echo "unsafe retry-attempt headroom ${retry_attempt_headroom_ms}ms; expected 1..$((deadline_ms - 1))ms" >&2
-		return 1
-	fi
-	if [[ ! "$max_recovery_sleep_ms" =~ ^[1-9][0-9]{0,9}$ ]] \
-		|| ((max_recovery_sleep_ms > deadline_ms - retry_attempt_headroom_ms)); then
-		echo "unsafe max recovery sleep ${max_recovery_sleep_ms}ms; expected 1..$((deadline_ms - retry_attempt_headroom_ms))ms" >&2
-		return 1
-	fi
-	if ((shutdown_grace_ms < deadline_ms)); then
-		echo "unsafe shutdown grace ${shutdown_grace_ms}ms; expected at least deadline ${deadline_ms}ms" >&2
-		return 1
-	fi
+	validate_guard_timing_values \
+		"$deadline_ms" \
+		"$retry_attempt_headroom_ms" \
+		"$max_recovery_sleep_ms" \
+		"$shutdown_grace_ms" \
+		"$max_recovery_waits" \
+		"" || return 1
 	if [[ "$kill_mode" != "mixed" ]]; then
 		echo "unsafe KillMode=${kill_mode}; expected mixed" >&2
 		return 1
@@ -457,11 +504,12 @@ validate_deployment_timing() {
 	fi
 	stop_timeout_ms=$((stop_timeout_usec / 1000))
 
-	printf '%s %s %s %s %s\n' \
+	emit_deployment_timing \
 		"$deadline_ms" \
 		"$retry_attempt_headroom_ms" \
 		"$max_recovery_sleep_ms" \
 		"$shutdown_grace_ms" \
+		"$max_recovery_waits" \
 		"$stop_timeout_ms"
 }
 
@@ -522,9 +570,9 @@ validate_effective_systemd_policy() {
 	fi
 	local service="$1" allow_missing_new_guard_limits=0
 	local kill_mode stop_timeout effective_environment effective_deadline_ms
-	local effective_retry_attempt_headroom_ms effective_max_recovery_sleep_ms effective_shutdown_grace_ms
+	local effective_retry_attempt_headroom_ms effective_max_recovery_sleep_ms effective_shutdown_grace_ms effective_max_recovery_waits
 	local stop_timeout_usec stop_timeout_ms
-	local minimum_stop_timeout_usec value
+	local minimum_stop_timeout_usec
 	if [[ "$#" -eq 2 ]]; then
 		allow_missing_new_guard_limits="$2"
 	fi
@@ -568,6 +616,18 @@ validate_effective_systemd_policy() {
 			return 1
 		fi
 	fi
+	if ! effective_max_recovery_waits="$(
+		systemd_environment_text_value "$effective_environment" GUARD_MAX_RECOVERY_WAITS
+	)"; then
+		if [[ "$allow_missing_new_guard_limits" == "1" ]]; then
+			# Rollback compatibility for pins installed before bounded recovery
+			# admission was explicit. New rendered pins always require this key.
+			effective_max_recovery_waits=12
+		else
+			echo "effective systemd environment is missing GUARD_MAX_RECOVERY_WAITS" >&2
+			return 1
+		fi
+	fi
 	effective_shutdown_grace_ms="$(
 		systemd_environment_text_value "$effective_environment" GUARD_SHUTDOWN_GRACE_MS
 	)" || {
@@ -579,27 +639,13 @@ validate_effective_systemd_policy() {
 		echo "effective KillMode=${kill_mode}; expected mixed" >&2
 		return 1
 	fi
-	for value in "$effective_deadline_ms" "$effective_shutdown_grace_ms"; do
-		if [[ ! "$value" =~ ^[1-9][0-9]{0,9}$ ]] \
-			|| ((value < 600000 || value > 2147483647)); then
-			echo "unsafe effective guard timing value ${value}" >&2
-			return 1
-		fi
-	done
-	if [[ ! "$effective_retry_attempt_headroom_ms" =~ ^[1-9][0-9]{0,9}$ ]] \
-		|| ((effective_retry_attempt_headroom_ms >= effective_deadline_ms)); then
-		echo "unsafe effective retry-attempt headroom ${effective_retry_attempt_headroom_ms}ms" >&2
-		return 1
-	fi
-	if [[ ! "$effective_max_recovery_sleep_ms" =~ ^[1-9][0-9]{0,9}$ ]] \
-		|| ((effective_max_recovery_sleep_ms > effective_deadline_ms - effective_retry_attempt_headroom_ms)); then
-		echo "unsafe effective max recovery sleep ${effective_max_recovery_sleep_ms}ms" >&2
-		return 1
-	fi
-	if ((effective_shutdown_grace_ms < effective_deadline_ms)); then
-		echo "effective shutdown grace is shorter than the guard deadline" >&2
-		return 1
-	fi
+	validate_guard_timing_values \
+		"$effective_deadline_ms" \
+		"$effective_retry_attempt_headroom_ms" \
+		"$effective_max_recovery_sleep_ms" \
+		"$effective_shutdown_grace_ms" \
+		"$effective_max_recovery_waits" \
+		"effective " || return 1
 	stop_timeout_usec="$(systemd_duration_to_microseconds "$stop_timeout")" || {
 		echo "unsupported effective TimeoutStopUSec=${stop_timeout}" >&2
 		return 1
@@ -610,11 +656,12 @@ validate_effective_systemd_policy() {
 		return 1
 	fi
 	stop_timeout_ms=$((stop_timeout_usec / 1000))
-	printf '%s %s %s %s %s\n' \
+	emit_deployment_timing \
 		"$effective_deadline_ms" \
 		"$effective_retry_attempt_headroom_ms" \
 		"$effective_max_recovery_sleep_ms" \
 		"$effective_shutdown_grace_ms" \
+		"$effective_max_recovery_waits" \
 		"$stop_timeout_ms"
 }
 
@@ -694,6 +741,7 @@ for (const name of [
 	"totalDeadlineMs",
 	"retryAttemptHeadroomMs",
 	"maxRecoverySleepMs",
+	"maxRecoveryWaits",
 	"shutdownGraceMs",
 	"maxAttempts",
 	"jitterMs",
@@ -704,6 +752,24 @@ for (const name of [
 		guard?.runtime?.limits?.[name],
 		expected?.limits?.[name],
 	);
+}
+
+for (const [label, value] of [
+	["actual", guard?.runtime?.limits?.maxRecoverySleepMs],
+	["expected", expected?.limits?.maxRecoverySleepMs],
+]) {
+	if (!Number.isSafeInteger(value) || value < 1 || value > 120000) {
+		mismatches.push(`${label} maxRecoverySleepMs=${JSON.stringify(value)} outside hard range 1..120000`);
+	}
+}
+
+for (const [label, value] of [
+	["actual", guard?.runtime?.limits?.maxRecoveryWaits],
+	["expected", expected?.limits?.maxRecoveryWaits],
+]) {
+	if (!Number.isSafeInteger(value) || value < 1 || value > 1000000) {
+		mismatches.push(`${label} maxRecoveryWaits=${JSON.stringify(value)} outside hard range 1..1000000`);
+	}
 }
 
 if (mismatches.length > 0) {

@@ -18,7 +18,9 @@ import {
 	DEFAULT_GUARD_RETRY_JITTER_MS,
 	DEFAULT_GUARD_SOURCE_ID,
 	DEFAULT_GUARD_TOTAL_DEADLINE_MS,
+	MAX_GUARD_RECOVERY_SILENCE_MS,
 	createGuard,
+	planRecoveryAction,
 } from "../ccflare-guard.mjs";
 
 const servers: Server[] = [];
@@ -261,6 +263,59 @@ async function waitForHealth(
 }
 
 describe("source-controlled guard", () => {
+	test("enforces the request-wide recovery silence hard maximum at the exact boundary", () => {
+		expect(MAX_GUARD_RECOVERY_SILENCE_MS).toBe(120_000);
+		expect(() =>
+			createGuard({ maxRecoverySleepMs: 120_000, logger: () => {} }),
+		).not.toThrow();
+		expect(() =>
+			createGuard({ maxRecoverySleepMs: 60_000, logger: () => {} }),
+		).not.toThrow();
+		for (const value of [120_001, 180_000, 0, "invalid"]) {
+			expect(() =>
+				createGuard({ maxRecoverySleepMs: value, logger: () => {} }),
+			).toThrow(/GUARD_MAX_RECOVERY_SLEEP_MS/);
+		}
+	});
+
+	test("plans recovery against elapsed request silence, not each sleep in isolation", () => {
+		expect(
+			planRecoveryAction({
+				recoveryDelayMs: 100,
+				elapsedMs: 0,
+				remainingMs: 1_000,
+				retryAttemptHeadroomMs: 20,
+				recoverySilenceBudgetMs: 120,
+				jitterMs: 0,
+				random: () => 0,
+			}),
+		).toMatchObject({ kind: "retry", delayMs: 100 });
+		expect(
+			planRecoveryAction({
+				recoveryDelayMs: 31,
+				elapsedMs: 70,
+				remainingMs: 930,
+				retryAttemptHeadroomMs: 20,
+				recoverySilenceBudgetMs: 120,
+				jitterMs: 0,
+				random: () => 0,
+			}),
+		).toEqual({
+			kind: "forward",
+			reason: "recovery_silence_budget_exceeded",
+		});
+		expect(
+			planRecoveryAction({
+				recoveryDelayMs: Number.NaN,
+				elapsedMs: 0,
+				remainingMs: 1_000,
+				retryAttemptHeadroomMs: 20,
+				recoverySilenceBudgetMs: 120,
+				jitterMs: 0,
+				random: () => 0,
+			}),
+		).toEqual({ kind: "forward", reason: "recovery_delay_invalid" });
+	});
 	test("publishes stable source and policy identities in health", async () => {
 		const { baseUrl } = await startGuard("http://127.0.0.1:1", {
 			sourceId: "test-source-sha",
@@ -1765,6 +1820,131 @@ describe("source-controlled guard", () => {
 		expect(order).toEqual(["A1", "B", "A2"]);
 	});
 
+	test("bounds recovery sleepers, exposes cardinality, and releases admission on abort", async () => {
+		const attempts = new Map<string, number>();
+		const upstreamBase = await listen(
+			http.createServer((req, res) => {
+				const id = String(req.headers["x-request-id"]);
+				const attempt = (attempts.get(id) ?? 0) + 1;
+				attempts.set(id, attempt);
+				if (attempt === 1) {
+					const delayMs = id === "A" ? 500 : 20;
+					res.writeHead(503, {
+						"content-type": "application/json",
+						"x-better-ccflare-pool-status": "exhausted",
+						"x-better-ccflare-recovery-scope": "model",
+					});
+					res.end(
+						JSON.stringify({
+							error: {
+								type: "model_pool_exhausted",
+								next_available_at: new Date(
+									Date.now() + delayMs,
+								).toISOString(),
+							},
+						}),
+					);
+					return;
+				}
+				res.end(`${id}-ok`);
+			}),
+		);
+		const { baseUrl, guard } = await startGuard(upstreamBase, {
+			maxActive: 4,
+			maxRecoveryWaits: 1,
+			maxRecoverySleepMs: 1_000,
+			totalDeadlineMs: 5_000,
+			maxAttempts: 2,
+		});
+
+		const controller = new AbortController();
+		const aResponse = fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			headers: { "x-request-id": "A" },
+			body: "A",
+			signal: controller.signal,
+		}).catch((error) => error);
+		await waitFor(() => guard.state.recoveryWaits.current === 1);
+
+		const rejected = await Promise.all(
+			["B", "C", "D"].map((id) =>
+				fetch(`${baseUrl}/v1/messages`, {
+					method: "POST",
+					headers: { "x-request-id": id },
+					body: id,
+				}),
+			),
+		);
+		expect(rejected.map((response) => response.status)).toEqual([503, 503, 503]);
+		expect(guard.state.recoveryWaits).toEqual({
+			configured: 1,
+			current: 1,
+			peak: 1,
+		});
+		expect(guard.state.counters.recoveryWaitCapacityFull).toBe(3);
+		expect(guard.state.counters.recoveryWaitRejectedByScope.model).toBe(3);
+		expect(["B", "C", "D"].map((id) => attempts.get(id))).toEqual([1, 1, 1]);
+
+		controller.abort();
+		await aResponse;
+		await waitFor(() => guard.state.recoveryWaits.current === 0);
+		expect(guard.state.counters.recoveryWaitReleased).toBe(1);
+
+		const recovered = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			headers: { "x-request-id": "E" },
+			body: "E",
+		});
+		expect(await recovered.text()).toBe("E-ok");
+		expect(guard.state.recoveryWaits.current).toBe(0);
+		expect(guard.state.counters.recoveryWaitAdmitted).toBe(2);
+		expect(guard.state.counters.recoveryWaitReleased).toBe(2);
+
+		const health = (await (
+			await fetch(`${baseUrl}/_guard/health`)
+		).json()) as {
+			recoveryWaits: { configured: number; current: number; peak: number };
+		};
+		expect(health.recoveryWaits).toEqual({ configured: 1, current: 0, peak: 1 });
+	});
+
+	test("releases a recovery-wait lease when shutdown force-closes the client", async () => {
+		const upstreamBase = await listen(
+			http.createServer((_req, res) => {
+				res.writeHead(503, {
+					"content-type": "application/json",
+					"x-better-ccflare-pool-status": "exhausted",
+					"x-better-ccflare-recovery-scope": "pool",
+				});
+				res.end(
+					JSON.stringify({
+						error: {
+							type: "pool_exhausted",
+							next_available_at: new Date(Date.now() + 500).toISOString(),
+						},
+					}),
+				);
+			}),
+		);
+		const { baseUrl, guard } = await startGuard(upstreamBase, {
+			maxRecoveryWaits: 1,
+			maxRecoverySleepMs: 1_000,
+			retryAttemptHeadroomMs: 10,
+			totalDeadlineMs: 2_000,
+			shutdownGraceMs: 20,
+		});
+
+		const pending = fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		}).catch((error) => error);
+		await waitFor(() => guard.state.recoveryWaits.current === 1);
+		guard.shutdown("test");
+		await pending;
+		await waitFor(() => guard.state.recoveryWaits.current === 0);
+		expect(guard.state.counters.recoveryWaitReleased).toBe(1);
+	});
+
 	test("bounds marked pool retries by the configured attempt count", async () => {
 		const events: Array<Record<string, unknown>> = [];
 		let attempts = 0;
@@ -2040,9 +2220,10 @@ describe("source-controlled guard", () => {
 		expect(guard.state.counters.finalError).toBe(1);
 	});
 
-	test("forwards a finite model recovery above the single-sleep cap without leaking its permit", async () => {
+	test("forwards a finite model recovery above the request-wide silence ceiling without leaking its permit", async () => {
 		const events: Array<Record<string, unknown>> = [];
 		let attempts = 0;
+		let heldResponse: http.ServerResponse | null = null;
 		const modelBody = JSON.stringify({
 			type: "error",
 			error: {
@@ -2060,8 +2241,10 @@ describe("source-controlled guard", () => {
 						"content-type": "application/json",
 						"retry-after": "300",
 						"x-better-ccflare-pool-status": "exhausted",
+						"x-better-ccflare-recovery-scope": "model",
 					});
-					res.end(modelBody);
+					heldResponse = res;
+					res.write(modelBody);
 					return;
 				}
 				res.end("next request admitted");
@@ -2086,17 +2269,20 @@ describe("source-controlled guard", () => {
 		expect(response.headers.get("x-better-ccflare-pool-status")).toBe(
 			"exhausted",
 		);
-		expect(await response.text()).toBe(modelBody);
-		expect(Date.now() - startedAt).toBeLessThan(500);
 		expect(attempts).toBe(1);
 		await waitFor(() => guard.state.active === 0);
 
+		// Keep the first response body open while proving that header-time trust
+		// released the upstream attempt permit for an unrelated request.
 		const next = await fetch(`${baseUrl}/v1/messages`, {
 			method: "POST",
 			body: "{}",
 			signal: AbortSignal.timeout(500),
 		});
 		expect(await next.text()).toBe("next request admitted");
+		heldResponse?.end();
+		expect(await response.text()).toBe(modelBody);
+		expect(Date.now() - startedAt).toBeLessThan(500);
 		expect(attempts).toBe(2);
 		expect(guard.state.active).toBe(0);
 		expect(guard.state.queued).toBe(0);
@@ -2107,7 +2293,7 @@ describe("source-controlled guard", () => {
 			events.find((event) => event.event === "proxy_final_error"),
 		).toMatchObject({
 			status: 503,
-			reason: "recovery_sleep_cap_exceeded",
+			reason: "recovery_silence_budget_exceeded",
 			recoverySource: "retry-after",
 			recoveryDelayMs: 300_000,
 			maxRecoverySleepMs: 120_000,
@@ -2169,6 +2355,71 @@ describe("source-controlled guard", () => {
 		});
 	});
 
+	test("forwards the current trusted 503 when consecutive recovery hints exceed one request-wide silence budget", async () => {
+		let attempts = 0;
+		const secondBody = JSON.stringify({
+			type: "error",
+			error: {
+				type: "service_unavailable",
+				code: "model_pool_exhausted",
+				message: "preserve the second terminal",
+			},
+		});
+		const upstreamBase = await listen(
+			http.createServer(async (_req, res) => {
+				attempts += 1;
+				if (attempts === 2) {
+					await new Promise((resolve) => setTimeout(resolve, 150));
+				}
+				const recoveryBody =
+					attempts === 2
+						? JSON.stringify({
+								...JSON.parse(secondBody),
+								error: {
+									...JSON.parse(secondBody).error,
+									next_available_at: new Date(
+										Date.now() + 80,
+									).toISOString(),
+								},
+							})
+						: JSON.stringify({
+								error: {
+									type: "model_pool_exhausted",
+									next_available_at: new Date(
+										Date.now() + 80,
+									).toISOString(),
+								},
+							});
+				res.writeHead(503, {
+					"content-type": "application/json",
+					"x-better-ccflare-pool-status": "exhausted",
+					"x-better-ccflare-recovery-scope": "model",
+				});
+				res.end(recoveryBody);
+			}),
+		);
+		const { baseUrl, guard } = await startGuard(upstreamBase, {
+			maxAttempts: 3,
+			maxRecoverySleepMs: 300,
+			retryAttemptHeadroomMs: 30,
+			totalDeadlineMs: 2_000,
+		});
+
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+		expect(response.status).toBe(503);
+		const terminal = (await response.json()) as {
+			error: { message: string };
+		};
+		expect(terminal.error.message).toBe("preserve the second terminal");
+		expect(attempts).toBe(2);
+		expect(guard.state.counters.retried).toBe(1);
+		expect(guard.state.counters.recoverySilenceBudgetExceeded).toBe(1);
+		expect(guard.state.recoveryWaits.current).toBe(0);
+	});
+
 	test("preserves an infeasible original 503 before applying a one-attempt cap", async () => {
 		let attempts = 0;
 		const body = JSON.stringify({
@@ -2212,7 +2463,7 @@ describe("source-controlled guard", () => {
 		{ name: "trusted header", headers: true, allowLegacyPoolBody: false },
 		{ name: "legacy body", headers: false, allowLegacyPoolBody: true },
 	])(
-		"immediately preserves an infeasible body recovery hint on the $name path",
+		"preserves a body-only recovery hint above the request-wide silence ceiling on the $name path",
 		async ({ headers, allowLegacyPoolBody }) => {
 			const events: Array<Record<string, unknown>> = [];
 			let attempts = 0;
@@ -2242,8 +2493,9 @@ describe("source-controlled guard", () => {
 				allowLegacyPoolBody,
 				logger: (line: string) => events.push(JSON.parse(line)),
 				maxAttempts: 3,
+				maxRecoverySleepMs: 300,
 				retryAttemptHeadroomMs: 100,
-				totalDeadlineMs: 300,
+				totalDeadlineMs: 2_000,
 			});
 
 			const startedAt = Date.now();
@@ -2261,12 +2513,13 @@ describe("source-controlled guard", () => {
 			).toMatchObject({
 				status: 503,
 				outcome: "final_error",
-				reason: "recovery_beyond_deadline",
+				reason: "recovery_silence_budget_exceeded",
 				recoverySource: "error.next_available_at",
 			});
 			expect(guard.state.counters.poolExhausted).toBe(1);
 			expect(guard.state.counters.retried).toBe(0);
 			expect(guard.state.counters.deadlineExceeded).toBe(0);
+			expect(guard.state.counters.recoverySilenceBudgetExceeded).toBe(1);
 			expect(guard.state.counters.finalError).toBe(1);
 		},
 	);

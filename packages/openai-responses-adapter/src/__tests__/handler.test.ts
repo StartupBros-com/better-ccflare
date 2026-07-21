@@ -193,6 +193,7 @@ describe("handleResponsesRequest", () => {
 							"content-type": "application/json",
 							"retry-after": "60",
 							"x-better-ccflare-pool-status": "exhausted",
+							"x-better-ccflare-recovery-scope": "pool",
 						},
 					},
 				),
@@ -206,6 +207,9 @@ describe("handleResponsesRequest", () => {
 		expect(poolResp.headers.get("retry-after")).toBe("60");
 		expect(poolResp.headers.get("x-better-ccflare-pool-status")).toBe(
 			"exhausted",
+		);
+		expect(poolResp.headers.get("x-better-ccflare-recovery-scope")).toBe(
+			"pool",
 		);
 
 		const modelResp = await handleResponsesRequest(
@@ -229,6 +233,7 @@ describe("handleResponsesRequest", () => {
 							// request-compatible model-pool recovery authoritative.
 							"retry-after": "60",
 							"x-better-ccflare-pool-status": "exhausted",
+							"x-better-ccflare-recovery-scope": "model",
 						},
 					},
 				),
@@ -243,6 +248,9 @@ describe("handleResponsesRequest", () => {
 		expect(modelResp.headers.get("x-better-ccflare-pool-status")).toBe(
 			"exhausted",
 		);
+		expect(modelResp.headers.get("x-better-ccflare-recovery-scope")).toBe(
+			"model",
+		);
 
 		for (const { code, headers: invalidHeaders } of [
 			{
@@ -250,18 +258,47 @@ describe("handleResponsesRequest", () => {
 				headers: {
 					"retry-after": "0",
 					"x-better-ccflare-pool-status": "exhausted",
+					"x-better-ccflare-recovery-scope": "model",
 				},
 			},
 			{ code: "model_pool_exhausted", headers: { "retry-after": "60" } },
 			{
 				code: "model_pool_exhausted",
-				headers: { "x-better-ccflare-pool-status": "exhausted" },
+				headers: {
+					"x-better-ccflare-pool-status": "exhausted",
+					"x-better-ccflare-recovery-scope": "model",
+				},
+			},
+			{
+				code: "model_pool_exhausted",
+				headers: {
+					"retry-after": "60",
+					"x-better-ccflare-pool-status": "exhausted",
+					"x-better-ccflare-recovery-scope": "pool",
+				},
+			},
+			{
+				code: "model_pool_exhausted",
+				headers: {
+					"retry-after": "01",
+					"x-better-ccflare-pool-status": "exhausted",
+					"x-better-ccflare-recovery-scope": "model",
+				},
+			},
+			{
+				code: "model_pool_exhausted",
+				headers: {
+					"retry-after": "9007199254741",
+					"x-better-ccflare-pool-status": "exhausted",
+					"x-better-ccflare-recovery-scope": "model",
+				},
 			},
 			{
 				code: "route_unavailable",
 				headers: {
 					"retry-after": "60",
 					"x-better-ccflare-pool-status": "exhausted",
+					"x-better-ccflare-recovery-scope": "model",
 				},
 			},
 		]) {
@@ -286,7 +323,38 @@ describe("handleResponsesRequest", () => {
 			expect(
 				invalidModelResp.headers.get("x-better-ccflare-pool-status"),
 			).toBeNull();
+			expect(
+				invalidModelResp.headers.get("x-better-ccflare-recovery-scope"),
+			).toBeNull();
 		}
+
+		const non503 = await handleResponsesRequest(
+			request(),
+			new URL("http://localhost/v1/responses"),
+			async () =>
+				new Response(
+					JSON.stringify({
+						error: {
+							type: "service_unavailable",
+							code: "model_pool_exhausted",
+							message: "not a retryable terminal",
+						},
+					}),
+					{
+						status: 429,
+						headers: {
+							"content-type": "application/json",
+							"retry-after": "60",
+							"x-better-ccflare-pool-status": "exhausted",
+							"x-better-ccflare-recovery-scope": "model",
+						},
+					},
+				),
+			{},
+		);
+		expect(non503.headers.get("retry-after")).toBeNull();
+		expect(non503.headers.get("x-better-ccflare-pool-status")).toBeNull();
+		expect(non503.headers.get("x-better-ccflare-recovery-scope")).toBeNull();
 	});
 
 	test("Test 4: streaming path → returns a text/event-stream response", async () => {
