@@ -38,6 +38,7 @@ export {
 	createModelPoolExhaustedResponse,
 	createRoutingTerminalResponse,
 	filterRequestCompatibleAccounts,
+	mergeTerminalAccountState,
 	type RoutingTerminalKind,
 	type RoutingTerminalResult,
 } from "./routing-terminal";

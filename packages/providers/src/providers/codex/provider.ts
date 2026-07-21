@@ -912,25 +912,111 @@ export class CodexProvider extends BaseProvider {
 	}
 
 	parseRateLimit(response: Response): RateLimitInfo {
-		// Parse reset time from Codex usage headers (present on all responses)
-		const parseReset = (v: string | null) =>
-			v ? Number.parseInt(v, 10) * 1000 : undefined;
+		const now = Date.now();
+		const maxVerifiedRecoveryTime = now + 8 * 24 * 60 * 60 * 1000;
+		const isPlausibleRecoveryTime = (candidate: number): boolean =>
+			Number.isSafeInteger(candidate) &&
+			candidate > now &&
+			candidate <= maxVerifiedRecoveryTime;
+		const parseEpochSeconds = (value: string | null): number | undefined => {
+			if (!value || !/^\d+$/.test(value)) return undefined;
+			const seconds = Number(value);
+			const candidate = seconds * 1000;
+			return Number.isSafeInteger(seconds) && isPlausibleRecoveryTime(candidate)
+				? candidate
+				: undefined;
+		};
+		const parseDeltaSeconds = (value: string | null): number | undefined => {
+			if (!value || !/^\d+$/.test(value)) return undefined;
+			const seconds = Number(value);
+			const candidate = now + seconds * 1000;
+			return Number.isSafeInteger(seconds) &&
+				seconds > 0 &&
+				isPlausibleRecoveryTime(candidate)
+				? candidate
+				: undefined;
+		};
+		const parseRetryAfter = (value: string | null): number | undefined => {
+			if (!value) return undefined;
+			if (/^\d+$/.test(value)) {
+				return parseDeltaSeconds(value);
+			}
+			const candidate = Date.parse(value);
+			return isPlausibleRecoveryTime(candidate) ? candidate : undefined;
+		};
+		const parseFiniteNumber = (value: string | null): number | undefined => {
+			if (!value || value.trim() === "") return undefined;
+			const parsed = Number(value);
+			return Number.isFinite(parsed) ? parsed : undefined;
+		};
+		const exhaustedWindowResets: number[] = [];
+		let hasIncompleteExhaustedWindow = false;
+		for (const prefix of ["primary", "secondary"] as const) {
+			const usedPercent = parseFiniteNumber(
+				response.headers.get(`x-codex-${prefix}-used-percent`),
+			);
+			if (usedPercent === undefined || usedPercent < 100) continue;
 
-		// Try primary/secondary headers first, then legacy x-codex-5h/7d headers
-		const resets = [
-			parseReset(response.headers.get("x-codex-primary-reset-at")),
-			parseReset(response.headers.get("x-codex-secondary-reset-at")),
-			parseReset(response.headers.get("x-codex-5h-reset-at")),
-			parseReset(response.headers.get("x-codex-7d-reset-at")),
+			const windowMinutes = parseFiniteNumber(
+				response.headers.get(`x-codex-${prefix}-window-minutes`),
+			);
+			const windowResetCandidates = [
+				parseEpochSeconds(response.headers.get(`x-codex-${prefix}-reset-at`)),
+				parseDeltaSeconds(
+					response.headers.get(`x-codex-${prefix}-reset-after-seconds`),
+				),
+			].filter((value): value is number => value !== undefined);
+			const windowReset =
+				windowResetCandidates.length > 0
+					? Math.max(...windowResetCandidates)
+					: undefined;
+			if (
+				windowMinutes === undefined ||
+				windowMinutes <= 0 ||
+				windowReset === undefined
+			) {
+				hasIncompleteExhaustedWindow = true;
+				continue;
+			}
+			exhaustedWindowResets.push(windowReset);
+		}
+
+		const retryAfterReset = parseRetryAfter(
+			response.headers.get("retry-after"),
+		);
+		const directRateLimitReset = parseEpochSeconds(
+			response.headers.get("x-ratelimit-reset"),
+		);
+		const codexUsageWindowResets = [
+			parseEpochSeconds(response.headers.get("x-codex-primary-reset-at")),
+			parseEpochSeconds(response.headers.get("x-codex-secondary-reset-at")),
+			parseEpochSeconds(response.headers.get("x-codex-5h-reset-at")),
+			parseEpochSeconds(response.headers.get("x-codex-7d-reset-at")),
 		].filter((v): v is number => v !== undefined);
 
-		// Use the sooner (smallest) reset time
-		const resetTime = resets.length > 0 ? Math.min(...resets) : undefined;
-
 		if (response.status === 429) {
+			// Codex usage-window resets are ordinary quota telemetry. They can be
+			// present while the corresponding window is not exhausted, so ignore a
+			// window reset unless its exact primary/secondary triple proves exhaustion.
+			// Without a direct rate-limit header, every exhausted window must have a
+			// complete future horizon before inferred recovery is trusted. With direct
+			// evidence, complete exhausted-window horizons may extend (never shorten)
+			// that lower bound; incomplete quota telemetry cannot invalidate it.
+			const directResets = [retryAfterReset, directRateLimitReset].filter(
+				(value): value is number => value !== undefined,
+			);
+			const resetCandidates =
+				directResets.length > 0
+					? [...directResets, ...exhaustedWindowResets]
+					: hasIncompleteExhaustedWindow
+						? []
+						: exhaustedWindowResets;
+			const resetTime =
+				resetCandidates.length > 0 ? Math.max(...resetCandidates) : undefined;
 			return {
 				isRateLimited: true,
-				resetTime: resetTime ?? Date.now() + 60 * 60 * 1000,
+				resetTime,
+				reason: resetTime === undefined ? undefined : "upstream_429_with_reset",
 			};
 		}
 
@@ -940,10 +1026,22 @@ export class CodexProvider extends BaseProvider {
 		// retries before falling back to account cooldown; forcing a synthesized
 		// resetTime would skip that retry path entirely.
 		if (response.status === 529) {
+			const resets = [
+				retryAfterReset,
+				directRateLimitReset,
+				...codexUsageWindowResets,
+			].filter((v): v is number => v !== undefined);
+			const resetTime = resets.length > 0 ? Math.min(...resets) : undefined;
 			return { isRateLimited: true, resetTime };
 		}
 
 		// Return reset time for DB tracking even on successful responses
+		const resets = [
+			retryAfterReset,
+			directRateLimitReset,
+			...codexUsageWindowResets,
+		].filter((v): v is number => v !== undefined);
+		const resetTime = resets.length > 0 ? Math.min(...resets) : undefined;
 		return { isRateLimited: false, resetTime };
 	}
 

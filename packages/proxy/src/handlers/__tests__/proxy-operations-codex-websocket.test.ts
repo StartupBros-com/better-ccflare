@@ -25,9 +25,13 @@ mock.module("@better-ccflare/database", () => ({
 }));
 
 const usageCollectorModule = await import("../../usage-collector");
+const { ForceRouteUnavailableError, selectAccountsForRequest } = await import(
+	"../account-selector"
+);
 const { proxyWithAccount } = await import("../proxy-operations");
+const { createRoutingTerminalResponse } = await import("../routing-terminal");
 
-function makeCodexAccount(): Account {
+function makeCodexAccount(overrides: Partial<Account> = {}): Account {
 	return {
 		id: "codex-ws-account",
 		name: "codex-ws-test",
@@ -62,6 +66,7 @@ function makeCodexAccount(): Account {
 		pause_reason: null,
 		refresh_token_issued_at: null,
 		consecutive_rate_limits: 0,
+		...overrides,
 	};
 }
 
@@ -111,13 +116,17 @@ function makeRequest(body: ArrayBuffer): Request {
 	});
 }
 
-function makeRequestMeta(id: string): RequestMeta {
+function makeRequestMeta(
+	id: string,
+	overrides: Partial<RequestMeta> = {},
+): RequestMeta {
 	return {
 		id,
 		method: "POST",
 		path: "/v1/messages",
 		timestamp: Date.now(),
 		headers: new Headers(),
+		...overrides,
 	};
 }
 
@@ -370,5 +379,175 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 		expect(await response?.json()).toMatchObject({
 			error: { code: "codex_websocket_post_write_error" },
 		});
+	});
+});
+
+describe("proxyWithAccount: verified Codex 429 recovery provenance", () => {
+	let originalFetch: typeof globalThis.fetch;
+
+	beforeEach(() => {
+		originalFetch = globalThis.fetch;
+	});
+
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+		mock.restore();
+	});
+
+	it("awaits a verified exhausted x-codex window reset before terminal and follow-up selection consume the cooldown", async () => {
+		const resetSeconds = Math.floor(Date.now() / 1000) + 120;
+		globalThis.fetch = mock(
+			async () =>
+				new Response(JSON.stringify({ error: { message: "rate limited" } }), {
+					status: 429,
+					headers: {
+						"content-type": "application/json",
+						"x-codex-primary-used-percent": "100",
+						"x-codex-primary-window-minutes": "300",
+						"x-codex-primary-reset-at": String(resetSeconds),
+					},
+				}),
+		);
+
+		const account = makeCodexAccount();
+		const persistedAccount = { ...account };
+		let releasePersist!: (value: number) => void;
+		let markStarted!: () => void;
+		const markStartedPromise = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		const persistPromise = new Promise<number>((resolve) => {
+			releasePersist = resolve;
+		});
+		const ctx = makeProxyContext();
+		ctx.asyncWriter = {
+			enqueue: mock((job: () => void | Promise<void>) => {
+				void job();
+			}),
+		} as never;
+		ctx.dbOps.markAccountRateLimited = mock(
+			async (_accountId: string, until: number, reason: string) => {
+				markStarted();
+				await persistPromise;
+				persistedAccount.rate_limited_until = until;
+				persistedAccount.rate_limited_reason = reason as never;
+				persistedAccount.rate_limited_at = Date.now();
+				persistedAccount.consecutive_rate_limits = 1;
+				return 1;
+			},
+		) as never;
+
+		const bodyBuffer = makeRequestBody();
+		const proxyPromise = proxyWithAccount(
+			makeRequest(bodyBuffer),
+			new URL("https://proxy.local/v1/messages"),
+			account,
+			makeRequestMeta("codex-verified-reset"),
+			bodyBuffer,
+			() => undefined,
+			0,
+			ctx,
+		);
+		await markStartedPromise;
+
+		const stateBeforePersist = await Promise.race([
+			proxyPromise.then(() => "settled" as const),
+			new Promise<"pending">((resolve) =>
+				setTimeout(() => resolve("pending"), 10),
+			),
+		]);
+		expect(stateBeforePersist).toBe("pending");
+
+		releasePersist(1);
+		expect(await proxyPromise).toBeNull();
+		expect(ctx.dbOps.markAccountRateLimited).toHaveBeenCalledWith(
+			account.id,
+			expect.any(Number),
+			"upstream_429_with_reset",
+		);
+		expect(account.rate_limited_until).toBeGreaterThan(Date.now());
+		expect(account.rate_limited_reason).toBe("upstream_429_with_reset");
+		expect(persistedAccount.rate_limited_until).toBeGreaterThan(Date.now());
+
+		const terminal = createRoutingTerminalResponse({
+			source: "attempts",
+			accounts: [account],
+			capacityContext: null,
+			rateLimitOutcomes: [],
+			upstreamAttempts: 1,
+		});
+		expect(terminal.kind).toBe("pool_exhausted");
+		expect(terminal.response.headers.get("retry-after")).not.toBeNull();
+		expect(terminal.response.headers.get("x-better-ccflare-pool-status")).toBe(
+			"exhausted",
+		);
+		expect(
+			terminal.response.headers.get("x-better-ccflare-recovery-scope"),
+		).toBe("pool");
+
+		const followUpCtx = makeProxyContext();
+		followUpCtx.dbOps.getAllAccounts = mock(async () => [
+			persistedAccount,
+		]) as never;
+		const followUpMeta = makeRequestMeta("codex-immediate-follow-up", {
+			headers: new Headers({
+				"x-better-ccflare-account-id": persistedAccount.id,
+			}),
+		});
+		await expect(
+			selectAccountsForRequest(followUpMeta, followUpCtx),
+		).rejects.toBeInstanceOf(ForceRouteUnavailableError);
+	});
+
+	it("keeps a reset-less Codex 429 unverified and non-retryable", async () => {
+		globalThis.fetch = mock(
+			async () =>
+				new Response(JSON.stringify({ error: { message: "rate limited" } }), {
+					status: 429,
+					headers: { "content-type": "application/json" },
+				}),
+		);
+		const ctx = makeProxyContext();
+		const persistedAccount = makeCodexAccount();
+		ctx.asyncWriter = {
+			enqueue: mock(async (job: () => void | Promise<void>) => {
+				await job();
+			}),
+		} as never;
+		ctx.dbOps.markAccountRateLimited = mock(
+			async (_accountId: string, until: number, reason: string) => {
+				persistedAccount.rate_limited_until = until;
+				persistedAccount.rate_limited_reason = reason as never;
+				return 1;
+			},
+		) as never;
+		const bodyBuffer = makeRequestBody();
+
+		expect(
+			await proxyWithAccount(
+				makeRequest(bodyBuffer),
+				new URL("https://proxy.local/v1/messages"),
+				persistedAccount,
+				makeRequestMeta("codex-resetless"),
+				bodyBuffer,
+				() => undefined,
+				0,
+				ctx,
+			),
+		).toBeNull();
+		expect(persistedAccount.rate_limited_reason).toBe("model_fallback_429");
+
+		const terminal = createRoutingTerminalResponse({
+			source: "attempts",
+			accounts: [persistedAccount],
+			capacityContext: null,
+			rateLimitOutcomes: [],
+			upstreamAttempts: 1,
+		});
+		expect(terminal.kind).toBe("route_unavailable");
+		expect(terminal.response.headers.get("retry-after")).toBeNull();
+		expect(
+			terminal.response.headers.get("x-better-ccflare-pool-status"),
+		).toBeNull();
 	});
 });

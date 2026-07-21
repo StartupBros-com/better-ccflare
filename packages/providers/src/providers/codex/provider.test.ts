@@ -683,14 +683,353 @@ describe("CodexProvider.parseRateLimit", () => {
 		expect(info.resetTime).toBe(primaryResetSeconds * 1000);
 	});
 
-	it("still treats 429 with no reset headers as rate limited with a synthesized resetTime", () => {
+	it("keeps a 429 without an upstream reset unverified", () => {
 		const provider = new CodexProvider();
 		const response = new Response(null, { status: 429 });
 
 		const info = provider.parseRateLimit(response);
 
 		expect(info.isRateLimited).toBeTrue();
-		expect(info.resetTime).toBeGreaterThan(Date.now());
+		expect(info.resetTime).toBeUndefined();
+		expect(info.reason).toBeUndefined();
+	});
+
+	it("does not treat a non-exhausted Codex usage-window reset as verified 429 provenance", () => {
+		const provider = new CodexProvider();
+		const resetSeconds = Math.floor(Date.now() / 1000) + 120;
+		const response = new Response(null, {
+			status: 429,
+			headers: {
+				"x-codex-primary-used-percent": "42",
+				"x-codex-primary-window-minutes": "300",
+				"x-codex-primary-reset-at": String(resetSeconds),
+			},
+		});
+
+		const info = provider.parseRateLimit(response);
+
+		expect(info).toEqual({
+			isRateLimited: true,
+			resetTime: undefined,
+			reason: undefined,
+		});
+	});
+
+	it("does not infer recovery from conflicting Codex usage windows", () => {
+		const provider = new CodexProvider();
+		const earlierSiblingReset = Math.floor(Date.now() / 1000) + 30;
+		const exhaustedWindowReset = Math.floor(Date.now() / 1000) + 180;
+		const response = new Response(null, {
+			status: 429,
+			headers: {
+				"x-codex-primary-used-percent": "100",
+				"x-codex-primary-reset-at": String(exhaustedWindowReset),
+				"x-codex-secondary-used-percent": "42",
+				"x-codex-secondary-reset-at": String(earlierSiblingReset),
+			},
+		});
+
+		expect(provider.parseRateLimit(response)).toEqual({
+			isRateLimited: true,
+			resetTime: undefined,
+			reason: undefined,
+		});
+	});
+
+	it("uses only the reset paired with an exhausted Codex usage window", () => {
+		const provider = new CodexProvider();
+		const earlierNonExhaustedReset = Math.floor(Date.now() / 1000) + 30;
+		const exhaustedWindowReset = Math.floor(Date.now() / 1000) + 180;
+		const response = new Response(null, {
+			status: 429,
+			headers: {
+				"x-codex-primary-used-percent": "100",
+				"x-codex-primary-window-minutes": "300",
+				"x-codex-primary-reset-at": String(exhaustedWindowReset),
+				"x-codex-secondary-used-percent": "42",
+				"x-codex-secondary-window-minutes": "10080",
+				"x-codex-secondary-reset-at": String(earlierNonExhaustedReset),
+			},
+		});
+
+		expect(provider.parseRateLimit(response)).toEqual({
+			isRateLimited: true,
+			resetTime: exhaustedWindowReset * 1000,
+			reason: "upstream_429_with_reset",
+		});
+	});
+
+	it("uses the latest reset when multiple Codex usage windows are exhausted", () => {
+		const provider = new CodexProvider();
+		const primaryReset = Math.floor(Date.now() / 1000) + 60;
+		const secondaryReset = Math.floor(Date.now() / 1000) + 180;
+		const response = new Response(null, {
+			status: 429,
+			headers: {
+				"x-codex-primary-used-percent": "100",
+				"x-codex-primary-window-minutes": "300",
+				"x-codex-primary-reset-at": String(primaryReset),
+				"x-codex-secondary-used-percent": "101",
+				"x-codex-secondary-window-minutes": "10080",
+				"x-codex-secondary-reset-at": String(secondaryReset),
+			},
+		});
+
+		expect(provider.parseRateLimit(response)).toEqual({
+			isRateLimited: true,
+			resetTime: secondaryReset * 1000,
+			reason: "upstream_429_with_reset",
+		});
+	});
+
+	it("accepts a relative reset paired with an exhausted Codex usage window", () => {
+		const provider = new CodexProvider();
+		const before = Date.now();
+		const response = new Response(null, {
+			status: 429,
+			headers: {
+				"x-codex-primary-used-percent": "100",
+				"x-codex-primary-window-minutes": "300",
+				"x-codex-primary-reset-after-seconds": "3600",
+			},
+		});
+
+		const info = provider.parseRateLimit(response);
+
+		expect(info.reason).toBe("upstream_429_with_reset");
+		expect(info.resetTime).toBeGreaterThanOrEqual(before + 3_600_000);
+		expect(info.resetTime).toBeLessThan(before + 3_601_000);
+	});
+
+	it("keeps inferred recovery unverified when any exhausted Codex window lacks a valid reset", () => {
+		const provider = new CodexProvider();
+		const primaryReset = Math.floor(Date.now() / 1000) + 60;
+		const response = new Response(null, {
+			status: 429,
+			headers: {
+				"x-codex-primary-used-percent": "100",
+				"x-codex-primary-window-minutes": "300",
+				"x-codex-primary-reset-at": String(primaryReset),
+				"x-codex-secondary-used-percent": "100",
+				"x-codex-secondary-window-minutes": "10080",
+			},
+		});
+
+		expect(provider.parseRateLimit(response)).toEqual({
+			isRateLimited: true,
+			resetTime: undefined,
+			reason: undefined,
+		});
+	});
+
+	it("does not infer verified 429 recovery from legacy Codex reset aliases", () => {
+		const provider = new CodexProvider();
+		const response = new Response(null, {
+			status: 429,
+			headers: {
+				"x-codex-5h-reset-at": String(Math.floor(Date.now() / 1000) + 60),
+				"x-codex-7d-reset-at": String(Math.floor(Date.now() / 1000) + 180),
+			},
+		});
+
+		expect(provider.parseRateLimit(response)).toEqual({
+			isRateLimited: true,
+			resetTime: undefined,
+			reason: undefined,
+		});
+	});
+
+	it("accepts direct standard 429 recovery headers with verified provenance", () => {
+		const provider = new CodexProvider();
+		const before = Date.now();
+		const retryAfter = provider.parseRateLimit(
+			new Response(null, {
+				status: 429,
+				headers: { "retry-after": "120" },
+			}),
+		);
+		const resetSeconds = Math.floor(before / 1000) + 180;
+		const resetHeader = provider.parseRateLimit(
+			new Response(null, {
+				status: 429,
+				headers: { "x-ratelimit-reset": String(resetSeconds) },
+			}),
+		);
+
+		expect(retryAfter.reason).toBe("upstream_429_with_reset");
+		expect(retryAfter.resetTime).toBeGreaterThanOrEqual(before + 120_000);
+		expect(resetHeader).toMatchObject({
+			resetTime: resetSeconds * 1000,
+			reason: "upstream_429_with_reset",
+		});
+	});
+
+	it("keeps Retry-After as a lower bound when earlier reset metadata conflicts", () => {
+		const provider = new CodexProvider();
+		const before = Date.now();
+		const response = new Response(null, {
+			status: 429,
+			headers: {
+				"retry-after": "120",
+				"x-ratelimit-reset": String(Math.floor(before / 1000) + 60),
+				"x-codex-primary-used-percent": "42",
+				"x-codex-primary-reset-at": String(Math.floor(before / 1000) + 30),
+			},
+		});
+
+		const info = provider.parseRateLimit(response);
+
+		expect(info.reason).toBe("upstream_429_with_reset");
+		expect(info.resetTime).toBeGreaterThanOrEqual(before + 120_000);
+		expect(info.resetTime).toBeLessThan(before + 121_000);
+	});
+
+	it("uses a valid direct recovery hint when its sibling is invalid", () => {
+		const provider = new CodexProvider();
+		const resetSeconds = Math.floor(Date.now() / 1000) + 180;
+		const response = new Response(null, {
+			status: 429,
+			headers: {
+				"retry-after": String(Number.MAX_SAFE_INTEGER),
+				"x-ratelimit-reset": String(resetSeconds),
+			},
+		});
+
+		expect(provider.parseRateLimit(response)).toEqual({
+			isRateLimited: true,
+			resetTime: resetSeconds * 1000,
+			reason: "upstream_429_with_reset",
+		});
+	});
+
+	it("keeps valid direct recovery when exhausted-window telemetry is incomplete", () => {
+		const provider = new CodexProvider();
+		const before = Date.now();
+		const response = new Response(null, {
+			status: 429,
+			headers: {
+				"retry-after": "120",
+				"x-codex-primary-used-percent": "100",
+				"x-codex-primary-window-minutes": "300",
+			},
+		});
+
+		const info = provider.parseRateLimit(response);
+
+		expect(info.reason).toBe("upstream_429_with_reset");
+		expect(info.resetTime).toBeGreaterThanOrEqual(before + 120_000);
+		expect(info.resetTime).toBeLessThan(before + 121_000);
+	});
+
+	it("lets a verified exhausted-window horizon extend direct Retry-After", () => {
+		const provider = new CodexProvider();
+		const before = Date.now();
+		const exhaustedReset = Math.floor(before / 1000) + 3600;
+		const response = new Response(null, {
+			status: 429,
+			headers: {
+				"retry-after": "120",
+				"x-codex-primary-used-percent": "100",
+				"x-codex-primary-window-minutes": "300",
+				"x-codex-primary-reset-at": String(exhaustedReset),
+				"x-codex-secondary-used-percent": "82",
+				"x-codex-secondary-window-minutes": "10080",
+				"x-codex-secondary-reset-at": String(
+					Math.floor(before / 1000) + 6 * 24 * 60 * 60,
+				),
+			},
+		});
+
+		expect(provider.parseRateLimit(response)).toEqual({
+			isRateLimited: true,
+			resetTime: exhaustedReset * 1000,
+			reason: "upstream_429_with_reset",
+		});
+	});
+
+	it.each([
+		"retry-after",
+		"x-ratelimit-reset",
+	])("rejects an overflowing %s recovery value", (header) => {
+		const provider = new CodexProvider();
+		const response = new Response(null, {
+			status: 429,
+			headers: { [header]: String(Number.MAX_SAFE_INTEGER) },
+		});
+
+		expect(provider.parseRateLimit(response)).toEqual({
+			isRateLimited: true,
+			resetTime: undefined,
+			reason: undefined,
+		});
+	});
+
+	it.each([
+		[
+			"retry-after",
+			String(8 * 24 * 60 * 60 + 60),
+			{} as Record<string, string>,
+		],
+		[
+			"x-ratelimit-reset",
+			String(Math.floor(Date.now() / 1000) + 8 * 24 * 60 * 60 + 60),
+			{} as Record<string, string>,
+		],
+		[
+			"x-codex-primary-reset-at",
+			String(Math.floor(Date.now() / 1000) + 8 * 24 * 60 * 60 + 60),
+			{
+				"x-codex-primary-used-percent": "100",
+				"x-codex-primary-window-minutes": "300",
+			},
+		],
+	])("rejects an out-of-horizon %s recovery value", (header, value, paired) => {
+		const provider = new CodexProvider();
+		const response = new Response(null, {
+			status: 429,
+			headers: { ...paired, [header]: value },
+		});
+
+		expect(provider.parseRateLimit(response)).toEqual({
+			isRateLimited: true,
+			resetTime: undefined,
+			reason: undefined,
+		});
+	});
+
+	it.each([
+		["malformed", "not-a-timestamp"],
+		["non-finite", "1e309"],
+		["past", String(Math.floor(Date.now() / 1000) - 60)],
+	])("does not trust a %s canonical Codex reset", (_label, resetAt) => {
+		const provider = new CodexProvider();
+		const response = new Response(null, {
+			status: 429,
+			headers: { "x-codex-primary-reset-at": resetAt },
+		});
+
+		const info = provider.parseRateLimit(response);
+
+		expect(info.isRateLimited).toBeTrue();
+		expect(info.resetTime).toBeUndefined();
+		expect(info.reason).toBeUndefined();
+	});
+
+	it("does not treat unrelated Codex window metadata as reset provenance", () => {
+		const provider = new CodexProvider();
+		const response = new Response(null, {
+			status: 429,
+			headers: {
+				"x-codex-primary-window-minutes": "300",
+				"x-codex-primary-used-percent": "100",
+			},
+		});
+
+		expect(provider.parseRateLimit(response)).toEqual({
+			isRateLimited: true,
+			resetTime: undefined,
+			reason: undefined,
+		});
 	});
 
 	it("does not treat a plain 200 as rate limited even with reset headers present", () => {

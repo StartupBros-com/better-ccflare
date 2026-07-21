@@ -136,6 +136,7 @@ function applyRateLimitCooldownInMemory(
 	// In-memory update so the rest of this request sees consistent state.
 	account.rate_limited_until = cooldownUntil;
 	account.rate_limited_at = now;
+	account.rate_limited_reason = reason;
 	account.consecutive_rate_limits = nextCount;
 	const wasRecoveryProbe = probeLeases.has(account.id);
 	completeRateLimitProbe(account, "cooldown_reapplied");

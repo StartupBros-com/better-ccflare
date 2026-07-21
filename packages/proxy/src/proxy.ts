@@ -55,6 +55,7 @@ import {
 	interceptAndModifyRequest,
 	isRefreshTokenLikelyExpired,
 	type ModelFallbackExecutionPolicy,
+	mergeTerminalAccountState,
 	type ProxyContext,
 	prepareRequestBody,
 	proxyUnauthenticated,
@@ -1501,9 +1502,13 @@ async function handleProxyCore(
 
 	let terminalAccounts = allAttemptedAccounts;
 	try {
-		terminalAccounts = filterRequestCompatibleAccounts(
+		const refreshedTerminalAccounts = filterRequestCompatibleAccounts(
 			await ctx.dbOps.getAllAccounts(),
 			req.headers,
+		);
+		terminalAccounts = mergeTerminalAccountState(
+			refreshedTerminalAccounts,
+			allAttemptedAccounts,
 		);
 	} catch (error) {
 		log.error("Failed to refresh terminal account state", error);

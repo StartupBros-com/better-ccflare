@@ -487,6 +487,75 @@ export function createRoutingTerminalResponse(
 	};
 }
 
+function finiteAccountTimestamp(
+	value: number | null | undefined,
+): number | null {
+	return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+/**
+ * Merge request-local cooldown observations into a successfully refreshed
+ * terminal inventory without replacing the refreshed rows wholesale.
+ *
+ * A bounded/rejected cooldown write can leave the DB row older than the
+ * account object mutated by the current request. In that case the local
+ * observation is required for an accurate terminal response. The DB row still
+ * supplies every unrelated field, and it wins outright when its
+ * `rate_limited_at` is equal or newer. When the local observation is newer, its
+ * deadline and reason remain an atomic observation: an older, longer DB
+ * deadline with a null or lane-scoped reason must not erase verified recovery
+ * provenance. Deleted or request-incompatible refreshed rows are never
+ * resurrected.
+ */
+export function mergeTerminalAccountState(
+	refreshedAccounts: readonly Account[],
+	requestLocalAccounts: readonly Account[],
+): Account[] {
+	const localById = new Map<string, Account>();
+	for (const account of requestLocalAccounts) {
+		const candidateAt = finiteAccountTimestamp(account.rate_limited_at);
+		if (candidateAt === null) continue;
+		const existing = localById.get(account.id);
+		const existingAt = finiteAccountTimestamp(existing?.rate_limited_at);
+		if (
+			existingAt === null ||
+			candidateAt > existingAt ||
+			(candidateAt === existingAt &&
+				(account.rate_limited_until ?? -Infinity) >
+					(existing?.rate_limited_until ?? -Infinity))
+		) {
+			localById.set(account.id, account);
+		}
+	}
+
+	return refreshedAccounts.map((refreshed) => {
+		const local = localById.get(refreshed.id);
+		if (!local) return refreshed;
+		const localAt = finiteAccountTimestamp(local.rate_limited_at);
+		const localUntil = finiteAccountTimestamp(local.rate_limited_until);
+		const refreshedAt = finiteAccountTimestamp(refreshed.rate_limited_at);
+		if (
+			localAt === null ||
+			localUntil === null ||
+			local.rate_limited_reason == null ||
+			(refreshedAt !== null && refreshedAt >= localAt)
+		) {
+			return refreshed;
+		}
+
+		return {
+			...refreshed,
+			rate_limited_at: localAt,
+			rate_limited_until: localUntil,
+			rate_limited_reason: local.rate_limited_reason,
+			consecutive_rate_limits: Math.max(
+				refreshed.consecutive_rate_limits,
+				local.consecutive_rate_limits,
+			),
+		};
+	});
+}
+
 /** Mirror selector request exclusions while retaining dynamic cross-provider routing. */
 export function filterRequestCompatibleAccounts(
 	accounts: readonly Account[],
