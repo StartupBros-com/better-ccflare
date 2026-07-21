@@ -28,6 +28,13 @@ export interface TraceRecord {
 	cache_key_cohort_id?: string | null;
 	conversation_id?: string | null;
 	cache_key_assignment_source?: "canary" | "explicit_session_override" | null;
+	pacing_canary?: string | null;
+	pacing_cohort_id?: string | null;
+	pacing_action?: string | null;
+	/** Additive schema reserved for the explicit cache-breakpoint canary. */
+	explicit_breakpoint_canary?: string | null;
+	explicit_breakpoint_cohort_id?: string | null;
+	explicit_breakpoint_action?: string | null;
 	input_item_count?: number;
 	input_item_total_count?: number;
 	input_item_fingerprints?: InputFingerprint[];
@@ -223,6 +230,88 @@ export interface TraceReport {
 			count: number;
 		}>;
 	};
+}
+
+export type CacheExperimentArm =
+	| "treatment"
+	| "control"
+	| "ineligible"
+	| "unassigned";
+export type CacheExperimentTurn =
+	| "first_observed"
+	| "follow_up_observed"
+	| "unknown";
+export type CacheExperimentGapBand =
+	| "under_1m"
+	| "from_1m_to_5m"
+	| "from_5m_to_15m"
+	| "from_15m_to_60m"
+	| "at_least_60m"
+	| "unknown";
+
+export interface CacheExperimentRow {
+	arm: CacheExperimentArm;
+	model: string;
+	turn: CacheExperimentTurn;
+	gapBand: CacheExperimentGapBand;
+	observedCodexAttempts: number;
+	joinedObservedCodexResponses: number;
+	unjoinedObservedCodexAttempts: number;
+	cache: {
+		measuredResponses: number;
+		unavailableResponses: number;
+		overflowResponses: number;
+		inputTokens: number;
+		cachedReadTokens: number;
+		weightedCachedReadPct: number | null;
+		cacheWriteMeasuredResponses: number;
+		cacheWriteUnavailableResponses: number;
+		cacheWriteOverflowResponses: number;
+		cacheWriteTokens: number;
+		positiveHitResponses: number;
+		positiveHitRatePct: number | null;
+	};
+	elapsed: {
+		availableResponses: number;
+		unavailableResponses: number;
+		p50Ms: number | null;
+		p95Ms: number | null;
+	};
+	outcomes: {
+		observedCodex400Responses: number;
+		observedCodexErrorResponses: number;
+		finalObservedCodexAttemptFallbacks: number;
+		observedCodexFallbackAttempts: number;
+	};
+	pacing: {
+		pacedRequests: number;
+		bypassedRequests: number;
+		crossoverPacedRequests: number;
+		unknownRequests: number;
+		waitMsAvailableRequests: number;
+		waitMsUnavailableRequests: number;
+	};
+	/** Whitelisted action buckets only; unknown values are never echoed. */
+	actions: Record<string, number>;
+}
+
+export interface CacheExperimentDimensionReport {
+	assignmentCounts: Record<CacheExperimentArm, number>;
+	rows: CacheExperimentRow[];
+}
+
+export interface CodexCacheExperimentReport {
+	schemaVersion: 1;
+	attribution: {
+		unit: "final_observed_codex_attempt";
+		responseScope: "codex_trace_only_no_cross_provider_terminal_visibility";
+		elapsed: "observed_codex_response_ts_minus_observed_codex_attempt_request_ts";
+		gap: "prior_observed_codex_request_ts_in_same_trace_and_valid_cohort";
+		pacingWaitMs: "unavailable";
+		pacingWaitReason: "trace_has_action_but_no_wait_duration";
+	};
+	pacing: CacheExperimentDimensionReport;
+	explicitBreakpoint: CacheExperimentDimensionReport;
 }
 
 function keyOf(call: ToolCall): string {
@@ -753,6 +842,597 @@ function analyzeRequestTransitions(requests: TraceRecord[]) {
 		}
 	}
 	return { prefixTransitions, instructionStability, toolStability };
+}
+
+const SAFE_COHORT = /^[a-fA-F0-9]{16}$/;
+const FALLBACK_CAUSES = new Set(["model_fallback", "account_failover"]);
+const PACING_ACTIONS = new Set(["paced", "bypassed", "crossover-paced"]);
+const OFFICIAL_CODEX_MODEL_FAMILIES: ReadonlyArray<readonly [RegExp, string]> =
+	[
+		[/^gpt-5\.6-sol(?:-\d{4}-\d{2}-\d{2})?$/, "gpt-5.6-sol"],
+		[/^gpt-5\.5(?:-\d{4}-\d{2}-\d{2})?$/, "gpt-5.5"],
+		[/^gpt-5\.4-mini(?:-\d{4}-\d{2}-\d{2})?$/, "gpt-5.4-mini"],
+		[/^gpt-5\.4(?:-\d{4}-\d{2}-\d{2})?$/, "gpt-5.4"],
+		[/^gpt-5\.3-codex(?:-\d{4}-\d{2}-\d{2})?$/, "gpt-5.3-codex"],
+	];
+const EXPLICIT_BREAKPOINT_ACTIONS = new Set([
+	"placed_source_marker",
+	"placed_first_user_text",
+	"skip_percent_control",
+	"skip_env_disabled",
+	"skip_non_gpt56",
+	"skip_non_eligible_endpoint",
+	"skip_no_prompt_cache_key",
+	"skip_no_conversation",
+	"skip_known_unsupported",
+	"skip_no_eligible_block",
+	"skip_rotated_cache_key_attempt",
+]);
+
+interface CacheExperimentLogicalSample {
+	request: TraceRecord;
+	attempts: TraceRecord[];
+	response?: TraceRecord;
+	logicalTimestamp: number | null;
+}
+
+interface CacheExperimentAnnotatedSample extends CacheExperimentLogicalSample {
+	arm: CacheExperimentArm;
+	model: string;
+	turn: CacheExperimentTurn;
+	gapBand: CacheExperimentGapBand;
+	action: string;
+}
+
+interface CacheExperimentRowAccumulator extends CacheExperimentRow {
+	elapsedSamples: number[];
+}
+
+type CacheExperimentKind = "pacing" | "explicitBreakpoint";
+
+function appendRecord(
+	map: Map<string, TraceRecord[]>,
+	id: string,
+	record: TraceRecord,
+): void {
+	const records = map.get(id) ?? [];
+	records.push(record);
+	map.set(id, records);
+}
+
+function matchingLogicalRequestIds(
+	request: TraceRecord,
+	response: TraceRecord,
+): boolean {
+	return !(
+		request.request_id &&
+		response.request_id &&
+		request.request_id !== response.request_id
+	);
+}
+
+/**
+ * Retain the last Codex attempt observed per request ID in this trace slice.
+ * The trace cannot reveal a later cross-provider attempt or terminal. IDs are
+ * used only as ephemeral join keys and never copied into the report.
+ */
+function cacheExperimentLogicalSamples(
+	records: readonly TraceRecord[],
+): CacheExperimentLogicalSample[] {
+	const requestRecords = records.filter(
+		(record) => (record.phase ?? "request") === "request",
+	);
+	const responseRecords = records.filter(
+		(record) => record.phase === "response",
+	);
+	const requestsByAttempt = new Map<string, TraceRecord[]>();
+	const responsesByAttempt = new Map<string, TraceRecord[]>();
+	const legacyRequestsByLogical = new Map<string, TraceRecord[]>();
+	const legacyResponsesByLogical = new Map<string, TraceRecord[]>();
+	for (const request of requestRecords) {
+		if (request.attempt_id)
+			appendRecord(requestsByAttempt, request.attempt_id, request);
+		else if (request.request_id && isLegacyJoinEligible(request))
+			appendRecord(legacyRequestsByLogical, request.request_id, request);
+	}
+	for (const response of responseRecords) {
+		if (response.attempt_id)
+			appendRecord(responsesByAttempt, response.attempt_id, response);
+		else if (response.request_id && isLegacyJoinEligible(response))
+			appendRecord(legacyResponsesByLogical, response.request_id, response);
+	}
+
+	const logicalRequests = new Map<string, TraceRecord[]>();
+	let anonymous = 0;
+	for (const request of requestRecords) {
+		const key = request.request_id
+			? `logical:${request.request_id}`
+			: request.attempt_id
+				? `attempt:${request.attempt_id}`
+				: `anonymous:${anonymous++}`;
+		appendRecord(logicalRequests, key, request);
+	}
+
+	const timestampOf = (record: TraceRecord): number | null => {
+		if (!record.ts) return null;
+		const parsed = Date.parse(record.ts);
+		return Number.isFinite(parsed) ? parsed : null;
+	};
+	const samples: CacheExperimentLogicalSample[] = [];
+	for (const attempts of logicalRequests.values()) {
+		const ordered = [...attempts].sort(
+			(a, b) =>
+				(a.attempt_ordinal ?? 0) - (b.attempt_ordinal ?? 0) ||
+				(timestampOf(a) ?? Number.POSITIVE_INFINITY) -
+					(timestampOf(b) ?? Number.POSITIVE_INFINITY),
+		);
+		const request = ordered.at(-1);
+		if (!request) continue;
+		let response: TraceRecord | undefined;
+		if (request.attempt_id) {
+			const joinedRequests = requestsByAttempt.get(request.attempt_id) ?? [];
+			const joinedResponses = responsesByAttempt.get(request.attempt_id) ?? [];
+			if (
+				joinedRequests.length === 1 &&
+				joinedResponses.length === 1 &&
+				joinedResponses[0] &&
+				matchingLogicalRequestIds(request, joinedResponses[0])
+			)
+				response = joinedResponses[0];
+		} else if (request.request_id && isLegacyJoinEligible(request)) {
+			const joinedRequests =
+				legacyRequestsByLogical.get(request.request_id) ?? [];
+			const joinedResponses =
+				legacyResponsesByLogical.get(request.request_id) ?? [];
+			if (
+				joinedRequests.length === 1 &&
+				joinedResponses.length === 1 &&
+				joinedResponses[0] &&
+				matchingLogicalRequestIds(request, joinedResponses[0])
+			)
+				response = joinedResponses[0];
+		}
+		const validAttemptTimes = ordered
+			.map(timestampOf)
+			.filter((value): value is number => value !== null);
+		const logicalTimestamp = validAttemptTimes.reduce<number | null>(
+			(earliest, timestamp) =>
+				earliest === null || timestamp < earliest ? timestamp : earliest,
+			null,
+		);
+		samples.push({
+			request,
+			attempts: ordered,
+			response,
+			logicalTimestamp,
+		});
+	}
+	return samples;
+}
+
+function experimentField(
+	request: TraceRecord,
+	kind: CacheExperimentKind,
+): string | null | undefined {
+	return kind === "pacing"
+		? request.pacing_canary
+		: request.explicit_breakpoint_canary;
+}
+
+function experimentCohort(
+	request: TraceRecord,
+	kind: CacheExperimentKind,
+): string | null {
+	const cohort =
+		kind === "pacing"
+			? request.pacing_cohort_id
+			: request.explicit_breakpoint_cohort_id;
+	return typeof cohort === "string" && SAFE_COHORT.test(cohort)
+		? cohort.toLowerCase()
+		: null;
+}
+
+function experimentArm(
+	value: string | null | undefined,
+	kind: CacheExperimentKind,
+): CacheExperimentArm {
+	if (kind === "pacing") {
+		if (value === "bypass") return "treatment";
+		if (value === "control") return "control";
+		return "unassigned";
+	}
+	if (value === "treatment" || value === "control" || value === "ineligible")
+		return value;
+	return "unassigned";
+}
+
+function safeModel(request: TraceRecord): string {
+	const model = request.model_out ?? request.model_in;
+	if (typeof model !== "string" || model.length === 0) return "unknown";
+	for (const [pattern, family] of OFFICIAL_CODEX_MODEL_FAMILIES)
+		if (pattern.test(model)) return family;
+	return "other_or_custom";
+}
+
+function experimentAction(
+	request: TraceRecord,
+	kind: CacheExperimentKind,
+): string {
+	const action =
+		kind === "pacing"
+			? request.pacing_action
+			: request.explicit_breakpoint_action;
+	if (action === null || action === undefined || action === "")
+		return "unavailable";
+	const allowlist =
+		kind === "pacing" ? PACING_ACTIONS : EXPLICIT_BREAKPOINT_ACTIONS;
+	return allowlist.has(action) ? action : "unknown";
+}
+
+function gapBand(gapMs: number): CacheExperimentGapBand {
+	if (gapMs < 60_000) return "under_1m";
+	if (gapMs < 5 * 60_000) return "from_1m_to_5m";
+	if (gapMs < 15 * 60_000) return "from_5m_to_15m";
+	if (gapMs < 60 * 60_000) return "from_15m_to_60m";
+	return "at_least_60m";
+}
+
+function annotateExperimentSamples(
+	samples: readonly CacheExperimentLogicalSample[],
+	kind: CacheExperimentKind,
+): CacheExperimentAnnotatedSample[] {
+	const included = samples.filter((sample) => {
+		const assignment = experimentField(sample.request, kind);
+		return typeof assignment === "string" && assignment.length > 0;
+	});
+	const turnBySample = new Map<
+		CacheExperimentLogicalSample,
+		{ turn: CacheExperimentTurn; gapBand: CacheExperimentGapBand }
+	>();
+	const samplesByCohort = new Map<string, CacheExperimentLogicalSample[]>();
+	for (const sample of included) {
+		const cohort = experimentCohort(sample.request, kind);
+		if (!cohort || sample.logicalTimestamp === null) {
+			turnBySample.set(sample, { turn: "unknown", gapBand: "unknown" });
+			continue;
+		}
+		const group = samplesByCohort.get(cohort) ?? [];
+		group.push(sample);
+		samplesByCohort.set(cohort, group);
+	}
+	for (const group of samplesByCohort.values()) {
+		group.sort((a, b) => (a.logicalTimestamp ?? 0) - (b.logicalTimestamp ?? 0));
+		group.forEach((sample, index) => {
+			if (index === 0) {
+				turnBySample.set(sample, {
+					turn: "first_observed",
+					gapBand: "unknown",
+				});
+				return;
+			}
+			const previous = group[index - 1];
+			const currentTs = sample.logicalTimestamp;
+			const previousTs = previous?.logicalTimestamp;
+			if (
+				currentTs === null ||
+				previousTs === null ||
+				previousTs === undefined ||
+				currentTs < previousTs
+			) {
+				turnBySample.set(sample, {
+					turn: "follow_up_observed",
+					gapBand: "unknown",
+				});
+				return;
+			}
+			const observedGapMs = currentTs - previousTs;
+			turnBySample.set(sample, {
+				turn: "follow_up_observed",
+				gapBand: Number.isSafeInteger(observedGapMs)
+					? gapBand(observedGapMs)
+					: "unknown",
+			});
+		});
+	}
+	return included.map((sample) => ({
+		...sample,
+		arm: experimentArm(experimentField(sample.request, kind), kind),
+		model: safeModel(sample.request),
+		...(turnBySample.get(sample) ?? {
+			turn: "unknown" as const,
+			gapBand: "unknown" as const,
+		}),
+		action: experimentAction(sample.request, kind),
+	}));
+}
+
+function cacheExperimentRowAccumulator(
+	sample: CacheExperimentAnnotatedSample,
+): CacheExperimentRowAccumulator {
+	return {
+		arm: sample.arm,
+		model: sample.model,
+		turn: sample.turn,
+		gapBand: sample.gapBand,
+		observedCodexAttempts: 0,
+		joinedObservedCodexResponses: 0,
+		unjoinedObservedCodexAttempts: 0,
+		cache: {
+			measuredResponses: 0,
+			unavailableResponses: 0,
+			overflowResponses: 0,
+			inputTokens: 0,
+			cachedReadTokens: 0,
+			weightedCachedReadPct: null,
+			cacheWriteMeasuredResponses: 0,
+			cacheWriteUnavailableResponses: 0,
+			cacheWriteOverflowResponses: 0,
+			cacheWriteTokens: 0,
+			positiveHitResponses: 0,
+			positiveHitRatePct: null,
+		},
+		elapsed: {
+			availableResponses: 0,
+			unavailableResponses: 0,
+			p50Ms: null,
+			p95Ms: null,
+		},
+		outcomes: {
+			observedCodex400Responses: 0,
+			observedCodexErrorResponses: 0,
+			finalObservedCodexAttemptFallbacks: 0,
+			observedCodexFallbackAttempts: 0,
+		},
+		pacing: {
+			pacedRequests: 0,
+			bypassedRequests: 0,
+			crossoverPacedRequests: 0,
+			unknownRequests: 0,
+			waitMsAvailableRequests: 0,
+			waitMsUnavailableRequests: 0,
+		},
+		actions: {},
+		elapsedSamples: [],
+	};
+}
+
+function safeTokenCount(value: unknown): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function safeTokenSum(current: number, increment: number): number | null {
+	if (increment > Number.MAX_SAFE_INTEGER - current) return null;
+	return current + increment;
+}
+
+function percentile(
+	values: readonly number[],
+	quantile: number,
+): number | null {
+	if (values.length === 0) return null;
+	const sorted = [...values].sort((a, b) => a - b);
+	const index = Math.max(0, Math.ceil(quantile * sorted.length) - 1);
+	return sorted[index] ?? null;
+}
+
+function incrementPacingAction(
+	row: CacheExperimentRowAccumulator,
+	action: string | null | undefined,
+): void {
+	if (action === "paced") {
+		row.pacing.pacedRequests++;
+		row.pacing.waitMsUnavailableRequests++;
+	} else if (action === "bypassed") {
+		row.pacing.bypassedRequests++;
+	} else if (action === "crossover-paced") {
+		row.pacing.crossoverPacedRequests++;
+		row.pacing.waitMsUnavailableRequests++;
+	} else {
+		row.pacing.unknownRequests++;
+	}
+}
+
+function finishCacheExperimentRow(
+	row: CacheExperimentRowAccumulator,
+): CacheExperimentRow {
+	const actions = Object.fromEntries(
+		Object.entries(row.actions).sort(([a], [b]) => a.localeCompare(b)),
+	);
+	return {
+		arm: row.arm,
+		model: row.model,
+		turn: row.turn,
+		gapBand: row.gapBand,
+		observedCodexAttempts: row.observedCodexAttempts,
+		joinedObservedCodexResponses: row.joinedObservedCodexResponses,
+		unjoinedObservedCodexAttempts: row.unjoinedObservedCodexAttempts,
+		cache: {
+			...row.cache,
+			weightedCachedReadPct:
+				row.cache.inputTokens > 0
+					? Math.round(
+							(row.cache.cachedReadTokens / row.cache.inputTokens) * 1000,
+						) / 10
+					: null,
+			positiveHitRatePct:
+				row.cache.measuredResponses > 0
+					? Math.round(
+							(1000 * row.cache.positiveHitResponses) /
+								row.cache.measuredResponses,
+						) / 10
+					: null,
+		},
+		elapsed: {
+			availableResponses: row.elapsed.availableResponses,
+			unavailableResponses: row.elapsed.unavailableResponses,
+			p50Ms: percentile(row.elapsedSamples, 0.5),
+			p95Ms: percentile(row.elapsedSamples, 0.95),
+		},
+		outcomes: row.outcomes,
+		pacing: row.pacing,
+		actions,
+	};
+}
+
+const ARM_ORDER: CacheExperimentArm[] = [
+	"control",
+	"treatment",
+	"ineligible",
+	"unassigned",
+];
+const TURN_ORDER: CacheExperimentTurn[] = [
+	"first_observed",
+	"follow_up_observed",
+	"unknown",
+];
+const GAP_ORDER: CacheExperimentGapBand[] = [
+	"under_1m",
+	"from_1m_to_5m",
+	"from_5m_to_15m",
+	"from_15m_to_60m",
+	"at_least_60m",
+	"unknown",
+];
+
+function cacheExperimentDimension(
+	samples: readonly CacheExperimentLogicalSample[],
+	kind: CacheExperimentKind,
+): CacheExperimentDimensionReport {
+	const annotated = annotateExperimentSamples(samples, kind);
+	const assignmentCounts: Record<CacheExperimentArm, number> = {
+		treatment: 0,
+		control: 0,
+		ineligible: 0,
+		unassigned: 0,
+	};
+	const rows = new Map<string, CacheExperimentRowAccumulator>();
+	for (const sample of annotated) {
+		assignmentCounts[sample.arm]++;
+		const rowKey = [sample.arm, sample.model, sample.turn, sample.gapBand].join(
+			"\u0000",
+		);
+		let row = rows.get(rowKey);
+		if (!row) {
+			row = cacheExperimentRowAccumulator(sample);
+			rows.set(rowKey, row);
+		}
+		row.observedCodexAttempts++;
+		increment(row.actions, sample.action);
+		incrementPacingAction(row, sample.request.pacing_action);
+		const fallbackAttempts = sample.attempts.filter((attempt) =>
+			FALLBACK_CAUSES.has(attempt.attempt_cause ?? ""),
+		).length;
+		if (FALLBACK_CAUSES.has(sample.request.attempt_cause ?? ""))
+			row.outcomes.finalObservedCodexAttemptFallbacks++;
+		row.outcomes.observedCodexFallbackAttempts += fallbackAttempts;
+		const response = sample.response;
+		if (!response) {
+			row.unjoinedObservedCodexAttempts++;
+			continue;
+		}
+		row.joinedObservedCodexResponses++;
+		if (response.stop_reason === "error")
+			row.outcomes.observedCodexErrorResponses++;
+		if (
+			Number(response.error_status) === 400 ||
+			response.error_type === "http_400"
+		)
+			row.outcomes.observedCodex400Responses++;
+		if (
+			response.cache_measurement_available !== false &&
+			safeTokenCount(response.input_tokens) &&
+			safeTokenCount(response.cache_read_input_tokens) &&
+			response.cache_read_input_tokens <= response.input_tokens
+		) {
+			const nextInputTokens = safeTokenSum(
+				row.cache.inputTokens,
+				response.input_tokens,
+			);
+			const nextCachedReadTokens = safeTokenSum(
+				row.cache.cachedReadTokens,
+				response.cache_read_input_tokens,
+			);
+			if (nextInputTokens === null || nextCachedReadTokens === null) {
+				row.cache.overflowResponses++;
+			} else {
+				row.cache.measuredResponses++;
+				row.cache.inputTokens = nextInputTokens;
+				row.cache.cachedReadTokens = nextCachedReadTokens;
+				if (response.cache_read_input_tokens > 0)
+					row.cache.positiveHitResponses++;
+			}
+		} else {
+			row.cache.unavailableResponses++;
+		}
+		if (
+			response.usage_measurement_available === false ||
+			!safeTokenCount(response.cache_creation_input_tokens)
+		) {
+			row.cache.cacheWriteUnavailableResponses++;
+		} else {
+			const nextCacheWriteTokens = safeTokenSum(
+				row.cache.cacheWriteTokens,
+				response.cache_creation_input_tokens,
+			);
+			if (nextCacheWriteTokens === null) {
+				row.cache.cacheWriteOverflowResponses++;
+			} else {
+				row.cache.cacheWriteMeasuredResponses++;
+				row.cache.cacheWriteTokens = nextCacheWriteTokens;
+			}
+		}
+		const requestTimestamp = sample.request.ts
+			? Date.parse(sample.request.ts)
+			: Number.NaN;
+		const responseTimestamp = response.ts
+			? Date.parse(response.ts)
+			: Number.NaN;
+		const observedElapsedMs = responseTimestamp - requestTimestamp;
+		if (
+			Number.isFinite(requestTimestamp) &&
+			Number.isFinite(responseTimestamp) &&
+			responseTimestamp >= requestTimestamp &&
+			Number.isSafeInteger(observedElapsedMs)
+		) {
+			row.elapsed.availableResponses++;
+			row.elapsedSamples.push(observedElapsedMs);
+		} else {
+			row.elapsed.unavailableResponses++;
+		}
+	}
+	const finishedRows = [...rows.values()].map(finishCacheExperimentRow);
+	finishedRows.sort(
+		(a, b) =>
+			ARM_ORDER.indexOf(a.arm) - ARM_ORDER.indexOf(b.arm) ||
+			a.model.localeCompare(b.model) ||
+			TURN_ORDER.indexOf(a.turn) - TURN_ORDER.indexOf(b.turn) ||
+			GAP_ORDER.indexOf(a.gapBand) - GAP_ORDER.indexOf(b.gapBand),
+	);
+	return { assignmentCounts, rows: finishedRows };
+}
+
+/**
+ * Privacy-safe, opt-in cache experiment analysis. Cohort hashes and join IDs
+ * are used only in-memory and never appear in the returned report.
+ */
+export function analyzeCodexCacheExperiments(
+	records: readonly TraceRecord[],
+): CodexCacheExperimentReport {
+	const samples = cacheExperimentLogicalSamples(records);
+	return {
+		schemaVersion: 1,
+		attribution: {
+			unit: "final_observed_codex_attempt",
+			responseScope: "codex_trace_only_no_cross_provider_terminal_visibility",
+			elapsed:
+				"observed_codex_response_ts_minus_observed_codex_attempt_request_ts",
+			gap: "prior_observed_codex_request_ts_in_same_trace_and_valid_cohort",
+			pacingWaitMs: "unavailable",
+			pacingWaitReason: "trace_has_action_but_no_wait_duration",
+		},
+		pacing: cacheExperimentDimension(samples, "pacing"),
+		explicitBreakpoint: cacheExperimentDimension(samples, "explicitBreakpoint"),
+	};
 }
 
 export function analyzeCodexTrace(
@@ -1309,15 +1989,44 @@ export function formatReport(report: TraceReport): string {
 	return lines.join("\n");
 }
 
+/**
+ * Format only aggregate cache-experiment metrics. Unlike the legacy diagnostic
+ * report, this intentionally has no request IDs, cohort hashes, cache keys, or
+ * tool-call previews.
+ */
+export function formatCacheExperimentReport(
+	report: CodexCacheExperimentReport,
+): string {
+	const lines = [
+		"CODEX CACHE EXPERIMENTS",
+		`attribution: unit=${report.attribution.unit} scope=${report.attribution.responseScope} elapsed=${report.attribution.elapsed} gap=${report.attribution.gap} pacing_wait_ms=${report.attribution.pacingWaitMs}`,
+	];
+	const append = (name: string, dimension: CacheExperimentDimensionReport) => {
+		lines.push(
+			"",
+			`${name}: assignments=${JSON.stringify(dimension.assignmentCounts)}`,
+		);
+		for (const row of dimension.rows) lines.push(`  ${JSON.stringify(row)}`);
+	};
+	append("PACING BYPASS CANARY", report.pacing);
+	append("EXPLICIT BREAKPOINT CANARY", report.explicitBreakpoint);
+	return lines.join("\n");
+}
+
 if (import.meta.main) {
-	const file = process.argv[2];
+	const args = process.argv.slice(2);
+	const cacheExperiments = args.includes("--cache-experiments");
+	const file = args.find((arg) => arg !== "--cache-experiments");
 	if (!file) {
-		console.error("usage: bun run analyze-trace.ts <codex-trace.jsonl>");
+		console.error(
+			"usage: bun run analyze-trace.ts [--cache-experiments] <codex-trace.jsonl>",
+		);
 		process.exit(1);
 	}
+	const records = parseTraceJsonl(readFileSync(file, "utf8"));
 	console.log(
-		formatReport(
-			analyzeCodexTrace(parseTraceJsonl(readFileSync(file, "utf8"))),
-		),
+		cacheExperiments
+			? formatCacheExperimentReport(analyzeCodexCacheExperiments(records))
+			: formatReport(analyzeCodexTrace(records)),
 	);
 }
