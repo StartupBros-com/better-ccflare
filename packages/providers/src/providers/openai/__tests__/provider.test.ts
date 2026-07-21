@@ -537,6 +537,100 @@ describe("OpenAICompatibleProvider", () => {
 		});
 	});
 
+	describe("DashScope physical model hooks", () => {
+		function dashscopeAccount(modelMappings?: Record<string, string>): Account {
+			return {
+				...mockAccount,
+				custom_endpoint: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+				model_mappings: modelMappings ? JSON.stringify(modelMappings) : null,
+			};
+		}
+
+		async function transformDashscopeRequest(
+			model: string,
+			account: Account,
+		): Promise<{
+			model: string;
+			enable_thinking?: boolean;
+			messages: Array<{
+				role: string;
+				content: string | Array<Record<string, unknown>>;
+			}>;
+		}> {
+			const request = new Request("https://example.com/v1/messages", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					model,
+					system: "You are a helpful assistant",
+					messages: [
+						{ role: "user", content: "Hello" },
+						{ role: "assistant", content: "Hi" },
+					],
+				}),
+			});
+
+			const transformed = await provider.transformRequestBody(request, account);
+			return (await transformed.json()) as {
+				model: string;
+				enable_thinking?: boolean;
+				messages: Array<{
+					role: string;
+					content: string | Array<Record<string, unknown>>;
+				}>;
+			};
+		}
+
+		function expectAlibabaCaching(
+			messages: Array<{
+				role: string;
+				content: string | Array<Record<string, unknown>>;
+			}>,
+		): void {
+			for (const message of messages) {
+				expect(Array.isArray(message.content)).toBe(true);
+				if (Array.isArray(message.content)) {
+					expect(message.content[message.content.length - 1]).toMatchObject({
+						cache_control: { type: "ephemeral" },
+					});
+				}
+			}
+		}
+
+		it("applies Qwen hooks when a Claude model maps to a Qwen physical model", async () => {
+			const body = await transformDashscopeRequest(
+				"claude-3-opus-20240229",
+				dashscopeAccount({ opus: "qwen3.5-plus" }),
+			);
+
+			expect(body.model).toBe("qwen3.5-plus");
+			expectAlibabaCaching(body.messages);
+			expect(body.enable_thinking).toBe(true);
+		});
+
+		it("does not apply Qwen hooks when a Claude model maps to a non-Qwen physical model", async () => {
+			const body = await transformDashscopeRequest(
+				"claude-3-opus-20240229",
+				dashscopeAccount({ opus: "openai/gpt-5" }),
+			);
+
+			expect(body.model).toBe("openai/gpt-5");
+			expect(JSON.stringify(body.messages)).not.toContain("cache_control");
+			expect(body.enable_thinking).toBeUndefined();
+		});
+
+		it("continues to apply Qwen hooks for a direct Qwen model", async () => {
+			const body = await transformDashscopeRequest(
+				"qwen3.5-plus",
+				dashscopeAccount(),
+			);
+
+			expect(body.model).toBe("qwen3.5-plus");
+			expectAlibabaCaching(body.messages);
+			expect(body.enable_thinking).toBe(true);
+		});
+	});
+
 	describe("concurrent request isolation", () => {
 		// The provider is a long-lived singleton shared across every in-flight
 		// request. buildUrl() is called (setting up the target endpoint) before
