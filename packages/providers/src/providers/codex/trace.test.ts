@@ -8,6 +8,7 @@ import {
 	contextUtilizationPct,
 	summarizeCodexResponse,
 	summarizeCodexTransform,
+	writeCodexResponseTrace,
 	writeCodexTrace,
 } from "./trace";
 
@@ -399,5 +400,79 @@ describe("summarizeCodexResponse (response phase)", () => {
 		expect(s.stop_reason).toBe("error");
 		expect(s.error_type).toBe("unclassified_upstream_error");
 		expect(s.error_message).toBeUndefined();
+	});
+});
+
+describe("writeCodexResponseTrace protocol identity telemetry", () => {
+	test("writes stable keyed rotation markers without retaining raw values", () => {
+		const dir = mkdtempSync(join(tmpdir(), "codex-response-trace-"));
+		process.env[CODEX_TRACE_DIR_ENV] = dir;
+		process.env[CODEX_TRACE_HMAC_KEY_ENV] = "test-only-key";
+		const summary = summarizeCodexResponse([], {}, "end_turn");
+		try {
+			writeCodexResponseTrace({
+				summary,
+				turnStateHeaderPresent: true,
+				turnState: "private-turn-state-a",
+				responseId: "private-response-a",
+			});
+			writeCodexResponseTrace({
+				summary,
+				turnStateHeaderPresent: true,
+				turnState: "private-turn-state-a",
+				responseId: "private-response-b",
+			});
+			writeCodexResponseTrace({
+				summary,
+				turnStateHeaderPresent: true,
+				turnState: "private-turn-state-b",
+				responseId: "private-response-c",
+			});
+
+			const file = readdirSync(dir).find((name) => name.endsWith(".jsonl"));
+			const rawTrace = readFileSync(join(dir, file as string), "utf8");
+			const records = rawTrace
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line));
+
+			expect(records[0].codex_turn_state_present).toBe(true);
+			expect(records[0].codex_turn_state_hmac).toHaveLength(64);
+			expect(records[0].codex_turn_state_hmac).toBe(
+				records[1].codex_turn_state_hmac,
+			);
+			expect(records[0].codex_turn_state_hmac).not.toBe(
+				records[2].codex_turn_state_hmac,
+			);
+			expect(records[0].response_id_present).toBe(true);
+			expect(records[0].response_id_hmac).toHaveLength(64);
+			expect(records[0].response_id_hmac).not.toBe(records[1].response_id_hmac);
+			expect(rawTrace).not.toContain("private-turn-state");
+			expect(rawTrace).not.toContain("private-response");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("records presence but no digest when keyed tracing is unavailable", () => {
+		const dir = mkdtempSync(join(tmpdir(), "codex-response-trace-"));
+		process.env[CODEX_TRACE_DIR_ENV] = dir;
+		try {
+			writeCodexResponseTrace({
+				summary: summarizeCodexResponse([], {}, "end_turn"),
+				turnStateHeaderPresent: true,
+				turnState: "must-not-be-written",
+			});
+			const file = readdirSync(dir).find((name) => name.endsWith(".jsonl"));
+			const rawTrace = readFileSync(join(dir, file as string), "utf8");
+			const record = JSON.parse(rawTrace.trim());
+			expect(record.codex_turn_state_present).toBe(true);
+			expect(record.codex_turn_state_hmac).toBeNull();
+			expect(record.response_id_present).toBe(false);
+			expect(record.response_id_hmac).toBeNull();
+			expect(rawTrace).not.toContain("must-not-be-written");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });
