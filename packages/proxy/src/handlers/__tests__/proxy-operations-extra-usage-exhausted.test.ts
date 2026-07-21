@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import type { Account, RequestMeta } from "@better-ccflare/types";
 import { proxyWithAccount } from "../proxy-operations";
 import type { ProxyContext } from "../proxy-types";
+import { RoutingAttemptLedger } from "../routing-attempt-ledger";
 
 // Anthropic account fixture — the extra_usage_exhausted body is Anthropic-specific.
 function makeAccount(overrides: Partial<Account> = {}): Account {
@@ -281,5 +282,89 @@ describe("proxyWithAccount — extra_usage_exhausted (issue #293)", () => {
 		expect(args[17]).toBeNull();
 		expect(args[18]).toBe("path_project");
 		expect(args[19]).toBe("prompt_agent");
+	});
+
+	it("classifies extra usage returned by an in-place 529 recovery through the shared boundary", async () => {
+		const previousBase = process.env.CCFLARE_OVERLOAD_RETRY_BASE_MS;
+		const previousMax = process.env.CCFLARE_OVERLOAD_RETRY_MAX_MS;
+		const previousAttempts = process.env.CCFLARE_OVERLOAD_RETRY_MAX_ATTEMPTS;
+		process.env.CCFLARE_OVERLOAD_RETRY_BASE_MS = "0";
+		process.env.CCFLARE_OVERLOAD_RETRY_MAX_MS = "0";
+		process.env.CCFLARE_OVERLOAD_RETRY_MAX_ATTEMPTS = "2";
+
+		try {
+			let calls = 0;
+			globalThis.fetch = mock(async () => {
+				calls++;
+				if (calls === 1) {
+					return new Response(
+						JSON.stringify({
+							type: "error",
+							error: { type: "overloaded_error", message: "overloaded" },
+						}),
+						{ status: 529, headers: { "content-type": "application/json" } },
+					);
+				}
+				return extraUsageExhaustedResponse();
+			});
+
+			const ctx = makeProxyContextWithAsyncExec();
+			ctx.provider.parseRateLimit = (response: Response) =>
+				({
+					isRateLimited: response.status === 529,
+					resetTime: undefined,
+					statusHeader: undefined,
+					remaining: undefined,
+				}) as never;
+			const account = makeAccount();
+			const bodyBuffer = makeRequestBody("claude-sonnet-4-5");
+			const req = makeRequest(bodyBuffer);
+			const ledger = new RoutingAttemptLedger();
+
+			const result = await proxyWithAccount(
+				req,
+				new URL(req.url),
+				account,
+				makeRequestMeta(),
+				bodyBuffer,
+				() => undefined,
+				0,
+				ctx,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				false,
+				undefined,
+				ledger,
+			);
+
+			expect(result).toBeNull();
+			expect(calls).toBe(2);
+			expect(account.rate_limited_until).toBeNull();
+			expect(account.consecutive_rate_limits).toBe(0);
+			expect(ctx.dbOps.markAccountRateLimited).not.toHaveBeenCalled();
+			const retained = ledger.takeTerminalResponse();
+			expect(retained).not.toBeNull();
+			const terminal = await retained?.deliver(1);
+			expect(terminal?.status).toBe(400);
+			expect(await terminal?.json()).toEqual({
+				type: "error",
+				error: {
+					type: "invalid_request_error",
+					message: EXTRA_USAGE_MESSAGE,
+				},
+			});
+		} finally {
+			if (previousBase === undefined)
+				delete process.env.CCFLARE_OVERLOAD_RETRY_BASE_MS;
+			else process.env.CCFLARE_OVERLOAD_RETRY_BASE_MS = previousBase;
+			if (previousMax === undefined)
+				delete process.env.CCFLARE_OVERLOAD_RETRY_MAX_MS;
+			else process.env.CCFLARE_OVERLOAD_RETRY_MAX_MS = previousMax;
+			if (previousAttempts === undefined)
+				delete process.env.CCFLARE_OVERLOAD_RETRY_MAX_ATTEMPTS;
+			else process.env.CCFLARE_OVERLOAD_RETRY_MAX_ATTEMPTS = previousAttempts;
+		}
 	});
 });

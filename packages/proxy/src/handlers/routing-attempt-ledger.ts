@@ -7,8 +7,9 @@ function normalizeConcreteModel(
 
 /**
  * Deferred ownership of one already-classified upstream terminal response.
- * The request loop either delivers it once after every unique route is spent,
- * or discards it once when a later unique route supersedes it or succeeds.
+ * The request loop delivers it once after every unique route is spent, releases
+ * it after a later route succeeds or throws, or replaces it with a later
+ * retained terminal (which releases the previous response exactly once).
  */
 export interface RetainedTerminalResponse {
 	deliver(failoverAttempts: number): Promise<Response>;
