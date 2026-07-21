@@ -1,3 +1,4 @@
+import type { ContentBlock } from "@aws-sdk/client-bedrock-runtime";
 import { Logger } from "@better-ccflare/logger";
 
 const log = new Logger("BedrockResponseParser");
@@ -77,12 +78,87 @@ export interface BedrockConverseResponse {
 	output: {
 		message: {
 			role: string;
-			content: Array<{ type: string; text?: string; [key: string]: unknown }>;
+			content: ContentBlock[];
 		};
 	};
 	stopReason: string;
 	usage?: BedrockUsage;
 	model?: string;
+}
+
+type ClaudeResponseContentBlock =
+	| { type: "text"; text: string }
+	| {
+			type: "tool_use";
+			id: string;
+			name: string;
+			input: Record<string, unknown>;
+	  }
+	| { type: "thinking"; thinking: string; signature: string };
+
+function isNonEmptyString(value: unknown): value is string {
+	return typeof value === "string" && value.trim().length > 0;
+}
+
+function transformResponseContentBlock(
+	block: ContentBlock,
+): ClaudeResponseContentBlock[] {
+	if ("text" in block && typeof block.text === "string") {
+		return [{ type: "text", text: block.text }];
+	}
+
+	if ("toolUse" in block && block.toolUse) {
+		const { toolUseId, name, input } = block.toolUse;
+		if (
+			isNonEmptyString(toolUseId) &&
+			isNonEmptyString(name) &&
+			typeof input === "object" &&
+			input !== null &&
+			!Array.isArray(input)
+		) {
+			return [
+				{
+					type: "tool_use",
+					id: toolUseId,
+					name,
+					input: input as Record<string, unknown>,
+				},
+			];
+		}
+		return [];
+	}
+
+	if ("reasoningContent" in block && block.reasoningContent) {
+		const reasoning = block.reasoningContent;
+		if (
+			"reasoningText" in reasoning &&
+			reasoning.reasoningText &&
+			isNonEmptyString(reasoning.reasoningText.text) &&
+			isNonEmptyString(reasoning.reasoningText.signature)
+		) {
+			return [
+				{
+					type: "thinking",
+					thinking: reasoning.reasoningText.text,
+					signature: reasoning.reasoningText.signature,
+				},
+			];
+		}
+		return [];
+	}
+
+	if ("citationsContent" in block && block.citationsContent?.content) {
+		return block.citationsContent.content.flatMap((content) =>
+			"text" in content && typeof content.text === "string"
+				? [{ type: "text" as const, text: content.text }]
+				: [],
+		);
+	}
+
+	// Converse supports input-only and provider-specific output unions that do
+	// not have valid Anthropic assistant content equivalents. Omit those blocks
+	// rather than leaking the AWS wire shape to Anthropic clients.
+	return [];
 }
 
 /**
@@ -93,7 +169,7 @@ export interface BedrockConverseResponse {
  * to native Claude API responses.
  *
  * Transformation mapping:
- * - output.message.content → content (1:1 array mapping, preserves text and tool blocks)
+ * - output.message.content → valid Anthropic text, tool-use, and thinking blocks
  * - stopReason → stop_reason
  * - usage.inputTokens → usage.input_tokens
  * - usage.outputTokens → usage.output_tokens
@@ -113,7 +189,7 @@ export interface BedrockConverseResponse {
  *   "output": {
  *     "message": {
  *       "role": "assistant",
- *       "content": [{ "type": "text", "text": "Hello" }]
+ *       "content": [{ "text": "Hello" }]
  *     }
  *   },
  *   "stopReason": "end_turn",
@@ -143,7 +219,9 @@ export async function transformNonStreamingResponse(
 		const json = (await clone.json()) as BedrockConverseResponse;
 
 		// Extract fields from Bedrock format
-		const content = json.output?.message?.content || [];
+		const content = (json.output?.message?.content || []).flatMap(
+			transformResponseContentBlock,
+		);
 		const stopReason = json.stopReason;
 		const usage = json.usage;
 		const normalizedUsage = usage ? normalizeBedrockUsage(usage) : undefined;
@@ -153,7 +231,7 @@ export async function transformNonStreamingResponse(
 			id: `msg_${crypto.randomUUID().replace(/-/g, "")}`,
 			type: "message",
 			role: "assistant",
-			content: content, // 1:1 mapping, preserve as-is
+			content,
 			model: json.model || "claude-bedrock",
 			stop_reason: stopReason,
 			usage: normalizedUsage

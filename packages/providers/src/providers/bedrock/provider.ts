@@ -24,6 +24,7 @@ import { translateModelName } from "./model-cache";
 import { generateClientModelName } from "./model-discovery";
 import {
 	type CrossRegionMode,
+	isBedrockResourceArn,
 	transformModelIdPrefix,
 } from "./model-transformer";
 import {
@@ -552,37 +553,41 @@ export class BedrockProvider extends BaseProvider implements Provider {
 			config.region,
 		);
 
-		// Validate model supports requested mode and fall back if needed
-		const supportsMode = await canUseInferenceProfile(
-			transformedModelId,
-			crossRegionMode,
-			account,
-		);
-
-		if (!supportsMode) {
-			const fallback = await getFallbackMode(
+		// An explicit Bedrock resource ARN already selects its inference profile.
+		// Treat it as opaque instead of rediscovering and rewriting that choice.
+		if (!isBedrockResourceArn(finalModelId)) {
+			// Validate model supports requested mode and fall back if needed
+			const supportsMode = await canUseInferenceProfile(
 				transformedModelId,
 				crossRegionMode,
 				account,
 			);
-			if (fallback) {
-				log.warn(
-					`Model ${finalModelId} doesn't support ${crossRegionMode} inference mode, falling back to ${fallback}`,
+
+			if (!supportsMode) {
+				const fallback = await getFallbackMode(
+					transformedModelId,
+					crossRegionMode,
+					account,
 				);
-				transformedModelId = transformModelIdPrefix(
-					finalModelId,
-					fallback,
-					config.region,
-				);
-			} else {
-				log.warn(
-					`Model ${finalModelId} has no supported inference mode, using regional fallback`,
-				);
-				transformedModelId = transformModelIdPrefix(
-					finalModelId,
-					"regional",
-					config.region,
-				);
+				if (fallback) {
+					log.warn(
+						`Model ${finalModelId} doesn't support ${crossRegionMode} inference mode, falling back to ${fallback}`,
+					);
+					transformedModelId = transformModelIdPrefix(
+						finalModelId,
+						fallback,
+						config.region,
+					);
+				} else {
+					log.warn(
+						`Model ${finalModelId} has no supported inference mode, using regional fallback`,
+					);
+					transformedModelId = transformModelIdPrefix(
+						finalModelId,
+						"regional",
+						config.region,
+					);
+				}
 			}
 		}
 

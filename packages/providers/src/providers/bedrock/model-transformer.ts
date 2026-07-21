@@ -4,6 +4,10 @@ const log = new Logger("BedrockModelTransformer");
 
 export type CrossRegionMode = "geographic" | "global" | "regional";
 
+export function isBedrockResourceArn(modelId: string): boolean {
+	return /^arn:[^:]+:bedrock:/.test(modelId);
+}
+
 // Geographic prefixes supported by AWS Bedrock inference profiles
 const GEOGRAPHIC_PREFIXES = ["us", "eu", "apac", "au", "ca", "jp"] as const;
 
@@ -61,6 +65,12 @@ export function transformModelIdPrefix(
 	mode: CrossRegionMode,
 	region?: string,
 ): string {
+	// Bedrock resource ARNs are complete, opaque model identifiers. Prefixing an
+	// inference-profile ARN (for example with `us.`) corrupts the identifier.
+	if (isBedrockResourceArn(modelId)) {
+		return modelId;
+	}
+
 	const { prefix, rest } = parseModelId(modelId);
 
 	switch (mode) {

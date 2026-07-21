@@ -74,4 +74,81 @@ describe("Bedrock usage normalization", () => {
 			cache_creation_input_tokens: 11,
 		});
 	});
+
+	it("maps Bedrock text and tool use blocks to valid Anthropic blocks", async () => {
+		const response = new Response(
+			JSON.stringify({
+				output: {
+					message: {
+						role: "assistant",
+						content: [
+							{ text: "I will look that up." },
+							{
+								toolUse: {
+									toolUseId: "tool_123",
+									name: "lookup",
+									input: { query: "cache" },
+								},
+							},
+						],
+					},
+				},
+				stopReason: "tool_use",
+			}),
+			{ headers: { "content-type": "application/json" } },
+		);
+
+		const transformed = await transformNonStreamingResponse(response);
+		const body = (await transformed.json()) as { content: unknown[] };
+
+		expect(body.content).toEqual([
+			{ type: "text", text: "I will look that up." },
+			{
+				type: "tool_use",
+				id: "tool_123",
+				name: "lookup",
+				input: { query: "cache" },
+			},
+		]);
+	});
+
+	it("maps signed reasoning and citation text while omitting unsupported output unions", async () => {
+		const response = new Response(
+			JSON.stringify({
+				output: {
+					message: {
+						role: "assistant",
+						content: [
+							{
+								reasoningContent: {
+									reasoningText: { text: "Reasoning", signature: "sig" },
+								},
+							},
+							{
+								citationsContent: {
+									content: [{ text: "Grounded answer" }],
+									citations: [],
+								},
+							},
+							{ image: { format: "png", source: { bytes: "AQID" } } },
+						],
+					},
+				},
+				stopReason: "end_turn",
+			}),
+			{ headers: { "content-type": "application/json" } },
+		);
+
+		const transformed = await transformNonStreamingResponse(response);
+		const body = (await transformed.json()) as { content: unknown[] };
+
+		expect(body.content).toEqual([
+			{
+				type: "thinking",
+				thinking: "Reasoning",
+				signature: "sig",
+			},
+			{ type: "text", text: "Grounded answer" },
+		]);
+	});
 });

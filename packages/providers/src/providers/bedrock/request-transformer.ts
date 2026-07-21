@@ -217,32 +217,217 @@ function isNonEmptyString(value: unknown): value is string {
 	return typeof value === "string" && value.trim().length > 0;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+type JsonValue =
+	| null
+	| boolean
+	| number
+	| string
+	| JsonValue[]
+	| { [key: string]: JsonValue };
+
+function isJsonValue(value: unknown): value is JsonValue {
+	if (
+		value === null ||
+		typeof value === "boolean" ||
+		typeof value === "string"
+	) {
+		return true;
+	}
+	if (typeof value === "number") {
+		return Number.isFinite(value);
+	}
+	if (Array.isArray(value)) {
+		return value.every(isJsonValue);
+	}
+	return isRecord(value) && Object.values(value).every(isJsonValue);
+}
+
+function decodeBase64(value: unknown): Uint8Array | null {
+	if (typeof value !== "string") {
+		return null;
+	}
+
+	try {
+		const decoded = atob(value);
+		return Uint8Array.from(decoded, (character) => character.charCodeAt(0));
+	} catch {
+		return null;
+	}
+}
+
+const IMAGE_FORMAT_BY_MEDIA_TYPE = {
+	"image/gif": "gif",
+	"image/jpeg": "jpeg",
+	"image/png": "png",
+	"image/webp": "webp",
+} as const;
+
+const DOCUMENT_FORMAT_BY_MEDIA_TYPE = {
+	"application/msword": "doc",
+	"application/pdf": "pdf",
+	"application/vnd.ms-excel": "xls",
+	"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+	"application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+		"docx",
+	"text/csv": "csv",
+	"text/html": "html",
+	"text/markdown": "md",
+	"text/plain": "txt",
+} as const;
+
+function normalizeDocumentName(value: unknown): string {
+	const source = isNonEmptyString(value) ? value.trim() : "document";
+	const normalized = source
+		.replace(/[^\p{L}\p{N}\s()\[\]-]/gu, "-")
+		.replace(/\s+/g, " ")
+		.replace(/-+/g, "-")
+		.slice(0, 200);
+	return normalized || "document";
+}
+
+function transformImageToolResult(
+	item: Record<string, unknown>,
+): ToolResultContentBlock | null {
+	if (!isRecord(item.source) || item.source.type !== "base64") {
+		return null;
+	}
+
+	const format =
+		typeof item.source.media_type === "string"
+			? IMAGE_FORMAT_BY_MEDIA_TYPE[
+					item.source
+						.media_type as keyof typeof IMAGE_FORMAT_BY_MEDIA_TYPE
+				]
+			: undefined;
+	const bytes = decodeBase64(item.source.data);
+	if (!format || !bytes) {
+		return null;
+	}
+
+	return { image: { format, source: { bytes } } };
+}
+
+function transformDocumentToolResult(
+	item: Record<string, unknown>,
+): ToolResultContentBlock | null {
+	if (!isRecord(item.source)) {
+		return null;
+	}
+
+	const name = normalizeDocumentName(item.title);
+	if (item.source.type === "text" && typeof item.source.data === "string") {
+		return {
+			document: {
+				format: "txt",
+				name,
+				source: { text: item.source.data },
+			},
+		};
+	}
+
+	if (item.source.type !== "base64") {
+		return null;
+	}
+
+	const format =
+		typeof item.source.media_type === "string"
+			? DOCUMENT_FORMAT_BY_MEDIA_TYPE[
+					item.source
+						.media_type as keyof typeof DOCUMENT_FORMAT_BY_MEDIA_TYPE
+				]
+			: undefined;
+	const bytes = decodeBase64(item.source.data);
+	if (!format || !bytes) {
+		return null;
+	}
+
+	return { document: { format, name, source: { bytes } } };
+}
+
+function transformSearchResultToolResult(
+	item: Record<string, unknown>,
+): ToolResultContentBlock | null {
+	if (
+		!isNonEmptyString(item.source) ||
+		!isNonEmptyString(item.title) ||
+		!Array.isArray(item.content)
+	) {
+		return null;
+	}
+
+	const content = item.content.flatMap((block) =>
+		isRecord(block) && block.type === "text" && typeof block.text === "string"
+			? [{ text: block.text }]
+			: [],
+	);
+	if (content.length === 0) {
+		return null;
+	}
+
+	const citations =
+		isRecord(item.citations) && typeof item.citations.enabled === "boolean"
+			? { enabled: item.citations.enabled }
+			: undefined;
+
+	return {
+		searchResult: {
+			source: item.source,
+			title: item.title,
+			content,
+			...(citations ? { citations } : {}),
+		},
+	};
+}
+
 function transformToolResultContent(
 	content: unknown,
 ): ToolResultContentBlock[] {
-	if (isNonEmptyString(content)) {
+	if (typeof content === "string") {
 		return [{ text: content }];
 	}
 
-	if (!Array.isArray(content)) {
-		return [];
+	if (isRecord(content) && isJsonValue(content)) {
+		return [{ json: content }];
+	}
+
+	if (!Array.isArray(content) || content.length === 0) {
+		return [{ text: "" }];
 	}
 
 	const transformedContent: ToolResultContentBlock[] = [];
 	for (const item of content) {
-		if (
-			typeof item === "object" &&
-			item !== null &&
-			"type" in item &&
-			item.type === "text" &&
-			"text" in item &&
-			isNonEmptyString(item.text)
-		) {
+		if (!isRecord(item)) {
+			continue;
+		}
+
+		if (item.type === "text" && typeof item.text === "string") {
 			transformedContent.push({ text: item.text });
+			continue;
+		}
+
+		if (item.type === "json" && isJsonValue(item.json)) {
+			transformedContent.push({ json: item.json });
+			continue;
+		}
+
+		const transformedItem =
+			item.type === "image"
+				? transformImageToolResult(item)
+				: item.type === "document"
+					? transformDocumentToolResult(item)
+					: item.type === "search_result"
+						? transformSearchResultToolResult(item)
+						: null;
+		if (transformedItem) {
+			transformedContent.push(transformedItem);
 		}
 	}
 
-	return transformedContent;
+	return transformedContent.length > 0 ? transformedContent : [{ text: "" }];
 }
 
 function transformMessageContentBlock(
@@ -271,10 +456,6 @@ function transformMessageContentBlock(
 
 	if (block.type === "tool_result" && isNonEmptyString(block.tool_use_id)) {
 		const content = transformToolResultContent(block.content);
-		if (content.length === 0) {
-			return null;
-		}
-
 		return {
 			toolResult: {
 				toolUseId: block.tool_use_id,

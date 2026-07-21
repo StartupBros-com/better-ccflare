@@ -138,6 +138,159 @@ describe("Bedrock request prompt-cache translation", () => {
 		]);
 	});
 
+	it("preserves empty tool results instead of leaving a dangling tool use", () => {
+		for (const emptyContent of ["", []]) {
+			const transformed = transformMessagesRequest(
+				request({
+					messages: [
+						{
+							role: "assistant",
+							content: [
+								{
+									type: "tool_use",
+									id: "tool_empty",
+									name: "lookup",
+									input: {},
+								},
+							],
+						},
+						{
+							role: "user",
+							content: [
+								{
+									type: "tool_result",
+									tool_use_id: "tool_empty",
+									content: emptyContent,
+								},
+							],
+						},
+					],
+				}),
+				SONNET_45,
+			);
+
+			expect(transformed.messages?.[1]?.content).toEqual([
+				{
+					toolResult: {
+						toolUseId: "tool_empty",
+						content: [{ text: "" }],
+						status: "success",
+					},
+				},
+			]);
+		}
+	});
+
+	it("maps image-only and structured tool results to Bedrock content unions", () => {
+		const transformed = transformMessagesRequest(
+			request({
+				messages: [
+					{
+						role: "assistant",
+						content: [
+							{
+								type: "tool_use",
+								id: "tool_image",
+								name: "image_lookup",
+								input: {},
+							},
+							{
+								type: "tool_use",
+								id: "tool_structured",
+								name: "structured_lookup",
+								input: {},
+							},
+						],
+					},
+					{
+						role: "user",
+						content: [
+							{
+								type: "tool_result",
+								tool_use_id: "tool_image",
+								content: [
+									{
+										type: "image",
+										source: {
+											type: "base64",
+											media_type: "image/png",
+											data: "AQID",
+										},
+									},
+								],
+							},
+							{
+								type: "tool_result",
+								tool_use_id: "tool_structured",
+								content: [
+									{ type: "json", json: { ok: true } },
+									{
+										type: "document",
+										title: "report.pdf",
+										source: {
+											type: "base64",
+											media_type: "application/pdf",
+											data: "BAUG",
+										},
+									},
+									{
+										type: "search_result",
+										source: "https://example.com/result",
+										title: "Example result",
+										content: [{ type: "text", text: "Grounded excerpt" }],
+										citations: { enabled: true },
+									},
+								],
+							},
+						],
+					},
+				],
+			}),
+			SONNET_45,
+		);
+
+		expect(transformed.messages?.[1]?.content).toEqual([
+			{
+				toolResult: {
+					toolUseId: "tool_image",
+					content: [
+						{
+							image: {
+								format: "png",
+								source: { bytes: new Uint8Array([1, 2, 3]) },
+							},
+						},
+					],
+					status: "success",
+				},
+			},
+			{
+				toolResult: {
+					toolUseId: "tool_structured",
+					content: [
+						{ json: { ok: true } },
+						{
+							document: {
+								format: "pdf",
+								name: "report-pdf",
+								source: { bytes: new Uint8Array([4, 5, 6]) },
+							},
+						},
+						{
+							searchResult: {
+								source: "https://example.com/result",
+								title: "Example result",
+								content: [{ text: "Grounded excerpt" }],
+								citations: { enabled: true },
+							},
+						},
+					],
+					status: "success",
+				},
+			},
+		]);
+	});
+
 	it("preserves tools while suppressing cache points for unsupported models", () => {
 		const transformed = transformMessagesRequest(
 			request({
