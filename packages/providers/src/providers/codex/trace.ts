@@ -247,6 +247,12 @@ interface ResponseTraceInputs {
 	modelOut?: string;
 	/** Raw model context window, for utilization telemetry. */
 	modelContextWindow?: number;
+	/** Whether the upstream response carried x-codex-turn-state. */
+	turnStateHeaderPresent?: boolean;
+	/** Never written raw; converted to a keyed, domain-separated fingerprint. */
+	turnState?: string | null;
+	/** Never written raw; converted to a keyed, domain-separated fingerprint. */
+	responseId?: string | null;
 	summary: CodexResponseSummary;
 }
 
@@ -392,6 +398,11 @@ export function writeCodexResponseTrace(inputs: ResponseTraceInputs): void {
 		request_id: inputs.requestId ?? null,
 		attempt_id: inputs.attemptId ?? null,
 		model_out: inputs.modelOut ?? null,
+		codex_turn_state_present:
+			inputs.turnStateHeaderPresent ?? Boolean(inputs.turnState),
+		codex_turn_state_hmac: privacyHmac("turn-state", inputs.turnState),
+		response_id_present: Boolean(inputs.responseId),
+		response_id_hmac: privacyHmac("response-id", inputs.responseId),
 		context_utilization_pct:
 			typeof inputs.summary.input_tokens === "number"
 				? contextUtilizationPct(
@@ -401,6 +412,18 @@ export function writeCodexResponseTrace(inputs: ResponseTraceInputs): void {
 				: null,
 		...inputs.summary,
 	});
+}
+
+function privacyHmac(
+	domain: "turn-state" | "response-id",
+	value: string | null | undefined,
+): string | null {
+	const key = process.env[CODEX_TRACE_HMAC_KEY_ENV];
+	if (!key || !value) return null;
+	return createHmac("sha256", key)
+		.update(`better-ccflare/codex-trace/${domain}/v1\0`, "utf8")
+		.update(value, "utf8")
+		.digest("hex");
 }
 
 function appendTraceRecord(record: Record<string, unknown>): void {

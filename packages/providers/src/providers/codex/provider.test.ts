@@ -19,7 +19,7 @@ import {
 	deriveCodexCacheKeySessionBucket,
 	readCodexCacheKeySessionPercent,
 } from "./provider";
-import { CODEX_TRACE_DIR_ENV } from "./trace";
+import { CODEX_TRACE_DIR_ENV, CODEX_TRACE_HMAC_KEY_ENV } from "./trace";
 import { parseCodexUsageHeaders } from "./usage";
 
 const sseBody = (lines: string[]) => `${lines.join("\n")}\n`;
@@ -43,6 +43,8 @@ afterEach(() => {
 	delete process.env[CODEX_CACHE_KEY_MODE_ENV];
 	delete process.env[CODEX_CACHE_KEY_SESSION_PERCENT_ENV];
 	delete process.env[CODEX_SINGLE_ORCHESTRATION_ROOT_ENV];
+	delete process.env[CODEX_TRACE_DIR_ENV];
+	delete process.env[CODEX_TRACE_HMAC_KEY_ENV];
 	resetOrchestrationElectionForTest();
 });
 
@@ -1390,8 +1392,9 @@ describe("CodexProvider.processResponse", () => {
 			label: "normal cached usage",
 			total: 100,
 			cached: 25,
-			uncached: 75,
+			uncached: 65,
 			cacheRead: 25,
+			cacheCreation: 10,
 		},
 		{
 			label: "zero usage",
@@ -1399,6 +1402,7 @@ describe("CodexProvider.processResponse", () => {
 			cached: 0,
 			uncached: 0,
 			cacheRead: 0,
+			cacheCreation: 0,
 		},
 		{
 			label: "cached usage above total",
@@ -1406,12 +1410,14 @@ describe("CodexProvider.processResponse", () => {
 			cached: 25,
 			uncached: 0,
 			cacheRead: 10,
+			cacheCreation: 0,
 		},
 	])("maps response.completed $label into additive Anthropic usage", async ({
 		total,
 		cached,
 		uncached,
 		cacheRead,
+		cacheCreation,
 	}) => {
 		const provider = new CodexProvider();
 		const upstreamBody = sseBody([
@@ -1449,12 +1455,21 @@ describe("CodexProvider.processResponse", () => {
 
 		expect(messageDelta.usage.input_tokens).toBe(uncached);
 		expect(messageDelta.usage.cache_read_input_tokens).toBe(cacheRead);
+		expect(messageDelta.usage.cache_creation_input_tokens).toBe(cacheCreation);
+		expect(
+			messageDelta.usage.input_tokens +
+				messageDelta.usage.cache_read_input_tokens +
+				messageDelta.usage.cache_creation_input_tokens,
+		).toBe(total);
 		expect(messageDelta.context_window.current_usage.input_tokens).toBe(
 			uncached,
 		);
 		expect(
 			messageDelta.context_window.current_usage.cache_read_input_tokens,
 		).toBe(cacheRead);
+		expect(
+			messageDelta.context_window.current_usage.cache_creation_input_tokens,
+		).toBe(cacheCreation);
 		expect(messageDelta.context_window.context_window_size).toBe(272_000);
 	});
 
@@ -1734,6 +1749,165 @@ describe("CodexProvider.processResponse", () => {
 		expect(messageDeltaLine).toContain('"cache_creation_input_tokens":9');
 		expect(messageDeltaLine).toContain('"context_window"');
 		expect(messageDeltaLine).toContain('"context_window_size":272000');
+	});
+
+	it("normalizes current cache_write_tokens to Anthropic cache creation usage", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_test", model: "gpt-5.4" },
+			}),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.4",
+					usage: {
+						input_tokens: 42,
+						output_tokens: 7,
+						input_tokens_details: {
+							cached_tokens: 5,
+							cache_write_tokens: 11,
+							cache_creation_input_tokens: 99,
+						},
+					},
+				},
+			}),
+		]);
+
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+		const transformedBody = await (
+			await provider.processResponse(response, null)
+		).text();
+		const messageDeltaLine = transformedBody
+			.split("\n")
+			.find((line) => line.includes('"type":"message_delta"'));
+
+		expect(messageDeltaLine).not.toBeUndefined();
+		const messageDelta = JSON.parse(
+			(messageDeltaLine as string).slice("data: ".length),
+		);
+		expect(messageDelta.usage).toEqual({
+			input_tokens: 26,
+			output_tokens: 7,
+			cache_read_input_tokens: 5,
+			cache_creation_input_tokens: 11,
+		});
+		expect(messageDelta.context_window.current_usage).toEqual({
+			input_tokens: 26,
+			cache_read_input_tokens: 5,
+			cache_creation_input_tokens: 11,
+		});
+	});
+
+	it.each([
+		"response.created",
+		"response.failed",
+		"response.completed",
+	])("uses the shared cache-write normalization for %s usage", async (eventName) => {
+		const provider = new CodexProvider();
+		const traceDir = mkdtempSync(join(tmpdir(), "codex-trace-usage-"));
+		process.env[CODEX_TRACE_DIR_ENV] = traceDir;
+		try {
+			const responsePayload: Record<string, unknown> = {
+				id: `resp_${eventName}`,
+				model: "gpt-5.4",
+				usage: {
+					input_tokens: 42,
+					output_tokens: 7,
+					input_tokens_details: {
+						cached_tokens: 5,
+						cache_write_tokens: 99,
+					},
+				},
+			};
+			if (eventName === "response.failed") {
+				responsePayload.error = {
+					type: "api_error",
+					message: "failed",
+				};
+			}
+			const transformed = await provider.processResponse(
+				new Response(
+					sseBody(eventLine(eventName, { response: responsePayload })),
+					{
+						status: 200,
+						headers: { "content-type": "text/event-stream" },
+					},
+				),
+				null,
+			);
+			await transformed.text();
+			const record = readTraceRecords(traceDir).find(
+				(candidate) => candidate.phase === "response",
+			);
+
+			expect(record).toMatchObject({
+				input_tokens: 42,
+				cache_read_input_tokens: 5,
+				cache_creation_input_tokens: 37,
+			});
+		} finally {
+			rmSync(traceDir, { recursive: true, force: true });
+		}
+	});
+
+	it("traces response protocol identities only as keyed markers", async () => {
+		const provider = new CodexProvider();
+		const traceDir = mkdtempSync(join(tmpdir(), "codex-trace-protocol-"));
+		process.env[CODEX_TRACE_DIR_ENV] = traceDir;
+		process.env[CODEX_TRACE_HMAC_KEY_ENV] = "test-only-key";
+		try {
+			const upstreamBody = sseBody([
+				...eventLine("response.created", {
+					response: { id: "private-response-id", model: "gpt-5.4" },
+				}),
+				...eventLine("response.completed", {
+					response: {
+						id: "private-response-id",
+						model: "gpt-5.4",
+						usage: {
+							input_tokens: 10,
+							output_tokens: 1,
+							input_tokens_details: { cached_tokens: 0 },
+						},
+					},
+				}),
+			]);
+			const response = new Response(upstreamBody, {
+				status: 200,
+				headers: {
+					"content-type": "text/event-stream",
+					"x-codex-turn-state": "private-turn-state",
+				},
+			});
+
+			await (await provider.processResponse(response, null)).text();
+			const rawTrace = readFileSync(
+				join(
+					traceDir,
+					readdirSync(traceDir).find((name) =>
+						name.endsWith(".jsonl"),
+					) as string,
+				),
+				"utf8",
+			);
+			const record = readTraceRecords(traceDir).find(
+				(candidate) => candidate.phase === "response",
+			);
+
+			expect(record).toMatchObject({
+				codex_turn_state_present: true,
+				response_id_present: true,
+			});
+			expect(record?.codex_turn_state_hmac).toBeString();
+			expect(record?.response_id_hmac).toBeString();
+			expect(rawTrace).not.toContain("private-turn-state");
+			expect(rawTrace).not.toContain("private-response-id");
+		} finally {
+			rmSync(traceDir, { recursive: true, force: true });
+		}
 	});
 
 	for (const contentType of [undefined, "text/event-stream"]) {

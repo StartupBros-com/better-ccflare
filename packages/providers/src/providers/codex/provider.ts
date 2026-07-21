@@ -33,7 +33,7 @@ import {
 	writeCodexResponseTrace,
 	writeCodexTrace,
 } from "./trace";
-import { normalizeCodexInputUsage } from "./usage";
+import { normalizeCodexResponseInputUsage } from "./usage";
 
 const log = new Logger("CodexProvider");
 
@@ -429,6 +429,9 @@ interface StreamState {
 	traceNewToolCalls: ToolCallSummary[];
 	traceRequestId: string;
 	traceAttemptId?: string;
+	traceTurnStateHeaderPresent: boolean;
+	traceTurnState: string | null;
+	traceResponseId: string | null;
 	// One terminal response trace per physical attempt, across every terminal
 	// path (completed, failed, abrupt EOF, read error, downstream cancel).
 	terminalTraceWritten: boolean;
@@ -452,6 +455,9 @@ function writeCodexStreamTerminalTrace(
 		modelOut: state.model,
 		modelContextWindow: resolveModelContextCapability("codex", state.model)
 			?.rawContextWindow,
+		turnStateHeaderPresent: state.traceTurnStateHeaderPresent,
+		turnState: state.traceTurnState,
+		responseId: state.traceResponseId,
 		summary: summarizeCodexResponse(
 			state.traceNewToolCalls,
 			state.usageMeasurementAvailable
@@ -815,6 +821,8 @@ export class CodexProvider extends BaseProvider {
 		const contentType = response.headers.get("content-type");
 		const requestId = response.headers.get("x-better-ccflare-request-id");
 		const attemptId = response.headers.get("x-better-ccflare-attempt-id");
+		const turnStateHeaderPresent = response.headers.has("x-codex-turn-state");
+		const turnState = response.headers.get("x-codex-turn-state");
 		const finalModel =
 			response.headers.get("x-better-ccflare-final-model") ?? undefined;
 		const headerRequestedStream = response.headers.get(
@@ -880,6 +888,8 @@ export class CodexProvider extends BaseProvider {
 			requestId: requestId ?? "unknown",
 			attemptId: attemptId ?? undefined,
 			modelOut: finalModel ?? "unknown",
+			turnStateHeaderPresent,
+			turnState,
 			summary: summarizeCodexResponse(
 				[],
 				{},
@@ -1307,21 +1317,16 @@ export class CodexProvider extends BaseProvider {
 		const inputTokenDetails = usageRecord?.input_tokens_details as
 			| Record<string, unknown>
 			| undefined;
-		const normalized = normalizeCodexInputUsage(
+		const normalized = normalizeCodexResponseInputUsage(
 			inputTokens,
-			inputTokenDetails?.cached_tokens,
+			inputTokenDetails,
 		);
 
 		return {
 			current_usage: {
 				input_tokens: normalized.inputTokens,
 				cache_read_input_tokens: normalized.cacheReadInputTokens,
-				cache_creation_input_tokens:
-					typeof inputTokenDetails?.cache_creation_input_tokens === "number" &&
-					Number.isFinite(inputTokenDetails.cache_creation_input_tokens) &&
-					inputTokenDetails.cache_creation_input_tokens >= 0
-						? inputTokenDetails.cache_creation_input_tokens
-						: 0,
+				cache_creation_input_tokens: normalized.cacheCreationInputTokens,
 			},
 			context_window_size: contextWindowSize,
 		};
@@ -1812,6 +1817,9 @@ export class CodexProvider extends BaseProvider {
 			traceNewToolCalls: [],
 			traceRequestId: requestId,
 			traceAttemptId: attemptId,
+			traceTurnStateHeaderPresent: response.headers.has("x-codex-turn-state"),
+			traceTurnState: response.headers.get("x-codex-turn-state"),
+			traceResponseId: null,
 			terminalTraceWritten: false,
 		};
 
@@ -2270,6 +2278,7 @@ export class CodexProvider extends BaseProvider {
 							output_tokens?: number;
 							input_tokens_details?: {
 								cached_tokens?: number;
+								cache_write_tokens?: number;
 								cache_creation_input_tokens?: number;
 							};
 					  }
@@ -2280,9 +2289,9 @@ export class CodexProvider extends BaseProvider {
 					state.cacheMeasurementAvailable =
 						state.usageMeasurementAvailable &&
 						typeof usage.input_tokens_details?.cached_tokens === "number";
-					const normalized = normalizeCodexInputUsage(
+					const normalized = normalizeCodexResponseInputUsage(
 						usage.input_tokens,
-						usage.input_tokens_details?.cached_tokens,
+						usage.input_tokens_details,
 					);
 					state.totalInputTokens = normalized.totalInputTokens;
 					state.inputTokens = normalized.inputTokens;
@@ -2294,18 +2303,14 @@ export class CodexProvider extends BaseProvider {
 					) {
 						state.outputTokens = usage.output_tokens;
 					}
-					const cacheCreation =
-						usage.input_tokens_details?.cache_creation_input_tokens;
-					if (
-						typeof cacheCreation === "number" &&
-						Number.isFinite(cacheCreation) &&
-						cacheCreation >= 0
-					) {
-						state.cacheCreationInputTokens = cacheCreation;
-					}
+					state.cacheCreationInputTokens = normalized.cacheCreationInputTokens;
 				}
-				const respId = (resp?.id as string) || state.messageId;
+				const respId =
+					typeof resp?.id === "string" && resp.id ? resp.id : state.messageId;
 				state.messageId = respId;
+				if (typeof resp?.id === "string" && resp.id) {
+					state.traceResponseId = resp.id;
+				}
 				state.model = (resp?.model as string) || state.model;
 				if (
 					state.hasSentMessageStart ||
@@ -2506,6 +2511,7 @@ export class CodexProvider extends BaseProvider {
 							output_tokens?: number;
 							input_tokens_details?: {
 								cached_tokens?: number;
+								cache_write_tokens?: number;
 								cache_creation_input_tokens?: number;
 							};
 					  }
@@ -2517,9 +2523,9 @@ export class CodexProvider extends BaseProvider {
 					typeof usage?.input_tokens_details?.cached_tokens === "number";
 				if (usage) {
 					const details = usage.input_tokens_details;
-					const normalized = normalizeCodexInputUsage(
+					const normalized = normalizeCodexResponseInputUsage(
 						usage.input_tokens,
-						details?.cached_tokens,
+						details,
 					);
 					state.totalInputTokens = normalized.totalInputTokens;
 					state.inputTokens = normalized.inputTokens;
@@ -2531,12 +2537,10 @@ export class CodexProvider extends BaseProvider {
 					) {
 						state.outputTokens = usage.output_tokens;
 					}
-					state.cacheCreationInputTokens =
-						typeof details?.cache_creation_input_tokens === "number" &&
-						Number.isFinite(details.cache_creation_input_tokens) &&
-						details.cache_creation_input_tokens >= 0
-							? details.cache_creation_input_tokens
-							: 0;
+					state.cacheCreationInputTokens = normalized.cacheCreationInputTokens;
+				}
+				if (typeof response?.id === "string" && response.id) {
+					state.traceResponseId = response.id;
 				}
 				if (typeof response?.model === "string") state.model = response.model;
 				state.contextWindow = this.extractContextWindow(response, usage);
@@ -2568,6 +2572,7 @@ export class CodexProvider extends BaseProvider {
 							output_tokens?: number;
 							input_tokens_details?: {
 								cached_tokens?: number;
+								cache_write_tokens?: number;
 								cache_creation_input_tokens?: number;
 							};
 					  }
@@ -2579,16 +2584,10 @@ export class CodexProvider extends BaseProvider {
 				state.cacheMeasurementAvailable =
 					state.usageMeasurementAvailable &&
 					typeof inputTokenDetails?.cached_tokens === "number";
-				const normalizedInput = normalizeCodexInputUsage(
+				const normalizedInput = normalizeCodexResponseInputUsage(
 					usage?.input_tokens,
-					inputTokenDetails?.cached_tokens,
+					inputTokenDetails,
 				);
-				const cacheCreation =
-					typeof inputTokenDetails?.cache_creation_input_tokens === "number" &&
-					Number.isFinite(inputTokenDetails.cache_creation_input_tokens) &&
-					inputTokenDetails.cache_creation_input_tokens >= 0
-						? inputTokenDetails.cache_creation_input_tokens
-						: 0;
 
 				state.totalInputTokens = normalizedInput.totalInputTokens;
 				state.inputTokens = normalizedInput.inputTokens;
@@ -2599,7 +2598,11 @@ export class CodexProvider extends BaseProvider {
 						? usage.output_tokens
 						: state.outputTokens;
 				state.cacheReadInputTokens = normalizedInput.cacheReadInputTokens;
-				state.cacheCreationInputTokens = cacheCreation;
+				state.cacheCreationInputTokens =
+					normalizedInput.cacheCreationInputTokens;
+				if (typeof resp?.id === "string" && resp.id) {
+					state.traceResponseId = resp.id;
+				}
 				state.contextWindow = this.extractContextWindow(resp, usage);
 				// Close any lingering content block
 				if (state.hasSentContentBlockStart) {

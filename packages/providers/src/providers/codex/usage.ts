@@ -16,19 +16,49 @@ export interface NormalizedCodexInputUsage {
 	/** Anthropic's additive, uncached input token field. */
 	inputTokens: number;
 	cacheReadInputTokens: number;
+	cacheCreationInputTokens: number;
+}
+
+/**
+ * Normalize OpenAI Responses cache-write usage to Anthropic's legacy cache
+ * creation field. Current Responses payloads use `cache_write_tokens`; older
+ * endpoints and fixtures used `cache_creation_input_tokens`.
+ */
+export function normalizeCodexCacheWriteTokens(
+	inputTokenDetails: unknown,
+): number {
+	if (
+		typeof inputTokenDetails !== "object" ||
+		inputTokenDetails === null ||
+		Array.isArray(inputTokenDetails)
+	) {
+		return 0;
+	}
+	const details = inputTokenDetails as Record<string, unknown>;
+	for (const field of [
+		"cache_write_tokens",
+		"cache_creation_input_tokens",
+	] as const) {
+		const value = details[field];
+		if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+			return value;
+		}
+	}
+	return 0;
 }
 
 /**
  * Convert Codex's cache-inclusive input total to Anthropic's additive usage
  * fields. OpenAI's usage.input_tokens counts cached tokens toward the total;
  * Anthropic's input_tokens is additive and excludes tokens already reported
- * via cache_read_input_tokens. Copying the inclusive total into both fields
- * double-counts cached tokens for clients and billing that expect Anthropic
- * semantics.
+ * via cache_read_input_tokens or cache_creation_input_tokens. Copying the
+ * inclusive total into any additive field double-counts tokens for clients and
+ * billing that expect Anthropic semantics.
  */
 export function normalizeCodexInputUsage(
 	totalInputTokens: unknown,
 	cachedTokens: unknown,
+	cacheCreationTokens: unknown = 0,
 ): NormalizedCodexInputUsage {
 	const total =
 		typeof totalInputTokens === "number" &&
@@ -42,12 +72,40 @@ export function normalizeCodexInputUsage(
 		cachedTokens >= 0
 			? Math.min(cachedTokens, total)
 			: 0;
+	const cacheCreation =
+		typeof cacheCreationTokens === "number" &&
+		Number.isFinite(cacheCreationTokens) &&
+		cacheCreationTokens >= 0
+			? Math.min(cacheCreationTokens, total - cached)
+			: 0;
 
 	return {
 		totalInputTokens: total,
-		inputTokens: total - cached,
+		inputTokens: total - cached - cacheCreation,
 		cacheReadInputTokens: cached,
+		cacheCreationInputTokens: cacheCreation,
 	};
+}
+
+/**
+ * Normalize an OpenAI Responses `input_tokens_details` object into Anthropic's
+ * additive input fields without double-counting the inclusive input total.
+ */
+export function normalizeCodexResponseInputUsage(
+	totalInputTokens: unknown,
+	inputTokenDetails: unknown,
+): NormalizedCodexInputUsage {
+	const details =
+		typeof inputTokenDetails === "object" &&
+		inputTokenDetails !== null &&
+		!Array.isArray(inputTokenDetails)
+			? (inputTokenDetails as Record<string, unknown>)
+			: {};
+	return normalizeCodexInputUsage(
+		totalInputTokens,
+		details.cached_tokens,
+		normalizeCodexCacheWriteTokens(details),
+	);
 }
 
 function parseNumber(value: string | null): number | null {
