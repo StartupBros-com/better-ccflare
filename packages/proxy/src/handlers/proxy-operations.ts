@@ -42,6 +42,11 @@ import {
 	stageCacheBodyForTransportAttempt,
 	stripCacheControlFromReplayBody,
 } from "../cache-transport-staging";
+import {
+	type CodexWebSocketReceipt,
+	codexWebSocketTransport,
+	createCodexWebSocketNoReplayResponse,
+} from "../codex-websocket-transport";
 
 export type {
 	CacheBodyStagingAction,
@@ -1421,6 +1426,8 @@ export async function proxyWithAccount(
 		| ReturnType<typeof resolveAttemptCommitmentDeadline>
 		| undefined;
 	let activeAttemptCommitment: AnthropicPreCommitAttemptScope | undefined;
+	let currentCodexWebSocketReceipt: CodexWebSocketReceipt | null = null;
+	const getCurrentCodexWebSocketReceipt = () => currentCodexWebSocketReceipt;
 	const readAttemptBoundJson: ResponseJsonReader = (response) =>
 		activeAttemptCommitment?.readJson(response) ??
 		readResponseCloneJson(response);
@@ -1428,7 +1435,12 @@ export async function proxyWithAccount(
 		error instanceof AnthropicPreCommitAttemptDeadlineError ||
 		routingSignal.aborted ||
 		activeAttemptCommitment?.signal.aborted === true;
-	const makeAttemptRequest = async (request: Request): Promise<Response> => {
+	const makeAttemptRequest = async (
+		request: Request,
+		optionalOutboundTransport?: (
+			signal: AbortSignal,
+		) => Promise<Response | null>,
+	): Promise<Response> => {
 		// The outer context exists only for an Anthropic-shaped downstream request.
 		// Any real provider transport can hang before headers (including transformed
 		// OpenAI-compatible routes), so start rescue immediately before every fetch.
@@ -1438,15 +1450,20 @@ export async function proxyWithAccount(
 		latestTransportCommitment = commitment;
 		activeAttemptCommitment?.dispose();
 		activeAttemptCommitment = undefined;
-		if (!commitment) {
+		const dispatch = async (signal: AbortSignal): Promise<Response> => {
+			const optionalResponse = await optionalOutboundTransport?.(signal);
+			if (optionalResponse) return optionalResponse;
 			return makeProxyRequest(
 				request,
 				undefined,
 				undefined,
 				undefined,
 				undefined,
-				routingSignal,
+				signal,
 			);
+		};
+		if (!commitment) {
+			return dispatch(routingSignal);
 		}
 
 		const attemptCommitment = new AnthropicPreCommitAttemptScope(
@@ -1459,16 +1476,14 @@ export async function proxyWithAccount(
 		}
 
 		try {
-			return await makeProxyRequest(
-				request,
-				undefined,
-				undefined,
-				undefined,
-				undefined,
-				attemptCommitment.signal,
-			);
+			return await dispatch(attemptCommitment.signal);
 		} catch (error) {
 			if (attemptCommitment.isPrivateDeadline()) {
+				const websocketReceipt = getCurrentCodexWebSocketReceipt();
+				if (websocketReceipt?.frameWritten) {
+					websocketReceipt.markPostWriteFailure("semantic_stall");
+					return createCodexWebSocketNoReplayResponse(504, "semantic_stall");
+				}
 				throw attemptCommitment.deadlineError;
 			}
 			throw error;
@@ -1808,9 +1823,26 @@ export async function proxyWithAccount(
 						? resolvedModel
 						: null,
 			});
-			return isSynthetic
-				? materializeSyntheticResponse(transportRequest)
-				: makeAttemptRequest(transportRequest);
+			if (isSynthetic) {
+				currentCodexWebSocketReceipt = null;
+				return materializeSyntheticResponse(transportRequest);
+			}
+			return makeAttemptRequest(transportRequest, async (signal) => {
+				currentCodexWebSocketReceipt = null;
+				if (provider.name !== "codex") return null;
+				const websocketAttempt = await codexWebSocketTransport.tryRequest({
+					accountId: account.id,
+					providerName: provider.name,
+					request: transportRequest,
+					signal,
+					onFrameWritten: (receipt) => {
+						currentCodexWebSocketReceipt = receipt;
+					},
+				});
+				if (!websocketAttempt) return null;
+				currentCodexWebSocketReceipt = websocketAttempt.receipt;
+				return websocketAttempt.response;
+			});
 		};
 		const enforcePhysicalModelAfterTransform = async (
 			transportRequest: Request,
@@ -3479,7 +3511,16 @@ export async function proxyWithAccount(
 				});
 				break;
 			} catch (error) {
+				const websocketReceipt = getCurrentCodexWebSocketReceipt();
 				if (activeAttemptCommitment?.isPrivateDeadline()) {
+					if (websocketReceipt?.frameWritten) {
+						websocketReceipt.markPostWriteFailure("semantic_stall");
+						response = createCodexWebSocketNoReplayResponse(
+							504,
+							"semantic_stall",
+						);
+						break;
+					}
 					// The fetch and semantic gate share this candidate's private
 					// commitment signal. Preserve that control-flow identity even when
 					// aborting the transport makes reader.read() reject first; otherwise
@@ -3492,6 +3533,26 @@ export async function proxyWithAccount(
 					error instanceof AnthropicPreCommitAbortedError
 				) {
 					throw error;
+				}
+				// A Responses WebSocket request cannot be replayed once response.create
+				// has been written: the server may have accepted the turn even when no
+				// meaningful downstream event arrived. Surface one final error and pin
+				// this conversation to HTTP before considering any HTTP/cache-lane retry.
+				if (websocketReceipt?.frameWritten) {
+					const isSemanticTimeout =
+						error instanceof AnthropicPreCommitStallError &&
+						error.errorType === undefined &&
+						(error.reason === "semantic_timeout" ||
+							error.reason === "meaningful_progress_timeout");
+					const failureCategory = isSemanticTimeout
+						? "semantic_stall"
+						: "post_write_error";
+					websocketReceipt.markPostWriteFailure(failureCategory);
+					response = createCodexWebSocketNoReplayResponse(
+						isSemanticTimeout ? 504 : 502,
+						failureCategory,
+					);
+					break;
 				}
 				if (!(error instanceof AnthropicPreCommitStallError)) throw error;
 				if (
