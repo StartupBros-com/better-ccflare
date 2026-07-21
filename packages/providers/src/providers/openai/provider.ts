@@ -197,17 +197,16 @@ export class OpenAICompatibleProvider extends BaseProvider {
 			} catch {
 				endpoint = "https://api.openai.com";
 			}
-			const model = typeof body?.model === "string" ? body.model : undefined;
-
 			const effectiveAccount = this.beforeConvert(body, account);
 			const openaiBody = convertAnthropicRequestToOpenAI(
 				body,
 				effectiveAccount,
 			);
-			this.afterConvert(openaiBody, endpoint, model);
+			const physicalModel = openaiBody.model;
+			this.afterConvert(openaiBody, endpoint, physicalModel);
 
 			// Inject enable_thinking for reasoning models on DashScope
-			this.injectDashScopeReasoning(openaiBody, body, endpoint, model);
+			this.injectDashScopeReasoning(openaiBody, body, endpoint, physicalModel);
 
 			const newHeaders = new Headers(request.headers);
 			newHeaders.set("content-type", "application/json");
