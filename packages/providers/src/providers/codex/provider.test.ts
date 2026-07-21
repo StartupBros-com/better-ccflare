@@ -4487,6 +4487,120 @@ describe("CodexProvider.transformRequestBody", () => {
 		expect(body.prompt_cache_key).toMatch(/^ccflare-convo-[0-9a-f]{48}$/);
 	});
 
+	it("rotates only an official subscription cache key for a cache-lane rescue", async () => {
+		process.env[CODEX_PROMPT_CACHE_KEY_ENV] = "1";
+		const provider = new CodexProvider();
+		const payload = JSON.stringify({
+			model: "claude-opus-4-8",
+			max_tokens: 10,
+			metadata: {
+				user_id: JSON.stringify({
+					session_id: "11111111-1111-4111-8111-111111111111",
+				}),
+			},
+			messages: [{ role: "user", content: "hello" }],
+		});
+		const transform = async (
+			cause: "initial" | "cache_lane_rescue",
+			requestId: string,
+			endpoint = CODEX_DEFAULT_ENDPOINT,
+			account?: Parameters<CodexProvider["transformRequestBody"]>[1],
+		) => {
+			const request = new Request(endpoint, {
+				method: "POST",
+				headers: {
+					"content-type": "application/json",
+					"x-better-ccflare-request-id": requestId,
+					"x-better-ccflare-attempt-id": `${cause}-attempt`,
+					"x-better-ccflare-attempt-ordinal": cause === "initial" ? "1" : "2",
+					"x-better-ccflare-attempt-cause": cause,
+				},
+				body: payload,
+			});
+			return provider
+				.transformRequestBody(request, account)
+				.then((response) => response.json()) as Promise<{
+				prompt_cache_key?: string;
+			}>;
+		};
+
+		const initial = await transform("initial", "logical-request-a");
+		const repeatedInitial = await transform("initial", "logical-request-a");
+		const rescue = await transform("cache_lane_rescue", "logical-request-a");
+		const repeatedRescue = await transform(
+			"cache_lane_rescue",
+			"logical-request-a",
+		);
+		const otherRequestRescue = await transform(
+			"cache_lane_rescue",
+			"logical-request-b",
+		);
+
+		expect(initial.prompt_cache_key).toMatch(/^ccflare-convo-[0-9a-f]{48}$/);
+		expect(repeatedInitial.prompt_cache_key).toBe(initial.prompt_cache_key);
+		expect(rescue.prompt_cache_key).toMatch(/^ccflare-rescue-[0-9a-f]{48}$/);
+		expect(rescue.prompt_cache_key).not.toBe(initial.prompt_cache_key);
+		expect(repeatedRescue.prompt_cache_key).toBe(rescue.prompt_cache_key);
+		expect(otherRequestRescue.prompt_cache_key).not.toBe(
+			rescue.prompt_cache_key,
+		);
+
+		const customAccount = {
+			name: "custom-codex",
+			custom_endpoint: "https://my-openai-proxy.example.com/v1/responses",
+		} as Parameters<CodexProvider["transformRequestBody"]>[1];
+		const customRescue = await transform(
+			"cache_lane_rescue",
+			"logical-request-a",
+			customAccount.custom_endpoint ?? undefined,
+			customAccount,
+		);
+		expect(customRescue.prompt_cache_key).toBeUndefined();
+	});
+
+	it("traces cache-lane rescue as a distinct physical attempt cause", async () => {
+		const traceDir = mkdtempSync(join(tmpdir(), "codex-trace-"));
+		process.env[CODEX_TRACE_DIR_ENV] = traceDir;
+		try {
+			const request = new Request(CODEX_DEFAULT_ENDPOINT, {
+				method: "POST",
+				headers: {
+					"content-type": "application/json",
+					"x-better-ccflare-request-id": "logical-rescue",
+					"x-better-ccflare-attempt-id": "physical-rescue",
+					"x-better-ccflare-attempt-ordinal": "2",
+					"x-better-ccflare-attempt-cause": "cache_lane_rescue",
+				},
+				body: JSON.stringify({
+					model: "claude-opus-4-8",
+					max_tokens: 10,
+					metadata: {
+						user_id: JSON.stringify({
+							session_id: "11111111-1111-4111-8111-111111111111",
+						}),
+					},
+					messages: [{ role: "user", content: "hello" }],
+				}),
+			});
+
+			await new CodexProvider().transformRequestBody(request);
+			const record = readTraceRecords(traceDir).find(
+				(candidate) => candidate.phase === "request",
+			);
+
+			expect(record).toMatchObject({
+				request_id: "logical-rescue",
+				attempt_id: "physical-rescue",
+				attempt_ordinal: 2,
+				attempt_cause: "cache_lane_rescue",
+				prompt_cache_key_set: true,
+			});
+		} finally {
+			delete process.env[CODEX_TRACE_DIR_ENV];
+			rmSync(traceDir, { recursive: true, force: true });
+		}
+	});
+
 	it("omits prompt_cache_key when explicitly disabled", async () => {
 		process.env[CODEX_PROMPT_CACHE_KEY_ENV] = "0";
 		const provider = new CodexProvider();

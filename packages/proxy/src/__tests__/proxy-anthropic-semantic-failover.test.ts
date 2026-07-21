@@ -250,6 +250,54 @@ const OPENAI_STRUCTURAL_CHUNK = JSON.stringify({
 	],
 });
 
+const CODEX_SESSION = "11111111-1111-4111-8111-111111111111";
+const CODEX_STRUCTURAL_FRAMES = [
+	{
+		event: "response.created",
+		data: { response: { id: "resp-stalled", model: "gpt-5.4" } },
+	},
+	{
+		event: "response.in_progress",
+		data: { response: { id: "resp-stalled", model: "gpt-5.4" } },
+	},
+] as const;
+
+function codexEventStream(
+	events: readonly { event: string; data: unknown }[],
+	complete = false,
+): string {
+	return `${events
+		.map(
+			({ event, data }) =>
+				`event: ${event}\ndata: ${JSON.stringify({ type: event, ...data })}\n\n`,
+		)
+		.join("")}${complete ? "data: [DONE]\n\n" : ""}`;
+}
+
+const CODEX_SUCCESS_STREAM = codexEventStream(
+	[
+		{
+			event: "response.created",
+			data: { response: { id: "resp-success", model: "gpt-5.4" } },
+		},
+		{
+			event: "response.output_text.delta",
+			data: { delta: "codex recovered" },
+		},
+		{
+			event: "response.completed",
+			data: {
+				response: {
+					id: "resp-success",
+					model: "gpt-5.4",
+					usage: { input_tokens: 10, output_tokens: 2 },
+				},
+			},
+		},
+	],
+	true,
+);
+
 function openAiContentChunk(text: string): string {
 	return JSON.stringify({
 		id: "chatcmpl-content",
@@ -304,6 +352,39 @@ function makeAccount(id: string): Account {
 
 function makeXaiAccount(id: string): Account {
 	return { ...makeAccount(id), provider: "xai" };
+}
+
+function makeCodexAccount(
+	id: string,
+	customEndpoint: string | null = null,
+): Account {
+	return {
+		...makeAccount(id),
+		provider: "codex",
+		api_key: null,
+		access_token: `access-${id}`,
+		refresh_token: null,
+		expires_at: Date.now() + 60 * 60 * 1000,
+		custom_endpoint: customEndpoint,
+	};
+}
+
+function stalledCodexEventStream(
+	events: readonly { event: string; data: unknown }[],
+	onCancel: () => void,
+): ReadableStream<Uint8Array> {
+	return new ReadableStream({
+		start(controller) {
+			controller.enqueue(encoder.encode(codexEventStream(events)));
+		},
+		cancel() {
+			onCancel();
+		},
+	});
+}
+
+function stalledCodexStream(onCancel: () => void): ReadableStream<Uint8Array> {
+	return stalledCodexEventStream(CODEX_STRUCTURAL_FRAMES, onCancel);
 }
 
 function byteStream(bytes: string): ReadableStream<Uint8Array> {
@@ -610,6 +691,23 @@ function makeRequest(
 	});
 }
 
+function makeCodexRequest(): Request {
+	const request = makeRequest();
+	return new Request(request.url, {
+		method: request.method,
+		headers: request.headers,
+		body: JSON.stringify({
+			model: MODEL,
+			messages: [{ role: "user", content: "hello" }],
+			metadata: {
+				user_id: JSON.stringify({ session_id: CODEX_SESSION }),
+			},
+			max_tokens: 16,
+			stream: true,
+		}),
+	});
+}
+
 beforeEach(() => {
 	process.env[TIMEOUT_ENV] = "20";
 	delete process.env[POST_COMMIT_MEANINGFUL_PROGRESS_ENV];
@@ -644,6 +742,257 @@ afterEach(() => {
 });
 
 describe("downstream Anthropic Messages SSE routing", () => {
+	it("retries one official Codex precommit stall on the same route with a rotated cache lane", async () => {
+		process.env[MEANINGFUL_PROGRESS_ENV] = "80";
+		const account = makeCodexAccount("codex-stall-a");
+		const { ctx, reportCandidateFailure, reportCandidateSuccess } = makeContext(
+			[account],
+			makeCombo([account]),
+		);
+		const outboundKeys: string[] = [];
+		const outboundModels: string[] = [];
+		let firstCancelCount = 0;
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			const body = (await upstreamRequest.clone().json()) as {
+				model: string;
+				prompt_cache_key: string;
+			};
+			outboundKeys.push(body.prompt_cache_key);
+			outboundModels.push(body.model);
+			if (outboundKeys.length === 1) {
+				return sseResponse(stalledCodexStream(() => firstCancelCount++));
+			}
+			return sseResponse(byteStream(CODEX_SUCCESS_STREAM));
+		}) as unknown as typeof fetch;
+
+		const request = makeCodexRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.text();
+
+		expect(response.status).toBe(200);
+		expect(outboundKeys).toHaveLength(2);
+		expect(outboundKeys[0]).toMatch(/^ccflare-convo-[0-9a-f]{48}$/);
+		expect(outboundKeys[1]).toMatch(/^ccflare-rescue-[0-9a-f]{48}$/);
+		expect(outboundKeys[1]).not.toBe(outboundKeys[0]);
+		expect(outboundModels[1]).toBe(outboundModels[0]);
+		expect(firstCancelCount).toBe(1);
+		expect(body).toContain('"text":"codex recovered"');
+		expect(body.match(/event: message_start/g)).toHaveLength(1);
+		expect(body).not.toContain("resp-stalled");
+		expect(usageHandleStart).toHaveBeenCalledTimes(1);
+		expect(usageHandleEnd).toHaveBeenCalledTimes(1);
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+		expect(reportCandidateSuccess).toHaveBeenCalledTimes(1);
+	});
+
+	it("bounds Codex cache-lane rescue to one retry and preserves fallback time", async () => {
+		process.env[TIMEOUT_ENV] = "30";
+		process.env[MEANINGFUL_PROGRESS_ENV] = "80";
+		process.env[RESCUE_DEADLINE_ENV] = "500";
+		const stalled = makeCodexAccount("codex-stall-twice");
+		const fallback = makeCodexAccount("codex-fallback");
+		const { ctx } = makeContext(
+			[stalled, fallback],
+			makeCombo([stalled, fallback]),
+		);
+		const fetchedAccounts: string[] = [];
+		let cancelCount = 0;
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			const bearer = upstreamRequest.headers.get("authorization") ?? "";
+			const accountId = bearer.replace(/^Bearer access-/, "");
+			fetchedAccounts.push(accountId);
+			if (accountId === stalled.id) {
+				return sseResponse(stalledCodexStream(() => cancelCount++));
+			}
+			return sseResponse(byteStream(CODEX_SUCCESS_STREAM));
+		}) as unknown as typeof fetch;
+
+		const request = makeCodexRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.text();
+
+		expect(fetchedAccounts).toEqual([stalled.id, stalled.id, fallback.id]);
+		expect(cancelCount).toBe(2);
+		expect(response.status).toBe(200);
+		expect(body).toContain('"text":"codex recovered"');
+	});
+
+	it("returns the existing 503 after exactly two stalled Codex cache-lane attempts", async () => {
+		process.env[TIMEOUT_ENV] = "20";
+		process.env[MEANINGFUL_PROGRESS_ENV] = "500";
+		const account = makeCodexAccount("codex-both-stall");
+		const { ctx } = makeContext([account]);
+		const outboundKeys: string[] = [];
+		let cancelCount = 0;
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			const body = (await upstreamRequest.clone().json()) as {
+				prompt_cache_key: string;
+			};
+			outboundKeys.push(body.prompt_cache_key);
+			return sseResponse(stalledCodexStream(() => cancelCount++));
+		}) as unknown as typeof fetch;
+
+		const request = makeCodexRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const payload = (await response.json()) as {
+			error: { code: string; attempted_routes: number };
+		};
+
+		expect(response.status).toBe(503);
+		expect(outboundKeys).toHaveLength(2);
+		expect(outboundKeys[0]).toMatch(/^ccflare-convo-/);
+		expect(outboundKeys[1]).toMatch(/^ccflare-rescue-/);
+		expect(cancelCount).toBe(2);
+		expect(payload.error).toMatchObject({
+			code: "route_unavailable",
+			attempted_routes: 1,
+		});
+	});
+
+	it("keeps the rescue inside the original Codex candidate deadline", async () => {
+		process.env[TIMEOUT_ENV] = "1000";
+		process.env[MEANINGFUL_PROGRESS_ENV] = "200";
+		const account = makeCodexAccount("codex-rescue-deadline");
+		const { ctx } = makeContext([account]);
+		let fetchCount = 0;
+		let rescueStartedAt: number | null = null;
+		const startedAt = Date.now();
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			fetchCount++;
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			if (fetchCount === 1) {
+				return sseResponse(stalledCodexStream(() => undefined));
+			}
+			rescueStartedAt = Date.now();
+			return await new Promise<Response>((_resolve, reject) => {
+				const rejectOnAbort = () =>
+					reject(new DOMException("candidate deadline", "AbortError"));
+				if (upstreamRequest.signal.aborted) rejectOnAbort();
+				else {
+					upstreamRequest.signal.addEventListener("abort", rejectOnAbort, {
+						once: true,
+					});
+				}
+			});
+		}) as unknown as typeof fetch;
+
+		const request = makeCodexRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.text();
+		const elapsedMs = Date.now() - startedAt;
+
+		expect(fetchCount).toBe(2);
+		expect(rescueStartedAt).not.toBeNull();
+		expect((rescueStartedAt ?? 0) - startedAt).toBeGreaterThanOrEqual(140);
+		expect(
+			(rescueStartedAt ?? Number.POSITIVE_INFINITY) - startedAt,
+		).toBeLessThan(200);
+		expect(elapsedMs).toBeGreaterThanOrEqual(150);
+		expect(elapsedMs).toBeLessThan(400);
+		expect(body).toContain(
+			"No compatible account route committed before the recovery deadline",
+		);
+	});
+
+	it("does not cache-lane retry a custom Codex endpoint", async () => {
+		const account = makeCodexAccount(
+			"codex-custom-stall",
+			"https://custom-codex.example.com/v1/responses",
+		);
+		const { ctx } = makeContext([account]);
+		let fetchCount = 0;
+		globalThis.fetch = mock(async () => {
+			fetchCount++;
+			return sseResponse(stalledCodexStream(() => undefined));
+		}) as unknown as typeof fetch;
+
+		const request = makeCodexRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		await response.text();
+
+		expect(fetchCount).toBe(1);
+		expect(response.status).toBe(503);
+	});
+
+	it.each([
+		"api_error",
+		"rate_limit_error",
+	] as const)("does not cache-lane retry a Codex %s SSE error", async (errorType) => {
+		const account = makeCodexAccount(`codex-${errorType}`);
+		const { ctx } = makeContext([account]);
+		let fetchCount = 0;
+		globalThis.fetch = mock(async () => {
+			fetchCount++;
+			return sseResponse(
+				byteStream(
+					codexEventStream(
+						[
+							CODEX_STRUCTURAL_FRAMES[0],
+							{
+								event: "response.failed",
+								data: {
+									response: {
+										status: "failed",
+										error: {
+											type: errorType,
+											message: "bounded test failure",
+										},
+									},
+								},
+							},
+						],
+						true,
+					),
+				),
+			);
+		}) as unknown as typeof fetch;
+
+		const request = makeCodexRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		await response.text();
+
+		expect(fetchCount).toBe(1);
+		expect(response.status).toBe(503);
+	});
+
+	it("does not cache-lane retry after Codex meaningful output commits", async () => {
+		process.env[POST_COMMIT_MEANINGFUL_PROGRESS_ENV] = "30";
+		const account = makeCodexAccount("codex-postcommit-stall");
+		const { ctx } = makeContext([account]);
+		let fetchCount = 0;
+		let cancelCount = 0;
+		globalThis.fetch = mock(async () => {
+			fetchCount++;
+			return sseResponse(
+				stalledCodexEventStream(
+					[
+						CODEX_STRUCTURAL_FRAMES[0],
+						{
+							event: "response.output_text.delta",
+							data: { delta: "committed partial" },
+						},
+					],
+					() => cancelCount++,
+				),
+			);
+		}) as unknown as typeof fetch;
+
+		const request = makeCodexRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.text();
+
+		expect(fetchCount).toBe(1);
+		expect(cancelCount).toBe(1);
+		expect(body).toContain('"text":"committed partial"');
+		expect(body).toContain("Response stalled after partial output");
+	});
 	it("keeps recognized Claude Code protocol-live past 180s while generic commitment and true-silence limits remain bounded", async () => {
 		delete process.env[TIMEOUT_ENV];
 		delete process.env[MEANINGFUL_PROGRESS_ENV];

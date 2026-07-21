@@ -78,6 +78,9 @@ const CODEX_CACHE_KEY_SESSION_BUCKET_DOMAIN =
 	"better-ccflare:codex-cache-key-session-canary:v1\0";
 const CODEX_CACHE_KEY_COHORT_DOMAIN =
 	"better-ccflare:codex-cache-key-cohort:v1\0";
+const CODEX_CACHE_LANE_RESCUE_DOMAIN =
+	"better-ccflare:codex-cache-lane-rescue:v1\0";
+const CODEX_CACHE_LANE_RESCUE_SALT_MAX_CHARS = 128;
 
 export function readCodexCacheKeySessionPercent(
 	raw = process.env[CODEX_CACHE_KEY_SESSION_PERCENT_ENV],
@@ -710,6 +713,11 @@ export class CodexProvider extends BaseProvider {
 				account,
 				requestId ?? undefined,
 				isAttributedAgent,
+				isSubscriptionEndpoint &&
+					attemptCause === "cache_lane_rescue" &&
+					requestId
+					? requestId.slice(0, CODEX_CACHE_LANE_RESCUE_SALT_MAX_CHARS)
+					: undefined,
 			);
 			if (isSubscriptionEndpoint) {
 				// ChatGPT's subscription Responses endpoint rejects this API-only field.
@@ -1010,6 +1018,7 @@ export class CodexProvider extends BaseProvider {
 		instructions: string,
 		input: readonly unknown[],
 		account?: Account,
+		cacheLaneRescueSalt?: string,
 	): CodexPromptCacheKeyDecision {
 		const ineligible: CodexPromptCacheKeyDecision = {
 			key: null,
@@ -1039,7 +1048,7 @@ export class CodexProvider extends BaseProvider {
 			explicitSessionOverride || assignment === "session" || input.length === 0
 				? "session"
 				: "conversation";
-		const key =
+		let key =
 			effectiveMode === "session"
 				? `ccflare-session-${createHash("sha256")
 						.update(sessionId)
@@ -1048,6 +1057,15 @@ export class CodexProvider extends BaseProvider {
 				: conversationIdentity
 					? `ccflare-convo-${conversationIdentity.slice(0, 48)}`
 					: null;
+		if (key && cacheLaneRescueSalt) {
+			key = `ccflare-rescue-${createHash("sha256")
+				.update(CODEX_CACHE_LANE_RESCUE_DOMAIN)
+				.update(key)
+				.update("\0")
+				.update(cacheLaneRescueSalt)
+				.digest("hex")
+				.slice(0, 48)}`;
+		}
 
 		return {
 			key,
@@ -1356,6 +1374,7 @@ export class CodexProvider extends BaseProvider {
 		account?: Account,
 		requestId?: string,
 		isAttributedAgent = false,
+		cacheLaneRescueSalt?: string,
 	): CodexConversionResult {
 		const model = this.mapModel(body.model, account);
 		if (process.env.DEBUG?.includes("model") || process.env.DEBUG === "true") {
@@ -1503,6 +1522,7 @@ export class CodexProvider extends BaseProvider {
 			codexRequest.instructions,
 			input,
 			account,
+			cacheLaneRescueSalt,
 		);
 		if (cacheKeyDecision.key) {
 			codexRequest.prompt_cache_key = cacheKeyDecision.key;
