@@ -7,11 +7,16 @@ import {
 	deviceSetupJobsNeedPolling,
 	FULL_MANAGED_ROUTING_INVALIDATION,
 	getAccountRoutingOverviewQueryOptions,
+	getApplyFamilyRoutingProposalMutationOptions,
+	getApplyRoutingProposalMutationOptions,
 	getDeviceSetupJobQueryOptions,
+	getExcludeAccountFromFamilyMutationOptions,
 	getForceResetRateLimitMutationOptions,
 	getPauseAccountMutationOptions,
+	getPreviewFamilyRoutingMutationOptions,
 	getRecentDeviceSetupJobsQueryOptions,
 	getRefreshUsageMutationOptions,
+	getRestoreAccountToFamilyMutationOptions,
 	getResumeAccountMutationOptions,
 	getRoutingPreviewMutationOptions,
 	getUpdateAccountAutoRefreshMutationOptions,
@@ -19,6 +24,7 @@ import {
 	getUpdateAccountCustomEndpointMutationOptions,
 	getUpdateAccountModelMappingsMutationOptions,
 	getUpdateAccountPriorityMutationOptions,
+	getUpdateFamilyPolicyMutationOptions,
 	invalidateManagedRouting,
 	ROUTING_CONFIGURATION_INVALIDATION,
 } from "./queries";
@@ -171,6 +177,48 @@ describe("routing preview mutation", () => {
 		expect(options).not.toHaveProperty("onSuccess");
 		expect(options).not.toHaveProperty("onSettled");
 	});
+
+	it("keeps family conversion preview read-only", () => {
+		const options = getPreviewFamilyRoutingMutationOptions();
+
+		expect(options).toHaveProperty("mutationFn");
+		expect(options).not.toHaveProperty("onSuccess");
+		expect(options).not.toHaveProperty("onSettled");
+	});
+});
+
+describe("family routing mutation invalidation", () => {
+	const routingConfigurationKeys = [
+		queryKeys.families(),
+		queryKeys.combos(),
+		queryKeys.routingEffective(),
+		queryKeys.accountRoutingOverview(),
+	];
+
+	for (const [name, getOptions] of [
+		["family policy", getUpdateFamilyPolicyMutationOptions],
+		["account proposal apply", getApplyRoutingProposalMutationOptions],
+		["family proposal apply", getApplyFamilyRoutingProposalMutationOptions],
+		["family exclusion", getExcludeAccountFromFamilyMutationOptions],
+		["family restore", getRestoreAccountToFamilyMutationOptions],
+	] as const) {
+		it(`${name} refreshes routing configuration without account records or device jobs`, async () => {
+			const { queryClient, invalidateQueries } = createQueryClientSpy();
+			const options = getOptions(queryClient);
+
+			await options.onSuccess();
+
+			expect(invalidatedKeys(invalidateQueries)).toEqual(
+				routingConfigurationKeys,
+			);
+			expect(invalidatedKeys(invalidateQueries)).not.toContainEqual(
+				queryKeys.accounts(),
+			);
+			expect(invalidatedKeys(invalidateQueries)).not.toContainEqual(
+				queryKeys.deviceSetupJobs(),
+			);
+		});
+	}
 });
 
 describe("usage-state mutation invalidation", () => {

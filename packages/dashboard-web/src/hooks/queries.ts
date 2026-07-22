@@ -2,6 +2,7 @@ import { getModelDisplayName } from "@better-ccflare/core";
 import type {
 	AgentUpdatePayload,
 	ComboFamily,
+	ComboMembershipMode,
 	ComboRoutingPreviewSubject,
 	ComboSlotCreateInput,
 	ComboSlotUpdateInput,
@@ -271,18 +272,113 @@ export const useRoutingPreview = () => {
 	return useMutation(getRoutingPreviewMutationOptions());
 };
 
+export interface UpdateFamilyPolicyVariables {
+	family: ComboFamily;
+	comboId?: string | null;
+	enabled?: boolean;
+	membershipMode?: ComboMembershipMode;
+	managedModel?: string | null;
+}
+
+export const getUpdateFamilyPolicyMutationOptions = (
+	queryClient: QueryClient,
+) => ({
+	mutationFn: (params: UpdateFamilyPolicyVariables) =>
+		api.updateFamilyPolicy(params),
+	onSuccess: () =>
+		invalidateManagedRouting(queryClient, ROUTING_CONFIGURATION_INVALIDATION),
+});
+
+export const useUpdateFamilyPolicy = () => {
+	const queryClient = useQueryClient();
+	return useMutation(getUpdateFamilyPolicyMutationOptions(queryClient));
+};
+
+export interface PreviewFamilyRoutingVariables {
+	family: ComboFamily;
+	managedModel?: string;
+}
+
+/** Family conversion preview is read-only and never invalidates cached state. */
+export const getPreviewFamilyRoutingMutationOptions = () => ({
+	mutationFn: ({ family, managedModel }: PreviewFamilyRoutingVariables) =>
+		api.previewFamilyRouting(family, managedModel),
+});
+
+export const usePreviewFamilyRouting = () =>
+	useMutation(getPreviewFamilyRoutingMutationOptions());
+
+export interface ApplyFamilyRoutingProposalVariables {
+	family: ComboFamily;
+	previewId: string;
+	proposalId: string;
+	managedModel: string;
+}
+
+export const getApplyFamilyRoutingProposalMutationOptions = (
+	queryClient: QueryClient,
+) => ({
+	mutationFn: (params: ApplyFamilyRoutingProposalVariables) =>
+		api.applyFamilyRoutingProposal(params),
+	onSuccess: () =>
+		invalidateManagedRouting(queryClient, ROUTING_CONFIGURATION_INVALIDATION),
+});
+
+export const useApplyFamilyRoutingProposal = () => {
+	const queryClient = useQueryClient();
+	return useMutation(getApplyFamilyRoutingProposalMutationOptions(queryClient));
+};
+
+export interface FamilyRoutingAccountVariables {
+	family: ComboFamily;
+	accountId: string;
+}
+
+export const getExcludeAccountFromFamilyMutationOptions = (
+	queryClient: QueryClient,
+) => ({
+	mutationFn: ({ family, accountId }: FamilyRoutingAccountVariables) =>
+		api.excludeAccountFromFamily(family, accountId),
+	onSuccess: () =>
+		invalidateManagedRouting(queryClient, ROUTING_CONFIGURATION_INVALIDATION),
+});
+
+export const useExcludeAccountFromFamily = () => {
+	const queryClient = useQueryClient();
+	return useMutation(getExcludeAccountFromFamilyMutationOptions(queryClient));
+};
+
+export const getRestoreAccountToFamilyMutationOptions = (
+	queryClient: QueryClient,
+) => ({
+	mutationFn: ({ family, accountId }: FamilyRoutingAccountVariables) =>
+		api.restoreAccountToFamily(family, accountId),
+	onSuccess: () =>
+		invalidateManagedRouting(queryClient, ROUTING_CONFIGURATION_INVALIDATION),
+});
+
+export const useRestoreAccountToFamily = () => {
+	const queryClient = useQueryClient();
+	return useMutation(getRestoreAccountToFamilyMutationOptions(queryClient));
+};
+
+export interface ApplyRoutingProposalVariables
+	extends ApplyFamilyRoutingProposalVariables {
+	accountId: string;
+}
+
+export const getApplyRoutingProposalMutationOptions = (
+	queryClient: QueryClient,
+) => ({
+	mutationFn: (params: ApplyRoutingProposalVariables) =>
+		api.applyRoutingProposal(params),
+	onSuccess: () =>
+		invalidateManagedRouting(queryClient, ROUTING_CONFIGURATION_INVALIDATION),
+});
+
 export const useApplyRoutingProposal = () => {
 	const queryClient = useQueryClient();
-	return useMutation({
-		mutationFn: (params: {
-			family: ComboFamily;
-			previewId: string;
-			proposalId: string;
-			accountId: string;
-			managedModel: string;
-		}) => api.applyRoutingProposal(params),
-		onSuccess: () => invalidateManagedRouting(queryClient),
-	});
+	return useMutation(getApplyRoutingProposalMutationOptions(queryClient));
 };
 
 export const useAgents = () => {

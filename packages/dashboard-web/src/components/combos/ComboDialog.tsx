@@ -62,14 +62,14 @@ export function ComboDialog({ isOpen, onClose, comboId }: ComboDialogProps) {
 
 	return (
 		<Dialog open={isOpen} onOpenChange={(open) => !open && handleClose()}>
-			<DialogContent className="flex max-h-[90vh] max-w-lg flex-col overflow-hidden">
+			<DialogContent className="flex max-h-[90vh] max-w-4xl flex-col overflow-hidden">
 				<DialogHeader>
 					<DialogTitle>
 						{isEditMode ? "Edit Combo" : "Create Combo"}
 					</DialogTitle>
 					<DialogDescription>
 						{isEditMode
-							? "Manage slots and settings for this combo"
+							? "Edit persisted Manual slots and inspect authoritative managed membership for every assigned family"
 							: "Define a new fallback chain for model families"}
 					</DialogDescription>
 				</DialogHeader>
@@ -78,6 +78,11 @@ export function ComboDialog({ isOpen, onClose, comboId }: ComboDialogProps) {
 					<div className="min-h-0 flex-1 space-y-4 overflow-y-auto py-2">
 						{comboQuery.isLoading && (
 							<p className="text-sm text-muted-foreground">Loading combo...</p>
+						)}
+						{comboQuery.isError && (
+							<p className="text-sm text-destructive" role="alert">
+								Could not load this combo or its persisted Manual slots.
+							</p>
 						)}
 						{combo && <ComboSlotBuilder combo={combo} />}
 					</div>
