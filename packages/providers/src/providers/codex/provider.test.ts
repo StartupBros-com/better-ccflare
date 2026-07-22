@@ -2824,6 +2824,7 @@ describe("CodexProvider.processResponse", () => {
 			expect(record).toMatchObject({
 				usage_measurement_available: false,
 				cache_measurement_available: false,
+				cache_creation_measurement_available: false,
 				input_tokens: null,
 				output_tokens: null,
 				cache_read_input_tokens: null,
@@ -2874,10 +2875,53 @@ describe("CodexProvider.processResponse", () => {
 			expect(record).toMatchObject({
 				usage_measurement_available: true,
 				cache_measurement_available: false,
+				cache_creation_measurement_available: false,
 				input_tokens: 12,
 				output_tokens: 3,
 				cache_read_input_tokens: null,
 				cache_creation_input_tokens: null,
+			});
+		} finally {
+			delete process.env[CODEX_TRACE_DIR_ENV];
+			rmSync(traceDir, { recursive: true, force: true });
+		}
+	});
+
+	it("traces an explicit zero cache write as measured", async () => {
+		const provider = new CodexProvider();
+		const traceDir = mkdtempSync(join(tmpdir(), "codex-trace-"));
+		process.env[CODEX_TRACE_DIR_ENV] = traceDir;
+		try {
+			const transformed = await provider.processResponse(
+				new Response(
+					sseBody(
+						eventLine("response.completed", {
+							response: {
+								model: "gpt-5.5",
+								status: "completed",
+								usage: {
+									input_tokens: 12,
+									output_tokens: 3,
+									input_tokens_details: {
+										cached_tokens: 0,
+										cache_write_tokens: 0,
+									},
+								},
+							},
+						}),
+					),
+					{ status: 200, headers: { "content-type": "text/event-stream" } },
+				),
+				null,
+			);
+			await transformed.text();
+			const record = readTraceRecords(traceDir).find(
+				(candidate) => candidate.phase === "response",
+			);
+
+			expect(record).toMatchObject({
+				cache_creation_measurement_available: true,
+				cache_creation_input_tokens: 0,
 			});
 		} finally {
 			delete process.env[CODEX_TRACE_DIR_ENV];
@@ -2932,6 +2976,7 @@ describe("CodexProvider.processResponse", () => {
 				error_type: "abrupt_stream_eof",
 				usage_measurement_available: true,
 				cache_measurement_available: true,
+				cache_creation_measurement_available: true,
 				input_tokens: 100,
 				output_tokens: 7,
 				cache_read_input_tokens: 60,
@@ -4642,7 +4687,7 @@ describe("CodexProvider.transformRequestBody", () => {
 			// BUG (documented, not fixed here): the demotion diagnostics confirm
 			// this was a session that already had an elected root.
 			expect(requestTrace).toMatchObject({
-				trace_schema_version: 10,
+				trace_schema_version: 11,
 				orchestration_admission: "non_root",
 				orchestration_demotion_observed: true,
 			});
@@ -4772,7 +4817,7 @@ describe("CodexProvider.transformRequestBody", () => {
 				(record) => record.phase === "request",
 			);
 			expect(requestTrace).toMatchObject({
-				trace_schema_version: 10,
+				trace_schema_version: 11,
 				orchestration_admission: "no_session",
 				is_descendant: true,
 				tools_before_count: 3,

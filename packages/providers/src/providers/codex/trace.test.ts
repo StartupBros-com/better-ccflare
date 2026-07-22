@@ -17,7 +17,7 @@ afterEach(() => {
 	delete process.env[CODEX_TRACE_HMAC_KEY_ENV];
 });
 
-describe("writeCodexTrace schema 10 cache experiments", () => {
+describe("writeCodexTrace schema 11 cache experiments", () => {
 	test("writes bounded decision fields without reconstructing their semantics", () => {
 		const dir = mkdtempSync(join(tmpdir(), "codex-trace-schema-"));
 		process.env[CODEX_TRACE_DIR_ENV] = dir;
@@ -42,7 +42,7 @@ describe("writeCodexTrace schema 10 cache experiments", () => {
 				readFileSync(join(dir, file as string), "utf8").trim(),
 			);
 			expect(record).toMatchObject({
-				trace_schema_version: 10,
+				trace_schema_version: 11,
 				request_id: "logical-1",
 				attempt_id: "attempt-1",
 				attempt_ordinal: 2,
@@ -78,7 +78,7 @@ describe("writeCodexTrace schema 10 cache experiments", () => {
 	});
 });
 
-describe("orchestration demotion diagnostics (preserved in schema 10)", () => {
+describe("orchestration demotion diagnostics (preserved in schema 11)", () => {
 	test("writes the demotion signal and elapsed time when supplied", () => {
 		const dir = mkdtempSync(join(tmpdir(), "codex-trace-schema-"));
 		process.env[CODEX_TRACE_DIR_ENV] = dir;
@@ -94,7 +94,7 @@ describe("orchestration demotion diagnostics (preserved in schema 10)", () => {
 				readFileSync(join(dir, file as string), "utf8").trim(),
 			);
 			expect(record).toMatchObject({
-				trace_schema_version: 10,
+				trace_schema_version: 11,
 				orchestration_demotion_observed: true,
 				elapsed_ms_since_root: 4_242,
 			});
@@ -103,7 +103,7 @@ describe("orchestration demotion diagnostics (preserved in schema 10)", () => {
 		}
 	});
 
-	test("defaults both fields to null so the schema stays additive, not version-bumped", () => {
+	test("defaults both fields to null in the current schema", () => {
 		const dir = mkdtempSync(join(tmpdir(), "codex-trace-schema-"));
 		process.env[CODEX_TRACE_DIR_ENV] = dir;
 		try {
@@ -113,7 +113,7 @@ describe("orchestration demotion diagnostics (preserved in schema 10)", () => {
 			const record = JSON.parse(
 				readFileSync(join(dir, file as string), "utf8").trim(),
 			);
-			expect(record.trace_schema_version).toBe(10);
+			expect(record.trace_schema_version).toBe(11);
 			expect(record.orchestration_demotion_observed).toBeNull();
 			expect(record.elapsed_ms_since_root).toBeNull();
 		} finally {
@@ -351,6 +351,7 @@ describe("summarizeCodexResponse (response phase)", () => {
 		expect(s.output_tokens).toBeNull();
 		expect(s.cache_read_input_tokens).toBeNull();
 		expect(s.cache_creation_input_tokens).toBeNull();
+		expect(s.cache_creation_measurement_available).toBe(false);
 		expect(s.cache_hit_pct).toBeNull();
 	});
 
@@ -364,6 +365,32 @@ describe("summarizeCodexResponse (response phase)", () => {
 		expect(s.cache_measurement_available).toBe(true);
 		expect(s.cache_read_input_tokens).toBe(0);
 		expect(s.cache_hit_pct).toBe(0);
+	});
+
+	test("distinguishes measured zero cache writes from unavailable cache writes", () => {
+		const measured = summarizeCodexResponse(
+			[],
+			{
+				input_tokens: 10,
+				cache_creation_input_tokens: 0,
+				cache_creation_measurement_available: true,
+			},
+			"end_turn",
+		);
+		const unavailable = summarizeCodexResponse(
+			[],
+			{
+				input_tokens: 10,
+				cache_creation_input_tokens: 0,
+				cache_creation_measurement_available: false,
+			},
+			"end_turn",
+		);
+
+		expect(measured.cache_creation_measurement_available).toBe(true);
+		expect(measured.cache_creation_input_tokens).toBe(0);
+		expect(unavailable.cache_creation_measurement_available).toBe(false);
+		expect(unavailable.cache_creation_input_tokens).toBeNull();
 	});
 
 	test("carries normalized upstream error details", () => {

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
 	normalizeCodexCacheWriteTokens,
+	normalizeCodexCacheWriteUsage,
 	normalizeCodexResponseInputUsage,
 } from "./usage";
 
@@ -38,6 +39,32 @@ describe("normalizeCodexCacheWriteTokens", () => {
 	});
 });
 
+describe("normalizeCodexCacheWriteUsage", () => {
+	test("distinguishes an explicit zero write count from an unavailable measurement", () => {
+		expect(normalizeCodexCacheWriteUsage({ cache_write_tokens: 0 })).toEqual({
+			tokens: 0,
+			measurementAvailable: true,
+		});
+		expect(normalizeCodexCacheWriteUsage({})).toEqual({
+			tokens: 0,
+			measurementAvailable: false,
+		});
+		expect(normalizeCodexCacheWriteUsage(null)).toEqual({
+			tokens: 0,
+			measurementAvailable: false,
+		});
+	});
+
+	test("marks valid legacy cache-write values as measured", () => {
+		expect(
+			normalizeCodexCacheWriteUsage({
+				cache_write_tokens: Number.NaN,
+				cache_creation_input_tokens: 17,
+			}),
+		).toEqual({ tokens: 17, measurementAvailable: true });
+	});
+});
+
 describe("normalizeCodexResponseInputUsage", () => {
 	test("partitions an inclusive total across uncached, read, and written tokens", () => {
 		const usage = normalizeCodexResponseInputUsage(42, {
@@ -51,6 +78,7 @@ describe("normalizeCodexResponseInputUsage", () => {
 			inputTokens: 26,
 			cacheReadInputTokens: 5,
 			cacheCreationInputTokens: 11,
+			cacheCreationMeasurementAvailable: true,
 		});
 		expect(
 			usage.inputTokens +
@@ -98,5 +126,14 @@ describe("normalizeCodexResponseInputUsage", () => {
 				usage.cacheReadInputTokens +
 				usage.cacheCreationInputTokens,
 		).toBe(usage.totalInputTokens);
+	});
+
+	test("preserves unavailable cache-write telemetry separately from the numeric compatibility field", () => {
+		const usage = normalizeCodexResponseInputUsage(42, {
+			cached_tokens: 5,
+		});
+
+		expect(usage.cacheCreationInputTokens).toBe(0);
+		expect(usage.cacheCreationMeasurementAvailable).toBe(false);
 	});
 });

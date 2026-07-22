@@ -5,6 +5,7 @@ import {
 	CODEX_RESPONSES_WEBSOCKET_URL,
 	type CodexWebSocketAttemptInput,
 	type CodexWebSocketAttemptResult,
+	type CodexWebSocketCacheStats,
 	type CodexWebSocketCounters,
 	type CodexWebSocketFactory,
 	type CodexWebSocketFailureCategory,
@@ -16,6 +17,7 @@ import {
 	type CodexWebSocketReceipt,
 	type CodexWebSocketRuntimeConfig,
 	type CodexWebSocketStats,
+	codexWebSocketCohortId,
 	isCodexWebSocketAssigned,
 	isOfficialCodexSubscriptionUrl,
 	readCodexWebSocketPercent,
@@ -54,13 +56,16 @@ export type {
 export {
 	CODEX_RESPONSES_WEBSOCKET_URL,
 	CODEX_WS_ACCOUNT_IDS_ENV,
+	CODEX_WS_COHORT_IDS_ENV,
 	CODEX_WS_IDLE_TTL_MS_ENV,
 	CODEX_WS_MAX_AGE_MS_ENV,
 	CODEX_WS_MAX_GLOBAL_ENV,
 	CODEX_WS_MAX_PER_ACCOUNT_ENV,
 	CODEX_WS_MODELS_ENV,
+	CODEX_WS_OBSERVE_ONLY_ENV,
 	CODEX_WS_PERCENT_ENV,
 	CODEX_WS_TELEMETRY_WARN_ENV,
+	codexWebSocketCohortId,
 	isCodexWebSocketAssigned,
 	readCodexWebSocketTelemetryWarn,
 } from "./codex-websocket-contract";
@@ -104,6 +109,10 @@ interface ActiveRequest {
 	streamClosePending: boolean;
 	rawIngressFrames: number;
 	rawIngressBytes: number;
+	inputTokens: number | null;
+	cachedReadTokens: number | null;
+	cacheWriteTokens: number | null;
+	cacheWriteMeasurementAvailable: boolean;
 	firstTimer?: ReturnType<typeof setTimeout>;
 	messageChain: Promise<void>;
 	resolveFirst: (result: Response | null) => void;
@@ -167,6 +176,16 @@ export class CodexWebSocketTransport {
 		evictions: 0,
 		aborts: 0,
 		terminals: 0,
+		observeOnly: 0,
+		cohortNotAllowlisted: 0,
+	};
+	private readonly cache: CodexWebSocketCacheStats = {
+		measuredTerminals: 0,
+		inputTokens: 0,
+		cachedReadTokens: 0,
+		cacheWriteMeasuredTerminals: 0,
+		cacheWriteUnavailableTerminals: 0,
+		cacheWriteTokens: 0,
 	};
 
 	constructor(options: CodexWebSocketTransportOptionsForTests = {}) {
@@ -185,10 +204,11 @@ export class CodexWebSocketTransport {
 	): Promise<CodexWebSocketAttemptResult | null> {
 		this.counters.requests++;
 		const config = readCodexWebSocketRuntimeConfig();
-		if (this.shuttingDown || config.percent <= 0) {
+		if (this.shuttingDown || (!config.observeOnly && config.percent <= 0)) {
 			this.retireIdle("kill_switch");
 			return null;
 		}
+		if (config.observeOnly) this.retireIdle("observe_only");
 		if (input.signal.aborted) throw input.signal.reason;
 		// Run lifecycle cleanup before request/allowlist/body eligibility can
 		// return. This makes config disablement effective even when the current
@@ -204,6 +224,26 @@ export class CodexWebSocketTransport {
 
 		const parsed = await this.parseRequest(input, config);
 		if (!parsed) return null;
+		if (config.observeOnly) {
+			this.counters.controls++;
+			this.counters.observeOnly++;
+			this.record({
+				...this.emptyObservation(input, parsed.model, parsed.cohortId),
+				assignment: "control",
+				fallbackReason: "observe_only",
+			});
+			return null;
+		}
+		if (config.cohortIds.size > 0 && !config.cohortIds.has(parsed.cohortId)) {
+			this.counters.controls++;
+			this.counters.cohortNotAllowlisted++;
+			this.record({
+				...this.emptyObservation(input, parsed.model, parsed.cohortId),
+				assignment: "control",
+				fallbackReason: "cohort_not_allowlisted",
+			});
+			return null;
+		}
 		if (this.stickyHttp.has(parsed.stickyKey)) {
 			this.touchSticky(parsed.stickyKey);
 			this.counters.stickyHttpBypass++;
@@ -217,7 +257,7 @@ export class CodexWebSocketTransport {
 		if (
 			!isCodexWebSocketAssigned(
 				input.accountId,
-				parsed.promptCacheKey,
+				parsed.assignmentKey,
 				config.percent,
 			)
 		) {
@@ -338,6 +378,7 @@ export class CodexWebSocketTransport {
 			poolSize: this.pool.size,
 			stickyHttpSize: this.stickyHttp.size,
 			counters: { ...this.counters },
+			cache: { ...this.cache },
 			pool: [...this.pool.values()].map((entry) => ({
 				connectionId: entry.connectionId,
 				accountId: entry.accountId,
@@ -385,10 +426,12 @@ export class CodexWebSocketTransport {
 			typeof payload.prompt_cache_key === "string"
 				? payload.prompt_cache_key
 				: "";
+		const conversationIdentity = input.conversationIdentity ?? "";
 		if (
 			payload.stream !== true ||
 			!model ||
 			!promptCacheKey ||
+			!/^[0-9a-f]{64}$/.test(conversationIdentity) ||
 			!config.models.has(model.toLowerCase())
 		) {
 			return null;
@@ -398,33 +441,31 @@ export class CodexWebSocketTransport {
 		const authFingerprint = opaqueRuntimeId("codex-ws-auth", authorization);
 		const framePayload = { ...payload };
 		delete framePayload.previous_response_id;
+		const assignmentKey = conversationIdentity;
 		const laneKey = opaqueRuntimeId(
 			"codex-ws-lane",
 			input.accountId,
-			promptCacheKey,
+			conversationIdentity,
 		);
 		const poolKey = opaqueRuntimeId(
 			"codex-ws-connection",
 			input.accountId,
-			promptCacheKey,
+			conversationIdentity,
 			model,
 			authFingerprint,
 		);
 		return {
 			model,
 			promptCacheKey,
+			assignmentKey,
 			laneKey,
 			poolKey,
 			stickyKey: opaqueRuntimeId(
 				"codex-ws-sticky",
 				input.accountId,
-				promptCacheKey,
+				conversationIdentity,
 			),
-			cohortId: opaqueRuntimeId(
-				"codex-ws-cohort",
-				input.accountId,
-				promptCacheKey,
-			),
+			cohortId: codexWebSocketCohortId(input.accountId, assignmentKey),
 			// Delay the only full-history reserialization until after cohort, sticky,
 			// busy, identity, and capacity fallbacks have all been ruled out.
 			framePayload,
@@ -644,6 +685,10 @@ export class CodexWebSocketTransport {
 			streamClosePending: false,
 			rawIngressFrames: 0,
 			rawIngressBytes: 0,
+			inputTokens: null,
+			cachedReadTokens: null,
+			cacheWriteTokens: null,
+			cacheWriteMeasurementAvailable: false,
 			messageChain: Promise.resolve(),
 			resolveFirst,
 			rejectFirst,
@@ -824,6 +869,7 @@ export class CodexWebSocketTransport {
 						active.resolveFirst(null);
 					}
 					if (CODEX_WEBSOCKET_TERMINAL_EVENT_TYPES.has(type)) {
+						this.captureTerminalCacheUsage(active, parsed);
 						active.terminalMs = elapsed;
 						entry.lastResponseId = active.responseId ?? responseId;
 						this.counters.terminals++;
@@ -1069,7 +1115,22 @@ export class CodexWebSocketTransport {
 			fallbackReason: this.normalizeTerminalFallback(failure),
 			fallbackAllowedBeforeWrite: false,
 			stickyHttp: active.receipt.stickyHttp,
+			inputTokens: active.inputTokens,
+			cachedReadTokens: active.cachedReadTokens,
+			cacheWriteTokens: active.cacheWriteTokens,
+			cacheWriteMeasurementAvailable: active.cacheWriteMeasurementAvailable,
 		});
+		if (active.inputTokens !== null && active.cachedReadTokens !== null) {
+			this.cache.measuredTerminals++;
+			this.cache.inputTokens += active.inputTokens;
+			this.cache.cachedReadTokens += active.cachedReadTokens;
+			if (active.cacheWriteMeasurementAvailable) {
+				this.cache.cacheWriteMeasuredTerminals++;
+				this.cache.cacheWriteTokens += active.cacheWriteTokens ?? 0;
+			} else {
+				this.cache.cacheWriteUnavailableTerminals++;
+			}
+		}
 	}
 
 	private emptyObservation(
@@ -1106,7 +1167,55 @@ export class CodexWebSocketTransport {
 			fallbackReason: null,
 			fallbackAllowedBeforeWrite: false,
 			stickyHttp: false,
+			inputTokens: null,
+			cachedReadTokens: null,
+			cacheWriteTokens: null,
+			cacheWriteMeasurementAvailable: false,
 		};
+	}
+
+	private captureTerminalCacheUsage(
+		active: ActiveRequest,
+		event: Record<string, unknown>,
+	): void {
+		const response = event.response;
+		if (!response || typeof response !== "object" || Array.isArray(response)) {
+			return;
+		}
+		const usage = (response as Record<string, unknown>).usage;
+		if (!usage || typeof usage !== "object" || Array.isArray(usage)) return;
+		const usageRecord = usage as Record<string, unknown>;
+		const inputTokens = this.validTokenCount(usageRecord.input_tokens);
+		const details = usageRecord.input_tokens_details;
+		if (!details || typeof details !== "object" || Array.isArray(details)) {
+			return;
+		}
+		const detailsRecord = details as Record<string, unknown>;
+		const cachedReadTokens = this.validTokenCount(detailsRecord.cached_tokens);
+		if (inputTokens === null || cachedReadTokens === null) return;
+		active.inputTokens = inputTokens;
+		active.cachedReadTokens = Math.min(cachedReadTokens, inputTokens);
+		for (const field of [
+			"cache_write_tokens",
+			"cache_creation_input_tokens",
+		] as const) {
+			const value = this.validTokenCount(detailsRecord[field]);
+			if (value === null) continue;
+			active.cacheWriteTokens = Math.min(
+				value,
+				Math.max(0, inputTokens - active.cachedReadTokens),
+			);
+			active.cacheWriteMeasurementAvailable = true;
+			break;
+		}
+	}
+
+	private validTokenCount(value: unknown): number | null {
+		return typeof value === "number" &&
+			Number.isSafeInteger(value) &&
+			value >= 0
+			? value
+			: null;
 	}
 
 	private normalizeTerminalFallback(

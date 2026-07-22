@@ -15,6 +15,7 @@ export {
 export { BedrockProvider, parseBedrockConfig } from "./bedrock/index";
 export type { CodexUsageRefreshFetchResult } from "./codex/index";
 export {
+	CODEX_CONVERSATION_ID_HEADER,
 	CODEX_DEFAULT_ENDPOINT,
 	CODEX_EXPLICIT_CACHE_BREAKPOINT_PERCENT_ENV,
 	CodexOAuthProvider,

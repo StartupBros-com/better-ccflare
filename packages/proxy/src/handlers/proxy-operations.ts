@@ -12,6 +12,7 @@ import { withSanitizedProxyHeaders } from "@better-ccflare/http-common";
 import { Logger } from "@better-ccflare/logger";
 import { stripCacheControlFromOpenAIRequest } from "@better-ccflare/openai-formats";
 import {
+	CODEX_CONVERSATION_ID_HEADER,
 	decideContextAdmission,
 	getProvider,
 	isAnthropicExtraUsageExhausted,
@@ -1883,6 +1884,17 @@ export async function proxyWithAccount(
 			cacheIdentityHasCacheControl?: boolean,
 			resolvedModel?: string | null,
 		): Promise<Response> => {
+			const webSocketConversationIdentity =
+				provider.name === "codex"
+					? transportRequest.headers.get(CODEX_CONVERSATION_ID_HEADER)
+					: null;
+			if (transportRequest.headers.has(CODEX_CONVERSATION_ID_HEADER)) {
+				const wireHeaders = new Headers(transportRequest.headers);
+				wireHeaders.delete(CODEX_CONVERSATION_ID_HEADER);
+				transportRequest = new Request(transportRequest, {
+					headers: wireHeaders,
+				});
+			}
 			const isSynthetic = isSyntheticProviderResponse(transportRequest);
 			await stageCacheBodyForTransportAttempt({
 				requestId: requestMeta.id,
@@ -1916,6 +1928,7 @@ export async function proxyWithAccount(
 					attemptId: websocketAttemptId,
 					accountId: account.id,
 					providerName: provider.name,
+					conversationIdentity: webSocketConversationIdentity,
 					request: transportRequest,
 					signal,
 					onFrameWritten: (receipt) => {

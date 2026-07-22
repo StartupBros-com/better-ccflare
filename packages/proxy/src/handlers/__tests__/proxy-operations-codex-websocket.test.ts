@@ -120,6 +120,28 @@ function makeRequestBody(): ArrayBuffer {
 	).buffer;
 }
 
+function makeConversationRequestBody(
+	messages: unknown[],
+	sessionId = "11111111-1111-4111-8111-111111111111",
+): ArrayBuffer {
+	return new TextEncoder().encode(
+		JSON.stringify({
+			model: "claude-sonnet-4-5",
+			messages,
+			metadata: { user_id: JSON.stringify({ session_id: sessionId }) },
+			tools: [
+				{
+					name: "Lookup",
+					description: "Lookup a value",
+					input_schema: { type: "object" },
+				},
+			],
+			max_tokens: 16,
+			stream: true,
+		}),
+	).buffer;
+}
+
 function makeRequest(
 	body: ArrayBuffer,
 	extraHeaders: Record<string, string> = {},
@@ -278,10 +300,12 @@ function readRequestTrace(
 describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () => {
 	let originalFetch: typeof globalThis.fetch;
 	let originalPromptCacheKey: string | undefined;
+	let originalCacheKeyMode: string | undefined;
 
 	beforeEach(() => {
 		originalFetch = globalThis.fetch;
 		originalPromptCacheKey = process.env.CCFLARE_CODEX_PROMPT_CACHE_KEY;
+		originalCacheKeyMode = process.env.CCFLARE_CODEX_CACHE_KEY_MODE;
 		process.env.CCFLARE_CODEX_PROMPT_CACHE_KEY = "1";
 	});
 
@@ -292,7 +316,127 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 		} else {
 			process.env.CCFLARE_CODEX_PROMPT_CACHE_KEY = originalPromptCacheKey;
 		}
+		if (originalCacheKeyMode === undefined) {
+			delete process.env.CCFLARE_CODEX_CACHE_KEY_MODE;
+		} else {
+			process.env.CCFLARE_CODEX_CACHE_KEY_MODE = originalCacheKeyMode;
+		}
 		mock.restore();
+	});
+
+	it("passes a compaction-stable sibling-safe identity despite one shared session cache key", async () => {
+		installUsageCollector();
+		process.env.CCFLARE_CODEX_CACHE_KEY_MODE = "session";
+		const upstreamConversationHeaders: Array<string | null> = [];
+		globalThis.fetch = mock(async (request: Request) => {
+			upstreamConversationHeaders.push(
+				request.headers.get("x-better-ccflare-codex-conversation-id"),
+			);
+			return new Response(
+				[
+					'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_ok","model":"gpt-5.4"}}\n\n',
+					'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"ok"}\n\n',
+					'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_ok","model":"gpt-5.4","status":"completed","usage":{"input_tokens":10,"output_tokens":1,"input_tokens_details":{"cached_tokens":0}}}}\n\n',
+					"data: [DONE]\n\n",
+				].join(""),
+				{
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				},
+			);
+		});
+
+		const attempts: Array<{
+			conversationIdentity: string | null | undefined;
+			promptCacheKey: string | undefined;
+		}> = [];
+		spyOn(codexWebSocketTransport, "tryRequest").mockImplementation(
+			async (input) => {
+				const payload = (await input.request.clone().json()) as {
+					prompt_cache_key?: string;
+				};
+				attempts.push({
+					conversationIdentity: (
+						input as typeof input & { conversationIdentity?: string | null }
+					).conversationIdentity,
+					promptCacheKey: payload.prompt_cache_key,
+				});
+				return null;
+			},
+		);
+
+		const originalMessages = [
+			{ role: "user", content: "start the task" },
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "tool_use",
+						id: "tool-lineage-root",
+						name: "Lookup",
+						input: { value: "root" },
+					},
+				],
+			},
+			{
+				role: "user",
+				content: [
+					{
+						type: "tool_result",
+						tool_use_id: "tool-lineage-root",
+						content: "root result",
+					},
+				],
+			},
+		];
+		const compactedMessages = [
+			...originalMessages.slice(1),
+			{ role: "user", content: "continue after compaction" },
+		];
+		const siblingMessages = [
+			{ role: "user", content: "sibling task" },
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "tool_use",
+						id: "tool-lineage-sibling",
+						name: "Lookup",
+						input: { value: "sibling" },
+					},
+				],
+			},
+		];
+
+		for (const [index, messages] of [
+			originalMessages,
+			compactedMessages,
+			siblingMessages,
+		].entries()) {
+			const body = makeConversationRequestBody(messages);
+			const response = await runProxy(
+				makeRequest(body),
+				body,
+				makePolicy(1_000),
+				`codex-ws-conversation-${index}`,
+			);
+			expect(response?.status).toBe(200);
+			await response?.text();
+		}
+
+		expect(attempts).toHaveLength(3);
+		expect(upstreamConversationHeaders).toEqual([null, null, null]);
+		expect(
+			new Set(attempts.map((attempt) => attempt.promptCacheKey)).size,
+		).toBe(1);
+		expect(attempts[0]?.conversationIdentity).toMatch(/^[0-9a-f]{64}$/);
+		expect(attempts[1]?.conversationIdentity).toBe(
+			attempts[0]?.conversationIdentity,
+		);
+		expect(attempts[2]?.conversationIdentity).toMatch(/^[0-9a-f]{64}$/);
+		expect(attempts[2]?.conversationIdentity).not.toBe(
+			attempts[0]?.conversationIdentity,
+		);
 	});
 
 	it("never falls back to HTTP after response.create was written and the attempt deadline fires", async () => {

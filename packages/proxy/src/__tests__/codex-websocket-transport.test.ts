@@ -1,18 +1,22 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import {
 	CODEX_RESPONSES_WEBSOCKET_URL,
 	CODEX_WS_ACCOUNT_IDS_ENV,
+	CODEX_WS_COHORT_IDS_ENV,
 	CODEX_WS_IDLE_TTL_MS_ENV,
 	CODEX_WS_MAX_AGE_MS_ENV,
 	CODEX_WS_MAX_GLOBAL_ENV,
 	CODEX_WS_MAX_PER_ACCOUNT_ENV,
 	CODEX_WS_MODELS_ENV,
+	CODEX_WS_OBSERVE_ONLY_ENV,
 	CODEX_WS_PERCENT_ENV,
 	CODEX_WS_TELEMETRY_WARN_ENV,
 	type CodexWebSocketLike,
 	type CodexWebSocketObservation,
 	type CodexWebSocketOptions,
 	CodexWebSocketTransport,
+	codexWebSocketCohortId,
 	isCodexWebSocketAssigned,
 	readCodexWebSocketTelemetryWarn,
 } from "../codex-websocket-transport";
@@ -21,6 +25,8 @@ const ENV_NAMES = [
 	CODEX_WS_PERCENT_ENV,
 	CODEX_WS_ACCOUNT_IDS_ENV,
 	CODEX_WS_MODELS_ENV,
+	CODEX_WS_COHORT_IDS_ENV,
+	CODEX_WS_OBSERVE_ONLY_ENV,
 	CODEX_WS_MAX_GLOBAL_ENV,
 	CODEX_WS_MAX_PER_ACCOUNT_ENV,
 	CODEX_WS_IDLE_TTL_MS_ENV,
@@ -147,6 +153,10 @@ function enableCanary(overrides: Record<string, string> = {}): void {
 		process.env[key] = value;
 }
 
+function testConversationIdentity(key: string): string {
+	return createHash("sha256").update(key).digest("hex");
+}
+
 function request(
 	opts: {
 		cacheKey?: string;
@@ -172,6 +182,7 @@ function request(
 				"user-agent": "codex-cli/test",
 				version: "0.144.4",
 				"x-codex-turn-state": "must-not-leak-turn-state",
+				"x-test-conversation-key": opts.cacheKey ?? "private-cache-key",
 			},
 			body: JSON.stringify({
 				type: "must-not-override-response-create",
@@ -205,19 +216,152 @@ function attempt(
 		signal?: AbortSignal;
 		requestId?: string;
 		attemptId?: string;
+		conversationIdentity?: string;
 	} = {},
 ) {
-	return transport.tryRequest({
+	const cacheKey = req.headers.get("x-test-conversation-key") ?? "default";
+	const input = {
 		accountId: opts.accountId ?? "acct-pro",
 		providerName: opts.providerName ?? "codex",
 		request: req,
 		signal: opts.signal ?? new AbortController().signal,
 		requestId: opts.requestId ?? "request-default",
 		attemptId: opts.attemptId ?? "attempt-default",
-	});
+		conversationIdentity:
+			opts.conversationIdentity ?? testConversationIdentity(cacheKey),
+	};
+	return transport.tryRequest(input);
 }
 
 describe("CodexWebSocketTransport eligibility", () => {
+	test("uses a restart-stable domain-separated cohort identifier", () => {
+		expect(codexWebSocketCohortId("acct-pro", "private-cache-key")).toBe(
+			"cdc21fa8ef76ac9e",
+		);
+	});
+
+	test("discovers eligible cohorts in observe-only mode without opening a socket", async () => {
+		process.env[CODEX_WS_OBSERVE_ONLY_ENV] = "1";
+		process.env[CODEX_WS_ACCOUNT_IDS_ENV] = "acct-pro";
+		process.env[CODEX_WS_MODELS_ENV] = "gpt-5.6-sol";
+		const h = harness();
+
+		expect(
+			await attempt(h.transport, request({ cacheKey: "observe-only-key" })),
+		).toBeNull();
+		expect(h.sockets).toHaveLength(0);
+		expect(h.observations).toEqual([
+			expect.objectContaining({
+				assignment: "control",
+				effectiveTransport: "http",
+				fallbackReason: "observe_only",
+				cohortId: codexWebSocketCohortId(
+					"acct-pro",
+					testConversationIdentity("observe-only-key"),
+				),
+			}),
+		]);
+		expect(h.transport.getStats().counters.observeOnly).toBe(1);
+	});
+
+	test("can enroll exactly one observed opaque cohort", async () => {
+		process.env[CODEX_WS_OBSERVE_ONLY_ENV] = "true";
+		process.env[CODEX_WS_ACCOUNT_IDS_ENV] = "acct-pro";
+		process.env[CODEX_WS_MODELS_ENV] = "gpt-5.6-sol";
+		const discovery = harness();
+		await attempt(discovery.transport, request({ cacheKey: "selected-key" }));
+		const selectedCohort = discovery.observations[0]?.cohortId;
+		expect(selectedCohort).toEqual(expect.any(String));
+
+		delete process.env[CODEX_WS_OBSERVE_ONLY_ENV];
+		process.env[CODEX_WS_PERCENT_ENV] = "100";
+		process.env[CODEX_WS_COHORT_IDS_ENV] = selectedCohort ?? "";
+		const h = harness({
+			configureSocket(socket) {
+				socket.onSend = (ws) =>
+					queueMicrotask(() => {
+						ws.emitJson({ type: "response.created", response: { id: "r1" } });
+						ws.emitJson({
+							type: "response.completed",
+							response: { id: "r1" },
+						});
+					});
+			},
+		});
+
+		expect(
+			await attempt(h.transport, request({ cacheKey: "not-selected" })),
+		).toBeNull();
+		expect(h.sockets).toHaveLength(0);
+		expect(h.observations).toContainEqual(
+			expect.objectContaining({
+				assignment: "control",
+				fallbackReason: "cohort_not_allowlisted",
+			}),
+		);
+
+		const selected = await attempt(
+			h.transport,
+			request({ cacheKey: "selected-key" }),
+		);
+		expect(selected).not.toBeNull();
+		await selected?.response.text();
+		expect(h.sockets).toHaveLength(1);
+		expect(h.transport.getStats().counters.cohortNotAllowlisted).toBe(1);
+	});
+
+	test("keeps sibling conversations distinct when a session cache key is shared", async () => {
+		process.env[CODEX_WS_OBSERVE_ONLY_ENV] = "true";
+		process.env[CODEX_WS_ACCOUNT_IDS_ENV] = "acct-pro";
+		process.env[CODEX_WS_MODELS_ENV] = "gpt-5.6-sol";
+		const discovery = harness();
+		const sharedSessionCacheKey = "ccflare-session-shared";
+		const firstConversation = "a".repeat(64);
+		const siblingConversation = "b".repeat(64);
+
+		await attempt(
+			discovery.transport,
+			request({ cacheKey: sharedSessionCacheKey, bodyMarker: "first sibling" }),
+			{ conversationIdentity: firstConversation },
+		);
+		await attempt(
+			discovery.transport,
+			request({
+				cacheKey: sharedSessionCacheKey,
+				bodyMarker: "second sibling",
+			}),
+			{ conversationIdentity: siblingConversation },
+		);
+
+		const firstCohort = discovery.observations[0]?.cohortId;
+		const siblingCohort = discovery.observations[1]?.cohortId;
+		expect(firstCohort).toEqual(expect.any(String));
+		expect(siblingCohort).toEqual(expect.any(String));
+		expect(siblingCohort).not.toBe(firstCohort);
+
+		delete process.env[CODEX_WS_OBSERVE_ONLY_ENV];
+		process.env[CODEX_WS_PERCENT_ENV] = "100";
+		process.env[CODEX_WS_COHORT_IDS_ENV] = firstCohort ?? "";
+		const treatment = harness();
+		expect(
+			await attempt(
+				treatment.transport,
+				request({
+					cacheKey: sharedSessionCacheKey,
+					bodyMarker: "second sibling",
+				}),
+				{ conversationIdentity: siblingConversation },
+			),
+		).toBeNull();
+		expect(treatment.sockets).toHaveLength(0);
+		expect(treatment.observations).toContainEqual(
+			expect.objectContaining({
+				cohortId: siblingCohort,
+				fallbackReason: "cohort_not_allowlisted",
+			}),
+		);
+	});
+
 	test("is default-off, requires both allowlists, and assigns deterministic cohorts", async () => {
 		const h = harness();
 		expect(await attempt(h.transport)).toBeNull();
@@ -306,7 +450,13 @@ describe("CodexWebSocketTransport eligibility", () => {
 		let cacheKey = "";
 		for (let index = 0; index < 1_000; index++) {
 			const candidate = `control-${index}`;
-			if (!isCodexWebSocketAssigned("acct-pro", candidate, 50)) {
+			if (
+				!isCodexWebSocketAssigned(
+					"acct-pro",
+					testConversationIdentity(candidate),
+					50,
+				)
+			) {
 				cacheKey = candidate;
 				break;
 			}
@@ -331,6 +481,47 @@ describe("CodexWebSocketTransport eligibility", () => {
 });
 
 describe("CodexWebSocketTransport wire contract", () => {
+	test("records aggregate cache reads and preserves missing cache-write telemetry", async () => {
+		enableCanary();
+		const h = harness({
+			configureSocket(socket) {
+				socket.onSend = (ws) =>
+					queueMicrotask(() => {
+						ws.emitJson({ type: "response.created", response: { id: "r1" } });
+						ws.emitJson({
+							type: "response.completed",
+							response: {
+								id: "r1",
+								usage: {
+									input_tokens: 10_000,
+									input_tokens_details: { cached_tokens: 9_200 },
+								},
+							},
+						});
+					});
+			},
+		});
+
+		const result = await attempt(h.transport);
+		await result?.response.text();
+		expect(h.observations).toContainEqual(
+			expect.objectContaining({
+				inputTokens: 10_000,
+				cachedReadTokens: 9_200,
+				cacheWriteTokens: null,
+				cacheWriteMeasurementAvailable: false,
+			}),
+		);
+		expect(h.transport.getStats().cache).toEqual({
+			measuredTerminals: 1,
+			inputTokens: 10_000,
+			cachedReadTokens: 9_200,
+			cacheWriteMeasuredTerminals: 0,
+			cacheWriteUnavailableTerminals: 1,
+			cacheWriteTokens: 0,
+		});
+	});
+
 	test("sends the full Responses request once with exact safe handshake headers", async () => {
 		enableCanary();
 		const h = harness({
@@ -601,6 +792,7 @@ describe("CodexWebSocketTransport replay boundary", () => {
 		const pending = h.transport.tryRequest({
 			accountId: "acct-pro",
 			providerName: "codex",
+			conversationIdentity: testConversationIdentity("private-cache-key"),
 			request: request(),
 			signal: new AbortController().signal,
 			requestId: "request-handshake",
@@ -657,6 +849,7 @@ describe("CodexWebSocketTransport replay boundary", () => {
 		const result = await h.transport.tryRequest({
 			accountId: "acct-pro",
 			providerName: "codex",
+			conversationIdentity: testConversationIdentity("private-cache-key"),
 			request: request(),
 			signal: new AbortController().signal,
 			requestId: "request-callback",
@@ -683,6 +876,7 @@ describe("CodexWebSocketTransport replay boundary", () => {
 		const pending = h.transport.tryRequest({
 			accountId: "acct-pro",
 			providerName: "codex",
+			conversationIdentity: testConversationIdentity("private-cache-key"),
 			request: request(),
 			signal: new AbortController().signal,
 			requestId: "request-veto",
@@ -1009,6 +1203,7 @@ describe("CodexWebSocketTransport replay boundary", () => {
 			h.transport.tryRequest({
 				accountId: "acct-pro",
 				providerName: "codex",
+				conversationIdentity: testConversationIdentity("private-cache-key"),
 				request: request(),
 				signal: controller.signal,
 				requestId: "request-abort",

@@ -147,6 +147,8 @@ These environment variables are not stored in the configuration file and must be
 | `CCFLARE_CODEX_WS_PERCENT` | Default-off deterministic percentage for the official ChatGPT-subscription Responses WebSocket canary. Assignment is stable per account and `prompt_cache_key`; both account and model allowlists below are also required | `0` | `CCFLARE_CODEX_WS_PERCENT=10` |
 | `CCFLARE_CODEX_WS_ACCOUNT_IDS` | Comma-separated exact account IDs eligible for the WebSocket canary. Empty means no accounts are eligible | empty | `CCFLARE_CODEX_WS_ACCOUNT_IDS=account-uuid` |
 | `CCFLARE_CODEX_WS_MODELS` | Comma-separated physical Codex model allowlist for the WebSocket canary, matched case-insensitively. Empty means no models are eligible | empty | `CCFLARE_CODEX_WS_MODELS=gpt-5.6-sol` |
+| `CCFLARE_CODEX_WS_OBSERVE_ONLY` | Set exactly to `1` or `true` to discover privacy-safe eligible conversation cohort IDs while keeping every request on HTTP. No WebSocket is opened, and idle canary sockets are retired. Account and model allowlists are still required | unset | `CCFLARE_CODEX_WS_OBSERVE_ONLY=1` |
+| `CCFLARE_CODEX_WS_COHORT_IDS` | Optional comma-separated allowlist of opaque, restart-stable cohort IDs emitted by observe-only telemetry. When set, non-listed cohorts remain on HTTP before percentage assignment. Use this with `CCFLARE_CODEX_WS_PERCENT=100` to enroll only explicitly selected natural-traffic cohorts instead of relying on a low percentage across a small population | empty | `CCFLARE_CODEX_WS_COHORT_IDS=0123456789abcdef` |
 | `CCFLARE_CODEX_WS_MAX_GLOBAL` | Maximum open plus opening canary WebSocket connections process-wide | `32` | `CCFLARE_CODEX_WS_MAX_GLOBAL=8` |
 | `CCFLARE_CODEX_WS_MAX_PER_ACCOUNT` | Maximum open plus opening canary WebSocket connections for one account | `8` | `CCFLARE_CODEX_WS_MAX_PER_ACCOUNT=4` |
 | `CCFLARE_CODEX_WS_IDLE_TTL_MS` | Retire an idle canary connection after this duration; active requests are never interrupted by TTL cleanup | `300000` | `CCFLARE_CODEX_WS_IDLE_TTL_MS=120000` |
@@ -154,6 +156,15 @@ These environment variables are not stored in the configuration file and must be
 | `CCFLARE_CODEX_WS_TELEMETRY_WARN` | Default-off telemetry escalation for scoped dogfood canaries. Set exactly to `1` or `true` (case-insensitive) to emit privacy-safe `codex_ws_transport` observations at WARN so a WARN-pinned journal can join `requestId`/`attemptId` to Codex cache traces; otherwise observations remain INFO | unset | `CCFLARE_CODEX_WS_TELEMETRY_WARN=1` |
 | `CF_STREAM_USAGE_BUFFER_KB` | Stream usage buffer size in KB | `64` | `CF_STREAM_USAGE_BUFFER_KB=128` |
 | `CF_STREAM_TIMEOUT_MS` | Stream processing timeout in milliseconds | `60000` (1 minute) | `CF_STREAM_TIMEOUT_MS=120000` |
+
+For a WebSocket cache canary, export the bounded service journal window as JSONL and join it to the matching Codex trace. The analyzer accepts direct transport observations, logger JSON, and `journalctl -o json` records; it excludes duplicate or ambiguous identities and prints aggregate-only output:
+
+```sh
+journalctl -u ccflare-stack.service --since "2026-07-22 12:00:00 UTC" --until "2026-07-22 12:30:00 UTC" -o json > /tmp/codex-ws-observations.jsonl
+bun run packages/providers/src/providers/codex/analyze-trace.ts --cache-experiments --ws-observations /tmp/codex-ws-observations.jsonl /path/to/codex-trace-2026-07-22.jsonl
+```
+
+The raw journal export still contains ephemeral join identities and must be protected and deleted after analysis. The formatted report never emits request or attempt IDs, cohort hashes, account IDs, endpoints, model strings, prompts, or unknown action values.
 
 Model-family capacity handling is integrated into account selection and does not require a standalone feature flag. Fresh Anthropic `limits[]` telemetry is interpreted by scope: exhausted `session` and `weekly_all` windows exclude the account, while an exhausted `weekly_scoped` row excludes only requests for the matching model family when paid overage is confirmed unavailable. Stale, malformed, unrelated, or incomplete scoped telemetry fails open, and observed upstream capacity responses provide short-lived reactive evidence while telemetry catches up.
 
