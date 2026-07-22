@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { usageCache } from "@better-ccflare/providers";
-import type { Account, ComboWithSlots } from "@better-ccflare/types";
+import type {
+	Account,
+	ComboFamily,
+	ComboRoutingPolicySnapshot,
+	ComboWithSlots,
+} from "@better-ccflare/types";
 import type { ProxyContext } from "../handlers";
 import { handleProxy } from "../proxy";
 import * as usageCollectorModule from "../usage-collector";
@@ -69,6 +74,26 @@ function installUsageCollector(): ReturnType<typeof mock> {
 	return handleStart;
 }
 
+function makeRoutingPolicy(
+	combo: ComboWithSlots,
+	family: ComboFamily,
+): ComboRoutingPolicySnapshot {
+	const { slots, ...comboRecord } = combo;
+	return {
+		assignment: {
+			family,
+			combo_id: combo.id,
+			enabled: true,
+			membership_mode: "manual",
+			managed_model: null,
+		},
+		combo: comboRecord,
+		slots,
+		rules: [],
+		exclusions: [],
+	};
+}
+
 function makeContext(
 	accounts: Account[],
 	combo: ComboWithSlots,
@@ -78,7 +103,9 @@ function makeContext(
 		strategy: { select: mock(strategySelect) },
 		dbOps: {
 			getAllAccounts: mock(async () => accounts),
-			getActiveComboForFamily: mock(async () => combo),
+			getComboRoutingPolicy: mock(async (family: ComboFamily) =>
+				makeRoutingPolicy(combo, family),
+			),
 		},
 		runtime: { port: 8080, clientId: "test" },
 		config: {
@@ -166,7 +193,9 @@ describe("post-combo normal fallback", () => {
 				},
 			],
 		};
-		const getActiveComboForFamily = mock(async () => combo);
+		const getComboRoutingPolicy = mock(async (family: ComboFamily) =>
+			makeRoutingPolicy(combo, family),
+		);
 		const strategySelect = mock(
 			(
 				accounts: Account[],
@@ -186,7 +215,7 @@ describe("post-combo normal fallback", () => {
 			strategy: { select: strategySelect },
 			dbOps: {
 				getAllAccounts: mock(async () => [comboAccount, normalAccount]),
-				getActiveComboForFamily,
+				getComboRoutingPolicy,
 			},
 			runtime: { port: 8080, clientId: "test" },
 			config: {
@@ -246,7 +275,7 @@ describe("post-combo normal fallback", () => {
 			"https://upstream.test/combo-account",
 			"https://upstream.test/normal-account",
 		]);
-		expect(getActiveComboForFamily).toHaveBeenCalledTimes(1);
+		expect(getComboRoutingPolicy).toHaveBeenCalledTimes(1);
 		expect(strategySelect).toHaveBeenCalledTimes(2);
 		expect(
 			(handleStart.mock.calls[0]?.[0] as { failoverAttempts: number })
@@ -283,7 +312,7 @@ describe("post-combo normal fallback", () => {
 					enabled: true,
 				},
 				{
-					id: "slot-later",
+					id: "slot-z-later",
 					combo_id: "combo-duplicates",
 					account_id: later.id,
 					model: "claude-opus-4-5",
@@ -405,7 +434,7 @@ describe("post-combo normal fallback", () => {
 					enabled: true,
 				},
 				{
-					id: "slot-later",
+					id: "slot-z-later",
 					combo_id: `combo-account-wide-${accountWideStatus}`,
 					account_id: later.id,
 					model: "claude-opus-4-5",

@@ -5,6 +5,8 @@
 	"main": "./src/index.ts",
 	"exports": {
 		".": "./src/index.ts",
+		"./request-capabilities": "./src/request-capabilities.ts",
+		"./usage-cache": "./src/usage-fetcher.ts",
 		"./bedrock": "./src/providers/bedrock/index.ts",
 		"./codex": "./src/providers/codex/index.ts",
 		"./qwen": "./src/providers/qwen/index.ts",

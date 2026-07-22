@@ -13,7 +13,8 @@ export type ComboMembershipReasonCode =
 	| "unsupported"
 	| "unknown"
 	| "disabled"
-	| "ambiguous";
+	| "ambiguous"
+	| "new_billing_class";
 export type LogicalModelCapabilityStatus =
 	| "supported"
 	| "unsupported"
@@ -179,6 +180,8 @@ export interface ComboFamilyPolicyUpdateInput {
 
 export interface ComboFamilyPolicyChanges {
 	family: ComboFamily;
+	/** Internal compare-and-swap token captured with a coherent preview read. */
+	expected_revision?: number;
 	assignment?: ComboFamilyPolicyUpdateInput;
 	create_rules?: Array<Omit<ComboEnrollmentRuleCreateInput, "family">>;
 	update_rules?: Array<{
@@ -242,17 +245,112 @@ export interface ComboMembershipResolution {
 
 /** A visible peer-derived policy suggestion; never applied by the resolver. */
 export interface ComboEnrollmentRuleProposal {
+	/** Deterministic, review-safe identity for this exact server proposal. */
+	proposal_id: string;
 	family: ComboFamily;
 	combo_id: string;
 	provider: string;
 	route_class: ComboRouteClass;
-	/** Existing disabled rule to reactivate instead of creating a duplicate. */
+	/** Existing rule to reuse or reactivate instead of creating a duplicate. */
 	existing_rule_id: string | null;
 	managed_model: string;
 	tier_source: "account_priority";
 	high_confidence: boolean;
 	selected_by_default: boolean;
 	reason: ComboMembershipReasonCode;
+}
+
+/** Non-secret authentication metadata accepted by managed-routing preview. */
+export interface ComboRoutingAccountDraft {
+	provider: string;
+	priority: number;
+	auth_shape: ComboRouteClass;
+	billing_type?: "plan" | "api" | null;
+	/** Optional routing-only input. It is never echoed by the API. */
+	model_mappings?: Record<string, string | string[]> | null;
+}
+
+export type ComboRoutingPreviewSubject =
+	| { account_id: string; draft?: never }
+	| { account_id?: never; draft: ComboRoutingAccountDraft };
+
+/** Server-owned inference scope for a reviewed routing preview. */
+export type ComboRoutingPreviewScope = "account" | "family";
+
+export type ComboRoutingAvailabilityReason =
+	| "available"
+	| "paused"
+	| "requires_reauth"
+	| "rate_limited"
+	| "model_exhausted";
+
+export interface ComboRoutingAvailabilitySummary {
+	available: boolean;
+	reason: ComboRoutingAvailabilityReason;
+}
+
+export interface EffectiveComboMemberView
+	extends Omit<EffectiveComboMember, "id"> {
+	/** Null only for a non-persisted account in a proposal preview. */
+	id: string | null;
+	account_name: string;
+	availability: ComboRoutingAvailabilitySummary;
+	identity_provisional: boolean;
+}
+
+export interface ComboMembershipDecisionView extends ComboMembershipDecision {
+	account_name: string;
+	availability: ComboRoutingAvailabilitySummary;
+	identity_provisional: boolean;
+}
+
+/** Secret-free authoritative family policy and effective-membership view. */
+export interface EffectiveComboRoutingView {
+	family: ComboFamily;
+	policy: ComboRoutingPolicySnapshot;
+	resolution: Omit<ComboMembershipResolution, "members" | "decisions"> & {
+		members: EffectiveComboMemberView[];
+		decisions: ComboMembershipDecisionView[];
+	};
+}
+
+export interface ComboRoutingPreviewMemberState {
+	/** Hash of stable, non-secret candidate ownership used to correlate changes. */
+	key: string;
+	/** Persisted identity only; null for a draft subject. */
+	account_id: string | null;
+	/** Durable slot/managed-candidate identity only; null for a draft subject. */
+	candidate_id: string | null;
+	identity_provisional: boolean;
+	source: ComboMembershipSource;
+	tier: number;
+	logical_model: string;
+	reason: ComboMembershipReasonCode;
+}
+
+export interface ComboRoutingMemberDelta {
+	key: string;
+	status: "added" | "removed" | "changed" | "unchanged";
+	before: ComboRoutingPreviewMemberState | null;
+	after: ComboRoutingPreviewMemberState | null;
+}
+
+export interface ComboRoutingProposalPreview
+	extends ComboEnrollmentRuleProposal {
+	/** Authoritative resolver result if this exact proposal were applied. */
+	proposed_effective: EffectiveComboRoutingView;
+	/** Exact server-owned before/after member comparison. */
+	member_delta: ComboRoutingMemberDelta[];
+}
+
+export interface ComboRoutingPreviewResult {
+	preview_id: string;
+	scope: ComboRoutingPreviewScope;
+	family: ComboFamily;
+	/** Resolved reviewed model: override, valid assignment model, then latest. */
+	managed_model: string;
+	proposals: ComboRoutingProposalPreview[];
+	effective: EffectiveComboRoutingView;
 }
 
 // Extended type with slots populated

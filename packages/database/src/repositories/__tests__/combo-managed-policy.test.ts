@@ -248,6 +248,52 @@ describe("ComboRepository managed policy", () => {
 		expect(snapshot.assignment.membership_mode).toBe("manual");
 	});
 
+	it("rejects a stale routing revision atomically after a raw slot interleave", async () => {
+		await repo.setFamilyAssignment("opus", "combo-1", true);
+		const reviewedRevision = await repo.getRoutingPolicyRevision();
+		db.run("UPDATE combo_slots SET priority = 7 WHERE id = 'slot-1'");
+
+		await expect(
+			repo.applyFamilyPolicyChanges({
+				family: "opus",
+				expected_revision: reviewedRevision,
+				assignment: { membership_mode: "managed" },
+				create_rules: [
+					{
+						id: "must-not-commit",
+						combo_id: "combo-1",
+						provider: "anthropic",
+						route_class: "oauth-subscription",
+					},
+				],
+			}),
+		).rejects.toThrow("Routing policy revision changed");
+
+		const snapshot = await repo.getRoutingPolicySnapshot("opus");
+		expect(snapshot.assignment.membership_mode).toBe("manual");
+		expect(snapshot.slots[0]?.priority).toBe(7);
+		expect(snapshot.rules).toEqual([]);
+
+		const accountReviewedRevision = await repo.getRoutingPolicyRevision();
+		db.run("UPDATE accounts SET priority = 3 WHERE id = 'account-1'");
+		await expect(
+			repo.applyFamilyPolicyChanges({
+				family: "opus",
+				expected_revision: accountReviewedRevision,
+				assignment: { membership_mode: "managed" },
+				create_rules: [
+					{
+						id: "account-interleave-must-not-commit",
+						combo_id: "combo-1",
+						provider: "anthropic",
+						route_class: "oauth-subscription",
+					},
+				],
+			}),
+		).rejects.toThrow("Routing policy revision changed");
+		expect((await repo.getRoutingPolicySnapshot("opus")).rules).toEqual([]);
+	});
+
 	it("rejects duplicate normalized rules and exclusions", async () => {
 		await repo.setFamilyAssignment("opus", "combo-1", true);
 		const rule = {

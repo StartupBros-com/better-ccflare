@@ -2230,6 +2230,10 @@ OAuth tokens will need to be re-authenticated.
 		return this.combo.getRoutingPolicySnapshot(family);
 	}
 
+	async getRoutingPolicyRevision(): Promise<number> {
+		return this.combo.getRoutingPolicyRevision();
+	}
+
 	async applyFamilyPolicyChanges(
 		changes: ComboFamilyPolicyChanges,
 	): Promise<ComboFamilyPolicyApplyResult> {

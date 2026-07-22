@@ -11,12 +11,17 @@ import type {
 	AnalyticsResponse,
 	CacheInsightsResponse,
 	Combo,
+	ComboFamily,
 	ComboFamilyAssignment,
+	ComboMembershipMode,
+	ComboRoutingPreviewResult,
+	ComboRoutingPreviewSubject,
 	ComboSlot,
 	ComboSlotCreateInput,
 	ComboSlotUpdateInput,
 	ComboWithSlots,
 	ContextInsightsResponse,
+	EffectiveComboRoutingView,
 	LogEvent,
 	ModelCatalogRefreshResponse,
 	ModelCatalogResponse,
@@ -35,6 +40,29 @@ export type Account = AccountResponse & {
 export type Stats = StatsWithAccounts;
 export type LogEntry = LogEvent;
 export type RequestSummary = RequestResponse;
+
+export interface AccountCreatedApiResponse {
+	success: true;
+	accountId: string;
+	message: string;
+	account: Account;
+}
+
+export interface OAuthAccountCreatedApiResponse {
+	success: true;
+	accountId: string;
+	message: string;
+	mode: string;
+}
+
+function safeAccountCreateLog(data: object): Record<string, unknown> {
+	const safe = data as { name?: string; mode?: string; priority?: number };
+	return {
+		...(safe.name ? { name: safe.name } : {}),
+		...(safe.mode ? { mode: safe.mode } : {}),
+		...(safe.priority !== undefined ? { priority: safe.priority } : {}),
+	};
+}
 
 // Re-export types directly
 export type {
@@ -277,7 +305,7 @@ class API extends HttpClient {
 		const startTime = Date.now();
 		const url = "/api/oauth/init";
 
-		this.logger.debug(`→ POST ${url}`, { data });
+		this.logger.debug(`→ POST ${url}`, safeAccountCreateLog(data));
 
 		try {
 			const response = await this.post<{ authUrl: string; sessionId: string }>(
@@ -303,17 +331,17 @@ class API extends HttpClient {
 	async completeAddAccount(data: {
 		sessionId: string;
 		code: string;
-	}): Promise<{ message: string; mode: string }> {
+	}): Promise<OAuthAccountCreatedApiResponse> {
 		const startTime = Date.now();
 		const url = "/api/oauth/callback";
 
-		this.logger.debug(`→ POST ${url}`, { data });
+		this.logger.debug(`→ POST ${url}`, safeAccountCreateLog(data));
 
 		try {
-			const response = await this.post<{
-				message: string;
-				mode: string;
-			}>(url, data);
+			const response = await this.post<OAuthAccountCreatedApiResponse>(
+				url,
+				data,
+			);
 			const duration = Date.now() - startTime;
 			this.logger.debug(`← POST ${url} - 200 (${duration}ms)`);
 			return response;
@@ -336,17 +364,14 @@ class API extends HttpClient {
 		priority: number;
 		customEndpoint?: string;
 		modelMappings?: { [key: string]: string };
-	}): Promise<{ message: string; account: Account }> {
+	}): Promise<AccountCreatedApiResponse> {
 		const startTime = Date.now();
 		const url = "/api/accounts/zai";
 
-		this.logger.debug(`→ POST ${url}`, { data });
+		this.logger.debug(`→ POST ${url}`, safeAccountCreateLog(data));
 
 		try {
-			const response = await this.post<{ message: string; account: Account }>(
-				url,
-				data,
-			);
+			const response = await this.post<AccountCreatedApiResponse>(url, data);
 			const duration = Date.now() - startTime;
 			this.logger.debug(`← POST ${url} - 200 (${duration}ms)`);
 			return response;
@@ -369,17 +394,14 @@ class API extends HttpClient {
 		priority: number;
 		customEndpoint: string;
 		modelMappings?: { [key: string]: string };
-	}): Promise<{ message: string; account: Account }> {
+	}): Promise<AccountCreatedApiResponse> {
 		const startTime = Date.now();
 		const url = "/api/accounts/openai-compatible";
 
-		this.logger.debug(`→ POST ${url}`, { data });
+		this.logger.debug(`→ POST ${url}`, safeAccountCreateLog(data));
 
 		try {
-			const response = await this.post<{ message: string; account: Account }>(
-				url,
-				data,
-			);
+			const response = await this.post<AccountCreatedApiResponse>(url, data);
 			const duration = Date.now() - startTime;
 			this.logger.debug(`← POST ${url} - 200 (${duration}ms)`);
 			return response;
@@ -402,15 +424,12 @@ class API extends HttpClient {
 		priority: number;
 		customEndpoint?: string;
 		modelMappings?: { [key: string]: string };
-	}): Promise<{ message: string; account: Account }> {
+	}): Promise<AccountCreatedApiResponse> {
 		const startTime = Date.now();
 		const url = "/api/accounts/nanogpt";
-		this.logger.debug(`→ POST ${url}`, { data });
+		this.logger.debug(`→ POST ${url}`, safeAccountCreateLog(data));
 		try {
-			const response = await this.post<{ message: string; account: Account }>(
-				url,
-				data,
-			);
+			const response = await this.post<AccountCreatedApiResponse>(url, data);
 			const duration = Date.now() - startTime;
 			this.logger.debug(`← POST ${url} - 200 (${duration}ms)`);
 			return response;
@@ -432,15 +451,12 @@ class API extends HttpClient {
 		apiKey: string;
 		priority: number;
 		modelMappings?: { [key: string]: string };
-	}): Promise<{ message: string; account: Account }> {
+	}): Promise<AccountCreatedApiResponse> {
 		const startTime = Date.now();
 		const url = "/api/accounts/alibaba-coding-plan";
-		this.logger.debug(`→ POST ${url}`, { data });
+		this.logger.debug(`→ POST ${url}`, safeAccountCreateLog(data));
 		try {
-			const response = await this.post<{ message: string; account: Account }>(
-				url,
-				data,
-			);
+			const response = await this.post<AccountCreatedApiResponse>(url, data);
 			const duration = Date.now() - startTime;
 			this.logger.debug(`← POST ${url} - 200 (${duration}ms)`);
 			return response;
@@ -462,15 +478,12 @@ class API extends HttpClient {
 		apiKey: string;
 		priority: number;
 		modelMappings?: { [key: string]: string };
-	}): Promise<{ message: string; account: Account }> {
+	}): Promise<AccountCreatedApiResponse> {
 		const startTime = Date.now();
 		const url = "/api/accounts/kilo";
-		this.logger.debug(`→ POST ${url}`, { data });
+		this.logger.debug(`→ POST ${url}`, safeAccountCreateLog(data));
 		try {
-			const response = await this.post<{ message: string; account: Account }>(
-				url,
-				data,
-			);
+			const response = await this.post<AccountCreatedApiResponse>(url, data);
 			const duration = Date.now() - startTime;
 			this.logger.debug(`← POST ${url} - 200 (${duration}ms)`);
 			return response;
@@ -492,15 +505,12 @@ class API extends HttpClient {
 		apiKey: string;
 		priority: number;
 		modelMappings?: { [key: string]: string };
-	}): Promise<{ message: string; account: Account }> {
+	}): Promise<AccountCreatedApiResponse> {
 		const startTime = Date.now();
 		const url = "/api/accounts/openrouter";
-		this.logger.debug(`→ POST ${url}`, { data });
+		this.logger.debug(`→ POST ${url}`, safeAccountCreateLog(data));
 		try {
-			const response = await this.post<{ message: string; account: Account }>(
-				url,
-				data,
-			);
+			const response = await this.post<AccountCreatedApiResponse>(url, data);
 			const duration = Date.now() - startTime;
 			this.logger.debug(`← POST ${url} - 200 (${duration}ms)`);
 			return response;
@@ -521,17 +531,14 @@ class API extends HttpClient {
 		name: string;
 		apiKey: string;
 		priority: number;
-	}): Promise<{ message: string; account: Account }> {
+	}): Promise<AccountCreatedApiResponse> {
 		const startTime = Date.now();
 		const url = "/api/accounts/minimax";
 
-		this.logger.debug(`→ POST ${url}`, { data });
+		this.logger.debug(`→ POST ${url}`, safeAccountCreateLog(data));
 
 		try {
-			const response = await this.post<{ message: string; account: Account }>(
-				url,
-				data,
-			);
+			const response = await this.post<AccountCreatedApiResponse>(url, data);
 			const duration = Date.now() - startTime;
 			this.logger.debug(`← POST ${url} - 200 (${duration}ms)`);
 			return response;
@@ -553,17 +560,14 @@ class API extends HttpClient {
 		projectId: string;
 		region: string;
 		priority: number;
-	}): Promise<{ message: string; account: Account }> {
+	}): Promise<AccountCreatedApiResponse> {
 		const startTime = Date.now();
 		const url = "/api/accounts/vertex-ai";
 
-		this.logger.debug(`→ POST ${url}`, { data });
+		this.logger.debug(`→ POST ${url}`, safeAccountCreateLog(data));
 
 		try {
-			const response = await this.post<{ message: string; account: Account }>(
-				url,
-				data,
-			);
+			const response = await this.post<AccountCreatedApiResponse>(url, data);
 			const duration = Date.now() - startTime;
 			this.logger.debug(`← POST ${url} - 200 (${duration}ms)`);
 			return response;
@@ -611,17 +615,14 @@ class API extends HttpClient {
 		priority: number;
 		cross_region_mode?: "geographic" | "global" | "regional";
 		customModel?: string;
-	}): Promise<{ message: string; account: Account }> {
+	}): Promise<AccountCreatedApiResponse> {
 		const startTime = Date.now();
 		const url = "/api/accounts/bedrock";
 
-		this.logger.debug(`→ POST ${url}`, { data });
+		this.logger.debug(`→ POST ${url}`, safeAccountCreateLog(data));
 
 		try {
-			const response = await this.post<{ message: string; account: Account }>(
-				url,
-				data,
-			);
+			const response = await this.post<AccountCreatedApiResponse>(url, data);
 			const duration = Date.now() - startTime;
 			this.logger.debug(`← POST ${url} - 200 (${duration}ms)`);
 			return response;
@@ -644,17 +645,14 @@ class API extends HttpClient {
 		priority: number;
 		customEndpoint?: string;
 		modelMappings?: { [key: string]: string };
-	}): Promise<{ message: string; account: Account }> {
+	}): Promise<AccountCreatedApiResponse> {
 		const startTime = Date.now();
 		const url = "/api/accounts/anthropic-compatible";
 
-		this.logger.debug(`→ POST ${url}`, { data });
+		this.logger.debug(`→ POST ${url}`, safeAccountCreateLog(data));
 
 		try {
-			const response = await this.post<{ message: string; account: Account }>(
-				url,
-				data,
-			);
+			const response = await this.post<AccountCreatedApiResponse>(url, data);
 			const duration = Date.now() - startTime;
 			this.logger.debug(`← POST ${url} - 200 (${duration}ms)`);
 			return response;
@@ -676,17 +674,14 @@ class API extends HttpClient {
 		priority: number;
 		customEndpoint?: string;
 		modelMappings?: { [key: string]: string };
-	}): Promise<{ message: string; account: Account }> {
+	}): Promise<AccountCreatedApiResponse> {
 		const startTime = Date.now();
 		const url = "/api/accounts/ollama";
 
-		this.logger.debug(`→ POST ${url}`, { data });
+		this.logger.debug(`→ POST ${url}`, safeAccountCreateLog(data));
 
 		try {
-			const response = await this.post<{ message: string; account: Account }>(
-				url,
-				data,
-			);
+			const response = await this.post<AccountCreatedApiResponse>(url, data);
 			const duration = Date.now() - startTime;
 			this.logger.debug(`← POST ${url} - 200 (${duration}ms)`);
 			return response;
@@ -708,17 +703,14 @@ class API extends HttpClient {
 		apiKey: string;
 		priority: number;
 		modelMappings?: { [key: string]: string };
-	}): Promise<{ message: string; account: Account }> {
+	}): Promise<AccountCreatedApiResponse> {
 		const startTime = Date.now();
 		const url = "/api/accounts/ollama-cloud";
 
-		this.logger.debug(`→ POST ${url}`, { data });
+		this.logger.debug(`→ POST ${url}`, safeAccountCreateLog(data));
 
 		try {
-			const response = await this.post<{ message: string; account: Account }>(
-				url,
-				data,
-			);
+			const response = await this.post<AccountCreatedApiResponse>(url, data);
 			const duration = Date.now() - startTime;
 			this.logger.debug(`← POST ${url} - 200 (${duration}ms)`);
 			return response;
@@ -1319,7 +1311,10 @@ class API extends HttpClient {
 		const startTime = Date.now();
 		const url = `/api/accounts/${accountId}/custom-endpoint`;
 
-		this.logger.debug(`→ POST ${url}`, { customEndpoint });
+		this.logger.debug(`→ POST ${url}`, {
+			accountId,
+			configured: customEndpoint !== null,
+		});
 
 		try {
 			await this.post(url, {
@@ -1347,7 +1342,10 @@ class API extends HttpClient {
 		const startTime = Date.now();
 		const url = `/api/accounts/${accountId}/model-mappings`;
 
-		this.logger.debug(`→ POST ${url}`, { modelMappings });
+		this.logger.debug(`→ POST ${url}`, {
+			accountId,
+			logicalModelCount: Object.keys(modelMappings).length,
+		});
 
 		try {
 			await this.post(url, {
@@ -2040,6 +2038,141 @@ class API extends HttpClient {
 		});
 	}
 
+	async updateFamilyPolicy(params: {
+		family: ComboFamily;
+		comboId?: string | null;
+		enabled?: boolean;
+		membershipMode?: ComboMembershipMode;
+		managedModel?: string | null;
+	}): Promise<ComboFamilyAssignment> {
+		const response = await this.put<{
+			success: true;
+			data: ComboFamilyAssignment;
+		}>(`/api/families/${params.family}`, {
+			...(params.comboId !== undefined ? { combo_id: params.comboId } : {}),
+			...(params.enabled !== undefined ? { enabled: params.enabled } : {}),
+			...(params.membershipMode !== undefined
+				? { membership_mode: params.membershipMode }
+				: {}),
+			...(params.managedModel !== undefined
+				? { managed_model: params.managedModel }
+				: {}),
+		});
+		return response.data;
+	}
+
+	async getEffectiveRouting(
+		family?: ComboFamily,
+	): Promise<EffectiveComboRoutingView | EffectiveComboRoutingView[]> {
+		const response = await this.get<{
+			success: true;
+			data: EffectiveComboRoutingView | EffectiveComboRoutingView[];
+		}>(
+			family
+				? `/api/routing/effective/${encodeURIComponent(family)}`
+				: "/api/routing/effective",
+		);
+		return response.data;
+	}
+
+	async previewRouting(
+		subject: ComboRoutingPreviewSubject,
+		family?: ComboFamily,
+		managedModel?: string,
+	): Promise<
+		ComboRoutingPreviewResult | { families: ComboRoutingPreviewResult[] }
+	> {
+		const response = await this.post<{
+			success: true;
+			data:
+				| ComboRoutingPreviewResult
+				| { families: ComboRoutingPreviewResult[] };
+		}>("/api/routing/preview", {
+			...(family ? { family } : {}),
+			...(managedModel !== undefined ? { managed_model: managedModel } : {}),
+			...subject,
+		});
+		return response.data;
+	}
+
+	async previewFamilyRouting(
+		family: ComboFamily,
+		managedModel?: string,
+	): Promise<ComboRoutingPreviewResult> {
+		const response = await this.post<{
+			success: true;
+			data: ComboRoutingPreviewResult;
+		}>("/api/routing/preview", {
+			scope: "family",
+			family,
+			...(managedModel !== undefined ? { managed_model: managedModel } : {}),
+		});
+		return response.data;
+	}
+
+	async applyRoutingProposal(params: {
+		family: ComboFamily;
+		previewId: string;
+		proposalId: string;
+		accountId: string;
+		managedModel: string;
+	}): Promise<EffectiveComboRoutingView> {
+		const response = await this.post<{
+			success: true;
+			data: EffectiveComboRoutingView;
+		}>(`/api/routing/apply/${encodeURIComponent(params.family)}`, {
+			preview_id: params.previewId,
+			proposal_id: params.proposalId,
+			managed_model: params.managedModel,
+			subject: { account_id: params.accountId },
+		});
+		return response.data;
+	}
+
+	async applyFamilyRoutingProposal(params: {
+		family: ComboFamily;
+		previewId: string;
+		proposalId: string;
+		managedModel: string;
+	}): Promise<EffectiveComboRoutingView> {
+		const response = await this.post<{
+			success: true;
+			data: EffectiveComboRoutingView;
+		}>(`/api/routing/apply/${encodeURIComponent(params.family)}`, {
+			scope: "family",
+			preview_id: params.previewId,
+			proposal_id: params.proposalId,
+			managed_model: params.managedModel,
+		});
+		return response.data;
+	}
+
+	async excludeAccountFromFamily(
+		family: ComboFamily,
+		accountId: string,
+	): Promise<EffectiveComboRoutingView> {
+		const response = await this.post<{
+			success: true;
+			data: EffectiveComboRoutingView;
+		}>(`/api/routing/exclusions/${encodeURIComponent(family)}`, {
+			account_id: accountId,
+		});
+		return response.data;
+	}
+
+	async restoreAccountToFamily(
+		family: ComboFamily,
+		accountId: string,
+	): Promise<EffectiveComboRoutingView> {
+		const response = await this.delete<{
+			success: true;
+			data: EffectiveComboRoutingView;
+		}>(
+			`/api/routing/exclusions/${encodeURIComponent(family)}/${encodeURIComponent(accountId)}`,
+		);
+		return response.data;
+	}
+
 	async getCombo(id: string): Promise<{ combo: ComboWithSlots }> {
 		const res = await this.get<{ success: boolean; data: ComboWithSlots }>(
 			`/api/combos/${id}`,
@@ -2084,7 +2217,7 @@ class API extends HttpClient {
 		userCode: string;
 	}> {
 		const url = "/api/oauth/codex/init";
-		this.logger.debug(`→ POST ${url}`, { data });
+		this.logger.debug(`→ POST ${url}`, safeAccountCreateLog(data));
 		try {
 			const response = await this.post<{
 				sessionId: string;
@@ -2100,20 +2233,26 @@ class API extends HttpClient {
 		}
 	}
 
-	async getCodexAuthStatus(
-		sessionId: string,
-	): Promise<{ status: "pending" | "complete" | "error"; error?: string }> {
+	async getCodexAuthStatus(sessionId: string): Promise<{
+		status: "pending" | "complete" | "error";
+		accountId?: string;
+		error?: string;
+	}> {
 		const url = `/api/oauth/codex/status/${sessionId}`;
-		this.logger.debug(`→ GET ${url}`);
+		const logUrl = "/api/oauth/codex/status/[session]";
+		this.logger.debug(`→ GET ${logUrl}`);
 		try {
 			const response = await this.get<{
 				status: "pending" | "complete" | "error";
+				accountId?: string;
 				error?: string;
 			}>(url);
-			this.logger.debug(`← GET ${url} - 200`);
+			this.logger.debug(`← GET ${logUrl} - 200`);
 			return response;
 		} catch (error) {
-			this.logger.error(`✗ GET ${url} - ERROR`, { error });
+			this.logger.error(`✗ GET ${logUrl} - ERROR`, {
+				error: error instanceof Error ? error.message : String(error),
+			});
 			if (error instanceof HttpError) throw new Error(error.message);
 			throw error;
 		}
@@ -2124,7 +2263,7 @@ class API extends HttpClient {
 		priority: number;
 	}): Promise<{ sessionId: string; authUrl: string; userCode: string }> {
 		const url = "/api/oauth/qwen/init";
-		this.logger.debug(`→ POST ${url}`, { data });
+		this.logger.debug(`→ POST ${url}`, safeAccountCreateLog(data));
 		try {
 			const response = await this.post<{
 				sessionId: string;
@@ -2144,7 +2283,7 @@ class API extends HttpClient {
 		accountId: string;
 	}): Promise<{ sessionId: string; authUrl: string; userCode: string }> {
 		const url = "/api/oauth/qwen/reauth";
-		this.logger.debug(`→ POST ${url}`, { data });
+		this.logger.debug(`→ POST ${url}`, safeAccountCreateLog(data));
 		try {
 			const response = await this.post<{
 				sessionId: string;
@@ -2166,7 +2305,7 @@ class API extends HttpClient {
 		userCode: string;
 	}> {
 		const url = "/api/oauth/codex/reauth";
-		this.logger.debug(`→ POST ${url}`, { data });
+		this.logger.debug(`→ POST ${url}`, safeAccountCreateLog(data));
 		try {
 			const response = await this.post<{
 				sessionId: string;
@@ -2206,7 +2345,7 @@ class API extends HttpClient {
 		code: string,
 	): Promise<{ success: boolean; message: string }> {
 		const url = "/api/oauth/anthropic/reauth/callback";
-		this.logger.debug(`→ POST ${url}`, { sessionId });
+		this.logger.debug(`→ POST ${url}`);
 		try {
 			const response = await this.post<{ success: boolean; message: string }>(
 				url,
@@ -2230,20 +2369,26 @@ class API extends HttpClient {
 		});
 	}
 
-	async getQwenAuthStatus(
-		sessionId: string,
-	): Promise<{ status: "pending" | "complete" | "error"; error?: string }> {
+	async getQwenAuthStatus(sessionId: string): Promise<{
+		status: "pending" | "complete" | "error";
+		accountId?: string;
+		error?: string;
+	}> {
 		const url = `/api/oauth/qwen/status/${sessionId}`;
-		this.logger.debug(`→ GET ${url}`);
+		const logUrl = "/api/oauth/qwen/status/[session]";
+		this.logger.debug(`→ GET ${logUrl}`);
 		try {
 			const response = await this.get<{
 				status: "pending" | "complete" | "error";
+				accountId?: string;
 				error?: string;
 			}>(url);
-			this.logger.debug(`← GET ${url} - 200`);
+			this.logger.debug(`← GET ${logUrl} - 200`);
 			return response;
 		} catch (error) {
-			this.logger.error(`✗ GET ${url} - ERROR`, { error });
+			this.logger.error(`✗ GET ${logUrl} - ERROR`, {
+				error: error instanceof Error ? error.message : String(error),
+			});
 			if (error instanceof HttpError) throw new Error(error.message);
 			throw error;
 		}

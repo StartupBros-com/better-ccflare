@@ -2,16 +2,22 @@ import {
 	getModelFamily,
 	isAccountAvailable,
 	isOfficialXaiEndpoint,
+	resolveEffectiveComboMembership,
 } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import {
 	canonicalizeBetaSignature,
+	deriveComboRouteClass,
+	resolveAccountLogicalModelCapability,
 	usageCache,
 } from "@better-ccflare/providers";
 import type {
 	Account,
 	AccountQuotaPressure,
 	ComboFamily,
+	ComboMembershipReasonCode,
+	ComboMembershipSource,
+	ComboRoutingPolicySnapshot,
 	ComboSlotInfo,
 	RequestMeta,
 	RoutingCandidateMetadata,
@@ -482,14 +488,27 @@ function applyXaiCacheAffinity(
 	return ctx.cacheAffinityOrderer?.order(accounts, meta) ?? accounts;
 }
 
+function reportAccountDatabaseError(error: unknown): void {
+	log.error("Failed to get accounts from database:", error);
+	console.error("\n❌ DATABASE ERROR DETECTED");
+	console.error("═".repeat(50));
+	console.error("The database encountered an error while loading accounts.");
+	console.error("This may indicate database corruption or integrity issues.\n");
+	console.error("To diagnose and repair the database, run:");
+	console.error("  bun run cli --repair-db\n");
+	console.error("The request will fall back to unauthenticated mode.");
+	console.error(`${"═".repeat(50)}\n`);
+}
+
 export async function getOrderedAccounts(
 	meta: RequestMeta,
 	ctx: ProxyContext,
 	effectiveModel: string | null = null,
 	syntheticProbe = false,
+	preloadedAccounts?: Account[],
 ): Promise<Account[]> {
 	try {
-		const allAccounts = await ctx.dbOps.getAllAccounts();
+		const allAccounts = preloadedAccounts ?? (await ctx.dbOps.getAllAccounts());
 		setXaiCacheEligibleAccounts(meta, allAccounts);
 		const eligibleAccounts = prepareNormalRoutingMetadata(
 			meta,
@@ -513,17 +532,7 @@ export async function getOrderedAccounts(
 			);
 		return applyXaiCacheAffinity(ordered, meta, ctx);
 	} catch (error) {
-		log.error("Failed to get accounts from database:", error);
-		console.error("\n❌ DATABASE ERROR DETECTED");
-		console.error("═".repeat(50));
-		console.error("The database encountered an error while loading accounts.");
-		console.error(
-			"This may indicate database corruption or integrity issues.\n",
-		);
-		console.error("To diagnose and repair the database, run:");
-		console.error("  bun run cli --repair-db\n");
-		console.error("The request will fall back to unauthenticated mode.");
-		console.error(`${"═".repeat(50)}\n`);
+		reportAccountDatabaseError(error);
 		// Return empty array to gracefully handle database errors
 		// This will cause the proxy to fall back to unauthenticated mode
 		return [];
@@ -714,6 +723,8 @@ export async function selectAccountsForRequest(
 		return filtered;
 	};
 
+	let preloadedAccounts: Account[] | undefined;
+
 	// Try combo-aware routing if a concrete effective model is available.
 	if (effectiveModel && !options.skipCombo) {
 		const family = getModelFamily(effectiveModel);
@@ -727,26 +738,94 @@ export async function selectAccountsForRequest(
 			if (!validFamilies.includes(family)) {
 				log.warn(`Unknown model family "${family}", skipping combo lookup`);
 			} else {
-				const combo = await ctx.dbOps.getActiveComboForFamily(
-					family as ComboFamily,
-				);
-				if (combo) {
-					log.info(
-						`Combo routing active: ${combo.name} for family ${family} (${combo.slots.length} slots)`,
+				const comboFamily = family as ComboFamily;
+				const routingPolicyReader = (
+					ctx.dbOps as Partial<
+						Pick<ProxyContext["dbOps"], "getComboRoutingPolicy">
+					>
+				).getComboRoutingPolicy;
+				let routingPolicy: ComboRoutingPolicySnapshot;
+				if (typeof routingPolicyReader === "function") {
+					routingPolicy = await routingPolicyReader.call(
+						ctx.dbOps,
+						comboFamily,
 					);
+				} else {
+					const combo = await ctx.dbOps.getActiveComboForFamily(comboFamily);
+					routingPolicy = {
+						assignment: {
+							family: comboFamily,
+							combo_id: combo?.id ?? null,
+							enabled: combo !== null,
+							membership_mode: "manual",
+							managed_model: null,
+						},
+						combo,
+						slots: combo?.slots ?? [],
+						rules: [],
+						exclusions: [],
+					};
+				}
+				let allAccounts: Account[];
+				try {
+					allAccounts = await ctx.dbOps.getAllAccounts();
+				} catch (error) {
+					reportAccountDatabaseError(error);
+					return [];
+				}
+				preloadedAccounts = allAccounts;
+				const resolution = resolveEffectiveComboMembership(
+					routingPolicy,
+					allAccounts,
+					{
+						deriveRouteClass: deriveComboRouteClass,
+						resolveCapability: resolveAccountLogicalModelCapability,
+					},
+				);
+				const sourceCounts: Record<ComboMembershipSource, number> = {
+					manual: 0,
+					managed: 0,
+				};
+				for (const member of resolution.members) {
+					sourceCounts[member.source]++;
+				}
+				const reasonCounts: Partial<Record<ComboMembershipReasonCode, number>> =
+					{};
+				for (const decision of resolution.decisions) {
+					reasonCounts[decision.reason] =
+						(reasonCounts[decision.reason] ?? 0) + 1;
+				}
+				const membershipDiagnostics = {
+					family,
+					comboId: resolution.combo_id,
+					active: resolution.active,
+					membershipMode: routingPolicy.assignment.membership_mode,
+					memberCount: resolution.members.length,
+					sourceCounts,
+					reasonCounts,
+				};
+				if (!resolution.active) {
+					log.info("Combo routing membership resolved", {
+						...membershipDiagnostics,
+						selectedSource: null,
+						selectedTier: null,
+						eligibleCandidateCount: 0,
+					});
+				}
 
-					const allAccounts = await ctx.dbOps.getAllAccounts();
+				const combo = routingPolicy.combo;
+				if (resolution.active && combo) {
 					const accountMap = new Map<string, Account>();
 					for (const account of allAccounts) {
 						accountMap.set(account.id, account);
 					}
 
 					const eligibleEntries: Array<{
-						slotId: string;
 						account: Account;
 						modelOverride: string;
 						tier: number;
 						ordinal: number;
+						source: ComboMembershipSource;
 						quotaPressure: AccountQuotaPressure | null;
 						routing: RoutingCandidateMetadata;
 					}> = [];
@@ -759,27 +838,27 @@ export async function selectAccountsForRequest(
 						meta.headers?.get("anthropic-beta"),
 					);
 
-					// Treat every slot as one account/model candidate. The repository's
-					// slot order is retained as the stable within-tier ordinal.
-					for (const [ordinal, slot] of combo.slots.entries()) {
-						if (!slot.enabled) continue;
-
-						const account = accountMap.get(slot.account_id);
+					// Effective members are structural candidates. The resolver owns
+					// manual/managed precedence and its order is the stable ordinal.
+					for (const [ordinal, member] of resolution.members.entries()) {
+						const account = accountMap.get(member.account_id);
 						if (!account) {
-							log.warn(
-								`Combo slot references unknown account ${slot.account_id}`,
-							);
+							log.warn("Resolved combo member references an unknown account", {
+								family,
+								comboId: resolution.combo_id,
+								source: member.source,
+							});
 							continue;
 						}
 
 						if (isProviderExcluded(account)) continue;
 						const routing: RoutingCandidateMetadata = {
-							candidateId: `combo:${combo.id}:slot:${slot.id}`,
+							candidateId: member.id,
 							accountId: account.id,
-							tier: slot.priority,
+							tier: member.tier,
 							ordinal,
-							comboSlotId: slot.id,
-							modelOverride: slot.model,
+							comboSlotId: member.slot_id,
+							modelOverride: member.logical_model,
 							quotaPressure: null,
 						};
 						candidateCatalog.push(routing);
@@ -794,7 +873,7 @@ export async function selectAccountsForRequest(
 						);
 						const evaluation = evaluateCandidateCapacity(
 							account,
-							slot.model,
+							member.logical_model,
 							beta,
 							now,
 							options.syntheticProbe === true,
@@ -804,10 +883,10 @@ export async function selectAccountsForRequest(
 							capacityExclusions.push(
 								candidateExclusion(
 									account,
-									slot.model,
+									member.logical_model,
 									evaluation,
 									"combo",
-									slot.id,
+									member.slot_id,
 									ordinal,
 								),
 							);
@@ -819,11 +898,11 @@ export async function selectAccountsForRequest(
 							(eligibleCountsByAccount.get(account.id) ?? 0) + 1,
 						);
 						eligibleEntries.push({
-							slotId: slot.id,
 							account,
-							modelOverride: slot.model,
-							tier: slot.priority,
+							modelOverride: member.logical_model,
+							tier: member.tier,
 							ordinal,
+							source: member.source,
 							quotaPressure: evaluation.quotaPressure,
 							routing,
 						});
@@ -933,6 +1012,12 @@ export async function selectAccountsForRequest(
 							(entry) => entry.routing,
 						);
 						if (orderedEntries.length > 0) {
+							log.info("Combo routing candidate selected", {
+								...membershipDiagnostics,
+								selectedSource: orderedEntries[0]?.source ?? null,
+								selectedTier: orderedEntries[0]?.tier ?? null,
+								eligibleCandidateCount: orderedEntries.length,
+							});
 							const slotInfo: ComboSlotInfo = {
 								comboName: combo.name,
 								slots: orderedEntries.map((entry) => ({
@@ -946,10 +1031,23 @@ export async function selectAccountsForRequest(
 						}
 					}
 
-					// All slots unavailable — fall back to normal routing
+					// All effective candidates unavailable — fall back to normal routing.
 					log.warn(
-						`All ${combo.slots.length} combo slots unavailable for ${combo.name}, falling back to SessionStrategy`,
+						`All ${resolution.members.length} combo candidates unavailable for ${combo.name}, falling back to SessionStrategy`,
+						{
+							...membershipDiagnostics,
+							selectedSource: null,
+							selectedTier: null,
+							eligibleCandidateCount: 0,
+						},
 					);
+				} else if (resolution.active) {
+					log.error("Active combo membership resolved without a combo record", {
+						...membershipDiagnostics,
+						selectedSource: null,
+						selectedTier: null,
+						eligibleCandidateCount: 0,
+					});
 				}
 			}
 		}
@@ -961,6 +1059,7 @@ export async function selectAccountsForRequest(
 			ctx,
 			effectiveModel,
 			options.syntheticProbe === true,
+			preloadedAccounts,
 		),
 	);
 }

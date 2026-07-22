@@ -11,6 +11,16 @@ function columnNames(db: Database, table: string): string[] {
 		.map((column) => column.name);
 }
 
+function routingRevision(db: Database): number {
+	return (
+		db
+			.query<{ revision: number }, []>(
+				"SELECT revision FROM routing_policy_revision WHERE scope = 'global'",
+			)
+			.get()?.revision ?? -1
+	);
+}
+
 describe("managed routing migrations", () => {
 	it("creates equivalent SQLite policy columns, constraints, indexes, and cascades", () => {
 		const db = new Database(":memory:");
@@ -67,6 +77,105 @@ describe("managed routing migrations", () => {
 				"UPDATE combo_family_assignments SET membership_mode = 'automatic' WHERE family = 'opus'",
 			),
 		).toThrow();
+		db.close();
+	});
+
+	it("tracks every SQLite preview-hash input without token-rotation churn", () => {
+		const db = new Database(":memory:");
+		db.run("PRAGMA foreign_keys = ON");
+		runMigrations(db);
+
+		expect(columnNames(db, "routing_policy_revision")).toEqual([
+			"scope",
+			"revision",
+		]);
+		expect(routingRevision(db)).toBe(0);
+		const triggerNames = new Set(
+			db
+				.query<{ name: string }, []>(
+					"SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'trg_routing_revision_%'",
+				)
+				.all()
+				.map((row) => row.name),
+		);
+		for (const table of [
+			"combos",
+			"combo_slots",
+			"combo_family_assignments",
+			"combo_enrollment_rules",
+			"combo_membership_exclusions",
+		]) {
+			for (const operation of ["insert", "update", "delete"]) {
+				expect(triggerNames).toContain(
+					`trg_routing_revision_${table}_${operation}`,
+				);
+			}
+		}
+		expect(triggerNames).toContain("trg_routing_revision_accounts_insert");
+		expect(triggerNames).toContain("trg_routing_revision_accounts_update");
+		expect(triggerNames).toContain("trg_routing_revision_accounts_delete");
+
+		const expectBump = (mutate: () => void) => {
+			const before = routingRevision(db);
+			mutate();
+			expect(routingRevision(db)).toBeGreaterThan(before);
+		};
+		expectBump(() =>
+			db.run(
+				"INSERT INTO accounts (id, name, provider, refresh_token, access_token, created_at, priority) VALUES ('account-r', 'routing', 'anthropic', 'first', 'first-access', 1, 0)",
+			),
+		);
+		expectBump(() =>
+			db.run(
+				"INSERT INTO combos (id, name, enabled, created_at, updated_at) VALUES ('combo-r', 'routing', 1, 1, 1)",
+			),
+		);
+		expectBump(() =>
+			db.run(
+				"INSERT INTO combo_slots (id, combo_id, account_id, model, priority, enabled) VALUES ('slot-r', 'combo-r', 'account-r', 'claude-opus-4-7', 0, 1)",
+			),
+		);
+		expectBump(() =>
+			db.run(
+				"UPDATE combo_family_assignments SET combo_id = 'combo-r', enabled = 1 WHERE family = 'opus'",
+			),
+		);
+		expectBump(() =>
+			db.run(
+				"INSERT INTO combo_enrollment_rules (id, family, combo_id, provider, route_class, enabled, created_at, updated_at) VALUES ('rule-r', 'opus', 'combo-r', 'anthropic', 'oauth-subscription', 1, 1, 1)",
+			),
+		);
+		expectBump(() =>
+			db.run(
+				"INSERT INTO combo_membership_exclusions (id, family, combo_id, account_id, created_at) VALUES ('exclusion-r', 'opus', 'combo-r', 'account-r', 1)",
+			),
+		);
+		expectBump(() =>
+			db.run("UPDATE accounts SET priority = 1 WHERE id = 'account-r'"),
+		);
+		for (const sql of [
+			"UPDATE accounts SET provider = 'xai' WHERE id = 'account-r'",
+			"UPDATE accounts SET billing_type = 'plan' WHERE id = 'account-r'",
+			"UPDATE accounts SET model_mappings = '{\"opus\":\"mapped\"}' WHERE id = 'account-r'",
+			"UPDATE accounts SET model_fallbacks = '{\"opus\":\"fallback\"}' WHERE id = 'account-r'",
+			"UPDATE accounts SET custom_endpoint = 'https://routing.example' WHERE id = 'account-r'",
+		]) {
+			expectBump(() => db.run(sql));
+		}
+
+		const beforeRotation = routingRevision(db);
+		db.run(
+			"UPDATE accounts SET refresh_token = 'rotated', access_token = 'rotated-access' WHERE id = 'account-r'",
+		);
+		expect(routingRevision(db)).toBe(beforeRotation);
+		const beforeUsageOnly = routingRevision(db);
+		db.run("UPDATE accounts SET request_count = 99 WHERE id = 'account-r'");
+		expect(routingRevision(db)).toBe(beforeUsageOnly);
+		expectBump(() =>
+			db.run("UPDATE accounts SET refresh_token = NULL WHERE id = 'account-r'"),
+		);
+		expectBump(() => db.run("DELETE FROM combo_membership_exclusions"));
+		expectBump(() => db.run("DELETE FROM combo_enrollment_rules"));
 		db.close();
 	});
 
@@ -214,11 +323,19 @@ describe("managed routing migrations", () => {
 	it("emits matching PostgreSQL fresh and upgrade policy DDL", async () => {
 		const freshStatements: string[] = [];
 		const freshAdapter = {
+			get: async () => ({ exists: 1 }),
+			run: async (sql: string) => {
+				freshStatements.push(sql);
+			},
 			unsafe: async (sql: string) => {
 				freshStatements.push(sql);
 			},
 		} as unknown as BunSqlAdapter;
 		await ensureSchemaPg(freshAdapter);
+		expect(freshStatements.join("\n")).not.toContain(
+			"CREATE TRIGGER trg_routing_revision_accounts_update",
+		);
+		await runMigrationsPg(freshAdapter);
 		const freshSql = freshStatements.join("\n");
 		expect(freshSql).toContain(
 			"membership_mode TEXT NOT NULL DEFAULT 'manual'",
@@ -231,6 +348,29 @@ describe("managed routing migrations", () => {
 		);
 		expect(freshSql).toContain("idx_combo_enrollment_rules_unique");
 		expect(freshSql).toContain("idx_combo_membership_exclusions_unique");
+		expect(freshSql).toContain(
+			"CREATE TABLE IF NOT EXISTS routing_policy_revision",
+		);
+		expect(freshSql).toContain(
+			"CREATE OR REPLACE FUNCTION bump_routing_policy_revision",
+		);
+		for (const table of [
+			"combos",
+			"combo_slots",
+			"combo_family_assignments",
+			"combo_enrollment_rules",
+			"combo_membership_exclusions",
+		]) {
+			expect(freshSql).toContain(
+				`CREATE TRIGGER trg_routing_revision_${table}`,
+			);
+		}
+		expect(freshSql).toContain(
+			"CREATE TRIGGER trg_routing_revision_accounts_insert_delete",
+		);
+		expect(freshSql).toContain(
+			"CREATE TRIGGER trg_routing_revision_accounts_update",
+		);
 
 		const upgradeStatements: string[] = [];
 		const upgradeAdapter = {
@@ -263,5 +403,78 @@ describe("managed routing migrations", () => {
 		expect(upgradeSql).toContain(
 			"CREATE TABLE IF NOT EXISTS combo_membership_exclusions",
 		);
+		expect(upgradeSql).toContain(
+			"CREATE TABLE IF NOT EXISTS routing_policy_revision",
+		);
+		expect(upgradeSql).toContain(
+			"CREATE OR REPLACE FUNCTION bump_routing_policy_revision",
+		);
+	});
+
+	it("migrates truly old PostgreSQL account columns before installing the routing revision trigger", async () => {
+		const accountColumns = new Set([
+			"id",
+			"name",
+			"provider",
+			"api_key",
+			"refresh_token",
+			"access_token",
+			"created_at",
+			"priority",
+			"custom_endpoint",
+		]);
+		const triggerColumns = [
+			"id",
+			"provider",
+			"priority",
+			"billing_type",
+			"model_mappings",
+			"model_fallbacks",
+			"custom_endpoint",
+			"api_key",
+			"refresh_token",
+			"access_token",
+		];
+		let accountUpdateTriggerInstalls = 0;
+		const adapter = {
+			get: async (_sql: string, params: unknown[]) => {
+				const [table, column] = params as [string, string];
+				return {
+					exists: table === "accounts" ? Number(accountColumns.has(column)) : 1,
+				};
+			},
+			unsafe: async (sql: string) => {
+				const normalized = sql.replace(/\s+/g, " ").trim();
+				const addedAccountColumn = normalized.match(
+					/^ALTER TABLE accounts ADD COLUMN ([a-z_]+)/i,
+				)?.[1];
+				if (addedAccountColumn) accountColumns.add(addedAccountColumn);
+				if (
+					normalized.includes(
+						"CREATE TRIGGER trg_routing_revision_accounts_update",
+					)
+				) {
+					const missing = triggerColumns.filter(
+						(column) => !accountColumns.has(column),
+					);
+					if (missing.length > 0) {
+						throw new Error(
+							`routing revision trigger references missing account columns: ${missing.join(", ")}`,
+						);
+					}
+					accountUpdateTriggerInstalls++;
+				}
+				return [];
+			},
+			run: async () => undefined,
+		} as unknown as BunSqlAdapter;
+
+		await ensureSchemaPg(adapter);
+		await runMigrationsPg(adapter);
+
+		expect(accountUpdateTriggerInstalls).toBe(1);
+		for (const column of triggerColumns) {
+			expect(accountColumns).toContain(column);
+		}
 	});
 });

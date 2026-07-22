@@ -29,9 +29,9 @@ const log = new Logger("OAuthHandler");
 
 // In-memory session store for Qwen device flow
 type QwenSession =
-	| { status: "pending"; accountName: string }
-	| { status: "complete"; accountName: string }
-	| { status: "error"; accountName: string; error: string };
+	| { status: "pending"; accountName: string; accountId?: string }
+	| { status: "complete"; accountName: string; accountId: string }
+	| { status: "error"; accountName: string; accountId?: string; error: string };
 
 const qwenSessions = new Map<string, QwenSession>();
 
@@ -126,6 +126,7 @@ export function createQwenDeviceFlowInitHandler(dbOps: DatabaseOperations) {
 					qwenSessions.set(sessionId, {
 						status: "complete",
 						accountName: name,
+						accountId,
 					});
 					log.info(`Qwen account '${name}' added via web device flow`);
 
@@ -171,9 +172,16 @@ export function createQwenDeviceFlowStatusHandler() {
 			return errorResponse(NotFound("Session not found or expired"));
 		}
 		if (session.status === "error") {
-			return jsonResponse({ status: "error", error: session.error });
+			return jsonResponse({
+				status: "error",
+				error: session.error,
+				...(session.accountId ? { accountId: session.accountId } : {}),
+			});
 		}
-		return jsonResponse({ status: session.status });
+		return jsonResponse({
+			status: session.status,
+			...(session.accountId ? { accountId: session.accountId } : {}),
+		});
 	};
 }
 
@@ -236,6 +244,7 @@ export function createQwenReauthHandler(dbOps: DatabaseOperations) {
 			qwenSessions.set(sessionId, {
 				status: "pending",
 				accountName: account.name,
+				accountId: account.id,
 			});
 
 			// Poll in background — do not await
@@ -290,6 +299,7 @@ export function createQwenReauthHandler(dbOps: DatabaseOperations) {
 					qwenSessions.set(sessionId, {
 						status: "complete",
 						accountName: account.name,
+						accountId: account.id,
 					});
 					log.info(
 						`Qwen account '${account.name}' re-authenticated via web device flow`,
@@ -301,6 +311,7 @@ export function createQwenReauthHandler(dbOps: DatabaseOperations) {
 					qwenSessions.set(sessionId, {
 						status: "error",
 						accountName: account.name,
+						accountId: account.id,
 						error: (err as Error).message,
 					});
 					setTimeout(() => qwenSessions.delete(sessionId), 10 * 60 * 1000);
@@ -327,9 +338,9 @@ export function createQwenReauthHandler(dbOps: DatabaseOperations) {
 
 // In-memory session store for Codex device flow
 type CodexSession =
-	| { status: "pending"; accountName: string }
-	| { status: "complete"; accountName: string }
-	| { status: "error"; accountName: string; error: string };
+	| { status: "pending"; accountName: string; accountId?: string }
+	| { status: "complete"; accountName: string; accountId: string }
+	| { status: "error"; accountName: string; accountId?: string; error: string };
 
 const codexSessions = new Map<string, CodexSession>();
 
@@ -410,6 +421,7 @@ export function createCodexDeviceFlowInitHandler(dbOps: DatabaseOperations) {
 					codexSessions.set(sessionId, {
 						status: "complete",
 						accountName: name,
+						accountId,
 					});
 					log.info(`Codex account '${name}' added via web device flow`);
 
@@ -497,6 +509,7 @@ export function createCodexReauthHandler(dbOps: DatabaseOperations) {
 			codexSessions.set(sessionId, {
 				status: "pending",
 				accountName: account.name,
+				accountId: account.id,
 			});
 
 			// Poll in background — do not await
@@ -542,6 +555,7 @@ export function createCodexReauthHandler(dbOps: DatabaseOperations) {
 					codexSessions.set(sessionId, {
 						status: "complete",
 						accountName: account.name,
+						accountId: account.id,
 					});
 					log.info(
 						`Codex account '${account.name}' re-authenticated via web device flow`,
@@ -553,6 +567,7 @@ export function createCodexReauthHandler(dbOps: DatabaseOperations) {
 					codexSessions.set(sessionId, {
 						status: "error",
 						accountName: account.name,
+						accountId: account.id,
 						error: (err as Error).message,
 					});
 					setTimeout(() => codexSessions.delete(sessionId), 10 * 60 * 1000);
@@ -587,9 +602,16 @@ export function createCodexDeviceFlowStatusHandler() {
 			return errorResponse(NotFound("Session not found or expired"));
 		}
 		if (session.status === "error") {
-			return jsonResponse({ status: "error", error: session.error });
+			return jsonResponse({
+				status: "error",
+				error: session.error,
+				...(session.accountId ? { accountId: session.accountId } : {}),
+			});
 		}
-		return jsonResponse({ status: session.status });
+		return jsonResponse({
+			status: session.status,
+			...(session.accountId ? { accountId: session.accountId } : {}),
+		});
 	};
 }
 
@@ -975,7 +997,7 @@ export function createOAuthCallbackHandler(dbOps: DatabaseOperations) {
 					`Completing OAuth flow for account '${name}' in ${savedMode} mode`,
 				);
 
-				await oauthFlow.complete(
+				const createdAccount = await oauthFlow.complete(
 					{
 						sessionId,
 						code,
@@ -993,6 +1015,7 @@ export function createOAuthCallbackHandler(dbOps: DatabaseOperations) {
 
 				return jsonResponse({
 					success: true,
+					accountId: createdAccount.id,
 					message: `Account '${name}' added successfully!`,
 					mode:
 						savedMode === "claude-oauth"

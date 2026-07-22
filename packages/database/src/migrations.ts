@@ -85,6 +85,104 @@ function pruneOldBackups(absoluteSourcePath: string): void {
 	}
 }
 
+const ROUTING_REVISION_POLICY_TABLES = [
+	"combos",
+	"combo_slots",
+	"combo_family_assignments",
+	"combo_enrollment_rules",
+	"combo_membership_exclusions",
+] as const;
+
+/**
+ * Install a database-owned revision clock for every persisted input that enters
+ * the managed-routing preview hash. Account availability/usage fields are
+ * intentionally excluded: preview identity uses route membership, not the
+ * transient availability decoration. Credential values are similarly reduced
+ * to presence so ordinary OAuth token rotation does not invalidate a review.
+ */
+function ensureRoutingPolicyRevisionSchema(db: Database): void {
+	db.run(`
+		CREATE TABLE IF NOT EXISTS routing_policy_revision (
+			scope TEXT PRIMARY KEY CHECK (scope = 'global'),
+			revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0)
+		)
+	`);
+	db.run(
+		"INSERT OR IGNORE INTO routing_policy_revision (scope, revision) VALUES ('global', 0)",
+	);
+
+	for (const table of ROUTING_REVISION_POLICY_TABLES) {
+		for (const operation of ["INSERT", "UPDATE", "DELETE"] as const) {
+			const suffix = operation.toLowerCase();
+			db.run(`
+				CREATE TRIGGER IF NOT EXISTS trg_routing_revision_${table}_${suffix}
+				AFTER ${operation} ON ${table}
+				BEGIN
+					UPDATE routing_policy_revision
+					SET revision = revision + 1
+					WHERE scope = 'global';
+				END
+			`);
+		}
+	}
+
+	for (const operation of ["INSERT", "DELETE"] as const) {
+		const suffix = operation.toLowerCase();
+		db.run(`
+			CREATE TRIGGER IF NOT EXISTS trg_routing_revision_accounts_${suffix}
+			AFTER ${operation} ON accounts
+			BEGIN
+				UPDATE routing_policy_revision
+				SET revision = revision + 1
+				WHERE scope = 'global';
+			END
+		`);
+	}
+	const accountColumns = new Set(
+		db
+			.query<{ name: string }, []>("PRAGMA table_info(accounts)")
+			.all()
+			.map((column) => column.name),
+	);
+	const accountRevisionColumns = [
+		"id",
+		"provider",
+		"priority",
+		"billing_type",
+		"model_mappings",
+		"model_fallbacks",
+		"custom_endpoint",
+		"api_key",
+		"refresh_token",
+		"access_token",
+	].filter((column) => accountColumns.has(column));
+	const presenceOnlyColumns = new Set([
+		"api_key",
+		"refresh_token",
+		"access_token",
+	]);
+	const comparisons = accountRevisionColumns.map((column) =>
+		presenceOnlyColumns.has(column)
+			? `(length(trim(COALESCE(OLD.${column}, ''))) > 0)
+				!= (length(trim(COALESCE(NEW.${column}, ''))) > 0)`
+			: `OLD.${column} IS NOT NEW.${column}`,
+	);
+	db.run("DROP TRIGGER IF EXISTS trg_routing_revision_accounts_update");
+	if (accountRevisionColumns.length > 0) {
+		db.run(`
+			CREATE TRIGGER trg_routing_revision_accounts_update
+			AFTER UPDATE OF ${accountRevisionColumns.join(", ")}
+			ON accounts
+			WHEN ${comparisons.join(" OR ")}
+			BEGIN
+				UPDATE routing_policy_revision
+				SET revision = revision + 1
+				WHERE scope = 'global';
+			END
+		`);
+	}
+}
+
 export function ensureSchema(db: Database): void {
 	// Apply auto_vacuum = INCREMENTAL before any tables exist so fresh DBs are
 	// born in incremental-vacuum mode. SQLite stores this in the DB header and
@@ -410,6 +508,7 @@ export function ensureSchema(db: Database): void {
 		`CREATE INDEX IF NOT EXISTS idx_combo_membership_exclusions_account_id
 		 ON combo_membership_exclusions(account_id)`,
 	);
+	ensureRoutingPolicyRevisionSchema(db);
 
 	// Create usage_snapshots table: time series of per-account usage-window
 	// utilization (0–100) captured on each /oauth/usage poll. Append-only, no
@@ -1390,6 +1489,10 @@ export function runMigrations(db: Database, dbPath?: string): void {
 		log.info(
 			`Populated ${insertedCount} default Claude model translations for Bedrock`,
 		);
+
+		// Account columns can be added or rebuilt above. Reinstall the dynamic
+		// account trigger only after the final table shape is in place.
+		ensureRoutingPolicyRevisionSchema(db);
 	});
 
 	// Execute the migration transaction
