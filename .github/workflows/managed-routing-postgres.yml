@@ -44,6 +44,9 @@ jobs:
       - name: Build CLI generated modules
         run: bun run build:cli
 
+      - name: Build dashboard generated modules
+        run: bun run build:dashboard
+
       - name: Run focused managed-routing database tests
         run: >-
           bun test
