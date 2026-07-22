@@ -12,6 +12,7 @@ import { AccountsTab } from "./components/AccountsTab";
 import { AgentsTab } from "./components/AgentsTab";
 import { ApiKeyAuthDialog } from "./components/ApiKeyAuthDialog";
 import { ApiKeysTab } from "./components/ApiKeysTab";
+import { DeviceSetupJobCoordinator } from "./components/accounts/DeviceSetupJobCoordinator";
 import { CombosTab } from "./components/combos/CombosTab";
 import { DebugPanel } from "./components/DebugPanel";
 import { LogsTab } from "./components/LogsTab";
@@ -342,6 +343,7 @@ export function App() {
 	return (
 		<QueryClientProvider client={queryClient}>
 			<ThemeProvider>
+				<DeviceSetupJobCoordinator authenticated={isAuthenticated} />
 				<div className="min-h-screen bg-background">
 					<Navigation
 						onLogout={authRequired ? handleLogout : undefined}

@@ -29,6 +29,25 @@ export {
 	type CacheFlightRecorderTimeline,
 	type MarkIncompleteOptions,
 } from "./repositories/cache-flight-recorder.repository";
+export {
+	type CreateDeviceSetupJobInput,
+	type CreateDeviceSetupJobResult,
+	DEVICE_SETUP_JOB_STATUSES,
+	DEVICE_SETUP_SAFE_ERROR_MESSAGES,
+	DeviceSetupDataIntegrityError,
+	DeviceSetupIdempotencyConflictError,
+	type DeviceSetupJob,
+	DeviceSetupJobRepository,
+	type DeviceSetupJobStatus,
+	type DeviceSetupJobView,
+	type DeviceSetupProvider,
+	type DeviceSetupRoutingOutcome,
+	type DeviceSetupRoutingOutcomeReason,
+	type DeviceSetupRoutingOutcomeStatus,
+	type DeviceSetupRoutingSelection,
+	type DeviceSetupSafeErrorCode,
+	type DeviceSetupTerminalStatus,
+} from "./repositories/device-setup-job.repository";
 export type {
 	ModelTranslation,
 	SimilarModel,

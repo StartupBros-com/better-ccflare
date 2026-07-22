@@ -5,6 +5,7 @@ import {
 } from "@better-ccflare/http-common";
 import type {
 	AccountResponse,
+	AccountRoutingOverview,
 	Agent,
 	AgentUpdatePayload,
 	AgentWorkspace,
@@ -21,6 +22,9 @@ import type {
 	ComboSlotUpdateInput,
 	ComboWithSlots,
 	ContextInsightsResponse,
+	DeviceSetupJobView,
+	DeviceSetupRoutingSelection,
+	DeviceSetupStartResult,
 	EffectiveComboRoutingView,
 	LogEvent,
 	ModelCatalogRefreshResponse,
@@ -53,6 +57,26 @@ export interface OAuthAccountCreatedApiResponse {
 	accountId: string;
 	message: string;
 	mode: string;
+}
+
+export interface DeviceSetupInitRequest {
+	name: string;
+	priority: number;
+	idempotencyKey: string;
+	reviewed: readonly DeviceSetupRoutingSelection[];
+}
+
+/** Copy the exact durable command whitelist; caller extras never cross HTTP. */
+function deviceSetupInitBody(input: DeviceSetupInitRequest) {
+	return {
+		name: input.name,
+		priority: input.priority,
+		idempotencyKey: input.idempotencyKey,
+		reviewed: input.reviewed.map(({ family, proposalId }) => ({
+			family,
+			proposalId,
+		})),
+	};
 }
 
 function safeAccountCreateLog(data: object): Record<string, unknown> {
@@ -2075,6 +2099,14 @@ class API extends HttpClient {
 		return response.data;
 	}
 
+	async getAccountRoutingOverview(): Promise<AccountRoutingOverview> {
+		const response = await this.get<{
+			success: true;
+			data: AccountRoutingOverview;
+		}>("/api/routing/accounts");
+		return response.data;
+	}
+
 	async previewRouting(
 		subject: ComboRoutingPreviewSubject,
 		family?: ComboFamily,
@@ -2211,19 +2243,16 @@ class API extends HttpClient {
 		await this.put(`/api/combos/${comboId}/slots/reorder`, { slotIds });
 	}
 
-	async initCodexDeviceFlow(data: { name: string; priority: number }): Promise<{
-		sessionId: string;
-		verificationUrl: string;
-		userCode: string;
-	}> {
+	async initCodexDeviceFlow(
+		data: DeviceSetupInitRequest,
+	): Promise<DeviceSetupStartResult> {
 		const url = "/api/oauth/codex/init";
 		this.logger.debug(`→ POST ${url}`, safeAccountCreateLog(data));
 		try {
-			const response = await this.post<{
-				sessionId: string;
-				verificationUrl: string;
-				userCode: string;
-			}>(url, data);
+			const response = await this.post<DeviceSetupStartResult>(
+				url,
+				deviceSetupInitBody(data),
+			);
 			this.logger.debug(`← POST ${url} - 200`);
 			return response;
 		} catch (error) {
@@ -2258,22 +2287,54 @@ class API extends HttpClient {
 		}
 	}
 
-	async initQwenDeviceFlow(data: {
-		name: string;
-		priority: number;
-	}): Promise<{ sessionId: string; authUrl: string; userCode: string }> {
+	async initQwenDeviceFlow(
+		data: DeviceSetupInitRequest,
+	): Promise<DeviceSetupStartResult> {
 		const url = "/api/oauth/qwen/init";
 		this.logger.debug(`→ POST ${url}`, safeAccountCreateLog(data));
 		try {
-			const response = await this.post<{
-				sessionId: string;
-				authUrl: string;
-				userCode: string;
-			}>(url, data);
+			const response = await this.post<DeviceSetupStartResult>(
+				url,
+				deviceSetupInitBody(data),
+			);
 			this.logger.debug(`← POST ${url} - 200`);
 			return response;
 		} catch (error) {
 			this.logger.error(`✗ POST ${url} - ERROR`, { error });
+			if (error instanceof HttpError) throw new Error(error.message);
+			throw error;
+		}
+	}
+
+	async getDeviceSetupJob(jobId: string): Promise<DeviceSetupJobView> {
+		const url = `/api/oauth/device-setup/jobs/${encodeURIComponent(jobId)}`;
+		const logUrl = "/api/oauth/device-setup/jobs/[job]";
+		this.logger.debug(`→ GET ${logUrl}`);
+		try {
+			const response = await this.get<DeviceSetupJobView>(url);
+			this.logger.debug(`← GET ${logUrl} - 200`);
+			return response;
+		} catch (error) {
+			this.logger.error(`✗ GET ${logUrl} - ERROR`, {
+				error: error instanceof Error ? error.message : "Request failed",
+			});
+			if (error instanceof HttpError) throw new Error(error.message);
+			throw error;
+		}
+	}
+
+	async getRecentDeviceSetupJobs(limit = 20): Promise<DeviceSetupJobView[]> {
+		const url = `/api/oauth/device-setup/jobs?limit=${encodeURIComponent(String(limit))}`;
+		const logUrl = "/api/oauth/device-setup/jobs?limit=[count]";
+		this.logger.debug(`→ GET ${logUrl}`);
+		try {
+			const response = await this.get<DeviceSetupJobView[]>(url);
+			this.logger.debug(`← GET ${logUrl} - 200`);
+			return response;
+		} catch (error) {
+			this.logger.error(`✗ GET ${logUrl} - ERROR`, {
+				error: error instanceof Error ? error.message : "Request failed",
+			});
 			if (error instanceof HttpError) throw new Error(error.message);
 			throw error;
 		}

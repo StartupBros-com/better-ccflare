@@ -21,7 +21,12 @@ import {
 	DatabaseFactory,
 	initPayloadEncryption,
 } from "@better-ccflare/database";
-import { AlertService, APIRouter, AuthService } from "@better-ccflare/http-api";
+import {
+	AlertService,
+	APIRouter,
+	AuthService,
+	createServerDeviceSetupCoordinator,
+} from "@better-ccflare/http-api";
 import {
 	LeastUsedStrategy,
 	SessionAffinityStrategy,
@@ -273,11 +278,106 @@ let stopDataCleanupJob: (() => void) | null = null;
 let stopWalCheckpointJob: (() => void) | null = null;
 let stopIntegritySchedulerJob: (() => void) | null = null;
 let stopModelCatalogRefreshJob: (() => void) | null = null;
+let stopDeviceSetupRecoveryJob: (() => Promise<void>) | null = null;
 let autoRefreshScheduler: AutoRefreshScheduler | null = null;
 let cacheKeepaliveScheduler: CacheKeepaliveScheduler | null = null;
 let memoryMonitorInterval: Timer | null = null;
 // Track usage polling retry timeouts for cleanup
 const usagePollingRetryTimeouts = new Map<string, NodeJS.Timeout>();
+
+export const DEVICE_SETUP_RECOVERY_INTERVAL_MS = 30_000;
+
+export interface DeviceSetupRecoveryCoordinatorLifecycle {
+	tick(): Promise<void>;
+	dispose(): void;
+	drain(): Promise<void>;
+}
+
+export interface DeviceSetupRecoveryLifecycleOptions {
+	intervalMs?: number;
+	schedule?: (
+		callback: () => void | Promise<void>,
+		intervalMs: number,
+	) => unknown;
+	cancel?: (handle: unknown) => void;
+	onError?: (error: unknown) => void;
+}
+
+/**
+ * Own the process-level trigger for durable device setup recovery. The
+ * coordinator owns the bounded work performed by each tick; this wrapper
+ * guarantees that startup completes one tick before recurring work begins and
+ * that interval callbacks never overlap.
+ */
+export async function startDeviceSetupRecoveryLifecycle(
+	coordinator: DeviceSetupRecoveryCoordinatorLifecycle,
+	options: DeviceSetupRecoveryLifecycleOptions = {},
+): Promise<() => Promise<void>> {
+	const intervalMs = options.intervalMs ?? DEVICE_SETUP_RECOVERY_INTERVAL_MS;
+	if (!Number.isSafeInteger(intervalMs) || intervalMs < 1) {
+		throw new TypeError("intervalMs must be a positive safe integer");
+	}
+	const schedule =
+		options.schedule ??
+		((callback: () => void | Promise<void>, delayMs: number): unknown => {
+			const handle = setInterval(callback, delayMs);
+			handle.unref?.();
+			return handle;
+		});
+	const cancel =
+		options.cancel ??
+		((handle: unknown) => {
+			clearInterval(handle as ReturnType<typeof setInterval>);
+		});
+	const reportError = (error: unknown) => {
+		try {
+			options.onError?.(error);
+		} catch {
+			// Recovery diagnostics must never tear down the scheduler.
+		}
+	};
+
+	let stopped = false;
+	let inFlight: Promise<void> | null = null;
+	let intervalHandle: unknown = null;
+	let stopPromise: Promise<void> | null = null;
+	const runTick = (): Promise<void> => {
+		if (stopped) return Promise.resolve();
+		if (inFlight) return inFlight;
+		let result: Promise<void>;
+		try {
+			result = coordinator.tick();
+		} catch (error) {
+			reportError(error);
+			return Promise.resolve();
+		}
+		const running = result
+			.catch((error) => {
+				reportError(error);
+			})
+			.finally(() => {
+				if (inFlight === running) inFlight = null;
+			});
+		inFlight = running;
+		return running;
+	};
+
+	await runTick();
+	intervalHandle = schedule(() => runTick(), intervalMs);
+
+	return () => {
+		if (stopPromise) return stopPromise;
+		stopped = true;
+		if (intervalHandle !== null) cancel(intervalHandle);
+		coordinator.dispose();
+		const currentTick = inFlight;
+		stopPromise = (async () => {
+			if (currentTick) await currentTick;
+			await coordinator.drain();
+		})();
+		return stopPromise;
+	};
+}
 
 // SSL/TLS configuration
 let tlsEnabled = false;
@@ -828,6 +928,15 @@ export default async function startServer(options?: {
 	const db = dbOps.getAdapter();
 	const log = container.resolve<Logger>(SERVICE_KEYS.Logger);
 	container.registerInstance(SERVICE_KEYS.Database, dbOps);
+	const deviceSetupCoordinator = createServerDeviceSetupCoordinator(dbOps);
+	stopDeviceSetupRecoveryJob = await startDeviceSetupRecoveryLifecycle(
+		deviceSetupCoordinator,
+		{
+			onError: () => {
+				log.error("Device setup recovery tick failed");
+			},
+		},
+	);
 
 	// Initialize async DB writer
 	const asyncWriter = new AsyncDbWriter();
@@ -853,35 +962,38 @@ export default async function startServer(options?: {
 	// ProxyContext exists — mirrors the getStrategy() lazy-getter pattern above.
 	let modelCatalogProxyContext: ProxyContext | null = null;
 
-	const apiRouter = new APIRouter({
-		db,
-		config,
-		dbOps,
-		alertService,
-		modelCatalog: {
-			get: () => getModelCatalog(),
-			refresh: async () => {
-				if (!modelCatalogProxyContext) {
-					return {
-						success: false,
-						error: "Model catalog is not initialized yet",
-					};
-				}
-				const result = await refreshModelCatalog(modelCatalogProxyContext, {
-					trigger: "manual",
-				});
-				return { success: result.success, error: result.error };
+	const apiRouter = new APIRouter(
+		{
+			db,
+			config,
+			dbOps,
+			alertService,
+			modelCatalog: {
+				get: () => getModelCatalog(),
+				refresh: async () => {
+					if (!modelCatalogProxyContext) {
+						return {
+							success: false,
+							error: "Model catalog is not initialized yet",
+						};
+					}
+					const result = await refreshModelCatalog(modelCatalogProxyContext, {
+						trigger: "manual",
+					});
+					return { success: result.success, error: result.error };
+				},
 			},
+			runtime: {
+				port,
+				tlsEnabled,
+			},
+			getAsyncWriterHealth: () => asyncWriter.getHealth(),
+			getUsageWorkerHealth: () => getUsageCollectorHealth(),
+			getIntegrityStatus: () => dbOps.getIntegrityStatus(),
+			getStrategy: () => currentStrategy,
 		},
-		runtime: {
-			port,
-			tlsEnabled,
-		},
-		getAsyncWriterHealth: () => asyncWriter.getHealth(),
-		getUsageWorkerHealth: () => getUsageCollectorHealth(),
-		getIntegrityStatus: () => dbOps.getIntegrityStatus(),
-		getStrategy: () => currentStrategy,
-	});
+		{ deviceSetupCoordinator },
+	);
 
 	// Initialize AuthService for proxy authentication
 	const authService = new AuthService(dbOps);
@@ -1999,8 +2111,13 @@ async function handleGracefulShutdown(signal: string) {
 
 	try {
 		// Stop scheduler triggers first so they don't add load while draining.
-		// These calls only stop the recurring trigger; any in-flight task they
-		// already kicked off continues until it finishes naturally.
+		// Device setup additionally drains its database-owning work before shared
+		// resources can be disposed below.
+		if (stopDeviceSetupRecoveryJob) {
+			const stopDeviceSetup = stopDeviceSetupRecoveryJob;
+			stopDeviceSetupRecoveryJob = null;
+			await stopDeviceSetup();
+		}
 		if (stopRetentionJob) {
 			stopRetentionJob();
 			stopRetentionJob = null;

@@ -1,3 +1,5 @@
+import type { ComboFamily } from "./combo";
+
 export type RateLimitReason =
 	| "upstream_429_with_reset"
 	/** @deprecated written by ccflare ≤ v3.5.x when no-reset 429s used a 5h ban.
@@ -559,4 +561,81 @@ export function toAccountDisplay(account: Account): AccountDisplay {
 		autoFallbackEnabled: account.auto_fallback_enabled,
 		autoRefreshEnabled: account.auto_refresh_enabled,
 	};
+}
+
+/** Durable, server-owned lifecycle for Qwen/Codex account setup. */
+export type DeviceSetupJobStatus =
+	| "awaiting_authorization"
+	| "account_committed"
+	| "reconciling"
+	| "complete"
+	| "complete_with_actions"
+	| "authorization_error"
+	| "expired";
+
+export type DeviceSetupProvider = "qwen" | "codex";
+
+export interface DeviceSetupRoutingSelection {
+	family: ComboFamily;
+	proposalId: string;
+}
+
+export type DeviceSetupRoutingOutcomeReason =
+	| "applied"
+	| "already-effective"
+	| "preview-missing"
+	| "proposal-missing"
+	| "confidence-downgraded"
+	| "default-downgraded"
+	| "stale-preview"
+	| "preview-failed"
+	| "apply-failed"
+	| "not-effective"
+	| "missing-account-id";
+
+export interface DeviceSetupRoutingOutcome extends DeviceSetupRoutingSelection {
+	status: "joined" | "action-required";
+	reason: DeviceSetupRoutingOutcomeReason;
+}
+
+export const DEVICE_SETUP_SAFE_ERROR_MESSAGES = {
+	authorization_denied: "Authorization was not approved",
+	authorization_failed: "Authorization failed",
+	authorization_interrupted: "Authorization must be restarted",
+	authorization_expired: "Authorization expired",
+} as const;
+
+export type DeviceSetupSafeErrorCode =
+	keyof typeof DEVICE_SETUP_SAFE_ERROR_MESSAGES;
+
+/**
+ * Secret-free setup state returned to dashboard/CLI clients.
+ *
+ * Preallocated account identity stays private until an account row has been
+ * committed, so an awaiting/failed authorization cannot be mistaken for a
+ * usable account.
+ */
+export interface DeviceSetupJobView {
+	id: string;
+	provider: DeviceSetupProvider;
+	accountId: string | null;
+	status: DeviceSetupJobStatus;
+	routingOutcomes: DeviceSetupRoutingOutcome[];
+	errorCode: DeviceSetupSafeErrorCode | null;
+	errorMessage: string | null;
+	createdAt: number;
+	updatedAt: number;
+	terminalAt: number | null;
+}
+
+/** Safe provider UI data; continuation material is intentionally absent. */
+export interface DeviceSetupAuthorizationView {
+	verificationUrl: string;
+	userCode: string;
+}
+
+export interface DeviceSetupStartResult {
+	job: DeviceSetupJobView;
+	authorization: DeviceSetupAuthorizationView | null;
+	replayed: boolean;
 }

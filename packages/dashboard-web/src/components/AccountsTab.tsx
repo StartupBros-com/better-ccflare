@@ -1,7 +1,25 @@
+import type { AccountRoutingOverview } from "@better-ccflare/types";
 import { AlertCircle, Plus } from "lucide-react";
 import { useState } from "react";
 import { type Account, api } from "../api";
-import { useAccounts, useRenameAccount } from "../hooks/queries";
+import {
+	ACCOUNT_ROUTING_INVALIDATION,
+	FULL_MANAGED_ROUTING_INVALIDATION,
+	useAccountRoutingOverview,
+	useAccounts,
+	useForceResetRateLimit,
+	useManagedRoutingInvalidation,
+	usePauseAccount,
+	useRefreshUsage,
+	useRemoveAccount,
+	useRenameAccount,
+	useResumeAccount,
+	useUpdateAccountAutoRefresh,
+	useUpdateAccountBillingType,
+	useUpdateAccountCustomEndpoint,
+	useUpdateAccountModelMappings,
+	useUpdateAccountPriority,
+} from "../hooks/queries";
 import { useApiError } from "../hooks/useApiError";
 import {
 	AccountAddForm,
@@ -15,6 +33,11 @@ import {
 	QwenReauthDialog,
 	RenameAccountDialog,
 } from "./accounts";
+import type { AccountCreationIdentity } from "./accounts/AccountAddForm";
+import {
+	type AccountFamilyRoutingState,
+	getAccountFamilyRoutingStates,
+} from "./accounts/account-routing";
 import { Button } from "./ui/button";
 import {
 	Card,
@@ -24,6 +47,168 @@ import {
 	CardTitle,
 } from "./ui/card";
 
+type AccountCreationClient = Pick<
+	typeof api,
+	| "completeAddAccount"
+	| "addVertexAIAccount"
+	| "addBedrockAccount"
+	| "addZaiAccount"
+	| "addMinimaxAccount"
+	| "addNanoGPTAccount"
+	| "addAlibabaCodingPlanAccount"
+	| "addKiloAccount"
+	| "addOpenRouterAccount"
+	| "addAnthropicCompatibleAccount"
+	| "addOpenAIAccount"
+	| "addOllamaAccount"
+	| "addOllamaCloudAccount"
+>;
+
+async function immutableAccountIdentity(
+	operation: () => Promise<{ accountId: string }>,
+	afterCreate: () => Promise<void>,
+	onError?: (error: unknown) => void,
+): Promise<AccountCreationIdentity> {
+	let response: { accountId: string };
+	try {
+		response = await operation();
+	} catch (error) {
+		onError?.(error);
+		throw error;
+	}
+	try {
+		await afterCreate();
+	} catch (error) {
+		onError?.(error);
+	}
+	return { accountId: response.accountId };
+}
+
+export function createAccountCreationCallbacks(
+	client: AccountCreationClient,
+	afterCreate: () => Promise<void> = async () => undefined,
+	onError?: (error: unknown) => void,
+) {
+	return {
+		onCompleteAccount: (
+			params: Parameters<typeof client.completeAddAccount>[0],
+		) =>
+			immutableAccountIdentity(
+				() => client.completeAddAccount(params),
+				afterCreate,
+				onError,
+			),
+		onAddVertexAIAccount: (
+			params: Parameters<typeof client.addVertexAIAccount>[0],
+		) =>
+			immutableAccountIdentity(
+				() => client.addVertexAIAccount(params),
+				afterCreate,
+				onError,
+			),
+		onAddBedrockAccount: (
+			params: Parameters<typeof client.addBedrockAccount>[0],
+		) =>
+			immutableAccountIdentity(
+				() => client.addBedrockAccount(params),
+				afterCreate,
+				onError,
+			),
+		onAddZaiAccount: (params: Parameters<typeof client.addZaiAccount>[0]) =>
+			immutableAccountIdentity(
+				() => client.addZaiAccount(params),
+				afterCreate,
+				onError,
+			),
+		onAddMinimaxAccount: (
+			params: Parameters<typeof client.addMinimaxAccount>[0],
+		) =>
+			immutableAccountIdentity(
+				() => client.addMinimaxAccount(params),
+				afterCreate,
+				onError,
+			),
+		onAddNanoGPTAccount: (
+			params: Parameters<typeof client.addNanoGPTAccount>[0],
+		) =>
+			immutableAccountIdentity(
+				() => client.addNanoGPTAccount(params),
+				afterCreate,
+				onError,
+			),
+		onAddAlibabaCodingPlanAccount: (
+			params: Parameters<typeof client.addAlibabaCodingPlanAccount>[0],
+		) =>
+			immutableAccountIdentity(
+				() => client.addAlibabaCodingPlanAccount(params),
+				afterCreate,
+				onError,
+			),
+		onAddKiloAccount: (params: Parameters<typeof client.addKiloAccount>[0]) =>
+			immutableAccountIdentity(
+				() => client.addKiloAccount(params),
+				afterCreate,
+				onError,
+			),
+		onAddOpenRouterAccount: (
+			params: Parameters<typeof client.addOpenRouterAccount>[0],
+		) =>
+			immutableAccountIdentity(
+				() => client.addOpenRouterAccount(params),
+				afterCreate,
+				onError,
+			),
+		onAddAnthropicCompatibleAccount: (
+			params: Parameters<typeof client.addAnthropicCompatibleAccount>[0],
+		) =>
+			immutableAccountIdentity(
+				() => client.addAnthropicCompatibleAccount(params),
+				afterCreate,
+				onError,
+			),
+		onAddOpenAIAccount: (
+			params: Parameters<typeof client.addOpenAIAccount>[0],
+		) =>
+			immutableAccountIdentity(
+				() => client.addOpenAIAccount(params),
+				afterCreate,
+				onError,
+			),
+		onAddOllamaAccount: (
+			params: Parameters<typeof client.addOllamaAccount>[0],
+		) =>
+			immutableAccountIdentity(
+				() => client.addOllamaAccount(params),
+				afterCreate,
+				onError,
+			),
+		onAddOllamaCloudAccount: (
+			params: Parameters<typeof client.addOllamaCloudAccount>[0],
+		) =>
+			immutableAccountIdentity(
+				() => client.addOllamaCloudAccount(params),
+				afterCreate,
+				onError,
+			),
+	};
+}
+
+export function buildRoutingByAccountId(
+	accountIds: readonly string[],
+	overview: AccountRoutingOverview | undefined,
+): Record<string, readonly AccountFamilyRoutingState[]> {
+	const routingByAccountId: Record<
+		string,
+		readonly AccountFamilyRoutingState[]
+	> = {};
+	for (const accountId of accountIds) {
+		routingByAccountId[accountId] = overview
+			? getAccountFamilyRoutingStates(accountId, overview)
+			: [];
+	}
+	return routingByAccountId;
+}
+
 export function AccountsTab() {
 	const { formatError } = useApiError();
 	const {
@@ -32,7 +217,23 @@ export function AccountsTab() {
 		error,
 		refetch: loadAccounts,
 	} = useAccounts();
+	const { data: routingOverview } = useAccountRoutingOverview();
+	const routingByAccountId = buildRoutingByAccountId(
+		accounts?.map((account) => account.id) ?? [],
+		routingOverview,
+	);
+	const invalidateManagedRouting = useManagedRoutingInvalidation();
+	const removeAccount = useRemoveAccount();
+	const pauseAccount = usePauseAccount();
+	const resumeAccount = useResumeAccount();
+	const forceResetRateLimit = useForceResetRateLimit();
+	const refreshUsage = useRefreshUsage();
 	const renameAccount = useRenameAccount();
+	const updatePriority = useUpdateAccountPriority();
+	const updateAutoRefresh = useUpdateAccountAutoRefresh();
+	const updateBillingType = useUpdateAccountBillingType();
+	const updateCustomEndpoint = useUpdateAccountCustomEndpoint();
+	const updateModelMappings = useUpdateAccountModelMappings();
 
 	const [adding, setAdding] = useState(false);
 	const [confirmDelete, setConfirmDelete] = useState<{
@@ -94,6 +295,11 @@ export function AccountsTab() {
 		account: null,
 	});
 	const [actionError, setActionError] = useState<string | null>(null);
+	const accountCreationCallbacks = createAccountCreationCallbacks(
+		api,
+		() => invalidateManagedRouting(FULL_MANAGED_ROUTING_INVALIDATION),
+		(err) => setActionError(formatError(err)),
+	);
 
 	const handleAddAccount = async (params: {
 		name: string;
@@ -132,15 +338,7 @@ export function AccountsTab() {
 		region: string;
 		priority: number;
 	}) => {
-		try {
-			await api.addVertexAIAccount(params);
-			await loadAccounts();
-			setAdding(false);
-			setActionError(null);
-		} catch (err) {
-			setActionError(formatError(err));
-			throw err;
-		}
+		return accountCreationCallbacks.onAddVertexAIAccount(params);
 	};
 
 	const handleAddBedrockAccount = async (params: {
@@ -151,30 +349,14 @@ export function AccountsTab() {
 		cross_region_mode?: "geographic" | "global" | "regional";
 		customModel?: string;
 	}) => {
-		try {
-			await api.addBedrockAccount(params);
-			await loadAccounts();
-			setAdding(false);
-			setActionError(null);
-		} catch (err) {
-			setActionError(formatError(err));
-			throw err;
-		}
+		return accountCreationCallbacks.onAddBedrockAccount(params);
 	};
 
 	const handleCompleteAccount = async (params: {
 		sessionId: string;
 		code: string;
 	}) => {
-		try {
-			await api.completeAddAccount(params);
-			await loadAccounts();
-			setAdding(false);
-			setActionError(null);
-		} catch (err) {
-			setActionError(formatError(err));
-			throw err;
-		}
+		return accountCreationCallbacks.onCompleteAccount(params);
 	};
 
 	const handleAddZaiAccount = async (params: {
@@ -184,15 +366,7 @@ export function AccountsTab() {
 		customEndpoint?: string;
 		modelMappings?: { [key: string]: string };
 	}) => {
-		try {
-			await api.addZaiAccount(params);
-			await loadAccounts();
-			setAdding(false);
-			setActionError(null);
-		} catch (err) {
-			setActionError(formatError(err));
-			throw err;
-		}
+		return accountCreationCallbacks.onAddZaiAccount(params);
 	};
 
 	const handleAddOpenAIAccount = async (params: {
@@ -202,15 +376,7 @@ export function AccountsTab() {
 		customEndpoint: string;
 		modelMappings?: { [key: string]: string };
 	}) => {
-		try {
-			await api.addOpenAIAccount(params);
-			await loadAccounts();
-			setAdding(false);
-			setActionError(null);
-		} catch (err) {
-			setActionError(formatError(err));
-			throw err;
-		}
+		return accountCreationCallbacks.onAddOpenAIAccount(params);
 	};
 
 	const handleAddMinimaxAccount = async (params: {
@@ -218,15 +384,7 @@ export function AccountsTab() {
 		apiKey: string;
 		priority: number;
 	}) => {
-		try {
-			await api.addMinimaxAccount(params);
-			await loadAccounts();
-			setAdding(false);
-			setActionError(null);
-		} catch (err) {
-			setActionError(formatError(err));
-			throw err;
-		}
+		return accountCreationCallbacks.onAddMinimaxAccount(params);
 	};
 
 	const handleAddNanoGPTAccount = async (params: {
@@ -236,15 +394,7 @@ export function AccountsTab() {
 		customEndpoint?: string;
 		modelMappings?: { [key: string]: string };
 	}) => {
-		try {
-			await api.addNanoGPTAccount(params);
-			await loadAccounts();
-			setAdding(false);
-			setActionError(null);
-		} catch (err) {
-			setActionError(formatError(err));
-			throw err;
-		}
+		return accountCreationCallbacks.onAddNanoGPTAccount(params);
 	};
 
 	const handleAddAlibabaCodingPlanAccount = async (params: {
@@ -253,15 +403,7 @@ export function AccountsTab() {
 		priority: number;
 		modelMappings?: { [key: string]: string };
 	}) => {
-		try {
-			await api.addAlibabaCodingPlanAccount(params);
-			await loadAccounts();
-			setAdding(false);
-			setActionError(null);
-		} catch (err) {
-			setActionError(formatError(err));
-			throw err;
-		}
+		return accountCreationCallbacks.onAddAlibabaCodingPlanAccount(params);
 	};
 
 	const handleAddKiloAccount = async (params: {
@@ -270,15 +412,7 @@ export function AccountsTab() {
 		priority: number;
 		modelMappings?: { [key: string]: string };
 	}) => {
-		try {
-			await api.addKiloAccount(params);
-			await loadAccounts();
-			setAdding(false);
-			setActionError(null);
-		} catch (err) {
-			setActionError(formatError(err));
-			throw err;
-		}
+		return accountCreationCallbacks.onAddKiloAccount(params);
 	};
 
 	const handleAddOpenRouterAccount = async (params: {
@@ -287,15 +421,7 @@ export function AccountsTab() {
 		priority: number;
 		modelMappings?: { [key: string]: string };
 	}) => {
-		try {
-			await api.addOpenRouterAccount(params);
-			await loadAccounts();
-			setAdding(false);
-			setActionError(null);
-		} catch (err) {
-			setActionError(formatError(err));
-			throw err;
-		}
+		return accountCreationCallbacks.onAddOpenRouterAccount(params);
 	};
 
 	const handleAddAnthropicCompatibleAccount = async (params: {
@@ -305,15 +431,7 @@ export function AccountsTab() {
 		customEndpoint?: string;
 		modelMappings?: { [key: string]: string };
 	}) => {
-		try {
-			await api.addAnthropicCompatibleAccount(params);
-			await loadAccounts();
-			setAdding(false);
-			setActionError(null);
-		} catch (err) {
-			setActionError(formatError(err));
-			throw err;
-		}
+		return accountCreationCallbacks.onAddAnthropicCompatibleAccount(params);
 	};
 
 	const handleAddOllamaAccount = async (params: {
@@ -322,15 +440,7 @@ export function AccountsTab() {
 		customEndpoint?: string;
 		modelMappings?: { [key: string]: string };
 	}) => {
-		try {
-			await api.addOllamaAccount(params);
-			await loadAccounts();
-			setAdding(false);
-			setActionError(null);
-		} catch (err) {
-			setActionError(formatError(err));
-			throw err;
-		}
+		return accountCreationCallbacks.onAddOllamaAccount(params);
 	};
 
 	const handleAddOllamaCloudAccount = async (params: {
@@ -339,15 +449,7 @@ export function AccountsTab() {
 		priority: number;
 		modelMappings?: { [key: string]: string };
 	}) => {
-		try {
-			await api.addOllamaCloudAccount(params);
-			await loadAccounts();
-			setAdding(false);
-			setActionError(null);
-		} catch (err) {
-			setActionError(formatError(err));
-			throw err;
-		}
+		return accountCreationCallbacks.onAddOllamaCloudAccount(params);
 	};
 
 	const handleRemoveAccount = (name: string) => {
@@ -363,11 +465,10 @@ export function AccountsTab() {
 		}
 
 		try {
-			await api.removeAccount(
-				confirmDelete.accountName,
-				confirmDelete.confirmInput,
-			);
-			await loadAccounts();
+			await removeAccount.mutateAsync({
+				name: confirmDelete.accountName,
+				confirmInput: confirmDelete.confirmInput,
+			});
 			setConfirmDelete({ show: false, accountName: "", confirmInput: "" });
 			setActionError(null);
 		} catch (err) {
@@ -397,11 +498,10 @@ export function AccountsTab() {
 	const handlePauseToggle = async (account: Account) => {
 		try {
 			if (account.paused) {
-				await api.resumeAccount(account.id);
+				await resumeAccount.mutateAsync(account.id);
 			} else {
-				await api.pauseAccount(account.id);
+				await pauseAccount.mutateAsync(account.id);
 			}
-			await loadAccounts();
 		} catch (err) {
 			setActionError(formatError(err));
 		}
@@ -409,8 +509,7 @@ export function AccountsTab() {
 
 	const handleForceResetRateLimit = async (account: Account) => {
 		try {
-			await api.forceResetRateLimit(account.id);
-			await loadAccounts();
+			await forceResetRateLimit.mutateAsync(account.id);
 			setActionError(null);
 		} catch (err) {
 			setActionError(formatError(err));
@@ -419,8 +518,7 @@ export function AccountsTab() {
 
 	const handleRefreshUsage = async (account: Account) => {
 		try {
-			await api.refreshUsage(account.id);
-			await loadAccounts();
+			await refreshUsage.mutateAsync(account.id);
 			setActionError(null);
 		} catch (err) {
 			setActionError(formatError(err));
@@ -433,8 +531,7 @@ export function AccountsTab() {
 
 	const handleUpdatePriority = async (accountId: string, priority: number) => {
 		try {
-			await api.updateAccountPriority(accountId, priority);
-			await loadAccounts();
+			await updatePriority.mutateAsync({ accountId, priority });
 		} catch (err) {
 			setActionError(formatError(err));
 			throw err;
@@ -455,11 +552,10 @@ export function AccountsTab() {
 
 	const handleAutoRefreshToggle = async (account: Account) => {
 		try {
-			await api.updateAccountAutoRefresh(
-				account.id,
-				!account.autoRefreshEnabled,
-			);
-			await loadAccounts();
+			await updateAutoRefresh.mutateAsync({
+				accountId: account.id,
+				enabled: !account.autoRefreshEnabled,
+			});
 		} catch (err) {
 			setActionError(formatError(err));
 		}
@@ -467,11 +563,10 @@ export function AccountsTab() {
 
 	const handleBillingTypeToggle = async (account: Account) => {
 		try {
-			await api.updateAccountBillingType(
-				account.id,
-				account.billingType === "plan" ? "api" : "plan",
-			);
-			await loadAccounts();
+			await updateBillingType.mutateAsync({
+				accountId: account.id,
+				billingType: account.billingType === "plan" ? "api" : "plan",
+			});
 		} catch (err) {
 			setActionError(formatError(err));
 		}
@@ -509,6 +604,16 @@ export function AccountsTab() {
 		setCodexReauthDialog({ isOpen: true, account });
 	};
 
+	const handleReauthSuccess = async (closeDialog: () => void) => {
+		try {
+			await invalidateManagedRouting(ACCOUNT_ROUTING_INVALIDATION);
+			closeDialog();
+			setActionError(null);
+		} catch (err) {
+			setActionError(formatError(err));
+		}
+	};
+
 	const handlePeakHoursPauseToggle = async (account: Account) => {
 		try {
 			await api.updateAccountPeakHoursPause(
@@ -526,8 +631,7 @@ export function AccountsTab() {
 		customEndpoint: string | null,
 	) => {
 		try {
-			await api.updateAccountCustomEndpoint(accountId, customEndpoint);
-			await loadAccounts();
+			await updateCustomEndpoint.mutateAsync({ accountId, customEndpoint });
 		} catch (err) {
 			setActionError(formatError(err));
 			throw err;
@@ -539,8 +643,7 @@ export function AccountsTab() {
 		modelMappings: { [key: string]: string | string[] },
 	) => {
 		try {
-			await api.updateAccountModelMappings(accountId, modelMappings);
-			await loadAccounts();
+			await updateModelMappings.mutateAsync({ accountId, modelMappings });
 		} catch (err) {
 			setActionError(formatError(err));
 			throw err;
@@ -612,13 +715,18 @@ export function AccountsTab() {
 							}}
 							onSuccess={() => {
 								setAdding(false);
+								setActionError(null);
 							}}
+							onRoutingChanged={() =>
+								invalidateManagedRouting(FULL_MANAGED_ROUTING_INVALIDATION)
+							}
 							onError={setActionError}
 						/>
 					)}
 
 					<AccountList
 						accounts={accounts}
+						routingByAccountId={routingByAccountId}
 						onPauseToggle={handlePauseToggle}
 						onForceResetRateLimit={handleForceResetRateLimit}
 						onRefreshUsage={handleRefreshUsage}
@@ -715,10 +823,11 @@ export function AccountsTab() {
 				isOpen={qwenReauthDialog.isOpen}
 				account={qwenReauthDialog.account}
 				onClose={() => setQwenReauthDialog({ isOpen: false, account: null })}
-				onSuccess={() => {
-					loadAccounts();
-					setQwenReauthDialog({ isOpen: false, account: null });
-				}}
+				onSuccess={() =>
+					handleReauthSuccess(() =>
+						setQwenReauthDialog({ isOpen: false, account: null }),
+					)
+				}
 			/>
 			<AnthropicReauthDialog
 				isOpen={anthropicReauthDialog.isOpen}
@@ -726,19 +835,21 @@ export function AccountsTab() {
 				onClose={() =>
 					setAnthropicReauthDialog({ isOpen: false, account: null })
 				}
-				onSuccess={() => {
-					loadAccounts();
-					setAnthropicReauthDialog({ isOpen: false, account: null });
-				}}
+				onSuccess={() =>
+					handleReauthSuccess(() =>
+						setAnthropicReauthDialog({ isOpen: false, account: null }),
+					)
+				}
 			/>
 			<CodexReauthDialog
 				isOpen={codexReauthDialog.isOpen}
 				account={codexReauthDialog.account}
 				onClose={() => setCodexReauthDialog({ isOpen: false, account: null })}
-				onSuccess={() => {
-					loadAccounts();
-					setCodexReauthDialog({ isOpen: false, account: null });
-				}}
+				onSuccess={() =>
+					handleReauthSuccess(() =>
+						setCodexReauthDialog({ isOpen: false, account: null }),
+					)
+				}
 			/>
 		</div>
 	);

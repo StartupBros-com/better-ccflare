@@ -353,6 +353,46 @@ export interface ComboRoutingPreviewResult {
 	effective: EffectiveComboRoutingView;
 }
 
+/** Name-free effective routing projection for the Accounts routing overview. */
+export interface AccountRoutingEffectiveMemberView
+	extends Omit<EffectiveComboMemberView, "account_name"> {}
+
+/** Name-free rejected/included decision for the Accounts routing overview. */
+export interface AccountRoutingMembershipDecisionView
+	extends Omit<ComboMembershipDecisionView, "account_name"> {}
+
+/**
+ * Authoritative family state used by account cards. Account names are already
+ * available from the Accounts API and are deliberately not repeated here.
+ */
+export interface AccountRoutingEffectiveView
+	extends Omit<EffectiveComboRoutingView, "resolution"> {
+	resolution: Omit<
+		EffectiveComboRoutingView["resolution"],
+		"members" | "decisions"
+	> & {
+		members: AccountRoutingEffectiveMemberView[];
+		decisions: AccountRoutingMembershipDecisionView[];
+	};
+}
+
+/** Compact, server-approved notice that an outside account can join a route. */
+export interface AccountRoutingOpportunityView {
+	account_id: string;
+	family: ComboFamily;
+	proposal_id: string;
+	combo_id: string;
+	managed_model: string;
+	tier_source: "account_priority";
+	reason: ComboMembershipReasonCode;
+}
+
+/** One coherent, secret-free routing snapshot for every persisted account. */
+export interface AccountRoutingOverview {
+	effective: AccountRoutingEffectiveView[];
+	opportunities: AccountRoutingOpportunityView[];
+}
+
 // Extended type with slots populated
 export interface ComboWithSlots extends Combo {
 	slots: ComboSlot[];

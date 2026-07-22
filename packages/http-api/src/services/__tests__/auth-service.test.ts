@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { AuthService } from "../auth-service";
 import { extractApiKey } from "../extract-api-key";
 
 /**
@@ -116,5 +117,72 @@ describe("API Key Header Extraction", () => {
 			});
 			expect(extractApiKey(req)).toBe("sk-ant-api03-test-key");
 		});
+	});
+});
+
+describe("device setup authentication", () => {
+	const protectedPaths = [
+		["/api/oauth/qwen/init", "POST"],
+		["/api/oauth/codex/init", "POST"],
+		["/api/oauth/qwen/status/job-1", "GET"],
+		["/api/oauth/codex/status/job-1", "GET"],
+		["/api/oauth/device-setup/jobs", "GET"],
+		["/api/oauth/device-setup/jobs/job-1", "GET"],
+	] as const;
+
+	function authWithActiveKeyCount(count: number): AuthService {
+		return new AuthService({
+			countActiveApiKeys: async () => count,
+			getActiveApiKeys: async () => [],
+			updateApiKeyUsage: async () => {},
+		} as never);
+	}
+
+	test("does not exempt init, status, list, or job routes", async () => {
+		const auth = authWithActiveKeyCount(1);
+		for (const [path, method] of protectedPaths) {
+			expect(await auth.isPathExempt(path, method)).toBe(false);
+			const result = await auth.authenticateRequest(
+				new Request(`http://localhost${path}`, { method }),
+				path,
+				method,
+			);
+			expect(result.isAuthenticated).toBe(false);
+		}
+	});
+
+	test("preserves no-key bootstrap while restricting dashboard routes to admin keys", async () => {
+		const bootstrap = authWithActiveKeyCount(0);
+		for (const [path, method] of protectedPaths) {
+			expect(
+				(
+					await bootstrap.authenticateRequest(
+						new Request(`http://localhost${path}`, { method }),
+						path,
+						method,
+					)
+				).isAuthenticated,
+			).toBe(true);
+		}
+
+		const auth = authWithActiveKeyCount(1);
+		expect(
+			(
+				await auth.authorizeEndpoint(
+					{ role: "admin" } as never,
+					protectedPaths[4][0],
+					"GET",
+				)
+			).authorized,
+		).toBe(true);
+		expect(
+			(
+				await auth.authorizeEndpoint(
+					{ role: "api-only" } as never,
+					protectedPaths[4][0],
+					"GET",
+				)
+			).authorized,
+		).toBe(false);
 	});
 });

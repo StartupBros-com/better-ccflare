@@ -340,6 +340,48 @@ export function ensureSchema(db: Database): void {
 		`CREATE INDEX IF NOT EXISTS idx_oauth_sessions_expires ON oauth_sessions(expires_at)`,
 	);
 
+	// Durable device setup orchestration state. Provider continuation material
+	// stays in process memory; this table persists only safe lifecycle metadata.
+	db.run(`
+		CREATE TABLE IF NOT EXISTS device_setup_jobs (
+			id TEXT PRIMARY KEY,
+			idempotency_key TEXT NOT NULL UNIQUE,
+			request_fingerprint TEXT NOT NULL,
+			provider TEXT NOT NULL CHECK (provider IN ('qwen', 'codex')),
+			account_id TEXT NOT NULL,
+			status TEXT NOT NULL
+				CHECK (status IN ('awaiting_authorization', 'account_committed', 'reconciling', 'complete', 'complete_with_actions', 'authorization_error', 'expired')),
+			routing_selections_json TEXT NOT NULL DEFAULT '[]',
+			routing_outcomes_json TEXT NOT NULL DEFAULT '[]',
+			routing_cursor INTEGER NOT NULL DEFAULT 0 CHECK (routing_cursor >= 0),
+			lease_token TEXT,
+			lease_expires_at INTEGER,
+			attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+			error_code TEXT,
+			error_message TEXT,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			terminal_at INTEGER,
+			retention_expires_at INTEGER,
+			CHECK (
+				(lease_token IS NULL AND lease_expires_at IS NULL)
+				OR (lease_token IS NOT NULL AND lease_expires_at IS NOT NULL)
+			)
+		)
+	`);
+	db.run(
+		`CREATE INDEX IF NOT EXISTS idx_device_setup_jobs_claim
+		 ON device_setup_jobs(status, lease_expires_at, updated_at)`,
+	);
+	db.run(
+		`CREATE INDEX IF NOT EXISTS idx_device_setup_jobs_retention
+		 ON device_setup_jobs(retention_expires_at)`,
+	);
+	db.run(
+		`CREATE INDEX IF NOT EXISTS idx_device_setup_jobs_account
+		 ON device_setup_jobs(account_id)`,
+	);
+
 	// Create agent_preferences table for storing user-defined agent settings
 	db.run(`
 		CREATE TABLE IF NOT EXISTS agent_preferences (

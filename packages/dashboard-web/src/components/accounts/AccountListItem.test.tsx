@@ -13,7 +13,9 @@
 import { describe, expect, it } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { Account } from "../../api";
+import { AccountList } from "./AccountList";
 import { AccountListItem } from "./AccountListItem";
+import type { AccountFamilyRoutingState } from "./account-routing";
 
 function noop() {}
 async function noopAsync() {}
@@ -68,6 +70,26 @@ const requiredHandlers = {
 	onAutoRefreshToggle: noop,
 	onBillingTypeToggle: noop,
 };
+
+function routingState(
+	overrides: Partial<AccountFamilyRoutingState> = {},
+): AccountFamilyRoutingState {
+	return {
+		family: "opus",
+		comboId: "combo-opus",
+		comboName: "Opus priority",
+		active: true,
+		membershipLabel: "Managed",
+		tier: 0,
+		logicalModel: "claude-opus-4-8",
+		reason: "included",
+		reasonLabel: "Included",
+		availability: "available",
+		availabilityLabel: "Available",
+		managedRouteAvailable: false,
+		...overrides,
+	};
+}
 
 describe("AccountListItem (P2 review: pause-reason rendering)", () => {
 	it("renders the derived requiresReauth signal as the same primary recovery action", () => {
@@ -162,5 +184,160 @@ describe("AccountListItem (P2 review: pause-reason rendering)", () => {
 		expect(html).not.toContain("Re-authentication required");
 		expect(html).not.toContain(">Re-authenticate<");
 		expect(html).not.toContain("bg-primary text-primary-foreground");
+	});
+});
+
+describe("AccountListItem authoritative family routing", () => {
+	it("renders server-owned Managed source, model, effective tier, and reason", () => {
+		const html = renderToStaticMarkup(
+			<AccountListItem
+				account={makeAccount({ paused: false })}
+				{...requiredHandlers}
+				routingStates={[routingState()]}
+			/>,
+		);
+
+		expect(html).toContain("Family routing");
+		expect(html).toContain("Opus");
+		expect(html).toContain("Managed");
+		expect(html).toContain("claude-opus-4-8");
+		expect(html).toContain("Tier 0");
+		expect(html).toContain("Included");
+	});
+
+	it("renders a Manual membership without duplicating manual_override as a warning", () => {
+		const html = renderToStaticMarkup(
+			<AccountListItem
+				account={makeAccount({ paused: false })}
+				{...requiredHandlers}
+				routingStates={[
+					routingState({
+						membershipLabel: "Manual",
+						reason: "manual_override",
+						reasonLabel: "Manual override",
+						tier: 7,
+					}),
+				]}
+			/>,
+		);
+
+		expect(html).toContain(">Manual<");
+		expect(html).toContain("Tier 7");
+		expect(html).not.toContain("Manual override");
+		expect(html).not.toContain("Action required");
+	});
+
+	for (const [availability, expected] of [
+		["paused", "Paused"],
+		["requires_reauth", "Needs authentication"],
+		["rate_limited", "Rate limited"],
+		["model_exhausted", "Model exhausted"],
+	] as const) {
+		it(`renders the distinct ${availability} operational overlay`, () => {
+			const html = renderToStaticMarkup(
+				<AccountListItem
+					account={makeAccount({ paused: false })}
+					{...requiredHandlers}
+					routingStates={[routingState({ availability })]}
+				/>,
+			);
+
+			expect(html).toContain(expected);
+			expect(html).toContain("membership is unchanged");
+		});
+	}
+
+	for (const [reason, expected, actionRequired] of [
+		["excluded", "Excluded from managed routing", false],
+		["unsupported", "Logical model unsupported", false],
+		["unknown", "Capability unknown", false],
+		["disabled", "Family routing disabled", false],
+		["ambiguous", "Ambiguous server proposal", true],
+		["new_billing_class", "New billing class requires review", true],
+	] as const) {
+		it(`renders ${reason} only from the supplied server decision`, () => {
+			const html = renderToStaticMarkup(
+				<AccountListItem
+					account={makeAccount({ paused: false, priority: 0 })}
+					{...requiredHandlers}
+					routingStates={[
+						routingState({
+							membershipLabel: null,
+							tier: null,
+							reason,
+							reasonLabel: expected,
+						}),
+					]}
+				/>,
+			);
+
+			expect(html).toContain(expected);
+			expect(html.includes("Action required")).toBe(actionRequired);
+		});
+	}
+
+	it("does not infer an outside-route warning from account priority", () => {
+		const html = renderToStaticMarkup(
+			<AccountListItem
+				account={makeAccount({ paused: false, priority: 0 })}
+				{...requiredHandlers}
+			/>,
+		);
+
+		expect(html).not.toContain("Family routing");
+		expect(html).not.toContain("Outside active route");
+		expect(html).not.toContain("Action required");
+	});
+
+	it("directs an outside-route account with a server-approved proposal to Combos without claiming membership", () => {
+		const html = renderToStaticMarkup(
+			<AccountListItem
+				account={makeAccount({ paused: false })}
+				{...requiredHandlers}
+				routingStates={[
+					routingState({
+						membershipLabel: null,
+						tier: null,
+						reason: "unknown",
+						reasonLabel: "Capability unknown",
+						managedRouteAvailable: true,
+					}),
+				]}
+			/>,
+		);
+
+		expect(html).toContain("Managed route available");
+		expect(html).toContain("Review in Combos");
+		expect(html).toContain("Capability unknown");
+		expect(html).not.toContain(">Managed<");
+		expect(html).not.toContain("Already a managed member");
+	});
+
+	it("keys cards and resolves routing state by immutable account ID", () => {
+		const firstRouting = [routingState({ family: "opus" })];
+		const secondRouting = [routingState({ family: "fable" })];
+		const tree = AccountList({
+			accounts: [
+				makeAccount({ id: "account-a", name: "duplicate-name" }),
+				makeAccount({ id: "account-b", name: "duplicate-name" }),
+			],
+			routingByAccountId: {
+				"account-a": firstRouting,
+				"account-b": secondRouting,
+			},
+			...requiredHandlers,
+		}) as React.ReactElement<{
+			children: React.ReactElement<{
+				routingStates?: readonly AccountFamilyRoutingState[];
+			}>[];
+		}>;
+		const children = tree.props.children;
+
+		expect(children.map((child) => child.key)).toEqual([
+			"account-a",
+			"account-b",
+		]);
+		expect(children[0]?.props.routingStates).toBe(firstRouting);
+		expect(children[1]?.props.routingStates).toBe(secondRouting);
 	});
 });

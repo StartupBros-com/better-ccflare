@@ -1,5 +1,10 @@
 import { validateNumber } from "@better-ccflare/core";
-import { BadRequest, Unauthorized } from "@better-ccflare/errors";
+import {
+	BadRequest,
+	NotFound,
+	ServiceUnavailable,
+	Unauthorized,
+} from "@better-ccflare/errors";
 import {
 	getCachePacingRouteStats,
 	getCachePacingStats,
@@ -66,6 +71,7 @@ import {
 	createApiKeyUpdateRoleHandler,
 } from "./handlers/api-keys";
 import {
+	createAccountRoutingOverviewHandler,
 	createComboCreateHandler,
 	createComboDeleteHandler,
 	createComboGetHandler,
@@ -109,6 +115,8 @@ import {
 	createCodexDeviceFlowInitHandler,
 	createCodexDeviceFlowStatusHandler,
 	createCodexReauthHandler,
+	createDeviceSetupJobGetHandler,
+	createDeviceSetupJobsListHandler,
 	createOAuthCallbackHandler,
 	createOAuthInitHandler,
 	createQwenDeviceFlowInitHandler,
@@ -136,8 +144,13 @@ import {
 import { createUsageHistoryHandler } from "./handlers/usage-history";
 import { createVersionCheckHandler } from "./handlers/version";
 import { AuthService } from "./services/auth-service";
+import type { DeviceSetupCoordinator } from "./services/device-setup-jobs";
 import type { APIContext } from "./types";
 import { errorResponse } from "./utils/http-error";
+
+export interface APIRouterOptions {
+	deviceSetupCoordinator?: DeviceSetupCoordinator;
+}
 
 /**
  * API Router that handles all API endpoints
@@ -151,13 +164,19 @@ export class APIRouter {
 	private authService: AuthService;
 	private qwenStatusHandler: (sessionId: string) => Response;
 	private codexStatusHandler: (sessionId: string) => Response;
+	private deviceSetupCoordinator?: DeviceSetupCoordinator;
+	private deviceSetupJobGetHandler?: (jobId: string) => Promise<Response>;
 
-	constructor(context: APIContext) {
+	constructor(context: APIContext, options: APIRouterOptions = {}) {
 		this.context = context;
 		this.handlers = new Map();
 		this.authService = new AuthService(context.dbOps);
 		this.qwenStatusHandler = createQwenDeviceFlowStatusHandler();
 		this.codexStatusHandler = createCodexDeviceFlowStatusHandler();
+		this.deviceSetupCoordinator = options.deviceSetupCoordinator;
+		this.deviceSetupJobGetHandler = options.deviceSetupCoordinator
+			? createDeviceSetupJobGetHandler(options.deviceSetupCoordinator)
+			: undefined;
 		this.registerHandlers();
 	}
 
@@ -228,9 +247,16 @@ export class APIRouter {
 		const alertsStreamHandler = createAlertsStreamHandler();
 		const oauthInitHandler = createOAuthInitHandler(dbOps);
 		const oauthCallbackHandler = createOAuthCallbackHandler(dbOps);
-		const qwenDeviceFlowInitHandler = createQwenDeviceFlowInitHandler(dbOps);
+		const qwenDeviceFlowInitHandler = this.deviceSetupCoordinator
+			? createQwenDeviceFlowInitHandler(this.deviceSetupCoordinator)
+			: null;
 		const qwenReauthHandler = createQwenReauthHandler(dbOps);
-		const codexDeviceFlowInitHandler = createCodexDeviceFlowInitHandler(dbOps);
+		const codexDeviceFlowInitHandler = this.deviceSetupCoordinator
+			? createCodexDeviceFlowInitHandler(this.deviceSetupCoordinator)
+			: null;
+		const deviceSetupJobsListHandler = this.deviceSetupCoordinator
+			? createDeviceSetupJobsListHandler(this.deviceSetupCoordinator)
+			: null;
 		const codexReauthHandler = createCodexReauthHandler(dbOps);
 		const anthropicReauthInitHandler = createAnthropicReauthInitHandler(
 			dbOps,
@@ -323,7 +349,11 @@ export class APIRouter {
 			oauthCallbackHandler(req),
 		);
 		this.handlers.set("POST:/api/oauth/qwen/init", (req) =>
-			qwenDeviceFlowInitHandler(req),
+			qwenDeviceFlowInitHandler
+				? qwenDeviceFlowInitHandler(req)
+				: errorResponse(
+						ServiceUnavailable("Durable device setup is not initialized"),
+					),
 		);
 		this.handlers.set("POST:/api/oauth/qwen/reauth", (req) =>
 			qwenReauthHandler(req),
@@ -335,7 +365,18 @@ export class APIRouter {
 			anthropicReauthCallbackHandler(req),
 		);
 		this.handlers.set("POST:/api/oauth/codex/init", (req) =>
-			codexDeviceFlowInitHandler(req),
+			codexDeviceFlowInitHandler
+				? codexDeviceFlowInitHandler(req)
+				: errorResponse(
+						ServiceUnavailable("Durable device setup is not initialized"),
+					),
+		);
+		this.handlers.set("GET:/api/oauth/device-setup/jobs", (_req, url) =>
+			deviceSetupJobsListHandler
+				? deviceSetupJobsListHandler(url)
+				: errorResponse(
+						ServiceUnavailable("Durable device setup is not initialized"),
+					),
 		);
 		this.handlers.set("POST:/api/oauth/codex/reauth", (req) =>
 			codexReauthHandler(req),
@@ -486,6 +527,9 @@ export class APIRouter {
 		);
 		this.handlers.set("GET:/api/routing/effective", () =>
 			createEffectiveRoutingHandler(dbOps)(),
+		);
+		this.handlers.set("GET:/api/routing/accounts", () =>
+			createAccountRoutingOverviewHandler(dbOps)(),
 		);
 		this.handlers.set("POST:/api/routing/preview", (req) =>
 			createRoutingPreviewHandler(dbOps)(req),
@@ -935,11 +979,44 @@ export class APIRouter {
 			}
 		}
 
-		// Check for Qwen device flow status endpoint
+		// Durable device-setup recovery by job ID.
+		if (path.startsWith("/api/oauth/device-setup/jobs/") && method === "GET") {
+			const parts = path.split("/");
+			const getJob = this.deviceSetupJobGetHandler;
+			if (!getJob) {
+				return errorResponse(
+					ServiceUnavailable("Durable device setup is not initialized"),
+				);
+			}
+			if (parts.length === 6 && parts[5] && getJob) {
+				let jobId: string;
+				try {
+					jobId = decodeURIComponent(parts[5]);
+				} catch {
+					return errorResponse(
+						BadRequest("Invalid device setup job id encoding"),
+					);
+				}
+				return await this.wrapHandler(() => getJob(jobId))(req, url);
+			}
+			return errorResponse(NotFound("Device setup job not found"));
+		}
+
+		// Compatibility status reads first consult durable setup jobs, then the
+		// separate in-memory reauthentication sessions.
 		if (path.startsWith("/api/oauth/qwen/status/") && method === "GET") {
 			const parts = path.split("/");
 			const sessionId = parts[5];
 			if (sessionId) {
+				const job = await this.deviceSetupCoordinator?.get(sessionId);
+				if (job) {
+					return job.provider === "qwen"
+						? new Response(JSON.stringify(job), {
+								status: 200,
+								headers: { "content-type": "application/json" },
+							})
+						: errorResponse(NotFound("Device setup job not found"));
+				}
 				return await this.wrapHandler(() => this.qwenStatusHandler(sessionId))(
 					req,
 					url,
@@ -952,6 +1029,15 @@ export class APIRouter {
 			const parts = path.split("/");
 			const sessionId = parts[5];
 			if (sessionId) {
+				const job = await this.deviceSetupCoordinator?.get(sessionId);
+				if (job) {
+					return job.provider === "codex"
+						? new Response(JSON.stringify(job), {
+								status: 200,
+								headers: { "content-type": "application/json" },
+							})
+						: errorResponse(NotFound("Device setup job not found"));
+				}
 				return await this.wrapHandler(() => this.codexStatusHandler(sessionId))(
 					req,
 					url,

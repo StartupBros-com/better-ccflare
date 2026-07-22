@@ -6,8 +6,9 @@ import type {
 	ComboFamilyPolicyChanges,
 	ComboRoutingPolicySnapshot,
 } from "@better-ccflare/types";
-
+import { createServerOwnedAccountRoutingFinalizer } from "../../services/account-routing-operations";
 import {
+	createAccountRoutingOverviewHandler,
 	createEffectiveRoutingHandler,
 	createFamilyAssignHandler,
 	createMembershipExclusionCreateHandler,
@@ -261,6 +262,185 @@ function statefulDb() {
 }
 
 describe("managed routing HTTP control plane", () => {
+	it("builds one coherent account-routing overview for ten accounts and two families", async () => {
+		const accounts = Array.from({ length: 10 }, (_, index) =>
+			account(
+				index < 2 ? String.fromCharCode(97 + index) : `outside-${index}`,
+				index,
+			),
+		);
+		const families = ["opus", "fable"] as const;
+		const getAllAccounts = mock(async () => structuredClone(accounts));
+		const getFamilyAssignments = mock(async () =>
+			families.map((family) => ({ ...snapshot().assignment, family })),
+		);
+		const getComboRoutingPolicy = mock(async (family: "opus" | "fable") => ({
+			...snapshot(),
+			assignment: { ...snapshot().assignment, family },
+			slots: snapshot().slots.map((slot) => ({
+				...slot,
+				model: family === "opus" ? "claude-opus-4-8" : "claude-fable-5",
+			})),
+		}));
+		const dbOps = {
+			getRoutingPolicyRevision: mock(async () => 7),
+			getFamilyAssignments,
+			getAllAccounts,
+			getComboRoutingPolicy,
+		} as unknown as DatabaseOperations;
+
+		const response = await createAccountRoutingOverviewHandler(
+			dbOps,
+			dependencies,
+		)();
+		const body = await response.json();
+
+		expect(response.status).toBe(200);
+		expect(getAllAccounts).toHaveBeenCalledTimes(1);
+		expect(getFamilyAssignments).toHaveBeenCalledTimes(1);
+		expect(getComboRoutingPolicy).toHaveBeenCalledTimes(2);
+		expect(
+			body.data.effective.map((view: { family: string }) => view.family),
+		).toEqual(["fable", "opus"]);
+		expect(body.data.opportunities).toHaveLength(16);
+		expect(body.data.opportunities[0]).toEqual({
+			account_id: expect.stringMatching(/^outside-/),
+			family: expect.stringMatching(/^(fable|opus)$/),
+			proposal_id: expect.any(String),
+			combo_id: "combo-1",
+			managed_model: expect.any(String),
+			tier_source: "account_priority",
+			reason: "included",
+		});
+	});
+
+	it("returns only exact high-confidence outside-route opportunities", async () => {
+		const current = account("current", 0);
+		const outside = account("acct:opaque/Δ-01", 2);
+		const unsupported = account("unsupported", 3);
+		const newBilling = {
+			...account("new-billing", 4),
+			provider: "unrepresented-provider",
+			api_key: "new-billing-secret",
+			refresh_token: null,
+			access_token: null,
+		};
+		const policy = {
+			...snapshot(),
+			slots: [
+				{
+					...snapshot().slots[0],
+					id: "slot-current",
+					account_id: "current",
+					priority: 0,
+				},
+				{
+					...snapshot().slots[1],
+					id: "slot-peer",
+					account_id: "peer",
+					priority: 1,
+				},
+			],
+			exclusions: [
+				{
+					id: "excluded-outside",
+					family: "opus" as const,
+					combo_id: "combo-1",
+					account_id: "excluded",
+					created_at: 1,
+				},
+			],
+		};
+		const accounts = [
+			current,
+			account("peer", 1),
+			outside,
+			unsupported,
+			account("excluded", 5),
+			newBilling,
+		];
+		const dbOps = {
+			getRoutingPolicyRevision: mock(async () => 4),
+			getFamilyAssignments: mock(async () => [policy.assignment]),
+			getAllAccounts: mock(async () => structuredClone(accounts)),
+			getComboRoutingPolicy: mock(async () => structuredClone(policy)),
+		} as unknown as DatabaseOperations;
+		const response = await createAccountRoutingOverviewHandler(dbOps, {
+			...dependencies,
+			resolveCapability(currentAccount: Account) {
+				return currentAccount.id === "unsupported"
+					? {
+							status: "unsupported" as const,
+							provenance: "explicit_mapping" as const,
+							reason: "unsupported" as const,
+						}
+					: dependencies.resolveCapability();
+			},
+		})();
+		const body = await response.json();
+
+		expect(body.data.opportunities).toEqual([
+			expect.objectContaining({
+				account_id: "acct:opaque/Δ-01",
+				family: "opus",
+			}),
+		]);
+		const serialized = JSON.stringify(body);
+		expect(serialized).not.toContain("Account acct:opaque");
+		expect(serialized).not.toContain("Account current");
+		expect(serialized).not.toContain("Account peer");
+		expect(serialized).not.toContain("Account unsupported");
+		expect(serialized).not.toContain("secret-");
+		expect(serialized).not.toContain("new-billing-secret");
+		expect(serialized).not.toContain("must-not-leak.example");
+		expect(serialized).not.toContain("private-physical-model");
+		expect(serialized).not.toContain("refresh_token");
+		expect(serialized).not.toContain("custom_endpoint");
+		expect(serialized).not.toContain("model_mappings");
+	});
+
+	it("retries the complete account-routing overview after a revision change", async () => {
+		const revisions = [10, 11, 11, 11];
+		let accountRead = 0;
+		const getAllAccounts = mock(async () => {
+			accountRead++;
+			return accountRead === 1
+				? [account("a", 0), account("b", 1), account("stale-account", 2)]
+				: [account("a", 0), account("b", 1), account("fresh-account", 2)];
+		});
+		const getComboRoutingPolicy = mock(async () => {
+			const policy = snapshot();
+			if (!policy.combo) throw new Error("Expected combo fixture");
+			policy.combo = {
+				...policy.combo,
+				name: accountRead === 1 ? "Stale policy" : "Fresh policy",
+			};
+			return policy;
+		});
+		const dbOps = {
+			getRoutingPolicyRevision: mock(async () => revisions.shift() ?? 11),
+			getFamilyAssignments: mock(async () => [snapshot().assignment]),
+			getAllAccounts,
+			getComboRoutingPolicy,
+		} as unknown as DatabaseOperations;
+
+		const response = await createAccountRoutingOverviewHandler(
+			dbOps,
+			dependencies,
+		)();
+		const body = await response.json();
+
+		expect(response.status).toBe(200);
+		expect(getAllAccounts).toHaveBeenCalledTimes(2);
+		expect(getComboRoutingPolicy).toHaveBeenCalledTimes(2);
+		expect(body.data.effective[0].policy.combo.name).toBe("Fresh policy");
+		expect(
+			body.data.opportunities.map(
+				(opportunity: { account_id: string }) => opportunity.account_id,
+			),
+		).toEqual(["fresh-account"]);
+	});
+
 	it("returns authoritative effective membership without credential or mapping data", async () => {
 		const { dbOps } = statefulDb();
 		const response = await createEffectiveRoutingHandler(
@@ -596,6 +776,38 @@ describe("managed routing HTTP control plane", () => {
 				(member: { account_id: string }) => member.account_id === "new",
 			),
 		).toMatchObject({ source: "managed", rule_id: "enabled-rule" });
+	});
+
+	it("server-owned finalization replays an exact reviewed account proposal idempotently", async () => {
+		const state = statefulDb();
+		const previewResponse = await createRoutingPreviewHandler(
+			state.dbOps,
+			dependencies,
+		)(request("/api/routing/preview", { family: "opus", account_id: "new" }));
+		const reviewed = (await previewResponse.json()).data.proposals[0];
+		const finalize = createServerOwnedAccountRoutingFinalizer(
+			state.dbOps,
+			dependencies,
+		);
+
+		const first = await finalize({
+			accountId: "new",
+			reviewed: [{ family: "opus", proposalId: reviewed.proposal_id }],
+		});
+		const replay = await finalize({
+			accountId: "new",
+			reviewed: [{ family: "opus", proposalId: reviewed.proposal_id }],
+		});
+
+		expect(first).toMatchObject({
+			accountId: "new",
+			outcomes: [{ status: "joined", reason: "applied" }],
+		});
+		expect(replay).toMatchObject({
+			accountId: "new",
+			outcomes: [{ status: "joined", reason: "already-effective" }],
+		});
+		expect(state.applyFamilyPolicyChanges).toHaveBeenCalledTimes(1);
 	});
 
 	it("defaults proposals to the valid assignment model and rejects a wrong-family override", async () => {

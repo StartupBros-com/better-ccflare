@@ -23,6 +23,7 @@ import { OAuthTokenStatusWithBoundary } from "../OAuthTokenStatus";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { Switch } from "../ui/switch";
+import type { AccountFamilyRoutingState } from "./account-routing";
 import { pauseStatusDisplay } from "./pause-status";
 import { RateLimitProgress } from "./RateLimitProgress";
 
@@ -47,8 +48,31 @@ function formatPauseReason(reason: string | null): string | null {
 	}
 }
 
+function formatRoutingFamily(family: string): string {
+	return family.charAt(0).toUpperCase() + family.slice(1);
+}
+
+function routingAvailabilityOverlay(
+	state: AccountFamilyRoutingState,
+): { label: string; variant: "destructive" | "warning" } | null {
+	if (state.availability === null) return null;
+	switch (state.availability) {
+		case "available":
+			return null;
+		case "paused":
+			return { label: "Paused", variant: "warning" };
+		case "requires_reauth":
+			return { label: "Needs authentication", variant: "destructive" };
+		case "rate_limited":
+			return { label: "Rate limited", variant: "warning" };
+		case "model_exhausted":
+			return { label: "Model exhausted", variant: "warning" };
+	}
+}
+
 interface AccountListItemProps {
 	account: Account;
+	routingStates?: readonly AccountFamilyRoutingState[];
 	isPrimary?: boolean;
 	onPauseToggle: (account: Account) => void;
 	onForceResetRateLimit: (account: Account) => void;
@@ -70,6 +94,7 @@ interface AccountListItemProps {
 
 export function AccountListItem({
 	account,
+	routingStates = [],
 	isPrimary = false,
 	onPauseToggle,
 	onForceResetRateLimit,
@@ -479,6 +504,77 @@ export function AccountListItem({
 					</Button>
 				</div>
 			</div>
+			{routingStates.length > 0 && (
+				<section aria-label="Family routing" className="space-y-2">
+					<p className="text-xs font-medium text-muted-foreground">
+						Family routing
+					</p>
+					<div className="flex flex-wrap gap-2">
+						{routingStates.map((state) => {
+							const availability = routingAvailabilityOverlay(state);
+							const actionRequired =
+								state.reason === "ambiguous" ||
+								state.reason === "new_billing_class";
+							const reasonDuplicatesMembership =
+								state.membershipLabel === "Manual" &&
+								state.reason === "manual_override";
+
+							return (
+								<div
+									key={`${state.family}:${state.comboId ?? "none"}`}
+									className="flex flex-wrap items-center gap-1.5 rounded-md border bg-muted/20 px-2 py-1.5 text-xs"
+								>
+									<Badge variant="outline">
+										{formatRoutingFamily(state.family)}
+									</Badge>
+									{state.membershipLabel && (
+										<Badge
+											variant={
+												state.membershipLabel === "Managed"
+													? "success"
+													: "secondary"
+											}
+										>
+											{state.membershipLabel}
+										</Badge>
+									)}
+									{state.logicalModel && <span>{state.logicalModel}</span>}
+									{state.tier !== null && <span>Tier {state.tier}</span>}
+									{state.reasonLabel && !reasonDuplicatesMembership && (
+										<span className="text-muted-foreground">
+											{state.reasonLabel}
+										</span>
+									)}
+									{actionRequired && (
+										<Badge variant="warning">Action required</Badge>
+									)}
+									{state.managedRouteAvailable && (
+										<>
+											<Badge variant="warning">Managed route available</Badge>
+											<span className="text-muted-foreground">
+												Review in Combos
+											</span>
+										</>
+									)}
+									{availability && (
+										<>
+											<Badge
+												variant={availability.variant}
+												title={state.availabilityLabel ?? undefined}
+											>
+												{availability.label}
+											</Badge>
+											<span className="text-muted-foreground">
+												membership is unchanged
+											</span>
+										</>
+									)}
+								</div>
+							);
+						})}
+					</div>
+				</section>
+			)}
 			{account.sessionStats && (
 				<div className="text-xs text-muted-foreground">
 					Session: {account.sessionStats.requests} req
