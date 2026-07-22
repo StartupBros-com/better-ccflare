@@ -17,6 +17,13 @@ export interface NormalizedCodexInputUsage {
 	inputTokens: number;
 	cacheReadInputTokens: number;
 	cacheCreationInputTokens: number;
+	/** Whether upstream explicitly supplied a valid cache-write measurement. */
+	cacheCreationMeasurementAvailable: boolean;
+}
+
+export interface NormalizedCodexCacheWriteUsage {
+	tokens: number;
+	measurementAvailable: boolean;
 }
 
 /**
@@ -27,12 +34,23 @@ export interface NormalizedCodexInputUsage {
 export function normalizeCodexCacheWriteTokens(
 	inputTokenDetails: unknown,
 ): number {
+	return normalizeCodexCacheWriteUsage(inputTokenDetails).tokens;
+}
+
+/**
+ * Preserve the difference between an explicit zero and an absent cache-write
+ * field. Anthropic compatibility still needs a numeric zero, while cache
+ * diagnostics must not mislabel missing telemetry as a measured zero.
+ */
+export function normalizeCodexCacheWriteUsage(
+	inputTokenDetails: unknown,
+): NormalizedCodexCacheWriteUsage {
 	if (
 		typeof inputTokenDetails !== "object" ||
 		inputTokenDetails === null ||
 		Array.isArray(inputTokenDetails)
 	) {
-		return 0;
+		return { tokens: 0, measurementAvailable: false };
 	}
 	const details = inputTokenDetails as Record<string, unknown>;
 	for (const field of [
@@ -41,10 +59,10 @@ export function normalizeCodexCacheWriteTokens(
 	] as const) {
 		const value = details[field];
 		if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
-			return value;
+			return { tokens: value, measurementAvailable: true };
 		}
 	}
-	return 0;
+	return { tokens: 0, measurementAvailable: false };
 }
 
 /**
@@ -59,6 +77,7 @@ export function normalizeCodexInputUsage(
 	totalInputTokens: unknown,
 	cachedTokens: unknown,
 	cacheCreationTokens: unknown = 0,
+	cacheCreationMeasurementAvailable = true,
 ): NormalizedCodexInputUsage {
 	const total =
 		typeof totalInputTokens === "number" &&
@@ -84,6 +103,7 @@ export function normalizeCodexInputUsage(
 		inputTokens: total - cached - cacheCreation,
 		cacheReadInputTokens: cached,
 		cacheCreationInputTokens: cacheCreation,
+		cacheCreationMeasurementAvailable,
 	};
 }
 
@@ -101,10 +121,12 @@ export function normalizeCodexResponseInputUsage(
 		!Array.isArray(inputTokenDetails)
 			? (inputTokenDetails as Record<string, unknown>)
 			: {};
+	const cacheWrite = normalizeCodexCacheWriteUsage(details);
 	return normalizeCodexInputUsage(
 		totalInputTokens,
 		details.cached_tokens,
-		normalizeCodexCacheWriteTokens(details),
+		cacheWrite.tokens,
+		cacheWrite.measurementAvailable,
 	);
 }
 

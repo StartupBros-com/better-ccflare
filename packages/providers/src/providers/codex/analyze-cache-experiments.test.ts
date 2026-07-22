@@ -663,4 +663,56 @@ describe("analyzeCodexCacheExperiments", () => {
 			skip_non_eligible_endpoint: 1,
 		});
 	});
+
+	test("does not count an ambiguous legacy zero cache write as a measurement", () => {
+		const report = analyzeCodexCacheExperiments([
+			{
+				trace_schema_version: 10,
+				phase: "request",
+				ts: "2026-07-21T08:00:00Z",
+				request_id: "legacy-zero",
+				attempt_id: "legacy-zero-attempt",
+				model_out: "gpt-5.6-sol",
+				pacing_canary: "control",
+			},
+			{
+				trace_schema_version: 10,
+				phase: "response",
+				ts: "2026-07-21T08:00:01Z",
+				request_id: "legacy-zero",
+				attempt_id: "legacy-zero-attempt",
+				stop_reason: "end_turn",
+				input_tokens: 100,
+				cache_read_input_tokens: 0,
+				cache_creation_input_tokens: 0,
+			},
+			{
+				trace_schema_version: 11,
+				phase: "request",
+				ts: "2026-07-21T08:01:00Z",
+				request_id: "measured-zero",
+				attempt_id: "measured-zero-attempt",
+				model_out: "gpt-5.6-sol",
+				pacing_canary: "control",
+			},
+			{
+				trace_schema_version: 11,
+				phase: "response",
+				ts: "2026-07-21T08:01:01Z",
+				request_id: "measured-zero",
+				attempt_id: "measured-zero-attempt",
+				stop_reason: "end_turn",
+				input_tokens: 100,
+				cache_read_input_tokens: 0,
+				cache_creation_input_tokens: 0,
+				cache_creation_measurement_available: true,
+			},
+		]);
+
+		expect(report.pacing.rows[0]?.cache).toMatchObject({
+			cacheWriteMeasuredResponses: 1,
+			cacheWriteUnavailableResponses: 1,
+			cacheWriteTokens: 0,
+		});
+	});
 });

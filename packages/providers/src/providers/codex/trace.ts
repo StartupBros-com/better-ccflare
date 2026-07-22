@@ -28,7 +28,7 @@ export const CODEX_TRACE_HMAC_KEY_ENV = "CCFLARE_CODEX_TRACE_HMAC_KEY";
 /** Warn when one response spawns at least this many subagents (0 disables). */
 export const CODEX_FANOUT_WARN_ENV = "CCFLARE_CODEX_FANOUT_WARN";
 
-const TRACE_SCHEMA_VERSION = 10;
+const TRACE_SCHEMA_VERSION = 11;
 const DEFAULT_FANOUT_WARN = 8;
 const MAX_INPUT_ITEM_FINGERPRINTS = 64;
 /**
@@ -90,6 +90,7 @@ export interface CodexResponseSummary {
 	output_tokens: number | null;
 	cache_read_input_tokens: number | null;
 	cache_creation_input_tokens: number | null;
+	cache_creation_measurement_available: boolean;
 	cache_hit_pct: number | null;
 	error_type?: string;
 	error_message?: string;
@@ -234,7 +235,8 @@ interface TraceInputs {
 	/**
 	 * Diagnostic: this turn's derived conversation identity no longer matched
 	 * an already-elected root for its session (see orchestration-election.ts).
-	 * Preserved in schema 10; a missing value writes null.
+	 * Introduced in schema 10 and preserved in later schemas; a missing value
+	 * writes null.
 	 */
 	orchestrationDemotionObserved?: boolean;
 	/**
@@ -280,6 +282,7 @@ export function summarizeCodexResponse(
 		output_tokens?: number;
 		cache_read_input_tokens?: number;
 		cache_creation_input_tokens?: number;
+		cache_creation_measurement_available?: boolean;
 	},
 	stopReason: CodexResponseSummary["stop_reason"],
 	error?: { type?: string; message?: string; code?: string; status?: string },
@@ -297,6 +300,11 @@ export function summarizeCodexResponse(
 	const usageMeasurementAvailable = typeof inputTokens === "number";
 	const cacheMeasurementAvailable =
 		usageMeasurementAvailable && typeof cacheRead === "number";
+	const cacheCreationMeasurementAvailable =
+		typeof usage.cache_creation_measurement_available === "boolean"
+			? usage.cache_creation_measurement_available &&
+				typeof usage.cache_creation_input_tokens === "number"
+			: typeof usage.cache_creation_input_tokens === "number";
 	return {
 		new_tool_call_count: toolCalls.length,
 		new_subagent_spawn_count: subagentSpawnCount,
@@ -308,7 +316,10 @@ export function summarizeCodexResponse(
 		input_tokens: inputTokens,
 		output_tokens: usage.output_tokens ?? null,
 		cache_read_input_tokens: cacheRead,
-		cache_creation_input_tokens: usage.cache_creation_input_tokens ?? null,
+		cache_creation_input_tokens: cacheCreationMeasurementAvailable
+			? (usage.cache_creation_input_tokens ?? null)
+			: null,
+		cache_creation_measurement_available: cacheCreationMeasurementAvailable,
 		cache_hit_pct:
 			cacheMeasurementAvailable && inputTokens > 0
 				? Math.round(

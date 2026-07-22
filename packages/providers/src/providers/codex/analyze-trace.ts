@@ -60,6 +60,7 @@ export interface TraceRecord {
 	output_tokens?: number | null;
 	cache_read_input_tokens?: number | null;
 	cache_creation_input_tokens?: number | null;
+	cache_creation_measurement_available?: boolean;
 	cache_hit_pct?: number | null;
 	context_utilization_pct?: number | null;
 	error_type?: string;
@@ -670,8 +671,10 @@ function analyzeCanary(
 			arm.usage.availableResponses++;
 			arm.usage.inputTokens += inputTokens;
 			arm.usage.outputTokens += response.output_tokens ?? 0;
-			arm.usage.cacheCreationInputTokens +=
-				response.cache_creation_input_tokens ?? 0;
+			if (hasMeasuredCacheWrite(response)) {
+				arm.usage.cacheCreationInputTokens +=
+					response.cache_creation_input_tokens ?? 0;
+			}
 		} else {
 			arm.usage.unavailableResponses++;
 		}
@@ -1200,6 +1203,20 @@ function safeTokenCount(value: unknown): value is number {
 	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
+/**
+ * Schema 11 records say whether cache-write usage was actually reported.
+ * Earlier positive values remain usable, but an earlier zero is ambiguous
+ * because the normalizer historically substituted zero when the field was
+ * absent. Treat those legacy zeros as unavailable instead of measured facts.
+ */
+function hasMeasuredCacheWrite(response: TraceRecord): boolean {
+	if (response.usage_measurement_available === false) return false;
+	if (!safeTokenCount(response.cache_creation_input_tokens)) return false;
+	if (response.cache_creation_measurement_available === false) return false;
+	if (response.cache_creation_measurement_available === true) return true;
+	return response.cache_creation_input_tokens > 0;
+}
+
 function safeTokenSum(current: number, increment: number): number | null {
 	if (increment > Number.MAX_SAFE_INTEGER - current) return null;
 	return current + increment;
@@ -1364,15 +1381,12 @@ function cacheExperimentDimension(
 		} else {
 			row.cache.unavailableResponses++;
 		}
-		if (
-			response.usage_measurement_available === false ||
-			!safeTokenCount(response.cache_creation_input_tokens)
-		) {
+		if (!hasMeasuredCacheWrite(response)) {
 			row.cache.cacheWriteUnavailableResponses++;
 		} else {
 			const nextCacheWriteTokens = safeTokenSum(
 				row.cache.cacheWriteTokens,
-				response.cache_creation_input_tokens,
+				response.cache_creation_input_tokens ?? 0,
 			);
 			if (nextCacheWriteTokens === null) {
 				row.cache.cacheWriteOverflowResponses++;
@@ -1732,8 +1746,10 @@ export function analyzeCodexTrace(
 			usage.availableResponses++;
 			usage.inputTokens += input;
 			usage.outputTokens += response.output_tokens ?? 0;
-			usage.cacheCreationInputTokens +=
-				response.cache_creation_input_tokens ?? 0;
+			if (hasMeasuredCacheWrite(response)) {
+				usage.cacheCreationInputTokens +=
+					response.cache_creation_input_tokens ?? 0;
+			}
 		} else {
 			usage.unavailableResponses++;
 		}

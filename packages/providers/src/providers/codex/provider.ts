@@ -551,6 +551,7 @@ interface StreamState {
 	outputTokens: number;
 	cacheReadInputTokens: number;
 	cacheCreationInputTokens: number;
+	cacheCreationMeasurementAvailable: boolean;
 	usageMeasurementAvailable: boolean;
 	cacheMeasurementAvailable: boolean;
 	// Anthropic clients expect stop_reason=tool_use when the assistant emitted a tool call.
@@ -608,6 +609,12 @@ function writeCodexStreamTerminalTrace(
 						...(state.cacheMeasurementAvailable
 							? {
 									cache_read_input_tokens: state.cacheReadInputTokens,
+								}
+							: {}),
+						cache_creation_measurement_available:
+							state.cacheCreationMeasurementAvailable,
+						...(state.cacheCreationMeasurementAvailable
+							? {
 									cache_creation_input_tokens: state.cacheCreationInputTokens,
 								}
 							: {}),
@@ -2252,6 +2259,7 @@ export class CodexProvider extends BaseProvider {
 			outputTokens: 0,
 			cacheReadInputTokens: 0,
 			cacheCreationInputTokens: 0,
+			cacheCreationMeasurementAvailable: false,
 			usageMeasurementAvailable: false,
 			cacheMeasurementAvailable: false,
 			contextWindow: null,
@@ -2748,6 +2756,8 @@ export class CodexProvider extends BaseProvider {
 						state.outputTokens = usage.output_tokens;
 					}
 					state.cacheCreationInputTokens = normalized.cacheCreationInputTokens;
+					state.cacheCreationMeasurementAvailable =
+						normalized.cacheCreationMeasurementAvailable;
 				}
 				const respId =
 					typeof resp?.id === "string" && resp.id ? resp.id : state.messageId;
@@ -2982,6 +2992,8 @@ export class CodexProvider extends BaseProvider {
 						state.outputTokens = usage.output_tokens;
 					}
 					state.cacheCreationInputTokens = normalized.cacheCreationInputTokens;
+					state.cacheCreationMeasurementAvailable =
+						normalized.cacheCreationMeasurementAvailable;
 				}
 				if (typeof response?.id === "string" && response.id) {
 					state.traceResponseId = response.id;
@@ -3044,6 +3056,8 @@ export class CodexProvider extends BaseProvider {
 				state.cacheReadInputTokens = normalizedInput.cacheReadInputTokens;
 				state.cacheCreationInputTokens =
 					normalizedInput.cacheCreationInputTokens;
+				state.cacheCreationMeasurementAvailable =
+					normalizedInput.cacheCreationMeasurementAvailable;
 				if (typeof resp?.id === "string" && resp.id) {
 					state.traceResponseId = resp.id;
 				}

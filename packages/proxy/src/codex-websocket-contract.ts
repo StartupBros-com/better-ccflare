@@ -8,6 +8,8 @@ export const CODEX_RESPONSES_HTTP_URL =
 export const CODEX_WS_PERCENT_ENV = "CCFLARE_CODEX_WS_PERCENT";
 export const CODEX_WS_ACCOUNT_IDS_ENV = "CCFLARE_CODEX_WS_ACCOUNT_IDS";
 export const CODEX_WS_MODELS_ENV = "CCFLARE_CODEX_WS_MODELS";
+export const CODEX_WS_COHORT_IDS_ENV = "CCFLARE_CODEX_WS_COHORT_IDS";
+export const CODEX_WS_OBSERVE_ONLY_ENV = "CCFLARE_CODEX_WS_OBSERVE_ONLY";
 export const CODEX_WS_MAX_GLOBAL_ENV = "CCFLARE_CODEX_WS_MAX_GLOBAL";
 export const CODEX_WS_MAX_PER_ACCOUNT_ENV = "CCFLARE_CODEX_WS_MAX_PER_ACCOUNT";
 export const CODEX_WS_IDLE_TTL_MS_ENV = "CCFLARE_CODEX_WS_IDLE_TTL_MS";
@@ -30,6 +32,7 @@ const MAX_FIRST_EVENT_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_GLOBAL_POOL = 256;
 const MAX_PER_ACCOUNT_POOL = 64;
 const ASSIGNMENT_DOMAIN = "better-ccflare:codex-ws-assignment:v1\0";
+const COHORT_DOMAIN = "better-ccflare:codex-ws-cohort:v1\0";
 
 export interface CodexWebSocketOptions {
 	headers: Record<string, string>;
@@ -64,10 +67,12 @@ export type CodexWebSocketFallbackReason =
 	| "cohort_control"
 	| "connection_busy"
 	| "connection_opening"
+	| "cohort_not_allowlisted"
 	| "global_cap"
 	| "lane_identity_busy"
 	| "per_account_cap"
 	| "send_failed_before_write"
+	| "observe_only"
 	| "sticky_http"
 	| "upstream_terminal_error";
 
@@ -97,6 +102,10 @@ export interface CodexWebSocketObservation {
 	fallbackReason: CodexWebSocketFallbackReason | null;
 	fallbackAllowedBeforeWrite: boolean;
 	stickyHttp: boolean;
+	inputTokens: number | null;
+	cachedReadTokens: number | null;
+	cacheWriteTokens: number | null;
+	cacheWriteMeasurementAvailable: boolean;
 }
 
 export interface CodexWebSocketCounters {
@@ -112,6 +121,17 @@ export interface CodexWebSocketCounters {
 	evictions: number;
 	aborts: number;
 	terminals: number;
+	observeOnly: number;
+	cohortNotAllowlisted: number;
+}
+
+export interface CodexWebSocketCacheStats {
+	measuredTerminals: number;
+	inputTokens: number;
+	cachedReadTokens: number;
+	cacheWriteMeasuredTerminals: number;
+	cacheWriteUnavailableTerminals: number;
+	cacheWriteTokens: number;
 }
 
 export interface CodexWebSocketStats {
@@ -121,6 +141,7 @@ export interface CodexWebSocketStats {
 	poolSize: number;
 	stickyHttpSize: number;
 	counters: CodexWebSocketCounters;
+	cache: CodexWebSocketCacheStats;
 	pool: Array<{
 		connectionId: string;
 		accountId: string;
@@ -171,8 +192,10 @@ export interface CodexWebSocketParsedRequest {
 
 export interface CodexWebSocketRuntimeConfig {
 	percent: number;
+	observeOnly: boolean;
 	accountIds: Set<string>;
 	models: Set<string>;
+	cohortIds: Set<string>;
 	maxGlobal: number;
 	maxPerAccount: number;
 	idleTtlMs: number;
@@ -203,6 +226,10 @@ export function readCodexWebSocketTelemetryWarn(): boolean {
 	return raw === "1" || raw?.toLowerCase() === "true";
 }
 
+function strictBoolean(raw: string | undefined): boolean {
+	return raw === "1" || raw?.toLowerCase() === "true";
+}
+
 function csvSet(raw: string | undefined, lowercase = false): Set<string> {
 	return new Set(
 		(raw ?? "")
@@ -216,8 +243,10 @@ function csvSet(raw: string | undefined, lowercase = false): Set<string> {
 export function readCodexWebSocketRuntimeConfig(): CodexWebSocketRuntimeConfig {
 	return {
 		percent: readCodexWebSocketPercent(),
+		observeOnly: strictBoolean(process.env[CODEX_WS_OBSERVE_ONLY_ENV]),
 		accountIds: csvSet(process.env[CODEX_WS_ACCOUNT_IDS_ENV]),
 		models: csvSet(process.env[CODEX_WS_MODELS_ENV], true),
+		cohortIds: csvSet(process.env[CODEX_WS_COHORT_IDS_ENV]),
 		maxGlobal: boundedInteger(
 			process.env[CODEX_WS_MAX_GLOBAL_ENV],
 			DEFAULT_MAX_GLOBAL,
@@ -267,6 +296,24 @@ export function isCodexWebSocketAssigned(
 		.digest()
 		.readUInt16BE(0);
 	return bucket % 100 < percent;
+}
+
+/**
+ * Stable across service restarts so an observe-only cohort can be selected in
+ * a systemd drop-in before the treatment restart. The source conversation key
+ * is already a server-derived prompt-cache digest and is never emitted.
+ */
+export function codexWebSocketCohortId(
+	accountId: string,
+	conversationKey: string,
+): string {
+	return createHash("sha256")
+		.update(COHORT_DOMAIN)
+		.update(accountId)
+		.update("\0")
+		.update(conversationKey)
+		.digest("hex")
+		.slice(0, 16);
 }
 
 export function isOfficialCodexSubscriptionUrl(url: string): boolean {
