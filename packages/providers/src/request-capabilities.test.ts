@@ -1,6 +1,10 @@
-import { beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import type { Account } from "@better-ccflare/types";
-import { registerProvider } from "./registry";
+import { AnthropicProvider } from "./providers/anthropic/provider";
+import { CodexProvider } from "./providers/codex/provider";
+import { QwenProvider } from "./providers/qwen/provider";
+import { XaiProvider } from "./providers/xai/provider";
+import { getProvider, registerProvider, registry } from "./registry";
 import {
 	decideContextAdmission,
 	deriveComboRouteClass,
@@ -27,52 +31,39 @@ const routingAccount = (overrides: Partial<Account> = {}): Account =>
 		...overrides,
 	}) as Account;
 
+const capabilityProviders: Provider[] = [
+	new AnthropicProvider(),
+	new CodexProvider(),
+	new QwenProvider(),
+	new XaiProvider(),
+];
+const previousProviders = new Map<string, Provider | undefined>();
+
 beforeAll(() => {
-	const capabilityProvider = (
-		name: string,
-		supportedFamilies: readonly string[],
-		provenance: "native_passthrough" | "provider_default",
-	): Provider =>
-		({
-			name,
-			getLogicalModelCapability(logicalModel: string) {
-				const supported = supportedFamilies.some((family) =>
-					logicalModel.includes(family),
-				);
-				return {
-					status: supported ? "supported" : "unsupported",
-					provenance,
-					reason: supported ? "included" : "unsupported",
-				};
-			},
-		}) as Provider;
-	registerProvider(
-		capabilityProvider(
-			"anthropic",
-			["fable", "opus", "sonnet", "haiku"],
-			"native_passthrough",
-		),
-	);
-	registerProvider(
-		capabilityProvider(
-			"codex",
-			["opus", "sonnet", "haiku"],
-			"provider_default",
-		),
-	);
-	registerProvider(
-		capabilityProvider("qwen", ["opus", "sonnet", "haiku"], "provider_default"),
-	);
-	registerProvider(
-		capabilityProvider(
-			"xai",
-			["fable", "opus", "sonnet", "haiku"],
-			"provider_default",
-		),
-	);
+	for (const provider of capabilityProviders) {
+		previousProviders.set(provider.name, getProvider(provider.name));
+		registerProvider(provider);
+	}
+});
+
+afterAll(() => {
+	for (const provider of capabilityProviders) {
+		registry.unregisterProvider(provider.name);
+		const previous = previousProviders.get(provider.name);
+		if (previous) registerProvider(previous);
+	}
+	previousProviders.clear();
 });
 
 describe("managed routing capabilities", () => {
+	it("keeps complete built-in providers available to downstream proxy tests", () => {
+		for (const providerName of ["anthropic", "codex", "qwen", "xai"]) {
+			const provider = getProvider(providerName);
+			expect(provider).toBeDefined();
+			expect(provider?.prepareHeaders).toBeFunction();
+		}
+	});
+
 	it("derives provider defaults from blank, non-secret draft metadata", () => {
 		for (const provider of ["anthropic", "codex", "qwen", "xai"]) {
 			expect(
