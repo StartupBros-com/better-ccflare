@@ -174,6 +174,12 @@ export interface CodexWebSocketAttemptInput {
 	attemptId: string;
 	accountId: string;
 	providerName: string;
+	/**
+	 * Server-derived, restart-stable logical conversation digest. This is
+	 * deliberately independent of prompt_cache_key because session-key cache
+	 * experiments can share one cache key across sibling conversations.
+	 */
+	conversationIdentity?: string | null;
 	request: Request;
 	signal: AbortSignal;
 	/** Called synchronously after send() succeeds, before waiting for any event. */
@@ -183,6 +189,7 @@ export interface CodexWebSocketAttemptInput {
 export interface CodexWebSocketParsedRequest {
 	model: string;
 	promptCacheKey: string;
+	assignmentKey: string;
 	laneKey: string;
 	poolKey: string;
 	stickyKey: string;

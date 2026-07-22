@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import {
 	CODEX_RESPONSES_WEBSOCKET_URL,
 	CODEX_WS_ACCOUNT_IDS_ENV,
@@ -152,6 +153,10 @@ function enableCanary(overrides: Record<string, string> = {}): void {
 		process.env[key] = value;
 }
 
+function testConversationIdentity(key: string): string {
+	return createHash("sha256").update(key).digest("hex");
+}
+
 function request(
 	opts: {
 		cacheKey?: string;
@@ -177,6 +182,7 @@ function request(
 				"user-agent": "codex-cli/test",
 				version: "0.144.4",
 				"x-codex-turn-state": "must-not-leak-turn-state",
+				"x-test-conversation-key": opts.cacheKey ?? "private-cache-key",
 			},
 			body: JSON.stringify({
 				type: "must-not-override-response-create",
@@ -210,16 +216,21 @@ function attempt(
 		signal?: AbortSignal;
 		requestId?: string;
 		attemptId?: string;
+		conversationIdentity?: string;
 	} = {},
 ) {
-	return transport.tryRequest({
+	const cacheKey = req.headers.get("x-test-conversation-key") ?? "default";
+	const input = {
 		accountId: opts.accountId ?? "acct-pro",
 		providerName: opts.providerName ?? "codex",
 		request: req,
 		signal: opts.signal ?? new AbortController().signal,
 		requestId: opts.requestId ?? "request-default",
 		attemptId: opts.attemptId ?? "attempt-default",
-	});
+		conversationIdentity:
+			opts.conversationIdentity ?? testConversationIdentity(cacheKey),
+	};
+	return transport.tryRequest(input);
 }
 
 describe("CodexWebSocketTransport eligibility", () => {
@@ -244,7 +255,10 @@ describe("CodexWebSocketTransport eligibility", () => {
 				assignment: "control",
 				effectiveTransport: "http",
 				fallbackReason: "observe_only",
-				cohortId: "83ba6b8f9cccde12",
+				cohortId: codexWebSocketCohortId(
+					"acct-pro",
+					testConversationIdentity("observe-only-key"),
+				),
 			}),
 		]);
 		expect(h.transport.getStats().counters.observeOnly).toBe(1);
@@ -294,6 +308,58 @@ describe("CodexWebSocketTransport eligibility", () => {
 		await selected?.response.text();
 		expect(h.sockets).toHaveLength(1);
 		expect(h.transport.getStats().counters.cohortNotAllowlisted).toBe(1);
+	});
+
+	test("keeps sibling conversations distinct when a session cache key is shared", async () => {
+		process.env[CODEX_WS_OBSERVE_ONLY_ENV] = "true";
+		process.env[CODEX_WS_ACCOUNT_IDS_ENV] = "acct-pro";
+		process.env[CODEX_WS_MODELS_ENV] = "gpt-5.6-sol";
+		const discovery = harness();
+		const sharedSessionCacheKey = "ccflare-session-shared";
+		const firstConversation = "a".repeat(64);
+		const siblingConversation = "b".repeat(64);
+
+		await attempt(
+			discovery.transport,
+			request({ cacheKey: sharedSessionCacheKey, bodyMarker: "first sibling" }),
+			{ conversationIdentity: firstConversation },
+		);
+		await attempt(
+			discovery.transport,
+			request({
+				cacheKey: sharedSessionCacheKey,
+				bodyMarker: "second sibling",
+			}),
+			{ conversationIdentity: siblingConversation },
+		);
+
+		const firstCohort = discovery.observations[0]?.cohortId;
+		const siblingCohort = discovery.observations[1]?.cohortId;
+		expect(firstCohort).toEqual(expect.any(String));
+		expect(siblingCohort).toEqual(expect.any(String));
+		expect(siblingCohort).not.toBe(firstCohort);
+
+		delete process.env[CODEX_WS_OBSERVE_ONLY_ENV];
+		process.env[CODEX_WS_PERCENT_ENV] = "100";
+		process.env[CODEX_WS_COHORT_IDS_ENV] = firstCohort ?? "";
+		const treatment = harness();
+		expect(
+			await attempt(
+				treatment.transport,
+				request({
+					cacheKey: sharedSessionCacheKey,
+					bodyMarker: "second sibling",
+				}),
+				{ conversationIdentity: siblingConversation },
+			),
+		).toBeNull();
+		expect(treatment.sockets).toHaveLength(0);
+		expect(treatment.observations).toContainEqual(
+			expect.objectContaining({
+				cohortId: siblingCohort,
+				fallbackReason: "cohort_not_allowlisted",
+			}),
+		);
 	});
 
 	test("is default-off, requires both allowlists, and assigns deterministic cohorts", async () => {
@@ -384,7 +450,13 @@ describe("CodexWebSocketTransport eligibility", () => {
 		let cacheKey = "";
 		for (let index = 0; index < 1_000; index++) {
 			const candidate = `control-${index}`;
-			if (!isCodexWebSocketAssigned("acct-pro", candidate, 50)) {
+			if (
+				!isCodexWebSocketAssigned(
+					"acct-pro",
+					testConversationIdentity(candidate),
+					50,
+				)
+			) {
 				cacheKey = candidate;
 				break;
 			}
@@ -720,6 +792,7 @@ describe("CodexWebSocketTransport replay boundary", () => {
 		const pending = h.transport.tryRequest({
 			accountId: "acct-pro",
 			providerName: "codex",
+			conversationIdentity: testConversationIdentity("private-cache-key"),
 			request: request(),
 			signal: new AbortController().signal,
 			requestId: "request-handshake",
@@ -776,6 +849,7 @@ describe("CodexWebSocketTransport replay boundary", () => {
 		const result = await h.transport.tryRequest({
 			accountId: "acct-pro",
 			providerName: "codex",
+			conversationIdentity: testConversationIdentity("private-cache-key"),
 			request: request(),
 			signal: new AbortController().signal,
 			requestId: "request-callback",
@@ -802,6 +876,7 @@ describe("CodexWebSocketTransport replay boundary", () => {
 		const pending = h.transport.tryRequest({
 			accountId: "acct-pro",
 			providerName: "codex",
+			conversationIdentity: testConversationIdentity("private-cache-key"),
 			request: request(),
 			signal: new AbortController().signal,
 			requestId: "request-veto",
@@ -1128,6 +1203,7 @@ describe("CodexWebSocketTransport replay boundary", () => {
 			h.transport.tryRequest({
 				accountId: "acct-pro",
 				providerName: "codex",
+				conversationIdentity: testConversationIdentity("private-cache-key"),
 				request: request(),
 				signal: controller.signal,
 				requestId: "request-abort",

@@ -157,6 +157,15 @@ These environment variables are not stored in the configuration file and must be
 | `CF_STREAM_USAGE_BUFFER_KB` | Stream usage buffer size in KB | `64` | `CF_STREAM_USAGE_BUFFER_KB=128` |
 | `CF_STREAM_TIMEOUT_MS` | Stream processing timeout in milliseconds | `60000` (1 minute) | `CF_STREAM_TIMEOUT_MS=120000` |
 
+For a WebSocket cache canary, export the bounded service journal window as JSONL and join it to the matching Codex trace. The analyzer accepts direct transport observations, logger JSON, and `journalctl -o json` records; it excludes duplicate or ambiguous identities and prints aggregate-only output:
+
+```sh
+journalctl -u ccflare-stack.service --since "2026-07-22 12:00:00 UTC" --until "2026-07-22 12:30:00 UTC" -o json > /tmp/codex-ws-observations.jsonl
+bun run packages/providers/src/providers/codex/analyze-trace.ts --cache-experiments --ws-observations /tmp/codex-ws-observations.jsonl /path/to/codex-trace-2026-07-22.jsonl
+```
+
+The raw journal export still contains ephemeral join identities and must be protected and deleted after analysis. The formatted report never emits request or attempt IDs, cohort hashes, account IDs, endpoints, model strings, prompts, or unknown action values.
+
 Model-family capacity handling is integrated into account selection and does not require a standalone feature flag. Fresh Anthropic `limits[]` telemetry is interpreted by scope: exhausted `session` and `weekly_all` windows exclude the account, while an exhausted `weekly_scoped` row excludes only requests for the matching model family when paid overage is confirmed unavailable. Stale, malformed, unrelated, or incomplete scoped telemetry fails open, and observed upstream capacity responses provide short-lived reactive evidence while telemetry catches up.
 
 ## Alerts

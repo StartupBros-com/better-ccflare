@@ -313,6 +313,103 @@ export interface CodexCacheExperimentReport {
 	};
 	pacing: CacheExperimentDimensionReport;
 	explicitBreakpoint: CacheExperimentDimensionReport;
+	websocket: WebSocketCacheExperimentReport;
+}
+
+export type WebSocketExperimentAssignment = "treatment" | "control";
+export type WebSocketExperimentTransport = "websocket" | "http";
+
+/**
+ * Ephemeral join material parsed from transport telemetry. The analyzer never
+ * copies either identity into its report or formatted output.
+ */
+export interface ParsedCodexWebSocketObservation {
+	requestId: string;
+	attemptId: string;
+	assignment: WebSocketExperimentAssignment;
+	effectiveTransport: WebSocketExperimentTransport;
+	action: string;
+	hasFallback: boolean;
+	frameWritten: boolean;
+	fallbackAllowedBeforeWrite: boolean;
+	hasCloseCategory: boolean;
+	terminalMs: number | null;
+	inputTokens: number | null;
+	cachedReadTokens: number | null;
+	cacheWriteTokens: number | null;
+	cacheWriteMeasurementAvailable: boolean;
+}
+
+export interface ParsedCodexWebSocketObservations {
+	observations: ParsedCodexWebSocketObservation[];
+	diagnostics: {
+		lines: number;
+		acceptedLines: number;
+		ignoredLines: number;
+		malformedLines: number;
+		futureSchemaLines: number;
+	};
+}
+
+export interface WebSocketExperimentRow {
+	assignment: WebSocketExperimentAssignment;
+	effectiveTransport: WebSocketExperimentTransport;
+	/** Whitelisted action only; unknown telemetry values collapse to `other`. */
+	action: string;
+	observations: number;
+	joinedTraceResponses: number;
+	unjoinedObservations: number;
+	cache: {
+		measuredResponses: number;
+		unavailableResponses: number;
+		overflowResponses: number;
+		inputTokens: number;
+		cachedReadTokens: number;
+		weightedCachedReadPct: number | null;
+		cacheWriteMeasuredResponses: number;
+		cacheWriteUnavailableResponses: number;
+		cacheWriteOverflowResponses: number;
+		cacheWriteTokens: number;
+	};
+	latency: {
+		availableResponses: number;
+		unavailableResponses: number;
+		p50Ms: number | null;
+		p95Ms: number | null;
+	};
+	outcomes: {
+		terminalResponses: number;
+		terminalErrors: number;
+		preWriteHttpFallbacks: number;
+		postWriteFailures: number;
+		fallbackCategories: Record<string, number>;
+	};
+}
+
+export interface WebSocketCacheExperimentReport {
+	attribution: {
+		unit: "unique_ws_observation_exact_request_and_attempt_join";
+		join: "one_request_and_one_response_with_exact_request_id_and_attempt_id";
+		websocketCache: "terminal_transport_observation";
+		httpCache: "joined_codex_trace_response";
+		websocketLatency: "frame_write_to_terminal_observation_ms";
+		httpLatency: "trace_response_ts_minus_trace_request_ts";
+	};
+	ingestion: {
+		lines: number;
+		acceptedObservations: number;
+		ignoredLines: number;
+		malformedLines: number;
+		futureSchemaLines: number;
+		uniqueObservations: number;
+		duplicateObservationGroups: number;
+		joinedObservations: number;
+		unjoinedObservations: number;
+		ambiguousTraceJoins: number;
+	};
+	assignmentCounts: Record<WebSocketExperimentAssignment, number>;
+	effectiveTransportCounts: Record<WebSocketExperimentTransport, number>;
+	rows: WebSocketExperimentRow[];
 }
 
 function keyOf(call: ToolCall): string {
@@ -872,6 +969,228 @@ const EXPLICIT_BREAKPOINT_ACTIONS = new Set([
 	"skip_rotated_cache_key_attempt",
 ]);
 
+const WS_OBSERVATION_MESSAGE = "codex_ws_transport";
+const WS_OBSERVATION_ACTIONS = new Set([
+	"abort",
+	"buffer_overflow",
+	"cohort_control",
+	"cohort_not_allowlisted",
+	"connection_busy",
+	"connection_opening",
+	"global_cap",
+	"handshake_close",
+	"handshake_error",
+	"handshake_timeout",
+	"lane_identity_busy",
+	"malformed_frame",
+	"observe_only",
+	"per_account_cap",
+	"post_write_close",
+	"post_write_error",
+	"post_write_timeout",
+	"semantic_stall",
+	"send_failed_before_write",
+	"sticky_http",
+	"stream_cancelled",
+	"upstream_terminal_error",
+]);
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function nullableSafeCount(value: unknown): value is number | null {
+	return value === null || safeTokenCount(value);
+}
+
+type WebSocketObservationCandidate =
+	| { kind: "ignored" }
+	| { kind: "malformed" }
+	| { kind: "candidate"; value: Record<string, unknown> };
+
+function extractWebSocketObservationCandidate(
+	value: unknown,
+	depth = 0,
+): WebSocketObservationCandidate {
+	if (!isObjectRecord(value)) return { kind: "ignored" };
+	if (typeof value.MESSAGE === "string" && depth < 2) {
+		const message = value.MESSAGE.trim();
+		try {
+			const nested = JSON.parse(message) as unknown;
+			const extracted = extractWebSocketObservationCandidate(nested, depth + 1);
+			if (extracted.kind !== "ignored") return extracted;
+		} catch {
+			// Pretty logger output is handled by the marker parser below.
+		}
+		const marker = message.indexOf(WS_OBSERVATION_MESSAGE);
+		if (marker < 0) return { kind: "ignored" };
+		const suffix = message.slice(marker + WS_OBSERVATION_MESSAGE.length).trim();
+		try {
+			const parsed = JSON.parse(suffix) as unknown;
+			return isObjectRecord(parsed)
+				? { kind: "candidate", value: parsed }
+				: { kind: "malformed" };
+		} catch {
+			return { kind: "malformed" };
+		}
+	}
+	if (value.msg === WS_OBSERVATION_MESSAGE) {
+		return isObjectRecord(value.data)
+			? { kind: "candidate", value: value.data }
+			: { kind: "malformed" };
+	}
+	if (
+		"requestId" in value ||
+		"attemptId" in value ||
+		"assignment" in value ||
+		"effectiveTransport" in value
+	) {
+		return { kind: "candidate", value };
+	}
+	return { kind: "ignored" };
+}
+
+type ParsedWebSocketObservationLine =
+	| { kind: "accepted"; observation: ParsedCodexWebSocketObservation }
+	| { kind: "malformed" }
+	| { kind: "future" };
+
+function parseWebSocketObservation(
+	value: Record<string, unknown>,
+): ParsedWebSocketObservationLine {
+	const schemaVersion =
+		value.observationSchemaVersion ??
+		value.observation_schema_version ??
+		value.schemaVersion ??
+		value.schema_version;
+	if (schemaVersion !== undefined) {
+		if (!Number.isSafeInteger(schemaVersion) || Number(schemaVersion) < 1)
+			return { kind: "malformed" };
+		if (Number(schemaVersion) > 1) return { kind: "future" };
+	}
+	if (
+		typeof value.requestId !== "string" ||
+		value.requestId.length === 0 ||
+		value.requestId.length > 1_024 ||
+		typeof value.attemptId !== "string" ||
+		value.attemptId.length === 0 ||
+		value.attemptId.length > 1_024 ||
+		(value.assignment !== "treatment" && value.assignment !== "control") ||
+		(value.effectiveTransport !== "websocket" &&
+			value.effectiveTransport !== "http") ||
+		typeof value.frameWritten !== "boolean" ||
+		typeof value.fallbackAllowedBeforeWrite !== "boolean" ||
+		typeof value.cacheWriteMeasurementAvailable !== "boolean" ||
+		(value.fallbackReason !== null &&
+			typeof value.fallbackReason !== "string") ||
+		(value.closeCategory !== null && typeof value.closeCategory !== "string") ||
+		!nullableSafeCount(value.terminalMs) ||
+		!nullableSafeCount(value.inputTokens) ||
+		!nullableSafeCount(value.cachedReadTokens) ||
+		!nullableSafeCount(value.cacheWriteTokens)
+	) {
+		return { kind: "malformed" };
+	}
+	const fallback = value.fallbackReason;
+	const action =
+		typeof fallback === "string" && fallback.length > 0
+			? WS_OBSERVATION_ACTIONS.has(fallback)
+				? fallback
+				: "other"
+			: value.effectiveTransport === "websocket"
+				? "websocket_terminal"
+				: value.assignment === "control"
+					? "http_control"
+					: "http_bypass";
+	return {
+		kind: "accepted",
+		observation: {
+			requestId: value.requestId,
+			attemptId: value.attemptId,
+			assignment: value.assignment,
+			effectiveTransport: value.effectiveTransport,
+			action,
+			hasFallback: typeof fallback === "string" && fallback.length > 0,
+			frameWritten: value.frameWritten,
+			fallbackAllowedBeforeWrite: value.fallbackAllowedBeforeWrite,
+			hasCloseCategory:
+				typeof value.closeCategory === "string" &&
+				value.closeCategory.length > 0,
+			terminalMs: value.terminalMs,
+			inputTokens: value.inputTokens,
+			cachedReadTokens: value.cachedReadTokens,
+			cacheWriteTokens: value.cacheWriteTokens,
+			cacheWriteMeasurementAvailable: value.cacheWriteMeasurementAvailable,
+		},
+	};
+}
+
+/**
+ * Parse direct observation JSONL, Logger JSONL, or `journalctl -o json` output.
+ * Sensitive telemetry fields are discarded immediately; only ephemeral exact
+ * join identities plus aggregate-safe enums and measurements are retained.
+ */
+export function parseCodexWebSocketObservationsJsonl(
+	text: string,
+): ParsedCodexWebSocketObservations {
+	const result: ParsedCodexWebSocketObservations = {
+		observations: [],
+		diagnostics: {
+			lines: 0,
+			acceptedLines: 0,
+			ignoredLines: 0,
+			malformedLines: 0,
+			futureSchemaLines: 0,
+		},
+	};
+	for (const rawLine of text.split(/\r?\n/)) {
+		const line = rawLine.trim();
+		if (!line) continue;
+		result.diagnostics.lines++;
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(line) as unknown;
+		} catch {
+			result.diagnostics.malformedLines++;
+			continue;
+		}
+		const candidate = extractWebSocketObservationCandidate(parsed);
+		if (candidate.kind === "ignored") {
+			result.diagnostics.ignoredLines++;
+			continue;
+		}
+		if (candidate.kind === "malformed") {
+			result.diagnostics.malformedLines++;
+			continue;
+		}
+		const observation = parseWebSocketObservation(candidate.value);
+		if (observation.kind === "future") {
+			result.diagnostics.futureSchemaLines++;
+			continue;
+		}
+		if (observation.kind === "malformed") {
+			result.diagnostics.malformedLines++;
+			continue;
+		}
+		result.observations.push(observation.observation);
+		result.diagnostics.acceptedLines++;
+	}
+	return result;
+}
+
+function emptyParsedCodexWebSocketObservations(): ParsedCodexWebSocketObservations {
+	return {
+		observations: [],
+		diagnostics: {
+			lines: 0,
+			acceptedLines: 0,
+			ignoredLines: 0,
+			malformedLines: 0,
+			futureSchemaLines: 0,
+		},
+	};
+}
+
 interface CacheExperimentLogicalSample {
 	request: TraceRecord;
 	attempts: TraceRecord[];
@@ -1425,12 +1744,367 @@ function cacheExperimentDimension(
 	return { assignmentCounts, rows: finishedRows };
 }
 
+interface WebSocketExperimentRowAccumulator extends WebSocketExperimentRow {
+	latencySamples: number[];
+}
+
+function webSocketObservationJoinKey(
+	requestId: string,
+	attemptId: string,
+): string {
+	return `${requestId.length}:${requestId}${attemptId.length}:${attemptId}`;
+}
+
+function webSocketRowAccumulator(
+	observation: ParsedCodexWebSocketObservation,
+): WebSocketExperimentRowAccumulator {
+	return {
+		assignment: observation.assignment,
+		effectiveTransport: observation.effectiveTransport,
+		action: observation.action,
+		observations: 0,
+		joinedTraceResponses: 0,
+		unjoinedObservations: 0,
+		cache: {
+			measuredResponses: 0,
+			unavailableResponses: 0,
+			overflowResponses: 0,
+			inputTokens: 0,
+			cachedReadTokens: 0,
+			weightedCachedReadPct: null,
+			cacheWriteMeasuredResponses: 0,
+			cacheWriteUnavailableResponses: 0,
+			cacheWriteOverflowResponses: 0,
+			cacheWriteTokens: 0,
+		},
+		latency: {
+			availableResponses: 0,
+			unavailableResponses: 0,
+			p50Ms: null,
+			p95Ms: null,
+		},
+		outcomes: {
+			terminalResponses: 0,
+			terminalErrors: 0,
+			preWriteHttpFallbacks: 0,
+			postWriteFailures: 0,
+			fallbackCategories: {
+				control: 0,
+				pre_write: 0,
+				post_write: 0,
+				none: 0,
+				other: 0,
+			},
+		},
+		latencySamples: [],
+	};
+}
+
+function webSocketFallbackCategory(
+	observation: ParsedCodexWebSocketObservation,
+): "control" | "pre_write" | "post_write" | "none" | "other" {
+	if (!observation.hasFallback && !observation.hasCloseCategory) return "none";
+	if (observation.assignment === "control") return "control";
+	if (observation.effectiveTransport === "http" && !observation.frameWritten)
+		return "pre_write";
+	if (
+		observation.effectiveTransport === "websocket" &&
+		observation.frameWritten
+	)
+		return "post_write";
+	return "other";
+}
+
+function finishWebSocketExperimentRow(
+	row: WebSocketExperimentRowAccumulator,
+): WebSocketExperimentRow {
+	return {
+		assignment: row.assignment,
+		effectiveTransport: row.effectiveTransport,
+		action: row.action,
+		observations: row.observations,
+		joinedTraceResponses: row.joinedTraceResponses,
+		unjoinedObservations: row.unjoinedObservations,
+		cache: {
+			...row.cache,
+			weightedCachedReadPct:
+				row.cache.inputTokens > 0
+					? Math.round(
+							(row.cache.cachedReadTokens / row.cache.inputTokens) * 1000,
+						) / 10
+					: null,
+		},
+		latency: {
+			availableResponses: row.latency.availableResponses,
+			unavailableResponses: row.latency.unavailableResponses,
+			p50Ms: percentile(row.latencySamples, 0.5),
+			p95Ms: percentile(row.latencySamples, 0.95),
+		},
+		outcomes: {
+			...row.outcomes,
+			fallbackCategories: Object.fromEntries(
+				Object.entries(row.outcomes.fallbackCategories).sort(([a], [b]) =>
+					a.localeCompare(b),
+				),
+			),
+		},
+	};
+}
+
+function addWebSocketCacheMeasurement(
+	row: WebSocketExperimentRowAccumulator,
+	inputTokens: unknown,
+	cachedReadTokens: unknown,
+): void {
+	if (
+		!safeTokenCount(inputTokens) ||
+		!safeTokenCount(cachedReadTokens) ||
+		cachedReadTokens > inputTokens
+	) {
+		row.cache.unavailableResponses++;
+		return;
+	}
+	const nextInput = safeTokenSum(row.cache.inputTokens, inputTokens);
+	const nextRead = safeTokenSum(row.cache.cachedReadTokens, cachedReadTokens);
+	if (nextInput === null || nextRead === null) {
+		row.cache.overflowResponses++;
+		return;
+	}
+	row.cache.measuredResponses++;
+	row.cache.inputTokens = nextInput;
+	row.cache.cachedReadTokens = nextRead;
+}
+
+function addWebSocketCacheWriteMeasurement(
+	row: WebSocketExperimentRowAccumulator,
+	available: boolean,
+	cacheWriteTokens: unknown,
+): void {
+	if (!available || !safeTokenCount(cacheWriteTokens)) {
+		row.cache.cacheWriteUnavailableResponses++;
+		return;
+	}
+	const nextWrite = safeTokenSum(row.cache.cacheWriteTokens, cacheWriteTokens);
+	if (nextWrite === null) {
+		row.cache.cacheWriteOverflowResponses++;
+		return;
+	}
+	row.cache.cacheWriteMeasuredResponses++;
+	row.cache.cacheWriteTokens = nextWrite;
+}
+
+function analyzeWebSocketCacheExperiments(
+	records: readonly TraceRecord[],
+	parsed: ParsedCodexWebSocketObservations,
+): WebSocketCacheExperimentReport {
+	const observationGroups = new Map<
+		string,
+		ParsedCodexWebSocketObservation[]
+	>();
+	for (const observation of parsed.observations) {
+		const key = webSocketObservationJoinKey(
+			observation.requestId,
+			observation.attemptId,
+		);
+		const group = observationGroups.get(key) ?? [];
+		group.push(observation);
+		observationGroups.set(key, group);
+	}
+	const uniqueObservations: ParsedCodexWebSocketObservation[] = [];
+	let duplicateObservationGroups = 0;
+	for (const group of observationGroups.values()) {
+		if (group.length !== 1) {
+			duplicateObservationGroups++;
+			continue;
+		}
+		const observation = group[0];
+		if (observation) uniqueObservations.push(observation);
+	}
+
+	const traceRequests = new Map<string, TraceRecord[]>();
+	const traceResponses = new Map<string, TraceRecord[]>();
+	for (const record of records) {
+		if (
+			typeof record.request_id !== "string" ||
+			record.request_id.length === 0 ||
+			typeof record.attempt_id !== "string" ||
+			record.attempt_id.length === 0
+		)
+			continue;
+		const key = webSocketObservationJoinKey(
+			record.request_id,
+			record.attempt_id,
+		);
+		appendRecord(
+			(record.phase ?? "request") === "request"
+				? traceRequests
+				: traceResponses,
+			key,
+			record,
+		);
+	}
+
+	const assignmentCounts: Record<WebSocketExperimentAssignment, number> = {
+		control: 0,
+		treatment: 0,
+	};
+	const effectiveTransportCounts: Record<WebSocketExperimentTransport, number> =
+		{
+			http: 0,
+			websocket: 0,
+		};
+	const rows = new Map<string, WebSocketExperimentRowAccumulator>();
+	let joinedObservations = 0;
+	let unjoinedObservations = 0;
+	let ambiguousTraceJoins = 0;
+	for (const observation of uniqueObservations) {
+		assignmentCounts[observation.assignment]++;
+		effectiveTransportCounts[observation.effectiveTransport]++;
+		const rowKey = [
+			observation.assignment,
+			observation.effectiveTransport,
+			observation.action,
+		].join("\u0000");
+		let row = rows.get(rowKey);
+		if (!row) {
+			row = webSocketRowAccumulator(observation);
+			rows.set(rowKey, row);
+		}
+		row.observations++;
+
+		const joinKey = webSocketObservationJoinKey(
+			observation.requestId,
+			observation.attemptId,
+		);
+		const requests = traceRequests.get(joinKey) ?? [];
+		const responses = traceResponses.get(joinKey) ?? [];
+		if (requests.length !== 1 || responses.length !== 1) {
+			if (requests.length > 1 || responses.length > 1) ambiguousTraceJoins++;
+			unjoinedObservations++;
+			row.unjoinedObservations++;
+			continue;
+		}
+		const request = requests[0];
+		const response = responses[0];
+		if (!request || !response) {
+			unjoinedObservations++;
+			row.unjoinedObservations++;
+			continue;
+		}
+		joinedObservations++;
+		row.joinedTraceResponses++;
+		row.outcomes.terminalResponses++;
+		const postWriteFailure =
+			observation.effectiveTransport === "websocket" &&
+			observation.frameWritten &&
+			(observation.hasFallback || observation.hasCloseCategory);
+		if (response.stop_reason === "error" || postWriteFailure)
+			row.outcomes.terminalErrors++;
+		if (
+			observation.assignment === "treatment" &&
+			observation.effectiveTransport === "http" &&
+			!observation.frameWritten &&
+			observation.hasFallback
+		)
+			row.outcomes.preWriteHttpFallbacks++;
+		if (postWriteFailure) row.outcomes.postWriteFailures++;
+		increment(
+			row.outcomes.fallbackCategories,
+			webSocketFallbackCategory(observation),
+		);
+
+		if (observation.effectiveTransport === "websocket") {
+			addWebSocketCacheMeasurement(
+				row,
+				observation.inputTokens,
+				observation.cachedReadTokens,
+			);
+			addWebSocketCacheWriteMeasurement(
+				row,
+				observation.cacheWriteMeasurementAvailable,
+				observation.cacheWriteTokens,
+			);
+			if (safeTokenCount(observation.terminalMs)) {
+				row.latency.availableResponses++;
+				row.latencySamples.push(observation.terminalMs);
+			} else row.latency.unavailableResponses++;
+		} else {
+			addWebSocketCacheMeasurement(
+				row,
+				response.input_tokens,
+				response.cache_read_input_tokens,
+			);
+			addWebSocketCacheWriteMeasurement(
+				row,
+				hasMeasuredCacheWrite(response),
+				response.cache_creation_input_tokens,
+			);
+			const requestTimestamp = request.ts ? Date.parse(request.ts) : Number.NaN;
+			const responseTimestamp = response.ts
+				? Date.parse(response.ts)
+				: Number.NaN;
+			const elapsedMs = responseTimestamp - requestTimestamp;
+			if (
+				Number.isFinite(requestTimestamp) &&
+				Number.isFinite(responseTimestamp) &&
+				responseTimestamp >= requestTimestamp &&
+				Number.isSafeInteger(elapsedMs)
+			) {
+				row.latency.availableResponses++;
+				row.latencySamples.push(elapsedMs);
+			} else row.latency.unavailableResponses++;
+		}
+	}
+
+	const finishedRows = [...rows.values()].map(finishWebSocketExperimentRow);
+	finishedRows.sort(
+		(a, b) =>
+			(a.assignment === b.assignment
+				? 0
+				: a.assignment === "control"
+					? -1
+					: 1) ||
+			(a.effectiveTransport === b.effectiveTransport
+				? 0
+				: a.effectiveTransport === "http"
+					? -1
+					: 1) ||
+			a.action.localeCompare(b.action),
+	);
+	return {
+		attribution: {
+			unit: "unique_ws_observation_exact_request_and_attempt_join",
+			join: "one_request_and_one_response_with_exact_request_id_and_attempt_id",
+			websocketCache: "terminal_transport_observation",
+			httpCache: "joined_codex_trace_response",
+			websocketLatency: "frame_write_to_terminal_observation_ms",
+			httpLatency: "trace_response_ts_minus_trace_request_ts",
+		},
+		ingestion: {
+			lines: parsed.diagnostics.lines,
+			acceptedObservations: parsed.diagnostics.acceptedLines,
+			ignoredLines: parsed.diagnostics.ignoredLines,
+			malformedLines: parsed.diagnostics.malformedLines,
+			futureSchemaLines: parsed.diagnostics.futureSchemaLines,
+			uniqueObservations: uniqueObservations.length,
+			duplicateObservationGroups,
+			joinedObservations,
+			unjoinedObservations,
+			ambiguousTraceJoins,
+		},
+		assignmentCounts,
+		effectiveTransportCounts,
+		rows: finishedRows,
+	};
+}
+
 /**
  * Privacy-safe, opt-in cache experiment analysis. Cohort hashes and join IDs
  * are used only in-memory and never appear in the returned report.
  */
 export function analyzeCodexCacheExperiments(
 	records: readonly TraceRecord[],
+	websocketObservations = emptyParsedCodexWebSocketObservations(),
 ): CodexCacheExperimentReport {
 	const samples = cacheExperimentLogicalSamples(records);
 	return {
@@ -1446,6 +2120,7 @@ export function analyzeCodexCacheExperiments(
 		},
 		pacing: cacheExperimentDimension(samples, "pacing"),
 		explicitBreakpoint: cacheExperimentDimension(samples, "explicitBreakpoint"),
+		websocket: analyzeWebSocketCacheExperiments(records, websocketObservations),
 	};
 }
 
@@ -2026,23 +2701,53 @@ export function formatCacheExperimentReport(
 	};
 	append("PACING BYPASS CANARY", report.pacing);
 	append("EXPLICIT BREAKPOINT CANARY", report.explicitBreakpoint);
+	lines.push(
+		"",
+		`WEBSOCKET TRANSPORT CANARY: assignments=${JSON.stringify(report.websocket.assignmentCounts)} effective_transports=${JSON.stringify(report.websocket.effectiveTransportCounts)} ingestion=${JSON.stringify(report.websocket.ingestion)}`,
+	);
+	for (const row of report.websocket.rows)
+		lines.push(`  ${JSON.stringify(row)}`);
 	return lines.join("\n");
 }
 
 if (import.meta.main) {
 	const args = process.argv.slice(2);
 	const cacheExperiments = args.includes("--cache-experiments");
-	const file = args.find((arg) => arg !== "--cache-experiments");
-	if (!file) {
+	let websocketObservationsFile: string | undefined;
+	const files: string[] = [];
+	for (let index = 0; index < args.length; index++) {
+		const arg = args[index];
+		if (arg === "--cache-experiments") continue;
+		if (arg === "--ws-observations") {
+			websocketObservationsFile = args[index + 1];
+			index++;
+			continue;
+		}
+		if (arg) files.push(arg);
+	}
+	const file = files[0];
+	if (
+		!file ||
+		files.length !== 1 ||
+		(args.includes("--ws-observations") && !websocketObservationsFile) ||
+		(websocketObservationsFile !== undefined && !cacheExperiments)
+	) {
 		console.error(
-			"usage: bun run analyze-trace.ts [--cache-experiments] <codex-trace.jsonl>",
+			"usage: bun run analyze-trace.ts [--cache-experiments [--ws-observations <codex-ws-observations.jsonl>]] <codex-trace.jsonl>",
 		);
 		process.exit(1);
 	}
 	const records = parseTraceJsonl(readFileSync(file, "utf8"));
+	const websocketObservations = websocketObservationsFile
+		? parseCodexWebSocketObservationsJsonl(
+				readFileSync(websocketObservationsFile, "utf8"),
+			)
+		: emptyParsedCodexWebSocketObservations();
 	console.log(
 		cacheExperiments
-			? formatCacheExperimentReport(analyzeCodexCacheExperiments(records))
+			? formatCacheExperimentReport(
+					analyzeCodexCacheExperiments(records, websocketObservations),
+				)
 			: formatReport(analyzeCodexTrace(records)),
 	);
 }

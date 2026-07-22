@@ -48,6 +48,7 @@ const INTERNAL_HEADERS = [
 	"x-better-ccflare-pacing-canary",
 	"x-better-ccflare-pacing-cohort-id",
 	"x-better-ccflare-pacing-action",
+	"x-better-ccflare-codex-conversation-id",
 ];
 
 function sanitizeResponseHeaders(headers: Headers): Headers {
@@ -71,6 +72,12 @@ const CODEX_SYNTHETIC_COUNT_TOKENS_URL =
 const CODEX_SYNTHETIC_RESPONSE_URL =
 	"https://better-ccflare.local/codex/response";
 export const CODEX_PROMPT_CACHE_KEY_ENV = "CCFLARE_CODEX_PROMPT_CACHE_KEY";
+/**
+ * Trusted provider-to-proxy carrier for the privacy-safe WebSocket conversation
+ * digest. The proxy strips it before every upstream transport.
+ */
+export const CODEX_CONVERSATION_ID_HEADER =
+	"x-better-ccflare-codex-conversation-id";
 /** "conversation" (default) or "session"; see derivePromptCacheKey. */
 export const CODEX_CACHE_KEY_MODE_ENV = "CCFLARE_CODEX_CACHE_KEY_MODE";
 export const CODEX_CACHE_KEY_SESSION_PERCENT_ENV =
@@ -84,6 +91,8 @@ const CODEX_CACHE_KEY_COHORT_DOMAIN =
 const CODEX_CACHE_LANE_RESCUE_DOMAIN =
 	"better-ccflare:codex-cache-lane-rescue:v1\0";
 const CODEX_CACHE_LANE_RESCUE_SALT_MAX_CHARS = 128;
+const CODEX_WEBSOCKET_CONVERSATION_DOMAIN =
+	"better-ccflare:codex-ws-conversation:v1\0";
 const CODEX_EXPLICIT_BREAKPOINT_BUCKET_DOMAIN =
 	"better-ccflare:codex-gpt56-explicit-breakpoint-canary:v1\0";
 const CODEX_EXPLICIT_BREAKPOINT_COHORT_DOMAIN =
@@ -416,6 +425,7 @@ export interface CodexPromptCacheKeyDecision {
 	effectiveMode: "conversation" | "session" | null;
 	cohortId: string | null;
 	conversationIdentity: string | null;
+	webSocketConversationIdentity: string | null;
 }
 
 export type CodexExplicitBreakpointAction =
@@ -957,6 +967,13 @@ export class CodexProvider extends BaseProvider {
 				"x-better-ccflare-request-stream",
 				body.stream === true ? "true" : "false",
 			);
+			newHeaders.delete(CODEX_CONVERSATION_ID_HEADER);
+			if (cacheKeyDecision.webSocketConversationIdentity) {
+				newHeaders.set(
+					CODEX_CONVERSATION_ID_HEADER,
+					cacheKeyDecision.webSocketConversationIdentity,
+				);
+			}
 
 			newHeaders.delete("x-better-ccflare-request-id");
 			newHeaders.delete("x-better-ccflare-attempt-id");
@@ -1281,6 +1298,52 @@ export class CodexProvider extends BaseProvider {
 	}
 
 	/**
+	 * Derive a conservative WebSocket conversation identity from tool lineage.
+	 *
+	 * Claude Code can deliberately share one prompt_cache_key across a root and
+	 * its sibling agents. Conversely, its history compaction can drop the first
+	 * user item used by deriveConversationIdentity(). Tool call IDs are scoped to
+	 * one logical conversation and survive the common prefix-drop compaction
+	 * shape as either a function_call or function_call_output. Hashing the first
+	 * surviving call ID with the validated session keeps ordinary follow-ups and
+	 * compacted continuations together without exposing either value.
+	 *
+	 * Requests without a trustworthy tool-lineage anchor intentionally return
+	 * null. WebSocket treatment must fail closed rather than widen to a shared
+	 * session identity.
+	 */
+	private deriveWebSocketConversationIdentity(
+		sessionId: string,
+		input: readonly unknown[],
+	): string | null {
+		for (const item of input) {
+			if (!item || typeof item !== "object") continue;
+			const record = item as Record<string, unknown>;
+			if (
+				record.type !== "function_call" &&
+				record.type !== "function_call_output"
+			) {
+				continue;
+			}
+			const callId = record.call_id;
+			if (
+				typeof callId !== "string" ||
+				callId.length === 0 ||
+				callId.length > 512
+			) {
+				continue;
+			}
+			return createHash("sha256")
+				.update(CODEX_WEBSOCKET_CONVERSATION_DOMAIN)
+				.update(sessionId.toLowerCase())
+				.update("\0")
+				.update(callId)
+				.digest("hex");
+		}
+		return null;
+	}
+
+	/**
 	 * OpenAI routes each request to a cache machine by hashing the prompt's
 	 * initial tokens together with prompt_cache_key, and documents that one key
 	 * should stay under ~15 requests/minute or "some requests may miss the
@@ -1312,6 +1375,7 @@ export class CodexProvider extends BaseProvider {
 			effectiveMode: null,
 			cohortId: null,
 			conversationIdentity: null,
+			webSocketConversationIdentity: null,
 		};
 		if (process.env[CODEX_PROMPT_CACHE_KEY_ENV] === "0") return ineligible;
 		if (!isOpenAiPromptCacheEndpoint(account)) return ineligible;
@@ -1320,6 +1384,8 @@ export class CodexProvider extends BaseProvider {
 
 		const conversationIdentity =
 			deriveConversationIdentity(sessionId, instructions, input) ?? null;
+		const webSocketConversationIdentity =
+			this.deriveWebSocketConversationIdentity(sessionId, input);
 		const sessionPercent = readCodexCacheKeySessionPercent();
 		const assignment: "conversation" | "session" =
 			sessionPercent === 100 ||
@@ -1365,6 +1431,7 @@ export class CodexProvider extends BaseProvider {
 				.digest("hex")
 				.slice(0, 16),
 			conversationIdentity,
+			webSocketConversationIdentity,
 		};
 	}
 

@@ -257,7 +257,7 @@ export class CodexWebSocketTransport {
 		if (
 			!isCodexWebSocketAssigned(
 				input.accountId,
-				parsed.promptCacheKey,
+				parsed.assignmentKey,
 				config.percent,
 			)
 		) {
@@ -426,10 +426,12 @@ export class CodexWebSocketTransport {
 			typeof payload.prompt_cache_key === "string"
 				? payload.prompt_cache_key
 				: "";
+		const conversationIdentity = input.conversationIdentity ?? "";
 		if (
 			payload.stream !== true ||
 			!model ||
 			!promptCacheKey ||
+			!/^[0-9a-f]{64}$/.test(conversationIdentity) ||
 			!config.models.has(model.toLowerCase())
 		) {
 			return null;
@@ -439,29 +441,31 @@ export class CodexWebSocketTransport {
 		const authFingerprint = opaqueRuntimeId("codex-ws-auth", authorization);
 		const framePayload = { ...payload };
 		delete framePayload.previous_response_id;
+		const assignmentKey = conversationIdentity;
 		const laneKey = opaqueRuntimeId(
 			"codex-ws-lane",
 			input.accountId,
-			promptCacheKey,
+			conversationIdentity,
 		);
 		const poolKey = opaqueRuntimeId(
 			"codex-ws-connection",
 			input.accountId,
-			promptCacheKey,
+			conversationIdentity,
 			model,
 			authFingerprint,
 		);
 		return {
 			model,
 			promptCacheKey,
+			assignmentKey,
 			laneKey,
 			poolKey,
 			stickyKey: opaqueRuntimeId(
 				"codex-ws-sticky",
 				input.accountId,
-				promptCacheKey,
+				conversationIdentity,
 			),
-			cohortId: codexWebSocketCohortId(input.accountId, promptCacheKey),
+			cohortId: codexWebSocketCohortId(input.accountId, assignmentKey),
 			// Delay the only full-history reserialization until after cohort, sticky,
 			// busy, identity, and capacity fallbacks have all been ruled out.
 			framePayload,
