@@ -67,6 +67,19 @@ export interface BatchStatement {
 	expectedChanges?: number;
 }
 
+export class BatchExpectedChangesError extends Error {
+	constructor(
+		readonly statementIndex: number,
+		readonly expectedChanges: number,
+		readonly actualChanges: number,
+	) {
+		super(
+			`Batch statement ${statementIndex + 1} expected ${expectedChanges} change(s), got ${actualChanges}`,
+		);
+		this.name = "BatchExpectedChangesError";
+	}
+}
+
 function assertExpectedChanges(
 	statement: BatchStatement,
 	actualChanges: number,
@@ -76,8 +89,10 @@ function assertExpectedChanges(
 		statement.expectedChanges !== undefined &&
 		actualChanges !== statement.expectedChanges
 	) {
-		throw new Error(
-			`Batch statement ${index + 1} expected ${statement.expectedChanges} change(s), got ${actualChanges}`,
+		throw new BatchExpectedChangesError(
+			index,
+			statement.expectedChanges,
+			actualChanges,
 		);
 	}
 }
@@ -298,11 +313,17 @@ export class BunSqlAdapter {
 	): Promise<number> {
 		if (this.isSQLite && this.sqliteDb) {
 			const db = this.sqliteDb;
-			const result = await this.withBusyRetry(() =>
+			return this.withBusyRetry(() => {
+				// `db.run().changes` includes writes made by AFTER triggers. The SQL
+				// changes() function reports only the outer statement, which is the
+				// portable count checked by the PostgreSQL path and repository CAS.
 				// biome-ignore lint/suspicious/noExplicitAny: SQLite params can be any binding type
-				db.run(sqlStr, params as any[]),
-			);
-			return result.changes;
+				db.run(sqlStr, params as any[]);
+				return (
+					db.query<{ changes: number }, []>("SELECT changes() AS changes").get()
+						?.changes ?? 0
+				);
+			});
 		}
 		const pgQuery = this.pgSql(sqlStr);
 		const result = await this.withPgTimeout(
@@ -320,16 +341,17 @@ export class BunSqlAdapter {
 		if (this.isSQLite && this.sqliteDb) {
 			const db = this.sqliteDb;
 			return this.withBusyRetry(() =>
-				db.transaction(() =>
-					statements.map((statement, index) => {
-						const actualChanges = db.run(
-							statement.sql,
-							(statement.params ?? []) as never[],
-						).changes;
+				db.transaction(() => {
+					const changesQuery = db.query<{ changes: number }, []>(
+						"SELECT changes() AS changes",
+					);
+					return statements.map((statement, index) => {
+						db.run(statement.sql, (statement.params ?? []) as never[]);
+						const actualChanges = changesQuery.get()?.changes ?? 0;
 						assertExpectedChanges(statement, actualChanges, index);
 						return actualChanges;
-					}),
-				)(),
+					});
+				})(),
 			);
 		}
 		if (!this.sql) throw new Error("SQL client not available for transaction");

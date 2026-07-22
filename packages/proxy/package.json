@@ -4,7 +4,8 @@
 	"type": "module",
 	"main": "./src/index.ts",
 	"exports": {
-		".": "./src/index.ts"
+		".": "./src/index.ts",
+		"./usage-throttling": "./src/handlers/usage-throttling.ts"
 	},
 	"scripts": {
 		"typecheck": "bunx tsc --noEmit"

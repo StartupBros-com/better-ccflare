@@ -326,6 +326,13 @@ function blockedProposal(
 	existingRuleId: string | null = null,
 ): ComboEnrollmentRuleProposal {
 	return {
+		proposal_id: createComboEnrollmentRuleProposalId({
+			family: snapshot.assignment.family,
+			comboId: snapshot.combo?.id ?? snapshot.assignment.combo_id ?? "",
+			provider,
+			routeClass,
+			managedModel,
+		}),
 		family: snapshot.assignment.family,
 		combo_id: snapshot.combo?.id ?? snapshot.assignment.combo_id ?? "",
 		provider,
@@ -339,11 +346,44 @@ function blockedProposal(
 	};
 }
 
+export function createComboEnrollmentRuleProposalId(input: {
+	family: ComboFamily;
+	comboId: string;
+	provider: string;
+	routeClass: ComboRouteClass;
+	managedModel: string;
+}): string {
+	return [
+		"proposal",
+		input.family,
+		input.comboId,
+		input.provider,
+		input.routeClass,
+		input.managedModel,
+	].join(":");
+}
+
+export function resolveComboProposalManagedModel(
+	snapshot: ComboRoutingPolicySnapshot,
+	reviewedOverride?: string,
+): string {
+	for (const candidate of [
+		reviewedOverride,
+		snapshot.assignment.managed_model ?? undefined,
+	]) {
+		if (candidate && getModelFamily(candidate) === snapshot.assignment.family) {
+			return candidate;
+		}
+	}
+	return LATEST_MODEL_BY_FAMILY[snapshot.assignment.family];
+}
+
 export function proposeComboEnrollmentRules(
 	snapshot: ComboRoutingPolicySnapshot,
 	accounts: readonly Account[],
 	draftAccount: Account,
 	deps: ComboResolverDependencies,
+	options: { managedModel?: string } = {},
 ): ComboEnrollmentRuleProposal[] {
 	if (
 		!snapshot.assignment.enabled ||
@@ -356,7 +396,10 @@ export function proposeComboEnrollmentRules(
 
 	const routeClass = deps.deriveRouteClass(draftAccount);
 	if (!routeClass) return [];
-	const managedModel = LATEST_MODEL_BY_FAMILY[snapshot.assignment.family];
+	const managedModel = resolveComboProposalManagedModel(
+		snapshot,
+		options.managedModel,
+	);
 	const base = (
 		reason: ComboMembershipReasonCode,
 		existingRuleId: string | null = null,
@@ -376,16 +419,51 @@ export function proposeComboEnrollmentRules(
 			rule.provider === draftAccount.provider &&
 			rule.route_class === routeClass,
 	);
-	if (matchingRules.some((rule) => rule.enabled)) return [];
-	if (matchingRules.length === 1) {
-		return [base("disabled", matchingRules[0].id)];
-	}
 	if (matchingRules.length > 1) return [base("ambiguous")];
 	const peerAccounts = new Map(
 		accounts.map((current) => [current.id, current]),
 	);
-	const peerSlots = snapshot.slots.filter((slot) => slot.enabled);
-	if (peerSlots.length === 0) return [base("ambiguous")];
+	if (matchingRules.length === 1) {
+		const [matchingRule] = matchingRules;
+		if (!matchingRule.enabled) {
+			return [base("disabled", matchingRule.id)];
+		}
+		if (
+			snapshot.exclusions.some(
+				(exclusion) =>
+					exclusion.combo_id === snapshot.combo?.id &&
+					exclusion.family === snapshot.assignment.family &&
+					exclusion.account_id === draftAccount.id,
+			)
+		) {
+			return [base("excluded", matchingRule.id)];
+		}
+		const capability = deps.resolveCapability(draftAccount, managedModel);
+		if (capability.status !== "supported") {
+			return [base(capability.reason, matchingRule.id)];
+		}
+		return [
+			{
+				...base("included", matchingRule.id),
+				high_confidence: true,
+				selected_by_default: true,
+			},
+		];
+	}
+	const peerSlots = snapshot.slots.filter(
+		(slot) =>
+			slot.enabled &&
+			peerAccounts.get(slot.account_id)?.provider === draftAccount.provider,
+	);
+	if (peerSlots.length === 0) {
+		return [
+			base(
+				snapshot.slots.some((slot) => slot.enabled)
+					? "new_billing_class"
+					: "ambiguous",
+			),
+		];
+	}
 	if (
 		new Set(peerSlots.map((slot) => slot.account_id)).size !== peerSlots.length
 	) {
@@ -404,21 +482,27 @@ export function proposeComboEnrollmentRules(
 		return [base("excluded")];
 	}
 
+	const peerRoutes = new Set<string>();
 	for (const slot of peerSlots) {
 		const peer = peerAccounts.get(slot.account_id);
 		if (
 			!peer ||
-			peer.provider !== draftAccount.provider ||
-			deps.deriveRouteClass(peer) !== routeClass ||
 			getModelFamily(slot.model) !== snapshot.assignment.family ||
 			slot.priority !== peer.priority
 		) {
 			return [base("ambiguous")];
 		}
+		const peerRouteClass = deps.deriveRouteClass(peer);
+		if (!peerRouteClass) return [base("ambiguous")];
+		peerRoutes.add(`${peer.provider}\u0000${peerRouteClass}`);
 		const peerCapability = deps.resolveCapability(peer, managedModel);
 		if (peerCapability.status !== "supported") {
 			return [base(peerCapability.reason)];
 		}
+	}
+	if (peerRoutes.size !== 1) return [base("ambiguous")];
+	if (!peerRoutes.has(`${draftAccount.provider}\u0000${routeClass}`)) {
+		return [base("new_billing_class")];
 	}
 
 	const capability = deps.resolveCapability(draftAccount, managedModel);
@@ -431,4 +515,153 @@ export function proposeComboEnrollmentRules(
 			selected_by_default: true,
 		},
 	];
+}
+
+/**
+ * Derive family-conversion proposals exclusively from persisted policy and
+ * explicit peers. Unlike account onboarding, an already-enabled rule remains
+ * visible so a family rolled back to manual mode can be reviewed and converted
+ * again without creating a duplicate rule.
+ */
+export function proposeComboFamilyConversionRules(
+	snapshot: ComboRoutingPolicySnapshot,
+	accounts: readonly Account[],
+	deps: ComboResolverDependencies,
+	options: { managedModel?: string } = {},
+): ComboEnrollmentRuleProposal[] {
+	if (
+		!snapshot.assignment.enabled ||
+		!snapshot.combo?.enabled ||
+		!snapshot.assignment.combo_id ||
+		snapshot.combo.id !== snapshot.assignment.combo_id
+	) {
+		return [];
+	}
+
+	const managedModel = resolveComboProposalManagedModel(
+		snapshot,
+		options.managedModel,
+	);
+	const proposals = new Map<string, ComboEnrollmentRuleProposal>();
+	const accountById = new Map(accounts.map((current) => [current.id, current]));
+	const currentRules = snapshot.rules
+		.filter(
+			(rule) =>
+				rule.family === snapshot.assignment.family &&
+				rule.combo_id === snapshot.assignment.combo_id,
+		)
+		.sort((left, right) => left.id.localeCompare(right.id));
+	const rulesByProposalId = new Map<string, (typeof currentRules)[number][]>();
+	for (const rule of currentRules) {
+		const proposalId = createComboEnrollmentRuleProposalId({
+			family: snapshot.assignment.family,
+			comboId: snapshot.assignment.combo_id,
+			provider: rule.provider,
+			routeClass: rule.route_class,
+			managedModel,
+		});
+		const matching = rulesByProposalId.get(proposalId) ?? [];
+		matching.push(rule);
+		rulesByProposalId.set(proposalId, matching);
+	}
+
+	const slotsByProvider = new Map<string, typeof snapshot.slots>();
+	for (const slot of snapshot.slots
+		.filter((current) => current.enabled)
+		.sort((left, right) => left.id.localeCompare(right.id))) {
+		const peer = accountById.get(slot.account_id);
+		if (!peer) continue;
+		const cohort = slotsByProvider.get(peer.provider) ?? [];
+		cohort.push(slot);
+		slotsByProvider.set(peer.provider, cohort);
+	}
+
+	for (const [provider, cohortSlots] of [...slotsByProvider.entries()].sort(
+		([left], [right]) => left.localeCompare(right),
+	)) {
+		const peerAccountIds = [
+			...new Set(cohortSlots.map((slot) => slot.account_id)),
+		].sort();
+		const cohortSnapshot: ComboRoutingPolicySnapshot = {
+			...snapshot,
+			slots: cohortSlots,
+			// Stored rules are merged after peer evidence is evaluated so an
+			// enabled rule cannot hide a conflicting explicit cohort.
+			rules: [],
+		};
+		for (const accountId of peerAccountIds) {
+			const peer = accountById.get(accountId);
+			if (!peer || peer.provider !== provider) continue;
+			for (const inferred of proposeComboEnrollmentRules(
+				cohortSnapshot,
+				accounts,
+				peer,
+				deps,
+				{ managedModel },
+			)) {
+				let proposal = inferred;
+				if (peerAccountIds.length < 2 && proposal.high_confidence) {
+					proposal = {
+						...proposal,
+						high_confidence: false,
+						selected_by_default: false,
+						reason: "ambiguous",
+					};
+				}
+				const matchingRules = rulesByProposalId.get(proposal.proposal_id) ?? [];
+				if (matchingRules.length > 0) {
+					const [rule] = matchingRules;
+					proposal = {
+						...proposal,
+						existing_rule_id: rule.id,
+						...(matchingRules.length > 1
+							? {
+									high_confidence: false,
+									selected_by_default: false,
+									reason: "ambiguous" as const,
+								}
+							: !rule.enabled && proposal.high_confidence
+								? {
+										high_confidence: false,
+										selected_by_default: false,
+										reason: "disabled" as const,
+									}
+								: {}),
+					};
+				}
+				if (!proposals.has(proposal.proposal_id)) {
+					proposals.set(proposal.proposal_id, proposal);
+				}
+			}
+		}
+	}
+
+	for (const rule of currentRules) {
+		const proposalId = createComboEnrollmentRuleProposalId({
+			family: snapshot.assignment.family,
+			comboId: snapshot.assignment.combo_id,
+			provider: rule.provider,
+			routeClass: rule.route_class,
+			managedModel,
+		});
+		if (proposals.has(proposalId)) continue;
+		const hasPeerEvidence = slotsByProvider.has(rule.provider);
+		const highConfidence = rule.enabled && !hasPeerEvidence;
+		proposals.set(proposalId, {
+			...blockedProposal(
+				snapshot,
+				rule.provider,
+				rule.route_class,
+				managedModel,
+				hasPeerEvidence ? "ambiguous" : rule.enabled ? "included" : "disabled",
+				rule.id,
+			),
+			high_confidence: highConfidence,
+			selected_by_default: highConfidence,
+		});
+	}
+
+	return [...proposals.values()].sort((left, right) =>
+		left.proposal_id.localeCompare(right.proposal_id),
+	);
 }

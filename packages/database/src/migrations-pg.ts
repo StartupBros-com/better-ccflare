@@ -145,6 +145,90 @@ async function ensureManagedRoutingPolicyTablesPg(
 	);
 }
 
+const ROUTING_REVISION_POLICY_TABLES = [
+	"combos",
+	"combo_slots",
+	"combo_family_assignments",
+	"combo_enrollment_rules",
+	"combo_membership_exclusions",
+] as const;
+
+/** PostgreSQL mirror of SQLite's managed-routing revision clock. */
+async function ensureRoutingPolicyRevisionSchemaPg(
+	adapter: BunSqlAdapter,
+	options: { installAccountUpdateTrigger?: boolean } = {},
+): Promise<void> {
+	await adapter.unsafe(`
+		CREATE TABLE IF NOT EXISTS routing_policy_revision (
+			scope TEXT PRIMARY KEY CHECK (scope = 'global'),
+			revision BIGINT NOT NULL DEFAULT 0 CHECK (revision >= 0)
+		)
+	`);
+	await adapter.unsafe(`
+		INSERT INTO routing_policy_revision (scope, revision)
+		VALUES ('global', 0)
+		ON CONFLICT (scope) DO NOTHING
+	`);
+	await adapter.unsafe(`
+		CREATE OR REPLACE FUNCTION bump_routing_policy_revision()
+		RETURNS trigger
+		LANGUAGE plpgsql
+		AS $$
+		BEGIN
+			UPDATE routing_policy_revision
+			SET revision = revision + 1
+			WHERE scope = 'global';
+			RETURN NULL;
+		END;
+		$$
+	`);
+
+	for (const table of ROUTING_REVISION_POLICY_TABLES) {
+		const trigger = `trg_routing_revision_${table}`;
+		await adapter.unsafe(`DROP TRIGGER IF EXISTS ${trigger} ON ${table}`);
+		await adapter.unsafe(`
+			CREATE TRIGGER ${trigger}
+			AFTER INSERT OR UPDATE OR DELETE ON ${table}
+			FOR EACH ROW EXECUTE FUNCTION bump_routing_policy_revision()
+		`);
+	}
+
+	await adapter.unsafe(
+		"DROP TRIGGER IF EXISTS trg_routing_revision_accounts_insert_delete ON accounts",
+	);
+	await adapter.unsafe(`
+		CREATE TRIGGER trg_routing_revision_accounts_insert_delete
+		AFTER INSERT OR DELETE ON accounts
+		FOR EACH ROW EXECUTE FUNCTION bump_routing_policy_revision()
+	`);
+	if (options.installAccountUpdateTrigger !== false) {
+		await adapter.unsafe(
+			"DROP TRIGGER IF EXISTS trg_routing_revision_accounts_update ON accounts",
+		);
+		await adapter.unsafe(`
+			CREATE TRIGGER trg_routing_revision_accounts_update
+			AFTER UPDATE OF id, provider, priority, billing_type, model_mappings,
+				model_fallbacks, custom_endpoint, api_key, refresh_token, access_token
+			ON accounts
+			FOR EACH ROW
+			WHEN (OLD.id IS DISTINCT FROM NEW.id
+				OR OLD.provider IS DISTINCT FROM NEW.provider
+				OR OLD.priority IS DISTINCT FROM NEW.priority
+				OR OLD.billing_type IS DISTINCT FROM NEW.billing_type
+				OR OLD.model_mappings IS DISTINCT FROM NEW.model_mappings
+				OR OLD.model_fallbacks IS DISTINCT FROM NEW.model_fallbacks
+				OR OLD.custom_endpoint IS DISTINCT FROM NEW.custom_endpoint
+				OR (NULLIF(BTRIM(OLD.api_key), '') IS NOT NULL)
+					IS DISTINCT FROM (NULLIF(BTRIM(NEW.api_key), '') IS NOT NULL)
+				OR (NULLIF(BTRIM(OLD.refresh_token), '') IS NOT NULL)
+					IS DISTINCT FROM (NULLIF(BTRIM(NEW.refresh_token), '') IS NOT NULL)
+				OR (NULLIF(BTRIM(OLD.access_token), '') IS NOT NULL)
+					IS DISTINCT FROM (NULLIF(BTRIM(NEW.access_token), '') IS NOT NULL))
+			EXECUTE FUNCTION bump_routing_policy_revision()
+		`);
+	}
+}
+
 /**
  * Ensure the full schema exists for PostgreSQL
  */
@@ -395,6 +479,12 @@ export async function ensureSchemaPg(adapter: BunSqlAdapter): Promise<void> {
 		ON CONFLICT (family) DO NOTHING
 	`);
 	await ensureManagedRoutingPolicyTablesPg(adapter);
+	// Existing PostgreSQL installations can predate account columns referenced
+	// by the scoped UPDATE trigger. initializeAsync() runs runMigrationsPg next,
+	// which installs that trigger only after all additive columns are present.
+	await ensureRoutingPolicyRevisionSchemaPg(adapter, {
+		installAccountUpdateTrigger: false,
+	});
 
 	// Create strategies table
 	await adapter.unsafe(`
@@ -749,6 +839,7 @@ export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 		ON CONFLICT (family) DO NOTHING
 	`);
 	await ensureManagedRoutingPolicyTablesPg(adapter);
+	await ensureRoutingPolicyRevisionSchemaPg(adapter);
 
 	// Ensure usage_snapshots table exists (for upgrades from pre-usage-history installs)
 	await adapter.unsafe(`

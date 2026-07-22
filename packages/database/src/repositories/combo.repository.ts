@@ -25,8 +25,20 @@ import {
 	toComboMembershipExclusion,
 	toComboSlot,
 } from "@better-ccflare/types";
-import type { BatchStatement } from "../adapters/bun-sql-adapter";
+import {
+	BatchExpectedChangesError,
+	type BatchStatement,
+} from "../adapters/bun-sql-adapter";
 import { BaseRepository } from "./base.repository";
+
+export class RoutingPolicyRevisionConflictError extends Error {
+	readonly code = "stale_routing_preview";
+
+	constructor() {
+		super("Routing policy revision changed before apply");
+		this.name = "RoutingPolicyRevisionConflictError";
+	}
+}
 
 interface RoutingPolicySnapshotRow {
 	row_kind: "assignment" | "combo" | "slot" | "rule" | "exclusion";
@@ -596,11 +608,37 @@ export class ComboRepository extends BaseRepository<Combo> {
 		return { assignment, combo, slots, rules, exclusions };
 	}
 
+	async getRoutingPolicyRevision(): Promise<number> {
+		const row = await this.get<{ revision: number }>(
+			"SELECT revision FROM routing_policy_revision WHERE scope = 'global'",
+		);
+		if (!row) throw new Error("Routing policy revision row is missing");
+		return Number(row.revision);
+	}
+
 	/** Apply a fixed set of policy mutations atomically on SQLite and PostgreSQL. */
 	async applyFamilyPolicyChanges(
 		changes: ComboFamilyPolicyChanges,
 	): Promise<ComboFamilyPolicyApplyResult> {
 		const statements: BatchStatement[] = [];
+		const hasRevisionPredicate = changes.expected_revision !== undefined;
+		if (hasRevisionPredicate) {
+			if (
+				!Number.isSafeInteger(changes.expected_revision) ||
+				(changes.expected_revision as number) < 0
+			) {
+				throw new Error(
+					"expected_revision must be a non-negative safe integer",
+				);
+			}
+			statements.push({
+				sql: `UPDATE routing_policy_revision
+				 SET revision = revision
+				 WHERE scope = 'global' AND revision = ?`,
+				params: [changes.expected_revision],
+				expectedChanges: 1,
+			});
+		}
 		if (changes.assignment) {
 			const update = this.buildFamilyPolicyUpdate(
 				changes.family,
@@ -681,14 +719,32 @@ export class ComboRepository extends BaseRepository<Combo> {
 				expectedChanges: 1,
 			});
 		}
-		const mutationCounts =
-			statements.length === 0
-				? []
-				: await this.adapter.runBatchWithChanges(statements);
+		let mutationCounts: number[];
+		try {
+			mutationCounts =
+				statements.length === 0
+					? []
+					: await this.adapter.runBatchWithChanges(statements);
+		} catch (error) {
+			if (
+				hasRevisionPredicate &&
+				error instanceof BatchExpectedChangesError &&
+				error.statementIndex === 0
+			) {
+				throw new RoutingPolicyRevisionConflictError();
+			}
+			throw error;
+		}
+		const policyMutationCounts = hasRevisionPredicate
+			? mutationCounts.slice(1)
+			: mutationCounts;
 		return {
 			family: changes.family,
 			applied: true,
-			mutation_count: mutationCounts.reduce((total, count) => total + count, 0),
+			mutation_count: policyMutationCounts.reduce(
+				(total, count) => total + count,
+				0,
+			),
 		};
 	}
 

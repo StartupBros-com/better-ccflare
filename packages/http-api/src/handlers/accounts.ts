@@ -47,6 +47,7 @@ import type {
 } from "@better-ccflare/types";
 import { requiresSessionDurationTracking } from "@better-ccflare/types";
 import type { AccountResponse } from "../types";
+import { accountCreatedResponse } from "../utils/account-created-response";
 import {
 	computeRateLimitStatusDisplay,
 	getRepresentativeUsageResetMs,
@@ -748,11 +749,9 @@ export function createAccountAddHandler(
 					],
 				);
 
-				return jsonResponse({
-					success: true,
+				return accountCreatedResponse(accountId, {
 					message: `Account ${name} added successfully`,
 					priority,
-					accountId,
 				});
 			} catch (error) {
 				if (
@@ -1094,7 +1093,7 @@ export function createZaiAccountAddHandler(dbOps: DatabaseOperations) {
 				);
 			}
 
-			return jsonResponse({
+			return accountCreatedResponse(accountId, {
 				message: `z.ai account '${name}' added successfully`,
 				account: {
 					id: account.id,
@@ -1228,7 +1227,7 @@ export function createOpenAIAccountAddHandler(dbOps: DatabaseOperations) {
 			);
 
 			log.info(
-				`Successfully added OpenAI-compatible account: ${name} (Endpoint: ${customEndpoint}, Priority ${priority})`,
+				`Successfully added OpenAI-compatible account: ${name} (Priority ${priority})`,
 			);
 
 			// Get the created account for response
@@ -1256,7 +1255,7 @@ export function createOpenAIAccountAddHandler(dbOps: DatabaseOperations) {
 				throw new Error("Failed to retrieve created account");
 			}
 
-			return jsonResponse({
+			return accountCreatedResponse(accountId, {
 				message: `OpenAI-compatible account '${name}' added successfully`,
 				account: {
 					id: account.id,
@@ -1372,7 +1371,7 @@ export function createVertexAIAccountAddHandler(dbOps: DatabaseOperations) {
 			);
 
 			log.info(
-				`Successfully added Vertex AI account: ${name} (Project: ${projectId}, Region: ${region}, Priority ${priority})`,
+				`Successfully added Vertex AI account: ${name} (Priority ${priority})`,
 			);
 
 			// Get the created account for response
@@ -1402,7 +1401,7 @@ export function createVertexAIAccountAddHandler(dbOps: DatabaseOperations) {
 				);
 			}
 
-			return jsonResponse({
+			return accountCreatedResponse(accountId, {
 				message: `Vertex AI account '${name}' added successfully`,
 				account: {
 					id: account.id,
@@ -1526,7 +1525,7 @@ export function createMinimaxAccountAddHandler(dbOps: DatabaseOperations) {
 				);
 			}
 
-			return jsonResponse({
+			return accountCreatedResponse(accountId, {
 				message: `Minimax account '${name}' added successfully`,
 				account: {
 					id: account.id,
@@ -1690,7 +1689,7 @@ export function createNanoGPTAccountAddHandler(dbOps: DatabaseOperations) {
 					InternalServerError("Failed to retrieve created account"),
 				);
 			}
-			return jsonResponse({
+			return accountCreatedResponse(accountId, {
 				message: `NanoGPT account '${name}' added successfully`,
 				account: {
 					id: account.id,
@@ -1858,7 +1857,7 @@ export function createAnthropicCompatibleAccountAddHandler(
 				);
 			}
 
-			return jsonResponse({
+			return accountCreatedResponse(accountId, {
 				message: `Anthropic-compatible account '${name}' added successfully`,
 				account: {
 					id: account.id,
@@ -2007,7 +2006,7 @@ export function createOllamaAccountAddHandler(dbOps: DatabaseOperations) {
 				);
 			}
 
-			return jsonResponse({
+			return accountCreatedResponse(accountId, {
 				message: `Ollama account '${name}' added successfully`,
 				account: {
 					id: account.id,
@@ -2143,7 +2142,7 @@ export function createOllamaCloudAccountAddHandler(dbOps: DatabaseOperations) {
 				);
 			}
 
-			return jsonResponse({
+			return accountCreatedResponse(accountId, {
 				message: `Ollama Cloud account '${name}' added successfully`,
 				account: {
 					id: account.id,
@@ -3089,7 +3088,7 @@ export function createBedrockAccountAddHandler(dbOps: DatabaseOperations) {
 			);
 
 			log.info(
-				`Successfully added Bedrock account: ${name} (Profile: ${profile}, Region: ${region}, CrossRegionMode: ${crossRegionMode}, Priority ${priority}${customModel ? `, CustomModel: ${customModel}` : ""})`,
+				`Successfully added Bedrock account: ${name} (Priority ${priority})`,
 			);
 
 			// Get the created account for response
@@ -3119,7 +3118,7 @@ export function createBedrockAccountAddHandler(dbOps: DatabaseOperations) {
 				);
 			}
 
-			return jsonResponse({
+			return accountCreatedResponse(accountId, {
 				message: `Bedrock account '${name}' added successfully`,
 				account: {
 					id: account.id,
@@ -3266,7 +3265,7 @@ export function createKiloAccountAddHandler(dbOps: DatabaseOperations) {
 				);
 			}
 
-			return jsonResponse({
+			return accountCreatedResponse(accountId, {
 				message: `Kilo Gateway account '${name}' added successfully`,
 				account: {
 					id: account.id,
@@ -3414,7 +3413,7 @@ export function createAlibabaCodingPlanAccountAddHandler(
 				);
 			}
 
-			return jsonResponse({
+			return accountCreatedResponse(accountId, {
 				message: `Alibaba Coding Plan account '${name}' added successfully`,
 				account: {
 					id: account.id,
@@ -3567,7 +3566,7 @@ export function createOpenRouterAccountAddHandler(dbOps: DatabaseOperations) {
 				);
 			}
 
-			return jsonResponse({
+			return accountCreatedResponse(accountId, {
 				message: `OpenRouter account '${name}' added successfully`,
 				account: {
 					id: account.id,

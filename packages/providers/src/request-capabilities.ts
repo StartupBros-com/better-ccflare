@@ -77,6 +77,55 @@ export function deriveComboRouteClass(
 	return "api-key";
 }
 
+/**
+ * Build a non-secret account shape for draft route-class validation. Credential
+ * transport and billing class are distinct: compatible-provider plan accounts
+ * still use an API key even though their enrollment route is subscription.
+ */
+export function createComboRouteClassDraftProbe(input: {
+	provider: string;
+	routeClass: ComboRouteClass;
+	billingType: "plan" | "api" | null;
+}): Pick<
+	Account,
+	"provider" | "billing_type" | "api_key" | "refresh_token" | "access_token"
+> | null {
+	const marker = "present-for-route-shape-validation";
+	let apiKey: string | null = null;
+	let refreshToken = "";
+
+	switch (input.routeClass) {
+		case "oauth-subscription":
+			if (OAUTH_SUBSCRIPTION_PROVIDERS.has(input.provider)) {
+				refreshToken = marker;
+			} else if (CUSTOM_BILLING_PROVIDERS.has(input.provider)) {
+				apiKey = marker;
+			} else {
+				return null;
+			}
+			break;
+		case "api-key":
+			if (!API_KEY_PROVIDERS.has(input.provider)) return null;
+			apiKey = marker;
+			break;
+		case "local":
+			if (!LOCAL_PROVIDERS.has(input.provider)) return null;
+			break;
+		case "cloud-credential":
+			if (!CLOUD_CREDENTIAL_PROVIDERS.has(input.provider)) return null;
+			break;
+	}
+
+	const probe = {
+		provider: input.provider,
+		billing_type: input.billingType,
+		api_key: apiKey,
+		refresh_token: refreshToken,
+		access_token: null,
+	};
+	return deriveComboRouteClass(probe) === input.routeClass ? probe : null;
+}
+
 const UNKNOWN_LOGICAL_MODEL_CAPABILITY: LogicalModelCapability = {
 	status: "unknown",
 	provenance: "undeclared",

@@ -5,6 +5,7 @@ import { CodexProvider } from "./providers/codex/provider";
 import { QwenProvider } from "./providers/qwen/provider";
 import { XaiProvider } from "./providers/xai/provider";
 import {
+	createComboRouteClassDraftProbe,
 	decideContextAdmission,
 	deriveComboRouteClass,
 	estimateAnthropicAdmissionTokens,
@@ -135,6 +136,30 @@ describe("managed routing capabilities", () => {
 				),
 			).toBe(expected);
 		}
+	});
+
+	it("builds compatible plan probes with API-key credentials and no fake OAuth", () => {
+		const probe = createComboRouteClassDraftProbe({
+			provider: "openai-compatible",
+			routeClass: "oauth-subscription",
+			billingType: "plan",
+		});
+
+		expect(probe).toMatchObject({
+			provider: "openai-compatible",
+			billing_type: "plan",
+			refresh_token: "",
+			access_token: null,
+		});
+		expect(probe?.api_key).toBeTruthy();
+		expect(probe && deriveComboRouteClass(probe)).toBe("oauth-subscription");
+		expect(
+			createComboRouteClassDraftProbe({
+				provider: "openai-compatible",
+				routeClass: "oauth-subscription",
+				billingType: "api",
+			}),
+		).toBeNull();
 	});
 
 	it("uses only credential-presence shape for auto classification", () => {

@@ -11,6 +11,7 @@ import type {
 import {
 	createManagedComboMemberId,
 	proposeComboEnrollmentRules,
+	proposeComboFamilyConversionRules,
 	resolveEffectiveComboMembership,
 } from "./combo-membership-resolver";
 
@@ -398,7 +399,7 @@ describe("resolveEffectiveComboMembership", () => {
 });
 
 describe("proposeComboEnrollmentRules", () => {
-	it("does not propose a duplicate when the exact managed rule is enabled", () => {
+	it("projects an exact enabled rule as a high-confidence idempotent reuse", () => {
 		const proposals = proposeComboEnrollmentRules(
 			snapshot(),
 			[account()],
@@ -406,7 +407,14 @@ describe("proposeComboEnrollmentRules", () => {
 			dependencies(),
 		);
 
-		expect(proposals).toEqual([]);
+		expect(proposals).toEqual([
+			expect.objectContaining({
+				existing_rule_id: "rule-1",
+				high_confidence: true,
+				selected_by_default: true,
+				reason: "included",
+			}),
+		]);
 	});
 
 	it("surfaces an exact disabled rule as a non-default reactivation", () => {
@@ -454,6 +462,8 @@ describe("proposeComboEnrollmentRules", () => {
 
 		expect(proposals).toEqual([
 			expect.objectContaining({
+				proposal_id:
+					"proposal:opus:combo-1:anthropic:oauth-subscription:claude-opus-4-8",
 				family: "opus",
 				combo_id: "combo-1",
 				provider: "anthropic",
@@ -465,6 +475,111 @@ describe("proposeComboEnrollmentRules", () => {
 				reason: "included",
 			}),
 		]);
+	});
+
+	it("isolates an Anthropic account cohort from manual Codex and xAI fallbacks", () => {
+		const peers = [0, 1, 2].map((priority) =>
+			account({ id: `anthropic-${priority}`, priority }),
+		);
+		const fallbacks = [
+			account({ id: "codex", provider: "codex", priority: 10 }),
+			account({ id: "xai", provider: "xai", priority: 20 }),
+		];
+		const allAccounts = [...peers, ...fallbacks];
+		const policy = snapshot("opus", {
+			rules: [],
+			slots: allAccounts.map((peer) => ({
+				id: `slot-${peer.id}`,
+				combo_id: "combo-1",
+				account_id: peer.id,
+				model: "claude-opus-4-8",
+				priority: peer.priority,
+				enabled: true,
+			})),
+		});
+
+		expect(
+			proposeComboEnrollmentRules(
+				policy,
+				allAccounts,
+				account({ id: "fourth-anthropic" }),
+				dependencies(),
+			),
+		).toEqual([
+			expect.objectContaining({
+				provider: "anthropic",
+				route_class: "oauth-subscription",
+				high_confidence: true,
+				selected_by_default: true,
+				reason: "included",
+			}),
+		]);
+	});
+
+	it("keeps mixed auth classes within one provider ambiguous and non-default", () => {
+		const peers = [
+			account({ id: "oauth-peer" }),
+			account({
+				id: "api-peer",
+				api_key: "secret",
+				refresh_token: null,
+				access_token: null,
+			}),
+		];
+		const policy = snapshot("opus", {
+			rules: [],
+			slots: peers.map((peer) => ({
+				id: `slot-${peer.id}`,
+				combo_id: "combo-1",
+				account_id: peer.id,
+				model: "claude-opus-4-8",
+				priority: peer.priority,
+				enabled: true,
+			})),
+		});
+		const [proposal] = proposeComboEnrollmentRules(
+			policy,
+			peers,
+			account({ id: "draft" }),
+			{
+				...dependencies(),
+				deriveRouteClass(current) {
+					return current.api_key ? "api-key" : "oauth-subscription";
+				},
+			},
+		);
+
+		expect(proposal).toMatchObject({
+			high_confidence: false,
+			selected_by_default: false,
+			reason: "ambiguous",
+		});
+	});
+
+	it("prefers a valid assignment model and permits an explicit reviewed override", () => {
+		const policy = snapshot("opus", {
+			assignment: {
+				...snapshot("opus").assignment,
+				managed_model: "claude-opus-4-7",
+			},
+			rules: [{ ...snapshot("opus").rules[0], enabled: false }],
+		});
+		const existingModel = proposeComboEnrollmentRules(
+			policy,
+			[account()],
+			account({ id: "draft" }),
+			dependencies(),
+		);
+		expect(existingModel[0]?.managed_model).toBe("claude-opus-4-7");
+
+		const overridden = proposeComboEnrollmentRules(
+			policy,
+			[account()],
+			account({ id: "draft" }),
+			dependencies(),
+			{ managedModel: "claude-opus-4-6" },
+		);
+		expect(overridden[0]?.managed_model).toBe("claude-opus-4-6");
 	});
 
 	it("blocks conflicting model families and tier relationships", () => {
@@ -546,7 +661,10 @@ describe("proposeComboEnrollmentRules", () => {
 				account({ id: "draft", provider: "openai-compatible" }),
 				dependencies(),
 			)[0],
-		).toMatchObject({ high_confidence: false, reason: "ambiguous" });
+		).toMatchObject({
+			high_confidence: false,
+			reason: "new_billing_class",
+		});
 
 		expect(
 			proposeComboEnrollmentRules(
@@ -609,5 +727,172 @@ describe("proposeComboEnrollmentRules", () => {
 				},
 			)[0],
 		).toMatchObject({ high_confidence: false, reason: "unknown" });
+	});
+});
+
+describe("proposeComboFamilyConversionRules", () => {
+	it("infers and deduplicates one proposal from unanimous persisted peers", () => {
+		const peers = [0, 1, 2].map((priority) =>
+			account({ id: `peer-${priority}`, priority }),
+		);
+		const policy = snapshot("opus", {
+			assignment: {
+				...snapshot("opus").assignment,
+				membership_mode: "manual",
+			},
+			rules: [],
+			slots: peers.map((peer) => ({
+				id: `slot-${peer.id}`,
+				combo_id: "combo-1",
+				account_id: peer.id,
+				model: "claude-opus-4-8",
+				priority: peer.priority,
+				enabled: true,
+			})),
+		});
+
+		const proposals = proposeComboFamilyConversionRules(
+			policy,
+			peers,
+			dependencies(),
+		);
+
+		expect(proposals).toEqual([
+			expect.objectContaining({
+				proposal_id:
+					"proposal:opus:combo-1:anthropic:oauth-subscription:claude-opus-4-8",
+				existing_rule_id: null,
+				high_confidence: true,
+				selected_by_default: true,
+				reason: "included",
+			}),
+		]);
+	});
+
+	it("surfaces an enabled stored rule as an idempotent reviewed conversion", () => {
+		const policy = snapshot("opus", {
+			assignment: {
+				...snapshot("opus").assignment,
+				membership_mode: "manual",
+			},
+		});
+
+		expect(
+			proposeComboFamilyConversionRules(policy, [account()], dependencies()),
+		).toEqual([
+			expect.objectContaining({
+				existing_rule_id: "rule-1",
+				high_confidence: true,
+				selected_by_default: true,
+				reason: "included",
+			}),
+		]);
+	});
+
+	it("never auto-selects conflicting persisted peer cohorts", () => {
+		const peers = [
+			account({ id: "peer-a", provider: "anthropic" }),
+			account({ id: "peer-b", provider: "openai-compatible" }),
+		];
+		const policy = snapshot("opus", {
+			rules: [],
+			slots: peers.map((peer) => ({
+				id: `slot-${peer.id}`,
+				combo_id: "combo-1",
+				account_id: peer.id,
+				model: "claude-opus-4-8",
+				priority: peer.priority,
+				enabled: true,
+			})),
+		});
+
+		const proposals = proposeComboFamilyConversionRules(
+			policy,
+			peers,
+			dependencies(),
+		);
+		expect(proposals.length).toBeGreaterThan(0);
+		expect(proposals.every((proposal) => !proposal.selected_by_default)).toBe(
+			true,
+		);
+	});
+
+	it("infers the unanimous Anthropic cohort without absorbing singleton fallback providers", () => {
+		const peers = [0, 1, 2].map((priority) =>
+			account({ id: `anthropic-${priority}`, priority }),
+		);
+		const fallbacks = [
+			account({ id: "codex", provider: "codex", priority: 10 }),
+			account({ id: "xai", provider: "xai", priority: 20 }),
+		];
+		const allAccounts = [...peers, ...fallbacks];
+		const policy = snapshot("opus", {
+			rules: [],
+			slots: allAccounts.map((peer) => ({
+				id: `slot-${peer.id}`,
+				combo_id: "combo-1",
+				account_id: peer.id,
+				model: "claude-opus-4-8",
+				priority: peer.priority,
+				enabled: true,
+			})),
+		});
+
+		const proposals = proposeComboFamilyConversionRules(
+			policy,
+			allAccounts,
+			dependencies(),
+		);
+		const selected = proposals.filter(
+			(proposal) => proposal.selected_by_default,
+		);
+		expect(selected).toEqual([
+			expect.objectContaining({
+				provider: "anthropic",
+				route_class: "oauth-subscription",
+				high_confidence: true,
+			}),
+		]);
+		expect(
+			proposals
+				.filter((proposal) => proposal.provider !== "anthropic")
+				.every((proposal) => !proposal.selected_by_default),
+		).toBe(true);
+	});
+
+	it("keeps an enabled rule reviewable but non-default when its peer evidence is ambiguous", () => {
+		const peers = [
+			account({ id: "oauth-peer" }),
+			account({
+				id: "api-peer",
+				api_key: "secret",
+				refresh_token: null,
+				access_token: null,
+			}),
+		];
+		const policy = snapshot("opus", {
+			slots: peers.map((peer) => ({
+				id: `slot-${peer.id}`,
+				combo_id: "combo-1",
+				account_id: peer.id,
+				model: "claude-opus-4-8",
+				priority: peer.priority,
+				enabled: true,
+			})),
+		});
+		const proposals = proposeComboFamilyConversionRules(policy, peers, {
+			...dependencies(),
+			deriveRouteClass(current) {
+				return current.api_key ? "api-key" : "oauth-subscription";
+			},
+		});
+		const storedRule = proposals.find(
+			(proposal) => proposal.existing_rule_id === "rule-1",
+		);
+		expect(storedRule).toMatchObject({
+			high_confidence: false,
+			selected_by_default: false,
+			reason: "ambiguous",
+		});
 	});
 });

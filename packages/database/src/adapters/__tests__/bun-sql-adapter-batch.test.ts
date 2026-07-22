@@ -40,6 +40,34 @@ describe("BunSqlAdapter checked DML batches", () => {
 		).toEqual({ value: "before" });
 	});
 
+	it("counts only direct SQLite changes when an audit trigger also writes", async () => {
+		db = new Database(":memory:");
+		db.exec(`
+			CREATE TABLE records (id TEXT PRIMARY KEY, value TEXT NOT NULL);
+			CREATE TABLE revision (value INTEGER NOT NULL);
+			INSERT INTO records (id, value) VALUES ('one', 'before');
+			INSERT INTO revision (value) VALUES (0);
+			CREATE TRIGGER bump_revision AFTER UPDATE ON records
+			BEGIN
+				UPDATE revision SET value = value + 1;
+			END;
+		`);
+		const adapter = new BunSqlAdapter(db);
+
+		expect(
+			await adapter.runBatchWithChanges([
+				{
+					sql: "UPDATE records SET value = ? WHERE id = ?",
+					params: ["after", "one"],
+					expectedChanges: 1,
+				},
+			]),
+		).toEqual([1]);
+		expect(
+			db.query<{ value: number }, []>("SELECT value FROM revision").get(),
+		).toEqual({ value: 1 });
+	});
+
 	it("throws inside the PostgreSQL transaction callback on a count mismatch", async () => {
 		let transactionRolledBack = false;
 		let statementIndex = 0;

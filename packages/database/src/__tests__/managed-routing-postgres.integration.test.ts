@@ -202,6 +202,27 @@ describePostgres("managed routing PostgreSQL integration", () => {
 			await runMigrationsPg(adapter);
 			await seedPolicyBase(adapter);
 			const repo = new ComboRepository(adapter);
+			const seededRevision = await repo.getRoutingPolicyRevision();
+			await adapter.run("UPDATE accounts SET refresh_token = ? WHERE id = ?", [
+				"first-token",
+				"account-1",
+			]);
+			const credentialShapeRevision = await repo.getRoutingPolicyRevision();
+			expect(credentialShapeRevision).toBeGreaterThan(seededRevision);
+			await adapter.run("UPDATE accounts SET refresh_token = ? WHERE id = ?", [
+				"rotated-token",
+				"account-1",
+			]);
+			expect(await repo.getRoutingPolicyRevision()).toBe(
+				credentialShapeRevision,
+			);
+			await adapter.run("UPDATE combo_slots SET priority = ? WHERE id = ?", [
+				8,
+				"slot-1",
+			]);
+			expect(await repo.getRoutingPolicyRevision()).toBeGreaterThan(
+				credentialShapeRevision,
+			);
 			await repo.setFamilyAssignment("opus", "combo-1", true);
 			expect((await repo.getRoutingPolicySnapshot("opus")).assignment).toEqual({
 				family: "opus",
@@ -260,6 +281,30 @@ describePostgres("managed routing PostgreSQL integration", () => {
 			expect(manualSnapshot.exclusions.map((row) => row.id)).toEqual([
 				"exclusion-1",
 			]);
+
+			const reviewedRevision = await repo.getRoutingPolicyRevision();
+			await adapter.run("UPDATE accounts SET priority = ? WHERE id = ?", [
+				4,
+				"account-1",
+			]);
+			await expect(
+				repo.applyFamilyPolicyChanges({
+					family: "opus",
+					expected_revision: reviewedRevision,
+					assignment: { membership_mode: "managed" },
+					create_rules: [
+						{
+							id: "must-not-commit",
+							combo_id: "combo-1",
+							provider: "other",
+							route_class: "api-key",
+						},
+					],
+				}),
+			).rejects.toThrow("Routing policy revision changed");
+			const afterStaleApply = await repo.getRoutingPolicySnapshot("opus");
+			expect(afterStaleApply.assignment.membership_mode).toBe("manual");
+			expect(afterStaleApply.rules.map((row) => row.id)).toEqual(["rule-1"]);
 			await expectPolicyConstraints(adapter);
 			await expectPolicyIndexes(adapter);
 
@@ -304,6 +349,13 @@ describePostgres("managed routing PostgreSQL integration", () => {
 	it("upgrades a true legacy schema without changing explicit combos or slots", async () => {
 		await withDisposableDatabase(async (adapter) => {
 			await ensureSchemaPg(adapter);
+			for (const column of [
+				"model_mappings",
+				"model_fallbacks",
+				"billing_type",
+			]) {
+				await adapter.unsafe(`ALTER TABLE accounts DROP COLUMN ${column}`);
+			}
 			await adapter.unsafe("DROP TABLE combo_membership_exclusions");
 			await adapter.unsafe("DROP TABLE combo_enrollment_rules");
 			await adapter.unsafe(
@@ -350,6 +402,15 @@ describePostgres("managed routing PostgreSQL integration", () => {
 			).toEqual(slotsBefore);
 
 			const repo = new ComboRepository(adapter);
+			const revisionBeforeAccountPolicyChange =
+				await repo.getRoutingPolicyRevision();
+			await adapter.run("UPDATE accounts SET billing_type = ? WHERE id = ?", [
+				"api",
+				"account-1",
+			]);
+			expect(await repo.getRoutingPolicyRevision()).toBeGreaterThan(
+				revisionBeforeAccountPolicyChange,
+			);
 			expect(
 				await repo.applyFamilyPolicyChanges({
 					family: "opus",

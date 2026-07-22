@@ -71,8 +71,13 @@ import {
 	createComboGetHandler,
 	createCombosListHandler,
 	createComboUpdateHandler,
+	createEffectiveRoutingHandler,
 	createFamiliesListHandler,
 	createFamilyAssignHandler,
+	createMembershipExclusionCreateHandler,
+	createMembershipExclusionRestoreHandler,
+	createRoutingApplyHandler,
+	createRoutingPreviewHandler,
 	createSlotAddHandler,
 	createSlotRemoveHandler,
 	createSlotReorderHandler,
@@ -479,6 +484,12 @@ export class APIRouter {
 		this.handlers.set("GET:/api/families", () =>
 			createFamiliesListHandler(dbOps)(),
 		);
+		this.handlers.set("GET:/api/routing/effective", () =>
+			createEffectiveRoutingHandler(dbOps)(),
+		);
+		this.handlers.set("POST:/api/routing/preview", (req) =>
+			createRoutingPreviewHandler(dbOps)(req),
+		);
 
 		// Model catalog routes
 		const modelsHandler = createModelsHandler(this.context);
@@ -856,6 +867,47 @@ export class APIRouter {
 			if (parts.length === 4 && method === "DELETE") {
 				const handler = createComboDeleteHandler(this.context.dbOps);
 				return await this.wrapHandler(() => handler(comboId))(req, url);
+			}
+		}
+
+		// Managed routing policy, preview application, and exclusion resources.
+		if (path.startsWith("/api/routing/")) {
+			const parts = path.split("/");
+			if (parts[3] === "effective" && parts.length === 5 && method === "GET") {
+				const family = decodeURIComponent(parts[4]);
+				const handler = createEffectiveRoutingHandler(this.context.dbOps);
+				return await this.wrapHandler(() => handler(family))(req, url);
+			}
+			if (parts[3] === "apply" && parts.length === 5 && method === "POST") {
+				const family = decodeURIComponent(parts[4]);
+				const handler = createRoutingApplyHandler(this.context.dbOps);
+				return await this.wrapHandler((req) => handler(req, family))(req, url);
+			}
+			if (
+				parts[3] === "exclusions" &&
+				parts.length === 5 &&
+				method === "POST"
+			) {
+				const family = decodeURIComponent(parts[4]);
+				const handler = createMembershipExclusionCreateHandler(
+					this.context.dbOps,
+				);
+				return await this.wrapHandler((req) => handler(req, family))(req, url);
+			}
+			if (
+				parts[3] === "exclusions" &&
+				parts.length === 6 &&
+				method === "DELETE"
+			) {
+				const family = decodeURIComponent(parts[4]);
+				const accountId = decodeURIComponent(parts[5]);
+				const handler = createMembershipExclusionRestoreHandler(
+					this.context.dbOps,
+				);
+				return await this.wrapHandler(() => handler(family, accountId))(
+					req,
+					url,
+				);
 			}
 		}
 
