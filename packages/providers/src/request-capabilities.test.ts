@@ -1,10 +1,6 @@
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import type { Account } from "@better-ccflare/types";
-import { AnthropicProvider } from "./providers/anthropic/provider";
-import { CodexProvider } from "./providers/codex/provider";
-import { QwenProvider } from "./providers/qwen/provider";
-import { XaiProvider } from "./providers/xai/provider";
-import { getProvider, registerProvider, registry } from "./registry";
+import { getProvider } from "./index";
 import {
 	decideContextAdmission,
 	deriveComboRouteClass,
@@ -13,7 +9,6 @@ import {
 	resolveAccountLogicalModelCapability,
 	resolveModelContextCapability,
 } from "./request-capabilities";
-import type { Provider } from "./types";
 
 const routingAccount = (overrides: Partial<Account> = {}): Account =>
 	({
@@ -31,39 +26,7 @@ const routingAccount = (overrides: Partial<Account> = {}): Account =>
 		...overrides,
 	}) as Account;
 
-const capabilityProviders: Provider[] = [
-	new AnthropicProvider(),
-	new CodexProvider(),
-	new QwenProvider(),
-	new XaiProvider(),
-];
-const previousProviders = new Map<string, Provider | undefined>();
-
-beforeAll(() => {
-	for (const provider of capabilityProviders) {
-		previousProviders.set(provider.name, getProvider(provider.name));
-		registerProvider(provider);
-	}
-});
-
-afterAll(() => {
-	for (const provider of capabilityProviders) {
-		registry.unregisterProvider(provider.name);
-		const previous = previousProviders.get(provider.name);
-		if (previous) registerProvider(previous);
-	}
-	previousProviders.clear();
-});
-
 describe("managed routing capabilities", () => {
-	it("keeps complete built-in providers available to downstream proxy tests", () => {
-		for (const providerName of ["anthropic", "codex", "qwen", "xai"]) {
-			const provider = getProvider(providerName);
-			expect(provider).toBeDefined();
-			expect(provider?.prepareHeaders).toBeFunction();
-		}
-	});
-
 	it("derives provider defaults from blank, non-secret draft metadata", () => {
 		for (const provider of ["anthropic", "codex", "qwen", "xai"]) {
 			expect(
@@ -296,6 +259,16 @@ describe("managed routing capabilities", () => {
 			provenance: "undeclared",
 			reason: "unknown",
 		});
+	});
+});
+
+describe("provider registry isolation", () => {
+	it("leaves complete built-in providers available to the next suite", () => {
+		for (const providerName of ["anthropic", "codex", "qwen", "xai"]) {
+			const provider = getProvider(providerName);
+			expect(provider).toBeDefined();
+			expect(provider?.prepareHeaders).toBeFunction();
+		}
 	});
 });
 
