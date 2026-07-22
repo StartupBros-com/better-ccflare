@@ -17,6 +17,7 @@ import type {
 	ComboFamily,
 	ComboMembershipReasonCode,
 	ComboMembershipSource,
+	ComboRoutingPolicySnapshot,
 	ComboSlotInfo,
 	RequestMeta,
 	RoutingCandidateMetadata,
@@ -737,9 +738,34 @@ export async function selectAccountsForRequest(
 			if (!validFamilies.includes(family)) {
 				log.warn(`Unknown model family "${family}", skipping combo lookup`);
 			} else {
-				const routingPolicy = await ctx.dbOps.getComboRoutingPolicy(
-					family as ComboFamily,
-				);
+				const comboFamily = family as ComboFamily;
+				const routingPolicyReader = (
+					ctx.dbOps as Partial<
+						Pick<ProxyContext["dbOps"], "getComboRoutingPolicy">
+					>
+				).getComboRoutingPolicy;
+				let routingPolicy: ComboRoutingPolicySnapshot;
+				if (typeof routingPolicyReader === "function") {
+					routingPolicy = await routingPolicyReader.call(
+						ctx.dbOps,
+						comboFamily,
+					);
+				} else {
+					const combo = await ctx.dbOps.getActiveComboForFamily(comboFamily);
+					routingPolicy = {
+						assignment: {
+							family: comboFamily,
+							combo_id: combo?.id ?? null,
+							enabled: combo !== null,
+							membership_mode: "manual",
+							managed_model: null,
+						},
+						combo,
+						slots: combo?.slots ?? [],
+						rules: [],
+						exclusions: [],
+					};
+				}
 				let allAccounts: Account[];
 				try {
 					allAccounts = await ctx.dbOps.getAllAccounts();

@@ -765,6 +765,61 @@ describe("selectAccountsForRequest — combo routing", () => {
 		});
 	});
 
+	it("keeps manual combo selection equivalent when the managed-policy reader is unavailable", async () => {
+		const first = makeAccount({ id: "manual-first", priority: 99 });
+		const second = makeAccount({ id: "manual-second", priority: 0 });
+		const combo = makeCombo([
+			{
+				id: "slot-a",
+				combo_id: "combo-1",
+				account_id: first.id,
+				model: "claude-opus-4-8",
+				priority: 2,
+				enabled: true,
+			},
+			{
+				id: "slot-b",
+				combo_id: "combo-1",
+				account_id: second.id,
+				model: "claude-opus-4-5",
+				priority: 3,
+				enabled: true,
+			},
+		]);
+		const accounts = [first, second];
+		const currentCtx = makeCtx({ accounts, activeCombo: combo });
+		const legacyCtx = makeCtx({ accounts, activeCombo: combo });
+		const legacyDbOps = legacyCtx.dbOps as unknown as {
+			getComboRoutingPolicy?: ProxyContext["dbOps"]["getComboRoutingPolicy"];
+			getActiveComboForFamily: ProxyContext["dbOps"]["getActiveComboForFamily"];
+		};
+		delete legacyDbOps.getComboRoutingPolicy;
+		const getActiveComboForFamily = mock(async () => combo);
+		legacyDbOps.getActiveComboForFamily = getActiveComboForFamily;
+		const currentMeta = makeRequestMeta();
+		const legacyMeta = makeRequestMeta();
+
+		const currentResult = await selectAccountsForRequest(
+			currentMeta,
+			currentCtx,
+			"claude-opus-4-8",
+		);
+		const legacyResult = await selectAccountsForRequest(
+			legacyMeta,
+			legacyCtx,
+			"claude-opus-4-8",
+		);
+
+		expect(legacyResult).toEqual(currentResult);
+		expect(legacyMeta.routingCandidateCatalog).toEqual(
+			currentMeta.routingCandidateCatalog,
+		);
+		expect(legacyMeta.routingCandidates).toEqual(currentMeta.routingCandidates);
+		expect(getComboSlotInfo(legacyMeta)).toEqual(getComboSlotInfo(currentMeta));
+		expect(legacyMeta.comboName).toBe(currentMeta.comboName);
+		expect(getActiveComboForFamily).toHaveBeenCalledWith("opus");
+	});
+
 	it("synthesizes a fourth managed peer at account priority with a stable virtual identity", async () => {
 		const accounts = [
 			"anthropic-1",
