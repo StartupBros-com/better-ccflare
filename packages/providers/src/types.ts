@@ -1,4 +1,8 @@
-import type { Account, RateLimitReason } from "@better-ccflare/types";
+import type {
+	Account,
+	LogicalModelCapability,
+	RateLimitReason,
+} from "@better-ccflare/types";
 
 export interface TokenRefreshResult {
 	accessToken: string;
@@ -37,6 +41,16 @@ export interface Provider {
 
 	/** How exact physical models are preserved during cache keepalive replay. */
 	readonly cacheReplayModelStrategy?: CacheReplayModelStrategy;
+
+	/**
+	 * Pure, network-free logical-model support after explicit mappings have been
+	 * checked by the registry facade. Implementations must mirror transport
+	 * defaults and return preview-safe metadata only.
+	 */
+	getLogicalModelCapability?(
+		logicalModel: string,
+		account: Account,
+	): LogicalModelCapability;
 
 	/**
 	 * Check if this provider can handle the given request path

@@ -61,6 +61,27 @@ function convertPlaceholders(sql: string): string {
  */
 export const PG_CLIENT_QUERY_TIMEOUT_MS = 8000;
 
+export interface BatchStatement {
+	sql: string;
+	params?: unknown[];
+	expectedChanges?: number;
+}
+
+function assertExpectedChanges(
+	statement: BatchStatement,
+	actualChanges: number,
+	index: number,
+): void {
+	if (
+		statement.expectedChanges !== undefined &&
+		actualChanges !== statement.expectedChanges
+	) {
+		throw new Error(
+			`Batch statement ${index + 1} expected ${statement.expectedChanges} change(s), got ${actualChanges}`,
+		);
+	}
+}
+
 /**
  * Unified SQL adapter that abstracts over bun:sqlite (sync) and Bun.SQL/PostgreSQL (async).
  *
@@ -295,28 +316,34 @@ export class BunSqlAdapter {
 	}
 
 	/** Execute a fixed DML batch atomically and return each affected-row count. */
-	async runBatchWithChanges(
-		statements: Array<{ sql: string; params?: unknown[] }>,
-	): Promise<number[]> {
+	async runBatchWithChanges(statements: BatchStatement[]): Promise<number[]> {
 		if (this.isSQLite && this.sqliteDb) {
 			const db = this.sqliteDb;
 			return this.withBusyRetry(() =>
 				db.transaction(() =>
-					statements.map(
-						({ sql, params = [] }) => db.run(sql, params as never[]).changes,
-					),
+					statements.map((statement, index) => {
+						const actualChanges = db.run(
+							statement.sql,
+							(statement.params ?? []) as never[],
+						).changes;
+						assertExpectedChanges(statement, actualChanges, index);
+						return actualChanges;
+					}),
 				)(),
 			);
 		}
 		if (!this.sql) throw new Error("SQL client not available for transaction");
 		return this.sql.begin(async (tx) => {
 			const changes: number[] = [];
-			for (const statement of statements) {
+			for (const [index, statement] of statements.entries()) {
 				const result = await tx.unsafe(
 					this.pgSql(statement.sql),
-					statement.params as never[],
+					(statement.params ?? []) as never[],
 				);
-				changes.push((result as unknown as { count?: number }).count ?? 0);
+				const actualChanges =
+					(result as unknown as { count?: number }).count ?? 0;
+				assertExpectedChanges(statement, actualChanges, index);
+				changes.push(actualChanges);
 			}
 			return changes;
 		});

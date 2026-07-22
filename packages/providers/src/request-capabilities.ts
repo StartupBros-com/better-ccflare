@@ -1,3 +1,120 @@
+import { getConfiguredModelMapping } from "@better-ccflare/core";
+import type {
+	Account,
+	ComboRouteClass,
+	LogicalModelCapability,
+} from "@better-ccflare/types";
+import { PROVIDER_NAMES } from "@better-ccflare/types";
+import { getCapabilityProvider } from "./registry";
+
+const OAUTH_SUBSCRIPTION_PROVIDERS = new Set<string>([
+	PROVIDER_NAMES.ANTHROPIC,
+	PROVIDER_NAMES.CODEX,
+	PROVIDER_NAMES.QWEN,
+	PROVIDER_NAMES.XAI,
+]);
+const API_KEY_PROVIDERS = new Set<string>([
+	PROVIDER_NAMES.CLAUDE_CONSOLE_API,
+	PROVIDER_NAMES.ZAI,
+	PROVIDER_NAMES.MINIMAX,
+	PROVIDER_NAMES.ANTHROPIC_COMPATIBLE,
+	PROVIDER_NAMES.OPENAI_COMPATIBLE,
+	PROVIDER_NAMES.NANOGPT,
+	PROVIDER_NAMES.KILO,
+	PROVIDER_NAMES.OPENROUTER,
+	PROVIDER_NAMES.ALIBABA_CODING_PLAN,
+	PROVIDER_NAMES.OLLAMA_CLOUD,
+]);
+const CUSTOM_BILLING_PROVIDERS = new Set<string>([
+	PROVIDER_NAMES.ANTHROPIC_COMPATIBLE,
+	PROVIDER_NAMES.OPENAI_COMPATIBLE,
+]);
+const LOCAL_PROVIDERS = new Set<string>([PROVIDER_NAMES.OLLAMA]);
+const CLOUD_CREDENTIAL_PROVIDERS = new Set<string>([
+	PROVIDER_NAMES.BEDROCK,
+	PROVIDER_NAMES.VERTEX_AI,
+]);
+
+/** Derive the durable, non-secret enrollment boundary for an account. */
+export function deriveComboRouteClass(
+	account: Pick<
+		Account,
+		"provider" | "billing_type" | "api_key" | "refresh_token" | "access_token"
+	>,
+): ComboRouteClass | null {
+	if (LOCAL_PROVIDERS.has(account.provider)) return "local";
+	if (CLOUD_CREDENTIAL_PROVIDERS.has(account.provider)) {
+		return "cloud-credential";
+	}
+
+	const isOAuthProvider = OAUTH_SUBSCRIPTION_PROVIDERS.has(account.provider);
+	const isApiKeyProvider = API_KEY_PROVIDERS.has(account.provider);
+	if (!isOAuthProvider && !isApiKeyProvider) return null;
+
+	const billingType = account.billing_type?.trim().toLowerCase() || null;
+	if (billingType !== null && billingType !== "plan" && billingType !== "api") {
+		return null;
+	}
+
+	// Secrets never participate in a selector. Their presence is reduced to a
+	// boolean auth shape so contradictory persisted records can fail closed.
+	const hasApiKey = Boolean(account.api_key?.trim());
+	const hasOAuthCredential = Boolean(
+		account.refresh_token?.trim() || account.access_token?.trim(),
+	);
+	if (hasApiKey && hasOAuthCredential) return null;
+
+	if (isOAuthProvider) {
+		if (billingType === "api" || hasApiKey) return null;
+		return "oauth-subscription";
+	}
+
+	if (hasOAuthCredential) return null;
+	if (CUSTOM_BILLING_PROVIDERS.has(account.provider)) {
+		return billingType === "plan" ? "oauth-subscription" : "api-key";
+	}
+	if (billingType === "plan") return null;
+	return "api-key";
+}
+
+const UNKNOWN_LOGICAL_MODEL_CAPABILITY: LogicalModelCapability = {
+	status: "unknown",
+	provenance: "undeclared",
+	reason: "unknown",
+};
+
+/**
+ * Resolve managed-routing model support without provider I/O. The transport
+ * provider must exist before account mappings are trusted, so unknown provider
+ * strings fail closed even when they carry mapping-shaped data.
+ */
+export function resolveAccountLogicalModelCapability(
+	account: Account,
+	logicalModel: string,
+	capabilityProviderLookup: typeof getCapabilityProvider = getCapabilityProvider,
+): LogicalModelCapability {
+	const provider = capabilityProviderLookup(account.provider);
+	if (!provider) return UNKNOWN_LOGICAL_MODEL_CAPABILITY;
+
+	const configured = getConfiguredModelMapping(logicalModel, account);
+	if (configured) {
+		return configured.models.some(
+			(model) => typeof model === "string" && model.trim().length > 0,
+		)
+			? {
+					status: "supported",
+					provenance: "explicit_account_mapping",
+					reason: "included",
+				}
+			: UNKNOWN_LOGICAL_MODEL_CAPABILITY;
+	}
+
+	return (
+		provider.getLogicalModelCapability?.(logicalModel, account) ??
+		UNKNOWN_LOGICAL_MODEL_CAPABILITY
+	);
+}
+
 export interface ModelContextCapability {
 	provider: string;
 	model: string;

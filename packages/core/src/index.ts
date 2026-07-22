@@ -1,4 +1,6 @@
 // Re-export only used items from each module
+
+export * from "./combo-membership-resolver";
 export {
 	BUFFER_SIZES,
 	CACHE,
@@ -14,7 +16,6 @@ export {
 	resolveCooldownUntil,
 	TIME_CONSTANTS,
 } from "./constants";
-
 export {
 	isInvalidGrantMessage,
 	logError,
@@ -28,7 +29,6 @@ export {
 	TokenRefreshError,
 	ValidationError,
 } from "./errors";
-
 export * from "./lifecycle";
 
 // Export types for model mappings - defined inline in model-mappings.ts
@@ -51,6 +51,7 @@ export {
 export {
 	createCustomEndpointData,
 	getAllowedModelsMessage,
+	getConfiguredModelMapping,
 	getEndpointUrl,
 	getModelFamily,
 	getModelList,
@@ -76,6 +77,7 @@ export {
 	isValidModelId,
 	LATEST_FABLE_MODEL,
 	LATEST_HAIKU_MODEL,
+	LATEST_MODEL_BY_FAMILY,
 	LATEST_OPUS_MODEL,
 	LATEST_SONNET_MODEL,
 	MODEL_DISPLAY_NAMES,

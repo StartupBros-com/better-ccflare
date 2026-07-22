@@ -21,6 +21,7 @@ export {
 export * from "./providers/index";
 // Export registry functions
 export {
+	getCapabilityProvider,
 	getOAuthProvider,
 	getProvider,
 	listOAuthProviders,

@@ -124,6 +124,8 @@ export interface RoutingCapacityContext {
 export interface AccountSelectionOptions {
 	/** Bypass active combo lookup for the explicit post-combo normal fallback. */
 	readonly skipCombo?: boolean;
+	/** Ignore request-reactive model/family markers for a trusted synthetic probe. */
+	readonly syntheticProbe?: boolean;
 }
 
 /** Request-local capacity evidence retained for terminal classification. */
@@ -287,6 +289,7 @@ function evaluateCandidateCapacity(
 	model: string,
 	betaSignature: string,
 	now: number,
+	syntheticProbe: boolean,
 ): CandidateCapacityEvaluation {
 	const snapshot = usageCache.getSnapshot(account.id);
 	const blockers: RoutingCapacityBlocker[] = [];
@@ -327,13 +330,15 @@ function evaluateCandidateCapacity(
 		}
 	}
 
-	const reactive = getReactiveModelCapacityBlocker(
-		account.id,
-		model,
-		betaSignature,
-		now,
-	);
-	if (reactive) blockers.push(reactive);
+	if (!syntheticProbe) {
+		const reactive = getReactiveModelCapacityBlocker(
+			account.id,
+			model,
+			betaSignature,
+			now,
+		);
+		if (reactive) blockers.push(reactive);
+	}
 
 	return {
 		blockers,
@@ -394,6 +399,7 @@ function prepareNormalRoutingMetadata(
 	meta: RequestMeta,
 	accounts: Account[],
 	effectiveModel: string | null,
+	syntheticProbe: boolean,
 ): Account[] {
 	meta.affinityLaneKey = deriveAffinityLaneKey(meta, effectiveModel);
 	if (!effectiveModel) {
@@ -418,6 +424,7 @@ function prepareNormalRoutingMetadata(
 			effectiveModel,
 			beta,
 			now,
+			syntheticProbe,
 		);
 		if (evaluation.quotaPressure) {
 			quotaPressure.set(account.id, evaluation.quotaPressure);
@@ -479,6 +486,7 @@ export async function getOrderedAccounts(
 	meta: RequestMeta,
 	ctx: ProxyContext,
 	effectiveModel: string | null = null,
+	syntheticProbe = false,
 ): Promise<Account[]> {
 	try {
 		const allAccounts = await ctx.dbOps.getAllAccounts();
@@ -487,6 +495,7 @@ export async function getOrderedAccounts(
 			meta,
 			allAccounts,
 			effectiveModel,
+			syntheticProbe,
 		);
 		const hardExcluded = meta.hardExcludedAccountIds;
 		// Return all accounts - the provider will be determined dynamically per account.
@@ -610,6 +619,7 @@ export async function selectAccountsForRequest(
 							effectiveModel,
 							canonicalizeBetaSignature(meta.headers.get("anthropic-beta")),
 							now,
+							options.syntheticProbe === true,
 						);
 						meta.quotaPressureByAccountId = evaluation.quotaPressure
 							? new Map([[forcedAccount.id, evaluation.quotaPressure]])
@@ -787,6 +797,7 @@ export async function selectAccountsForRequest(
 							slot.model,
 							beta,
 							now,
+							options.syntheticProbe === true,
 						);
 						routing.quotaPressure = evaluation.quotaPressure;
 						if (evaluation.blockers.length > 0) {
@@ -944,5 +955,12 @@ export async function selectAccountsForRequest(
 		}
 	}
 
-	return applyExclusions(await getOrderedAccounts(meta, ctx, effectiveModel));
+	return applyExclusions(
+		await getOrderedAccounts(
+			meta,
+			ctx,
+			effectiveModel,
+			options.syntheticProbe === true,
+		),
+	);
 }

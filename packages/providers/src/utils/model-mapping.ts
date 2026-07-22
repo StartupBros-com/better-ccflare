@@ -1,4 +1,4 @@
-import { getModelFamily, parseModelMappings } from "@better-ccflare/core";
+import { mapModelName } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import type { Account } from "@better-ccflare/types";
 
@@ -51,36 +51,10 @@ export function getModelName(
 	anthropicModel: string,
 	account: Account | undefined,
 ): string {
-	if (!anthropicModel || !account?.model_mappings) {
+	if (!anthropicModel || !account) {
 		return anthropicModel;
 	}
-
-	const accountMappings = parseModelMappings(account.model_mappings);
-	if (!accountMappings) {
-		return anthropicModel;
-	}
-
-	const toFirst = (v: string | string[]) => (Array.isArray(v) ? v[0] : v);
-
-	// First try exact match
-	if (accountMappings[anthropicModel]) {
-		const mappedModel = toFirst(accountMappings[anthropicModel]);
-		log.debug(`Exact model mapping: ${anthropicModel} -> ${mappedModel}`);
-		return mappedModel;
-	}
-
-	// Use shared pattern detection
-	const family = getModelFamily(anthropicModel);
-	if (family && accountMappings[family]) {
-		const mappedModel = toFirst(accountMappings[family]);
-		log.debug(
-			`Pattern model mapping: ${anthropicModel} (${family}) -> ${mappedModel}`,
-		);
-		return mappedModel;
-	}
-
-	// No mapping found, return original
-	return anthropicModel;
+	return mapModelName(anthropicModel, account);
 }
 
 /**

@@ -343,6 +343,9 @@ export function ensureSchema(db: Database): void {
 			family TEXT PRIMARY KEY,
 			combo_id TEXT,
 			enabled INTEGER DEFAULT 0,
+			membership_mode TEXT NOT NULL DEFAULT 'manual'
+				CHECK (membership_mode IN ('manual', 'managed')),
+			managed_model TEXT DEFAULT NULL,
 			FOREIGN KEY (combo_id) REFERENCES combos(id) ON DELETE SET NULL
 		)
 	`);
@@ -356,6 +359,57 @@ export function ensureSchema(db: Database): void {
 		       ('sonnet', NULL, 0),
 		       ('haiku',  NULL, 0);
 	`);
+
+	// Managed policy is normalized and additive. No derived account membership is
+	// persisted, so manual assignments retain the exact legacy slot behavior.
+	db.run(`
+		CREATE TABLE IF NOT EXISTS combo_enrollment_rules (
+			id TEXT PRIMARY KEY,
+			family TEXT NOT NULL,
+			combo_id TEXT NOT NULL,
+			provider TEXT NOT NULL CHECK (length(trim(provider)) > 0),
+			route_class TEXT NOT NULL
+				CHECK (route_class IN ('oauth-subscription', 'api-key', 'local', 'cloud-credential')),
+			enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			FOREIGN KEY (family) REFERENCES combo_family_assignments(family) ON DELETE CASCADE,
+			FOREIGN KEY (combo_id) REFERENCES combos(id) ON DELETE CASCADE
+		)
+	`);
+	db.run(
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_combo_enrollment_rules_unique
+		 ON combo_enrollment_rules(family, combo_id, provider, route_class)`,
+	);
+	db.run(
+		`CREATE INDEX IF NOT EXISTS idx_combo_enrollment_rules_combo_id
+		 ON combo_enrollment_rules(combo_id)`,
+	);
+
+	db.run(`
+		CREATE TABLE IF NOT EXISTS combo_membership_exclusions (
+			id TEXT PRIMARY KEY,
+			family TEXT NOT NULL,
+			combo_id TEXT NOT NULL,
+			account_id TEXT NOT NULL,
+			created_at INTEGER NOT NULL,
+			FOREIGN KEY (family) REFERENCES combo_family_assignments(family) ON DELETE CASCADE,
+			FOREIGN KEY (combo_id) REFERENCES combos(id) ON DELETE CASCADE,
+			FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+		)
+	`);
+	db.run(
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_combo_membership_exclusions_unique
+		 ON combo_membership_exclusions(family, combo_id, account_id)`,
+	);
+	db.run(
+		`CREATE INDEX IF NOT EXISTS idx_combo_membership_exclusions_combo_id
+		 ON combo_membership_exclusions(combo_id)`,
+	);
+	db.run(
+		`CREATE INDEX IF NOT EXISTS idx_combo_membership_exclusions_account_id
+		 ON combo_membership_exclusions(account_id)`,
+	);
 
 	// Create usage_snapshots table: time series of per-account usage-window
 	// utilization (0–100) captured on each /oauth/usage poll. Append-only, no
@@ -499,6 +553,12 @@ export function runMigrations(db: Database, dbPath?: string): void {
 	const initialOauthSessionsColumnNames = oauthSessionsInfo.map(
 		(col) => col.name,
 	);
+	const comboFamilyAssignmentsInfo = db
+		.prepare("PRAGMA table_info(combo_family_assignments)")
+		.all() as Array<{ name: string }>;
+	const comboFamilyAssignmentColumnNames = comboFamilyAssignmentsInfo.map(
+		(column) => column.name,
+	);
 
 	const refreshTokenCol = accountsInfo.find(
 		(col) => col.name === "refresh_token",
@@ -590,6 +650,21 @@ export function runMigrations(db: Database, dbPath?: string): void {
 
 	// Wrap database operations in a transaction for atomicity
 	const migrationTx = db.transaction(() => {
+		if (!comboFamilyAssignmentColumnNames.includes("membership_mode")) {
+			db.prepare(
+				`ALTER TABLE combo_family_assignments
+				 ADD COLUMN membership_mode TEXT NOT NULL DEFAULT 'manual'
+				 CHECK (membership_mode IN ('manual', 'managed'))`,
+			).run();
+			log.info("Added manual-default membership policy to family assignments");
+		}
+		if (!comboFamilyAssignmentColumnNames.includes("managed_model")) {
+			db.prepare(
+				"ALTER TABLE combo_family_assignments ADD COLUMN managed_model TEXT DEFAULT NULL",
+			).run();
+			log.info("Added managed logical model to family assignments");
+		}
+
 		// Add rate_limited_until column if it doesn't exist
 		if (!initialAccountsColumnNames.includes("rate_limited_until")) {
 			db.prepare(

@@ -30,6 +30,8 @@ export interface RoutingTerminalOptions {
 	readonly now?: number;
 	readonly message?: string;
 	readonly routeCircuitRecoveryHint?: RouteCircuitRecoveryHint | null;
+	/** Request-local finite recovery learned after the selection snapshot. */
+	readonly modelRecoveryAt?: number | null;
 }
 
 interface AutomaticRecovery {
@@ -243,12 +245,14 @@ export function createModelPoolExhaustedResponse(options: {
 	capacityContext: RoutingCapacityContext | null;
 	rateLimitOutcomes: readonly RequestRateLimitOutcome[];
 	now: number;
+	modelRecoveryAt?: number | null;
 }): Response {
-	const { capacityContext, rateLimitOutcomes, now } = options;
+	const { capacityContext, rateLimitOutcomes, now, modelRecoveryAt } = options;
 	const nextAvailableAt = earliestFuture(
 		[
 			capacityContext?.blockedUntil,
 			...rateLimitOutcomes.map((outcome) => outcome.availableAt),
+			modelRecoveryAt,
 		],
 		now,
 	);
@@ -412,6 +416,7 @@ export function createRoutingTerminalResponse(
 					options.source === "selection" ? options.capacityContext : null,
 				rateLimitOutcomes: options.rateLimitOutcomes,
 				now,
+				modelRecoveryAt: options.modelRecoveryAt,
 			}),
 		};
 	}

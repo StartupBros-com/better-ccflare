@@ -1,4 +1,12 @@
-import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
+import {
+	afterEach,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	mock,
+	spyOn,
+} from "bun:test";
 import {
 	type CacheReplayModelStrategy,
 	usageCache,
@@ -19,6 +27,7 @@ import {
 	stampInternalAutoRefreshAuth,
 } from "../internal-probe-auth";
 import { handleProxy } from "../proxy";
+import * as usageCollectorModule from "../usage-collector";
 
 function makeAccount(overrides: Partial<Account> = {}): Account {
 	return {
@@ -114,8 +123,31 @@ function makeRequest(
 
 const originalFetch = globalThis.fetch;
 const originalCachePacingMs = process.env[CACHE_PACING_MS_ENV];
+let restoreUsageCollector = (): void => {};
+
+beforeEach(() => {
+	const collector = {
+		handleStart: mock(() => undefined),
+		handleChunk: mock(() => undefined),
+		handleEnd: mock(async () => undefined),
+	};
+	const requiredCollectorSpy = spyOn(
+		usageCollectorModule,
+		"getUsageCollector",
+	).mockReturnValue(collector as never);
+	const optionalCollectorSpy = spyOn(
+		usageCollectorModule,
+		"tryGetUsageCollector",
+	).mockReturnValue(collector as never);
+	restoreUsageCollector = () => {
+		requiredCollectorSpy.mockRestore();
+		optionalCollectorSpy.mockRestore();
+	};
+});
 
 afterEach(() => {
+	restoreUsageCollector();
+	restoreUsageCollector = (): void => {};
 	globalThis.fetch = originalFetch;
 	usageCache.delete("refresh-account");
 	cacheBodyStore.setEnabled(false);

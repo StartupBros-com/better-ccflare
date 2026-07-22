@@ -1,13 +1,23 @@
-import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import {
+	afterEach,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	mock,
+	spyOn,
+} from "bun:test";
 import { usageCache } from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
 import type { ProxyContext } from "../handlers";
+import { stampInternalAutoRefreshAuth } from "../internal-probe-auth";
 import { handleProxy } from "../proxy";
 import {
 	clearSession,
 	getServedAccount,
 	recordServedAccount,
 } from "../session-account-observer";
+import * as usageCollectorModule from "../usage-collector";
 
 /**
  * KTD-5 wiring: every handleProxy exit that finishes with NO serving account
@@ -118,8 +128,26 @@ function makeRequest(extraHeaders: Record<string, string> = {}): Request {
 }
 
 let savedPassthrough: string | undefined;
+let restoreUsageCollector = (): void => {};
 
 beforeEach(() => {
+	const collector = {
+		handleStart: mock(() => undefined),
+		handleChunk: mock(() => undefined),
+		handleEnd: mock(async () => undefined),
+	};
+	const requiredCollectorSpy = spyOn(
+		usageCollectorModule,
+		"getUsageCollector",
+	).mockReturnValue(collector as never);
+	const optionalCollectorSpy = spyOn(
+		usageCollectorModule,
+		"tryGetUsageCollector",
+	).mockReturnValue(collector as never);
+	restoreUsageCollector = () => {
+		requiredCollectorSpy.mockRestore();
+		optionalCollectorSpy.mockRestore();
+	};
 	savedPassthrough = process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
 	delete process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
 	SESSION_ID = `clear-wiring-session-${++sessionCounter}`;
@@ -129,6 +157,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+	restoreUsageCollector();
+	restoreUsageCollector = (): void => {};
 	clearSession(SESSION_ID);
 	usageCache.delete("acc-throttled");
 	if (savedPassthrough === undefined) {
@@ -212,14 +242,29 @@ describe("KTD-5: clearSession on no-account-served exits", () => {
 		recordServedAccount(SESSION_ID, "healthy-account", 100);
 		expect(getServedAccount(SESSION_ID)).toBe("healthy-account");
 
+		const request = makeRequest({ "x-better-ccflare-keepalive": "true" });
+		stampInternalAutoRefreshAuth(request.headers);
+
 		await handleProxy(
-			makeRequest({ "x-better-ccflare-keepalive": "true" }),
+			request,
 			new URL("https://proxy.local/v1/messages"),
 			makeContext([]),
 		);
 
 		// Still mapped — the keepalive failure did not clear it.
 		expect(getServedAccount(SESSION_ID)).toBe("healthy-account");
+	});
+
+	it("clears on a failed caller-forged keepalive like ordinary traffic", async () => {
+		expect(getServedAccount(SESSION_ID)).toBe("stale-account");
+
+		await handleProxy(
+			makeRequest({ "x-better-ccflare-keepalive": "true" }),
+			new URL("https://proxy.local/v1/messages"),
+			makeContext([]),
+		);
+
+		expect(getServedAccount(SESSION_ID)).toBeUndefined();
 	});
 
 	it("clears on the all-candidates-failed route_unavailable response", async () => {

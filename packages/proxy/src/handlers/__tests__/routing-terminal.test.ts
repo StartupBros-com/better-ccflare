@@ -274,6 +274,29 @@ describe("routing terminal responses", () => {
 		}
 	});
 
+	it("uses a finite request-local model recovery hint when selection evidence is stale", async () => {
+		const now = Date.UTC(2026, 6, 17, 12);
+		const recoveryAt = now + 45_001;
+		const response = createModelPoolExhaustedResponse({
+			capacityContext: null,
+			rateLimitOutcomes: [],
+			now,
+			modelRecoveryAt: recoveryAt,
+		});
+
+		expect(response.headers.get("retry-after")).toBe("46");
+		expect(response.headers.get("x-better-ccflare-pool-status")).toBe(
+			"exhausted",
+		);
+		expect(response.headers.get("x-better-ccflare-recovery-scope")).toBe(
+			"model",
+		);
+		const parsed = await body(response);
+		expect(parsed.error.next_available_at).toBe(
+			new Date(recoveryAt).toISOString(),
+		);
+	});
+
 	it("omits an unknown model recovery instead of fabricating Retry-After", async () => {
 		const terminal = createRoutingTerminalResponse({
 			source: "selection",

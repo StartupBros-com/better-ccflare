@@ -1513,9 +1513,11 @@ describe("source-controlled stack runner", () => {
 		const fixture = join(dir, "stubborn-stack-child.mjs");
 		const eventsFile = join(dir, "events.log");
 		const runnerPidFile = join(dir, "runner.pid");
+		const nodeBin = Bun.which("node");
+		if (!nodeBin) throw new Error("Node executable not found on PATH");
 		writeFileSync(
 			fixture,
-			`#!/usr/bin/node
+			`#!${nodeBin}
 import { appendFileSync } from "node:fs";
 import http from "node:http";
 
@@ -1566,7 +1568,7 @@ process.on("SIGTERM", () => {
 					USER: "ccflare-test",
 					CCFLARE_BIN: shellPath(fixture),
 					GUARD_SCRIPT: shellPath(fixture),
-					NODE_BIN: "/usr/bin/node",
+					NODE_BIN: nodeBin,
 					CCFLARE_UPSTREAM_PORT: String(upstreamPort),
 					GUARD_PORT: String(guardPort),
 					AI_GATEWAY_TUNNEL_ENABLED: "0",

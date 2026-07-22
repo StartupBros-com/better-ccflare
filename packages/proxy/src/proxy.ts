@@ -8,6 +8,7 @@ import {
 import { DatabaseFactory } from "@better-ccflare/database";
 import { Logger } from "@better-ccflare/logger";
 import {
+	canonicalizeBetaSignature,
 	deriveCacheFlightRecorderId,
 	deriveXaiConversationIdentity,
 	estimateAnthropicAdmissionTokens,
@@ -67,6 +68,7 @@ import {
 	selectAccountsForRequest,
 	validateProviderPath,
 } from "./handlers";
+import { getReactiveModelCapacityBlocker } from "./handlers/account-selector";
 import {
 	completeRateLimitProbe,
 	getRateLimitProbeAdmission,
@@ -99,27 +101,32 @@ import {
 
 export type { ProxyContext } from "./handlers";
 
-export function isReactivelyModelDepleted(opts: {
+interface ReactiveModelDepletionOptions {
 	accountId: string;
 	model: string | null;
 	betaSignature: string | null;
 	syntheticProbe: boolean;
 	now?: number;
-}): boolean {
-	if (opts.syntheticProbe || !opts.model) return false;
+}
+
+function getReactiveModelRecoveryAt(
+	opts: ReactiveModelDepletionOptions,
+): number | null {
+	if (opts.syntheticProbe || !opts.model) return null;
 	return (
-		usageCache.getModelScopedExhaustion(
+		getReactiveModelCapacityBlocker(
 			opts.accountId,
 			opts.model,
-			opts.betaSignature,
-			opts.now,
-		) != null ||
-		usageCache.getFamilyScopedExhaustion(
-			opts.accountId,
-			opts.model,
-			opts.now,
-		) != null
+			canonicalizeBetaSignature(opts.betaSignature),
+			opts.now ?? Date.now(),
+		)?.evidenceExpiresAt ?? null
 	);
+}
+
+export function isReactivelyModelDepleted(
+	opts: ReactiveModelDepletionOptions,
+): boolean {
+	return getReactiveModelRecoveryAt(opts) !== null;
 }
 
 /**
@@ -538,6 +545,7 @@ async function handleProxyCore(
 	const canaryCandidate = isCodexPacingBypassCandidate(pacingCohortKey);
 	requestMeta.codexPacingCohortId = pacingCohortKey?.slice(0, 16) ?? null;
 	const effectiveModel = resolveEffectiveModel(appliedModel, requestModel);
+	const syntheticProbe = trustedInternalKeepalive;
 	const selectAccountsWithDeadline = (
 		options?: Parameters<typeof selectAccountsForRequest>[3],
 	) =>
@@ -550,7 +558,7 @@ async function handleProxyCore(
 					requestMeta,
 					ctx,
 					effectiveModel ?? undefined,
-					options,
+					{ ...options, syntheticProbe },
 				),
 		});
 	const getRouteCircuitRecoveryHint = () =>
@@ -639,7 +647,18 @@ async function handleProxyCore(
 		}
 		throw error;
 	}
-	const syntheticProbe = trustedInternalKeepalive;
+	let reactiveModelRecoveryAt: number | null = null;
+	const hasReactiveModelDepletion = (
+		opts: ReactiveModelDepletionOptions,
+	): boolean => {
+		const recoveryAt = getReactiveModelRecoveryAt(opts);
+		if (recoveryAt === null) return false;
+		reactiveModelRecoveryAt =
+			reactiveModelRecoveryAt === null
+				? recoveryAt
+				: Math.min(reactiveModelRecoveryAt, recoveryAt);
+		return true;
+	};
 	const applyUsageThrottling = (accounts: Account[]) => {
 		const settings = {
 			fiveHourEnabled: ctx.config.getUsageThrottlingFiveHourEnabled(),
@@ -672,7 +691,7 @@ async function handleProxyCore(
 				: null;
 			const reactivelyDepleted =
 				!comboRouted &&
-				isReactivelyModelDepleted({
+				hasReactiveModelDepletion({
 					accountId: account.id,
 					model: effectiveModel,
 					betaSignature: req.headers.get("anthropic-beta"),
@@ -803,6 +822,7 @@ async function handleProxyCore(
 					capacityContext: getRoutingCapacityContext(requestMeta),
 					rateLimitOutcomes: getRequestRateLimitOutcomes(req),
 					now: Date.now(),
+					modelRecoveryAt: reactiveModelRecoveryAt,
 				}),
 			);
 		}
@@ -1022,7 +1042,7 @@ async function handleProxyCore(
 		if (
 			filteredComboInfo &&
 			attemptModel &&
-			isReactivelyModelDepleted({
+			hasReactiveModelDepletion({
 				accountId: accounts[i].id,
 				model: attemptModel,
 				betaSignature,
@@ -1260,6 +1280,7 @@ async function handleProxyCore(
 					capacityContext: getRoutingCapacityContext(requestMeta),
 					rateLimitOutcomes: getRequestRateLimitOutcomes(req),
 					now: Date.now(),
+					modelRecoveryAt: reactiveModelRecoveryAt,
 				}),
 			);
 		} else if (
@@ -1294,7 +1315,7 @@ async function handleProxyCore(
 			requestMeta.comboSlotIndex = route.comboSlotIndex;
 
 			if (
-				isReactivelyModelDepleted({
+				hasReactiveModelDepletion({
 					accountId: route.account.id,
 					model: route.model,
 					betaSignature,
@@ -1410,6 +1431,7 @@ async function handleProxyCore(
 				capacityContext: getRoutingCapacityContext(requestMeta),
 				rateLimitOutcomes: getRequestRateLimitOutcomes(req),
 				now: Date.now(),
+				modelRecoveryAt: reactiveModelRecoveryAt,
 			}),
 		);
 	}
@@ -1435,6 +1457,7 @@ async function handleProxyCore(
 					capacityContext: getRoutingCapacityContext(requestMeta),
 					rateLimitOutcomes: getRequestRateLimitOutcomes(req),
 					now: Date.now(),
+					modelRecoveryAt: reactiveModelRecoveryAt,
 				}),
 			);
 		}
@@ -1520,6 +1543,7 @@ async function handleProxyCore(
 		capacityContext: getRoutingCapacityContext(requestMeta),
 		rateLimitOutcomes: getRequestRateLimitOutcomes(req),
 		upstreamAttempts: actualUpstreamAttempts,
+		modelRecoveryAt: reactiveModelRecoveryAt,
 		message: formatRoutingAttemptMessage(
 			ERROR_MESSAGES.ALL_UPSTREAM_ROUTES_FAILED,
 			routingAttemptLedger,

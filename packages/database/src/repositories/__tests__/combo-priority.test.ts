@@ -30,7 +30,9 @@ describe("ComboRepository priority tiers", () => {
 			CREATE TABLE combo_family_assignments (
 				family TEXT PRIMARY KEY,
 				combo_id TEXT,
-				enabled INTEGER NOT NULL
+				enabled INTEGER NOT NULL,
+				membership_mode TEXT NOT NULL DEFAULT 'manual',
+				managed_model TEXT
 			);
 		`);
 		db.run(
@@ -66,7 +68,7 @@ describe("ComboRepository priority tiers", () => {
 		insertSlot("slot-b", 0);
 		insertSlot("slot-a", 0);
 		db.run(
-			"INSERT INTO combo_family_assignments VALUES ('opus', 'combo-1', 1)",
+			"INSERT INTO combo_family_assignments (family, combo_id, enabled) VALUES ('opus', 'combo-1', 1)",
 		);
 
 		const active = await repo.getActiveComboForFamily("opus");

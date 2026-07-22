@@ -1390,6 +1390,46 @@ describe("selectAccountsForRequest — model-lane hard capacity", () => {
 		]);
 	});
 
+	it("bypasses reactive markers only for explicit synthetic probes while preserving snapshot blockers", async () => {
+		const account = makeAccount({ id: "synthetic-capacity" });
+		const headers = new Headers({
+			"x-better-ccflare-account-id": account.id,
+		});
+		usageCache.markFamilyScopedExhausted(
+			account.id,
+			"claude-fable-5",
+			Date.now() + 60_000,
+		);
+		cachedUsageAccountIds.add(account.id);
+		const ctx = makeCtx({ accounts: [account] });
+
+		await expect(
+			selectAccountsForRequest(
+				makeRequestMeta({ headers }),
+				ctx,
+				"claude-fable-5",
+			),
+		).rejects.toMatchObject({ reason: "model_capacity_exhausted" });
+
+		const synthetic = await selectAccountsForRequest(
+			makeRequestMeta({ headers: new Headers(headers) }),
+			ctx,
+			"claude-fable-5",
+			{ syntheticProbe: true },
+		);
+		expect(synthetic).toEqual([account]);
+
+		cacheUsage(account.id, weeklyScoped("Fable"));
+		await expect(
+			selectAccountsForRequest(
+				makeRequestMeta({ headers: new Headers(headers) }),
+				ctx,
+				"claude-fable-5",
+				{ syntheticProbe: true },
+			),
+		).rejects.toMatchObject({ reason: "model_capacity_exhausted" });
+	});
+
 	it("uses inferred family evidence for every Fable version while leaving Opus usable", async () => {
 		const preferred = makeAccount({
 			id: "reactive-family-preferred",

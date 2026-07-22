@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
 	getAllowedModelsMessage,
+	getConfiguredModelMapping,
 	getModelFamily,
 	isValidClaudeModel,
 	mapModelName,
@@ -9,6 +10,30 @@ import {
 import type { Account } from "@better-ccflare/types";
 
 describe("Model Mapping", () => {
+	test("distinguishes an explicit mapping from ordinary pass-through", () => {
+		const account = {
+			id: "test",
+			name: "mapped",
+			provider: "openai-compatible",
+			model_mappings: JSON.stringify({
+				"claude-opus-special": "physical-exact",
+				opus: ["physical-family", "physical-fallback"],
+			}),
+			model_fallbacks: null,
+			custom_endpoint: null,
+		} as Account;
+
+		expect(getConfiguredModelMapping("claude-opus-special", account)).toEqual({
+			models: ["physical-exact"],
+			match: "exact",
+		});
+		expect(getConfiguredModelMapping("claude-opus-current", account)).toEqual({
+			models: ["physical-family", "physical-fallback"],
+			match: "family",
+		});
+		expect(getConfiguredModelMapping("claude-fable-5", account)).toBeNull();
+	});
+
 	test("parseModelMappings handles valid JSON", () => {
 		const mappings = JSON.stringify({
 			sonnet: "gpt-4",

@@ -761,6 +761,7 @@ describe("raw upstream HTTP 402 routing", () => {
 			reason: "header_absent_legacy_body_disabled",
 			delayMs: 0,
 			recoverySource: null,
+			recoveryScope: null,
 		});
 	});
 });

@@ -2,6 +2,7 @@
  * Centralized model definitions and constants
  * All Claude model IDs and metadata should be defined here
  */
+import type { ComboFamily } from "@better-ccflare/types";
 
 // Full model IDs as used by the Anthropic API
 export const CLAUDE_MODEL_IDS = {
@@ -65,6 +66,16 @@ export const LATEST_FABLE_MODEL = CLAUDE_MODEL_IDS.FABLE_5;
 export const LATEST_OPUS_MODEL = CLAUDE_MODEL_IDS.OPUS_4_8;
 export const LATEST_SONNET_MODEL = CLAUDE_MODEL_IDS.SONNET_5;
 export const LATEST_HAIKU_MODEL = CLAUDE_MODEL_IDS.HAIKU_4_5;
+
+/** Canonical logical policy model for each managed family. */
+export const LATEST_MODEL_BY_FAMILY: Readonly<
+	Record<ComboFamily, ClaudeModelId>
+> = {
+	fable: LATEST_FABLE_MODEL,
+	opus: LATEST_OPUS_MODEL,
+	sonnet: LATEST_SONNET_MODEL,
+	haiku: LATEST_HAIKU_MODEL,
+};
 
 // Default model for various contexts
 export const DEFAULT_MODEL = CLAUDE_MODEL_IDS.SONNET_5;

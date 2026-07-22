@@ -323,7 +323,7 @@ const DOCUMENT_FORMAT_BY_MEDIA_TYPE = {
 function normalizeDocumentName(value: unknown): string {
 	const source = isNonEmptyString(value) ? value.trim() : "document";
 	const normalized = source
-		.replace(/[^\p{L}\p{N}\s()\[\]-]/gu, "-")
+		.replace(/[^\p{L}\p{N}\s()[\]-]/gu, "-")
 		.replace(/\s+/g, " ")
 		.replace(/-+/g, "-")
 		.slice(0, 200);

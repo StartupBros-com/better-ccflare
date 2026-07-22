@@ -7,6 +7,22 @@ import {
 } from "../model-mapping";
 
 describe("getModelName", () => {
+	it("shares legacy and fallback mapping precedence with core", () => {
+		const account = {
+			id: "test-id",
+			name: "test-account",
+			provider: "openai-compatible",
+			model_mappings: JSON.stringify({ opus: "account-opus" }),
+			custom_endpoint: JSON.stringify({
+				modelMappings: { opus: "legacy-opus" },
+			}),
+			model_fallbacks: JSON.stringify({ fable: "fallback-fable" }),
+		} as Account;
+
+		expect(getModelName("claude-opus-4-8", account)).toBe("legacy-opus");
+		expect(getModelName("claude-fable-5", account)).toBe("fallback-fable");
+	});
+
 	it("returns original model when no account mappings", () => {
 		const result = getModelName("claude-sonnet-4-5-20250929", undefined);
 		expect(result).toBe("claude-sonnet-4-5-20250929");
