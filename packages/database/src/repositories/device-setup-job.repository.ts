@@ -553,11 +553,18 @@ export class DeviceSetupJobRepository extends BaseRepository<DeviceSetupJob> {
 		}
 		const changes = await this.runWithChanges(
 			`UPDATE device_setup_jobs
-			 SET lease_expires_at = ?, updated_at = ?
+			 SET lease_expires_at = CASE
+			       WHEN lease_expires_at < ? THEN ?
+			       ELSE lease_expires_at
+			     END,
+			     updated_at = CASE
+			       WHEN updated_at < ? THEN ?
+			       ELSE updated_at
+			     END
 			 WHERE id = ? AND lease_token = ?
 			   AND status IN ${CLAIMABLE_STATUS_SQL}
 			   AND lease_expires_at > ?`,
-			[leaseExpiresAt, now, id, leaseToken, now],
+			[leaseExpiresAt, leaseExpiresAt, now, now, id, leaseToken, now],
 		);
 		return changes === 1;
 	}

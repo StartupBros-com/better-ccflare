@@ -137,6 +137,26 @@ describe("DeviceSetupJobRepository", () => {
 		expect(claimed?.attemptCount).toBe(2);
 	});
 
+	it("does not move lease timestamps backward when an older renewal finishes last", async () => {
+		const { job } = await createJob();
+
+		expect(await repository.tryClaim(job.id, "worker-a", 1_100, 2_100)).toBe(
+			true,
+		);
+		expect(await repository.renewLease(job.id, "worker-a", 1_300, 2_300)).toBe(
+			true,
+		);
+		expect(await repository.renewLease(job.id, "worker-a", 1_200, 2_200)).toBe(
+			true,
+		);
+
+		expect(await repository.findById(job.id)).toMatchObject({
+			leaseToken: "worker-a",
+			leaseExpiresAt: 2_300,
+			updatedAt: 1_300,
+		});
+	});
+
 	it("recovers an account commit only from the exact preallocated account id", async () => {
 		const { job } = await createJob();
 		await repository.tryClaim(job.id, "worker", 1_100, 2_100);
