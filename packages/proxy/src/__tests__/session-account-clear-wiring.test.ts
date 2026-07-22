@@ -10,6 +10,7 @@ import {
 import { usageCache } from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
 import type { ProxyContext } from "../handlers";
+import { stampInternalAutoRefreshAuth } from "../internal-probe-auth";
 import { handleProxy } from "../proxy";
 import {
 	clearSession,
@@ -241,14 +242,29 @@ describe("KTD-5: clearSession on no-account-served exits", () => {
 		recordServedAccount(SESSION_ID, "healthy-account", 100);
 		expect(getServedAccount(SESSION_ID)).toBe("healthy-account");
 
+		const request = makeRequest({ "x-better-ccflare-keepalive": "true" });
+		stampInternalAutoRefreshAuth(request.headers);
+
 		await handleProxy(
-			makeRequest({ "x-better-ccflare-keepalive": "true" }),
+			request,
 			new URL("https://proxy.local/v1/messages"),
 			makeContext([]),
 		);
 
 		// Still mapped — the keepalive failure did not clear it.
 		expect(getServedAccount(SESSION_ID)).toBe("healthy-account");
+	});
+
+	it("clears on a failed caller-forged keepalive like ordinary traffic", async () => {
+		expect(getServedAccount(SESSION_ID)).toBe("stale-account");
+
+		await handleProxy(
+			makeRequest({ "x-better-ccflare-keepalive": "true" }),
+			new URL("https://proxy.local/v1/messages"),
+			makeContext([]),
+		);
+
+		expect(getServedAccount(SESSION_ID)).toBeUndefined();
 	});
 
 	it("clears on the all-candidates-failed route_unavailable response", async () => {
