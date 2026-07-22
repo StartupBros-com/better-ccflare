@@ -1,4 +1,24 @@
 /**
+ * Exact managed-routing surface shared with the packaged CLI help.
+ */
+export function getManagedRoutingHelpText(): string {
+	return `Managed routing (live server; admin key is read only from BETTER_CCFLARE_ADMIN_API_KEY):
+  routing list [--api-url <loopback-url>] [--json]
+  routing detail <account-id> [--api-url <loopback-url>] [--json]
+  routing preview <family> [--managed-model <model>] [--api-url <loopback-url>] [--json]
+  routing apply <family> --preview-id <id> --proposal-id <id> --managed-model <model> --yes [--api-url <loopback-url>] [--json]
+  routing manual <family> --yes [--api-url <loopback-url>] [--json]
+
+  Families: fable, opus, sonnet, haiku
+  Interactive apply may omit the reviewed tuple to preview, review exact deltas,
+  select a proposal explicitly, and confirm. JSON and non-interactive mutations
+  require every displayed identifier/model plus --yes.
+  After interactive account creation, each selected family is freshly previewed,
+  reviewed, and confirmed before its account-scoped write. Non-interactive account
+  creation prints the immutable account ID and follow-up commands without routing writes.`;
+}
+
+/**
  * Get help text for CLI commands
  */
 export function getHelpText(): string {
@@ -6,7 +26,7 @@ export function getHelpText(): string {
 Usage: better-ccflare <command> [options]
 
 Commands:
-  add <name> [--mode <claude-oauth|console|codex|qwen|xai|zai|minimax|anthropic-compatible|openai-compatible|nanogpt|kilo|openrouter|ollama|ollama-cloud>] [--priority <number>] [--modelMappings <JSON>]
+  add <name> [--mode <claude-oauth|console|codex|qwen|xai|zai|minimax|anthropic-compatible|openai-compatible|nanogpt|kilo|openrouter|ollama|ollama-cloud>] [--priority <number>] [--modelMappings <JSON>] [--api-url <loopback-url>]
     Add a new account using OAuth or API key
     --mode: Account type (optional, will prompt if not provided)
       claude-oauth: Claude CLI OAuth account (OAuth)
@@ -25,6 +45,7 @@ Commands:
       ollama-cloud: Ollama Cloud provider (ollama.com, API key required)
     --priority: Account priority (0-100, default 0, lower numbers = higher priority)
     --modelMappings: Model mappings as JSON string (e.g., '{"opus":"my-opus-model","sonnet":"my-sonnet-model"}')
+    --api-url: Optional loopback live-server target for post-create routing review
 
   list
     List all accounts with their details
@@ -59,6 +80,8 @@ Commands:
   reauth-needed
     Quick check for accounts that need re-authentication
     Shows only accounts that require immediate attention
+
+${getManagedRoutingHelpText()}
 
   --cache-flight-recorder-report <id> [--json]
     Report a retained cache flight recorder timeline by opaque recorder ID

@@ -65,6 +65,22 @@ export interface AddAccountOptionsWithAdapter {
 	adapter?: PromptAdapter;
 }
 
+export interface CreatedAccountIdentity {
+	readonly id: string;
+	readonly name: string;
+	readonly provider: string;
+}
+
+export function toCreatedAccountIdentity(
+	account: CreatedAccountIdentity,
+): CreatedAccountIdentity {
+	return Object.freeze({
+		id: account.id,
+		name: account.name,
+		provider: account.provider,
+	});
+}
+
 // Re-export AccountListItem from types for backward compatibility
 export type { AccountListItem } from "@better-ccflare/types";
 
@@ -99,7 +115,7 @@ async function createConsoleAccountWithApiKey(
 	apiKey: string,
 	priority: number,
 	customEndpoint?: string,
-): Promise<void> {
+): Promise<CreatedAccountIdentity> {
 	const accountId = crypto.randomUUID();
 	const now = Date.now();
 
@@ -125,6 +141,11 @@ async function createConsoleAccountWithApiKey(
 
 	console.log(`\nAccount '${name}' added successfully!`);
 	console.log("Type: Claude Console (API key)");
+	return toCreatedAccountIdentity({
+		id: accountId,
+		name,
+		provider: "claude-console-api",
+	});
 }
 
 /**
@@ -135,7 +156,7 @@ async function createMinimaxAccount(
 	name: string,
 	apiKey: string,
 	priority: number,
-): Promise<void> {
+): Promise<CreatedAccountIdentity> {
 	const accountId = crypto.randomUUID();
 	const now = Date.now();
 
@@ -158,6 +179,7 @@ async function createMinimaxAccount(
 			null, // No custom endpoint for minimax
 		],
 	);
+	return toCreatedAccountIdentity({ id: accountId, name, provider: "minimax" });
 }
 
 /**
@@ -171,7 +193,7 @@ export async function createNanoGPTAccount(
 	customEndpoint?: string,
 	modelMappings?: { [key: string]: string | string[] } | null,
 	modelFallbacks?: { [key: string]: string | string[] } | null,
-): Promise<void> {
+): Promise<CreatedAccountIdentity> {
 	const accountId = crypto.randomUUID();
 	const now = Date.now();
 	// Validate inputs
@@ -216,6 +238,7 @@ export async function createNanoGPTAccount(
 			validatedModelFallbacks,
 		],
 	);
+	return toCreatedAccountIdentity({ id: accountId, name, provider: "nanogpt" });
 }
 
 /**
@@ -228,7 +251,7 @@ async function createKiloAccount(
 	priority: number,
 	modelMappings?: { [key: string]: string | string[] } | null,
 	modelFallbacks?: { [key: string]: string | string[] } | null,
-): Promise<void> {
+): Promise<CreatedAccountIdentity> {
 	const accountId = crypto.randomUUID();
 	const now = Date.now();
 	const validatedApiKey = validateApiKey(apiKey, "Kilo API key");
@@ -266,6 +289,7 @@ async function createKiloAccount(
 			validatedModelFallbacks,
 		],
 	);
+	return toCreatedAccountIdentity({ id: accountId, name, provider: "kilo" });
 }
 
 /**
@@ -278,7 +302,7 @@ async function createAlibabaCodingPlanAccount(
 	priority: number,
 	modelMappings?: { [key: string]: string | string[] } | null,
 	modelFallbacks?: { [key: string]: string | string[] } | null,
-): Promise<void> {
+): Promise<CreatedAccountIdentity> {
 	const accountId = crypto.randomUUID();
 	const now = Date.now();
 	const validatedApiKey = validateApiKey(apiKey, "Alibaba Coding Plan API key");
@@ -316,6 +340,11 @@ async function createAlibabaCodingPlanAccount(
 			validatedModelFallbacks,
 		],
 	);
+	return toCreatedAccountIdentity({
+		id: accountId,
+		name,
+		provider: "alibaba-coding-plan",
+	});
 }
 
 /**
@@ -328,7 +357,7 @@ async function createOpenRouterAccount(
 	priority: number,
 	modelMappings?: { [key: string]: string | string[] } | null,
 	modelFallbacks?: { [key: string]: string | string[] } | null,
-): Promise<void> {
+): Promise<CreatedAccountIdentity> {
 	const accountId = crypto.randomUUID();
 	const now = Date.now();
 	const validatedApiKey = validateApiKey(apiKey, "OpenRouter API key");
@@ -366,6 +395,11 @@ async function createOpenRouterAccount(
 			validatedModelFallbacks,
 		],
 	);
+	return toCreatedAccountIdentity({
+		id: accountId,
+		name,
+		provider: "openrouter",
+	});
 }
 
 /**
@@ -380,7 +414,7 @@ async function createAnthropicCompatibleAccount(
 	modelMappings?: { [key: string]: string | string[] } | null,
 	modelFallbacks?: { [key: string]: string | string[] } | null,
 	provider = "anthropic-compatible",
-): Promise<void> {
+): Promise<CreatedAccountIdentity> {
 	const accountId = crypto.randomUUID();
 	const now = Date.now();
 
@@ -428,6 +462,7 @@ async function createAnthropicCompatibleAccount(
 			validatedModelFallbacks,
 		],
 	);
+	return toCreatedAccountIdentity({ id: accountId, name, provider });
 }
 
 /**
@@ -440,7 +475,7 @@ async function createZaiAccount(
 	priority: number,
 	modelMappings?: { [key: string]: string | string[] } | null,
 	modelFallbacks?: { [key: string]: string | string[] } | null,
-): Promise<void> {
+): Promise<CreatedAccountIdentity> {
 	const accountId = crypto.randomUUID();
 	const now = Date.now();
 
@@ -481,6 +516,7 @@ async function createZaiAccount(
 
 	console.log(`\nAccount '${name}' added successfully!`);
 	console.log("Type: z.ai (API key)");
+	return toCreatedAccountIdentity({ id: accountId, name, provider: "zai" });
 }
 
 /**
@@ -529,7 +565,7 @@ async function createBedrockAccount(
 	region: string,
 	priority: number,
 	crossRegionMode?: "geographic" | "global" | "regional",
-): Promise<void> {
+): Promise<CreatedAccountIdentity> {
 	const accountId = crypto.randomUUID();
 	const now = Date.now();
 	const validatedPriority = validatePriority(priority, "priority");
@@ -558,6 +594,7 @@ async function createBedrockAccount(
 			crossRegionMode || "geographic",
 		],
 	);
+	return toCreatedAccountIdentity({ id: accountId, name, provider: "bedrock" });
 }
 
 /**
@@ -569,7 +606,7 @@ async function createVertexAIAccount(
 	projectId: string,
 	region: string,
 	priority: number,
-): Promise<void> {
+): Promise<CreatedAccountIdentity> {
 	const accountId = crypto.randomUUID();
 	const now = Date.now();
 
@@ -620,6 +657,11 @@ async function createVertexAIAccount(
 	console.log(
 		"  • export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json",
 	);
+	return toCreatedAccountIdentity({
+		id: accountId,
+		name,
+		provider: "vertex-ai",
+	});
 }
 
 /**
@@ -760,7 +802,7 @@ async function createXaiAccount(
 	priority: number,
 	customEndpoint?: string,
 	modelMappings?: ModelMapping | null,
-): Promise<void> {
+): Promise<CreatedAccountIdentity> {
 	const auth = loadGrokAuthEntry();
 	if (!auth?.key || !auth.refresh_token) {
 		throw new Error(
@@ -820,6 +862,7 @@ async function createXaiAccount(
 			console.log(`  ${key} → ${value}`);
 		}
 	}
+	return toCreatedAccountIdentity({ id: accountId, name, provider: "xai" });
 }
 
 async function createOpenAIAccount(
@@ -830,7 +873,7 @@ async function createOpenAIAccount(
 	priority: number,
 	modelMappings: ModelMapping | null,
 	modelFallbacks?: ModelMapping | null,
-): Promise<void> {
+): Promise<CreatedAccountIdentity> {
 	const accountId = crypto.randomUUID();
 	const now = Date.now();
 
@@ -889,6 +932,11 @@ async function createOpenAIAccount(
 			console.log(`  ${key} → ${value}`);
 		}
 	}
+	return toCreatedAccountIdentity({
+		id: accountId,
+		name,
+		provider: "openai-compatible",
+	});
 }
 
 /**
@@ -901,7 +949,7 @@ async function createCodexOAuthAccount(
 	customEndpoint?: string,
 	modelMappings?: { [key: string]: string | string[] } | null,
 	modelFallbacks?: { [key: string]: string | string[] } | null,
-): Promise<void> {
+): Promise<CreatedAccountIdentity> {
 	// Get the CodexOAuthProvider
 	const oauthProvider = getOAuthProvider("codex");
 	if (!oauthProvider) {
@@ -1031,6 +1079,7 @@ async function createCodexOAuthAccount(
 
 	console.log(`\nAccount '${name}' added successfully!`);
 	console.log("Type: Codex (OpenAI OAuth)");
+	return toCreatedAccountIdentity({ id: accountId, name, provider: "codex" });
 }
 
 async function createQwenOAuthAccount(
@@ -1039,7 +1088,7 @@ async function createQwenOAuthAccount(
 	priority: number,
 	modelMappings?: { [key: string]: string | string[] } | null,
 	modelFallbacks?: { [key: string]: string | string[] } | null,
-): Promise<void> {
+): Promise<CreatedAccountIdentity> {
 	console.log("\nQwen uses OAuth device code authentication.");
 	console.log("You will be given a URL and a code to enter in your browser.\n");
 
@@ -1129,6 +1178,7 @@ async function createQwenOAuthAccount(
 
 	console.log(`\nAccount '${name}' added successfully!`);
 	console.log("Type: Qwen (OAuth device code)");
+	return toCreatedAccountIdentity({ id: accountId, name, provider: "qwen" });
 }
 
 /**
@@ -1146,6 +1196,64 @@ function normalizeQwenBaseUrl(url: string): string {
 	return normalized;
 }
 
+async function completeAnthropicOAuthAccount(
+	oauthFlow: Awaited<ReturnType<typeof createOAuthFlow>>,
+	name: string,
+	mode: "claude-oauth" | "console",
+	priority: number,
+	customEndpoint: string | undefined,
+	adapter: PromptAdapter,
+): Promise<CreatedAccountIdentity> {
+	const flowResult = await oauthFlow.begin({ name, mode });
+	const { authUrl, sessionId } = flowResult;
+
+	console.log("\nOpening browser to authenticate...");
+	console.log(`URL: ${authUrl}`);
+	const browserOpened = await openBrowser(authUrl);
+	if (!browserOpened) {
+		console.log(
+			"\nFailed to open browser automatically. Please manually open the URL above.",
+		);
+	}
+
+	const code = await adapter.input("\nEnter the authorization code: ");
+
+	let endpointForOAuth = customEndpoint;
+	if (!customEndpoint) {
+		const wantsCustomEndpoint = await adapter.select(
+			`\nDo you want to use a custom endpoint for this ${mode === "claude-oauth" ? "OAuth" : "Console"} account?`,
+			[
+				{ label: "No, use default endpoint", value: "no" },
+				{ label: "Yes, use custom endpoint", value: "yes" },
+			],
+		);
+
+		if (wantsCustomEndpoint === "yes") {
+			endpointForOAuth = await adapter.input(
+				"Enter custom endpoint URL (e.g., https://api.anthropic.com): ",
+			);
+		}
+	}
+
+	console.log("\nExchanging code for tokens...");
+	const account = await oauthFlow.complete(
+		{
+			sessionId,
+			code,
+			name,
+			priority,
+			customEndpoint: endpointForOAuth,
+		},
+		flowResult,
+	);
+
+	console.log(`\nAccount '${name}' added successfully!`);
+	console.log(
+		`Type: ${mode === "claude-oauth" ? "Claude CLI OAuth" : "Claude API"}`,
+	);
+	return toCreatedAccountIdentity(account);
+}
+
 /**
  * Add a new account using OAuth flow
  */
@@ -1153,7 +1261,7 @@ export async function addAccount(
 	dbOps: DatabaseOperations,
 	config: Config,
 	options: AddAccountOptionsWithAdapter,
-): Promise<void> {
+): Promise<CreatedAccountIdentity> {
 	const {
 		name,
 		mode: providedMode,
@@ -1230,7 +1338,7 @@ export async function addAccount(
 		const priority = providedPriority || 0;
 
 		// Create account
-		await createBedrockAccount(
+		return createBedrockAccount(
 			dbOps,
 			name,
 			profile,
@@ -1278,7 +1386,7 @@ export async function addAccount(
 				"\nEnter priority (0 = highest, lower number = higher priority, default 0): ",
 			));
 
-		await createVertexAIAccount(
+		return createVertexAIAccount(
 			dbOps,
 			name,
 			projectId,
@@ -1297,7 +1405,7 @@ export async function addAccount(
 			modelMappings,
 		);
 
-		await createZaiAccount(
+		return createZaiAccount(
 			dbOps,
 			name,
 			apiKey,
@@ -1345,7 +1453,7 @@ export async function addAccount(
 			}
 
 			// Create console account with direct API key
-			await createConsoleAccountWithApiKey(
+			const createdAccount = await createConsoleAccountWithApiKey(
 				dbOps,
 				name,
 				apiKey,
@@ -1358,9 +1466,16 @@ export async function addAccount(
 			if (endpointForConsole) {
 				console.log(`Endpoint: ${endpointForConsole}`);
 			}
-			return; // Exit early for direct API key approach
+			return createdAccount; // Exit early for direct API key approach
 		}
-		// Fall through to OAuth flow for consoleMethod === "oauth"
+		return completeAnthropicOAuthAccount(
+			oauthFlow,
+			name,
+			"console",
+			providedPriority || 0,
+			customEndpoint,
+			adapter,
+		);
 	} else if (mode === "openai-compatible") {
 		// Handle OpenAI-compatible accounts with API keys
 		const apiKey = await adapter.input("\nEnter your API key: ");
@@ -1385,7 +1500,7 @@ export async function addAccount(
 			modelMappings,
 		);
 
-		await createOpenAIAccount(
+		return createOpenAIAccount(
 			dbOps,
 			name,
 			apiKey,
@@ -1399,9 +1514,15 @@ export async function addAccount(
 		// Handle Minimax accounts with API keys
 		const apiKey = await adapter.input("\nEnter your Minimax API key: ");
 
-		await createMinimaxAccount(dbOps, name, apiKey, providedPriority || 0);
+		const createdAccount = await createMinimaxAccount(
+			dbOps,
+			name,
+			apiKey,
+			providedPriority || 0,
+		);
 		console.log(`\nAccount '${name}' added successfully!`);
 		console.log("Type: Minimax (API key)");
+		return createdAccount;
 	} else if (mode === "nanogpt") {
 		// Handle NanoGPT accounts with API keys
 		const apiKey = await adapter.input("\nEnter your NanoGPT API key: ");
@@ -1424,7 +1545,7 @@ export async function addAccount(
 			modelMappings,
 		);
 
-		await createNanoGPTAccount(
+		const createdAccount = await createNanoGPTAccount(
 			dbOps,
 			name,
 			apiKey,
@@ -1436,6 +1557,7 @@ export async function addAccount(
 		);
 		console.log(`\nAccount '${name}' added successfully!`);
 		console.log("Type: NanoGPT (API key)");
+		return createdAccount;
 	} else if (mode === "kilo") {
 		// Handle Kilo Gateway accounts with API keys
 		const apiKey = await adapter.input("\nEnter your Kilo API key: ");
@@ -1451,7 +1573,7 @@ export async function addAccount(
 			modelMappings,
 		);
 
-		await createKiloAccount(
+		const createdAccount = await createKiloAccount(
 			dbOps,
 			name,
 			apiKey,
@@ -1463,6 +1585,7 @@ export async function addAccount(
 		console.log(`\nAccount '${name}' added successfully!`);
 		console.log("Type: Kilo Gateway (API key)");
 		console.log("Endpoint: https://api.kilo.ai/api/gateway");
+		return createdAccount;
 	} else if (mode === "openrouter") {
 		// Handle OpenRouter accounts with API keys
 		const apiKey = await adapter.input("\nEnter your OpenRouter API key: ");
@@ -1478,7 +1601,7 @@ export async function addAccount(
 			modelMappings,
 		);
 
-		await createOpenRouterAccount(
+		const createdAccount = await createOpenRouterAccount(
 			dbOps,
 			name,
 			apiKey,
@@ -1490,6 +1613,7 @@ export async function addAccount(
 		console.log(`\nAccount '${name}' added successfully!`);
 		console.log("Type: OpenRouter (API key)");
 		console.log("Endpoint: https://openrouter.ai/api/v1");
+		return createdAccount;
 	} else if (mode === "alibaba-coding-plan") {
 		// Handle Alibaba Coding Plan accounts with API keys
 		const apiKey = await adapter.input(
@@ -1507,7 +1631,7 @@ export async function addAccount(
 			modelMappings,
 		);
 
-		await createAlibabaCodingPlanAccount(
+		const createdAccount = await createAlibabaCodingPlanAccount(
 			dbOps,
 			name,
 			apiKey,
@@ -1519,6 +1643,7 @@ export async function addAccount(
 		console.log(`\nAccount '${name}' added successfully!`);
 		console.log("Type: Alibaba Coding Plan International (API key)");
 		console.log("Endpoint: https://coding-intl.dashscope.aliyuncs.com");
+		return createdAccount;
 	} else if (mode === "codex") {
 		// Handle Codex accounts via OpenAI OAuth (port-1455 callback server)
 		const priority =
@@ -1539,7 +1664,7 @@ export async function addAccount(
 			},
 		);
 
-		await createCodexOAuthAccount(
+		return createCodexOAuthAccount(
 			dbOps,
 			name,
 			typeof priority === "number"
@@ -1568,7 +1693,7 @@ export async function addAccount(
 			},
 		);
 
-		await createQwenOAuthAccount(
+		return createQwenOAuthAccount(
 			dbOps,
 			name,
 			typeof priority === "number"
@@ -1592,7 +1717,7 @@ export async function addAccount(
 			XAI_MODEL_MAPPINGS,
 		);
 
-		await createXaiAccount(
+		return createXaiAccount(
 			dbOps,
 			name,
 			typeof priority === "number"
@@ -1627,7 +1752,7 @@ export async function addAccount(
 			modelMappings,
 		);
 
-		await createAnthropicCompatibleAccount(
+		const createdAccount = await createAnthropicCompatibleAccount(
 			dbOps,
 			name,
 			apiKey,
@@ -1640,6 +1765,7 @@ export async function addAccount(
 		console.log(`\nAccount '${name}' added successfully!`);
 		console.log("Type: Anthropic-compatible (API key)");
 		console.log(`Endpoint: ${endpoint}`);
+		return createdAccount;
 	} else if (mode === "ollama") {
 		// Ollama uses the Anthropic-compatible endpoint at /v1/messages (no API key required)
 		const endpoint =
@@ -1660,7 +1786,7 @@ export async function addAccount(
 			modelMappings,
 		);
 
-		await createAnthropicCompatibleAccount(
+		const createdAccount = await createAnthropicCompatibleAccount(
 			dbOps,
 			name,
 			"ollama",
@@ -1675,6 +1801,7 @@ export async function addAccount(
 		console.log(`\nAccount '${name}' added successfully!`);
 		console.log("Type: Ollama (v0.14.0+)");
 		console.log(`Endpoint: ${endpoint}`);
+		return createdAccount;
 	} else if (mode === "ollama-cloud") {
 		const apiKey = await adapter.input("\nEnter Ollama Cloud API key: ");
 
@@ -1693,7 +1820,7 @@ export async function addAccount(
 			modelMappings,
 		);
 
-		await createAnthropicCompatibleAccount(
+		const createdAccount = await createAnthropicCompatibleAccount(
 			dbOps,
 			name,
 			apiKey,
@@ -1708,61 +1835,15 @@ export async function addAccount(
 		console.log(`\nAccount '${name}' added successfully!`);
 		console.log("Type: Ollama Cloud");
 		console.log(`Endpoint: https://ollama.com/api/chat`);
+		return createdAccount;
 	} else {
-		// Handle OAuth accounts (Anthropic)
-		const flowResult = await oauthFlow.begin({
+		return completeAnthropicOAuthAccount(
+			oauthFlow,
 			name,
-			mode: mode as "claude-oauth" | "console",
-		});
-		const { authUrl, sessionId } = flowResult;
-
-		// Open browser and prompt for code
-		console.log(`\nOpening browser to authenticate...`);
-		console.log(`URL: ${authUrl}`);
-		const browserOpened = await openBrowser(authUrl);
-		if (!browserOpened) {
-			console.log(
-				`\nFailed to open browser automatically. Please manually open the URL above.`,
-			);
-		}
-
-		// Get authorization code
-		const code = await adapter.input("\nEnter the authorization code: ");
-
-		// Get custom endpoint for Max/Console modes if not provided
-		let endpointForOAuth = customEndpoint;
-		if ((mode === "claude-oauth" || mode === "console") && !customEndpoint) {
-			const wantsCustomEndpoint = await adapter.select(
-				`\nDo you want to use a custom endpoint for this ${mode === "claude-oauth" ? "OAuth" : "Console"} account?`,
-				[
-					{ label: "No, use default endpoint", value: "no" },
-					{ label: "Yes, use custom endpoint", value: "yes" },
-				],
-			);
-
-			if (wantsCustomEndpoint === "yes") {
-				endpointForOAuth = await adapter.input(
-					"Enter custom endpoint URL (e.g., https://api.anthropic.com): ",
-				);
-			}
-		}
-
-		// Complete OAuth flow
-		console.log("\nExchanging code for tokens...");
-		const _account = await oauthFlow.complete(
-			{
-				sessionId,
-				code,
-				name,
-				priority: providedPriority || 0,
-				customEndpoint: endpointForOAuth,
-			},
-			flowResult,
-		);
-
-		console.log(`\nAccount '${name}' added successfully!`);
-		console.log(
-			`Type: ${mode === "claude-oauth" ? "Claude CLI OAuth" : "Claude API"}`,
+			mode as "claude-oauth",
+			providedPriority || 0,
+			customEndpoint,
+			adapter,
 		);
 	}
 }

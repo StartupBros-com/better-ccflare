@@ -27,33 +27,16 @@ for (const envPath of possibleEnvPaths) {
 	}
 }
 
+import type { CreatedAccountIdentity } from "@better-ccflare/cli-commands";
+import { getManagedRoutingHelpText } from "@better-ccflare/cli-commands/help";
+import { createManagedRoutingClient } from "@better-ccflare/cli-commands/managed-routing-client";
 import {
-	addAccount,
-	analyzePerformance,
-	cacheFlightRecorderError,
-	clearRequestHistory,
-	compactDatabase,
-	deleteApiKey,
-	disableApiKey,
-	enableApiKey,
-	forceResetRateLimit,
-	formatApiKeyForDisplay,
-	formatApiKeyGenerationResult,
-	generateApiKey,
-	getAccountsList,
-	getApiKeyStats,
-	handleRepairCommand,
-	isValidCacheFlightRecorderId,
-	listApiKeys,
-	pauseAccount,
-	reauthenticateAccount,
-	removeAccount,
-	resetAllStats,
-	resumeAccount,
-	runCacheFlightRecorderCommand,
-	runDoctor,
-	setAccountPriority,
-} from "@better-ccflare/cli-commands";
+	executeManagedRoutingCliCommand,
+	handlePostCreateManagedRouting,
+	type ManagedRoutingCliCommand,
+	ManagedRoutingCliUsageError,
+	parseManagedRoutingCliCommand,
+} from "@better-ccflare/cli-commands/runner";
 import { Config } from "@better-ccflare/config";
 import {
 	CLAUDE_MODEL_IDS,
@@ -63,14 +46,7 @@ import {
 	shutdown,
 } from "@better-ccflare/core";
 import { container, SERVICE_KEYS } from "@better-ccflare/core-di";
-import { DatabaseFactory } from "@better-ccflare/database";
 import { Logger } from "@better-ccflare/logger";
-import {
-	isCacheFlightRecorderEnabled,
-	parseBedrockConfig,
-} from "@better-ccflare/providers";
-// Import server
-import startServer from "@better-ccflare/server";
 
 interface ParsedArgs {
 	version: boolean;
@@ -126,6 +102,7 @@ interface ParsedArgs {
 	forceResetRateLimit: string | null;
 	showConfig: boolean;
 	admin: boolean;
+	apiUrl: string | null;
 }
 
 // When the long-running server starts, its own SIGINT/SIGTERM handlers
@@ -138,7 +115,8 @@ let serverOwnsShutdown = false;
 /**
  * Helper function to start server with unified environment variable handling
  */
-function startServerWithConfig(args: ParsedArgs, config: Config) {
+async function startServerWithConfig(args: ParsedArgs, config: Config) {
+	const { default: startServer } = await import("@better-ccflare/server");
 	serverOwnsShutdown = true;
 	const runtime = config.getRuntime();
 
@@ -489,6 +467,7 @@ function parseArgs(args: string[]): ParsedArgs {
 		forceResetRateLimit: null,
 		showConfig: false,
 		admin: false,
+		apiUrl: null,
 	};
 
 	for (let i = 0; i < args.length; i++) {
@@ -766,6 +745,13 @@ function parseArgs(args: string[]): ParsedArgs {
 			case "--json":
 				parsed.json = true;
 				break;
+			case "--api-url":
+				if (i + 1 >= args.length || args[i + 1].startsWith("--")) {
+					console.error("❌ --api-url requires a loopback URL");
+					fastExit(2);
+				}
+				parsed.apiUrl = args[++i];
+				break;
 			case "--reset-stats":
 				parsed.resetStats = true;
 				break;
@@ -859,12 +845,47 @@ function hasRecorderCommandConflict(args: string[]): boolean {
 
 async function main() {
 	const args = process.argv.slice(2);
+	const interactive = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+	let routingCommand: ManagedRoutingCliCommand | null;
+	try {
+		routingCommand = parseManagedRoutingCliCommand(args, { interactive });
+	} catch (error) {
+		console.error(
+			error instanceof Error ? error.message : "Invalid routing arguments.",
+		);
+		fastExit(2);
+	}
+	if (routingCommand) {
+		try {
+			const result = await executeManagedRoutingCliCommand(routingCommand, {
+				interactive,
+				onReviewOutput: (output) => console.log(output),
+			});
+			console.log(result.output);
+			fastExit(result.exitCode);
+		} catch (error) {
+			console.error(
+				error instanceof Error
+					? error.message
+					: "Managed-routing operation failed.",
+			);
+			fastExit(error instanceof ManagedRoutingCliUsageError ? 2 : 1);
+		}
+	}
 	const parsed = parseArgs(args);
 	const recorderRequested =
 		args.includes("--cache-flight-recorder-report") ||
 		parsed.cacheFlightRecorderHealth;
 
 	if (recorderRequested) {
+		const {
+			cacheFlightRecorderError,
+			isValidCacheFlightRecorderId,
+			runCacheFlightRecorderCommand,
+		} = await import("@better-ccflare/cli-commands");
+		const { isCacheFlightRecorderEnabled } = await import(
+			"@better-ccflare/providers"
+		);
 		const invalidReportId =
 			args.includes("--cache-flight-recorder-report") &&
 			!isValidCacheFlightRecorderId(parsed.cacheFlightRecorderReport);
@@ -884,6 +905,7 @@ async function main() {
 
 		try {
 			const config = new Config();
+			const { DatabaseFactory } = await import("@better-ccflare/database");
 			DatabaseFactory.initialize(undefined, undefined, false);
 			const dbOps = await DatabaseFactory.getInstanceAsync(false);
 			const options = parsed.cacheFlightRecorderReport
@@ -963,6 +985,9 @@ Options:
   --resume <name>      Resume an account
   --force-reset-rate-limit <name> Force-clear stale rate-limit lock for an account
   --set-priority <name> <priority>  Set account priority
+
+${getManagedRoutingHelpText()}
+
   --analyze            Analyze database performance
   --repair-db          Check and repair database integrity
   --doctor             Run database integrity check and storage diagnostics
@@ -1009,6 +1034,33 @@ Examples:
 		return;
 	}
 
+	if (parsed.apiUrl && !parsed.addAccount) {
+		console.error(
+			"--api-url is valid only with a routing command or --add-account.",
+		);
+		fastExit(2);
+	}
+	if (parsed.addAccount && parsed.json) {
+		console.error(
+			"--json is not supported with --add-account because provider setup may emit interactive output.",
+		);
+		fastExit(2);
+	}
+	if (parsed.addAccount && (parsed.apiUrl || interactive)) {
+		try {
+			createManagedRoutingClient({
+				...(parsed.apiUrl ? { baseUrl: parsed.apiUrl } : {}),
+			});
+		} catch (error) {
+			console.error(
+				error instanceof Error
+					? error.message
+					: "Managed-routing API configuration is invalid.",
+			);
+			fastExit(2);
+		}
+	}
+
 	// Handle commands that don't need database or DI initialization
 	if (parsed.getModel || parsed.setModel) {
 		// Initialize only config for these simple commands
@@ -1047,9 +1099,37 @@ Examples:
 		}
 	}
 
+	const {
+		addAccount,
+		analyzePerformance,
+		clearRequestHistory,
+		compactDatabase,
+		deleteApiKey,
+		disableApiKey,
+		enableApiKey,
+		forceResetRateLimit,
+		formatApiKeyForDisplay,
+		formatApiKeyGenerationResult,
+		generateApiKey,
+		getAccountsList,
+		getApiKeyStats,
+		handleRepairCommand,
+		listApiKeys,
+		pauseAccount,
+		reauthenticateAccount,
+		removeAccount,
+		resetAllStats,
+		resumeAccount,
+		runDoctor,
+		setAccountPriority,
+		stdPromptAdapter,
+	} = await import("@better-ccflare/cli-commands");
+	const { parseBedrockConfig } = await import("@better-ccflare/providers");
+
 	// Initialize DI container and services for commands that need them
 	container.registerInstance(SERVICE_KEYS.Config, new Config());
 	container.registerInstance(SERVICE_KEYS.Logger, new Logger("CLI"));
+	const { DatabaseFactory } = await import("@better-ccflare/database");
 
 	// Initialize database factory with minimal configuration for CLI commands
 	// CLI commands don't need expensive integrity checks
@@ -1060,7 +1140,7 @@ Examples:
 	// Handle non-interactive commands
 	if (parsed.serve) {
 		const config = new Config();
-		startServerWithConfig(parsed, config);
+		await startServerWithConfig(parsed, config);
 		// Keep process alive
 		await new Promise(() => {});
 		return;
@@ -1137,13 +1217,14 @@ Examples:
 			// OAuth modes need interactive prompts for the auth code
 			const needsInteractiveAuth =
 				mode === "claude-oauth" || mode === "console" || mode === "codex";
+			let createdAccount: CreatedAccountIdentity;
 
 			if (needsInteractiveAuth) {
 				// Use real prompt adapter for OAuth - needs user to paste auth code
 				const { stdPromptAdapter } = await import(
 					"@better-ccflare/cli-commands"
 				);
-				await addAccount(dbOps, new Config(), {
+				createdAccount = await addAccount(dbOps, new Config(), {
 					name: parsed.addAccount,
 					mode,
 					priority,
@@ -1158,7 +1239,7 @@ Examples:
 					);
 					await exitGracefully(1);
 				}
-				await addAccount(dbOps, new Config(), {
+				createdAccount = await addAccount(dbOps, new Config(), {
 					name: parsed.addAccount,
 					mode: "bedrock",
 					priority,
@@ -1174,7 +1255,7 @@ Examples:
 					},
 				});
 			} else if (mode === "xai") {
-				await addAccount(dbOps, new Config(), {
+				createdAccount = await addAccount(dbOps, new Config(), {
 					name: parsed.addAccount,
 					mode: "xai",
 					priority,
@@ -1195,7 +1276,7 @@ Examples:
 				const { stdPromptAdapter } = await import(
 					"@better-ccflare/cli-commands"
 				);
-				await addAccount(dbOps, new Config(), {
+				createdAccount = await addAccount(dbOps, new Config(), {
 					name: parsed.addAccount,
 					mode,
 					priority,
@@ -1226,7 +1307,7 @@ Examples:
 					}
 				}
 
-				await addAccount(dbOps, new Config(), {
+				createdAccount = await addAccount(dbOps, new Config(), {
 					name: parsed.addAccount,
 					mode,
 					priority,
@@ -1240,7 +1321,14 @@ Examples:
 					},
 				});
 			}
-			console.log(`✅ Account "${parsed.addAccount}" added successfully`);
+			const postCreateExit = await handlePostCreateManagedRouting({
+				identity: createdAccount,
+				interactive,
+				json: parsed.json,
+				...(parsed.apiUrl ? { apiUrl: parsed.apiUrl } : {}),
+				prompt: stdPromptAdapter,
+			});
+			await exitGracefully(postCreateExit);
 		} catch (error: unknown) {
 			const errorMessage =
 				error instanceof Error ? error.message : String(error);
@@ -1485,26 +1573,28 @@ Examples:
 	// Default: Start server if no command specified
 	console.log("Starting better-ccflare server...");
 	const config = new Config();
-	startServerWithConfig(parsed, config);
+	await startServerWithConfig(parsed, config);
 
 	// Keep process alive
 	await new Promise(() => {});
 }
 
-// Run main and handle errors
-main().catch(async (error) => {
-	console.error("Error:", error.message);
-	await exitGracefully(1);
-});
+if (import.meta.main) {
+	// Run main and handle errors
+	main().catch(async (error) => {
+		console.error("Error:", error.message);
+		await exitGracefully(1);
+	});
 
-// Handle process termination. When the server is running it owns shutdown
-// (see serverOwnsShutdown); these handlers cover short-lived CLI commands.
-process.on("SIGINT", async () => {
-	if (serverOwnsShutdown) return;
-	await exitGracefully(0);
-});
+	// Handle process termination. When the server is running it owns shutdown
+	// (see serverOwnsShutdown); these handlers cover short-lived CLI commands.
+	process.on("SIGINT", async () => {
+		if (serverOwnsShutdown) return;
+		await exitGracefully(0);
+	});
 
-process.on("SIGTERM", async () => {
-	if (serverOwnsShutdown) return;
-	await exitGracefully(0);
-});
+	process.on("SIGTERM", async () => {
+		if (serverOwnsShutdown) return;
+		await exitGracefully(0);
+	});
+}

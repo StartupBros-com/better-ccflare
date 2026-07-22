@@ -15,13 +15,13 @@ import type {
 	Account,
 	AccountQuotaPressure,
 	ComboFamily,
-	ComboMembershipReasonCode,
 	ComboMembershipSource,
 	ComboRoutingPolicySnapshot,
 	ComboSlotInfo,
 	RequestMeta,
 	RoutingCandidateMetadata,
 } from "@better-ccflare/types";
+import { buildComboMembershipDiagnostics } from "./managed-routing-diagnostics";
 import type { ProxyContext } from "./proxy-types";
 import {
 	evaluateHardCapacity,
@@ -39,6 +39,12 @@ const PRESSURE_RANK = {
 	urgent: 4,
 	critical: 5,
 } as const;
+
+export {
+	buildComboMembershipDiagnostics,
+	type ComboMembershipDiagnostics,
+	type ComboMembershipDiagnosticsSelection,
+} from "./managed-routing-diagnostics";
 
 /** Higher comparable pressure is consumed first; incomparable lanes stay stable. */
 function compareCandidatePressure(
@@ -782,35 +788,15 @@ export async function selectAccountsForRequest(
 						resolveCapability: resolveAccountLogicalModelCapability,
 					},
 				);
-				const sourceCounts: Record<ComboMembershipSource, number> = {
-					manual: 0,
-					managed: 0,
-				};
-				for (const member of resolution.members) {
-					sourceCounts[member.source]++;
-				}
-				const reasonCounts: Partial<Record<ComboMembershipReasonCode, number>> =
-					{};
-				for (const decision of resolution.decisions) {
-					reasonCounts[decision.reason] =
-						(reasonCounts[decision.reason] ?? 0) + 1;
-				}
-				const membershipDiagnostics = {
-					family,
-					comboId: resolution.combo_id,
-					active: resolution.active,
-					membershipMode: routingPolicy.assignment.membership_mode,
-					memberCount: resolution.members.length,
-					sourceCounts,
-					reasonCounts,
-				};
 				if (!resolution.active) {
-					log.info("Combo routing membership resolved", {
-						...membershipDiagnostics,
-						selectedSource: null,
-						selectedTier: null,
-						eligibleCandidateCount: 0,
-					});
+					log.info(
+						"Combo routing membership resolved",
+						buildComboMembershipDiagnostics(
+							resolution,
+							routingPolicy.assignment.membership_mode,
+							null,
+						),
+					);
 				}
 
 				const combo = routingPolicy.combo;
@@ -1012,12 +998,19 @@ export async function selectAccountsForRequest(
 							(entry) => entry.routing,
 						);
 						if (orderedEntries.length > 0) {
-							log.info("Combo routing candidate selected", {
-								...membershipDiagnostics,
-								selectedSource: orderedEntries[0]?.source ?? null,
-								selectedTier: orderedEntries[0]?.tier ?? null,
-								eligibleCandidateCount: orderedEntries.length,
-							});
+							const selectedEntry = orderedEntries[0];
+							log.info(
+								"Combo routing candidate selected",
+								buildComboMembershipDiagnostics(
+									resolution,
+									routingPolicy.assignment.membership_mode,
+									{
+										source: selectedEntry.source,
+										tier: selectedEntry.tier,
+										eligibleCandidateCount: orderedEntries.length,
+									},
+								),
+							);
 							const slotInfo: ComboSlotInfo = {
 								comboName: combo.name,
 								slots: orderedEntries.map((entry) => ({
@@ -1034,20 +1027,21 @@ export async function selectAccountsForRequest(
 					// All effective candidates unavailable — fall back to normal routing.
 					log.warn(
 						`All ${resolution.members.length} combo candidates unavailable for ${combo.name}, falling back to SessionStrategy`,
-						{
-							...membershipDiagnostics,
-							selectedSource: null,
-							selectedTier: null,
-							eligibleCandidateCount: 0,
-						},
+						buildComboMembershipDiagnostics(
+							resolution,
+							routingPolicy.assignment.membership_mode,
+							null,
+						),
 					);
 				} else if (resolution.active) {
-					log.error("Active combo membership resolved without a combo record", {
-						...membershipDiagnostics,
-						selectedSource: null,
-						selectedTier: null,
-						eligibleCandidateCount: 0,
-					});
+					log.error(
+						"Active combo membership resolved without a combo record",
+						buildComboMembershipDiagnostics(
+							resolution,
+							routingPolicy.assignment.membership_mode,
+							null,
+						),
+					);
 				}
 			}
 		}

@@ -652,13 +652,28 @@ We recommend using one of the workarounds above until the npm bug is fixed.
 - **503 on Pool Exhaustion** - Returns HTTP 503 when all accounts are rate-limited or paused, enabling client-side retry logic
 - **Rate Limit Audit Trail** - Tracks when and why each account became rate-limited (`rate_limited_reason`, `rate_limited_at`)
 
-### 🔗 Combos — Cross-Provider Fallback Chains
-- **Named Combos** - Create named fallback chains with ordered (account, model) slots
-- **Family Activation** - Assign one combo per model family (Opus, Sonnet, Haiku) — independent activation toggles
-- **Auto Waterfall** - Requests automatically fall through slots top-to-bottom, skipping unavailable accounts (rate-limited, paused)
-- **Per-Slot Model Override** - Each slot can use a different model, enabling cross-model fallback (e.g., try Opus on provider A, then Sonnet on provider B)
-- **SessionStrategy Fallback** - If all combo slots fail, automatically falls back to normal session-based routing
-- **Dashboard Management** - Drag-and-drop slot builder with account provider badges, enable/disable per combo, and family assignment UI
+### 🔗 Combos — Managed Family Routing
+- **Four Independent Families** - Assign one combo to Fable, Opus, Sonnet, or Haiku without changing the other families
+- **Manual and Managed Membership** - Keep precise account/model slots, or safely enroll compatible accounts by provider and route class without mixing billing lanes
+- **Priority-Aware Balancing** - Manual slots retain their persisted tier; Managed members use global account priority, with same-tier pressure and session/cache affinity
+- **Safe Precedence** - Manual overrides and account exclusions win over Managed rules, while unknown or unsupported capabilities fail closed
+- **Operational Resilience** - Paused, limited, exhausted, or reauth-required accounts remain members but are skipped until available
+- **Reviewable Changes** - Server-owned preview/apply shows exact member deltas, rejects zero-candidate Managed routes, and supports non-destructive rollback to Manual
+- **Dashboard and CLI Parity** - Inspect the same authoritative effective route from the dashboard, live-server CLI workflow, or management API
+
+See [Combos and Managed Family Routing](docs/combos.md) for routing semantics and rollout guidance, and [CLI documentation](docs/cli.md#managed-routing-live-server) for command-line operations.
+
+The shipped live-server CLI surface is:
+
+```bash
+better-ccflare routing list [--api-url <loopback-url>] [--json]
+better-ccflare routing detail <account-id> [--api-url <loopback-url>] [--json]
+better-ccflare routing preview <family> [--managed-model <model>] [--api-url <loopback-url>] [--json]
+better-ccflare routing apply <family> --preview-id <id> --proposal-id <id> --managed-model <model> --yes [--api-url <loopback-url>] [--json]
+better-ccflare routing manual <family> --yes [--api-url <loopback-url>] [--json]
+```
+
+Interactive apply can preview, show exact deltas, require an explicit proposal selection, and confirm before writing. Unattended or JSON apply requires the complete displayed tuple plus `--yes`; Manual rollback requires `--yes`. The admin key is accepted only through `BETTER_CCFLARE_ADMIN_API_KEY`. Interactive account creation reviews routing by the persisted immutable account ID, then freshly previews, displays, confirms, and applies each selected family in sequence. Missing or materially changed proposals fail closed, and any already-applied family results are reported as partial rather than hidden or rolled back. `--add-account --json` is rejected before creation; non-TTY text creation prints the immutable ID and follow-up commands without previewing or changing routing. Routing commands continue to support `--json`.
 
 ### 📈 Real-Time Analytics
 - Token usage tracking per request with optimized batch processing
