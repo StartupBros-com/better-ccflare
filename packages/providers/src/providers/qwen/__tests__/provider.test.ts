@@ -261,6 +261,33 @@ describe("QwenProvider", () => {
 	// 5. beforeConvert
 	// -------------------------------------------------------------------------
 	describe("beforeConvert", () => {
+		it("declares defaults in parity with default-injection semantics", () => {
+			expect(
+				provider.getLogicalModelCapability(
+					"claude-opus-4-8",
+					makeAccount({ model_mappings: null }),
+				),
+			).toMatchObject({ status: "supported", provenance: "provider_default" });
+			expect(
+				provider.getLogicalModelCapability(
+					"claude-fable-5",
+					makeAccount({ model_mappings: null }),
+				),
+			).toMatchObject({
+				status: "unsupported",
+				provenance: "provider_default",
+			});
+			expect(
+				provider.getLogicalModelCapability(
+					"claude-opus-4-8",
+					makeAccount({ model_mappings: "{}" }),
+				),
+			).toMatchObject({
+				status: "unsupported",
+				provenance: "provider_default",
+			});
+		});
+
 		it("returns undefined when account is undefined", () => {
 			const result = provider.beforeConvert({}, undefined);
 			expect(result).toBeUndefined();

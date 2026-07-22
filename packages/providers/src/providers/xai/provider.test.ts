@@ -103,6 +103,19 @@ describe("XaiProvider", () => {
 		expect(body.model).toBe("grok-custom");
 	});
 
+	it("declares only the defaults the transform will inject", () => {
+		const provider = new XaiProvider();
+		expect(
+			provider.getLogicalModelCapability("claude-fable-5", account()),
+		).toMatchObject({ status: "supported", provenance: "provider_default" });
+		expect(
+			provider.getLogicalModelCapability(
+				"claude-fable-5",
+				account({ model_mappings: JSON.stringify({ opus: "custom-opus" }) }),
+			),
+		).toMatchObject({ status: "unsupported", provenance: "provider_default" });
+	});
+
 	it("advertises Grok Build credits usage polling", () => {
 		const provider = new XaiProvider();
 

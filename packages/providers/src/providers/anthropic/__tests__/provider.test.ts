@@ -39,6 +39,16 @@ describe("AnthropicProvider", () => {
 		};
 	});
 
+	it("declares native logical-family support without resolving a physical model", () => {
+		expect(
+			provider.getLogicalModelCapability("claude-fable-5", mockAccount),
+		).toEqual({
+			status: "supported",
+			provenance: "native_passthrough",
+			reason: "included",
+		});
+	});
+
 	describe("processResponse", () => {
 		it("preserves body and status", async () => {
 			const body = JSON.stringify({ type: "message", content: "hello" });

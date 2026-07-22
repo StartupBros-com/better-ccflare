@@ -1,6 +1,7 @@
+import { getModelFamily } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import type { OpenAIRequest } from "@better-ccflare/openai-formats";
-import type { Account } from "@better-ccflare/types";
+import type { Account, LogicalModelCapability } from "@better-ccflare/types";
 import type { RateLimitInfo } from "../../types";
 import { OpenAICompatibleProvider } from "../openai/provider";
 
@@ -35,7 +36,7 @@ const STAINLESS_HEADERS: Record<string, string> = {
 };
 
 // All Anthropic model tiers map to coder-model (Qwen's unified coding model)
-const QWEN_MODEL_MAPPINGS = {
+export const QWEN_MODEL_MAPPINGS = {
 	opus: "coder-model",
 	sonnet: "coder-model",
 	haiku: "coder-model",
@@ -308,6 +309,32 @@ function addDashScopeCacheControl(body: OpenAIRequest): void {
 
 export class QwenProvider extends OpenAICompatibleProvider {
 	override name = "qwen";
+
+	getLogicalModelCapability(
+		logicalModel: string,
+		account: Account,
+	): LogicalModelCapability {
+		const family = getModelFamily(logicalModel);
+		if (!family) {
+			return {
+				status: "unknown",
+				provenance: "undeclared",
+				reason: "unknown",
+			};
+		}
+		const usesDefaults = account.model_mappings == null;
+		return usesDefaults && family in QWEN_MODEL_MAPPINGS
+			? {
+					status: "supported",
+					provenance: "provider_default",
+					reason: "included",
+				}
+			: {
+					status: "unsupported",
+					provenance: "provider_default",
+					reason: "unsupported",
+				};
+	}
 
 	/*
 	 * Override to save raw Qwen SSE to /tmp for debugging tool call chunks.

@@ -72,6 +72,10 @@ class ProviderRegistry {
 	}
 }
 
+const CAPABILITY_PROVIDER_ALIASES: Readonly<Record<string, string>> = {
+	"claude-console-api": "anthropic",
+};
+
 // Create singleton registry instance
 export const registry = new ProviderRegistry();
 
@@ -79,6 +83,8 @@ export const registry = new ProviderRegistry();
 export const registerProvider = (provider: Provider) =>
 	registry.registerProvider(provider);
 export const getProvider = (name: string) => registry.getProvider(name);
+export const getCapabilityProvider = (name: string) =>
+	registry.getProvider(CAPABILITY_PROVIDER_ALIASES[name] ?? name);
 export const getOAuthProvider = (name: string) =>
 	registry.getOAuthProvider(name);
 export const listProviders = () => registry.listProviders();

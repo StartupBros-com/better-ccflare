@@ -1,0 +1,76 @@
+name: Managed Routing Foundation Gate
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  managed-routing-foundation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: better_ccflare_test
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d better_ccflare_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build CLI generated modules
+        run: bun run build:cli
+
+      - name: Run focused managed-routing database tests
+        run: >-
+          bun test
+          packages/database/src/__tests__/managed-routing-migrations.test.ts
+          packages/database/src/adapters/__tests__/bun-sql-adapter-batch.test.ts
+          packages/database/src/repositories/__tests__/combo-managed-policy.test.ts
+          packages/database/src/repositories/__tests__/combo-priority.test.ts
+
+      - name: Run managed-routing PostgreSQL integration
+        env:
+          BETTER_CCFLARE_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/better_ccflare_test
+        run: bun test packages/database/src/__tests__/managed-routing-postgres.integration.test.ts
+
+      - name: Run full test suite
+        run: bun test
+
+      - name: Run lint
+        run: bun run lint
+
+      - name: Run typecheck
+        run: bun run typecheck
+
+      - name: Run format
+        run: bun run format
+
+      - name: Verify lint and format left the checkout clean
+        run: |
+          git diff --check
+          git diff --exit-code
+          test -z "$(git status --porcelain)"

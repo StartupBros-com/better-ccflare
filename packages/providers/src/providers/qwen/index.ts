@@ -7,4 +7,4 @@ export {
 	pollForToken,
 	refreshQwenTokens,
 } from "./device-oauth";
-export { QwenProvider } from "./provider";
+export { QWEN_MODEL_MAPPINGS, QwenProvider } from "./provider";

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import {
 	BUFFER_SIZES,
+	getModelFamily,
 	isInvalidGrantMessage,
 	mapModelName,
 	OAuthRefreshTokenError,
@@ -12,7 +13,7 @@ import {
 import { sanitizeProxyHeaders } from "@better-ccflare/http-common";
 import { Logger } from "@better-ccflare/logger";
 import { resolveReasoningEffort } from "@better-ccflare/openai-formats";
-import type { Account } from "@better-ccflare/types";
+import type { Account, LogicalModelCapability } from "@better-ccflare/types";
 import { BaseProvider } from "../../base";
 import {
 	estimateAnthropicRequestTokens,
@@ -660,6 +661,31 @@ export function codexEventCommitsOutput(
 
 export class CodexProvider extends BaseProvider {
 	name = "codex";
+
+	getLogicalModelCapability(
+		logicalModel: string,
+		_account: Account,
+	): LogicalModelCapability {
+		const family = getModelFamily(logicalModel);
+		if (!family) {
+			return {
+				status: "unknown",
+				provenance: "undeclared",
+				reason: "unknown",
+			};
+		}
+		return DEFAULT_MODEL_MAP[family]
+			? {
+					status: "supported",
+					provenance: "provider_default",
+					reason: "included",
+				}
+			: {
+					status: "unsupported",
+					provenance: "provider_default",
+					reason: "unsupported",
+				};
+	}
 	override readonly cacheReplayModelStrategy = "transformed-body" as const;
 	// Fallback map: proxy-operations.ts injects x-better-ccflare-request-id and
 	// x-better-ccflare-request-stream into the upstream response before calling

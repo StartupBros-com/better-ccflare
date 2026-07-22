@@ -1,7 +1,11 @@
-import { getEndpointUrl, validateEndpointUrl } from "@better-ccflare/core";
+import {
+	getEndpointUrl,
+	getModelFamily,
+	validateEndpointUrl,
+} from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import type { OpenAIRequest } from "@better-ccflare/openai-formats";
-import type { Account } from "@better-ccflare/types";
+import type { Account, LogicalModelCapability } from "@better-ccflare/types";
 import { parseStandardRetryAfter429 } from "../../base";
 import type { RateLimitInfo, TokenRefreshResult } from "../../types";
 import { OpenAICompatibleProvider } from "../openai/provider";
@@ -28,6 +32,32 @@ export const XAI_MODEL_MAPPINGS = {
 
 export class XaiProvider extends OpenAICompatibleProvider {
 	override name = "xai";
+
+	getLogicalModelCapability(
+		logicalModel: string,
+		account: Account,
+	): LogicalModelCapability {
+		const family = getModelFamily(logicalModel);
+		if (!family) {
+			return {
+				status: "unknown",
+				provenance: "undeclared",
+				reason: "unknown",
+			};
+		}
+		const usesDefaults = account.model_mappings == null;
+		return usesDefaults && XAI_MODEL_MAPPINGS[family]
+			? {
+					status: "supported",
+					provenance: "provider_default",
+					reason: "included",
+				}
+			: {
+					status: "unsupported",
+					provenance: "provider_default",
+					reason: "unsupported",
+				};
+	}
 
 	override async refreshToken(
 		account: Account,

@@ -92,6 +92,59 @@ async function ensureCacheFlightRecorderTablesPg(
 	`);
 }
 
+async function ensureManagedRoutingPolicyTablesPg(
+	adapter: BunSqlAdapter,
+): Promise<void> {
+	await adapter.unsafe(`
+		CREATE TABLE IF NOT EXISTS combo_enrollment_rules (
+			id TEXT PRIMARY KEY,
+			family TEXT NOT NULL,
+			combo_id TEXT NOT NULL,
+			provider TEXT NOT NULL CHECK (length(trim(provider)) > 0),
+			route_class TEXT NOT NULL
+				CHECK (route_class IN ('oauth-subscription', 'api-key', 'local', 'cloud-credential')),
+			enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+			created_at BIGINT NOT NULL,
+			updated_at BIGINT NOT NULL,
+			FOREIGN KEY (family) REFERENCES combo_family_assignments(family) ON DELETE CASCADE,
+			FOREIGN KEY (combo_id) REFERENCES combos(id) ON DELETE CASCADE
+		)
+	`);
+	await adapter.unsafe(
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_combo_enrollment_rules_unique
+		 ON combo_enrollment_rules(family, combo_id, provider, route_class)`,
+	);
+	await adapter.unsafe(
+		`CREATE INDEX IF NOT EXISTS idx_combo_enrollment_rules_combo_id
+		 ON combo_enrollment_rules(combo_id)`,
+	);
+
+	await adapter.unsafe(`
+		CREATE TABLE IF NOT EXISTS combo_membership_exclusions (
+			id TEXT PRIMARY KEY,
+			family TEXT NOT NULL,
+			combo_id TEXT NOT NULL,
+			account_id TEXT NOT NULL,
+			created_at BIGINT NOT NULL,
+			FOREIGN KEY (family) REFERENCES combo_family_assignments(family) ON DELETE CASCADE,
+			FOREIGN KEY (combo_id) REFERENCES combos(id) ON DELETE CASCADE,
+			FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+		)
+	`);
+	await adapter.unsafe(
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_combo_membership_exclusions_unique
+		 ON combo_membership_exclusions(family, combo_id, account_id)`,
+	);
+	await adapter.unsafe(
+		`CREATE INDEX IF NOT EXISTS idx_combo_membership_exclusions_combo_id
+		 ON combo_membership_exclusions(combo_id)`,
+	);
+	await adapter.unsafe(
+		`CREATE INDEX IF NOT EXISTS idx_combo_membership_exclusions_account_id
+		 ON combo_membership_exclusions(account_id)`,
+	);
+}
+
 /**
  * Ensure the full schema exists for PostgreSQL
  */
@@ -328,6 +381,9 @@ export async function ensureSchemaPg(adapter: BunSqlAdapter): Promise<void> {
 			family TEXT PRIMARY KEY,
 			combo_id TEXT,
 			enabled INTEGER DEFAULT 0,
+			membership_mode TEXT NOT NULL DEFAULT 'manual'
+				CHECK (membership_mode IN ('manual', 'managed')),
+			managed_model TEXT DEFAULT NULL,
 			FOREIGN KEY (combo_id) REFERENCES combos(id) ON DELETE SET NULL
 		)
 	`);
@@ -338,6 +394,7 @@ export async function ensureSchemaPg(adapter: BunSqlAdapter): Promise<void> {
 		VALUES ('fable', NULL, 0), ('opus', NULL, 0), ('sonnet', NULL, 0), ('haiku', NULL, 0)
 		ON CONFLICT (family) DO NOTHING
 	`);
+	await ensureManagedRoutingPolicyTablesPg(adapter);
 
 	// Create strategies table
 	await adapter.unsafe(`
@@ -425,6 +482,18 @@ export async function addColumnTolerant(
 export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 	// Add columns that might be missing from older schema versions
 	const columnsToAdd: ColumnToAdd[] = [
+		{
+			table: "combo_family_assignments",
+			column: "membership_mode",
+			definition:
+				"ALTER TABLE combo_family_assignments ADD COLUMN membership_mode TEXT NOT NULL DEFAULT 'manual' CHECK (membership_mode IN ('manual', 'managed'))",
+		},
+		{
+			table: "combo_family_assignments",
+			column: "managed_model",
+			definition:
+				"ALTER TABLE combo_family_assignments ADD COLUMN managed_model TEXT",
+		},
 		{
 			table: "accounts",
 			column: "cross_region_mode",
@@ -668,6 +737,9 @@ export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 			family TEXT PRIMARY KEY,
 			combo_id TEXT,
 			enabled INTEGER DEFAULT 0,
+			membership_mode TEXT NOT NULL DEFAULT 'manual'
+				CHECK (membership_mode IN ('manual', 'managed')),
+			managed_model TEXT DEFAULT NULL,
 			FOREIGN KEY (combo_id) REFERENCES combos(id) ON DELETE SET NULL
 		)
 	`);
@@ -676,6 +748,7 @@ export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 		VALUES ('fable', NULL, 0), ('opus', NULL, 0), ('sonnet', NULL, 0), ('haiku', NULL, 0)
 		ON CONFLICT (family) DO NOTHING
 	`);
+	await ensureManagedRoutingPolicyTablesPg(adapter);
 
 	// Ensure usage_snapshots table exists (for upgrades from pre-usage-history installs)
 	await adapter.unsafe(`

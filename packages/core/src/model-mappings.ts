@@ -121,6 +121,11 @@ function toArray(value: string | string[]): string[] {
 	return Array.isArray(value) ? value : [value];
 }
 
+export interface ConfiguredModelMapping {
+	models: string[];
+	match: "exact" | "family";
+}
+
 /**
  * Get effective model mappings for an account, merging model_fallbacks into
  * the arrays so that model_fallbacks becomes the second+ entry for each family.
@@ -188,6 +193,28 @@ export function getModelMappings(
 }
 
 /**
+ * Resolve only an explicitly configured model mapping. Unlike getModelList(),
+ * this returns null for ordinary pass-through so provider capability checks can
+ * distinguish operator intent from an undeclared/default model.
+ */
+export function getConfiguredModelMapping(
+	anthropicModel: string,
+	account: Account,
+): ConfiguredModelMapping | null {
+	const mappings = getModelMappings(account);
+	if (mappings[anthropicModel] !== undefined) {
+		return { models: toArray(mappings[anthropicModel]), match: "exact" };
+	}
+
+	const family = getModelFamily(anthropicModel);
+	if (family && mappings[family] !== undefined) {
+		return { models: toArray(mappings[family]), match: "family" };
+	}
+
+	return null;
+}
+
+/**
  * Check whether an account has any model mapping configuration.
  * Returns false if the account should just forward the model name unchanged.
  */
@@ -232,18 +259,8 @@ export function getModelList(
 		return null;
 	}
 
-	const mappings = getModelMappings(account);
-
-	// Exact match first
-	if (mappings[anthropicModel] !== undefined) {
-		return toArray(mappings[anthropicModel]);
-	}
-
-	// Family match
-	const family = getModelFamily(anthropicModel);
-	if (family && mappings[family] !== undefined) {
-		return toArray(mappings[family]);
-	}
+	const configured = getConfiguredModelMapping(anthropicModel, account);
+	if (configured) return configured.models;
 
 	// No mapping for this model — pass through unchanged
 	return [anthropicModel];

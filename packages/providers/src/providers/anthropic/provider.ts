@@ -1,5 +1,6 @@
 import {
 	BUFFER_SIZES,
+	getModelFamily,
 	isInvalidGrantMessage,
 	mapModelName,
 	OAuthRefreshTokenError,
@@ -7,7 +8,7 @@ import {
 } from "@better-ccflare/core";
 import { sanitizeProxyHeaders } from "@better-ccflare/http-common";
 import { Logger } from "@better-ccflare/logger";
-import type { Account } from "@better-ccflare/types";
+import type { Account, LogicalModelCapability } from "@better-ccflare/types";
 import { BaseProvider } from "../../base";
 import type {
 	CacheReplayModelStrategy,
@@ -84,6 +85,23 @@ const log = new Logger("AnthropicProvider");
 
 export class AnthropicProvider extends BaseProvider {
 	name = "anthropic";
+
+	getLogicalModelCapability(
+		logicalModel: string,
+		_account: Account,
+	): LogicalModelCapability {
+		return getModelFamily(logicalModel)
+			? {
+					status: "supported",
+					provenance: "native_passthrough",
+					reason: "included",
+				}
+			: {
+					status: "unsupported",
+					provenance: "native_passthrough",
+					reason: "unsupported",
+				};
+	}
 	override readonly cacheReplayModelStrategy: CacheReplayModelStrategy =
 		"transformed-body";
 

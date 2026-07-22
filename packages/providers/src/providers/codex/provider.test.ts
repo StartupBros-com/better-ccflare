@@ -18,6 +18,7 @@ import {
 	codexEventCommitsOutput,
 	deriveCodexCacheKeySessionBucket,
 	readCodexCacheKeySessionPercent,
+	resolveCodexRequestModel,
 } from "./provider";
 import { CODEX_TRACE_DIR_ENV, CODEX_TRACE_HMAC_KEY_ENV } from "./trace";
 import { parseCodexUsageHeaders } from "./usage";
@@ -49,6 +50,24 @@ afterEach(() => {
 });
 
 describe("CodexProvider request conversion", () => {
+	it("keeps capability defaults in parity with the request model resolver", () => {
+		const provider = new CodexProvider();
+		for (const model of [
+			"claude-opus-4-8",
+			"claude-sonnet-5",
+			"claude-haiku-4-5-20251001",
+		]) {
+			expect(
+				provider.getLogicalModelCapability(model, {} as never).status,
+			).toBe("supported");
+			expect(resolveCodexRequestModel(model)).not.toBe(model);
+		}
+		expect(
+			provider.getLogicalModelCapability("claude-fable-5", {} as never),
+		).toMatchObject({ status: "unsupported", provenance: "provider_default" });
+		expect(resolveCodexRequestModel("claude-fable-5")).toBe("claude-fable-5");
+	});
+
 	it("handles messages and synthetic count_tokens paths", () => {
 		const provider = new CodexProvider();
 		expect(provider.canHandle("/v1/messages")).toBeTrue();

@@ -1,10 +1,312 @@
-import { describe, expect, it } from "bun:test";
+import { beforeAll, describe, expect, it } from "bun:test";
+import type { Account } from "@better-ccflare/types";
+import { registerProvider } from "./registry";
 import {
 	decideContextAdmission,
+	deriveComboRouteClass,
 	estimateAnthropicAdmissionTokens,
 	estimateAnthropicRequestTokens,
+	resolveAccountLogicalModelCapability,
 	resolveModelContextCapability,
 } from "./request-capabilities";
+import type { Provider } from "./types";
+
+const routingAccount = (overrides: Partial<Account> = {}): Account =>
+	({
+		id: "account-1",
+		name: "routing account",
+		provider: "anthropic",
+		api_key: null,
+		refresh_token: "oauth-refresh",
+		access_token: "oauth-access",
+		billing_type: null,
+		priority: 0,
+		model_mappings: null,
+		model_fallbacks: null,
+		custom_endpoint: null,
+		...overrides,
+	}) as Account;
+
+beforeAll(() => {
+	const capabilityProvider = (
+		name: string,
+		supportedFamilies: readonly string[],
+		provenance: "native_passthrough" | "provider_default",
+	): Provider =>
+		({
+			name,
+			getLogicalModelCapability(logicalModel: string) {
+				const supported = supportedFamilies.some((family) =>
+					logicalModel.includes(family),
+				);
+				return {
+					status: supported ? "supported" : "unsupported",
+					provenance,
+					reason: supported ? "included" : "unsupported",
+				};
+			},
+		}) as Provider;
+	registerProvider(
+		capabilityProvider(
+			"anthropic",
+			["fable", "opus", "sonnet", "haiku"],
+			"native_passthrough",
+		),
+	);
+	registerProvider(
+		capabilityProvider(
+			"codex",
+			["opus", "sonnet", "haiku"],
+			"provider_default",
+		),
+	);
+	registerProvider(
+		capabilityProvider("qwen", ["opus", "sonnet", "haiku"], "provider_default"),
+	);
+	registerProvider(
+		capabilityProvider(
+			"xai",
+			["fable", "opus", "sonnet", "haiku"],
+			"provider_default",
+		),
+	);
+});
+
+describe("managed routing capabilities", () => {
+	it("derives provider defaults from blank, non-secret draft metadata", () => {
+		for (const provider of ["anthropic", "codex", "qwen", "xai"]) {
+			expect(
+				deriveComboRouteClass(
+					routingAccount({
+						provider,
+						refresh_token: "",
+						access_token: null,
+					}),
+				),
+			).toBe("oauth-subscription");
+		}
+		for (const provider of [
+			"claude-console-api",
+			"zai",
+			"minimax",
+			"anthropic-compatible",
+			"openai-compatible",
+			"nanogpt",
+			"kilo",
+			"openrouter",
+			"alibaba-coding-plan",
+			"ollama-cloud",
+		]) {
+			expect(
+				deriveComboRouteClass(
+					routingAccount({
+						provider,
+						refresh_token: "",
+						access_token: null,
+					}),
+				),
+			).toBe("api-key");
+		}
+		expect(deriveComboRouteClass(routingAccount({ provider: "ollama" }))).toBe(
+			"local",
+		);
+		for (const provider of ["bedrock", "vertex-ai"]) {
+			expect(deriveComboRouteClass(routingAccount({ provider }))).toBe(
+				"cloud-credential",
+			);
+		}
+		for (const provider of [
+			"unknown",
+			"console",
+			"claude-oauth",
+			"anthropic-oauth",
+		]) {
+			expect(deriveComboRouteClass(routingAccount({ provider }))).toBeNull();
+		}
+	});
+
+	it("separates same-provider plan and paygo accounts by persisted billing type", () => {
+		const authShapes = {
+			none: { api_key: null, refresh_token: "", access_token: null },
+			api: { api_key: "configured", refresh_token: "", access_token: null },
+			oauth: {
+				api_key: null,
+				refresh_token: "configured",
+				access_token: null,
+			},
+			mixed: {
+				api_key: "configured",
+				refresh_token: "configured",
+				access_token: null,
+			},
+		} as const;
+		const cases = [
+			[null, "none", "api-key"],
+			[null, "api", "api-key"],
+			[null, "oauth", null],
+			[null, "mixed", null],
+			["plan", "none", "oauth-subscription"],
+			["plan", "api", "oauth-subscription"],
+			["plan", "oauth", null],
+			["plan", "mixed", null],
+			["api", "none", "api-key"],
+			["api", "api", "api-key"],
+			["api", "oauth", null],
+			["api", "mixed", null],
+		] as const;
+
+		for (const [billingType, authShape, expected] of cases) {
+			expect(
+				deriveComboRouteClass(
+					routingAccount({
+						provider: "openai-compatible",
+						billing_type: billingType,
+						...authShapes[authShape],
+					}),
+				),
+			).toBe(expected);
+		}
+	});
+
+	it("uses only credential-presence shape for auto classification", () => {
+		expect(
+			deriveComboRouteClass(
+				routingAccount({
+					provider: "anthropic",
+					api_key: null,
+					refresh_token: "configured",
+					access_token: null,
+					billing_type: null,
+				}),
+			),
+		).toBe("oauth-subscription");
+		expect(
+			deriveComboRouteClass(
+				routingAccount({
+					provider: "claude-console-api",
+					api_key: "configured",
+					refresh_token: "",
+					access_token: null,
+					billing_type: null,
+				}),
+			),
+		).toBe("api-key");
+	});
+
+	it("fails closed for unknown billing and contradictory auth shapes", () => {
+		for (const account of [
+			routingAccount({
+				provider: "openai-compatible",
+				api_key: "configured",
+				refresh_token: "",
+				access_token: null,
+				billing_type: "other",
+			}),
+			routingAccount({
+				provider: "anthropic",
+				api_key: "configured",
+				refresh_token: "configured",
+				access_token: null,
+				billing_type: null,
+			}),
+			routingAccount({
+				provider: "anthropic",
+				api_key: "configured",
+				refresh_token: "",
+				access_token: null,
+				billing_type: null,
+			}),
+			routingAccount({
+				provider: "openai-compatible",
+				api_key: null,
+				refresh_token: "configured",
+				access_token: null,
+				billing_type: "plan",
+			}),
+			routingAccount({
+				provider: "unknown",
+				api_key: "configured",
+				refresh_token: "",
+				access_token: null,
+				billing_type: "plan",
+			}),
+		]) {
+			expect(deriveComboRouteClass(account)).toBeNull();
+		}
+	});
+
+	it("keeps local and cloud credentials outside billing cohorts", () => {
+		expect(
+			deriveComboRouteClass(
+				routingAccount({ provider: "ollama", billing_type: "plan" }),
+			),
+		).toBe("local");
+		for (const provider of ["bedrock", "vertex-ai"]) {
+			expect(
+				deriveComboRouteClass(
+					routingAccount({ provider, billing_type: "api" }),
+				),
+			).toBe("cloud-credential");
+		}
+	});
+
+	it("uses native and provider defaults, including the console capability alias", () => {
+		expect(
+			resolveAccountLogicalModelCapability(routingAccount(), "claude-fable-5"),
+		).toMatchObject({ status: "supported", provenance: "native_passthrough" });
+		expect(
+			resolveAccountLogicalModelCapability(
+				routingAccount({ provider: "claude-console-api" }),
+				"claude-fable-5",
+			),
+		).toMatchObject({ status: "supported", provenance: "native_passthrough" });
+		expect(
+			resolveAccountLogicalModelCapability(
+				routingAccount({ provider: "codex" }),
+				"claude-fable-5",
+			),
+		).toMatchObject({ status: "unsupported", provenance: "provider_default" });
+		expect(
+			resolveAccountLogicalModelCapability(
+				routingAccount({ provider: "qwen" }),
+				"claude-opus-4-8",
+			),
+		).toMatchObject({ status: "supported", provenance: "provider_default" });
+		expect(
+			resolveAccountLogicalModelCapability(
+				routingAccount({ provider: "xai" }),
+				"claude-fable-5",
+			),
+		).toMatchObject({ status: "supported", provenance: "provider_default" });
+	});
+
+	it("lets an explicit mapping override defaults but fails unknown providers closed", () => {
+		const explicitlyMapped = routingAccount({
+			provider: "qwen",
+			model_mappings: JSON.stringify({ fable: "coder-model" }),
+		});
+		expect(
+			resolveAccountLogicalModelCapability(explicitlyMapped, "claude-fable-5"),
+		).toEqual({
+			status: "supported",
+			provenance: "explicit_account_mapping",
+			reason: "included",
+		});
+		expect(
+			resolveAccountLogicalModelCapability(
+				routingAccount({
+					provider: "unknown",
+					model_mappings: JSON.stringify({ fable: "some-model" }),
+				}),
+				"claude-fable-5",
+			),
+		).toEqual({
+			status: "unknown",
+			provenance: "undeclared",
+			reason: "unknown",
+		});
+	});
+});
 
 describe("resolveModelContextCapability", () => {
 	it("resolves exact Codex models with raw and effective windows", () => {

@@ -12,8 +12,17 @@ import type {
 	Account,
 	AgentAttributionSource,
 	Combo,
+	ComboEnrollmentRule,
+	ComboEnrollmentRuleCreateInput,
+	ComboEnrollmentRuleUpdateInput,
 	ComboFamily,
 	ComboFamilyAssignment,
+	ComboFamilyPolicyApplyResult,
+	ComboFamilyPolicyChanges,
+	ComboFamilyPolicyUpdateInput,
+	ComboMembershipExclusion,
+	ComboMembershipExclusionCreateInput,
+	ComboRoutingPolicySnapshot,
 	ComboSlot,
 	ComboWithSlots,
 	IntegrityStatus,
@@ -2206,6 +2215,74 @@ OAuth tokens will need to be re-authenticated.
 
 	async getFamilyAssignments(): Promise<ComboFamilyAssignment[]> {
 		return this.combo.getFamilyAssignments();
+	}
+
+	async setFamilyPolicy(
+		family: ComboFamily,
+		fields: ComboFamilyPolicyUpdateInput,
+	): Promise<ComboFamilyAssignment> {
+		return this.combo.updateFamilyPolicy(family, fields);
+	}
+
+	async getComboRoutingPolicy(
+		family: ComboFamily,
+	): Promise<ComboRoutingPolicySnapshot> {
+		return this.combo.getRoutingPolicySnapshot(family);
+	}
+
+	async applyFamilyPolicyChanges(
+		changes: ComboFamilyPolicyChanges,
+	): Promise<ComboFamilyPolicyApplyResult> {
+		return this.combo.applyFamilyPolicyChanges(changes);
+	}
+
+	async createComboEnrollmentRule(
+		input: ComboEnrollmentRuleCreateInput,
+	): Promise<ComboEnrollmentRule> {
+		return this.combo.createEnrollmentRule(input);
+	}
+
+	async updateComboEnrollmentRule(
+		id: string,
+		fields: ComboEnrollmentRuleUpdateInput,
+	): Promise<ComboEnrollmentRule> {
+		return this.combo.updateEnrollmentRule(id, fields);
+	}
+
+	async deleteComboEnrollmentRule(id: string): Promise<void> {
+		await this.combo.deleteEnrollmentRule(id);
+	}
+
+	async getComboEnrollmentRules(
+		family: ComboFamily,
+		comboId?: string,
+	): Promise<ComboEnrollmentRule[]> {
+		return this.combo.getEnrollmentRules(family, comboId);
+	}
+
+	async createComboMembershipExclusion(
+		input: ComboMembershipExclusionCreateInput,
+	): Promise<ComboMembershipExclusion> {
+		return this.combo.createMembershipExclusion(input);
+	}
+
+	async deleteComboMembershipExclusion(id: string): Promise<void> {
+		await this.combo.deleteMembershipExclusion(id);
+	}
+
+	async restoreComboMembership(
+		family: ComboFamily,
+		comboId: string,
+		accountId: string,
+	): Promise<void> {
+		await this.combo.restoreMembership(family, comboId, accountId);
+	}
+
+	async getComboMembershipExclusions(
+		family: ComboFamily,
+		comboId?: string,
+	): Promise<ComboMembershipExclusion[]> {
+		return this.combo.getMembershipExclusions(family, comboId);
 	}
 
 	async getActiveComboForFamily(
