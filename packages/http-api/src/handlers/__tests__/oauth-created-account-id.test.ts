@@ -72,18 +72,6 @@ function fakeDb() {
 	};
 }
 
-async function waitForComplete(
-	status: (sessionId: string) => Response,
-	sessionId: string,
-): Promise<Record<string, unknown>> {
-	for (let attempt = 0; attempt < 50; attempt++) {
-		const body = (await status(sessionId).json()) as Record<string, unknown>;
-		if (body.status === "complete") return body;
-		await Bun.sleep(1);
-	}
-	throw new Error("device flow did not complete");
-}
-
 describe("account creation identity responses", () => {
 	it("preserves OAuthFlow AccountCreated identity at the Anthropic callback", async () => {
 		const { createOAuthCallbackHandler } = await handlers();
@@ -108,31 +96,51 @@ describe("account creation identity responses", () => {
 	});
 
 	for (const provider of ["qwen", "codex"] as const) {
-		it(`returns the immutable ${provider} accountId from terminal device status`, async () => {
+		it(`returns the immutable ${provider} account identity from the durable setup job`, async () => {
 			const module = await handlers();
-			const { dbOps, insertedIds } = fakeDb();
+			const durableId = `${provider}-durable-account-id`;
+			const result = {
+				job: {
+					id: `${provider}-job-id`,
+					provider,
+					accountId: durableId,
+					status: "complete" as const,
+					routingOutcomes: [],
+					errorCode: null,
+					errorMessage: null,
+					createdAt: 1,
+					updatedAt: 2,
+					terminalAt: 2,
+				},
+				authorization: null,
+				replayed: true,
+			};
+			const coordinator = {
+				initQwen: async () => result,
+				initCodex: async () => result,
+			} as never;
 			const init =
 				provider === "qwen"
-					? module.createQwenDeviceFlowInitHandler(dbOps as never)
-					: module.createCodexDeviceFlowInitHandler(dbOps as never);
-			const status =
-				provider === "qwen"
-					? module.createQwenDeviceFlowStatusHandler()
-					: module.createCodexDeviceFlowStatusHandler();
+					? module.createQwenDeviceFlowInitHandler(coordinator)
+					: module.createCodexDeviceFlowInitHandler(coordinator);
 			const started = await init(
 				new Request(`http://localhost/api/oauth/${provider}/init`, {
 					method: "POST",
 					headers: { "content-type": "application/json" },
-					body: JSON.stringify({ name: `${provider}-new`, priority: 0 }),
+					body: JSON.stringify({
+						name: `${provider}-new`,
+						priority: 0,
+						idempotencyKey: `${provider}:one`,
+						reviewed: [],
+					}),
 				}),
 			);
-			const sessionId = (await started.json()).sessionId as string;
-			const completeStatus = await waitForComplete(status, sessionId);
-			expect(completeStatus).toMatchObject({
-				status: "complete",
-				accountId: insertedIds[0],
+			const body = await started.json();
+			expect(body).toMatchObject({
+				job: { status: "complete", accountId: durableId },
+				replayed: true,
 			});
-			expect(JSON.stringify(completeStatus)).not.toContain("secret-");
+			expect(JSON.stringify(body)).not.toContain("secret-");
 		});
 	}
 });

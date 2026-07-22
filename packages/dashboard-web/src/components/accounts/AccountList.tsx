@@ -1,8 +1,12 @@
 import type { Account } from "../../api";
 import { AccountListItem } from "./AccountListItem";
+import type { AccountFamilyRoutingState } from "./account-routing";
 
 interface AccountListProps {
 	accounts: Account[] | undefined;
+	routingByAccountId?: Readonly<
+		Record<string, readonly AccountFamilyRoutingState[]>
+	>;
 	onPauseToggle: (account: Account) => void;
 	onForceResetRateLimit: (account: Account) => void;
 	onRefreshUsage: (account: Account) => Promise<void>;
@@ -23,6 +27,7 @@ interface AccountListProps {
 
 export function AccountList({
 	accounts,
+	routingByAccountId,
 	onPauseToggle,
 	onForceResetRateLimit,
 	onRefreshUsage,
@@ -48,8 +53,9 @@ export function AccountList({
 		<div className="space-y-2">
 			{accounts.map((account) => (
 				<AccountListItem
-					key={account.name}
+					key={account.id}
 					account={account}
+					routingStates={routingByAccountId?.[account.id]}
 					isPrimary={account.isPrimary}
 					onPauseToggle={onPauseToggle}
 					onForceResetRateLimit={onForceResetRateLimit}

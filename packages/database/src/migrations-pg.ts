@@ -92,6 +92,50 @@ async function ensureCacheFlightRecorderTablesPg(
 	`);
 }
 
+async function ensureDeviceSetupJobsSchemaPg(
+	adapter: BunSqlAdapter,
+): Promise<void> {
+	await adapter.unsafe(`
+		CREATE TABLE IF NOT EXISTS device_setup_jobs (
+			id TEXT PRIMARY KEY,
+			idempotency_key TEXT NOT NULL UNIQUE,
+			request_fingerprint TEXT NOT NULL,
+			provider TEXT NOT NULL CHECK (provider IN ('qwen', 'codex')),
+			account_id TEXT NOT NULL,
+			status TEXT NOT NULL
+				CHECK (status IN ('awaiting_authorization', 'account_committed', 'reconciling', 'complete', 'complete_with_actions', 'authorization_error', 'expired')),
+			routing_selections_json TEXT NOT NULL DEFAULT '[]',
+			routing_outcomes_json TEXT NOT NULL DEFAULT '[]',
+			routing_cursor INTEGER NOT NULL DEFAULT 0 CHECK (routing_cursor >= 0),
+			lease_token TEXT,
+			lease_expires_at BIGINT,
+			attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+			error_code TEXT,
+			error_message TEXT,
+			created_at BIGINT NOT NULL,
+			updated_at BIGINT NOT NULL,
+			terminal_at BIGINT,
+			retention_expires_at BIGINT,
+			CHECK (
+				(lease_token IS NULL AND lease_expires_at IS NULL)
+				OR (lease_token IS NOT NULL AND lease_expires_at IS NOT NULL)
+			)
+		)
+	`);
+	await adapter.unsafe(
+		`CREATE INDEX IF NOT EXISTS idx_device_setup_jobs_claim
+		 ON device_setup_jobs(status, lease_expires_at, updated_at)`,
+	);
+	await adapter.unsafe(
+		`CREATE INDEX IF NOT EXISTS idx_device_setup_jobs_retention
+		 ON device_setup_jobs(retention_expires_at)`,
+	);
+	await adapter.unsafe(
+		`CREATE INDEX IF NOT EXISTS idx_device_setup_jobs_account
+		 ON device_setup_jobs(account_id)`,
+	);
+}
+
 async function ensureManagedRoutingPolicyTablesPg(
 	adapter: BunSqlAdapter,
 ): Promise<void> {
@@ -153,11 +197,30 @@ const ROUTING_REVISION_POLICY_TABLES = [
 	"combo_membership_exclusions",
 ] as const;
 
+// Keep this provider boundary in semantic parity with API_KEY_PROVIDERS in
+// packages/providers/src/request-capabilities.ts. The trigger compares only
+// the non-secret legacy-mirrored-shape boolean.
+const ROUTING_REVISION_API_KEY_PROVIDERS = [
+	"claude-console-api",
+	"zai",
+	"minimax",
+	"anthropic-compatible",
+	"openai-compatible",
+	"nanogpt",
+	"kilo",
+	"openrouter",
+	"alibaba-coding-plan",
+	"ollama-cloud",
+] as const;
+
 /** PostgreSQL mirror of SQLite's managed-routing revision clock. */
 async function ensureRoutingPolicyRevisionSchemaPg(
 	adapter: BunSqlAdapter,
 	options: { installAccountUpdateTrigger?: boolean } = {},
 ): Promise<void> {
+	const apiKeyProviderList = ROUTING_REVISION_API_KEY_PROVIDERS.map(
+		(provider) => `'${provider}'`,
+	).join(", ");
 	await adapter.unsafe(`
 		CREATE TABLE IF NOT EXISTS routing_policy_revision (
 			scope TEXT PRIMARY KEY CHECK (scope = 'global'),
@@ -223,7 +286,20 @@ async function ensureRoutingPolicyRevisionSchemaPg(
 				OR (NULLIF(BTRIM(OLD.refresh_token), '') IS NOT NULL)
 					IS DISTINCT FROM (NULLIF(BTRIM(NEW.refresh_token), '') IS NOT NULL)
 				OR (NULLIF(BTRIM(OLD.access_token), '') IS NOT NULL)
-					IS DISTINCT FROM (NULLIF(BTRIM(NEW.access_token), '') IS NOT NULL))
+					IS DISTINCT FROM (NULLIF(BTRIM(NEW.access_token), '') IS NOT NULL)
+				OR (COALESCE(OLD.provider IN (${apiKeyProviderList}), FALSE)
+					AND NULLIF(BTRIM(OLD.api_key), '') IS NOT NULL
+					AND OLD.refresh_token IS NOT NULL
+					AND OLD.access_token IS NOT NULL
+					AND OLD.refresh_token = OLD.api_key
+					AND OLD.access_token = OLD.api_key)
+					IS DISTINCT FROM
+					(COALESCE(NEW.provider IN (${apiKeyProviderList}), FALSE)
+					AND NULLIF(BTRIM(NEW.api_key), '') IS NOT NULL
+					AND NEW.refresh_token IS NOT NULL
+					AND NEW.access_token IS NOT NULL
+					AND NEW.refresh_token = NEW.api_key
+					AND NEW.access_token = NEW.api_key))
 			EXECUTE FUNCTION bump_routing_policy_revision()
 		`);
 	}
@@ -375,6 +451,7 @@ export async function ensureSchemaPg(adapter: BunSqlAdapter): Promise<void> {
 	await adapter.unsafe(
 		`CREATE INDEX IF NOT EXISTS idx_oauth_sessions_expires ON oauth_sessions(expires_at)`,
 	);
+	await ensureDeviceSetupJobsSchemaPg(adapter);
 
 	// Create agent_preferences table
 	await adapter.unsafe(`
@@ -735,6 +812,7 @@ export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 			await addColumnTolerant(adapter, col);
 		}
 	}
+	await ensureDeviceSetupJobsSchemaPg(adapter);
 
 	// Backfill pause_reason for existing paused accounts (mirrors SQLite migration)
 	await adapter.unsafe(`

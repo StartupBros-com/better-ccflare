@@ -4,7 +4,11 @@
 	"type": "module",
 	"main": "./src/index.ts",
 	"exports": {
-		".": "./src/index.ts"
+		".": "./src/index.ts",
+		"./help": "./src/commands/help.ts",
+		"./managed-routing": "./src/commands/managed-routing.ts",
+		"./managed-routing-client": "./src/commands/managed-routing-client.ts",
+		"./runner": "./src/runner.ts"
 	},
 	"scripts": {
 		"typecheck": "bunx tsc --noEmit"
@@ -12,10 +16,11 @@
 	"dependencies": {
 		"@better-ccflare/core": "workspace:*",
 		"@better-ccflare/core-di": "workspace:*",
-		"@better-ccflare/database": "workspace:*",
 		"@better-ccflare/config": "workspace:*",
+		"@better-ccflare/database": "workspace:*",
 		"@better-ccflare/providers": "workspace:*",
 		"@better-ccflare/oauth-flow": "workspace:*",
+		"@better-ccflare/types": "workspace:*",
 		"open": "^11.0.0"
 	}
 }

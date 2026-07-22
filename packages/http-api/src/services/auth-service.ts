@@ -158,8 +158,9 @@ export class AuthService {
 		// API client already attaches x-api-key to every call it makes,
 		// including these. A blanket exemption let any unauthenticated caller
 		// overwrite a configured account's tokens (session takeover) once auth
-		// was enabled. Only read-only status polling stays exempt; see the
-		// method-aware gating in isPathExempt().
+		// was enabled. Durable setup reads also expose account lifecycle state,
+		// so init, status, list, and individual-job routes all use normal admin
+		// authentication once an API key exists.
 
 		// Version check returns only the latest npm-published version. The
 		// dashboard's sidebar tile fires this on load with no API key in
@@ -193,8 +194,7 @@ export class AuthService {
 		// exempt" rule here instead let arbitrary paths (e.g. POST /foo) reach
 		// the upstream proxy without an API key whenever the dashboard was
 		// disabled or its assets were unavailable, since providers accept
-		// arbitrary paths. Only /health is statically exempt; OAuth read-only
-		// status polling is gated in isPathExempt().
+		// arbitrary paths. Only /health is statically exempt here.
 
 		return false;
 	}
@@ -209,23 +209,12 @@ export class AuthService {
 			return true;
 		}
 
-		// OAuth endpoints.
-		// Read-only status polling (GET /api/oauth/{qwen,codex}/status/*) stays
-		// exempt: it returns transient setup progress only (no secrets, no
-		// mutation), and the setup UI may poll it before an API key exists.
-		// Token-mutating endpoints (init / reauth / callback) are NOT exempt:
-		// when no API keys exist authenticateRequest() still allows them
-		// (initial account setup, via the isAuthenticationEnabled() check
-		// below); once authentication is enabled they fall through to
-		// API-key validation and authorizeEndpoint(), which only grants admin
-		// keys access to non-proxy paths. This closes the unauthenticated
-		// token-overwrite hole.
+		// OAuth setup endpoints are intentionally not exempt. When no API keys
+		// exist authenticateRequest() still permits bootstrap below. Once auth is
+		// enabled, init, reauth, callback, status, list, and individual-job reads
+		// all require a validated admin key like every other dashboard API.
 		if (path.startsWith("/api/oauth")) {
-			return (
-				method === "GET" &&
-				(path.startsWith("/api/oauth/qwen/status/") ||
-					path.startsWith("/api/oauth/codex/status/"))
-			);
+			return false;
 		}
 
 		// API key management: Only allow initial key creation without auth if no keys exist

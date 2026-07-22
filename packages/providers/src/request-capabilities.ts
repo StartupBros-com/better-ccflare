@@ -62,14 +62,27 @@ export function deriveComboRouteClass(
 	const hasOAuthCredential = Boolean(
 		account.refresh_token?.trim() || account.access_token?.trim(),
 	);
-	if (hasApiKey && hasOAuthCredential) return null;
+	// Older direct-create HTTP handlers mirrored one API key byte-for-byte into
+	// all three credential columns. Treat only that exact, provider-appropriate
+	// storage shape as a single API-key credential; any partial or differing
+	// mixture remains contradictory and fails closed.
+	const hasLegacyMirroredApiKey =
+		isApiKeyProvider &&
+		hasApiKey &&
+		Boolean(account.refresh_token) &&
+		Boolean(account.access_token) &&
+		account.refresh_token === account.api_key &&
+		account.access_token === account.api_key;
+	const hasEffectiveOAuthCredential =
+		hasOAuthCredential && !hasLegacyMirroredApiKey;
+	if (hasApiKey && hasEffectiveOAuthCredential) return null;
 
 	if (isOAuthProvider) {
 		if (billingType === "api" || hasApiKey) return null;
 		return "oauth-subscription";
 	}
 
-	if (hasOAuthCredential) return null;
+	if (hasEffectiveOAuthCredential) return null;
 	if (CUSTOM_BILLING_PROVIDERS.has(account.provider)) {
 		return billingType === "plan" ? "oauth-subscription" : "api-key";
 	}

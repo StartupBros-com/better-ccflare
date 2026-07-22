@@ -93,12 +93,30 @@ const ROUTING_REVISION_POLICY_TABLES = [
 	"combo_membership_exclusions",
 ] as const;
 
+// Keep this provider boundary in semantic parity with API_KEY_PROVIDERS in
+// packages/providers/src/request-capabilities.ts. The revision trigger stores
+// only whether the legacy mirrored credential shape changed, never a secret.
+const ROUTING_REVISION_API_KEY_PROVIDERS = [
+	"claude-console-api",
+	"zai",
+	"minimax",
+	"anthropic-compatible",
+	"openai-compatible",
+	"nanogpt",
+	"kilo",
+	"openrouter",
+	"alibaba-coding-plan",
+	"ollama-cloud",
+] as const;
+
 /**
  * Install a database-owned revision clock for every persisted input that enters
  * the managed-routing preview hash. Account availability/usage fields are
  * intentionally excluded: preview identity uses route membership, not the
- * transient availability decoration. Credential values are similarly reduced
- * to presence so ordinary OAuth token rotation does not invalidate a review.
+ * transient availability decoration. Credential values are reduced to
+ * presence plus the provider-scoped legacy-mirrored-shape boolean, so ordinary
+ * OAuth/API-key rotation does not invalidate a review while route-class changes
+ * still do.
  */
 function ensureRoutingPolicyRevisionSchema(db: Database): void {
 	db.run(`
@@ -167,6 +185,25 @@ function ensureRoutingPolicyRevisionSchema(db: Database): void {
 				!= (length(trim(COALESCE(NEW.${column}, ''))) > 0)`
 			: `OLD.${column} IS NOT NEW.${column}`,
 	);
+	if (
+		["provider", "api_key", "refresh_token", "access_token"].every((column) =>
+			accountColumns.has(column),
+		)
+	) {
+		const providerList = ROUTING_REVISION_API_KEY_PROVIDERS.map(
+			(provider) => `'${provider}'`,
+		).join(", ");
+		const legacyMirroredCredentialShape = (row: "OLD" | "NEW") => `(
+			COALESCE(${row}.provider IN (${providerList}), 0)
+			AND length(trim(COALESCE(${row}.api_key, ''))) > 0
+			AND ${row}.refresh_token IS ${row}.api_key
+			AND ${row}.access_token IS ${row}.api_key
+		)`;
+		comparisons.push(
+			`${legacyMirroredCredentialShape("OLD")}
+			!= ${legacyMirroredCredentialShape("NEW")}`,
+		);
+	}
 	db.run("DROP TRIGGER IF EXISTS trg_routing_revision_accounts_update");
 	if (accountRevisionColumns.length > 0) {
 		db.run(`
@@ -338,6 +375,48 @@ export function ensureSchema(db: Database): void {
 	// Create index for faster cleanup of expired sessions
 	db.run(
 		`CREATE INDEX IF NOT EXISTS idx_oauth_sessions_expires ON oauth_sessions(expires_at)`,
+	);
+
+	// Durable device setup orchestration state. Provider continuation material
+	// stays in process memory; this table persists only safe lifecycle metadata.
+	db.run(`
+		CREATE TABLE IF NOT EXISTS device_setup_jobs (
+			id TEXT PRIMARY KEY,
+			idempotency_key TEXT NOT NULL UNIQUE,
+			request_fingerprint TEXT NOT NULL,
+			provider TEXT NOT NULL CHECK (provider IN ('qwen', 'codex')),
+			account_id TEXT NOT NULL,
+			status TEXT NOT NULL
+				CHECK (status IN ('awaiting_authorization', 'account_committed', 'reconciling', 'complete', 'complete_with_actions', 'authorization_error', 'expired')),
+			routing_selections_json TEXT NOT NULL DEFAULT '[]',
+			routing_outcomes_json TEXT NOT NULL DEFAULT '[]',
+			routing_cursor INTEGER NOT NULL DEFAULT 0 CHECK (routing_cursor >= 0),
+			lease_token TEXT,
+			lease_expires_at INTEGER,
+			attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+			error_code TEXT,
+			error_message TEXT,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			terminal_at INTEGER,
+			retention_expires_at INTEGER,
+			CHECK (
+				(lease_token IS NULL AND lease_expires_at IS NULL)
+				OR (lease_token IS NOT NULL AND lease_expires_at IS NOT NULL)
+			)
+		)
+	`);
+	db.run(
+		`CREATE INDEX IF NOT EXISTS idx_device_setup_jobs_claim
+		 ON device_setup_jobs(status, lease_expires_at, updated_at)`,
+	);
+	db.run(
+		`CREATE INDEX IF NOT EXISTS idx_device_setup_jobs_retention
+		 ON device_setup_jobs(retention_expires_at)`,
+	);
+	db.run(
+		`CREATE INDEX IF NOT EXISTS idx_device_setup_jobs_account
+		 ON device_setup_jobs(account_id)`,
 	);
 
 	// Create agent_preferences table for storing user-defined agent settings

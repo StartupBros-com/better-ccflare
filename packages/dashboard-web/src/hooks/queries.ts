@@ -1,13 +1,112 @@
 import { getModelDisplayName } from "@better-ccflare/core";
 import type {
 	AgentUpdatePayload,
+	ComboFamily,
+	ComboMembershipMode,
+	ComboRoutingPreviewSubject,
 	ComboSlotCreateInput,
 	ComboSlotUpdateInput,
+	DeviceSetupJobStatus,
+	DeviceSetupJobView,
 } from "@better-ccflare/types";
 import { COMMON_MODELS } from "@better-ccflare/types";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+	type QueryClient,
+	useMutation,
+	useQuery,
+	useQueryClient,
+} from "@tanstack/react-query";
+import { useCallback } from "react";
 import { api, type RequestPayload, type RequestSummary } from "../api";
 import { queryKeys } from "../lib/query-keys";
+
+export interface ManagedRoutingInvalidationOptions {
+	accounts?: boolean;
+	families?: boolean;
+	combos?: boolean;
+	effective?: boolean;
+	accountOverview?: boolean;
+}
+
+export const FULL_MANAGED_ROUTING_INVALIDATION = {
+	accounts: true,
+	families: true,
+	combos: true,
+	effective: true,
+	accountOverview: true,
+} as const satisfies ManagedRoutingInvalidationOptions;
+
+export const ACCOUNT_ROUTING_INVALIDATION = {
+	accounts: true,
+	effective: true,
+	accountOverview: true,
+} as const satisfies ManagedRoutingInvalidationOptions;
+
+export const ROUTING_CONFIGURATION_INVALIDATION = {
+	families: true,
+	combos: true,
+	effective: true,
+	accountOverview: true,
+} as const satisfies ManagedRoutingInvalidationOptions;
+
+export const ACCOUNTS_ONLY_INVALIDATION = {
+	accounts: true,
+} as const satisfies ManagedRoutingInvalidationOptions;
+
+/**
+ * Invalidate cached views affected by a managed-routing mutation.
+ *
+ * Calling without options is intentionally the safe, full invalidation used by
+ * mutations that can change family membership or ordering. Narrower account
+ * mutations opt into one of the exported scopes above.
+ */
+export async function invalidateManagedRouting(
+	queryClient: QueryClient,
+	options: ManagedRoutingInvalidationOptions = FULL_MANAGED_ROUTING_INVALIDATION,
+): Promise<void> {
+	const invalidations: Promise<void>[] = [];
+
+	if (options.accounts) {
+		invalidations.push(
+			queryClient.invalidateQueries({ queryKey: queryKeys.accounts() }),
+		);
+	}
+	if (options.families) {
+		invalidations.push(
+			queryClient.invalidateQueries({ queryKey: queryKeys.families() }),
+		);
+	}
+	if (options.combos) {
+		invalidations.push(
+			queryClient.invalidateQueries({ queryKey: queryKeys.combos() }),
+		);
+	}
+	if (options.effective) {
+		invalidations.push(
+			queryClient.invalidateQueries({ queryKey: queryKeys.routingEffective() }),
+		);
+	}
+	if (options.accountOverview) {
+		invalidations.push(
+			queryClient.invalidateQueries({
+				queryKey: queryKeys.accountRoutingOverview(),
+			}),
+		);
+	}
+
+	await Promise.all(invalidations);
+}
+
+/** Stable invalidator for direct account-creation and reauthentication flows. */
+export const useManagedRoutingInvalidation = () => {
+	const queryClient = useQueryClient();
+	return useCallback(
+		(
+			options: ManagedRoutingInvalidationOptions = FULL_MANAGED_ROUTING_INVALIDATION,
+		) => invalidateManagedRouting(queryClient, options),
+		[queryClient],
+	);
+};
 
 /**
  * Build a lightweight RequestPayload from a RequestSummary.
@@ -91,6 +190,195 @@ export const useAccounts = () => {
 		refetchIntervalInBackground: false, // Don't refresh when tab is not focused
 		gcTime: 5 * 60 * 1000, // Keep in cache for 5 minutes
 	});
+};
+
+const ACTIVE_DEVICE_SETUP_STATUSES = new Set<DeviceSetupJobStatus>([
+	"awaiting_authorization",
+	"account_committed",
+	"reconciling",
+]);
+
+export function deviceSetupJobsNeedPolling(
+	jobs: readonly Pick<DeviceSetupJobView, "status">[],
+): boolean {
+	return jobs.some((job) => ACTIVE_DEVICE_SETUP_STATUSES.has(job.status));
+}
+
+export const getRecentDeviceSetupJobsQueryOptions = (
+	authenticated: boolean,
+) => ({
+	queryKey: queryKeys.deviceSetupJobsRecent(),
+	queryFn: () => api.getRecentDeviceSetupJobs(),
+	enabled: authenticated,
+	staleTime: 0,
+	refetchInterval: (query: { state: { data?: DeviceSetupJobView[] } }) =>
+		deviceSetupJobsNeedPolling(query.state.data ?? []) ? 3_000 : false,
+	refetchIntervalInBackground: false,
+});
+
+export const useRecentDeviceSetupJobs = (authenticated: boolean) =>
+	useQuery(getRecentDeviceSetupJobsQueryOptions(authenticated));
+
+export const getDeviceSetupJobQueryOptions = (jobId: string | null) => ({
+	queryKey: queryKeys.deviceSetupJob(jobId ?? "inactive"),
+	queryFn: () => {
+		if (!jobId) throw new Error("Device setup job ID is unavailable");
+		return api.getDeviceSetupJob(jobId);
+	},
+	enabled: jobId !== null,
+	staleTime: 0,
+	refetchInterval: (query: { state: { data?: DeviceSetupJobView } }) =>
+		query.state.data && deviceSetupJobsNeedPolling([query.state.data])
+			? 3_000
+			: false,
+	refetchIntervalInBackground: false,
+});
+
+export const useDeviceSetupJob = (jobId: string | null) =>
+	useQuery(getDeviceSetupJobQueryOptions(jobId));
+
+export const useEffectiveRouting = (family?: ComboFamily) => {
+	return useQuery({
+		queryKey: queryKeys.routingEffective(family),
+		queryFn: () => api.getEffectiveRouting(family),
+	});
+};
+
+export const getAccountRoutingOverviewQueryOptions = () => ({
+	queryKey: queryKeys.accountRoutingOverview(),
+	queryFn: () => api.getAccountRoutingOverview(),
+});
+
+/** One coherent account-card snapshot; cardinality is independent of account count. */
+export const useAccountRoutingOverview = () => {
+	return useQuery(getAccountRoutingOverviewQueryOptions());
+};
+
+export interface RoutingPreviewVariables {
+	subject: ComboRoutingPreviewSubject;
+	family?: ComboFamily;
+	managedModel?: string;
+}
+
+/** Preview is read-only and deliberately has no invalidation side effects. */
+export const getRoutingPreviewMutationOptions = () => {
+	return {
+		mutationFn: ({ subject, family, managedModel }: RoutingPreviewVariables) =>
+			api.previewRouting(subject, family, managedModel),
+	};
+};
+
+export const useRoutingPreview = () => {
+	return useMutation(getRoutingPreviewMutationOptions());
+};
+
+export interface UpdateFamilyPolicyVariables {
+	family: ComboFamily;
+	comboId?: string | null;
+	enabled?: boolean;
+	membershipMode?: ComboMembershipMode;
+	managedModel?: string | null;
+}
+
+export const getUpdateFamilyPolicyMutationOptions = (
+	queryClient: QueryClient,
+) => ({
+	mutationFn: (params: UpdateFamilyPolicyVariables) =>
+		api.updateFamilyPolicy(params),
+	onSuccess: () =>
+		invalidateManagedRouting(queryClient, ROUTING_CONFIGURATION_INVALIDATION),
+});
+
+export const useUpdateFamilyPolicy = () => {
+	const queryClient = useQueryClient();
+	return useMutation(getUpdateFamilyPolicyMutationOptions(queryClient));
+};
+
+export interface PreviewFamilyRoutingVariables {
+	family: ComboFamily;
+	managedModel?: string;
+}
+
+/** Family conversion preview is read-only and never invalidates cached state. */
+export const getPreviewFamilyRoutingMutationOptions = () => ({
+	mutationFn: ({ family, managedModel }: PreviewFamilyRoutingVariables) =>
+		api.previewFamilyRouting(family, managedModel),
+});
+
+export const usePreviewFamilyRouting = () =>
+	useMutation(getPreviewFamilyRoutingMutationOptions());
+
+export interface ApplyFamilyRoutingProposalVariables {
+	family: ComboFamily;
+	previewId: string;
+	proposalId: string;
+	managedModel: string;
+}
+
+export const getApplyFamilyRoutingProposalMutationOptions = (
+	queryClient: QueryClient,
+) => ({
+	mutationFn: (params: ApplyFamilyRoutingProposalVariables) =>
+		api.applyFamilyRoutingProposal(params),
+	onSuccess: () =>
+		invalidateManagedRouting(queryClient, ROUTING_CONFIGURATION_INVALIDATION),
+});
+
+export const useApplyFamilyRoutingProposal = () => {
+	const queryClient = useQueryClient();
+	return useMutation(getApplyFamilyRoutingProposalMutationOptions(queryClient));
+};
+
+export interface FamilyRoutingAccountVariables {
+	family: ComboFamily;
+	accountId: string;
+}
+
+export const getExcludeAccountFromFamilyMutationOptions = (
+	queryClient: QueryClient,
+) => ({
+	mutationFn: ({ family, accountId }: FamilyRoutingAccountVariables) =>
+		api.excludeAccountFromFamily(family, accountId),
+	onSuccess: () =>
+		invalidateManagedRouting(queryClient, ROUTING_CONFIGURATION_INVALIDATION),
+});
+
+export const useExcludeAccountFromFamily = () => {
+	const queryClient = useQueryClient();
+	return useMutation(getExcludeAccountFromFamilyMutationOptions(queryClient));
+};
+
+export const getRestoreAccountToFamilyMutationOptions = (
+	queryClient: QueryClient,
+) => ({
+	mutationFn: ({ family, accountId }: FamilyRoutingAccountVariables) =>
+		api.restoreAccountToFamily(family, accountId),
+	onSuccess: () =>
+		invalidateManagedRouting(queryClient, ROUTING_CONFIGURATION_INVALIDATION),
+});
+
+export const useRestoreAccountToFamily = () => {
+	const queryClient = useQueryClient();
+	return useMutation(getRestoreAccountToFamilyMutationOptions(queryClient));
+};
+
+export interface ApplyRoutingProposalVariables
+	extends ApplyFamilyRoutingProposalVariables {
+	accountId: string;
+}
+
+export const getApplyRoutingProposalMutationOptions = (
+	queryClient: QueryClient,
+) => ({
+	mutationFn: (params: ApplyRoutingProposalVariables) =>
+		api.applyRoutingProposal(params),
+	onSuccess: () =>
+		invalidateManagedRouting(queryClient, ROUTING_CONFIGURATION_INVALIDATION),
+});
+
+export const useApplyRoutingProposal = () => {
+	const queryClient = useQueryClient();
+	return useMutation(getApplyRoutingProposalMutationOptions(queryClient));
 };
 
 export const useAgents = () => {
@@ -297,9 +585,7 @@ export const useRemoveAccount = () => {
 			name: string;
 			confirmInput: string;
 		}) => api.removeAccount(name, confirmInput),
-		onSuccess: () => {
-			queryClient.invalidateQueries({ queryKey: queryKeys.accounts() });
-		},
+		onSuccess: () => invalidateManagedRouting(queryClient),
 	});
 };
 
@@ -313,10 +599,148 @@ export const useRenameAccount = () => {
 			accountId: string;
 			newName: string;
 		}) => api.renameAccount(accountId, newName),
-		onSuccess: () => {
-			queryClient.invalidateQueries({ queryKey: queryKeys.accounts() });
-		},
+		onSuccess: () =>
+			invalidateManagedRouting(queryClient, ACCOUNT_ROUTING_INVALIDATION),
 	});
+};
+
+export const getPauseAccountMutationOptions = (queryClient: QueryClient) => ({
+	mutationFn: (accountId: string) => api.pauseAccount(accountId),
+	onSuccess: () =>
+		invalidateManagedRouting(queryClient, ACCOUNT_ROUTING_INVALIDATION),
+});
+
+export const usePauseAccount = () => {
+	const queryClient = useQueryClient();
+	return useMutation(getPauseAccountMutationOptions(queryClient));
+};
+
+export const getResumeAccountMutationOptions = (queryClient: QueryClient) => ({
+	mutationFn: (accountId: string) => api.resumeAccount(accountId),
+	onSuccess: () =>
+		invalidateManagedRouting(queryClient, ACCOUNT_ROUTING_INVALIDATION),
+});
+
+export const useResumeAccount = () => {
+	const queryClient = useQueryClient();
+	return useMutation(getResumeAccountMutationOptions(queryClient));
+};
+
+export const getForceResetRateLimitMutationOptions = (
+	queryClient: QueryClient,
+) => ({
+	mutationFn: (accountId: string) => api.forceResetRateLimit(accountId),
+	onSuccess: () =>
+		invalidateManagedRouting(queryClient, ACCOUNT_ROUTING_INVALIDATION),
+});
+
+export const useForceResetRateLimit = () => {
+	const queryClient = useQueryClient();
+	return useMutation(getForceResetRateLimitMutationOptions(queryClient));
+};
+
+export const getRefreshUsageMutationOptions = (queryClient: QueryClient) => ({
+	mutationFn: (accountId: string) => api.refreshUsage(accountId),
+	onSuccess: () =>
+		invalidateManagedRouting(queryClient, ACCOUNT_ROUTING_INVALIDATION),
+});
+
+export const useRefreshUsage = () => {
+	const queryClient = useQueryClient();
+	return useMutation(getRefreshUsageMutationOptions(queryClient));
+};
+
+export const getUpdateAccountPriorityMutationOptions = (
+	queryClient: QueryClient,
+) => ({
+	mutationFn: ({
+		accountId,
+		priority,
+	}: {
+		accountId: string;
+		priority: number;
+	}) => api.updateAccountPriority(accountId, priority),
+	onSuccess: () => invalidateManagedRouting(queryClient),
+});
+
+export const useUpdateAccountPriority = () => {
+	const queryClient = useQueryClient();
+	return useMutation(getUpdateAccountPriorityMutationOptions(queryClient));
+};
+
+export const getUpdateAccountAutoRefreshMutationOptions = (
+	queryClient: QueryClient,
+) => ({
+	mutationFn: ({
+		accountId,
+		enabled,
+	}: {
+		accountId: string;
+		enabled: boolean;
+	}) => api.updateAccountAutoRefresh(accountId, enabled),
+	onSuccess: () =>
+		invalidateManagedRouting(queryClient, ACCOUNTS_ONLY_INVALIDATION),
+});
+
+export const useUpdateAccountAutoRefresh = () => {
+	const queryClient = useQueryClient();
+	return useMutation(getUpdateAccountAutoRefreshMutationOptions(queryClient));
+};
+
+export const getUpdateAccountBillingTypeMutationOptions = (
+	queryClient: QueryClient,
+) => ({
+	mutationFn: ({
+		accountId,
+		billingType,
+	}: {
+		accountId: string;
+		billingType: "plan" | "api" | "auto";
+	}) => api.updateAccountBillingType(accountId, billingType),
+	onSuccess: () => invalidateManagedRouting(queryClient),
+});
+
+export const useUpdateAccountBillingType = () => {
+	const queryClient = useQueryClient();
+	return useMutation(getUpdateAccountBillingTypeMutationOptions(queryClient));
+};
+
+export const getUpdateAccountCustomEndpointMutationOptions = (
+	queryClient: QueryClient,
+) => ({
+	mutationFn: ({
+		accountId,
+		customEndpoint,
+	}: {
+		accountId: string;
+		customEndpoint: string | null;
+	}) => api.updateAccountCustomEndpoint(accountId, customEndpoint),
+	onSuccess: () => invalidateManagedRouting(queryClient),
+});
+
+export const useUpdateAccountCustomEndpoint = () => {
+	const queryClient = useQueryClient();
+	return useMutation(
+		getUpdateAccountCustomEndpointMutationOptions(queryClient),
+	);
+};
+
+export const getUpdateAccountModelMappingsMutationOptions = (
+	queryClient: QueryClient,
+) => ({
+	mutationFn: ({
+		accountId,
+		modelMappings,
+	}: {
+		accountId: string;
+		modelMappings: Record<string, string | string[]>;
+	}) => api.updateAccountModelMappings(accountId, modelMappings),
+	onSuccess: () => invalidateManagedRouting(queryClient),
+});
+
+export const useUpdateAccountModelMappings = () => {
+	const queryClient = useQueryClient();
+	return useMutation(getUpdateAccountModelMappingsMutationOptions(queryClient));
 };
 
 export const useResetStats = () => {
@@ -547,9 +971,7 @@ export const useCreateCombo = () => {
 			description?: string;
 			enabled?: boolean;
 		}) => api.createCombo(params),
-		onSuccess: () => {
-			queryClient.invalidateQueries({ queryKey: queryKeys.combos() });
-		},
+		onSuccess: () => invalidateManagedRouting(queryClient, { combos: true }),
 	});
 };
 
@@ -561,10 +983,8 @@ export const useAssignFamily = () => {
 			comboId: string | null;
 			enabled: boolean;
 		}) => api.assignFamily(params),
-		onSuccess: () => {
-			queryClient.invalidateQueries({ queryKey: queryKeys.families() });
-			queryClient.invalidateQueries({ queryKey: queryKeys.combos() });
-		},
+		onSuccess: () =>
+			invalidateManagedRouting(queryClient, ROUTING_CONFIGURATION_INVALIDATION),
 	});
 };
 
@@ -572,9 +992,8 @@ export const useDeleteCombo = () => {
 	const queryClient = useQueryClient();
 	return useMutation({
 		mutationFn: (id: string) => api.deleteCombo(id),
-		onSuccess: () => {
-			queryClient.invalidateQueries({ queryKey: queryKeys.combos() });
-		},
+		onSuccess: () =>
+			invalidateManagedRouting(queryClient, ROUTING_CONFIGURATION_INVALIDATION),
 	});
 };
 
@@ -587,9 +1006,8 @@ export const useUpdateCombo = () => {
 			description?: string;
 			enabled?: boolean;
 		}) => api.updateCombo(params.id, params),
-		onSuccess: () => {
-			queryClient.invalidateQueries({ queryKey: queryKeys.combos() });
-		},
+		onSuccess: () =>
+			invalidateManagedRouting(queryClient, ROUTING_CONFIGURATION_INVALIDATION),
 	});
 };
 
@@ -612,9 +1030,14 @@ export const useAddComboSlot = () => {
 			comboId: string;
 			params: ComboSlotCreateInput;
 		}) => api.addComboSlot(comboId, params),
-		onSuccess: (_data, { comboId }) => {
-			queryClient.invalidateQueries({ queryKey: queryKeys.combos() });
-			queryClient.invalidateQueries({ queryKey: ["combo", comboId] });
+		onSuccess: async (_data, { comboId }) => {
+			await Promise.all([
+				invalidateManagedRouting(
+					queryClient,
+					ROUTING_CONFIGURATION_INVALIDATION,
+				),
+				queryClient.invalidateQueries({ queryKey: ["combo", comboId] }),
+			]);
 		},
 	});
 };
@@ -631,9 +1054,14 @@ export const useUpdateComboSlot = () => {
 			slotId: string;
 			params: ComboSlotUpdateInput;
 		}) => api.updateComboSlot(comboId, slotId, params),
-		onSuccess: (_data, { comboId }) => {
-			queryClient.invalidateQueries({ queryKey: queryKeys.combos() });
-			queryClient.invalidateQueries({ queryKey: ["combo", comboId] });
+		onSuccess: async (_data, { comboId }) => {
+			await Promise.all([
+				invalidateManagedRouting(
+					queryClient,
+					ROUTING_CONFIGURATION_INVALIDATION,
+				),
+				queryClient.invalidateQueries({ queryKey: ["combo", comboId] }),
+			]);
 		},
 	});
 };
@@ -643,9 +1071,14 @@ export const useRemoveComboSlot = () => {
 	return useMutation({
 		mutationFn: ({ comboId, slotId }: { comboId: string; slotId: string }) =>
 			api.removeComboSlot(comboId, slotId),
-		onSuccess: (_data, { comboId }) => {
-			queryClient.invalidateQueries({ queryKey: queryKeys.combos() });
-			queryClient.invalidateQueries({ queryKey: ["combo", comboId] });
+		onSuccess: async (_data, { comboId }) => {
+			await Promise.all([
+				invalidateManagedRouting(
+					queryClient,
+					ROUTING_CONFIGURATION_INVALIDATION,
+				),
+				queryClient.invalidateQueries({ queryKey: ["combo", comboId] }),
+			]);
 		},
 	});
 };
@@ -660,9 +1093,14 @@ export const useReorderComboSlots = () => {
 			comboId: string;
 			slotIds: string[];
 		}) => api.reorderComboSlots(comboId, slotIds),
-		onSuccess: (_data, { comboId }) => {
-			queryClient.invalidateQueries({ queryKey: queryKeys.combos() });
-			queryClient.invalidateQueries({ queryKey: ["combo", comboId] });
+		onSuccess: async (_data, { comboId }) => {
+			await Promise.all([
+				invalidateManagedRouting(
+					queryClient,
+					ROUTING_CONFIGURATION_INVALIDATION,
+				),
+				queryClient.invalidateQueries({ queryKey: ["combo", comboId] }),
+			]);
 		},
 	});
 };

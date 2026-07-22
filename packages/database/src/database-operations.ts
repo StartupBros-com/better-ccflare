@@ -47,6 +47,7 @@ import {
 	type MarkIncompleteOptions,
 } from "./repositories/cache-flight-recorder.repository";
 import { ComboRepository } from "./repositories/combo.repository";
+import { DeviceSetupJobRepository } from "./repositories/device-setup-job.repository";
 import { OAuthRepository } from "./repositories/oauth.repository";
 import {
 	type RequestData,
@@ -359,6 +360,7 @@ export class DatabaseOperations implements StrategyStore, Disposable {
 	private agentPreferences: AgentPreferenceRepository;
 	private apiKeys: ApiKeyRepository;
 	private combo: ComboRepository;
+	private deviceSetupJobs: DeviceSetupJobRepository;
 	private usageHistory: UsageHistoryRepository;
 	private cacheFlightRecorder: CacheFlightRecorderRepository;
 
@@ -507,6 +509,7 @@ export class DatabaseOperations implements StrategyStore, Disposable {
 		this.agentPreferences = new AgentPreferenceRepository(this.adapter);
 		this.apiKeys = new ApiKeyRepository(this.adapter);
 		this.combo = new ComboRepository(this.adapter);
+		this.deviceSetupJobs = new DeviceSetupJobRepository(this.adapter);
 		this.usageHistory = new UsageHistoryRepository(this.adapter);
 		this.cacheFlightRecorder = new CacheFlightRecorderRepository(this.adapter);
 	}
@@ -948,6 +951,10 @@ OAuth tokens will need to be re-authenticated.
 			reset,
 			remaining,
 		);
+	}
+
+	getDeviceSetupJobRepository(): DeviceSetupJobRepository {
+		return this.deviceSetupJobs;
 	}
 
 	// Usage-history operations delegated to repository

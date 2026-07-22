@@ -187,6 +187,67 @@ describe("managed routing capabilities", () => {
 		).toBe("api-key");
 	});
 
+	it("recognizes legacy API-key records with identical mirrored credentials", () => {
+		for (const provider of [
+			"zai",
+			"minimax",
+			"anthropic-compatible",
+			"openai-compatible",
+			"nanogpt",
+			"alibaba-coding-plan",
+			"ollama-cloud",
+		]) {
+			expect(
+				deriveComboRouteClass(
+					routingAccount({
+						provider,
+						api_key: "same-api-key",
+						refresh_token: "same-api-key",
+						access_token: "same-api-key",
+						billing_type: null,
+					}),
+				),
+			).toBe("api-key");
+		}
+
+		expect(
+			deriveComboRouteClass(
+				routingAccount({
+					provider: "openai-compatible",
+					api_key: "same-plan-key",
+					refresh_token: "same-plan-key",
+					access_token: "same-plan-key",
+					billing_type: "plan",
+				}),
+			),
+		).toBe("oauth-subscription");
+	});
+
+	it("keeps genuinely mixed and OAuth-provider credentials fail closed", () => {
+		for (const account of [
+			routingAccount({
+				provider: "zai",
+				api_key: "api-key",
+				refresh_token: "different-refresh-token",
+				access_token: "api-key",
+			}),
+			routingAccount({
+				provider: "zai",
+				api_key: "api-key",
+				refresh_token: "api-key",
+				access_token: "different-access-token",
+			}),
+			routingAccount({
+				provider: "anthropic",
+				api_key: "same-secret",
+				refresh_token: "same-secret",
+				access_token: "same-secret",
+			}),
+		]) {
+			expect(deriveComboRouteClass(account)).toBeNull();
+		}
+	});
+
 	it("fails closed for unknown billing and contradictory auth shapes", () => {
 		for (const account of [
 			routingAccount({

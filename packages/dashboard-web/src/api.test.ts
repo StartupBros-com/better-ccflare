@@ -19,6 +19,42 @@ function callFor(url: string): RequestCall {
 
 beforeEach(() => {
 	requestMock = mock(async (url: string) => {
+		if (url === "/api/oauth/device-setup/jobs?limit=17") return [];
+		if (url.startsWith("/api/oauth/device-setup/jobs/")) {
+			return {
+				id: "opaque-job",
+				provider: "codex",
+				accountId: null,
+				status: "awaiting_authorization",
+				routingOutcomes: [],
+				errorCode: null,
+				errorMessage: null,
+				createdAt: 1,
+				updatedAt: 1,
+				terminalAt: null,
+			};
+		}
+		if (url === "/api/oauth/qwen/init" || url === "/api/oauth/codex/init") {
+			return {
+				job: {
+					id: "opaque-job",
+					provider: url.includes("qwen") ? "qwen" : "codex",
+					accountId: null,
+					status: "awaiting_authorization",
+					routingOutcomes: [],
+					errorCode: null,
+					errorMessage: null,
+					createdAt: 1,
+					updatedAt: 1,
+					terminalAt: null,
+				},
+				authorization: {
+					verificationUrl: "https://authorize.example",
+					userCode: "SAFE-CODE",
+				},
+				replayed: false,
+			};
+		}
 		if (url.includes("/status/")) {
 			return { status: "complete", accountId: "created-account" };
 		}
@@ -51,9 +87,49 @@ afterEach(() => {
 });
 
 describe("managed-routing dashboard API contracts", () => {
+	it("uses durable device-setup contracts and copies only reviewed command fields", async () => {
+		const command = {
+			name: "account name",
+			priority: 0,
+			idempotencyKey: "device-setup-stable-key",
+			reviewed: [
+				{ family: "opus" as const, proposalId: "proposal/opaque:opus" },
+				{ family: "fable" as const, proposalId: "proposal/opaque:fable" },
+			],
+			apiKey: "must-not-cross-api-boundary",
+			jobId: "must-not-be-client-selected",
+		};
+
+		await api.initQwenDeviceFlow(command);
+		await api.initCodexDeviceFlow(command);
+		await api.getDeviceSetupJob("opaque/job id");
+		await api.getRecentDeviceSetupJobs(17);
+
+		for (const url of ["/api/oauth/qwen/init", "/api/oauth/codex/init"]) {
+			const request = callFor(url)[1];
+			expect(request.method).toBe("POST");
+			expect(JSON.parse(request.body as string)).toEqual({
+				name: "account name",
+				priority: 0,
+				idempotencyKey: "device-setup-stable-key",
+				reviewed: [
+					{ family: "opus", proposalId: "proposal/opaque:opus" },
+					{ family: "fable", proposalId: "proposal/opaque:fable" },
+				],
+			});
+		}
+		expect(
+			callFor("/api/oauth/device-setup/jobs/opaque%2Fjob%20id")[1].method,
+		).toBe("GET");
+		expect(callFor("/api/oauth/device-setup/jobs?limit=17")[1].method).toBe(
+			"GET",
+		);
+	});
+
 	it("uses the authoritative effective, preview, apply, and exclusion endpoints", async () => {
 		await api.getEffectiveRouting();
 		await api.getEffectiveRouting("opus");
+		await api.getAccountRoutingOverview();
 		await api.previewRouting(
 			{
 				draft: {
@@ -77,6 +153,7 @@ describe("managed-routing dashboard API contracts", () => {
 
 		expect(callFor("/api/routing/effective")[1].method).toBe("GET");
 		expect(callFor("/api/routing/effective/opus")[1].method).toBe("GET");
+		expect(callFor("/api/routing/accounts")[1].method).toBe("GET");
 
 		const preview = callFor("/api/routing/preview")[1];
 		expect(preview.method).toBe("POST");
@@ -219,6 +296,8 @@ describe("dashboard API log redaction", () => {
 			);
 			await api.getCodexAuthStatus("secret-codex-session-sentinel");
 			await api.getQwenAuthStatus("secret-qwen-session-sentinel");
+			await api.getDeviceSetupJob("secret-device-job-id-sentinel");
+			await api.getRecentDeviceSetupJobs(17);
 			await api.updateAccountCustomEndpoint(
 				"account-safe",
 				"https://secret-updated-endpoint-sentinel.example",
@@ -244,6 +323,7 @@ describe("dashboard API log redaction", () => {
 			"secret-reauth-code-sentinel",
 			"secret-codex-session-sentinel",
 			"secret-qwen-session-sentinel",
+			"secret-device-job-id-sentinel",
 			"secret-updated-endpoint-sentinel",
 			"secret-updated-mapping-sentinel",
 		]) {

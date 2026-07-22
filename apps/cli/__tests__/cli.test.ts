@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { spawn } from "node:child_process";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -10,14 +11,17 @@ const CLI_PATH = join(process.cwd(), "apps/cli/src/main.ts");
  * Helper function to run CLI command and get output
  * Available to all test suites
  */
-function runCLI(args: string[]): Promise<{
+function runCLI(
+	args: string[],
+	env: Record<string, string | undefined> = {},
+): Promise<{
 	stdout: string;
 	stderr: string;
 	exitCode: number;
 }> {
 	return new Promise((resolve) => {
 		const proc = spawn("bun", ["run", CLI_PATH, ...args], {
-			env: { ...process.env, NODE_ENV: "test" },
+			env: { ...process.env, NODE_ENV: "test", ...env },
 		});
 
 		let stdout = "";
@@ -49,6 +53,159 @@ function runCLI(args: string[]): Promise<{
 			});
 		}, 6000);
 	});
+}
+
+async function startRoutingServer(): Promise<{
+	baseUrl: string;
+	requests: Array<{ method: string; path: string; body: unknown }>;
+	stop: () => Promise<void>;
+}> {
+	const requests: Array<{ method: string; path: string; body: unknown }> = [];
+	const effective = {
+		family: "opus",
+		policy: {
+			assignment: {
+				family: "opus",
+				combo_id: "combo-opus",
+				enabled: true,
+				membership_mode: "managed",
+				managed_model: "claude-opus-4-8",
+			},
+			combo: {
+				id: "combo-opus",
+				name: "Opus",
+				description: null,
+				enabled: true,
+				created_at: 1,
+				updated_at: 1,
+			},
+			slots: [],
+			rules: [],
+			exclusions: [],
+		},
+		resolution: {
+			family: "opus",
+			combo_id: "combo-opus",
+			active: true,
+			reason: "included",
+			members: [
+				{
+					id: "managed:account-live",
+					account_id: "account-live",
+					account_name: "Live account",
+					combo_id: "combo-opus",
+					family: "opus",
+					included: true,
+					logical_model: "claude-opus-4-8",
+					tier: 3,
+					source: "managed",
+					reason: "included",
+					slot_id: null,
+					rule_id: "rule-opus",
+					availability: { available: true, reason: "available" },
+					identity_provisional: false,
+				},
+			],
+			decisions: [],
+		},
+	};
+	const preview = {
+		preview_id: "preview-opus",
+		scope: "family",
+		family: "opus",
+		managed_model: "claude-opus-4-8",
+		effective,
+		proposals: [
+			{
+				proposal_id: "proposal-opus",
+				family: "opus",
+				combo_id: "combo-opus",
+				provider: "anthropic",
+				route_class: "oauth-subscription",
+				existing_rule_id: null,
+				managed_model: "claude-opus-4-8",
+				tier_source: "account_priority",
+				high_confidence: true,
+				selected_by_default: true,
+				reason: "included",
+				proposed_effective: effective,
+				member_delta: [],
+			},
+		],
+	};
+	const server = createServer(async (request, response) => {
+		const chunks: Buffer[] = [];
+		for await (const chunk of request) chunks.push(Buffer.from(chunk));
+		const rawBody = Buffer.concat(chunks).toString("utf8");
+		requests.push({
+			method: request.method ?? "GET",
+			path: request.url ?? "",
+			body: rawBody ? JSON.parse(rawBody) : null,
+		});
+		response.setHeader("content-type", "application/json");
+		if (request.url === "/api/accounts") {
+			response.end(
+				JSON.stringify([
+					{
+						id: "account-live",
+						name: "Live account",
+						provider: "anthropic",
+						priority: 3,
+						paused: false,
+						requiresReauth: false,
+						tokenStatus: "valid",
+						rateLimitStatus: "Active",
+					},
+				]),
+			);
+			return;
+		}
+		if (request.url === "/api/routing/accounts") {
+			response.end(
+				JSON.stringify({
+					success: true,
+					data: { effective: [effective], opportunities: [] },
+				}),
+			);
+			return;
+		}
+		if (request.url === "/api/routing/preview") {
+			response.end(JSON.stringify({ success: true, data: preview }));
+			return;
+		}
+		if (request.url === "/api/routing/apply/opus") {
+			response.end(JSON.stringify({ success: true, data: effective }));
+			return;
+		}
+		if (request.url === "/api/families/opus") {
+			response.end(
+				JSON.stringify({
+					success: true,
+					data: {
+						family: "opus",
+						combo_id: "combo-opus",
+						enabled: true,
+						membership_mode: "manual",
+						managed_model: "claude-opus-4-8",
+					},
+				}),
+			);
+			return;
+		}
+		response.statusCode = 404;
+		response.end(JSON.stringify({ error: "not found" }));
+	});
+
+	await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+	const address = server.address();
+	if (!address || typeof address === "string") {
+		throw new Error("test server did not bind a TCP port");
+	}
+	return {
+		baseUrl: `http://127.0.0.1:${address.port}`,
+		requests,
+		stop: () => new Promise((resolve) => server.close(() => resolve())),
+	};
 }
 
 /**
@@ -147,6 +304,20 @@ describe("CLI Integration Tests", () => {
 			expect(result.stdout).toContain("--compact");
 		});
 
+		it("shows the exact managed-routing command surface without a credential flag", async () => {
+			const result = await runCLI(["--help"]);
+
+			expect(result.stdout).toContain("routing list");
+			expect(result.stdout).toContain("routing detail <account-id>");
+			expect(result.stdout).toContain("routing preview <family>");
+			expect(result.stdout).toContain(
+				"routing apply <family> --preview-id <id> --proposal-id <id> --managed-model <model> --yes",
+			);
+			expect(result.stdout).toContain("routing manual <family> --yes");
+			expect(result.stdout).toContain("--api-url <loopback-url>");
+			expect(result.stdout).not.toContain("--admin-api-key");
+		});
+
 		it("should show account mode options", async () => {
 			const result = await runCLI(["--help"]);
 
@@ -163,6 +334,155 @@ describe("CLI Integration Tests", () => {
 
 			// Should complete in less than 2 seconds (fast exit)
 			expect(duration).toBeLessThan(2000);
+		});
+	});
+
+	describe("Managed Routing Commands", () => {
+		it("reads live routing before local database initialization", async () => {
+			const server = await startRoutingServer();
+			try {
+				const result = await runCLI(
+					["routing", "list", "--api-url", server.baseUrl, "--json"],
+					{
+						BETTER_CCFLARE_DB_PATH:
+							"/proc/better-ccflare-must-not-open/routing.db",
+					},
+				);
+
+				expect(result.exitCode).toBe(0);
+				expect(result.stdout).toContain('"account_id": "account-live"');
+				expect(result.stdout).toContain('"source": "managed"');
+				expect(result.stdout).toContain('"tier": 3');
+				expect(result.stdout).toContain('"reason": "included"');
+				expect(result.stderr).not.toContain("database");
+			} finally {
+				await server.stop();
+			}
+		});
+
+		it("ships preview, reviewed apply, and manual rollback with exact live API writes", async () => {
+			const server = await startRoutingServer();
+			const noDatabase = {
+				BETTER_CCFLARE_DB_PATH: "/proc/better-ccflare-must-not-open/routing.db",
+			};
+			try {
+				const preview = await runCLI(
+					[
+						"routing",
+						"preview",
+						"opus",
+						"--managed-model",
+						"claude-opus-4-8",
+						"--api-url",
+						server.baseUrl,
+						"--json",
+					],
+					noDatabase,
+				);
+				const apply = await runCLI(
+					[
+						"routing",
+						"apply",
+						"opus",
+						"--preview-id",
+						"preview-opus",
+						"--proposal-id",
+						"proposal-opus",
+						"--managed-model",
+						"claude-opus-4-8",
+						"--yes",
+						"--api-url",
+						server.baseUrl,
+						"--json",
+					],
+					noDatabase,
+				);
+				const manual = await runCLI(
+					[
+						"routing",
+						"manual",
+						"opus",
+						"--yes",
+						"--api-url",
+						server.baseUrl,
+						"--json",
+					],
+					noDatabase,
+				);
+
+				expect(preview.exitCode).toBe(0);
+				expect(preview.stdout).toContain('"preview_id": "preview-opus"');
+				expect(apply.exitCode).toBe(0);
+				expect(apply.stdout).toContain('"status": "applied"');
+				expect(manual.exitCode).toBe(0);
+				expect(manual.stdout).toContain('"membership_mode": "manual"');
+				expect(server.requests).toEqual([
+					{
+						method: "POST",
+						path: "/api/routing/preview",
+						body: {
+							scope: "family",
+							family: "opus",
+							managed_model: "claude-opus-4-8",
+						},
+					},
+					{
+						method: "POST",
+						path: "/api/routing/apply/opus",
+						body: {
+							scope: "family",
+							preview_id: "preview-opus",
+							proposal_id: "proposal-opus",
+							managed_model: "claude-opus-4-8",
+						},
+					},
+					{
+						method: "PUT",
+						path: "/api/families/opus",
+						body: { membership_mode: "manual" },
+					},
+				]);
+			} finally {
+				await server.stop();
+			}
+		});
+
+		it("returns usage exit 2 for invalid or incomplete routing commands", async () => {
+			for (const args of [
+				["routing", "detail"],
+				["routing", "preview", "unknown-family"],
+				["routing", "apply", "opus", "--yes"],
+				["routing", "manual", "opus"],
+				["routing", "list", "--proposal-id", "not-valid-for-list"],
+				["routing", "list", "--admin-api-key", "must-not-be-accepted"],
+			]) {
+				const result = await runCLI(args);
+				expect(result.exitCode).toBe(2);
+				expect(result.stdout).not.toContain("Starting better-ccflare server");
+			}
+		});
+
+		it("rejects a non-loopback API URL as usage error before any request", async () => {
+			const result = await runCLI([
+				"routing",
+				"list",
+				"--api-url",
+				"https://example.com",
+			]);
+
+			expect(result.exitCode).toBe(2);
+			expect(result.stderr).toMatch(/loopback/i);
+		});
+
+		it("returns operational exit 1 when the live control plane is unavailable", async () => {
+			const server = await startRoutingServer();
+			const baseUrl = server.baseUrl;
+			await server.stop();
+
+			const result = await runCLI(["routing", "list", "--api-url", baseUrl]);
+
+			expect(result.exitCode).toBe(1);
+			expect(result.stderr).toMatch(/could not be completed|failed/i);
 		});
 	});
 
@@ -217,6 +537,35 @@ describe("CLI Integration Tests", () => {
 	});
 
 	describe("Add Account Command", () => {
+		it("rejects a non-loopback post-create API target before account creation", async () => {
+			const result = await runCLI([
+				"--add-account",
+				"test-account",
+				"--mode",
+				"zai",
+				"--api-url",
+				"https://example.com",
+			]);
+
+			expect(result.exitCode).toBe(2);
+			expect(result.stderr).toMatch(/loopback/i);
+			expect(result.stdout).not.toContain("added successfully");
+		});
+
+		it("rejects mixed human/provider output for --add-account --json before creation", async () => {
+			const result = await runCLI([
+				"--add-account",
+				"test-account",
+				"--mode",
+				"zai",
+				"--json",
+			]);
+
+			expect(result.exitCode).toBe(2);
+			expect(result.stderr).toMatch(/--json is not supported/i);
+			expect(result.stdout).not.toContain("added successfully");
+		});
+
 		it("should reject add account without required flags", async () => {
 			const result = await runCLI(["--add-account", "test-account"]);
 

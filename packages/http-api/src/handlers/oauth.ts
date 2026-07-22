@@ -8,10 +8,12 @@ import {
 import type { DatabaseOperations } from "@better-ccflare/database";
 import {
 	BadRequest,
+	Conflict,
 	errorResponse,
 	InternalServerError,
 	jsonResponse,
 	NotFound,
+	ServiceUnavailable,
 } from "@better-ccflare/http-common";
 import { Logger } from "@better-ccflare/logger";
 import { createOAuthFlow } from "@better-ccflare/oauth-flow";
@@ -24,6 +26,12 @@ import {
 	pollForToken as pollQwenForToken,
 } from "@better-ccflare/providers/qwen";
 import { clearAccountRefreshCache } from "@better-ccflare/proxy";
+import type { DeviceSetupCoordinator } from "../services/device-setup-jobs";
+import {
+	DeviceSetupAuthorizationUnavailableError,
+	DeviceSetupIdempotencyConflictError,
+	DeviceSetupValidationError,
+} from "../services/device-setup-jobs";
 
 const log = new Logger("OAuthHandler");
 
@@ -46,117 +54,71 @@ function normalizeQwenBaseUrl(url: string): string {
 	return normalized;
 }
 
+async function readDeviceSetupBody(req: Request): Promise<unknown> {
+	try {
+		return await req.json();
+	} catch {
+		throw new DeviceSetupValidationError("Request body must be valid JSON");
+	}
+}
+
+function deviceSetupErrorResponse(error: unknown): Response {
+	if (error instanceof DeviceSetupValidationError) {
+		return errorResponse(BadRequest(error.message));
+	}
+	if (error instanceof DeviceSetupIdempotencyConflictError) {
+		return errorResponse(Conflict(error.message));
+	}
+	if (error instanceof DeviceSetupAuthorizationUnavailableError) {
+		return errorResponse(ServiceUnavailable(error.message));
+	}
+	return errorResponse(
+		InternalServerError("Failed to initialize durable device setup"),
+	);
+}
+
+/** Authenticated recovery list for durable device-setup jobs. */
+export function createDeviceSetupJobsListHandler(
+	coordinator: DeviceSetupCoordinator,
+) {
+	return async (url: URL): Promise<Response> => {
+		try {
+			const rawLimit = url.searchParams.get("limit");
+			const limit = rawLimit === null ? undefined : Number(rawLimit);
+			return jsonResponse(await coordinator.listRecent(limit));
+		} catch (error) {
+			return deviceSetupErrorResponse(error);
+		}
+	};
+}
+
+/** Authenticated, secret-free view of one durable device-setup job. */
+export function createDeviceSetupJobGetHandler(
+	coordinator: DeviceSetupCoordinator,
+) {
+	return async (jobId: string): Promise<Response> => {
+		const job = await coordinator.get(jobId);
+		return job
+			? jsonResponse(job)
+			: errorResponse(NotFound("Device setup job not found"));
+	};
+}
+
 /**
  * Create a Qwen device flow initialization handler.
- * Returns { authUrl, userCode, sessionId } immediately, then polls in background.
+ * Returns the durable job plus transient authorization fields. The coordinator
+ * owns background polling and finalization independently of client reads.
  */
-export function createQwenDeviceFlowInitHandler(dbOps: DatabaseOperations) {
+export function createQwenDeviceFlowInitHandler(
+	coordinator: DeviceSetupCoordinator,
+) {
 	return async (req: Request): Promise<Response> => {
 		try {
-			const body = await req.json();
-
-			const name = validateString(body.name, "name", {
-				required: true,
-				minLength: 1,
-				maxLength: 100,
-				pattern: patterns.accountName,
-				patternErrorMessage:
-					"can only contain letters, numbers, spaces, hyphens, underscores, and dots",
-			});
-
-			if (!name) {
-				return errorResponse(BadRequest("Valid account name is required"));
-			}
-
-			const priority = validatePriority(body.priority ?? 0, "priority");
-
-			let deviceFlow: Awaited<ReturnType<typeof initiateQwenDeviceFlow>>;
-			try {
-				deviceFlow = await initiateQwenDeviceFlow();
-			} catch (err) {
-				log.error("Qwen device flow initiation failed:", err);
-				return errorResponse(
-					InternalServerError(
-						`Failed to initiate Qwen device flow: ${(err as Error).message}`,
-					),
-				);
-			}
-
-			const sessionId = crypto.randomUUID();
-			qwenSessions.set(sessionId, { status: "pending", accountName: name });
-
-			// Poll in background — do not await
-			(async () => {
-				try {
-					const tokens = await pollQwenForToken(
-						deviceFlow.deviceCode,
-						deviceFlow.pkce,
-						deviceFlow.interval,
-						60,
-					);
-
-					const accountId = crypto.randomUUID();
-					const now = Date.now();
-					const resourceUrl = tokens.resource_url
-						? normalizeQwenBaseUrl(tokens.resource_url)
-						: null;
-
-					await dbOps.getAdapter().run(
-						`INSERT INTO accounts (
-							id, name, provider, api_key, refresh_token, access_token,
-							expires_at, created_at, request_count, total_requests, priority,
-							custom_endpoint, model_mappings, model_fallbacks
-						) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)`,
-						[
-							accountId,
-							name,
-							"qwen",
-							null,
-							tokens.refresh_token,
-							tokens.access_token,
-							now + tokens.expires_in * 1000,
-							now,
-							priority,
-							resourceUrl,
-							null,
-							null,
-						],
-					);
-
-					qwenSessions.set(sessionId, {
-						status: "complete",
-						accountName: name,
-						accountId,
-					});
-					log.info(`Qwen account '${name}' added via web device flow`);
-
-					// Clean up session after 10 minutes
-					setTimeout(() => qwenSessions.delete(sessionId), 10 * 60 * 1000);
-				} catch (err) {
-					log.error(`Qwen device flow polling failed for '${name}':`, err);
-					qwenSessions.set(sessionId, {
-						status: "error",
-						accountName: name,
-						error: (err as Error).message,
-					});
-					setTimeout(() => qwenSessions.delete(sessionId), 10 * 60 * 1000);
-				}
-			})();
-
-			return jsonResponse({
-				success: true,
-				sessionId,
-				authUrl:
-					deviceFlow.verificationUriComplete || deviceFlow.verificationUri,
-				userCode: deviceFlow.userCode,
-			});
-		} catch (error) {
-			log.error("Qwen device flow init error:", error);
-			return errorResponse(
-				error instanceof Error
-					? error
-					: new Error("Failed to initialize Qwen device flow"),
+			return jsonResponse(
+				await coordinator.initQwen(await readDeviceSetupBody(req)),
 			);
+		} catch (error) {
+			return deviceSetupErrorResponse(error);
 		}
 	};
 }
@@ -346,110 +308,19 @@ const codexSessions = new Map<string, CodexSession>();
 
 /**
  * Create a Codex device flow initialization handler.
- * Returns { verificationUrl, userCode, sessionId } immediately, then polls in background.
+ * Returns the durable job plus transient authorization fields. The coordinator
+ * owns background polling and finalization independently of client reads.
  */
-export function createCodexDeviceFlowInitHandler(dbOps: DatabaseOperations) {
+export function createCodexDeviceFlowInitHandler(
+	coordinator: DeviceSetupCoordinator,
+) {
 	return async (req: Request): Promise<Response> => {
 		try {
-			const body = await req.json();
-
-			const name = validateString(body.name, "name", {
-				required: true,
-				minLength: 1,
-				maxLength: 100,
-				pattern: patterns.accountName,
-				patternErrorMessage:
-					"can only contain letters, numbers, spaces, hyphens, underscores, and dots",
-			});
-
-			if (!name) {
-				return errorResponse(BadRequest("Valid account name is required"));
-			}
-
-			const priority = validatePriority(body.priority ?? 0, "priority");
-
-			let deviceFlow: Awaited<ReturnType<typeof initiateCodexDeviceFlow>>;
-			try {
-				deviceFlow = await initiateCodexDeviceFlow();
-			} catch (err) {
-				log.error("Codex device flow initiation failed:", err);
-				return errorResponse(
-					InternalServerError(
-						`Failed to initiate Codex device flow: ${(err as Error).message}`,
-					),
-				);
-			}
-
-			const sessionId = crypto.randomUUID();
-			codexSessions.set(sessionId, { status: "pending", accountName: name });
-
-			// Poll in background — do not await
-			(async () => {
-				try {
-					const tokens = await pollCodexForToken(
-						deviceFlow.deviceAuthId,
-						deviceFlow.userCode,
-						deviceFlow.interval,
-						180,
-					);
-
-					const accountId = crypto.randomUUID();
-					const now = Date.now();
-
-					await dbOps.getAdapter().run(
-						`INSERT INTO accounts (
-							id, name, provider, api_key, refresh_token, access_token,
-							expires_at, created_at, request_count, total_requests, priority,
-							custom_endpoint, model_mappings, model_fallbacks
-						) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)`,
-						[
-							accountId,
-							name,
-							"codex",
-							null,
-							tokens.refresh_token,
-							tokens.access_token,
-							now + tokens.expires_in * 1000,
-							now,
-							priority,
-							null,
-							null,
-							null,
-						],
-					);
-
-					codexSessions.set(sessionId, {
-						status: "complete",
-						accountName: name,
-						accountId,
-					});
-					log.info(`Codex account '${name}' added via web device flow`);
-
-					setTimeout(() => codexSessions.delete(sessionId), 10 * 60 * 1000);
-				} catch (err) {
-					log.error(`Codex device flow polling failed for '${name}':`, err);
-					codexSessions.set(sessionId, {
-						status: "error",
-						accountName: name,
-						error: (err as Error).message,
-					});
-					setTimeout(() => codexSessions.delete(sessionId), 10 * 60 * 1000);
-				}
-			})();
-
-			return jsonResponse({
-				success: true,
-				sessionId,
-				verificationUrl: deviceFlow.verificationUrl,
-				userCode: deviceFlow.userCode,
-			});
-		} catch (error) {
-			log.error("Codex device flow init error:", error);
-			return errorResponse(
-				error instanceof Error
-					? error
-					: new Error("Failed to initialize Codex device flow"),
+			return jsonResponse(
+				await coordinator.initCodex(await readDeviceSetupBody(req)),
 			);
+		} catch (error) {
+			return deviceSetupErrorResponse(error);
 		}
 	};
 }

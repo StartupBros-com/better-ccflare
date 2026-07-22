@@ -9,6 +9,7 @@ The better-ccflare CLI provides a command-line interface for managing OAuth acco
 - [Command Reference](#command-reference)
   - [Account Management](#account-management)
   - [Account Priorities](#account-priorities)
+  - [Managed Routing (Live Server)](#managed-routing-live-server)
   - [Statistics and History](#statistics-and-history)
   - [System Commands](#system-commands)
   - [Server and Monitoring](#server-and-monitoring)
@@ -235,6 +236,8 @@ bun run cli --set-priority <name> <priority>
 - Default priority is 0 if not specified
 - Priority affects both primary account selection and fallback order
 - Changes take effect immediately without restarting the server
+- In a Managed family route, global account priority becomes that virtual member's tier only after a matching enabled provider/route-class rule admits the account
+- Global priority alone never grants combo membership and never rewrites the persisted tier of a Manual combo slot
 
 **Example:**
 ```bash
@@ -247,6 +250,108 @@ bun run cli --set-priority development-account 50
 # Set account to low priority (high number)
 bun run cli --set-priority backup-account 90
 ```
+
+### Managed Routing (Live Server)
+
+The managed-routing CLI controls the same authoritative live-server policy used by the dashboard and proxy.
+
+#### Exact command surface
+
+```bash
+better-ccflare routing list [--api-url <loopback-url>] [--json]
+better-ccflare routing detail <account-id> [--api-url <loopback-url>] [--json]
+better-ccflare routing preview <family> [--managed-model <model>] [--api-url <loopback-url>] [--json]
+better-ccflare routing apply <family> --preview-id <id> --proposal-id <id> --managed-model <model> --yes [--api-url <loopback-url>] [--json]
+better-ccflare routing manual <family> --yes [--api-url <loopback-url>] [--json]
+```
+
+`<family>` must be `fable`, `opus`, `sonnet`, or `haiku`. Unattended or JSON apply requires the complete displayed tuple plus `--yes`; unattended or JSON Manual rollback requires `--yes`. In an interactive TTY, `routing apply` may omit the tuple and `--yes`, and `routing manual` may omit `--yes`; the CLI then performs the review and confirmation flow described below.
+
+The CLI calls the running management API instead of opening the local database or reimplementing capability and precedence rules. The API origin resolves in this order:
+
+1. `--api-url <loopback-url>`;
+2. `BETTER_CCFLARE_API_URL`;
+3. `http://127.0.0.1:8788`.
+
+Only an HTTP or HTTPS loopback origin is accepted. A URL with a non-loopback host, credentials, path, query, or fragment is rejected. `--api-url` is valid only with a `routing` command or the packaged `--add-account` post-create workflow.
+
+If API authentication is configured, set `BETTER_CCFLARE_ADMIN_API_KEY` in the process environment. There is deliberately no admin-key CLI flag. Use a better-ccflare admin key, not a provider credential or API-only key. The client sends it as `x-api-key`, redacts it from text/JSON/errors, and rejects redirects instead of forwarding a credentialed request.
+
+#### Read and preview commands
+
+| Command | Behavior |
+| --- | --- |
+| `routing list` | Merges live accounts with authoritative memberships, decisions, availability, and routing opportunities; accounts with no membership remain visible |
+| `routing detail <account-id>` | Shows the same routing projection for one immutable account ID, never a display-name lookup |
+| `routing preview <family>` | Returns the full server-owned family preview, proposals, confidence, route class, and exact member deltas without writing policy |
+
+`routing preview` may use `--managed-model` to review a family-compatible model override. `routing apply` accepts that flag only as part of the complete unattended tuple, or by itself in an interactive run to constrain the preview that follows. `--json` selects the redacted JSON rendering; it does not change the server contract. List, detail, and preview never mutate routing.
+
+#### Interactive and unattended mutations
+
+Interactive `routing apply <family>` may omit the reviewed tuple. The CLI then:
+
+1. fetches and prints the complete live family preview;
+2. requires explicit selection of one proposal, even if the server marks one as the default;
+3. asks for confirmation;
+4. submits the exact `preview_id`, `proposal_id`, and `managed_model` that were reviewed.
+
+If an interactive apply supplies the complete tuple, the CLI still asks for confirmation unless `--yes` is present. Interactive `routing manual <family>` likewise asks before returning the family to Manual mode unless `--yes` is present.
+
+When stdin/stdout is not a TTY, or whenever `--json` is used, mutation commands do not prompt or auto-select:
+
+- `routing apply` requires the complete `--preview-id`, `--proposal-id`, `--managed-model`, and `--yes` set.
+- `routing manual` requires `--yes`.
+- A partial tuple, missing confirmation, unknown option, or misplaced `routing` token is a usage error.
+
+A rejected stale preview or zero-candidate Managed route is not retried, force-applied, or automatically rolled back. Request a fresh preview and review it again. Managed mode continues to fail closed for unsupported or unknown capability. Use the dashboard or management API for Managed exclusion and restore; those are not shipped routing subcommands.
+
+#### Post-create routing review
+
+The packaged `--add-account` flow persists the account first and returns its immutable created ID. Routing review always uses that persisted ID; it never guesses by display name or invents draft routing metadata.
+
+`--add-account --json` is rejected before account creation because provider setup can emit interactive human output. This restriction applies only to account creation; every shipped `routing` command continues to support its documented `--json` form.
+
+In a non-TTY text process, account creation can proceed. After persistence, the CLI reads and prints the authoritative effective-routing detail for the exact immutable created ID, followed by `routing detail <account-id>` and `routing preview <family>` guidance. This path never requests a routing preview and never sends a routing mutation. If the authoritative read cannot complete, the CLI preserves the printed created identity, reports that the post-create effective-routing result is incomplete, prints the same follow-up guidance, and exits nonzero.
+
+In an interactive TTY, the CLI first:
+
+1. asks the live server for account-scoped previews across the supported families;
+2. prints the complete previews and exact deltas;
+3. requires an explicit proposal-or-skip choice for every family that has proposals.
+
+Selecting nothing sends no routing write. For each selected family, in review order, the CLI then completes a separate fresh-preview/review/confirmation/write cycle:
+
+1. request a new account-and-family-scoped preview, because every prior policy write advances the global routing revision;
+2. print the refreshed preview and exact delta;
+3. verify that the selected proposal is still present and materially identical to what the operator selected initially;
+4. ask for confirmation of that refreshed family proposal;
+5. apply it using the refreshed `preview_id`, proposal, model, and immutable account ID before moving to the next family.
+
+A missing or materially changed proposal, preview/review/confirmation failure, declined confirmation, unavailable live API, or apply failure stops the sequence without retry or automatic rollback. Before any family succeeds, the result is reported as declined or failed closed, as appropriate. After one or more families succeed, the CLI reports `partial`, including the successful family results and the exact family/reason where it stopped. The persisted account and any already-applied reviewed family changes remain visible; follow-up detail/preview guidance is printed when the outer review fails.
+
+For complete Manual/Managed precedence, priority, exclusion, availability, and controlled-rollout behavior, see [Combos and Managed Family Routing](combos.md).
+
+#### Rollback contract
+
+Rollback must send a partial family-policy update equivalent to:
+
+```json
+{
+  "membership_mode": "manual"
+}
+```
+
+Do not send a replacement assignment or clear the combo, rules, Managed model, Manual slots, or exclusions. This makes rollback immediate and preserves the reviewed policy for diagnosis.
+
+#### Safe automation
+
+- Keep the server target on loopback; the managed-routing client rejects non-loopback hosts and credential-bearing URLs.
+- Supply the admin key through `BETTER_CCFLARE_ADMIN_API_KEY`, never a command-line argument that can leak through process listings or shell history.
+- Treat JSON as a redacted reporting format; it must not include credentials, model mappings containing secrets, or raw authentication material.
+- Use `--json` with `routing` commands only; `--add-account --json` is rejected before creating an account.
+- Automate list, detail, and preview freely, but require explicit reviewed identifiers and confirmation for apply.
+- Never validate Managed routing by sending scripted inference to Anthropic or Codex. Use natural traffic and aggregate diagnostics for a live canary.
 
 ### Statistics and History
 
@@ -564,6 +669,8 @@ The SQLite database follows the same directory structure:
 | `better-ccflare_DB_PATH` | Override database location | Platform default |
 | `PORT` | Server port | 8080 |
 | `CLIENT_ID` | OAuth client ID | 9d1c250a-e61b-44d9-88ed-5944d1962f5e |
+| `BETTER_CCFLARE_API_URL` | Loopback origin for live managed-routing CLI operations | `http://127.0.0.1:8788` |
+| `BETTER_CCFLARE_ADMIN_API_KEY` | Admin API key for live-server managed-routing CLI operations when authentication is enabled | Unset |
 
 ### Load Balancing
 

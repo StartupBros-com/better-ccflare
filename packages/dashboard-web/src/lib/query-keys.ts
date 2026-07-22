@@ -30,6 +30,17 @@ export const queryKeys = {
 		[...queryKeys.all, "config", "defaultAgentModel"] as const,
 	combos: () => [...queryKeys.all, "combos"] as const,
 	families: () => [...queryKeys.all, "families"] as const,
+	routingEffective: (family?: string) =>
+		family
+			? ([...queryKeys.all, "routing", "effective", family] as const)
+			: ([...queryKeys.all, "routing", "effective"] as const),
+	accountRoutingOverview: () =>
+		[...queryKeys.all, "routing", "accounts"] as const,
+	deviceSetupJobs: () => [...queryKeys.all, "device-setup", "jobs"] as const,
+	deviceSetupJobsRecent: () =>
+		[...queryKeys.deviceSetupJobs(), "recent"] as const,
+	deviceSetupJob: (jobId: string) =>
+		[...queryKeys.deviceSetupJobs(), jobId] as const,
 	apiKeys: () => [...queryKeys.all, "api-keys"] as const,
 	storage: () => [...queryKeys.all, "storage"] as const,
 	usageHistory: (account?: string, range?: string) =>

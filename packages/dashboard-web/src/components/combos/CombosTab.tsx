@@ -1,16 +1,63 @@
+import type { ComboFamilyAssignment } from "@better-ccflare/types";
 import { Plus } from "lucide-react";
 import { useState } from "react";
 import {
 	useCombos,
 	useDeleteCombo,
+	useEffectiveRouting,
 	useFamilies,
 	useUpdateCombo,
 } from "../../hooks/queries";
 import { Button } from "../ui/button";
 import { Separator } from "../ui/separator";
-import { ComboCard } from "./ComboCard";
+import { ComboCard, type ComboFamilyRoutingCardState } from "./ComboCard";
 import { ComboDialog } from "./ComboDialog";
 import { FamilyActivationSection } from "./FamilyActivationSection";
+import {
+	type FamilyRoutingProjection,
+	projectFamilyRoutings,
+} from "./family-routing";
+
+/**
+ * Join assignment configuration to the coherent effective-routing snapshots.
+ * A snapshot owns effective counts; an assignment without one remains visible
+ * but deliberately has no client-inferred membership count.
+ */
+export function buildComboFamilyRoutingStates(
+	comboId: string,
+	assignments: readonly ComboFamilyAssignment[],
+	projections: readonly FamilyRoutingProjection[],
+): ComboFamilyRoutingCardState[] {
+	const projectionByFamily = new Map(
+		projections.map((projection) => [projection.family, projection]),
+	);
+	const statesByFamily = new Map<
+		ComboFamilyAssignment["family"],
+		ComboFamilyRoutingCardState
+	>();
+
+	for (const assignment of assignments) {
+		if (assignment.combo_id !== comboId) continue;
+		const projection = projectionByFamily.get(assignment.family) ?? null;
+		if (projection && projection.assignment.combo_id !== comboId) continue;
+		statesByFamily.set(assignment.family, {
+			assignment: projection?.assignment ?? assignment,
+			routing: projection,
+		});
+	}
+
+	// A coherent routing snapshot may be newer than the separately cached family
+	// list. Preserve every family the server currently assigns to this combo.
+	for (const projection of projections) {
+		if (projection.assignment.combo_id !== comboId) continue;
+		statesByFamily.set(projection.family, {
+			assignment: projection.assignment,
+			routing: projection,
+		});
+	}
+
+	return [...statesByFamily.values()];
+}
 
 export function CombosTab() {
 	const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false);
@@ -19,18 +66,18 @@ export function CombosTab() {
 	);
 	const combosQuery = useCombos();
 	const familiesQuery = useFamilies();
+	const effectiveRoutingQuery = useEffectiveRouting();
 	const deleteCombo = useDeleteCombo();
 	const updateCombo = useUpdateCombo();
 	const combos = combosQuery.data?.combos ?? [];
 	const families = familiesQuery.data?.families ?? [];
-
-	const getAssignedFamily = (comboId: string) => {
-		const assignment = families.find((f) => f.combo_id === comboId);
-		if (!assignment) return null;
-		return (
-			assignment.family.charAt(0).toUpperCase() + assignment.family.slice(1)
-		);
-	};
+	const effectiveData = effectiveRoutingQuery.data;
+	const effectiveViews = effectiveData
+		? Array.isArray(effectiveData)
+			? effectiveData
+			: [effectiveData]
+		: [];
+	const routingProjections = projectFamilyRoutings(effectiveViews);
 
 	return (
 		<div className="space-y-6">
@@ -76,7 +123,11 @@ export function CombosTab() {
 								key={combo.id}
 								combo={combo}
 								slotCount={combo.slot_count}
-								assignedFamily={getAssignedFamily(combo.id)}
+								familyRoutings={buildComboFamilyRoutingStates(
+									combo.id,
+									families,
+									routingProjections,
+								)}
 								onEdit={() => setEditDialogComboId(combo.id)}
 								onDelete={() => deleteCombo.mutate(combo.id)}
 								onToggleEnabled={(enabled) =>
