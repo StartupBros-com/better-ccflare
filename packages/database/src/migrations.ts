@@ -93,12 +93,30 @@ const ROUTING_REVISION_POLICY_TABLES = [
 	"combo_membership_exclusions",
 ] as const;
 
+// Keep this provider boundary in semantic parity with API_KEY_PROVIDERS in
+// packages/providers/src/request-capabilities.ts. The revision trigger stores
+// only whether the legacy mirrored credential shape changed, never a secret.
+const ROUTING_REVISION_API_KEY_PROVIDERS = [
+	"claude-console-api",
+	"zai",
+	"minimax",
+	"anthropic-compatible",
+	"openai-compatible",
+	"nanogpt",
+	"kilo",
+	"openrouter",
+	"alibaba-coding-plan",
+	"ollama-cloud",
+] as const;
+
 /**
  * Install a database-owned revision clock for every persisted input that enters
  * the managed-routing preview hash. Account availability/usage fields are
  * intentionally excluded: preview identity uses route membership, not the
- * transient availability decoration. Credential values are similarly reduced
- * to presence so ordinary OAuth token rotation does not invalidate a review.
+ * transient availability decoration. Credential values are reduced to
+ * presence plus the provider-scoped legacy-mirrored-shape boolean, so ordinary
+ * OAuth/API-key rotation does not invalidate a review while route-class changes
+ * still do.
  */
 function ensureRoutingPolicyRevisionSchema(db: Database): void {
 	db.run(`
@@ -167,6 +185,25 @@ function ensureRoutingPolicyRevisionSchema(db: Database): void {
 				!= (length(trim(COALESCE(NEW.${column}, ''))) > 0)`
 			: `OLD.${column} IS NOT NEW.${column}`,
 	);
+	if (
+		["provider", "api_key", "refresh_token", "access_token"].every((column) =>
+			accountColumns.has(column),
+		)
+	) {
+		const providerList = ROUTING_REVISION_API_KEY_PROVIDERS.map(
+			(provider) => `'${provider}'`,
+		).join(", ");
+		const legacyMirroredCredentialShape = (row: "OLD" | "NEW") => `(
+			COALESCE(${row}.provider IN (${providerList}), 0)
+			AND length(trim(COALESCE(${row}.api_key, ''))) > 0
+			AND ${row}.refresh_token IS ${row}.api_key
+			AND ${row}.access_token IS ${row}.api_key
+		)`;
+		comparisons.push(
+			`${legacyMirroredCredentialShape("OLD")}
+			!= ${legacyMirroredCredentialShape("NEW")}`,
+		);
+	}
 	db.run("DROP TRIGGER IF EXISTS trg_routing_revision_accounts_update");
 	if (accountRevisionColumns.length > 0) {
 		db.run(`

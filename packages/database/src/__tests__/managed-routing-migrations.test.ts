@@ -179,6 +179,91 @@ describe("managed routing migrations", () => {
 		db.close();
 	});
 
+	it("tracks SQLite legacy-mirrored credential shape without secret-rotation churn", () => {
+		const db = new Database(":memory:");
+		db.run("PRAGMA foreign_keys = ON");
+		runMigrations(db);
+		db.run(
+			"INSERT INTO accounts (id, name, provider, api_key, refresh_token, access_token, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+			[
+				"legacy-shape",
+				"legacy shape",
+				"openai-compatible",
+				"shape-a",
+				"shape-a",
+				"shape-a",
+				1,
+			],
+		);
+
+		const expectRevisionDelta = (expected: number, mutate: () => void) => {
+			const before = routingRevision(db);
+			mutate();
+			expect(routingRevision(db) - before).toBe(expected);
+		};
+
+		// Exact mirror -> contradictory same-presence shape changes route class.
+		expectRevisionDelta(1, () =>
+			db.run("UPDATE accounts SET access_token = ? WHERE id = ?", [
+				"shape-b",
+				"legacy-shape",
+			]),
+		);
+		// Contradictory -> contradictory rotation remains the same durable shape.
+		expectRevisionDelta(0, () =>
+			db.run("UPDATE accounts SET access_token = ? WHERE id = ?", [
+				"shape-c",
+				"legacy-shape",
+			]),
+		);
+		// Contradictory -> exact mirror restores the API-key route class.
+		expectRevisionDelta(1, () =>
+			db.run(
+				"UPDATE accounts SET refresh_token = api_key, access_token = api_key WHERE id = ?",
+				["legacy-shape"],
+			),
+		);
+		// Exact mirror -> a different exact mirror is ordinary secret rotation.
+		expectRevisionDelta(0, () =>
+			db.run(
+				"UPDATE accounts SET api_key = ?, refresh_token = ?, access_token = ? WHERE id = ?",
+				["shape-d", "shape-d", "shape-d", "legacy-shape"],
+			),
+		);
+		// Presence transitions retain the existing revision behavior.
+		expectRevisionDelta(1, () =>
+			db.run("UPDATE accounts SET access_token = NULL WHERE id = ?", [
+				"legacy-shape",
+			]),
+		);
+		expectRevisionDelta(1, () =>
+			db.run("UPDATE accounts SET access_token = api_key WHERE id = ?", [
+				"legacy-shape",
+			]),
+		);
+
+		// Exact mirror equality is not a route-class input for OAuth providers.
+		db.run(
+			"INSERT INTO accounts (id, name, provider, api_key, refresh_token, access_token, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+			[
+				"oauth-shape",
+				"oauth shape",
+				"anthropic",
+				"shape-o",
+				"shape-o",
+				"shape-o",
+				1,
+			],
+		);
+		expectRevisionDelta(0, () =>
+			db.run("UPDATE accounts SET access_token = ? WHERE id = ?", [
+				"shape-p",
+				"oauth-shape",
+			]),
+		);
+		db.close();
+	});
+
 	it("upgrades explicit-only SQLite data to manual policy without changing combos or slots", () => {
 		const db = new Database(":memory:");
 		db.run("PRAGMA foreign_keys = ON");
@@ -371,6 +456,26 @@ describe("managed routing migrations", () => {
 		expect(freshSql).toContain(
 			"CREATE TRIGGER trg_routing_revision_accounts_update",
 		);
+		const accountTriggerSql = freshStatements
+			.find((statement) =>
+				statement.includes(
+					"CREATE TRIGGER trg_routing_revision_accounts_update",
+				),
+			)
+			?.replace(/\s+/g, " ");
+		expect(accountTriggerSql).toContain(
+			"OLD.refresh_token = OLD.api_key AND OLD.access_token = OLD.api_key",
+		);
+		expect(accountTriggerSql).toContain(
+			"NEW.refresh_token = NEW.api_key AND NEW.access_token = NEW.api_key",
+		);
+		expect(accountTriggerSql).toContain(
+			"COALESCE(OLD.provider IN ('claude-console-api', 'zai', 'minimax', 'anthropic-compatible', 'openai-compatible', 'nanogpt', 'kilo', 'openrouter', 'alibaba-coding-plan', 'ollama-cloud'), FALSE)",
+		);
+		expect(accountTriggerSql).toContain(
+			"COALESCE(NEW.provider IN ('claude-console-api', 'zai', 'minimax', 'anthropic-compatible', 'openai-compatible', 'nanogpt', 'kilo', 'openrouter', 'alibaba-coding-plan', 'ollama-cloud'), FALSE)",
+		);
+		expect(accountTriggerSql).toContain("IS DISTINCT FROM");
 
 		const upgradeStatements: string[] = [];
 		const upgradeAdapter = {

@@ -196,6 +196,70 @@ async function expectPolicyConstraints(adapter: BunSqlAdapter): Promise<void> {
 }
 
 describePostgres("managed routing PostgreSQL integration", () => {
+	it("tracks legacy-mirrored credential shape without secret-rotation churn", async () => {
+		await withDisposableDatabase(async (adapter) => {
+			await ensureSchemaPg(adapter);
+			await runMigrationsPg(adapter);
+			await adapter.run(
+				"INSERT INTO accounts (id, name, provider, api_key, refresh_token, access_token, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+				[
+					"legacy-shape",
+					"legacy shape",
+					"openai-compatible",
+					"shape-a",
+					"shape-a",
+					"shape-a",
+					1,
+				],
+			);
+			const repo = new ComboRepository(adapter);
+			const expectRevisionDelta = async (
+				expected: bigint,
+				mutate: () => Promise<unknown>,
+			) => {
+				const before = await repo.getRoutingPolicyRevision();
+				await mutate();
+				const after = await repo.getRoutingPolicyRevision();
+				expect(BigInt(after) - BigInt(before)).toBe(expected);
+			};
+
+			await expectRevisionDelta(1n, () =>
+				adapter.run("UPDATE accounts SET access_token = ? WHERE id = ?", [
+					"shape-b",
+					"legacy-shape",
+				]),
+			);
+			await expectRevisionDelta(0n, () =>
+				adapter.run("UPDATE accounts SET access_token = ? WHERE id = ?", [
+					"shape-c",
+					"legacy-shape",
+				]),
+			);
+			await expectRevisionDelta(1n, () =>
+				adapter.run(
+					"UPDATE accounts SET refresh_token = api_key, access_token = api_key WHERE id = ?",
+					["legacy-shape"],
+				),
+			);
+			await expectRevisionDelta(0n, () =>
+				adapter.run(
+					"UPDATE accounts SET api_key = ?, refresh_token = ?, access_token = ? WHERE id = ?",
+					["shape-d", "shape-d", "shape-d", "legacy-shape"],
+				),
+			);
+			await expectRevisionDelta(1n, () =>
+				adapter.run("UPDATE accounts SET access_token = NULL WHERE id = ?", [
+					"legacy-shape",
+				]),
+			);
+			await expectRevisionDelta(1n, () =>
+				adapter.run("UPDATE accounts SET access_token = api_key WHERE id = ?", [
+					"legacy-shape",
+				]),
+			);
+		});
+	});
+
 	it("executes the fresh schema, repository round trip, checked rollback, and cascades", async () => {
 		await withDisposableDatabase(async (adapter) => {
 			await ensureSchemaPg(adapter);

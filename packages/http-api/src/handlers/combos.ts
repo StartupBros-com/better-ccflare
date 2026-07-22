@@ -15,6 +15,8 @@ import type {
 	AccountRoutingOverview,
 	ComboFamily,
 	ComboFamilyAssignment,
+	ComboFamilyPolicyChanges,
+	ComboFamilyPolicyUpdateInput,
 	ComboRoutingAccountDraft,
 	ComboRoutingPolicySnapshot,
 	ComboRoutingPreviewScope,
@@ -395,6 +397,34 @@ export function createFamiliesListHandler(dbOps: DatabaseOperations) {
 	};
 }
 
+function isStaleRoutingRevisionError(error: unknown): boolean {
+	return (
+		error !== null &&
+		typeof error === "object" &&
+		"code" in error &&
+		(error as { code?: unknown }).code === "stale_routing_preview"
+	);
+}
+
+async function applyFamilyPolicyChange(
+	dbOps: DatabaseOperations,
+	changes: ComboFamilyPolicyChanges,
+): Promise<void> {
+	try {
+		await dbOps.applyFamilyPolicyChanges(changes);
+	} catch (error) {
+		if (isStaleRoutingRevisionError(error)) {
+			throw Conflict(
+				"Routing policy changed; review the current family policy",
+				{
+					code: "stale_routing_preview",
+				},
+			);
+		}
+		throw error;
+	}
+}
+
 /**
  * PUT /api/families/:family — Assign or unassign a combo to a family
  */
@@ -474,8 +504,9 @@ export function createFamilyAssignHandler(
 				membershipMode !== undefined ||
 				managedModel !== undefined;
 			if (usePartialPolicyUpdate) {
-				const current = await dbOps.getComboRoutingPolicy(typedFamily);
-				const fields = {
+				const inputs = await readCoherentRoutingInputs(dbOps, [typedFamily]);
+				const current = coherentSnapshot(inputs, typedFamily);
+				const fields: ComboFamilyPolicyUpdateInput = {
 					...(combo_id !== undefined ? { combo_id: safeComboId } : {}),
 					...(bodyEnabled !== undefined ? { enabled } : {}),
 					...(membershipMode !== undefined
@@ -525,10 +556,9 @@ export function createFamilyAssignHandler(
 					proposedSnapshot.assignment.combo_id !== null &&
 					proposedSnapshot.assignment.membership_mode === "managed"
 				) {
-					const accounts = await dbOps.getAllAccounts();
 					const resolution = resolveEffectiveComboMembership(
 						proposedSnapshot,
-						accounts,
+						inputs.accounts,
 						dependencies,
 					);
 					if (resolution.members.length === 0) {
@@ -540,11 +570,16 @@ export function createFamilyAssignHandler(
 						);
 					}
 				}
-				await dbOps.setFamilyPolicy(typedFamily, fields);
+				await applyFamilyPolicyChange(dbOps, {
+					family: typedFamily,
+					expected_revision: inputs.revision,
+					assignment: fields,
+				});
 			} else {
 				// Preserve the legacy write shape, while preventing an already-managed
 				// assignment from bypassing the authoritative zero-candidate guard.
-				const current = await dbOps.getComboRoutingPolicy(typedFamily);
+				const inputs = await readCoherentRoutingInputs(dbOps, [typedFamily]);
+				const current = coherentSnapshot(inputs, typedFamily);
 				if (
 					current.assignment.membership_mode === "managed" &&
 					enabled &&
@@ -574,10 +609,9 @@ export function createFamilyAssignHandler(
 							exclusions,
 						};
 					}
-					const accounts = await dbOps.getAllAccounts();
 					const resolution = resolveEffectiveComboMembership(
 						proposedSnapshot,
-						accounts,
+						inputs.accounts,
 						dependencies,
 					);
 					if (resolution.members.length === 0) {
@@ -589,7 +623,11 @@ export function createFamilyAssignHandler(
 						);
 					}
 				}
-				await dbOps.setFamilyCombo(typedFamily, safeComboId, enabled);
+				await applyFamilyPolicyChange(dbOps, {
+					family: typedFamily,
+					expected_revision: inputs.revision,
+					assignment: { combo_id: safeComboId, enabled },
+				});
 			}
 			const assignment = (await dbOps.getComboRoutingPolicy(typedFamily))
 				.assignment;
@@ -961,10 +999,11 @@ export function createMembershipExclusionCreateHandler(
 			if (typeof body.account_id !== "string" || !body.account_id) {
 				throw BadRequest("account_id is required");
 			}
-			const [snapshot, account] = await Promise.all([
-				dbOps.getComboRoutingPolicy(family),
-				dbOps.getAccount(body.account_id),
-			]);
+			const inputs = await readCoherentRoutingInputs(dbOps, [family]);
+			const snapshot = coherentSnapshot(inputs, family);
+			const account = inputs.accounts.find(
+				(current) => current.id === body.account_id,
+			);
 			if (!snapshot.assignment.enabled || !snapshot.combo?.enabled) {
 				throw UnprocessableEntity(
 					"Cannot exclude from a disabled family route",
@@ -985,10 +1024,15 @@ export function createMembershipExclusionCreateHandler(
 			) {
 				throw Conflict("Account is already excluded from this family");
 			}
-			await dbOps.createComboMembershipExclusion({
+			await applyFamilyPolicyChange(dbOps, {
 				family,
-				combo_id: snapshot.assignment.combo_id,
-				account_id: account.id,
+				expected_revision: inputs.revision,
+				create_exclusions: [
+					{
+						combo_id: snapshot.assignment.combo_id,
+						account_id: account.id,
+					},
+				],
 			});
 			return new Response(
 				JSON.stringify({
@@ -1011,23 +1055,23 @@ export function createMembershipExclusionRestoreHandler(
 	return async (familyValue: string, accountId: string): Promise<Response> => {
 		try {
 			const family = parseFamily(familyValue);
-			const snapshot = await dbOps.getComboRoutingPolicy(family);
+			const inputs = await readCoherentRoutingInputs(dbOps, [family]);
+			const snapshot = coherentSnapshot(inputs, family);
 			if (!snapshot.assignment.combo_id)
 				throw NotFound("Assigned combo not found");
-			if (
-				!snapshot.exclusions.some(
-					(exclusion) =>
-						exclusion.combo_id === snapshot.assignment.combo_id &&
-						exclusion.account_id === accountId,
-				)
-			) {
+			const exclusion = snapshot.exclusions.find(
+				(current) =>
+					current.combo_id === snapshot.assignment.combo_id &&
+					current.account_id === accountId,
+			);
+			if (!exclusion) {
 				throw NotFound("Membership exclusion not found");
 			}
-			await dbOps.restoreComboMembership(
+			await applyFamilyPolicyChange(dbOps, {
 				family,
-				snapshot.assignment.combo_id,
-				accountId,
-			);
+				expected_revision: inputs.revision,
+				delete_exclusion_ids: [exclusion.id],
+			});
 			return Response.json({
 				success: true,
 				data: await readEffectiveRouting(dbOps, family, dependencies),

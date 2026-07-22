@@ -197,11 +197,30 @@ const ROUTING_REVISION_POLICY_TABLES = [
 	"combo_membership_exclusions",
 ] as const;
 
+// Keep this provider boundary in semantic parity with API_KEY_PROVIDERS in
+// packages/providers/src/request-capabilities.ts. The trigger compares only
+// the non-secret legacy-mirrored-shape boolean.
+const ROUTING_REVISION_API_KEY_PROVIDERS = [
+	"claude-console-api",
+	"zai",
+	"minimax",
+	"anthropic-compatible",
+	"openai-compatible",
+	"nanogpt",
+	"kilo",
+	"openrouter",
+	"alibaba-coding-plan",
+	"ollama-cloud",
+] as const;
+
 /** PostgreSQL mirror of SQLite's managed-routing revision clock. */
 async function ensureRoutingPolicyRevisionSchemaPg(
 	adapter: BunSqlAdapter,
 	options: { installAccountUpdateTrigger?: boolean } = {},
 ): Promise<void> {
+	const apiKeyProviderList = ROUTING_REVISION_API_KEY_PROVIDERS.map(
+		(provider) => `'${provider}'`,
+	).join(", ");
 	await adapter.unsafe(`
 		CREATE TABLE IF NOT EXISTS routing_policy_revision (
 			scope TEXT PRIMARY KEY CHECK (scope = 'global'),
@@ -267,7 +286,20 @@ async function ensureRoutingPolicyRevisionSchemaPg(
 				OR (NULLIF(BTRIM(OLD.refresh_token), '') IS NOT NULL)
 					IS DISTINCT FROM (NULLIF(BTRIM(NEW.refresh_token), '') IS NOT NULL)
 				OR (NULLIF(BTRIM(OLD.access_token), '') IS NOT NULL)
-					IS DISTINCT FROM (NULLIF(BTRIM(NEW.access_token), '') IS NOT NULL))
+					IS DISTINCT FROM (NULLIF(BTRIM(NEW.access_token), '') IS NOT NULL)
+				OR (COALESCE(OLD.provider IN (${apiKeyProviderList}), FALSE)
+					AND NULLIF(BTRIM(OLD.api_key), '') IS NOT NULL
+					AND OLD.refresh_token IS NOT NULL
+					AND OLD.access_token IS NOT NULL
+					AND OLD.refresh_token = OLD.api_key
+					AND OLD.access_token = OLD.api_key)
+					IS DISTINCT FROM
+					(COALESCE(NEW.provider IN (${apiKeyProviderList}), FALSE)
+					AND NULLIF(BTRIM(NEW.api_key), '') IS NOT NULL
+					AND NEW.refresh_token IS NOT NULL
+					AND NEW.access_token IS NOT NULL
+					AND NEW.refresh_token = NEW.api_key
+					AND NEW.access_token = NEW.api_key))
 			EXECUTE FUNCTION bump_routing_policy_revision()
 		`);
 	}

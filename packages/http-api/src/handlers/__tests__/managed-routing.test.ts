@@ -178,6 +178,11 @@ function statefulDb() {
 					created_at: 3,
 				});
 			}
+			for (const exclusionId of changes.delete_exclusion_ids ?? []) {
+				policy.exclusions = policy.exclusions.filter(
+					(exclusion) => exclusion.id !== exclusionId,
+				);
+			}
 			routingRevision++;
 			return {
 				family: changes.family,
@@ -1395,6 +1400,43 @@ describe("managed routing HTTP control plane", () => {
 		expect(response.status).toBe(422);
 	});
 
+	it("rejects a concurrent last-candidate removal for partial and legacy managed writes", async () => {
+		for (const body of [
+			{
+				membership_mode: "managed",
+				managed_model: "claude-opus-4-8",
+			},
+			{ combo_id: "combo-1", enabled: true },
+		] as const) {
+			const state = statefulDb();
+			if (!("membership_mode" in body)) {
+				state.mutatePolicy((policy) => {
+					policy.assignment.membership_mode = "managed";
+					policy.assignment.managed_model = "claude-opus-4-8";
+				});
+			}
+			state.interleaveBeforeNextApply(() => {
+				state.mutatePolicy((policy) => {
+					policy.slots = [];
+					policy.rules = [];
+				});
+			});
+
+			const response = await createFamilyAssignHandler(
+				state.dbOps,
+				dependencies,
+			)(request("/api/families/opus", body, "PUT"), "opus");
+
+			expect(response.status).toBe(409);
+			expect(await response.json()).toMatchObject({
+				details: { code: "stale_routing_preview" },
+			});
+			expect(state.applyFamilyPolicyChanges).toHaveBeenCalledTimes(1);
+			expect(state.dbOps.setFamilyPolicy).not.toHaveBeenCalled();
+			expect(state.dbOps.setFamilyCombo).not.toHaveBeenCalled();
+		}
+	});
+
 	it("keeps family conversion atomic when its recomputed proposal is empty", async () => {
 		const state = statefulDb();
 		state.mutatePolicy((policy) => {
@@ -1469,8 +1511,10 @@ describe("managed routing HTTP control plane", () => {
 		);
 
 		expect(disabled.status).toBe(200);
-		expect(state.dbOps.setFamilyPolicy).toHaveBeenCalledWith("opus", {
-			enabled: false,
+		expect(state.applyFamilyPolicyChanges).toHaveBeenNthCalledWith(1, {
+			family: "opus",
+			expected_revision: 0,
+			assignment: { enabled: false },
 		});
 		expect(state.dbOps.setFamilyCombo).not.toHaveBeenCalled();
 		expect((await disabled.json()).data).toMatchObject({
@@ -1487,8 +1531,10 @@ describe("managed routing HTTP control plane", () => {
 			"opus",
 		);
 		expect(modeled.status).toBe(200);
-		expect(state.dbOps.setFamilyPolicy).toHaveBeenLastCalledWith("opus", {
-			managed_model: "claude-opus-4-7",
+		expect(state.applyFamilyPolicyChanges).toHaveBeenNthCalledWith(2, {
+			family: "opus",
+			expected_revision: 1,
+			assignment: { managed_model: "claude-opus-4-7" },
 		});
 		expect((await modeled.json()).data).toMatchObject({
 			combo_id: "combo-1",
@@ -1510,11 +1556,12 @@ describe("managed routing HTTP control plane", () => {
 			"opus",
 		);
 		expect(assignResponse.status).toBe(200);
-		expect(assigned.dbOps.setFamilyCombo).toHaveBeenCalledWith(
-			"opus",
-			"combo-1",
-			true,
-		);
+		expect(assigned.applyFamilyPolicyChanges).toHaveBeenCalledWith({
+			family: "opus",
+			expected_revision: 0,
+			assignment: { combo_id: "combo-1", enabled: true },
+		});
+		expect(assigned.dbOps.setFamilyCombo).not.toHaveBeenCalled();
 		expect(assigned.dbOps.setFamilyPolicy).not.toHaveBeenCalled();
 
 		const unassigned = statefulDb();
@@ -1526,11 +1573,12 @@ describe("managed routing HTTP control plane", () => {
 			"opus",
 		);
 		expect(unassignResponse.status).toBe(200);
-		expect(unassigned.dbOps.setFamilyCombo).toHaveBeenCalledWith(
-			"opus",
-			null,
-			false,
-		);
+		expect(unassigned.applyFamilyPolicyChanges).toHaveBeenCalledWith({
+			family: "opus",
+			expected_revision: 0,
+			assignment: { combo_id: null, enabled: false },
+		});
+		expect(unassigned.dbOps.setFamilyCombo).not.toHaveBeenCalled();
 		expect(unassigned.dbOps.setFamilyPolicy).not.toHaveBeenCalled();
 	});
 
@@ -1547,9 +1595,12 @@ describe("managed routing HTTP control plane", () => {
 		);
 
 		expect(response.status).toBe(200);
-		expect(state.dbOps.setFamilyPolicy).toHaveBeenCalledWith("opus", {
-			membership_mode: "manual",
+		expect(state.applyFamilyPolicyChanges).toHaveBeenCalledWith({
+			family: "opus",
+			expected_revision: 1,
+			assignment: { membership_mode: "manual" },
 		});
+		expect(state.dbOps.setFamilyPolicy).not.toHaveBeenCalled();
 		expect(state.dbOps.setFamilyCombo).not.toHaveBeenCalled();
 		expect((await response.json()).data).toMatchObject({
 			combo_id: "combo-1",
@@ -1647,19 +1698,93 @@ describe("managed routing HTTP control plane", () => {
 			dependencies,
 		)(request("/api/routing/exclusions/opus", { account_id: "new" }), "opus");
 		expect(exclude.status).toBe(201);
+		expect(state.applyFamilyPolicyChanges).toHaveBeenNthCalledWith(1, {
+			family: "opus",
+			expected_revision: 0,
+			create_exclusions: [{ combo_id: "combo-1", account_id: "new" }],
+		});
+		expect(state.dbOps.createComboMembershipExclusion).not.toHaveBeenCalled();
 		expect((await exclude.json()).data.policy.exclusions).toHaveLength(1);
+
+		const duplicate = await createMembershipExclusionCreateHandler(
+			state.dbOps,
+			dependencies,
+		)(request("/api/routing/exclusions/opus", { account_id: "new" }), "opus");
+		expect(duplicate.status).toBe(409);
+		expect(state.applyFamilyPolicyChanges).toHaveBeenCalledTimes(1);
 
 		const restore = await createMembershipExclusionRestoreHandler(
 			state.dbOps,
 			dependencies,
 		)("opus", "new");
 		expect(restore.status).toBe(200);
-		expect(state.restoreComboMembership).toHaveBeenCalledWith(
-			"opus",
-			"combo-1",
-			"new",
-		);
+		expect(state.applyFamilyPolicyChanges).toHaveBeenNthCalledWith(2, {
+			family: "opus",
+			expected_revision: 1,
+			delete_exclusion_ids: ["created-exclusion"],
+		});
+		expect(state.restoreComboMembership).not.toHaveBeenCalled();
 		expect((await restore.json()).data.policy.exclusions).toHaveLength(0);
+
+		const alreadyRestored = await createMembershipExclusionRestoreHandler(
+			state.dbOps,
+			dependencies,
+		)("opus", "new");
+		expect(alreadyRestored.status).toBe(404);
+		expect(state.applyFamilyPolicyChanges).toHaveBeenCalledTimes(2);
+	});
+
+	it("rejects exclusion creation when the family assignment changes before commit", async () => {
+		const state = statefulDb();
+		state.interleaveBeforeNextApply(() => {
+			state.mutatePolicy((policy) => {
+				policy.assignment.combo_id = null;
+				policy.assignment.enabled = false;
+			});
+		});
+
+		const response = await createMembershipExclusionCreateHandler(
+			state.dbOps,
+			dependencies,
+		)(request("/api/routing/exclusions/opus", { account_id: "new" }), "opus");
+
+		expect(response.status).toBe(409);
+		expect(await response.json()).toMatchObject({
+			details: { code: "stale_routing_preview" },
+		});
+		expect(state.applyFamilyPolicyChanges).toHaveBeenCalledTimes(1);
+		expect(state.dbOps.createComboMembershipExclusion).not.toHaveBeenCalled();
+	});
+
+	it("rejects exclusion restore when the family assignment changes before commit", async () => {
+		const state = statefulDb();
+		state.mutatePolicy((policy) => {
+			policy.exclusions.push({
+				id: "exclude-new",
+				family: "opus",
+				combo_id: "combo-1",
+				account_id: "new",
+				created_at: 1,
+			});
+		});
+		state.interleaveBeforeNextApply(() => {
+			state.mutatePolicy((policy) => {
+				policy.assignment.combo_id = null;
+				policy.assignment.enabled = false;
+			});
+		});
+
+		const response = await createMembershipExclusionRestoreHandler(
+			state.dbOps,
+			dependencies,
+		)("opus", "new");
+
+		expect(response.status).toBe(409);
+		expect(await response.json()).toMatchObject({
+			details: { code: "stale_routing_preview" },
+		});
+		expect(state.applyFamilyPolicyChanges).toHaveBeenCalledTimes(1);
+		expect(state.restoreComboMembership).not.toHaveBeenCalled();
 	});
 
 	it("returns a typed 404 before restoring a missing exclusion", async () => {
