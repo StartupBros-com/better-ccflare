@@ -1,8 +1,17 @@
-import { afterEach, describe, expect, it, mock } from "bun:test";
+import {
+	afterEach,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	mock,
+	spyOn,
+} from "bun:test";
 import { usageCache } from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
 import type { ProxyContext } from "../handlers";
 import { handleProxy, isReactivelyModelDepleted } from "../proxy";
+import * as usageCollectorModule from "../usage-collector";
 
 function makeAccount(overrides: Partial<Account> = {}): Account {
 	return {
@@ -68,7 +77,31 @@ function makeContext(account: Account): ProxyContext {
 	};
 }
 
+let restoreUsageCollector = (): void => {};
+
+beforeEach(() => {
+	const collector = {
+		handleStart: mock(() => undefined),
+		handleChunk: mock(() => undefined),
+		handleEnd: mock(async () => undefined),
+	};
+	const requiredCollectorSpy = spyOn(
+		usageCollectorModule,
+		"getUsageCollector",
+	).mockReturnValue(collector as never);
+	const optionalCollectorSpy = spyOn(
+		usageCollectorModule,
+		"tryGetUsageCollector",
+	).mockReturnValue(collector as never);
+	restoreUsageCollector = () => {
+		requiredCollectorSpy.mockRestore();
+		optionalCollectorSpy.mockRestore();
+	};
+});
+
 afterEach(() => {
+	restoreUsageCollector();
+	restoreUsageCollector = (): void => {};
 	usageCache.delete("acc-1");
 });
 

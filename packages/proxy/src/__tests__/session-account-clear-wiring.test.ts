@@ -1,4 +1,12 @@
-import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import {
+	afterEach,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	mock,
+	spyOn,
+} from "bun:test";
 import { usageCache } from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
 import type { ProxyContext } from "../handlers";
@@ -8,6 +16,7 @@ import {
 	getServedAccount,
 	recordServedAccount,
 } from "../session-account-observer";
+import * as usageCollectorModule from "../usage-collector";
 
 /**
  * KTD-5 wiring: every handleProxy exit that finishes with NO serving account
@@ -118,8 +127,26 @@ function makeRequest(extraHeaders: Record<string, string> = {}): Request {
 }
 
 let savedPassthrough: string | undefined;
+let restoreUsageCollector = (): void => {};
 
 beforeEach(() => {
+	const collector = {
+		handleStart: mock(() => undefined),
+		handleChunk: mock(() => undefined),
+		handleEnd: mock(async () => undefined),
+	};
+	const requiredCollectorSpy = spyOn(
+		usageCollectorModule,
+		"getUsageCollector",
+	).mockReturnValue(collector as never);
+	const optionalCollectorSpy = spyOn(
+		usageCollectorModule,
+		"tryGetUsageCollector",
+	).mockReturnValue(collector as never);
+	restoreUsageCollector = () => {
+		requiredCollectorSpy.mockRestore();
+		optionalCollectorSpy.mockRestore();
+	};
 	savedPassthrough = process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
 	delete process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
 	SESSION_ID = `clear-wiring-session-${++sessionCounter}`;
@@ -129,6 +156,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+	restoreUsageCollector();
+	restoreUsageCollector = (): void => {};
 	clearSession(SESSION_ID);
 	usageCache.delete("acc-throttled");
 	if (savedPassthrough === undefined) {
