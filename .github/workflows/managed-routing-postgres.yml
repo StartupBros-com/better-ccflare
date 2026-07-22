@@ -58,7 +58,41 @@ jobs:
         run: bun test packages/database/src/__tests__/managed-routing-postgres.integration.test.ts
 
       - name: Run full test suite
-        run: bun test
+        run: |
+          for root in apps packages scripts tests; do
+            if [[ ! -d "$root" ]]; then
+              echo "::error::Test root is missing: $root"
+              exit 1
+            fi
+          done
+
+          mapfile -d '' -t test_files < <(
+            find apps packages scripts tests -type f \
+              \( -name '*.test.ts' -o -name '*.test.tsx' -o -name '*.spec.ts' -o -name '*.spec.tsx' \) \
+              -print0 | LC_ALL=C sort -z
+          )
+
+          if (( ${#test_files[@]} == 0 )); then
+            echo "::error::No test files found"
+            exit 1
+          fi
+
+          echo "Running ${#test_files[@]} test files in isolated Bun processes"
+          failures=()
+          for test_file in "${test_files[@]}"; do
+            printf '\n==> %s\n' "$test_file"
+            if ! bun test --timeout 15000 "$test_file"; then
+              failures+=("$test_file")
+            fi
+          done
+
+          if (( ${#failures[@]} > 0 )); then
+            printf '\n::error::%d isolated test file(s) failed\n' "${#failures[@]}"
+            printf '  %q\n' "${failures[@]}"
+            exit 1
+          fi
+
+          printf '\nAll %d isolated test files passed\n' "${#test_files[@]}"
 
       - name: Run lint
         run: bun run lint
