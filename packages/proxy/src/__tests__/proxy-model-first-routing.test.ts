@@ -7,7 +7,12 @@ import {
 	mock,
 	spyOn,
 } from "bun:test";
-import type { Account, ComboWithSlots } from "@better-ccflare/types";
+import type {
+	Account,
+	ComboFamily,
+	ComboRoutingPolicySnapshot,
+	ComboWithSlots,
+} from "@better-ccflare/types";
 import type { ProxyContext } from "../handlers";
 import type { UsageCollector } from "../usage-collector";
 
@@ -95,6 +100,26 @@ function makeCombo(
 	};
 }
 
+function makeRoutingPolicy(
+	combo: ComboWithSlots | null,
+	family: ComboFamily,
+): ComboRoutingPolicySnapshot {
+	const { slots = [], ...comboRecord } = combo ?? {};
+	return {
+		assignment: {
+			family,
+			combo_id: combo?.id ?? null,
+			enabled: combo !== null,
+			membership_mode: "manual",
+			managed_model: null,
+		},
+		combo: combo ? (comboRecord as ComboRoutingPolicySnapshot["combo"]) : null,
+		slots,
+		rules: [],
+		exclusions: [],
+	};
+}
+
 function installUsageCollector(): void {
 	usageHandleStart = mock(() => undefined);
 	usageHandleEnd = mock(async () => undefined);
@@ -122,7 +147,9 @@ function makeContext(accounts: Account[], combo: ComboWithSlots): ProxyContext {
 		strategy: { select: mock((selected: Account[]) => selected) },
 		dbOps: {
 			getAllAccounts: mock(async () => accounts),
-			getActiveComboForFamily: mock(async () => combo),
+			getComboRoutingPolicy: mock(async (family: ComboFamily) =>
+				makeRoutingPolicy(combo, family),
+			),
 		},
 		runtime: { port: 8080, clientId: "test" },
 		config: {
@@ -424,7 +451,9 @@ describe("global model-first routing", () => {
 			[accountA, accountB],
 			makeCombo({ account: accountA }, { account: accountB }),
 		);
-		ctx.dbOps.getActiveComboForFamily = mock(async () => null);
+		ctx.dbOps.getComboRoutingPolicy = mock(async (family: ComboFamily) =>
+			makeRoutingPolicy(null, family),
+		);
 		const attempts = installFetch((attempt) =>
 			attempt.account === accountB.id && attempt.model === FABLE
 				? success()

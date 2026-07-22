@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it, mock } from "bun:test";
 import { usageCache } from "@better-ccflare/providers";
 import type {
 	Account,
+	ComboFamily,
+	ComboRoutingPolicySnapshot,
 	ComboWithSlots,
 	RequestMeta,
 } from "@better-ccflare/types";
@@ -74,8 +76,34 @@ function makeCombo(slots: ComboWithSlots["slots"]): ComboWithSlots {
 	};
 }
 
+function makeRoutingPolicy(
+	combo: ComboWithSlots | null,
+	family: ComboFamily,
+	overrides: Partial<ComboRoutingPolicySnapshot> = {},
+): ComboRoutingPolicySnapshot {
+	const { slots: comboSlots = [], ...comboRecord } = combo ?? { slots: [] };
+	return {
+		assignment: {
+			family,
+			combo_id: combo?.id ?? null,
+			enabled: combo !== null,
+			membership_mode: "manual",
+			managed_model: null,
+		},
+		combo: combo ? comboRecord : null,
+		slots: comboSlots,
+		rules: [],
+		exclusions: [],
+		...overrides,
+	};
+}
+
 function makeCtx(
-	opts: { accounts?: Account[]; activeCombo?: ComboWithSlots | null } = {},
+	opts: {
+		accounts?: Account[];
+		activeCombo?: ComboWithSlots | null;
+		routingPolicy?: ComboRoutingPolicySnapshot;
+	} = {},
 ): ProxyContext {
 	const accounts = opts.accounts ?? [makeAccount()];
 	return {
@@ -84,7 +112,11 @@ function makeCtx(
 		},
 		dbOps: {
 			getAllAccounts: mock(async () => accounts),
-			getActiveComboForFamily: mock(async () => opts.activeCombo ?? null),
+			getComboRoutingPolicy: mock(
+				async (family: ComboFamily) =>
+					opts.routingPolicy ??
+					makeRoutingPolicy(opts.activeCombo ?? null, family),
+			),
 		},
 		refreshInFlight: new Map(),
 		asyncWriter: { enqueue: mock(() => {}) },
@@ -174,7 +206,6 @@ describe("selectAccountsForRequest — x-better-ccflare-account-id header", () =
 			strategy: { select: mock(() => [activeAcc]) },
 			dbOps: {
 				getAllAccounts: mock(async () => [pausedAcc, activeAcc]),
-				getActiveComboForFamily: mock(async () => null),
 			},
 			refreshInFlight: new Map(),
 			asyncWriter: { enqueue: mock(() => {}) },
@@ -203,7 +234,6 @@ describe("selectAccountsForRequest — x-better-ccflare-account-id header", () =
 			strategy: { select: mock(() => [activeAcc]) },
 			dbOps: {
 				getAllAccounts: mock(async () => [rateLimitedAcc, activeAcc]),
-				getActiveComboForFamily: mock(async () => null),
 			},
 			refreshInFlight: new Map(),
 			asyncWriter: { enqueue: mock(() => {}) },
@@ -271,6 +301,86 @@ describe("selectAccountsForRequest — Grok cache-native ownership", () => {
 		expect(second[0]?.id).toBe("xai-a");
 	});
 
+	it("keeps an equal-tier managed owner but yields immediately to a better managed tier", async () => {
+		const a = makeAccount({
+			id: "xai-managed-a",
+			provider: "xai",
+			priority: 1,
+		});
+		const b = makeAccount({
+			id: "xai-managed-b",
+			provider: "xai",
+			priority: 1,
+		});
+		const combo = makeCombo([]);
+		const policy = makeRoutingPolicy(combo, "fable", {
+			assignment: {
+				family: "fable",
+				combo_id: combo.id,
+				enabled: true,
+				membership_mode: "managed",
+				managed_model: "claude-fable-5",
+			},
+			rules: [
+				{
+					id: "rule-xai-oauth",
+					family: "fable",
+					combo_id: combo.id,
+					provider: "xai",
+					route_class: "oauth-subscription",
+					enabled: true,
+					created_at: 1,
+					updated_at: 1,
+				},
+			],
+		});
+		const ctx = makeCtx({ accounts: [a, b], routingPolicy: policy });
+		let reverseStrategy = false;
+		ctx.strategy.select = mock(() => (reverseStrategy ? [b, a] : [a, b]));
+		ctx.cacheAffinityOrderer = new CacheAffinityOrderer(60_000);
+		const affinity = {
+			xaiCacheNativeActive: true,
+			cacheAffinityKey: "managed-conversation",
+		};
+
+		const first = await selectAccountsForRequest(
+			makeRequestMeta(affinity),
+			ctx,
+			"claude-fable-5",
+		);
+		reverseStrategy = true;
+		const equalTierMeta = makeRequestMeta({ ...affinity, id: "req-equal" });
+		const equalTier = await selectAccountsForRequest(
+			equalTierMeta,
+			ctx,
+			"claude-fable-5",
+		);
+
+		expect(first[0]?.id).toBe(a.id);
+		expect(equalTier[0]?.id).toBe(a.id);
+		expect(equalTierMeta.routingCandidates?.[0]).toMatchObject({
+			candidateId:
+				"combo:combo-1:managed:fable:rule:rule-xai-oauth:account:xai-managed-a",
+			tier: 1,
+			comboSlotId: null,
+		});
+
+		b.priority = 0;
+		const betterTierMeta = makeRequestMeta({ ...affinity, id: "req-better" });
+		const betterTier = await selectAccountsForRequest(
+			betterTierMeta,
+			ctx,
+			"claude-fable-5",
+		);
+		expect(betterTier.map((account) => account.id)).toEqual([b.id, a.id]);
+		expect(betterTierMeta.routingCandidates?.[0]).toMatchObject({
+			candidateId:
+				"combo:combo-1:managed:fable:rule:rule-xai-oauth:account:xai-managed-b",
+			tier: 0,
+			comboSlotId: null,
+		});
+	});
+
 	it("replaces combo ownership when a better slot tier becomes routable", async () => {
 		const a = makeAccount({ id: "xai-a", provider: "xai" });
 		const b = makeAccount({ id: "xai-b", provider: "xai" });
@@ -325,8 +435,10 @@ describe("selectAccountsForRequest — Grok cache-native ownership", () => {
 			},
 		]);
 		(
-			ctx.dbOps.getActiveComboForFamily as ReturnType<typeof mock>
-		).mockImplementation(async () => reversedCombo);
+			ctx.dbOps.getComboRoutingPolicy as ReturnType<typeof mock>
+		).mockImplementation(async (family: ComboFamily) =>
+			makeRoutingPolicy(reversedCombo, family),
+		);
 		const meta = makeRequestMeta(affinity);
 		const result = await selectAccountsForRequest(
 			meta,
@@ -373,7 +485,7 @@ describe("selectAccountsForRequest — Grok cache-native ownership", () => {
 		]);
 	});
 
-	it("reorders repeated-account xAI slots atomically by slot identity", async () => {
+	it("keeps repeated-account xAI slots aligned by stable resolved identity", async () => {
 		const account = makeAccount({ id: "xai-a", provider: "xai" });
 		const initialCombo = makeCombo([
 			{
@@ -406,9 +518,12 @@ describe("selectAccountsForRequest — Grok cache-native ownership", () => {
 			"claude-sonnet-4-5",
 		);
 		(
-			ctx.dbOps.getActiveComboForFamily as ReturnType<typeof mock>
-		).mockImplementation(async () =>
-			makeCombo([initialCombo.slots[1], initialCombo.slots[0]]),
+			ctx.dbOps.getComboRoutingPolicy as ReturnType<typeof mock>
+		).mockImplementation(async (family: ComboFamily) =>
+			makeRoutingPolicy(
+				makeCombo([initialCombo.slots[1], initialCombo.slots[0]]),
+				family,
+			),
 		);
 		const meta = makeRequestMeta(affinity);
 		const result = await selectAccountsForRequest(
@@ -419,8 +534,8 @@ describe("selectAccountsForRequest — Grok cache-native ownership", () => {
 
 		expect(result.map((entry) => entry.id)).toEqual([account.id, account.id]);
 		expect(getComboSlotInfo(meta)?.slots).toEqual([
-			{ accountId: account.id, modelOverride: "claude-opus-4-8" },
 			{ accountId: account.id, modelOverride: "claude-fable-5" },
+			{ accountId: account.id, modelOverride: "claude-opus-4-8" },
 		]);
 		expect(
 			meta.routingCandidates?.map((candidate) => ({
@@ -431,16 +546,16 @@ describe("selectAccountsForRequest — Grok cache-native ownership", () => {
 			})),
 		).toEqual([
 			{
-				comboSlotId: "slot-opus",
-				modelOverride: "claude-opus-4-8",
-				tier: 0,
-				ordinal: 1,
-			},
-			{
 				comboSlotId: "slot-fable",
 				modelOverride: "claude-fable-5",
 				tier: 0,
 				ordinal: 0,
+			},
+			{
+				comboSlotId: "slot-opus",
+				modelOverride: "claude-opus-4-8",
+				tier: 0,
+				ordinal: 1,
 			},
 		]);
 	});
@@ -463,7 +578,6 @@ describe("selectAccountsForRequest — Grok cache-native force-route fail-closed
 			strategy: { select: mock(() => [activeAcc]) },
 			dbOps: {
 				getAllAccounts: mock(async () => [pausedAcc, activeAcc]),
-				getActiveComboForFamily: mock(async () => null),
 			},
 			refreshInFlight: new Map(),
 			asyncWriter: { enqueue: mock(() => {}) },
@@ -491,7 +605,6 @@ describe("selectAccountsForRequest — Grok cache-native force-route fail-closed
 			strategy: { select: mock(() => [activeAcc]) },
 			dbOps: {
 				getAllAccounts: mock(async () => [customAcc, activeAcc]),
-				getActiveComboForFamily: mock(async () => null),
 			},
 			refreshInFlight: new Map(),
 			asyncWriter: { enqueue: mock(() => {}) },
@@ -521,7 +634,6 @@ describe("selectAccountsForRequest — Grok cache-native force-route fail-closed
 			strategy: { select: mock(() => [activeAcc]) },
 			dbOps: {
 				getAllAccounts: mock(async () => [pausedAcc, activeAcc]),
-				getActiveComboForFamily: mock(async () => null),
 			},
 			refreshInFlight: new Map(),
 			asyncWriter: { enqueue: mock(() => {}) },
@@ -575,7 +687,6 @@ describe("selectAccountsForRequest — Grok cache-native force-route fail-closed
 			strategy: { select: mock(() => [activeAcc]) },
 			dbOps: {
 				getAllAccounts: mock(async () => [pausedAcc, activeAcc]),
-				getActiveComboForFamily: mock(async () => null),
 			},
 			refreshInFlight: new Map(),
 			asyncWriter: { enqueue: mock(() => {}) },
@@ -596,6 +707,343 @@ describe("selectAccountsForRequest — Grok cache-native force-route fail-closed
 // ── selectAccountsForRequest — combo routing ──────────────────────────────────
 
 describe("selectAccountsForRequest — combo routing", () => {
+	it("keeps the legacy manual candidate contract exactly", async () => {
+		const first = makeAccount({ id: "manual-first", priority: 99 });
+		const second = makeAccount({ id: "manual-second", priority: 0 });
+		const combo = makeCombo([
+			{
+				id: "slot-a",
+				combo_id: "combo-1",
+				account_id: first.id,
+				model: "claude-opus-4-8",
+				priority: 2,
+				enabled: true,
+			},
+			{
+				id: "slot-b",
+				combo_id: "combo-1",
+				account_id: second.id,
+				model: "claude-opus-4-5",
+				priority: 3,
+				enabled: true,
+			},
+		]);
+		const ctx = makeCtx({ accounts: [first, second], activeCombo: combo });
+		const meta = makeRequestMeta();
+
+		const result = await selectAccountsForRequest(meta, ctx, "claude-opus-4-8");
+		const expectedCandidates = [
+			{
+				candidateId: "combo:combo-1:slot:slot-a",
+				accountId: first.id,
+				tier: 2,
+				ordinal: 0,
+				comboSlotId: "slot-a",
+				modelOverride: "claude-opus-4-8",
+				quotaPressure: null,
+			},
+			{
+				candidateId: "combo:combo-1:slot:slot-b",
+				accountId: second.id,
+				tier: 3,
+				ordinal: 1,
+				comboSlotId: "slot-b",
+				modelOverride: "claude-opus-4-5",
+				quotaPressure: null,
+			},
+		];
+
+		expect(result).toEqual([first, second]);
+		expect(meta.routingCandidateCatalog).toEqual(expectedCandidates);
+		expect(meta.routingCandidates).toEqual(expectedCandidates);
+		expect(getComboSlotInfo(meta)).toEqual({
+			comboName: "Test Combo",
+			slots: [
+				{ accountId: first.id, modelOverride: "claude-opus-4-8" },
+				{ accountId: second.id, modelOverride: "claude-opus-4-5" },
+			],
+		});
+	});
+
+	it("synthesizes a fourth managed peer at account priority with a stable virtual identity", async () => {
+		const accounts = [
+			"anthropic-1",
+			"anthropic-2",
+			"anthropic-3",
+			"anthropic-4",
+		].map((id) => makeAccount({ id, priority: 0 }));
+		const combo = makeCombo([]);
+		const policy = makeRoutingPolicy(combo, "opus", {
+			assignment: {
+				family: "opus",
+				combo_id: combo.id,
+				enabled: true,
+				membership_mode: "managed",
+				managed_model: "claude-opus-4-8",
+			},
+			rules: [
+				{
+					id: "rule-anthropic-oauth",
+					family: "opus",
+					combo_id: combo.id,
+					provider: "anthropic",
+					route_class: "oauth-subscription",
+					enabled: true,
+					created_at: 1,
+					updated_at: 1,
+				},
+			],
+		});
+		const ctx = makeCtx({ accounts, routingPolicy: policy });
+		const meta = makeRequestMeta();
+
+		const result = await selectAccountsForRequest(meta, ctx, "claude-opus-4-8");
+
+		expect(result.map((account) => account.id)).toEqual(
+			accounts.map((account) => account.id),
+		);
+		expect(meta.routingCandidates?.at(-1)).toMatchObject({
+			candidateId:
+				"combo:combo-1:managed:opus:rule:rule-anthropic-oauth:account:anthropic-4",
+			accountId: "anthropic-4",
+			tier: 0,
+			ordinal: 3,
+			comboSlotId: null,
+			modelOverride: "claude-opus-4-8",
+		});
+		expect(ctx.dbOps.getAllAccounts).toHaveBeenCalledTimes(1);
+		expect(ctx.dbOps.getComboRoutingPolicy).toHaveBeenCalledWith("opus");
+
+		const reconstructedMeta = makeRequestMeta({ id: "req-reconstructed" });
+		await selectAccountsForRequest(reconstructedMeta, ctx, "claude-opus-4-8");
+		expect(
+			reconstructedMeta.routingCandidates?.map(
+				(candidate) => candidate.candidateId,
+			),
+		).toEqual(
+			meta.routingCandidates?.map((candidate) => candidate.candidateId),
+		);
+		expect(ctx.dbOps.getAllAccounts).toHaveBeenCalledTimes(2);
+	});
+
+	it("keeps repeated manual lanes while suppressing their managed duplicate", async () => {
+		const overridden = makeAccount({ id: "manual-account", priority: 0 });
+		const managed = makeAccount({ id: "managed-account", priority: 1 });
+		const combo = makeCombo([
+			{
+				id: "slot-manual-opus",
+				combo_id: "combo-1",
+				account_id: overridden.id,
+				model: "claude-opus-4-8",
+				priority: 5,
+				enabled: true,
+			},
+			{
+				id: "slot-manual-fable",
+				combo_id: "combo-1",
+				account_id: overridden.id,
+				model: "claude-fable-5",
+				priority: 6,
+				enabled: true,
+			},
+		]);
+		const policy = makeRoutingPolicy(combo, "opus", {
+			assignment: {
+				family: "opus",
+				combo_id: combo.id,
+				enabled: true,
+				membership_mode: "managed",
+				managed_model: "claude-opus-4-8",
+			},
+			rules: [
+				{
+					id: "rule-anthropic-oauth",
+					family: "opus",
+					combo_id: combo.id,
+					provider: "anthropic",
+					route_class: "oauth-subscription",
+					enabled: true,
+					created_at: 1,
+					updated_at: 1,
+				},
+			],
+		});
+		const ctx = makeCtx({
+			accounts: [overridden, managed],
+			routingPolicy: policy,
+		});
+		const meta = makeRequestMeta();
+
+		const result = await selectAccountsForRequest(meta, ctx, "claude-opus-4-8");
+
+		expect(result.map((account) => account.id)).toEqual([
+			managed.id,
+			overridden.id,
+			overridden.id,
+		]);
+		expect(
+			meta.routingCandidates?.map((candidate) => ({
+				candidateId: candidate.candidateId,
+				comboSlotId: candidate.comboSlotId,
+				modelOverride: candidate.modelOverride,
+			})),
+		).toEqual([
+			{
+				candidateId:
+					"combo:combo-1:managed:opus:rule:rule-anthropic-oauth:account:managed-account",
+				comboSlotId: null,
+				modelOverride: "claude-opus-4-8",
+			},
+			{
+				candidateId: "combo:combo-1:slot:slot-manual-opus",
+				comboSlotId: "slot-manual-opus",
+				modelOverride: "claude-opus-4-8",
+			},
+			{
+				candidateId: "combo:combo-1:slot:slot-manual-fable",
+				comboSlotId: "slot-manual-fable",
+				modelOverride: "claude-fable-5",
+			},
+		]);
+	});
+
+	it("applies request provider exclusions after managed membership synthesis", async () => {
+		const managed = makeAccount({ id: "managed-anthropic", priority: 0 });
+		const manual = makeAccount({
+			id: "manual-xai",
+			provider: "xai",
+			priority: 99,
+		});
+		const combo = makeCombo([
+			{
+				id: "slot-xai",
+				combo_id: "combo-1",
+				account_id: manual.id,
+				model: "grok-4",
+				priority: 1,
+				enabled: true,
+			},
+		]);
+		const policy = makeRoutingPolicy(combo, "opus", {
+			assignment: {
+				family: "opus",
+				combo_id: combo.id,
+				enabled: true,
+				membership_mode: "managed",
+				managed_model: "claude-opus-4-8",
+			},
+			rules: [
+				{
+					id: "rule-anthropic-oauth",
+					family: "opus",
+					combo_id: combo.id,
+					provider: "anthropic",
+					route_class: "oauth-subscription",
+					enabled: true,
+					created_at: 1,
+					updated_at: 1,
+				},
+			],
+		});
+		const ctx = makeCtx({
+			accounts: [managed, manual],
+			routingPolicy: policy,
+		});
+		const meta = makeRequestMeta({
+			headers: new Headers({
+				"x-better-ccflare-exclude-providers": "anthropic-oauth",
+			}),
+		});
+
+		const result = await selectAccountsForRequest(meta, ctx, "claude-opus-4-8");
+
+		expect(result.map((account) => account.id)).toEqual([manual.id]);
+		expect(
+			meta.routingCandidateCatalog?.map((candidate) => candidate.accountId),
+		).toEqual([manual.id]);
+	});
+
+	it("retains unavailable or exhausted managed members while routing to a later tier", async () => {
+		const unavailable = makeAccount({
+			id: "managed-paused",
+			priority: 0,
+			paused: true,
+		});
+		const fallback = makeAccount({ id: "managed-fallback", priority: 1 });
+		const combo = makeCombo([]);
+		const policy = makeRoutingPolicy(combo, "fable", {
+			assignment: {
+				family: "fable",
+				combo_id: combo.id,
+				enabled: true,
+				membership_mode: "managed",
+				managed_model: "claude-fable-5",
+			},
+			rules: [
+				{
+					id: "rule-anthropic-oauth",
+					family: "fable",
+					combo_id: combo.id,
+					provider: "anthropic",
+					route_class: "oauth-subscription",
+					enabled: true,
+					created_at: 1,
+					updated_at: 1,
+				},
+			],
+		});
+		const ctx = makeCtx({
+			accounts: [unavailable, fallback],
+			routingPolicy: policy,
+		});
+		const meta = makeRequestMeta();
+
+		const result = await selectAccountsForRequest(meta, ctx, "claude-fable-5");
+
+		expect(result.map((account) => account.id)).toEqual([fallback.id]);
+		expect(
+			meta.routingCandidateCatalog?.map((candidate) => candidate.accountId),
+		).toEqual([unavailable.id, fallback.id]);
+		expect(meta.routingCandidates?.[0]).toMatchObject({
+			accountId: fallback.id,
+			tier: 1,
+			comboSlotId: null,
+			modelOverride: "claude-fable-5",
+		});
+
+		unavailable.paused = false;
+		cacheUsage(unavailable.id, {
+			spend: { enabled: false },
+			limits: [
+				{
+					kind: "weekly_scoped",
+					percent: 100,
+					resets_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+					scope: {
+						model: { id: null, display_name: "Fable" },
+						surface: null,
+					},
+				},
+			],
+		});
+		const exhaustedMeta = makeRequestMeta({ id: "req-exhausted" });
+		const exhaustedResult = await selectAccountsForRequest(
+			exhaustedMeta,
+			ctx,
+			"claude-fable-5",
+		);
+
+		expect(exhaustedResult.map((account) => account.id)).toEqual([fallback.id]);
+		expect(getRoutingCapacityContext(exhaustedMeta)?.exclusions).toMatchObject([
+			{
+				accountId: unavailable.id,
+				model: "claude-fable-5",
+				comboSlotId: null,
+				comboSlotOrdinal: 0,
+			},
+		]);
+	});
+
 	it("returns combo-ordered accounts when an active combo exists for the model family", async () => {
 		const acc1 = makeAccount({ id: "acc-1" });
 		const acc2 = makeAccount({ id: "acc-2" });
@@ -717,7 +1165,8 @@ describe("selectAccountsForRequest — combo routing", () => {
 		);
 
 		expect(fallback.map((account) => account.id)).toEqual([normalAccount.id]);
-		expect(ctx.dbOps.getActiveComboForFamily).toHaveBeenCalledTimes(1);
+		expect(ctx.dbOps.getComboRoutingPolicy).toHaveBeenCalledTimes(1);
+		expect(ctx.dbOps.getAllAccounts).toHaveBeenCalledTimes(2);
 		expect(ctx.strategy.select).toHaveBeenCalledTimes(2);
 		expect(getComboSlotInfo(meta)).toBeNull();
 		expect(meta.comboName).toBeNull();
@@ -781,7 +1230,9 @@ describe("selectAccountsForRequest — combo routing", () => {
 			},
 			dbOps: {
 				getAllAccounts: mock(async () => [rateLimitedAcc, fallbackAcc]),
-				getActiveComboForFamily: mock(async () => combo),
+				getComboRoutingPolicy: mock(async (family: ComboFamily) =>
+					makeRoutingPolicy(combo, family),
+				),
 			},
 			refreshInFlight: new Map(),
 			asyncWriter: { enqueue: mock(() => {}) },
@@ -797,6 +1248,7 @@ describe("selectAccountsForRequest — combo routing", () => {
 
 		// Should fall back to strategy result (fallbackAcc)
 		expect(result[0]?.id).toBe("acc-fallback");
+		expect(ctx.dbOps.getAllAccounts).toHaveBeenCalledTimes(1);
 	});
 
 	it("falls back to SessionStrategy when no combo is active for the model family", async () => {
@@ -811,6 +1263,20 @@ describe("selectAccountsForRequest — combo routing", () => {
 		);
 		// No combo — strategy.select is used
 		expect(result[0]?.id).toBe("acc-normal");
+	});
+
+	it("fails safely when the recognized-family account preload rejects", async () => {
+		const ctx = makeCtx({ activeCombo: null });
+		ctx.dbOps.getAllAccounts = mock(async () => {
+			throw new Error("database unavailable");
+		});
+		const meta = makeRequestMeta();
+
+		await expect(
+			selectAccountsForRequest(meta, ctx, "claude-opus-4-8"),
+		).resolves.toEqual([]);
+		expect(ctx.strategy.select).not.toHaveBeenCalled();
+		expect(ctx.dbOps.getAllAccounts).toHaveBeenCalledTimes(1);
 	});
 
 	it("falls back to normal routing when no model is provided", async () => {
@@ -833,12 +1299,12 @@ describe("selectAccountsForRequest — combo routing", () => {
 			ctx,
 			"gpt-4-turbo-unknown",
 		);
-		// getActiveComboForFamily should not be called for unknown families.
+		// getComboRoutingPolicy should not be called for unknown families.
 		// dbOps is a plain mock object (not a real DatabaseOperations instance),
 		// so the mock-specific assertion methods require escaping the type here.
 		// biome-ignore lint/suspicious/noExplicitAny: accessing bun:test mock assertion API on a test double
 		const ctxAny = ctx as any;
-		expect(ctxAny.dbOps.getActiveComboForFamily).not.toHaveBeenCalled();
+		expect(ctxAny.dbOps.getComboRoutingPolicy).not.toHaveBeenCalled();
 		expect(result[0]?.id).toBe("acc-normal");
 	});
 
@@ -897,7 +1363,6 @@ describe("selectAccountsForRequest — trusted auto-refresh bypass", () => {
 			strategy: { select: mock(() => [activeAcc]) },
 			dbOps: {
 				getAllAccounts: mock(async () => [overagePausedAcc, activeAcc]),
-				getActiveComboForFamily: mock(async () => null),
 			},
 			refreshInFlight: new Map(),
 			asyncWriter: { enqueue: mock(() => {}) },
@@ -950,7 +1415,6 @@ describe("selectAccountsForRequest — trusted auto-refresh bypass", () => {
 			strategy: { select: mock(() => [activeAcc]) },
 			dbOps: {
 				getAllAccounts: mock(async () => [overagePausedAcc, activeAcc]),
-				getActiveComboForFamily: mock(async () => null),
 			},
 			refreshInFlight: new Map(),
 			asyncWriter: { enqueue: mock(() => {}) },
@@ -987,7 +1451,6 @@ describe("selectAccountsForRequest — trusted auto-refresh bypass", () => {
 			strategy: { select: mock(() => [activeAcc]) },
 			dbOps: {
 				getAllAccounts: mock(async () => [manualPausedAcc, activeAcc]),
-				getActiveComboForFamily: mock(async () => null),
 			},
 			refreshInFlight: new Map(),
 			asyncWriter: { enqueue: mock(() => {}) },
@@ -1023,7 +1486,6 @@ describe("selectAccountsForRequest — trusted auto-refresh bypass", () => {
 			strategy: { select: mock(() => [activeAcc]) },
 			dbOps: {
 				getAllAccounts: mock(async () => [rateLimitedAcc, activeAcc]),
-				getActiveComboForFamily: mock(async () => null),
 			},
 			refreshInFlight: new Map(),
 			asyncWriter: { enqueue: mock(() => {}) },
@@ -1056,7 +1518,6 @@ describe("selectAccountsForRequest — trusted auto-refresh bypass", () => {
 			strategy: { select: mock(() => [activeAcc]) },
 			dbOps: {
 				getAllAccounts: mock(async () => [failurePausedAcc, activeAcc]),
-				getActiveComboForFamily: mock(async () => null),
 			},
 			refreshInFlight: new Map(),
 			asyncWriter: { enqueue: mock(() => {}) },
@@ -1156,7 +1617,7 @@ describe("selectAccountsForRequest — routes on effective model, not the client
 		const opusCombo = makeCombo([
 			{
 				id: "slot-1",
-				combo_id: "combo-opus",
+				combo_id: "combo-1",
 				account_id: "acc-opus",
 				model: "claude-opus-4-5",
 				priority: 0,
@@ -1846,18 +2307,18 @@ describe("selectAccountsForRequest — atomic combo capacity", () => {
 		const result = await selectAccountsForRequest(meta, ctx, "claude-opus-4-8");
 
 		expect(result.map((account) => account.id)).toEqual([
-			accountLow.id,
 			accountHigh.id,
+			accountLow.id,
 			accountHigh.id,
 		]);
 		expect(getComboSlotInfo(meta)?.slots).toEqual([
 			{
-				accountId: accountLow.id,
-				modelOverride: "claude-opus-4-8",
-			},
-			{
 				accountId: accountHigh.id,
 				modelOverride: "claude-opus-4-5",
+			},
+			{
+				accountId: accountLow.id,
+				modelOverride: "claude-opus-4-8",
 			},
 			{
 				accountId: accountHigh.id,
@@ -1876,6 +2337,13 @@ describe("selectAccountsForRequest — atomic combo capacity", () => {
 			),
 		).toEqual([
 			{
+				comboSlotId: "slot-high-second-in-tier",
+				accountId: accountHigh.id,
+				modelOverride: "claude-opus-4-5",
+				tier: 1,
+				ordinal: 0,
+			},
+			{
 				comboSlotId: "slot-low-first-in-tier",
 				accountId: accountLow.id,
 				modelOverride: "claude-opus-4-8",
@@ -1883,18 +2351,11 @@ describe("selectAccountsForRequest — atomic combo capacity", () => {
 				ordinal: 1,
 			},
 			{
-				comboSlotId: "slot-high-second-in-tier",
-				accountId: accountHigh.id,
-				modelOverride: "claude-opus-4-5",
-				tier: 1,
-				ordinal: 2,
-			},
-			{
 				comboSlotId: "slot-high-late-tier",
 				accountId: accountHigh.id,
 				modelOverride: "claude-opus-4-8",
 				tier: 2,
-				ordinal: 0,
+				ordinal: 2,
 			},
 		]);
 	});
