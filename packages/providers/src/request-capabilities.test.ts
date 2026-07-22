@@ -1,6 +1,9 @@
 import { describe, expect, it } from "bun:test";
 import type { Account } from "@better-ccflare/types";
-import { getProvider } from "./index";
+import { AnthropicProvider } from "./providers/anthropic/provider";
+import { CodexProvider } from "./providers/codex/provider";
+import { QwenProvider } from "./providers/qwen/provider";
+import { XaiProvider } from "./providers/xai/provider";
 import {
 	decideContextAdmission,
 	deriveComboRouteClass,
@@ -9,6 +12,7 @@ import {
 	resolveAccountLogicalModelCapability,
 	resolveModelContextCapability,
 } from "./request-capabilities";
+import type { Provider } from "./types";
 
 const routingAccount = (overrides: Partial<Account> = {}): Account =>
 	({
@@ -25,6 +29,17 @@ const routingAccount = (overrides: Partial<Account> = {}): Account =>
 		custom_endpoint: null,
 		...overrides,
 	}) as Account;
+
+const anthropicCapabilityProvider = new AnthropicProvider();
+const capabilityProviders = new Map<string, Provider>([
+	["anthropic", anthropicCapabilityProvider],
+	["claude-console-api", anthropicCapabilityProvider],
+	["codex", new CodexProvider()],
+	["qwen", new QwenProvider()],
+	["xai", new XaiProvider()],
+]);
+const getTestCapabilityProvider = (name: string): Provider | undefined =>
+	capabilityProviders.get(name);
 
 describe("managed routing capabilities", () => {
 	it("derives provider defaults from blank, non-secret draft metadata", () => {
@@ -206,30 +221,38 @@ describe("managed routing capabilities", () => {
 
 	it("uses native and provider defaults, including the console capability alias", () => {
 		expect(
-			resolveAccountLogicalModelCapability(routingAccount(), "claude-fable-5"),
+			resolveAccountLogicalModelCapability(
+				routingAccount(),
+				"claude-fable-5",
+				getTestCapabilityProvider,
+			),
 		).toMatchObject({ status: "supported", provenance: "native_passthrough" });
 		expect(
 			resolveAccountLogicalModelCapability(
 				routingAccount({ provider: "claude-console-api" }),
 				"claude-fable-5",
+				getTestCapabilityProvider,
 			),
 		).toMatchObject({ status: "supported", provenance: "native_passthrough" });
 		expect(
 			resolveAccountLogicalModelCapability(
 				routingAccount({ provider: "codex" }),
 				"claude-fable-5",
+				getTestCapabilityProvider,
 			),
 		).toMatchObject({ status: "unsupported", provenance: "provider_default" });
 		expect(
 			resolveAccountLogicalModelCapability(
 				routingAccount({ provider: "qwen" }),
 				"claude-opus-4-8",
+				getTestCapabilityProvider,
 			),
 		).toMatchObject({ status: "supported", provenance: "provider_default" });
 		expect(
 			resolveAccountLogicalModelCapability(
 				routingAccount({ provider: "xai" }),
 				"claude-fable-5",
+				getTestCapabilityProvider,
 			),
 		).toMatchObject({ status: "supported", provenance: "provider_default" });
 	});
@@ -240,7 +263,11 @@ describe("managed routing capabilities", () => {
 			model_mappings: JSON.stringify({ fable: "coder-model" }),
 		});
 		expect(
-			resolveAccountLogicalModelCapability(explicitlyMapped, "claude-fable-5"),
+			resolveAccountLogicalModelCapability(
+				explicitlyMapped,
+				"claude-fable-5",
+				getTestCapabilityProvider,
+			),
 		).toEqual({
 			status: "supported",
 			provenance: "explicit_account_mapping",
@@ -253,22 +280,13 @@ describe("managed routing capabilities", () => {
 					model_mappings: JSON.stringify({ fable: "some-model" }),
 				}),
 				"claude-fable-5",
+				getTestCapabilityProvider,
 			),
 		).toEqual({
 			status: "unknown",
 			provenance: "undeclared",
 			reason: "unknown",
 		});
-	});
-});
-
-describe("provider registry isolation", () => {
-	it("leaves complete built-in providers available to the next suite", () => {
-		for (const providerName of ["anthropic", "codex", "qwen", "xai"]) {
-			const provider = getProvider(providerName);
-			expect(provider).toBeDefined();
-			expect(provider?.prepareHeaders).toBeFunction();
-		}
 	});
 });
 

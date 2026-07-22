@@ -91,8 +91,9 @@ const UNKNOWN_LOGICAL_MODEL_CAPABILITY: LogicalModelCapability = {
 export function resolveAccountLogicalModelCapability(
 	account: Account,
 	logicalModel: string,
+	capabilityProviderLookup: typeof getCapabilityProvider = getCapabilityProvider,
 ): LogicalModelCapability {
-	const provider = getCapabilityProvider(account.provider);
+	const provider = capabilityProviderLookup(account.provider);
 	if (!provider) return UNKNOWN_LOGICAL_MODEL_CAPABILITY;
 
 	const configured = getConfiguredModelMapping(logicalModel, account);
