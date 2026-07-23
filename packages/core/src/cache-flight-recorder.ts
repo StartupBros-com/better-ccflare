@@ -280,6 +280,18 @@ function unknownReport(
 	};
 }
 
+function idleGapSeconds(
+	previous: TurnEvidence,
+	current: TurnEvidence,
+): number | undefined {
+	const fromMs = Date.parse(previous.timestamp);
+	const toMs = Date.parse(current.timestamp);
+	if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || toMs < fromMs) {
+		return undefined;
+	}
+	return (toMs - fromMs) / 1000;
+}
+
 /** Diagnose the first cache miss after a proven hit using only retained evidence. */
 export function diagnoseTimeline(timeline: Timeline): DiagnosisReport {
 	const turns = [...timeline.turns].sort((a, b) => a.sequence - b.sequence);
@@ -355,13 +367,30 @@ export function diagnoseTimeline(timeline: Timeline): DiagnosisReport {
 				: changed.some((item) => item.dimension === "cacheable_prefix")
 					? "cacheable_prefix_changed"
 					: "upstream_miss_despite_stable_lineage";
+		const idleEvidence: DiagnosisEvidence[] = [];
+		if (cause === "upstream_miss_despite_stable_lineage") {
+			const priorHit = turns[priorHitIndex] as TurnEvidence;
+			const gapSeconds = idleGapSeconds(priorHit, current);
+			// Live Grok collapses appear after ~90-120s idle on stable lineage.
+			// Ignore sub-minute fixture spacing so unit timelines stay clean.
+			if (gapSeconds !== undefined && gapSeconds >= 90) {
+				idleEvidence.push({
+					kind: "observed",
+					dimension: "timeline",
+					fromSequence: priorHit.sequence,
+					toSequence: current.sequence,
+					fromValue: Math.round(gapSeconds),
+					detail: `idle_gap_seconds_${Math.round(gapSeconds)}`,
+				});
+			}
+		}
 		return {
 			recorderConversationId: timeline.recorderConversationId,
 			baselineSequence: baseline.sequence,
 			diagnosedSequence: current.sequence,
 			cause,
 			completeness: integrity.completeness,
-			supportingEvidence: [...lineageEvidence, missEvidence],
+			supportingEvidence: [...lineageEvidence, missEvidence, ...idleEvidence],
 			continuityProof: [],
 			gaps: integrity.gaps,
 			unavailableDimensions: integrity.unavailableDimensions,

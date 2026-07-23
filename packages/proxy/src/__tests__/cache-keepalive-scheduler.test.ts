@@ -48,7 +48,12 @@ mock.module("@better-ccflare/core", () => ({
 
 import { cacheBodyStore } from "../cache-body-store";
 // Import AFTER mock.module so the scheduler gets the mocked registerHeartbeat.
-import { CacheKeepaliveScheduler } from "../cache-keepalive-scheduler";
+import {
+	CacheKeepaliveScheduler,
+	keepaliveIntervalSeconds,
+	resolveKeepaliveTtlMinutes,
+	shouldSkipKeepaliveForFreshness,
+} from "../cache-keepalive-scheduler";
 import { CACHE_REPLAY_MODEL_HEADER } from "../cache-transport-staging";
 import {
 	consumeInternalAutoRefreshAuth,
@@ -67,15 +72,21 @@ function makeProxyContext(port = 8081): ProxyContext {
 type ConfigChangeListener = (evt: { key: string; newValue: unknown }) => void;
 
 /** Minimal Config mock with a simple event emitter for "change". */
-function makeConfig(initialTtl: number): {
+function makeConfig(
+	initialTtl: number,
+	initialXaiTtl = 0,
+): {
 	config: Config;
 	fireTtlChange: (newTtl: number) => void;
+	fireXaiTtlChange: (newTtl: number) => void;
 } {
 	let ttl = initialTtl;
+	let xaiTtl = initialXaiTtl;
 	const listeners: ConfigChangeListener[] = [];
 
 	const config = {
 		getCacheKeepaliveTtlMinutes: () => ttl,
+		getXaiCacheKeepaliveTtlMinutes: () => xaiTtl,
 		on: (event: string, cb: ConfigChangeListener) => {
 			if (event === "change") listeners.push(cb);
 		},
@@ -89,6 +100,9 @@ function makeConfig(initialTtl: number): {
 		_setTtl: (v: number) => {
 			ttl = v;
 		},
+		_setXaiTtl: (v: number) => {
+			xaiTtl = v;
+		},
 	} as unknown as Config;
 
 	const fireTtlChange = (newTtl: number) => {
@@ -98,7 +112,16 @@ function makeConfig(initialTtl: number): {
 		}
 	};
 
-	return { config, fireTtlChange };
+	const fireXaiTtlChange = (newTtl: number) => {
+		(config as unknown as { _setXaiTtl: (v: number) => void })._setXaiTtl(
+			newTtl,
+		);
+		for (const l of listeners) {
+			l({ key: "xai_cache_keepalive_ttl_minutes", newValue: newTtl });
+		}
+	};
+
+	return { config, fireTtlChange, fireXaiTtlChange };
 }
 
 /** Stage + promote a cached request entry for a given accountId. */
@@ -108,6 +131,7 @@ function seedCacheEntry(
 	bodyText = '{"model":"claude-opus-4-5","messages":[],"system":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}]}',
 	resolvedModel: string | null = null,
 	sourceHeaders = new Headers({ "content-type": "application/json" }),
+	providerName = "anthropic",
 ): void {
 	const requestId = `req-${accountId}-${Date.now()}`;
 	const bodyBuffer = new TextEncoder().encode(bodyText).buffer;
@@ -120,9 +144,19 @@ function seedCacheEntry(
 		undefined,
 		undefined,
 		resolvedModel,
+		{ providerName, automaticPrefixCache: providerName === "xai" },
 	);
 	// Promote by simulating a successful cache creation (cacheCreationInputTokens > 0).
-	cacheBodyStore.onSummary(requestId, 42);
+	cacheBodyStore.onSummary(requestId, 42, true, undefined, {
+		totalInputTokens: 100,
+		inputTokensPresent: true,
+	});
+	// Age past the freshness window so sendKeepalives actually replays.
+	// 3min is chosen to sit inside the replay window [ttl/2, ttl*3] for every
+	// TTL used in this file (2..5 → [1min,6min]..[2.5min,15min]). A test using
+	// a TTL <= 4 with this helper stays valid; TTL <= 1 (eviction at 3min) or a
+	// much larger TTL (freshness > 3min) would need a matched age.
+	cacheBodyStore.ageLastCachedRequest(accountId, 3 * 60_000);
 }
 
 // ---------------------------------------------------------------------------
@@ -730,6 +764,116 @@ describe("CacheKeepaliveScheduler", () => {
 
 			scheduler.stop();
 		});
+	});
+});
+
+describe("keepalive provider TTL helpers", () => {
+	it("prefers xAI TTL for xai providers and ignores it for others", () => {
+		expect(resolveKeepaliveTtlMinutes("xai", 0, 2)).toBe(2);
+		expect(resolveKeepaliveTtlMinutes("xai", 5, 2)).toBe(2);
+		expect(resolveKeepaliveTtlMinutes("xai", 5, 0)).toBe(5);
+		expect(resolveKeepaliveTtlMinutes("anthropic", 5, 2)).toBe(5);
+		expect(resolveKeepaliveTtlMinutes("anthropic", 0, 2)).toBe(0);
+	});
+
+	it("skips keepalive while the entry is still fresh relative to TTL", () => {
+		const now = 1_000_000;
+		expect(shouldSkipKeepaliveForFreshness(now - 10_000, 2, now)).toBe(true);
+		expect(shouldSkipKeepaliveForFreshness(now - 90_000, 2, now)).toBe(false);
+	});
+
+	it("derives interval from the tightest active TTL", () => {
+		expect(keepaliveIntervalSeconds(0, 0)).toBe(0);
+		expect(keepaliveIntervalSeconds(0, 2)).toBe(60);
+		expect(keepaliveIntervalSeconds(5, 2)).toBe(60);
+		expect(keepaliveIntervalSeconds(5, 0)).toBe(240);
+	});
+});
+
+describe("xAI-only keepalive canary", () => {
+	beforeEach(() => {
+		resetMocks();
+		resetStore();
+	});
+
+	it("starts from xAI TTL alone and skips anthropic accounts", async () => {
+		const fetchMock = mock(
+			async (_input: RequestInfo | URL, _init?: RequestInit) =>
+				new Response("", { status: 200 }),
+		);
+		globalThis.fetch = fetchMock;
+
+		const { config } = makeConfig(0, 2);
+		const scheduler = new CacheKeepaliveScheduler(makeProxyContext(), config);
+		scheduler.start();
+		expect(cacheBodyStore.isEnabled()).toBe(true);
+		expect(capturedSeconds).toBe(60);
+
+		seedCacheEntry("acc-anthropic");
+		seedCacheEntry(
+			"acc-xai",
+			"/v1/messages",
+			'{"model":"grok-4.5","messages":[{"role":"user","content":"hi"}]}',
+			"grok-4.5",
+			new Headers({ "content-type": "application/json" }),
+			"xai",
+		);
+		expect(cacheBodyStore.getLastCachedRequest("acc-xai")?.providerName).toBe(
+			"xai",
+		);
+
+		await capturedCallback?.();
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		scheduler.stop();
+	});
+
+	it("does not stage anthropic bodies at all when only the xAI TTL is set", () => {
+		const { config } = makeConfig(0, 2);
+		const scheduler = new CacheKeepaliveScheduler(makeProxyContext(), config);
+		scheduler.start();
+
+		// Anthropic request under an xAI-only canary: resolved TTL is 0, so it
+		// must never buffer a body (no memory/CPU overhead on prod traffic).
+		seedCacheEntry("acc-anthropic");
+		expect(cacheBodyStore.getLastCachedRequest("acc-anthropic")).toBeNull();
+		expect(cacheBodyStore.getAllCachedAccounts()).not.toContain(
+			"acc-anthropic",
+		);
+
+		// xAI entry under the same config is still staged.
+		seedCacheEntry(
+			"acc-xai",
+			"/v1/messages",
+			'{"model":"grok-4.5","messages":[{"role":"user","content":"hi"}]}',
+			"grok-4.5",
+			new Headers({ "content-type": "application/json" }),
+			"xai",
+		);
+		expect(cacheBodyStore.getLastCachedRequest("acc-xai")).not.toBeNull();
+
+		scheduler.stop();
+	});
+
+	it("stages all providers when the global TTL is set (legacy parity)", () => {
+		const { config } = makeConfig(5, 0);
+		const scheduler = new CacheKeepaliveScheduler(makeProxyContext(), config);
+		scheduler.start();
+
+		// Global keepalive keeps every provider warm, including xAI (falls back
+		// to the global TTL). This preserves pre-canary behavior.
+		seedCacheEntry("acc-anthropic");
+		seedCacheEntry(
+			"acc-xai",
+			"/v1/messages",
+			'{"model":"grok-4.5","messages":[{"role":"user","content":"hi"}]}',
+			"grok-4.5",
+			new Headers({ "content-type": "application/json" }),
+			"xai",
+		);
+		expect(cacheBodyStore.getLastCachedRequest("acc-anthropic")).not.toBeNull();
+		expect(cacheBodyStore.getLastCachedRequest("acc-xai")).not.toBeNull();
+
+		scheduler.stop();
 	});
 });
 

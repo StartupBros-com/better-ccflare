@@ -78,6 +78,8 @@ export interface CachedRequestEntry {
 	timestamp: number;
 	/** Exact physical model used by the cache-writing transport. */
 	resolvedModel: string | null;
+	/** Provider that wrote this entry (e.g. xai, anthropic). */
+	providerName: string | null;
 }
 
 // Strip sensitive and internal headers before storing.
@@ -123,16 +125,39 @@ class CacheBodyStore {
 	/** Whether the feature is enabled — skip staging entirely when false. */
 	private enabled = false;
 
+	/**
+	 * Optional per-provider staging gate. When set, a provider whose keepalive
+	 * would never replay (resolved TTL 0) is skipped BEFORE any body copy or
+	 * cache-control scan. This keeps an xAI-only keepalive canary from imposing
+	 * staging cost + memory retention on unrelated Anthropic production traffic.
+	 * Null means "no provider filter" (legacy behavior: gated only by `enabled`).
+	 */
+	private stagingEligibility:
+		| ((providerName: string | null) => boolean)
+		| null = null;
+
 	setEnabled(enabled: boolean): void {
 		this.enabled = enabled;
 		if (!enabled) {
 			this.staging.clear();
 			this.lastCachedRequest.clear();
+			this.stagingEligibility = null;
 		}
 	}
 
 	isEnabled(): boolean {
 		return this.enabled;
+	}
+
+	/**
+	 * Install (or clear with null) a predicate deciding whether a provider's
+	 * requests are worth staging. The keepalive scheduler sets this from the
+	 * resolved global/xAI TTLs so ineligible providers never buffer bodies.
+	 */
+	setStagingEligibility(
+		predicate: ((providerName: string | null) => boolean) | null,
+	): void {
+		this.stagingEligibility = predicate;
 	}
 
 	/**
@@ -153,9 +178,23 @@ class CacheBodyStore {
 		cacheIdentityBody: ArrayBuffer | null = body,
 		cacheIdentityHasCacheControl?: boolean,
 		resolvedModel: string | null = null,
-		options?: { automaticPrefixCache?: boolean },
+		options?: { automaticPrefixCache?: boolean; providerName?: string },
 	): void {
 		if (!this.enabled) return;
+
+		const providerName =
+			typeof options?.providerName === "string" && options.providerName
+				? options.providerName
+				: null;
+
+		// Provider filter runs before any work: an ineligible provider (its
+		// keepalive TTL resolves to 0) must not pay the body-copy / scan / retain
+		// cost. Still clear any prior staging for this request id so a later
+		// summary cannot promote a stale projection.
+		if (this.stagingEligibility && !this.stagingEligibility(providerName)) {
+			this.staging.delete(requestId);
+			return;
+		}
 
 		// A request can execute multiple physical transports through in-place retry,
 		// model fallback, or account failover. Each new attempt replaces the prior
@@ -201,6 +240,7 @@ class CacheBodyStore {
 				path,
 				timestamp: Date.now(),
 				resolvedModel,
+				providerName,
 			},
 		});
 
@@ -300,6 +340,20 @@ class CacheBodyStore {
 	 */
 	getLastCachedRequest(accountId: string): CachedRequestEntry | null {
 		return this.lastCachedRequest.get(accountId) ?? null;
+	}
+
+	/**
+	 * Test/ops helper: age a promoted entry so keepalive freshness skip can be
+	 * exercised deterministically without waiting on real clocks.
+	 */
+	ageLastCachedRequest(accountId: string, ageMs: number): void {
+		const entry = this.lastCachedRequest.get(accountId);
+		if (!entry) return;
+		const safeAge = Number.isFinite(ageMs) && ageMs > 0 ? ageMs : 0;
+		this.lastCachedRequest.set(accountId, {
+			...entry,
+			timestamp: Date.now() - safeAge,
+		});
 	}
 
 	/** Returns all accounts that have a recorded cached request. */

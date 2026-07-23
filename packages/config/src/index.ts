@@ -60,6 +60,7 @@ export interface ConfigData {
 	store_payloads?: boolean;
 	usage_poll_interval_ms?: number;
 	cache_keepalive_ttl_minutes?: number;
+	xai_cache_keepalive_ttl_minutes?: number;
 	system_prompt_cache_ttl_1h?: boolean;
 	usage_throttling_five_hour_enabled?: boolean;
 	usage_throttling_weekly_enabled?: boolean;
@@ -411,6 +412,27 @@ export class Config extends EventEmitter {
 		this.set("cache_keepalive_ttl_minutes", clamped);
 	}
 
+	/**
+	 * Official-xAI-only keepalive TTL. Independent of the global Anthropic-oriented
+	 * CACHE_KEEPALIVE_TTL_MINUTES so Grok can be canaried without replaying every
+	 * Anthropic account. Env: CCFLARE_XAI_CACHE_KEEPALIVE_TTL_MINUTES.
+	 */
+	getXaiCacheKeepaliveTtlMinutes(): number {
+		const fromEnv = process.env.CCFLARE_XAI_CACHE_KEEPALIVE_TTL_MINUTES;
+		if (fromEnv) {
+			const n = parseInt(fromEnv, 10);
+			if (!Number.isNaN(n)) return this.clamp(n, 0, 60);
+		}
+		const fromFile = this.data.xai_cache_keepalive_ttl_minutes;
+		if (typeof fromFile === "number") return this.clamp(fromFile, 0, 60);
+		return 0; // default: disabled
+	}
+
+	setXaiCacheKeepaliveTtlMinutes(minutes: number): void {
+		const clamped = this.clamp(minutes, 0, 60);
+		this.set("xai_cache_keepalive_ttl_minutes", clamped);
+	}
+
 	getSystemPromptCacheTtl1h(): boolean {
 		const fromEnv = process.env.SYSTEM_PROMPT_CACHE_TTL_1H;
 		if (fromEnv) {
@@ -646,6 +668,7 @@ export class Config extends EventEmitter {
 			store_payloads: this.getStorePayloads(),
 			usage_poll_interval_ms: this.getUsagePollIntervalMs(),
 			cache_keepalive_ttl_minutes: this.getCacheKeepaliveTtlMinutes(),
+			xai_cache_keepalive_ttl_minutes: this.getXaiCacheKeepaliveTtlMinutes(),
 			system_prompt_cache_ttl_1h: this.getSystemPromptCacheTtl1h(),
 			usage_throttling_five_hour_enabled:
 				this.getUsageThrottlingFiveHourEnabled(),
