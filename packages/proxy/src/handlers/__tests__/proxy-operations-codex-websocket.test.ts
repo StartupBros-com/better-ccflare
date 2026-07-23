@@ -5,6 +5,7 @@ import {
 	expect,
 	it,
 	mock,
+	setSystemTime,
 	spyOn,
 } from "bun:test";
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
@@ -171,19 +172,30 @@ function makeRequestMeta(
 	};
 }
 
-function makePolicy(deadlineMs = 100): ModelFallbackExecutionPolicy {
-	const routeAbort = new AbortController();
-	const deadlineAt = Date.now() + deadlineMs;
+function makePolicy(
+	deadlineMs = 100,
+	options: {
+		attemptDeadlineMs?: number;
+		isFinalAttempt?: boolean;
+		routeAbort?: AbortController;
+	} = {},
+): ModelFallbackExecutionPolicy {
+	const routeAbort = options.routeAbort ?? new AbortController();
+	const startedAt = Date.now();
+	const deadlineAt = startedAt + deadlineMs;
+	const attemptDeadlineAt =
+		startedAt + (options.attemptDeadlineMs ?? deadlineMs);
 	return {
 		routeCandidateId: "codex-ws-route",
 		implicitFallbacksEnabled: false,
 		forwardModelUnavailableResponse: true,
-		isFinalSemanticAttempt: () => true,
+		isFinalSemanticAttempt: () => options.isFinalAttempt ?? true,
 		anthropicPreCommitRescue: {
 			activate: () => undefined,
 			signal: routeAbort.signal,
 			commitmentDeadlineAt: deadlineAt,
-			getAttemptCommitmentDeadlineAt: () => deadlineAt,
+			getAttemptCommitmentDeadlineAt: (isFinalAttempt) =>
+				isFinalAttempt ? deadlineAt : attemptDeadlineAt,
 			registerTerminalRecorder: () => undefined,
 			registerRequestLifecycle: () => undefined,
 			releaseResponseLifecycle: () => undefined,
@@ -192,15 +204,19 @@ function makePolicy(deadlineMs = 100): ModelFallbackExecutionPolicy {
 	};
 }
 
-function makeReceipt(onMark: () => void): CodexWebSocketReceipt {
+function makeReceipt(
+	onMark: (
+		category: Parameters<CodexWebSocketReceipt["markPostWriteFailure"]>[0],
+	) => void,
+): CodexWebSocketReceipt {
 	const receipt: CodexWebSocketReceipt = {
 		connectionId: "conn_test",
 		cohortId: "cohort_test",
 		reused: false,
 		frameWritten: true,
 		stickyHttp: false,
-		markPostWriteFailure: () => {
-			onMark();
+		markPostWriteFailure: (category) => {
+			onMark(category);
 			receipt.stickyHttp = true;
 		},
 	};
@@ -313,6 +329,7 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 	});
 
 	afterEach(() => {
+		setSystemTime();
 		globalThis.fetch = originalFetch;
 		if (originalPromptCacheKey === undefined) {
 			delete process.env.CCFLARE_CODEX_PROMPT_CACHE_KEY;
@@ -448,62 +465,56 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 		);
 	});
 
-	it("never falls back to HTTP after response.create was written and the attempt deadline fires", async () => {
+	it("keeps the private attempt deadline for pre-write WebSocket fallback and HTTP", async () => {
 		installUsageCollector();
 		let httpCalls = 0;
-		globalThis.fetch = mock(async () => {
+		globalThis.fetch = mock(async (input) => {
 			httpCalls++;
-			return new Response("unexpected HTTP fallback", { status: 500 });
-		});
-
-		let postWriteMarks = 0;
-		const receipt = makeReceipt(() => postWriteMarks++);
-		const websocketAttempt = spyOn(
-			codexWebSocketTransport,
-			"tryRequest",
-		).mockImplementation(async (input) => {
-			input.onFrameWritten?.(receipt);
+			const signal = input instanceof Request ? input.signal : undefined;
 			await new Promise<never>((_resolve, reject) => {
-				const rejectFromAbort = () => reject(input.signal.reason);
-				input.signal.addEventListener("abort", rejectFromAbort, { once: true });
-				if (input.signal.aborted) rejectFromAbort();
+				const rejectFromAbort = () => reject(signal?.reason);
+				signal?.addEventListener("abort", rejectFromAbort, { once: true });
+				if (signal?.aborted) rejectFromAbort();
 			});
 		});
 
+		const websocketAttempt = spyOn(
+			codexWebSocketTransport,
+			"tryRequest",
+		).mockResolvedValue(null);
+
 		const body = makeRequestBody();
 		const request = makeRequest(body);
+		const startedAt = Date.now();
 		const response = await runProxy(
 			request,
 			body,
-			makePolicy(),
-			"codex-ws-request",
+			makePolicy(350, { attemptDeadlineMs: 90, isFinalAttempt: false }),
+			"codex-ws-prewrite-http-deadline",
 		);
+		const elapsedMs = Date.now() - startedAt;
 
 		expect(websocketAttempt).toHaveBeenCalledTimes(1);
-		const websocketInput = websocketAttempt.mock.calls[0]?.[0];
-		expect(websocketInput?.requestId).toBe("codex-ws-request");
-		expect(websocketInput?.attemptId).toMatch(
-			/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
-		);
-		expect(httpCalls).toBe(0);
-		expect(postWriteMarks).toBe(1);
-		expect(receipt.stickyHttp).toBe(true);
-		expect(response?.status).toBe(504);
-		expect(await response?.json()).toMatchObject({
-			error: { code: "codex_websocket_semantic_stall" },
-		});
+		expect(httpCalls).toBe(1);
+		expect(elapsedMs).toBeGreaterThanOrEqual(60);
+		expect(elapsedMs).toBeLessThan(250);
+		expect(response).toBeNull();
 	});
 
 	it("does not replay over HTTP when a structurally-started WebSocket stream reaches its semantic deadline", async () => {
 		installUsageCollector();
+		process.env.CCFLARE_ANTHROPIC_PRECOMMIT_TIMEOUT_MS = "40";
 		let httpCalls = 0;
 		globalThis.fetch = mock(async () => {
 			httpCalls++;
 			return new Response("unexpected HTTP replay", { status: 500 });
 		});
 
-		let postWriteMarks = 0;
-		const receipt = makeReceipt(() => postWriteMarks++);
+		const postWriteCategories: string[] = [];
+		let upstreamCancels = 0;
+		const receipt = makeReceipt((category) =>
+			postWriteCategories.push(category),
+		);
 		const encoder = new TextEncoder();
 		const structurallyStarted = new Response(
 			new ReadableStream<Uint8Array>({
@@ -514,6 +525,9 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 						),
 					);
 					// Deliberately no meaningful event and no terminal event.
+				},
+				cancel() {
+					upstreamCancels++;
 				},
 			}),
 			{
@@ -531,16 +545,389 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 
 		const body = makeRequestBody();
 		const request = makeRequest(body);
+		const startedAt = Date.now();
 		const response = await runProxy(
 			request,
 			body,
-			makePolicy(150),
+			makePolicy(180),
 			"codex-ws-structural-stall",
+		);
+		const elapsedMs = Date.now() - startedAt;
+
+		expect(websocketAttempt).toHaveBeenCalledTimes(1);
+		expect(httpCalls).toBe(0);
+		expect(postWriteCategories).toEqual(["semantic_stall"]);
+		expect(upstreamCancels).toBe(1);
+		expect(elapsedMs).toBeGreaterThanOrEqual(140);
+		expect(receipt.stickyHttp).toBe(true);
+		expect(response?.status).toBe(504);
+		expect(await response?.json()).toMatchObject({
+			error: { code: "codex_websocket_semantic_stall" },
+		});
+	});
+
+	it("allows event-silent WebSocket reasoning past protocol idle to commit before the request-wide deadline", async () => {
+		installUsageCollector();
+		process.env.CCFLARE_ANTHROPIC_PRECOMMIT_TIMEOUT_MS = "40";
+		let httpCalls = 0;
+		globalThis.fetch = mock(async () => {
+			httpCalls++;
+			return new Response("unexpected HTTP replay", { status: 500 });
+		});
+
+		const postWriteCategories: string[] = [];
+		let upstreamCancels = 0;
+		const receipt = makeReceipt((category) =>
+			postWriteCategories.push(category),
+		);
+		const websocketAttempt = spyOn(
+			codexWebSocketTransport,
+			"tryRequest",
+		).mockImplementation(async (input) => {
+			input.onFrameWritten?.(receipt);
+			const encoder = new TextEncoder();
+			let successTimer: ReturnType<typeof setTimeout> | undefined;
+			const eventSilentReasoning = new Response(
+				new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.enqueue(
+							encoder.encode(
+								'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_silent_reasoning","model":"gpt-5.4"}}\n\n',
+							),
+						);
+						successTimer = setTimeout(() => {
+							controller.enqueue(
+								encoder.encode(
+									[
+										'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"eventual output"}\n\n',
+										'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_silent_reasoning","model":"gpt-5.4","status":"completed","usage":{"input_tokens":10,"output_tokens":2}}}\n\n',
+										"data: [DONE]\n\n",
+									].join(""),
+								),
+							);
+							controller.close();
+						}, 120);
+					},
+					cancel() {
+						if (successTimer !== undefined) clearTimeout(successTimer);
+						upstreamCancels++;
+					},
+				}),
+				{
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				},
+			);
+			return { response: eventSilentReasoning, receipt };
+		});
+
+		const body = makeRequestBody();
+		const request = makeRequest(body);
+		const response = await runProxy(
+			request,
+			body,
+			makePolicy(350),
+			"codex-ws-event-silent-reasoning",
+		);
+		const responseBody = await response?.text();
+
+		expect(websocketAttempt).toHaveBeenCalledTimes(1);
+		expect(httpCalls).toBe(0);
+		expect(postWriteCategories).toEqual([]);
+		expect(upstreamCancels).toBe(0);
+		expect(receipt.stickyHttp).toBe(false);
+		expect(response?.status).toBe(200);
+		expect(responseBody).toContain('"text":"eventual output"');
+	});
+
+	it("promotes a written non-final WebSocket attempt to the request-wide commitment deadline", async () => {
+		installUsageCollector();
+		process.env.CCFLARE_ANTHROPIC_PRECOMMIT_TIMEOUT_MS = "40";
+		let httpCalls = 0;
+		globalThis.fetch = mock(async () => {
+			httpCalls++;
+			return new Response("unexpected HTTP replay", { status: 500 });
+		});
+
+		const postWriteCategories: string[] = [];
+		let upstreamCancels = 0;
+		const receipt = makeReceipt((category) =>
+			postWriteCategories.push(category),
+		);
+		const websocketAttempt = spyOn(
+			codexWebSocketTransport,
+			"tryRequest",
+		).mockImplementation(async (input) => {
+			input.onFrameWritten?.(receipt);
+			const encoder = new TextEncoder();
+			let successTimer: ReturnType<typeof setTimeout> | undefined;
+			const delayedWinner = new Response(
+				new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.enqueue(
+							encoder.encode(
+								'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_promoted","model":"gpt-5.4"}}\n\n',
+							),
+						);
+						successTimer = setTimeout(() => {
+							controller.enqueue(
+								encoder.encode(
+									[
+										'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"promoted winner"}\n\n',
+										'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_promoted","model":"gpt-5.4","status":"completed","usage":{"input_tokens":10,"output_tokens":2}}}\n\n',
+										"data: [DONE]\n\n",
+									].join(""),
+								),
+							);
+							controller.close();
+						}, 160);
+					},
+					cancel() {
+						if (successTimer !== undefined) clearTimeout(successTimer);
+						upstreamCancels++;
+					},
+				}),
+				{
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				},
+			);
+			return { response: delayedWinner, receipt };
+		});
+
+		const body = makeRequestBody();
+		const request = makeRequest(body);
+		const response = await runProxy(
+			request,
+			body,
+			makePolicy(350, { attemptDeadlineMs: 90, isFinalAttempt: false }),
+			"codex-ws-promote-non-final-attempt",
+		);
+		const responseBody = await response?.text();
+
+		expect(websocketAttempt).toHaveBeenCalledTimes(1);
+		expect(httpCalls).toBe(0);
+		expect(postWriteCategories).toEqual([]);
+		expect(upstreamCancels).toBe(0);
+		expect(receipt.stickyHttp).toBe(false);
+		expect(response?.status).toBe(200);
+		expect(responseBody).toContain('"text":"promoted winner"');
+	});
+
+	it("preserves downstream cancellation after promoting the written WebSocket deadline", async () => {
+		installUsageCollector();
+		process.env.CCFLARE_ANTHROPIC_PRECOMMIT_TIMEOUT_MS = "40";
+		let httpCalls = 0;
+		globalThis.fetch = mock(async () => {
+			httpCalls++;
+			return new Response("unexpected HTTP replay", { status: 500 });
+		});
+
+		const routeAbort = new AbortController();
+		const postWriteCategories: string[] = [];
+		let upstreamCancels = 0;
+		const receipt = makeReceipt((category) =>
+			postWriteCategories.push(category),
+		);
+		const websocketAttempt = spyOn(
+			codexWebSocketTransport,
+			"tryRequest",
+		).mockImplementation(async (input) => {
+			input.onFrameWritten?.(receipt);
+			const encoder = new TextEncoder();
+			return {
+				receipt,
+				response: new Response(
+					new ReadableStream<Uint8Array>({
+						start(controller) {
+							controller.enqueue(
+								encoder.encode(
+									'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_cancelled","model":"gpt-5.4"}}\n\n',
+								),
+							);
+						},
+						cancel() {
+							upstreamCancels++;
+						},
+					}),
+					{
+						status: 200,
+						headers: { "content-type": "text/event-stream" },
+					},
+				),
+			};
+		});
+
+		const body = makeRequestBody();
+		const request = makeRequest(body);
+		const proxyPromise = runProxy(
+			request,
+			body,
+			makePolicy(350, {
+				attemptDeadlineMs: 90,
+				isFinalAttempt: false,
+				routeAbort,
+			}),
+			"codex-ws-promoted-downstream-cancel",
+		);
+		const abortTimer = setTimeout(
+			() =>
+				routeAbort.abort(
+					new DOMException("downstream cancelled", "AbortError"),
+				),
+			130,
+		);
+		let thrown: unknown;
+		try {
+			await proxyPromise;
+		} catch (error) {
+			thrown = error;
+		} finally {
+			clearTimeout(abortTimer);
+		}
+
+		expect(websocketAttempt).toHaveBeenCalledTimes(1);
+		expect(httpCalls).toBe(0);
+		expect(postWriteCategories).toEqual([]);
+		expect(upstreamCancels).toBe(1);
+		expect(receipt.stickyHttp).toBe(false);
+		expect(thrown).toBeInstanceOf(Error);
+		expect((thrown as Error).name).toBe("AnthropicPreCommitAbortedError");
+	});
+
+	it("terminates once when the request-wide deadline expires during frame-write promotion", async () => {
+		installUsageCollector();
+		process.env.CCFLARE_ANTHROPIC_PRECOMMIT_TIMEOUT_MS = "40";
+		let httpCalls = 0;
+		globalThis.fetch = mock(async () => {
+			httpCalls++;
+			return new Response("unexpected HTTP replay", { status: 500 });
+		});
+
+		const postWriteCategories: string[] = [];
+		let upstreamCancels = 0;
+		const receipt = makeReceipt((category) =>
+			postWriteCategories.push(category),
+		);
+		const encoder = new TextEncoder();
+		const structurallyStarted = new Response(
+			new ReadableStream<Uint8Array>({
+				start(controller) {
+					controller.enqueue(
+						encoder.encode(
+							'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_expired_promotion","model":"gpt-5.4"}}\n\n',
+						),
+					);
+				},
+				cancel() {
+					upstreamCancels++;
+				},
+			}),
+			{
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			},
+		);
+		const websocketAttempt = spyOn(
+			codexWebSocketTransport,
+			"tryRequest",
+		).mockImplementation(async (input) => {
+			// Advance wall time without advancing the still-pending private timer.
+			// Promotion must synchronously abort the same controller at the expired
+			// request-wide boundary, then the normal gate owns one final 504.
+			setSystemTime(Date.now() + 5_000);
+			try {
+				input.onFrameWritten?.(receipt);
+				expect(input.signal.aborted).toBe(true);
+			} finally {
+				setSystemTime();
+			}
+			return { response: structurallyStarted, receipt };
+		});
+
+		const body = makeRequestBody();
+		const request = makeRequest(body);
+		const response = await runProxy(
+			request,
+			body,
+			makePolicy(1_000, {
+				attemptDeadlineMs: 500,
+				isFinalAttempt: false,
+			}),
+			"codex-ws-expired-frame-promotion",
 		);
 
 		expect(websocketAttempt).toHaveBeenCalledTimes(1);
 		expect(httpCalls).toBe(0);
-		expect(postWriteMarks).toBe(1);
+		expect(postWriteCategories).toEqual(["semantic_stall"]);
+		expect(upstreamCancels).toBe(1);
+		expect(receipt.stickyHttp).toBe(true);
+		expect(response?.status).toBe(504);
+		expect(await response?.json()).toMatchObject({
+			error: { code: "codex_websocket_semantic_stall" },
+		});
+	});
+
+	it("does not treat a transport-first structural output item as semantic progress", async () => {
+		installUsageCollector();
+		process.env.CCFLARE_ANTHROPIC_PRECOMMIT_TIMEOUT_MS = "40";
+		let httpCalls = 0;
+		globalThis.fetch = mock(async () => {
+			httpCalls++;
+			return new Response("unexpected HTTP replay", { status: 500 });
+		});
+
+		const postWriteCategories: string[] = [];
+		let upstreamCancels = 0;
+		const receipt = makeReceipt((category) =>
+			postWriteCategories.push(category),
+		);
+		const encoder = new TextEncoder();
+		const structurallyStarted = new Response(
+			new ReadableStream<Uint8Array>({
+				start(controller) {
+					controller.enqueue(
+						encoder.encode(
+							[
+								'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_structural_item","model":"gpt-5.4"}}\n\n',
+								'event: response.output_item.added\ndata: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_structural","type":"message","role":"assistant","content":[]}}\n\n',
+							].join(""),
+						),
+					);
+				},
+				cancel() {
+					upstreamCancels++;
+				},
+			}),
+			{
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			},
+		);
+		const websocketAttempt = spyOn(
+			codexWebSocketTransport,
+			"tryRequest",
+		).mockImplementation(async (input) => {
+			input.onFrameWritten?.(receipt);
+			return { response: structurallyStarted, receipt };
+		});
+
+		const body = makeRequestBody();
+		const request = makeRequest(body);
+		const startedAt = Date.now();
+		const response = await runProxy(
+			request,
+			body,
+			makePolicy(180, { attemptDeadlineMs: 90, isFinalAttempt: false }),
+			"codex-ws-structural-output-item",
+		);
+		const elapsedMs = Date.now() - startedAt;
+
+		expect(websocketAttempt).toHaveBeenCalledTimes(1);
+		expect(httpCalls).toBe(0);
+		expect(postWriteCategories).toEqual(["semantic_stall"]);
+		expect(upstreamCancels).toBe(1);
+		expect(elapsedMs).toBeGreaterThanOrEqual(140);
 		expect(receipt.stickyHttp).toBe(true);
 		expect(response?.status).toBe(504);
 		expect(await response?.json()).toMatchObject({

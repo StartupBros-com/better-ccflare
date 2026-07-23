@@ -1190,7 +1190,7 @@ interface AnthropicAttemptCommitmentTiming {
  * semantic gate share the same absolute boundary.
  */
 class AnthropicPreCommitAttemptScope {
-	readonly deadlineError: AnthropicPreCommitAttemptDeadlineError;
+	deadlineError: AnthropicPreCommitAttemptDeadlineError;
 	readonly signal: AbortSignal;
 	readonly abortPromise: Promise<never>;
 	private readonly deadlineController = new AbortController();
@@ -1199,7 +1199,7 @@ class AnthropicPreCommitAttemptScope {
 
 	constructor(
 		private readonly routingSignal: AbortSignal,
-		readonly timing: AnthropicAttemptCommitmentTiming,
+		public timing: AnthropicAttemptCommitmentTiming,
 	) {
 		this.deadlineError = new AnthropicPreCommitAttemptDeadlineError(
 			timing.deadlineAt,
@@ -1246,6 +1246,38 @@ class AnthropicPreCommitAttemptScope {
 	isPrivateDeadline(): boolean {
 		return (
 			!this.routingSignal.aborted && this.deadlineController.signal.aborted
+		);
+	}
+
+	/** Promote an irreversible transport write onto the request-wide boundary. */
+	promoteDeadlineTo(deadlineAt: number): void {
+		if (!Number.isSafeInteger(deadlineAt) || deadlineAt <= 0) {
+			throw new RangeError("deadlineAt must be a positive safe integer");
+		}
+		if (this.deadlineController.signal.aborted) return;
+		if (deadlineAt <= this.timing.deadlineAt) return;
+
+		if (this.deadlineTimer !== undefined) {
+			clearTimeout(this.deadlineTimer);
+			this.deadlineTimer = undefined;
+		}
+		this.timing = {
+			deadlineAt,
+			startedAt: this.timing.startedAt,
+			budgetMs: Math.max(0, deadlineAt - this.timing.startedAt),
+		};
+		this.deadlineError = new AnthropicPreCommitAttemptDeadlineError(
+			this.timing.deadlineAt,
+			this.timing.budgetMs,
+		);
+		const remainingMs = deadlineAt - Date.now();
+		if (remainingMs <= 0) {
+			this.deadlineController.abort(this.deadlineError);
+			return;
+		}
+		this.deadlineTimer = setTimeout(
+			() => this.deadlineController.abort(this.deadlineError),
+			remainingMs,
 		);
 	}
 
@@ -1934,6 +1966,14 @@ export async function proxyWithAccount(
 					signal,
 					onFrameWritten: (receipt) => {
 						currentCodexWebSocketReceipt = receipt;
+						// response.create is now irreversible, so neither the non-final
+						// fallback reserve nor the cache-lane retry reserve can be used.
+						// Promote the existing composite signal to the request-wide deadline.
+						if (preCommitRescue) {
+							activeAttemptCommitment?.promoteDeadlineTo(
+								preCommitRescue.commitmentDeadlineAt,
+							);
+						}
 					},
 				});
 				if (!websocketAttempt) return null;
@@ -3761,17 +3801,23 @@ export async function proxyWithAccount(
 							0,
 							attemptCommitmentDeadlineAt - attemptCommitmentStartedAt,
 						);
+			const websocketReceipt = getCurrentCodexWebSocketReceipt();
+			const hasIrreversibleCodexWebSocketWrite =
+				preCommitRescue !== undefined &&
+				websocketReceipt?.frameWritten === true;
 			// Split only this already-allocated candidate slice. The request-wide
 			// deadline and any global fallback reserve remain unchanged, while the
 			// first cache lane cannot consume the retry's bounded share.
 			const cacheLaneRescueReserveMs =
+				!hasIrreversibleCodexWebSocketWrite &&
 				officialCodexCacheLaneRescueEligible &&
 				!codexPrecommitRetryAttempted &&
 				attemptCommitmentDeadlineAt !== undefined
 					? getCodexCacheLaneRescueReserveMs(attemptCommitmentBudgetMs)
 					: 0;
-			const semanticCommitmentDeadlineAt =
-				attemptCommitmentDeadlineAt === undefined
+			const semanticCommitmentDeadlineAt = hasIrreversibleCodexWebSocketWrite
+				? preCommitRescue.commitmentDeadlineAt
+				: attemptCommitmentDeadlineAt === undefined
 					? undefined
 					: attemptCommitmentDeadlineAt - cacheLaneRescueReserveMs;
 			try {
@@ -3779,6 +3825,7 @@ export async function proxyWithAccount(
 					downstreamAnthropicResponseBody,
 					{
 						semanticTimeoutMs: streamConfig.semanticTimeoutMs,
+						disableProtocolIdleTimeout: hasIrreversibleCodexWebSocketWrite,
 						meaningfulProgressTimeoutMs:
 							streamConfig.meaningfulProgressTimeoutMs,
 						commitmentDeadlineAt: semanticCommitmentDeadlineAt,

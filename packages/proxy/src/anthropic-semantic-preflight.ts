@@ -310,6 +310,11 @@ export class AnthropicPreCommitAbortedError extends Error {
 export interface AnthropicSemanticPreflightOptions {
 	/** Maximum idle time between valid complete protocol events before content. */
 	semanticTimeoutMs?: number;
+	/**
+	 * Skip the rolling protocol-idle boundary after an irreversible transport
+	 * write. The absolute commitment deadline remains mandatory and finite.
+	 */
+	disableProtocolIdleTimeout?: boolean;
 	/** Per-call progress cap for standalone gates without a shared deadline. */
 	meaningfulProgressTimeoutMs?: number;
 	/** Absolute request-wide commitment boundary shared across serial routes. */
@@ -483,7 +488,11 @@ export async function gateAnthropicSsePreCommit(
 	});
 	const bufferedChunks: Uint8Array[] = [];
 	const startedAt = Date.now();
-	let protocolIdleDeadline = startedAt + semanticTimeoutMs;
+	const protocolIdleTimeoutEnabled =
+		options.disableProtocolIdleTimeout !== true;
+	let protocolIdleDeadline = protocolIdleTimeoutEnabled
+		? startedAt + semanticTimeoutMs
+		: Number.POSITIVE_INFINITY;
 	const meaningfulProgressDeadline =
 		meaningfulProgressDeadlineAt ??
 		startedAt +
@@ -584,7 +593,7 @@ export async function gateAnthropicSsePreCommit(
 				validProtocolFramesSeen + 1,
 			);
 			lastValidProtocolActivityAt = Date.now();
-			if (terminalDeadline === undefined) {
+			if (terminalDeadline === undefined && protocolIdleTimeoutEnabled) {
 				protocolIdleDeadline = lastValidProtocolActivityAt + semanticTimeoutMs;
 			}
 		}
