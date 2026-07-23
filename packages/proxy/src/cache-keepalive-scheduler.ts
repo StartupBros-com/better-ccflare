@@ -247,7 +247,8 @@ export class CacheKeepaliveScheduler {
 			return;
 		}
 
-		const eligible: string[] = [];
+		const eligible: Array<{ accountId: string; cached: CachedRequestEntry }> =
+			[];
 		for (const accountId of accounts) {
 			const cached = cacheBodyStore.getLastCachedRequest(accountId);
 			if (!cached) continue;
@@ -263,7 +264,7 @@ export class CacheKeepaliveScheduler {
 				);
 				continue;
 			}
-			eligible.push(accountId);
+			eligible.push({ accountId, cached });
 		}
 
 		if (eligible.length === 0) {
@@ -276,14 +277,10 @@ export class CacheKeepaliveScheduler {
 		log.info(`Sending cache keepalive to ${eligible.length} account(s)`);
 
 		await Promise.allSettled(
-			eligible.map((accountId) => this.replayRequest(accountId)),
+			eligible.map(({ accountId, cached }) =>
+				this.replayCachedEntry(accountId, cached),
+			),
 		);
-	}
-
-	private async replayRequest(accountId: string): Promise<void> {
-		const cached = cacheBodyStore.getLastCachedRequest(accountId);
-		if (!cached) return;
-		await this.replayCachedEntry(accountId, cached);
 	}
 
 	private async replayCachedEntry(
