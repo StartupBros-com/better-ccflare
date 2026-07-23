@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { AnthropicPreCommitStallError } from "../anthropic-semantic-preflight";
+import { createAnthropicSseFrameKindCounts } from "../anthropic-sse-frame-classifier";
 import {
 	CODEX_RESPONSES_WEBSOCKET_URL,
 	CODEX_WS_ACCOUNT_IDS_ENV,
@@ -155,6 +157,23 @@ function enableCanary(overrides: Record<string, string> = {}): void {
 
 function testConversationIdentity(key: string): string {
 	return createHash("sha256").update(key).digest("hex");
+}
+
+function preCommitStallError(
+	overrides: Partial<
+		ConstructorParameters<typeof AnthropicPreCommitStallError>[0]
+	> = {},
+): AnthropicPreCommitStallError {
+	return new AnthropicPreCommitStallError({
+		reason: "semantic_timeout",
+		bufferedBytes: 128,
+		framesSeen: 1,
+		validProtocolFramesSeen: 1,
+		frameKindCounts: createAnthropicSseFrameKindCounts(),
+		lastValidProtocolActivityAgeMs: 120_000,
+		terminalEvidenceSeen: false,
+		...overrides,
+	});
 }
 
 function request(
@@ -1062,11 +1081,172 @@ describe("CodexWebSocketTransport replay boundary", () => {
 		);
 	});
 
-	test("defers retirement when a completed turn is cancelled during a reused turn", async () => {
+	test("retires a midstream downstream cancellation without replay or sticky HTTP", async () => {
+		enableCanary();
+		const h = harness({
+			configureSocket(socket, index) {
+				socket.onSend = (ws) =>
+					queueMicrotask(() => {
+						ws.emitJson({
+							type: "response.created",
+							response: { id: index === 0 ? "cancelled" : "fresh" },
+						});
+						if (index === 1) {
+							ws.emitJson({
+								type: "response.completed",
+								response: { id: "fresh" },
+							});
+						}
+					});
+			},
+		});
+		const cancelled = await attempt(h.transport, request(), {
+			requestId: "request-cancelled",
+			attemptId: "attempt-cancelled",
+		});
+		expect(cancelled?.response.status).toBe(200);
+		expect(h.sockets[0].sent).toHaveLength(1);
+
+		await cancelled?.response.body?.cancel();
+
+		expect(cancelled?.receipt.stickyHttp).toBe(false);
+		expect(h.sockets[0].sent).toHaveLength(1);
+		expect(h.sockets[0].closes).toHaveLength(1);
+		expect(h.transport.getStats()).toMatchObject({
+			poolSize: 0,
+			stickyHttpSize: 0,
+			counters: { postWriteFailures: 0 },
+		});
+		expect(h.observations).toContainEqual(
+			expect.objectContaining({
+				requestId: "request-cancelled",
+				attemptId: "attempt-cancelled",
+				closeCategory: null,
+				fallbackReason: "downstream_cancelled",
+				fallbackAllowedBeforeWrite: false,
+				stickyHttp: false,
+			}),
+		);
+
+		const fresh = await attempt(h.transport, request(), {
+			requestId: "request-fresh",
+			attemptId: "attempt-fresh",
+		});
+		expect(fresh?.response.status).toBe(200);
+		expect(fresh?.receipt.reused).toBe(false);
+		expect(h.sockets).toHaveLength(2);
+		await fresh?.response.text();
+	});
+
+	test("preserves semantic-stall cancellation attribution and quarantine", async () => {
+		enableCanary();
+		const h = harness({
+			configureSocket(socket) {
+				socket.onSend = (ws) =>
+					queueMicrotask(() =>
+						ws.emitJson({
+							type: "response.created",
+							response: { id: "semantic-stall" },
+						}),
+					);
+			},
+		});
+		const stalled = await attempt(h.transport, request(), {
+			requestId: "request-semantic-stall",
+			attemptId: "attempt-semantic-stall",
+		});
+		const reason = preCommitStallError();
+
+		await stalled?.response.body?.cancel(reason);
+
+		expect(stalled?.receipt.stickyHttp).toBe(true);
+		expect(h.sockets[0].sent).toHaveLength(1);
+		expect(h.sockets[0].closes).toHaveLength(1);
+		expect(h.transport.getStats()).toMatchObject({
+			poolSize: 0,
+			stickyHttpSize: 1,
+			counters: { postWriteFailures: 1 },
+		});
+		expect(
+			h.observations.filter(
+				(observation) => observation.attemptId === "attempt-semantic-stall",
+			),
+		).toEqual([
+			expect.objectContaining({
+				closeCategory: "semantic_stall",
+				fallbackReason: "semantic_stall",
+				stickyHttp: true,
+			}),
+		]);
+		expect(await attempt(h.transport)).toBeNull();
+		expect(h.sockets).toHaveLength(1);
+	});
+
+	test("classifies non-semantic precommit cancellation as a post-write error", async () => {
+		enableCanary();
+		const cases = [
+			preCommitStallError({ reason: "context_length_exceeded" }),
+			preCommitStallError({
+				reason: "semantic_timeout",
+				errorType: "api_error",
+			}),
+		];
+		for (const [index, reason] of cases.entries()) {
+			const h = harness({
+				configureSocket(socket) {
+					socket.onSend = (ws) =>
+						queueMicrotask(() =>
+							ws.emitJson({
+								type: "response.created",
+								response: { id: `non-semantic-${index}` },
+							}),
+						);
+				},
+			});
+			const result = await attempt(h.transport, request(), {
+				requestId: `request-non-semantic-${index}`,
+				attemptId: `attempt-non-semantic-${index}`,
+			});
+
+			await result?.response.body?.cancel(reason);
+
+			expect(result?.receipt.stickyHttp).toBe(true);
+			expect(h.sockets[0].sent).toHaveLength(1);
+			expect(h.sockets[0].closes).toHaveLength(1);
+			expect(h.transport.getStats()).toMatchObject({
+				poolSize: 0,
+				stickyHttpSize: 1,
+				counters: { postWriteFailures: 1 },
+			});
+			expect(h.observations).toContainEqual(
+				expect.objectContaining({
+					attemptId: `attempt-non-semantic-${index}`,
+					closeCategory: "post_write_error",
+					fallbackReason: "post_write_error",
+					stickyHttp: true,
+				}),
+			);
+		}
+	});
+
+	test("ignores completed-body cancellation during a reused turn", async () => {
 		enableCanary();
 		const h = harness({
 			configureSocket(socket) {
 				socket.onSend = (ws) => {
+					if (ws.sent.length === 3) {
+						queueMicrotask(() => {
+							ws.emitJson({
+								type: "response.created",
+								response: { id: "turn-c" },
+							});
+							ws.emitJson({
+								type: "response.completed",
+								response: { id: "turn-c" },
+							});
+						});
+						return;
+					}
 					if (ws.sent.length !== 1) return;
 					queueMicrotask(() => {
 						ws.emitJson({
@@ -1128,8 +1308,8 @@ describe("CodexWebSocketTransport replay boundary", () => {
 		const second = await secondPromise;
 		expect(second?.response.status).toBe(200);
 		await second?.response.text();
-		expect(h.sockets[0].closes).toHaveLength(1);
-		expect(h.transport.getStats().poolSize).toBe(0);
+		expect(h.sockets[0].closes).toHaveLength(0);
+		expect(h.transport.getStats().poolSize).toBe(1);
 		expect(
 			h.observations.filter(
 				(observation) => observation.attemptId === "attempt-turn-a",
@@ -1140,13 +1320,18 @@ describe("CodexWebSocketTransport replay boundary", () => {
 				(observation) => observation.attemptId === "attempt-turn-b",
 			),
 		).toHaveLength(1);
-		expect(
-			await attempt(h.transport, request(), {
-				requestId: "request-turn-c",
-				attemptId: "attempt-turn-c",
-			}),
-		).toBeNull();
+		expect(h.transport.getStats()).toMatchObject({
+			stickyHttpSize: 0,
+			counters: { postWriteFailures: 0 },
+		});
+		const third = await attempt(h.transport, request(), {
+			requestId: "request-turn-c",
+			attemptId: "attempt-turn-c",
+		});
+		expect(third?.response.status).toBe(200);
+		expect(third?.receipt.reused).toBe(true);
 		expect(h.sockets).toHaveLength(1);
+		await third?.response.text();
 	});
 
 	test("records at most one terminal observation per transport attempt", async () => {
@@ -1186,6 +1371,68 @@ describe("CodexWebSocketTransport replay boundary", () => {
 		expect(result?.receipt.stickyHttp).toBe(true);
 		expect(await attempt(h.transport)).toBeNull();
 		expect(h.sockets).toHaveLength(1);
+	});
+
+	test("expires genuine failure quarantine without sliding on sticky bypass", async () => {
+		enableCanary();
+		let now = 1_000;
+		const h = harness({
+			now: () => now,
+			configureSocket(socket, index) {
+				socket.onSend = (ws) =>
+					queueMicrotask(() => {
+						if (index === 0) {
+							ws.emitClose(1011, "boom");
+							return;
+						}
+						ws.emitJson({
+							type: "response.created",
+							response: { id: "after-cooldown" },
+						});
+						ws.emitJson({
+							type: "response.completed",
+							response: { id: "after-cooldown" },
+						});
+					});
+			},
+		});
+		const failed = await attempt(h.transport);
+		expect(failed?.response.status).toBe(502);
+		expect(failed?.receipt.stickyHttp).toBe(true);
+
+		now += 4 * 60 * 1_000;
+		expect(await attempt(h.transport)).toBeNull();
+		expect(h.sockets).toHaveLength(1);
+
+		// The bypass above must not extend the original five-minute quarantine.
+		now += 60 * 1_000;
+		const recovered = await attempt(h.transport);
+		expect(recovered?.response.status).toBe(200);
+		expect(recovered?.receipt.reused).toBe(false);
+		expect(h.sockets).toHaveLength(2);
+		expect(h.transport.getStats()).toMatchObject({
+			stickyHttpSize: 0,
+			counters: { postWriteFailures: 1, stickyHttpBypass: 1 },
+		});
+		await recovered?.response.text();
+	});
+
+	test("prunes expired sticky entries before enforcing the capacity bound", () => {
+		let now = 1_000;
+		const h = harness({ now: () => now });
+		const internals = h.transport as unknown as {
+			stickyHttp: Map<string, number>;
+			markSticky(key: string): void;
+		};
+		for (let index = 0; index < 2_048; index++) {
+			internals.markSticky(`expired-${index}`);
+		}
+		expect(internals.stickyHttp.size).toBe(2_048);
+
+		now += 5 * 60 * 1_000;
+		internals.markSticky("fresh");
+
+		expect([...internals.stickyHttp.keys()]).toEqual(["fresh"]);
 	});
 
 	test("abort closes the socket, preserves the signal reason, and never replays", async () => {

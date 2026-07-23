@@ -977,6 +977,7 @@ const WS_OBSERVATION_ACTIONS = new Set([
 	"cohort_not_allowlisted",
 	"connection_busy",
 	"connection_opening",
+	"downstream_cancelled",
 	"global_cap",
 	"handshake_close",
 	"handshake_error",
@@ -1802,7 +1803,12 @@ function webSocketRowAccumulator(
 
 function webSocketFallbackCategory(
 	observation: ParsedCodexWebSocketObservation,
-): "control" | "pre_write" | "post_write" | "none" | "other" {
+): "control" | "downstream" | "pre_write" | "post_write" | "none" | "other" {
+	if (
+		observation.action === "downstream_cancelled" &&
+		!observation.hasCloseCategory
+	)
+		return "downstream";
 	if (!observation.hasFallback && !observation.hasCloseCategory) return "none";
 	if (observation.assignment === "control") return "control";
 	if (observation.effectiveTransport === "http" && !observation.frameWritten)
@@ -1994,11 +2000,18 @@ function analyzeWebSocketCacheExperiments(
 		joinedObservations++;
 		row.joinedTraceResponses++;
 		row.outcomes.terminalResponses++;
+		const downstreamCancellation =
+			observation.action === "downstream_cancelled" &&
+			!observation.hasCloseCategory;
 		const postWriteFailure =
+			!downstreamCancellation &&
 			observation.effectiveTransport === "websocket" &&
 			observation.frameWritten &&
 			(observation.hasFallback || observation.hasCloseCategory);
-		if (response.stop_reason === "error" || postWriteFailure)
+		if (
+			!downstreamCancellation &&
+			(response.stop_reason === "error" || postWriteFailure)
+		)
 			row.outcomes.terminalErrors++;
 		if (
 			observation.assignment === "treatment" &&

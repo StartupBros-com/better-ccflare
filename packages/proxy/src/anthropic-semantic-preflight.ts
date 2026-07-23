@@ -241,6 +241,25 @@ export class AnthropicPreCommitStallError extends Error {
 	}
 }
 
+export type AnthropicPreCommitWebSocketFailureCategory =
+	| "semantic_stall"
+	| "post_write_error";
+
+/**
+ * Preserve the post-write WebSocket classification used by both stream
+ * cancellation and the outer proxy retry boundary.
+ */
+export function classifyAnthropicPreCommitWebSocketFailure(
+	error: unknown,
+): AnthropicPreCommitWebSocketFailureCategory | null {
+	if (!(error instanceof AnthropicPreCommitStallError)) return null;
+	return error.errorType === undefined &&
+		(error.reason === "semantic_timeout" ||
+			error.reason === "meaningful_progress_timeout")
+		? "semantic_stall"
+		: "post_write_error";
+}
+
 /** A safely retryable HTTP-200 Anthropic SSE error before any bytes escaped. */
 export class AnthropicPreCommitTransientError extends AnthropicPreCommitStallError {
 	declare readonly errorType: AnthropicTransientSseErrorType;
