@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1067,6 +1067,67 @@ describe("CodexProvider.parseRateLimit", () => {
 });
 
 describe("CodexProvider.processResponse", () => {
+	it("throttles response.in_progress pings, reopens after one second, and resets per stream", async () => {
+		const provider = new CodexProvider();
+		const nowValues = [10_000, 10_999, 11_000, 11_100];
+		const nowSpy = spyOn(Date, "now").mockImplementation(
+			() => nowValues.shift() ?? 11_100,
+		);
+		const makeProgressResponse = (id: string, progressCount: number) =>
+			new Response(
+				sseBody([
+					...eventLine("response.created", {
+						type: "response.created",
+						response: { id, model: "gpt-5.4" },
+					}),
+					...Array.from({ length: progressCount }, () =>
+						eventLine("response.in_progress", {
+							type: "response.in_progress",
+							response: { id, model: "gpt-5.4" },
+						}),
+					).flat(),
+					...eventLine("response.completed", {
+						type: "response.completed",
+						response: {
+							id,
+							model: "gpt-5.4",
+							usage: { input_tokens: 1, output_tokens: 0 },
+						},
+					}),
+				]),
+				{
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				},
+			);
+
+		try {
+			const first = await provider.processResponse(
+				makeProgressResponse("resp_progress_1", 3),
+				null,
+			);
+			const firstBody = await first.text();
+			const second = await provider.processResponse(
+				makeProgressResponse("resp_progress_2", 1),
+				null,
+			);
+			const secondBody = await second.text();
+
+			expect(firstBody.match(/event: ping\n/g) ?? []).toHaveLength(2);
+			expect(secondBody.match(/event: ping\n/g) ?? []).toHaveLength(1);
+			expect(firstBody).toContain('event: ping\ndata: {"type":"ping"}\n\n');
+			expect(firstBody).not.toContain("event: response.in_progress");
+			expect(secondBody).not.toContain("event: response.in_progress");
+			expect(
+				codexEventCommitsOutput("response.in_progress", {
+					type: "response.in_progress",
+				}),
+			).toBeFalse();
+		} finally {
+			nowSpy.mockRestore();
+		}
+	});
+
 	it("buffers tool-call arguments and emits them once before content_block_stop", async () => {
 		const provider = new CodexProvider();
 		const upstreamBody = sseBody([
