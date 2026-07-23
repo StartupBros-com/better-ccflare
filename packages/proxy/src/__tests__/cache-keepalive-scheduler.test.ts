@@ -152,6 +152,10 @@ function seedCacheEntry(
 		inputTokensPresent: true,
 	});
 	// Age past the freshness window so sendKeepalives actually replays.
+	// 3min is chosen to sit inside the replay window [ttl/2, ttl*3] for every
+	// TTL used in this file (2..5 → [1min,6min]..[2.5min,15min]). A test using
+	// a TTL <= 4 with this helper stays valid; TTL <= 1 (eviction at 3min) or a
+	// much larger TTL (freshness > 3min) would need a matched age.
 	cacheBodyStore.ageLastCachedRequest(accountId, 3 * 60_000);
 }
 
@@ -820,6 +824,55 @@ describe("xAI-only keepalive canary", () => {
 
 		await capturedCallback?.();
 		expect(fetchMock).toHaveBeenCalledTimes(1);
+		scheduler.stop();
+	});
+
+	it("does not stage anthropic bodies at all when only the xAI TTL is set", () => {
+		const { config } = makeConfig(0, 2);
+		const scheduler = new CacheKeepaliveScheduler(makeProxyContext(), config);
+		scheduler.start();
+
+		// Anthropic request under an xAI-only canary: resolved TTL is 0, so it
+		// must never buffer a body (no memory/CPU overhead on prod traffic).
+		seedCacheEntry("acc-anthropic");
+		expect(cacheBodyStore.getLastCachedRequest("acc-anthropic")).toBeNull();
+		expect(cacheBodyStore.getAllCachedAccounts()).not.toContain(
+			"acc-anthropic",
+		);
+
+		// xAI entry under the same config is still staged.
+		seedCacheEntry(
+			"acc-xai",
+			"/v1/messages",
+			'{"model":"grok-4.5","messages":[{"role":"user","content":"hi"}]}',
+			"grok-4.5",
+			new Headers({ "content-type": "application/json" }),
+			"xai",
+		);
+		expect(cacheBodyStore.getLastCachedRequest("acc-xai")).not.toBeNull();
+
+		scheduler.stop();
+	});
+
+	it("stages all providers when the global TTL is set (legacy parity)", () => {
+		const { config } = makeConfig(5, 0);
+		const scheduler = new CacheKeepaliveScheduler(makeProxyContext(), config);
+		scheduler.start();
+
+		// Global keepalive keeps every provider warm, including xAI (falls back
+		// to the global TTL). This preserves pre-canary behavior.
+		seedCacheEntry("acc-anthropic");
+		seedCacheEntry(
+			"acc-xai",
+			"/v1/messages",
+			'{"model":"grok-4.5","messages":[{"role":"user","content":"hi"}]}',
+			"grok-4.5",
+			new Headers({ "content-type": "application/json" }),
+			"xai",
+		);
+		expect(cacheBodyStore.getLastCachedRequest("acc-anthropic")).not.toBeNull();
+		expect(cacheBodyStore.getLastCachedRequest("acc-xai")).not.toBeNull();
+
 		scheduler.stop();
 	});
 });

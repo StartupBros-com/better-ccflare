@@ -136,11 +136,28 @@ export class CacheKeepaliveScheduler {
 		return globalTtl > 0 || xaiTtl > 0;
 	}
 
+	/**
+	 * Sync the store's enabled flag AND its per-provider staging filter so a
+	 * provider whose resolved TTL is 0 (e.g. Anthropic while only the xAI
+	 * canary TTL is set) never buffers request bodies. When both TTLs are 0 the
+	 * store is disabled and the filter is cleared by setEnabled(false).
+	 */
+	private applyStoreGating(globalTtl: number, xaiTtl: number): void {
+		const enabled = this.anyTtlEnabled(globalTtl, xaiTtl);
+		cacheBodyStore.setEnabled(enabled);
+		if (enabled) {
+			cacheBodyStore.setStagingEligibility(
+				(providerName) =>
+					resolveKeepaliveTtlMinutes(providerName, globalTtl, xaiTtl) > 0,
+			);
+		}
+	}
+
 	start(): void {
 		const { globalTtl, xaiTtl } = this.readTtls();
 		this.currentGlobalTtlMinutes = globalTtl;
 		this.currentXaiTtlMinutes = xaiTtl;
-		cacheBodyStore.setEnabled(this.anyTtlEnabled(globalTtl, xaiTtl));
+		this.applyStoreGating(globalTtl, xaiTtl);
 
 		// Adjust dynamically when TTL config changes
 		this.boundConfigChangeHandler = ({
@@ -174,9 +191,7 @@ export class CacheKeepaliveScheduler {
 			) {
 				this.currentGlobalTtlMinutes = appliedGlobal;
 				this.currentXaiTtlMinutes = appliedXai;
-				cacheBodyStore.setEnabled(
-					this.anyTtlEnabled(appliedGlobal, appliedXai),
-				);
+				this.applyStoreGating(appliedGlobal, appliedXai);
 				this.restart();
 			}
 		};
