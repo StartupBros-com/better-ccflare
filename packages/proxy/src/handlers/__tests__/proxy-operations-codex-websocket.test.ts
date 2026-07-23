@@ -301,11 +301,14 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 	let originalFetch: typeof globalThis.fetch;
 	let originalPromptCacheKey: string | undefined;
 	let originalCacheKeyMode: string | undefined;
+	let originalAnthropicPrecommitTimeout: string | undefined;
 
 	beforeEach(() => {
 		originalFetch = globalThis.fetch;
 		originalPromptCacheKey = process.env.CCFLARE_CODEX_PROMPT_CACHE_KEY;
 		originalCacheKeyMode = process.env.CCFLARE_CODEX_CACHE_KEY_MODE;
+		originalAnthropicPrecommitTimeout =
+			process.env.CCFLARE_ANTHROPIC_PRECOMMIT_TIMEOUT_MS;
 		process.env.CCFLARE_CODEX_PROMPT_CACHE_KEY = "1";
 	});
 
@@ -320,6 +323,12 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 			delete process.env.CCFLARE_CODEX_CACHE_KEY_MODE;
 		} else {
 			process.env.CCFLARE_CODEX_CACHE_KEY_MODE = originalCacheKeyMode;
+		}
+		if (originalAnthropicPrecommitTimeout === undefined) {
+			delete process.env.CCFLARE_ANTHROPIC_PRECOMMIT_TIMEOUT_MS;
+		} else {
+			process.env.CCFLARE_ANTHROPIC_PRECOMMIT_TIMEOUT_MS =
+				originalAnthropicPrecommitTimeout;
 		}
 		mock.restore();
 	});
@@ -533,6 +542,168 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 		expect(httpCalls).toBe(0);
 		expect(postWriteMarks).toBe(1);
 		expect(receipt.stickyHttp).toBe(true);
+		expect(response?.status).toBe(504);
+		expect(await response?.json()).toMatchObject({
+			error: { code: "codex_websocket_semantic_stall" },
+		});
+	});
+
+	it("keeps a progressing WebSocket response alive across the protocol-idle window without HTTP replay", async () => {
+		installUsageCollector();
+		process.env.CCFLARE_ANTHROPIC_PRECOMMIT_TIMEOUT_MS = "200";
+		let httpCalls = 0;
+		globalThis.fetch = mock(async () => {
+			httpCalls++;
+			return new Response("unexpected HTTP replay", { status: 500 });
+		});
+
+		let postWriteMarks = 0;
+		const receipt = makeReceipt(() => postWriteMarks++);
+		const websocketAttempt = spyOn(
+			codexWebSocketTransport,
+			"tryRequest",
+		).mockImplementation(async (input) => {
+			input.onFrameWritten?.(receipt);
+			const encoder = new TextEncoder();
+			let progressTimer: ReturnType<typeof setTimeout> | undefined;
+			let successTimer: ReturnType<typeof setTimeout> | undefined;
+			const stopTimers = () => {
+				if (progressTimer !== undefined) clearTimeout(progressTimer);
+				if (successTimer !== undefined) clearTimeout(successTimer);
+			};
+			const progressing = new Response(
+				new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.enqueue(
+							encoder.encode(
+								'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_progress","model":"gpt-5.4"}}\n\n',
+							),
+						);
+						progressTimer = setTimeout(() => {
+							controller.enqueue(
+								encoder.encode(
+									'event: response.in_progress\ndata: {"type":"response.in_progress","response":{"id":"resp_progress","model":"gpt-5.4"}}\n\n',
+								),
+							);
+						}, 140);
+						successTimer = setTimeout(() => {
+							stopTimers();
+							controller.enqueue(
+								encoder.encode(
+									[
+										'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"still alive"}\n\n',
+										'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_progress","model":"gpt-5.4","status":"completed","usage":{"input_tokens":10,"output_tokens":2}}}\n\n',
+										"data: [DONE]\n\n",
+									].join(""),
+								),
+							);
+							controller.close();
+						}, 280);
+					},
+					cancel() {
+						stopTimers();
+					},
+				}),
+				{
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				},
+			);
+			return { response: progressing, receipt };
+		});
+
+		const body = makeRequestBody();
+		const request = makeRequest(body);
+		const response = await runProxy(
+			request,
+			body,
+			makePolicy(500),
+			"codex-ws-progress-liveness",
+		);
+		const responseBody = await response?.text();
+
+		expect(websocketAttempt).toHaveBeenCalledTimes(1);
+		expect(httpCalls).toBe(0);
+		expect(postWriteMarks).toBe(0);
+		expect(receipt.stickyHttp).toBe(false);
+		expect(response?.status).toBe(200);
+		expect(responseBody).toContain('event: ping\ndata: {"type":"ping"}\n\n');
+		expect(responseBody).not.toContain("event: response.in_progress");
+		expect(responseBody).toContain('"text":"still alive"');
+	});
+
+	it("keeps progress pings noncommitting at the absolute deadline without HTTP replay", async () => {
+		installUsageCollector();
+		process.env.CCFLARE_ANTHROPIC_PRECOMMIT_TIMEOUT_MS = "1300";
+		let httpCalls = 0;
+		globalThis.fetch = mock(async () => {
+			httpCalls++;
+			return new Response("unexpected HTTP replay", { status: 500 });
+		});
+
+		let postWriteMarks = 0;
+		let upstreamCancels = 0;
+		let progressEventsSent = 0;
+		const receipt = makeReceipt(() => postWriteMarks++);
+		const websocketAttempt = spyOn(
+			codexWebSocketTransport,
+			"tryRequest",
+		).mockImplementation(async (input) => {
+			input.onFrameWritten?.(receipt);
+			const encoder = new TextEncoder();
+			let progressTimer: ReturnType<typeof setInterval> | undefined;
+			const progressingWithoutContent = new Response(
+				new ReadableStream<Uint8Array>({
+					start(controller) {
+						progressEventsSent++;
+						controller.enqueue(
+							encoder.encode(
+								[
+									'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_progress_deadline","model":"gpt-5.4"}}\n\n',
+									'event: response.in_progress\ndata: {"type":"response.in_progress","response":{"id":"resp_progress_deadline","model":"gpt-5.4"}}\n\n',
+								].join(""),
+							),
+						);
+						progressTimer = setInterval(() => {
+							progressEventsSent++;
+							controller.enqueue(
+								encoder.encode(
+									'event: response.in_progress\ndata: {"type":"response.in_progress","response":{"id":"resp_progress_deadline","model":"gpt-5.4"}}\n\n',
+								),
+							);
+						}, 1_100);
+					},
+					cancel() {
+						if (progressTimer !== undefined) clearInterval(progressTimer);
+						upstreamCancels++;
+					},
+				}),
+				{
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				},
+			);
+			return { response: progressingWithoutContent, receipt };
+		});
+
+		const body = makeRequestBody();
+		const request = makeRequest(body);
+		const startedAt = Date.now();
+		const response = await runProxy(
+			request,
+			body,
+			makePolicy(1_600),
+			"codex-ws-progress-absolute-deadline",
+		);
+		const elapsedMs = Date.now() - startedAt;
+
+		expect(websocketAttempt).toHaveBeenCalledTimes(1);
+		expect(httpCalls).toBe(0);
+		expect(postWriteMarks).toBe(1);
+		expect(receipt.stickyHttp).toBe(true);
+		expect(upstreamCancels).toBe(1);
+		expect(progressEventsSent).toBeGreaterThanOrEqual(2);
+		expect(elapsedMs).toBeGreaterThanOrEqual(1_450);
 		expect(response?.status).toBe(504);
 		expect(await response?.json()).toMatchObject({
 			error: { code: "codex_websocket_semantic_stall" },

@@ -548,6 +548,13 @@ interface ContextWindow {
 	context_window_size: number;
 }
 
+// Bound translated protocol-liveness traffic even if an upstream emits the
+// same nonterminal progress event at delta-like frequency. This stays far
+// inside the independent 120s Anthropic protocol-idle window while ensuring a
+// throttled event can move that window by at most one second less than the
+// latest observed upstream activity.
+const CODEX_PROGRESS_PING_MIN_INTERVAL_MS = 1_000;
+
 interface StreamState {
 	messageId: string;
 	model: string;
@@ -584,6 +591,8 @@ interface StreamState {
 	traceTurnStateHeaderPresent: boolean;
 	traceTurnState: string | null;
 	traceResponseId: string | null;
+	/** Last canonical Anthropic ping translated from allowlisted Codex progress. */
+	lastProgressPingAt: number | null;
 	// One terminal response trace per physical attempt, across every terminal
 	// path (completed, failed, abrupt EOF, read error, downstream cancel).
 	terminalTraceWritten: boolean;
@@ -2339,6 +2348,7 @@ export class CodexProvider extends BaseProvider {
 			traceTurnStateHeaderPresent: response.headers.has("x-codex-turn-state"),
 			traceTurnState: response.headers.get("x-codex-turn-state"),
 			traceResponseId: null,
+			lastProgressPingAt: null,
 			terminalTraceWritten: false,
 		};
 
@@ -2789,6 +2799,26 @@ export class CodexProvider extends BaseProvider {
 		ensureMessageStart: () => Promise<void>,
 	): Promise<void> {
 		switch (eventName) {
+			case "response.in_progress": {
+				// Exact allowlist: this is known, nonterminal Codex protocol activity.
+				// Translate it to a canonical Anthropic keepalive instead of exposing
+				// the raw Responses event or manufacturing semantic content. Pings are
+				// deliberately outside codexEventCommitsOutput(), so the absolute
+				// meaningful-content deadline and no-replay boundary remain unchanged.
+				if (state.hasSentTerminalEvents) break;
+				const now = Date.now();
+				if (
+					state.lastProgressPingAt !== null &&
+					now >= state.lastProgressPingAt &&
+					now - state.lastProgressPingAt < CODEX_PROGRESS_PING_MIN_INTERVAL_MS
+				) {
+					break;
+				}
+				state.lastProgressPingAt = now;
+				await writeSSE("ping", { type: "ping" });
+				break;
+			}
+
 			case "response.created": {
 				const resp = data.response as Record<string, unknown> | undefined;
 				const usage = resp?.usage as
