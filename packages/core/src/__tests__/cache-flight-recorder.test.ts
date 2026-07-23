@@ -261,6 +261,33 @@ describe("diagnoseTimeline", () => {
 		expect(report.gaps).toContain("missing_turns_2_to_2");
 	});
 
+	it("annotates stable-lineage misses with idle gap evidence", () => {
+		const report = diagnoseTimeline(
+			timeline(
+				turn(1, {
+					timestamp: "2026-07-23T02:07:20.000Z",
+					inputTokens: 316_800,
+					cachedTokens: 316_800,
+				}),
+				turn(2, {
+					timestamp: "2026-07-23T02:09:44.000Z",
+					cacheOutcome: "miss",
+					inputTokens: 319_758,
+					cachedTokens: 128,
+				}),
+			),
+		);
+
+		expect(report.cause).toBe("upstream_miss_despite_stable_lineage");
+		expect(report.supportingEvidence).toContainEqual(
+			expect.objectContaining({
+				dimension: "timeline",
+				kind: "observed",
+				detail: "idle_gap_seconds_144",
+			}),
+		);
+	});
+
 	it("diagnoses effective near-miss collapses without token contradiction", () => {
 		const report = diagnoseTimeline(
 			timeline(

@@ -127,6 +127,7 @@ export function applyCacheBodyStagingPolicy(
 				automaticPrefixCache: providerUsesAutomaticPrefixCache(
 					input.providerName,
 				),
+				providerName: input.providerName,
 			},
 		);
 	} else if (action === "discard") {
@@ -180,6 +181,7 @@ export async function stageCacheBodyForTransportAttempt(
 			automaticPrefixCache: providerUsesAutomaticPrefixCache(
 				input.providerName,
 			),
+			providerName: input.providerName,
 		},
 	);
 	return action;

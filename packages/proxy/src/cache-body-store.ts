@@ -78,6 +78,8 @@ export interface CachedRequestEntry {
 	timestamp: number;
 	/** Exact physical model used by the cache-writing transport. */
 	resolvedModel: string | null;
+	/** Provider that wrote this entry (e.g. xai, anthropic). */
+	providerName: string | null;
 }
 
 // Strip sensitive and internal headers before storing.
@@ -153,7 +155,7 @@ class CacheBodyStore {
 		cacheIdentityBody: ArrayBuffer | null = body,
 		cacheIdentityHasCacheControl?: boolean,
 		resolvedModel: string | null = null,
-		options?: { automaticPrefixCache?: boolean },
+		options?: { automaticPrefixCache?: boolean; providerName?: string },
 	): void {
 		if (!this.enabled) return;
 
@@ -201,6 +203,10 @@ class CacheBodyStore {
 				path,
 				timestamp: Date.now(),
 				resolvedModel,
+				providerName:
+					typeof options?.providerName === "string" && options.providerName
+						? options.providerName
+						: null,
 			},
 		});
 
@@ -300,6 +306,20 @@ class CacheBodyStore {
 	 */
 	getLastCachedRequest(accountId: string): CachedRequestEntry | null {
 		return this.lastCachedRequest.get(accountId) ?? null;
+	}
+
+	/**
+	 * Test/ops helper: age a promoted entry so keepalive freshness skip can be
+	 * exercised deterministically without waiting on real clocks.
+	 */
+	ageLastCachedRequest(accountId: string, ageMs: number): void {
+		const entry = this.lastCachedRequest.get(accountId);
+		if (!entry) return;
+		const safeAge = Number.isFinite(ageMs) && ageMs > 0 ? ageMs : 0;
+		this.lastCachedRequest.set(accountId, {
+			...entry,
+			timestamp: Date.now() - safeAge,
+		});
 	}
 
 	/** Returns all accounts that have a recorded cached request. */

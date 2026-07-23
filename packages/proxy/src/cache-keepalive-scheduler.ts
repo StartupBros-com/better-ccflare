@@ -2,7 +2,7 @@ import https from "node:https";
 import type { Config } from "@better-ccflare/config";
 import { registerHeartbeat } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
-import { cacheBodyStore } from "./cache-body-store";
+import { type CachedRequestEntry, cacheBodyStore } from "./cache-body-store";
 import { CACHE_REPLAY_MODEL_HEADER } from "./cache-transport-staging";
 import { stampInternalAutoRefreshAuth } from "./internal-probe-auth";
 import type { ProxyContext } from "./proxy";
@@ -63,11 +63,57 @@ export function sanitizeKeepaliveBody(
 	return bytes.slice().buffer;
 }
 
+/** Effective keepalive TTL for one staged entry given global + xAI knobs. */
+export function resolveKeepaliveTtlMinutes(
+	providerName: string | null | undefined,
+	globalTtlMinutes: number,
+	xaiTtlMinutes: number,
+): number {
+	if (providerName === "xai") {
+		// Prefer the xAI-specific knob when set so Grok can be canaried without
+		// enabling Anthropic keepalives. Fall back to the global TTL when the
+		// operator only configured CACHE_KEEPALIVE_TTL_MINUTES.
+		if (xaiTtlMinutes > 0) return xaiTtlMinutes;
+		return globalTtlMinutes > 0 ? globalTtlMinutes : 0;
+	}
+	return globalTtlMinutes > 0 ? globalTtlMinutes : 0;
+}
+
+/**
+ * Skip synthetic keepalive when real traffic is still fresher than half the
+ * TTL window. Active multi-turn sessions already refresh the prefix; replaying
+ * full contexts against limited Grok quota is pure waste in that window.
+ */
+export function shouldSkipKeepaliveForFreshness(
+	entryTimestamp: number,
+	ttlMinutes: number,
+	nowMs: number = Date.now(),
+): boolean {
+	if (ttlMinutes <= 0) return true;
+	const ageMs = nowMs - entryTimestamp;
+	if (!Number.isFinite(ageMs) || ageMs < 0) return true;
+	const freshnessMs = Math.max(30_000, (ttlMinutes * 60_000) / 2);
+	return ageMs < freshnessMs;
+}
+
+/** Heartbeat interval from the tightest active TTL (seconds). */
+export function keepaliveIntervalSeconds(
+	globalTtlMinutes: number,
+	xaiTtlMinutes: number,
+): number {
+	const active = [globalTtlMinutes, xaiTtlMinutes].filter((ttl) => ttl > 0);
+	if (active.length === 0) return 0;
+	const minTtl = Math.min(...active);
+	// Fire (ttl - 1) minutes before expiry, minimum 60s.
+	return Math.floor(Math.max(60_000, (minTtl - 1) * 60_000) / 1_000);
+}
+
 export class CacheKeepaliveScheduler {
 	private proxyContext: ProxyContext;
 	private config: Config;
 	private unregisterInterval: (() => void) | null = null;
-	private currentTtlMinutes = 0;
+	private currentGlobalTtlMinutes = 0;
+	private currentXaiTtlMinutes = 0;
 	private boundConfigChangeHandler:
 		| ((event: { key: string; newValue: unknown }) => void)
 		| null = null;
@@ -77,9 +123,24 @@ export class CacheKeepaliveScheduler {
 		this.config = config;
 	}
 
+	private readTtls(): { globalTtl: number; xaiTtl: number } {
+		const globalTtl = this.config.getCacheKeepaliveTtlMinutes();
+		const xaiTtl =
+			typeof this.config.getXaiCacheKeepaliveTtlMinutes === "function"
+				? this.config.getXaiCacheKeepaliveTtlMinutes()
+				: 0;
+		return { globalTtl, xaiTtl };
+	}
+
+	private anyTtlEnabled(globalTtl: number, xaiTtl: number): boolean {
+		return globalTtl > 0 || xaiTtl > 0;
+	}
+
 	start(): void {
-		this.currentTtlMinutes = this.config.getCacheKeepaliveTtlMinutes();
-		cacheBodyStore.setEnabled(this.currentTtlMinutes > 0);
+		const { globalTtl, xaiTtl } = this.readTtls();
+		this.currentGlobalTtlMinutes = globalTtl;
+		this.currentXaiTtlMinutes = xaiTtl;
+		cacheBodyStore.setEnabled(this.anyTtlEnabled(globalTtl, xaiTtl));
 
 		// Adjust dynamically when TTL config changes
 		this.boundConfigChangeHandler = ({
@@ -89,13 +150,34 @@ export class CacheKeepaliveScheduler {
 			key: string;
 			newValue: unknown;
 		}) => {
-			if (key === "cache_keepalive_ttl_minutes") {
-				const newTtl = typeof newValue === "number" ? newValue : 0;
-				if (newTtl !== this.currentTtlMinutes) {
-					this.currentTtlMinutes = newTtl;
-					cacheBodyStore.setEnabled(newTtl > 0);
-					this.restart();
-				}
+			if (
+				key !== "cache_keepalive_ttl_minutes" &&
+				key !== "xai_cache_keepalive_ttl_minutes"
+			) {
+				return;
+			}
+			const { globalTtl: nextGlobal, xaiTtl: nextXai } = this.readTtls();
+			// Prefer event payload when present so tests can drive TTL without a
+			// full Config implementation.
+			const appliedGlobal =
+				key === "cache_keepalive_ttl_minutes" && typeof newValue === "number"
+					? newValue
+					: nextGlobal;
+			const appliedXai =
+				key === "xai_cache_keepalive_ttl_minutes" &&
+				typeof newValue === "number"
+					? newValue
+					: nextXai;
+			if (
+				appliedGlobal !== this.currentGlobalTtlMinutes ||
+				appliedXai !== this.currentXaiTtlMinutes
+			) {
+				this.currentGlobalTtlMinutes = appliedGlobal;
+				this.currentXaiTtlMinutes = appliedXai;
+				cacheBodyStore.setEnabled(
+					this.anyTtlEnabled(appliedGlobal, appliedXai),
+				);
+				this.restart();
 			}
 		};
 		this.config.on("change", this.boundConfigChangeHandler);
@@ -124,32 +206,37 @@ export class CacheKeepaliveScheduler {
 	}
 
 	private startInterval(): void {
-		if (this.currentTtlMinutes <= 0) {
-			log.info("Cache keepalive disabled (ttl = 0)");
+		const intervalSeconds = keepaliveIntervalSeconds(
+			this.currentGlobalTtlMinutes,
+			this.currentXaiTtlMinutes,
+		);
+		if (intervalSeconds <= 0) {
+			log.info("Cache keepalive disabled (global and xAI TTL = 0)");
 			return;
 		}
 
-		// Fire (ttl - 1) minutes before the cache would expire, minimum 60 seconds
-		const intervalMs = Math.max(60_000, (this.currentTtlMinutes - 1) * 60_000);
-		const intervalSeconds = Math.floor(intervalMs / 1_000);
-
 		log.info(
-			`Starting cache keepalive scheduler, interval: ${intervalSeconds}s (ttl: ${this.currentTtlMinutes}min)`,
+			`Starting cache keepalive scheduler, interval: ${intervalSeconds}s (global_ttl: ${this.currentGlobalTtlMinutes}min, xai_ttl: ${this.currentXaiTtlMinutes}min)`,
 		);
 
 		this.unregisterInterval = registerHeartbeat({
 			id: "cache-keepalive-scheduler",
 			callback: () => this.sendKeepalives(),
 			seconds: intervalSeconds,
-			description: `Cache keepalive scheduler (TTL ${this.currentTtlMinutes}min)`,
+			description: `Cache keepalive scheduler (global ${this.currentGlobalTtlMinutes}min / xai ${this.currentXaiTtlMinutes}min)`,
 		});
 	}
 
 	private async sendKeepalives(): Promise<void> {
-		// Evict stale cached requests before sending keepalives.
-		// This prevents replaying requests that are clearly no longer warm
-		// (e.g., from days ago when the underlying prompt cache has long expired).
-		cacheBodyStore.evictStaleEntries(this.currentTtlMinutes);
+		// Evict with the loosest active TTL so short xAI windows do not wipe
+		// longer-lived Anthropic entries when both are enabled.
+		const evictionTtl = Math.max(
+			this.currentGlobalTtlMinutes,
+			this.currentXaiTtlMinutes,
+		);
+		if (evictionTtl > 0) {
+			cacheBodyStore.evictStaleEntries(evictionTtl);
+		}
 
 		const accounts = cacheBodyStore.getAllCachedAccounts();
 
@@ -160,17 +247,49 @@ export class CacheKeepaliveScheduler {
 			return;
 		}
 
-		log.info(`Sending cache keepalive to ${accounts.length} account(s)`);
+		const eligible: string[] = [];
+		for (const accountId of accounts) {
+			const cached = cacheBodyStore.getLastCachedRequest(accountId);
+			if (!cached) continue;
+			const ttl = resolveKeepaliveTtlMinutes(
+				cached.providerName,
+				this.currentGlobalTtlMinutes,
+				this.currentXaiTtlMinutes,
+			);
+			if (ttl <= 0) continue;
+			if (shouldSkipKeepaliveForFreshness(cached.timestamp, ttl)) {
+				log.debug(
+					`Skipping fresh keepalive for account ${accountId} (provider=${cached.providerName ?? "unknown"}, age_s=${Math.round((Date.now() - cached.timestamp) / 1000)}, ttl_min=${ttl})`,
+				);
+				continue;
+			}
+			eligible.push(accountId);
+		}
+
+		if (eligible.length === 0) {
+			log.debug(
+				"No keepalive-eligible accounts after provider/freshness filter",
+			);
+			return;
+		}
+
+		log.info(`Sending cache keepalive to ${eligible.length} account(s)`);
 
 		await Promise.allSettled(
-			accounts.map((accountId) => this.replayRequest(accountId)),
+			eligible.map((accountId) => this.replayRequest(accountId)),
 		);
 	}
 
 	private async replayRequest(accountId: string): Promise<void> {
 		const cached = cacheBodyStore.getLastCachedRequest(accountId);
 		if (!cached) return;
+		await this.replayCachedEntry(accountId, cached);
+	}
 
+	private async replayCachedEntry(
+		accountId: string,
+		cached: CachedRequestEntry,
+	): Promise<void> {
 		try {
 			// Reconstruct headers from the stored snapshot.
 			// Anthropic's prepareHeaders() copies incoming client headers and augments
@@ -201,7 +320,7 @@ export class CacheKeepaliveScheduler {
 			const endpoint = `${protocol}://localhost:${proxyPort}${cached.path}`;
 
 			log.debug(
-				`Replaying cached request for account ${accountId} (${cached.body.length} bytes, recorded ${Math.round((Date.now() - cached.timestamp) / 1000)}s ago)`,
+				`Replaying cached request for account ${accountId} (${cached.body.length} bytes, recorded ${Math.round((Date.now() - cached.timestamp) / 1000)}s ago, provider=${cached.providerName ?? "unknown"})`,
 			);
 
 			const bodyToSend = sanitizeKeepaliveBody(cached.body);
