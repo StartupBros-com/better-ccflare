@@ -754,9 +754,17 @@ export class UsageCollector {
 			}
 		}
 
+		const totalInputForOutcome =
+			(state.usage.inputTokens ?? 0) +
+			(state.usage.cacheReadInputTokens ?? 0) +
+			(state.usage.cacheCreationInputTokens ?? 0);
 		const xaiCacheOutcome = cacheOutcomeFromTokens(
 			state.usage.cacheReadInputTokens,
 			state.usage.cacheReadInputTokensPresent === true,
+			state.usage.inputTokensPresent === true ||
+				state.usage.cacheReadInputTokensPresent === true
+				? totalInputForOutcome
+				: undefined,
 		);
 		if (
 			startMessage.xaiCacheIdentityFingerprint &&

@@ -240,7 +240,7 @@ describe("XaiProvider", () => {
 		const provider = new XaiProvider();
 		const response = new Response(
 			JSON.stringify({
-				model: "grok-4.3",
+				model: "grok-4.5",
 				usage: {
 					prompt_tokens: 100,
 					completion_tokens: 10,

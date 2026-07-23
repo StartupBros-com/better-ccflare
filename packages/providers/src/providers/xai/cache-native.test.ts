@@ -323,4 +323,15 @@ describe("xAI cache-native helpers", () => {
 		expect(cacheOutcomeFromTokens(0, true)).toBe("miss");
 		expect(cacheOutcomeFromTokens(undefined, false)).toBe("unknown");
 	});
+
+	it("treats near-zero cache ratios as misses when total input is known", () => {
+		// Live eviction shape: 128 cached of ~320k total.
+		expect(cacheOutcomeFromTokens(128, true, 319_758)).toBe("miss");
+		// Cold-start floor seen in flight recorder (~2.6%).
+		expect(cacheOutcomeFromTokens(128, true, 4_841)).toBe("miss");
+		// Warm multi-turn stays a hit.
+		expect(cacheOutcomeFromTokens(55_040, true, 55_048)).toBe("hit");
+		// Without a total, any positive cached count remains a hit.
+		expect(cacheOutcomeFromTokens(128, true)).toBe("hit");
+	});
 });

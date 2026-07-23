@@ -24,10 +24,10 @@ export const XAI_TOKEN_ENDPOINT = "https://auth.x.ai/oauth2/token";
 export const XAI_DEFAULT_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828";
 
 export const XAI_MODEL_MAPPINGS = {
-	opus: "grok-4.3",
-	sonnet: "grok-4.3",
-	haiku: "grok-4.3",
-	fable: "grok-4.3",
+	opus: "grok-4.5",
+	sonnet: "grok-4.5",
+	haiku: "grok-4.5",
+	fable: "grok-4.5",
 };
 
 export class XaiProvider extends OpenAICompatibleProvider {

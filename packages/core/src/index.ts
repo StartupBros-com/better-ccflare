@@ -130,6 +130,7 @@ export {
 	cacheOutcomeFromTokens,
 	formatXaiCacheCanary,
 	isOfficialXaiEndpoint,
+	XAI_EFFECTIVE_CACHE_HIT_MIN_RATIO,
 	type XaiCacheCanaryFields,
 	type XaiCacheOutcome,
 } from "./xai";

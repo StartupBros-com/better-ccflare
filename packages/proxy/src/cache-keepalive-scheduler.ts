@@ -32,10 +32,25 @@ export function sanitizeKeepaliveBody(
 ): string | ArrayBuffer {
 	const bytes = body instanceof Uint8Array ? body : new Uint8Array(body);
 	try {
-		const bodyJson = JSON.parse(new TextDecoder().decode(bytes));
+		const bodyJson = JSON.parse(new TextDecoder().decode(bytes)) as Record<
+			string,
+			unknown
+		>;
 		if (typeof bodyJson === "object" && bodyJson !== null) {
 			bodyJson.max_tokens = 1;
 			bodyJson.stream = false;
+			// Grok-4.5 reasoning cannot be disabled and defaults to high. Force the
+			// lowest effort on keepalive replays so TTL refresh does not burn a
+			// full reasoning budget against limited xAI quota. reasoning.effort is
+			// not part of xAI's messages-array prefix identity.
+			const existingReasoning =
+				typeof bodyJson.reasoning === "object" && bodyJson.reasoning !== null
+					? (bodyJson.reasoning as Record<string, unknown>)
+					: {};
+			bodyJson.reasoning = {
+				...existingReasoning,
+				effort: "low",
+			};
 			return JSON.stringify(bodyJson);
 		}
 	} catch {

@@ -173,6 +173,26 @@ describe("cache transport staging", () => {
 		expect(promotedBody("account-success")?.model).toBe("successful-model");
 	});
 
+	it("stages official xAI traffic without Anthropic cache_control markers", async () => {
+		await stage({
+			requestId: "req-xai-automatic",
+			accountId: "account-xai",
+			providerName: "xai",
+			replayBody: {
+				model: "grok-4.5",
+				messages: [{ role: "user", content: "hello" }],
+			},
+			transportBody: {
+				model: "grok-4.5",
+				messages: [{ role: "user", content: "hello" }],
+			},
+			cacheIdentityHasCacheControl: false,
+		});
+
+		cacheBodyStore.onSummary("req-xai-automatic", 0, true, 12_800);
+		expect(promotedBody("account-xai")?.model).toBe("grok-4.5");
+	});
+
 	it("clears a previous route when the final transport has no cache marker", async () => {
 		await stage({
 			requestId: "req-final-uncached",

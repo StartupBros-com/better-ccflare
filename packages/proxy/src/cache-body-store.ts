@@ -134,6 +134,11 @@ class CacheBodyStore {
 	/**
 	 * Called when a request body has been buffered.
 	 * Only stages if the feature is enabled and we have a body.
+	 *
+	 * @param options.automaticPrefixCache When true, stage even without
+	 *   Anthropic-style `cache_control` markers. Official xAI Chat uses
+	 *   automatic exact-prefix caching, so keepalive eligibility must not
+	 *   depend on markers the client may omit.
 	 */
 	stageRequest(
 		requestId: string,
@@ -144,6 +149,7 @@ class CacheBodyStore {
 		cacheIdentityBody: ArrayBuffer | null = body,
 		cacheIdentityHasCacheControl?: boolean,
 		resolvedModel: string | null = null,
+		options?: { automaticPrefixCache?: boolean },
 	): void {
 		if (!this.enabled) return;
 
@@ -158,13 +164,15 @@ class CacheBodyStore {
 		// Only cache prompt-cache-relevant endpoint.
 		if (path !== CACHEABLE_PATH) return;
 
-		// Only stage if the body contains a cache_control hint — requests without
-		// prompt-cache markers won't create cache entries, nothing to keep alive.
+		// Marker-based providers (Anthropic) only create cache when the body
+		// carries cache_control. Automatic-prefix providers (official xAI) cache
+		// without markers, so keepalive must stage those bodies too.
 		const cacheable =
-			cacheIdentityHasCacheControl ??
-			(cacheIdentityBody !== null &&
-				cacheIdentityBody.byteLength > 0 &&
-				hasCacheControlHint(cacheIdentityBody));
+			options?.automaticPrefixCache === true ||
+			(cacheIdentityHasCacheControl ??
+				(cacheIdentityBody !== null &&
+					cacheIdentityBody.byteLength > 0 &&
+					hasCacheControlHint(cacheIdentityBody)));
 		if (!cacheable) {
 			return;
 		}

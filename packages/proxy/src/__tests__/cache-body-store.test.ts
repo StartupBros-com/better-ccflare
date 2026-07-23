@@ -168,6 +168,22 @@ describe("CacheBodyStore", () => {
 			expect(cacheBodyStore.getLastCachedRequest("account-a")).toBeNull();
 		});
 
+		it("stages automatic-prefix providers without cache-control hints", () => {
+			cacheBodyStore.stageRequest(
+				"req-xai-automatic",
+				"account-xai",
+				makeBodyWithoutCacheHint(),
+				makeHeaders({ "content-type": "application/json" }),
+				"/v1/messages",
+				undefined,
+				undefined,
+				"grok-4.5",
+				{ automaticPrefixCache: true },
+			);
+			cacheBodyStore.onSummary("req-xai-automatic", 0, true, 12_800);
+			expect(cacheBodyStore.getLastCachedRequest("account-xai")).not.toBeNull();
+		});
+
 		it("skips cache-control bodies outside /v1/messages", () => {
 			cacheBodyStore.stageRequest(
 				"req-wrong-path",
