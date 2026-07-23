@@ -1,3 +1,5 @@
+import { XAI_EFFECTIVE_CACHE_HIT_MIN_RATIO } from "./xai";
+
 export type CacheOutcome = "hit" | "miss" | "unknown";
 
 export type DiagnosisCause =
@@ -111,8 +113,24 @@ function tokenContradiction(turn: TurnEvidence): string | null {
 		(cachedTokens === undefined || cachedTokens <= 0)
 	)
 		return "hit_without_positive_cached_tokens";
-	if (cacheOutcome === "miss" && cachedTokens !== 0)
+	// Effective near-misses keep the raw positive cached_tokens count while
+	// classifying the turn as a miss (xAI eviction floor, e.g. 128 / 319k).
+	// That is not contradictory when the ratio is below the shared threshold.
+	if (
+		cacheOutcome === "miss" &&
+		cachedTokens !== undefined &&
+		cachedTokens !== 0
+	) {
+		if (
+			typeof inputTokens === "number" &&
+			inputTokens > 0 &&
+			cachedTokens > 0 &&
+			cachedTokens / inputTokens < XAI_EFFECTIVE_CACHE_HIT_MIN_RATIO
+		) {
+			return null;
+		}
 		return "miss_without_zero_cached_tokens";
+	}
 	return null;
 }
 

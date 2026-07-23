@@ -39,10 +39,12 @@ export function sanitizeKeepaliveBody(
 		if (typeof bodyJson === "object" && bodyJson !== null) {
 			bodyJson.max_tokens = 1;
 			bodyJson.stream = false;
-			// Grok-4.5 reasoning cannot be disabled and defaults to high. Force the
-			// lowest effort on keepalive replays so TTL refresh does not burn a
-			// full reasoning budget against limited xAI quota. reasoning.effort is
-			// not part of xAI's messages-array prefix identity.
+			// Staged bodies are Anthropic-shaped and re-enter the proxy for
+			// provider conversion. Set Anthropic reasoning.effort=low so the
+			// converter emits nested effort; XaiProvider.afterConvert mirrors
+			// that to Chat Completions reasoning_effort. Effort is not part of
+			// xAI's messages-array prefix identity. Grok-4.5 cannot disable
+			// reasoning and defaults to high, so keepalives must force low.
 			const existingReasoning =
 				typeof bodyJson.reasoning === "object" && bodyJson.reasoning !== null
 					? (bodyJson.reasoning as Record<string, unknown>)

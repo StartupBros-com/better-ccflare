@@ -184,6 +184,28 @@ describe("CacheBodyStore", () => {
 			expect(cacheBodyStore.getLastCachedRequest("account-xai")).not.toBeNull();
 		});
 
+		it("promotes automatic-prefix cold seeds with zero cache-read tokens", () => {
+			cacheBodyStore.stageRequest(
+				"req-xai-cold",
+				"account-xai-cold",
+				makeBodyWithoutCacheHint(),
+				makeHeaders({ "content-type": "application/json" }),
+				"/v1/messages",
+				undefined,
+				undefined,
+				"grok-4.5",
+				{ automaticPrefixCache: true },
+			);
+			// First request: cached_tokens=0 but prompt was processed and cached.
+			cacheBodyStore.onSummary("req-xai-cold", 0, true, 0, {
+				totalInputTokens: 48_320,
+				inputTokensPresent: true,
+			});
+			expect(
+				cacheBodyStore.getLastCachedRequest("account-xai-cold"),
+			).not.toBeNull();
+		});
+
 		it("skips cache-control bodies outside /v1/messages", () => {
 			cacheBodyStore.stageRequest(
 				"req-wrong-path",

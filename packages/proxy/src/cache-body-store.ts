@@ -107,10 +107,14 @@ const STRIP_HEADERS = new Set([
 ]);
 
 class CacheBodyStore {
-	/** requestId → { accountId, entry } while the request is in-flight. */
+	/** requestId → { accountId, entry, automaticPrefixCache } while in-flight. */
 	private staging = new Map<
 		string,
-		{ accountId: string; entry: CachedRequestEntry }
+		{
+			accountId: string;
+			entry: CachedRequestEntry;
+			automaticPrefixCache: boolean;
+		}
 	>();
 
 	/** accountId → last request that created or read a cache entry. */
@@ -190,6 +194,7 @@ class CacheBodyStore {
 
 		this.staging.set(requestId, {
 			accountId,
+			automaticPrefixCache: options?.automaticPrefixCache === true,
 			entry: {
 				body: Buffer.from(body),
 				headers: sanitizedHeaders,
@@ -259,6 +264,11 @@ class CacheBodyStore {
 		cacheCreationInputTokens: number | undefined,
 		success = true,
 		cacheReadInputTokens?: number,
+		options?: {
+			/** Inclusive prompt tokens when the provider reported authoritative usage. */
+			totalInputTokens?: number;
+			inputTokensPresent?: boolean;
+		},
 	): void {
 		const staged = this.staging.get(requestId);
 		this.staging.delete(requestId);
@@ -267,7 +277,16 @@ class CacheBodyStore {
 
 		const cacheWasUsed =
 			(cacheCreationInputTokens ?? 0) > 0 || (cacheReadInputTokens ?? 0) > 0;
-		if (success && cacheWasUsed) {
+		// Automatic-prefix providers (xAI) cache the first request even when
+		// cached_tokens is 0. Promote successful cold seeds so keepalive can
+		// refresh the entry that was just written.
+		const automaticPrefixColdSeed =
+			staged.automaticPrefixCache &&
+			options?.inputTokensPresent === true &&
+			typeof options.totalInputTokens === "number" &&
+			Number.isFinite(options.totalInputTokens) &&
+			options.totalInputTokens > 0;
+		if (success && (cacheWasUsed || automaticPrefixColdSeed)) {
 			this.lastCachedRequest.set(staged.accountId, {
 				...staged.entry,
 				timestamp: Date.now(),
