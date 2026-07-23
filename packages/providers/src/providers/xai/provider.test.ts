@@ -240,7 +240,7 @@ describe("XaiProvider", () => {
 		const provider = new XaiProvider();
 		const response = new Response(
 			JSON.stringify({
-				model: "grok-4.3",
+				model: "grok-4.5",
 				usage: {
 					prompt_tokens: 100,
 					completion_tokens: 10,
@@ -386,5 +386,29 @@ describe("OpenAICompatibleProvider.parseRateLimit - unchanged for generic provid
 
 		expect(info.isRateLimited).toBe(false);
 		expect(info.statusHeader).toBe("allowed");
+	});
+
+	it("mirrors nested reasoning.effort to Chat Completions reasoning_effort", async () => {
+		const provider = new XaiProvider();
+		const req = new Request("http://localhost/v1/messages", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				model: "claude-sonnet-4-5-20250929",
+				max_tokens: 32,
+				reasoning: { effort: "low" },
+				messages: [{ role: "user", content: "hi" }],
+			}),
+		});
+		const transformed = await provider.transformRequestBody(
+			req,
+			account({ custom_endpoint: "https://api.x.ai/v1" }),
+		);
+		const body = (await transformed.json()) as {
+			reasoning?: { effort?: string };
+			reasoning_effort?: string;
+		};
+		expect(body.reasoning?.effort).toBe("low");
+		expect(body.reasoning_effort).toBe("low");
 	});
 });

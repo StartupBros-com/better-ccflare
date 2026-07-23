@@ -754,9 +754,17 @@ export class UsageCollector {
 			}
 		}
 
+		const totalInputForOutcome =
+			(state.usage.inputTokens ?? 0) +
+			(state.usage.cacheReadInputTokens ?? 0) +
+			(state.usage.cacheCreationInputTokens ?? 0);
 		const xaiCacheOutcome = cacheOutcomeFromTokens(
 			state.usage.cacheReadInputTokens,
 			state.usage.cacheReadInputTokensPresent === true,
+			state.usage.inputTokensPresent === true ||
+				state.usage.cacheReadInputTokensPresent === true
+				? totalInputForOutcome
+				: undefined,
 		);
 		if (
 			startMessage.xaiCacheIdentityFingerprint &&
@@ -1083,11 +1091,21 @@ export class UsageCollector {
 		};
 
 		// Notify cacheBodyStore and emit summary for real-time updates
+		const totalInputTokensForStaging =
+			(state.usage.inputTokens ?? 0) +
+			(state.usage.cacheReadInputTokens ?? 0) +
+			(state.usage.cacheCreationInputTokens ?? 0);
 		cacheBodyStore.onSummary(
 			startMessage.requestId,
 			state.usage.cacheCreationInputTokens,
 			msg.success,
 			state.usage.cacheReadInputTokens,
+			{
+				totalInputTokens: totalInputTokensForStaging,
+				inputTokensPresent:
+					state.usage.inputTokensPresent === true ||
+					state.usage.cacheReadInputTokensPresent === true,
+			},
 		);
 		this.onSummary(summary);
 	}

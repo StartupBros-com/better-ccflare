@@ -107,10 +107,14 @@ const STRIP_HEADERS = new Set([
 ]);
 
 class CacheBodyStore {
-	/** requestId → { accountId, entry } while the request is in-flight. */
+	/** requestId → { accountId, entry, automaticPrefixCache } while in-flight. */
 	private staging = new Map<
 		string,
-		{ accountId: string; entry: CachedRequestEntry }
+		{
+			accountId: string;
+			entry: CachedRequestEntry;
+			automaticPrefixCache: boolean;
+		}
 	>();
 
 	/** accountId → last request that created or read a cache entry. */
@@ -134,6 +138,11 @@ class CacheBodyStore {
 	/**
 	 * Called when a request body has been buffered.
 	 * Only stages if the feature is enabled and we have a body.
+	 *
+	 * @param options.automaticPrefixCache When true, stage even without
+	 *   Anthropic-style `cache_control` markers. Official xAI Chat uses
+	 *   automatic exact-prefix caching, so keepalive eligibility must not
+	 *   depend on markers the client may omit.
 	 */
 	stageRequest(
 		requestId: string,
@@ -144,6 +153,7 @@ class CacheBodyStore {
 		cacheIdentityBody: ArrayBuffer | null = body,
 		cacheIdentityHasCacheControl?: boolean,
 		resolvedModel: string | null = null,
+		options?: { automaticPrefixCache?: boolean },
 	): void {
 		if (!this.enabled) return;
 
@@ -158,13 +168,15 @@ class CacheBodyStore {
 		// Only cache prompt-cache-relevant endpoint.
 		if (path !== CACHEABLE_PATH) return;
 
-		// Only stage if the body contains a cache_control hint — requests without
-		// prompt-cache markers won't create cache entries, nothing to keep alive.
+		// Marker-based providers (Anthropic) only create cache when the body
+		// carries cache_control. Automatic-prefix providers (official xAI) cache
+		// without markers, so keepalive must stage those bodies too.
 		const cacheable =
-			cacheIdentityHasCacheControl ??
-			(cacheIdentityBody !== null &&
-				cacheIdentityBody.byteLength > 0 &&
-				hasCacheControlHint(cacheIdentityBody));
+			options?.automaticPrefixCache === true ||
+			(cacheIdentityHasCacheControl ??
+				(cacheIdentityBody !== null &&
+					cacheIdentityBody.byteLength > 0 &&
+					hasCacheControlHint(cacheIdentityBody)));
 		if (!cacheable) {
 			return;
 		}
@@ -182,6 +194,7 @@ class CacheBodyStore {
 
 		this.staging.set(requestId, {
 			accountId,
+			automaticPrefixCache: options?.automaticPrefixCache === true,
 			entry: {
 				body: Buffer.from(body),
 				headers: sanitizedHeaders,
@@ -251,6 +264,11 @@ class CacheBodyStore {
 		cacheCreationInputTokens: number | undefined,
 		success = true,
 		cacheReadInputTokens?: number,
+		options?: {
+			/** Inclusive prompt tokens when the provider reported authoritative usage. */
+			totalInputTokens?: number;
+			inputTokensPresent?: boolean;
+		},
 	): void {
 		const staged = this.staging.get(requestId);
 		this.staging.delete(requestId);
@@ -259,7 +277,16 @@ class CacheBodyStore {
 
 		const cacheWasUsed =
 			(cacheCreationInputTokens ?? 0) > 0 || (cacheReadInputTokens ?? 0) > 0;
-		if (success && cacheWasUsed) {
+		// Automatic-prefix providers (xAI) cache the first request even when
+		// cached_tokens is 0. Promote successful cold seeds so keepalive can
+		// refresh the entry that was just written.
+		const automaticPrefixColdSeed =
+			staged.automaticPrefixCache &&
+			options?.inputTokensPresent === true &&
+			typeof options.totalInputTokens === "number" &&
+			Number.isFinite(options.totalInputTokens) &&
+			options.totalInputTokens > 0;
+		if (success && (cacheWasUsed || automaticPrefixColdSeed)) {
 			this.lastCachedRequest.set(staged.accountId, {
 				...staged.entry,
 				timestamp: Date.now(),

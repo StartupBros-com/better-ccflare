@@ -261,6 +261,26 @@ describe("diagnoseTimeline", () => {
 		expect(report.gaps).toContain("missing_turns_2_to_2");
 	});
 
+	it("diagnoses effective near-miss collapses without token contradiction", () => {
+		const report = diagnoseTimeline(
+			timeline(
+				turn(1, {
+					inputTokens: 316_800,
+					cachedTokens: 316_800,
+				}),
+				turn(2, {
+					cacheOutcome: "miss",
+					inputTokens: 319_758,
+					cachedTokens: 128,
+				}),
+			),
+		);
+
+		expect(report.cause).toBe("upstream_miss_despite_stable_lineage");
+		expect(report.completeness).toBe("complete");
+		expect(report.diagnosedSequence).toBe(2);
+	});
+
 	it("returns telemetry unknown for contradictory token evidence", () => {
 		const report = diagnoseTimeline(
 			timeline(turn(1), turn(2, { cacheOutcome: "miss", cachedTokens: 25 })),

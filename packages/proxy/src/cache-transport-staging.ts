@@ -100,6 +100,13 @@ export function getCacheBodyStagingAction(
 	return "stage";
 }
 
+/** Official xAI Chat caches by exact prefix without Anthropic cache_control markers. */
+export function providerUsesAutomaticPrefixCache(
+	providerName: string,
+): boolean {
+	return providerName === "xai";
+}
+
 /** Applies the cache-body staging policy to an already materialized projection. */
 export function applyCacheBodyStagingPolicy(
 	input: CacheBodyStagingInput,
@@ -116,6 +123,11 @@ export function applyCacheBodyStagingPolicy(
 			input.cacheIdentityBody,
 			input.cacheIdentityHasCacheControl,
 			input.resolvedModel,
+			{
+				automaticPrefixCache: providerUsesAutomaticPrefixCache(
+					input.providerName,
+				),
+			},
 		);
 	} else if (action === "discard") {
 		cacheBodyStore.discardStaged(input.requestId);
@@ -164,6 +176,11 @@ export async function stageCacheBodyForTransportAttempt(
 		cacheIdentityBody,
 		cacheIdentityHasCacheControl,
 		input.resolvedModel,
+		{
+			automaticPrefixCache: providerUsesAutomaticPrefixCache(
+				input.providerName,
+			),
+		},
 	);
 	return action;
 }

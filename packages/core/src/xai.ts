@@ -66,10 +66,33 @@ export function formatXaiCacheCanary(fields: XaiCacheCanaryFields): string {
 	return parts.join(" ");
 }
 
+/**
+ * Classify cache outcome from provider token telemetry.
+ *
+ * xAI (and other automatic-prefix caches) can return a tiny positive
+ * `cached_tokens` value even when the useful conversation prefix was
+ * evicted. Treat those near-zero ratios as misses so flight-recorder and
+ * canary paths surface the collapse instead of a false hit.
+ *
+ * Threshold is intentionally low (5%): warm multi-turn traffic sits at
+ * 99%+, while cold starts and post-eviction collapses land well below 5%.
+ */
+export const XAI_EFFECTIVE_CACHE_HIT_MIN_RATIO = 0.05;
+
 export function cacheOutcomeFromTokens(
 	cachedTokens: number | undefined | null,
 	detailsPresent: boolean,
+	totalInputTokens?: number | null,
 ): XaiCacheOutcome {
 	if (!detailsPresent || typeof cachedTokens !== "number") return "unknown";
-	return cachedTokens > 0 ? "hit" : "miss";
+	if (cachedTokens <= 0) return "miss";
+	if (
+		typeof totalInputTokens === "number" &&
+		Number.isFinite(totalInputTokens) &&
+		totalInputTokens > 0 &&
+		cachedTokens / totalInputTokens < XAI_EFFECTIVE_CACHE_HIT_MIN_RATIO
+	) {
+		return "miss";
+	}
+	return "hit";
 }

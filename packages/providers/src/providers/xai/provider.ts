@@ -24,10 +24,10 @@ export const XAI_TOKEN_ENDPOINT = "https://auth.x.ai/oauth2/token";
 export const XAI_DEFAULT_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828";
 
 export const XAI_MODEL_MAPPINGS = {
-	opus: "grok-4.3",
-	sonnet: "grok-4.3",
-	haiku: "grok-4.3",
-	fable: "grok-4.3",
+	opus: "grok-4.5",
+	sonnet: "grok-4.5",
+	haiku: "grok-4.5",
+	fable: "grok-4.5",
 };
 
 export class XaiProvider extends OpenAICompatibleProvider {
@@ -200,14 +200,25 @@ export class XaiProvider extends OpenAICompatibleProvider {
 		// Ask OpenAI-compatible streaming APIs to include a final usage chunk when
 		// supported. xAI accepts this OpenAI field and it improves request accounting
 		// when the downstream client streams responses.
+		const record = body as unknown as Record<string, unknown>;
 		if (body.stream) {
-			const record = body as unknown as Record<string, unknown>;
 			record.stream_options = {
 				...(typeof record.stream_options === "object" && record.stream_options
 					? (record.stream_options as Record<string, unknown>)
 					: {}),
 				include_usage: true,
 			};
+		}
+		// Chat Completions wire form uses flat reasoning_effort. The shared
+		// Anthropic→OpenAI converter emits nested reasoning.effort (Responses
+		// shape). Mirror the effort so keepalive low-effort and client effort
+		// both reach official xAI Chat.
+		const nested = record.reasoning;
+		if (nested && typeof nested === "object") {
+			const effort = (nested as Record<string, unknown>).effort;
+			if (typeof effort === "string" && effort.length > 0) {
+				record.reasoning_effort = effort;
+			}
 		}
 	}
 

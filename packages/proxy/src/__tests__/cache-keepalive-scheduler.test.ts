@@ -759,6 +759,22 @@ describe("sanitizeKeepaliveBody", () => {
 		expect(parsed.tool_choice).toEqual({ type: "auto" });
 		expect(parsed.system[0].cache_control).toEqual({ type: "ephemeral" });
 		expect(parsed.messages).toEqual([{ role: "user", content: "hi" }]);
+		// Keepalive forces low reasoning effort so Grok-4.5 refreshes stay cheap.
+		expect(parsed.reasoning).toEqual({ effort: "low" });
+	});
+
+	it("forces low reasoning effort without dropping other reasoning fields", () => {
+		const out = sanitizeKeepaliveBody(
+			encode({
+				model: "grok-4.5",
+				max_tokens: 4096,
+				stream: true,
+				reasoning: { effort: "high", summary: "auto" },
+				messages: [{ role: "user", content: "hi" }],
+			}),
+		);
+		const parsed = JSON.parse(out as string);
+		expect(parsed.reasoning).toEqual({ effort: "low", summary: "auto" });
 	});
 
 	it("returns original bytes for non-JSON bodies", () => {
