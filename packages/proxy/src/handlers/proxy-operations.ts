@@ -38,6 +38,7 @@ import type { AnthropicPreCommitRescueRouteContext } from "../anthropic-precommi
 import {
 	AnthropicPreCommitAbortedError,
 	AnthropicPreCommitStallError,
+	classifyAnthropicPreCommitWebSocketFailure,
 	gateAnthropicSsePreCommit,
 	getAnthropicStreamRuntimeConfig,
 	isDownstreamAnthropicMessagesSse,
@@ -3822,17 +3823,12 @@ export async function proxyWithAccount(
 				// meaningful downstream event arrived. Surface one final error and pin
 				// this conversation to HTTP before considering any HTTP/cache-lane retry.
 				if (websocketReceipt?.frameWritten) {
-					const isSemanticTimeout =
-						error instanceof AnthropicPreCommitStallError &&
-						error.errorType === undefined &&
-						(error.reason === "semantic_timeout" ||
-							error.reason === "meaningful_progress_timeout");
-					const failureCategory = isSemanticTimeout
-						? "semantic_stall"
-						: "post_write_error";
+					const failureCategory =
+						classifyAnthropicPreCommitWebSocketFailure(error) ??
+						"post_write_error";
 					websocketReceipt.markPostWriteFailure(failureCategory);
 					response = createCodexWebSocketNoReplayResponse(
-						isSemanticTimeout ? 504 : 502,
+						failureCategory === "semantic_stall" ? 504 : 502,
 						failureCategory,
 					);
 					break;

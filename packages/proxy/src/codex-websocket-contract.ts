@@ -59,8 +59,7 @@ export type CodexWebSocketFailureCategory =
 	| "post_write_close"
 	| "post_write_error"
 	| "post_write_timeout"
-	| "semantic_stall"
-	| "stream_cancelled";
+	| "semantic_stall";
 
 export type CodexWebSocketFallbackReason =
 	| CodexWebSocketFailureCategory
@@ -68,6 +67,7 @@ export type CodexWebSocketFallbackReason =
 	| "connection_busy"
 	| "connection_opening"
 	| "cohort_not_allowlisted"
+	| "downstream_cancelled"
 	| "global_cap"
 	| "lane_identity_busy"
 	| "per_account_cap"

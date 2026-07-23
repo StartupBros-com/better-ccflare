@@ -248,6 +248,73 @@ describe("Codex WebSocket cache experiment analysis", () => {
 		});
 	});
 
+	test("reports a clean-terminal downstream cancellation race without adverse failure counts", () => {
+		const parsed = parseCodexWebSocketObservationsJsonl(
+			loggerJsonl(
+				observation("cancelled", "cancelled-attempt", {
+					fallbackReason: "downstream_cancelled",
+					closeCategory: null,
+					terminalMs: null,
+					inputTokens: null,
+					cachedReadTokens: null,
+					cacheWriteTokens: null,
+					cacheWriteMeasurementAvailable: false,
+				}),
+			),
+		);
+		const report = analyzeCodexCacheExperiments(
+			tracePair("cancelled", "cancelled-attempt"),
+			parsed,
+		);
+
+		expect(report.websocket.rows).toHaveLength(1);
+		expect(report.websocket.rows[0]).toMatchObject({
+			action: "downstream_cancelled",
+			outcomes: {
+				terminalResponses: 1,
+				terminalErrors: 0,
+				preWriteHttpFallbacks: 0,
+				postWriteFailures: 0,
+				fallbackCategories: { downstream: 1 },
+			},
+		});
+	});
+
+	test("does not let a downstream cancellation label mask a real WebSocket failure", () => {
+		const parsed = parseCodexWebSocketObservationsJsonl(
+			loggerJsonl(
+				observation("failed", "failed-attempt", {
+					fallbackReason: "downstream_cancelled",
+					closeCategory: "post_write_close",
+					terminalMs: null,
+					inputTokens: null,
+					cachedReadTokens: null,
+					cacheWriteTokens: null,
+					cacheWriteMeasurementAvailable: false,
+				}),
+			),
+		);
+		const report = analyzeCodexCacheExperiments(
+			[
+				...tracePair("failed", "failed-attempt", {
+					stop_reason: "error",
+				}),
+			],
+			parsed,
+		);
+
+		expect(report.websocket.rows).toHaveLength(1);
+		expect(report.websocket.rows[0]).toMatchObject({
+			action: "downstream_cancelled",
+			outcomes: {
+				terminalResponses: 1,
+				terminalErrors: 1,
+				postWriteFailures: 1,
+				fallbackCategories: { post_write: 1 },
+			},
+		});
+	});
+
 	test("excludes duplicate observations, future schemas, malformed records, and ambiguous exact joins", () => {
 		const duplicate = observation("duplicate", "duplicate-attempt");
 		const parsed = parseCodexWebSocketObservationsJsonl(

@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer";
 import { Logger } from "@better-ccflare/logger";
+import { classifyAnthropicPreCommitWebSocketFailure } from "./anthropic-semantic-preflight";
 import { chatGptCloudflareCookieJar } from "./chatgpt-cloudflare-cookies";
 import {
 	CODEX_RESPONSES_WEBSOCKET_URL,
@@ -74,6 +75,7 @@ export { createCodexWebSocketNoReplayResponse } from "./codex-websocket-wire";
 const log = new Logger("CodexWebSocketTransport");
 
 const MAX_STICKY_HTTP = 2_048;
+const STICKY_HTTP_COOLDOWN_MS = 5 * 60 * 1_000;
 const MAX_RECENT_OBSERVATIONS = 128;
 // Keep the WebSocket reader from outrunning a paused or abandoned HTTP client.
 // These are intentionally internal until the canary provides enough evidence to
@@ -244,7 +246,7 @@ export class CodexWebSocketTransport {
 			});
 			return null;
 		}
-		if (this.stickyHttp.has(parsed.stickyKey)) {
+		if (this.isSticky(parsed.stickyKey)) {
 			this.touchSticky(parsed.stickyKey);
 			this.counters.stickyHttpBypass++;
 			this.record({
@@ -369,6 +371,7 @@ export class CodexWebSocketTransport {
 	}
 
 	getStats(): CodexWebSocketStats {
+		this.pruneExpiredSticky();
 		const now = this.now();
 		const config = readCodexWebSocketRuntimeConfig();
 		return {
@@ -613,10 +616,10 @@ export class CodexWebSocketTransport {
 					activeRequest.receipt !== receipt
 				) {
 					// The completed response body can be cancelled after a later turn has
-					// already reused this socket. Preserve the old turn's sticky/no-replay
-					// decision, but never resolve, close, or attribute the newer turn.
+					// already reused this socket. Preserve the old turn's failure decision,
+					// but never resolve, close, or attribute the newer turn.
 					entry.retireAfterActive = true;
-					this.recordReceiptFailure(accountId, model, entry, receipt, category);
+					this.recordReceiptOutcome(accountId, model, entry, receipt, category);
 					return;
 				}
 				if (
@@ -637,7 +640,7 @@ export class CodexWebSocketTransport {
 					this.finishActive(entry, activeRequest, true);
 					this.recordActive(entry, activeRequest, category);
 				} else {
-					this.recordReceiptFailure(accountId, model, entry, receipt, category);
+					this.recordReceiptOutcome(accountId, model, entry, receipt, category);
 				}
 				this.evict(entry, category, true);
 			},
@@ -657,8 +660,17 @@ export class CodexWebSocketTransport {
 						this.flushActive(active);
 					}
 				},
-				cancel: () => {
-					receipt.markPostWriteFailure("stream_cancelled");
+				cancel: (reason) => {
+					// Once the upstream terminal has been recorded, downstream body
+					// disposal cannot change that outcome or make the socket unhealthy.
+					if (receipt.observationRecorded) return;
+					const preCommitFailure =
+						classifyAnthropicPreCommitWebSocketFailure(reason);
+					if (preCommitFailure) {
+						receipt.markPostWriteFailure(preCommitFailure);
+						return;
+					}
+					this.handleDownstreamCancellation(accountId, model, entry, receipt);
 				},
 			},
 			{ highWaterMark: 1 },
@@ -1050,14 +1062,49 @@ export class CodexWebSocketTransport {
 		}
 	}
 
-	private recordReceiptFailure(
+	private handleDownstreamCancellation(
 		accountId: string,
 		model: string,
 		entry: PoolEntry,
 		receipt: InternalCodexWebSocketReceipt,
-		failure: CodexWebSocketFailureCategory,
+	): void {
+		const activeRequest = entry.active;
+		if (
+			activeRequest &&
+			!activeRequest.closed &&
+			activeRequest.receipt !== receipt
+		) {
+			// An older body must never change the newer turn or its healthy socket.
+			return;
+		}
+		if (
+			activeRequest &&
+			!activeRequest.closed &&
+			activeRequest.receipt === receipt
+		) {
+			this.finishActive(entry, activeRequest, true);
+			this.recordActive(entry, activeRequest, "downstream_cancelled");
+		} else {
+			this.recordReceiptOutcome(
+				accountId,
+				model,
+				entry,
+				receipt,
+				"downstream_cancelled",
+			);
+		}
+		this.evict(entry, "downstream_cancelled", true);
+	}
+
+	private recordReceiptOutcome(
+		accountId: string,
+		model: string,
+		entry: PoolEntry,
+		receipt: InternalCodexWebSocketReceipt,
+		outcome: CodexWebSocketFailureCategory | "downstream_cancelled",
 	): void {
 		if (receipt.observationRecorded) return;
+		const downstreamCancelled = outcome === "downstream_cancelled";
 		receipt.observationRecorded = true;
 		this.record({
 			...this.emptyObservation(
@@ -1075,8 +1122,8 @@ export class CodexWebSocketTransport {
 			connectionReused: receipt.reused,
 			connectionAgeMs: this.now() - entry.createdAt,
 			frameWritten: receipt.frameWritten,
-			closeCategory: failure,
-			fallbackReason: failure,
+			closeCategory: downstreamCancelled ? null : outcome,
+			fallbackReason: outcome,
 			stickyHttp: receipt.stickyHttp,
 		});
 	}
@@ -1088,6 +1135,7 @@ export class CodexWebSocketTransport {
 		code: number | null = null,
 	): void {
 		if (active.receipt.observationRecorded) return;
+		const downstreamCancelled = failure === "downstream_cancelled";
 		active.receipt.observationRecorded = true;
 		this.record({
 			requestId: active.receipt.requestId,
@@ -1111,8 +1159,10 @@ export class CodexWebSocketTransport {
 			firstOutputMs: active.firstOutputMs,
 			terminalMs: active.terminalMs,
 			closeCode: code,
-			closeCategory: failure,
-			fallbackReason: this.normalizeTerminalFallback(failure),
+			closeCategory: downstreamCancelled ? null : failure,
+			fallbackReason: downstreamCancelled
+				? "downstream_cancelled"
+				: this.normalizeTerminalFallback(failure),
 			fallbackAllowedBeforeWrite: false,
 			stickyHttp: active.receipt.stickyHttp,
 			inputTokens: active.inputTokens,
@@ -1249,6 +1299,7 @@ export class CodexWebSocketTransport {
 	}
 
 	private markSticky(key: string): void {
+		this.pruneExpiredSticky();
 		this.stickyHttp.delete(key);
 		this.stickyHttp.set(key, this.now());
 		while (this.stickyHttp.size > MAX_STICKY_HTTP) {
@@ -1256,6 +1307,20 @@ export class CodexWebSocketTransport {
 			if (oldest === undefined) break;
 			this.stickyHttp.delete(oldest);
 		}
+	}
+
+	private isSticky(key: string): boolean {
+		const startedAt = this.stickyHttp.get(key);
+		if (startedAt === undefined) return false;
+		if (this.now() - startedAt >= STICKY_HTTP_COOLDOWN_MS) {
+			this.stickyHttp.delete(key);
+			return false;
+		}
+		return true;
+	}
+
+	private pruneExpiredSticky(): void {
+		for (const key of this.stickyHttp.keys()) this.isSticky(key);
 	}
 
 	private touchSticky(key: string): void {
