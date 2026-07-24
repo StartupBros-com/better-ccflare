@@ -1,4 +1,8 @@
 import { describe, expect, it, mock } from "bun:test";
+import {
+	getModelDisplayName,
+	LATEST_MODEL_BY_FAMILY,
+} from "@better-ccflare/core";
 import type {
 	ComboFamilyAssignment,
 	ComboRoutingPreviewResult,
@@ -166,6 +170,28 @@ describe("FamilyActivationSection managed policy controls", () => {
 		]);
 	});
 
+	it("labels an alias-valued stored managed_model with what it resolves to", () => {
+		const liveOptions = [
+			{ id: "vendor/claude-opus-preview", displayName: "Live Opus" },
+		];
+
+		const withExplicitFamily = getManagedModelOptions(
+			liveOptions,
+			"opus",
+			"opus",
+		);
+		expect(withExplicitFamily[0]).toEqual({
+			id: "opus",
+			displayName: `opus (tracks latest → ${getModelDisplayName(
+				LATEST_MODEL_BY_FAMILY.opus,
+			)})`,
+		});
+
+		// Family is omittable: the bare alias string self-identifies its family.
+		const withoutFamily = getManagedModelOptions(liveOptions, "opus");
+		expect(withoutFamily[0]).toEqual(withExplicitFamily[0]);
+	});
+
 	it("keeps the selector authoritative when a different draft model is canceled or rolled back", () => {
 		const liveOptions = [
 			{ id: "claude-opus-4-8", displayName: "Opus 4.8" },
@@ -207,6 +233,26 @@ describe("FamilyActivationSection managed policy controls", () => {
 			previewMatchesPendingConversion(data, {
 				family: "opus",
 				managedModel: "claude-opus-preview",
+			}),
+		).toBe(false);
+	});
+
+	it("treats a stored family alias as current when the preview resolved it to the latest model", () => {
+		const data = {
+			family: "opus",
+			managed_model: LATEST_MODEL_BY_FAMILY.opus,
+		} as ComboRoutingPreviewResult;
+
+		expect(
+			previewMatchesPendingConversion(data, {
+				family: "opus",
+				managedModel: "opus",
+			}),
+		).toBe(true);
+		expect(
+			previewMatchesPendingConversion(data, {
+				family: "opus",
+				managedModel: "claude-opus-4-8",
 			}),
 		).toBe(false);
 	});

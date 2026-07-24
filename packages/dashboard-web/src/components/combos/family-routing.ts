@@ -1,7 +1,9 @@
 import {
 	getModelDisplayName,
 	getModelFamily,
+	isFamilyAliasModel,
 	LATEST_MODEL_BY_FAMILY,
+	resolveFamilyAliasModel,
 } from "@better-ccflare/core";
 import type {
 	Combo,
@@ -189,4 +191,28 @@ export function useFamilyModelOptions(
 	family: ComboFamily,
 ): FamilyRoutingModelOption[] {
 	return familyModelOptions(family, useModelOptions());
+}
+
+/**
+ * Render a stored `combo_family_assignments.managed_model` /
+ * `combo_slots.model` value for display. When the value is a bare family
+ * alias (e.g. "opus" — meaning "track the latest model in this family"), show
+ * what it currently resolves to alongside the stored literal so the UI never
+ * shows an unexplained bare word. Concrete model IDs are returned unchanged.
+ *
+ * When `family` is omitted, it is derived from the value itself via
+ * `getModelFamily`. That derivation only succeeds when the value IS a bare
+ * alias string: `getModelFamily` pattern-matches by substring, so a concrete
+ * ID like "claude-opus-5" also yields "opus", but `isFamilyAliasModel` then
+ * rejects it (the full trimmed value isn't exactly "opus"), so the value is
+ * still returned unchanged in that case.
+ */
+export function formatPolicyModel(value: string, family?: ComboFamily): string {
+	const trimmed = value.trim();
+	const candidateFamily = family ?? getModelFamily(trimmed) ?? undefined;
+	if (!candidateFamily || !isFamilyAliasModel(trimmed, candidateFamily)) {
+		return value;
+	}
+	const resolved = resolveFamilyAliasModel(trimmed, candidateFamily);
+	return `${trimmed} → ${resolved}`;
 }

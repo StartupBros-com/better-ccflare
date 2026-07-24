@@ -3,9 +3,12 @@ import {
 	getAllowedModelsMessage,
 	getConfiguredModelMapping,
 	getModelFamily,
+	isFamilyAliasModel,
 	isValidClaudeModel,
+	LATEST_MODEL_BY_FAMILY,
 	mapModelName,
 	parseModelMappings,
+	resolveFamilyAliasModel,
 } from "@better-ccflare/core";
 import type { Account } from "@better-ccflare/types";
 
@@ -319,5 +322,45 @@ describe("Model Validation Utilities", () => {
 		expect(mapModelName("claude-opus-4-6", mockAccount)).toBe(
 			"claude-opus-4-6",
 		);
+	});
+});
+
+describe("Family alias helpers", () => {
+	test("isFamilyAliasModel matches the bare family word (trim + case-insensitive)", () => {
+		expect(isFamilyAliasModel("opus", "opus")).toBe(true);
+		expect(isFamilyAliasModel("OPUS", "opus")).toBe(true);
+		expect(isFamilyAliasModel("  opus  ", "opus")).toBe(true);
+		expect(isFamilyAliasModel("claude-opus-5", "opus")).toBe(false);
+		expect(isFamilyAliasModel("sonnet", "opus")).toBe(false);
+		expect(isFamilyAliasModel("", "opus")).toBe(false);
+	});
+
+	test("resolveFamilyAliasModel resolves a bare alias to the latest model in that family", () => {
+		expect(resolveFamilyAliasModel("opus", "opus")).toBe(
+			LATEST_MODEL_BY_FAMILY.opus,
+		);
+		expect(resolveFamilyAliasModel("  OPUS  ", "opus")).toBe(
+			LATEST_MODEL_BY_FAMILY.opus,
+		);
+		expect(resolveFamilyAliasModel("sonnet", "sonnet")).toBe(
+			LATEST_MODEL_BY_FAMILY.sonnet,
+		);
+		expect(resolveFamilyAliasModel("haiku", "haiku")).toBe(
+			LATEST_MODEL_BY_FAMILY.haiku,
+		);
+		expect(resolveFamilyAliasModel("fable", "fable")).toBe(
+			LATEST_MODEL_BY_FAMILY.fable,
+		);
+	});
+
+	test("resolveFamilyAliasModel returns a concrete (non-matching-family) value trimmed but otherwise unchanged", () => {
+		expect(resolveFamilyAliasModel("claude-opus-4-8", "opus")).toBe(
+			"claude-opus-4-8",
+		);
+		expect(resolveFamilyAliasModel("  claude-opus-4-8  ", "opus")).toBe(
+			"claude-opus-4-8",
+		);
+		// A different family's bare word is not an alias for this family — passed through trimmed.
+		expect(resolveFamilyAliasModel("sonnet", "opus")).toBe("sonnet");
 	});
 });

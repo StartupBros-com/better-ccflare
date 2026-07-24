@@ -1,5 +1,6 @@
 import { Logger } from "@better-ccflare/logger";
-import type { Account } from "@better-ccflare/types";
+import type { Account, ComboFamily } from "@better-ccflare/types";
+import { LATEST_MODEL_BY_FAMILY } from "./models";
 import { safeJsonParse, validateModelMappings } from "./validation";
 
 const log = new Logger("ModelMappings");
@@ -27,6 +28,36 @@ export function getModelFamily(
 		}
 	}
 	return null;
+}
+
+/**
+ * Check whether a stored value is a bare "family alias" — the literal family
+ * name itself (e.g. "opus") used as a placeholder meaning "resolve to the
+ * latest model in this family at read time", instead of a concrete model ID.
+ * Comparison is trim + case-insensitive.
+ */
+export function isFamilyAliasModel(
+	value: string,
+	family: ComboFamily,
+): boolean {
+	return value.trim().toLowerCase() === family;
+}
+
+/**
+ * Resolve a stored managed-model/slot-model value that may be a bare family
+ * alias into a concrete model ID. If `value` (trimmed) equals the family name
+ * itself, returns the currently-latest model for that family
+ * (LATEST_MODEL_BY_FAMILY). Otherwise returns the trimmed value unchanged.
+ */
+export function resolveFamilyAliasModel(
+	value: string,
+	family: ComboFamily,
+): string {
+	const trimmed = value.trim();
+	if (trimmed.toLowerCase() === family) {
+		return LATEST_MODEL_BY_FAMILY[family];
+	}
+	return trimmed;
 }
 
 /**

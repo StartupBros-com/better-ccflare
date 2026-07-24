@@ -158,6 +158,20 @@ Rollback is a partial family-policy update:
 
 Do not replace the whole assignment when rolling back. The partial update immediately stops virtual enrollment while retaining the combo assignment, Manual slots, enrollment rules, Managed model, and exclusions for inspection or a later retry.
 
+### Family-alias managed models
+
+A family's `managed_model`, and an individual Manual slot's `model`, can hold either a concrete logical model ID or a bare family-alias literal — the family's own name (`opus`, `sonnet`, `haiku`, or `fable`, case-insensitive). An alias means "track the latest model in this family": it is resolved to the current concrete model at read and request time, and is never rewritten to a concrete value by that resolution. Shipping a new latest model for a family only requires the latest-model mapping bump in `models.ts` plus a deploy; it does not require a policy migration, a new preview, or an apply step against existing alias-valued assignments or slots.
+
+The dashboard and CLI always show what an alias currently resolves to alongside the stored literal (for example, `opus → claude-opus-5`) instead of displaying the bare word unexplained.
+
+**Rollback caveat:** a binary built before family-alias support does not know how to resolve the alias literal — it would treat the stored word as a real (and nonsensical) model ID. Before rolling production back to a pre-alias-feature binary, run:
+
+```bash
+better-ccflare --resolve-family-policy-aliases
+```
+
+This idempotent maintenance sweep rewrites every stored alias — in both the family's `managed_model` policy field and any Manual slot's `model` field, across every family — to its currently-resolved concrete model, so the older binary only ever sees concrete IDs.
+
 ## Excluding and restoring an account
 
 An exclusion removes one account's virtual Managed candidate from one active family route. It does not pause the account globally, affect other families, or remove an enabled Manual slot.

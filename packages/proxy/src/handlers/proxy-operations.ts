@@ -217,6 +217,15 @@ export interface ModelFallbackExecutionPolicy {
 	 * discovered while proxyWithAccount is already running.
 	 */
 	readonly isFinalSemanticAttempt?: () => boolean;
+	/**
+	 * Pre-override model (effectiveModel at selection time) when a combo
+	 * slot's model override applies to this attempt; null/absent for a plain
+	 * route, an implicit-fallback route, or the post-combo fallback re-route.
+	 * Populated only by the genuine combo-slot call site in proxy.ts so the
+	 * combo-vs-implicit-fallback distinction never has to be inferred from
+	 * modelOverride alone.
+	 */
+	readonly comboModelOverrideFrom?: string | null;
 }
 
 export function createContextAdmissionTracker(
@@ -1613,11 +1622,16 @@ export async function proxyWithAccount(
 			requestBodyContext ?? new RequestBodyContext(requestBodyBuffer);
 		let effectiveBodyContext = baseBodyContext;
 		let effectiveBodyBuffer = baseBodyContext.getBuffer();
+		// True only once the override is actually patched into the outgoing body —
+		// a failed patch falls through to the original body, so applied_model must
+		// not claim a model that was never really sent upstream.
+		let modelOverrideApplied = false;
 		if (modelOverride && effectiveBodyBuffer) {
 			const overriddenContext = baseBodyContext.withPatchedModel(modelOverride);
 			if (overriddenContext) {
 				effectiveBodyContext = overriddenContext;
 				effectiveBodyBuffer = overriddenContext.getBuffer();
+				modelOverrideApplied = true;
 
 				if (
 					process.env.DEBUG?.includes("proxy") ||
@@ -1635,6 +1649,24 @@ export async function proxyWithAccount(
 				effectiveBodyBuffer = baseBodyContext.getBuffer();
 			}
 		}
+
+		// Model observability for this specific attempt (success-conditioned):
+		// modelOverride and modelFallbackPolicy are plain function
+		// arguments/closures, never mutated after this call started, so these
+		// stay correctly scoped to THIS attempt even if the eventual response is
+		// retained by the routing ledger and delivered later, after subsequent
+		// attempts (including a non-combo fallback) have already run. Combo
+		// override info is attributed only when the override actually made it
+		// into the outgoing body — never a stale value from a failed slot.
+		const attemptAppliedModel = modelOverrideApplied
+			? (modelOverride as string)
+			: (requestMeta.appliedModel ?? null);
+		const comboModelOverrideFrom = modelOverrideApplied
+			? (modelFallbackPolicy?.comboModelOverrideFrom ?? null)
+			: null;
+		const comboModelOverrideTo = comboModelOverrideFrom
+			? (modelOverride as string)
+			: null;
 
 		// Get the provider for this account before applying the staging policy: the
 		// resolved provider (including ctx fallback) determines replay safety.
@@ -4179,10 +4211,12 @@ export async function proxyWithAccount(
 						failoverAttempts: terminalFailoverAttempts,
 						agentUsed: requestMeta.agentUsed,
 						originalModel: requestMeta.originalModel,
-						appliedModel: requestMeta.appliedModel,
+						appliedModel: attemptAppliedModel,
 						attemptedModel: currentTransportModel,
 						agentAttributionSource: requestMeta.agentAttributionSource ?? null,
 						comboName: comboNameAtAttempt,
+						comboModelOverrideFrom,
+						comboModelOverrideTo,
 						apiKeyId,
 						apiKeyName,
 						xaiCacheIdentityFingerprint:
@@ -4266,10 +4300,12 @@ export async function proxyWithAccount(
 				failoverAttempts,
 				agentUsed: requestMeta.agentUsed,
 				originalModel: requestMeta.originalModel,
-				appliedModel: requestMeta.appliedModel,
+				appliedModel: attemptAppliedModel,
 				attemptedModel: currentTransportModel,
 				agentAttributionSource: requestMeta.agentAttributionSource ?? null,
 				comboName: requestMeta.comboName,
+				comboModelOverrideFrom,
+				comboModelOverrideTo,
 				apiKeyId,
 				apiKeyName,
 				xaiCacheIdentityFingerprint: requestMeta.xaiCacheIdentityFingerprint,

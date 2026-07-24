@@ -18,7 +18,29 @@ export type AlertType =
 	| "anomaly_output_blowup"
 	| "anomaly_runaway_loop"
 	| "anomaly_model_misrouting"
-	| "auth_failure";
+	| "auth_failure"
+	| "model_routing_drift";
+
+/**
+ * Discriminates the two staleness classes detected under the
+ * `model_routing_drift` alert type (see AlertService.buildModelRoutingDriftAlerts
+ * in packages/http-api/src/services/alerts.ts):
+ * - `stale_policy`: a combo's stored model override rewrites traffic AWAY
+ *   from what is currently the family's canonical latest model — the "Opus 5
+ *   incident", where a pinned combo policy silently downgraded every request
+ *   for hours after a new model released.
+ * - `unknown_model`: a client requested a plausibly-shaped Claude model ID
+ *   that isn't in the bundled catalog (CLAUDE_MODEL_IDS) — the day-0 signal
+ *   that packages/core/src/models.ts itself needs a bump.
+ *
+ * There is no dedicated schema column for this discriminator (the `alerts`
+ * table's fixed columns are shared by every alert type). Following how other
+ * alert types pack extra semantics into the existing fields instead of a
+ * generic payload, the reason is carried in the alert `id`'s cooldown-bucket
+ * scope (`model_routing_drift:<reason>:...`, via buildThresholdAlertId) and
+ * spelled out in `title`/`message`.
+ */
+export type ModelRoutingDriftReason = "stale_policy" | "unknown_model";
 
 /** A single alert raised by the alert engine. */
 export interface AlertEvent {

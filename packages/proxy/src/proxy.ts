@@ -950,12 +950,18 @@ async function handleProxyCore(
 		candidateId: string,
 		forwardModelUnavailableResponse: boolean,
 		currentlyFinalSemanticRoute: boolean,
+		// Pre-override model (effectiveModel) when this attempt is a genuine
+		// combo-slot override; null for the fallback loop and every other
+		// caller (default), so the combo-vs-implicit-fallback distinction is
+		// never inferred from modelOverride alone.
+		comboModelOverrideFrom: string | null = null,
 	): ModelFallbackExecutionPolicy => {
 		const comboName = requestMeta.comboName ?? null;
 		const comboSlotIndex = requestMeta.comboSlotIndex ?? null;
 		return {
 			routeCandidateId: candidateId,
 			forwardModelUnavailableResponse,
+			comboModelOverrideFrom,
 			// proxyWithAccount combines this currently-known queue finality with its
 			// account/model-specific implicit-fallback discovery state immediately
 			// before each real fetch and semantic gate.
@@ -1098,6 +1104,10 @@ async function handleProxyCore(
 					candidateId,
 					isFinalSelectedCandidate,
 					isFinalSelectedSemanticRoute,
+					// Only a genuine combo slot carries a pre-override baseline;
+					// the desync edge case above leaves modelOverride null so no
+					// override is attributed there either.
+					modelOverride ? effectiveModel : null,
 				),
 			);
 		} catch (error) {

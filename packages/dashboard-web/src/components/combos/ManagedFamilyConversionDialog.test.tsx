@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { LATEST_MODEL_BY_FAMILY } from "@better-ccflare/core";
 import type {
 	ComboRoutingPreviewResult,
 	ComboRoutingProposalPreview,
@@ -257,6 +258,13 @@ describe("ManagedFamilyConversionDialog", () => {
 		expect(
 			isManagedFamilyPreviewCurrent(data, "opus", "claude-opus-preview"),
 		).toBe(false);
+		expect(
+			isManagedFamilyPreviewCurrent(
+				{ ...data, managed_model: LATEST_MODEL_BY_FAMILY.opus },
+				"opus",
+				"opus",
+			),
+		).toBe(true);
 		expect(
 			buildManagedFamilyApplyCommand(
 				data,

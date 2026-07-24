@@ -4,7 +4,10 @@ import {
 	type AuthFailureEvt,
 	alertEvents,
 	authFailureEvents,
+	getModelFamily,
 	getModelRates,
+	isValidModelId,
+	LATEST_MODEL_BY_FAMILY,
 	type RequestEvt,
 	requestEvents,
 } from "@better-ccflare/core";
@@ -149,6 +152,117 @@ export function buildRequestTokenAlert(
 	};
 }
 
+// Plausible-shape guard for Claude model IDs. getModelFamily() is a cheap
+// substring match (see packages/core/src/model-mappings.ts) that would
+// otherwise fire on arbitrary strings that merely *contain* a family word
+// (e.g. some unrelated identifier with "opus" inside it); this regex
+// requires the string to actually look like a `claude-<family>...` model ID
+// before we treat it as a genuine (if unrecognized) Claude model request.
+const CLAUDE_MODEL_SHAPE_RE = /^claude-(opus|sonnet|haiku|fable)(-|$)/i;
+
+/**
+ * Detects the "Opus 5 incident" class of model-routing staleness: a combo
+ * slot's stored model override rewrote a request AWAY from what is
+ * currently the family's canonical latest model (LATEST_MODEL_BY_FAMILY).
+ * Only evaluated when the proxy itself reports a combo override applied via
+ * `comboModelOverride` — agent-preference rewrites never populate that
+ * field (see packages/proxy/src/usage-collector.ts), so they can never
+ * trigger this alert. A healthy upgrade (from an older model to the new
+ * latest) is silent because `from` is not the family's latest in that case.
+ */
+export function buildStalePolicyDriftAlert(
+	request: RequestResponse,
+	config: AlertsConfigPayload,
+	timestamp: number,
+): AlertEvent | null {
+	const override = request.comboModelOverride;
+	if (!override) return null;
+	const { from, to } = override;
+	const family = getModelFamily(from);
+	if (!family) return null;
+	if (LATEST_MODEL_BY_FAMILY[family] !== from) return null;
+	return {
+		id: buildThresholdAlertId(
+			"model_routing_drift",
+			`stale_policy:${family}:${to}`,
+			timestamp,
+			config.cooldownMinutes,
+		),
+		timestamp,
+		type: "model_routing_drift",
+		severity: "critical",
+		title: "Model routing policy appears stale",
+		message: `${family} routing policy rewrites ${from} -> ${to}, but ${from} is the current latest ${family} model — the combo policy appears stale; update the combo or switch it to the '${family}' alias`,
+		value: null,
+		threshold: null,
+		account: request.accountUsed,
+		model: to,
+		project: request.project ?? null,
+		requestId: request.id,
+		acknowledged: false,
+	};
+}
+
+/**
+ * Detects the day-0 signal that packages/core/src/models.ts itself needs a
+ * bump: a client requested a plausibly-shaped Claude model ID that isn't in
+ * the bundled catalog (CLAUDE_MODEL_IDS). Uses the pre-override
+ * (client-requested) model when any rewrite occurred (combo or agent), else
+ * the request's own model — mirroring how `originalModel`/`model` are
+ * persisted (see packages/types/src/request.ts).
+ */
+export function buildUnknownModelDriftAlert(
+	request: RequestResponse,
+	config: AlertsConfigPayload,
+	timestamp: number,
+): AlertEvent | null {
+	const requestedModel = request.originalModel ?? request.model;
+	if (!requestedModel) return null;
+	if (!CLAUDE_MODEL_SHAPE_RE.test(requestedModel)) return null;
+	if (isValidModelId(requestedModel)) return null;
+	const family = getModelFamily(requestedModel);
+	if (!family) return null;
+	return {
+		id: buildThresholdAlertId(
+			"model_routing_drift",
+			`unknown_model:${family}`,
+			timestamp,
+			config.cooldownMinutes,
+		),
+		timestamp,
+		type: "model_routing_drift",
+		severity: "warning",
+		title: "Unknown model requested",
+		message: `clients are requesting ${requestedModel} (family ${family}) which is not in the bundled model catalog — bump CLAUDE_MODEL_IDS/LATEST_* in packages/core/src/models.ts and deploy`,
+		value: null,
+		threshold: null,
+		account: request.accountUsed,
+		model: requestedModel,
+		project: request.project ?? null,
+		requestId: request.id,
+		acknowledged: false,
+	};
+}
+
+/**
+ * Evaluates both model-routing-drift staleness classes for a single request
+ * summary. Pure and synchronous like buildRequestTokenAlert — evaluateRequest
+ * runs it from the async requestEvents "summary" listener, never from the
+ * proxy hot path.
+ */
+export function buildModelRoutingDriftAlerts(
+	request: RequestResponse,
+	config: AlertsConfigPayload,
+	timestamp: number,
+): AlertEvent[] {
+	const alerts: AlertEvent[] = [];
+	const stalePolicy = buildStalePolicyDriftAlert(request, config, timestamp);
+	if (stalePolicy) alerts.push(stalePolicy);
+	const unknownModel = buildUnknownModelDriftAlert(request, config, timestamp);
+	if (unknownModel) alerts.push(unknownModel);
+	return alerts;
+}
+
 function toAlertEvent(row: AlertRow): AlertEvent {
 	return {
 		id: row.id,
@@ -275,6 +389,11 @@ export class AlertService {
 		const requestAlert = buildRequestTokenAlert(request, config);
 		if (requestAlert) alerts.push(requestAlert);
 		const timestamp = parseTimestamp(request.timestamp);
+		// Async by construction: this listener is invoked off the requestEvents
+		// "summary" emitter (see requestListener in the constructor above),
+		// never from the proxy's hot path, so evaluating model-routing drift
+		// here adds no request latency.
+		alerts.push(...buildModelRoutingDriftAlerts(request, config, timestamp));
 		alerts.push(
 			...(await this.buildAggregateAlerts(timestamp, request, config)),
 		);

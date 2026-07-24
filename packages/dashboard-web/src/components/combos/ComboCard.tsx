@@ -4,7 +4,10 @@ import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "../ui/card";
 import { Switch } from "../ui/switch";
-import type { FamilyRoutingProjection } from "./family-routing";
+import {
+	type FamilyRoutingProjection,
+	formatPolicyModel,
+} from "./family-routing";
 
 export interface ComboFamilyRoutingCardState {
 	assignment: ComboFamilyAssignment;
@@ -130,7 +133,14 @@ export function ComboCard({
 
 										{assignment.membership_mode === "managed" && (
 											<p className="break-all text-xs text-muted-foreground">
-												{`Logical model: ${assignment.managed_model ?? "Not configured"}`}
+												{`Logical model: ${
+													assignment.managed_model
+														? formatPolicyModel(
+																assignment.managed_model,
+																assignment.family,
+															)
+														: "Not configured"
+												}`}
 											</p>
 										)}
 

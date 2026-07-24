@@ -104,6 +104,13 @@ export interface RequestResponse {
 	comboName?: string;
 	originalModel?: string;
 	appliedModel?: string;
+	// Present only when a combo slot's model override actually applied on the
+	// successful attempt and differs from the pre-override (effectiveModel)
+	// baseline; null when no combo override applied or it resolved to the
+	// same model. Lets a follow-up alerting change detect policy-driven model
+	// downgrades that would otherwise be invisible in `model`/`appliedModel`
+	// alone (see the "Opus 5 incident").
+	comboModelOverride?: { from: string; to: string } | null;
 	// Derived from statusCode === 429 server-side so the list view can render
 	// the "Rate Limited" badge without lazy-loading the full payload.
 	rateLimited?: boolean;
