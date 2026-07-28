@@ -37,7 +37,7 @@ flowchart TD
     G --> H
     H --> I{"Any account available<br/>after throttling?"}
     I -->|"No"| J{"Why is the pool empty?"}
-    J -->|"Capacity filter emptied<br/>a non-empty candidate list"| K["429 rate_limit_error<br/>code: model_family_exhausted"]
+    J -->|"Capacity filter emptied<br/>a non-empty candidate list"| K["429 rate_limit_error<br/>code: model_pool_exhausted"]
     J -->|"Usage-throttling emptied<br/>an otherwise non-empty list"| L["529 overloaded_error<br/>(usage-throttled)"]
     J -->|"Strategy itself found nothing<br/>(all paused / rate-limited)"| M["503 pool_exhausted"]
     I -->|"Yes"| N["Dispatch: try candidates in order"]
@@ -54,11 +54,11 @@ flowchart TD
 
 ## The Three Load-Balancing Strategies
 
-`lb_strategy` selects one of four implementations (`packages/load-balancer/src/strategies/`), all constructed in `apps/server/src/server.ts`. All four return an ordered list of candidate accounts; the first entry is tried first, the rest are failover order.
+`lb_strategy` selects one of three implementations (`packages/load-balancer/src/strategies/`), all constructed in `apps/server/src/server.ts`. All three return an ordered list of candidate accounts; the first entry is tried first, the rest are failover order.
 
 ### session (SessionStrategy)
 
-The default strategy pins a client to one account for the configured session duration (5h by default) so prompt caches stay warm, and only rotates to a new account once that session expires, the account becomes unavailable, or a higher-priority account frees up. Unlike the drain-soonest variant below, an active session *can* be preempted — but only by a strictly higher-priority account, never by a same-or-lower-priority one. Auto-fallback candidates are checked first on every call; if one becomes eligible, its session is reset but it is not force-ranked to the top — it is simply included in a fresh priority-sorted list, avoiding a priority inversion if an even-higher-priority account is already available.
+The default strategy pins a client to one account for the configured session duration (5h by default) so prompt caches stay warm, and only rotates to a new account once that session expires, the account becomes unavailable, or a higher-priority account frees up. An active session *can* be preempted — but only by a strictly higher-priority account, never by a same-or-lower-priority one. Auto-fallback candidates are checked first on every call; if one becomes eligible, its session is reset but it is not force-ranked to the top — it is simply included in a fresh priority-sorted list, avoiding a priority inversion if an even-higher-priority account is already available.
 
 ```mermaid
 flowchart TD
@@ -146,7 +146,7 @@ flowchart TD
     F -->|"No"| H["Account stays in<br/>the candidate pool"]
     E --> I{"Did excluding accounts empty an<br/>otherwise non-empty candidate pool?"}
     G --> I
-    I -->|"Yes"| J["429 model_family_exhausted —<br/>origin is telemetry_confirmed only if<br/>EVERY excluded account was confirmed,<br/>else recent_upstream_rejection"]
+    I -->|"Yes"| J["429 model_pool_exhausted —<br/>origin is telemetry_confirmed only if<br/>EVERY excluded account was confirmed,<br/>else recent_upstream_rejection"]
     I -->|"No"| K["Return the remaining accounts"]
 ```
 

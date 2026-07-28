@@ -842,4 +842,310 @@ describe("Database Migrations — non-destructive account dedup", () => {
 			expect(v).not.toBeNull();
 		}
 	});
+
+	// Regression tests for the code-review finding "dedup silently
+	// CASCADE-deletes combo_membership_exclusions" (and the companion
+	// device_setup_jobs gap). All tests above run with SQLite's default
+	// `PRAGMA foreign_keys = OFF`, so the `combo_membership_exclusions`
+	// `ON DELETE CASCADE` FK never actually fires against them — production
+	// unconditionally enables `PRAGMA foreign_keys = ON` in
+	// `configureSqlite()`, which always runs before `runMigrations()`. These
+	// tests enable the pragma explicitly to reproduce that real ordering, so
+	// a regression here would actually destroy operator-configured exclusion
+	// rows in production even though it wouldn't fail in CI without this.
+	describe("dependent-row repointing with PRAGMA foreign_keys = ON", () => {
+		it("repoints combo_membership_exclusions.account_id instead of losing it to ON DELETE CASCADE", () => {
+			db.exec("PRAGMA foreign_keys = ON");
+			setupFullSchemaForDedupTest(db);
+
+			const now = Date.now();
+			db.prepare(
+				`INSERT INTO accounts (id, name, provider, refresh_token, access_token, created_at, last_used, refresh_token_issued_at, custom_endpoint)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			).run(
+				"alpha-1",
+				"alpha",
+				"anthropic",
+				"r1",
+				"a1",
+				now - 5000,
+				now,
+				now - 5000,
+				null,
+			);
+			db.prepare(
+				`INSERT INTO accounts (id, name, provider, refresh_token, access_token, created_at, last_used, refresh_token_issued_at, custom_endpoint)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			).run(
+				"alpha-2",
+				"alpha",
+				"anthropic",
+				"r2",
+				"a2",
+				now - 5000,
+				now - 100000,
+				now - 5000,
+				null,
+			);
+
+			db.prepare(
+				`INSERT INTO combos (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)`,
+			).run("combo-1", "my-combo", now, now);
+
+			// Exclusion on the DISCARDED duplicate (alpha-2). Without
+			// repointing, the final `DELETE FROM accounts` would cascade
+			// through the `ON DELETE CASCADE` FK on
+			// combo_membership_exclusions.account_id and destroy this row —
+			// silently, with no error and no log line.
+			db.prepare(
+				`INSERT INTO combo_membership_exclusions (id, family, combo_id, account_id, created_at)
+				 VALUES (?, ?, ?, ?, ?)`,
+			).run("excl-1", "opus", "combo-1", "alpha-2", now);
+
+			runMigrations(db);
+
+			const exclusions = db
+				.prepare(`SELECT id, account_id FROM combo_membership_exclusions`)
+				.all() as Array<{ id: string; account_id: string }>;
+			expect(exclusions).toHaveLength(1);
+			expect(exclusions[0]?.id).toBe("excl-1");
+			expect(exclusions[0]?.account_id).toBe("alpha-1");
+		});
+
+		it("resolves a UNIQUE(family, combo_id, account_id) collision by dropping the discarded row instead of throwing", () => {
+			db.exec("PRAGMA foreign_keys = ON");
+			setupFullSchemaForDedupTest(db);
+
+			const now = Date.now();
+			db.prepare(
+				`INSERT INTO accounts (id, name, provider, refresh_token, access_token, created_at, last_used, refresh_token_issued_at, custom_endpoint)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			).run(
+				"alpha-1",
+				"alpha",
+				"anthropic",
+				"r1",
+				"a1",
+				now - 5000,
+				now,
+				now - 5000,
+				null,
+			);
+			db.prepare(
+				`INSERT INTO accounts (id, name, provider, refresh_token, access_token, created_at, last_used, refresh_token_issued_at, custom_endpoint)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			).run(
+				"alpha-2",
+				"alpha",
+				"anthropic",
+				"r2",
+				"a2",
+				now - 5000,
+				now - 100000,
+				now - 5000,
+				null,
+			);
+
+			db.prepare(
+				`INSERT INTO combos (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)`,
+			).run("combo-1", "combo-one", now, now);
+			db.prepare(
+				`INSERT INTO combos (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)`,
+			).run("combo-2", "combo-two", now, now);
+
+			// The survivor (alpha-1) AND the discarded duplicate (alpha-2)
+			// both already have an exclusion row for the SAME (family,
+			// combo_id) = (opus, combo-1). A blind repoint UPDATE of the
+			// discarded row onto alpha-1 would violate
+			// UNIQUE(family, combo_id, account_id) — the migration must drop
+			// that colliding discarded row instead of throwing.
+			db.prepare(
+				`INSERT INTO combo_membership_exclusions (id, family, combo_id, account_id, created_at)
+				 VALUES (?, ?, ?, ?, ?)`,
+			).run("excl-survivor", "opus", "combo-1", "alpha-1", now);
+			db.prepare(
+				`INSERT INTO combo_membership_exclusions (id, family, combo_id, account_id, created_at)
+				 VALUES (?, ?, ?, ?, ?)`,
+			).run("excl-loser-colliding", "opus", "combo-1", "alpha-2", now);
+			// The discarded duplicate ALSO has a second, NON-colliding
+			// exclusion for a different combo (opus, combo-2), which the
+			// survivor has no row for. This is the discriminator: a naive
+			// "just let ON DELETE CASCADE clean up the discarded id" (i.e.
+			// no repointing at all) would destroy this row too, since it
+			// also still points at alpha-2 when the account row is deleted.
+			// A correct fix must repoint it to the survivor instead of
+			// losing it, even though the OTHER exclusion on the same
+			// discarded account had to be dropped for the collision above.
+			db.prepare(
+				`INSERT INTO combo_membership_exclusions (id, family, combo_id, account_id, created_at)
+				 VALUES (?, ?, ?, ?, ?)`,
+			).run("excl-loser-unique", "opus", "combo-2", "alpha-2", now);
+
+			expect(() => runMigrations(db)).not.toThrow();
+
+			const exclusions = db
+				.prepare(
+					`SELECT id, combo_id, account_id FROM combo_membership_exclusions ORDER BY combo_id`,
+				)
+				.all() as Array<{ id: string; combo_id: string; account_id: string }>;
+			// The colliding loser row is gone, but the non-colliding loser
+			// row survived by being repointed — not silently dropped along
+			// with it.
+			expect(exclusions).toHaveLength(2);
+			expect(exclusions[0]).toMatchObject({
+				id: "excl-survivor",
+				combo_id: "combo-1",
+				account_id: "alpha-1",
+			});
+			expect(exclusions[1]).toMatchObject({
+				id: "excl-loser-unique",
+				combo_id: "combo-2",
+				account_id: "alpha-1",
+			});
+		});
+
+		it("resolves a collision between two DISCARDED rows when the survivor has no exclusion for that combo", () => {
+			db.exec("PRAGMA foreign_keys = ON");
+			setupFullSchemaForDedupTest(db);
+
+			const now = Date.now();
+			const insertAccount = db.prepare(
+				`INSERT INTO accounts (id, name, provider, refresh_token, access_token, created_at, last_used, refresh_token_issued_at, custom_endpoint)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			);
+			// Three rows in ONE tuple group: alpha-1 survives (most recent
+			// last_used); alpha-2 and alpha-3 are both discarded.
+			insertAccount.run(
+				"alpha-1",
+				"alpha",
+				"anthropic",
+				"r1",
+				"a1",
+				now - 5000,
+				now,
+				now - 5000,
+				null,
+			);
+			insertAccount.run(
+				"alpha-2",
+				"alpha",
+				"anthropic",
+				"r2",
+				"a2",
+				now - 5000,
+				now - 100000,
+				now - 5000,
+				null,
+			);
+			insertAccount.run(
+				"alpha-3",
+				"alpha",
+				"anthropic",
+				"r3",
+				"a3",
+				now - 5000,
+				now - 200000,
+				now - 5000,
+				null,
+			);
+
+			db.prepare(
+				`INSERT INTO combos (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)`,
+			).run("combo-1", "combo-one", now, now);
+
+			// Neither collides with the SURVIVOR (alpha-1 has no exclusion at
+			// all) — they collide with EACH OTHER. Repointing both onto
+			// alpha-1 would produce two (opus, combo-1, alpha-1) rows and
+			// violate UNIQUE(family, combo_id, account_id), aborting the whole
+			// migration transaction. Exactly one must survive, repointed.
+			const insertExclusion = db.prepare(
+				`INSERT INTO combo_membership_exclusions (id, family, combo_id, account_id, created_at)
+				 VALUES (?, ?, ?, ?, ?)`,
+			);
+			insertExclusion.run("excl-loser-a", "opus", "combo-1", "alpha-2", now);
+			insertExclusion.run("excl-loser-b", "opus", "combo-1", "alpha-3", now);
+
+			expect(() => runMigrations(db)).not.toThrow();
+
+			const exclusions = db
+				.prepare(
+					`SELECT id, family, combo_id, account_id FROM combo_membership_exclusions`,
+				)
+				.all() as Array<{
+				id: string;
+				family: string;
+				combo_id: string;
+				account_id: string;
+			}>;
+			expect(exclusions).toHaveLength(1);
+			// Lowest id wins the tie-break; it is repointed, not dropped.
+			expect(exclusions[0]).toMatchObject({
+				id: "excl-loser-a",
+				family: "opus",
+				combo_id: "combo-1",
+				account_id: "alpha-1",
+			});
+		});
+
+		it("repoints device_setup_jobs.account_id from discarded ids to the survivor id", () => {
+			db.exec("PRAGMA foreign_keys = ON");
+			setupFullSchemaForDedupTest(db);
+
+			const now = Date.now();
+			db.prepare(
+				`INSERT INTO accounts (id, name, provider, refresh_token, access_token, created_at, last_used, refresh_token_issued_at, custom_endpoint)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			).run(
+				"alpha-1",
+				"alpha",
+				"anthropic",
+				"r1",
+				"a1",
+				now - 5000,
+				now,
+				now - 5000,
+				null,
+			);
+			db.prepare(
+				`INSERT INTO accounts (id, name, provider, refresh_token, access_token, created_at, last_used, refresh_token_issued_at, custom_endpoint)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			).run(
+				"alpha-2",
+				"alpha",
+				"anthropic",
+				"r2",
+				"a2",
+				now - 5000,
+				now - 100000,
+				now - 5000,
+				null,
+			);
+
+			// device_setup_jobs.account_id has no FK to accounts (fork-only
+			// lifecycle table), so this row references the DISCARDED
+			// duplicate without tripping any cascade — but it must still be
+			// repointed, or it's left pointing at an id that no longer
+			// exists once alpha-2 is deleted.
+			db.prepare(
+				`INSERT INTO device_setup_jobs (id, idempotency_key, request_fingerprint, provider, account_id, status, created_at, updated_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			).run(
+				"job-1",
+				"idem-1",
+				"fp-1",
+				"qwen",
+				"alpha-2",
+				"awaiting_authorization",
+				now,
+				now,
+			);
+
+			runMigrations(db);
+
+			const job = db
+				.prepare(`SELECT account_id FROM device_setup_jobs WHERE id = 'job-1'`)
+				.get() as { account_id: string };
+			expect(job.account_id).toBe("alpha-1");
+		});
+	});
 });

@@ -365,5 +365,125 @@ describe.skipIf(!livePgAvailable)(
 				await adapter.close();
 			}
 		});
+
+		it("merges duplicate-account credentials from a single consistent row, not independently per column", async () => {
+			// Regression test for a bug where collapseAccountDuplicatesPreservingStatePg
+			// computed refresh_token/refresh_token_issued_at, access_token, and
+			// expires_at via three INDEPENDENTLY-filtered subqueries. Each could
+			// pick a DIFFERENT duplicate row, producing a mismatched credential
+			// pair (e.g. a fresh refresh_token paired with a stale/unrelated
+			// access_token) that fails at the provider. The fix reads all four
+			// fields from the SAME freshest-row-with-a-refresh-token, mirroring
+			// the SQLite helper's single nested `WHERE rowid = (SELECT rowid ...)`
+			// structure.
+			const { SQL } = await import("bun");
+			const { BunSqlAdapter } = await import("./adapters/bun-sql-adapter");
+			const {
+				ensureSchemaPg,
+				runMigrationsPg,
+				collapseAccountDuplicatesPreservingStatePg,
+			} = await import("./migrations-pg");
+
+			// biome-ignore lint/style/noNonNullAssertion: guarded by describe.skipIf(!livePgAvailable)
+			const databaseUrl = process.env.DATABASE_URL!;
+			const sqlClient = new SQL({ url: databaseUrl });
+			const adapter = new BunSqlAdapter(sqlClient, false);
+
+			try {
+				await ensureSchemaPg(adapter);
+				await runMigrationsPg(adapter);
+
+				// runMigrationsPg only (re-)runs the collapse the first time
+				// idx_accounts_unique_name_provider_endpoint is missing (see
+				// the `if (uniqueAccountsIndexExists... === 0)` guard) — once
+				// it exists, the whole block, collapse included, is a no-op.
+				// Rather than fight that guard (dropping the index would
+				// also let the duplicate insert below race a concurrent
+				// re-create), call the collapse function directly — it's
+				// the unit under test for this regression, and it's already
+				// exported for exactly this purpose.
+				const now = Date.now();
+
+				// "newer" has the freshest refresh_token/refresh_token_issued_at
+				// (so it's the row the fix must source ALL credential fields
+				// from) but a NULL access_token/expires_at — e.g. a token that
+				// was just refreshed but not yet exchanged.
+				await adapter.unsafe(
+					`INSERT INTO accounts
+					   (id, name, provider, custom_endpoint, refresh_token, refresh_token_issued_at,
+					    access_token, expires_at, created_at, last_used)
+					 VALUES ($1, $2, $3, NULL, $4, $5, NULL, NULL, $6, $7)`,
+					[
+						"pg-dedup-newer",
+						"pg-dedup-cred-test",
+						"anthropic",
+						"r-new",
+						now,
+						now - 10_000,
+						now,
+					],
+				);
+				// "older" has a stale refresh_token/refresh_token_issued_at but
+				// a non-NULL access_token/expires_at. Pre-fix, the independent
+				// per-column subqueries would pull access_token/expires_at from
+				// THIS row (the only row with non-NULL values for those columns)
+				// while refresh_token comes from "newer" — a mismatched pair.
+				await adapter.unsafe(
+					`INSERT INTO accounts
+					   (id, name, provider, custom_endpoint, refresh_token, refresh_token_issued_at,
+					    access_token, expires_at, created_at, last_used)
+					 VALUES ($1, $2, $3, NULL, $4, $5, $6, $7, $8, $9)`,
+					[
+						"pg-dedup-older",
+						"pg-dedup-cred-test",
+						"anthropic",
+						"r-old",
+						now - 50_000,
+						"a-old-stale-token",
+						now + 999_999,
+						now - 20_000,
+						now - 50_000,
+					],
+				);
+
+				// Directly invoke the collapse (see the note above on why —
+				// runMigrationsPg's own retriggering of it is gated on the
+				// UNIQUE index not existing yet, which is no longer true
+				// after the ensureSchemaPg/runMigrationsPg call above).
+				await collapseAccountDuplicatesPreservingStatePg(adapter);
+
+				const rows = await adapter.query<{
+					id: string;
+					refresh_token: string | null;
+					access_token: string | null;
+					expires_at: string | number | null;
+					refresh_token_issued_at: string | number | null;
+				}>(
+					`SELECT id, refresh_token, access_token, expires_at, refresh_token_issued_at
+					 FROM accounts WHERE name = $1`,
+					["pg-dedup-cred-test"],
+				);
+
+				// Dedup must have collapsed the two duplicates into one row.
+				expect(rows).toHaveLength(1);
+				const survivor = rows[0];
+
+				// The freshest row ("newer") is the one with the freshest
+				// refresh_token, so its refresh_token wins.
+				expect(survivor?.refresh_token).toBe("r-new");
+				// access_token and expires_at must come from that SAME row
+				// ("newer"), i.e. stay NULL — NOT get backfilled from
+				// "older"'s unrelated access_token/expires_at.
+				expect(survivor?.access_token).toBeNull();
+				expect(survivor?.expires_at).toBeNull();
+			} finally {
+				// Clean up so a re-run of this test (or others sharing the
+				// database) doesn't see a stale duplicate-free leftover row.
+				await adapter.unsafe(`DELETE FROM accounts WHERE name = $1`, [
+					"pg-dedup-cred-test",
+				]);
+				await adapter.close();
+			}
+		});
 	},
 );

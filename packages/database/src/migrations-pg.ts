@@ -662,13 +662,24 @@ export async function addColumnTolerant(
  * deleted (see SQLite helper for the full rationale and column-by-column
  * rules). Dependent rows are repointed at the survivor's id before the
  * account row is removed: `combo_slots.account_id`, `requests.account_used`,
- * `usage_snapshots.account_id`. `combo_slots.account_id` has a real
- * `ON DELETE CASCADE` FK, so without this repointing we would silently
- * delete combo configurations. `requests.account_used` and
- * `usage_snapshots.account_id` are plain TEXT columns with no FK, so
- * without this repointing the request history would orphan.
+ * `usage_snapshots.account_id`, `combo_membership_exclusions.account_id`,
+ * `device_setup_jobs.account_id`. `combo_slots.account_id` and
+ * `combo_membership_exclusions.account_id` both have a real `ON DELETE
+ * CASCADE` FK, so without this repointing we would silently delete combo
+ * configurations / operator-configured exclusions. `combo_membership_
+ * exclusions` also has a UNIQUE(family, combo_id, account_id) index, so
+ * colliding discarded rows are dropped rather than repointed (see the
+ * collision handling below). `requests.account_used`,
+ * `usage_snapshots.account_id`, and `device_setup_jobs.account_id` are
+ * plain TEXT columns with no FK, so without this repointing the request
+ * history / usage history / device-setup jobs would orphan.
  *
  * Idempotent — a no-op on already-deduped accounts.
+ *
+ * Exported (unlike its SQLite twin) so tests can invoke the collapse
+ * directly instead of only through `runMigrationsPg`'s
+ * `idx_accounts_unique_name_provider_endpoint`-exists guard, which only
+ * re-runs the collapse the first time the index is missing.
  */
 /**
  * Duplicate-group scope for the survivor merge below. PostgreSQL permits a
@@ -690,7 +701,7 @@ function pgFreshest(col: string): string {
 		    LIMIT 1)`;
 }
 
-async function collapseAccountDuplicatesPreservingStatePg(
+export async function collapseAccountDuplicatesPreservingStatePg(
 	adapter: BunSqlAdapter,
 ): Promise<void> {
 	// Find every tuple with > 1 row. COALESCE(custom_endpoint,'') is the
@@ -710,6 +721,9 @@ async function collapseAccountDuplicatesPreservingStatePg(
 	let totalRepointedSlots = 0;
 	let totalRepointedRequests = 0;
 	let totalRepointedSnapshots = 0;
+	let totalRepointedExclusions = 0;
+	let totalDroppedCollidingExclusions = 0;
+	let totalRepointedDeviceSetupJobs = 0;
 
 	for (const grp of groups) {
 		// Pick the survivor per tuple group.
@@ -739,36 +753,41 @@ async function collapseAccountDuplicatesPreservingStatePg(
 		const discardedIds = discardedRows.map((r) => r.id);
 
 		// Best (most-recently-issued) credentials from any row in the group.
+		// refresh_token, access_token, expires_at, and refresh_token_issued_at
+		// are all read from the SAME single row — the freshest row that has a
+		// non-empty refresh_token — via one nested `id = (SELECT id ...)`
+		// lookup repeated identically in each subquery below. This mirrors the
+		// SQLite helper's `WHERE rowid = (SELECT rowid ... )` structure: it
+		// guarantees the four fields describe one consistent credential set
+		// rather than being independently recomputed (which previously let
+		// access_token/expires_at come from a DIFFERENT duplicate row than
+		// refresh_token — a mismatched pair that fails at the provider).
+		// api_key intentionally keeps its own separate criterion (freshest row
+		// that has a non-empty api_key), since API-key providers have no
+		// refresh_token at all.
+		const FRESHEST_CREDENTIAL_ROW_ID = `(SELECT id FROM accounts
+			      WHERE name = $1 AND provider = $2 AND COALESCE(custom_endpoint, '') = $3
+			        AND refresh_token IS NOT NULL AND refresh_token <> ''
+			      ORDER BY COALESCE(refresh_token_issued_at, 0) DESC, ctid::text ASC
+			      LIMIT 1)`;
 		const mergedRows = (await adapter.unsafe(
 			`SELECT
 			   (SELECT refresh_token FROM accounts
-			    WHERE name = $1 AND provider = $2 AND COALESCE(custom_endpoint, '') = $3
-			      AND refresh_token IS NOT NULL AND refresh_token <> ''
-			    ORDER BY COALESCE(refresh_token_issued_at, 0) DESC, ctid::text ASC
-			    LIMIT 1) AS merged_refresh_token,
+			    WHERE id = ${FRESHEST_CREDENTIAL_ROW_ID}) AS merged_refresh_token,
 			   (SELECT access_token FROM accounts
-			    WHERE name = $1 AND provider = $2 AND COALESCE(custom_endpoint, '') = $3
-			      AND access_token IS NOT NULL AND access_token <> ''
-			    ORDER BY COALESCE(refresh_token_issued_at, 0) DESC, ctid::text ASC
-			    LIMIT 1) AS merged_access_token,
+			    WHERE id = ${FRESHEST_CREDENTIAL_ROW_ID}) AS merged_access_token,
 			   (SELECT expires_at FROM accounts
-			    WHERE name = $1 AND provider = $2 AND COALESCE(custom_endpoint, '') = $3
-			      AND expires_at IS NOT NULL
-			    ORDER BY COALESCE(refresh_token_issued_at, 0) DESC, ctid::text ASC
-			    LIMIT 1) AS merged_expires_at,
+			    WHERE id = ${FRESHEST_CREDENTIAL_ROW_ID}) AS merged_expires_at,
 			   (SELECT api_key FROM accounts
 			    WHERE name = $1 AND provider = $2 AND COALESCE(custom_endpoint, '') = $3
 			      AND api_key IS NOT NULL AND api_key <> ''
 			    ORDER BY COALESCE(refresh_token_issued_at, 0) DESC, created_at DESC, ctid::text ASC
 			    LIMIT 1) AS merged_api_key,
 			   -- Read from the SAME freshest row as the three token fields
-			   -- above, using the identical ordering, so the survivor's
+			   -- above, using the identical nested lookup, so the survivor's
 			   -- issued-at always describes the tokens it actually holds.
 			   (SELECT refresh_token_issued_at FROM accounts
-			    WHERE name = $1 AND provider = $2 AND COALESCE(custom_endpoint, '') = $3
-			      AND refresh_token IS NOT NULL AND refresh_token <> ''
-			    ORDER BY COALESCE(refresh_token_issued_at, 0) DESC, ctid::text ASC
-			    LIMIT 1) AS merged_refresh_token_issued_at`,
+			    WHERE id = ${FRESHEST_CREDENTIAL_ROW_ID}) AS merged_refresh_token_issued_at`,
 			[grp.name, grp.provider, grp.ep],
 		)) as Array<{
 			merged_refresh_token: string | null;
@@ -888,6 +907,51 @@ async function collapseAccountDuplicatesPreservingStatePg(
 				[survivor.id, ...discardedIds],
 			);
 
+			// combo_membership_exclusions.account_id has a real `ON DELETE
+			// CASCADE` FK (like combo_slots), so without this repointing the
+			// DELETE below would silently destroy operator-configured
+			// exclusion rows. It also has a UNIQUE(family, combo_id,
+			// account_id) index, so a blind repoint can collide. Two distinct
+			// collisions are possible once a tuple group has three or more
+			// rows:
+			//   1. the survivor already holds an exclusion for the same
+			//      (family, combo_id); or
+			//   2. two or more DISCARDED rows hold one for the same
+			//      (family, combo_id) — repointing both at the survivor would
+			//      violate the UNIQUE index and abort the whole migration.
+			// Drop every discarded row that some other row in the merged set
+			// already covers, keeping the survivor's own row when it exists
+			// and otherwise the lowest-id discarded row, then repoint the
+			// non-colliding remainder.
+			const droppedCollidingExclusions = await adapter.runWithChanges(
+				`DELETE FROM combo_membership_exclusions
+				 WHERE account_id IN (${idListPlaceholders})
+				   AND EXISTS (
+				     SELECT 1 FROM combo_membership_exclusions AS keeper
+				     WHERE keeper.family = combo_membership_exclusions.family
+				       AND keeper.combo_id = combo_membership_exclusions.combo_id
+				       AND keeper.id <> combo_membership_exclusions.id
+				       AND (
+				         keeper.account_id = $1
+				         OR (keeper.account_id IN (${idListPlaceholders})
+				             AND keeper.id < combo_membership_exclusions.id)
+				       )
+				   )`,
+				[survivor.id, ...discardedIds],
+			);
+			const repointExclusions = await adapter.runWithChanges(
+				`UPDATE combo_membership_exclusions SET account_id = $1 WHERE account_id IN (${idListPlaceholders})`,
+				[survivor.id, ...discardedIds],
+			);
+
+			// device_setup_jobs.account_id has no FK (fork-only lifecycle
+			// table), so a missed repoint doesn't cascade-delete anything but
+			// still leaves the job row pointing at a dangling account id.
+			const repointDeviceSetupJobs = await adapter.runWithChanges(
+				`UPDATE device_setup_jobs SET account_id = $1 WHERE account_id IN (${idListPlaceholders})`,
+				[survivor.id, ...discardedIds],
+			);
+
 			const idPlaceholders = discardedIds.map((_, i) => `$${i + 1}`).join(",");
 			const deleted = await adapter.runWithChanges(
 				`DELETE FROM accounts WHERE id IN (${idPlaceholders})`,
@@ -898,6 +962,9 @@ async function collapseAccountDuplicatesPreservingStatePg(
 			totalRepointedSlots += repointSlots;
 			totalRepointedRequests += repointRequests;
 			totalRepointedSnapshots += repointSnapshots;
+			totalDroppedCollidingExclusions += droppedCollidingExclusions;
+			totalRepointedExclusions += repointExclusions;
+			totalRepointedDeviceSetupJobs += repointDeviceSetupJobs;
 		}
 	}
 
@@ -909,7 +976,10 @@ async function collapseAccountDuplicatesPreservingStatePg(
 				`(most recent last_used → refresh_token_issued_at → created_at → smallest ctid) ` +
 				`and merged request counts / priority / paused state from the rest. ` +
 				`Repointed ${totalRepointedSlots} combo slot(s), ${totalRepointedRequests} ` +
-				`request-history row(s), and ${totalRepointedSnapshots} usage-snapshot row(s) ` +
+				`request-history row(s), ${totalRepointedSnapshots} usage-snapshot row(s), ` +
+				`and ${totalRepointedExclusions} combo-membership-exclusion row(s) ` +
+				`(dropped ${totalDroppedCollidingExclusions} colliding duplicate exclusion(s)), ` +
+				`and repointed ${totalRepointedDeviceSetupJobs} device-setup-job row(s), ` +
 				`to the surviving account ids.`,
 		);
 	}

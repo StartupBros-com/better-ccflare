@@ -687,7 +687,15 @@ export function ensureSchema(db: Database): void {
  * For each tuple group the non-survivor rows are deleted only after their
  * state has been merged into the survivor and every dependent row
  * (`combo_slots.account_id`, `requests.account_used`,
- * `usage_snapshots.account_id`) has been repointed at the survivor's id.
+ * `usage_snapshots.account_id`, `combo_membership_exclusions.account_id`,
+ * `device_setup_jobs.account_id`) has been repointed at the survivor's id.
+ * `combo_membership_exclusions` has a real `ON DELETE CASCADE` FK to
+ * `accounts` (like `combo_slots`), so an unrepointed row there is silently
+ * destroyed by the DELETE; it also has a UNIQUE(family, combo_id,
+ * account_id) index, so colliding discarded rows are dropped rather than
+ * repointed (see the collision handling below). `device_setup_jobs` has no
+ * FK, so a missed repoint doesn't cascade-delete anything but still leaves
+ * the job pointing at a dangling id.
  * State that is merged into the survivor:
  *   - `refresh_token`, `access_token`, `expires_at`: from the row whose
  *     `refresh_token_issued_at` is most recent (i.e. freshest credentials).
@@ -873,6 +881,9 @@ function collapseAccountDuplicatesPreservingState(db: Database): void {
 	let totalRepointedSlots = 0;
 	let totalRepointedRequests = 0;
 	let totalRepointedSnapshots = 0;
+	let totalRepointedExclusions = 0;
+	let totalDroppedCollidingExclusions = 0;
+	let totalRepointedDeviceSetupJobs = 0;
 
 	for (const grp of dupGroups) {
 		const survivor = pickSurvivor.get(grp.name, grp.provider, grp.ep) as {
@@ -950,6 +961,54 @@ function collapseAccountDuplicatesPreservingState(db: Database): void {
 				)
 				.run(survivor.survivor_id, ...discardedIds);
 
+			// combo_membership_exclusions.account_id has a real `ON DELETE
+			// CASCADE` FK — like combo_slots, an unrepointed row here would be
+			// silently destroyed by the DELETE below. Unlike combo_slots it
+			// also has a UNIQUE(family, combo_id, account_id) index, so a
+			// blind repoint can collide. Two distinct collisions are possible
+			// once a tuple group has three or more rows:
+			//   1. the survivor already holds an exclusion for the same
+			//      (family, combo_id); or
+			//   2. two or more DISCARDED rows hold one for the same
+			//      (family, combo_id) — repointing both at the survivor would
+			//      violate the UNIQUE index and abort the whole migration.
+			// Drop every discarded row that some other row in the merged set
+			// already covers, keeping the survivor's own row when it exists
+			// and otherwise the lowest-id discarded row, then repoint the
+			// non-colliding remainder.
+			const dropCollidingExclusions = db
+				.prepare(
+					`DELETE FROM combo_membership_exclusions
+					 WHERE account_id IN (${placeholders})
+					   AND EXISTS (
+					     SELECT 1 FROM combo_membership_exclusions AS keeper
+					     WHERE keeper.family = combo_membership_exclusions.family
+					       AND keeper.combo_id = combo_membership_exclusions.combo_id
+					       AND keeper.id <> combo_membership_exclusions.id
+					       AND (
+					         keeper.account_id = ?
+					         OR (keeper.account_id IN (${placeholders})
+					             AND keeper.id < combo_membership_exclusions.id)
+					       )
+					   )`,
+				)
+				.run(...discardedIds, survivor.survivor_id, ...discardedIds);
+			const repointExclusions = db
+				.prepare(
+					`UPDATE combo_membership_exclusions SET account_id = ? WHERE account_id IN (${placeholders})`,
+				)
+				.run(survivor.survivor_id, ...discardedIds);
+
+			// device_setup_jobs.account_id has no FK (it's a fork-only
+			// lifecycle table), so a missed repoint doesn't cascade-delete
+			// anything, but it does leave the job row pointing at an id that
+			// no longer exists in accounts.
+			const repointDeviceSetupJobs = db
+				.prepare(
+					`UPDATE device_setup_jobs SET account_id = ? WHERE account_id IN (${placeholders})`,
+				)
+				.run(survivor.survivor_id, ...discardedIds);
+
 			const deleted = db
 				.prepare(`DELETE FROM accounts WHERE id IN (${placeholders})`)
 				.run(...discardedIds).changes;
@@ -958,6 +1017,13 @@ function collapseAccountDuplicatesPreservingState(db: Database): void {
 			totalRepointedSlots += Number(repointSlots.changes ?? 0);
 			totalRepointedRequests += Number(repointRequests.changes ?? 0);
 			totalRepointedSnapshots += Number(repointSnapshots.changes ?? 0);
+			totalDroppedCollidingExclusions += Number(
+				dropCollidingExclusions.changes ?? 0,
+			);
+			totalRepointedExclusions += Number(repointExclusions.changes ?? 0);
+			totalRepointedDeviceSetupJobs += Number(
+				repointDeviceSetupJobs.changes ?? 0,
+			);
 		}
 	}
 
@@ -969,7 +1035,10 @@ function collapseAccountDuplicatesPreservingState(db: Database): void {
 				`recent last_used → refresh_token_issued_at → created_at → smallest rowid) ` +
 				`and merged request counts / priority / paused state from the rest. ` +
 				`Repointed ${totalRepointedSlots} combo slot(s), ${totalRepointedRequests} ` +
-				`request-history row(s), and ${totalRepointedSnapshots} usage-snapshot row(s) ` +
+				`request-history row(s), ${totalRepointedSnapshots} usage-snapshot row(s), ` +
+				`and ${totalRepointedExclusions} combo-membership-exclusion row(s) ` +
+				`(dropped ${totalDroppedCollidingExclusions} colliding duplicate exclusion(s)), ` +
+				`and repointed ${totalRepointedDeviceSetupJobs} device-setup-job row(s), ` +
 				`to the surviving account ids.`,
 		);
 	}
