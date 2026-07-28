@@ -131,7 +131,9 @@ describe("model_routing_drift: stale_policy (Opus 5 incident)", () => {
 
 		expect(alert).not.toBeNull();
 		expect(alert.type).toBe("model_routing_drift");
-		expect(alert.severity).toBe("critical");
+		// warning, not critical: this predicate also matches a deliberate
+		// pinned-fallback slot, so critical would fire on supported config.
+		expect(alert.severity).toBe("warning");
 		expect(alert.id).toBe(
 			buildThresholdAlertId(
 				"model_routing_drift",
@@ -146,7 +148,13 @@ describe("model_routing_drift: stale_policy (Opus 5 incident)", () => {
 		expect(alert.message).toContain(
 			`${CLAUDE_MODEL_IDS.OPUS_5} is the current latest opus model`,
 		);
-		expect(alert.message).toContain("combo policy appears stale");
+		// The message must NOT assert staleness as fact: a deliberate pinned
+		// fallback slot produces this exact shape, so the wording has to offer
+		// both readings (severity is asserted above).
+		expect(alert.message).toContain(
+			"If this combo is meant to track the latest model",
+		);
+		expect(alert.message).toContain("deliberate pin, no action is needed");
 		expect(alert.message).toContain("'opus' alias");
 		expect(alert.model).toBe(CLAUDE_MODEL_IDS.OPUS_4_8);
 		expect(alert.requestId).toBe(request.id);

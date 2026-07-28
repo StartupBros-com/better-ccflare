@@ -875,7 +875,7 @@ const COMBO_FAMILIES: readonly ComboFamily[] = [
  * checking a stored value against all four is unambiguous regardless of
  * which family's combo it happens to live under.
  */
-async function resolveFamilyPolicyAliases(
+export async function resolveFamilyPolicyAliases(
 	dbOps: DatabaseOperations,
 ): Promise<void> {
 	let changeCount = 0;

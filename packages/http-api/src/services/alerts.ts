@@ -181,6 +181,18 @@ export function buildStalePolicyDriftAlert(
 	const family = getModelFamily(from);
 	if (!family) return null;
 	if (LATEST_MODEL_BY_FAMILY[family] !== from) return null;
+	// Severity is deliberately `warning`, not `critical`. This check cannot yet
+	// distinguish a genuinely stale policy from an operator's DELIBERATE pin: a
+	// combo fallback slot pinned to an older model is a documented, first-class
+	// feature (docs/combos.md), and every failover onto such a slot rewrites the
+	// family's latest model away — matching this predicate exactly. Firing
+	// `critical` on supported configuration is how an alert channel gets muted,
+	// which would then hide the real incident this exists to catch.
+	// FOLLOW-UP: thread an intentionality signal (was the slot alias-configured,
+	// or an explicit concrete pin?) from combo-membership-resolver through
+	// RoutingCandidateMetadata -> StartMessage -> RequestResponse.comboModelOverride,
+	// the same plumbing this feature already built for from/to. Once that exists,
+	// this can fire only on genuine drift and be promoted back to `critical`.
 	return {
 		id: buildThresholdAlertId(
 			"model_routing_drift",
@@ -190,9 +202,9 @@ export function buildStalePolicyDriftAlert(
 		),
 		timestamp,
 		type: "model_routing_drift",
-		severity: "critical",
-		title: "Model routing policy appears stale",
-		message: `${family} routing policy rewrites ${from} -> ${to}, but ${from} is the current latest ${family} model — the combo policy appears stale; update the combo or switch it to the '${family}' alias`,
+		severity: "warning",
+		title: "Model routing policy may be stale",
+		message: `${family} routing policy rewrites ${from} -> ${to}, and ${from} is the current latest ${family} model. If this combo is meant to track the latest model, update it or switch it to the '${family}' alias; if the older model is a deliberate pin, no action is needed.`,
 		value: null,
 		threshold: null,
 		account: request.accountUsed,

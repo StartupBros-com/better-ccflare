@@ -110,6 +110,13 @@ export interface RequestResponse {
 	// same model. Lets a follow-up alerting change detect policy-driven model
 	// downgrades that would otherwise be invisible in `model`/`appliedModel`
 	// alone (see the "Opus 5 incident").
+	//
+	// LIVE-ONLY: this is populated on the real-time summary event
+	// (packages/proxy/src/usage-collector.ts) and is NOT persisted — there is no
+	// combo_model_override column, so historical `GET /api/requests` reads never
+	// return it. That is sufficient for its consumer, the model-routing drift
+	// alert, which evaluates the live event stream. Persisting it would require
+	// a dual SQLite+Postgres migration per the repo's migration-parity rule.
 	comboModelOverride?: { from: string; to: string } | null;
 	// Derived from statusCode === 429 server-side so the list view can render
 	// the "Rate Limited" badge without lazy-loading the full payload.

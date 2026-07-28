@@ -1,7 +1,5 @@
 import {
 	getModelDisplayName,
-	getModelFamily,
-	isFamilyAliasModel,
 	resolveFamilyAliasModel,
 } from "@better-ccflare/core";
 import type {
@@ -40,6 +38,7 @@ import { Switch } from "../ui/switch";
 import {
 	type FamilyRoutingModelOption,
 	familyModelOptions as filterFamilyModelOptions,
+	resolvePolicyModelAlias,
 } from "./family-routing";
 import {
 	type ManagedFamilyApplyCommand,
@@ -112,19 +111,17 @@ export function runSerializedFamilyPolicyUpdate(
  * Label a stored managed_model value not present in the live catalog. A bare
  * family alias (e.g. "opus") is shown alongside the concrete model it
  * currently tracks so the fallback SelectItem never displays an unexplained
- * bare word; any other stored value keeps its normal display name.
+ * bare word; any other stored value keeps its normal display name. Alias
+ * detection/resolution is shared with `formatPolicyModel` via
+ * `resolvePolicyModelAlias`; only the final string formatting differs here.
  */
 function describeStoredManagedModel(
 	storedModel: string,
 	family?: ComboFamily,
 ): string {
-	const trimmed = storedModel.trim();
-	const candidateFamily = family ?? getModelFamily(trimmed) ?? undefined;
-	if (candidateFamily && isFamilyAliasModel(trimmed, candidateFamily)) {
-		const resolved = resolveFamilyAliasModel(trimmed, candidateFamily);
-		return `${trimmed} (tracks latest → ${getModelDisplayName(resolved)})`;
-	}
-	return getModelDisplayName(storedModel);
+	const resolution = resolvePolicyModelAlias(storedModel, family);
+	if (!resolution.isAlias) return getModelDisplayName(storedModel);
+	return `${resolution.trimmed} (tracks latest → ${getModelDisplayName(resolution.resolved)})`;
 }
 
 export function getManagedModelOptions(

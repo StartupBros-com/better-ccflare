@@ -79,6 +79,8 @@ describe("UsageCollector - RequestPayload.meta includes projectAttributionSource
 			accountName: null,
 			agentUsed: null,
 			comboName: null,
+			comboModelOverrideFrom: null,
+			comboModelOverrideTo: null,
 			apiKeyId: null,
 			apiKeyName: null,
 			retryAttempt: 0,

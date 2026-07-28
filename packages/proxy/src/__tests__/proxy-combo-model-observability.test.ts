@@ -21,11 +21,15 @@ import type {
 	ComboWithSlots,
 } from "@better-ccflare/types";
 import type { ProxyContext } from "../handlers";
+import {
+	getRateLimitProbeAdmission,
+	resetRateLimitProbeGatesForTests,
+} from "../handlers/rate-limit-cooldown";
 import { handleProxy } from "../proxy";
 import * as usageCollectorModule from "../usage-collector";
 import type { StartMessage } from "../worker-messages";
 
-function makeAccount(id: string): Account {
+function makeAccount(id: string, overrides: Partial<Account> = {}): Account {
 	return {
 		id,
 		name: id,
@@ -60,6 +64,7 @@ function makeAccount(id: string): Account {
 		pause_reason: null,
 		refresh_token_issued_at: null,
 		consecutive_rate_limits: 0,
+		...overrides,
 	};
 }
 
@@ -73,6 +78,7 @@ afterEach(() => {
 	for (const accountId of cachedUsageAccountIds) usageCache.delete(accountId);
 	cachedUsageAccountIds.clear();
 	globalThis.fetch = originalFetch;
+	resetRateLimitProbeGatesForTests();
 });
 
 function installUsageCollector(): ReturnType<typeof mock> {
@@ -211,6 +217,70 @@ describe("combo-override model observability", () => {
 		// persists these verbatim to requests.original_model/applied_model.
 		expect(startMessage.originalModel).toBe("claude-opus-4-5");
 		expect(startMessage.appliedModel).toBe("claude-haiku-4-5");
+		expect(startMessage.comboModelOverrideFrom).toBe("claude-opus-4-5");
+		expect(startMessage.comboModelOverrideTo).toBe("claude-haiku-4-5");
+	});
+
+	it("attributes the combo override on the probe-gate-suppressed ungated retry", async () => {
+		// Regression: when EVERY candidate is probe-gate suppressed, proxy.ts
+		// retries the first account ungated rather than 503-ing. That retry
+		// applies the combo slot's model override exactly like the main loop —
+		// but it used to call modelFallbackPolicyFor() without the
+		// comboModelOverrideFrom argument, so the 5th parameter fell back to its
+		// `= null` default. The rewrite still reached upstream while being
+		// recorded as "no override", hiding a real policy-driven model downgrade
+		// from comboModelOverride attribution and from the drift alert — the
+		// exact blindness this whole feature exists to remove.
+		const handleStart = installUsageCollector();
+		const now = Date.now();
+		const comboAccount = makeAccount("probe-suppressed-combo-account", {
+			rate_limited_until: now - 1,
+			rate_limited_reason: "upstream_529_overloaded_no_reset",
+		});
+
+		// Stand in for a concurrent request that already took this account's
+		// single-flight probe lease: the cooldown has expired, so the account is
+		// usable, but every candidate is now gate-suppressed — which is what
+		// forces proxy.ts down the ungated-retry branch.
+		expect(getRateLimitProbeAdmission(comboAccount)).toBe("admitted");
+
+		const combo: ComboWithSlots = {
+			id: "combo-probe-suppressed",
+			name: "Probe suppressed",
+			description: null,
+			enabled: true,
+			created_at: 0,
+			updated_at: 0,
+			slots: [
+				{
+					id: "slot-probe-suppressed",
+					combo_id: "combo-probe-suppressed",
+					account_id: comboAccount.id,
+					// Differs from the requested model, so the override is real.
+					model: "claude-haiku-4-5",
+					priority: 0,
+					enabled: true,
+				},
+			],
+		};
+		const ctx = makeContext([comboAccount], combo, (accounts) => accounts);
+		globalThis.fetch = mock(
+			async () =>
+				new Response('{"type":"message","content":[]}', {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+		) as unknown as typeof fetch;
+
+		const request = makeProxyRequest("claude-opus-4-5");
+		const response = await handleProxy(request, new URL(request.url), ctx);
+
+		expect(response.status).toBe(200);
+		expect(handleStart).toHaveBeenCalledTimes(1);
+		const startMessage = handleStart.mock.calls[0]?.[0] as StartMessage;
+		// The override really was applied on this path...
+		expect(startMessage.appliedModel).toBe("claude-haiku-4-5");
+		// ...so it must be attributed here too, not silently nulled.
 		expect(startMessage.comboModelOverrideFrom).toBe("claude-opus-4-5");
 		expect(startMessage.comboModelOverrideTo).toBe("claude-haiku-4-5");
 	});

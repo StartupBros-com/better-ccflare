@@ -72,7 +72,11 @@ describe("AlertService model_routing_drift alerts", () => {
 		sqlite.close();
 	});
 
-	it("persists a critical stale_policy alert for the Opus 5 incident shape", async () => {
+	// Severity is `warning`, not `critical`, and deliberately so: the check
+	// cannot distinguish a stale policy from a deliberate pinned-fallback slot
+	// (a documented feature), so firing critical on supported configuration
+	// would train operators to mute the channel. See buildStalePolicyDriftAlert.
+	it("persists a warning stale_policy alert for the Opus 5 incident shape", async () => {
 		service = new AlertService(new BunSqlAdapter(sqlite), makeConfig());
 		service.start();
 
@@ -90,7 +94,7 @@ describe("AlertService model_routing_drift alerts", () => {
 		expect(alerts).toHaveLength(1);
 		const alert = alerts[0] as AlertEvent;
 		expect(alert.type).toBe("model_routing_drift");
-		expect(alert.severity).toBe("critical");
+		expect(alert.severity).toBe("warning");
 		expect(alert.message).toContain(
 			`opus routing policy rewrites ${CLAUDE_MODEL_IDS.OPUS_5} -> ${CLAUDE_MODEL_IDS.OPUS_4_8}`,
 		);
