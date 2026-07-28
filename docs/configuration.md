@@ -134,10 +134,13 @@ These environment variables are not stored in the configuration file and must be
 | `CCFLARE_OVERLOAD_RETRY_MAX_ATTEMPTS` | Total attempts including the original request | `2` | `CCFLARE_OVERLOAD_RETRY_MAX_ATTEMPTS=3` |
 | `CCFLARE_OVERLOAD_RETRY_BASE_MS` | Overload retry backoff base in ms; `0` = no sleep | `750` | `CCFLARE_OVERLOAD_RETRY_BASE_MS=500` |
 | `CCFLARE_OVERLOAD_RETRY_MAX_MS` | Overload retry backoff ceiling in ms | `3000` | `CCFLARE_OVERLOAD_RETRY_MAX_MS=5000` |
+| `CCFLARE_OVERLOAD_COOLDOWN_MS` | Fixed per-account cooldown after a 529 (overloaded) response with no Retry-After header. Unlike 429 cooldowns it never ramps with a streak; pairs with a single-flight recovery probe that admits exactly one request once the cooldown expires, as long as another account is available to defer to — if every account in the pool is currently suppressed, the request runs ungated instead | `10000` (10s) | `CCFLARE_OVERLOAD_COOLDOWN_MS=15000` |
+| `CCFLARE_OVERLOAD_WITH_RESET_MAX_MS` | Cap on a 529-with-reset cooldown duration (`min(resetTime, now + cap)`). Guards against a multi-hour quota-window reset header (`anthropic-ratelimit-unified-reset`) being mistaken for a short, real retry-after | `60000` (60s) | `CCFLARE_OVERLOAD_WITH_RESET_MAX_MS=120000` |
 | `CCFLARE_RATE_LIMIT_BACKOFF_BASE_MS` | Base delay for adaptive per-account 429 cooldown backoff | `30000` (30s) | `CCFLARE_RATE_LIMIT_BACKOFF_BASE_MS=15000` |
 | `CCFLARE_RATE_LIMIT_BACKOFF_MAX_MS` | Ceiling for adaptive per-account 429 cooldown backoff | `300000` (5min) | `CCFLARE_RATE_LIMIT_BACKOFF_MAX_MS=600000` |
 | `CCFLARE_RATE_LIMIT_RESET_STABILITY_MS` | Window after which a clean streak resets the consecutive-429 counter | `300000` (5min) | `CCFLARE_RATE_LIMIT_RESET_STABILITY_MS=600000` |
 | `HEALTH_DETAIL_ENABLED` | Expose per-account status on `GET /health?detail=1` | `false` | `HEALTH_DETAIL_ENABLED=true` |
+| `CCFLARE_DISABLE_COMBO_SESSION_FALLBACK` | When enabled, combo-routed requests stop after every combo slot fails instead of falling through to normal SessionStrategy routing. This keeps explicit combo chains isolated, which is useful when combos intentionally separate provider pools (for example Anthropic-only Opus/Fable combos next to Codex-only Sonnet/Haiku combos). Disabled by default to preserve existing behavior | `false` | `CCFLARE_DISABLE_COMBO_SESSION_FALLBACK=true` |
 | `BETTER_CCFLARE_DISCOVER_PLUGIN_AGENTS` | Discover agents distributed by Claude Code plugins (reads `~/.claude/plugins/installed_plugins.json`) | `false` | `BETTER_CCFLARE_DISCOVER_PLUGIN_AGENTS=true` |
 | `STORE_PAYLOADS` | Set to `false` to stop storing request/response bodies (token counts, cost, model, status, and timing are still recorded) | `true` | `STORE_PAYLOADS=false` |
 | `PAYLOAD_ENCRYPTION_KEY` | AES-256-GCM key encrypting `request_payloads` at rest. 64-char hex (32 bytes), generate with `openssl rand -hex 32`. Unset = plaintext storage. Losing the key makes encrypted rows unreadable; read once at process start (and per Bun worker), so rotation needs a re-encrypt migration (not yet built) | - (plaintext) | `PAYLOAD_ENCRYPTION_KEY=$(openssl rand -hex 32)` |
@@ -156,6 +159,7 @@ These environment variables are not stored in the configuration file and must be
 | `CCFLARE_CODEX_WS_TELEMETRY_WARN` | Default-off telemetry escalation for scoped dogfood canaries. Set exactly to `1` or `true` (case-insensitive) to emit privacy-safe `codex_ws_transport` observations at WARN so a WARN-pinned journal can join `requestId`/`attemptId` to Codex cache traces; otherwise observations remain INFO | unset | `CCFLARE_CODEX_WS_TELEMETRY_WARN=1` |
 | `CF_STREAM_USAGE_BUFFER_KB` | Stream usage buffer size in KB | `64` | `CF_STREAM_USAGE_BUFFER_KB=128` |
 | `CF_STREAM_TIMEOUT_MS` | Stream processing timeout in milliseconds | `60000` (1 minute) | `CF_STREAM_TIMEOUT_MS=120000` |
+| `BETTER_CCFLARE_OUTBOUND_PROXY` | Routes all outbound HTTP(S) traffic through a forward proxy | unset | `BETTER_CCFLARE_OUTBOUND_PROXY=http://127.0.0.1:3636` |
 
 For a WebSocket cache canary, export the bounded service journal window as JSONL and join it to the matching Codex trace. The analyzer accepts direct transport observations, logger JSON, and `journalctl -o json` records; it excludes duplicate or ambiguous identities and prints aggregate-only output:
 
@@ -167,6 +171,20 @@ bun run packages/providers/src/providers/codex/analyze-trace.ts --cache-experime
 The raw journal export still contains ephemeral join identities and must be protected and deleted after analysis. The formatted report never emits request or attempt IDs, cohort hashes, account IDs, endpoints, model strings, prompts, or unknown action values.
 
 Model-family capacity handling is integrated into account selection and does not require a standalone feature flag. Fresh Anthropic `limits[]` telemetry is interpreted by scope: exhausted `session` and `weekly_all` windows exclude the account, while an exhausted `weekly_scoped` row excludes only requests for the matching model family when paid overage is confirmed unavailable. Stale, malformed, unrelated, or incomplete scoped telemetry fails open, and observed upstream capacity responses provide short-lived reactive evidence while telemetry catches up.
+
+## Outbound Proxy
+
+better-ccflare can route all of its outbound HTTP(S) traffic — provider requests, OAuth flows, usage polling, and webhooks — through an explicit forward proxy using HTTP CONNECT. This is useful for enterprises that want every egress connection from better-ccflare to pass through a security/inspection proxy.
+
+Configure it via the `BETTER_CCFLARE_OUTBOUND_PROXY` environment variable (or the equivalent `outbound_proxy` config file key); env var takes precedence over the config file value, matching the pattern used elsewhere in this doc. A dedicated variable is used instead of the conventional `HTTPS_PROXY`/`HTTP_PROXY` because those affect every process on the machine by convention — a dedicated variable lets operators scope the proxy to just this application (e.g. via MDM/provisioning) without redirecting traffic for every other tool.
+
+Loopback destinations (`localhost`, `127.0.0.0/8` addresses, `::1`) are always exempt and never routed through the configured proxy, so local testing setups (e.g. a local Ollama or LiteLLM instance) keep working unaffected.
+
+If the forward proxy performs TLS interception (MITM), such as an LLM security/inspection gateway, its CA certificate must be trusted by the Node/Bun process. Set `NODE_EXTRA_CA_CERTS` as a real environment variable at process launch — not inside a `.env` file loaded at runtime — since it must be present before the process starts.
+
+This setting operates at the transport layer and is unrelated to a per-account `custom_endpoint`, which is a URL/routing-level override rather than a proxy.
+
+Coverage spans both the running server process and CLI-only commands that never start the server (e.g. `better-ccflare --add-account`, `--reauthenticate`) — account management and OAuth flows invoked directly from the CLI are proxied the same way; the one carve-out is the embedded database-maintenance worker threads, which run in their own global scope outside this wrapper, but they make no outbound HTTP requests themselves so no traffic escapes unproxied through them.
 
 ## Alerts
 

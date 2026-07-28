@@ -89,7 +89,7 @@ function makeProxyContext(): ProxyContext {
 		dbOps: {
 			markAccountRateLimited: mock(
 				(_accountId: string, _until: number, _reason: string) =>
-					Promise.resolve(1),
+					Promise.resolve({ consecutiveRateLimits: 1, applied: true }),
 			),
 			saveRequest: mock((..._args: unknown[]) => Promise.resolve()),
 			updateAccountUsage: mock(() => Promise.resolve()),
@@ -118,6 +118,7 @@ function makeProxyContext(): ProxyContext {
 		refreshInFlight: new Map(),
 		asyncWriter: { enqueue: mock(() => {}) } as never,
 		config: { getStorePayloads: () => true } as never,
+		internalProbeSecret: "test-secret",
 	};
 }
 
@@ -1265,6 +1266,7 @@ describe("proxyWithAccount — 529 in-place retry", () => {
 			headers: {
 				"Content-Type": "application/json",
 				"x-better-ccflare-keepalive": "true",
+				"x-better-ccflare-internal-probe-secret": "test-secret",
 			},
 		});
 		await proxyWithAccount(

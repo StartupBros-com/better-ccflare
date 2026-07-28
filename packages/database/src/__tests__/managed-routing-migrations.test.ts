@@ -479,7 +479,10 @@ describe("managed routing migrations", () => {
 
 		const upgradeStatements: string[] = [];
 		const upgradeAdapter = {
-			get: async (_sql: string, params: unknown[]) => ({
+			// Mirrors BunSqlAdapter.get's real signature, where `params` defaults
+			// to `[]` — some callers (e.g. the unique-index existence checks in
+			// runMigrationsPg) intentionally omit it for parameterless queries.
+			get: async (_sql: string, params: unknown[] = []) => ({
 				exists:
 					params[0] === "combo_family_assignments" &&
 					(params[1] === "membership_mode" || params[1] === "managed_model")
@@ -542,7 +545,10 @@ describe("managed routing migrations", () => {
 		];
 		let accountUpdateTriggerInstalls = 0;
 		const adapter = {
-			get: async (_sql: string, params: unknown[]) => {
+			// Mirrors BunSqlAdapter.get's real signature, where `params` defaults
+			// to `[]` — some callers (e.g. the unique-index existence checks in
+			// runMigrationsPg) intentionally omit it for parameterless queries.
+			get: async (_sql: string, params: unknown[] = []) => {
 				const [table, column] = params as [string, string];
 				return {
 					exists: table === "accounts" ? Number(accountColumns.has(column)) : 1,

@@ -276,7 +276,7 @@ describe("AccountRepository - markAccountRateLimited MAX-style clamp under concu
 		insertAccount(db, "acc-clamp-1");
 		const until = Date.now() + 1000;
 
-		const count = await repo.markAccountRateLimited(
+		const result = await repo.markAccountRateLimited(
 			"acc-clamp-1",
 			until,
 			"xai_capacity_402",
@@ -285,7 +285,7 @@ describe("AccountRepository - markAccountRateLimited MAX-style clamp under concu
 		const row = getFullAudit(db, "acc-clamp-1");
 		expect(row.rate_limited_until).toBe(until);
 		expect(row.rate_limited_reason).toBe("xai_capacity_402");
-		expect(count).toBe(1);
+		expect(result).toEqual({ consecutiveRateLimits: 1, applied: true });
 		expect(row.consecutive_rate_limits).toBe(1);
 	});
 
@@ -299,13 +299,13 @@ describe("AccountRepository - markAccountRateLimited MAX-style clamp under concu
 			"xai_capacity_402",
 		);
 		// Later call with a SMALLER until (would be discarded by the clamp).
-		const count = await repo.markAccountRateLimited(
+		const result = await repo.markAccountRateLimited(
 			"acc-clamp-2",
 			now + 1_000,
 			"xai_capacity_402",
 		);
 
-		expect(count).toBe(2);
+		expect(result).toEqual({ consecutiveRateLimits: 2, applied: true });
 		const row = getFullAudit(db, "acc-clamp-2");
 		expect(row.consecutive_rate_limits).toBe(2);
 	});
@@ -416,12 +416,12 @@ describe("AccountRepository - markAccountRateLimited MAX-style clamp under concu
 			now + 2_000,
 			"xai_capacity_402",
 		);
-		const thirdCount = await repo.markAccountRateLimited(
+		const thirdResult = await repo.markAccountRateLimited(
 			"acc-clamp-7",
 			now + 3_000,
 			"xai_capacity_402",
 		);
 
-		expect(thirdCount).toBe(3);
+		expect(thirdResult).toEqual({ consecutiveRateLimits: 3, applied: true });
 	});
 });

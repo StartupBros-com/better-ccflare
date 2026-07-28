@@ -15,6 +15,7 @@ import type { Account } from "@better-ccflare/types";
 import { forwardToClient } from "../../response-handler";
 import * as usageCollectorModule from "../../usage-collector";
 import type { ProxyContext } from "../proxy-types";
+import * as rateLimitCooldownModule from "../rate-limit-cooldown";
 import { handleRateLimitResponse } from "../response-processor";
 import { createSseRateLimitSniffer } from "../sse-rate-limit-sniffer";
 
@@ -90,7 +91,7 @@ function makeCtxWithReason() {
 				reason: string,
 			) => {
 				calls.markRateLimited.push({ accountId, resetTime, reason });
-				return Promise.resolve(1);
+				return Promise.resolve({ consecutiveRateLimits: 1, applied: true });
 			},
 			updateAccountUsage: () => {},
 			updateAccountRateLimitMeta: () => {},
@@ -319,12 +320,19 @@ describe("production sniffer integration — overloaded_error mid-stream", () =>
 		expect(sniffer.feed(frame)).toBe(false);
 	});
 
+	// Upstream v3.5.44 split 529-overload cooldown away from the generic
+	// no-reset 429 cooldown so an overload can no longer ramp the 429 streak
+	// (upstream commits f68ba838f / a25b8f252 / c168a56bc). The overload path
+	// now reads CCFLARE_OVERLOAD_COOLDOWN_MS instead of
+	// CCFLARE_DEFAULT_COOLDOWN_NO_RESET_MS. This test's two real claims are
+	// unchanged: unrelated quota reset headers are ignored, and the short
+	// overload cooldown is what gets applied.
 	it("ignores unrelated quota reset headers and uses the short overload cooldown", async () => {
 		const now = 1_800_000_000_000;
 		const realDateNow = Date.now;
-		const originalCooldown = process.env.CCFLARE_DEFAULT_COOLDOWN_NO_RESET_MS;
+		const originalCooldown = process.env.CCFLARE_OVERLOAD_COOLDOWN_MS;
 		Date.now = () => now;
-		process.env.CCFLARE_DEFAULT_COOLDOWN_NO_RESET_MS = "15000";
+		process.env.CCFLARE_OVERLOAD_COOLDOWN_MS = "15000";
 		const account = makeAccount({ id: "acct-mid-overload-quota-reset" });
 		const { ctx, calls } = makeCtxWithReason();
 
@@ -350,9 +358,9 @@ describe("production sniffer integration — overloaded_error mid-stream", () =>
 		} finally {
 			Date.now = realDateNow;
 			if (originalCooldown === undefined) {
-				delete process.env.CCFLARE_DEFAULT_COOLDOWN_NO_RESET_MS;
+				delete process.env.CCFLARE_OVERLOAD_COOLDOWN_MS;
 			} else {
-				process.env.CCFLARE_DEFAULT_COOLDOWN_NO_RESET_MS = originalCooldown;
+				process.env.CCFLARE_OVERLOAD_COOLDOWN_MS = originalCooldown;
 			}
 		}
 	});
@@ -522,6 +530,132 @@ describe("forwardToClient — model-scoped Anthropic 429 after SSE bytes", () =>
 		} finally {
 			usageCache.delete(account.id);
 			Date.now = realDateNow;
+		}
+	});
+});
+
+// ── real forwardToClient call form (review Befund 4/8) ───────────────────────
+//
+// The tests above exercise handleRateLimitResponse (response-processor.ts's
+// status-based 429/529 path) and the sniffer in isolation. Neither drives the
+// actual code that constructs the mid-stream applyRateLimitCooldown() call in
+// response-handler.ts's forwardToClient — the synthetic-resetTime bug (an
+// invented reset passed off as an upstream instruction) lived entirely in
+// that construction and would have stayed green through CI without a test
+// that runs the real call form.
+describe("forwardToClient — real mid-stream sniffer call form", () => {
+	function createStreamingCtx(): ProxyContext {
+		return {
+			provider: { name: "anthropic", isStreamingResponse: () => true },
+			config: { getStorePayloads: () => true },
+			dbOps: {
+				markAccountRateLimited: () =>
+					Promise.resolve({ consecutiveRateLimits: 1, applied: true }),
+			},
+			asyncWriter: {
+				enqueue: (job: () => void | Promise<void>) => {
+					void job();
+				},
+			},
+		} as unknown as ProxyContext;
+	}
+
+	function mockCollector() {
+		return {
+			handleStart: () => {},
+			handleChunk: () => {},
+			handleEnd: () => Promise.resolve(),
+		};
+	}
+
+	async function feedSseErrorFrame(
+		errorType: "overloaded_error" | "rate_limit_error",
+		account: Account,
+		ctx: ProxyContext,
+	): Promise<void> {
+		const collectorSpy = spyOn(
+			usageCollectorModule,
+			"getUsageCollector",
+		).mockReturnValue(
+			mockCollector() as unknown as usageCollectorModule.UsageCollector,
+		);
+		try {
+			const body = new ReadableStream<Uint8Array>({
+				start(controller) {
+					controller.enqueue(
+						new TextEncoder().encode(
+							`event: error\ndata: {"type":"error","error":{"type":"${errorType}","message":"Overloaded"}}\n\n`,
+						),
+					);
+					controller.close();
+				},
+			});
+
+			const response = await forwardToClient(
+				{
+					requestId: `req-real-${errorType}`,
+					method: "POST",
+					path: "/v1/messages",
+					account,
+					requestHeaders: new Headers({ "content-type": "application/json" }),
+					requestBody: new TextEncoder().encode("{}"),
+					response: new Response(body, {
+						status: 200,
+						headers: { "content-type": "text/event-stream" },
+					}),
+					timestamp: Date.now(),
+					retryAttempt: 0,
+					failoverAttempts: 0,
+				},
+				ctx,
+			);
+			await response.text();
+		} finally {
+			collectorSpy.mockRestore();
+		}
+	}
+
+	it("overloaded_error: calls applyRateLimitCooldown with reason='upstream_529_overloaded_no_reset' and no resetTime — no synthetic upstream instruction", async () => {
+		const account = makeAccount({ id: "acct-real-529" });
+		const ctx = createStreamingCtx();
+		const spy = spyOn(rateLimitCooldownModule, "applyRateLimitCooldown");
+
+		try {
+			await feedSseErrorFrame("overloaded_error", account, ctx);
+
+			expect(spy).toHaveBeenCalledTimes(1);
+			const [, rateLimitInfo] = spy.mock.calls[0] as [
+				Account,
+				{ resetTime?: number; reason?: string },
+				ProxyContext,
+			];
+			expect(rateLimitInfo.reason).toBe("upstream_529_overloaded_no_reset");
+			expect(rateLimitInfo.resetTime).toBeUndefined();
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	it("rate_limit_error: calls applyRateLimitCooldown with reason='upstream_429_with_reset' and a synthetic ~60s resetTime — unchanged 429 behaviour", async () => {
+		const account = makeAccount({ id: "acct-real-429" });
+		const ctx = createStreamingCtx();
+		const spy = spyOn(rateLimitCooldownModule, "applyRateLimitCooldown");
+		const before = Date.now();
+
+		try {
+			await feedSseErrorFrame("rate_limit_error", account, ctx);
+
+			expect(spy).toHaveBeenCalledTimes(1);
+			const [, rateLimitInfo] = spy.mock.calls[0] as [
+				Account,
+				{ resetTime?: number; reason?: string },
+				ProxyContext,
+			];
+			expect(rateLimitInfo.reason).toBe("upstream_429_with_reset");
+			expect(rateLimitInfo.resetTime).toBeGreaterThanOrEqual(before + 59_000);
+			expect(rateLimitInfo.resetTime).toBeLessThanOrEqual(Date.now() + 61_000);
+		} finally {
+			spy.mockRestore();
 		}
 	});
 });

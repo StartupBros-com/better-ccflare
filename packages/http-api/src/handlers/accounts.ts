@@ -457,6 +457,26 @@ export function createAccountsListHandler(
 							);
 						}
 					}
+				} else if (account.provider === "minimax" && usageData) {
+					// Minimax Token Plan usage data — 5h/7d windows from /v1/token_plan/remains
+					const isMinimaxData =
+						"five_hour" in usageData || "seven_day" in usageData;
+					if (isMinimaxData) {
+						try {
+							const {
+								getRepresentativeMinimaxUtilization,
+								getRepresentativeMinimaxWindow,
+							} = require("@better-ccflare/providers");
+							usageUtilization = getRepresentativeMinimaxUtilization(usageData);
+							usageWindow = getRepresentativeMinimaxWindow(usageData);
+							fullUsageData = usageData as FullUsageData;
+						} catch (error) {
+							log.warn(
+								`Failed to process Minimax usage data for account ${account.name}:`,
+								error,
+							);
+						}
+					}
 				}
 
 				const usageThrottleSettings = {
@@ -646,6 +666,71 @@ export function createAccountPriorityUpdateHandler(dbOps: DatabaseOperations) {
 }
 
 /**
+ * Reject an add whose (name, provider, custom_endpoint) tuple already
+ * has a row. Mirrors the rename handler's "is already taken" error
+ * style at `createAccountRenameHandler` so duplicate accounts are
+ * rejected consistently across add and rename paths.
+ *
+ * `customEndpoint` is treated as NULL-equivalent to empty string so that
+ * two Anthropic console accounts (which never set a custom endpoint)
+ * collide on name as expected. Returns the response to send back, or
+ * `null` if the name is available.
+ *
+ * This is the friendly fast-path: the atomic uniqueness guarantee comes
+ * from the DB-level UNIQUE index
+ * `idx_accounts_unique_name_provider_endpoint` enforced on every INSERT.
+ * Concurrent adds that race past this SELECT are still rejected at the
+ * INSERT via `isUniqueConstraintError` below — see Greptile P1.
+ */
+async function assertAccountNameAvailable(
+	dbOps: DatabaseOperations,
+	name: string,
+	provider: string,
+	customEndpoint: string | null,
+): Promise<Response | null> {
+	const db = dbOps.getAdapter();
+	const existing = await db.get<{ id: string }>(
+		`SELECT id FROM accounts
+		 WHERE name = ?
+		   AND provider = ?
+		   AND COALESCE(custom_endpoint, '') = COALESCE(?, '')`,
+		[name, provider, customEndpoint],
+	);
+	if (existing) {
+		return errorResponse(BadRequest(`Account name '${name}' is already taken`));
+	}
+	return null;
+}
+
+/**
+ * SQLite surfaces a UNIQUE-constraint violation as an Error whose message
+ * contains "UNIQUE constraint failed:". PostgreSQL (via Bun.SQL) surfaces
+ * the same condition as SQLSTATE 23505 (unique_violation) on `.code`, with
+ * a message like `duplicate key value violates unique constraint "..."` —
+ * it does NOT contain the SQLite string, so both must be checked. Map
+ * either to the same BadRequest the pre-check returns so callers see a
+ * consistent 400 regardless of which side of the race the second add
+ * loses on, and regardless of which database backend is in use.
+ *
+ * Keeping the pre-check is intentional: it gives a clean 400 for the
+ * common sequential case without a wasted INSERT round-trip, and lets
+ * us attach the friendly "Account name '<name>' is already taken" copy
+ * that points at the field the user just typed. The DB constraint is the
+ * authoritative gate; this catch is what makes the add path survive
+ * concurrent callers (different processes, network-attached SQLite,
+ * future async adapters, or any INSERT site that bypasses the pre-check
+ * — cli-commands, oauth-flow, dashboard-web, etc.).
+ */
+const PG_UNIQUE_VIOLATION = "23505";
+
+function isUniqueConstraintError(error: unknown): boolean {
+	if (!(error instanceof Error)) return false;
+	if (error.message.includes("UNIQUE constraint failed")) return true;
+	const code = (error as { code?: string }).code;
+	return code === PG_UNIQUE_VIOLATION;
+}
+
+/**
  * Create an account add handler (manual token addition)
  * This is primarily used for adding accounts with existing tokens
  * For OAuth flow, use the OAuth handlers
@@ -728,6 +813,18 @@ export function createAccountAddHandler(
 			);
 
 			try {
+				// Reject adds that would collide with an existing row on
+				// (name, provider, custom_endpoint). Mirrors the rename handler
+				// collision check so duplicate accounts cannot be created via
+				// this path.
+				const conflict = await assertAccountNameAvailable(
+					dbOps,
+					name,
+					provider,
+					customEndpoint || null,
+				);
+				if (conflict) return conflict;
+
 				// Add account directly to database
 				const accountId = crypto.randomUUID();
 				const now = Date.now();
@@ -760,6 +857,15 @@ export function createAccountAddHandler(
 				) {
 					return errorResponse(BadRequest(error.message));
 				}
+				if (isUniqueConstraintError(error)) {
+					// Concurrent caller raced past assertAccountNameAvailable
+					// and lost on the DB UNIQUE index. Surface the same 400 the
+					// pre-check would have produced so the response shape is
+					// identical across the two paths.
+					return errorResponse(
+						BadRequest(`Account name '${name}' is already taken`),
+					);
+				}
 				return errorResponse(InternalServerError((error as Error).message));
 			}
 		} catch (error) {
@@ -773,9 +879,16 @@ export function createAccountAddHandler(
 
 /**
  * Create an account remove handler
+ *
+ * The URL is `/api/accounts/:id` where `:id` is the account row id. The
+ * router already extracts the third path segment as `accountId`. The
+ * confirm-string safety UX is preserved by looking up the account's name
+ * via id, then comparing the submitted `confirm` against that name.
+ * Deletion is then dispatched via the id-keyed path on the CLI commands
+ * layer (`removeAccountById`) so a shared name never cascades.
  */
 export function createAccountRemoveHandler(dbOps: DatabaseOperations) {
-	return async (req: Request, accountName: string): Promise<Response> => {
+	return async (req: Request, accountId: string): Promise<Response> => {
 		try {
 			// Parse and validate confirmation
 			const body = await req.json();
@@ -785,7 +898,20 @@ export function createAccountRemoveHandler(dbOps: DatabaseOperations) {
 				required: true,
 			});
 
-			if (confirm !== accountName) {
+			// Resolve the account by id so we can compare `confirm` against
+			// the actual stored name (defence-in-depth: a typo in the URL
+			// segment should fail with 404, not silently succeed).
+			const db = dbOps.getAdapter();
+			const account = await db.get<{ name: string }>(
+				"SELECT name FROM accounts WHERE id = ?",
+				[accountId],
+			);
+
+			if (!account) {
+				return errorResponse(NotFound("Account not found"));
+			}
+
+			if (confirm !== account.name) {
 				return errorResponse(
 					BadRequest("Confirmation string does not match account name", {
 						confirmationRequired: true,
@@ -793,23 +919,16 @@ export function createAccountRemoveHandler(dbOps: DatabaseOperations) {
 				);
 			}
 
-			const result = await cliCommands.removeAccount(dbOps, accountName);
+			const result = await cliCommands.removeAccountById(dbOps, accountId);
 
 			if (!result.success) {
 				return errorResponse(NotFound(result.message));
 			}
 
-			// Find the account ID to clean up usage cache (check before deletion)
-			const db = dbOps.getAdapter();
-			const account = await db.get<{ id: string }>(
-				"SELECT id FROM accounts WHERE name = ?",
-				[accountName],
-			);
-
-			if (account) {
-				// Clear usage cache for removed account to prevent memory leaks
-				usageCache.delete(account.id);
-			}
+			// Clear usage cache for removed account to prevent memory leaks.
+			// The cache is keyed by id, and we already have the id from the
+			// URL — no extra lookup needed.
+			usageCache.delete(accountId);
 
 			return jsonResponse({
 				success: true,
@@ -1040,6 +1159,17 @@ export function createZaiAccountAddHandler(dbOps: DatabaseOperations) {
 			const now = Date.now();
 
 			const db = dbOps.getAdapter();
+
+			// Reject duplicate (name, provider, custom_endpoint) — same guard as
+			// the manual add handler and the rename collision check.
+			const conflict = await assertAccountNameAvailable(
+				dbOps,
+				name,
+				"zai",
+				customEndpoint || null,
+			);
+			if (conflict) return conflict;
+
 			await db.run(
 				`INSERT INTO accounts (
 					id, name, provider, api_key, refresh_token, access_token,
@@ -1119,6 +1249,11 @@ export function createZaiAccountAddHandler(dbOps: DatabaseOperations) {
 			});
 		} catch (error) {
 			log.error("z.ai account creation error:", error);
+			if (isUniqueConstraintError(error)) {
+				return errorResponse(
+					BadRequest(`Account name '${name}' is already taken`),
+				);
+			}
 			return errorResponse(
 				error instanceof Error
 					? error
@@ -1204,6 +1339,15 @@ export function createOpenAIAccountAddHandler(dbOps: DatabaseOperations) {
 			const now = Date.now();
 
 			const db = dbOps.getAdapter();
+
+			const conflict = await assertAccountNameAvailable(
+				dbOps,
+				name,
+				"openai-compatible",
+				customEndpoint || null,
+			);
+			if (conflict) return conflict;
+
 			await db.run(
 				`INSERT INTO accounts (
 					id, name, provider, api_key, refresh_token, access_token,
@@ -1282,6 +1426,11 @@ export function createOpenAIAccountAddHandler(dbOps: DatabaseOperations) {
 			});
 		} catch (error) {
 			log.error("OpenAI-compatible account creation error:", error);
+			if (isUniqueConstraintError(error)) {
+				return errorResponse(
+					BadRequest(`Account name '${name}' is already taken`),
+				);
+			}
 			return errorResponse(
 				error instanceof Error
 					? error
@@ -1349,6 +1498,15 @@ export function createVertexAIAccountAddHandler(dbOps: DatabaseOperations) {
 			const accountId = crypto.randomUUID();
 			const now = Date.now();
 			const db = dbOps.getAdapter();
+
+			const conflict = await assertAccountNameAvailable(
+				dbOps,
+				name,
+				"vertex-ai",
+				vertexConfig,
+			);
+			if (conflict) return conflict;
+
 			await db.run(
 				`INSERT INTO accounts (
 					id, name, provider, api_key, refresh_token, access_token,
@@ -1422,6 +1580,11 @@ export function createVertexAIAccountAddHandler(dbOps: DatabaseOperations) {
 			if (error instanceof ValidationError) {
 				return errorResponse(BadRequest(error.message));
 			}
+			if (isUniqueConstraintError(error)) {
+				return errorResponse(
+					BadRequest(`Account name '${name}' is already taken`),
+				);
+			}
 			return errorResponse(
 				InternalServerError(
 					error instanceof Error ? error.message : "Failed to add account",
@@ -1473,6 +1636,15 @@ export function createMinimaxAccountAddHandler(dbOps: DatabaseOperations) {
 			const accountId = crypto.randomUUID();
 			const now = Date.now();
 			const db = dbOps.getAdapter();
+
+			const conflict = await assertAccountNameAvailable(
+				dbOps,
+				name,
+				"minimax",
+				null,
+			);
+			if (conflict) return conflict;
+
 			await db.run(
 				`INSERT INTO accounts (
 					id, name, provider, api_key, refresh_token, access_token,
@@ -1551,6 +1723,11 @@ export function createMinimaxAccountAddHandler(dbOps: DatabaseOperations) {
 			});
 		} catch (error) {
 			log.error("Minimax account creation error:", error);
+			if (isUniqueConstraintError(error)) {
+				return errorResponse(
+					BadRequest(`Account name '${name}' is already taken`),
+				);
+			}
 			return errorResponse(
 				error instanceof Error
 					? error
@@ -1640,6 +1817,15 @@ export function createNanoGPTAccountAddHandler(dbOps: DatabaseOperations) {
 			const accountId = crypto.randomUUID();
 			const now = Date.now();
 			const db = dbOps.getAdapter();
+
+			const conflict = await assertAccountNameAvailable(
+				dbOps,
+				name,
+				"nanogpt",
+				customEndpoint || null,
+			);
+			if (conflict) return conflict;
+
 			await db.run(
 				`INSERT INTO accounts (
 					id, name, provider, api_key, refresh_token, access_token,
@@ -1717,6 +1903,11 @@ export function createNanoGPTAccountAddHandler(dbOps: DatabaseOperations) {
 			log.error("NanoGPT account creation error:", error);
 			if (error instanceof ValidationError) {
 				return errorResponse(BadRequest(error.message));
+			}
+			if (isUniqueConstraintError(error)) {
+				return errorResponse(
+					BadRequest(`Account name '${name}' is already taken`),
+				);
 			}
 			return errorResponse(
 				error instanceof Error
@@ -1804,6 +1995,15 @@ export function createAnthropicCompatibleAccountAddHandler(
 			const accountId = crypto.randomUUID();
 			const now = Date.now();
 			const db = dbOps.getAdapter();
+
+			const conflict = await assertAccountNameAvailable(
+				dbOps,
+				name,
+				"anthropic-compatible",
+				customEndpoint || null,
+			);
+			if (conflict) return conflict;
+
 			await db.run(
 				`INSERT INTO accounts (
 					id, name, provider, api_key, refresh_token, access_token,
@@ -1883,6 +2083,11 @@ export function createAnthropicCompatibleAccountAddHandler(
 			});
 		} catch (error) {
 			log.error("Anthropic-compatible account creation error:", error);
+			if (isUniqueConstraintError(error)) {
+				return errorResponse(
+					BadRequest(`Account name '${name}' is already taken`),
+				);
+			}
 			return errorResponse(
 				error instanceof Error
 					? error
@@ -1954,6 +2159,15 @@ export function createOllamaAccountAddHandler(dbOps: DatabaseOperations) {
 			const accountId = crypto.randomUUID();
 			const now = Date.now();
 			const db = dbOps.getAdapter();
+
+			const conflict = await assertAccountNameAvailable(
+				dbOps,
+				name,
+				"ollama",
+				customEndpoint || null,
+			);
+			if (conflict) return conflict;
+
 			await db.run(
 				`INSERT INTO accounts (
 					id, name, provider, api_key, refresh_token, access_token,
@@ -2032,6 +2246,11 @@ export function createOllamaAccountAddHandler(dbOps: DatabaseOperations) {
 			});
 		} catch (error) {
 			log.error("Ollama account creation error:", error);
+			if (isUniqueConstraintError(error)) {
+				return errorResponse(
+					BadRequest(`Account name '${name}' is already taken`),
+				);
+			}
 			return errorResponse(
 				error instanceof Error
 					? error
@@ -2090,6 +2309,15 @@ export function createOllamaCloudAccountAddHandler(dbOps: DatabaseOperations) {
 			const accountId = crypto.randomUUID();
 			const now = Date.now();
 			const db = dbOps.getAdapter();
+
+			const conflict = await assertAccountNameAvailable(
+				dbOps,
+				name,
+				"ollama-cloud",
+				"https://ollama.com",
+			);
+			if (conflict) return conflict;
+
 			await db.run(
 				`INSERT INTO accounts (
 					id, name, provider, api_key, refresh_token, access_token,
@@ -2168,6 +2396,11 @@ export function createOllamaCloudAccountAddHandler(dbOps: DatabaseOperations) {
 			});
 		} catch (error) {
 			log.error("Ollama Cloud account creation error:", error);
+			if (isUniqueConstraintError(error)) {
+				return errorResponse(
+					BadRequest(`Account name '${name}' is already taken`),
+				);
+			}
 			return errorResponse(
 				error instanceof Error
 					? error
@@ -3064,6 +3297,14 @@ export function createBedrockAccountAddHandler(dbOps: DatabaseOperations) {
 			const now = Date.now();
 			const oneYearFromNow = now + 365 * 24 * 60 * 60 * 1000; // 1 year expiry
 			const db = dbOps.getAdapter();
+
+			const conflict = await assertAccountNameAvailable(
+				dbOps,
+				name,
+				"bedrock",
+				bedrockConfig,
+			);
+			if (conflict) return conflict;
 			await db.run(
 				`INSERT INTO accounts (
 					id, name, provider, api_key, refresh_token, access_token,
@@ -3213,6 +3454,15 @@ export function createKiloAccountAddHandler(dbOps: DatabaseOperations) {
 			const accountId = crypto.randomUUID();
 			const now = Date.now();
 			const db = dbOps.getAdapter();
+
+			const conflict = await assertAccountNameAvailable(
+				dbOps,
+				name,
+				"kilo",
+				null,
+			);
+			if (conflict) return conflict;
+
 			await db.run(
 				`INSERT INTO accounts (
 					id, name, provider, api_key, refresh_token, access_token,
@@ -3361,6 +3611,15 @@ export function createAlibabaCodingPlanAccountAddHandler(
 			const accountId = crypto.randomUUID();
 			const now = Date.now();
 			const db = dbOps.getAdapter();
+
+			const conflict = await assertAccountNameAvailable(
+				dbOps,
+				name,
+				"alibaba-coding-plan",
+				null,
+			);
+			if (conflict) return conflict;
+
 			await db.run(
 				`INSERT INTO accounts (
 					id, name, provider, api_key, refresh_token, access_token,
@@ -3514,6 +3773,15 @@ export function createOpenRouterAccountAddHandler(dbOps: DatabaseOperations) {
 			const accountId = crypto.randomUUID();
 			const now = Date.now();
 			const db = dbOps.getAdapter();
+
+			const conflict = await assertAccountNameAvailable(
+				dbOps,
+				name,
+				"openrouter",
+				null,
+			);
+			if (conflict) return conflict;
+
 			await db.run(
 				`INSERT INTO accounts (
 					id, name, provider, api_key, refresh_token, access_token,

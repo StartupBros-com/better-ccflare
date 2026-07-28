@@ -54,6 +54,7 @@ import {
 	getRoutingCapacityContext,
 	getUsageThrottleUntil,
 	interceptAndModifyRequest,
+	isInternalProbe,
 	isRefreshTokenLikelyExpired,
 	type ModelFallbackExecutionPolicy,
 	mergeTerminalAccountState,
@@ -72,6 +73,7 @@ import { getReactiveModelCapacityBlocker } from "./handlers/account-selector";
 import {
 	completeRateLimitProbe,
 	getRateLimitProbeAdmission,
+	wouldSuppressProbe,
 } from "./handlers/rate-limit-cooldown";
 import { getRequestRateLimitOutcomes } from "./handlers/rate-limit-scope";
 import { consumeInternalAutoRefreshAuth } from "./internal-probe-auth";
@@ -167,6 +169,31 @@ export function alignRouteCandidateIds(
 }
 
 const log = new Logger("Proxy");
+
+function isComboSessionFallbackDisabled(): boolean {
+	const value = process.env.CCFLARE_DISABLE_COMBO_SESSION_FALLBACK;
+	return /^(1|true|yes|on)$/i.test(value ?? "");
+}
+
+function createComboSessionFallbackDisabledResponse(
+	comboName: string,
+): Response {
+	return new Response(
+		JSON.stringify({
+			type: "error",
+			error: {
+				type: "service_unavailable_error",
+				message: "Service temporarily unavailable. Please try again later.",
+				code: "combo_session_fallback_disabled",
+				combo: comboName,
+			},
+		}),
+		{
+			status: 503,
+			headers: { "Content-Type": "application/json" },
+		},
+	);
+}
 
 // ===== USAGE COLLECTOR MANAGEMENT =====
 
@@ -274,13 +301,22 @@ async function handleProxyCore(
 ): Promise<Response> {
 	// Consume the private scheduler credential before any request inspection,
 	// metadata construction, logging, cache staging, or upstream forwarding.
+	// Two internal-probe trust mechanisms currently coexist: our own
+	// randomBytes(32)/timingSafeEqual credential (consumeInternalAutoRefreshAuth,
+	// delete-before-compare above) and isInternalProbe's process-local
+	// ctx.internalProbeSecret (a crypto.randomUUID() minted in server.ts),
+	// which request-handler.ts/response-processor.ts/proxy-operations.ts already
+	// rely on for the same schedulers' probe requests. Either one, backed by its
+	// matching secret, is sufficient here — an unverified marker alone never is.
 	const trustedInternalScheduler = consumeInternalAutoRefreshAuth(req.headers);
 	const trustedInternalAutoRefresh =
-		trustedInternalScheduler &&
-		req.headers.get("x-better-ccflare-auto-refresh") === "true";
+		(trustedInternalScheduler &&
+			req.headers.get("x-better-ccflare-auto-refresh") === "true") ||
+		isInternalProbe(req.headers, ctx, "auto-refresh");
 	const trustedInternalKeepalive =
-		trustedInternalScheduler &&
-		req.headers.get("x-better-ccflare-keepalive") === "true";
+		(trustedInternalScheduler &&
+			req.headers.get("x-better-ccflare-keepalive") === "true") ||
+		isInternalProbe(req.headers, ctx, "keepalive");
 	// The public marker is meaningful only after internal authentication. Remove
 	// spoofed markers so they cannot suppress pacing, analytics, or cache staging.
 	if (!trustedInternalAutoRefresh) {
@@ -666,6 +702,31 @@ async function handleProxyCore(
 		};
 		const predictiveUsageEnabled =
 			settings.fiveHourEnabled || settings.weeklyEnabled;
+
+		// Internal synthetic probes (auto-refresh window-reset checks, cache
+		// keepalive replays) must never be usage-throttled. They exist
+		// specifically to hit the real endpoint and observe state changes
+		// (window resets, recovered accounts) — the same reason
+		// selectAccountsForRequest already lets them bypass pause/rate-limit
+		// checks (see account-selector.ts's isAutoRefreshBypass). Without this
+		// exemption, a throttled-but-healthy account's own synthetic probe gets
+		// our own 529 back; the auto-refresh scheduler then misreads that as an
+		// endpoint failure and counts it toward its consecutive-failure pause
+		// threshold (recordRefreshFailure), auto-pausing a healthy account the
+		// instant its usage window resets and the scheduler re-probes it.
+		// trustedInternalAutoRefresh/trustedInternalKeepalive already fold in
+		// both internal-probe trust mechanisms (see the comment where they're
+		// computed above), so they're the single canonical trust signal here —
+		// consistent with how they gate pacing, session tracking, and cache
+		// staging elsewhere in this function.
+		if (trustedInternalAutoRefresh || trustedInternalKeepalive) {
+			return {
+				available: accounts,
+				predictivelyThrottled: [] as Account[],
+				reactivelyDepletedAccounts: [] as Account[],
+			};
+		}
+
 		const now = Date.now();
 		const available: Account[] = [];
 		const predictivelyThrottled: Account[] = [];
@@ -725,6 +786,63 @@ async function handleProxyCore(
 			predictivelyThrottled,
 			reactivelyDepletedAccounts,
 		};
+	};
+
+	const returnComboSessionFallbackDisabled = async (
+		comboName: string,
+		failoverAttempts: number,
+	): Promise<Response> => {
+		const disabledFallbackResponse =
+			createComboSessionFallbackDisabledResponse(comboName);
+		const collector = tryGetUsageCollector();
+		if (collector) {
+			collector.handleStart({
+				type: "start",
+				messageId: crypto.randomUUID(),
+				requestId: requestMeta.id,
+				accountId: null,
+				method: req.method,
+				path: url.pathname,
+				timestamp: requestMeta.timestamp,
+				requestHeaders: Object.fromEntries(req.headers.entries()),
+				requestBody: null,
+				project: project ?? null,
+				projectAttributionSource: projectAttributionSource ?? "none",
+				agentAttributionSource: agentAttributionSource ?? "none",
+				responseStatus: 503,
+				responseHeaders: Object.fromEntries(
+					disabledFallbackResponse.headers.entries(),
+				),
+				isStream: false,
+				providerName: ctx.provider.name,
+				accountBillingType: null,
+				accountAutoPauseOnOverageEnabled: 0,
+				accountName: null,
+				agentUsed: agentUsed || null,
+				originalModel: originalModel || null,
+				appliedModel: appliedModel || null,
+				comboName,
+				apiKeyId: apiKeyId || null,
+				apiKeyName: apiKeyName || null,
+				retryAttempt: 0,
+				failoverAttempts,
+			});
+			try {
+				await collector.handleEnd({
+					type: "end",
+					requestId: requestMeta.id,
+					success: false,
+					error: "combo_session_fallback_disabled",
+				});
+			} catch (err) {
+				log.error(
+					`handleEnd failed for combo fallback disabled request ${requestMeta.id}`,
+					err,
+				);
+			}
+		}
+		cacheBodyStore.discardStaged(requestMeta.id);
+		return disabledFallbackResponse;
 	};
 
 	let {
@@ -814,6 +932,10 @@ async function handleProxyCore(
 		// never reaches forwardToClient's null-account clear) — so no failure or
 		// throw below can leave a stale mapping (KTD-5).
 		if (sessionId) clearSession(sessionId, requestMeta.timestamp);
+
+		if (requestMeta.comboName && isComboSessionFallbackDisabled()) {
+			return await returnComboSessionFallbackDisabled(requestMeta.comboName, 0);
+		}
 
 		if (reactivelyDepletedAccounts.length > 0) {
 			return finishPacing(
@@ -929,6 +1051,10 @@ async function handleProxyCore(
 		: null;
 	let response: Response | null = null;
 	let upstreamAttempts = 0;
+	// Every candidate probe-gate-suppressed and skipped via `continue` below
+	// means the loop never actually attempted an account; the post-loop
+	// fallback tier uses this to retry the top candidate once, ungated.
+	let anyAccountAttempted = false;
 	type DeferredModelRoute = {
 		readonly account: Account;
 		readonly model: string;
@@ -1067,15 +1193,25 @@ async function handleProxyCore(
 			continue;
 		}
 
+		anyAccountAttempted = true;
+		// The last actually-attempted candidate is not always the last pool
+		// index: a probe-suppressed tail account gets skipped via `continue`
+		// above rather than attempted. Look ahead at the remaining candidates'
+		// CURRENT suppression state (without taking a lease) to find out
+		// whether any of them would still be attempted after this one.
+		const isLastAttemptedCandidate = accounts
+			.slice(i + 1)
+			.every((candidate) => wouldSuppressProbe(candidate));
+
 		const attemptedBefore = routingAttemptLedger.attemptedCount;
 		const candidateId =
 			selectedRouteCandidateIds[i] ?? `account:${accounts[i].id}`;
 		const isFinalSelectedCandidate =
 			!filteredComboInfo?.comboName &&
-			i === accounts.length - 1 &&
+			isLastAttemptedCandidate &&
 			deferredModelRoutes.length === 0;
 		const isFinalSelectedSemanticRoute =
-			i === accounts.length - 1 && deferredModelRoutes.length === 0;
+			isLastAttemptedCandidate && deferredModelRoutes.length === 0;
 		try {
 			response = await proxyWithAccount(
 				req,
@@ -1135,6 +1271,81 @@ async function handleProxyCore(
 		}
 	}
 
+	// Every candidate was single-flight probe-gate suppressed — no account was
+	// ever actually attempted. The gate's purpose is to prefer another account
+	// over stampeding one that just recovered, not to drop the request when
+	// there is no other account to prefer: retry the highest-priority
+	// candidate once, bypassing the gate, instead of falling through to a hard
+	// 503 against what may be a perfectly healthy account.
+	if (!anyAccountAttempted && accounts.length > 0) {
+		const i = 0;
+		let modelOverride: string | null = null;
+		if (filteredComboInfo?.slots[i]?.accountId === accounts[i].id) {
+			modelOverride = filteredComboInfo.slots[i].modelOverride;
+		}
+		log.info(
+			`All ${accounts.length} candidate account(s) were probe-gate suppressed; retrying account ${accounts[i].name} ungated`,
+		);
+		// This retry IS the request's terminal attempt by construction — the
+		// loop above never actually attempted any candidate (anyAccountAttempted
+		// is only set once a candidate clears the probe gate), so
+		// deferredModelRoutes is still empty and this is final whenever it
+		// isn't combo routing. Threads through the same routingAttemptLedger /
+		// contextAdmissionTracker / modelFallbackPolicy wiring, and the same
+		// pacing finalization, as the main loop above so this rare path can't
+		// silently skip our fork's routing/pacing bookkeeping.
+		const candidateId =
+			selectedRouteCandidateIds[i] ?? `account:${accounts[i].id}`;
+		const isFinalSelectedCandidate = !filteredComboInfo?.comboName;
+		const attemptedBefore = routingAttemptLedger.attemptedCount;
+		try {
+			response = await proxyWithAccount(
+				req,
+				url,
+				accounts[i],
+				requestMeta,
+				finalBodyBuffer,
+				finalCreateBodyStream,
+				upstreamAttempts,
+				ctx,
+				modelOverride,
+				apiKeyId,
+				apiKeyName,
+				finalRequestBodyContext,
+				isFinalSelectedCandidate,
+				contextAdmissionTracker,
+				routingAttemptLedger,
+				modelFallbackPolicyFor(
+					accounts[i],
+					candidateId,
+					isFinalSelectedCandidate,
+					true,
+				),
+			);
+		} catch (error) {
+			await routingAttemptLedger.discardTerminalResponse();
+			throw error;
+		}
+		upstreamAttempts += routingAttemptLedger.attemptedCount - attemptedBefore;
+
+		if (response) {
+			await routingAttemptLedger.discardTerminalResponse();
+			recordCachePacingRoute(
+				pacingObservation,
+				{
+					accountId: accounts[i].id,
+					accountName: accounts[i].name,
+					provider: accounts[i].provider,
+				},
+				{
+					candidate: pacingEligible,
+					assignedBypass: assignedCodexPacingBypass,
+				},
+			);
+			return finishPacing(pacingSlot, response);
+		}
+	}
+
 	// 10. Combo fallback: if combo routing was active and all slots failed,
 	//     fall back to normal SessionStrategy routing (REQ-14)
 	let fallbackAccounts: Account[] | null = null;
@@ -1142,6 +1353,16 @@ async function handleProxyCore(
 	let throttledFallbackAccounts: Account[] = [];
 	let fallbackSelectionHadNoAvailable = false;
 	if (filteredComboInfo?.comboName) {
+		if (isComboSessionFallbackDisabled()) {
+			log.warn(
+				`All combo slots failed for combo "${filteredComboInfo.comboName}", session fallback disabled by CCFLARE_DISABLE_COMBO_SESSION_FALLBACK`,
+			);
+			return await returnComboSessionFallbackDisabled(
+				filteredComboInfo.comboName,
+				accounts.length,
+			);
+		}
+
 		log.warn(
 			`All combo slots failed for combo "${filteredComboInfo.comboName}", falling back to SessionStrategy routing`,
 		);
@@ -1188,6 +1409,7 @@ async function handleProxyCore(
 			log.info(
 				`Fallback: trying ${fallbackAccounts.length} SessionStrategy accounts`,
 			);
+			let anyFallbackAttempted = false;
 			for (let i = 0; i < fallbackAccounts.length; i++) {
 				if (
 					pacingBypassed &&
@@ -1211,11 +1433,18 @@ async function handleProxyCore(
 					continue;
 				}
 
+				anyFallbackAttempted = true;
+				// Same rationale as the main loop above: a probe-suppressed tail
+				// candidate is skipped via `continue`, so the last pool index is
+				// not necessarily the last one actually attempted.
+				const isLastAttemptedFallback = fallbackAccounts
+					.slice(i + 1)
+					.every((candidate) => wouldSuppressProbe(candidate));
 				const attemptedBefore = routingAttemptLedger.attemptedCount;
 				const candidateId =
 					fallbackRouteCandidateIds[i] ?? `account:${fallbackAccounts[i].id}`;
 				const isFinalFallbackCandidate =
-					i === fallbackAccounts.length - 1 && deferredModelRoutes.length === 0;
+					isLastAttemptedFallback && deferredModelRoutes.length === 0;
 				try {
 					response = await proxyWithAccount(
 						req,
@@ -1247,6 +1476,72 @@ async function handleProxyCore(
 					if (probeAdmission === "admitted") {
 						completeRateLimitProbe(fallbackAccounts[i], "abandoned");
 					}
+				}
+				upstreamAttempts +=
+					routingAttemptLedger.attemptedCount - attemptedBefore;
+
+				if (response) {
+					await routingAttemptLedger.discardTerminalResponse();
+					recordCachePacingRoute(
+						pacingObservation,
+						{
+							accountId: fallbackAccounts[i].id,
+							accountName: fallbackAccounts[i].name,
+							provider: fallbackAccounts[i].provider,
+						},
+						{
+							candidate: pacingEligible,
+							assignedBypass: assignedCodexPacingBypass,
+						},
+					);
+					return finishPacing(pacingSlot, response);
+				}
+			}
+
+			// Every candidate was single-flight probe-gate suppressed — no account
+			// was ever actually attempted. Same rationale as the main loop above:
+			// retry the highest-priority fallback candidate once, bypassing the
+			// gate, instead of falling through to a hard failure.
+			if (!anyFallbackAttempted && fallbackAccounts.length > 0) {
+				const i = 0;
+				log.info(
+					`All ${fallbackAccounts.length} fallback candidate(s) were probe-gate suppressed; retrying account ${fallbackAccounts[i].name} ungated`,
+				);
+				// This retry is the terminal attempt by construction (the fallback
+				// loop already exhausted every candidate), and the fallback path is
+				// never combo-routed (comboName was cleared before re-selection), so
+				// isFinalFallbackCandidate only needs to account for deferred routes.
+				const candidateId =
+					fallbackRouteCandidateIds[i] ?? `account:${fallbackAccounts[i].id}`;
+				const isFinalFallbackCandidate = deferredModelRoutes.length === 0;
+				const attemptedBefore = routingAttemptLedger.attemptedCount;
+				try {
+					response = await proxyWithAccount(
+						req,
+						url,
+						fallbackAccounts[i],
+						requestMeta,
+						finalBodyBuffer,
+						finalCreateBodyStream,
+						upstreamAttempts,
+						ctx,
+						undefined,
+						apiKeyId,
+						apiKeyName,
+						finalRequestBodyContext,
+						isFinalFallbackCandidate,
+						contextAdmissionTracker,
+						routingAttemptLedger,
+						modelFallbackPolicyFor(
+							fallbackAccounts[i],
+							candidateId,
+							isFinalFallbackCandidate,
+							true,
+						),
+					);
+				} catch (error) {
+					await routingAttemptLedger.discardTerminalResponse();
+					throw error;
 				}
 				upstreamAttempts +=
 					routingAttemptLedger.attemptedCount - attemptedBefore;
@@ -1328,7 +1623,6 @@ async function handleProxyCore(
 				}
 				continue;
 			}
-
 			if (
 				pacingBypassed &&
 				!crossoverPacingRestored &&

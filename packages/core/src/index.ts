@@ -4,6 +4,8 @@ export * from "./combo-membership-resolver";
 export {
 	BUFFER_SIZES,
 	CACHE,
+	computeOverloadCooldownMs,
+	computeOverloadWithResetCapMs,
 	computeRateLimitBackoffMs,
 	getInPlaceRetryDrainTimeoutMs,
 	getOverloadRetryConfig,
@@ -11,6 +13,7 @@ export {
 	getRateLimitResetStabilityMs,
 	getSessionAffinityAntiThrashWindowMs,
 	HTTP_STATUS,
+	isOverloadReason,
 	LIMITS,
 	NETWORK,
 	resolveCooldownUntil,
@@ -83,6 +86,10 @@ export {
 	MODEL_DISPLAY_NAMES,
 	MODEL_SHORT_NAMES,
 } from "./models";
+export {
+	installOutboundProxy,
+	uninstallOutboundProxy,
+} from "./outbound-proxy";
 export {
 	estimateCostUSD,
 	getModelRates,
