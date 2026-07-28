@@ -1,6 +1,8 @@
 import type { ComboResolverDependencies } from "@better-ccflare/core/managed-routing";
 import {
+	getAllowedModelsMessage,
 	getModelFamily,
+	isFamilyAliasModel,
 	resolveEffectiveComboMembership,
 } from "@better-ccflare/core/managed-routing";
 import type { DatabaseOperations } from "@better-ccflare/database";
@@ -216,6 +218,61 @@ export function createComboDeleteHandler(dbOps: DatabaseOperations) {
 }
 
 /**
+ * Canonicalize a stored managed_model/slot-model value: if it is a bare
+ * family alias (e.g. "opus"), store the lowercase family word itself so
+ * later reads compare consistently; otherwise return the trimmed value
+ * unchanged. This never resolves the alias to a concrete model — storing the
+ * alias literal is the point of the feature (it lets future model releases
+ * propagate via a models.ts bump instead of a data migration).
+ */
+function normalizeManagedModelValue(
+	value: string,
+	family: ComboFamily,
+): string {
+	const trimmed = value.trim();
+	return isFamilyAliasModel(trimmed, family) ? family : trimmed;
+}
+
+/**
+ * Validate and normalize a slot's model against the family (if any) that the
+ * slot's combo is currently assigned to. Combos not yet assigned to any
+ * family accept any non-empty model unchanged (no family context to check
+ * against). A combo assigned to one or more families must have its slot
+ * models belong to at least one of those families (concrete model or bare
+ * family alias); the matched family's alias spelling is canonicalized.
+ */
+async function normalizeSlotModelForCombo(
+	dbOps: DatabaseOperations,
+	comboId: string,
+	rawModel: string,
+): Promise<{ ok: true; model: string } | { ok: false; message: string }> {
+	const trimmed = rawModel.trim();
+	if (!trimmed) {
+		return { ok: false, message: "model must be a non-empty string" };
+	}
+	const assignments = await dbOps.getFamilyAssignments();
+	const assignedFamilies = assignments
+		.filter((assignment) => assignment.combo_id === comboId)
+		.map((assignment) => assignment.family);
+	if (assignedFamilies.length === 0) {
+		return { ok: true, model: trimmed };
+	}
+	const matchedFamily = assignedFamilies.find(
+		(family) => getModelFamily(trimmed) === family,
+	);
+	if (!matchedFamily) {
+		return {
+			ok: false,
+			message: `model must belong to a family assigned to this combo (${assignedFamilies.join(", ")}). ${getAllowedModelsMessage()}`,
+		};
+	}
+	return {
+		ok: true,
+		model: normalizeManagedModelValue(trimmed, matchedFamily),
+	};
+}
+
+/**
  * POST /api/combos/:id/slots — Add a slot to a combo
  */
 export function createSlotAddHandler(dbOps: DatabaseOperations) {
@@ -241,6 +298,16 @@ export function createSlotAddHandler(dbOps: DatabaseOperations) {
 				return errorResponse(BadRequest("account_id and model are required"));
 			}
 
+			const normalizedModelResult = await normalizeSlotModelForCombo(
+				dbOps,
+				comboId,
+				model,
+			);
+			if (!normalizedModelResult.ok) {
+				return errorResponse(BadRequest(normalizedModelResult.message));
+			}
+			const normalizedModel = normalizedModelResult.model;
+
 			if (priority !== undefined && !isComboSlotPriority(priority)) {
 				return errorResponse(
 					BadRequest("priority must be an integer between 0 and 100"),
@@ -253,7 +320,7 @@ export function createSlotAddHandler(dbOps: DatabaseOperations) {
 			const newSlot = await dbOps.addComboSlot(
 				comboId,
 				account_id,
-				model.trim(),
+				normalizedModel,
 				nextPriority,
 			);
 
@@ -273,7 +340,7 @@ export function createSlotAddHandler(dbOps: DatabaseOperations) {
 export function createSlotUpdateHandler(dbOps: DatabaseOperations) {
 	return async (
 		req: Request,
-		_comboId: string,
+		comboId: string,
 		slotId: string,
 	): Promise<Response> => {
 		try {
@@ -290,7 +357,15 @@ export function createSlotUpdateHandler(dbOps: DatabaseOperations) {
 				if (typeof model !== "string" || model.trim().length === 0) {
 					return errorResponse(BadRequest("model must be a non-empty string"));
 				}
-				fields.model = model.trim();
+				const normalizedModelResult = await normalizeSlotModelForCombo(
+					dbOps,
+					comboId,
+					model,
+				);
+				if (!normalizedModelResult.ok) {
+					return errorResponse(BadRequest(normalizedModelResult.message));
+				}
+				fields.model = normalizedModelResult.model;
 			}
 
 			if (enabled !== undefined) {
@@ -513,7 +588,12 @@ export function createFamilyAssignHandler(
 						? { membership_mode: membershipMode }
 						: {}),
 					...(managedModel !== undefined
-						? { managed_model: managedModel }
+						? {
+								managed_model:
+									managedModel === null
+										? null
+										: normalizeManagedModelValue(managedModel, typedFamily),
+							}
 						: {}),
 				};
 				let proposedSnapshot: ComboRoutingPolicySnapshot = {

@@ -1,4 +1,7 @@
-import { getModelDisplayName } from "@better-ccflare/core";
+import {
+	getModelDisplayName,
+	resolveFamilyAliasModel,
+} from "@better-ccflare/core";
 import type {
 	ComboFamily,
 	ComboFamilyAssignment,
@@ -35,6 +38,7 @@ import { Switch } from "../ui/switch";
 import {
 	type FamilyRoutingModelOption,
 	familyModelOptions as filterFamilyModelOptions,
+	resolvePolicyModelAlias,
 } from "./family-routing";
 import {
 	type ManagedFamilyApplyCommand,
@@ -103,13 +107,34 @@ export function runSerializedFamilyPolicyUpdate(
 		});
 }
 
+/**
+ * Label a stored managed_model value not present in the live catalog. A bare
+ * family alias (e.g. "opus") is shown alongside the concrete model it
+ * currently tracks so the fallback SelectItem never displays an unexplained
+ * bare word; any other stored value keeps its normal display name. Alias
+ * detection/resolution is shared with `formatPolicyModel` via
+ * `resolvePolicyModelAlias`; only the final string formatting differs here.
+ */
+function describeStoredManagedModel(
+	storedModel: string,
+	family?: ComboFamily,
+): string {
+	const resolution = resolvePolicyModelAlias(storedModel, family);
+	if (!resolution.isAlias) return getModelDisplayName(storedModel);
+	return `${resolution.trimmed} (tracks latest → ${getModelDisplayName(resolution.resolved)})`;
+}
+
 export function getManagedModelOptions(
 	liveOptions: readonly FamilyRoutingModelOption[],
 	storedModel?: string | null,
+	family?: ComboFamily,
 ): FamilyRoutingModelOption[] {
 	if (storedModel && !liveOptions.some(({ id }) => id === storedModel)) {
 		return [
-			{ id: storedModel, displayName: getModelDisplayName(storedModel) },
+			{
+				id: storedModel,
+				displayName: describeStoredManagedModel(storedModel, family),
+			},
 			...liveOptions,
 		];
 	}
@@ -127,11 +152,16 @@ export function previewMatchesPendingConversion(
 	preview: ComboRoutingPreviewResult | null | undefined,
 	pending: PendingManagedConversion | null,
 ): preview is ComboRoutingPreviewResult {
+	// preview.managed_model is server-resolved and always concrete, while the
+	// pending value can be a stored bare family alias (e.g. "opus") — resolve
+	// it the same way before comparing or an alias-valued policy would never
+	// count as current.
 	return Boolean(
 		preview &&
 			pending &&
 			preview.family === pending.family &&
-			preview.managed_model === pending.managedModel,
+			preview.managed_model ===
+				resolveFamilyAliasModel(pending.managedModel, pending.family),
 	);
 }
 
@@ -391,6 +421,7 @@ export function FamilyActivationSection() {
 							const modelOptions = getManagedModelOptions(
 								familyModelOptions[family],
 								assignment?.managed_model,
+								family,
 							);
 							const managedModel = resolveAuthoritativeManagedModel(
 								assignment,

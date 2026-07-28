@@ -1542,6 +1542,47 @@ describe("managed routing HTTP control plane", () => {
 		});
 	});
 
+	it("normalizes a bare family alias managed_model to the canonical family word at write time", async () => {
+		const state = statefulDb();
+		const response = await createFamilyAssignHandler(state.dbOps, dependencies)(
+			request("/api/families/opus", { managed_model: "  OPUS  " }, "PUT"),
+			"opus",
+		);
+
+		expect(response.status).toBe(200);
+		expect(state.applyFamilyPolicyChanges).toHaveBeenCalledWith({
+			family: "opus",
+			expected_revision: 0,
+			assignment: { managed_model: "opus" },
+		});
+		expect((await response.json()).data).toMatchObject({
+			combo_id: "combo-1",
+			managed_model: "opus",
+		});
+	});
+
+	it("clears managed_model to null without normalizing it as an alias", async () => {
+		const state = statefulDb();
+		state.mutatePolicy((policy) => {
+			policy.assignment.managed_model = "claude-opus-4-7";
+		});
+		const response = await createFamilyAssignHandler(state.dbOps, dependencies)(
+			request("/api/families/opus", { managed_model: null }, "PUT"),
+			"opus",
+		);
+
+		expect(response.status).toBe(200);
+		expect(state.applyFamilyPolicyChanges).toHaveBeenCalledWith({
+			family: "opus",
+			expected_revision: 1,
+			assignment: { managed_model: null },
+		});
+		expect((await response.json()).data).toMatchObject({
+			combo_id: "combo-1",
+			managed_model: null,
+		});
+	});
+
 	it("preserves explicit combo and null legacy assignment compatibility", async () => {
 		const assigned = statefulDb();
 		const assignResponse = await createFamilyAssignHandler(

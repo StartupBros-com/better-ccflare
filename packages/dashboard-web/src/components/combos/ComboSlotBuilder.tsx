@@ -48,6 +48,7 @@ import {
 } from "./combo-slot-priority";
 import {
 	type FamilyRoutingProjection,
+	formatPolicyModel,
 	projectFamilyRoutings,
 } from "./family-routing";
 import { ManagedExclusionList } from "./ManagedExclusionList";
@@ -648,7 +649,10 @@ export function ComboSlotBuilder({ combo }: ComboSlotBuilderProps) {
 										</Badge>
 										{policyAssignment.managed_model && (
 											<span className="font-mono text-xs text-muted-foreground">
-												{policyAssignment.managed_model}
+												{formatPolicyModel(
+													policyAssignment.managed_model,
+													family,
+												)}
 											</span>
 										)}
 									</div>

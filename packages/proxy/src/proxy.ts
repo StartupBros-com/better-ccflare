@@ -822,6 +822,14 @@ async function handleProxyCore(
 				originalModel: originalModel || null,
 				appliedModel: appliedModel || null,
 				comboName,
+				// This 503 is generated locally when combo session fallback is
+				// disabled: the request never reaches a combo slot or a serving
+				// account (accountId is null above), so no slot-level model
+				// rewrite happened and there is nothing to attribute. Same
+				// reasoning as the locally generated terminal path in
+				// routing-terminal-recorder.ts.
+				comboModelOverrideFrom: null,
+				comboModelOverrideTo: null,
 				apiKeyId: apiKeyId || null,
 				apiKeyName: apiKeyName || null,
 				retryAttempt: 0,
@@ -1076,12 +1084,18 @@ async function handleProxyCore(
 		candidateId: string,
 		forwardModelUnavailableResponse: boolean,
 		currentlyFinalSemanticRoute: boolean,
+		// Pre-override model (effectiveModel) when this attempt is a genuine
+		// combo-slot override; null for the fallback loop and every other
+		// caller (default), so the combo-vs-implicit-fallback distinction is
+		// never inferred from modelOverride alone.
+		comboModelOverrideFrom: string | null = null,
 	): ModelFallbackExecutionPolicy => {
 		const comboName = requestMeta.comboName ?? null;
 		const comboSlotIndex = requestMeta.comboSlotIndex ?? null;
 		return {
 			routeCandidateId: candidateId,
 			forwardModelUnavailableResponse,
+			comboModelOverrideFrom,
 			// proxyWithAccount combines this currently-known queue finality with its
 			// account/model-specific implicit-fallback discovery state immediately
 			// before each real fetch and semantic gate.
@@ -1234,6 +1248,10 @@ async function handleProxyCore(
 					candidateId,
 					isFinalSelectedCandidate,
 					isFinalSelectedSemanticRoute,
+					// Only a genuine combo slot carries a pre-override baseline;
+					// the desync edge case above leaves modelOverride null so no
+					// override is attributed there either.
+					modelOverride ? effectiveModel : null,
 				),
 			);
 		} catch (error) {
@@ -1320,6 +1338,14 @@ async function handleProxyCore(
 					candidateId,
 					isFinalSelectedCandidate,
 					true,
+					// This ungated retry applies the combo slot's model override
+					// exactly like the main loop does (modelOverride is computed
+					// above and passed to proxyWithAccount), so it must attribute
+					// the override too. Omitting this argument let it default to
+					// null, which recorded a real slot-level rewrite as "no
+					// override" and hid it from comboModelOverride attribution
+					// and from the model-routing drift alert.
+					modelOverride ? effectiveModel : null,
 				),
 			);
 		} catch (error) {

@@ -57,6 +57,14 @@ export interface StartMessage {
 	// Combo info
 	comboName: string | null;
 
+	// Combo model-override delta observability: populated only when a combo
+	// slot's model override actually applied on the successful attempt and
+	// differs from the pre-override (effectiveModel) baseline — gate every
+	// write through resolveComboModelOverride() for the same reason
+	// originalModel/appliedModel are gated through isModelRewrite().
+	comboModelOverrideFrom: string | null;
+	comboModelOverrideTo: string | null;
+
 	// API key info
 	apiKeyId: string | null;
 	apiKeyName: string | null;
@@ -89,6 +97,21 @@ export function isModelRewrite(
 	appliedModel: string | null | undefined,
 ): boolean {
 	return !!originalModel && !!appliedModel && originalModel !== appliedModel;
+}
+
+/**
+ * True only when a combo slot's model override actually applied on this
+ * attempt and resolved to a different model than the pre-override baseline
+ * (effectiveModel at selection time). Mirrors isModelRewrite's gating so the
+ * same "detected but no real change" case never surfaces as a delta — used
+ * before StartMessage construction and before exposing comboModelOverride on
+ * the summary event/RequestResponse.
+ */
+export function resolveComboModelOverride(
+	from: string | null | undefined,
+	to: string | null | undefined,
+): boolean {
+	return !!from && !!to && from !== to;
 }
 
 export interface ChunkMessage {

@@ -10,7 +10,7 @@ import type {
 	EffectiveComboMember,
 	LogicalModelCapability,
 } from "@better-ccflare/types";
-import { getModelFamily } from "./model-mappings";
+import { getModelFamily, resolveFamilyAliasModel } from "./model-mappings";
 import { LATEST_MODEL_BY_FAMILY } from "./models";
 
 export interface ComboResolverDependencies {
@@ -51,7 +51,10 @@ function createManualMember(
 		combo_id: slot.combo_id,
 		family: snapshot.assignment.family,
 		included: true,
-		logical_model: slot.model,
+		logical_model: resolveFamilyAliasModel(
+			slot.model,
+			snapshot.assignment.family,
+		),
 		tier: slot.priority,
 		source: "manual",
 		reason: "included",
@@ -116,9 +119,10 @@ function rejectedDecision(
 function resolveManagedModel(
 	snapshot: ComboRoutingPolicySnapshot,
 ): string | null {
-	const model =
+	const raw =
 		snapshot.assignment.managed_model ??
 		LATEST_MODEL_BY_FAMILY[snapshot.assignment.family];
+	const model = resolveFamilyAliasModel(raw, snapshot.assignment.family);
 	return getModelFamily(model) === snapshot.assignment.family ? model : null;
 }
 
@@ -150,10 +154,36 @@ export function resolveEffectiveComboMembership(
 		};
 	}
 
-	const members = snapshot.slots
+	// Two manual slots for the same account can resolve to the same concrete
+	// model (e.g. one stored as a literal model ID, another as a bare family
+	// alias that resolves to that same latest model). Dedupe by
+	// (account_id, resolved logical_model), keeping the first member by the
+	// existing compare order and demoting the rest to a rejected
+	// "manual_override" decision so every enabled slot still yields exactly
+	// one decision entry.
+	const manualCandidates = snapshot.slots
 		.filter((slot) => slot.enabled && slot.combo_id === comboId)
-		.map((slot) => createManualMember(snapshot, slot));
-	const decisions: ComboMembershipDecision[] = members.map(toDecision);
+		.map((slot) => createManualMember(snapshot, slot))
+		.sort(compareMembers);
+	const members: EffectiveComboMember[] = [];
+	const decisions: ComboMembershipDecision[] = [];
+	const seenManualKeys = new Set<string>();
+	for (const candidate of manualCandidates) {
+		const key = `${candidate.account_id}\u0000${candidate.logical_model}`;
+		if (seenManualKeys.has(key)) {
+			decisions.push(
+				rejectedDecision(snapshot, candidate.account_id, "manual_override", {
+					logicalModel: candidate.logical_model,
+					tier: candidate.tier,
+					slotId: candidate.slot_id,
+				}),
+			);
+			continue;
+		}
+		seenManualKeys.add(key);
+		members.push(candidate);
+		decisions.push(toDecision(candidate));
+	}
 	for (const slot of snapshot.slots) {
 		if (!slot.enabled && slot.combo_id === comboId) {
 			decisions.push(
@@ -371,8 +401,13 @@ export function resolveComboProposalManagedModel(
 		reviewedOverride,
 		snapshot.assignment.managed_model ?? undefined,
 	]) {
-		if (candidate && getModelFamily(candidate) === snapshot.assignment.family) {
-			return candidate;
+		if (!candidate) continue;
+		const resolved = resolveFamilyAliasModel(
+			candidate,
+			snapshot.assignment.family,
+		);
+		if (getModelFamily(resolved) === snapshot.assignment.family) {
+			return resolved;
 		}
 	}
 	return LATEST_MODEL_BY_FAMILY[snapshot.assignment.family];

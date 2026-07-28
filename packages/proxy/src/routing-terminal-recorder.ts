@@ -206,6 +206,11 @@ export function recordRoutingTerminalRequest(
 						? (requestMeta.appliedModel as string)
 						: null,
 					comboName: requestMeta.comboName ?? null,
+					// No serving account/attempt exists on this locally generated
+					// terminal path (see file doc comment), so there is never a
+					// combo-slot override to attribute here.
+					comboModelOverrideFrom: null,
+					comboModelOverrideTo: null,
 					apiKeyId: options.apiKeyId ?? null,
 					apiKeyName: options.apiKeyName ?? null,
 					retryAttempt: 0,

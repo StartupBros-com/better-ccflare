@@ -1124,6 +1124,8 @@ describe("forwardToClient usage-collector protocol", () => {
 			accountName: null,
 			agentUsed: null,
 			comboName: null,
+			comboModelOverrideFrom: null,
+			comboModelOverrideTo: null,
 			apiKeyId: null,
 			apiKeyName: null,
 			retryAttempt: 0,

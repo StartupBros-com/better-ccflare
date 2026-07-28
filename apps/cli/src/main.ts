@@ -42,12 +42,16 @@ import {
 	CLAUDE_MODEL_IDS,
 	getVersionSync,
 	installOutboundProxy,
+	isFamilyAliasModel,
 	levenshteinDistance,
 	NETWORK,
+	resolveFamilyAliasModel,
 	shutdown,
 } from "@better-ccflare/core";
 import { container, SERVICE_KEYS } from "@better-ccflare/core-di";
+import type { DatabaseOperations } from "@better-ccflare/database";
 import { Logger } from "@better-ccflare/logger";
+import type { ComboFamily } from "@better-ccflare/types";
 
 interface ParsedArgs {
 	version: boolean;
@@ -104,6 +108,7 @@ interface ParsedArgs {
 	showConfig: boolean;
 	admin: boolean;
 	apiUrl: string | null;
+	resolveFamilyPolicyAliases: boolean;
 }
 
 // When the long-running server starts, its own SIGINT/SIGTERM handlers
@@ -469,6 +474,7 @@ function parseArgs(args: string[]): ParsedArgs {
 		showConfig: false,
 		admin: false,
 		apiUrl: null,
+		resolveFamilyPolicyAliases: false,
 	};
 
 	for (let i = 0; i < args.length; i++) {
@@ -733,6 +739,9 @@ function parseArgs(args: string[]): ParsedArgs {
 				parsed.doctorRecover = true;
 				parsed.doctor = true; // Base flag
 				break;
+			case "--resolve-family-policy-aliases":
+				parsed.resolveFamilyPolicyAliases = true;
+				break;
 			case "--cache-flight-recorder-report":
 				if (i + 1 >= args.length || args[i + 1].startsWith("--")) {
 					parsed.cacheFlightRecorderReport = "";
@@ -842,6 +851,79 @@ function hasRecorderCommandConflict(args: string[]): boolean {
 		}
 	}
 	return args.some((_, index) => !allowed.has(index));
+}
+
+const COMBO_FAMILIES: readonly ComboFamily[] = [
+	"fable",
+	"opus",
+	"sonnet",
+	"haiku",
+];
+
+/**
+ * Idempotent maintenance sweep for --resolve-family-policy-aliases: rewrite
+ * any stored bare family-alias value (the literal family word, e.g. "opus",
+ * standing in for "resolve to the latest model in this family") to its
+ * currently-resolved concrete model. This must be run before rolling
+ * production back to a binary that predates family-alias support, since an
+ * older binary would treat a stored alias literal as a real (nonsensical)
+ * model ID rather than resolving it.
+ *
+ * Covers both places an alias can be stored: a family's managed_model policy
+ * field, and an individual combo slot's model field (a manual slot can also
+ * hold a bare alias). Because the four family words are mutually exclusive,
+ * checking a stored value against all four is unambiguous regardless of
+ * which family's combo it happens to live under.
+ */
+export async function resolveFamilyPolicyAliases(
+	dbOps: DatabaseOperations,
+): Promise<void> {
+	let changeCount = 0;
+
+	const assignments = await dbOps.getFamilyAssignments();
+	for (const assignment of assignments) {
+		if (assignment.managed_model === null) continue;
+		for (const family of COMBO_FAMILIES) {
+			if (!isFamilyAliasModel(assignment.managed_model, family)) continue;
+			const resolved = resolveFamilyAliasModel(
+				assignment.managed_model,
+				family,
+			);
+			await dbOps.setFamilyPolicy(assignment.family, {
+				managed_model: resolved,
+			});
+			console.log(
+				`  [family:${assignment.family}] managed_model "${assignment.managed_model}" -> "${resolved}"`,
+			);
+			changeCount++;
+			break;
+		}
+	}
+
+	const combos = await dbOps.listCombos();
+	for (const combo of combos) {
+		const slots = await dbOps.getComboSlots(combo.id);
+		for (const slot of slots) {
+			for (const family of COMBO_FAMILIES) {
+				if (!isFamilyAliasModel(slot.model, family)) continue;
+				const resolved = resolveFamilyAliasModel(slot.model, family);
+				await dbOps.updateComboSlot(slot.id, { model: resolved });
+				console.log(
+					`  [combo:${combo.name} slot:${slot.id}] model "${slot.model}" -> "${resolved}"`,
+				);
+				changeCount++;
+				break;
+			}
+		}
+	}
+
+	if (changeCount === 0) {
+		console.log("✅ No stored family-alias values found; nothing to rewrite.");
+	} else {
+		console.log(
+			`✅ Rewrote ${changeCount} stored family-alias value${changeCount === 1 ? "" : "s"} to concrete models.`,
+		);
+	}
 }
 
 async function main() {
@@ -994,6 +1076,9 @@ ${getManagedRoutingHelpText()}
   --doctor             Run database integrity check and storage diagnostics
   --doctor-full        Run exhaustive integrity check (slower)
   --doctor-recover     Generate recovery instructions for corrupted database
+  --resolve-family-policy-aliases  Rewrite stored family-alias values (e.g. "opus") to
+                       their currently-resolved concrete models (run before rolling back
+                       to a pre-alias-feature binary)
   --cache-flight-recorder-report <id>  Report a retained recorder timeline
     --json             Emit exactly one structured JSON object
   --cache-flight-recorder-health       Show minimal recorder health
@@ -1575,6 +1660,11 @@ Examples:
 			recover: parsed.doctorRecover,
 		});
 		await exitGracefully(exitCode as 0 | 1);
+	}
+
+	if (parsed.resolveFamilyPolicyAliases) {
+		await resolveFamilyPolicyAliases(dbOps);
+		await exitGracefully(0);
 	}
 
 	// Default: Start server if no command specified

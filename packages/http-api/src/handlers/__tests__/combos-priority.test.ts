@@ -1,6 +1,10 @@
 import { describe, expect, it, mock } from "bun:test";
 import type { DatabaseOperations } from "@better-ccflare/database";
-import type { Combo, ComboSlot } from "@better-ccflare/types";
+import type {
+	Combo,
+	ComboFamilyAssignment,
+	ComboSlot,
+} from "@better-ccflare/types";
 import { createSlotAddHandler, createSlotUpdateHandler } from "../combos";
 
 const combo: Combo = {
@@ -31,7 +35,10 @@ function request(method: "POST" | "PUT", body: unknown): Request {
 	});
 }
 
-function makeDb(existing: ComboSlot[] = []) {
+function makeDb(
+	existing: ComboSlot[] = [],
+	assignments: ComboFamilyAssignment[] = [],
+) {
 	const addComboSlot = mock(
 		async (
 			comboId: string,
@@ -58,6 +65,7 @@ function makeDb(existing: ComboSlot[] = []) {
 		dbOps: {
 			getCombo: mock(async () => combo),
 			getComboSlots: mock(async () => existing),
+			getFamilyAssignments: mock(async () => assignments),
 			addComboSlot,
 			updateComboSlot,
 		} as unknown as DatabaseOperations,
@@ -159,5 +167,111 @@ describe("combo slot priority API", () => {
 
 		expect(response.status).toBe(400);
 		expect(updateComboSlot).not.toHaveBeenCalled();
+	});
+});
+
+describe("combo slot family alias validation", () => {
+	const opusAssignment: ComboFamilyAssignment = {
+		family: "opus",
+		combo_id: combo.id,
+		enabled: true,
+		membership_mode: "managed",
+		managed_model: "claude-opus-4-8",
+	};
+
+	it("accepts any non-empty model when the combo has no family assignment", async () => {
+		const { dbOps, addComboSlot } = makeDb([], []);
+		const response = await createSlotAddHandler(dbOps)(
+			request("POST", {
+				account_id: "account-new",
+				model: "some-custom-model",
+			}),
+			combo.id,
+		);
+
+		expect(response.status).toBe(201);
+		expect(addComboSlot).toHaveBeenCalledWith(
+			combo.id,
+			"account-new",
+			"some-custom-model",
+			0,
+		);
+	});
+
+	it("rejects a slot model that does not belong to any family assigned to the combo", async () => {
+		const { dbOps, addComboSlot } = makeDb([], [opusAssignment]);
+		const response = await createSlotAddHandler(dbOps)(
+			request("POST", {
+				account_id: "account-new",
+				model: "claude-sonnet-5",
+			}),
+			combo.id,
+		);
+
+		expect(response.status).toBe(400);
+		expect(addComboSlot).not.toHaveBeenCalled();
+	});
+
+	it("normalizes a bare family alias slot model to the canonical family word when a matching assignment exists", async () => {
+		const { dbOps, addComboSlot } = makeDb([], [opusAssignment]);
+		const response = await createSlotAddHandler(dbOps)(
+			request("POST", { account_id: "account-new", model: "  OPUS  " }),
+			combo.id,
+		);
+
+		expect(response.status).toBe(201);
+		expect(addComboSlot).toHaveBeenCalledWith(
+			combo.id,
+			"account-new",
+			"opus",
+			0,
+		);
+	});
+
+	it("matches a slot model against any of multiple families assigned to the combo", async () => {
+		const fableAssignment: ComboFamilyAssignment = {
+			...opusAssignment,
+			family: "fable",
+		};
+		const { dbOps, addComboSlot } = makeDb(
+			[],
+			[opusAssignment, fableAssignment],
+		);
+		const response = await createSlotAddHandler(dbOps)(
+			request("POST", { account_id: "account-new", model: "fable" }),
+			combo.id,
+		);
+
+		expect(response.status).toBe(201);
+		expect(addComboSlot).toHaveBeenCalledWith(
+			combo.id,
+			"account-new",
+			"fable",
+			0,
+		);
+	});
+
+	it("rejects a slot model update that does not belong to any family assigned to the combo", async () => {
+		const { dbOps, updateComboSlot } = makeDb([slot(0)], [opusAssignment]);
+		const response = await createSlotUpdateHandler(dbOps)(
+			request("PUT", { model: "claude-sonnet-5" }),
+			combo.id,
+			"slot-0",
+		);
+
+		expect(response.status).toBe(400);
+		expect(updateComboSlot).not.toHaveBeenCalled();
+	});
+
+	it("normalizes a bare family alias on a slot model update when a matching assignment exists", async () => {
+		const { dbOps, updateComboSlot } = makeDb([slot(0)], [opusAssignment]);
+		const response = await createSlotUpdateHandler(dbOps)(
+			request("PUT", { model: "opus" }),
+			combo.id,
+			"slot-0",
+		);
+
+		expect(response.status).toBe(200);
+		expect(updateComboSlot).toHaveBeenCalledWith("slot-0", { model: "opus" });
 	});
 });

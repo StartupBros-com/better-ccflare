@@ -44,6 +44,7 @@ import { getUsageCollector } from "./usage-collector";
 import {
 	type EndMessage,
 	isModelRewrite,
+	resolveComboModelOverride,
 	type StartMessage,
 } from "./worker-messages";
 
@@ -264,6 +265,13 @@ export interface ResponseHandlerOptions {
 	comboName?: string | null;
 	originalModel?: string | null;
 	appliedModel?: string | null;
+	/** Pre-override model when a combo slot's model override applied on this
+	 * attempt; null otherwise. Paired with comboModelOverrideTo and gated
+	 * through resolveComboModelOverride() before being persisted/exposed. */
+	comboModelOverrideFrom?: string | null;
+	/** Combo slot's override model when it applied on this attempt; null
+	 * otherwise. See comboModelOverrideFrom. */
+	comboModelOverrideTo?: string | null;
 	xaiCacheIdentityFingerprint?: RequestMeta["xaiCacheIdentityFingerprint"];
 	xaiCachePrefixFingerprint?: RequestMeta["xaiCachePrefixFingerprint"];
 	xaiCacheOfficialEndpoint?: boolean;
@@ -309,6 +317,8 @@ export async function forwardToClient(
 		comboName,
 		originalModel,
 		appliedModel,
+		comboModelOverrideFrom,
+		comboModelOverrideTo,
 		xaiCacheIdentityFingerprint,
 		xaiCachePrefixFingerprint,
 		xaiCacheOfficialEndpoint,
@@ -424,6 +434,22 @@ export async function forwardToClient(
 				? (appliedModel as string)
 				: null,
 			comboName: comboName || null,
+			// Combo delta only when the override actually applied on THIS
+			// (successful) attempt and produced a real change — never a stale
+			// value from an earlier failed slot (see proxy-operations.ts
+			// attemptAppliedModel/comboModelOverrideFrom derivation).
+			comboModelOverrideFrom: resolveComboModelOverride(
+				comboModelOverrideFrom,
+				comboModelOverrideTo,
+			)
+				? (comboModelOverrideFrom as string)
+				: null,
+			comboModelOverrideTo: resolveComboModelOverride(
+				comboModelOverrideFrom,
+				comboModelOverrideTo,
+			)
+				? (comboModelOverrideTo as string)
+				: null,
 			apiKeyId: apiKeyId || null,
 			apiKeyName: apiKeyName || null,
 			retryAttempt,

@@ -10,6 +10,7 @@ import {
 	handleComboSlotPriorityKeyDown,
 	parseComboSlotPriority,
 } from "./combo-slot-priority";
+import { formatPolicyModel } from "./family-routing";
 
 export interface ManualMemberRoutingFact {
 	family: ComboFamily;
@@ -94,7 +95,7 @@ export function ManualMemberRow({
 					)}
 				</div>
 				<div className="font-mono text-xs text-muted-foreground">
-					{slot.model}
+					{formatPolicyModel(slot.model)}
 				</div>
 				{routingFacts.map((fact) => (
 					<div key={fact.family} className="text-xs text-muted-foreground">

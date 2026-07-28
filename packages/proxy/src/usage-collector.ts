@@ -24,6 +24,7 @@ import { combineChunks } from "./stream-tee";
 import {
 	type EndMessage,
 	isModelRewrite,
+	resolveComboModelOverride,
 	type StartMessage,
 } from "./worker-messages";
 
@@ -1087,6 +1088,18 @@ export class UsageCollector {
 			originalModel: startMessage.originalModel || undefined,
 			appliedModel: startMessage.appliedModel || undefined,
 			comboName: startMessage.comboName || undefined,
+			// Already gated in response-handler.ts (both-or-neither), but re-gate
+			// here too so this object literal is never the sole place that could
+			// leak a from===to or one-sided pair onto the live summary event.
+			comboModelOverride: resolveComboModelOverride(
+				startMessage.comboModelOverrideFrom,
+				startMessage.comboModelOverrideTo,
+			)
+				? {
+						from: startMessage.comboModelOverrideFrom as string,
+						to: startMessage.comboModelOverrideTo as string,
+					}
+				: null,
 			projectAttributionSource: state.projectAttributionSource ?? undefined,
 			agentAttributionSource: state.agentAttributionSource ?? undefined,
 		};

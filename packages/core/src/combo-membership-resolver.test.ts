@@ -12,8 +12,10 @@ import {
 	createManagedComboMemberId,
 	proposeComboEnrollmentRules,
 	proposeComboFamilyConversionRules,
+	resolveComboProposalManagedModel,
 	resolveEffectiveComboMembership,
 } from "./combo-membership-resolver";
+import { LATEST_MODEL_BY_FAMILY } from "./models";
 
 function account(overrides: Partial<Account> = {}): Account {
 	return {
@@ -396,6 +398,201 @@ describe("resolveEffectiveComboMembership", () => {
 			}),
 		).not.toBe(id);
 	});
+
+	it("resolves a bare family alias stored on a manual slot to the latest concrete model", () => {
+		const policy = snapshot("opus", {
+			assignment: {
+				...snapshot().assignment,
+				membership_mode: "manual",
+			},
+			slots: [
+				{
+					id: "slot-alias",
+					combo_id: "combo-1",
+					account_id: "account-1",
+					model: "opus",
+					priority: 5,
+					enabled: true,
+				},
+			],
+		});
+		const result = resolveEffectiveComboMembership(
+			policy,
+			[account()],
+			dependencies(),
+		);
+		expect(result.members).toHaveLength(1);
+		expect(result.members[0]).toMatchObject({
+			logical_model: LATEST_MODEL_BY_FAMILY.opus,
+			source: "manual",
+		});
+	});
+
+	it("resolves a bare family alias stored on the managed_model policy to the latest concrete model", () => {
+		const policy = snapshot("opus", {
+			assignment: {
+				...snapshot().assignment,
+				managed_model: "  OPUS  ",
+			},
+		});
+		const result = resolveEffectiveComboMembership(
+			policy,
+			[account()],
+			dependencies(),
+		);
+		expect(result.members).toHaveLength(1);
+		expect(result.members[0]).toMatchObject({
+			logical_model: LATEST_MODEL_BY_FAMILY.opus,
+			source: "managed",
+		});
+	});
+
+	it("does not resolve a family alias that belongs to a different family and reports ambiguous", () => {
+		const policy = snapshot("opus", {
+			assignment: {
+				...snapshot().assignment,
+				managed_model: "sonnet",
+			},
+		});
+		const result = resolveEffectiveComboMembership(
+			policy,
+			[account()],
+			dependencies(),
+		);
+		expect(result).toMatchObject({ active: true, reason: "ambiguous" });
+		expect(result.members).toHaveLength(0);
+	});
+
+	it("dedupes manual members for the same account when a literal model and a bare alias resolve to the same concrete model", () => {
+		const policy = snapshot("opus", {
+			assignment: {
+				...snapshot().assignment,
+				membership_mode: "manual",
+			},
+			slots: [
+				{
+					id: "slot-literal",
+					combo_id: "combo-1",
+					account_id: "account-1",
+					model: LATEST_MODEL_BY_FAMILY.opus,
+					priority: 5,
+					enabled: true,
+				},
+				{
+					id: "slot-alias",
+					combo_id: "combo-1",
+					account_id: "account-1",
+					model: "opus",
+					priority: 10,
+					enabled: true,
+				},
+			],
+		});
+		const result = resolveEffectiveComboMembership(
+			policy,
+			[account()],
+			dependencies(),
+		);
+
+		expect(result.members).toHaveLength(1);
+		expect(result.members[0]).toMatchObject({
+			id: "combo:combo-1:slot:slot-literal",
+			logical_model: LATEST_MODEL_BY_FAMILY.opus,
+			tier: 5,
+		});
+		expect(result.decisions).toHaveLength(2);
+		expect(result.decisions).toContainEqual(
+			expect.objectContaining({
+				account_id: "account-1",
+				slot_id: "slot-alias",
+				included: false,
+				reason: "manual_override",
+				logical_model: LATEST_MODEL_BY_FAMILY.opus,
+				tier: 10,
+			}),
+		);
+	});
+
+	it("keeps two manual slots for the same account distinct when they resolve to different concrete models", () => {
+		const policy = snapshot("opus", {
+			assignment: {
+				...snapshot().assignment,
+				membership_mode: "manual",
+			},
+			slots: [
+				{
+					id: "slot-alias",
+					combo_id: "combo-1",
+					account_id: "account-1",
+					model: "opus",
+					priority: 5,
+					enabled: true,
+				},
+				{
+					id: "slot-older",
+					combo_id: "combo-1",
+					account_id: "account-1",
+					model: "claude-opus-4-6",
+					priority: 10,
+					enabled: true,
+				},
+			],
+		});
+		const result = resolveEffectiveComboMembership(
+			policy,
+			[account()],
+			dependencies(),
+		);
+		expect(result.members).toHaveLength(2);
+		expect(result.decisions).toHaveLength(2);
+	});
+});
+
+describe("resolveComboProposalManagedModel", () => {
+	it("resolves a bare family alias passed as reviewedOverride to the latest concrete model", () => {
+		expect(resolveComboProposalManagedModel(snapshot("opus"), "opus")).toBe(
+			LATEST_MODEL_BY_FAMILY.opus,
+		);
+		expect(resolveComboProposalManagedModel(snapshot("opus"), "  OPUS ")).toBe(
+			LATEST_MODEL_BY_FAMILY.opus,
+		);
+	});
+
+	it("resolves a bare family alias stored in managed_model when no override is given", () => {
+		const policy = snapshot("fable", {
+			assignment: {
+				...snapshot("fable").assignment,
+				managed_model: "fable",
+			},
+		});
+		expect(resolveComboProposalManagedModel(policy)).toBe(
+			LATEST_MODEL_BY_FAMILY.fable,
+		);
+	});
+
+	it("prefers a concrete reviewedOverride over a stored alias", () => {
+		const policy = snapshot("opus", {
+			assignment: {
+				...snapshot("opus").assignment,
+				managed_model: "opus",
+			},
+		});
+		expect(resolveComboProposalManagedModel(policy, "claude-opus-4-6")).toBe(
+			"claude-opus-4-6",
+		);
+	});
+
+	it("falls back to the family's latest model when the override and stored value both mismatch the family", () => {
+		const policy = snapshot("opus", {
+			assignment: {
+				...snapshot("opus").assignment,
+				managed_model: "sonnet",
+			},
+		});
+		expect(resolveComboProposalManagedModel(policy, "haiku")).toBe(
+			LATEST_MODEL_BY_FAMILY.opus,
+		);
+	});
 });
 
 describe("proposeComboEnrollmentRules", () => {
@@ -580,6 +777,34 @@ describe("proposeComboEnrollmentRules", () => {
 			{ managedModel: "claude-opus-4-6" },
 		);
 		expect(overridden[0]?.managed_model).toBe("claude-opus-4-6");
+	});
+
+	it("resolves a bare family alias in the stored assignment model or an explicit override", () => {
+		const aliasPolicy = snapshot("opus", {
+			assignment: {
+				...snapshot("opus").assignment,
+				managed_model: "opus",
+			},
+			rules: [{ ...snapshot("opus").rules[0], enabled: false }],
+		});
+		const fromStoredAlias = proposeComboEnrollmentRules(
+			aliasPolicy,
+			[account()],
+			account({ id: "draft" }),
+			dependencies(),
+		);
+		expect(fromStoredAlias[0]?.managed_model).toBe(LATEST_MODEL_BY_FAMILY.opus);
+
+		const fromOverrideAlias = proposeComboEnrollmentRules(
+			aliasPolicy,
+			[account()],
+			account({ id: "draft" }),
+			dependencies(),
+			{ managedModel: "OPUS" },
+		);
+		expect(fromOverrideAlias[0]?.managed_model).toBe(
+			LATEST_MODEL_BY_FAMILY.opus,
+		);
 	});
 
 	it("blocks conflicting model families and tier relationships", () => {

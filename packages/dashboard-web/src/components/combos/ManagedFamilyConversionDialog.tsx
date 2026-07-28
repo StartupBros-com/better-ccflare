@@ -1,3 +1,4 @@
+import { resolveFamilyAliasModel } from "@better-ccflare/core";
 import type {
 	ComboFamily,
 	ComboRoutingPreviewMemberState,
@@ -15,7 +16,10 @@ import {
 	DialogHeader,
 	DialogTitle,
 } from "../ui/dialog";
-import { projectFamilyConversionPreview } from "./family-routing";
+import {
+	formatPolicyModel,
+	projectFamilyConversionPreview,
+} from "./family-routing";
 
 export interface ManagedFamilyApplyCommand {
 	family: ComboFamily;
@@ -125,7 +129,13 @@ export function isManagedFamilyPreviewCurrent(
 	family: ComboFamily,
 	managedModel: string,
 ): boolean {
-	return preview.family === family && preview.managed_model === managedModel;
+	// preview.managed_model is server-resolved and always concrete; the local
+	// managedModel can be a stored bare family alias (e.g. "opus"), so resolve
+	// it before comparing or an alias-valued policy would never be "current".
+	return (
+		preview.family === family &&
+		preview.managed_model === resolveFamilyAliasModel(managedModel, family)
+	);
 }
 
 function selectedProposal(
@@ -254,8 +264,9 @@ export function ManagedFamilyConversionReview({
 					Review {FAMILY_LABELS[family]} managed routing
 				</h3>
 				<p className="text-sm text-muted-foreground">
-					This is the current server-owned preview for {managedModel}. No manual
-					slots will be deleted.
+					This is the current server-owned preview for{" "}
+					{formatPolicyModel(managedModel, family)}. No manual slots will be
+					deleted.
 				</p>
 			</div>
 
@@ -295,7 +306,8 @@ export function ManagedFamilyConversionReview({
 								</span>
 								<span className="block text-xs text-muted-foreground">
 									Proposed rule · {proposal.provider} / {proposal.route_class} ·{" "}
-									{proposal.managed_model} · tier source: account priority
+									{formatPolicyModel(proposal.managed_model, family)} · tier
+									source: account priority
 								</span>
 								<span className="block text-xs">
 									Server reason: <code>{proposal.reason}</code>
@@ -350,8 +362,8 @@ export function ManagedFamilyConversionReview({
 						</h4>
 						{selectedProjection.proposedRouting.manualSlots.map((slot) => (
 							<div key={slot.id} className="text-xs text-muted-foreground">
-								{slot.account_id} · {slot.model} · tier {slot.priority} ·{" "}
-								{slot.enabled ? "Enabled" : "Disabled"}
+								{slot.account_id} · {formatPolicyModel(slot.model, family)} ·
+								tier {slot.priority} · {slot.enabled ? "Enabled" : "Disabled"}
 							</div>
 						))}
 					</div>
