@@ -1,8 +1,16 @@
 import { afterEach, describe, expect, it, mock } from "bun:test";
+import type { MarkAccountRateLimitedResult } from "@better-ccflare/database";
 import type { Account } from "@better-ccflare/types";
 import type { ProxyContext } from "../proxy-types";
 import { applyRateLimitCooldownAwaitingPersist } from "../rate-limit-cooldown";
 import { createRoutingTerminalResponse } from "../routing-terminal";
+
+// markAccountRateLimited returns {consecutiveRateLimits, applied} (upstream
+// v3.5.44 changed it from a bare number). Mocks must mirror that contract or
+// the destructure in applyRateLimitCooldownAwaitingPersist yields undefined.
+const markResult = (
+	consecutiveRateLimits: number,
+): MarkAccountRateLimitedResult => ({ consecutiveRateLimits, applied: true });
 
 // Covers the P0 review fix: applyRateLimitCooldownAwaitingPersist must never let
 // a slow or failing ctx.dbOps.markAccountRateLimited call stall or crash the
@@ -120,7 +128,8 @@ describe("applyRateLimitCooldownAwaitingPersist: bounded persist (P0)", () => {
 			dbOps: {
 				// Never-resolving stub: simulates a stalled SQLite write (e.g. blocked
 				// behind an exclusive VACUUM lock via withBusyRetry).
-				markAccountRateLimited: () => new Promise<number>(() => {}),
+				markAccountRateLimited: () =>
+					new Promise<MarkAccountRateLimitedResult>(() => {}),
 			},
 		} as unknown as ProxyContext;
 
@@ -159,12 +168,14 @@ describe("applyRateLimitCooldownAwaitingPersist: per-account single-flight coale
 			consecutive_rate_limits: 3,
 		});
 		let callCount = 0;
-		let resolveWrite: ((value: number) => void) | undefined;
+		let resolveWrite:
+			| ((value: MarkAccountRateLimitedResult) => void)
+			| undefined;
 		const ctx = {
 			dbOps: {
 				markAccountRateLimited: () => {
 					callCount++;
-					return new Promise<number>((resolve) => {
+					return new Promise<MarkAccountRateLimitedResult>((resolve) => {
 						resolveWrite = resolve;
 					});
 				},
@@ -188,7 +199,7 @@ describe("applyRateLimitCooldownAwaitingPersist: per-account single-flight coale
 		await Promise.resolve();
 		expect(callCount).toBe(1);
 
-		resolveWrite?.(7);
+		resolveWrite?.(markResult(7));
 		await Promise.all([p1, p2]);
 		expect(callCount).toBe(1);
 	});
@@ -202,7 +213,7 @@ describe("applyRateLimitCooldownAwaitingPersist: per-account single-flight coale
 		const calls: Array<{
 			until: number;
 			reason: string;
-			resolve: (value: number) => void;
+			resolve: (value: MarkAccountRateLimitedResult) => void;
 		}> = [];
 		const ctx = {
 			dbOps: {
@@ -211,7 +222,7 @@ describe("applyRateLimitCooldownAwaitingPersist: per-account single-flight coale
 					until: number,
 					reason: string,
 				) =>
-					new Promise<number>((resolve) => {
+					new Promise<MarkAccountRateLimitedResult>((resolve) => {
 						calls.push({ until, reason, resolve });
 					}),
 			},
@@ -260,7 +271,7 @@ describe("applyRateLimitCooldownAwaitingPersist: per-account single-flight coale
 			reason: "upstream_402_payment_required",
 		});
 
-		calls[0]?.resolve(7);
+		calls[0]?.resolve(markResult(7));
 		await first;
 		await Promise.resolve();
 
@@ -271,7 +282,7 @@ describe("applyRateLimitCooldownAwaitingPersist: per-account single-flight coale
 			reason: "all_models_exhausted_429",
 		});
 
-		calls[1]?.resolve(8);
+		calls[1]?.resolve(markResult(8));
 		await Promise.all([intermediate, maximum, tiedMaximum]);
 		expect(calls).toHaveLength(2);
 	});
@@ -285,7 +296,7 @@ describe("applyRateLimitCooldownAwaitingPersist: per-account single-flight coale
 		const calls: Array<{
 			until: number;
 			reason: string;
-			resolve: (value: number) => void;
+			resolve: (value: MarkAccountRateLimitedResult) => void;
 			reject: (error: unknown) => void;
 		}> = [];
 		const ctx = {
@@ -295,7 +306,7 @@ describe("applyRateLimitCooldownAwaitingPersist: per-account single-flight coale
 					until: number,
 					reason: string,
 				) =>
-					new Promise<number>((resolve, reject) => {
+					new Promise<MarkAccountRateLimitedResult>((resolve, reject) => {
 						calls.push({ until, reason, resolve, reject });
 					}),
 			},
@@ -339,7 +350,7 @@ describe("applyRateLimitCooldownAwaitingPersist: per-account single-flight coale
 				reason: "model_fallback_429",
 			});
 
-			calls[1]?.resolve(11);
+			calls[1]?.resolve(markResult(11));
 			await pending;
 			await new Promise((resolve) => setTimeout(resolve, 5));
 			expect(account.consecutive_rate_limits).toBe(11);
@@ -361,7 +372,7 @@ describe("applyRateLimitCooldownAwaitingPersist: per-account single-flight coale
 			dbOps: {
 				markAccountRateLimited: async () => {
 					callCount++;
-					return 10;
+					return markResult(10);
 				},
 			},
 		} as unknown as ProxyContext;
@@ -392,12 +403,12 @@ describe("applyRateLimitCooldownAwaitingPersist: per-account single-flight coale
 			consecutive_rate_limits: 3,
 		});
 		let callCount = 0;
-		const resolvers: Array<(value: number) => void> = [];
+		const resolvers: Array<(value: MarkAccountRateLimitedResult) => void> = [];
 		const ctx = {
 			dbOps: {
 				markAccountRateLimited: () => {
 					callCount++;
-					return new Promise<number>((resolve) => {
+					return new Promise<MarkAccountRateLimitedResult>((resolve) => {
 						resolvers.push(resolve);
 					});
 				},
@@ -420,7 +431,7 @@ describe("applyRateLimitCooldownAwaitingPersist: per-account single-flight coale
 		await Promise.resolve();
 		expect(callCount).toBe(2);
 
-		for (const resolve of resolvers) resolve(1);
+		for (const resolve of resolvers) resolve(markResult(1));
 		await Promise.all([p1, p2]);
 	});
 });

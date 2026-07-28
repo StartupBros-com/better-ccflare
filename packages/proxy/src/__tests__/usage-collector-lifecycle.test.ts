@@ -1,12 +1,14 @@
-import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import {
+	afterAll,
+	afterEach,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	mock,
+} from "bun:test";
 import { logBus } from "@better-ccflare/logger";
 import type { LogEvent } from "@better-ccflare/types";
-import { isValidClaudeModel } from "../../../core/src/model-mappings";
-import { CLAUDE_MODEL_IDS } from "../../../core/src/models";
-import {
-	cacheOutcomeFromTokens,
-	formatXaiCacheCanary,
-} from "../../../core/src/xai";
 import { cacheBodyStore } from "../cache-body-store";
 import type { StartMessage } from "../worker-messages";
 
@@ -27,28 +29,40 @@ const estimateCostUSD = mock((model: string, tokens: PricingTokens) =>
 	pricingImplementation(model, tokens),
 );
 
+// Spread the real module so every other export (constants, isValidClaudeModel,
+// isOverloadReason, computeRateLimitBackoffMs, ...) stays intact for the rest
+// of the process — mock.module replaces the WHOLE module globally and across
+// file boundaries in Bun, so a partial stub here silently breaks unrelated
+// modules imported later in the same test run. Only estimateCostUSD needs
+// interception here (routed through a controllable pricingImplementation per
+// test case).
+const actualCore = await import("@better-ccflare/core");
+
 mock.module("@better-ccflare/core", () => ({
-	cacheOutcomeFromTokens,
-	formatXaiCacheCanary,
-	BUFFER_SIZES: {
-		STREAM_TEE_MAX_BYTES: 1024 * 1024,
-		STREAM_USAGE_BUFFER_KB: 64,
-	},
-	CLAUDE_MODEL_IDS,
+	...actualCore,
 	estimateCostUSD,
-	isValidClaudeModel,
-	TIME_CONSTANTS: {
-		HOUR: 60 * 60 * 1000,
-		MINUTE: 60 * 1000,
-		SECOND: 1000,
-		STREAM_TIMEOUT_DEFAULT: 60 * 1000,
-	},
 }));
 
-mock.module("@better-ccflare/database", () => ({
-	AsyncDbWriter: class {},
-	DatabaseOperations: class {},
-}));
+// Unlike @better-ccflare/core above, this file never touches
+// @better-ccflare/database's real exports at runtime: every test constructs
+// UsageCollector directly with hand-rolled fake dbOps/asyncWriter objects
+// (see makeHarness below), so getUsageCollector()'s internal
+// `new DatabaseOperations()` / `new AsyncDbWriter()` fallback is never
+// reached. Stubbing DatabaseOperations/AsyncDbWriter here bought nothing and
+// cost every other test file in the process a broken DatabaseFactory
+// singleton (mock.module has no per-file isolation without --isolate, and
+// bun pre-evaluates every file's top-level mock.module calls before running
+// any test, so even an afterAll restore here can't protect a file whose
+// beforeAll runs first). Do not reintroduce this mock without also auditing
+// bun's cross-file mock.module ordering.
+
+// Restore @better-ccflare/core once this file's tests finish so later test
+// files in the same process (mock.module has no per-file isolation without
+// --isolate) resolve the real exports again instead of the stub registered
+// above.
+afterAll(() => {
+	mock.module("@better-ccflare/core", () => actualCore);
+});
 
 const { UsageCollector } = await import("../usage-collector");
 type UsageCollectorInstance = InstanceType<typeof UsageCollector>;

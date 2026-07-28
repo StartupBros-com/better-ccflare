@@ -82,7 +82,11 @@ import {
 import { combineChunks } from "../stream-tee";
 import { isModelRewrite } from "../worker-messages";
 import { GUARD_REQUEST_ID_HEADER } from "./internal-transport-headers";
-import { ERROR_MESSAGES, type ProxyContext } from "./proxy-types";
+import {
+	ERROR_MESSAGES,
+	isInternalProbe,
+	type ProxyContext,
+} from "./proxy-types";
 import {
 	applyRateLimitCooldown,
 	applyRateLimitCooldownAwaitingPersist,
@@ -3192,8 +3196,7 @@ export async function proxyWithAccount(
 						// account at the same instant. Applying real cooldowns
 						// here drains the pool to zero routable accounts even
 						// though no real user-facing rate limit was hit.
-						const isKeepalive =
-							req.headers.get("x-better-ccflare-keepalive") === "true";
+						const isKeepalive = isInternalProbe(req.headers, ctx, "keepalive");
 						if (isKeepalive) {
 							log.warn(
 								`Keepalive replay for ${account.name} got 429 — skipping cooldown (synthetic burst, not a real per-account rate limit)`,
@@ -3484,8 +3487,7 @@ export async function proxyWithAccount(
 					// Same keepalive-skip as the no-fallback path above: synthetic
 					// keepalive bursts can trip Anthropic's per-IP limit even when
 					// individual accounts are healthy.
-					const isKeepalive =
-						req.headers.get("x-better-ccflare-keepalive") === "true";
+					const isKeepalive = isInternalProbe(req.headers, ctx, "keepalive");
 					if (isKeepalive) {
 						log.warn(
 							`Keepalive replay for ${account.name} got 429 (post-model-list) — skipping cooldown`,

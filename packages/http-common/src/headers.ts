@@ -65,6 +65,10 @@ export function sanitizeRequestHeaders(original: Headers): Headers {
 	// This hop-local join key is useful in live structured logs only. Persisting it
 	// with request payload metadata would unnecessarily widen its trust boundary.
 	h.delete(GUARD_REQUEST_ID_HEADER);
+	// keep in sync with INTERNAL_PROBE_SECRET_HEADER
+	// (@better-ccflare/proxy already depends on http-common, so importing the
+	// proxy package's constant here would create an import cycle)
+	h.delete("x-better-ccflare-internal-probe-secret");
 	return h;
 }
 

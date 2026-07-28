@@ -41,6 +41,7 @@ import { Config } from "@better-ccflare/config";
 import {
 	CLAUDE_MODEL_IDS,
 	getVersionSync,
+	installOutboundProxy,
 	isFamilyAliasModel,
 	levenshteinDistance,
 	NETWORK,
@@ -1213,9 +1214,14 @@ Examples:
 	const { parseBedrockConfig } = await import("@better-ccflare/providers");
 
 	// Initialize DI container and services for commands that need them
-	container.registerInstance(SERVICE_KEYS.Config, new Config());
+	const cliConfig = new Config();
+	container.registerInstance(SERVICE_KEYS.Config, cliConfig);
 	container.registerInstance(SERVICE_KEYS.Logger, new Logger("CLI"));
 	const { DatabaseFactory } = await import("@better-ccflare/database");
+
+	// Route CLI outbound fetches (OAuth exchange, API key validation, etc.)
+	// through the configured forward proxy, same as the server process.
+	installOutboundProxy(() => cliConfig.getOutboundProxy());
 
 	// Initialize database factory with minimal configuration for CLI commands
 	// CLI commands don't need expensive integrity checks

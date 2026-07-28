@@ -1552,6 +1552,11 @@ describe("proxyWithAccount: verified Codex 429 recovery provenance", () => {
 			account.id,
 			expect.any(Number),
 			"upstream_429_with_reset",
+			// Upstream v3.5.44 added the incrementStreak parameter. A real
+			// upstream 429 with a reset is genuine quota exhaustion, so the
+			// consecutive-rate-limit streak must advance (unlike a 529
+			// overload, which passes false).
+			true,
 		);
 		expect(account.rate_limited_until).toBeGreaterThan(Date.now());
 		expect(account.rate_limited_reason).toBe("upstream_429_with_reset");

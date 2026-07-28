@@ -945,6 +945,7 @@ export class UsageCollector {
 					modelRewritten ? startMessage.appliedModel : null,
 					state.projectAttributionSource ?? null,
 					state.agentAttributionSource ?? null,
+					msg.streamTerminalState ?? null,
 				);
 			} catch (error) {
 				log.error(
