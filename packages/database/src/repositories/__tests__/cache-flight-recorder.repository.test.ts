@@ -59,8 +59,13 @@ describe("cache flight recorder schema", () => {
 			unsafe: async (sql: string) => {
 				statements.push(sql);
 			},
+			// Reports both column and index existence checks as satisfied so
+			// runMigrationsPg's unique-index/dedup migration (unrelated to the
+			// recorder tables this test exercises) is a no-op: its collapse
+			// helper reads rows back via adapter.unsafe(), which this mock
+			// doesn't model.
 			get: async <T>(sql: string): Promise<T | null> =>
-				sql.includes("information_schema.columns")
+				sql.includes("information_schema.columns") || sql.includes("pg_indexes")
 					? ({ exists: 1 } as T)
 					: null,
 			run: async () => {},

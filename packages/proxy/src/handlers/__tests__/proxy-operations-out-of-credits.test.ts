@@ -98,7 +98,8 @@ function deferred<T>() {
 
 function makeProxyContextWithAsyncExec(): ProxyContext {
 	const markAccountRateLimited = mock(
-		(_accountId: string, _until: number, _reason: string) => Promise.resolve(1),
+		(_accountId: string, _until: number, _reason: string) =>
+			Promise.resolve({ consecutiveRateLimits: 1, applied: true }),
 	);
 	const saveRequest = mock((..._args: unknown[]) => Promise.resolve());
 	return {
@@ -137,6 +138,7 @@ function makeProxyContextWithAsyncExec(): ProxyContext {
 			}),
 		} as never,
 		config: { getStorePayloads: () => true } as never,
+		internalProbeSecret: "test-secret",
 	};
 }
 
@@ -328,6 +330,7 @@ describe("proxyWithAccount — out_of_credits (issue #261)", () => {
 			headers: {
 				"Content-Type": "application/json",
 				"x-better-ccflare-keepalive": "true",
+				"x-better-ccflare-internal-probe-secret": "test-secret",
 			},
 		});
 

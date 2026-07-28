@@ -208,6 +208,7 @@ describe("response-handler — shouldProcessRequest suppresses auto-refresh prob
 				isStreamingResponse: () => false,
 			} as never,
 			config: { getStorePayloads: () => false } as never,
+			internalProbeSecret: "test-secret",
 		};
 
 		const response = new Response(JSON.stringify({ type: "message" }), {
@@ -217,6 +218,7 @@ describe("response-handler — shouldProcessRequest suppresses auto-refresh prob
 
 		const requestHeaders = new Headers({
 			"x-better-ccflare-auto-refresh": "true",
+			"x-better-ccflare-internal-probe-secret": "test-secret",
 		});
 
 		await forwardToClient(
@@ -339,6 +341,7 @@ describe("proxy.ts — pool-exhausted path skips usageCollector for auto-refresh
 			} as never,
 			refreshInFlight: new Map(),
 			asyncWriter: { enqueue: mock(() => {}) } as never,
+			internalProbeSecret: "test-secret",
 		};
 
 		const probeHeaders = new Headers({

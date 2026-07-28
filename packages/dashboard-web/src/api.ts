@@ -751,9 +751,13 @@ class API extends HttpClient {
 		}
 	}
 
-	async removeAccount(name: string, confirm: string): Promise<void> {
+	async removeAccount(
+		id: string,
+		_name: string,
+		confirm: string,
+	): Promise<void> {
 		const startTime = Date.now();
-		const url = `/api/accounts/${name}`;
+		const url = `/api/accounts/${id}`;
 
 		this.logger.debug(`→ DELETE ${url}`, { confirm });
 
@@ -1418,17 +1422,23 @@ class API extends HttpClient {
 		}
 	}
 
-	async getStrategy(): Promise<string> {
+	async getStrategy(): Promise<{
+		strategy: string;
+		strategySource: "env" | "file" | "default";
+	}> {
 		const startTime = Date.now();
 		const url = "/api/config/strategy";
 
 		this.logger.debug(`→ GET ${url}`);
 
 		try {
-			const data = await this.get<{ strategy: string }>(url);
+			const data = await this.get<{
+				strategy: string;
+				strategySource: "env" | "file" | "default";
+			}>(url);
 			const duration = Date.now() - startTime;
 			this.logger.debug(`← GET ${url} - 200 (${duration}ms)`);
-			return data.strategy;
+			return data;
 		} catch (error) {
 			const duration = Date.now() - startTime;
 			this.logger.error(`✗ GET ${url} - ERROR (${duration}ms)`, {

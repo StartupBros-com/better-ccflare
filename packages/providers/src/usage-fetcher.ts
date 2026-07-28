@@ -14,6 +14,12 @@ import {
 	type KiloUsageData,
 } from "./kilo-usage-fetcher";
 import {
+	fetchMinimaxUsageData,
+	getRepresentativeMinimaxUtilization,
+	getRepresentativeMinimaxWindow,
+	type MinimaxUsageData,
+} from "./minimax-usage-fetcher";
+import {
 	fetchNanoGPTUsageData,
 	getRepresentativeNanoGPTUtilization,
 	getRepresentativeNanoGPTWindow,
@@ -143,7 +149,8 @@ export type AnyUsageData =
 	| ZaiUsageData
 	| KiloUsageData
 	| AlibabaCodingPlanUsageData
-	| XaiUsageData;
+	| XaiUsageData
+	| MinimaxUsageData;
 
 /** A read-only view of one authoritative cache observation. */
 export interface UsageSnapshot {
@@ -182,6 +189,15 @@ export function extractWindowResetTime(
 		if (!resetsAt) return null;
 		const ms = new Date(resetsAt).getTime();
 		return Number.isFinite(ms) ? ms : null;
+	}
+	if (provider === "minimax") {
+		const m = data as MinimaxUsageData;
+		const windowName = getRepresentativeMinimaxWindow(m);
+		if (windowName === "seven_day") {
+			return m.seven_day?.resetAt ?? null;
+		}
+		// Default and "five_hour": prefer the short window's reset
+		return m.five_hour?.resetAt ?? m.seven_day?.resetAt ?? null;
 	}
 	return null;
 }
@@ -449,6 +465,9 @@ export function getRepresentativeUtilizationForProvider(
 		case "xai": {
 			return getRepresentativeXaiUtilization(data as XaiUsageData);
 		}
+		case "minimax": {
+			return getRepresentativeMinimaxUtilization(data as MinimaxUsageData);
+		}
 		default:
 			return null;
 	}
@@ -489,6 +508,8 @@ export function getRepresentativeUtilizationForDisplay(
 			);
 		case "xai":
 			return getRepresentativeXaiUtilization(data as XaiUsageData);
+		case "minimax":
+			return getRepresentativeMinimaxUtilization(data as MinimaxUsageData);
 		default:
 			return null;
 	}
@@ -523,8 +544,139 @@ export function getRepresentativeWindowForProvider(
 			);
 		case "xai":
 			return getRepresentativeXaiWindow(data as XaiUsageData);
+		case "minimax":
+			return getRepresentativeMinimaxWindow(data as MinimaxUsageData);
 		default:
 			return null;
+	}
+}
+
+/**
+ * Pull the reset timestamp (ms epoch) of a named usage window out of raw
+ * provider usage data. Handles both timestamp shapes in use:
+ * anthropic-style `resets_at` (ISO string) and zai/nanogpt-style `resetAt`
+ * (ms number).
+ */
+export function extractUsageResetMs(
+	usageData: unknown,
+	windowName: string | null,
+): number | null {
+	if (!usageData || typeof usageData !== "object" || !windowName) return null;
+	const window = (usageData as Record<string, unknown>)[windowName];
+	if (!window || typeof window !== "object") return null;
+	const w = window as { resets_at?: unknown; resetAt?: unknown };
+	if (typeof w.resets_at === "string") {
+		const ms = new Date(w.resets_at).getTime();
+		return Number.isFinite(ms) ? ms : null;
+	}
+	if (typeof w.resetAt === "number" && Number.isFinite(w.resetAt)) {
+		return w.resetAt;
+	}
+	return null;
+}
+
+/**
+ * limits[] `kind` that maps to each synthetic window name produced by
+ * getRepresentativeWindow's accountLevelLimitWindows fold (session ->
+ * five_hour, weekly_all -> seven_day). Kept in lockstep with that mapping
+ * above in this file.
+ */
+const WINDOW_NAME_TO_LIMIT_KIND: Record<string, string> = {
+	five_hour: "session",
+	seven_day: "weekly_all",
+};
+
+/**
+ * Reset time (ms epoch) for a limits[]-only Anthropic/Codex payload: finds
+ * the limits[] entry whose `kind` corresponds to the given synthetic window
+ * name and returns its own `resets_at`.
+ */
+function getRepresentativeLimitResetMs(
+	usage: UsageData,
+	windowName: string | null,
+): number | null {
+	if (!windowName || !Array.isArray(usage.limits)) return null;
+	const kind = WINDOW_NAME_TO_LIMIT_KIND[windowName];
+	if (!kind) return null;
+	const limit = usage.limits.find((l) => l?.kind === kind);
+	const resetsAt = limit?.resets_at;
+	if (typeof resetsAt !== "string") return null;
+	const ms = new Date(resetsAt).getTime();
+	return Number.isFinite(ms) ? ms : null;
+}
+
+/**
+ * Reset time (ms epoch) of the representative usage window, derived the same
+ * way for every provider — the single source BOTH the /health usage_exhausted
+ * counter and the accounts rateLimitStatus display use, so their staleness
+ * guards cannot diverge (PR #299 review finding). Note zai: the display
+ * window is labeled "five_hour" (Claude terminology), but the payload key
+ * carrying the reset is `tokens_limit` — extraction must use the payload key,
+ * not the display label.
+ */
+export function getRepresentativeUsageResetMs(
+	usageData: unknown,
+	provider: string,
+): number | null {
+	if (!usageData || typeof usageData !== "object") return null;
+	try {
+		const data = usageData as AnyUsageData;
+		switch (provider) {
+			case "anthropic":
+			case "codex": {
+				const windowName = getRepresentativeWindow(data as UsageData);
+				// Flat legacy shape: the window name is an actual property
+				// (five_hour/seven_day/...) carrying its own resets_at.
+				const flatReset = extractUsageResetMs(data, windowName);
+				if (flatReset !== null) return flatReset;
+				// limits[]-only payloads (2026 API): five_hour/seven_day are
+				// absent as properties — getRepresentativeWindow derives those
+				// same names synthetically from limits[] kind "session" /
+				// "weekly_all". Fall back to the matching limits[] entry's own
+				// resets_at so the staleness guard still has a real reset time.
+				return getRepresentativeLimitResetMs(data as UsageData, windowName);
+			}
+			case "zai":
+				return extractUsageResetMs(
+					data,
+					(data as ZaiUsageData).tokens_limit ? "tokens_limit" : null,
+				);
+			case "nanogpt":
+				return extractUsageResetMs(
+					data,
+					getRepresentativeNanoGPTWindow(data as NanoGPTUsageData),
+				);
+			case "kilo":
+				return extractUsageResetMs(
+					data,
+					getRepresentativeKiloWindow(data as KiloUsageData),
+				);
+			case "alibaba-coding-plan":
+				return extractUsageResetMs(
+					data,
+					getRepresentativeAlibabaCodingPlanWindow(
+						data as AlibabaCodingPlanUsageData,
+					),
+				);
+			case "xai":
+				return extractUsageResetMs(
+					data,
+					getRepresentativeXaiWindow(data as XaiUsageData),
+				);
+			case "minimax": {
+				const windowName = getRepresentativeMinimaxWindow(
+					data as MinimaxUsageData,
+				);
+				// extractUsageResetMs reads `resets_at` (string) OR `resetAt` (ms);
+				// the Minimax fetcher populates `resetAt` with epoch ms, so this
+				// works for both 5h and 7d windows.
+				return extractUsageResetMs(data, windowName);
+			}
+			default:
+				return null;
+		}
+	} catch {
+		return null;
 	}
 }
 
@@ -930,6 +1082,25 @@ class UsageCache {
 					const window = getRepresentativeXaiWindow(data as XaiUsageData);
 					log.debug(
 						`Successfully fetched xAI Grok usage data for account ${accountId}: ${utilization?.toFixed(1)}% used (${window} window)`,
+					);
+					return { success: true, retryAfterMs: null };
+				}
+			} else if (provider === "minimax") {
+				// Fetch Minimax Token Plan remains (metadata-only GET, zero quota).
+				data = await fetchMinimaxUsageData(token);
+				if (data) {
+					const callback = this.windowResetCallbacks.get(accountId);
+					if (callback)
+						this.notifyWindowReset(accountId, data, "minimax", callback);
+					this.cache.set(accountId, { data, timestamp: Date.now() });
+					const utilization = getRepresentativeMinimaxUtilization(
+						data as MinimaxUsageData,
+					);
+					const window = getRepresentativeMinimaxWindow(
+						data as MinimaxUsageData,
+					);
+					log.debug(
+						`Successfully fetched Minimax usage data for account ${accountId}: ${utilization?.toFixed(1)}% used (${window} window)`,
 					);
 					return { success: true, retryAfterMs: null };
 				}

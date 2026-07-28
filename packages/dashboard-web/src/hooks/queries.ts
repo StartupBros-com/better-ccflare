@@ -579,12 +579,14 @@ export const useRemoveAccount = () => {
 	const queryClient = useQueryClient();
 	return useMutation({
 		mutationFn: ({
+			id,
 			name,
 			confirmInput,
 		}: {
+			id: string;
 			name: string;
 			confirmInput: string;
-		}) => api.removeAccount(name, confirmInput),
+		}) => api.removeAccount(id, name, confirmInput),
 		onSuccess: () => invalidateManagedRouting(queryClient),
 	});
 };
@@ -938,6 +940,24 @@ export const useSetUsageThrottling = () => {
 		}) => api.setUsageThrottling(settings),
 		onSuccess: () => {
 			queryClient.invalidateQueries({ queryKey: ["usage-throttling"] });
+			queryClient.invalidateQueries({ queryKey: queryKeys.accounts() });
+		},
+	});
+};
+
+export const useStrategy = () => {
+	return useQuery({
+		queryKey: ["strategy"],
+		queryFn: () => api.getStrategy(),
+	});
+};
+
+export const useSetStrategy = () => {
+	const queryClient = useQueryClient();
+	return useMutation({
+		mutationFn: (strategy: string) => api.setStrategy(strategy),
+		onSuccess: () => {
+			queryClient.invalidateQueries({ queryKey: ["strategy"] });
 			queryClient.invalidateQueries({ queryKey: queryKeys.accounts() });
 		},
 	});

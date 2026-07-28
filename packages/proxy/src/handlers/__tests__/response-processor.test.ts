@@ -75,7 +75,7 @@ function makeCtx(opts: {
 				_reason: string,
 			) => {
 				calls.markRateLimited.push({ accountId, resetTime });
-				return Promise.resolve(1);
+				return Promise.resolve({ consecutiveRateLimits: 1, applied: true });
 			},
 			updateAccountUsage: () => {},
 			updateAccountRateLimitMeta: () => {},
@@ -135,7 +135,7 @@ function makeCtxWithReason(opts: {
 				reason: string,
 			) => {
 				calls.markRateLimited.push({ accountId, resetTime, reason });
-				return Promise.resolve(1);
+				return Promise.resolve({ consecutiveRateLimits: 1, applied: true });
 			},
 			updateAccountUsage: () => {},
 			updateAccountRateLimitMeta: () => {},
@@ -151,6 +151,7 @@ function makeCtxWithReason(opts: {
 				void job();
 			},
 		},
+		internalProbeSecret: "test-secret",
 	} as unknown as ProxyContext;
 
 	return { ctx, calls };
@@ -426,7 +427,10 @@ describe("processProxyResponse — 529 overload reason", () => {
 			},
 		);
 		const requestMeta = {
-			headers: new Headers({ "x-better-ccflare-keepalive": "true" }),
+			headers: new Headers({
+				"x-better-ccflare-keepalive": "true",
+				"x-better-ccflare-internal-probe-secret": "test-secret",
+			}),
 		};
 
 		await processProxyResponse(response, account, ctx, undefined, requestMeta);

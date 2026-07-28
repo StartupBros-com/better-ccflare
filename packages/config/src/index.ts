@@ -9,6 +9,7 @@ import {
 	type StrategyName,
 	TIME_CONSTANTS,
 	ValidationError,
+	validateEndpointUrl,
 	validateNumber,
 	validateString,
 } from "@better-ccflare/core";
@@ -74,6 +75,7 @@ export interface ConfigData {
 	alert_anomaly_interval_minutes?: number;
 	alert_cooldown_minutes?: number;
 	alert_webhook_url?: string;
+	outbound_proxy?: string;
 	// Database configuration
 	db_wal_mode?: boolean;
 	db_busy_timeout_ms?: number;
@@ -246,19 +248,19 @@ export class Config extends EventEmitter {
 	}
 
 	getStrategy(): StrategyName {
-		// First check environment variable
-		const envStrategy = process.env.LB_STRATEGY;
-		if (envStrategy && isValidStrategy(envStrategy)) {
-			return envStrategy;
-		}
+		return this.resolveStrategy().value;
+	}
 
-		// Then check config file
-		const configStrategy = this.data.lb_strategy;
-		if (configStrategy && isValidStrategy(configStrategy)) {
-			return configStrategy;
-		}
-
-		return DEFAULT_STRATEGY;
+	/**
+	 * Report where the effective load-balancing strategy comes from, mirroring
+	 * the precedence in getStrategy(): a valid LB_STRATEGY env value wins
+	 * ("env"), else a valid config-file field ("file"), else the built-in
+	 * default ("default"). The dashboard uses "env" to lock the strategy
+	 * control, because a POST that writes the file field is ineffective while
+	 * the env var overrides it.
+	 */
+	getStrategySource(): "env" | "file" | "default" {
+		return this.resolveStrategy().source;
 	}
 
 	setStrategy(strategy: StrategyName): void {
@@ -287,6 +289,20 @@ export class Config extends EventEmitter {
 
 	setDefaultAgentModel(model: string): void {
 		this.set("default_agent_model", model);
+	}
+
+	getOutboundProxy(): string | undefined {
+		const candidate =
+			process.env.BETTER_CCFLARE_OUTBOUND_PROXY ?? this.data.outbound_proxy;
+		if (!candidate) {
+			return undefined;
+		}
+		try {
+			return validateEndpointUrl(candidate, "outbound_proxy");
+		} catch (error) {
+			log.warn("Invalid outbound proxy URL. Ignoring.", error);
+			return undefined;
+		}
 	}
 
 	private clamp(n: number, min: number, max: number): number {
@@ -520,6 +536,45 @@ export class Config extends EventEmitter {
 
 	setUsageThrottlingWeeklyEnabled(value: boolean): void {
 		this.set("usage_throttling_weekly_enabled", value);
+	}
+
+	/**
+	 * Shared env > file > default precedence resolver: a valid environment
+	 * value wins ("env"), else a valid config-file value ("file"), else
+	 * `defaultValue` ("default"). Used by resolveStrategy() so getStrategy()
+	 * and getStrategySource() can never drift, and is reusable for other
+	 * env+file-backed string settings.
+	 */
+	private resolveEnvFileSetting<T extends string>(
+		envValue: string | undefined,
+		fileValue: T | undefined,
+		isValid: (value: string) => value is T,
+		defaultValue: T,
+	): { value: T; source: "env" | "file" | "default" } {
+		if (envValue !== undefined && isValid(envValue)) {
+			return { value: envValue, source: "env" };
+		}
+		if (fileValue !== undefined && isValid(fileValue)) {
+			return { value: fileValue, source: "file" };
+		}
+		return { value: defaultValue, source: "default" };
+	}
+
+	/**
+	 * Resolve the effective load-balancing strategy plus its source, using the
+	 * same env > file > default precedence getStrategy() has always used.
+	 * Backs both getStrategy() and getStrategySource() so they cannot drift.
+	 */
+	private resolveStrategy(): {
+		value: StrategyName;
+		source: "env" | "file" | "default";
+	} {
+		return this.resolveEnvFileSetting(
+			process.env.LB_STRATEGY,
+			this.data.lb_strategy,
+			isValidStrategy,
+			DEFAULT_STRATEGY,
+		);
 	}
 
 	getHealthDetailEnabled(): boolean {

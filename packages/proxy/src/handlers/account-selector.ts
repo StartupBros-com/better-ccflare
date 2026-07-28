@@ -163,6 +163,15 @@ export function getComboSlotInfo(meta: RequestMeta): ComboSlotInfo | null {
 	return comboSlotInfoMap.get(meta) ?? null;
 }
 
+// Deliberately kept even though our fork replaced upstream's model-capacity.ts
+// module wholesale (see account-selector's hard-capacity system below): this
+// one flag is an unrelated, additive combo-isolation safety valve with no
+// equivalent in our fork's control plane, and is exercised by tests below.
+function isComboSessionFallbackDisabled(): boolean {
+	const value = process.env.CCFLARE_DISABLE_COMBO_SESSION_FALLBACK;
+	return /^(1|true|yes|on)$/i.test(value ?? "");
+}
+
 /**
  * Resolves the model that should drive account routing: the agent
  * interceptor's applied (post-rewrite) model when it modified the request,
@@ -1025,6 +1034,15 @@ export async function selectAccountsForRequest(
 					}
 
 					// All effective candidates unavailable — fall back to normal routing.
+					if (isComboSessionFallbackDisabled()) {
+						setComboSlotInfo(meta, { comboName: combo.name, slots: [] });
+						meta.comboName = combo.name;
+						log.warn(
+							`All ${resolution.members.length} combo candidates unavailable for ${combo.name}, session fallback disabled by CCFLARE_DISABLE_COMBO_SESSION_FALLBACK`,
+						);
+						return [];
+					}
+
 					log.warn(
 						`All ${resolution.members.length} combo candidates unavailable for ${combo.name}, falling back to SessionStrategy`,
 						buildComboMembershipDiagnostics(
