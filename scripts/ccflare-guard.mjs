@@ -1133,9 +1133,9 @@ export function createGuard(options = {}) {
 		recoveryWaitCapacityFull: 0,
 		recoveryWaitAdmitted: 0,
 		recoveryWaitReleased: 0,
-		recoveryByScope: { pool: 0, model: 0, legacy: 0 },
-		recoveryWaitAdmittedByScope: { pool: 0, model: 0, legacy: 0 },
-		recoveryWaitRejectedByScope: { pool: 0, model: 0, legacy: 0 },
+		recoveryByScope: { pool: 0, model: 0, route: 0, legacy: 0 },
+		recoveryWaitAdmittedByScope: { pool: 0, model: 0, route: 0, legacy: 0 },
+		recoveryWaitRejectedByScope: { pool: 0, model: 0, route: 0, legacy: 0 },
 		attemptsExhausted: 0,
 		oversizedInspectionBodies: 0,
 		responseBodyIdleTimeouts: 0,
@@ -1236,8 +1236,14 @@ export function createGuard(options = {}) {
 		});
 	}
 
+	// "legacy" must stay reserved for markers emitted before scoped metadata
+	// existed: it is the signal for whether the pre-scope compatibility path is
+	// still in use. Folding a known scope into it would both hide route-circuit
+	// pressure and make legacy look live forever.
 	function recoveryScopeKey(scope) {
-		return scope === "pool" || scope === "model" ? scope : "legacy";
+		return scope === "pool" || scope === "model" || scope === "route"
+			? scope
+			: "legacy";
 	}
 
 	function recordTrustedRecovery(scope) {
