@@ -379,6 +379,22 @@ function createRouteUnavailableResponse(options: {
 			String(Math.max(1, Math.ceil((effectiveRetryAt - now) / 1000))),
 		);
 		headers.set("x-better-ccflare-route-status", "circuit-open");
+		// Every candidate on this lane is circuit-open with a positively known
+		// reopen time, so this terminal is finitely recoverable and the guard may
+		// hold the request instead of failing it once. Emitting Retry-After alone
+		// was not enough: the guard requires the recovery marker to authorize a
+		// retry, so without this the response read as "recovery evidence absent"
+		// and every request in the suppression window became a bare 503.
+		//
+		// The scope stays "route" rather than "pool": one lane being circuit-open
+		// is not a whole-pool exhaustion claim. That distinction only matters for
+		// telemetry today, but keeping it honest preserves the contract.
+		//
+		// This is load-bearing when the pool is down to a single routable account:
+		// with siblings, selection just picks another route and this terminal is
+		// never reached.
+		headers.set(RECOVERY_STATUS_HEADER, RECOVERY_STATUS_EXHAUSTED);
+		headers.set(RECOVERY_SCOPE_HEADER, "route");
 	}
 	return new Response(
 		JSON.stringify({

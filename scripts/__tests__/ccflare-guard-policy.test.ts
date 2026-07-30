@@ -118,7 +118,7 @@ describe("poolHeaderStatus", () => {
 });
 
 describe("recoveryHeaderStatus", () => {
-	test.each(["pool", "model"] as const)(
+	test.each(["pool", "model", "route"] as const)(
 		"confirms a trusted finite %s recovery scope",
 		(scope) => {
 			expect(
@@ -169,6 +169,31 @@ describe("recoveryHeaderStatus", () => {
 });
 
 describe("evaluateGuardRetry", () => {
+	// Regression: a route-scoped terminal must authorize a bounded hold. When the
+	// pool is down to a single routable account, one transient upstream 529 opens
+	// the route circuit on the only lane; the proxy knows the reopen time and
+	// sends it as Retry-After. Before route scope existed the guard read that
+	// response as "recovery evidence absent" and failed it once, so every request
+	// in the suppression window surfaced to the client as a bare 503.
+	test("holds a route-scoped terminal for its advertised reopen delay", () => {
+		const decision = evaluate({
+			headers: {
+				"x-better-ccflare-pool-status": "exhausted",
+				"x-better-ccflare-recovery-scope": "route",
+				"x-better-ccflare-route-status": "circuit-open",
+				"retry-after": "15",
+			},
+		});
+
+		expect(decision).toMatchObject({
+			retry: true,
+			reason: "trusted_finite_recovery",
+			recoveryScope: "route",
+			recoverySource: "retry-after",
+			delayMs: 15_000,
+		});
+	});
+
 	test("reports the trusted model recovery scope", () => {
 		const decision = evaluate({
 			headers: {
