@@ -71,6 +71,7 @@ const RESCUE_PING_ENV = ANTHROPIC_PRECOMMIT_RESCUE_PING_INTERVAL_ENV;
 const RESCUE_DEADLINE_ENV = ANTHROPIC_PRECOMMIT_RESCUE_DEADLINE_ENV;
 const CONTEXT_ADMISSION_ENV = "CCFLARE_CONTEXT_ADMISSION";
 const CODEX_PROMPT_CACHE_KEY_ENV = "CCFLARE_CODEX_PROMPT_CACHE_KEY";
+const ACCOUNT_SELECTION_TIMEOUT_ENV = "CCFLARE_ACCOUNT_SELECTION_TIMEOUT_MS";
 
 const originalFetch = globalThis.fetch;
 const originalEnv = new Map(
@@ -86,6 +87,7 @@ const originalEnv = new Map(
 		RESCUE_DEADLINE_ENV,
 		CONTEXT_ADMISSION_ENV,
 		CODEX_PROMPT_CACHE_KEY_ENV,
+		ACCOUNT_SELECTION_TIMEOUT_ENV,
 	].map((name) => [name, process.env[name]] as const),
 );
 let restoreUsageCollector = (): void => {};
@@ -321,6 +323,90 @@ function codexFailureStream(
 			},
 		],
 		true,
+	);
+}
+
+function codexContextOverflowStream(): string {
+	return codexEventStream(
+		[
+			CODEX_STRUCTURAL_FRAMES[0],
+			{
+				event: "response.failed",
+				data: {
+					response: {
+						status: "failed",
+						error: {
+							type: "invalid_request_error",
+							code: "context_length_exceeded",
+							message: "Input is too large",
+						},
+					},
+				},
+			},
+		],
+		true,
+	);
+}
+
+function codexMessageOnlyContextOverflowStream(): string {
+	return codexEventStream(
+		[
+			CODEX_STRUCTURAL_FRAMES[0],
+			{
+				event: "response.failed",
+				data: {
+					response: {
+						status: "failed",
+						error: {
+							type: "invalid_request_error",
+							message:
+								"Your input exceeds the context window of this model. Please adjust your input and try again.",
+						},
+					},
+				},
+			},
+		],
+		true,
+	);
+}
+
+function codexContextOverflowResponse(proof: string): Response {
+	return new Response(
+		JSON.stringify({
+			error: {
+				type: "invalid_request_error",
+				code: "context_length_exceeded",
+				message: "Input is too large",
+			},
+		}),
+		{
+			status: 400,
+			headers: {
+				"content-type": "application/json",
+				"x-upstream-proof": proof,
+			},
+		},
+	);
+}
+
+function openAiJsonResponse(text: string): Response {
+	return new Response(
+		JSON.stringify({
+			id: "chatcmpl-context-fallback",
+			object: "chat.completion",
+			model: "grok-4",
+			choices: [
+				{
+					message: { role: "assistant", content: text },
+					finish_reason: "stop",
+				},
+			],
+			usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 },
+		}),
+		{
+			status: 200,
+			headers: { "content-type": "application/json" },
+		},
 	);
 }
 
@@ -735,10 +821,11 @@ function makeRequest(
 }
 
 function makeCodexRequest(
-	options: { includeSessionMetadata?: boolean } = {},
+	options: { includeSessionMetadata?: boolean; stream?: boolean } = {},
 ): Request {
 	const request = makeRequest();
 	const includeSessionMetadata = options.includeSessionMetadata ?? true;
+	const stream = options.stream ?? true;
 	return new Request(request.url, {
 		method: request.method,
 		headers: request.headers,
@@ -753,7 +840,7 @@ function makeCodexRequest(
 					}
 				: {}),
 			max_tokens: 16,
-			stream: true,
+			stream,
 		}),
 	});
 }
@@ -1199,6 +1286,639 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		expect(cancelCount).toBe(2);
 		expect(response.status).toBe(200);
 		expect(body).toContain('"text":"codex recovered"');
+	});
+
+	it("routes a precommit Codex context overflow to xAI without penalizing Codex", async () => {
+		const previousXaiCacheNative = process.env.CCFLARE_XAI_CACHE_NATIVE;
+		process.env.CCFLARE_XAI_CACHE_NATIVE = "1";
+		try {
+			const codex = makeCodexAccount("codex-context-overflow");
+			const xai = makeXaiAccount("xai-context-fallback");
+			const { ctx, reportCandidateFailure } = makeContext(
+				[codex, xai],
+				makeCombo([codex]),
+			);
+			const fetchedProviders: string[] = [];
+			const xaiConversationIds: string[] = [];
+			let codexCalls = 0;
+			globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+				const upstreamRequest =
+					input instanceof Request ? input : new Request(input);
+				const authorization =
+					upstreamRequest.headers.get("authorization") ?? "";
+				if (authorization === `Bearer access-${codex.id}`) {
+					fetchedProviders.push("codex");
+					codexCalls++;
+					return sseResponse(
+						byteStream(
+							codexCalls <= 2
+								? codexContextOverflowStream()
+								: CODEX_SUCCESS_STREAM,
+						),
+					);
+				}
+				fetchedProviders.push("xai");
+				xaiConversationIds.push(
+					upstreamRequest.headers.get("x-grok-conv-id") ?? "",
+				);
+				return sseResponse(
+					completedOpenAiStream([openAiContentChunk("xai recovered")]),
+				);
+			}) as unknown as typeof fetch;
+
+			const firstRequest = makeCodexRequest();
+			const firstResponse = await handleProxy(
+				firstRequest,
+				new URL(firstRequest.url),
+				ctx,
+			);
+			const firstBody = await firstResponse.text();
+
+			const secondRequest = makeCodexRequest();
+			const secondResponse = await handleProxy(
+				secondRequest,
+				new URL(secondRequest.url),
+				ctx,
+			);
+			const secondBody = await secondResponse.text();
+
+			const thirdRequest = makeCodexRequest();
+			const thirdResponse = await handleProxy(
+				thirdRequest,
+				new URL(thirdRequest.url),
+				ctx,
+			);
+			const thirdBody = await thirdResponse.text();
+
+			expect(fetchedProviders).toEqual([
+				"codex",
+				"xai",
+				"codex",
+				"xai",
+				"codex",
+			]);
+			expect(firstBody).toContain('"text":"xai recovered"');
+			expect(secondBody).toContain('"text":"xai recovered"');
+			expect(thirdBody).toContain('"text":"codex recovered"');
+			expect(xaiConversationIds).toHaveLength(2);
+			expect(xaiConversationIds[0]).toMatch(/^ccflare-xai-[0-9a-f]{48}$/);
+			expect(xaiConversationIds[1]).toBe(xaiConversationIds[0]);
+			expect(reportCandidateFailure).not.toHaveBeenCalled();
+			expect(codex.rate_limited_until).toBeNull();
+			expect(codex.consecutive_rate_limits).toBe(0);
+		} finally {
+			if (previousXaiCacheNative === undefined) {
+				delete process.env.CCFLARE_XAI_CACHE_NATIVE;
+			} else {
+				process.env.CCFLARE_XAI_CACHE_NATIVE = previousXaiCacheNative;
+			}
+		}
+	});
+
+	it("routes a direct Codex context overflow to a remaining xAI route", async () => {
+		const codex = makeCodexAccount("codex-http-context-overflow");
+		const xai = makeXaiAccount("xai-http-context-fallback");
+		const { ctx, reportCandidateFailure } = makeContext([codex, xai]);
+		const fetchedProviders: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			if (
+				upstreamRequest.headers.get("authorization") ===
+				`Bearer access-${codex.id}`
+			) {
+				fetchedProviders.push("codex");
+				return codexContextOverflowResponse("codex-overflow");
+			}
+			fetchedProviders.push("xai");
+			return sseResponse(
+				completedOpenAiStream([openAiContentChunk("xai recovered")]),
+			);
+		}) as unknown as typeof fetch;
+
+		const request = makeCodexRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.text();
+
+		expect(fetchedProviders).toEqual(["codex", "xai"]);
+		expect(response.status).toBe(200);
+		expect(body).toContain('"text":"xai recovered"');
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+		expect(codex.rate_limited_until).toBeNull();
+		expect(codex.consecutive_rate_limits).toBe(0);
+	});
+
+	it("routes a coded Codex SSE overflow for a non-streaming request to xAI", async () => {
+		const codex = makeCodexAccount("codex-json-context-overflow");
+		const xai = makeXaiAccount("xai-json-context-fallback");
+		const { ctx, reportCandidateFailure } = makeContext(
+			[codex, xai],
+			makeCombo([codex]),
+		);
+		const fetchedProviders: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			if (
+				upstreamRequest.headers.get("authorization") ===
+				`Bearer access-${codex.id}`
+			) {
+				fetchedProviders.push("codex");
+				return sseResponse(byteStream(codexContextOverflowStream()));
+			}
+			fetchedProviders.push("xai");
+			return openAiJsonResponse("xai json recovered");
+		}) as unknown as typeof fetch;
+
+		const request = makeCodexRequest({ stream: false });
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const payload = (await response.json()) as {
+			content?: Array<{ type?: string; text?: string }>;
+		};
+
+		expect(fetchedProviders).toEqual(["codex", "xai"]);
+		expect(response.status).toBe(200);
+		expect(payload.content).toContainEqual({
+			type: "text",
+			text: "xai json recovered",
+		});
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+		expect(codex.rate_limited_until).toBeNull();
+		expect(codex.consecutive_rate_limits).toBe(0);
+	});
+
+	it("uses a legacy message-only overflow only for the queued larger Codex model and stops before xAI", async () => {
+		process.env[CONTEXT_ADMISSION_ENV] = "1";
+		const codex = makeCodexAccount("codex-message-larger-model");
+		codex.model_mappings = JSON.stringify({
+			opus: ["gpt-5.3-codex-spark", "future-model", "gpt-5.6-sol"],
+		});
+		const xai = makeXaiAccount("must-not-fetch-after-largest-message");
+		const { ctx, reportCandidateFailure } = makeContext(
+			[codex, xai],
+			makeCombo([codex]),
+		);
+		const fetchedCodexModels: string[] = [];
+		let xaiFetches = 0;
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			if (
+				upstreamRequest.headers.get("authorization") ===
+				`Bearer access-${codex.id}`
+			) {
+				const body = (await upstreamRequest.clone().json()) as {
+					model: string;
+				};
+				fetchedCodexModels.push(body.model);
+				return sseResponse(byteStream(codexMessageOnlyContextOverflowStream()));
+			}
+			xaiFetches++;
+			return sseResponse(
+				completedOpenAiStream([openAiContentChunk("must not be fetched")]),
+			);
+		}) as unknown as typeof fetch;
+
+		const request = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"anthropic-version": "2023-06-01",
+			},
+			body: JSON.stringify({
+				model: MODEL,
+				messages: [{ role: "user", content: "x".repeat(440_000) }],
+				metadata: {
+					user_id: JSON.stringify({ session_id: CODEX_SESSION }),
+				},
+				max_tokens: 50_000,
+				stream: true,
+			}),
+		});
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.text();
+
+		expect(fetchedCodexModels).toEqual(["gpt-5.3-codex-spark", "gpt-5.6-sol"]);
+		expect(xaiFetches).toBe(0);
+		expect(response.status).toBe(200);
+		expect(body).toContain("Prompt is too long. Codex reported:");
+		expect(body).not.toContain("must not be fetched");
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+		expect(codex.rate_limited_until).toBeNull();
+		expect(codex.consecutive_rate_limits).toBe(0);
+	});
+
+	it.each([
+		{ stream: false, authoritativeKind: "processed JSON" },
+		{ stream: true, authoritativeKind: "precommit SSE" },
+	])("lets a larger-model $authoritativeKind overflow supersede an older legacy terminal", async ({
+		stream,
+	}) => {
+		process.env[CONTEXT_ADMISSION_ENV] = "1";
+		const codex = makeCodexAccount(
+			`codex-larger-authoritative-${String(stream)}`,
+		);
+		codex.model_mappings = JSON.stringify({
+			opus: ["gpt-5.3-codex-spark", "gpt-5.6-sol"],
+		});
+		const xai = makeXaiAccount(
+			`must-not-fetch-after-authoritative-${String(stream)}`,
+		);
+		const { ctx, reportCandidateFailure } = makeContext(
+			[codex, xai],
+			makeCombo([codex]),
+		);
+		const fetchedCodexModels: string[] = [];
+		let xaiFetches = 0;
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			if (
+				upstreamRequest.headers.get("authorization") ===
+				`Bearer access-${codex.id}`
+			) {
+				const body = (await upstreamRequest.clone().json()) as {
+					model: string;
+				};
+				fetchedCodexModels.push(body.model);
+				if (body.model === "gpt-5.3-codex-spark") {
+					return sseResponse(
+						byteStream(codexMessageOnlyContextOverflowStream()),
+					);
+				}
+				return stream
+					? sseResponse(byteStream(codexContextOverflowStream()))
+					: codexContextOverflowResponse("larger-authoritative");
+			}
+			xaiFetches++;
+			return stream
+				? sseResponse(
+						completedOpenAiStream([openAiContentChunk("must not be fetched")]),
+					)
+				: openAiJsonResponse("must not be fetched");
+		}) as unknown as typeof fetch;
+
+		const request = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"anthropic-version": "2023-06-01",
+			},
+			body: JSON.stringify({
+				model: MODEL,
+				messages: [{ role: "user", content: "x".repeat(440_000) }],
+				metadata: {
+					user_id: JSON.stringify({ session_id: CODEX_SESSION }),
+				},
+				max_tokens: 50_000,
+				stream,
+			}),
+		});
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const payload = (await response.json()) as {
+			error?: { code?: string; message?: string };
+		};
+
+		expect(fetchedCodexModels).toEqual(["gpt-5.3-codex-spark", "gpt-5.6-sol"]);
+		expect(xaiFetches).toBe(0);
+		expect(response.status).toBe(400);
+		expect(payload.error?.code).toBe("context_length_exceeded");
+		if (!stream) {
+			expect(response.headers.get("x-upstream-proof")).toBe(
+				"larger-authoritative",
+			);
+			expect(payload.error?.message).toBe("Input is too large");
+			expect(payload.error?.message).not.toContain(
+				"Prompt is too long. Codex reported:",
+			);
+		}
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+		expect(codex.rate_limited_until).toBeNull();
+		expect(codex.consecutive_rate_limits).toBe(0);
+	});
+
+	it.each([
+		{ stream: true, expectedStatus: 200 },
+		{ stream: false, expectedStatus: 400 },
+	])("keeps a message-only Codex SSE overflow terminal when stream=$stream", async ({
+		stream,
+		expectedStatus,
+	}) => {
+		const codex = makeCodexAccount(
+			`codex-message-only-context-${String(stream)}`,
+		);
+		const xai = makeXaiAccount(`must-not-fetch-message-only-${String(stream)}`);
+		const { ctx, reportCandidateFailure } = makeContext(
+			[codex, xai],
+			makeCombo([codex, xai]),
+		);
+		const fetchedProviders: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			if (
+				upstreamRequest.headers.get("authorization") ===
+				`Bearer access-${codex.id}`
+			) {
+				fetchedProviders.push("codex");
+				return sseResponse(byteStream(codexMessageOnlyContextOverflowStream()));
+			}
+			fetchedProviders.push("xai");
+			return stream
+				? sseResponse(
+						completedOpenAiStream([openAiContentChunk("must not be fetched")]),
+					)
+				: openAiJsonResponse("must not be fetched");
+		}) as unknown as typeof fetch;
+
+		const request = makeCodexRequest({ stream });
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.text();
+
+		expect(fetchedProviders).toEqual(["codex"]);
+		expect(response.status).toBe(expectedStatus);
+		expect(body).toContain("Prompt is too long. Codex reported:");
+		expect(body).not.toContain("must not be fetched");
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+		expect(codex.rate_limited_until).toBeNull();
+		expect(codex.consecutive_rate_limits).toBe(0);
+	});
+
+	it.each([
+		{
+			name: "near-miss JSON",
+			response: () =>
+				new Response(
+					JSON.stringify({
+						error: {
+							type: "invalid_request_error",
+							code: "CONTEXT_LENGTH_EXCEEDED",
+							message: "Input is too large",
+						},
+					}),
+					{
+						status: 400,
+						headers: { "content-type": "application/json" },
+					},
+				),
+		},
+		{
+			name: "non-JSON",
+			response: () =>
+				new Response(
+					'{"error":{"code":"context_length_exceeded","message":"Input is too large"}}',
+					{
+						status: 400,
+						headers: { "content-type": "text/plain" },
+					},
+				),
+		},
+	])("keeps a $name Codex 400 terminal", async ({ response: makeResponse }) => {
+		const codex = makeCodexAccount("codex-near-miss-context");
+		const xai = makeXaiAccount("must-not-fetch-near-miss");
+		const { ctx, reportCandidateFailure } = makeContext(
+			[codex, xai],
+			makeCombo([codex, xai]),
+		);
+		const fetchedProviders: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			if (
+				upstreamRequest.headers.get("authorization") ===
+				`Bearer access-${codex.id}`
+			) {
+				fetchedProviders.push("codex");
+				return makeResponse();
+			}
+			fetchedProviders.push("xai");
+			return sseResponse(
+				completedOpenAiStream([openAiContentChunk("must not be fetched")]),
+			);
+		}) as unknown as typeof fetch;
+
+		const request = makeCodexRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.text();
+
+		expect(fetchedProviders).toEqual(["codex"]);
+		expect(response.status).toBe(400);
+		expect(body).toContain("Input is too large");
+		expect(body).not.toContain("must not be fetched");
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+		expect(codex.rate_limited_until).toBeNull();
+		expect(codex.consecutive_rate_limits).toBe(0);
+	});
+
+	it("preserves the coded Codex overflow when the xAI fallback fails", async () => {
+		const codex = makeCodexAccount("codex-context-before-failed-xai");
+		const xai = makeXaiAccount("xai-failed-context-fallback");
+		const { ctx, reportCandidateFailure } = makeContext(
+			[codex, xai],
+			makeCombo([codex]),
+		);
+		const fetchedProviders: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			if (
+				upstreamRequest.headers.get("authorization") ===
+				`Bearer access-${codex.id}`
+			) {
+				fetchedProviders.push("codex");
+				return sseResponse(byteStream(codexContextOverflowStream()));
+			}
+			fetchedProviders.push("xai");
+			return new Response(
+				JSON.stringify({
+					error: { type: "api_error", message: "xAI unavailable" },
+				}),
+				{
+					status: 500,
+					headers: { "content-type": "application/json" },
+				},
+			);
+		}) as unknown as typeof fetch;
+
+		const request = makeCodexRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const payload = (await response.json()) as {
+			error?: { type?: string; code?: string; message?: string };
+		};
+
+		expect(fetchedProviders).toEqual(["codex", "xai"]);
+		expect(response.status).toBe(400);
+		expect(payload.error).toMatchObject({
+			type: "invalid_request_error",
+			code: "context_length_exceeded",
+		});
+		expect(payload.error?.message).toContain("Prompt is too long.");
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+		expect(codex.rate_limited_until).toBeNull();
+		expect(codex.consecutive_rate_limits).toBe(0);
+	});
+
+	it("preserves the coded Codex overflow when post-combo selection returns no routes", async () => {
+		const codex = makeCodexAccount("codex-context-empty-tail");
+		const xai = makeXaiAccount("must-not-fetch-empty-tail");
+		const { ctx, reportCandidateFailure } = makeContext(
+			[codex, xai],
+			makeCombo([codex]),
+		);
+		let selectionCalls = 0;
+		ctx.strategy.select = mock(async (selected: Account[]) => {
+			selectionCalls++;
+			return selectionCalls === 1 ? selected : [];
+		});
+		const fetchedProviders: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			if (
+				upstreamRequest.headers.get("authorization") ===
+				`Bearer access-${codex.id}`
+			) {
+				fetchedProviders.push("codex");
+				return sseResponse(byteStream(codexContextOverflowStream()));
+			}
+			fetchedProviders.push("xai");
+			return sseResponse(
+				completedOpenAiStream([openAiContentChunk("must not be fetched")]),
+			);
+		}) as unknown as typeof fetch;
+
+		const request = makeCodexRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const payload = (await response.json()) as {
+			error?: { type?: string; code?: string; message?: string };
+		};
+
+		expect(selectionCalls).toBe(2);
+		expect(fetchedProviders).toEqual(["codex"]);
+		expect(response.status).toBe(400);
+		expect(payload.error).toMatchObject({
+			type: "invalid_request_error",
+			code: "context_length_exceeded",
+		});
+		expect(payload.error?.message).toContain("Prompt is too long.");
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+		expect(codex.rate_limited_until).toBeNull();
+		expect(codex.consecutive_rate_limits).toBe(0);
+	});
+
+	it("preserves the coded Codex overflow when post-combo selection times out", async () => {
+		process.env[ACCOUNT_SELECTION_TIMEOUT_ENV] = "5";
+		const codex = makeCodexAccount("codex-context-timeout-tail");
+		const xai = makeXaiAccount("must-not-fetch-timeout-tail");
+		const { ctx, reportCandidateFailure } = makeContext(
+			[codex, xai],
+			makeCombo([codex]),
+		);
+		let selectionCalls = 0;
+		ctx.strategy.select = mock(async (selected: Account[]) => {
+			selectionCalls++;
+			if (selectionCalls === 1) return selected;
+			return new Promise<Account[]>(() => undefined);
+		});
+		const fetchedProviders: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			if (
+				upstreamRequest.headers.get("authorization") ===
+				`Bearer access-${codex.id}`
+			) {
+				fetchedProviders.push("codex");
+				return sseResponse(byteStream(codexContextOverflowStream()));
+			}
+			fetchedProviders.push("xai");
+			return sseResponse(
+				completedOpenAiStream([openAiContentChunk("must not be fetched")]),
+			);
+		}) as unknown as typeof fetch;
+
+		const request = makeCodexRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const payload = (await response.json()) as {
+			error?: { type?: string; code?: string; message?: string };
+		};
+
+		expect(selectionCalls).toBe(2);
+		expect(fetchedProviders).toEqual(["codex"]);
+		expect(response.status).toBe(400);
+		expect(response.headers.get("retry-after")).toBeNull();
+		expect(payload.error).toMatchObject({
+			type: "invalid_request_error",
+			code: "context_length_exceeded",
+		});
+		expect(payload.error?.message).toContain("Prompt is too long.");
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+		expect(codex.rate_limited_until).toBeNull();
+		expect(codex.consecutive_rate_limits).toBe(0);
+	});
+
+	it("preserves the coded Codex overflow when post-combo routing only duplicates it", async () => {
+		const codex = makeCodexAccount("codex-context-duplicate-tail");
+		const { ctx, reportCandidateFailure } = makeContext(
+			[codex],
+			makeCombo([codex]),
+		);
+		let fetchCount = 0;
+		globalThis.fetch = mock(async () => {
+			fetchCount++;
+			return sseResponse(byteStream(codexContextOverflowStream()));
+		}) as unknown as typeof fetch;
+
+		const request = makeCodexRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const payload = (await response.json()) as {
+			error?: { type?: string; code?: string; message?: string };
+		};
+
+		expect(fetchCount).toBe(1);
+		expect(response.status).toBe(400);
+		expect(payload.error).toMatchObject({
+			type: "invalid_request_error",
+			code: "context_length_exceeded",
+		});
+		expect(payload.error?.message).toContain("Prompt is too long.");
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+		expect(codex.rate_limited_until).toBeNull();
+		expect(codex.consecutive_rate_limits).toBe(0);
+	});
+
+	it("preserves a forced Codex direct context overflow response", async () => {
+		const codex = makeCodexAccount("codex-http-context-terminal");
+		const { ctx, reportCandidateFailure } = makeContext([codex]);
+		globalThis.fetch = mock(async () =>
+			codexContextOverflowResponse("forced-codex-overflow"),
+		) as unknown as typeof fetch;
+		const baseRequest = makeCodexRequest();
+		const headers = new Headers(baseRequest.headers);
+		headers.set("x-better-ccflare-account-id", codex.id);
+		const request = new Request(baseRequest.url, {
+			method: baseRequest.method,
+			headers,
+			body: await baseRequest.text(),
+		});
+
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const payload = (await response.json()) as {
+			error?: { type?: string; code?: string; message?: string };
+		};
+
+		expect(response.status).toBe(400);
+		expect(response.headers.get("x-upstream-proof")).toBe(
+			"forced-codex-overflow",
+		);
+		expect(payload.error).toEqual({
+			type: "invalid_request_error",
+			code: "context_length_exceeded",
+			message: "Input is too large",
+		});
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+		expect(codex.rate_limited_until).toBeNull();
+		expect(codex.consecutive_rate_limits).toBe(0);
 	});
 
 	it("returns the existing 503 after exactly two stalled Codex cache-lane attempts", async () => {

@@ -204,6 +204,7 @@ export interface AnthropicPreCommitStallMetadata {
 	terminalEvidenceSeen: boolean;
 	limitBytes?: number;
 	errorType?: AnthropicTransientSseErrorType;
+	contextOverflowAuthoritative?: boolean;
 }
 
 /**
@@ -222,6 +223,7 @@ export class AnthropicPreCommitStallError extends Error {
 	readonly terminalEvidenceSeen: boolean;
 	readonly limitBytes?: number;
 	readonly errorType?: AnthropicTransientSseErrorType;
+	readonly contextOverflowAuthoritative?: boolean;
 
 	constructor(metadata: AnthropicPreCommitStallMetadata) {
 		super(
@@ -238,6 +240,7 @@ export class AnthropicPreCommitStallError extends Error {
 		this.terminalEvidenceSeen = metadata.terminalEvidenceSeen;
 		this.limitBytes = metadata.limitBytes;
 		this.errorType = metadata.errorType;
+		this.contextOverflowAuthoritative = metadata.contextOverflowAuthoritative;
 	}
 }
 
@@ -325,6 +328,8 @@ export interface AnthropicSemanticPreflightOptions {
 	maxBufferedBytes?: number;
 	/** Raise a sanitized pre-commit signal for a provider-scoped context fallback. */
 	failOnContextOverflow?: boolean;
+	/** Require the canonical error code instead of the legacy message heuristic. */
+	requireAuthoritativeContextOverflow?: boolean;
 	/** Cancel preflight without reporting a provider/account route failure. */
 	signal?: AbortSignal;
 }
@@ -511,6 +516,7 @@ export async function gateAnthropicSsePreCommit(
 		reason: AnthropicPreCommitStallReason,
 		limitBytes?: number,
 		errorType?: AnthropicTransientSseErrorType,
+		contextOverflowAuthoritative?: boolean,
 	): AnthropicPreCommitStallMetadata => ({
 		reason,
 		bufferedBytes,
@@ -521,6 +527,9 @@ export async function gateAnthropicSsePreCommit(
 		terminalEvidenceSeen,
 		...(limitBytes === undefined ? {} : { limitBytes }),
 		...(errorType === undefined ? {} : { errorType }),
+		...(contextOverflowAuthoritative === undefined
+			? {}
+			: { contextOverflowAuthoritative }),
 	});
 
 	const cancelOnce = (reason: unknown): Promise<void> => {
@@ -544,9 +553,10 @@ export async function gateAnthropicSsePreCommit(
 	const fail = (
 		reason: AnthropicPreCommitStallReason,
 		limitBytes?: number,
+		contextOverflowAuthoritative?: boolean,
 	): never => {
 		const error = new AnthropicPreCommitStallError(
-			metadata(reason, limitBytes),
+			metadata(reason, limitBytes, undefined, contextOverflowAuthoritative),
 		);
 		cancelBestEffort(error);
 		throw error;
@@ -600,8 +610,17 @@ export async function gateAnthropicSsePreCommit(
 		if (classification.transientErrorType) {
 			return failTransient(classification.transientErrorType);
 		}
-		if (options.failOnContextOverflow && classification.contextOverflow) {
-			return fail("context_length_exceeded");
+		if (
+			options.failOnContextOverflow &&
+			classification.contextOverflow &&
+			(!options.requireAuthoritativeContextOverflow ||
+				classification.authoritativeContextOverflow)
+		) {
+			return fail(
+				"context_length_exceeded",
+				undefined,
+				classification.authoritativeContextOverflow === true,
+			);
 		}
 		if (classification.kind === "terminal_delta") {
 			terminalEvidenceSeen = true;

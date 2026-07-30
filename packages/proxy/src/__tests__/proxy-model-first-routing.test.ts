@@ -792,7 +792,7 @@ describe("global model-first routing", () => {
 			const body = await response.text();
 
 			expect(fetchedModels).toEqual(["gpt-5.3-codex-spark"]);
-			expect(response.status).toBe(200);
+			expect(response.status).toBe(400);
 			expect(body).toContain("context_length_exceeded");
 			expect(reportCandidateFailure).toHaveBeenCalledTimes(0);
 			expect(account.rate_limited_until).toBeNull();

@@ -1066,15 +1066,19 @@ async function handleProxyCore(
 	type DeferredModelRoute = {
 		readonly account: Account;
 		readonly model: string;
+		readonly routeKey: string;
 		readonly candidateId: string;
 		readonly comboName: string | null;
 		readonly comboSlotIndex: number | null;
 		readonly fallbackWave: number;
 		readonly sequence: number;
 	};
+	const deferredModelRouteKeyFor = (account: Account, model: string): string =>
+		JSON.stringify([account.id, model.trim().toLowerCase()]);
 	const deferredModelRoutes: DeferredModelRoute[] = [];
 	const deferredModelRouteKeys = new Set<string>();
 	const deferredFallbackWaves = new Map<string, number>();
+	let preferredContextOverflowRouteKey: string | null = null;
 	const selectedRouteCandidateIds = alignRouteCandidateIds(
 		accounts,
 		requestMeta.routingCandidates,
@@ -1101,9 +1105,13 @@ async function handleProxyCore(
 			// before each real fetch and semantic gate.
 			isFinalSemanticAttempt: () =>
 				currentlyFinalSemanticRoute && deferredModelRoutes.length === 0,
+			canReplayContextOverflow: () =>
+				!currentlyFinalSemanticRoute ||
+				deferredModelRoutes.length > 0 ||
+				(comboName !== null && !isComboSessionFallbackDisabled()),
 			anthropicPreCommitRescue: activeAnthropicPreCommitRescue,
 			deferImplicitFallback: (model, fallbackRank) => {
-				const key = JSON.stringify([account.id, model.trim().toLowerCase()]);
+				const key = deferredModelRouteKeyFor(account, model);
 				if (deferredModelRouteKeys.has(key)) return;
 				deferredModelRouteKeys.add(key);
 				const targetFamily = getModelFamily(model);
@@ -1118,6 +1126,7 @@ async function handleProxyCore(
 				deferredModelRoutes.push({
 					account,
 					model,
+					routeKey: key,
 					candidateId,
 					comboName,
 					comboSlotIndex,
@@ -1125,8 +1134,17 @@ async function handleProxyCore(
 					sequence: deferredModelRoutes.length,
 				});
 			},
+			preferContextOverflowFallback: (model) => {
+				const key = deferredModelRouteKeyFor(account, model);
+				if (deferredModelRouteKeys.has(key)) {
+					preferredContextOverflowRouteKey = key;
+				}
+			},
 		};
 	};
+	const hasPreferredLegacyContextOverflowRoute = (): boolean =>
+		preferredContextOverflowRouteKey !== null &&
+		routingAttemptLedger.hasRetainedTerminalKind("legacy_context_overflow");
 	const deliverRetainedTerminalResponse =
 		async (): Promise<Response | null> => {
 			const retainedTerminalResponse =
@@ -1138,6 +1156,23 @@ async function handleProxyCore(
 			);
 			return retainedTerminalResponse.deliver(terminalFailoverAttempts);
 		};
+	const settleRoutedResponse = async (
+		candidateResponse: Response,
+	): Promise<Response> => {
+		if (candidateResponse.ok) {
+			await routingAttemptLedger.discardTerminalResponse();
+			return candidateResponse;
+		}
+		const retainedTerminalResponse = await deliverRetainedTerminalResponse();
+		if (!retainedTerminalResponse) return candidateResponse;
+		void candidateResponse.body
+			?.cancel("superseded by retained upstream terminal")
+			.catch(() => {
+				// Best-effort release: the chosen retained response must not wait on
+				// a failed fallback body's transport cleanup.
+			});
+		return retainedTerminalResponse;
+	};
 	const reactiveDepletionSkips: Account[] = [];
 	const betaSignature = req.headers.get("anthropic-beta");
 
@@ -1265,7 +1300,7 @@ async function handleProxyCore(
 		upstreamAttempts += routingAttemptLedger.attemptedCount - attemptedBefore;
 
 		if (response) {
-			await routingAttemptLedger.discardTerminalResponse();
+			response = await settleRoutedResponse(response);
 			recordCachePacingRoute(
 				pacingObservation,
 				{
@@ -1279,6 +1314,9 @@ async function handleProxyCore(
 				},
 			);
 			return finishPacing(pacingSlot, response);
+		}
+		if (hasPreferredLegacyContextOverflowRoute()) {
+			break;
 		}
 
 		// Log combo slot failure
@@ -1355,7 +1393,7 @@ async function handleProxyCore(
 		upstreamAttempts += routingAttemptLedger.attemptedCount - attemptedBefore;
 
 		if (response) {
-			await routingAttemptLedger.discardTerminalResponse();
+			response = await settleRoutedResponse(response);
 			recordCachePacingRoute(
 				pacingObservation,
 				{
@@ -1378,7 +1416,10 @@ async function handleProxyCore(
 	let reactivelyDepletedFallbackAccounts: Account[] = [];
 	let throttledFallbackAccounts: Account[] = [];
 	let fallbackSelectionHadNoAvailable = false;
-	if (filteredComboInfo?.comboName) {
+	if (
+		filteredComboInfo?.comboName &&
+		!hasPreferredLegacyContextOverflowRoute()
+	) {
 		if (isComboSessionFallbackDisabled()) {
 			log.warn(
 				`All combo slots failed for combo "${filteredComboInfo.comboName}", session fallback disabled by CCFLARE_DISABLE_COMBO_SESSION_FALLBACK`,
@@ -1401,10 +1442,28 @@ async function handleProxyCore(
 				skipCombo: true,
 			});
 		} catch (error) {
-			await routingAttemptLedger.discardTerminalResponse();
 			if (error instanceof PreTransportPhaseTimeoutError) {
+				const retainedTerminalResponse =
+					routingAttemptLedger.takeTerminalResponse();
+				if (
+					retainedTerminalResponse?.terminalKind ===
+					"authoritative_context_overflow"
+				) {
+					const terminalFailoverAttempts = Math.max(
+						0,
+						routingAttemptLedger.attemptedCount - 1,
+					);
+					return finishPacing(
+						pacingSlot,
+						await retainedTerminalResponse.deliver(terminalFailoverAttempts),
+					);
+				}
+				if (retainedTerminalResponse) {
+					await retainedTerminalResponse.discard();
+				}
 				return accountSelectionTimeoutResponse(pacingSlot);
 			}
+			await routingAttemptLedger.discardTerminalResponse();
 			throw error;
 		}
 		const fallbackSelection = applyUsageThrottling(selectedFallbackAccounts);
@@ -1507,7 +1566,7 @@ async function handleProxyCore(
 					routingAttemptLedger.attemptedCount - attemptedBefore;
 
 				if (response) {
-					await routingAttemptLedger.discardTerminalResponse();
+					response = await settleRoutedResponse(response);
 					recordCachePacingRoute(
 						pacingObservation,
 						{
@@ -1521,6 +1580,9 @@ async function handleProxyCore(
 						},
 					);
 					return finishPacing(pacingSlot, response);
+				}
+				if (hasPreferredLegacyContextOverflowRoute()) {
+					break;
 				}
 			}
 
@@ -1573,7 +1635,7 @@ async function handleProxyCore(
 					routingAttemptLedger.attemptedCount - attemptedBefore;
 
 				if (response) {
-					await routingAttemptLedger.discardTerminalResponse();
+					response = await settleRoutedResponse(response);
 					recordCachePacingRoute(
 						pacingObservation,
 						{
@@ -1624,9 +1686,13 @@ async function handleProxyCore(
 	// every explicit combo/normal candidate and known same-family sibling. Each
 	// re-entry is constrained to exactly the queued model.
 	if (deferredModelRoutes.length > 0) {
-		const orderedDeferredModelRoutes = [...deferredModelRoutes].sort(
-			(a, b) => a.fallbackWave - b.fallbackWave || a.sequence - b.sequence,
-		);
+		const orderedDeferredModelRoutes = hasPreferredLegacyContextOverflowRoute()
+			? deferredModelRoutes.filter(
+					(route) => route.routeKey === preferredContextOverflowRouteKey,
+				)
+			: [...deferredModelRoutes].sort(
+					(a, b) => a.fallbackWave - b.fallbackWave || a.sequence - b.sequence,
+				);
 		log.info(
 			`Requested-family routes exhausted; trying ${orderedDeferredModelRoutes.length} deferred degradation route(s)`,
 		);
@@ -1714,7 +1780,7 @@ async function handleProxyCore(
 			upstreamAttempts += routingAttemptLedger.attemptedCount - attemptedBefore;
 
 			if (response) {
-				await routingAttemptLedger.discardTerminalResponse();
+				response = await settleRoutedResponse(response);
 				recordCachePacingRoute(
 					pacingObservation,
 					{
