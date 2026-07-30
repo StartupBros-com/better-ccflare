@@ -1908,6 +1908,58 @@ describe("source-controlled guard", () => {
 		expect(health.recoveryWaits).toEqual({ configured: 1, current: 0, peak: 1 });
 	});
 
+	test("counts a route-scoped recovery under route, not legacy", async () => {
+		// A route-circuit terminal is the single-account failure mode: the only
+		// lane is circuit-open until a known time. It must be held and retried
+		// like any other finite recovery, and it must NOT land in the legacy
+		// bucket, which exists to show whether the pre-scope compatibility path
+		// is still in use.
+		let attempts = 0;
+		const upstreamBase = await listen(
+			http.createServer((_req, res) => {
+				attempts += 1;
+				if (attempts === 1) {
+					res.writeHead(503, {
+						"content-type": "application/json",
+						"x-better-ccflare-pool-status": "exhausted",
+						"x-better-ccflare-recovery-scope": "route",
+						"x-better-ccflare-route-status": "circuit-open",
+						"retry-after": "1",
+					});
+					res.end(
+						JSON.stringify({
+							error: {
+								type: "service_unavailable",
+								code: "route_unavailable",
+							},
+						}),
+					);
+					return;
+				}
+				res.writeHead(200, { "content-type": "application/json" });
+				res.end(JSON.stringify({ ok: true }));
+			}),
+		);
+		const { baseUrl, guard } = await startGuard(upstreamBase, {
+			maxRecoveryWaits: 1,
+			maxRecoverySleepMs: 5_000,
+			totalDeadlineMs: 10_000,
+		});
+
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+
+		expect(response.status).toBe(200);
+		expect(attempts).toBe(2);
+		expect(guard.state.counters.recoveryByScope.route).toBe(1);
+		expect(guard.state.counters.recoveryByScope.legacy).toBe(0);
+		expect(guard.state.counters.recoveryWaitAdmittedByScope.route).toBe(1);
+		expect(guard.state.counters.recoveryWaitAdmittedByScope.legacy).toBe(0);
+		expect(guard.state.counters.recoveryWaitRejectedByScope.route).toBe(0);
+	});
+
 	test("releases a recovery-wait lease when shutdown force-closes the client", async () => {
 		const upstreamBase = await listen(
 			http.createServer((_req, res) => {

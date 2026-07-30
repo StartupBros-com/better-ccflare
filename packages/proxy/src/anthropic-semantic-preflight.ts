@@ -35,7 +35,20 @@ export const ANTHROPIC_PRE_COMMIT_TERMINAL_GRACE_MS =
 export const ANTHROPIC_PRE_COMMIT_MAX_BUFFERED_BYTES =
 	BUFFER_SIZES.SSE_TRANSPORT_FRAME_MAX_BYTES +
 	BUFFER_SIZES.SSE_TRANSPORT_TAIL_MAX_BYTES;
-export const ANTHROPIC_PRE_COMMIT_ROUTE_SUPPRESSION_MS = 5 * 60 * 1000;
+// Must stay inside what the local guard can actually hold, or advertising
+// finite route recovery is pointless: planRecoveryAction() forwards instead of
+// retrying once the advertised delay exceeds
+// (GUARD_MAX_RECOVERY_SLEEP_MS - GUARD_RETRY_ATTEMPT_HEADROOM_MS), i.e. 90s at
+// the shipped 120s/30s defaults. The former 5-minute default blew that budget
+// on the FIRST failure, so route_unavailable was forwarded as a bare 503 even
+// with a correct Retry-After.
+//
+// Route suppression exists to shift load off a stalling route. With a healthy
+// pool that happens via selection anyway; the window only has to outlast a
+// transient upstream blip. 15s does, and survives the first three doublings of
+// the 2^n route backoff (15s/30s/60s) while staying holdable. Past that the
+// route is failing persistently, and forwarding to the client is correct.
+export const ANTHROPIC_PRE_COMMIT_ROUTE_SUPPRESSION_MS = 15 * 1000;
 
 export const ANTHROPIC_PRE_COMMIT_TIMEOUT_ENV =
 	"CCFLARE_ANTHROPIC_PRECOMMIT_TIMEOUT_MS";

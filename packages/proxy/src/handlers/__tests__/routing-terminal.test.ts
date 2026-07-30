@@ -172,7 +172,7 @@ async function body(response: Response) {
 }
 
 describe("routing terminal responses", () => {
-	it("advertises finite route-circuit recovery without claiming whole-pool exhaustion", async () => {
+	it("authorizes finite route-circuit recovery at route scope, without claiming whole-pool exhaustion", async () => {
 		const now = Date.UTC(2026, 6, 17, 12);
 		const retryAt = now + 30_001;
 		const terminal = createRoutingTerminalResponse({
@@ -196,9 +196,18 @@ describe("routing terminal responses", () => {
 		expect(terminal.response.headers.get("x-better-ccflare-route-status")).toBe(
 			"circuit-open",
 		);
+		// The marker authorizes a bounded guard retry; the scope keeps the claim
+		// honest. "route" says this lane's candidates are circuit-open until a
+		// known time, which is strictly narrower than whole-pool exhaustion.
+		// Without the marker the guard reads finite recovery as absent and fails
+		// the request once, which is what turned a transient upstream blip into a
+		// bare 503 whenever the pool was down to a single routable account.
+		expect(terminal.response.headers.get("x-better-ccflare-pool-status")).toBe(
+			"exhausted",
+		);
 		expect(
-			terminal.response.headers.get("x-better-ccflare-pool-status"),
-		).toBeNull();
+			terminal.response.headers.get("x-better-ccflare-recovery-scope"),
+		).toBe("route");
 		const parsed = await body(terminal.response);
 		expect(parsed.error.code).toBe("route_unavailable");
 		expect(parsed.error.next_available_at).toBe(

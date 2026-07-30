@@ -2,11 +2,17 @@ import { describe, expect, it, mock } from "bun:test";
 import { BUFFER_SIZES } from "@better-ccflare/core";
 import {
 	ANTHROPIC_PRE_COMMIT_MAX_BUFFERED_BYTES,
+	ANTHROPIC_PRE_COMMIT_ROUTE_SUPPRESSION_MS,
 	AnthropicPreCommitAbortedError,
 	AnthropicPreCommitStallError,
 	AnthropicPreCommitTransientError,
 	gateAnthropicSsePreCommit,
 } from "../anthropic-semantic-preflight";
+
+// Guard defaults shipped in scripts/run-ccflare-stack.sh. Kept as literals so
+// that raising either one there without re-checking this budget fails here.
+const GUARD_MAX_RECOVERY_SLEEP_MS = 120_000;
+const GUARD_RETRY_ATTEMPT_HEADROOM_MS = 30_000;
 
 const encoder = new TextEncoder();
 
@@ -67,6 +73,34 @@ const signatureDelta =
 const terminalDelta =
 	'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n';
 const messageStop = 'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+
+describe("route suppression default", () => {
+	it("stays within the delay the local guard can actually hold", () => {
+		// planRecoveryAction() forwards instead of retrying once the advertised
+		// recovery delay exceeds the silence budget minus the retry headroom. A
+		// suppression window past that ceiling makes route_unavailable's
+		// Retry-After unusable, so the client gets a bare 503 no matter how
+		// correct the recovery marker is. This was the production failure: the
+		// old 5-minute default blew the budget on the first failure.
+		const holdableMs =
+			GUARD_MAX_RECOVERY_SLEEP_MS - GUARD_RETRY_ATTEMPT_HEADROOM_MS;
+		expect(ANTHROPIC_PRE_COMMIT_ROUTE_SUPPRESSION_MS).toBeLessThanOrEqual(
+			holdableMs,
+		);
+	});
+
+	it("keeps the first backoff doublings holdable too", () => {
+		// The route circuit multiplies the base window by 2^n on consecutive
+		// failures. Transient blips (the case worth retrying) must survive the
+		// first few doublings; a persistently failing route legitimately falls
+		// out of the holdable range and is forwarded to the client.
+		const holdableMs =
+			GUARD_MAX_RECOVERY_SLEEP_MS - GUARD_RETRY_ATTEMPT_HEADROOM_MS;
+		expect(ANTHROPIC_PRE_COMMIT_ROUTE_SUPPRESSION_MS * 4).toBeLessThanOrEqual(
+			holdableMs,
+		);
+	});
+});
 
 describe("gateAnthropicSsePreCommit", () => {
 	it("derives default retention from the shared frame and tail policies", () => {

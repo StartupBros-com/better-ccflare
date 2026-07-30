@@ -3229,7 +3229,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		});
 	});
 
-	it("carries a route-circuit recovery hint through handleProxy without a pool-exhausted marker", async () => {
+	it("carries a route-circuit recovery hint through handleProxy as a route-scoped recovery marker", async () => {
 		const account = makeAccount("circuit-open-a");
 		const { ctx } = makeContext([account]);
 		const retryAt = Date.now() + 30_000;
@@ -3263,7 +3263,16 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		expect(response.headers.get("x-better-ccflare-route-status")).toBe(
 			"circuit-open",
 		);
-		expect(response.headers.get("x-better-ccflare-pool-status")).toBeNull();
+		// End-to-end counterpart of the routing-terminal unit test: the marker is
+		// what lets the guard hold this request for the advertised reopen delay
+		// instead of failing it once. "route" scope keeps the claim narrower than
+		// whole-pool exhaustion.
+		expect(response.headers.get("x-better-ccflare-pool-status")).toBe(
+			"exhausted",
+		);
+		expect(response.headers.get("x-better-ccflare-recovery-scope")).toBe(
+			"route",
+		);
 		expect(payload.error).toMatchObject({
 			code: "route_unavailable",
 			next_available_at: new Date(retryAt).toISOString(),
