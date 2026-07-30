@@ -31,6 +31,31 @@ export interface RoutingCandidateMetadata {
 }
 
 /**
+ * Side-effect-free view of a session lane's authoritative routing owner.
+ *
+ * Candidate identity is distinct from account identity because multiple combo
+ * slots may share one backing account.
+ */
+export interface AffinityOwnerSnapshot {
+	readonly candidateId: string;
+	readonly accountId: string;
+}
+
+/**
+ * Narrow request-local ownership instructions consumed by load-balancing
+ * strategies. The proxy owns degraded-cohort state; strategies deliberately
+ * receive only these generic directives.
+ */
+export type AffinityOwnerDirective =
+	| {
+			readonly kind: "retain-owner";
+			readonly owner: AffinityOwnerSnapshot;
+	  }
+	| {
+			readonly kind: "defer-owner-assignment";
+	  };
+
+/**
  * Coarse, stable quota-pressure buckets used to consume comparable
  * subscription windows before they reset. Higher-pressure bands sort first.
  */
@@ -54,6 +79,8 @@ export interface AccountQuotaPressure {
 
 export interface RequestMeta {
 	id: string;
+	/** Authenticated guard attempt join key. Absent for direct or invalid traffic. */
+	guardAttemptOrdinal?: number;
 	method: string;
 	path: string;
 	timestamp: number;
@@ -76,6 +103,13 @@ export interface RequestMeta {
 	 * Fable and Opus traffic can have independent sticky owners.
 	 */
 	affinityLaneKey?: string | null;
+	/**
+	 * Capture-once authoritative owner read before account selection can mutate
+	 * affinity. `undefined` means not captured; `null` means captured ownerless.
+	 */
+	affinityOwnerSnapshot?: AffinityOwnerSnapshot | null;
+	/** Request-local ownership behavior materialized by the injected overlay. */
+	affinityOwnerDirective?: AffinityOwnerDirective | null;
 	/** Accounts that are hard-ineligible for this concrete request lane. */
 	hardExcludedAccountIds?: ReadonlySet<string> | null;
 	/** Comparable per-account quota pressure for this concrete request lane. */

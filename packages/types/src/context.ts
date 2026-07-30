@@ -5,9 +5,9 @@ import type {
 } from "@better-ccflare/database";
 import type { Account } from "./account";
 import type { AlertEvent } from "./alerts";
-import type { RequestMeta } from "./api";
+import type { AffinityOwnerSnapshot, RequestMeta } from "./api";
 import type { ApiKey } from "./api-key";
-import type { IntegrityStatus } from "./stats";
+import type { AnthropicDegradedRuntimeHealth, IntegrityStatus } from "./stats";
 import type { StrategyStore } from "./strategy";
 
 /**
@@ -79,6 +79,8 @@ export interface APIContext {
 		state: string;
 	};
 	getIntegrityStatus?: () => IntegrityStatus;
+	/** Fixed aggregate-only, restart-scoped degraded-mode health snapshot. */
+	getAnthropicDegradedHealth?: () => AnthropicDegradedRuntimeHealth;
 	getStrategy?: () => LoadBalancingStrategy | null;
 	/**
 	 * Live Anthropic model catalog access, injected by the server entrypoint
@@ -119,6 +121,21 @@ export interface LoadBalancingStrategy {
 	 * no resumeAccount, no resetSession, no internal counters).
 	 */
 	peek(accounts: Account[]): string | null;
+
+	/**
+	 * Read the current authoritative affinity owner without changing TTLs,
+	 * assignments, recency, route-circuit leases, or account state.
+	 */
+	snapshotAffinityOwner?(meta: RequestMeta): AffinityOwnerSnapshot | null;
+
+	/**
+	 * Install an owner only after the caller has proven terminal success.
+	 * Implementations should refuse to overwrite a different live owner.
+	 */
+	commitAffinityOwner?(
+		meta: RequestMeta,
+		owner: AffinityOwnerSnapshot,
+	): boolean;
 
 	/**
 	 * Optionally suppress one exact routing candidate for the request's affinity

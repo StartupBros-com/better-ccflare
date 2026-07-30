@@ -206,6 +206,63 @@ export interface AccountDetail {
 	rate_limited_at: number | null;
 }
 
+export interface AnthropicDegradedRuntimeHealth {
+	schemaVersion: 1;
+	bootId: string;
+	mode: "off" | "observe" | "enforce";
+	diagnosticsEnabled: boolean;
+	thresholds: {
+		largeRequestTokenThreshold: number;
+		largeRequestByteThreshold: number;
+		evidenceWindowMs: number;
+		quorum: number;
+		retryMinMs: number;
+		retryFallbackMs: number;
+		retryMaxMs: number;
+		recoveryWindowMs: number;
+		probeLeaseMs: number;
+		maxCohorts: number;
+	};
+	cohorts: {
+		total: number;
+		byState: {
+			collecting: number;
+			open: number;
+			probing: number;
+			recovering: number;
+		};
+		ageBands: {
+			under30Seconds: number;
+			from30SecondsTo5Minutes: number;
+			atLeast5Minutes: number;
+		};
+	};
+	activeProbes: number;
+	attempts: {
+		logical: number;
+		guard: number;
+		local: number;
+		physical: number;
+	};
+	decisions: {
+		suppressedSends: number;
+		wouldSuppressSends: number;
+		probeSends: number;
+		wouldProbeSends: number;
+	};
+	terminals: {
+		success: number;
+		overload: number;
+		suppressed: number;
+		failure: number;
+		cancelled: number;
+		timeout: number;
+	};
+	droppedEvents: number;
+	droppedEvidence: number;
+	saturation: boolean;
+}
+
 // Health check response
 export interface HealthResponse {
 	status: string;
@@ -228,6 +285,7 @@ export interface HealthResponse {
 		usageWorker?: {
 			state: string;
 		};
+		anthropicDegraded?: AnthropicDegradedRuntimeHealth;
 		storage?: {
 			integrity: {
 				status: "ok" | "corrupt" | "unchecked" | "running";

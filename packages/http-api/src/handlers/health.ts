@@ -11,7 +11,10 @@ import {
 	getRepresentativeUtilizationForProvider,
 	usageCache,
 } from "@better-ccflare/providers";
-import type { Account } from "@better-ccflare/types";
+import type {
+	Account,
+	AnthropicDegradedRuntimeHealth,
+} from "@better-ccflare/types";
 import type { HealthResponse, IntegrityStatus, PoolStatus } from "../types";
 import {
 	getRepresentativeUsageResetMs,
@@ -62,6 +65,7 @@ type UsageWorkerHealthFn = () => {
 	state: string;
 };
 type IntegrityStatusFn = () => IntegrityStatus;
+type AnthropicDegradedHealthFn = () => AnthropicDegradedRuntimeHealth;
 
 export function computePoolStatus(
 	accounts: Account[],
@@ -147,6 +151,7 @@ export function createHealthHandler(
 	getUsageWorkerHealth?: UsageWorkerHealthFn,
 	getIntegrityStatus?: IntegrityStatusFn,
 	getAccountUsageInfo: AccountUsageInfoFn = usageCacheUsageInfo,
+	getAnthropicDegradedHealth?: AnthropicDegradedHealthFn,
 ) {
 	const normalCache = new TtlCache<HealthResponse>(2000);
 	const detailCache = new TtlCache<HealthResponse>(2000);
@@ -201,6 +206,12 @@ export function createHealthHandler(
 				asyncWriter: asyncWriterHealth,
 				usageWorker: usageWorkerHealth,
 			};
+		}
+
+		if (getAnthropicDegradedHealth) {
+			const runtime = response.runtime ?? {};
+			response.runtime = runtime;
+			runtime.anthropicDegraded = getAnthropicDegradedHealth();
 		}
 
 		// Add storage integrity independently — orthogonal to asyncWriter/usageWorker

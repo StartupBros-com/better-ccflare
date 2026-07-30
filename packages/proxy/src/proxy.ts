@@ -6,6 +6,7 @@ import {
 	trackClientVersion,
 } from "@better-ccflare/core";
 import { DatabaseFactory } from "@better-ccflare/database";
+import { sanitizeRequestHeaders } from "@better-ccflare/http-common";
 import { Logger } from "@better-ccflare/logger";
 import {
 	canonicalizeBetaSignature,
@@ -16,7 +17,15 @@ import {
 	isXaiCacheNativeEnabled,
 	usageCache,
 } from "@better-ccflare/providers";
-import type { Account } from "@better-ccflare/types";
+import type { Account, RequestMeta } from "@better-ccflare/types";
+import {
+	type AnthropicDegradedCohortFacts,
+	type AnthropicDegradedRouteInspection,
+	classifyAnthropicReplayRisk,
+	sanitizeAnthropicRetryAfterSeconds,
+} from "./anthropic-degraded-mode";
+import type { DegradedModeRequestTracker } from "./anthropic-degraded-observability";
+import { trackDegradedResponseTerminal } from "./anthropic-degraded-runtime";
 import {
 	type AnthropicPreCommitRescueRouteContext,
 	coordinateAnthropicPreCommitRescue,
@@ -71,11 +80,20 @@ import {
 } from "./handlers";
 import { getReactiveModelCapacityBlocker } from "./handlers/account-selector";
 import {
+	type AnthropicDegradedRequestSendState,
+	type AnthropicDegradedSendDenied,
+	createAnthropicDegradedNoAccountDenial,
+	discardUpstreamBody,
+	isAnthropicDegradedSendDenied,
+	type ProxyWithAccountResult,
+} from "./handlers/proxy-operations";
+import {
 	completeRateLimitProbe,
 	getRateLimitProbeAdmission,
 	wouldSuppressProbe,
 } from "./handlers/rate-limit-cooldown";
 import { getRequestRateLimitOutcomes } from "./handlers/rate-limit-scope";
+import { createProtectedAnthropicOverloadResponse } from "./handlers/routing-terminal";
 import { consumeInternalAutoRefreshAuth } from "./internal-probe-auth";
 import {
 	getPreTransportDeadlineConfig,
@@ -169,6 +187,70 @@ export function alignRouteCandidateIds(
 }
 
 const log = new Logger("Proxy");
+const ANTHROPIC_OAUTH_BETA = "oauth-2025-04-20";
+
+function physicalAnthropicOAuthBetaSignature(headers: Headers): string {
+	const features = new Set(
+		(headers.get("anthropic-beta") ?? "")
+			.split(",")
+			.map((feature) => feature.trim())
+			.filter(Boolean),
+	);
+	features.add(ANTHROPIC_OAUTH_BETA);
+	return [...features].join(",");
+}
+
+function derivePotentialAnthropicOAuthCohortFacts(input: {
+	ctx: ProxyContext;
+	url: URL;
+	headers: Headers;
+	body: RequestBodyContext;
+}): AnthropicDegradedCohortFacts | null {
+	if (
+		input.ctx.provider.name !== "anthropic" ||
+		input.url.pathname !== "/v1/messages"
+	) {
+		return null;
+	}
+	const model = input.body.getModel();
+	if (!model) return null;
+	let endpoint: string;
+	try {
+		endpoint = input.ctx.provider.buildUrl(
+			input.url.pathname,
+			input.url.search,
+		);
+	} catch {
+		return null;
+	}
+	return {
+		provider: "anthropic",
+		endpoint,
+		path: input.url.pathname,
+		protocol: "messages",
+		model,
+		betaSignature: physicalAnthropicOAuthBetaSignature(input.headers),
+	};
+}
+
+interface DegradedTelemetryHolder {
+	tracker: DegradedModeRequestTracker | null;
+}
+
+function degradedSizeBucket(input: {
+	readonly kind: "small" | "large";
+	readonly bodyBytes: number;
+	readonly estimatedInputTokens: number | null;
+	readonly tokenThreshold: number;
+	readonly byteThreshold: number;
+}): "small" | "near_threshold" | "large" {
+	if (input.kind === "large") return "large";
+	const nearTokens =
+		input.estimatedInputTokens !== null &&
+		input.estimatedInputTokens >= Math.floor(input.tokenThreshold * 0.8);
+	const nearBytes = input.bodyBytes >= Math.floor(input.byteThreshold * 0.8);
+	return nearTokens || nearBytes ? "near_threshold" : "small";
+}
 
 function isComboSessionFallbackDisabled(): boolean {
 	const value = process.env.CCFLARE_DISABLE_COMBO_SESSION_FALLBACK;
@@ -192,6 +274,57 @@ function createComboSessionFallbackDisabledResponse(
 			status: 503,
 			headers: { "Content-Type": "application/json" },
 		},
+	);
+}
+
+function createAnthropicDegradedDenialResponse(
+	denial: AnthropicDegradedSendDenied,
+): Response {
+	return createProtectedAnthropicOverloadResponse({
+		kind: "local_suppression",
+		retryAfter: denial.decision.retryAfterSeconds,
+	});
+}
+
+function getEmptyPoolAnthropicDegradedDenial(input: {
+	inspection: AnthropicDegradedRouteInspection | null;
+	requestKind: "small" | "large";
+	config: ProxyContext["anthropicDegradedMode"]["config"];
+	now?: number;
+}): AnthropicDegradedSendDenied | null {
+	if (
+		input.config.mode !== "enforce" ||
+		input.requestKind !== "large" ||
+		input.inspection === null
+	) {
+		return null;
+	}
+
+	const now = input.now ?? Date.now();
+	let retryAt: number;
+	switch (input.inspection.detail.state) {
+		case "open":
+			retryAt = input.inspection.detail.nextProbeAt;
+			break;
+		case "probing":
+			retryAt = Math.max(
+				input.inspection.detail.nextProbeAt,
+				input.inspection.detail.leaseExpiresAt,
+			);
+			break;
+		case "recovering":
+			retryAt = input.inspection.detail.recoveringUntil;
+			break;
+		default:
+			return null;
+	}
+
+	return createAnthropicDegradedNoAccountDenial(
+		sanitizeAnthropicRetryAfterSeconds(
+			Math.max(0, retryAt - now) / 1_000,
+			now,
+			input.config,
+		),
 	);
 }
 
@@ -247,48 +380,80 @@ export async function handleProxy(
 	apiKeyId?: string | null,
 	apiKeyName?: string | null,
 ): Promise<Response> {
+	const telemetry: DegradedTelemetryHolder = { tracker: null };
 	const rescueRequestStartedAt = Date.now();
-	if (!isPotentialDownstreamAnthropicMessagesRequest(req, url)) {
-		return handleProxyCore(req, url, ctx, apiKeyId, apiKeyName);
+	try {
+		let response: Response;
+		if (!isPotentialDownstreamAnthropicMessagesRequest(req, url)) {
+			response = await handleProxyCore(
+				req,
+				url,
+				ctx,
+				apiKeyId,
+				apiKeyName,
+				undefined,
+				telemetry,
+			);
+		} else {
+			const activation = createAnthropicPreCommitRescueActivation();
+			const rescueConfig = getAnthropicPreCommitRescueConfig(req);
+			const routingAbortController = new AbortController();
+			const routingSignal = AbortSignal.any([
+				req.signal,
+				routingAbortController.signal,
+			]);
+			const routeContext = createAnthropicPreCommitRescueRouteContext({
+				activate: activation.activate,
+				signal: routingSignal,
+				requestStartedAt: rescueRequestStartedAt,
+				commitmentDeadlineMs: rescueConfig.commitmentDeadlineMs,
+			});
+			const routedResponse = handleProxyCore(
+				req,
+				url,
+				ctx,
+				apiKeyId,
+				apiKeyName,
+				routeContext,
+				telemetry,
+			);
+			const coordinatedResponse = await coordinateAnthropicPreCommitRescue({
+				response: routedResponse,
+				activation: activation.promise,
+				config: rescueConfig,
+				requestStartedAt: rescueRequestStartedAt,
+				commitmentDeadlineAt: routeContext.commitmentDeadlineAt,
+				onRescueTerminal: routeContext.reportTerminal,
+				onResponseAccepted: routeContext.releaseResponseLifecycle,
+				abortRouting(reason) {
+					if (!routingAbortController.signal.aborted) {
+						routingAbortController.abort(reason);
+					}
+				},
+			});
+			response = adaptAnthropicSsePingsForClaudeCode(
+				req,
+				url,
+				coordinatedResponse,
+			);
+		}
+		return telemetry.tracker
+			? trackDegradedResponseTerminal(response, telemetry.tracker)
+			: response;
+	} catch (error) {
+		try {
+			telemetry.tracker?.finish({
+				outcome: req.signal.aborted
+					? "cancelled"
+					: error instanceof DOMException && error.name === "TimeoutError"
+						? "timeout"
+						: "failure",
+			});
+		} catch {
+			// Telemetry never changes request failure authority.
+		}
+		throw error;
 	}
-
-	const activation = createAnthropicPreCommitRescueActivation();
-	const rescueConfig = getAnthropicPreCommitRescueConfig(req);
-	const routingAbortController = new AbortController();
-	const routingSignal = AbortSignal.any([
-		req.signal,
-		routingAbortController.signal,
-	]);
-	const routeContext = createAnthropicPreCommitRescueRouteContext({
-		activate: activation.activate,
-		signal: routingSignal,
-		requestStartedAt: rescueRequestStartedAt,
-		commitmentDeadlineMs: rescueConfig.commitmentDeadlineMs,
-	});
-	const routedResponse = handleProxyCore(
-		req,
-		url,
-		ctx,
-		apiKeyId,
-		apiKeyName,
-		routeContext,
-	);
-
-	const coordinatedResponse = await coordinateAnthropicPreCommitRescue({
-		response: routedResponse,
-		activation: activation.promise,
-		config: rescueConfig,
-		requestStartedAt: rescueRequestStartedAt,
-		commitmentDeadlineAt: routeContext.commitmentDeadlineAt,
-		onRescueTerminal: routeContext.reportTerminal,
-		onResponseAccepted: routeContext.releaseResponseLifecycle,
-		abortRouting(reason) {
-			if (!routingAbortController.signal.aborted) {
-				routingAbortController.abort(reason);
-			}
-		},
-	});
-	return adaptAnthropicSsePingsForClaudeCode(req, url, coordinatedResponse);
 }
 
 async function handleProxyCore(
@@ -298,6 +463,7 @@ async function handleProxyCore(
 	apiKeyId?: string | null,
 	apiKeyName?: string | null,
 	anthropicPreCommitRescue?: AnthropicPreCommitRescueRouteContext,
+	degradedTelemetry?: DegradedTelemetryHolder,
 ): Promise<Response> {
 	// Consume the private scheduler credential before any request inspection,
 	// metadata construction, logging, cache staging, or upstream forwarding.
@@ -367,7 +533,11 @@ async function handleProxyCore(
 	// Create the shared request identity before activating rescue so any outer
 	// terminal can join the same one-shot lifecycle as forwardToClient and local
 	// routing terminals, even if routing later rejects before producing a Response.
-	const requestMeta = createRequestMetadata(req, url);
+	const requestMeta = createRequestMetadata(
+		req,
+		url,
+		ctx.guardCorrelationVerifier,
+	);
 	requestMeta.trustedInternalAutoRefresh = trustedInternalAutoRefresh;
 	const routingAttemptLedger = new RoutingAttemptLedger();
 	activeAnthropicPreCommitRescue?.registerRequestLifecycle(
@@ -516,6 +686,103 @@ async function handleProxyCore(
 		if (!finalBodyBuffer) return undefined;
 		return new Response(finalBodyBuffer).body ?? undefined;
 	};
+	const finalParsedBody = finalRequestBodyContext.getParsedJson();
+	const potentialAnthropicCohortFacts =
+		derivePotentialAnthropicOAuthCohortFacts({
+			ctx,
+			url,
+			headers: req.headers,
+			body: finalRequestBodyContext,
+		});
+	const anthropicDegradedMode = ctx.anthropicDegradedMode;
+	const anthropicDegradedObservability = ctx.anthropicDegradedObservability;
+	const degradedTelemetryActive =
+		anthropicDegradedMode !== undefined &&
+		(anthropicDegradedMode.config.mode !== "off" ||
+			anthropicDegradedObservability?.detailsEnabled === true);
+	// Classification can invoke a comparatively expensive token estimator.
+	// Keep the entire degraded path inert unless the route is a native Anthropic
+	// Messages candidate and either mode or explicit diagnostics is active.
+	const anthropicReplayRisk =
+		potentialAnthropicCohortFacts !== null &&
+		anthropicDegradedMode !== undefined &&
+		degradedTelemetryActive
+			? classifyAnthropicReplayRisk({
+					body: finalBodyBuffer
+						? new Uint8Array(finalBodyBuffer)
+						: new Uint8Array(0),
+					estimateInputTokens: finalParsedBody
+						? () => estimateAnthropicAdmissionTokens(finalParsedBody)
+						: undefined,
+					config: anthropicDegradedMode.config,
+				})
+			: null;
+	let degradedTracker: DegradedModeRequestTracker | null = null;
+	if (
+		potentialAnthropicCohortFacts !== null &&
+		anthropicReplayRisk !== null &&
+		anthropicDegradedMode !== undefined &&
+		anthropicDegradedObservability !== undefined
+	) {
+		try {
+			degradedTracker = anthropicDegradedObservability.beginRequest({
+				correlationKey: requestMeta.id,
+				guardAttemptOrdinal: requestMeta.guardAttemptOrdinal,
+				replayRisk: anthropicReplayRisk.kind,
+				sizeBucket: degradedSizeBucket({
+					...anthropicReplayRisk,
+					tokenThreshold:
+						anthropicDegradedMode.config.largeRequestTokenThreshold,
+					byteThreshold: anthropicDegradedMode.config.largeRequestByteThreshold,
+				}),
+				estimatedInputTokens: anthropicReplayRisk.estimatedInputTokens,
+				bodyBytes: anthropicReplayRisk.bodyBytes,
+			});
+			routingAttemptLedger.attachDegradedTracker(
+				degradedTracker,
+				requestMeta.guardAttemptOrdinal,
+			);
+			if (degradedTelemetry) degradedTelemetry.tracker = degradedTracker;
+		} catch {
+			// Aggregate/detail instrumentation is never routing authority.
+		}
+	}
+	const anthropicDegradedInspection =
+		potentialAnthropicCohortFacts !== null &&
+		anthropicReplayRisk !== null &&
+		anthropicDegradedMode !== undefined
+			? anthropicDegradedMode.inspectRoute(potentialAnthropicCohortFacts)
+			: null;
+	const degradedOwnerSelection =
+		anthropicDegradedInspection && anthropicReplayRisk
+			? {
+					inspection: anthropicDegradedInspection,
+					requestKind: anthropicReplayRisk.kind,
+					onDecision: (
+						decision: NonNullable<RequestMeta["affinityOwnerDirective"]> | null,
+					): void => {
+						if (!degradedTracker || decision === null) return;
+						try {
+							degradedTracker.recordTransition({
+								subject: "owner",
+								from: "missing",
+								to: decision.kind === "retain-owner" ? "retained" : "missing",
+								reason:
+									decision.kind === "retain-owner"
+										? "owner_observed"
+										: "unknown",
+								cohortKey: anthropicDegradedInspection.cohortKey,
+								ownerKey:
+									decision.kind === "retain-owner"
+										? decision.owner.accountId
+										: null,
+							});
+						} catch {
+							// Owner simulation is already complete.
+						}
+					},
+				}
+			: undefined;
 
 	if (agentUsed && originalModel !== appliedModel) {
 		log.info(
@@ -594,7 +861,11 @@ async function handleProxyCore(
 					requestMeta,
 					ctx,
 					effectiveModel ?? undefined,
-					{ ...options, syntheticProbe },
+					{
+						...options,
+						syntheticProbe,
+						degradedOwner: degradedOwnerSelection,
+					},
 				),
 		});
 	const getRouteCircuitRecoveryHint = () =>
@@ -804,7 +1075,9 @@ async function handleProxyCore(
 				method: req.method,
 				path: url.pathname,
 				timestamp: requestMeta.timestamp,
-				requestHeaders: Object.fromEntries(req.headers.entries()),
+				requestHeaders: Object.fromEntries(
+					sanitizeRequestHeaders(req.headers).entries(),
+				),
 				requestBody: null,
 				project: project ?? null,
 				projectAttributionSource: projectAttributionSource ?? "none",
@@ -931,6 +1204,59 @@ async function handleProxyCore(
 			? "bypassed"
 			: "paced"
 		: null;
+	const requestedForcedAccountId = req.headers.get(
+		"x-better-ccflare-account-id",
+	);
+	const successfullyForceRouted =
+		requestedForcedAccountId !== null &&
+		requestedForcedAccountId.length > 0 &&
+		selectedAccounts.length === 1 &&
+		selectedAccounts[0]?.id === requestedForcedAccountId;
+	type LateBindableAnthropicDegradedSendState =
+		AnthropicDegradedRequestSendState & {
+			bindOwnerBeforeFirstProtectedSend(ownerAccountId: string): boolean;
+		};
+	const anthropicDegradedSendState:
+		| LateBindableAnthropicDegradedSendState
+		| undefined =
+		anthropicReplayRisk && anthropicDegradedMode
+			? (() => {
+					let admission = anthropicDegradedMode.createRequestAdmission({
+						cohortKey: anthropicDegradedInspection?.cohortKey ?? null,
+						risk: anthropicReplayRisk,
+						ownerAccountId:
+							requestMeta.affinityOwnerDirective?.kind === "retain-owner"
+								? requestMeta.affinityOwnerDirective.owner.accountId
+								: null,
+						forceRouted: successfullyForceRouted,
+					});
+					let ownerBound = Boolean(admission.input.ownerAccountId?.trim());
+					return {
+						get admission() {
+							return admission;
+						},
+						lifecycle: null,
+						tracker: degradedTracker,
+						bindOwnerBeforeFirstProtectedSend(ownerAccountId: string): boolean {
+							const normalizedOwnerAccountId = ownerAccountId.trim();
+							if (
+								anthropicDegradedMode.config.mode !== "enforce" ||
+								ownerBound ||
+								normalizedOwnerAccountId.length === 0 ||
+								admission.hasClaimedProtectedSend
+							) {
+								return false;
+							}
+							admission = anthropicDegradedMode.createRequestAdmission({
+								...admission.input,
+								ownerAccountId: normalizedOwnerAccountId,
+							});
+							ownerBound = true;
+							return true;
+						},
+					};
+				})()
+			: undefined;
 
 	// 7. Handle no accounts case
 	if (accounts.length === 0) {
@@ -966,6 +1292,34 @@ async function handleProxyCore(
 
 		// Check feature flag for backwards compatibility
 		if (process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL === "1") {
+			// An unauthenticated passthrough cannot supply independent account
+			// evidence and must never claim the protected cohort's recovery lease.
+			// Inspecting is deliberately non-mutating: protected large requests
+			// receive the same typed overload denial used by authenticated sends,
+			// while off-mode, closed, and small requests retain legacy passthrough.
+			const degradedDenial = anthropicDegradedMode
+				? getEmptyPoolAnthropicDegradedDenial({
+						inspection: anthropicDegradedInspection,
+						requestKind: anthropicReplayRisk?.kind ?? "small",
+						config: anthropicDegradedMode.config,
+					})
+				: null;
+			if (degradedDenial) {
+				try {
+					degradedTracker?.recordSuppression({
+						decision: "suppressed",
+						reason: "owner_missing",
+						cohortKey: anthropicDegradedInspection?.cohortKey,
+					});
+					degradedTracker?.finish({ outcome: "suppressed" });
+				} catch {
+					// Local overload response remains authoritative.
+				}
+				return finishPacing(
+					pacingSlot,
+					createAnthropicDegradedDenialResponse(degradedDenial),
+				);
+			}
 			log.warn(ERROR_MESSAGES.NO_ACCOUNTS);
 			return finishPacing(
 				pacingSlot,
@@ -979,6 +1333,7 @@ async function handleProxyCore(
 					apiKeyId,
 					apiKeyName,
 					activeAnthropicPreCommitRescue,
+					routingAttemptLedger,
 				),
 			);
 		}
@@ -1057,7 +1412,7 @@ async function handleProxyCore(
 				),
 			}
 		: null;
-	let response: Response | null = null;
+	let response: ProxyWithAccountResult = null;
 	let upstreamAttempts = 0;
 	// Every candidate probe-gate-suppressed and skipped via `continue` below
 	// means the loop never actually attempted an account; the post-loop
@@ -1172,6 +1527,36 @@ async function handleProxyCore(
 				// a failed fallback body's transport cleanup.
 			});
 		return retainedTerminalResponse;
+	};
+	const deliverAnthropicDegradedDenial = async (
+		denial: AnthropicDegradedSendDenied,
+	): Promise<Response> => {
+		try {
+			degradedTracker?.finish({ outcome: "suppressed" });
+		} catch {
+			// The typed denial already owns the terminal response.
+		}
+		if (denial.retainedTrustedResponse) {
+			return createProtectedAnthropicOverloadResponse({
+				kind: "trusted_upstream",
+				response: denial.retainedTrustedResponse,
+				retryAfter: denial.decision.retryAfterSeconds,
+			});
+		}
+		const retainedTerminalResponse = await deliverRetainedTerminalResponse();
+		if (retainedTerminalResponse?.status === 529) {
+			return createProtectedAnthropicOverloadResponse({
+				kind: "trusted_upstream",
+				response: retainedTerminalResponse,
+				retryAfter:
+					retainedTerminalResponse.headers.get("retry-after") ??
+					denial.decision.retryAfterSeconds,
+			});
+		}
+		if (retainedTerminalResponse) {
+			await discardUpstreamBody(retainedTerminalResponse);
+		}
+		return createAnthropicDegradedDenialResponse(denial);
 	};
 	const reactiveDepletionSkips: Account[] = [];
 	const betaSignature = req.headers.get("anthropic-beta");
@@ -1288,6 +1673,7 @@ async function handleProxyCore(
 					// override is attributed there either.
 					modelOverride ? effectiveModel : null,
 				),
+				anthropicDegradedSendState,
 			);
 		} catch (error) {
 			await routingAttemptLedger.discardTerminalResponse();
@@ -1299,6 +1685,17 @@ async function handleProxyCore(
 		}
 		upstreamAttempts += routingAttemptLedger.attemptedCount - attemptedBefore;
 
+		if (isAnthropicDegradedSendDenied(response)) {
+			try {
+				degradedTracker?.finish({ outcome: "suppressed" });
+			} catch {
+				// The typed denial already owns the terminal response.
+			}
+			return finishPacing(
+				pacingSlot,
+				await deliverAnthropicDegradedDenial(response),
+			);
+		}
 		if (response) {
 			response = await settleRoutedResponse(response);
 			recordCachePacingRoute(
@@ -1385,6 +1782,7 @@ async function handleProxyCore(
 					// and from the model-routing drift alert.
 					modelOverride ? effectiveModel : null,
 				),
+				anthropicDegradedSendState,
 			);
 		} catch (error) {
 			await routingAttemptLedger.discardTerminalResponse();
@@ -1392,6 +1790,12 @@ async function handleProxyCore(
 		}
 		upstreamAttempts += routingAttemptLedger.attemptedCount - attemptedBefore;
 
+		if (isAnthropicDegradedSendDenied(response)) {
+			return finishPacing(
+				pacingSlot,
+				await deliverAnthropicDegradedDenial(response),
+			);
+		}
 		if (response) {
 			response = await settleRoutedResponse(response);
 			recordCachePacingRoute(
@@ -1465,6 +1869,17 @@ async function handleProxyCore(
 			}
 			await routingAttemptLedger.discardTerminalResponse();
 			throw error;
+		}
+		// The explicit post-combo selection is the only strategy pass that runs
+		// after request admission is created. A combo without a native Anthropic
+		// OAuth candidate cannot materialize an affinity owner, but normal fallback
+		// may discover a retained owner. Bind that owner before the first protected
+		// fallback send; once a protected send is claimed, the admission (and its
+		// permit fencing) remains immutable.
+		if (requestMeta.affinityOwnerDirective?.kind === "retain-owner") {
+			anthropicDegradedSendState?.bindOwnerBeforeFirstProtectedSend(
+				requestMeta.affinityOwnerDirective.owner.accountId,
+			);
 		}
 		const fallbackSelection = applyUsageThrottling(selectedFallbackAccounts);
 		const filteredFallbackAccounts = fallbackSelection.available;
@@ -1553,6 +1968,7 @@ async function handleProxyCore(
 							isFinalFallbackCandidate,
 							isFinalFallbackCandidate,
 						),
+						anthropicDegradedSendState,
 					);
 				} catch (error) {
 					await routingAttemptLedger.discardTerminalResponse();
@@ -1565,6 +1981,12 @@ async function handleProxyCore(
 				upstreamAttempts +=
 					routingAttemptLedger.attemptedCount - attemptedBefore;
 
+				if (isAnthropicDegradedSendDenied(response)) {
+					return finishPacing(
+						pacingSlot,
+						await deliverAnthropicDegradedDenial(response),
+					);
+				}
 				if (response) {
 					response = await settleRoutedResponse(response);
 					recordCachePacingRoute(
@@ -1626,6 +2048,7 @@ async function handleProxyCore(
 							isFinalFallbackCandidate,
 							true,
 						),
+						anthropicDegradedSendState,
 					);
 				} catch (error) {
 					await routingAttemptLedger.discardTerminalResponse();
@@ -1634,6 +2057,12 @@ async function handleProxyCore(
 				upstreamAttempts +=
 					routingAttemptLedger.attemptedCount - attemptedBefore;
 
+				if (isAnthropicDegradedSendDenied(response)) {
+					return finishPacing(
+						pacingSlot,
+						await deliverAnthropicDegradedDenial(response),
+					);
+				}
 				if (response) {
 					response = await settleRoutedResponse(response);
 					recordCachePacingRoute(
@@ -1768,6 +2197,7 @@ async function handleProxyCore(
 							i === orderedDeferredModelRoutes.length - 1,
 						anthropicPreCommitRescue: activeAnthropicPreCommitRescue,
 					},
+					anthropicDegradedSendState,
 				);
 			} catch (error) {
 				await routingAttemptLedger.discardTerminalResponse();
@@ -1779,6 +2209,12 @@ async function handleProxyCore(
 			}
 			upstreamAttempts += routingAttemptLedger.attemptedCount - attemptedBefore;
 
+			if (isAnthropicDegradedSendDenied(response)) {
+				return finishPacing(
+					pacingSlot,
+					await deliverAnthropicDegradedDenial(response),
+				);
+			}
 			if (response) {
 				response = await settleRoutedResponse(response);
 				recordCachePacingRoute(

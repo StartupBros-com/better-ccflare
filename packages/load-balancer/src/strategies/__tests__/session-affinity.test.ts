@@ -140,6 +140,168 @@ describe("SessionAffinityStrategy", () => {
 		expect((await strategy.select(accounts, opusMeta))[0].id).toBe(opusOwner);
 	});
 
+	describe("authoritative owner directives", () => {
+		it("captures candidate and backing account without mutating selection", async () => {
+			const shared = makeAccount({ id: "shared" });
+			const laneMeta = {
+				...metaFor("snapshot-client"),
+				affinityLaneKey: "snapshot-client:anthropic:opus",
+				routingCandidates: [
+					{
+						candidateId: "combo:test:slot:owner",
+						accountId: "shared",
+						tier: 0,
+						ordinal: 0,
+						comboSlotId: "slot-owner",
+						modelOverride: "claude-opus-4-8",
+						quotaPressure: null,
+					},
+				],
+			} as RequestMeta;
+
+			await strategy.select([shared], laneMeta);
+			expect(strategy.snapshotAffinityOwner(laneMeta)).toEqual({
+				candidateId: "combo:test:slot:owner",
+				accountId: "shared",
+			});
+			expect((await strategy.select([shared], laneMeta))[0]?.id).toBe("shared");
+		});
+
+		it("keeps an unavailable equal-tier owner authoritative for snapback", async () => {
+			const owner = makeAccount({ id: "owner", priority: 0 });
+			const fallback = makeAccount({ id: "fallback", priority: 0 });
+			const laneMeta = {
+				...metaFor("retained-client"),
+				affinityLaneKey: "retained-client:anthropic:opus",
+			} as RequestMeta;
+			await strategy.select([owner, fallback], laneMeta);
+			const snapshot = strategy.snapshotAffinityOwner(laneMeta);
+			expect(snapshot).toEqual({
+				candidateId: "account:owner",
+				accountId: "owner",
+			});
+
+			const ownerDown = makeAccount({
+				id: owner.id,
+				priority: owner.priority,
+				rate_limited_until: Date.now() + 60_000,
+			});
+			const degradedMeta = {
+				...laneMeta,
+				affinityOwnerDirective: {
+					kind: "retain-owner",
+					owner: snapshot,
+				},
+			} as RequestMeta;
+			expect(
+				(await strategy.select([ownerDown, fallback], degradedMeta))[0]?.id,
+			).toBe("fallback");
+			expect(strategy.snapshotAffinityOwner(laneMeta)).toEqual(snapshot);
+			expect(
+				(await strategy.select([owner, fallback], degradedMeta))[0]?.id,
+			).toBe("owner");
+		});
+
+		it("lets hard-invalid owners use current reassignment behavior", async () => {
+			const owner = makeAccount({ id: "owner", priority: 0 });
+			const fallback = makeAccount({ id: "fallback", priority: 0 });
+			const laneMeta = {
+				...metaFor("invalid-owner-client"),
+				affinityLaneKey: "invalid-owner-client:anthropic:opus",
+			} as RequestMeta;
+			await strategy.select([owner, fallback], laneMeta);
+			const snapshot = strategy.snapshotAffinityOwner(laneMeta);
+			const invalidMeta = {
+				...laneMeta,
+				hardExcludedAccountIds: new Set([owner.id]),
+				affinityOwnerDirective: {
+					kind: "retain-owner",
+					owner: snapshot,
+				},
+			} as RequestMeta;
+
+			expect(
+				(await strategy.select([owner, fallback], invalidMeta))[0]?.id,
+			).toBe("fallback");
+			expect(strategy.snapshotAffinityOwner(laneMeta)).toEqual({
+				candidateId: "account:fallback",
+				accountId: "fallback",
+			});
+		});
+
+		it("defers ownerless affinity until an explicit terminal-success commit", async () => {
+			const accounts = [
+				makeAccount({ id: "selected" }),
+				makeAccount({ id: "other" }),
+			];
+			const laneMeta = {
+				...metaFor("ownerless-client"),
+				affinityLaneKey: "ownerless-client:anthropic:opus",
+				affinityOwnerDirective: {
+					kind: "defer-owner-assignment",
+				},
+			} as RequestMeta;
+
+			const selected = (await strategy.select(accounts, laneMeta))[0];
+			expect(selected?.id).toBe("selected");
+			expect(strategy.snapshotAffinityOwner(laneMeta)).toBeNull();
+			expect(
+				strategy.commitAffinityOwner(laneMeta, {
+					candidateId: "account:selected",
+					accountId: "selected",
+				}),
+			).toBe(true);
+			expect(strategy.snapshotAffinityOwner(laneMeta)).toEqual({
+				candidateId: "account:selected",
+				accountId: "selected",
+			});
+		});
+
+		it("leases an equal-tier half-open owner probe ahead of a healthy fallback", async () => {
+			let now = 1_000;
+			const clocked = new SessionAffinityStrategy(
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				() => now,
+			);
+			clocked.initialize(store);
+			const owner = makeAccount({ id: "owner", priority: 0 });
+			const fallback = makeAccount({ id: "fallback", priority: 0 });
+			const laneMeta = {
+				...metaFor("owner-probe-client"),
+				affinityLaneKey: "owner-probe-client:anthropic:opus",
+			} as RequestMeta;
+			await clocked.select([owner, fallback], laneMeta);
+			const snapshot = clocked.snapshotAffinityOwner(laneMeta);
+			clocked.reportCandidateFailure(laneMeta, {
+				candidateId: "account:owner",
+				reason: "overloaded",
+				suppressForMs: 100,
+			});
+			const retainedMeta = {
+				...laneMeta,
+				affinityOwnerDirective: {
+					kind: "retain-owner",
+					owner: snapshot,
+				},
+			} as RequestMeta;
+
+			expect(
+				(await clocked.select([owner, fallback], retainedMeta)).map(
+					(account) => account.id,
+				),
+			).toEqual(["fallback"]);
+			now += 100;
+			expect(
+				(await clocked.select([owner, fallback], { ...retainedMeta })).map(
+					(account) => account.id,
+				),
+			).toEqual(["owner", "fallback"]);
+		});
+	});
+
 	describe("lane-scoped candidate failure suppression", () => {
 		it("leases two all-open account routes on sequential independent selects", async () => {
 			const primary = makeAccount({ id: "primary", priority: 0 });

@@ -1,9 +1,13 @@
 import crypto from "node:crypto";
 import { TIME_CONSTANTS, ValidationError } from "@better-ccflare/core";
+import {
+	GUARD_CORRELATION_SECRET_HEADER,
+	GUARD_REQUEST_ID_HEADER,
+} from "@better-ccflare/http-common";
 import type { Provider } from "@better-ccflare/providers";
 import type { RequestMeta } from "@better-ccflare/types";
 import { chatGptCloudflareCookieJar } from "../chatgpt-cloudflare-cookies";
-import { getGuardRequestId } from "./internal-transport-headers";
+import type { GuardCorrelationVerifier } from "./guard-correlation-auth";
 import { ERROR_MESSAGES, INTERNAL_PROBE_SECRET_HEADER } from "./proxy-types";
 
 /**
@@ -16,6 +20,8 @@ function stripInternalControlHeaders(headers: Headers): void {
 	headers.delete(INTERNAL_PROBE_SECRET_HEADER);
 	headers.delete("x-better-ccflare-auto-refresh");
 	headers.delete("x-better-ccflare-keepalive");
+	headers.delete(GUARD_REQUEST_ID_HEADER);
+	headers.delete(GUARD_CORRELATION_SECRET_HEADER);
 }
 
 /**
@@ -24,9 +30,15 @@ function stripInternalControlHeaders(headers: Headers): void {
  * @param url - The parsed URL
  * @returns Request metadata object
  */
-export function createRequestMetadata(req: Request, url: URL): RequestMeta {
+export function createRequestMetadata(
+	req: Request,
+	url: URL,
+	verifyGuardCorrelation?: GuardCorrelationVerifier,
+): RequestMeta {
+	const guardCorrelation = verifyGuardCorrelation?.(req.headers);
 	return {
-		id: getGuardRequestId(req.headers) ?? crypto.randomUUID(),
+		id: guardCorrelation?.requestId ?? crypto.randomUUID(),
+		guardAttemptOrdinal: guardCorrelation?.attemptOrdinal,
 		method: req.method,
 		path: url.pathname,
 		timestamp: Date.now(),

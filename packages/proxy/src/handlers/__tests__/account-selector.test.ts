@@ -1,5 +1,4 @@
 import { afterEach, describe, expect, it, mock } from "bun:test";
-import { usageCache } from "@better-ccflare/providers";
 import type {
 	Account,
 	ComboFamily,
@@ -7,8 +6,25 @@ import type {
 	ComboWithSlots,
 	RequestMeta,
 } from "@better-ccflare/types";
+import type {
+	AnthropicDegradedCohortKey,
+	AnthropicDegradedRouteInspection,
+} from "../../anthropic-degraded-mode";
 import { CacheAffinityOrderer } from "../../cache-affinity-orderer";
-import {
+import { DegradedOwnerOverlay } from "../../degraded-owner-overlay";
+import type { ProxyContext } from "../proxy-types";
+
+// Focused source-worktree tests do not have the ignored CLI-embedded database
+// workers. Keep account selection tests independent of those packaged artifacts.
+mock.module("@better-ccflare/database", () => ({
+	AsyncDbWriter: class AsyncDbWriter {},
+	DatabaseFactory: class DatabaseFactory {},
+	DatabaseOperations: class DatabaseOperations {},
+	ModelTranslationRepository: class ModelTranslationRepository {},
+}));
+
+const { usageCache } = await import("@better-ccflare/providers");
+const {
 	ForceRouteUnavailableError,
 	getComboSlotInfo,
 	getReactiveModelCapacityBlocker,
@@ -16,8 +32,7 @@ import {
 	resolveEffectiveModel,
 	selectAccountsForRequest,
 	setComboSlotInfo,
-} from "../account-selector";
-import type { ProxyContext } from "../proxy-types";
+} = await import("../account-selector");
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
@@ -165,6 +180,298 @@ describe("setComboSlotInfo / getComboSlotInfo", () => {
 			slots: [{ accountId: "a", modelOverride: "m" }],
 		});
 		expect(getComboSlotInfo(meta2)).toBeNull();
+	});
+});
+
+describe("selectAccountsForRequest — authoritative owner capture", () => {
+	const cohortKey = "cohort-owner-test" as AnthropicDegradedCohortKey;
+	const inspection: AnthropicDegradedRouteInspection = {
+		cohortKey,
+		state: "open",
+		detail: { state: "open", nextProbeAt: 0 },
+	};
+
+	it("captures once and materializes retention before mutating select", async () => {
+		const owner = makeAccount({ id: "owner" });
+		const fallback = makeAccount({ id: "fallback" });
+		const snapshot = {
+			candidateId: "account:owner",
+			accountId: "owner",
+		};
+		const capture = mock((_meta: RequestMeta) => snapshot);
+		const select = mock((accounts: Account[], meta: RequestMeta) => {
+			expect(meta.affinityOwnerSnapshot).toEqual(snapshot);
+			expect(meta.affinityOwnerDirective).toEqual({
+				kind: "retain-owner",
+				owner: snapshot,
+			});
+			return accounts;
+		});
+		const ctx = makeCtx({ accounts: [owner, fallback] });
+		ctx.strategy = {
+			select,
+			snapshotAffinityOwner: capture,
+		} as unknown as ProxyContext["strategy"];
+		ctx.degradedOwnerOverlay = new DegradedOwnerOverlay();
+		ctx.anthropicDegradedMode = {
+			config: { mode: "enforce" },
+		} as ProxyContext["anthropicDegradedMode"];
+		const meta = makeRequestMeta({
+			clientSessionId: "capture-once-client",
+		});
+
+		await selectAccountsForRequest(meta, ctx, "claude-opus-4-8", {
+			degradedOwner: { inspection, requestKind: "large" },
+		});
+		await selectAccountsForRequest(meta, ctx, "claude-opus-4-8", {
+			degradedOwner: { inspection, requestKind: "large" },
+		});
+
+		expect(capture).toHaveBeenCalledTimes(1);
+		expect(select).toHaveBeenCalledTimes(2);
+	});
+
+	it("materializes defer-owner-assignment for a protected ownerless request", async () => {
+		const account = makeAccount({ id: "selected" });
+		const select = mock((accounts: Account[], meta: RequestMeta) => {
+			expect(meta.affinityOwnerSnapshot).toBeNull();
+			expect(meta.affinityOwnerDirective).toEqual({
+				kind: "defer-owner-assignment",
+			});
+			return accounts;
+		});
+		const ctx = makeCtx({ accounts: [account] });
+		ctx.strategy = {
+			select,
+			snapshotAffinityOwner: mock(() => null),
+		} as unknown as ProxyContext["strategy"];
+		ctx.degradedOwnerOverlay = new DegradedOwnerOverlay();
+		ctx.anthropicDegradedMode = {
+			config: { mode: "enforce" },
+		} as ProxyContext["anthropicDegradedMode"];
+
+		await selectAccountsForRequest(
+			makeRequestMeta({ clientSessionId: "ownerless-client" }),
+			ctx,
+			"claude-opus-4-8",
+			{ degradedOwner: { inspection, requestKind: "large" } },
+		);
+		expect(select).toHaveBeenCalledTimes(1);
+	});
+
+	it("drops a retained directive when the captured owner is paused", async () => {
+		const pausedOwner = makeAccount({ id: "owner", paused: true });
+		const fallback = makeAccount({ id: "fallback" });
+		const snapshot = {
+			candidateId: "account:owner",
+			accountId: "owner",
+		};
+		const select = mock((accounts: Account[], meta: RequestMeta) => {
+			expect(meta.affinityOwnerDirective).toBeNull();
+			return accounts;
+		});
+		const ctx = makeCtx({ accounts: [pausedOwner, fallback] });
+		ctx.strategy = {
+			select,
+			snapshotAffinityOwner: mock(() => snapshot),
+		} as unknown as ProxyContext["strategy"];
+		ctx.degradedOwnerOverlay = new DegradedOwnerOverlay();
+		ctx.anthropicDegradedMode = {
+			config: { mode: "enforce" },
+		} as ProxyContext["anthropicDegradedMode"];
+
+		await selectAccountsForRequest(
+			makeRequestMeta({ clientSessionId: "invalid-owner-client" }),
+			ctx,
+			"claude-opus-4-8",
+			{ degradedOwner: { inspection, requestKind: "large" } },
+		);
+		expect(select).toHaveBeenCalledTimes(1);
+		expect(ctx.degradedOwnerOverlay.size).toBe(0);
+	});
+
+	for (const [label, overrides] of [
+		[
+			"Anthropic API-key",
+			{
+				provider: "anthropic",
+				api_key: "api-key",
+				refresh_token: "",
+				access_token: null,
+			},
+		],
+		[
+			"Anthropic access-token-only",
+			{
+				provider: "anthropic",
+				api_key: null,
+				refresh_token: "",
+				access_token: "access-token",
+			},
+		],
+		[
+			"Codex OAuth",
+			{
+				provider: "codex",
+				api_key: null,
+				refresh_token: "codex-refresh",
+				access_token: "codex-access",
+			},
+		],
+		[
+			"Anthropic-compatible",
+			{
+				provider: "anthropic-compatible",
+				api_key: "compatible-key",
+				refresh_token: "",
+				access_token: null,
+			},
+		],
+	] as const) {
+		it(`leaves ${label} owner selection unchanged without consulting affinity ownership`, async () => {
+			const account = makeAccount({ id: "owner", ...overrides });
+			const snapshot = {
+				candidateId: "account:owner",
+				accountId: "owner",
+			};
+			const snapshotAffinityOwner = mock(() => snapshot);
+			const select = mock((accounts: Account[], meta: RequestMeta) => {
+				expect(meta.affinityOwnerDirective).toBeNull();
+				return accounts;
+			});
+			const ctx = makeCtx({ accounts: [account] });
+			ctx.strategy = {
+				select,
+				snapshotAffinityOwner,
+			} as unknown as ProxyContext["strategy"];
+			ctx.degradedOwnerOverlay = new DegradedOwnerOverlay();
+			ctx.anthropicDegradedMode = {
+				config: { mode: "enforce" },
+			} as ProxyContext["anthropicDegradedMode"];
+			const meta = makeRequestMeta({
+				clientSessionId: `unrelated-${label}`,
+			});
+
+			const selected = await selectAccountsForRequest(
+				meta,
+				ctx,
+				"claude-opus-4-8",
+				{ degradedOwner: { inspection, requestKind: "large" } },
+			);
+
+			expect(selected).toEqual([account]);
+			expect(meta.affinityOwnerSnapshot).toBeUndefined();
+			expect(snapshotAffinityOwner).not.toHaveBeenCalled();
+			expect(ctx.degradedOwnerOverlay.size).toBe(0);
+		});
+	}
+
+	it("does not defer ownerless selection when its current route is not native Anthropic OAuth", async () => {
+		const account = makeAccount({
+			id: "codex-current",
+			provider: "codex",
+			api_key: null,
+			refresh_token: "codex-refresh",
+		});
+		const select = mock((accounts: Account[], meta: RequestMeta) => {
+			expect(meta.affinityOwnerDirective).toBeNull();
+			return accounts;
+		});
+		const ctx = makeCtx({ accounts: [account] });
+		ctx.strategy = {
+			select,
+			snapshotAffinityOwner: mock(() => null),
+		} as unknown as ProxyContext["strategy"];
+		ctx.degradedOwnerOverlay = new DegradedOwnerOverlay();
+		ctx.anthropicDegradedMode = {
+			config: { mode: "enforce" },
+		} as ProxyContext["anthropicDegradedMode"];
+
+		const selected = await selectAccountsForRequest(
+			makeRequestMeta({ clientSessionId: "ownerless-codex" }),
+			ctx,
+			"claude-opus-4-8",
+			{ degradedOwner: { inspection, requestKind: "large" } },
+		);
+		expect(selected).toEqual([account]);
+	});
+
+	it("simulates the enforce owner decision in observe mode without mutating routing or the real overlay", async () => {
+		const owner = makeAccount({ id: "owner" });
+		const fallback = makeAccount({ id: "fallback" });
+		const snapshot = {
+			candidateId: "account:owner",
+			accountId: "owner",
+		};
+		const enforceCtx = makeCtx({ accounts: [owner, fallback] });
+		enforceCtx.strategy = {
+			select: mock((accounts: Account[]) => accounts),
+			snapshotAffinityOwner: mock(() => snapshot),
+		} as unknown as ProxyContext["strategy"];
+		enforceCtx.degradedOwnerOverlay = new DegradedOwnerOverlay();
+		enforceCtx.degradedOwnerShadowOverlay = new DegradedOwnerOverlay();
+		enforceCtx.anthropicDegradedMode = {
+			config: { mode: "enforce" },
+		} as ProxyContext["anthropicDegradedMode"];
+		const enforceMeta = makeRequestMeta({ clientSessionId: "owner-client" });
+		let enforceDecision: unknown;
+		const enforceSelected = await selectAccountsForRequest(
+			enforceMeta,
+			enforceCtx,
+			"claude-opus-4-8",
+			{
+				degradedOwner: {
+					inspection,
+					requestKind: "large",
+					onDecision: (decision) => {
+						enforceDecision = decision;
+					},
+				},
+			},
+		);
+
+		const observeCtx = makeCtx({ accounts: [owner, fallback] });
+		const baselineOrder = [fallback, owner];
+		observeCtx.strategy = {
+			select: mock(() => baselineOrder),
+			snapshotAffinityOwner: mock(() => snapshot),
+		} as unknown as ProxyContext["strategy"];
+		observeCtx.degradedOwnerOverlay = new DegradedOwnerOverlay();
+		observeCtx.degradedOwnerShadowOverlay = new DegradedOwnerOverlay();
+		observeCtx.anthropicDegradedMode = {
+			config: { mode: "observe" },
+		} as ProxyContext["anthropicDegradedMode"];
+		const observeMeta = makeRequestMeta({ clientSessionId: "owner-client" });
+		let observeDecision: unknown;
+		const observeSelected = await selectAccountsForRequest(
+			observeMeta,
+			observeCtx,
+			"claude-opus-4-8",
+			{
+				degradedOwner: {
+					inspection,
+					requestKind: "large",
+					onDecision: (decision) => {
+						observeDecision = decision;
+					},
+				},
+			},
+		);
+
+		expect(enforceDecision).toEqual({
+			kind: "retain-owner",
+			owner: snapshot,
+		});
+		expect(observeDecision).toEqual(enforceDecision);
+		expect(enforceMeta.affinityOwnerDirective).toEqual(enforceDecision);
+		expect(observeMeta.affinityOwnerDirective).toBeNull();
+		expect(enforceSelected).toEqual([owner, fallback]);
+		expect(observeSelected).toEqual(baselineOrder);
+		expect(observeCtx.degradedOwnerOverlay.size).toBe(0);
+		expect(observeCtx.degradedOwnerShadowOverlay.size).toBe(1);
+
+		const restarted = new DegradedOwnerOverlay();
+		expect(restarted.size).toBe(0);
 	});
 });
 

@@ -5,11 +5,23 @@ import type {
 } from "@better-ccflare/database";
 import type { Provider } from "@better-ccflare/providers";
 import type { LoadBalancingStrategy } from "@better-ccflare/types";
+import type { AnthropicDegradedModeCoordinator } from "../anthropic-degraded-mode";
+import type { DegradedModeObservability } from "../anthropic-degraded-observability";
 import type { CacheAffinityOrderer } from "../cache-affinity-orderer";
+import type { DegradedOwnerOverlay } from "../degraded-owner-overlay";
+import type { GuardCorrelationVerifier } from "./guard-correlation-auth";
 
 export interface ProxyContext {
 	strategy: LoadBalancingStrategy;
 	cacheAffinityOrderer?: CacheAffinityOrderer;
+	/** One restart-scoped coordinator shared by every request in this server. */
+	anthropicDegradedMode: AnthropicDegradedModeCoordinator;
+	/** Process-local aggregate counters plus default-off detailed diagnostics. */
+	anthropicDegradedObservability: DegradedModeObservability;
+	/** Bounded owner continuity state colocated with the coordinator. */
+	degradedOwnerOverlay: DegradedOwnerOverlay;
+	/** Observe-only owner simulation; never read by enforcement. */
+	degradedOwnerShadowOverlay: DegradedOwnerOverlay;
 	dbOps: DatabaseOperations;
 	runtime: RuntimeConfig;
 	config: Config;
@@ -17,6 +29,8 @@ export interface ProxyContext {
 	refreshInFlight: Map<string, Promise<string>>;
 	asyncWriter: AsyncDbWriter;
 	internalProbeSecret?: string;
+	/** Verifies guard correlation without exposing the env-only credential. */
+	guardCorrelationVerifier?: GuardCorrelationVerifier;
 }
 
 /** Error messages used throughout the proxy module */

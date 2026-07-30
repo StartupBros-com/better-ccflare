@@ -42,10 +42,16 @@ mock.module("@better-ccflare/proxy", () => {
 		stop() {}
 	}
 	return {
+		AnthropicDegradedModeCoordinator: class {},
 		AutoRefreshScheduler: Scheduler,
 		CacheAffinityOrderer: class {},
 		CacheKeepaliveScheduler: Scheduler,
 		clearAccountRefreshCache: () => {},
+		createAnthropicDegradedDetailedEventSink: () => undefined,
+		createAnthropicDegradedRuntimeHealth: () => ({}),
+		createGuardCorrelationVerifier: () => undefined,
+		DegradedModeObservability: class {},
+		DegradedOwnerOverlay: class {},
 		drainUsageCollector: async () => {},
 		getModelCatalog: () => null,
 		getUsageCollectorHealth: () => null,

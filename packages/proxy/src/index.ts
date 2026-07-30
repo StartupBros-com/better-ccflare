@@ -9,6 +9,47 @@ export {
 	listProviders,
 	registerProvider,
 } from "@better-ccflare/providers";
+export {
+	type AnthropicDegradedAdmissionDecision,
+	type AnthropicDegradedCohortFacts,
+	type AnthropicDegradedCohortKey,
+	type AnthropicDegradedCohortStateSnapshot,
+	AnthropicDegradedModeCoordinator,
+	type AnthropicDegradedModeCoordinatorOptions,
+	type AnthropicDegradedModeSnapshot,
+	type AnthropicDegradedObservationResult,
+	type AnthropicDegradedOutcome,
+	type AnthropicDegradedOutcomeObservation,
+	type AnthropicDegradedPermit,
+	type AnthropicDegradedPermitOutcome,
+	type AnthropicDegradedProtectionState,
+	AnthropicDegradedRequestAdmission,
+	type AnthropicDegradedRequestAdmissionInput,
+	type AnthropicDegradedRouteInspection,
+	type AnthropicReplayRisk,
+	type AnthropicReplayRiskInput,
+	type AnthropicReplayRiskReason,
+	type AnthropicRequestProtocol,
+	type AnthropicTrustedOverloadObservation,
+	buildAnthropicDegradedCohortKey,
+	classifyAnthropicReplayRisk,
+	sanitizeAnthropicRetryAfterSeconds,
+} from "./anthropic-degraded-mode";
+export {
+	type DegradedModeAggregateCounter,
+	type DegradedModeDetailedEventSink,
+	type DegradedModeDiagnosticEvent,
+	DegradedModeObservability,
+	type DegradedModeObservabilityOptions,
+	type DegradedModeObservabilitySnapshot,
+	type DegradedModeRequestTracker,
+} from "./anthropic-degraded-observability";
+export {
+	type AnthropicDegradedRuntimeHealthInput,
+	createAnthropicDegradedDetailedEventSink,
+	createAnthropicDegradedRuntimeHealth,
+	trackDegradedResponseTerminal,
+} from "./anthropic-degraded-runtime";
 export { AutoRefreshScheduler } from "./auto-refresh-scheduler";
 export { CacheAffinityOrderer } from "./cache-affinity-orderer";
 export { handleCacheDiagnosisRequest } from "./cache-diagnosis";
@@ -26,12 +67,20 @@ export {
 	readCodexPacingBypassPercent,
 } from "./cache-pacing";
 export {
+	type DegradedOwnerDirectiveInput,
+	type DegradedOwnerEvidenceInput,
+	DegradedOwnerOverlay,
+	type DegradedOwnerOverlayOptions,
+} from "./degraded-owner-overlay";
+export {
 	type CodexUsageRefreshOutcome,
 	checkAllAccountsHealth,
 	checkRefreshTokenHealth,
 	clearAccountRefreshCache,
+	createGuardCorrelationVerifier,
 	createUsageThrottledResponse,
 	formatTokenHealthReport,
+	type GuardCorrelationVerifier,
 	getAccountsNeedingReauth,
 	getUsageThrottleStatus,
 	getUsageThrottleUntil,

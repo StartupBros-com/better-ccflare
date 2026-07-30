@@ -1,3 +1,8 @@
+import type {
+	DegradedModePhysicalAttemptKind,
+	DegradedModeRequestTracker,
+} from "../anthropic-degraded-observability";
+
 function normalizeConcreteModel(
 	model: string | null | undefined,
 ): string | null {
@@ -21,6 +26,13 @@ export interface RetainedTerminalResponse {
 	discard(): Promise<void>;
 }
 
+export interface PhysicalAttemptTelemetryInput {
+	readonly accountId?: string | null;
+	readonly candidateId?: string | null;
+	readonly laneKey?: string | null;
+	readonly recoveryProbe?: boolean;
+}
+
 /**
  * Request-local ledger of concrete upstream route candidates. It deliberately
  * lives above combo and normal fallback loops so the same account/model pair is
@@ -30,10 +42,76 @@ export interface RetainedTerminalResponse {
 export class RoutingAttemptLedger {
 	private readonly attempted = new Set<string>();
 	private readonly blockedAccounts = new Set<string>();
+	private physicalAttempts = 0;
+	private degradedTracker: DegradedModeRequestTracker | null = null;
+	private guardAttemptOrdinal: number | undefined;
+	private lastPhysicalAccountId: string | null | undefined;
 	private retainedTerminalResponse: RetainedTerminalResponse | null = null;
 
 	get attemptedCount(): number {
 		return this.attempted.size;
+	}
+
+	/** Number of actual provider transports, including in-place retries. */
+	get physicalAttemptCount(): number {
+		return this.physicalAttempts;
+	}
+
+	/**
+	 * Record one actual provider transport and return its request-local,
+	 * one-based ordinal. This is deliberately independent of unique route
+	 * claims: retries can increase this count without changing attemptedCount.
+	 */
+	attachDegradedTracker(
+		tracker: DegradedModeRequestTracker,
+		guardAttemptOrdinal?: number,
+	): void {
+		this.degradedTracker = tracker;
+		this.guardAttemptOrdinal =
+			Number.isSafeInteger(guardAttemptOrdinal) &&
+			(guardAttemptOrdinal ?? 0) > 0
+				? guardAttemptOrdinal
+				: undefined;
+	}
+
+	recordPhysicalAttempt(input: PhysicalAttemptTelemetryInput = {}): number {
+		if (this.physicalAttempts < Number.MAX_SAFE_INTEGER) {
+			this.physicalAttempts++;
+		}
+		const accountId = input.accountId?.trim() || null;
+		let kind: DegradedModePhysicalAttemptKind;
+		if (input.recoveryProbe === true) {
+			kind = "recovery_probe";
+		} else if (
+			this.physicalAttempts === 1 &&
+			(this.guardAttemptOrdinal ?? 0) > 1
+		) {
+			kind = "guard_replay";
+		} else if (this.physicalAttempts === 1) {
+			kind = "initial";
+		} else if (
+			accountId !== null &&
+			this.lastPhysicalAccountId !== undefined &&
+			this.lastPhysicalAccountId !== null &&
+			accountId !== this.lastPhysicalAccountId
+		) {
+			kind = "account_failover";
+		} else {
+			kind = "in_place_retry";
+		}
+		try {
+			this.degradedTracker?.recordPhysicalAttempt({
+				ordinal: this.physicalAttempts,
+				kind,
+				accountKey: accountId,
+				candidateKey: input.candidateId,
+				laneKey: input.laneKey,
+			});
+		} catch {
+			// Telemetry never owns the provider dispatch.
+		}
+		this.lastPhysicalAccountId = accountId;
+		return this.physicalAttempts;
 	}
 
 	claim(accountId: string, concreteModel?: string | null): boolean {

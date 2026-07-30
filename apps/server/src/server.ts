@@ -1,6 +1,10 @@
 import { existsSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { Config, type RuntimeConfig } from "@better-ccflare/config";
+import {
+	Config,
+	type RuntimeConfig,
+	readGuardCorrelationSecret,
+} from "@better-ccflare/config";
 import {
 	CACHE,
 	DEFAULT_STRATEGY,
@@ -48,9 +52,15 @@ import {
 	translateModelName,
 } from "@better-ccflare/providers/bedrock";
 import {
+	AnthropicDegradedModeCoordinator,
 	AutoRefreshScheduler,
 	CacheAffinityOrderer,
 	CacheKeepaliveScheduler,
+	createAnthropicDegradedDetailedEventSink,
+	createAnthropicDegradedRuntimeHealth,
+	createGuardCorrelationVerifier,
+	DegradedModeObservability,
+	DegradedOwnerOverlay,
 	drainUsageCollector,
 	getModelCatalog,
 	getUsageCollectorHealth,
@@ -970,6 +980,25 @@ export default async function startServer(options?: {
 	// eagerly, so route through a mutable reference assigned once the
 	// ProxyContext exists — mirrors the getStrategy() lazy-getter pattern above.
 	let modelCatalogProxyContext: ProxyContext | null = null;
+	const anthropicDegradedConfig = config.getAnthropicDegradedModeConfig();
+	const anthropicDegradedMode = new AnthropicDegradedModeCoordinator({
+		config: anthropicDegradedConfig,
+	});
+	const degradedOwnerOverlay = new DegradedOwnerOverlay({
+		evidenceWindowMs: anthropicDegradedMode.config.evidenceWindowMs,
+	});
+	const degradedOwnerShadowOverlay = new DegradedOwnerOverlay({
+		evidenceWindowMs: anthropicDegradedMode.config.evidenceWindowMs,
+	});
+	const anthropicDegradedObservability = new DegradedModeObservability({
+		mode: anthropicDegradedConfig.mode,
+		largeRequestTokenThreshold:
+			anthropicDegradedConfig.largeRequestTokenThreshold,
+		largeRequestByteThreshold:
+			anthropicDegradedConfig.largeRequestByteThreshold,
+		detailedEventsEnabled: config.getAnthropicDegradedDiagnosticsEnabled(),
+		sink: createAnthropicDegradedDetailedEventSink(process.stdout),
+	});
 
 	const apiRouter = new APIRouter(
 		{
@@ -999,6 +1028,13 @@ export default async function startServer(options?: {
 			getAsyncWriterHealth: () => asyncWriter.getHealth(),
 			getUsageWorkerHealth: () => getUsageCollectorHealth(),
 			getIntegrityStatus: () => dbOps.getIntegrityStatus(),
+			getAnthropicDegradedHealth: () =>
+				createAnthropicDegradedRuntimeHealth({
+					coordinator: anthropicDegradedMode,
+					observability: anthropicDegradedObservability,
+					ownerOverlay: degradedOwnerOverlay,
+					shadowOwnerOverlay: degradedOwnerShadowOverlay,
+				}),
 			getStrategy: () => currentStrategy,
 		},
 		{ deviceSetupCoordinator },
@@ -1196,11 +1232,18 @@ export default async function startServer(options?: {
 
 	// Proxy context
 	const internalProbeSecret = crypto.randomUUID();
+	const guardCorrelationVerifier = createGuardCorrelationVerifier(
+		readGuardCorrelationSecret(),
+	);
 	const proxyContext: ProxyContext = {
 		strategy,
 		cacheAffinityOrderer: new CacheAffinityOrderer(
 			runtimeConfig.sessionDurationMs,
 		),
+		anthropicDegradedMode,
+		anthropicDegradedObservability,
+		degradedOwnerOverlay,
+		degradedOwnerShadowOverlay,
 		dbOps,
 		runtime: runtimeConfig,
 		config,
@@ -1208,6 +1251,7 @@ export default async function startServer(options?: {
 		refreshInFlight: new Map(),
 		asyncWriter,
 		internalProbeSecret,
+		guardCorrelationVerifier,
 	};
 	modelCatalogProxyContext = proxyContext;
 
@@ -1385,6 +1429,8 @@ export default async function startServer(options?: {
 				runtimeConfig.sessionDurationMs,
 			);
 			strategy.initialize?.(strategyStore);
+			proxyContext.degradedOwnerOverlay.clear();
+			proxyContext.degradedOwnerShadowOverlay.clear();
 			proxyContext.strategy = strategy;
 			currentStrategy = strategy;
 		}
