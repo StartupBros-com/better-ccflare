@@ -29,6 +29,10 @@ import {
 	recordOrchestrationRootInstructions,
 } from "./orchestration-election";
 import {
+	CodexStreamLiveness,
+	type CodexStreamLivenessOptions,
+} from "./stream-liveness";
+import {
 	summarizeCodexResponse,
 	type ToolCallSummary,
 	writeCodexResponseTrace,
@@ -686,8 +690,22 @@ export function codexEventCommitsOutput(
 	}
 }
 
+export interface CodexProviderOptionsForTests {
+	streamHeartbeatIntervalMs?: number;
+	streamRawSilenceTimeoutMs?: number;
+}
+
 export class CodexProvider extends BaseProvider {
 	name = "codex";
+	private readonly streamLivenessOptions: CodexStreamLivenessOptions;
+
+	constructor(options: CodexProviderOptionsForTests = {}) {
+		super();
+		this.streamLivenessOptions = {
+			heartbeatIntervalMs: options.streamHeartbeatIntervalMs,
+			rawSilenceTimeoutMs: options.streamRawSilenceTimeoutMs,
+		};
+	}
 
 	getLogicalModelCapability(
 		logicalModel: string,
@@ -1053,6 +1071,9 @@ export class CodexProvider extends BaseProvider {
 					finalModel,
 				);
 			}
+			// Wire keepalives belong only on a streaming Anthropic response.
+			// stream:false keeps consuming the original upstream SSE into one JSON
+			// result, without exposing or depending on synthetic heartbeat frames.
 			return this.transformSseResponseToJson(
 				response,
 				requestId ?? undefined,
@@ -2357,20 +2378,49 @@ export class CodexProvider extends BaseProvider {
 		headers.set("content-type", "text/event-stream");
 
 		const upstreamReader = response.body?.getReader();
+		let upstreamCancelStarted = false;
+		const cancelUpstreamOnce = (reason: unknown): void => {
+			if (upstreamCancelStarted || !upstreamReader) return;
+			upstreamCancelStarted = true;
+			try {
+				void upstreamReader.cancel(reason).catch(() => undefined);
+			} catch {
+				// Cancellation is best-effort; downstream termination must still finish.
+			}
+		};
+		const streamLiveness = new CodexStreamLiveness(this.streamLivenessOptions);
 		let downstreamController: ReadableStreamDefaultController<Uint8Array>;
 		let cancelled = false;
-		let pullWaiters: Array<() => void> = [];
+		const pullWaiters = new Set<() => void>();
 		const releasePullWaiters = () => {
-			const waiters = pullWaiters;
-			pullWaiters = [];
+			const waiters = [...pullWaiters];
+			pullWaiters.clear();
 			for (const waiter of waiters) waiter();
 		};
-		const awaitDownstreamCapacity = async () => {
-			while (!cancelled && (downstreamController.desiredSize ?? 1) <= 0) {
+		const awaitDownstreamCapacity = async (signal?: AbortSignal) => {
+			while (
+				!cancelled &&
+				!signal?.aborted &&
+				(downstreamController.desiredSize ?? 1) <= 0
+			) {
 				await new Promise<void>((resolve) => {
-					pullWaiters.push(resolve);
+					let released = false;
+					const release = () => {
+						if (released) return;
+						released = true;
+						pullWaiters.delete(release);
+						signal?.removeEventListener("abort", release);
+						resolve();
+					};
+					pullWaiters.add(release);
+					signal?.addEventListener("abort", release, { once: true });
+					if (signal?.aborted) release();
 				});
 			}
+		};
+		const heartbeatGate = {
+			isReady: () => !cancelled && (downstreamController.desiredSize ?? 1) > 0,
+			waitUntilReady: (signal: AbortSignal) => awaitDownstreamCapacity(signal),
 		};
 		const writeTerminalTrace = (
 			error?: {
@@ -2397,8 +2447,9 @@ export class CodexProvider extends BaseProvider {
 			pull() {
 				releasePullWaiters();
 			},
-			async cancel(reason) {
+			cancel(reason) {
 				cancelled = true;
+				streamLiveness.stop();
 				writeTerminalTrace({
 					type: "downstream_cancelled",
 					message:
@@ -2407,7 +2458,7 @@ export class CodexProvider extends BaseProvider {
 							: "Downstream response was cancelled",
 				});
 				releasePullWaiters();
-				await upstreamReader?.cancel(reason).catch(() => undefined);
+				cancelUpstreamOnce(reason);
 			},
 		});
 		const encoder = new TextEncoder();
@@ -2416,7 +2467,11 @@ export class CodexProvider extends BaseProvider {
 			maxBufferBytes: BUFFER_SIZES.SSE_TRANSPORT_TAIL_MAX_BYTES,
 		});
 
-		const writeSSE = async (event: string, data: unknown) => {
+		const writeSSE = async (
+			event: string,
+			data: unknown,
+			canEnqueue?: () => boolean,
+		): Promise<void> => {
 			const payload =
 				typeof data === "object" && data !== null
 					? (data as Record<string, unknown>)
@@ -2458,8 +2513,10 @@ export class CodexProvider extends BaseProvider {
 			}
 			await awaitDownstreamCapacity();
 			if (cancelled) throw new Error("Downstream response was cancelled");
+			if (canEnqueue && !canEnqueue()) return;
 			const line = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
 			downstreamController.enqueue(encoder.encode(line));
+			streamLiveness.recordDownstreamWrite();
 		};
 		const ensureMessageStart = async () => {
 			if (state.hasSentMessageStart) return;
@@ -2495,7 +2552,52 @@ export class CodexProvider extends BaseProvider {
 				if (!upstreamReader) throw new Error("Response body is not readable");
 
 				while (true) {
-					const { value, done } = await upstreamReader.read();
+					const outcome = await streamLiveness.next(
+						upstreamReader,
+						heartbeatGate,
+					);
+					if (outcome.type === "stopped") break;
+					if (outcome.type === "heartbeat_due") {
+						if (state.hasSentTerminalEvents) break;
+						await writeSSE(
+							"ping",
+							{ type: "ping" },
+							() =>
+								!state.hasSentTerminalEvents &&
+								streamLiveness.canEmitHeartbeat(),
+						);
+						continue;
+					}
+					if (outcome.type === "raw_silence_timeout") {
+						const timeoutError = {
+							type: "upstream_stream_timeout",
+							message:
+								"Codex upstream timed out while waiting for response data.",
+						};
+						// Claim this terminal path before any backpressured writes. A
+						// downstream-cancel or pending-read rejection during teardown
+						// must not replace it with a second terminal trace/error.
+						writeCodexStreamTerminalTrace(state, "error", timeoutError);
+						cancelUpstreamOnce(new Error(timeoutError.message));
+						await this.closeOpenBlockAndWriteError(
+							state,
+							writeSSE,
+							ensureMessageStart,
+							{
+								type: "error",
+								error: {
+									type: "api_error",
+									message: timeoutError.message,
+								},
+							},
+						);
+						return;
+					}
+					if (outcome.type === "upstream_error") {
+						throw outcome.error;
+					}
+
+					const { value, done } = outcome.result;
 					if (done) break;
 
 					// Frame boundary detection and cap enforcement live in
@@ -2535,9 +2637,17 @@ export class CodexProvider extends BaseProvider {
 							writeSSE,
 							ensureMessageStart,
 						);
+						if (state.hasSentTerminalEvents) break;
+					}
+
+					if (state.hasSentTerminalEvents) {
+						streamLiveness.stop();
+						cancelUpstreamOnce("Codex terminal response received");
+						break;
 					}
 				}
 
+				if (cancelled) return;
 				if (state.upstreamError) {
 					return;
 				}
@@ -2623,8 +2733,10 @@ export class CodexProvider extends BaseProvider {
 						writeTerminalTrace(streamError);
 					}
 				}
-				await upstreamReader?.cancel(error).catch(() => undefined);
+				cancelUpstreamOnce(error);
 			} finally {
+				streamLiveness.stop();
+				await streamLiveness.settlePendingReadForCleanup();
 				upstreamReader?.releaseLock();
 				if (!cancelled) downstreamController.close();
 			}

@@ -1128,6 +1128,312 @@ describe("CodexProvider.processResponse", () => {
 		}
 	});
 
+	it("keeps the HTTP Codex SSE path alive during silent reasoning", async () => {
+		const provider = new CodexProvider({
+			streamHeartbeatIntervalMs: 20,
+			streamRawSilenceTimeoutMs: 200,
+		});
+		let upstreamController: ReadableStreamDefaultController<Uint8Array>;
+		let upstreamCancelReason: unknown;
+		const upstream = new ReadableStream<Uint8Array>({
+			start(controller) {
+				upstreamController = controller;
+				controller.enqueue(
+					new TextEncoder().encode(
+						`${eventLine("response.in_progress", {
+							type: "response.in_progress",
+							response: { id: "resp_silent", model: "gpt-5.6-sol" },
+						}).join("\n")}\n`,
+					),
+				);
+			},
+			cancel(reason) {
+				upstreamCancelReason = reason;
+			},
+		});
+		const transformed = await provider.processResponse(
+			new Response(upstream, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+		const reader = transformed.body?.getReader();
+		if (!reader) throw new Error("transformed response has no body");
+		const decoder = new TextDecoder();
+
+		const immediate = await reader.read();
+		expect(decoder.decode(immediate.value)).toBe(
+			'event: ping\ndata: {"type":"ping"}\n\n',
+		);
+
+		const periodic = await Promise.race([
+			reader.read(),
+			Bun.sleep(100).then(() => {
+				throw new Error("periodic Codex heartbeat did not arrive");
+			}),
+		]);
+		expect(decoder.decode(periodic.value)).toBe(
+			'event: ping\ndata: {"type":"ping"}\n\n',
+		);
+
+		upstreamController.enqueue(
+			new TextEncoder().encode(
+				`${eventLine("response.completed", {
+					type: "response.completed",
+					response: {
+						id: "resp_silent",
+						model: "gpt-5.6-sol",
+						usage: { input_tokens: 1, output_tokens: 0 },
+					},
+				}).join("\n")}\n`,
+			),
+		);
+		let terminalBody = "";
+		while (true) {
+			const { value, done } = await reader.read();
+			if (done) break;
+			terminalBody += decoder.decode(value, { stream: true });
+		}
+		expect(terminalBody).toContain("event: message_stop");
+		expect(terminalBody).not.toContain("event: ping");
+		expect(upstreamCancelReason).toBeDefined();
+	});
+
+	it("keeps a committed Codex stream alive during post-output silence", async () => {
+		const provider = new CodexProvider({
+			streamHeartbeatIntervalMs: 20,
+			streamRawSilenceTimeoutMs: 300,
+		});
+		let upstreamController: ReadableStreamDefaultController<Uint8Array>;
+		const upstream = new ReadableStream<Uint8Array>({
+			start(controller) {
+				upstreamController = controller;
+			},
+		});
+		const transformed = await provider.processResponse(
+			new Response(upstream, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+		const reader = transformed.body?.getReader();
+		if (!reader) throw new Error("transformed response has no body");
+		const decoder = new TextDecoder();
+
+		upstreamController.enqueue(
+			new TextEncoder().encode(
+				`${[
+					...eventLine("response.created", {
+						type: "response.created",
+						response: { id: "resp_committed", model: "gpt-5.6-sol" },
+					}),
+					...eventLine("response.output_item.added", {
+						type: "response.output_item.added",
+						item: { type: "message" },
+						output_index: 0,
+					}),
+					...eventLine("response.content_part.added", {
+						type: "response.content_part.added",
+						part: { type: "output_text" },
+					}),
+					...eventLine("response.output_text.delta", {
+						type: "response.output_text.delta",
+						delta: "hello",
+					}),
+				].join("\n")}\n`,
+			),
+		);
+
+		let committedBody = "";
+		while (!committedBody.includes('"text":"hello"')) {
+			const next = await Promise.race([
+				reader.read(),
+				Bun.sleep(200).then(() => {
+					throw new Error("committed Codex output did not arrive");
+				}),
+			]);
+			if (next.done) throw new Error("committed Codex stream ended early");
+			committedBody += decoder.decode(next.value, { stream: true });
+		}
+		expect(committedBody).toContain("event: message_start");
+		expect(committedBody).toContain("event: content_block_delta");
+
+		const heartbeat = await Promise.race([
+			reader.read(),
+			Bun.sleep(100).then(() => {
+				throw new Error("postcommit Codex heartbeat did not arrive");
+			}),
+		]);
+		expect(decoder.decode(heartbeat.value)).toBe(
+			'event: ping\ndata: {"type":"ping"}\n\n',
+		);
+
+		upstreamController.enqueue(
+			new TextEncoder().encode(
+				`${eventLine("response.completed", {
+					type: "response.completed",
+					response: {
+						id: "resp_committed",
+						model: "gpt-5.6-sol",
+						usage: { input_tokens: 1, output_tokens: 1 },
+					},
+				}).join("\n")}\n`,
+			),
+		);
+		let terminalBody = "";
+		while (true) {
+			const { value, done } = await reader.read();
+			if (done) break;
+			terminalBody += decoder.decode(value, { stream: true });
+		}
+		expect(terminalBody).toContain("event: message_stop");
+		expect(terminalBody).not.toContain("event: ping");
+	});
+
+	it("does not let a backpressured heartbeat overtake settled terminal data", async () => {
+		const provider = new CodexProvider({
+			streamHeartbeatIntervalMs: 15,
+			streamRawSilenceTimeoutMs: 300,
+		});
+		let upstreamController: ReadableStreamDefaultController<Uint8Array>;
+		let upstreamCancelReason: unknown;
+		const upstream = new ReadableStream<Uint8Array>({
+			start(controller) {
+				upstreamController = controller;
+			},
+			cancel(reason) {
+				upstreamCancelReason = reason;
+			},
+		});
+		const transformed = await provider.processResponse(
+			new Response(upstream, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+
+		// The first heartbeat fills the downstream queue. Let the next heartbeat
+		// become due without pulling, then settle the retained upstream read.
+		await Bun.sleep(40);
+		upstreamController.enqueue(
+			new TextEncoder().encode(
+				`${[
+					...eventLine("response.created", {
+						type: "response.created",
+						response: { id: "resp_terminal", model: "gpt-5.6-sol" },
+					}),
+					...eventLine("response.completed", {
+						type: "response.completed",
+						response: {
+							id: "resp_terminal",
+							model: "gpt-5.6-sol",
+							usage: { input_tokens: 1, output_tokens: 0 },
+						},
+					}),
+				].join("\n")}\n`,
+			),
+		);
+		await Bun.sleep(5);
+
+		const body = await Promise.race([
+			transformed.text(),
+			Bun.sleep(500).then(() => {
+				throw new Error("backpressured Codex stream did not terminate");
+			}),
+		]);
+		expect(body.match(/event: ping\n/g) ?? []).toHaveLength(1);
+		expect(body).toContain("event: message_start");
+		expect(body).toContain("event: message_stop");
+		expect(upstreamCancelReason).toBeDefined();
+	});
+
+	it("closes a terminal stream without awaiting upstream cancellation", async () => {
+		const provider = new CodexProvider({
+			streamHeartbeatIntervalMs: 100,
+			streamRawSilenceTimeoutMs: 500,
+		});
+		let cancelCalls = 0;
+		const upstream = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(
+					new TextEncoder().encode(
+						`${eventLine("response.completed", {
+							type: "response.completed",
+							response: {
+								id: "resp_terminal_cancel",
+								model: "gpt-5.6-sol",
+								usage: { input_tokens: 1, output_tokens: 0 },
+							},
+						}).join("\n")}\n`,
+					),
+				);
+			},
+			cancel() {
+				cancelCalls++;
+				return new Promise<void>(() => {});
+			},
+		});
+		const transformed = await provider.processResponse(
+			new Response(upstream, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+
+		const body = await Promise.race([
+			transformed.text(),
+			Bun.sleep(300).then(() => {
+				throw new Error("terminal Codex stream did not reach EOF");
+			}),
+		]);
+		expect(body).toContain("event: message_stop");
+		expect(cancelCalls).toBe(1);
+	});
+
+	it("terminates raw-upstream silence after synthetic keepalive output", async () => {
+		const provider = new CodexProvider({
+			streamHeartbeatIntervalMs: 15,
+			streamRawSilenceTimeoutMs: 70,
+		});
+		let upstreamCancelReason: unknown;
+		const upstream = new ReadableStream<Uint8Array>({
+			cancel(reason) {
+				upstreamCancelReason = reason;
+				return new Promise<void>(() => {});
+			},
+		});
+		const transformed = await provider.processResponse(
+			new Response(upstream, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+		// Do not consume downstream until after the hard deadline. Upstream
+		// cancellation must not wait for capacity to emit the terminal error.
+		await Bun.sleep(90);
+		expect(upstreamCancelReason).toBeInstanceOf(Error);
+		const body = await Promise.race([
+			transformed.text(),
+			Bun.sleep(300).then(() => {
+				throw new Error("timed-out Codex stream did not reach EOF");
+			}),
+		]);
+
+		expect(body.match(/event: ping\n/g) ?? []).toHaveLength(1);
+		expect(body.match(/event: error\n/g) ?? []).toHaveLength(1);
+		expect(body).toContain(
+			'"error":{"type":"api_error","message":"Codex upstream timed out while waiting for response data."}',
+		);
+		expect(body).not.toContain("rawSilenceTimeoutMs");
+		expect(body).not.toContain("upstream_stream_read_error");
+		expect(body).not.toContain("abrupt_stream_eof");
+	});
+
 	it("buffers tool-call arguments and emits them once before content_block_stop", async () => {
 		const provider = new CodexProvider();
 		const upstreamBody = sseBody([
