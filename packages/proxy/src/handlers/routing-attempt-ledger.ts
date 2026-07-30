@@ -11,7 +11,12 @@ function normalizeConcreteModel(
  * it after a later route succeeds or throws, or replaces it with a later
  * retained terminal (which releases the previous response exactly once).
  */
+export type RetainedTerminalKind =
+	| "authoritative_context_overflow"
+	| "legacy_context_overflow";
+
 export interface RetainedTerminalResponse {
+	readonly terminalKind?: RetainedTerminalKind;
 	deliver(failoverAttempts: number): Promise<Response>;
 	discard(): Promise<void>;
 }
@@ -62,6 +67,10 @@ export class RoutingAttemptLedger {
 		const retained = this.retainedTerminalResponse;
 		this.retainedTerminalResponse = null;
 		return retained;
+	}
+
+	hasRetainedTerminalKind(kind: RetainedTerminalKind): boolean {
+		return this.retainedTerminalResponse?.terminalKind === kind;
 	}
 
 	/** Release deferred terminal ownership, if any. Safe to call repeatedly. */

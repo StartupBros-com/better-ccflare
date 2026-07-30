@@ -1157,6 +1157,73 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 			error: { code: "codex_websocket_post_write_error" },
 		});
 	});
+
+	it("vetoes authoritative context-overflow replay to a safe xAI candidate after response.create was written", async () => {
+		installUsageCollector();
+		let httpOrXaiCalls = 0;
+		globalThis.fetch = mock(async () => {
+			httpOrXaiCalls++;
+			return new Response("unexpected HTTP or xAI replay", { status: 500 });
+		});
+
+		const postWriteCategories: string[] = [];
+		const receipt = makeReceipt((category) =>
+			postWriteCategories.push(category),
+		);
+		const encoder = new TextEncoder();
+		const authoritativeOverflow = new Response(
+			new ReadableStream<Uint8Array>({
+				start(controller) {
+					controller.enqueue(
+						encoder.encode(
+							[
+								'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_context_overflow","model":"gpt-5.4"}}\n\n',
+								'event: response.failed\ndata: {"type":"response.failed","response":{"id":"resp_context_overflow","model":"gpt-5.4","status":"failed","error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"Input is too large"}}}\n\n',
+								"data: [DONE]\n\n",
+							].join(""),
+						),
+					);
+					controller.close();
+				},
+			}),
+			{
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			},
+		);
+		const websocketAttempt = spyOn(
+			codexWebSocketTransport,
+			"tryRequest",
+		).mockImplementation(async (input) => {
+			input.onFrameWritten?.(receipt);
+			return { response: authoritativeOverflow, receipt };
+		});
+		const canReplayToXai = mock(() => true);
+		const xaiCandidatePolicy: ModelFallbackExecutionPolicy = {
+			...makePolicy(500, { isFinalAttempt: false }),
+			canReplayContextOverflow: canReplayToXai,
+		};
+
+		const body = makeRequestBody();
+		const request = makeRequest(body);
+		const response = await runProxy(
+			request,
+			body,
+			xaiCandidatePolicy,
+			"codex-ws-context-overflow-xai-candidate",
+		);
+
+		expect(canReplayToXai).toHaveBeenCalled();
+		expect(websocketAttempt).toHaveBeenCalledTimes(1);
+		expect(httpOrXaiCalls).toBe(0);
+		expect(postWriteCategories).toEqual(["post_write_error"]);
+		expect(receipt.stickyHttp).toBe(true);
+		expect(response).not.toBeNull();
+		expect(response?.status).toBe(502);
+		expect(await response?.json()).toMatchObject({
+			error: { code: "codex_websocket_post_write_error" },
+		});
+	});
 });
 
 describe("proxyWithAccount: GPT-5.6 explicit breakpoint compatibility retry", () => {

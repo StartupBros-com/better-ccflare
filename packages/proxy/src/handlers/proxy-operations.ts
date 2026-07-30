@@ -212,6 +212,11 @@ export interface ModelFallbackExecutionPolicy {
 		model: string,
 		fallbackRank: number,
 	) => void;
+	/**
+	 * Bind a legacy message-only context overflow to the exact queued
+	 * known-larger Codex model selected for its one permitted replay.
+	 */
+	readonly preferContextOverflowFallback?: (model: string) => void;
 	readonly implicitFallbacksEnabled?: boolean;
 	/** A planned non-final candidate must not terminate the global route queue. */
 	readonly forwardModelUnavailableResponse?: boolean;
@@ -221,6 +226,12 @@ export interface ModelFallbackExecutionPolicy {
 	 * discovered while proxyWithAccount is already running.
 	 */
 	readonly isFinalSemanticAttempt?: () => boolean;
+	/**
+	 * Narrow replay policy for authoritative Codex context overflow. This may
+	 * include a pending post-combo route without changing generic stall/deadline
+	 * finality for the current transport.
+	 */
+	readonly canReplayContextOverflow?: () => boolean;
 	/**
 	 * Pre-override model (effectiveModel at selection time) when a combo
 	 * slot's model override applies to this attempt; null/absent for a plain
@@ -1004,6 +1015,52 @@ function hasCodexExplicitCacheBreakpoint(body: unknown): boolean {
 }
 
 /**
+ * Classify only Codex's authoritative Responses API capacity code or the
+ * legacy message-only shape produced by CodexProvider. The legacy shape is
+ * eligible only for a known-larger-model replay at its call site; generic
+ * invalid-request 400s remain terminal and never consume another route.
+ */
+async function classifyCodexContextOverflowError(
+	response: Response,
+	readJson: ResponseJsonReader = readResponseCloneJson,
+): Promise<"authoritative" | "legacy" | null> {
+	if (response.status !== 400) return null;
+	const contentType = response.headers.get("content-type");
+	if (!contentType?.includes("application/json")) return null;
+	const json = (await readJson(response)) as {
+		error?: { code?: unknown; message?: unknown };
+	} | null;
+	if (json?.error?.code === "context_length_exceeded") {
+		return "authoritative";
+	}
+	return typeof json?.error?.message === "string" &&
+		/^Prompt is too long\. Codex reported:/i.test(json.error.message)
+		? "legacy"
+		: null;
+}
+
+function createCodexContextOverflowTerminalResponse(
+	authoritative: boolean,
+): Response {
+	return new Response(
+		JSON.stringify({
+			type: "error",
+			error: {
+				type: "invalid_request_error",
+				message:
+					"Prompt is too long. Codex reported: Input exceeds the context window.",
+				...(authoritative ? { code: "context_length_exceeded" } : {}),
+			},
+		}),
+		{
+			status: 400,
+			statusText: "Bad Request",
+			headers: { "content-type": "application/json" },
+		},
+	);
+}
+
+/**
  * Checks if a response error indicates the requested model is unavailable.
  * Covers Anthropic (not_found_error), OpenAI-compat (model_not_found),
  * generic messages, and Bedrock (ResourceNotFoundException).
@@ -1525,6 +1582,9 @@ export async function proxyWithAccount(
 		(modelFallbackPolicy?.isFinalSemanticAttempt?.() ??
 			modelFallbackPolicy?.forwardModelUnavailableResponse === true) &&
 		!implicitFallbackDiscoveryPossible;
+	const canReplayContextOverflow = (): boolean =>
+		modelFallbackPolicy?.canReplayContextOverflow?.() ??
+		!isFinalSemanticAttempt();
 	const resolveAttemptCommitmentDeadline = ():
 		| {
 				readonly deadlineAt: number;
@@ -1727,7 +1787,7 @@ export async function proxyWithAccount(
 			modelFallbackPolicy?.deferImplicitFallback !== undefined &&
 			modelFallbackPolicy.implicitFallbacksEnabled !== false &&
 			admission.model !== null;
-		let codexContextOverflowFallbackPlanned = false;
+		let codexContextOverflowFallbackModel: string | null = null;
 		if (modelFallbackPolicy?.deferImplicitFallback) {
 			const discoveryModels =
 				modelFallbackPolicy.implicitFallbacksEnabled === false ||
@@ -1762,11 +1822,12 @@ export async function proxyWithAccount(
 				if (
 					mayPlanCodexContextOverflowFallback &&
 					admission.model &&
+					codexContextOverflowFallbackModel === null &&
 					isKnownLargerCodexCandidate(admission.model, candidateModel)
 				) {
 					// Set only after the request-level queue accepts this route (or
 					// de-duplicates it against the same route queued during admission).
-					codexContextOverflowFallbackPlanned = true;
+					codexContextOverflowFallbackModel = candidateModel;
 				}
 			}
 		} else {
@@ -2192,6 +2253,81 @@ export async function proxyWithAccount(
 			} catch {
 				// Body may already be locked/disturbed; ignore synchronous throws too.
 			}
+		};
+		const retainCodexContextOverflowResponse = async (
+			retainedContextOverflowResponse: Response,
+			authoritative: boolean,
+		): Promise<void> => {
+			if (routingAttemptLedger) {
+				await routingAttemptLedger.retainTerminalResponse({
+					terminalKind: authoritative
+						? "authoritative_context_overflow"
+						: "legacy_context_overflow",
+					deliver: async () => {
+						const retainedSessionId = sessionIdForObservation(req.headers);
+						if (retainedSessionId) {
+							recordServedAccount(
+								retainedSessionId,
+								account.id,
+								requestMeta.timestamp,
+							);
+						}
+						return withSanitizedProxyHeaders(retainedContextOverflowResponse);
+					},
+					discard: () => discardUpstreamBody(retainedContextOverflowResponse),
+				});
+				return;
+			}
+			await discardUpstreamBody(retainedContextOverflowResponse);
+		};
+		const hasRetainedLegacyContextOverflow = (): boolean =>
+			routingAttemptLedger?.hasRetainedTerminalKind(
+				"legacy_context_overflow",
+			) === true;
+		const handleProcessedCodexContextOverflow = async (
+			candidateResponse: Response,
+		): Promise<boolean> => {
+			if (
+				provider.name !== "codex" ||
+				account.provider !== "codex" ||
+				getCurrentCodexWebSocketReceipt()?.frameWritten === true
+			) {
+				return false;
+			}
+			const classification = await classifyCodexContextOverflowError(
+				candidateResponse,
+				readAttemptBoundJson,
+			);
+			if (!classification) return false;
+			const authoritative = classification === "authoritative";
+			if (
+				authoritative
+					? !canReplayContextOverflow() && !hasRetainedLegacyContextOverflow()
+					: codexContextOverflowFallbackModel === null
+			) {
+				return false;
+			}
+			if (!authoritative && codexContextOverflowFallbackModel) {
+				modelFallbackPolicy?.preferContextOverflowFallback?.(
+					codexContextOverflowFallbackModel,
+				);
+			}
+			log.info("codex_context_overflow_fallback", {
+				requestId: requestMeta.id,
+				accountId: account.id,
+				attemptedModel: currentTransportModel,
+				fallbackScope: authoritative
+					? hasRetainedLegacyContextOverflow()
+						? "larger_model_terminal"
+						: "remaining_route"
+					: "larger_model",
+				responseStatus: candidateResponse.status,
+			});
+			await retainCodexContextOverflowResponse(
+				candidateResponse,
+				authoritative,
+			);
+			return true;
 		};
 
 		// Drains a superseded in-place-retry response so its usage capture and
@@ -3586,6 +3722,10 @@ export async function proxyWithAccount(
 			finalizedCodexAttemptIds.add(currentTransportAttemptId);
 		}
 
+		if (await handleProcessedCodexContextOverflow(response)) {
+			return null;
+		}
+
 		// Failover to next account on upstream 401 — credentials are invalid/expired
 		if (response.status === 401) {
 			log.warn(
@@ -3710,6 +3850,9 @@ export async function proxyWithAccount(
 
 						await discardUpstreamBody(response);
 						response = retryResponse;
+						if (await handleProcessedCodexContextOverflow(retryResponse)) {
+							return null;
+						}
 
 						// If credentials expired mid-retry, break out and let the 401
 						// failover guard below handle it (return null → try next account).
@@ -3854,6 +3997,10 @@ export async function proxyWithAccount(
 				: attemptCommitmentDeadlineAt === undefined
 					? undefined
 					: attemptCommitmentDeadlineAt - cacheLaneRescueReserveMs;
+			const codexAuthoritativeContextOverflowCanBeHandled =
+				provider.name === "codex" &&
+				account.provider === "codex" &&
+				(canReplayContextOverflow() || hasRetainedLegacyContextOverflow());
 			try {
 				const gatedBody = await gateAnthropicSsePreCommit(
 					downstreamAnthropicResponseBody,
@@ -3865,7 +4012,11 @@ export async function proxyWithAccount(
 						commitmentDeadlineAt: semanticCommitmentDeadlineAt,
 						terminalGraceMs: streamConfig.terminalGraceMs,
 						maxBufferedBytes: streamConfig.maxBufferedBytes,
-						failOnContextOverflow: codexContextOverflowFallbackPlanned,
+						failOnContextOverflow:
+							codexContextOverflowFallbackModel !== null ||
+							codexAuthoritativeContextOverflowCanBeHandled,
+						requireAuthoritativeContextOverflow:
+							codexContextOverflowFallbackModel === null,
 						signal: activeAttemptCommitment?.signal ?? routingSignal,
 					},
 				);
@@ -3917,20 +4068,43 @@ export async function proxyWithAccount(
 				if (!(error instanceof AnthropicPreCommitStallError)) throw error;
 				if (
 					error.reason === "context_length_exceeded" &&
-					codexContextOverflowFallbackPlanned
+					(codexContextOverflowFallbackModel !== null ||
+						(error.contextOverflowAuthoritative === true &&
+							codexAuthoritativeContextOverflowCanBeHandled))
 				) {
+					if (
+						error.contextOverflowAuthoritative !== true &&
+						codexContextOverflowFallbackModel
+					) {
+						modelFallbackPolicy?.preferContextOverflowFallback?.(
+							codexContextOverflowFallbackModel,
+						);
+					}
 					log.info("codex_context_overflow_fallback", {
 						requestId: requestMeta.id,
 						accountId: account.id,
 						attemptedModel: currentTransportModel,
+						fallbackScope:
+							codexContextOverflowFallbackModel !== null
+								? "larger_model"
+								: hasRetainedLegacyContextOverflow()
+									? "larger_model_terminal"
+									: "remaining_route",
 						bufferedBytes: error.bufferedBytes,
 						framesSeen: error.framesSeen,
 					});
-					// The larger model was already queued by deferImplicitFallback.
-					// Codex records the terminal trace before emitting this downstream
-					// error frame; the gate's one-shot reader cancellation then propagates
-					// through the transformed stream to the raw upstream reader. This is
-					// request/model capacity, not unhealthy account evidence.
+					// A larger model may already be queued by deferImplicitFallback;
+					// otherwise the request-local route ledger still has a distinct
+					// replay-safe candidate. Codex records the terminal trace before
+					// emitting this downstream error frame, and the gate cancels its
+					// private reader before any meaningful client-visible bytes escape.
+					// This is request/model capacity, not unhealthy account evidence.
+					await retainCodexContextOverflowResponse(
+						createCodexContextOverflowTerminalResponse(
+							error.contextOverflowAuthoritative === true,
+						),
+						error.contextOverflowAuthoritative === true,
+					);
 					return null;
 				}
 				const isZeroMeaningfulCodexStall =
@@ -4086,6 +4260,9 @@ export async function proxyWithAccount(
 					);
 					if (currentTransportAttemptId) {
 						finalizedCodexAttemptIds.add(currentTransportAttemptId);
+					}
+					if (await handleProcessedCodexContextOverflow(response)) {
+						return null;
 					}
 					if (response.status === 401) {
 						routingAttemptLedger?.blockAccount(account.id);
