@@ -1,4 +1,5 @@
 import { describe, expect, it, mock, spyOn } from "bun:test";
+import { CodexProvider } from "../../../providers/src/providers/codex/provider";
 import {
 	ANTHROPIC_SEMANTIC_LIVENESS_ERROR_FRAME,
 	createAnthropicSemanticLivenessStream,
@@ -87,6 +88,99 @@ describe("createAnthropicSemanticLivenessStream", () => {
 				}
 			}
 		}
+	});
+
+	it("keeps committed Codex output alive across semantic-idle windows with canonical pings", async () => {
+		const semanticTimeoutMs = 45;
+		const upstreamSilenceMs = semanticTimeoutMs * 4;
+		const provider = new CodexProvider({
+			streamHeartbeatIntervalMs: 15,
+			streamRawSilenceTimeoutMs: 500,
+		});
+		let upstreamController!: ReadableStreamDefaultController<Uint8Array>;
+		let upstreamCancelled = false;
+		const upstream = new ReadableStream<Uint8Array>({
+			start(controller) {
+				upstreamController = controller;
+			},
+			cancel() {
+				upstreamCancelled = true;
+			},
+		});
+		const codexResponse = await provider.processResponse(
+			new Response(upstream, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+		if (!codexResponse.body) throw new Error("Codex response has no body");
+
+		const onTimeout = mock(() => undefined);
+		const guarded = createAnthropicSemanticLivenessStream(codexResponse.body, {
+			semanticTimeoutMs,
+			onTimeout,
+		});
+		const codexEvent = (name: string, data: unknown) =>
+			`event: ${name}\ndata: ${JSON.stringify(data)}\n\n`;
+		upstreamController.enqueue(
+			encoder.encode(
+				[
+					codexEvent("response.created", {
+						type: "response.created",
+						response: { id: "resp_cross_layer", model: "gpt-5.6-sol" },
+					}),
+					codexEvent("response.output_item.added", {
+						type: "response.output_item.added",
+						item: { type: "message" },
+						output_index: 0,
+					}),
+					codexEvent("response.content_part.added", {
+						type: "response.content_part.added",
+						part: { type: "output_text" },
+					}),
+					codexEvent("response.output_text.delta", {
+						type: "response.output_text.delta",
+						delta: "committed",
+					}),
+				].join(""),
+			),
+		);
+
+		const completionTimer = setTimeout(() => {
+			if (upstreamCancelled) return;
+			upstreamController.enqueue(
+				encoder.encode(
+					codexEvent("response.completed", {
+						type: "response.completed",
+						response: {
+							id: "resp_cross_layer",
+							model: "gpt-5.6-sol",
+							usage: { input_tokens: 1, output_tokens: 1 },
+						},
+					}),
+				),
+			);
+		}, upstreamSilenceMs);
+
+		let body: string;
+		try {
+			body = await Promise.race([
+				new Response(guarded).text(),
+				delay(600).then(() => {
+					throw new Error("cross-layer Codex stream did not terminate");
+				}),
+			]);
+		} finally {
+			clearTimeout(completionTimer);
+		}
+
+		expect(body).toContain('"text":"committed"');
+		expect(body.match(/event: ping\n/g)?.length ?? 0).toBeGreaterThanOrEqual(3);
+		expect(body).toContain(messageStop);
+		expect(body).not.toContain(ANTHROPIC_SEMANTIC_LIVENESS_ERROR_FRAME);
+		expect(body).not.toContain("event: error");
+		expect(onTimeout).not.toHaveBeenCalled();
 	});
 
 	it("bounds postcommit ping and structural activity without meaningful progress", async () => {
