@@ -8,8 +8,28 @@ import {
 	RECOVERY_STATUS_EXHAUSTED,
 	RECOVERY_STATUS_HEADER,
 } from "@better-ccflare/types/routing-recovery";
+import { sanitizeAnthropicRetryAfterSeconds } from "../anthropic-degraded-mode";
 import type { RoutingCapacityContext } from "./account-selector";
 import type { RequestRateLimitOutcome } from "./rate-limit-scope";
+
+const PROTECTED_ANTHROPIC_RETRY_CONFIG = Object.freeze({
+	retryMinMs: 5_000,
+	retryFallbackMs: 10_000,
+	retryMaxMs: 60_000,
+});
+const PROTECTED_ANTHROPIC_CONTENT_TYPE = "application/json";
+const MAX_UPSTREAM_REQUEST_ID_LENGTH = 128;
+const MAX_RETRY_AFTER_HEADER_LENGTH = 128;
+const IMF_FIXDATE_PATTERN =
+	/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/i;
+const SAFE_UPSTREAM_REQUEST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const CANONICAL_ANTHROPIC_OVERLOAD_BODY = JSON.stringify({
+	type: "error",
+	error: {
+		type: "overloaded_error",
+		message: "Overloaded",
+	},
+});
 
 export type RoutingTerminalKind =
 	| "model_pool_exhausted"
@@ -32,6 +52,111 @@ export interface RoutingTerminalOptions {
 	readonly routeCircuitRecoveryHint?: RouteCircuitRecoveryHint | null;
 	/** Request-local finite recovery learned after the selection snapshot. */
 	readonly modelRecoveryAt?: number | null;
+}
+
+export type ProtectedAnthropicOverloadInput =
+	| {
+			/**
+			 * Transfers one undisturbed upstream 529 body into the returned response.
+			 * The caller must not attempt to deliver the original response afterward.
+			 */
+			readonly kind: "trusted_upstream";
+			readonly response: Response;
+			readonly retryAfter?: unknown;
+			readonly now?: number;
+	  }
+	| {
+			readonly kind: "local_suppression" | "semantic_overload";
+			readonly retryAfter?: unknown;
+			readonly now?: number;
+	  };
+
+function canonicalJsonContentType(value: string | null): string {
+	if (value === null || value.length > 64) {
+		return PROTECTED_ANTHROPIC_CONTENT_TYPE;
+	}
+	const normalized = value.trim().toLowerCase();
+	if (normalized === PROTECTED_ANTHROPIC_CONTENT_TYPE) {
+		return PROTECTED_ANTHROPIC_CONTENT_TYPE;
+	}
+	if (
+		/^application\/json\s*;\s*charset\s*=\s*(?:"utf-8"|utf-8)$/i.test(
+			normalized,
+		)
+	) {
+		return "application/json; charset=utf-8";
+	}
+	return PROTECTED_ANTHROPIC_CONTENT_TYPE;
+}
+
+function trustedRetryAfterValue(value: string | null): unknown {
+	if (value === null) return undefined;
+	const normalized = value.trim();
+	if (
+		normalized.length === 0 ||
+		normalized.length > MAX_RETRY_AFTER_HEADER_LENGTH
+	) {
+		return undefined;
+	}
+	if (/^-?\d+$/.test(normalized) || IMF_FIXDATE_PATTERN.test(normalized)) {
+		return normalized;
+	}
+	return undefined;
+}
+
+function safeUpstreamRequestId(value: string | null): string | null {
+	if (
+		value === null ||
+		value.length === 0 ||
+		value.length > MAX_UPSTREAM_REQUEST_ID_LENGTH ||
+		!SAFE_UPSTREAM_REQUEST_ID_PATTERN.test(value)
+	) {
+		return null;
+	}
+	return value;
+}
+
+/**
+ * Construct the single client-visible Anthropic overload terminal.
+ *
+ * A trusted upstream 529 transfers its body without cloning or eager reads.
+ * Every header is rebuilt from a narrow allowlist. Local, semantic, and
+ * non-529 inputs use the canonical synthetic body instead.
+ */
+export function createProtectedAnthropicOverloadResponse(
+	input: ProtectedAnthropicOverloadInput,
+): Response {
+	const now = input.now ?? Date.now();
+	const trusted =
+		input.kind === "trusted_upstream" && input.response.status === 529
+			? input.response
+			: null;
+	const trustedRetryAfter = trustedRetryAfterValue(
+		trusted?.headers.get("retry-after") ?? null,
+	);
+	const retryAfterSeconds = sanitizeAnthropicRetryAfterSeconds(
+		trustedRetryAfter ?? input.retryAfter,
+		now,
+		PROTECTED_ANTHROPIC_RETRY_CONFIG,
+	);
+	const headers = new Headers({
+		"content-type": canonicalJsonContentType(
+			trusted?.headers.get("content-type") ?? null,
+		),
+		"retry-after": String(retryAfterSeconds),
+	});
+	const requestId = safeUpstreamRequestId(
+		trusted?.headers.get("x-request-id") ?? null,
+	);
+	if (requestId !== null) headers.set("x-request-id", requestId);
+
+	const responseBody =
+		trusted === null ? CANONICAL_ANTHROPIC_OVERLOAD_BODY : trusted.body;
+	return new Response(responseBody, {
+		status: 529,
+		...(trusted?.statusText ? { statusText: trusted.statusText } : {}),
+		headers,
+	});
 }
 
 interface AutomaticRecovery {

@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+	GUARD_CORRELATION_SECRET_HEADER,
+	GUARD_REQUEST_ID_HEADER,
 	sanitizeProxyHeaders,
 	sanitizeRequestHeaders,
 	withSanitizedProxyHeaders,
@@ -61,28 +63,33 @@ describe("withSanitizedProxyHeaders", () => {
 });
 
 describe("guard request correlation privacy", () => {
-	const header = "x-better-ccflare-guard-request-id";
 	const guardId = "76110a75-9e91-4ab9-89a7-3e5d25a318fc";
 
-	test("does not persist the private guard ID in request analytics", () => {
+	test("does not persist private guard correlation material in request analytics", () => {
 		const original = new Headers({
 			"content-type": "application/json",
-			[header]: guardId,
+			[GUARD_REQUEST_ID_HEADER]: guardId,
+			[GUARD_CORRELATION_SECRET_HEADER]: "must-never-be-http",
 		});
 
 		const sanitized = sanitizeRequestHeaders(original);
 
-		expect(sanitized.has(header)).toBe(false);
+		expect(sanitized.has(GUARD_REQUEST_ID_HEADER)).toBe(false);
+		expect(sanitized.has(GUARD_CORRELATION_SECRET_HEADER)).toBe(false);
 		expect(sanitized.get("content-type")).toBe("application/json");
 	});
 
-	test("does not expose a same-named upstream response header to clients", () => {
+	test("does not expose same-named upstream response headers to clients", () => {
 		const upstream = new Response("body", {
-			headers: { [header]: guardId },
+			headers: {
+				[GUARD_REQUEST_ID_HEADER]: guardId,
+				[GUARD_CORRELATION_SECRET_HEADER]: "must-never-be-http",
+			},
 		});
 
 		const sanitized = withSanitizedProxyHeaders(upstream);
 
-		expect(sanitized.headers.has(header)).toBe(false);
+		expect(sanitized.headers.has(GUARD_REQUEST_ID_HEADER)).toBe(false);
+		expect(sanitized.headers.has(GUARD_CORRELATION_SECRET_HEADER)).toBe(false);
 	});
 });

@@ -1273,7 +1273,8 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 		const headers = new Headers({
 			authorization: "Bearer public-upstream-token",
 			"x-better-ccflare-guard-request-id":
-				"76110a75-9e91-4ab9-89a7-3e5d25a318fc",
+				"v1.76110a75-9e91-4ab9-89a7-3e5d25a318fc.1.signature",
+			"x-better-ccflare-guard-correlation-secret": "must-never-be-http",
 			"x-better-ccflare-request-id": "req-internal",
 			"x-better-ccflare-pacing-canary": "bypass",
 			"x-better-ccflare-pacing-cohort-id": "cohort",
@@ -1285,6 +1286,7 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 		expect(sanitized.get("authorization")).toBe("Bearer public-upstream-token");
 		for (const name of [
 			"x-better-ccflare-guard-request-id",
+			"x-better-ccflare-guard-correlation-secret",
 			"x-better-ccflare-request-id",
 			"x-better-ccflare-pacing-canary",
 			"x-better-ccflare-pacing-cohort-id",

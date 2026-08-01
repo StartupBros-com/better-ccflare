@@ -4,6 +4,7 @@ import type { RoutingCapacityContext } from "../account-selector";
 import type { RequestRateLimitOutcome } from "../rate-limit-scope";
 import {
 	createModelPoolExhaustedResponse,
+	createProtectedAnthropicOverloadResponse,
 	createRoutingTerminalResponse,
 	filterRequestCompatibleAccounts,
 	mergeTerminalAccountState,
@@ -1010,5 +1011,193 @@ describe("terminal account refresh merge", () => {
 
 		expect(mergeTerminalAccountState([], [local])).toEqual([]);
 		expect(mergeTerminalAccountState(excluded, [local])).toEqual([]);
+	});
+});
+
+describe("protected Anthropic overload terminal", () => {
+	const now = Date.UTC(2026, 6, 29, 12);
+	const canonicalBody = JSON.stringify({
+		type: "error",
+		error: {
+			type: "overloaded_error",
+			message: "Overloaded",
+		},
+	});
+
+	it("preserves one trusted 529 body and status while rebuilding safe headers", async () => {
+		const trustedBody = JSON.stringify({
+			type: "error",
+			error: {
+				type: "overloaded_error",
+				message: "Upstream overloaded",
+			},
+		});
+		const trusted = new Response(trustedBody, {
+			status: 529,
+			statusText: "Overloaded",
+			headers: {
+				"content-type": "application/json; charset=utf-8",
+				"retry-after": "17",
+				"x-request-id": "req_01HXYZ",
+			},
+		});
+
+		const response = createProtectedAnthropicOverloadResponse({
+			kind: "trusted_upstream",
+			response: trusted,
+			now,
+		});
+
+		expect(response).not.toBe(trusted);
+		// One-shot integration transfers the undrained stream rather than cloning
+		// it and abandoning a second tee branch.
+		expect(trusted.bodyUsed).toBe(true);
+		expect(response.status).toBe(529);
+		expect(response.statusText).toBe("Overloaded");
+		expect(response.headers.get("content-type")).toBe(
+			"application/json; charset=utf-8",
+		);
+		expect(response.headers.get("retry-after")).toBe("17");
+		expect(response.headers.get("x-request-id")).toBe("req_01HXYZ");
+		expect(await response.text()).toBe(trustedBody);
+	});
+
+	it("preserves an intentionally empty trusted 529 body", async () => {
+		const response = createProtectedAnthropicOverloadResponse({
+			kind: "trusted_upstream",
+			response: new Response(null, {
+				status: 529,
+				headers: { "retry-after": "8" },
+			}),
+			now,
+		});
+
+		expect(response.status).toBe(529);
+		expect(response.headers.get("retry-after")).toBe("8");
+		expect(await response.text()).toBe("");
+	});
+
+	it.each([
+		"local_suppression",
+		"semantic_overload",
+	] as const)("synthesizes the canonical 529 body for %s", async (kind) => {
+		const response = createProtectedAnthropicOverloadResponse({
+			kind,
+			retryAfter: 12,
+			now,
+		});
+
+		expect(response.status).toBe(529);
+		expect(response.headers.get("content-type")).toBe("application/json");
+		expect(response.headers.get("retry-after")).toBe("12");
+		expect(response.headers.get("x-request-id")).toBeNull();
+		expect(await response.text()).toBe(canonicalBody);
+	});
+
+	it.each([
+		["delta seconds", "7", "7"],
+		["HTTP date", new Date(now + 17_000).toUTCString(), "17"],
+		["absent", null, "10"],
+		["malformed", "later", "10"],
+		["negative", "-30", "5"],
+		["oversized", "9999999999", "60"],
+	] as const)("canonicalizes %s Retry-After guidance", (_label, retryAfter, expected) => {
+		const headers = new Headers({ "content-type": "application/json" });
+		if (retryAfter !== null) headers.set("retry-after", retryAfter);
+		const response = createProtectedAnthropicOverloadResponse({
+			kind: "trusted_upstream",
+			response: new Response(canonicalBody, {
+				status: 529,
+				headers,
+			}),
+			now,
+		});
+
+		expect(response.headers.get("retry-after")).toBe(expected);
+	});
+
+	it("drops malicious, duplicate, internal, recovery, and arbitrary upstream headers", () => {
+		const headers = new Headers({
+			authorization: "Bearer secret",
+			connection: "keep-alive",
+			cookie: "session=secret",
+			"set-cookie": "session=secret; HttpOnly",
+			traceparent: "00-secret",
+			tracestate: "vendor=secret",
+			"transfer-encoding": "chunked",
+			"x-better-ccflare-guard-request-id": "guard-secret",
+			"x-better-ccflare-pool-status": "exhausted",
+			"x-better-ccflare-recovery-scope": "pool",
+			"x-provider-echo": "secret",
+			"content-type": "application/json; charset=utf-8",
+			"retry-after": "5",
+			"x-request-id": "req_first",
+		});
+		headers.append("content-type", "text/html");
+		headers.append("retry-after", "30");
+		headers.append("x-request-id", "req_second");
+
+		const response = createProtectedAnthropicOverloadResponse({
+			kind: "trusted_upstream",
+			response: new Response(canonicalBody, { status: 529, headers }),
+			now,
+		});
+
+		expect([...response.headers.keys()].sort()).toEqual([
+			"content-type",
+			"retry-after",
+		]);
+		expect(response.headers.get("content-type")).toBe("application/json");
+		expect(response.headers.get("retry-after")).toBe("10");
+		expect(response.headers.get("x-request-id")).toBeNull();
+		expect(response.headers.get("x-better-ccflare-pool-status")).toBeNull();
+		expect(response.headers.get("x-better-ccflare-recovery-scope")).toBeNull();
+	});
+
+	it.each([
+		["contains whitespace", "req unsafe"],
+		["contains a delimiter", "req_one,req_two"],
+		["is oversized", `req_${"x".repeat(128)}`],
+	] as const)("drops an x-request-id that %s", (_label, requestId) => {
+		const response = createProtectedAnthropicOverloadResponse({
+			kind: "trusted_upstream",
+			response: new Response(canonicalBody, {
+				status: 529,
+				headers: {
+					"content-type": "application/json",
+					"x-request-id": requestId,
+				},
+			}),
+			now,
+		});
+
+		expect(response.headers.get("x-request-id")).toBeNull();
+	});
+
+	it("does not preserve or consume a non-529 response", async () => {
+		const untrusted = new Response("private upstream failure", {
+			status: 503,
+			headers: {
+				"content-type": "text/html",
+				"retry-after": "60",
+				"x-request-id": "req_should_not_escape",
+				"x-provider-echo": "secret",
+			},
+		});
+
+		const response = createProtectedAnthropicOverloadResponse({
+			kind: "trusted_upstream",
+			response: untrusted,
+			retryAfter: 13,
+			now,
+		});
+
+		expect(untrusted.bodyUsed).toBe(false);
+		expect(response.status).toBe(529);
+		expect(response.headers.get("content-type")).toBe("application/json");
+		expect(response.headers.get("retry-after")).toBe("13");
+		expect(response.headers.get("x-request-id")).toBeNull();
+		expect(await response.text()).toBe(canonicalBody);
+		expect(await untrusted.text()).toBe("private upstream failure");
 	});
 });

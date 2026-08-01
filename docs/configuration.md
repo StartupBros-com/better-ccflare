@@ -9,6 +9,7 @@ This guide covers all configuration options for better-ccflare, including file-b
 - [Configuration File Format](#configuration-file-format)
 - [Configuration Options](#configuration-options)
 - [Environment Variables](#environment-variables)
+- [Anthropic Degraded Mode](#anthropic-degraded-mode)
 - [Model Catalog](#model-catalog)
 - [Runtime Configuration API](#runtime-configuration-api)
 - [Example Configurations](#example-configurations)
@@ -38,6 +39,7 @@ Configuration values are resolved in the following order (highest to lowest prio
 
 - **Load balancing strategy**: Environment variable `LB_STRATEGY` overrides file configuration
 - **Runtime configuration**: Some values (like strategy) can be changed at runtime via API
+- **Anthropic degraded mode**: All policy and diagnostic settings are captured at process start; changing them requires a full restart
 
 ## Configuration File Format
 
@@ -160,6 +162,59 @@ These environment variables are not stored in the configuration file and must be
 | `CF_STREAM_USAGE_BUFFER_KB` | Stream usage buffer size in KB | `64` | `CF_STREAM_USAGE_BUFFER_KB=128` |
 | `CF_STREAM_TIMEOUT_MS` | Stream processing timeout in milliseconds | `60000` (1 minute) | `CF_STREAM_TIMEOUT_MS=120000` |
 | `BETTER_CCFLARE_OUTBOUND_PROXY` | Routes all outbound HTTP(S) traffic through a forward proxy | unset | `BETTER_CCFLARE_OUTBOUND_PROXY=http://127.0.0.1:3636` |
+
+## Anthropic Degraded Mode
+
+Anthropic degraded mode is an opt-in, restart-scoped safety layer for large native Anthropic OAuth requests during a confirmed provider-cohort overload. It is `off` by default. For the routing and recovery model, see [Account Routing Architecture](./routing-architecture.md#anthropic-degraded-mode); for staged activation and rollback, see [Systemd Deployment](./systemd.md#anthropic-degraded-mode-rollout).
+
+| Mode | Effect |
+|---|---|
+| `off` | No cohort evidence is retained and existing routing, ownership, transport, response, and retry behavior is unchanged. |
+| `observe` | Builds isolated shadow state and reports the decisions enforcement would make. It does not change candidate order, cache-owner mappings, provider sends, responses, or retry counts. Shadow state is discarded on restart and is never promoted into enforcement state. |
+| `enforce` | Bounds large-request sends and preserves an established cache owner when available after a matching cross-account overload quorum. This is supported only when all affected traffic shares one server-process coordinator. Separate replicas can each elect one recovery probe. |
+
+Environment values take precedence over the matching configuration-file fields. All numeric settings require safe integers, including when supplied as strings through the environment.
+
+| Environment variable | Configuration-file field | Default | Accepted value or bound |
+|---|---|---:|---|
+| `CCFLARE_ANTHROPIC_DEGRADED_MODE` | `anthropic_degraded_mode` | `off` | `off`, `observe`, or `enforce` |
+| `CCFLARE_ANTHROPIC_DEGRADED_LARGE_REQUEST_TOKENS` | `anthropic_degraded_large_request_tokens` | `100000` | `10000`–`2000000` tokens |
+| `CCFLARE_ANTHROPIC_DEGRADED_LARGE_REQUEST_BYTES` | `anthropic_degraded_large_request_bytes` | `262144` | `65536`–`16777216` bytes |
+| `CCFLARE_ANTHROPIC_DEGRADED_EVIDENCE_WINDOW_MS` | `anthropic_degraded_evidence_window_ms` | `30000` | `5000`–`300000` ms |
+| `CCFLARE_ANTHROPIC_DEGRADED_QUORUM` | `anthropic_degraded_quorum` | `2` | `2`–`8` distinct underlying accounts |
+| `CCFLARE_ANTHROPIC_DEGRADED_RETRY_MIN_MS` | `anthropic_degraded_retry_min_ms` | `5000` | `1000`–`60000` ms |
+| `CCFLARE_ANTHROPIC_DEGRADED_RETRY_FALLBACK_MS` | `anthropic_degraded_retry_fallback_ms` | `10000` | `1000`–`300000` ms |
+| `CCFLARE_ANTHROPIC_DEGRADED_RETRY_MAX_MS` | `anthropic_degraded_retry_max_ms` | `60000` | `5000`–`300000` ms |
+| `CCFLARE_ANTHROPIC_DEGRADED_RECOVERY_WINDOW_MS` | `anthropic_degraded_recovery_window_ms` | `30000` | `5000`–`300000` ms |
+| `CCFLARE_ANTHROPIC_DEGRADED_PROBE_LEASE_MS` | `anthropic_degraded_probe_lease_ms` | `600000` | `60000`–`900000` ms |
+| `CCFLARE_ANTHROPIC_DEGRADED_MAX_COHORTS` | `anthropic_degraded_max_cohorts` | `1024` | `1`–`10000` retained cohorts |
+| `CCFLARE_ANTHROPIC_DEGRADED_DIAGNOSTICS` | `anthropic_degraded_diagnostics_enabled` | `false` | Environment: `true`/`1` or `false`/`0`; file: JSON boolean |
+
+The retry values must also satisfy `retry min <= retry fallback <= retry max`. If the mode or any numeric policy setting is malformed, out of range, or violates that relationship, the entire policy resolves atomically to the built-in defaults (including mode `off`) and writes a warning. It never runs with a partially accepted policy. An invalid diagnostic flag separately leaves detailed diagnostics off and writes a warning.
+
+All cohort, probe, shadow-owner, and diagnostic-correlation state is in memory. A restart clears it, rotates the opaque boot identity, and starts fresh in the configured mode; there is no database migration or cleanup step. Configuration API writes do not hot-switch a running coordinator.
+
+### Aggregate health
+
+Ordinary `GET /health` includes a fixed, aggregate-only `runtime.anthropicDegraded` object. The existing short health cache can delay a new snapshot by about two seconds.
+
+| Group | Fields |
+|---|---|
+| Identity and policy | `schemaVersion`, opaque `bootId`, `mode`, `diagnosticsEnabled`, and `thresholds.{largeRequestTokenThreshold,largeRequestByteThreshold,evidenceWindowMs,quorum,retryMinMs,retryFallbackMs,retryMaxMs,recoveryWindowMs,probeLeaseMs,maxCohorts}` |
+| Cohort state | `cohorts.total`, `cohorts.byState.{collecting,open,probing,recovering}`, `cohorts.ageBands.{under30Seconds,from30SecondsTo5Minutes,atLeast5Minutes}`, and `activeProbes` |
+| Attempt accounting | `attempts.{logical,guard,local,physical}` |
+| Decisions and terminals | `decisions.{suppressedSends,wouldSuppressSends,probeSends,wouldProbeSends}` and `terminals.{success,overload,suppressed,failure,cancelled,timeout}` |
+| Pressure | `droppedEvents`, `droppedEvidence`, and `saturation` |
+
+Health never exposes exact request sizes, per-cohort/account/owner identifiers, or diagnostic event history. Enabling `HEALTH_DETAIL_ENABLED` does not add degraded-mode joins or a detailed degraded-mode route.
+
+### Detailed diagnostics
+
+`CCFLARE_ANTHROPIC_DEGRADED_DIAGNOSTICS=true` enables bounded, privacy-safe structured events after the next restart. The default is `false`. Each accepted line is written to stdout as JSON with `event: "anthropic_degraded_mode"` and is captured by journald in the production unit. Event kinds cover request risk, physical attempts, would-suppress/suppress decisions, quorum/probe/owner transitions, and terminal outcomes. Exact bounded byte/token estimates and boot-scoped opaque joins appear only in this stream.
+
+Detailed events never include prompts, reasoning, tool payloads, response bodies, credentials, raw account or session identifiers, endpoint URLs, or arbitrary serialized errors. Delivery is bounded and nonblocking; dropped events increment `droppedEvents` and cannot affect routing or lease cleanup. The application provides no public HTTP endpoint or queryable history for these records.
+
+Enable diagnostics only for a bounded observation window after verifying who can read the service journal and that journald has explicit size and time retention. See [Journal access and retention](./systemd.md#journal-access-and-retention). Disable diagnostics and restart when the window ends.
 
 For a WebSocket cache canary, export the bounded service journal window as JSONL and join it to the matching Codex trace. The analyzer accepts direct transport observations, logger JSON, and `journalctl -o json` records; it excludes duplicate or ambiguous identities and prints aggregate-only output:
 

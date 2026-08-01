@@ -372,6 +372,21 @@ afterEach(() => {
 });
 
 describe("global model-first routing", () => {
+	it("preserves baseline routing when the degraded-mode runtime is absent", async () => {
+		const account = makeAccount("legacy-context");
+		const ctx = makeContext([account], makeCombo({ account }));
+		const attempts = installFetch(() => success());
+
+		expect(
+			(ctx as Partial<ProxyContext>).anthropicDegradedMode,
+		).toBeUndefined();
+
+		const response = await run(ctx);
+
+		expect(response.status).toBe(200);
+		expect(attempts).toEqual([{ account: account.id, model: FABLE }]);
+	});
+
 	it("tries B/Fable after A/Fable scoped failure without attempting A/Opus", async () => {
 		const accountA = makeAccount("account-a");
 		const accountB = makeAccount("account-b");

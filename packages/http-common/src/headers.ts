@@ -8,6 +8,13 @@ export const GUARD_REQUEST_ID_HEADER =
 	"x-better-ccflare-guard-request-id" as const;
 
 /**
+ * Reserved defense-in-depth name for the env-only guard credential.
+ * Legitimate stack components never transmit the credential over HTTP.
+ */
+export const GUARD_CORRELATION_SECRET_HEADER =
+	"x-better-ccflare-guard-correlation-secret" as const;
+
+/**
  * Sanitizes proxy headers by removing hop-by-hop headers that should not be forwarded
  * after Bun has automatically decompressed the response body, and reserved,
  * guard-trusted headers that must never originate from an upstream provider.
@@ -40,6 +47,7 @@ export function sanitizeProxyHeaders(original: Headers): Headers {
 	// request header on responses, and an upstream must not be able to introduce
 	// a same-named value that the client or guard could mistake for internal state.
 	sanitized.delete(GUARD_REQUEST_ID_HEADER);
+	sanitized.delete(GUARD_CORRELATION_SECRET_HEADER);
 
 	return sanitized;
 }
@@ -65,6 +73,7 @@ export function sanitizeRequestHeaders(original: Headers): Headers {
 	// This hop-local join key is useful in live structured logs only. Persisting it
 	// with request payload metadata would unnecessarily widen its trust boundary.
 	h.delete(GUARD_REQUEST_ID_HEADER);
+	h.delete(GUARD_CORRELATION_SECRET_HEADER);
 	// keep in sync with INTERNAL_PROBE_SECRET_HEADER
 	// (@better-ccflare/proxy already depends on http-common, so importing the
 	// proxy package's constant here would create an import cycle)

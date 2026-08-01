@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import {
 	closeSync,
 	openSync,
@@ -41,6 +41,19 @@ export const DEFAULT_GUARD_DELAY_INSPECTION_TIMEOUT_MS = 5_000;
 // rationale.
 export const DEFAULT_GUARD_ALLOW_LEGACY_POOL_BODY = false;
 export const GUARD_REQUEST_ID_HEADER = "x-better-ccflare-guard-request-id";
+export const GUARD_CORRELATION_SECRET_HEADER =
+	"x-better-ccflare-guard-correlation-secret";
+const PROXY_REQUEST_ID_HEADER = "x-better-ccflare-request-id";
+export const GUARD_CORRELATION_SECRET_ENV =
+	"CCFLARE_GUARD_CORRELATION_SECRET";
+
+const GUARD_CORRELATION_VERSION = "v1";
+const GUARD_CORRELATION_SIGNING_DOMAIN =
+	"better-ccflare/guard-correlation/v1";
+const MAX_GUARD_ATTEMPT_ORDINAL = 1_000_000;
+const CANONICAL_UUID_V4_PATTERN =
+	/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const CANONICAL_32_BYTE_BASE64URL = /^[A-Za-z0-9_-]{43}$/;
 
 // Bound the only response-content state retained by the guard. The observer
 // never logs event data (which can include provider or user content); it emits
@@ -210,7 +223,7 @@ function combineAbortSignals(signals) {
 	};
 }
 
-function requestHeaders(req, bodyLength, guardRequestId) {
+function requestHeaders(req, bodyLength, guardCorrelationEnvelope) {
 	const headers = new Headers();
 	for (const [key, value] of Object.entries(req.headers)) {
 		const lower = key.toLowerCase();
@@ -224,9 +237,13 @@ function requestHeaders(req, bodyLength, guardRequestId) {
 		if (Array.isArray(value)) headers.set(key, value.join(", "));
 		else if (value != null) headers.set(key, String(value));
 	}
-	// This listener is the trust boundary for the private correlation header.
-	// Always overwrite a client-supplied value with this request's UUID.
-	headers.set(GUARD_REQUEST_ID_HEADER, guardRequestId);
+	// This listener is the trust boundary for correlation. A client-supplied
+	// value is always discarded, including when stack credentials are missing.
+	headers.delete(GUARD_REQUEST_ID_HEADER);
+	headers.delete(GUARD_CORRELATION_SECRET_HEADER);
+	if (guardCorrelationEnvelope) {
+		headers.set(GUARD_REQUEST_ID_HEADER, guardCorrelationEnvelope);
+	}
 	if (bodyLength > 0) headers.set("content-length", String(bodyLength));
 	return headers;
 }
@@ -236,11 +253,52 @@ function responseHeaders(fetchHeaders, bodyLength = null) {
 	fetchHeaders.forEach((value, key) => {
 		const lower = key.toLowerCase();
 		if (HOP_BY_HOP_HEADERS.has(lower)) return;
+		if (
+			lower === GUARD_REQUEST_ID_HEADER ||
+			lower === GUARD_CORRELATION_SECRET_HEADER ||
+			lower === PROXY_REQUEST_ID_HEADER
+		) {
+			return;
+		}
 		if (bodyLength != null && lower === "content-length") return;
 		headers[key] = value;
 	});
 	if (bodyLength != null) headers["content-length"] = String(bodyLength);
 	return headers;
+}
+
+function decodeGuardCorrelationSecret(encoded) {
+	if (
+		typeof encoded !== "string" ||
+		!CANONICAL_32_BYTE_BASE64URL.test(encoded)
+	) {
+		return null;
+	}
+	const decoded = Buffer.from(encoded, "base64url");
+	if (decoded.byteLength !== 32 || decoded.toString("base64url") !== encoded) {
+		return null;
+	}
+	return decoded;
+}
+
+function createGuardCorrelationSigner(encodedSecret) {
+	const secret = decodeGuardCorrelationSecret(encodedSecret);
+	if (!secret) return () => null;
+	return (requestId, attemptOrdinal) => {
+		if (
+			!CANONICAL_UUID_V4_PATTERN.test(requestId) ||
+			!Number.isSafeInteger(attemptOrdinal) ||
+			attemptOrdinal < 1 ||
+			attemptOrdinal > MAX_GUARD_ATTEMPT_ORDINAL
+		) {
+			return null;
+		}
+		const signingInput = `${GUARD_CORRELATION_SIGNING_DOMAIN}\n${requestId}\n${attemptOrdinal}`;
+		const signature = createHmac("sha256", secret)
+			.update(signingInput, "utf8")
+			.digest("base64url");
+		return `${GUARD_CORRELATION_VERSION}.${requestId}.${attemptOrdinal}.${signature}`;
+	};
 }
 
 async function readBody(req, signal) {
@@ -988,6 +1046,9 @@ export function planRecoveryAction({
 
 export function createGuard(options = {}) {
 	const env = options.env || process.env;
+	const signGuardCorrelation = createGuardCorrelationSigner(
+		options.guardCorrelationSecret ?? env[GUARD_CORRELATION_SECRET_ENV],
+	);
 	const listenHost = options.listenHost ?? env.GUARD_HOST ?? "127.0.0.1";
 	const listenPort = configuredNumber(
 		options.listenPort ?? env.GUARD_PORT ?? env.PORT,
@@ -1302,10 +1363,21 @@ export function createGuard(options = {}) {
 		signal,
 		upstreamTarget,
 		guardRequestId,
+		guardAttemptOrdinal,
 	) {
+		// Sign at the physical-fetch boundary so ordinals describe actual guard
+		// attempts, not queue admissions or planned retries.
+		const guardCorrelationEnvelope = signGuardCorrelation(
+			guardRequestId,
+			guardAttemptOrdinal,
+		);
 		const init = {
 			method: req.method,
-			headers: requestHeaders(req, body.length, guardRequestId),
+			headers: requestHeaders(
+				req,
+				body.length,
+				guardCorrelationEnvelope,
+			),
 			redirect: "manual",
 			signal,
 		};
@@ -1608,6 +1680,7 @@ export function createGuard(options = {}) {
 							context.signal,
 							upstreamTarget,
 							id,
+							attempt,
 						),
 						responseTelemetry,
 						{
@@ -2066,6 +2139,7 @@ export function createGuard(options = {}) {
 					context.signal,
 					upstreamTarget,
 					context.id,
+					1,
 				),
 				responseTelemetry,
 			);

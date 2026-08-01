@@ -200,6 +200,140 @@ Set the database path in the unit file:
 ```ini
 Environment=BETTER_CCFLARE_DB_PATH=/var/lib/better-ccflare/better-ccflare.db
 ```
+
+## Anthropic Degraded Mode Rollout
+
+Anthropic degraded mode is restart-scoped and `off` by default. Read [Configuration](./configuration.md#anthropic-degraded-mode) and [Account Routing Architecture](./routing-architecture.md#anthropic-degraded-mode) before activation. Do not generate synthetic traffic against a real Anthropic account for this rollout; use deterministic validation before deployment and observe only naturally arriving production traffic.
+
+### Topology gate
+
+`enforce` is supported only when all affected traffic reaches one better-ccflare server process and therefore one in-memory coordinator. The standard `ccflare-stack.service` runner starts one guard and one upstream server, which satisfies the process boundary only if no other stack, worker, pod, or replica also receives the traffic.
+
+Before enforcement:
+
+- Inventory every load-balancer target and service instance, not just the local unit.
+- Confirm one active upstream server process owns all affected routes.
+- Treat SQLite/PostgreSQL as irrelevant to coordination; degraded state is never stored there.
+- Do not enable enforcement across replicas. Two independent coordinators may each elect one natural recovery probe.
+
+The local process check is useful but does not replace the fleet inventory:
+
+```sh
+systemctl show ccflare-stack.service \
+  --property=ActiveState \
+  --property=SubState \
+  --property=MainPID
+```
+
+### Establish an off baseline
+
+Set these values in the existing service environment or configuration file:
+
+```ini
+Environment=CCFLARE_ANTHROPIC_DEGRADED_MODE=off
+Environment=CCFLARE_ANTHROPIC_DEGRADED_DIAGNOSTICS=false
+```
+
+Then restart the complete stack:
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl restart ccflare-stack.service
+
+curl -fsS http://127.0.0.1:8788/health |
+  jq '{status, git_sha, anthropicDegraded: .runtime.anthropicDegraded}'
+curl -fsS http://127.0.0.1:8788/_guard/health |
+  jq '{status, runtime, counters}'
+```
+
+Record the expected `git_sha` and the opaque `runtime.anthropicDegraded.bootId`. Verify `mode` is `off`, `diagnosticsEnabled` is `false`, both health endpoints respond, and the boot ID changed from the previous full-stack run. Use this boot-scoped window to establish normal client status/error-body shape, account selection, physical-send rate, guard-attempt rate, and session-owner continuity.
+
+### Journal access and retention
+
+Detailed diagnostics are allowed only in the host service journal. Before enabling them, verify that intended operators can read the unit and unrelated users cannot:
+
+```sh
+getent group systemd-journal
+namei -l /var/log/journal /run/log/journal 2>/dev/null
+getfacl -p /var/log/journal /run/log/journal 2>/dev/null
+OPERATOR_USER=alice
+sudo -u "$OPERATOR_USER" journalctl \
+  -u ccflare-stack.service --since -5min --no-pager
+```
+
+Review the effective journald policy, not only one source file:
+
+```sh
+systemd-analyze cat-config systemd/journald.conf
+journalctl --disk-usage
+```
+
+Confirm the active storage mode and explicit site-appropriate size and time bounds, including `SystemMaxUse` or `RuntimeMaxUse` and `MaxRetentionSec`. If the policy is changed in `/etc/systemd/journald.conf.d/`, restart `systemd-journald` and repeat both checks. Do not enable detailed diagnostics when reader access is broader than intended or either retention dimension is unbounded.
+
+Inspect detailed records in place instead of creating an unmanaged export:
+
+```sh
+journalctl -u ccflare-stack.service --since -15min -o cat |
+  jq -Rc 'fromjson? | select(.event == "anthropic_degraded_mode")'
+```
+
+These records contain only bounded estimates and boot-scoped opaque identifiers, but they are still operator diagnostic data. If a controlled export is necessary, protect it under the same ACL and deletion deadline as the journal window.
+
+### Observe before enforcing
+
+After the baseline and journal checks, set:
+
+```ini
+Environment=CCFLARE_ANTHROPIC_DEGRADED_MODE=observe
+Environment=CCFLARE_ANTHROPIC_DEGRADED_DIAGNOSTICS=true
+```
+
+Perform another full-stack restart and confirm a new boot ID, `mode: "observe"`, and `diagnosticsEnabled: true`. Observation starts with empty shadow state; no state from the off baseline is reused.
+
+Compare rates over similarly sized natural-traffic windows. Counters reset on every restart, and opaque account/owner identifiers rotate with the boot ID, so compare distributions and behavior rather than attempting cross-boot identifier joins.
+
+| Signal | Source | Observation pass criterion |
+|---|---|---|
+| Client status and body | Existing client/application telemetry | Status and Anthropic error type/message shape match the off baseline; do not add raw body logging. |
+| Account choice | Existing request/account attribution; boot-local `physical_attempt.accountId` diagnostics | Candidate order and account distribution show no observe-only routing change. |
+| Owner continuity | Repeated session/account attribution; boot-local `transition` events with `subject: "owner"` | Existing owners remain authoritative and hypothetical retention does not remap affinity. |
+| Proxy sends | Health `attempts.{logical,local,physical}` | Physical-send behavior matches off for comparable traffic; `decisions.suppressedSends` and `decisions.probeSends` remain zero while `wouldSuppressSends`/`wouldProbeSends` may increase. |
+| Guard attempts | Health `attempts.guard` plus guard-health `counters.{total,retried,overload529}` | Guard amplification does not increase in observe. |
+| Pressure and loss | Health `droppedEvents`, `droppedEvidence`, and `saturation` | `saturation` stays false; any drop is explained before enforcement. |
+
+Detailed events should reconcile each logical request to its physical attempts, guard-attempt ordinal when authenticated, owner/quorum/probe decisions, and terminal outcome without retaining user content. End the diagnostic window if client semantics, routing, owner state, sends, or retry behavior diverge from the off baseline.
+
+### Enforce and rollback
+
+Enable `enforce` only after the topology gate and observation criteria pass. Leave diagnostics off unless a separately approved bounded journal window is still active:
+
+```ini
+Environment=CCFLARE_ANTHROPIC_DEGRADED_MODE=enforce
+Environment=CCFLARE_ANTHROPIC_DEGRADED_DIAGNOSTICS=false
+```
+
+Restart the complete stack and verify the expected SHA, a new boot ID, `mode: "enforce"`, and the intended diagnostic state. The fresh coordinator does not inherit observe evidence. During a real matching overload, monitor cohort state, active probes, send/suppression decisions, terminal outcomes, guard attempts, drops, and saturation. A protected 529 is terminal at the guard and must not produce a guard body replay.
+
+Rollback is configuration-only:
+
+```ini
+Environment=CCFLARE_ANTHROPIC_DEGRADED_MODE=off
+Environment=CCFLARE_ANTHROPIC_DEGRADED_DIAGNOSTICS=false
+```
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl restart ccflare-stack.service
+```
+
+Verify a new boot ID with `mode: "off"` and `diagnosticsEnabled: false`. The restart clears cohorts, leases, retained/shadow owners, and detailed joins. No database cleanup is required.
+
+### Full-stack guard correlation
+
+Each full-stack runner invocation internally generates one ephemeral guard-correlation credential and gives it directly to both child processes. It is not operator configuration: do not add it to `.env`, a unit drop-in, command-line arguments, or logs. A full-stack restart rotates it.
+
+If one child is replaced independently or the two children otherwise disagree, correlation authentication fails closed to local, unjoined attempt accounting. That mismatch does not grant routing authority and must not change provider selection, response bodies, 529 passthrough, or guard retry policy. Restart the full stack to restore joined guard-attempt diagnostics.
+
 ## Codex orchestration safety
 
 Codex routing allows one orchestration-capable conversation per identified Claude Code session. The first conversation that offers `Agent` or `Task` becomes the session root. Other conversation identities in that session keep their normal tools but have current `Agent` and `Task` declarations removed. The election is process-local, expires after five hours of orchestration inactivity, and resets when the service restarts. Concurrent independent orchestration roots in one Claude Code session are intentionally unsupported.

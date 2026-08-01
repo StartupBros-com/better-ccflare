@@ -14,6 +14,7 @@ import {
 import type {
 	Account,
 	AccountQuotaPressure,
+	AffinityOwnerDirective,
 	ComboFamily,
 	ComboMembershipSource,
 	ComboRoutingPolicySnapshot,
@@ -21,6 +22,11 @@ import type {
 	RequestMeta,
 	RoutingCandidateMetadata,
 } from "@better-ccflare/types";
+import { isNativeAnthropicOAuthDegradedModeEligible } from "../anthropic-degraded-eligibility";
+import type {
+	AnthropicDegradedRouteInspection,
+	AnthropicReplayRisk,
+} from "../anthropic-degraded-mode";
 import { buildComboMembershipDiagnostics } from "./managed-routing-diagnostics";
 import type { ProxyContext } from "./proxy-types";
 import {
@@ -138,6 +144,19 @@ export interface AccountSelectionOptions {
 	readonly skipCombo?: boolean;
 	/** Ignore request-reactive model/family markers for a trusted synthetic probe. */
 	readonly syntheticProbe?: boolean;
+	/**
+	 * U3 supplies the capture-once replay/cohort inspection computed before
+	 * selection. Account selection owns materializing the typed directive before
+	 * the strategy can mutate affinity.
+	 */
+	readonly degradedOwner?: DegradedOwnerSelectionContext;
+}
+
+export interface DegradedOwnerSelectionContext {
+	readonly inspection: AnthropicDegradedRouteInspection;
+	readonly requestKind: AnthropicReplayRisk["kind"];
+	/** Reports the actual/enforce or hypothetical/observe owner decision. */
+	readonly onDecision?: (decision: AffinityOwnerDirective | null) => void;
 }
 
 /** Request-local capacity evidence retained for terminal classification. */
@@ -474,6 +493,170 @@ function prepareNormalRoutingMetadata(
 	return accounts.filter((account) => !excludedIds.has(account.id));
 }
 
+function captureAffinityOwnerSnapshot(
+	meta: RequestMeta,
+	ctx: ProxyContext,
+): void {
+	if (meta.affinityOwnerSnapshot !== undefined) return;
+	meta.affinityOwnerSnapshot =
+		ctx.strategy.snapshotAffinityOwner?.(meta) ?? null;
+}
+
+function findNativeAnthropicOAuthOwner(
+	owner: NonNullable<RequestMeta["affinityOwnerSnapshot"]>,
+	meta: RequestMeta,
+	accounts: readonly Account[],
+): Account | null {
+	const candidateStillConfigured =
+		meta.routingCandidateCatalog?.some(
+			(candidate) =>
+				candidate.candidateId === owner.candidateId &&
+				candidate.accountId === owner.accountId,
+		) === true;
+	if (
+		!candidateStillConfigured ||
+		meta.hardExcludedAccountIds?.has(owner.accountId)
+	) {
+		return null;
+	}
+	const account = accounts.find(
+		(candidate) => candidate.id === owner.accountId,
+	);
+	return account &&
+		!account.paused &&
+		isNativeAnthropicOAuthDegradedModeEligible(account)
+		? account
+		: null;
+}
+
+function hasOnlyNativeAnthropicOAuthCandidates(
+	meta: RequestMeta,
+	accounts: readonly Account[],
+): boolean {
+	const candidates = meta.routingCandidates ?? [];
+	if (candidates.length === 0) return false;
+	const accountsById = new Map(
+		accounts.map((account) => [account.id, account]),
+	);
+	return candidates.every((candidate) => {
+		const account = accountsById.get(candidate.accountId);
+		return (
+			account !== undefined &&
+			!account.paused &&
+			!meta.hardExcludedAccountIds?.has(account.id) &&
+			isNativeAnthropicOAuthDegradedModeEligible(account)
+		);
+	});
+}
+
+function hasNativeAnthropicOAuthCandidate(
+	meta: RequestMeta,
+	accounts: readonly Account[],
+): boolean {
+	const candidates = meta.routingCandidates ?? [];
+	if (candidates.length === 0) return false;
+	const accountsById = new Map(
+		accounts.map((account) => [account.id, account]),
+	);
+	return candidates.some((candidate) => {
+		const account = accountsById.get(candidate.accountId);
+		return (
+			account !== undefined &&
+			!account.paused &&
+			!meta.hardExcludedAccountIds?.has(account.id) &&
+			isNativeAnthropicOAuthDegradedModeEligible(account)
+		);
+	});
+}
+
+function materializeDegradedOwnerDirective(
+	meta: RequestMeta,
+	ctx: ProxyContext,
+	accounts: readonly Account[],
+	context: DegradedOwnerSelectionContext | undefined,
+): void {
+	if (!context) {
+		meta.affinityOwnerDirective = null;
+		return;
+	}
+	const { inspection, requestKind } = context;
+	const mode = ctx.anthropicDegradedMode.config.mode;
+	if (mode === "off") {
+		meta.affinityOwnerDirective = null;
+		return;
+	}
+	if (!hasNativeAnthropicOAuthCandidate(meta, accounts)) {
+		meta.affinityOwnerDirective = null;
+		return;
+	}
+	captureAffinityOwnerSnapshot(meta, ctx);
+	const observeOnly = mode === "observe";
+	const overlay = observeOnly
+		? ctx.degradedOwnerShadowOverlay
+		: ctx.degradedOwnerOverlay;
+	const publish = (decision: AffinityOwnerDirective | null): void => {
+		try {
+			context.onDecision?.(decision);
+		} catch {
+			// Observability cannot affect account selection.
+		}
+		meta.affinityOwnerDirective = observeOnly ? null : decision;
+	};
+	const laneKey = meta.affinityLaneKey ?? null;
+	let prospectiveOwner = overlay.peekRetainedOwner(
+		laneKey,
+		inspection.cohortKey,
+	);
+	if (
+		prospectiveOwner &&
+		!findNativeAnthropicOAuthOwner(prospectiveOwner, meta, accounts)
+	) {
+		if (laneKey && inspection.cohortKey) {
+			overlay.invalidateOwner(laneKey, inspection.cohortKey);
+		}
+		prospectiveOwner = null;
+	}
+	prospectiveOwner ??= meta.affinityOwnerSnapshot ?? null;
+	if (prospectiveOwner) {
+		if (!findNativeAnthropicOAuthOwner(prospectiveOwner, meta, accounts)) {
+			publish(null);
+			return;
+		}
+	} else if (!hasOnlyNativeAnthropicOAuthCandidates(meta, accounts)) {
+		publish(null);
+		return;
+	}
+
+	const recoveringUntil =
+		inspection.detail.state === "recovering"
+			? inspection.detail.recoveringUntil
+			: undefined;
+	const directive = overlay.materializeDirective({
+		laneKey,
+		cohortKey: inspection.cohortKey,
+		state: inspection.state,
+		requestKind,
+		owner: meta.affinityOwnerSnapshot ?? null,
+		enforced: true,
+		recoveringUntil,
+	});
+
+	if (directive?.kind !== "retain-owner") {
+		publish(directive);
+		return;
+	}
+
+	if (findNativeAnthropicOAuthOwner(directive.owner, meta, accounts)) {
+		publish(directive);
+		return;
+	}
+
+	if (laneKey && inspection.cohortKey) {
+		overlay.invalidateOwner(laneKey, inspection.cohortKey);
+	}
+	publish(null);
+}
+
 /**
  * Gets accounts ordered by the load balancing strategy
  * @param meta - Request metadata
@@ -521,6 +704,7 @@ export async function getOrderedAccounts(
 	effectiveModel: string | null = null,
 	syntheticProbe = false,
 	preloadedAccounts?: Account[],
+	degradedOwner?: DegradedOwnerSelectionContext,
 ): Promise<Account[]> {
 	try {
 		const allAccounts = preloadedAccounts ?? (await ctx.dbOps.getAllAccounts());
@@ -531,6 +715,7 @@ export async function getOrderedAccounts(
 			effectiveModel,
 			syntheticProbe,
 		);
+		materializeDegradedOwnerDirective(meta, ctx, allAccounts, degradedOwner);
 		const hardExcluded = meta.hardExcludedAccountIds;
 		// Return all accounts - the provider will be determined dynamically per account.
 		const ordered = (await ctx.strategy.select(eligibleAccounts, meta)).filter(
@@ -931,6 +1116,12 @@ export async function selectAccountsForRequest(
 						meta.routingCandidates = eligibleEntries.map(
 							(entry) => entry.routing,
 						);
+						materializeDegradedOwnerDirective(
+							meta,
+							ctx,
+							allAccounts,
+							options.degradedOwner,
+						);
 						const entryByCandidateId = new Map(
 							eligibleEntries.map((entry) => [
 								entry.routing.candidateId,
@@ -1072,6 +1263,7 @@ export async function selectAccountsForRequest(
 			effectiveModel,
 			options.syntheticProbe === true,
 			preloadedAccounts,
+			options.degradedOwner,
 		),
 	);
 }

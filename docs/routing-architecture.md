@@ -8,13 +8,14 @@ This document explains how better-ccflare picks an account for each proxied requ
 
 1. [Overview: Three Orthogonal Axes](#overview-three-orthogonal-axes)
 2. [Master Pipeline](#master-pipeline)
-3. [The Three Load-Balancing Strategies](#the-three-load-balancing-strategies)
+3. [Anthropic Degraded Mode](#anthropic-degraded-mode)
+4. [The Three Load-Balancing Strategies](#the-three-load-balancing-strategies)
    - [session](#session-sessionstrategy)
    - [session-affinity](#session-affinity-sessionaffinitystrategy)
    - [least-used](#least-used-leastusedstrategy)
-4. [Usage Throttling](#usage-throttling)
-5. [Model-Capacity Routing](#model-capacity-routing)
-6. [Auto-Fallback](#auto-fallback)
+5. [Usage Throttling](#usage-throttling)
+6. [Model-Capacity Routing](#model-capacity-routing)
+7. [Auto-Fallback](#auto-fallback)
 
 ## Overview: Three Orthogonal Axes
 
@@ -22,7 +23,7 @@ Account routing is controlled by two independent runtime settings plus one alway
 
 ## Master Pipeline
 
-Every proxied request first checks for the `x-better-ccflare-account-id` force-route header (used both for manual force-routing and by internal auto-refresh/keepalive probes), then runs the configured strategy's `select()`, then an optional model-capacity filter, then an optional usage-throttling gate. If the candidate pool is empty afterwards, the response depends on *why* it emptied — the capacity filter and usage-throttling empty the pool for mutually exclusive reasons on a given request (the capacity filter runs first and, if it excludes everyone, usage-throttling never sees any accounts to throttle), so the code checks them in a fixed priority order: a capacity exclusion is reported first (as a structured 429), a throttling exclusion second (as a 529), and a strategy-level "nothing available at all" last (as a generic 503). When a [Combo](./combos.md) is active for the request's model family, an additional per-slot routing layer runs between the forced-header check and `Strategy.select`; it is omitted from the diagram below for clarity (see `packages/proxy/src/handlers/account-selector.ts`).
+Every proxied request first checks for the `x-better-ccflare-account-id` force-route header (used both for manual force-routing and by internal auto-refresh/keepalive probes), then runs the configured strategy's `select()`, then an optional model-capacity filter, then an optional usage-throttling gate. If the candidate pool is empty afterwards, the response depends on *why* it emptied — the capacity filter and usage-throttling empty the pool for mutually exclusive reasons on a given request (the capacity filter runs first and, if it excludes everyone, usage-throttling never sees any accounts to throttle), so the code checks them in a fixed priority order: a capacity exclusion is reported first (as a structured 429), a throttling exclusion second (as a 529), and a strategy-level "nothing available at all" last (as a generic 503). When a [Combo](./combos.md) is active for the request's model family, an additional per-slot routing layer runs between the forced-header check and `Strategy.select`; it is omitted from the diagram below for clarity (see `packages/proxy/src/handlers/account-selector.ts`). The default-off [Anthropic degraded-mode](#anthropic-degraded-mode) admission gate sits below selection at every physical-send boundary; in `off` and `observe` the diagram remains behaviorally unchanged, while `enforce` can retain an owner for a matching session and can return a protected 529 before dispatching a matching large request.
 
 ```mermaid
 flowchart TD
@@ -51,6 +52,61 @@ flowchart TD
 ```
 
 *Source: `packages/proxy/src/proxy.ts` (`handleProxy`, `applyUsageThrottling`), `packages/proxy/src/handlers/account-selector.ts` (`selectAccountsForRequest`).*
+
+## Anthropic Degraded Mode
+
+This restart-scoped feature protects large-context sessions after better-ccflare has evidence of a provider-cohort overload. It is `off` by default and does not replace the ordinary per-account cooldown or failover paths.
+
+### Eligibility and cohort scope
+
+Enrollment is deliberately narrow. An account must use the native `anthropic` provider, have no API key, have a nonblank refresh token, and resolve to the OAuth-subscription route class. Anthropic API-key accounts, access-token-only accounts, Anthropic-compatible providers, Codex accounts, and other providers are excluded. Runtime enforcement currently enrolls only native Anthropic `/v1/messages` requests.
+
+The physical cohort-key abstraction can represent either a `/messages` or `/responses` path class and is built from bounded, allowlisted route facts: endpoint scheme and host, path class, Claude model family, request protocol, and canonical beta-feature signature. The current runtime enrollment above does not yet apply degraded-mode enforcement to `/responses`. Unsupported or ambiguous route facts fail open. This keeps unrelated endpoints, protocols, model families, and beta lanes from sharing outage state.
+
+A cohort opens only after trusted pre-commit overload outcomes from the configured quorum of distinct underlying account IDs inside the evidence window. The default quorum is two. A faithful HTTP 529 and a pre-commit Anthropic semantic `overloaded_error` qualify. Aliases and repeated sends through one account still count as one source; authentication, authorization, quota, 429, transport, cancellation, and post-commit failures do not qualify. A force-routed outcome cannot establish or refresh shared evidence, but an eligible force-routed request still obeys an already-open matching cohort.
+
+### Replay risk, ownership, and admission
+
+Replay risk is classified once from the final normalized Anthropic body after interception and before account-specific transforms. A request is large when its best nonthrowing input-token estimate meets the token threshold **or** its actual UTF-8 body length meets the byte threshold; estimator failure leaves the byte check authoritative. Small requests retain ordinary validity checks, cooldowns, retries, failover, and send admission, and the large-request gate never suppresses them. During active degradation, however, an existing retained authoritative owner can still influence `session-affinity` candidate ordering.
+
+For a protected large request, `session-affinity` supplies a side-effect-free owner snapshot when one exists, and the first qualifying snapshot is retained across transient overload. If that owner remains valid, a probe can target only that owner. If no valid owner exists, assignment is deferred and at most one policy-selected account can be committed as the owner, only after a terminal success. Non-overload invalidation can remove a stale owner, but it does not grant another send to the same protected request.
+
+```mermaid
+flowchart TD
+    A["Enrolled native Anthropic OAuth<br/>/v1/messages request"] --> B{"Large by token or UTF-8 byte threshold?"}
+    B -->|"No"| C["No large-send suppression;<br/>ordinary retry/failover with any<br/>retained affinity owner"]
+    B -->|"Yes"| D{"Matching cohort state"}
+    D -->|"Inactive or collecting"| E["Existing routing; trusted overload can add evidence"]
+    D -->|"Open, probe not ready"| F["Suppress before provider send"]
+    D -->|"Open, probe ready"| G{"Single probe slot free in this server runtime?"}
+    G -->|"No"| F
+    G -->|"Yes"| H["One natural incoming request sends once<br/>to retained owner or one selected account"]
+    D -->|"Probing"| F
+    D -->|"Recovering"| I["Owner remains retained;<br/>each large request gets at most one send"]
+    H -->|"Complete success"| I
+    H -->|"Overload, failure, cancellation, or timeout"| J["Return to open with bounded retry timing"]
+    I -->|"Overload"| J
+    I -->|"Stabilization window completes"| K["Clear cohort and resume ordinary routing"]
+    F --> L["Anthropic-compatible 529 overloaded_error"]
+```
+
+The recovery probe always comes from normal incoming traffic; better-ccflare never creates a synthetic Anthropic probe. A committed probe succeeds only after a nonstream body is fully consumed or an Anthropic stream reaches `message_stop` and then clean EOF. The lease watchdog aborts a stuck transport before releasing its fenced lease, so a late completion cannot close the cohort or overlap a successor. A successful probe enters the bounded recovering window; another qualifying overload reopens protection.
+
+`observe` uses isolated shadow ownership and the same pure classification to report would-retain, would-probe, and would-suppress decisions. It changes no candidate order, owner mapping, transport count, response, or retry. Restarting into `enforce` starts with empty enforcement state; observe evidence is never promoted.
+
+### Protected terminal response and topology boundary
+
+Local suppression and semantic overload use the canonical body:
+
+```json
+{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}
+```
+
+The response status is 529. Its headers are rebuilt from a narrow allowlist: canonical JSON content type, a numeric `Retry-After`, and a syntactically safe bounded upstream `x-request-id` when one exists. Trusted upstream 529 bodies are transferred without eager reads, but unapproved upstream headers are still removed. Coordinator retry timing uses the configured min/fallback/max values; the client-visible protected terminal applies a narrower 5–60 second safety clamp. The front guard treats 529 as terminal and performs no request-body replay.
+
+The single-probe guarantee is process-local. `enforce` is supported only when every affected request reaches one server-process coordinator. A second server process, worker, pod, or replica owns independent in-memory state and may elect its own probe; sharing SQLite or PostgreSQL does not change that boundary. State, leases, retained owners, and shadow state all clear on restart.
+
+*Source: `packages/proxy/src/anthropic-degraded-eligibility.ts`, `packages/proxy/src/anthropic-degraded-mode.ts`, `packages/proxy/src/degraded-owner-overlay.ts`, `packages/proxy/src/handlers/proxy-operations.ts`, and `packages/proxy/src/handlers/routing-terminal.ts`. Configuration and safe bounds are documented in [Configuration](./configuration.md#anthropic-degraded-mode).*
 
 ## The Three Load-Balancing Strategies
 

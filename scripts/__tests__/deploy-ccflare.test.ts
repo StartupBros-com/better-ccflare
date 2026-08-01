@@ -415,6 +415,21 @@ describe("render_systemd_pin", () => {
 		expect(readFileSync(secondOutput, "utf8")).toBe(
 			readFileSync(output, "utf8"),
 		);
+		expect(readFileSync(output, "utf8")).not.toContain(
+			"CCFLARE_GUARD_CORRELATION_SECRET",
+		);
+	});
+
+	test("leaves correlation credential generation to the restart-scoped runner", () => {
+		const deploySource = readFileSync(deployScript, "utf8");
+
+		expect(deploySource).toContain("run-ccflare-stack.sh");
+		expect(deploySource).not.toMatch(
+			/Environment=.*CCFLARE_GUARD_CORRELATION_SECRET/,
+		);
+		expect(deploySource).not.toMatch(
+			/CCFLARE_GUARD_CORRELATION_SECRET=[A-Za-z0-9_-]+/,
+		);
 	});
 
 	test("rejects meaningful unmanaged content with an actionable operator-policy migration error", () => {

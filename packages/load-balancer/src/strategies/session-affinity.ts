@@ -7,6 +7,7 @@ import {
 import { Logger } from "@better-ccflare/logger";
 import type {
 	Account,
+	AffinityOwnerSnapshot,
 	LoadBalancingStrategy,
 	RequestMeta,
 	RouteCircuitRecoveryHint,
@@ -96,6 +97,8 @@ interface RouteCircuitSelection {
 interface SessionAffinityEntry {
 	/** Preferred/current owner retained for ordinary stickiness and snapback. */
 	candidateId: string;
+	/** Backing account identity, distinct from a combo candidate identity. */
+	accountId: string;
 	/**
 	 * Temporary owner used while a strictly-better preferred owner is absent.
 	 * Kept separately so fallback turns stay cache-sticky without forfeiting the
@@ -209,6 +212,56 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 		if (laneKey !== null) return `lane:${laneKey}`;
 		const clientId = meta.clientSessionId ?? null;
 		return clientId !== null ? `client:${clientId}` : null;
+	}
+
+	snapshotAffinityOwner(meta: RequestMeta): AffinityOwnerSnapshot | null {
+		const affinityKey = this.affinityKey(meta);
+		if (affinityKey === null) return null;
+		const mapping = this.affinity.get(affinityKey);
+		if (!mapping || this.now() - mapping.assignedAt >= this.affinityTtlMs) {
+			return null;
+		}
+		return {
+			candidateId: mapping.candidateId,
+			accountId: mapping.accountId,
+		};
+	}
+
+	commitAffinityOwner(
+		meta: RequestMeta,
+		owner: AffinityOwnerSnapshot,
+	): boolean {
+		const affinityKey = this.affinityKey(meta);
+		if (
+			affinityKey === null ||
+			owner.candidateId.length === 0 ||
+			owner.accountId.length === 0 ||
+			meta.hardExcludedAccountIds?.has(owner.accountId)
+		) {
+			return false;
+		}
+		const now = this.now();
+		const existing = this.affinity.get(affinityKey);
+		if (existing && now - existing.assignedAt < this.affinityTtlMs) {
+			if (
+				existing.candidateId !== owner.candidateId ||
+				existing.accountId !== owner.accountId
+			) {
+				return false;
+			}
+			existing.assignedAt = now;
+			return true;
+		}
+		if (!existing) this.evictOldestIfFull();
+		this.affinity.set(affinityKey, {
+			candidateId: owner.candidateId,
+			accountId: owner.accountId,
+			fallbackCandidateId: null,
+			assignedAt: now,
+			upgradedAt: null,
+			suppressUpgradesUntil: null,
+		});
+		return true;
 	}
 
 	private routeSuppressionKey(
@@ -608,6 +661,129 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 			return commitStrategyCandidateOrder([], meta);
 		}
 
+		// GC before any directive-aware return so a retained overlay cannot keep
+		// unrelated expired mappings alive.
+		for (const [clientId, entry] of this.affinity) {
+			if (now - entry.assignedAt >= this.affinityTtlMs) {
+				this.affinity.delete(clientId);
+			}
+		}
+
+		const ownerDirective =
+			meta.affinityOwnerDirective?.kind === "retain-owner"
+				? meta.affinityOwnerDirective
+				: null;
+		if (affinityKey !== null && ownerDirective) {
+			const retainedOwner = ownerDirective.owner;
+			const catalogOwner = meta.routingCandidateCatalog?.find(
+				(candidate) =>
+					candidate.candidateId === retainedOwner.candidateId &&
+					candidate.accountId === retainedOwner.accountId,
+			);
+			const configuredOwner = configuredCandidates.find(
+				(candidate) =>
+					candidate.routing.candidateId === retainedOwner.candidateId &&
+					candidate.account.id === retainedOwner.accountId,
+			);
+			const catalogProvesMissing =
+				meta.routingCandidateCatalog !== null &&
+				meta.routingCandidateCatalog !== undefined &&
+				catalogOwner === undefined;
+			const hardInvalid =
+				meta.hardExcludedAccountIds?.has(retainedOwner.accountId) === true ||
+				catalogProvesMissing ||
+				(catalogOwner === undefined && configuredOwner === undefined) ||
+				configuredOwner?.account.paused === true;
+
+			if (!hardInvalid) {
+				let mapping = this.affinity.get(affinityKey);
+				if (!mapping) {
+					this.evictOldestIfFull();
+					mapping = {
+						candidateId: retainedOwner.candidateId,
+						accountId: retainedOwner.accountId,
+						fallbackCandidateId: null,
+						assignedAt: now,
+						upgradedAt: null,
+						suppressUpgradesUntil: null,
+					};
+					this.affinity.set(affinityKey, mapping);
+				} else {
+					mapping.candidateId = retainedOwner.candidateId;
+					mapping.accountId = retainedOwner.accountId;
+					mapping.assignedAt = now;
+				}
+
+				this.routeCircuitSelections.set(meta, {
+					candidateIds: [
+						...new Set(
+							otherwiseAvailable.map(
+								(candidate) => candidate.routing.candidateId,
+							),
+						),
+					],
+				});
+				const closedCandidates = otherwiseAvailable.filter(
+					(candidate) =>
+						this.routeFailureState(
+							affinityKey,
+							candidate.routing.candidateId,
+						) === undefined,
+				);
+				const availableOwner = otherwiseAvailable.find(
+					(candidate) =>
+						candidate.routing.candidateId === retainedOwner.candidateId &&
+						candidate.account.id === retainedOwner.accountId,
+				);
+				const ownerCircuit =
+					availableOwner === undefined
+						? undefined
+						: this.routeFailureState(
+								affinityKey,
+								availableOwner.routing.candidateId,
+							);
+
+				if (availableOwner && ownerCircuit === undefined) {
+					mapping.fallbackCandidateId = null;
+					const others = this.rankByLeastUsed(
+						closedCandidates.filter(
+							(candidate) =>
+								candidate.routing.candidateId !==
+								availableOwner.routing.candidateId,
+						),
+						now,
+						meta,
+					);
+					return commitStrategyCandidateOrder(
+						[availableOwner, ...others],
+						meta,
+					);
+				}
+
+				const fallbacks = closedCandidates.filter(
+					(candidate) =>
+						candidate.routing.candidateId !== retainedOwner.candidateId,
+				);
+				const ownerProbe =
+					availableOwner && ownerCircuit
+						? this.acquireHalfOpenProbe(
+								[availableOwner],
+								affinityKey,
+								now,
+								fallbacks.length === 0,
+							)
+						: null;
+				const orderedFallbacks =
+					fallbacks.length > 0
+						? this.orderWithActiveFallback(fallbacks, mapping, now, meta)
+						: [];
+				return commitStrategyCandidateOrder(
+					ownerProbe ? [ownerProbe, ...orderedFallbacks] : orderedFallbacks,
+					meta,
+				);
+			}
+		}
+
 		let available = otherwiseAvailable;
 		let forcedPriorityProbe: StrategyCandidate | null = null;
 		let forcedPriorityFallbacks: StrategyCandidate[] = [];
@@ -701,15 +877,6 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 			}
 		}
 
-		// GC expired affinity entries so the map doesn't grow unboundedly and so
-		// long-idle clients are re-balanced onto the currently least-loaded
-		// account rather than re-pinned to a possibly-stale one.
-		for (const [clientId, entry] of this.affinity) {
-			if (now - entry.assignedAt >= this.affinityTtlMs) {
-				this.affinity.delete(clientId);
-			}
-		}
-
 		if (forcedPriorityProbe) {
 			this.log.info(
 				"Expired higher-priority route circuit selected for a half-open probe",
@@ -800,6 +967,7 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 					const replacement = ordered[0];
 					if (replacement) {
 						mapping.candidateId = replacement.routing.candidateId;
+						mapping.accountId = replacement.account.id;
 						mapping.fallbackCandidateId = null;
 						mapping.assignedAt = now;
 						mapping.upgradedAt = now;
@@ -869,6 +1037,7 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 							upgradedAt + this.antiThrashWindowMs;
 						if (fallback) {
 							mapping.candidateId = fallback.routing.candidateId;
+							mapping.accountId = fallback.account.id;
 							mapping.fallbackCandidateId = null;
 							mapping.assignedAt = now;
 							mapping.upgradedAt = null;
@@ -910,6 +1079,7 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 					const fallback = ordered[0];
 					if (fallback) {
 						mapping.candidateId = fallback.routing.candidateId;
+						mapping.accountId = fallback.account.id;
 						mapping.fallbackCandidateId = null;
 						mapping.assignedAt = now;
 						mapping.upgradedAt = null;
@@ -929,10 +1099,15 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 		const ranked = this.pickAndMark(available, now, meta);
 		const chosen = ranked[0];
 
-		if (affinityKey !== null && chosen) {
+		if (
+			affinityKey !== null &&
+			chosen &&
+			meta.affinityOwnerDirective?.kind !== "defer-owner-assignment"
+		) {
 			this.evictOldestIfFull();
 			this.affinity.set(affinityKey, {
 				candidateId: chosen.routing.candidateId,
+				accountId: chosen.account.id,
 				fallbackCandidateId: null,
 				assignedAt: now,
 				upgradedAt: null,

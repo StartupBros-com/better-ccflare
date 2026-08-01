@@ -7,12 +7,14 @@ import {
 	mock,
 	spyOn,
 } from "bun:test";
+import { ANTHROPIC_DEGRADED_MODE_DEFAULTS } from "@better-ccflare/config";
 import { SessionAffinityStrategy } from "@better-ccflare/load-balancer";
 import type {
 	Account,
 	ComboWithSlots,
 	RequestMeta,
 } from "@better-ccflare/types";
+import { AnthropicDegradedModeCoordinator } from "../anthropic-degraded-mode";
 import {
 	ANTHROPIC_PRECOMMIT_RESCUE_ACTIVATION_ENV,
 	ANTHROPIC_PRECOMMIT_RESCUE_ACTIVATION_MS,
@@ -38,6 +40,7 @@ import {
 	isNativeAnthropicMessagesSse,
 } from "../anthropic-semantic-preflight";
 import { AnthropicStreamOutcomeTracker } from "../anthropic-stream-outcome";
+import { DegradedOwnerOverlay } from "../degraded-owner-overlay";
 import type { ProxyContext } from "../handlers";
 import { stampInternalAutoRefreshAuth } from "../internal-probe-auth";
 import type { UsageCollector } from "../usage-collector";
@@ -776,6 +779,13 @@ function makeContext(accounts: Account[], combo: ComboWithSlots | null = null) {
 			getAgentFrontmatterModelFallback: () => false,
 			getStorePayloads: () => false,
 		},
+		anthropicDegradedMode: new AnthropicDegradedModeCoordinator({
+			config: {
+				...ANTHROPIC_DEGRADED_MODE_DEFAULTS,
+				mode: "off",
+			},
+		}),
+		degradedOwnerOverlay: new DegradedOwnerOverlay(),
 		provider: {
 			name: "anthropic",
 			canHandle: () => true,

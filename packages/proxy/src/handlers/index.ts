@@ -16,6 +16,12 @@ export {
 	isRewriteTargetServable,
 } from "./agent-interceptor";
 export {
+	createGuardCorrelationEnvelope,
+	createGuardCorrelationVerifier,
+	type GuardCorrelationVerifier,
+	verifyGuardCorrelationEnvelope,
+} from "./guard-correlation-auth";
+export {
 	createContextAdmissionTracker,
 	createContextLengthExceededResponse,
 	createPoolExhaustedResponse,

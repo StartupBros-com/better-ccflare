@@ -1,8 +1,19 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import type { Account } from "@better-ccflare/types";
+import { AnthropicDegradedModeCoordinator } from "../anthropic-degraded-mode";
+import { DegradedOwnerOverlay } from "../degraded-owner-overlay";
 import type { ProxyContext } from "../handlers";
-import { handleProxy } from "../proxy";
-import * as usageCollectorModule from "../usage-collector";
+import type { UsageCollector } from "../usage-collector";
+
+mock.module("@better-ccflare/database", () => ({
+	AsyncDbWriter: class AsyncDbWriter {},
+	DatabaseFactory: class DatabaseFactory {},
+	DatabaseOperations: class DatabaseOperations {},
+	ModelTranslationRepository: class ModelTranslationRepository {},
+}));
+
+const usageCollectorModule = await import("../usage-collector");
+const { handleProxy } = await import("../proxy");
 
 // P1 spoofing (proxy side): x-better-ccflare-pool-status is a reserved,
 // guard-trusted header. The ccflare-guard sitting in front of the proxy
@@ -72,11 +83,30 @@ describe("upstream response header sanitization (P1 spoofing defense)", () => {
 			handleStart: mock(() => undefined),
 			handleChunk: mock(() => undefined),
 			handleEnd: mock(async () => undefined),
-		} as unknown as usageCollectorModule.UsageCollector);
+		} as unknown as UsageCollector);
 		restoreUsageCollector = () => collectorSpy.mockRestore();
 		const account = makeAccount();
+		const anthropicDegradedMode = new AnthropicDegradedModeCoordinator({
+			config: {
+				mode: "off",
+				largeRequestTokenThreshold: 100_000,
+				largeRequestByteThreshold: 256 * 1024,
+				evidenceWindowMs: 30_000,
+				quorum: 2,
+				retryMinMs: 5_000,
+				retryFallbackMs: 10_000,
+				retryMaxMs: 60_000,
+				recoveryWindowMs: 30_000,
+				probeLeaseMs: 10 * 60_000,
+				maxCohorts: 1_024,
+			},
+		});
 		const ctx = {
 			strategy: { select: mock(() => [account]) },
+			anthropicDegradedMode,
+			degradedOwnerOverlay: new DegradedOwnerOverlay({
+				evidenceWindowMs: anthropicDegradedMode.config.evidenceWindowMs,
+			}),
 			dbOps: {
 				getAllAccounts: mock(async () => [account]),
 				getActiveComboForFamily: mock(async () => null),
@@ -107,8 +137,13 @@ describe("upstream response header sanitization (P1 spoofing defense)", () => {
 		} as unknown as ProxyContext;
 
 		let fetchCalls = 0;
-		globalThis.fetch = mock(async () => {
+		let providerRequestHeaders: Headers | null = null;
+		globalThis.fetch = mock(async (input: Request | URL | string, init) => {
 			fetchCalls += 1;
+			providerRequestHeaders =
+				input instanceof Request
+					? new Headers(input.headers)
+					: new Headers(init?.headers);
 			// A spoofing (or merely misconfigured) upstream sets the reserved
 			// guard-trusted header itself, on an otherwise-ordinary 503.
 			return new Response(
@@ -119,6 +154,8 @@ describe("upstream response header sanitization (P1 spoofing defense)", () => {
 						"content-type": "application/json",
 						"x-better-ccflare-pool-status": "exhausted",
 						"x-better-ccflare-recovery-scope": "model",
+						"x-better-ccflare-guard-request-id": "must-not-reach-client",
+						"x-better-ccflare-guard-correlation-secret": "must-never-be-http",
 					},
 				},
 			);
@@ -126,7 +163,12 @@ describe("upstream response header sanitization (P1 spoofing defense)", () => {
 
 		const request = new Request("https://proxy.local/v1/messages", {
 			method: "POST",
-			headers: { "content-type": "application/json" },
+			headers: {
+				"content-type": "application/json",
+				"x-better-ccflare-guard-request-id":
+					"v1.76110a75-9e91-4ab9-89a7-3e5d25a318fc.1.spoofed",
+				"x-better-ccflare-guard-correlation-secret": "client-spoof",
+			},
 			body: JSON.stringify({
 				model: "claude-opus-4-5",
 				messages: [{ role: "user", content: "hello" }],
@@ -140,5 +182,17 @@ describe("upstream response header sanitization (P1 spoofing defense)", () => {
 		expect(response.status).toBe(503);
 		expect(response.headers.has("x-better-ccflare-pool-status")).toBe(false);
 		expect(response.headers.has("x-better-ccflare-recovery-scope")).toBe(false);
+		expect(response.headers.has("x-better-ccflare-guard-request-id")).toBe(
+			false,
+		);
+		expect(
+			response.headers.has("x-better-ccflare-guard-correlation-secret"),
+		).toBe(false);
+		expect(
+			providerRequestHeaders?.has("x-better-ccflare-guard-request-id"),
+		).toBe(false);
+		expect(
+			providerRequestHeaders?.has("x-better-ccflare-guard-correlation-secret"),
+		).toBe(false);
 	});
 });

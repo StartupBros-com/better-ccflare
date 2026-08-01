@@ -199,6 +199,20 @@ require_file "$CCFLARE_BIN"
 require_file "$NODE_BIN"
 require_file "$GUARD_SCRIPT"
 
+# One full-stack invocation owns one correlation credential. Keep it in this
+# runner's shell memory and pass it independently to each child environment;
+# never export it globally, persist it, print it, or place it in argv.
+guard_correlation_secret="$(
+	LC_ALL=C head -c 32 /dev/urandom \
+		| base64 \
+		| tr '+/' '-_' \
+		| tr -d '=\n'
+)"
+if [[ ! "$guard_correlation_secret" =~ ^[A-Za-z0-9_-]{43}$ ]]; then
+	log "failed to generate guard correlation credential"
+	exit 70
+fi
+
 if ! start_ai_gateway_tunnel; then
 	if [[ "$AI_GATEWAY_TUNNEL_REQUIRED" == "1" || "$AI_GATEWAY_TUNNEL_REQUIRED" == "true" ]]; then
 		log "ai-gateway tunnel is required; exiting"
@@ -208,14 +222,14 @@ if ! start_ai_gateway_tunnel; then
 fi
 
 log "starting better-ccflare upstream on 127.0.0.1:${UPSTREAM_PORT}"
-env \
-	HOME="$HOME" \
+HOME="$HOME" \
 	USER="$USER" \
 	BETTER_CCFLARE_HOST=127.0.0.1 \
 	PORT="$UPSTREAM_PORT" \
 	STORE_PAYLOADS=false \
 	LOG_LEVEL=warn \
 	CCFLARE_RATE_LIMIT_BACKOFF_MAX_MS=120000 \
+	CCFLARE_GUARD_CORRELATION_SECRET="$guard_correlation_secret" \
 	CCFLARE_DEBUG_ANTHROPIC_BOUNDARY="${CCFLARE_DEBUG_ANTHROPIC_BOUNDARY:-1}" \
 	CCFLARE_DEBUG_CODEX_STREAM="${CCFLARE_DEBUG_CODEX_STREAM:-1}" \
 	"$CCFLARE_BIN" --serve --port "$UPSTREAM_PORT" &
@@ -223,13 +237,13 @@ upstream_pid=$!
 wait_for_url better-ccflare "http://127.0.0.1:${UPSTREAM_PORT}/health" "$upstream_pid"
 
 log "starting ccflare guard on 127.0.0.1:${GUARD_PORT} -> 127.0.0.1:${UPSTREAM_PORT}"
-env \
-	HOME="$HOME" \
+HOME="$HOME" \
 	USER="$USER" \
 	GUARD_HOST=127.0.0.1 \
 	GUARD_PORT="$GUARD_PORT" \
 	CCFLARE_UPSTREAM="http://127.0.0.1:${UPSTREAM_PORT}" \
 	GUARD_UPSTREAM_PID="${upstream_pid}" \
+	CCFLARE_GUARD_CORRELATION_SECRET="$guard_correlation_secret" \
 	GUARD_MAX_ACTIVE="$GUARD_EFFECTIVE_MAX_ACTIVE" \
 	GUARD_MAX_QUEUE="${CCFLARE_GUARD_MAX_QUEUE:-${GUARD_MAX_QUEUE:-500}}" \
 	GUARD_MAX_RECOVERY_WAITS="$GUARD_MAX_RECOVERY_WAITS" \

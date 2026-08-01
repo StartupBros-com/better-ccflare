@@ -1,14 +1,25 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
-import { usageCache } from "@better-ccflare/providers";
 import type {
 	Account,
 	ComboFamily,
 	ComboRoutingPolicySnapshot,
 	ComboWithSlots,
 } from "@better-ccflare/types";
+import { AnthropicDegradedModeCoordinator } from "../anthropic-degraded-mode";
+import { DegradedOwnerOverlay } from "../degraded-owner-overlay";
 import type { ProxyContext } from "../handlers";
-import { handleProxy } from "../proxy";
-import * as usageCollectorModule from "../usage-collector";
+import type { UsageCollector } from "../usage-collector";
+
+mock.module("@better-ccflare/database", () => ({
+	AsyncDbWriter: class AsyncDbWriter {},
+	DatabaseFactory: class DatabaseFactory {},
+	DatabaseOperations: class DatabaseOperations {},
+	ModelTranslationRepository: class ModelTranslationRepository {},
+}));
+
+const { usageCache } = await import("@better-ccflare/providers");
+const usageCollectorModule = await import("../usage-collector");
+const { handleProxy } = await import("../proxy");
 
 function makeAccount(id: string): Account {
 	return {
@@ -62,15 +73,23 @@ afterEach(() => {
 
 function installUsageCollector(): ReturnType<typeof mock> {
 	const handleStart = mock(() => undefined);
-	const collectorSpy = spyOn(
-		usageCollectorModule,
-		"getUsageCollector",
-	).mockReturnValue({
+	const collector = {
 		handleStart,
 		handleChunk: mock(() => undefined),
 		handleEnd: mock(async () => undefined),
-	} as unknown as usageCollectorModule.UsageCollector);
-	restoreUsageCollector = () => collectorSpy.mockRestore();
+	} as unknown as UsageCollector;
+	const requiredCollectorSpy = spyOn(
+		usageCollectorModule,
+		"getUsageCollector",
+	).mockReturnValue(collector);
+	const optionalCollectorSpy = spyOn(
+		usageCollectorModule,
+		"tryGetUsageCollector",
+	).mockReturnValue(collector);
+	restoreUsageCollector = () => {
+		requiredCollectorSpy.mockRestore();
+		optionalCollectorSpy.mockRestore();
+	};
 	return handleStart;
 }
 
@@ -94,12 +113,40 @@ function makeRoutingPolicy(
 	};
 }
 
+function makeDisabledDegradedModeContext(): Pick<
+	ProxyContext,
+	"anthropicDegradedMode" | "degradedOwnerOverlay"
+> {
+	const anthropicDegradedMode = new AnthropicDegradedModeCoordinator({
+		config: {
+			mode: "off",
+			largeRequestTokenThreshold: 100_000,
+			largeRequestByteThreshold: 256 * 1024,
+			evidenceWindowMs: 30_000,
+			quorum: 2,
+			retryMinMs: 5_000,
+			retryFallbackMs: 10_000,
+			retryMaxMs: 60_000,
+			recoveryWindowMs: 30_000,
+			probeLeaseMs: 10 * 60_000,
+			maxCohorts: 1_024,
+		},
+	});
+	return {
+		anthropicDegradedMode,
+		degradedOwnerOverlay: new DegradedOwnerOverlay({
+			evidenceWindowMs: anthropicDegradedMode.config.evidenceWindowMs,
+		}),
+	};
+}
+
 function makeContext(
 	accounts: Account[],
 	combo: ComboWithSlots,
 	strategySelect: (accounts: Account[], meta: unknown) => Account[],
 ): ProxyContext {
 	return {
+		...makeDisabledDegradedModeContext(),
 		strategy: { select: mock(strategySelect) },
 		dbOps: {
 			getAllAccounts: mock(async () => accounts),
@@ -161,6 +208,157 @@ function outOfCreditsResponse(): Response {
 	});
 }
 
+function addSensitivePersistenceHeaders(request: Request): Request {
+	request.headers.set("authorization", "Bearer client-secret");
+	request.headers.set("cookie", "session=client-secret");
+	request.headers.set("x-api-key", "client-secret");
+	request.headers.set(
+		"x-better-ccflare-guard-request-id",
+		"v1.00000000-0000-4000-8000-000000000001.1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+	);
+	request.headers.set(
+		"x-better-ccflare-guard-correlation-secret",
+		"spoofed-guard-secret",
+	);
+	request.headers.set(
+		"x-better-ccflare-internal-probe-secret",
+		"spoofed-probe-secret",
+	);
+	request.headers.set("x-client-visible", "kept");
+	return request;
+}
+
+function expectSanitizedComboTerminalHeaders(
+	handleStart: ReturnType<typeof mock>,
+): void {
+	const terminalStart = handleStart.mock.calls
+		.map(
+			(call) =>
+				call[0] as
+					| {
+							accountId: string | null;
+							responseStatus: number;
+							requestHeaders: Record<string, string>;
+					  }
+					| undefined,
+		)
+		.find(
+			(message) =>
+				message?.accountId === null && message.responseStatus === 503,
+		);
+
+	expect(terminalStart).toBeDefined();
+	expect(terminalStart?.requestHeaders).toEqual({
+		"content-type": "application/json",
+		"x-client-visible": "kept",
+	});
+}
+
+describe("combo fallback disabled terminal persistence", () => {
+	it("sanitizes request headers when no combo slot is available", async () => {
+		const previousFallbackSetting =
+			process.env.CCFLARE_DISABLE_COMBO_SESSION_FALLBACK;
+		process.env.CCFLARE_DISABLE_COMBO_SESSION_FALLBACK = "true";
+		const handleStart = installUsageCollector();
+		const unavailable = makeAccount("unavailable-combo-account");
+		unavailable.rate_limited_until = Date.now() + 60_000;
+		const combo: ComboWithSlots = {
+			id: "combo-unavailable",
+			name: "Unavailable combo",
+			description: null,
+			enabled: true,
+			created_at: 0,
+			updated_at: 0,
+			slots: [
+				{
+					id: "slot-unavailable",
+					combo_id: "combo-unavailable",
+					account_id: unavailable.id,
+					model: "claude-opus-4-5",
+					priority: 0,
+					enabled: true,
+				},
+			],
+		};
+		const ctx = makeContext([unavailable], combo, (accounts) => accounts);
+		const upstreamFetch = mock(async () => {
+			throw new Error("unavailable combo must not reach upstream");
+		});
+		globalThis.fetch = upstreamFetch as unknown as typeof fetch;
+
+		try {
+			const request = addSensitivePersistenceHeaders(
+				makeProxyRequest("claude-opus-4-5", false),
+			);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+
+			expect(response.status).toBe(503);
+			expect(upstreamFetch).not.toHaveBeenCalled();
+			expectSanitizedComboTerminalHeaders(handleStart);
+		} finally {
+			if (previousFallbackSetting === undefined) {
+				delete process.env.CCFLARE_DISABLE_COMBO_SESSION_FALLBACK;
+			} else {
+				process.env.CCFLARE_DISABLE_COMBO_SESSION_FALLBACK =
+					previousFallbackSetting;
+			}
+		}
+	});
+
+	it("sanitizes request headers after every combo slot fails", async () => {
+		const previousFallbackSetting =
+			process.env.CCFLARE_DISABLE_COMBO_SESSION_FALLBACK;
+		process.env.CCFLARE_DISABLE_COMBO_SESSION_FALLBACK = "true";
+		const handleStart = installUsageCollector();
+		const account = makeAccount("failed-combo-account");
+		const combo: ComboWithSlots = {
+			id: "combo-failed",
+			name: "Failed combo",
+			description: null,
+			enabled: true,
+			created_at: 0,
+			updated_at: 0,
+			slots: [
+				{
+					id: "slot-failed",
+					combo_id: "combo-failed",
+					account_id: account.id,
+					model: "claude-opus-4-5",
+					priority: 0,
+					enabled: true,
+				},
+			],
+		};
+		const ctx = makeContext([account], combo, (accounts) => accounts);
+		let fetchCount = 0;
+		globalThis.fetch = mock(async () => {
+			fetchCount++;
+			return new Response('{"error":"expired"}', {
+				status: 401,
+				headers: { "content-type": "application/json" },
+			});
+		}) as unknown as typeof fetch;
+
+		try {
+			const request = addSensitivePersistenceHeaders(
+				makeProxyRequest("claude-opus-4-5", false),
+			);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+
+			expect(response.status).toBe(503);
+			expect(fetchCount).toBe(1);
+			expectSanitizedComboTerminalHeaders(handleStart);
+		} finally {
+			if (previousFallbackSetting === undefined) {
+				delete process.env.CCFLARE_DISABLE_COMBO_SESSION_FALLBACK;
+			} else {
+				process.env.CCFLARE_DISABLE_COMBO_SESSION_FALLBACK =
+					previousFallbackSetting;
+			}
+		}
+	});
+});
+
 describe("post-combo normal fallback", () => {
 	it("runs the active combo once, then selects normal accounts without re-entering it", async () => {
 		const handleStart = mock(() => undefined);
@@ -171,7 +369,7 @@ describe("post-combo normal fallback", () => {
 			handleStart,
 			handleChunk: mock(() => undefined),
 			handleEnd: mock(async () => undefined),
-		} as unknown as usageCollectorModule.UsageCollector);
+		} as unknown as UsageCollector);
 		restoreUsageCollector = () => collectorSpy.mockRestore();
 		const comboAccount = makeAccount("combo-account");
 		const normalAccount = makeAccount("normal-account");
@@ -212,6 +410,7 @@ describe("post-combo normal fallback", () => {
 					: [normalAccount],
 		);
 		const ctx = {
+			...makeDisabledDegradedModeContext(),
 			strategy: { select: strategySelect },
 			dbOps: {
 				getAllAccounts: mock(async () => [comboAccount, normalAccount]),

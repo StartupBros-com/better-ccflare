@@ -114,4 +114,17 @@ describe("RoutingAttemptLedger", () => {
 
 		expect(discard).toHaveBeenCalledTimes(1);
 	});
+
+	it("reconciles physical send ordinals without changing unique route claims", () => {
+		const ledger = new RoutingAttemptLedger();
+
+		expect(ledger.claim("account-a", "claude-opus-4-8")).toBe(true);
+		expect(ledger.recordPhysicalAttempt()).toBe(1);
+		expect(ledger.recordPhysicalAttempt()).toBe(2);
+		expect(ledger.claim("account-a", "claude-opus-4-8")).toBe(false);
+		expect(ledger.recordPhysicalAttempt()).toBe(3);
+
+		expect(ledger.attemptedCount).toBe(1);
+		expect(ledger.physicalAttemptCount).toBe(3);
+	});
 });

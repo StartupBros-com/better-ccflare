@@ -1,7 +1,47 @@
-import { describe, expect, it } from "bun:test";
-import { AsyncDbWriter } from "@better-ccflare/database";
+import { describe, expect, it, mock } from "bun:test";
 import type { Account, HealthResponse } from "@better-ccflare/types";
-import { createHealthHandler } from "../health";
+
+mock.module("@better-ccflare/database", () => ({
+	AsyncDbWriter: class {
+		private queuedJobs = 0;
+
+		enqueue(job: () => void): void {
+			this.queuedJobs++;
+			queueMicrotask(() => {
+				try {
+					job();
+				} finally {
+					this.queuedJobs--;
+				}
+			});
+		}
+
+		getHealth() {
+			return {
+				healthy: true,
+				failureCount: 0,
+				recentDrops: 0,
+				queuedJobs: this.queuedJobs,
+				metadataQueuedJobs: this.queuedJobs,
+				payloadQueuedJobs: 0,
+				payloadBytesPending: 0,
+				oldestMetadataAgeMs: 0,
+				oldestPayloadAgeMs: 0,
+				metadataDropped: 0,
+				payloadDropped: 0,
+				payloadDroppedBytes: 0,
+			};
+		}
+
+		async dispose(): Promise<void> {}
+	},
+	DatabaseFactory: class DatabaseFactory {},
+	DatabaseOperations: class DatabaseOperations {},
+	ModelTranslationRepository: class ModelTranslationRepository {},
+}));
+
+const { AsyncDbWriter } = await import("@better-ccflare/database");
+const { createHealthHandler } = await import("../health");
 
 describe("health runtime payload", () => {
 	it("returns unhealthy status when no routable accounts and no recovery time", async () => {
@@ -14,6 +54,7 @@ describe("health runtime payload", () => {
 
 		const config = {
 			getStrategy: () => "session",
+			getHealthDetailEnabled: () => false,
 		} as unknown as import("@better-ccflare/config").Config;
 
 		const handler = createHealthHandler(db, config);
@@ -37,6 +78,7 @@ describe("health runtime payload", () => {
 
 		const config = {
 			getStrategy: () => "session",
+			getHealthDetailEnabled: () => false,
 		} as unknown as import("@better-ccflare/config").Config;
 
 		const handler = createHealthHandler(
@@ -85,6 +127,203 @@ describe("health runtime payload", () => {
 		const body = (await response.json()) as Record<string, unknown>;
 
 		expect(body).not.toHaveProperty("runtime");
+	});
+
+	it("exposes only the fixed aggregate Anthropic degraded runtime schema", async () => {
+		const db = {
+			getAllAccounts: async () => [
+				{ name: "acc1", paused: false, rate_limited_until: null },
+			],
+		} as unknown as import("@better-ccflare/database").DatabaseOperations;
+		const config = {
+			getStrategy: () => "session",
+			getHealthDetailEnabled: () => false,
+		} as unknown as import("@better-ccflare/config").Config;
+		const anthropicDegraded = {
+			schemaVersion: 1 as const,
+			bootId: "or1_boot_public-opaque-value",
+			mode: "observe" as const,
+			diagnosticsEnabled: false,
+			thresholds: {
+				largeRequestTokenThreshold: 100_000,
+				largeRequestByteThreshold: 262_144,
+				evidenceWindowMs: 30_000,
+				quorum: 2,
+				retryMinMs: 5_000,
+				retryFallbackMs: 10_000,
+				retryMaxMs: 60_000,
+				recoveryWindowMs: 30_000,
+				probeLeaseMs: 600_000,
+				maxCohorts: 1_024,
+			},
+			cohorts: {
+				total: 4,
+				byState: {
+					collecting: 1,
+					open: 1,
+					probing: 1,
+					recovering: 1,
+				},
+				ageBands: {
+					under30Seconds: 2,
+					from30SecondsTo5Minutes: 1,
+					atLeast5Minutes: 1,
+				},
+			},
+			activeProbes: 1,
+			attempts: {
+				logical: 7,
+				guard: 3,
+				local: 4,
+				physical: 9,
+			},
+			decisions: {
+				suppressedSends: 2,
+				wouldSuppressSends: 3,
+				probeSends: 1,
+				wouldProbeSends: 2,
+			},
+			terminals: {
+				success: 2,
+				overload: 1,
+				suppressed: 1,
+				failure: 1,
+				cancelled: 1,
+				timeout: 1,
+			},
+			droppedEvents: 5,
+			droppedEvidence: 6,
+			saturation: false,
+		};
+
+		const response = await createHealthHandler(
+			db,
+			config,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			() => anthropicDegraded,
+		)(new URL("http://localhost/health?detail=1"));
+		const body = (await response.json()) as HealthResponse;
+
+		expect(body.runtime?.anthropicDegraded).toEqual(anthropicDegraded);
+		expect(Object.keys(body.runtime?.anthropicDegraded ?? {})).toEqual([
+			"schemaVersion",
+			"bootId",
+			"mode",
+			"diagnosticsEnabled",
+			"thresholds",
+			"cohorts",
+			"activeProbes",
+			"attempts",
+			"decisions",
+			"terminals",
+			"droppedEvents",
+			"droppedEvidence",
+			"saturation",
+		]);
+		const serialized = JSON.stringify(body);
+		for (const forbidden of [
+			"cohortId",
+			"accountId",
+			"ownerId",
+			"logicalRequestId",
+			"estimatedInputTokens",
+			"bodyBytes",
+			"requestBody",
+			"responseBody",
+			"raw-prompt",
+			"authorization",
+		]) {
+			expect(serialized).not.toContain(forbidden);
+		}
+	});
+
+	it("keeps independent runtime snapshots restart-scoped with no retained history", async () => {
+		const db = {
+			getAllAccounts: async () => [
+				{ name: "acc1", paused: false, rate_limited_until: null },
+			],
+		} as unknown as import("@better-ccflare/database").DatabaseOperations;
+		const config = {
+			getStrategy: () => "session",
+		} as unknown as import("@better-ccflare/config").Config;
+		const base = {
+			schemaVersion: 1 as const,
+			mode: "off" as const,
+			diagnosticsEnabled: false,
+			thresholds: {
+				largeRequestTokenThreshold: 100_000,
+				largeRequestByteThreshold: 262_144,
+				evidenceWindowMs: 30_000,
+				quorum: 2,
+				retryMinMs: 5_000,
+				retryFallbackMs: 10_000,
+				retryMaxMs: 60_000,
+				recoveryWindowMs: 30_000,
+				probeLeaseMs: 600_000,
+				maxCohorts: 1_024,
+			},
+			cohorts: {
+				total: 0,
+				byState: { collecting: 0, open: 0, probing: 0, recovering: 0 },
+				ageBands: {
+					under30Seconds: 0,
+					from30SecondsTo5Minutes: 0,
+					atLeast5Minutes: 0,
+				},
+			},
+			activeProbes: 0,
+			attempts: { logical: 0, guard: 0, local: 0, physical: 0 },
+			decisions: {
+				suppressedSends: 0,
+				wouldSuppressSends: 0,
+				probeSends: 0,
+				wouldProbeSends: 0,
+			},
+			terminals: {
+				success: 0,
+				overload: 0,
+				suppressed: 0,
+				failure: 0,
+				cancelled: 0,
+				timeout: 0,
+			},
+			droppedEvents: 0,
+			droppedEvidence: 0,
+			saturation: false,
+		};
+		const first = createHealthHandler(
+			db,
+			config,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			() => ({ ...base, bootId: "or1_boot_first" }),
+		);
+		const second = createHealthHandler(
+			db,
+			config,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			() => ({ ...base, bootId: "or1_boot_second" }),
+		);
+
+		const firstBody = (await (
+			await first(new URL("http://localhost/health"))
+		).json()) as HealthResponse;
+		const secondBody = (await (
+			await second(new URL("http://localhost/health"))
+		).json()) as HealthResponse;
+		expect(firstBody.runtime?.anthropicDegraded?.bootId).toBe("or1_boot_first");
+		expect(secondBody.runtime?.anthropicDegraded?.bootId).toBe(
+			"or1_boot_second",
+		);
+		expect(secondBody.runtime?.anthropicDegraded?.attempts.logical).toBe(0);
 	});
 });
 

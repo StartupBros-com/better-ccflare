@@ -56,6 +56,7 @@ This project builds upon the excellent foundation of [snipeship/ccflare](https:/
 - **Enterprise Features** - Custom API endpoints, session management, advanced analytics
 - **Performance Optimized** - <10ms overhead with request deduplication and caching
 - **Reliability** - Automatic error recovery, circuit breakers, and health monitoring
+- **Anthropic Degraded-Mode Hardening (opt-in)** - Default-off, restart-scoped large-context replay protection; enforcement is supported only when all affected traffic shares one server runtime. See [configuration](docs/configuration.md#anthropic-degraded-mode), [routing behavior](docs/routing-architecture.md#anthropic-degraded-mode), and the [systemd rollout](docs/systemd.md#anthropic-degraded-mode-rollout).
 - **Scalability** - Built for high-throughput production environments
 - **PostgreSQL Support** - Set `DATABASE_URL=postgresql://...` to use PostgreSQL for Kubernetes multi-pod deployments where SQLite file-sharing is not feasible
 

@@ -12,6 +12,7 @@ import type {
 	RateLimitReason,
 	RequestMeta,
 } from "@better-ccflare/types";
+import type { AnthropicDegradedResponseLifecycle } from "./anthropic-degraded-response-lifecycle";
 import { createAnthropicSemanticLivenessStream } from "./anthropic-semantic-liveness";
 import {
 	getAnthropicStreamRuntimeConfig,
@@ -285,6 +286,8 @@ export interface ResponseHandlerOptions {
 	routeCandidateId?: string | null;
 	/** Internal routing context used only for lane-local failure suppression. */
 	routingMeta?: RequestMeta;
+	/** One committed degraded-mode send, transferred after wrapping succeeds. */
+	anthropicDegradedLifecycle?: AnthropicDegradedResponseLifecycle | null;
 }
 
 /**
@@ -329,6 +332,7 @@ export async function forwardToClient(
 		attemptedModel = null,
 		routeCandidateId = null,
 		routingMeta,
+		anthropicDegradedLifecycle,
 	} = options;
 
 	// Record which account actually served this session's request, keyed on the
@@ -704,6 +708,32 @@ export async function forwardToClient(
 			streamTerminalHandled = true;
 
 			const anthropicOutcome = anthropicOutcomeTracker?.finish();
+			if (anthropicDegradedLifecycle) {
+				if (response.status === 529) {
+					anthropicDegradedLifecycle.settle(
+						"overloaded",
+						response.headers.get("retry-after"),
+					);
+				} else if (
+					anthropicOutcome?.status === "midstream_error" &&
+					anthropicOutcome.errorType === "overloaded_error"
+				) {
+					anthropicDegradedLifecycle.settle("overloaded");
+				} else if (termination.kind === "cancel") {
+					anthropicDegradedLifecycle.settle("cancelled");
+				} else if (termination.kind === "error") {
+					anthropicDegradedLifecycle.settle("failed");
+				} else if (
+					anthropicCleanTerminalSuccessSeen &&
+					anthropicOutcome?.status === "completed" &&
+					anthropicOutcome.parseState === "clean" &&
+					!anthropicOutcome.truncatedTailSeen
+				) {
+					anthropicDegradedLifecycle.settle("success");
+				} else {
+					anthropicDegradedLifecycle.settle("truncated");
+				}
+			}
 			if (
 				termination.kind === "close" &&
 				anthropicCleanTerminalSuccessSeen &&
@@ -829,7 +859,7 @@ export async function forwardToClient(
 			onCancel,
 		});
 
-		return new Response(passthroughBody, {
+		const clientResponse = new Response(passthroughBody, {
 			status: response.status,
 			statusText: response.statusText,
 			headers: withResponseMetadataHeaders(response.headers, {
@@ -839,12 +869,20 @@ export async function forwardToClient(
 				cacheFlightRecorderEligible,
 			}),
 		});
+		anthropicDegradedLifecycle?.transferToResponse();
+		return clientResponse;
 	}
 
 	/*********************************************************************
 	 *  NON-STREAMING RESPONSES — read body in background, send END once
 	 *********************************************************************/
 	if (!response.body) {
+		const lifecycleOutcome =
+			response.status === 529
+				? "overloaded"
+				: isExpectedResponse(path, response)
+					? "success"
+					: "failed";
 		if (shouldProcessRequest) {
 			fireAndForgetEnd(
 				{
@@ -857,12 +895,13 @@ export async function forwardToClient(
 			);
 		}
 
+		let clientResponse = response;
 		if (
 			isModelRewrite(originalModel, appliedModel) ||
 			(cacheFlightRecorderEligible === true &&
 				Boolean(cacheFlightRecorderConversationId))
 		) {
-			return new Response(null, {
+			clientResponse = new Response(null, {
 				status: response.status,
 				statusText: response.statusText,
 				headers: withResponseMetadataHeaders(response.headers, {
@@ -874,7 +913,14 @@ export async function forwardToClient(
 			});
 		}
 
-		return response;
+		anthropicDegradedLifecycle?.transferToResponse();
+		anthropicDegradedLifecycle?.settle(
+			lifecycleOutcome,
+			lifecycleOutcome === "overloaded"
+				? response.headers.get("retry-after")
+				: undefined,
+		);
+		return clientResponse;
 	}
 
 	const MAX_NON_STREAM_BODY_BYTES = 256 * 1024; // 256KB cap for stored body
@@ -882,6 +928,18 @@ export async function forwardToClient(
 	const passthroughBody = teeStream(response.body, {
 		maxBytes: MAX_NON_STREAM_BODY_BYTES,
 		onClose(buffered) {
+			const lifecycleOutcome =
+				response.status === 529
+					? "overloaded"
+					: isExpectedResponse(path, response)
+						? "success"
+						: "failed";
+			anthropicDegradedLifecycle?.settle(
+				lifecycleOutcome,
+				lifecycleOutcome === "overloaded"
+					? response.headers.get("retry-after")
+					: undefined,
+			);
 			// Hoisted above the shouldProcessRequest filter: passive model-catalog
 			// capture is independent of the analytics/logging filter above (it's
 			// not analytics, and must still run e.g. for a filtered synthetic
@@ -910,6 +968,7 @@ export async function forwardToClient(
 			);
 		},
 		onError(err) {
+			anthropicDegradedLifecycle?.settle("failed");
 			if (!shouldProcessRequest) return;
 			fireAndForgetEnd(
 				{
@@ -922,6 +981,7 @@ export async function forwardToClient(
 			);
 		},
 		onCancel() {
+			anthropicDegradedLifecycle?.settle("cancelled");
 			if (!shouldProcessRequest) return;
 			fireAndForgetEnd(
 				{
@@ -935,7 +995,7 @@ export async function forwardToClient(
 		},
 	});
 
-	return new Response(passthroughBody, {
+	const clientResponse = new Response(passthroughBody, {
 		status: response.status,
 		statusText: response.statusText,
 		headers: withResponseMetadataHeaders(response.headers, {
@@ -945,4 +1005,6 @@ export async function forwardToClient(
 			cacheFlightRecorderEligible,
 		}),
 	});
+	anthropicDegradedLifecycle?.transferToResponse();
+	return clientResponse;
 }

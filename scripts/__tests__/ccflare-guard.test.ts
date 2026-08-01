@@ -6,6 +6,10 @@ import http, { type Server } from "node:http";
 import net from "node:net";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
+import { GUARD_CORRELATION_SECRET_HEADER } from "../../packages/http-common/src/headers";
+import {
+	createGuardCorrelationVerifier,
+} from "../../packages/proxy/src/handlers/guard-correlation-auth";
 import { GUARD_REQUEST_ID_HEADER } from "../../packages/proxy/src/handlers/internal-transport-headers";
 import { createRequestMetadata } from "../../packages/proxy/src/handlers/request-handler";
 
@@ -25,6 +29,12 @@ import {
 
 const servers: Server[] = [];
 const children: ChildProcess[] = [];
+const GUARD_CORRELATION_SECRET = Buffer.from(
+	"0123456789abcdef0123456789abcdef",
+	"utf8",
+);
+const GUARD_CORRELATION_SECRET_ENCODED =
+	GUARD_CORRELATION_SECRET.toString("base64url");
 
 afterEach(async () => {
 	await Promise.all(
@@ -453,6 +463,7 @@ describe("source-controlled guard", () => {
 		let forwardedId: string | null = null;
 		let proxyRequestId: string | null = null;
 		const { baseUrl } = await startGuard("http://127.0.0.1:8789", {
+			guardCorrelationSecret: GUARD_CORRELATION_SECRET_ENCODED,
 			logger: (line: string) => events.push(JSON.parse(line)),
 			fetchImpl: async (url: URL, init: RequestInit) => {
 				const headers = new Headers(init.headers);
@@ -461,7 +472,11 @@ describe("source-controlled guard", () => {
 					method: init.method,
 					headers,
 				});
-				proxyRequestId = createRequestMetadata(request, new URL(url)).id;
+				proxyRequestId = createRequestMetadata(
+					request,
+					new URL(url),
+					createGuardCorrelationVerifier(GUARD_CORRELATION_SECRET),
+				).id;
 				return new Response("forwarded", { status: 200 });
 			},
 		});
@@ -479,11 +494,192 @@ describe("source-controlled guard", () => {
 		const guardEvent = events.find((event) => event.event === "proxy_response");
 		expect(forwardedId).not.toBe(spoofedId);
 		expect(forwardedId).toMatch(
+			/^v1\.[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.1\.[A-Za-z0-9_-]{43}$/,
+		);
+		expect(proxyRequestId).toBe(guardEvent?.id);
+		expect(response.headers.get(GUARD_REQUEST_ID_HEADER)).toBeNull();
+	});
+
+	test("signs one logical UUID with increasing ordinals across trusted 503 recovery", async () => {
+		const envelopes: string[] = [];
+		let fetchCalls = 0;
+		const { baseUrl } = await startGuard("http://127.0.0.1:8789", {
+			guardCorrelationSecret: GUARD_CORRELATION_SECRET_ENCODED,
+			maxAttempts: 2,
+			fetchImpl: async (_url: URL, init: RequestInit) => {
+				fetchCalls += 1;
+				envelopes.push(
+					new Headers(init.headers).get(GUARD_REQUEST_ID_HEADER) ?? "",
+				);
+				if (fetchCalls === 1) {
+					return new Response(
+						JSON.stringify({ error: { type: "pool_exhausted" } }),
+						{
+							status: 503,
+							headers: {
+								"x-better-ccflare-pool-status": "exhausted",
+								"x-better-ccflare-recovery-scope": "pool",
+							},
+						},
+					);
+				}
+				return new Response("recovered", { status: 200 });
+			},
+		});
+
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+
+		expect(response.status).toBe(200);
+		expect(await response.text()).toBe("recovered");
+		expect(fetchCalls).toBe(2);
+		const verify = createGuardCorrelationVerifier(GUARD_CORRELATION_SECRET);
+		const proxyAttempts = envelopes.map((envelope) => {
+			const request = new Request("http://127.0.0.1:8789/v1/messages", {
+				headers: { [GUARD_REQUEST_ID_HEADER]: envelope },
+			});
+			const metadata = createRequestMetadata(
+				request,
+				new URL(request.url),
+				verify,
+			);
+			return {
+				requestId: metadata.id,
+				attemptOrdinal: metadata.guardAttemptOrdinal,
+			};
+		});
+		expect(proxyAttempts).toEqual([
+			{
+				requestId: proxyAttempts[0]?.requestId,
+				attemptOrdinal: 1,
+			},
+			{
+				requestId: proxyAttempts[0]?.requestId,
+				attemptOrdinal: 2,
+			},
+		]);
+	});
+
+	test("a rotated backend credential discards guard correlation without failing the request", async () => {
+		const rotatedSecret = Buffer.from(
+			"fedcba9876543210fedcba9876543210",
+			"utf8",
+		);
+		let trustedId: string | null = null;
+		let localId: string | null = null;
+		const { baseUrl } = await startGuard("http://127.0.0.1:8789", {
+			guardCorrelationSecret: GUARD_CORRELATION_SECRET_ENCODED,
+			fetchImpl: async (url: URL, init: RequestInit) => {
+				const request = new Request(url, {
+					method: init.method,
+					headers: init.headers,
+				});
+				const guardEnvelope = new Headers(init.headers).get(
+					GUARD_REQUEST_ID_HEADER,
+				);
+				trustedId = createGuardCorrelationVerifier(
+					GUARD_CORRELATION_SECRET,
+				)(new Headers(init.headers))?.requestId ?? null;
+				localId = createRequestMetadata(
+					request,
+					new URL(url),
+					createGuardCorrelationVerifier(rotatedSecret),
+				).id;
+				expect(guardEnvelope).not.toContain(localId);
+				return new Response("ok", { status: 200 });
+			},
+		});
+
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+
+		expect(await response.text()).toBe("ok");
+		expect(trustedId).toMatch(
 			/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
 		);
-		expect(proxyRequestId).toBe(forwardedId);
-		expect(guardEvent?.id).toBe(forwardedId);
+		expect(localId).not.toBe(trustedId);
+		expect(localId).toMatch(
+			/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+		);
+	});
+
+	test.each([
+		["missing", undefined],
+		["malformed", "not-a-canonical-32-byte-secret"],
+	])(
+		"discards client correlation when the guard credential is %s",
+		async (_name, guardCorrelationSecret) => {
+			let forwardedEnvelope: string | null = "not-observed";
+			const { baseUrl } = await startGuard("http://127.0.0.1:8789", {
+				env: {},
+				guardCorrelationSecret,
+				fetchImpl: async (_url: URL, init: RequestInit) => {
+					forwardedEnvelope = new Headers(init.headers).get(
+						GUARD_REQUEST_ID_HEADER,
+					);
+					return new Response("ok", { status: 200 });
+				},
+			});
+
+			const response = await fetch(`${baseUrl}/v1/messages`, {
+				method: "POST",
+				headers: {
+					[GUARD_REQUEST_ID_HEADER]:
+						"v1.76110a75-9e91-4ab9-89a7-3e5d25a318fc.1.spoofed",
+				},
+				body: "{}",
+			});
+
+			expect(await response.text()).toBe("ok");
+			expect(forwardedEnvelope).toBeNull();
+		},
+	);
+
+	test("forwards a protected 529 exactly once while stripping internal response headers", async () => {
+		const protectedBody = JSON.stringify({
+			type: "error",
+			error: {
+				type: "overloaded_error",
+				message: "Overloaded",
+			},
+		});
+		let fetchCalls = 0;
+		const { baseUrl } = await startGuard("http://127.0.0.1:8789", {
+			guardCorrelationSecret: GUARD_CORRELATION_SECRET_ENCODED,
+			fetchImpl: async () => {
+				fetchCalls += 1;
+				return new Response(protectedBody, {
+					status: 529,
+					headers: {
+						"content-type": "application/json",
+						"retry-after": "7",
+						"x-request-id": "req_safe",
+						[GUARD_REQUEST_ID_HEADER]: "must-not-reach-client",
+						[GUARD_CORRELATION_SECRET_HEADER]: "must-never-be-http",
+						"x-better-ccflare-request-id":
+							"derived-correlation-must-not-reach-client",
+					},
+				});
+			},
+		});
+
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+
+		expect(response.status).toBe(529);
+		expect(await response.text()).toBe(protectedBody);
+		expect(response.headers.get("retry-after")).toBe("7");
+		expect(response.headers.get("x-request-id")).toBe("req_safe");
 		expect(response.headers.get(GUARD_REQUEST_ID_HEADER)).toBeNull();
+		expect(response.headers.get(GUARD_CORRELATION_SECRET_HEADER)).toBeNull();
+		expect(response.headers.get("x-better-ccflare-request-id")).toBeNull();
+		expect(fetchCalls).toBe(1);
 	});
 
 	test("aborts a stalled response body and releases its active lease", async () => {

@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
@@ -19,9 +20,177 @@ import { resolveConfigPath } from "./paths";
 
 const log = new Logger("Config");
 
+/**
+ * This credential is intentionally env-only: it is absent from ConfigData,
+ * config files, health output, and every generic config enumeration surface.
+ */
+export const GUARD_CORRELATION_SECRET_ENV =
+	"CCFLARE_GUARD_CORRELATION_SECRET" as const;
+
+const CANONICAL_32_BYTE_BASE64URL = /^[A-Za-z0-9_-]{43}$/;
+
+export function readGuardCorrelationSecret(
+	env: Record<string, string | undefined> = process.env,
+): Uint8Array | undefined {
+	const encoded = env[GUARD_CORRELATION_SECRET_ENV];
+	if (!encoded || !CANONICAL_32_BYTE_BASE64URL.test(encoded)) return undefined;
+	const decoded = Buffer.from(encoded, "base64url");
+	if (decoded.byteLength !== 32 || decoded.toString("base64url") !== encoded) {
+		return undefined;
+	}
+	return Uint8Array.from(decoded);
+}
+
 function parseEnabledEnvFlag(value: string | undefined): boolean | undefined {
 	if (value === undefined) return undefined;
 	return value === "true" || value === "1";
+}
+
+function parseStrictBooleanFlag(value: unknown): boolean | null {
+	if (typeof value === "boolean") return value;
+	if (typeof value !== "string") return null;
+	const normalized = value.trim().toLowerCase();
+	if (normalized === "true" || normalized === "1") return true;
+	if (normalized === "false" || normalized === "0") return false;
+	return null;
+}
+
+export type AnthropicDegradedMode = "off" | "observe" | "enforce";
+
+/**
+ * Restart-scoped policy settings for Anthropic degraded mode. The coordinator
+ * owns only process-local state; none of these settings imply persistence.
+ */
+export interface AnthropicDegradedModeConfig {
+	mode: AnthropicDegradedMode;
+	largeRequestTokenThreshold: number;
+	largeRequestByteThreshold: number;
+	evidenceWindowMs: number;
+	quorum: number;
+	retryMinMs: number;
+	retryFallbackMs: number;
+	retryMaxMs: number;
+	recoveryWindowMs: number;
+	probeLeaseMs: number;
+	maxCohorts: number;
+}
+
+export const ANTHROPIC_DEGRADED_MODE_DEFAULTS: Readonly<AnthropicDegradedModeConfig> =
+	Object.freeze({
+		mode: "off",
+		largeRequestTokenThreshold: 100_000,
+		largeRequestByteThreshold: 256 * 1024,
+		evidenceWindowMs: 30_000,
+		quorum: 2,
+		retryMinMs: 5_000,
+		retryFallbackMs: 10_000,
+		retryMaxMs: 60_000,
+		recoveryWindowMs: 30_000,
+		probeLeaseMs: 10 * 60_000,
+		maxCohorts: 1_024,
+	});
+
+export interface AnthropicDegradedModeConfigInput {
+	mode?: unknown;
+	largeRequestTokenThreshold?: unknown;
+	largeRequestByteThreshold?: unknown;
+	evidenceWindowMs?: unknown;
+	quorum?: unknown;
+	retryMinMs?: unknown;
+	retryFallbackMs?: unknown;
+	retryMaxMs?: unknown;
+	recoveryWindowMs?: unknown;
+	probeLeaseMs?: unknown;
+	maxCohorts?: unknown;
+}
+
+const ANTHROPIC_DEGRADED_NUMERIC_BOUNDS = {
+	largeRequestTokenThreshold: [10_000, 2_000_000],
+	largeRequestByteThreshold: [64 * 1024, 16 * 1024 * 1024],
+	evidenceWindowMs: [5_000, 5 * 60_000],
+	quorum: [2, 8],
+	retryMinMs: [1_000, 60_000],
+	retryFallbackMs: [1_000, 5 * 60_000],
+	retryMaxMs: [5_000, 5 * 60_000],
+	recoveryWindowMs: [5_000, 5 * 60_000],
+	probeLeaseMs: [60_000, 15 * 60_000],
+	maxCohorts: [1, 10_000],
+} as const satisfies Record<
+	Exclude<keyof AnthropicDegradedModeConfig, "mode">,
+	readonly [number, number]
+>;
+
+function parseBoundedInteger(
+	value: unknown,
+	fallback: number,
+	bounds: readonly [number, number],
+): number | null {
+	if (value === undefined) return fallback;
+	if (
+		typeof value !== "number" &&
+		(typeof value !== "string" || value.trim() === "")
+	) {
+		return null;
+	}
+	const parsed = typeof value === "number" ? value : Number(value);
+	if (
+		!Number.isSafeInteger(parsed) ||
+		parsed < bounds[0] ||
+		parsed > bounds[1]
+	) {
+		return null;
+	}
+	return parsed;
+}
+
+/**
+ * Resolve the entire policy atomically. Any invalid supplied value disables
+ * enforcement instead of leaving a partially valid policy active.
+ */
+export function resolveAnthropicDegradedModeConfig(
+	input: AnthropicDegradedModeConfigInput,
+	onInvalid?: (field: keyof AnthropicDegradedModeConfig) => void,
+): AnthropicDegradedModeConfig {
+	const rawMode = input.mode ?? ANTHROPIC_DEGRADED_MODE_DEFAULTS.mode;
+	const normalizedMode =
+		typeof rawMode === "string" ? rawMode.trim().toLowerCase() : "";
+	const mode =
+		normalizedMode === "off" ||
+		normalizedMode === "observe" ||
+		normalizedMode === "enforce"
+			? normalizedMode
+			: null;
+	if (mode === null) {
+		onInvalid?.("mode");
+		return { ...ANTHROPIC_DEGRADED_MODE_DEFAULTS };
+	}
+
+	const resolved = {
+		mode,
+	} as AnthropicDegradedModeConfig;
+	for (const field of Object.keys(ANTHROPIC_DEGRADED_NUMERIC_BOUNDS) as Array<
+		Exclude<keyof AnthropicDegradedModeConfig, "mode">
+	>) {
+		const value = parseBoundedInteger(
+			input[field],
+			ANTHROPIC_DEGRADED_MODE_DEFAULTS[field],
+			ANTHROPIC_DEGRADED_NUMERIC_BOUNDS[field],
+		);
+		if (value === null) {
+			onInvalid?.(field);
+			return { ...ANTHROPIC_DEGRADED_MODE_DEFAULTS };
+		}
+		resolved[field] = value;
+	}
+
+	if (
+		resolved.retryMinMs > resolved.retryFallbackMs ||
+		resolved.retryFallbackMs > resolved.retryMaxMs
+	) {
+		onInvalid?.("retryFallbackMs");
+		return { ...ANTHROPIC_DEGRADED_MODE_DEFAULTS };
+	}
+	return resolved;
 }
 
 export interface RuntimeConfig {
@@ -68,6 +237,18 @@ export interface ConfigData {
 	agent_frontmatter_model_fallback?: boolean;
 	model_catalog_oauth_refresh_enabled?: boolean;
 	health_detail_enabled?: boolean;
+	anthropic_degraded_mode?: AnthropicDegradedMode;
+	anthropic_degraded_large_request_tokens?: number;
+	anthropic_degraded_large_request_bytes?: number;
+	anthropic_degraded_evidence_window_ms?: number;
+	anthropic_degraded_quorum?: number;
+	anthropic_degraded_retry_min_ms?: number;
+	anthropic_degraded_retry_fallback_ms?: number;
+	anthropic_degraded_retry_max_ms?: number;
+	anthropic_degraded_recovery_window_ms?: number;
+	anthropic_degraded_probe_lease_ms?: number;
+	anthropic_degraded_max_cohorts?: number;
+	anthropic_degraded_diagnostics_enabled?: boolean;
 	alert_daily_spend_usd?: number;
 	alert_tokens_per_hour?: number;
 	alert_request_tokens?: number;
@@ -587,6 +768,78 @@ export class Config extends EventEmitter {
 		return false;
 	}
 
+	getAnthropicDegradedModeConfig(): AnthropicDegradedModeConfig {
+		let invalidField: keyof AnthropicDegradedModeConfig | null = null;
+		const resolved = resolveAnthropicDegradedModeConfig(
+			{
+				mode:
+					process.env.CCFLARE_ANTHROPIC_DEGRADED_MODE ??
+					this.data.anthropic_degraded_mode,
+				largeRequestTokenThreshold:
+					process.env.CCFLARE_ANTHROPIC_DEGRADED_LARGE_REQUEST_TOKENS ??
+					this.data.anthropic_degraded_large_request_tokens,
+				largeRequestByteThreshold:
+					process.env.CCFLARE_ANTHROPIC_DEGRADED_LARGE_REQUEST_BYTES ??
+					this.data.anthropic_degraded_large_request_bytes,
+				evidenceWindowMs:
+					process.env.CCFLARE_ANTHROPIC_DEGRADED_EVIDENCE_WINDOW_MS ??
+					this.data.anthropic_degraded_evidence_window_ms,
+				quorum:
+					process.env.CCFLARE_ANTHROPIC_DEGRADED_QUORUM ??
+					this.data.anthropic_degraded_quorum,
+				retryMinMs:
+					process.env.CCFLARE_ANTHROPIC_DEGRADED_RETRY_MIN_MS ??
+					this.data.anthropic_degraded_retry_min_ms,
+				retryFallbackMs:
+					process.env.CCFLARE_ANTHROPIC_DEGRADED_RETRY_FALLBACK_MS ??
+					this.data.anthropic_degraded_retry_fallback_ms,
+				retryMaxMs:
+					process.env.CCFLARE_ANTHROPIC_DEGRADED_RETRY_MAX_MS ??
+					this.data.anthropic_degraded_retry_max_ms,
+				recoveryWindowMs:
+					process.env.CCFLARE_ANTHROPIC_DEGRADED_RECOVERY_WINDOW_MS ??
+					this.data.anthropic_degraded_recovery_window_ms,
+				probeLeaseMs:
+					process.env.CCFLARE_ANTHROPIC_DEGRADED_PROBE_LEASE_MS ??
+					this.data.anthropic_degraded_probe_lease_ms,
+				maxCohorts:
+					process.env.CCFLARE_ANTHROPIC_DEGRADED_MAX_COHORTS ??
+					this.data.anthropic_degraded_max_cohorts,
+			},
+			(field) => {
+				invalidField ??= field;
+			},
+		);
+		if (invalidField !== null) {
+			log.warn(
+				`Invalid Anthropic degraded-mode setting "${invalidField}"; degraded mode is off until configuration is corrected and the process restarts`,
+			);
+		}
+		return resolved;
+	}
+
+	/**
+	 * Restart-scoped, host-log-only diagnostic detail. Malformed values fail
+	 * closed so an operator typo cannot silently start emitting joinable events.
+	 */
+	getAnthropicDegradedDiagnosticsEnabled(): boolean {
+		const fromEnv = process.env.CCFLARE_ANTHROPIC_DEGRADED_DIAGNOSTICS;
+		const raw =
+			fromEnv === undefined
+				? this.data.anthropic_degraded_diagnostics_enabled
+				: fromEnv;
+		if (raw === undefined) return false;
+		const resolved =
+			fromEnv === undefined && typeof raw !== "boolean"
+				? null
+				: parseStrictBooleanFlag(raw);
+		if (resolved !== null) return resolved;
+		log.warn(
+			"Invalid Anthropic degraded-mode diagnostics setting; detailed events remain off until configuration is corrected and the process restarts",
+		);
+		return false;
+	}
+
 	getAlertDailySpendUsd(): number {
 		const fromEnv = process.env.ALERT_DAILY_SPEND_USD;
 		if (fromEnv) {
@@ -710,6 +963,7 @@ export class Config extends EventEmitter {
 	}
 
 	getAllSettings(): Record<string, string | number | boolean | undefined> {
+		const anthropicDegradedMode = this.getAnthropicDegradedModeConfig();
 		// Include current strategy (which might come from env)
 		return {
 			...this.data,
@@ -732,6 +986,24 @@ export class Config extends EventEmitter {
 			model_catalog_oauth_refresh_enabled:
 				this.getModelCatalogOAuthRefreshEnabled(),
 			health_detail_enabled: this.getHealthDetailEnabled(),
+			anthropic_degraded_mode: anthropicDegradedMode.mode,
+			anthropic_degraded_large_request_tokens:
+				anthropicDegradedMode.largeRequestTokenThreshold,
+			anthropic_degraded_large_request_bytes:
+				anthropicDegradedMode.largeRequestByteThreshold,
+			anthropic_degraded_evidence_window_ms:
+				anthropicDegradedMode.evidenceWindowMs,
+			anthropic_degraded_quorum: anthropicDegradedMode.quorum,
+			anthropic_degraded_retry_min_ms: anthropicDegradedMode.retryMinMs,
+			anthropic_degraded_retry_fallback_ms:
+				anthropicDegradedMode.retryFallbackMs,
+			anthropic_degraded_retry_max_ms: anthropicDegradedMode.retryMaxMs,
+			anthropic_degraded_recovery_window_ms:
+				anthropicDegradedMode.recoveryWindowMs,
+			anthropic_degraded_probe_lease_ms: anthropicDegradedMode.probeLeaseMs,
+			anthropic_degraded_max_cohorts: anthropicDegradedMode.maxCohorts,
+			anthropic_degraded_diagnostics_enabled:
+				this.getAnthropicDegradedDiagnosticsEnabled(),
 			alert_daily_spend_usd: this.getAlertDailySpendUsd(),
 			alert_tokens_per_hour: this.getAlertTokensPerHour(),
 			alert_request_tokens: this.getAlertRequestTokens(),
