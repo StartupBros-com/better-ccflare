@@ -25,13 +25,17 @@ mock.module("@better-ccflare/database", () => ({
 	DatabaseOperations: class DatabaseOperations {},
 	ModelTranslationRepository: class ModelTranslationRepository {},
 }));
-const { usageCache } = await import("@better-ccflare/providers");
+const providersModule = await import("@better-ccflare/providers");
+const { usageCache } = providersModule;
 const usageCollectorModule = await import("../usage-collector");
 const { handleProxy } = await import("../proxy");
+const { getRateLimitProbeAdmission, resetRateLimitProbeGatesForTests } =
+	await import("../handlers/rate-limit-cooldown");
 
 const FABLE = "claude-fable-5";
 const FABLE_SIBLING = "claude-fable-5-20260701";
 const OPUS = "claude-opus-4-8";
+const OPUS_NEXT = "claude-opus-5";
 const SONNET = "claude-sonnet-4-5";
 
 const originalFetch = globalThis.fetch;
@@ -328,6 +332,27 @@ function cacheFreshFableExhaustion(accountId: string): void {
 	}
 }
 
+function cacheCurrentFamilyExhaustion(
+	accountId: string,
+	...displayNames: string[]
+): void {
+	usageCache.set(accountId, {
+		spend: { enabled: false },
+		limits: displayNames.map((displayName) => ({
+			kind: "weekly_scoped",
+			percent: 100,
+			resets_at: new Date(Date.now() + 2 * 24 * 60 * 60 * 1000).toISOString(),
+			scope: { model: { id: null, display_name: displayName } },
+			is_active: true,
+		})),
+	});
+	cachedUsageAccountIds.add(accountId);
+}
+
+function cacheCurrentFableExhaustion(accountId: string): void {
+	cacheCurrentFamilyExhaustion(accountId, "Fable");
+}
+
 type Attempt = { account: string; model: string };
 
 function installFetch(
@@ -354,11 +379,13 @@ async function run(
 }
 
 beforeEach(() => {
+	resetRateLimitProbeGatesForTests();
 	installUsageCollector();
 	process.env.CCFLARE_OVERLOAD_RETRY_ENABLED = "false";
 });
 
 afterEach(() => {
+	resetRateLimitProbeGatesForTests();
 	restoreUsageCollector();
 	restoreUsageCollector = (): void => {};
 	globalThis.fetch = originalFetch;
@@ -987,6 +1014,791 @@ describe("global model-first routing", () => {
 			}
 		});
 	}
+
+	it("uses the account's configured native Opus fallback when its normal Fable lane is already exhausted", async () => {
+		const account = makeAccount("preselected-capacity-fallback");
+		const ctx = makeContext([account], makeCombo({ account }));
+		ctx.dbOps.getComboRoutingPolicy = mock(async (family: ComboFamily) =>
+			makeRoutingPolicy(null, family),
+		);
+		cacheCurrentFableExhaustion(account.id);
+		const attempts = installFetch((attempt) =>
+			attempt.model === OPUS ? success() : exactModelExhausted(),
+		);
+
+		const response = await run(ctx);
+
+		expect(response.status).toBe(200);
+		expect(attempts).toEqual([{ account: account.id, model: OPUS }]);
+		expect(usageHandleStart).toHaveBeenCalledTimes(1);
+		expect(usageHandleStart.mock.calls[0]?.[0]).toMatchObject({
+			originalModel: FABLE,
+			appliedModel: OPUS,
+			comboModelOverrideFrom: null,
+			comboModelOverrideTo: null,
+		});
+	});
+
+	it("runs a blocked earlier account's Opus only after a healthy Fable route fails", async () => {
+		const blocked = makeAccount("blocked-primary");
+		const healthy = makeAccount("healthy-lower-priority");
+		blocked.priority = 0;
+		healthy.priority = 1;
+		const ctx = makeContext(
+			[blocked, healthy],
+			makeCombo({ account: blocked }, { account: healthy }),
+		);
+		ctx.dbOps.getComboRoutingPolicy = mock(async (family: ComboFamily) =>
+			makeRoutingPolicy(null, family),
+		);
+		cacheCurrentFableExhaustion(blocked.id);
+		const attempts = installFetch((attempt) =>
+			attempt.account === blocked.id && attempt.model === OPUS
+				? success()
+				: exactModelExhausted(),
+		);
+
+		const response = await run(ctx);
+
+		expect(response.status).toBe(200);
+		expect(attempts).toEqual([
+			{ account: healthy.id, model: FABLE },
+			{ account: blocked.id, model: OPUS },
+		]);
+	});
+
+	it("orders deferred families by their minimum configured fallback rank", async () => {
+		const earlier = makeAccount("ranked-family-a", [FABLE, OPUS, SONNET]);
+		const later = makeAccount("ranked-family-b", [FABLE, OPUS]);
+		const ctx = makeContext(
+			[earlier, later],
+			makeCombo({ account: earlier }, { account: later }),
+		);
+		ctx.dbOps.getComboRoutingPolicy = mock(async (family: ComboFamily) =>
+			makeRoutingPolicy(null, family),
+		);
+		cacheCurrentFamilyExhaustion(earlier.id, "Fable", "Opus");
+		cacheCurrentFableExhaustion(later.id);
+		const attempts = installFetch((attempt) =>
+			attempt.account === later.id && attempt.model === OPUS
+				? success()
+				: exactModelExhausted(),
+		);
+
+		const response = await run(ctx);
+
+		expect(response.status).toBe(200);
+		expect(attempts).toEqual([{ account: later.id, model: OPUS }]);
+	});
+
+	it("globally promotes a later account's requested-family sibling over cross-family routes", async () => {
+		const earlier = makeAccount("ranked-sibling-a", [FABLE, OPUS]);
+		const later = makeAccount("ranked-sibling-b", [FABLE, OPUS, FABLE_SIBLING]);
+		const ctx = makeContext(
+			[earlier, later],
+			makeCombo({ account: earlier }, { account: later }),
+		);
+		ctx.dbOps.getComboRoutingPolicy = mock(async (family: ComboFamily) =>
+			makeRoutingPolicy(null, family),
+		);
+		for (const account of [earlier, later]) {
+			usageCache.markModelScopedExhausted(
+				account.id,
+				FABLE,
+				"",
+				Date.now() + 60_000,
+			);
+			cachedUsageAccountIds.add(account.id);
+		}
+		const attempts = installFetch((attempt) =>
+			attempt.account === later.id && attempt.model === FABLE_SIBLING
+				? success()
+				: exactModelExhausted(),
+		);
+
+		const response = await run(ctx);
+
+		expect(response.status).toBe(200);
+		expect(attempts).toEqual([{ account: later.id, model: FABLE_SIBLING }]);
+	});
+
+	it("retries an all-suppressed deferred pool once without the probe gate", async () => {
+		const account = makeAccount("suppressed-deferred");
+		account.rate_limited_until = Date.now() - 1;
+		account.rate_limited_reason = "upstream_529_overloaded_no_reset";
+		const ctx = makeContext([account], makeCombo({ account }));
+		ctx.dbOps.getComboRoutingPolicy = mock(async (family: ComboFamily) =>
+			makeRoutingPolicy(null, family),
+		);
+		cacheCurrentFableExhaustion(account.id);
+		expect(getRateLimitProbeAdmission(account)).toBe("admitted");
+		const attempts = installFetch(() => success());
+
+		const response = await run(ctx);
+
+		expect(response.status).toBe(200);
+		expect(attempts).toEqual([{ account: account.id, model: OPUS }]);
+	});
+
+	it("returns context overflow when the rescued deferred route is rejected before transport", async () => {
+		const previousAdmission = process.env.CCFLARE_CONTEXT_ADMISSION;
+		const previousWindow =
+			process.env.CCFLARE_CONTEXT_ADMISSION_TEST_EFFECTIVE_WINDOW;
+		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
+		process.env.CCFLARE_CONTEXT_ADMISSION_TEST_EFFECTIVE_WINDOW = "64";
+		const estimateSpy = spyOn(
+			providersModule,
+			"estimateAnthropicAdmissionTokens",
+		).mockReturnValue({
+			tokens: 100,
+			method: "test-authoritative",
+			confidence: "authoritative",
+		});
+		try {
+			const account = makeAccount("suppressed-admission-deferred");
+			account.provider = "codex";
+			account.api_key = null;
+			account.access_token = "token-suppressed-admission-deferred";
+			account.expires_at = Date.now() + 60 * 60 * 1000;
+			account.model_mappings = JSON.stringify({
+				fable: [FABLE, "gpt-5.3-codex-spark"],
+			});
+			account.rate_limited_until = Date.now() - 1;
+			account.rate_limited_reason = "upstream_529_overloaded_no_reset";
+			const ctx = makeContext([account], makeCombo({ account }));
+			ctx.dbOps.getComboRoutingPolicy = mock(async (family: ComboFamily) =>
+				makeRoutingPolicy(null, family),
+			);
+			cacheCurrentFableExhaustion(account.id);
+			expect(getRateLimitProbeAdmission(account)).toBe("admitted");
+			const attempts = installFetch(() => success());
+
+			const response = await run(ctx);
+
+			expect(response.status).toBe(400);
+			expect(await response.json()).toMatchObject({
+				type: "error",
+				error: { code: "context_length_exceeded" },
+			});
+			expect(attempts).toEqual([]);
+		} finally {
+			estimateSpy.mockRestore();
+			if (previousAdmission === undefined) {
+				delete process.env.CCFLARE_CONTEXT_ADMISSION;
+			} else {
+				process.env.CCFLARE_CONTEXT_ADMISSION = previousAdmission;
+			}
+			if (previousWindow === undefined) {
+				delete process.env.CCFLARE_CONTEXT_ADMISSION_TEST_EFFECTIVE_WINDOW;
+			} else {
+				process.env.CCFLARE_CONTEXT_ADMISSION_TEST_EFFECTIVE_WINDOW =
+					previousWindow;
+			}
+		}
+	});
+
+	it("continues from an ungated requested-route overload to a deferred route", async () => {
+		const requested = makeAccount("suppressed-requested");
+		requested.model_mappings = null;
+		requested.rate_limited_until = Date.now() - 1;
+		requested.rate_limited_reason = "upstream_529_overloaded_no_reset";
+		const deferred = makeAccount("deferred-after-requested");
+		deferred.priority = 1;
+		const ctx = makeContext(
+			[requested, deferred],
+			makeCombo({ account: requested }, { account: deferred }),
+		);
+		ctx.dbOps.getComboRoutingPolicy = mock(async (family: ComboFamily) =>
+			makeRoutingPolicy(null, family),
+		);
+		cacheCurrentFableExhaustion(deferred.id);
+		expect(getRateLimitProbeAdmission(requested)).toBe("admitted");
+		const attempts = installFetch((attempt) =>
+			attempt.account === deferred.id && attempt.model === OPUS
+				? success()
+				: new Response('{"type":"error","error":{"type":"overloaded_error"}}', {
+						status: 529,
+						headers: { "content-type": "application/json" },
+					}),
+		);
+
+		const response = await run(ctx);
+
+		expect(response.status).toBe(200);
+		expect(attempts).toEqual([
+			{ account: requested.id, model: FABLE },
+			{ account: deferred.id, model: OPUS },
+		]);
+	});
+
+	it("preserves side-effect-free strategy order for routes deferred before selection", async () => {
+		const repositoryFirst = makeAccount("deferred-repository-first");
+		repositoryFirst.priority = 0;
+		const strategyFirst = makeAccount("deferred-strategy-first");
+		strategyFirst.priority = 10;
+		const ctx = makeContext(
+			[repositoryFirst, strategyFirst],
+			makeCombo({ account: repositoryFirst }, { account: strategyFirst }),
+		);
+		ctx.strategy.select = mock(async (selected: Account[]) =>
+			[strategyFirst, repositoryFirst].filter((account) =>
+				selected.some((candidate) => candidate.id === account.id),
+			),
+		);
+		ctx.strategy.peek = mock((selected: Account[]) =>
+			selected.some((candidate) => candidate.id === strategyFirst.id)
+				? strategyFirst.id
+				: (selected[0]?.id ?? null),
+		);
+		ctx.dbOps.getComboRoutingPolicy = mock(async (family: ComboFamily) =>
+			makeRoutingPolicy(null, family),
+		);
+		cacheCurrentFableExhaustion(repositoryFirst.id);
+		cacheCurrentFableExhaustion(strategyFirst.id);
+		const attempts = installFetch((attempt) =>
+			attempt.account === strategyFirst.id ? success() : exactModelExhausted(),
+		);
+
+		const response = await run(ctx);
+
+		expect(response.status).toBe(200);
+		expect(attempts).toEqual([{ account: strategyFirst.id, model: OPUS }]);
+		expect(ctx.strategy.select).toHaveBeenCalledTimes(1);
+		expect(ctx.strategy.select).toHaveBeenCalledWith([], expect.anything());
+	});
+
+	it("preserves strategy order across mixed preplanned and dynamic normal routes", async () => {
+		const preplanned = makeAccount("mixed-preplanned-a");
+		preplanned.priority = 1;
+		const dynamic = makeAccount("mixed-dynamic-b");
+		dynamic.priority = 0;
+		const ctx = makeContext(
+			[preplanned, dynamic],
+			makeCombo({ account: preplanned }, { account: dynamic }),
+		);
+		ctx.strategy.select = mock(async (selected: Account[]) =>
+			[dynamic, preplanned].filter((account) =>
+				selected.some((candidate) => candidate.id === account.id),
+			),
+		);
+		ctx.strategy.peek = mock((selected: Account[]) =>
+			selected.some((candidate) => candidate.id === dynamic.id)
+				? dynamic.id
+				: (selected[0]?.id ?? null),
+		);
+		ctx.dbOps.getComboRoutingPolicy = mock(async (family: ComboFamily) =>
+			makeRoutingPolicy(null, family),
+		);
+		cacheCurrentFableExhaustion(preplanned.id);
+		const attempts = installFetch((attempt) =>
+			attempt.account === dynamic.id && attempt.model === OPUS
+				? success()
+				: exactModelExhausted(),
+		);
+
+		const response = await run(ctx);
+
+		expect(response.status).toBe(200);
+		expect(attempts).toEqual([
+			{ account: dynamic.id, model: FABLE },
+			{ account: dynamic.id, model: OPUS },
+		]);
+		expect(ctx.strategy.select).toHaveBeenCalledTimes(1);
+	});
+
+	it.each([
+		["null", null],
+		["invalid", "missing-account"],
+	] as const)("keeps stable deferred order when strategy.peek returns %s", async (label, peekedAccountId) => {
+		const first = makeAccount(`peek-${label}-a`);
+		const second = makeAccount(`peek-${label}-b`);
+		const ctx = makeContext(
+			[first, second],
+			makeCombo({ account: first }, { account: second }),
+		);
+		ctx.dbOps.getComboRoutingPolicy = mock(async (family: ComboFamily) =>
+			makeRoutingPolicy(null, family),
+		);
+		ctx.strategy.peek = mock(() => peekedAccountId);
+		cacheCurrentFableExhaustion(first.id);
+		cacheCurrentFableExhaustion(second.id);
+		const attempts = installFetch((attempt) =>
+			attempt.account === second.id ? success() : exactModelExhausted(),
+		);
+
+		const response = await run(ctx);
+
+		expect(response.status).toBe(200);
+		expect(attempts).toEqual([
+			{ account: first.id, model: OPUS },
+			{ account: second.id, model: OPUS },
+		]);
+	});
+
+	it("keeps repeated occurrences of one family in configured fallback epochs", async () => {
+		const account = makeAccount("repeated-family", [
+			FABLE,
+			OPUS,
+			SONNET,
+			OPUS_NEXT,
+		]);
+		const ctx = makeContext([account], makeCombo({ account }));
+		ctx.dbOps.getComboRoutingPolicy = mock(async (family: ComboFamily) =>
+			makeRoutingPolicy(null, family),
+		);
+		cacheCurrentFableExhaustion(account.id);
+		const attempts = installFetch((attempt) =>
+			attempt.model === OPUS_NEXT ? success() : exactModelExhausted(),
+		);
+
+		const response = await run(ctx);
+
+		expect(response.status).toBe(200);
+		expect(attempts).toEqual([
+			{ account: account.id, model: OPUS },
+			{ account: account.id, model: SONNET },
+			{ account: account.id, model: OPUS_NEXT },
+		]);
+	});
+
+	it("counts a blocked mapped model in its configured family epoch", async () => {
+		const repeated = makeAccount("blocked-family-occurrence-a", [
+			FABLE,
+			OPUS,
+			SONNET,
+			OPUS_NEXT,
+		]);
+		const peer = makeAccount("blocked-family-occurrence-b", [FABLE, OPUS]);
+		const ctx = makeContext(
+			[repeated, peer],
+			makeCombo({ account: repeated }, { account: peer }),
+		);
+		ctx.dbOps.getComboRoutingPolicy = mock(async (family: ComboFamily) =>
+			makeRoutingPolicy(null, family),
+		);
+		cacheCurrentFableExhaustion(repeated.id);
+		cacheCurrentFableExhaustion(peer.id);
+		usageCache.markModelScopedExhausted(
+			repeated.id,
+			OPUS,
+			"",
+			Date.now() + 60_000,
+		);
+		const attempts = installFetch((attempt) =>
+			attempt.account === repeated.id && attempt.model === OPUS_NEXT
+				? success()
+				: exactModelExhausted(),
+		);
+
+		const response = await run(ctx);
+
+		expect(response.status).toBe(200);
+		expect(attempts).toEqual([
+			{ account: peer.id, model: OPUS },
+			{ account: repeated.id, model: SONNET },
+			{ account: repeated.id, model: OPUS_NEXT },
+		]);
+	});
+
+	it("includes a capacity-deferred OAuth account in aged-token diagnosis", async () => {
+		const account = makeAccount("aged-deferred-oauth");
+		account.provider = "anthropic";
+		account.api_key = null;
+		account.refresh_token = "aged-refresh-token";
+		account.access_token = "expired-access-token";
+		account.expires_at = Date.now() + 60_000;
+		account.refresh_token_issued_at = Date.now() - 100 * 24 * 60 * 60 * 1000;
+		const ctx = makeContext([account], makeCombo({ account }));
+		ctx.dbOps.getComboRoutingPolicy = mock(async (family: ComboFamily) =>
+			makeRoutingPolicy(null, family),
+		);
+		cacheCurrentFableExhaustion(account.id);
+		const attempts = installFetch(
+			() =>
+				new Response(
+					'{"type":"error","error":{"type":"authentication_error"}}',
+					{
+						status: 401,
+						headers: { "content-type": "application/json" },
+					},
+				),
+		);
+
+		await expect(run(ctx)).rejects.toThrow(
+			"OAuth tokens have expired for accounts: aged-deferred-oauth",
+		);
+		expect(attempts).toEqual([]);
+	});
+
+	it("returns deferred predictive throttle after a prior requested-route attempt", async () => {
+		const account = makeAccount("predictive-after-attempt");
+		const ctx = makeContext([account], makeCombo({ account }));
+		ctx.dbOps.getComboRoutingPolicy = mock(async (family: ComboFamily) =>
+			makeRoutingPolicy(null, family),
+		);
+		ctx.config.getUsageThrottlingWeeklyEnabled = () => true;
+		usageCache.set(account.id, {
+			spend: { enabled: false },
+			limits: [
+				{
+					kind: "weekly_scoped",
+					percent: 90,
+					resets_at: new Date(
+						Date.now() + 2 * 24 * 60 * 60 * 1000,
+					).toISOString(),
+					scope: { model: { id: null, display_name: "Opus" } },
+					is_active: true,
+				},
+			],
+		});
+		cachedUsageAccountIds.add(account.id);
+		const attempts = installFetch(
+			() =>
+				new Response(
+					'{"type":"error","error":{"type":"authentication_error"}}',
+					{
+						status: 401,
+						headers: { "content-type": "application/json" },
+					},
+				),
+		);
+
+		const response = await run(ctx);
+
+		expect(response.status).toBe(529);
+		expect(attempts).toEqual([{ account: account.id, model: FABLE }]);
+	});
+
+	it("prefers a hard deferred reactive terminal over a soft predictive throttle", async () => {
+		const predictive = makeAccount("mixed-terminal-predictive");
+		const reactive = makeAccount("mixed-terminal-reactive");
+		const ctx = makeContext(
+			[predictive, reactive],
+			makeCombo({ account: predictive }, { account: reactive }),
+		);
+		ctx.dbOps.getComboRoutingPolicy = mock(async (family: ComboFamily) =>
+			makeRoutingPolicy(null, family),
+		);
+		ctx.config.getUsageThrottlingWeeklyEnabled = () => true;
+		usageCache.set(predictive.id, {
+			spend: { enabled: false },
+			limits: [
+				{
+					kind: "weekly_scoped",
+					percent: 100,
+					resets_at: new Date(
+						Date.now() + 2 * 24 * 60 * 60 * 1000,
+					).toISOString(),
+					scope: { model: { id: null, display_name: "Fable" } },
+					is_active: true,
+				},
+				{
+					kind: "weekly_scoped",
+					percent: 90,
+					resets_at: new Date(
+						Date.now() + 2 * 24 * 60 * 60 * 1000,
+					).toISOString(),
+					scope: { model: { id: null, display_name: "Opus" } },
+					is_active: true,
+				},
+			],
+		});
+		cachedUsageAccountIds.add(predictive.id);
+		cacheCurrentFableExhaustion(reactive.id);
+		let installedReactiveEvidence = false;
+		ctx.strategy.peek = mock((selected: Account[]) => {
+			if (!installedReactiveEvidence) {
+				installedReactiveEvidence = true;
+				usageCache.markModelScopedExhausted(
+					reactive.id,
+					OPUS,
+					"",
+					Date.now() + 60_000,
+				);
+			}
+			return selected[0]?.id ?? null;
+		});
+		const attempts = installFetch(() => success());
+
+		const response = await run(ctx);
+		const body = (await response.json()) as {
+			error?: { code?: string };
+		};
+
+		expect(response.status).toBe(503);
+		expect(body.error?.code).toBe("model_pool_exhausted");
+		expect(attempts).toEqual([]);
+	});
+
+	it("skips a reactively depleted deferred route and tries the next clear peer", async () => {
+		const depleted = makeAccount("deferred-reactive-depleted");
+		const clear = makeAccount("deferred-reactive-clear");
+		const ctx = makeContext(
+			[depleted, clear],
+			makeCombo({ account: depleted }, { account: clear }),
+		);
+		ctx.dbOps.getComboRoutingPolicy = mock(async (family: ComboFamily) =>
+			makeRoutingPolicy(null, family),
+		);
+		cacheCurrentFableExhaustion(depleted.id);
+		cacheCurrentFableExhaustion(clear.id);
+		let installedReactiveEvidence = false;
+		ctx.strategy.peek = mock((selected: Account[]) => {
+			if (!installedReactiveEvidence) {
+				installedReactiveEvidence = true;
+				usageCache.markModelScopedExhausted(
+					depleted.id,
+					OPUS,
+					"",
+					Date.now() + 60_000,
+				);
+			}
+			return selected[0]?.id ?? null;
+		});
+		const attempts = installFetch(() => success());
+
+		const response = await run(ctx);
+
+		expect(response.status).toBe(200);
+		expect(attempts).toEqual([{ account: clear.id, model: OPUS }]);
+	});
+
+	it("returns model-pool exhaustion when every deferred route is reactively depleted", async () => {
+		const first = makeAccount("deferred-reactive-all-a");
+		const second = makeAccount("deferred-reactive-all-b");
+		const ctx = makeContext(
+			[first, second],
+			makeCombo({ account: first }, { account: second }),
+		);
+		ctx.dbOps.getComboRoutingPolicy = mock(async (family: ComboFamily) =>
+			makeRoutingPolicy(null, family),
+		);
+		cacheCurrentFableExhaustion(first.id);
+		cacheCurrentFableExhaustion(second.id);
+		let installedReactiveEvidence = false;
+		ctx.strategy.peek = mock((selected: Account[]) => {
+			if (!installedReactiveEvidence) {
+				installedReactiveEvidence = true;
+				for (const account of [first, second]) {
+					usageCache.markModelScopedExhausted(
+						account.id,
+						OPUS,
+						"",
+						Date.now() + 60_000,
+					);
+				}
+			}
+			return selected[0]?.id ?? null;
+		});
+		const attempts = installFetch(() => success());
+
+		const response = await run(ctx);
+		const body = (await response.json()) as {
+			error?: { code?: string };
+		};
+
+		expect(response.status).toBe(503);
+		expect(body.error?.code).toBe("model_pool_exhausted");
+		expect(attempts).toEqual([]);
+	});
+
+	it("ignores an excluded healthy Anthropic OAuth route when planning an allowed blocked fallback", async () => {
+		const excludedHealthy = makeAccount("excluded-healthy-oauth");
+		excludedHealthy.provider = "anthropic";
+		excludedHealthy.api_key = null;
+		excludedHealthy.refresh_token = "oauth-refresh";
+		const allowedBlocked = makeAccount("allowed-blocked-fallback");
+		const ctx = makeContext(
+			[excludedHealthy, allowedBlocked],
+			makeCombo({ account: excludedHealthy }, { account: allowedBlocked }),
+		);
+		ctx.dbOps.getComboRoutingPolicy = mock(async (family: ComboFamily) =>
+			makeRoutingPolicy(null, family),
+		);
+		cacheCurrentFableExhaustion(allowedBlocked.id);
+		const attempts = installFetch((attempt) =>
+			attempt.account === allowedBlocked.id && attempt.model === OPUS
+				? success()
+				: exactModelExhausted(),
+		);
+
+		const response = await run(
+			ctx,
+			makeRequest({
+				"x-better-ccflare-exclude-providers": "anthropic-oauth",
+			}),
+		);
+
+		expect(response.status).toBe(200);
+		expect(attempts).toEqual([{ account: allowedBlocked.id, model: OPUS }]);
+	});
+
+	it("keeps asymmetric fallback families in stable waves when an earlier account starts blocked", async () => {
+		const blocked = makeAccount("blocked-asymmetric-a", [FABLE, OPUS, SONNET]);
+		const healthy = makeAccount("healthy-asymmetric-b", [
+			FABLE,
+			FABLE_SIBLING,
+			SONNET,
+			OPUS,
+		]);
+		blocked.priority = 0;
+		healthy.priority = 1;
+		const ctx = makeContext(
+			[blocked, healthy],
+			makeCombo({ account: blocked }, { account: healthy }),
+		);
+		ctx.dbOps.getComboRoutingPolicy = mock(async (family: ComboFamily) =>
+			makeRoutingPolicy(null, family),
+		);
+		cacheCurrentFableExhaustion(blocked.id);
+		const attempts = installFetch((attempt) =>
+			attempt.account === healthy.id && attempt.model === SONNET
+				? success()
+				: exactModelExhausted(),
+		);
+
+		const response = await run(ctx);
+
+		expect(response.status).toBe(200);
+		expect(attempts).toEqual([
+			{ account: healthy.id, model: FABLE },
+			{ account: healthy.id, model: FABLE_SIBLING },
+			{ account: blocked.id, model: OPUS },
+			{ account: healthy.id, model: OPUS },
+			{ account: blocked.id, model: SONNET },
+			{ account: healthy.id, model: SONNET },
+		]);
+	});
+
+	it("runs a capacity-clear requested-family sibling before every cross-family fallback", async () => {
+		const blocked = makeAccount("blocked-same-family-a", [
+			FABLE,
+			OPUS,
+			FABLE_SIBLING,
+		]);
+		const healthy = makeAccount("healthy-same-family-b");
+		const ctx = makeContext(
+			[blocked, healthy],
+			makeCombo({ account: blocked }, { account: healthy }),
+		);
+		ctx.dbOps.getComboRoutingPolicy = mock(async (family: ComboFamily) =>
+			makeRoutingPolicy(null, family),
+		);
+		usageCache.markModelScopedExhausted(
+			blocked.id,
+			FABLE,
+			"",
+			Date.now() + 60_000,
+		);
+		cachedUsageAccountIds.add(blocked.id);
+		const attempts = installFetch((attempt) =>
+			attempt.account === blocked.id && attempt.model === FABLE_SIBLING
+				? success()
+				: exactModelExhausted(),
+		);
+
+		const response = await run(ctx);
+
+		expect(response.status).toBe(200);
+		expect(attempts).toEqual([
+			{ account: healthy.id, model: FABLE },
+			{ account: blocked.id, model: FABLE_SIBLING },
+		]);
+	});
+
+	it("preserves a three-model tail so Sonnet runs after deferred Opus fails", async () => {
+		const account = makeAccount("capacity-three-model-tail", [
+			FABLE,
+			OPUS,
+			SONNET,
+		]);
+		const ctx = makeContext([account], makeCombo({ account }));
+		ctx.dbOps.getComboRoutingPolicy = mock(async (family: ComboFamily) =>
+			makeRoutingPolicy(null, family),
+		);
+		cacheCurrentFableExhaustion(account.id);
+		const attempts = installFetch((attempt) =>
+			attempt.model === SONNET ? success() : exactModelExhausted(),
+		);
+
+		const response = await run(ctx);
+
+		expect(response.status).toBe(200);
+		expect(attempts).toEqual([
+			{ account: account.id, model: OPUS },
+			{ account: account.id, model: SONNET },
+		]);
+	});
+
+	it("records a hard-blocked fallback model and skips it while draining the remaining tail", async () => {
+		const account = makeAccount("capacity-blocked-opus-tail", [
+			FABLE,
+			OPUS,
+			SONNET,
+		]);
+		const ctx = makeContext([account], makeCombo({ account }));
+		ctx.dbOps.getComboRoutingPolicy = mock(async (family: ComboFamily) =>
+			makeRoutingPolicy(null, family),
+		);
+		cacheCurrentFamilyExhaustion(account.id, "Fable", "Opus");
+		const attempts = installFetch((attempt) =>
+			attempt.model === SONNET ? success() : exactModelExhausted(),
+		);
+
+		const response = await run(ctx);
+
+		expect(response.status).toBe(200);
+		expect(attempts).toEqual([{ account: account.id, model: SONNET }]);
+		expect(usageHandleStart.mock.calls[0]?.[0]).toMatchObject({
+			originalModel: FABLE,
+			appliedModel: SONNET,
+		});
+	});
+
+	it("uses each exact deferred model for predictive usage checks", async () => {
+		const account = makeAccount("capacity-predictive-tail", [
+			FABLE,
+			OPUS,
+			SONNET,
+		]);
+		const ctx = makeContext([account], makeCombo({ account }));
+		ctx.dbOps.getComboRoutingPolicy = mock(async (family: ComboFamily) =>
+			makeRoutingPolicy(null, family),
+		);
+		ctx.config.getUsageThrottlingWeeklyEnabled = () => true;
+		usageCache.set(account.id, {
+			spend: { enabled: false },
+			limits: [
+				{
+					kind: "weekly_scoped",
+					percent: 100,
+					resets_at: new Date(
+						Date.now() + 2 * 24 * 60 * 60 * 1000,
+					).toISOString(),
+					scope: { model: { id: null, display_name: "Fable" } },
+					is_active: true,
+				},
+				{
+					kind: "weekly_scoped",
+					percent: 90,
+					resets_at: new Date(
+						Date.now() + 2 * 24 * 60 * 60 * 1000,
+					).toISOString(),
+					scope: { model: { id: null, display_name: "Opus" } },
+					is_active: true,
+				},
+			],
+		});
+		cachedUsageAccountIds.add(account.id);
+		const attempts = installFetch((attempt) =>
+			attempt.model === SONNET ? success() : exactModelExhausted(),
+		);
+
+		const response = await run(ctx);
+
+		expect(response.status).toBe(200);
+		expect(attempts).toEqual([{ account: account.id, model: SONNET }]);
+	});
 
 	it("allows an exact-failure same-family sibling before accounts but defers cross-family", async () => {
 		const accountA = makeAccount("exact-a", [FABLE, FABLE_SIBLING, OPUS]);
