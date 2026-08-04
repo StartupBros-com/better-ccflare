@@ -249,7 +249,50 @@ describe("pre-transport deadline primitive", () => {
 describe("proxy pre-transport recovery", () => {
 	it("derives one frozen minimal server-tool requirement from the final intercepted body", async () => {
 		const account = makeAccount("server-tool-requirement");
+		account.provider = "pre-transport-server-tool-test";
 		const { ctx } = makeContext([account]);
+		ctx.provider.name = account.provider;
+		ctx.provider.getLogicalModelCapability = () => ({
+			status: "supported",
+			provenance: "native_passthrough",
+			reason: "included",
+		});
+		ctx.provider.createServerToolCapabilityTuple = (context) => ({
+			candidateId: context.candidateId,
+			provider: context.account.provider,
+			authMode: "api-key",
+			endpointClass: "test-messages",
+			normalizedEndpoint: "https://upstream.test/v1/messages",
+			model: context.physicalModel,
+			toolType: "web_search_20250305",
+			profile: context.requirements.profileId ?? "missing-profile",
+			inputReplay: ["native-Anthropic"],
+			outputReplay: ["native-Anthropic"],
+			providerContractRevision: "pre-transport-test-v1",
+			replayDecoderRevision: "pre-transport-test-v1",
+			requestTransport: "test-messages-json",
+			responseTransport: "test-messages-json",
+		});
+		ctx.provider.resolveServerToolCapability = (_requirements, tuple) => ({
+			decision: "proven",
+			proof: Object.freeze({
+				revision: "pre-transport-test-proof-v1",
+				tuple,
+				decision: "proven",
+				provenance: "sanitized-test-fixture",
+				owner: "pre-transport-deadline-test",
+				verifiedAt: "2026-07-29T00:00:00.000Z",
+				revalidateAfter: "2035-07-29T00:00:00.000Z",
+				fixtureRevision: "fixture-v1",
+				contractRevision: tuple.providerContractRevision,
+				revalidationTriggers: Object.freeze([
+					"tuple_change",
+					"contract_change",
+					"decoder_change",
+					"observed_behavior_change",
+				]),
+			}),
+		});
 		const catalog = await modelCatalogModule.getModelCatalog();
 		const preferredModel = catalog.models.find(
 			(entry) => entry.id !== MODEL,

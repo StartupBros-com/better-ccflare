@@ -198,7 +198,7 @@ export function createAccountsListHandler(
 			rate_limit_remaining: number | null;
 			session_start: number | null;
 			session_request_count: number;
-			refresh_token: string;
+			refresh_token: string | null;
 			access_token: string | null;
 			paused: 0 | 1;
 			priority: number;

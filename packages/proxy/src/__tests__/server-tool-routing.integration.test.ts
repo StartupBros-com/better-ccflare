@@ -132,6 +132,11 @@ function makeProvider(refreshCalls: { value: number }): Provider {
 		canHandle: () => true,
 		async refreshToken(account) {
 			refreshCalls.value++;
+			if (account.refresh_token === null) {
+				throw new Error(
+					"server-tool routing refresh mock requires a refresh token",
+				);
+			}
 			return {
 				accessToken: "unexpected-token",
 				expiresAt: Date.now() + 60_000,

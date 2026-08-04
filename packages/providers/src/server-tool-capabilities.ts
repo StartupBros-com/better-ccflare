@@ -946,7 +946,7 @@ function snapshotCapabilityAccount(
 		provider.length === 0 ||
 		provider.length > TUPLE_STRING_LIMITS.provider ||
 		(apiKey !== null && typeof apiKey !== "string") ||
-		typeof refreshToken !== "string" ||
+		(refreshToken !== null && typeof refreshToken !== "string") ||
 		(accessToken !== null && typeof accessToken !== "string") ||
 		(customEndpoint !== null && typeof customEndpoint !== "string") ||
 		(crossRegionMode !== null &&

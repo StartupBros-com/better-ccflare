@@ -50,6 +50,9 @@ mock.module("@better-ccflare/proxy", () => {
 		createAnthropicDegradedDetailedEventSink: () => undefined,
 		createAnthropicDegradedRuntimeHealth: () => ({}),
 		createGuardCorrelationVerifier: () => undefined,
+		createServerToolReplayRuntime: async () => ({
+			status: "disabled" as const,
+		}),
 		DegradedModeObservability: class {},
 		DegradedOwnerOverlay: class {},
 		drainUsageCollector: async () => {},

@@ -147,6 +147,37 @@ function customPlan(
 }
 
 describe("materializeProviderAttemptPlan", () => {
+	test("preserves a null refresh token in the immutable legacy account view", async () => {
+		const sharedAccount = accountFixture();
+		Object.defineProperty(sharedAccount, "refresh_token", {
+			configurable: true,
+			enumerable: true,
+			value: null,
+			writable: true,
+		});
+		let planningAccount: Account | undefined;
+		let transformAccount: Account | undefined;
+		const provider = baseProvider({
+			prepareRequest(_request, _buffer, account) {
+				planningAccount = account;
+			},
+			transformRequestBody: async (request, account) => {
+				transformAccount = account;
+				return request;
+			},
+		});
+
+		const plan = materializeProviderAttemptPlan(
+			provider,
+			context(sharedAccount),
+		);
+		await plan.transformRequestBody(requestFor());
+
+		expect(planningAccount).toBe(transformAccount);
+		expect(planningAccount?.refresh_token).toBeNull();
+		expect(Object.isFrozen(planningAccount)).toBe(true);
+	});
+
 	test("isolates two interleaved Vertex-style legacy plans on one shared account", async () => {
 		const sharedAccount = accountFixture();
 		const originalAccount = { ...sharedAccount };

@@ -1722,6 +1722,48 @@ describe("provider-owned server-tool tuple materialization", () => {
 		);
 	});
 
+	test("treats a null refresh token as unconfigured capability metadata", () => {
+		const requirement = requireDefined(
+			deriveServerToolRequirement({
+				tools: [{ type: "web_search_20250305", name: "web_search" }],
+			}),
+			"valid server-tool request must produce requirements",
+		);
+		const account = capabilityAccountFixture();
+		account.refresh_token = null;
+		let observedAccount:
+			| ProviderServerToolCapabilityContext["account"]
+			| undefined;
+		const tuple = materializeProviderServerToolCapabilityTuple(
+			capabilityProvider({
+				createServerToolCapabilityTuple(context) {
+					observedAccount = context.account;
+					return capabilityTupleFixture({
+						candidateId: context.candidateId,
+						provider: "fixture",
+						normalizedEndpoint: context.account.customEndpoint ?? undefined,
+						model: context.physicalModel,
+						profile: requirement.profileId ?? "missing",
+					});
+				},
+			}),
+			{
+				candidateId: "candidate-null-refresh-token",
+				account,
+				path: "/v1/messages",
+				query: "",
+				physicalModel: "fixture-model",
+				requirements: requirement,
+			},
+		);
+
+		expect(tuple).toBeDefined();
+		expect(observedAccount).toMatchObject({
+			refreshTokenConfigured: false,
+			legacyMirroredApiKey: false,
+		});
+	});
+
 	test("mirrors raw transport truthiness and fails closed on whitespace endpoints", () => {
 		const requirement = requireDefined(
 			deriveServerToolRequirement({

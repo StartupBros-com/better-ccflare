@@ -415,7 +415,7 @@ function createScalarAccountView(account: Account): Account {
 		name: readAccountString(account, "name"),
 		provider: readAccountString(account, "provider"),
 		api_key: readAccountNullableString(account, "api_key"),
-		refresh_token: readAccountString(account, "refresh_token"),
+		refresh_token: readAccountNullableString(account, "refresh_token"),
 		access_token: readAccountNullableString(account, "access_token"),
 		expires_at: readAccountNullableNumber(account, "expires_at"),
 		request_count: readAccountNumber(account, "request_count"),
