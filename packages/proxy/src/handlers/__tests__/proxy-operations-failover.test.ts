@@ -1,4 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import {
+	getProvider,
+	type Provider,
+	type ProviderAttemptPlan,
+	type ProviderAttemptPlanContext,
+} from "@better-ccflare/providers";
 import type { Account, RequestMeta } from "@better-ccflare/types";
 import {
 	boundResponseBodyForClassification,
@@ -28,6 +34,7 @@ function makeAccount(overrides: Partial<Account> = {}): Account {
 		session_start: null,
 		session_request_count: 0,
 		paused: false,
+		requires_reauth: false,
 		rate_limit_reset: null,
 		rate_limit_status: null,
 		rate_limit_remaining: null,
@@ -57,6 +64,15 @@ function makeAccount(overrides: Partial<Account> = {}): Account {
 function makeXaiAccount(overrides: Partial<Account> = {}): Account {
 	return makeAccount({
 		provider: "xai",
+		custom_endpoint: null,
+		model_mappings: null,
+		...overrides,
+	});
+}
+
+function makeZaiAccount(overrides: Partial<Account> = {}): Account {
+	return makeAccount({
+		provider: "zai",
 		custom_endpoint: null,
 		model_mappings: null,
 		...overrides,
@@ -136,6 +152,467 @@ function jsonResponse(body: object, status: number) {
 		headers: { "Content-Type": "application/json" },
 	});
 }
+
+function makeAttemptPlanningProvider(
+	options: {
+		onPlan?: (context: ProviderAttemptPlanContext) => void;
+		onRefresh?: () => void;
+		onPlanHook?: (hook: string, plan: ProviderAttemptPlan) => void;
+		throwDuringPlanning?: boolean;
+	} = {},
+): Provider {
+	const provider = {
+		name: "attempt-plan-test",
+		cacheReplayModelStrategy: "transformed-body" as const,
+		canHandle: () => true,
+		refreshToken: async (account: Account) => {
+			options.onRefresh?.();
+			return {
+				accessToken: "refreshed-token",
+				expiresAt: Date.now() + 60 * 60 * 1000,
+				refreshToken: account.refresh_token ?? "refresh-token",
+			};
+		},
+		buildUrl: () => "https://legacy.invalid/v1/messages",
+		prepareHeaders: (headers: Headers) => new Headers(headers),
+		transformRequestBody: async (request: Request) => request,
+		processResponse: async (response: Response) => response,
+		parseRateLimit: (response: Response) => ({
+			isRateLimited: response.status === 529,
+		}),
+		isStreamingResponse: () => false,
+		createAttemptPlan(context: ProviderAttemptPlanContext) {
+			options.onPlan?.(context);
+			if (options.throwDuringPlanning) {
+				throw new Error("intentional planning failure");
+			}
+
+			const targetUrl = `https://planned.invalid/${encodeURIComponent(
+				context.account.id,
+			)}/${encodeURIComponent(context.physicalModel ?? "none")}`;
+			const candidate: ProviderAttemptPlan = {
+				providerName: provider.name,
+				targetUrl,
+				apiFamily: "test-responses",
+				physicalModel: context.physicalModel,
+				capabilityProofKey: context.capabilityProofKey,
+				inputReplayMode: context.inputReplayMode,
+				outputReplayMode: context.outputReplayMode,
+				dataRetryPolicy: { mode: "reuse-same-plan", maxAttempts: 3 },
+				classifyNoExecution: async () => ({
+					decision: "executing_or_ambiguous",
+				}),
+				cacheReplayModelStrategy: "transformed-body",
+				prepareHeaders(headers, accessToken, apiKey) {
+					options.onPlanHook?.("prepareHeaders", this);
+					const prepared = new Headers(headers);
+					prepared.set(
+						"authorization",
+						`Bearer ${accessToken || apiKey || "plan-test"}`,
+					);
+					return prepared;
+				},
+				async transformRequestBody(request) {
+					options.onPlanHook?.("transformRequestBody", this);
+					return request;
+				},
+				async processResponse(response) {
+					options.onPlanHook?.("processResponse", this);
+					return response;
+				},
+				parseRateLimit(response) {
+					options.onPlanHook?.("parseRateLimit", this);
+					return { isRateLimited: response.status === 529 };
+				},
+				isStreamingResponse(response) {
+					options.onPlanHook?.("isStreamingResponse", this);
+					return (
+						response.headers
+							.get("content-type")
+							?.includes("text/event-stream") ?? false
+					);
+				},
+				async extractUsageInfo() {
+					options.onPlanHook?.("extractUsageInfo", this);
+					return null;
+				},
+			};
+			return candidate;
+		},
+	} satisfies Provider;
+	return provider;
+}
+
+describe("proxyWithAccount — immutable provider attempt plans", () => {
+	let originalFetch: typeof globalThis.fetch;
+	let originalOverloadEnabled: string | undefined;
+	let originalOverloadAttempts: string | undefined;
+	let originalOverloadBaseMs: string | undefined;
+	let originalOverloadMaxMs: string | undefined;
+
+	beforeEach(() => {
+		originalFetch = globalThis.fetch;
+		originalOverloadEnabled = process.env.CCFLARE_OVERLOAD_RETRY_ENABLED;
+		originalOverloadAttempts = process.env.CCFLARE_OVERLOAD_RETRY_MAX_ATTEMPTS;
+		originalOverloadBaseMs = process.env.CCFLARE_OVERLOAD_RETRY_BASE_MS;
+		originalOverloadMaxMs = process.env.CCFLARE_OVERLOAD_RETRY_MAX_MS;
+	});
+
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+		for (const [key, value] of [
+			["CCFLARE_OVERLOAD_RETRY_ENABLED", originalOverloadEnabled],
+			["CCFLARE_OVERLOAD_RETRY_MAX_ATTEMPTS", originalOverloadAttempts],
+			["CCFLARE_OVERLOAD_RETRY_BASE_MS", originalOverloadBaseMs],
+			["CCFLARE_OVERLOAD_RETRY_MAX_MS", originalOverloadMaxMs],
+		] as const) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	});
+
+	it("materializes the effective final body before credential resolution and performs zero I/O when planning fails", async () => {
+		const planningContexts: Array<{
+			bodyModel: string | undefined;
+			physicalModel: string | null;
+			inputReplayMode: readonly string[];
+			outputReplayMode: readonly string[];
+		}> = [];
+		let refreshCalls = 0;
+		globalThis.fetch = mock(async () =>
+			jsonResponse({ error: "unexpected" }, 500),
+		);
+		const provider = makeAttemptPlanningProvider({
+			throwDuringPlanning: true,
+			onRefresh: () => refreshCalls++,
+			onPlan: (context) => {
+				const body = context.requestBodyBuffer
+					? (JSON.parse(
+							new TextDecoder().decode(context.requestBodyBuffer),
+						) as {
+							model?: string;
+						})
+					: {};
+				planningContexts.push({
+					bodyModel: body.model,
+					physicalModel: context.physicalModel,
+					inputReplayMode: context.inputReplayMode,
+					outputReplayMode: context.outputReplayMode,
+				});
+			},
+		});
+		const ctx = makeProxyContext();
+		ctx.provider = provider;
+		const account = makeAccount({
+			provider: "attempt-plan-test",
+			api_key: null,
+			access_token: null,
+			expires_at: null,
+			refresh_token: "refresh-token",
+		});
+		const bodyBuffer = makeRequestBody("source-model");
+		let result: Response | null = null;
+		try {
+			result = await proxyWithAccount(
+				makeRequest(bodyBuffer),
+				new URL("https://proxy.local/v1/messages"),
+				account,
+				makeRequestMeta({
+					serverToolRequirements: {
+						revision: 1,
+						replay: {
+							input: ["native-Anthropic"],
+							output: ["proxy-evidence-v1"],
+							requiresOutputReplay: true,
+						},
+					},
+				}),
+				bodyBuffer,
+				() => undefined,
+				0,
+				ctx,
+				"combo-final-model",
+			);
+		} catch (error) {
+			if (
+				!(error instanceof Error) ||
+				!error.message.includes("UsageCollector")
+			) {
+				throw error;
+			}
+		}
+
+		expect(result).toBeNull();
+		expect(planningContexts).toEqual([
+			{
+				bodyModel: "combo-final-model",
+				physicalModel: "combo-final-model",
+				inputReplayMode: ["native-Anthropic"],
+				outputReplayMode: ["proxy-evidence-v1"],
+			},
+		]);
+		expect(refreshCalls).toBe(0);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+	});
+
+	it("materializes a fresh plan for every physical-model fallback", async () => {
+		const planned: Array<{
+			physicalModel: string | null;
+			bodyModel: string | undefined;
+		}> = [];
+		const fetched: Array<{ url: string; model: string | undefined }> = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const request =
+				input instanceof Request ? input : new Request(String(input));
+			const body = (await request.clone().json()) as { model?: string };
+			fetched.push({ url: request.url, model: body.model });
+			return fetched.length === 1
+				? jsonResponse({ error: { message: "rate limited" } }, 429)
+				: jsonResponse({ ok: true }, 200);
+		});
+		const provider = makeAttemptPlanningProvider({
+			onPlan: (context) => {
+				const body = context.requestBodyBuffer
+					? (JSON.parse(
+							new TextDecoder().decode(context.requestBodyBuffer),
+						) as {
+							model?: string;
+						})
+					: {};
+				planned.push({
+					physicalModel: context.physicalModel,
+					bodyModel: body.model,
+				});
+			},
+		});
+		const ctx = makeProxyContext();
+		ctx.provider = provider;
+		const account = makeAccount({
+			provider: "attempt-plan-test",
+			model_mappings: JSON.stringify({
+				primary: ["primary", "fallback"],
+			}),
+		});
+		const bodyBuffer = makeRequestBody("primary");
+		try {
+			await proxyWithAccount(
+				makeRequest(bodyBuffer),
+				new URL("https://proxy.local/v1/messages"),
+				account,
+				makeRequestMeta(),
+				bodyBuffer,
+				() => undefined,
+				0,
+				ctx,
+			);
+		} catch (error) {
+			if (
+				!(error instanceof Error) ||
+				!error.message.includes("UsageCollector")
+			) {
+				throw error;
+			}
+		}
+
+		expect(planned).toEqual([
+			{ physicalModel: "primary", bodyModel: "primary" },
+			{ physicalModel: "fallback", bodyModel: "fallback" },
+		]);
+		expect(fetched).toEqual([
+			{
+				url: "https://planned.invalid/acc-1/primary",
+				model: "primary",
+			},
+			{
+				url: "https://planned.invalid/acc-1/fallback",
+				model: "fallback",
+			},
+		]);
+	});
+
+	it("fails a fallback locally when its fresh plan cannot be materialized", async () => {
+		let planningCount = 0;
+		globalThis.fetch = mock(async () =>
+			jsonResponse({ error: { message: "rate limited" } }, 429),
+		);
+		const provider = makeAttemptPlanningProvider({
+			onPlan: () => {
+				planningCount++;
+				if (planningCount === 2) {
+					throw new Error("fallback planning failed");
+				}
+			},
+		});
+		const ctx = makeProxyContext();
+		ctx.provider = provider;
+		const account = makeAccount({
+			provider: "attempt-plan-test",
+			model_mappings: JSON.stringify({
+				primary: ["primary", "fallback"],
+			}),
+		});
+		const bodyBuffer = makeRequestBody("primary");
+		const result = await proxyWithAccount(
+			makeRequest(bodyBuffer),
+			new URL("https://proxy.local/v1/messages"),
+			account,
+			makeRequestMeta(),
+			bodyBuffer,
+			() => undefined,
+			0,
+			ctx,
+		);
+
+		expect(result).toBeNull();
+		expect(planningCount).toBe(2);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+	});
+
+	it("materializes distinct plans when the outer route fails over between accounts", async () => {
+		const plannedAccountIds: string[] = [];
+		globalThis.fetch = mock(async () =>
+			jsonResponse({ error: "unauthorized" }, 401),
+		);
+		const provider = makeAttemptPlanningProvider({
+			onPlan: (context) => plannedAccountIds.push(context.account.id),
+		});
+		const ctx = makeProxyContext();
+		ctx.provider = provider;
+		const bodyBuffer = makeRequestBody("primary");
+		for (const accountId of ["account-a", "account-b"]) {
+			const result = await proxyWithAccount(
+				makeRequest(bodyBuffer),
+				new URL("https://proxy.local/v1/messages"),
+				makeAccount({ id: accountId, provider: "attempt-plan-test" }),
+				makeRequestMeta({ id: `request-${accountId}` }),
+				bodyBuffer,
+				() => undefined,
+				0,
+				ctx,
+			);
+			expect(result).toBeNull();
+		}
+
+		expect(plannedAccountIds).toEqual(["account-a", "account-b"]);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(2);
+	});
+
+	it("reuses the exact plan object for one in-place retry and response finalization", async () => {
+		process.env.CCFLARE_OVERLOAD_RETRY_ENABLED = "true";
+		process.env.CCFLARE_OVERLOAD_RETRY_MAX_ATTEMPTS = "2";
+		process.env.CCFLARE_OVERLOAD_RETRY_BASE_MS = "0";
+		process.env.CCFLARE_OVERLOAD_RETRY_MAX_MS = "0";
+		let planningCount = 0;
+		let sourceProviderHookCalls = 0;
+		const hookPlans: Array<{ hook: string; plan: ProviderAttemptPlan }> = [];
+		const provider = makeAttemptPlanningProvider({
+			onPlan: () => planningCount++,
+			onPlanHook: (hook, plan) => hookPlans.push({ hook, plan }),
+		});
+		globalThis.fetch = mock(async () => {
+			if (
+				(globalThis.fetch as ReturnType<typeof mock>).mock.calls.length === 1
+			) {
+				// Planning has already captured every downstream hook. Mutating the
+				// source singleton now must not affect retry parsing or finalization.
+				provider.processResponse = async (response) => {
+					sourceProviderHookCalls++;
+					return response;
+				};
+				provider.parseRateLimit = () => {
+					sourceProviderHookCalls++;
+					return { isRateLimited: false };
+				};
+				provider.extractUsageInfo = async () => {
+					sourceProviderHookCalls++;
+					return null;
+				};
+				return jsonResponse({ error: { type: "overloaded_error" } }, 529);
+			}
+			return jsonResponse({ ok: true }, 200);
+		});
+		const ctx = makeProxyContext();
+		ctx.provider = provider;
+		const bodyBuffer = makeRequestBody("primary");
+		try {
+			await proxyWithAccount(
+				makeRequest(bodyBuffer),
+				new URL("https://proxy.local/v1/messages"),
+				makeAccount({ provider: "attempt-plan-test" }),
+				makeRequestMeta(),
+				bodyBuffer,
+				() => undefined,
+				0,
+				ctx,
+			);
+		} catch (error) {
+			if (
+				!(error instanceof Error) ||
+				!error.message.includes("UsageCollector")
+			) {
+				throw error;
+			}
+		}
+
+		expect(planningCount).toBe(1);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(2);
+		expect(
+			hookPlans.filter(({ hook }) => hook === "processResponse"),
+		).toHaveLength(2);
+		expect(new Set(hookPlans.map(({ plan }) => plan)).size).toBe(1);
+		expect(sourceProviderHookCalls).toBe(0);
+	});
+
+	it("never exposes legacy request-scoped account mutations on the shared account", async () => {
+		globalThis.fetch = mock(async () =>
+			jsonResponse({ error: "unauthorized" }, 401),
+		);
+		const provider = makeAttemptPlanningProvider();
+		Reflect.deleteProperty(provider, "createAttemptPlan");
+		provider.prepareRequest = (_request, _body, attemptAccount) => {
+			attemptAccount.custom_endpoint = "https://request-local.invalid";
+			attemptAccount.model_mappings = JSON.stringify({
+				primary: "request-local",
+			});
+		};
+		provider.buildUrl = (_path, _query, attemptAccount) =>
+			`${attemptAccount?.custom_endpoint}/v1/messages`;
+		const ctx = makeProxyContext();
+		ctx.provider = provider;
+		const account = makeAccount({
+			provider: "attempt-plan-test",
+			custom_endpoint: "https://shared.invalid",
+			model_mappings: JSON.stringify({ primary: "shared" }),
+		});
+		const originalEndpoint = account.custom_endpoint;
+		const originalMappings = account.model_mappings;
+		const bodyBuffer = makeRequestBody("primary");
+		const result = await proxyWithAccount(
+			makeRequest(bodyBuffer),
+			new URL("https://proxy.local/v1/messages"),
+			account,
+			makeRequestMeta(),
+			bodyBuffer,
+			() => undefined,
+			0,
+			ctx,
+		);
+
+		expect(result).toBeNull();
+		expect(account.custom_endpoint).toBe(originalEndpoint);
+		expect(account.model_mappings).toBe(originalMappings);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+		expect(
+			(globalThis.fetch as ReturnType<typeof mock>).mock.calls[0]?.[0],
+		).toBeInstanceOf(Request);
+		expect(
+			(
+				(globalThis.fetch as ReturnType<typeof mock>).mock
+					.calls[0]?.[0] as Request
+			).url,
+		).toBe("https://request-local.invalid/v1/messages");
+	});
+});
 
 describe("proxyWithAccount — 429 failover", () => {
 	let originalFetch: typeof globalThis.fetch;
@@ -1889,6 +2366,122 @@ describe("proxyWithAccount — 401 failover", () => {
 			// Reaching forwardToClient (which throws UsageCollector not initialized)
 			// itself proves the success path was taken and no failover (null) occurred.
 			expect(threwUsageCollectorError).toBe(true);
+		}
+	});
+});
+
+describe("proxyWithAccount - attempt-bound Zai rate-limit parsing", () => {
+	let originalFetch: typeof globalThis.fetch;
+
+	beforeEach(() => {
+		originalFetch = globalThis.fetch;
+	});
+
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+	});
+
+	it("captures Zai body-reset parsing in the plan before transport and ignores later source-provider mutation", async () => {
+		type ZaiBodyParserProvider = Provider & {
+			parseRateLimitFromBody: (
+				response: Response,
+			) => Promise<number | undefined>;
+		};
+
+		const sourceProvider = getProvider("zai") as
+			| ZaiBodyParserProvider
+			| undefined;
+		expect(sourceProvider).toBeDefined();
+		if (!sourceProvider) throw new Error("registered Zai provider is required");
+
+		const originalOwnDescriptor = Object.getOwnPropertyDescriptor(
+			sourceProvider,
+			"parseRateLimitFromBody",
+		);
+		const originalProcessResponseDescriptor = Object.getOwnPropertyDescriptor(
+			sourceProvider,
+			"processResponse",
+		);
+		const originalBodyParser = sourceProvider.parseRateLimitFromBody;
+		let plannedBodyParserCalls = 0;
+		let mutatedBodyParserCalls = 0;
+		Object.defineProperty(sourceProvider, "parseRateLimitFromBody", {
+			configurable: true,
+			writable: true,
+			value: async (response: Response) => {
+				plannedBodyParserCalls++;
+				return originalBodyParser.call(sourceProvider, response);
+			},
+		});
+		Object.defineProperty(sourceProvider, "processResponse", {
+			configurable: true,
+			writable: true,
+			// Let the raw transport pass the model-fallback loop as a 200, then
+			// expose the upstream 429 at the response-processing seam under test.
+			value: async (response: Response) =>
+				new Response(response.body, {
+					status: 429,
+					headers: response.headers,
+				}),
+		});
+
+		const account = makeZaiAccount();
+		try {
+			globalThis.fetch = mock(async () => {
+				// Planning has already completed when transport begins. A shared
+				// provider mutation here must not change this physical attempt's hooks.
+				sourceProvider.parseRateLimitFromBody = async () => {
+					mutatedBodyParserCalls++;
+					return undefined;
+				};
+				return jsonResponse(
+					{
+						type: "error",
+						error: {
+							type: "1308",
+							message:
+								"Usage limit reached for 5 hour. Your limit will reset at 2099-01-02 03:04:05",
+						},
+					},
+					200,
+				);
+			});
+
+			const bodyBuffer = makeRequestBody();
+			const result = await proxyWithAccount(
+				makeRequest(bodyBuffer),
+				new URL("https://proxy.local/v1/messages"),
+				account,
+				makeRequestMeta(),
+				bodyBuffer,
+				() => undefined,
+				0,
+				makeProxyContext(),
+			);
+
+			expect(result).toBeNull();
+			expect(plannedBodyParserCalls).toBe(1);
+			expect(mutatedBodyParserCalls).toBe(0);
+			expect(account.rate_limited_reason).toBe("upstream_429_with_reset");
+		} finally {
+			if (originalOwnDescriptor) {
+				Object.defineProperty(
+					sourceProvider,
+					"parseRateLimitFromBody",
+					originalOwnDescriptor,
+				);
+			} else {
+				Reflect.deleteProperty(sourceProvider, "parseRateLimitFromBody");
+			}
+			if (originalProcessResponseDescriptor) {
+				Object.defineProperty(
+					sourceProvider,
+					"processResponse",
+					originalProcessResponseDescriptor,
+				);
+			} else {
+				Reflect.deleteProperty(sourceProvider, "processResponse");
+			}
 		}
 	});
 });

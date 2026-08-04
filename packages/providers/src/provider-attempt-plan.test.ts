@@ -603,6 +603,40 @@ describe("materializeProviderAttemptPlan", () => {
 		expect(replacementTransformCalls).toBe(0);
 	});
 
+	test("captures the optional legacy body-derived rate-limit hook", async () => {
+		let originalCalls = 0;
+		let replacementCalls = 0;
+		const provider = baseProvider() as Provider & {
+			parseRateLimitFromBody?: (
+				response: Response,
+			) => Promise<number | undefined>;
+		};
+		provider.parseRateLimitFromBody = async function (response) {
+			expect(this).toBe(provider);
+			originalCalls += 1;
+			return response.status === 429 ? 321 : undefined;
+		};
+
+		const plan = materializeProviderAttemptPlan(
+			provider,
+			context(accountFixture()),
+		) as ProviderAttemptPlan & {
+			parseRateLimitFromBody?: (
+				response: Response,
+			) => Promise<number | undefined>;
+		};
+		provider.parseRateLimitFromBody = async () => {
+			replacementCalls += 1;
+			return 999;
+		};
+
+		expect(
+			await plan.parseRateLimitFromBody?.(new Response(null, { status: 429 })),
+		).toBe(321);
+		expect(originalCalls).toBe(1);
+		expect(replacementCalls).toBe(0);
+	});
+
 	test("accepts a synchronous custom planner and deep-freezes its plan", async () => {
 		const sharedAccount = accountFixture();
 		let plannerCalls = 0;
@@ -653,6 +687,52 @@ describe("materializeProviderAttemptPlan", () => {
 			reason: "fixture_rejection",
 		});
 		expectDeeplyFrozen(plan);
+	});
+
+	test("binds and freezes a custom body-derived rate-limit hook", async () => {
+		let originalCalls = 0;
+		let replacementCalls = 0;
+		let materializedThis: unknown;
+		const candidate = customPlan() as ProviderAttemptPlan & {
+			parseRateLimitFromBody?: (
+				response: Response,
+			) => Promise<number | undefined>;
+		};
+		candidate.parseRateLimitFromBody = async function (response) {
+			materializedThis = this;
+			originalCalls += 1;
+			return response.status === 429 ? 654 : undefined;
+		};
+		const provider = baseProvider({
+			name: "custom",
+			createAttemptPlan: () => candidate,
+		});
+
+		const plan = materializeProviderAttemptPlan(
+			provider,
+			context(accountFixture(), {
+				physicalModel: "gpt-5.6-sol",
+				capabilityProofKey: "proof:custom",
+				inputReplayMode: ["proxy-evidence-v1"],
+				outputReplayMode: ["proxy-evidence-v1"],
+			}),
+		) as ProviderAttemptPlan & {
+			parseRateLimitFromBody?: (
+				response: Response,
+			) => Promise<number | undefined>;
+		};
+		candidate.parseRateLimitFromBody = async () => {
+			replacementCalls += 1;
+			return 999;
+		};
+
+		expect(
+			await plan.parseRateLimitFromBody?.(new Response(null, { status: 429 })),
+		).toBe(654);
+		expect(materializedThis).toBe(plan);
+		expect(originalCalls).toBe(1);
+		expect(replacementCalls).toBe(0);
+		expect(Object.isFrozen(plan)).toBe(true);
 	});
 
 	test("rejects Promise and bare-thenable planners synchronously before legacy hooks", () => {

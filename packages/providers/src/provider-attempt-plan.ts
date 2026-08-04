@@ -40,6 +40,7 @@ interface CapturedProviderDescriptor {
 	readonly transformRequestBody: Provider["transformRequestBody"];
 	readonly processResponse: Provider["processResponse"];
 	readonly parseRateLimit: Provider["parseRateLimit"];
+	readonly parseRateLimitFromBody: Provider["parseRateLimitFromBody"];
 	readonly isStreamingResponse: Provider["isStreamingResponse"];
 	readonly extractTierInfo: Provider["extractTierInfo"];
 	readonly extractUsageInfo: Provider["extractUsageInfo"];
@@ -158,6 +159,9 @@ function captureProviderDescriptor(
 		provider.parseRateLimit,
 		"parseRateLimit",
 	);
+	const parseRateLimitFromBody = optionalFunction<
+		NonNullable<Provider["parseRateLimitFromBody"]>
+	>(provider.parseRateLimitFromBody, "parseRateLimitFromBody");
 	const isStreamingResponse = optionalFunction<
 		NonNullable<Provider["isStreamingResponse"]>
 	>(provider.isStreamingResponse, "isStreamingResponse");
@@ -185,6 +189,7 @@ function captureProviderDescriptor(
 		transformRequestBody,
 		processResponse,
 		parseRateLimit,
+		parseRateLimitFromBody,
 		isStreamingResponse,
 		extractTierInfo,
 		extractUsageInfo,
@@ -207,6 +212,7 @@ function requireStableProviderDescriptor(
 		current.transformRequestBody !== expected.transformRequestBody ||
 		current.processResponse !== expected.processResponse ||
 		current.parseRateLimit !== expected.parseRateLimit ||
+		current.parseRateLimitFromBody !== expected.parseRateLimitFromBody ||
 		current.isStreamingResponse !== expected.isStreamingResponse ||
 		current.extractTierInfo !== expected.extractTierInfo ||
 		current.extractUsageInfo !== expected.extractUsageInfo ||
@@ -615,6 +621,9 @@ function materializeCustomPlan(
 	const rawParseRateLimit = requireFunction<
 		(response: Response) => RateLimitInfo
 	>(candidate.parseRateLimit, "parseRateLimit");
+	const rawParseRateLimitFromBody = optionalFunction<
+		(response: Response) => Promise<number | undefined>
+	>(candidate.parseRateLimitFromBody, "parseRateLimitFromBody");
 	const rawIsStreamingResponse = optionalFunction<
 		(response: Response) => boolean
 	>(candidate.isStreamingResponse, "isStreamingResponse");
@@ -655,6 +664,12 @@ function materializeCustomPlan(
 			Reflect.apply(rawProcessResponse, plan, [response, requestHeaders]),
 		parseRateLimit: (response) =>
 			Reflect.apply(rawParseRateLimit, plan, [response]),
+		...(rawParseRateLimitFromBody
+			? {
+					parseRateLimitFromBody: (response: Response) =>
+						Reflect.apply(rawParseRateLimitFromBody, plan, [response]),
+				}
+			: {}),
 		...(rawIsStreamingResponse
 			? {
 					isStreamingResponse: (response: Response) =>
@@ -697,6 +712,7 @@ function materializeLegacyPlan(
 		transformRequestBody,
 		processResponse,
 		parseRateLimit,
+		parseRateLimitFromBody,
 		isStreamingResponse,
 		extractTierInfo,
 		extractUsageInfo,
@@ -758,6 +774,12 @@ function materializeLegacyPlan(
 			]),
 		parseRateLimit: (response) =>
 			Reflect.apply(parseRateLimit, provider, [response]),
+		...(parseRateLimitFromBody
+			? {
+					parseRateLimitFromBody: (response: Response) =>
+						Reflect.apply(parseRateLimitFromBody, provider, [response]),
+				}
+			: {}),
 		...(isStreamingResponse
 			? {
 					isStreamingResponse: (response: Response) =>

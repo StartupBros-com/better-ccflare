@@ -40,6 +40,7 @@ function makeAccount(id: string, overrides: Partial<Account> = {}): Account {
 		session_start: null,
 		session_request_count: 0,
 		paused: false,
+		requires_reauth: false,
 		rate_limit_reset: null,
 		rate_limit_status: null,
 		rate_limit_remaining: null,

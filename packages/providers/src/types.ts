@@ -107,6 +107,9 @@ export interface ProviderAttemptPlan {
 		requestHeaders?: Headers,
 	) => Promise<Response>;
 	readonly parseRateLimit: (response: Response) => RateLimitInfo;
+	readonly parseRateLimitFromBody?: (
+		response: Response,
+	) => Promise<number | undefined>;
 	readonly isStreamingResponse?: (response: Response) => boolean;
 	readonly extractTierInfo?: (response: Response) => Promise<number | null>;
 	readonly extractUsageInfo?: (
@@ -190,6 +193,12 @@ export interface Provider {
 	 * Parse rate limit information from response
 	 */
 	parseRateLimit(response: Response): RateLimitInfo;
+
+	/**
+	 * Optionally recover a provider-specific reset timestamp from a bounded
+	 * response body when headers alone do not contain it.
+	 */
+	parseRateLimitFromBody?(response: Response): Promise<number | undefined>;
 
 	/**
 	 * Process the response before returning to client
