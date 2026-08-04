@@ -31,6 +31,7 @@ export {
 	listOAuthProviders,
 	listProviders,
 	registerProvider,
+	resolveProviderForAccount,
 } from "./registry";
 export * from "./request-capabilities";
 export * from "./server-tool-capabilities";

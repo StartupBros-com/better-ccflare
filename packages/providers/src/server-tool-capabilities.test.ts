@@ -1,12 +1,120 @@
 import { describe, expect, test } from "bun:test";
+import type { Account, ServerToolCapabilityTuple } from "@better-ccflare/types";
 
 import {
+	buildServerToolCapabilityProofKey,
+	buildServerToolCapabilityTupleKey,
 	deriveServerToolRequirement,
 	indexServerToolCapabilityProofs,
+	materializeProviderServerToolCapabilityDecision as materializeDecision,
+	materializeProviderServerToolCapabilityTuple,
 	resolveServerToolCapability,
 	type ServerToolCapabilityProof,
 	type ServerToolReplayAtom,
 } from "./server-tool-capabilities";
+import type { Provider, ProviderServerToolCapabilityContext } from "./types";
+
+function capabilityAccountFixture(): Account {
+	return {
+		id: "capability-account-1",
+		name: "Capability Account",
+		provider: "fixture",
+		api_key: null,
+		refresh_token: "refresh-token",
+		access_token: "access-token",
+		expires_at: 1,
+		request_count: 0,
+		total_requests: 0,
+		last_used: null,
+		created_at: 1,
+		rate_limited_until: null,
+		rate_limited_reason: null,
+		rate_limited_at: null,
+		session_start: null,
+		session_request_count: 0,
+		paused: false,
+		requires_reauth: false,
+		rate_limit_reset: null,
+		rate_limit_status: null,
+		rate_limit_remaining: null,
+		priority: 0,
+		auto_fallback_enabled: true,
+		auto_refresh_enabled: true,
+		auto_pause_on_overage_enabled: true,
+		peak_hours_pause_enabled: false,
+		custom_endpoint: "https://fixture.invalid/v1/responses",
+		model_mappings: null,
+		cross_region_mode: null,
+		model_fallbacks: null,
+		billing_type: "plan",
+		pause_reason: null,
+		refresh_token_issued_at: null,
+		consecutive_rate_limits: 0,
+	};
+}
+
+function capabilityProvider(overrides: Partial<Provider> = {}): Provider {
+	return {
+		name: "fixture",
+		canHandle: () => true,
+		refreshToken: async () => ({
+			accessToken: "token",
+			expiresAt: 1,
+			refreshToken: "refresh",
+		}),
+		buildUrl: () => "https://fixture.invalid/v1/responses",
+		prepareHeaders: (headers) => new Headers(headers),
+		parseRateLimit: () => ({ isRateLimited: false }),
+		processResponse: async (response) => response,
+		...overrides,
+	};
+}
+
+function capabilityTupleFixture(
+	overrides: Partial<ServerToolCapabilityTuple> = {},
+): ServerToolCapabilityTuple {
+	return {
+		candidateId: "candidate-1",
+		provider: "codex",
+		authMode: "oauth-subscription",
+		endpointClass: "codex_responses",
+		normalizedEndpoint: "https://chatgpt.com/backend-api/codex/responses",
+		model: "gpt-5.6-sol",
+		toolType: "web_search_20250305",
+		profile: "web-search-profile-1",
+		inputReplay: ["native-Anthropic", "proxy-evidence-v1"],
+		outputReplay: ["native-Anthropic", "proxy-evidence-v1"],
+		providerContractRevision: "codex-responses-v1",
+		replayDecoderRevision: "server-tool-replay-v1",
+		requestTransport: "openai_responses",
+		responseTransport: "openai_responses_sse",
+		...overrides,
+	};
+}
+
+function capabilityProofFixture(
+	tuple: ServerToolCapabilityTuple,
+	overrides: Partial<ServerToolCapabilityProof> = {},
+): ServerToolCapabilityProof {
+	return {
+		revision: "proof-fixture-1",
+		tuple,
+		decision: "proven",
+		provenance: "sanitized_fixture",
+		owner: "providers/fixture",
+		verifiedAt: "2026-08-04T00:00:00.000Z",
+		revalidateAfter: "2026-09-04T00:00:00.000Z",
+		fixtureRevision: "fixture-1",
+		contractRevision: "fixture-contract-1",
+		revalidationTriggers: [
+			"tuple_change",
+			"contract_change",
+			"decoder_change",
+			"observed_behavior_change",
+		],
+		...overrides,
+	};
+}
 
 function requireDefined<T>(value: T | null | undefined, message: string): T {
 	if (value === null || value === undefined) throw new Error(message);
@@ -869,6 +977,17 @@ describe("resolveServerToolCapability", () => {
 			resolveServerToolCapability(
 				requirement,
 				tuple,
+				proofIndex,
+				"2026-08-03T00:00:00.000Z",
+			),
+		).toEqual({
+			decision: "unknown",
+			reason: "proof_incomplete",
+		});
+		expect(
+			resolveServerToolCapability(
+				requirement,
+				tuple,
 				indexServerToolCapabilityProofs([
 					{ ...proof, supersededBy: "proof-2" },
 				]),
@@ -1195,5 +1314,1096 @@ describe("resolveServerToolCapability", () => {
 			decision: "unknown",
 			reason: "proof_ambiguous",
 		});
+	});
+});
+
+describe("canonical server-tool capability identity", () => {
+	const tuple = capabilityTupleFixture();
+
+	test("binds every tuple field while canonicalizing replay order", () => {
+		const key = buildServerToolCapabilityTupleKey(tuple);
+		expect(typeof key).toBe("string");
+		expect(
+			buildServerToolCapabilityTupleKey({
+				...tuple,
+				inputReplay: ["proxy-evidence-v1", "native-Anthropic"],
+				outputReplay: ["proxy-evidence-v1", "native-Anthropic"],
+			}),
+		).toBe(key);
+
+		const scalarDrifts: Partial<ServerToolCapabilityTuple>[] = [
+			{ candidateId: "candidate-2" },
+			{ provider: "anthropic" },
+			{ authMode: "api-key" },
+			{ endpointClass: "anthropic_messages" },
+			{ normalizedEndpoint: "https://api.anthropic.com/v1/messages" },
+			{ normalizedEndpoint: undefined },
+			{ model: "gpt-5.6-terra" },
+			{ toolType: "web_search_20260101" },
+			{ profile: "web-search-profile-2" },
+			{ providerContractRevision: "codex-responses-v2" },
+			{ replayDecoderRevision: "server-tool-replay-v2" },
+			{ requestTransport: "anthropic_messages" },
+			{ responseTransport: "anthropic_sse" },
+		];
+		for (const drift of scalarDrifts) {
+			expect(
+				buildServerToolCapabilityTupleKey({ ...tuple, ...drift }),
+			).not.toBe(key);
+		}
+		expect(
+			buildServerToolCapabilityTupleKey({
+				...tuple,
+				inputReplay: ["native-Anthropic"],
+			}),
+		).not.toBe(key);
+		expect(
+			buildServerToolCapabilityTupleKey({
+				...tuple,
+				outputReplay: ["proxy-evidence-v1"],
+			}),
+		).not.toBe(key);
+	});
+
+	test("fails closed on duplicate or noncanonical replay atoms", () => {
+		expect(
+			buildServerToolCapabilityTupleKey({
+				...tuple,
+				inputReplay: ["native-Anthropic", "native-Anthropic"],
+			}),
+		).toBeUndefined();
+		expect(
+			buildServerToolCapabilityTupleKey({
+				...tuple,
+				outputReplay: ["provider-private-v1"],
+			} as unknown as ServerToolCapabilityTuple),
+		).toBeUndefined();
+	});
+
+	test("fails closed without invoking tuple accessors or accepting extensions", () => {
+		let getterCalls = 0;
+		const accessorTuple = capabilityTupleFixture();
+		Object.defineProperty(accessorTuple, "provider", {
+			configurable: true,
+			enumerable: true,
+			get() {
+				getterCalls += 1;
+				return "codex";
+			},
+		});
+
+		expect(buildServerToolCapabilityTupleKey(accessorTuple)).toBeUndefined();
+		expect(
+			buildServerToolCapabilityProofKey("proof-accessor", accessorTuple),
+		).toBeUndefined();
+		expect(getterCalls).toBe(0);
+		expect(
+			buildServerToolCapabilityTupleKey({
+				...tuple,
+				unexpected: { retained: true },
+			} as ServerToolCapabilityTuple),
+		).toBeUndefined();
+	});
+
+	test("canonicalizes URL-shaped endpoints and rejects credentials, query, or fragment", () => {
+		const canonical = buildServerToolCapabilityTupleKey(
+			capabilityTupleFixture({
+				normalizedEndpoint: "https://EXAMPLE.com:443/v1/responses",
+			}),
+		);
+		expect(canonical).toBe(
+			buildServerToolCapabilityTupleKey(
+				capabilityTupleFixture({
+					normalizedEndpoint: "https://example.com/v1/responses",
+				}),
+			),
+		);
+		for (const normalizedEndpoint of [
+			"https://user@example.com/v1/responses",
+			"https://user:password@example.com/v1/responses",
+			"https://example.com/v1/responses?api_key=secret",
+			"https://example.com/v1/responses#credential",
+			"not-a-url-secret-bearing-value",
+			"bedrock:profile:region",
+			"ftp://example.com/private",
+		]) {
+			expect(
+				buildServerToolCapabilityTupleKey(
+					capabilityTupleFixture({ normalizedEndpoint }),
+				),
+			).toBeUndefined();
+		}
+	});
+
+	test("binds proof revision and the entire canonical tuple without collisions", () => {
+		const first = buildServerToolCapabilityProofKey("proof-1", tuple);
+		const revised = buildServerToolCapabilityProofKey("proof-2", tuple);
+		const otherTuple = buildServerToolCapabilityProofKey("proof-1", {
+			...tuple,
+			candidateId: "candidate-2",
+		});
+		expect(typeof first).toBe("string");
+		expect(revised).not.toBe(first);
+		expect(otherTuple).not.toBe(first);
+		expect(new Set([first, revised, otherTuple]).size).toBe(3);
+		expect(buildServerToolCapabilityProofKey("", tuple)).toBeUndefined();
+		expect(
+			buildServerToolCapabilityProofKey("proof-1", {
+				...tuple,
+				outputReplay: ["proxy-evidence-v1", "proxy-evidence-v1"],
+			}),
+		).toBeUndefined();
+	});
+
+	test("uses bounded tuple fields and fixed-size collision-resistant proof keys", () => {
+		const maximumCandidate = capabilityTupleFixture({
+			candidateId: "c".repeat(256),
+			model: "m".repeat(512),
+		});
+		const maximumTupleKey = buildServerToolCapabilityTupleKey(maximumCandidate);
+		expect(typeof maximumTupleKey).toBe("string");
+		expect(maximumTupleKey?.length).toBeLessThan(8 * 1024);
+		expect(
+			buildServerToolCapabilityTupleKey({
+				...maximumCandidate,
+				candidateId: "c".repeat(257),
+			}),
+		).toBeUndefined();
+		expect(
+			buildServerToolCapabilityTupleKey({
+				...maximumCandidate,
+				model: "m".repeat(513),
+			}),
+		).toBeUndefined();
+		expect(
+			buildServerToolCapabilityTupleKey(
+				capabilityTupleFixture({
+					normalizedEndpoint: `https://example.com/${"x".repeat(2048)}`,
+				}),
+			),
+		).toBeUndefined();
+		expect(
+			buildServerToolCapabilityTupleKey(
+				capabilityTupleFixture({
+					candidateId: "\0".repeat(256),
+					provider: "\0".repeat(128),
+					authMode: "\0".repeat(64),
+					endpointClass: "\0".repeat(128),
+					model: "\0".repeat(512),
+					toolType: "\0".repeat(128),
+					profile: "\0".repeat(256),
+					providerContractRevision: "\0".repeat(128),
+					replayDecoderRevision: "\0".repeat(128),
+					requestTransport: "\0".repeat(128),
+					responseTransport: "\0".repeat(128),
+				}),
+			),
+		).toBeUndefined();
+
+		const proofKeys = Array.from({ length: 512 }, (_, index) =>
+			buildServerToolCapabilityProofKey(
+				`proof-${index}`,
+				capabilityTupleFixture({ candidateId: `candidate-${index}` }),
+			),
+		);
+		expect(proofKeys.every((key) => typeof key === "string")).toBe(true);
+		expect(new Set(proofKeys).size).toBe(proofKeys.length);
+		const proofKeyLengths = new Set(proofKeys.map((key) => key?.length));
+		expect(proofKeyLengths.size).toBe(1);
+		expect(proofKeys[0]?.length).toBeLessThan(128);
+		expect(
+			proofKeys.reduce((total, key) => total + (key?.length ?? 0), 0),
+		).toBe(proofKeys.length * (proofKeys[0]?.length ?? 0));
+		expect(
+			buildServerToolCapabilityProofKey("p".repeat(257), tuple),
+		).toBeUndefined();
+	});
+});
+
+describe("provider-owned server-tool tuple materialization", () => {
+	test("passes a frozen content-minimal private copy and snapshots the tuple", () => {
+		const requirement = requireDefined(
+			deriveServerToolRequirement({
+				tools: [{ type: "web_search_20250305", name: "web_search" }],
+			}),
+			"valid server-tool request must produce requirements",
+		);
+		const account = capabilityAccountFixture();
+		let observedContext: ProviderServerToolCapabilityContext | undefined;
+		const provider = capabilityProvider({
+			createServerToolCapabilityTuple(context) {
+				observedContext = context;
+				return {
+					candidateId: context.candidateId,
+					provider: "fixture",
+					authMode: "oauth-subscription",
+					endpointClass: "fixture_responses",
+					normalizedEndpoint: context.account.customEndpoint ?? undefined,
+					model: context.physicalModel,
+					toolType: "web_search_20250305",
+					profile: requirement.profileId ?? "missing",
+					inputReplay: ["proxy-evidence-v1", "native-Anthropic"],
+					outputReplay: ["proxy-evidence-v1", "native-Anthropic"],
+					providerContractRevision: "fixture-responses-v1",
+					replayDecoderRevision: "fixture-replay-v1",
+					requestTransport: "openai_responses",
+					responseTransport: "openai_responses_sse",
+				};
+			},
+		});
+
+		const materialized = materializeProviderServerToolCapabilityTuple(
+			provider,
+			{
+				candidateId: "combo-slot-7",
+				account,
+				path: "/v1/messages",
+				query: "beta=true",
+				physicalModel: "gpt-5.6-sol",
+				requirements: requirement,
+			},
+		);
+
+		expect(Object.isFrozen(observedContext)).toBe(true);
+		expect(Object.keys(observedContext ?? {}).sort()).toEqual([
+			"account",
+			"candidateId",
+			"endpointContract",
+			"physicalModel",
+			"requirements",
+		]);
+		expect(observedContext?.account).not.toBe(account);
+		expect(Object.isFrozen(observedContext?.account)).toBe(true);
+		expect(observedContext?.requirements).not.toBe(requirement);
+		expect(Object.isFrozen(observedContext?.requirements)).toBe(true);
+		expect(Object.isFrozen(observedContext?.requirements?.replay)).toBe(true);
+		expect(observedContext).not.toHaveProperty("request");
+		expect(observedContext).not.toHaveProperty("messages");
+		expect(observedContext).not.toHaveProperty("tools");
+		expect(observedContext).not.toHaveProperty("path");
+		expect(observedContext).not.toHaveProperty("query");
+		expect(observedContext?.endpointContract).toEqual({
+			routeClass: "anthropic_messages",
+			queryPresent: true,
+		});
+		expect(Object.isFrozen(observedContext?.endpointContract)).toBe(true);
+		expect(Object.isFrozen(materialized)).toBe(true);
+		expect(Object.isFrozen(materialized?.inputReplay)).toBe(true);
+		expect(Object.isFrozen(materialized?.outputReplay)).toBe(true);
+		expect(materialized?.inputReplay).toEqual([
+			"native-Anthropic",
+			"proxy-evidence-v1",
+		]);
+		expect(materialized?.outputReplay).toEqual([
+			"native-Anthropic",
+			"proxy-evidence-v1",
+		]);
+
+		account.provider = "mutated-after-materialization";
+		account.custom_endpoint = "https://mutated.invalid";
+		expect(observedContext?.account.provider).toBe("fixture");
+		expect(observedContext?.account.customEndpoint).toBe(
+			"https://fixture.invalid/v1/responses",
+		);
+	});
+
+	test("mirrors raw transport truthiness and fails closed on whitespace endpoints", () => {
+		const requirement = requireDefined(
+			deriveServerToolRequirement({
+				tools: [{ type: "web_search_20250305", name: "web_search" }],
+			}),
+			"valid server-tool request must produce requirements",
+		);
+		const account = capabilityAccountFixture();
+		account.api_key = "   ";
+		account.refresh_token = "   ";
+		account.access_token = "   ";
+		account.custom_endpoint = "   ";
+		let observedAccount:
+			| ProviderServerToolCapabilityContext["account"]
+			| undefined;
+		let factoryCalls = 0;
+		const tuple = materializeProviderServerToolCapabilityTuple(
+			capabilityProvider({
+				createServerToolCapabilityTuple(context) {
+					factoryCalls += 1;
+					observedAccount = context.account;
+					return capabilityTupleFixture({
+						candidateId: context.candidateId,
+						provider: "fixture",
+						model: context.physicalModel,
+					});
+				},
+			}),
+			{
+				candidateId: "candidate-whitespace",
+				account,
+				path: "/v1/messages",
+				query: "",
+				physicalModel: "fixture-model",
+				requirements: requirement,
+			},
+		);
+
+		expect(factoryCalls).toBe(1);
+		expect(observedAccount).toMatchObject({
+			apiKeyConfigured: true,
+			refreshTokenConfigured: true,
+			accessTokenConfigured: true,
+			legacyMirroredApiKey: true,
+			customEndpoint: null,
+			customEndpointConfigured: true,
+			unsafeCustomEndpoint: true,
+		});
+		expect(tuple).toBeUndefined();
+	});
+
+	test("binds configured custom endpoints into exact tuple identity", () => {
+		const requirement = requireDefined(
+			deriveServerToolRequirement({
+				tools: [{ type: "web_search_20250305", name: "web_search" }],
+			}),
+			"valid server-tool request must produce requirements",
+		);
+		const account = capabilityAccountFixture();
+		const provider = capabilityProvider({
+			createServerToolCapabilityTuple(context) {
+				return capabilityTupleFixture({
+					candidateId: context.candidateId,
+					provider: "fixture",
+					normalizedEndpoint: context.account.customEndpoint ?? undefined,
+					model: context.physicalModel,
+				});
+			},
+		});
+		const materialize = () =>
+			materializeProviderServerToolCapabilityTuple(provider, {
+				candidateId: "candidate-endpoint",
+				account,
+				path: "/v1/messages",
+				query: "",
+				physicalModel: "fixture-model",
+				requirements: requirement,
+			});
+
+		account.custom_endpoint = "https://EXAMPLE.com:443/v1/first";
+		const first = materialize();
+		expect(first?.normalizedEndpoint).toBe("https://example.com/v1/first");
+		account.custom_endpoint = "https://example.com/v1/second";
+		const second = materialize();
+		expect(second?.normalizedEndpoint).toBe("https://example.com/v1/second");
+		expect(buildServerToolCapabilityTupleKey(second as never)).not.toBe(
+			buildServerToolCapabilityTupleKey(first as never),
+		);
+
+		expect(
+			materializeProviderServerToolCapabilityTuple(
+				capabilityProvider({
+					createServerToolCapabilityTuple(context) {
+						return capabilityTupleFixture({
+							candidateId: context.candidateId,
+							provider: "fixture",
+							normalizedEndpoint: "https://example.com/v1/first",
+							model: context.physicalModel,
+						});
+					},
+				}),
+				{
+					candidateId: "candidate-endpoint",
+					account,
+					path: "/v1/messages",
+					query: "",
+					physicalModel: "fixture-model",
+					requirements: requirement,
+				},
+			),
+		).toBeUndefined();
+		expect(
+			materializeProviderServerToolCapabilityTuple(
+				capabilityProvider({
+					createServerToolCapabilityTuple(context) {
+						return capabilityTupleFixture({
+							candidateId: context.candidateId,
+							provider: "fixture",
+							normalizedEndpoint: undefined,
+							model: context.physicalModel,
+						});
+					},
+				}),
+				{
+					candidateId: "candidate-endpoint",
+					account,
+					path: "/v1/messages",
+					query: "",
+					physicalModel: "fixture-model",
+					requirements: requirement,
+				},
+			),
+		).toBeUndefined();
+	});
+
+	test("reduces raw route inputs to the same credential-free endpoint contract", () => {
+		const requirement = requireDefined(
+			deriveServerToolRequirement({
+				tools: [{ type: "web_search_20250305", name: "web_search" }],
+			}),
+			"valid server-tool request must produce requirements",
+		);
+		const observedContexts: string[] = [];
+		const provider = capabilityProvider({
+			createServerToolCapabilityTuple(context) {
+				observedContexts.push(JSON.stringify(context));
+				return capabilityTupleFixture({
+					candidateId: context.candidateId,
+					provider: "fixture",
+					normalizedEndpoint: context.account.customEndpoint ?? undefined,
+					model: context.physicalModel,
+				});
+			},
+		});
+		const account = capabilityAccountFixture();
+		const common = {
+			candidateId: "candidate-query-normalization",
+			account,
+			path: "/v1/messages",
+			physicalModel: "fixture-model",
+			requirements: requirement,
+		};
+		const selectionTuple = materializeProviderServerToolCapabilityTuple(
+			provider,
+			{ ...common, query: "api_key=selection-query-sentinel" },
+		);
+		const pretransportTuple = materializeProviderServerToolCapabilityTuple(
+			provider,
+			{ ...common, query: "?api_key=pretransport-query-sentinel" },
+		);
+		expect(observedContexts).toHaveLength(2);
+		expect(observedContexts[0]).toBe(observedContexts[1]);
+		expect(observedContexts.join(" ")).not.toContain(
+			"selection-query-sentinel",
+		);
+		expect(observedContexts.join(" ")).not.toContain(
+			"pretransport-query-sentinel",
+		);
+		expect(buildServerToolCapabilityTupleKey(selectionTuple as never)).toBe(
+			buildServerToolCapabilityTupleKey(pretransportTuple as never),
+		);
+
+		let pathContext = "";
+		materializeProviderServerToolCapabilityTuple(
+			capabilityProvider({
+				createServerToolCapabilityTuple(context) {
+					pathContext = JSON.stringify(context);
+					return undefined;
+				},
+			}),
+			{
+				...common,
+				path: "/v1/messages/path-credential-sentinel",
+				query: "",
+			},
+		);
+		expect(pathContext).not.toContain("path-credential-sentinel");
+		expect(JSON.parse(pathContext).endpointContract).toEqual({
+			routeClass: "other",
+			queryPresent: false,
+		});
+	});
+
+	test("allows an absent or explicitly unsupported provider seam without throwing", () => {
+		const requirement = requireDefined(
+			deriveServerToolRequirement({
+				tools: [{ type: "web_search_20250305", name: "web_search" }],
+			}),
+			"valid server-tool request must produce requirements",
+		);
+		const context = {
+			candidateId: "candidate-unsupported",
+			account: capabilityAccountFixture(),
+			path: "/v1/messages",
+			query: "",
+			physicalModel: "fixture-model",
+			requirements: requirement,
+		};
+		expect(
+			materializeProviderServerToolCapabilityTuple(
+				capabilityProvider(),
+				context,
+			),
+		).toBeUndefined();
+		expect(
+			materializeProviderServerToolCapabilityTuple(
+				capabilityProvider({
+					createServerToolCapabilityTuple: () => undefined,
+				}),
+				context,
+			),
+		).toBeUndefined();
+	});
+
+	test("never exposes credential bytes to capability factories, tuples, or proof keys", () => {
+		const requirement = requireDefined(
+			deriveServerToolRequirement({
+				tools: [{ type: "web_search_20250305", name: "web_search" }],
+			}),
+			"valid server-tool request must produce requirements",
+		);
+		const account = capabilityAccountFixture();
+		const secretSentinels = [
+			"u4-api-key-secret",
+			"u4-refresh-token-secret",
+			"u4-access-token-secret",
+			"endpoint-user-secret",
+			"endpoint-password-secret",
+			"endpoint-query-secret",
+		] as const;
+		account.api_key = secretSentinels[0];
+		account.refresh_token = secretSentinels[1];
+		account.access_token = secretSentinels[2];
+		account.custom_endpoint = `https://${secretSentinels[3]}:${secretSentinels[4]}@example.com/v1/responses?api_key=${secretSentinels[5]}`;
+		let serializedFactoryContext = "";
+		let capabilityAccountKeys: string[] = [];
+		let capabilityAccountContext:
+			| ProviderServerToolCapabilityContext["account"]
+			| undefined;
+		const provider = capabilityProvider({
+			createServerToolCapabilityTuple(context) {
+				serializedFactoryContext = JSON.stringify(context);
+				capabilityAccountKeys = Object.keys(context.account).sort();
+				capabilityAccountContext = context.account;
+				return capabilityTupleFixture({
+					candidateId: context.candidateId,
+					provider: "fixture",
+					model: context.physicalModel,
+				});
+			},
+		});
+		const tuple = materializeProviderServerToolCapabilityTuple(provider, {
+			candidateId: "candidate-secret-sentinel",
+			account,
+			path: "/v1/messages",
+			query: "",
+			physicalModel: "fixture-model",
+			requirements: requirement,
+		});
+		const proofKey =
+			tuple === undefined
+				? undefined
+				: buildServerToolCapabilityProofKey("proof-secret-sentinel", tuple);
+
+		expect(capabilityAccountKeys).toEqual([
+			"accessTokenConfigured",
+			"apiKeyConfigured",
+			"billingType",
+			"crossRegionMode",
+			"customEndpoint",
+			"customEndpointConfigured",
+			"legacyMirroredApiKey",
+			"provider",
+			"refreshTokenConfigured",
+			"unsafeCustomEndpoint",
+		]);
+		expect(capabilityAccountContext).toMatchObject({
+			customEndpoint: null,
+			customEndpointConfigured: true,
+			unsafeCustomEndpoint: true,
+		});
+		expect(tuple).toBeUndefined();
+		expect(proofKey).toBeUndefined();
+		for (const sentinel of secretSentinels) {
+			expect(serializedFactoryContext).not.toContain(sentinel);
+			expect(JSON.stringify(tuple) ?? "").not.toContain(sentinel);
+			expect(String(proofKey)).not.toContain(sentinel);
+		}
+	});
+
+	test("rejects an asynchronous tuple factory before it can escape planning", () => {
+		const requirement = requireDefined(
+			deriveServerToolRequirement({
+				tools: [{ type: "web_search_20250305", name: "web_search" }],
+			}),
+			"valid server-tool request must produce requirements",
+		);
+		expect(() =>
+			materializeProviderServerToolCapabilityTuple(
+				capabilityProvider({
+					createServerToolCapabilityTuple: async () => undefined,
+				} as unknown as Partial<Provider>),
+				{
+					candidateId: "candidate-async",
+					account: capabilityAccountFixture(),
+					path: "/v1/messages",
+					query: "",
+					physicalModel: "fixture-model",
+					requirements: requirement,
+				},
+			),
+		).toThrow();
+	});
+
+	test("does not invoke accessors on a provider-returned tuple", () => {
+		const requirement = requireDefined(
+			deriveServerToolRequirement({
+				tools: [{ type: "web_search_20250305", name: "web_search" }],
+			}),
+			"valid server-tool request must produce requirements",
+		);
+		let getterCalls = 0;
+		const tuple = capabilityTupleFixture({
+			provider: "fixture",
+			model: "fixture-model",
+		});
+		Object.defineProperty(tuple, "endpointClass", {
+			configurable: true,
+			enumerable: true,
+			get() {
+				getterCalls += 1;
+				return "fixture_responses";
+			},
+		});
+
+		expect(
+			materializeProviderServerToolCapabilityTuple(
+				capabilityProvider({
+					createServerToolCapabilityTuple: () => tuple,
+				}),
+				{
+					candidateId: tuple.candidateId,
+					account: capabilityAccountFixture(),
+					path: "/v1/messages",
+					query: "",
+					physicalModel: tuple.model,
+					requirements: requirement,
+				},
+			),
+		).toBeUndefined();
+		expect(getterCalls).toBe(0);
+	});
+
+	test("rejects provider identity accessors and factory-reference drift", () => {
+		const requirement = requireDefined(
+			deriveServerToolRequirement({
+				tools: [{ type: "web_search_20250305", name: "web_search" }],
+			}),
+			"valid server-tool request must produce requirements",
+		);
+		const context = {
+			candidateId: "candidate-drift",
+			account: capabilityAccountFixture(),
+			path: "/v1/messages",
+			query: "",
+			physicalModel: "fixture-model",
+			requirements: requirement,
+		};
+
+		let nameGetterCalls = 0;
+		let accessorFactoryCalls = 0;
+		const alternatingNameProvider = capabilityProvider({
+			createServerToolCapabilityTuple: () => {
+				accessorFactoryCalls += 1;
+				return undefined;
+			},
+		});
+		Object.defineProperty(alternatingNameProvider, "name", {
+			configurable: true,
+			enumerable: true,
+			get() {
+				nameGetterCalls += 1;
+				return nameGetterCalls % 2 === 1 ? "fixture" : "mutated";
+			},
+		});
+		expect(() =>
+			materializeProviderServerToolCapabilityTuple(
+				alternatingNameProvider,
+				context,
+			),
+		).toThrow();
+		expect(nameGetterCalls).toBe(0);
+		expect(accessorFactoryCalls).toBe(0);
+
+		let provider: Provider;
+		provider = capabilityProvider({
+			createServerToolCapabilityTuple: () => {
+				provider.createServerToolCapabilityTuple = () => undefined;
+				return capabilityTupleFixture({
+					candidateId: context.candidateId,
+					provider: "fixture",
+					model: context.physicalModel,
+				});
+			},
+		});
+		expect(() =>
+			materializeProviderServerToolCapabilityTuple(provider, context),
+		).toThrow();
+	});
+
+	test("rejects materialization-context accessors and symbols before provider code", () => {
+		const requirement = requireDefined(
+			deriveServerToolRequirement({
+				tools: [{ type: "web_search_20250305", name: "web_search" }],
+			}),
+			"valid server-tool request must produce requirements",
+		);
+		let getterCalls = 0;
+		let factoryCalls = 0;
+		const context = {
+			candidateId: "candidate-context-accessor",
+			account: capabilityAccountFixture(),
+			path: "/v1/messages",
+			query: "",
+			physicalModel: "fixture-model",
+			requirements: requirement,
+			[Symbol("unexpected")]: true,
+		};
+		Object.defineProperty(context, "candidateId", {
+			configurable: true,
+			enumerable: true,
+			get() {
+				getterCalls += 1;
+				return "candidate-context-accessor";
+			},
+		});
+		const provider = capabilityProvider({
+			createServerToolCapabilityTuple: () => {
+				factoryCalls += 1;
+				return undefined;
+			},
+		});
+
+		expect(() =>
+			materializeProviderServerToolCapabilityTuple(provider, context),
+		).toThrow();
+		expect(getterCalls).toBe(0);
+		expect(factoryCalls).toBe(0);
+	});
+});
+
+describe("provider-owned server-tool decision materialization", () => {
+	const requirement = requireDefined(
+		deriveServerToolRequirement({
+			tools: [{ type: "web_search_20250305", name: "web_search" }],
+		}),
+		"valid server-tool request must produce requirements",
+	);
+	const tuple = capabilityTupleFixture({
+		candidateId: "candidate-decision",
+		provider: "fixture",
+		model: "fixture-model",
+		profile: requirement.profileId,
+	});
+
+	test("returns an immutable conservative decision when no resolver exists", () => {
+		expect(typeof materializeDecision).toBe("function");
+		const decision = materializeDecision(
+			capabilityProvider(),
+			requirement,
+			tuple,
+		);
+		expect(decision).toEqual({
+			decision: "unknown",
+			reason: "no_exact_proof",
+		});
+		expect(Object.isFrozen(decision)).toBe(true);
+	});
+
+	test("snapshots a valid exact proof without retaining resolver objects", () => {
+		const proof = capabilityProofFixture(tuple);
+		let observedRequirements: unknown;
+		let observedTuple: unknown;
+		const provider = capabilityProvider({
+			resolveServerToolCapability(requirements, candidateTuple) {
+				observedRequirements = requirements;
+				observedTuple = candidateTuple;
+				return { decision: "proven", proof };
+			},
+		});
+		const decision = materializeDecision(provider, requirement, tuple);
+
+		expect(decision).toMatchObject({ decision: "proven" });
+		expect(decision).not.toBe(proof);
+		expect(Object.isFrozen(decision)).toBe(true);
+		expect(observedRequirements).not.toBe(requirement);
+		expect(Object.isFrozen(observedRequirements)).toBe(true);
+		expect(observedTuple).not.toBe(tuple);
+		expect(Object.isFrozen(observedTuple)).toBe(true);
+		if (decision.decision !== "proven") {
+			throw new Error("exact proof must remain proven");
+		}
+		expect(decision.proof).not.toBe(proof);
+		expect(Object.isFrozen(decision.proof)).toBe(true);
+		expect(Object.isFrozen(decision.proof.tuple)).toBe(true);
+		expect(buildServerToolCapabilityTupleKey(decision.proof.tuple)).toBe(
+			buildServerToolCapabilityTupleKey(tuple),
+		);
+	});
+
+	test("rejects requirement-mismatched tuples before invoking provider code", () => {
+		let resolverCalls = 0;
+		const decision = materializeDecision(
+			capabilityProvider({
+				resolveServerToolCapability(_requirements, candidateTuple) {
+					resolverCalls += 1;
+					return {
+						decision: "proven",
+						proof: capabilityProofFixture(candidateTuple),
+					};
+				},
+			}),
+			requirement,
+			{ ...tuple, profile: "mismatched-profile" },
+		);
+
+		expect(decision).toEqual({
+			decision: "unknown",
+			reason: "requirement_mismatch",
+		});
+		expect(Object.isFrozen(decision)).toBe(true);
+		expect(resolverCalls).toBe(0);
+	});
+
+	test("bounds requirement snapshots by bytes, depth, nodes, arrays, and keys", () => {
+		let resolverCalls = 0;
+		const provider = capabilityProvider({
+			resolveServerToolCapability() {
+				resolverCalls += 1;
+				return { decision: "unknown", reason: "no_exact_proof" };
+			},
+		});
+		const deepRoot: Record<string, unknown> = {};
+		let deepCursor = deepRoot;
+		for (let depth = 0; depth < 20; depth += 1) {
+			const next: Record<string, unknown> = {};
+			deepCursor.child = next;
+			deepCursor = next;
+		}
+		const nodeHeavy = Array.from({ length: 32 }, (_, row) =>
+			Object.fromEntries(
+				Array.from({ length: 16 }, (_unused, column) => [
+					`field-${column}`,
+					`${row}-${column}`,
+				]),
+			),
+		);
+		const invalidRequirements = [
+			{ ...requirement, profileId: "x".repeat(64 * 1024 + 1) },
+			{
+				...requirement,
+				declarations: Array.from({ length: 65 }, () => ({ type: "x" })),
+			},
+			{
+				...requirement,
+				declarations: [
+					Object.fromEntries(
+						Array.from({ length: 33 }, (_unused, index) => [
+							`field-${index}`,
+							index,
+						]),
+					),
+				],
+			},
+			{ ...requirement, declarations: [deepRoot] },
+			{ ...requirement, declarations: nodeHeavy },
+		] as const;
+
+		for (const invalidRequirement of invalidRequirements) {
+			expect(() =>
+				materializeDecision(provider, invalidRequirement as never, tuple),
+			).toThrow();
+		}
+		expect(resolverCalls).toBe(0);
+	});
+
+	test("validates tiny decision and proof shapes before recursive descent", () => {
+		let nestedTraversals = 0;
+		const nestedTrap = new Proxy(
+			{},
+			{
+				ownKeys() {
+					nestedTraversals += 1;
+					return [];
+				},
+			},
+		);
+		expect(() =>
+			materializeDecision(
+				capabilityProvider({
+					resolveServerToolCapability: () =>
+						({
+							decision: "unknown",
+							reason: "no_exact_proof",
+							unexpected: nestedTrap,
+						}) as never,
+				}),
+				requirement,
+				tuple,
+			),
+		).toThrow();
+		expect(nestedTraversals).toBe(0);
+
+		expect(() =>
+			materializeDecision(
+				capabilityProvider({
+					resolveServerToolCapability: () =>
+						({
+							decision: "proven",
+							proof: {
+								...capabilityProofFixture(tuple),
+								unexpected: nestedTrap,
+							},
+						}) as never,
+				}),
+				requirement,
+				tuple,
+			),
+		).toThrow();
+		expect(nestedTraversals).toBe(0);
+	});
+
+	test("requires canonical UTC ISO proof instants in both decision paths", () => {
+		for (const verifiedAt of [
+			"2026-08-04T00:00:00",
+			"2026-08-04T00:00:00+00:00",
+			"August 4, 2026 00:00:00 GMT",
+		]) {
+			const proof = capabilityProofFixture(tuple, { verifiedAt });
+			expect(() =>
+				materializeDecision(
+					capabilityProvider({
+						resolveServerToolCapability: () => ({
+							decision: "proven",
+							proof,
+						}),
+					}),
+					requirement,
+					tuple,
+					"2026-08-05T00:00:00.000Z",
+				),
+			).toThrow();
+			expect(
+				resolveServerToolCapability(
+					requirement,
+					tuple,
+					indexServerToolCapabilityProofs([proof]),
+					"2026-08-05T00:00:00.000Z",
+				),
+			).toEqual({ decision: "unknown", reason: "no_exact_proof" });
+		}
+	});
+
+	test("rejects mismatched proof decisions, tuples, and unknown reasons", () => {
+		for (const decision of [
+			{
+				decision: "proven",
+				proof: capabilityProofFixture(tuple, { decision: "unsupported" }),
+			},
+			{
+				decision: "proven",
+				proof: capabilityProofFixture(
+					capabilityTupleFixture({
+						candidateId: tuple.candidateId,
+						provider: tuple.provider,
+						model: "different-model",
+						profile: tuple.profile,
+					}),
+				),
+			},
+			{
+				decision: "proven",
+				proof: capabilityProofFixture(tuple, {
+					fixtureRevision: undefined,
+				}),
+			},
+			{
+				decision: "proven",
+				proof: capabilityProofFixture(tuple, {
+					revalidateAfter: "2026-08-04T00:00:00.000Z",
+				}),
+			},
+			{
+				decision: "proven",
+				proof: capabilityProofFixture(tuple, {
+					verifiedAt: "2026-08-06T00:00:00.000Z",
+				}),
+			},
+			{ decision: "unknown", reason: "provider_said_maybe" },
+		] as const) {
+			expect(() =>
+				materializeDecision(
+					capabilityProvider({
+						resolveServerToolCapability: () => decision as never,
+					}),
+					requirement,
+					tuple,
+					"2026-08-05T00:00:00.000Z",
+				),
+			).toThrow();
+		}
+	});
+
+	test("rejects async, throwing, accessor, and drifting resolvers safely", () => {
+		expect(() =>
+			materializeDecision(
+				capabilityProvider({
+					resolveServerToolCapability: async () => ({
+						decision: "unknown",
+						reason: "no_exact_proof",
+					}),
+				} as unknown as Partial<Provider>),
+				requirement,
+				tuple,
+			),
+		).toThrow();
+
+		const diagnosticSentinel = "resolver-secret-diagnostic";
+		let thrownMessage = "";
+		try {
+			materializeDecision(
+				capabilityProvider({
+					resolveServerToolCapability: () => {
+						throw new Error(diagnosticSentinel);
+					},
+				}),
+				requirement,
+				tuple,
+			);
+		} catch (error) {
+			thrownMessage = error instanceof Error ? error.message : String(error);
+		}
+		expect(thrownMessage).not.toContain(diagnosticSentinel);
+
+		let getterCalls = 0;
+		const accessorDecision: Record<string, unknown> = {
+			reason: "no_exact_proof",
+		};
+		Object.defineProperty(accessorDecision, "decision", {
+			configurable: true,
+			enumerable: true,
+			get() {
+				getterCalls += 1;
+				return "unknown";
+			},
+		});
+		expect(() =>
+			materializeDecision(
+				capabilityProvider({
+					resolveServerToolCapability: () => accessorDecision as never,
+				}),
+				requirement,
+				tuple,
+			),
+		).toThrow();
+		expect(getterCalls).toBe(0);
+
+		let provider: Provider;
+		provider = capabilityProvider({
+			resolveServerToolCapability: () => {
+				provider.resolveServerToolCapability = () => ({
+					decision: "unknown",
+					reason: "no_exact_proof",
+				});
+				return { decision: "unknown", reason: "no_exact_proof" };
+			},
+		});
+		expect(() => materializeDecision(provider, requirement, tuple)).toThrow();
 	});
 });

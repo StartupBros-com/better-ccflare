@@ -64,6 +64,59 @@ export interface ProviderAttemptPlanContext {
 	readonly outputReplayMode: readonly ServerToolReplayAtom[];
 }
 
+/**
+ * Pure request-local inputs from which a provider may describe one exact
+ * server-tool capability tuple. The contract intentionally excludes Request,
+ * message content, client-function schemas, credentials I/O, and transport
+ * execution state.
+ */
+export interface ProviderServerToolCapabilityAccountContext {
+	readonly provider: string;
+	readonly apiKeyConfigured: boolean;
+	readonly refreshTokenConfigured: boolean;
+	readonly accessTokenConfigured: boolean;
+	readonly legacyMirroredApiKey: boolean;
+	readonly customEndpoint: string | null;
+	readonly customEndpointConfigured: boolean;
+	readonly unsafeCustomEndpoint: boolean;
+	readonly crossRegionMode: string | null;
+	readonly billingType: string | null;
+}
+
+export type ProviderServerToolCapabilityRouteClass =
+	| "anthropic_messages"
+	| "openai_chat_completions"
+	| "openai_responses"
+	| "other";
+
+/**
+ * Bounded semantic route data. Raw request paths and query strings can contain
+ * credentials, so capability factories receive only this closed descriptor.
+ */
+export interface ProviderServerToolCapabilityEndpointContract {
+	readonly routeClass: ProviderServerToolCapabilityRouteClass;
+	readonly queryPresent: boolean;
+}
+
+/** The non-secret immutable context visible to a provider capability factory. */
+export interface ProviderServerToolCapabilityContext {
+	readonly candidateId: string;
+	readonly account: ProviderServerToolCapabilityAccountContext;
+	readonly endpointContract: ProviderServerToolCapabilityEndpointContract;
+	readonly physicalModel: string;
+	readonly requirements: ServerToolRequirements;
+}
+
+/** Proxy-side inputs accepted by the capability materializer. */
+export interface ProviderServerToolCapabilityMaterializationContext {
+	readonly candidateId: string;
+	readonly account: Account;
+	readonly path: string;
+	readonly query: string;
+	readonly physicalModel: string;
+	readonly requirements: ServerToolRequirements;
+}
+
 export type ProviderAttemptDataRetryPolicy =
 	| Readonly<{ mode: "none"; maxAttempts: 0 }>
 	| Readonly<{ mode: "reuse-same-plan"; maxAttempts: number }>;
@@ -144,6 +197,15 @@ export interface Provider {
 		requirement: ServerToolRequirements,
 		tuple: ServerToolCapabilityTuple,
 	): ServerToolCapabilityDecision;
+
+	/**
+	 * Purely construct the provider-owned exact capability tuple for one
+	 * concrete candidate/model, or return undefined when this provider has no
+	 * declared implementation. This factory is deliberately synchronous.
+	 */
+	createServerToolCapabilityTuple?(
+		context: ProviderServerToolCapabilityContext,
+	): ServerToolCapabilityTuple | undefined;
 
 	/**
 	 * Build one synchronous, request-scoped transport plan after the concrete

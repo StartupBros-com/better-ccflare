@@ -72,7 +72,7 @@ class ProviderRegistry {
 	}
 }
 
-const CAPABILITY_PROVIDER_ALIASES: Readonly<Record<string, string>> = {
+const ACCOUNT_PROVIDER_ALIASES: Readonly<Record<string, string>> = {
 	"claude-console-api": "anthropic",
 };
 
@@ -83,8 +83,17 @@ export const registry = new ProviderRegistry();
 export const registerProvider = (provider: Provider) =>
 	registry.registerProvider(provider);
 export const getProvider = (name: string) => registry.getProvider(name);
+/**
+ * Resolve the provider identity used by both transport and capability paths.
+ * Known account aliases are canonicalized before an optional request fallback.
+ */
+export const resolveProviderForAccount = (
+	name: string,
+	fallback?: Provider,
+): Provider | undefined =>
+	registry.getProvider(ACCOUNT_PROVIDER_ALIASES[name] ?? name) ?? fallback;
 export const getCapabilityProvider = (name: string) =>
-	registry.getProvider(CAPABILITY_PROVIDER_ALIASES[name] ?? name);
+	resolveProviderForAccount(name);
 export const getOAuthProvider = (name: string) =>
 	registry.getOAuthProvider(name);
 export const listProviders = () => registry.listProviders();
