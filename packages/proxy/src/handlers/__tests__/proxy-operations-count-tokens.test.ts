@@ -7,6 +7,7 @@ import {
 	mock,
 	spyOn,
 } from "bun:test";
+import { CODEX_LOGICAL_MODEL_FAMILY_HEADER } from "@better-ccflare/http-common";
 import { logBus } from "@better-ccflare/logger";
 import type { Account, RequestMeta } from "@better-ccflare/types";
 import type { ProxyContext } from "../proxy-types";
@@ -21,9 +22,8 @@ mock.module("@better-ccflare/database", () => ({
 	ModelTranslationRepository: class ModelTranslationRepository {},
 }));
 
-const { CodexProvider, estimateAnthropicAdmissionTokens } = await import(
-	"@better-ccflare/providers"
-);
+const { CodexProvider, estimateAnthropicAdmissionTokens, getProvider } =
+	await import("@better-ccflare/providers");
 const usageCollectorModule = await import("../../usage-collector");
 const {
 	createContextAdmissionTracker,
@@ -1282,6 +1282,7 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 			"x-better-ccflare-pacing-action": "bypassed",
 			"x-better-ccflare-request-stream": "true",
 			"x-better-ccflare-attributed-agent": "true",
+			[CODEX_LOGICAL_MODEL_FAMILY_HEADER]: "fable",
 		});
 		const sanitized = sanitizeInternalHeaders(headers);
 		expect(sanitized.get("authorization")).toBe("Bearer public-upstream-token");
@@ -1294,11 +1295,240 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 			"x-better-ccflare-pacing-action",
 			"x-better-ccflare-request-stream",
 			"x-better-ccflare-attributed-agent",
+			CODEX_LOGICAL_MODEL_FAMILY_HEADER,
 		]) {
 			expect(sanitized.get(name)).toBeNull();
 		}
 		// Pure helper: the reusable transform headers remain intact for retries.
 		expect(headers.get("x-better-ccflare-request-id")).toBe("req-internal");
+	});
+
+	it("overwrites spoofed logical-family metadata and strips it before Codex transport", async () => {
+		let transformedHeaders: Headers | null = null;
+		let fetchedRequest: Request | null = null;
+		const provider = getProvider("codex");
+		if (!provider) throw new Error("Codex provider is not registered");
+		const originalTransform = provider.transformRequestBody.bind(provider);
+		const transformSpy = spyOn(
+			provider,
+			"transformRequestBody",
+		).mockImplementation(async (request, account) => {
+			transformedHeaders = new Headers(request.headers);
+			return originalTransform(request, account);
+		});
+		const ctx = makeProxyContext();
+		ctx.provider = provider as never;
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			fetchedRequest = input instanceof Request ? input : new Request(input);
+			return new Response(JSON.stringify({ ok: true }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		});
+		const collectorSpy = spyOn(
+			usageCollectorModule,
+			"getUsageCollector",
+		).mockReturnValue({
+			handleStart: mock(() => {}),
+			handleChunk: mock(() => {}),
+			handleEnd: mock(() => Promise.resolve()),
+		} as unknown as usageCollectorModule.UsageCollector);
+		try {
+			const bodyBuffer = new TextEncoder().encode(
+				JSON.stringify({
+					model: "claude-fable-5",
+					messages: [{ role: "user", content: "hello" }],
+					max_tokens: 16,
+				}),
+			).buffer;
+			const requestMeta = {
+				...makeRequestMeta("/v1/messages"),
+				originalModel: "claude-opus-5",
+				appliedModel: "CLAUDE-FABLE-5",
+			};
+			const result = await proxyWithAccount(
+				makeMessagesRequest(bodyBuffer, {
+					"Content-Type": "application/json",
+					[CODEX_LOGICAL_MODEL_FAMILY_HEADER]: "opus",
+				}),
+				new URL("https://proxy.local/v1/messages"),
+				makeCodexAccount({
+					access_token: "access-token",
+					expires_at: Date.now() + 60 * 60 * 1000,
+					model_mappings: JSON.stringify({ fable: "gpt-5.6-sol" }),
+				}),
+				requestMeta,
+				bodyBuffer,
+				() => undefined,
+				0,
+				ctx,
+			);
+			await result?.text();
+		} finally {
+			collectorSpy.mockRestore();
+			transformSpy.mockRestore();
+		}
+
+		expect(transformedHeaders?.get(CODEX_LOGICAL_MODEL_FAMILY_HEADER)).toBe(
+			"fable",
+		);
+		expect(
+			fetchedRequest?.headers.get(CODEX_LOGICAL_MODEL_FAMILY_HEADER),
+		).toBeNull();
+		const upstreamBody = await fetchedRequest?.clone().json();
+		expect(upstreamBody).toMatchObject({
+			model: "gpt-5.6-sol",
+			reasoning: { effort: "xhigh" },
+		});
+	});
+
+	it.each([
+		["claude-fable-5", "claude-opus-5", "fable", "xhigh"],
+		["claude-opus-5", "claude-fable-5", "opus", "medium"],
+	])("keeps %s origin authoritative when the combo slot overrides the body to %s", async (originModel, comboModel, expectedFamily, expectedEffort) => {
+		let transformedHeaders: Headers | null = null;
+		let fetchedRequest: Request | null = null;
+		const provider = getProvider("codex");
+		if (!provider) throw new Error("Codex provider is not registered");
+		const originalTransform = provider.transformRequestBody.bind(provider);
+		const transformSpy = spyOn(
+			provider,
+			"transformRequestBody",
+		).mockImplementation(async (request, account) => {
+			transformedHeaders = new Headers(request.headers);
+			return originalTransform(request, account);
+		});
+		const ctx = makeProxyContext();
+		ctx.provider = provider as never;
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			fetchedRequest = input instanceof Request ? input : new Request(input);
+			return new Response(JSON.stringify({ ok: true }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		});
+		const collectorSpy = spyOn(
+			usageCollectorModule,
+			"getUsageCollector",
+		).mockReturnValue({
+			handleStart: mock(() => {}),
+			handleChunk: mock(() => {}),
+			handleEnd: mock(() => Promise.resolve()),
+		} as unknown as usageCollectorModule.UsageCollector);
+		try {
+			const bodyBuffer = new TextEncoder().encode(
+				JSON.stringify({
+					model: originModel,
+					messages: [{ role: "user", content: "hello" }],
+					max_tokens: 16,
+				}),
+			).buffer;
+			const requestMeta = {
+				...makeRequestMeta("/v1/messages"),
+				originalModel: originModel,
+				appliedModel: originModel,
+			};
+			const result = await proxyWithAccount(
+				makeMessagesRequest(bodyBuffer, {
+					"Content-Type": "application/json",
+				}),
+				new URL("https://proxy.local/v1/messages"),
+				makeCodexAccount({
+					access_token: "access-token",
+					expires_at: Date.now() + 60 * 60 * 1000,
+					model_mappings: JSON.stringify({
+						fable: "gpt-5.6-sol",
+						opus: "gpt-5.6-sol",
+					}),
+				}),
+				requestMeta,
+				bodyBuffer,
+				() => undefined,
+				0,
+				ctx,
+				comboModel,
+			);
+			await result?.text();
+		} finally {
+			collectorSpy.mockRestore();
+			transformSpy.mockRestore();
+		}
+
+		expect(transformedHeaders?.get(CODEX_LOGICAL_MODEL_FAMILY_HEADER)).toBe(
+			expectedFamily,
+		);
+		expect(
+			fetchedRequest?.headers.get(CODEX_LOGICAL_MODEL_FAMILY_HEADER),
+		).toBeNull();
+		const upstreamBody = await fetchedRequest?.clone().json();
+		expect(upstreamBody).toMatchObject({
+			model: "gpt-5.6-sol",
+			reasoning: { effort: expectedEffort },
+		});
+	});
+
+	it("strips a spoofed logical-family carrier before non-Codex transport", async () => {
+		let fetchedRequest: Request | null = null;
+		const nonCodexProvider = {
+			name: "fixture-non-codex",
+			canHandle: () => true,
+			buildUrl: () => "https://example.com/v1/messages",
+			prepareHeaders: (headers: Headers) => new Headers(headers),
+			transformRequestBody: async (request: Request) => request,
+			processResponse: async (response: Response) => response,
+			parseRateLimit: () => ({ isRateLimited: false }),
+			isStreamingResponse: () => false,
+		} as never;
+		const ctx = makeProxyContext();
+		ctx.provider = nonCodexProvider;
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			fetchedRequest = input instanceof Request ? input : new Request(input);
+			return new Response("ok", {
+				status: 200,
+				headers: { "content-type": "text/plain" },
+			});
+		});
+		const collectorSpy = spyOn(
+			usageCollectorModule,
+			"getUsageCollector",
+		).mockReturnValue({
+			handleStart: mock(() => {}),
+			handleChunk: mock(() => {}),
+			handleEnd: mock(() => Promise.resolve()),
+		} as unknown as usageCollectorModule.UsageCollector);
+		try {
+			const bodyBuffer = new TextEncoder().encode(
+				JSON.stringify({
+					model: "claude-fable-5",
+					messages: [{ role: "user", content: "hello" }],
+					max_tokens: 16,
+				}),
+			).buffer;
+			const result = await proxyWithAccount(
+				makeMessagesRequest(bodyBuffer, {
+					"Content-Type": "application/json",
+					[CODEX_LOGICAL_MODEL_FAMILY_HEADER]: "fable",
+				}),
+				new URL("https://proxy.local/v1/messages"),
+				makeCodexAccount({
+					provider: "fixture-non-codex",
+					access_token: "access-token",
+					expires_at: Date.now() + 60 * 60 * 1000,
+				}),
+				makeRequestMeta("/v1/messages"),
+				bodyBuffer,
+				() => undefined,
+				0,
+				ctx,
+			);
+			await result?.text();
+		} finally {
+			collectorSpy.mockRestore();
+		}
+
+		expect(
+			fetchedRequest?.headers.get(CODEX_LOGICAL_MODEL_FAMILY_HEADER),
+		).toBeNull();
 	});
 
 	it("does not trust client-supplied pacing experiment metadata", async () => {

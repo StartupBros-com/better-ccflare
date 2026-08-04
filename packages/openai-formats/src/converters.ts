@@ -1,7 +1,7 @@
 import { mapModelName } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import type { Account } from "@better-ccflare/types";
-import { resolveReasoningEffort } from "./reasoning";
+import { resolveAnthropicReasoningEffort } from "./reasoning";
 import type {
 	AnthropicContent,
 	AnthropicContentBlock,
@@ -86,13 +86,10 @@ export function convertAnthropicRequestToOpenAI(
 			openaiRequest.stream_options = { include_usage: true };
 		}
 	}
-	const reasoningResolution = resolveReasoningEffort(
-		anthropicData.reasoning?.effort,
-		{
-			sourceModel: anthropicData.model,
-			targetModel: mappedModel,
-		},
-	);
+	const reasoningResolution = resolveAnthropicReasoningEffort(anthropicData, {
+		sourceModel: anthropicData.model,
+		targetModel: mappedModel,
+	});
 	if (reasoningResolution.downgrades.length > 0) {
 		for (const downgrade of reasoningResolution.downgrades) {
 			log.warn(

@@ -9,6 +9,7 @@ import {
 import {
 	CODEX_CACHE_KEY_MODE_ENV,
 	CODEX_CACHE_KEY_SESSION_PERCENT_ENV,
+	CODEX_LOGICAL_MODEL_FAMILY_HEADER,
 	CODEX_PROMPT_CACHE_KEY_ENV,
 	CodexProvider,
 } from "./provider";
@@ -74,19 +75,27 @@ describe("Codex trace wiring (integration)", () => {
 	test("transformRequestBody traces the physical attempt and strips internal identity", async () => {
 		process.env[CODEX_TRACE_DIR_ENV] = dir;
 		const transformed = await new CodexProvider().transformRequestBody(
-			messagesRequest(SAMPLE, "req_trace_1", {
-				"x-better-ccflare-attempt-id": "attempt-1",
-				"x-better-ccflare-attempt-ordinal": "2",
-				"x-better-ccflare-attempt-cause": "model_fallback",
-				"x-better-ccflare-final-model": "gpt-5.4-mini",
-			}),
+			messagesRequest(
+				{
+					...SAMPLE,
+					output_config: { effort: "max" },
+					reasoning: { effort: "max" },
+				},
+				"req_trace_1",
+				{
+					"x-better-ccflare-attempt-id": "attempt-1",
+					"x-better-ccflare-attempt-ordinal": "2",
+					"x-better-ccflare-attempt-cause": "model_fallback",
+					"x-better-ccflare-final-model": "gpt-5.4-mini",
+				},
+			),
 			undefined,
 		);
 
 		const files = readdirSync(dir).filter((f) => f.endsWith(".jsonl"));
 		expect(files.length).toBe(1);
 		const rec = JSON.parse(readFileSync(join(dir, files[0]), "utf8").trim());
-		expect(rec.trace_schema_version).toBe(11);
+		expect(rec.trace_schema_version).toBe(12);
 		expect(rec.phase).toBe("request");
 		expect(rec.orchestration_admission).toBe("no_orchestration_tools");
 		expect(rec.request_id).toBe("req_trace_1");
@@ -94,7 +103,16 @@ describe("Codex trace wiring (integration)", () => {
 		expect(rec.attempt_ordinal).toBe(2);
 		expect(rec.attempt_cause).toBe("model_fallback");
 		expect(rec.model_out).toBe("gpt-5.4-mini");
-		expect((await transformed.clone().json()).model).toBe("gpt-5.4-mini");
+		expect(rec.logical_reasoning_effort_requested).toBe("max");
+		expect(rec.logical_reasoning_effort_source).toBe("output_config");
+		expect(rec.physical_reasoning_effort_applied).toBe("medium");
+		const transformedBody = await transformed.clone().json();
+		expect(transformedBody.model).toBe("gpt-5.4-mini");
+		expect(transformedBody.reasoning).toEqual({ effort: "medium" });
+		expect(transformedBody.output_config).toBeUndefined();
+		expect(transformedBody.logical_reasoning_effort_requested).toBeUndefined();
+		expect(transformedBody.logical_reasoning_effort_source).toBeUndefined();
+		expect(transformedBody.physical_reasoning_effort_applied).toBeUndefined();
 		// Cache-key experiment is off by default in this test environment.
 		expect(rec.prompt_cache_key_set).toBe(false);
 		expect(rec.prompt_cache_key_id).toBeNull();
@@ -120,6 +138,48 @@ describe("Codex trace wiring (integration)", () => {
 		}
 		// full bodies must be absent unless FULL is set
 		expect(rec.anthropic_request).toBeUndefined();
+	});
+
+	test("traces omitted Fable-origin GPT-5.6 Sol effort as the xhigh default without leaking metadata", async () => {
+		process.env[CODEX_TRACE_DIR_ENV] = dir;
+		const transformed = await new CodexProvider().transformRequestBody(
+			messagesRequest(
+				{
+					model: "claude-fable-5",
+					max_tokens: 10,
+					messages: [{ role: "user", content: "review" }],
+				},
+				"req_trace_fable_default",
+				{
+					[CODEX_LOGICAL_MODEL_FAMILY_HEADER]: "fable",
+					"x-better-ccflare-final-model": "gpt-5.6-sol",
+				},
+			),
+		);
+
+		const file = readdirSync(dir).find((name) => name.endsWith(".jsonl"));
+		const record = JSON.parse(
+			readFileSync(join(dir, file as string), "utf8").trim(),
+		);
+		expect(record).toMatchObject({
+			trace_schema_version: 12,
+			request_id: "req_trace_fable_default",
+			model_in: "claude-fable-5",
+			model_out: "gpt-5.6-sol",
+			logical_reasoning_effort_requested: null,
+			logical_reasoning_effort_source: "default",
+			physical_reasoning_effort_applied: "xhigh",
+		});
+
+		const transformedBody = await transformed.clone().json();
+		expect(transformedBody.reasoning).toEqual({ effort: "xhigh" });
+		expect(transformedBody.output_config).toBeUndefined();
+		expect(transformedBody.logical_reasoning_effort_requested).toBeUndefined();
+		expect(transformedBody.logical_reasoning_effort_source).toBeUndefined();
+		expect(transformedBody.physical_reasoning_effort_applied).toBeUndefined();
+		expect(
+			transformed.headers.get(CODEX_LOGICAL_MODEL_FAMILY_HEADER),
+		).toBeNull();
 	});
 
 	test("traces stable canary decisions across sibling conversations", async () => {
@@ -156,7 +216,7 @@ describe("Codex trace wiring (integration)", () => {
 			.trim()
 			.split("\n")
 			.map((line) => JSON.parse(line));
-		expect(records.every((record) => record.trace_schema_version === 11)).toBe(
+		expect(records.every((record) => record.trace_schema_version === 12)).toBe(
 			true,
 		);
 		expect(records.map((record) => record.cache_key_assignment)).toEqual([

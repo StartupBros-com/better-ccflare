@@ -11,6 +11,7 @@ import {
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { CODEX_LOGICAL_MODEL_FAMILY_HEADER } from "@better-ccflare/http-common";
 import type {
 	ProviderAttemptPlan,
 	ProviderAttemptPlanContext,
@@ -314,17 +315,19 @@ async function runProxy(
 	policy: ModelFallbackExecutionPolicy,
 	requestId: string,
 	account = makeCodexAccount(),
+	requestMetaOverrides: Partial<RequestMeta> = {},
+	comboModel?: string,
 ): Promise<Response | null> {
 	return proxyWithAccount(
 		request,
 		new URL(request.url),
 		account,
-		makeRequestMeta(requestId),
+		makeRequestMeta(requestId, requestMetaOverrides),
 		body,
 		() => undefined,
 		0,
 		makeProxyContext(),
-		undefined,
+		comboModel,
 		undefined,
 		undefined,
 		undefined,
@@ -519,6 +522,7 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 
 		const attempts: Array<{
 			conversationIdentity: string | null | undefined;
+			logicalModelFamily: string | null;
 			promptCacheKey: string | undefined;
 		}> = [];
 		spyOn(codexWebSocketTransport, "tryRequest").mockImplementation(
@@ -530,6 +534,9 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 					conversationIdentity: (
 						input as typeof input & { conversationIdentity?: string | null }
 					).conversationIdentity,
+					logicalModelFamily: input.request.headers.get(
+						CODEX_LOGICAL_MODEL_FAMILY_HEADER,
+					),
 					promptCacheKey: payload.prompt_cache_key,
 				});
 				return null;
@@ -596,6 +603,11 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 		}
 
 		expect(attempts).toHaveLength(3);
+		expect(attempts.map((attempt) => attempt.logicalModelFamily)).toEqual([
+			null,
+			null,
+			null,
+		]);
 		expect(upstreamConversationHeaders).toEqual([null, null, null]);
 		expect(
 			new Set(attempts.map((attempt) => attempt.promptCacheKey)).size,
@@ -608,6 +620,72 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 		expect(attempts[2]?.conversationIdentity).not.toBe(
 			attempts[0]?.conversationIdentity,
 		);
+	});
+
+	it("keeps Fable effort through an Opus-overridden WebSocket request without leaking the carrier", async () => {
+		installUsageCollector();
+		let observedWebSocketRequest: Request | null = null;
+		spyOn(codexWebSocketTransport, "tryRequest").mockImplementation(
+			async (input) => {
+				observedWebSocketRequest = input.request.clone();
+				return null;
+			},
+		);
+		globalThis.fetch = mock(
+			async () =>
+				new Response(
+					[
+						'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_ok","model":"gpt-5.6-sol"}}\n\n',
+						'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"ok"}\n\n',
+						'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_ok","model":"gpt-5.6-sol","status":"completed","usage":{"input_tokens":10,"output_tokens":1,"input_tokens_details":{"cached_tokens":0}}}}\n\n',
+						"data: [DONE]\n\n",
+					].join(""),
+					{
+						status: 200,
+						headers: { "content-type": "text/event-stream" },
+					},
+				),
+		);
+
+		const body = new TextEncoder().encode(
+			JSON.stringify({
+				model: "claude-fable-5",
+				messages: [{ role: "user", content: "hello" }],
+				max_tokens: 16,
+				stream: true,
+			}),
+		).buffer;
+		const response = await runProxy(
+			makeRequest(body),
+			body,
+			makePolicy(1_000),
+			"codex-ws-fable-opus-override",
+			makeCodexAccount({
+				model_mappings: JSON.stringify({
+					fable: "gpt-5.6-sol",
+					opus: "gpt-5.6-sol",
+				}),
+			}),
+			{
+				originalModel: "claude-fable-5",
+				appliedModel: "claude-fable-5",
+			},
+			"claude-opus-5",
+		);
+		expect(response?.status).toBe(200);
+		await response?.text();
+
+		expect(observedWebSocketRequest).not.toBeNull();
+		const webSocketRequest = observedWebSocketRequest as unknown as Request;
+		const payload = (await webSocketRequest.clone().json()) as {
+			model?: string;
+			reasoning?: { effort?: string };
+		};
+		expect(payload.model).toBe("gpt-5.6-sol");
+		expect(payload.reasoning).toEqual({ effort: "xhigh" });
+		expect(
+			webSocketRequest.headers.get(CODEX_LOGICAL_MODEL_FAMILY_HEADER),
+		).toBeNull();
 	});
 
 	it("keeps the private attempt deadline for pre-write WebSocket fallback and HTTP", async () => {
