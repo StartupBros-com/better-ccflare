@@ -138,6 +138,7 @@ export interface AnthropicRequest {
 	stream?: boolean;
 	tools?: AnthropicTool[];
 	tool_choice?: AnthropicToolChoice;
+	output_config?: { effort?: string };
 	reasoning?: { effort?: string };
 }
 

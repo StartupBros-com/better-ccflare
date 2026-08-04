@@ -3,6 +3,7 @@ import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BUFFER_SIZES } from "@better-ccflare/core";
+import { CODEX_LOGICAL_MODEL_FAMILY_HEADER } from "@better-ccflare/http-common";
 import { fetchCodexUsageOnDemand } from "./on-demand-fetch";
 import {
 	CODEX_SINGLE_ORCHESTRATION_ROOT_ENV,
@@ -351,6 +352,302 @@ describe("CodexProvider request conversion", () => {
 		const body = await transformed.json();
 
 		expect(body.reasoning).toEqual({ effort: "medium" });
+	});
+
+	it("defaults omitted Fable-origin GPT-5.6 Sol effort to xhigh and consumes the logical-family header", async () => {
+		const provider = new CodexProvider();
+		const account = {
+			model_mappings: JSON.stringify({ opus: "gpt-5.6-sol" }),
+		} as Parameters<typeof provider.transformRequestBody>[1];
+		const request = new Request("https://example.com/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				[CODEX_LOGICAL_MODEL_FAMILY_HEADER]: "fable",
+			},
+			body: JSON.stringify({
+				// The concrete fallback body no longer identifies the logical origin.
+				model: "claude-opus-5",
+				max_tokens: 100,
+				messages: [{ role: "user", content: "Hello" }],
+			}),
+		});
+
+		const transformed = await provider.transformRequestBody(request, account);
+		const body = await transformed.clone().json();
+
+		expect(body.model).toBe("gpt-5.6-sol");
+		expect(body.reasoning).toEqual({ effort: "xhigh" });
+		expect(
+			transformed.headers.get(CODEX_LOGICAL_MODEL_FAMILY_HEADER),
+		).toBeNull();
+	});
+
+	it("infers Fable origin from the direct request body when the trusted carrier is absent", async () => {
+		const provider = new CodexProvider();
+		const account = {
+			model_mappings: JSON.stringify({ fable: "gpt-5.6-sol" }),
+		} as Parameters<typeof provider.transformRequestBody>[1];
+		const request = new Request("https://example.com/v1/messages", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				model: "claude-fable-5",
+				max_tokens: 100,
+				messages: [{ role: "user", content: "Hello" }],
+			}),
+		});
+
+		const transformed = await provider.transformRequestBody(request, account);
+		const body = await transformed.json();
+
+		expect(body.model).toBe("gpt-5.6-sol");
+		expect(body.reasoning).toEqual({ effort: "xhigh" });
+	});
+
+	it("keeps a present trusted family carrier authoritative over the request body", async () => {
+		const provider = new CodexProvider();
+		const account = {
+			model_mappings: JSON.stringify({ fable: "gpt-5.6-sol" }),
+		} as Parameters<typeof provider.transformRequestBody>[1];
+		const request = new Request("https://example.com/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				[CODEX_LOGICAL_MODEL_FAMILY_HEADER]: "opus",
+			},
+			body: JSON.stringify({
+				model: "claude-fable-5",
+				max_tokens: 100,
+				messages: [{ role: "user", content: "Hello" }],
+			}),
+		});
+
+		const transformed = await provider.transformRequestBody(request, account);
+		const body = await transformed.json();
+
+		expect(body.model).toBe("gpt-5.6-sol");
+		expect(body.reasoning).toEqual({ effort: "medium" });
+	});
+
+	it.each([
+		"  openai/gpt-5.6-sol  ",
+		"azure/openai/gpt-5.6-sol-preview",
+	])("defaults omitted Fable-origin %j effort to xhigh", async (targetModel) => {
+		const provider = new CodexProvider();
+		const account = {
+			model_mappings: JSON.stringify({ fable: targetModel }),
+		} as Parameters<typeof provider.transformRequestBody>[1];
+		const request = new Request("https://example.com/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				[CODEX_LOGICAL_MODEL_FAMILY_HEADER]: "fable",
+			},
+			body: JSON.stringify({
+				model: "claude-fable-5",
+				max_tokens: 100,
+				messages: [{ role: "user", content: "Hello" }],
+			}),
+		});
+
+		const transformed = await provider.transformRequestBody(request, account);
+		const body = await transformed.json();
+
+		expect(body.reasoning).toEqual({ effort: "xhigh" });
+	});
+
+	it.each([
+		"minimal",
+		"low",
+		"medium",
+		"high",
+		"xhigh",
+		"max",
+	])("preserves explicit %s effort for Fable-origin GPT-5.6 Sol requests", async (effort) => {
+		const provider = new CodexProvider();
+		const account = {
+			model_mappings: JSON.stringify({ fable: "gpt-5.6-sol" }),
+		} as Parameters<typeof provider.transformRequestBody>[1];
+		const request = new Request("https://example.com/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				[CODEX_LOGICAL_MODEL_FAMILY_HEADER]: "fable",
+			},
+			body: JSON.stringify({
+				model: "claude-fable-5",
+				max_tokens: 100,
+				reasoning: { effort },
+				messages: [{ role: "user", content: "Hello" }],
+			}),
+		});
+
+		const transformed = await provider.transformRequestBody(request, account);
+		const body = await transformed.json();
+		expect(body.reasoning).toEqual({ effort });
+	});
+
+	it("honors Claude Code output_config effort without forwarding the Anthropic field", async () => {
+		const provider = new CodexProvider();
+		const account = {
+			model_mappings: JSON.stringify({ fable: "gpt-5.6-sol" }),
+		} as Parameters<typeof provider.transformRequestBody>[1];
+		const request = new Request("https://example.com/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				[CODEX_LOGICAL_MODEL_FAMILY_HEADER]: "fable",
+			},
+			body: JSON.stringify({
+				model: "claude-fable-5",
+				max_tokens: 100,
+				output_config: { effort: "max" },
+				messages: [{ role: "user", content: "Hello" }],
+			}),
+		});
+
+		const transformed = await provider.transformRequestBody(request, account);
+		const body = await transformed.json();
+
+		expect(body.reasoning).toEqual({ effort: "max" });
+		expect(body.output_config).toBeUndefined();
+	});
+
+	it("rejects conflicting official and legacy Anthropic effort fields", async () => {
+		const provider = new CodexProvider();
+		const request = new Request("https://example.com/v1/messages", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				model: "claude-fable-5",
+				max_tokens: 100,
+				output_config: { effort: "max" },
+				reasoning: { effort: "xhigh" },
+				messages: [{ role: "user", content: "Hello" }],
+			}),
+		});
+
+		await expect(provider.transformRequestBody(request)).rejects.toThrow(
+			"output_config.effort conflicts with reasoning.effort",
+		);
+	});
+
+	it.each([
+		["sonnet", "claude-sonnet-4-5", "gpt-5.6-sol"],
+		["fable", "claude-fable-5", "gpt-5.5"],
+		["fable", "claude-fable-5", "gpt-5.6-terra"],
+		["fable", "claude-fable-5", "gpt-5.6-solar"],
+	])("keeps the medium default for %s-origin %s requests targeting %s", async (logicalFamily, sourceModel, targetModel) => {
+		const provider = new CodexProvider();
+		const account = {
+			model_mappings: JSON.stringify({
+				[logicalFamily]: targetModel,
+			}),
+		} as Parameters<typeof provider.transformRequestBody>[1];
+		const request = new Request("https://example.com/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				[CODEX_LOGICAL_MODEL_FAMILY_HEADER]: logicalFamily,
+			},
+			body: JSON.stringify({
+				model: sourceModel,
+				max_tokens: 100,
+				messages: [{ role: "user", content: "Hello" }],
+			}),
+		});
+
+		const transformed = await provider.transformRequestBody(request, account);
+		const body = await transformed.json();
+		expect(body.reasoning).toEqual({ effort: "medium" });
+	});
+
+	it.each([
+		"",
+		"   ",
+	])("ignores a blank final-model carrier %j", async (finalModel) => {
+		const provider = new CodexProvider();
+		const account = {
+			model_mappings: JSON.stringify({ sonnet: "gpt-5.4" }),
+		} as Parameters<typeof provider.transformRequestBody>[1];
+		const request = new Request("https://example.com/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"x-better-ccflare-final-model": finalModel,
+			},
+			body: JSON.stringify({
+				model: "claude-sonnet-4-5",
+				max_tokens: 100,
+				messages: [{ role: "user", content: "Hello" }],
+			}),
+		});
+
+		const transformed = await provider.transformRequestBody(request, account);
+		const body = await transformed.json();
+
+		expect(body.model).toBe("gpt-5.4");
+		expect(body.reasoning).toEqual({ effort: "medium" });
+	});
+
+	it("validates explicit effort against the final physical model", async () => {
+		const provider = new CodexProvider();
+		const requestFor = (finalModel: string) =>
+			new Request("https://example.com/v1/messages", {
+				method: "POST",
+				headers: {
+					"content-type": "application/json",
+					[CODEX_LOGICAL_MODEL_FAMILY_HEADER]: "fable",
+					"x-better-ccflare-final-model": finalModel,
+				},
+				body: JSON.stringify({
+					model: "claude-fable-5",
+					max_tokens: 100,
+					output_config: { effort: "max" },
+					messages: [{ role: "user", content: "Hello" }],
+				}),
+			});
+
+		const finalSol = await provider.transformRequestBody(
+			requestFor("gpt-5.6-sol"),
+			{
+				model_mappings: JSON.stringify({ fable: "gpt-5.4-mini" }),
+			} as Parameters<typeof provider.transformRequestBody>[1],
+		);
+		expect(await finalSol.json()).toMatchObject({
+			model: "gpt-5.6-sol",
+			reasoning: { effort: "max" },
+		});
+
+		const finalMini = await provider.transformRequestBody(
+			requestFor("gpt-5.4-mini"),
+			{
+				model_mappings: JSON.stringify({ fable: "gpt-5.6-sol" }),
+			} as Parameters<typeof provider.transformRequestBody>[1],
+		);
+		expect(await finalMini.json()).toMatchObject({
+			model: "gpt-5.4-mini",
+			reasoning: { effort: "medium" },
+		});
+	});
+
+	it("strips the logical-family header from processed responses", async () => {
+		const provider = new CodexProvider();
+		const transformed = await provider.processResponse(
+			new Response(JSON.stringify({ error: { message: "bad request" } }), {
+				status: 400,
+				headers: {
+					"content-type": "application/json",
+					[CODEX_LOGICAL_MODEL_FAMILY_HEADER]: "fable",
+				},
+			}),
+			null,
+		);
+
+		expect(
+			transformed.headers.get(CODEX_LOGICAL_MODEL_FAMILY_HEADER),
+		).toBeNull();
 	});
 
 	it("rejects unsupported reasoning effort values", async () => {
@@ -5054,7 +5351,7 @@ describe("CodexProvider.transformRequestBody", () => {
 			// BUG (documented, not fixed here): the demotion diagnostics confirm
 			// this was a session that already had an elected root.
 			expect(requestTrace).toMatchObject({
-				trace_schema_version: 11,
+				trace_schema_version: 12,
 				orchestration_admission: "non_root",
 				orchestration_demotion_observed: true,
 			});
@@ -5184,7 +5481,7 @@ describe("CodexProvider.transformRequestBody", () => {
 				(record) => record.phase === "request",
 			);
 			expect(requestTrace).toMatchObject({
-				trace_schema_version: 11,
+				trace_schema_version: 12,
 				orchestration_admission: "no_session",
 				is_descendant: true,
 				tools_before_count: 3,

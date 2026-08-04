@@ -17,7 +17,7 @@ afterEach(() => {
 	delete process.env[CODEX_TRACE_HMAC_KEY_ENV];
 });
 
-describe("writeCodexTrace schema 11 cache experiments", () => {
+describe("writeCodexTrace schema 12 cache experiments", () => {
 	test("writes bounded decision fields without reconstructing their semantics", () => {
 		const dir = mkdtempSync(join(tmpdir(), "codex-trace-schema-"));
 		process.env[CODEX_TRACE_DIR_ENV] = dir;
@@ -42,7 +42,7 @@ describe("writeCodexTrace schema 11 cache experiments", () => {
 				readFileSync(join(dir, file as string), "utf8").trim(),
 			);
 			expect(record).toMatchObject({
-				trace_schema_version: 11,
+				trace_schema_version: 12,
 				request_id: "logical-1",
 				attempt_id: "attempt-1",
 				attempt_ordinal: 2,
@@ -78,7 +78,7 @@ describe("writeCodexTrace schema 11 cache experiments", () => {
 	});
 });
 
-describe("orchestration demotion diagnostics (preserved in schema 11)", () => {
+describe("orchestration demotion diagnostics (preserved in schema 12)", () => {
 	test("writes the demotion signal and elapsed time when supplied", () => {
 		const dir = mkdtempSync(join(tmpdir(), "codex-trace-schema-"));
 		process.env[CODEX_TRACE_DIR_ENV] = dir;
@@ -94,7 +94,7 @@ describe("orchestration demotion diagnostics (preserved in schema 11)", () => {
 				readFileSync(join(dir, file as string), "utf8").trim(),
 			);
 			expect(record).toMatchObject({
-				trace_schema_version: 11,
+				trace_schema_version: 12,
 				orchestration_demotion_observed: true,
 				elapsed_ms_since_root: 4_242,
 			});
@@ -113,7 +113,7 @@ describe("orchestration demotion diagnostics (preserved in schema 11)", () => {
 			const record = JSON.parse(
 				readFileSync(join(dir, file as string), "utf8").trim(),
 			);
-			expect(record.trace_schema_version).toBe(11);
+			expect(record.trace_schema_version).toBe(12);
 			expect(record.orchestration_demotion_observed).toBeNull();
 			expect(record.elapsed_ms_since_root).toBeNull();
 		} finally {

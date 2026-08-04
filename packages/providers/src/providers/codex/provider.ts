@@ -10,9 +10,17 @@ import {
 	ValidationError,
 	validateEndpointUrl,
 } from "@better-ccflare/core";
-import { sanitizeProxyHeaders } from "@better-ccflare/http-common";
+import {
+	CODEX_LOGICAL_MODEL_FAMILY_HEADER,
+	sanitizeProxyHeaders,
+} from "@better-ccflare/http-common";
 import { Logger } from "@better-ccflare/logger";
-import { resolveReasoningEffort } from "@better-ccflare/openai-formats";
+import {
+	type AnthropicReasoningEffortSource,
+	isGpt56SolModel,
+	type ReasoningEffort,
+	resolveAnthropicReasoningEffort,
+} from "@better-ccflare/openai-formats";
 import type { Account, LogicalModelCapability } from "@better-ccflare/types";
 import { BaseProvider } from "../../base";
 import {
@@ -41,6 +49,8 @@ import {
 import { normalizeCodexResponseInputUsage } from "./usage";
 
 const log = new Logger("CodexProvider");
+
+export { CODEX_LOGICAL_MODEL_FAMILY_HEADER };
 
 const INTERNAL_HEADERS = [
 	"x-better-ccflare-request-id",
@@ -410,7 +420,7 @@ interface CodexRequest {
 	input: (CodexMessage | CodexFunctionCallItem | CodexFunctionCallOutputItem)[];
 	stream: boolean;
 	store: false;
-	reasoning?: { effort: string };
+	reasoning?: { effort: ReasoningEffort };
 	instructions?: string;
 	prompt_cache_key?: string;
 	tools?: CodexTool[];
@@ -453,6 +463,8 @@ export interface CodexExplicitBreakpointDecision {
 
 interface CodexConversionResult {
 	codexBody: CodexRequest;
+	reasoningEffortRequested: ReasoningEffort | undefined;
+	reasoningEffortSource: AnthropicReasoningEffortSource;
 	cacheKeyDecision: CodexPromptCacheKeyDecision;
 	explicitBreakpointDecision: CodexExplicitBreakpointDecision;
 	orchestrationAdmission: OrchestrationAdmission;
@@ -527,6 +539,7 @@ interface AnthropicRequest {
 	stream?: boolean;
 	tools?: AnthropicTool[];
 	tool_choice?: AnthropicToolChoice;
+	output_config?: { effort?: string };
 	reasoning?: { effort?: string };
 	metadata?: { user_id?: string };
 	[key: string]: unknown;
@@ -866,6 +879,18 @@ export class CodexProvider extends BaseProvider {
 		request: Request,
 		account?: Account,
 	): Promise<Request> {
+		const trustedLogicalModelFamily = request.headers.has(
+			CODEX_LOGICAL_MODEL_FAMILY_HEADER,
+		)
+			? (request.headers.get(CODEX_LOGICAL_MODEL_FAMILY_HEADER) ?? "")
+					.trim()
+					.toLowerCase()
+			: null;
+		if (request.headers.has(CODEX_LOGICAL_MODEL_FAMILY_HEADER)) {
+			const sanitizedHeaders = new Headers(request.headers);
+			sanitizedHeaders.delete(CODEX_LOGICAL_MODEL_FAMILY_HEADER);
+			request = new Request(request, { headers: sanitizedHeaders });
+		}
 		const isSyntheticCountTokens = this.isSyntheticCountTokensRequest(
 			request.url,
 		);
@@ -884,6 +909,8 @@ export class CodexProvider extends BaseProvider {
 		try {
 			this.sweepRequestStreamById();
 			const body = (await request.json()) as AnthropicRequest;
+			const logicalModelFamily =
+				trustedLogicalModelFamily ?? getModelFamily(body.model);
 			if (isSyntheticCountTokens) {
 				return this.createSyntheticCountTokensResponse(request, body);
 			}
@@ -921,6 +948,8 @@ export class CodexProvider extends BaseProvider {
 			}
 			const {
 				codexBody,
+				reasoningEffortRequested,
+				reasoningEffortSource,
 				cacheKeyDecision,
 				explicitBreakpointDecision,
 				orchestrationAdmission,
@@ -940,6 +969,7 @@ export class CodexProvider extends BaseProvider {
 					: undefined,
 				request.url,
 				finalModel ?? undefined,
+				logicalModelFamily,
 			);
 			if (isSubscriptionEndpoint) {
 				// ChatGPT's subscription Responses endpoint rejects this API-only field.
@@ -956,6 +986,9 @@ export class CodexProvider extends BaseProvider {
 				account: account?.name,
 				modelIn: body.model,
 				modelOut: codexBody.model,
+				logicalReasoningEffortRequested: reasoningEffortRequested,
+				logicalReasoningEffortSource: reasoningEffortSource,
+				physicalReasoningEffortApplied: codexBody.reasoning?.effort,
 				messageCount: body.messages.length,
 				sessionKeyHash: this.hashSessionKey(body),
 				promptCacheKeySet: Boolean(codexBody.prompt_cache_key),
@@ -1918,8 +1951,10 @@ export class CodexProvider extends BaseProvider {
 		cacheLaneRescueSalt?: string,
 		endpoint = CODEX_DEFAULT_ENDPOINT,
 		finalModel?: string,
+		logicalModelFamily?: string | null,
 	): CodexConversionResult {
 		const model = this.mapModel(body.model, account);
+		const physicalModel = finalModel?.trim() || model;
 		if (process.env.DEBUG?.includes("model") || process.env.DEBUG === "true") {
 			log.info(
 				`[codex:model-debug] request_id=${requestId ?? "unknown"} request_model=${body.model} mapped_model=${model} account=${account?.name ?? "unknown"}`,
@@ -2037,9 +2072,9 @@ export class CodexProvider extends BaseProvider {
 			}));
 		}
 
-		const reasoningResolution = resolveReasoningEffort(body.reasoning?.effort, {
+		const reasoningResolution = resolveAnthropicReasoningEffort(body, {
 			sourceModel: body.model,
-			targetModel: model,
+			targetModel: physicalModel,
 		});
 		if (reasoningResolution.downgrades.length > 0) {
 			for (const downgrade of reasoningResolution.downgrades) {
@@ -2051,12 +2086,18 @@ export class CodexProvider extends BaseProvider {
 
 		// Codex always requires streaming upstream; non-streaming clients are handled
 		// on the response side via transformSseResponseToJson.
+		const defaultReasoningEffort =
+			logicalModelFamily === "fable" && isGpt56SolModel(physicalModel)
+				? "xhigh"
+				: "medium";
 		const codexRequest: CodexRequest = {
-			model: finalModel || model,
+			model: physicalModel,
 			input,
 			stream: true,
 			store: false,
-			reasoning: { effort: reasoningResolution.effort ?? "medium" },
+			reasoning: {
+				effort: reasoningResolution.effort ?? defaultReasoningEffort,
+			},
 		};
 
 		codexRequest.instructions = finalInstructions;
@@ -2120,6 +2161,8 @@ export class CodexProvider extends BaseProvider {
 
 		return {
 			codexBody: codexRequest,
+			reasoningEffortRequested: reasoningResolution.requestedEffort,
+			reasoningEffortSource: reasoningResolution.source,
 			cacheKeyDecision,
 			explicitBreakpointDecision,
 			orchestrationAdmission,

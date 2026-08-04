@@ -122,6 +122,54 @@ describe("convertAnthropicRequestToOpenAI — basic fields", () => {
 		expect(result.stream).toBe(false);
 		expect(result.stream_options).toBeUndefined();
 	});
+
+	it("maps Claude Code output_config effort without forwarding the Anthropic field", () => {
+		const result = convertAnthropicRequestToOpenAI(
+			anthropicRequest({
+				model: "gpt-5.6-sol",
+				output_config: { effort: "max" },
+			}),
+		);
+
+		expect(result.reasoning).toEqual({ effort: "max" });
+		expect(result).not.toHaveProperty("output_config");
+	});
+
+	it("keeps legacy reasoning effort compatibility", () => {
+		const result = convertAnthropicRequestToOpenAI(
+			anthropicRequest({
+				model: "gpt-5.6-sol",
+				reasoning: { effort: "xhigh" },
+			}),
+		);
+
+		expect(result.reasoning).toEqual({ effort: "xhigh" });
+	});
+
+	it("rejects conflicting official and legacy effort fields", () => {
+		expect(() =>
+			convertAnthropicRequestToOpenAI(
+				anthropicRequest({
+					model: "gpt-5.6-sol",
+					output_config: { effort: "max" },
+					reasoning: { effort: "xhigh" },
+				}),
+			),
+		).toThrow("output_config.effort conflicts with reasoning.effort");
+	});
+
+	it("rejects an invalid official effort instead of treating it as omitted", () => {
+		expect(() =>
+			convertAnthropicRequestToOpenAI(
+				anthropicRequest({
+					model: "gpt-5.6-sol",
+					output_config: { effort: null },
+				} as unknown as Partial<AnthropicRequest>),
+			),
+		).toThrow(
+			"output_config.effort must be one of: minimal, low, medium, high, xhigh, max",
+		);
+	});
 });
 
 describe("convertAnthropicRequestToOpenAI — system message", () => {

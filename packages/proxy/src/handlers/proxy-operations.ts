@@ -8,7 +8,10 @@ import {
 	ProviderError,
 	TIME_CONSTANTS,
 } from "@better-ccflare/core";
-import { withSanitizedProxyHeaders } from "@better-ccflare/http-common";
+import {
+	CODEX_LOGICAL_MODEL_FAMILY_HEADER,
+	withSanitizedProxyHeaders,
+} from "@better-ccflare/http-common";
 import { Logger } from "@better-ccflare/logger";
 import { stripCacheControlFromOpenAIRequest } from "@better-ccflare/openai-formats";
 import {
@@ -235,6 +238,7 @@ const INTERNAL_TRANSPORT_HEADERS = [
 	"x-better-ccflare-pacing-action",
 	"x-better-ccflare-request-stream",
 	"x-better-ccflare-attributed-agent",
+	CODEX_LOGICAL_MODEL_FAMILY_HEADER,
 	CACHE_REPLAY_MODEL_HEADER,
 ] as const;
 const ANTHROPIC_BILLING_HEADER = "x-anthropic-billing-header";
@@ -2046,8 +2050,10 @@ export async function proxyWithAccount(
 			provider.cacheReplayModelStrategy === "transformed-body"
 				? req.headers.get(CACHE_REPLAY_MODEL_HEADER)
 				: null;
+		const clientHeadersForProvider = new Headers(req.headers);
+		clientHeadersForProvider.delete(CODEX_LOGICAL_MODEL_FAMILY_HEADER);
 		const headers = provider.prepareHeaders(
-			req.headers,
+			clientHeadersForProvider,
 			accessToken,
 			account.api_key || undefined,
 		);
@@ -2092,6 +2098,14 @@ export async function proxyWithAccount(
 			}
 		};
 		if (provider.name === "codex") {
+			const logicalModel =
+				requestMeta.appliedModel ?? requestMeta.originalModel;
+			const logicalModelFamily = logicalModel
+				? getModelFamily(logicalModel)
+				: null;
+			if (logicalModelFamily) {
+				headers.set(CODEX_LOGICAL_MODEL_FAMILY_HEADER, logicalModelFamily);
+			}
 			const isAttributedAgent =
 				Boolean(requestMeta.agentUsed) ||
 				isBillingAttributedSubagent(req.headers);
