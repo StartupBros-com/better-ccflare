@@ -1,5 +1,9 @@
 import type { AllowedModel } from "./agent";
-import type { ServerToolRequirements } from "./provider-capabilities";
+import type {
+	ServerToolCapabilityDecision,
+	ServerToolReplayAtom,
+	ServerToolRequirements,
+} from "./provider-capabilities";
 import type {
 	AgentAttributionSource,
 	ProjectAttributionSource,
@@ -29,6 +33,46 @@ export interface RoutingCandidateMetadata {
 	modelOverride: string | null;
 	/** Model-lane pressure for this exact candidate, when safely comparable. */
 	quotaPressure: AccountQuotaPressure | null;
+	/**
+	 * Exact server-tool admission result for this candidate and physical model.
+	 * Absent for ordinary requests so legacy routing sidecars remain unchanged.
+	 */
+	serverToolCapability?: RoutingCandidateServerToolCapability;
+}
+
+export type RoutingCandidateServerToolCapabilityReason =
+	| Extract<ServerToolCapabilityDecision, { decision: "unknown" }>["reason"]
+	| "provider_unavailable"
+	| "physical_model_unavailable"
+	| "tuple_unavailable"
+	| "resolver_unavailable"
+	| "invalid_resolver_result";
+
+/** Compact proof binding retained on the routing candidate sidecar. */
+export interface RoutingCandidateServerToolCapability {
+	readonly resolvedProvider: string | null;
+	readonly physicalModel: string | null;
+	readonly decision: "proven" | "unsupported" | "unknown";
+	readonly reason: RoutingCandidateServerToolCapabilityReason | null;
+	readonly proofKey: string | null;
+	readonly inputReplayMode: readonly ServerToolReplayAtom[];
+	readonly outputReplayMode: readonly ServerToolReplayAtom[];
+	readonly replayRuntimeStatus:
+		| "not_required"
+		| "ready"
+		| "input_unavailable"
+		| "output_unavailable";
+}
+
+/** Aggregate request-local admission evidence without account-wide semantics. */
+export interface ServerToolRoutingCapabilitySummary {
+	readonly structuralCandidateCount: number;
+	readonly provenCandidateCount: number;
+	readonly unsupportedCandidateCount: number;
+	readonly unknownCandidateCount: number;
+	readonly replayIneligibleCandidateCount: number;
+	readonly temporarilyUnavailableProvenCandidateCount: number;
+	readonly eligibleCandidateCount: number;
 }
 
 /**
@@ -94,6 +138,13 @@ export interface RequestMeta {
 	trustedInternalAutoRefresh?: boolean;
 	/** Frozen content-minimal server-tool constraints derived from the final request body. */
 	serverToolRequirements?: ServerToolRequirements;
+	/**
+	 * Request-local endpoint fact used by capability selection. Raw query text is
+	 * intentionally never copied into routing metadata.
+	 */
+	serverToolQueryPresent?: boolean;
+	/** Aggregate capability/admission evidence for the structural candidate pool. */
+	serverToolCapabilitySummary?: ServerToolRoutingCapabilitySummary;
 	/** Active combo name (set when combo routing is used) */
 	comboName?: string | null;
 	/** Combo slot index being attempted (set per-iteration in proxy loop) */

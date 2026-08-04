@@ -1,10 +1,15 @@
 import { afterEach, describe, expect, it, mock } from "bun:test";
+import type { Provider } from "@better-ccflare/providers";
 import type {
 	Account,
 	ComboFamily,
 	ComboRoutingPolicySnapshot,
 	ComboWithSlots,
 	RequestMeta,
+	ServerToolCapabilityDecision,
+	ServerToolCapabilityProof,
+	ServerToolCapabilityTuple,
+	ServerToolRequirements,
 } from "@better-ccflare/types";
 import type {
 	AnthropicDegradedCohortKey,
@@ -23,7 +28,9 @@ mock.module("@better-ccflare/database", () => ({
 	ModelTranslationRepository: class ModelTranslationRepository {},
 }));
 
-const { usageCache } = await import("@better-ccflare/providers");
+const { getProvider, registerProvider, usageCache } = await import(
+	"@better-ccflare/providers"
+);
 const {
 	ForceRouteUnavailableError,
 	getComboSlotInfo,
@@ -67,6 +74,7 @@ function makeAccount(overrides: Partial<Account> = {}): Account {
 		custom_endpoint: null,
 		model_mappings: null,
 		cross_region_mode: null,
+		billing_type: null,
 		model_fallbacks: null,
 		...overrides,
 	};
@@ -140,6 +148,116 @@ function makeCtx(
 		refreshInFlight: new Map(),
 		asyncWriter: { enqueue: mock(() => {}) },
 	} as unknown as ProxyContext;
+}
+
+const SERVER_TOOL_REQUIREMENTS: ServerToolRequirements = Object.freeze({
+	revision: 1,
+	profileId: "web-search:test-profile",
+	declarations: Object.freeze([
+		Object.freeze({ type: "web_search_20250305" as const, maxUses: 1 }),
+	]),
+	replay: Object.freeze({
+		input: Object.freeze([]),
+		output: Object.freeze([]),
+		requiresOutputReplay: true,
+	}),
+});
+
+type CapabilityProviderContext = Parameters<
+	NonNullable<Provider["createServerToolCapabilityTuple"]>
+>[0];
+
+function proofFor(
+	tuple: ServerToolCapabilityTuple,
+	decision: "proven" | "unsupported",
+): ServerToolCapabilityProof {
+	return Object.freeze({
+		revision: `proof:${tuple.candidateId}:${tuple.model}:${decision}`,
+		tuple,
+		decision,
+		provenance: "account-selector-test-fixture",
+		owner: "account-selector-test",
+		verifiedAt: "2026-08-01T00:00:00.000Z",
+		revalidateAfter: "2099-01-01T00:00:00.000Z",
+		fixtureRevision: "fixture-v1",
+		contractRevision: "contract-v1",
+		revalidationTriggers: Object.freeze([
+			"tuple_change" as const,
+			"contract_change" as const,
+			"decoder_change" as const,
+			"observed_behavior_change" as const,
+		]),
+	});
+}
+
+function installCapabilityProvider(input: {
+	name: string;
+	decision: (
+		context: CapabilityProviderContext,
+		tuple: ServerToolCapabilityTuple,
+	) => ServerToolCapabilityDecision;
+	onTuple?: (context: CapabilityProviderContext) => void;
+}): Provider | undefined {
+	const previous = getProvider(input.name);
+	const provider = {
+		name: input.name,
+		getLogicalModelCapability: () => ({
+			status: "supported" as const,
+			provenance: "native_passthrough" as const,
+			reason: "included" as const,
+		}),
+		createServerToolCapabilityTuple(context: CapabilityProviderContext) {
+			input.onTuple?.(context);
+			const tuple = {
+				candidateId: context.candidateId,
+				provider: input.name,
+				authMode: "test-auth",
+				endpointClass: "test-endpoint",
+				model: context.physicalModel,
+				toolType: context.requirements.declarations?.[0]?.type ?? "unknown",
+				profile: context.requirements.profileId ?? "unknown",
+				inputReplay: context.requirements.replay.input,
+				outputReplay: context.physicalModel.includes("proxy-replay")
+					? ["proxy-evidence-v1" as const]
+					: ["native-Anthropic" as const],
+				providerContractRevision: "provider-contract-v1",
+				replayDecoderRevision: "decoder-v1",
+				requestTransport: "test-request-v1",
+				responseTransport: "test-response-v1",
+			};
+			return tuple;
+		},
+		resolveServerToolCapability(
+			_requirement: ServerToolRequirements,
+			tuple: ServerToolCapabilityTuple,
+		) {
+			const context = {
+				candidateId: tuple.candidateId,
+				account: {} as CapabilityProviderContext["account"],
+				path: "/v1/messages",
+				query: "",
+				physicalModel: tuple.model,
+				requirements: SERVER_TOOL_REQUIREMENTS,
+			};
+			return input.decision(context, tuple);
+		},
+	} as unknown as Provider;
+	registerProvider(provider);
+	return previous;
+}
+
+function provenDecision(
+	_context: CapabilityProviderContext,
+	tuple: ServerToolCapabilityTuple,
+): ServerToolCapabilityDecision {
+	return { decision: "proven", proof: proofFor(tuple, "proven") };
+}
+
+function serverToolMeta(overrides: Partial<RequestMeta> = {}): RequestMeta {
+	return makeRequestMeta({
+		serverToolRequirements: SERVER_TOOL_REQUIREMENTS,
+		...overrides,
+	});
 }
 
 const cachedUsageAccountIds = new Set<string>();
@@ -2833,5 +2951,664 @@ describe("selectAccountsForRequest — atomic combo capacity", () => {
 			expiringFable.id,
 			expiringOpus.id,
 		]);
+	});
+});
+
+describe("selectAccountsForRequest — server-tool capability-first routing", () => {
+	it("does not allocate capability metadata or call capability hooks for ordinary requests", async () => {
+		const providerName = "u4-ordinary-provider";
+		const onTuple = mock((_context: CapabilityProviderContext) => {});
+		installCapabilityProvider({
+			name: providerName,
+			decision: provenDecision,
+			onTuple,
+		});
+		const account = makeAccount({ id: "ordinary", provider: providerName });
+		const ctx = makeCtx({ accounts: [account] });
+		const meta = makeRequestMeta();
+
+		const result = await selectAccountsForRequest(meta, ctx, "claude-opus-4-8");
+
+		expect(result).toEqual([account]);
+		expect(onTuple).not.toHaveBeenCalled();
+		expect(meta.serverToolCapabilitySummary).toBeUndefined();
+		expect(meta.routingCandidateCatalog).toEqual([
+			{
+				candidateId: "account:ordinary",
+				accountId: "ordinary",
+				tier: 0,
+				ordinal: 0,
+				comboSlotId: null,
+				modelOverride: "claude-opus-4-8",
+				quotaPressure: null,
+			},
+		]);
+		expect(
+			Object.hasOwn(
+				meta.routingCandidateCatalog?.[0] ?? {},
+				"serverToolCapability",
+			),
+		).toBe(false);
+	});
+
+	it("removes request-excluded providers before capability evaluation and terminal classification", async () => {
+		const excludedProvider = "u4-request-excluded-proven";
+		const excludedTuple = mock((_context: CapabilityProviderContext) => {});
+		installCapabilityProvider({
+			name: excludedProvider,
+			decision: provenDecision,
+			onTuple: excludedTuple,
+		});
+		const includedProvider = "u4-request-included-unknown";
+		const includedTuple = mock((_context: CapabilityProviderContext) => {});
+		installCapabilityProvider({
+			name: includedProvider,
+			decision: () => ({ decision: "unknown", reason: "no_exact_proof" }),
+			onTuple: includedTuple,
+		});
+		const excluded = makeAccount({
+			id: "excluded-proven",
+			provider: excludedProvider,
+			model_mappings: JSON.stringify({ opus: "physical-excluded" }),
+		});
+		const included = makeAccount({
+			id: "included-unknown",
+			provider: includedProvider,
+			model_mappings: JSON.stringify({ opus: "physical-included" }),
+		});
+		const ctx = makeCtx({ accounts: [excluded, included] });
+		const meta = serverToolMeta({
+			headers: new Headers({
+				"x-better-ccflare-exclude-providers": excludedProvider,
+			}),
+		});
+
+		try {
+			await selectAccountsForRequest(meta, ctx, "claude-opus-4-8");
+			expect.unreachable("expected local no-implementation terminal");
+		} catch (error) {
+			expect(error).toMatchObject({
+				name: "ServerToolRoutingError",
+				reason: "no_implementation",
+			});
+		}
+		expect(excludedTuple).not.toHaveBeenCalled();
+		expect(includedTuple).toHaveBeenCalledTimes(1);
+		expect(ctx.strategy.select).not.toHaveBeenCalled();
+		expect(
+			meta.routingCandidateCatalog?.map(({ accountId }) => accountId),
+		).toEqual([included.id]);
+		expect(meta.serverToolCapabilitySummary).toEqual({
+			structuralCandidateCount: 1,
+			provenCandidateCount: 0,
+			unsupportedCandidateCount: 0,
+			unknownCandidateCount: 1,
+			replayIneligibleCandidateCount: 0,
+			temporarilyUnavailableProvenCandidateCount: 0,
+			eligibleCandidateCount: 0,
+		});
+	});
+
+	it("filters higher-priority and sticky incapable candidates before strategy ordering", async () => {
+		const providerName = "u4-normal-provider";
+		installCapabilityProvider({
+			name: providerName,
+			decision: (_context, tuple) =>
+				tuple.candidateId.includes("incapable")
+					? {
+							decision: "unsupported",
+							proof: proofFor(tuple, "unsupported"),
+						}
+					: provenDecision(_context, tuple),
+		});
+		const incapable = makeAccount({
+			id: "incapable",
+			provider: providerName,
+			priority: 0,
+			model_mappings: JSON.stringify({ opus: "physical-incapable" }),
+		});
+		const capable = makeAccount({
+			id: "capable",
+			provider: providerName,
+			priority: 1,
+			model_mappings: JSON.stringify({ opus: "physical-capable" }),
+		});
+		const ctx = makeCtx({ accounts: [incapable, capable] });
+		ctx.strategy.select = mock((accounts: Account[], meta: RequestMeta) => {
+			expect(accounts).toEqual([capable]);
+			expect(
+				meta.routingCandidates?.map(({ candidateId }) => candidateId),
+			).toEqual(["account:capable"]);
+			return accounts;
+		});
+		const meta = serverToolMeta({
+			affinityOwnerSnapshot: {
+				candidateId: "account:incapable",
+				accountId: incapable.id,
+			},
+		});
+
+		const result = await selectAccountsForRequest(meta, ctx, "claude-opus-4-8");
+
+		expect(result).toEqual([capable]);
+		expect(meta.hardExcludedAccountIds).toBeNull();
+		expect(
+			meta.routingCandidateCatalog?.map((candidate) => ({
+				candidateId: candidate.candidateId,
+				decision: candidate.serverToolCapability?.decision,
+				physicalModel: candidate.serverToolCapability?.physicalModel,
+			})),
+		).toEqual([
+			{
+				candidateId: "account:incapable",
+				decision: "unsupported",
+				physicalModel: "physical-incapable",
+			},
+			{
+				candidateId: "account:capable",
+				decision: "proven",
+				physicalModel: "physical-capable",
+			},
+		]);
+		expect(meta.serverToolCapabilitySummary).toEqual({
+			structuralCandidateCount: 2,
+			provenCandidateCount: 1,
+			unsupportedCandidateCount: 1,
+			unknownCandidateCount: 0,
+			replayIneligibleCandidateCount: 0,
+			temporarilyUnavailableProvenCandidateCount: 0,
+			eligibleCandidateCount: 1,
+		});
+		const proof = meta.routingCandidates?.[0]?.serverToolCapability;
+		expect(proof?.proofKey).toBeString();
+		expect(proof?.inputReplayMode).toEqual([]);
+		expect(proof?.outputReplayMode).toEqual(["native-Anthropic"]);
+		expect(Object.isFrozen(proof)).toBe(true);
+		expect(Object.isFrozen(proof?.outputReplayMode)).toBe(true);
+	});
+
+	it("fails malformed, mismatched, thenable, and throwing resolver results closed", async () => {
+		const badCases = [
+			"proof-decision-mismatch",
+			"proof-tuple-mismatch",
+			"thenable",
+			"throwing",
+		] as const;
+		const accounts = badCases.map((kind, priority) => {
+			const providerName = `u4-invalid-resolver-${kind}`;
+			installCapabilityProvider({
+				name: providerName,
+				decision: (_context, tuple) => {
+					if (kind === "throwing") throw new Error("resolver failed");
+					if (kind === "proof-decision-mismatch") {
+						return {
+							decision: "proven",
+							proof: proofFor(tuple, "unsupported"),
+						};
+					}
+					if (kind === "proof-tuple-mismatch") {
+						return {
+							decision: "proven",
+							proof: proofFor(
+								{ ...tuple, model: `${tuple.model}-different` },
+								"proven",
+							),
+						};
+					}
+					return provenDecision(_context, tuple);
+				},
+			});
+			if (kind === "thenable") {
+				const provider = getProvider(providerName);
+				if (provider) {
+					provider.resolveServerToolCapability = (() =>
+						Promise.resolve({
+							decision: "unknown",
+							reason: "no_exact_proof",
+						})) as unknown as NonNullable<
+						Provider["resolveServerToolCapability"]
+					>;
+				}
+			}
+			return makeAccount({
+				id: `invalid-${kind}`,
+				provider: providerName,
+				priority,
+				model_mappings: JSON.stringify({ opus: `physical-${kind}` }),
+			});
+		});
+		const capableProvider = "u4-valid-resolver";
+		installCapabilityProvider({
+			name: capableProvider,
+			decision: provenDecision,
+		});
+		const capable = makeAccount({
+			id: "valid-resolver",
+			provider: capableProvider,
+			priority: 99,
+			model_mappings: JSON.stringify({ opus: "physical-valid" }),
+		});
+		const ctx = makeCtx({ accounts: [...accounts, capable] });
+		ctx.strategy.select = mock((strategyAccounts: Account[]) => {
+			expect(strategyAccounts).toEqual([capable]);
+			return strategyAccounts;
+		});
+		const meta = serverToolMeta();
+
+		const result = await selectAccountsForRequest(meta, ctx, "claude-opus-4-8");
+
+		expect(result).toEqual([capable]);
+		expect(
+			meta.routingCandidateCatalog
+				?.slice(0, badCases.length)
+				.map((candidate) => candidate.serverToolCapability),
+		).toEqual(
+			badCases.map(() =>
+				expect.objectContaining({
+					decision: "unknown",
+					reason: "invalid_resolver_result",
+					proofKey: null,
+				}),
+			),
+		);
+		expect(meta.serverToolCapabilitySummary).toMatchObject({
+			structuralCandidateCount: 5,
+			unknownCandidateCount: 4,
+			provenCandidateCount: 1,
+			eligibleCandidateCount: 1,
+		});
+	});
+
+	it("keeps duplicate combo slots and exact physical-model proofs aligned after filtering", async () => {
+		const providerName = "u4-combo-provider";
+		const tupleContexts: CapabilityProviderContext[] = [];
+		installCapabilityProvider({
+			name: providerName,
+			onTuple: (context) => tupleContexts.push(context),
+			decision: (_context, tuple) =>
+				tuple.model === "physical-blocked"
+					? {
+							decision: "unsupported",
+							proof: proofFor(tuple, "unsupported"),
+						}
+					: provenDecision(_context, tuple),
+		});
+		const duplicate = makeAccount({
+			id: "duplicate-account",
+			provider: providerName,
+			model_mappings: JSON.stringify({
+				"claude-opus-4-8": "physical-blocked",
+				"claude-opus-4-5": "physical-allowed",
+			}),
+		});
+		const other = makeAccount({
+			id: "other-account",
+			provider: providerName,
+			model_mappings: JSON.stringify({
+				"claude-opus-4-1": "physical-other",
+			}),
+		});
+		const combo = makeCombo([
+			{
+				id: "slot-duplicate-blocked",
+				combo_id: "combo-1",
+				account_id: duplicate.id,
+				model: "claude-opus-4-8",
+				priority: 0,
+				enabled: true,
+			},
+			{
+				id: "slot-duplicate-allowed",
+				combo_id: "combo-1",
+				account_id: duplicate.id,
+				model: "claude-opus-4-5",
+				priority: 1,
+				enabled: true,
+			},
+			{
+				id: "slot-other",
+				combo_id: "combo-1",
+				account_id: other.id,
+				model: "claude-opus-4-1",
+				priority: 2,
+				enabled: true,
+			},
+		]);
+		const ctx = makeCtx({ accounts: [duplicate, other], activeCombo: combo });
+		ctx.strategy.select = mock((accounts: Account[], meta: RequestMeta) => {
+			expect(accounts.map(({ id }) => id)).toEqual([duplicate.id, other.id]);
+			expect(
+				meta.routingCandidates?.map(({ comboSlotId }) => comboSlotId),
+			).toEqual(["slot-duplicate-allowed", "slot-other"]);
+			meta.routingCandidates = [...(meta.routingCandidates ?? [])].reverse();
+			return [...accounts].reverse();
+		});
+		const meta = serverToolMeta();
+
+		const result = await selectAccountsForRequest(meta, ctx, "claude-opus-4-8");
+
+		expect(result.map(({ id }) => id)).toEqual([other.id, duplicate.id]);
+		expect(meta.hardExcludedAccountIds).toBeNull();
+		expect(
+			meta.routingCandidateCatalog?.map(({ comboSlotId }) => comboSlotId),
+		).toEqual([
+			"slot-duplicate-blocked",
+			"slot-duplicate-allowed",
+			"slot-other",
+		]);
+		expect(
+			meta.routingCandidates?.map(({ comboSlotId }) => comboSlotId),
+		).toEqual(["slot-other", "slot-duplicate-allowed"]);
+		expect(getComboSlotInfo(meta)?.slots).toEqual([
+			{ accountId: other.id, modelOverride: "claude-opus-4-1" },
+			{ accountId: duplicate.id, modelOverride: "claude-opus-4-5" },
+		]);
+		expect(
+			tupleContexts.map(({ candidateId, physicalModel }) => ({
+				candidateId,
+				physicalModel,
+			})),
+		).toEqual([
+			{
+				candidateId: "combo:combo-1:slot:slot-duplicate-blocked",
+				physicalModel: "physical-blocked",
+			},
+			{
+				candidateId: "combo:combo-1:slot:slot-duplicate-allowed",
+				physicalModel: "physical-allowed",
+			},
+			{
+				candidateId: "combo:combo-1:slot:slot-other",
+				physicalModel: "physical-other",
+			},
+		]);
+		expect(meta.serverToolCapabilitySummary).toMatchObject({
+			structuralCandidateCount: 3,
+			provenCandidateCount: 2,
+			unsupportedCandidateCount: 1,
+			eligibleCandidateCount: 2,
+		});
+	});
+
+	it("continues from a capability-empty combo into the allowed normal structural pool", async () => {
+		const providerName = "u4-combo-session-fallback";
+		installCapabilityProvider({
+			name: providerName,
+			decision: (_context, tuple) =>
+				tuple.candidateId.includes("combo-incapable")
+					? {
+							decision: "unsupported",
+							proof: proofFor(tuple, "unsupported"),
+						}
+					: provenDecision(_context, tuple),
+		});
+		const comboIncappable = makeAccount({
+			id: "combo-incapable",
+			provider: providerName,
+			model_mappings: JSON.stringify({ opus: "physical-combo-incapable" }),
+		});
+		const normalCapable = makeAccount({
+			id: "normal-capable",
+			provider: providerName,
+			model_mappings: JSON.stringify({ opus: "physical-normal-capable" }),
+		});
+		const combo = makeCombo([
+			{
+				id: "combo-incapable",
+				combo_id: "combo-1",
+				account_id: comboIncappable.id,
+				model: "claude-opus-4-8",
+				priority: 0,
+				enabled: true,
+			},
+		]);
+		const ctx = makeCtx({
+			accounts: [comboIncappable, normalCapable],
+			activeCombo: combo,
+		});
+		ctx.strategy.select = mock((accounts: Account[]) => {
+			expect(accounts).toEqual([normalCapable]);
+			return accounts;
+		});
+		const meta = serverToolMeta();
+
+		const result = await selectAccountsForRequest(meta, ctx, "claude-opus-4-8");
+
+		expect(result).toEqual([normalCapable]);
+		expect(
+			meta.routingCandidateCatalog?.map(({ candidateId }) => candidateId),
+		).toEqual([
+			"combo:combo-1:slot:combo-incapable",
+			"account:combo-incapable",
+			"account:normal-capable",
+		]);
+		expect(
+			meta.routingCandidates?.map(({ candidateId }) => candidateId),
+		).toEqual(["account:normal-capable"]);
+		expect(meta.serverToolCapabilitySummary).toMatchObject({
+			structuralCandidateCount: 3,
+			unsupportedCandidateCount: 2,
+			provenCandidateCount: 1,
+			eligibleCandidateCount: 1,
+		});
+	});
+
+	it("fails capability-empty combo selection locally when session fallback is disabled", async () => {
+		process.env.CCFLARE_DISABLE_COMBO_SESSION_FALLBACK = "1";
+		const providerName = "u4-combo-no-session-fallback";
+		installCapabilityProvider({
+			name: providerName,
+			decision: (_context, tuple) => ({
+				decision: "unsupported",
+				proof: proofFor(tuple, "unsupported"),
+			}),
+		});
+		const incapable = makeAccount({
+			id: "combo-only-incapable",
+			provider: providerName,
+			model_mappings: JSON.stringify({ opus: "physical-incapable" }),
+		});
+		const combo = makeCombo([
+			{
+				id: "combo-only-incapable",
+				combo_id: "combo-1",
+				account_id: incapable.id,
+				model: "claude-opus-4-8",
+				priority: 0,
+				enabled: true,
+			},
+		]);
+		const ctx = makeCtx({ accounts: [incapable], activeCombo: combo });
+		const meta = serverToolMeta();
+
+		try {
+			await selectAccountsForRequest(meta, ctx, "claude-opus-4-8");
+			expect.unreachable("expected capability-specific combo failure");
+		} catch (error) {
+			expect(error).toMatchObject({
+				name: "ServerToolRoutingError",
+				reason: "no_implementation",
+			});
+		}
+		expect(ctx.strategy.select).not.toHaveBeenCalled();
+		expect(meta.serverToolCapabilitySummary).toMatchObject({
+			structuralCandidateCount: 1,
+			unsupportedCandidateCount: 1,
+			eligibleCandidateCount: 0,
+		});
+	});
+
+	for (const forcedCase of [
+		{ kind: "unsupported", expectedDecision: "unsupported" },
+		{ kind: "unknown", expectedDecision: "unknown" },
+		{ kind: "proxy-replay", expectedDecision: "proven" },
+	] as const) {
+		it(`fails a forced ${forcedCase.kind} tuple closed without semantic hard exclusion`, async () => {
+			const providerName = `u4-force-${forcedCase.kind}`;
+			installCapabilityProvider({
+				name: providerName,
+				decision: (_context, tuple) => {
+					if (forcedCase.kind === "unknown") {
+						return { decision: "unknown", reason: "no_exact_proof" };
+					}
+					if (forcedCase.kind === "unsupported") {
+						return {
+							decision: "unsupported",
+							proof: proofFor(tuple, "unsupported"),
+						};
+					}
+					return provenDecision(_context, tuple);
+				},
+			});
+			const forced = makeAccount({
+				id: `forced-${forcedCase.kind}`,
+				provider: providerName,
+				model_mappings: JSON.stringify({
+					opus:
+						forcedCase.kind === "proxy-replay"
+							? "physical-proxy-replay"
+							: `physical-${forcedCase.kind}`,
+				}),
+			});
+			const substitute = makeAccount({ id: "force-substitute" });
+			const ctx = makeCtx({ accounts: [forced, substitute] });
+			ctx.serverToolReplay = {
+				status: "disabled",
+			} as ProxyContext["serverToolReplay"];
+			const meta = serverToolMeta({
+				headers: new Headers({
+					"x-better-ccflare-account-id": forced.id,
+				}),
+			});
+
+			try {
+				await selectAccountsForRequest(meta, ctx, "claude-opus-4-8");
+				expect.unreachable("expected forced capability failure");
+			} catch (error) {
+				expect(error).toMatchObject({
+					name: "ServerToolRoutingError",
+					reason: "forced_incapable",
+					accountId: forced.id,
+				});
+			}
+			expect(meta.hardExcludedAccountIds).toBeNull();
+			expect(
+				meta.routingCandidateCatalog?.[0]?.serverToolCapability,
+			).toMatchObject({
+				decision: forcedCase.expectedDecision,
+			});
+			if (forcedCase.kind === "proxy-replay") {
+				expect(
+					meta.routingCandidateCatalog?.[0]?.serverToolCapability
+						?.replayRuntimeStatus,
+				).toBe("output_unavailable");
+			}
+		});
+	}
+
+	it("does not let an incapable degraded owner re-enter the eligible pool", async () => {
+		const previous = installCapabilityProvider({
+			name: "anthropic",
+			decision: (_context, tuple) =>
+				tuple.candidateId === "account:degraded-owner"
+					? {
+							decision: "unsupported",
+							proof: proofFor(tuple, "unsupported"),
+						}
+					: provenDecision(_context, tuple),
+		});
+		try {
+			const owner = makeAccount({
+				id: "degraded-owner",
+				priority: 0,
+				model_mappings: JSON.stringify({ opus: "physical-owner" }),
+			});
+			const fallback = makeAccount({
+				id: "degraded-fallback",
+				priority: 1,
+				model_mappings: JSON.stringify({ opus: "physical-fallback" }),
+			});
+			const ownerSnapshot = {
+				candidateId: "account:degraded-owner",
+				accountId: owner.id,
+			};
+			const ctx = makeCtx({ accounts: [owner, fallback] });
+			ctx.strategy = {
+				select: mock((accounts: Account[]) => accounts),
+				snapshotAffinityOwner: mock(() => ownerSnapshot),
+			} as unknown as ProxyContext["strategy"];
+			ctx.degradedOwnerOverlay = new DegradedOwnerOverlay();
+			ctx.degradedOwnerShadowOverlay = new DegradedOwnerOverlay();
+			ctx.anthropicDegradedMode = {
+				config: { mode: "enforce" },
+			} as ProxyContext["anthropicDegradedMode"];
+			const meta = serverToolMeta({ clientSessionId: "degraded-capability" });
+			const inspection: AnthropicDegradedRouteInspection = {
+				cohortKey: "capability-cohort" as AnthropicDegradedCohortKey,
+				state: "open",
+				detail: { state: "open", nextProbeAt: 0 },
+			};
+
+			const result = await selectAccountsForRequest(
+				meta,
+				ctx,
+				"claude-opus-4-8",
+				{
+					degradedOwner: { inspection, requestKind: "large" },
+				},
+			);
+
+			expect(result).toEqual([fallback]);
+			expect(meta.routingCandidates?.map(({ accountId }) => accountId)).toEqual(
+				[fallback.id],
+			);
+			expect(meta.affinityOwnerDirective).toBeNull();
+			expect(meta.hardExcludedAccountIds).toBeNull();
+		} finally {
+			if (previous) registerProvider(previous);
+		}
+	});
+
+	it("distinguishes a proven but temporarily unavailable candidate from no implementation", async () => {
+		const providerName = "u4-temporary-provider";
+		installCapabilityProvider({
+			name: providerName,
+			decision: provenDecision,
+		});
+		const paused = makeAccount({
+			id: "temporarily-unavailable",
+			provider: providerName,
+			paused: true,
+			model_mappings: JSON.stringify({ opus: "physical-temporary" }),
+		});
+		const ctx = makeCtx({ accounts: [paused] });
+		const meta = serverToolMeta();
+
+		try {
+			await selectAccountsForRequest(meta, ctx, "claude-opus-4-8");
+			expect.unreachable("expected temporary capability pool failure");
+		} catch (error) {
+			expect(error).toMatchObject({
+				name: "ServerToolRoutingError",
+				reason: "temporary_unavailable",
+			});
+		}
+		expect(meta.serverToolCapabilitySummary).toEqual({
+			structuralCandidateCount: 1,
+			provenCandidateCount: 1,
+			unsupportedCandidateCount: 0,
+			unknownCandidateCount: 0,
+			replayIneligibleCandidateCount: 0,
+			temporarilyUnavailableProvenCandidateCount: 1,
+			eligibleCandidateCount: 0,
+		});
+		expect(
+			meta.routingCandidateCatalog?.[0]?.serverToolCapability,
+		).toMatchObject({
+			decision: "proven",
+			proofKey: expect.any(String),
+		});
+		expect(meta.routingCandidates).toEqual([]);
+		expect(meta.hardExcludedAccountIds).toBeNull();
 	});
 });
