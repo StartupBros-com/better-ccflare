@@ -16,8 +16,10 @@ import {
 } from "@better-ccflare/http-common";
 import { Logger } from "@better-ccflare/logger";
 import {
+	type AnthropicReasoningEffortSource,
 	isGpt56SolModel,
-	resolveReasoningEffort,
+	type ReasoningEffort,
+	resolveAnthropicReasoningEffort,
 } from "@better-ccflare/openai-formats";
 import type { Account, LogicalModelCapability } from "@better-ccflare/types";
 import { BaseProvider } from "../../base";
@@ -418,7 +420,7 @@ interface CodexRequest {
 	input: (CodexMessage | CodexFunctionCallItem | CodexFunctionCallOutputItem)[];
 	stream: boolean;
 	store: false;
-	reasoning?: { effort: string };
+	reasoning?: { effort: ReasoningEffort };
 	instructions?: string;
 	prompt_cache_key?: string;
 	tools?: CodexTool[];
@@ -461,6 +463,8 @@ export interface CodexExplicitBreakpointDecision {
 
 interface CodexConversionResult {
 	codexBody: CodexRequest;
+	reasoningEffortRequested: ReasoningEffort | undefined;
+	reasoningEffortSource: AnthropicReasoningEffortSource;
 	cacheKeyDecision: CodexPromptCacheKeyDecision;
 	explicitBreakpointDecision: CodexExplicitBreakpointDecision;
 	orchestrationAdmission: OrchestrationAdmission;
@@ -535,6 +539,7 @@ interface AnthropicRequest {
 	stream?: boolean;
 	tools?: AnthropicTool[];
 	tool_choice?: AnthropicToolChoice;
+	output_config?: { effort?: string };
 	reasoning?: { effort?: string };
 	metadata?: { user_id?: string };
 	[key: string]: unknown;
@@ -943,6 +948,8 @@ export class CodexProvider extends BaseProvider {
 			}
 			const {
 				codexBody,
+				reasoningEffortRequested,
+				reasoningEffortSource,
 				cacheKeyDecision,
 				explicitBreakpointDecision,
 				orchestrationAdmission,
@@ -979,6 +986,9 @@ export class CodexProvider extends BaseProvider {
 				account: account?.name,
 				modelIn: body.model,
 				modelOut: codexBody.model,
+				logicalReasoningEffortRequested: reasoningEffortRequested,
+				logicalReasoningEffortSource: reasoningEffortSource,
+				physicalReasoningEffortApplied: codexBody.reasoning?.effort,
 				messageCount: body.messages.length,
 				sessionKeyHash: this.hashSessionKey(body),
 				promptCacheKeySet: Boolean(codexBody.prompt_cache_key),
@@ -2062,7 +2072,7 @@ export class CodexProvider extends BaseProvider {
 			}));
 		}
 
-		const reasoningResolution = resolveReasoningEffort(body.reasoning?.effort, {
+		const reasoningResolution = resolveAnthropicReasoningEffort(body, {
 			sourceModel: body.model,
 			targetModel: physicalModel,
 		});
@@ -2151,6 +2161,8 @@ export class CodexProvider extends BaseProvider {
 
 		return {
 			codexBody: codexRequest,
+			reasoningEffortRequested: reasoningResolution.requestedEffort,
+			reasoningEffortSource: reasoningResolution.source,
 			cacheKeyDecision,
 			explicitBreakpointDecision,
 			orchestrationAdmission,

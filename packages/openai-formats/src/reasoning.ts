@@ -83,29 +83,50 @@ export interface ReasoningEffortResolution {
 	}>;
 }
 
-// sourceModel is accepted for API symmetry but only targetModel is used for
-// downgrade resolution — the source model's effort ceiling must not further
-// constrain the value sent to a capable target.
-export function resolveReasoningEffort(
-	effort: unknown,
-	models: { sourceModel?: string; targetModel?: string },
-): ReasoningEffortResolution {
-	if (effort === undefined) {
-		return { effort: undefined, downgrades: [] };
-	}
+interface ReasoningEffortModels {
+	sourceModel?: string;
+	targetModel?: string;
+}
 
+export interface AnthropicReasoningEffortInput {
+	output_config?: { effort?: unknown };
+	reasoning?: { effort?: unknown };
+}
+
+export type AnthropicReasoningEffortSource =
+	| "output_config"
+	| "reasoning"
+	| "default";
+
+export interface AnthropicReasoningEffortResolution
+	extends ReasoningEffortResolution {
+	requestedEffort: ReasoningEffort | undefined;
+	source: AnthropicReasoningEffortSource;
+}
+
+function validateReasoningEffortValue(
+	effort: unknown,
+	field: "output_config.effort" | "reasoning.effort",
+): ReasoningEffort {
 	if (
 		typeof effort !== "string" ||
 		!REASONING_EFFORT_VALUES.includes(effort as ReasoningEffort)
 	) {
 		throw new ValidationError(
-			`reasoning.effort must be one of: ${REASONING_EFFORT_VALUES.join(", ")}`,
-			"reasoning.effort",
+			`${field} must be one of: ${REASONING_EFFORT_VALUES.join(", ")}`,
+			field,
 			effort,
 		);
 	}
 
-	let resolvedEffort = effort as ReasoningEffort;
+	return effort as ReasoningEffort;
+}
+
+function resolveValidatedReasoningEffort(
+	effort: ReasoningEffort,
+	models: ReasoningEffortModels,
+): ReasoningEffortResolution {
+	let resolvedEffort = effort;
 	const downgrades: Array<{
 		model: string;
 		from: ReasoningEffort;
@@ -159,9 +180,70 @@ export function resolveReasoningEffort(
 	return { effort: resolvedEffort, downgrades };
 }
 
+// sourceModel is accepted for API symmetry but only targetModel is used for
+// downgrade resolution — the source model's effort ceiling must not further
+// constrain the value sent to a capable target.
+export function resolveReasoningEffort(
+	effort: unknown,
+	models: ReasoningEffortModels,
+): ReasoningEffortResolution {
+	if (effort === undefined) {
+		return { effort: undefined, downgrades: [] };
+	}
+
+	return resolveValidatedReasoningEffort(
+		validateReasoningEffortValue(effort, "reasoning.effort"),
+		models,
+	);
+}
+
+/**
+ * Resolve Anthropic's official effort field while retaining compatibility with
+ * the legacy better-ccflare reasoning field. Matching dual values are safe;
+ * conflicting values are rejected instead of silently changing caller intent.
+ */
+export function resolveAnthropicReasoningEffort(
+	input: AnthropicReasoningEffortInput,
+	models: ReasoningEffortModels,
+): AnthropicReasoningEffortResolution {
+	const officialEffort = input.output_config?.effort;
+	const legacyEffort = input.reasoning?.effort;
+
+	if (
+		officialEffort !== undefined &&
+		legacyEffort !== undefined &&
+		officialEffort !== legacyEffort
+	) {
+		throw new ValidationError(
+			"output_config.effort conflicts with reasoning.effort",
+			"output_config.effort",
+			officialEffort,
+		);
+	}
+
+	const hasOfficialEffort = officialEffort !== undefined;
+	const effort = hasOfficialEffort ? officialEffort : legacyEffort;
+	if (effort === undefined) {
+		return {
+			effort: undefined,
+			downgrades: [],
+			requestedEffort: undefined,
+			source: "default",
+		};
+	}
+
+	const field = hasOfficialEffort ? "output_config.effort" : "reasoning.effort";
+	const requestedEffort = validateReasoningEffortValue(effort, field);
+	return {
+		...resolveValidatedReasoningEffort(requestedEffort, models),
+		requestedEffort,
+		source: hasOfficialEffort ? "output_config" : "reasoning",
+	};
+}
+
 export function validateReasoningEffort(
 	effort: unknown,
-	models: { sourceModel?: string; targetModel?: string },
+	models: ReasoningEffortModels,
 ): ReasoningEffort | undefined {
 	return resolveReasoningEffort(effort, models).effort;
 }

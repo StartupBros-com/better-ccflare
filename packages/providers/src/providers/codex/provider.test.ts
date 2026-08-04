@@ -488,6 +488,51 @@ describe("CodexProvider request conversion", () => {
 		expect(body.reasoning).toEqual({ effort });
 	});
 
+	it("honors Claude Code output_config effort without forwarding the Anthropic field", async () => {
+		const provider = new CodexProvider();
+		const account = {
+			model_mappings: JSON.stringify({ fable: "gpt-5.6-sol" }),
+		} as Parameters<typeof provider.transformRequestBody>[1];
+		const request = new Request("https://example.com/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				[CODEX_LOGICAL_MODEL_FAMILY_HEADER]: "fable",
+			},
+			body: JSON.stringify({
+				model: "claude-fable-5",
+				max_tokens: 100,
+				output_config: { effort: "max" },
+				messages: [{ role: "user", content: "Hello" }],
+			}),
+		});
+
+		const transformed = await provider.transformRequestBody(request, account);
+		const body = await transformed.json();
+
+		expect(body.reasoning).toEqual({ effort: "max" });
+		expect(body.output_config).toBeUndefined();
+	});
+
+	it("rejects conflicting official and legacy Anthropic effort fields", async () => {
+		const provider = new CodexProvider();
+		const request = new Request("https://example.com/v1/messages", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				model: "claude-fable-5",
+				max_tokens: 100,
+				output_config: { effort: "max" },
+				reasoning: { effort: "xhigh" },
+				messages: [{ role: "user", content: "Hello" }],
+			}),
+		});
+
+		await expect(provider.transformRequestBody(request)).rejects.toThrow(
+			"output_config.effort conflicts with reasoning.effort",
+		);
+	});
+
 	it.each([
 		["sonnet", "claude-sonnet-4-5", "gpt-5.6-sol"],
 		["fable", "claude-fable-5", "gpt-5.5"],
@@ -559,7 +604,7 @@ describe("CodexProvider request conversion", () => {
 				body: JSON.stringify({
 					model: "claude-fable-5",
 					max_tokens: 100,
-					reasoning: { effort: "max" },
+					output_config: { effort: "max" },
 					messages: [{ role: "user", content: "Hello" }],
 				}),
 			});
@@ -5306,7 +5351,7 @@ describe("CodexProvider.transformRequestBody", () => {
 			// BUG (documented, not fixed here): the demotion diagnostics confirm
 			// this was a session that already had an elected root.
 			expect(requestTrace).toMatchObject({
-				trace_schema_version: 11,
+				trace_schema_version: 12,
 				orchestration_admission: "non_root",
 				orchestration_demotion_observed: true,
 			});
@@ -5436,7 +5481,7 @@ describe("CodexProvider.transformRequestBody", () => {
 				(record) => record.phase === "request",
 			);
 			expect(requestTrace).toMatchObject({
-				trace_schema_version: 11,
+				trace_schema_version: 12,
 				orchestration_admission: "no_session",
 				is_descendant: true,
 				tools_before_count: 3,

@@ -21,6 +21,10 @@ import { createHmac } from "node:crypto";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { Logger } from "@better-ccflare/logger";
+import type {
+	AnthropicReasoningEffortSource,
+	ReasoningEffort,
+} from "@better-ccflare/openai-formats";
 
 export const CODEX_TRACE_DIR_ENV = "CCFLARE_CODEX_TRACE_DIR";
 export const CODEX_TRACE_FULL_ENV = "CCFLARE_CODEX_TRACE_FULL";
@@ -28,7 +32,7 @@ export const CODEX_TRACE_HMAC_KEY_ENV = "CCFLARE_CODEX_TRACE_HMAC_KEY";
 /** Warn when one response spawns at least this many subagents (0 disables). */
 export const CODEX_FANOUT_WARN_ENV = "CCFLARE_CODEX_FANOUT_WARN";
 
-const TRACE_SCHEMA_VERSION = 11;
+const TRACE_SCHEMA_VERSION = 12;
 const DEFAULT_FANOUT_WARN = 8;
 const MAX_INPUT_ITEM_FINGERPRINTS = 64;
 /**
@@ -188,6 +192,12 @@ interface TraceInputs {
 	account?: string;
 	modelIn?: string;
 	modelOut?: string;
+	/** Validated logical effort explicitly requested by the Anthropic caller. */
+	logicalReasoningEffortRequested?: ReasoningEffort | null;
+	/** Which bounded Anthropic field supplied the effort, or default when omitted. */
+	logicalReasoningEffortSource?: AnthropicReasoningEffortSource | null;
+	/** Final effort applied to the physical Codex request after model clamping/defaults. */
+	physicalReasoningEffortApplied?: ReasoningEffort | null;
 	messageCount?: number;
 	/** Privacy-preserving session join key (hash of metadata.user_id). */
 	sessionKeyHash?: string | null;
@@ -357,6 +367,12 @@ export function writeCodexTrace(inputs: TraceInputs): void {
 		account: inputs.account ?? null,
 		model_in: inputs.modelIn ?? null,
 		model_out: inputs.modelOut ?? null,
+		logical_reasoning_effort_requested:
+			inputs.logicalReasoningEffortRequested ?? null,
+		logical_reasoning_effort_source:
+			inputs.logicalReasoningEffortSource ?? null,
+		physical_reasoning_effort_applied:
+			inputs.physicalReasoningEffortApplied ?? null,
 		message_count: inputs.messageCount ?? null,
 		session_key_hash: inputs.sessionKeyHash ?? null,
 		prompt_cache_key_set: inputs.promptCacheKeySet ?? false,
