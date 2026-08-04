@@ -117,6 +117,22 @@ describe("AlertService model_routing_drift alerts", () => {
 		expect(await service.listAlerts()).toHaveLength(0);
 	});
 
+	it("does not persist stale_policy alerts for cross-family fallback slots", async () => {
+		service = new AlertService(new BunSqlAdapter(sqlite), makeConfig());
+		service.start();
+
+		await service.evaluateRequest(
+			baseRequest({
+				comboModelOverride: {
+					from: CLAUDE_MODEL_IDS.FABLE_5,
+					to: CLAUDE_MODEL_IDS.OPUS_5,
+				},
+			}),
+		);
+
+		expect(await service.listAlerts()).toHaveLength(0);
+	});
+
 	it("is silent for agent-preference rewrites (comboModelOverride null) even though original/applied differ", async () => {
 		service = new AlertService(new BunSqlAdapter(sqlite), makeConfig());
 		service.start();
