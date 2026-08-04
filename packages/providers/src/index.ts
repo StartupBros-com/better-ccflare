@@ -33,6 +33,8 @@ export {
 // Export pure request capability and admission primitives
 export * from "./request-capabilities";
 export * from "./server-tool-capabilities";
+export * from "./server-tools/history-projection";
+export * from "./server-tools/replay-envelope";
 export * from "./types";
 // Export usage fetcher
 export * from "./usage-fetcher";

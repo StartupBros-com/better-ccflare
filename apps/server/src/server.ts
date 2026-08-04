@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
 import {
 	Config,
+	loadServerToolReplayKeys,
 	type RuntimeConfig,
 	readGuardCorrelationSecret,
 } from "@better-ccflare/config";
@@ -59,6 +60,7 @@ import {
 	createAnthropicDegradedDetailedEventSink,
 	createAnthropicDegradedRuntimeHealth,
 	createGuardCorrelationVerifier,
+	createServerToolReplayRuntime,
 	DegradedModeObservability,
 	DegradedOwnerOverlay,
 	drainUsageCollector,
@@ -980,6 +982,9 @@ export default async function startServer(options?: {
 	// eagerly, so route through a mutable reference assigned once the
 	// ProxyContext exists — mirrors the getStrategy() lazy-getter pattern above.
 	let modelCatalogProxyContext: ProxyContext | null = null;
+	const serverToolReplay = createServerToolReplayRuntime(
+		loadServerToolReplayKeys(),
+	);
 	const anthropicDegradedConfig = config.getAnthropicDegradedModeConfig();
 	const anthropicDegradedMode = new AnthropicDegradedModeCoordinator({
 		config: anthropicDegradedConfig,
@@ -1244,6 +1249,7 @@ export default async function startServer(options?: {
 		anthropicDegradedObservability,
 		degradedOwnerOverlay,
 		degradedOwnerShadowOverlay,
+		serverToolReplay,
 		dbOps,
 		runtime: runtimeConfig,
 		config,
