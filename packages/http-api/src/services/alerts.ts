@@ -163,7 +163,9 @@ const CLAUDE_MODEL_SHAPE_RE = /^claude-(opus|sonnet|haiku|fable)(-|$)/i;
 /**
  * Detects the "Opus 5 incident" class of model-routing staleness: a combo
  * slot's stored model override rewrote a request AWAY from what is
- * currently the family's canonical latest model (LATEST_MODEL_BY_FAMILY).
+ * currently the family's canonical latest model (LATEST_MODEL_BY_FAMILY)
+ * to an older model in that same family. Cross-family rewrites are fallback
+ * policy, not evidence that a family-specific latest-model pin went stale.
  * Only evaluated when the proxy itself reports a combo override applied via
  * `comboModelOverride` — agent-preference rewrites never populate that
  * field (see packages/proxy/src/usage-collector.ts), so they can never
@@ -180,6 +182,7 @@ export function buildStalePolicyDriftAlert(
 	const { from, to } = override;
 	const family = getModelFamily(from);
 	if (!family) return null;
+	if (getModelFamily(to) !== family) return null;
 	if (LATEST_MODEL_BY_FAMILY[family] !== from) return null;
 	// Severity is deliberately `warning`, not `critical`. This check cannot yet
 	// distinguish a genuinely stale policy from an operator's DELIBERATE pin: a

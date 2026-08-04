@@ -78,7 +78,10 @@ import {
 	selectAccountsForRequest,
 	validateProviderPath,
 } from "./handlers";
-import { getReactiveModelCapacityBlocker } from "./handlers/account-selector";
+import {
+	getCapacityDeferredModelRoutes,
+	getReactiveModelCapacityBlocker,
+} from "./handlers/account-selector";
 import {
 	type AnthropicDegradedRequestSendState,
 	type AnthropicDegradedSendDenied,
@@ -966,14 +969,23 @@ async function handleProxyCore(
 				: Math.min(reactiveModelRecoveryAt, recoveryAt);
 		return true;
 	};
-	const applyUsageThrottling = (accounts: Account[]) => {
+	const getPredictiveThrottleUntil = (
+		account: Account,
+		model: string | null,
+		now: number,
+	): number | null => {
 		const settings = {
 			fiveHourEnabled: ctx.config.getUsageThrottlingFiveHourEnabled(),
 			weeklyEnabled: ctx.config.getUsageThrottlingWeeklyEnabled(),
 		};
-		const predictiveUsageEnabled =
-			settings.fiveHourEnabled || settings.weeklyEnabled;
-
+		return settings.fiveHourEnabled || settings.weeklyEnabled
+			? getUsageThrottleUntil(usageCache.get(account.id), settings, now, {
+					requestModel: model,
+					scopedMode: "match",
+				})
+			: null;
+	};
+	const applyUsageThrottling = (accounts: Account[]) => {
 		// Internal synthetic probes (auto-refresh window-reset checks, cache
 		// keepalive replays) must never be usage-throttled. They exist
 		// specifically to hit the real endpoint and observe state changes
@@ -1015,17 +1027,17 @@ async function handleProxyCore(
 		const effectiveModel = appliedModel ?? requestModel ?? null;
 
 		for (const account of accounts) {
-			const throttleUntil = predictiveUsageEnabled
-				? getUsageThrottleUntil(usageCache.get(account.id), settings, now, {
-						requestModel: comboRouted ? null : effectiveModel,
-						scopedMode: "match",
-					})
-				: null;
+			const candidateModel = comboRouted ? null : effectiveModel;
+			const throttleUntil = getPredictiveThrottleUntil(
+				account,
+				candidateModel,
+				now,
+			);
 			const reactivelyDepleted =
 				!comboRouted &&
 				hasReactiveModelDepletion({
 					accountId: account.id,
-					model: effectiveModel,
+					model: candidateModel,
 					betaSignature: req.headers.get("anthropic-beta"),
 					syntheticProbe,
 					now,
@@ -1192,6 +1204,8 @@ async function handleProxyCore(
 			reactivelyDepletedAccounts,
 		} = applyUsageThrottling(selectedAccounts));
 	}
+	const selectedCapacityDeferredRoutes =
+		getCapacityDeferredModelRoutes(requestMeta);
 	let pacingSlot = pacingObservation?.slot ?? null;
 	let crossoverPacingRestored = false;
 	requestMeta.codexPacingCanary = pacingEligible
@@ -1259,7 +1273,7 @@ async function handleProxyCore(
 			: undefined;
 
 	// 7. Handle no accounts case
-	if (accounts.length === 0) {
+	if (accounts.length === 0 && selectedCapacityDeferredRoutes.length === 0) {
 		// No account will serve this request, whichever branch below fires. Clear
 		// the badge association up front — BEFORE the fallible getAllAccounts fetch,
 		// collector logging, and the passthrough (a thrown proxyUnauthenticated
@@ -1425,6 +1439,8 @@ async function handleProxyCore(
 		readonly candidateId: string;
 		readonly comboName: string | null;
 		readonly comboSlotIndex: number | null;
+		readonly normalStrategyManaged: boolean;
+		readonly fallbackRank: number;
 		readonly fallbackWave: number;
 		readonly sequence: number;
 	};
@@ -1433,11 +1449,67 @@ async function handleProxyCore(
 	const deferredModelRoutes: DeferredModelRoute[] = [];
 	const deferredModelRouteKeys = new Set<string>();
 	const deferredFallbackWaves = new Map<string, number>();
+	const deferredFamilyOccurrences = new Map<string, number>();
 	let preferredContextOverflowRouteKey: string | null = null;
+	const deferModelRoute = (
+		account: Account,
+		model: string,
+		candidateId: string,
+		fallbackRank: number,
+		comboName: string | null,
+		comboSlotIndex: number | null,
+		configuredFamilyOccurrence?: number | null,
+	): void => {
+		const key = deferredModelRouteKeyFor(account, model);
+		if (deferredModelRouteKeys.has(key)) return;
+		deferredModelRouteKeys.add(key);
+		const targetFamily = getModelFamily(model);
+		let waveKey: string;
+		if (targetFamily) {
+			const occurrenceKey = JSON.stringify([account.id, targetFamily]);
+			const nextOccurrence = deferredFamilyOccurrences.get(occurrenceKey) ?? 0;
+			const occurrence = configuredFamilyOccurrence ?? nextOccurrence;
+			deferredFamilyOccurrences.set(
+				occurrenceKey,
+				Math.max(nextOccurrence, occurrence + 1),
+			);
+			waveKey = `family:${targetFamily}:occurrence:${occurrence}`;
+		} else {
+			waveKey = `fallback-rank:${fallbackRank}`;
+		}
+		let fallbackWave = deferredFallbackWaves.get(waveKey);
+		if (fallbackWave === undefined) {
+			fallbackWave = deferredFallbackWaves.size;
+			deferredFallbackWaves.set(waveKey, fallbackWave);
+		}
+		deferredModelRoutes.push({
+			account,
+			model,
+			routeKey: key,
+			candidateId,
+			comboName,
+			comboSlotIndex,
+			normalStrategyManaged: comboName === null,
+			fallbackRank,
+			fallbackWave,
+			sequence: deferredModelRoutes.length,
+		});
+	};
 	const selectedRouteCandidateIds = alignRouteCandidateIds(
 		accounts,
 		requestMeta.routingCandidates,
 	);
+	for (const route of selectedCapacityDeferredRoutes) {
+		deferModelRoute(
+			route.account,
+			route.model,
+			route.candidateId,
+			route.fallbackRank,
+			null,
+			null,
+			route.familyOccurrence,
+		);
+	}
 	const modelFallbackPolicyFor = (
 		account: Account,
 		candidateId: string,
@@ -1466,28 +1538,14 @@ async function handleProxyCore(
 				(comboName !== null && !isComboSessionFallbackDisabled()),
 			anthropicPreCommitRescue: activeAnthropicPreCommitRescue,
 			deferImplicitFallback: (model, fallbackRank) => {
-				const key = deferredModelRouteKeyFor(account, model);
-				if (deferredModelRouteKeys.has(key)) return;
-				deferredModelRouteKeys.add(key);
-				const targetFamily = getModelFamily(model);
-				const waveKey = targetFamily
-					? `family:${targetFamily}`
-					: `fallback-rank:${fallbackRank}`;
-				let fallbackWave = deferredFallbackWaves.get(waveKey);
-				if (fallbackWave === undefined) {
-					fallbackWave = deferredFallbackWaves.size;
-					deferredFallbackWaves.set(waveKey, fallbackWave);
-				}
-				deferredModelRoutes.push({
+				deferModelRoute(
 					account,
 					model,
-					routeKey: key,
 					candidateId,
+					fallbackRank,
 					comboName,
 					comboSlotIndex,
-					fallbackWave,
-					sequence: deferredModelRoutes.length,
-				});
+				);
 			},
 			preferContextOverflowFallback: (model) => {
 				const key = deferredModelRouteKeyFor(account, model);
@@ -1558,7 +1616,9 @@ async function handleProxyCore(
 		}
 		return createAnthropicDegradedDenialResponse(denial);
 	};
+	const deferredPredictivelyThrottledAccounts: Account[] = [];
 	const reactiveDepletionSkips: Account[] = [];
+	const deferredReactiveDepletionSkips: Account[] = [];
 	const betaSignature = req.headers.get("anthropic-beta");
 
 	for (let i = 0; i < accounts.length; i++) {
@@ -1739,17 +1799,18 @@ async function handleProxyCore(
 		log.info(
 			`All ${accounts.length} candidate account(s) were probe-gate suppressed; retrying account ${accounts[i].name} ungated`,
 		);
-		// This retry IS the request's terminal attempt by construction — the
-		// loop above never actually attempted any candidate (anyAccountAttempted
-		// is only set once a candidate clears the probe gate), so
-		// deferredModelRoutes is still empty and this is final whenever it
-		// isn't combo routing. Threads through the same routingAttemptLedger /
+		// This retry is terminal only when no deferred route remains. The loop
+		// above never actually attempted any selected candidate, but hard-capacity
+		// planning may already have queued another account/model route. Threads
+		// through the same routingAttemptLedger /
 		// contextAdmissionTracker / modelFallbackPolicy wiring, and the same
 		// pacing finalization, as the main loop above so this rare path can't
 		// silently skip our fork's routing/pacing bookkeeping.
 		const candidateId =
 			selectedRouteCandidateIds[i] ?? `account:${accounts[i].id}`;
-		const isFinalSelectedCandidate = !filteredComboInfo?.comboName;
+		const isFinalSelectedCandidate =
+			!filteredComboInfo?.comboName && deferredModelRoutes.length === 0;
+		const isFinalSelectedSemanticRoute = deferredModelRoutes.length === 0;
 		const attemptedBefore = routingAttemptLedger.attemptedCount;
 		try {
 			response = await proxyWithAccount(
@@ -1772,7 +1833,7 @@ async function handleProxyCore(
 					accounts[i],
 					candidateId,
 					isFinalSelectedCandidate,
-					true,
+					isFinalSelectedSemanticRoute,
 					// This ungated retry applies the combo slot's model override
 					// exactly like the main loop does (modelOverride is computed
 					// above and passed to proxyWithAccount), so it must attribute
@@ -1869,6 +1930,17 @@ async function handleProxyCore(
 			}
 			await routingAttemptLedger.discardTerminalResponse();
 			throw error;
+		}
+		for (const route of getCapacityDeferredModelRoutes(requestMeta)) {
+			deferModelRoute(
+				route.account,
+				route.model,
+				route.candidateId,
+				route.fallbackRank,
+				null,
+				null,
+				route.familyOccurrence,
+			);
 		}
 		// The explicit post-combo selection is the only strategy pass that runs
 		// after request admission is created. A combo without a native Anthropic
@@ -2115,20 +2187,189 @@ async function handleProxyCore(
 	// every explicit combo/normal candidate and known same-family sibling. Each
 	// re-entry is constrained to exactly the queued model.
 	if (deferredModelRoutes.length > 0) {
+		// A normal deferred family can combine preblocked accounts (which never
+		// reached strategy.select()) with dynamically deferred selected accounts.
+		// Derive one side-effect-free strategy order by repeatedly peeking and
+		// removing the winner. This avoids a second select() call, which could mutate
+		// affinity, recency, sessions, or route-circuit leases. Explicit combo routes
+		// remain sequence-ordered below.
+		const strategyManagedAccountOrder = new Map<string, number>();
+		const remainingStrategyManagedAccounts = [
+			...new Map(
+				deferredModelRoutes
+					.filter((route) => route.normalStrategyManaged)
+					.map((route) => [route.account.id, route.account]),
+			).values(),
+		];
+		while (remainingStrategyManagedAccounts.length > 0) {
+			const preferredAccountId = ctx.strategy.peek?.(
+				remainingStrategyManagedAccounts,
+			);
+			if (!preferredAccountId) break;
+			const preferredIndex = remainingStrategyManagedAccounts.findIndex(
+				(account) => account.id === preferredAccountId,
+			);
+			if (preferredIndex < 0) break;
+			strategyManagedAccountOrder.set(
+				preferredAccountId,
+				strategyManagedAccountOrder.size,
+			);
+			remainingStrategyManagedAccounts.splice(preferredIndex, 1);
+		}
+		for (const account of remainingStrategyManagedAccounts) {
+			strategyManagedAccountOrder.set(
+				account.id,
+				strategyManagedAccountOrder.size,
+			);
+		}
+
+		const requestedFamily = effectiveModel
+			? getModelFamily(effectiveModel)
+			: null;
+		type DeferredFallbackGroup = {
+			readonly requestedFamilyTier: number;
+			readonly minimumFallbackRank: number;
+			readonly firstSeen: number;
+			readonly normalStrategyManagedOnly: boolean;
+		};
+		const deferredFallbackGroups = new Map<number, DeferredFallbackGroup>();
+		for (const route of deferredModelRoutes) {
+			const routeFamily = getModelFamily(route.model);
+			const requestedFamilyTier =
+				requestedFamily !== null && routeFamily === requestedFamily ? 0 : 1;
+			const existing = deferredFallbackGroups.get(route.fallbackWave);
+			deferredFallbackGroups.set(route.fallbackWave, {
+				requestedFamilyTier: Math.min(
+					existing?.requestedFamilyTier ?? requestedFamilyTier,
+					requestedFamilyTier,
+				),
+				minimumFallbackRank: Math.min(
+					existing?.minimumFallbackRank ?? route.fallbackRank,
+					route.fallbackRank,
+				),
+				firstSeen: existing?.firstSeen ?? route.fallbackWave,
+				normalStrategyManagedOnly:
+					(existing?.normalStrategyManagedOnly ?? true) &&
+					route.normalStrategyManaged,
+			});
+		}
 		const orderedDeferredModelRoutes = hasPreferredLegacyContextOverflowRoute()
 			? deferredModelRoutes.filter(
 					(route) => route.routeKey === preferredContextOverflowRouteKey,
 				)
-			: [...deferredModelRoutes].sort(
-					(a, b) => a.fallbackWave - b.fallbackWave || a.sequence - b.sequence,
-				);
+			: [...deferredModelRoutes].sort((a, b) => {
+					const aGroup = deferredFallbackGroups.get(a.fallbackWave);
+					const bGroup = deferredFallbackGroups.get(b.fallbackWave);
+					if (!aGroup || !bGroup) return a.sequence - b.sequence;
+					const groupOrder =
+						aGroup.requestedFamilyTier - bGroup.requestedFamilyTier ||
+						aGroup.minimumFallbackRank - bGroup.minimumFallbackRank ||
+						aGroup.firstSeen - bGroup.firstSeen;
+					if (groupOrder !== 0) return groupOrder;
+					if (aGroup.normalStrategyManagedOnly) {
+						const accountOrder =
+							(strategyManagedAccountOrder.get(a.account.id) ??
+								Number.MAX_SAFE_INTEGER) -
+							(strategyManagedAccountOrder.get(b.account.id) ??
+								Number.MAX_SAFE_INTEGER);
+						if (accountOrder !== 0) return accountOrder;
+					}
+					return a.sequence - b.sequence;
+				});
 		log.info(
 			`Requested-family routes exhausted; trying ${orderedDeferredModelRoutes.length} deferred degradation route(s)`,
 		);
+		const attemptDeferredRoute = async (
+			route: DeferredModelRoute,
+			isFinalDeferredRoute: boolean,
+			probeAdmission: ReturnType<typeof getRateLimitProbeAdmission> | null,
+		): Promise<Response | null> => {
+			requestMeta.comboName = route.comboName;
+			requestMeta.comboSlotIndex = route.comboSlotIndex;
+			log.info(
+				`Attempting deferred route candidate=${route.candidateId} account=${route.account.name} model=${route.model}`,
+			);
+			const attemptedBefore = routingAttemptLedger.attemptedCount;
+			try {
+				response = await proxyWithAccount(
+					req,
+					url,
+					route.account,
+					requestMeta,
+					finalBodyBuffer,
+					finalCreateBodyStream,
+					upstreamAttempts,
+					ctx,
+					route.model,
+					apiKeyId,
+					apiKeyName,
+					finalRequestBodyContext,
+					isFinalDeferredRoute,
+					contextAdmissionTracker,
+					routingAttemptLedger,
+					{
+						routeCandidateId: route.candidateId,
+						implicitFallbacksEnabled: false,
+						forwardModelUnavailableResponse: isFinalDeferredRoute,
+						isFinalSemanticAttempt: () => isFinalDeferredRoute,
+						anthropicPreCommitRescue: activeAnthropicPreCommitRescue,
+					},
+					anthropicDegradedSendState,
+				);
+			} catch (error) {
+				await routingAttemptLedger.discardTerminalResponse();
+				throw error;
+			} finally {
+				if (probeAdmission === "admitted") {
+					completeRateLimitProbe(route.account, "abandoned");
+				}
+			}
+			upstreamAttempts += routingAttemptLedger.attemptedCount - attemptedBefore;
+
+			if (isAnthropicDegradedSendDenied(response)) {
+				return finishPacing(
+					pacingSlot,
+					await deliverAnthropicDegradedDenial(response),
+				);
+			}
+			if (!response) return null;
+
+			response = await settleRoutedResponse(response);
+			recordCachePacingRoute(
+				pacingObservation,
+				{
+					accountId: route.account.id,
+					accountName: route.account.name,
+					provider: route.account.provider,
+				},
+				{
+					candidate: pacingEligible,
+					assignedBypass: assignedCodexPacingBypass,
+				},
+			);
+			return finishPacing(pacingSlot, response);
+		};
+		let anyDeferredRouteCrossedTransport = false;
+		let firstProbeSuppressedDeferredRoute: DeferredModelRoute | null = null;
 		for (let i = 0; i < orderedDeferredModelRoutes.length; i++) {
 			const route = orderedDeferredModelRoutes[i];
 			requestMeta.comboName = route.comboName;
 			requestMeta.comboSlotIndex = route.comboSlotIndex;
+			const now = Date.now();
+			const predictiveThrottleUntil =
+				trustedInternalAutoRefresh || trustedInternalKeepalive
+					? null
+					: getPredictiveThrottleUntil(route.account, route.model, now);
+			if (predictiveThrottleUntil !== null && predictiveThrottleUntil > now) {
+				if (
+					!deferredPredictivelyThrottledAccounts.some(
+						(account) => account.id === route.account.id,
+					)
+				) {
+					deferredPredictivelyThrottledAccounts.push(route.account);
+				}
+				continue;
+			}
 
 			if (
 				hasReactiveModelDepletion({
@@ -2139,6 +2380,13 @@ async function handleProxyCore(
 				})
 			) {
 				reactiveDepletionSkips.push(route.account);
+				if (
+					!deferredReactiveDepletionSkips.some(
+						(account) => account.id === route.account.id,
+					)
+				) {
+					deferredReactiveDepletionSkips.push(route.account);
+				}
 				if (contextAdmissionTracker) {
 					contextAdmissionTracker.nonCapacitySkipCount++;
 				}
@@ -2161,76 +2409,40 @@ async function handleProxyCore(
 
 			const probeAdmission = getRateLimitProbeAdmission(route.account);
 			if (probeAdmission === "suppressed") {
+				firstProbeSuppressedDeferredRoute ??= route;
 				if (contextAdmissionTracker) {
 					contextAdmissionTracker.nonCapacitySkipCount++;
 				}
 				continue;
 			}
 
-			log.info(
-				`Attempting deferred route candidate=${route.candidateId} account=${route.account.name} model=${route.model}`,
+			const attemptedBeforeDeferredRoute = routingAttemptLedger.attemptedCount;
+			const finalResponse = await attemptDeferredRoute(
+				route,
+				i === orderedDeferredModelRoutes.length - 1,
+				probeAdmission,
 			);
-			const attemptedBefore = routingAttemptLedger.attemptedCount;
-			try {
-				response = await proxyWithAccount(
-					req,
-					url,
-					route.account,
-					requestMeta,
-					finalBodyBuffer,
-					finalCreateBodyStream,
-					upstreamAttempts,
-					ctx,
-					route.model,
-					apiKeyId,
-					apiKeyName,
-					finalRequestBodyContext,
-					i === orderedDeferredModelRoutes.length - 1,
-					contextAdmissionTracker,
-					routingAttemptLedger,
-					{
-						routeCandidateId: route.candidateId,
-						implicitFallbacksEnabled: false,
-						forwardModelUnavailableResponse:
-							i === orderedDeferredModelRoutes.length - 1,
-						isFinalSemanticAttempt: () =>
-							i === orderedDeferredModelRoutes.length - 1,
-						anthropicPreCommitRescue: activeAnthropicPreCommitRescue,
-					},
-					anthropicDegradedSendState,
-				);
-			} catch (error) {
-				await routingAttemptLedger.discardTerminalResponse();
-				throw error;
-			} finally {
-				if (probeAdmission === "admitted") {
-					completeRateLimitProbe(route.account, "abandoned");
-				}
+			if (routingAttemptLedger.attemptedCount > attemptedBeforeDeferredRoute) {
+				anyDeferredRouteCrossedTransport = true;
 			}
-			upstreamAttempts += routingAttemptLedger.attemptedCount - attemptedBefore;
-
-			if (isAnthropicDegradedSendDenied(response)) {
-				return finishPacing(
-					pacingSlot,
-					await deliverAnthropicDegradedDenial(response),
-				);
+			if (finalResponse) return finalResponse;
+		}
+		if (
+			!anyDeferredRouteCrossedTransport &&
+			firstProbeSuppressedDeferredRoute
+		) {
+			log.info(
+				`No deferred route crossed transport and a probe-gated route remains; retrying account ${firstProbeSuppressedDeferredRoute.account.name} model=${firstProbeSuppressedDeferredRoute.model} ungated`,
+			);
+			if (contextAdmissionTracker) {
+				contextAdmissionTracker.nonCapacitySkipCount--;
 			}
-			if (response) {
-				response = await settleRoutedResponse(response);
-				recordCachePacingRoute(
-					pacingObservation,
-					{
-						accountId: route.account.id,
-						accountName: route.account.name,
-						provider: route.account.provider,
-					},
-					{
-						candidate: pacingEligible,
-						assignedBypass: assignedCodexPacingBypass,
-					},
-				);
-				return finishPacing(pacingSlot, response);
-			}
+			const finalResponse = await attemptDeferredRoute(
+				firstProbeSuppressedDeferredRoute,
+				true,
+				null,
+			);
+			if (finalResponse) return finalResponse;
 		}
 		requestMeta.comboName = null;
 		requestMeta.comboSlotIndex = null;
@@ -2257,6 +2469,25 @@ async function handleProxyCore(
 			}),
 		);
 	}
+	// If routing skipped every remaining candidate using direct, short-lived
+	// model-scoped depletion evidence, return a model-lane terminal. Predictive
+	// pacing alone owns HTTP 529; hard/reactive exclusions take precedence over
+	// every soft throttle and must not acquire retry-held whole-pool markers.
+	if (
+		deferredReactiveDepletionSkips.length > 0 ||
+		(reactiveDepletionSkips.length > 0 && upstreamAttempts === 0)
+	) {
+		cacheBodyStore.discardStaged(requestMeta.id);
+		return finishPacing(
+			pacingSlot,
+			createModelPoolExhaustedResponse({
+				capacityContext: getRoutingCapacityContext(requestMeta),
+				rateLimitOutcomes: getRequestRateLimitOutcomes(req),
+				now: Date.now(),
+				modelRecoveryAt: reactiveModelRecoveryAt,
+			}),
+		);
+	}
 	if (fallbackSelectionHadNoAvailable && throttledFallbackAccounts.length > 0) {
 		cacheBodyStore.discardStaged(requestMeta.id);
 		if (sessionId) clearSession(sessionId, requestMeta.timestamp);
@@ -2265,24 +2496,13 @@ async function handleProxyCore(
 			createUsageThrottledResponse(throttledFallbackAccounts),
 		);
 	}
-
-	// If routing skipped every remaining candidate using direct, short-lived
-	// model-scoped depletion evidence, return a model-lane terminal. Predictive
-	// pacing alone owns HTTP 529; hard/reactive exclusions must not masquerade as
-	// a soft throttle or acquire retry-held whole-pool markers.
-	if (reactiveDepletionSkips.length > 0) {
-		if (upstreamAttempts === 0) {
-			cacheBodyStore.discardStaged(requestMeta.id);
-			return finishPacing(
-				pacingSlot,
-				createModelPoolExhaustedResponse({
-					capacityContext: getRoutingCapacityContext(requestMeta),
-					rateLimitOutcomes: getRequestRateLimitOutcomes(req),
-					now: Date.now(),
-					modelRecoveryAt: reactiveModelRecoveryAt,
-				}),
-			);
-		}
+	if (deferredPredictivelyThrottledAccounts.length > 0) {
+		cacheBodyStore.discardStaged(requestMeta.id);
+		if (sessionId) clearSession(sessionId, requestMeta.timestamp);
+		return finishPacing(
+			pacingSlot,
+			createUsageThrottledResponse(deferredPredictivelyThrottledAccounts),
+		);
 	}
 
 	if (
@@ -2319,9 +2539,15 @@ async function handleProxyCore(
 	}
 
 	// 11. All accounts failed - check if OAuth token issues are the cause
-	const allAttemptedAccounts = filteredComboInfo
-		? [...accounts, ...(fallbackAccounts ?? [])]
-		: accounts;
+	const allAttemptedAccounts = [
+		...new Map(
+			[
+				...accounts,
+				...(fallbackAccounts ?? []),
+				...deferredModelRoutes.map((route) => route.account),
+			].map((account) => [account.id, account]),
+		).values(),
+	];
 	const oauthAccounts = allAttemptedAccounts.filter((acc) => acc.refresh_token);
 	const needsReauth = oauthAccounts.filter((acc) =>
 		isRefreshTokenLikelyExpired(acc),
