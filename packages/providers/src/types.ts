@@ -4,6 +4,7 @@ import type {
 	RateLimitReason,
 	ServerToolCapabilityDecision,
 	ServerToolCapabilityTuple,
+	ServerToolReplayAtom,
 	ServerToolRequirements,
 } from "@better-ccflare/types";
 
@@ -39,6 +40,83 @@ export interface RateLimitInfo {
  */
 export type CacheReplayModelStrategy = "normalized-source" | "transformed-body";
 
+export interface ProviderUsageInfo {
+	model?: string;
+	promptTokens?: number;
+	completionTokens?: number;
+	totalTokens?: number;
+	costUsd?: number;
+	inputTokens?: number;
+	cacheReadInputTokens?: number;
+	cacheCreationInputTokens?: number;
+	outputTokens?: number;
+}
+
+export interface ProviderAttemptPlanContext {
+	readonly request: Request;
+	readonly requestBodyBuffer: ArrayBuffer | null;
+	readonly account: Account;
+	readonly path: string;
+	readonly query: string;
+	readonly physicalModel: string | null;
+	readonly capabilityProofKey: string | null;
+	readonly inputReplayMode: readonly ServerToolReplayAtom[];
+	readonly outputReplayMode: readonly ServerToolReplayAtom[];
+}
+
+export type ProviderAttemptDataRetryPolicy =
+	| Readonly<{ mode: "none"; maxAttempts: 0 }>
+	| Readonly<{ mode: "reuse-same-plan"; maxAttempts: number }>;
+
+export type ProviderAttemptNoExecutionDecision =
+	| Readonly<{ decision: "proven_no_execution"; reason: string }>
+	| Readonly<{ decision: "executing_or_ambiguous" }>;
+
+declare const providerAttemptNoExecutionSnapshotBrand: unique symbol;
+
+/** Canonical bounded response metadata safe for provider classification. */
+export interface ProviderAttemptNoExecutionSnapshot {
+	readonly status: number;
+	readonly headers: readonly (readonly [name: string, value: string])[];
+	readonly bodyText: string;
+	readonly bodyTruncated: boolean;
+	readonly [providerAttemptNoExecutionSnapshotBrand]: true;
+}
+
+export interface ProviderAttemptPlan {
+	readonly providerName: string;
+	readonly targetUrl: string;
+	readonly apiFamily: string;
+	readonly physicalModel: string | null;
+	readonly capabilityProofKey: string | null;
+	readonly inputReplayMode: readonly ServerToolReplayAtom[];
+	readonly outputReplayMode: readonly ServerToolReplayAtom[];
+	readonly dataRetryPolicy: ProviderAttemptDataRetryPolicy;
+	readonly classifyNoExecution: (
+		snapshot: ProviderAttemptNoExecutionSnapshot,
+	) => Promise<ProviderAttemptNoExecutionDecision>;
+	readonly cacheReplayModelStrategy: CacheReplayModelStrategy;
+	readonly prepareHeaders: (
+		headers: Headers,
+		accessToken?: string,
+		apiKey?: string,
+	) => Headers;
+	readonly transformRequestBody: (request: Request) => Promise<Request>;
+	readonly processResponse: (
+		response: Response,
+		requestHeaders?: Headers,
+	) => Promise<Response>;
+	readonly parseRateLimit: (response: Response) => RateLimitInfo;
+	readonly isStreamingResponse?: (response: Response) => boolean;
+	readonly extractTierInfo?: (response: Response) => Promise<number | null>;
+	readonly extractUsageInfo?: (
+		response: Response,
+	) => Promise<ProviderUsageInfo | null>;
+	readonly parseUsage?: (
+		response: Response,
+	) => Promise<ProviderUsageInfo | null>;
+}
+
 export interface Provider {
 	name: string;
 
@@ -63,6 +141,12 @@ export interface Provider {
 		requirement: ServerToolRequirements,
 		tuple: ServerToolCapabilityTuple,
 	): ServerToolCapabilityDecision;
+
+	/**
+	 * Build one synchronous, request-scoped transport plan after the concrete
+	 * account and physical model have been selected. Async planners are invalid.
+	 */
+	createAttemptPlan?(context: ProviderAttemptPlanContext): ProviderAttemptPlan;
 
 	/**
 	 * Check if this provider can handle the given request path
@@ -129,34 +213,14 @@ export interface Provider {
 	/**
 	 * Extract usage information from response if available
 	 */
-	extractUsageInfo?(response: Response): Promise<{
-		model?: string;
-		promptTokens?: number;
-		completionTokens?: number;
-		totalTokens?: number;
-		costUsd?: number;
-		inputTokens?: number;
-		cacheReadInputTokens?: number;
-		cacheCreationInputTokens?: number;
-		outputTokens?: number;
-	} | null>;
+	extractUsageInfo?(response: Response): Promise<ProviderUsageInfo | null>;
 
 	/**
 	 * Parse usage information from streaming SSE response if available
 	 * This is called for streaming responses to extract usage from final SSE events
 	 * Falls back to extractUsageInfo for non-streaming responses
 	 */
-	parseUsage?(response: Response): Promise<{
-		model?: string;
-		promptTokens?: number;
-		completionTokens?: number;
-		totalTokens?: number;
-		costUsd?: number;
-		inputTokens?: number;
-		cacheReadInputTokens?: number;
-		cacheCreationInputTokens?: number;
-		outputTokens?: number;
-	} | null>;
+	parseUsage?(response: Response): Promise<ProviderUsageInfo | null>;
 
 	/**
 	 * Check if the response is a streaming response

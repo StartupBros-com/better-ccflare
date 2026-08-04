@@ -12,6 +12,8 @@ export * from "./minimax-usage-fetcher";
 export * from "./nanogpt-usage-fetcher";
 // Export OAuth utilities
 export * from "./oauth";
+// Export pure request capability and admission primitives
+export * from "./provider-attempt-plan";
 // Factory functions for creating providers
 export {
 	type AnthropicCompatibleConfig,
@@ -30,7 +32,6 @@ export {
 	listProviders,
 	registerProvider,
 } from "./registry";
-// Export pure request capability and admission primitives
 export * from "./request-capabilities";
 export * from "./server-tool-capabilities";
 export * from "./server-tools/history-projection";
