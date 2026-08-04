@@ -642,8 +642,11 @@ export class BedrockProvider extends BaseProvider implements Provider {
 	 */
 	buildUrl(path: string, query: string, account?: Account): string {
 		// Bedrock uses AWS SDK client (not HTTP URLs)
-		// Return placeholder - actual requests use BedrockRuntimeClient in Phase 3
-		return `bedrock://${account?.name || "unknown"}${path}${query}`;
+		// Return a component-safe placeholder; actual requests use
+		// BedrockRuntimeClient in Phase 3. Account names are operator-controlled and
+		// must not become URL authority/path/query delimiters.
+		const accountName = encodeURIComponent(account?.name || "unknown");
+		return `bedrock://${accountName}${path}${query}`;
 	}
 
 	/**

@@ -53,7 +53,11 @@ mock.module("@better-ccflare/database", () => ({
 	})),
 }));
 
-const { BedrockProvider } = await import("../provider");
+const [{ BedrockProvider }, { materializeProviderAttemptPlan }] =
+	await Promise.all([
+		import("../provider"),
+		import("../../../provider-attempt-plan"),
+	]);
 
 function account(modelId: string): Account {
 	return {
@@ -94,27 +98,31 @@ function account(modelId: string): Account {
 	};
 }
 
+function requestFixture(): Request {
+	return new Request("https://localhost/v1/messages", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({
+			model: "claude-sonnet-4-5",
+			max_tokens: 32,
+			system: [
+				{
+					type: "text",
+					text: "Stable instructions",
+					cache_control: { type: "ephemeral", ttl: "1h" },
+				},
+			],
+			messages: [{ role: "user", content: "Hello" }],
+		}),
+	});
+}
+
 describe("BedrockProvider request model integration", () => {
 	it("preserves inference-profile ARNs under the default geographic mode", async () => {
 		const inferenceProfileArn =
 			"arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-sonnet-4-5-20250929-v1:0";
 		const provider = new BedrockProvider();
-		const request = new Request("https://localhost/v1/messages", {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify({
-				model: "claude-sonnet-4-5",
-				max_tokens: 32,
-				system: [
-					{
-						type: "text",
-						text: "Stable instructions",
-						cache_control: { type: "ephemeral", ttl: "1h" },
-					},
-				],
-				messages: [{ role: "user", content: "Hello" }],
-			}),
-		});
+		const request = requestFixture();
 
 		await provider.transformRequestBody(request, account(inferenceProfileArn));
 
@@ -125,4 +133,39 @@ describe("BedrockProvider request model integration", () => {
 		]);
 		expect(profileSend).not.toHaveBeenCalled();
 	});
+
+	for (const [label, accountName] of [
+		["reserved delimiters", "ops/#?@prod"],
+		["Unicode plus delimiters", "東京/運用?#@"],
+	] as const) {
+		it(`materializes ${label} as one stable synthetic target before the AWS SDK transform`, async () => {
+			capturedInput = undefined;
+			const inferenceProfileArn =
+				"arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-sonnet-4-5-20250929-v1:0";
+			const provider = new BedrockProvider();
+			const bedrockAccount = account(inferenceProfileArn);
+			bedrockAccount.name = accountName;
+			const request = requestFixture();
+			const requestBodyBuffer = await request.clone().arrayBuffer();
+
+			const plan = materializeProviderAttemptPlan(provider, {
+				request,
+				requestBodyBuffer,
+				account: bedrockAccount,
+				path: "/v1/messages",
+				query: "",
+				physicalModel: "claude-sonnet-4-5",
+				capabilityProofKey: null,
+				inputReplayMode: [],
+				outputReplayMode: [],
+			});
+
+			expect(plan.targetUrl).toBe(
+				`bedrock://${encodeURIComponent(accountName)}/v1/messages`,
+			);
+			await plan.transformRequestBody(request);
+			expect(capturedInput?.modelId).toBe(inferenceProfileArn);
+			expect(profileSend).not.toHaveBeenCalled();
+		});
+	}
 });

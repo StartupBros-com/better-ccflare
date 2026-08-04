@@ -1,3 +1,4 @@
+import { isServerToolWebSearchEnabled } from "@better-ccflare/config";
 import {
 	formatXaiCacheCanary,
 	getModelFamily,
@@ -546,6 +547,12 @@ async function handleProxyCore(
 		url,
 		ctx.guardCorrelationVerifier,
 	);
+	const createUnservedServerToolRoutingErrorResponse = (
+		error: ServerToolRoutingError,
+	): Response => {
+		if (sessionId) clearSession(sessionId, requestMeta.timestamp);
+		return createServerToolRoutingErrorResponse(error);
+	};
 	requestMeta.trustedInternalAutoRefresh = trustedInternalAutoRefresh;
 	const routingAttemptLedger = new RoutingAttemptLedger();
 	activeAnthropicPreCommitRescue?.registerRequestLifecycle(
@@ -694,8 +701,9 @@ async function handleProxyCore(
 		if (!finalBodyBuffer) return undefined;
 		return new Response(finalBodyBuffer).body ?? undefined;
 	};
-	const serverToolRequirements =
-		finalRequestBodyContext.finalizeServerToolRequirements();
+	const serverToolRequirements = isServerToolWebSearchEnabled()
+		? finalRequestBodyContext.finalizeServerToolRequirements()
+		: undefined;
 	if (serverToolRequirements) {
 		requestMeta.serverToolRequirements = serverToolRequirements;
 		// Selection needs only the semantic presence bit. Keep the raw query out of
@@ -703,12 +711,12 @@ async function handleProxyCore(
 		// same endpoint contract here and at pretransport binding.
 		requestMeta.serverToolQueryPresent = url.search.length > 0;
 		if (serverToolRequirements.invalid?.length) {
-			return createServerToolRoutingErrorResponse(
+			return createUnservedServerToolRoutingErrorResponse(
 				new ServerToolRoutingError({ reason: "invalid_requirement" }),
 			);
 		}
 		if (serverToolRequirements.unsupported?.length) {
-			return createServerToolRoutingErrorResponse(
+			return createUnservedServerToolRoutingErrorResponse(
 				new ServerToolRoutingError({ reason: "unsupported_requirement" }),
 			);
 		}
@@ -947,7 +955,7 @@ async function handleProxyCore(
 		if (error instanceof ServerToolRoutingError) {
 			return finishPacing(
 				pacingObservation?.slot ?? null,
-				createServerToolRoutingErrorResponse(error),
+				createUnservedServerToolRoutingErrorResponse(error),
 			);
 		}
 		if (error instanceof ForceRouteUnavailableError) {
@@ -988,7 +996,7 @@ async function handleProxyCore(
 		if (serverToolRequirements) {
 			return finishPacing(
 				pacingObservation?.slot ?? null,
-				createServerToolRoutingErrorResponse(
+				createUnservedServerToolRoutingErrorResponse(
 					new ServerToolRoutingError({
 						reason: "temporary_unavailable",
 						capabilitySummary: requestMeta.serverToolCapabilitySummary,
@@ -1204,7 +1212,7 @@ async function handleProxyCore(
 			if (error instanceof ServerToolRoutingError) {
 				return finishPacing(
 					pacingObservation?.slot ?? null,
-					createServerToolRoutingErrorResponse(error),
+					createUnservedServerToolRoutingErrorResponse(error),
 				);
 			}
 			if (error instanceof ForceRouteUnavailableError) {
@@ -1246,7 +1254,7 @@ async function handleProxyCore(
 			if (serverToolRequirements) {
 				return finishPacing(
 					pacingObservation?.slot ?? null,
-					createServerToolRoutingErrorResponse(
+					createUnservedServerToolRoutingErrorResponse(
 						new ServerToolRoutingError({
 							reason: "temporary_unavailable",
 							capabilitySummary: requestMeta.serverToolCapabilitySummary,
@@ -1669,7 +1677,7 @@ async function handleProxyCore(
 			routingAttemptLedger.attemptedCount === attemptedBefore
 		) {
 			cacheBodyStore.discardStaged(requestMeta.id);
-			return createServerToolRoutingErrorResponse(
+			return createUnservedServerToolRoutingErrorResponse(
 				new ServerToolRoutingError({
 					reason: "forced_incapable",
 					accountId: error.accountId,
@@ -2070,7 +2078,7 @@ async function handleProxyCore(
 				cacheBodyStore.discardStaged(requestMeta.id);
 				return finishPacing(
 					pacingSlot,
-					createServerToolRoutingErrorResponse(
+					createUnservedServerToolRoutingErrorResponse(
 						new ServerToolRoutingError({
 							reason: "no_implementation",
 							capabilitySummary: currentServerToolCapabilitySummary(),
@@ -2128,7 +2136,7 @@ async function handleProxyCore(
 				}
 				return finishPacing(
 					pacingSlot,
-					createServerToolRoutingErrorResponse(error),
+					createUnservedServerToolRoutingErrorResponse(error),
 				);
 			}
 			if (serverToolRequirements) {
@@ -2139,7 +2147,7 @@ async function handleProxyCore(
 				}
 				return finishPacing(
 					pacingSlot,
-					createServerToolRoutingErrorResponse(
+					createUnservedServerToolRoutingErrorResponse(
 						new ServerToolRoutingError({
 							reason: "temporary_unavailable",
 							capabilitySummary: requestMeta.serverToolCapabilitySummary,
@@ -2713,7 +2721,7 @@ async function handleProxyCore(
 		cacheBodyStore.discardStaged(requestMeta.id);
 		return finishPacing(
 			pacingSlot,
-			createServerToolRoutingErrorResponse(
+			createUnservedServerToolRoutingErrorResponse(
 				new ServerToolRoutingError({
 					reason: "no_implementation",
 					capabilitySummary: currentServerToolCapabilitySummary(),

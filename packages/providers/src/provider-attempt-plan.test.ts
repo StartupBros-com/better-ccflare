@@ -832,6 +832,64 @@ describe("materializeProviderAttemptPlan", () => {
 		}
 	});
 
+	test("rejects non-HTTP targets outside the legacy Bedrock provider scope", () => {
+		for (const targetUrl of [
+			"file:///etc/passwd",
+			"bedrock://fixture/v1/messages",
+		]) {
+			const provider = baseProvider({ buildUrl: () => targetUrl });
+
+			expect(() =>
+				materializeProviderAttemptPlan(provider, context(accountFixture())),
+			).toThrow("Invalid provider attempt plan targetUrl");
+		}
+
+		const customBedrockProvider = baseProvider({
+			name: "bedrock",
+			createAttemptPlan: () =>
+				customPlan({
+					providerName: "bedrock",
+					targetUrl: "bedrock://fixture/v1/messages",
+				}),
+		});
+		expect(() =>
+			materializeProviderAttemptPlan(
+				customBedrockProvider,
+				context(accountFixture(), {
+					physicalModel: "gpt-5.6-sol",
+					capabilityProofKey: "proof:custom",
+					inputReplayMode: ["proxy-evidence-v1"],
+					outputReplayMode: ["proxy-evidence-v1"],
+				}),
+			),
+		).toThrow("Invalid provider attempt plan targetUrl");
+	});
+
+	test("skips unused planning Request and ArrayBuffer copies for ordinary legacy providers", () => {
+		const callerRequest = requestFor();
+		let cloneCalls = 0;
+		Object.defineProperty(callerRequest, "clone", {
+			configurable: true,
+			value() {
+				cloneCalls += 1;
+				throw new Error("ordinary providers must not clone planning requests");
+			},
+		});
+		const detachedBuffer = new Uint8Array([1, 2, 3]).buffer;
+		structuredClone(detachedBuffer, { transfer: [detachedBuffer] });
+
+		const plan = materializeProviderAttemptPlan(
+			baseProvider(),
+			context(accountFixture(), {
+				request: callerRequest,
+				requestBodyBuffer: detachedBuffer,
+			}),
+		);
+
+		expect(plan.targetUrl).toBe("https://fixture.invalid/v1/messages");
+		expect(cloneCalls).toBe(0);
+	});
+
 	for (const planningMode of ["legacy", "custom"] as const) {
 		test(`gives ${planningMode} planning private Request and ArrayBuffer copies`, async () => {
 			const callerRequest = new Request(

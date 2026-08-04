@@ -40,6 +40,7 @@ const DEADLINE_ENVS = [
 	PRE_TRANSPORT_AGENT_INTERCEPTION_TIMEOUT_ENV,
 	PRE_TRANSPORT_ACCOUNT_SELECTION_TIMEOUT_ENV,
 	PRE_TRANSPORT_CREDENTIAL_RESOLUTION_TIMEOUT_ENV,
+	"CCFLARE_SERVER_TOOL_WEB_SEARCH",
 ] as const;
 const originalEnv = new Map(
 	DEADLINE_ENVS.map((name) => [name, process.env[name]] as const),
@@ -164,6 +165,7 @@ beforeEach(() => {
 	process.env[PRE_TRANSPORT_AGENT_INTERCEPTION_TIMEOUT_ENV] = "5";
 	process.env[PRE_TRANSPORT_ACCOUNT_SELECTION_TIMEOUT_ENV] = "5";
 	process.env[PRE_TRANSPORT_CREDENTIAL_RESOLUTION_TIMEOUT_ENV] = "5";
+	process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH = "1";
 	const collectorSpy = spyOn(
 		usageCollectorModule,
 		"getUsageCollector",

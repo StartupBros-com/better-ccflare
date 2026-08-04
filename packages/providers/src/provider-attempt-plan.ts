@@ -47,6 +47,18 @@ interface CapturedProviderDescriptor {
 	readonly parseUsage: Provider["parseUsage"];
 }
 
+type ValidatedProviderAttemptPlanContext = Readonly<{
+	request: Request;
+	requestBodyBuffer: ArrayBuffer | null;
+	account: Account;
+	path: string;
+	query: string;
+	physicalModel: string | null;
+	capabilityProofKey: string | null;
+	inputReplayMode: readonly ServerToolReplayAtom[];
+	outputReplayMode: readonly ServerToolReplayAtom[];
+}>;
+
 function isRecord(value: unknown): value is UnknownRecord {
 	return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -222,15 +234,33 @@ function requireStableProviderDescriptor(
 	}
 }
 
-function normalizeTargetUrl(value: unknown): string {
+function normalizeTargetUrl(
+	value: unknown,
+	legacyProviderName?: string,
+): string {
 	const targetUrl = requireNonEmptyString(value, "targetUrl");
+	// Bedrock's legacy adapter dispatches through the AWS SDK and uses this
+	// provider-owned scheme only as the Request-compatible transport target.
+	const isLegacyBedrockTarget =
+		legacyProviderName === "bedrock" && targetUrl.startsWith("bedrock://");
 	let parsed: URL;
 	try {
 		parsed = new URL(targetUrl);
 	} catch {
 		throw new TypeError("Invalid provider attempt plan targetUrl");
 	}
-	if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+	if (
+		parsed.protocol !== "http:" &&
+		parsed.protocol !== "https:" &&
+		!(
+			isLegacyBedrockTarget &&
+			parsed.protocol === "bedrock:" &&
+			parsed.hostname.length > 0 &&
+			parsed.username.length === 0 &&
+			parsed.password.length === 0 &&
+			parsed.hash.length === 0
+		)
+	) {
 		throw new TypeError("Invalid provider attempt plan targetUrl");
 	}
 	return targetUrl;
@@ -491,17 +521,9 @@ function validateLegacyAccountView(
 	}
 }
 
-function validateContext(context: ProviderAttemptPlanContext): Readonly<{
-	request: Request;
-	requestBodyBuffer: ArrayBuffer | null;
-	account: Account;
-	path: string;
-	query: string;
-	physicalModel: string | null;
-	capabilityProofKey: string | null;
-	inputReplayMode: readonly ServerToolReplayAtom[];
-	outputReplayMode: readonly ServerToolReplayAtom[];
-}> {
+function validateContext(
+	context: ProviderAttemptPlanContext,
+): ValidatedProviderAttemptPlanContext {
 	if (!isRecord(context) || !(context.request instanceof Request)) {
 		throw new TypeError("Invalid provider attempt plan context");
 	}
@@ -514,27 +536,9 @@ function validateContext(context: ProviderAttemptPlanContext): Readonly<{
 	if (!isRecord(context.account)) {
 		throw new TypeError("Invalid provider attempt plan account");
 	}
-	if (context.request.bodyUsed) {
-		throw new TypeError("Unable to copy provider attempt plan request");
-	}
-	let requestBodyBuffer: ArrayBuffer | null = null;
-	if (context.requestBodyBuffer !== null) {
-		try {
-			requestBodyBuffer = new Uint8Array(context.requestBodyBuffer).slice()
-				.buffer;
-		} catch {
-			throw new TypeError("Unable to copy provider attempt plan request body");
-		}
-	}
-	let request: Request;
-	try {
-		request = context.request.clone();
-	} catch {
-		throw new TypeError("Unable to copy provider attempt plan request");
-	}
 	return {
-		request,
-		requestBodyBuffer,
+		request: context.request,
+		requestBodyBuffer: context.requestBodyBuffer,
 		account: context.account,
 		path: requireNonEmptyString(context.path, "path"),
 		query:
@@ -554,9 +558,37 @@ function validateContext(context: ProviderAttemptPlanContext): Readonly<{
 	};
 }
 
+function copyPlanningInputs(
+	context: ValidatedProviderAttemptPlanContext,
+): ValidatedProviderAttemptPlanContext {
+	if (context.request.bodyUsed) {
+		throw new TypeError("Unable to copy provider attempt plan request");
+	}
+	let requestBodyBuffer: ArrayBuffer | null = null;
+	if (context.requestBodyBuffer !== null) {
+		try {
+			requestBodyBuffer = new Uint8Array(context.requestBodyBuffer).slice()
+				.buffer;
+		} catch {
+			throw new TypeError("Unable to copy provider attempt plan request body");
+		}
+	}
+	let request: Request;
+	try {
+		request = context.request.clone();
+	} catch {
+		throw new TypeError("Unable to copy provider attempt plan request");
+	}
+	return {
+		...context,
+		request,
+		requestBodyBuffer,
+	};
+}
+
 function materializeCustomPlan(
 	provider: Provider,
-	context: ReturnType<typeof validateContext>,
+	context: ValidatedProviderAttemptPlanContext,
 	providerDescriptor: Readonly<CapturedProviderDescriptor>,
 ): ProviderAttemptPlan {
 	const planningContext: ProviderAttemptPlanContext = Object.freeze({
@@ -700,7 +732,7 @@ function materializeCustomPlan(
 
 function materializeLegacyPlan(
 	provider: Provider,
-	context: ReturnType<typeof validateContext>,
+	context: ValidatedProviderAttemptPlanContext,
 	providerDescriptor: Readonly<CapturedProviderDescriptor>,
 ): ProviderAttemptPlan {
 	const accountView = createScalarAccountView(context.account);
@@ -748,7 +780,7 @@ function materializeLegacyPlan(
 
 	const plan: ProviderAttemptPlan = {
 		providerName: providerDescriptor.providerName,
-		targetUrl: normalizeTargetUrl(targetUrl),
+		targetUrl: normalizeTargetUrl(targetUrl, providerDescriptor.providerName),
 		apiFamily: `legacy:${providerDescriptor.providerName}`,
 		physicalModel: context.physicalModel,
 		capabilityProofKey: context.capabilityProofKey,
@@ -820,12 +852,14 @@ export function materializeProviderAttemptPlan(
 	const validatedContext = validateContext(context);
 	const providerDescriptor = captureProviderDescriptor(provider);
 	requireStableProviderDescriptor(provider, providerDescriptor);
+	// Defensive body-sized copies exist only for hooks that can observe them.
+	const planningContext =
+		providerDescriptor.createAttemptPlan !== undefined ||
+		providerDescriptor.prepareRequest !== undefined
+			? copyPlanningInputs(validatedContext)
+			: validatedContext;
 	if (providerDescriptor.createAttemptPlan !== undefined) {
-		return materializeCustomPlan(
-			provider,
-			validatedContext,
-			providerDescriptor,
-		);
+		return materializeCustomPlan(provider, planningContext, providerDescriptor);
 	}
-	return materializeLegacyPlan(provider, validatedContext, providerDescriptor);
+	return materializeLegacyPlan(provider, planningContext, providerDescriptor);
 }

@@ -10,6 +10,7 @@ import type {
 	ServerToolCapabilityProof,
 	ServerToolCapabilityTuple,
 	ServerToolRequirements,
+	StrategyStore,
 } from "@better-ccflare/types";
 import type {
 	AnthropicDegradedCohortKey,
@@ -31,6 +32,7 @@ mock.module("@better-ccflare/database", () => ({
 const { getProvider, registerProvider, usageCache } = await import(
 	"@better-ccflare/providers"
 );
+const { SessionStrategy } = await import("@better-ccflare/load-balancer");
 const {
 	ForceRouteUnavailableError,
 	getCapacityDeferredModelRoutes,
@@ -149,6 +151,22 @@ function makeCtx(
 		refreshInFlight: new Map(),
 		asyncWriter: { enqueue: mock(() => {}) },
 	} as unknown as ProxyContext;
+}
+
+function useSessionStrategy(ctx: ProxyContext): {
+	resumeAccount: ReturnType<typeof mock>;
+} {
+	const resumeAccount = mock(async (_accountId: string) => ({
+		resumed: true,
+		pauseReason: null,
+	}));
+	const strategy = new SessionStrategy();
+	strategy.initialize({
+		resetAccountSession: mock((_accountId: string, _timestamp: number) => {}),
+		resumeAccount,
+	} as StrategyStore);
+	ctx.strategy = strategy;
+	return { resumeAccount };
 }
 
 const SERVER_TOOL_REQUIREMENTS: ServerToolRequirements = Object.freeze({
@@ -3284,6 +3302,23 @@ describe("selectAccountsForRequest — atomic combo capacity", () => {
 });
 
 describe("selectAccountsForRequest — server-tool capability-first routing", () => {
+	function blockedFableCapacity() {
+		return {
+			spend: { enabled: false },
+			limits: [
+				{
+					kind: "weekly_scoped",
+					percent: 100,
+					resets_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+					scope: {
+						model: { id: null, display_name: "Fable" },
+						surface: null,
+					},
+				},
+			],
+		};
+	}
+
 	it("does not allocate capability metadata or call capability hooks for ordinary requests", async () => {
 		const providerName = "u4-ordinary-provider";
 		const onTuple = mock((_context: CapabilityProviderContext) => {});
@@ -3432,7 +3467,7 @@ describe("selectAccountsForRequest — server-tool capability-first routing", ()
 			const firstTailId = `capacity-deferred:${account.id}:claude-opus-4-8`;
 			const provenTailId = `capacity-deferred:${account.id}:claude-sonnet-4-5`;
 			expect(result).toEqual([]);
-			expect(ctx.strategy.select).toHaveBeenCalledWith([], meta);
+			expect(ctx.strategy.select).toHaveBeenCalledWith([account], meta);
 			expect(getCapacityDeferredModelRoutes(meta)).toMatchObject([
 				{
 					account,
@@ -3557,6 +3592,351 @@ describe("selectAccountsForRequest — server-tool capability-first routing", ()
 		expect(proof?.outputReplayMode).toEqual(["native-Anthropic"]);
 		expect(Object.isFrozen(proof)).toBe(true);
 		expect(Object.isFrozen(proof?.outputReplayMode)).toBe(true);
+	});
+
+	it("lets a proven expired overage pause reach SessionStrategy auto-resume", async () => {
+		const previous = installCapabilityProvider({
+			name: "anthropic",
+			decision: provenDecision,
+		});
+		try {
+			const account = makeAccount({
+				id: "normal-overage-resume",
+				paused: true,
+				pause_reason: "overage",
+				auto_fallback_enabled: true,
+				rate_limit_reset: Date.now() - 5_000,
+				rate_limited_until: Date.now() - 5_000,
+				model_mappings: JSON.stringify({ opus: "physical-overage" }),
+			});
+			const ctx = makeCtx({ accounts: [account] });
+			const { resumeAccount } = useSessionStrategy(ctx);
+			const meta = serverToolMeta();
+
+			const result = await selectAccountsForRequest(
+				meta,
+				ctx,
+				"claude-opus-4-8",
+			);
+
+			expect(resumeAccount).toHaveBeenCalledTimes(1);
+			expect(resumeAccount).toHaveBeenCalledWith(account.id);
+			expect(account.paused).toBe(false);
+			expect(result).toEqual([account]);
+			expect(
+				meta.routingCandidates?.map(
+					({ candidateId, serverToolCapability }) => ({
+						candidateId,
+						decision: serverToolCapability?.decision,
+						proofKey: serverToolCapability?.proofKey,
+					}),
+				),
+			).toEqual([
+				{
+					candidateId: `account:${account.id}`,
+					decision: "proven",
+					proofKey: expect.any(String),
+				},
+			]);
+			expect(meta.serverToolCapabilitySummary).toMatchObject({
+				provenCandidateCount: 1,
+				temporarilyUnavailableProvenCandidateCount: 0,
+				eligibleCandidateCount: 1,
+			});
+		} finally {
+			if (previous) registerProvider(previous);
+		}
+	});
+
+	it("does not publish a clear capacity fallback for a proven non-resumable pause", async () => {
+		const previous = installCapabilityProvider({
+			name: "anthropic",
+			decision: provenDecision,
+		});
+		try {
+			const account = makeAccount({
+				id: "capacity-manual-no-resume",
+				paused: true,
+				pause_reason: "manual",
+				auto_fallback_enabled: true,
+				rate_limit_reset: Date.now() - 5_000,
+				rate_limited_until: Date.now() - 5_000,
+				model_mappings: JSON.stringify({
+					fable: ["claude-fable-5", "claude-opus-4-8"],
+				}),
+			});
+			cacheUsage(account.id, blockedFableCapacity());
+			const ctx = makeCtx({ accounts: [account] });
+			const { resumeAccount } = useSessionStrategy(ctx);
+			const meta = serverToolMeta();
+
+			await expect(
+				selectAccountsForRequest(meta, ctx, "claude-fable-5"),
+			).rejects.toMatchObject({
+				name: "ServerToolRoutingError",
+				reason: "temporary_unavailable",
+			});
+			expect(resumeAccount).not.toHaveBeenCalled();
+			expect(account.paused).toBe(true);
+			expect(getCapacityDeferredModelRoutes(meta)).toEqual([]);
+			expect(meta.routingCandidates).toEqual([]);
+			expect(
+				meta.routingCandidateCatalog?.map(({ candidateId }) => candidateId),
+			).toEqual([`account:${account.id}`]);
+			expect(meta.serverToolCapabilitySummary).toMatchObject({
+				structuralCandidateCount: 1,
+				provenCandidateCount: 1,
+				temporarilyUnavailableProvenCandidateCount: 1,
+				eligibleCandidateCount: 0,
+			});
+		} finally {
+			if (previous) registerProvider(previous);
+		}
+	});
+
+	it("resumes a reset-qualified paused account before publishing its clear capacity fallback", async () => {
+		const previous = installCapabilityProvider({
+			name: "anthropic",
+			decision: provenDecision,
+		});
+		try {
+			const account = makeAccount({
+				id: "capacity-overage-resume",
+				paused: true,
+				pause_reason: "overage",
+				auto_fallback_enabled: true,
+				rate_limit_reset: Date.now() - 5_000,
+				rate_limited_until: Date.now() - 5_000,
+				model_mappings: JSON.stringify({
+					fable: ["claude-fable-5", "claude-opus-4-8"],
+				}),
+			});
+			cacheUsage(account.id, blockedFableCapacity());
+			const ctx = makeCtx({ accounts: [account] });
+			const { resumeAccount } = useSessionStrategy(ctx);
+			const meta = serverToolMeta();
+
+			const result = await selectAccountsForRequest(
+				meta,
+				ctx,
+				"claude-fable-5",
+			);
+
+			expect(resumeAccount).toHaveBeenCalledTimes(1);
+			expect(resumeAccount).toHaveBeenCalledWith(account.id);
+			expect(account.paused).toBe(false);
+			expect(result).toEqual([]);
+			expect(getCapacityDeferredModelRoutes(meta)).toMatchObject([
+				{
+					account,
+					candidateId: `capacity-deferred:${account.id}:claude-opus-4-8`,
+					model: "claude-opus-4-8",
+					fallbackRank: 0,
+				},
+			]);
+			expect(meta.routingCandidates).toEqual([]);
+			expect(
+				meta.routingCandidateCatalog?.map(({ candidateId }) => candidateId),
+			).toEqual([
+				`account:${account.id}`,
+				`capacity-deferred:${account.id}:claude-opus-4-8`,
+			]);
+			expect(meta.serverToolCapabilitySummary).toMatchObject({
+				structuralCandidateCount: 2,
+				provenCandidateCount: 2,
+				temporarilyUnavailableProvenCandidateCount: 1,
+				eligibleCandidateCount: 1,
+			});
+		} finally {
+			if (previous) registerProvider(previous);
+		}
+	});
+
+	it("auto-resumes a proven rate-limit-window account across duplicate combo slots without losing sidecars", async () => {
+		const previous = installCapabilityProvider({
+			name: "anthropic",
+			decision: provenDecision,
+		});
+		try {
+			const account = makeAccount({
+				id: "combo-rate-window-resume",
+				paused: true,
+				pause_reason: "rate_limit_window",
+				auto_fallback_enabled: true,
+				rate_limit_reset: Date.now() - 5_000,
+				rate_limited_until: Date.now() - 5_000,
+				model_mappings: JSON.stringify({
+					"claude-opus-4-8": "physical-combo-a",
+					"claude-opus-4-5": "physical-combo-b",
+				}),
+			});
+			const combo = makeCombo([
+				{
+					id: "resume-slot-a",
+					combo_id: "combo-1",
+					account_id: account.id,
+					model: "claude-opus-4-8",
+					priority: 0,
+					enabled: true,
+				},
+				{
+					id: "resume-slot-b",
+					combo_id: "combo-1",
+					account_id: account.id,
+					model: "claude-opus-4-5",
+					priority: 1,
+					enabled: true,
+				},
+			]);
+			const ctx = makeCtx({ accounts: [account], activeCombo: combo });
+			const { resumeAccount } = useSessionStrategy(ctx);
+			const meta = serverToolMeta();
+
+			const result = await selectAccountsForRequest(
+				meta,
+				ctx,
+				"claude-opus-4-8",
+			);
+
+			expect(resumeAccount).toHaveBeenCalledTimes(1);
+			expect(account.paused).toBe(false);
+			expect(result).toEqual([account, account]);
+			expect(
+				meta.routingCandidates?.map(
+					({ candidateId, serverToolCapability }) => ({
+						candidateId,
+						decision: serverToolCapability?.decision,
+						proofKey: serverToolCapability?.proofKey,
+					}),
+				),
+			).toEqual([
+				{
+					candidateId: "combo:combo-1:slot:resume-slot-a",
+					decision: "proven",
+					proofKey: expect.any(String),
+				},
+				{
+					candidateId: "combo:combo-1:slot:resume-slot-b",
+					decision: "proven",
+					proofKey: expect.any(String),
+				},
+			]);
+			expect(getComboSlotInfo(meta)?.slots).toEqual([
+				{ accountId: account.id, modelOverride: "claude-opus-4-8" },
+				{ accountId: account.id, modelOverride: "claude-opus-4-5" },
+			]);
+			expect(meta.serverToolCapabilitySummary).toMatchObject({
+				structuralCandidateCount: 2,
+				provenCandidateCount: 2,
+				eligibleCandidateCount: 2,
+			});
+		} finally {
+			if (previous) registerProvider(previous);
+		}
+	});
+
+	for (const pauseReason of ["manual", "failure_threshold"] as const) {
+		it(`keeps a proven ${pauseReason} pause unavailable without attempting resume`, async () => {
+			const previous = installCapabilityProvider({
+				name: "anthropic",
+				decision: provenDecision,
+			});
+			try {
+				const account = makeAccount({
+					id: `non-resumable-${pauseReason}`,
+					paused: true,
+					pause_reason: pauseReason,
+					auto_fallback_enabled: true,
+					rate_limit_reset: Date.now() - 5_000,
+					rate_limited_until: Date.now() - 5_000,
+					model_mappings: JSON.stringify({ opus: "physical-control" }),
+				});
+				const ctx = makeCtx({ accounts: [account] });
+				const { resumeAccount } = useSessionStrategy(ctx);
+				const meta = serverToolMeta();
+
+				await expect(
+					selectAccountsForRequest(meta, ctx, "claude-opus-4-8"),
+				).rejects.toMatchObject({
+					name: "ServerToolRoutingError",
+					reason: "temporary_unavailable",
+				});
+				expect(resumeAccount).not.toHaveBeenCalled();
+				expect(account.paused).toBe(true);
+				expect(meta.routingCandidates).toEqual([]);
+				expect(meta.serverToolCapabilitySummary).toMatchObject({
+					provenCandidateCount: 1,
+					temporarilyUnavailableProvenCandidateCount: 1,
+					eligibleCandidateCount: 0,
+				});
+			} finally {
+				if (previous) registerProvider(previous);
+			}
+		});
+	}
+
+	it("never lets an incapable reset-qualified candidate reach resume and keeps the capable proof aligned", async () => {
+		const previous = installCapabilityProvider({
+			name: "anthropic",
+			decision: (_context, tuple) =>
+				tuple.candidateId.includes("incapable-reset")
+					? {
+							decision: "unsupported",
+							proof: proofFor(tuple, "unsupported"),
+						}
+					: provenDecision(_context, tuple),
+		});
+		try {
+			const incapable = makeAccount({
+				id: "incapable-reset",
+				paused: true,
+				pause_reason: "overage",
+				auto_fallback_enabled: true,
+				rate_limit_reset: Date.now() - 5_000,
+				rate_limited_until: Date.now() - 5_000,
+				model_mappings: JSON.stringify({ opus: "physical-incapable" }),
+			});
+			const capable = makeAccount({
+				id: "capable-control",
+				priority: 1,
+				model_mappings: JSON.stringify({ opus: "physical-capable" }),
+			});
+			const ctx = makeCtx({ accounts: [incapable, capable] });
+			const { resumeAccount } = useSessionStrategy(ctx);
+			const meta = serverToolMeta();
+
+			const result = await selectAccountsForRequest(
+				meta,
+				ctx,
+				"claude-opus-4-8",
+			);
+
+			expect(resumeAccount).not.toHaveBeenCalled();
+			expect(incapable.paused).toBe(true);
+			expect(result).toEqual([capable]);
+			expect(
+				meta.routingCandidateCatalog?.map(
+					({ candidateId, serverToolCapability }) => ({
+						candidateId,
+						decision: serverToolCapability?.decision,
+					}),
+				),
+			).toEqual([
+				{ candidateId: `account:${incapable.id}`, decision: "unsupported" },
+				{ candidateId: `account:${capable.id}`, decision: "proven" },
+			]);
+			expect(meta.routingCandidates).toHaveLength(1);
+			expect(meta.routingCandidates?.[0]).toMatchObject({
+				candidateId: `account:${capable.id}`,
+				accountId: capable.id,
+				serverToolCapability: {
+					decision: "proven",
+					proofKey: expect.any(String),
+				},
+			});
+		} finally {
+			if (previous) registerProvider(previous);
+		}
 	});
 
 	it("fails malformed, mismatched, thenable, and throwing resolver results closed", async () => {

@@ -43,6 +43,7 @@ const SONNET = "claude-sonnet-4-5";
 
 const originalFetch = globalThis.fetch;
 const originalOverloadRetry = process.env.CCFLARE_OVERLOAD_RETRY_ENABLED;
+const originalServerToolWebSearch = process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH;
 const cachedUsageAccountIds = new Set<string>();
 let restoreUsageCollector = (): void => {};
 let usageHandleStart = mock(() => undefined);
@@ -446,6 +447,7 @@ beforeEach(() => {
 	resetRateLimitProbeGatesForTests();
 	installUsageCollector();
 	process.env.CCFLARE_OVERLOAD_RETRY_ENABLED = "false";
+	process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH = "1";
 });
 
 afterEach(() => {
@@ -459,6 +461,11 @@ afterEach(() => {
 		delete process.env.CCFLARE_OVERLOAD_RETRY_ENABLED;
 	} else {
 		process.env.CCFLARE_OVERLOAD_RETRY_ENABLED = originalOverloadRetry;
+	}
+	if (originalServerToolWebSearch === undefined) {
+		delete process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH;
+	} else {
+		process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH = originalServerToolWebSearch;
 	}
 });
 

@@ -39,6 +39,7 @@ const { handleProxy } = await import("../proxy");
 const MODEL = "claude-sonnet-4-5";
 const originalFetch = globalThis.fetch;
 const originalPassthrough = process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
+const originalServerToolWebSearch = process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH;
 let restoreUsageCollectors = (): void => {};
 
 function makeAccount(overrides: Partial<Account> = {}): Account {
@@ -317,6 +318,7 @@ function makeServerToolRequest(
 
 beforeEach(() => {
 	process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL = "1";
+	process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH = "1";
 	const collector = {
 		handleStart: mock(() => undefined),
 		handleChunk: mock(() => undefined),
@@ -345,9 +347,49 @@ afterEach(() => {
 	} else {
 		process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL = originalPassthrough;
 	}
+	if (originalServerToolWebSearch === undefined) {
+		delete process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH;
+	} else {
+		process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH = originalServerToolWebSearch;
+	}
 });
 
 describe("server-tool routing integration", () => {
+	it("preserves native server-tool passthrough while admission is default-off", async () => {
+		delete process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH;
+		const account = makeAccount({
+			access_token: "test-token",
+			expires_at: Date.now() + 60 * 60_000,
+		});
+		const { ctx, refreshCalls, mutations } = makeContext(account);
+		let forwardedBody: Record<string, unknown> | undefined;
+		globalThis.fetch = mock(async (request: Request) => {
+			forwardedBody = (await request.clone().json()) as Record<string, unknown>;
+			return new Response(JSON.stringify({ type: "message", content: [] }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		});
+		const request = makeServerToolRequest({ invalid: true });
+
+		const response = await handleProxy(request, new URL(request.url), ctx);
+
+		expect(response.status).toBe(200);
+		expect(ctx.strategy.select).toHaveBeenCalledTimes(1);
+		expect(refreshCalls.value).toBe(0);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+		expect(forwardedBody?.tools).toEqual([
+			{
+				type: "web_search_20250305",
+				name: "web_search",
+				allowed_domains: ["example.com"],
+				blocked_domains: ["blocked.example"],
+			},
+		]);
+		expect(mutations.pauseAccount).toHaveBeenCalledTimes(0);
+		expect(mutations.markAccountRateLimited).toHaveBeenCalledTimes(0);
+	});
+
 	it("validates the winning post-interception requirement locally", async () => {
 		const account = makeAccount();
 		const { ctx, refreshCalls, mutations, getAgentPreference } =
