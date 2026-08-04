@@ -7,6 +7,7 @@
 import { describe, expect, it } from "bun:test";
 import {
 	getSupportedReasoningEfforts,
+	isGpt56SolModel,
 	resolveReasoningEffort,
 	validateReasoningEffort,
 } from "./reasoning";
@@ -35,6 +36,35 @@ describe("reasoning effort support", () => {
 			"low",
 			"medium",
 		]);
+	});
+
+	it("supports max only at the GPT-5.6 model boundary", () => {
+		for (const model of ["gpt-5.6", "gpt-5.6-sol", "openai/gpt-5.6-preview"]) {
+			expect(getSupportedReasoningEfforts(model)).toContain("max");
+		}
+
+		for (const model of ["gpt-5.60", "gpt-5.6preview", "gpt-5.5"]) {
+			expect(getSupportedReasoningEfforts(model)).not.toContain("max");
+		}
+	});
+
+	it("detects provider-prefixed GPT-5.6 Sol names without matching lookalikes", () => {
+		for (const model of [
+			"gpt-5.6-sol",
+			"  openai/gpt-5.6-sol  ",
+			"azure/openai/gpt-5.6-sol-preview",
+		]) {
+			expect(isGpt56SolModel(model)).toBe(true);
+		}
+
+		for (const model of [
+			"gpt-5.6-terra",
+			"gpt-5.6-solar",
+			"openai/gpt-5.6-solstice",
+			"gpt-5.60-sol",
+		]) {
+			expect(isGpt56SolModel(model)).toBe(false);
+		}
 	});
 
 	it("accepts valid reasoning effort for supported Claude and Codex models", () => {
@@ -66,6 +96,16 @@ describe("reasoning effort support", () => {
 			validateReasoningEffort("extreme", {
 				sourceModel: "claude-sonnet-4-6",
 				targetModel: "gpt-5.3-codex",
+			}),
+		).toThrow(
+			"reasoning.effort must be one of: minimal, low, medium, high, xhigh, max",
+		);
+	});
+
+	it("keeps ultra invalid for GPT-5.6", () => {
+		expect(() =>
+			validateReasoningEffort("ultra", {
+				targetModel: "gpt-5.6-sol",
 			}),
 		).toThrow(
 			"reasoning.effort must be one of: minimal, low, medium, high, xhigh, max",

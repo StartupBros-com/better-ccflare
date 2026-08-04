@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+	CODEX_LOGICAL_MODEL_FAMILY_HEADER,
 	GUARD_CORRELATION_SECRET_HEADER,
 	GUARD_REQUEST_ID_HEADER,
 	sanitizeProxyHeaders,
@@ -38,6 +39,18 @@ describe("sanitizeProxyHeaders", () => {
 		expect(
 			sanitizeProxyHeaders(original).has("x-better-ccflare-pool-status"),
 		).toBe(false);
+	});
+
+	test("strips a mixed-case logical-family carrier from raw upstream responses", () => {
+		const original = new Headers({
+			"content-type": "application/json",
+			"X-Better-Ccflare-Logical-Model-Family": "fable",
+		});
+
+		const sanitized = sanitizeProxyHeaders(original);
+
+		expect(sanitized.has(CODEX_LOGICAL_MODEL_FAMILY_HEADER)).toBe(false);
+		expect(sanitized.get("content-type")).toBe("application/json");
 	});
 });
 

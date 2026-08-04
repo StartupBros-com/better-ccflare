@@ -37,12 +37,17 @@ const CLAUDE_REASONING_EFFORTS: Record<
 
 const TARGET_REASONING_EFFORTS: Record<string, readonly ReasoningEffort[]> = {
 	"gpt-5": ["minimal", "low", "medium", "high", "xhigh"],
+	"gpt-5.6": ["minimal", "low", "medium", "high", "xhigh", "max"],
 	"gpt-5.3-codex": ["minimal", "low", "medium", "high", "xhigh"],
 	"gpt-5.4-mini": ["low", "medium"],
 };
 
 function normalizeTargetModelName(model: string): string {
 	return model.toLowerCase().trim().replace(/^.*\//, "");
+}
+
+export function isGpt56SolModel(model: string): boolean {
+	return /^gpt-5\.6-sol(?:$|-)/.test(normalizeTargetModelName(model));
 }
 
 export function getSupportedReasoningEfforts(
@@ -56,6 +61,10 @@ export function getSupportedReasoningEfforts(
 
 	if (normalized in TARGET_REASONING_EFFORTS) {
 		return TARGET_REASONING_EFFORTS[normalized];
+	}
+
+	if (/^gpt-5\.6(?:$|-)/.test(normalized)) {
+		return TARGET_REASONING_EFFORTS["gpt-5.6"];
 	}
 
 	if (normalized.startsWith("gpt-5")) {

@@ -14,6 +14,10 @@ export const GUARD_REQUEST_ID_HEADER =
 export const GUARD_CORRELATION_SECRET_HEADER =
 	"x-better-ccflare-guard-correlation-secret" as const;
 
+/** Private proxy-to-provider carrier for the normalized logical Claude family. */
+export const CODEX_LOGICAL_MODEL_FAMILY_HEADER =
+	"x-better-ccflare-logical-model-family" as const;
+
 /**
  * Sanitizes proxy headers by removing hop-by-hop headers that should not be forwarded
  * after Bun has automatically decompressed the response body, and reserved,
@@ -21,7 +25,8 @@ export const GUARD_CORRELATION_SECRET_HEADER =
  *
  * Removes: content-encoding, content-length, transfer-encoding,
  * x-better-ccflare-pool-status, x-better-ccflare-recovery-scope,
- * x-better-ccflare-guard-request-id
+ * x-better-ccflare-guard-request-id,
+ * x-better-ccflare-logical-model-family
  */
 export function sanitizeProxyHeaders(original: Headers): Headers {
 	const sanitized = new Headers(original);
@@ -48,6 +53,7 @@ export function sanitizeProxyHeaders(original: Headers): Headers {
 	// a same-named value that the client or guard could mistake for internal state.
 	sanitized.delete(GUARD_REQUEST_ID_HEADER);
 	sanitized.delete(GUARD_CORRELATION_SECRET_HEADER);
+	sanitized.delete(CODEX_LOGICAL_MODEL_FAMILY_HEADER);
 
 	return sanitized;
 }

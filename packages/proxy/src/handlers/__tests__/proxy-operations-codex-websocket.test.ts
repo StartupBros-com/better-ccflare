@@ -11,6 +11,7 @@ import {
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { CODEX_LOGICAL_MODEL_FAMILY_HEADER } from "@better-ccflare/http-common";
 import type { Account, RequestMeta } from "@better-ccflare/types";
 import { CACHE_REPLAY_MODEL_HEADER } from "../../cache-transport-staging";
 import {
@@ -374,6 +375,7 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 
 		const attempts: Array<{
 			conversationIdentity: string | null | undefined;
+			logicalModelFamily: string | null;
 			promptCacheKey: string | undefined;
 		}> = [];
 		spyOn(codexWebSocketTransport, "tryRequest").mockImplementation(
@@ -385,6 +387,9 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 					conversationIdentity: (
 						input as typeof input & { conversationIdentity?: string | null }
 					).conversationIdentity,
+					logicalModelFamily: input.request.headers.get(
+						CODEX_LOGICAL_MODEL_FAMILY_HEADER,
+					),
 					promptCacheKey: payload.prompt_cache_key,
 				});
 				return null;
@@ -451,6 +456,11 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 		}
 
 		expect(attempts).toHaveLength(3);
+		expect(attempts.map((attempt) => attempt.logicalModelFamily)).toEqual([
+			null,
+			null,
+			null,
+		]);
 		expect(upstreamConversationHeaders).toEqual([null, null, null]);
 		expect(
 			new Set(attempts.map((attempt) => attempt.promptCacheKey)).size,
