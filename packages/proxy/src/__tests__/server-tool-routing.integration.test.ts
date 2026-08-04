@@ -418,6 +418,99 @@ describe("server-tool routing integration", () => {
 		expect(response.headers.has("x-better-ccflare-recovery-scope")).toBeFalse();
 	});
 
+	it("stops a declaration-proven replay-ineligible pool before strategy, credentials, provider I/O, mutation, or dispatch", async () => {
+		const first = makeAccount({
+			id: "replay-ineligible-first",
+			name: "replay-ineligible-first",
+		});
+		const second = makeAccount({
+			id: "replay-ineligible-second",
+			name: "replay-ineligible-second",
+			priority: 1,
+		});
+		const providerIo = {
+			buildUrl: mock(() => "https://capability.invalid/v1/responses"),
+			prepareHeaders: mock((headers: Headers) => new Headers(headers)),
+			processResponse: mock(async (response: Response) => response),
+			parseRateLimit: mock(() => ({ isRateLimited: false })),
+			transformRequestBody: mock(async (request: Request) => request),
+		};
+		const resolveCapability = mock(
+			(
+				_requirements: Parameters<
+					NonNullable<Provider["resolveServerToolCapability"]>
+				>[0],
+				tuple: ServerToolCapabilityTuple,
+			) => ({
+				decision: "proven" as const,
+				proof: makeProof(tuple, `proxy-output-only:${tuple.candidateId}`),
+			}),
+		);
+		const { ctx, refreshCalls, mutations } = makeContext(
+			[first, second],
+			(provider) => {
+				provider.buildUrl = providerIo.buildUrl;
+				provider.prepareHeaders = providerIo.prepareHeaders;
+				provider.processResponse = providerIo.processResponse;
+				provider.parseRateLimit = providerIo.parseRateLimit;
+				provider.transformRequestBody = providerIo.transformRequestBody;
+				provider.createServerToolCapabilityTuple = (context) => ({
+					...makeTuple(context, provider.name),
+					inputReplay: [],
+					outputReplay: ["proxy-evidence-v1"],
+				});
+				provider.resolveServerToolCapability = resolveCapability;
+			},
+		);
+		globalThis.fetch = mock(
+			async () =>
+				new Response(JSON.stringify({ unexpected: true }), { status: 500 }),
+		);
+		const request = makeServerToolRequest();
+
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.json();
+
+		expect(response.status).toBe(503);
+		expect(body).toEqual({
+			type: "error",
+			error: {
+				type: "service_unavailable",
+				code: "server_tool_replay_unavailable",
+				reason: "replay_unavailable",
+				message:
+					"Server-tool replay configuration cannot satisfy this request.",
+				capability: {
+					structuralCandidateCount: 2,
+					provenCandidateCount: 2,
+					unsupportedCandidateCount: 0,
+					unknownCandidateCount: 0,
+					replayIneligibleCandidateCount: 2,
+					temporarilyUnavailableProvenCandidateCount: 0,
+					eligibleCandidateCount: 0,
+				},
+			},
+		});
+		expect(resolveCapability).toHaveBeenCalledTimes(2);
+		expect(ctx.strategy.select).toHaveBeenCalledTimes(0);
+		expect(ctx.strategy.reportCandidateSuccess).toHaveBeenCalledTimes(0);
+		expect(refreshCalls.value).toBe(0);
+		expect(providerIo.buildUrl).toHaveBeenCalledTimes(0);
+		expect(providerIo.prepareHeaders).toHaveBeenCalledTimes(0);
+		expect(providerIo.processResponse).toHaveBeenCalledTimes(0);
+		expect(providerIo.parseRateLimit).toHaveBeenCalledTimes(0);
+		expect(providerIo.transformRequestBody).toHaveBeenCalledTimes(0);
+		expect(mutations.pauseAccount).toHaveBeenCalledTimes(0);
+		expect(mutations.markAccountRateLimited).toHaveBeenCalledTimes(0);
+		expect(mutations.updateAccountUsage).toHaveBeenCalledTimes(0);
+		expect(mutations.asyncWrite).toHaveBeenCalledTimes(0);
+		expect(mutations.reportFailure).toHaveBeenCalledTimes(0);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+		expect(response.headers.has("retry-after")).toBeFalse();
+		expect(response.headers.has("x-better-ccflare-pool-status")).toBeFalse();
+		expect(response.headers.has("x-better-ccflare-recovery-scope")).toBeFalse();
+	});
+
 	it("skips a locally drifted candidate and succeeds through a proven sibling", async () => {
 		const first = makeAccount({
 			id: "capability-first",

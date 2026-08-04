@@ -525,6 +525,7 @@ export async function projectServerToolHistory({
 		let encryptedInputBytes = 0;
 		let finalizedReplacementTextBytes = 0;
 		let sequence = 0;
+		let citationReplayMode: "proxy" | "native" | null = null;
 
 		const pushReplacementDraft = (draft: ReplacementDraft): void => {
 			const nextFinalizedTextBytes =
@@ -817,12 +818,17 @@ export async function projectServerToolHistory({
 							if (typeof citation.encrypted_index !== "string") {
 								throw invalidProjection();
 							}
+							const mode = isProxyOpaqueValue(citation.encrypted_index)
+								? "proxy"
+								: "native";
+							if (citationReplayMode !== null && citationReplayMode !== mode) {
+								throw invalidProjection();
+							}
+							citationReplayMode = mode;
 							hostedCitations.push({
 								citationIndex,
 								citation,
-								mode: isProxyOpaqueValue(citation.encrypted_index)
-									? "proxy"
-									: "native",
+								mode,
 							});
 						}
 

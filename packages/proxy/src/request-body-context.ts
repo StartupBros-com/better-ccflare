@@ -15,54 +15,6 @@ function encodeJson(body: RequestJsonBody): ArrayBuffer {
 	);
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-/**
- * Freeze only the layers whose identity or top-level fields are inspected by
- * server-tool requirement derivation. Opaque schemas and provider payloads
- * nested below those blocks deliberately remain outside this boundary.
- */
-function freezeServerToolSemanticLayers(body: RequestJsonBody): void {
-	if (Array.isArray(body.tools)) {
-		for (const tool of body.tools) {
-			if (!isRecord(tool)) continue;
-			if (Array.isArray(tool.allowed_domains)) {
-				Object.freeze(tool.allowed_domains);
-			}
-			if (Array.isArray(tool.blocked_domains)) {
-				Object.freeze(tool.blocked_domains);
-			}
-			if (isRecord(tool.user_location)) {
-				Object.freeze(tool.user_location);
-			}
-			Object.freeze(tool);
-		}
-		Object.freeze(body.tools);
-	}
-
-	if (isRecord(body.tool_choice)) {
-		Object.freeze(body.tool_choice);
-	}
-
-	if (Array.isArray(body.messages)) {
-		for (const message of body.messages) {
-			if (!isRecord(message)) continue;
-			if (Array.isArray(message.content)) {
-				for (const block of message.content) {
-					if (isRecord(block)) Object.freeze(block);
-				}
-				Object.freeze(message.content);
-			}
-			Object.freeze(message);
-		}
-		Object.freeze(body.messages);
-	}
-
-	Object.freeze(body);
-}
-
 export class RequestBodyContext {
 	readonly originalBuffer: ArrayBuffer | null;
 
@@ -158,10 +110,9 @@ export class RequestBodyContext {
 			return this.serverToolRequirements;
 		}
 		const parsedBody = this.getParsedJson();
-		if (parsedBody) {
-			freezeServerToolSemanticLayers(parsedBody as RequestJsonBody);
-		}
-		this.serverToolRequirements = deriveServerToolRequirement(parsedBody);
+		this.serverToolRequirements = deriveServerToolRequirement(parsedBody, {
+			freezeSemanticLayers: true,
+		});
 		this.serverToolRequirementsFinalized = true;
 		return this.serverToolRequirements;
 	}

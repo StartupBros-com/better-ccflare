@@ -1,5 +1,6 @@
 import type { ServerToolReplayKeysState } from "@better-ccflare/config";
 import {
+	awaitServerToolReplayEnvelopeCodecReady,
 	createServerToolReplayEnvelopeCodec,
 	type ServerToolReplayEnvelopeCodec,
 	type ServerToolReplayEnvelopeKey,
@@ -64,10 +65,11 @@ function copyKeyBytes(value: unknown): Uint8Array | undefined {
 	return Uint8Array.from(value);
 }
 
-function composeReadyRuntime(
+async function composeReadyRuntime(
 	state: Record<string, unknown>,
-): ServerToolReplayRuntimeState {
+): Promise<ServerToolReplayRuntimeState> {
 	const temporaryKeyCopies: Uint8Array[] = [];
+	let codec: ServerToolReplayEnvelopeCodec | undefined;
 	try {
 		if (
 			!hasExactProperties(state, ["activeKeyId", "keys", "status"]) ||
@@ -123,16 +125,22 @@ function composeReadyRuntime(
 			return SERVER_TOOL_REPLAY_UNAVAILABLE;
 		}
 
-		const codec = createServerToolReplayEnvelopeCodec({
+		codec = createServerToolReplayEnvelopeCodec({
 			activeKey,
 			retainedKeys,
 			writerAdmission: WRITER_ADMISSION_DISABLED,
 		});
-		return Object.freeze({ status: "ready", codec: Object.freeze(codec) });
 	} catch {
 		return SERVER_TOOL_REPLAY_UNAVAILABLE;
 	} finally {
 		for (const key of temporaryKeyCopies) key.fill(0);
+	}
+
+	try {
+		await awaitServerToolReplayEnvelopeCodecReady(codec);
+		return Object.freeze({ status: "ready", codec: Object.freeze(codec) });
+	} catch {
+		return SERVER_TOOL_REPLAY_UNAVAILABLE;
 	}
 }
 
@@ -140,9 +148,9 @@ function composeReadyRuntime(
  * Convert structural, restart-scoped key configuration into a reader-only
  * replay runtime without exposing key material or key identifiers.
  */
-export function createServerToolReplayRuntime(
+export async function createServerToolReplayRuntime(
 	keysState: ServerToolReplayKeysState,
-): ServerToolReplayRuntimeState {
+): Promise<ServerToolReplayRuntimeState> {
 	try {
 		if (!isRecord(keysState) || typeof keysState.status !== "string") {
 			return SERVER_TOOL_REPLAY_UNAVAILABLE;
@@ -160,7 +168,8 @@ export function createServerToolReplayRuntime(
 		) {
 			return SERVER_TOOL_REPLAY_UNAVAILABLE;
 		}
-		if (keysState.status === "ready") return composeReadyRuntime(keysState);
+		if (keysState.status === "ready")
+			return await composeReadyRuntime(keysState);
 		return SERVER_TOOL_REPLAY_UNAVAILABLE;
 	} catch {
 		return SERVER_TOOL_REPLAY_UNAVAILABLE;

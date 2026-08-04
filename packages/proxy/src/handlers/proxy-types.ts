@@ -24,7 +24,7 @@ export interface ProxyContext {
 	/** Observe-only owner simulation; never read by enforcement. */
 	degradedOwnerShadowOverlay: DegradedOwnerOverlay;
 	/** Restart-scoped replay readers; writer admission remains independently gated. */
-	serverToolReplay: ServerToolReplayRuntimeState;
+	serverToolReplay?: ServerToolReplayRuntimeState;
 	dbOps: DatabaseOperations;
 	runtime: RuntimeConfig;
 	config: Config;

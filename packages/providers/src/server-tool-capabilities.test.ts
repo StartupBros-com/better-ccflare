@@ -278,9 +278,24 @@ describe("deriveServerToolRequirement", () => {
 						{
 							type: "web_search_tool_result",
 							tool_use_id: "srvtoolu_1",
-							content: [{ type: "web_search_result", title: "private" }],
+							content: [
+								{
+									type: "web_search_result",
+									title: "private",
+									encrypted_content: "anthropic-opaque-content",
+								},
+							],
 						},
-						{ type: "x_better_ccflare_server_tool", opaque: "ciphertext" },
+						{
+							type: "text",
+							text: "cited answer",
+							citations: [
+								{
+									type: "web_search_result_location",
+									encrypted_index: "bccf1.A256GCM.proxy-envelope",
+								},
+							],
+						},
 					],
 				},
 			],
@@ -300,6 +315,87 @@ describe("deriveServerToolRequirement", () => {
 			"+",
 		);
 		expect(JSON.stringify(requirement)).not.toContain(inventedCombinedMode);
+	});
+
+	test("routes every bccf-prefixed opaque field to local proxy projection validation", () => {
+		for (const proxyEnvelope of [
+			"bccf",
+			"bccf0.legacy",
+			"bccf1.malformed",
+			"bccf2.future",
+		]) {
+			const contentReplay = deriveServerToolRequirement({
+				messages: [
+					{
+						role: "assistant",
+						content: [
+							{
+								type: "web_search_tool_result",
+								content: [
+									{
+										type: "web_search_result",
+										encrypted_content: proxyEnvelope,
+									},
+								],
+							},
+						],
+					},
+				],
+			})?.replay.output;
+			const locationReplay = deriveServerToolRequirement({
+				messages: [
+					{
+						role: "assistant",
+						content: [
+							{
+								type: "text",
+								text: "cited answer",
+								citations: [
+									{
+										type: "web_search_result_location",
+										encrypted_index: proxyEnvelope,
+									},
+								],
+							},
+						],
+					},
+				],
+			})?.replay.output;
+
+			expect(contentReplay).toEqual(["proxy-evidence-v1"]);
+			expect(locationReplay).toEqual(["proxy-evidence-v1"]);
+		}
+
+		expect(
+			deriveServerToolRequirement({
+				messages: [
+					{
+						role: "assistant",
+						content: [
+							{
+								type: "web_search_tool_result",
+								content: [
+									{
+										type: "web_search_result",
+										encrypted_content: "anthropic-opaque-content",
+									},
+								],
+							},
+							{
+								type: "text",
+								text: "cited answer",
+								citations: [
+									{
+										type: "web_search_result_location",
+										encrypted_index: "anthropic-opaque-index",
+									},
+								],
+							},
+						],
+					},
+				],
+			})?.replay.output,
+		).toEqual(["native-Anthropic"]);
 	});
 
 	test("preserves bounded domain paths and order while rejecting allow/block broadening", () => {
@@ -594,7 +690,15 @@ describe("deriveServerToolRequirement", () => {
 					{
 						role: "assistant",
 						content: [
-							{ type: "x_better_ccflare_server_tool", opaque: "ciphertext" },
+							{
+								type: "web_search_tool_result",
+								content: [
+									{
+										type: "web_search_result",
+										encrypted_content: "bccf1.A256GCM.proxy-envelope",
+									},
+								],
+							},
 						],
 					},
 				],
@@ -1157,11 +1261,22 @@ describe("resolveServerToolCapability", () => {
 							{
 								type: "web_search_tool_result",
 								tool_use_id: "srvtoolu_1",
-								content: [],
+								content: [
+									{
+										type: "web_search_result",
+										encrypted_content: "anthropic-opaque-content",
+									},
+								],
 							},
 							{
-								type: "x_better_ccflare_server_tool",
-								opaque: "ciphertext",
+								type: "text",
+								text: "cited answer",
+								citations: [
+									{
+										type: "web_search_result_location",
+										encrypted_index: "bccf1.A256GCM.proxy-envelope",
+									},
+								],
 							},
 						],
 					},

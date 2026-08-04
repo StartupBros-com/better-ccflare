@@ -982,7 +982,7 @@ export default async function startServer(options?: {
 	// eagerly, so route through a mutable reference assigned once the
 	// ProxyContext exists — mirrors the getStrategy() lazy-getter pattern above.
 	let modelCatalogProxyContext: ProxyContext | null = null;
-	const serverToolReplay = createServerToolReplayRuntime(
+	const serverToolReplay = await createServerToolReplayRuntime(
 		loadServerToolReplayKeys(),
 	);
 	const anthropicDegradedConfig = config.getAnthropicDegradedModeConfig();

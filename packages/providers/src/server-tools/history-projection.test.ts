@@ -1760,6 +1760,111 @@ describe("projectServerToolHistory", () => {
 		expect(decodeCalls).toBe(0);
 	});
 
+	test("rejects proxy plus native web citations split across text blocks before decoding", async () => {
+		const callId = "srvtoolu_split_citation_blocks";
+		const url = "https://example.com/split-citation-blocks";
+		const title = "Split citation blocks";
+		const sourceToken = proxyToken(710);
+		const proxyCitation = proxyToken(711, 192, 710);
+		let decodeCalls = 0;
+
+		await expect(
+			projectServerToolHistory({
+				messages: [
+					{
+						role: "assistant",
+						content: [serverToolUse(callId, "split citation blocks")],
+					},
+					{
+						role: "assistant",
+						content: [proxyResult(callId, sourceToken, url, title)],
+					},
+					{
+						role: "assistant",
+						content: [
+							{
+								type: "text",
+								text: "proxy citation",
+								citations: [citation(url, title, "proxy", proxyCitation)],
+							},
+							{
+								type: "text",
+								text: "native citation",
+								citations: [
+									{
+										type: "web_search_result_location",
+										encrypted_index: "native-web-secret",
+									},
+								],
+							},
+						],
+					},
+				],
+				replayContext,
+				decoder: decoder(async () => {
+					decodeCalls += 1;
+					return Object.freeze({ authenticated: true });
+				}),
+			}),
+		).rejects.toBeInstanceOf(InvalidServerToolHistoryProjectionError);
+		expect(decodeCalls).toBe(0);
+	});
+
+	test("rejects proxy plus native web citations split across messages before decoding", async () => {
+		const callId = "srvtoolu_split_citation_messages";
+		const url = "https://example.com/split-citation-messages";
+		const title = "Split citation messages";
+		const sourceToken = proxyToken(712);
+		const proxyCitation = proxyToken(713, 192, 712);
+		let decodeCalls = 0;
+
+		await expect(
+			projectServerToolHistory({
+				messages: [
+					{
+						role: "assistant",
+						content: [serverToolUse(callId, "split citation messages")],
+					},
+					{
+						role: "assistant",
+						content: [proxyResult(callId, sourceToken, url, title)],
+					},
+					{
+						role: "assistant",
+						content: [
+							{
+								type: "text",
+								text: "proxy citation",
+								citations: [citation(url, title, "proxy", proxyCitation)],
+							},
+						],
+					},
+					{
+						role: "assistant",
+						content: [
+							{
+								type: "text",
+								text: "native citation",
+								citations: [
+									{
+										type: "web_search_result_location",
+										encrypted_index: "native-web-secret",
+									},
+								],
+							},
+						],
+					},
+				],
+				replayContext,
+				decoder: decoder(async () => {
+					decodeCalls += 1;
+					return Object.freeze({ authenticated: true });
+				}),
+			}),
+		).rejects.toBeInstanceOf(InvalidServerToolHistoryProjectionError);
+		expect(decodeCalls).toBe(0);
+	});
+
 	test("uses real distinct locators for duplicate URL/title sources across calls and ordinals", async () => {
 		const url = "https://example.com/duplicate";
 		const title = "Duplicate";

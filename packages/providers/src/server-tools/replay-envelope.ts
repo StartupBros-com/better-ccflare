@@ -154,6 +154,11 @@ export interface ServerToolReplayEnvelopeCodec {
 	): Promise<DecodedServerToolReplayEnvelope>;
 }
 
+const replayEnvelopeCodecReadiness = new WeakMap<
+	ServerToolReplayEnvelopeCodec,
+	Promise<void>
+>();
+
 type ImportedKey = {
 	readonly id: string;
 	readonly fleetFingerprint: string;
@@ -1009,12 +1014,29 @@ async function importKeyMaterial(
 		rawKey.fill(0);
 	}
 
-	const [encryptionKey, digestKey, locatorKey] = await Promise.all([
+	const imports = await Promise.allSettled([
 		importEncryptionKey(webCrypto, encryptionRawKey, encryptionKeyUsages),
 		deriveDigestKey(webCrypto, digestRawKey),
 		deriveLocatorKey(webCrypto, locatorRawKey),
 	]);
+	const rejectedImport = imports.find(
+		(result): result is PromiseRejectedResult => result.status === "rejected",
+	);
+	if (rejectedImport) throw rejectedImport.reason;
+	const [encryptionKey, digestKey, locatorKey] = imports.map(
+		(result) => (result as PromiseFulfilledResult<CryptoKey>).value,
+	);
 	return Object.freeze({ encryptionKey, digestKey, locatorKey });
+}
+
+export async function awaitServerToolReplayEnvelopeCodecReady(
+	codec: ServerToolReplayEnvelopeCodec,
+): Promise<void> {
+	const readiness = replayEnvelopeCodecReadiness.get(codec);
+	if (!readiness) {
+		throw new TypeError("Unknown server-tool replay codec instance.");
+	}
+	await readiness;
 }
 
 export function createServerToolReplayEnvelopeCodec(
@@ -1068,7 +1090,20 @@ export function createServerToolReplayEnvelopeCodec(
 	const readWriterReadiness = (): ServerToolReplayWriterReadiness =>
 		getWriterReadiness(writerAdmission, activeKey.fleetFingerprint);
 
-	return Object.freeze({
+	const readiness = Promise.allSettled(
+		[...importedKeys.values()].map(({ material }) => material),
+	).then((results) => {
+		const rejectedImport = results.find(
+			(result): result is PromiseRejectedResult => result.status === "rejected",
+		);
+		if (rejectedImport) throw rejectedImport.reason;
+	});
+	// Direct codec construction remains synchronous. Attach a rejection handler
+	// immediately so a caller that never performs I/O cannot leak an unhandled
+	// background import failure; readiness callers still observe the rejection.
+	void readiness.catch(() => undefined);
+
+	const codec: ServerToolReplayEnvelopeCodec = Object.freeze({
 		getWriterReadiness: readWriterReadiness,
 
 		async encode(
@@ -1216,4 +1251,6 @@ export function createServerToolReplayEnvelopeCodec(
 			}
 		},
 	});
+	replayEnvelopeCodecReadiness.set(codec, readiness);
+	return codec;
 }

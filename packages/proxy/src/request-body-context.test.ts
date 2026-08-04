@@ -24,6 +24,24 @@ function assertPresent<T>(value: T | null | undefined): asserts value is T {
 	}
 }
 
+function countIterations<T>(
+	values: T[],
+	visits: Record<string, number>,
+	key: string,
+): T[] {
+	return new Proxy(values, {
+		get(target, property, receiver) {
+			if (property === Symbol.iterator) {
+				return function* countedIterator() {
+					visits[key] = (visits[key] ?? 0) + 1;
+					yield* target;
+				};
+			}
+			return Reflect.get(target, property, receiver);
+		},
+	});
+}
+
 type MutableSemanticBody = Record<string, unknown> & {
 	model: string;
 	tools: Array<Record<string, unknown>>;
@@ -106,6 +124,73 @@ describe("RequestBodyContext server-tool finalization", () => {
 		expect(second).toBe(first);
 		expect(Object.isFrozen(first)).toBe(true);
 		expect(Object.isFrozen(first?.declarations)).toBe(true);
+	});
+
+	test("derives and protects tools and history in one traversal", () => {
+		const visits: Record<string, number> = {};
+		const citations = countIterations(
+			[
+				{
+					type: "web_search_result_location",
+					encrypted_index: "bccf1.A256GCM.proxy-envelope",
+				},
+			],
+			visits,
+			"citations",
+		);
+		const resultContent = countIterations(
+			[
+				{
+					type: "web_search_result",
+					encrypted_content: "bccf1.A256GCM.proxy-envelope",
+				},
+			],
+			visits,
+			"resultContent",
+		);
+		const messageContent = countIterations(
+			[
+				{
+					type: "web_search_tool_result",
+					content: resultContent,
+				},
+				{ type: "text", text: "cited answer", citations },
+			],
+			visits,
+			"messageContent",
+		);
+		const body = {
+			tools: countIterations(
+				[{ type: "web_search_20250305", name: "web_search" }],
+				visits,
+				"tools",
+			),
+			messages: countIterations(
+				[{ role: "assistant", content: messageContent }],
+				visits,
+				"messages",
+			),
+		};
+		const context = RequestBodyContext.fromParsed(null, body);
+
+		expect(context.finalizeServerToolRequirements()?.replay.output).toEqual([
+			"proxy-evidence-v1",
+		]);
+		expect(visits).toEqual({
+			tools: 1,
+			messages: 1,
+			messageContent: 1,
+			resultContent: 1,
+			citations: 1,
+		});
+		expect(Object.isFrozen(body)).toBe(true);
+		expect(Object.isFrozen(body.tools)).toBe(true);
+		expect(Object.isFrozen(body.messages)).toBe(true);
+		expect(Object.isFrozen(messageContent)).toBe(true);
+		expect(Object.isFrozen(resultContent)).toBe(true);
+		expect(Object.isFrozen(resultContent[0])).toBe(true);
+		expect(Object.isFrozen(citations)).toBe(true);
+		expect(Object.isFrozen(citations[0])).toBe(true);
 	});
 
 	test("rejects every mutation entry point before stale metadata can be created", () => {

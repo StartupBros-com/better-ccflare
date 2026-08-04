@@ -40,10 +40,17 @@ const MAX_DOMAIN_LENGTH = 8 * 1024;
 const MAX_LOCATION_VALUE_LENGTH = 256;
 const MAX_ISSUE_RECORDS = 8;
 const MAX_RETAINED_TOOL_TYPE_LENGTH = 128;
+const MAX_HISTORY_MESSAGE_VISITS = 4_096;
+const MAX_HISTORY_BLOCK_VISITS = 16_384;
 const WEB_SEARCH_PROFILE_PREFIX = "web-search-20250305-v1" as const;
 const UNKNOWN_TYPED_TOOL = "unknown_typed_tool" as const;
 
 type UnknownRecord = Record<string, unknown>;
+
+export interface DeriveServerToolRequirementOptions {
+	/** Protect the exact request layers inspected while deriving requirements. */
+	readonly freezeSemanticLayers?: boolean;
+}
 
 function isRecord(value: unknown): value is UnknownRecord {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -279,25 +286,113 @@ function buildWebSearchProfileId(
 	return `${WEB_SEARCH_PROFILE_PREFIX}:domains-${domainShape}:max-${maxUsesShape}:location-${locationShape}:client-${hasClientFunctions ? "yes" : "no"}`;
 }
 
+function freezeToolSemanticLayers(tool: UnknownRecord): void {
+	if (Array.isArray(tool.allowed_domains)) Object.freeze(tool.allowed_domains);
+	if (Array.isArray(tool.blocked_domains)) Object.freeze(tool.blocked_domains);
+	if (isRecord(tool.user_location)) Object.freeze(tool.user_location);
+	Object.freeze(tool);
+}
+
+function classifyOpaqueReplayValue(
+	value: unknown,
+): "native-Anthropic" | "proxy-evidence-v1" | undefined {
+	if (typeof value !== "string") return undefined;
+	return value.startsWith("bccf") ? "proxy-evidence-v1" : "native-Anthropic";
+}
+
 function scanHistoricalReplay(
 	messages: unknown,
 	requiresOutputReplay: boolean,
+	freezeSemanticLayers: boolean,
 ): ServerToolReplayRequirement {
 	let hasNativeInput = false;
 	let hasNativeOutput = false;
 	let hasProxyOpaqueOutput = false;
+	let messageVisits = 0;
+	let historyBlockVisits = 0;
+	let traversalTruncated = false;
+	const recordOpaqueReplay = (value: unknown): boolean => {
+		const replayAtom = classifyOpaqueReplayValue(value);
+		if (replayAtom === "native-Anthropic") hasNativeOutput = true;
+		if (replayAtom === "proxy-evidence-v1") hasProxyOpaqueOutput = true;
+		return replayAtom !== undefined;
+	};
 
 	if (Array.isArray(messages)) {
 		for (const message of messages) {
-			if (!isRecord(message) || !Array.isArray(message.content)) continue;
-			for (const block of message.content) {
-				if (!isRecord(block)) continue;
-				if (block.type === "server_tool_use") hasNativeInput = true;
-				if (block.type === "web_search_tool_result") hasNativeOutput = true;
-				if (block.type === "x_better_ccflare_server_tool")
-					hasProxyOpaqueOutput = true;
+			if (messageVisits >= MAX_HISTORY_MESSAGE_VISITS) {
+				traversalTruncated = true;
+				break;
 			}
+			messageVisits += 1;
+			if (!isRecord(message)) continue;
+			const messageContent = message.content;
+			if (Array.isArray(messageContent)) {
+				for (const block of messageContent) {
+					if (historyBlockVisits >= MAX_HISTORY_BLOCK_VISITS) {
+						traversalTruncated = true;
+						break;
+					}
+					historyBlockVisits += 1;
+					if (!isRecord(block)) continue;
+					if (block.type === "server_tool_use") hasNativeInput = true;
+					if (block.type === "web_search_tool_result") {
+						let classifiedOpaqueReplay = false;
+						const resultContent = block.content;
+						if (Array.isArray(resultContent)) {
+							for (const result of resultContent) {
+								if (historyBlockVisits >= MAX_HISTORY_BLOCK_VISITS) {
+									traversalTruncated = true;
+									break;
+								}
+								historyBlockVisits += 1;
+								if (!isRecord(result)) continue;
+								if (result.type === "web_search_result") {
+									classifiedOpaqueReplay =
+										recordOpaqueReplay(result.encrypted_content) ||
+										classifiedOpaqueReplay;
+								}
+								if (freezeSemanticLayers) Object.freeze(result);
+							}
+							if (freezeSemanticLayers) Object.freeze(resultContent);
+						}
+						if (!classifiedOpaqueReplay) hasNativeOutput = true;
+					}
+
+					const citations = block.citations;
+					if (Array.isArray(citations)) {
+						for (const citation of citations) {
+							if (historyBlockVisits >= MAX_HISTORY_BLOCK_VISITS) {
+								traversalTruncated = true;
+								break;
+							}
+							historyBlockVisits += 1;
+							if (!isRecord(citation)) continue;
+							if (citation.type === "web_search_result_location") {
+								recordOpaqueReplay(citation.encrypted_index);
+							}
+							if (freezeSemanticLayers) Object.freeze(citation);
+						}
+						if (freezeSemanticLayers) Object.freeze(citations);
+					}
+					if (freezeSemanticLayers) Object.freeze(block);
+				}
+			}
+			if (freezeSemanticLayers) {
+				if (Array.isArray(messageContent)) Object.freeze(messageContent);
+				Object.freeze(message);
+			}
+			if (traversalTruncated) break;
 		}
+		if (freezeSemanticLayers) Object.freeze(messages);
+	}
+
+	if (traversalTruncated) {
+		// An uninspected suffix may contain any replay shape. Fail closed by
+		// requiring every replay mode instead of silently under-classifying it.
+		hasNativeInput = true;
+		hasNativeOutput = true;
+		hasProxyOpaqueOutput = true;
 	}
 
 	const input = freezeReplayAtoms(hasNativeInput, false);
@@ -308,8 +403,15 @@ function scanHistoricalReplay(
 
 export function deriveServerToolRequirement(
 	body: unknown,
+	options: DeriveServerToolRequirementOptions = {},
 ): ServerToolRequirements | undefined {
-	if (!isRecord(body)) return undefined;
+	const freezeSemanticLayers = options.freezeSemanticLayers === true;
+	if (!isRecord(body)) {
+		if (freezeSemanticLayers && typeof body === "object" && body !== null) {
+			Object.freeze(body);
+		}
+		return undefined;
+	}
 
 	const declarations: WebSearchServerToolDeclaration[] = [];
 	const invalid: { type: string; reason: "invalid_options" }[] = [];
@@ -317,9 +419,11 @@ export function deriveServerToolRequirement(
 	let hasClientFunctions = false;
 	let exactDeclarationCount = 0;
 
-	if (Array.isArray(body.tools)) {
-		for (const tool of body.tools) {
+	const tools = body.tools;
+	if (Array.isArray(tools)) {
+		for (const tool of tools) {
 			if (!isRecord(tool)) continue;
+			if (freezeSemanticLayers) freezeToolSemanticLayers(tool);
 
 			if (
 				tool.type === undefined &&
@@ -360,6 +464,7 @@ export function deriveServerToolRequirement(
 				);
 			}
 		}
+		if (freezeSemanticLayers) Object.freeze(tools);
 	}
 
 	if (exactDeclarationCount > 1) {
@@ -374,13 +479,16 @@ export function deriveServerToolRequirement(
 			);
 		}
 	}
+	const toolChoice = body.tool_choice;
+	if (freezeSemanticLayers && isRecord(toolChoice)) {
+		Object.freeze(toolChoice);
+	}
 
 	if (
 		exactDeclarationCount === 1 &&
 		declarations.length === 1 &&
-		body.tool_choice !== undefined
+		toolChoice !== undefined
 	) {
-		const toolChoice = body.tool_choice;
 		const isAdmittedAutoChoice =
 			isRecord(toolChoice) &&
 			hasOnlyKeys(toolChoice, new Set(["type", "disable_parallel_tool_use"])) &&
@@ -401,7 +509,12 @@ export function deriveServerToolRequirement(
 		}
 	}
 
-	const replay = scanHistoricalReplay(body.messages, declarations.length > 0);
+	const replay = scanHistoricalReplay(
+		body.messages,
+		declarations.length > 0,
+		freezeSemanticLayers,
+	);
+	if (freezeSemanticLayers) Object.freeze(body);
 	if (
 		declarations.length === 0 &&
 		invalid.length === 0 &&

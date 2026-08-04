@@ -135,9 +135,66 @@ function expectKeyCopiesZeroedExactlyOnce<T>(
 }
 
 describe("server-tool replay runtime", () => {
-	it("returns canonical deeply frozen disabled and unavailable states", () => {
-		const disabled = createServerToolReplayRuntime({ status: "disabled" });
-		const unavailable = createServerToolReplayRuntime({
+	it("waits for every key import and fails initialization closed", async () => {
+		const subtle = globalThis.crypto.subtle;
+		const originalImportKey = subtle.importKey.bind(subtle);
+		let importCalls = 0;
+		let releaseFinalImport = (): void => {};
+		const finalImportGate = new Promise<void>((resolve) => {
+			releaseFinalImport = resolve;
+		});
+		const importKeySpy = spyOn(subtle, "importKey").mockImplementation((async (
+			...args: Parameters<SubtleCrypto["importKey"]>
+		) => {
+			importCalls += 1;
+			if (importCalls === 2) {
+				throw new Error("forced replay-key import failure");
+			}
+			if (importCalls === 6) await finalImportGate;
+			return Reflect.apply(
+				originalImportKey,
+				subtle,
+				args,
+			) as Promise<CryptoKey>;
+		}) as SubtleCrypto["importKey"]);
+
+		try {
+			const runtimePromise = createServerToolReplayRuntime(
+				readyState("next-active", [
+					{ id: "next-active", status: "active", key: [...ACTIVE_BYTES] },
+					{
+						id: "old-retained",
+						status: "retained",
+						key: [...RETAINED_BYTES],
+					},
+				]),
+			);
+			let initializationSettled = false;
+			void runtimePromise.then(() => {
+				initializationSettled = true;
+			});
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(importCalls).toBe(6);
+			expect(initializationSettled).toBe(false);
+
+			releaseFinalImport();
+			const runtime = await runtimePromise;
+
+			expect(runtime).toEqual({
+				status: "unavailable",
+				code: "invalid_replay_key_config",
+			});
+		} finally {
+			importKeySpy.mockRestore();
+		}
+	});
+
+	it("returns canonical deeply frozen disabled and unavailable states", async () => {
+		const disabled = await createServerToolReplayRuntime({
+			status: "disabled",
+		});
+		const unavailable = await createServerToolReplayRuntime({
 			status: "unavailable",
 			code: "invalid_replay_key_config",
 		});
@@ -180,8 +237,8 @@ describe("server-tool replay runtime", () => {
 			activeKeyId: "current",
 			keys: [{ id: "current", status: "unknown", key: [...ACTIVE_BYTES] }],
 		} as unknown as ServerToolReplayKeysState,
-	])("sanitizes malformed or mismatched ready input", (state) => {
-		const runtime = createServerToolReplayRuntime(state);
+	])("sanitizes malformed or mismatched ready input", async (state) => {
+		const runtime = await createServerToolReplayRuntime(state);
 
 		expect(runtime).toEqual({
 			status: "unavailable",
@@ -205,7 +262,7 @@ describe("server-tool replay runtime", () => {
 		];
 
 		for (const keys of [records, [...records].reverse()]) {
-			const runtime = createServerToolReplayRuntime(
+			const runtime = await createServerToolReplayRuntime(
 				readyState("next-active", keys),
 			);
 			expect(runtime.status).toBe("ready");
@@ -219,7 +276,7 @@ describe("server-tool replay runtime", () => {
 	it("retains old-key decoding after rotation", async () => {
 		const oldWriter = enabledCodec("old-retained", RETAINED_BYTES);
 		const oldToken = await oldWriter.encode(BINDING, PAYLOAD);
-		const runtime = createServerToolReplayRuntime(
+		const runtime = await createServerToolReplayRuntime(
 			readyState("next-active", [
 				{ id: "next-active", status: "active", key: [...ACTIVE_BYTES] },
 				{
@@ -240,7 +297,7 @@ describe("server-tool replay runtime", () => {
 	it("excludes revoked keys from the codec reader set", async () => {
 		const revokedWriter = enabledCodec("revoked-key", REVOKED_BYTES);
 		const revokedToken = await revokedWriter.encode(BINDING, PAYLOAD);
-		const runtime = createServerToolReplayRuntime(
+		const runtime = await createServerToolReplayRuntime(
 			readyState("next-active", [
 				{ id: "revoked-key", status: "revoked" },
 				{ id: "next-active", status: "active", key: [...ACTIVE_BYTES] },
@@ -257,7 +314,7 @@ describe("server-tool replay runtime", () => {
 	it("keeps readers ready while writer admission remains disabled", async () => {
 		const writer = enabledCodec("next-active", ACTIVE_BYTES);
 		const token = await writer.encode(BINDING, PAYLOAD);
-		const runtime = createServerToolReplayRuntime(
+		const runtime = await createServerToolReplayRuntime(
 			readyState("next-active", [
 				{ id: "next-active", status: "active", key: [...ACTIVE_BYTES] },
 			]),
@@ -285,7 +342,7 @@ describe("server-tool replay runtime", () => {
 			"retained-id-sentinel",
 			RETAINED_BYTES,
 		).encode(BINDING, PAYLOAD);
-		const runtime = createServerToolReplayRuntime(
+		const runtime = await createServerToolReplayRuntime(
 			readyState("active-id-sentinel", [
 				{ id: "active-id-sentinel", status: "active", key: active },
 				{ id: "retained-id-sentinel", status: "retained", key: retained },
@@ -310,7 +367,7 @@ describe("server-tool replay runtime", () => {
 		expectDeeplyFrozen(runtime);
 	});
 
-	it("zeroes every temporary key copy exactly once after successful construction", () => {
+	it("zeroes every temporary key copy exactly once after successful construction", async () => {
 		const capture = captureZeroedKeyCopies(() =>
 			createServerToolReplayRuntime(
 				readyState("next-active", [
@@ -324,11 +381,11 @@ describe("server-tool replay runtime", () => {
 			),
 		);
 
-		expect(capture.result.status).toBe("ready");
+		expect((await capture.result).status).toBe("ready");
 		expectKeyCopiesZeroedExactlyOnce(capture, [ACTIVE_BYTES, RETAINED_BYTES]);
 	});
 
-	it("zeroes earlier copies after a late invalid record", () => {
+	it("zeroes earlier copies after a late invalid record", async () => {
 		const capture = captureZeroedKeyCopies(() =>
 			createServerToolReplayRuntime(
 				readyState("next-active", [
@@ -350,11 +407,11 @@ describe("server-tool replay runtime", () => {
 			),
 		);
 
-		expect(capture.result.status).toBe("unavailable");
+		expect((await capture.result).status).toBe("unavailable");
 		expectKeyCopiesZeroedExactlyOnce(capture, [ACTIVE_BYTES, RETAINED_BYTES]);
 	});
 
-	it("zeroes earlier copies when a later record getter throws", () => {
+	it("zeroes earlier copies when a later record getter throws", async () => {
 		const throwingRecord = new Proxy<Record<string, unknown>>(
 			{},
 			{
@@ -375,11 +432,11 @@ describe("server-tool replay runtime", () => {
 			createServerToolReplayRuntime(state),
 		);
 
-		expect(capture.result.status).toBe("unavailable");
+		expect((await capture.result).status).toBe("unavailable");
 		expectKeyCopiesZeroedExactlyOnce(capture, [ACTIVE_BYTES]);
 	});
 
-	it("zeroes a copied active key after an active-key ID mismatch", () => {
+	it("zeroes a copied active key after an active-key ID mismatch", async () => {
 		const capture = captureZeroedKeyCopies(() =>
 			createServerToolReplayRuntime(
 				readyState("missing", [
@@ -388,11 +445,11 @@ describe("server-tool replay runtime", () => {
 			),
 		);
 
-		expect(capture.result.status).toBe("unavailable");
+		expect((await capture.result).status).toBe("unavailable");
 		expectKeyCopiesZeroedExactlyOnce(capture, [ACTIVE_BYTES]);
 	});
 
-	it("zeroes selected and non-selected active copies after a count mismatch", () => {
+	it("zeroes selected and non-selected active copies after a count mismatch", async () => {
 		const capture = captureZeroedKeyCopies(() =>
 			createServerToolReplayRuntime(
 				readyState("current", [
@@ -402,11 +459,11 @@ describe("server-tool replay runtime", () => {
 			),
 		);
 
-		expect(capture.result.status).toBe("unavailable");
+		expect((await capture.result).status).toBe("unavailable");
 		expectKeyCopiesZeroedExactlyOnce(capture, [ACTIVE_BYTES, RETAINED_BYTES]);
 	});
 
-	it("zeroes all temporary copies when codec construction rejects key material", () => {
+	it("zeroes all temporary copies when codec construction rejects key material", async () => {
 		const capture = captureZeroedKeyCopies(() =>
 			createServerToolReplayRuntime(
 				readyState("next-active", [
@@ -420,7 +477,7 @@ describe("server-tool replay runtime", () => {
 			),
 		);
 
-		expect(capture.result.status).toBe("unavailable");
+		expect((await capture.result).status).toBe("unavailable");
 		expectKeyCopiesZeroedExactlyOnce(capture, [ACTIVE_BYTES, ACTIVE_BYTES]);
 	});
 });
