@@ -3,6 +3,7 @@ import { TIME_CONSTANTS } from "@better-ccflare/core";
 import {
 	clearSession,
 	getServedAccount,
+	getServedAccountObservation,
 	recordServedAccount,
 	SessionAccountObserver,
 } from "../session-account-observer";
@@ -37,6 +38,29 @@ describe("SessionAccountObserver", () => {
 		obs.record("session-a", "acc-2");
 		expect(obs.get("session-a")).toBe("acc-2");
 		expect(obs.size).toBe(1);
+	});
+
+	it("stores profile provenance atomically and clears it on a newer ordinary record", () => {
+		const obs = new SessionAccountObserver();
+		obs.record("session-a", "profile-account", 10, "pro-primary-sol");
+		expect(obs.getObservation("session-a")).toEqual({
+			accountId: "profile-account",
+			routeProfileId: "pro-primary-sol",
+		});
+
+		obs.record("session-a", "ordinary-account", 20);
+		expect(obs.getObservation("session-a")).toEqual({
+			accountId: "ordinary-account",
+			routeProfileId: null,
+		});
+
+		// A late completion from the older profile request cannot restore either
+		// its account or its provenance over the newer ordinary observation.
+		obs.record("session-a", "stale-profile-account", 15, "stale-profile");
+		expect(obs.getObservation("session-a")).toEqual({
+			accountId: "ordinary-account",
+			routeProfileId: null,
+		});
 	});
 
 	it("returns undefined for a session that was never recorded", () => {
@@ -193,9 +217,14 @@ describe("session-account-observer module singleton", () => {
 	});
 
 	it("records, reads, and clears through the exported functions", () => {
-		recordServedAccount("mod-session", "acc-9");
+		recordServedAccount("mod-session", "acc-9", undefined, "premium");
 		expect(getServedAccount("mod-session")).toBe("acc-9");
+		expect(getServedAccountObservation("mod-session")).toEqual({
+			accountId: "acc-9",
+			routeProfileId: "premium",
+		});
 		clearSession("mod-session");
 		expect(getServedAccount("mod-session")).toBeUndefined();
+		expect(getServedAccountObservation("mod-session")).toBeUndefined();
 	});
 });

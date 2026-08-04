@@ -407,6 +407,18 @@ function capabilityPoolErrorReason(
 	return "temporary_unavailable";
 }
 
+/**
+ * Returns an account id only when it came from the public force-route surface.
+ * Route profiles carry a private configured account UUID that must remain
+ * server-side even when server-tool routing fails before transport.
+ */
+export function getClientVisibleServerToolAccountId(
+	meta: Pick<RequestMeta, "routeProfileId">,
+	accountId: string | undefined,
+): string | undefined {
+	return meta.routeProfileId == null ? accountId : undefined;
+}
+
 function throwServerToolCapabilityPoolError(meta: RequestMeta): never {
 	const summary = meta.serverToolCapabilitySummary;
 	if (!summary) {
@@ -425,12 +437,24 @@ function serverToolSelectionFailure(meta: RequestMeta): ServerToolRoutingError {
 	});
 }
 
+export type ForceRouteUnavailableReason =
+	| "account_capacity_exhausted"
+	| "conflicting_force_route"
+	| "lookup_failed"
+	| "model_capacity_exhausted"
+	| "model_mapping_mismatch"
+	| "not_found"
+	| "paused"
+	| "provider_excluded"
+	| "provider_mismatch"
+	| "rate_limited_or_unavailable";
+
 /** Thrown when an explicit one-account route cannot use its target. */
 export class ForceRouteUnavailableError extends Error {
 	readonly accountId: string;
-	readonly reason: string;
+	readonly reason: ForceRouteUnavailableReason;
 
-	constructor(accountId: string, reason: string) {
+	constructor(accountId: string, reason: ForceRouteUnavailableReason) {
 		super(`Force-routed account unavailable: ${reason}`);
 		this.name = "ForceRouteUnavailableError";
 		this.accountId = accountId;
@@ -1546,168 +1570,220 @@ async function selectAccountsForRequestInternal(
 	meta.serverToolCapabilitySummary = undefined;
 	saveCapacityContext(meta, effectiveModel, []);
 
-	// Check if a specific account is requested via special header
-	if (meta.headers) {
-		const forcedAccountId = meta.headers.get("x-better-ccflare-account-id");
-		if (forcedAccountId) {
-			try {
-				const allAccounts = await ctx.dbOps.getAllAccounts();
-				const forcedAccount = allAccounts.find(
-					(acc) => acc.id === forcedAccountId,
+	// A route profile's server-derived account id has the same exact-account,
+	// fail-closed semantics as the public header. Never silently choose between
+	// conflicting directives: doing so would make the selected account depend on
+	// an implementation detail instead of either caller's explicit intent.
+	const publicForcedAccountId = meta.headers?.get(
+		"x-better-ccflare-account-id",
+	);
+	const serverForcedAccountId = meta.forcedAccountId?.trim();
+	if (
+		serverForcedAccountId &&
+		publicForcedAccountId &&
+		serverForcedAccountId !== publicForcedAccountId
+	) {
+		throw new ForceRouteUnavailableError(
+			serverForcedAccountId,
+			"conflicting_force_route",
+		);
+	}
+	const forcedAccountId = serverForcedAccountId || publicForcedAccountId;
+	if (forcedAccountId) {
+		try {
+			const allAccounts = await ctx.dbOps.getAllAccounts();
+			const forcedAccount = allAccounts.find(
+				(acc) => acc.id === forcedAccountId,
+			);
+			if (!forcedAccount) {
+				throw new ForceRouteUnavailableError(forcedAccountId, "not_found");
+			}
+			if (
+				serverForcedAccountId &&
+				isProviderExcludedForRequest(forcedAccount, getExcludedProviders(meta))
+			) {
+				throw new ForceRouteUnavailableError(
+					forcedAccountId,
+					"provider_excluded",
 				);
-				if (!forcedAccount) {
-					throw new ForceRouteUnavailableError(forcedAccountId, "not_found");
-				}
-				let forcedRouting: RoutingCandidateMetadata | undefined;
-				if (meta.serverToolRequirements) {
-					forcedRouting = normalCandidateMetadata(
-						forcedAccount,
-						0,
-						effectiveModel,
+			}
+			if (meta.routeProfileId) {
+				if (
+					meta.routeExpectedProvider &&
+					forcedAccount.provider !== meta.routeExpectedProvider
+				) {
+					throw new ForceRouteUnavailableError(
+						forcedAccountId,
+						"provider_mismatch",
 					);
-					forcedRouting.serverToolCapability =
-						evaluateCandidateServerToolCapability({
-							account: forcedAccount,
-							routing: forcedRouting,
-							logicalModel: effectiveModel,
-							meta,
-							ctx,
-						});
-					meta.routingCandidateCatalog = [forcedRouting];
-					meta.routingCandidates = [];
-					publishServerToolCapabilitySummary(meta, [forcedRouting], new Set());
-					if (!isServerToolCandidateSemanticallyEligible(forcedRouting)) {
-						const reason: ServerToolRoutingErrorReason = meta
-							.serverToolRequirements.invalid?.length
-							? "invalid_requirement"
-							: meta.serverToolRequirements.unsupported?.length
-								? "unsupported_requirement"
-								: "forced_incapable";
-						throw new ServerToolRoutingError({
-							reason,
-							accountId: forcedAccount.id,
-							capabilitySummary: meta.serverToolCapabilitySummary,
-						});
-					}
 				}
-				{
-					// The auto-refresh scheduler sends authenticated internal probes
-					// to intentionally refresh accounts that are paused due to auto_pause_on_overage,
-					// or to probe accounts that are rate-limited (to detect when the window has reset).
-					// For trusted probes we allow through an overage-paused or rate-limited account
-					// so the scheduler can hit the real endpoint and trigger the window-reset + auto-resume logic.
-					// Only an overage pause qualifies: a manual pause (pause_reason='manual') or a
-					// failure-threshold / peak_hours pause must still win even when the overage feature
-					// flag is enabled, because the auto-resume guard would never un-pause those accounts.
-					// This mirrors the scheduler eligibility query and the sendDummyMessage resume guard
-					// (auto_pause_on_overage_enabled=1 AND pause_reason IN (NULL,'overage')).
-					const isAutoRefreshBypass = meta.trustedInternalAutoRefresh === true;
-					const available = isAccountAvailable(forcedAccount);
-					const isOveragePaused =
-						forcedAccount.paused &&
-						forcedAccount.auto_pause_on_overage_enabled &&
-						(!forcedAccount.pause_reason ||
-							forcedAccount.pause_reason === "overage");
-					const isRateLimited =
-						!available &&
-						!forcedAccount.paused &&
-						!!forcedAccount.rate_limited_until;
-					// Fail closed for every provider: a client that explicitly
-					// force-routes to a specific account id must never be silently
-					// redirected to a *different* account it did not ask for, and must
-					// never be silently downgraded into normal pool selection. This
-					// used to be scoped to the xAI cache-native official-endpoint
-					// carve-out only (meta.xaiCacheNativeActive && provider === "xai"
-					// && isOfficialXaiEndpoint); it now applies unconditionally to any
-					// unavailable or capacity-exhausted forced account, regardless of
-					// provider, custom-endpoint status, or the xaiCacheNativeActive flag.
-					const mayProbeUnavailableAccount =
-						isAutoRefreshBypass && (isOveragePaused || isRateLimited);
-					if (!available && !mayProbeUnavailableAccount) {
+				if (meta.routeExpectedPhysicalModel) {
+					const mappedModels = effectiveModel
+						? getModelList(effectiveModel, forcedAccount)
+						: null;
+					const firstPhysicalModel = effectiveModel
+						? (mappedModels?.[0] ?? effectiveModel)
+						: null;
+					if (firstPhysicalModel !== meta.routeExpectedPhysicalModel) {
 						throw new ForceRouteUnavailableError(
 							forcedAccountId,
-							forcedAccount.paused ? "paused" : "rate_limited_or_unavailable",
+							"model_mapping_mismatch",
 						);
 					}
+				}
+			}
+			let forcedRouting: RoutingCandidateMetadata | undefined;
+			if (meta.serverToolRequirements) {
+				forcedRouting = normalCandidateMetadata(
+					forcedAccount,
+					0,
+					effectiveModel,
+				);
+				forcedRouting.serverToolCapability =
+					evaluateCandidateServerToolCapability({
+						account: forcedAccount,
+						routing: forcedRouting,
+						logicalModel: effectiveModel,
+						meta,
+						ctx,
+					});
+				meta.routingCandidateCatalog = [forcedRouting];
+				meta.routingCandidates = [];
+				publishServerToolCapabilitySummary(meta, [forcedRouting], new Set());
+				if (!isServerToolCandidateSemanticallyEligible(forcedRouting)) {
+					const reason: ServerToolRoutingErrorReason = meta
+						.serverToolRequirements.invalid?.length
+						? "invalid_requirement"
+						: meta.serverToolRequirements.unsupported?.length
+							? "unsupported_requirement"
+							: "forced_incapable";
+					throw new ServerToolRoutingError({
+						reason,
+						accountId: getClientVisibleServerToolAccountId(
+							meta,
+							forcedAccount.id,
+						),
+						capabilitySummary: meta.serverToolCapabilitySummary,
+					});
+				}
+			}
+			{
+				// The auto-refresh scheduler sends authenticated internal probes
+				// to intentionally refresh accounts that are paused due to auto_pause_on_overage,
+				// or to probe accounts that are rate-limited (to detect when the window has reset).
+				// For trusted probes we allow through an overage-paused or rate-limited account
+				// so the scheduler can hit the real endpoint and trigger the window-reset + auto-resume logic.
+				// Only an overage pause qualifies: a manual pause (pause_reason='manual') or a
+				// failure-threshold / peak_hours pause must still win even when the overage feature
+				// flag is enabled, because the auto-resume guard would never un-pause those accounts.
+				// This mirrors the scheduler eligibility query and the sendDummyMessage resume guard
+				// (auto_pause_on_overage_enabled=1 AND pause_reason IN (NULL,'overage')).
+				const isAutoRefreshBypass = meta.trustedInternalAutoRefresh === true;
+				const available = isAccountAvailable(forcedAccount);
+				const isOveragePaused =
+					forcedAccount.paused &&
+					forcedAccount.auto_pause_on_overage_enabled &&
+					(!forcedAccount.pause_reason ||
+						forcedAccount.pause_reason === "overage");
+				const isRateLimited =
+					!available &&
+					!forcedAccount.paused &&
+					!!forcedAccount.rate_limited_until;
+				// Fail closed for every provider: a client that explicitly
+				// force-routes to a specific account id must never be silently
+				// redirected to a *different* account it did not ask for, and must
+				// never be silently downgraded into normal pool selection. This
+				// used to be scoped to the xAI cache-native official-endpoint
+				// carve-out only (meta.xaiCacheNativeActive && provider === "xai"
+				// && isOfficialXaiEndpoint); it now applies unconditionally to any
+				// unavailable or capacity-exhausted forced account, regardless of
+				// provider, custom-endpoint status, or the xaiCacheNativeActive flag.
+				const mayProbeUnavailableAccount =
+					isAutoRefreshBypass && (isOveragePaused || isRateLimited);
+				if (!available && !mayProbeUnavailableAccount) {
+					throw new ForceRouteUnavailableError(
+						forcedAccountId,
+						forcedAccount.paused ? "paused" : "rate_limited_or_unavailable",
+					);
+				}
 
-					if (effectiveModel) {
-						const now = Date.now();
-						const evaluation = evaluateCandidateCapacity(
+				if (effectiveModel) {
+					const now = Date.now();
+					const evaluation = evaluateCandidateCapacity(
+						forcedAccount,
+						effectiveModel,
+						canonicalizeBetaSignature(meta.headers?.get("anthropic-beta")),
+						now,
+						options.syntheticProbe === true,
+					);
+					meta.quotaPressureByAccountId = evaluation.quotaPressure
+						? new Map([[forcedAccount.id, evaluation.quotaPressure]])
+						: null;
+					if (evaluation.blockers.length > 0) {
+						meta.hardExcludedAccountIds = new Set([forcedAccount.id]);
+						const exclusion = candidateExclusion(
 							forcedAccount,
 							effectiveModel,
-							canonicalizeBetaSignature(meta.headers.get("anthropic-beta")),
-							now,
-							options.syntheticProbe === true,
+							evaluation,
+							"force",
 						);
-						meta.quotaPressureByAccountId = evaluation.quotaPressure
-							? new Map([[forcedAccount.id, evaluation.quotaPressure]])
-							: null;
-						if (evaluation.blockers.length > 0) {
-							meta.hardExcludedAccountIds = new Set([forcedAccount.id]);
-							const exclusion = candidateExclusion(
-								forcedAccount,
-								effectiveModel,
-								evaluation,
-								"force",
-							);
-							saveCapacityContext(meta, effectiveModel, [exclusion]);
-							const accountWide = evaluation.blockers.some(
-								(blocker) => blocker.scope === "account",
-							);
-							throw new ForceRouteUnavailableError(
-								forcedAccountId,
-								accountWide
-									? "account_capacity_exhausted"
-									: "model_capacity_exhausted",
-							);
-						}
-						meta.hardExcludedAccountIds = null;
-						saveCapacityContext(meta, effectiveModel, []);
-					} else {
-						meta.hardExcludedAccountIds = null;
-						meta.quotaPressureByAccountId = null;
-						saveCapacityContext(meta, null, []);
-					}
-					if (forcedRouting) {
-						meta.routingCandidates = [forcedRouting];
-						publishServerToolCapabilitySummary(
-							meta,
-							[forcedRouting],
-							new Set([forcedRouting.candidateId]),
+						saveCapacityContext(meta, effectiveModel, [exclusion]);
+						const accountWide = evaluation.blockers.some(
+							(blocker) => blocker.scope === "account",
+						);
+						throw new ForceRouteUnavailableError(
+							forcedAccountId,
+							accountWide
+								? "account_capacity_exhausted"
+								: "model_capacity_exhausted",
 						);
 					}
-					return [forcedAccount];
+					meta.hardExcludedAccountIds = null;
+					saveCapacityContext(meta, effectiveModel, []);
+				} else {
+					meta.hardExcludedAccountIds = null;
+					meta.quotaPressureByAccountId = null;
+					saveCapacityContext(meta, null, []);
 				}
-				// Forced account id does not exist in the database at all. Fail
-				// closed here too instead of silently falling back to normal
-				// selection, which would route the request to an account the
-				// caller never asked for. (Handled above via the `!forcedAccount`
-				// early throw before this try block's inner logic runs.)
-			} catch (error) {
-				if (
-					error instanceof ForceRouteUnavailableError ||
-					error instanceof ServerToolRoutingError
-				) {
-					throw error;
+				if (forcedRouting) {
+					meta.routingCandidates = [forcedRouting];
+					publishServerToolCapabilitySummary(
+						meta,
+						[forcedRouting],
+						new Set([forcedRouting.candidateId]),
+					);
 				}
-				log.error(
-					"Failed to get accounts from database for forced account lookup:",
-					error,
-				);
-				console.error("\n❌ DATABASE ERROR DETECTED");
-				console.error("═".repeat(50));
-				console.error(
-					"The database encountered an error while looking up the requested account.",
-				);
-				console.error(
-					"This may indicate database corruption or integrity issues.\n",
-				);
-				console.error("To diagnose and repair the database, run:");
-				console.error("  bun run cli --repair-db\n");
-				console.error("The explicit route will fail closed.");
-				console.error(`${"═".repeat(50)}\n`);
-				throw new ForceRouteUnavailableError(forcedAccountId, "lookup_failed");
+				return [forcedAccount];
 			}
+			// Forced account id does not exist in the database at all. Fail
+			// closed here too instead of silently falling back to normal
+			// selection, which would route the request to an account the
+			// caller never asked for. (Handled above via the `!forcedAccount`
+			// early throw before this try block's inner logic runs.)
+		} catch (error) {
+			if (
+				error instanceof ForceRouteUnavailableError ||
+				error instanceof ServerToolRoutingError
+			) {
+				throw error;
+			}
+			log.error(
+				"Failed to get accounts from database for forced account lookup:",
+				error,
+			);
+			console.error("\n❌ DATABASE ERROR DETECTED");
+			console.error("═".repeat(50));
+			console.error(
+				"The database encountered an error while looking up the requested account.",
+			);
+			console.error(
+				"This may indicate database corruption or integrity issues.\n",
+			);
+			console.error("To diagnose and repair the database, run:");
+			console.error("  bun run cli --repair-db\n");
+			console.error("The explicit route will fail closed.");
+			console.error(`${"═".repeat(50)}\n`);
+			throw new ForceRouteUnavailableError(forcedAccountId, "lookup_failed");
 		}
 	}
 

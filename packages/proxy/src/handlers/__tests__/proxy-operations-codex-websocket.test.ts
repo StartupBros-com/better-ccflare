@@ -1452,11 +1452,13 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 describe("proxyWithAccount: GPT-5.6 explicit breakpoint compatibility retry", () => {
 	let originalFetch: typeof globalThis.fetch;
 	let originalPercent: string | undefined;
+	let originalCacheKeyMode: string | undefined;
 
 	beforeEach(() => {
 		originalFetch = globalThis.fetch;
 		originalPercent =
 			process.env.CCFLARE_CODEX_GPT56_EXPLICIT_CACHE_BREAKPOINT_PERCENT;
+		originalCacheKeyMode = process.env.CCFLARE_CODEX_CACHE_KEY_MODE;
 		process.env.CCFLARE_CODEX_GPT56_EXPLICIT_CACHE_BREAKPOINT_PERCENT = "100";
 		process.env.CCFLARE_CODEX_PROMPT_CACHE_KEY = "1";
 		resetCodexExplicitBreakpointSuppressionsForTest();
@@ -1471,6 +1473,11 @@ describe("proxyWithAccount: GPT-5.6 explicit breakpoint compatibility retry", ()
 				originalPercent;
 		}
 		delete process.env.CCFLARE_CODEX_PROMPT_CACHE_KEY;
+		if (originalCacheKeyMode === undefined) {
+			delete process.env.CCFLARE_CODEX_CACHE_KEY_MODE;
+		} else {
+			process.env.CCFLARE_CODEX_CACHE_KEY_MODE = originalCacheKeyMode;
+		}
 		delete process.env.CCFLARE_CODEX_TRACE_DIR;
 		resetCodexExplicitBreakpointSuppressionsForTest();
 		mock.restore();
@@ -1557,8 +1564,34 @@ describe("proxyWithAccount: GPT-5.6 explicit breakpoint compatibility retry", ()
 
 	it("retries one pre-content 400 without the marker and suppresses that account/model", async () => {
 		installUsageCollector();
+		process.env.CCFLARE_CODEX_CACHE_KEY_MODE = "session";
+		const websocketAttempts: Array<{
+			conversationIdentity: string | null | undefined;
+			reservedHeaderNames: string[];
+		}> = [];
+		spyOn(codexWebSocketTransport, "tryRequest").mockImplementation(
+			async (input) => {
+				websocketAttempts.push({
+					conversationIdentity: (
+						input as typeof input & {
+							conversationIdentity?: string | null;
+						}
+					).conversationIdentity,
+					reservedHeaderNames: [...input.request.headers.keys()].filter(
+						(name) => name.startsWith("x-better-ccflare-"),
+					),
+				});
+				return null;
+			},
+		);
 		const outbound: Array<Record<string, unknown>> = [];
+		const httpReservedHeaderNames: string[][] = [];
 		globalThis.fetch = mock(async (request: Request) => {
+			httpReservedHeaderNames.push(
+				[...request.headers.keys()].filter((name) =>
+					name.startsWith("x-better-ccflare-"),
+				),
+			);
 			outbound.push((await request.clone().json()) as Record<string, unknown>);
 			if (outbound.length === 1) {
 				return new Response(
@@ -1588,7 +1621,39 @@ describe("proxyWithAccount: GPT-5.6 explicit breakpoint compatibility retry", ()
 		const account = makeCodexAccount({
 			model_mappings: JSON.stringify({ sonnet: "gpt-5.6-sol" }),
 		});
-		const body = makeGpt56RequestBody();
+		const body = makeConversationRequestBody([
+			{
+				role: "user",
+				content: [
+					{
+						type: "text",
+						text: "stable cached prefix",
+						cache_control: { type: "ephemeral" },
+					},
+				],
+			},
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "tool_use",
+						id: "tool-lineage-breakpoint-retry",
+						name: "Lookup",
+						input: { value: "retry" },
+					},
+				],
+			},
+			{
+				role: "user",
+				content: [
+					{
+						type: "tool_result",
+						tool_use_id: "tool-lineage-breakpoint-retry",
+						content: "retry result",
+					},
+				],
+			},
+		]);
 		const response = await runProxy(
 			makeRequest(body),
 			body,
@@ -1598,6 +1663,17 @@ describe("proxyWithAccount: GPT-5.6 explicit breakpoint compatibility retry", ()
 		);
 
 		expect(outbound).toHaveLength(2);
+		expect(websocketAttempts).toHaveLength(2);
+		expect(websocketAttempts[0]?.conversationIdentity).toMatch(
+			/^[0-9a-f]{64}$/,
+		);
+		expect(websocketAttempts[1]?.conversationIdentity).toBe(
+			websocketAttempts[0]?.conversationIdentity,
+		);
+		expect(
+			websocketAttempts.map((attempt) => attempt.reservedHeaderNames),
+		).toEqual([[], []]);
+		expect(httpReservedHeaderNames).toEqual([[], []]);
 		expect(response?.status).toBe(200);
 		expect(JSON.stringify(outbound[0])).toContain("prompt_cache_breakpoint");
 		expect(JSON.stringify(outbound[1])).not.toContain(

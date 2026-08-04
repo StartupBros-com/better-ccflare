@@ -26,6 +26,8 @@ interface SessionAccountEntry {
 	/** Account id, or null for a TOMBSTONE — a cleared session whose version
 	 * watermark is retained so a slow older request can't recreate the mapping. */
 	accountId: string | null;
+	/** Model-route profile provenance, or null for an ordinary account route. */
+	routeProfileId: string | null;
 	/** Observation (completion) time — drives TTL expiry and eviction recency. */
 	recordedAt: number;
 	/**
@@ -45,6 +47,13 @@ interface SessionAccountEntry {
 	 * but is not warranted for a cosmetic badge.
 	 */
 	version: number;
+}
+
+/** The account observation stored atomically for one live Claude Code session. */
+export interface SessionAccountObservation {
+	accountId: string;
+	/** Internal profile slug, or null when ordinary account selection served it. */
+	routeProfileId: string | null;
 }
 
 export interface SessionAccountObserverOptions {
@@ -89,6 +98,7 @@ export class SessionAccountObserver {
 		sessionId: string,
 		accountId: string,
 		version: number = this.now(),
+		routeProfileId: string | null = null,
 	): void {
 		if (!sessionId || !accountId) return;
 		const existing = this.map.get(sessionId);
@@ -97,7 +107,12 @@ export class SessionAccountObserver {
 		if (!existing) {
 			this.evictOldestIfFull();
 		}
-		this.map.set(sessionId, { accountId, recordedAt: this.now(), version });
+		this.map.set(sessionId, {
+			accountId,
+			routeProfileId,
+			recordedAt: this.now(),
+			version,
+		});
 	}
 
 	/**
@@ -106,6 +121,15 @@ export class SessionAccountObserver {
 	 * access).
 	 */
 	get(sessionId: string): string | undefined {
+		return this.getObservation(sessionId)?.accountId;
+	}
+
+	/**
+	 * Return the account and route-profile provenance last recorded for
+	 * `sessionId`. The pair is read from one entry so callers cannot observe an
+	 * account from one request with provenance from another concurrent request.
+	 */
+	getObservation(sessionId: string): SessionAccountObservation | undefined {
 		if (!sessionId) return undefined;
 		const entry = this.map.get(sessionId);
 		if (!entry) return undefined;
@@ -113,7 +137,11 @@ export class SessionAccountObserver {
 			this.map.delete(sessionId);
 			return undefined;
 		}
-		return entry.accountId ?? undefined;
+		if (entry.accountId === null) return undefined;
+		return {
+			accountId: entry.accountId,
+			routeProfileId: entry.routeProfileId,
+		};
 	}
 
 	/**
@@ -136,6 +164,7 @@ export class SessionAccountObserver {
 		}
 		this.map.set(sessionId, {
 			accountId: null,
+			routeProfileId: null,
 			recordedAt: this.now(),
 			version,
 		});
@@ -197,13 +226,21 @@ export function recordServedAccount(
 	sessionId: string,
 	accountId: string,
 	version?: number,
+	routeProfileId: string | null = null,
 ): void {
-	observer.record(sessionId, accountId, version);
+	observer.record(sessionId, accountId, version, routeProfileId);
 }
 
 /** Look up the account id that last served `sessionId`, if still live. */
 export function getServedAccount(sessionId: string): string | undefined {
 	return observer.get(sessionId);
+}
+
+/** Look up the serving account and its route-profile provenance atomically. */
+export function getServedAccountObservation(
+	sessionId: string,
+): SessionAccountObservation | undefined {
+	return observer.getObservation(sessionId);
 }
 
 /**

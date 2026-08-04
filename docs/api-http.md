@@ -203,6 +203,12 @@ This endpoint is **exempt from API-key authentication**: the caller is a local
 status-line script with no credential store, and the payload is coarse
 operational state (account name plus usage/health) with no secrets.
 
+Ordinary account routing includes the account's existing `id` field. When a
+model-route profile served the request, the response omits that raw account UUID
+and instead includes the public picker model id in `profileModelId` (for example,
+`claude-bccf-route-pro-primary-sol`). This distinct field is display provenance,
+not an account id that can be reused with the force-account header.
+
 **Response — known session (200):**
 ```json
 {
@@ -221,6 +227,31 @@ operational state (account name plus usage/health) with no secrets.
         { "window": "five_hour", "utilization": 42, "resetMs": 1765000000000 },
         { "window": "seven_day", "utilization": 61, "resetMs": 1765400000000 }
       ],
+      "rateLimitStatus": "OK",
+      "rateLimitedUntil": null,
+      "rateLimitReset": null,
+      "usageThrottledUntil": null,
+      "usageThrottledWindows": []
+    }
+  }
+}
+```
+
+**Response — known model-route profile session (200):**
+```json
+{
+  "success": true,
+  "data": {
+    "status": "known",
+    "account": {
+      "profileModelId": "claude-bccf-route-pro-primary-sol",
+      "name": "account1",
+      "provider": "anthropic",
+      "paused": false,
+      "usageUtilization": 42,
+      "usageWindow": "five_hour",
+      "usageResetMs": 1765000000000,
+      "windows": [],
       "rateLimitStatus": "OK",
       "rateLimitedUntil": null,
       "rateLimitReset": null,

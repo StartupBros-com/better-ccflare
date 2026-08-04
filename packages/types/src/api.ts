@@ -134,6 +134,14 @@ export interface RequestMeta {
 	projectAttributionSource?: ProjectAttributionSource | null;
 	agentAttributionSource?: AgentAttributionSource | null;
 	headers?: Headers;
+	/** Server-derived exact-account route. Never populated directly from a public header. */
+	forcedAccountId?: string | null;
+	/** Restart-scoped model route profile that produced the server-derived route. */
+	routeProfileId?: string | null;
+	/** Optional provider invariant for a route profile; mismatches fail closed. */
+	routeExpectedProvider?: string | null;
+	/** Optional first physical-model invariant for a route profile; mismatches fail closed. */
+	routeExpectedPhysicalModel?: string | null;
 	/** Authenticated in-process auto-refresh probe; never derived from public hint headers. */
 	trustedInternalAutoRefresh?: boolean;
 	/** Frozen content-minimal server-tool constraints derived from the final request body. */

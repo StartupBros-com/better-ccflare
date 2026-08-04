@@ -166,9 +166,12 @@ describe("upstream response header sanitization (P1 spoofing defense)", () => {
 			method: "POST",
 			headers: {
 				"content-type": "application/json",
+				"x-better-ccflare-account-id": "test-account",
+				"x-better-ccflare-future-routing-signal": "must-not-reach-provider",
 				"x-better-ccflare-guard-request-id":
 					"v1.76110a75-9e91-4ab9-89a7-3e5d25a318fc.1.spoofed",
 				"x-better-ccflare-guard-correlation-secret": "client-spoof",
+				"x-public-client-header": "preserved",
 			},
 			body: JSON.stringify({
 				model: "claude-opus-4-5",
@@ -195,5 +198,14 @@ describe("upstream response header sanitization (P1 spoofing defense)", () => {
 		expect(
 			providerRequestHeaders?.has("x-better-ccflare-guard-correlation-secret"),
 		).toBe(false);
+		expect(providerRequestHeaders?.has("x-better-ccflare-account-id")).toBe(
+			false,
+		);
+		expect(
+			providerRequestHeaders?.has("x-better-ccflare-future-routing-signal"),
+		).toBe(false);
+		expect(providerRequestHeaders?.get("x-public-client-header")).toBe(
+			"preserved",
+		);
 	});
 });

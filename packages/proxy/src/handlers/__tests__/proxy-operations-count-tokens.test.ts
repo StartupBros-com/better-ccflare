@@ -398,7 +398,7 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 	it.each([
 		["cc_version=2.1.207; cc_entrypoint=cli; cc_is_subagent=true", []],
 		["cc_version=2.1.207; cc_is_subagent=false", ["Agent"]],
-		["cc_version=2.1.207; cc_is_subagent=TRUE", ["Agent"]],
+		["cc_version=2.1.207; cc_is_subagent=TRUE", []],
 		["cc_version=2.1.207; not_cc_is_subagent=true", ["Agent"]],
 	])("derives descendant containment from billing metadata %s", async (billingHeader, expectedTools) => {
 		let fetchedRequest: Request | null = null;

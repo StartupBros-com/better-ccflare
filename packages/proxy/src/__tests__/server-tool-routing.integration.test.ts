@@ -21,6 +21,10 @@ import type {
 	ServerToolCapabilityTuple,
 } from "@better-ccflare/types";
 import type { ProxyContext } from "../handlers";
+import {
+	ModelRouteSessionRegistry,
+	parseModelRouteProfiles,
+} from "../model-route-profiles";
 
 // Focused proxy tests must not load ignored embedded worker artifacts.
 mock.module("@better-ccflare/database", () => ({
@@ -278,6 +282,7 @@ function makeServerToolRequest(
 		invalid?: boolean;
 		agentId?: string;
 		forcedAccountId?: string;
+		model?: string;
 		query?: string;
 	} = {},
 ): Request {
@@ -296,7 +301,7 @@ function makeServerToolRequest(
 		method: "POST",
 		headers,
 		body: JSON.stringify({
-			model: MODEL,
+			model: options.model ?? MODEL,
 			messages: [{ role: "user", content: "hello" }],
 			max_tokens: 16,
 			stream: false,
@@ -691,6 +696,69 @@ describe("server-tool routing integration", () => {
 			reason: "forced_incapable",
 			account_id: forced.id,
 		});
+		expect(response.headers.get("x-better-ccflare-force-route")).toBe(
+			"unavailable",
+		);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+		expect(refreshCalls.value).toBe(0);
+		expect(mutations.pauseAccount).toHaveBeenCalledTimes(0);
+		expect(mutations.markAccountRateLimited).toHaveBeenCalledTimes(0);
+		expect(mutations.reportFailure).toHaveBeenCalledTimes(0);
+	});
+
+	it("redacts a profile account id when its force-routed proof drifts", async () => {
+		const forced = makeAccount({
+			id: "profile-capability-forced",
+			name: "profile-capability-forced",
+			api_key: "forced-key",
+			refresh_token: "",
+		});
+		const substitute = makeAccount({
+			id: "profile-capability-substitute",
+			name: "profile-capability-substitute",
+			api_key: "substitute-key",
+			refresh_token: "",
+			priority: 1,
+		});
+		const { ctx, refreshCalls, mutations } = makeContext(
+			[forced, substitute],
+			(provider) => {
+				installDriftingProofResolver(provider, new Set([forced.id]));
+			},
+		);
+		const publicModelId = "claude-bccf-route-server-tool-profile";
+		ctx.modelRouteSessionRegistry = new ModelRouteSessionRegistry(
+			parseModelRouteProfiles(
+				JSON.stringify([
+					{
+						id: "server-tool-profile",
+						displayName: "Server-tool profile",
+						accountId: forced.id,
+						logicalModel: MODEL,
+						expectedProvider: forced.provider,
+					},
+				]),
+			),
+		);
+		globalThis.fetch = mock(
+			async () =>
+				new Response(JSON.stringify({ unexpected: true }), { status: 500 }),
+		);
+		const request = makeServerToolRequest({ model: publicModelId });
+
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = (await response.json()) as {
+			error: Record<string, unknown>;
+		};
+
+		expect(response.status).toBe(503);
+		expect(body.error).toMatchObject({
+			type: "force_route_unavailable",
+			code: "server_tool_force_route_unavailable",
+			reason: "forced_incapable",
+		});
+		expect(body.error).not.toHaveProperty("account_id");
+		expect(JSON.stringify(body)).not.toContain(forced.id);
 		expect(response.headers.get("x-better-ccflare-force-route")).toBe(
 			"unavailable",
 		);

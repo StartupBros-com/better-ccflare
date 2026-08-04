@@ -48,6 +48,7 @@ import {
 import { warnOnLookbackRisk } from "./cache-telemetry";
 import { CACHE_REPLAY_MODEL_HEADER } from "./cache-transport-staging";
 import { adaptAnthropicSsePingsForClaudeCode } from "./claude-code-ping-compat";
+import { isClaudeCodeSubagent } from "./claude-code-request";
 import {
 	type AgentInterceptResult,
 	createContextAdmissionTracker,
@@ -81,6 +82,7 @@ import {
 } from "./handlers";
 import {
 	getCapacityDeferredModelRoutes,
+	getClientVisibleServerToolAccountId,
 	getReactiveModelCapacityBlocker,
 } from "./handlers/account-selector";
 import {
@@ -99,6 +101,11 @@ import {
 import { getRequestRateLimitOutcomes } from "./handlers/rate-limit-scope";
 import { createProtectedAnthropicOverloadResponse } from "./handlers/routing-terminal";
 import { consumeInternalAutoRefreshAuth } from "./internal-probe-auth";
+import {
+	MODEL_ROUTE_PROFILE_MODEL_PREFIX,
+	type ModelRouteProfile,
+} from "./model-route-profiles";
+import { opaqueRuntimeId } from "./opaque-runtime-id";
 import {
 	getPreTransportDeadlineConfig,
 	PreTransportPhaseTimeoutError,
@@ -129,6 +136,105 @@ import {
 } from "./usage-collector";
 
 export type { ProxyContext } from "./handlers";
+
+function modelRouteUnavailableResponse(
+	model: string,
+	reason:
+		| "unknown_profile"
+		| "unbound_child_profile"
+		| "conflicting_child_profile" = "unknown_profile",
+): Response {
+	return new Response(
+		JSON.stringify({
+			type: "error",
+			error: {
+				type: "model_route_unavailable",
+				message: `Model route ${model} is unavailable`,
+				reason,
+			},
+		}),
+		{
+			status: 503,
+			headers: {
+				"content-type": "application/json",
+				"x-better-ccflare-model-route": "unavailable",
+			},
+		},
+	);
+}
+
+function forceRouteUnavailableResponse(
+	error: ForceRouteUnavailableError,
+	revealAccountId: boolean,
+): Response {
+	return new Response(
+		JSON.stringify({
+			error: {
+				type: "force_route_unavailable",
+				message: error.message,
+				...(revealAccountId ? { account_id: error.accountId } : {}),
+				reason: error.reason,
+			},
+		}),
+		{
+			status: 503,
+			headers: {
+				"content-type": "application/json",
+				"x-better-ccflare-force-route": "unavailable",
+			},
+		},
+	);
+}
+
+function routeCallerIdentity(
+	req: Request,
+	apiKeyId?: string | null,
+): string | null {
+	if (apiKeyId?.trim()) return `api-key-id:${apiKeyId.trim()}`;
+	const credential =
+		req.headers.get("authorization") ?? req.headers.get("x-api-key");
+	if (credential?.trim()) {
+		return opaqueRuntimeId("model-route-caller", credential.trim());
+	}
+	return null;
+}
+
+function isModelRouteIntentRequest(req: Request, url: URL): boolean {
+	return (
+		req.method === "POST" &&
+		(url.pathname === "/v1/messages" ||
+			url.pathname === "/v1/messages/count_tokens")
+	);
+}
+
+function applyExplicitModelRoute(
+	bodyContext: RequestBodyContext,
+	profile: ModelRouteProfile,
+): void {
+	bodyContext.setModel(profile.logicalModel);
+	if (!profile.defaultEffort) return;
+	bodyContext.mutateParsedJson((body) => {
+		const outputConfig =
+			typeof body.output_config === "object" && body.output_config !== null
+				? (body.output_config as Record<string, unknown>)
+				: null;
+		const reasoning =
+			typeof body.reasoning === "object" && body.reasoning !== null
+				? (body.reasoning as Record<string, unknown>)
+				: null;
+		if (
+			(outputConfig && "effort" in outputConfig) ||
+			(reasoning && "effort" in reasoning)
+		) {
+			return;
+		}
+		if (body.output_config !== undefined && outputConfig === null) return;
+		body.output_config = {
+			...(outputConfig ?? {}),
+			effort: profile.defaultEffort,
+		};
+	});
+}
 
 interface ReactiveModelDepletionOptions {
 	accountId: string;
@@ -389,6 +495,19 @@ export async function handleProxy(
 	apiKeyId?: string | null,
 	apiKeyName?: string | null,
 ): Promise<Response> {
+	// Reserve root intent synchronously, before body buffering or agent
+	// interception can await and invert same-session request order. Discovery,
+	// unrelated paths, children, credentialless callers, and zero-profile
+	// registries remain allocation-free.
+	const rootIntentGeneration =
+		ctx.modelRouteSessionRegistry?.hasProfiles &&
+		isModelRouteIntentRequest(req, url)
+			? ctx.modelRouteSessionRegistry.beginRootIntent({
+					callerIdentity: routeCallerIdentity(req, apiKeyId),
+					sessionId: req.headers.get("x-claude-code-session-id"),
+					isSubagent: isClaudeCodeSubagent(req.headers),
+				})
+			: null;
 	const telemetry: DegradedTelemetryHolder = { tracker: null };
 	const rescueRequestStartedAt = Date.now();
 	try {
@@ -400,6 +519,7 @@ export async function handleProxy(
 				ctx,
 				apiKeyId,
 				apiKeyName,
+				rootIntentGeneration,
 				undefined,
 				telemetry,
 			);
@@ -423,6 +543,7 @@ export async function handleProxy(
 				ctx,
 				apiKeyId,
 				apiKeyName,
+				rootIntentGeneration,
 				routeContext,
 				telemetry,
 			);
@@ -471,6 +592,7 @@ async function handleProxyCore(
 	ctx: ProxyContext,
 	apiKeyId?: string | null,
 	apiKeyName?: string | null,
+	rootIntentGeneration: number | null = null,
 	anthropicPreCommitRescue?: AnthropicPreCommitRescueRouteContext,
 	degradedTelemetry?: DegradedTelemetryHolder,
 ): Promise<Response> {
@@ -513,6 +635,29 @@ async function handleProxyCore(
 		});
 	}
 
+	// handleProxy is entered only after the server's authentication layer. When
+	// profiles are configured, Claude Code gateway discovery is a local metadata
+	// read: never validate a provider, query accounts, or forward this request.
+	if (
+		req.method === "GET" &&
+		url.pathname === "/v1/models" &&
+		ctx.modelRouteSessionRegistry?.hasProfiles
+	) {
+		return new Response(
+			JSON.stringify({
+				data: ctx.modelRouteSessionRegistry.getDiscoveryModels(),
+				has_more: false,
+			}),
+			{
+				status: 200,
+				headers: {
+					"content-type": "application/json",
+					"cache-control": "no-store",
+				},
+			},
+		);
+	}
+
 	// 1. Track client version from user-agent for use in auto-refresh
 	trackClientVersion(req.headers.get("user-agent"));
 
@@ -551,7 +696,19 @@ async function handleProxyCore(
 		error: ServerToolRoutingError,
 	): Response => {
 		if (sessionId) clearSession(sessionId, requestMeta.timestamp);
-		return createServerToolRoutingErrorResponse(error);
+		const clientVisibleAccountId = getClientVisibleServerToolAccountId(
+			requestMeta,
+			error.accountId,
+		);
+		return createServerToolRoutingErrorResponse(
+			clientVisibleAccountId === error.accountId
+				? error
+				: new ServerToolRoutingError({
+						reason: error.reason,
+						accountId: clientVisibleAccountId,
+						capabilitySummary: error.capabilitySummary,
+					}),
+		);
 	};
 	requestMeta.trustedInternalAutoRefresh = trustedInternalAutoRefresh;
 	const routingAttemptLedger = new RoutingAttemptLedger();
@@ -608,6 +765,8 @@ async function handleProxyCore(
 	// and reuse parsed body for /v1/messages validation (consolidate parses)
 	const parsedBody = requestBodyContext.getParsedJson();
 	const requestModel = requestBodyContext.getModel();
+	const normalizedRequestModel = requestModel?.trim() ?? null;
+	const modelRouteRegistry = ctx.modelRouteSessionRegistry;
 	const { project, projectAttributionSource } =
 		extractProjectAttributionFromRequest(req.headers, parsedBody);
 
@@ -680,16 +839,12 @@ async function handleProxyCore(
 			agentAttributionSource: "none" as const,
 		};
 	}
-	const {
-		modifiedBody,
-		agentUsed,
-		originalModel,
-		appliedModel,
-		agentAttributionSource,
-	} = agentInterception;
+	const { modifiedBody, agentUsed, originalModel, agentAttributionSource } =
+		agentInterception;
+	let appliedModel = agentInterception.appliedModel;
 
 	// Use modified body if available
-	const finalBodyBuffer = modifiedBody || requestBodyContext.getBuffer();
+	let finalBodyBuffer = modifiedBody || requestBodyContext.getBuffer();
 	// proxyWithAccount prefers the parsed context over its raw buffer argument.
 	// Keep that context aligned with the interceptor result while retaining the
 	// original isolated context if the deadline failed open.
@@ -697,6 +852,88 @@ async function handleProxyCore(
 		finalBodyBuffer === requestBodyContext.getBuffer()
 			? requestBodyContext
 			: new RequestBodyContext(finalBodyBuffer);
+	const effectiveModelAfterInterception =
+		finalRequestBodyContext.getModel()?.trim() ?? null;
+	const isSubagent = isClaudeCodeSubagent(req.headers);
+	const originalReservedPicker =
+		normalizedRequestModel?.startsWith(MODEL_ROUTE_PROFILE_MODEL_PREFIX) ===
+		true;
+	const configuredOriginalPicker =
+		normalizedRequestModel !== null &&
+		modelRouteRegistry?.hasPublicModelId(normalizedRequestModel) === true;
+	const effectiveReservedPicker =
+		effectiveModelAfterInterception?.startsWith(
+			MODEL_ROUTE_PROFILE_MODEL_PREFIX,
+		) === true;
+	const configuredEffectivePicker =
+		effectiveModelAfterInterception !== null &&
+		modelRouteRegistry?.hasPublicModelId(effectiveModelAfterInterception) ===
+			true;
+	// A stale picker selected directly in /model is not a native clear. Children,
+	// however, are classified entirely by their post-interception effective model.
+	if (!isSubagent && originalReservedPicker && !configuredOriginalPicker) {
+		return modelRouteUnavailableResponse(normalizedRequestModel ?? "unknown");
+	}
+	if (isSubagent && effectiveReservedPicker && !configuredEffectivePicker) {
+		return modelRouteUnavailableResponse(
+			effectiveModelAfterInterception ?? "unknown",
+		);
+	}
+	const modelRouteRequestModel = isSubagent
+		? effectiveModelAfterInterception
+		: normalizedRequestModel;
+	const modelRouteResolutionInput = {
+		callerIdentity: routeCallerIdentity(req, apiKeyId),
+		requestModel: modelRouteRequestModel,
+		sessionId: req.headers.get("x-claude-code-session-id"),
+		isSubagent,
+	};
+	const modelRouteResolution = modelRouteRegistry?.resolve(
+		modelRouteResolutionInput,
+		rootIntentGeneration,
+	);
+	// A native root remains native even if an agent preference injects a reserved
+	// picker after /model selection. Resolve first so the authoritative native
+	// intent clears the binding, then fail locally before the picker can escape.
+	if (!isSubagent && !originalReservedPicker && effectiveReservedPicker) {
+		return modelRouteUnavailableResponse(
+			effectiveModelAfterInterception ?? "unknown",
+		);
+	}
+	if (modelRouteResolution?.kind === "unavailable") {
+		return modelRouteUnavailableResponse(
+			modelRouteRequestModel ?? "unknown",
+			modelRouteResolution.reason,
+		);
+	}
+	if (modelRouteResolution?.kind === "route") {
+		const { profile, source } = modelRouteResolution;
+		requestMeta.forcedAccountId = profile.accountId;
+		requestMeta.routeProfileId = profile.id;
+		requestMeta.routeExpectedProvider = profile.expectedProvider;
+		const inheritedPickerModel =
+			source === "inherited" && configuredEffectivePicker;
+		if (
+			inheritedPickerModel &&
+			effectiveModelAfterInterception !== profile.publicModelId
+		) {
+			return modelRouteUnavailableResponse(
+				effectiveModelAfterInterception,
+				"conflicting_child_profile",
+			);
+		}
+		if (source === "explicit") {
+			applyExplicitModelRoute(finalRequestBodyContext, profile);
+			finalBodyBuffer = finalRequestBodyContext.getBuffer();
+			appliedModel = profile.logicalModel;
+			requestMeta.routeExpectedPhysicalModel = profile.expectedPhysicalModel;
+		} else if (inheritedPickerModel) {
+			finalRequestBodyContext.setModel(profile.logicalModel);
+			finalBodyBuffer = finalRequestBodyContext.getBuffer();
+			appliedModel = profile.logicalModel;
+			requestMeta.routeExpectedPhysicalModel = profile.expectedPhysicalModel;
+		}
+	}
 	const finalCreateBodyStream = () => {
 		if (!finalBodyBuffer) return undefined;
 		return new Response(finalBodyBuffer).body ?? undefined;
@@ -849,7 +1086,13 @@ async function handleProxyCore(
 			requestMeta.xaiCachePrefixFingerprint = identity.prefixFingerprint;
 		}
 	}
-	requestMeta.originalModel = originalModel;
+	// Model-rewrite provenance is serialized into a response header. Picker IDs
+	// are matched after trimming, so keep only that header-bound value normalized.
+	requestMeta.originalModel =
+		normalizedRequestModel !== null &&
+		modelRouteRegistry?.hasPublicModelId(normalizedRequestModel) === true
+			? normalizedRequestModel
+			: originalModel;
 	requestMeta.appliedModel = appliedModel;
 
 	// 5b. Session volume circuit breaker: a runaway subagent storm shows up as
@@ -974,22 +1217,9 @@ async function handleProxyCore(
 			);
 			return finishPacing(
 				pacingObservation?.slot ?? null,
-				new Response(
-					JSON.stringify({
-						error: {
-							type: "force_route_unavailable",
-							message: error.message,
-							account_id: error.accountId,
-							reason: error.reason,
-						},
-					}),
-					{
-						status: 503,
-						headers: {
-							"content-type": "application/json",
-							"x-better-ccflare-force-route": "unavailable",
-						},
-					},
+				forceRouteUnavailableResponse(
+					error,
+					requestMeta.routeProfileId == null,
 				),
 			);
 		}
@@ -1232,22 +1462,9 @@ async function handleProxyCore(
 				);
 				return finishPacing(
 					pacingObservation?.slot ?? null,
-					new Response(
-						JSON.stringify({
-							error: {
-								type: "force_route_unavailable",
-								message: error.message,
-								account_id: error.accountId,
-								reason: error.reason,
-							},
-						}),
-						{
-							status: 503,
-							headers: {
-								"content-type": "application/json",
-								"x-better-ccflare-force-route": "unavailable",
-							},
-						},
+					forceRouteUnavailableResponse(
+						error,
+						requestMeta.routeProfileId == null,
 					),
 				);
 			}
@@ -1284,9 +1501,10 @@ async function handleProxyCore(
 			? "bypassed"
 			: "paced"
 		: null;
-	const requestedForcedAccountId = req.headers.get(
-		"x-better-ccflare-account-id",
-	);
+	const requestedForcedAccountId =
+		requestMeta.forcedAccountId?.trim() ||
+		req.headers.get("x-better-ccflare-account-id")?.trim() ||
+		null;
 	const successfullyForceRouted =
 		requestedForcedAccountId !== null &&
 		requestedForcedAccountId.length > 0 &&
@@ -1467,6 +1685,19 @@ async function handleProxyCore(
 
 		// (Session badge already cleared at the top of this block.)
 		return finishPacing(pacingSlot, terminal.response);
+	}
+
+	if (
+		modelRouteResolution?.kind === "route" &&
+		modelRouteResolution.source === "explicit" &&
+		accounts.some(
+			(account) => account.id === modelRouteResolution.profile.accountId,
+		)
+	) {
+		modelRouteRegistry?.commitExplicit(
+			modelRouteResolutionInput,
+			modelRouteResolution,
+		);
 	}
 
 	// 8. Log selected accounts
