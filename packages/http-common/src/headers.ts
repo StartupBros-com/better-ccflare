@@ -64,7 +64,8 @@ export function sanitizeProxyHeaders(original: Headers): Headers {
  * analytics.
  *
  * Removes: accept-encoding, content-encoding, transfer-encoding, content-length,
- * authorization, x-api-key, cookie, x-better-ccflare-guard-request-id
+ * authorization, x-api-key, cookie, x-better-ccflare-guard-request-id,
+ * x-better-ccflare-logical-model-family
  */
 export function sanitizeRequestHeaders(original: Headers): Headers {
 	const h = new Headers(original);
@@ -80,6 +81,7 @@ export function sanitizeRequestHeaders(original: Headers): Headers {
 	// with request payload metadata would unnecessarily widen its trust boundary.
 	h.delete(GUARD_REQUEST_ID_HEADER);
 	h.delete(GUARD_CORRELATION_SECRET_HEADER);
+	h.delete(CODEX_LOGICAL_MODEL_FAMILY_HEADER);
 	// keep in sync with INTERNAL_PROBE_SECRET_HEADER
 	// (@better-ccflare/proxy already depends on http-common, so importing the
 	// proxy package's constant here would create an import cycle)

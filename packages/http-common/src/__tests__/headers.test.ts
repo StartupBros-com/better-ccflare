@@ -75,6 +75,20 @@ describe("withSanitizedProxyHeaders", () => {
 	});
 });
 
+describe("request analytics privacy", () => {
+	test("does not persist the logical-family carrier", () => {
+		const original = new Headers({
+			"content-type": "application/json",
+			[CODEX_LOGICAL_MODEL_FAMILY_HEADER]: "fable",
+		});
+
+		const sanitized = sanitizeRequestHeaders(original);
+
+		expect(sanitized.has(CODEX_LOGICAL_MODEL_FAMILY_HEADER)).toBe(false);
+		expect(sanitized.get("content-type")).toBe("application/json");
+	});
+});
+
 describe("guard request correlation privacy", () => {
 	const guardId = "76110a75-9e91-4ab9-89a7-3e5d25a318fc";
 
