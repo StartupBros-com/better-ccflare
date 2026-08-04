@@ -1197,6 +1197,65 @@ describe("global model-first routing", () => {
 		}
 	});
 
+	it("rescues a later probe-suppressed deferred route after a pre-transport admission rejection", async () => {
+		const previousAdmission = process.env.CCFLARE_CONTEXT_ADMISSION;
+		const previousWindow =
+			process.env.CCFLARE_CONTEXT_ADMISSION_TEST_EFFECTIVE_WINDOW;
+		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
+		process.env.CCFLARE_CONTEXT_ADMISSION_TEST_EFFECTIVE_WINDOW = "64";
+		const estimateSpy = spyOn(
+			providersModule,
+			"estimateAnthropicAdmissionTokens",
+		).mockReturnValue({
+			tokens: 100,
+			method: "test-authoritative",
+			confidence: "authoritative",
+		});
+		try {
+			const rejected = makeAccount("admission-rejected-deferred", [
+				FABLE,
+				"gpt-5.3-codex-spark",
+			]);
+			rejected.provider = "codex";
+			rejected.api_key = null;
+			rejected.access_token = "token-admission-rejected-deferred";
+			rejected.expires_at = Date.now() + 60 * 60 * 1000;
+			const suppressed = makeAccount("probe-suppressed-deferred");
+			suppressed.priority = 1;
+			suppressed.rate_limited_until = Date.now() - 1;
+			suppressed.rate_limited_reason = "upstream_529_overloaded_no_reset";
+			const ctx = makeContext(
+				[rejected, suppressed],
+				makeCombo({ account: rejected }, { account: suppressed }),
+			);
+			ctx.dbOps.getComboRoutingPolicy = mock(async (family: ComboFamily) =>
+				makeRoutingPolicy(null, family),
+			);
+			cacheCurrentFableExhaustion(rejected.id);
+			cacheCurrentFableExhaustion(suppressed.id);
+			expect(getRateLimitProbeAdmission(suppressed)).toBe("admitted");
+			const attempts = installFetch(() => success());
+
+			const response = await run(ctx);
+
+			expect(response.status).toBe(200);
+			expect(attempts).toEqual([{ account: suppressed.id, model: OPUS }]);
+		} finally {
+			estimateSpy.mockRestore();
+			if (previousAdmission === undefined) {
+				delete process.env.CCFLARE_CONTEXT_ADMISSION;
+			} else {
+				process.env.CCFLARE_CONTEXT_ADMISSION = previousAdmission;
+			}
+			if (previousWindow === undefined) {
+				delete process.env.CCFLARE_CONTEXT_ADMISSION_TEST_EFFECTIVE_WINDOW;
+			} else {
+				process.env.CCFLARE_CONTEXT_ADMISSION_TEST_EFFECTIVE_WINDOW =
+					previousWindow;
+			}
+		}
+	});
+
 	it("continues from an ungated requested-route overload to a deferred route", async () => {
 		const requested = makeAccount("suppressed-requested");
 		requested.model_mappings = null;
@@ -1528,6 +1587,93 @@ describe("global model-first routing", () => {
 		expect(response.status).toBe(503);
 		expect(body.error?.code).toBe("model_pool_exhausted");
 		expect(attempts).toEqual([]);
+	});
+
+	it("prefers post-combo deferred depletion over a soft normal-fallback throttle", async () => {
+		const comboAccount = makeAccount("post-combo-reactive-deferred");
+		const predictiveFallback = makeAccount("post-combo-predictive-fallback");
+		predictiveFallback.priority = 1;
+		const ctx = makeContext(
+			[comboAccount, predictiveFallback],
+			makeCombo({ account: comboAccount }),
+		);
+		ctx.strategy.select = mock(
+			(
+				selected: Account[],
+				meta: {
+					routingCandidates?: readonly { comboSlotId?: string | null }[];
+				},
+			) =>
+				meta.routingCandidates?.some(
+					(candidate) => candidate.comboSlotId != null,
+				)
+					? selected.filter((account) => account.id === comboAccount.id)
+					: selected.filter((account) => account.id === predictiveFallback.id),
+		);
+		ctx.config.getUsageThrottlingWeeklyEnabled = () => true;
+		usageCache.set(predictiveFallback.id, {
+			spend: { enabled: false },
+			limits: [
+				{
+					kind: "weekly_scoped",
+					percent: 90,
+					resets_at: new Date(
+						Date.now() + 2 * 24 * 60 * 60 * 1000,
+					).toISOString(),
+					scope: { model: { id: null, display_name: "Fable" } },
+					is_active: true,
+				},
+			],
+		});
+		cachedUsageAccountIds.add(predictiveFallback.id);
+		const attempts = installFetch((attempt) => {
+			usageCache.markModelScopedExhausted(
+				comboAccount.id,
+				OPUS,
+				"",
+				Date.now() + 60_000,
+			);
+			cachedUsageAccountIds.add(comboAccount.id);
+			return attempt.account === comboAccount.id && attempt.model === FABLE
+				? exactModelExhausted()
+				: success();
+		});
+
+		const response = await run(ctx);
+		const body = (await response.json()) as {
+			error?: { code?: string };
+		};
+
+		expect(response.status).toBe(503);
+		expect(body.error?.code).toBe("model_pool_exhausted");
+		expect(attempts).toEqual([{ account: comboAccount.id, model: FABLE }]);
+	});
+
+	it("returns hard deferred depletion after a prior requested-model transport", async () => {
+		const account = makeAccount("reactive-deferred-after-transport");
+		const ctx = makeContext([account], makeCombo({ account }));
+		ctx.dbOps.getComboRoutingPolicy = mock(async (family: ComboFamily) =>
+			makeRoutingPolicy(null, family),
+		);
+		const attempts = installFetch(() => {
+			usageCache.markModelScopedExhausted(
+				account.id,
+				OPUS,
+				"",
+				Date.now() + 60_000,
+			);
+			cachedUsageAccountIds.add(account.id);
+			return exactModelExhausted();
+		});
+
+		const response = await run(ctx);
+		const body = (await response.json()) as {
+			error?: { code?: string };
+		};
+
+		expect(response.status).toBe(503);
+		expect(body.error?.code).toBe("model_pool_exhausted");
+		expect(attempts).toEqual([{ account: account.id, model: FABLE }]);
 	});
 
 	it("skips a reactively depleted deferred route and tries the next clear peer", async () => {

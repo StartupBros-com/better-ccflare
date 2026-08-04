@@ -2189,8 +2189,15 @@ describe("selectAccountsForRequest — model-lane hard capacity", () => {
 				fable: ["claude-fable-5", "claude-opus-4-8"],
 			}),
 		});
-		const paused = makeAccount({ id: "capacity-paused", paused: true });
+		const paused = makeAccount({
+			id: "capacity-paused",
+			paused: true,
+			model_mappings: JSON.stringify({
+				fable: ["claude-fable-5", "claude-opus-4-8"],
+			}),
+		});
 		cacheUsage(exhausted.id, weeklyScoped("Fable"));
+		cacheUsage(paused.id, weeklyScoped("Fable"));
 		const meta = makeRequestMeta();
 		const ctx = makeCtx({ accounts: [exhausted, paused] });
 		ctx.strategy.select = mock((accounts: Account[]) =>
@@ -2201,9 +2208,14 @@ describe("selectAccountsForRequest — model-lane hard capacity", () => {
 
 		expect(result).toEqual([]);
 		expect(meta.routingCandidates).toEqual([]);
-		expect(getCapacityDeferredModelRoutes(meta)).toMatchObject([
+		expect(
+			getCapacityDeferredModelRoutes(meta).map(({ account, model }) => ({
+				accountId: account.id,
+				model,
+			})),
+		).toEqual([
 			{
-				account: exhausted,
+				accountId: exhausted.id,
 				model: "claude-opus-4-8",
 			},
 		]);

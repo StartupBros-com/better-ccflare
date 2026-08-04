@@ -2349,7 +2349,7 @@ async function handleProxyCore(
 			);
 			return finishPacing(pacingSlot, response);
 		};
-		let anyDeferredRouteAttempted = false;
+		let anyDeferredRouteCrossedTransport = false;
 		let firstProbeSuppressedDeferredRoute: DeferredModelRoute | null = null;
 		for (let i = 0; i < orderedDeferredModelRoutes.length; i++) {
 			const route = orderedDeferredModelRoutes[i];
@@ -2416,17 +2416,23 @@ async function handleProxyCore(
 				continue;
 			}
 
-			anyDeferredRouteAttempted = true;
+			const attemptedBeforeDeferredRoute = routingAttemptLedger.attemptedCount;
 			const finalResponse = await attemptDeferredRoute(
 				route,
 				i === orderedDeferredModelRoutes.length - 1,
 				probeAdmission,
 			);
+			if (routingAttemptLedger.attemptedCount > attemptedBeforeDeferredRoute) {
+				anyDeferredRouteCrossedTransport = true;
+			}
 			if (finalResponse) return finalResponse;
 		}
-		if (!anyDeferredRouteAttempted && firstProbeSuppressedDeferredRoute) {
+		if (
+			!anyDeferredRouteCrossedTransport &&
+			firstProbeSuppressedDeferredRoute
+		) {
 			log.info(
-				`No deferred route was attempted and a probe-gated route remains; retrying account ${firstProbeSuppressedDeferredRoute.account.name} model=${firstProbeSuppressedDeferredRoute.model} ungated`,
+				`No deferred route crossed transport and a probe-gated route remains; retrying account ${firstProbeSuppressedDeferredRoute.account.name} model=${firstProbeSuppressedDeferredRoute.model} ungated`,
 			);
 			if (contextAdmissionTracker) {
 				contextAdmissionTracker.nonCapacitySkipCount--;
@@ -2463,18 +2469,10 @@ async function handleProxyCore(
 			}),
 		);
 	}
-	if (fallbackSelectionHadNoAvailable && throttledFallbackAccounts.length > 0) {
-		cacheBodyStore.discardStaged(requestMeta.id);
-		if (sessionId) clearSession(sessionId, requestMeta.timestamp);
-		return finishPacing(
-			pacingSlot,
-			createUsageThrottledResponse(throttledFallbackAccounts),
-		);
-	}
 	// If routing skipped every remaining candidate using direct, short-lived
 	// model-scoped depletion evidence, return a model-lane terminal. Predictive
-	// pacing alone owns HTTP 529; hard/reactive exclusions must not masquerade as
-	// a soft throttle or acquire retry-held whole-pool markers.
+	// pacing alone owns HTTP 529; hard/reactive exclusions take precedence over
+	// every soft throttle and must not acquire retry-held whole-pool markers.
 	if (
 		deferredReactiveDepletionSkips.length > 0 ||
 		(reactiveDepletionSkips.length > 0 && upstreamAttempts === 0)
@@ -2488,6 +2486,14 @@ async function handleProxyCore(
 				now: Date.now(),
 				modelRecoveryAt: reactiveModelRecoveryAt,
 			}),
+		);
+	}
+	if (fallbackSelectionHadNoAvailable && throttledFallbackAccounts.length > 0) {
+		cacheBodyStore.discardStaged(requestMeta.id);
+		if (sessionId) clearSession(sessionId, requestMeta.timestamp);
+		return finishPacing(
+			pacingSlot,
+			createUsageThrottledResponse(throttledFallbackAccounts),
 		);
 	}
 	if (deferredPredictivelyThrottledAccounts.length > 0) {
