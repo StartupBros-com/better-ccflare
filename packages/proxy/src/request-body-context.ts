@@ -1,3 +1,6 @@
+import { deriveServerToolRequirement } from "@better-ccflare/providers/server-tool-capabilities";
+import type { ServerToolRequirements } from "@better-ccflare/types";
+
 export type RequestJsonBody = Record<string, unknown>;
 
 const decoder = new TextDecoder();
@@ -12,6 +15,54 @@ function encodeJson(body: RequestJsonBody): ArrayBuffer {
 	);
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Freeze only the layers whose identity or top-level fields are inspected by
+ * server-tool requirement derivation. Opaque schemas and provider payloads
+ * nested below those blocks deliberately remain outside this boundary.
+ */
+function freezeServerToolSemanticLayers(body: RequestJsonBody): void {
+	if (Array.isArray(body.tools)) {
+		for (const tool of body.tools) {
+			if (!isRecord(tool)) continue;
+			if (Array.isArray(tool.allowed_domains)) {
+				Object.freeze(tool.allowed_domains);
+			}
+			if (Array.isArray(tool.blocked_domains)) {
+				Object.freeze(tool.blocked_domains);
+			}
+			if (isRecord(tool.user_location)) {
+				Object.freeze(tool.user_location);
+			}
+			Object.freeze(tool);
+		}
+		Object.freeze(body.tools);
+	}
+
+	if (isRecord(body.tool_choice)) {
+		Object.freeze(body.tool_choice);
+	}
+
+	if (Array.isArray(body.messages)) {
+		for (const message of body.messages) {
+			if (!isRecord(message)) continue;
+			if (Array.isArray(message.content)) {
+				for (const block of message.content) {
+					if (isRecord(block)) Object.freeze(block);
+				}
+				Object.freeze(message.content);
+			}
+			Object.freeze(message);
+		}
+		Object.freeze(body.messages);
+	}
+
+	Object.freeze(body);
+}
+
 export class RequestBodyContext {
 	readonly originalBuffer: ArrayBuffer | null;
 
@@ -20,6 +71,16 @@ export class RequestBodyContext {
 	private parseAttempted = false;
 	private parseFailed = false;
 	private dirty = false;
+	private serverToolRequirementsFinalized = false;
+	private serverToolRequirements: ServerToolRequirements | undefined;
+
+	private assertServerToolRequirementsMutable(): void {
+		if (this.serverToolRequirementsFinalized) {
+			throw new Error(
+				"RequestBodyContext server-tool requirements are finalized",
+			);
+		}
+	}
 
 	constructor(buffer: ArrayBuffer | null) {
 		this.originalBuffer = buffer;
@@ -88,7 +149,25 @@ export class RequestBodyContext {
 		return typeof model === "string" ? model : null;
 	}
 
+	/**
+	 * Derive capability metadata once from this context's already-cached final
+	 * parsed body. Callers must invoke this only after all interception is done.
+	 */
+	finalizeServerToolRequirements(): ServerToolRequirements | undefined {
+		if (this.serverToolRequirementsFinalized) {
+			return this.serverToolRequirements;
+		}
+		const parsedBody = this.getParsedJson();
+		if (parsedBody) {
+			freezeServerToolSemanticLayers(parsedBody as RequestJsonBody);
+		}
+		this.serverToolRequirements = deriveServerToolRequirement(parsedBody);
+		this.serverToolRequirementsFinalized = true;
+		return this.serverToolRequirements;
+	}
+
 	setModel(model: string): boolean {
+		this.assertServerToolRequirementsMutable();
 		if (!this.parsedBody) {
 			this.getParsedJson();
 		}
@@ -101,6 +180,7 @@ export class RequestBodyContext {
 
 	/** Mutate the parsed body in-place via callback and mark dirty. */
 	mutateParsedJson(fn: (body: RequestJsonBody) => void): boolean {
+		this.assertServerToolRequirementsMutable();
 		const body =
 			this.parsedBody ?? (this.getParsedJson() as RequestJsonBody | null);
 		if (!body) return false;
@@ -110,6 +190,7 @@ export class RequestBodyContext {
 	}
 
 	markDirty(): void {
+		this.assertServerToolRequirementsMutable();
 		this.dirty = true;
 	}
 

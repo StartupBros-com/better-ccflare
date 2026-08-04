@@ -2,6 +2,9 @@ import type {
 	Account,
 	LogicalModelCapability,
 	RateLimitReason,
+	ServerToolCapabilityDecision,
+	ServerToolCapabilityTuple,
+	ServerToolRequirements,
 } from "@better-ccflare/types";
 
 export interface TokenRefreshResult {
@@ -51,6 +54,15 @@ export interface Provider {
 		logicalModel: string,
 		account: Account,
 	): LogicalModelCapability;
+
+	/**
+	 * Pure, network-free support decision for one exact candidate, endpoint,
+	 * model, tool profile, replay shape, and transport contract.
+	 */
+	resolveServerToolCapability?(
+		requirement: ServerToolRequirements,
+		tuple: ServerToolCapabilityTuple,
+	): ServerToolCapabilityDecision;
 
 	/**
 	 * Check if this provider can handle the given request path

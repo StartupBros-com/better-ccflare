@@ -686,6 +686,11 @@ async function handleProxyCore(
 		if (!finalBodyBuffer) return undefined;
 		return new Response(finalBodyBuffer).body ?? undefined;
 	};
+	const serverToolRequirements =
+		finalRequestBodyContext.finalizeServerToolRequirements();
+	if (serverToolRequirements) {
+		requestMeta.serverToolRequirements = serverToolRequirements;
+	}
 	const finalParsedBody = finalRequestBodyContext.getParsedJson();
 	const potentialAnthropicCohortFacts =
 		derivePotentialAnthropicOAuthCohortFacts({

@@ -110,7 +110,11 @@ function makeContext(accounts: Account[]) {
 }
 
 function makeRequest(
-	options: { signal?: AbortSignal; agentId?: string } = {},
+	options: {
+		signal?: AbortSignal;
+		agentId?: string;
+		body?: Record<string, unknown>;
+	} = {},
 ): Request {
 	const headers = new Headers({
 		"content-type": "application/json",
@@ -122,12 +126,14 @@ function makeRequest(
 	return new Request("https://proxy.local/v1/messages", {
 		method: "POST",
 		headers,
-		body: JSON.stringify({
-			model: MODEL,
-			messages: [{ role: "user", content: "hello" }],
-			max_tokens: 16,
-			stream: false,
-		}),
+		body: JSON.stringify(
+			options.body ?? {
+				model: MODEL,
+				messages: [{ role: "user", content: "hello" }],
+				max_tokens: 16,
+				stream: false,
+			},
+		),
 		signal: options.signal,
 	});
 }
@@ -219,6 +225,151 @@ describe("pre-transport deadline primitive", () => {
 });
 
 describe("proxy pre-transport recovery", () => {
+	it("derives one frozen minimal server-tool requirement from the final intercepted body", async () => {
+		const account = makeAccount("server-tool-requirement");
+		const { ctx } = makeContext([account]);
+		const catalog = await modelCatalogModule.getModelCatalog();
+		const preferredModel = catalog.models.find(
+			(entry) => entry.id !== MODEL,
+		)?.id;
+		expect(preferredModel).toBeDefined();
+		ctx.dbOps.getAgentPreference = mock(async () => ({
+			model: preferredModel ?? MODEL,
+		}));
+
+		const selectedMetas: RequestMeta[] = [];
+		ctx.strategy.select = mock(
+			async (accounts: Account[], meta: RequestMeta) => {
+				selectedMetas.push(meta);
+				return accounts;
+			},
+		);
+		globalThis.fetch = mock(
+			async () =>
+				new Response(JSON.stringify({ ok: true }), {
+					headers: { "content-type": "application/json" },
+				}),
+		) as unknown as typeof fetch;
+
+		const request = makeRequest({
+			agentId: "server-tool-agent",
+			body: {
+				model: MODEL,
+				messages: [{ role: "user", content: "private conversation content" }],
+				max_tokens: 16,
+				stream: false,
+				tools: [
+					{
+						name: "WebSearch",
+						description: "ordinary client function sentinel",
+						input_schema: { type: "object" },
+					},
+					{
+						type: "web_search_20250305",
+						name: "web_search",
+						max_uses: 2,
+						allowed_domains: ["example.com"],
+					},
+				],
+			},
+		});
+		const sourceBodyRead = spyOn(request, "arrayBuffer");
+		const response = await handleProxy(request, new URL(request.url), ctx);
+
+		expect(response.status).toBe(200);
+		expect(sourceBodyRead).toHaveBeenCalledTimes(1);
+		expect(selectedMetas).toHaveLength(1);
+		expect(selectedMetas[0]?.appliedModel).toBe(preferredModel);
+		const requirement = (
+			selectedMetas[0] as RequestMeta & {
+				serverToolRequirements?: unknown;
+			}
+		).serverToolRequirements;
+		expect(requirement).toMatchObject({
+			revision: 1,
+			declarations: [
+				{
+					type: "web_search_20250305",
+					maxUses: 2,
+					allowedDomains: ["example.com"],
+				},
+			],
+			hasClientFunctions: true,
+			replay: {
+				input: [],
+				output: [],
+				requiresOutputReplay: true,
+			},
+		});
+		const profileId = (requirement as { profileId?: unknown }).profileId;
+		expect(typeof profileId).toBe("string");
+		expect((profileId as string).length).toBeGreaterThan(0);
+		expect((profileId as string).length).toBeLessThanOrEqual(128);
+		expect(profileId).not.toContain("example.com");
+		expect(profileId).not.toContain("private conversation content");
+		expect(Object.isFrozen(requirement)).toBe(true);
+		expect(
+			Object.isFrozen(
+				(requirement as { declarations?: readonly unknown[] }).declarations,
+			),
+		).toBe(true);
+		const serializedRequirement = JSON.stringify(requirement);
+		expect(serializedRequirement).not.toContain("private conversation content");
+		expect(serializedRequirement).not.toContain(
+			"ordinary client function sentinel",
+		);
+		expect(serializedRequirement).not.toContain(MODEL);
+		sourceBodyRead.mockRestore();
+	});
+
+	it("leaves ordinary requests without server-tool routing metadata", async () => {
+		const account = makeAccount("ordinary-request");
+		const { ctx } = makeContext([account]);
+		const selectedMetas: RequestMeta[] = [];
+		ctx.strategy.select = mock(
+			async (accounts: Account[], meta: RequestMeta) => {
+				selectedMetas.push(meta);
+				return accounts;
+			},
+		);
+		globalThis.fetch = mock(
+			async () =>
+				new Response(JSON.stringify({ ok: true }), {
+					headers: { "content-type": "application/json" },
+				}),
+		) as unknown as typeof fetch;
+
+		const request = makeRequest({
+			body: {
+				model: MODEL,
+				messages: [{ role: "user", content: "hello" }],
+				max_tokens: 16,
+				stream: false,
+				tools: [
+					{
+						name: "WebSearch",
+						description: "ordinary client function",
+						input_schema: { type: "object" },
+					},
+				],
+			},
+		});
+		const sourceBodyRead = spyOn(request, "arrayBuffer");
+		const response = await handleProxy(request, new URL(request.url), ctx);
+
+		expect(response.status).toBe(200);
+		expect(sourceBodyRead).toHaveBeenCalledTimes(1);
+		expect(selectedMetas).toHaveLength(1);
+		expect(
+			(
+				selectedMetas[0] as RequestMeta & {
+					serverToolRequirements?: unknown;
+				}
+			).serverToolRequirements,
+		).toBeUndefined();
+		sourceBodyRead.mockRestore();
+	});
+
 	it("preserves a fast successful agent rewrite in the transported body", async () => {
 		const account = makeAccount("agent-rewrite");
 		const { ctx } = makeContext([account]);

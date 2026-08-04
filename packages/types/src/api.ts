@@ -1,4 +1,5 @@
 import type { AllowedModel } from "./agent";
+import type { ServerToolRequirements } from "./provider-capabilities";
 import type {
 	AgentAttributionSource,
 	ProjectAttributionSource,
@@ -91,6 +92,8 @@ export interface RequestMeta {
 	headers?: Headers;
 	/** Authenticated in-process auto-refresh probe; never derived from public hint headers. */
 	trustedInternalAutoRefresh?: boolean;
+	/** Frozen content-minimal server-tool constraints derived from the final request body. */
+	serverToolRequirements?: ServerToolRequirements;
 	/** Active combo name (set when combo routing is used) */
 	comboName?: string | null;
 	/** Combo slot index being attempted (set per-iteration in proxy loop) */

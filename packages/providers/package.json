@@ -6,6 +6,7 @@
 	"exports": {
 		".": "./src/index.ts",
 		"./request-capabilities": "./src/request-capabilities.ts",
+		"./server-tool-capabilities": "./src/server-tool-capabilities.ts",
 		"./usage-cache": "./src/usage-fetcher.ts",
 		"./bedrock": "./src/providers/bedrock/index.ts",
 		"./codex": "./src/providers/codex/index.ts",

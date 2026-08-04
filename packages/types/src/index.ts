@@ -12,6 +12,7 @@ export * from "./context";
 export * from "./conversation";
 export * from "./insights";
 export * from "./logging";
+export * from "./provider-capabilities";
 export * from "./request";
 export * from "./routing-recovery";
 export * from "./stats";
