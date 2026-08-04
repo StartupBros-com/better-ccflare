@@ -33,6 +33,7 @@ const { getProvider, registerProvider, usageCache } = await import(
 );
 const {
 	ForceRouteUnavailableError,
+	getCapacityDeferredModelRoutes,
 	getComboSlotInfo,
 	getReactiveModelCapacityBlocker,
 	getRoutingCapacityContext,
@@ -2204,7 +2205,13 @@ describe("selectAccountsForRequest — model-lane hard capacity", () => {
 	}
 
 	it("excludes a Fable-full account before strategy selection but keeps it eligible for Opus", async () => {
-		const preferred = makeAccount({ id: "capacity-preferred", priority: 0 });
+		const preferred = makeAccount({
+			id: "capacity-preferred",
+			priority: 0,
+			model_mappings: JSON.stringify({
+				fable: ["claude-fable-5", "claude-opus-4-8"],
+			}),
+		});
 		const fallback = makeAccount({ id: "capacity-fallback", priority: 1 });
 		cacheUsage(preferred.id, weeklyScoped("Fable"));
 
@@ -2260,6 +2267,323 @@ describe("selectAccountsForRequest — model-lane hard capacity", () => {
 		).toEqual([preferred.id, fallback.id]);
 	});
 
+	it("queues a configured native Opus fallback after excluding its capacity-blocked Fable lane", async () => {
+		const account = makeAccount({
+			id: "capacity-native-fallback",
+			model_mappings: JSON.stringify({
+				fable: ["claude-fable-5", "claude-opus-4-8"],
+			}),
+		});
+		cacheUsage(account.id, weeklyScoped("Fable"));
+		const ctx = makeCtx({ accounts: [account] });
+		const meta = makeRequestMeta();
+
+		const result = await selectAccountsForRequest(meta, ctx, "claude-fable-5");
+
+		expect(result).toEqual([]);
+		expect(meta.routingCandidates).toEqual([]);
+		expect(getCapacityDeferredModelRoutes(meta)).toMatchObject([
+			{
+				account,
+				candidateId: `capacity-deferred:${account.id}:claude-opus-4-8`,
+				model: "claude-opus-4-8",
+				fallbackRank: 0,
+			},
+		]);
+		expect(meta.hardExcludedAccountIds).toEqual(new Set([account.id]));
+		expect(getRoutingCapacityContext(meta)?.exclusions).toMatchObject([
+			{
+				accountId: account.id,
+				model: "claude-fable-5",
+				modelFamily: "fable",
+			},
+		]);
+	});
+
+	it("queues fallbacks only for available capacity-blocked accounts", async () => {
+		const exhausted = makeAccount({
+			id: "capacity-active-exhausted",
+			model_mappings: JSON.stringify({
+				fable: ["claude-fable-5", "claude-opus-4-8"],
+			}),
+		});
+		const paused = makeAccount({
+			id: "capacity-paused",
+			paused: true,
+			model_mappings: JSON.stringify({
+				fable: ["claude-fable-5", "claude-opus-4-8"],
+			}),
+		});
+		cacheUsage(exhausted.id, weeklyScoped("Fable"));
+		cacheUsage(paused.id, weeklyScoped("Fable"));
+		const meta = makeRequestMeta();
+		const ctx = makeCtx({ accounts: [exhausted, paused] });
+		ctx.strategy.select = mock((accounts: Account[]) =>
+			accounts.filter((account) => !account.paused),
+		);
+
+		const result = await selectAccountsForRequest(meta, ctx, "claude-fable-5");
+
+		expect(result).toEqual([]);
+		expect(meta.routingCandidates).toEqual([]);
+		expect(
+			getCapacityDeferredModelRoutes(meta).map(({ account, model }) => ({
+				accountId: account.id,
+				model,
+			})),
+		).toEqual([
+			{
+				accountId: exhausted.id,
+				model: "claude-opus-4-8",
+			},
+		]);
+	});
+
+	it("preserves every capacity-clear model in the original mapping tail", async () => {
+		const account = makeAccount({
+			id: "capacity-full-tail",
+			model_mappings: JSON.stringify({
+				fable: ["claude-fable-5", "claude-opus-4-8", "claude-sonnet-4-5"],
+			}),
+		});
+		cacheUsage(account.id, weeklyScoped("Fable"));
+		const meta = makeRequestMeta();
+
+		const result = await selectAccountsForRequest(
+			meta,
+			makeCtx({ accounts: [account] }),
+			"claude-fable-5",
+		);
+
+		expect(result).toEqual([]);
+		expect(
+			getCapacityDeferredModelRoutes(meta).map(({ model, fallbackRank }) => ({
+				model,
+				fallbackRank,
+			})),
+		).toEqual([
+			{ model: "claude-opus-4-8", fallbackRank: 0 },
+			{ model: "claude-sonnet-4-5", fallbackRank: 1 },
+		]);
+	});
+
+	it("records a blocked fallback model while preserving a later clear route", async () => {
+		const account = makeAccount({
+			id: "capacity-partial-tail",
+			model_mappings: JSON.stringify({
+				fable: ["claude-fable-5", "claude-opus-4-8", "claude-sonnet-4-5"],
+			}),
+		});
+		cacheUsage(account.id, {
+			spend: { enabled: false },
+			limits: [...weeklyScoped("Fable").limits, ...weeklyScoped("Opus").limits],
+		});
+		const meta = makeRequestMeta();
+
+		const result = await selectAccountsForRequest(
+			meta,
+			makeCtx({ accounts: [account] }),
+			"claude-fable-5",
+		);
+
+		expect(result).toEqual([]);
+		expect(getCapacityDeferredModelRoutes(meta)).toMatchObject([
+			{ account, model: "claude-sonnet-4-5", fallbackRank: 1 },
+		]);
+		expect(
+			getRoutingCapacityContext(meta)?.exclusions.map(
+				(exclusion) => exclusion.model,
+			),
+		).toEqual(["claude-fable-5", "claude-opus-4-8"]);
+	});
+
+	it("counts blocked mapped models when assigning family occurrences", async () => {
+		const account = makeAccount({
+			id: "capacity-blocked-family-occurrence",
+			model_mappings: JSON.stringify({
+				fable: [
+					"claude-fable-5",
+					"claude-opus-4-8",
+					"claude-sonnet-4-5",
+					"claude-opus-5",
+				],
+			}),
+		});
+		cacheUsage(account.id, weeklyScoped("Fable"));
+		usageCache.markModelScopedExhausted(
+			account.id,
+			"claude-opus-4-8",
+			"",
+			Date.now() + 60_000,
+		);
+		const meta = makeRequestMeta();
+
+		const result = await selectAccountsForRequest(
+			meta,
+			makeCtx({ accounts: [account] }),
+			"claude-fable-5",
+		);
+
+		expect(result).toEqual([]);
+		expect(
+			getCapacityDeferredModelRoutes(meta).map(
+				({ model, fallbackRank, familyOccurrence }) => ({
+					model,
+					fallbackRank,
+					familyOccurrence,
+				}),
+			),
+		).toEqual([
+			{
+				model: "claude-sonnet-4-5",
+				fallbackRank: 1,
+				familyOccurrence: 0,
+			},
+			{
+				model: "claude-opus-5",
+				fallbackRank: 2,
+				familyOccurrence: 1,
+			},
+		]);
+	});
+
+	it("resets a deferred plan when the same RequestMeta is selected again", async () => {
+		const account = makeAccount({
+			id: "capacity-plan-reuse",
+			model_mappings: JSON.stringify({
+				fable: ["claude-fable-5", "claude-opus-4-8"],
+			}),
+		});
+		cacheUsage(account.id, weeklyScoped("Fable"));
+		const meta = makeRequestMeta();
+		const ctx = makeCtx({ accounts: [account] });
+
+		expect(await selectAccountsForRequest(meta, ctx, "claude-fable-5")).toEqual(
+			[],
+		);
+		expect(getCapacityDeferredModelRoutes(meta)).toHaveLength(1);
+
+		usageCache.delete(account.id);
+		expect(await selectAccountsForRequest(meta, ctx, "claude-fable-5")).toEqual(
+			[account],
+		);
+		expect(getCapacityDeferredModelRoutes(meta)).toEqual([]);
+	});
+
+	it("clears a prepared deferred plan when strategy selection throws", async () => {
+		const account = makeAccount({
+			id: "capacity-plan-error",
+			model_mappings: JSON.stringify({
+				fable: ["claude-fable-5", "claude-opus-4-8"],
+			}),
+		});
+		cacheUsage(account.id, weeklyScoped("Fable"));
+		const meta = makeRequestMeta();
+		const ctx = makeCtx({ accounts: [account] });
+		ctx.strategy.select = mock(() => {
+			throw new Error("selection failed");
+		});
+
+		expect(await selectAccountsForRequest(meta, ctx, "claude-fable-5")).toEqual(
+			[],
+		);
+		expect(getCapacityDeferredModelRoutes(meta)).toEqual([]);
+	});
+
+	it("applies provider exclusions before a healthy account can suppress an allowed fallback", async () => {
+		const excludedHealthy = makeAccount({
+			id: "excluded-healthy",
+			provider: "anthropic",
+			refresh_token: "oauth-refresh",
+		});
+		const allowedBlocked = makeAccount({
+			id: "allowed-blocked",
+			provider: "test-provider" as Account["provider"],
+			refresh_token: null,
+			model_mappings: JSON.stringify({
+				fable: ["claude-fable-5", "claude-opus-4-8"],
+			}),
+		});
+		cacheUsage(allowedBlocked.id, weeklyScoped("Fable"));
+		const ctx = makeCtx({ accounts: [excludedHealthy, allowedBlocked] });
+		const meta = makeRequestMeta({
+			headers: new Headers({
+				"x-better-ccflare-exclude-providers": "anthropic-oauth",
+			}),
+		});
+
+		const result = await selectAccountsForRequest(meta, ctx, "claude-fable-5");
+
+		expect(result).toEqual([]);
+		expect(ctx.strategy.select).toHaveBeenCalledWith([], meta);
+		expect(meta.routingCandidateCatalog).toMatchObject([
+			{ accountId: allowedBlocked.id },
+		]);
+		expect(getCapacityDeferredModelRoutes(meta)).toMatchObject([
+			{ account: allowedBlocked, model: "claude-opus-4-8" },
+		]);
+	});
+
+	it("keeps the account excluded when its configured Opus fallback is also capacity-blocked", async () => {
+		const account = makeAccount({
+			id: "capacity-fallback-blocked",
+			model_mappings: JSON.stringify({
+				fable: ["claude-fable-5", "claude-opus-4-8"],
+			}),
+		});
+		cacheUsage(account.id, {
+			spend: { enabled: false },
+			limits: [...weeklyScoped("Fable").limits, ...weeklyScoped("Opus").limits],
+		});
+		const meta = makeRequestMeta();
+
+		const result = await selectAccountsForRequest(
+			meta,
+			makeCtx({ accounts: [account] }),
+			"claude-fable-5",
+		);
+
+		expect(result).toEqual([]);
+		expect(meta.hardExcludedAccountIds).toEqual(new Set([account.id]));
+		expect(getCapacityDeferredModelRoutes(meta)).toEqual([]);
+		expect(
+			getRoutingCapacityContext(meta)?.exclusions.map(
+				(exclusion) => exclusion.model,
+			),
+		).toEqual(["claude-fable-5", "claude-opus-4-8"]);
+	});
+
+	it("does not promote a model fallback through an account-wide capacity blocker", async () => {
+		const account = makeAccount({
+			id: "capacity-account-wide",
+			model_mappings: JSON.stringify({
+				fable: ["claude-fable-5", "claude-opus-4-8"],
+			}),
+		});
+		cacheUsage(account.id, {
+			spend: { enabled: false },
+			limits: [
+				{
+					kind: "session",
+					percent: 100,
+					resets_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+					is_active: true,
+				},
+			],
+		});
+		const meta = makeRequestMeta();
+
+		const result = await selectAccountsForRequest(
+			meta,
+			makeCtx({ accounts: [account] }),
+			"claude-fable-5",
+		);
+
+		expect(result).toEqual([]);
+		expect(meta.hardExcludedAccountIds).toEqual(new Set([account.id]));
+		expect(getCapacityDeferredModelRoutes(meta)).toEqual([]);
+	});
+
 	it("fails open for a 100% weekly-scoped cap whose family is unknown", async () => {
 		const account = makeAccount({ id: "capacity-unknown-scope" });
 		cacheUsage(account.id, weeklyScoped(null));
@@ -2275,7 +2599,12 @@ describe("selectAccountsForRequest — model-lane hard capacity", () => {
 	});
 
 	it("fails a forced exhausted model lane closed without substituting another account", async () => {
-		const forced = makeAccount({ id: "forced-capacity" });
+		const forced = makeAccount({
+			id: "forced-capacity",
+			model_mappings: JSON.stringify({
+				fable: ["claude-fable-5", "claude-opus-4-8"],
+			}),
+		});
 		const substitute = makeAccount({ id: "forced-substitute" });
 		cacheUsage(forced.id, weeklyScoped("Fable"));
 		const ctx = makeCtx({ accounts: [forced, substitute] });
@@ -3048,6 +3377,109 @@ describe("selectAccountsForRequest — server-tool capability-first routing", ()
 			eligibleCandidateCount: 0,
 		});
 	});
+
+	for (const firstTailDecision of ["unsupported", "unknown"] as const) {
+		it(`queues only the proven exact fallback after an ${firstTailDecision} capacity tail`, async () => {
+			const providerName = `u4-capacity-tail-${firstTailDecision}`;
+			const tupleContexts: CapabilityProviderContext[] = [];
+			installCapabilityProvider({
+				name: providerName,
+				onTuple: (context) => tupleContexts.push(context),
+				decision: (_context, tuple) => {
+					if (tuple.model !== "claude-opus-4-8") {
+						return provenDecision(_context, tuple);
+					}
+					return firstTailDecision === "unsupported"
+						? {
+								decision: "unsupported",
+								proof: proofFor(tuple, "unsupported"),
+							}
+						: { decision: "unknown", reason: "no_exact_proof" };
+				},
+			});
+			const account = makeAccount({
+				id: `capacity-tail-${firstTailDecision}`,
+				provider: providerName,
+				model_mappings: JSON.stringify({
+					fable: ["claude-fable-5", "claude-opus-4-8", "claude-sonnet-4-5"],
+					opus: "must-not-remap-opus",
+					sonnet: "must-not-remap-sonnet",
+				}),
+			});
+			cacheUsage(account.id, {
+				spend: { enabled: false },
+				limits: [
+					{
+						kind: "weekly_scoped",
+						percent: 100,
+						resets_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+						scope: {
+							model: { id: null, display_name: "Fable" },
+							surface: null,
+						},
+					},
+				],
+			});
+			const ctx = makeCtx({ accounts: [account] });
+			const meta = serverToolMeta();
+
+			const result = await selectAccountsForRequest(
+				meta,
+				ctx,
+				"claude-fable-5",
+			);
+
+			const firstTailId = `capacity-deferred:${account.id}:claude-opus-4-8`;
+			const provenTailId = `capacity-deferred:${account.id}:claude-sonnet-4-5`;
+			expect(result).toEqual([]);
+			expect(ctx.strategy.select).toHaveBeenCalledWith([], meta);
+			expect(getCapacityDeferredModelRoutes(meta)).toMatchObject([
+				{
+					account,
+					candidateId: provenTailId,
+					model: "claude-sonnet-4-5",
+					fallbackRank: 1,
+				},
+			]);
+			expect(
+				meta.routingCandidateCatalog?.map((candidate) => ({
+					candidateId: candidate.candidateId,
+					decision: candidate.serverToolCapability?.decision,
+					physicalModel: candidate.serverToolCapability?.physicalModel,
+				})),
+			).toEqual([
+				{
+					candidateId: `account:${account.id}`,
+					decision: "proven",
+					physicalModel: "claude-fable-5",
+				},
+				{
+					candidateId: firstTailId,
+					decision: firstTailDecision,
+					physicalModel: "claude-opus-4-8",
+				},
+				{
+					candidateId: provenTailId,
+					decision: "proven",
+					physicalModel: "claude-sonnet-4-5",
+				},
+			]);
+			expect(meta.serverToolCapabilitySummary).toEqual({
+				structuralCandidateCount: 3,
+				provenCandidateCount: 2,
+				unsupportedCandidateCount: firstTailDecision === "unsupported" ? 1 : 0,
+				unknownCandidateCount: firstTailDecision === "unknown" ? 1 : 0,
+				replayIneligibleCandidateCount: 0,
+				temporarilyUnavailableProvenCandidateCount: 1,
+				eligibleCandidateCount: 1,
+			});
+			expect(tupleContexts.map(({ physicalModel }) => physicalModel)).toEqual([
+				"claude-fable-5",
+				"claude-opus-4-8",
+				"claude-sonnet-4-5",
+			]);
+		});
+	}
 
 	it("filters higher-priority and sticky incapable candidates before strategy ordering", async () => {
 		const providerName = "u4-normal-provider";

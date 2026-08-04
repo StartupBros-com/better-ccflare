@@ -1,6 +1,7 @@
 import {
 	getConfiguredModelMapping,
 	getModelFamily,
+	getModelList,
 	isAccountAvailable,
 	isOfficialXaiEndpoint,
 	resolveEffectiveComboMembership,
@@ -98,6 +99,23 @@ function normalCandidateMetadata(
 		comboSlotId: null,
 		modelOverride: model,
 		quotaPressure,
+	};
+}
+
+function capacityDeferredCandidateId(accountId: string, model: string): string {
+	return `capacity-deferred:${encodeURIComponent(accountId)}:${encodeURIComponent(
+		model.trim().toLowerCase(),
+	)}`;
+}
+
+function capacityDeferredCandidateMetadata(
+	account: Account,
+	ordinal: number,
+	model: string,
+): RoutingCandidateMetadata {
+	return {
+		...normalCandidateMetadata(account, ordinal, model),
+		candidateId: capacityDeferredCandidateId(account.id, model),
 	};
 }
 
@@ -225,6 +243,7 @@ function evaluateCandidateServerToolCapability(input: {
 	account: Account;
 	routing: RoutingCandidateMetadata;
 	logicalModel: string | null;
+	physicalModel?: string;
 	meta: RequestMeta;
 	ctx: ProxyContext;
 }): RoutingCandidateServerToolCapability | undefined {
@@ -248,11 +267,9 @@ function evaluateCandidateServerToolCapability(input: {
 			reason: "physical_model_unavailable",
 		});
 	}
-	const physicalModel = previewCandidatePhysicalModel(
-		input.account,
-		input.logicalModel,
-		provider,
-	);
+	const physicalModel =
+		input.physicalModel ??
+		previewCandidatePhysicalModel(input.account, input.logicalModel, provider);
 	if (!physicalModel) {
 		return unknownCandidateCapability({
 			resolvedProvider: input.account.provider,
@@ -461,6 +478,15 @@ export interface RoutingCapacityContext {
 	readonly blockedUntil: number | null;
 }
 
+/** Exact account/model routes deferred when the requested lane is capacity-blocked. */
+export interface CapacityDeferredModelRoute {
+	readonly account: Account;
+	readonly model: string;
+	readonly candidateId: string;
+	readonly fallbackRank: number;
+	readonly familyOccurrence: number | null;
+}
+
 export interface AccountSelectionOptions {
 	/** Bypass active combo lookup for the explicit post-combo normal fallback. */
 	readonly skipCombo?: boolean;
@@ -487,11 +513,23 @@ const routingCapacityContextMap = new WeakMap<
 	RoutingCapacityContext
 >();
 
+/** Request-local capacity fallback plan consumed by the proxy route executor. */
+const capacityDeferredModelRoutesMap = new WeakMap<
+	RequestMeta,
+	readonly CapacityDeferredModelRoute[]
+>();
+
 /** Retrieve request-local hard-capacity evidence (null before selection). */
 export function getRoutingCapacityContext(
 	meta: RequestMeta,
 ): RoutingCapacityContext | null {
 	return routingCapacityContextMap.get(meta) ?? null;
+}
+
+export function getCapacityDeferredModelRoutes(
+	meta: RequestMeta,
+): readonly CapacityDeferredModelRoute[] {
+	return capacityDeferredModelRoutesMap.get(meta) ?? [];
 }
 
 /** Store combo slot info on a RequestMeta for downstream consumption */
@@ -712,6 +750,77 @@ function evaluateCandidateCapacity(
 	};
 }
 
+function resolveCapacityDeferredRoutes(
+	account: Account,
+	requestedModel: string,
+	betaSignature: string,
+	now: number,
+	syntheticProbe: boolean,
+): {
+	readonly routes: readonly {
+		readonly model: string;
+		readonly fallbackRank: number;
+		readonly familyOccurrence: number | null;
+	}[];
+	readonly blocked: readonly {
+		readonly model: string;
+		readonly evaluation: CandidateCapacityEvaluation;
+	}[];
+} {
+	const requestedFamily = getModelFamily(requestedModel);
+	const configuredModels = getModelList(requestedModel, account);
+	if (!configuredModels || configuredModels.length < 2) {
+		return { routes: [], blocked: [] };
+	}
+
+	const requestedFamilyRoutes: Array<{
+		model: string;
+		fallbackRank: number;
+		familyOccurrence: number | null;
+	}> = [];
+	const fallbackRoutes: Array<{
+		model: string;
+		fallbackRank: number;
+		familyOccurrence: number | null;
+	}> = [];
+	const blocked: Array<{
+		model: string;
+		evaluation: CandidateCapacityEvaluation;
+	}> = [];
+	let deferredFallbackRank = 0;
+	const familyOccurrences = new Map<string, number>();
+	for (const candidateModel of configuredModels.slice(1)) {
+		const candidateFamily = getModelFamily(candidateModel);
+		const familyOccurrence = candidateFamily
+			? (familyOccurrences.get(candidateFamily) ?? 0)
+			: null;
+		if (candidateFamily) {
+			familyOccurrences.set(candidateFamily, (familyOccurrence ?? 0) + 1);
+		}
+		const isRequestedFamilySibling =
+			requestedFamily !== null && candidateFamily === requestedFamily;
+		const fallbackRank = isRequestedFamilySibling ? 0 : deferredFallbackRank++;
+		const evaluation = evaluateCandidateCapacity(
+			account,
+			candidateModel,
+			betaSignature,
+			now,
+			syntheticProbe,
+		);
+		if (evaluation.blockers.length === 0) {
+			const route = { model: candidateModel, fallbackRank, familyOccurrence };
+			if (isRequestedFamilySibling) {
+				requestedFamilyRoutes.push(route);
+			} else {
+				fallbackRoutes.push(route);
+			}
+			continue;
+		}
+		blocked.push({ model: candidateModel, evaluation });
+	}
+	return { routes: [...requestedFamilyRoutes, ...fallbackRoutes], blocked };
+}
+
 function candidateExclusion(
 	account: Account,
 	model: string,
@@ -778,26 +887,18 @@ function prepareNormalRoutingMetadata(
 			});
 			return routing;
 		});
-		const catalog = [...priorServerToolCatalog, ...normalCatalog];
-		const semanticallyEligibleIds = new Set(
-			normalCatalog
-				.filter(isServerToolCandidateSemanticallyEligible)
-				.map((candidate) => candidate.candidateId),
-		);
 		const now = Date.now();
 		const beta = canonicalizeBetaSignature(meta.headers?.get("anthropic-beta"));
 		const excludedIds = new Set<string>();
 		const quotaPressure = new Map<string, AccountQuotaPressure>();
 		const exclusions: RoutingCapacityCandidateExclusion[] = [];
+		const deferredCatalog: RoutingCandidateMetadata[] = [];
+		const deferredRoutes: CapacityDeferredModelRoute[] = [];
 		const eligibleAccounts: Account[] = [];
 		const eligibleCandidateIds = new Set<string>();
 		for (const [ordinal, account] of accounts.entries()) {
 			const candidate = normalCatalog[ordinal];
-			if (
-				!candidate ||
-				!semanticallyEligibleIds.has(candidate.candidateId) ||
-				!isAccountAvailable(account)
-			) {
+			if (!candidate || !isAccountAvailable(account)) {
 				continue;
 			}
 			if (effectiveModel) {
@@ -817,25 +918,87 @@ function prepareNormalRoutingMetadata(
 					exclusions.push(
 						candidateExclusion(account, effectiveModel, evaluation, "normal"),
 					);
+					const accountWide = evaluation.blockers.some(
+						(blocker) => blocker.scope === "account",
+					);
+					const fallback = accountWide
+						? { routes: [], blocked: [] }
+						: resolveCapacityDeferredRoutes(
+								account,
+								effectiveModel,
+								beta,
+								now,
+								syntheticProbe,
+							);
+					for (const blocked of fallback.blocked) {
+						exclusions.push(
+							candidateExclusion(
+								account,
+								blocked.model,
+								blocked.evaluation,
+								"normal",
+							),
+						);
+					}
+					for (const route of [...fallback.routes, ...fallback.blocked]) {
+						const routing = capacityDeferredCandidateMetadata(
+							account,
+							normalCatalog.length + deferredCatalog.length,
+							route.model,
+						);
+						routing.serverToolCapability =
+							evaluateCandidateServerToolCapability({
+								account,
+								routing,
+								logicalModel: route.model,
+								physicalModel: route.model,
+								meta,
+								ctx,
+							});
+						deferredCatalog.push(routing);
+						if (
+							"fallbackRank" in route &&
+							isServerToolCandidateSemanticallyEligible(routing)
+						) {
+							deferredRoutes.push({
+								account,
+								model: route.model,
+								candidateId: routing.candidateId,
+								fallbackRank: route.fallbackRank,
+								familyOccurrence: route.familyOccurrence,
+							});
+							eligibleCandidateIds.add(routing.candidateId);
+						}
+					}
 					continue;
 				}
 			}
+			if (!isServerToolCandidateSemanticallyEligible(candidate)) continue;
 			eligibleAccounts.push(account);
 			eligibleCandidateIds.add(candidate.candidateId);
 		}
+		const catalog = [
+			...priorServerToolCatalog,
+			...normalCatalog,
+			...deferredCatalog,
+		];
 		meta.hardExcludedAccountIds = excludedIds.size > 0 ? excludedIds : null;
 		meta.quotaPressureByAccountId =
 			quotaPressure.size > 0 ? quotaPressure : null;
+		capacityDeferredModelRoutesMap.set(meta, deferredRoutes);
 		meta.routingCandidateCatalog = catalog;
 		meta.routingCandidates = normalCatalog.filter((candidate) =>
 			eligibleCandidateIds.has(candidate.candidateId),
 		);
 		saveCapacityContext(meta, effectiveModel, exclusions);
 		publishServerToolCapabilitySummary(meta, catalog, eligibleCandidateIds);
-		if (eligibleAccounts.length === 0) throwServerToolCapabilityPoolError(meta);
+		if (eligibleAccounts.length === 0 && deferredRoutes.length === 0) {
+			throwServerToolCapabilityPoolError(meta);
+		}
 		return eligibleAccounts;
 	}
 	if (!effectiveModel) {
+		capacityDeferredModelRoutesMap.set(meta, []);
 		meta.hardExcludedAccountIds = null;
 		meta.quotaPressureByAccountId = null;
 		meta.routingCandidateCatalog = accounts.map((account, ordinal) =>
@@ -851,6 +1014,7 @@ function prepareNormalRoutingMetadata(
 	const excludedIds = new Set<string>();
 	const quotaPressure = new Map<string, AccountQuotaPressure>();
 	const exclusions: RoutingCapacityCandidateExclusion[] = [];
+	const deferredRoutes: CapacityDeferredModelRoute[] = [];
 	for (const account of accounts) {
 		const evaluation = evaluateCandidateCapacity(
 			account,
@@ -859,18 +1023,52 @@ function prepareNormalRoutingMetadata(
 			now,
 			syntheticProbe,
 		);
-		if (evaluation.quotaPressure) {
-			quotaPressure.set(account.id, evaluation.quotaPressure);
-		}
 		if (evaluation.blockers.length > 0) {
 			excludedIds.add(account.id);
 			exclusions.push(
 				candidateExclusion(account, effectiveModel, evaluation, "normal"),
 			);
+			const accountWide = evaluation.blockers.some(
+				(blocker) => blocker.scope === "account",
+			);
+			const fallback =
+				accountWide || !isAccountAvailable(account)
+					? { routes: [], blocked: [] }
+					: resolveCapacityDeferredRoutes(
+							account,
+							effectiveModel,
+							beta,
+							now,
+							syntheticProbe,
+						);
+			for (const blocked of fallback.blocked) {
+				exclusions.push(
+					candidateExclusion(
+						account,
+						blocked.model,
+						blocked.evaluation,
+						"normal",
+					),
+				);
+			}
+			for (const route of fallback.routes) {
+				deferredRoutes.push({
+					account,
+					model: route.model,
+					candidateId: capacityDeferredCandidateId(account.id, route.model),
+					fallbackRank: route.fallbackRank,
+					familyOccurrence: route.familyOccurrence,
+				});
+			}
+			continue;
+		}
+		if (evaluation.quotaPressure) {
+			quotaPressure.set(account.id, evaluation.quotaPressure);
 		}
 	}
 	meta.hardExcludedAccountIds = excludedIds.size > 0 ? excludedIds : null;
 	meta.quotaPressureByAccountId = quotaPressure.size > 0 ? quotaPressure : null;
+	capacityDeferredModelRoutesMap.set(meta, deferredRoutes);
 	meta.routingCandidateCatalog = accounts.map((account, ordinal) =>
 		normalCandidateMetadata(
 			account,
@@ -1128,9 +1326,14 @@ export async function getOrderedAccounts(
 	preloadedAccounts?: Account[],
 	degradedOwner?: DegradedOwnerSelectionContext,
 	priorServerToolCatalog: readonly RoutingCandidateMetadata[] = [],
+	preselectionFilter?: (accounts: Account[]) => Account[],
 ): Promise<Account[]> {
 	try {
-		const allAccounts = preloadedAccounts ?? (await ctx.dbOps.getAllAccounts());
+		const loadedAccounts =
+			preloadedAccounts ?? (await ctx.dbOps.getAllAccounts());
+		const allAccounts = preselectionFilter
+			? preselectionFilter(loadedAccounts)
+			: loadedAccounts;
 		const excludedProviders = meta.serverToolRequirements
 			? getExcludedProviders(meta)
 			: [];
@@ -1198,13 +1401,24 @@ export async function getOrderedAccounts(
 			}
 			affinityOrdered = finalAccounts;
 			meta.routingCandidates = finalCandidates;
-			publishServerToolCapabilitySummary(meta, catalog, seenCandidateIds);
-			if (meta.routingCandidates.length === 0) {
+			const deferredCandidateIds = getCapacityDeferredModelRoutes(meta).map(
+				(route) => route.candidateId,
+			);
+			const eligibleCandidateIds = new Set([
+				...seenCandidateIds,
+				...deferredCandidateIds,
+			]);
+			publishServerToolCapabilitySummary(meta, catalog, eligibleCandidateIds);
+			if (
+				meta.routingCandidates.length === 0 &&
+				deferredCandidateIds.length === 0
+			) {
 				throwServerToolCapabilityPoolError(meta);
 			}
 		}
 		return affinityOrdered;
 	} catch (error) {
+		capacityDeferredModelRoutesMap.delete(meta);
 		if (error instanceof ServerToolRoutingError) throw error;
 		reportAccountDatabaseError(error);
 		if (meta.serverToolRequirements) throw serverToolSelectionFailure(meta);
@@ -1233,6 +1447,7 @@ async function selectAccountsForRequestInternal(
 	options: AccountSelectionOptions = {},
 ): Promise<Account[]> {
 	comboSlotInfoMap.delete(meta);
+	capacityDeferredModelRoutesMap.delete(meta);
 	meta.comboName = null;
 	meta.comboSlotIndex = null;
 	const effectiveModel =
@@ -1805,16 +2020,15 @@ async function selectAccountsForRequestInternal(
 		}
 	}
 
-	return applyExclusions(
-		await getOrderedAccounts(
-			meta,
-			ctx,
-			effectiveModel,
-			options.syntheticProbe === true,
-			preloadedAccounts,
-			options.degradedOwner,
-			priorServerToolCatalog,
-		),
+	return await getOrderedAccounts(
+		meta,
+		ctx,
+		effectiveModel,
+		options.syntheticProbe === true,
+		preloadedAccounts,
+		options.degradedOwner,
+		priorServerToolCatalog,
+		applyExclusions,
 	);
 }
 

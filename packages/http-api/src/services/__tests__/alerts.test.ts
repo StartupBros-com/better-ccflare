@@ -176,6 +176,22 @@ describe("model_routing_drift: stale_policy (Opus 5 incident)", () => {
 		).toEqual([]);
 	});
 
+	test("is silent for an intentional cross-family fallback from latest Fable to Opus", () => {
+		const request = baseRequest({
+			comboModelOverride: {
+				from: CLAUDE_MODEL_IDS.FABLE_5,
+				to: CLAUDE_MODEL_IDS.OPUS_5,
+			},
+		});
+
+		expect(
+			buildStalePolicyDriftAlert(request, CONFIG, DRIFT_TIMESTAMP),
+		).toBeNull();
+		expect(
+			buildModelRoutingDriftAlerts(request, CONFIG, DRIFT_TIMESTAMP),
+		).toEqual([]);
+	});
+
 	test("is silent for agent-preference rewrites (comboModelOverride null) even when original/applied differ", () => {
 		const request = baseRequest({
 			comboModelOverride: null,
