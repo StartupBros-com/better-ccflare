@@ -1,18 +1,40 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
-import {
-	getProvider,
-	type Provider,
-	type ProviderAttemptPlan,
-	type ProviderAttemptPlanContext,
+import type {
+	Provider,
+	ProviderAttemptPlan,
+	ProviderAttemptPlanContext,
+	ProviderServerToolCapabilityContext,
 } from "@better-ccflare/providers";
-import type { Account, RequestMeta } from "@better-ccflare/types";
-import {
+import type {
+	Account,
+	RequestMeta,
+	ServerToolCapabilityDecision,
+	ServerToolCapabilityProof,
+	ServerToolCapabilityTuple,
+	ServerToolReplayAtom,
+	ServerToolRequirements,
+} from "@better-ccflare/types";
+import { ServerToolCandidateCapabilityError } from "../../server-tool-routing-errors";
+import type { ProxyContext } from "../proxy-types";
+
+// Source worktrees intentionally omit generated database worker bundles. This
+// harness injects dbOps and never constructs the database classes.
+mock.module("@better-ccflare/database", () => ({
+	AsyncDbWriter: class AsyncDbWriter {},
+	DatabaseFactory: class DatabaseFactory {},
+	DatabaseOperations: class DatabaseOperations {},
+	ModelTranslationRepository: class ModelTranslationRepository {},
+}));
+
+const { buildServerToolCapabilityProofKey, getProvider } = await import(
+	"@better-ccflare/providers"
+);
+const {
 	boundResponseBodyForClassification,
 	isModelUnavailableError,
 	proxyWithAccount,
-} from "../proxy-operations";
-import type { ProxyContext } from "../proxy-types";
-import { RoutingAttemptLedger } from "../routing-attempt-ledger";
+} = await import("../proxy-operations");
+const { RoutingAttemptLedger } = await import("../routing-attempt-ledger");
 
 // Minimal Account fixture for openai-compatible provider
 function makeAccount(overrides: Partial<Account> = {}): Account {
@@ -138,6 +160,16 @@ function makeProxyContext(): ProxyContext {
 	};
 }
 
+function enableServerToolReplay(ctx: ProxyContext): ProxyContext {
+	ctx.serverToolReplay = Object.freeze({
+		status: "ready",
+		codec: Object.freeze({
+			getWriterReadiness: () => Object.freeze({ status: "ready" }),
+		}),
+	}) as never;
+	return ctx;
+}
+
 function makeRequest(body: ArrayBuffer) {
 	return new Request("https://proxy.local/v1/messages", {
 		method: "POST",
@@ -243,6 +275,129 @@ function makeAttemptPlanningProvider(
 	return provider;
 }
 
+const SERVER_TOOL_REQUIREMENTS: ServerToolRequirements = Object.freeze({
+	revision: 1,
+	profileId:
+		"web-search-20250305-v1:domains-none:max-none:location-absent:client-no",
+	declarations: Object.freeze([
+		Object.freeze({ type: "web_search_20250305" as const }),
+	]),
+	replay: Object.freeze({
+		input: Object.freeze(["native-Anthropic" as const]),
+		output: Object.freeze(["proxy-evidence-v1" as const]),
+		requiresOutputReplay: true,
+	}),
+});
+
+const PROVEN_INPUT_REPLAY = Object.freeze([
+	"native-Anthropic",
+	"proxy-evidence-v1",
+] as const satisfies readonly ServerToolReplayAtom[]);
+const PROVEN_OUTPUT_REPLAY = Object.freeze([
+	"native-Anthropic",
+	"proxy-evidence-v1",
+] as const satisfies readonly ServerToolReplayAtom[]);
+
+function makeServerToolCapabilityTuple(
+	context: ProviderServerToolCapabilityContext,
+	providerName: string,
+	inputReplay: readonly ServerToolReplayAtom[] = PROVEN_INPUT_REPLAY,
+	outputReplay: readonly ServerToolReplayAtom[] = PROVEN_OUTPUT_REPLAY,
+): ServerToolCapabilityTuple {
+	const capabilityAccount = context.account as unknown as {
+		customEndpoint?: string | null;
+		custom_endpoint?: string | null;
+	};
+	return Object.freeze({
+		candidateId: context.candidateId,
+		provider: providerName,
+		authMode: "api-key",
+		endpointClass: "test-responses",
+		normalizedEndpoint:
+			capabilityAccount.customEndpoint ??
+			capabilityAccount.custom_endpoint ??
+			"https://planned.invalid/v1/responses",
+		model: context.physicalModel,
+		toolType: "web_search_20250305",
+		profile: context.requirements.profileId ?? "missing-profile",
+		inputReplay: Object.freeze([...inputReplay]),
+		outputReplay: Object.freeze([...outputReplay]),
+		providerContractRevision: "test-provider-contract-v1",
+		replayDecoderRevision: "server-tool-replay-v1",
+		requestTransport: "test-responses-json",
+		responseTransport: "test-responses-json",
+	});
+}
+
+function makeServerToolCapabilityProof(
+	tuple: ServerToolCapabilityTuple,
+	revision: string,
+): ServerToolCapabilityProof {
+	return Object.freeze({
+		revision,
+		tuple,
+		decision: "proven",
+		provenance: "sanitized-test-fixture",
+		owner: "proxy-test",
+		verifiedAt: "2026-07-29T00:00:00.000Z",
+		revalidateAfter: "2035-07-29T00:00:00.000Z",
+		fixtureRevision: "fixture-v1",
+		contractRevision: "test-provider-contract-v1",
+		revalidationTriggers: Object.freeze([
+			"tuple_change",
+			"contract_change",
+			"decoder_change",
+			"observed_behavior_change",
+		]),
+	});
+}
+
+function bindServerToolCandidate(
+	meta: RequestMeta,
+	input: {
+		provider: string;
+		physicalModel: string;
+		proof: ServerToolCapabilityProof;
+		requirements?: ServerToolRequirements;
+		replayRuntimeStatus?:
+			| "not_required"
+			| "ready"
+			| "input_unavailable"
+			| "output_unavailable";
+	},
+): RequestMeta {
+	const proofKey = buildServerToolCapabilityProofKey(
+		input.proof.revision,
+		input.proof.tuple,
+	);
+	expect(proofKey).toBeDefined();
+	return {
+		...meta,
+		serverToolRequirements: input.requirements ?? SERVER_TOOL_REQUIREMENTS,
+		routingCandidates: [
+			{
+				candidateId: input.proof.tuple.candidateId,
+				accountId: "acc-1",
+				tier: 0,
+				ordinal: 0,
+				comboSlotId: null,
+				modelOverride: input.physicalModel,
+				quotaPressure: null,
+				serverToolCapability: {
+					resolvedProvider: input.provider,
+					physicalModel: input.physicalModel,
+					decision: "proven",
+					reason: null,
+					proofKey,
+					inputReplayMode: input.proof.tuple.inputReplay,
+					outputReplayMode: input.proof.tuple.outputReplay,
+					replayRuntimeStatus: input.replayRuntimeStatus ?? "ready",
+				},
+			},
+		],
+	} as RequestMeta;
+}
+
 describe("proxyWithAccount — immutable provider attempt plans", () => {
 	let originalFetch: typeof globalThis.fetch;
 	let originalOverloadEnabled: string | undefined;
@@ -317,16 +472,7 @@ describe("proxyWithAccount — immutable provider attempt plans", () => {
 				makeRequest(bodyBuffer),
 				new URL("https://proxy.local/v1/messages"),
 				account,
-				makeRequestMeta({
-					serverToolRequirements: {
-						revision: 1,
-						replay: {
-							input: ["native-Anthropic"],
-							output: ["proxy-evidence-v1"],
-							requiresOutputReplay: true,
-						},
-					},
-				}),
+				makeRequestMeta(),
 				bodyBuffer,
 				() => undefined,
 				0,
@@ -347,8 +493,8 @@ describe("proxyWithAccount — immutable provider attempt plans", () => {
 			{
 				bodyModel: "combo-final-model",
 				physicalModel: "combo-final-model",
-				inputReplayMode: ["native-Anthropic"],
-				outputReplayMode: ["proxy-evidence-v1"],
+				inputReplayMode: [],
+				outputReplayMode: [],
 			},
 		]);
 		expect(refreshCalls).toBe(0);
@@ -611,6 +757,638 @@ describe("proxyWithAccount — immutable provider attempt plans", () => {
 					.calls[0]?.[0] as Request
 			).url,
 		).toBe("https://request-local.invalid/v1/messages");
+	});
+});
+
+describe("proxyWithAccount — exact server-tool capability binding", () => {
+	let originalFetch: typeof globalThis.fetch;
+
+	beforeEach(() => {
+		originalFetch = globalThis.fetch;
+	});
+
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+	});
+
+	it("binds the selected candidate's exact proof and proof-owned replay modes before credentials", async () => {
+		const events: string[] = [];
+		const planContexts: ProviderAttemptPlanContext[] = [];
+		let refreshCalls = 0;
+		const provider = makeAttemptPlanningProvider({
+			throwDuringPlanning: true,
+			onRefresh: () => {
+				refreshCalls++;
+				events.push("refresh");
+			},
+			onPlan: (context) => {
+				planContexts.push(context);
+				events.push("plan");
+			},
+		});
+		provider.createServerToolCapabilityTuple = (context) => {
+			events.push("tuple");
+			return makeServerToolCapabilityTuple(context, provider.name);
+		};
+		provider.resolveServerToolCapability = (_requirements, tuple) => {
+			events.push("resolve");
+			return {
+				decision: "proven",
+				proof: makeServerToolCapabilityProof(tuple, "proof-initial"),
+			};
+		};
+		const account = makeAccount({
+			provider: provider.name,
+			api_key: null,
+			access_token: null,
+			expires_at: null,
+			refresh_token: "refresh-token",
+			model_mappings: JSON.stringify({ primary: "primary" }),
+		});
+		const initialTuple = makeServerToolCapabilityTuple(
+			{
+				candidateId: "account:acc-1",
+				account,
+				path: "/v1/messages",
+				query: "",
+				physicalModel: "primary",
+				requirements: SERVER_TOOL_REQUIREMENTS,
+			},
+			provider.name,
+		);
+		const initialProof = makeServerToolCapabilityProof(
+			initialTuple,
+			"proof-initial",
+		);
+		const meta = bindServerToolCandidate(makeRequestMeta(), {
+			provider: provider.name,
+			physicalModel: "primary",
+			proof: initialProof,
+		});
+		const ctx = enableServerToolReplay(makeProxyContext());
+		ctx.provider = provider;
+		const bodyBuffer = makeRequestBody("primary");
+		globalThis.fetch = mock(async () =>
+			jsonResponse({ unexpected: true }, 500),
+		);
+
+		const result = await proxyWithAccount(
+			makeRequest(bodyBuffer),
+			new URL("https://proxy.local/v1/messages"),
+			account,
+			meta,
+			bodyBuffer,
+			() => undefined,
+			0,
+			ctx,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			false,
+			undefined,
+			undefined,
+			{ routeCandidateId: "account:acc-1" },
+		);
+
+		expect(result).toBeNull();
+		expect(events).toEqual(["tuple", "resolve", "plan"]);
+		expect(refreshCalls).toBe(0);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+		expect(planContexts).toHaveLength(1);
+		expect(planContexts[0]?.capabilityProofKey).toBe(
+			buildServerToolCapabilityProofKey(
+				initialProof.revision,
+				initialProof.tuple,
+			),
+		);
+		expect(planContexts[0]?.inputReplayMode).toEqual(PROVEN_INPUT_REPLAY);
+		expect(planContexts[0]?.outputReplayMode).toEqual(PROVEN_OUTPUT_REPLAY);
+		expect(planContexts[0]?.inputReplayMode).not.toEqual(
+			SERVER_TOOL_REQUIREMENTS.replay.input,
+		);
+	});
+
+	it("fails locally when the exact proof identity drifts immediately before transform", async () => {
+		let resolutionCount = 0;
+		let transformCalls = 0;
+		const provider = makeAttemptPlanningProvider({
+			onPlanHook: (hook) => {
+				if (hook === "transformRequestBody") transformCalls++;
+			},
+		});
+		provider.createServerToolCapabilityTuple = (context) =>
+			makeServerToolCapabilityTuple(context, provider.name);
+		provider.resolveServerToolCapability = (_requirements, tuple) => {
+			resolutionCount++;
+			return {
+				decision: "proven",
+				proof: makeServerToolCapabilityProof(
+					tuple,
+					resolutionCount === 1 ? "proof-stable" : "proof-drifted",
+				),
+			};
+		};
+		const account = makeAccount({
+			provider: provider.name,
+			model_mappings: JSON.stringify({ primary: "primary" }),
+		});
+		const initialTuple = makeServerToolCapabilityTuple(
+			{
+				candidateId: "account:acc-1",
+				account,
+				path: "/v1/messages",
+				query: "",
+				physicalModel: "primary",
+				requirements: SERVER_TOOL_REQUIREMENTS,
+			},
+			provider.name,
+		);
+		const meta = bindServerToolCandidate(makeRequestMeta(), {
+			provider: provider.name,
+			physicalModel: "primary",
+			proof: makeServerToolCapabilityProof(initialTuple, "proof-stable"),
+		});
+		const ctx = enableServerToolReplay(makeProxyContext());
+		ctx.provider = provider;
+		const bodyBuffer = makeRequestBody("primary");
+		globalThis.fetch = mock(async () =>
+			jsonResponse({ unexpected: true }, 500),
+		);
+
+		await expect(
+			proxyWithAccount(
+				makeRequest(bodyBuffer),
+				new URL("https://proxy.local/v1/messages"),
+				account,
+				meta,
+				bodyBuffer,
+				() => undefined,
+				0,
+				ctx,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				false,
+				undefined,
+				undefined,
+				{ routeCandidateId: "account:acc-1" },
+			),
+		).rejects.toBeInstanceOf(ServerToolCandidateCapabilityError);
+		expect(resolutionCount).toBe(2);
+		expect(transformCalls).toBe(0);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+		expect(ctx.asyncWriter.enqueue).toHaveBeenCalledTimes(0);
+	});
+
+	it("re-resolves and binds a fresh exact proof for every physical-model fallback", async () => {
+		const plans: Array<{
+			model: string | null;
+			proofKey: string | null;
+			inputReplay: readonly ServerToolReplayAtom[];
+			outputReplay: readonly ServerToolReplayAtom[];
+		}> = [];
+		const resolutionModels: string[] = [];
+		const provider = makeAttemptPlanningProvider({
+			onPlan: (context) => {
+				plans.push({
+					model: context.physicalModel,
+					proofKey: context.capabilityProofKey,
+					inputReplay: context.inputReplayMode,
+					outputReplay: context.outputReplayMode,
+				});
+			},
+		});
+		provider.createServerToolCapabilityTuple = (context) =>
+			makeServerToolCapabilityTuple(
+				context,
+				provider.name,
+				context.physicalModel === "fallback"
+					? (["native-Anthropic"] as const)
+					: PROVEN_INPUT_REPLAY,
+				context.physicalModel === "fallback"
+					? (["proxy-evidence-v1"] as const)
+					: PROVEN_OUTPUT_REPLAY,
+			);
+		provider.resolveServerToolCapability = (_requirements, tuple) => {
+			resolutionModels.push(tuple.model);
+			return {
+				decision: "proven",
+				proof: makeServerToolCapabilityProof(tuple, `proof:${tuple.model}`),
+			};
+		};
+		const account = makeAccount({
+			provider: provider.name,
+			model_mappings: JSON.stringify({ primary: ["primary", "fallback"] }),
+		});
+		const initialTuple = makeServerToolCapabilityTuple(
+			{
+				candidateId: "account:acc-1",
+				account,
+				path: "/v1/messages",
+				query: "",
+				physicalModel: "primary",
+				requirements: SERVER_TOOL_REQUIREMENTS,
+			},
+			provider.name,
+		);
+		const initialProof = makeServerToolCapabilityProof(
+			initialTuple,
+			"proof:primary",
+		);
+		const meta = bindServerToolCandidate(makeRequestMeta(), {
+			provider: provider.name,
+			physicalModel: "primary",
+			proof: initialProof,
+		});
+		const ctx = enableServerToolReplay(makeProxyContext());
+		ctx.provider = provider;
+		const bodyBuffer = makeRequestBody("primary");
+		globalThis.fetch = mock(async () =>
+			(globalThis.fetch as ReturnType<typeof mock>).mock.calls.length === 1
+				? jsonResponse({ error: { message: "rate limited" } }, 429)
+				: jsonResponse({ ok: true }, 200),
+		);
+
+		try {
+			await proxyWithAccount(
+				makeRequest(bodyBuffer),
+				new URL("https://proxy.local/v1/messages"),
+				account,
+				meta,
+				bodyBuffer,
+				() => undefined,
+				0,
+				ctx,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				false,
+				undefined,
+				undefined,
+				{ routeCandidateId: "account:acc-1" },
+			);
+		} catch (error) {
+			if (
+				!(error instanceof Error) ||
+				!error.message.includes("UsageCollector")
+			) {
+				throw error;
+			}
+		}
+
+		expect(globalThis.fetch).toHaveBeenCalledTimes(2);
+		expect(resolutionModels).toEqual([
+			"primary",
+			"primary",
+			"fallback",
+			"fallback",
+		]);
+		expect(plans).toEqual([
+			{
+				model: "primary",
+				proofKey: buildServerToolCapabilityProofKey(
+					"proof:primary",
+					initialTuple,
+				),
+				inputReplay: PROVEN_INPUT_REPLAY,
+				outputReplay: PROVEN_OUTPUT_REPLAY,
+			},
+			{
+				model: "fallback",
+				proofKey: expect.any(String),
+				inputReplay: ["native-Anthropic"],
+				outputReplay: ["proxy-evidence-v1"],
+			},
+		]);
+		expect(plans[1]?.proofKey).not.toBe(plans[0]?.proofKey);
+	});
+
+	it("requires the explicit recompute flag when a deferred route changes the admitted physical model", async () => {
+		const primaryModel = "claude-sonnet-4-5";
+		const deferredModel = "claude-opus-4-5";
+		const resolutionModels: string[] = [];
+		const provider = makeAttemptPlanningProvider();
+		provider.createServerToolCapabilityTuple = (context) =>
+			makeServerToolCapabilityTuple(context, provider.name);
+		provider.resolveServerToolCapability = (_requirements, tuple) => {
+			resolutionModels.push(tuple.model);
+			return {
+				decision: "proven",
+				proof: makeServerToolCapabilityProof(tuple, `proof:${tuple.model}`),
+			};
+		};
+		const account = makeAccount({
+			provider: provider.name,
+			custom_endpoint: "https://planned.invalid/v1/responses",
+			model_mappings: JSON.stringify({
+				sonnet: primaryModel,
+				opus: deferredModel,
+			}),
+		});
+		const initialTuple = makeServerToolCapabilityTuple(
+			{
+				candidateId: "account:acc-1",
+				account: {
+					provider: provider.name,
+					apiKeyConfigured: true,
+					refreshTokenConfigured: false,
+					accessTokenConfigured: false,
+					legacyMirroredApiKey: false,
+					customEndpoint: "https://planned.invalid/v1/responses",
+					customEndpointConfigured: true,
+					unsafeCustomEndpoint: false,
+					crossRegionMode: null,
+					billingType: null,
+				},
+				endpointContract: {
+					routeClass: "anthropic_messages",
+					queryPresent: false,
+				},
+				physicalModel: primaryModel,
+				requirements: SERVER_TOOL_REQUIREMENTS,
+			},
+			provider.name,
+		);
+		const meta = bindServerToolCandidate(makeRequestMeta(), {
+			provider: provider.name,
+			physicalModel: primaryModel,
+			proof: makeServerToolCapabilityProof(
+				initialTuple,
+				`proof:${primaryModel}`,
+			),
+		});
+		const ctx = enableServerToolReplay(makeProxyContext());
+		ctx.provider = provider;
+		const bodyBuffer = makeRequestBody(primaryModel);
+		globalThis.fetch = mock(async () => jsonResponse({ ok: true }, 200));
+
+		await expect(
+			proxyWithAccount(
+				makeRequest(bodyBuffer),
+				new URL("https://proxy.local/v1/messages"),
+				account,
+				meta,
+				bodyBuffer,
+				() => undefined,
+				0,
+				ctx,
+				deferredModel,
+				undefined,
+				undefined,
+				undefined,
+				false,
+				undefined,
+				undefined,
+				{ routeCandidateId: "account:acc-1" },
+			),
+		).rejects.toBeInstanceOf(ServerToolCandidateCapabilityError);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+
+		resolutionModels.length = 0;
+		try {
+			await proxyWithAccount(
+				makeRequest(bodyBuffer),
+				new URL("https://proxy.local/v1/messages"),
+				account,
+				meta,
+				bodyBuffer,
+				() => undefined,
+				0,
+				ctx,
+				deferredModel,
+				undefined,
+				undefined,
+				undefined,
+				false,
+				undefined,
+				undefined,
+				{
+					routeCandidateId: "account:acc-1",
+					recomputeServerToolCapability: true,
+				},
+			);
+		} catch (error) {
+			if (
+				!(error instanceof Error) ||
+				!error.message.includes("UsageCollector")
+			) {
+				throw error;
+			}
+		}
+
+		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+		expect(resolutionModels).toEqual([deferredModel, deferredModel]);
+	});
+
+	it("rechecks replay runtime eligibility before claiming a physical fallback", async () => {
+		const replayFlexibleRequirements: ServerToolRequirements = Object.freeze({
+			...SERVER_TOOL_REQUIREMENTS,
+			replay: Object.freeze({
+				input: Object.freeze([]),
+				output: Object.freeze([]),
+				requiresOutputReplay: true,
+			}),
+		});
+		const plannedModels: Array<string | null> = [];
+		const resolutionModels: string[] = [];
+		const provider = makeAttemptPlanningProvider({
+			onPlan: (context) => plannedModels.push(context.physicalModel),
+		});
+		provider.createServerToolCapabilityTuple = (context) =>
+			makeServerToolCapabilityTuple(
+				context,
+				provider.name,
+				["native-Anthropic"],
+				context.physicalModel === "fallback"
+					? ["proxy-evidence-v1"]
+					: ["native-Anthropic"],
+			);
+		provider.resolveServerToolCapability = (_requirements, tuple) => {
+			resolutionModels.push(tuple.model);
+			return {
+				decision: "proven",
+				proof: makeServerToolCapabilityProof(tuple, `proof:${tuple.model}`),
+			};
+		};
+		const account = makeAccount({
+			provider: provider.name,
+			model_mappings: JSON.stringify({ primary: ["primary", "fallback"] }),
+		});
+		const initialTuple = makeServerToolCapabilityTuple(
+			{
+				candidateId: "account:acc-1",
+				account,
+				path: "/v1/messages",
+				query: "",
+				physicalModel: "primary",
+				requirements: replayFlexibleRequirements,
+			},
+			provider.name,
+			["native-Anthropic"],
+			["native-Anthropic"],
+		);
+		const meta = bindServerToolCandidate(makeRequestMeta(), {
+			provider: provider.name,
+			physicalModel: "primary",
+			proof: makeServerToolCapabilityProof(initialTuple, "proof:primary"),
+			requirements: replayFlexibleRequirements,
+			replayRuntimeStatus: "not_required",
+		});
+		const ctx = makeProxyContext();
+		ctx.provider = provider;
+		ctx.serverToolReplay = Object.freeze({ status: "disabled" });
+		const ledger = new RoutingAttemptLedger();
+		const bodyBuffer = makeRequestBody("primary");
+		globalThis.fetch = mock(async () =>
+			jsonResponse({ error: { message: "rate limited" } }, 429),
+		);
+
+		await expect(
+			proxyWithAccount(
+				makeRequest(bodyBuffer),
+				new URL("https://proxy.local/v1/messages"),
+				account,
+				meta,
+				bodyBuffer,
+				() => undefined,
+				0,
+				ctx,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				false,
+				undefined,
+				ledger,
+				{ routeCandidateId: "account:acc-1" },
+			),
+		).rejects.toBeInstanceOf(ServerToolCandidateCapabilityError);
+
+		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+		expect(ledger.attemptedCount).toBe(1);
+		expect(ledger.physicalAttemptCount).toBe(1);
+		expect(plannedModels).toEqual(["primary"]);
+		expect(resolutionModels).toEqual(["primary", "primary", "fallback"]);
+		expect(ctx.asyncWriter.enqueue).toHaveBeenCalledTimes(0);
+	});
+
+	it("skips an incapable physical fallback before ledger claim, plan, transform, or transport", async () => {
+		const plannedModels: Array<string | null> = [];
+		const transformedModels: string[] = [];
+		const provider = makeAttemptPlanningProvider({
+			onPlan: (context) => plannedModels.push(context.physicalModel),
+			onPlanHook: (hook, plan) => {
+				if (hook === "transformRequestBody") {
+					transformedModels.push(plan.physicalModel ?? "none");
+				}
+			},
+		});
+		provider.createServerToolCapabilityTuple = (context) =>
+			makeServerToolCapabilityTuple(context, provider.name);
+		provider.resolveServerToolCapability = (_requirements, tuple) =>
+			tuple.model === "fallback"
+				? ({
+						decision: "unknown",
+						reason: "no_exact_proof",
+					} satisfies ServerToolCapabilityDecision)
+				: {
+						decision: "proven",
+						proof: makeServerToolCapabilityProof(tuple, "proof:primary"),
+					};
+		const account = makeAccount({
+			provider: provider.name,
+			model_mappings: JSON.stringify({ primary: ["primary", "fallback"] }),
+		});
+		const initialTuple = makeServerToolCapabilityTuple(
+			{
+				candidateId: "account:acc-1",
+				account,
+				path: "/v1/messages",
+				query: "",
+				physicalModel: "primary",
+				requirements: SERVER_TOOL_REQUIREMENTS,
+			},
+			provider.name,
+		);
+		const meta = bindServerToolCandidate(makeRequestMeta(), {
+			provider: provider.name,
+			physicalModel: "primary",
+			proof: makeServerToolCapabilityProof(initialTuple, "proof:primary"),
+		});
+		const ctx = enableServerToolReplay(makeProxyContext());
+		ctx.provider = provider;
+		const ledger = new RoutingAttemptLedger();
+		const bodyBuffer = makeRequestBody("primary");
+		globalThis.fetch = mock(async () =>
+			jsonResponse({ error: { message: "rate limited" } }, 429),
+		);
+
+		await expect(
+			proxyWithAccount(
+				makeRequest(bodyBuffer),
+				new URL("https://proxy.local/v1/messages"),
+				account,
+				meta,
+				bodyBuffer,
+				() => undefined,
+				0,
+				ctx,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				false,
+				undefined,
+				ledger,
+				{ routeCandidateId: "account:acc-1" },
+			),
+		).rejects.toBeInstanceOf(ServerToolCandidateCapabilityError);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+		expect(ledger.attemptedCount).toBe(1);
+		expect(ledger.physicalAttemptCount).toBe(1);
+		expect(plannedModels).toEqual(["primary"]);
+		expect(transformedModels).toEqual(["primary"]);
+	});
+
+	it("uses the same canonical provider alias identity for transport execution", async () => {
+		const canonicalAnthropic = getProvider("anthropic");
+		expect(canonicalAnthropic).toBeDefined();
+		const fallbackProvider = makeAttemptPlanningProvider();
+		const ctx = makeProxyContext();
+		ctx.provider = fallbackProvider;
+		const account = makeAccount({
+			provider: "claude-console-api",
+			api_key: "test-anthropic-key",
+			custom_endpoint: null,
+			model_mappings: null,
+		});
+		const bodyBuffer = makeRequestBody("claude-sonnet-4-5");
+		const fetchedUrls: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const request =
+				input instanceof Request ? input : new Request(String(input));
+			fetchedUrls.push(request.url);
+			return jsonResponse({ error: { type: "authentication_error" } }, 401);
+		});
+
+		const result = await proxyWithAccount(
+			makeRequest(bodyBuffer),
+			new URL("https://proxy.local/v1/messages"),
+			account,
+			makeRequestMeta(),
+			bodyBuffer,
+			() => undefined,
+			0,
+			ctx,
+		);
+
+		expect(result).toBeNull();
+		expect(fetchedUrls).toHaveLength(1);
+		expect(fetchedUrls[0]).toStartWith("https://api.anthropic.com/");
+		expect(fetchedUrls[0]).not.toStartWith("https://planned.invalid/");
 	});
 });
 

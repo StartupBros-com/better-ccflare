@@ -13,16 +13,19 @@ import { Logger } from "@better-ccflare/logger";
 import { stripCacheControlFromOpenAIRequest } from "@better-ccflare/openai-formats";
 import type { Provider, ProviderAttemptPlan } from "@better-ccflare/providers";
 import {
+	buildServerToolCapabilityProofKey,
 	CODEX_CONVERSATION_ID_HEADER,
 	decideContextAdmission,
-	getProvider,
 	isAnthropicExtraUsageExhausted,
 	isAnthropicOutOfCredits,
 	isCodexSubscriptionEndpoint,
 	materializeProviderAttemptPlan,
+	materializeProviderServerToolCapabilityDecision,
+	materializeProviderServerToolCapabilityTuple,
 	resolveCodexEndpoint,
 	resolveCodexRequestModel,
 	resolveModelContextCapability,
+	resolveProviderForAccount,
 	suppressCodexExplicitCacheBreakpoint,
 	usageCache,
 } from "@better-ccflare/providers";
@@ -30,6 +33,9 @@ import type {
 	Account,
 	RateLimitReason,
 	RequestMeta,
+	ServerToolCapabilityDecision,
+	ServerToolCapabilityTuple,
+	ServerToolReplayAtom,
 } from "@better-ccflare/types";
 import {
 	RECOVERY_SCOPE_HEADER,
@@ -90,6 +96,8 @@ import {
 	forwardToClient,
 	handleAnthropicSseRateLimit,
 } from "../response-handler";
+import { evaluateServerToolReplayEligibility } from "../server-tool-replay-eligibility";
+import { ServerToolCandidateCapabilityError } from "../server-tool-routing-errors";
 import {
 	recordServedAccount,
 	sessionIdForObservation,
@@ -357,6 +365,12 @@ export interface ContextAdmissionEstimate {
 export interface ModelFallbackExecutionPolicy {
 	/** Immutable ID of the exact route candidate being executed. */
 	readonly routeCandidateId: string;
+	/**
+	 * A globally deferred physical-model route may outlive replacement of the
+	 * selector sidecar that admitted its source candidate. It must recompute an
+	 * exact proof instead of trusting the newer unrelated sidecar.
+	 */
+	readonly recomputeServerToolCapability?: boolean;
 	/** Request-scoped Anthropic downstream rescue; absent for ordinary routing. */
 	readonly anthropicPreCommitRescue?: AnthropicPreCommitRescueRouteContext;
 	readonly deferImplicitFallback?: (
@@ -1907,7 +1921,15 @@ export async function proxyWithAccount(
 
 		// Get the provider for this account before applying the staging policy: the
 		// resolved provider (including ctx fallback) determines replay safety.
-		const provider = getProvider(account.provider) || ctx.provider;
+		const provider = resolveProviderForAccount(account.provider, ctx.provider);
+		if (!provider) {
+			throw new ServerToolCandidateCapabilityError({
+				accountId: account.id,
+				candidateId:
+					modelFallbackPolicy?.routeCandidateId ?? `account:${account.id}`,
+				reason: "provider_unavailable",
+			});
+		}
 		const requestedModelBeforeAdmission = effectiveBodyContext.getModel();
 		const concreteCodexModels =
 			account.provider === "codex" && requestedModelBeforeAdmission
@@ -2053,6 +2075,124 @@ export async function proxyWithAccount(
 			}
 		}
 
+		type ExactServerToolCapabilityBinding = Readonly<{
+			tuple: ServerToolCapabilityTuple;
+			proofKey: string;
+			inputReplayMode: readonly ServerToolReplayAtom[];
+			outputReplayMode: readonly ServerToolReplayAtom[];
+		}>;
+		const serverToolRequirements = requestMeta.serverToolRequirements;
+		const routeCandidateId =
+			modelFallbackPolicy?.routeCandidateId ?? `account:${account.id}`;
+		const candidateCapabilityError = (
+			reason: ConstructorParameters<
+				typeof ServerToolCandidateCapabilityError
+			>[0]["reason"],
+		): ServerToolCandidateCapabilityError =>
+			new ServerToolCandidateCapabilityError({
+				accountId: account.id,
+				candidateId: routeCandidateId,
+				reason,
+			});
+		const replayModesEqual = (
+			left: readonly ServerToolReplayAtom[],
+			right: readonly ServerToolReplayAtom[],
+		): boolean =>
+			left.length === right.length &&
+			left.every((atom, index) => atom === right[index]);
+		const resolveExactServerToolCapability = (
+			physicalModel: string | null,
+			requireSelectedCandidateBinding: boolean,
+		): ExactServerToolCapabilityBinding | null => {
+			if (!serverToolRequirements) return null;
+			if (!physicalModel) throw candidateCapabilityError("tuple_unavailable");
+
+			const currentProvider = resolveProviderForAccount(
+				account.provider,
+				ctx.provider,
+			);
+			if (!currentProvider || currentProvider !== provider) {
+				throw candidateCapabilityError("provider_unavailable");
+			}
+
+			let tuple: ServerToolCapabilityTuple | undefined;
+			try {
+				tuple = materializeProviderServerToolCapabilityTuple(provider, {
+					candidateId: routeCandidateId,
+					account,
+					path: url.pathname,
+					query: url.search,
+					physicalModel,
+					requirements: serverToolRequirements,
+				});
+			} catch {
+				throw candidateCapabilityError("tuple_unavailable");
+			}
+			if (!tuple) throw candidateCapabilityError("tuple_unavailable");
+
+			let decision: ServerToolCapabilityDecision;
+			try {
+				decision = materializeProviderServerToolCapabilityDecision(
+					provider,
+					serverToolRequirements,
+					tuple,
+				);
+			} catch {
+				throw candidateCapabilityError("resolver_invalid");
+			}
+			if (decision.decision !== "proven") {
+				throw candidateCapabilityError("capability_unproven");
+			}
+			const proof = decision.proof;
+			const proofKey = buildServerToolCapabilityProofKey(
+				proof.revision,
+				proof.tuple,
+			);
+			if (!proofKey) throw candidateCapabilityError("resolver_invalid");
+
+			const inputReplayMode = Object.freeze([...proof.tuple.inputReplay]);
+			const outputReplayMode = Object.freeze([...proof.tuple.outputReplay]);
+			const replayEligibility = evaluateServerToolReplayEligibility(
+				serverToolRequirements,
+				inputReplayMode,
+				outputReplayMode,
+				ctx.serverToolReplay,
+			);
+			if (!replayEligibility.eligible) {
+				throw candidateCapabilityError("replay_unavailable");
+			}
+			if (requireSelectedCandidateBinding) {
+				const selected = requestMeta.routingCandidates?.find(
+					(candidate) =>
+						candidate.candidateId === routeCandidateId &&
+						candidate.accountId === account.id,
+				);
+				const expected = selected?.serverToolCapability;
+				if (!expected) {
+					throw candidateCapabilityError("candidate_binding_missing");
+				}
+				if (
+					expected.resolvedProvider !== tuple.provider ||
+					expected.physicalModel !== physicalModel ||
+					expected.decision !== "proven" ||
+					expected.reason !== null ||
+					expected.proofKey !== proofKey ||
+					expected.replayRuntimeStatus !== replayEligibility.status ||
+					!replayModesEqual(expected.inputReplayMode, inputReplayMode) ||
+					!replayModesEqual(expected.outputReplayMode, outputReplayMode)
+				) {
+					throw candidateCapabilityError("candidate_binding_mismatch");
+				}
+			}
+
+			return Object.freeze({
+				tuple,
+				proofKey,
+				inputReplayMode,
+				outputReplayMode,
+			});
+		};
+
 		const cacheReplayPhysicalModel = req.headers.get(CACHE_REPLAY_MODEL_HEADER);
 		const createPlanningRequest = (bodyBuffer: ArrayBuffer | null): Request => {
 			const init: RequestInit & { duplex?: "half" } = {
@@ -2068,22 +2208,54 @@ export async function proxyWithAccount(
 		const materializeAttemptPlan = (
 			bodyBuffer: ArrayBuffer | null,
 			physicalModel: string | null,
-		): ProviderAttemptPlan =>
-			materializeProviderAttemptPlan(provider, {
+			requireSelectedCandidateBinding = false,
+		): ProviderAttemptPlan => {
+			const capability = resolveExactServerToolCapability(
+				physicalModel,
+				requireSelectedCandidateBinding,
+			);
+			return materializeProviderAttemptPlan(provider, {
 				request: createPlanningRequest(bodyBuffer),
 				requestBodyBuffer: bodyBuffer,
 				account,
 				path: url.pathname,
 				query: url.search,
 				physicalModel,
-				capabilityProofKey: null,
-				inputReplayMode: requestMeta.serverToolRequirements?.replay.input ?? [],
-				outputReplayMode:
-					requestMeta.serverToolRequirements?.replay.output ?? [],
+				capabilityProofKey: capability?.proofKey ?? null,
+				inputReplayMode: capability?.inputReplayMode ?? [],
+				outputReplayMode: capability?.outputReplayMode ?? [],
 			});
+		};
+		const assertAttemptPlanCapabilityIsCurrent = (
+			plan: ProviderAttemptPlan,
+		): void => {
+			const current = resolveExactServerToolCapability(
+				plan.physicalModel,
+				false,
+			);
+			if (!serverToolRequirements) return;
+			if (
+				!current ||
+				current.tuple.provider !== plan.providerName ||
+				current.tuple.model !== plan.physicalModel ||
+				current.proofKey !== plan.capabilityProofKey ||
+				!replayModesEqual(current.inputReplayMode, plan.inputReplayMode) ||
+				!replayModesEqual(current.outputReplayMode, plan.outputReplayMode)
+			) {
+				throw candidateCapabilityError("proof_drift");
+			}
+		};
+		const transformWithCurrentAttemptPlan = async (
+			plan: ProviderAttemptPlan,
+			request: Request,
+		): Promise<Request> => {
+			assertAttemptPlanCapabilityIsCurrent(plan);
+			return plan.transformRequestBody(request);
+		};
 		let attemptPlan = materializeAttemptPlan(
 			effectiveBodyBuffer,
 			cacheReplayPhysicalModel ?? concreteAttemptModel,
+			modelFallbackPolicy?.recomputeServerToolCapability !== true,
 		);
 		let attemptProvider = bindProviderAttemptPlan(attemptPlan);
 		const attemptProxyContext = (): ProxyContext => ({
@@ -2696,10 +2868,11 @@ export async function proxyWithAccount(
 		const enforcePhysicalModelAfterTransform = async (
 			transportRequest: Request,
 			physicalModel: string | null | undefined,
+			plan: ProviderAttemptPlan = attemptPlan,
 		): Promise<Request> => {
 			if (
 				!physicalModel ||
-				attemptPlan.cacheReplayModelStrategy !== "transformed-body" ||
+				plan.cacheReplayModelStrategy !== "transformed-body" ||
 				isSyntheticProviderResponse(transportRequest)
 			) {
 				return transportRequest;
@@ -2722,8 +2895,10 @@ export async function proxyWithAccount(
 		// cohort attribution. Strip only the concrete transport request below,
 		// after each transform, so internal headers never reach upstream.
 
-		let transformedRequest =
-			await attemptPlan.transformRequestBody(providerRequest);
+		let transformedRequest = await transformWithCurrentAttemptPlan(
+			attemptPlan,
+			providerRequest,
+		);
 		transformedRequest = await enforcePhysicalModelAfterTransform(
 			transformedRequest,
 			replayResolvedModel,
@@ -3046,8 +3221,10 @@ export async function proxyWithAccount(
 				const retryProviderRequest = new Request(targetUrl, retryRequestInit);
 				retrySourceRequest = retryProviderRequest.clone();
 
-				let retryTransformedRequest =
-					await attemptPlan.transformRequestBody(retryProviderRequest);
+				let retryTransformedRequest = await transformWithCurrentAttemptPlan(
+					attemptPlan,
+					retryProviderRequest,
+				);
 				retryTransformedRequest = await enforcePhysicalModelAfterTransform(
 					retryTransformedRequest,
 					currentTransportModel,
@@ -3107,8 +3284,10 @@ export async function proxyWithAccount(
 				const retryProviderRequest = new Request(targetUrl, retryRequestInit);
 				retrySourceRequest = retryProviderRequest.clone();
 
-				let retryTransformedRequest =
-					await attemptPlan.transformRequestBody(retryProviderRequest);
+				let retryTransformedRequest = await transformWithCurrentAttemptPlan(
+					attemptPlan,
+					retryProviderRequest,
+				);
 				retryTransformedRequest = await enforcePhysicalModelAfterTransform(
 					retryTransformedRequest,
 					currentTransportModel,
@@ -3176,8 +3355,10 @@ export async function proxyWithAccount(
 					body: new Uint8Array(replayBody),
 				});
 				retrySourceRequest = retrySource.clone();
-				let retryTransformed =
-					await attemptPlan.transformRequestBody(retrySource);
+				let retryTransformed = await transformWithCurrentAttemptPlan(
+					attemptPlan,
+					retrySource,
+				);
 				retryTransformed = await enforcePhysicalModelAfterTransform(
 					retryTransformed,
 					currentTransportModel,
@@ -3238,8 +3419,10 @@ export async function proxyWithAccount(
 					currentReplayBody = new TextEncoder().encode(retrySourceText).buffer;
 					currentCacheIdentityHasCacheControl = undefined;
 					retrySourceRequest = retrySource.clone();
-					const retryTransformed =
-						await attemptPlan.transformRequestBody(retrySource);
+					const retryTransformed = await transformWithCurrentAttemptPlan(
+						attemptPlan,
+						retrySource,
+					);
 					retryTransformedTemplate = retryTransformed.clone();
 					retryRequest = sanitizeInternalTransportHeaders(
 						retryTransformedTemplate.clone(),
@@ -4079,6 +4262,8 @@ export async function proxyWithAccount(
 					}
 
 					let deferredFallbackRank = 0;
+					let lastModelFallbackCapabilityError: ServerToolCandidateCapabilityError | null =
+						null;
 					for (let i = fallbackStartIndex; i < modelList.length; i++) {
 						const nextModel = modelList[i];
 						if (candidateHasScopedFailure(nextModel)) {
@@ -4130,9 +4315,50 @@ export async function proxyWithAccount(
 							log.warn("Failed to patch request body for model retry");
 							break;
 						}
+						let fallbackPlan: ProviderAttemptPlan;
+						let fallbackHeaders: Headers;
+						let retryTransformedRequest: Request;
+						try {
+							// Exact capability and replay readiness are resolved before the
+							// request ledger can claim this physical fallback.
+							fallbackPlan = materializeAttemptPlan(
+								patchedBody,
+								nextModel,
+								false,
+							);
+							fallbackHeaders = prepareAttemptHeaders(fallbackPlan);
+							const retryRequestInit: RequestInit & { duplex?: "half" } = {
+								method: req.method,
+								headers: fallbackHeaders,
+								body: new Uint8Array(patchedBody),
+								duplex: "half",
+							};
+							const retryProviderRequest = new Request(
+								fallbackPlan.targetUrl,
+								retryRequestInit,
+							);
+							retrySourceRequest = retryProviderRequest.clone();
+							retryTransformedRequest = await transformWithCurrentAttemptPlan(
+								fallbackPlan,
+								retryProviderRequest,
+							);
+							retryTransformedRequest =
+								await enforcePhysicalModelAfterTransform(
+									retryTransformedRequest,
+									nextModel,
+									fallbackPlan,
+								);
+						} catch (error) {
+							if (error instanceof ServerToolCandidateCapabilityError) {
+								lastModelFallbackCapabilityError = error;
+								continue;
+							}
+							throw error;
+						}
+
 						// getModelList returns concrete provider models, and the transformed
-						// request is force-patched to this exact value below. Claim before
-						// retry tracing/finalization so a duplicate skip has no side effects.
+						// request is force-patched to this exact value. Claim only after the
+						// proof-equality transform gate has succeeded.
 						if (
 							routingAttemptLedger &&
 							!routingAttemptLedger.claim(account.id, nextModel)
@@ -4145,6 +4371,7 @@ export async function proxyWithAccount(
 							);
 							continue;
 						}
+						lastModelFallbackCapabilityError = null;
 						if (routingAttemptLedger) {
 							failoverAttempts = Math.max(
 								failoverAttempts,
@@ -4155,33 +4382,12 @@ export async function proxyWithAccount(
 							await finalizeCurrentCodexTransport(rawResponse);
 							await discardUpstreamBody(rawResponse);
 						}
-						const fallbackPlan = materializeAttemptPlan(patchedBody, nextModel);
 						attemptPlan = fallbackPlan;
 						attemptProvider = bindProviderAttemptPlan(fallbackPlan);
-						headers = prepareAttemptHeaders(fallbackPlan);
+						headers = fallbackHeaders;
 						stampCodexAttempt(headers, "model_fallback", nextModel);
 						currentTransportModel = nextModel;
 						targetUrl = fallbackPlan.targetUrl;
-						const retryRequestInit: RequestInit & { duplex?: "half" } = {
-							method: req.method,
-							headers,
-							body: new Uint8Array(patchedBody),
-							duplex: "half",
-						};
-						const retryProviderRequest = new Request(
-							fallbackPlan.targetUrl,
-							retryRequestInit,
-						);
-						retrySourceRequest = retryProviderRequest.clone();
-						let retryTransformedRequest =
-							await fallbackPlan.transformRequestBody(retryProviderRequest);
-
-						// Body-model conversions can remap nextModel back to the primary;
-						// source/URL providers already resolved it during prepare/build above.
-						retryTransformedRequest = await enforcePhysicalModelAfterTransform(
-							retryTransformedRequest,
-							nextModel,
-						);
 						retryTransformedTemplate = retryTransformedRequest.clone();
 
 						// Fallback transforms need internal correlation metadata, but the
@@ -4221,6 +4427,11 @@ export async function proxyWithAccount(
 						) {
 							break; // Success — stop cycling
 						}
+					}
+					if (lastModelFallbackCapabilityError) {
+						await finalizeCurrentCodexTransport(rawResponse);
+						await discardUpstreamBody(rawResponse);
+						throw lastModelFallbackCapabilityError;
 					}
 				}
 
@@ -4431,8 +4642,10 @@ export async function proxyWithAccount(
 								headers: retryHeaders,
 								body: await retrySourceRequest.clone().arrayBuffer(),
 							});
-							let retryTransformed =
-								await attemptPlan.transformRequestBody(retrySource);
+							let retryTransformed = await transformWithCurrentAttemptPlan(
+								attemptPlan,
+								retrySource,
+							);
 							if (currentTransportModel) {
 								retryTransformed = await forceModelInTransformedRequest(
 									retryTransformed,
@@ -4860,8 +5073,10 @@ export async function proxyWithAccount(
 						rescueRequestInit,
 					);
 					retrySourceRequest = rescueSourceRequest.clone();
-					let rescueTransformedRequest =
-						await attemptPlan.transformRequestBody(rescueSourceRequest);
+					let rescueTransformedRequest = await transformWithCurrentAttemptPlan(
+						attemptPlan,
+						rescueSourceRequest,
+					);
 					rescueTransformedRequest = await enforcePhysicalModelAfterTransform(
 						rescueTransformedRequest,
 						currentTransportModel,
@@ -5232,6 +5447,12 @@ export async function proxyWithAccount(
 		}
 		return forwardedResponse;
 	} catch (err) {
+		if (err instanceof ServerToolCandidateCapabilityError) {
+			// Exact capability drift is request-local. It must not pause the account,
+			// poison route health, or be collapsed into a generic transport failure;
+			// the request orchestrator owns sibling failover and the final terminal.
+			throw err;
+		}
 		const committedLifecycle = anthropicDegradedState?.lifecycle;
 		if (
 			committedLifecycle &&

@@ -106,6 +106,11 @@ import {
 	recordRoutingTerminalRequest,
 } from "./routing-terminal-recorder";
 import {
+	createServerToolRoutingErrorResponse,
+	ServerToolCandidateCapabilityError,
+	ServerToolRoutingError,
+} from "./server-tool-routing-errors";
+import {
 	clearSession,
 	sessionIdForObservation,
 } from "./session-account-observer";
@@ -690,6 +695,20 @@ async function handleProxyCore(
 		finalRequestBodyContext.finalizeServerToolRequirements();
 	if (serverToolRequirements) {
 		requestMeta.serverToolRequirements = serverToolRequirements;
+		// Selection needs only the semantic presence bit. Keep the raw query out of
+		// routing metadata while allowing the provider materializer to derive the
+		// same endpoint contract here and at pretransport binding.
+		requestMeta.serverToolQueryPresent = url.search.length > 0;
+		if (serverToolRequirements.invalid?.length) {
+			return createServerToolRoutingErrorResponse(
+				new ServerToolRoutingError({ reason: "invalid_requirement" }),
+			);
+		}
+		if (serverToolRequirements.unsupported?.length) {
+			return createServerToolRoutingErrorResponse(
+				new ServerToolRoutingError({ reason: "unsupported_requirement" }),
+			);
+		}
 	}
 	const finalParsedBody = finalRequestBodyContext.getParsedJson();
 	const potentialAnthropicCohortFacts =
@@ -922,6 +941,12 @@ async function handleProxyCore(
 		if (error instanceof PreTransportPhaseTimeoutError) {
 			return accountSelectionTimeoutResponse(pacingObservation?.slot ?? null);
 		}
+		if (error instanceof ServerToolRoutingError) {
+			return finishPacing(
+				pacingObservation?.slot ?? null,
+				createServerToolRoutingErrorResponse(error),
+			);
+		}
 		if (error instanceof ForceRouteUnavailableError) {
 			log.warn(
 				`Grok cache canary ${formatXaiCacheCanary({
@@ -954,6 +979,17 @@ async function handleProxyCore(
 							"x-better-ccflare-force-route": "unavailable",
 						},
 					},
+				),
+			);
+		}
+		if (serverToolRequirements) {
+			return finishPacing(
+				pacingObservation?.slot ?? null,
+				createServerToolRoutingErrorResponse(
+					new ServerToolRoutingError({
+						reason: "temporary_unavailable",
+						capabilitySummary: requestMeta.serverToolCapabilitySummary,
+					}),
 				),
 			);
 		}
@@ -1153,6 +1189,12 @@ async function handleProxyCore(
 			if (error instanceof PreTransportPhaseTimeoutError) {
 				return accountSelectionTimeoutResponse(pacingObservation?.slot ?? null);
 			}
+			if (error instanceof ServerToolRoutingError) {
+				return finishPacing(
+					pacingObservation?.slot ?? null,
+					createServerToolRoutingErrorResponse(error),
+				);
+			}
 			if (error instanceof ForceRouteUnavailableError) {
 				log.warn(
 					`Grok cache canary ${formatXaiCacheCanary({
@@ -1186,6 +1228,17 @@ async function handleProxyCore(
 								"x-better-ccflare-force-route": "unavailable",
 							},
 						},
+					),
+				);
+			}
+			if (serverToolRequirements) {
+				return finishPacing(
+					pacingObservation?.slot ?? null,
+					createServerToolRoutingErrorResponse(
+						new ServerToolRoutingError({
+							reason: "temporary_unavailable",
+							capabilitySummary: requestMeta.serverToolCapabilitySummary,
+						}),
 					),
 				);
 			}
@@ -1419,6 +1472,9 @@ async function handleProxyCore(
 		: null;
 	let response: ProxyWithAccountResult = null;
 	let upstreamAttempts = 0;
+	const serverToolCandidateCapabilityFailures: ServerToolCandidateCapabilityError[] =
+		[];
+	const locallyFailedServerToolCandidateIds = new Set<string>();
 	// Every candidate probe-gate-suppressed and skipped via `continue` below
 	// means the loop never actually attempted an account; the post-loop
 	// fallback tier uses this to retry the top candidate once, ungated.
@@ -1532,6 +1588,99 @@ async function handleProxyCore(
 				// a failed fallback body's transport cleanup.
 			});
 		return retainedTerminalResponse;
+	};
+	const recordServerToolCandidateCapabilityFailure = (
+		error: ServerToolCandidateCapabilityError,
+		attemptedBefore: number,
+	): Response | null => {
+		serverToolCandidateCapabilityFailures.push(error);
+		locallyFailedServerToolCandidateIds.add(error.candidateId);
+		log.warn("server_tool_candidate_capability_drift", {
+			requestId: requestMeta.id,
+			accountId: error.accountId,
+			candidateId: error.candidateId,
+			reason: error.reason,
+		});
+		// A forced route whose exact proof failed before any transport has no
+		// authorized sibling substitute. A capability failure discovered only
+		// after a genuine upstream attempt remains subject to retained-terminal
+		// precedence below.
+		if (
+			successfullyForceRouted &&
+			error.accountId === requestedForcedAccountId &&
+			routingAttemptLedger.attemptedCount === attemptedBefore
+		) {
+			cacheBodyStore.discardStaged(requestMeta.id);
+			return createServerToolRoutingErrorResponse(
+				new ServerToolRoutingError({
+					reason: "forced_incapable",
+					accountId: error.accountId,
+					capabilitySummary: currentServerToolCapabilitySummary(),
+				}),
+			);
+		}
+		return null;
+	};
+	const currentServerToolSelectionWaveCandidateIds = (): ReadonlySet<string> =>
+		new Set(
+			(requestMeta.routingCandidates ?? []).map(
+				(candidate) => candidate.candidateId,
+			),
+		);
+	const currentServerToolSelectionWaveFailedCandidateIds =
+		(): ReadonlySet<string> => {
+			const activeCandidateIds = currentServerToolSelectionWaveCandidateIds();
+			return new Set(
+				[...locallyFailedServerToolCandidateIds].filter((candidateId) =>
+					activeCandidateIds.has(candidateId),
+				),
+			);
+		};
+	const currentServerToolCapabilitySummary = () => {
+		const summary = requestMeta.serverToolCapabilitySummary;
+		if (!summary) return undefined;
+		const failedCandidateIds =
+			currentServerToolSelectionWaveFailedCandidateIds();
+		const invalidatedProvenCount = Math.min(
+			summary.provenCandidateCount,
+			failedCandidateIds.size,
+		);
+		const provenCandidateCount = Math.max(
+			0,
+			summary.provenCandidateCount - invalidatedProvenCount,
+		);
+		return Object.freeze({
+			...summary,
+			provenCandidateCount,
+			unknownCandidateCount:
+				summary.unknownCandidateCount + invalidatedProvenCount,
+			temporarilyUnavailableProvenCandidateCount: Math.min(
+				summary.temporarilyUnavailableProvenCandidateCount,
+				Math.max(
+					0,
+					provenCandidateCount - summary.replayIneligibleCandidateCount,
+				),
+			),
+			eligibleCandidateCount: Math.max(
+				0,
+				summary.eligibleCandidateCount - failedCandidateIds.size,
+			),
+		});
+	};
+	const hasExhaustedLocalServerToolCapabilityFailures = (): boolean => {
+		if (
+			serverToolCandidateCapabilityFailures.length === 0 ||
+			routingAttemptLedger.attemptedCount !== 0
+		) {
+			return false;
+		}
+		const activeCandidateIds = currentServerToolSelectionWaveCandidateIds();
+		return (
+			activeCandidateIds.size > 0 &&
+			[...activeCandidateIds].every((candidateId) =>
+				locallyFailedServerToolCandidateIds.has(candidateId),
+			)
+		);
 	};
 	const deliverAnthropicDegradedDenial = async (
 		denial: AnthropicDegradedSendDenied,
@@ -1681,6 +1830,18 @@ async function handleProxyCore(
 				anthropicDegradedSendState,
 			);
 		} catch (error) {
+			if (error instanceof ServerToolCandidateCapabilityError) {
+				upstreamAttempts +=
+					routingAttemptLedger.attemptedCount - attemptedBefore;
+				const forcedResponse = recordServerToolCandidateCapabilityFailure(
+					error,
+					attemptedBefore,
+				);
+				if (forcedResponse) {
+					return finishPacing(pacingSlot, forcedResponse);
+				}
+				continue;
+			}
 			await routingAttemptLedger.discardTerminalResponse();
 			throw error;
 		} finally {
@@ -1790,8 +1951,19 @@ async function handleProxyCore(
 				anthropicDegradedSendState,
 			);
 		} catch (error) {
-			await routingAttemptLedger.discardTerminalResponse();
-			throw error;
+			if (error instanceof ServerToolCandidateCapabilityError) {
+				const forcedResponse = recordServerToolCandidateCapabilityFailure(
+					error,
+					attemptedBefore,
+				);
+				if (forcedResponse) {
+					return finishPacing(pacingSlot, forcedResponse);
+				}
+				response = null;
+			} else {
+				await routingAttemptLedger.discardTerminalResponse();
+				throw error;
+			}
 		}
 		upstreamAttempts += routingAttemptLedger.attemptedCount - attemptedBefore;
 
@@ -1830,6 +2002,18 @@ async function handleProxyCore(
 		!hasPreferredLegacyContextOverflowRoute()
 	) {
 		if (isComboSessionFallbackDisabled()) {
+			if (hasExhaustedLocalServerToolCapabilityFailures()) {
+				cacheBodyStore.discardStaged(requestMeta.id);
+				return finishPacing(
+					pacingSlot,
+					createServerToolRoutingErrorResponse(
+						new ServerToolRoutingError({
+							reason: "no_implementation",
+							capabilitySummary: currentServerToolCapabilitySummary(),
+						}),
+					),
+				);
+			}
 			log.warn(
 				`All combo slots failed for combo "${filteredComboInfo.comboName}", session fallback disabled by CCFLARE_DISABLE_COMBO_SESSION_FALLBACK`,
 			);
@@ -1871,6 +2055,33 @@ async function handleProxyCore(
 					await retainedTerminalResponse.discard();
 				}
 				return accountSelectionTimeoutResponse(pacingSlot);
+			}
+			if (error instanceof ServerToolRoutingError) {
+				const retainedTerminalResponse =
+					await deliverRetainedTerminalResponse();
+				if (retainedTerminalResponse) {
+					return finishPacing(pacingSlot, retainedTerminalResponse);
+				}
+				return finishPacing(
+					pacingSlot,
+					createServerToolRoutingErrorResponse(error),
+				);
+			}
+			if (serverToolRequirements) {
+				const retainedTerminalResponse =
+					await deliverRetainedTerminalResponse();
+				if (retainedTerminalResponse) {
+					return finishPacing(pacingSlot, retainedTerminalResponse);
+				}
+				return finishPacing(
+					pacingSlot,
+					createServerToolRoutingErrorResponse(
+						new ServerToolRoutingError({
+							reason: "temporary_unavailable",
+							capabilitySummary: requestMeta.serverToolCapabilitySummary,
+						}),
+					),
+				);
 			}
 			await routingAttemptLedger.discardTerminalResponse();
 			throw error;
@@ -1976,6 +2187,18 @@ async function handleProxyCore(
 						anthropicDegradedSendState,
 					);
 				} catch (error) {
+					if (error instanceof ServerToolCandidateCapabilityError) {
+						upstreamAttempts +=
+							routingAttemptLedger.attemptedCount - attemptedBefore;
+						const forcedResponse = recordServerToolCandidateCapabilityFailure(
+							error,
+							attemptedBefore,
+						);
+						if (forcedResponse) {
+							return finishPacing(pacingSlot, forcedResponse);
+						}
+						continue;
+					}
 					await routingAttemptLedger.discardTerminalResponse();
 					throw error;
 				} finally {
@@ -2056,8 +2279,19 @@ async function handleProxyCore(
 						anthropicDegradedSendState,
 					);
 				} catch (error) {
-					await routingAttemptLedger.discardTerminalResponse();
-					throw error;
+					if (error instanceof ServerToolCandidateCapabilityError) {
+						const forcedResponse = recordServerToolCandidateCapabilityFailure(
+							error,
+							attemptedBefore,
+						);
+						if (forcedResponse) {
+							return finishPacing(pacingSlot, forcedResponse);
+						}
+						response = null;
+					} else {
+						await routingAttemptLedger.discardTerminalResponse();
+						throw error;
+					}
 				}
 				upstreamAttempts +=
 					routingAttemptLedger.attemptedCount - attemptedBefore;
@@ -2087,6 +2321,7 @@ async function handleProxyCore(
 			}
 		} else if (
 			deferredModelRoutes.length === 0 &&
+			!hasExhaustedLocalServerToolCapabilityFailures() &&
 			reactivelyDepletedFallbackAccounts.length > 0
 		) {
 			cacheBodyStore.discardStaged(requestMeta.id);
@@ -2102,6 +2337,7 @@ async function handleProxyCore(
 			);
 		} else if (
 			deferredModelRoutes.length === 0 &&
+			!hasExhaustedLocalServerToolCapabilityFailures() &&
 			throttledFallbackAccounts.length > 0
 		) {
 			cacheBodyStore.discardStaged(requestMeta.id);
@@ -2195,6 +2431,7 @@ async function handleProxyCore(
 					routingAttemptLedger,
 					{
 						routeCandidateId: route.candidateId,
+						recomputeServerToolCapability: true,
 						implicitFallbacksEnabled: false,
 						forwardModelUnavailableResponse:
 							i === orderedDeferredModelRoutes.length - 1,
@@ -2205,6 +2442,18 @@ async function handleProxyCore(
 					anthropicDegradedSendState,
 				);
 			} catch (error) {
+				if (error instanceof ServerToolCandidateCapabilityError) {
+					upstreamAttempts +=
+						routingAttemptLedger.attemptedCount - attemptedBefore;
+					const forcedResponse = recordServerToolCandidateCapabilityFailure(
+						error,
+						attemptedBefore,
+					);
+					if (forcedResponse) {
+						return finishPacing(pacingSlot, forcedResponse);
+					}
+					continue;
+				}
 				await routingAttemptLedger.discardTerminalResponse();
 				throw error;
 			} finally {
@@ -2244,6 +2493,18 @@ async function handleProxyCore(
 	const retainedTerminalResponse = await deliverRetainedTerminalResponse();
 	if (retainedTerminalResponse) {
 		return finishPacing(pacingSlot, retainedTerminalResponse);
+	}
+	if (hasExhaustedLocalServerToolCapabilityFailures()) {
+		cacheBodyStore.discardStaged(requestMeta.id);
+		return finishPacing(
+			pacingSlot,
+			createServerToolRoutingErrorResponse(
+				new ServerToolRoutingError({
+					reason: "no_implementation",
+					capabilitySummary: currentServerToolCapabilitySummary(),
+				}),
+			),
+		);
 	}
 
 	if (
