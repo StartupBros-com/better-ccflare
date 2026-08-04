@@ -227,6 +227,7 @@ function createRuntime(
 		anthropicDegradedObservability: observability,
 		degradedOwnerOverlay: ownerOverlay,
 		degradedOwnerShadowOverlay: shadowOwnerOverlay,
+		serverToolReplay: Object.freeze({ status: "disabled" }),
 		dbOps: {
 			getAllAccounts: mock(async () => accounts),
 			getActiveComboForFamily: mock(async () => null),

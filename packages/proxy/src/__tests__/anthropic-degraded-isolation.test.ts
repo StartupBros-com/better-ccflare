@@ -116,6 +116,7 @@ function makeContext(options: {
 		}),
 		degradedOwnerOverlay: new DegradedOwnerOverlay(),
 		degradedOwnerShadowOverlay: new DegradedOwnerOverlay(),
+		serverToolReplay: Object.freeze({ status: "disabled" }),
 		dbOps: {
 			getAllAccounts: mock(async () => accounts),
 			getActiveComboForFamily: mock(async () => null),

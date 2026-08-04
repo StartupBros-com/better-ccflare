@@ -7,11 +7,14 @@ import {
 	mock,
 	spyOn,
 } from "bun:test";
+import type { ProviderServerToolCapabilityContext } from "@better-ccflare/providers";
 import type {
 	Account,
 	ComboFamily,
 	ComboRoutingPolicySnapshot,
 	ComboWithSlots,
+	ServerToolCapabilityProof,
+	ServerToolCapabilityTuple,
 } from "@better-ccflare/types";
 import type { ProxyContext } from "../handlers";
 import type { UsageCollector } from "../usage-collector";
@@ -40,6 +43,7 @@ const SONNET = "claude-sonnet-4-5";
 
 const originalFetch = globalThis.fetch;
 const originalOverloadRetry = process.env.CCFLARE_OVERLOAD_RETRY_ENABLED;
+const originalServerToolWebSearch = process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH;
 const cachedUsageAccountIds = new Set<string>();
 let restoreUsageCollector = (): void => {};
 let usageHandleStart = mock(() => undefined);
@@ -51,7 +55,7 @@ function makeAccount(id: string, fallbacks: string[] = [FABLE, OPUS]): Account {
 		name: id,
 		provider: "test-provider" as Account["provider"],
 		api_key: "test-key",
-		refresh_token: null,
+		refresh_token: "",
 		access_token: null,
 		expires_at: null,
 		request_count: 0,
@@ -64,6 +68,7 @@ function makeAccount(id: string, fallbacks: string[] = [FABLE, OPUS]): Account {
 		session_start: null,
 		session_request_count: 0,
 		paused: false,
+		requires_reauth: false,
 		rate_limit_reset: null,
 		rate_limit_status: null,
 		rate_limit_remaining: null,
@@ -189,6 +194,66 @@ function makeRequest(extraHeaders: Record<string, string> = {}): Request {
 			messages: [{ role: "user", content: "hello" }],
 			max_tokens: 16,
 		}),
+	});
+}
+
+function makeServerToolRequest(): Request {
+	return new Request("https://proxy.local/v1/messages", {
+		method: "POST",
+		headers: {
+			"content-type": "application/json",
+			"anthropic-version": "2023-06-01",
+		},
+		body: JSON.stringify({
+			model: FABLE,
+			messages: [{ role: "user", content: "hello" }],
+			max_tokens: 16,
+			stream: false,
+			tools: [{ type: "web_search_20250305", name: "web_search" }],
+		}),
+	});
+}
+
+function makeServerToolTuple(
+	context: ProviderServerToolCapabilityContext,
+): ServerToolCapabilityTuple {
+	return {
+		candidateId: context.candidateId,
+		provider: context.account.provider,
+		authMode: "api-key",
+		endpointClass: "test-messages",
+		normalizedEndpoint: "https://upstream.test/v1/messages",
+		model: context.physicalModel,
+		toolType: context.requirements.declarations?.[0]?.type ?? "unknown",
+		profile: context.requirements.profileId ?? "unknown",
+		inputReplay: context.requirements.replay.input,
+		outputReplay: ["native-Anthropic"],
+		providerContractRevision: "model-first-test-v1",
+		replayDecoderRevision: "server-tool-replay-v1",
+		requestTransport: "test-messages-json",
+		responseTransport: "test-messages-json",
+	};
+}
+
+function makeServerToolProof(
+	tuple: ServerToolCapabilityTuple,
+): ServerToolCapabilityProof {
+	return Object.freeze({
+		revision: `proof:${tuple.candidateId}:${tuple.model}`,
+		tuple,
+		decision: "proven",
+		provenance: "model-first-routing-test-fixture",
+		owner: "proxy-model-first-routing",
+		verifiedAt: "2026-08-04T00:00:00.000Z",
+		revalidateAfter: "2099-01-01T00:00:00.000Z",
+		fixtureRevision: "fixture-v1",
+		contractRevision: tuple.providerContractRevision,
+		revalidationTriggers: Object.freeze([
+			"tuple_change",
+			"contract_change",
+			"decoder_change",
+			"observed_behavior_change",
+		]),
 	});
 }
 
@@ -382,6 +447,7 @@ beforeEach(() => {
 	resetRateLimitProbeGatesForTests();
 	installUsageCollector();
 	process.env.CCFLARE_OVERLOAD_RETRY_ENABLED = "false";
+	process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH = "1";
 });
 
 afterEach(() => {
@@ -395,6 +461,11 @@ afterEach(() => {
 		delete process.env.CCFLARE_OVERLOAD_RETRY_ENABLED;
 	} else {
 		process.env.CCFLARE_OVERLOAD_RETRY_ENABLED = originalOverloadRetry;
+	}
+	if (originalServerToolWebSearch === undefined) {
+		delete process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH;
+	} else {
+		process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH = originalServerToolWebSearch;
 	}
 });
 
@@ -1065,6 +1136,107 @@ describe("global model-first routing", () => {
 			{ account: healthy.id, model: FABLE },
 			{ account: blocked.id, model: OPUS },
 		]);
+	});
+
+	it("runs only the exact proven Opus tail when a server-tool Fable route is capacity-blocked", async () => {
+		const blocked = makeAccount("server-tool-capacity-tail");
+		const ctx = makeContext([blocked], makeCombo({ account: blocked }));
+		ctx.dbOps.getComboRoutingPolicy = mock(async (family: ComboFamily) =>
+			makeRoutingPolicy(null, family),
+		);
+		ctx.provider.name = blocked.provider;
+		ctx.provider.getLogicalModelCapability = () => ({
+			status: "supported",
+			provenance: "native_passthrough",
+			reason: "included",
+		});
+		const observedTuples: ServerToolCapabilityTuple[] = [];
+		const observedProofs: ServerToolCapabilityProof[] = [];
+		ctx.provider.createServerToolCapabilityTuple = (context) => {
+			const tuple = makeServerToolTuple(context);
+			observedTuples.push(tuple);
+			return tuple;
+		};
+		ctx.provider.resolveServerToolCapability = (_requirements, tuple) => {
+			const proof = makeServerToolProof(tuple);
+			observedProofs.push(proof);
+			return { decision: "proven", proof };
+		};
+		cacheCurrentFableExhaustion(blocked.id);
+		const attempts = installFetch(() => success());
+
+		const response = await run(ctx, makeServerToolRequest());
+
+		const deferredCandidateId = `capacity-deferred:${encodeURIComponent(
+			blocked.id,
+		)}:${encodeURIComponent(OPUS)}`;
+		const deferredTuples = observedTuples.filter(
+			(tuple) => tuple.model === OPUS,
+		);
+		const deferredProofs = observedProofs.filter(
+			(proof) => proof.tuple.model === OPUS,
+		);
+		expect(response.status).toBe(200);
+		expect(attempts).toEqual([{ account: blocked.id, model: OPUS }]);
+		expect(deferredTuples.length).toBeGreaterThan(0);
+		expect(new Set(deferredTuples.map((tuple) => tuple.candidateId))).toEqual(
+			new Set([deferredCandidateId]),
+		);
+		expect(deferredProofs.length).toBeGreaterThan(0);
+		expect(new Set(deferredProofs.map((proof) => proof.revision))).toEqual(
+			new Set([`proof:${deferredCandidateId}:${OPUS}`]),
+		);
+	});
+
+	it("returns a capability terminal when the only deferred server-tool proof drifts before transport", async () => {
+		const blocked = makeAccount("server-tool-drifted-capacity-tail");
+		const ctx = makeContext([blocked], makeCombo({ account: blocked }));
+		ctx.dbOps.getComboRoutingPolicy = mock(async (family: ComboFamily) =>
+			makeRoutingPolicy(null, family),
+		);
+		ctx.provider.name = blocked.provider;
+		ctx.provider.getLogicalModelCapability = () => ({
+			status: "supported",
+			provenance: "native_passthrough",
+			reason: "included",
+		});
+		const resolutionCounts = new Map<string, number>();
+		ctx.provider.createServerToolCapabilityTuple = makeServerToolTuple;
+		ctx.provider.resolveServerToolCapability = (_requirements, tuple) => {
+			const count = (resolutionCounts.get(tuple.candidateId) ?? 0) + 1;
+			resolutionCounts.set(tuple.candidateId, count);
+			if (tuple.model === OPUS && count > 1) {
+				return { decision: "unknown", reason: "no_exact_proof" };
+			}
+			return { decision: "proven", proof: makeServerToolProof(tuple) };
+		};
+		cacheCurrentFableExhaustion(blocked.id);
+		const attempts = installFetch(() => success());
+
+		const response = await run(ctx, makeServerToolRequest());
+		const body = (await response.json()) as {
+			error: {
+				code: string;
+				reason: string;
+				capability: Record<string, number>;
+			};
+		};
+		const deferredCandidateId = `capacity-deferred:${encodeURIComponent(
+			blocked.id,
+		)}:${encodeURIComponent(OPUS)}`;
+
+		expect(response.status).toBe(503);
+		expect(body.error).toMatchObject({
+			code: "server_tool_capability_unavailable",
+			reason: "no_implementation",
+			capability: {
+				provenCandidateCount: 1,
+				unknownCandidateCount: 1,
+				eligibleCandidateCount: 0,
+			},
+		});
+		expect(attempts).toEqual([]);
+		expect(resolutionCounts.get(deferredCandidateId)).toBe(2);
 	});
 
 	it("orders deferred families by their minimum configured fallback rank", async () => {

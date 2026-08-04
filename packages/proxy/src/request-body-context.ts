@@ -1,3 +1,6 @@
+import { deriveServerToolRequirement } from "@better-ccflare/providers/server-tool-capabilities";
+import type { ServerToolRequirements } from "@better-ccflare/types";
+
 export type RequestJsonBody = Record<string, unknown>;
 
 const decoder = new TextDecoder();
@@ -20,6 +23,16 @@ export class RequestBodyContext {
 	private parseAttempted = false;
 	private parseFailed = false;
 	private dirty = false;
+	private serverToolRequirementsFinalized = false;
+	private serverToolRequirements: ServerToolRequirements | undefined;
+
+	private assertServerToolRequirementsMutable(): void {
+		if (this.serverToolRequirementsFinalized) {
+			throw new Error(
+				"RequestBodyContext server-tool requirements are finalized",
+			);
+		}
+	}
 
 	constructor(buffer: ArrayBuffer | null) {
 		this.originalBuffer = buffer;
@@ -88,7 +101,24 @@ export class RequestBodyContext {
 		return typeof model === "string" ? model : null;
 	}
 
+	/**
+	 * Derive capability metadata once from this context's already-cached final
+	 * parsed body. Callers must invoke this only after all interception is done.
+	 */
+	finalizeServerToolRequirements(): ServerToolRequirements | undefined {
+		if (this.serverToolRequirementsFinalized) {
+			return this.serverToolRequirements;
+		}
+		const parsedBody = this.getParsedJson();
+		this.serverToolRequirements = deriveServerToolRequirement(parsedBody, {
+			freezeSemanticLayers: true,
+		});
+		this.serverToolRequirementsFinalized = true;
+		return this.serverToolRequirements;
+	}
+
 	setModel(model: string): boolean {
+		this.assertServerToolRequirementsMutable();
 		if (!this.parsedBody) {
 			this.getParsedJson();
 		}
@@ -101,6 +131,7 @@ export class RequestBodyContext {
 
 	/** Mutate the parsed body in-place via callback and mark dirty. */
 	mutateParsedJson(fn: (body: RequestJsonBody) => void): boolean {
+		this.assertServerToolRequirementsMutable();
 		const body =
 			this.parsedBody ?? (this.getParsedJson() as RequestJsonBody | null);
 		if (!body) return false;
@@ -110,6 +141,7 @@ export class RequestBodyContext {
 	}
 
 	markDirty(): void {
+		this.assertServerToolRequirementsMutable();
 		this.dirty = true;
 	}
 

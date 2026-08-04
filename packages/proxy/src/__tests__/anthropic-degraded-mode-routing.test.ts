@@ -130,6 +130,7 @@ function makeContext(
 		}),
 		degradedOwnerOverlay: new DegradedOwnerOverlay(),
 		degradedOwnerShadowOverlay: new DegradedOwnerOverlay(),
+		serverToolReplay: Object.freeze({ status: "disabled" }),
 		dbOps: {
 			markAccountRateLimited: mock(async () => ({
 				consecutiveRateLimits: 1,

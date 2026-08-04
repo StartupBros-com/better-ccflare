@@ -1,7 +1,17 @@
 import { Buffer } from "node:buffer";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import {
+	closeSync,
+	existsSync,
+	constants as fsConstants,
+	fstatSync,
+	mkdirSync,
+	openSync,
+	readFileSync,
+	readSync,
+	writeFileSync,
+} from "node:fs";
+import { dirname, posix } from "node:path";
 import {
 	DEFAULT_AGENT_MODEL,
 	DEFAULT_STRATEGY,
@@ -27,7 +37,597 @@ const log = new Logger("Config");
 export const GUARD_CORRELATION_SECRET_ENV =
 	"CCFLARE_GUARD_CORRELATION_SECRET" as const;
 
+export const CCFLARE_SERVER_TOOL_REPLAY_KEYS_FILE =
+	"CCFLARE_SERVER_TOOL_REPLAY_KEYS_FILE" as const;
+
 const CANONICAL_32_BYTE_BASE64URL = /^[A-Za-z0-9_-]{43}$/;
+const SAFE_REPLAY_KEY_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+const MAX_SERVER_TOOL_REPLAY_KEYS_BYTES = 64 * 1024;
+const MAX_SERVER_TOOL_REPLAY_JSON_DEPTH = 64;
+// Linux uapi asm-generic/fcntl.h. Node/Bun do not consistently expose O_PATH.
+const LINUX_O_PATH = 0o10000000;
+
+export type ServerToolReplayUsableKey = Readonly<{
+	id: string;
+	status: "active" | "retained";
+	key: ReadonlyArray<number>;
+}>;
+
+export type ServerToolReplayRevokedKey = Readonly<{
+	id: string;
+	status: "revoked";
+}>;
+
+export type ServerToolReplayKey =
+	| ServerToolReplayUsableKey
+	| ServerToolReplayRevokedKey;
+
+export type ServerToolReplayKeysState =
+	| Readonly<{ status: "disabled" }>
+	| Readonly<{
+			status: "unavailable";
+			code: "invalid_replay_key_config";
+	  }>
+	| Readonly<{
+			status: "ready";
+			activeKeyId: string;
+			keys: ReadonlyArray<ServerToolReplayKey>;
+	  }>;
+
+const SERVER_TOOL_REPLAY_KEYS_DISABLED: ServerToolReplayKeysState =
+	Object.freeze({ status: "disabled" });
+const SERVER_TOOL_REPLAY_KEYS_UNAVAILABLE: ServerToolReplayKeysState =
+	Object.freeze({
+		status: "unavailable",
+		code: "invalid_replay_key_config",
+	});
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function hasExactProperties(
+	value: Record<string, unknown>,
+	expected: readonly string[],
+): boolean {
+	const actual = Object.keys(value).sort();
+	return (
+		actual.length === expected.length &&
+		actual.every((property, index) => property === expected[index])
+	);
+}
+
+class StrictJsonScanner {
+	private offset = 0;
+
+	constructor(private readonly source: string) {}
+
+	scan(): boolean {
+		if (!this.parseValue(0)) return false;
+		this.skipWhitespace();
+		return this.offset === this.source.length;
+	}
+
+	private parseValue(depth: number): boolean {
+		this.skipWhitespace();
+		const character = this.source[this.offset];
+		if (character === "{") return this.parseObject(depth);
+		if (character === "[") return this.parseArray(depth);
+		if (character === '"') return this.scanStringLiteral() !== undefined;
+		if (character === "t") return this.consumeLiteral("true");
+		if (character === "f") return this.consumeLiteral("false");
+		if (character === "n") return this.consumeLiteral("null");
+		return this.consumeNumber();
+	}
+
+	private parseObject(depth: number): boolean {
+		if (depth >= MAX_SERVER_TOOL_REPLAY_JSON_DEPTH) return false;
+		this.offset += 1;
+		this.skipWhitespace();
+		if (this.source[this.offset] === "}") {
+			this.offset += 1;
+			return true;
+		}
+
+		const memberNames = new Set<string>();
+		while (this.offset < this.source.length) {
+			const literal = this.scanStringLiteral();
+			if (literal === undefined) return false;
+			let memberName: unknown;
+			try {
+				memberName = JSON.parse(literal) as unknown;
+			} catch {
+				return false;
+			}
+			if (typeof memberName !== "string" || memberNames.has(memberName)) {
+				return false;
+			}
+			memberNames.add(memberName);
+
+			this.skipWhitespace();
+			if (this.source[this.offset] !== ":") return false;
+			this.offset += 1;
+			if (!this.parseValue(depth + 1)) return false;
+			this.skipWhitespace();
+			const delimiter = this.source[this.offset];
+			if (delimiter === "}") {
+				this.offset += 1;
+				return true;
+			}
+			if (delimiter !== ",") return false;
+			this.offset += 1;
+			this.skipWhitespace();
+		}
+		return false;
+	}
+
+	private parseArray(depth: number): boolean {
+		if (depth >= MAX_SERVER_TOOL_REPLAY_JSON_DEPTH) return false;
+		this.offset += 1;
+		this.skipWhitespace();
+		if (this.source[this.offset] === "]") {
+			this.offset += 1;
+			return true;
+		}
+
+		while (this.offset < this.source.length) {
+			if (!this.parseValue(depth + 1)) return false;
+			this.skipWhitespace();
+			const delimiter = this.source[this.offset];
+			if (delimiter === "]") {
+				this.offset += 1;
+				return true;
+			}
+			if (delimiter !== ",") return false;
+			this.offset += 1;
+		}
+		return false;
+	}
+
+	private scanStringLiteral(): string | undefined {
+		if (this.source[this.offset] !== '"') return undefined;
+		const start = this.offset;
+		this.offset += 1;
+		while (this.offset < this.source.length) {
+			const codeUnit = this.source.charCodeAt(this.offset);
+			if (codeUnit === 0x22) {
+				this.offset += 1;
+				return this.source.slice(start, this.offset);
+			}
+			if (codeUnit < 0x20) return undefined;
+			if (codeUnit !== 0x5c) {
+				this.offset += 1;
+				continue;
+			}
+
+			this.offset += 1;
+			const escapeSequence = this.source[this.offset];
+			if (escapeSequence === undefined) return undefined;
+			if ('"\\/bfnrt'.includes(escapeSequence)) {
+				this.offset += 1;
+				continue;
+			}
+			if (escapeSequence !== "u" || !this.hasFourHexDigits(this.offset + 1)) {
+				return undefined;
+			}
+			this.offset += 5;
+		}
+		return undefined;
+	}
+
+	private hasFourHexDigits(start: number): boolean {
+		if (start + 4 > this.source.length) return false;
+		for (let index = start; index < start + 4; index += 1) {
+			const codeUnit = this.source.charCodeAt(index);
+			if (
+				!(
+					(codeUnit >= 0x30 && codeUnit <= 0x39) ||
+					(codeUnit >= 0x41 && codeUnit <= 0x46) ||
+					(codeUnit >= 0x61 && codeUnit <= 0x66)
+				)
+			) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	private consumeLiteral(literal: "true" | "false" | "null"): boolean {
+		if (!this.source.startsWith(literal, this.offset)) return false;
+		this.offset += literal.length;
+		return true;
+	}
+
+	private consumeNumber(): boolean {
+		const start = this.offset;
+		if (this.source[this.offset] === "-") this.offset += 1;
+
+		if (this.source[this.offset] === "0") {
+			this.offset += 1;
+			if (this.isDigitAt(this.offset)) {
+				this.offset = start;
+				return false;
+			}
+		} else if (this.isNonZeroDigitAt(this.offset)) {
+			this.offset += 1;
+			while (this.isDigitAt(this.offset)) this.offset += 1;
+		} else {
+			this.offset = start;
+			return false;
+		}
+
+		if (this.source[this.offset] === ".") {
+			this.offset += 1;
+			if (!this.isDigitAt(this.offset)) {
+				this.offset = start;
+				return false;
+			}
+			while (this.isDigitAt(this.offset)) this.offset += 1;
+		}
+
+		const exponent = this.source[this.offset];
+		if (exponent === "e" || exponent === "E") {
+			this.offset += 1;
+			const sign = this.source[this.offset];
+			if (sign === "+" || sign === "-") this.offset += 1;
+			if (!this.isDigitAt(this.offset)) {
+				this.offset = start;
+				return false;
+			}
+			while (this.isDigitAt(this.offset)) this.offset += 1;
+		}
+
+		return true;
+	}
+
+	private isDigitAt(offset: number): boolean {
+		const codeUnit = this.source.charCodeAt(offset);
+		return codeUnit >= 0x30 && codeUnit <= 0x39;
+	}
+
+	private isNonZeroDigitAt(offset: number): boolean {
+		const codeUnit = this.source.charCodeAt(offset);
+		return codeUnit >= 0x31 && codeUnit <= 0x39;
+	}
+
+	private skipWhitespace(): void {
+		while (this.offset < this.source.length) {
+			const codeUnit = this.source.charCodeAt(this.offset);
+			if (
+				codeUnit !== 0x20 &&
+				codeUnit !== 0x09 &&
+				codeUnit !== 0x0a &&
+				codeUnit !== 0x0d
+			) {
+				return;
+			}
+			this.offset += 1;
+		}
+	}
+}
+
+function isStrictJsonDocument(source: string): boolean {
+	return new StrictJsonScanner(source).scan();
+}
+
+function decodeReplayKey(value: unknown): ReadonlyArray<number> | undefined {
+	if (typeof value !== "string" || !CANONICAL_32_BYTE_BASE64URL.test(value)) {
+		return undefined;
+	}
+	const decoded = Buffer.from(value, "base64url");
+	try {
+		if (decoded.byteLength !== 32 || decoded.toString("base64url") !== value) {
+			return undefined;
+		}
+		return Object.freeze([...decoded]);
+	} finally {
+		decoded.fill(0);
+	}
+}
+
+function parseServerToolReplayKeys(
+	value: unknown,
+): ServerToolReplayKeysState | undefined {
+	if (
+		!isRecord(value) ||
+		!hasExactProperties(value, ["activeKeyId", "keys", "version"]) ||
+		value.version !== 1 ||
+		typeof value.activeKeyId !== "string" ||
+		!SAFE_REPLAY_KEY_ID.test(value.activeKeyId) ||
+		!Array.isArray(value.keys)
+	) {
+		return undefined;
+	}
+
+	const seenIds = new Set<string>();
+	const seenUsableKeyMaterial = new Set<string>();
+	const keys: ServerToolReplayKey[] = [];
+	let activeRecords = 0;
+	for (const candidate of value.keys) {
+		if (
+			!isRecord(candidate) ||
+			typeof candidate.id !== "string" ||
+			!SAFE_REPLAY_KEY_ID.test(candidate.id) ||
+			seenIds.has(candidate.id) ||
+			(candidate.status !== "active" &&
+				candidate.status !== "retained" &&
+				candidate.status !== "revoked")
+		) {
+			return undefined;
+		}
+		seenIds.add(candidate.id);
+
+		if (candidate.status === "revoked") {
+			if (!hasExactProperties(candidate, ["id", "status"])) return undefined;
+			keys.push(Object.freeze({ id: candidate.id, status: "revoked" }));
+			continue;
+		}
+
+		if (!hasExactProperties(candidate, ["id", "key", "status"])) {
+			return undefined;
+		}
+		const encodedKey = candidate.key;
+		const key = decodeReplayKey(encodedKey);
+		if (
+			!key ||
+			typeof encodedKey !== "string" ||
+			seenUsableKeyMaterial.has(encodedKey)
+		) {
+			return undefined;
+		}
+		seenUsableKeyMaterial.add(encodedKey);
+		if (candidate.status === "active") activeRecords += 1;
+		keys.push(
+			Object.freeze({ id: candidate.id, status: candidate.status, key }),
+		);
+	}
+
+	if (
+		activeRecords !== 1 ||
+		!keys.some((key) => key.id === value.activeKeyId && key.status === "active")
+	) {
+		return undefined;
+	}
+
+	keys.sort((left, right) =>
+		left.id < right.id ? -1 : left.id > right.id ? 1 : 0,
+	);
+	return Object.freeze({
+		status: "ready",
+		activeKeyId: value.activeKeyId,
+		keys: Object.freeze(keys),
+	});
+}
+
+function replayKeyPathComponents(
+	configuredPath: string,
+): ReadonlyArray<string> | undefined {
+	if (
+		configuredPath.length === 0 ||
+		configuredPath.includes("\0") ||
+		!posix.isAbsolute(configuredPath) ||
+		posix.normalize(configuredPath) !== configuredPath
+	) {
+		return undefined;
+	}
+
+	const components = configuredPath.slice(1).split("/");
+	if (
+		components.length === 0 ||
+		components.some(
+			(component) =>
+				component.length === 0 || component === "." || component === "..",
+		)
+	) {
+		return undefined;
+	}
+	return components;
+}
+
+type ReplayKeyFileSnapshot = Readonly<{
+	dev: bigint;
+	ino: bigint;
+	fileType: bigint;
+	mode: bigint;
+	uid: bigint;
+	nlink: bigint;
+	size: bigint;
+	mtimeNs: bigint;
+	ctimeNs: bigint;
+	isFile: boolean;
+}>;
+
+function replayKeyFileSnapshot(descriptor: number): ReplayKeyFileSnapshot {
+	const stats = fstatSync(descriptor, { bigint: true });
+	return {
+		dev: stats.dev,
+		ino: stats.ino,
+		fileType: stats.mode & BigInt(fsConstants.S_IFMT),
+		mode: stats.mode,
+		uid: stats.uid,
+		nlink: stats.nlink,
+		size: stats.size,
+		mtimeNs: stats.mtimeNs,
+		ctimeNs: stats.ctimeNs,
+		isFile: stats.isFile(),
+	};
+}
+
+function sameReplayKeyFileSnapshot(
+	left: ReplayKeyFileSnapshot,
+	right: ReplayKeyFileSnapshot,
+): boolean {
+	return (
+		left.dev === right.dev &&
+		left.ino === right.ino &&
+		left.fileType === right.fileType &&
+		left.mode === right.mode &&
+		left.uid === right.uid &&
+		left.nlink === right.nlink &&
+		left.size === right.size &&
+		left.mtimeNs === right.mtimeNs &&
+		left.ctimeNs === right.ctimeNs &&
+		left.isFile === right.isFile
+	);
+}
+
+function isProtectedReplayKeyFile(
+	snapshot: ReplayKeyFileSnapshot,
+	effectiveUid: number,
+): boolean {
+	const permissions = Number(snapshot.mode & 0o7777n);
+	return (
+		snapshot.isFile &&
+		snapshot.nlink === 1n &&
+		(permissions === 0o400 || permissions === 0o600) &&
+		snapshot.uid === BigInt(effectiveUid) &&
+		snapshot.size >= 0n &&
+		snapshot.size <= BigInt(MAX_SERVER_TOOL_REPLAY_KEYS_BYTES)
+	);
+}
+
+function openReplayKeyFileFromRoot(
+	components: ReadonlyArray<string>,
+	descriptors: number[],
+): number | undefined {
+	const directoryFlags =
+		fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW;
+	let parentDescriptor = openSync("/", directoryFlags);
+	descriptors.push(parentDescriptor);
+	if (!fstatSync(parentDescriptor).isDirectory()) return undefined;
+
+	for (const component of components.slice(0, -1)) {
+		const descriptor = openSync(
+			`/proc/self/fd/${parentDescriptor}/${component}`,
+			directoryFlags,
+		);
+		descriptors.push(descriptor);
+		if (!fstatSync(descriptor).isDirectory()) return undefined;
+		parentDescriptor = descriptor;
+	}
+
+	const finalComponent = components.at(-1);
+	if (finalComponent === undefined) return undefined;
+	const fileDescriptor = openSync(
+		`/proc/self/fd/${parentDescriptor}/${finalComponent}`,
+		LINUX_O_PATH | fsConstants.O_NOFOLLOW,
+	);
+	descriptors.push(fileDescriptor);
+	return fileDescriptor;
+}
+
+function readBoundedReplayKeyFile(
+	descriptor: number,
+	size: number,
+): string | undefined {
+	const content = Buffer.alloc(size);
+	const overflowProbe = Buffer.alloc(1);
+	try {
+		let offset = 0;
+		while (offset < size) {
+			const bytesRead = readSync(
+				descriptor,
+				content,
+				offset,
+				size - offset,
+				offset,
+			);
+			if (bytesRead === 0) return undefined;
+			offset += bytesRead;
+		}
+
+		if (readSync(descriptor, overflowProbe, 0, 1, size) !== 0) {
+			return undefined;
+		}
+		return content.toString("utf8");
+	} finally {
+		content.fill(0);
+		overflowProbe.fill(0);
+	}
+}
+
+/**
+ * Load the restart-scoped replay keyring without exposing file, parser, or key
+ * details through its failure DTO.
+ */
+export function loadServerToolReplayKeys(
+	env: Record<string, string | undefined> = process.env,
+	platform: NodeJS.Platform = process.platform,
+): ServerToolReplayKeysState {
+	let configuredPath: string | undefined;
+	try {
+		configuredPath = env[CCFLARE_SERVER_TOOL_REPLAY_KEYS_FILE];
+	} catch {
+		return SERVER_TOOL_REPLAY_KEYS_UNAVAILABLE;
+	}
+	if (configuredPath === undefined) return SERVER_TOOL_REPLAY_KEYS_DISABLED;
+	if (platform !== "linux" || process.platform !== "linux") {
+		return SERVER_TOOL_REPLAY_KEYS_UNAVAILABLE;
+	}
+
+	const descriptors: number[] = [];
+	try {
+		const components = replayKeyPathComponents(configuredPath);
+		if (components === undefined) return SERVER_TOOL_REPLAY_KEYS_UNAVAILABLE;
+		if (typeof process.geteuid !== "function") {
+			return SERVER_TOOL_REPLAY_KEYS_UNAVAILABLE;
+		}
+		const effectiveUid = process.geteuid();
+		const pinnedDescriptor = openReplayKeyFileFromRoot(components, descriptors);
+		if (pinnedDescriptor === undefined) {
+			return SERVER_TOOL_REPLAY_KEYS_UNAVAILABLE;
+		}
+		const pinnedBefore = replayKeyFileSnapshot(pinnedDescriptor);
+		// Ancestors may legitimately be root-owned or shared. The O_NOFOLLOW
+		// descriptor walk prevents path substitution; ownership, restrictive mode,
+		// single-link state, and fd pinning are therefore enforced on the secret
+		// file itself instead of imposing a brittle all-ancestors-owner policy.
+		if (!isProtectedReplayKeyFile(pinnedBefore, effectiveUid)) {
+			return SERVER_TOOL_REPLAY_KEYS_UNAVAILABLE;
+		}
+
+		// This proc link refers only to the already validated O_PATH descriptor.
+		// Non-regular payloads never reach this read-capable open.
+		const readDescriptor = openSync(
+			`/proc/self/fd/${pinnedDescriptor}`,
+			fsConstants.O_RDONLY,
+		);
+		descriptors.push(readDescriptor);
+		const readBefore = replayKeyFileSnapshot(readDescriptor);
+		if (!sameReplayKeyFileSnapshot(pinnedBefore, readBefore)) {
+			return SERVER_TOOL_REPLAY_KEYS_UNAVAILABLE;
+		}
+
+		const contents = readBoundedReplayKeyFile(
+			readDescriptor,
+			Number(pinnedBefore.size),
+		);
+		if (contents === undefined) return SERVER_TOOL_REPLAY_KEYS_UNAVAILABLE;
+		const readAfter = replayKeyFileSnapshot(readDescriptor);
+		const pinnedAfter = replayKeyFileSnapshot(pinnedDescriptor);
+		if (
+			!sameReplayKeyFileSnapshot(pinnedBefore, readAfter) ||
+			!sameReplayKeyFileSnapshot(pinnedBefore, pinnedAfter) ||
+			!isStrictJsonDocument(contents)
+		) {
+			return SERVER_TOOL_REPLAY_KEYS_UNAVAILABLE;
+		}
+		const parsed = JSON.parse(contents) as unknown;
+		return (
+			parseServerToolReplayKeys(parsed) ?? SERVER_TOOL_REPLAY_KEYS_UNAVAILABLE
+		);
+	} catch {
+		return SERVER_TOOL_REPLAY_KEYS_UNAVAILABLE;
+	} finally {
+		for (let index = descriptors.length - 1; index >= 0; index -= 1) {
+			try {
+				closeSync(descriptors[index] as number);
+			} catch {
+				// The public loader remains detail-free even if descriptor cleanup fails.
+			}
+		}
+	}
+}
 
 export function readGuardCorrelationSecret(
 	env: Record<string, string | undefined> = process.env,
@@ -1173,3 +1773,7 @@ export class Config extends EventEmitter {
 export type { StrategyName } from "@better-ccflare/core";
 export { resolveConfigPath } from "./paths";
 export { getLegacyConfigDir, getPlatformConfigDir } from "./paths-common";
+export {
+	CCFLARE_SERVER_TOOL_WEB_SEARCH_ENV,
+	isServerToolWebSearchEnabled,
+} from "./server-tool-web-search";

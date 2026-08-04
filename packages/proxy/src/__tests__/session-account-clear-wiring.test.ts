@@ -53,6 +53,7 @@ function makeAccount(overrides: Partial<Account> = {}): Account {
 		session_start: null,
 		session_request_count: 0,
 		paused: false,
+		requires_reauth: false,
 		rate_limit_reset: null,
 		rate_limit_status: null,
 		rate_limit_remaining: null,
@@ -127,7 +128,38 @@ function makeRequest(extraHeaders: Record<string, string> = {}): Request {
 	});
 }
 
+function makeServerToolRequest(
+	type: string,
+	options: { invalid?: boolean } = {},
+): Request {
+	return new Request("https://proxy.local/v1/messages", {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json",
+			"X-Claude-Code-Session-Id": SESSION_ID,
+		},
+		body: JSON.stringify({
+			model: "claude-sonnet-4-5",
+			messages: [{ role: "user", content: "hello" }],
+			max_tokens: 16,
+			tools: [
+				{
+					type,
+					name: "web_search",
+					...(options.invalid
+						? {
+								allowed_domains: ["example.com"],
+								blocked_domains: ["blocked.example"],
+							}
+						: {}),
+				},
+			],
+		}),
+	});
+}
+
 let savedPassthrough: string | undefined;
+let savedServerToolWebSearch: string | undefined;
 let restoreUsageCollector = (): void => {};
 
 beforeEach(() => {
@@ -149,7 +181,9 @@ beforeEach(() => {
 		optionalCollectorSpy.mockRestore();
 	};
 	savedPassthrough = process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
+	savedServerToolWebSearch = process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH;
 	delete process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
+	process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH = "1";
 	SESSION_ID = `clear-wiring-session-${++sessionCounter}`;
 	// Seed a stale association (from an OLDER request, version 1) so each exit's
 	// clear — stamped with the current request's later timestamp — supersedes it.
@@ -166,9 +200,44 @@ afterEach(() => {
 	} else {
 		process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL = savedPassthrough;
 	}
+	if (savedServerToolWebSearch === undefined) {
+		delete process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH;
+	} else {
+		process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH = savedServerToolWebSearch;
+	}
 });
 
 describe("KTD-5: clearSession on no-account-served exits", () => {
+	it("clears on a locally rejected invalid server-tool requirement", async () => {
+		expect(getServedAccount(SESSION_ID)).toBe("stale-account");
+		const request = makeServerToolRequest("web_search_20250305", {
+			invalid: true,
+		});
+
+		const response = await handleProxy(
+			request,
+			new URL(request.url),
+			makeContext([makeAccount()]),
+		);
+
+		expect(response.status).toBe(400);
+		expect(getServedAccount(SESSION_ID)).toBeUndefined();
+	});
+
+	it("clears on a locally rejected unsupported server-tool requirement", async () => {
+		expect(getServedAccount(SESSION_ID)).toBe("stale-account");
+		const request = makeServerToolRequest("computer_20241022");
+
+		const response = await handleProxy(
+			request,
+			new URL(request.url),
+			makeContext([makeAccount()]),
+		);
+
+		expect(response.status).toBe(400);
+		expect(getServedAccount(SESSION_ID)).toBeUndefined();
+	});
+
 	it("clears on the no-accounts 503 pool-exhausted exit", async () => {
 		expect(getServedAccount(SESSION_ID)).toBe("stale-account");
 

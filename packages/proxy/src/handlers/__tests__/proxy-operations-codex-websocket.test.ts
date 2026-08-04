@@ -12,6 +12,10 @@ import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CODEX_LOGICAL_MODEL_FAMILY_HEADER } from "@better-ccflare/http-common";
+import type {
+	ProviderAttemptPlan,
+	ProviderAttemptPlanContext,
+} from "@better-ccflare/providers";
 import type { Account, RequestMeta } from "@better-ccflare/types";
 import { CACHE_REPLAY_MODEL_HEADER } from "../../cache-transport-staging";
 import {
@@ -32,6 +36,7 @@ mock.module("@better-ccflare/database", () => ({
 
 const usageCollectorModule = await import("../../usage-collector");
 const {
+	getProvider,
 	isCodexExplicitCacheBreakpointSuppressed,
 	resetCodexExplicitBreakpointSuppressionsForTest,
 } = await import("@better-ccflare/providers");
@@ -60,6 +65,7 @@ function makeCodexAccount(overrides: Partial<Account> = {}): Account {
 		session_start: null,
 		session_request_count: 0,
 		paused: false,
+		requires_reauth: false,
 		rate_limit_reset: null,
 		rate_limit_status: null,
 		rate_limit_remaining: null,
@@ -232,6 +238,77 @@ function installUsageCollector(): void {
 	} as never);
 }
 
+function installCountingCodexAttemptPlanner(
+	onPlan: (context: ProviderAttemptPlanContext) => void,
+): () => void {
+	const provider = getProvider("codex");
+	if (!provider) throw new Error("Codex provider is not registered");
+	const originalCreateAttemptPlan = provider.createAttemptPlan;
+	provider.createAttemptPlan = (context) => {
+		onPlan(context);
+		const candidate: ProviderAttemptPlan = {
+			providerName: provider.name,
+			targetUrl: provider.buildUrl(
+				context.path,
+				context.query,
+				context.account,
+			),
+			apiFamily: "codex-responses",
+			physicalModel: context.physicalModel,
+			capabilityProofKey: context.capabilityProofKey,
+			inputReplayMode: context.inputReplayMode,
+			outputReplayMode: context.outputReplayMode,
+			dataRetryPolicy: { mode: "none", maxAttempts: 0 },
+			classifyNoExecution: async () => ({
+				decision: "executing_or_ambiguous",
+			}),
+			cacheReplayModelStrategy:
+				provider.cacheReplayModelStrategy ?? "normalized-source",
+			prepareHeaders: (headers, accessToken, apiKey) =>
+				provider.prepareHeaders(headers, accessToken, apiKey),
+			transformRequestBody: (request) =>
+				provider.transformRequestBody
+					? provider.transformRequestBody(request, context.account)
+					: Promise.resolve(request),
+			processResponse: (response, requestHeaders) =>
+				provider.processResponse(response, context.account, requestHeaders),
+			parseRateLimit: (response) => provider.parseRateLimit(response),
+			...(provider.isStreamingResponse
+				? {
+						isStreamingResponse: (response: Response) =>
+							provider.isStreamingResponse?.(response) ?? false,
+					}
+				: {}),
+			...(provider.extractTierInfo
+				? {
+						extractTierInfo: (response: Response) =>
+							provider.extractTierInfo?.(response) ?? Promise.resolve(null),
+					}
+				: {}),
+			...(provider.extractUsageInfo
+				? {
+						extractUsageInfo: (response: Response) =>
+							provider.extractUsageInfo?.(response) ?? Promise.resolve(null),
+					}
+				: {}),
+			...(provider.parseUsage
+				? {
+						parseUsage: (response: Response) =>
+							provider.parseUsage?.(response) ?? Promise.resolve(null),
+					}
+				: {}),
+		};
+		return candidate;
+	};
+	return () => {
+		if (originalCreateAttemptPlan) {
+			provider.createAttemptPlan = originalCreateAttemptPlan;
+		} else {
+			delete provider.createAttemptPlan;
+		}
+	};
+}
+
 async function runProxy(
 	request: Request,
 	body: ArrayBuffer,
@@ -351,6 +428,74 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 				originalAnthropicPrecommitTimeout;
 		}
 		mock.restore();
+	});
+
+	it("keeps ordinary Codex WebSocket success and HTTP fallback behavior on one coherent plan per request", async () => {
+		installUsageCollector();
+		const plannedModels: Array<string | null> = [];
+		const restorePlanner = installCountingCodexAttemptPlanner((context) => {
+			plannedModels.push(context.physicalModel);
+		});
+		let httpCalls = 0;
+		globalThis.fetch = mock(async () => {
+			httpCalls++;
+			return new Response(
+				[
+					'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_http","model":"gpt-5.4"}}\n\n',
+					'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"http"}\n\n',
+					'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_http","model":"gpt-5.4","status":"completed","usage":{"input_tokens":2,"output_tokens":1,"input_tokens_details":{"cached_tokens":0}}}}\n\n',
+					"data: [DONE]\n\n",
+				].join(""),
+				{
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				},
+			);
+		});
+		let websocketCalls = 0;
+		spyOn(codexWebSocketTransport, "tryRequest").mockImplementation(
+			async (input) => {
+				websocketCalls++;
+				if (websocketCalls > 1) return null;
+				const receipt = makeReceipt(() => undefined);
+				input.onFrameWritten(receipt);
+				return {
+					receipt,
+					response: new Response(
+						[
+							'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_ws","model":"gpt-5.4"}}\n\n',
+							'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"ws"}\n\n',
+							'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_ws","model":"gpt-5.4","status":"completed","usage":{"input_tokens":2,"output_tokens":1,"input_tokens_details":{"cached_tokens":0}}}}\n\n',
+							"data: [DONE]\n\n",
+						].join(""),
+						{
+							status: 200,
+							headers: { "content-type": "text/event-stream" },
+						},
+					),
+				};
+			},
+		);
+
+		try {
+			for (const [index, expectedText] of ["ws", "http"].entries()) {
+				const body = makeRequestBody();
+				const response = await runProxy(
+					makeRequest(body),
+					body,
+					makePolicy(1_000),
+					`codex-plan-transport-${index}`,
+				);
+				expect(response?.status).toBe(200);
+				expect(await response?.text()).toContain(expectedText);
+			}
+		} finally {
+			restorePlanner();
+		}
+
+		expect(plannedModels).toEqual(["gpt-5.4", "gpt-5.4"]);
+		expect(websocketCalls).toBe(2);
+		expect(httpCalls).toBe(1);
 	});
 
 	it("passes a compaction-stable sibling-safe identity despite one shared session cache key", async () => {

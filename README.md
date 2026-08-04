@@ -197,6 +197,56 @@ STORE_PAYLOADS=false                   # Disable storing request/response bodies
 - Never commit `.env` files containing sensitive values to version control
 - Use environment-specific configuration for production deployments
 
+#### Server-tool admission and replay key file (Linux operators)
+
+Hosted web-search admission and capability routing remain strictly default-off. Set `CCFLARE_SERVER_TOOL_WEB_SEARCH=1` (the exact string `1`) and restart to opt in; unset or any other value preserves native provider passthrough. `CCFLARE_SERVER_TOOL_REPLAY_KEYS_FILE` prepares the replay readers; it does **not** enable server-tool admission. On Linux, set it to a normalized absolute path whose components are not symlinks. The loader pins each path component by descriptor, while the target must be a regular, single-link file owned by the service process UID with mode `0400` or `0600`; group/world-readable files fail closed. Ancestor ownership is not used as an authorization signal, so use an administrator-controlled directory even though the final-inode checks remain the enforcement boundary. Put only the path in the environment, never key material.
+
+The file is versioned JSON with exactly one `active` record matching `activeKeyId`. `retained` records remain decrypt-only readers during normal rotation, while a `revoked` record names a deliberately unusable key and omits its material. Usable keys are exactly 32 bytes encoded as canonical, unpadded base64url (43 characters). IDs must be stable, unique, and match `[A-Za-z0-9][A-Za-z0-9_-]{0,63}`; decoded key material must also be unique across usable records. Array order never selects the writer because `activeKeyId` does. Duplicate JSON member names fail closed. This template contains fake placeholders and will be rejected until they are replaced with independently generated keys:
+
+```json
+{
+  "version": 1,
+  "activeKeyId": "key-2026-08",
+  "keys": [
+    {
+      "id": "key-2026-08",
+      "status": "active",
+      "key": "<fake-43-character-unpadded-base64url-key>"
+    },
+    {
+      "id": "key-2026-07",
+      "status": "retained",
+      "key": "<fake-43-character-unpadded-base64url-key>"
+    },
+    { "id": "key-compromised", "status": "revoked" }
+  ]
+}
+```
+
+Protect the live file and make a protected backup without printing either file. Restore the backup to a separate regular file, then inspect every path component and verify ownership, mode, link count, and byte equality:
+
+```bash
+replay_file=/etc/better-ccflare/server-tool-replay-keys.json
+backup_file=/secure/offline-backups/server-tool-replay-keys.v1.json
+restore_file=/etc/better-ccflare/server-tool-replay-keys.restore-test.json
+
+sudo chown <service-user>:<service-group> "$replay_file"
+sudo chmod 0600 "$replay_file"
+sudo namei -l "$replay_file"
+sudo stat -Lc 'owner=%U mode=%a links=%h type=%F' "$replay_file"
+sudo install -o root -g root -m 0600 "$replay_file" "$backup_file"
+sudo install -o <service-user> -g <service-group> -m 0600 "$backup_file" "$restore_file"
+sudo namei -l "$restore_file"
+sudo stat -Lc 'owner=%U mode=%a links=%h type=%F' "$restore_file"
+sudo cmp --silent "$replay_file" "$restore_file"
+```
+
+The reader wire contract is the six-segment `bccf2.A256GCM.<kid>.<sloc>.<nonce>.<ciphertext-and-tag>` format. The opaque 16-byte/22-character `<sloc>` is the truncated HMAC-SHA256 of canonical common source identity, using a separately HKDF-derived locator key. Its inputs are protocol/suite, tool, audience, lineage, call, query digest, result state, source ordinal, and ordered source URL/title/nullable page age; citation text/linkage/ordinal, provider/model/fidelity, time, nonce, and wire key ID are excluded so a source and its citations share one locator. History maps `(kid, sloc)` to one exact prior source before its single AES decrypt, including when URL/title values repeat; full authenticated data still binds envelope kind (`source` or `citation`) and exact context, ordering, linkage, and visible evidence. Every old or unknown `bccf*` token is locally invalid and is never forwarded as native Anthropic state. The earlier `bccf1` draft never shipped and writer admission never existed, so carrying a compatibility reader would add ambiguity without preserving any production history.
+
+Before any writer can be enabled, deploy decoder-compatible readers and the identical keyring everywhere with admission off. U2 installs only these readers and keeps writer admission disabled until the later fixture, automated, rollout, and canary gates pass. Validate the restored file in a clean reader, including decoding a pre-rotation envelope. For normal rotation, write and protect a complete new file, atomically rename it into place, and restart; never rewrite the live inode in place. Make the new ID explicitly active, retain the prior key through the documented conversation drain, and keep both old and new decoders during deployment. First rollback disables new admission but leaves replay/history readers and required retained keys in place; never roll back below that decoder-compatible floor. Compromised-key revocation is a separate incident action that may intentionally break affected history.
+
+Writers remain unavailable without trustworthy aggregate, per-key-material fleet issuance telemetry. Key identity and its counter are independent of wire version, so changing the protocol cannot reset the budget for reused AES key bytes. Rotate and stop issuance at `2^31` envelopes per key material and keep the hard operational budget below `2^32`. These are operational limits for probabilistic nonce uniqueness, not an atomic cross-process guarantee.
+
 📖 **See [docs/configuration.md](docs/configuration.md) for the complete list** — overload/rate-limit retry tuning, health endpoint detail, agent discovery, payload encryption at rest, model catalog refresh, PostgreSQL pooling, Codex prompt-cache keys, and more.
 
 ### Using .env Files

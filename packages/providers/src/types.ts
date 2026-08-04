@@ -2,6 +2,10 @@ import type {
 	Account,
 	LogicalModelCapability,
 	RateLimitReason,
+	ServerToolCapabilityDecision,
+	ServerToolCapabilityTuple,
+	ServerToolReplayAtom,
+	ServerToolRequirements,
 } from "@better-ccflare/types";
 
 export interface TokenRefreshResult {
@@ -36,6 +40,139 @@ export interface RateLimitInfo {
  */
 export type CacheReplayModelStrategy = "normalized-source" | "transformed-body";
 
+export interface ProviderUsageInfo {
+	model?: string;
+	promptTokens?: number;
+	completionTokens?: number;
+	totalTokens?: number;
+	costUsd?: number;
+	inputTokens?: number;
+	cacheReadInputTokens?: number;
+	cacheCreationInputTokens?: number;
+	outputTokens?: number;
+}
+
+export interface ProviderAttemptPlanContext {
+	readonly request: Request;
+	readonly requestBodyBuffer: ArrayBuffer | null;
+	readonly account: Account;
+	readonly path: string;
+	readonly query: string;
+	readonly physicalModel: string | null;
+	readonly capabilityProofKey: string | null;
+	readonly inputReplayMode: readonly ServerToolReplayAtom[];
+	readonly outputReplayMode: readonly ServerToolReplayAtom[];
+}
+
+/**
+ * Pure request-local inputs from which a provider may describe one exact
+ * server-tool capability tuple. The contract intentionally excludes Request,
+ * message content, client-function schemas, credentials I/O, and transport
+ * execution state.
+ */
+export interface ProviderServerToolCapabilityAccountContext {
+	readonly provider: string;
+	readonly apiKeyConfigured: boolean;
+	readonly refreshTokenConfigured: boolean;
+	readonly accessTokenConfigured: boolean;
+	readonly legacyMirroredApiKey: boolean;
+	readonly customEndpoint: string | null;
+	readonly customEndpointConfigured: boolean;
+	readonly unsafeCustomEndpoint: boolean;
+	readonly crossRegionMode: string | null;
+	readonly billingType: string | null;
+}
+
+export type ProviderServerToolCapabilityRouteClass =
+	| "anthropic_messages"
+	| "openai_chat_completions"
+	| "openai_responses"
+	| "other";
+
+/**
+ * Bounded semantic route data. Raw request paths and query strings can contain
+ * credentials, so capability factories receive only this closed descriptor.
+ */
+export interface ProviderServerToolCapabilityEndpointContract {
+	readonly routeClass: ProviderServerToolCapabilityRouteClass;
+	readonly queryPresent: boolean;
+}
+
+/** The non-secret immutable context visible to a provider capability factory. */
+export interface ProviderServerToolCapabilityContext {
+	readonly candidateId: string;
+	readonly account: ProviderServerToolCapabilityAccountContext;
+	readonly endpointContract: ProviderServerToolCapabilityEndpointContract;
+	readonly physicalModel: string;
+	readonly requirements: ServerToolRequirements;
+}
+
+/** Proxy-side inputs accepted by the capability materializer. */
+export interface ProviderServerToolCapabilityMaterializationContext {
+	readonly candidateId: string;
+	readonly account: Account;
+	readonly path: string;
+	readonly query: string;
+	readonly physicalModel: string;
+	readonly requirements: ServerToolRequirements;
+}
+
+export type ProviderAttemptDataRetryPolicy =
+	| Readonly<{ mode: "none"; maxAttempts: 0 }>
+	| Readonly<{ mode: "reuse-same-plan"; maxAttempts: number }>;
+
+export type ProviderAttemptNoExecutionDecision =
+	| Readonly<{ decision: "proven_no_execution"; reason: string }>
+	| Readonly<{ decision: "executing_or_ambiguous" }>;
+
+declare const providerAttemptNoExecutionSnapshotBrand: unique symbol;
+
+/** Canonical bounded response metadata safe for provider classification. */
+export interface ProviderAttemptNoExecutionSnapshot {
+	readonly status: number;
+	readonly headers: readonly (readonly [name: string, value: string])[];
+	readonly bodyText: string;
+	readonly bodyTruncated: boolean;
+	readonly [providerAttemptNoExecutionSnapshotBrand]: true;
+}
+
+export interface ProviderAttemptPlan {
+	readonly providerName: string;
+	readonly targetUrl: string;
+	readonly apiFamily: string;
+	readonly physicalModel: string | null;
+	readonly capabilityProofKey: string | null;
+	readonly inputReplayMode: readonly ServerToolReplayAtom[];
+	readonly outputReplayMode: readonly ServerToolReplayAtom[];
+	readonly dataRetryPolicy: ProviderAttemptDataRetryPolicy;
+	readonly classifyNoExecution: (
+		snapshot: ProviderAttemptNoExecutionSnapshot,
+	) => Promise<ProviderAttemptNoExecutionDecision>;
+	readonly cacheReplayModelStrategy: CacheReplayModelStrategy;
+	readonly prepareHeaders: (
+		headers: Headers,
+		accessToken?: string,
+		apiKey?: string,
+	) => Headers;
+	readonly transformRequestBody: (request: Request) => Promise<Request>;
+	readonly processResponse: (
+		response: Response,
+		requestHeaders?: Headers,
+	) => Promise<Response>;
+	readonly parseRateLimit: (response: Response) => RateLimitInfo;
+	readonly parseRateLimitFromBody?: (
+		response: Response,
+	) => Promise<number | undefined>;
+	readonly isStreamingResponse?: (response: Response) => boolean;
+	readonly extractTierInfo?: (response: Response) => Promise<number | null>;
+	readonly extractUsageInfo?: (
+		response: Response,
+	) => Promise<ProviderUsageInfo | null>;
+	readonly parseUsage?: (
+		response: Response,
+	) => Promise<ProviderUsageInfo | null>;
+}
+
 export interface Provider {
 	name: string;
 
@@ -51,6 +188,30 @@ export interface Provider {
 		logicalModel: string,
 		account: Account,
 	): LogicalModelCapability;
+
+	/**
+	 * Pure, network-free support decision for one exact candidate, endpoint,
+	 * model, tool profile, replay shape, and transport contract.
+	 */
+	resolveServerToolCapability?(
+		requirement: ServerToolRequirements,
+		tuple: ServerToolCapabilityTuple,
+	): ServerToolCapabilityDecision;
+
+	/**
+	 * Purely construct the provider-owned exact capability tuple for one
+	 * concrete candidate/model, or return undefined when this provider has no
+	 * declared implementation. This factory is deliberately synchronous.
+	 */
+	createServerToolCapabilityTuple?(
+		context: ProviderServerToolCapabilityContext,
+	): ServerToolCapabilityTuple | undefined;
+
+	/**
+	 * Build one synchronous, request-scoped transport plan after the concrete
+	 * account and physical model have been selected. Async planners are invalid.
+	 */
+	createAttemptPlan?(context: ProviderAttemptPlanContext): ProviderAttemptPlan;
 
 	/**
 	 * Check if this provider can handle the given request path
@@ -96,6 +257,12 @@ export interface Provider {
 	parseRateLimit(response: Response): RateLimitInfo;
 
 	/**
+	 * Optionally recover a provider-specific reset timestamp from a bounded
+	 * response body when headers alone do not contain it.
+	 */
+	parseRateLimitFromBody?(response: Response): Promise<number | undefined>;
+
+	/**
 	 * Process the response before returning to client
 	 */
 	processResponse(
@@ -117,34 +284,14 @@ export interface Provider {
 	/**
 	 * Extract usage information from response if available
 	 */
-	extractUsageInfo?(response: Response): Promise<{
-		model?: string;
-		promptTokens?: number;
-		completionTokens?: number;
-		totalTokens?: number;
-		costUsd?: number;
-		inputTokens?: number;
-		cacheReadInputTokens?: number;
-		cacheCreationInputTokens?: number;
-		outputTokens?: number;
-	} | null>;
+	extractUsageInfo?(response: Response): Promise<ProviderUsageInfo | null>;
 
 	/**
 	 * Parse usage information from streaming SSE response if available
 	 * This is called for streaming responses to extract usage from final SSE events
 	 * Falls back to extractUsageInfo for non-streaming responses
 	 */
-	parseUsage?(response: Response): Promise<{
-		model?: string;
-		promptTokens?: number;
-		completionTokens?: number;
-		totalTokens?: number;
-		costUsd?: number;
-		inputTokens?: number;
-		cacheReadInputTokens?: number;
-		cacheCreationInputTokens?: number;
-		outputTokens?: number;
-	} | null>;
+	parseUsage?(response: Response): Promise<ProviderUsageInfo | null>;
 
 	/**
 	 * Check if the response is a streaming response

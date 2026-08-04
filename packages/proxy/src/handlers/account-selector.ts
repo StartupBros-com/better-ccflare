@@ -1,4 +1,5 @@
 import {
+	getConfiguredModelMapping,
 	getModelFamily,
 	getModelList,
 	isAccountAvailable,
@@ -6,10 +7,15 @@ import {
 	resolveEffectiveComboMembership,
 } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
+import type { Provider } from "@better-ccflare/providers";
 import {
+	buildServerToolCapabilityProofKey,
 	canonicalizeBetaSignature,
 	deriveComboRouteClass,
+	materializeProviderServerToolCapabilityDecision,
+	materializeProviderServerToolCapabilityTuple,
 	resolveAccountLogicalModelCapability,
+	resolveProviderForAccount,
 	usageCache,
 } from "@better-ccflare/providers";
 import type {
@@ -22,12 +28,21 @@ import type {
 	ComboSlotInfo,
 	RequestMeta,
 	RoutingCandidateMetadata,
+	RoutingCandidateServerToolCapability,
+	RoutingCandidateServerToolCapabilityReason,
+	ServerToolCapabilityTuple,
+	ServerToolRoutingCapabilitySummary,
 } from "@better-ccflare/types";
 import { isNativeAnthropicOAuthDegradedModeEligible } from "../anthropic-degraded-eligibility";
 import type {
 	AnthropicDegradedRouteInspection,
 	AnthropicReplayRisk,
 } from "../anthropic-degraded-mode";
+import { evaluateServerToolReplayEligibility } from "../server-tool-replay-eligibility";
+import {
+	ServerToolRoutingError,
+	type ServerToolRoutingErrorReason,
+} from "../server-tool-routing-errors";
 import { buildComboMembershipDiagnostics } from "./managed-routing-diagnostics";
 import type { ProxyContext } from "./proxy-types";
 import {
@@ -85,6 +100,329 @@ function normalCandidateMetadata(
 		modelOverride: model,
 		quotaPressure,
 	};
+}
+
+function capacityDeferredCandidateId(accountId: string, model: string): string {
+	return `capacity-deferred:${encodeURIComponent(accountId)}:${encodeURIComponent(
+		model.trim().toLowerCase(),
+	)}`;
+}
+
+function capacityDeferredCandidateMetadata(
+	account: Account,
+	ordinal: number,
+	model: string,
+): RoutingCandidateMetadata {
+	return {
+		...normalCandidateMetadata(account, ordinal, model),
+		candidateId: capacityDeferredCandidateId(account.id, model),
+	};
+}
+
+function splitRequestTarget(target: string): { path: string; query: string } {
+	const queryIndex = target.indexOf("?");
+	if (queryIndex < 0) return { path: target || "/", query: "" };
+	return {
+		path: target.slice(0, queryIndex) || "/",
+		query: target.slice(queryIndex + 1),
+	};
+}
+
+/**
+ * Preview only physical models already proven by existing pure configuration
+ * seams. Provider defaults intentionally remain unknown until a provider owns
+ * an exact preview contract; guessing here could bind proof to a model transport
+ * later rewrites.
+ */
+function previewCandidatePhysicalModel(
+	account: Account,
+	logicalModel: string,
+	provider: Provider,
+): string | null {
+	const configured = getConfiguredModelMapping(logicalModel, account);
+	if (configured) {
+		const first = configured.models[0];
+		return typeof first === "string" && first.trim().length > 0
+			? first.trim()
+			: null;
+	}
+	try {
+		const capability = provider.getLogicalModelCapability?.(
+			logicalModel,
+			account,
+		);
+		return capability?.status === "supported" &&
+			capability.provenance === "native_passthrough" &&
+			logicalModel.trim().length > 0
+			? logicalModel.trim()
+			: null;
+	} catch {
+		return null;
+	}
+}
+
+function freezeReplayMode<T extends readonly string[]>(mode: T): T {
+	return Object.freeze([...mode]) as unknown as T;
+}
+
+function unknownCandidateCapability(input: {
+	resolvedProvider: string | null;
+	physicalModel: string | null;
+	reason: RoutingCandidateServerToolCapabilityReason;
+	inputReplayMode?: ServerToolCapabilityTuple["inputReplay"];
+	outputReplayMode?: ServerToolCapabilityTuple["outputReplay"];
+}): RoutingCandidateServerToolCapability {
+	return Object.freeze({
+		resolvedProvider: input.resolvedProvider,
+		physicalModel: input.physicalModel,
+		decision: "unknown",
+		reason: input.reason,
+		proofKey: null,
+		inputReplayMode: freezeReplayMode(input.inputReplayMode ?? []),
+		outputReplayMode: freezeReplayMode(input.outputReplayMode ?? []),
+		replayRuntimeStatus: "not_required",
+	});
+}
+
+function validateProviderCapabilityDecision(
+	decision: ReturnType<typeof materializeProviderServerToolCapabilityDecision>,
+	tuple: ServerToolCapabilityTuple,
+	requirements: NonNullable<RequestMeta["serverToolRequirements"]>,
+	ctx: ProxyContext,
+): RoutingCandidateServerToolCapability {
+	const base = {
+		resolvedProvider: tuple.provider,
+		physicalModel: tuple.model,
+		inputReplayMode: tuple.inputReplay,
+		outputReplayMode: tuple.outputReplay,
+	};
+	if (requirements.invalid?.length) {
+		return unknownCandidateCapability({
+			...base,
+			reason: "invalid_requirement",
+		});
+	}
+	if (requirements.unsupported?.length) {
+		return unknownCandidateCapability({
+			...base,
+			reason: "unsupported_requirement",
+		});
+	}
+	if (decision.decision === "unknown") {
+		return unknownCandidateCapability({
+			...base,
+			reason: decision.reason,
+		});
+	}
+	const proof = decision.proof;
+	const proofKey = buildServerToolCapabilityProofKey(proof.revision, tuple);
+	if (proofKey === undefined)
+		throw new TypeError("Invalid capability proof key");
+	const runtimeStatus =
+		decision.decision === "proven"
+			? evaluateServerToolReplayEligibility(
+					requirements,
+					tuple.inputReplay,
+					tuple.outputReplay,
+					ctx.serverToolReplay,
+				).status
+			: "not_required";
+	return Object.freeze({
+		resolvedProvider: tuple.provider,
+		physicalModel: tuple.model,
+		decision: decision.decision,
+		reason: null,
+		proofKey,
+		inputReplayMode: freezeReplayMode(tuple.inputReplay),
+		outputReplayMode: freezeReplayMode(tuple.outputReplay),
+		replayRuntimeStatus: runtimeStatus,
+	});
+}
+
+function evaluateCandidateServerToolCapability(input: {
+	account: Account;
+	routing: RoutingCandidateMetadata;
+	logicalModel: string | null;
+	physicalModel?: string;
+	meta: RequestMeta;
+	ctx: ProxyContext;
+}): RoutingCandidateServerToolCapability | undefined {
+	const requirements = input.meta.serverToolRequirements;
+	if (!requirements) return undefined;
+	const provider = resolveProviderForAccount(
+		input.account.provider,
+		input.ctx.provider,
+	);
+	if (!provider) {
+		return unknownCandidateCapability({
+			resolvedProvider: null,
+			physicalModel: null,
+			reason: "provider_unavailable",
+		});
+	}
+	if (!input.logicalModel) {
+		return unknownCandidateCapability({
+			resolvedProvider: input.account.provider,
+			physicalModel: null,
+			reason: "physical_model_unavailable",
+		});
+	}
+	const physicalModel =
+		input.physicalModel ??
+		previewCandidatePhysicalModel(input.account, input.logicalModel, provider);
+	if (!physicalModel) {
+		return unknownCandidateCapability({
+			resolvedProvider: input.account.provider,
+			physicalModel: null,
+			reason: "physical_model_unavailable",
+		});
+	}
+	const requestTarget = splitRequestTarget(input.meta.path);
+	const capabilityQuery =
+		requestTarget.query.length > 0
+			? requestTarget.query
+			: input.meta.serverToolQueryPresent === true
+				? "present"
+				: "";
+	let tuple: ServerToolCapabilityTuple | undefined;
+	try {
+		tuple = materializeProviderServerToolCapabilityTuple(provider, {
+			candidateId: input.routing.candidateId,
+			account: input.account,
+			path: requestTarget.path,
+			query: capabilityQuery,
+			physicalModel,
+			requirements,
+		});
+	} catch {
+		return unknownCandidateCapability({
+			resolvedProvider: input.account.provider,
+			physicalModel,
+			reason: "tuple_unavailable",
+		});
+	}
+	if (!tuple) {
+		return unknownCandidateCapability({
+			resolvedProvider: input.account.provider,
+			physicalModel,
+			reason: "tuple_unavailable",
+		});
+	}
+	try {
+		const decision = materializeProviderServerToolCapabilityDecision(
+			provider,
+			requirements,
+			tuple,
+		);
+		return validateProviderCapabilityDecision(
+			decision,
+			tuple,
+			requirements,
+			input.ctx,
+		);
+	} catch {
+		return unknownCandidateCapability({
+			resolvedProvider: tuple.provider,
+			physicalModel,
+			reason: "invalid_resolver_result",
+			inputReplayMode: tuple.inputReplay,
+			outputReplayMode: tuple.outputReplay,
+		});
+	}
+}
+
+function isServerToolCandidateSemanticallyEligible(
+	candidate: RoutingCandidateMetadata,
+): boolean {
+	const capability = candidate.serverToolCapability;
+	return (
+		capability?.decision === "proven" &&
+		capability.proofKey !== null &&
+		(capability.replayRuntimeStatus === "not_required" ||
+			capability.replayRuntimeStatus === "ready")
+	);
+}
+
+function publishServerToolCapabilitySummary(
+	meta: RequestMeta,
+	catalog: readonly RoutingCandidateMetadata[],
+	transientlyEligibleCandidateIds: ReadonlySet<string>,
+): ServerToolRoutingCapabilitySummary | undefined {
+	if (!meta.serverToolRequirements) {
+		meta.serverToolCapabilitySummary = undefined;
+		return undefined;
+	}
+	let provenCandidateCount = 0;
+	let unsupportedCandidateCount = 0;
+	let unknownCandidateCount = 0;
+	let replayIneligibleCandidateCount = 0;
+	let semanticallyEligibleCandidateCount = 0;
+	for (const candidate of catalog) {
+		const capability = candidate.serverToolCapability;
+		if (capability?.decision === "proven") {
+			provenCandidateCount += 1;
+			if (
+				capability.replayRuntimeStatus === "input_unavailable" ||
+				capability.replayRuntimeStatus === "output_unavailable"
+			) {
+				replayIneligibleCandidateCount += 1;
+			} else {
+				semanticallyEligibleCandidateCount += 1;
+			}
+		} else if (capability?.decision === "unsupported") {
+			unsupportedCandidateCount += 1;
+		} else {
+			unknownCandidateCount += 1;
+		}
+	}
+	const eligibleCandidateCount = transientlyEligibleCandidateIds.size;
+	const summary = Object.freeze({
+		structuralCandidateCount: catalog.length,
+		provenCandidateCount,
+		unsupportedCandidateCount,
+		unknownCandidateCount,
+		replayIneligibleCandidateCount,
+		temporarilyUnavailableProvenCandidateCount: Math.max(
+			0,
+			semanticallyEligibleCandidateCount - eligibleCandidateCount,
+		),
+		eligibleCandidateCount,
+	});
+	meta.serverToolCapabilitySummary = summary;
+	return summary;
+}
+
+function capabilityPoolErrorReason(
+	meta: RequestMeta,
+	summary: ServerToolRoutingCapabilitySummary,
+): ServerToolRoutingErrorReason {
+	if (meta.serverToolRequirements?.invalid?.length)
+		return "invalid_requirement";
+	if (meta.serverToolRequirements?.unsupported?.length)
+		return "unsupported_requirement";
+	if (summary.provenCandidateCount === 0) return "no_implementation";
+	if (summary.provenCandidateCount === summary.replayIneligibleCandidateCount) {
+		return "replay_unavailable";
+	}
+	return "temporary_unavailable";
+}
+
+function throwServerToolCapabilityPoolError(meta: RequestMeta): never {
+	const summary = meta.serverToolCapabilitySummary;
+	if (!summary) {
+		throw new ServerToolRoutingError({ reason: "no_implementation" });
+	}
+	throw new ServerToolRoutingError({
+		reason: capabilityPoolErrorReason(meta, summary),
+		capabilitySummary: summary,
+	});
+}
+
+function serverToolSelectionFailure(meta: RequestMeta): ServerToolRoutingError {
+	return new ServerToolRoutingError({
+		reason: "temporary_unavailable",
+		capabilitySummary: meta.serverToolCapabilitySummary,
+	});
 }
 
 /** Thrown when an explicit one-account route cannot use its target. */
@@ -530,11 +868,80 @@ function saveCapacityContext(
 
 function prepareNormalRoutingMetadata(
 	meta: RequestMeta,
+	ctx: ProxyContext,
 	accounts: Account[],
 	effectiveModel: string | null,
 	syntheticProbe: boolean,
+	priorServerToolCatalog: readonly RoutingCandidateMetadata[] = [],
 ): Account[] {
 	meta.affinityLaneKey = deriveAffinityLaneKey(meta, effectiveModel);
+	if (meta.serverToolRequirements) {
+		const normalCatalog = accounts.map((account, ordinal) => {
+			const routing = normalCandidateMetadata(account, ordinal, effectiveModel);
+			routing.serverToolCapability = evaluateCandidateServerToolCapability({
+				account,
+				routing,
+				logicalModel: effectiveModel,
+				meta,
+				ctx,
+			});
+			return routing;
+		});
+		const now = Date.now();
+		const beta = canonicalizeBetaSignature(meta.headers?.get("anthropic-beta"));
+		const preliminaryExcludedIds = new Set<string>();
+		const preliminaryQuotaPressure = new Map<string, AccountQuotaPressure>();
+		const preliminaryExclusions: RoutingCapacityCandidateExclusion[] = [];
+		const eligibleAccounts: Account[] = [];
+		const eligibleCandidateIds = new Set<string>();
+		for (const [ordinal, account] of accounts.entries()) {
+			const candidate = normalCatalog[ordinal];
+			if (!candidate || !isServerToolCandidateSemanticallyEligible(candidate)) {
+				continue;
+			}
+			// Preserve pressure ordering and degraded-owner inspection without
+			// publishing a route. SessionStrategy still receives every proven
+			// candidate so only its reset-qualified path can reactivate a pause;
+			// availability and capacity are authoritatively rechecked afterward.
+			if (effectiveModel) {
+				const evaluation = evaluateCandidateCapacity(
+					account,
+					effectiveModel,
+					beta,
+					now,
+					syntheticProbe,
+				);
+				candidate.quotaPressure = evaluation.quotaPressure;
+				if (evaluation.quotaPressure) {
+					preliminaryQuotaPressure.set(account.id, evaluation.quotaPressure);
+				}
+				if (evaluation.blockers.length > 0) {
+					preliminaryExcludedIds.add(account.id);
+					preliminaryExclusions.push(
+						candidateExclusion(account, effectiveModel, evaluation, "normal"),
+					);
+				}
+			}
+			eligibleAccounts.push(account);
+			eligibleCandidateIds.add(candidate.candidateId);
+		}
+		const catalog = [...priorServerToolCatalog, ...normalCatalog];
+		meta.hardExcludedAccountIds =
+			preliminaryExcludedIds.size > 0 ? preliminaryExcludedIds : null;
+		meta.quotaPressureByAccountId =
+			preliminaryQuotaPressure.size > 0 ? preliminaryQuotaPressure : null;
+		capacityDeferredModelRoutesMap.set(meta, []);
+		meta.routingCandidateCatalog = catalog;
+		meta.routingCandidates = normalCatalog.filter((candidate) =>
+			eligibleCandidateIds.has(candidate.candidateId),
+		);
+		saveCapacityContext(meta, effectiveModel, preliminaryExclusions);
+		publishServerToolCapabilitySummary(meta, catalog, eligibleCandidateIds);
+		if (eligibleAccounts.length === 0) {
+			throwServerToolCapabilityPoolError(meta);
+		}
+		return eligibleAccounts;
+	}
 	if (!effectiveModel) {
 		capacityDeferredModelRoutesMap.set(meta, []);
 		meta.hardExcludedAccountIds = null;
@@ -593,7 +1000,7 @@ function prepareNormalRoutingMetadata(
 				deferredRoutes.push({
 					account,
 					model: route.model,
-					candidateId: `account:${account.id}`,
+					candidateId: capacityDeferredCandidateId(account.id, route.model),
 					fallbackRank: route.fallbackRank,
 					familyOccurrence: route.familyOccurrence,
 				});
@@ -622,6 +1029,137 @@ function prepareNormalRoutingMetadata(
 	return accounts.filter((account) => !excludedIds.has(account.id));
 }
 
+function finalizeNormalServerToolRoutingMetadata(
+	meta: RequestMeta,
+	ctx: ProxyContext,
+	orderedAccounts: readonly Account[],
+	effectiveModel: string | null,
+	syntheticProbe: boolean,
+): Account[] {
+	const baseCatalog = meta.routingCandidateCatalog ?? [];
+	const normalCatalog = baseCatalog.filter(
+		(candidate) =>
+			candidate.comboSlotId === null &&
+			candidate.candidateId === `account:${candidate.accountId}`,
+	);
+	const candidateByAccountId = new Map(
+		normalCatalog.map((candidate) => [candidate.accountId, candidate]),
+	);
+	const now = Date.now();
+	const beta = canonicalizeBetaSignature(meta.headers?.get("anthropic-beta"));
+	const excludedIds = new Set<string>();
+	const quotaPressure = new Map<string, AccountQuotaPressure>();
+	const exclusions: RoutingCapacityCandidateExclusion[] = [];
+	const deferredCatalog: RoutingCandidateMetadata[] = [];
+	const deferredRoutes: CapacityDeferredModelRoute[] = [];
+	const eligibleAccounts: Account[] = [];
+	const eligibleCandidateIds = new Set<string>();
+	const seenAccountIds = new Set<string>();
+
+	for (const account of orderedAccounts) {
+		if (seenAccountIds.has(account.id)) continue;
+		seenAccountIds.add(account.id);
+		const candidate = candidateByAccountId.get(account.id);
+		if (
+			!candidate ||
+			!isServerToolCandidateSemanticallyEligible(candidate) ||
+			!isAccountAvailable(account)
+		) {
+			continue;
+		}
+
+		if (effectiveModel) {
+			const evaluation = evaluateCandidateCapacity(
+				account,
+				effectiveModel,
+				beta,
+				now,
+				syntheticProbe,
+			);
+			candidate.quotaPressure = evaluation.quotaPressure;
+			if (evaluation.quotaPressure) {
+				quotaPressure.set(account.id, evaluation.quotaPressure);
+			}
+			if (evaluation.blockers.length > 0) {
+				excludedIds.add(account.id);
+				exclusions.push(
+					candidateExclusion(account, effectiveModel, evaluation, "normal"),
+				);
+				const accountWide = evaluation.blockers.some(
+					(blocker) => blocker.scope === "account",
+				);
+				const fallback = accountWide
+					? { routes: [], blocked: [] }
+					: resolveCapacityDeferredRoutes(
+							account,
+							effectiveModel,
+							beta,
+							now,
+							syntheticProbe,
+						);
+				for (const blocked of fallback.blocked) {
+					exclusions.push(
+						candidateExclusion(
+							account,
+							blocked.model,
+							blocked.evaluation,
+							"normal",
+						),
+					);
+				}
+				for (const route of [...fallback.routes, ...fallback.blocked]) {
+					const routing = capacityDeferredCandidateMetadata(
+						account,
+						normalCatalog.length + deferredCatalog.length,
+						route.model,
+					);
+					routing.serverToolCapability = evaluateCandidateServerToolCapability({
+						account,
+						routing,
+						logicalModel: route.model,
+						physicalModel: route.model,
+						meta,
+						ctx,
+					});
+					deferredCatalog.push(routing);
+					if (
+						"fallbackRank" in route &&
+						isServerToolCandidateSemanticallyEligible(routing)
+					) {
+						deferredRoutes.push({
+							account,
+							model: route.model,
+							candidateId: routing.candidateId,
+							fallbackRank: route.fallbackRank,
+							familyOccurrence: route.familyOccurrence,
+						});
+						eligibleCandidateIds.add(routing.candidateId);
+					}
+				}
+				continue;
+			}
+		}
+
+		eligibleAccounts.push(account);
+		eligibleCandidateIds.add(candidate.candidateId);
+	}
+
+	const catalog = [...baseCatalog, ...deferredCatalog];
+	meta.hardExcludedAccountIds = excludedIds.size > 0 ? excludedIds : null;
+	meta.quotaPressureByAccountId = quotaPressure.size > 0 ? quotaPressure : null;
+	capacityDeferredModelRoutesMap.set(meta, deferredRoutes);
+	meta.routingCandidateCatalog = catalog;
+	meta.routingCandidates = normalCatalog.filter((candidate) =>
+		eligibleCandidateIds.has(candidate.candidateId),
+	);
+	saveCapacityContext(meta, effectiveModel, exclusions);
+	publishServerToolCapabilitySummary(meta, catalog, eligibleCandidateIds);
+	if (eligibleAccounts.length === 0 && deferredRoutes.length === 0) {
+		throwServerToolCapabilityPoolError(meta);
+	}
+	return eligibleAccounts;
+}
+
 function captureAffinityOwnerSnapshot(
 	meta: RequestMeta,
 	ctx: ProxyContext,
@@ -636,12 +1174,15 @@ function findNativeAnthropicOAuthOwner(
 	meta: RequestMeta,
 	accounts: readonly Account[],
 ): Account | null {
+	const ownerCandidate = meta.routingCandidateCatalog?.find(
+		(candidate) =>
+			candidate.candidateId === owner.candidateId &&
+			candidate.accountId === owner.accountId,
+	);
 	const candidateStillConfigured =
-		meta.routingCandidateCatalog?.some(
-			(candidate) =>
-				candidate.candidateId === owner.candidateId &&
-				candidate.accountId === owner.accountId,
-		) === true;
+		ownerCandidate !== undefined &&
+		(!meta.serverToolRequirements ||
+			isServerToolCandidateSemanticallyEligible(ownerCandidate));
 	if (
 		!candidateStillConfigured ||
 		meta.hardExcludedAccountIds?.has(owner.accountId)
@@ -815,6 +1356,32 @@ function applyXaiCacheAffinity(
 	return ctx.cacheAffinityOrderer?.order(accounts, meta) ?? accounts;
 }
 
+function getExcludedProviders(meta: RequestMeta): readonly string[] {
+	return (
+		meta.headers
+			?.get("x-better-ccflare-exclude-providers")
+			?.split(",")
+			.map((provider) => provider.trim())
+			.filter(Boolean) ?? []
+	);
+}
+
+function isProviderExcludedForRequest(
+	account: Account,
+	excludeProviders: readonly string[],
+): boolean {
+	for (const excluded of excludeProviders) {
+		if (excluded === "anthropic-oauth") {
+			if (account.provider === "anthropic" && account.refresh_token != null) {
+				return true;
+			}
+		} else if (account.provider === excluded) {
+			return true;
+		}
+	}
+	return false;
+}
+
 function reportAccountDatabaseError(error: unknown): void {
 	log.error("Failed to get accounts from database:", error);
 	console.error("\n❌ DATABASE ERROR DETECTED");
@@ -834,6 +1401,7 @@ export async function getOrderedAccounts(
 	syntheticProbe = false,
 	preloadedAccounts?: Account[],
 	degradedOwner?: DegradedOwnerSelectionContext,
+	priorServerToolCatalog: readonly RoutingCandidateMetadata[] = [],
 	preselectionFilter?: (accounts: Account[]) => Account[],
 ): Promise<Account[]> {
 	try {
@@ -842,32 +1410,104 @@ export async function getOrderedAccounts(
 		const allAccounts = preselectionFilter
 			? preselectionFilter(loadedAccounts)
 			: loadedAccounts;
-		setXaiCacheEligibleAccounts(meta, allAccounts);
+		const excludedProviders = meta.serverToolRequirements
+			? getExcludedProviders(meta)
+			: [];
+		const structuralAccounts = meta.serverToolRequirements
+			? allAccounts.filter(
+					(account) =>
+						!isProviderExcludedForRequest(account, excludedProviders),
+				)
+			: allAccounts;
+		setXaiCacheEligibleAccounts(meta, structuralAccounts);
 		const eligibleAccounts = prepareNormalRoutingMetadata(
 			meta,
-			allAccounts,
+			ctx,
+			structuralAccounts,
 			effectiveModel,
 			syntheticProbe,
+			priorServerToolCatalog,
 		);
-		materializeDegradedOwnerDirective(meta, ctx, allAccounts, degradedOwner);
-		const hardExcluded = meta.hardExcludedAccountIds;
+		try {
+			materializeDegradedOwnerDirective(
+				meta,
+				ctx,
+				structuralAccounts,
+				degradedOwner,
+			);
+		} finally {
+			// Preliminary capacity exclusions are inspection-only. Clearing them is
+			// what lets SessionStrategy run its existing reset-qualified resume path;
+			// the final phase below republishes authoritative exclusions.
+			if (meta.serverToolRequirements) meta.hardExcludedAccountIds = null;
+		}
 		// Return all accounts - the provider will be determined dynamically per account.
-		const ordered = (await ctx.strategy.select(eligibleAccounts, meta)).filter(
-			(account) => !hardExcluded?.has(account.id),
-		);
+		const strategyOrdered = await ctx.strategy.select(eligibleAccounts, meta);
+		const ordered = meta.serverToolRequirements
+			? finalizeNormalServerToolRoutingMetadata(
+					meta,
+					ctx,
+					strategyOrdered,
+					effectiveModel,
+					syntheticProbe,
+				)
+			: strategyOrdered.filter(
+					(account) => !meta.hardExcludedAccountIds?.has(account.id),
+				);
 		const catalog = meta.routingCandidateCatalog ?? [];
 		meta.routingCandidates = ordered
 			.map((account) =>
-				catalog.find((candidate) => candidate.accountId === account.id),
+				catalog.find(
+					(candidate) =>
+						candidate.candidateId === `account:${account.id}` &&
+						candidate.accountId === account.id,
+				),
 			)
 			.filter(
 				(candidate): candidate is RoutingCandidateMetadata =>
 					candidate !== undefined,
 			);
-		return applyXaiCacheAffinity(ordered, meta, ctx);
+		let affinityOrdered = applyXaiCacheAffinity(ordered, meta, ctx);
+		if (meta.serverToolRequirements) {
+			const candidatesByAccountId = new Map(
+				(meta.routingCandidates ?? []).map((candidate) => [
+					candidate.accountId,
+					candidate,
+				]),
+			);
+			const finalAccounts: Account[] = [];
+			const finalCandidates: RoutingCandidateMetadata[] = [];
+			const seenCandidateIds = new Set<string>();
+			for (const account of affinityOrdered) {
+				const candidate = candidatesByAccountId.get(account.id);
+				if (!candidate || seenCandidateIds.has(candidate.candidateId)) continue;
+				seenCandidateIds.add(candidate.candidateId);
+				finalAccounts.push(account);
+				finalCandidates.push(candidate);
+			}
+			affinityOrdered = finalAccounts;
+			meta.routingCandidates = finalCandidates;
+			const deferredCandidateIds = getCapacityDeferredModelRoutes(meta).map(
+				(route) => route.candidateId,
+			);
+			const eligibleCandidateIds = new Set([
+				...seenCandidateIds,
+				...deferredCandidateIds,
+			]);
+			publishServerToolCapabilitySummary(meta, catalog, eligibleCandidateIds);
+			if (
+				meta.routingCandidates.length === 0 &&
+				deferredCandidateIds.length === 0
+			) {
+				throwServerToolCapabilityPoolError(meta);
+			}
+		}
+		return affinityOrdered;
 	} catch (error) {
 		capacityDeferredModelRoutesMap.delete(meta);
+		if (error instanceof ServerToolRoutingError) throw error;
 		reportAccountDatabaseError(error);
+		if (meta.serverToolRequirements) throw serverToolSelectionFailure(meta);
 		// Return empty array to gracefully handle database errors
 		// This will cause the proxy to fall back to unauthenticated mode
 		return [];
@@ -886,7 +1526,7 @@ export async function getOrderedAccounts(
  * @param options - Selection-mode controls for explicit fallback paths
  * @returns Array of selected accounts
  */
-export async function selectAccountsForRequest(
+async function selectAccountsForRequestInternal(
 	meta: RequestMeta,
 	ctx: ProxyContext,
 	model?: string,
@@ -903,6 +1543,7 @@ export async function selectAccountsForRequest(
 	meta.quotaPressureByAccountId = null;
 	meta.routingCandidateCatalog = null;
 	meta.routingCandidates = null;
+	meta.serverToolCapabilitySummary = undefined;
 	saveCapacityContext(meta, effectiveModel, []);
 
 	// Check if a specific account is requested via special header
@@ -916,6 +1557,38 @@ export async function selectAccountsForRequest(
 				);
 				if (!forcedAccount) {
 					throw new ForceRouteUnavailableError(forcedAccountId, "not_found");
+				}
+				let forcedRouting: RoutingCandidateMetadata | undefined;
+				if (meta.serverToolRequirements) {
+					forcedRouting = normalCandidateMetadata(
+						forcedAccount,
+						0,
+						effectiveModel,
+					);
+					forcedRouting.serverToolCapability =
+						evaluateCandidateServerToolCapability({
+							account: forcedAccount,
+							routing: forcedRouting,
+							logicalModel: effectiveModel,
+							meta,
+							ctx,
+						});
+					meta.routingCandidateCatalog = [forcedRouting];
+					meta.routingCandidates = [];
+					publishServerToolCapabilitySummary(meta, [forcedRouting], new Set());
+					if (!isServerToolCandidateSemanticallyEligible(forcedRouting)) {
+						const reason: ServerToolRoutingErrorReason = meta
+							.serverToolRequirements.invalid?.length
+							? "invalid_requirement"
+							: meta.serverToolRequirements.unsupported?.length
+								? "unsupported_requirement"
+								: "forced_incapable";
+						throw new ServerToolRoutingError({
+							reason,
+							accountId: forcedAccount.id,
+							capabilitySummary: meta.serverToolCapabilitySummary,
+						});
+					}
 				}
 				{
 					// The auto-refresh scheduler sends authenticated internal probes
@@ -995,6 +1668,14 @@ export async function selectAccountsForRequest(
 						meta.quotaPressureByAccountId = null;
 						saveCapacityContext(meta, null, []);
 					}
+					if (forcedRouting) {
+						meta.routingCandidates = [forcedRouting];
+						publishServerToolCapabilitySummary(
+							meta,
+							[forcedRouting],
+							new Set([forcedRouting.candidateId]),
+						);
+					}
 					return [forcedAccount];
 				}
 				// Forced account id does not exist in the database at all. Fail
@@ -1003,7 +1684,12 @@ export async function selectAccountsForRequest(
 				// caller never asked for. (Handled above via the `!forcedAccount`
 				// early throw before this try block's inner logic runs.)
 			} catch (error) {
-				if (error instanceof ForceRouteUnavailableError) throw error;
+				if (
+					error instanceof ForceRouteUnavailableError ||
+					error instanceof ServerToolRoutingError
+				) {
+					throw error;
+				}
 				log.error(
 					"Failed to get accounts from database for forced account lookup:",
 					error,
@@ -1026,25 +1712,9 @@ export async function selectAccountsForRequest(
 	}
 
 	// Filter out excluded providers (e.g. claude-oauth excluded by the responses adapter)
-	const excludeProviders =
-		meta.headers
-			?.get("x-better-ccflare-exclude-providers")
-			?.split(",")
-			.map((p) => p.trim())
-			.filter(Boolean) ?? [];
+	const excludeProviders = getExcludedProviders(meta);
 	const isProviderExcluded = (account: Account): boolean => {
-		for (const ex of excludeProviders) {
-			// "anthropic-oauth" targets only Anthropic OAuth accounts
-			// (refresh_token present), leaving API-key accounts eligible.
-			if (ex === "anthropic-oauth") {
-				if (account.provider === "anthropic" && account.refresh_token != null) {
-					return true;
-				}
-			} else if (account.provider === ex) {
-				return true;
-			}
-		}
-		return false;
+		return isProviderExcludedForRequest(account, excludeProviders);
 	};
 
 	const applyExclusions = (accounts: Account[]): Account[] => {
@@ -1060,6 +1730,7 @@ export async function selectAccountsForRequest(
 	};
 
 	let preloadedAccounts: Account[] | undefined;
+	let priorServerToolCatalog: readonly RoutingCandidateMetadata[] = [];
 
 	// Try combo-aware routing if a concrete effective model is available.
 	if (effectiveModel && !options.skipCombo) {
@@ -1107,6 +1778,9 @@ export async function selectAccountsForRequest(
 					allAccounts = await ctx.dbOps.getAllAccounts();
 				} catch (error) {
 					reportAccountDatabaseError(error);
+					if (meta.serverToolRequirements) {
+						throw serverToolSelectionFailure(meta);
+					}
 					return [];
 				}
 				preloadedAccounts = allAccounts;
@@ -1177,9 +1851,24 @@ export async function selectAccountsForRequest(
 							modelOverride: member.logical_model,
 							quotaPressure: null,
 						};
+						if (meta.serverToolRequirements) {
+							routing.serverToolCapability =
+								evaluateCandidateServerToolCapability({
+									account,
+									routing,
+									logicalModel: member.logical_model,
+									meta,
+									ctx,
+								});
+						}
 						candidateCatalog.push(routing);
-
-						if (!isAccountAvailable(account)) {
+						if (
+							meta.serverToolRequirements &&
+							!isServerToolCandidateSemanticallyEligible(routing)
+						) {
+							continue;
+						}
+						if (!meta.serverToolRequirements && !isAccountAvailable(account)) {
 							continue;
 						}
 
@@ -1224,7 +1913,12 @@ export async function selectAccountsForRequest(
 						});
 					}
 
-					setXaiCacheEligibleAccounts(meta, allAccounts);
+					setXaiCacheEligibleAccounts(
+						meta,
+						meta.serverToolRequirements
+							? allAccounts.filter((account) => !isProviderExcluded(account))
+							: allAccounts,
+					);
 					const fullyExcludedAccountIds = new Set<string>();
 					for (const [accountId, count] of candidateCountsByAccount) {
 						if (
@@ -1240,6 +1934,14 @@ export async function selectAccountsForRequest(
 					// multiple concrete model lanes. Never collapse it into an account map.
 					meta.quotaPressureByAccountId = null;
 					meta.routingCandidateCatalog = candidateCatalog;
+					meta.routingCandidates = eligibleEntries.map(
+						(entry) => entry.routing,
+					);
+					publishServerToolCapabilitySummary(
+						meta,
+						candidateCatalog,
+						new Set(eligibleEntries.map((entry) => entry.routing.candidateId)),
+					);
 					saveCapacityContext(meta, effectiveModel, capacityExclusions);
 
 					if (eligibleEntries.length > 0) {
@@ -1317,6 +2019,10 @@ export async function selectAccountsForRequest(
 						let orderedEntries = reconcileEntries(
 							strategyAccounts,
 							meta.routingCandidates ?? null,
+						).filter(
+							(entry) =>
+								!meta.serverToolRequirements ||
+								isAccountAvailable(entry.account),
 						);
 						meta.routingCandidates = orderedEntries.map(
 							(entry) => entry.routing,
@@ -1332,6 +2038,11 @@ export async function selectAccountsForRequest(
 						);
 						meta.routingCandidates = orderedEntries.map(
 							(entry) => entry.routing,
+						);
+						publishServerToolCapabilitySummary(
+							meta,
+							candidateCatalog,
+							new Set(orderedEntries.map((entry) => entry.routing.candidateId)),
 						);
 						if (orderedEntries.length > 0) {
 							const selectedEntry = orderedEntries[0];
@@ -1367,7 +2078,13 @@ export async function selectAccountsForRequest(
 						log.warn(
 							`All ${resolution.members.length} combo candidates unavailable for ${combo.name}, session fallback disabled by CCFLARE_DISABLE_COMBO_SESSION_FALLBACK`,
 						);
+						if (meta.serverToolRequirements) {
+							throwServerToolCapabilityPoolError(meta);
+						}
 						return [];
+					}
+					if (meta.serverToolRequirements) {
+						priorServerToolCatalog = candidateCatalog;
 					}
 
 					log.warn(
@@ -1399,6 +2116,27 @@ export async function selectAccountsForRequest(
 		options.syntheticProbe === true,
 		preloadedAccounts,
 		options.degradedOwner,
+		priorServerToolCatalog,
 		applyExclusions,
 	);
+}
+
+export async function selectAccountsForRequest(
+	meta: RequestMeta,
+	ctx: ProxyContext,
+	model?: string,
+	options: AccountSelectionOptions = {},
+): Promise<Account[]> {
+	try {
+		return await selectAccountsForRequestInternal(meta, ctx, model, options);
+	} catch (error) {
+		if (
+			error instanceof ServerToolRoutingError ||
+			error instanceof ForceRouteUnavailableError ||
+			!meta.serverToolRequirements
+		) {
+			throw error;
+		}
+		throw serverToolSelectionFailure(meta);
+	}
 }

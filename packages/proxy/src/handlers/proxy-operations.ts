@@ -14,16 +14,21 @@ import {
 } from "@better-ccflare/http-common";
 import { Logger } from "@better-ccflare/logger";
 import { stripCacheControlFromOpenAIRequest } from "@better-ccflare/openai-formats";
+import type { Provider, ProviderAttemptPlan } from "@better-ccflare/providers";
 import {
+	buildServerToolCapabilityProofKey,
 	CODEX_CONVERSATION_ID_HEADER,
 	decideContextAdmission,
-	getProvider,
 	isAnthropicExtraUsageExhausted,
 	isAnthropicOutOfCredits,
 	isCodexSubscriptionEndpoint,
+	materializeProviderAttemptPlan,
+	materializeProviderServerToolCapabilityDecision,
+	materializeProviderServerToolCapabilityTuple,
 	resolveCodexEndpoint,
 	resolveCodexRequestModel,
 	resolveModelContextCapability,
+	resolveProviderForAccount,
 	suppressCodexExplicitCacheBreakpoint,
 	usageCache,
 } from "@better-ccflare/providers";
@@ -31,6 +36,9 @@ import type {
 	Account,
 	RateLimitReason,
 	RequestMeta,
+	ServerToolCapabilityDecision,
+	ServerToolCapabilityTuple,
+	ServerToolReplayAtom,
 } from "@better-ccflare/types";
 import {
 	RECOVERY_SCOPE_HEADER,
@@ -91,6 +99,8 @@ import {
 	forwardToClient,
 	handleAnthropicSseRateLimit,
 } from "../response-handler";
+import { evaluateServerToolReplayEligibility } from "../server-tool-replay-eligibility";
+import { ServerToolCandidateCapabilityError } from "../server-tool-routing-errors";
 import {
 	recordServedAccount,
 	sessionIdForObservation,
@@ -247,6 +257,45 @@ const CODEX_CACHE_LANE_RESCUE_RESERVE_DIVISOR = 4;
 const TEST_CONTEXT_WINDOW_ENV =
 	"CCFLARE_CONTEXT_ADMISSION_TEST_EFFECTIVE_WINDOW";
 
+/**
+ * Downstream proxy helpers still accept a Provider-shaped context. Bind that
+ * request-local view to one immutable attempt plan so rate-limit, streaming,
+ * usage, and response-finalization reads cannot drift back to the shared
+ * provider singleton after transport planning.
+ */
+function bindProviderAttemptPlan(plan: ProviderAttemptPlan): Provider {
+	const invalidDownstreamLifecycleCall = (method: string): never => {
+		throw new Error(
+			`Provider lifecycle method ${method} is unavailable on an attempt-bound proxy context`,
+		);
+	};
+	const boundProvider: Provider = {
+		name: plan.providerName,
+		cacheReplayModelStrategy: plan.cacheReplayModelStrategy,
+		canHandle: () => invalidDownstreamLifecycleCall("canHandle"),
+		refreshToken: async () => invalidDownstreamLifecycleCall("refreshToken"),
+		buildUrl: () => plan.targetUrl,
+		prepareHeaders: (headers, accessToken, apiKey) =>
+			plan.prepareHeaders(headers, accessToken, apiKey),
+		transformRequestBody: (request) => plan.transformRequestBody(request),
+		processResponse: (response, _account, requestHeaders) =>
+			plan.processResponse(response, requestHeaders),
+		parseRateLimit: (response) => plan.parseRateLimit(response),
+		...(plan.parseRateLimitFromBody
+			? { parseRateLimitFromBody: plan.parseRateLimitFromBody }
+			: {}),
+		...(plan.isStreamingResponse
+			? { isStreamingResponse: plan.isStreamingResponse }
+			: {}),
+		...(plan.extractTierInfo ? { extractTierInfo: plan.extractTierInfo } : {}),
+		...(plan.extractUsageInfo
+			? { extractUsageInfo: plan.extractUsageInfo }
+			: {}),
+		...(plan.parseUsage ? { parseUsage: plan.parseUsage } : {}),
+	};
+	return Object.freeze(boundProvider);
+}
+
 function getCodexCacheLaneRescueReserveMs(candidateBudgetMs: number): number {
 	if (!Number.isFinite(candidateBudgetMs) || candidateBudgetMs <= 0) return 0;
 	return Math.min(
@@ -320,6 +369,12 @@ export interface ContextAdmissionEstimate {
 export interface ModelFallbackExecutionPolicy {
 	/** Immutable ID of the exact route candidate being executed. */
 	readonly routeCandidateId: string;
+	/**
+	 * A globally deferred physical-model route may outlive replacement of the
+	 * selector sidecar that admitted its source candidate. It must recompute an
+	 * exact proof instead of trusting the newer unrelated sidecar.
+	 */
+	readonly recomputeServerToolCapability?: boolean;
 	/** Request-scoped Anthropic downstream rescue; absent for ordinary routing. */
 	readonly anthropicPreCommitRescue?: AnthropicPreCommitRescueRouteContext;
 	readonly deferImplicitFallback?: (
@@ -1870,7 +1925,15 @@ export async function proxyWithAccount(
 
 		// Get the provider for this account before applying the staging policy: the
 		// resolved provider (including ctx fallback) determines replay safety.
-		const provider = getProvider(account.provider) || ctx.provider;
+		const provider = resolveProviderForAccount(account.provider, ctx.provider);
+		if (!provider) {
+			throw new ServerToolCandidateCapabilityError({
+				accountId: account.id,
+				candidateId:
+					modelFallbackPolicy?.routeCandidateId ?? `account:${account.id}`,
+				reason: "provider_unavailable",
+			});
+		}
 		const requestedModelBeforeAdmission = effectiveBodyContext.getModel();
 		const concreteCodexModels =
 			account.provider === "codex" && requestedModelBeforeAdmission
@@ -1983,7 +2046,10 @@ export async function proxyWithAccount(
 		const concreteAttemptModel =
 			account.provider === "codex" && admittedRequestModel
 				? resolveCodexRequestModel(admittedRequestModel, account)
-				: admittedRequestModel;
+				: admittedRequestModel
+					? (getModelList(admittedRequestModel, account)?.[0] ??
+						admittedRequestModel)
+					: null;
 		const isSyntheticInternal = isSyntheticInternalRequest(req.headers);
 
 		// Validate that the account-specific provider can handle this path
@@ -2012,10 +2078,199 @@ export async function proxyWithAccount(
 				}
 			}
 		}
+
+		type ExactServerToolCapabilityBinding = Readonly<{
+			tuple: ServerToolCapabilityTuple;
+			proofKey: string;
+			inputReplayMode: readonly ServerToolReplayAtom[];
+			outputReplayMode: readonly ServerToolReplayAtom[];
+		}>;
+		const serverToolRequirements = requestMeta.serverToolRequirements;
+		const routeCandidateId =
+			modelFallbackPolicy?.routeCandidateId ?? `account:${account.id}`;
+		const candidateCapabilityError = (
+			reason: ConstructorParameters<
+				typeof ServerToolCandidateCapabilityError
+			>[0]["reason"],
+		): ServerToolCandidateCapabilityError =>
+			new ServerToolCandidateCapabilityError({
+				accountId: account.id,
+				candidateId: routeCandidateId,
+				reason,
+			});
+		const replayModesEqual = (
+			left: readonly ServerToolReplayAtom[],
+			right: readonly ServerToolReplayAtom[],
+		): boolean =>
+			left.length === right.length &&
+			left.every((atom, index) => atom === right[index]);
+		const resolveExactServerToolCapability = (
+			physicalModel: string | null,
+			requireSelectedCandidateBinding: boolean,
+		): ExactServerToolCapabilityBinding | null => {
+			if (!serverToolRequirements) return null;
+			if (!physicalModel) throw candidateCapabilityError("tuple_unavailable");
+
+			const currentProvider = resolveProviderForAccount(
+				account.provider,
+				ctx.provider,
+			);
+			if (!currentProvider || currentProvider !== provider) {
+				throw candidateCapabilityError("provider_unavailable");
+			}
+
+			let tuple: ServerToolCapabilityTuple | undefined;
+			try {
+				tuple = materializeProviderServerToolCapabilityTuple(provider, {
+					candidateId: routeCandidateId,
+					account,
+					path: url.pathname,
+					query: url.search,
+					physicalModel,
+					requirements: serverToolRequirements,
+				});
+			} catch {
+				throw candidateCapabilityError("tuple_unavailable");
+			}
+			if (!tuple) throw candidateCapabilityError("tuple_unavailable");
+
+			let decision: ServerToolCapabilityDecision;
+			try {
+				decision = materializeProviderServerToolCapabilityDecision(
+					provider,
+					serverToolRequirements,
+					tuple,
+				);
+			} catch {
+				throw candidateCapabilityError("resolver_invalid");
+			}
+			if (decision.decision !== "proven") {
+				throw candidateCapabilityError("capability_unproven");
+			}
+			const proof = decision.proof;
+			const proofKey = buildServerToolCapabilityProofKey(
+				proof.revision,
+				proof.tuple,
+			);
+			if (!proofKey) throw candidateCapabilityError("resolver_invalid");
+
+			const inputReplayMode = Object.freeze([...proof.tuple.inputReplay]);
+			const outputReplayMode = Object.freeze([...proof.tuple.outputReplay]);
+			const replayEligibility = evaluateServerToolReplayEligibility(
+				serverToolRequirements,
+				inputReplayMode,
+				outputReplayMode,
+				ctx.serverToolReplay,
+			);
+			if (!replayEligibility.eligible) {
+				throw candidateCapabilityError("replay_unavailable");
+			}
+			if (requireSelectedCandidateBinding) {
+				const selected = requestMeta.routingCandidates?.find(
+					(candidate) =>
+						candidate.candidateId === routeCandidateId &&
+						candidate.accountId === account.id,
+				);
+				const expected = selected?.serverToolCapability;
+				if (!expected) {
+					throw candidateCapabilityError("candidate_binding_missing");
+				}
+				if (
+					expected.resolvedProvider !== tuple.provider ||
+					expected.physicalModel !== physicalModel ||
+					expected.decision !== "proven" ||
+					expected.reason !== null ||
+					expected.proofKey !== proofKey ||
+					expected.replayRuntimeStatus !== replayEligibility.status ||
+					!replayModesEqual(expected.inputReplayMode, inputReplayMode) ||
+					!replayModesEqual(expected.outputReplayMode, outputReplayMode)
+				) {
+					throw candidateCapabilityError("candidate_binding_mismatch");
+				}
+			}
+
+			return Object.freeze({
+				tuple,
+				proofKey,
+				inputReplayMode,
+				outputReplayMode,
+			});
+		};
+
+		const cacheReplayPhysicalModel = req.headers.get(CACHE_REPLAY_MODEL_HEADER);
+		const createPlanningRequest = (bodyBuffer: ArrayBuffer | null): Request => {
+			const init: RequestInit & { duplex?: "half" } = {
+				method: req.method,
+				headers: req.headers,
+			};
+			if (bodyBuffer) {
+				init.body = new Uint8Array(bodyBuffer);
+				init.duplex = "half";
+			}
+			return new Request(req.url, init);
+		};
+		const materializeAttemptPlan = (
+			bodyBuffer: ArrayBuffer | null,
+			physicalModel: string | null,
+			requireSelectedCandidateBinding = false,
+		): ProviderAttemptPlan => {
+			const capability = resolveExactServerToolCapability(
+				physicalModel,
+				requireSelectedCandidateBinding,
+			);
+			return materializeProviderAttemptPlan(provider, {
+				request: createPlanningRequest(bodyBuffer),
+				requestBodyBuffer: bodyBuffer,
+				account,
+				path: url.pathname,
+				query: url.search,
+				physicalModel,
+				capabilityProofKey: capability?.proofKey ?? null,
+				inputReplayMode: capability?.inputReplayMode ?? [],
+				outputReplayMode: capability?.outputReplayMode ?? [],
+			});
+		};
+		const assertAttemptPlanCapabilityIsCurrent = (
+			plan: ProviderAttemptPlan,
+		): void => {
+			const current = resolveExactServerToolCapability(
+				plan.physicalModel,
+				false,
+			);
+			if (!serverToolRequirements) return;
+			if (
+				!current ||
+				current.tuple.provider !== plan.providerName ||
+				current.tuple.model !== plan.physicalModel ||
+				current.proofKey !== plan.capabilityProofKey ||
+				!replayModesEqual(current.inputReplayMode, plan.inputReplayMode) ||
+				!replayModesEqual(current.outputReplayMode, plan.outputReplayMode)
+			) {
+				throw candidateCapabilityError("proof_drift");
+			}
+		};
+		const transformWithCurrentAttemptPlan = async (
+			plan: ProviderAttemptPlan,
+			request: Request,
+		): Promise<Request> => {
+			assertAttemptPlanCapabilityIsCurrent(plan);
+			return plan.transformRequestBody(request);
+		};
+		let attemptPlan = materializeAttemptPlan(
+			effectiveBodyBuffer,
+			cacheReplayPhysicalModel ?? concreteAttemptModel,
+			modelFallbackPolicy?.recomputeServerToolCapability !== true,
+		);
+		let attemptProvider = bindProviderAttemptPlan(attemptPlan);
+		const attemptProxyContext = (): ProxyContext => ({
+			...ctx,
+			provider: attemptProvider,
+		});
 		let currentReplayBody = effectiveBodyBuffer;
 
 		const isSyntheticCodexCountTokens =
-			provider.name === "codex" && url.pathname === "/v1/messages/count_tokens";
+			attemptPlan.providerName === "codex" &&
+			url.pathname === "/v1/messages/count_tokens";
 
 		// Synthetic Codex count_tokens never calls upstream, so it should not require
 		// or refresh OAuth credentials just to return an advisory local estimate.
@@ -2040,24 +2295,10 @@ export async function proxyWithAccount(
 			}
 		}
 
-		// Pre-process request if provider supports it (e.g., to extract model for URL)
-		if (provider.prepareRequest) {
-			provider.prepareRequest(req, effectiveBodyBuffer, account);
-		}
-
-		// Prepare request using account-specific provider
 		const replayResolvedModel =
-			provider.cacheReplayModelStrategy === "transformed-body"
-				? req.headers.get(CACHE_REPLAY_MODEL_HEADER)
+			attemptPlan.cacheReplayModelStrategy === "transformed-body"
+				? cacheReplayPhysicalModel
 				: null;
-		const clientHeadersForProvider = new Headers(req.headers);
-		clientHeadersForProvider.delete(CODEX_LOGICAL_MODEL_FAMILY_HEADER);
-		const headers = provider.prepareHeaders(
-			clientHeadersForProvider,
-			accessToken,
-			account.api_key || undefined,
-		);
-		headers.delete(CACHE_REPLAY_MODEL_HEADER);
 		// Codex request tracing and stream-intent correlation need the proxy request
 		// ID during transformRequestBody. The Codex provider consumes and strips this
 		// internal header before the request is sent upstream.
@@ -2078,7 +2319,7 @@ export async function proxyWithAccount(
 				| "other_retry",
 			finalModel?: string,
 		) => {
-			if (provider.name !== "codex") return;
+			if (attemptPlan.providerName !== "codex") return;
 			transportAttemptOrdinal++;
 			requestMeta.codexTransportAttemptOrdinal = transportAttemptOrdinal;
 			currentTransportAttemptId = crypto.randomUUID();
@@ -2097,63 +2338,75 @@ export async function proxyWithAccount(
 				attemptHeaders.delete("x-better-ccflare-final-model");
 			}
 		};
-		if (provider.name === "codex") {
-			const logicalModel =
-				requestMeta.appliedModel ?? requestMeta.originalModel;
-			const logicalModelFamily = logicalModel
-				? getModelFamily(logicalModel)
-				: null;
-			if (logicalModelFamily) {
-				headers.set(CODEX_LOGICAL_MODEL_FAMILY_HEADER, logicalModelFamily);
-			}
-			const isAttributedAgent =
-				Boolean(requestMeta.agentUsed) ||
-				isBillingAttributedSubagent(req.headers);
-			// Client-supplied copies are untrusted. Strip before attaching only
-			// server-derived experiment metadata so traces cannot be spoofed or
-			// retain arbitrary sensitive header content.
-			headers.delete("x-better-ccflare-pacing-canary");
-			headers.delete("x-better-ccflare-pacing-cohort-id");
-			headers.delete("x-better-ccflare-pacing-action");
-			headers.set("x-better-ccflare-request-id", requestMeta.id);
-			// Attribution is resolved by the proxy before account selection. Replace
-			// any client-supplied marker here, once the selected provider is known.
-			if (isAttributedAgent) {
-				headers.set("x-better-ccflare-attributed-agent", "true");
+		const prepareAttemptHeaders = (plan: ProviderAttemptPlan): Headers => {
+			const clientHeadersForPlan = new Headers(req.headers);
+			clientHeadersForPlan.delete(CODEX_LOGICAL_MODEL_FAMILY_HEADER);
+			const prepared = plan.prepareHeaders(
+				clientHeadersForPlan,
+				accessToken,
+				account.api_key || undefined,
+			);
+			prepared.delete(CACHE_REPLAY_MODEL_HEADER);
+			if (plan.providerName === "codex") {
+				const logicalModel =
+					requestMeta.appliedModel ?? requestMeta.originalModel;
+				const logicalModelFamily = logicalModel
+					? getModelFamily(logicalModel)
+					: null;
+				if (logicalModelFamily) {
+					prepared.set(CODEX_LOGICAL_MODEL_FAMILY_HEADER, logicalModelFamily);
+				}
+				const isAttributedAgent =
+					Boolean(requestMeta.agentUsed) ||
+					isBillingAttributedSubagent(req.headers);
+				// Client-supplied copies are untrusted. Strip before attaching only
+				// server-derived experiment metadata so traces cannot be spoofed or
+				// retain arbitrary sensitive header content.
+				prepared.delete("x-better-ccflare-pacing-canary");
+				prepared.delete("x-better-ccflare-pacing-cohort-id");
+				prepared.delete("x-better-ccflare-pacing-action");
+				prepared.set("x-better-ccflare-request-id", requestMeta.id);
+				// Attribution is resolved by the proxy before account selection. Replace
+				// any client-supplied marker here, once the selected provider is known.
+				if (isAttributedAgent) {
+					prepared.set("x-better-ccflare-attributed-agent", "true");
+				} else {
+					prepared.delete("x-better-ccflare-attributed-agent");
+				}
+				if (requestMeta.codexPacingCanary) {
+					prepared.set(
+						"x-better-ccflare-pacing-canary",
+						requestMeta.codexPacingCanary,
+					);
+				}
+				if (requestMeta.codexPacingAction) {
+					prepared.set(
+						"x-better-ccflare-pacing-action",
+						requestMeta.codexPacingAction,
+					);
+				}
+				if (requestMeta.codexPacingCohortId) {
+					prepared.set(
+						"x-better-ccflare-pacing-cohort-id",
+						requestMeta.codexPacingCohortId,
+					);
+				}
 			} else {
-				headers.delete("x-better-ccflare-attributed-agent");
+				prepared.delete("x-better-ccflare-attributed-agent");
 			}
-			if (requestMeta.codexPacingCanary) {
-				headers.set(
-					"x-better-ccflare-pacing-canary",
-					requestMeta.codexPacingCanary,
-				);
-			}
-			if (requestMeta.codexPacingAction) {
-				headers.set(
-					"x-better-ccflare-pacing-action",
-					requestMeta.codexPacingAction,
-				);
-			}
-			if (requestMeta.codexPacingCohortId) {
-				headers.set(
-					"x-better-ccflare-pacing-cohort-id",
-					requestMeta.codexPacingCohortId,
-				);
-			}
-		} else {
-			headers.delete("x-better-ccflare-attributed-agent");
-		}
+			// Synthetic-response markers are internal provider-to-proxy signals. Strip
+			// client-supplied copies before providers transform the outbound request.
+			prepared.delete(SYNTHETIC_RESPONSE_HEADER);
+			prepared.delete(SYNTHETIC_STATUS_HEADER);
+			return prepared;
+		};
+		let headers = prepareAttemptHeaders(attemptPlan);
 		stampCodexAttempt(
 			headers,
 			transportAttemptOrdinal > 0 ? "account_failover" : "initial",
 			replayResolvedModel ?? undefined,
 		);
-		// Synthetic-response markers are internal provider-to-proxy signals. Strip
-		// client-supplied copies before providers transform the outbound request.
-		headers.delete(SYNTHETIC_RESPONSE_HEADER);
-		headers.delete(SYNTHETIC_STATUS_HEADER);
-		const targetUrl = provider.buildUrl(url.pathname, url.search, account);
+		let targetUrl = attemptPlan.targetUrl;
 		type PhysicalSendReservation =
 			| { readonly kind: "not_required" }
 			| {
@@ -2173,7 +2426,7 @@ export async function proxyWithAccount(
 		) => {
 			if (
 				!anthropicDegradedState ||
-				provider.name !== "anthropic" ||
+				attemptPlan.providerName !== "anthropic" ||
 				!isNativeAnthropicOAuthDegradedModeEligible(account) ||
 				url.pathname !== "/v1/messages" ||
 				!resolvedModel
@@ -2520,7 +2773,7 @@ export async function proxyWithAccount(
 			reservation?: PhysicalSendReservation,
 		): Promise<Response> => {
 			const webSocketConversationIdentity =
-				provider.name === "codex"
+				attemptPlan.providerName === "codex"
 					? transportRequest.headers.get(CODEX_CONVERSATION_ID_HEADER)
 					: null;
 			if (transportRequest.headers.has(CODEX_CONVERSATION_ID_HEADER)) {
@@ -2543,7 +2796,7 @@ export async function proxyWithAccount(
 			await stageCacheBodyForTransportAttempt({
 				requestId: requestMeta.id,
 				accountId: account.id,
-				providerName: provider.name,
+				providerName: attemptPlan.providerName,
 				replayBody,
 				transportRequest,
 				clientHeaders: req.headers,
@@ -2551,7 +2804,7 @@ export async function proxyWithAccount(
 				cacheIdentityHasCacheControl,
 				isSyntheticProviderTransport: isSynthetic,
 				resolvedModel:
-					provider.cacheReplayModelStrategy === "transformed-body"
+					attemptPlan.cacheReplayModelStrategy === "transformed-body"
 						? resolvedModel
 						: null,
 			});
@@ -2585,7 +2838,7 @@ export async function proxyWithAccount(
 			};
 			const response = await makeAttemptRequest(
 				transportRequest,
-				provider.name === "codex"
+				attemptPlan.providerName === "codex"
 					? async (signal) => {
 							currentCodexWebSocketReceipt = null;
 							// Capture the concrete stamped attempt before any later retry mutates the
@@ -2598,7 +2851,7 @@ export async function proxyWithAccount(
 									requestId: requestMeta.id,
 									attemptId: websocketAttemptId,
 									accountId: account.id,
-									providerName: provider.name,
+									providerName: attemptPlan.providerName,
 									conversationIdentity: webSocketConversationIdentity,
 									request: transportRequest,
 									signal,
@@ -2629,10 +2882,11 @@ export async function proxyWithAccount(
 		const enforcePhysicalModelAfterTransform = async (
 			transportRequest: Request,
 			physicalModel: string | null | undefined,
+			plan: ProviderAttemptPlan = attemptPlan,
 		): Promise<Request> => {
 			if (
 				!physicalModel ||
-				provider.cacheReplayModelStrategy !== "transformed-body" ||
+				plan.cacheReplayModelStrategy !== "transformed-body" ||
 				isSyntheticProviderResponse(transportRequest)
 			) {
 				return transportRequest;
@@ -2655,9 +2909,10 @@ export async function proxyWithAccount(
 		// cohort attribution. Strip only the concrete transport request below,
 		// after each transform, so internal headers never reach upstream.
 
-		let transformedRequest = provider.transformRequestBody
-			? await provider.transformRequestBody(providerRequest, account)
-			: providerRequest;
+		let transformedRequest = await transformWithCurrentAttemptPlan(
+			attemptPlan,
+			providerRequest,
+		);
 		transformedRequest = await enforcePhysicalModelAfterTransform(
 			transformedRequest,
 			replayResolvedModel,
@@ -2671,7 +2926,7 @@ export async function proxyWithAccount(
 		const xaiCacheKeyPresent = transformedRequest.headers.has("x-grok-conv-id");
 		const xaiCacheOfficialEndpoint = isOfficialXaiEndpoint(account);
 		const cacheFlightRecorderEligible =
-			provider.name === "xai" &&
+			attemptPlan.providerName === "xai" &&
 			url.pathname === "/v1/messages" &&
 			xaiCacheOfficialEndpoint &&
 			Boolean(requestMeta.cacheFlightRecorderConversationId);
@@ -2727,7 +2982,8 @@ export async function proxyWithAccount(
 
 		const finalizedCodexAttemptIds = new Set<string>();
 		const finalizeCurrentCodexTransport = async (discarded: Response) => {
-			if (provider.name !== "codex" || !currentTransportAttemptId) return;
+			if (attemptPlan.providerName !== "codex" || !currentTransportAttemptId)
+				return;
 			const attemptId = currentTransportAttemptId;
 			if (finalizedCodexAttemptIds.has(attemptId)) return;
 			// Mark finalized before draining so a rejecting body cannot abort the
@@ -2744,13 +3000,12 @@ export async function proxyWithAccount(
 						currentTransportModel,
 					);
 				}
-				const processed = await provider.processResponse(
+				const processed = await attemptPlan.processResponse(
 					new Response(discarded.clone().body, {
 						status: discarded.status,
 						statusText: discarded.statusText,
 						headers: traceHeaders,
 					}),
-					account,
 					req.headers,
 				);
 				await processed.arrayBuffer();
@@ -2836,7 +3091,7 @@ export async function proxyWithAccount(
 			candidateResponse: Response,
 		): Promise<boolean> => {
 			if (
-				provider.name !== "codex" ||
+				attemptPlan.providerName !== "codex" ||
 				account.provider !== "codex" ||
 				getCurrentCodexWebSocketReceipt()?.frameWritten === true
 			) {
@@ -2980,9 +3235,10 @@ export async function proxyWithAccount(
 				const retryProviderRequest = new Request(targetUrl, retryRequestInit);
 				retrySourceRequest = retryProviderRequest.clone();
 
-				let retryTransformedRequest = provider.transformRequestBody
-					? await provider.transformRequestBody(retryProviderRequest, account)
-					: retryProviderRequest;
+				let retryTransformedRequest = await transformWithCurrentAttemptPlan(
+					attemptPlan,
+					retryProviderRequest,
+				);
 				retryTransformedRequest = await enforcePhysicalModelAfterTransform(
 					retryTransformedRequest,
 					currentTransportModel,
@@ -3042,9 +3298,10 @@ export async function proxyWithAccount(
 				const retryProviderRequest = new Request(targetUrl, retryRequestInit);
 				retrySourceRequest = retryProviderRequest.clone();
 
-				let retryTransformedRequest = provider.transformRequestBody
-					? await provider.transformRequestBody(retryProviderRequest, account)
-					: retryProviderRequest;
+				let retryTransformedRequest = await transformWithCurrentAttemptPlan(
+					attemptPlan,
+					retryProviderRequest,
+				);
 				retryTransformedRequest = await enforcePhysicalModelAfterTransform(
 					retryTransformedRequest,
 					currentTransportModel,
@@ -3078,7 +3335,7 @@ export async function proxyWithAccount(
 		const transformedRequestHadExplicitBreakpoint =
 			hasCodexExplicitCacheBreakpoint(transformedBodyJson);
 		const explicitBreakpointRejection =
-			provider.name === "codex" &&
+			attemptPlan.providerName === "codex" &&
 			(await isCodexExplicitCacheBreakpointRejectionError(
 				rawResponse,
 				transformedRequestHadExplicitBreakpoint,
@@ -3090,11 +3347,8 @@ export async function proxyWithAccount(
 				transformedModel,
 				transformedRequest.url,
 			);
-			const transformRequestBody =
-				provider.transformRequestBody?.bind(provider);
 			const replayBody = currentReplayBody;
 			if (
-				transformRequestBody !== undefined &&
 				replayBody !== null &&
 				!getCurrentCodexWebSocketReceipt()?.frameWritten
 			) {
@@ -3115,7 +3369,10 @@ export async function proxyWithAccount(
 					body: new Uint8Array(replayBody),
 				});
 				retrySourceRequest = retrySource.clone();
-				let retryTransformed = await transformRequestBody(retrySource, account);
+				let retryTransformed = await transformWithCurrentAttemptPlan(
+					attemptPlan,
+					retrySource,
+				);
 				retryTransformed = await enforcePhysicalModelAfterTransform(
 					retryTransformed,
 					currentTransportModel,
@@ -3160,7 +3417,7 @@ export async function proxyWithAccount(
 				const retryBodyJson = JSON.parse(transformedBodyText);
 				stripCacheControlFromOpenAIRequest(retryBodyJson);
 				let retryRequest: Request;
-				if (provider.name === "codex" && provider.transformRequestBody) {
+				if (attemptPlan.providerName === "codex") {
 					await finalizeCurrentCodexTransport(rawResponse);
 					await discardUpstreamBody(rawResponse);
 					const retryHeaders = new Headers(providerRequest.headers);
@@ -3176,9 +3433,9 @@ export async function proxyWithAccount(
 					currentReplayBody = new TextEncoder().encode(retrySourceText).buffer;
 					currentCacheIdentityHasCacheControl = undefined;
 					retrySourceRequest = retrySource.clone();
-					const retryTransformed = await provider.transformRequestBody(
+					const retryTransformed = await transformWithCurrentAttemptPlan(
+						attemptPlan,
 						retrySource,
-						account,
 					);
 					retryTransformedTemplate = retryTransformed.clone();
 					retryRequest = sanitizeInternalTransportHeaders(
@@ -3804,8 +4061,8 @@ export async function proxyWithAccount(
 					// telemetry alone is not trusted. The cooldown helper applies the shared
 					// safety ceiling before persisting the verified deadline.
 					const codexRateLimitInfo =
-						provider.name === "codex" && !isKeepalive
-							? provider.parseRateLimit(rawResponse)
+						attemptPlan.providerName === "codex" && !isKeepalive
+							? attemptPlan.parseRateLimit(rawResponse)
 							: null;
 					const verifiedCodexReset =
 						codexRateLimitInfo?.isRateLimited === true &&
@@ -4019,6 +4276,8 @@ export async function proxyWithAccount(
 					}
 
 					let deferredFallbackRank = 0;
+					let lastModelFallbackCapabilityError: ServerToolCandidateCapabilityError | null =
+						null;
 					for (let i = fallbackStartIndex; i < modelList.length; i++) {
 						const nextModel = modelList[i];
 						if (candidateHasScopedFailure(nextModel)) {
@@ -4070,9 +4329,50 @@ export async function proxyWithAccount(
 							log.warn("Failed to patch request body for model retry");
 							break;
 						}
+						let fallbackPlan: ProviderAttemptPlan;
+						let fallbackHeaders: Headers;
+						let retryTransformedRequest: Request;
+						try {
+							// Exact capability and replay readiness are resolved before the
+							// request ledger can claim this physical fallback.
+							fallbackPlan = materializeAttemptPlan(
+								patchedBody,
+								nextModel,
+								false,
+							);
+							fallbackHeaders = prepareAttemptHeaders(fallbackPlan);
+							const retryRequestInit: RequestInit & { duplex?: "half" } = {
+								method: req.method,
+								headers: fallbackHeaders,
+								body: new Uint8Array(patchedBody),
+								duplex: "half",
+							};
+							const retryProviderRequest = new Request(
+								fallbackPlan.targetUrl,
+								retryRequestInit,
+							);
+							retrySourceRequest = retryProviderRequest.clone();
+							retryTransformedRequest = await transformWithCurrentAttemptPlan(
+								fallbackPlan,
+								retryProviderRequest,
+							);
+							retryTransformedRequest =
+								await enforcePhysicalModelAfterTransform(
+									retryTransformedRequest,
+									nextModel,
+									fallbackPlan,
+								);
+						} catch (error) {
+							if (error instanceof ServerToolCandidateCapabilityError) {
+								lastModelFallbackCapabilityError = error;
+								continue;
+							}
+							throw error;
+						}
+
 						// getModelList returns concrete provider models, and the transformed
-						// request is force-patched to this exact value below. Claim before
-						// retry tracing/finalization so a duplicate skip has no side effects.
+						// request is force-patched to this exact value. Claim only after the
+						// proof-equality transform gate has succeeded.
 						if (
 							routingAttemptLedger &&
 							!routingAttemptLedger.claim(account.id, nextModel)
@@ -4085,54 +4385,23 @@ export async function proxyWithAccount(
 							);
 							continue;
 						}
+						lastModelFallbackCapabilityError = null;
 						if (routingAttemptLedger) {
 							failoverAttempts = Math.max(
 								failoverAttempts,
 								routingAttemptLedger.attemptedCount - 1,
 							);
 						}
-						const retryRequestInit: RequestInit & { duplex?: "half" } = {
-							method: req.method,
-							headers,
-							body: new Uint8Array(patchedBody),
-							duplex: "half",
-						};
-
 						if (!isScopedFailure(rawFailureClassification)) {
 							await finalizeCurrentCodexTransport(rawResponse);
 							await discardUpstreamBody(rawResponse);
 						}
+						attemptPlan = fallbackPlan;
+						attemptProvider = bindProviderAttemptPlan(fallbackPlan);
+						headers = fallbackHeaders;
 						stampCodexAttempt(headers, "model_fallback", nextModel);
 						currentTransportModel = nextModel;
-						// URL-model providers derive their physical transport from the
-						// normalized retry source, so prepare and rebuild the URL for every
-						// concrete fallback rather than reusing the primary model's URL.
-						if (provider.prepareRequest) {
-							provider.prepareRequest(req, patchedBody, account);
-						}
-						const retryTargetUrl = provider.buildUrl(
-							url.pathname,
-							url.search,
-							account,
-						);
-						const retryProviderRequest = new Request(
-							retryTargetUrl,
-							retryRequestInit,
-						);
-						retrySourceRequest = retryProviderRequest.clone();
-						let retryTransformedRequest = provider.transformRequestBody
-							? await provider.transformRequestBody(
-									retryProviderRequest,
-									account,
-								)
-							: retryProviderRequest;
-
-						// Body-model conversions can remap nextModel back to the primary;
-						// source/URL providers already resolved it during prepare/build above.
-						retryTransformedRequest = await enforcePhysicalModelAfterTransform(
-							retryTransformedRequest,
-							nextModel,
-						);
+						targetUrl = fallbackPlan.targetUrl;
 						retryTransformedTemplate = retryTransformedRequest.clone();
 
 						// Fallback transforms need internal correlation metadata, but the
@@ -4172,6 +4441,11 @@ export async function proxyWithAccount(
 						) {
 							break; // Success — stop cycling
 						}
+					}
+					if (lastModelFallbackCapabilityError) {
+						await finalizeCurrentCodexTransport(rawResponse);
+						await discardUpstreamBody(rawResponse);
+						throw lastModelFallbackCapabilityError;
 					}
 				}
 
@@ -4289,12 +4563,11 @@ export async function proxyWithAccount(
 		});
 
 		// Process response (transform format, sanitize headers, etc.) using account-specific provider
-		let response = await provider.processResponse(
+		let response = await attemptPlan.processResponse(
 			taggedRawResponse,
-			account,
 			req.headers,
 		);
-		if (provider.name === "codex" && currentTransportAttemptId) {
+		if (attemptPlan.providerName === "codex" && currentTransportAttemptId) {
 			finalizedCodexAttemptIds.add(currentTransportAttemptId);
 		}
 
@@ -4324,7 +4597,7 @@ export async function proxyWithAccount(
 			!wasProtectedLifecycleForLatestResponse()
 		) {
 			const rlInfoClone = response.clone();
-			const rlInfo = provider.parseRateLimit(rlInfoClone);
+			const rlInfo = attemptPlan.parseRateLimit(rlInfoClone);
 			// parseRateLimit only reads headers; it never touches the body. This
 			// clone is otherwise an abandoned tee branch that would block a later
 			// discardUnusedResponse/cancel() on `response` from ever settling (see
@@ -4370,7 +4643,7 @@ export async function proxyWithAccount(
 						// destructive drain below and the cache staging/fetch in the
 						// shared executor.
 						commitPhysicalSendReservation(degradedReservation, response);
-						if (provider.name === "codex" && provider.transformRequestBody) {
+						if (attemptPlan.providerName === "codex") {
 							const retryHeaders = new Headers(retrySourceRequest.headers);
 							await drainSupersededResponse(response);
 							stampCodexAttempt(
@@ -4383,9 +4656,9 @@ export async function proxyWithAccount(
 								headers: retryHeaders,
 								body: await retrySourceRequest.clone().arrayBuffer(),
 							});
-							let retryTransformed = await provider.transformRequestBody(
+							let retryTransformed = await transformWithCurrentAttemptPlan(
+								attemptPlan,
 								retrySource,
-								account,
 							);
 							if (currentTransportModel) {
 								retryTransformed = await forceModelInTransformedRequest(
@@ -4443,9 +4716,8 @@ export async function proxyWithAccount(
 							statusText: retryRaw.statusText,
 							headers: retryTaggedHeaders,
 						});
-						const retryResponse = await provider.processResponse(
+						const retryResponse = await attemptPlan.processResponse(
 							retryTaggedRaw,
-							account,
 							req.headers,
 						);
 
@@ -4469,7 +4741,7 @@ export async function proxyWithAccount(
 						}
 
 						const retryRlInfoClone = retryResponse.clone();
-						const retryRlInfo = provider.parseRateLimit(retryRlInfoClone);
+						const retryRlInfo = attemptPlan.parseRateLimit(retryRlInfoClone);
 						// Same reasoning as the outer parseRateLimit clone above: this is a
 						// header-only read, and if the loop breaks out below without a
 						// further iteration to drain `retryResponse` via arrayBuffer(),
@@ -4519,7 +4791,7 @@ export async function proxyWithAccount(
 		// pre-commit stall wait indefinitely. In Bun, merely reading Response.body
 		// before a later classification clone can also disturb the retained branch.
 		const officialCodexPrecommitSseRetryRouteEligible =
-			provider.name === "codex" &&
+			attemptPlan.providerName === "codex" &&
 			account.provider === "codex" &&
 			url.pathname === "/v1/messages" &&
 			!isSyntheticInternal &&
@@ -4540,13 +4812,13 @@ export async function proxyWithAccount(
 			const isNativeAnthropicMessagesStream = isNativeAnthropicMessagesSse({
 				method: req.method,
 				path: url.pathname,
-				providerName: provider.name,
+				providerName: attemptPlan.providerName,
 				requestHeaders: req.headers,
 				response,
 			});
 			const nativeAnthropicHeadersAreRateLimited =
 				isNativeAnthropicMessagesStream &&
-				provider.parseRateLimit(response).isRateLimited;
+				attemptPlan.parseRateLimit(response).isRateLimited;
 			if (
 				!isDownstreamAnthropicMessagesStream ||
 				nativeAnthropicHeadersAreRateLimited
@@ -4612,7 +4884,7 @@ export async function proxyWithAccount(
 					? undefined
 					: attemptCommitmentDeadlineAt - cacheLaneRescueReserveMs;
 			const codexAuthoritativeContextOverflowCanBeHandled =
-				provider.name === "codex" &&
+				attemptPlan.providerName === "codex" &&
 				account.provider === "codex" &&
 				(canReplayContextOverflow() || hasRetainedLegacyContextOverflow());
 			try {
@@ -4815,9 +5087,10 @@ export async function proxyWithAccount(
 						rescueRequestInit,
 					);
 					retrySourceRequest = rescueSourceRequest.clone();
-					let rescueTransformedRequest = provider.transformRequestBody
-						? await provider.transformRequestBody(rescueSourceRequest, account)
-						: rescueSourceRequest;
+					let rescueTransformedRequest = await transformWithCurrentAttemptPlan(
+						attemptPlan,
+						rescueSourceRequest,
+					);
 					rescueTransformedRequest = await enforcePhysicalModelAfterTransform(
 						rescueTransformedRequest,
 						currentTransportModel,
@@ -4869,13 +5142,12 @@ export async function proxyWithAccount(
 							internalRequestStream,
 						);
 					}
-					response = await provider.processResponse(
+					response = await attemptPlan.processResponse(
 						new Response(rawResponse.body, {
 							status: rawResponse.status,
 							statusText: rawResponse.statusText,
 							headers: rescueResponseHeaders,
 						}),
-						account,
 						req.headers,
 					);
 					if (currentTransportAttemptId) {
@@ -4968,7 +5240,7 @@ export async function proxyWithAccount(
 						error.errorType,
 						response,
 						requestMeta.id,
-						{ ...ctx, provider },
+						attemptProxyContext(),
 						req.headers.get("anthropic-beta"),
 					);
 				}
@@ -5017,10 +5289,7 @@ export async function proxyWithAccount(
 		const isRateLimited = await processProxyResponse(
 			responseForRateLimitCheck,
 			account,
-			{
-				...ctx,
-				provider,
-			},
+			attemptProxyContext(),
 			requestMeta.id,
 			requestMeta,
 		);
@@ -5078,7 +5347,7 @@ export async function proxyWithAccount(
 						routingMeta: requestMeta,
 						anthropicDegradedLifecycle: activeLifecycleForLatestResponse(),
 					},
-					{ ...ctx, provider },
+					attemptProxyContext(),
 				);
 			if (wasProtectedLifecycleForLatestResponse()) {
 				return await forwardTerminalRateLimitResponse(
@@ -5185,13 +5454,19 @@ export async function proxyWithAccount(
 				routingMeta: requestMeta,
 				anthropicDegradedLifecycle: responseLifecycle,
 			},
-			{ ...ctx, provider },
+			attemptProxyContext(),
 		);
 		if (responseLifecycle?.enforced) {
 			return await forwardedResponse;
 		}
 		return forwardedResponse;
 	} catch (err) {
+		if (err instanceof ServerToolCandidateCapabilityError) {
+			// Exact capability drift is request-local. It must not pause the account,
+			// poison route health, or be collapsed into a generic transport failure;
+			// the request orchestrator owns sibling failover and the final terminal.
+			throw err;
+		}
 		const committedLifecycle = anthropicDegradedState?.lifecycle;
 		if (
 			committedLifecycle &&

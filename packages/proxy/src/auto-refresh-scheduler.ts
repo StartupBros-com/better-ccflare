@@ -131,7 +131,7 @@ export class AutoRefreshScheduler {
 				id: string;
 				name: string;
 				provider: string;
-				refresh_token: string;
+				refresh_token: string | null;
 				access_token: string | null;
 				expires_at: number | null;
 				rate_limit_reset: number | null;
@@ -258,7 +258,7 @@ export class AutoRefreshScheduler {
 		id: string;
 		name: string;
 		provider: string;
-		refresh_token: string;
+		refresh_token: string | null;
 		access_token: string | null;
 		expires_at: number | null;
 		rate_limit_reset: number | null;
@@ -1186,7 +1186,7 @@ export class AutoRefreshScheduler {
 			id: string;
 			name: string;
 			provider: string;
-			refresh_token: string;
+			refresh_token: string | null;
 			access_token: string | null;
 			expires_at: number | null;
 			rate_limit_reset: number | null;

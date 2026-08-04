@@ -9,6 +9,7 @@ import type { AnthropicDegradedModeCoordinator } from "../anthropic-degraded-mod
 import type { DegradedModeObservability } from "../anthropic-degraded-observability";
 import type { CacheAffinityOrderer } from "../cache-affinity-orderer";
 import type { DegradedOwnerOverlay } from "../degraded-owner-overlay";
+import type { ServerToolReplayRuntimeState } from "../server-tool-replay-runtime";
 import type { GuardCorrelationVerifier } from "./guard-correlation-auth";
 
 export interface ProxyContext {
@@ -22,6 +23,8 @@ export interface ProxyContext {
 	degradedOwnerOverlay: DegradedOwnerOverlay;
 	/** Observe-only owner simulation; never read by enforcement. */
 	degradedOwnerShadowOverlay: DegradedOwnerOverlay;
+	/** Restart-scoped replay readers; writer admission remains independently gated. */
+	serverToolReplay?: ServerToolReplayRuntimeState;
 	dbOps: DatabaseOperations;
 	runtime: RuntimeConfig;
 	config: Config;
