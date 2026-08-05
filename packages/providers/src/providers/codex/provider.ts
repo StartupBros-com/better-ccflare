@@ -37,6 +37,12 @@ import {
 	recordOrchestrationRootInstructions,
 } from "./orchestration-election";
 import {
+	createServerToolCharacterizationContext,
+	type ServerToolCharacterizationContext,
+	type ServerToolCharacterizationKind,
+	type ServerToolCharacterizationObserver,
+} from "./server-tool-characterization";
+import {
 	CodexStreamLiveness,
 	type CodexStreamLivenessOptions,
 } from "./stream-liveness";
@@ -706,11 +712,20 @@ export function codexEventCommitsOutput(
 export interface CodexProviderOptionsForTests {
 	streamHeartbeatIntervalMs?: number;
 	streamRawSilenceTimeoutMs?: number;
+	characterizationObserver?: ServerToolCharacterizationObserver;
+	characterizationObservationGate?: (
+		kind: ServerToolCharacterizationKind,
+	) => boolean;
 }
 
 export class CodexProvider extends BaseProvider {
 	name = "codex";
 	private readonly streamLivenessOptions: CodexStreamLivenessOptions;
+	private readonly characterizationObserver?: ServerToolCharacterizationObserver;
+	private readonly characterizationContext?: ServerToolCharacterizationContext;
+	private readonly characterizationObservationGate?: (
+		kind: ServerToolCharacterizationKind,
+	) => boolean;
 
 	constructor(options: CodexProviderOptionsForTests = {}) {
 		super();
@@ -718,6 +733,44 @@ export class CodexProvider extends BaseProvider {
 			heartbeatIntervalMs: options.streamHeartbeatIntervalMs,
 			rawSilenceTimeoutMs: options.streamRawSilenceTimeoutMs,
 		};
+		try {
+			const observer = options.characterizationObserver;
+			const candidateGate = options.characterizationObservationGate;
+			if (typeof observer === "function") {
+				const context = createServerToolCharacterizationContext({
+					ignoredSymbols: [SOURCE_MESSAGE_INDEX, SOURCE_CACHE_MARKED],
+				});
+				this.characterizationObserver = observer;
+				this.characterizationContext = context;
+				if (typeof candidateGate === "function") {
+					this.characterizationObservationGate = candidateGate;
+				}
+			}
+		} catch {
+			// Characterization is test-service instrumentation and must stay inert.
+		}
+	}
+
+	private observeServerToolCharacterization(
+		kind: ServerToolCharacterizationKind,
+		payload: unknown,
+	): void {
+		const observer = this.characterizationObserver;
+		const context = this.characterizationContext;
+		if (!observer || !context) return;
+		const gate = this.characterizationObservationGate;
+		if (gate) {
+			try {
+				if (gate(kind) !== true) return;
+			} catch {
+				return;
+			}
+		}
+		try {
+			context.emit(observer, kind, payload);
+		} catch {
+			// Observation must never alter provider bytes, retries, or control flow.
+		}
 	}
 
 	getLogicalModelCapability(
@@ -1047,6 +1100,9 @@ export class CodexProvider extends BaseProvider {
 			newHeaders.delete("x-better-ccflare-pacing-action");
 			newHeaders.delete("content-length");
 
+			if (this.characterizationObserver && this.characterizationContext) {
+				this.observeServerToolCharacterization("outbound_request", codexBody);
+			}
 			return new Request(request.url, {
 				method: request.method,
 				headers: newHeaders,
@@ -1095,6 +1151,26 @@ export class CodexProvider extends BaseProvider {
 			this.requestStreamById.delete(requestId);
 		}
 		const isEventStream = contentType?.includes("text/event-stream") ?? false;
+		if (this.characterizationObserver && this.characterizationContext) {
+			const normalizedContentType = contentType
+				?.split(";", 1)[0]
+				?.trim()
+				.toLowerCase();
+			this.observeServerToolCharacterization("response_metadata", {
+				status: response.status,
+				ok: response.ok,
+				body_present: response.body !== null,
+				requested_stream: requestedStream,
+				content_type_class: isEventStream
+					? "event_stream"
+					: contentType === null
+						? "missing"
+						: normalizedContentType === "application/json"
+							? "json"
+							: "other",
+				turn_state_present: turnStateHeaderPresent,
+			});
+		}
 		if (isEventStream) {
 			if (requestedStream) {
 				return this.transformStreamingResponse(
@@ -2673,6 +2749,12 @@ export class CodexProvider extends BaseProvider {
 							continue;
 						}
 
+						if (this.characterizationObserver && this.characterizationContext) {
+							this.observeServerToolCharacterization("upstream_event", {
+								event: eventName,
+								data,
+							});
+						}
 						await this.handleCodexEvent(
 							eventName,
 							data,
