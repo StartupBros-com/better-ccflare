@@ -1276,7 +1276,7 @@ describe("server-tool characterization sanitizer", () => {
 		};
 		expect(() =>
 			emitServerToolCharacterization(
-				() => returnedThenable as unknown as void,
+				() => returnedThenable as unknown as undefined,
 				"upstream_event",
 				{ status: "completed" },
 			),

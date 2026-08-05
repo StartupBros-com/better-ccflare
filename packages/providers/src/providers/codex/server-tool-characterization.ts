@@ -920,7 +920,7 @@ function sanitizeObject(
 				return undefined;
 			}
 			const descriptor = Object.getOwnPropertyDescriptor(input, key);
-			if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) {
+			if (!descriptor?.enumerable || !("value" in descriptor)) {
 				return undefined;
 			}
 		}
@@ -1169,7 +1169,7 @@ function snapshotObject(
 				return undefined;
 			}
 			const descriptor = Object.getOwnPropertyDescriptor(value, key);
-			if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) {
+			if (!descriptor?.enumerable || !("value" in descriptor)) {
 				return undefined;
 			}
 			const child = snapshotSanitizedValue(
