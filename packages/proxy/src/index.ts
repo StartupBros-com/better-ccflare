@@ -112,6 +112,17 @@ export {
 	refreshModelCatalog,
 } from "./model-catalog";
 export {
+	MODEL_ROUTE_PROFILE_MODEL_PREFIX,
+	MODEL_ROUTE_PROFILES_ENV,
+	type ModelRouteEffort,
+	type ModelRouteProfile,
+	type ModelRouteResolution,
+	type ModelRouteResolutionInput,
+	ModelRouteSessionRegistry,
+	type ModelRouteSessionRegistryOptions,
+	parseModelRouteProfiles,
+} from "./model-route-profiles";
+export {
 	drainUsageCollector,
 	getUsageCollectorHealth,
 	handleProxy,
@@ -129,7 +140,9 @@ export {
 export {
 	clearSession,
 	getServedAccount,
+	getServedAccountObservation,
 	recordServedAccount,
+	type SessionAccountObservation,
 } from "./session-account-observer";
 export type { ProxyRequest, ProxyResponse } from "./types";
 export type { UsageCollectorHealth } from "./usage-collector";

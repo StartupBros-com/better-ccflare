@@ -35,6 +35,7 @@ const { getProvider, registerProvider, usageCache } = await import(
 const { SessionStrategy } = await import("@better-ccflare/load-balancer");
 const {
 	ForceRouteUnavailableError,
+	getClientVisibleServerToolAccountId,
 	getCapacityDeferredModelRoutes,
 	getComboSlotInfo,
 	getReactiveModelCapacityBlocker,
@@ -317,6 +318,35 @@ describe("setComboSlotInfo / getComboSlotInfo", () => {
 			slots: [{ accountId: "a", modelOverride: "m" }],
 		});
 		expect(getComboSlotInfo(meta2)).toBeNull();
+	});
+});
+
+describe("getClientVisibleServerToolAccountId", () => {
+	it("preserves public force-route account ids", () => {
+		expect(
+			getClientVisibleServerToolAccountId(
+				makeRequestMeta(),
+				"public-account-id",
+			),
+		).toBe("public-account-id");
+	});
+
+	it("redacts private account ids from profile-originated routes", () => {
+		expect(
+			getClientVisibleServerToolAccountId(
+				makeRequestMeta({ routeProfileId: "pro-primary-sol" }),
+				"private-account-id",
+			),
+		).toBeUndefined();
+	});
+
+	it("treats any present profile marker as private", () => {
+		expect(
+			getClientVisibleServerToolAccountId(
+				makeRequestMeta({ routeProfileId: "" }),
+				"private-account-id",
+			),
+		).toBeUndefined();
 	});
 });
 
@@ -715,6 +745,206 @@ describe("selectAccountsForRequest — x-better-ccflare-account-id header", () =
 			reason: "lookup_failed",
 		});
 		expect(ctx.strategy.select).not.toHaveBeenCalled();
+	});
+});
+
+describe("selectAccountsForRequest — server-derived route profile", () => {
+	it("uses the server-derived forced account without consulting normal routing", async () => {
+		const forced = makeAccount({
+			id: "route-account",
+			provider: "codex",
+			model_mappings: JSON.stringify({
+				"claude-opus-5": "gpt-5.6-sol",
+			}),
+		});
+		const fallback = makeAccount({ id: "fallback" });
+		const ctx = makeCtx({ accounts: [fallback, forced] });
+		const meta = makeRequestMeta({
+			forcedAccountId: forced.id,
+			routeProfileId: "pro-primary-sol",
+			routeExpectedProvider: "codex",
+			routeExpectedPhysicalModel: "gpt-5.6-sol",
+		});
+
+		const result = await selectAccountsForRequest(meta, ctx, "claude-opus-5");
+		expect(result.map((account) => account.id)).toEqual([forced.id]);
+		expect(ctx.strategy.select).not.toHaveBeenCalled();
+	});
+
+	for (const profileCase of [
+		{
+			kind: "invalid",
+			expectedReason: "invalid_requirement",
+			requirements: Object.freeze({
+				...SERVER_TOOL_REQUIREMENTS,
+				invalid: Object.freeze([
+					Object.freeze({
+						type: "web_search_20250305",
+						reason: "invalid_options" as const,
+					}),
+				]),
+			}),
+		},
+		{
+			kind: "unsupported",
+			expectedReason: "unsupported_requirement",
+			requirements: Object.freeze({
+				...SERVER_TOOL_REQUIREMENTS,
+				unsupported: Object.freeze([
+					Object.freeze({ type: "future_server_tool" }),
+				]),
+			}),
+		},
+		{
+			kind: "incapable",
+			expectedReason: "forced_incapable",
+			requirements: SERVER_TOOL_REQUIREMENTS,
+		},
+	] as const) {
+		it(`redacts the private account id from an initial ${profileCase.kind} server-tool terminal`, async () => {
+			const providerName = `profile-initial-${profileCase.kind}`;
+			installCapabilityProvider({
+				name: providerName,
+				decision: () => ({
+					decision: "unknown",
+					reason: "no_exact_proof",
+				}),
+			});
+			const forced = makeAccount({
+				id: `private-${profileCase.kind}-account-id`,
+				provider: providerName,
+				model_mappings: JSON.stringify({ opus: "physical-profile-model" }),
+			});
+			const ctx = makeCtx({ accounts: [forced] });
+			const meta = serverToolMeta({
+				forcedAccountId: forced.id,
+				routeProfileId: "pro-primary-sol",
+				serverToolRequirements: profileCase.requirements,
+			});
+
+			try {
+				await selectAccountsForRequest(meta, ctx, "claude-opus-4-8");
+				expect.unreachable("expected a profile server-tool terminal");
+			} catch (error) {
+				expect(error).toMatchObject({
+					name: "ServerToolRoutingError",
+					reason: profileCase.expectedReason,
+				});
+				expect((error as { accountId?: string }).accountId).toBeUndefined();
+			}
+			expect(ctx.strategy.select).not.toHaveBeenCalled();
+		});
+	}
+
+	it("fails a server-derived route closed when its provider is excluded", async () => {
+		const forced = makeAccount({ id: "route-account", provider: "codex" });
+		const fallback = makeAccount({ id: "fallback", provider: "anthropic" });
+		const ctx = makeCtx({ accounts: [forced, fallback] });
+		const meta = makeRequestMeta({
+			forcedAccountId: forced.id,
+			routeProfileId: "pro-primary-sol",
+			headers: new Headers({
+				"x-better-ccflare-exclude-providers": "codex",
+			}),
+		});
+
+		await expect(
+			selectAccountsForRequest(meta, ctx, "claude-opus-5"),
+		).rejects.toMatchObject({
+			accountId: forced.id,
+			reason: "provider_excluded",
+		});
+		expect(ctx.strategy.select).not.toHaveBeenCalled();
+	});
+
+	it("rejects conflicting public and server-derived force routes", async () => {
+		const ctx = makeCtx({
+			accounts: [makeAccount({ id: "server" }), makeAccount({ id: "public" })],
+		});
+		const meta = makeRequestMeta({
+			forcedAccountId: "server",
+			routeProfileId: "profile",
+			headers: new Headers({ "x-better-ccflare-account-id": "public" }),
+		});
+
+		await expect(selectAccountsForRequest(meta, ctx)).rejects.toMatchObject({
+			accountId: "server",
+			reason: "conflicting_force_route",
+		});
+		expect(ctx.dbOps.getAllAccounts).not.toHaveBeenCalled();
+		expect(ctx.strategy.select).not.toHaveBeenCalled();
+	});
+
+	it("allows matching public and server-derived force routes", async () => {
+		const account = makeAccount({ id: "same" });
+		const ctx = makeCtx({ accounts: [account] });
+		const meta = makeRequestMeta({
+			forcedAccountId: account.id,
+			routeProfileId: "profile",
+			headers: new Headers({
+				"x-better-ccflare-account-id": account.id,
+			}),
+		});
+
+		const result = await selectAccountsForRequest(meta, ctx);
+		expect(result.map(({ id }) => id)).toEqual([account.id]);
+	});
+
+	it("fails closed when the route profile targets the wrong provider", async () => {
+		const account = makeAccount({ id: "account", provider: "codex" });
+		const fallback = makeAccount({ id: "fallback" });
+		const ctx = makeCtx({ accounts: [account, fallback] });
+		const meta = makeRequestMeta({
+			forcedAccountId: account.id,
+			routeProfileId: "profile",
+			routeExpectedProvider: "anthropic",
+		});
+
+		await expect(
+			selectAccountsForRequest(meta, ctx, "claude-opus-5"),
+		).rejects.toMatchObject({
+			accountId: account.id,
+			reason: "provider_mismatch",
+		});
+		expect(ctx.strategy.select).not.toHaveBeenCalled();
+	});
+
+	it("fails closed when the first physical model mapping differs", async () => {
+		const account = makeAccount({
+			id: "account",
+			provider: "codex",
+			model_mappings: JSON.stringify({
+				"claude-opus-5": ["gpt-5.6-terra", "gpt-5.6-sol"],
+			}),
+		});
+		const ctx = makeCtx({ accounts: [account] });
+		const meta = makeRequestMeta({
+			forcedAccountId: account.id,
+			routeProfileId: "profile",
+			routeExpectedProvider: "codex",
+			routeExpectedPhysicalModel: "gpt-5.6-sol",
+		});
+
+		await expect(
+			selectAccountsForRequest(meta, ctx, "claude-opus-5"),
+		).rejects.toMatchObject({
+			accountId: account.id,
+			reason: "model_mapping_mismatch",
+		});
+		expect(ctx.strategy.select).not.toHaveBeenCalled();
+	});
+
+	it("validates the unchanged logical model when the account has no mappings", async () => {
+		const account = makeAccount({ id: "account", provider: "anthropic" });
+		const ctx = makeCtx({ accounts: [account] });
+		const meta = makeRequestMeta({
+			forcedAccountId: account.id,
+			routeProfileId: "profile",
+			routeExpectedPhysicalModel: "claude-opus-5",
+		});
+
+		const result = await selectAccountsForRequest(meta, ctx, "claude-opus-5");
+		expect(result).toEqual([account]);
 	});
 });
 

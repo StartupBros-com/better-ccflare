@@ -64,7 +64,8 @@ type SessionAccountBody = {
 	data: {
 		status: "known" | "unknown";
 		account?: {
-			id: string;
+			id?: string;
+			profileModelId?: string;
 			name: string;
 			provider: string;
 			paused: boolean;
@@ -119,6 +120,8 @@ describe("createSessionAccountHandler", () => {
 		const body = (await res.json()) as SessionAccountBody;
 		expect(body.success).toBe(true);
 		expect(body.data.status).toBe("known");
+		expect(body.data.account?.id).toBe(ACCOUNT_ID);
+		expect(body.data.account?.profileModelId).toBeUndefined();
 		expect(body.data.account?.name).toBe("healthy-acct");
 		expect(body.data.account?.usageUtilization).toBe(30);
 		expect(body.data.account?.usageWindow).toBe("five_hour");
@@ -135,6 +138,34 @@ describe("createSessionAccountHandler", () => {
 		expect(w.find((x) => x.window === "five_hour")?.resetMs).toBeGreaterThan(
 			now,
 		);
+	});
+
+	it("redacts the raw account id for a model-route-profile observation", async () => {
+		recordServedAccount(SESSION, ACCOUNT_ID, Date.now(), "pro-primary-sol");
+		const account = makeAccount({
+			id: ACCOUNT_ID,
+			name: "profile-serving-account",
+		});
+		const handler = createSessionAccountHandler(
+			makeDbOps([account]),
+			makeConfig(),
+		);
+
+		const res = await handler(SESSION);
+		const raw = await res.text();
+		const body = JSON.parse(raw) as SessionAccountBody;
+
+		expect(res.status).toBe(200);
+		expect(raw).not.toContain(ACCOUNT_ID);
+		expect(body.data.status).toBe("known");
+		expect(body.data.account).toMatchObject({
+			profileModelId: "claude-bccf-route-pro-primary-sol",
+			name: "profile-serving-account",
+			provider: "anthropic",
+			paused: false,
+			rateLimitStatus: "OK",
+		});
+		expect(body.data.account?.id).toBeUndefined();
 	});
 
 	it("composes usage provider-aware for a non-anthropic (zai) account", async () => {

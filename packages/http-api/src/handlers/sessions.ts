@@ -13,8 +13,9 @@ import {
 	usageCache,
 } from "@better-ccflare/providers";
 import {
-	getServedAccount,
+	getServedAccountObservation,
 	getUsageThrottleStatus,
+	MODEL_ROUTE_PROFILE_MODEL_PREFIX,
 } from "@better-ccflare/proxy";
 import {
 	computeRateLimitStatusDisplay,
@@ -37,10 +38,13 @@ interface LimitWindow {
 	resetMs: number | null;
 }
 
+type SessionAccountIdentity =
+	| { id: string; profileModelId?: never }
+	| { id?: never; profileModelId: string };
+
 interface SessionAccountData {
 	status: "known" | "unknown";
-	account?: {
-		id: string;
+	account?: SessionAccountIdentity & {
 		name: string;
 		provider: string;
 		paused: boolean;
@@ -184,13 +188,14 @@ export function createSessionAccountHandler(
 			return errorResponse(BadRequest("Session id cannot be empty"));
 		}
 
-		const accountId = getServedAccount(trimmed);
-		if (!accountId) {
+		const observation = getServedAccountObservation(trimmed);
+		if (!observation) {
 			// No live association for this session (fresh chat, proxy restart, or an
 			// older/non-Claude-Code client that sends no session header). AE2, AE4.
 			return unknownResponse();
 		}
 
+		const { accountId, routeProfileId } = observation;
 		const accounts = await dbOps.getAllAccounts();
 		const account = accounts.find((a) => a.id === accountId);
 		if (!account) {
@@ -276,7 +281,11 @@ export function createSessionAccountHandler(
 		const data: SessionAccountData = {
 			status: "known",
 			account: {
-				id: account.id,
+				...(routeProfileId === null
+					? { id: account.id }
+					: {
+							profileModelId: `${MODEL_ROUTE_PROFILE_MODEL_PREFIX}${routeProfileId}`,
+						}),
 				name: account.name,
 				provider,
 				paused: account.paused,

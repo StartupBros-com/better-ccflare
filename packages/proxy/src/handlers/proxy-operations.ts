@@ -74,6 +74,7 @@ import {
 	stageCacheBodyForTransportAttempt,
 	stripCacheControlFromReplayBody,
 } from "../cache-transport-staging";
+import { isClaudeCodeSubagent } from "../claude-code-request";
 import {
 	type CodexWebSocketReceipt,
 	codexWebSocketTransport,
@@ -107,10 +108,6 @@ import {
 } from "../session-account-observer";
 import { combineChunks } from "../stream-tee";
 import { isModelRewrite } from "../worker-messages";
-import {
-	GUARD_CORRELATION_SECRET_HEADER,
-	GUARD_REQUEST_ID_HEADER,
-} from "./internal-transport-headers";
 import {
 	ERROR_MESSAGES,
 	isInternalProbe,
@@ -235,23 +232,8 @@ function isSyntheticInternalRequest(headers: Headers): boolean {
 const SYNTHETIC_RESPONSE_HEADER = "x-better-ccflare-synthetic-response";
 const SYNTHETIC_STATUS_HEADER = "x-better-ccflare-synthetic-status";
 const SYNTHETIC_RESPONSE_URL_PREFIX = "https://better-ccflare.local/";
-const INTERNAL_TRANSPORT_HEADERS = [
-	GUARD_CORRELATION_SECRET_HEADER,
-	GUARD_REQUEST_ID_HEADER,
-	"x-better-ccflare-request-id",
-	"x-better-ccflare-attempt-id",
-	"x-better-ccflare-attempt-ordinal",
-	"x-better-ccflare-attempt-cause",
-	"x-better-ccflare-final-model",
-	"x-better-ccflare-pacing-canary",
-	"x-better-ccflare-pacing-cohort-id",
-	"x-better-ccflare-pacing-action",
-	"x-better-ccflare-request-stream",
-	"x-better-ccflare-attributed-agent",
-	CODEX_LOGICAL_MODEL_FAMILY_HEADER,
-	CACHE_REPLAY_MODEL_HEADER,
-] as const;
-const ANTHROPIC_BILLING_HEADER = "x-anthropic-billing-header";
+const INTERNAL_TRANSPORT_HEADER_PREFIX = "x-better-ccflare-";
+const TRUSTED_SYNTHETIC_HEADER_PREFIX = "x-better-ccflare-synthetic-";
 const CODEX_CACHE_LANE_RESCUE_RESERVE_MAX_MS = 30_000;
 const CODEX_CACHE_LANE_RESCUE_RESERVE_DIVISOR = 4;
 const TEST_CONTEXT_WINDOW_ENV =
@@ -638,33 +620,51 @@ export function createContextLengthExceededResponse(
 	);
 }
 
-function isBillingAttributedSubagent(headers: Headers): boolean {
-	const billing = headers.get(ANTHROPIC_BILLING_HEADER);
-	if (!billing) return false;
-	return billing.split(";").some((field) => {
-		const separator = field.indexOf("=");
-		if (separator < 0) return false;
-		return (
-			field.slice(0, separator).trim() === "cc_is_subagent" &&
-			field.slice(separator + 1).trim() === "true"
-		);
-	});
+function sanitizeInternalHeadersCopy(
+	headers: Headers,
+	preserveTrustedSyntheticMarkers: boolean,
+): { headers: Headers; changed: boolean } {
+	const sanitized = new Headers(headers);
+	let changed = false;
+	for (const name of [...sanitized.keys()]) {
+		const normalizedName = name.toLowerCase();
+		if (!normalizedName.startsWith(INTERNAL_TRANSPORT_HEADER_PREFIX)) continue;
+		if (
+			preserveTrustedSyntheticMarkers &&
+			normalizedName.startsWith(TRUSTED_SYNTHETIC_HEADER_PREFIX)
+		) {
+			continue;
+		}
+		sanitized.delete(name);
+		changed = true;
+	}
+	return { headers: sanitized, changed };
 }
 
 export function sanitizeInternalHeaders(headers: Headers): Headers {
-	const sanitized = new Headers(headers);
-	for (const name of INTERNAL_TRANSPORT_HEADERS) sanitized.delete(name);
-	return sanitized;
+	return sanitizeInternalHeadersCopy(headers, false).headers;
+}
+
+function isTrustedSyntheticProviderResponse(request: Request): boolean {
+	return (
+		request.headers.get(SYNTHETIC_RESPONSE_HEADER) === "true" &&
+		request.url.startsWith(SYNTHETIC_RESPONSE_URL_PREFIX)
+	);
 }
 
 /** Strip proxy-only metadata from a concrete request before upstream fetch. */
 function sanitizeInternalTransportHeaders(request: Request): Request {
-	if (!INTERNAL_TRANSPORT_HEADERS.some((name) => request.headers.has(name))) {
+	const preserveSyntheticMarkers = isTrustedSyntheticProviderResponse(request);
+	const { headers: sanitizedHeaders, changed } = sanitizeInternalHeadersCopy(
+		request.headers,
+		preserveSyntheticMarkers,
+	);
+	if (!changed) {
 		return request;
 	}
 	return new Request(request.url, {
 		method: request.method,
-		headers: sanitizeInternalHeaders(request.headers),
+		headers: sanitizedHeaders,
 		body: request.body,
 		...(request.body ? { duplex: "half" as const } : {}),
 	});
@@ -757,8 +757,7 @@ function isSyntheticProviderResponse(request: Request): boolean {
 	return (
 		(request.headers.get("x-bedrock-response") === "true" &&
 			request.url.startsWith("https://bedrock.aws/response")) ||
-		(request.headers.get(SYNTHETIC_RESPONSE_HEADER) === "true" &&
-			request.url.startsWith(SYNTHETIC_RESPONSE_URL_PREFIX))
+		isTrustedSyntheticProviderResponse(request)
 	);
 }
 
@@ -2357,8 +2356,7 @@ export async function proxyWithAccount(
 					prepared.set(CODEX_LOGICAL_MODEL_FAMILY_HEADER, logicalModelFamily);
 				}
 				const isAttributedAgent =
-					Boolean(requestMeta.agentUsed) ||
-					isBillingAttributedSubagent(req.headers);
+					Boolean(requestMeta.agentUsed) || isClaudeCodeSubagent(req.headers);
 				// Client-supplied copies are untrusted. Strip before attaching only
 				// server-derived experiment metadata so traces cannot be spoofed or
 				// retain arbitrary sensitive header content.
@@ -2772,17 +2770,17 @@ export async function proxyWithAccount(
 			resolvedModel?: string | null,
 			reservation?: PhysicalSendReservation,
 		): Promise<Response> => {
+			// Codex replaces any client copy with its trusted, derived conversation
+			// identity during transformation. Capture that local transport hint before
+			// the broad private-header sanitizer removes it from the wire request.
 			const webSocketConversationIdentity =
 				attemptPlan.providerName === "codex"
 					? transportRequest.headers.get(CODEX_CONVERSATION_ID_HEADER)
 					: null;
-			if (transportRequest.headers.has(CODEX_CONVERSATION_ID_HEADER)) {
-				const wireHeaders = new Headers(transportRequest.headers);
-				wireHeaders.delete(CODEX_CONVERSATION_ID_HEADER);
-				transportRequest = new Request(transportRequest, {
-					headers: wireHeaders,
-				});
-			}
+			// Every transport attempt, including retries, passes this final boundary.
+			// Preserve only trusted local synthetic-response markers; no
+			// x-better-ccflare-* metadata may reach a real upstream transport.
+			transportRequest = sanitizeInternalTransportHeaders(transportRequest);
 			const isSynthetic = isSyntheticProviderResponse(transportRequest);
 			latestPhysicalAnthropicCohortKey = isSynthetic
 				? null
@@ -2930,9 +2928,6 @@ export async function proxyWithAccount(
 			url.pathname === "/v1/messages" &&
 			xaiCacheOfficialEndpoint &&
 			Boolean(requestMeta.cacheFlightRecorderConversationId);
-		// Defense-in-depth: providers normally consume these before returning,
-		// but transform fallbacks may return the original request.
-		transformedRequest = sanitizeInternalTransportHeaders(transformedRequest);
 		const isSyntheticResponse = isSyntheticProviderResponse(transformedRequest);
 
 		// Pre-strip cache_control for (account, model) pairs known to reject it
@@ -3245,11 +3240,7 @@ export async function proxyWithAccount(
 				);
 				retryTransformedTemplate = retryTransformedRequest.clone();
 
-				// Preserve internal metadata through the transform for tracing, then
-				// strip it from the concrete transport request.
-				const retryTransportRequest = sanitizeInternalTransportHeaders(
-					retryTransformedTemplate.clone(),
-				);
+				const retryTransportRequest = retryTransformedTemplate.clone();
 				currentReplayBody = filteredBodyBuffer;
 				currentCacheIdentityHasCacheControl = undefined;
 				// Make the retry request (or unwrap a synthetic provider response)
@@ -3308,9 +3299,7 @@ export async function proxyWithAccount(
 				);
 				retryTransformedTemplate = retryTransformedRequest.clone();
 
-				const retryTransportRequest = sanitizeInternalTransportHeaders(
-					retryTransformedTemplate.clone(),
-				);
+				const retryTransportRequest = retryTransformedTemplate.clone();
 				currentReplayBody = strippedBodyBuffer;
 				currentCacheIdentityHasCacheControl = undefined;
 				rawResponse = await executeCacheAwareProviderAttempt(
@@ -3387,7 +3376,7 @@ export async function proxyWithAccount(
 				});
 				const retryTransport = new Request(retryTransformed.url, {
 					method: retryTransformed.method,
-					headers: sanitizeInternalHeaders(retryTransformed.headers),
+					headers: retryTransformed.headers,
 					body: retryTransformedBody,
 				});
 				rawResponse = await executeCacheAwareProviderAttempt(
@@ -3438,9 +3427,7 @@ export async function proxyWithAccount(
 						retrySource,
 					);
 					retryTransformedTemplate = retryTransformed.clone();
-					retryRequest = sanitizeInternalTransportHeaders(
-						retryTransformedTemplate.clone(),
-					);
+					retryRequest = retryTransformedTemplate.clone();
 				} else {
 					const retryBodyText = JSON.stringify(retryBodyJson);
 					retryRequest = new Request(transformedRequest.url, {
@@ -4404,11 +4391,7 @@ export async function proxyWithAccount(
 						targetUrl = fallbackPlan.targetUrl;
 						retryTransformedTemplate = retryTransformedRequest.clone();
 
-						// Fallback transforms need internal correlation metadata, but the
-						// concrete transport request must never carry it upstream.
-						const retryTransportRequest = sanitizeInternalTransportHeaders(
-							retryTransformedRequest,
-						);
+						const retryTransportRequest = retryTransformedRequest;
 						currentReplayBody = patchedBody;
 						currentCacheIdentityHasCacheControl = undefined;
 						// Attribution advances only once a concrete request is ready to
@@ -4610,9 +4593,7 @@ export async function proxyWithAccount(
 				const retryCfg = getOverloadRetryConfig();
 				if (retryCfg.enabled && retryCfg.maxAttempts > 1) {
 					for (let attempt = 1; attempt < retryCfg.maxAttempts; attempt++) {
-						let retryTransport = sanitizeInternalTransportHeaders(
-							retryTransformedTemplate.clone(),
-						);
+						let retryTransport = retryTransformedTemplate.clone();
 						// Reserve before backoff or touching the trusted 529. A denied
 						// follower returns it untouched to the outer terminal authority.
 						const degradedReservation = reservePhysicalSend(
@@ -4666,8 +4647,7 @@ export async function proxyWithAccount(
 									currentTransportModel,
 								);
 							}
-							retryTransport =
-								sanitizeInternalTransportHeaders(retryTransformed);
+							retryTransport = retryTransformed;
 						} else {
 							// Non-codex providers reach this loop too (the anthropic
 							// provider marks bare 529 overloaded_error responses as rate
@@ -5099,9 +5079,7 @@ export async function proxyWithAccount(
 					const rescueBodyText = await rescueTransformedRequest.clone().text();
 					currentCacheIdentityHasCacheControl =
 						hasCacheControlHintInJsonText(rescueBodyText);
-					const rescueTransportRequest = sanitizeInternalTransportHeaders(
-						rescueTransformedRequest,
-					);
+					const rescueTransportRequest = rescueTransformedRequest;
 					rawResponse = await executeCacheAwareProviderAttempt(
 						rescueTransportRequest,
 						currentReplayBody,

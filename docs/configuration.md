@@ -9,6 +9,7 @@ This guide covers all configuration options for better-ccflare, including file-b
 - [Configuration File Format](#configuration-file-format)
 - [Configuration Options](#configuration-options)
 - [Environment Variables](#environment-variables)
+- [Claude Code Model Route Profiles](#claude-code-model-route-profiles)
 - [Anthropic Degraded Mode](#anthropic-degraded-mode)
 - [Model Catalog](#model-catalog)
 - [Runtime Configuration API](#runtime-configuration-api)
@@ -130,6 +131,7 @@ These environment variables are not stored in the configuration file and must be
 | `BETTER_CCFLARE_MODELS_OFFLINE` | Disable scheduled/manual model catalog refresh **and** passive `/v1/models` capture | - | `BETTER_CCFLARE_MODELS_OFFLINE=1` |
 | `BETTER_CCFLARE_MODELS_CACHE_DIR` | Directory for the persisted model catalog cache file. Use a persistent directory (not a tmpdir that's wiped on restart) to keep the refresh schedule stable across restarts | Platform tmp dir | `BETTER_CCFLARE_MODELS_CACHE_DIR=/var/lib/better-ccflare` |
 | `BETTER_CCFLARE_MODELS_OAUTH_REFRESH` | Allow OAuth accounts as a fallback source for *scheduled* model catalog refreshes when no console/API-key account is eligible. Same as the `model_catalog_oauth_refresh_enabled` config file field; env var takes precedence. Manual refreshes (`POST /api/models/refresh`) always allow the OAuth fallback regardless of this setting | - (console-only) | `BETTER_CCFLARE_MODELS_OAUTH_REFRESH=1` |
+| `CCFLARE_MODEL_ROUTE_PROFILES_JSON` | Restart-scoped Claude Code `/model` route profiles. The value is a strict JSON array; malformed nonblank input prevents startup | unset (disabled) | See [Claude Code Model Route Profiles](#claude-code-model-route-profiles) |
 | `BETTER_CCFLARE_HOST` | Server binding host | `0.0.0.0` | `BETTER_CCFLARE_HOST=127.0.0.1` (localhost-only) |
 | `SSL_KEY_PATH` / `SSL_CERT_PATH` | SSL private key / certificate paths for HTTPS | - | `SSL_KEY_PATH=/path/to/key.pem` |
 | `CCFLARE_OVERLOAD_RETRY_ENABLED` | In-place retry of Anthropic 529 "no reset" overloads before falling back to account cooldown | `true` | `CCFLARE_OVERLOAD_RETRY_ENABLED=false` |
@@ -162,6 +164,65 @@ These environment variables are not stored in the configuration file and must be
 | `CF_STREAM_USAGE_BUFFER_KB` | Stream usage buffer size in KB | `64` | `CF_STREAM_USAGE_BUFFER_KB=128` |
 | `CF_STREAM_TIMEOUT_MS` | Stream processing timeout in milliseconds | `60000` (1 minute) | `CF_STREAM_TIMEOUT_MS=120000` |
 | `BETTER_CCFLARE_OUTBOUND_PROXY` | Routes all outbound HTTP(S) traffic through a forward proxy | unset | `BETTER_CCFLARE_OUTBOUND_PROXY=http://127.0.0.1:3636` |
+
+## Claude Code Model Route Profiles
+
+`CCFLARE_MODEL_ROUTE_PROFILES_JSON` adds operator-defined, exact-account routes to Claude Code's native `/model` picker. The setting is read once at process start. Unset or whitespace-only input configures no profiles and preserves the existing `/v1/models` pass-through behavior. A nonblank value must be valid and conform to the schema below; malformed JSON, unknown fields, duplicate IDs, or invalid values abort startup instead of silently disabling an intended pin.
+
+The value is a JSON array with at most 32 objects. This example deliberately uses placeholder account and model values:
+
+```bash
+CCFLARE_MODEL_ROUTE_PROFILES_JSON='[
+  {
+    "id": "premium-reasoning",
+    "displayName": "Premium reasoning route",
+    "description": "Pins one Claude Code session tree to a dedicated account",
+    "accountId": "00000000-0000-0000-0000-000000000000",
+    "logicalModel": "claude-example-model",
+    "defaultEffort": "xhigh",
+    "expectedProvider": "example-provider",
+    "expectedPhysicalModel": "example-physical-model"
+  }
+]'
+```
+
+| Field | Required | Contract |
+|---|---:|---|
+| `id` | yes | Unique lowercase kebab-case slug, up to 48 characters. better-ccflare generates the reserved public model ID `claude-bccf-route-<id>`; clients cannot configure a different public ID |
+| `displayName` | yes | Picker label, 1–120 characters |
+| `description` | no | Operator-facing description, up to 500 characters |
+| `accountId` | yes | Exact better-ccflare account ID to pin. It is never returned by the discovery endpoint |
+| `logicalModel` | yes | Claude request model written on an explicit root selection before the account's normal model mapping is applied |
+| `defaultEffort` | no | Default used only when the request omits effort. Accepted values: `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`; an explicit client effort always wins |
+| `expectedProvider` | no | Lowercase provider guard. If the target account's provider differs, the route fails closed |
+| `expectedPhysicalModel` | no | Guard for the first physical model produced by the account's mapping for `logicalModel`. A mismatch fails closed |
+
+At startup, better-ccflare logs only the configured profile count, never the JSON, account IDs, logical models, or physical models. Because this configuration names exact account IDs, keep it in a protected environment file or service-manager credential rather than committing a real deployment value.
+
+### Claude Code `/model` setup
+
+Point Claude Code's Anthropic base URL and authentication at better-ccflare as usual, then enable [gateway model discovery](https://code.claude.com/docs/en/llm-gateway):
+
+```bash
+CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+```
+
+When at least one route profile is configured, authenticated `GET /v1/models` requests are answered locally with only each reserved public model ID and display name. Discovery does not select an account or contact an upstream provider. Claude Code labels these entries as gateway models in `/model`.
+
+The reserved IDs are intentionally opaque to Claude Code's built-in model-family inference. To expose effort, `xhigh`, and `max` controls for one discovered profile, pair that same public ID with Claude Code's [custom model option](https://code.claude.com/docs/en/model-config):
+
+```bash
+ANTHROPIC_CUSTOM_MODEL_OPTION=claude-bccf-route-premium-reasoning
+ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="Premium reasoning route"
+ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION="Pinned account with explicit effort controls"
+ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES=effort,xhigh_effort,max_effort,thinking,adaptive_thinking,interleaved_thinking
+```
+
+Gateway discovery can list multiple profiles; Claude Code's custom-model variables describe one option. Pairing the exact same ID augments that discovered row with the declared capabilities instead of creating a different route. `xhigh` and `max` remain explicit picker/request overrides: choosing the route does not silently force `max`, and `defaultEffort` applies only when Claude Code sends no effort.
+
+Selecting a profile on a root agent pins only that authenticated caller's Claude Code session tree. Child agents inherit the exact account but keep their own requested logical model, so a Sonnet subagent can still use that account's Sonnet mapping. Other sessions continue through ordinary better-ccflare routing. Switching the same root session back to a native Claude model clears its profile binding on the next root request.
+
+Bindings are process-local, bounded, and restart-scoped. Their TTL matches `session_duration_ms`, and a restart clears every binding. Missing, paused, unavailable, rate-limited, or quota-exhausted accounts fail closed without falling back to another account. Configured provider and physical-model guards also fail closed, as does a conflicting `x-better-ccflare-account-id` header. See [Account Routing Architecture](./routing-architecture.md#claude-code-model-route-profiles) for the request flow and inheritance boundary.
 
 ## Anthropic Degraded Mode
 

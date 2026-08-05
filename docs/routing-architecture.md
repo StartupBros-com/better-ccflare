@@ -1,6 +1,6 @@
 # Account Routing Architecture
 
-This document explains how better-ccflare picks an account for each proxied request: the master pipeline, the three load-balancing strategies, usage-throttling, model-family capacity routing, and auto-fallback. It is a technical reference for understanding *why* a given request landed on a given account — for user-facing setup guides see [Load Balancing](./load-balancing.md), [Auto-Fallback Configuration](./auto-fallback.md), [Combos](./combos.md), and [Configuration](./configuration.md).
+This document explains how better-ccflare picks an account for each proxied request: the master pipeline, Claude Code model route profiles, the three load-balancing strategies, usage-throttling, model-family capacity routing, and auto-fallback. It is a technical reference for understanding *why* a given request landed on a given account — for user-facing setup guides see [Load Balancing](./load-balancing.md), [Auto-Fallback Configuration](./auto-fallback.md), [Combos](./combos.md), and [Configuration](./configuration.md).
 
 > **Fork note.** This reference was ported from upstream (`tombii/better-ccflare`) and adjusted for this fork. Two upstream features it originally documented are not shipped here: the `session-drain-soonest` strategy (this fork registers only `session`, `least-used`, and `session-affinity`), and the `model_scoped_capacity_routing` on/off toggle (this fork's capacity routing is always on — see [Model-Capacity Routing](#model-capacity-routing)). This document also describes only the strategy layer; when a [Combo](./combos.md) or managed family routing is active, this fork runs an additional authoritative routing layer above it.
 
@@ -8,33 +8,38 @@ This document explains how better-ccflare picks an account for each proxied requ
 
 1. [Overview: Three Orthogonal Axes](#overview-three-orthogonal-axes)
 2. [Master Pipeline](#master-pipeline)
-3. [Anthropic Degraded Mode](#anthropic-degraded-mode)
-4. [The Three Load-Balancing Strategies](#the-three-load-balancing-strategies)
+3. [Claude Code Model Route Profiles](#claude-code-model-route-profiles)
+4. [Anthropic Degraded Mode](#anthropic-degraded-mode)
+5. [The Three Load-Balancing Strategies](#the-three-load-balancing-strategies)
    - [session](#session-sessionstrategy)
    - [session-affinity](#session-affinity-sessionaffinitystrategy)
    - [least-used](#least-used-leastusedstrategy)
-5. [Usage Throttling](#usage-throttling)
-6. [Model-Capacity Routing](#model-capacity-routing)
-7. [Auto-Fallback](#auto-fallback)
+6. [Usage Throttling](#usage-throttling)
+7. [Model-Capacity Routing](#model-capacity-routing)
+8. [Auto-Fallback](#auto-fallback)
 
 ## Overview: Three Orthogonal Axes
 
-Account routing is controlled by two independent runtime settings plus one always-on filter: the **load-balancing strategy** (`lb_strategy` — which of the three strategies below picks the candidate order), **usage-throttling** (`usage_throttling_five_hour_enabled` / `usage_throttling_weekly_enabled` — an optional pacing gate applied after strategy selection), and **model-family capacity routing** (always on in this fork; no `model_scoped_capacity_routing` toggle — a per-model-family exclusion filter). Any runtime "combination" you observe (e.g. `least-used` with weekly throttling on) is not a special combined mode — it is simply the master pipeline below with the configured strategy plugged into the `Strategy.select` step. Understanding the pipeline once is enough to reason about every valid combination.
+Ordinary account routing is controlled by two independent runtime settings plus one always-on filter: the **load-balancing strategy** (`lb_strategy` — which of the three strategies below picks the candidate order), **usage-throttling** (`usage_throttling_five_hour_enabled` / `usage_throttling_weekly_enabled` — an optional pacing gate applied after strategy selection), and **model-family capacity routing** (always on in this fork; no `model_scoped_capacity_routing` toggle — a per-model-family exclusion filter). Any runtime "combination" you observe (e.g. `least-used` with weekly throttling on) is not a special combined mode — it is simply the master pipeline below with the configured strategy plugged into the `Strategy.select` step. Understanding the pipeline once is enough to reason about every valid combination. An explicit or inherited [Claude Code model route profile](#claude-code-model-route-profiles) is an exact-account override above those ordinary candidate-order mechanisms, not a fourth strategy.
 
 ## Master Pipeline
 
-Every proxied request first checks for the `x-better-ccflare-account-id` force-route header (used both for manual force-routing and by internal auto-refresh/keepalive probes), then runs the configured strategy's `select()`, then an optional model-capacity filter, then an optional usage-throttling gate. If the candidate pool is empty afterwards, the response depends on *why* it emptied — the capacity filter and usage-throttling empty the pool for mutually exclusive reasons on a given request (the capacity filter runs first and, if it excludes everyone, usage-throttling never sees any accounts to throttle), so the code checks them in a fixed priority order: a capacity exclusion is reported first (as a structured 429), a throttling exclusion second (as a 529), and a strategy-level "nothing available at all" last (as a generic 503). When a [Combo](./combos.md) is active for the request's model family, an additional per-slot routing layer runs between the forced-header check and `Strategy.select`; it is omitted from the diagram below for clarity (see `packages/proxy/src/handlers/account-selector.ts`). The default-off [Anthropic degraded-mode](#anthropic-degraded-mode) admission gate sits below selection at every physical-send boundary; in `off` and `observe` the diagram remains behaviorally unchanged, while `enforce` can retain an owner for a matching session and can return a protected 529 before dispatching a matching large request.
+Every proxied inference request first resolves any configured model route profile and the `x-better-ccflare-account-id` force-route header (used both for manual force-routing and by internal auto-refresh/keepalive probes). A profile creates a server-derived exact-account directive; it never fabricates or forwards the public force-route header. Conflicting profile and public directives fail closed. A valid exact-account directive bypasses combos and the configured strategy, while a request without one runs combo routing when applicable and otherwise the strategy's `select()`. Model-capacity checks and the optional usage-throttling gate still apply. If the ordinary candidate pool is empty afterwards, the response depends on *why* it emptied — the capacity filter and usage-throttling empty the pool for mutually exclusive reasons on a given request (the capacity filter runs first and, if it excludes everyone, usage-throttling never sees any accounts to throttle), so the code checks them in a fixed priority order: a capacity exclusion is reported first (as a structured 429), a throttling exclusion second (as a 529), and a strategy-level "nothing available at all" last (as a generic 503). The default-off [Anthropic degraded-mode](#anthropic-degraded-mode) admission gate sits below selection at every physical-send boundary; in `off` and `observe` the diagram remains behaviorally unchanged, while `enforce` can retain an owner for a matching session and can return a protected 529 before dispatching a matching large request.
 
 ```mermaid
 flowchart TD
-    A["Incoming proxied request<br/>(e.g. POST /v1/messages)"] --> B{"Forced account header?<br/>(x-better-ccflare-account-id)"}
-    B -->|"Yes, account usable"| C["Use forced account only —<br/>skips strategy and capacity filter"]
-    B -->|"No / unusable"| D["Strategy.select()<br/>per configured lb_strategy"]
+    A["Incoming proxied request<br/>(e.g. POST /v1/messages)"] --> R{"Configured model route<br/>explicit or inherited?"}
+    R -->|"Yes"| C["Use server-derived exact account —<br/>skip combos and strategy"]
+    R -->|"No"| B{"Forced account header?<br/>(x-better-ccflare-account-id)"}
+    B -->|"Yes"| C
+    B -->|"No"| D["Combo route when active;<br/>otherwise Strategy.select()"]
+    C --> C2{"Exact route valid?<br/>Account available, capacity present,<br/>guards match, no conflict"}
+    C2 -->|"No"| C3["Fail closed —<br/>never select another account"]
+    C2 -->|"Yes"| H["applyUsageThrottling<br/>(5h / weekly pacing-line gate)"]
     D --> E{"Model-capacity routing<br/>mode = exhausted?"}
     E -->|"Yes"| F["Drop accounts capacity-excluded<br/>for the request's model family"]
     E -->|"No"| G["Ordered candidate accounts"]
     F --> G
-    C --> H["applyUsageThrottling<br/>(5h / weekly pacing-line gate)"]
     G --> H
     H --> I{"Any account available<br/>after throttling?"}
     I -->|"No"| J{"Why is the pool empty?"}
@@ -51,7 +56,39 @@ flowchart TD
     O -->|"No"| Q["Return response to client"]
 ```
 
-*Source: `packages/proxy/src/proxy.ts` (`handleProxy`, `applyUsageThrottling`), `packages/proxy/src/handlers/account-selector.ts` (`selectAccountsForRequest`).*
+*Source: `packages/proxy/src/proxy.ts` (`handleProxy`, `applyUsageThrottling`), `packages/proxy/src/model-route-profiles.ts`, and `packages/proxy/src/handlers/account-selector.ts` (`selectAccountsForRequest`).*
+
+## Claude Code Model Route Profiles
+
+Model route profiles let an operator expose exact-account routes in Claude Code's native `/model` picker without putting an account UUID in the public model ID. Profiles are disabled when `CCFLARE_MODEL_ROUTE_PROFILES_JSON` is absent or blank. When enabled, an authenticated `GET /v1/models` is answered locally with the reserved `claude-bccf-route-<profile-id>` IDs and display names. It performs no provider fetch and no account selection. See [Configuration](./configuration.md#claude-code-model-route-profiles) for the strict schema and Claude Code environment variables.
+
+An explicit root request using a profile's public model ID performs three operations in order:
+
+1. Replace the root request's public model ID with the profile's `logicalModel`, apply `defaultEffort` only if neither `output_config.effort` nor `reasoning.effort` was supplied, and stage a server-derived exact-account directive.
+2. Admit that exact route locally, including account availability, capacity, provider, and first-physical-model checks. A rejected route makes no provider request and does not create or replace a binding.
+3. After admission and before provider dispatch, bind the profile to the authenticated caller plus `X-Claude-Code-Session-Id` when both identities are available.
+
+The caller's explicit effort is authoritative, including `xhigh` or `max`; a profile default never overwrites it. The account's ordinary model mapping runs after the logical root model is set, so one profile can say “select this account with this logical model” while the mapping determines the physical provider model.
+
+Child-agent inheritance is intentionally narrower. A request identified as a Claude Code subagent and carrying the same authenticated caller/session identity inherits only the profile's exact account. Its own requested logical model is preserved, including a global or per-agent Sonnet/Haiku choice, and that model uses the pinned account's corresponding mapping. Children never create, replace, or clear bindings; a child carrying a reserved profile ID without an existing binding fails locally. A native **root** request in the same caller/session clears the binding. An explicit profile request without a usable caller/session identity still routes that one request exactly but cannot create a tree binding.
+
+```mermaid
+flowchart TD
+    A["Root selects<br/>claude-bccf-route-&lt;id&gt;"] --> C["Root: write logicalModel,<br/>default effort only when omitted"]
+    C --> D["Admit configured account + guards;<br/>fail locally on rejection"]
+    D --> B["Bind authenticated caller +<br/>Claude Code session ID"]
+    B --> E{"Next request in same<br/>caller/session tree"}
+    E -->|"Child agent"| F["Keep child's requested model;<br/>inherit account only"]
+    E -->|"Native root model"| G["Clear binding;<br/>resume ordinary routing"]
+    E -->|"Profile root model"| A
+    H["Different caller or session"] --> I["No binding;<br/>ordinary routing"]
+```
+
+Profile routes are fail-closed. A missing/stale account ID, manual pause, unavailable or rate-limited account, model-family quota exhaustion, provider-guard mismatch, first-physical-model mapping mismatch, or conflicting public force-route header returns an error instead of consulting a combo or strategy fallback. This preserves the meaning of manually selecting a dedicated route.
+
+The binding registry is process-local and capped at 10,000 session entries. Entries expire after the configured `session_duration_ms` of inactivity, oldest entries are evicted at the cap, and every restart clears the registry. Consequently, all requests in a pinned tree must reach the same better-ccflare server process; sharing SQLite or PostgreSQL across replicas does not share these bindings. Other authenticated callers and other Claude Code sessions are isolated and continue to use ordinary routing.
+
+*Source: `packages/proxy/src/model-route-profiles.ts`, `packages/proxy/src/proxy.ts` (`routeCallerIdentity`, `applyExplicitModelRoute`, `handleProxy`), and `packages/proxy/src/handlers/account-selector.ts` (`selectAccountsForRequest`).*
 
 ## Anthropic Degraded Mode
 

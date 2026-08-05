@@ -62,6 +62,8 @@ mock.module("@better-ccflare/proxy", () => {
 		handleProxy: async () => new Response(),
 		initModelCatalogRefresh: () => () => {},
 		initProxy: () => {},
+		ModelRouteSessionRegistry: class {},
+		parseModelRouteProfiles: () => [],
 		refreshModelCatalog: async () => ({ success: true }),
 		registerCodexUsageRefresher: () => {},
 		registerPollingRestarter: () => {},

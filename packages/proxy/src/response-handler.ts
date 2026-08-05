@@ -353,7 +353,12 @@ export async function forwardToClient(
 		// `timestamp` is the request's start time — the ordering version that keeps
 		// concurrent same-session requests resolving by issuance, not completion.
 		if (account) {
-			recordServedAccount(servedSessionId, account.id, timestamp);
+			recordServedAccount(
+				servedSessionId,
+				account.id,
+				timestamp,
+				routingMeta?.routeProfileId ?? null,
+			);
 		} else {
 			clearSession(servedSessionId, timestamp);
 		}

@@ -70,7 +70,9 @@ import {
 	handleProxy,
 	initModelCatalogRefresh,
 	initProxy,
+	ModelRouteSessionRegistry,
 	type ProxyContext,
+	parseModelRouteProfiles,
 	refreshModelCatalog,
 	registerCodexUsageRefresher,
 	registerPollingRestarter,
@@ -888,6 +890,9 @@ export default async function startServer(options?: {
 		);
 	}
 	const runtime = config.getRuntime();
+	// Route profiles are strict operator intent. Validate before database startup,
+	// background jobs, or the HTTP listener can make this process look healthy.
+	const modelRouteProfiles = parseModelRouteProfiles();
 	// Override port if provided
 	if (port !== runtime.port) {
 		runtime.port = port;
@@ -1214,6 +1219,13 @@ export default async function startServer(options?: {
 		) as number,
 		port,
 	};
+	const modelRouteSessionRegistry = new ModelRouteSessionRegistry(
+		modelRouteProfiles,
+		{ ttlMs: runtimeConfig.sessionDurationMs },
+	);
+	if (modelRouteProfiles.length > 0) {
+		log.info(`Model route profiles configured: ${modelRouteProfiles.length}`);
+	}
 
 	// Now create the strategy with runtime config
 	const strategy = buildStrategy(
@@ -1258,6 +1270,7 @@ export default async function startServer(options?: {
 		asyncWriter,
 		internalProbeSecret,
 		guardCorrelationVerifier,
+		modelRouteSessionRegistry,
 	};
 	modelCatalogProxyContext = proxyContext;
 

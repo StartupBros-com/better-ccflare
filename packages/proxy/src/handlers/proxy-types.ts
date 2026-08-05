@@ -9,6 +9,7 @@ import type { AnthropicDegradedModeCoordinator } from "../anthropic-degraded-mod
 import type { DegradedModeObservability } from "../anthropic-degraded-observability";
 import type { CacheAffinityOrderer } from "../cache-affinity-orderer";
 import type { DegradedOwnerOverlay } from "../degraded-owner-overlay";
+import type { ModelRouteSessionRegistry } from "../model-route-profiles";
 import type { ServerToolReplayRuntimeState } from "../server-tool-replay-runtime";
 import type { GuardCorrelationVerifier } from "./guard-correlation-auth";
 
@@ -34,6 +35,8 @@ export interface ProxyContext {
 	internalProbeSecret?: string;
 	/** Verifies guard correlation without exposing the env-only credential. */
 	guardCorrelationVerifier?: GuardCorrelationVerifier;
+	/** Restart-scoped Claude Code gateway route profiles and session bindings. */
+	modelRouteSessionRegistry?: ModelRouteSessionRegistry;
 }
 
 /** Error messages used throughout the proxy module */
