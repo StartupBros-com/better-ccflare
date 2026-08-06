@@ -113,6 +113,27 @@ describe("MuseSparkProvider", () => {
 			);
 		});
 
+		it("collapses /v1 overlap behind a gateway path prefix", () => {
+			const custom = makeAccount({
+				custom_endpoint: "https://gateway.example/proxy/v1",
+			});
+			expect(provider.buildUrl("/v1/messages", "", custom)).toBe(
+				"https://gateway.example/proxy/v1/messages",
+			);
+			expect(provider.buildUrl("/v1/messages/count_tokens", "", custom)).toBe(
+				"https://gateway.example/proxy/v1/messages/count_tokens",
+			);
+		});
+
+		it("keeps a gateway prefix that does not overlap the request path", () => {
+			const custom = makeAccount({
+				custom_endpoint: "https://gateway.example/proxy",
+			});
+			expect(provider.buildUrl("/v1/messages", "", custom)).toBe(
+				"https://gateway.example/proxy/v1/messages",
+			);
+		});
+
 		it("falls back to the default when no account is given", () => {
 			expect(provider.buildUrl("/v1/messages", "")).toBe(
 				"https://api.meta.ai/v1/messages",
@@ -302,6 +323,23 @@ describe("MuseSparkProvider", () => {
 				isMuseSparkMessagesPath("https://api.meta.ai/v1/messages?beta=1"),
 			).toBe(true);
 		});
+
+		// The proxy hands transformRequestBody the already-rewritten target URL,
+		// so a gateway prefix must still be recognised or sanitization is skipped
+		// for exactly the accounts that need it.
+		it("matches both Messages routes behind a gateway path prefix", () => {
+			expect(
+				isMuseSparkMessagesPath("https://gateway.example/proxy/v1/messages"),
+			).toBe(true);
+			expect(
+				isMuseSparkMessagesPath(
+					"https://gateway.example/proxy/v1/messages/count_tokens",
+				),
+			).toBe(true);
+			expect(
+				isMuseSparkMessagesPath("https://gateway.example/proxy/v1/files"),
+			).toBe(false);
+		});
 	});
 
 	describe("parseRateLimit", () => {
@@ -398,6 +436,28 @@ describe("MuseSparkProvider", () => {
 			expect(provider.getLogicalModelCapability("gpt-4o", account).status).toBe(
 				"unknown",
 			);
+		});
+
+		// A partial table must not strand the families it omits: resolveModel
+		// still routes them to the default checkpoint, so admission must agree or
+		// combo/managed routing drops an account that can serve the request.
+		it("keeps families absent from a partial mapping table supported", () => {
+			const partial = makeAccount({
+				model_mappings: JSON.stringify({ opus: "muse-spark-1.1" }),
+			});
+			expect(
+				provider.getLogicalModelCapability("claude-sonnet-4-5", partial).status,
+			).toBe("supported");
+			expect(
+				provider.getLogicalModelCapability("claude-haiku-4-5", partial).status,
+			).toBe("supported");
+		});
+
+		it("keeps families supported with an empty mapping table", () => {
+			const empty = makeAccount({ model_mappings: JSON.stringify({}) });
+			expect(
+				provider.getLogicalModelCapability("claude-opus-4-6", empty).status,
+			).toBe("supported");
 		});
 	});
 

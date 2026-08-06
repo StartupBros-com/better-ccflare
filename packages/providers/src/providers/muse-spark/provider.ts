@@ -42,17 +42,55 @@ export function isMuseSparkModel(model: string): boolean {
  * Whether a request targets the Anthropic Messages surface (`/v1/messages` or
  * `/v1/messages/count_tokens`), the only endpoints whose body follows the
  * contract the request sanitizer enforces.
+ *
+ * Matched as a suffix, not an exact path: the proxy builds the downstream
+ * request from the already-rewritten target URL, so behind a path-prefixed
+ * gateway this sees `/proxy/v1/messages`. An exact match would silently skip
+ * sanitization for exactly the accounts that still need it.
  */
 export function isMuseSparkMessagesPath(url: string): boolean {
 	let pathname: string;
 	try {
 		pathname = new URL(url).pathname;
 	} catch {
-		pathname = url;
+		pathname = url.split("?")[0];
 	}
+	pathname = pathname.replace(/\/$/, "");
 	return (
-		pathname === "/v1/messages" || pathname === "/v1/messages/count_tokens"
+		pathname.endsWith("/v1/messages") ||
+		pathname.endsWith("/v1/messages/count_tokens")
 	);
+}
+
+/**
+ * Join a base URL path with a request path, collapsing any overlap between the
+ * base's trailing segments and the request's leading ones.
+ *
+ * A gateway base may carry its own prefix and its own `/v1` (for example
+ * `https://gateway.example/proxy/v1`). Comparing the whole base path would miss
+ * that, producing `/proxy/v1/v1/messages` and routing a valid configuration to
+ * an endpoint that does not exist.
+ */
+export function joinMuseSparkPath(basePath: string, pathname: string): string {
+	const baseSegments = basePath.split("/").filter(Boolean);
+	const pathSegments = pathname.split("/").filter(Boolean);
+
+	let overlap = 0;
+	for (
+		let size = Math.min(baseSegments.length, pathSegments.length);
+		size > 0;
+		size--
+	) {
+		const baseTail = baseSegments.slice(baseSegments.length - size);
+		const pathHead = pathSegments.slice(0, size);
+		if (baseTail.every((segment, i) => segment === pathHead[i])) {
+			overlap = size;
+			break;
+		}
+	}
+
+	const remainder = pathSegments.slice(overlap);
+	return remainder.length > 0 ? `/${remainder.join("/")}` : "/";
 }
 
 export class MuseSparkProvider extends BaseAnthropicCompatibleProvider {
@@ -74,9 +112,9 @@ export class MuseSparkProvider extends BaseAnthropicCompatibleProvider {
 
 	/**
 	 * Meta serves the Messages API at `<base>/v1/messages`. A custom endpoint is
-	 * honoured so the account can be pointed at a gateway or regional host; its
-	 * path prefix is de-duplicated so a base already ending in `/v1` does not
-	 * produce `/v1/v1/messages`.
+	 * honoured so the account can be pointed at a gateway or regional host, and
+	 * any overlap between the base's trailing path and the request path is
+	 * collapsed, so neither `.../v1` nor `.../proxy/v1` yields a duplicate `/v1`.
 	 */
 	buildUrl(pathname: string, search: string, account?: Account): string {
 		const baseUrl = account?.custom_endpoint?.trim() || this.getEndpoint();
@@ -85,11 +123,7 @@ export class MuseSparkProvider extends BaseAnthropicCompatibleProvider {
 		try {
 			const parsed = new URL(cleanBaseUrl);
 			const basePath = parsed.pathname.replace(/\/$/, "");
-			const effectivePath =
-				basePath && pathname.startsWith(basePath)
-					? pathname.slice(basePath.length) || "/"
-					: pathname;
-			return `${cleanBaseUrl}${effectivePath}${search}`;
+			return `${cleanBaseUrl}${joinMuseSparkPath(basePath, pathname)}${search}`;
 		} catch {
 			return `${cleanBaseUrl}${pathname}${search}`;
 		}
@@ -273,10 +307,13 @@ export class MuseSparkProvider extends BaseAnthropicCompatibleProvider {
 			};
 		}
 
-		// With no explicit mapping the provider defaults route every Claude
-		// family to the standard Muse Spark checkpoint.
-		const usesDefaults = account.model_mappings == null;
-		return usesDefaults && MUSE_SPARK_MODEL_MAPPINGS[family]
+		// Admission must mirror what the transport actually does. resolveModel
+		// falls back to the default checkpoint for any unmapped Claude family, so
+		// keying off "the account has a mapping table at all" would report every
+		// family absent from a partial table as unsupported and drop accounts that
+		// can serve the request from combo and managed routing.
+		const resolved = this.resolveModel(logicalModel, account);
+		return isMuseSparkModel(resolved)
 			? {
 					status: "supported",
 					provenance: "provider_default",

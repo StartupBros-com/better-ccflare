@@ -10,6 +10,7 @@ import {
 	REAUTHENTICATION_REQUIRED_CODE,
 	sanitizers,
 	validateAndSanitizeModelMappings,
+	validateEndpointUrl,
 	validateNumber,
 	validatePriority,
 	validateString,
@@ -2151,13 +2152,11 @@ export function createMuseSparkAccountAddHandler(dbOps: DatabaseOperations) {
 						if (!value) return "";
 						const trimmed = value.trim();
 						if (!trimmed) return "";
-						// Validate URL format
-						try {
-							new URL(trimmed);
-							return trimmed;
-						} catch {
-							throw new ValidationError("Invalid URL format");
-						}
+						// Use the shared validator rather than a bare `new URL()`:
+						// `new URL()` accepts file:, ftp: and friends, which would
+						// persist an account the proxy can never route. This matches
+						// the CLI creation path, which already restricts to http(s).
+						return validateEndpointUrl(trimmed, "customEndpoint");
 					},
 				},
 			);
