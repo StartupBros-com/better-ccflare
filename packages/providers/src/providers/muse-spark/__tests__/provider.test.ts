@@ -1,0 +1,411 @@
+import type { Account } from "@better-ccflare/types";
+import {
+	isMuseSparkMessagesPath,
+	isMuseSparkModel,
+	MUSE_SPARK_DEFAULT_MODEL,
+	MuseSparkProvider,
+} from "../provider";
+
+function makeAccount(overrides: Partial<Account> = {}): Account {
+	return {
+		id: "test-id",
+		name: "test-muse-spark-account",
+		provider: "muse-spark",
+		refresh_token: "",
+		access_token: null,
+		expires_at: null,
+		api_key: "LLM|123|secret",
+		custom_endpoint: null,
+		rate_limited_until: null,
+		rate_limit_status: null,
+		rate_limit_reset: null,
+		rate_limit_remaining: null,
+		created_at: Date.now(),
+		last_used: null,
+		request_count: 0,
+		total_requests: 0,
+		session_start: null,
+		session_request_count: 0,
+		paused: false,
+		priority: 0,
+		auto_fallback_enabled: false,
+		auto_refresh_enabled: false,
+		...overrides,
+	} as Account;
+}
+
+async function bodyOf(request: Request): Promise<Record<string, unknown>> {
+	return (await request.json()) as Record<string, unknown>;
+}
+
+function jsonRequest(body: unknown): Request {
+	return new Request("https://proxy.local/v1/messages", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(body),
+	});
+}
+
+describe("MuseSparkProvider", () => {
+	let provider: MuseSparkProvider;
+	let account: Account;
+
+	beforeEach(() => {
+		provider = new MuseSparkProvider();
+		account = makeAccount();
+	});
+
+	describe("name", () => {
+		it("should have the correct provider name", () => {
+			expect(provider.name).toBe("muse-spark");
+		});
+	});
+
+	describe("getEndpoint", () => {
+		it("returns the Meta Model API base", () => {
+			expect(provider.getEndpoint()).toBe("https://api.meta.ai");
+		});
+	});
+
+	describe("buildUrl", () => {
+		it("targets the Messages endpoint by default", () => {
+			expect(provider.buildUrl("/v1/messages", "", account)).toBe(
+				"https://api.meta.ai/v1/messages",
+			);
+		});
+
+		it("preserves the query string", () => {
+			expect(provider.buildUrl("/v1/messages", "?beta=true", account)).toBe(
+				"https://api.meta.ai/v1/messages?beta=true",
+			);
+		});
+
+		it("supports the count_tokens endpoint", () => {
+			expect(provider.buildUrl("/v1/messages/count_tokens", "", account)).toBe(
+				"https://api.meta.ai/v1/messages/count_tokens",
+			);
+		});
+
+		it("honours a custom endpoint", () => {
+			const custom = makeAccount({
+				custom_endpoint: "https://gateway.example.com",
+			});
+			expect(provider.buildUrl("/v1/messages", "", custom)).toBe(
+				"https://gateway.example.com/v1/messages",
+			);
+		});
+
+		it("strips a trailing slash on a custom endpoint", () => {
+			const custom = makeAccount({
+				custom_endpoint: "https://gateway.example.com/",
+			});
+			expect(provider.buildUrl("/v1/messages", "", custom)).toBe(
+				"https://gateway.example.com/v1/messages",
+			);
+		});
+
+		it("does not double up when the base already ends in /v1", () => {
+			const custom = makeAccount({
+				custom_endpoint: "https://api.meta.ai/v1",
+			});
+			expect(provider.buildUrl("/v1/messages", "", custom)).toBe(
+				"https://api.meta.ai/v1/messages",
+			);
+		});
+
+		it("falls back to the default when no account is given", () => {
+			expect(provider.buildUrl("/v1/messages", "")).toBe(
+				"https://api.meta.ai/v1/messages",
+			);
+		});
+	});
+
+	describe("prepareHeaders", () => {
+		it("sends the key as a bearer token, not x-api-key", () => {
+			const headers = provider.prepareHeaders(
+				new Headers(),
+				undefined,
+				"LLM|123|secret",
+			);
+			expect(headers.get("Authorization")).toBe("Bearer LLM|123|secret");
+			expect(headers.get("x-api-key")).toBeNull();
+		});
+
+		it("replaces a client-supplied credential", () => {
+			const incoming = new Headers({
+				authorization: "Bearer client-token",
+				"x-api-key": "client-key",
+			});
+			const headers = provider.prepareHeaders(
+				incoming,
+				undefined,
+				"LLM|123|secret",
+			);
+			expect(headers.get("Authorization")).toBe("Bearer LLM|123|secret");
+			expect(headers.get("x-api-key")).toBeNull();
+		});
+
+		it("strips hop-by-hop and compression headers", () => {
+			const incoming = new Headers({
+				host: "proxy.local",
+				"accept-encoding": "gzip",
+			});
+			const headers = provider.prepareHeaders(incoming, "token");
+			expect(headers.get("host")).toBeNull();
+			expect(headers.get("accept-encoding")).toBeNull();
+		});
+	});
+
+	describe("resolveModel", () => {
+		it("routes a Claude model to the default Muse Spark checkpoint", () => {
+			expect(provider.resolveModel("claude-opus-4-6-20260115", account)).toBe(
+				MUSE_SPARK_DEFAULT_MODEL,
+			);
+			expect(provider.resolveModel("claude-haiku-4-5-20251001", account)).toBe(
+				MUSE_SPARK_DEFAULT_MODEL,
+			);
+		});
+
+		it("passes an explicit Muse Spark model through", () => {
+			expect(provider.resolveModel("muse-spark-1.1", account)).toBe(
+				"muse-spark-1.1",
+			);
+			expect(provider.resolveModel("muse-spark-1.2-contributor", account)).toBe(
+				"muse-spark-1.2-contributor",
+			);
+		});
+
+		it("lets an explicit account mapping win", () => {
+			const mapped = makeAccount({
+				model_mappings: JSON.stringify({ opus: "muse-spark-1.1" }),
+			});
+			expect(provider.resolveModel("claude-opus-4-6-20260115", mapped)).toBe(
+				"muse-spark-1.1",
+			);
+		});
+
+		it("routes an unknown model to the default rather than forwarding it", () => {
+			expect(provider.resolveModel("gpt-4o", account)).toBe(
+				MUSE_SPARK_DEFAULT_MODEL,
+			);
+		});
+	});
+
+	describe("transformRequestBody", () => {
+		it("maps the model and strips fields Meta rejects", async () => {
+			const request = jsonRequest({
+				model: "claude-opus-4-6-20260115",
+				max_tokens: 4096,
+				messages: [{ role: "user", content: "hi" }],
+				stop_sequences: ["\n"],
+				top_k: 40,
+			});
+
+			const body = await bodyOf(
+				await provider.transformRequestBody(request, account),
+			);
+
+			expect(body.model).toBe(MUSE_SPARK_DEFAULT_MODEL);
+			expect(body).not.toHaveProperty("stop_sequences");
+			expect(body).not.toHaveProperty("top_k");
+			expect(body.messages).toEqual([{ role: "user", content: "hi" }]);
+		});
+
+		it("drops thinking:disabled, which would be a 400", async () => {
+			const request = jsonRequest({
+				model: "muse-spark-1.2",
+				max_tokens: 4096,
+				messages: [{ role: "user", content: "hi" }],
+				thinking: { type: "disabled" },
+			});
+
+			const body = await bodyOf(
+				await provider.transformRequestBody(request, account),
+			);
+			expect(body).not.toHaveProperty("thinking");
+		});
+
+		it("leaves a non-JSON body untouched", async () => {
+			const request = new Request("https://proxy.local/v1/messages", {
+				method: "POST",
+				headers: { "content-type": "text/plain" },
+				body: "raw",
+			});
+			const result = await provider.transformRequestBody(request, account);
+			expect(await result.text()).toBe("raw");
+		});
+
+		it("forwards an unparseable JSON body rather than dropping it", async () => {
+			const request = new Request("https://proxy.local/v1/messages", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: "{not json",
+			});
+			const result = await provider.transformRequestBody(request, account);
+			expect(await result.text()).toBe("{not json");
+		});
+
+		it("also sanitizes count_tokens, which shares the Messages contract", async () => {
+			const request = new Request(
+				"https://proxy.local/v1/messages/count_tokens",
+				{
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({
+						model: "claude-opus-4-6-20260115",
+						messages: [{ role: "user", content: "hi" }],
+						top_k: 40,
+					}),
+				},
+			);
+
+			const body = await bodyOf(
+				await provider.transformRequestBody(request, account),
+			);
+			expect(body.model).toBe(MUSE_SPARK_DEFAULT_MODEL);
+			expect(body).not.toHaveProperty("top_k");
+		});
+
+		it("leaves a non-Messages endpoint body untouched", async () => {
+			const original = { purpose: "assistants", some_field: 1 };
+			const request = new Request("https://proxy.local/v1/files", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(original),
+			});
+
+			const body = await bodyOf(
+				await provider.transformRequestBody(request, account),
+			);
+			expect(body).toEqual(original);
+		});
+	});
+
+	describe("isMuseSparkMessagesPath", () => {
+		it("matches the Messages surface only", () => {
+			expect(isMuseSparkMessagesPath("https://api.meta.ai/v1/messages")).toBe(
+				true,
+			);
+			expect(
+				isMuseSparkMessagesPath("https://api.meta.ai/v1/messages/count_tokens"),
+			).toBe(true);
+			expect(isMuseSparkMessagesPath("https://api.meta.ai/v1/files")).toBe(
+				false,
+			);
+			expect(isMuseSparkMessagesPath("https://api.meta.ai/v1/responses")).toBe(
+				false,
+			);
+		});
+
+		it("ignores the query string", () => {
+			expect(
+				isMuseSparkMessagesPath("https://api.meta.ai/v1/messages?beta=1"),
+			).toBe(true);
+		});
+	});
+
+	describe("parseRateLimit", () => {
+		it("reports not rate limited on a healthy response", () => {
+			const response = new Response("{}", {
+				status: 200,
+				headers: {
+					"x-ratelimit-remaining-requests": "2500",
+					"x-ratelimit-limit-requests": "3000",
+				},
+			});
+			const info = provider.parseRateLimit(response);
+			expect(info.isRateLimited).toBe(false);
+			expect(info.remaining).toBe(2500);
+		});
+
+		it("falls back to remaining tokens when requests are not reported", () => {
+			const response = new Response("{}", {
+				status: 200,
+				headers: { "x-ratelimit-remaining-tokens": "1200000" },
+			});
+			expect(provider.parseRateLimit(response).remaining).toBe(1_200_000);
+		});
+
+		it("flags a 429 and derives the reset time from retry-after", () => {
+			const before = Date.now();
+			const response = new Response("{}", {
+				status: 429,
+				headers: { "retry-after": "30" },
+			});
+			const info = provider.parseRateLimit(response);
+			expect(info.isRateLimited).toBe(true);
+			expect(info.resetTime).toBeGreaterThanOrEqual(before + 30_000);
+		});
+
+		it("flags a 429 with no retry-after and leaves the reset time unset", () => {
+			const info = provider.parseRateLimit(new Response("{}", { status: 429 }));
+			expect(info.isRateLimited).toBe(true);
+			expect(info.resetTime).toBeUndefined();
+		});
+
+		it("returns undefined remaining when no headers are present", () => {
+			const info = provider.parseRateLimit(new Response("{}", { status: 200 }));
+			expect(info.isRateLimited).toBe(false);
+			expect(info.remaining).toBeUndefined();
+		});
+	});
+
+	describe("extractUsageInfo", () => {
+		it("reads Anthropic-shaped usage from a JSON response", async () => {
+			const response = new Response(
+				JSON.stringify({
+					model: "muse-spark-1.2",
+					usage: {
+						input_tokens: 100,
+						output_tokens: 50,
+						cache_read_input_tokens: 20,
+					},
+				}),
+				{ headers: { "content-type": "application/json" } },
+			);
+
+			const usage = await provider.extractUsageInfo(response);
+			expect(usage?.model).toBe("muse-spark-1.2");
+			expect(usage?.inputTokens).toBe(100);
+			expect(usage?.outputTokens).toBe(50);
+			expect(usage?.cacheReadInputTokens).toBe(20);
+		});
+	});
+
+	describe("supportsOAuth", () => {
+		it("is an API-key provider", () => {
+			expect(provider.supportsOAuth()).toBe(false);
+		});
+	});
+
+	describe("getLogicalModelCapability", () => {
+		it("declares Claude families supported under provider defaults", () => {
+			const capability = provider.getLogicalModelCapability(
+				"claude-sonnet-4-5",
+				makeAccount({ model_mappings: null }),
+			);
+			expect(capability.status).toBe("supported");
+			expect(capability.provenance).toBe("provider_default");
+		});
+
+		it("declares an explicit Muse Spark model supported", () => {
+			expect(
+				provider.getLogicalModelCapability("muse-spark-1.2", account).status,
+			).toBe("supported");
+		});
+
+		it("returns unknown for an unrecognised family", () => {
+			expect(provider.getLogicalModelCapability("gpt-4o", account).status).toBe(
+				"unknown",
+			);
+		});
+	});
+
+	describe("isMuseSparkModel", () => {
+		it("recognises Muse Spark model IDs", () => {
+			expect(isMuseSparkModel("muse-spark-1.2")).toBe(true);
+			expect(isMuseSparkModel("MUSE-SPARK-1.1")).toBe(true);
+			expect(isMuseSparkModel("claude-opus-4-6")).toBe(false);
+		});
+	});
+});

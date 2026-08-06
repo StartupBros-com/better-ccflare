@@ -107,6 +107,7 @@ const ROUTING_REVISION_API_KEY_PROVIDERS = [
 	"openrouter",
 	"alibaba-coding-plan",
 	"ollama-cloud",
+	"muse-spark",
 ] as const;
 
 /**

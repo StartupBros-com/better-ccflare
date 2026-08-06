@@ -350,7 +350,8 @@ export interface AccountListItem {
 		| "qwen"
 		| "xai"
 		| "ollama"
-		| "ollama-cloud";
+		| "ollama-cloud"
+		| "muse-spark";
 	priority: number;
 	autoFallbackEnabled: boolean;
 	autoRefreshEnabled: boolean;
@@ -370,7 +371,8 @@ export interface AddAccountOptions {
 		| "openai-compatible"
 		| "bedrock"
 		| "openrouter"
-		| "xai";
+		| "xai"
+		| "muse-spark";
 	priority?: number;
 	customEndpoint?: string;
 }

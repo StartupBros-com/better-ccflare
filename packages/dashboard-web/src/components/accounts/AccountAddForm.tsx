@@ -112,6 +112,13 @@ interface AccountAddFormProps {
 		apiKey: string;
 		priority: number;
 	}) => Promise<AccountCreationIdentity>;
+	onAddMuseSparkAccount: (params: {
+		name: string;
+		apiKey: string;
+		priority: number;
+		customEndpoint?: string;
+		modelMappings?: { [key: string]: string };
+	}) => Promise<AccountCreationIdentity>;
 	onAddAnthropicCompatibleAccount: (params: {
 		name: string;
 		apiKey: string;
@@ -191,6 +198,7 @@ export function AccountAddForm({
 	onCompleteAccount,
 	onAddZaiAccount,
 	onAddMinimaxAccount,
+	onAddMuseSparkAccount,
 	onAddAnthropicCompatibleAccount,
 	onAddNanoGPTAccount,
 	onAddOpenAIAccount,
@@ -216,6 +224,7 @@ export function AccountAddForm({
 			| "console"
 			| "zai"
 			| "minimax"
+			| "muse-spark"
 			| "anthropic-compatible"
 			| "openai-compatible"
 			| "nanogpt"
@@ -416,6 +425,7 @@ export function AccountAddForm({
 			const apiKeyErrors: Partial<Record<AccountSetupMode, string>> = {
 				zai: "API key is required for z.ai accounts",
 				minimax: "API key is required for Minimax accounts",
+				"muse-spark": "API key is required for Muse Spark accounts",
 				nanogpt: "API key is required for NanoGPT accounts",
 				"anthropic-compatible":
 					"API key is required for Anthropic-compatible accounts",
@@ -736,6 +746,28 @@ export function AccountAddForm({
 				name: newAccount.name,
 				apiKey: newAccount.apiKey,
 				priority: newAccount.priority,
+			});
+			// Reset form and signal success
+			await completeCreatedAccount(identity);
+			return;
+		}
+
+		if (newAccount.mode === "muse-spark") {
+			if (!newAccount.apiKey) {
+				onError("API key is required for Muse Spark accounts");
+				return;
+			}
+			// Build model mappings object
+			const modelMappings = buildAccountModelMappings(newAccount);
+
+			// For Muse Spark accounts, we don't need OAuth flow and use default tier
+			const identity = await onAddMuseSparkAccount({
+				name: newAccount.name,
+				apiKey: newAccount.apiKey,
+				priority: newAccount.priority,
+				customEndpoint: newAccount.customEndpoint || undefined,
+				modelMappings:
+					Object.keys(modelMappings).length > 0 ? modelMappings : undefined,
 			});
 			// Reset form and signal success
 			await completeCreatedAccount(identity);
@@ -1063,6 +1095,7 @@ export function AccountAddForm({
 										| "console"
 										| "zai"
 										| "minimax"
+										| "muse-spark"
 										| "anthropic-compatible"
 										| "openai-compatible"
 										| "bedrock"
@@ -1092,6 +1125,9 @@ export function AccountAddForm({
 									<SelectItem value="bedrock">AWS Bedrock</SelectItem>
 									<SelectItem value="zai">z.ai (API Key)</SelectItem>
 									<SelectItem value="minimax">Minimax (API Key)</SelectItem>
+									<SelectItem value="muse-spark">
+										Meta Model API (Muse Spark)
+									</SelectItem>
 									<SelectItem value="nanogpt">NanoGPT (API Key)</SelectItem>
 									<SelectItem value="anthropic-compatible">
 										Anthropic-Compatible (API Key)
@@ -2091,6 +2127,119 @@ export function AccountAddForm({
 													})
 												}
 												placeholder="claude-3-haiku-20240307 (default)"
+												className="mt-1"
+											/>
+										</div>
+									</div>
+								</div>
+							</>
+						)}
+						{newAccount.mode === "muse-spark" && (
+							<>
+								<div className="space-y-2">
+									<Label htmlFor="apiKey">Muse Spark API Key</Label>
+									<Input
+										id="apiKey"
+										type="password"
+										value={newAccount.apiKey}
+										onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+											setNewAccount({
+												...newAccount,
+												apiKey: (e.target as HTMLInputElement).value,
+											})
+										}
+										placeholder="Enter your Meta Model API (Muse Spark) key"
+									/>
+								</div>
+								<div className="space-y-2">
+									<Label htmlFor="customEndpoint">
+										Custom Endpoint URL (Optional)
+									</Label>
+									<Input
+										id="customEndpoint"
+										type="url"
+										value={newAccount.customEndpoint}
+										onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+											setNewAccount({
+												...newAccount,
+												customEndpoint: (e.target as HTMLInputElement).value,
+											})
+										}
+										placeholder="https://api.meta.ai"
+									/>
+								</div>
+								<div className="space-y-2">
+									<Label>Model Mappings (Optional)</Label>
+									<p className="text-xs text-muted-foreground mb-2">
+										Map Anthropic model names to provider-specific models. Leave
+										empty to default to muse-spark-1.2.
+									</p>
+									<div className="space-y-2 pl-4">
+										<div>
+											<Label htmlFor="museSparkFableModel" className="text-sm">
+												Fable Model
+											</Label>
+											<Input
+												id="museSparkFableModel"
+												value={newAccount.fableModel}
+												onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+													setNewAccount({
+														...newAccount,
+														fableModel: (e.target as HTMLInputElement).value,
+													})
+												}
+												placeholder="muse-spark-1.2 (default)"
+												className="mt-1"
+											/>
+										</div>
+										<div>
+											<Label htmlFor="opusModel" className="text-sm">
+												Opus Model
+											</Label>
+											<Input
+												id="opusModel"
+												value={newAccount.opusModel}
+												onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+													setNewAccount({
+														...newAccount,
+														opusModel: (e.target as HTMLInputElement).value,
+													})
+												}
+												placeholder="muse-spark-1.2 (default)"
+												className="mt-1"
+											/>
+										</div>
+										<div>
+											<Label htmlFor="sonnetModel" className="text-sm">
+												Sonnet Model
+											</Label>
+											<Input
+												id="sonnetModel"
+												value={newAccount.sonnetModel}
+												onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+													setNewAccount({
+														...newAccount,
+														sonnetModel: (e.target as HTMLInputElement).value,
+													})
+												}
+												placeholder="muse-spark-1.2 (default)"
+												className="mt-1"
+											/>
+										</div>
+										<div>
+											<Label htmlFor="haikuModel" className="text-sm">
+												Haiku Model
+											</Label>
+											<Input
+												id="haikuModel"
+												value={newAccount.haikuModel}
+												onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+													setNewAccount({
+														...newAccount,
+														haikuModel: (e.target as HTMLInputElement).value,
+													})
+												}
+												placeholder="muse-spark-1.2 (default)"
 												className="mt-1"
 											/>
 										</div>

@@ -34,6 +34,21 @@ export {
 } from "./codex/index";
 export { KiloProvider } from "./kilo/index";
 export { MinimaxProvider } from "./minimax/index";
+export {
+	effortForThinkingBudget,
+	isMuseSparkMessagesPath,
+	isMuseSparkModel,
+	MUSE_SPARK_CONTEXT_WINDOW,
+	MUSE_SPARK_DEFAULT_ENDPOINT,
+	MUSE_SPARK_DEFAULT_MODEL,
+	MUSE_SPARK_MAX_OUTPUT_TOKENS,
+	MUSE_SPARK_MIN_THINKING_BUDGET_TOKENS,
+	MUSE_SPARK_MODEL_IDS,
+	MUSE_SPARK_MODEL_MAPPINGS,
+	MuseSparkProvider,
+	type MuseSparkSanitizeResult,
+	sanitizeMuseSparkRequestBody,
+} from "./muse-spark/index";
 export { NanoGPTProvider } from "./nanogpt/index";
 export { OllamaCloudProvider, OllamaProvider } from "./ollama/index";
 export { OpenAICompatibleProvider } from "./openai/index";

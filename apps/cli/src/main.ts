@@ -76,6 +76,7 @@ interface ParsedArgs {
 		| "codex"
 		| "xai"
 		| "ollama"
+		| "muse-spark"
 		| null;
 	priority: number | null;
 	profile: string | null;
@@ -551,6 +552,7 @@ function parseArgs(args: string[]): ParsedArgs {
 					| "codex"
 					| "xai"
 					| "ollama"
+					| "muse-spark"
 					| "max";
 
 				// Handle deprecated "max" mode with warning
@@ -574,7 +576,8 @@ function parseArgs(args: string[]): ParsedArgs {
 					| "alibaba-coding-plan"
 					| "codex"
 					| "xai"
-					| "ollama";
+					| "ollama"
+					| "muse-spark";
 				const validModes: Array<
 					| "claude-oauth"
 					| "console"
@@ -589,6 +592,7 @@ function parseArgs(args: string[]): ParsedArgs {
 					| "codex"
 					| "xai"
 					| "ollama"
+					| "muse-spark"
 				> = [
 					"claude-oauth",
 					"console",
@@ -603,6 +607,7 @@ function parseArgs(args: string[]): ParsedArgs {
 					"codex",
 					"xai",
 					"ollama",
+					"muse-spark",
 				];
 				if (!validModes.includes(modeValue)) {
 					console.error(`❌ Invalid mode: ${modeValue}`);

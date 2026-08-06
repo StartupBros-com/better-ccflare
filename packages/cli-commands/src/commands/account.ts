@@ -54,7 +54,8 @@ export interface AddAccountOptionsWithAdapter {
 		| "qwen"
 		| "xai"
 		| "ollama"
-		| "ollama-cloud";
+		| "ollama-cloud"
+		| "muse-spark";
 	priority?: number;
 	customEndpoint?: string;
 	modelMappings?: { [key: string]: string | string[] };
@@ -103,7 +104,8 @@ export interface AccountListItemWithMode extends AccountListItem {
 		| "qwen"
 		| "xai"
 		| "ollama"
-		| "ollama-cloud";
+		| "ollama-cloud"
+		| "muse-spark";
 }
 
 /**
@@ -1309,6 +1311,10 @@ export async function addAccount(
 				label: "Ollama Cloud (ollama.com, API key required)",
 				value: "ollama-cloud",
 			},
+			{
+				label: "Meta Model API (Muse Spark)",
+				value: "muse-spark",
+			},
 		]));
 
 	if (mode === "bedrock") {
@@ -1835,6 +1841,50 @@ export async function addAccount(
 		console.log(`\nAccount '${name}' added successfully!`);
 		console.log("Type: Ollama Cloud");
 		console.log(`Endpoint: https://ollama.com/api/chat`);
+		return createdAccount;
+	} else if (mode === "muse-spark") {
+		// Handle Meta Model API (Muse Spark) accounts with API keys
+		const apiKey = await adapter.input(
+			"\nEnter your Meta Model API (Muse Spark) API key: ",
+		);
+
+		// Get custom endpoint (optional; defaults to the Muse Spark API)
+		const endpoint =
+			customEndpoint ||
+			(await adapter.input(
+				"\nEnter API endpoint URL (press Enter for default https://api.meta.ai): ",
+			)) ||
+			"https://api.meta.ai";
+
+		// Get priority
+		const priority =
+			providedPriority ??
+			(await adapter.input(
+				"\nEnter priority (0 = highest, lower number = higher priority, default 0): ",
+			));
+
+		// Get model mappings (optional — muse-spark already routes every model
+		// to muse-spark-1.2 by default, so custom mappings are never required)
+		const finalModelMappings = await promptModelMappings(
+			adapter,
+			modelMappings,
+		);
+
+		const createdAccount = await createAnthropicCompatibleAccount(
+			dbOps,
+			name,
+			apiKey,
+			typeof priority === "string"
+				? parseInt(priority, 10) || 0
+				: priority || 0,
+			endpoint,
+			finalModelMappings,
+			undefined,
+			"muse-spark",
+		);
+		console.log(`\nAccount '${name}' added successfully!`);
+		console.log("Type: Meta Model API (Muse Spark) (API key)");
+		console.log(`Endpoint: ${endpoint}`);
 		return createdAccount;
 	} else {
 		return completeAnthropicOAuthAccount(

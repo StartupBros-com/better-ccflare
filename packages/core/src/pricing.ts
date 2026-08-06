@@ -231,6 +231,46 @@ BUNDLED_PRICING.minimax = {
 	},
 };
 
+// Pricing for Meta Model API / Muse Spark models (dollars per 1M tokens)
+// Source: https://dev.meta.ai/docs/pricing-rate-limits
+// Meta caches prompt prefixes automatically and does not bill a separate
+// cache-write rate, so cache_write is 0 rather than absent.
+BUNDLED_PRICING.meta = {
+	models: {
+		"muse-spark-1.1": {
+			id: "muse-spark-1.1",
+			name: "Muse Spark 1.1",
+			cost: {
+				input: 1.25,
+				output: 4.25,
+				cache_read: 0.15,
+				cache_write: 0,
+			},
+		},
+		"muse-spark-1.2": {
+			id: "muse-spark-1.2",
+			name: "Muse Spark 1.2",
+			cost: {
+				input: 1.25,
+				output: 4.25,
+				cache_read: 0.15,
+				cache_write: 0,
+			},
+		},
+		// Contributor tier: discounted in exchange for training rights.
+		"muse-spark-1.2-contributor": {
+			id: "muse-spark-1.2-contributor",
+			name: "Muse Spark 1.2 (Contributor)",
+			cost: {
+				input: 0.1,
+				output: 0.2,
+				cache_read: 0.002,
+				cache_write: 0,
+			},
+		},
+	},
+};
+
 interface Logger {
 	warn(message: string, ...args: unknown[]): void;
 	debug(message: string, ...args: unknown[]): void;
