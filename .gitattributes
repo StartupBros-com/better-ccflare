@@ -1,0 +1,12 @@
+# Normalise line endings so the repository's canonical form is always LF.
+#
+# Without this, an editor or tool reaching into the checkout from Windows
+# rewrites whole files to CRLF. Because git had no attribute to normalise
+# against and core.autocrlf was unset, those rewrites showed up as a diff
+# touching every line with equal insertions and deletions and no content
+# change at all — 72 files and ~75k/~75k on one occasion, which then blocked
+# the production deploy gate on "working tree has uncommitted changes".
+#
+# `text=auto` lets git detect text files (binaries are left alone) and store
+# them LF-normalised in the index; `eol=lf` checks them out as LF everywhere.
+* text=auto eol=lf
