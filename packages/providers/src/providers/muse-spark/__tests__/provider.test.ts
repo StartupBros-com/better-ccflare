@@ -134,6 +134,38 @@ describe("MuseSparkProvider", () => {
 			);
 		});
 
+		// A query on the base must stay a query: string concatenation would bury
+		// the route inside it and leave the path at /proxy.
+		it("preserves a query string on a custom endpoint", () => {
+			const custom = makeAccount({
+				custom_endpoint: "https://gateway.example/proxy?api-version=2024",
+			});
+			const url = new URL(provider.buildUrl("/v1/messages", "", custom));
+			expect(url.pathname).toBe("/proxy/v1/messages");
+			expect(url.searchParams.get("api-version")).toBe("2024");
+		});
+
+		it("merges base and request query parameters", () => {
+			const custom = makeAccount({
+				custom_endpoint: "https://gateway.example/proxy?api-version=2024",
+			});
+			const url = new URL(
+				provider.buildUrl("/v1/messages", "?beta=true", custom),
+			);
+			expect(url.pathname).toBe("/proxy/v1/messages");
+			expect(url.searchParams.get("api-version")).toBe("2024");
+			expect(url.searchParams.get("beta")).toBe("true");
+		});
+
+		it("drops a fragment, which is never sent upstream", () => {
+			const custom = makeAccount({
+				custom_endpoint: "https://gateway.example/proxy#section",
+			});
+			expect(provider.buildUrl("/v1/messages", "", custom)).toBe(
+				"https://gateway.example/proxy/v1/messages",
+			);
+		});
+
 		it("falls back to the default when no account is given", () => {
 			expect(provider.buildUrl("/v1/messages", "")).toBe(
 				"https://api.meta.ai/v1/messages",
@@ -174,6 +206,12 @@ describe("MuseSparkProvider", () => {
 			const headers = provider.prepareHeaders(incoming, "token");
 			expect(headers.get("host")).toBeNull();
 			expect(headers.get("accept-encoding")).toBeNull();
+		});
+
+		it("strips content-length, which sanitization invalidates", () => {
+			const incoming = new Headers({ "content-length": "1234" });
+			const headers = provider.prepareHeaders(incoming, "token");
+			expect(headers.get("content-length")).toBeNull();
 		});
 	});
 
@@ -266,6 +304,31 @@ describe("MuseSparkProvider", () => {
 			expect(await result.text()).toBe("{not json");
 		});
 
+		// Reusing the inbound length after rewriting the body sends wrong framing
+		// and the outgoing fetch can reject the request before Meta sees it.
+		it("does not carry a stale content-length onto the rewritten body", async () => {
+			const original = JSON.stringify({
+				model: "claude-opus-4-6-20260115",
+				max_tokens: 4096,
+				messages: [{ role: "user", content: "hi" }],
+				stop_sequences: ["\n"],
+				top_k: 40,
+			});
+			const request = new Request("https://proxy.local/v1/messages", {
+				method: "POST",
+				headers: {
+					"content-type": "application/json",
+					"content-length": String(original.length),
+				},
+				body: original,
+			});
+
+			const transformed = await provider.transformRequestBody(request, account);
+			const stated = transformed.headers.get("content-length");
+			const actual = (await transformed.clone().text()).length;
+			expect(stated === null || Number(stated) === actual).toBe(true);
+		});
+
 		it("also sanitizes count_tokens, which shares the Messages contract", async () => {
 			const request = new Request(
 				"https://proxy.local/v1/messages/count_tokens",
@@ -354,6 +417,25 @@ describe("MuseSparkProvider", () => {
 			const info = provider.parseRateLimit(response);
 			expect(info.isRateLimited).toBe(false);
 			expect(info.remaining).toBe(2500);
+		});
+
+		// Rate-limit metadata is only persisted when a status is present, so a
+		// healthy response must carry one or the parsed headroom is discarded.
+		it("marks a healthy response allowed so headroom is persisted", () => {
+			const response = new Response("{}", {
+				status: 200,
+				headers: { "x-ratelimit-remaining-requests": "2500" },
+			});
+			const info = provider.parseRateLimit(response);
+			expect(info.statusHeader).toBe("allowed");
+			expect(info.remaining).toBe(2500);
+			expect(info.isRateLimited).toBe(false);
+		});
+
+		it("claims no status when Meta reported no quota headers", () => {
+			const info = provider.parseRateLimit(new Response("{}", { status: 200 }));
+			expect(info.statusHeader).toBeUndefined();
+			expect(info.remaining).toBeUndefined();
 		});
 
 		it("falls back to remaining tokens when requests are not reported", () => {

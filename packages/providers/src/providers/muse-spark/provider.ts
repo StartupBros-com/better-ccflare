@@ -89,8 +89,8 @@ export function joinMuseSparkPath(basePath: string, pathname: string): string {
 		}
 	}
 
-	const remainder = pathSegments.slice(overlap);
-	return remainder.length > 0 ? `/${remainder.join("/")}` : "/";
+	const joined = [...baseSegments, ...pathSegments.slice(overlap)];
+	return joined.length > 0 ? `/${joined.join("/")}` : "/";
 }
 
 export class MuseSparkProvider extends BaseAnthropicCompatibleProvider {
@@ -115,15 +115,34 @@ export class MuseSparkProvider extends BaseAnthropicCompatibleProvider {
 	 * honoured so the account can be pointed at a gateway or regional host, and
 	 * any overlap between the base's trailing path and the request path is
 	 * collapsed, so neither `.../v1` nor `.../proxy/v1` yields a duplicate `/v1`.
+	 *
+	 * The result is assembled through the parsed URL rather than by string
+	 * concatenation: a gateway base may legitimately carry its own query string
+	 * (`https://gateway.example/proxy?api-version=2024`), and appending the route
+	 * as text would bury it inside that query and leave the path at `/proxy`.
+	 * Base query parameters are preserved and the request's own take precedence.
 	 */
 	buildUrl(pathname: string, search: string, account?: Account): string {
 		const baseUrl = account?.custom_endpoint?.trim() || this.getEndpoint();
 		const cleanBaseUrl = baseUrl.replace(/\/$/, "");
 
 		try {
-			const parsed = new URL(cleanBaseUrl);
-			const basePath = parsed.pathname.replace(/\/$/, "");
-			return `${cleanBaseUrl}${joinMuseSparkPath(basePath, pathname)}${search}`;
+			const target = new URL(cleanBaseUrl);
+			target.pathname = joinMuseSparkPath(
+				target.pathname.replace(/\/$/, ""),
+				pathname,
+			);
+
+			const requestParams = new URLSearchParams(
+				search.startsWith("?") ? search.slice(1) : search,
+			);
+			for (const [key, value] of requestParams) {
+				target.searchParams.set(key, value);
+			}
+			// A fragment is meaningless to the upstream and never sent anyway.
+			target.hash = "";
+
+			return target.toString();
 		} catch {
 			return `${cleanBaseUrl}${pathname}${search}`;
 		}
@@ -144,6 +163,9 @@ export class MuseSparkProvider extends BaseAnthropicCompatibleProvider {
 			newHeaders.set("Authorization", `Bearer ${token}`);
 		}
 
+		// The sanitizer rewrites the body, so any inbound length is stale. The
+		// openai and codex providers strip it for the same reason.
+		newHeaders.delete("content-length");
 		newHeaders.delete("host");
 		newHeaders.delete("accept-encoding");
 		newHeaders.delete("content-encoding");
@@ -196,12 +218,19 @@ export class MuseSparkProvider extends BaseAnthropicCompatibleProvider {
 			return request;
 		}
 
-		const rebuild = (body: BodyInit): Request =>
-			new Request(request.url, {
+		// Sanitization changes the body length, so the inbound content-length must
+		// not ride along: reusing it sends wrong framing and the outgoing fetch can
+		// reject the request before Meta ever sees it. Deleting it lets the length
+		// be recomputed from the actual bytes.
+		const rebuild = (body: BodyInit): Request => {
+			const headers = new Headers(request.headers);
+			headers.delete("content-length");
+			return new Request(request.url, {
 				method: request.method,
-				headers: request.headers,
+				headers,
 				body,
 			});
+		};
 
 		let bytes: ArrayBuffer;
 		try {
@@ -265,7 +294,14 @@ export class MuseSparkProvider extends BaseAnthropicCompatibleProvider {
 			parseCount(remainingRequests) ?? parseCount(remainingTokens);
 
 		if (response.status !== 429) {
-			return { isRateLimited: false, remaining };
+			// Response metadata is only persisted when a status is present, so
+			// headroom parsed from a healthy response would otherwise be discarded
+			// and the account's remaining quota would stay null or stale. "allowed"
+			// is the same marker the qwen and openai providers use, and is not a
+			// hard-limit status. Only claim it when Meta actually reported quota.
+			return remaining === undefined
+				? { isRateLimited: false }
+				: { isRateLimited: false, statusHeader: "allowed", remaining };
 		}
 
 		const retryAfter = response.headers.get("retry-after");
