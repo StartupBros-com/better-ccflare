@@ -1908,8 +1908,14 @@ export async function getAccountsList(
 	const now = Date.now();
 
 	return accounts.map((account) => {
+		// An API-key account holds a static credential with no OAuth expiry, so an
+		// absent expires_at means "never expires", not "expired". Without this a
+		// working Muse Spark account is listed and exported as expired.
+		const usesStaticApiKey = Boolean(account.api_key) && !account.expires_at;
 		const tokenStatus =
-			account.expires_at && account.expires_at > now ? "valid" : "expired";
+			usesStaticApiKey || (account.expires_at && account.expires_at > now)
+				? "valid"
+				: "expired";
 
 		let rateLimitStatus = "OK";
 		if (account.paused) {
@@ -1943,6 +1949,7 @@ export async function getAccountsList(
 				if (
 					account.provider === "zai" ||
 					account.provider === "minimax" ||
+					account.provider === "muse-spark" ||
 					account.provider === "anthropic-compatible" ||
 					account.provider === "bedrock" ||
 					account.provider === "openrouter" ||

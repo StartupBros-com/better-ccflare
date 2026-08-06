@@ -215,43 +215,24 @@ function sanitizeOutputConfig(
 	return config && Object.keys(config).length > 0 ? config : undefined;
 }
 
-/**
- * Meta rejects a named tool choice. `any` is the closest surviving semantic:
- * both compel the model to call a tool, `any` just does not pin which one.
- */
-function sanitizeToolChoice(
-	toolChoice: unknown,
-	changes: string[],
-): unknown | undefined {
-	if (toolChoice === undefined) return undefined;
-	if (!isPlainObject(toolChoice)) {
-		changes.push("dropped_tool_choice:unsupported_shape");
-		return undefined;
-	}
-
-	if (toolChoice.type === "tool") {
-		changes.push("rewrote_tool_choice:tool->any");
-		const rewritten: Record<string, unknown> = { type: "any" };
-		if (toolChoice.disable_parallel_tool_use !== undefined) {
-			rewritten.disable_parallel_tool_use =
-				toolChoice.disable_parallel_tool_use;
-		}
-		return rewritten;
-	}
-
-	if (
-		toolChoice.type === "auto" ||
-		toolChoice.type === "any" ||
-		toolChoice.type === "none"
-	) {
-		return toolChoice;
-	}
-
-	changes.push(`dropped_tool_choice:${String(toolChoice.type)}`);
-	return undefined;
+function isWebSearchTool(tool: Record<string, unknown>): boolean {
+	const type = typeof tool.type === "string" ? tool.type : "";
+	const name = typeof tool.name === "string" ? tool.name : "";
+	return type.startsWith("web_search") || name === "web_search";
 }
 
-/** Strip `web_search` options Meta rejects, leaving the tool itself intact. */
+/**
+ * Drop any `web_search` tool whose constraints Meta cannot honour.
+ *
+ * Meta rejects `allowed_domains`, `blocked_domains` and `max_uses` outright and
+ * offers no equivalent. Stripping just those fields would leave search ENABLED
+ * but unbounded: a request restricted to approved sources, or to a fixed number
+ * of searches, would silently gain the ability to search anything, any number of
+ * times. That widens a security, compliance and cost boundary the caller set, so
+ * the whole tool is removed instead — failing closed, never open.
+ *
+ * A `web_search` tool carrying no such constraints is passed through untouched.
+ */
 function sanitizeTools(tools: unknown, changes: string[]): unknown | undefined {
 	if (tools === undefined) return undefined;
 	if (!Array.isArray(tools)) {
@@ -259,22 +240,79 @@ function sanitizeTools(tools: unknown, changes: string[]): unknown | undefined {
 		return undefined;
 	}
 
-	return tools.map((tool) => {
-		if (!isPlainObject(tool)) return tool;
-		const type = typeof tool.type === "string" ? tool.type : "";
-		const name = typeof tool.name === "string" ? tool.name : "";
-		const isWebSearch = type.startsWith("web_search") || name === "web_search";
-		if (!isWebSearch) return tool;
+	return tools.filter((tool) => {
+		if (!isPlainObject(tool) || !isWebSearchTool(tool)) return true;
 
-		const sanitized = { ...tool };
-		for (const field of WEB_SEARCH_UNSUPPORTED_FIELDS) {
-			if (field in sanitized) {
-				delete sanitized[field];
-				changes.push(`dropped_web_search_field:${field}`);
-			}
-		}
-		return sanitized;
+		const constrained = WEB_SEARCH_UNSUPPORTED_FIELDS.filter(
+			(field) => field in tool,
+		);
+		if (constrained.length === 0) return true;
+
+		changes.push(`dropped_web_search_tool:${constrained.join("+")}`);
+		return false;
 	});
+}
+
+/**
+ * Resolve `tool_choice`, and the tool list it authorizes, together.
+ *
+ * Meta rejects a named tool choice (`{type: "tool", name}`). Rewriting it to
+ * `{type: "any"}` on its own would compel a tool call while leaving EVERY
+ * declared tool callable, so the model could invoke a tool the caller never
+ * authorized — including one with external side effects. Narrowing the outgoing
+ * tool list to the named tool preserves the original meaning exactly: a tool
+ * call is required, and only the authorized tool is available.
+ *
+ * If the named tool is not declared the request was already malformed; the tool
+ * list is emptied so the upstream rejects it rather than the proxy quietly
+ * authorizing something broader.
+ */
+function resolveToolAuthorization(
+	toolChoice: unknown,
+	tools: unknown,
+	changes: string[],
+): { toolChoice?: unknown; tools?: unknown } {
+	const sanitizedTools = sanitizeTools(tools, changes);
+
+	if (toolChoice === undefined) return { tools: sanitizedTools };
+	if (!isPlainObject(toolChoice)) {
+		changes.push("dropped_tool_choice:unsupported_shape");
+		return { tools: sanitizedTools };
+	}
+
+	if (toolChoice.type === "tool") {
+		const rewritten: Record<string, unknown> = { type: "any" };
+		if (toolChoice.disable_parallel_tool_use !== undefined) {
+			rewritten.disable_parallel_tool_use =
+				toolChoice.disable_parallel_tool_use;
+		}
+
+		const name = typeof toolChoice.name === "string" ? toolChoice.name : "";
+		const declared = Array.isArray(sanitizedTools) ? sanitizedTools : [];
+		const authorized = declared.filter(
+			(tool) => isPlainObject(tool) && tool.name === name,
+		);
+
+		if (authorized.length > 0) {
+			changes.push(`narrowed_tools_to_named_choice:${name}`);
+			return { toolChoice: rewritten, tools: authorized };
+		}
+
+		// Named tool absent: fail closed rather than authorize every tool.
+		changes.push(`named_tool_not_declared:${name || "(unnamed)"}`);
+		return { toolChoice: rewritten, tools: [] };
+	}
+
+	if (
+		toolChoice.type === "auto" ||
+		toolChoice.type === "any" ||
+		toolChoice.type === "none"
+	) {
+		return { toolChoice, tools: sanitizedTools };
+	}
+
+	changes.push(`dropped_tool_choice:${String(toolChoice.type)}`);
+	return { tools: sanitizedTools };
 }
 
 /**
@@ -362,18 +400,20 @@ export function sanitizeMuseSparkRequestBody(
 	if (outputConfig === undefined) delete sanitized.output_config;
 	else sanitized.output_config = outputConfig;
 
-	// 8. tool_choice.
-	if ("tool_choice" in sanitized) {
-		const toolChoice = sanitizeToolChoice(sanitized.tool_choice, changes);
-		if (toolChoice === undefined) delete sanitized.tool_choice;
-		else sanitized.tool_choice = toolChoice;
-	}
+	// 8. tool_choice and tools, resolved together: narrowing a named choice
+	//    requires narrowing the tool list it authorizes.
+	if ("tool_choice" in sanitized || "tools" in sanitized) {
+		const authorization = resolveToolAuthorization(
+			sanitized.tool_choice,
+			sanitized.tools,
+			changes,
+		);
 
-	// 9. tools.
-	if ("tools" in sanitized) {
-		const tools = sanitizeTools(sanitized.tools, changes);
-		if (tools === undefined) delete sanitized.tools;
-		else sanitized.tools = tools;
+		if (authorization.toolChoice === undefined) delete sanitized.tool_choice;
+		else sanitized.tool_choice = authorization.toolChoice;
+
+		if (authorization.tools === undefined) delete sanitized.tools;
+		else sanitized.tools = authorization.tools;
 	}
 
 	return { body: sanitized, changes };

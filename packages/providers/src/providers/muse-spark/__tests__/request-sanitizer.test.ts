@@ -294,17 +294,65 @@ describe("sanitizeMuseSparkRequestBody", () => {
 	});
 
 	describe("tool_choice", () => {
-		it("rewrites a named tool choice to any, which Meta accepts", () => {
+		const weather = {
+			name: "get_weather",
+			description: "w",
+			input_schema: {},
+		};
+		const wire = {
+			name: "send_wire_transfer",
+			description: "$",
+			input_schema: {},
+		};
+
+		// Meta rejects a named choice, but rewriting it to `any` on its own would
+		// leave every declared tool callable — the model could invoke a tool the
+		// caller never authorized, including one with side effects.
+		it("narrows the tool list to the named tool, not just the choice", () => {
 			const result = sanitizeMuseSparkRequestBody(
-				baseBody({ tool_choice: { type: "tool", name: "get_weather" } }),
+				baseBody({
+					tools: [weather, wire],
+					tool_choice: { type: "tool", name: "get_weather" },
+				}),
 			);
 			expect(result.body.tool_choice).toEqual({ type: "any" });
-			expect(result.changes).toContain("rewrote_tool_choice:tool->any");
+			expect(result.body.tools).toEqual([weather]);
+			expect(result.changes).toContain(
+				"narrowed_tools_to_named_choice:get_weather",
+			);
+		});
+
+		it("never leaves an unauthorized tool callable", () => {
+			const result = sanitizeMuseSparkRequestBody(
+				baseBody({
+					tools: [weather, wire],
+					tool_choice: { type: "tool", name: "get_weather" },
+				}),
+			);
+			const names = (result.body.tools as Array<{ name: string }>).map(
+				(t) => t.name,
+			);
+			expect(names).not.toContain("send_wire_transfer");
+		});
+
+		// A named tool that was never declared is a malformed request: emptying
+		// the list makes the upstream reject it instead of the proxy quietly
+		// authorizing every other tool.
+		it("fails closed when the named tool is not declared", () => {
+			const result = sanitizeMuseSparkRequestBody(
+				baseBody({
+					tools: [wire],
+					tool_choice: { type: "tool", name: "missing_tool" },
+				}),
+			);
+			expect(result.body.tools).toEqual([]);
+			expect(result.changes).toContain("named_tool_not_declared:missing_tool");
 		});
 
 		it("preserves disable_parallel_tool_use through the rewrite", () => {
 			const result = sanitizeMuseSparkRequestBody(
 				baseBody({
+					tools: [{ name: "x", description: "x", input_schema: {} }],
 					tool_choice: {
 						type: "tool",
 						name: "x",
@@ -329,7 +377,10 @@ describe("sanitizeMuseSparkRequestBody", () => {
 	});
 
 	describe("tools", () => {
-		it("strips web_search options Meta rejects", () => {
+		// Meta honours none of allowed_domains / blocked_domains / max_uses.
+		// Stripping just those fields would leave search enabled but UNBOUNDED,
+		// silently widening the caller's security, compliance and cost boundary.
+		it("drops a constrained web_search tool entirely rather than unbounding it", () => {
 			const result = sanitizeMuseSparkRequestBody(
 				baseBody({
 					tools: [
@@ -344,17 +395,40 @@ describe("sanitizeMuseSparkRequestBody", () => {
 					],
 				}),
 			);
-			expect(result.body.tools).toEqual([
-				{
-					type: "web_search_20250305",
-					name: "web_search",
-					user_location: { type: "approximate" },
-				},
-			]);
-			expect(result.changes).toContain("dropped_web_search_field:max_uses");
-			expect(result.changes).toContain(
-				"dropped_web_search_field:allowed_domains",
+			expect(result.body.tools).toEqual([]);
+			expect(
+				result.changes.some((c) => c.startsWith("dropped_web_search_tool:")),
+			).toBe(true);
+		});
+
+		it("keeps other tools when a constrained web_search is dropped", () => {
+			const calc = { name: "calc", description: "c", input_schema: {} };
+			const result = sanitizeMuseSparkRequestBody(
+				baseBody({
+					tools: [
+						calc,
+						{
+							type: "web_search_20250305",
+							name: "web_search",
+							allowed_domains: ["example.com"],
+						},
+					],
+				}),
 			);
+			expect(result.body.tools).toEqual([calc]);
+		});
+
+		it("keeps an unconstrained web_search tool, which broadens nothing", () => {
+			const search = {
+				type: "web_search_20250305",
+				name: "web_search",
+				user_location: { type: "approximate" },
+			};
+			const result = sanitizeMuseSparkRequestBody(
+				baseBody({ tools: [search] }),
+			);
+			expect(result.body.tools).toEqual([search]);
+			expect(result.changes).toEqual([]);
 		});
 
 		it("leaves developer-defined tools untouched", () => {
