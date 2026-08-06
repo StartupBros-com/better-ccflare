@@ -593,7 +593,8 @@ export async function getValidAccessToken(
 		account.provider === "zai" ||
 		account.provider === "claude-console-api" ||
 		account.provider === "anthropic-compatible" ||
-		account.provider === "minimax"
+		account.provider === "minimax" ||
+		account.provider === "muse-spark"
 	) {
 		if (account.api_key) {
 			return account.api_key;

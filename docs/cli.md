@@ -121,7 +121,7 @@ Add a new OAuth account to the load balancer pool.
 
 **Syntax:**
 ```bash
-bun run cli --add-account <name> --mode <claude-oauth|console|codex|qwen|xai|zai|minimax|anthropic-compatible|openai-compatible> --priority <number>
+bun run cli --add-account <name> --mode <claude-oauth|console|codex|qwen|xai|zai|minimax|muse-spark|anthropic-compatible|openai-compatible> --priority <number>
 ```
 
 **Note:** All flags must be provided explicitly as the CLI requires explicit parameters.

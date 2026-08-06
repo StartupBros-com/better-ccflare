@@ -36,6 +36,7 @@ import {
 	createBedrockAccountAddHandler,
 	createKiloAccountAddHandler,
 	createMinimaxAccountAddHandler,
+	createMuseSparkAccountAddHandler,
 	createNanoGPTAccountAddHandler,
 	createOllamaAccountAddHandler,
 	createOllamaCloudAccountAddHandler,
@@ -224,6 +225,7 @@ export class APIRouter {
 		const nanogptAccountAddHandler = createNanoGPTAccountAddHandler(dbOps);
 		const anthropicCompatibleAccountAddHandler =
 			createAnthropicCompatibleAccountAddHandler(dbOps);
+		const museSparkAccountAddHandler = createMuseSparkAccountAddHandler(dbOps);
 		const ollamaAccountAddHandler = createOllamaAccountAddHandler(dbOps);
 		const openaiAccountAddHandler = createOpenAIAccountAddHandler(dbOps);
 		const _accountRemoveHandler = createAccountRemoveHandler(dbOps);
@@ -324,6 +326,9 @@ export class APIRouter {
 		);
 		this.handlers.set("POST:/api/accounts/anthropic-compatible", (req) =>
 			anthropicCompatibleAccountAddHandler(req),
+		);
+		this.handlers.set("POST:/api/accounts/muse-spark", (req) =>
+			museSparkAccountAddHandler(req),
 		);
 		this.handlers.set("POST:/api/accounts/ollama", (req) =>
 			ollamaAccountAddHandler(req),

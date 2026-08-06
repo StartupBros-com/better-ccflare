@@ -693,6 +693,36 @@ class API extends HttpClient {
 		}
 	}
 
+	async addMuseSparkAccount(data: {
+		name: string;
+		apiKey: string;
+		priority: number;
+		customEndpoint?: string;
+		modelMappings?: { [key: string]: string };
+	}): Promise<AccountCreatedApiResponse> {
+		const startTime = Date.now();
+		const url = "/api/accounts/muse-spark";
+
+		this.logger.debug(`→ POST ${url}`, safeAccountCreateLog(data));
+
+		try {
+			const response = await this.post<AccountCreatedApiResponse>(url, data);
+			const duration = Date.now() - startTime;
+			this.logger.debug(`← POST ${url} - 200 (${duration}ms)`);
+			return response;
+		} catch (error) {
+			const duration = Date.now() - startTime;
+			this.logger.error(`✗ POST ${url} - ERROR (${duration}ms)`, {
+				error: error instanceof Error ? error.message : String(error),
+				stack: error instanceof Error ? error.stack : undefined,
+			});
+			if (error instanceof HttpError) {
+				throw new Error(error.message);
+			}
+			throw error;
+		}
+	}
+
 	async addOllamaAccount(data: {
 		name: string;
 		priority: number;

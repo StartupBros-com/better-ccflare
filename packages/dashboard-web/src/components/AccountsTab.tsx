@@ -54,6 +54,7 @@ type AccountCreationClient = Pick<
 	| "addBedrockAccount"
 	| "addZaiAccount"
 	| "addMinimaxAccount"
+	| "addMuseSparkAccount"
 	| "addNanoGPTAccount"
 	| "addAlibabaCodingPlanAccount"
 	| "addKiloAccount"
@@ -125,6 +126,14 @@ export function createAccountCreationCallbacks(
 		) =>
 			immutableAccountIdentity(
 				() => client.addMinimaxAccount(params),
+				afterCreate,
+				onError,
+			),
+		onAddMuseSparkAccount: (
+			params: Parameters<typeof client.addMuseSparkAccount>[0],
+		) =>
+			immutableAccountIdentity(
+				() => client.addMuseSparkAccount(params),
 				afterCreate,
 				onError,
 			),
@@ -387,6 +396,16 @@ export function AccountsTab() {
 		priority: number;
 	}) => {
 		return accountCreationCallbacks.onAddMinimaxAccount(params);
+	};
+
+	const handleAddMuseSparkAccount = async (params: {
+		name: string;
+		apiKey: string;
+		priority: number;
+		customEndpoint?: string;
+		modelMappings?: { [key: string]: string };
+	}) => {
+		return accountCreationCallbacks.onAddMuseSparkAccount(params);
 	};
 
 	const handleAddNanoGPTAccount = async (params: {
@@ -717,6 +736,7 @@ export function AccountsTab() {
 							onAddBedrockAccount={handleAddBedrockAccount}
 							onAddZaiAccount={handleAddZaiAccount}
 							onAddMinimaxAccount={handleAddMinimaxAccount}
+							onAddMuseSparkAccount={handleAddMuseSparkAccount}
 							onAddNanoGPTAccount={handleAddNanoGPTAccount}
 							onAddAlibabaCodingPlanAccount={handleAddAlibabaCodingPlanAccount}
 							onAddKiloAccount={handleAddKiloAccount}

@@ -470,10 +470,10 @@ describe("managed routing migrations", () => {
 			"NEW.refresh_token = NEW.api_key AND NEW.access_token = NEW.api_key",
 		);
 		expect(accountTriggerSql).toContain(
-			"COALESCE(OLD.provider IN ('claude-console-api', 'zai', 'minimax', 'anthropic-compatible', 'openai-compatible', 'nanogpt', 'kilo', 'openrouter', 'alibaba-coding-plan', 'ollama-cloud'), FALSE)",
+			"COALESCE(OLD.provider IN ('claude-console-api', 'zai', 'minimax', 'anthropic-compatible', 'openai-compatible', 'nanogpt', 'kilo', 'openrouter', 'alibaba-coding-plan', 'ollama-cloud', 'muse-spark'), FALSE)",
 		);
 		expect(accountTriggerSql).toContain(
-			"COALESCE(NEW.provider IN ('claude-console-api', 'zai', 'minimax', 'anthropic-compatible', 'openai-compatible', 'nanogpt', 'kilo', 'openrouter', 'alibaba-coding-plan', 'ollama-cloud'), FALSE)",
+			"COALESCE(NEW.provider IN ('claude-console-api', 'zai', 'minimax', 'anthropic-compatible', 'openai-compatible', 'nanogpt', 'kilo', 'openrouter', 'alibaba-coding-plan', 'ollama-cloud', 'muse-spark'), FALSE)",
 		);
 		expect(accountTriggerSql).toContain("IS DISTINCT FROM");
 

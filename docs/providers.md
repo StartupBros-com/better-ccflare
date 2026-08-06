@@ -40,6 +40,12 @@
   - Bearer token authentication via API key
   - Converts Anthropic-format requests to Ollama native `/api/chat` format
   - Converts NDJSON streaming responses back to Anthropic SSE
+- **Muse Spark** - Meta Model API at `https://api.meta.ai`:
+  - Anthropic-compatible Messages endpoint (`/v1/messages`, `/v1/messages/count_tokens`)
+  - Models `muse-spark-1.2` (default), `muse-spark-1.1`, `muse-spark-1.2-contributor`
+  - Bearer token authentication via API key
+  - Model mapping optional — Claude model names route to `muse-spark-1.2` automatically
+  - Normalizes outbound requests for Meta's strict field validation
 
 ### Key Points
 - Anthropic requests route to `https://api.anthropic.com`
@@ -123,6 +129,14 @@ The better-ccflare providers system is a modular architecture designed to suppor
    - NDJSON streaming responses converted back to Anthropic SSE
    - Bearer token authentication via API key
    - Model mapping required (configured via `model_mappings` on account)
+
+10. **Muse Spark Provider** - Provides access to:
+    - **Meta Model API** at `https://api.meta.ai` via its Anthropic-compatible Messages endpoint
+    - Models `muse-spark-1.2` (default), `muse-spark-1.1`, and `muse-spark-1.2-contributor`
+    - 1,048,576-token context window; 131,072-token maximum output
+    - Bearer token authentication (`Authorization: Bearer`), not `x-api-key`
+    - Automatic model mapping: any Claude model name routes to `muse-spark-1.2` unless the account overrides it
+    - Request normalization for Meta's strict field validation (see below)
 
 The providers system handles:
 - OAuth authentication flows with PKCE security (Anthropic)
@@ -313,6 +327,75 @@ prepareHeaders(headers: Headers, accessToken?: string, apiKey?: string): Headers
 ```
 
 The API key is stored in the `refresh_token` field of the account record for consistency with the authentication system.
+
+## MuseSparkProvider Implementation
+
+The MuseSparkProvider extends `BaseAnthropicCompatibleProvider` and serves Meta's Muse Spark models through the Meta Model API.
+
+### Key Features
+
+1. **Bearer Authentication**: Uses `Authorization: Bearer <key>`, not Anthropic's `x-api-key`
+2. **Fixed Default Endpoint**: `https://api.meta.ai`, with an optional per-account custom endpoint
+3. **Automatic Model Mapping**: Any Claude model name routes to `muse-spark-1.2` without configuration
+4. **Request Normalization**: Rewrites the outbound body to satisfy Meta's strict validator
+5. **OpenAI-style Rate Limit Headers**: Reads `x-ratelimit-*` rather than `anthropic-ratelimit-unified-*`
+
+### Endpoint and Models
+
+| Setting | Value |
+| --- | --- |
+| Base URL | `https://api.meta.ai` |
+| Endpoints | `POST /v1/messages`, `POST /v1/messages/count_tokens` |
+| Default model | `muse-spark-1.2` |
+| Other models | `muse-spark-1.1`, `muse-spark-1.2-contributor` |
+| Context window | 1,048,576 tokens |
+| Max output | 131,072 tokens |
+
+### Model Mapping
+
+Meta serves one model per tier, so every Claude family collapses onto the current standard checkpoint. `resolveModel()` applies this order:
+
+1. An explicit `model_mappings` entry on the account wins.
+2. A model ID already starting with `muse-spark` passes through unchanged.
+3. Anything else (including every `claude-*` name) becomes `muse-spark-1.2`.
+
+Step 3 matters: forwarding `claude-opus-4-6-…` unchanged would return `model_not_found`.
+
+### Request Normalization
+
+Meta's Messages endpoint is a wire-format adapter over its Responses pipeline, not a full Anthropic implementation. It validates against a strict allowlist and returns `HTTP 400` for anything it does not recognise — **including unknown top-level fields**. Claude Code routinely sends such fields, so `sanitizeMuseSparkRequestBody()` normalizes every outbound body:
+
+| Client sends | Proxy does | Why |
+| --- | --- | --- |
+| `stop_sequences`, `top_k`, `container`, `inference_geo` | dropped | explicitly rejected |
+| any unrecognised top-level field | dropped | unknown fields are rejected |
+| `thinking: {type: "disabled"}` | dropped | Muse Spark cannot disable reasoning |
+| `thinking: {type: "enabled", budget_tokens}` | clamped to `1024 ≤ budget < max_tokens` | outside that range is a 400 |
+| a valid thinking budget | also sets `output_config.effort` | Meta ignores `budget_tokens` for depth; only `effort` moves the dial |
+| `tool_choice: {type: "tool", name}` | rewritten to `{type: "any"}` | named tool choice is rejected |
+| `web_search` with `allowed_domains` / `blocked_domains` / `max_uses` | those fields dropped | Meta's built-in search has no domain filtering or use cap |
+| non-`text` blocks in `system` | dropped | system accepts text blocks only |
+| `service_tier` outside `auto` / `standard_only` | dropped | other values are rejected |
+| `temperature` outside 0–1 | clamped | enforced to Anthropic's range |
+| `max_tokens` above 131,072 | clamped | model output ceiling |
+
+The sanitizer is pure and never mutates the caller's object. Every edit is recorded in a `changes` list that the provider logs at debug level, so a surprising rewrite is traceable without logging request content.
+
+Because `budget_tokens` alone has no effect on Meta's reasoning depth, the provider derives `output_config.effort` from it (`<4k` → `low`, `<16k` → `medium`, `<32k` → `high`, else `xhigh`). An explicit `output_config.effort` from the client always wins.
+
+### Rate Limits
+
+Meta reports quota with `x-ratelimit-limit-requests`, `x-ratelimit-remaining-requests`, `x-ratelimit-limit-tokens`, and `x-ratelimit-remaining-tokens` on every successful response. `parseRateLimit()` surfaces remaining requests (falling back to remaining tokens) so the load balancer can see headroom before a 429, and treats a 429 as rate-limited, using `retry-after` for the reset time when present.
+
+Standard-tier limits are 3,000 RPM / 4,000,000 TPM; contributor tier is 60 RPM / 2,100,000 TPM. Limits apply per team, not per API key — multiple keys on one team share a single quota, which is worth knowing before adding several Muse Spark accounts expecting independent budgets.
+
+### Setup
+
+```bash
+bun run cli --add-account meta --mode muse-spark --priority 10
+```
+
+Supply the Model API key when prompted. The custom endpoint is optional and defaults to `https://api.meta.ai`.
 
 ## VertexAIProvider Implementation
 
