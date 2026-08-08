@@ -107,7 +107,19 @@ function normalizeCodexUsageData(usage: UsageData): UsageData | null {
 	// Spread the source first so polling-only extras (plan_type,
 	// credits_balance, code_review_used_percent/_resets_at from the free
 	// wham/usage endpoint) survive normalization and reach API consumers.
-	return five_hour.resets_at !== null || seven_day.resets_at !== null
+	// Reset presence alone is NOT the validity test: the wham endpoint can
+	// report live utilization with reset_at 0/absent (e.g. an unstarted
+	// window), and polled snapshots carrying extras or non-zero utilization
+	// must not be discarded in favor of stale header replays (pro-gate P2).
+	const hasWindowReset =
+		five_hour.resets_at !== null || seven_day.resets_at !== null;
+	const hasPollingExtras =
+		usage.plan_type !== undefined ||
+		usage.credits_balance !== undefined ||
+		usage.code_review_used_percent !== undefined;
+	const hasLiveUtilization =
+		five_hour.utilization > 0 || seven_day.utilization > 0;
+	return hasWindowReset || hasPollingExtras || hasLiveUtilization
 		? { ...usage, five_hour, seven_day }
 		: null;
 }
@@ -2954,6 +2966,16 @@ export function createAccountCustomEndpointUpdateHandler(
 				]);
 
 			log.info(`Updated custom endpoint for account ${accountId}`);
+
+			// Re-evaluate usage polling under the new endpoint: the restarter
+			// stops loops that are no longer eligible (codex on a custom
+			// endpoint) and restarts eligible ones. Best-effort — the endpoint
+			// update itself has already succeeded.
+			restartUsagePollingForAccount(accountId).catch((err) =>
+				log.warn(
+					`Failed to restart usage polling after endpoint update for ${accountId}: ${err}`,
+				),
+			);
 
 			return jsonResponse({
 				success: true,

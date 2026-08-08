@@ -204,9 +204,8 @@ async function requestWhamUsage(
 	endpoint: string,
 	accessToken: string,
 	chatgptAccountId: string | null,
+	signal: AbortSignal,
 ): Promise<Response> {
-	const controller = new AbortController();
-	const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 	const headers: Record<string, string> = {
 		Authorization: `Bearer ${accessToken}`,
 		Accept: "application/json",
@@ -219,15 +218,11 @@ async function requestWhamUsage(
 		headers["chatgpt-account-id"] = chatgptAccountId;
 		headers["X-Account-Id"] = chatgptAccountId;
 	}
-	try {
-		return await fetch(endpoint, {
-			method: "GET",
-			headers,
-			signal: controller.signal,
-		});
-	} finally {
-		clearTimeout(timeoutId);
-	}
+	return fetch(endpoint, {
+		method: "GET",
+		headers,
+		signal,
+	});
 }
 
 /**
@@ -245,27 +240,74 @@ export async function fetchCodexUsageData(
 
 	const chatgptAccountId = extractChatGptAccountId(accessToken);
 
-	let response: Response;
+	// One deadline covers the request(s) AND body consumption: fetch resolves
+	// at headers, so a peer that streams headers then stalls the body would
+	// otherwise hang response.json() forever with no timer — permanently
+	// wedging the per-account in-flight dedup and the polling loop.
+	const controller = new AbortController();
+	const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+	// Snapshot the module global BEFORE any await: a concurrent call may flip
+	// it mid-flight, and the 404 counterpart must derive from the URL this
+	// call actually tried, not from whatever the global says afterwards.
+	const attemptedEndpoint = resolvedUsageEndpoint;
+
 	try {
-		response = await requestWhamUsage(
-			resolvedUsageEndpoint,
+		let response = await requestWhamUsage(
+			attemptedEndpoint,
 			accessToken,
 			chatgptAccountId,
+			controller.signal,
 		);
 		if (response.status === 404) {
-			const alternate = counterpartUsageEndpoint(resolvedUsageEndpoint);
+			const alternate = counterpartUsageEndpoint(attemptedEndpoint);
 			log.warn(
-				`Codex usage endpoint 404 at ${resolvedUsageEndpoint}, retrying at ${alternate}`,
+				`Codex usage endpoint 404 at ${attemptedEndpoint}, retrying at ${alternate}`,
 			);
+			try {
+				await response.body?.cancel();
+			} catch {
+				// Best-effort: an uncancellable 404 body must not block the retry.
+			}
 			response = await requestWhamUsage(
 				alternate,
 				accessToken,
 				chatgptAccountId,
+				controller.signal,
 			);
 			if (response.ok) {
 				resolvedUsageEndpoint = alternate;
 			}
 		}
+
+		if (!response.ok) {
+			let retryAfterMs: number | null = null;
+			if (response.status === 429) {
+				const retryAfter = response.headers.get("retry-after");
+				if (retryAfter) {
+					const seconds = Number(retryAfter);
+					if (Number.isFinite(seconds) && seconds > 0) {
+						retryAfterMs = Math.round(seconds * 1000);
+						log.warn(
+							`Codex usage endpoint rate-limited, retry-after: ${seconds}s`,
+						);
+					}
+				}
+			}
+			log.warn(
+				`Failed to fetch Codex usage data: ${response.status} ${response.statusText}`,
+			);
+			return { data: null, retryAfterMs };
+		}
+
+		let body: WhamUsageResponse;
+		try {
+			body = (await response.json()) as WhamUsageResponse;
+		} catch (error) {
+			log.error("Failed to parse Codex usage response JSON:", error);
+			return { data: null, retryAfterMs: null };
+		}
+
+		return { data: mapWhamUsageResponse(body), retryAfterMs: null };
 	} catch (error) {
 		const errorMessage =
 			error instanceof Error
@@ -278,35 +320,7 @@ export async function fetchCodexUsageData(
 			errorMessage || "Unknown error",
 		);
 		return { data: null, retryAfterMs: null };
+	} finally {
+		clearTimeout(timeoutId);
 	}
-
-	if (!response.ok) {
-		let retryAfterMs: number | null = null;
-		if (response.status === 429) {
-			const retryAfter = response.headers.get("retry-after");
-			if (retryAfter) {
-				const seconds = Number(retryAfter);
-				if (Number.isFinite(seconds) && seconds > 0) {
-					retryAfterMs = Math.round(seconds * 1000);
-					log.warn(
-						`Codex usage endpoint rate-limited, retry-after: ${seconds}s`,
-					);
-				}
-			}
-		}
-		log.warn(
-			`Failed to fetch Codex usage data: ${response.status} ${response.statusText}`,
-		);
-		return { data: null, retryAfterMs };
-	}
-
-	let body: WhamUsageResponse;
-	try {
-		body = (await response.json()) as WhamUsageResponse;
-	} catch (error) {
-		log.error("Failed to parse Codex usage response JSON:", error);
-		return { data: null, retryAfterMs: null };
-	}
-
-	return { data: mapWhamUsageResponse(body), retryAfterMs: null };
 }

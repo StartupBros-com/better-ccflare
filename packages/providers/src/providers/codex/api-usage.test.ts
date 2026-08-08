@@ -391,6 +391,27 @@ describe("fetchCodexUsageData", () => {
 		});
 	});
 
+	it("returns null data instead of hanging when the body read fails", async () => {
+		// fetch resolves at headers; a stalled/failing body must not wedge the
+		// call — the deadline stays armed through json() and failures return.
+		const fetchMock = mock(async () => {
+			return {
+				ok: true,
+				status: 200,
+				statusText: "OK",
+				headers: new Headers(),
+				json: async () => {
+					throw new Error("body stream aborted");
+				},
+			} as unknown as Response;
+		});
+		globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+		const result = await fetchCodexUsageData(ACCOUNT_TOKEN);
+
+		expect(result).toEqual({ data: null, retryAfterMs: null });
+	});
+
 	it("returns no data and no retryAfterMs on a 401", async () => {
 		const fetchMock = mock(
 			async () => new Response("unauthorized", { status: 401 }),

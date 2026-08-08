@@ -1111,8 +1111,6 @@ class UsageCache {
 				// quota-consuming ping in on-demand-fetch.ts.
 				const result = await fetchCodexUsageData(token);
 				if (result.data) {
-					// Snapshot before clearing — needed for the capacity-restored guard below.
-					const wasRateLimited = this.usageRateLimitedUntil.has(accountId);
 					this.usageRateLimitedUntil.delete(accountId);
 					const callback = this.windowResetCallbacks.get(accountId);
 					if (callback)
@@ -1123,14 +1121,12 @@ class UsageCache {
 					const utilization = getRepresentativeUtilization(
 						result.data as UsageData,
 					);
-					// Notify capacity-restored listener only when the account was
-					// previously rate-limited and usage now shows available capacity
-					// (<100%). Mirrors the anthropic branch's seat-reassignment handling.
-					if (utilization !== null && utilization < 100 && wasRateLimited) {
-						const capacityCallback =
-							this.capacityRestoredCallbacks.get(accountId);
-						if (capacityCallback) capacityCallback(accountId);
-					}
+					// Deliberately NO capacity-restored callback for codex (unlike
+					// the anthropic branch): a 429 here is the wham INTROSPECTION
+					// endpoint throttling, which says nothing about cooldowns on
+					// the responses endpoint — firing the callback could clear a
+					// live rate_limited_until and re-route a cooling account
+					// (pro-gate P1). Cooldowns clear on their natural expiry.
 					const window = getRepresentativeWindow(result.data as UsageData);
 					log.debug(
 						`Successfully fetched Codex usage data for account ${accountId}: ${utilization}% (${window} window)`,

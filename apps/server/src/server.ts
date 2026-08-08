@@ -590,9 +590,23 @@ function startUsagePollingWithRefresh(
 	// Initial polling with token refresh
 	const pollWithRefresh = async () => {
 		try {
-			// Create a token provider function that gets a fresh token each time
-			const tokenProvider = async () =>
-				refreshPollingAccessToken(account, proxyContext);
+			// Create a token provider function that gets a fresh token each time.
+			// For codex it also re-checks endpoint eligibility from the DB on
+			// every cycle: a live custom_endpoint edit must not leave a stale
+			// loop polling the subscription backend (pro-gate P1) — the throw
+			// fails this fetch and stopPolling ends the loop cleanly.
+			const tokenProvider = async () => {
+				if (account.provider === "codex") {
+					const fresh = await proxyContext.dbOps.getAccount(account.id);
+					if (fresh && !accountSupportsRefreshBackedUsagePolling(fresh)) {
+						usageCache.stopPolling(account.id);
+						throw new Error(
+							`Codex account ${account.name} no longer targets the subscription backend; usage polling stopped`,
+						);
+					}
+				}
+				return refreshPollingAccessToken(account, proxyContext);
+			};
 
 			// Start usage polling with the token provider
 			usageCache.startPolling(
@@ -1315,6 +1329,10 @@ export default async function startServer(options?: {
 			return false;
 		}
 		if (!accountSupportsRefreshBackedUsagePolling(account)) {
+			// Stop any loop started under an earlier, eligible configuration
+			// (e.g. a codex account whose custom_endpoint changed) — restart
+			// requests are the hook endpoint updates use to enforce the gate.
+			usageCache.stopPolling(accountId);
 			log.warn(
 				`Cannot restart usage polling: account ${account.name} does not support refresh-backed usage polling`,
 			);
