@@ -77,6 +77,14 @@ export type {
 } from "./repositories/model-translation.repository";
 // Re-export repository classes
 export { ModelTranslationRepository } from "./repositories/model-translation.repository";
+export {
+	type ReserveReplayIssuanceInput,
+	SERVER_TOOL_REPLAY_ISSUANCE_MAX,
+	type ServerToolReplayIssuance,
+	ServerToolReplayIssuanceDataIntegrityError,
+	ServerToolReplayIssuanceLimitError,
+	ServerToolReplayIssuanceRepository,
+} from "./repositories/server-tool-replay-issuance.repository";
 // Re-export repository types
 export type { StatsRepository } from "./repositories/stats.repository";
 // Re-export retry utilities for external use (from your improvements)

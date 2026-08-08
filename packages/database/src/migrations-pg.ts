@@ -136,6 +136,35 @@ async function ensureDeviceSetupJobsSchemaPg(
 	);
 }
 
+async function ensureServerToolReplayIssuanceSchemaPg(
+	adapter: BunSqlAdapter,
+): Promise<void> {
+	await adapter.unsafe(`
+		CREATE TABLE IF NOT EXISTS server_tool_replay_issuance (
+			counter_identity TEXT PRIMARY KEY
+				CHECK (length(counter_identity) BETWEEN 1 AND 512),
+			issuance_count BIGINT NOT NULL DEFAULT 0
+				CHECK (issuance_count >= 0 AND issuance_count <= 2147483648),
+			first_issued_at BIGINT NOT NULL
+				CHECK (first_issued_at >= 0 AND first_issued_at <= 9007199254740991),
+			last_issued_at BIGINT NOT NULL
+				CHECK (last_issued_at >= first_issued_at AND last_issued_at <= 9007199254740991),
+			first_writer_revision TEXT NOT NULL
+				CHECK (length(first_writer_revision) BETWEEN 1 AND 256),
+			first_build_sha TEXT NOT NULL
+				CHECK (length(first_build_sha) BETWEEN 1 AND 256),
+			first_decoder_revision TEXT NOT NULL
+				CHECK (length(first_decoder_revision) BETWEEN 1 AND 256),
+			last_writer_revision TEXT NOT NULL
+				CHECK (length(last_writer_revision) BETWEEN 1 AND 256),
+			last_build_sha TEXT NOT NULL
+				CHECK (length(last_build_sha) BETWEEN 1 AND 256),
+			last_decoder_revision TEXT NOT NULL
+				CHECK (length(last_decoder_revision) BETWEEN 1 AND 256)
+		)
+	`);
+}
+
 async function ensureManagedRoutingPolicyTablesPg(
 	adapter: BunSqlAdapter,
 ): Promise<void> {
@@ -473,6 +502,7 @@ export async function ensureSchemaPg(adapter: BunSqlAdapter): Promise<void> {
 		`CREATE INDEX IF NOT EXISTS idx_oauth_sessions_expires ON oauth_sessions(expires_at)`,
 	);
 	await ensureDeviceSetupJobsSchemaPg(adapter);
+	await ensureServerToolReplayIssuanceSchemaPg(adapter);
 
 	// Create agent_preferences table
 	await adapter.unsafe(`
@@ -1213,6 +1243,7 @@ export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 		}
 	}
 	await ensureDeviceSetupJobsSchemaPg(adapter);
+	await ensureServerToolReplayIssuanceSchemaPg(adapter);
 
 	// Performance indexes — mirrors packages/database/src/performance-indexes.ts
 	// (addPerformanceIndexes) plus idx_api_keys_role, both applied to SQLite via
