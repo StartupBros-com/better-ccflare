@@ -1,0 +1,195 @@
+{
+	"schemaVersion": 1,
+	"capabilityStatus": "unknown",
+	"implementationGate": "blocked",
+	"proofRevision": 0,
+	"missingProofReason": "No operator-driven private endpoint capture has completed for the exact Codex endpoint/auth/model tuple.",
+	"evidence": [
+		{
+			"id": "request_acceptance",
+			"status": "missing"
+		},
+		{
+			"id": "endpoint_contract",
+			"status": "missing"
+		},
+		{
+			"id": "normalized_host_class",
+			"status": "missing"
+		},
+		{
+			"id": "auth_mode",
+			"status": "missing"
+		},
+		{
+			"id": "physical_model",
+			"status": "missing"
+		},
+		{
+			"id": "model_family",
+			"status": "missing"
+		},
+		{
+			"id": "client_version",
+			"status": "missing"
+		},
+		{
+			"id": "provider_version",
+			"status": "missing"
+		},
+		{
+			"id": "accepted_tool_declaration",
+			"status": "missing"
+		},
+		{
+			"id": "accepted_option_surface",
+			"status": "missing"
+		},
+		{
+			"id": "ordered_streaming_event_names",
+			"status": "missing"
+		},
+		{
+			"id": "sources_citations",
+			"status": "missing"
+		},
+		{
+			"id": "zero_result",
+			"status": "missing"
+		},
+		{
+			"id": "error_path",
+			"status": "missing"
+		},
+		{
+			"id": "usage_reconciliation",
+			"status": "missing"
+		},
+		{
+			"id": "mixed_tools",
+			"status": "missing"
+		},
+		{
+			"id": "continuation",
+			"status": "missing"
+		},
+		{
+			"id": "input_replay_direction",
+			"status": "missing"
+		},
+		{
+			"id": "input_replay_audience",
+			"status": "missing"
+		},
+		{
+			"id": "output_replay_direction",
+			"status": "missing"
+		},
+		{
+			"id": "output_replay_audience",
+			"status": "missing"
+		},
+		{
+			"id": "bccf2_provider_neutral_replay_wire_vectors",
+			"status": "missing"
+		},
+		{
+			"id": "bccf2_provider_neutral_replay_downgrade_behavior",
+			"status": "missing"
+		},
+		{
+			"id": "bccf2_provider_neutral_replay_nonce_tag_encoding",
+			"status": "missing"
+		},
+		{
+			"id": "bccf2_provider_neutral_replay_key_behavior",
+			"status": "missing"
+		},
+		{
+			"id": "bccf2_provider_neutral_replay_nonce_budget_rotation",
+			"status": "missing"
+		},
+		{
+			"id": "no_execution_status_code_headers",
+			"status": "missing"
+		},
+		{
+			"id": "no_execution_bounded_parse_rule",
+			"status": "missing"
+		},
+		{
+			"id": "no_execution_fixture_evidence",
+			"status": "missing"
+		},
+		{
+			"id": "declared_limits",
+			"status": "missing"
+		},
+		{
+			"id": "fixture_driven_profile_reductions",
+			"status": "missing"
+		},
+		{
+			"id": "sanitization",
+			"status": "missing"
+		},
+		{
+			"id": "redactions",
+			"status": "missing"
+		}
+	],
+	"artifacts": [],
+	"redactedFields": [
+		"authorization_headers",
+		"cookies",
+		"access_tokens",
+		"refresh_tokens",
+		"api_keys",
+		"account_identifiers",
+		"user_identifiers",
+		"session_identifiers",
+		"conversation_identifiers",
+		"request_identifiers",
+		"response_identifiers",
+		"call_identifiers",
+		"project_identifiers",
+		"organization_identifiers",
+		"correlation_identifiers",
+		"trace_identifiers",
+		"prompt_system_and_query_text",
+		"response_reasoning_and_output_text",
+		"turn_state",
+		"source_urls_titles_and_snippets",
+		"user_location",
+		"raw_transport_headers",
+		"raw_request_and_response_bodies",
+		"replay_plaintext",
+		"replay_envelopes",
+		"replay_nonces",
+		"replay_key_material",
+		"replay_key_ids",
+		"encrypted_replay_payloads",
+		"private_endpoint_origin"
+	],
+	"ownerRole": "maintainer",
+	"verificationDate": null,
+	"lastVerifiedAt": null,
+	"revalidationTriggers": [
+		"an operator-driven private endpoint capture completes",
+		"the Codex endpoint, auth mode, model family, client version, or provider event contract changes",
+		"provider-neutral replay, sanitization, or no-execution classifier contracts change"
+	],
+	"supersedingRevisionRestoration": [
+		"retain this blocked revision when a higher proof revision supersedes it",
+		"restore this blocked revision if the superseding proof is invalidated, drifts, or cannot be reproduced"
+	],
+	"providerNeutralReplayEvidence": {
+		"status": "missing",
+		"refs": [
+			"packages/providers/src/server-tools/replay-envelope.test.ts",
+			"packages/providers/src/server-tools/history-projection.test.ts",
+			"packages/providers/src/provider-attempt-plan.test.ts",
+			"packages/providers/src/server-tool-capabilities.test.ts"
+		]
+	}
+}
