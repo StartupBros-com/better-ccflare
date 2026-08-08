@@ -4,11 +4,63 @@ import {
 	createServerToolReplayEnvelopeCodec,
 	type ServerToolReplayEnvelopeCodec,
 	type ServerToolReplayEnvelopeKey,
+	type ServerToolReplayWriterAdmission,
 } from "@better-ccflare/providers";
 
 const SAFE_REPLAY_KEY_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const REPLAY_KEY_BYTES = 32;
+const REPLAY_PROVENANCE_TEXT_MAX_LENGTH = 256;
 const WRITER_ADMISSION_DISABLED = Object.freeze({ enabled: false as const });
+
+export const SERVER_TOOL_REPLAY_WRITER_REVISION =
+	"bccf2.A256GCM.writer.v1" as const;
+export const SERVER_TOOL_REPLAY_DECODER_REVISION =
+	"bccf2.A256GCM.decoder.v1" as const;
+
+export type ServerToolReplayWriterProvenance = Readonly<{
+	writerRevision: string;
+	buildSha: string | null;
+	decoderRevision: string;
+}>;
+
+export type ServerToolReplayIssuanceReservationInput = Readonly<{
+	counterIdentity: string;
+	writerRevision: string;
+	buildSha: string;
+	decoderRevision: string;
+	now: number;
+}>;
+
+export interface ServerToolReplayIssuanceStore {
+	reserveReplayIssuance(
+		input: ServerToolReplayIssuanceReservationInput,
+	): Promise<Readonly<{ issuanceCount: number }>>;
+}
+
+export type ServerToolReplayWriterAdmissionUnavailableReason =
+	| "invalid_store"
+	| "invalid_provenance_shape"
+	| "invalid_writer_revision"
+	| "missing_build_sha"
+	| "invalid_build_sha"
+	| "invalid_decoder_revision";
+
+export type ServerToolReplayWriterAdmissionBuildResult =
+	| Readonly<{
+			status: "ready";
+			writerAdmission: Extract<
+				ServerToolReplayWriterAdmission,
+				Readonly<{ enabled: true }>
+			>;
+	  }>
+	| Readonly<{
+			status: "unavailable";
+			reason: ServerToolReplayWriterAdmissionUnavailableReason;
+			writerAdmission: Extract<
+				ServerToolReplayWriterAdmission,
+				Readonly<{ enabled: false }>
+			>;
+	  }>;
 
 export type ServerToolReplayRuntimeState =
 	| Readonly<{ status: "disabled" }>
@@ -20,6 +72,10 @@ export type ServerToolReplayRuntimeState =
 			status: "ready";
 			codec: ServerToolReplayEnvelopeCodec;
 	  }>;
+
+export type ServerToolReplayRuntimeOptions = Readonly<{
+	writerAdmission?: ServerToolReplayWriterAdmission;
+}>;
 
 const SERVER_TOOL_REPLAY_DISABLED: ServerToolReplayRuntimeState = Object.freeze(
 	{
@@ -47,6 +103,133 @@ function hasExactProperties(
 	);
 }
 
+function hasControlCharacter(value: string): boolean {
+	return Array.from(value).some((character) => {
+		const codePoint = character.codePointAt(0) ?? 0;
+		return codePoint <= 0x1f || codePoint === 0x7f;
+	});
+}
+
+function isBoundedOpaqueText(value: unknown): value is string {
+	return (
+		typeof value === "string" &&
+		value.length >= 1 &&
+		value.length <= REPLAY_PROVENANCE_TEXT_MAX_LENGTH &&
+		value.trim() === value &&
+		!hasControlCharacter(value)
+	);
+}
+
+function unavailableWriterAdmission(
+	reason: ServerToolReplayWriterAdmissionUnavailableReason,
+): ServerToolReplayWriterAdmissionBuildResult {
+	return Object.freeze({
+		status: "unavailable",
+		reason,
+		writerAdmission: WRITER_ADMISSION_DISABLED,
+	});
+}
+
+function snapshotBoundReplayIssuanceReservation(
+	store: unknown,
+): ServerToolReplayIssuanceStore["reserveReplayIssuance"] | undefined {
+	if (!isRecord(store)) return undefined;
+
+	try {
+		let owner: object | null = store;
+		while (owner !== null) {
+			const descriptor = Object.getOwnPropertyDescriptor(
+				owner,
+				"reserveReplayIssuance",
+			);
+			if (descriptor !== undefined) {
+				if (
+					!("value" in descriptor) ||
+					typeof descriptor.value !== "function"
+				) {
+					return undefined;
+				}
+				return Reflect.apply(Function.prototype.bind, descriptor.value, [
+					store,
+				]) as ServerToolReplayIssuanceStore["reserveReplayIssuance"];
+			}
+			owner = Object.getPrototypeOf(owner) as object | null;
+		}
+	} catch {
+		return undefined;
+	}
+
+	return undefined;
+}
+
+/**
+ * Adapt the durable issuance repository's narrow atomic reservation operation
+ * to the codec writer-admission contract. Provenance is snapshotted once and
+ * never participates in the aggregate counter identity.
+ */
+export function createDurableServerToolReplayWriterAdmission(
+	store: ServerToolReplayIssuanceStore,
+	provenance: ServerToolReplayWriterProvenance,
+): ServerToolReplayWriterAdmissionBuildResult {
+	const reserveReplayIssuance = snapshotBoundReplayIssuanceReservation(store);
+	if (reserveReplayIssuance === undefined) {
+		return unavailableWriterAdmission("invalid_store");
+	}
+	if (
+		!isRecord(provenance) ||
+		!hasExactProperties(provenance, [
+			"buildSha",
+			"decoderRevision",
+			"writerRevision",
+		])
+	) {
+		return unavailableWriterAdmission("invalid_provenance_shape");
+	}
+
+	const writerRevision = provenance.writerRevision;
+	const buildSha = provenance.buildSha;
+	const decoderRevision = provenance.decoderRevision;
+	if (!isBoundedOpaqueText(writerRevision)) {
+		return unavailableWriterAdmission("invalid_writer_revision");
+	}
+	if (
+		buildSha === null ||
+		(typeof buildSha === "string" && buildSha.toLowerCase() === "unknown")
+	) {
+		return unavailableWriterAdmission("missing_build_sha");
+	}
+	if (!isBoundedOpaqueText(buildSha)) {
+		return unavailableWriterAdmission("invalid_build_sha");
+	}
+	if (!isBoundedOpaqueText(decoderRevision)) {
+		return unavailableWriterAdmission("invalid_decoder_revision");
+	}
+
+	const frozenProvenance = Object.freeze({
+		writerRevision,
+		buildSha,
+		decoderRevision,
+	});
+	const writerAdmission = Object.freeze({
+		enabled: true as const,
+		claimIssuance: async (
+			claim: Readonly<{ counterIdentity: string; issuedAtMs: number }>,
+		): Promise<number> => {
+			const reservation = await reserveReplayIssuance(
+				Object.freeze({
+					counterIdentity: claim.counterIdentity,
+					writerRevision: frozenProvenance.writerRevision,
+					buildSha: frozenProvenance.buildSha,
+					decoderRevision: frozenProvenance.decoderRevision,
+					now: claim.issuedAtMs,
+				}),
+			);
+			return reservation.issuanceCount;
+		},
+	});
+	return Object.freeze({ status: "ready", writerAdmission });
+}
+
 function copyKeyBytes(value: unknown): Uint8Array | undefined {
 	if (!Array.isArray(value) || value.length !== REPLAY_KEY_BYTES) {
 		return undefined;
@@ -67,6 +250,7 @@ function copyKeyBytes(value: unknown): Uint8Array | undefined {
 
 async function composeReadyRuntime(
 	state: Record<string, unknown>,
+	writerAdmission: ServerToolReplayWriterAdmission,
 ): Promise<ServerToolReplayRuntimeState> {
 	const temporaryKeyCopies: Uint8Array[] = [];
 	let codec: ServerToolReplayEnvelopeCodec | undefined;
@@ -128,7 +312,7 @@ async function composeReadyRuntime(
 		codec = createServerToolReplayEnvelopeCodec({
 			activeKey,
 			retainedKeys,
-			writerAdmission: WRITER_ADMISSION_DISABLED,
+			writerAdmission,
 		});
 	} catch {
 		return SERVER_TOOL_REPLAY_UNAVAILABLE;
@@ -150,8 +334,11 @@ async function composeReadyRuntime(
  */
 export async function createServerToolReplayRuntime(
 	keysState: ServerToolReplayKeysState,
+	options: ServerToolReplayRuntimeOptions = {},
 ): Promise<ServerToolReplayRuntimeState> {
 	try {
+		const writerAdmission =
+			options.writerAdmission ?? WRITER_ADMISSION_DISABLED;
 		if (!isRecord(keysState) || typeof keysState.status !== "string") {
 			return SERVER_TOOL_REPLAY_UNAVAILABLE;
 		}
@@ -169,7 +356,7 @@ export async function createServerToolReplayRuntime(
 			return SERVER_TOOL_REPLAY_UNAVAILABLE;
 		}
 		if (keysState.status === "ready")
-			return await composeReadyRuntime(keysState);
+			return await composeReadyRuntime(keysState, writerAdmission);
 		return SERVER_TOOL_REPLAY_UNAVAILABLE;
 	} catch {
 		return SERVER_TOOL_REPLAY_UNAVAILABLE;

@@ -26,10 +26,13 @@ mock.module("@better-ccflare/openai-responses-adapter", () => ({
 }));
 mock.module("@better-ccflare/providers", () => ({
 	CODEX_DEFAULT_ENDPOINT: "https://example.invalid",
+	fetchCodexUsageData: async () => null,
 	fetchCodexUsageOnDemand: async () => null,
 	getOAuthProvider: () => ({ getOAuthConfig: () => ({ clientId: "test" }) }),
 	getProvider: () => null,
 	getRepresentativeUtilizationForProvider: () => null,
+	isCodexSubscriptionEndpoint: () => false,
+	resolveCodexEndpoint: (endpoint: string) => endpoint,
 	usageCache: { clear: () => {} },
 }));
 mock.module("@better-ccflare/providers/bedrock", () => ({
@@ -49,6 +52,11 @@ mock.module("@better-ccflare/proxy", () => {
 		clearAccountRefreshCache: () => {},
 		createAnthropicDegradedDetailedEventSink: () => undefined,
 		createAnthropicDegradedRuntimeHealth: () => ({}),
+		createDurableServerToolReplayWriterAdmission: () => ({
+			status: "unavailable" as const,
+			reason: "missing_build_sha" as const,
+			writerAdmission: { enabled: false as const },
+		}),
 		createGuardCorrelationVerifier: () => undefined,
 		createServerToolReplayRuntime: async () => ({
 			status: "disabled" as const,
@@ -69,6 +77,8 @@ mock.module("@better-ccflare/proxy", () => {
 		registerCodexUsageRefresher: () => {},
 		registerPollingRestarter: () => {},
 		registerRefreshClearer: () => {},
+		SERVER_TOOL_REPLAY_DECODER_REVISION: "bccf2.A256GCM.decoder.v1",
+		SERVER_TOOL_REPLAY_WRITER_REVISION: "bccf2.A256GCM.writer.v1",
 		startGlobalTokenHealthChecks: () => {},
 		startIntegrityScheduler: () => () => {},
 		stopGlobalTokenHealthChecks: () => {},

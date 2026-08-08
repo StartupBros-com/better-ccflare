@@ -9,6 +9,7 @@ import {
 import {
 	CACHE,
 	DEFAULT_STRATEGY,
+	getGitSha,
 	getVersion,
 	HTTP_STATUS,
 	initializeNanoGPTPricingIfAccountsExist,
@@ -63,6 +64,7 @@ import {
 	CacheKeepaliveScheduler,
 	createAnthropicDegradedDetailedEventSink,
 	createAnthropicDegradedRuntimeHealth,
+	createDurableServerToolReplayWriterAdmission,
 	createGuardCorrelationVerifier,
 	createServerToolReplayRuntime,
 	DegradedModeObservability,
@@ -82,6 +84,8 @@ import {
 	registerCodexUsageRefresher,
 	registerPollingRestarter,
 	registerRefreshClearer,
+	SERVER_TOOL_REPLAY_DECODER_REVISION,
+	SERVER_TOOL_REPLAY_WRITER_REVISION,
 	startGlobalTokenHealthChecks,
 	startIntegrityScheduler,
 	stopGlobalTokenHealthChecks,
@@ -1138,8 +1142,18 @@ export default async function startServer(options?: {
 	// eagerly, so route through a mutable reference assigned once the
 	// ProxyContext exists — mirrors the getStrategy() lazy-getter pattern above.
 	let modelCatalogProxyContext: ProxyContext | null = null;
+	const serverToolReplayWriterAdmission =
+		createDurableServerToolReplayWriterAdmission(
+			dbOps.getServerToolReplayIssuanceRepository(),
+			Object.freeze({
+				writerRevision: SERVER_TOOL_REPLAY_WRITER_REVISION,
+				buildSha: getGitSha(),
+				decoderRevision: SERVER_TOOL_REPLAY_DECODER_REVISION,
+			}),
+		);
 	const serverToolReplay = await createServerToolReplayRuntime(
 		loadServerToolReplayKeys(),
+		{ writerAdmission: serverToolReplayWriterAdmission.writerAdmission },
 	);
 	const anthropicDegradedConfig = config.getAnthropicDegradedModeConfig();
 	const anthropicDegradedMode = new AnthropicDegradedModeCoordinator({

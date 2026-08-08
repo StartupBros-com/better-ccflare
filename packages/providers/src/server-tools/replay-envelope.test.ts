@@ -2,6 +2,7 @@ import { describe, expect, spyOn, test } from "bun:test";
 
 import {
 	createServerToolReplayEnvelopeCodec,
+	getServerToolReplayEnvelopeCounterIdentity,
 	InvalidServerToolReplayEnvelopeError,
 	inspectServerToolReplayEnvelopeHeader,
 	SERVER_TOOL_REPLAY_ENVELOPE_PREFIX,
@@ -19,7 +20,7 @@ const RETAINED_KEY = Uint8Array.from(
 const OTHER_KEY = Uint8Array.from({ length: 32 }, (_, index) => 0x40 + index);
 const FIXED_NONCE = Uint8Array.from({ length: 12 }, (_, index) => 0xa0 + index);
 const FIXED_NOW_MS = 1_700_000_000_123;
-const NOOP_RECORD_ISSUED = (_keyFingerprint: string): void => undefined;
+const NOOP_CLAIM_ISSUANCE = async (): Promise<number> => 1;
 const GOLDEN_TOKEN =
 	"bccf2.A256GCM.active-2026.eJ8F_ULECkFbkO5RSI0QQg.oKGio6Slpqeoqaqr.vSpQHHL7Mo9SVbfjN0vy7VyOOn_20jpOsCxB9guGQC_kVGvdwU0hUD7wbbJsHqHVZWk2BCP9bgsuKEM36yK8yYbxzQ1ild2yvYOKXbyCo4z4au7O8qXxMaQ-XMuTtm_e7NcbwkbP_ffQsHMA4cqZBUUqNZqbDNR3QpjunIUv3waSXPkaiQblTQYA3KdJe73gvoTw___4zgDjxPzwYN0fJhL0Tw";
 const HKDF_SALT = "bccf2.A256GCM.replay-envelope.digest-key.salt.v1";
@@ -68,8 +69,7 @@ function deterministicCodec(
 		nowMs: () => FIXED_NOW_MS,
 		writerAdmission: {
 			enabled: true,
-			readFleetIssuedCount: () => 0,
-			recordIssued: NOOP_RECORD_ISSUED,
+			claimIssuance: NOOP_CLAIM_ISSUANCE,
 		},
 		...overrides,
 	});
@@ -500,12 +500,14 @@ describe("server-tool replay envelope", () => {
 		const codecs = [
 			createServerToolReplayEnvelopeCodec({
 				activeKey: { id: "active-2026", key: ACTIVE_KEY },
+				nowMs: () => FIXED_NOW_MS,
 				randomBytes: () => {
 					throw new Error("reader-only codec must not request entropy");
 				},
 			}),
 			createServerToolReplayEnvelopeCodec({
 				activeKey: { id: "active-2026", key: ACTIVE_KEY },
+				nowMs: () => FIXED_NOW_MS,
 				randomBytes: () => {
 					throw new Error("disabled codec must not request entropy");
 				},
@@ -523,78 +525,74 @@ describe("server-tool replay envelope", () => {
 		}
 	});
 
-	test.each([
-		["missing", undefined],
-		["negative", -1],
-		["fractional", 0.5],
-		["NaN", Number.NaN],
-		["infinite", Number.POSITIVE_INFINITY],
-		["unsafe", Number.MAX_SAFE_INTEGER + 1],
-	] as const)("fails closed when fleet telemetry is %s", async (_label, count) => {
-		let randomCalls = 0;
-		const codec = deterministicCodec({
-			randomBytes: () => {
-				randomCalls += 1;
-				return FIXED_NONCE.slice();
-			},
-			writerAdmission: {
-				enabled: true,
-				readFleetIssuedCount: () => count,
-				recordIssued: NOOP_RECORD_ISSUED,
-			},
-		});
+	test("accepts exact authenticated age boundaries and rejects N+1 uniformly", async () => {
+		const token = await deterministicCodec().encode(binding, payload);
+		const fiveMinutesMs = 5 * 60 * 1000;
+		const ninetyDaysMs = 90 * 24 * 60 * 60 * 1000;
 
-		expect(codec.getWriterReadiness()).toEqual({
-			status: "telemetry_unavailable",
-		});
-		await captureAdmission(() => codec.encode(binding, payload));
-		expect(randomCalls).toBe(0);
+		for (const nowMs of [
+			FIXED_NOW_MS - fiveMinutesMs + 1,
+			FIXED_NOW_MS - fiveMinutesMs,
+			FIXED_NOW_MS,
+			FIXED_NOW_MS + ninetyDaysMs - 1,
+			FIXED_NOW_MS + ninetyDaysMs,
+		]) {
+			const reader = deterministicCodec({ nowMs: () => nowMs });
+			await expect(reader.decode(token, binding)).resolves.toMatchObject(
+				payload,
+			);
+		}
+
+		for (const nowMs of [
+			FIXED_NOW_MS - fiveMinutesMs - 1,
+			FIXED_NOW_MS + ninetyDaysMs + 1,
+		]) {
+			const reader = deterministicCodec({ nowMs: () => nowMs });
+			await captureInvalid(() => reader.decode(token, binding));
+		}
 	});
 
-	test("keys fleet telemetry by stable key-material fingerprint rather than wire key ID", async () => {
-		const readFingerprints: string[] = [];
-		const recordedFingerprints: string[] = [];
-		const writerAdmission: ServerToolReplayWriterAdmission = {
-			enabled: true,
-			readFleetIssuedCount: (fingerprint) => {
-				readFingerprints.push(fingerprint);
-				return 0;
-			},
-			recordIssued: (fingerprint) => {
-				recordedFingerprints.push(fingerprint);
-			},
-		};
+	test("exposes one stable opaque counter identity independent of wire key ID", async () => {
+		const claims: Array<
+			Readonly<{ counterIdentity: string; issuedAtMs: number }>
+		> = [];
+		const expectedIdentity = await independentlyFingerprintFleetKey(ACTIVE_KEY);
+
 		for (const id of ["first-label", "second-label"]) {
 			const codec = createServerToolReplayEnvelopeCodec({
 				activeKey: { id, key: ACTIVE_KEY },
 				randomBytes: () => FIXED_NONCE.slice(),
 				nowMs: () => FIXED_NOW_MS,
-				writerAdmission,
+				writerAdmission: {
+					enabled: true,
+					claimIssuance: async (claim) => {
+						expect(Object.isFrozen(claim)).toBe(true);
+						expect(Object.keys(claim)).toEqual([
+							"counterIdentity",
+							"issuedAtMs",
+						]);
+						claims.push(claim);
+						return claims.length;
+					},
+				},
 			});
+			expect(getServerToolReplayEnvelopeCounterIdentity(codec)).toBe(
+				expectedIdentity,
+			);
 			await codec.encode(binding, payload);
 		}
 
-		const expectedFingerprint =
-			await independentlyFingerprintFleetKey(ACTIVE_KEY);
-		expect(readFingerprints).toEqual([
-			expectedFingerprint,
-			expectedFingerprint,
+		expect(claims).toEqual([
+			{ counterIdentity: expectedIdentity, issuedAtMs: FIXED_NOW_MS },
+			{ counterIdentity: expectedIdentity, issuedAtMs: FIXED_NOW_MS },
 		]);
-		expect(recordedFingerprints).toEqual([
-			expectedFingerprint,
-			expectedFingerprint,
-		]);
-		expect(expectedFingerprint).toMatch(
+		expect(expectedIdentity).toMatch(
 			/^better-ccflare\.aes-256-gcm\.keyfp\.v1\.[A-Za-z0-9_-]{43}$/u,
 		);
-		expect(expectedFingerprint).not.toContain("bccf2");
-		expect(expectedFingerprint).not.toContain("A256GCM");
-		expect([...readFingerprints, ...recordedFingerprints]).not.toContain(
-			"first-label",
-		);
-		expect([...readFingerprints, ...recordedFingerprints]).not.toContain(
-			"second-label",
-		);
+		expect(expectedIdentity).not.toContain("bccf2");
+		expect(expectedIdentity).not.toContain("A256GCM");
+		expect(JSON.stringify(claims)).not.toContain("first-label");
+		expect(JSON.stringify(claims)).not.toContain("second-label");
 	});
 
 	test("rejects duplicate configured key material even when IDs differ", () => {
@@ -607,16 +605,13 @@ describe("server-tool replay envelope", () => {
 	});
 
 	test.each([
-		["missing fleet reader", undefined, NOOP_RECORD_ISSUED],
-		["malformed fleet reader", "not-a-function", NOOP_RECORD_ISSUED],
-		["missing fleet recorder", () => 0, undefined],
-		["malformed fleet recorder", () => 0, "not-a-function"],
-	] as const)("fails closed when the enabled %s is invalid", async (_label, readFleetIssuedCount, recordIssued) => {
+		["missing atomic claim", undefined],
+		["malformed atomic claim", "not-a-function"],
+	] as const)("fails closed when the enabled %s is invalid", async (_label, claimIssuance) => {
 		let randomCalls = 0;
 		const writerAdmission = {
 			enabled: true,
-			readFleetIssuedCount,
-			recordIssued,
+			claimIssuance,
 		} as unknown as ServerToolReplayWriterAdmission;
 		const codec = deterministicCodec({
 			randomBytes: () => {
@@ -630,40 +625,70 @@ describe("server-tool replay envelope", () => {
 			status: "telemetry_unavailable",
 		});
 		await captureAdmission(() => codec.encode(binding, payload));
+		await captureAdmission(() => codec.encode(binding, payload));
 		expect(randomCalls).toBe(0);
 	});
 
-	test("maps fleet-count boundaries to ready, rotate-required, and exhausted", async () => {
-		let count = 2 ** 31 - 1;
-		const recordedFingerprints: string[] = [];
-		const expectedFingerprint =
-			await independentlyFingerprintFleetKey(ACTIVE_KEY);
+	test.each([
+		["zero", 0, "telemetry_unavailable"],
+		["missing", undefined, "telemetry_unavailable"],
+		["negative", -1, "telemetry_unavailable"],
+		["fractional", 0.5, "telemetry_unavailable"],
+		["NaN", Number.NaN, "telemetry_unavailable"],
+		["infinite", Number.POSITIVE_INFINITY, "telemetry_unavailable"],
+		["unsafe", Number.MAX_SAFE_INTEGER + 1, "telemetry_unavailable"],
+		["rotation boundary", 2 ** 31, "rotate_required"],
+		["rotation N+1", 2 ** 31 + 1, "rotate_required"],
+		["fleet exhaustion", 2 ** 32, "exhausted"],
+	] as const)("fails closed for %s atomic claim result before nonce or encryption", async (_label, count, statusAfterClaim) => {
+		const encrypt = spyOn(crypto.subtle, "encrypt");
+		let claimCalls = 0;
+		let randomCalls = 0;
 		const codec = deterministicCodec({
+			randomBytes: () => {
+				randomCalls += 1;
+				return FIXED_NONCE.slice();
+			},
 			writerAdmission: {
 				enabled: true,
-				readFleetIssuedCount: () => count,
-				recordIssued: (fingerprint) => recordedFingerprints.push(fingerprint),
+				claimIssuance: async () => {
+					claimCalls += 1;
+					return count;
+				},
 			},
 		});
 
-		expect(codec.getWriterReadiness()).toEqual({ status: "ready" });
-		expect(await codec.encode(binding, payload)).toBe(GOLDEN_TOKEN);
-		expect(recordedFingerprints).toEqual([expectedFingerprint]);
-
-		count = 2 ** 31;
-		expect(codec.getWriterReadiness()).toEqual({ status: "rotate_required" });
-		await captureAdmission(() => codec.encode(binding, payload));
-
-		count = 2 ** 32;
-		expect(codec.getWriterReadiness()).toEqual({ status: "exhausted" });
-		await captureAdmission(() => codec.encode(binding, payload));
-		expect(recordedFingerprints).toEqual([expectedFingerprint]);
+		try {
+			expect(codec.getWriterReadiness()).toEqual({ status: "ready" });
+			await captureAdmission(() => codec.encode(binding, payload));
+			expect(codec.getWriterReadiness()).toEqual({
+				status: statusAfterClaim,
+			});
+			await captureAdmission(() => codec.encode(binding, payload));
+			expect(claimCalls).toBe(1);
+			expect(randomCalls).toBe(0);
+			expect(encrypt).not.toHaveBeenCalled();
+		} finally {
+			encrypt.mockRestore();
+		}
 	});
 
-	test("records exactly once after a valid token is built and sanitizes accounting failure", async () => {
+	test("accepts N-1 and resolves the atomic claim before nonce or encryption", async () => {
 		const events: string[] = [];
-		const expectedFingerprint =
-			await independentlyFingerprintFleetKey(ACTIVE_KEY);
+		const expectedIdentity = await independentlyFingerprintFleetKey(ACTIVE_KEY);
+		let releaseClaim = (): void => {
+			throw new Error("claim release was not initialized");
+		};
+		let markClaimStarted = (): void => {
+			throw new Error("claim start was not initialized");
+		};
+		const claimGate = new Promise<void>((resolve) => {
+			releaseClaim = resolve;
+		});
+		const claimStarted = new Promise<void>((resolve) => {
+			markClaimStarted = resolve;
+		});
+		const encrypt = spyOn(crypto.subtle, "encrypt");
 		const codec = deterministicCodec({
 			randomBytes: () => {
 				events.push("random");
@@ -671,139 +696,153 @@ describe("server-tool replay envelope", () => {
 			},
 			writerAdmission: {
 				enabled: true,
-				readFleetIssuedCount: () => 0,
-				recordIssued: (fingerprint) => events.push(`record:${fingerprint}`),
-			},
-		});
-
-		const token = await codec.encode(binding, payload);
-		events.push("returned");
-		expect(token).toBe(GOLDEN_TOKEN);
-		expect(events).toEqual([
-			"random",
-			`record:${expectedFingerprint}`,
-			"returned",
-		]);
-
-		let invalidBuildRecords = 0;
-		const invalidBuild = deterministicCodec({
-			randomBytes: () => new Uint8Array(11),
-			writerAdmission: {
-				enabled: true,
-				readFleetIssuedCount: () => 0,
-				recordIssued: () => {
-					invalidBuildRecords += 1;
+				claimIssuance: async (claim) => {
+					events.push(`claim:start:${claim.counterIdentity}`);
+					markClaimStarted();
+					await claimGate;
+					events.push("claim:complete");
+					return 2 ** 31 - 1;
 				},
 			},
 		});
-		await captureInvalid(() => invalidBuild.encode(binding, payload));
-		expect(invalidBuildRecords).toBe(0);
 
-		const failedAccounting = deterministicCodec({
-			writerAdmission: {
-				enabled: true,
-				readFleetIssuedCount: () => 0,
-				recordIssued: () => {
-					throw new Error("fleet-counter-secret");
-				},
-			},
-		});
-		const error = await captureAdmission(() =>
-			failedAccounting.encode(binding, payload),
-		);
-		expect(error.message).not.toContain("fleet-counter-secret");
+		try {
+			const tokenPromise = codec.encode(binding, payload).then((token) => {
+				events.push("returned");
+				return token;
+			});
+			await claimStarted;
+			await Promise.resolve();
+			expect(events).toEqual([`claim:start:${expectedIdentity}`]);
+			expect(encrypt).not.toHaveBeenCalled();
+			releaseClaim();
+			expect(await tokenPromise).toBe(GOLDEN_TOKEN);
+			expect(events).toEqual([
+				`claim:start:${expectedIdentity}`,
+				"claim:complete",
+				"random",
+				"returned",
+			]);
+			expect(encrypt).toHaveBeenCalledTimes(1);
+			expect(codec.getWriterReadiness()).toEqual({ status: "ready" });
+		} finally {
+			encrypt.mockRestore();
+		}
 	});
 
-	test("awaits asynchronous accounting and sanitizes asynchronous rejection", async () => {
-		const events: string[] = [];
-		let releaseAccounting = (): void => {
-			throw new Error("accounting release was not initialized");
+	test("sanitizes rejected claims and rejects synchronous claim implementations", async () => {
+		const claimImplementations: unknown[] = [
+			async () => {
+				throw new Error("async-fleet-counter-secret");
+			},
+			() => 1,
+		];
+		for (const claimIssuance of claimImplementations) {
+			const encrypt = spyOn(crypto.subtle, "encrypt");
+			let claimCalls = 0;
+			let randomCalls = 0;
+			const trackedClaim = (...args: unknown[]) => {
+				claimCalls += 1;
+				return Reflect.apply(
+					claimIssuance as (...values: unknown[]) => unknown,
+					undefined,
+					args,
+				);
+			};
+			const codec = deterministicCodec({
+				randomBytes: () => {
+					randomCalls += 1;
+					return FIXED_NONCE.slice();
+				},
+				writerAdmission: {
+					enabled: true,
+					claimIssuance: trackedClaim,
+				} as unknown as ServerToolReplayWriterAdmission,
+			});
+			try {
+				const error = await captureAdmission(() =>
+					codec.encode(binding, payload),
+				);
+				expect(error.message).not.toContain("fleet-counter-secret");
+				expect(codec.getWriterReadiness()).toEqual({
+					status: "telemetry_unavailable",
+				});
+				await captureAdmission(() => codec.encode(binding, payload));
+				expect(claimCalls).toBe(1);
+				expect(randomCalls).toBe(0);
+				expect(encrypt).not.toHaveBeenCalled();
+			} finally {
+				encrypt.mockRestore();
+			}
+		}
+	});
+
+	test("keeps atomic claims concurrent while each issuance waits for admission", async () => {
+		let claimCount = 0;
+		let randomCalls = 0;
+		let markBothStarted = (): void => {
+			throw new Error("concurrency marker was not initialized");
 		};
-		let markAccountingStarted = (): void => {
-			throw new Error("accounting start was not initialized");
+		let releaseClaims = (): void => {
+			throw new Error("claim release was not initialized");
 		};
-		const accountingGate = new Promise<void>((resolve) => {
-			releaseAccounting = resolve;
+		const bothStarted = new Promise<void>((resolve) => {
+			markBothStarted = resolve;
 		});
-		const accountingStarted = new Promise<void>((resolve) => {
-			markAccountingStarted = resolve;
+		const claimGate = new Promise<void>((resolve) => {
+			releaseClaims = resolve;
 		});
 		const codec = deterministicCodec({
+			randomBytes: () => {
+				randomCalls += 1;
+				return new Uint8Array(12).fill(randomCalls);
+			},
 			writerAdmission: {
 				enabled: true,
-				readFleetIssuedCount: () => 0,
-				recordIssued: async () => {
-					events.push("record:start");
-					markAccountingStarted();
-					await accountingGate;
-					events.push("record:complete");
+				claimIssuance: async () => {
+					const admittedCount = ++claimCount;
+					if (claimCount === 2) markBothStarted();
+					await claimGate;
+					return admittedCount;
 				},
 			},
 		});
 
-		const tokenPromise = codec.encode(binding, payload).then((token) => {
-			events.push("returned");
-			return token;
-		});
-		await accountingStarted;
-		await Promise.resolve();
-		expect(events).toEqual(["record:start"]);
-		releaseAccounting();
-		expect(await tokenPromise).toBe(GOLDEN_TOKEN);
-		expect(events).toEqual(["record:start", "record:complete", "returned"]);
-
-		const failedAccounting = deterministicCodec({
-			writerAdmission: {
-				enabled: true,
-				readFleetIssuedCount: () => 0,
-				recordIssued: async () => {
-					await Promise.resolve();
-					throw new Error("async-fleet-counter-secret");
-				},
-			},
-		});
-		const error = await captureAdmission(() =>
-			failedAccounting.encode(binding, payload),
-		);
-		expect(error.message).not.toContain("async-fleet-counter-secret");
+		const first = codec.encode(binding, payload);
+		const second = codec.encode({ ...binding, ordinal: 3 }, payload);
+		await bothStarted;
+		expect(claimCount).toBe(2);
+		expect(randomCalls).toBe(0);
+		releaseClaims();
+		await expect(Promise.all([first, second])).resolves.toHaveLength(2);
+		expect(randomCalls).toBe(2);
 	});
 
 	test("snapshots writer admission state and callback identities at factory creation", async () => {
 		const events: string[] = [];
 		const mutableAdmission = {
 			enabled: true,
-			readFleetIssuedCount: () => {
-				events.push("read:original");
-				return 0;
-			},
-			recordIssued: () => {
-				events.push("record:original");
+			claimIssuance: async () => {
+				events.push("claim:original");
+				return 1;
 			},
 		};
 		const codec = deterministicCodec({
 			writerAdmission: mutableAdmission as ServerToolReplayWriterAdmission,
 		});
 		mutableAdmission.enabled = false;
-		mutableAdmission.readFleetIssuedCount = () => {
-			events.push("read:mutated");
+		mutableAdmission.claimIssuance = async () => {
+			events.push("claim:mutated");
 			return 2 ** 32;
-		};
-		mutableAdmission.recordIssued = () => {
-			events.push("record:mutated");
 		};
 
 		expect(codec.getWriterReadiness()).toEqual({ status: "ready" });
 		expect(await codec.encode(binding, payload)).toBe(GOLDEN_TOKEN);
-		expect(events).toEqual([
-			"read:original",
-			"read:original",
-			"record:original",
-		]);
+		expect(events).toEqual(["claim:original"]);
 
 		const originallyDisabled = {
 			enabled: false,
-			readFleetIssuedCount: () => 0,
-			recordIssued: NOOP_RECORD_ISSUED,
+			claimIssuance: NOOP_CLAIM_ISSUANCE,
 		};
 		const disabledCodec = deterministicCodec({
 			writerAdmission:
@@ -817,18 +856,13 @@ describe("server-tool replay envelope", () => {
 	test("uses the rotated active key's independent fleet budget and retains old-key decode", async () => {
 		const oldFingerprint = await independentlyFingerprintFleetKey(RETAINED_KEY);
 		const newFingerprint = await independentlyFingerprintFleetKey(ACTIVE_KEY);
-		const counts = new Map([
-			[oldFingerprint, 0],
-			[newFingerprint, 0],
-		]);
-		const reads: string[] = [];
+		const claims: string[] = [];
 		const writerAdmission: ServerToolReplayWriterAdmission = {
 			enabled: true,
-			readFleetIssuedCount: (fingerprint) => {
-				reads.push(fingerprint);
-				return counts.get(fingerprint);
+			claimIssuance: async ({ counterIdentity }) => {
+				claims.push(counterIdentity);
+				return 1;
 			},
-			recordIssued: NOOP_RECORD_ISSUED,
 		};
 		const oldWriter = createServerToolReplayEnvelopeCodec({
 			activeKey: { id: "old", key: RETAINED_KEY },
@@ -837,7 +871,6 @@ describe("server-tool replay envelope", () => {
 			writerAdmission,
 		});
 		const oldToken = await oldWriter.encode(binding, payload);
-		counts.set(oldFingerprint, 2 ** 31);
 
 		const rotated = createServerToolReplayEnvelopeCodec({
 			activeKey: { id: "new", key: ACTIVE_KEY },
@@ -846,15 +879,12 @@ describe("server-tool replay envelope", () => {
 			nowMs: () => FIXED_NOW_MS,
 			writerAdmission,
 		});
-		const readsBeforeDecode = reads.length;
+		const claimsBeforeDecode = claims.length;
 		expect(await rotated.decode(oldToken, binding)).toMatchObject(payload);
-		expect(reads).toHaveLength(readsBeforeDecode);
+		expect(claims).toHaveLength(claimsBeforeDecode);
 		expect(rotated.getWriterReadiness()).toEqual({ status: "ready" });
 		await expect(rotated.encode(binding, payload)).resolves.toBeString();
-		expect(reads.slice(readsBeforeDecode)).toEqual([
-			newFingerprint,
-			newFingerprint,
-		]);
+		expect(claims).toEqual([oldFingerprint, newFingerprint]);
 	});
 
 	test("supports a reader-only restart after issuance", async () => {
@@ -862,6 +892,7 @@ describe("server-tool replay envelope", () => {
 		const restartedReader = createServerToolReplayEnvelopeCodec({
 			activeKey: { id: "replacement", key: OTHER_KEY },
 			retainedKeys: [{ id: "active-2026", key: ACTIVE_KEY }],
+			nowMs: () => FIXED_NOW_MS,
 		});
 
 		expect(restartedReader.getWriterReadiness()).toEqual({
@@ -881,18 +912,15 @@ describe("server-tool replay envelope", () => {
 				{ enabled: false },
 				{
 					enabled: true,
-					readFleetIssuedCount: () => undefined,
-					recordIssued: NOOP_RECORD_ISSUED,
+					claimIssuance: async () => undefined,
 				},
 				{
 					enabled: true,
-					readFleetIssuedCount: () => 2 ** 31,
-					recordIssued: NOOP_RECORD_ISSUED,
+					claimIssuance: async () => 2 ** 31,
 				},
 				{
 					enabled: true,
-					readFleetIssuedCount: () => 2 ** 32,
-					recordIssued: NOOP_RECORD_ISSUED,
+					claimIssuance: async () => 2 ** 32,
 				},
 			];
 
@@ -977,7 +1005,7 @@ describe("server-tool replay envelope", () => {
 			randomBytes: () => {
 				throw new Error("literal-vector decode must not request entropy");
 			},
-			nowMs: () => 0,
+			nowMs: () => FIXED_NOW_MS,
 		});
 		expect(await cleanReader.decode(GOLDEN_TOKEN, binding)).toEqual({
 			...binding,
@@ -1013,8 +1041,7 @@ describe("server-tool replay envelope", () => {
 			nowMs: () => FIXED_NOW_MS,
 			writerAdmission: {
 				enabled: true,
-				readFleetIssuedCount: () => 0,
-				recordIssued: NOOP_RECORD_ISSUED,
+				claimIssuance: NOOP_CLAIM_ISSUANCE,
 			},
 		});
 		const token = await oldWriter.encode(binding, payload);
@@ -1035,7 +1062,7 @@ describe("server-tool replay envelope", () => {
 				randomBytes: () => {
 					throw new Error("decode must not request entropy");
 				},
-				nowMs: () => 0,
+				nowMs: () => FIXED_NOW_MS,
 			});
 			expect(await cleanReader.decode(token, binding)).toMatchObject(payload);
 		}
