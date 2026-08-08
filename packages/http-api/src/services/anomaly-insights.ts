@@ -20,7 +20,12 @@ import type {
  * - tokenOutliers / outputBlowups: requests >= zScoreThreshold stddevs
  *   above their baseline mean (total tokens / output tokens respectively)
  * - runawayLoops: dense bursts of near-identical requests per
- *   (account, model, project)
+ *   (account, model, project, agent) — keyed by per-agent identity so
+ *   many workers sharing one account+model+project (each on its own
+ *   agent) do not collapse into one bucket that falsely reports as a
+ *   loop. `project` is also part of the key so requests with no agent
+ *   attribution still split by project (the x-claude-code-session-id
+ *   header is unreliable in some clients and is not always present).
  * - misrouting: expensive models repeatedly used for trivially small calls
  */
 
@@ -41,6 +46,13 @@ export interface AnomalyRequestRow {
 	account: string | null;
 	model: string | null;
 	project: string | null;
+	/**
+	 * Per-request agent identity (from the agent-attribution pipeline).
+	 * Used by the runaway-loop detector as the per-bucket key so distinct
+	 * workers sharing one (account, model, project) do not collapse
+	 * into a single bucket that falsely reports as a loop.
+	 */
+	agentUsed: string | null;
 	inputTokens: number;
 	cacheReadInputTokens: number;
 	cacheCreationInputTokens: number;
@@ -88,6 +100,53 @@ export const DEFAULT_MISROUTING_MAX_TOTAL_TOKENS = 500;
 export const DEFAULT_MISROUTING_MIN_OUTPUT_RATE_USD = 25;
 export const DEFAULT_MISROUTING_MIN_REQUESTS = 5;
 export const DEFAULT_MAX_EVENTS_PER_DETECTOR = 50;
+
+/**
+ * Display cap for project names. The upstream `project` field on requests
+ * is built from free-form text (#368 — known to sometimes leak prompt
+ * content), so this is a defense-in-depth at the presentation layer: any
+ * string leaving the API/alert pipeline through a `project` slot is
+ * stripped of control characters and clamped to this many chars with an
+ * ellipsis. Longer values look like obvious junk to the operator rather
+ * than authentic-looking prompt content.
+ */
+export const PROJECT_DISPLAY_MAX_CHARS = 64;
+/** Replacement character used when an input cannot be rendered. */
+const ELLIPSIS = "…";
+
+/**
+ * Defence-in-depth sanitiser for values that originate as a request's
+ * `project` field. The real extraction bug (prompt content leaking into
+ * `project`) is fixed upstream in proxy/src/project-attribution.ts (#368)
+ * — this function does not address that, it only ensures that whatever
+ * reaches the JSON response or an alert message can never render as if
+ * it were a normal label.
+ *
+ * - null / undefined / empty -> null
+ * - control chars (incl. newlines, tabs) are stripped
+ * - collapses runs of whitespace
+ * - clamps to PROJECT_DISPLAY_MAX_CHARS, appending an ellipsis when truncated
+ */
+export function sanitizeProjectForDisplay(
+	raw: string | null | undefined,
+): string | null {
+	if (raw == null) return null;
+	// Strip ANSI CSI sequences FIRST while the leading ESC byte is
+	// still present, then strip remaining C0 control chars (incl. any
+	// orphan ESC) and DEL so prompt content cannot smuggle terminal
+	// control bytes through the UI. See sanitizeProjectName in
+	// packages/proxy/src/project-attribution.ts for the same pattern.
+	const stripped = raw
+		// biome-ignore lint/suspicious/noControlCharactersInRegex: ANSI CSI sequences are the target, not a literal
+		.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "")
+		// biome-ignore lint/suspicious/noControlCharactersInRegex: C0 control range is the target, not a literal
+		.replace(/[\x00-\x1f\x7f]+/g, "")
+		.replace(/\s+/g, " ")
+		.trim();
+	if (stripped === "") return null;
+	if (stripped.length <= PROJECT_DISPLAY_MAX_CHARS) return stripped;
+	return stripped.slice(0, PROJECT_DISPLAY_MAX_CHARS - 1) + ELLIPSIS;
+}
 
 const UNKNOWN_KEY = "Unknown";
 const GROUP_KEY_SEPARATOR = "\u001f"; // unit separator: never appears in names, keys cannot collide
@@ -245,8 +304,20 @@ export interface RunawayLoopOptions {
 
 /**
  * Detect runaway loops: bursts of >= minRequests requests within windowMs
- * for one (account, model, project), where the request-side token profile
- * is similar (coefficient of variation <= similarityTolerance).
+ * for one (account, model, project, agent), where the request-side token
+ * profile is similar (coefficient of variation <= similarityTolerance).
+ *
+ * The key carries BOTH `project` and `agentUsed` so the bucket is no
+ * coarser than the most informative available signal:
+ *  - When `agentUsed` is set (e.g. via x-better-ccflare-agent-id or
+ *    x-claude-code-session-id), many independent workers sharing one
+ *    (account, model, project) — each running its own agent — do not
+ *    collapse into a single bucket that falsely reports as a loop.
+ *  - When `agentUsed` is null, `project` still distinguishes requests
+ *    on the (account, model) pair so unattributed traffic does not
+ *    collapse either.
+ *  - Both signals collapse to `Unknown` only when both are null, which
+ *    is the strictest reasonable bucket.
  *
  * All rows count, including zero-token ones — repeated failing retries are
  * exactly the signal.
@@ -268,7 +339,7 @@ export function detectRunawayLoops(
 ): RunawayLoopGroup[] {
 	const groups = new Map<string, AnomalyRequestRow[]>();
 	for (const row of rows) {
-		const key = `${baselineKey(row.account, row.model)}${GROUP_KEY_SEPARATOR}${normalizeKey(row.project)}`;
+		const key = `${baselineKey(row.account, row.model)}${GROUP_KEY_SEPARATOR}${normalizeKey(row.project)}${GROUP_KEY_SEPARATOR}${normalizeKey(row.agentUsed)}`;
 		const group = groups.get(key);
 		if (group) {
 			group.push(row);
@@ -360,6 +431,7 @@ export function detectRunawayLoops(
 				account: normalizeKey(group[run.start].account),
 				model: normalizeKey(group[run.start].model),
 				project: group[run.start].project,
+				agentUsed: group[run.start].agentUsed,
 				windowStartMs,
 				windowEndMs,
 				requests: run.end - run.start + 1,
@@ -500,6 +572,12 @@ export function buildAnomalyInsightsResponse(
 		minRequests: misroutingMinRequests,
 	});
 
+	const baselinesTop = baselines.slice(0, maxEventsPerDetector);
+	const tokenOutliersTop = tokenOutliers.slice(0, maxEventsPerDetector);
+	const outputBlowupsTop = outputBlowups.slice(0, maxEventsPerDetector);
+	const runawayLoopsTop = runawayLoops.slice(0, maxEventsPerDetector);
+	const misroutingTop = misrouting.slice(0, maxEventsPerDetector);
+
 	return {
 		meta: {
 			range: options.range,
@@ -515,10 +593,26 @@ export function buildAnomalyInsightsResponse(
 			scannedRequests: input.rows.length,
 			truncated: options.truncated ?? false,
 		},
-		baselines: baselines.slice(0, maxEventsPerDetector),
-		tokenOutliers: tokenOutliers.slice(0, maxEventsPerDetector),
-		outputBlowups: outputBlowups.slice(0, maxEventsPerDetector),
-		runawayLoops: runawayLoops.slice(0, maxEventsPerDetector),
-		misrouting: misrouting.slice(0, maxEventsPerDetector),
+		baselines: baselinesTop,
+		tokenOutliers: tokenOutliersTop,
+		tokenOutliersSummary: {
+			totalCount: tokenOutliers.length,
+			truncated: tokenOutliers.length > tokenOutliersTop.length,
+		},
+		outputBlowups: outputBlowupsTop,
+		outputBlowupsSummary: {
+			totalCount: outputBlowups.length,
+			truncated: outputBlowups.length > outputBlowupsTop.length,
+		},
+		runawayLoops: runawayLoopsTop,
+		runawayLoopsSummary: {
+			totalCount: runawayLoops.length,
+			truncated: runawayLoops.length > runawayLoopsTop.length,
+		},
+		misrouting: misroutingTop,
+		misroutingSummary: {
+			totalCount: misrouting.length,
+			truncated: misrouting.length > misroutingTop.length,
+		},
 	};
 }

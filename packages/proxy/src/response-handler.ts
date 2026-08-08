@@ -261,6 +261,8 @@ export interface ResponseHandlerOptions {
 	failoverAttempts: number;
 	agentUsed?: string | null;
 	agentAttributionSource?: AgentAttributionSource | null;
+	/** Client session id (body `metadata.user_id`), persisted for attribution. */
+	clientSessionId?: string | null;
 	apiKeyId?: string | null;
 	apiKeyName?: string | null;
 	comboName?: string | null;
@@ -315,6 +317,7 @@ export async function forwardToClient(
 		failoverAttempts,
 		agentUsed,
 		agentAttributionSource,
+		clientSessionId,
 		apiKeyId,
 		apiKeyName,
 		comboName,
@@ -433,6 +436,7 @@ export async function forwardToClient(
 				: 0,
 			accountName: account?.name ?? null,
 			agentUsed: agentUsed || null,
+			clientSessionId: clientSessionId ?? null,
 			// Persist the pair only for an actual swap — an agent-detected but
 			// unmodified request would otherwise record two equal values that
 			// downstream cannot distinguish from a real rewrite.
@@ -689,15 +693,36 @@ export async function forwardToClient(
 			if (account && rateLimitSniffer?.feed(value)) {
 				const firedReason = rateLimitSniffer.firedReason;
 				if (firedReason) {
-					handleAnthropicSseRateLimit(
-						account,
-						attemptedModel,
-						firedReason,
-						response,
-						requestId,
-						ctx,
-						requestHeaders.get("anthropic-beta"),
-					);
+					// Skip cooldown on synthetic cache-keepalive replays. The
+					// keepalive scheduler fires parallel requests to every cached
+					// account simultaneously; bursts of 4+ concurrent requests can
+					// trip Anthropic's per-IP burst limit and 429 every account at
+					// the same instant. A keepalive replay whose 200 OK response
+					// later emits a mid-stream `event: error` SSE frame is the
+					// same class of synthetic burst — applying a real cooldown
+					// here drains the pool to zero routable accounts even though
+					// no user-visible quota was actually exhausted. Loop-prevention
+					// header set by cache-keepalive-scheduler.ts; only synthetic
+					// replays carry it. Mirrors the keepalive exemption already
+					// applied in proxy-operations.ts (3 sites) and
+					// response-processor.ts — closing the gap flagged on merged
+					// upstream PR #196 (greptile-apps).
+					const isKeepalive = isInternalProbe(requestHeaders, ctx, "keepalive");
+					if (isKeepalive) {
+						log.warn(
+							`Keepalive replay for ${account.name} hit mid-stream rate-limit — skipping cooldown (synthetic burst, not a real per-account rate limit)`,
+						);
+					} else {
+						handleAnthropicSseRateLimit(
+							account,
+							attemptedModel,
+							firedReason,
+							response,
+							requestId,
+							ctx,
+							requestHeaders.get("anthropic-beta"),
+						);
+					}
 				}
 			}
 		};

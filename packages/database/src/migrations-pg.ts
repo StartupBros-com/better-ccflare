@@ -307,6 +307,24 @@ async function ensureRoutingPolicyRevisionSchemaPg(
 }
 
 /**
+ * Get a column's data_type from information_schema (e.g. "integer", "bigint").
+ * Returns null if the table/column doesn't exist yet.
+ */
+async function columnDataType(
+	adapter: BunSqlAdapter,
+	table: string,
+	column: string,
+): Promise<string | null> {
+	const result = await adapter.get<{ data_type: string }>(
+		`SELECT data_type
+		 FROM information_schema.columns
+		 WHERE table_name = ? AND column_name = ?`,
+		[table, column],
+	);
+	return result?.data_type ?? null;
+}
+
+/**
  * Ensure the full schema exists for PostgreSQL
  */
 export async function ensureSchemaPg(adapter: BunSqlAdapter): Promise<void> {
@@ -383,7 +401,8 @@ export async function ensureSchemaPg(adapter: BunSqlAdapter): Promise<void> {
 			applied_model TEXT,
 			project_attribution_source TEXT,
 			agent_attribution_source TEXT,
-			stream_terminal_state TEXT
+			stream_terminal_state TEXT,
+			client_session_id TEXT
 		)
 	`);
 
@@ -593,6 +612,27 @@ export async function ensureSchemaPg(adapter: BunSqlAdapter): Promise<void> {
 	);
 
 	await ensureCacheFlightRecorderTablesPg(adapter);
+
+	// Create instance_heartbeats table: per-process heartbeat for the
+	// multi-instance guard (see packages/database/src/multi-instance-guard.ts
+	// and tombii/better-ccflare#351). Each instance writes one row and
+	// refreshes `last_heartbeat` on a tick. Rows older than the expiry
+	// window are treated as dead predecessors so a crash never blocks a
+	// legitimate restart.
+	await adapter.unsafe(`
+		CREATE TABLE IF NOT EXISTS instance_heartbeats (
+			instance_id TEXT PRIMARY KEY,
+			hostname TEXT NOT NULL,
+			pid INTEGER NOT NULL,
+			started_at BIGINT NOT NULL,
+			last_heartbeat BIGINT NOT NULL,
+			node_version TEXT NOT NULL,
+			db_dialect TEXT NOT NULL
+		)
+	`);
+	await adapter.unsafe(
+		`CREATE INDEX IF NOT EXISTS idx_instance_heartbeats_last_heartbeat ON instance_heartbeats(last_heartbeat)`,
+	);
 
 	log.info("PostgreSQL schema ensured");
 }
@@ -1132,6 +1172,11 @@ export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 				"ALTER TABLE requests ADD COLUMN agent_attribution_source TEXT",
 		},
 		{
+			table: "requests",
+			column: "client_session_id",
+			definition: "ALTER TABLE requests ADD COLUMN client_session_id TEXT",
+		},
+		{
 			// Real SSE termination state for Anthropic-Messages-shaped
 			// streaming responses — see packages/proxy/src/anthropic-terminal-recovery.ts
 			// for the producer side. One of "complete" | "recovered" | "error"
@@ -1513,6 +1558,51 @@ export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 		log.info("Made refresh_token nullable in accounts table");
 	} catch (_error) {
 		// Already nullable or column doesn't exist — ignore
+	}
+
+	// Widen instance_heartbeats.{started_at,last_heartbeat} from INTEGER (int4)
+	// to BIGINT (int8). The multi-instance guard writes Date.now() epoch-ms
+	// (~1.79e12), which overflows int4 and crash-loops PG deployments on the
+	// first heartbeat upsert (issue #383). Widening is lossless — every int4
+	// value is a valid int8. Only run the ALTER when the column is still
+	// int4, so repeat startups after the first are a no-op. Errors are
+	// allowed to propagate: silently swallowing a failed widening would let
+	// startup continue writing epoch-ms into an unchanged int4 column,
+	// reproducing the same overflow crash this migration fixes.
+	//
+	// The type check + ALTER is not synchronised across instances (see the
+	// accounts unique-index migration below for why adapter.transaction()
+	// and pg_advisory_lock both fail to give real atomicity over a pooled
+	// connection). Two instances can both observe int4 and both run the
+	// ALTER; that is harmless since ALTER COLUMN TYPE bigint is idempotent
+	// on an already-bigint column and PostgreSQL serialises the concurrent
+	// DDL. What must NOT happen is a blanket `DELETE FROM instance_heartbeats`
+	// here: that would erase a peer's heartbeat written between this
+	// instance's ALTER and its own scan, defeating the multi-instance guard.
+	// Instead, only purge rows that are actually garbage — int4-overflow
+	// wraparound from crash-looping pre-fix incarnations produces values
+	// wildly outside any plausible epoch-ms range (negative, or before
+	// year 2000), which a live instance's freshly written Date.now() never
+	// is. This scoping makes the purge safe under concurrent startup: it
+	// can never match a row a peer just wrote correctly.
+	const startedAtType = await columnDataType(
+		adapter,
+		"instance_heartbeats",
+		"started_at",
+	);
+	if (startedAtType === "integer") {
+		await adapter.unsafe(
+			`ALTER TABLE instance_heartbeats
+			 ALTER COLUMN started_at TYPE bigint,
+			 ALTER COLUMN last_heartbeat TYPE bigint`,
+		);
+		const MIN_PLAUSIBLE_EPOCH_MS = 946684800000; // 2000-01-01T00:00:00Z
+		await adapter.unsafe(
+			`DELETE FROM instance_heartbeats
+			 WHERE started_at < ${MIN_PLAUSIBLE_EPOCH_MS}
+			    OR last_heartbeat < ${MIN_PLAUSIBLE_EPOCH_MS}`,
+		);
+		log.info("Widened instance_heartbeats timestamps to bigint (issue #383)");
 	}
 
 	// Clean up empty-string sentinels left by old migration

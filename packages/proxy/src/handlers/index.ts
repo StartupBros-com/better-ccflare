@@ -26,6 +26,8 @@ export {
 	createContextLengthExceededResponse,
 	createPoolExhaustedResponse,
 	type ModelFallbackExecutionPolicy,
+	type PoolExhaustionAccountReason,
+	type PoolExhaustionKind,
 	proxyUnauthenticated,
 	proxyWithAccount,
 } from "./proxy-operations";

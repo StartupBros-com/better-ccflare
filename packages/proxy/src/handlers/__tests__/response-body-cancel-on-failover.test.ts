@@ -123,20 +123,29 @@ function makeRequest(body: ArrayBuffer, headers: Record<string, string> = {}) {
 
 /**
  * Build an error Response whose body is a ReadableStream we can observe. The
- * returned `state.cancelled` ref flips true if the proxy cancels the body
- * (the fix); it stays false if the body is dropped on the floor (the leak).
- * `state.pulled` flips true the moment anything actually reads from the
- * stream (including a discarded provider clone) -- a body that is read
- * anywhere in its tee graph is not abandoned, even if a *sibling* branch's
- * later cancel() call never resolves at the tee level (see the native xAI
- * tests below for why that distinction matters).
+ * returned `state.released` ref flips true only on an explicit `cancel()`
+ * call -- still used by call sites that need to unstick a background pump
+ * (e.g. the 401 auth-failure path below) or by a consumer that locks/cancels
+ * the body directly. This helper enqueues its whole payload and closes the
+ * stream in a single `pull()`, so a normal single read to completion (e.g. a
+ * provider's one-shot `response.clone().json()` classification check) is
+ * indistinguishable from "never touched" as far as `released` is concerned
+ * -- it stays false. Tests that need to observe the *drain-to-done* release
+ * path (the discard helper's mechanism since the v3.5.48 sync; `body.cancel()`
+ * is a measured leak no-op on released Bun) use the two-step
+ * `observableDrainableBodyResponse` helper below instead. `state.pulled`
+ * flips true the moment anything actually reads from the stream (including a
+ * discarded provider clone) -- a body that is read anywhere in its tee graph
+ * is not abandoned, even if a *sibling* branch's later cancel() call never
+ * resolves at the tee level (see the native xAI tests below for why that
+ * distinction matters).
  */
 function observableBodyResponse(
 	status: number,
 	json: string,
 	headers: Record<string, string> = {},
-): { response: Response; state: { cancelled: boolean; pulled: boolean } } {
-	const state = { cancelled: false, pulled: false };
+): { response: Response; state: { released: boolean; pulled: boolean } } {
+	const state = { released: false, pulled: false };
 	const payload = new TextEncoder().encode(json);
 	const body = new ReadableStream<Uint8Array>({
 		pull(controller) {
@@ -145,7 +154,53 @@ function observableBodyResponse(
 			controller.close();
 		},
 		cancel() {
-			state.cancelled = true;
+			state.released = true;
+		},
+	});
+	const response = new Response(body, {
+		status,
+		headers: { "content-type": "application/json", ...headers },
+	});
+	return { response, state };
+}
+
+/**
+ * Two-step-pull variant of `observableBodyResponse`, for tests that need to
+ * observe the *drain-to-done* release path used by `discardUpstreamBody`
+ * (packages/proxy/src/handlers/discard-body-cancel.ts) since the v3.5.48
+ * sync: `body.cancel()` is a measured leak no-op on released Bun, so the
+ * discard helper instead reads the body in chunks until `done`. The first
+ * `pull()` enqueues the payload; a *second* `pull()` -- reached only by
+ * reading past the payload to `done` -- is what flips `state.released`. A
+ * single read elsewhere (e.g. a provider's one-shot `response.clone().json()`
+ * classification check) never reaches this second pull, so it correctly does
+ * not flip `released`. Only use this helper for scenarios where the body
+ * genuinely is abandoned/drained by the discard path and nothing else
+ * legitimately reads it first (see `observableBodyResponse` above for the
+ * general-purpose single-shot variant used everywhere else in this file).
+ */
+function observableDrainableBodyResponse(
+	status: number,
+	json: string,
+	headers: Record<string, string> = {},
+): { response: Response; state: { released: boolean; pulled: boolean } } {
+	const state = { released: false, pulled: false };
+	const payload = new TextEncoder().encode(json);
+	let pushed = false;
+	const body = new ReadableStream<Uint8Array>({
+		pull(controller) {
+			state.pulled = true;
+			if (!pushed) {
+				pushed = true;
+				controller.enqueue(payload);
+				return;
+			}
+			// Reading past the payload to `done` is the drain release.
+			state.released = true;
+			controller.close();
+		},
+		cancel() {
+			state.released = true;
 		},
 	});
 	const response = new Response(body, {
@@ -156,10 +211,13 @@ function observableBodyResponse(
 }
 
 describe("discardUpstreamBody (unit)", () => {
-	it("cancels a fresh body", async () => {
-		const { response, state } = observableBodyResponse(429, "{}");
+	it("releases a fresh body", async () => {
+		const { response, state } = observableDrainableBodyResponse(429, "{}");
 		await discardUpstreamBody(response);
-		expect(state.cancelled).toBe(true);
+		// The drain is fire-and-forget (settles on microtasks after
+		// discardUpstreamBody returns), so yield before observing release.
+		await Bun.sleep(0);
+		expect(state.released).toBe(true);
 	});
 
 	it("skips a locked body without throwing", async () => {
@@ -168,7 +226,7 @@ describe("discardUpstreamBody (unit)", () => {
 		// by another consumer (e.g. mid-clone).
 		response.body?.getReader();
 		await expect(discardUpstreamBody(response)).resolves.toBeUndefined();
-		expect(state.cancelled).toBe(false);
+		expect(state.released).toBe(false);
 	});
 
 	it("swallows the error from an already-cancelled body", async () => {
@@ -194,8 +252,8 @@ describe("proxyWithAccount — cancels abandoned upstream body on failover", () 
 		globalThis.fetch = originalFetch;
 	});
 
-	it("cancels the 429 body on the no-fallback failover (return null)", async () => {
-		const { response, state } = observableBodyResponse(
+	it("releases the 429 body on the no-fallback failover (return null)", async () => {
+		const { response, state } = observableDrainableBodyResponse(
 			429,
 			JSON.stringify({
 				error: {
@@ -221,7 +279,10 @@ describe("proxyWithAccount — cancels abandoned upstream body on failover", () 
 		);
 
 		expect(result).toBeNull();
-		expect(state.cancelled).toBe(true);
+		// The drain is fire-and-forget (settles on microtasks after
+		// proxyWithAccount returns), so yield before observing release.
+		await Bun.sleep(0);
+		expect(state.released).toBe(true);
 	});
 
 	it("cancels the 401 body on the auth-failure failover (return null)", async () => {
@@ -257,11 +318,13 @@ describe("proxyWithAccount — cancels abandoned upstream body on failover", () 
 		);
 
 		expect(result).toBeNull();
-		expect(state.cancelled).toBe(true);
+		// Real body.cancel() via discardUnusedResponse (not the drain-based
+		// discardUpstreamBody path), so no drain settling delay is needed here.
+		expect(state.released).toBe(true);
 	});
 
-	it("cancels the abandoned body before overwriting it on a model-fallback retry", async () => {
-		const bodies: { cancelled: boolean }[] = [];
+	it("releases the abandoned body before overwriting it on a model-fallback retry", async () => {
+		const bodies: { released: boolean }[] = [];
 		let call = 0;
 		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
 			call++;
@@ -269,7 +332,7 @@ describe("proxyWithAccount — cancels abandoned upstream body on failover", () 
 			const bodyText = await req.text().catch(() => "{}");
 			const model = (JSON.parse(bodyText) as { model?: string }).model ?? "";
 			if (call === 1) {
-				const { response, state } = observableBodyResponse(
+				const { response, state } = observableDrainableBodyResponse(
 					429,
 					JSON.stringify({
 						error: { type: "api_error", message: "Rate limit exceeded" },
@@ -319,7 +382,10 @@ describe("proxyWithAccount — cancels abandoned upstream body on failover", () 
 
 		expect(call).toBe(2);
 		expect(bodies).toHaveLength(1);
-		expect(bodies[0].cancelled).toBe(true);
+		// The drain is fire-and-forget (settles on microtasks after
+		// proxyWithAccount returns), so yield before observing release.
+		await Bun.sleep(0);
+		expect(bodies[0].released).toBe(true);
 	});
 
 	it("does not abandon the native xAI 402 body on the middle-candidate failover (return null, AE3)", async () => {
@@ -329,7 +395,7 @@ describe("proxyWithAccount — cancels abandoned upstream body on failover", () 
 		// not the ctx.provider "openai-compatible" fixture used by the other
 		// tests in this file.
 		//
-		// This path does not exercise state.cancelled the way the other
+		// This path does not exercise state.released the way the other
 		// tests in this file do, and that is expected, not a regression.
 		// Unlike the no-fallback/auth-failure/model-fallback paths above
 		// (which discard rawResponse directly, before any provider hook
@@ -382,7 +448,7 @@ describe("proxyWithAccount — cancels abandoned upstream body on failover", () 
 		// Same reasoning as the 402 test directly above: the body is
 		// consumed via provider.processResponse() / extractUsageInfo(), not
 		// via an explicit cancel() on `response` itself, so state.pulled
-		// (not state.cancelled) is the correct no-leak signal here.
+		// (not state.released) is the correct no-leak signal here.
 		const { response, state } = observableBodyResponse(
 			429,
 			JSON.stringify({ error: { message: "rate limited" } }),
@@ -467,7 +533,7 @@ describe("proxyWithAccount — cancels abandoned upstream body on failover", () 
 		// Passed through unchanged to the client — body must still be readable.
 		expect(result).not.toBeNull();
 		expect(result?.status).toBe(400);
-		expect(state.cancelled).toBe(false);
+		expect(state.released).toBe(false);
 		const parsed = await result?.json();
 		expect(parsed).toEqual({
 			type: "error",

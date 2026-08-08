@@ -26,6 +26,44 @@ mock.module("@better-ccflare/database", () => ({
 	ModelTranslationRepository: class ModelTranslationRepository {},
 }));
 
+// Records every response handed to cancelDiscardedResponseBody, so the
+// "releases the rate-limit-check clone" test below (529 failover describe
+// block) can observe the release. Since the v3.5.48 sync, that call site
+// (disposing `responseForRateLimitCheck` after classification) migrated
+// from discardUnusedResponse(responseForRateLimitCheck,
+// "rate_limit_check_clone") (real body.cancel(reason)) to
+// cancelDiscardedResponseBody (chunked drain-to-done, no reason arg --
+// body.cancel() is a measured leak no-op on released Bun). A global
+// `ReadableStream.prototype.cancel` reason-string spy can no longer see
+// this release, so we spy at the module boundary instead. Reimplements the
+// real chunked-drain behaviour (rather than delegating to the actual
+// module) so every other discard site funnelled through this same helper
+// elsewhere in this file keeps working identically.
+const discardedResponses: Response[] = [];
+async function drainBody(body: ReadableStream<Uint8Array>): Promise<void> {
+	const reader = body.getReader();
+	try {
+		while (true) {
+			const { done } = await reader.read();
+			if (done) return;
+		}
+	} finally {
+		reader.releaseLock();
+	}
+}
+mock.module("../discard-body-cancel", () => ({
+	// Also re-exported for response-processor.ts, which imports `drainBody`
+	// directly (not through `cancelDiscardedResponseBody`).
+	drainBody,
+	cancelDiscardedResponseBody(response: Response | null | undefined): void {
+		if (!response) return;
+		const body = response.body;
+		if (!body || body.locked) return;
+		discardedResponses.push(response);
+		void drainBody(body).catch(() => {});
+	},
+}));
+
 const { buildServerToolCapabilityProofKey, getProvider } = await import(
 	"@better-ccflare/providers"
 );
@@ -2281,25 +2319,34 @@ describe("proxyWithAccount — 529 failover", () => {
 	});
 
 	it("releases the rate-limit-check clone on the final-attempt 529 passthrough", async () => {
-		const cancelReasons: string[] = [];
-		const originalStreamCancel = ReadableStream.prototype.cancel;
-		ReadableStream.prototype.cancel = function (
-			this: ReadableStream,
-			reason?: unknown,
-		) {
-			cancelReasons.push(String(reason));
-			return originalStreamCancel.call(this, reason);
-		};
-		globalThis.fetch = mock(
-			async () =>
-				new Response(
-					'{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}',
-					{
-						status: 529,
-						headers: { "content-type": "application/json" },
+		// Reset the shared discard-site recorder (module-scoped, see the
+		// mock.module("../discard-body-cancel", ...) call above) so counts
+		// below reflect only this test's request.
+		discardedResponses.length = 0;
+		// CCFLARE_OVERLOAD_RETRY_ENABLED defaults to true (core/src/constants.ts),
+		// so the 529 in-place retry loop also runs here and discards its own
+		// superseded `response` via a *different* call site (proxy-operations.ts
+		// line ~4817) before this test's target call site (the
+		// responseForRateLimitCheck classification-clone disposal, line ~5385)
+		// ever runs. Both funnel through the same cancelDiscardedResponseBody
+		// primitive, so discardedResponses can contain more than one entry; tag
+		// each fetch response with its attempt number so the assertion below
+		// can isolate the *last* attempt's response -- the only one that ever
+		// reaches the rate-limit-check clone path.
+		let fetchCallCount = 0;
+		globalThis.fetch = mock(async () => {
+			fetchCallCount++;
+			return new Response(
+				'{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}',
+				{
+					status: 529,
+					headers: {
+						"content-type": "application/json",
+						"x-test-fetch-attempt": String(fetchCallCount),
 					},
-				),
-		);
+				},
+			);
+		});
 
 		const bodyBuffer = makeRequestBody();
 		const req = makeRequest(bodyBuffer);
@@ -2326,13 +2373,15 @@ describe("proxyWithAccount — 529 failover", () => {
 		} catch (e) {
 			const msg = e instanceof Error ? e.message : String(e);
 			if (!msg.includes("UsageCollector not initialized")) throw e;
-		} finally {
-			ReadableStream.prototype.cancel = originalStreamCancel;
 		}
 
-		expect(
-			cancelReasons.filter((r) => r === "rate_limit_check_clone").length,
-		).toBe(1);
+		// The drain is fire-and-forget (settles on microtasks after
+		// proxyWithAccount returns), so yield before observing release.
+		await Bun.sleep(0);
+		const lastAttemptDiscards = discardedResponses.filter(
+			(r) => r.headers.get("x-test-fetch-attempt") === String(fetchCallCount),
+		);
+		expect(lastAttemptDiscards.length).toBe(1);
 	});
 
 	it("isModelUnavailableError returns false for 529 overloaded responses", async () => {

@@ -6,6 +6,22 @@ import type { RateLimitReason } from "./account";
 export type IntegrityCheckKind = "quick" | "full";
 
 /**
+ * Cached data-retention job status. Minimal by design (#384): retention
+ * cleanup runs hourly and silently swallows errors into a log line today, so
+ * there's no way to distinguish "retention healthy" from "retention dead for
+ * weeks" without tailing logs. This exposes just enough for a dead-man alert
+ * on `lastSuccessAt` plus the most recent error for triage.
+ */
+export interface RetentionStatus {
+	/** Epoch ms when cleanupOldRequests + pruneUsageSnapshots last both completed without throwing; null before the first successful run. */
+	lastSuccessAt: number | null;
+	/** Most recent error message from a failed run; null if the last run succeeded (or none has failed yet). */
+	lastError: string | null;
+	/** Epoch ms of the most recent error; null if none has occurred. */
+	lastErrorAt: number | null;
+}
+
+/**
  * Cached integrity status. The `status` collapses both probes into a single
  * surface, but each probe's own most-recent result is preserved so a quick
  * `ok` cannot mask a previously-detected full `corrupt`.
@@ -269,11 +285,22 @@ export interface HealthResponse {
 	accounts: number;
 	timestamp: string;
 	strategy: string;
-	version?: string;
 	// Git short SHA the running binary was built from, or null if unknown
 	// (e.g. dev runs outside a compiled binary). Lets a deploy be verified
-	// over HTTP without trusting the binary filename.
+	// over HTTP without trusting the binary filename. Nullable per the
+	// fork's getGitSha(); upstream's build-provenance fields below report
+	// "unknown" (never null) for the same not-set case.
+	version?: string;
 	git_sha?: string | null;
+	/**
+	 * Additional build-time provenance from upstream. Populated from env vars
+	 * injected by the Dockerfile at build time:
+	 *   - git_ref: branch / tag name (e.g. "main", "deploy/2026-07-30"),
+	 *     or "unknown" if not set.
+	 *   - build_date: RFC 3339 timestamp the image was built, or "unknown".
+	 */
+	git_ref?: string;
+	build_date?: string;
 	pool?: PoolStatus;
 	accounts_detail?: Array<AccountDetail>;
 	runtime?: {
@@ -287,7 +314,7 @@ export interface HealthResponse {
 		};
 		anthropicDegraded?: AnthropicDegradedRuntimeHealth;
 		storage?: {
-			integrity: {
+			integrity?: {
 				status: "ok" | "corrupt" | "unchecked" | "running";
 				runningKind: IntegrityCheckKind | null;
 				lastCheckAt: string | null;
@@ -296,6 +323,11 @@ export interface HealthResponse {
 				lastQuickResult: "ok" | "corrupt" | null;
 				lastFullCheckAt: string | null;
 				lastFullResult: "ok" | "corrupt" | null;
+			};
+			retention?: {
+				lastSuccessAt: string | null;
+				lastError: string | null;
+				lastErrorAt: string | null;
 			};
 		};
 	};

@@ -1383,6 +1383,7 @@ async function handleProxyCore(
 				accountAutoPauseOnOverageEnabled: 0,
 				accountName: null,
 				agentUsed: agentUsed || null,
+				clientSessionId: requestMeta.clientSessionId ?? null,
 				originalModel: originalModel || null,
 				appliedModel: appliedModel || null,
 				comboName,

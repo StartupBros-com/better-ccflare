@@ -106,11 +106,21 @@ export async function makeProxyRequest(
 	hasBody?: boolean,
 	signal?: AbortSignal,
 ): Promise<Response> {
+	// The header-phase timeout is always armed, independent of any caller
+	// signal, so it can abort the fetch even after headers arrive — a client
+	// that disconnects mid-stream (Claude Code's idle watchdog, Ctrl-C, a
+	// dropped network) would otherwise leak the upstream connection, since
+	// reader.cancel() doesn't close the socket in Bun, only abort() does.
 	const headerTimeoutController = new AbortController();
 	const timeoutId = setTimeout(
 		() => headerTimeoutController.abort(),
 		TIME_CONSTANTS.PROXY_REQUEST_TIMEOUT_MS,
 	);
+	// Combine every abort source that can legitimately end this fetch: an
+	// explicit caller signal, the signal already carried by a Request target
+	// (Request derivation preserves it), and the header-phase timeout above.
+	// Any one of them can fire independently and must stay live for the whole
+	// stream lifetime, not just the header phase.
 	const signals = [
 		...(signal ? [signal] : []),
 		...(target instanceof Request ? [target.signal] : []),

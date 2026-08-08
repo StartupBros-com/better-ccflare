@@ -24,6 +24,7 @@ import {
 	extractProjectAttributionFromParts,
 	extractProjectAttributionFromRequest,
 	extractSystemPromptFromBase64,
+	isLowRiskPathSegment,
 	isLowRiskProjectSlug,
 } from "../project-attribution";
 
@@ -45,8 +46,11 @@ describe("extractProjectAttributionFromRequest", () => {
 		expect(result.projectAttributionSource).toBe("header_project");
 	});
 
-	it("strips control characters and caps header-derived project length at 64", () => {
-		const raw = `\x01\x02${"x".repeat(80)}\n`;
+	it("strips control characters from a valid header-derived project name", () => {
+		// Dash-delimited so no unbroken alnum run trips LONG_TOKEN_RE (20+), and
+		// within the 64-char slug grammar bound so it passes validation.
+		const slug = `${"x".repeat(15)}-`.repeat(4);
+		const raw = `\x01\x02${slug}\n`;
 		const headers = new Headers({ "x-project": raw });
 		const result = extractProjectAttributionFromRequest(headers, null);
 		expect(result.project).not.toBeNull();
@@ -54,6 +58,66 @@ describe("extractProjectAttributionFromRequest", () => {
 		// biome-ignore lint/suspicious/noControlCharactersInRegex: asserting control chars are gone
 		expect(result.project ?? "").not.toMatch(/[\x00-\x1F\x7F]/);
 		expect(result.projectAttributionSource).toBe("header_project");
+	});
+
+	it("rejects a header value that exceeds the 64-char slug grammar bound (no silent truncate)", () => {
+		// Round-2 P1 hardening for the H1 path made >64-char values reject
+		// wholesale rather than truncate-and-keep; the header path must match.
+		const raw = "x".repeat(80);
+		const headers = new Headers({ "x-project": raw });
+		const result = extractProjectAttributionFromRequest(headers, null);
+		expect(result.project).toBeNull();
+		expect(result.projectAttributionSource).toBe("none");
+	});
+
+	describe("header-derived project names are validated like heading-derived ones (#373)", () => {
+		it("rejects a namespaced header value that fails isLowRiskProjectSlug", () => {
+			const headers = new Headers({
+				"x-better-ccflare-project": "## some system prompt fragment",
+			});
+			const result = extractProjectAttributionFromRequest(headers, null);
+			expect(result.project).toBeNull();
+			expect(result.projectAttributionSource).toBe("none");
+		});
+
+		it("rejects a legacy x-project header value that fails isLowRiskProjectSlug", () => {
+			const headers = new Headers({
+				"x-project": "Authorization: Bearer sk_live_abc123456789",
+			});
+			const result = extractProjectAttributionFromRequest(headers, null);
+			expect(result.project).toBeNull();
+			expect(result.projectAttributionSource).toBe("none");
+		});
+
+		it("rejects a header value carrying a secret past the 64-char truncation boundary", () => {
+			// Same shape as the H1 boundary-straddling test: a pre-truncation
+			// validator would slice this down to a clean 64-char prefix and let
+			// it through. Header path must validate the FULL value too.
+			const cleanPrefix = `${"x".repeat(15)}-`.repeat(4);
+			const headers = new Headers({
+				"x-project": `${cleanPrefix}${"Z".repeat(25)}`,
+			});
+			const result = extractProjectAttributionFromRequest(headers, null);
+			expect(result.project).toBeNull();
+			expect(result.projectAttributionSource).toBe("none");
+		});
+
+		it("falls through to the legacy header when the namespaced header is rejected", () => {
+			const headers = new Headers({
+				"x-better-ccflare-project": "# leaked system prompt heading",
+				"x-project": "legacy-project",
+			});
+			const result = extractProjectAttributionFromRequest(headers, null);
+			expect(result.project).toBe("legacy-project");
+			expect(result.projectAttributionSource).toBe("header_project");
+		});
+
+		it("still accepts ordinary slug-shaped header values", () => {
+			const headers = new Headers({ "x-better-ccflare-project": "my-app" });
+			const result = extractProjectAttributionFromRequest(headers, null);
+			expect(result.project).toBe("my-app");
+			expect(result.projectAttributionSource).toBe("header_project");
+		});
 	});
 
 	it("infers a sanitized repo slug from a /home workspace path in the system prompt", () => {
@@ -74,6 +138,99 @@ describe("extractProjectAttributionFromRequest", () => {
 		const result = extractProjectAttributionFromRequest(headers, body);
 		expect(result.project).toBe("MyProj");
 		expect(result.projectAttributionSource).toBe("path_project");
+	});
+
+	describe("workspace-path segments are validated like header/heading values (#373)", () => {
+		it("rejects a path segment that runs on past the directory name into leaked prompt text", () => {
+			// Same signature as the original report: a collapsed-newline system
+			// prompt makes WORKSPACE_PATH_RE's [^/]+ capture group run on past the
+			// real directory name into following prompt text, producing a
+			// multi-word, `#`-containing value that must be rejected wholesale
+			// rather than truncated to 64 chars and kept.
+			const headers = new Headers();
+			const body = {
+				system:
+					"/home/will/projects/better-ccflare # Some Leaked System Prompt Heading Text/more",
+			};
+			const result = extractProjectAttributionFromRequest(headers, body);
+			expect(result.project).toBeNull();
+			expect(result.projectAttributionSource).toBe("none");
+		});
+
+		it("falls through to an eligible H1 heading when the workspace path segment is rejected", () => {
+			const headers = new Headers();
+			const body = {
+				system:
+					"/home/will/projects/leaked system prompt fragment with many words/more\n# Harness\nWelcome.",
+			};
+			const result = extractProjectAttributionFromRequest(headers, body);
+			expect(result.project).toBe("Harness");
+			expect(result.projectAttributionSource).toBe("heading_project");
+		});
+
+		it("rejects a path segment carrying a secret past the 64-char truncation boundary", () => {
+			const cleanPrefix = `${"x".repeat(15)}-`.repeat(4);
+			const headers = new Headers();
+			const body = {
+				system: `/home/will/projects/${cleanPrefix}${"Z".repeat(25)}/file.ts`,
+			};
+			const result = extractProjectAttributionFromRequest(headers, body);
+			expect(result.project).toBeNull();
+			expect(result.projectAttributionSource).toBe("none");
+		});
+
+		it("rejects a short space-separated run-on rather than persisting it as the project (round-2 Greptile review on #378)", () => {
+			// "repo short words" is short enough to dodge the six-word sentence
+			// cap and slug-shaped enough to pass SLUG_SHAPE_RE, but a real
+			// directory name never contains a literal space — this is leaked
+			// prompt text riding along with the real "repo" directory, not a
+			// directory name itself.
+			const headers = new Headers();
+			const body = {
+				system: "/home/u/projects/repo short words/more",
+			};
+			const result = extractProjectAttributionFromRequest(headers, body);
+			expect(result.project).toBeNull();
+			expect(result.projectAttributionSource).toBe("none");
+		});
+
+		it("rejects a path segment where a control char fuses the real directory with leaked text (round-3 Greptile review on #378)", () => {
+			// A naive strip-then-check validator deletes \n/\t before checking for
+			// whitespace, silently fusing "repo" + "leaked-fragment" into the
+			// clean-looking slug "repoleaked-fragment". The control char must be
+			// detected in the RAW captured value before any stripping happens.
+			const headers = new Headers();
+			const body = {
+				system: "/home/u/projects/repo\nleaked-fragment/more",
+			};
+			const result = extractProjectAttributionFromRequest(headers, body);
+			expect(result.project).toBeNull();
+			expect(result.projectAttributionSource).toBe("none");
+		});
+
+		// Regression (Greptile review on #378): isLowRiskProjectSlug's label-based
+		// heuristics (credential/incident/hostname labels) are tuned for free-text
+		// headings and headers, and false-positive on ordinary directory names.
+		// The path-segment capture is structurally a single path component, so it
+		// must use the narrower isLowRiskPathSegment validator instead.
+		const legitDirNames: Array<[string, string]> = [
+			["password-manager", "password-manager"],
+			["customer-portal", "customer-portal"],
+			["auth-token-service", "auth-token-service"],
+			["account-billing", "account-billing"],
+			["ui.v2", "ui.v2"],
+		];
+		for (const [label, dirName] of legitDirNames) {
+			it(`still extracts legit workspace directory name: ${label}`, () => {
+				const headers = new Headers();
+				const body = {
+					system: `/home/will/projects/${dirName}/file.ts`,
+				};
+				const result = extractProjectAttributionFromRequest(headers, body);
+				expect(result.project).toBe(dirName);
+				expect(result.projectAttributionSource).toBe("path_project");
+			});
+		}
 	});
 
 	it("uses the first eligible non-Claude H1 heading as the project when no header/path match", () => {
@@ -378,6 +535,70 @@ describe("isLowRiskProjectSlug", () => {
 			const boundaryStraddlingSecret = `${CLEAN_64_PREFIX}${"Z".repeat(25)}`;
 			expect(isLowRiskProjectSlug(boundaryStraddlingSecret)).toBe(false);
 		});
+	});
+});
+
+describe("isLowRiskPathSegment", () => {
+	it("accepts ordinary directory names that isLowRiskProjectSlug's label heuristics would reject", () => {
+		// These are all real, unremarkable workspace directory names that
+		// CREDENTIAL_LABEL_RE / INCIDENT_LABEL_RE / DOTTED_HOSTNAME_LABEL_RE
+		// false-positive on when applied to free text (Greptile review on #378).
+		expect(isLowRiskPathSegment("password-manager")).toBe(true);
+		expect(isLowRiskPathSegment("customer-portal")).toBe(true);
+		expect(isLowRiskPathSegment("auth-token-service")).toBe(true);
+		expect(isLowRiskPathSegment("account-billing")).toBe(true);
+		expect(isLowRiskPathSegment("ui.v2")).toBe(true);
+		expect(isLowRiskPathSegment("better-ccflare")).toBe(true);
+		expect(isLowRiskPathSegment("MyProj")).toBe(true);
+	});
+
+	it("still rejects a runaway sentence-shaped capture (the #373 leak signature)", () => {
+		expect(
+			isLowRiskPathSegment(
+				"better-ccflare # Some Leaked System Prompt Heading Text",
+			),
+		).toBe(false);
+		expect(
+			isLowRiskPathSegment("leaked system prompt fragment with many words"),
+		).toBe(false);
+	});
+
+	it("rejects any whitespace, even a short run-on that dodges the sentence heuristic (round-2 Greptile review on #378)", () => {
+		// A real directory name is never space-separated, so a short capture
+		// like "repo short words" must be rejected outright rather than only
+		// once it crosses a word-count threshold.
+		expect(isLowRiskPathSegment("repo short words")).toBe(false);
+		expect(isLowRiskPathSegment("two words")).toBe(false);
+		expect(isLowRiskPathSegment("a b")).toBe(false);
+	});
+
+	it("rejects a control-char-fused value rather than silently deleting the separator (round-3 Greptile review on #378)", () => {
+		// The raw value must be checked for control chars BEFORE they're
+		// stripped, or "repo\nleaked" silently fuses into "repoleaked" and
+		// passes the whitespace/shape checks.
+		expect(isLowRiskPathSegment("repo\nleaked-fragment")).toBe(false);
+		expect(isLowRiskPathSegment("repo\tleaked-fragment")).toBe(false);
+		expect(isLowRiskPathSegment("repo\rleaked-fragment")).toBe(false);
+	});
+
+	it("still rejects secrets, keys, IPs, and opaque high-entropy tokens", () => {
+		expect(isLowRiskPathSegment("Bearer sk_live_abc123456789")).toBe(false);
+		expect(isLowRiskPathSegment("AKIAIOSFODNN7EXAMPLE")).toBe(false);
+		expect(isLowRiskPathSegment("10.0.0.5")).toBe(false);
+		expect(isLowRiskPathSegment("sess1234567890qwerty")).toBe(false);
+		expect(isLowRiskPathSegment("deadbeefcafebabe")).toBe(false);
+	});
+
+	it("still rejects URL/URI-scheme and traversal shapes", () => {
+		expect(isLowRiskPathSegment("https://example.com")).toBe(false);
+		expect(isLowRiskPathSegment("www.example.com")).toBe(false);
+		expect(isLowRiskPathSegment("..")).toBe(false);
+	});
+
+	it("rejects the FULL value rather than a 64-char-truncated prefix", () => {
+		const cleanPrefix = `${"x".repeat(15)}-`.repeat(4);
+		const boundaryStraddlingSecret = `${cleanPrefix}${"Z".repeat(25)}`;
+		expect(isLowRiskPathSegment(boundaryStraddlingSecret)).toBe(false);
 	});
 });
 

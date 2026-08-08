@@ -159,6 +159,19 @@ export interface UsageSnapshot {
 }
 
 /**
+ * Minimum advance of the upstream reset timestamp that counts as a real window
+ * rollover.
+ *
+ * Providers recompute `resets_at` per response and it jitters by fractions of a
+ * second around the same instant, so comparing for any advance at all reports a
+ * rollover on nearly every poll. Measured over 48h of production traffic across
+ * three Anthropic accounts: 1554 of 1564 detections were jitter (largest 1.879s)
+ * and the 10 genuine rollovers all advanced by exactly 5.00h — nothing landed in
+ * between. 60s sits in that empty gap with a wide margin on both sides.
+ */
+export const WINDOW_RESET_MIN_ADVANCE_MS = 60_000;
+
+/**
  * Extract the primary window reset timestamp (ms) from usage data.
  * Returns null if the provider doesn't expose a reset time or it isn't available.
  */
@@ -678,6 +691,50 @@ export function getRepresentativeUsageResetMs(
 	} catch {
 		return null;
 	}
+}
+
+/**
+ * Representative utilization paired with the reset that belongs to the same
+ * winning window. Zai needs special handling because its utilization is the
+ * max of time_limit and tokens_limit while getRepresentativeUsageResetMs is
+ * intentionally tokens_limit-only for display surfaces. Other providers keep
+ * their existing representative-reset behavior unchanged.
+ */
+export function getRepresentativeUsageSnapshotForProvider(
+	data: AnyUsageData,
+	provider: string,
+): { utilization: number; resetMs: number | null } | null {
+	if (provider === "zai") {
+		const zai = data as ZaiUsageData;
+		const candidates = [zai.time_limit, zai.tokens_limit].filter(
+			(window): window is NonNullable<typeof window> => window !== null,
+		);
+		if (candidates.length === 0) return null;
+		// On a tie (both windows equally exhausted), prefer the LATER reset —
+		// the account isn't actually available again until every exhausted
+		// window clears, so picking the earlier one would tell clients to
+		// retry while the other window is still capped.
+		const winning = candidates.reduce((prev, current) => {
+			if (current.percentage !== prev.percentage) {
+				return current.percentage > prev.percentage ? current : prev;
+			}
+			if (current.resetAt === null || prev.resetAt === null) {
+				return prev.resetAt === null ? prev : current;
+			}
+			return current.resetAt > prev.resetAt ? current : prev;
+		});
+		return {
+			utilization: winning.percentage,
+			resetMs: winning.resetAt,
+		};
+	}
+
+	const utilization = getRepresentativeUtilizationForProvider(data, provider);
+	if (utilization === null) return null;
+	return {
+		utilization,
+		resetMs: getRepresentativeUsageResetMs(data, provider),
+	};
 }
 
 /**
@@ -1411,7 +1468,9 @@ class UsageCache {
 
 	/**
 	 * Check if the usage window has reset by comparing the new data's reset time
-	 * against the previously cached data, and fire the callback if it has advanced.
+	 * against the previously cached data, and fire the callback if it has advanced
+	 * by more than {@link WINDOW_RESET_MIN_ADVANCE_MS} — smaller advances are
+	 * upstream jitter on the same window, not a rollover.
 	 * Should be called after successfully fetching new data, before updating the cache.
 	 * No-ops on the first poll (no previous data) to avoid spurious resets.
 	 */
@@ -1430,7 +1489,7 @@ class UsageCache {
 		if (
 			prevResetAt !== null &&
 			newResetAt !== null &&
-			newResetAt > prevResetAt
+			newResetAt - prevResetAt > WINDOW_RESET_MIN_ADVANCE_MS
 		) {
 			log.info(
 				`Usage window reset detected for account ${accountId} (${provider}): ` +

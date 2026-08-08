@@ -7,6 +7,8 @@ import {
 	detectModelMisrouting,
 	detectRunawayLoops,
 	detectTokenOutliers,
+	PROJECT_DISPLAY_MAX_CHARS,
+	sanitizeProjectForDisplay,
 } from "../anomaly-insights";
 
 /**
@@ -41,6 +43,7 @@ function req(partial: Partial<AnomalyRequestRow> = {}): AnomalyRequestRow {
 		account: "acc",
 		model: "claude-opus-4-8",
 		project: null,
+		agentUsed: null,
 		inputTokens: 0,
 		cacheReadInputTokens: 0,
 		cacheCreationInputTokens: 0,
@@ -203,14 +206,20 @@ describe("detectRunawayLoops", () => {
 	};
 
 	test("flags a dense burst of near-identical requests", () => {
-		// 12 requests, one every 10s, identical token profile.
+		// 12 requests, one every 10s, identical token profile, same agent.
 		const rows = Array.from({ length: 12 }, (_, i) =>
-			req({ timestamp: i * 10_000, inputTokens: 500, project: "proj" }),
+			req({
+				timestamp: i * 10_000,
+				inputTokens: 500,
+				project: "proj",
+				agentUsed: "agent-a",
+			}),
 		);
 		const loops = detectRunawayLoops(rows, opts);
 		expect(loops).toHaveLength(1);
 		expect(loops[0].account).toBe("acc");
 		expect(loops[0].project).toBe("proj");
+		expect(loops[0].agentUsed).toBe("agent-a");
 		expect(loops[0].requests).toBe(12);
 		expect(loops[0].windowStartMs).toBe(0);
 		expect(loops[0].windowEndMs).toBe(110_000);
@@ -223,33 +232,132 @@ describe("detectRunawayLoops", () => {
 	test("does not flag sparse traffic", () => {
 		// One request every 10 minutes: never enough in any 5-minute window.
 		const rows = Array.from({ length: 12 }, (_, i) =>
-			req({ timestamp: i * 600_000, inputTokens: 500 }),
+			req({ timestamp: i * 600_000, inputTokens: 500, agentUsed: "agent-a" }),
 		);
 		expect(detectRunawayLoops(rows, opts)).toHaveLength(0);
 	});
 
 	test("does not flag bursts with dissimilar token profiles", () => {
 		const rows = Array.from({ length: 12 }, (_, i) =>
-			req({ timestamp: i * 10_000, inputTokens: i % 2 === 0 ? 10 : 10_000 }),
-		);
-		expect(detectRunawayLoops(rows, opts)).toHaveLength(0);
-	});
-
-	test("splits groups by project", () => {
-		// 6 requests in each of two projects: neither reaches minRequests.
-		const rows = Array.from({ length: 12 }, (_, i) =>
 			req({
 				timestamp: i * 10_000,
-				inputTokens: 500,
-				project: i % 2 === 0 ? "p1" : "p2",
+				inputTokens: i % 2 === 0 ? 10 : 10_000,
+				agentUsed: "agent-a",
 			}),
 		);
 		expect(detectRunawayLoops(rows, opts)).toHaveLength(0);
 	});
 
+	test("splits groups by project when agent id is absent", () => {
+		// Regression guard for issue #367: when no agent attribution is
+		// present (live traffic — `agent_used` is NULL on 100% of
+		// rows), the project must still split the bucket. 6 requests in
+		// each of two projects: neither reaches minRequests, and the
+		// combined 12-row bucket would falsely report as a loop if the
+		// key dropped project entirely.
+		const rows = Array.from({ length: 12 }, (_, i) =>
+			req({
+				timestamp: i * 10_000,
+				inputTokens: 500,
+				project: i % 2 === 0 ? "p1" : "p2",
+				agentUsed: null,
+			}),
+		);
+		expect(detectRunawayLoops(rows, opts)).toHaveLength(0);
+	});
+
+	test("does NOT flag parallel-fleet traffic from N distinct agents", () => {
+		// Production evidence (issue #367): a fleet of independent workers
+		// shared one (account, model, project). Each worker ran its own
+		// agent and did modest per-agent traffic. With the old
+		// (account, model, project) keying the fleet collapsed into ONE
+		// bucket and the burst looked like a runaway loop (97 CRITICAL
+		// pages in 3h). With per-agent keying the burst splits into N
+		// buckets, each below opts.minRequests, and no loop fires.
+		//
+		// To produce a definitive negative-control shape:
+		//   - Per-worker count (9) is below opts.minRequests (10).
+		//   - Per-worker tokens are identical (CoV = 0) — without the fix,
+		//     the combined 108-row bucket has CoV = 0 and clearly qualifies.
+		const rows: AnomalyRequestRow[] = [];
+		const workerCount = 12;
+		const requestsPerWorker = 9; // < opts.minRequests = 10
+		for (let w = 0; w < workerCount; w++) {
+			for (let r = 0; r < requestsPerWorker; r++) {
+				rows.push(
+					req({
+						timestamp: r * 1100 + w * 13, // slight per-agent skew
+						inputTokens: 500, // identical across one worker
+						cacheReadInputTokens: 0,
+						project: "fleet-proj",
+						agentUsed: `worker-${w}`,
+					}),
+				);
+			}
+		}
+		const loops = detectRunawayLoops(rows, opts);
+		expect(loops).toHaveLength(0);
+	});
+
+	test("DOES flag a single agent repeating the same request (true loop)", () => {
+		// The reverse case: one agent / one session, repeating the same
+		// request shape many times inside one window.
+		const rows = Array.from({ length: 12 }, (_, i) =>
+			req({
+				timestamp: i * 10_000,
+				inputTokens: 500,
+				project: "proj",
+				agentUsed: "agent-a",
+			}),
+		);
+		const loops = detectRunawayLoops(rows, opts);
+		expect(loops).toHaveLength(1);
+		expect(loops[0].agentUsed).toBe("agent-a");
+		expect(loops[0].requests).toBe(12);
+	});
+
+	test("N concurrent distinct sessions do NOT fire, one session repeating DOES", () => {
+		// Mirrors the live fleet: the only stable per-worker signal
+		// is the x-claude-code-session-id header, surfaced as agentUsed
+		// via the session_header attribution source. 12 concurrent
+		// distinct sessions, 9 requests each — none should reach
+		// opts.minRequests (10) on its own. Then one session repeats
+		// 12 times — that bucket DOES fire.
+		const concurrentSessions = 12;
+		const requestsPerSession = 9; // < opts.minRequests = 10
+		const concurrentRows: AnomalyRequestRow[] = [];
+		for (let s = 0; s < concurrentSessions; s++) {
+			for (let r = 0; r < requestsPerSession; r++) {
+				concurrentRows.push(
+					req({
+						timestamp: r * 1_100 + s * 13, // slight per-session skew
+						inputTokens: 500,
+						project: "fleet-proj",
+						agentUsed: `sess-${s}`,
+					}),
+				);
+			}
+		}
+		expect(detectRunawayLoops(concurrentRows, opts)).toHaveLength(0);
+
+		// One session repeating 12 times in one window => exactly one loop.
+		const repeatingRows = Array.from({ length: 12 }, (_, i) =>
+			req({
+				timestamp: i * 10_000,
+				inputTokens: 500,
+				project: "fleet-proj",
+				agentUsed: "sess-0",
+			}),
+		);
+		const loops = detectRunawayLoops(repeatingRows, opts);
+		expect(loops).toHaveLength(1);
+		expect(loops[0].agentUsed).toBe("sess-0");
+		expect(loops[0].requests).toBe(12);
+	});
+
 	test("flags repeated zero-token requests (e.g. failing retries)", () => {
 		const rows = Array.from({ length: 12 }, (_, i) =>
-			req({ timestamp: i * 5_000 }),
+			req({ timestamp: i * 5_000, agentUsed: "agent-a" }),
 		);
 		const loops = detectRunawayLoops(rows, opts);
 		expect(loops).toHaveLength(1);
@@ -264,10 +372,14 @@ describe("detectRunawayLoops", () => {
 		// per-window qualification must report each burst on its own.
 		const rows = [
 			...Array.from({ length: 12 }, (_, i) =>
-				req({ timestamp: i * 10_000, inputTokens: 100 }),
+				req({ timestamp: i * 10_000, inputTokens: 100, agentUsed: "agent-a" }),
 			),
 			...Array.from({ length: 12 }, (_, i) =>
-				req({ timestamp: 120_000 + i * 10_000, inputTokens: 10_000 }),
+				req({
+					timestamp: 120_000 + i * 10_000,
+					inputTokens: 10_000,
+					agentUsed: "agent-a",
+				}),
 			),
 		];
 		const loops = detectRunawayLoops(rows, opts);
@@ -286,13 +398,86 @@ describe("detectRunawayLoops", () => {
 		// 30 requests, one every 30s (14.5 minutes total). Every 5-minute
 		// window holds 10-11 requests, so the run must merge into one group.
 		const rows = Array.from({ length: 30 }, (_, i) =>
-			req({ timestamp: i * 30_000, inputTokens: 500 }),
+			req({ timestamp: i * 30_000, inputTokens: 500, agentUsed: "agent-a" }),
 		);
 		const loops = detectRunawayLoops(rows, opts);
 		expect(loops).toHaveLength(1);
 		expect(loops[0].requests).toBe(30);
 		expect(loops[0].windowStartMs).toBe(0);
 		expect(loops[0].windowEndMs).toBe(29 * 30_000);
+	});
+
+	test("distinct projects that share a 63-char prefix do NOT collapse into one loop", () => {
+		// Regression for Greptile review on PR #369: toAnomalyRow used to
+		// call sanitizeProjectForDisplay BEFORE handing rows to the
+		// detectors, so any project longer than 64 chars was sliced to 63
+		// chars + ellipsis. Two projects that share their first 63 chars
+		// and differ at byte 64 (or beyond) collapse to the same display
+		// value, and the (account, model, project) grouping key in
+		// detectRunawayLoops then merges them into one loop. After the fix,
+		// toAnomalyRow hands the raw project to the detectors (the DB-side
+		// sanitizeProjectName already caps at PROJECT_NAME_MAX_LEN=64 and
+		// strips C0 control chars), so this test must surface TWO loops
+		// with the original project values preserved.
+		const sharedPrefix = "z".repeat(63);
+		const projectA = `${sharedPrefix}A_suffix`;
+		const projectB = `${sharedPrefix}B_suffix`;
+		// Demonstrate the bug we are protecting against: the sanitiser
+		// truncates both projects to 63 chars + ellipsis, so the display
+		// values are identical under the old behaviour. If the sanitiser
+		// ever stops truncating, this assert fails and the test no longer
+		// exercises the regression — that is the signal to revisit.
+		expect(sanitizeProjectForDisplay(projectA)).toBe(
+			sanitizeProjectForDisplay(projectB),
+		);
+		// The detector sees the raw (un-truncated) projects, which is what
+		// toAnomalyRow now provides after the fix.
+		const rows = [
+			...Array.from({ length: 12 }, (_, i) =>
+				req({
+					timestamp: i * 10_000,
+					inputTokens: 500,
+					project: projectA,
+				}),
+			),
+			...Array.from({ length: 12 }, (_, i) =>
+				req({
+					timestamp: i * 10_000,
+					inputTokens: 500,
+					project: projectB,
+				}),
+			),
+		];
+		const loops = detectRunawayLoops(rows, opts);
+		expect(loops).toHaveLength(2);
+		const projects = loops.map((l) => l.project).sort();
+		expect(projects).toEqual([projectA, projectB].sort());
+		// Each loop carries its 12 un-punctuated rows — the original project
+		// propagates end-to-end, not the truncated display value.
+		for (const loop of loops) {
+			expect(loop.requests).toBe(12);
+			expect(loop.project).not.toContain("…");
+		}
+	});
+
+	test("honors a configurable loopMinRequests threshold", () => {
+		// Per-agent key, but the threshold is the count of requests for
+		// one agent inside the window. With loopMinRequests=12 this exact
+		// 11-request steady stream should NOT fire; relaxing to 10 makes
+		// it fire. This is the configurable knob the operator needs.
+		const rows = Array.from({ length: 11 }, (_, i) =>
+			req({
+				timestamp: i * 10_000,
+				inputTokens: 500,
+				agentUsed: "agent-a",
+			}),
+		);
+		expect(detectRunawayLoops(rows, { ...opts, minRequests: 12 })).toHaveLength(
+			0,
+		);
+		const loops = detectRunawayLoops(rows, { ...opts, minRequests: 10 });
+		expect(loops).toHaveLength(1);
+		expect(loops[0].requests).toBe(11);
 	});
 });
 
@@ -434,12 +619,13 @@ describe("buildAnomalyInsightsResponse", () => {
 				inputTokens: 90_000,
 				outputTokens: 10_000,
 			}),
-			// Runaway loop burst on another account/project; the model has no
+			// Runaway loop burst on another account/agent; the model has no
 			// known rates so the small calls don't count as misrouting.
 			...Array.from({ length: 12 }, (_, i) =>
 				req({
 					account: "loop-acc",
 					project: "loop-proj",
+					agentUsed: "loop-agent",
 					model: "loop-model",
 					timestamp: i * 10_000,
 					inputTokens: 50,
@@ -492,5 +678,133 @@ describe("buildAnomalyInsightsResponse", () => {
 		expect(response.tokenOutliers).toHaveLength(1);
 		// The cap keeps the highest z-score.
 		expect(response.tokenOutliers[0].requestId).toBe("bigger");
+	});
+
+	test("reports totalCount + truncation per detector so the UI can distinguish '50-of-50' from '50-of-847'", () => {
+		// Baseline rows dominate so the mean stays low; spikes are far enough
+		// above to register as outliers. Cap of 5 forces 5 of N to be shown.
+		const rows: AnomalyRequestRow[] = [
+			...Array.from({ length: 100 }, () => req({ inputTokens: 100 })),
+			...Array.from({ length: 10 }, (_, i) =>
+				req({ id: `spike-${i}`, inputTokens: 50000 }),
+			),
+		];
+		const response = buildAnomalyInsightsResponse({
+			rows,
+			rates,
+			options: {
+				range: "24h",
+				minBaselineRequests: 10,
+				zScoreThreshold: 1.5,
+				maxEventsPerDetector: 5,
+			},
+		});
+		// Without totalCount the UI cannot tell "5 hidden" from "no more".
+		expect(response.tokenOutliersSummary.totalCount).toBe(10);
+		expect(response.tokenOutliersSummary.truncated).toBe(true);
+		expect(response.tokenOutliers).toHaveLength(5);
+		// Output blowups use the same detector math — they should mirror.
+		expect(response.outputBlowupsSummary.totalCount).toBe(0);
+		expect(response.outputBlowupsSummary.truncated).toBe(false);
+	});
+
+	test("summary.truncated is false when the full count fits under the cap", () => {
+		// 18 baseline + 2 spikes at z threshold 1.5 => exactly 2 outliers.
+		const rows: AnomalyRequestRow[] = [
+			...Array.from({ length: 18 }, () => req({ inputTokens: 100 })),
+			req({ id: "big", inputTokens: 1000 }),
+			req({ id: "bigger", inputTokens: 2000 }),
+		];
+		const response = buildAnomalyInsightsResponse({
+			rows,
+			rates,
+			options: {
+				range: "24h",
+				minBaselineRequests: 10,
+				zScoreThreshold: 1.5,
+				maxEventsPerDetector: 50,
+			},
+		});
+		expect(response.tokenOutliersSummary.totalCount).toBe(2);
+		expect(response.tokenOutliersSummary.truncated).toBe(false);
+		expect(response.tokenOutliers).toHaveLength(2);
+	});
+
+	test("summary is correct for runawayLoops and misrouting as well", () => {
+		// 12 near-identical loops on one (account, model) using a model
+		// with no known rates so the same rows are NOT flagged as
+		// misrouting.
+		const loopRows: AnomalyRequestRow[] = Array.from({ length: 12 }, (_, i) =>
+			req({
+				timestamp: i * 10_000,
+				inputTokens: 500,
+				project: "loop-proj",
+				model: "unknown-loop-model",
+			}),
+		);
+		// And one tiny-call account for misrouting
+		const tinyRows: AnomalyRequestRow[] = Array.from({ length: 5 }, (_, i) =>
+			req({
+				account: "tiny-acc",
+				timestamp: i,
+				inputTokens: 50,
+				costUsd: 0.02,
+			}),
+		);
+		const response = buildAnomalyInsightsResponse({
+			rows: [...loopRows, ...tinyRows],
+			rates,
+			options: {
+				range: "24h",
+				minBaselineRequests: 5,
+				maxEventsPerDetector: 1,
+			},
+		});
+		expect(response.runawayLoopsSummary.totalCount).toBeGreaterThanOrEqual(1);
+		expect(response.runawayLoops).toHaveLength(1);
+		if (response.runawayLoopsSummary.totalCount > 1) {
+			expect(response.runawayLoopsSummary.truncated).toBe(true);
+		}
+		expect(response.misroutingSummary.totalCount).toBe(1);
+		expect(response.misroutingSummary.truncated).toBe(false);
+	});
+});
+
+describe("sanitizeProjectForDisplay", () => {
+	test("returns null for null / undefined / empty / whitespace-only input", () => {
+		expect(sanitizeProjectForDisplay(null)).toBeNull();
+		expect(sanitizeProjectForDisplay(undefined)).toBeNull();
+		expect(sanitizeProjectForDisplay("")).toBeNull();
+		expect(sanitizeProjectForDisplay("   \t\n  ")).toBeNull();
+	});
+
+	test("strips C0 control characters and DEL so prompt content cannot smuggle bytes through the UI", () => {
+		const hostile = "hello\x00\x07\x1b[31m\x7fworld";
+		expect(sanitizeProjectForDisplay(hostile)).toBe("helloworld");
+	});
+
+	test("collapses whitespace runs and trims", () => {
+		// The gap between `alpha` and `beta` is purely C0 whitespace, so
+		// after stripping the control chars the words become adjacent
+		// (sanitisation cannot fabricate a space where none existed).
+		expect(sanitizeProjectForDisplay("  alpha\n\n\tbeta  ")).toBe("alphabeta");
+		// Spaces inside the input are real whitespace and DO get collapsed.
+		expect(sanitizeProjectForDisplay("  alpha    beta  ")).toBe("alpha beta");
+	});
+
+	test("clamps to PROJECT_DISPLAY_MAX_CHARS and appends an ellipsis", () => {
+		const long = "x".repeat(PROJECT_DISPLAY_MAX_CHARS + 50);
+		const out = sanitizeProjectForDisplay(long);
+		expect(out).not.toBeNull();
+		expect(out?.length).toBe(PROJECT_DISPLAY_MAX_CHARS);
+		expect(out?.endsWith("…")).toBe(true);
+	});
+
+	test("passes a normal project name through unchanged", () => {
+		expect(sanitizeProjectForDisplay("repo-frontend")).toBe("repo-frontend");
+	});
+
+	test("returns null when the input is only control characters", () => {
+		expect(sanitizeProjectForDisplay("\x00\x01\x02")).toBeNull();
 	});
 });

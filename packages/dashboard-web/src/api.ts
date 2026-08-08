@@ -10,6 +10,7 @@ import type {
 	AgentUpdatePayload,
 	AgentWorkspace,
 	AnalyticsResponse,
+	AnomalyInsightsResponse,
 	CacheInsightsResponse,
 	Combo,
 	ComboFamily,
@@ -852,8 +853,22 @@ class API extends HttpClient {
 	}
 
 	// SSE streaming requires special handling, keep as-is
-	streamLogs(onLog: (log: LogEntry) => void): EventSource {
-		const eventSource = new EventSource(`/api/logs/stream`);
+	async streamLogs(onLog: (log: LogEntry) => void): Promise<EventSource> {
+		// The native EventSource API cannot set custom headers, so instead of
+		// passing the durable API key via query string (which risks leaking
+		// it via browser history, Referer headers, or access logs), a
+		// short-lived single-use token is minted first via a normally
+		// authenticated POST request, then passed in the EventSource URL
+		// (#216, #379).
+		const apiKey = this.getApiKey();
+		let url = "/api/logs/stream";
+		if (apiKey) {
+			const { token } = await this.post<{ token: string }>(
+				"/api/logs/stream/token",
+			);
+			url = `/api/logs/stream?stream_token=${encodeURIComponent(token)}`;
+		}
+		const eventSource = new EventSource(url);
 		eventSource.addEventListener("message", (event) => {
 			try {
 				const data = JSON.parse(event.data);
@@ -1032,6 +1047,28 @@ class API extends HttpClient {
 
 		return this.get<CacheInsightsResponse>(
 			`/api/insights/cache?${params.toString()}`,
+		);
+	}
+
+	async getAnomalyInsights(
+		range = "24h",
+		options?: {
+			zScoreThreshold?: number;
+			maxEventsPerDetector?: number;
+		},
+	): Promise<AnomalyInsightsResponse> {
+		const params = new URLSearchParams({ range });
+		if (options?.zScoreThreshold !== undefined) {
+			params.append("zScoreThreshold", String(options.zScoreThreshold));
+		}
+		if (options?.maxEventsPerDetector !== undefined) {
+			params.append(
+				"maxEventsPerDetector",
+				String(options.maxEventsPerDetector),
+			);
+		}
+		return this.get<AnomalyInsightsResponse>(
+			`/api/insights/anomalies?${params.toString()}`,
 		);
 	}
 

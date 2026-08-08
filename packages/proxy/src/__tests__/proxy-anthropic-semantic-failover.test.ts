@@ -54,6 +54,48 @@ mock.module("@better-ccflare/database", () => ({
 	ModelTranslationRepository: class ModelTranslationRepository {},
 }));
 
+// Records every response handed to cancelDiscardedResponseBody, so the
+// "bounds hanging JSON classifiers inside the same private attempt deadline"
+// test below can observe the release of the abandoned original branch. When
+// the private attempt deadline fires on a hanging classifier read,
+// AnthropicPreCommitAttemptScope.readJson cancels the classification clone's
+// own reader directly (untouched, still real body.cancel()) but disposes the
+// *original* response via `discardUpstreamBody(response)` -- which, since
+// the v3.5.48 sync, drains-to-done instead of cancelling
+// (cancelDiscardedResponseBody; body.cancel() is a measured leak no-op on
+// released Bun). Per WHATWG tee semantics the underlying source's own
+// cancel() callback only fires once *both* tee branches are cancelled, so
+// draining (not cancelling) the original branch means the fixture's
+// underlying `cancel()` handler can no longer fire at all -- we must spy at
+// the module boundary instead. The fixture stream itself must keep hanging
+// unmodified (no pull()/payload): this test's timing assertions
+// (elapsedMs >= 100/< 150) depend on the classifier read genuinely stalling
+// until the deadline timer fires.
+const discardedResponses: Response[] = [];
+async function drainBody(body: ReadableStream<Uint8Array>): Promise<void> {
+	const reader = body.getReader();
+	try {
+		while (true) {
+			const { done } = await reader.read();
+			if (done) return;
+		}
+	} finally {
+		reader.releaseLock();
+	}
+}
+mock.module("../handlers/discard-body-cancel", () => ({
+	// Also re-exported for response-processor.ts, which imports `drainBody`
+	// directly (not through `cancelDiscardedResponseBody`).
+	drainBody,
+	cancelDiscardedResponseBody(response: Response | null | undefined): void {
+		if (!response) return;
+		const body = response.body;
+		if (!body || body.locked) return;
+		discardedResponses.push(response);
+		void drainBody(body).catch(() => {});
+	},
+}));
+
 const usageCollectorModule = await import("../usage-collector");
 const { usageCache } = await import("@better-ccflare/providers");
 const { alignRouteCandidateIds, handleProxy } = await import("../proxy");
@@ -2722,11 +2764,25 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		process.env[RESCUE_ACTIVATION_ENV] = "5";
 		process.env[RESCUE_PING_ENV] = "10";
 		delete process.env[RESCUE_DEADLINE_ENV];
+		// Reset the shared discard-site recorder (module-scoped, see the
+		// mock.module("../handlers/discard-body-cancel", ...) call above) so
+		// this assertion reflects only this test's request.
+		discardedResponses.length = 0;
 		const first = makeAccount("classifier-stalled-a");
 		const second = makeAccount("classifier-fallback-b");
 		const { ctx, reportCandidateFailure } = makeContext([first, second]);
 		const fetchedAccounts: string[] = [];
-		let firstBodyCancelCount = 0;
+		// The fixture stream's own cancel() handler is kept wired but is no
+		// longer reachable: AnthropicPreCommitAttemptScope.readJson only
+		// cancels the classification clone's reader directly on deadline
+		// (a real, unmigrated body.cancel()); the *original* response is
+		// released via discardUpstreamBody, which drains-to-done instead of
+		// cancelling. Per WHATWG tee semantics the underlying source's own
+		// cancel() only fires once both branches are cancelled, so with one
+		// branch now drained instead of cancelled this counter can never
+		// increment again -- release is observed via discardedResponses
+		// (the module-boundary recorder) below instead.
+		let firstBodyDirectCancelCount = 0;
 		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
 			const upstreamRequest =
 				input instanceof Request ? input : new Request(input);
@@ -2734,7 +2790,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 				upstreamRequest.headers.get("x-api-key")?.slice(4) ?? "";
 			fetchedAccounts.push(accountId);
 			return accountId === first.id
-				? neverEndingJsonResponse(() => firstBodyCancelCount++)
+				? neverEndingJsonResponse(() => firstBodyDirectCancelCount++)
 				: sseResponse(byteStream(SUCCESS));
 		}) as unknown as typeof fetch;
 
@@ -2747,7 +2803,11 @@ describe("downstream Anthropic Messages SSE routing", () => {
 
 		expect(fetchedAccounts).toEqual([first.id, second.id]);
 		expect(body).toEndWith(SUCCESS);
-		expect(firstBodyCancelCount).toBe(1);
+		// The drain is fire-and-forget (settles on microtasks after
+		// handleProxy returns), so yield before observing release.
+		await Bun.sleep(0);
+		expect(discardedResponses.length).toBe(1);
+		expect(firstBodyDirectCancelCount).toBe(0);
 		expect(elapsedMs).toBeGreaterThanOrEqual(100);
 		expect(elapsedMs).toBeLessThan(150);
 		expect(first.paused).toBe(false);
@@ -4053,9 +4113,11 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		}) as unknown as typeof fetch;
 
 		const request = makeRequest(abortController.signal);
-		await expect(
-			handleProxy(request, new URL(request.url), ctx),
-		).rejects.toBeDefined();
+		// Client disconnect now resolves with nginx's 499 instead of rejecting
+		// (upstream cec5b5b99f, merged in the v3.5.48 sync). The contract under
+		// test is unchanged: one upstream attempt, no failover, no penalty.
+		const result = await handleProxy(request, new URL(request.url), ctx);
+		expect(result.status).toBe(499);
 
 		expect(fetchCount).toBe(1);
 		expect(cancelCount).toBe(1);

@@ -67,6 +67,19 @@ export {
 	readCodexPacingBypassPercent,
 } from "./cache-pacing";
 export {
+	CircuitBreaker,
+	type CircuitKey,
+	type CircuitSnapshotEntry,
+	type CircuitState,
+	circuitKeyFor,
+	type FailureKind,
+	forceClose as forceCloseCircuit,
+	getDefaultCircuitBreaker as getDefaultCircuitBreakerProxy,
+	recordSuccess as recordCircuitSuccess,
+	resetDefaultCircuitBreaker as resetDefaultCircuitBreakerProxy,
+	shouldCountAsCircuitFailure,
+} from "./circuit-breaker";
+export {
 	type DegradedOwnerDirectiveInput,
 	type DegradedOwnerEvidenceInput,
 	DegradedOwnerOverlay,

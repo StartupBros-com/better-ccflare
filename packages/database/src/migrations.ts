@@ -293,7 +293,8 @@ export function ensureSchema(db: Database): void {
 			applied_model TEXT,
 			project_attribution_source TEXT,
 			agent_attribution_source TEXT,
-			stream_terminal_state TEXT
+			stream_terminal_state TEXT,
+			client_session_id TEXT
 		)
 	`);
 
@@ -667,6 +668,27 @@ export function ensureSchema(db: Database): void {
 				ON DELETE CASCADE
 		)
 	`);
+
+	// Create instance_heartbeats table: per-process heartbeat for the
+	// multi-instance guard (see packages/database/src/multi-instance-guard.ts
+	// and tombii/better-ccflare#351). Each instance writes one row and
+	// refreshes `last_heartbeat` on a tick. Rows older than the expiry
+	// window are treated as dead predecessors so a crash never blocks a
+	// legitimate restart.
+	db.run(`
+		CREATE TABLE IF NOT EXISTS instance_heartbeats (
+			instance_id TEXT PRIMARY KEY,
+			hostname TEXT NOT NULL,
+			pid INTEGER NOT NULL,
+			started_at INTEGER NOT NULL,
+			last_heartbeat INTEGER NOT NULL,
+			node_version TEXT NOT NULL,
+			db_dialect TEXT NOT NULL
+		)
+	`);
+	db.run(
+		`CREATE INDEX IF NOT EXISTS idx_instance_heartbeats_last_heartbeat ON instance_heartbeats(last_heartbeat)`,
+	);
 }
 
 /**
@@ -1687,6 +1709,14 @@ export function runMigrations(db: Database, dbPath?: string): void {
 				"ALTER TABLE requests ADD COLUMN project_attribution_source TEXT",
 			).run();
 			log.info("Added project_attribution_source column to requests table");
+		}
+
+		// Add client_session_id column if it doesn't exist
+		if (!requestsColumnNames.includes("client_session_id")) {
+			db.prepare(
+				"ALTER TABLE requests ADD COLUMN client_session_id TEXT",
+			).run();
+			log.info("Added client_session_id column to requests table");
 		}
 
 		// Add agent_attribution_source column if it doesn't exist

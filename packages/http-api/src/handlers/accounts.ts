@@ -66,6 +66,10 @@ const RATE_LIMIT_REASONS = new Set<RateLimitReason>([
 	"upstream_402_payment_required",
 	"model_fallback_429",
 	"all_models_exhausted_429",
+	// Fresh-usage-proven model-family-scoped 429 (see proxy-operations.ts);
+	// listed so a persisted row's reason survives the API read instead of
+	// being nulled by toRateLimitReason.
+	"model_scoped_429",
 	"upstream_529_overloaded_with_reset",
 	"upstream_529_overloaded_no_reset",
 	"out_of_credits",
@@ -74,6 +78,11 @@ const RATE_LIMIT_REASONS = new Set<RateLimitReason>([
 	// an upstream 402 (Grok Build credits exhausted) with this typed reason
 	// instead of relabeling it as a generic 429.
 	"xai_capacity_402",
+	// Never actually written to accounts.rate_limited_reason today (a
+	// windowless 429 does not bench the account), but listed so this set stays
+	// a faithful mirror of the union and cannot silently null the value if a
+	// future path ever persists it.
+	"windowless_429",
 ]);
 
 function toRateLimitReason(v: string | null): RateLimitReason | null {
