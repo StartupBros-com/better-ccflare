@@ -1415,6 +1415,24 @@ export default async function startServer(options?: {
 			}
 
 			if (freeResult?.data) {
+				// Re-check endpoint eligibility AFTER the network fetch: a
+				// custom_endpoint switch while the wham request was in flight
+				// must not resurrect a subscription snapshot post-teardown
+				// (pro-gate round 3). This narrows the race from the fetch
+				// duration to milliseconds; full closure needs per-registration
+				// identity (follow-up issue).
+				const currentRow = await dbOps.getAccount(accountId);
+				if (
+					!currentRow ||
+					!isCodexSubscriptionEndpoint(
+						resolveCodexEndpoint(currentRow.custom_endpoint, currentRow.name),
+					)
+				) {
+					return {
+						success: false,
+						message: `Account '${account.name}' switched endpoints during the refresh — discarded the subscription usage snapshot`,
+					};
+				}
 				usageCache.set(accountId, freeResult.data);
 
 				const windows = [
@@ -1441,27 +1459,21 @@ export default async function startServer(options?: {
 						: windows.length > 0
 							? Math.min(...windows.map((w) => w.resetMs))
 							: null;
-				const cooldownUntilMs =
-					account.rate_limited_until != null
-						? Number(account.rate_limited_until)
-						: null;
-				const existingResetMs =
-					account.rate_limit_reset != null
-						? Number(account.rate_limit_reset)
-						: null;
-				// While a real response-endpoint cooldown is active, never pull an
-				// already-later reset earlier on introspection data alone.
-				const preserveExisting =
-					cooldownUntilMs !== null &&
-					cooldownUntilMs > Date.now() &&
-					existingResetMs !== null &&
-					candidateMs !== null &&
-					existingResetMs > candidateMs;
-				if (candidateMs !== null && !preserveExisting) {
+				if (candidateMs !== null) {
+					// Preservation decided INSIDE the UPDATE against the current
+					// row (pro-gate round 3): while a response-endpoint cooldown
+					// is active, an already-later reset — possibly persisted by a
+					// concurrent real 429 after our row read — must not be pulled
+					// earlier on introspection data alone.
 					try {
 						await db.run(
-							"UPDATE accounts SET rate_limit_reset = ? WHERE id = ?",
-							[candidateMs, account.id],
+							`UPDATE accounts SET rate_limit_reset = ?
+							 WHERE id = ?
+							   AND NOT (
+							     rate_limited_until IS NOT NULL AND rate_limited_until > ?
+							     AND rate_limit_reset IS NOT NULL AND rate_limit_reset > ?
+							   )`,
+							[candidateMs, account.id, Date.now(), candidateMs],
 						);
 					} catch (error) {
 						log.warn(
