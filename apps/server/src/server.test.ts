@@ -1,5 +1,7 @@
 import { describe, expect, it } from "bun:test";
+import { CODEX_DEFAULT_ENDPOINT } from "@better-ccflare/providers";
 import {
+	accountSupportsRefreshBackedUsagePolling,
 	resolveDashboardRoute,
 	supportsRefreshBackedUsagePolling,
 } from "./server";
@@ -8,13 +10,66 @@ describe("supportsRefreshBackedUsagePolling", () => {
 	it("includes pollable OAuth providers that need token refresh", () => {
 		expect(supportsRefreshBackedUsagePolling("anthropic")).toBe(true);
 		expect(supportsRefreshBackedUsagePolling("xai")).toBe(true);
+		expect(supportsRefreshBackedUsagePolling("codex")).toBe(true);
 	});
 
 	it("does not include providers whose usage is not polled through this path", () => {
-		expect(supportsRefreshBackedUsagePolling("codex")).toBe(false);
 		expect(supportsRefreshBackedUsagePolling("qwen")).toBe(false);
 		expect(supportsRefreshBackedUsagePolling("nanogpt")).toBe(false);
 		expect(supportsRefreshBackedUsagePolling(null)).toBe(false);
+	});
+});
+
+describe("accountSupportsRefreshBackedUsagePolling", () => {
+	it("allows codex accounts with no custom endpoint (defaults to the subscription backend)", () => {
+		expect(
+			accountSupportsRefreshBackedUsagePolling({
+				provider: "codex",
+				custom_endpoint: null,
+			}),
+		).toBe(true);
+	});
+
+	it("allows codex accounts explicitly pointed at the subscription backend", () => {
+		expect(
+			accountSupportsRefreshBackedUsagePolling({
+				provider: "codex",
+				custom_endpoint: CODEX_DEFAULT_ENDPOINT,
+			}),
+		).toBe(true);
+	});
+
+	it("excludes codex accounts pointed at a custom OpenAI-compatible endpoint", () => {
+		expect(
+			accountSupportsRefreshBackedUsagePolling({
+				provider: "codex",
+				custom_endpoint: "https://api.openai.com/v1/responses",
+			}),
+		).toBe(false);
+	});
+
+	it("allows anthropic accounts regardless of custom_endpoint", () => {
+		expect(
+			accountSupportsRefreshBackedUsagePolling({
+				provider: "anthropic",
+				custom_endpoint: "https://example.com/whatever",
+			}),
+		).toBe(true);
+		expect(
+			accountSupportsRefreshBackedUsagePolling({
+				provider: "anthropic",
+				custom_endpoint: null,
+			}),
+		).toBe(true);
+	});
+
+	it("excludes providers that don't support refresh-backed usage polling at all", () => {
+		expect(
+			accountSupportsRefreshBackedUsagePolling({
+				provider: "qwen",
+				custom_endpoint: null,
+			}),
+		).toBe(false);
 	});
 });
 

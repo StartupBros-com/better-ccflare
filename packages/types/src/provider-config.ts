@@ -124,7 +124,7 @@ export const PROVIDER_CONFIG: Record<ProviderName, ProviderConfig> = {
 	},
 	[PROVIDER_NAMES.CODEX]: {
 		requiresSessionTracking: true, // Codex has 5h/7d usage windows like Anthropic OAuth
-		supportsUsageTracking: false, // Usage tracked via response headers, not a polling API
+		supportsUsageTracking: true, // Polled for free from the ChatGPT backend's wham/usage endpoint; x-codex-* response headers remain a passive fallback
 		supportsOAuth: true, // Codex uses OpenAI OAuth with PKCE
 		defaultEndpoint: "https://chatgpt.com/backend-api/codex/responses",
 	},

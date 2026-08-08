@@ -25,6 +25,7 @@ import {
 	getRepresentativeNanoGPTWindow,
 	type NanoGPTUsageData,
 } from "./nanogpt-usage-fetcher";
+import { fetchCodexUsageData } from "./providers/codex/api-usage";
 import {
 	fetchXaiUsageData,
 	getRepresentativeXaiUtilization,
@@ -1104,6 +1105,48 @@ class UsageCache {
 					);
 					return { success: true, retryAfterMs: null };
 				}
+			} else if (provider === "codex") {
+				// Codex/ChatGPT subscription usage via the free wham/usage
+				// introspection endpoint — no quota consumed, unlike the
+				// quota-consuming ping in on-demand-fetch.ts.
+				const result = await fetchCodexUsageData(token);
+				if (result.data) {
+					// Snapshot before clearing — needed for the capacity-restored guard below.
+					const wasRateLimited = this.usageRateLimitedUntil.has(accountId);
+					this.usageRateLimitedUntil.delete(accountId);
+					const callback = this.windowResetCallbacks.get(accountId);
+					if (callback)
+						this.notifyWindowReset(accountId, result.data, "codex", callback);
+					this.setAuthoritative(accountId, result.data);
+					const snapshotCb = this.snapshotCallbacks.get(accountId);
+					if (snapshotCb) snapshotCb(accountId, result.data as UsageData);
+					const utilization = getRepresentativeUtilization(
+						result.data as UsageData,
+					);
+					// Notify capacity-restored listener only when the account was
+					// previously rate-limited and usage now shows available capacity
+					// (<100%). Mirrors the anthropic branch's seat-reassignment handling.
+					if (utilization !== null && utilization < 100 && wasRateLimited) {
+						const capacityCallback =
+							this.capacityRestoredCallbacks.get(accountId);
+						if (capacityCallback) capacityCallback(accountId);
+					}
+					const window = getRepresentativeWindow(result.data as UsageData);
+					log.debug(
+						`Successfully fetched Codex usage data for account ${accountId}: ${utilization}% (${window} window)`,
+					);
+					return { success: true, retryAfterMs: null };
+				}
+				if (result.retryAfterMs != null && result.retryAfterMs > 0) {
+					this.usageRateLimitedUntil.set(
+						accountId,
+						Date.now() + result.retryAfterMs,
+					);
+				} else if (result.retryAfterMs == null) {
+					// Non-429 failure: clear any stale rate-limit marker
+					this.usageRateLimitedUntil.delete(accountId);
+				}
+				return { success: false, retryAfterMs: result.retryAfterMs };
 			} else {
 				// Default to Anthropic usage data
 				const result = await fetchUsageData(token);

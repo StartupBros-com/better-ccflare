@@ -42,9 +42,12 @@ import { Logger, setConsoleLogging } from "@better-ccflare/logger";
 import { handleResponsesRequest } from "@better-ccflare/openai-responses-adapter";
 import {
 	CODEX_DEFAULT_ENDPOINT,
+	fetchCodexUsageData,
 	fetchCodexUsageOnDemand,
 	getProvider,
 	getRepresentativeUtilizationForProvider,
+	isCodexSubscriptionEndpoint,
+	resolveCodexEndpoint,
 	usageCache,
 } from "@better-ccflare/providers";
 import {
@@ -141,7 +144,25 @@ const MEMORY_GROWTH_ERROR_BYTES = 1024 * 1024 * 1024;
 export function supportsRefreshBackedUsagePolling(
 	provider: string | null | undefined,
 ): boolean {
-	return provider === "anthropic" || provider === "xai";
+	return provider === "anthropic" || provider === "xai" || provider === "codex";
+}
+
+/**
+ * Account-level refresh-backed usage polling gate. Unlike Anthropic and xAI,
+ * Codex's free wham/usage endpoint only exists on the ChatGPT subscription
+ * backend — accounts pointed at a custom OpenAI-compatible endpoint have no
+ * equivalent and must not be polled through this path.
+ */
+export function accountSupportsRefreshBackedUsagePolling(account: {
+	provider: string | null;
+	custom_endpoint?: string | null;
+}): boolean {
+	if (!supportsRefreshBackedUsagePolling(account.provider)) return false;
+	if (account.provider !== "codex") return true;
+	return (
+		!account.custom_endpoint ||
+		isCodexSubscriptionEndpoint(resolveCodexEndpoint(account.custom_endpoint))
+	);
 }
 
 /**
@@ -1293,7 +1314,7 @@ export default async function startServer(options?: {
 			);
 			return false;
 		}
-		if (!supportsRefreshBackedUsagePolling(account.provider)) {
+		if (!accountSupportsRefreshBackedUsagePolling(account)) {
 			log.warn(
 				`Cannot restart usage polling: account ${account.name} does not support refresh-backed usage polling`,
 			);
@@ -1318,11 +1339,12 @@ export default async function startServer(options?: {
 		return true;
 	});
 
-	// Register this server's codex on-demand usage refresher. Codex does not
-	// expose a free usage endpoint (unlike Anthropic's /api/oauth/usage), so
-	// each call sends a tiny upstream request and parses the x-codex-* headers
-	// from the response. The subscription endpoint rejects output-token caps,
-	// so fetchCodexUsageOnDemand aborts and cancels immediately after headers.
+	// Register this server's codex usage refresher. Subscription-backend
+	// accounts try the free wham/usage introspection endpoint first (see
+	// fetchCodexUsageData) — no quota consumed. If that yields no data, or
+	// for accounts on a custom OpenAI-compatible endpoint (which has no
+	// wham/usage equivalent), fall back to the quota-consuming on-demand ping
+	// that parses x-codex-* headers off a tiny upstream request.
 	registerCodexUsageRefresher(serverId, async (accountId: string) => {
 		const account = await dbOps.getAccount(accountId);
 		if (!account) {
@@ -1356,6 +1378,76 @@ export default async function startServer(options?: {
 				success: false,
 				message: `Could not refresh access token for '${account.name}': ${message}`,
 			};
+		}
+
+		const resolvedEndpoint = resolveCodexEndpoint(
+			account.custom_endpoint,
+			account.name,
+		);
+		if (isCodexSubscriptionEndpoint(resolvedEndpoint)) {
+			let freeResult: Awaited<ReturnType<typeof fetchCodexUsageData>> | null =
+				null;
+			try {
+				freeResult = await fetchCodexUsageData(accessToken);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				log.warn(
+					`Codex usage refresh: free usage endpoint failed for ${account.name}, falling back to on-demand ping: ${message}`,
+				);
+			}
+
+			if (freeResult?.data) {
+				usageCache.set(accountId, freeResult.data);
+
+				const resetTimesMs = [
+					freeResult.data.five_hour?.resets_at,
+					freeResult.data.seven_day?.resets_at,
+				]
+					.map((iso) => (iso ? new Date(iso).getTime() : Number.NaN))
+					.filter((ms) => Number.isFinite(ms));
+				if (resetTimesMs.length > 0) {
+					try {
+						await db.run(
+							"UPDATE accounts SET rate_limit_reset = ? WHERE id = ?",
+							[Math.min(...resetTimesMs), account.id],
+						);
+					} catch (error) {
+						log.warn(
+							`Codex usage refresh: failed to update rate_limit_reset for ${account.name}:`,
+							error,
+						);
+					}
+				}
+
+				const fiveHour = freeResult.data.five_hour?.utilization ?? 0;
+				const sevenDay = freeResult.data.seven_day?.utilization ?? 0;
+				// The free endpoint reports quota utilization but knows nothing of
+				// live cooldowns on the responses endpoint (429/529 set
+				// rate_limited_until via real traffic). The old ping-based path
+				// surfaced those implicitly through its own HTTP status — keep
+				// that honesty by consulting the account row too.
+				const cooldownActive =
+					account.rate_limited_until != null &&
+					Number(account.rate_limited_until) > Date.now();
+				const isRateLimited =
+					fiveHour >= 100 || sevenDay >= 100 || cooldownActive;
+				log.info(
+					`Codex usage refreshed (free endpoint) for '${account.name}': 5h=${fiveHour}%, 7d=${sevenDay}%${
+						isRateLimited ? " (rate-limited)" : ""
+					}`,
+				);
+
+				// Mirror the on-demand path's message tone: 429-equivalent
+				// exhaustion must not read as an unqualified success. See
+				// tombii's PR #219 review note.
+				const message = isRateLimited
+					? `Usage refreshed for '${account.name}' — account is rate limited (5h: ${fiveHour}%, 7d: ${sevenDay}%).`
+					: `Usage refreshed for '${account.name}' (5h: ${fiveHour}%, 7d: ${sevenDay}%).`;
+
+				return { success: true, message };
+			}
+			// Free fetch yielded no data (or errored) — fall through to the
+			// quota-consuming ping below.
 		}
 
 		const endpoint = account.custom_endpoint ?? CODEX_DEFAULT_ENDPOINT;
@@ -1762,9 +1854,11 @@ Available endpoints:
 	// Start usage polling for refresh-backed providers (regardless of paused status).
 	// Anthropic polls Claude quota windows; xAI polls Grok Build credits via
 	// grok.com gRPC-web and may need to refresh an expired imported Grok CLI token
-	// before the first usage fetch.
+	// before the first usage fetch; Codex polls the free ChatGPT wham/usage
+	// endpoint, but only for accounts on the subscription backend — custom
+	// OpenAI-compatible endpoints have no equivalent and are excluded here.
 	const refreshBackedUsageAccounts = accounts.filter((a) =>
-		supportsRefreshBackedUsagePolling(a.provider),
+		accountSupportsRefreshBackedUsagePolling(a),
 	);
 	if (refreshBackedUsageAccounts.length > 0) {
 		log.info(

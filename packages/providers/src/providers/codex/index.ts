@@ -1,3 +1,11 @@
+export {
+	CODEX_WHAM_USAGE_ENDPOINT,
+	CODEX_WHAM_USAGE_FALLBACK_ENDPOINT,
+	extractChatGptAccountId,
+	fetchCodexUsageData,
+	mapWhamUsageResponse,
+	resetCodexUsageEndpointForTest,
+} from "./api-usage";
 export type { CodexDeviceFlowResult, CodexTokenResponse } from "./device-oauth";
 export {
 	initiateCodexDeviceFlow,

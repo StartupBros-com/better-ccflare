@@ -104,8 +104,11 @@ function normalizeCodexUsageData(usage: UsageData): UsageData | null {
 	) {
 		seven_day = { utilization: 0, resets_at: null };
 	}
+	// Spread the source first so polling-only extras (plan_type,
+	// credits_balance, code_review_used_percent/_resets_at from the free
+	// wham/usage endpoint) survive normalization and reach API consumers.
 	return five_hour.resets_at !== null || seven_day.resets_at !== null
-		? { five_hour, seven_day }
+		? { ...usage, five_hour, seven_day }
 		: null;
 }
 

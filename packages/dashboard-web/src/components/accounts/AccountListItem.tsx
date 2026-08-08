@@ -458,7 +458,7 @@ export function AccountListItem({
 							}}
 							title={
 								account.provider === "codex"
-									? "Refresh usage data (sends one minimal Codex request — consumes a small slice of quota)"
+									? "Refresh usage data (free ChatGPT usage endpoint; falls back to a minimal quota-consuming request on custom endpoints or when the free endpoint fails)"
 									: "Refresh usage data (restarts usage polling and refreshes token if expired)"
 							}
 						>
