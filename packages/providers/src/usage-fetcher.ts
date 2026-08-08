@@ -25,6 +25,7 @@ import {
 	getRepresentativeNanoGPTWindow,
 	type NanoGPTUsageData,
 } from "./nanogpt-usage-fetcher";
+import { fetchCodexUsageData } from "./providers/codex/api-usage";
 import {
 	fetchXaiUsageData,
 	getRepresentativeXaiUtilization,
@@ -1161,6 +1162,51 @@ class UsageCache {
 					);
 					return { success: true, retryAfterMs: null };
 				}
+			} else if (provider === "codex") {
+				// Codex/ChatGPT subscription usage via the free wham/usage
+				// introspection endpoint — no quota consumed, unlike the
+				// quota-consuming ping in on-demand-fetch.ts.
+				const result = await fetchCodexUsageData(token);
+				if (!this.tokenProviders.has(accountId)) {
+					// Polling was stopped while this fetch was in flight (e.g. the
+					// account's endpoint changed away from the subscription
+					// backend): discard the snapshot rather than resurrecting
+					// stale subscription quota after teardown (pro-gate round 2).
+					return { success: false, retryAfterMs: null };
+				}
+				if (result.data) {
+					this.usageRateLimitedUntil.delete(accountId);
+					const callback = this.windowResetCallbacks.get(accountId);
+					if (callback)
+						this.notifyWindowReset(accountId, result.data, "codex", callback);
+					this.setAuthoritative(accountId, result.data);
+					const snapshotCb = this.snapshotCallbacks.get(accountId);
+					if (snapshotCb) snapshotCb(accountId, result.data as UsageData);
+					const utilization = getRepresentativeUtilization(
+						result.data as UsageData,
+					);
+					// Deliberately NO capacity-restored callback for codex (unlike
+					// the anthropic branch): a 429 here is the wham INTROSPECTION
+					// endpoint throttling, which says nothing about cooldowns on
+					// the responses endpoint — firing the callback could clear a
+					// live rate_limited_until and re-route a cooling account
+					// (pro-gate P1). Cooldowns clear on their natural expiry.
+					const window = getRepresentativeWindow(result.data as UsageData);
+					log.debug(
+						`Successfully fetched Codex usage data for account ${accountId}: ${utilization}% (${window} window)`,
+					);
+					return { success: true, retryAfterMs: null };
+				}
+				if (result.retryAfterMs != null && result.retryAfterMs > 0) {
+					this.usageRateLimitedUntil.set(
+						accountId,
+						Date.now() + result.retryAfterMs,
+					);
+				} else if (result.retryAfterMs == null) {
+					// Non-429 failure: clear any stale rate-limit marker
+					this.usageRateLimitedUntil.delete(accountId);
+				}
+				return { success: false, retryAfterMs: result.retryAfterMs };
 			} else {
 				// Default to Anthropic usage data
 				const result = await fetchUsageData(token);

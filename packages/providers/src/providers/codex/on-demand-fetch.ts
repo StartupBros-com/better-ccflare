@@ -34,9 +34,11 @@ export interface CodexUsageRefreshFetchResult {
  * rejects `max_output_tokens`; custom API-compatible endpoints retain the
  * legacy one-token cap.
  *
- * Unlike Anthropic's `/api/oauth/usage`, OpenAI does not expose a free
- * usage-introspection endpoint, so this call always consumes a small slice
- * of the user's Codex quota.
+ * The ChatGPT backend DOES expose a free usage-introspection endpoint
+ * (`wham/usage`, see api-usage.ts's `fetchCodexUsageData`), used to poll
+ * subscription accounts without spending quota. This quota-consuming ping
+ * remains in use for custom OpenAI-compatible endpoints (which have no
+ * wham/usage equivalent) and as a fallback when the free endpoint fails.
  */
 export async function fetchCodexUsageOnDemand(
 	accessToken: string,
