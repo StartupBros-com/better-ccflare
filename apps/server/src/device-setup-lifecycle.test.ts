@@ -56,6 +56,7 @@ mock.module("@better-ccflare/proxy", () => {
 		DegradedModeObservability: class {},
 		DegradedOwnerOverlay: class {},
 		drainUsageCollector: async () => {},
+		forceCloseCircuit: () => {},
 		getModelCatalog: () => null,
 		getUsageCollectorHealth: () => null,
 		getValidAccessToken: async () => null,

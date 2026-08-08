@@ -2,9 +2,47 @@ import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import type { Provider } from "@better-ccflare/providers";
 import type { Account, RequestMeta } from "@better-ccflare/types";
 import { CACHE_REPLAY_MODEL_HEADER } from "../../cache-transport-staging";
-import { proxyWithAccount } from "../proxy-operations";
 import type { ProxyContext } from "../proxy-types";
 import { RoutingAttemptLedger } from "../routing-attempt-ledger";
+
+// Records every response handed to cancelDiscardedResponseBody, so the
+// "keeps the edit pre-send when thinking is enabled, but retries stripped
+// if Claude still rejects it" test below can observe the release. Since the
+// v3.5.48 sync, the clear_thinking reactive-retry discard
+// (`await discardUpstreamBody(rawResponse)` in proxy-operations.ts) migrated
+// from a real `body.cancel()` to `cancelDiscardedResponseBody` (chunked
+// drain-to-done -- body.cancel() is a measured leak no-op on released Bun).
+// An instance-level `response.body.cancel` override can no longer see this
+// release, so we spy at the module boundary instead. This must be
+// registered before `proxy-operations` (and its transitive
+// `discard-body-cancel` import) loads, hence the dynamic import below
+// instead of a static top-level one.
+const discardedResponses: Response[] = [];
+async function drainBody(body: ReadableStream<Uint8Array>): Promise<void> {
+	const reader = body.getReader();
+	try {
+		while (true) {
+			const { done } = await reader.read();
+			if (done) return;
+		}
+	} finally {
+		reader.releaseLock();
+	}
+}
+mock.module("../discard-body-cancel", () => ({
+	// Also re-exported for response-processor.ts, which imports `drainBody`
+	// directly (not through `cancelDiscardedResponseBody`).
+	drainBody,
+	cancelDiscardedResponseBody(response: Response | null | undefined): void {
+		if (!response) return;
+		const body = response.body;
+		if (!body || body.locked) return;
+		discardedResponses.push(response);
+		void drainBody(body).catch(() => {});
+	},
+}));
+
+const { proxyWithAccount } = await import("../proxy-operations");
 
 // Anthropic account fixture: clear_thinking context management is
 // Anthropic-specific (Claude Code sends it on newer model families).
@@ -128,8 +166,8 @@ function jsonResponse(body: object, status: number) {
 const CLEAR_THINKING_ERROR_MESSAGE =
 	"`clear_thinking_20251015` strategy requires `thinking` to be enabled or adaptive";
 
-function clearThinkingRejectionResponse(onCancel?: () => void): Response {
-	const response = jsonResponse(
+function clearThinkingRejectionResponse(): Response {
+	return jsonResponse(
 		{
 			type: "error",
 			error: {
@@ -139,16 +177,6 @@ function clearThinkingRejectionResponse(onCancel?: () => void): Response {
 		},
 		400,
 	);
-
-	if (onCancel && response.body) {
-		const cancel = response.body.cancel.bind(response.body);
-		response.body.cancel = (...args) => {
-			onCancel();
-			return cancel(...args);
-		};
-	}
-
-	return response;
 }
 
 function invalidSignatureResponse(): Response {
@@ -563,7 +591,10 @@ describe("proxyWithAccount clear_thinking context-management handling", () => {
 	});
 
 	it("keeps the edit pre-send when thinking is enabled, but retries stripped if Claude still rejects it", async () => {
-		let rejectedBodyCancelled = false;
+		// Reset the shared discard-site recorder (module-scoped, see the
+		// mock.module("../discard-body-cancel", ...) call above) so this
+		// assertion reflects only this test's request.
+		discardedResponses.length = 0;
 		const { upstreamBodies } = await runProxyCapturingBodies(
 			{
 				model: "claude-opus-4-8",
@@ -577,19 +608,17 @@ describe("proxyWithAccount clear_thinking context-management handling", () => {
 				},
 				messages: [{ role: "user", content: "hello" }],
 			},
-			[
-				clearThinkingRejectionResponse(() => {
-					rejectedBodyCancelled = true;
-				}),
-				successResponse("claude-opus-4-8"),
-			],
+			[clearThinkingRejectionResponse(), successResponse("claude-opus-4-8")],
 			makeAccount(),
 			makeProxyContext(),
 			false,
 		);
 
 		expect(upstreamBodies).toHaveLength(2);
-		expect(rejectedBodyCancelled).toBe(true);
+		// The drain is fire-and-forget (settles on microtasks after
+		// proxyWithAccount returns), so yield before observing release.
+		await Bun.sleep(0);
+		expect(discardedResponses.length).toBe(1);
 		// First send kept the client's request intact.
 		expect(upstreamBodies[0].context_management).toBeDefined();
 		// Reactive retry stripped only the edit; thinking config is untouched.

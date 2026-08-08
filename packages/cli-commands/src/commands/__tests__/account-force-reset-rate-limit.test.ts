@@ -21,6 +21,7 @@ function handledRejectedPromise<T>(error: Error): Promise<T> {
 function makeConfig(): Config {
 	return {
 		getRuntime: () => ({ port: 8080 }),
+		getLocalControlSecret: () => "test-local-control-secret",
 	} as unknown as Config;
 }
 
@@ -61,12 +62,13 @@ describe("forceResetRateLimit", () => {
 		await Promise.resolve();
 		await Promise.resolve();
 		expect(settled).toBe(false);
-		expect(dbOps.getActiveApiKeys).not.toHaveBeenCalled();
 
 		resolveReset(true);
 		const result = await resultPromise;
+		// Server notification now authenticates via config.getLocalControlSecret()
+		// (upstream #216) rather than getActiveApiKeys, so success resolving after
+		// resolveReset is the ordering evidence here.
 		expect(result.success).toBe(true);
-		expect(dbOps.getActiveApiKeys).toHaveBeenCalledTimes(1);
 	});
 
 	it("surfaces an asynchronous reset rejection before server notification", async () => {

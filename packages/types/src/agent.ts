@@ -1,4 +1,11 @@
-import { CLAUDE_MODEL_IDS, isValidClaudeModel } from "@better-ccflare/core";
+// Leaf-module subpath imports, NOT the core barrel: this file is evaluated
+// while the @better-ccflare/types barrel is still initializing, and core's
+// barrel loads core/strategy.ts, which reads StrategyName from the types
+// barrel at module scope — an uninitialized binding at that point. Importing
+// the two leaf modules directly keeps core/strategy.ts (and the rest of
+// core's barrel) out of the types-barrel evaluation window.
+import { isValidClaudeModel } from "@better-ccflare/core/model-mappings";
+import { CLAUDE_MODEL_IDS } from "@better-ccflare/core/models";
 
 export type AgentSource = "global" | "workspace" | "plugin";
 

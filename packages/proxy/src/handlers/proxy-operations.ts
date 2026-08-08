@@ -1,9 +1,11 @@
 import {
+	type AccountUsageSnapshot,
 	getInPlaceRetryDrainTimeoutMs,
 	getModelFamily,
 	getModelList,
 	getOverloadRetryConfig,
 	isOfficialXaiEndpoint,
+	isUsageExhausted,
 	logError,
 	ProviderError,
 	TIME_CONSTANTS,
@@ -108,6 +110,7 @@ import {
 } from "../session-account-observer";
 import { combineChunks } from "../stream-tee";
 import { isModelRewrite } from "../worker-messages";
+import { cancelDiscardedResponseBody } from "./discard-body-cancel";
 import {
 	ERROR_MESSAGES,
 	isInternalProbe,
@@ -124,6 +127,7 @@ import {
 } from "./rate-limit-scope";
 import { makeProxyRequest, validateProviderPath } from "./request-handler";
 import { handleProxyError, processProxyResponse } from "./response-processor";
+import { isRetryable429 } from "./retryable-429";
 import type { RoutingAttemptLedger } from "./routing-attempt-ledger";
 import { createProtectedAnthropicOverloadResponse } from "./routing-terminal";
 import { getValidAccessToken } from "./token-manager";
@@ -996,6 +1000,11 @@ async function isInvalidThinkingSignatureError(
 	const contentType = response.headers.get("content-type");
 	if (!contentType?.includes("application/json")) return false;
 
+	// Cloned only after the content-type gate above. Cloning before it would
+	// tee the body and then return early for every non-JSON body, stranding
+	// that copy unread — the tee keeps buffering for whoever consumes the
+	// original. Reachable in normal operation: providers such as Qwen do
+	// return non-JSON error bodies. See issue #356.
 	const json = (await readJson(response)) as {
 		error?: { message?: unknown };
 	} | null;
@@ -1108,6 +1117,11 @@ async function isCacheControlRejectionError(
 	const contentType = response.headers.get("content-type");
 	if (!contentType?.includes("application/json")) return false;
 
+	// Cloned only after the content-type gate above. Cloning before it would
+	// tee the body and then return early for every non-JSON body, stranding
+	// that copy unread — the tee keeps buffering for whoever consumes the
+	// original. Reachable in normal operation: providers such as Qwen do
+	// return non-JSON error bodies. See issue #356.
 	const json = (await readJson(response)) as {
 		error?: { message?: unknown };
 		message?: unknown;
@@ -1256,6 +1270,11 @@ export async function isModelUnavailableError(
 	const contentType = response.headers.get("content-type");
 	if (!contentType?.includes("application/json")) return false;
 
+	// Cloned only after the content-type gate above. Cloning before it would
+	// tee the body and then return early for every non-JSON body, stranding
+	// that copy unread — the tee keeps buffering for whoever consumes the
+	// original. Reachable in normal operation: providers such as Qwen do
+	// return non-JSON error bodies. See issue #356.
 	const json = (await readJson(response)) as {
 		error?: { type?: unknown; code?: unknown; message?: unknown };
 	} | null;
@@ -1281,10 +1300,10 @@ export async function isModelUnavailableError(
 }
 
 /**
- * Cancel an abandoned upstream response body so Bun releases its socket and
- * native read buffer immediately.
+ * Release an abandoned upstream response body so Bun frees its socket and
+ * native read buffer.
  *
- * A `fetch()` Response body that is neither read to EOF nor cancelled keeps
+ * A `fetch()` Response body that is neither read to EOF nor released keeps
  * that memory committed indefinitely. On the proxy's failover/retry paths we
  * obtain an upstream Response and then discard it: return `null` to try the
  * next account, or overwrite `rawResponse`/`response` with a retry, without
@@ -1292,27 +1311,18 @@ export async function isModelUnavailableError(
  * ratchets up with every 429/401/529 failover under load. Calling this
  * before every such drop releases the buffer.
  *
- * Safe to call with any Response/null: skips a `null`/locked body (locked
- * means a reader already owns it, so it will be drained or was cloned) and
- * swallows the harmless error from a body that is already cancelled/errored.
+ * Delegates to the chunked-drain primitive (discard-body-cancel.ts):
+ * `body.cancel()` is a measured NO-OP on every released Bun (78–83 KB/req
+ * leaked, indistinguishable from not calling it — see the bench notes in
+ * that module), while draining to `done` actually closes the upstream
+ * source. The drain is fire-and-forget inside the helper, so this never
+ * blocks the failover path; locked bodies (a reader/clone owns them) and
+ * null bodies are skipped there.
  */
 export async function discardUpstreamBody(
 	response: Response | null | undefined,
 ): Promise<void> {
-	const body = response?.body;
-	if (!body || body.locked) return;
-	try {
-		// Fire without awaiting settlement: per the Streams spec, cancelling
-		// one branch of a tee()'d body never settles until every sibling
-		// branch is cancelled or fully read, so awaiting here can hang
-		// forever if a sibling clone was abandoned (same rationale as
-		// discardUnusedResponse below).
-		body.cancel().catch(() => {
-			// Body already cancelled/errored -- nothing left to release.
-		});
-	} catch {
-		// Body may already be locked/disturbed; ignore synchronous throws too.
-	}
+	cancelDiscardedResponseBody(response);
 }
 
 /**
@@ -1635,6 +1645,10 @@ export async function proxyUnauthenticated(
 			headers,
 			createBodyStream,
 			!!req.body,
+			// Abort upstream when the client disconnects; this path builds no
+			// Request object, so the signal has to be passed explicitly.
+			// routingSignal already falls back to req.signal when there is no
+			// active pre-commit rescue, so this chain covers both cases.
 			attemptCommitment?.signal ?? routingSignal,
 		);
 
@@ -1674,6 +1688,7 @@ export async function proxyUnauthenticated(
 				requestHeaders: req.headers,
 				requestBody: requestBodyBuffer,
 				project: requestMeta.project,
+				clientSessionId: requestMeta.clientSessionId ?? null,
 				query: url.search || null,
 				projectAttributionSource: requestMeta.projectAttributionSource ?? null,
 				response,
@@ -1861,6 +1876,12 @@ export async function proxyWithAccount(
 		}
 	};
 	try {
+		// Every upstream call stays tied to the client connection: when the client
+		// disconnects, the upstream fetch must be aborted instead of running on.
+		// Call sites pass `req.signal` to makeProxyRequest explicitly instead of
+		// relying on the Request object to carry it, because provider body
+		// transforms rebuild the Request from its URL and drop the signal (see
+		// providers/src/utils/model-mapping.ts and the openai/codex providers).
 		if (
 			process.env.DEBUG?.includes("proxy") ||
 			process.env.DEBUG === "true" ||
@@ -2895,6 +2916,11 @@ export async function proxyWithAccount(
 		const requestInit: RequestInit & { duplex?: "half" } = {
 			method: req.method,
 			headers,
+			// Tie the upstream fetch to the client connection. When the client goes
+			// away mid-stream (idle-watchdog abort, Ctrl-C, network drop) the
+			// upstream request must be aborted too, instead of streaming on
+			// unattended and holding the connection open.
+			signal: req.signal,
 		};
 		if (effectiveBodyBuffer) {
 			requestInit.body = new Uint8Array(effectiveBodyBuffer);
@@ -3176,6 +3202,11 @@ export async function proxyWithAccount(
 				method: transformedRequest.method,
 				headers: transformedRequest.headers,
 				body: strippedBodyText,
+				// A URL-based rebuild drops the signal — carry it over. Belt-and-
+				// braces: executeCacheAwareProviderAttempt below also threads an
+				// explicit AbortSignal into every physical transport, but a rebuilt
+				// Request should never silently lose the one it started with.
+				signal: req.signal,
 			});
 			currentCacheIdentityHasCacheControl =
 				hasCacheControlHintInJsonText(strippedBodyText);
@@ -3222,6 +3253,7 @@ export async function proxyWithAccount(
 					headers,
 					body: new Uint8Array(filteredBodyBuffer),
 					duplex: "half",
+					signal: req.signal,
 				};
 
 				await finalizeCurrentCodexTransport(rawResponse);
@@ -3243,7 +3275,9 @@ export async function proxyWithAccount(
 				const retryTransportRequest = retryTransformedTemplate.clone();
 				currentReplayBody = filteredBodyBuffer;
 				currentCacheIdentityHasCacheControl = undefined;
-				// Make the retry request (or unwrap a synthetic provider response)
+				// Make the retry request (or unwrap a synthetic provider response).
+				// The prior rawResponse body was already drained above via
+				// discardUpstreamBody before this retry request was built.
 				rawResponse = await executeCacheAwareProviderAttempt(
 					retryTransportRequest,
 					currentReplayBody,
@@ -3434,6 +3468,8 @@ export async function proxyWithAccount(
 						method: transformedRequest.method,
 						headers: transformedRequest.headers,
 						body: retryBodyText,
+						// A URL-based rebuild drops the signal — carry it over.
+						signal: req.signal,
 					});
 					// The physical retry is already provider-transformed, but keepalive
 					// must re-enter from the normalized source and receive exactly one
@@ -3444,6 +3480,10 @@ export async function proxyWithAccount(
 					currentCacheIdentityHasCacheControl =
 						hasCacheControlHintInJsonText(retryBodyText);
 					retryTransformedTemplate = retryRequest.clone();
+					// The codex branch above already drains the pre-retry rawResponse
+					// via discardUpstreamBody; this branch has no equivalent call, so
+					// drain it here before the reassignment below drops the reference.
+					cancelDiscardedResponseBody(rawResponse);
 				}
 				rawResponse = await executeCacheAwareProviderAttempt(
 					retryRequest,
@@ -3535,6 +3575,8 @@ export async function proxyWithAccount(
 						: null,
 					requestMeta.projectAttributionSource ?? null,
 					requestMeta.agentAttributionSource ?? null,
+					null,
+					requestMeta.clientSessionId ?? null,
 				),
 			);
 			return {
@@ -3597,6 +3639,8 @@ export async function proxyWithAccount(
 						: null,
 					requestMeta.projectAttributionSource ?? null,
 					requestMeta.agentAttributionSource ?? null,
+					null,
+					requestMeta.clientSessionId ?? null,
 				),
 			);
 
@@ -3642,6 +3686,67 @@ export async function proxyWithAccount(
 				req.headers.get("x-better-ccflare-keepalive") === "true"
 			) {
 				return null;
+			}
+			// ── windowless 429: request-scoped, NOT account-wide (issue #301) ──
+			// Anthropic 429s some requests with `x-should-retry: true` and not one
+			// rate-limit header (`retry-after`, `anthropic-ratelimit-*`,
+			// `x-ratelimit-*`). Live measurement (upstream #301) showed these are
+			// scoped to the individual request, not the account: the same account
+			// serves 200s seconds either side of the rejection, in-place retries
+			// never clear it, and every other account rejects the same request
+			// identically. Benching would drain the pool one account per attempt.
+			// Fail over per request with NO cooldown, NO consecutive-429 increment,
+			// and — unlike the classified model/family branches below — NO
+			// usageCache exhaustion marker (measured recovery is ~38s; a 5-minute
+			// model-scoped marker would wrongly suppress a healthy route). The
+			// enclosing guard has already excluded non-429, non-Claude,
+			// out_of_credits, and keepalive traffic — the exact preconditions
+			// upstream's placement required.
+			if (isRetryable429(failureResponse, isClaudeProvider)) {
+				const reason: RateLimitReason = "windowless_429";
+				log.warn(
+					`Account ${account.name} returned a windowless 429 (${
+						attemptedModel ? `model=${attemptedModel}, ` : ""
+					}x-should-retry with no rate-limit window) — request-scoped, ` +
+						`NOT benching account; failing over to next account`,
+				);
+				const responseTime = Date.now() - requestMeta.timestamp;
+				ctx.asyncWriter.enqueue(() =>
+					ctx.dbOps.saveRequest(
+						crypto.randomUUID(),
+						req.method,
+						url.pathname,
+						account.id,
+						429,
+						false,
+						reason,
+						responseTime,
+						failoverAttempts,
+						attemptedModel ? { model: attemptedModel } : undefined,
+						requestMeta.agentUsed ?? undefined,
+						apiKeyId ?? undefined,
+						apiKeyName ?? undefined,
+						requestMeta.project ?? null,
+						undefined,
+						requestMeta.comboName ?? null,
+						isModelRewrite(requestMeta.originalModel, requestMeta.appliedModel)
+							? (requestMeta.originalModel ?? null)
+							: null,
+						isModelRewrite(requestMeta.originalModel, requestMeta.appliedModel)
+							? (requestMeta.appliedModel ?? null)
+							: null,
+						requestMeta.projectAttributionSource ?? null,
+						requestMeta.agentAttributionSource ?? null,
+						null,
+						requestMeta.clientSessionId ?? null,
+					),
+				);
+				return {
+					scope: "model",
+					attemptedModel,
+					family: attemptedModel ? getModelFamily(attemptedModel) : null,
+					stopAccountAttempt: false,
+				};
 			}
 			const decision = classifyPreByte429({
 				isAnthropic: true,
@@ -3705,6 +3810,8 @@ export async function proxyWithAccount(
 							: null,
 						requestMeta.projectAttributionSource ?? null,
 						requestMeta.agentAttributionSource ?? null,
+						null,
+						requestMeta.clientSessionId ?? null,
 					),
 				);
 				return {
@@ -3795,6 +3902,8 @@ export async function proxyWithAccount(
 						: null,
 					requestMeta.projectAttributionSource ?? null,
 					requestMeta.agentAttributionSource ?? null,
+					null,
+					requestMeta.clientSessionId ?? null,
 				),
 			);
 			return {
@@ -3893,6 +4002,8 @@ export async function proxyWithAccount(
 						: null,
 					requestMeta.projectAttributionSource ?? null,
 					requestMeta.agentAttributionSource ?? null,
+					null,
+					requestMeta.clientSessionId ?? null,
 				),
 			);
 			return {
@@ -4105,6 +4216,8 @@ export async function proxyWithAccount(
 									: null,
 								requestMeta.projectAttributionSource ?? null,
 								requestMeta.agentAttributionSource ?? null,
+								null,
+								requestMeta.clientSessionId ?? null,
 							),
 						);
 						await finalizeCurrentCodexTransport(rawResponse);
@@ -4200,6 +4313,8 @@ export async function proxyWithAccount(
 										: null,
 									requestMeta.projectAttributionSource ?? null,
 									requestMeta.agentAttributionSource ?? null,
+									null,
+									requestMeta.clientSessionId ?? null,
 								),
 							);
 							await finalizeCurrentCodexTransport(rawResponse);
@@ -4506,6 +4621,8 @@ export async function proxyWithAccount(
 										: null,
 									requestMeta.projectAttributionSource ?? null,
 									requestMeta.agentAttributionSource ?? null,
+									null,
+									requestMeta.clientSessionId ?? null,
 								),
 							);
 						}
@@ -4579,16 +4696,12 @@ export async function proxyWithAccount(
 			!isSyntheticInternal &&
 			!wasProtectedLifecycleForLatestResponse()
 		) {
-			const rlInfoClone = response.clone();
-			const rlInfo = attemptPlan.parseRateLimit(rlInfoClone);
-			// parseRateLimit only reads headers; it never touches the body. This
-			// clone is otherwise an abandoned tee branch that would block a later
-			// discardUnusedResponse/cancel() on `response` from ever settling (see
-			// the comment on discardUnusedResponse above). Reuse the same helper
-			// to release it: it is fire-and-forget internally, so calling it here
-			// (before `response` itself has been consumed or cancelled) cannot
-			// deadlock, unlike an unbounded cancel() would.
-			await discardUnusedResponse(rlInfoClone, "rate_limit_probe_clone");
+			// No clone: parseRateLimit is synchronous (providers/types.ts) and
+			// reads only headers and status, so it cannot touch the body. Cloning
+			// here teed the body into a second stream that nothing ever read or
+			// disposed of — one orphan per 529, plus one per in-place retry
+			// below. See issue #354.
+			const rlInfo = attemptPlan.parseRateLimit(response);
 			if (rlInfo.isRateLimited && !rlInfo.resetTime) {
 				const retryCfg = getOverloadRetryConfig();
 				if (retryCfg.enabled && retryCfg.maxAttempts > 1) {
@@ -4720,16 +4833,9 @@ export async function proxyWithAccount(
 							break;
 						}
 
-						const retryRlInfoClone = retryResponse.clone();
-						const retryRlInfo = attemptPlan.parseRateLimit(retryRlInfoClone);
-						// Same reasoning as the outer parseRateLimit clone above: this is a
-						// header-only read, and if the loop breaks out below without a
-						// further iteration to drain `retryResponse` via arrayBuffer(),
-						// nothing else would ever release this clone's tee branch.
-						await discardUnusedResponse(
-							retryRlInfoClone,
-							"rate_limit_probe_clone_retry",
-						);
+						// Header-only read, see the note on the first parseRateLimit
+						// call above — the retry response must not be teed either.
+						const retryRlInfo = attemptPlan.parseRateLimit(retryResponse);
 						if (!retryRlInfo.isRateLimited || retryRlInfo.resetTime) {
 							// Got a reset hint on retry — stop; let processProxyResponse apply cooldown
 							break;
@@ -5273,12 +5379,10 @@ export async function proxyWithAccount(
 		);
 		if (responseForRateLimitCheck !== response) {
 			// The rate-limit check ran on a clone whose header-only use is done.
-			// Release its tee branch so it cannot keep the original body's
-			// cancellation pending elsewhere.
-			await discardUnusedResponse(
-				responseForRateLimitCheck,
-				"rate_limit_check_clone",
-			);
+			// boundResponseBodyForClassification already buffered it into a
+			// synthetic Response, so release it via the drain primitive —
+			// body.cancel() is a measured no-op on released Bun (issue #273).
+			cancelDiscardedResponseBody(responseForRateLimitCheck);
 		}
 		if (isRateLimited) {
 			const comboNameAtAttempt = requestMeta.comboName ?? null;
@@ -5295,6 +5399,7 @@ export async function proxyWithAccount(
 						requestHeaders: req.headers,
 						requestBody: effectiveBodyBuffer,
 						project: requestMeta.project,
+						clientSessionId: requestMeta.clientSessionId ?? null,
 						query: url.search || null,
 						projectAttributionSource:
 							requestMeta.projectAttributionSource ?? null,
@@ -5403,6 +5508,7 @@ export async function proxyWithAccount(
 				requestHeaders: req.headers,
 				requestBody: effectiveBodyBuffer,
 				project: requestMeta.project,
+				clientSessionId: requestMeta.clientSessionId ?? null,
 				query: url.search || null,
 				projectAttributionSource: requestMeta.projectAttributionSource ?? null,
 				response,
@@ -5474,9 +5580,18 @@ export async function proxyWithAccount(
 		if (err instanceof AnthropicDegradedSendDeniedError) {
 			return err.denial;
 		}
+		if (req.signal.aborted) {
+			// Client disconnected: the socket is gone, so failing over to another
+			// account would burn pool capacity answering nobody. End the request
+			// with nginx's 499 (client closed request) — the status matters only
+			// for the log and the request record. (upstream cec5b5b99f)
+			log.info(
+				`Client disconnected during request to ${account.name} — ending instead of failing over`,
+			);
+			return new Response(null, { status: 499 });
+		}
 		if (
 			routingSignal.aborted ||
-			req.signal.aborted ||
 			err instanceof AnthropicPreCommitAbortedError
 		) {
 			throw err;
@@ -5510,26 +5625,126 @@ export async function proxyWithAccount(
 }
 
 /**
- * Create a 503 Service Unavailable response when the account pool is exhausted.
- * All accounts are paused, rate-limited, or filtered out.
- * @param accounts - All accounts that were considered but are unavailable
- * @returns 503 response with pool_exhausted error and Retry-After header
+ * Floor for `Retry-After` when no recovery time is known (cooldown cleared and
+ * usage reset unknown). Tuned to the UsageCache TTL (10 minutes — see
+ * providers/src/usage-fetcher.ts:1065) so a client that respects this header
+ * is guaranteed to see fresh usage telemetry on retry. Pre-fix this was the
+ * optimistic 60s that triggered CLAUDE_CODE_MAX_RETRIES=5 clients to die in
+ * 300s during an approximately two-hour outage (production trace).
  */
-export function createPoolExhaustedResponse(accounts: Account[]): Response {
+export const POOL_EXHAUSTED_UNKNOWN_RESET_RETRY_AFTER_SECONDS = 600;
+
+/** Upper bound on Retry-After so clients don't sleep through a recovery. */
+export const POOL_EXHAUSTED_MAX_RETRY_AFTER_SECONDS = 3600;
+
+/**
+ * Top-level error.type values produced by createPoolExhaustedResponse.
+ *
+ * `pool_exhausted` means "every account is genuinely exhausted (rate-limited,
+ * usage-capped, paused, requires reauth, or otherwise filtered out)".
+ * `circuit_open` means "the circuit breaker is refusing this account". The
+ * wire shape stays identical — only `error.type` and `accounts[].reason`
+ * differ — so SDK clients keep treating the response as a 503 transient.
+ * Downstream consumers that need to differentiate (e.g. the AO fleet reaper)
+ * read the JSON body.
+ */
+export type PoolExhaustionKind = "pool_exhausted" | "circuit_open";
+
+/**
+ * Per-account reason values emitted in `accounts[].reason`.
+ *
+ * `circuit_open` is distinct from the other values: it means the breaker
+ * refused this account, NOT that the account's cooldown is expired. Reporting
+ * a circuit-open account as `rate_limited` would mislead the reaper into
+ * pausing session spawns for the wrong reason.
+ */
+export type PoolExhaustionAccountReason =
+	| "requires_reauth"
+	| "paused"
+	| "usage_exhausted"
+	| "rate_limited"
+	| "circuit_open"
+	| "unavailable";
+
+/**
+ * Default Retry-After (seconds) for the `circuit_open` response. Matches the
+ * breaker's `OPEN_COOLDOWN_MS` so a polite client that respects Retry-After
+ * will retry exactly when the breaker is most likely to admit a half-open
+ * probe. Only used as a floor when no usage/cooldown recovery time is known
+ * or is sooner than this — see `retryAfterSeconds` below.
+ */
+const CIRCUIT_OPEN_RETRY_AFTER_SECONDS = 30;
+
+/**
+ * Create a 503 Service Unavailable response when the account pool is exhausted.
+ * All accounts are paused, rate-limited, usage-exhausted, circuit-open, or
+ * filtered out.
+ *
+ * Usage-aware: `usageSnapshots` (keyed by account.id) lets the function surface
+ * a `usage_exhausted` reason for accounts with no `rate_limited_until` cooldown
+ * — otherwise those would fall through to the `unavailable` bucket and the
+ * client would receive an optimistic `Retry-After: 60`, never reaching the
+ * upstream reset. The caller is responsible for sourcing snapshots from
+ * `usageCache` (or its own snapshot provider); the function itself stays pure
+ * and testable without touching I/O.
+ *
+ * `kind: "circuit_open"` overrides every per-account reason to `circuit_open`
+ * — the account's own state (paused, rate-limited, usage-exhausted) is
+ * irrelevant when the breaker itself is the gate refusing the request. The
+ * Retry-After is still the longer of the breaker's cooldown and any known
+ * usage/rate-limit recovery time: a 30s breaker hint on an account that is
+ * also usage-capped for hours would otherwise lie to the client about when
+ * capacity actually returns.
+ *
+ * @param accounts - All accounts that were considered but are unavailable
+ * @param usageSnapshots - Per-account usage telemetry (id → snapshot), used
+ *   to identify usage_exhausted accounts and to derive `next_available_at` /
+ *   `Retry-After` when an upstream reset time is known.
+ * @param kind - Which top-level cause to report. Defaults to `"pool_exhausted"`.
+ * @returns 503 response with the pool-exhausted JSON shape and Retry-After header
+ */
+export function createPoolExhaustedResponse(
+	accounts: Account[],
+	usageSnapshots?: ReadonlyMap<string, AccountUsageSnapshot>,
+	kind: PoolExhaustionKind = "pool_exhausted",
+): Response {
 	const now = Date.now();
+	const isCircuitOpen = kind === "circuit_open";
 
-	// Build account info list
+	// Build account info list — usage-exhausted outranks cooldown because the
+	// client needs the longer reset horizon (weekly vs minutes-long cooldowns)
+	// to avoid retrying an account upstream will reject immediately.
+	// `circuit_open` outranks everything else: the breaker was the gate, so
+	// the account's own state is irrelevant to why this request was refused.
 	const accountInfos = accounts.map((account) => {
-		const reason = account.paused
-			? "paused"
-			: account.rate_limited_until && account.rate_limited_until > now
-				? "rate_limited"
-				: "unavailable";
+		const usage = usageSnapshots?.get(account.id);
+		const usageExhausted =
+			usage !== undefined &&
+			isUsageExhausted(usage.utilization, usage.resetMs, now);
 
-		const availableAt =
-			account.rate_limited_until && account.rate_limited_until > now
-				? new Date(account.rate_limited_until).toISOString()
-				: null;
+		const reason: PoolExhaustionAccountReason = isCircuitOpen
+			? "circuit_open"
+			: account.requires_reauth
+				? "requires_reauth"
+				: account.paused
+					? "paused"
+					: usageExhausted
+						? "usage_exhausted"
+						: account.rate_limited_until && account.rate_limited_until > now
+							? "rate_limited"
+							: "unavailable";
+
+		let availableAt: string | null = null;
+		if (!isCircuitOpen) {
+			if (usageExhausted && usage?.resetMs && usage.resetMs > now) {
+				availableAt = new Date(usage.resetMs).toISOString();
+			} else if (
+				account.rate_limited_until &&
+				account.rate_limited_until > now
+			) {
+				availableAt = new Date(account.rate_limited_until).toISOString();
+			}
+		}
 
 		return {
 			name: account.name,
@@ -5538,31 +5753,69 @@ export function createPoolExhaustedResponse(accounts: Account[]): Response {
 		};
 	});
 
-	// Calculate next_available_at from earliest rate_limited_until
-	const rateLimitedAccounts = accounts.filter(
-		(account) => account.rate_limited_until && account.rate_limited_until > now,
-	);
-	const rateLimitedUntil = rateLimitedAccounts
-		.map((account) => account.rate_limited_until)
-		.filter((until): until is number => typeof until === "number");
-	const earliestRateLimitedUntil =
-		rateLimitedUntil.length > 0 ? Math.min(...rateLimitedUntil) : null;
+	// next_available_at / Retry-After = earliest of (active cooldown) and
+	// (future usage reset). Both signals have to be considered — a
+	// usage-capped account with `rate_limited_until = null` would otherwise be
+	// ignored and leak an optimistic Retry-After to the client. For
+	// circuit_open, the breaker's own cooldown floors the wait — but if the
+	// account is ALSO usage-capped or rate-limited past that, the longer,
+	// more honest wait wins (a 30s breaker hint must never undercut an hours-long
+	// usage cap).
+	const recoveryCandidates: number[] = [];
+	for (const account of accounts) {
+		if (account.rate_limited_until && account.rate_limited_until > now) {
+			recoveryCandidates.push(account.rate_limited_until);
+		}
+		const usage = usageSnapshots?.get(account.id);
+		if (
+			usage &&
+			isUsageExhausted(usage.utilization, usage.resetMs, now) &&
+			usage.resetMs &&
+			usage.resetMs > now
+		) {
+			recoveryCandidates.push(usage.resetMs);
+		}
+	}
+	const earliestRecoveryMs =
+		recoveryCandidates.length > 0 ? Math.min(...recoveryCandidates) : null;
+
 	const nextAvailableAt =
-		earliestRateLimitedUntil !== null
-			? new Date(earliestRateLimitedUntil).toISOString()
+		!isCircuitOpen && earliestRecoveryMs !== null
+			? new Date(earliestRecoveryMs).toISOString()
 			: null;
 
-	// Calculate Retry-After header (seconds) directly from numeric min
-	const retryAfterSeconds =
-		earliestRateLimitedUntil !== null
-			? Math.max(1, Math.round((earliestRateLimitedUntil - now) / 1000))
-			: 60; // Default 60s if no cooldown info
+	// Retry-After: clamped to [1, MAX], with a defensible floor when no
+	// recovery time is known. Mirrors model-capacity.ts's clamp semantics; the
+	// floor (600s = UsageCache TTL) ensures a client retry can observe fresh
+	// telemetry rather than retrying blindly against a stale snapshot.
+	const usageAwareRetryAfterSeconds =
+		earliestRecoveryMs !== null
+			? Math.max(
+					1,
+					Math.min(
+						POOL_EXHAUSTED_MAX_RETRY_AFTER_SECONDS,
+						Math.ceil((earliestRecoveryMs - now) / 1000),
+					),
+				)
+			: POOL_EXHAUSTED_UNKNOWN_RESET_RETRY_AFTER_SECONDS;
+
+	// For circuit_open, take the longer of the breaker's own cooldown and any
+	// KNOWN usage/rate-limit recovery — "the longer, more honest wait wins".
+	// The 600s POOL_EXHAUSTED_UNKNOWN_RESET_RETRY_AFTER_SECONDS floor is a
+	// pool_exhausted-specific fallback for "no telemetry at all"; it must not
+	// leak into circuit_open's own 30s floor when no other recovery signal
+	// is known (earliestRecoveryMs === null).
+	const retryAfterSeconds = isCircuitOpen
+		? earliestRecoveryMs !== null
+			? Math.max(CIRCUIT_OPEN_RETRY_AFTER_SECONDS, usageAwareRetryAfterSeconds)
+			: CIRCUIT_OPEN_RETRY_AFTER_SECONDS
+		: usageAwareRetryAfterSeconds;
 
 	return new Response(
 		JSON.stringify({
 			type: "error",
 			error: {
-				type: "pool_exhausted",
+				type: kind,
 				message: ERROR_MESSAGES.POOL_EXHAUSTED,
 				next_available_at: nextAvailableAt,
 				accounts: accountInfos,
@@ -5573,6 +5826,9 @@ export function createPoolExhaustedResponse(accounts: Account[]): Response {
 			headers: {
 				"Content-Type": "application/json",
 				"Retry-After": String(retryAfterSeconds),
+				// Wire shape stays identical regardless of kind — the cause lives
+				// in `error.type`. Downstream consumers that need to differentiate
+				// (fleet reaper, capacity-state consumers) read the JSON body.
 				[RECOVERY_STATUS_HEADER]: RECOVERY_STATUS_EXHAUSTED,
 				[RECOVERY_SCOPE_HEADER]: "pool",
 			},

@@ -3,11 +3,16 @@ import type {
 	BunSqlAdapter,
 	DatabaseOperations,
 } from "@better-ccflare/database";
+import type { CircuitBreaker } from "@better-ccflare/proxy";
 import type { Account } from "./account";
 import type { AlertEvent } from "./alerts";
 import type { AffinityOwnerSnapshot, RequestMeta } from "./api";
 import type { ApiKey } from "./api-key";
-import type { AnthropicDegradedRuntimeHealth, IntegrityStatus } from "./stats";
+import type {
+	AnthropicDegradedRuntimeHealth,
+	IntegrityStatus,
+	RetentionStatus,
+} from "./stats";
 import type { StrategyStore } from "./strategy";
 
 /**
@@ -81,7 +86,15 @@ export interface APIContext {
 	getIntegrityStatus?: () => IntegrityStatus;
 	/** Fixed aggregate-only, restart-scoped degraded-mode health snapshot. */
 	getAnthropicDegradedHealth?: () => AnthropicDegradedRuntimeHealth;
+	getRetentionStatus?: () => RetentionStatus;
 	getStrategy?: () => LoadBalancingStrategy | null;
+	/**
+	 * Live circuit breaker exposed by the proxy path. Optional so older
+	 * entrypoints that don't wire the breaker can still construct an
+	 * APIRouter; the capacity-state handler takes its own copy from this
+	 * field when present.
+	 */
+	circuitBreaker?: CircuitBreaker;
 	/**
 	 * Live Anthropic model catalog access, injected by the server entrypoint
 	 * (avoids a direct http-api -> proxy type dependency here). Absent when
@@ -99,6 +112,21 @@ export interface APIContext {
 		}>;
 		refresh: () => Promise<{ success: boolean; error?: string }>;
 	};
+	/**
+	 * Process-local secret gating internal-probe requests (auto-refresh /
+	 * cache-keepalive self-loops) at the AuthService HTTP auth gate (#216).
+	 * Optional so older entrypoints/tests that don't wire it still construct
+	 * an APIRouter; AuthService fails closed (no exemption) when absent.
+	 */
+	internalProbeSecret?: string;
+	/**
+	 * Persisted secret (shared with the CLI via the on-disk config file)
+	 * allowing the user's own CLI to notify their own locally-running server
+	 * of DB-side changes (token reload, force-reset-rate-limit) even when
+	 * API-key auth is enabled (#216). Optional for the same reason as
+	 * internalProbeSecret above.
+	 */
+	localControlSecret?: string;
 }
 
 // Load balancing strategy interface

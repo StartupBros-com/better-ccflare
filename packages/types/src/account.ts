@@ -32,7 +32,16 @@ export type RateLimitReason =
 	 *  not billing failure. Distinct from `upstream_429_with_reset`/
 	 *  `upstream_429_no_reset_probe_cooldown` so operators can tell native xAI
 	 *  capacity cooldowns apart from ordinary upstream rate limiting. */
-	| "xai_capacity_402";
+	| "xai_capacity_402"
+	/** Anthropic 429 that reports no rate-limit window at all — `x-should-retry:
+	 *  true` and not a single `anthropic-ratelimit-*` / `x-ratelimit-*` header or
+	 *  `retry-after`. Live measurement showed this to be request-scoped rather
+	 *  than account-wide: the same account served 200s seconds either side of the
+	 *  rejection on the same model, while every other account rejected the same
+	 *  request identically, and retries spanning 11s never once cleared it. The
+	 *  account is NOT benched — the request fails over and the account stays in
+	 *  rotation. */
+	| "windowless_429";
 
 // Usage data types for Anthropic accounts
 export interface UsageWindowData {
@@ -151,6 +160,22 @@ export interface XaiUsageData {
 	credits: XaiUsageWindow;
 }
 
+// Usage data types for MiniMax Token Plan accounts. Mirrors
+// MinimaxUsageWindow/MinimaxUsageData in
+// packages/providers/src/minimax-usage-fetcher.ts — camelCase `resetAt`
+// (epoch ms), distinct from the Anthropic-style snake_case `resets_at`.
+export interface MinimaxUsageWindow {
+	utilization: number; // 0-100. 0 = fully available, 100 = exhausted.
+	remainingPercent: number; // 0-100, straight from the API.
+	resetAt: number | null; // Epoch milliseconds.
+	intervalMs: number | null; // Window length in ms.
+}
+
+export interface MinimaxUsageData {
+	five_hour: MinimaxUsageWindow | null;
+	seven_day: MinimaxUsageWindow | null;
+}
+
 // Combined usage data type that supports all providers
 export type FullUsageData =
 	| AnthropicUsageData
@@ -158,7 +183,8 @@ export type FullUsageData =
 	| ZaiUsageData
 	| KiloUsageData
 	| AlibabaCodingPlanUsageData
-	| XaiUsageData;
+	| XaiUsageData
+	| MinimaxUsageData;
 
 // Database row types that match the actual database schema
 export interface AccountRow {

@@ -14,6 +14,11 @@ const HARD_UNIFIED_STATUSES = new Set([
 	"blocked",
 	"queueing_hard",
 	"payment_required",
+	// Measured on a real exhausted-window 429 (five-hour utilization 1.01,
+	// `anthropic-ratelimit-unified-5h-status: rejected`) that also carried
+	// `x-should-retry: true` — see retryable-429.ts's
+	// ACCOUNT_WIDE_UNIFIED_STATUSES derivation notes.
+	"rejected",
 ]);
 
 export type RateLimitFailureScope = "account" | "family" | "model";
@@ -22,6 +27,7 @@ export type RateLimitScopeReason =
 	| "not_429"
 	| "non_anthropic"
 	| "hard_response_signal"
+	| "spent_window_signal"
 	| "unknown_model"
 	| "missing_usage"
 	| "stale_usage"
@@ -151,6 +157,49 @@ export function hasHardAnthropicAccountSignal(response: Response): boolean {
 }
 
 /**
+ * True when a 429 positively describes a spent unified rate-limit window —
+ * Anthropic's own limiter speaking, e.g. `anthropic-ratelimit-unified-reset`
+ * or a per-window `anthropic-ratelimit-unified-5h-status: rejected`. Used to
+ * bench the account when no usage snapshot exists to refine the scope
+ * (upstream issue #301's counterpart: a 429 that DOES report a window is a
+ * real window rejection, unlike the windowless shape).
+ *
+ * Deliberately narrower than "any rate-limit metadata":
+ * - Generic `retry-after` / `x-ratelimit-*` hints only ever shorten marker
+ *   expiry, never broaden scope (fork behavior, pinned by
+ *   rate-limit-scope.test.ts).
+ * - Empty header values are not evidence (matches the empty
+ *   `unified-remaining` precedent in hasHardAnthropicAccountSignal).
+ * - A `-status` header only counts when its value is in
+ *   HARD_UNIFIED_STATUSES — a soft/allowed status is not a spent window.
+ * - A parseable POSITIVE `unified-remaining` contradicts an account-wide
+ *   rejection (the unified limiter has headroom; a scoped limit elsewhere
+ *   produced the 429), so it vetoes the evidence.
+ */
+function hasSpentUnifiedWindowEvidence(response: Response): boolean {
+	const remaining = response.headers.get(
+		"anthropic-ratelimit-unified-remaining",
+	);
+	if (remaining !== null && remaining.trim() !== "") {
+		const parsed = Number(remaining);
+		if (Number.isFinite(parsed) && parsed > 0) return false;
+	}
+	let evidence = false;
+	response.headers.forEach((value, name) => {
+		const lower = name.toLowerCase();
+		if (!lower.startsWith("anthropic-ratelimit-unified-")) return;
+		const trimmed = value.trim();
+		if (trimmed === "") return;
+		if (lower.endsWith("-status")) {
+			if (HARD_UNIFIED_STATUSES.has(trimmed.toLowerCase())) evidence = true;
+			return;
+		}
+		evidence = true;
+	});
+	return evidence;
+}
+
+/**
  * Scope a generic Anthropic 429 using only positive capacity evidence. Explicit
  * account-wide exhaustion stays account scoped; fresh matching scoped usage is
  * family scoped; every ambiguous recognized-Claude case is isolated to the
@@ -176,6 +225,12 @@ export function classifyPreByte429(
 		return accountDecision(options, "unknown_model", null, null);
 	}
 	if (options.snapshot === null) {
+		// No usage evidence to refine the scope. If the response itself reports
+		// a spent unified window, that is account-level evidence from the
+		// server — bench rather than model-mark (upstream #301 counterpart).
+		if (hasSpentUnifiedWindowEvidence(options.response)) {
+			return accountDecision(options, "spent_window_signal", family, null);
+		}
 		return modelDecision(options, "missing_usage", family, null, now);
 	}
 
@@ -186,6 +241,14 @@ export function classifyPreByte429(
 		snapshotAgeMs < 0 ||
 		snapshotAgeMs > maxAgeMs
 	) {
+		if (hasSpentUnifiedWindowEvidence(options.response)) {
+			return accountDecision(
+				options,
+				"spent_window_signal",
+				family,
+				snapshotAgeMs,
+			);
+		}
 		return modelDecision(options, "stale_usage", family, snapshotAgeMs, now);
 	}
 

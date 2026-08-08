@@ -7,7 +7,8 @@
 		".": "./src/index.ts",
 		"./api-key": "./src/api-key.ts",
 		"./combo": "./src/combo.ts",
-		"./routing-recovery": "./src/routing-recovery.ts"
+		"./routing-recovery": "./src/routing-recovery.ts",
+		"./request": "./src/request.ts"
 	},
 	"scripts": {
 		"typecheck": "bunx tsc --noEmit"

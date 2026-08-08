@@ -51,6 +51,8 @@ The `--no-ff` flag creates a merge commit even if the branch could be fast-forwa
 
 **Do NOT use `gh pr merge`** — it may squash or rebase, losing the contributor's identity. Always merge manually with `git merge --no-ff`.
 
+Note: a `--no-ff` merge commit's subject carries the PR title (e.g. `fix(proxy): ... (PR #N)`), **not** GitHub-UI's `Merge pull request #N from user/branch` format. Any tooling that scans merge commits for contributor credit or PR association must handle both formats — the release workflow (`release.yml`) does this by collecting PR numbers from both shapes and resolving authors via `gh pr view`.
+
 If the PR branch isn't available locally, fetch it first:
 ```bash
 git fetch origin pull/<PR_NUMBER>/head:<branch-name>

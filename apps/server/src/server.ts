@@ -13,6 +13,7 @@ import {
 	HTTP_STATUS,
 	initializeNanoGPTPricingIfAccountsExist,
 	installOutboundProxy,
+	intervalManager,
 	NETWORK,
 	registerCleanup,
 	registerDisposable,
@@ -67,6 +68,7 @@ import {
 	DegradedModeObservability,
 	DegradedOwnerOverlay,
 	drainUsageCollector,
+	forceCloseCircuit,
 	getModelCatalog,
 	getUsageCollectorHealth,
 	getValidAccessToken,
@@ -89,6 +91,7 @@ import { validatePathOrThrow } from "@better-ccflare/security";
 import {
 	type Account,
 	type LoadBalancingStrategy,
+	type RetentionStatus,
 	StrategyName,
 	type StrategyStore,
 } from "@better-ccflare/types";
@@ -212,6 +215,99 @@ export function resolveDashboardRoute(
 	}
 
 	return "pass-through";
+}
+
+/**
+ * Minimal interface satisfied by the `usageCache` singleton in
+ * `@better-ccflare/providers`. Declared locally so the bootstrap helper
+ * can be unit-tested with a mock without dragging the full UsageCache
+ * class (which is not exported) into the public type surface.
+ */
+export interface UsageCacheRegistrar {
+	startPolling(
+		accountId: string,
+		tokenProvider: () => Promise<string>,
+		provider: string,
+		intervalMs: number,
+	): void;
+}
+
+/**
+ * Register usage polling for a single Minimax account. The Minimax fetcher
+ * hits the Token Plan `remains` endpoint with a Bearer API key; no OAuth
+ * refresh is required. Mirrors the surrounding nanogpt/zai/kilo pattern:
+ * pay-as-you-go, API-key authentication, no window reset callback
+ * (Minimax has `requiresSessionTracking: false` in provider-config.ts).
+ *
+ * Returns true if polling was registered, false if the account is not
+ * a Minimax account or has no API key. Extracted from the bootstrap
+ * loop so the registration contract is unit-testable.
+ *
+ * When `logger` is provided AND the account is a Minimax account missing a
+ * non-empty API key, emits a `WARN` naming the account. Matches the
+ * sibling nanogpt/zai/kilo blocks (Greptile #350 P2): "X account <name> has
+ * no API key, skipping usage polling". The account name is the only
+ * identifier in the message — never the key value or any part of it.
+ */
+export function registerMinimaxUsagePolling(
+	account: Account,
+	usageCache: UsageCacheRegistrar,
+	intervalMs: number,
+	logger?: Logger,
+): boolean {
+	if (account.provider !== "minimax") return false;
+	if (!account.api_key) {
+		logger?.warn(
+			`Minimax account ${account.name ?? account.id} has no API key, skipping usage polling`,
+		);
+		return false;
+	}
+	const apiKeyProvider = async () => account.api_key || "";
+	usageCache.startPolling(
+		account.id,
+		apiKeyProvider,
+		account.provider,
+		intervalMs,
+	);
+	return true;
+}
+
+/**
+ * Run the Minimax usage-polling bootstrap over a list of accounts. This is the
+ * shape of the wiring block `startServer()` runs for every Minimax account at
+ * startup — filter for provider === "minimax", then delegate each one to
+ * {@link registerMinimaxUsagePolling} which decides whether polling should
+ * actually start.
+ *
+ * Returns the account IDs that were registered (i.e. had a usable API key).
+ * Returning the registered IDs rather than a bare count lets callers log the
+ * affected accounts and gives tests a stable handle to assert against.
+ *
+ * `logger` is forwarded to {@link registerMinimaxUsagePolling} so per-account
+ * "no API key" warnings surface from the unit-testable helper, keeping
+ * behavior consistent with the sibling nanogpt/zai/kilo bootstrap blocks.
+ *
+ * Extracted from the inline bootstrap block so a regression test can exercise
+ * the exact wiring path (filter → forEach → registerMinimaxUsagePolling) with
+ * a mixed-provider account list. If the inline block in `startServer()` is
+ * removed but this helper still exists and is unit-tested in isolation, the
+ * startup-time wiring has no test coverage — that is the gap this function
+ * exists to close. Keep the bootstrap block in `startServer()` calling this.
+ */
+export function bootstrapMinimaxUsagePolling(
+	accounts: readonly Account[],
+	usageCache: UsageCacheRegistrar,
+	intervalMs: number,
+	logger?: Logger,
+): string[] {
+	const minimaxAccounts = accounts.filter((a) => a.provider === "minimax");
+	const registered: string[] = [];
+	for (const account of minimaxAccounts) {
+		if (registerMinimaxUsagePolling(account, usageCache, intervalMs, logger)) {
+			registered.push(account.id);
+		}
+	}
+	return registered;
 }
 
 // Helper function to resolve dashboard assets with fallback
@@ -448,24 +544,21 @@ async function runStartupMaintenance(
 	dbOps: DatabaseOperations,
 ) {
 	const log = new Logger("StartupMaintenance");
-	try {
-		const payloadDays = config.getDataRetentionDays();
-		const requestDays = config.getRequestRetentionDays();
-		const { removedRequests, removedPayloads } = await dbOps.cleanupOldRequests(
-			payloadDays * 24 * 60 * 60 * 1000,
-			requestDays * 24 * 60 * 60 * 1000,
+	// Runs the "data-retention-cleanup" interval's own callback via
+	// intervalManager.runNow() instead of duplicating its retention logic
+	// here. Two independent code paths writing retentionState could race — a
+	// startup run that outlives the first hourly tick would overwrite that
+	// tick's newer result — because only the periodic registration's
+	// isRunning flag guarded against overlap. runNow() shares that exact flag
+	// (registered with maxConcurrent: 1), so at most one retention run is
+	// ever in flight regardless of whether startup or the interval triggered
+	// it, closing the race entirely (Greptile, PR #390). The interval must
+	// already be registered before this runs — see the call site.
+	const ran = await intervalManager.runNow("data-retention-cleanup");
+	if (!ran) {
+		log.warn(
+			"Skipped startup retention cleanup - periodic run already in progress",
 		);
-		log.info(
-			`Startup cleanup removed ${removedRequests} requests and ${removedPayloads} payloads (payload=${payloadDays}d, requests=${requestDays}d)`,
-		);
-		const removedSnapshots = await dbOps.pruneUsageSnapshots(
-			Date.now() - config.getUsageHistoryRetentionDays() * TIME_CONSTANTS.DAY,
-		);
-		if (removedSnapshots > 0) {
-			log.info(`Pruned ${removedSnapshots} old usage snapshots`);
-		}
-	} catch (err) {
-		log.error(`Startup cleanup error: ${err}`);
 	}
 	await cleanupCacheFlightRecorderRetention(config, dbOps, log);
 	try {
@@ -480,11 +573,20 @@ async function runStartupMaintenance(
 		log.error(`OAuth session cleanup error: ${err}`);
 	}
 	try {
-		// Clear expired rate_limited_until values
+		// Clear expired rate_limited_until values. Each cleared row is fed to
+		// the circuit breaker via recordSuccess — the active-clear path from
+		// the circuit-breaker integration design §3. Without this, the breaker
+		// would keep an account failed-fast AFTER the upstream recovered
+		// (Risk 2, HIGH).
 		const now = Date.now();
-		const clearedCount = await dbOps.clearExpiredRateLimits(now);
-		if (clearedCount > 0) {
-			log.info(`Cleared ${clearedCount} expired rate_limited_until entries`);
+		const clearedRows = await dbOps.clearExpiredRateLimits(now);
+		for (const row of clearedRows) {
+			forceCloseCircuit({ provider: row.provider, accountId: row.id }, now);
+		}
+		if (clearedRows.length > 0) {
+			log.info(
+				`Cleared ${clearedRows.length} expired rate_limited_until entries`,
+			);
 		} else {
 			log.info("No expired rate_limited_until entries found to clear");
 		}
@@ -932,6 +1034,20 @@ export default async function startServer(options?: {
 	if (port !== runtime.port) {
 		runtime.port = port;
 	}
+
+	// Process-local secret gating internal-probe markers (auto-refresh /
+	// cache-keepalive self-loop requests) — see proxy-types.ts isInternalProbe
+	// and AuthService#isInternalProbeRequest. Intentionally re-minted every
+	// process start (not persisted): these self-loops originate from the same
+	// process that mints the secret, so nothing outside this process ever
+	// needs to know it across restarts.
+	const internalProbeSecret = crypto.randomUUID();
+	// Persisted secret shared with the CLI (via the same on-disk config file)
+	// so `bun run cli --reauthenticate` / `--force-reset-rate-limit` can
+	// notify this locally-running server of DB-side changes even when
+	// API-key auth is enabled (issue #216). See AuthService#isLocalControlRequest.
+	const localControlSecret = config.getLocalControlSecret();
+
 	DatabaseFactory.initialize(undefined, runtime);
 	const dbOps = await DatabaseFactory.getInstanceAsync();
 
@@ -1045,97 +1161,32 @@ export default async function startServer(options?: {
 		sink: createAnthropicDegradedDetailedEventSink(process.stdout),
 	});
 
-	const apiRouter = new APIRouter(
-		{
-			db,
-			config,
-			dbOps,
-			alertService,
-			modelCatalog: {
-				get: () => getModelCatalog(),
-				refresh: async () => {
-					if (!modelCatalogProxyContext) {
-						return {
-							success: false,
-							error: "Model catalog is not initialized yet",
-						};
-					}
-					const result = await refreshModelCatalog(modelCatalogProxyContext, {
-						trigger: "manual",
-					});
-					return { success: result.success, error: result.error };
-				},
-			},
-			runtime: {
-				port,
-				tlsEnabled,
-			},
-			getAsyncWriterHealth: () => asyncWriter.getHealth(),
-			getUsageWorkerHealth: () => getUsageCollectorHealth(),
-			getIntegrityStatus: () => dbOps.getIntegrityStatus(),
-			getAnthropicDegradedHealth: () =>
-				createAnthropicDegradedRuntimeHealth({
-					coordinator: anthropicDegradedMode,
-					observability: anthropicDegradedObservability,
-					ownerOverlay: degradedOwnerOverlay,
-					shadowOwnerOverlay: degradedOwnerShadowOverlay,
-				}),
-			getStrategy: () => currentStrategy,
-		},
-		{ deviceSetupCoordinator },
-	);
+	// Minimal retention-job telemetry (#384): the periodic data-retention
+	// cleanup below silently swallowed failures into a log line with no way
+	// to tell "retention healthy" from "retention dead for weeks" apart from
+	// tailing logs. Declared here (mirrors the currentStrategy /
+	// modelCatalogProxyContext mutable-ref pattern above) so the router,
+	// constructed eagerly below, can read it via a getter; the cleanup
+	// callback mutates it in place once defined further down.
+	const retentionState: RetentionStatus = {
+		lastSuccessAt: null,
+		lastError: null,
+		lastErrorAt: null,
+	};
+	const getRetentionStatus = (): RetentionStatus => ({ ...retentionState });
 
-	// Initialize AuthService for proxy authentication
-	const authService = new AuthService(dbOps);
+	// apiRouter itself is constructed further below (after the
+	// data-retention-cleanup job is registered) so its getRetentionStatus and
+	// getAnthropicDegradedHealth getters, plus the AuthService/cleanup jobs
+	// that follow, can all share one internalProbeSecret/localControlSecret
+	// declaration instead of duplicating router construction here.
 
-	// Run startup maintenance once (cleanup only) - fire and forget
-	runStartupMaintenance(config, dbOps).catch((err) => {
-		log.error("Startup maintenance failed:", err);
-	});
-	stopRetentionJob = () => {}; // No-op stopper
-
-	// Set up periodic OAuth session cleanup (every hour)
-	const unregisterOAuthCleanup = registerCleanup({
-		id: "oauth-session-cleanup",
-		callback: async () => {
-			try {
-				const removedSessions = await dbOps.cleanupExpiredOAuthSessions();
-				if (removedSessions > 0) {
-					log.debug(`Cleaned up ${removedSessions} expired OAuth sessions`);
-				}
-			} catch (err) {
-				log.error(`OAuth session cleanup error: ${err}`);
-			}
-		},
-		minutes: 60,
-		description: "OAuth session cleanup",
-	});
-
-	stopOAuthCleanupJob = unregisterOAuthCleanup;
-
-	// Set up periodic rate limit cleanup (every hour)
-	const unregisterRateLimitCleanup = registerCleanup({
-		id: "rate-limit-cleanup",
-		callback: async () => {
-			try {
-				const now = Date.now();
-				const clearedCount = await dbOps.clearExpiredRateLimits(now);
-				if (clearedCount > 0) {
-					log.debug(
-						`Cleared ${clearedCount} expired rate_limited_until entries`,
-					);
-				}
-			} catch (err) {
-				log.error(`Rate limit cleanup error: ${err}`);
-			}
-		},
-		minutes: 60,
-		description: "Rate limit cleanup",
-	});
-
-	stopRateLimitCleanupJob = unregisterRateLimitCleanup;
-
-	// Set up periodic data retention cleanup every 1 hour
+	// Registered here (before runStartupMaintenance() below) so intervalManager
+	// has "data-retention-cleanup" on record and runNow() can find it — startup
+	// maintenance triggers the very same callback via runNow() instead of
+	// duplicating this logic, so both the boot-time run and the hourly tick
+	// share one isRunning guard (maxConcurrent: 1) and can never race on
+	// retentionState (Greptile, PR #390).
 	const dataRetentionCleanup = async () => {
 		const startTime = Date.now();
 		try {
@@ -1182,24 +1233,136 @@ export default async function startServer(options?: {
 			if (removedSnapshots > 0) {
 				log.info(`Pruned ${removedSnapshots} old usage snapshots`);
 			}
+			retentionState.lastSuccessAt = Date.now();
+			retentionState.lastError = null;
+			retentionState.lastErrorAt = null;
 		} catch (err) {
 			log.error(`Periodic data retention cleanup error: ${err}`);
+			retentionState.lastError =
+				err instanceof Error ? err.message : String(err);
+			retentionState.lastErrorAt = Date.now();
 		}
 		await cleanupCacheFlightRecorderRetention(config, dbOps, log);
 	};
 
 	// Periodic data retention cleanup every 1 hour (reduced from 6 hours for more aggressive cleanup).
-	// runStartupMaintenance() (called above) handles the initial cleanup on boot,
-	// so we don't fire dataRetentionCleanup() immediately to avoid concurrent
-	// large deletes that can spike WAL size and wedge the service.
+	// Registered with immediate: false (default) — runStartupMaintenance()
+	// below fires the first run via intervalManager.runNow() instead, so we
+	// don't double-run at boot.
 	const unregisterDataCleanup = registerCleanup({
 		id: "data-retention-cleanup",
 		callback: dataRetentionCleanup,
 		minutes: 60, // every 1 hour
+		// A batched cleanup can run long on a large backlog (#384) — long enough
+		// to still be in flight when the next hourly tick fires, or when
+		// runStartupMaintenance's runNow() call races a tick. Without this,
+		// IntervalManager would allow overlapping runs, and the two completing
+		// out of order could overwrite retentionState with a stale result (e.g.
+		// an older failure clobbering a newer success in /health).
+		maxConcurrent: 1,
 		description: "Periodic data retention cleanup and incremental vacuum",
 	});
-
 	stopDataCleanupJob = unregisterDataCleanup;
+
+	const apiRouter = new APIRouter(
+		{
+			db,
+			config,
+			dbOps,
+			alertService,
+			modelCatalog: {
+				get: () => getModelCatalog(),
+				refresh: async () => {
+					if (!modelCatalogProxyContext) {
+						return {
+							success: false,
+							error: "Model catalog is not initialized yet",
+						};
+					}
+					const result = await refreshModelCatalog(modelCatalogProxyContext, {
+						trigger: "manual",
+					});
+					return { success: result.success, error: result.error };
+				},
+			},
+			runtime: {
+				port,
+				tlsEnabled,
+			},
+			getAsyncWriterHealth: () => asyncWriter.getHealth(),
+			getUsageWorkerHealth: () => getUsageCollectorHealth(),
+			getIntegrityStatus: () => dbOps.getIntegrityStatus(),
+			getAnthropicDegradedHealth: () =>
+				createAnthropicDegradedRuntimeHealth({
+					coordinator: anthropicDegradedMode,
+					observability: anthropicDegradedObservability,
+					ownerOverlay: degradedOwnerOverlay,
+					shadowOwnerOverlay: degradedOwnerShadowOverlay,
+				}),
+			getRetentionStatus,
+			getStrategy: () => currentStrategy,
+			internalProbeSecret,
+			localControlSecret,
+		},
+		{ deviceSetupCoordinator },
+	);
+
+	// Initialize AuthService for proxy authentication
+	const authService = new AuthService(
+		dbOps,
+		internalProbeSecret,
+		localControlSecret,
+	);
+
+	// Run startup maintenance once (cleanup only) - fire and forget
+	runStartupMaintenance(config, dbOps).catch((err) => {
+		log.error("Startup maintenance failed:", err);
+	});
+	stopRetentionJob = () => {}; // No-op stopper
+
+	// Set up periodic OAuth session cleanup (every hour)
+	const unregisterOAuthCleanup = registerCleanup({
+		id: "oauth-session-cleanup",
+		callback: async () => {
+			try {
+				const removedSessions = await dbOps.cleanupExpiredOAuthSessions();
+				if (removedSessions > 0) {
+					log.debug(`Cleaned up ${removedSessions} expired OAuth sessions`);
+				}
+			} catch (err) {
+				log.error(`OAuth session cleanup error: ${err}`);
+			}
+		},
+		minutes: 60,
+		description: "OAuth session cleanup",
+	});
+
+	stopOAuthCleanupJob = unregisterOAuthCleanup;
+
+	// Set up periodic rate limit cleanup (every hour)
+	const unregisterRateLimitCleanup = registerCleanup({
+		id: "rate-limit-cleanup",
+		callback: async () => {
+			try {
+				const now = Date.now();
+				const clearedRows = await dbOps.clearExpiredRateLimits(now);
+				for (const row of clearedRows) {
+					forceCloseCircuit({ provider: row.provider, accountId: row.id }, now);
+				}
+				if (clearedRows.length > 0) {
+					log.debug(
+						`Cleared ${clearedRows.length} expired rate_limited_until entries`,
+					);
+				}
+			} catch (err) {
+				log.error(`Rate limit cleanup error: ${err}`);
+			}
+		},
+		minutes: 60,
+		description: "Rate limit cleanup",
+	});
+
+	stopRateLimitCleanupJob = unregisterRateLimitCleanup;
 
 	// Periodic WAL checkpoint every 60s to keep the WAL bounded. Runs PRAGMA
 	// optimize + PRAGMA wal_checkpoint(TRUNCATE) in a worker thread. This is the
@@ -1283,7 +1446,6 @@ export default async function startServer(options?: {
 	await initProxy(() => config.getStorePayloads());
 
 	// Proxy context
-	const internalProbeSecret = crypto.randomUUID();
 	const guardCorrelationVerifier = createGuardCorrelationVerifier(
 		readGuardCorrelationSecret(),
 	);
@@ -2076,6 +2238,37 @@ Available endpoints:
 		}
 	} else {
 		log.info(`No Kilo Gateway accounts found, usage polling will not start`);
+	}
+
+	// Start usage polling for Minimax accounts (Token Plan `remains` endpoint)
+	const minimaxAccounts = accounts.filter((a) => a.provider === "minimax");
+	const registeredMinimaxAccountIds = bootstrapMinimaxUsagePolling(
+		accounts,
+		usageCache,
+		config.getUsagePollIntervalMs(),
+		log,
+	);
+	if (minimaxAccounts.length === 0) {
+		log.info(`No Minimax accounts found, usage polling will not start`);
+	} else if (registeredMinimaxAccountIds.length > 0) {
+		log.info(
+			`Found ${minimaxAccounts.length} Minimax accounts, starting usage polling...`,
+		);
+		for (const accountId of registeredMinimaxAccountIds) {
+			const account = accounts.find((a) => a.id === accountId);
+			log.info(
+				`Started usage polling for Minimax account ${account?.name ?? accountId}`,
+			);
+		}
+	} else {
+		// All Minimax accounts exist but lack API keys. Per-account WARN logs
+		// already fired inside registerMinimaxUsagePolling; this summary
+		// makes the diagnosis unambiguous: the reason polling did not start
+		// is missing credentials, not a missing account. Matches the
+		// nanogpt/zai/kilo phrasing style (Greptile #350 P2).
+		log.info(
+			`Found ${minimaxAccounts.length} Minimax account(s) but all lack API keys, usage polling will not start`,
+		);
 	}
 
 	// Pre-warm Bedrock model and inference profile caches

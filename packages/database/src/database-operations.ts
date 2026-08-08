@@ -38,9 +38,15 @@ import { EMBEDDED_INCREMENTAL_VACUUM_WORKER_CODE } from "./inline-incremental-va
 import { EMBEDDED_VACUUM_WORKER_CODE } from "./inline-vacuum-worker";
 import { ensureSchema, runMigrations } from "./migrations";
 import { ensureSchemaPg, runMigrationsPg } from "./migrations-pg";
+import {
+	readMultiInstanceMode,
+	runStartupGuard,
+	startHeartbeatLoop,
+} from "./multi-instance-guard";
 import { resolveDbPath } from "./paths";
 import {
 	AccountRepository,
+	type ClearedRateLimit,
 	type MarkAccountRateLimitedResult,
 } from "./repositories/account.repository";
 import { AgentPreferenceRepository } from "./repositories/agent-preference.repository";
@@ -324,6 +330,8 @@ export class DatabaseOperations implements StrategyStore, Disposable {
 	private originalAutoVacuumMode?: number;
 	/** Prevents concurrent compact() calls from spawning multiple vacuum workers */
 	private compacting = false;
+	/** Stop function returned by the multi-instance guard's heartbeat loop. */
+	private heartbeatStop: (() => Promise<void>) | null = null;
 	/**
 	 * Hourly `incrementalVacuum()` ticks that bailed because the worker
 	 * couldn't claim the writer slot (SQLITE_BUSY). Bumped on every failure,
@@ -525,6 +533,15 @@ export class DatabaseOperations implements StrategyStore, Disposable {
 			await ensureSchemaPg(this.adapter);
 			await runMigrationsPg(this.adapter);
 		}
+		// Run the multi-instance guard after migrations so the heartbeat table
+		// exists before we probe it. SQLite migrations are synchronous so they
+		// were applied inside the constructor; for PG we just ran them above.
+		// Default mode is "warn" — see #351.
+		const mode = readMultiInstanceMode();
+		await runStartupGuard(this.adapter, { mode });
+		// Start the heartbeat loop so this instance's row is refreshed
+		// while it lives. The stopper is invoked from close().
+		this.heartbeatStop = startHeartbeatLoop(this.adapter);
 	}
 
 	setRuntimeConfig(runtime: RuntimeConfig): void {
@@ -937,11 +954,15 @@ OAuth tokens will need to be re-authenticated.
 	}
 
 	/**
-	 * Clear expired rate_limited_until values from all accounts
+	 * Clear expired rate_limited_until values from all accounts and return
+	 * the `(id, provider)` pairs that were cleared. The caller (server.ts)
+	 * feeds each cleared entry to the circuit breaker via `recordSuccess` —
+	 * the active-clear path from the circuit-breaker integration design §3.
+	 *
 	 * @param now The current timestamp to compare against
-	 * @returns Number of accounts that had their rate_limited_until cleared
+	 * @returns The accounts whose `rate_limited_until` was cleared
 	 */
-	async clearExpiredRateLimits(now: number): Promise<number> {
+	async clearExpiredRateLimits(now: number): Promise<ClearedRateLimit[]> {
 		return withDatabaseRetry(
 			() => this.accounts.clearExpiredRateLimits(now),
 			this.retryConfig,
@@ -1196,6 +1217,7 @@ OAuth tokens will need to be re-authenticated.
 			| "truncated"
 			| "client_cancelled"
 			| null,
+		clientSessionId?: string | null,
 	): Promise<void> {
 		await withDatabaseRetry(
 			() =>
@@ -1221,6 +1243,7 @@ OAuth tokens will need to be re-authenticated.
 					projectAttributionSource,
 					agentAttributionSource,
 					streamTerminalState,
+					clientSessionId,
 				}),
 			this.retryConfig,
 			"saveRequest",
@@ -1522,6 +1545,16 @@ OAuth tokens will need to be re-authenticated.
 	}
 
 	async close(): Promise<void> {
+		// Stop the multi-instance heartbeat loop and remove this instance's
+		// row before closing the adapter. Best-effort — errors here are
+		// logged inside the stopper, not rethrown.
+		if (this.heartbeatStop) {
+			try {
+				await this.heartbeatStop();
+			} finally {
+				this.heartbeatStop = null;
+			}
+		}
 		await this.adapter.close();
 	}
 

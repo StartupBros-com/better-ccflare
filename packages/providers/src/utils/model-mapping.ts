@@ -73,11 +73,15 @@ async function readBodyForTransform(request: Request): Promise<{
 	bytes: ArrayBuffer | null;
 	rebuild: (body: BodyInit) => Request;
 }> {
+	// Rebuilding from `request.url` (a string) does not inherit the signal, so
+	// it is carried over explicitly — otherwise a client disconnect can no
+	// longer abort the upstream fetch for every caller of this helper.
 	const rebuild = (body: BodyInit): Request =>
 		new Request(request.url, {
 			method: request.method,
 			headers: request.headers,
 			body,
+			signal: request.signal,
 		});
 	try {
 		return { bytes: await request.arrayBuffer(), rebuild };

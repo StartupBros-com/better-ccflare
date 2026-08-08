@@ -20,6 +20,7 @@ import {
 	isGpt56SolModel,
 	type ReasoningEffort,
 	resolveAnthropicReasoningEffort,
+	sanitizeSchemaForOpenAI,
 } from "@better-ccflare/openai-formats";
 import type { Account, LogicalModelCapability } from "@better-ccflare/types";
 import { BaseProvider } from "../../base";
@@ -77,7 +78,7 @@ const TOKEN_URL = "https://auth.openai.com/oauth/token";
 const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 export const CODEX_DEFAULT_ENDPOINT =
 	"https://chatgpt.com/backend-api/codex/responses";
-export const CODEX_VERSION = "0.145.0";
+export const CODEX_VERSION = "0.147.0";
 /** Hosts that are OpenAI's own Codex/Responses API, not a custom endpoint. */
 const OPENAI_PROMPT_CACHE_HOSTS = new Set(["chatgpt.com", "api.openai.com"]);
 export const CODEX_USER_AGENT = `codex-cli/${CODEX_VERSION} (Windows 10.0.26100; x64)`;
@@ -2068,7 +2069,9 @@ export class CodexProvider extends BaseProvider {
 				type: "function" as const,
 				name: t.name,
 				description: t.description,
-				parameters: t.input_schema,
+				parameters: sanitizeSchemaForOpenAI(t.input_schema) as
+					| Record<string, unknown>
+					| undefined,
 			}));
 		}
 

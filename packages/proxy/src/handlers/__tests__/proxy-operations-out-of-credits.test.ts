@@ -816,10 +816,16 @@ describe("proxyWithAccount — generic Anthropic 429 scope", () => {
 
 	it("cancels the discarded body for a model-scoped no-fallback 429", async () => {
 		cacheIncidentUsage("acc-anthropic-1", INCIDENT_NOW - 120_000);
-		const state = { cancelled: false };
+		// Released = drained to done OR cancelled (the discard helper drains
+		// since the v3.5.48 sync; cancel() is a leak no-op on released Bun).
+		const state = { released: false };
 		const body = new ReadableStream<Uint8Array>({
+			pull(controller) {
+				state.released = true;
+				controller.close();
+			},
 			cancel() {
-				state.cancelled = true;
+				state.released = true;
 			},
 		});
 		globalThis.fetch = mock(
@@ -843,7 +849,8 @@ describe("proxyWithAccount — generic Anthropic 429 scope", () => {
 			ctx,
 		);
 
-		expect(state.cancelled).toBe(true);
+		await Bun.sleep(0);
+		expect(state.released).toBe(true);
 	});
 
 	it("keeps the same fixture exact-model scoped when its snapshot is 181 seconds old", async () => {
@@ -939,7 +946,8 @@ describe("proxyWithAccount — generic Anthropic 429 scope", () => {
 	it("attributes a configured fallback 429 to its concrete Fable model", async () => {
 		cacheIncidentUsage("acc-anthropic-1", INCIDENT_NOW - 120_000);
 		let calls = 0;
-		const fallbackBodyState = { cancelled: false };
+		// Released = drained to done OR cancelled (see note in the test above).
+		const fallbackBodyState = { released: false };
 		globalThis.fetch = mock(async () => {
 			calls++;
 			return calls === 1
@@ -955,8 +963,12 @@ describe("proxyWithAccount — generic Anthropic 429 scope", () => {
 					)
 				: new Response(
 						new ReadableStream<Uint8Array>({
+							pull(controller) {
+								fallbackBodyState.released = true;
+								controller.close();
+							},
 							cancel() {
-								fallbackBodyState.cancelled = true;
+								fallbackBodyState.released = true;
 							},
 						}),
 						{
@@ -986,7 +998,8 @@ describe("proxyWithAccount — generic Anthropic 429 scope", () => {
 		);
 
 		expect(calls).toBe(2);
-		expect(fallbackBodyState.cancelled).toBe(true);
+		await Bun.sleep(0);
+		expect(fallbackBodyState.released).toBe(true);
 		expect(account.rate_limited_until).toBeNull();
 		expect(ctx.dbOps.markAccountRateLimited).not.toHaveBeenCalled();
 		expect(getRequestRateLimitOutcomes(req)[0]).toMatchObject({
@@ -1104,7 +1117,7 @@ describe("proxyWithAccount — generic Anthropic 429 scope", () => {
 
 interface ObservableErrorResponse {
 	response: Response;
-	cancelCount: () => number;
+	releaseCount: () => Promise<number>;
 }
 
 describe("proxyWithAccount — durable account cooldown ordering", () => {
@@ -1285,7 +1298,7 @@ describe("proxyWithAccount — scoped same-account model continuation", () => {
 
 		expect(result).toBeNull();
 		expect(attemptedModels).toEqual(["claude-fable-5"]);
-		expect(hardAccount429.cancelCount()).toBe(1);
+		expect(await hardAccount429.releaseCount()).toBe(1);
 		expect(account.rate_limited_until).toBe(INCIDENT_NOW + 120_000);
 		expect(ctx.dbOps.markAccountRateLimited).toHaveBeenCalledTimes(1);
 		expect(getRequestRateLimitOutcomes(req)).toEqual([
@@ -1340,7 +1353,7 @@ describe("proxyWithAccount — scoped same-account model continuation", () => {
 		await proxyUntilSuccessfulTransport(req, account, ctx, bodyBuffer);
 
 		expect(attemptedModels).toEqual(["claude-fable-5", "claude-opus-4-8"]);
-		expect(scopedFable.cancelCount()).toBe(1);
+		expect(await scopedFable.releaseCount()).toBe(1);
 		expect(account.rate_limited_until).toBeNull();
 		expect(ctx.dbOps.markAccountRateLimited).not.toHaveBeenCalled();
 		expect(getRequestRateLimitOutcomes(req)).toEqual([
@@ -1390,7 +1403,7 @@ describe("proxyWithAccount — scoped same-account model continuation", () => {
 			"claude-fable-5",
 			"claude-opus-4-8",
 		]);
-		expect(scopedFable.cancelCount()).toBe(1);
+		expect(await scopedFable.releaseCount()).toBe(1);
 		expect(account.rate_limited_until).toBeNull();
 		expect(ctx.dbOps.markAccountRateLimited).not.toHaveBeenCalled();
 		expect(getRequestRateLimitOutcomes(req)).toEqual([
@@ -1431,7 +1444,7 @@ describe("proxyWithAccount — scoped same-account model continuation", () => {
 			"claude-fable-5",
 			"claude-fable-5-20260701",
 		]);
-		expect(exactFable.cancelCount()).toBe(1);
+		expect(await exactFable.releaseCount()).toBe(1);
 		expect(account.rate_limited_until).toBeNull();
 		expect(ctx.dbOps.markAccountRateLimited).not.toHaveBeenCalled();
 		expect(getRequestRateLimitOutcomes(req)).toEqual([
@@ -1483,7 +1496,7 @@ describe("proxyWithAccount — scoped same-account model continuation", () => {
 
 		expect(result).toBeNull();
 		expect(attemptedModels).toEqual(["claude-fable-5"]);
-		expect(exactFable.cancelCount()).toBe(1);
+		expect(await exactFable.releaseCount()).toBe(1);
 		expect(account.rate_limited_until).toBeNull();
 		expect(ctx.dbOps.markAccountRateLimited).not.toHaveBeenCalled();
 		expect(getRequestRateLimitOutcomes(req)).toEqual([]);
@@ -1517,7 +1530,7 @@ describe("proxyWithAccount — scoped same-account model continuation", () => {
 		await proxyUntilSuccessfulTransport(req, account, ctx, bodyBuffer);
 
 		expect(attemptedModels).toEqual(["claude-fable-5", "claude-opus-4-8"]);
-		expect(scopedFable.cancelCount()).toBe(1);
+		expect(await scopedFable.releaseCount()).toBe(1);
 		expect(account.rate_limited_until).toBeNull();
 		expect(ctx.dbOps.markAccountRateLimited).not.toHaveBeenCalled();
 	});
@@ -1554,7 +1567,7 @@ describe("proxyWithAccount — scoped same-account model continuation", () => {
 
 		expect(result).toBeNull();
 		expect(attemptedModels).toEqual(["claude-fable-5"]);
-		expect(scopedFable.cancelCount()).toBe(1);
+		expect(await scopedFable.releaseCount()).toBe(1);
 		expect(account.rate_limited_until).toBeNull();
 		expect(ctx.dbOps.markAccountRateLimited).not.toHaveBeenCalled();
 	});
@@ -1564,7 +1577,13 @@ function observableErrorResponse(
 	status: number,
 	headers: HeadersInit = {},
 ): ObservableErrorResponse {
-	let cancellations = 0;
+	// A "release" is either an explicit body.cancel() or a drain-to-done read.
+	// Since the v3.5.48 sync, discardUpstreamBody delegates to the chunked
+	// drain primitive (discard-body-cancel.ts) because body.cancel() is a
+	// measured leak no-op on released Bun — so the released-exactly-once
+	// contract is observed via either mechanism.
+	let releases = 0;
+	let pushed = false;
 	const payload = new TextEncoder().encode(
 		JSON.stringify({
 			type: "error",
@@ -1577,11 +1596,18 @@ function observableErrorResponse(
 	return {
 		response: new Response(
 			new ReadableStream<Uint8Array>({
-				start(controller) {
-					controller.enqueue(payload);
+				pull(controller) {
+					if (!pushed) {
+						pushed = true;
+						controller.enqueue(payload);
+						return;
+					}
+					// Reading past the payload to `done` is the drain release.
+					releases++;
+					controller.close();
 				},
 				cancel() {
-					cancellations++;
+					releases++;
 				},
 			}),
 			{
@@ -1589,7 +1615,12 @@ function observableErrorResponse(
 				headers: { "content-type": "application/json", ...headers },
 			},
 		),
-		cancelCount: () => cancellations,
+		// The drain is fire-and-forget microtask work that settles after
+		// proxyWithAccount returns; yield one macrotask before counting.
+		releaseCount: async () => {
+			await Bun.sleep(0);
+			return releases;
+		},
 	};
 }
 
@@ -1660,7 +1691,7 @@ describe("proxyWithAccount — scoped failures returned by a 529 retry", () => {
 		expect(calls).toBe(2);
 		expect(account.rate_limited_until).toBeNull();
 		expect(ctx.dbOps.markAccountRateLimited).not.toHaveBeenCalled();
-		expect(retry429.cancelCount()).toBe(1);
+		expect(await retry429.releaseCount()).toBe(1);
 		expect(
 			usageCache.getModelScopedExhaustion(account.id, "claude-fable-5", null),
 		).not.toBeNull();
@@ -1710,7 +1741,7 @@ describe("proxyWithAccount — scoped failures returned by a 529 retry", () => {
 		expect(calls).toBe(2);
 		expect(account.rate_limited_until).toBeNull();
 		expect(ctx.dbOps.markAccountRateLimited).not.toHaveBeenCalled();
-		expect(retry429.cancelCount()).toBe(1);
+		expect(await retry429.releaseCount()).toBe(1);
 		expect(
 			usageCache.getFamilyScopedExhaustion(
 				account.id,

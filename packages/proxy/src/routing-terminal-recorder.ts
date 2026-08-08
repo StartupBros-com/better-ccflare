@@ -185,6 +185,7 @@ export function recordRoutingTerminalRequest(
 					projectAttributionSource:
 						requestMeta.projectAttributionSource ?? "none",
 					agentAttributionSource: requestMeta.agentAttributionSource ?? "none",
+					clientSessionId: requestMeta.clientSessionId ?? null,
 					responseStatus: options.response.status,
 					responseHeaders: Object.fromEntries(
 						options.response.headers.entries(),

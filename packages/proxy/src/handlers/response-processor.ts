@@ -7,6 +7,8 @@ import {
 	usageCache,
 } from "@better-ccflare/providers";
 import type { Account, RateLimitReason } from "@better-ccflare/types";
+import { circuitKeyFor, recordSuccess } from "../circuit-breaker";
+import { drainBody } from "./discard-body-cancel";
 import { isInternalProbe, type ProxyContext } from "./proxy-types";
 import {
 	applyRateLimitCooldown,
@@ -32,21 +34,27 @@ const log = new Logger("ResponseProcessor");
  * this outer clone too in the common "clone-then-read-the-inner-clone"
  * pattern used by anthropic/openai/base-anthropic-compatible, but fully
  * draining their inner clone also closes this one (tee branches close
- * together once the shared underlying source reaches EOF), so cancelling an
+ * together once the shared underlying source reaches EOF), so draining an
  * already-closed stream here is a harmless, immediately-resolved no-op.
- * Never awaited by the caller: cancellation may itself stay pending on a
+ * Never awaited by the caller: the drain may itself stay pending on a
  * still-unresolved sibling branch, and this function must never become
  * another place a caller can get stuck waiting.
+ *
+ * Uses `drainBody`, NOT `body.cancel()`: this repo's own benchmark
+ * (bench/drain-strategy-harness.ts) measured `body.cancel()` as a no-op on
+ * every released Bun (Bun 1.3.2 ~83 KB/req leak, 1.3.14 ~78 KB/req — both
+ * indistinguishable from never calling it at all). Only draining the body
+ * to done actually releases the native backing store on stock Bun.
  */
 function releaseUnconsumedClone(clone: Response): void {
 	if (clone.bodyUsed) return;
-	try {
-		clone.body?.cancel().catch(() => {
-			// Best effort only; see function doc above.
-		});
-	} catch {
-		// Body may already be locked/disturbed by the time we check; ignore.
-	}
+	const body = clone.body;
+	if (!body || body.locked) return;
+	// Fire and forget — releasing the buffer must not block the caller, and
+	// a drain that throws must not surface into the response path.
+	drainBody(body).catch(() => {
+		// Best effort only; see function doc above.
+	});
 }
 
 /**
@@ -223,6 +231,9 @@ export function updateAccountMetadata(
 
 		if (isStream && ctx.provider.parseUsage) {
 			const parseUsage = ctx.provider.parseUsage.bind(ctx.provider);
+			// Cloned eagerly (not inside the IIFE) so a synchronous
+			// response.clone() failure surfaces to the caller immediately
+			// rather than being swallowed by the async try/catch below.
 			const usageClone = response.clone() as Response;
 			(async () => {
 				try {
@@ -246,11 +257,23 @@ export function updateAccountMetadata(
 						error,
 					);
 				} finally {
+					// Releases the tee branch if parseUsage returned early
+					// (unsupported content-type, no body reader available)
+					// without ever reading it. See releaseUnconsumedClone's
+					// doc comment above for why this uses drainBody, not
+					// body.cancel(). See issue #354.
 					releaseUnconsumedClone(usageClone);
 				}
 			})();
 		} else if (!isStream && ctx.provider.extractUsageInfo) {
 			const extractUsageInfo = ctx.provider.extractUsageInfo.bind(ctx.provider);
+			// Cloned eagerly (not inside the IIFE) so a synchronous
+			// response.clone() failure surfaces to the caller immediately
+			// rather than being swallowed by the async try/catch below. The
+			// clone is consumed by extractUsageInfo (which itself clones
+			// again internally — see providers/anthropic/provider.ts:645);
+			// releasing before that await completes would truncate usage
+			// extraction, which is why release only happens in `finally`.
 			const usageClone = response.clone() as Response;
 			(async () => {
 				try {
@@ -274,6 +297,14 @@ export function updateAccountMetadata(
 						error,
 					);
 				} finally {
+					// After the await, the body is either fully consumed or
+					// the provider's reader was cancelled mid-stream. Either
+					// way the local has no further consumer; release its
+					// body if it is still unlocked. This bounds transient,
+					// concurrency-scaled off-heap retention per in-flight
+					// request — sequential requests are flat (no per-request
+					// growth), but under concurrent load the held clone
+					// compounds.
 					releaseUnconsumedClone(usageClone);
 				}
 			})();
@@ -341,6 +372,19 @@ export async function processProxyResponse(
 	// errors, would silently bypass marking and failover. The mid-stream case
 	// (status 200 with an SSE `event: error` frame partway through the body)
 	// is handled separately by the streaming forwarder — see issue #114.
+
+	// Hoisted out of the rate-limit branch below so the success branch can
+	// gate the new circuit-breaker `recordSuccess` call symmetrically with
+	// the existing `recordFailure` exclusion in applyRateLimitCooldown:
+	// without this guard, the keepalive scheduler (which fires parallel
+	// requests across every cached account simultaneously) becomes a
+	// timer-driven circuit-eraser — every keepalive tick that returns 200
+	// closes a circuit regardless of whether the upstream has actually
+	// recovered. The header is set by cache-keepalive-scheduler.ts and only
+	// synthetic replays carry it, so it cannot be confused for a real
+	// user-driven request.
+	const isKeepalive = isInternalProbe(requestMeta?.headers, ctx, "keepalive");
+
 	if (rateLimitInfo.isRateLimited) {
 		// Skip cooldown application on synthetic cache-keepalive replays. The
 		// keepalive scheduler fires parallel requests across every cached
@@ -350,7 +394,6 @@ export async function processProxyResponse(
 		// pool to zero routable accounts even though no user-visible quota
 		// was actually exhausted. Loop-prevention header set by
 		// cache-keepalive-scheduler.ts; only synthetic replays carry it.
-		const isKeepalive = isInternalProbe(requestMeta?.headers, ctx, "keepalive");
 		if (isKeepalive) {
 			log.warn(
 				`Keepalive replay for ${account.name} got ${response.status} — skipping cooldown (synthetic burst, not a real per-account rate limit)`,
@@ -421,6 +464,39 @@ export async function processProxyResponse(
 
 	if (!rateLimitInfo.isRateLimited && !skipAccountMetadata) {
 		completeRateLimitProbe(account, response.ok ? "recovered" : "abandoned");
+
+		// Notify the circuit breaker of the successful request — the
+		// request-path success call that fixes PR #349's
+		// "half-open probe can never close" defect (PR #349 audit,
+		// Risk 2: HIGH). Without this call the breaker's only success
+		// side-effect is `forceClose` from clearExpiredRateLimits, which
+		// cannot transition a `half-open` entry to `closed` (that is the
+		// half-open-only branch in `CircuitBreaker.recordSuccess`). The
+		// gate must survive three filters to fire:
+		//
+		//   1. response.ok — a 5xx against an open upstream is not
+		//      evidence of recovery; calling recordSuccess on a 500 would
+		//      close a circuit the upstream has not actually healed.
+		//   2. !isKeepalive — symmetric with the cooldown-skip above; see
+		//      comment on the hoisted constant.
+		//   3. !isInternalProbe(requestMeta?.headers, ctx, "auto-refresh")
+		//      — auto-refresh probes run on an internal cadence and
+		//      bypass user-quota state; treating one of their 200s as a
+		//      recovery signal would erase an open circuit any time the
+		//      auto-refresh scheduler happens to land successfully.
+		//
+		// The half-open close is the only mutation that matters here;
+		// `recordSuccess` on a `closed` entry with `failureCount > 0`
+		// clears the streak, which is also the right behaviour for a
+		// healthy stream of successful requests.
+		if (
+			response.ok &&
+			!isKeepalive &&
+			!isInternalProbe(requestMeta?.headers, ctx, "auto-refresh")
+		) {
+			recordSuccess(circuitKeyFor(account));
+		}
+
 		// Cooldown/reason state is cleared only by an actual provider-approved
 		// success (response.ok), never by a non-rate-limited error response
 		// (400/403/404/500/etc). Without this gate, ANY non-rate-limited error

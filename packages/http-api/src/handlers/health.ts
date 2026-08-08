@@ -15,7 +15,12 @@ import type {
 	Account,
 	AnthropicDegradedRuntimeHealth,
 } from "@better-ccflare/types";
-import type { HealthResponse, IntegrityStatus, PoolStatus } from "../types";
+import type {
+	HealthResponse,
+	IntegrityStatus,
+	PoolStatus,
+	RetentionStatus,
+} from "../types";
 import {
 	getRepresentativeUsageResetMs,
 	isUsageExhausted,
@@ -66,6 +71,7 @@ type UsageWorkerHealthFn = () => {
 };
 type IntegrityStatusFn = () => IntegrityStatus;
 type AnthropicDegradedHealthFn = () => AnthropicDegradedRuntimeHealth;
+type RetentionStatusFn = () => RetentionStatus;
 
 export function computePoolStatus(
 	accounts: Account[],
@@ -78,14 +84,25 @@ export function computePoolStatus(
 		(a) => !a.paused && a.rate_limited_until && a.rate_limited_until >= now,
 	);
 	const rate_limited = rateLimitedAccounts.length;
-	const routable = accounts.filter((a) => isAccountAvailable(a, now)).length;
-	// Subset of `routable`: accounts with no pause and no active cooldown
-	// whose usage window sits at 100% — they look available locally, yet
-	// upstream rejects their requests, so `routable > 0` alone can mask an
-	// effectively exhausted pool (incident 2026-07-09). Benched accounts are
-	// excluded — they are already visible via `rate_limited`, and counting
-	// them here would let usage_exhausted exceed routable (PR #299 review
-	// finding).
+	// `routable` reflects what ccflare will actually attempt to route, i.e.
+	// unpaused + no active cooldown + NOT usage-exhausted. Passing the usage
+	// snapshot here is load-bearing: without it, an account at 100% utilization
+	// with no `rate_limited_until` was counted as routable while upstream
+	// rejected every request — masking the effective outage from the dashboard
+	// and from clients polling /health (incident 2026-07-30T20:24-22:20Z:
+	// every 503 came back with a default 60s Retry-After that compounded with
+	// CLAUDE_CODE_MAX_RETRIES=5 to kill clients in 300s). The relationship
+	// between `routable` and `usage_exhausted` changed because `routable` now
+	// honors usage telemetry — see commit message for details.
+	const routable = accounts.filter((a) =>
+		isAccountAvailable(a, now, getUsageInfo(a) ?? undefined),
+	).length;
+	// `usage_exhausted` is the diagnostic overlay: accounts whose cached
+	// telemetry shows 100% utilization with a future reset, AND that have no
+	// other reason to be unavailable (no pause, no active cooldown). The
+	// pre-usage-aware isAccountAvailable gate is preserved on purpose so this
+	// counter keeps its PR #299 semantics (no double-counting with paused or
+	// rate_limited accounts).
 	const usage_exhausted = accounts.filter((a) => {
 		if (!isAccountAvailable(a, now)) return false;
 		const usage = getUsageInfo(a);
@@ -144,6 +161,39 @@ function toHttpStatus(status: HealthResponse["status"]): 200 | 503 {
 	return status === "ok" ? 200 : 503;
 }
 
+/**
+ * Build-time provenance for the /health response. Populated from env vars
+ * injected by the Dockerfile at build time:
+ *   - CCFLARE_VERSION: optional override; normally reads from
+ *     `npm_package_version` which is set automatically by `bun run` /
+ *     npm scripts.
+ *   - CCFLARE_GIT_SHA: full 40-char commit SHA the image was built from.
+ *   - CCFLARE_GIT_REF: branch / tag name (e.g. "main", "deploy/2026-07-30").
+ *   - CCFLARE_BUILD_DATE: RFC 3339 timestamp the image was built.
+ *
+ * Each field reports "unknown" when unset so the shape is stable and the
+ * canary can detect "field present but empty" vs "field missing" without
+ * guessing. The canary expects this four-tuple and uses it to compare
+ * against the deploy branch HEAD.
+ */
+function readBuildProvenance(): {
+	version: string;
+	git_sha: string;
+	git_ref: string;
+	build_date: string;
+} {
+	return {
+		version:
+			process.env.CCFLARE_VERSION ??
+			process.env.BETTER_CCFLARE_VERSION ??
+			process.env.npm_package_version ??
+			"unknown",
+		git_sha: process.env.CCFLARE_GIT_SHA ?? "unknown",
+		git_ref: process.env.CCFLARE_GIT_REF ?? "unknown",
+		build_date: process.env.CCFLARE_BUILD_DATE ?? "unknown",
+	};
+}
+
 export function createHealthHandler(
 	dbOps: DatabaseOperations,
 	config: Config,
@@ -152,6 +202,7 @@ export function createHealthHandler(
 	getIntegrityStatus?: IntegrityStatusFn,
 	getAccountUsageInfo: AccountUsageInfoFn = usageCacheUsageInfo,
 	getAnthropicDegradedHealth?: AnthropicDegradedHealthFn,
+	getRetentionStatus?: RetentionStatusFn,
 ) {
 	const normalCache = new TtlCache<HealthResponse>(2000);
 	const detailCache = new TtlCache<HealthResponse>(2000);
@@ -193,8 +244,12 @@ export function createHealthHandler(
 			accounts: pool.configured,
 			timestamp: new Date().toISOString(),
 			strategy: config.getStrategy(),
-			// Deploy provenance: lets a deploy be verified over HTTP (git_sha)
-			// without trusting the pinned binary filename.
+			// Deploy provenance: build-time env fields (git_ref, build_date) from
+			// the Dockerfile-injected readBuildProvenance(), with version/git_sha
+			// overridden by the fork's own --define-based mechanism so a deploy
+			// can still be verified over HTTP (git_sha) without trusting the
+			// pinned binary filename.
+			...readBuildProvenance(),
 			version: getVersionSync(),
 			git_sha: getGitSha(),
 			pool,
@@ -220,6 +275,7 @@ export function createHealthHandler(
 			response.runtime = runtime;
 			const integrity = getIntegrityStatus();
 			runtime.storage = {
+				...runtime.storage,
 				integrity: {
 					status: integrity.status,
 					runningKind: integrity.runningKind,
@@ -235,6 +291,27 @@ export function createHealthHandler(
 						? new Date(integrity.lastFullCheckAt).toISOString()
 						: null,
 					lastFullResult: integrity.lastFullResult,
+				},
+			};
+		}
+
+		// Add data-retention job telemetry independently — orthogonal to the
+		// blocks above. Lets operators dead-man-alert on lastSuccessAt instead
+		// of only finding out via a swallowed log line (#384).
+		if (getRetentionStatus) {
+			const runtime = response.runtime ?? {};
+			response.runtime = runtime;
+			const retention = getRetentionStatus();
+			runtime.storage = {
+				...runtime.storage,
+				retention: {
+					lastSuccessAt: retention.lastSuccessAt
+						? new Date(retention.lastSuccessAt).toISOString()
+						: null,
+					lastError: retention.lastError,
+					lastErrorAt: retention.lastErrorAt
+						? new Date(retention.lastErrorAt).toISOString()
+						: null,
 				},
 			};
 		}

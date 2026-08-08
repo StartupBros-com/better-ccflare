@@ -34,6 +34,7 @@ function makeConfig(
 		getAlertRequestTokens: () => 0,
 		getAlertAnomalyEnabled: () => false,
 		getAlertAnomalyIntervalMinutes: () => 15,
+		getAlertAnomalyLoopMinRequests: () => 10,
 		getAlertCooldownMinutes: () => overrides.cooldownMinutes ?? 60,
 		getAlertWebhookUrl: () => "",
 	}) as unknown as Config;

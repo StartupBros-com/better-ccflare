@@ -18,10 +18,12 @@ import type {
 	AlertsConfigPayload,
 	AlertType,
 	RequestResponse,
+	RunawayLoopGroup,
 } from "@better-ccflare/types";
 import {
 	type AnomalyRequestRow,
 	buildAnomalyInsightsResponse,
+	sanitizeProjectForDisplay,
 } from "./anomaly-insights";
 
 const log = new Logger("AlertsService");
@@ -58,6 +60,7 @@ interface AnomalySqlRow {
 	account: string | null;
 	model: string | null;
 	project: string | null;
+	agent_used: string | null;
 	input_tokens: number;
 	cache_read_input_tokens: number;
 	cache_creation_input_tokens: number;
@@ -72,6 +75,7 @@ export function getAlertsConfig(config: Config): AlertsConfigPayload {
 		requestTokens: config.getAlertRequestTokens(),
 		anomalyEnabled: config.getAlertAnomalyEnabled(),
 		anomalyIntervalMinutes: config.getAlertAnomalyIntervalMinutes(),
+		loopMinRequests: config.getAlertAnomalyLoopMinRequests(),
 		cooldownMinutes: config.getAlertCooldownMinutes(),
 		webhookUrl: config.getAlertWebhookUrl(),
 	};
@@ -90,6 +94,7 @@ export function setAlertsConfig(
 	config.setAlertRequestTokens(payload.requestTokens);
 	config.setAlertAnomalyEnabled(payload.anomalyEnabled);
 	config.setAlertAnomalyIntervalMinutes(payload.anomalyIntervalMinutes);
+	config.setAlertAnomalyLoopMinRequests(payload.loopMinRequests);
 	config.setAlertCooldownMinutes(payload.cooldownMinutes);
 }
 
@@ -105,6 +110,18 @@ export function buildThresholdAlertId(
 ): string {
 	const bucketMs = Math.max(1, cooldownMinutes) * 60 * 1000;
 	return `${type}:${scope}:${Math.floor(timestamp / bucketMs)}`;
+}
+
+export function buildRunawayLoopAlertId(
+	loop: RunawayLoopGroup,
+	cooldownMinutes: number,
+): string {
+	return buildThresholdAlertId(
+		"anomaly_runaway_loop",
+		`${loop.account}:${loop.model}:${loop.project ?? ""}:${loop.agentUsed ?? ""}`,
+		loop.windowEndMs,
+		cooldownMinutes,
+	);
 }
 
 function parseTimestamp(timestamp: string | number): number {
@@ -290,7 +307,11 @@ function toAlertEvent(row: AlertRow): AlertEvent {
 		threshold: row.threshold == null ? null : Number(row.threshold),
 		account: row.account,
 		model: row.model,
-		project: row.project,
+		// Defence in depth: sanitise at the read boundary so historical
+		// alert rows that pre-date the project-extraction fix cannot leak
+		// prompt content through the alerts UI. Stored DB data is not
+		// modified; only what the dashboard sees is clamped.
+		project: sanitizeProjectForDisplay(row.project),
 		requestId: row.request_id,
 		acknowledged: Boolean(row.acknowledged),
 	};
@@ -302,7 +323,17 @@ function toAnomalyRow(row: AnomalySqlRow): AnomalyRequestRow {
 		timestamp: Number(row.timestamp) || 0,
 		account: row.account,
 		model: row.model,
+		// Preserve the original project so the runaway-loop grouping key
+		// (account, model, project) sees distinct values for two projects
+		// that share a 63-char prefix but differ at the last char. The
+		// DB-side project is already sanitised at write time by
+		// sanitizeProjectName in proxy/src/project-attribution.ts
+		// (PROJECT_NAME_MAX_LEN=64, C0 control chars stripped). Display
+		// truncation for the API response below lives in the response
+		// builder, not here — truncation before detection makes the
+		// detector itself collapse distinct projects into one loop.
 		project: row.project,
+		agentUsed: row.agent_used,
 		inputTokens: Number(row.input_tokens) || 0,
 		cacheReadInputTokens: Number(row.cache_read_input_tokens) || 0,
 		cacheCreationInputTokens: Number(row.cache_creation_input_tokens) || 0,
@@ -437,7 +468,12 @@ export class AlertService {
 			`SELECT COUNT(*) as cnt FROM alerts WHERE id = ?`,
 			[id],
 		);
-		if (!row || row.cnt === 0) return false;
+		// Bun.SQL returns COUNT(*) on PostgreSQL as a JavaScript string (BIGINT
+		// is stringified, see Bun#22188). Strict equality `row.cnt === 0` is
+		// always false under that serialization, so the "missing id" branch
+		// never fires on PG. Coerce to Number first — the same coercion
+		// getUnacknowledgedCount() uses one method above.
+		if (!row || Number(row.cnt) === 0) return false;
 		await this.db.run(`UPDATE alerts SET acknowledged = 1 WHERE id = ?`, [id]);
 		return true;
 	}
@@ -530,6 +566,7 @@ export class AlertService {
 					a.name as account,
 					r.model as model,
 					r.project as project,
+					r.agent_used as agent_used,
 					COALESCE(r.input_tokens, 0) as input_tokens,
 					COALESCE(r.cache_read_input_tokens, 0) as cache_read_input_tokens,
 					COALESCE(r.cache_creation_input_tokens, 0) as cache_creation_input_tokens,
@@ -560,7 +597,11 @@ export class AlertService {
 		const response = buildAnomalyInsightsResponse({
 			rows,
 			rates,
-			options: { range: `${config.anomalyIntervalMinutes}m`, truncated: false },
+			options: {
+				range: `${config.anomalyIntervalMinutes}m`,
+				truncated: false,
+				loopMinRequests: config.loopMinRequests,
+			},
 		});
 		const alerts: AlertEvent[] = [];
 		for (const event of response.tokenOutliers.slice(
@@ -618,17 +659,12 @@ export class AlertService {
 			MAX_ANOMALY_ALERTS_PER_RUN,
 		)) {
 			alerts.push({
-				id: buildThresholdAlertId(
-					"anomaly_runaway_loop",
-					`${loop.account}:${loop.model}:${loop.project ?? ""}`,
-					loop.windowEndMs,
-					config.cooldownMinutes,
-				),
+				id: buildRunawayLoopAlertId(loop, config.cooldownMinutes),
 				timestamp: loop.windowEndMs,
 				type: "anomaly_runaway_loop",
 				severity: "critical",
 				title: "Runaway loop detected",
-				message: `${loop.requests} near-identical requests were sent in a short window for ${loop.model}.`,
+				message: `${loop.requests} near-identical requests were sent in a short window by ${loop.agentUsed ?? "an unattributed agent"} for ${loop.model}.`,
 				value: loop.requests,
 				threshold: null,
 				account: loop.account,
