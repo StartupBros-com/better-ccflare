@@ -79,7 +79,23 @@ export function teeStream(
 			if (terminalState !== "active") return;
 			terminalState = "cancelled";
 			runTerminalCallback(() => onCancel?.(reason));
-			return reader.cancel(reason);
+			// FORK DIVERGENCE from upstream 50ec29ba8d (which drains to `done`
+			// here instead of cancelling): in this fork, teeStream wraps the
+			// semantic-liveness / terminal-recovery stream chain, not the raw
+			// fetch body. Propagating reader.cancel(reason) is load-bearing:
+			// (1) it runs createAnthropicTerminalRecoveryStream's cancel()
+			// handler, which records streamTerminalState="client_cancelled"
+			// (response-handler.ts's onCancel comment documents this contract),
+			// and (2) it tears down a STALLED upstream during stall-recovery,
+			// where the client is still connected so upstream's drain — bounded
+			// only by the fetch abort signal — would hang forever holding the
+			// connection. Upstream's Bun cancel-leak rationale (oven-sh/bun#35093)
+			// applies to raw fetch bodies; releasing the raw body is the
+			// responsibility of the innermost wrapper in this fork's chain.
+			// One piece of upstream's change IS adopted: teardown must not
+			// throw, so a rejection from cancelling an already-errored inner
+			// stream is swallowed rather than propagated.
+			return reader.cancel(reason).catch(() => {});
 		},
 	});
 }
