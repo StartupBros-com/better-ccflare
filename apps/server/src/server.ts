@@ -1417,17 +1417,51 @@ export default async function startServer(options?: {
 			if (freeResult?.data) {
 				usageCache.set(accountId, freeResult.data);
 
-				const resetTimesMs = [
-					freeResult.data.five_hour?.resets_at,
-					freeResult.data.seven_day?.resets_at,
-				]
-					.map((iso) => (iso ? new Date(iso).getTime() : Number.NaN))
-					.filter((ms) => Number.isFinite(ms));
-				if (resetTimesMs.length > 0) {
+				const windows = [
+					freeResult.data.five_hour,
+					freeResult.data.seven_day,
+				].flatMap((w) => {
+					const resetMs = w?.resets_at
+						? new Date(w.resets_at).getTime()
+						: Number.NaN;
+					return Number.isFinite(resetMs)
+						? [{ utilization: w?.utilization ?? 0, resetMs }]
+						: [];
+				});
+				const exhausted = windows.filter((w) => w.utilization >= 100);
+				// The auto-refresh scheduler treats an account as probe-due once
+				// rate_limit_reset passes (its query includes codex). Persisting
+				// the EARLIEST reset while a LATER hard window is exhausted would
+				// schedule guaranteed-fail probes at the short-window boundary —
+				// when any window is exhausted, persist the latest exhausted
+				// window's reset instead (pro-gate round 2).
+				const candidateMs =
+					exhausted.length > 0
+						? Math.max(...exhausted.map((w) => w.resetMs))
+						: windows.length > 0
+							? Math.min(...windows.map((w) => w.resetMs))
+							: null;
+				const cooldownUntilMs =
+					account.rate_limited_until != null
+						? Number(account.rate_limited_until)
+						: null;
+				const existingResetMs =
+					account.rate_limit_reset != null
+						? Number(account.rate_limit_reset)
+						: null;
+				// While a real response-endpoint cooldown is active, never pull an
+				// already-later reset earlier on introspection data alone.
+				const preserveExisting =
+					cooldownUntilMs !== null &&
+					cooldownUntilMs > Date.now() &&
+					existingResetMs !== null &&
+					candidateMs !== null &&
+					existingResetMs > candidateMs;
+				if (candidateMs !== null && !preserveExisting) {
 					try {
 						await db.run(
 							"UPDATE accounts SET rate_limit_reset = ? WHERE id = ?",
-							[Math.min(...resetTimesMs), account.id],
+							[candidateMs, account.id],
 						);
 					} catch (error) {
 						log.warn(

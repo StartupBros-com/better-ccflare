@@ -1110,6 +1110,13 @@ class UsageCache {
 				// introspection endpoint — no quota consumed, unlike the
 				// quota-consuming ping in on-demand-fetch.ts.
 				const result = await fetchCodexUsageData(token);
+				if (!this.tokenProviders.has(accountId)) {
+					// Polling was stopped while this fetch was in flight (e.g. the
+					// account's endpoint changed away from the subscription
+					// backend): discard the snapshot rather than resurrecting
+					// stale subscription quota after teardown (pro-gate round 2).
+					return { success: false, retryAfterMs: null };
+				}
 				if (result.data) {
 					this.usageRateLimitedUntil.delete(accountId);
 					const callback = this.windowResetCallbacks.get(accountId);
