@@ -33,6 +33,8 @@ export interface PhysicalAttemptTelemetryInput {
 	readonly recoveryProbe?: boolean;
 }
 
+export type HostedDispatchState = "undispatched" | "hosted_dispatched";
+
 /**
  * Request-local ledger of concrete upstream route candidates. It deliberately
  * lives above combo and normal fallback loops so the same account/model pair is
@@ -47,6 +49,7 @@ export class RoutingAttemptLedger {
 	private guardAttemptOrdinal: number | undefined;
 	private lastPhysicalAccountId: string | null | undefined;
 	private retainedTerminalResponse: RetainedTerminalResponse | null = null;
+	private hostedDispatch: HostedDispatchState = "undispatched";
 
 	get attemptedCount(): number {
 		return this.attempted.size;
@@ -55,6 +58,22 @@ export class RoutingAttemptLedger {
 	/** Number of actual provider transports, including in-place retries. */
 	get physicalAttemptCount(): number {
 		return this.physicalAttempts;
+	}
+
+	/** Monotonic request-local ownership state for hosted server-tool dispatch. */
+	get hostedDispatchState(): HostedDispatchState {
+		return this.hostedDispatch;
+	}
+
+	/**
+	 * Claim the request's single hosted server-tool dispatch. The synchronous
+	 * check-and-set makes the first caller the exclusive owner; ownership is
+	 * intentionally never released or reset by retries or route failover.
+	 */
+	claimHostedDispatch(): boolean {
+		if (this.hostedDispatch === "hosted_dispatched") return false;
+		this.hostedDispatch = "hosted_dispatched";
+		return true;
 	}
 
 	/**
