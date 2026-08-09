@@ -1,4 +1,3 @@
-import { isServerToolWebSearchEnabled } from "@better-ccflare/config";
 import {
 	formatXaiCacheCanary,
 	getModelFamily,
@@ -116,6 +115,7 @@ import {
 	getRequestLifecycleCoordinator,
 	recordRoutingTerminalRequest,
 } from "./routing-terminal-recorder";
+import { bindRequestPrivateServerToolReplay } from "./server-tool-replay-runtime";
 import {
 	createServerToolRoutingErrorResponse,
 	ServerToolCandidateCapabilityError,
@@ -938,9 +938,8 @@ async function handleProxyCore(
 		if (!finalBodyBuffer) return undefined;
 		return new Response(finalBodyBuffer).body ?? undefined;
 	};
-	const serverToolRequirements = isServerToolWebSearchEnabled()
-		? finalRequestBodyContext.finalizeServerToolRequirements()
-		: undefined;
+	const serverToolRequirements =
+		finalRequestBodyContext.finalizeServerToolRequirements();
 	if (serverToolRequirements) {
 		requestMeta.serverToolRequirements = serverToolRequirements;
 		// Selection needs only the semantic presence bit. Keep the raw query out of
@@ -955,6 +954,22 @@ async function handleProxyCore(
 		if (serverToolRequirements.unsupported?.length) {
 			return createUnservedServerToolRoutingErrorResponse(
 				new ServerToolRoutingError({ reason: "unsupported_requirement" }),
+			);
+		}
+		if (
+			!(await bindRequestPrivateServerToolReplay(
+				requestMeta,
+				ctx.serverToolReplay,
+				{
+					request: req,
+					apiKeyId,
+					audience: routeCallerIdentity(req, apiKeyId),
+					lineage: sessionId,
+				},
+			))
+		) {
+			return createUnservedServerToolRoutingErrorResponse(
+				new ServerToolRoutingError({ reason: "replay_unavailable" }),
 			);
 		}
 	}
@@ -1159,6 +1174,7 @@ async function handleProxyCore(
 			capacityContext: null,
 			rateLimitOutcomes: [],
 			upstreamAttempts: 0,
+			hostedDispatchState: routingAttemptLedger.hostedDispatchState,
 		});
 		// A phase timeout is transient incomplete evidence, so keep the canonical
 		// route_unavailable body while explicitly inviting a bounded client retry.
@@ -1655,6 +1671,7 @@ async function handleProxyCore(
 			capacityContext: getRoutingCapacityContext(requestMeta),
 			rateLimitOutcomes: getRequestRateLimitOutcomes(req),
 			upstreamAttempts: 0,
+			hostedDispatchState: routingAttemptLedger.hostedDispatchState,
 			routeCircuitRecoveryHint: getRouteCircuitRecoveryHint(),
 		});
 		log.error(`Routing terminal: ${terminal.kind}`);
@@ -3100,6 +3117,7 @@ async function handleProxyCore(
 		capacityContext: getRoutingCapacityContext(requestMeta),
 		rateLimitOutcomes: getRequestRateLimitOutcomes(req),
 		upstreamAttempts: actualUpstreamAttempts,
+		hostedDispatchState: routingAttemptLedger.hostedDispatchState,
 		modelRecoveryAt: reactiveModelRecoveryAt,
 		message: formatRoutingAttemptMessage(
 			ERROR_MESSAGES.ALL_UPSTREAM_ROUTES_FAILED,

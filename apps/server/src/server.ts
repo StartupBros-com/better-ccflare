@@ -63,6 +63,7 @@ import {
 	CacheKeepaliveScheduler,
 	createAnthropicDegradedDetailedEventSink,
 	createAnthropicDegradedRuntimeHealth,
+	createDurableServerToolReplayWriterAdmission,
 	createGuardCorrelationVerifier,
 	createServerToolReplayRuntime,
 	DegradedModeObservability,
@@ -1138,8 +1139,13 @@ export default async function startServer(options?: {
 	// eagerly, so route through a mutable reference assigned once the
 	// ProxyContext exists — mirrors the getStrategy() lazy-getter pattern above.
 	let modelCatalogProxyContext: ProxyContext | null = null;
+	const serverToolReplayWriterAdmission =
+		createDurableServerToolReplayWriterAdmission(
+			dbOps.getServerToolReplayIssuanceRepository(),
+		);
 	const serverToolReplay = await createServerToolReplayRuntime(
 		loadServerToolReplayKeys(),
+		{ writerAdmission: serverToolReplayWriterAdmission.writerAdmission },
 	);
 	const anthropicDegradedConfig = config.getAnthropicDegradedModeConfig();
 	const anthropicDegradedMode = new AnthropicDegradedModeCoordinator({

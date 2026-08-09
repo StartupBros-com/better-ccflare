@@ -22,13 +22,25 @@ import {
 	resolveAnthropicReasoningEffort,
 	sanitizeSchemaForOpenAI,
 } from "@better-ccflare/openai-formats";
-import type { Account, LogicalModelCapability } from "@better-ccflare/types";
+import type {
+	Account,
+	LogicalModelCapability,
+	ServerToolCapabilityDecision,
+	ServerToolCapabilityTuple,
+	ServerToolRequirements,
+} from "@better-ccflare/types";
 import { BaseProvider } from "../../base";
 import {
 	estimateAnthropicRequestTokens,
 	resolveModelContextCapability,
 } from "../../request-capabilities";
-import type { RateLimitInfo, TokenRefreshResult } from "../../types";
+import type {
+	ProviderAttemptPlanContext,
+	ProviderServerToolCapabilityContext,
+	ProviderServerToolReplayIssuer,
+	RateLimitInfo,
+	TokenRefreshResult,
+} from "../../types";
 import {
 	CODEX_SINGLE_ORCHESTRATION_ROOT_ENV,
 	deriveConversationIdentity,
@@ -37,6 +49,14 @@ import {
 	peekOrchestrationRoot,
 	recordOrchestrationRootInstructions,
 } from "./orchestration-election";
+import {
+	createCodexHostedSearchAttemptPlan,
+	processCodexHostedSearchResponse,
+} from "./server-tool-attempt-plan";
+import {
+	createCodexServerToolCapabilityTuple,
+	resolveCodexServerToolCapability,
+} from "./server-tools";
 import {
 	CodexStreamLiveness,
 	type CodexStreamLivenessOptions,
@@ -719,6 +739,69 @@ export class CodexProvider extends BaseProvider {
 			heartbeatIntervalMs: options.streamHeartbeatIntervalMs,
 			rawSilenceTimeoutMs: options.streamRawSilenceTimeoutMs,
 		};
+	}
+
+	createServerToolCapabilityTuple(
+		context: ProviderServerToolCapabilityContext,
+	): ServerToolCapabilityTuple | undefined {
+		return createCodexServerToolCapabilityTuple(context);
+	}
+
+	resolveServerToolCapability(
+		requirements: ServerToolRequirements,
+		tuple: ServerToolCapabilityTuple,
+	): ServerToolCapabilityDecision {
+		return resolveCodexServerToolCapability(requirements, tuple);
+	}
+
+	createAttemptPlan(context: ProviderAttemptPlanContext) {
+		return createCodexHostedSearchAttemptPlan(context, {
+			prepareHeaders: (headers, accessToken) =>
+				this.prepareHeaders(headers, accessToken),
+			transformOrdinaryRequest: (request) =>
+				this.transformRequestBody(request, context.account),
+			processHostedResponse: (
+				response,
+				_requestHeaders,
+				requestedStream,
+				replayIssuer: ProviderServerToolReplayIssuer,
+				capabilityProofKey,
+				physicalModel,
+			) => {
+				const requestId = response.headers.get("x-better-ccflare-request-id");
+				if (requestId) this.requestStreamById.delete(requestId);
+				return processCodexHostedSearchResponse({
+					response,
+					requestedStream,
+					replayIssuer,
+					capabilityProofKey,
+					physicalModel,
+					sanitizeHeaders: sanitizeResponseHeaders,
+					sanitizeClientFunctionArguments: (name, argumentsJson) =>
+						this.sanitizeToolUsePartialJson(name, argumentsJson),
+					fallback: () => this.processResponse(response, context.account),
+				});
+			},
+			parseRateLimit: (response) => this.parseRateLimit(response),
+			...(this.isStreamingResponse
+				? {
+						isStreamingResponse: (response: Response) =>
+							this.isStreamingResponse?.(response) ?? false,
+					}
+				: {}),
+			...(this.extractTierInfo
+				? {
+						extractTierInfo: (response: Response) =>
+							this.extractTierInfo?.(response) ?? Promise.resolve(null),
+					}
+				: {}),
+			...(this.extractUsageInfo
+				? {
+						extractUsageInfo: (response: Response) =>
+							this.extractUsageInfo?.(response) ?? Promise.resolve(null),
+					}
+				: {}),
+		});
 	}
 
 	getLogicalModelCapability(

@@ -34,13 +34,15 @@ mock.module("@better-ccflare/database", () => ({
 const usageCollectorModule = await import("../usage-collector");
 const modelCatalogModule = await import("../model-catalog");
 const { handleProxy } = await import("../proxy");
+const { createReadyServerToolReplayRuntimeForTest } = await import(
+	"./helpers/server-tool-replay-runtime"
+);
 
 const MODEL = "claude-opus-4-8";
 const DEADLINE_ENVS = [
 	PRE_TRANSPORT_AGENT_INTERCEPTION_TIMEOUT_ENV,
 	PRE_TRANSPORT_ACCOUNT_SELECTION_TIMEOUT_ENV,
 	PRE_TRANSPORT_CREDENTIAL_RESOLUTION_TIMEOUT_ENV,
-	"CCFLARE_SERVER_TOOL_WEB_SEARCH",
 ] as const;
 const originalEnv = new Map(
 	DEADLINE_ENVS.map((name) => [name, process.env[name]] as const),
@@ -132,6 +134,14 @@ function makeContext(accounts: Account[]) {
 	return { ctx, pauseAccount, refreshInFlight, reportCandidateFailure };
 }
 
+async function installReadyServerToolReplay(ctx: ProxyContext) {
+	const reserveReplayIssuanceRange = mock(() => undefined);
+	ctx.serverToolReplay = await createReadyServerToolReplayRuntimeForTest({
+		onReserveReplayIssuanceRange: reserveReplayIssuanceRange,
+	});
+	return { reserveReplayIssuanceRange };
+}
+
 function makeRequest(
 	options: {
 		signal?: AbortSignal;
@@ -165,7 +175,6 @@ beforeEach(() => {
 	process.env[PRE_TRANSPORT_AGENT_INTERCEPTION_TIMEOUT_ENV] = "5";
 	process.env[PRE_TRANSPORT_ACCOUNT_SELECTION_TIMEOUT_ENV] = "5";
 	process.env[PRE_TRANSPORT_CREDENTIAL_RESOLUTION_TIMEOUT_ENV] = "5";
-	process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH = "1";
 	const collectorSpy = spyOn(
 		usageCollectorModule,
 		"getUsageCollector",
@@ -253,28 +262,39 @@ describe("proxy pre-transport recovery", () => {
 		const account = makeAccount("server-tool-requirement");
 		account.provider = "pre-transport-server-tool-test";
 		const { ctx } = makeContext([account]);
+		await installReadyServerToolReplay(ctx);
 		ctx.provider.name = account.provider;
 		ctx.provider.getLogicalModelCapability = () => ({
 			status: "supported",
 			provenance: "native_passthrough",
 			reason: "included",
 		});
-		ctx.provider.createServerToolCapabilityTuple = (context) => ({
-			candidateId: context.candidateId,
-			provider: context.account.provider,
-			authMode: "api-key",
-			endpointClass: "test-messages",
-			normalizedEndpoint: "https://upstream.test/v1/messages",
-			model: context.physicalModel,
-			toolType: "web_search_20250305",
-			profile: context.requirements.profileId ?? "missing-profile",
-			inputReplay: ["native-Anthropic"],
-			outputReplay: ["native-Anthropic"],
-			providerContractRevision: "pre-transport-test-v1",
-			replayDecoderRevision: "pre-transport-test-v1",
-			requestTransport: "test-messages-json",
-			responseTransport: "test-messages-json",
-		});
+		ctx.provider.createServerToolCapabilityTuple = (context) => {
+			const { optionProfileId, responseMode, mixedToolMode } =
+				context.requirements;
+			if (!optionProfileId || !responseMode || !mixedToolMode) {
+				throw new Error("Expected exact server-tool requirement profile");
+			}
+			return {
+				candidateId: context.candidateId,
+				provider: context.account.provider,
+				authMode: "api-key",
+				endpointClass: "test-messages",
+				normalizedEndpoint: "https://upstream.test/v1/messages",
+				model: context.physicalModel,
+				toolType: "web_search_20250305",
+				profile: context.requirements.profileId ?? "missing-profile",
+				optionProfile: optionProfileId,
+				responseMode,
+				mixedToolMode,
+				inputReplay: ["native-Anthropic"],
+				outputReplay: ["native-Anthropic"],
+				providerContractRevision: "pre-transport-test-v1",
+				replayDecoderRevision: "pre-transport-test-v1",
+				requestTransport: "test-messages-json",
+				responseTransport: "test-messages-json",
+			};
+		};
 		ctx.provider.resolveServerToolCapability = (_requirements, tuple) => ({
 			decision: "proven",
 			proof: Object.freeze({
@@ -340,6 +360,14 @@ describe("proxy pre-transport recovery", () => {
 				],
 			},
 		});
+		request.headers.set(
+			"authorization",
+			"Bearer pre-transport-server-tool-test",
+		);
+		request.headers.set(
+			"x-claude-code-session-id",
+			"pre-transport-server-tool-session",
+		);
 		const sourceBodyRead = spyOn(request, "arrayBuffer");
 		const response = await handleProxy(request, new URL(request.url), ctx);
 
@@ -353,7 +381,7 @@ describe("proxy pre-transport recovery", () => {
 			}
 		).serverToolRequirements;
 		expect(requirement).toMatchObject({
-			revision: 1,
+			revision: 2,
 			declarations: [
 				{
 					type: "web_search_20250305",
@@ -392,6 +420,7 @@ describe("proxy pre-transport recovery", () => {
 	it("leaves ordinary requests without server-tool routing metadata", async () => {
 		const account = makeAccount("ordinary-request");
 		const { ctx } = makeContext([account]);
+		const replay = await installReadyServerToolReplay(ctx);
 		const selectedMetas: RequestMeta[] = [];
 		ctx.strategy.select = mock(
 			async (accounts: Account[], meta: RequestMeta) => {
@@ -427,6 +456,8 @@ describe("proxy pre-transport recovery", () => {
 		expect(response.status).toBe(200);
 		expect(sourceBodyRead).toHaveBeenCalledTimes(1);
 		expect(selectedMetas).toHaveLength(1);
+		expect(selectedMetas[0]?.serverToolRequirements).toBeUndefined();
+		expect(replay.reserveReplayIssuanceRange).toHaveBeenCalledTimes(0);
 		expect(
 			(
 				selectedMetas[0] as RequestMeta & {

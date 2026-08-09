@@ -221,6 +221,17 @@ function ensureRoutingPolicyRevisionSchema(db: Database): void {
 	}
 }
 
+function ensureServerToolReplayIssuanceSchema(db: Database): void {
+	db.run(`
+		CREATE TABLE IF NOT EXISTS server_tool_replay_issuance (
+			counter_identity TEXT PRIMARY KEY
+				CHECK (length(counter_identity) BETWEEN 1 AND 512),
+			issuance_count INTEGER NOT NULL DEFAULT 0
+				CHECK (issuance_count >= 0 AND issuance_count <= 2147483648)
+		)
+	`);
+}
+
 export function ensureSchema(db: Database): void {
 	// Apply auto_vacuum = INCREMENTAL before any tables exist so fresh DBs are
 	// born in incremental-vacuum mode. SQLite stores this in the DB header and
@@ -421,6 +432,7 @@ export function ensureSchema(db: Database): void {
 		`CREATE INDEX IF NOT EXISTS idx_device_setup_jobs_account
 		 ON device_setup_jobs(account_id)`,
 	);
+	ensureServerToolReplayIssuanceSchema(db);
 
 	// Create agent_preferences table for storing user-defined agent settings
 	db.run(`

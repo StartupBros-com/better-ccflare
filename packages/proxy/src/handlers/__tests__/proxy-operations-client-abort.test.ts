@@ -1,7 +1,19 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import type { Account, RequestMeta } from "@better-ccflare/types";
-import { proxyWithAccount } from "../proxy-operations";
+import { AnthropicDegradedResponseLifecycle } from "../../anthropic-degraded-response-lifecycle";
+import type { AnthropicDegradedRequestSendState } from "../proxy-operations";
 import type { ProxyContext } from "../proxy-types";
+
+// Source worktrees intentionally omit generated database worker bundles. This
+// harness injects dbOps and never constructs the database classes.
+mock.module("@better-ccflare/database", () => ({
+	AsyncDbWriter: class AsyncDbWriter {},
+	DatabaseFactory: class DatabaseFactory {},
+	DatabaseOperations: class DatabaseOperations {},
+	ModelTranslationRepository: class ModelTranslationRepository {},
+}));
+
+const { proxyWithAccount } = await import("../proxy-operations");
 
 /**
  * The client's abort signal must reach the upstream fetch through the whole
@@ -307,6 +319,73 @@ describe("proxyWithAccount: a client disconnect must not look like an account fa
 		// fallback route for a request nobody is listening to.
 		expect(result).not.toBeNull();
 		expect(result?.status).toBe(499);
+	});
+
+	it("settles a committed degraded lifecycle as cancelled before returning 499", async () => {
+		const controller = new AbortController();
+		const settlements: string[] = [];
+		let committed = false;
+		const permit = {
+			kind: "recovery_send" as const,
+			leaseExpiresAt: null,
+			commit() {
+				committed = true;
+				return true;
+			},
+			cancel: () => false,
+			complete(outcome: string) {
+				if (!committed) return false;
+				settlements.push(outcome);
+				return true;
+			},
+			expire: () => false,
+		};
+		expect(permit.commit()).toBe(true);
+		const degradedState: AnthropicDegradedRequestSendState = {
+			admission: {} as never,
+			lifecycle: new AnthropicDegradedResponseLifecycle({
+				permit,
+				accountId: "acc-abort",
+				cohortKey: "cohort-abort" as never,
+				enforced: true,
+			}),
+			tracker: null,
+		};
+		globalThis.fetch = mock(async () => {
+			controller.abort();
+			throw abortError();
+		}) as unknown as typeof globalThis.fetch;
+		const bodyBuffer = makeRequestBody();
+		const req = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			body: bodyBuffer,
+			headers: { "Content-Type": "application/json" },
+			signal: controller.signal,
+		});
+
+		const result = await proxyWithAccount(
+			req,
+			new URL(req.url),
+			makeAccount(),
+			makeRequestMeta(),
+			bodyBuffer,
+			() => undefined,
+			0,
+			makeProxyContext(),
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			false,
+			undefined,
+			undefined,
+			undefined,
+			degradedState,
+		);
+
+		expect(result?.status).toBe(499);
+		expect(settlements).toEqual(["cancelled"]);
+		expect(degradedState.lifecycle?.isSettled).toBe(true);
 	});
 
 	it("still fails over when an abort did NOT come from the client", async () => {

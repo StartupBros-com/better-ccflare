@@ -182,6 +182,12 @@ export interface CodexWebSocketAttemptInput {
 	conversationIdentity?: string | null;
 	request: Request;
 	signal: AbortSignal;
+	/**
+	 * Called synchronously exactly once immediately before response.create is
+	 * written. Throwing vetoes the write, releases the active lane, and is
+	 * propagated to the caller.
+	 */
+	onBeforeFrameWrite?: () => void;
 	/** Called synchronously after send() succeeds, before waiting for any event. */
 	onFrameWritten?: (receipt: CodexWebSocketReceipt) => void;
 }

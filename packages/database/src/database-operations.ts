@@ -62,6 +62,7 @@ import {
 	type RequestData,
 	RequestRepository,
 } from "./repositories/request.repository";
+import { ServerToolReplayIssuanceRepository } from "./repositories/server-tool-replay-issuance.repository";
 import { StatsRepository } from "./repositories/stats.repository";
 import { StrategyRepository } from "./repositories/strategy.repository";
 import { UsageHistoryRepository } from "./repositories/usage-history.repository";
@@ -372,6 +373,7 @@ export class DatabaseOperations implements StrategyStore, Disposable {
 	private apiKeys: ApiKeyRepository;
 	private combo: ComboRepository;
 	private deviceSetupJobs: DeviceSetupJobRepository;
+	private serverToolReplayIssuance: ServerToolReplayIssuanceRepository;
 	private usageHistory: UsageHistoryRepository;
 	private cacheFlightRecorder: CacheFlightRecorderRepository;
 
@@ -521,6 +523,9 @@ export class DatabaseOperations implements StrategyStore, Disposable {
 		this.apiKeys = new ApiKeyRepository(this.adapter);
 		this.combo = new ComboRepository(this.adapter);
 		this.deviceSetupJobs = new DeviceSetupJobRepository(this.adapter);
+		this.serverToolReplayIssuance = new ServerToolReplayIssuanceRepository(
+			this.adapter,
+		);
 		this.usageHistory = new UsageHistoryRepository(this.adapter);
 		this.cacheFlightRecorder = new CacheFlightRecorderRepository(this.adapter);
 	}
@@ -986,6 +991,10 @@ OAuth tokens will need to be re-authenticated.
 
 	getDeviceSetupJobRepository(): DeviceSetupJobRepository {
 		return this.deviceSetupJobs;
+	}
+
+	getServerToolReplayIssuanceRepository(): ServerToolReplayIssuanceRepository {
+		return this.serverToolReplayIssuance;
 	}
 
 	// Usage-history operations delegated to repository

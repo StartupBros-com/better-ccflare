@@ -24,4 +24,11 @@ export abstract class BaseRepository<_T> {
 	): Promise<number> {
 		return this.adapter.runWithChanges(sql, params);
 	}
+
+	protected async runReturningOne<R>(
+		sql: string,
+		params: unknown[] = [],
+	): Promise<R | null> {
+		return this.adapter.runReturningOne<R>(sql, params);
+	}
 }
