@@ -10,6 +10,8 @@ import type {
 	ProviderAttemptNoExecutionSnapshot,
 	ProviderAttemptPlan,
 	ProviderAttemptPlanContext,
+	ProviderServerToolHistoryProjector,
+	ProviderServerToolReplayIssuer,
 } from "./types";
 
 type VertexAccountView = Account & {
@@ -147,6 +149,114 @@ function customPlan(
 }
 
 describe("materializeProviderAttemptPlan", () => {
+	test("bypasses custom planning for proof-null ordinary attempts", () => {
+		let plannerCalls = 0;
+		let legacyBuildCalls = 0;
+		const provider = baseProvider({
+			name: "ordinary-custom-capable",
+			createAttemptPlan() {
+				plannerCalls += 1;
+				return customPlan();
+			},
+			buildUrl() {
+				legacyBuildCalls += 1;
+				return "https://ordinary.invalid/v1/messages";
+			},
+		});
+
+		const plan = materializeProviderAttemptPlan(
+			provider,
+			context(accountFixture(), {
+				capabilityProofKey: null,
+			}),
+		);
+
+		expect(plannerCalls).toBe(0);
+		expect(legacyBuildCalls).toBe(1);
+		expect(plan.apiFamily).toBe("legacy:ordinary-custom-capable");
+		expect(plan.targetUrl).toBe("https://ordinary.invalid/v1/messages");
+	});
+
+	test("validates, snapshots, and hides request-private replay functions", () => {
+		const originalProjector: ProviderServerToolHistoryProjector = async () => ({
+			declarations: [],
+			nativeOpaquePositions: [],
+			replacements: [],
+			envelopeCount: 0,
+			encryptedInputBytes: 0,
+		});
+		const originalIssuer: ProviderServerToolReplayIssuer = async () =>
+			"bccf2.A256GCM.fixture";
+		let observedProjector: ProviderServerToolHistoryProjector | undefined;
+		let observedIssuer: ProviderServerToolReplayIssuer | undefined;
+		const provider = baseProvider({
+			name: "custom",
+			createAttemptPlan(planningContext) {
+				observedProjector = planningContext.serverToolHistoryProjector;
+				observedIssuer = planningContext.serverToolReplayIssuer;
+				return customPlan();
+			},
+		});
+
+		const plan = materializeProviderAttemptPlan(
+			provider,
+			context(accountFixture(), {
+				physicalModel: "gpt-5.6-sol",
+				capabilityProofKey: "proof:custom",
+				inputReplayMode: ["proxy-evidence-v1"],
+				outputReplayMode: ["proxy-evidence-v1"],
+				serverToolHistoryProjector: originalProjector,
+				serverToolReplayIssuer: originalIssuer,
+			}),
+		);
+
+		expect(observedProjector).toBeFunction();
+		expect(observedIssuer).toBeFunction();
+		expect(observedProjector).not.toBe(originalProjector);
+		expect(observedIssuer).not.toBe(originalIssuer);
+		expect(Object.isFrozen(observedProjector as object)).toBe(true);
+		expect(Object.isFrozen(observedIssuer as object)).toBe(true);
+		expect("serverToolHistoryProjector" in plan).toBe(false);
+		expect("serverToolReplayIssuer" in plan).toBe(false);
+		expect(JSON.stringify(plan)).not.toContain("serverToolReplay");
+	});
+
+	test.each([
+		["serverToolHistoryProjector", null],
+		["serverToolHistoryProjector", {}],
+		["serverToolReplayIssuer", "not-a-function"],
+		["serverToolReplayIssuer", Promise.resolve("not-a-function")],
+	] as const)("rejects an invalid private %s before provider hooks", (field, value) => {
+		let plannerCalls = 0;
+		let legacyCalls = 0;
+		const provider = baseProvider({
+			name: "custom",
+			createAttemptPlan() {
+				plannerCalls += 1;
+				return customPlan();
+			},
+			buildUrl() {
+				legacyCalls += 1;
+				return "https://legacy.invalid";
+			},
+		});
+
+		expect(() =>
+			materializeProviderAttemptPlan(
+				provider,
+				context(accountFixture(), {
+					physicalModel: "gpt-5.6-sol",
+					capabilityProofKey: "proof:custom",
+					inputReplayMode: ["proxy-evidence-v1"],
+					outputReplayMode: ["proxy-evidence-v1"],
+					[field]: value,
+				} as Partial<ProviderAttemptPlanContext>),
+			),
+		).toThrow(`Invalid provider attempt plan ${field}`);
+		expect(plannerCalls).toBe(0);
+		expect(legacyCalls).toBe(0);
+	});
+
 	test("preserves a null refresh token in the immutable legacy account view", async () => {
 		const sharedAccount = accountFixture();
 		Object.defineProperty(sharedAccount, "refresh_token", {
@@ -790,7 +900,15 @@ describe("materializeProviderAttemptPlan", () => {
 			} as Partial<Provider>);
 
 			expect(() =>
-				materializeProviderAttemptPlan(provider, context(sharedAccount)),
+				materializeProviderAttemptPlan(
+					provider,
+					context(sharedAccount, {
+						physicalModel: "gpt-5.6-sol",
+						capabilityProofKey: "proof:custom",
+						inputReplayMode: ["proxy-evidence-v1"],
+						outputReplayMode: ["proxy-evidence-v1"],
+					}),
+				),
 			).toThrow();
 			expect(legacyHookCalls).toBe(0);
 		}
@@ -826,7 +944,15 @@ describe("materializeProviderAttemptPlan", () => {
 			} as Partial<Provider>);
 
 			expect(() =>
-				materializeProviderAttemptPlan(provider, context(sharedAccount)),
+				materializeProviderAttemptPlan(
+					provider,
+					context(sharedAccount, {
+						physicalModel: "gpt-5.6-sol",
+						capabilityProofKey: "proof:custom",
+						inputReplayMode: ["proxy-evidence-v1"],
+						outputReplayMode: ["proxy-evidence-v1"],
+					}),
+				),
 			).toThrow();
 			expect(returnedHookCalls).toBe(0);
 		}

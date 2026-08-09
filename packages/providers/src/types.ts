@@ -7,6 +7,7 @@ import type {
 	ServerToolReplayAtom,
 	ServerToolRequirements,
 } from "@better-ccflare/types";
+import type { ServerToolHistoryProjection } from "./server-tools/history-projection";
 import type {
 	ServerToolReplayEnvelopeBinding,
 	ServerToolReplayEnvelopePayload,
@@ -66,6 +67,10 @@ export interface ProviderAttemptPlanContext {
 	readonly capabilityProofKey: string | null;
 	readonly inputReplayMode: readonly ServerToolReplayAtom[];
 	readonly outputReplayMode: readonly ServerToolReplayAtom[];
+	/** Request-private, proof-only history projection authority. */
+	readonly serverToolHistoryProjector?: ProviderServerToolHistoryProjector;
+	/** Request-private, proof-only replay-envelope issuance authority. */
+	readonly serverToolReplayIssuer?: ProviderServerToolReplayIssuer;
 }
 
 /**
@@ -130,6 +135,11 @@ export type ProviderServerToolReplayIssuer = (
 	binding: Omit<ServerToolReplayEnvelopeBinding, "audience" | "lineage">,
 	payload: ServerToolReplayEnvelopePayload,
 ) => Promise<string>;
+
+/** Project one snapshotted Anthropic history using trusted replay authority. */
+export type ProviderServerToolHistoryProjector = (
+	messages: unknown,
+) => Promise<ServerToolHistoryProjection>;
 
 export type ProviderAttemptDataRetryPolicy =
 	| Readonly<{ mode: "none"; maxAttempts: 0 }>

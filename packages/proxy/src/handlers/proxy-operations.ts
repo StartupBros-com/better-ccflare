@@ -103,6 +103,10 @@ import {
 	handleAnthropicSseRateLimit,
 } from "../response-handler";
 import { evaluateServerToolReplayEligibility } from "../server-tool-replay-eligibility";
+import {
+	type RequestPrivateServerToolReplay,
+	resolveRequestPrivateServerToolReplay,
+} from "../server-tool-replay-runtime";
 import { ServerToolCandidateCapabilityError } from "../server-tool-routing-errors";
 import {
 	recordServedAccount,
@@ -2104,6 +2108,7 @@ export async function proxyWithAccount(
 			proofKey: string;
 			inputReplayMode: readonly ServerToolReplayAtom[];
 			outputReplayMode: readonly ServerToolReplayAtom[];
+			replay: RequestPrivateServerToolReplay;
 		}>;
 		const serverToolRequirements = requestMeta.serverToolRequirements;
 		const routeCandidateId =
@@ -2185,6 +2190,12 @@ export async function proxyWithAccount(
 			if (!replayEligibility.eligible) {
 				throw candidateCapabilityError("replay_unavailable");
 			}
+			const replay = resolveRequestPrivateServerToolReplay(requestMeta, {
+				request: req,
+				apiKeyId,
+				lineage: sessionIdForObservation(req.headers),
+			});
+			if (!replay) throw candidateCapabilityError("replay_unavailable");
 			if (requireSelectedCandidateBinding) {
 				const selected = requestMeta.routingCandidates?.find(
 					(candidate) =>
@@ -2214,6 +2225,7 @@ export async function proxyWithAccount(
 				proofKey,
 				inputReplayMode,
 				outputReplayMode,
+				replay,
 			});
 		};
 
@@ -2248,6 +2260,9 @@ export async function proxyWithAccount(
 				capabilityProofKey: capability?.proofKey ?? null,
 				inputReplayMode: capability?.inputReplayMode ?? [],
 				outputReplayMode: capability?.outputReplayMode ?? [],
+				serverToolHistoryProjector:
+					capability?.replay.serverToolHistoryProjector,
+				serverToolReplayIssuer: capability?.replay.serverToolReplayIssuer,
 			});
 		};
 		const assertAttemptPlanCapabilityIsCurrent = (

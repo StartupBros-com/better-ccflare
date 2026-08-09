@@ -234,7 +234,14 @@ function makeContext(
 		provider,
 		refreshInFlight: new Map(),
 		asyncWriter: { enqueue: mutations.asyncWrite },
-		serverToolReplay: Object.freeze({ status: "disabled" }),
+		serverToolReplay: Object.freeze({
+			status: "ready",
+			codec: Object.freeze({
+				getWriterReadiness: () => Object.freeze({ status: "ready" }),
+				encode: async () => "bccf2.A256GCM.fixture",
+				decode: async () => Object.freeze({}),
+			}),
+		}),
 	} as unknown as ProxyContext;
 	return { ctx, refreshCalls, mutations, getAgentPreference, provider };
 }
@@ -291,12 +298,20 @@ function makeServerToolRequest(
 		forcedAccountId?: string;
 		model?: string;
 		query?: string;
+		replayIdentity?: "valid" | "missing" | "ambiguous";
 	} = {},
 ): Request {
 	const headers = new Headers({
 		"content-type": "application/json",
 		"anthropic-version": "2023-06-01",
 	});
+	if (options.replayIdentity !== "missing") {
+		headers.set("authorization", "Bearer server-tool-test-client");
+		headers.set("x-claude-code-session-id", "server-tool-test-session");
+	}
+	if (options.replayIdentity === "ambiguous") {
+		headers.set("x-api-key", "second-server-tool-test-client");
+	}
 	if (options.agentId) {
 		headers.set("x-better-ccflare-agent-id", options.agentId);
 	}
@@ -436,6 +451,53 @@ describe("server-tool routing integration", () => {
 		expect(mutations.asyncWrite).toHaveBeenCalledTimes(0);
 	});
 
+	it.each([
+		"missing",
+		"ambiguous",
+	] as const)("fails a %s request-private replay identity before selection or provider I/O", async (replayIdentity) => {
+		const account = makeAccount({
+			access_token: "test-token",
+			expires_at: Date.now() + 60 * 60_000,
+		});
+		const providerIo = {
+			buildUrl: mock(() => "https://capability.invalid/v1/responses"),
+			prepareHeaders: mock((headers: Headers) => new Headers(headers)),
+			processResponse: mock(async (response: Response) => response),
+			transformRequestBody: mock(async (request: Request) => request),
+		};
+		const { ctx, refreshCalls, mutations } = makeContext(
+			account,
+			(provider) => {
+				provider.buildUrl = providerIo.buildUrl;
+				provider.prepareHeaders = providerIo.prepareHeaders;
+				provider.processResponse = providerIo.processResponse;
+				provider.transformRequestBody = providerIo.transformRequestBody;
+			},
+		);
+		globalThis.fetch = mock(async () => new Response(null, { status: 500 }));
+		const request = makeServerToolRequest({ replayIdentity });
+
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.json();
+
+		expect(response.status).toBe(503);
+		expect(body).toMatchObject({
+			type: "error",
+			error: {
+				code: "server_tool_replay_unavailable",
+				reason: "replay_unavailable",
+			},
+		});
+		expect(ctx.strategy.select).toHaveBeenCalledTimes(0);
+		expect(refreshCalls.value).toBe(0);
+		expect(providerIo.buildUrl).toHaveBeenCalledTimes(0);
+		expect(providerIo.prepareHeaders).toHaveBeenCalledTimes(0);
+		expect(providerIo.processResponse).toHaveBeenCalledTimes(0);
+		expect(providerIo.transformRequestBody).toHaveBeenCalledTimes(0);
+		expect(mutations.asyncWrite).toHaveBeenCalledTimes(0);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+	});
+
 	it("stops an incapable pool before refresh, transport, mutation, or unauthenticated passthrough", async () => {
 		const account = makeAccount();
 		const { ctx, refreshCalls, mutations } = makeContext(account);
@@ -521,6 +583,14 @@ describe("server-tool routing integration", () => {
 				provider.resolveServerToolCapability = resolveCapability;
 			},
 		);
+		ctx.serverToolReplay = Object.freeze({
+			status: "ready",
+			codec: Object.freeze({
+				getWriterReadiness: () => Object.freeze({ status: "disabled" }),
+				encode: async () => "bccf2.A256GCM.fixture",
+				decode: async () => Object.freeze({}),
+			}),
+		}) as never;
 		globalThis.fetch = mock(
 			async () =>
 				new Response(JSON.stringify({ unexpected: true }), { status: 500 }),

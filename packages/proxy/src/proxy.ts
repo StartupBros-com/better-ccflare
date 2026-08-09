@@ -116,6 +116,7 @@ import {
 	getRequestLifecycleCoordinator,
 	recordRoutingTerminalRequest,
 } from "./routing-terminal-recorder";
+import { bindRequestPrivateServerToolReplay } from "./server-tool-replay-runtime";
 import {
 	createServerToolRoutingErrorResponse,
 	ServerToolCandidateCapabilityError,
@@ -955,6 +956,18 @@ async function handleProxyCore(
 		if (serverToolRequirements.unsupported?.length) {
 			return createUnservedServerToolRoutingErrorResponse(
 				new ServerToolRoutingError({ reason: "unsupported_requirement" }),
+			);
+		}
+		if (
+			!bindRequestPrivateServerToolReplay(requestMeta, ctx.serverToolReplay, {
+				request: req,
+				apiKeyId,
+				audience: routeCallerIdentity(req, apiKeyId),
+				lineage: sessionId,
+			})
+		) {
+			return createUnservedServerToolRoutingErrorResponse(
+				new ServerToolRoutingError({ reason: "replay_unavailable" }),
 			);
 		}
 	}

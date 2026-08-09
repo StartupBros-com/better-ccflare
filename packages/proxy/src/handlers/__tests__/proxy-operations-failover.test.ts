@@ -73,6 +73,21 @@ const {
 	proxyWithAccount,
 } = await import("../proxy-operations");
 const { RoutingAttemptLedger } = await import("../routing-attempt-ledger");
+const { bindRequestPrivateServerToolReplay } = await import(
+	"../../server-tool-replay-runtime"
+);
+const { opaqueRuntimeId } = await import("../../opaque-runtime-id");
+
+const TEST_REPLAY_CREDENTIAL = "Bearer proxy-operations-server-tool-test";
+const TEST_REPLAY_LINEAGE = "proxy-operations-server-tool-session";
+const TEST_SERVER_TOOL_REPLAY_RUNTIME = Object.freeze({
+	status: "ready" as const,
+	codec: Object.freeze({
+		getWriterReadiness: () => Object.freeze({ status: "ready" as const }),
+		encode: async () => "bccf2.A256GCM.fixture",
+		decode: async () => Object.freeze({}),
+	}),
+});
 
 // Minimal Account fixture for openai-compatible provider
 function makeAccount(overrides: Partial<Account> = {}): Account {
@@ -199,12 +214,7 @@ function makeProxyContext(): ProxyContext {
 }
 
 function enableServerToolReplay(ctx: ProxyContext): ProxyContext {
-	ctx.serverToolReplay = Object.freeze({
-		status: "ready",
-		codec: Object.freeze({
-			getWriterReadiness: () => Object.freeze({ status: "ready" }),
-		}),
-	}) as never;
+	ctx.serverToolReplay = TEST_SERVER_TOOL_REPLAY_RUNTIME as never;
 	return ctx;
 }
 
@@ -212,7 +222,11 @@ function makeRequest(body: ArrayBuffer) {
 	return new Request("https://proxy.local/v1/messages", {
 		method: "POST",
 		body,
-		headers: { "Content-Type": "application/json" },
+		headers: {
+			"Content-Type": "application/json",
+			authorization: TEST_REPLAY_CREDENTIAL,
+			"x-claude-code-session-id": TEST_REPLAY_LINEAGE,
+		},
 	});
 }
 
@@ -420,7 +434,7 @@ function bindServerToolCandidate(
 		input.proof.tuple,
 	);
 	expect(proofKey).toBeDefined();
-	return {
+	const boundMeta = {
 		...meta,
 		serverToolRequirements: input.requirements ?? SERVER_TOOL_REQUIREMENTS,
 		routingCandidates: [
@@ -445,6 +459,20 @@ function bindServerToolCandidate(
 			},
 		],
 	} as RequestMeta;
+	const identityRequest = makeRequest(makeRequestBody(input.physicalModel));
+	expect(
+		bindRequestPrivateServerToolReplay(
+			boundMeta,
+			TEST_SERVER_TOOL_REPLAY_RUNTIME as never,
+			{
+				request: identityRequest,
+				apiKeyId: null,
+				audience: opaqueRuntimeId("model-route-caller", TEST_REPLAY_CREDENTIAL),
+				lineage: TEST_REPLAY_LINEAGE,
+			},
+		),
+	).toBe(true);
+	return boundMeta;
 }
 
 describe("proxyWithAccount — immutable provider attempt plans", () => {
@@ -475,7 +503,7 @@ describe("proxyWithAccount — immutable provider attempt plans", () => {
 		}
 	});
 
-	it("materializes the effective final body before credential resolution and performs zero I/O when planning fails", async () => {
+	it("bypasses a custom planner for an ordinary proof-null attempt", async () => {
 		const planningContexts: Array<{
 			bodyModel: string | undefined;
 			physicalModel: string | null;
@@ -538,19 +566,12 @@ describe("proxyWithAccount — immutable provider attempt plans", () => {
 		}
 
 		expect(result).toBeNull();
-		expect(planningContexts).toEqual([
-			{
-				bodyModel: "combo-final-model",
-				physicalModel: "combo-final-model",
-				inputReplayMode: [],
-				outputReplayMode: [],
-			},
-		]);
-		expect(refreshCalls).toBe(0);
-		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+		expect(planningContexts).toEqual([]);
+		expect(refreshCalls).toBe(1);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
 	});
 
-	it("materializes a fresh plan for every physical-model fallback", async () => {
+	it("keeps ordinary physical-model fallbacks on the legacy plan path", async () => {
 		const planned: Array<{
 			physicalModel: string | null;
 			bodyModel: string | undefined;
@@ -609,23 +630,20 @@ describe("proxyWithAccount — immutable provider attempt plans", () => {
 			}
 		}
 
-		expect(planned).toEqual([
-			{ physicalModel: "primary", bodyModel: "primary" },
-			{ physicalModel: "fallback", bodyModel: "fallback" },
-		]);
+		expect(planned).toEqual([]);
 		expect(fetched).toEqual([
 			{
-				url: "https://planned.invalid/acc-1/primary",
+				url: "https://legacy.invalid/v1/messages",
 				model: "primary",
 			},
 			{
-				url: "https://planned.invalid/acc-1/fallback",
+				url: "https://legacy.invalid/v1/messages",
 				model: "fallback",
 			},
 		]);
 	});
 
-	it("fails a fallback locally when its fresh plan cannot be materialized", async () => {
+	it("does not invoke a proof-only planner for ordinary fallback rematerialization", async () => {
 		let planningCount = 0;
 		globalThis.fetch = mock(async () =>
 			jsonResponse({ error: { message: "rate limited" } }, 429),
@@ -659,11 +677,11 @@ describe("proxyWithAccount — immutable provider attempt plans", () => {
 		);
 
 		expect(result).toBeNull();
-		expect(planningCount).toBe(2);
-		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+		expect(planningCount).toBe(0);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(2);
 	});
 
-	it("materializes distinct plans when the outer route fails over between accounts", async () => {
+	it("does not invoke a proof-only planner across ordinary account failover", async () => {
 		const plannedAccountIds: string[] = [];
 		globalThis.fetch = mock(async () =>
 			jsonResponse({ error: "unauthorized" }, 401),
@@ -688,11 +706,11 @@ describe("proxyWithAccount — immutable provider attempt plans", () => {
 			expect(result).toBeNull();
 		}
 
-		expect(plannedAccountIds).toEqual(["account-a", "account-b"]);
+		expect(plannedAccountIds).toEqual([]);
 		expect(globalThis.fetch).toHaveBeenCalledTimes(2);
 	});
 
-	it("reuses the exact plan object for one in-place retry and response finalization", async () => {
+	it("captures one ordinary legacy plan for in-place retry and response finalization", async () => {
 		process.env.CCFLARE_OVERLOAD_RETRY_ENABLED = "true";
 		process.env.CCFLARE_OVERLOAD_RETRY_MAX_ATTEMPTS = "2";
 		process.env.CCFLARE_OVERLOAD_RETRY_BASE_MS = "0";
@@ -749,12 +767,9 @@ describe("proxyWithAccount — immutable provider attempt plans", () => {
 			}
 		}
 
-		expect(planningCount).toBe(1);
+		expect(planningCount).toBe(0);
 		expect(globalThis.fetch).toHaveBeenCalledTimes(2);
-		expect(
-			hookPlans.filter(({ hook }) => hook === "processResponse"),
-		).toHaveLength(2);
-		expect(new Set(hookPlans.map(({ plan }) => plan)).size).toBe(1);
+		expect(hookPlans).toHaveLength(0);
 		expect(sourceProviderHookCalls).toBe(0);
 	});
 
@@ -916,6 +931,101 @@ describe("proxyWithAccount — exact server-tool capability binding", () => {
 		expect(planContexts[0]?.inputReplayMode).not.toEqual(
 			SERVER_TOOL_REQUIREMENTS.replay.input,
 		);
+		expect(planContexts[0]?.serverToolHistoryProjector).toBeFunction();
+		expect(planContexts[0]?.serverToolReplayIssuer).toBeFunction();
+		expect(
+			Object.isFrozen(planContexts[0]?.serverToolHistoryProjector as object),
+		).toBe(true);
+		expect(
+			Object.isFrozen(planContexts[0]?.serverToolReplayIssuer as object),
+		).toBe(true);
+		expect(JSON.stringify(meta)).not.toContain("serverToolReplayIssuer");
+		expect(JSON.stringify(meta)).not.toContain("serverToolHistoryProjector");
+	});
+
+	it("revalidates request-private identity immediately before transform", async () => {
+		let planningCount = 0;
+		let transformCalls = 0;
+		let resolutionCount = 0;
+		const bodyBuffer = makeRequestBody("primary");
+		const request = makeRequest(bodyBuffer);
+		const provider = makeAttemptPlanningProvider({
+			onPlan: () => {
+				planningCount += 1;
+				request.headers.set("authorization", "Bearer rematerialized-identity");
+			},
+			onPlanHook: (hook) => {
+				if (hook === "transformRequestBody") transformCalls += 1;
+			},
+		});
+		provider.createServerToolCapabilityTuple = (context) =>
+			makeServerToolCapabilityTuple(context, provider.name);
+		provider.resolveServerToolCapability = (_requirements, tuple) => {
+			resolutionCount += 1;
+			return {
+				decision: "proven",
+				proof: makeServerToolCapabilityProof(tuple, "proof-stable"),
+			};
+		};
+		const account = makeAccount({
+			provider: provider.name,
+			model_mappings: JSON.stringify({ primary: "primary" }),
+		});
+		const initialTuple = makeServerToolCapabilityTuple(
+			{
+				candidateId: "account:acc-1",
+				account,
+				path: "/v1/messages",
+				query: "",
+				physicalModel: "primary",
+				requirements: SERVER_TOOL_REQUIREMENTS,
+			},
+			provider.name,
+		);
+		const meta = bindServerToolCandidate(makeRequestMeta(), {
+			provider: provider.name,
+			physicalModel: "primary",
+			proof: makeServerToolCapabilityProof(initialTuple, "proof-stable"),
+		});
+		const ctx = enableServerToolReplay(makeProxyContext());
+		ctx.provider = provider;
+		globalThis.fetch = mock(async () =>
+			jsonResponse({ unexpected: true }, 500),
+		);
+
+		let caught: unknown;
+		try {
+			await proxyWithAccount(
+				request,
+				new URL("https://proxy.local/v1/messages"),
+				account,
+				meta,
+				bodyBuffer,
+				() => undefined,
+				0,
+				ctx,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				false,
+				undefined,
+				undefined,
+				{ routeCandidateId: "account:acc-1" },
+			);
+		} catch (error) {
+			caught = error;
+		}
+
+		expect(caught).toBeInstanceOf(ServerToolCandidateCapabilityError);
+		expect((caught as ServerToolCandidateCapabilityError).reason).toBe(
+			"replay_unavailable",
+		);
+		expect(planningCount).toBe(1);
+		expect(resolutionCount).toBe(2);
+		expect(transformCalls).toBe(0);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+		expect(ctx.asyncWriter.enqueue).toHaveBeenCalledTimes(0);
 	});
 
 	it("fails locally when the exact proof identity drifts immediately before transform", async () => {

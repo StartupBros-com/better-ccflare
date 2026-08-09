@@ -19,11 +19,14 @@ const {
 	getServerToolReplayEnvelopeCounterIdentity,
 } = await import("@better-ccflare/providers");
 const {
+	bindRequestPrivateServerToolReplay,
 	createDurableServerToolReplayWriterAdmission,
 	createServerToolReplayRuntime,
+	resolveRequestPrivateServerToolReplay,
 	SERVER_TOOL_REPLAY_DECODER_REVISION,
 	SERVER_TOOL_REPLAY_WRITER_REVISION,
 } = await import("./server-tool-replay-runtime");
+const { opaqueRuntimeId } = await import("./opaque-runtime-id");
 
 const ACTIVE_BYTES = Uint8Array.from({ length: 32 }, (_, index) => index + 1);
 const RETAINED_BYTES = Uint8Array.from(
@@ -379,6 +382,283 @@ describe("durable server-tool replay writer admission", () => {
 });
 
 describe("server-tool replay runtime", () => {
+	it("binds only frozen projector and issuer closures to one private request identity", async () => {
+		const runtime = await createServerToolReplayRuntime(
+			readyState("next-active", [
+				{ id: "next-active", status: "active", key: [...ACTIVE_BYTES] },
+			]),
+			{
+				writerAdmission: {
+					enabled: true,
+					claimIssuance: async () => 1,
+				},
+			},
+		);
+		const requestMeta = { id: "request-private-owner" };
+		const credential = "Bearer replay-client";
+		const request = new Request("https://proxy.local/v1/messages", {
+			headers: {
+				authorization: credential,
+				"x-claude-code-session-id": "session-lineage",
+			},
+		});
+		const audience = opaqueRuntimeId("model-route-caller", credential);
+
+		expect(
+			bindRequestPrivateServerToolReplay(requestMeta, runtime, {
+				request,
+				apiKeyId: null,
+				audience,
+				lineage: "session-lineage",
+			}),
+		).toBe(true);
+		const authority = resolveRequestPrivateServerToolReplay(requestMeta, {
+			request,
+			apiKeyId: null,
+			lineage: "session-lineage",
+		});
+
+		expect(authority).not.toBeNull();
+		expect(Object.isFrozen(authority)).toBe(true);
+		expect(Object.isFrozen(authority?.serverToolHistoryProjector)).toBe(true);
+		expect(Object.isFrozen(authority?.serverToolReplayIssuer)).toBe(true);
+		expect(Object.keys(authority ?? {})).toEqual([
+			"serverToolHistoryProjector",
+			"serverToolReplayIssuer",
+		]);
+		expect(JSON.stringify(requestMeta)).toBe('{"id":"request-private-owner"}');
+		expect(JSON.stringify(authority)).toBe("{}");
+	});
+
+	it("snapshots projector and issuer inputs while overriding forged authority", async () => {
+		let issuanceCount = 0;
+		const runtime = await createServerToolReplayRuntime(
+			readyState("next-active", [
+				{ id: "next-active", status: "active", key: [...ACTIVE_BYTES] },
+			]),
+			{
+				writerAdmission: {
+					enabled: true,
+					claimIssuance: async () => {
+						issuanceCount += 1;
+						return issuanceCount;
+					},
+				},
+			},
+		);
+		const requestMeta = {};
+		const credential = "Bearer replay-client";
+		const request = new Request("https://proxy.local/v1/messages", {
+			headers: {
+				authorization: credential,
+				"x-claude-code-session-id": "session-lineage",
+			},
+		});
+		const audience = opaqueRuntimeId("model-route-caller", credential);
+		expect(
+			bindRequestPrivateServerToolReplay(requestMeta, runtime, {
+				request,
+				apiKeyId: null,
+				audience,
+				lineage: "session-lineage",
+			}),
+		).toBe(true);
+		const authority = resolveRequestPrivateServerToolReplay(requestMeta, {
+			request,
+			apiKeyId: null,
+			lineage: "session-lineage",
+		});
+		if (!authority) throw new Error("request-private replay was not bound");
+
+		const snapshotSourceBinding = {
+			envelopeKind: "source" as const,
+			toolType: "web_search_20250305",
+			callId: "srvtoolu_snapshot",
+			visibleQuery: "original query",
+			resultState: "result" as const,
+			ordinal: 0,
+			linkage: null,
+			visibleEvidence: [
+				{
+					url: "https://example.com/source",
+					title: "Snapshot source",
+					citedText: "",
+					pageAge: null,
+				},
+			],
+		};
+		const snapshotToken = await authority.serverToolReplayIssuer(
+			snapshotSourceBinding,
+			PAYLOAD,
+		);
+		const messages = [
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "server_tool_use",
+						id: "srvtoolu_snapshot",
+						name: "web_search",
+						input: { query: "original query" },
+					},
+				],
+			},
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "web_search_tool_result",
+						tool_use_id: "srvtoolu_snapshot",
+						content: [
+							{
+								type: "web_search_result",
+								url: "https://example.com/source",
+								title: "Snapshot source",
+								encrypted_content: snapshotToken,
+							},
+						],
+					},
+				],
+			},
+		];
+		const projectionPromise = authority.serverToolHistoryProjector(messages);
+		const mutableToolUse = messages[0]?.content[0];
+		if (!mutableToolUse || !("input" in mutableToolUse)) {
+			throw new Error("missing mutable server-tool use fixture");
+		}
+		mutableToolUse.input.query = "mutated query";
+		const projection = await projectionPromise;
+		expect(projection.replacements.length).toBeGreaterThan(0);
+		const replacementText = projection.replacements
+			.map((replacement) => replacement.text)
+			.join("\n");
+		expect(replacementText).toContain("original query");
+		expect(replacementText).not.toContain("mutated query");
+
+		const mutableBinding = {
+			...BINDING,
+			audience: "forged-audience",
+			lineage: "forged-lineage",
+			visibleQuery: "original query",
+		};
+		const mutablePayload = { ...PAYLOAD };
+		const tokenPromise = authority.serverToolReplayIssuer(
+			mutableBinding,
+			mutablePayload,
+		);
+		mutableBinding.visibleQuery = "mutated query";
+		mutablePayload.model = "mutated-model";
+		const token = await tokenPromise;
+		const trustedBinding = {
+			...BINDING,
+			audience,
+			lineage: "session-lineage",
+			visibleQuery: "original query",
+		};
+		expect(runtime.status).toBe("ready");
+		if (runtime.status !== "ready") throw new Error("runtime was not ready");
+		await expect(
+			runtime.codec.decode(token, trustedBinding),
+		).resolves.toMatchObject({
+			model: PAYLOAD.model,
+			audience,
+			lineage: "session-lineage",
+		});
+		await expect(
+			runtime.codec.decode(token, {
+				...trustedBinding,
+				audience: "forged-audience",
+			}),
+		).rejects.toMatchObject({ code: "invalid_server_tool_replay_envelope" });
+	});
+
+	it("rejects missing, ambiguous, rebound, and rematerialized request identities", async () => {
+		const runtime = await createServerToolReplayRuntime(
+			readyState("next-active", [
+				{ id: "next-active", status: "active", key: [...ACTIVE_BYTES] },
+			]),
+		);
+		const owner = {};
+		const credential = "Bearer replay-client";
+		const request = new Request("https://proxy.local/v1/messages", {
+			headers: {
+				authorization: credential,
+				"x-claude-code-session-id": "session-lineage",
+			},
+		});
+		const audience = opaqueRuntimeId("model-route-caller", credential);
+
+		expect(
+			bindRequestPrivateServerToolReplay(owner, runtime, {
+				request,
+				apiKeyId: null,
+				audience,
+				lineage: "session-lineage",
+			}),
+		).toBe(true);
+		expect(
+			bindRequestPrivateServerToolReplay(owner, runtime, {
+				request,
+				apiKeyId: null,
+				audience,
+				lineage: "session-lineage",
+			}),
+		).toBe(false);
+		expect(
+			resolveRequestPrivateServerToolReplay(
+				{},
+				{
+					request,
+					apiKeyId: null,
+					lineage: "session-lineage",
+				},
+			),
+		).toBeNull();
+		expect(
+			resolveRequestPrivateServerToolReplay(owner, {
+				request: new Request("https://proxy.local/v1/messages", {
+					headers: {
+						authorization: "Bearer different-client",
+						"x-claude-code-session-id": "session-lineage",
+					},
+				}),
+				apiKeyId: null,
+				lineage: "session-lineage",
+			}),
+		).toBeNull();
+		expect(
+			resolveRequestPrivateServerToolReplay(owner, {
+				request,
+				apiKeyId: null,
+				lineage: "different-lineage",
+			}),
+		).toBeNull();
+
+		const ambiguous = new Request("https://proxy.local/v1/messages", {
+			headers: {
+				authorization: credential,
+				"x-api-key": "second-credential",
+				"x-claude-code-session-id": "session-lineage",
+			},
+		});
+		expect(
+			bindRequestPrivateServerToolReplay({}, runtime, {
+				request: ambiguous,
+				apiKeyId: null,
+				audience,
+				lineage: "session-lineage",
+			}),
+		).toBe(false);
+		expect(
+			bindRequestPrivateServerToolReplay({}, runtime, {
+				request: new Request("https://proxy.local/v1/messages"),
+				apiKeyId: null,
+				audience: null,
+				lineage: null,
+			}),
+		).toBe(false);
+	});
+
 	it("waits for every key import and fails initialization closed", async () => {
 		const subtle = globalThis.crypto.subtle;
 		const originalImportKey = subtle.importKey.bind(subtle);
