@@ -118,10 +118,21 @@ When Claude Code sends `web_search_20250305`, better-ccflare must preserve it as
 
 **Files**
 
+- `packages/types/src/provider-capabilities.ts`
+- `packages/providers/src/types.ts`
+- `packages/providers/src/server-tool-capabilities.ts`
+- `packages/providers/src/server-tool-capabilities.test.ts`
+- `packages/providers/src/provider-attempt-plan.ts`
+- `packages/providers/src/provider-attempt-plan.test.ts`
 - `packages/providers/src/providers/codex/server-tools.ts`
 - `packages/providers/src/providers/codex/provider.ts`
 - `packages/providers/src/providers/codex/provider.server-tools.test.ts`
-- `packages/providers/src/server-tool-capabilities.test.ts`
+- `packages/providers/src/index.ts`
+- `packages/proxy/src/server-tool-replay-runtime.ts`
+- `packages/proxy/src/server-tool-replay-runtime.test.ts`
+- `packages/proxy/src/proxy.ts`
+- `packages/proxy/src/handlers/proxy-operations.ts`
+- `packages/proxy/src/handlers/__tests__/proxy-operations-failover.test.ts`
 
 **Test first**
 
@@ -131,13 +142,18 @@ When Claude Code sends `web_search_20250305`, better-ccflare must preserve it as
 - normalized restrictions survive native mapping exactly;
 - mapper output is deeply immutable and request-local;
 - no provider hook exposes a generic callback capable of blessing a forged tuple.
+- option values, response mode, mixed-tool mode, and replay shape all participate in tuple identity;
+- history projector and replay issuer closures are available only to a proof-bearing custom planner and never appear on serializable request metadata or the returned plan.
 
 **Implementation**
 
+- Extend the provider-neutral requirement and tuple contract with exact option-profile, response-mode, and mixed-tool-mode dimensions.
 - Define the finite embedded Codex profile matrix.
 - Implement `CodexProvider.createServerToolCapabilityTuple`, `resolveServerToolCapability`, and `createAttemptPlan`.
+- Bind the ready replay codec to trusted request-local audience/lineage and pass only frozen projector/issuer closures through capability-only attempt-plan context.
 - Map only a proven capability-bearing request to native hosted search.
-- Preserve existing Codex request behavior for every non-capability attempt.
+- Parse each native response event once and fan it out to hosted lifecycle reduction plus the existing client-function and usage/model terminal paths.
+- Preserve existing Codex request behavior for every non-capability attempt; `createAttemptPlan` is bypassed when the capability proof key is null.
 
 ### U2 — Hosted lifecycle, native decoder, and Anthropic encoder
 
