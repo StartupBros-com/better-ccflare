@@ -43,6 +43,17 @@ export const QWEN_MODEL_MAPPINGS = {
 	haiku: "coder-model",
 };
 
+registerProviderModelDefaultFactory("qwen", QWEN_MODEL_MAPPINGS);
+
+function resolvedQwenModelMappings(): Record<string, string> {
+	return Object.fromEntries(
+		Object.entries(QWEN_MODEL_MAPPINGS).map(([family, factory]) => [
+			family,
+			resolveProviderModelDefault("qwen", family) ?? factory,
+		]),
+	);
+}
+
 // Lines in the Claude Code system prompt that are environment/model-specific
 // and should be dropped entirely when proxying to Qwen.
 const DROP_LINE_PATTERNS = [
@@ -407,7 +418,7 @@ export class QwenProvider extends OpenAICompatibleProvider {
 		return {
 			...account,
 			model_mappings:
-				account.model_mappings ?? JSON.stringify(QWEN_MODEL_MAPPINGS),
+				account.model_mappings ?? JSON.stringify(resolvedQwenModelMappings()),
 		};
 	}
 

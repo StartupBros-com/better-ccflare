@@ -815,6 +815,47 @@ export interface RuntimeConfig {
 	};
 }
 
+export type ProviderModelDefaultOverrides = Record<
+	string,
+	Record<string, string>
+>;
+
+/**
+ * Env var that expands which providers accept editable model-default
+ * overrides (via the config file, the API, and the dashboard tab).
+ * Absent or empty => only "codex" is editable. This gates only the
+ * override SURFACE (listing, accepting POSTs, showing a dashboard
+ * tab) — the built-in factory maps for every provider (xai, qwen,
+ * ...) keep translating models exactly as before; nothing here
+ * touches model resolution itself.
+ */
+export const PROVIDER_MODEL_DEFAULTS_ENV_VAR =
+	"CCFLARE_MODEL_DEFAULTS_PROVIDERS";
+
+const DEFAULT_PROVIDER_MODEL_DEFAULTS_PROVIDERS: readonly string[] = ["codex"];
+
+/**
+ * Drops overrides for providers outside `enabledProviders` without
+ * mutating the input. Callers pass in the full, persisted overrides
+ * map and push the filtered result into the in-memory registry (see
+ * setProviderModelDefaultOverrides in @better-ccflare/providers) at
+ * boot and after a successful POST. The persisted file always keeps
+ * the full map — a disabled provider's stored override is never
+ * erased, just excluded here, so it re-applies automatically once
+ * CCFLARE_MODEL_DEFAULTS_PROVIDERS re-enables that provider.
+ */
+export function filterEnabledProviderModelDefaultOverrides(
+	enabledProviders: Iterable<string>,
+	overrides: ProviderModelDefaultOverrides,
+): ProviderModelDefaultOverrides {
+	const enabled = new Set(enabledProviders);
+	const filtered: ProviderModelDefaultOverrides = {};
+	for (const [provider, families] of Object.entries(overrides)) {
+		if (enabled.has(provider)) filtered[provider] = families;
+	}
+	return filtered;
+}
+
 export interface ConfigData {
 	lb_strategy?: StrategyName;
 	client_id?: string;
@@ -878,7 +919,12 @@ export interface ConfigData {
 	db_retry_delay_ms?: number;
 	db_retry_backoff?: number;
 	db_retry_max_delay_ms?: number;
-	[key: string]: string | number | boolean | undefined;
+	[key: string]:
+		| string
+		| number
+		| boolean
+		| ProviderModelDefaultOverrides
+		| undefined;
 }
 
 /**
@@ -1026,7 +1072,12 @@ export class Config extends EventEmitter {
 		defaultValue?: string | number | boolean,
 	): string | number | boolean | undefined {
 		if (key in this.data) {
-			return this.data[key];
+			const value = this.data[key];
+			// Settings with an object value (e.g.
+			// provider_model_default_overrides) have their own typed getter.
+			// This generic accessor serves scalars only — returning the object
+			// here would misrepresent the declared type.
+			return typeof value === "object" ? undefined : value;
 		}
 
 		if (defaultValue !== undefined) {

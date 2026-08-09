@@ -30,6 +30,17 @@ export const XAI_MODEL_MAPPINGS = {
 	fable: "grok-4.5",
 };
 
+registerProviderModelDefaultFactory("xai", XAI_MODEL_MAPPINGS);
+
+function resolvedXaiModelMappings(): Record<string, string> {
+	return Object.fromEntries(
+		Object.entries(XAI_MODEL_MAPPINGS).map(([family, factory]) => [
+			family,
+			resolveProviderModelDefault("xai", family) ?? factory,
+		]),
+	);
+}
+
 export class XaiProvider extends OpenAICompatibleProvider {
 	override name = "xai";
 
@@ -192,7 +203,7 @@ export class XaiProvider extends OpenAICompatibleProvider {
 			...account,
 			custom_endpoint: account.custom_endpoint ?? XAI_DEFAULT_ENDPOINT,
 			model_mappings:
-				account.model_mappings ?? JSON.stringify(XAI_MODEL_MAPPINGS),
+				account.model_mappings ?? JSON.stringify(resolvedXaiModelMappings()),
 		};
 	}
 

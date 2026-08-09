@@ -1066,6 +1066,12 @@ export default async function startServer(options?: {
 
 	// Initialize components
 	const config = container.resolve<Config>(SERVICE_KEYS.Config);
+	setProviderModelDefaultOverrides(
+		filterEnabledProviderModelDefaultOverrides(
+			config.getEnabledProviderModelDefaultProviders(),
+			config.getProviderModelDefaultOverrides(),
+		),
+	);
 	installOutboundProxy(() => config.getOutboundProxy());
 	const outboundProxyUrl = config.getOutboundProxy();
 	if (outboundProxyUrl) {
