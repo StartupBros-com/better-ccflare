@@ -5,6 +5,7 @@ import {
 } from "@better-ccflare/config";
 import {
 	DEFAULT_AGENT_MODEL,
+	KNOWN_PATTERNS,
 	NETWORK,
 	STRATEGIES,
 	type StrategyName,
