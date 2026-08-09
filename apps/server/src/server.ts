@@ -72,6 +72,7 @@ import {
 	DegradedOwnerOverlay,
 	drainUsageCollector,
 	forceCloseCircuit,
+	getCodexModels,
 	getModelCatalog,
 	getUsageCollectorHealth,
 	getValidAccessToken,
