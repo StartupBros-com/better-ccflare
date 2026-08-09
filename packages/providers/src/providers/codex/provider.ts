@@ -22,13 +22,23 @@ import {
 	resolveAnthropicReasoningEffort,
 	sanitizeSchemaForOpenAI,
 } from "@better-ccflare/openai-formats";
-import type { Account, LogicalModelCapability } from "@better-ccflare/types";
+import type {
+	Account,
+	LogicalModelCapability,
+	ServerToolCapabilityDecision,
+	ServerToolCapabilityTuple,
+	ServerToolRequirements,
+} from "@better-ccflare/types";
 import { BaseProvider } from "../../base";
 import {
 	estimateAnthropicRequestTokens,
 	resolveModelContextCapability,
 } from "../../request-capabilities";
-import type { RateLimitInfo, TokenRefreshResult } from "../../types";
+import type {
+	ProviderServerToolCapabilityContext,
+	RateLimitInfo,
+	TokenRefreshResult,
+} from "../../types";
 import {
 	CODEX_SINGLE_ORCHESTRATION_ROOT_ENV,
 	deriveConversationIdentity,
@@ -37,6 +47,10 @@ import {
 	peekOrchestrationRoot,
 	recordOrchestrationRootInstructions,
 } from "./orchestration-election";
+import {
+	createCodexServerToolCapabilityTuple,
+	resolveCodexServerToolCapability,
+} from "./server-tools";
 import {
 	CodexStreamLiveness,
 	type CodexStreamLivenessOptions,
@@ -719,6 +733,19 @@ export class CodexProvider extends BaseProvider {
 			heartbeatIntervalMs: options.streamHeartbeatIntervalMs,
 			rawSilenceTimeoutMs: options.streamRawSilenceTimeoutMs,
 		};
+	}
+
+	createServerToolCapabilityTuple(
+		context: ProviderServerToolCapabilityContext,
+	): ServerToolCapabilityTuple | undefined {
+		return createCodexServerToolCapabilityTuple(context);
+	}
+
+	resolveServerToolCapability(
+		requirements: ServerToolRequirements,
+		tuple: ServerToolCapabilityTuple,
+	): ServerToolCapabilityDecision {
+		return resolveCodexServerToolCapability(requirements, tuple);
 	}
 
 	getLogicalModelCapability(
