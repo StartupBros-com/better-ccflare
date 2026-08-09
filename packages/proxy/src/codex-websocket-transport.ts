@@ -726,16 +726,7 @@ export class CodexWebSocketTransport {
 			once: true,
 		});
 		entry.active = active;
-		try {
-			const frame = JSON.stringify({
-				...parsed.framePayload,
-				type: "response.create",
-			});
-			entry.socket.send(frame);
-			// WebSocket.send() synchronously queues/copies the frame. Drop the only
-			// canary-owned full-history serialization before awaiting the first event.
-			parsed.framePayload = {};
-		} catch {
+		const finishFallbackSafePreWriteFailure = (): null => {
 			this.finishActive(entry, active, true);
 			this.evict(entry, "send_failed");
 			this.counters.preWriteHttpFallbacks++;
@@ -750,6 +741,40 @@ export class CodexWebSocketTransport {
 				fallbackAllowedBeforeWrite: true,
 			});
 			return null;
+		};
+		let frame: string;
+		try {
+			frame = JSON.stringify({
+				...parsed.framePayload,
+				type: "response.create",
+			});
+		} catch {
+			return finishFallbackSafePreWriteFailure();
+		}
+		try {
+			input.onBeforeFrameWrite?.();
+		} catch (error) {
+			// A veto is still unambiguously pre-write. Release the active lane and
+			// its abort/stream resources, but preserve the healthy pooled socket.
+			parsed.framePayload = {};
+			this.finishActive(entry, active, true);
+			throw error;
+		}
+		try {
+			entry.socket.send(frame);
+			// WebSocket.send() synchronously queues/copies the frame. Drop the only
+			// canary-owned full-history serialization before awaiting the first event.
+			parsed.framePayload = {};
+		} catch (error) {
+			if (input.onBeforeFrameWrite) {
+				// The caller crossed its logical dispatch boundary immediately before
+				// send(), so a send error is ambiguous even if no receipt exists yet.
+				parsed.framePayload = {};
+				this.finishActive(entry, active, true);
+				this.evict(entry, "send_failed");
+				throw error;
+			}
+			return finishFallbackSafePreWriteFailure();
 		}
 		receipt.frameWritten = true;
 		active.frameWrittenAt = this.now();
