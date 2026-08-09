@@ -43,7 +43,6 @@ const SONNET = "claude-sonnet-4-5";
 
 const originalFetch = globalThis.fetch;
 const originalOverloadRetry = process.env.CCFLARE_OVERLOAD_RETRY_ENABLED;
-const originalServerToolWebSearch = process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH;
 const cachedUsageAccountIds = new Set<string>();
 let restoreUsageCollector = (): void => {};
 let usageHandleStart = mock(() => undefined);
@@ -185,6 +184,17 @@ function makeContext(accounts: Account[], combo: ComboWithSlots): ProxyContext {
 	} as unknown as ProxyContext;
 }
 
+function installReadyServerToolReplay(ctx: ProxyContext): void {
+	ctx.serverToolReplay = Object.freeze({
+		status: "ready",
+		codec: Object.freeze({
+			getWriterReadiness: () => Object.freeze({ status: "ready" }),
+			encode: async () => "bccf2.A256GCM.fixture",
+			decode: async () => Object.freeze({}),
+		}),
+	}) as never;
+}
+
 function makeRequest(extraHeaders: Record<string, string> = {}): Request {
 	return new Request("https://proxy.local/v1/messages", {
 		method: "POST",
@@ -203,6 +213,8 @@ function makeServerToolRequest(): Request {
 		headers: {
 			"content-type": "application/json",
 			"anthropic-version": "2023-06-01",
+			authorization: "Bearer model-first-server-tool-test",
+			"x-claude-code-session-id": "model-first-server-tool-session",
 		},
 		body: JSON.stringify({
 			model: FABLE,
@@ -454,7 +466,6 @@ beforeEach(() => {
 	resetRateLimitProbeGatesForTests();
 	installUsageCollector();
 	process.env.CCFLARE_OVERLOAD_RETRY_ENABLED = "false";
-	process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH = "1";
 });
 
 afterEach(() => {
@@ -468,11 +479,6 @@ afterEach(() => {
 		delete process.env.CCFLARE_OVERLOAD_RETRY_ENABLED;
 	} else {
 		process.env.CCFLARE_OVERLOAD_RETRY_ENABLED = originalOverloadRetry;
-	}
-	if (originalServerToolWebSearch === undefined) {
-		delete process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH;
-	} else {
-		process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH = originalServerToolWebSearch;
 	}
 });
 
@@ -1148,6 +1154,7 @@ describe("global model-first routing", () => {
 	it("runs only the exact proven Opus tail when a server-tool Fable route is capacity-blocked", async () => {
 		const blocked = makeAccount("server-tool-capacity-tail");
 		const ctx = makeContext([blocked], makeCombo({ account: blocked }));
+		installReadyServerToolReplay(ctx);
 		ctx.dbOps.getComboRoutingPolicy = mock(async (family: ComboFamily) =>
 			makeRoutingPolicy(null, family),
 		);
@@ -1198,6 +1205,7 @@ describe("global model-first routing", () => {
 	it("returns a capability terminal when the only deferred server-tool proof drifts before transport", async () => {
 		const blocked = makeAccount("server-tool-drifted-capacity-tail");
 		const ctx = makeContext([blocked], makeCombo({ account: blocked }));
+		installReadyServerToolReplay(ctx);
 		ctx.dbOps.getComboRoutingPolicy = mock(async (family: ComboFamily) =>
 			makeRoutingPolicy(null, family),
 		);

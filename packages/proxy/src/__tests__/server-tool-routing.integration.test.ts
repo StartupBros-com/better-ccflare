@@ -43,7 +43,6 @@ const { handleProxy } = await import("../proxy");
 const MODEL = "claude-sonnet-4-5";
 const originalFetch = globalThis.fetch;
 const originalPassthrough = process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
-const originalServerToolWebSearch = process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH;
 let restoreUsageCollectors = (): void => {};
 
 function makeAccount(overrides: Partial<Account> = {}): Account {
@@ -345,7 +344,6 @@ function makeServerToolRequest(
 
 beforeEach(() => {
 	process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL = "1";
-	process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH = "1";
 	const collector = {
 		handleStart: mock(() => undefined),
 		handleChunk: mock(() => undefined),
@@ -374,16 +372,10 @@ afterEach(() => {
 	} else {
 		process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL = originalPassthrough;
 	}
-	if (originalServerToolWebSearch === undefined) {
-		delete process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH;
-	} else {
-		process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH = originalServerToolWebSearch;
-	}
 });
 
 describe("server-tool routing integration", () => {
-	it("preserves native server-tool passthrough while admission is default-off", async () => {
-		delete process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH;
+	it("validates server-tool requirements without an activation flag", async () => {
 		const account = makeAccount({
 			access_token: "test-token",
 			expires_at: Date.now() + 60 * 60_000,
@@ -400,19 +392,20 @@ describe("server-tool routing integration", () => {
 		const request = makeServerToolRequest({ invalid: true });
 
 		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = (await response.json()) as {
+			error: { type: string; code: string; reason: string };
+		};
 
-		expect(response.status).toBe(200);
-		expect(ctx.strategy.select).toHaveBeenCalledTimes(1);
+		expect(response.status).toBe(400);
+		expect(body.error).toMatchObject({
+			type: "invalid_request_error",
+			code: "server_tool_invalid_requirement",
+			reason: "invalid_requirement",
+		});
+		expect(ctx.strategy.select).toHaveBeenCalledTimes(0);
 		expect(refreshCalls.value).toBe(0);
-		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
-		expect(forwardedBody?.tools).toEqual([
-			{
-				type: "web_search_20250305",
-				name: "web_search",
-				allowed_domains: ["example.com"],
-				blocked_domains: ["blocked.example"],
-			},
-		]);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+		expect(forwardedBody).toBeUndefined();
 		expect(mutations.pauseAccount).toHaveBeenCalledTimes(0);
 		expect(mutations.markAccountRateLimited).toHaveBeenCalledTimes(0);
 	});

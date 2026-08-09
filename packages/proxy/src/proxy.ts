@@ -1,4 +1,3 @@
-import { isServerToolWebSearchEnabled } from "@better-ccflare/config";
 import {
 	formatXaiCacheCanary,
 	getModelFamily,
@@ -939,9 +938,8 @@ async function handleProxyCore(
 		if (!finalBodyBuffer) return undefined;
 		return new Response(finalBodyBuffer).body ?? undefined;
 	};
-	const serverToolRequirements = isServerToolWebSearchEnabled()
-		? finalRequestBodyContext.finalizeServerToolRequirements()
-		: undefined;
+	const serverToolRequirements =
+		finalRequestBodyContext.finalizeServerToolRequirements();
 	if (serverToolRequirements) {
 		requestMeta.serverToolRequirements = serverToolRequirements;
 		// Selection needs only the semantic presence bit. Keep the raw query out of

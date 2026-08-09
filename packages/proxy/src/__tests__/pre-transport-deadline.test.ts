@@ -40,7 +40,6 @@ const DEADLINE_ENVS = [
 	PRE_TRANSPORT_AGENT_INTERCEPTION_TIMEOUT_ENV,
 	PRE_TRANSPORT_ACCOUNT_SELECTION_TIMEOUT_ENV,
 	PRE_TRANSPORT_CREDENTIAL_RESOLUTION_TIMEOUT_ENV,
-	"CCFLARE_SERVER_TOOL_WEB_SEARCH",
 ] as const;
 const originalEnv = new Map(
 	DEADLINE_ENVS.map((name) => [name, process.env[name]] as const),
@@ -132,6 +131,20 @@ function makeContext(accounts: Account[]) {
 	return { ctx, pauseAccount, refreshInFlight, reportCandidateFailure };
 }
 
+function installReadyServerToolReplay(ctx: ProxyContext) {
+	const encode = mock(async () => "bccf2.A256GCM.fixture");
+	const decode = mock(async () => Object.freeze({}));
+	ctx.serverToolReplay = Object.freeze({
+		status: "ready",
+		codec: Object.freeze({
+			getWriterReadiness: () => Object.freeze({ status: "ready" }),
+			encode,
+			decode,
+		}),
+	}) as never;
+	return { encode, decode };
+}
+
 function makeRequest(
 	options: {
 		signal?: AbortSignal;
@@ -165,7 +178,6 @@ beforeEach(() => {
 	process.env[PRE_TRANSPORT_AGENT_INTERCEPTION_TIMEOUT_ENV] = "5";
 	process.env[PRE_TRANSPORT_ACCOUNT_SELECTION_TIMEOUT_ENV] = "5";
 	process.env[PRE_TRANSPORT_CREDENTIAL_RESOLUTION_TIMEOUT_ENV] = "5";
-	process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH = "1";
 	const collectorSpy = spyOn(
 		usageCollectorModule,
 		"getUsageCollector",
@@ -253,6 +265,7 @@ describe("proxy pre-transport recovery", () => {
 		const account = makeAccount("server-tool-requirement");
 		account.provider = "pre-transport-server-tool-test";
 		const { ctx } = makeContext([account]);
+		installReadyServerToolReplay(ctx);
 		ctx.provider.name = account.provider;
 		ctx.provider.getLogicalModelCapability = () => ({
 			status: "supported",
@@ -350,6 +363,14 @@ describe("proxy pre-transport recovery", () => {
 				],
 			},
 		});
+		request.headers.set(
+			"authorization",
+			"Bearer pre-transport-server-tool-test",
+		);
+		request.headers.set(
+			"x-claude-code-session-id",
+			"pre-transport-server-tool-session",
+		);
 		const sourceBodyRead = spyOn(request, "arrayBuffer");
 		const response = await handleProxy(request, new URL(request.url), ctx);
 
@@ -402,6 +423,7 @@ describe("proxy pre-transport recovery", () => {
 	it("leaves ordinary requests without server-tool routing metadata", async () => {
 		const account = makeAccount("ordinary-request");
 		const { ctx } = makeContext([account]);
+		const replay = installReadyServerToolReplay(ctx);
 		const selectedMetas: RequestMeta[] = [];
 		ctx.strategy.select = mock(
 			async (accounts: Account[], meta: RequestMeta) => {
@@ -437,6 +459,9 @@ describe("proxy pre-transport recovery", () => {
 		expect(response.status).toBe(200);
 		expect(sourceBodyRead).toHaveBeenCalledTimes(1);
 		expect(selectedMetas).toHaveLength(1);
+		expect(selectedMetas[0]?.serverToolRequirements).toBeUndefined();
+		expect(replay.encode).toHaveBeenCalledTimes(0);
+		expect(replay.decode).toHaveBeenCalledTimes(0);
 		expect(
 			(
 				selectedMetas[0] as RequestMeta & {

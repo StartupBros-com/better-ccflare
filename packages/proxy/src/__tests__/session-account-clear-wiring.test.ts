@@ -159,7 +159,6 @@ function makeServerToolRequest(
 }
 
 let savedPassthrough: string | undefined;
-let savedServerToolWebSearch: string | undefined;
 let restoreUsageCollector = (): void => {};
 
 beforeEach(() => {
@@ -181,9 +180,7 @@ beforeEach(() => {
 		optionalCollectorSpy.mockRestore();
 	};
 	savedPassthrough = process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
-	savedServerToolWebSearch = process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH;
 	delete process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
-	process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH = "1";
 	SESSION_ID = `clear-wiring-session-${++sessionCounter}`;
 	// Seed a stale association (from an OLDER request, version 1) so each exit's
 	// clear — stamped with the current request's later timestamp — supersedes it.
@@ -199,11 +196,6 @@ afterEach(() => {
 		delete process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
 	} else {
 		process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL = savedPassthrough;
-	}
-	if (savedServerToolWebSearch === undefined) {
-		delete process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH;
-	} else {
-		process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH = savedServerToolWebSearch;
 	}
 });
 

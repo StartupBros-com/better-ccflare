@@ -1858,7 +1858,3 @@ export class Config extends EventEmitter {
 export type { StrategyName } from "@better-ccflare/core";
 export { resolveConfigPath } from "./paths";
 export { getLegacyConfigDir, getPlatformConfigDir } from "./paths-common";
-export {
-	CCFLARE_SERVER_TOOL_WEB_SEARCH_ENV,
-	isServerToolWebSearchEnabled,
-} from "./server-tool-web-search";
