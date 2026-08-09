@@ -259,22 +259,32 @@ describe("proxy pre-transport recovery", () => {
 			provenance: "native_passthrough",
 			reason: "included",
 		});
-		ctx.provider.createServerToolCapabilityTuple = (context) => ({
-			candidateId: context.candidateId,
-			provider: context.account.provider,
-			authMode: "api-key",
-			endpointClass: "test-messages",
-			normalizedEndpoint: "https://upstream.test/v1/messages",
-			model: context.physicalModel,
-			toolType: "web_search_20250305",
-			profile: context.requirements.profileId ?? "missing-profile",
-			inputReplay: ["native-Anthropic"],
-			outputReplay: ["native-Anthropic"],
-			providerContractRevision: "pre-transport-test-v1",
-			replayDecoderRevision: "pre-transport-test-v1",
-			requestTransport: "test-messages-json",
-			responseTransport: "test-messages-json",
-		});
+		ctx.provider.createServerToolCapabilityTuple = (context) => {
+			const { optionProfileId, responseMode, mixedToolMode } =
+				context.requirements;
+			if (!optionProfileId || !responseMode || !mixedToolMode) {
+				throw new Error("Expected exact server-tool requirement profile");
+			}
+			return {
+				candidateId: context.candidateId,
+				provider: context.account.provider,
+				authMode: "api-key",
+				endpointClass: "test-messages",
+				normalizedEndpoint: "https://upstream.test/v1/messages",
+				model: context.physicalModel,
+				toolType: "web_search_20250305",
+				profile: context.requirements.profileId ?? "missing-profile",
+				optionProfile: optionProfileId,
+				responseMode,
+				mixedToolMode,
+				inputReplay: ["native-Anthropic"],
+				outputReplay: ["native-Anthropic"],
+				providerContractRevision: "pre-transport-test-v1",
+				replayDecoderRevision: "pre-transport-test-v1",
+				requestTransport: "test-messages-json",
+				responseTransport: "test-messages-json",
+			};
+		};
 		ctx.provider.resolveServerToolCapability = (_requirements, tuple) => ({
 			decision: "proven",
 			proof: Object.freeze({
@@ -353,7 +363,7 @@ describe("proxy pre-transport recovery", () => {
 			}
 		).serverToolRequirements;
 		expect(requirement).toMatchObject({
-			revision: 1,
+			revision: 2,
 			declarations: [
 				{
 					type: "web_search_20250305",

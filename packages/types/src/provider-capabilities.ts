@@ -1,6 +1,14 @@
 /** One independently supported replay representation at provider capability seams. */
 export type ServerToolReplayAtom = "native-Anthropic" | "proxy-evidence-v1";
 
+/** Closed client response representation for one capability-bearing request. */
+export type ServerToolResponseMode = "json" | "streaming";
+
+/** Whether the request combines ordinary client functions with a server tool. */
+export type ServerToolMixedToolMode =
+	| "server_only"
+	| "server_and_client_functions";
+
 export interface ServerToolReplayRequirement {
 	readonly input: readonly ServerToolReplayAtom[];
 	readonly output: readonly ServerToolReplayAtom[];
@@ -37,8 +45,13 @@ export interface UnsupportedServerToolRequirement {
  * body. It deliberately excludes messages, client-function schemas, and model.
  */
 export interface ServerToolRequirements {
-	readonly revision: 1;
+	readonly revision: 2;
+	/** Intentionally low-cardinality, value-free telemetry profile. */
 	readonly profileId?: string;
+	/** Collision-resistant identity of the exact normalized admitted options. */
+	readonly optionProfileId?: string;
+	readonly responseMode?: ServerToolResponseMode;
+	readonly mixedToolMode?: ServerToolMixedToolMode;
 	readonly hasClientFunctions?: true;
 	readonly declarations?: readonly WebSearchServerToolDeclaration[];
 	readonly invalid?: readonly InvalidServerToolRequirement[];
@@ -55,7 +68,12 @@ export interface ServerToolCapabilityTuple {
 	readonly normalizedEndpoint?: string;
 	readonly model: string;
 	readonly toolType: string;
+	/** Intentionally low-cardinality, value-free telemetry profile. */
 	readonly profile: string;
+	/** Exact normalized option profile; distinct from `profile`. */
+	readonly optionProfile: string;
+	readonly responseMode: ServerToolResponseMode;
+	readonly mixedToolMode: ServerToolMixedToolMode;
 	readonly inputReplay: readonly ServerToolReplayAtom[];
 	readonly outputReplay: readonly ServerToolReplayAtom[];
 	readonly providerContractRevision: string;

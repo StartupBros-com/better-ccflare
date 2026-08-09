@@ -314,9 +314,13 @@ function makeAttemptPlanningProvider(
 }
 
 const SERVER_TOOL_REQUIREMENTS: ServerToolRequirements = Object.freeze({
-	revision: 1,
+	revision: 2,
 	profileId:
 		"web-search-20250305-v1:domains-none:max-none:location-absent:client-no",
+	optionProfileId:
+		"server-tool-option-profile-v1.sha256.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+	responseMode: "json",
+	mixedToolMode: "server_only",
 	declarations: Object.freeze([
 		Object.freeze({ type: "web_search_20250305" as const }),
 	]),
@@ -346,6 +350,10 @@ function makeServerToolCapabilityTuple(
 		customEndpoint?: string | null;
 		custom_endpoint?: string | null;
 	};
+	const { optionProfileId, responseMode, mixedToolMode } = context.requirements;
+	if (!optionProfileId || !responseMode || !mixedToolMode) {
+		throw new Error("Expected exact server-tool requirement profile");
+	}
 	return Object.freeze({
 		candidateId: context.candidateId,
 		provider: providerName,
@@ -358,6 +366,9 @@ function makeServerToolCapabilityTuple(
 		model: context.physicalModel,
 		toolType: "web_search_20250305",
 		profile: context.requirements.profileId ?? "missing-profile",
+		optionProfile: optionProfileId,
+		responseMode,
+		mixedToolMode,
 		inputReplay: Object.freeze([...inputReplay]),
 		outputReplay: Object.freeze([...outputReplay]),
 		providerContractRevision: "test-provider-contract-v1",

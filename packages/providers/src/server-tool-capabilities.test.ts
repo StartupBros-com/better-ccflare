@@ -82,6 +82,10 @@ function capabilityTupleFixture(
 		model: "gpt-5.6-sol",
 		toolType: "web_search_20250305",
 		profile: "web-search-profile-1",
+		optionProfile:
+			"server-tool-option-profile-v1.sha256.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		responseMode: "streaming",
+		mixedToolMode: "server_only",
 		inputReplay: ["native-Anthropic", "proxy-evidence-v1"],
 		outputReplay: ["native-Anthropic", "proxy-evidence-v1"],
 		providerContractRevision: "codex-responses-v1",
@@ -122,6 +126,84 @@ function requireDefined<T>(value: T | null | undefined, message: string): T {
 }
 
 describe("deriveServerToolRequirement", () => {
+	test("binds exact normalized options without exposing option values", () => {
+		const first = deriveServerToolRequirement({
+			tools: [
+				{
+					type: "web_search_20250305",
+					name: "web_search",
+					max_uses: 2,
+					allowed_domains: ["one.example/docs"],
+					user_location: { type: "approximate", country: "US" },
+				},
+			],
+		});
+		const second = deriveServerToolRequirement({
+			tools: [
+				{
+					type: "web_search_20250305",
+					name: "web_search",
+					max_uses: 8,
+					allowed_domains: ["two.example/docs"],
+					user_location: { type: "approximate", country: "CA" },
+				},
+			],
+		});
+
+		const firstOptionProfile = (
+			first as unknown as { optionProfileId?: string }
+		).optionProfileId;
+		const secondOptionProfile = (
+			second as unknown as { optionProfileId?: string }
+		).optionProfileId;
+		expect(first?.profileId).toBe(second?.profileId);
+		expect(firstOptionProfile).toMatch(
+			/^server-tool-option-profile-v1\.sha256\.[a-f0-9]{64}$/,
+		);
+		expect(secondOptionProfile).not.toBe(firstOptionProfile);
+		expect(firstOptionProfile).not.toContain("one.example");
+		expect(firstOptionProfile).not.toContain("US");
+	});
+
+	test("derives closed response and mixed-tool modes and rejects invalid stream values", () => {
+		const jsonServerOnly = deriveServerToolRequirement({
+			stream: false,
+			tools: [{ type: "web_search_20250305", name: "web_search" }],
+		}) as unknown as {
+			responseMode?: string;
+			mixedToolMode?: string;
+		};
+		const streamingMixed = deriveServerToolRequirement({
+			stream: true,
+			tools: [
+				{ name: "lookup", input_schema: { type: "object" } },
+				{ type: "web_search_20250305", name: "web_search" },
+			],
+		}) as unknown as {
+			responseMode?: string;
+			mixedToolMode?: string;
+		};
+
+		expect(jsonServerOnly).toMatchObject({
+			responseMode: "json",
+			mixedToolMode: "server_only",
+		});
+		expect(streamingMixed).toMatchObject({
+			responseMode: "streaming",
+			mixedToolMode: "server_and_client_functions",
+		});
+		expect(
+			deriveServerToolRequirement({
+				stream: "true",
+				tools: [{ type: "web_search_20250305", name: "web_search" }],
+			}),
+		).toEqual({
+			revision: 2,
+			invalid: [{ type: "web_search_20250305", reason: "invalid_options" }],
+			replay: { input: [], output: [], requiresOutputReplay: false },
+		});
+	});
+
 	test("does not mistake an input-schema WebSearch function for a server tool", () => {
 		expect(
 			deriveServerToolRequirement({
@@ -168,7 +250,7 @@ describe("deriveServerToolRequirement", () => {
 		});
 
 		expect(requirement).toMatchObject({
-			revision: 1,
+			revision: 2,
 			declarations: [
 				{
 					type: "web_search_20250305",
@@ -222,7 +304,7 @@ describe("deriveServerToolRequirement", () => {
 				],
 			}),
 		).toEqual({
-			revision: 1,
+			revision: 2,
 			invalid: [{ type: "web_search_20250305", reason: "invalid_options" }],
 			replay: { input: [], output: [], requiresOutputReplay: false },
 		});
@@ -234,7 +316,7 @@ describe("deriveServerToolRequirement", () => {
 				tools: [{ type: "web_search_20260101", name: "web_search" }],
 			}),
 		).toEqual({
-			revision: 1,
+			revision: 2,
 			unsupported: [{ type: "web_search_20260101" }],
 			replay: { input: [], output: [], requiresOutputReplay: false },
 		});
@@ -254,7 +336,7 @@ describe("deriveServerToolRequirement", () => {
 		});
 
 		expect(requirement).toMatchObject({
-			revision: 1,
+			revision: 2,
 			unsupported: [{ type: "computer_20250124" }],
 			replay: { input: [], output: [], requiresOutputReplay: false },
 		});
@@ -302,7 +384,7 @@ describe("deriveServerToolRequirement", () => {
 		});
 
 		expect(requirement).toEqual({
-			revision: 1,
+			revision: 2,
 			replay: {
 				input: ["native-Anthropic"],
 				output: ["native-Anthropic", "proxy-evidence-v1"],
@@ -874,6 +956,9 @@ describe("deriveServerToolRequirement", () => {
 					model: "claude-sonnet-4-5",
 					toolType: "web_search_20250305",
 					profile: "default",
+					optionProfile: "default-options",
+					responseMode: "json",
+					mixedToolMode: "server_only",
 					inputReplay: [],
 					outputReplay: [],
 					providerContractRevision: "codex-responses-v1",
@@ -955,6 +1040,18 @@ describe("resolveServerToolCapability", () => {
 		model: "gpt-5.6-sol",
 		toolType: declaration.type,
 		profile: profileId,
+		optionProfile: requireDefined(
+			requirement.optionProfileId,
+			"valid web-search requirement must have an exact option profile",
+		),
+		responseMode: requireDefined(
+			requirement.responseMode,
+			"valid web-search requirement must have a response mode",
+		),
+		mixedToolMode: requireDefined(
+			requirement.mixedToolMode,
+			"valid web-search requirement must have a mixed-tool mode",
+		),
 		inputReplay: requirement.replay.input,
 		outputReplay: ["proxy-evidence-v1"],
 		providerContractRevision: "codex-responses-v1",
@@ -1160,6 +1257,17 @@ describe("resolveServerToolCapability", () => {
 		const mismatches = [
 			{ toolType: "web_search_20260101" },
 			{ profile: `${requirement.profileId}-different` },
+			{ optionProfile: `${requirement.optionProfileId}-different` },
+			{
+				responseMode:
+					requirement.responseMode === "streaming" ? "json" : "streaming",
+			},
+			{
+				mixedToolMode:
+					requirement.mixedToolMode === "server_only"
+						? "server_and_client_functions"
+						: "server_only",
+			},
 			{ outputReplay: [] },
 		] as const;
 
@@ -1435,9 +1543,39 @@ describe("resolveServerToolCapability", () => {
 describe("canonical server-tool capability identity", () => {
 	const tuple = capabilityTupleFixture();
 
+	test("binds exact option, response, and mixed-tool dimensions into tuple identity", () => {
+		const exactTuple = {
+			...tuple,
+			optionProfile:
+				"server-tool-option-profile-v1.sha256.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			responseMode: "streaming",
+			mixedToolMode: "server_and_client_functions",
+		} as unknown as ServerToolCapabilityTuple;
+		const key = buildServerToolCapabilityTupleKey(exactTuple);
+
+		expect(typeof key).toBe("string");
+		for (const drift of [
+			{ optionProfile: "different-exact-options" },
+			{ responseMode: "json" },
+			{ mixedToolMode: "server_only" },
+		]) {
+			expect(
+				buildServerToolCapabilityTupleKey({
+					...exactTuple,
+					...drift,
+				} as ServerToolCapabilityTuple),
+			).not.toBe(key);
+		}
+	});
+
 	test("binds every tuple field while canonicalizing replay order", () => {
 		const key = buildServerToolCapabilityTupleKey(tuple);
 		expect(typeof key).toBe("string");
+		expect(key).toContain("server-tool-capability-tuple-v2");
+		expect(key).not.toContain("server-tool-capability-tuple-v1");
+		expect(buildServerToolCapabilityProofKey("proof-v2", tuple)).toMatch(
+			/^server-tool-proof-v2\.sha256\.[a-f0-9]{64}$/,
+		);
 		expect(
 			buildServerToolCapabilityTupleKey({
 				...tuple,
@@ -1657,6 +1795,9 @@ describe("provider-owned server-tool tuple materialization", () => {
 					model: context.physicalModel,
 					toolType: "web_search_20250305",
 					profile: requirement.profileId ?? "missing",
+					optionProfile: requirement.optionProfileId ?? "missing",
+					responseMode: requirement.responseMode ?? "json",
+					mixedToolMode: requirement.mixedToolMode ?? "server_only",
 					inputReplay: ["proxy-evidence-v1", "native-Anthropic"],
 					outputReplay: ["proxy-evidence-v1", "native-Anthropic"],
 					providerContractRevision: "fixture-responses-v1",
@@ -2247,6 +2388,9 @@ describe("provider-owned server-tool decision materialization", () => {
 		provider: "fixture",
 		model: "fixture-model",
 		profile: requirement.profileId,
+		optionProfile: requirement.optionProfileId,
+		responseMode: requirement.responseMode,
+		mixedToolMode: requirement.mixedToolMode,
 	});
 
 	test("returns an immutable conservative decision when no resolver exists", () => {
@@ -2261,6 +2405,16 @@ describe("provider-owned server-tool decision materialization", () => {
 			reason: "no_exact_proof",
 		});
 		expect(Object.isFrozen(decision)).toBe(true);
+	});
+
+	test("fails closed on a pre-v2 requirement snapshot", () => {
+		expect(() =>
+			materializeDecision(
+				capabilityProvider(),
+				{ ...requirement, revision: 1 } as never,
+				tuple,
+			),
+		).toThrow("Invalid provider server-tool capability requirements");
 	});
 
 	test("snapshots a valid exact proof without retaining resolver objects", () => {

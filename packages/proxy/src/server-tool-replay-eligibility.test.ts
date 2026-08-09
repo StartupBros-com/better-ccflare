@@ -4,7 +4,7 @@ import { evaluateServerToolReplayEligibility } from "./server-tool-replay-eligib
 import type { ServerToolReplayRuntimeState } from "./server-tool-replay-runtime";
 
 const REQUIREMENTS: ServerToolRequirements = Object.freeze({
-	revision: 1,
+	revision: 2,
 	replay: Object.freeze({
 		input: Object.freeze([]),
 		output: Object.freeze([]),

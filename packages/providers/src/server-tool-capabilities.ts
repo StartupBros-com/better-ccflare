@@ -7,9 +7,11 @@ import type {
 	ServerToolCapabilityProofIndex,
 	ServerToolCapabilityProofIndexEntry,
 	ServerToolCapabilityTuple,
+	ServerToolMixedToolMode,
 	ServerToolReplayAtom,
 	ServerToolReplayRequirement,
 	ServerToolRequirements,
+	ServerToolResponseMode,
 	WebSearchServerToolDeclaration,
 } from "@better-ccflare/types";
 import type {
@@ -27,14 +29,16 @@ export type {
 	ServerToolCapabilityProofIndex,
 	ServerToolCapabilityProofIndexEntry,
 	ServerToolCapabilityTuple,
+	ServerToolMixedToolMode,
 	ServerToolReplayAtom,
 	ServerToolReplayRequirement,
 	ServerToolRequirements,
+	ServerToolResponseMode,
 	WebSearchServerToolDeclaration,
 } from "@better-ccflare/types";
 
 const EXACT_WEB_SEARCH_TYPE = "web_search_20250305" as const;
-const REQUIREMENT_REVISION = 1 as const;
+const REQUIREMENT_REVISION = 2 as const;
 const MAX_DOMAINS = 10;
 const MAX_DOMAIN_LENGTH = 8 * 1024;
 const MAX_LOCATION_VALUE_LENGTH = 256;
@@ -43,6 +47,9 @@ const MAX_RETAINED_TOOL_TYPE_LENGTH = 128;
 const MAX_HISTORY_MESSAGE_VISITS = 4_096;
 const MAX_HISTORY_BLOCK_VISITS = 16_384;
 const WEB_SEARCH_PROFILE_PREFIX = "web-search-20250305-v1" as const;
+const OPTION_PROFILE_PREFIX = "server-tool-option-profile-v1.sha256." as const;
+const OPTION_PROFILE_DOMAIN =
+	"better-ccflare/server-tool-option-profile/v1\0" as const;
 const UNKNOWN_TYPED_TOOL = "unknown_typed_tool" as const;
 
 type UnknownRecord = Record<string, unknown>;
@@ -286,6 +293,34 @@ function buildWebSearchProfileId(
 	return `${WEB_SEARCH_PROFILE_PREFIX}:domains-${domainShape}:max-${maxUsesShape}:location-${locationShape}:client-${hasClientFunctions ? "yes" : "no"}`;
 }
 
+function buildWebSearchOptionProfileId(
+	declaration: WebSearchServerToolDeclaration,
+): string {
+	const sorted = (values: readonly string[] | undefined) =>
+		values === undefined ? null : [...values].sort();
+	const location = declaration.userLocation;
+	const canonical = JSON.stringify([
+		declaration.type,
+		declaration.maxUses ?? null,
+		sorted(declaration.allowedDomains),
+		sorted(declaration.blockedDomains),
+		location === undefined
+			? null
+			: [
+					location.type,
+					location.city ?? null,
+					location.region ?? null,
+					location.country ?? null,
+					location.timezone ?? null,
+				],
+	]);
+	const digest = createHash("sha256")
+		.update(OPTION_PROFILE_DOMAIN, "utf8")
+		.update(canonical, "utf8")
+		.digest("hex");
+	return `${OPTION_PROFILE_PREFIX}${digest}`;
+}
+
 function freezeToolSemanticLayers(tool: UnknownRecord): void {
 	if (Array.isArray(tool.allowed_domains)) Object.freeze(tool.allowed_domains);
 	if (Array.isArray(tool.blocked_domains)) Object.freeze(tool.blocked_domains);
@@ -509,6 +544,24 @@ export function deriveServerToolRequirement(
 		}
 	}
 
+	if (
+		exactDeclarationCount === 1 &&
+		declarations.length === 1 &&
+		body.stream !== undefined &&
+		typeof body.stream !== "boolean"
+	) {
+		declarations.length = 0;
+		if (!invalid.some((entry) => entry.type === EXACT_WEB_SEARCH_TYPE)) {
+			pushBoundedIssue(
+				invalid,
+				Object.freeze({
+					type: EXACT_WEB_SEARCH_TYPE,
+					reason: "invalid_options",
+				}),
+			);
+		}
+	}
+
 	const replay = scanHistoricalReplay(
 		body.messages,
 		declarations.length > 0,
@@ -528,6 +581,9 @@ export function deriveServerToolRequirement(
 	const requirement: {
 		revision: typeof REQUIREMENT_REVISION;
 		profileId?: string;
+		optionProfileId?: string;
+		responseMode?: ServerToolResponseMode;
+		mixedToolMode?: ServerToolMixedToolMode;
 		hasClientFunctions?: true;
 		declarations?: readonly WebSearchServerToolDeclaration[];
 		invalid?: readonly {
@@ -544,6 +600,11 @@ export function deriveServerToolRequirement(
 			declaration,
 			hasClientFunctions,
 		);
+		requirement.optionProfileId = buildWebSearchOptionProfileId(declaration);
+		requirement.responseMode = body.stream === true ? "streaming" : "json";
+		requirement.mixedToolMode = hasClientFunctions
+			? "server_and_client_functions"
+			: "server_only";
 		requirement.declarations = Object.freeze(declarations);
 	}
 	if (hasClientFunctions) requirement.hasClientFunctions = true;
@@ -562,6 +623,9 @@ const TUPLE_KEYS = [
 	"model",
 	"toolType",
 	"profile",
+	"optionProfile",
+	"responseMode",
+	"mixedToolMode",
 	"providerContractRevision",
 	"replayDecoderRevision",
 	"requestTransport",
@@ -579,6 +643,9 @@ const TUPLE_STRING_LIMITS: Readonly<
 	model: 512,
 	toolType: 128,
 	profile: 256,
+	optionProfile: 256,
+	responseMode: 32,
+	mixedToolMode: 64,
 	providerContractRevision: 128,
 	replayDecoderRevision: 128,
 	requestTransport: 128,
@@ -586,7 +653,7 @@ const TUPLE_STRING_LIMITS: Readonly<
 });
 const MAX_PROOF_REVISION_LENGTH = 256;
 const MAX_CANONICAL_TUPLE_KEY_BYTES = 8 * 1024;
-const SERVER_TOOL_PROOF_KEY_PREFIX = "server-tool-proof-v1.sha256.";
+const SERVER_TOOL_PROOF_KEY_PREFIX = "server-tool-proof-v2.sha256.";
 const TUPLE_ALL_KEYS = new Set<PropertyKey>([
 	...TUPLE_KEYS,
 	"inputReplay",
@@ -597,7 +664,7 @@ function serializeCanonicalCapabilityTuple(
 	tuple: ServerToolCapabilityTuple,
 ): string {
 	return JSON.stringify([
-		"server-tool-capability-tuple-v1",
+		"server-tool-capability-tuple-v2",
 		...TUPLE_KEYS.map((key) => {
 			const value = tuple[key];
 			return value === undefined ? null : value;
@@ -637,7 +704,7 @@ export function buildServerToolCapabilityProofKey(
 	const digest = createHash("sha256")
 		.update(
 			JSON.stringify([
-				"server-tool-capability-proof-v1",
+				"server-tool-capability-proof-v2",
 				proofRevision,
 				canonicalTupleKey,
 			]),
@@ -1204,6 +1271,9 @@ function snapshotCapabilityTuple(
 		const model = readString("model");
 		const toolType = readString("toolType");
 		const profile = readString("profile");
+		const optionProfile = readString("optionProfile");
+		const responseMode = readString("responseMode");
+		const mixedToolMode = readString("mixedToolMode");
 		const providerContractRevision = readString("providerContractRevision");
 		const replayDecoderRevision = readString("replayDecoderRevision");
 		const requestTransport = readString("requestTransport");
@@ -1220,6 +1290,10 @@ function snapshotCapabilityTuple(
 			model === undefined ||
 			toolType === undefined ||
 			profile === undefined ||
+			optionProfile === undefined ||
+			(responseMode !== "json" && responseMode !== "streaming") ||
+			(mixedToolMode !== "server_only" &&
+				mixedToolMode !== "server_and_client_functions") ||
 			providerContractRevision === undefined ||
 			replayDecoderRevision === undefined ||
 			requestTransport === undefined ||
@@ -1242,6 +1316,9 @@ function snapshotCapabilityTuple(
 			model,
 			toolType,
 			profile,
+			optionProfile,
+			responseMode,
+			mixedToolMode,
 			inputReplay,
 			outputReplay,
 			providerContractRevision,
@@ -1350,6 +1427,9 @@ const CAPABILITY_CONTEXT_KEYS = new Set<PropertyKey>([
 const CAPABILITY_REQUIREMENT_KEYS = new Set([
 	"revision",
 	"profileId",
+	"optionProfileId",
+	"responseMode",
+	"mixedToolMode",
 	"hasClientFunctions",
 	"declarations",
 	"invalid",
@@ -1368,7 +1448,7 @@ function snapshotProviderCapabilityRequirements(
 	let requirements: ServerToolRequirements;
 	try {
 		if (
-			!isPlainDataRecordWithOnlyKeys(source, CAPABILITY_REQUIREMENT_KEYS, 7)
+			!isPlainDataRecordWithOnlyKeys(source, CAPABILITY_REQUIREMENT_KEYS, 10)
 		) {
 			throw new TypeError();
 		}
@@ -1715,11 +1795,17 @@ function tupleMatchesRequirement(
 	if (requirement.declarations !== undefined) {
 		if (
 			requirement.declarations.length !== 1 ||
-			requirement.profileId === undefined
+			requirement.profileId === undefined ||
+			requirement.optionProfileId === undefined ||
+			requirement.responseMode === undefined ||
+			requirement.mixedToolMode === undefined
 		)
 			return false;
 		if (tuple.toolType !== requirement.declarations[0]?.type) return false;
 		if (tuple.profile !== requirement.profileId) return false;
+		if (tuple.optionProfile !== requirement.optionProfileId) return false;
+		if (tuple.responseMode !== requirement.responseMode) return false;
+		if (tuple.mixedToolMode !== requirement.mixedToolMode) return false;
 	}
 
 	return true;
@@ -1731,6 +1817,9 @@ export function resolveServerToolCapability(
 	proofIndex: ServerToolCapabilityProofIndex,
 	now: string = new Date().toISOString(),
 ): ServerToolCapabilityDecision {
+	if (requirement.revision !== REQUIREMENT_REVISION) {
+		return { decision: "unknown", reason: "requirement_mismatch" };
+	}
 	if (requirement.invalid?.length)
 		return { decision: "unknown", reason: "invalid_requirement" };
 	if (requirement.unsupported?.length)

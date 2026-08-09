@@ -217,6 +217,10 @@ function makeServerToolRequest(): Request {
 function makeServerToolTuple(
 	context: ProviderServerToolCapabilityContext,
 ): ServerToolCapabilityTuple {
+	const { optionProfileId, responseMode, mixedToolMode } = context.requirements;
+	if (!optionProfileId || !responseMode || !mixedToolMode) {
+		throw new Error("Expected exact server-tool requirement profile");
+	}
 	return {
 		candidateId: context.candidateId,
 		provider: context.account.provider,
@@ -226,6 +230,9 @@ function makeServerToolTuple(
 		model: context.physicalModel,
 		toolType: context.requirements.declarations?.[0]?.type ?? "unknown",
 		profile: context.requirements.profileId ?? "unknown",
+		optionProfile: optionProfileId,
+		responseMode,
+		mixedToolMode,
 		inputReplay: context.requirements.replay.input,
 		outputReplay: ["native-Anthropic"],
 		providerContractRevision: "model-first-test-v1",

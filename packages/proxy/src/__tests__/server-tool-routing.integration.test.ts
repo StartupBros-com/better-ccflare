@@ -90,6 +90,10 @@ function makeTuple(
 	context: ProviderServerToolCapabilityContext,
 	providerName: string,
 ): ServerToolCapabilityTuple {
+	const { optionProfileId, responseMode, mixedToolMode } = context.requirements;
+	if (!optionProfileId || !responseMode || !mixedToolMode) {
+		throw new Error("Expected exact server-tool requirement profile");
+	}
 	return {
 		candidateId: context.candidateId,
 		provider: providerName,
@@ -99,6 +103,9 @@ function makeTuple(
 		model: context.physicalModel,
 		toolType: "web_search_20250305",
 		profile: context.requirements.profileId ?? "missing-profile",
+		optionProfile: optionProfileId,
+		responseMode,
+		mixedToolMode,
 		inputReplay: ["native-Anthropic", "proxy-evidence-v1"],
 		outputReplay: ["native-Anthropic", "proxy-evidence-v1"],
 		providerContractRevision: "capability-test-v1",
