@@ -17,7 +17,6 @@ import {
 import officialSearchStream from "./__fixtures__/server-tools/official-search-stream.sanitized.json";
 import { CODEX_DEFAULT_ENDPOINT, CodexProvider } from "./provider";
 import {
-	CODEX_SERVER_TOOL_COMPILED_CONTRACTS,
 	CodexServerToolConversionError,
 	hasCodexServerToolDeclaration,
 	mapCodexServerToolRequest,
@@ -287,8 +286,7 @@ function materializeCodexTuple(
 
 describe("Codex exact hosted-search capability", () => {
 	test("admits the complete response, mixed-tool, and continuation matrix", () => {
-		expect(CODEX_SERVER_TOOL_COMPILED_CONTRACTS).toHaveLength(8);
-		expect(Object.isFrozen(CODEX_SERVER_TOOL_COMPILED_CONTRACTS)).toBe(true);
+		let admittedContracts = 0;
 
 		for (const stream of [false, true]) {
 			for (const mixed of [false, true]) {
@@ -299,7 +297,8 @@ describe("Codex exact hosted-search capability", () => {
 						continuation,
 					});
 					const tuple = materializeCodexTuple(requirements);
-					expect(tuple).toMatchObject({
+					expect(tuple).toEqual({
+						candidateId: "account:codex-live-shaped",
 						provider: "codex",
 						authMode: "oauth-subscription",
 						endpointClass: "codex_responses",
@@ -314,6 +313,8 @@ describe("Codex exact hosted-search capability", () => {
 							: "server_only",
 						inputReplay: continuation ? ["proxy-evidence-v1"] : [],
 						outputReplay: ["proxy-evidence-v1"],
+						providerContractRevision: "codex-responses-web-search-v1",
+						replayDecoderRevision: "server-tool-replay-v1",
 						requestTransport: "openai_responses",
 						responseTransport: "openai_responses_sse",
 					});
@@ -321,6 +322,7 @@ describe("Codex exact hosted-search capability", () => {
 					expect(Object.isFrozen(tuple?.inputReplay)).toBe(true);
 					expect(Object.isFrozen(tuple?.outputReplay)).toBe(true);
 					if (!tuple) throw new Error("expected exact Codex tuple");
+					admittedContracts += 1;
 
 					const decision = materializeProviderServerToolCapabilityDecision(
 						new CodexProvider(),
@@ -335,6 +337,7 @@ describe("Codex exact hosted-search capability", () => {
 				}
 			}
 		}
+		expect(admittedContracts).toBe(8);
 	});
 
 	test("rejects every near miss before capability admission", () => {
@@ -415,6 +418,27 @@ describe("Codex exact hosted-search capability", () => {
 		expect(materializeCodexTuple(nativeReplay)).toBeUndefined();
 		expect(materializeCodexTuple(nativeOutputReplay)).toBeUndefined();
 		expect(materializeCodexTuple(oversizedLocation)).toBeUndefined();
+	});
+
+	test("enforces the compiled location limit in UTF-8 bytes", () => {
+		const requirementWithCity = (city: string) =>
+			deriveServerToolRequirement({
+				tools: [
+					{
+						type: "web_search_20250305",
+						name: "web_search",
+						user_location: { type: "approximate", city },
+					},
+				],
+			});
+		const atLimit = requirementWithCity("x".repeat(256));
+		const aboveLimit = requirementWithCity(`${"x".repeat(255)}é`);
+		if (!atLimit || !aboveLimit) {
+			throw new Error("expected normalized location requirements");
+		}
+
+		expect(materializeCodexTuple(atLimit)).toBeDefined();
+		expect(materializeCodexTuple(aboveLimit)).toBeUndefined();
 	});
 
 	test("binds option values, response mode, mixed mode, and replay shape into identity", () => {

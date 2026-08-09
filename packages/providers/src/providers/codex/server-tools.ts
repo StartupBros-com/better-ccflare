@@ -35,7 +35,7 @@ const MIXED_TOOL_MODES = Object.freeze([
 	"server_and_client_functions" as const,
 ]);
 
-export interface CodexServerToolCompiledContract {
+interface CodexServerToolCompiledContract {
 	readonly responseMode: ServerToolResponseMode;
 	readonly mixedToolMode: ServerToolMixedToolMode;
 	readonly inputReplay: readonly ServerToolReplayAtom[];
@@ -46,7 +46,7 @@ export interface CodexServerToolCompiledContract {
  * authority, not runtime-learned proof profiles: changing any row changes the
  * deployed SHA and requires review like any other provider contract change.
  */
-export const CODEX_SERVER_TOOL_COMPILED_CONTRACTS = Object.freeze(
+const CODEX_SERVER_TOOL_COMPILED_CONTRACTS = Object.freeze(
 	RESPONSE_MODES.flatMap((responseMode) =>
 		MIXED_TOOL_MODES.flatMap((mixedToolMode) =>
 			[FRESH_REPLAY, PROXY_EVIDENCE_REPLAY].map((inputReplay) =>
@@ -84,6 +84,19 @@ const UNKNOWN_UNSUPPORTED_REQUIREMENT: ServerToolCapabilityDecision =
 		reason: "unsupported_requirement",
 	});
 const MAX_LOCATION_VALUE_BYTES = 256;
+const LOCATION_TEXT_ENCODER = new TextEncoder();
+
+type ExactCodexServerToolRequirements = ServerToolRequirements &
+	Required<
+		Pick<
+			ServerToolRequirements,
+			| "profileId"
+			| "optionProfileId"
+			| "responseMode"
+			| "mixedToolMode"
+			| "declarations"
+		>
+	>;
 
 function replayEquals(
 	actual: readonly ServerToolReplayAtom[],
@@ -104,17 +117,6 @@ function isSupportedOutputReplay(
 	);
 }
 
-function findCompiledContract(
-	requirements: ServerToolRequirements,
-): CodexServerToolCompiledContract | undefined {
-	return CODEX_SERVER_TOOL_COMPILED_CONTRACTS.find(
-		(contract) =>
-			contract.responseMode === requirements.responseMode &&
-			contract.mixedToolMode === requirements.mixedToolMode &&
-			replayEquals(contract.inputReplay, requirements.replay.input),
-	);
-}
-
 function hasCompiledOptionBounds(
 	declaration: WebSearchServerToolDeclaration,
 ): boolean {
@@ -124,24 +126,14 @@ function hasCompiledOptionBounds(
 		const value = location[key];
 		return (
 			value === undefined ||
-			new TextEncoder().encode(value).byteLength <= MAX_LOCATION_VALUE_BYTES
+			LOCATION_TEXT_ENCODER.encode(value).byteLength <= MAX_LOCATION_VALUE_BYTES
 		);
 	});
 }
 
-function hasExactCodexServerToolRequirement(
+function matchCompiledContract(
 	requirements: ServerToolRequirements,
-): requirements is ServerToolRequirements &
-	Required<
-		Pick<
-			ServerToolRequirements,
-			| "profileId"
-			| "optionProfileId"
-			| "responseMode"
-			| "mixedToolMode"
-			| "declarations"
-		>
-	> {
+): CodexServerToolCompiledContract | undefined {
 	if (
 		requirements.revision !== 2 ||
 		requirements.invalid?.length ||
@@ -156,7 +148,7 @@ function hasExactCodexServerToolRequirement(
 		requirements.replay.requiresOutputReplay !== true ||
 		!isSupportedOutputReplay(requirements.replay.output)
 	) {
-		return false;
+		return undefined;
 	}
 
 	const mixedShapeMatches =
@@ -164,7 +156,14 @@ function hasExactCodexServerToolRequirement(
 			requirements.hasClientFunctions !== true) ||
 		(requirements.mixedToolMode === "server_and_client_functions" &&
 			requirements.hasClientFunctions === true);
-	return mixedShapeMatches && findCompiledContract(requirements) !== undefined;
+	if (!mixedShapeMatches) return undefined;
+
+	return CODEX_SERVER_TOOL_COMPILED_CONTRACTS.find(
+		(contract) =>
+			contract.responseMode === requirements.responseMode &&
+			contract.mixedToolMode === requirements.mixedToolMode &&
+			replayEquals(contract.inputReplay, requirements.replay.input),
+	);
 }
 
 function isCodexOAuthSubscription(
@@ -185,11 +184,9 @@ function isCodexOAuthSubscription(
 
 function materializeCodexTuple(
 	candidateId: string,
-	requirements: ServerToolRequirements,
+	requirements: ExactCodexServerToolRequirements,
+	contract: CodexServerToolCompiledContract,
 ): ServerToolCapabilityTuple | undefined {
-	if (!hasExactCodexServerToolRequirement(requirements)) return undefined;
-	const contract = findCompiledContract(requirements);
-	if (!contract) return undefined;
 	return Object.freeze({
 		candidateId,
 		provider: "codex",
@@ -223,7 +220,13 @@ export function createCodexServerToolCapabilityTuple(
 	) {
 		return undefined;
 	}
-	return materializeCodexTuple(context.candidateId, context.requirements);
+	const contract = matchCompiledContract(context.requirements);
+	if (!contract) return undefined;
+	return materializeCodexTuple(
+		context.candidateId,
+		context.requirements as ExactCodexServerToolRequirements,
+		contract,
+	);
 }
 
 function readCandidateId(tuple: ServerToolCapabilityTuple): string | undefined {
@@ -250,12 +253,17 @@ export function resolveCodexServerToolCapability(
 ): ServerToolCapabilityDecision {
 	if (requirements.invalid?.length) return UNKNOWN_INVALID_REQUIREMENT;
 	if (requirements.unsupported?.length) return UNKNOWN_UNSUPPORTED_REQUIREMENT;
-	if (!hasExactCodexServerToolRequirement(requirements)) {
+	const contract = matchCompiledContract(requirements);
+	if (!contract) {
 		return UNKNOWN_REQUIREMENT_MISMATCH;
 	}
 	const candidateId = readCandidateId(tuple);
 	if (!candidateId) return UNKNOWN_NO_EXACT_CONTRACT;
-	const expected = materializeCodexTuple(candidateId, requirements);
+	const expected = materializeCodexTuple(
+		candidateId,
+		requirements as ExactCodexServerToolRequirements,
+		contract,
+	);
 	if (
 		!expected ||
 		buildServerToolCapabilityTupleKey(tuple) !==
@@ -623,7 +631,7 @@ export function mapCodexServerToolRequest(
 			requirement.invalid !== undefined ||
 			requirement.unsupported !== undefined ||
 			requirement.declarations?.length !== 1 ||
-			!hasExactCodexServerToolRequirement(requirement) ||
+			!matchCompiledContract(requirement) ||
 			requirement.replay.input.length > 0 ||
 			requirement.replay.output.length > 0
 		) {
