@@ -138,6 +138,49 @@ import { getValidAccessToken } from "./token-manager";
 
 const log = new Logger("ProxyOperations");
 
+type HostedDispatchTerminalReason =
+	| "ledger_missing"
+	| "already_dispatched"
+	| "ambiguous_transport";
+
+/**
+ * Request-local terminal raised only at or after the irreversible hosted-tool
+ * boundary. It is deliberately not a candidate error: once a hosted dispatch
+ * may have happened, no sibling route, retry loop, or guard replay is safe.
+ */
+class HostedDispatchTerminalError extends Error {
+	readonly reason: HostedDispatchTerminalReason;
+
+	constructor(reason: HostedDispatchTerminalReason, cause?: unknown) {
+		super("Hosted server-tool dispatch is terminal for this request", {
+			cause,
+		});
+		this.name = "HostedDispatchTerminalError";
+		this.reason = reason;
+	}
+}
+
+function createHostedDispatchTerminalResponse(
+	error: HostedDispatchTerminalError,
+): Response {
+	return new Response(
+		JSON.stringify({
+			type: "error",
+			error: {
+				type: "api_error",
+				code: "server_tool_dispatch_terminal",
+				reason: error.reason,
+				message:
+					"The hosted server-tool attempt ended after its non-replayable dispatch boundary.",
+			},
+		}),
+		{
+			status: 502,
+			headers: { "content-type": "application/json" },
+		},
+	);
+}
+
 interface AnthropicDegradedNoAccountSuppressionDecision {
 	readonly action: "suppress";
 	readonly wouldAction: "suppress";
@@ -2284,6 +2327,8 @@ export async function proxyWithAccount(
 				throw candidateCapabilityError("proof_drift");
 			}
 		};
+		const hostedDispatchCommitted = (): boolean =>
+			routingAttemptLedger?.hostedDispatchState === "hosted_dispatched";
 		const transformWithCurrentAttemptPlan = async (
 			plan: ProviderAttemptPlan,
 			request: Request,
@@ -2301,6 +2346,18 @@ export async function proxyWithAccount(
 			...ctx,
 			provider: attemptProvider,
 		});
+		const claimCurrentHostedDispatch = (): void => {
+			if (attemptPlan.capabilityProofKey === null) return;
+			// Revalidate after every fallible local staging step and immediately before
+			// the irreversible fetch/frame-write callback.
+			assertAttemptPlanCapabilityIsCurrent(attemptPlan);
+			if (!routingAttemptLedger) {
+				throw new HostedDispatchTerminalError("ledger_missing");
+			}
+			if (!routingAttemptLedger.claimHostedDispatch()) {
+				throw new HostedDispatchTerminalError("already_dispatched");
+			}
+		};
 		let currentReplayBody = effectiveBodyBuffer;
 
 		const isSyntheticCodexCountTokens =
@@ -2870,8 +2927,12 @@ export async function proxyWithAccount(
 					// The physical send remains authoritative over telemetry.
 				}
 			};
+			const hostedAttempt = attemptPlan.capabilityProofKey !== null;
+			const httpTransportRequest = hostedAttempt
+				? new Request(transportRequest, { redirect: "manual" })
+				: transportRequest;
 			const response = await makeAttemptRequest(
-				transportRequest,
+				httpTransportRequest,
 				attemptPlan.providerName === "codex"
 					? async (signal) => {
 							currentCodexWebSocketReceipt = null;
@@ -2889,6 +2950,9 @@ export async function proxyWithAccount(
 									conversationIdentity: webSocketConversationIdentity,
 									request: transportRequest,
 									signal,
+									...(hostedAttempt
+										? { onBeforeFrameWrite: claimCurrentHostedDispatch }
+										: {}),
 									onFrameWritten: (receipt) => {
 										recordPhysicalDispatch();
 										currentCodexWebSocketReceipt = receipt;
@@ -2908,7 +2972,10 @@ export async function proxyWithAccount(
 							return websocketAttempt.response;
 						}
 					: undefined,
-				recordPhysicalDispatch,
+				() => {
+					claimCurrentHostedDispatch();
+					recordPhysicalDispatch();
+				},
 			);
 			observeTrustedHttpOverload(response, transportRequest, resolvedModel);
 			return response;
@@ -3251,6 +3318,7 @@ export async function proxyWithAccount(
 
 		// Check if this is a Claude provider and we got an invalid thinking signature error
 		if (
+			!hostedDispatchCommitted() &&
 			isClaudeProvider &&
 			(await isInvalidThinkingSignatureError(rawResponse, readAttemptBoundJson))
 		) {
@@ -3313,6 +3381,7 @@ export async function proxyWithAccount(
 		// turn, so the session stays wedged unless the edit is dropped. Retry
 		// once with the offending edits removed; everything else is preserved.
 		if (
+			!hostedDispatchCommitted() &&
 			isClaudeProvider &&
 			(await isClearThinkingRequiresThinkingError(
 				rawResponse,
@@ -3379,7 +3448,7 @@ export async function proxyWithAccount(
 				transformedRequestHadExplicitBreakpoint,
 				readAttemptBoundJson,
 			));
-		if (explicitBreakpointRejection) {
+		if (explicitBreakpointRejection && !hostedDispatchCommitted()) {
 			suppressCodexExplicitCacheBreakpoint(
 				account.id,
 				transformedModel,
@@ -3439,7 +3508,10 @@ export async function proxyWithAccount(
 
 		// Retry without cache_control if provider rejected it (e.g. GLM-5.1 strict validation).
 		// Mark (accountId, model) so subsequent requests skip cache_control immediately.
-		if (await isCacheControlRejectionError(rawResponse, readAttemptBoundJson)) {
+		if (
+			!hostedDispatchCommitted() &&
+			(await isCacheControlRejectionError(rawResponse, readAttemptBoundJson))
+		) {
 			const rejectorKey = cacheControlRejectorKey(account.id, transformedModel);
 			if (!cacheControlRejectors.has(rejectorKey)) {
 				// Mark before retry so subsequent requests pre-strip without a round-trip.
@@ -4103,7 +4175,10 @@ export async function proxyWithAccount(
 		// A committed enforced degraded-mode send owns this request's only
 		// physical attempt. Preserve its response before any raw classifier,
 		// model fallback, cooldown failover, or body drain can consume it.
-		if (!wasProtectedLifecycleForLatestResponse()) {
+		if (
+			!wasProtectedLifecycleForLatestResponse() &&
+			!hostedDispatchCommitted()
+		) {
 			rawFailureClassification = await handleRawAttemptFailure(rawResponse);
 			if (rawFailureClassification.returnOriginalResponse) {
 				return withSanitizedProxyHeaders(rawResponse);
@@ -4686,12 +4761,15 @@ export async function proxyWithAccount(
 			finalizedCodexAttemptIds.add(currentTransportAttemptId);
 		}
 
-		if (await handleProcessedCodexContextOverflow(response)) {
+		if (
+			!hostedDispatchCommitted() &&
+			(await handleProcessedCodexContextOverflow(response))
+		) {
 			return null;
 		}
 
 		// Failover to next account on upstream 401 — credentials are invalid/expired
-		if (response.status === 401) {
+		if (response.status === 401 && !hostedDispatchCommitted()) {
 			log.warn(
 				`Authentication failed (401) for account ${account.name}${wasProtectedLifecycleForLatestResponse() ? "; protected response remains terminal" : ", failing over to next account"}`,
 			);
@@ -4708,6 +4786,7 @@ export async function proxyWithAccount(
 		// synthetic (keepalive / auto-refresh) requests to avoid loop amplification.
 		if (
 			response.status === 529 &&
+			!hostedDispatchCommitted() &&
 			!isSyntheticInternal &&
 			!wasProtectedLifecycleForLatestResponse()
 		) {
@@ -4869,7 +4948,7 @@ export async function proxyWithAccount(
 		// between the initial 529 and a retry response. The guard above only covered
 		// the initial response; a retry 401 would have updated `response` and broken
 		// out of the loop, so we need to catch it here before forwarding to the client.
-		if (response.status === 401) {
+		if (response.status === 401 && !hostedDispatchCommitted()) {
 			log.warn(
 				`Authentication failed (401) on 529 retry for account ${account.name}${wasProtectedLifecycleForLatestResponse() ? "; protected response remains terminal" : ", failing over to next account"}`,
 			);
@@ -4892,6 +4971,7 @@ export async function proxyWithAccount(
 		// pre-commit stall wait indefinitely. In Bun, merely reading Response.body
 		// before a later classification clone can also disturb the retained branch.
 		const officialCodexPrecommitSseRetryRouteEligible =
+			!hostedDispatchCommitted() &&
 			attemptPlan.providerName === "codex" &&
 			account.provider === "codex" &&
 			url.pathname === "/v1/messages" &&
@@ -4985,6 +5065,7 @@ export async function proxyWithAccount(
 					? undefined
 					: attemptCommitmentDeadlineAt - cacheLaneRescueReserveMs;
 			const codexAuthoritativeContextOverflowCanBeHandled =
+				!hostedDispatchCommitted() &&
 				attemptPlan.providerName === "codex" &&
 				account.provider === "codex" &&
 				(canReplayContextOverflow() || hasRetainedLegacyContextOverflow());
@@ -5447,6 +5528,15 @@ export async function proxyWithAccount(
 					},
 					attemptProxyContext(),
 				);
+			if (hostedDispatchCommitted()) {
+				// The first hosted provider response is authoritative for this inbound
+				// request. Preserve it exactly; converting it into an account miss would
+				// invite model/account/guard replay after an irreversible execution.
+				return await forwardTerminalRateLimitResponse(
+					response,
+					failoverAttempts,
+				);
+			}
 			if (wasProtectedLifecycleForLatestResponse()) {
 				return await forwardTerminalRateLimitResponse(
 					response.status === 529
@@ -5555,11 +5645,30 @@ export async function proxyWithAccount(
 			},
 			attemptProxyContext(),
 		);
-		if (responseLifecycle?.enforced) {
+		if (responseLifecycle?.enforced || hostedDispatchCommitted()) {
 			return await forwardedResponse;
 		}
 		return forwardedResponse;
 	} catch (err) {
+		if (req.signal.aborted) {
+			// Client disconnected: the socket is gone, so failing over to another
+			// account would burn pool capacity answering nobody. End the request
+			// with nginx's 499 (client closed request).
+			log.info(
+				`Client disconnected during request to ${account.name} — ending instead of failing over`,
+			);
+			return new Response(null, { status: 499 });
+		}
+		if (
+			err instanceof HostedDispatchTerminalError ||
+			routingAttemptLedger?.hostedDispatchState === "hosted_dispatched"
+		) {
+			const terminalError =
+				err instanceof HostedDispatchTerminalError
+					? err
+					: new HostedDispatchTerminalError("ambiguous_transport", err);
+			return createHostedDispatchTerminalResponse(terminalError);
+		}
 		if (err instanceof ServerToolCandidateCapabilityError) {
 			// Exact capability drift is request-local. It must not pause the account,
 			// poison route health, or be collapsed into a generic transport failure;
@@ -5594,16 +5703,6 @@ export async function proxyWithAccount(
 		}
 		if (err instanceof AnthropicDegradedSendDeniedError) {
 			return err.denial;
-		}
-		if (req.signal.aborted) {
-			// Client disconnected: the socket is gone, so failing over to another
-			// account would burn pool capacity answering nobody. End the request
-			// with nginx's 499 (client closed request) — the status matters only
-			// for the log and the request record. (upstream cec5b5b99f)
-			log.info(
-				`Client disconnected during request to ${account.name} — ending instead of failing over`,
-			);
-			return new Response(null, { status: 499 });
 		}
 		if (
 			routingSignal.aborted ||

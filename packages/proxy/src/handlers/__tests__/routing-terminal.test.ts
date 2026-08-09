@@ -222,6 +222,63 @@ describe("routing terminal responses", () => {
 		});
 	});
 
+	it.each([
+		["model", familyCapacityContext(Date.UTC(2026, 6, 17, 12) + 60_000)],
+		["pool", accountCapacityContext(Date.UTC(2026, 6, 17, 12) + 60_000)],
+	] as const)("does not authorize %s recovery after a hosted dispatch", async (_scope, capacityContext) => {
+		const now = Date.UTC(2026, 6, 17, 12);
+		const terminal = createRoutingTerminalResponse({
+			source: "attempts",
+			accounts: [makeAccount()],
+			capacityContext,
+			rateLimitOutcomes: [],
+			upstreamAttempts: 1,
+			now,
+			hostedDispatchState: "hosted_dispatched",
+		});
+
+		expect(terminal.kind).toBe("route_unavailable");
+		expect(terminal.response.headers.get("retry-after")).toBeNull();
+		expect(
+			terminal.response.headers.get("x-better-ccflare-pool-status"),
+		).toBeNull();
+		expect(
+			terminal.response.headers.get("x-better-ccflare-recovery-scope"),
+		).toBeNull();
+		const parsed = await body(terminal.response);
+		expect(parsed.error.code).toBe("route_unavailable");
+		expect(parsed.error.type).not.toBe("pool_exhausted");
+	});
+
+	it("does not authorize circuit recovery after a hosted dispatch", async () => {
+		const now = Date.UTC(2026, 6, 17, 12);
+		const terminal = createRoutingTerminalResponse({
+			source: "attempts",
+			accounts: [makeAccount()],
+			capacityContext: null,
+			rateLimitOutcomes: [],
+			upstreamAttempts: 1,
+			now,
+			hostedDispatchState: "hosted_dispatched",
+			routeCircuitRecoveryHint: {
+				allCandidatesOpen: true,
+				candidateCount: 1,
+				probeLeased: true,
+				retryAt: now + 30_000,
+				reason: "semantic_stream_stall",
+			},
+		});
+
+		expect(terminal.kind).toBe("route_unavailable");
+		expect(terminal.response.headers.get("retry-after")).toBeNull();
+		expect(
+			terminal.response.headers.get("x-better-ccflare-route-status"),
+		).toBeNull();
+		expect(
+			terminal.response.headers.get("x-better-ccflare-pool-status"),
+		).toBeNull();
+	});
+
 	it("returns retryable model_pool_exhausted for finite model-only capacity", async () => {
 		const now = Date.UTC(2026, 6, 17, 12);
 		const next = now + 60_001;

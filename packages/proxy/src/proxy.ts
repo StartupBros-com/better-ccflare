@@ -1170,6 +1170,7 @@ async function handleProxyCore(
 			capacityContext: null,
 			rateLimitOutcomes: [],
 			upstreamAttempts: 0,
+			hostedDispatchState: routingAttemptLedger.hostedDispatchState,
 		});
 		// A phase timeout is transient incomplete evidence, so keep the canonical
 		// route_unavailable body while explicitly inviting a bounded client retry.
@@ -1666,6 +1667,7 @@ async function handleProxyCore(
 			capacityContext: getRoutingCapacityContext(requestMeta),
 			rateLimitOutcomes: getRequestRateLimitOutcomes(req),
 			upstreamAttempts: 0,
+			hostedDispatchState: routingAttemptLedger.hostedDispatchState,
 			routeCircuitRecoveryHint: getRouteCircuitRecoveryHint(),
 		});
 		log.error(`Routing terminal: ${terminal.kind}`);
@@ -3111,6 +3113,7 @@ async function handleProxyCore(
 		capacityContext: getRoutingCapacityContext(requestMeta),
 		rateLimitOutcomes: getRequestRateLimitOutcomes(req),
 		upstreamAttempts: actualUpstreamAttempts,
+		hostedDispatchState: routingAttemptLedger.hostedDispatchState,
 		modelRecoveryAt: reactiveModelRecoveryAt,
 		message: formatRoutingAttemptMessage(
 			ERROR_MESSAGES.ALL_UPSTREAM_ROUTES_FAILED,

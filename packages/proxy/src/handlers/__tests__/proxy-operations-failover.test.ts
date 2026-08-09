@@ -475,6 +475,45 @@ function bindServerToolCandidate(
 	return boundMeta;
 }
 
+function makeHostedDispatchFixture() {
+	const provider = makeAttemptPlanningProvider();
+	provider.createServerToolCapabilityTuple = (context) =>
+		makeServerToolCapabilityTuple(context, provider.name);
+	provider.resolveServerToolCapability = (_requirements, tuple) => ({
+		decision: "proven",
+		proof: makeServerToolCapabilityProof(tuple, "proof:dispatch-matrix"),
+	});
+	const account = makeAccount({
+		provider: provider.name,
+		model_mappings: JSON.stringify({ primary: ["primary", "fallback"] }),
+	});
+	const tuple = makeServerToolCapabilityTuple(
+		{
+			candidateId: "account:acc-1",
+			account,
+			path: "/v1/messages",
+			query: "",
+			physicalModel: "primary",
+			requirements: SERVER_TOOL_REQUIREMENTS,
+		},
+		provider.name,
+	);
+	const meta = bindServerToolCandidate(makeRequestMeta(), {
+		provider: provider.name,
+		physicalModel: "primary",
+		proof: makeServerToolCapabilityProof(tuple, "proof:dispatch-matrix"),
+	});
+	const ctx = enableServerToolReplay(makeProxyContext());
+	ctx.provider = provider;
+	return {
+		account,
+		bodyBuffer: makeRequestBody("primary"),
+		ctx,
+		ledger: new RoutingAttemptLedger(),
+		meta,
+	};
+}
+
 describe("proxyWithAccount — immutable provider attempt plans", () => {
 	let originalFetch: typeof globalThis.fetch;
 	let originalOverloadEnabled: string | undefined;
@@ -1101,7 +1140,7 @@ describe("proxyWithAccount — exact server-tool capability binding", () => {
 		expect(ctx.asyncWriter.enqueue).toHaveBeenCalledTimes(0);
 	});
 
-	it("re-resolves and binds a fresh exact proof for every physical-model fallback", async () => {
+	it("terminates a hosted request before any physical-model fallback can plan or send", async () => {
 		const plans: Array<{
 			model: string | null;
 			proofKey: string | null;
@@ -1163,6 +1202,7 @@ describe("proxyWithAccount — exact server-tool capability binding", () => {
 		});
 		const ctx = enableServerToolReplay(makeProxyContext());
 		ctx.provider = provider;
+		const ledger = new RoutingAttemptLedger();
 		const bodyBuffer = makeRequestBody("primary");
 		globalThis.fetch = mock(async () =>
 			(globalThis.fetch as ReturnType<typeof mock>).mock.calls.length === 1
@@ -1186,7 +1226,7 @@ describe("proxyWithAccount — exact server-tool capability binding", () => {
 				undefined,
 				false,
 				undefined,
-				undefined,
+				ledger,
 				{ routeCandidateId: "account:acc-1" },
 			);
 		} catch (error) {
@@ -1198,13 +1238,17 @@ describe("proxyWithAccount — exact server-tool capability binding", () => {
 			}
 		}
 
-		expect(globalThis.fetch).toHaveBeenCalledTimes(2);
-		expect(resolutionModels).toEqual([
-			"primary",
-			"primary",
-			"fallback",
-			"fallback",
-		]);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+		expect(
+			(
+				(globalThis.fetch as ReturnType<typeof mock>).mock
+					.calls[0]?.[0] as Request
+			).redirect,
+		).toBe("manual");
+		expect(ledger.hostedDispatchState).toBe("hosted_dispatched");
+		// Initial resolution, pre-transform revalidation, and the final pre-dispatch
+		// revalidation all bind the same proof before the one physical send.
+		expect(resolutionModels).toEqual(["primary", "primary", "primary"]);
 		expect(plans).toEqual([
 			{
 				model: "primary",
@@ -1215,14 +1259,137 @@ describe("proxyWithAccount — exact server-tool capability binding", () => {
 				inputReplay: PROVEN_INPUT_REPLAY,
 				outputReplay: PROVEN_OUTPUT_REPLAY,
 			},
-			{
-				model: "fallback",
-				proofKey: expect.any(String),
-				inputReplay: ["native-Anthropic"],
-				outputReplay: ["proxy-evidence-v1"],
-			},
 		]);
-		expect(plans[1]?.proofKey).not.toBe(plans[0]?.proofKey);
+	});
+
+	it.each([
+		"before",
+		"after",
+	] as const)("aborting %s the hosted claim keeps physical dispatch bounded", async (phase) => {
+		const provider = makeAttemptPlanningProvider();
+		provider.createServerToolCapabilityTuple = (context) =>
+			makeServerToolCapabilityTuple(context, provider.name);
+		provider.resolveServerToolCapability = (_requirements, tuple) => ({
+			decision: "proven",
+			proof: makeServerToolCapabilityProof(tuple, "proof:abort"),
+		});
+		const account = makeAccount({
+			provider: provider.name,
+			model_mappings: JSON.stringify({ primary: "primary" }),
+		});
+		const tuple = makeServerToolCapabilityTuple(
+			{
+				candidateId: "account:acc-1",
+				account,
+				path: "/v1/messages",
+				query: "",
+				physicalModel: "primary",
+				requirements: SERVER_TOOL_REQUIREMENTS,
+			},
+			provider.name,
+		);
+		const meta = bindServerToolCandidate(makeRequestMeta(), {
+			provider: provider.name,
+			physicalModel: "primary",
+			proof: makeServerToolCapabilityProof(tuple, "proof:abort"),
+		});
+		const ctx = enableServerToolReplay(makeProxyContext());
+		ctx.provider = provider;
+		const ledger = new RoutingAttemptLedger();
+		const bodyBuffer = makeRequestBody("primary");
+		const controller = new AbortController();
+		const request = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			body: bodyBuffer,
+			signal: controller.signal,
+			headers: {
+				"content-type": "application/json",
+				authorization: TEST_REPLAY_CREDENTIAL,
+				"x-claude-code-session-id": TEST_REPLAY_LINEAGE,
+			},
+		});
+		let fetchCalls = 0;
+		globalThis.fetch = mock(async () => {
+			fetchCalls++;
+			if (phase === "after") controller.abort("after hosted claim");
+			throw new DOMException("aborted", "AbortError");
+		});
+		if (phase === "before") controller.abort("before hosted claim");
+
+		const result = await proxyWithAccount(
+			request,
+			new URL(request.url),
+			account,
+			meta,
+			bodyBuffer,
+			() => undefined,
+			0,
+			ctx,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			false,
+			undefined,
+			ledger,
+			{ routeCandidateId: "account:acc-1" },
+		);
+
+		expect(result?.status).toBe(499);
+		expect(fetchCalls).toBe(phase === "before" ? 0 : 1);
+		expect(ledger.hostedDispatchState).toBe(
+			phase === "before" ? "undispatched" : "hosted_dispatched",
+		);
+	});
+
+	it.each([
+		[400, { error: { message: "cache_control is not supported" } }],
+		[401, { error: { message: "invalid credentials" } }],
+		[429, { error: { message: "rate limited" } }],
+		[529, { error: { type: "overloaded_error" } }],
+		[500, { error: { message: "upstream failure" } }],
+		[302, { redirect: true }],
+	] as const)("keeps a hosted %i response terminal at one manual-redirect HTTP send", async (status, responseBody) => {
+		const { account, bodyBuffer, ctx, ledger, meta } =
+			makeHostedDispatchFixture();
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const request =
+				input instanceof Request ? input : new Request(String(input));
+			expect(request.redirect).toBe("manual");
+			return new Response(JSON.stringify(responseBody), {
+				status,
+				headers: {
+					"content-type": "application/json",
+					...(status === 302
+						? { location: "https://redirect.invalid/second-send" }
+						: {}),
+				},
+			});
+		});
+
+		const result = await proxyWithAccount(
+			makeRequest(bodyBuffer),
+			new URL("https://proxy.local/v1/messages"),
+			account,
+			meta,
+			bodyBuffer,
+			() => undefined,
+			0,
+			ctx,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			false,
+			undefined,
+			ledger,
+			{ routeCandidateId: "account:acc-1" },
+		);
+
+		expect(result?.status).toBe(502);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+		expect(ledger.physicalAttemptCount).toBe(1);
+		expect(ledger.hostedDispatchState).toBe("hosted_dispatched");
 	});
 
 	it("requires the explicit recompute flag when a deferred route changes the admitted physical model", async () => {
@@ -1307,6 +1474,7 @@ describe("proxyWithAccount — exact server-tool capability binding", () => {
 		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
 
 		resolutionModels.length = 0;
+		const recomputedLedger = new RoutingAttemptLedger();
 		try {
 			await proxyWithAccount(
 				makeRequest(bodyBuffer),
@@ -1323,7 +1491,7 @@ describe("proxyWithAccount — exact server-tool capability binding", () => {
 				undefined,
 				false,
 				undefined,
-				undefined,
+				recomputedLedger,
 				{
 					routeCandidateId: "account:acc-1",
 					recomputeServerToolCapability: true,
@@ -1339,10 +1507,15 @@ describe("proxyWithAccount — exact server-tool capability binding", () => {
 		}
 
 		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
-		expect(resolutionModels).toEqual([deferredModel, deferredModel]);
+		expect(recomputedLedger.hostedDispatchState).toBe("hosted_dispatched");
+		expect(resolutionModels).toEqual([
+			deferredModel,
+			deferredModel,
+			deferredModel,
+		]);
 	});
 
-	it("rechecks replay runtime eligibility before claiming a physical fallback", async () => {
+	it("does not recheck or plan fallback replay after hosted dispatch", async () => {
 		const replayFlexibleRequirements: ServerToolRequirements = Object.freeze({
 			...SERVER_TOOL_REQUIREMENTS,
 			replay: Object.freeze({
@@ -1405,36 +1578,34 @@ describe("proxyWithAccount — exact server-tool capability binding", () => {
 			jsonResponse({ error: { message: "rate limited" } }, 429),
 		);
 
-		await expect(
-			proxyWithAccount(
-				makeRequest(bodyBuffer),
-				new URL("https://proxy.local/v1/messages"),
-				account,
-				meta,
-				bodyBuffer,
-				() => undefined,
-				0,
-				ctx,
-				undefined,
-				undefined,
-				undefined,
-				undefined,
-				false,
-				undefined,
-				ledger,
-				{ routeCandidateId: "account:acc-1" },
-			),
-		).rejects.toBeInstanceOf(ServerToolCandidateCapabilityError);
+		const result = await proxyWithAccount(
+			makeRequest(bodyBuffer),
+			new URL("https://proxy.local/v1/messages"),
+			account,
+			meta,
+			bodyBuffer,
+			() => undefined,
+			0,
+			ctx,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			false,
+			undefined,
+			ledger,
+			{ routeCandidateId: "account:acc-1" },
+		);
 
+		expect(result?.status).toBe(502);
 		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
 		expect(ledger.attemptedCount).toBe(1);
 		expect(ledger.physicalAttemptCount).toBe(1);
 		expect(plannedModels).toEqual(["primary"]);
-		expect(resolutionModels).toEqual(["primary", "primary", "fallback"]);
-		expect(ctx.asyncWriter.enqueue).toHaveBeenCalledTimes(0);
+		expect(resolutionModels).toEqual(["primary", "primary", "primary"]);
 	});
 
-	it("skips an incapable physical fallback before ledger claim, plan, transform, or transport", async () => {
+	it("never resolves an incapable physical fallback after hosted dispatch", async () => {
 		const plannedModels: Array<string | null> = [];
 		const transformedModels: string[] = [];
 		const provider = makeAttemptPlanningProvider({
@@ -1485,26 +1656,25 @@ describe("proxyWithAccount — exact server-tool capability binding", () => {
 			jsonResponse({ error: { message: "rate limited" } }, 429),
 		);
 
-		await expect(
-			proxyWithAccount(
-				makeRequest(bodyBuffer),
-				new URL("https://proxy.local/v1/messages"),
-				account,
-				meta,
-				bodyBuffer,
-				() => undefined,
-				0,
-				ctx,
-				undefined,
-				undefined,
-				undefined,
-				undefined,
-				false,
-				undefined,
-				ledger,
-				{ routeCandidateId: "account:acc-1" },
-			),
-		).rejects.toBeInstanceOf(ServerToolCandidateCapabilityError);
+		const result = await proxyWithAccount(
+			makeRequest(bodyBuffer),
+			new URL("https://proxy.local/v1/messages"),
+			account,
+			meta,
+			bodyBuffer,
+			() => undefined,
+			0,
+			ctx,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			false,
+			undefined,
+			ledger,
+			{ routeCandidateId: "account:acc-1" },
+		);
+		expect(result?.status).toBe(502);
 		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
 		expect(ledger.attemptedCount).toBe(1);
 		expect(ledger.physicalAttemptCount).toBe(1);
