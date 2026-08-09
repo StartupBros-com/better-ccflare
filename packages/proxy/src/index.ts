@@ -150,6 +150,7 @@ export {
 	createDurableServerToolReplayWriterAdmission,
 	createServerToolReplayRuntime,
 	SERVER_TOOL_REPLAY_ISSUANCE_RANGE_SIZE,
+	type ServerToolReplayIssuanceLeaseInput,
 	type ServerToolReplayIssuanceReservation,
 	type ServerToolReplayIssuanceReservationInput,
 	type ServerToolReplayIssuanceStore,
@@ -157,6 +158,7 @@ export {
 	type ServerToolReplayRuntimeState,
 	type ServerToolReplayWriterAdmissionBuildResult,
 	type ServerToolReplayWriterAdmissionUnavailableReason,
+	type ServerToolReplayWriterLeaseAdmission,
 } from "./server-tool-replay-runtime";
 export {
 	clearSession,

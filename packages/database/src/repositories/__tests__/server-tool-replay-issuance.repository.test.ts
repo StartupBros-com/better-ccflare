@@ -57,6 +57,21 @@ describe("ServerToolReplayIssuanceRepository", () => {
 		});
 	});
 
+	it("atomically reserves the full hosted-search lifecycle bound", async () => {
+		expect(SERVER_TOOL_REPLAY_ISSUANCE_RESERVATION_MAX).toBe(512);
+
+		await expect(
+			repository.reserveReplayIssuanceRange({
+				counterIdentity: COUNTER_IDENTITY,
+				reservationSize: 512,
+			}),
+		).resolves.toEqual({
+			counterIdentity: COUNTER_IDENTITY,
+			firstIssuanceCount: 1,
+			lastIssuanceCount: 512,
+		});
+	});
+
 	it("serializes concurrent reservation amounts into disjoint monotonic ranges", async () => {
 		const reservations = await Promise.all(
 			Array.from({ length: 32 }, () =>

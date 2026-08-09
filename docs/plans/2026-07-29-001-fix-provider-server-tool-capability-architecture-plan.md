@@ -19,7 +19,7 @@ planning_base_sha: 93fc8e17f36e83de529ba785ba7676fe85467eef
 - **Current-main finding:** `origin/main` already contains provider-neutral server-tool requirements, exact capability tuples, candidate filtering, immutable attempt plans, authenticated `bccf2` replay readers, request-body reuse, route deduplication, circuit admission, WebSocket transport, client-abort propagation, response disposal, and the latest Codex usage-polling fixes through PR #125. Codex still has no capability tuple, hosted-search request mapper, native response decoder, or working attempt-plan integration, and the proxy still hides requirement extraction behind `CCFLARE_SERVER_TOOL_WEB_SEARCH`.
 - **Decision:** The plan remains relevant, but its former pair-canary/proof-control system is not. Admission authority is reviewed embedded code plus the deployed git SHA. Request-scoped at-most-one dispatch belongs in `RoutingAttemptLedger`. The only new durable state is the bounded fleet issuance count required to enable the already-landed AES-GCM replay writer safely.
 - **Execution profile:** Test-first in a branch rooted directly at current `origin/main`; selectively port isolated protocol modules from the old branch and manually integrate them against current routing, circuit, abort, drain, and WebSocket behavior.
-- **Performance posture:** Ordinary requests add no network or database work. Server-tool requirements are derived once from the already-buffered body. Capability resolution is frozen and synchronous. Replay writers atomically reserve bounded counter ranges and consume them locally, so capability-bearing responses do not serialize one database write per source or citation.
+- **Performance posture:** Ordinary requests add no network or database work. Server-tool requirements are derived once from the already-buffered body. Capability resolution is frozen and synchronous. Each capability request performs one atomic durable reservation of the exact 512-slot hosted-search lifecycle bound before request-private replay binding and before provider I/O; per-envelope claims are then in-memory only after dispatch, so responses do not serialize one database write per source or citation.
 - **Safety boundary:** Never automate or `curl` Anthropic or a Codex subscription account. Use unit tests, sanitized fixtures, and fake upstreams until the merged main deployment. Final proof uses a naturally initiated Claude Code two-turn search through the existing service.
 - **Deployment posture:** No feature flag, manual arm, parallel service, alternate database, or shadow install. Unsupported tuples fail locally before provider I/O. A failed live canary is handled by reverting main and deploying the prior reader-compatible build.
 
@@ -49,14 +49,14 @@ When Claude Code sends `web_search_20250305`, better-ccflare must preserve it as
 ### Functional requirements
 
 - **R1 — Protocol identity:** Classify tools by protocol type, never display name. Ordinary functions named `web_search` remain ordinary client functions.
-- **R2 — Exact admission:** A supported tuple binds provider, OAuth subscription endpoint class, physical model, normalized declaration profile, response mode, mixed-tool mode, and replay shape. Unknown provider, endpoint, query-bearing route, model, declaration revision, option field, mode, or replay shape fails locally before provider I/O.
+- **R2 — Exact admission:** A supported tuple binds provider, OAuth subscription endpoint class, physical model, normalized declaration profile, response mode, mixed-tool mode, and one of exactly eight replay rows: fresh input `[] -> proxy-evidence` output or natural-continuation input `[native-Anthropic] -> proxy-evidence` output, each crossed with `json`/`streaming` and server-only/mixed modes. Unknown provider, endpoint, query-bearing route, model, declaration revision, option field, mode, or replay row fails locally before provider I/O.
 - **R3 — Finite Codex authority:** Codex owns one embedded, deep-frozen capability matrix derived from committed sanitized fixtures. Provider hooks materialize only those exact tuples; callers cannot forge support by constructing a structurally similar object.
 - **R4 — Options:** Preserve and validate the supported `max_uses`, domain filter, and location contract with byte-based bounds, deterministic normalization, duplicate handling, mutual-exclusion rules, and unknown-field rejection. Never silently drop a restriction.
 - **R5 — Request mapping:** A capability-bearing Codex attempt maps the Anthropic declaration to the exact native hosted-search request and removes the client-function surrogate. Non-capability attempts retain current Codex behavior byte-for-byte.
 - **R6 — Native decoding:** Decode both Responses SSE and JSON into one bounded lifecycle. Reject unknown, malformed, duplicate, out-of-order, contradictory, or incomplete events. Raw provider events never pass through as valid Anthropic server-tool output.
 - **R7 — Anthropic encoding:** Emit valid streaming and non-streaming Anthropic server-tool blocks, citations, usage, error, and terminal ordering. Never invent a successful result, citation, locator, usage count, or zero-search predicate.
-- **R8 — Continuation:** Emit authenticated `bccf2` source/citation envelopes through request-private closures, and project only valid prior evidence back into the native Codex history shape. Invalid, expired, mismatched, oversized, or unknown envelopes fail locally.
-- **R9 — Replay writer accounting:** Enable the existing AES-GCM writer only when a persistent fleet issuance count is available. Atomically reserve a bounded range before nonce generation and encryption, then consume unique slots monotonically in-process. Concurrent writers can never exceed the fleet bound; a crash, restart, or later encryption failure conservatively burns unused slots and never refunds or reuses them. Enforce the existing rotation/exhaustion thresholds. Store only opaque counter identity and reserved-slot count; never store request, query, result, URL, citation, token, envelope, build, or revision content.
+- **R8 — Continuation:** Emit authenticated `bccf2` source/citation envelopes through request-private closures. Natural-continuation input `[native-Anthropic]` is admissible only when request-private authenticated history projection validates prior proxy evidence and projects it into the native Codex history shape; a caller assertion, missing projector, or invalid, expired, mismatched, oversized, or unknown envelope fails locally.
+- **R9 — Replay writer accounting:** Every capability request must acquire an exclusive durable issuance lease of exactly `HOSTED_SEARCH_LIFECYCLE_LIMITS.replayEnvelopes` (`512`) slots—the hard hosted-search lifecycle bound—before request-private replay binding and before provider I/O. Each bind performs one atomic reservation; structural writer readiness without a successful request lease is insufficient. Concurrent requests cannot share a lease or overcommit the fleet bound. Only after hosted dispatch may that request claim one slot per envelope in memory; claims 1–512 are unique, claim 513 fails closed without a second store call, and unused slots burn on completion, failure, or crash and are never refunded or reused. Enforce the existing rotation/exhaustion thresholds. Store only opaque counter identity and reserved-slot count; never store request, query, result, URL, citation, token, envelope, build, or revision content.
 - **R10 — At-most-one hosted dispatch:** Extend `RoutingAttemptLedger` with a monotonic `undispatched -> hosted_dispatched` claim. The first capability-bearing HTTP fetch or WebSocket `response.create` pre-write wins. After the claim, every thinking retry, cache retry, prompt-breakpoint retry, model fallback, account failover, 529 retry, WS-to-HTTP rescue, recovery marker, redirect, and ambiguous transport path is terminal for that inbound request.
 - **R11 — Final-send ordering:** Current route/circuit eligibility and physical-send reservation complete before the hosted claim. Immediately before irreversible provider I/O, revalidate the immutable attempt-plan capability, claim hosted dispatch synchronously, record physical telemetry, and perform exactly one manual-redirect HTTP fetch or one WebSocket frame write. A failed claim performs zero provider I/O.
 - **R12 — WebSocket parity:** WebSocket ownership is claimed before the first `response.create` frame is written, not in the existing post-write callback. A frame-write error remains ambiguous and cannot fall back to HTTP.
@@ -73,7 +73,7 @@ When Claude Code sends `web_search_20250305`, better-ccflare must preserve it as
 - A capability-plan mismatch at pretransport is local and sends nothing.
 - Once dispatch is claimed, any HTTP response, redirect, EOF, timeout, protocol error, decoder/encoder error, cancellation, resource loss, refusal, or unknown lifecycle is non-replayable for that inbound request.
 - A response that cannot be translated honestly terminates as an error; it is never converted to a client function and never retried on another provider.
-- A missing/unavailable replay key or issuance counter makes continuation-capable Codex tuples ineligible locally; it does not affect ordinary traffic.
+- A missing/unavailable replay key, issuance counter, or successful 512-slot request lease makes capability-bearing Codex tuples ineligible locally; structural writer readiness alone does not admit them, and ordinary traffic remains unaffected.
 
 ## Current-Main Reconciliation
 
@@ -136,21 +136,34 @@ When Claude Code sends `web_search_20250305`, better-ccflare must preserve it as
 
 **Test first**
 
-- exact endpoint/model/declaration/mode/replay matrix admits;
+- exact endpoint/model/declaration matrix admits only the following eight replay rows:
+
+  | Request shape | Input replay | Output replay | Response mode | Tool mode |
+  |---|---|---|---|---|
+  | fresh | `[]` | `proxy-evidence` | `json` | server-only |
+  | fresh | `[]` | `proxy-evidence` | `json` | mixed |
+  | fresh | `[]` | `proxy-evidence` | streaming | server-only |
+  | fresh | `[]` | `proxy-evidence` | streaming | mixed |
+  | natural continuation | `[native-Anthropic]` | `proxy-evidence` | `json` | server-only |
+  | natural continuation | `[native-Anthropic]` | `proxy-evidence` | `json` | mixed |
+  | natural continuation | `[native-Anthropic]` | `proxy-evidence` | streaming | server-only |
+  | natural continuation | `[native-Anthropic]` | `proxy-evidence` | streaming | mixed |
+
+- the natural-continuation regression derives `[native-Anthropic]` from Anthropic encoder output, rejects every non-native replay-input assertion, and admits the request only with request-private authenticated history projection;
 - near misses and unknown fields reject locally;
 - ordinary functions named `web_search` remain functions;
 - normalized restrictions survive native mapping exactly;
 - mapper output is deeply immutable and request-local;
 - no provider hook exposes a generic callback capable of blessing a forged tuple.
 - option values, response mode, mixed-tool mode, and replay shape all participate in tuple identity;
-- history projector and replay issuer closures are available only to a proof-bearing custom planner and never appear on serializable request metadata or the returned plan.
+- history projector and replay issuer closures are available only to the capability-bearing custom planner after a successful request-private replay bind and never appear on serializable request metadata or the returned plan.
 
 **Implementation**
 
 - Extend the provider-neutral requirement and tuple contract with exact option-profile, response-mode, and mixed-tool-mode dimensions.
 - Define the finite embedded Codex profile matrix.
 - Implement `CodexProvider.createServerToolCapabilityTuple`, `resolveServerToolCapability`, and `createAttemptPlan`.
-- Bind the ready replay codec to trusted request-local audience/lineage and pass only frozen projector/issuer closures through capability-only attempt-plan context.
+- After the durable request lease succeeds, bind the replay codec to trusted request-local audience/lineage and pass only frozen projector/issuer closures through capability-only attempt-plan context; structural codec/writer readiness alone is not admission.
 - Map only a proven capability-bearing request to native hosted search.
 - Parse each native response event once and fan it out to hosted lifecycle reduction plus the existing client-function and usage/model terminal paths.
 - Preserve existing Codex request behavior for every non-capability attempt; `createAttemptPlan` is bypassed when the capability proof key is null.
@@ -190,29 +203,34 @@ When Claude Code sends `web_search_20250305`, better-ccflare must preserve it as
 - `packages/database/src/migrations.ts`
 - `packages/database/src/migrations-pg.ts`
 - `packages/database/src/repositories/server-tool-replay-issuance.repository.ts`
-- repository and migration tests for SQLite and PostgreSQL
+- `packages/database/src/repositories/__tests__/server-tool-replay-issuance.repository.test.ts`
 - `packages/database/src/database-operations.ts`
 - `packages/database/src/index.ts`
 - `packages/proxy/src/server-tool-replay-runtime.ts`
 - `packages/proxy/src/server-tool-replay-runtime.test.ts`
 - `apps/server/src/server.ts`
 - `apps/server/src/device-setup-lifecycle.test.ts`
+- `.github/workflows/managed-routing-postgres.yml`
 
 **Test first**
 
 - SQLite and PostgreSQL new-install and upgrade parity;
-- atomic bounded range reservations and monotonic unique local consumption under concurrency;
+- every capability bind makes exactly one atomic durable reservation for an exclusive `HOSTED_SEARCH_LIFECYCLE_LIMITS.replayEnvelopes` (`512`) lease—the hard hosted-search lifecycle bound—before private replay binding and provider I/O, while structural writer readiness without that lease fails closed;
+- concurrent requests receive disjoint leases and cannot share or overcommit slots;
+- per-envelope claims begin only after hosted dispatch, claims 1–512 are unique and in-memory, claim 513 fails closed with no second store call, and unused slots burn on completion, failure, or crash without refund;
 - unknown future schema remains reader-compatible;
 - writer unavailable when count read/write is unavailable;
 - rotation/exhaustion thresholds and failed-record behavior;
 - no content columns and no ordinary-request repository calls;
-- request-private history projection and issuer closures reject reuse or forgery.
+- the natural-continuation regression accepts `[native-Anthropic]` only through request-private authenticated history projection, emits `proxy-evidence`, and rejects missing-projector, reuse, or forgery paths before provider I/O;
+- `server-tool-replay-issuance.repository.test.ts` exercises PostgreSQL under `BETTER_CCFLARE_TEST_POSTGRES_URL` in the existing managed-routing workflow.
 
 **Implementation**
 
 - Add only the bounded `server_tool_replay_issuance` counter table to both database backends.
-- Bind it to the existing replay runtime without exposing the codec or key material globally.
-- Build request-private history projector and replay issuer closures in the Codex attempt plan.
+- Make one atomic 512-slot reservation per capability bind and publish no request-private replay authority until the exclusive lease succeeds.
+- Bind the lease to the existing replay runtime without exposing the codec or key material globally; claim envelope slots in memory only after dispatch and never refill the lease.
+- Build request-private history projector and replay issuer closures in the Codex attempt plan, with unused issuance slots conservatively burned rather than refunded.
 
 ### U4 — Remove the default-off gate and preserve exact routing
 
@@ -265,6 +283,7 @@ When Claude Code sends `web_search_20250305`, better-ccflare must preserve it as
 - WebSocket claims before `response.create` write;
 - WS write ambiguity never falls back to HTTP;
 - abort before claim sends zero; abort after claim sends at most one;
+- the client-abort/cancel regression settles a committed, untransferred degraded lifecycle as `cancelled` before returning 499 and never reopens retry or failover;
 - 400/401/429/529/5xx, redirect, EOF, timeout, malformed lifecycle, and every current retry family remain at one send;
 - post-claim responses never emit guard retry authorization;
 - non-hosted retry/failover behavior remains unchanged;
@@ -275,27 +294,33 @@ When Claude Code sends `web_search_20250305`, better-ccflare must preserve it as
 - Add read-only hosted dispatch state plus synchronous `claimHostedDispatch()`.
 - Thread hosted ownership through the current attempt-plan dispatch seam.
 - Add a WebSocket pre-write hook and retain the existing post-write receipt hook for telemetry.
+- Preserve client-abort cancellation settlement before the 499 return while keeping the hosted claim monotonic.
 - Suppress all in-process and guard retry paths after claim without changing ordinary retry behavior.
 
 ### U6 — Vertical slice, verification, and deployment
 
 **Files**
 
-- Codex/provider/proxy integration tests listed above
+- `packages/providers/src/providers/codex/provider.server-tools.test.ts`
+- `packages/proxy/src/server-tool-replay-runtime.test.ts`
+- `packages/proxy/src/handlers/__tests__/proxy-operations-client-abort.test.ts`
+- `packages/database/src/repositories/__tests__/server-tool-replay-issuance.repository.test.ts`
+- `.github/workflows/managed-routing-postgres.yml`
+- remaining Codex/provider/proxy integration tests listed above
 - root `README.md`
 - this plan
 
 **Verification**
 
-1. Run focused provider, replay, database, routing-ledger, proxy-operation, guard, abort, and WebSocket tests.
-2. Run isolated PostgreSQL migration/repository tests; a missing PostgreSQL test URL is a release blocker for this database change.
+1. Run focused provider, replay, database, routing-ledger, proxy-operation, guard, abort, and WebSocket tests, explicitly including the natural-continuation and client-abort/cancel regressions.
+2. In the existing `.github/workflows/managed-routing-postgres.yml` PostgreSQL job, explicitly run `packages/database/src/repositories/__tests__/server-tool-replay-issuance.repository.test.ts` with `BETTER_CCFLARE_TEST_POSTGRES_URL`; a missing URL or failing PostgreSQL path is a release blocker.
 3. Run `bun run lint && bun run typecheck && bun run format` and confirm `git diff --check`.
 4. Run the repository's full test suite and build gates required by CI.
 5. Run an independent code review against the exact current-main merge base and resolve all P0/P1 findings.
 6. Push a focused draft PR without generated-worker or version changes.
 7. Merge only after CI/review, update the launch checkout to `refs/heads/main`, and deploy with `scripts/deploy-ccflare.sh`.
 8. Verify the existing service is healthy and `/health.git_sha` equals merged main.
-9. Observe naturally initiated Claude Code traffic: turn one performs one native hosted search; turn two consumes authenticated evidence with no hosted search unless explicitly requested. Confirm one physical upstream dispatch per inbound request, zero guard replay, valid citations, and a normal terminal without inspecting prompt/result content.
+9. Observe naturally initiated Claude Code traffic: turn one performs one native hosted search; turn two sends natural `[native-Anthropic]` history, passes request-private authenticated projection, emits `proxy-evidence`, and performs no hosted search unless explicitly requested. Confirm one physical upstream dispatch per inbound request, zero guard replay, valid citations, and a normal terminal without inspecting prompt/result content.
 
 ## Acceptance Matrix
 
@@ -303,10 +328,10 @@ When Claude Code sends `web_search_20250305`, better-ccflare must preserve it as
 |---|---:|---:|---|---|
 | Ordinary request | unchanged | unchanged | unchanged | unchanged |
 | Function named `web_search` | ordinary function path | unchanged | unchanged | unchanged |
-| Exact Codex fresh profile | admitted | exactly 1 | none after send | native Anthropic server-tool lifecycle |
-| Exact continuation with valid `bccf2` evidence | admitted | exactly 1 request dispatch; zero new hosted executions unless declared | none after send | evidence-aware continuation |
+| Exact fresh `[] -> proxy-evidence` profile in `json`/`streaming` and server-only/mixed modes | admitted | exactly 1 | none after send | native Anthropic server-tool lifecycle |
+| Exact natural continuation `[native-Anthropic] -> proxy-evidence` through request-private authenticated projection | admitted | exactly 1 request dispatch; zero new hosted executions unless declared | none after send | evidence-aware continuation |
 | Unsupported option/model/endpoint/mode | rejected locally | 0 | 0 | typed routing error |
-| Replay key/counter unavailable | rejected locally for continuation-capable tuple | 0 | 0 | typed routing error |
+| Replay key/counter/request lease unavailable | rejected locally for capability-bearing tuple | 0 | 0 | typed routing error |
 | Abort before claim | rejected/aborted | 0 | 0 | client-aborted terminal |
 | Abort or transport ambiguity after claim | admitted then terminal | at most 1 | 0 | non-replayable error/abort |
 | Unknown/malformed native event | admitted then terminal | 1 | 0 | honest translation error |
@@ -325,9 +350,10 @@ When Claude Code sends `web_search_20250305`, better-ccflare must preserve it as
 - Codex owns and wires an exact native hosted-search capability and attempt plan.
 - Claude Code no longer receives a client `tool_use` surrogate for an admitted server-owned search.
 - Native SSE and JSON lifecycles translate honestly to streaming and non-streaming Anthropic output.
-- Continuation evidence is authenticated, bounded, request-private, and fleet issuance is durably counted without content persistence.
+- The exact eight-row fresh/natural-continuation matrix is enforced; `[native-Anthropic]` input is admitted only through request-private authenticated projection and every output replay mode is `proxy-evidence`.
+- Every capability bind acquires one exclusive durable 512-slot issuance lease before private replay binding and provider I/O; post-dispatch claims are in-memory, claim 513 fails without a second store call, concurrent requests cannot share or overcommit, and unused slots are never refunded.
 - A capability-bearing inbound request can cross exactly one irreversible HTTP or WebSocket send boundary.
-- Every existing retry, failover, guard replay, abort, circuit, body-disposal, and WebSocket-rescue path is proven against that boundary.
+- Every existing retry, failover, guard replay, abort, circuit, body-disposal, and WebSocket-rescue path is proven against that boundary, including the natural-continuation and client-abort/cancel regressions.
 - `CCFLARE_SERVER_TOOL_WEB_SEARCH` no longer exists; exact capability admission is live automatically in the existing service.
 - Ordinary requests have no new database/network work and retain existing behavior.
 - SQLite and PostgreSQL parity, focused/full gates, independent review, draft PR, main-only deploy, matching health SHA, and a natural two-turn Claude Code canary are complete.

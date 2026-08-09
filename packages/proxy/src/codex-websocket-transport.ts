@@ -751,6 +751,14 @@ export class CodexWebSocketTransport {
 		} catch {
 			return finishFallbackSafePreWriteFailure();
 		}
+		// AbortSignal listeners added after abort() do not fire. Recheck at the
+		// final dispatch boundary so an abort observed during request preparation
+		// cannot claim hosted work or write a frame on a reused socket.
+		if (input.signal.aborted) {
+			parsed.framePayload = {};
+			this.finishActive(entry, active, true);
+			throw input.signal.reason;
+		}
 		try {
 			input.onBeforeFrameWrite?.();
 		} catch (error) {

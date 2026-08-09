@@ -2,6 +2,9 @@ import type { ServerToolReplayKeysState } from "@better-ccflare/config";
 import {
 	awaitServerToolReplayEnvelopeCodecReady,
 	createServerToolReplayEnvelopeCodec,
+	createServerToolReplayEnvelopeWriter,
+	getServerToolReplayEnvelopeCounterIdentity,
+	HOSTED_SEARCH_LIFECYCLE_LIMITS,
 	type ProviderServerToolHistoryProjector,
 	type ProviderServerToolReplayIssuer,
 	projectServerToolHistory,
@@ -9,6 +12,7 @@ import {
 	type ServerToolReplayEnvelopeCodec,
 	type ServerToolReplayEnvelopeKey,
 	type ServerToolReplayEnvelopePayload,
+	type ServerToolReplayEnvelopeWriter,
 	type ServerToolReplayWriterAdmission,
 } from "@better-ccflare/providers";
 import { opaqueRuntimeId } from "./opaque-runtime-id";
@@ -17,13 +21,19 @@ const SAFE_REPLAY_KEY_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const REPLAY_KEY_BYTES = 32;
 const REPLAY_AUTHORITY_TEXT_MAX_BYTES = 256;
 const WRITER_ADMISSION_DISABLED = Object.freeze({ enabled: false as const });
+const STRUCTURAL_WRITER_ADMISSION = Object.freeze({
+	enabled: true as const,
+	claimIssuance: async () => undefined,
+});
+const SERVER_TOOL_REPLAY_ISSUANCE_ROTATION_COUNT = 2 ** 31;
 
 /**
- * Reserve enough issuance counts to amortize durable coordination without
- * making crash-burn waste operationally meaningful. Unused counts are never
- * recycled, so nonce telemetry remains globally monotonic across restarts.
+ * Reserve the admitted protocol's complete replay-envelope budget once per
+ * inbound request. Unused counts are never recycled, so crash-burn semantics
+ * remain globally monotonic across restarts.
  */
-export const SERVER_TOOL_REPLAY_ISSUANCE_RANGE_SIZE = 256;
+export const SERVER_TOOL_REPLAY_ISSUANCE_RANGE_SIZE =
+	HOSTED_SEARCH_LIFECYCLE_LIMITS.replayEnvelopes;
 
 export type ServerToolReplayIssuanceReservationInput = Readonly<{
 	counterIdentity: string;
@@ -42,13 +52,28 @@ export interface ServerToolReplayIssuanceStore {
 	): Promise<ServerToolReplayIssuanceReservation>;
 }
 
+export type ServerToolReplayIssuanceLeaseInput = Readonly<{
+	counterIdentity: string;
+}>;
+
+export type ServerToolReplayWriterLeaseAdmission =
+	| Readonly<{ enabled: false }>
+	| Readonly<{
+			enabled: true;
+			acquireIssuanceLease: (
+				input: ServerToolReplayIssuanceLeaseInput,
+			) => Promise<
+				Extract<ServerToolReplayWriterAdmission, Readonly<{ enabled: true }>>
+			>;
+	  }>;
+
 export type ServerToolReplayWriterAdmissionUnavailableReason = "invalid_store";
 
 export type ServerToolReplayWriterAdmissionBuildResult =
 	| Readonly<{
 			status: "ready";
 			writerAdmission: Extract<
-				ServerToolReplayWriterAdmission,
+				ServerToolReplayWriterLeaseAdmission,
 				Readonly<{ enabled: true }>
 			>;
 	  }>
@@ -56,7 +81,7 @@ export type ServerToolReplayWriterAdmissionBuildResult =
 			status: "unavailable";
 			reason: ServerToolReplayWriterAdmissionUnavailableReason;
 			writerAdmission: Extract<
-				ServerToolReplayWriterAdmission,
+				ServerToolReplayWriterLeaseAdmission,
 				Readonly<{ enabled: false }>
 			>;
 	  }>;
@@ -73,7 +98,7 @@ export type ServerToolReplayRuntimeState =
 	  }>;
 
 export type ServerToolReplayRuntimeOptions = Readonly<{
-	writerAdmission?: ServerToolReplayWriterAdmission;
+	writerAdmission?: ServerToolReplayWriterLeaseAdmission;
 }>;
 
 export type RequestPrivateServerToolReplay = Readonly<{
@@ -104,6 +129,11 @@ const requestPrivateServerToolReplay = new WeakMap<
 	object,
 	RequestPrivateServerToolReplayRecord
 >();
+const pendingRequestPrivateServerToolReplay = new WeakSet<object>();
+const replayCodecWriterLeaseAdmission = new WeakMap<
+	ServerToolReplayEnvelopeCodec,
+	ServerToolReplayWriterLeaseAdmission
+>();
 
 const SERVER_TOOL_REPLAY_DISABLED: ServerToolReplayRuntimeState = Object.freeze(
 	{
@@ -124,6 +154,20 @@ function isWeakKey(value: unknown): value is object {
 	return (
 		(typeof value === "object" && value !== null) || typeof value === "function"
 	);
+}
+
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+	if (
+		(typeof value !== "object" && typeof value !== "function") ||
+		value === null
+	) {
+		return false;
+	}
+	try {
+		return typeof Reflect.get(value, "then") === "function";
+	} catch {
+		return false;
+	}
 }
 
 function boundedAuthorityText(value: unknown): string | null {
@@ -233,10 +277,11 @@ function snapshotReplayPayload(
 
 function createRequestPrivateReplayAuthority(
 	codec: ServerToolReplayEnvelopeCodec,
+	writer: ServerToolReplayEnvelopeWriter,
 	audience: string,
 	lineage: string,
 ): RequestPrivateServerToolReplay | null {
-	const encode = codec.encode;
+	const encode = writer.encode;
 	const decode = codec.decode;
 	if (typeof encode !== "function" || typeof decode !== "function") return null;
 
@@ -260,7 +305,7 @@ function createRequestPrivateReplayAuthority(
 		);
 	const serverToolReplayIssuer: ProviderServerToolReplayIssuer = Object.freeze(
 		async (binding, payload) =>
-			Reflect.apply(encode, codec, [
+			Reflect.apply(encode, writer, [
 				snapshotReplayBinding(binding, audience, lineage),
 				snapshotReplayPayload(payload),
 			]),
@@ -276,14 +321,15 @@ function createRequestPrivateReplayAuthority(
  * the only link between RequestMeta and the replay codec; no secret-bearing
  * value is attached to metadata or returned from this operation.
  */
-export function bindRequestPrivateServerToolReplay(
+export async function bindRequestPrivateServerToolReplay(
 	owner: object,
 	runtime: ServerToolReplayRuntimeState | undefined,
 	input: RequestPrivateServerToolReplayBindInput,
-): boolean {
+): Promise<boolean> {
 	if (
 		!isWeakKey(owner) ||
 		requestPrivateServerToolReplay.has(owner) ||
+		pendingRequestPrivateServerToolReplay.has(owner) ||
 		runtime?.status !== "ready" ||
 		!isRecord(input) ||
 		!(input.request instanceof Request)
@@ -300,17 +346,61 @@ export function bindRequestPrivateServerToolReplay(
 	) {
 		return false;
 	}
-	const authority = createRequestPrivateReplayAuthority(
+
+	const writerLeaseAdmission = replayCodecWriterLeaseAdmission.get(
 		runtime.codec,
-		audience,
-		lineage,
 	);
-	if (authority === null) return false;
-	requestPrivateServerToolReplay.set(
-		owner,
-		Object.freeze({ audience, lineage, authority }),
-	);
-	return true;
+	if (writerLeaseAdmission === undefined || !writerLeaseAdmission.enabled) {
+		return false;
+	}
+
+	pendingRequestPrivateServerToolReplay.add(owner);
+	try {
+		let pendingLease: unknown;
+		try {
+			pendingLease = writerLeaseAdmission.acquireIssuanceLease(
+				Object.freeze({
+					counterIdentity: getServerToolReplayEnvelopeCounterIdentity(
+						runtime.codec,
+					),
+				}),
+			);
+		} catch {
+			return false;
+		}
+		if (!isPromiseLike(pendingLease)) return false;
+
+		let writerAdmission: ServerToolReplayWriterAdmission;
+		try {
+			writerAdmission = (await pendingLease) as ServerToolReplayWriterAdmission;
+		} catch {
+			return false;
+		}
+		let writer: ServerToolReplayEnvelopeWriter;
+		try {
+			writer = createServerToolReplayEnvelopeWriter(
+				runtime.codec,
+				writerAdmission,
+			);
+		} catch {
+			return false;
+		}
+		if (requestPrivateServerToolReplay.has(owner)) return false;
+		const authority = createRequestPrivateReplayAuthority(
+			runtime.codec,
+			writer,
+			audience,
+			lineage,
+		);
+		if (authority === null) return false;
+		requestPrivateServerToolReplay.set(
+			owner,
+			Object.freeze({ audience, lineage, authority }),
+		);
+		return true;
+	} finally {
+		pendingRequestPrivateServerToolReplay.delete(owner);
+	}
 }
 
 /** Revalidate trusted request identity before exposing proof-only closures. */
@@ -397,12 +487,6 @@ function snapshotBoundReplayIssuanceRangeReservation(
 	return undefined;
 }
 
-type AvailableReplayIssuanceRange = {
-	nextIssuanceCount: number;
-	lastIssuanceCount: number;
-	pendingReservation?: Promise<void>;
-};
-
 function invalidReplayIssuanceRange(): Error {
 	return new Error("Server-tool replay issuance range is invalid");
 }
@@ -410,7 +494,6 @@ function invalidReplayIssuanceRange(): Error {
 function validateReplayIssuanceRange(
 	reservation: unknown,
 	counterIdentity: string,
-	previousLastIssuanceCount: number,
 ): ServerToolReplayIssuanceReservation {
 	if (
 		!isRecord(reservation) ||
@@ -428,7 +511,8 @@ function validateReplayIssuanceRange(
 	const firstIssuanceCount = reservation.firstIssuanceCount as number;
 	const lastIssuanceCount = reservation.lastIssuanceCount as number;
 	if (
-		firstIssuanceCount <= previousLastIssuanceCount ||
+		firstIssuanceCount < 1 ||
+		lastIssuanceCount >= SERVER_TOOL_REPLAY_ISSUANCE_ROTATION_COUNT ||
 		lastIssuanceCount - firstIssuanceCount + 1 !==
 			SERVER_TOOL_REPLAY_ISSUANCE_RANGE_SIZE
 	) {
@@ -442,9 +526,10 @@ function validateReplayIssuanceRange(
 }
 
 /**
- * Adapt bounded durable range reservations to the codec's per-envelope claim
- * contract. Each counter identity owns one in-flight reservation and consumes
- * its range monotonically in process. A crash intentionally burns unused slots.
+ * Adapt one atomic durable range reservation into one request-private in-memory
+ * claimant. Requests never share a pending reservation or capacity, and an
+ * exhausted request lease never rolls over. A crash intentionally burns every
+ * unused slot in the request's range.
  */
 export function createDurableServerToolReplayWriterAdmission(
 	store: ServerToolReplayIssuanceStore,
@@ -454,54 +539,71 @@ export function createDurableServerToolReplayWriterAdmission(
 	if (reserveReplayIssuanceRange === undefined) {
 		return unavailableWriterAdmission("invalid_store");
 	}
-	const availableRanges = new Map<string, AvailableReplayIssuanceRange>();
+	let unavailable = false;
 	const writerAdmission = Object.freeze({
 		enabled: true as const,
-		claimIssuance: async (
-			claim: Readonly<{ counterIdentity: string; issuedAtMs: number }>,
-		): Promise<number> => {
-			let availableRange = availableRanges.get(claim.counterIdentity);
-			if (availableRange === undefined) {
-				availableRange = {
-					nextIssuanceCount: 1,
-					lastIssuanceCount: 0,
-				};
-				availableRanges.set(claim.counterIdentity, availableRange);
-			}
-
-			while (
-				availableRange.nextIssuanceCount > availableRange.lastIssuanceCount
+		acquireIssuanceLease: async (
+			input: ServerToolReplayIssuanceLeaseInput,
+		): Promise<
+			Extract<ServerToolReplayWriterAdmission, Readonly<{ enabled: true }>>
+		> => {
+			if (
+				unavailable ||
+				!isRecord(input) ||
+				!hasExactProperties(input, ["counterIdentity"]) ||
+				boundedAuthorityText(input.counterIdentity) === null
 			) {
-				if (availableRange.pendingReservation === undefined) {
-					availableRange.pendingReservation = (async () => {
-						const reservation = validateReplayIssuanceRange(
-							await reserveReplayIssuanceRange(
-								Object.freeze({
-									counterIdentity: claim.counterIdentity,
-									reservationSize: SERVER_TOOL_REPLAY_ISSUANCE_RANGE_SIZE,
-								}),
-							),
-							claim.counterIdentity,
-							availableRange.lastIssuanceCount,
-						);
-						availableRange.nextIssuanceCount = reservation.firstIssuanceCount;
-						availableRange.lastIssuanceCount = reservation.lastIssuanceCount;
-					})();
-				}
-
-				const pendingReservation = availableRange.pendingReservation;
-				try {
-					await pendingReservation;
-				} finally {
-					if (availableRange.pendingReservation === pendingReservation) {
-						availableRange.pendingReservation = undefined;
-					}
-				}
+				throw invalidReplayIssuanceRange();
 			}
 
-			const issuanceCount = availableRange.nextIssuanceCount;
-			availableRange.nextIssuanceCount += 1;
-			return issuanceCount;
+			const counterIdentity = input.counterIdentity as string;
+			let pendingReservation: unknown;
+			try {
+				pendingReservation = reserveReplayIssuanceRange(
+					Object.freeze({
+						counterIdentity,
+						reservationSize: SERVER_TOOL_REPLAY_ISSUANCE_RANGE_SIZE,
+					}),
+				);
+			} catch (error) {
+				unavailable = true;
+				throw error;
+			}
+			if (!isPromiseLike(pendingReservation)) {
+				unavailable = true;
+				throw invalidReplayIssuanceRange();
+			}
+
+			let reservation: ServerToolReplayIssuanceReservation;
+			try {
+				reservation = validateReplayIssuanceRange(
+					await pendingReservation,
+					counterIdentity,
+				);
+			} catch (error) {
+				unavailable = true;
+				throw error;
+			}
+
+			let nextIssuanceCount = reservation.firstIssuanceCount;
+			const claimIssuance = Object.freeze(
+				async (claim: unknown): Promise<number | undefined> => {
+					if (
+						!isRecord(claim) ||
+						!hasExactProperties(claim, ["counterIdentity", "issuedAtMs"]) ||
+						claim.counterIdentity !== counterIdentity ||
+						!Number.isSafeInteger(claim.issuedAtMs) ||
+						(claim.issuedAtMs as number) < 0 ||
+						nextIssuanceCount > reservation.lastIssuanceCount
+					) {
+						return undefined;
+					}
+					const issuanceCount = nextIssuanceCount;
+					nextIssuanceCount += 1;
+					return issuanceCount;
+				},
+			);
+			return Object.freeze({ enabled: true as const, claimIssuance });
 		},
 	});
 	return Object.freeze({ status: "ready", writerAdmission });
@@ -527,7 +629,7 @@ function copyKeyBytes(value: unknown): Uint8Array | undefined {
 
 async function composeReadyRuntime(
 	state: Record<string, unknown>,
-	writerAdmission: ServerToolReplayWriterAdmission,
+	writerAdmission: ServerToolReplayWriterLeaseAdmission,
 ): Promise<ServerToolReplayRuntimeState> {
 	const temporaryKeyCopies: Uint8Array[] = [];
 	let codec: ServerToolReplayEnvelopeCodec | undefined;
@@ -589,7 +691,9 @@ async function composeReadyRuntime(
 		codec = createServerToolReplayEnvelopeCodec({
 			activeKey,
 			retainedKeys,
-			writerAdmission,
+			writerAdmission: writerAdmission.enabled
+				? STRUCTURAL_WRITER_ADMISSION
+				: WRITER_ADMISSION_DISABLED,
 		});
 	} catch {
 		return SERVER_TOOL_REPLAY_UNAVAILABLE;
@@ -599,7 +703,9 @@ async function composeReadyRuntime(
 
 	try {
 		await awaitServerToolReplayEnvelopeCodecReady(codec);
-		return Object.freeze({ status: "ready", codec: Object.freeze(codec) });
+		const readyCodec = Object.freeze(codec);
+		replayCodecWriterLeaseAdmission.set(readyCodec, writerAdmission);
+		return Object.freeze({ status: "ready", codec: readyCodec });
 	} catch {
 		return SERVER_TOOL_REPLAY_UNAVAILABLE;
 	}

@@ -3,12 +3,11 @@ import { BaseRepository } from "./base.repository";
 export const SERVER_TOOL_REPLAY_ISSUANCE_MAX = 2 ** 31;
 
 /**
- * A small upper bound keeps crash-burn waste negligible while removing one
- * durable write from every replay envelope. The runtime currently reserves the
- * full 256-slot block; smaller requests remain available for boundary tests and
- * future staged rollouts.
+ * One request reserves the hosted-search protocol's complete replay-envelope
+ * budget before dispatch. Unused slots intentionally burn on completion or
+ * crash so no request ever needs a second durable write after provider I/O.
  */
-export const SERVER_TOOL_REPLAY_ISSUANCE_RESERVATION_MAX = 256;
+export const SERVER_TOOL_REPLAY_ISSUANCE_RESERVATION_MAX = 512;
 
 const PORTABLE_UNSIGNED_INTEGER = /^(0|[1-9][0-9]*)$/;
 

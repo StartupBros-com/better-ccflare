@@ -39,6 +39,18 @@ const { buildServerToolCapabilityProofKey, usageCache } = await import(
 );
 const usageCollectorModule = await import("../usage-collector");
 const { handleProxy } = await import("../proxy");
+const { codexWebSocketTransport } = await import(
+	"../codex-websocket-transport"
+);
+const {
+	createDurableServerToolReplayWriterAdmission,
+	createServerToolReplayRuntime,
+} = await import("../server-tool-replay-runtime");
+const { createReadyServerToolReplayRuntimeForTest } = await import(
+	"./helpers/server-tool-replay-runtime"
+);
+const READY_SERVER_TOOL_REPLAY_RUNTIME =
+	await createReadyServerToolReplayRuntimeForTest();
 
 const MODEL = "claude-sonnet-4-5";
 const originalFetch = globalThis.fetch;
@@ -233,14 +245,7 @@ function makeContext(
 		provider,
 		refreshInFlight: new Map(),
 		asyncWriter: { enqueue: mutations.asyncWrite },
-		serverToolReplay: Object.freeze({
-			status: "ready",
-			codec: Object.freeze({
-				getWriterReadiness: () => Object.freeze({ status: "ready" }),
-				encode: async () => "bccf2.A256GCM.fixture",
-				decode: async () => Object.freeze({}),
-			}),
-		}),
+		serverToolReplay: READY_SERVER_TOOL_REPLAY_RUNTIME,
 	} as unknown as ProxyContext;
 	return { ctx, refreshCalls, mutations, getAgentPreference, provider };
 }
@@ -491,6 +496,78 @@ describe("server-tool routing integration", () => {
 		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
 	});
 
+	it("fails the first durable replay reservation before selection or any provider I/O", async () => {
+		const account = makeAccount({
+			access_token: "test-token",
+			expires_at: Date.now() + 60 * 60_000,
+		});
+		const providerIo = {
+			buildUrl: mock(() => "https://capability.invalid/v1/responses"),
+			prepareHeaders: mock((headers: Headers) => new Headers(headers)),
+			processResponse: mock(async (response: Response) => response),
+			transformRequestBody: mock(async (request: Request) => request),
+		};
+		const { ctx, refreshCalls, mutations } = makeContext(
+			account,
+			(provider) => {
+				provider.buildUrl = providerIo.buildUrl;
+				provider.prepareHeaders = providerIo.prepareHeaders;
+				provider.processResponse = providerIo.processResponse;
+				provider.transformRequestBody = providerIo.transformRequestBody;
+			},
+		);
+		let reservationCalls = 0;
+		const admission = createDurableServerToolReplayWriterAdmission({
+			reserveReplayIssuanceRange: async () => {
+				reservationCalls += 1;
+				throw new Error("durable issuance unavailable");
+			},
+		});
+		ctx.serverToolReplay = await createServerToolReplayRuntime(
+			{
+				status: "ready",
+				activeKeyId: "integration-active",
+				keys: [
+					{
+						id: "integration-active",
+						status: "active",
+						key: Array.from({ length: 32 }, (_, index) => index + 1),
+					},
+				],
+			},
+			{ writerAdmission: admission.writerAdmission },
+		);
+		const websocketAttempt = spyOn(
+			codexWebSocketTransport,
+			"tryRequest",
+		).mockImplementation(async () => null);
+		globalThis.fetch = mock(async () => new Response(null, { status: 500 }));
+		const request = makeServerToolRequest();
+
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.json();
+
+		expect(response.status).toBe(503);
+		expect(body).toMatchObject({
+			type: "error",
+			error: {
+				code: "server_tool_replay_unavailable",
+				reason: "replay_unavailable",
+			},
+		});
+		expect(reservationCalls).toBe(1);
+		expect(ctx.strategy.select).toHaveBeenCalledTimes(0);
+		expect(refreshCalls.value).toBe(0);
+		expect(providerIo.buildUrl).toHaveBeenCalledTimes(0);
+		expect(providerIo.prepareHeaders).toHaveBeenCalledTimes(0);
+		expect(providerIo.processResponse).toHaveBeenCalledTimes(0);
+		expect(providerIo.transformRequestBody).toHaveBeenCalledTimes(0);
+		expect(mutations.asyncWrite).toHaveBeenCalledTimes(0);
+		expect(websocketAttempt).toHaveBeenCalledTimes(0);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+		websocketAttempt.mockRestore();
+	});
+
 	it("stops an incapable pool before refresh, transport, mutation, or unauthenticated passthrough", async () => {
 		const account = makeAccount();
 		const { ctx, refreshCalls, mutations } = makeContext(account);
@@ -532,7 +609,7 @@ describe("server-tool routing integration", () => {
 		expect(response.headers.has("x-better-ccflare-recovery-scope")).toBeFalse();
 	});
 
-	it("stops a declaration-proven replay-ineligible pool before strategy, credentials, provider I/O, mutation, or dispatch", async () => {
+	it("stops a writer-disabled replay runtime before capability work or provider I/O", async () => {
 		const first = makeAccount({
 			id: "replay-ineligible-first",
 			name: "replay-ineligible-first",
@@ -576,14 +653,17 @@ describe("server-tool routing integration", () => {
 				provider.resolveServerToolCapability = resolveCapability;
 			},
 		);
-		ctx.serverToolReplay = Object.freeze({
+		ctx.serverToolReplay = await createServerToolReplayRuntime({
 			status: "ready",
-			codec: Object.freeze({
-				getWriterReadiness: () => Object.freeze({ status: "disabled" }),
-				encode: async () => "bccf2.A256GCM.fixture",
-				decode: async () => Object.freeze({}),
-			}),
-		}) as never;
+			activeKeyId: "writer-disabled-active",
+			keys: [
+				{
+					id: "writer-disabled-active",
+					status: "active",
+					key: Array.from({ length: 32 }, (_, index) => index + 1),
+				},
+			],
+		});
 		globalThis.fetch = mock(
 			async () =>
 				new Response(JSON.stringify({ unexpected: true }), { status: 500 }),
@@ -602,18 +682,9 @@ describe("server-tool routing integration", () => {
 				reason: "replay_unavailable",
 				message:
 					"Server-tool replay configuration cannot satisfy this request.",
-				capability: {
-					structuralCandidateCount: 2,
-					provenCandidateCount: 2,
-					unsupportedCandidateCount: 0,
-					unknownCandidateCount: 0,
-					replayIneligibleCandidateCount: 2,
-					temporarilyUnavailableProvenCandidateCount: 0,
-					eligibleCandidateCount: 0,
-				},
 			},
 		});
-		expect(resolveCapability).toHaveBeenCalledTimes(2);
+		expect(resolveCapability).toHaveBeenCalledTimes(0);
 		expect(ctx.strategy.select).toHaveBeenCalledTimes(0);
 		expect(ctx.strategy.reportCandidateSuccess).toHaveBeenCalledTimes(0);
 		expect(refreshCalls.value).toBe(0);

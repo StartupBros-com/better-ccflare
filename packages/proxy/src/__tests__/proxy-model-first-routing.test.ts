@@ -32,6 +32,9 @@ const providersModule = await import("@better-ccflare/providers");
 const { usageCache } = providersModule;
 const usageCollectorModule = await import("../usage-collector");
 const { handleProxy } = await import("../proxy");
+const { createReadyServerToolReplayRuntimeForTest } = await import(
+	"./helpers/server-tool-replay-runtime"
+);
 const { getRateLimitProbeAdmission, resetRateLimitProbeGatesForTests } =
 	await import("../handlers/rate-limit-cooldown");
 
@@ -184,15 +187,8 @@ function makeContext(accounts: Account[], combo: ComboWithSlots): ProxyContext {
 	} as unknown as ProxyContext;
 }
 
-function installReadyServerToolReplay(ctx: ProxyContext): void {
-	ctx.serverToolReplay = Object.freeze({
-		status: "ready",
-		codec: Object.freeze({
-			getWriterReadiness: () => Object.freeze({ status: "ready" }),
-			encode: async () => "bccf2.A256GCM.fixture",
-			decode: async () => Object.freeze({}),
-		}),
-	}) as never;
+async function installReadyServerToolReplay(ctx: ProxyContext): Promise<void> {
+	ctx.serverToolReplay = await createReadyServerToolReplayRuntimeForTest();
 }
 
 function makeRequest(extraHeaders: Record<string, string> = {}): Request {
@@ -1154,7 +1150,7 @@ describe("global model-first routing", () => {
 	it("runs only the exact proven Opus tail when a server-tool Fable route is capacity-blocked", async () => {
 		const blocked = makeAccount("server-tool-capacity-tail");
 		const ctx = makeContext([blocked], makeCombo({ account: blocked }));
-		installReadyServerToolReplay(ctx);
+		await installReadyServerToolReplay(ctx);
 		ctx.dbOps.getComboRoutingPolicy = mock(async (family: ComboFamily) =>
 			makeRoutingPolicy(null, family),
 		);
@@ -1205,7 +1201,7 @@ describe("global model-first routing", () => {
 	it("returns a capability terminal when the only deferred server-tool proof drifts before transport", async () => {
 		const blocked = makeAccount("server-tool-drifted-capacity-tail");
 		const ctx = makeContext([blocked], makeCombo({ account: blocked }));
-		installReadyServerToolReplay(ctx);
+		await installReadyServerToolReplay(ctx);
 		ctx.dbOps.getComboRoutingPolicy = mock(async (family: ComboFamily) =>
 			makeRoutingPolicy(null, family),
 		);

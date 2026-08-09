@@ -55,10 +55,13 @@ jobs:
           packages/database/src/repositories/__tests__/combo-managed-policy.test.ts
           packages/database/src/repositories/__tests__/combo-priority.test.ts
 
-      - name: Run managed-routing PostgreSQL integration
+      - name: Run focused PostgreSQL integration tests
         env:
           BETTER_CCFLARE_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/better_ccflare_test
-        run: bun test packages/database/src/__tests__/managed-routing-postgres.integration.test.ts
+        run: >-
+          bun test
+          packages/database/src/__tests__/managed-routing-postgres.integration.test.ts
+          packages/database/src/repositories/__tests__/server-tool-replay-issuance.repository.test.ts
 
       - name: Run full test suite
         run: |

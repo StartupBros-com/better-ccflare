@@ -36,6 +36,7 @@ export {
 export * from "./request-capabilities";
 export * from "./server-tool-capabilities";
 export * from "./server-tools/history-projection";
+export { HOSTED_SEARCH_LIFECYCLE_LIMITS } from "./server-tools/hosted-search-lifecycle";
 export * from "./server-tools/replay-envelope";
 export * from "./types";
 // Export usage fetcher

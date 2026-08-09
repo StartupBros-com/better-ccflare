@@ -957,12 +957,16 @@ async function handleProxyCore(
 			);
 		}
 		if (
-			!bindRequestPrivateServerToolReplay(requestMeta, ctx.serverToolReplay, {
-				request: req,
-				apiKeyId,
-				audience: routeCallerIdentity(req, apiKeyId),
-				lineage: sessionId,
-			})
+			!(await bindRequestPrivateServerToolReplay(
+				requestMeta,
+				ctx.serverToolReplay,
+				{
+					request: req,
+					apiKeyId,
+					audience: routeCallerIdentity(req, apiKeyId),
+					lineage: sessionId,
+				},
+			))
 		) {
 			return createUnservedServerToolRoutingErrorResponse(
 				new ServerToolRoutingError({ reason: "replay_unavailable" }),

@@ -125,6 +125,9 @@ function assertExactContext(context: ProviderAttemptPlanContext): {
 	const proofKey = context.capabilityProofKey;
 	const replayIssuer = context.serverToolReplayIssuer;
 	const account = context.account;
+	const hasReviewedInputReplay =
+		sameReplay(context.inputReplayMode, []) ||
+		sameReplay(context.inputReplayMode, ["native-Anthropic"]);
 	if (
 		typeof proofKey !== "string" ||
 		proofKey.length === 0 ||
@@ -132,8 +135,7 @@ function assertExactContext(context: ProviderAttemptPlanContext): {
 		context.query !== "" ||
 		context.physicalModel !== CODEX_SERVER_TOOL_MODEL ||
 		!sameReplay(context.outputReplayMode, ["proxy-evidence-v1"]) ||
-		(!sameReplay(context.inputReplayMode, []) &&
-			!sameReplay(context.inputReplayMode, ["proxy-evidence-v1"])) ||
+		!hasReviewedInputReplay ||
 		typeof replayIssuer !== "function" ||
 		account.provider !== "codex" ||
 		account.api_key !== null ||
@@ -143,7 +145,7 @@ function assertExactContext(context: ProviderAttemptPlanContext): {
 		throw rejected();
 	}
 	if (
-		sameReplay(context.inputReplayMode, ["proxy-evidence-v1"]) &&
+		context.inputReplayMode.length > 0 &&
 		typeof context.serverToolHistoryProjector !== "function"
 	) {
 		throw rejected();

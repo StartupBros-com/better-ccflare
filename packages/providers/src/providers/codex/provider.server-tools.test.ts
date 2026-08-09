@@ -14,6 +14,7 @@ import {
 	materializeProviderServerToolCapabilityDecision,
 	materializeProviderServerToolCapabilityTuple,
 } from "../../server-tool-capabilities";
+import type { ServerToolHistoryReplacement } from "../../server-tools/history-projection";
 import officialSearchStream from "./__fixtures__/server-tools/official-search-stream.sanitized.json";
 import { CODEX_DEFAULT_ENDPOINT, CodexProvider } from "./provider";
 import {
@@ -229,6 +230,35 @@ function deriveExactRequirement(
 ): ServerToolRequirements {
 	const requirement = deriveServerToolRequirement({
 		stream: options.stream ?? true,
+		...(options.continuation
+			? {
+					messages: [
+						{
+							role: "assistant",
+							content: [
+								{
+									type: "server_tool_use",
+									id: "srvtoolu_continuation_fixture",
+									name: "web_search",
+									input: { query: "prior query" },
+								},
+								{
+									type: "web_search_tool_result",
+									tool_use_id: "srvtoolu_continuation_fixture",
+									content: [
+										{
+											type: "web_search_result",
+											url: "https://example.com/docs",
+											title: "Example docs",
+											encrypted_content: "bccf2.fixture",
+										},
+									],
+								},
+							],
+						},
+					],
+				}
+			: {}),
 		tools: [
 			...(options.mixed
 				? [
@@ -255,14 +285,7 @@ function deriveExactRequirement(
 		],
 	});
 	if (!requirement) throw new Error("expected exact server-tool requirement");
-	if (!options.continuation) return requirement;
-	return Object.freeze({
-		...requirement,
-		replay: Object.freeze({
-			...requirement.replay,
-			input: Object.freeze(["proxy-evidence-v1" as const]),
-		}),
-	});
+	return requirement;
 }
 
 function materializeCodexTuple(
@@ -311,7 +334,7 @@ describe("Codex exact hosted-search capability", () => {
 						mixedToolMode: mixed
 							? "server_and_client_functions"
 							: "server_only",
-						inputReplay: continuation ? ["proxy-evidence-v1"] : [],
+						inputReplay: continuation ? ["native-Anthropic"] : [],
 						outputReplay: ["proxy-evidence-v1"],
 						providerContractRevision: "codex-responses-web-search-v1",
 						replayDecoderRevision: "server-tool-replay-v1",
@@ -340,6 +363,136 @@ describe("Codex exact hosted-search capability", () => {
 		expect(admittedContracts).toBe(8);
 	});
 
+	test("admits the authenticated natural continuation emitted by the Anthropic encoder", async () => {
+		const firstTurnPlan = materializeHostedPlan(hostedRequestBody(false));
+		const firstTurnResponse = await firstTurnPlan.processResponse(
+			upstreamSse(officialSearchStream),
+		);
+		const firstTurn = (await firstTurnResponse.json()) as {
+			content: Array<Record<string, unknown>>;
+		};
+		const continuationBody = hostedRequestBody(false);
+		continuationBody.messages = [
+			{ role: "assistant", content: firstTurn.content },
+			{ role: "user", content: "Continue from that search" },
+		];
+		const requirements = deriveServerToolRequirement(continuationBody);
+		expect(requirements?.replay).toEqual({
+			input: ["native-Anthropic"],
+			output: ["proxy-evidence-v1"],
+			requiresOutputReplay: true,
+		});
+		if (!requirements) throw new Error("expected continuation requirement");
+
+		const tuple = materializeCodexTuple(requirements);
+		expect(tuple).toMatchObject({
+			inputReplay: ["native-Anthropic"],
+			outputReplay: ["proxy-evidence-v1"],
+		});
+		if (!tuple) throw new Error("expected authenticated continuation tuple");
+		expect(() =>
+			materializeHostedPlan(continuationBody, {
+				inputReplayMode: ["proxy-evidence-v1"],
+				outputReplayMode: tuple.outputReplay,
+			}),
+		).toThrow(CodexServerToolConversionError);
+
+		// A native Anthropic server_tool_use is admissible only when its paired
+		// output carries proxy evidence and the request-scoped projector is present
+		// to authenticate and neutralize that evidence before Codex conversion.
+		expect(() =>
+			materializeHostedPlan(continuationBody, {
+				inputReplayMode: tuple.inputReplay,
+				outputReplayMode: tuple.outputReplay,
+				serverToolHistoryProjector: undefined,
+			}),
+		).toThrow(CodexServerToolConversionError);
+
+		const callId = firstTurn.content.find(
+			(block) => block.type === "server_tool_use",
+		)?.id;
+		if (typeof callId !== "string") {
+			throw new Error("expected encoded server-tool call id");
+		}
+		const replacements: ServerToolHistoryReplacement[] = [];
+		for (
+			let blockIndex = 0;
+			blockIndex < firstTurn.content.length;
+			blockIndex++
+		) {
+			const block = firstTurn.content[blockIndex];
+			if (block?.type === "server_tool_use") {
+				replacements.push({
+					messageIndex: 0,
+					blockIndex,
+					role: "assistant",
+					sourceType: "server_tool_use",
+					callId,
+					text: '["bccf-untrusted-history-v1","server_tool_use"]',
+				});
+			} else if (block?.type === "web_search_tool_result") {
+				replacements.push({
+					messageIndex: 0,
+					blockIndex,
+					role: "assistant",
+					sourceType: "web_search_tool_result",
+					callId,
+					text: '["bccf-untrusted-history-v1","web_search_tool_result"]',
+				});
+			} else if (block?.type === "text" && Array.isArray(block.citations)) {
+				for (
+					let citationIndex = 0;
+					citationIndex < block.citations.length;
+					citationIndex++
+				) {
+					replacements.push({
+						messageIndex: 0,
+						blockIndex,
+						role: "assistant",
+						sourceType: "web_search_citation",
+						citationIndex,
+						callId,
+						text: '["bccf-untrusted-history-v1","web_search_citation"]',
+					});
+				}
+			}
+		}
+		const continuationPlan = materializeHostedPlan(continuationBody, {
+			inputReplayMode: tuple.inputReplay,
+			outputReplayMode: tuple.outputReplay,
+			serverToolHistoryProjector: async () =>
+				Object.freeze({
+					declarations: Object.freeze([]),
+					nativeOpaquePositions: Object.freeze([]),
+					replacements: Object.freeze(replacements),
+					envelopeCount: 1,
+					encryptedInputBytes: 1,
+				}),
+		});
+		const transformed = await continuationPlan.transformRequestBody(
+			new Request(CODEX_DEFAULT_ENDPOINT, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(continuationBody),
+			}),
+		);
+		const mapped = (await transformed.json()) as {
+			input: Array<{ content?: Array<Record<string, unknown>> }>;
+		};
+		const projectedContent = mapped.input.flatMap(
+			(message) => message.content ?? [],
+		);
+		expect(projectedContent.map((item) => item.type)).toEqual([
+			"output_text",
+			"output_text",
+			"output_text",
+			"input_text",
+		]);
+		expect(
+			projectedContent.some((item) => Object.hasOwn(item, "citations")),
+		).toBe(false);
+	});
+
 	test("rejects every near miss before capability admission", () => {
 		const exact = deriveExactRequirement();
 		const invalid = deriveServerToolRequirement({
@@ -355,20 +508,29 @@ describe("Codex exact hosted-search capability", () => {
 			tools: [{ type: "web_search_20990101", name: "web_search" }],
 		});
 		if (!invalid || !unsupported) throw new Error("expected rejected inputs");
-		const nativeReplay: ServerToolRequirements = Object.freeze({
-			...exact,
-			replay: Object.freeze({
-				...exact.replay,
-				input: Object.freeze(["native-Anthropic"]),
-			}),
-		});
-		const nativeOutputReplay: ServerToolRequirements = Object.freeze({
-			...exact,
-			replay: Object.freeze({
-				...exact.replay,
-				output: Object.freeze(["native-Anthropic"]),
-			}),
-		});
+		const continuation = deriveExactRequirement({ continuation: true });
+		const replayNearMisses = [
+			{
+				input: ["native-Anthropic"],
+				output: [],
+			},
+			{
+				input: ["proxy-evidence-v1"],
+				output: ["proxy-evidence-v1"],
+			},
+			{
+				input: ["native-Anthropic"],
+				output: ["native-Anthropic"],
+			},
+			{
+				input: ["native-Anthropic", "proxy-evidence-v1"],
+				output: ["proxy-evidence-v1"],
+			},
+			{
+				input: ["proxy-evidence-v1"],
+				output: [],
+			},
+		] as const;
 		const oversizedLocation = deriveServerToolRequirement({
 			tools: [
 				{
@@ -415,8 +577,20 @@ describe("Codex exact hosted-search capability", () => {
 		}
 		expect(materializeCodexTuple(invalid)).toBeUndefined();
 		expect(materializeCodexTuple(unsupported)).toBeUndefined();
-		expect(materializeCodexTuple(nativeReplay)).toBeUndefined();
-		expect(materializeCodexTuple(nativeOutputReplay)).toBeUndefined();
+		for (const replay of replayNearMisses) {
+			expect(
+				materializeCodexTuple(
+					Object.freeze({
+						...continuation,
+						replay: Object.freeze({
+							...continuation.replay,
+							input: Object.freeze([...replay.input]),
+							output: Object.freeze([...replay.output]),
+						}),
+					}),
+				),
+			).toBeUndefined();
+		}
 		expect(materializeCodexTuple(oversizedLocation)).toBeUndefined();
 	});
 
@@ -839,7 +1013,7 @@ describe("Codex exact hosted-search attempt plan", () => {
 		];
 		const replacementText = '["bccf-untrusted-history-v1","server_tool_use"]';
 		const plan = materializeHostedPlan(body, {
-			inputReplayMode: ["proxy-evidence-v1"],
+			inputReplayMode: ["native-Anthropic"],
 			serverToolHistoryProjector: async () =>
 				Object.freeze({
 					declarations: Object.freeze([]),

@@ -28,6 +28,7 @@ export const CODEX_SERVER_TOOL_RESPONSE_TRANSPORT =
 	"openai_responses_sse" as const;
 
 const FRESH_REPLAY = Object.freeze([]) as readonly ServerToolReplayAtom[];
+const NATIVE_ANTHROPIC_REPLAY = Object.freeze(["native-Anthropic" as const]);
 const PROXY_EVIDENCE_REPLAY = Object.freeze(["proxy-evidence-v1" as const]);
 const RESPONSE_MODES = Object.freeze(["json" as const, "streaming" as const]);
 const MIXED_TOOL_MODES = Object.freeze([
@@ -39,7 +40,22 @@ interface CodexServerToolCompiledContract {
 	readonly responseMode: ServerToolResponseMode;
 	readonly mixedToolMode: ServerToolMixedToolMode;
 	readonly inputReplay: readonly ServerToolReplayAtom[];
+	readonly outputReplay: readonly ServerToolReplayAtom[];
 }
+
+const CODEX_SERVER_TOOL_REPLAY_CONTRACTS = Object.freeze([
+	Object.freeze({
+		inputReplay: FRESH_REPLAY,
+		outputReplay: PROXY_EVIDENCE_REPLAY,
+	}),
+	// The Anthropic encoder emits a native server_tool_use paired with
+	// proxy-authenticated output. These two rows are the complete replay authority;
+	// proxy-evidence input, native output, and mixed atoms remain inadmissible.
+	Object.freeze({
+		inputReplay: NATIVE_ANTHROPIC_REPLAY,
+		outputReplay: PROXY_EVIDENCE_REPLAY,
+	}),
+]);
 
 /**
  * The complete reviewed Codex hosted-search transport matrix. These are code
@@ -49,8 +65,13 @@ interface CodexServerToolCompiledContract {
 const CODEX_SERVER_TOOL_COMPILED_CONTRACTS = Object.freeze(
 	RESPONSE_MODES.flatMap((responseMode) =>
 		MIXED_TOOL_MODES.flatMap((mixedToolMode) =>
-			[FRESH_REPLAY, PROXY_EVIDENCE_REPLAY].map((inputReplay) =>
-				Object.freeze({ responseMode, mixedToolMode, inputReplay }),
+			CODEX_SERVER_TOOL_REPLAY_CONTRACTS.map(({ inputReplay, outputReplay }) =>
+				Object.freeze({
+					responseMode,
+					mixedToolMode,
+					inputReplay,
+					outputReplay,
+				}),
 			),
 		),
 	),
@@ -108,15 +129,6 @@ function replayEquals(
 	);
 }
 
-function isSupportedOutputReplay(
-	replay: readonly ServerToolReplayAtom[],
-): boolean {
-	return (
-		replayEquals(replay, FRESH_REPLAY) ||
-		replayEquals(replay, PROXY_EVIDENCE_REPLAY)
-	);
-}
-
 function hasCompiledOptionBounds(
 	declaration: WebSearchServerToolDeclaration,
 ): boolean {
@@ -145,8 +157,7 @@ function matchCompiledContract(
 		requirements.profileId.length === 0 ||
 		typeof requirements.optionProfileId !== "string" ||
 		requirements.optionProfileId.length === 0 ||
-		requirements.replay.requiresOutputReplay !== true ||
-		!isSupportedOutputReplay(requirements.replay.output)
+		requirements.replay.requiresOutputReplay !== true
 	) {
 		return undefined;
 	}
@@ -157,6 +168,15 @@ function matchCompiledContract(
 		(requirements.mixedToolMode === "server_and_client_functions" &&
 			requirements.hasClientFunctions === true);
 	if (!mixedShapeMatches) return undefined;
+	// A fresh history has no observed output atom; the matched compiled row still
+	// requires proxy-evidence output for the response this candidate will produce.
+	const isFreshRequest =
+		replayEquals(requirements.replay.input, FRESH_REPLAY) &&
+		replayEquals(requirements.replay.output, FRESH_REPLAY);
+	const isNaturalContinuation =
+		replayEquals(requirements.replay.input, NATIVE_ANTHROPIC_REPLAY) &&
+		replayEquals(requirements.replay.output, PROXY_EVIDENCE_REPLAY);
+	if (!isFreshRequest && !isNaturalContinuation) return undefined;
 
 	return CODEX_SERVER_TOOL_COMPILED_CONTRACTS.find(
 		(contract) =>
@@ -200,7 +220,7 @@ function materializeCodexTuple(
 		responseMode: contract.responseMode,
 		mixedToolMode: contract.mixedToolMode,
 		inputReplay: contract.inputReplay,
-		outputReplay: PROXY_EVIDENCE_REPLAY,
+		outputReplay: contract.outputReplay,
 		providerContractRevision: CODEX_SERVER_TOOL_PROVIDER_CONTRACT_REVISION,
 		replayDecoderRevision: CODEX_SERVER_TOOL_REPLAY_DECODER_REVISION,
 		requestTransport: CODEX_SERVER_TOOL_REQUEST_TRANSPORT,

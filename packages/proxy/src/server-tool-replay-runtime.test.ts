@@ -3,6 +3,7 @@ import type { ServerToolReplayKeysState } from "@better-ccflare/config";
 import type {
 	ServerToolReplayEnvelopeBinding,
 	ServerToolReplayEnvelopePayload,
+	ServerToolReplayIssuanceClaim,
 } from "@better-ccflare/providers";
 
 // Focused source-worktree tests must not require generated database workers
@@ -63,6 +64,25 @@ function enabledCodec(id: string, key: Uint8Array) {
 				issued += 1;
 				return issued;
 			},
+		},
+	});
+}
+
+function enabledLeaseAdmission(
+	onClaim?: (claim: ServerToolReplayIssuanceClaim, count: number) => number,
+) {
+	return Object.freeze({
+		enabled: true as const,
+		acquireIssuanceLease: async (input: { counterIdentity: string }) => {
+			let issuanceCount = 0;
+			return Object.freeze({
+				enabled: true as const,
+				claimIssuance: async (claim: ServerToolReplayIssuanceClaim) => {
+					if (claim.counterIdentity !== input.counterIdentity) return undefined;
+					issuanceCount += 1;
+					return onClaim?.(claim, issuanceCount) ?? issuanceCount;
+				},
+			});
 		},
 	});
 }
@@ -141,6 +161,100 @@ function expectKeyCopiesZeroedExactlyOnce<T>(
 }
 
 describe("durable server-tool replay writer admission", () => {
+	it("acquires one exclusive full-lifecycle lease with no rollover store call", async () => {
+		let durableCount = 0;
+		const reservations: unknown[] = [];
+		const admission = createDurableServerToolReplayWriterAdmission({
+			reserveReplayIssuanceRange: async (input) => {
+				reservations.push(input);
+				const firstIssuanceCount = durableCount + 1;
+				durableCount += input.reservationSize;
+				return {
+					counterIdentity: input.counterIdentity,
+					firstIssuanceCount,
+					lastIssuanceCount: durableCount,
+				};
+			},
+		});
+		if (admission.status !== "ready") {
+			throw new Error("durable writer admission was not ready");
+		}
+
+		const lease = await admission.writerAdmission.acquireIssuanceLease({
+			counterIdentity: "opaque-counter-identity",
+		});
+		const claims = [];
+		for (let index = 0; index < 512; index += 1) {
+			claims.push(
+				await lease.claimIssuance({
+					counterIdentity: "opaque-counter-identity",
+					issuedAtMs: 1_786_000_000_123 + index,
+				}),
+			);
+		}
+
+		expect(SERVER_TOOL_REPLAY_ISSUANCE_RANGE_SIZE).toBe(512);
+		expect(claims).toEqual(
+			Array.from({ length: 512 }, (_, index) => index + 1),
+		);
+		await expect(
+			lease.claimIssuance({
+				counterIdentity: "opaque-counter-identity",
+				issuedAtMs: 1_786_000_000_123 + 512,
+			}),
+		).resolves.toBeUndefined();
+		expect(reservations).toEqual([
+			{
+				counterIdentity: "opaque-counter-identity",
+				reservationSize: 512,
+			},
+		]);
+	});
+
+	it("gives concurrent requests disjoint request-private leases", async () => {
+		let durableCount = 0;
+		let reservationCalls = 0;
+		const admission = createDurableServerToolReplayWriterAdmission({
+			reserveReplayIssuanceRange: async (input) => {
+				reservationCalls += 1;
+				const firstIssuanceCount = durableCount + 1;
+				durableCount += input.reservationSize;
+				const lastIssuanceCount = durableCount;
+				await Promise.resolve();
+				return {
+					counterIdentity: input.counterIdentity,
+					firstIssuanceCount,
+					lastIssuanceCount,
+				};
+			},
+		});
+		if (admission.status !== "ready") {
+			throw new Error("durable writer admission was not ready");
+		}
+
+		const [firstLease, secondLease] = await Promise.all([
+			admission.writerAdmission.acquireIssuanceLease({
+				counterIdentity: "opaque-counter-identity",
+			}),
+			admission.writerAdmission.acquireIssuanceLease({
+				counterIdentity: "opaque-counter-identity",
+			}),
+		]);
+		const [firstClaim, secondClaim] = await Promise.all([
+			firstLease.claimIssuance({
+				counterIdentity: "opaque-counter-identity",
+				issuedAtMs: 1,
+			}),
+			secondLease.claimIssuance({
+				counterIdentity: "opaque-counter-identity",
+				issuedAtMs: 2,
+			}),
+		]);
+
+		expect(reservationCalls).toBe(2);
+		expect(new Set([firstClaim, secondClaim])).toEqual(new Set([1, 513]));
+	});
+
 	it("serves many claims from one conservative durable range reservation", async () => {
 		const reservations: unknown[] = [];
 		const admission = createDurableServerToolReplayWriterAdmission({
@@ -160,10 +274,13 @@ describe("durable server-tool replay writer admission", () => {
 		}
 		expect(Object.isFrozen(admission)).toBe(true);
 		expect(Object.isFrozen(admission.writerAdmission)).toBe(true);
+		const lease = await admission.writerAdmission.acquireIssuanceLease({
+			counterIdentity: "opaque-counter-identity",
+		});
 		const claims = [];
 		for (let index = 0; index < 64; index += 1) {
 			claims.push(
-				await admission.writerAdmission.claimIssuance({
+				await lease.claimIssuance({
 					counterIdentity: "opaque-counter-identity",
 					issuedAtMs: 1_786_000_000_123 + index,
 				}),
@@ -178,7 +295,7 @@ describe("durable server-tool replay writer admission", () => {
 		]);
 	});
 
-	it("shares one in-flight reservation across concurrent claims and assigns unique counts", async () => {
+	it("assigns unique counts to concurrent in-memory claims in one lease", async () => {
 		let reservationCalls = 0;
 		const admission = createDurableServerToolReplayWriterAdmission({
 			reserveReplayIssuanceRange: async (input) => {
@@ -194,10 +311,13 @@ describe("durable server-tool replay writer admission", () => {
 		if (admission.status !== "ready") {
 			throw new Error("durable writer admission was not ready");
 		}
+		const lease = await admission.writerAdmission.acquireIssuanceLease({
+			counterIdentity: "opaque-counter-identity",
+		});
 
 		const claims = await Promise.all(
 			Array.from({ length: 128 }, (_, index) =>
-				admission.writerAdmission.claimIssuance({
+				lease.claimIssuance({
 					counterIdentity: "opaque-counter-identity",
 					issuedAtMs: 1_786_000_000_123 + index,
 				}),
@@ -210,7 +330,7 @@ describe("durable server-tool replay writer admission", () => {
 		);
 	});
 
-	it("rolls over only after every slot in the current block is consumed", async () => {
+	it("fails a request lease closed instead of rolling over after its final slot", async () => {
 		let durableCount = 0;
 		let reservationCalls = 0;
 		const admission = createDurableServerToolReplayWriterAdmission({
@@ -228,6 +348,9 @@ describe("durable server-tool replay writer admission", () => {
 		if (admission.status !== "ready") {
 			throw new Error("durable writer admission was not ready");
 		}
+		const lease = await admission.writerAdmission.acquireIssuanceLease({
+			counterIdentity: "opaque-counter-identity",
+		});
 
 		const claims = [];
 		for (
@@ -236,15 +359,15 @@ describe("durable server-tool replay writer admission", () => {
 			index += 1
 		) {
 			claims.push(
-				await admission.writerAdmission.claimIssuance({
+				await lease.claimIssuance({
 					counterIdentity: "opaque-counter-identity",
 					issuedAtMs: index,
 				}),
 			);
 		}
 
-		expect(reservationCalls).toBe(2);
-		expect(claims.at(-1)).toBe(SERVER_TOOL_REPLAY_ISSUANCE_RANGE_SIZE + 1);
+		expect(reservationCalls).toBe(1);
+		expect(claims.at(-1)).toBeUndefined();
 	});
 
 	it("conservatively burns unused slots across admission restart", async () => {
@@ -267,8 +390,11 @@ describe("durable server-tool replay writer admission", () => {
 		if (firstProcess.status !== "ready") {
 			throw new Error("first durable writer admission was not ready");
 		}
+		const firstLease = await firstProcess.writerAdmission.acquireIssuanceLease({
+			counterIdentity: "opaque-counter-identity",
+		});
 		await expect(
-			firstProcess.writerAdmission.claimIssuance({
+			firstLease.claimIssuance({
 				counterIdentity: "opaque-counter-identity",
 				issuedAtMs: 1,
 			}),
@@ -279,8 +405,12 @@ describe("durable server-tool replay writer admission", () => {
 		if (restartedProcess.status !== "ready") {
 			throw new Error("restarted durable writer admission was not ready");
 		}
+		const restartedLease =
+			await restartedProcess.writerAdmission.acquireIssuanceLease({
+				counterIdentity: "opaque-counter-identity",
+			});
 		await expect(
-			restartedProcess.writerAdmission.claimIssuance({
+			restartedLease.claimIssuance({
 				counterIdentity: "opaque-counter-identity",
 				issuedAtMs: 2,
 			}),
@@ -321,8 +451,11 @@ describe("durable server-tool replay writer admission", () => {
 		if (admission.status !== "ready") {
 			throw new Error("durable writer admission was not ready");
 		}
+		const lease = await admission.writerAdmission.acquireIssuanceLease({
+			counterIdentity: "opaque-counter-identity",
+		});
 		await expect(
-			admission.writerAdmission.claimIssuance({
+			lease.claimIssuance({
 				counterIdentity: "opaque-counter-identity",
 				issuedAtMs: 1_786_000_000_123,
 			}),
@@ -391,9 +524,8 @@ describe("durable server-tool replay writer admission", () => {
 			throw new Error("durable writer admission was not ready");
 		}
 		await expect(
-			admission.writerAdmission.claimIssuance({
+			admission.writerAdmission.acquireIssuanceLease({
 				counterIdentity: "opaque-counter-identity",
-				issuedAtMs: 1_786_000_000_123,
 			}),
 		).rejects.toBe(repositoryFailure);
 		expect(reservationCalls).toBe(1);
@@ -412,46 +544,85 @@ describe("durable server-tool replay writer admission", () => {
 		}
 
 		await expect(
-			admission.writerAdmission.claimIssuance({
+			admission.writerAdmission.acquireIssuanceLease({
 				counterIdentity: "opaque-counter-identity",
-				issuedAtMs: 1,
 			}),
 		).rejects.toThrow("Server-tool replay issuance range is invalid");
 	});
 
-	it("fails closed rather than reusing a stale range at block rollover", async () => {
+	it("does not reserve a replacement range after a request lease is exhausted", async () => {
+		let reservationCalls = 0;
 		const admission = createDurableServerToolReplayWriterAdmission({
-			reserveReplayIssuanceRange: async (input) => ({
-				counterIdentity: input.counterIdentity,
-				firstIssuanceCount: 1,
-				lastIssuanceCount: SERVER_TOOL_REPLAY_ISSUANCE_RANGE_SIZE,
-			}),
+			reserveReplayIssuanceRange: async (input) => {
+				reservationCalls += 1;
+				return {
+					counterIdentity: input.counterIdentity,
+					firstIssuanceCount: 1,
+					lastIssuanceCount: SERVER_TOOL_REPLAY_ISSUANCE_RANGE_SIZE,
+				};
+			},
 		});
 		if (admission.status !== "ready") {
 			throw new Error("durable writer admission was not ready");
 		}
+		const lease = await admission.writerAdmission.acquireIssuanceLease({
+			counterIdentity: "opaque-counter-identity",
+		});
 		for (
 			let index = 0;
 			index < SERVER_TOOL_REPLAY_ISSUANCE_RANGE_SIZE;
 			index += 1
 		) {
-			await admission.writerAdmission.claimIssuance({
+			await lease.claimIssuance({
 				counterIdentity: "opaque-counter-identity",
 				issuedAtMs: index,
 			});
 		}
 
 		await expect(
-			admission.writerAdmission.claimIssuance({
+			lease.claimIssuance({
 				counterIdentity: "opaque-counter-identity",
 				issuedAtMs: SERVER_TOOL_REPLAY_ISSUANCE_RANGE_SIZE,
 			}),
-		).rejects.toThrow("Server-tool replay issuance range is invalid");
+		).resolves.toBeUndefined();
+		expect(reservationCalls).toBe(1);
 	});
 });
 
 describe("server-tool replay runtime", () => {
-	it("binds only frozen projector and issuer closures to one private request identity", async () => {
+	it("fails closed for an unregistered structural runtime", async () => {
+		const runtime = Object.freeze({
+			status: "ready" as const,
+			codec: enabledCodec("structural-only", ACTIVE_BYTES),
+		});
+		const owner = {};
+		const credential = "Bearer replay-client";
+		const request = new Request("https://proxy.local/v1/messages", {
+			headers: {
+				authorization: credential,
+				"x-claude-code-session-id": "session-lineage",
+			},
+		});
+
+		expect(
+			await bindRequestPrivateServerToolReplay(owner, runtime, {
+				request,
+				apiKeyId: null,
+				audience: opaqueRuntimeId("model-route-caller", credential),
+				lineage: "session-lineage",
+			}),
+		).toBe(false);
+		expect(
+			resolveRequestPrivateServerToolReplay(owner, {
+				request,
+				apiKeyId: null,
+				lineage: "session-lineage",
+			}),
+		).toBeNull();
+	});
+
+	it("fails binding before authority publication when the first lease reservation fails", async () => {
+		let leaseCalls = 0;
 		const runtime = await createServerToolReplayRuntime(
 			readyState("next-active", [
 				{ id: "next-active", status: "active", key: [...ACTIVE_BYTES] },
@@ -459,8 +630,90 @@ describe("server-tool replay runtime", () => {
 			{
 				writerAdmission: {
 					enabled: true,
-					claimIssuance: async () => 1,
+					acquireIssuanceLease: async () => {
+						leaseCalls += 1;
+						throw new Error("durable issuance unavailable");
+					},
 				},
+			},
+		);
+		const owner = {};
+		const credential = "Bearer replay-client";
+		const request = new Request("https://proxy.local/v1/messages", {
+			headers: {
+				authorization: credential,
+				"x-claude-code-session-id": "session-lineage",
+			},
+		});
+
+		await expect(
+			bindRequestPrivateServerToolReplay(owner, runtime, {
+				request,
+				apiKeyId: null,
+				audience: opaqueRuntimeId("model-route-caller", credential),
+				lineage: "session-lineage",
+			}),
+		).resolves.toBe(false);
+		expect(leaseCalls).toBe(1);
+		expect(
+			resolveRequestPrivateServerToolReplay(owner, {
+				request,
+				apiKeyId: null,
+				lineage: "session-lineage",
+			}),
+		).toBeNull();
+	});
+
+	it("fails malformed request lease ranges before authority publication", async () => {
+		const admission = createDurableServerToolReplayWriterAdmission({
+			reserveReplayIssuanceRange: async (input) => ({
+				counterIdentity: input.counterIdentity,
+				firstIssuanceCount: 1,
+				lastIssuanceCount: 511,
+			}),
+		});
+		if (admission.status !== "ready") {
+			throw new Error("durable writer admission was not ready");
+		}
+		const runtime = await createServerToolReplayRuntime(
+			readyState("next-active", [
+				{ id: "next-active", status: "active", key: [...ACTIVE_BYTES] },
+			]),
+			{ writerAdmission: admission.writerAdmission },
+		);
+		const owner = {};
+		const credential = "Bearer replay-client";
+		const request = new Request("https://proxy.local/v1/messages", {
+			headers: {
+				authorization: credential,
+				"x-claude-code-session-id": "session-lineage",
+			},
+		});
+
+		await expect(
+			bindRequestPrivateServerToolReplay(owner, runtime, {
+				request,
+				apiKeyId: null,
+				audience: opaqueRuntimeId("model-route-caller", credential),
+				lineage: "session-lineage",
+			}),
+		).resolves.toBe(false);
+		expect(
+			resolveRequestPrivateServerToolReplay(owner, {
+				request,
+				apiKeyId: null,
+				lineage: "session-lineage",
+			}),
+		).toBeNull();
+	});
+
+	it("binds only frozen projector and issuer closures to one private request identity", async () => {
+		const runtime = await createServerToolReplayRuntime(
+			readyState("next-active", [
+				{ id: "next-active", status: "active", key: [...ACTIVE_BYTES] },
+			]),
+			{
+				writerAdmission: enabledLeaseAdmission(),
 			},
 		);
 		const requestMeta = { id: "request-private-owner" };
@@ -473,14 +726,14 @@ describe("server-tool replay runtime", () => {
 		});
 		const audience = opaqueRuntimeId("model-route-caller", credential);
 
-		expect(
+		await expect(
 			bindRequestPrivateServerToolReplay(requestMeta, runtime, {
 				request,
 				apiKeyId: null,
 				audience,
 				lineage: "session-lineage",
 			}),
-		).toBe(true);
+		).resolves.toBe(true);
 		const authority = resolveRequestPrivateServerToolReplay(requestMeta, {
 			request,
 			apiKeyId: null,
@@ -500,20 +753,11 @@ describe("server-tool replay runtime", () => {
 	});
 
 	it("snapshots projector and issuer inputs while overriding forged authority", async () => {
-		let issuanceCount = 0;
 		const runtime = await createServerToolReplayRuntime(
 			readyState("next-active", [
 				{ id: "next-active", status: "active", key: [...ACTIVE_BYTES] },
 			]),
-			{
-				writerAdmission: {
-					enabled: true,
-					claimIssuance: async () => {
-						issuanceCount += 1;
-						return issuanceCount;
-					},
-				},
-			},
+			{ writerAdmission: enabledLeaseAdmission() },
 		);
 		const requestMeta = {};
 		const credential = "Bearer replay-client";
@@ -524,14 +768,14 @@ describe("server-tool replay runtime", () => {
 			},
 		});
 		const audience = opaqueRuntimeId("model-route-caller", credential);
-		expect(
+		await expect(
 			bindRequestPrivateServerToolReplay(requestMeta, runtime, {
 				request,
 				apiKeyId: null,
 				audience,
 				lineage: "session-lineage",
 			}),
-		).toBe(true);
+		).resolves.toBe(true);
 		const authority = resolveRequestPrivateServerToolReplay(requestMeta, {
 			request,
 			apiKeyId: null,
@@ -646,6 +890,7 @@ describe("server-tool replay runtime", () => {
 			readyState("next-active", [
 				{ id: "next-active", status: "active", key: [...ACTIVE_BYTES] },
 			]),
+			{ writerAdmission: enabledLeaseAdmission() },
 		);
 		const owner = {};
 		const credential = "Bearer replay-client";
@@ -658,7 +903,7 @@ describe("server-tool replay runtime", () => {
 		const audience = opaqueRuntimeId("model-route-caller", credential);
 
 		expect(
-			bindRequestPrivateServerToolReplay(owner, runtime, {
+			await bindRequestPrivateServerToolReplay(owner, runtime, {
 				request,
 				apiKeyId: null,
 				audience,
@@ -666,7 +911,7 @@ describe("server-tool replay runtime", () => {
 			}),
 		).toBe(true);
 		expect(
-			bindRequestPrivateServerToolReplay(owner, runtime, {
+			await bindRequestPrivateServerToolReplay(owner, runtime, {
 				request,
 				apiKeyId: null,
 				audience,
@@ -711,7 +956,7 @@ describe("server-tool replay runtime", () => {
 			},
 		});
 		expect(
-			bindRequestPrivateServerToolReplay({}, runtime, {
+			await bindRequestPrivateServerToolReplay({}, runtime, {
 				request: ambiguous,
 				apiKeyId: null,
 				audience,
@@ -719,7 +964,7 @@ describe("server-tool replay runtime", () => {
 			}),
 		).toBe(false);
 		expect(
-			bindRequestPrivateServerToolReplay({}, runtime, {
+			await bindRequestPrivateServerToolReplay({}, runtime, {
 				request: new Request("https://proxy.local/v1/messages"),
 				apiKeyId: null,
 				audience: null,
@@ -924,7 +1169,7 @@ describe("server-tool replay runtime", () => {
 		});
 	});
 
-	it("enables atomic writer admission only when explicitly injected", async () => {
+	it("enables a request-private writer lease only when explicitly injected", async () => {
 		const claims: Array<
 			Readonly<{ counterIdentity: string; issuedAtMs: number }>
 		> = [];
@@ -933,20 +1178,41 @@ describe("server-tool replay runtime", () => {
 				{ id: "next-active", status: "active", key: [...ACTIVE_BYTES] },
 			]),
 			{
-				writerAdmission: {
-					enabled: true,
-					claimIssuance: async (claim) => {
-						claims.push(claim);
-						return claims.length;
-					},
-				},
+				writerAdmission: enabledLeaseAdmission((claim, count) => {
+					claims.push(claim);
+					return count;
+				}),
 			},
 		);
 
 		expect(runtime.status).toBe("ready");
 		if (runtime.status !== "ready") throw new Error("runtime was not ready");
 		expect(runtime.codec.getWriterReadiness()).toEqual({ status: "ready" });
-		await expect(runtime.codec.encode(BINDING, PAYLOAD)).resolves.toBeString();
+		const owner = {};
+		const credential = "Bearer replay-client";
+		const request = new Request("https://proxy.local/v1/messages", {
+			headers: {
+				authorization: credential,
+				"x-claude-code-session-id": "session-lineage",
+			},
+		});
+		expect(
+			await bindRequestPrivateServerToolReplay(owner, runtime, {
+				request,
+				apiKeyId: null,
+				audience: opaqueRuntimeId("model-route-caller", credential),
+				lineage: "session-lineage",
+			}),
+		).toBe(true);
+		const authority = resolveRequestPrivateServerToolReplay(owner, {
+			request,
+			apiKeyId: null,
+			lineage: "session-lineage",
+		});
+		if (!authority) throw new Error("request-private replay was not bound");
+		await expect(
+			authority.serverToolReplayIssuer(BINDING, PAYLOAD),
+		).resolves.toBeString();
 		expect(claims).toHaveLength(1);
 		expect(claims[0]?.counterIdentity).toBe(
 			getServerToolReplayEnvelopeCounterIdentity(runtime.codec),
@@ -981,15 +1247,24 @@ describe("server-tool replay runtime", () => {
 
 		expect(runtime.status).toBe("ready");
 		if (runtime.status !== "ready") throw new Error("runtime was not ready");
-		await expect(runtime.codec.encode(BINDING, PAYLOAD)).rejects.toMatchObject({
-			code: "server_tool_replay_admission_error",
+		const credential = "Bearer replay-client";
+		const request = new Request("https://proxy.local/v1/messages", {
+			headers: {
+				authorization: credential,
+				"x-claude-code-session-id": "session-lineage",
+			},
 		});
-		expect(runtime.codec.getWriterReadiness()).toEqual({
-			status: "telemetry_unavailable",
-		});
-		await expect(runtime.codec.encode(BINDING, PAYLOAD)).rejects.toMatchObject({
-			code: "server_tool_replay_admission_error",
-		});
+		for (const owner of [{}, {}]) {
+			expect(
+				await bindRequestPrivateServerToolReplay(owner, runtime, {
+					request,
+					apiKeyId: null,
+					audience: opaqueRuntimeId("model-route-caller", credential),
+					lineage: "session-lineage",
+				}),
+			).toBe(false);
+		}
+		expect(runtime.codec.getWriterReadiness()).toEqual({ status: "ready" });
 		expect(reservationCalls).toBe(1);
 		await expect(
 			runtime.codec.decode(readerToken, BINDING),

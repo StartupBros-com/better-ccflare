@@ -2,6 +2,7 @@ import { describe, expect, spyOn, test } from "bun:test";
 
 import {
 	createServerToolReplayEnvelopeCodec,
+	createServerToolReplayEnvelopeWriter,
 	getServerToolReplayEnvelopeCounterIdentity,
 	InvalidServerToolReplayEnvelopeError,
 	inspectServerToolReplayEnvelopeHeader,
@@ -523,6 +524,37 @@ describe("server-tool replay envelope", () => {
 			expect(await codec.decode(GOLDEN_TOKEN, binding)).toMatchObject(payload);
 			await captureAdmission(() => codec.encode(binding, payload));
 		}
+	});
+
+	test("creates an isolated request writer without mutating codec admission", async () => {
+		let defaultClaims = 0;
+		let requestClaims = 0;
+		const codec = deterministicCodec({
+			writerAdmission: {
+				enabled: true,
+				claimIssuance: async () => {
+					defaultClaims += 1;
+					return defaultClaims;
+				},
+			},
+		});
+		const writer = createServerToolReplayEnvelopeWriter(codec, {
+			enabled: true,
+			claimIssuance: async () => {
+				requestClaims += 1;
+				return requestClaims;
+			},
+		});
+
+		expect(Object.isFrozen(writer)).toBe(true);
+		expect(Object.isFrozen(writer.encode)).toBe(true);
+		expect(JSON.stringify(writer)).toBe("{}");
+		await expect(writer.encode(binding, payload)).resolves.toBe(GOLDEN_TOKEN);
+		expect(requestClaims).toBe(1);
+		expect(defaultClaims).toBe(0);
+		expect(codec.getWriterReadiness()).toEqual({ status: "ready" });
+		await expect(codec.encode(binding, payload)).resolves.toBe(GOLDEN_TOKEN);
+		expect(defaultClaims).toBe(1);
 	});
 
 	test("accepts exact authenticated age boundaries and rejects N+1 uniformly", async () => {

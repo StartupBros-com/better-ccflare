@@ -76,18 +76,15 @@ const { RoutingAttemptLedger } = await import("../routing-attempt-ledger");
 const { bindRequestPrivateServerToolReplay } = await import(
 	"../../server-tool-replay-runtime"
 );
+const { createReadyServerToolReplayRuntimeForTest } = await import(
+	"../../__tests__/helpers/server-tool-replay-runtime"
+);
 const { opaqueRuntimeId } = await import("../../opaque-runtime-id");
 
 const TEST_REPLAY_CREDENTIAL = "Bearer proxy-operations-server-tool-test";
 const TEST_REPLAY_LINEAGE = "proxy-operations-server-tool-session";
-const TEST_SERVER_TOOL_REPLAY_RUNTIME = Object.freeze({
-	status: "ready" as const,
-	codec: Object.freeze({
-		getWriterReadiness: () => Object.freeze({ status: "ready" as const }),
-		encode: async () => "bccf2.A256GCM.fixture",
-		decode: async () => Object.freeze({}),
-	}),
-});
+const TEST_SERVER_TOOL_REPLAY_RUNTIME =
+	await createReadyServerToolReplayRuntimeForTest();
 
 // Minimal Account fixture for openai-compatible provider
 function makeAccount(overrides: Partial<Account> = {}): Account {
@@ -214,7 +211,7 @@ function makeProxyContext(): ProxyContext {
 }
 
 function enableServerToolReplay(ctx: ProxyContext): ProxyContext {
-	ctx.serverToolReplay = TEST_SERVER_TOOL_REPLAY_RUNTIME as never;
+	ctx.serverToolReplay = TEST_SERVER_TOOL_REPLAY_RUNTIME;
 	return ctx;
 }
 
@@ -415,7 +412,7 @@ function makeServerToolCapabilityProof(
 	});
 }
 
-function bindServerToolCandidate(
+async function bindServerToolCandidate(
 	meta: RequestMeta,
 	input: {
 		provider: string;
@@ -428,7 +425,7 @@ function bindServerToolCandidate(
 			| "input_unavailable"
 			| "output_unavailable";
 	},
-): RequestMeta {
+): Promise<RequestMeta> {
 	const proofKey = buildServerToolCapabilityProofKey(
 		input.proof.revision,
 		input.proof.tuple,
@@ -461,9 +458,9 @@ function bindServerToolCandidate(
 	} as RequestMeta;
 	const identityRequest = makeRequest(makeRequestBody(input.physicalModel));
 	expect(
-		bindRequestPrivateServerToolReplay(
+		await bindRequestPrivateServerToolReplay(
 			boundMeta,
-			TEST_SERVER_TOOL_REPLAY_RUNTIME as never,
+			TEST_SERVER_TOOL_REPLAY_RUNTIME,
 			{
 				request: identityRequest,
 				apiKeyId: null,
@@ -475,7 +472,7 @@ function bindServerToolCandidate(
 	return boundMeta;
 }
 
-function makeHostedDispatchFixture() {
+async function makeHostedDispatchFixture() {
 	const provider = makeAttemptPlanningProvider();
 	provider.createServerToolCapabilityTuple = (context) =>
 		makeServerToolCapabilityTuple(context, provider.name);
@@ -498,7 +495,7 @@ function makeHostedDispatchFixture() {
 		},
 		provider.name,
 	);
-	const meta = bindServerToolCandidate(makeRequestMeta(), {
+	const meta = await bindServerToolCandidate(makeRequestMeta(), {
 		provider: provider.name,
 		physicalModel: "primary",
 		proof: makeServerToolCapabilityProof(tuple, "proof:dispatch-matrix"),
@@ -923,7 +920,7 @@ describe("proxyWithAccount — exact server-tool capability binding", () => {
 			initialTuple,
 			"proof-initial",
 		);
-		const meta = bindServerToolCandidate(makeRequestMeta(), {
+		const meta = await bindServerToolCandidate(makeRequestMeta(), {
 			provider: provider.name,
 			physicalModel: "primary",
 			proof: initialProof,
@@ -1021,7 +1018,7 @@ describe("proxyWithAccount — exact server-tool capability binding", () => {
 			},
 			provider.name,
 		);
-		const meta = bindServerToolCandidate(makeRequestMeta(), {
+		const meta = await bindServerToolCandidate(makeRequestMeta(), {
 			provider: provider.name,
 			physicalModel: "primary",
 			proof: makeServerToolCapabilityProof(initialTuple, "proof-stable"),
@@ -1102,7 +1099,7 @@ describe("proxyWithAccount — exact server-tool capability binding", () => {
 			},
 			provider.name,
 		);
-		const meta = bindServerToolCandidate(makeRequestMeta(), {
+		const meta = await bindServerToolCandidate(makeRequestMeta(), {
 			provider: provider.name,
 			physicalModel: "primary",
 			proof: makeServerToolCapabilityProof(initialTuple, "proof-stable"),
@@ -1195,7 +1192,7 @@ describe("proxyWithAccount — exact server-tool capability binding", () => {
 			initialTuple,
 			"proof:primary",
 		);
-		const meta = bindServerToolCandidate(makeRequestMeta(), {
+		const meta = await bindServerToolCandidate(makeRequestMeta(), {
 			provider: provider.name,
 			physicalModel: "primary",
 			proof: initialProof,
@@ -1288,7 +1285,7 @@ describe("proxyWithAccount — exact server-tool capability binding", () => {
 			},
 			provider.name,
 		);
-		const meta = bindServerToolCandidate(makeRequestMeta(), {
+		const meta = await bindServerToolCandidate(makeRequestMeta(), {
 			provider: provider.name,
 			physicalModel: "primary",
 			proof: makeServerToolCapabilityProof(tuple, "proof:abort"),
@@ -1351,7 +1348,7 @@ describe("proxyWithAccount — exact server-tool capability binding", () => {
 		[302, { redirect: true }],
 	] as const)("keeps a hosted %i response terminal at one manual-redirect HTTP send", async (status, responseBody) => {
 		const { account, bodyBuffer, ctx, ledger, meta } =
-			makeHostedDispatchFixture();
+			await makeHostedDispatchFixture();
 		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
 			const request =
 				input instanceof Request ? input : new Request(String(input));
@@ -1438,7 +1435,7 @@ describe("proxyWithAccount — exact server-tool capability binding", () => {
 			},
 			provider.name,
 		);
-		const meta = bindServerToolCandidate(makeRequestMeta(), {
+		const meta = await bindServerToolCandidate(makeRequestMeta(), {
 			provider: provider.name,
 			physicalModel: primaryModel,
 			proof: makeServerToolCapabilityProof(
@@ -1562,7 +1559,7 @@ describe("proxyWithAccount — exact server-tool capability binding", () => {
 			["native-Anthropic"],
 			["native-Anthropic"],
 		);
-		const meta = bindServerToolCandidate(makeRequestMeta(), {
+		const meta = await bindServerToolCandidate(makeRequestMeta(), {
 			provider: provider.name,
 			physicalModel: "primary",
 			proof: makeServerToolCapabilityProof(initialTuple, "proof:primary"),
@@ -1643,7 +1640,7 @@ describe("proxyWithAccount — exact server-tool capability binding", () => {
 			},
 			provider.name,
 		);
-		const meta = bindServerToolCandidate(makeRequestMeta(), {
+		const meta = await bindServerToolCandidate(makeRequestMeta(), {
 			provider: provider.name,
 			physicalModel: "primary",
 			proof: makeServerToolCapabilityProof(initialTuple, "proof:primary"),

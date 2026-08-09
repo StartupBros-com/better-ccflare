@@ -963,6 +963,106 @@ describe("CodexWebSocketTransport replay boundary", () => {
 		expect(h.sockets[0]?.sent).toHaveLength(1);
 	});
 
+	test("rejects an abort observed after parsing before claiming a reused socket", async () => {
+		enableCanary();
+		const abortReason = new Error("cancelled after request parsing");
+		const controller = new AbortController();
+		let abortBeforeNextTimestamp = false;
+		let now = 1_000;
+		let preWriteCalls = 0;
+		let frameWrittenCalls = 0;
+		const h = harness({
+			now: () => {
+				now++;
+				if (abortBeforeNextTimestamp) {
+					abortBeforeNextTimestamp = false;
+					controller.abort(abortReason);
+				}
+				return now;
+			},
+			configureSocket(socket) {
+				socket.onSend = (ws) => {
+					if (ws.sent.length !== 1) return;
+					queueMicrotask(() => {
+						ws.emitJson({ type: "response.created", response: { id: "seed" } });
+						ws.emitJson({
+							type: "response.completed",
+							response: { id: "seed" },
+						});
+					});
+				};
+			},
+		});
+
+		const seeded = await attempt(h.transport, request(), {
+			requestId: "request-abort-after-parse-seed",
+			attemptId: "attempt-abort-after-parse-seed",
+		});
+		await seeded?.response.text();
+		expect(h.sockets[0]?.sent).toHaveLength(1);
+
+		const parsedThenAbortedRequest = request();
+		const cloneRequest = parsedThenAbortedRequest.clone.bind(
+			parsedThenAbortedRequest,
+		);
+		parsedThenAbortedRequest.clone = () => {
+			const clone = cloneRequest();
+			const parseJson = clone.json.bind(clone);
+			clone.json = async () => {
+				const payload = await parseJson();
+				abortBeforeNextTimestamp = true;
+				return payload;
+			};
+			return clone;
+		};
+
+		await expect(
+			h.transport.tryRequest({
+				accountId: "acct-pro",
+				providerName: "codex",
+				conversationIdentity: testConversationIdentity("private-cache-key"),
+				request: parsedThenAbortedRequest,
+				signal: controller.signal,
+				requestId: "request-abort-after-parse",
+				attemptId: "attempt-abort-after-parse",
+				onBeforeFrameWrite: () => {
+					preWriteCalls++;
+				},
+				onFrameWritten: () => {
+					frameWrittenCalls++;
+				},
+			}),
+		).rejects.toBe(abortReason);
+
+		expect(controller.signal.aborted).toBe(true);
+		expect(preWriteCalls).toBe(0);
+		expect(frameWrittenCalls).toBe(0);
+		expect(h.sockets[0]?.sent).toHaveLength(1);
+		expect(h.transport.getStats()).toMatchObject({
+			poolSize: 1,
+			stickyHttpSize: 0,
+			pool: [{ busy: false }],
+			counters: { aborts: 0 },
+		});
+
+		h.sockets[0].onSend = (ws) =>
+			queueMicrotask(() => {
+				ws.emitJson({ type: "response.created", response: { id: "reused" } });
+				ws.emitJson({
+					type: "response.completed",
+					response: { id: "reused" },
+				});
+			});
+		const next = await attempt(h.transport, request(), {
+			requestId: "request-after-abort-after-parse",
+			attemptId: "attempt-after-abort-after-parse",
+		});
+		expect(next?.receipt.reused).toBe(true);
+		await next?.response.text();
+		expect(h.sockets).toHaveLength(1);
+		expect(h.sockets[0]?.sent).toHaveLength(2);
+	});
+
 	test("allows HTTP fallback only when handshake fails before response.create", async () => {
 		enableCanary();
 		const h = harness({ autoOpen: false });

@@ -5650,7 +5650,15 @@ export async function proxyWithAccount(
 		}
 		return forwardedResponse;
 	} catch (err) {
+		const committedLifecycle = anthropicDegradedState?.lifecycle;
 		if (req.signal.aborted) {
+			if (
+				committedLifecycle &&
+				!committedLifecycle.isTransferred &&
+				!committedLifecycle.isSettled
+			) {
+				committedLifecycle.settle("cancelled");
+			}
 			// Client disconnected: the socket is gone, so failing over to another
 			// account would burn pool capacity answering nobody. End the request
 			// with nginx's 499 (client closed request).
@@ -5675,7 +5683,6 @@ export async function proxyWithAccount(
 			// the request orchestrator owns sibling failover and the final terminal.
 			throw err;
 		}
-		const committedLifecycle = anthropicDegradedState?.lifecycle;
 		if (
 			committedLifecycle &&
 			!committedLifecycle.isTransferred &&

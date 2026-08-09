@@ -50,18 +50,14 @@ const { RoutingAttemptLedger } = await import("../routing-attempt-ledger");
 const { bindRequestPrivateServerToolReplay } = await import(
 	"../../server-tool-replay-runtime"
 );
+const { createReadyServerToolReplayRuntimeForTest } = await import(
+	"../../__tests__/helpers/server-tool-replay-runtime"
+);
 const { opaqueRuntimeId } = await import("../../opaque-runtime-id");
 
 const HOSTED_REPLAY_CREDENTIAL = "Bearer codex-websocket-hosted-test";
 const HOSTED_REPLAY_LINEAGE = "codex-websocket-hosted-session";
-const HOSTED_REPLAY_RUNTIME = Object.freeze({
-	status: "ready" as const,
-	codec: Object.freeze({
-		getWriterReadiness: () => Object.freeze({ status: "ready" as const }),
-		encode: async () => "bccf2.A256GCM.fixture",
-		decode: async () => Object.freeze({}),
-	}),
-});
+const HOSTED_REPLAY_RUNTIME = await createReadyServerToolReplayRuntimeForTest();
 
 function makeCodexAccount(overrides: Partial<Account> = {}): Account {
 	return {
@@ -562,7 +558,7 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 			serverToolRequirements: requirements,
 		});
 		expect(
-			bindRequestPrivateServerToolReplay(meta, HOSTED_REPLAY_RUNTIME as never, {
+			await bindRequestPrivateServerToolReplay(meta, HOSTED_REPLAY_RUNTIME, {
 				request,
 				apiKeyId: null,
 				audience: opaqueRuntimeId(

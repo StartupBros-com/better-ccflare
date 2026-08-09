@@ -34,6 +34,9 @@ mock.module("@better-ccflare/database", () => ({
 const usageCollectorModule = await import("../usage-collector");
 const modelCatalogModule = await import("../model-catalog");
 const { handleProxy } = await import("../proxy");
+const { createReadyServerToolReplayRuntimeForTest } = await import(
+	"./helpers/server-tool-replay-runtime"
+);
 
 const MODEL = "claude-opus-4-8";
 const DEADLINE_ENVS = [
@@ -131,18 +134,12 @@ function makeContext(accounts: Account[]) {
 	return { ctx, pauseAccount, refreshInFlight, reportCandidateFailure };
 }
 
-function installReadyServerToolReplay(ctx: ProxyContext) {
-	const encode = mock(async () => "bccf2.A256GCM.fixture");
-	const decode = mock(async () => Object.freeze({}));
-	ctx.serverToolReplay = Object.freeze({
-		status: "ready",
-		codec: Object.freeze({
-			getWriterReadiness: () => Object.freeze({ status: "ready" }),
-			encode,
-			decode,
-		}),
-	}) as never;
-	return { encode, decode };
+async function installReadyServerToolReplay(ctx: ProxyContext) {
+	const reserveReplayIssuanceRange = mock(() => undefined);
+	ctx.serverToolReplay = await createReadyServerToolReplayRuntimeForTest({
+		onReserveReplayIssuanceRange: reserveReplayIssuanceRange,
+	});
+	return { reserveReplayIssuanceRange };
 }
 
 function makeRequest(
@@ -265,7 +262,7 @@ describe("proxy pre-transport recovery", () => {
 		const account = makeAccount("server-tool-requirement");
 		account.provider = "pre-transport-server-tool-test";
 		const { ctx } = makeContext([account]);
-		installReadyServerToolReplay(ctx);
+		await installReadyServerToolReplay(ctx);
 		ctx.provider.name = account.provider;
 		ctx.provider.getLogicalModelCapability = () => ({
 			status: "supported",
@@ -423,7 +420,7 @@ describe("proxy pre-transport recovery", () => {
 	it("leaves ordinary requests without server-tool routing metadata", async () => {
 		const account = makeAccount("ordinary-request");
 		const { ctx } = makeContext([account]);
-		const replay = installReadyServerToolReplay(ctx);
+		const replay = await installReadyServerToolReplay(ctx);
 		const selectedMetas: RequestMeta[] = [];
 		ctx.strategy.select = mock(
 			async (accounts: Account[], meta: RequestMeta) => {
@@ -460,8 +457,7 @@ describe("proxy pre-transport recovery", () => {
 		expect(sourceBodyRead).toHaveBeenCalledTimes(1);
 		expect(selectedMetas).toHaveLength(1);
 		expect(selectedMetas[0]?.serverToolRequirements).toBeUndefined();
-		expect(replay.encode).toHaveBeenCalledTimes(0);
-		expect(replay.decode).toHaveBeenCalledTimes(0);
+		expect(replay.reserveReplayIssuanceRange).toHaveBeenCalledTimes(0);
 		expect(
 			(
 				selectedMetas[0] as RequestMeta & {
