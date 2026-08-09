@@ -15,42 +15,34 @@ import { opaqueRuntimeId } from "./opaque-runtime-id";
 
 const SAFE_REPLAY_KEY_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const REPLAY_KEY_BYTES = 32;
-const REPLAY_PROVENANCE_TEXT_MAX_LENGTH = 256;
 const REPLAY_AUTHORITY_TEXT_MAX_BYTES = 256;
 const WRITER_ADMISSION_DISABLED = Object.freeze({ enabled: false as const });
 
-export const SERVER_TOOL_REPLAY_WRITER_REVISION =
-	"bccf2.A256GCM.writer.v1" as const;
-export const SERVER_TOOL_REPLAY_DECODER_REVISION =
-	"bccf2.A256GCM.decoder.v1" as const;
-
-export type ServerToolReplayWriterProvenance = Readonly<{
-	writerRevision: string;
-	buildSha: string | null;
-	decoderRevision: string;
-}>;
+/**
+ * Reserve enough issuance counts to amortize durable coordination without
+ * making crash-burn waste operationally meaningful. Unused counts are never
+ * recycled, so nonce telemetry remains globally monotonic across restarts.
+ */
+export const SERVER_TOOL_REPLAY_ISSUANCE_RANGE_SIZE = 256;
 
 export type ServerToolReplayIssuanceReservationInput = Readonly<{
 	counterIdentity: string;
-	writerRevision: string;
-	buildSha: string;
-	decoderRevision: string;
-	now: number;
+	reservationSize: number;
+}>;
+
+export type ServerToolReplayIssuanceReservation = Readonly<{
+	counterIdentity: string;
+	firstIssuanceCount: number;
+	lastIssuanceCount: number;
 }>;
 
 export interface ServerToolReplayIssuanceStore {
-	reserveReplayIssuance(
+	reserveReplayIssuanceRange(
 		input: ServerToolReplayIssuanceReservationInput,
-	): Promise<Readonly<{ issuanceCount: number }>>;
+	): Promise<ServerToolReplayIssuanceReservation>;
 }
 
-export type ServerToolReplayWriterAdmissionUnavailableReason =
-	| "invalid_store"
-	| "invalid_provenance_shape"
-	| "invalid_writer_revision"
-	| "missing_build_sha"
-	| "invalid_build_sha"
-	| "invalid_decoder_revision";
+export type ServerToolReplayWriterAdmissionUnavailableReason = "invalid_store";
 
 export type ServerToolReplayWriterAdmissionBuildResult =
 	| Readonly<{
@@ -363,16 +355,6 @@ function hasControlCharacter(value: string): boolean {
 	});
 }
 
-function isBoundedOpaqueText(value: unknown): value is string {
-	return (
-		typeof value === "string" &&
-		value.length >= 1 &&
-		value.length <= REPLAY_PROVENANCE_TEXT_MAX_LENGTH &&
-		value.trim() === value &&
-		!hasControlCharacter(value)
-	);
-}
-
 function unavailableWriterAdmission(
 	reason: ServerToolReplayWriterAdmissionUnavailableReason,
 ): ServerToolReplayWriterAdmissionBuildResult {
@@ -383,9 +365,9 @@ function unavailableWriterAdmission(
 	});
 }
 
-function snapshotBoundReplayIssuanceReservation(
+function snapshotBoundReplayIssuanceRangeReservation(
 	store: unknown,
-): ServerToolReplayIssuanceStore["reserveReplayIssuance"] | undefined {
+): ServerToolReplayIssuanceStore["reserveReplayIssuanceRange"] | undefined {
 	if (!isRecord(store)) return undefined;
 
 	try {
@@ -393,7 +375,7 @@ function snapshotBoundReplayIssuanceReservation(
 		while (owner !== null) {
 			const descriptor = Object.getOwnPropertyDescriptor(
 				owner,
-				"reserveReplayIssuance",
+				"reserveReplayIssuanceRange",
 			);
 			if (descriptor !== undefined) {
 				if (
@@ -404,7 +386,7 @@ function snapshotBoundReplayIssuanceReservation(
 				}
 				return Reflect.apply(Function.prototype.bind, descriptor.value, [
 					store,
-				]) as ServerToolReplayIssuanceStore["reserveReplayIssuance"];
+				]) as ServerToolReplayIssuanceStore["reserveReplayIssuanceRange"];
 			}
 			owner = Object.getPrototypeOf(owner) as object | null;
 		}
@@ -415,69 +397,111 @@ function snapshotBoundReplayIssuanceReservation(
 	return undefined;
 }
 
+type AvailableReplayIssuanceRange = {
+	nextIssuanceCount: number;
+	lastIssuanceCount: number;
+	pendingReservation?: Promise<void>;
+};
+
+function invalidReplayIssuanceRange(): Error {
+	return new Error("Server-tool replay issuance range is invalid");
+}
+
+function validateReplayIssuanceRange(
+	reservation: unknown,
+	counterIdentity: string,
+	previousLastIssuanceCount: number,
+): ServerToolReplayIssuanceReservation {
+	if (
+		!isRecord(reservation) ||
+		!hasExactProperties(reservation, [
+			"counterIdentity",
+			"firstIssuanceCount",
+			"lastIssuanceCount",
+		]) ||
+		reservation.counterIdentity !== counterIdentity ||
+		!Number.isSafeInteger(reservation.firstIssuanceCount) ||
+		!Number.isSafeInteger(reservation.lastIssuanceCount)
+	) {
+		throw invalidReplayIssuanceRange();
+	}
+	const firstIssuanceCount = reservation.firstIssuanceCount as number;
+	const lastIssuanceCount = reservation.lastIssuanceCount as number;
+	if (
+		firstIssuanceCount <= previousLastIssuanceCount ||
+		lastIssuanceCount - firstIssuanceCount + 1 !==
+			SERVER_TOOL_REPLAY_ISSUANCE_RANGE_SIZE
+	) {
+		throw invalidReplayIssuanceRange();
+	}
+	return Object.freeze({
+		counterIdentity,
+		firstIssuanceCount,
+		lastIssuanceCount,
+	});
+}
+
 /**
- * Adapt the durable issuance repository's narrow atomic reservation operation
- * to the codec writer-admission contract. Provenance is snapshotted once and
- * never participates in the aggregate counter identity.
+ * Adapt bounded durable range reservations to the codec's per-envelope claim
+ * contract. Each counter identity owns one in-flight reservation and consumes
+ * its range monotonically in process. A crash intentionally burns unused slots.
  */
 export function createDurableServerToolReplayWriterAdmission(
 	store: ServerToolReplayIssuanceStore,
-	provenance: ServerToolReplayWriterProvenance,
 ): ServerToolReplayWriterAdmissionBuildResult {
-	const reserveReplayIssuance = snapshotBoundReplayIssuanceReservation(store);
-	if (reserveReplayIssuance === undefined) {
+	const reserveReplayIssuanceRange =
+		snapshotBoundReplayIssuanceRangeReservation(store);
+	if (reserveReplayIssuanceRange === undefined) {
 		return unavailableWriterAdmission("invalid_store");
 	}
-	if (
-		!isRecord(provenance) ||
-		!hasExactProperties(provenance, [
-			"buildSha",
-			"decoderRevision",
-			"writerRevision",
-		])
-	) {
-		return unavailableWriterAdmission("invalid_provenance_shape");
-	}
-
-	const writerRevision = provenance.writerRevision;
-	const buildSha = provenance.buildSha;
-	const decoderRevision = provenance.decoderRevision;
-	if (!isBoundedOpaqueText(writerRevision)) {
-		return unavailableWriterAdmission("invalid_writer_revision");
-	}
-	if (
-		buildSha === null ||
-		(typeof buildSha === "string" && buildSha.toLowerCase() === "unknown")
-	) {
-		return unavailableWriterAdmission("missing_build_sha");
-	}
-	if (!isBoundedOpaqueText(buildSha)) {
-		return unavailableWriterAdmission("invalid_build_sha");
-	}
-	if (!isBoundedOpaqueText(decoderRevision)) {
-		return unavailableWriterAdmission("invalid_decoder_revision");
-	}
-
-	const frozenProvenance = Object.freeze({
-		writerRevision,
-		buildSha,
-		decoderRevision,
-	});
+	const availableRanges = new Map<string, AvailableReplayIssuanceRange>();
 	const writerAdmission = Object.freeze({
 		enabled: true as const,
 		claimIssuance: async (
 			claim: Readonly<{ counterIdentity: string; issuedAtMs: number }>,
 		): Promise<number> => {
-			const reservation = await reserveReplayIssuance(
-				Object.freeze({
-					counterIdentity: claim.counterIdentity,
-					writerRevision: frozenProvenance.writerRevision,
-					buildSha: frozenProvenance.buildSha,
-					decoderRevision: frozenProvenance.decoderRevision,
-					now: claim.issuedAtMs,
-				}),
-			);
-			return reservation.issuanceCount;
+			let availableRange = availableRanges.get(claim.counterIdentity);
+			if (availableRange === undefined) {
+				availableRange = {
+					nextIssuanceCount: 1,
+					lastIssuanceCount: 0,
+				};
+				availableRanges.set(claim.counterIdentity, availableRange);
+			}
+
+			while (
+				availableRange.nextIssuanceCount > availableRange.lastIssuanceCount
+			) {
+				if (availableRange.pendingReservation === undefined) {
+					availableRange.pendingReservation = (async () => {
+						const reservation = validateReplayIssuanceRange(
+							await reserveReplayIssuanceRange(
+								Object.freeze({
+									counterIdentity: claim.counterIdentity,
+									reservationSize: SERVER_TOOL_REPLAY_ISSUANCE_RANGE_SIZE,
+								}),
+							),
+							claim.counterIdentity,
+							availableRange.lastIssuanceCount,
+						);
+						availableRange.nextIssuanceCount = reservation.firstIssuanceCount;
+						availableRange.lastIssuanceCount = reservation.lastIssuanceCount;
+					})();
+				}
+
+				const pendingReservation = availableRange.pendingReservation;
+				try {
+					await pendingReservation;
+				} finally {
+					if (availableRange.pendingReservation === pendingReservation) {
+						availableRange.pendingReservation = undefined;
+					}
+				}
+			}
+
+			const issuanceCount = availableRange.nextIssuanceCount;
+			availableRange.nextIssuanceCount += 1;
+			return issuanceCount;
 		},
 	});
 	return Object.freeze({ status: "ready", writerAdmission });

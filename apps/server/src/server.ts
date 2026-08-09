@@ -9,7 +9,6 @@ import {
 import {
 	CACHE,
 	DEFAULT_STRATEGY,
-	getGitSha,
 	getVersion,
 	HTTP_STATUS,
 	initializeNanoGPTPricingIfAccountsExist,
@@ -84,8 +83,6 @@ import {
 	registerCodexUsageRefresher,
 	registerPollingRestarter,
 	registerRefreshClearer,
-	SERVER_TOOL_REPLAY_DECODER_REVISION,
-	SERVER_TOOL_REPLAY_WRITER_REVISION,
 	startGlobalTokenHealthChecks,
 	startIntegrityScheduler,
 	stopGlobalTokenHealthChecks,
@@ -1145,11 +1142,6 @@ export default async function startServer(options?: {
 	const serverToolReplayWriterAdmission =
 		createDurableServerToolReplayWriterAdmission(
 			dbOps.getServerToolReplayIssuanceRepository(),
-			Object.freeze({
-				writerRevision: SERVER_TOOL_REPLAY_WRITER_REVISION,
-				buildSha: getGitSha(),
-				decoderRevision: SERVER_TOOL_REPLAY_DECODER_REVISION,
-			}),
 		);
 	const serverToolReplay = await createServerToolReplayRuntime(
 		loadServerToolReplayKeys(),

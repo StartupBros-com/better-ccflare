@@ -144,23 +144,7 @@ async function ensureServerToolReplayIssuanceSchemaPg(
 			counter_identity TEXT PRIMARY KEY
 				CHECK (length(counter_identity) BETWEEN 1 AND 512),
 			issuance_count BIGINT NOT NULL DEFAULT 0
-				CHECK (issuance_count >= 0 AND issuance_count <= 2147483648),
-			first_issued_at BIGINT NOT NULL
-				CHECK (first_issued_at >= 0 AND first_issued_at <= 9007199254740991),
-			last_issued_at BIGINT NOT NULL
-				CHECK (last_issued_at >= first_issued_at AND last_issued_at <= 9007199254740991),
-			first_writer_revision TEXT NOT NULL
-				CHECK (length(first_writer_revision) BETWEEN 1 AND 256),
-			first_build_sha TEXT NOT NULL
-				CHECK (length(first_build_sha) BETWEEN 1 AND 256),
-			first_decoder_revision TEXT NOT NULL
-				CHECK (length(first_decoder_revision) BETWEEN 1 AND 256),
-			last_writer_revision TEXT NOT NULL
-				CHECK (length(last_writer_revision) BETWEEN 1 AND 256),
-			last_build_sha TEXT NOT NULL
-				CHECK (length(last_build_sha) BETWEEN 1 AND 256),
-			last_decoder_revision TEXT NOT NULL
-				CHECK (length(last_decoder_revision) BETWEEN 1 AND 256)
+				CHECK (issuance_count >= 0 AND issuance_count <= 2147483648)
 		)
 	`);
 }

@@ -4,9 +4,9 @@ import type { BunSqlAdapter } from "../adapters/bun-sql-adapter";
 import { ensureSchema, runMigrations } from "../migrations";
 import { ensureSchemaPg, runMigrationsPg } from "../migrations-pg";
 
-const ISSUANCE_COLUMNS = [
-	"counter_identity",
-	"issuance_count",
+const ISSUANCE_COLUMNS = ["counter_identity", "issuance_count"];
+
+const FORBIDDEN_CONTENT_COLUMNS = [
 	"first_issued_at",
 	"last_issued_at",
 	"first_writer_revision",
@@ -15,9 +15,6 @@ const ISSUANCE_COLUMNS = [
 	"last_writer_revision",
 	"last_build_sha",
 	"last_decoder_revision",
-];
-
-const FORBIDDEN_CONTENT_COLUMNS = [
 	"raw_key",
 	"key_material",
 	"key_id",
@@ -83,20 +80,13 @@ function expectContentFreeSchema(actualColumns: string[], ddl: string): void {
 	}
 }
 
-function expectIssuanceDdl(
-	ddl: string,
-	timestampType: "INTEGER" | "BIGINT",
-): void {
+function expectIssuanceDdl(ddl: string): void {
 	const normalized = ddl.replace(/\s+/g, " ");
 	for (const column of ISSUANCE_COLUMNS) {
 		expect(ddl).toMatch(new RegExp(`\\b${column}\\b`));
 	}
 	expect(normalized).toContain(
 		"CHECK (issuance_count >= 0 AND issuance_count <= 2147483648)",
-	);
-	expect(normalized).toContain(`first_issued_at ${timestampType} NOT NULL`);
-	expect(normalized).toContain(
-		"CHECK (last_issued_at >= first_issued_at AND last_issued_at <= 9007199254740991)",
 	);
 	expect(normalized).not.toContain("FOREIGN KEY");
 }
@@ -108,7 +98,7 @@ describe("server-tool replay issuance migrations", () => {
 			ensureSchema(db);
 			const ddl = tableSql(db);
 			expectContentFreeSchema(columns(db), ddl);
-			expectIssuanceDdl(ddl, "INTEGER");
+			expectIssuanceDdl(ddl);
 			expect(
 				db
 					.query<{ count: number }, []>(
@@ -129,7 +119,7 @@ describe("server-tool replay issuance migrations", () => {
 			runMigrations(db);
 			const ddl = tableSql(db);
 			expectContentFreeSchema(columns(db), ddl);
-			expectIssuanceDdl(ddl, "INTEGER");
+			expectIssuanceDdl(ddl);
 		} finally {
 			db.close();
 		}
@@ -144,8 +134,8 @@ describe("server-tool replay issuance migrations", () => {
 		const freshDdl = pgTableSql(fresh);
 		const upgradeDdl = pgTableSql(upgrade);
 		expectContentFreeSchema(ISSUANCE_COLUMNS, freshDdl);
-		expectIssuanceDdl(freshDdl, "BIGINT");
-		expectIssuanceDdl(upgradeDdl, "BIGINT");
+		expectIssuanceDdl(freshDdl);
+		expectIssuanceDdl(upgradeDdl);
 		expect(fresh.join("\n")).not.toContain("server_tool_proof_controls");
 		expect(upgrade.join("\n")).not.toContain("server_tool_proof_controls");
 		expect(freshDdl.replace(/\s+/g, " ").trim()).toBe(

@@ -23,8 +23,7 @@ const {
 	createDurableServerToolReplayWriterAdmission,
 	createServerToolReplayRuntime,
 	resolveRequestPrivateServerToolReplay,
-	SERVER_TOOL_REPLAY_DECODER_REVISION,
-	SERVER_TOOL_REPLAY_WRITER_REVISION,
+	SERVER_TOOL_REPLAY_ISSUANCE_RANGE_SIZE,
 } = await import("./server-tool-replay-runtime");
 const { opaqueRuntimeId } = await import("./opaque-runtime-id");
 
@@ -142,21 +141,18 @@ function expectKeyCopiesZeroedExactlyOnce<T>(
 }
 
 describe("durable server-tool replay writer admission", () => {
-	it("maps one codec claim to exactly one durable issuance reservation", async () => {
+	it("serves many claims from one conservative durable range reservation", async () => {
 		const reservations: unknown[] = [];
-		const admission = createDurableServerToolReplayWriterAdmission(
-			{
-				reserveReplayIssuance: async (input) => {
-					reservations.push(input);
-					return { issuanceCount: 17 };
-				},
+		const admission = createDurableServerToolReplayWriterAdmission({
+			reserveReplayIssuanceRange: async (input) => {
+				reservations.push(input);
+				return {
+					counterIdentity: input.counterIdentity,
+					firstIssuanceCount: 1,
+					lastIssuanceCount: SERVER_TOOL_REPLAY_ISSUANCE_RANGE_SIZE,
+				};
 			},
-			Object.freeze({
-				writerRevision: SERVER_TOOL_REPLAY_WRITER_REVISION,
-				buildSha: "0123456789abcdef",
-				decoderRevision: SERVER_TOOL_REPLAY_DECODER_REVISION,
-			}),
-		);
+		});
 
 		expect(admission.status).toBe("ready");
 		if (admission.status !== "ready") {
@@ -164,48 +160,161 @@ describe("durable server-tool replay writer admission", () => {
 		}
 		expect(Object.isFrozen(admission)).toBe(true);
 		expect(Object.isFrozen(admission.writerAdmission)).toBe(true);
-		await expect(
-			admission.writerAdmission.claimIssuance(
-				Object.freeze({
+		const claims = [];
+		for (let index = 0; index < 64; index += 1) {
+			claims.push(
+				await admission.writerAdmission.claimIssuance({
 					counterIdentity: "opaque-counter-identity",
-					issuedAtMs: 1_786_000_000_123,
+					issuedAtMs: 1_786_000_000_123 + index,
 				}),
-			),
-		).resolves.toBe(17);
+			);
+		}
+		expect(claims).toEqual(Array.from({ length: 64 }, (_, index) => index + 1));
 		expect(reservations).toEqual([
 			{
 				counterIdentity: "opaque-counter-identity",
-				writerRevision: SERVER_TOOL_REPLAY_WRITER_REVISION,
-				buildSha: "0123456789abcdef",
-				decoderRevision: SERVER_TOOL_REPLAY_DECODER_REVISION,
-				now: 1_786_000_000_123,
+				reservationSize: SERVER_TOOL_REPLAY_ISSUANCE_RANGE_SIZE,
 			},
 		]);
 	});
 
-	it("snapshots and binds the original reservation method once", async () => {
+	it("shares one in-flight reservation across concurrent claims and assigns unique counts", async () => {
+		let reservationCalls = 0;
+		const admission = createDurableServerToolReplayWriterAdmission({
+			reserveReplayIssuanceRange: async (input) => {
+				reservationCalls += 1;
+				await Promise.resolve();
+				return {
+					counterIdentity: input.counterIdentity,
+					firstIssuanceCount: 1,
+					lastIssuanceCount: SERVER_TOOL_REPLAY_ISSUANCE_RANGE_SIZE,
+				};
+			},
+		});
+		if (admission.status !== "ready") {
+			throw new Error("durable writer admission was not ready");
+		}
+
+		const claims = await Promise.all(
+			Array.from({ length: 128 }, (_, index) =>
+				admission.writerAdmission.claimIssuance({
+					counterIdentity: "opaque-counter-identity",
+					issuedAtMs: 1_786_000_000_123 + index,
+				}),
+			),
+		);
+
+		expect(reservationCalls).toBe(1);
+		expect([...claims].sort((a, b) => (a ?? 0) - (b ?? 0))).toEqual(
+			Array.from({ length: 128 }, (_, index) => index + 1),
+		);
+	});
+
+	it("rolls over only after every slot in the current block is consumed", async () => {
+		let durableCount = 0;
+		let reservationCalls = 0;
+		const admission = createDurableServerToolReplayWriterAdmission({
+			reserveReplayIssuanceRange: async (input) => {
+				reservationCalls += 1;
+				const firstIssuanceCount = durableCount + 1;
+				durableCount += input.reservationSize;
+				return {
+					counterIdentity: input.counterIdentity,
+					firstIssuanceCount,
+					lastIssuanceCount: durableCount,
+				};
+			},
+		});
+		if (admission.status !== "ready") {
+			throw new Error("durable writer admission was not ready");
+		}
+
+		const claims = [];
+		for (
+			let index = 0;
+			index <= SERVER_TOOL_REPLAY_ISSUANCE_RANGE_SIZE;
+			index += 1
+		) {
+			claims.push(
+				await admission.writerAdmission.claimIssuance({
+					counterIdentity: "opaque-counter-identity",
+					issuedAtMs: index,
+				}),
+			);
+		}
+
+		expect(reservationCalls).toBe(2);
+		expect(claims.at(-1)).toBe(SERVER_TOOL_REPLAY_ISSUANCE_RANGE_SIZE + 1);
+	});
+
+	it("conservatively burns unused slots across admission restart", async () => {
+		let durableCount = 0;
+		const store = {
+			reserveReplayIssuanceRange: async (input: {
+				counterIdentity: string;
+				reservationSize: number;
+			}) => {
+				const firstIssuanceCount = durableCount + 1;
+				durableCount += input.reservationSize;
+				return {
+					counterIdentity: input.counterIdentity,
+					firstIssuanceCount,
+					lastIssuanceCount: durableCount,
+				};
+			},
+		};
+		const firstProcess = createDurableServerToolReplayWriterAdmission(store);
+		if (firstProcess.status !== "ready") {
+			throw new Error("first durable writer admission was not ready");
+		}
+		await expect(
+			firstProcess.writerAdmission.claimIssuance({
+				counterIdentity: "opaque-counter-identity",
+				issuedAtMs: 1,
+			}),
+		).resolves.toBe(1);
+
+		const restartedProcess =
+			createDurableServerToolReplayWriterAdmission(store);
+		if (restartedProcess.status !== "ready") {
+			throw new Error("restarted durable writer admission was not ready");
+		}
+		await expect(
+			restartedProcess.writerAdmission.claimIssuance({
+				counterIdentity: "opaque-counter-identity",
+				issuedAtMs: 2,
+			}),
+		).resolves.toBe(SERVER_TOOL_REPLAY_ISSUANCE_RANGE_SIZE + 1);
+		expect(durableCount).toBe(SERVER_TOOL_REPLAY_ISSUANCE_RANGE_SIZE * 2);
+	});
+
+	it("snapshots and binds the original range reservation method once", async () => {
 		const originalReservations: unknown[] = [];
 		let replacementCalls = 0;
 		let originalReceiver: unknown;
 		class MutableStore {
-			async reserveReplayIssuance(input: unknown) {
+			async reserveReplayIssuanceRange(input: {
+				counterIdentity: string;
+				reservationSize: number;
+			}) {
 				originalReceiver = this;
 				originalReservations.push(input);
-				return { issuanceCount: 23 };
+				return {
+					counterIdentity: input.counterIdentity,
+					firstIssuanceCount: 23,
+					lastIssuanceCount: 23 + SERVER_TOOL_REPLAY_ISSUANCE_RANGE_SIZE - 1,
+				};
 			}
 		}
 		const store = new MutableStore();
-		const admission = createDurableServerToolReplayWriterAdmission(
-			store,
-			Object.freeze({
-				writerRevision: SERVER_TOOL_REPLAY_WRITER_REVISION,
-				buildSha: "0123456789abcdef",
-				decoderRevision: SERVER_TOOL_REPLAY_DECODER_REVISION,
-			}),
-		);
-		store.reserveReplayIssuance = async () => {
+		const admission = createDurableServerToolReplayWriterAdmission(store);
+		store.reserveReplayIssuanceRange = async (input) => {
 			replacementCalls += 1;
-			return { issuanceCount: 99 };
+			return {
+				counterIdentity: input.counterIdentity,
+				firstIssuanceCount: 99,
+				lastIssuanceCount: 99 + input.reservationSize - 1,
+			};
 		};
 
 		expect(admission.status).toBe("ready");
@@ -226,17 +335,12 @@ describe("durable server-tool replay writer admission", () => {
 	it.each([
 		null,
 		{},
-		{ reserveReplayIssuance: null },
+		{ reserveReplayIssuanceRange: null },
 	] as const)("fails closed for invalid issuance store %p", (store) => {
 		const admission = createDurableServerToolReplayWriterAdmission(
 			store as unknown as Parameters<
 				typeof createDurableServerToolReplayWriterAdmission
 			>[0],
-			Object.freeze({
-				writerRevision: SERVER_TOOL_REPLAY_WRITER_REVISION,
-				buildSha: "0123456789abcdef",
-				decoderRevision: SERVER_TOOL_REPLAY_DECODER_REVISION,
-			}),
 		);
 
 		expect(admission).toEqual({
@@ -248,21 +352,20 @@ describe("durable server-tool replay writer admission", () => {
 
 	it("rejects accessor-backed reservation methods without invoking them", () => {
 		let accessorCalls = 0;
-		const store = Object.defineProperty({}, "reserveReplayIssuance", {
+		const store = Object.defineProperty({}, "reserveReplayIssuanceRange", {
 			get() {
 				accessorCalls += 1;
-				return async () => ({ issuanceCount: 1 });
+				return async () => ({
+					counterIdentity: "opaque-counter-identity",
+					firstIssuanceCount: 1,
+					lastIssuanceCount: SERVER_TOOL_REPLAY_ISSUANCE_RANGE_SIZE,
+				});
 			},
 		});
 		const admission = createDurableServerToolReplayWriterAdmission(
 			store as Parameters<
 				typeof createDurableServerToolReplayWriterAdmission
 			>[0],
-			Object.freeze({
-				writerRevision: SERVER_TOOL_REPLAY_WRITER_REVISION,
-				buildSha: "0123456789abcdef",
-				decoderRevision: SERVER_TOOL_REPLAY_DECODER_REVISION,
-			}),
 		);
 
 		expect(admission).toMatchObject({
@@ -273,99 +376,15 @@ describe("durable server-tool replay writer admission", () => {
 		expect(accessorCalls).toBe(0);
 	});
 
-	it.each([
-		null,
-		"unknown",
-	] as const)("fails writer admission closed for unavailable build SHA %p without touching storage", async (buildSha) => {
-		let reservationCalls = 0;
-		const admission = createDurableServerToolReplayWriterAdmission(
-			{
-				reserveReplayIssuance: async () => {
-					reservationCalls += 1;
-					return { issuanceCount: 1 };
-				},
-			},
-			Object.freeze({
-				writerRevision: SERVER_TOOL_REPLAY_WRITER_REVISION,
-				buildSha,
-				decoderRevision: SERVER_TOOL_REPLAY_DECODER_REVISION,
-			}),
-		);
-
-		expect(admission).toEqual({
-			status: "unavailable",
-			reason: "missing_build_sha",
-			writerAdmission: { enabled: false },
-		});
-		expect(Object.isFrozen(admission)).toBe(true);
-		expect(Object.isFrozen(admission.writerAdmission)).toBe(true);
-		expect(reservationCalls).toBe(0);
-	});
-
-	it.each([
-		[
-			"writer revision",
-			{
-				writerRevision: " writer-v1",
-				buildSha: "0123456789abcdef",
-				decoderRevision: SERVER_TOOL_REPLAY_DECODER_REVISION,
-			},
-			"invalid_writer_revision",
-		],
-		[
-			"build SHA",
-			{
-				writerRevision: SERVER_TOOL_REPLAY_WRITER_REVISION,
-				buildSha: "sha\u0000suffix",
-				decoderRevision: SERVER_TOOL_REPLAY_DECODER_REVISION,
-			},
-			"invalid_build_sha",
-		],
-		[
-			"decoder revision",
-			{
-				writerRevision: SERVER_TOOL_REPLAY_WRITER_REVISION,
-				buildSha: "0123456789abcdef",
-				decoderRevision: "d".repeat(257),
-			},
-			"invalid_decoder_revision",
-		],
-	] as const)("rejects bounded-opaque-text violations in %s without touching storage", async (_label, provenance, reason) => {
-		let reservationCalls = 0;
-		const admission = createDurableServerToolReplayWriterAdmission(
-			{
-				reserveReplayIssuance: async () => {
-					reservationCalls += 1;
-					return { issuanceCount: 1 };
-				},
-			},
-			Object.freeze(provenance),
-		);
-
-		expect(admission).toMatchObject({
-			status: "unavailable",
-			reason,
-			writerAdmission: { enabled: false },
-		});
-		expect(reservationCalls).toBe(0);
-	});
-
 	it("propagates repository failures without retry or fallback", async () => {
 		const repositoryFailure = new Error("durable issuance unavailable");
 		let reservationCalls = 0;
-		const admission = createDurableServerToolReplayWriterAdmission(
-			{
-				reserveReplayIssuance: async () => {
-					reservationCalls += 1;
-					throw repositoryFailure;
-				},
+		const admission = createDurableServerToolReplayWriterAdmission({
+			reserveReplayIssuanceRange: async () => {
+				reservationCalls += 1;
+				throw repositoryFailure;
 			},
-			Object.freeze({
-				writerRevision: SERVER_TOOL_REPLAY_WRITER_REVISION,
-				buildSha: "0123456789abcdef",
-				decoderRevision: SERVER_TOOL_REPLAY_DECODER_REVISION,
-			}),
-		);
+		});
 
 		expect(admission.status).toBe("ready");
 		if (admission.status !== "ready") {
@@ -378,6 +397,56 @@ describe("durable server-tool replay writer admission", () => {
 			}),
 		).rejects.toBe(repositoryFailure);
 		expect(reservationCalls).toBe(1);
+	});
+
+	it("fails closed when storage returns a malformed or mismatched range", async () => {
+		const admission = createDurableServerToolReplayWriterAdmission({
+			reserveReplayIssuanceRange: async () => ({
+				counterIdentity: "different-counter",
+				firstIssuanceCount: 1,
+				lastIssuanceCount: SERVER_TOOL_REPLAY_ISSUANCE_RANGE_SIZE,
+			}),
+		});
+		if (admission.status !== "ready") {
+			throw new Error("durable writer admission was not ready");
+		}
+
+		await expect(
+			admission.writerAdmission.claimIssuance({
+				counterIdentity: "opaque-counter-identity",
+				issuedAtMs: 1,
+			}),
+		).rejects.toThrow("Server-tool replay issuance range is invalid");
+	});
+
+	it("fails closed rather than reusing a stale range at block rollover", async () => {
+		const admission = createDurableServerToolReplayWriterAdmission({
+			reserveReplayIssuanceRange: async (input) => ({
+				counterIdentity: input.counterIdentity,
+				firstIssuanceCount: 1,
+				lastIssuanceCount: SERVER_TOOL_REPLAY_ISSUANCE_RANGE_SIZE,
+			}),
+		});
+		if (admission.status !== "ready") {
+			throw new Error("durable writer admission was not ready");
+		}
+		for (
+			let index = 0;
+			index < SERVER_TOOL_REPLAY_ISSUANCE_RANGE_SIZE;
+			index += 1
+		) {
+			await admission.writerAdmission.claimIssuance({
+				counterIdentity: "opaque-counter-identity",
+				issuedAtMs: index,
+			});
+		}
+
+		await expect(
+			admission.writerAdmission.claimIssuance({
+				counterIdentity: "opaque-counter-identity",
+				issuedAtMs: SERVER_TOOL_REPLAY_ISSUANCE_RANGE_SIZE,
+			}),
+		).rejects.toThrow("Server-tool replay issuance range is invalid");
 	});
 });
 
@@ -893,19 +962,12 @@ describe("server-tool replay runtime", () => {
 			PAYLOAD,
 		);
 		let reservationCalls = 0;
-		const admission = createDurableServerToolReplayWriterAdmission(
-			{
-				reserveReplayIssuance: async () => {
-					reservationCalls += 1;
-					throw new Error("durable issuance unavailable");
-				},
+		const admission = createDurableServerToolReplayWriterAdmission({
+			reserveReplayIssuanceRange: async () => {
+				reservationCalls += 1;
+				throw new Error("durable issuance unavailable");
 			},
-			Object.freeze({
-				writerRevision: SERVER_TOOL_REPLAY_WRITER_REVISION,
-				buildSha: "0123456789abcdef",
-				decoderRevision: SERVER_TOOL_REPLAY_DECODER_REVISION,
-			}),
-		);
+		});
 		expect(admission.status).toBe("ready");
 		if (admission.status !== "ready") {
 			throw new Error("durable writer admission was not ready");

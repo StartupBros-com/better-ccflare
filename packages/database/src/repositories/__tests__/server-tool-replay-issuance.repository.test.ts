@@ -7,6 +7,7 @@ import { ensureSchema, runMigrations } from "../../migrations";
 import { ensureSchemaPg, runMigrationsPg } from "../../migrations-pg";
 import {
 	SERVER_TOOL_REPLAY_ISSUANCE_MAX,
+	SERVER_TOOL_REPLAY_ISSUANCE_RESERVATION_MAX,
 	ServerToolReplayIssuanceDataIntegrityError,
 	ServerToolReplayIssuanceLimitError,
 	ServerToolReplayIssuanceRepository,
@@ -30,57 +31,58 @@ describe("ServerToolReplayIssuanceRepository", () => {
 		db.close();
 	});
 
-	it("atomically increments a portable counter and preserves first metadata", async () => {
-		const first = await repository.reserveReplayIssuance({
+	it("atomically reserves the requested bounded range", async () => {
+		const first = await repository.reserveReplayIssuanceRange({
 			counterIdentity: COUNTER_IDENTITY,
-			writerRevision: "writer-r1",
-			buildSha: "build-a",
-			decoderRevision: "decoder-r1",
-			now: 1_000,
+			reservationSize: 7,
 		});
-		const second = await repository.reserveReplayIssuance({
+		const second = await repository.reserveReplayIssuanceRange({
 			counterIdentity: COUNTER_IDENTITY,
-			writerRevision: "writer-r2",
-			buildSha: "build-b",
-			decoderRevision: "decoder-r2",
-			now: 2_000,
+			reservationSize: 9,
 		});
 
-		expect(first.issuanceCount).toBe(1);
+		expect(first).toEqual({
+			counterIdentity: COUNTER_IDENTITY,
+			firstIssuanceCount: 1,
+			lastIssuanceCount: 7,
+		});
 		expect(second).toEqual({
 			counterIdentity: COUNTER_IDENTITY,
-			issuanceCount: 2,
-			firstIssuedAt: 1_000,
-			lastIssuedAt: 2_000,
-			firstWriterRevision: "writer-r1",
-			firstBuildSha: "build-a",
-			firstDecoderRevision: "decoder-r1",
-			lastWriterRevision: "writer-r2",
-			lastBuildSha: "build-b",
-			lastDecoderRevision: "decoder-r2",
+			firstIssuanceCount: 8,
+			lastIssuanceCount: 16,
+		});
+		expect(await repository.getReplayIssuance(COUNTER_IDENTITY)).toEqual({
+			counterIdentity: COUNTER_IDENTITY,
+			issuanceCount: 16,
 		});
 	});
 
-	it("serializes concurrent reservations into unique monotonic counts", async () => {
+	it("serializes concurrent reservation amounts into disjoint monotonic ranges", async () => {
 		const reservations = await Promise.all(
-			Array.from({ length: 32 }, (_, index) =>
-				repository.reserveReplayIssuance({
+			Array.from({ length: 32 }, () =>
+				repository.reserveReplayIssuanceRange({
 					counterIdentity: COUNTER_IDENTITY,
-					writerRevision: `writer-${index % 2}`,
-					buildSha: `build-${index % 3}`,
-					decoderRevision: `decoder-${index % 2}`,
-					now: 10_000 + index,
+					reservationSize: 3,
 				}),
 			),
 		);
+		const claimed = reservations
+			.flatMap((range) =>
+				Array.from(
+					{
+						length: range.lastIssuanceCount - range.firstIssuanceCount + 1,
+					},
+					(_, index) => range.firstIssuanceCount + index,
+				),
+			)
+			.sort((a, b) => a - b);
 
-		expect(
-			reservations.map((row) => row.issuanceCount).sort((a, b) => a - b),
-		).toEqual(Array.from({ length: 32 }, (_, index) => index + 1));
-		expect(await repository.getReplayIssuance(COUNTER_IDENTITY)).toMatchObject({
-			issuanceCount: 32,
-			firstIssuedAt: 10_000,
-			lastIssuedAt: 10_031,
+		expect(claimed).toEqual(
+			Array.from({ length: 96 }, (_, index) => index + 1),
+		);
+		expect(await repository.getReplayIssuance(COUNTER_IDENTITY)).toEqual({
+			counterIdentity: COUNTER_IDENTITY,
+			issuanceCount: 96,
 		});
 	});
 
@@ -97,95 +99,102 @@ describe("ServerToolReplayIssuanceRepository", () => {
 		);
 
 		await expect(
-			unavailableRepository.reserveReplayIssuance({
+			unavailableRepository.reserveReplayIssuanceRange({
 				counterIdentity: COUNTER_IDENTITY,
-				writerRevision: "writer-r1",
-				buildSha: "build-a",
-				decoderRevision: "decoder-r1",
-				now: 1_000,
+				reservationSize: 7,
 			}),
 		).rejects.toThrow("database unavailable");
 		expect(calls).toBe(1);
 	});
 
-	it("does not let a late older timestamp roll back last-writer metadata", async () => {
-		await repository.reserveReplayIssuance({
-			counterIdentity: COUNTER_IDENTITY,
-			writerRevision: "writer-new",
-			buildSha: "build-new",
-			decoderRevision: "decoder-new",
-			now: 2_000,
-		});
-		const result = await repository.reserveReplayIssuance({
-			counterIdentity: COUNTER_IDENTITY,
-			writerRevision: "writer-old",
-			buildSha: "build-old",
-			decoderRevision: "decoder-old",
-			now: 1_000,
-		});
-
-		expect(result).toMatchObject({
-			issuanceCount: 2,
-			lastIssuedAt: 2_000,
-			lastWriterRevision: "writer-new",
-			lastBuildSha: "build-new",
-			lastDecoderRevision: "decoder-new",
-		});
-	});
-
-	it("returns the final value at the portable cap and then fails closed", async () => {
+	it("reserves the final aligned block at the global cap and then fails closed", async () => {
 		db.run(
-			`INSERT INTO server_tool_replay_issuance (
-				counter_identity, issuance_count, first_issued_at, last_issued_at,
-				first_writer_revision, first_build_sha, first_decoder_revision,
-				last_writer_revision, last_build_sha, last_decoder_revision
-			) VALUES (?, ?, 1, 1, 'writer-r1', 'build-a', 'decoder-r1',
-				'writer-r1', 'build-a', 'decoder-r1')`,
-			[COUNTER_IDENTITY, SERVER_TOOL_REPLAY_ISSUANCE_MAX - 1],
+			`INSERT INTO server_tool_replay_issuance (counter_identity, issuance_count)
+			 VALUES (?, ?)`,
+			[
+				COUNTER_IDENTITY,
+				SERVER_TOOL_REPLAY_ISSUANCE_MAX -
+					SERVER_TOOL_REPLAY_ISSUANCE_RESERVATION_MAX,
+			],
 		);
 
-		const final = await repository.reserveReplayIssuance({
+		const final = await repository.reserveReplayIssuanceRange({
 			counterIdentity: COUNTER_IDENTITY,
-			writerRevision: "writer-r2",
-			buildSha: "build-b",
-			decoderRevision: "decoder-r2",
-			now: 2,
+			reservationSize: SERVER_TOOL_REPLAY_ISSUANCE_RESERVATION_MAX,
 		});
-		expect(final.issuanceCount).toBe(SERVER_TOOL_REPLAY_ISSUANCE_MAX);
+		expect(final).toEqual({
+			counterIdentity: COUNTER_IDENTITY,
+			firstIssuanceCount:
+				SERVER_TOOL_REPLAY_ISSUANCE_MAX -
+				SERVER_TOOL_REPLAY_ISSUANCE_RESERVATION_MAX +
+				1,
+			lastIssuanceCount: SERVER_TOOL_REPLAY_ISSUANCE_MAX,
+		});
 
 		await expect(
-			repository.reserveReplayIssuance({
+			repository.reserveReplayIssuanceRange({
 				counterIdentity: COUNTER_IDENTITY,
-				writerRevision: "writer-r3",
-				buildSha: "build-c",
-				decoderRevision: "decoder-r3",
-				now: 3,
+				reservationSize: 1,
 			}),
 		).rejects.toBeInstanceOf(ServerToolReplayIssuanceLimitError);
 	});
 
-	it("rejects unbounded, padded, controlled, or invalid-time input before SQL", async () => {
+	it("enforces the global cap across independent stores", async () => {
+		db.run(
+			`INSERT INTO server_tool_replay_issuance (counter_identity, issuance_count)
+			 VALUES (?, ?)`,
+			[
+				COUNTER_IDENTITY,
+				SERVER_TOOL_REPLAY_ISSUANCE_MAX -
+					SERVER_TOOL_REPLAY_ISSUANCE_RESERVATION_MAX,
+			],
+		);
+		const secondStore = new ServerToolReplayIssuanceRepository(
+			new BunSqlAdapter(db),
+		);
+		const outcomes = await Promise.allSettled([
+			repository.reserveReplayIssuanceRange({
+				counterIdentity: COUNTER_IDENTITY,
+				reservationSize: SERVER_TOOL_REPLAY_ISSUANCE_RESERVATION_MAX,
+			}),
+			secondStore.reserveReplayIssuanceRange({
+				counterIdentity: COUNTER_IDENTITY,
+				reservationSize: SERVER_TOOL_REPLAY_ISSUANCE_RESERVATION_MAX,
+			}),
+		]);
+
+		expect(
+			outcomes.filter(({ status }) => status === "fulfilled"),
+		).toHaveLength(1);
+		const rejected = outcomes.find(({ status }) => status === "rejected");
+		expect(rejected).toMatchObject({
+			status: "rejected",
+			reason: expect.any(ServerToolReplayIssuanceLimitError),
+		});
+		expect(await repository.getReplayIssuance(COUNTER_IDENTITY)).toEqual({
+			counterIdentity: COUNTER_IDENTITY,
+			issuanceCount: SERVER_TOOL_REPLAY_ISSUANCE_MAX,
+		});
+	});
+
+	it("rejects invalid identities and reservation sizes before SQL", async () => {
 		const valid = {
 			counterIdentity: COUNTER_IDENTITY,
-			writerRevision: "writer-r1",
-			buildSha: "build-a",
-			decoderRevision: "decoder-r1",
-			now: 1_000,
+			reservationSize: 7,
 		};
 		for (const input of [
 			{ ...valid, counterIdentity: "" },
 			{ ...valid, counterIdentity: ` ${COUNTER_IDENTITY}` },
 			{ ...valid, counterIdentity: "x".repeat(513) },
-			{ ...valid, writerRevision: "writer\nrevision" },
-			{ ...valid, writerRevision: "x".repeat(257) },
-			{ ...valid, buildSha: "x".repeat(257) },
-			{ ...valid, decoderRevision: "" },
-			{ ...valid, decoderRevision: "x".repeat(257) },
-			{ ...valid, now: -1 },
-			{ ...valid, now: Number.MAX_SAFE_INTEGER + 1 },
+			{ ...valid, reservationSize: 0 },
+			{ ...valid, reservationSize: 1.5 },
+			{
+				...valid,
+				reservationSize: SERVER_TOOL_REPLAY_ISSUANCE_RESERVATION_MAX + 1,
+			},
 		]) {
 			await expect(
-				repository.reserveReplayIssuance(input),
+				repository.reserveReplayIssuanceRange(input),
 			).rejects.toBeInstanceOf(TypeError);
 		}
 		expect(await repository.getReplayIssuance(COUNTER_IDENTITY)).toBeNull();
@@ -196,14 +205,6 @@ describe("ServerToolReplayIssuanceRepository", () => {
 			get: async () => ({
 				counter_identity: COUNTER_IDENTITY,
 				issuance_count_text: "1e3",
-				first_issued_at_text: "1000",
-				last_issued_at_text: "1000",
-				first_writer_revision: "writer",
-				first_build_sha: "build",
-				first_decoder_revision: "decoder",
-				last_writer_revision: "writer",
-				last_build_sha: "build",
-				last_decoder_revision: "decoder",
 			}),
 		};
 		const corruptRepository = new ServerToolReplayIssuanceRepository(
@@ -239,7 +240,7 @@ const postgresUrl = configuredPostgresUrl
 const describePostgres = postgresUrl ? describe : describe.skip;
 
 describePostgres("ServerToolReplayIssuanceRepository PostgreSQL parity", () => {
-	it("creates the upgrade-safe table and reserves concurrent monotonic counts", async () => {
+	it("creates the upgrade-safe table and atomically reserves concurrent amounts", async () => {
 		if (!postgresUrl) throw new Error("PostgreSQL integration URL is required");
 		const databaseName = `ccflare_replay_${randomUUID().replaceAll("-", "")}`;
 		const adminSql = new SQL({ url: postgresUrl, max: 1, prepare: false });
@@ -260,25 +261,29 @@ describePostgres("ServerToolReplayIssuanceRepository PostgreSQL parity", () => {
 			await runMigrationsPg(adapter);
 			const repository = new ServerToolReplayIssuanceRepository(adapter);
 			const rows = await Promise.all(
-				Array.from({ length: 16 }, (_, index) =>
-					repository.reserveReplayIssuance({
+				Array.from({ length: 16 }, () =>
+					repository.reserveReplayIssuanceRange({
 						counterIdentity: COUNTER_IDENTITY,
-						writerRevision: `writer-${index}`,
-						buildSha: `build-${index}`,
-						decoderRevision: `decoder-${index}`,
-						now: 20_000 + index,
+						reservationSize: 7,
 					}),
 				),
 			);
-			expect(
-				rows.map((row) => row.issuanceCount).sort((a, b) => a - b),
-			).toEqual(Array.from({ length: 16 }, (_, index) => index + 1));
-			expect(
-				await repository.getReplayIssuance(COUNTER_IDENTITY),
-			).toMatchObject({
-				issuanceCount: 16,
-				firstIssuedAt: 20_000,
-				lastIssuedAt: 20_015,
+			const claimed = rows
+				.flatMap((range) =>
+					Array.from(
+						{
+							length: range.lastIssuanceCount - range.firstIssuanceCount + 1,
+						},
+						(_, index) => range.firstIssuanceCount + index,
+					),
+				)
+				.sort((a, b) => a - b);
+			expect(claimed).toEqual(
+				Array.from({ length: 16 * 7 }, (_, index) => index + 1),
+			);
+			expect(await repository.getReplayIssuance(COUNTER_IDENTITY)).toEqual({
+				counterIdentity: COUNTER_IDENTITY,
+				issuanceCount: 16 * 7,
 			});
 		} finally {
 			await adapter?.close();

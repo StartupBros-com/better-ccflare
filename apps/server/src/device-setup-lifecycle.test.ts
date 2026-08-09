@@ -54,7 +54,7 @@ mock.module("@better-ccflare/proxy", () => {
 		createAnthropicDegradedRuntimeHealth: () => ({}),
 		createDurableServerToolReplayWriterAdmission: () => ({
 			status: "unavailable" as const,
-			reason: "missing_build_sha" as const,
+			reason: "invalid_store" as const,
 			writerAdmission: { enabled: false as const },
 		}),
 		createGuardCorrelationVerifier: () => undefined,
@@ -77,8 +77,6 @@ mock.module("@better-ccflare/proxy", () => {
 		registerCodexUsageRefresher: () => {},
 		registerPollingRestarter: () => {},
 		registerRefreshClearer: () => {},
-		SERVER_TOOL_REPLAY_DECODER_REVISION: "bccf2.A256GCM.decoder.v1",
-		SERVER_TOOL_REPLAY_WRITER_REVISION: "bccf2.A256GCM.writer.v1",
 		startGlobalTokenHealthChecks: () => {},
 		startIntegrityScheduler: () => () => {},
 		stopGlobalTokenHealthChecks: () => {},

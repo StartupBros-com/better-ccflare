@@ -149,15 +149,14 @@ export {
 export {
 	createDurableServerToolReplayWriterAdmission,
 	createServerToolReplayRuntime,
-	SERVER_TOOL_REPLAY_DECODER_REVISION,
-	SERVER_TOOL_REPLAY_WRITER_REVISION,
+	SERVER_TOOL_REPLAY_ISSUANCE_RANGE_SIZE,
+	type ServerToolReplayIssuanceReservation,
 	type ServerToolReplayIssuanceReservationInput,
 	type ServerToolReplayIssuanceStore,
 	type ServerToolReplayRuntimeOptions,
 	type ServerToolReplayRuntimeState,
 	type ServerToolReplayWriterAdmissionBuildResult,
 	type ServerToolReplayWriterAdmissionUnavailableReason,
-	type ServerToolReplayWriterProvenance,
 } from "./server-tool-replay-runtime";
 export {
 	clearSession,

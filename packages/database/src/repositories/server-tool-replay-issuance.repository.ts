@@ -2,53 +2,40 @@ import { BaseRepository } from "./base.repository";
 
 export const SERVER_TOOL_REPLAY_ISSUANCE_MAX = 2 ** 31;
 
+/**
+ * A small upper bound keeps crash-burn waste negligible while removing one
+ * durable write from every replay envelope. The runtime currently reserves the
+ * full 256-slot block; smaller requests remain available for boundary tests and
+ * future staged rollouts.
+ */
+export const SERVER_TOOL_REPLAY_ISSUANCE_RESERVATION_MAX = 256;
+
 const PORTABLE_UNSIGNED_INTEGER = /^(0|[1-9][0-9]*)$/;
 
 export interface ServerToolReplayIssuance {
 	counterIdentity: string;
 	issuanceCount: number;
-	firstIssuedAt: number;
-	lastIssuedAt: number;
-	firstWriterRevision: string;
-	firstBuildSha: string;
-	firstDecoderRevision: string;
-	lastWriterRevision: string;
-	lastBuildSha: string;
-	lastDecoderRevision: string;
 }
 
-export interface ReserveReplayIssuanceInput {
+export interface ServerToolReplayIssuanceRange {
 	counterIdentity: string;
-	writerRevision: string;
-	buildSha: string;
-	decoderRevision: string;
-	now: number;
+	firstIssuanceCount: number;
+	lastIssuanceCount: number;
+}
+
+export interface ReserveReplayIssuanceRangeInput {
+	counterIdentity: string;
+	reservationSize: number;
 }
 
 interface ReplayIssuanceRow {
 	counter_identity: string;
 	issuance_count_text: string;
-	first_issued_at_text: string;
-	last_issued_at_text: string;
-	first_writer_revision: string;
-	first_build_sha: string;
-	first_decoder_revision: string;
-	last_writer_revision: string;
-	last_build_sha: string;
-	last_decoder_revision: string;
 }
 
 const REPLAY_ISSUANCE_COLUMNS = `
 	counter_identity,
-	CAST(issuance_count AS TEXT) AS issuance_count_text,
-	CAST(first_issued_at AS TEXT) AS first_issued_at_text,
-	CAST(last_issued_at AS TEXT) AS last_issued_at_text,
-	first_writer_revision,
-	first_build_sha,
-	first_decoder_revision,
-	last_writer_revision,
-	last_build_sha,
-	last_decoder_revision`;
+	CAST(issuance_count AS TEXT) AS issuance_count_text`;
 
 export class ServerToolReplayIssuanceLimitError extends Error {
 	constructor() {
@@ -88,10 +75,14 @@ function requireOpaqueText(
 	return value;
 }
 
-function requireEpochMs(value: number, field: string): number {
-	if (!Number.isSafeInteger(value) || value < 0) {
+function requireReservationSize(value: number): number {
+	if (
+		!Number.isSafeInteger(value) ||
+		value < 1 ||
+		value > SERVER_TOOL_REPLAY_ISSUANCE_RESERVATION_MAX
+	) {
 		throw new TypeError(
-			`${field} must be a non-negative safe epoch-ms integer`,
+			`reservationSize must be an integer between 1 and ${SERVER_TOOL_REPLAY_ISSUANCE_RESERVATION_MAX}`,
 		);
 	}
 	return value;
@@ -124,90 +115,49 @@ function toReplayIssuance(row: ReplayIssuanceRow): ServerToolReplayIssuance {
 			"issuance_count",
 			SERVER_TOOL_REPLAY_ISSUANCE_MAX,
 		),
-		firstIssuedAt: parsePortableInteger(
-			row.first_issued_at_text,
-			"first_issued_at",
-			Number.MAX_SAFE_INTEGER,
-		),
-		lastIssuedAt: parsePortableInteger(
-			row.last_issued_at_text,
-			"last_issued_at",
-			Number.MAX_SAFE_INTEGER,
-		),
-		firstWriterRevision: row.first_writer_revision,
-		firstBuildSha: row.first_build_sha,
-		firstDecoderRevision: row.first_decoder_revision,
-		lastWriterRevision: row.last_writer_revision,
-		lastBuildSha: row.last_build_sha,
-		lastDecoderRevision: row.last_decoder_revision,
 	};
 }
 
 export class ServerToolReplayIssuanceRepository extends BaseRepository<never> {
-	async reserveReplayIssuance(
-		input: ReserveReplayIssuanceInput,
-	): Promise<ServerToolReplayIssuance> {
+	async reserveReplayIssuanceRange(
+		input: ReserveReplayIssuanceRangeInput,
+	): Promise<ServerToolReplayIssuanceRange> {
 		const counterIdentity = requireOpaqueText(
 			input.counterIdentity,
 			"counterIdentity",
 			512,
 		);
-		const writerRevision = requireOpaqueText(
-			input.writerRevision,
-			"writerRevision",
-			256,
-		);
-		const buildSha = requireOpaqueText(input.buildSha, "buildSha", 256);
-		const decoderRevision = requireOpaqueText(
-			input.decoderRevision,
-			"decoderRevision",
-			256,
-		);
-		const now = requireEpochMs(input.now, "now");
+		const reservationSize = requireReservationSize(input.reservationSize);
 		const row = await this.runReturningOne<ReplayIssuanceRow>(
 			`INSERT INTO server_tool_replay_issuance (
-				counter_identity, issuance_count, first_issued_at, last_issued_at,
-				first_writer_revision, first_build_sha, first_decoder_revision,
-				last_writer_revision, last_build_sha, last_decoder_revision
-			) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+				counter_identity, issuance_count
+			) VALUES (?, ?)
 			ON CONFLICT (counter_identity) DO UPDATE SET
-				issuance_count = server_tool_replay_issuance.issuance_count + 1,
-				last_issued_at = CASE
-					WHEN excluded.last_issued_at >= server_tool_replay_issuance.last_issued_at
-					THEN excluded.last_issued_at
-					ELSE server_tool_replay_issuance.last_issued_at
-				END,
-				last_writer_revision = CASE
-					WHEN excluded.last_issued_at >= server_tool_replay_issuance.last_issued_at
-					THEN excluded.last_writer_revision
-					ELSE server_tool_replay_issuance.last_writer_revision
-				END,
-				last_build_sha = CASE
-					WHEN excluded.last_issued_at >= server_tool_replay_issuance.last_issued_at
-					THEN excluded.last_build_sha
-					ELSE server_tool_replay_issuance.last_build_sha
-				END,
-				last_decoder_revision = CASE
-					WHEN excluded.last_issued_at >= server_tool_replay_issuance.last_issued_at
-					THEN excluded.last_decoder_revision
-					ELSE server_tool_replay_issuance.last_decoder_revision
-				END
-			WHERE server_tool_replay_issuance.issuance_count < ${SERVER_TOOL_REPLAY_ISSUANCE_MAX}
+				issuance_count = server_tool_replay_issuance.issuance_count + excluded.issuance_count
+			WHERE server_tool_replay_issuance.issuance_count
+				<= ${SERVER_TOOL_REPLAY_ISSUANCE_MAX} - excluded.issuance_count
 			RETURNING ${REPLAY_ISSUANCE_COLUMNS}`,
-			[
-				counterIdentity,
-				now,
-				now,
-				writerRevision,
-				buildSha,
-				decoderRevision,
-				writerRevision,
-				buildSha,
-				decoderRevision,
-			],
+			[counterIdentity, reservationSize],
 		);
 		if (!row) throw new ServerToolReplayIssuanceLimitError();
-		return toReplayIssuance(row);
+
+		const replayIssuance = toReplayIssuance(row);
+		const firstIssuanceCount =
+			replayIssuance.issuanceCount - reservationSize + 1;
+		if (
+			replayIssuance.counterIdentity !== counterIdentity ||
+			!Number.isSafeInteger(firstIssuanceCount) ||
+			firstIssuanceCount < 1
+		) {
+			throw new ServerToolReplayIssuanceDataIntegrityError(
+				"reserved issuance range is invalid",
+			);
+		}
+		return {
+			counterIdentity: replayIssuance.counterIdentity,
+			firstIssuanceCount,
+			lastIssuanceCount: replayIssuance.issuanceCount,
+		};
 	}
 
 	async getReplayIssuance(
