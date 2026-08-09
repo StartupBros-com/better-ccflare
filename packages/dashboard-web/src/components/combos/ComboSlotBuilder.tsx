@@ -32,7 +32,6 @@ import {
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "../ui/card";
-import { Input } from "../ui/input";
 import { Label } from "../ui/label";
 import {
 	Select,
@@ -130,6 +129,24 @@ function SortableManualMemberRow({
 			/>
 		</div>
 	);
+}
+
+/**
+ * Help line under the model field — must state the rule that applies TO THE
+ * SELECTED ACCOUNT, not a universal "Empty = passthrough" that only holds
+ * on the Anthropic provider.
+ */
+function modelFieldHint(
+	provider: string | null,
+	passthroughAllowed: boolean,
+): string {
+	if (!provider) {
+		return "Pick an account first: whether the model is required depends on the provider.";
+	}
+	if (passthroughAllowed) {
+		return "Empty = passthrough: the model sent by the client goes upstream untouched.";
+	}
+	return `Required for ${provider}: this provider does not serve Claude model ids, so there is no passthrough.`;
 }
 
 interface ComboSlotBuilderProps {
@@ -533,6 +550,11 @@ export function ComboSlotBuilder({ combo }: ComboSlotBuilderProps) {
 									!newModel.trim() ||
 									parsedNewPriority === null ||
 									addSlot.isPending
+								}
+								title={
+									missingRequiredModel
+										? `A model is required for ${selectedProvider}: this provider does not serve Claude model ids, so there is no passthrough.`
+										: undefined
 								}
 							>
 								{addSlot.isPending ? "Adding..." : "Add"}
