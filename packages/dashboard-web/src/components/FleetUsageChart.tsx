@@ -52,7 +52,16 @@ export function buildFleetChartData(accounts: FleetAccountUsageSeries[]): {
 		const color = CHART_COLORS[accountIndex % CHART_COLORS.length];
 		for (const w of account.windows) {
 			const dataKey = fleetSeriesKey(account.accountId, w.window);
-			for (const p of w.points) ensureRow(p.t)[dataKey] = p.utilization;
+			// Bucket timestamps to a shared minute grid: accounts poll on
+			// independent, unaligned cycles, so exact-ms keys would give every
+			// account its own disjoint row set and the merged rows would grow
+			// toward accounts x windows x 500 — defeating the server's
+			// per-series cap (review finding). Same-bucket points overwrite
+			// (latest wins), which is fine for a trend line.
+			for (const p of w.points) {
+				const bucketT = Math.round(p.t / 60_000) * 60_000;
+				ensureRow(bucketT)[dataKey] = p.utilization;
+			}
 			lines.push({
 				dataKey,
 				name: `${account.accountName} · ${formatWindowName(w.window)}`,
@@ -63,7 +72,26 @@ export function buildFleetChartData(accounts: FleetAccountUsageSeries[]): {
 	});
 
 	const allKeys = lines.map((l) => l.dataKey);
-	const rows = [...byTime.values()].sort((a, b) => a.t - b.t);
+	let rows = [...byTime.values()].sort((a, b) => a.t - b.t);
+	// Hard cap on merged rows (belt over the minute bucketing, e.g. 30d
+	// ranges): evenly sample, always keeping the first and last row so the
+	// chart's time domain stays exact — mirrors the server's downsampling.
+	const MAX_MERGED_ROWS = 1500;
+	if (rows.length > MAX_MERGED_ROWS) {
+		const step = (rows.length - 1) / (MAX_MERGED_ROWS - 1);
+		const sampled: FleetChartRow[] = [];
+		let lastIdx = -1;
+		for (let i = 0; i < MAX_MERGED_ROWS; i++) {
+			const idx = Math.round(i * step);
+			if (idx === lastIdx) continue;
+			sampled.push(rows[idx]);
+			lastIdx = idx;
+		}
+		if (sampled[sampled.length - 1] !== rows[rows.length - 1]) {
+			sampled.push(rows[rows.length - 1]);
+		}
+		rows = sampled;
+	}
 	for (const row of rows) {
 		for (const key of allKeys) if (!(key in row)) row[key] = null;
 	}

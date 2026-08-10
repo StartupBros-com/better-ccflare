@@ -431,4 +431,146 @@ describe("AlertService usage-window alerts", () => {
 
 		expect(await service.listAlerts()).toHaveLength(0);
 	});
+
+	it("escalates to critical severity at 100% utilization", async () => {
+		service = new AlertService(new BunSqlAdapter(sqlite), makeConfig());
+		service.start();
+
+		const now = 1_800_000_000_000;
+		await service.evaluateUsageSnapshot(
+			"acct-1",
+			"Primary account",
+			{
+				five_hour: {
+					utilization: 100,
+					resets_at: new Date(now + FIVE_HOURS_MS).toISOString(),
+				},
+			},
+			now,
+		);
+
+		const alerts = (await service.listAlerts()).filter(
+			(a) => a.type === "usage_window_threshold",
+		);
+		expect(alerts).toHaveLength(1);
+		expect((alerts[0] as AlertEvent).severity).toBe("critical");
+	});
+
+	it("evaluates limits[]-only payloads (session -> five_hour), matching what usage history records", async () => {
+		// Limits-only Anthropic payloads carry NO flat windows — the evaluator
+		// must fold limits[] or the alert feature silently dies for those
+		// accounts (cross-model review finding).
+		service = new AlertService(new BunSqlAdapter(sqlite), makeConfig());
+		service.start();
+
+		const now = 1_800_000_000_000;
+		await service.evaluateUsageSnapshot(
+			"acct-1",
+			"Primary account",
+			{
+				limits: [
+					{
+						kind: "session",
+						percent: 95,
+						resets_at: new Date(now + FIVE_HOURS_MS).toISOString(),
+					},
+					{ kind: "weekly_all", percent: 12, resets_at: null },
+				],
+			},
+			now,
+		);
+
+		const alerts = (await service.listAlerts()).filter(
+			(a) => a.type === "usage_window_threshold",
+		);
+		expect(alerts).toHaveLength(1);
+		expect((alerts[0] as AlertEvent).message).toContain("five_hour");
+	});
+
+	it("excludes an already-persisted current-poll row from the regression input", async () => {
+		// The caller records the current snapshot un-awaited; on SQLite that
+		// insert commits before the evaluator's SELECT. Seed a poison row AT
+		// the evaluation timestamp whose value (0%) would flatten the rising
+		// trend if double-counted — the alert must still fire, proving the
+		// current poll is represented exactly once (cross-model finding).
+		service = new AlertService(
+			new BunSqlAdapter(sqlite),
+			makeConfig({ usageWindowThresholdPercent: 0 }),
+		);
+		service.start();
+
+		const now = 1_800_000_000_000;
+		const resetsAtMs = now + 60 * 60 * 1000;
+		seedSnapshot(sqlite, {
+			accountId: "acct-1",
+			timestamp: now - 30 * 60 * 1000,
+			windowKey: "five_hour",
+			utilization: 40,
+			resetsAt: resetsAtMs,
+		});
+		seedSnapshot(sqlite, {
+			accountId: "acct-1",
+			timestamp: now - 15 * 60 * 1000,
+			windowKey: "five_hour",
+			utilization: 55,
+			resetsAt: resetsAtMs,
+		});
+		// The "already committed" current poll — same timestamp, poison value.
+		seedSnapshot(sqlite, {
+			accountId: "acct-1",
+			timestamp: now,
+			windowKey: "five_hour",
+			utilization: 0,
+			resetsAt: resetsAtMs,
+		});
+
+		await service.evaluateUsageSnapshot(
+			"acct-1",
+			"Primary account",
+			{
+				five_hour: {
+					utilization: 70,
+					resets_at: new Date(resetsAtMs).toISOString(),
+				},
+			},
+			now,
+		);
+
+		const alerts = (await service.listAlerts()).filter(
+			(a) => a.type === "usage_window_exhaustion_projected",
+		);
+		expect(alerts).toHaveLength(1);
+	});
+
+	it("does not double-fire when jitter crosses a minute-bucket boundary", async () => {
+		// A reset instant near the half-minute tie-break can round to adjacent
+		// buckets under the documented <2s jitter. The adjacent-bucket dedup
+		// check must treat those as the same cycle (correctness + cross-model
+		// corroborated finding).
+		service = new AlertService(new BunSqlAdapter(sqlite), makeConfig());
+		service.start();
+
+		const start = 1_800_000_000_000;
+		// Place the reset 29.6s past a minute boundary: +1879ms jitter crosses
+		// the 30s rounding tie-break into the next bucket.
+		const resetsAtMs = start + FIVE_HOURS_MS + 29_600;
+		for (const jitterMs of [0, 1879]) {
+			await service.evaluateUsageSnapshot(
+				"acct-1",
+				"Primary account",
+				{
+					five_hour: {
+						utilization: 92,
+						resets_at: new Date(resetsAtMs + jitterMs).toISOString(),
+					},
+				},
+				start + 90_000,
+			);
+		}
+
+		const alerts = (await service.listAlerts()).filter(
+			(a) => a.type === "usage_window_threshold",
+		);
+		expect(alerts).toHaveLength(1);
+	});
 });

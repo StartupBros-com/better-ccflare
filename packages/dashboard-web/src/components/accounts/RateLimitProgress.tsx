@@ -1,7 +1,7 @@
 import { computeWindowStartMs, registerUIRefresh } from "@better-ccflare/core";
 import type { AnthropicUsageData, FullUsageData } from "@better-ccflare/types";
 import { useEffect, useState } from "react";
-import { cn } from "../../lib/utils";
+import { cn, formatShortDuration } from "../../lib/utils";
 import {
 	isAnthropicPeakHour,
 	isZaiPeakHour,
@@ -88,14 +88,6 @@ function computeWindowThrottleUntil(
 	return resumeAt > now ? resumeAt : null;
 }
 
-function formatDuration(ms: number): string {
-	const totalMinutes = Math.round(ms / 60000);
-	const hours = Math.floor(totalMinutes / 60);
-	const minutes = totalMinutes % 60;
-	if (hours > 0) return `${hours}h ${minutes}m`;
-	return `${minutes}m`;
-}
-
 function formatThrottledUntil(throttledUntilMs: number, now: number): string {
 	const remainingMs = throttledUntilMs - now;
 	if (remainingMs < 60 * 1000) {
@@ -137,9 +129,9 @@ function computeProjectedMessage(
 	if (f <= 0) return "No usage recorded yet in this window";
 	const timeToExhaustMs = ((1 - f) / f) * elapsed;
 	if (timeToExhaustMs < remaining) {
-		return `Runs out ${formatDuration(remaining - timeToExhaustMs)} before reset`;
+		return `Runs out ${formatShortDuration(remaining - timeToExhaustMs)} before reset`;
 	}
-	return `Resets ${formatDuration(timeToExhaustMs - remaining)} before exhaustion`;
+	return `Resets ${formatShortDuration(timeToExhaustMs - remaining)} before exhaustion`;
 }
 
 export function RateLimitProgress({

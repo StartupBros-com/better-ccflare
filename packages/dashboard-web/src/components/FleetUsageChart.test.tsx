@@ -88,25 +88,30 @@ describe("buildFleetChartData", () => {
 		expect(lines[CHART_COLORS.length].color).toBe(CHART_COLORS[0]); // wraps around
 	});
 
-	it("merges points from different accounts/windows into time-indexed rows, nulling absent series", () => {
+	it("merges points into shared minute buckets, nulling absent series", () => {
+		const M = 60_000;
 		const { rows } = buildFleetChartData([
 			account("acc1", "Acc One", [
 				{
 					window: "five_hour",
 					points: [
-						{ t: 1000, utilization: 10, resetsAt: null },
-						{ t: 2000, utilization: 20, resetsAt: null },
+						{ t: 1 * M, utilization: 10, resetsAt: null },
+						{ t: 2 * M, utilization: 20, resetsAt: null },
 					],
 				},
 			]),
 			account("acc2", "Acc Two", [
 				{
 					window: "five_hour",
-					points: [{ t: 1000, utilization: 50, resetsAt: null }],
+					// 12s off acc1's poll time — unaligned per-account cycles must
+					// land in the SAME minute bucket so cross-account rows merge
+					// instead of growing toward accounts x windows x 500 disjoint
+					// rows (review finding).
+					points: [{ t: 1 * M + 12_000, utilization: 50, resetsAt: null }],
 				},
 			]),
 		]);
-		expect(rows.map((r) => r.t)).toEqual([1000, 2000]);
+		expect(rows.map((r) => r.t)).toEqual([1 * M, 2 * M]);
 		const row1 = rows[0];
 		const row2 = rows[1];
 		const acc1Key = "acc1::five_hour";
@@ -114,7 +119,7 @@ describe("buildFleetChartData", () => {
 		expect(row1[acc1Key]).toBe(10);
 		expect(row1[acc2Key]).toBe(50);
 		expect(row2[acc1Key]).toBe(20);
-		expect(row2[acc2Key]).toBeNull(); // acc2 has no point at t=2000
+		expect(row2[acc2Key]).toBeNull(); // acc2 has no point in the 2m bucket
 	});
 
 	it("omits an account's window entirely when it has no points (no empty line)", () => {

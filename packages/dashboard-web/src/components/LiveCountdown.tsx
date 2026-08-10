@@ -65,8 +65,13 @@ export function LiveCountdown({
 	const [remainingMs, setRemainingMs] = useState(() => targetMs - Date.now());
 
 	useEffect(() => {
-		setRemainingMs(targetMs - Date.now());
-		if (!Number.isFinite(targetMs) || targetMs - Date.now() <= 0) {
+		// One clock read for both the state seed and the install decision: a
+		// target expiring between two separate Date.now() calls would set a
+		// positive remaining value and then skip installing the interval,
+		// freezing the display at that value (cross-model review finding).
+		const initialRemaining = targetMs - Date.now();
+		setRemainingMs(initialRemaining);
+		if (!Number.isFinite(targetMs) || initialRemaining <= 0) {
 			return;
 		}
 		const interval = setInterval(() => {

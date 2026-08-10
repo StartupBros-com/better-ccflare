@@ -5,7 +5,7 @@ import type {
 	PoolUsageResult,
 	PoolWindow,
 } from "../../lib/pool-usage";
-import { cn } from "../../lib/utils";
+import { cn, formatShortDuration } from "../../lib/utils";
 import { Card, CardContent } from "../ui/card";
 import { Popover, PopoverContent, PopoverTrigger } from "../ui/popover";
 
@@ -93,14 +93,6 @@ function nextQuotaLabel(
 ): string {
 	const name = accountName ?? "unknown";
 	return `${name} at ${nextQuotaTimeLabel(earliestResetMs, window)}`;
-}
-
-function formatShortDuration(ms: number): string {
-	const totalMinutes = Math.max(0, Math.round(ms / 60000));
-	const hours = Math.floor(totalMinutes / 60);
-	const minutes = totalMinutes % 60;
-	if (hours > 0) return `${hours}h ${minutes}m`;
-	return `${minutes}m`;
 }
 
 function atRiskBadge(

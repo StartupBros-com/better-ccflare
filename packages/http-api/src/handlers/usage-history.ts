@@ -43,6 +43,18 @@ export function downsamplePoints(
 	return result;
 }
 
+function groupRowsByWindow<T extends { windowKey: string }>(
+	rows: T[],
+): Map<string, T[]> {
+	const byWindow = new Map<string, T[]>();
+	for (const r of rows) {
+		const arr = byWindow.get(r.windowKey) ?? [];
+		arr.push(r);
+		byWindow.set(r.windowKey, arr);
+	}
+	return byWindow;
+}
+
 function rowsToPoints(
 	rows: { timestamp: number; utilization: number; resetsAt: number | null }[],
 ): PredictionPoint[] {
@@ -79,24 +91,18 @@ export function createUsageHistoryHandler(context: APIContext) {
 				since: startMs,
 			});
 
-			const byWindow = new Map<string, PredictionPoint[]>();
-			for (const r of rows) {
-				const arr = byWindow.get(r.windowKey) ?? [];
-				arr.push({
-					t: r.timestamp,
-					utilization: r.utilization,
-					resetsAt: r.resetsAt,
-				});
-				byWindow.set(r.windowKey, arr);
-			}
-
-			const windows: UsageHistoryWindowSeries[] = [...byWindow.entries()]
+			const windows: UsageHistoryWindowSeries[] = [
+				...groupRowsByWindow(rows).entries(),
+			]
 				.sort(([a], [b]) => a.localeCompare(b))
-				.map(([window, points]) => ({
-					window,
-					points,
-					prediction: computeUsagePrediction(points),
-				}));
+				.map(([window, windowRows]) => {
+					const points = rowsToPoints(windowRows);
+					return {
+						window,
+						points,
+						prediction: computeUsagePrediction(points),
+					};
+				});
 
 			const response: UsageHistoryResponse = { accountId, range, windows };
 			return jsonResponse(response);
@@ -117,21 +123,25 @@ async function buildFleetResponse(
 	const results: FleetAccountUsageSeries[] = [];
 
 	for (const account of accounts) {
-		const rows = await context.dbOps.getUsageHistory({
-			accountId: account.id,
-			windowKey: opts.windowKey,
-			since: opts.startMs,
-		});
+		let rows: Awaited<ReturnType<typeof context.dbOps.getUsageHistory>>;
+		try {
+			rows = await context.dbOps.getUsageHistory({
+				accountId: account.id,
+				windowKey: opts.windowKey,
+				since: opts.startMs,
+			});
+		} catch (error) {
+			// One account's transient failure must not 500 the whole fleet
+			// response — that would also let layered client retries replay the
+			// entire sequential fan-out. Log, skip, serve a partial fleet.
+			log.warn(
+				`Fleet usage history: query failed for account ${account.name}, skipping: ${error}`,
+			);
+			continue;
+		}
 		if (rows.length === 0) continue; // no snapshots in range — skip entirely
 
-		const byWindow = new Map<string, typeof rows>();
-		for (const r of rows) {
-			const arr = byWindow.get(r.windowKey) ?? [];
-			arr.push(r);
-			byWindow.set(r.windowKey, arr);
-		}
-
-		const windows: FleetWindowSeries[] = [...byWindow.entries()]
+		const windows: FleetWindowSeries[] = [...groupRowsByWindow(rows).entries()]
 			.sort(([a], [b]) => a.localeCompare(b))
 			.map(([window, windowRows]) => ({
 				window,

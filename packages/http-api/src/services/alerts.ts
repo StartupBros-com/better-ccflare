@@ -11,6 +11,7 @@ import {
 	LATEST_MODEL_BY_FAMILY,
 	type RequestEvt,
 	requestEvents,
+	weeklyScopedWindowKey,
 } from "@better-ccflare/core";
 import type { BunSqlAdapter } from "@better-ccflare/database";
 import { Logger } from "@better-ccflare/logger";
@@ -160,18 +161,39 @@ export interface ExtractedUsageWindow {
 }
 
 /**
- * Pulls every `{ utilization: number, resets_at: ... }`-shaped window out of
- * a raw usage snapshot payload (Anthropic's five_hour/seven_day/..., Codex's
- * mirrored shape, xAI's nested `credits`, etc.). Deliberately does not fold
- * in the generic `limits[]` array (per-model weekly caps) — this is a
- * narrower, deliberately-scoped evaluation of the flat top-level windows;
- * broadening to `limits[]` parity is a follow-up, not required for the
- * threshold/exhaustion alert to be useful today.
+ * Maps a `limits[]` entry to the internal window_key. MUST stay in lockstep
+ * with `limitWindowKey` in usage-history.repository.ts — the alert evaluator
+ * and the history recorder must agree on which windows exist, or an account
+ * gets a window persisted and charted but never alerted on (the exact gap
+ * this shared mapping closes).
+ */
+function alertLimitWindowKey(limit: {
+	kind?: string;
+	scope?: { model?: { display_name?: string } | null } | null;
+}): string | null {
+	if (limit.kind === "session") return "five_hour";
+	if (limit.kind === "weekly_all") return "seven_day";
+	if (limit.kind === "weekly_scoped") {
+		const name = limit.scope?.model?.display_name?.trim();
+		return name ? weeklyScopedWindowKey(name) : null;
+	}
+	return null;
+}
+
+/**
+ * Pulls every usage window out of a raw usage snapshot payload: the flat
+ * `{ utilization: number, resets_at: ... }`-shaped entries (Anthropic's
+ * five_hour/seven_day/..., Codex's mirrored shape, xAI's nested `credits`)
+ * AND the generic `limits[]` array (session/weekly_all/weekly_scoped) that
+ * limits-only Anthropic payloads carry INSTEAD of flat windows. The set of
+ * windows this returns matches what usage-history.repository.ts records, so
+ * everything persisted/charted is also alert-eligible.
  */
 export function extractUsageWindows(
 	usage: Record<string, unknown>,
 ): ExtractedUsageWindow[] {
 	const windows: ExtractedUsageWindow[] = [];
+	const seen = new Set<string>();
 	for (const [windowKey, value] of Object.entries(usage)) {
 		if (typeof value !== "object" || value === null) continue;
 		const utilization = (value as { utilization?: unknown }).utilization;
@@ -184,6 +206,32 @@ export function extractUsageWindows(
 			resetsAtMs = Number.isFinite(ms) ? ms : null;
 		}
 		windows.push({ windowKey, utilization, resetsAtMs });
+		seen.add(windowKey);
+	}
+	const limits = (usage as { limits?: unknown }).limits;
+	if (Array.isArray(limits)) {
+		for (const limit of limits) {
+			if (typeof limit !== "object" || limit === null || !("kind" in limit))
+				continue;
+			const l = limit as {
+				kind?: string;
+				percent?: unknown;
+				resets_at?: unknown;
+				scope?: { model?: { display_name?: string } | null } | null;
+			};
+			if (typeof l.percent !== "number") continue;
+			const windowKey = alertLimitWindowKey(l);
+			// Skip unmapped kinds and windows already present as flat entries
+			// (no double-evaluation of five_hour/seven_day).
+			if (!windowKey || seen.has(windowKey)) continue;
+			let resetsAtMs: number | null = null;
+			if (typeof l.resets_at === "string") {
+				const ms = new Date(l.resets_at).getTime();
+				resetsAtMs = Number.isFinite(ms) ? ms : null;
+			}
+			windows.push({ windowKey, utilization: l.percent, resetsAtMs });
+			seen.add(windowKey);
+		}
 	}
 	return windows;
 }
@@ -581,8 +629,28 @@ export class AlertService {
 			if (exhaustionAlert) alerts.push(exhaustionAlert);
 		}
 		for (const alert of alerts) {
+			// Jitter <2s can move the minute bucket by exactly one when the
+			// reset instant sits near a half-minute boundary — treat an alert
+			// already persisted in an adjacent bucket as the same cycle so a
+			// boundary-straddling jitter cannot double-fire (review finding,
+			// corroborated cross-model).
+			if (await this.usageWindowNeighborBucketExists(alert.id)) continue;
 			await this.persistAndEmit(alert, config.webhookUrl);
 		}
+	}
+
+	private async usageWindowNeighborBucketExists(
+		alertId: string,
+	): Promise<boolean> {
+		const m = alertId.match(/^(.*):(-?\d+)$/);
+		if (!m) return false;
+		const [, prefix, bucketStr] = m;
+		const bucket = Number(bucketStr);
+		const rows = await this.db.query<{ id: string }>(
+			`SELECT id FROM alerts WHERE id IN (?, ?) LIMIT 1`,
+			[`${prefix}:${bucket - 1}`, `${prefix}:${bucket + 1}`],
+		);
+		return rows.length > 0;
 	}
 
 	private buildUsageWindowThresholdAlert(
@@ -634,20 +702,23 @@ export class AlertService {
 		const windowStartMs =
 			computeWindowStartMs(resetsAtMs, windowKey) ??
 			timestamp - USAGE_WINDOW_HISTORY_FALLBACK_LOOKBACK_MS;
+		// Bound the query at `timestamp` so the current poll is represented
+		// EXACTLY once regardless of insert/evaluate ordering: on SQLite the
+		// caller's un-awaited recordUsageSnapshot commits synchronously before
+		// this SELECT runs, and reading that row PLUS the push below would
+		// double-count the current point and bias the regression (pro-gate
+		// cross-model finding).
 		const rows = await this.db.query<UsageSnapshotSqlRow>(
 			`SELECT timestamp, utilization, resets_at FROM usage_snapshots
-			 WHERE account_id = ? AND window_key = ? AND timestamp >= ?
+			 WHERE account_id = ? AND window_key = ? AND timestamp >= ? AND timestamp < ?
 			 ORDER BY timestamp ASC`,
-			[accountId, windowKey, windowStartMs],
+			[accountId, windowKey, windowStartMs, timestamp],
 		);
 		const points: PredictionPoint[] = rows.map((row) => ({
 			t: Number(row.timestamp),
 			utilization: Number(row.utilization),
 			resetsAt: row.resets_at == null ? null : Number(row.resets_at),
 		}));
-		// Include the current poll even though the caller (server.ts) records it
-		// to usage_snapshots separately and asynchronously — evaluation must not
-		// depend on winning that race.
 		points.push({ t: timestamp, utilization, resetsAt: resetsAtMs });
 		const prediction = computeUsagePrediction(points);
 		if (!prediction.willExhaustBeforeReset) return null;

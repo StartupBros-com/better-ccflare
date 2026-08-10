@@ -1134,6 +1134,12 @@ class UsageCache {
 					if (callback)
 						this.notifyWindowReset(accountId, data, "xai", callback);
 					this.setAuthoritative(accountId, data);
+					// Snapshot callback (history persistence + usage-window alert
+					// evaluation) — without this, xAI accounts silently miss both
+					// while every other refresh-backed provider gets them
+					// (cross-model review finding on PR #130).
+					const snapshotCb = this.snapshotCallbacks.get(accountId);
+					if (snapshotCb) snapshotCb(accountId, data as unknown as UsageData);
 					const utilization = getRepresentativeXaiUtilization(
 						data as XaiUsageData,
 					);

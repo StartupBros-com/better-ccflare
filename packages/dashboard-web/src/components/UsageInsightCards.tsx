@@ -1,7 +1,7 @@
 import type { UsageHistoryWindowSeries } from "@better-ccflare/types";
 import { Flame } from "lucide-react";
-import { computeWeeklyPace, formatDurationShort } from "../lib/usage-pace";
-import { cn } from "../lib/utils";
+import { computeWeeklyPace } from "../lib/usage-pace";
+import { cn, formatShortDuration } from "../lib/utils";
 import { formatWindowName } from "./accounts/rate-limit-helpers";
 import { Card, CardContent } from "./ui/card";
 
@@ -69,10 +69,10 @@ function WindowInsightCard({
 				prediction.state === "exhausted"
 					? "exhausts now"
 					: prediction.etaExhaustMs != null
-						? `exhausts in ${formatDurationShort(Math.max(0, prediction.etaExhaustMs - now))}`
+						? `exhausts in ${formatShortDuration(Math.max(0, prediction.etaExhaustMs - now))}`
 						: "not exhausting",
 				prediction.resetsAtMs != null
-					? `resets in ${formatDurationShort(Math.max(0, prediction.resetsAtMs - now))}`
+					? `resets in ${formatShortDuration(Math.max(0, prediction.resetsAtMs - now))}`
 					: "no reset known",
 			].join(" / ");
 

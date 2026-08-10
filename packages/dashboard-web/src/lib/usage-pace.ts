@@ -56,16 +56,3 @@ export function computeWeeklyPace(
 
 	return { expectedPct, deltaPct, band, windowStartMs };
 }
-
-/**
- * Short "Xh Ym" / "Ym" duration label for a millisecond span, for the
- * burn-rate insight cards' "exhausts in … / resets in …" rows. Negative
- * spans (already past) clamp to "0m" rather than printing a sign.
- */
-export function formatDurationShort(ms: number): string {
-	const totalMinutes = Math.max(0, Math.round(ms / 60_000));
-	const hours = Math.floor(totalMinutes / 60);
-	const minutes = totalMinutes % 60;
-	if (hours > 0) return `${hours}h ${minutes}m`;
-	return `${minutes}m`;
-}

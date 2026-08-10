@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
-import { computeWeeklyPace, formatDurationShort } from "../usage-pace";
+import { computeWeeklyPace } from "../usage-pace";
+import { formatShortDuration } from "../utils";
 
 const DAY = 24 * 60 * 60 * 1000;
 const HOUR = 60 * 60 * 1000;
@@ -65,24 +66,24 @@ describe("computeWeeklyPace", () => {
 	});
 });
 
-describe("formatDurationShort", () => {
+describe("formatShortDuration", () => {
 	it("renders sub-hour spans as minutes only", () => {
-		expect(formatDurationShort(45 * MIN)).toBe("45m");
+		expect(formatShortDuration(45 * MIN)).toBe("45m");
 	});
 
 	it("renders hour+minute spans as 'Xh Ym'", () => {
-		expect(formatDurationShort(3 * HOUR + 12 * MIN)).toBe("3h 12m");
+		expect(formatShortDuration(3 * HOUR + 12 * MIN)).toBe("3h 12m");
 	});
 
 	it("renders an exact hour as 'Xh 0m'", () => {
-		expect(formatDurationShort(HOUR)).toBe("1h 0m");
+		expect(formatShortDuration(HOUR)).toBe("1h 0m");
 	});
 
 	it("clamps negative spans to 0m", () => {
-		expect(formatDurationShort(-5 * MIN)).toBe("0m");
+		expect(formatShortDuration(-5 * MIN)).toBe("0m");
 	});
 
 	it("renders a zero span as 0m", () => {
-		expect(formatDurationShort(0)).toBe("0m");
+		expect(formatShortDuration(0)).toBe("0m");
 	});
 });
