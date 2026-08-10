@@ -17,7 +17,7 @@ afterEach(() => {
 	delete process.env[CODEX_TRACE_HMAC_KEY_ENV];
 });
 
-describe("writeCodexTrace schema 12 cache experiments", () => {
+describe("writeCodexTrace schema 13 cache experiments", () => {
 	test("writes bounded decision fields without reconstructing their semantics", () => {
 		const dir = mkdtempSync(join(tmpdir(), "codex-trace-schema-"));
 		process.env[CODEX_TRACE_DIR_ENV] = dir;
@@ -42,7 +42,7 @@ describe("writeCodexTrace schema 12 cache experiments", () => {
 				readFileSync(join(dir, file as string), "utf8").trim(),
 			);
 			expect(record).toMatchObject({
-				trace_schema_version: 12,
+				trace_schema_version: 13,
 				request_id: "logical-1",
 				attempt_id: "attempt-1",
 				attempt_ordinal: 2,
@@ -78,7 +78,7 @@ describe("writeCodexTrace schema 12 cache experiments", () => {
 	});
 });
 
-describe("orchestration demotion diagnostics (preserved in schema 12)", () => {
+describe("orchestration demotion diagnostics (preserved in schema 13)", () => {
 	test("writes the demotion signal and elapsed time when supplied", () => {
 		const dir = mkdtempSync(join(tmpdir(), "codex-trace-schema-"));
 		process.env[CODEX_TRACE_DIR_ENV] = dir;
@@ -94,7 +94,7 @@ describe("orchestration demotion diagnostics (preserved in schema 12)", () => {
 				readFileSync(join(dir, file as string), "utf8").trim(),
 			);
 			expect(record).toMatchObject({
-				trace_schema_version: 12,
+				trace_schema_version: 13,
 				orchestration_demotion_observed: true,
 				elapsed_ms_since_root: 4_242,
 			});
@@ -113,7 +113,7 @@ describe("orchestration demotion diagnostics (preserved in schema 12)", () => {
 			const record = JSON.parse(
 				readFileSync(join(dir, file as string), "utf8").trim(),
 			);
-			expect(record.trace_schema_version).toBe(12);
+			expect(record.trace_schema_version).toBe(13);
 			expect(record.orchestration_demotion_observed).toBeNull();
 			expect(record.elapsed_ms_since_root).toBeNull();
 		} finally {
@@ -135,6 +135,98 @@ describe("orchestration demotion diagnostics (preserved in schema 12)", () => {
 				readFileSync(join(dir, file as string), "utf8").trim(),
 			);
 			expect(record.orchestration_demotion_observed).toBe(false);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("orchestration admission basis (introduced in schema 13)", () => {
+	test("writes an explicit categorical basis alongside its admission", () => {
+		const dir = mkdtempSync(join(tmpdir(), "codex-trace-basis-"));
+		process.env[CODEX_TRACE_DIR_ENV] = dir;
+		try {
+			writeCodexTrace({
+				codexInput: [],
+				orchestrationAdmission: "root",
+				orchestrationBasis: "lineage_match",
+			});
+
+			const file = readdirSync(dir).find((name) => name.endsWith(".jsonl"));
+			const record = JSON.parse(
+				readFileSync(join(dir, file as string), "utf8").trim(),
+			);
+			expect(record).toMatchObject({
+				trace_schema_version: 13,
+				orchestration_admission: "root",
+				orchestration_basis: "lineage_match",
+			});
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("defaults the basis to null when omitted", () => {
+		const dir = mkdtempSync(join(tmpdir(), "codex-trace-basis-"));
+		process.env[CODEX_TRACE_DIR_ENV] = dir;
+		try {
+			writeCodexTrace({ codexInput: [] });
+
+			const file = readdirSync(dir).find((name) => name.endsWith(".jsonl"));
+			const record = JSON.parse(
+				readFileSync(join(dir, file as string), "utf8").trim(),
+			);
+			expect(record.orchestration_basis).toBeNull();
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("preserves an explicit null basis without collapsing a falsy check", () => {
+		const dir = mkdtempSync(join(tmpdir(), "codex-trace-basis-"));
+		process.env[CODEX_TRACE_DIR_ENV] = dir;
+		try {
+			writeCodexTrace({
+				codexInput: [],
+				orchestrationAdmission: "attributed_descendant",
+				orchestrationBasis: null,
+			});
+
+			const file = readdirSync(dir).find((name) => name.endsWith(".jsonl"));
+			const record = JSON.parse(
+				readFileSync(join(dir, file as string), "utf8").trim(),
+			);
+			expect(record).toMatchObject({
+				// No cast required at the call site: "attributed_descendant" is a
+				// first-class member of the imported OrchestrationAdmission union.
+				orchestration_admission: "attributed_descendant",
+				orchestration_basis: null,
+			});
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test.each([
+		"initial_claim",
+		"identity_match",
+		"lineage_match",
+		"rejected",
+	] as const)("accepts the %s categorical basis verbatim", (basis) => {
+		const dir = mkdtempSync(join(tmpdir(), "codex-trace-basis-"));
+		process.env[CODEX_TRACE_DIR_ENV] = dir;
+		try {
+			writeCodexTrace({
+				codexInput: [],
+				orchestrationAdmission: basis === "rejected" ? "non_root" : "root",
+				orchestrationBasis: basis,
+			});
+
+			const file = readdirSync(dir).find((name) => name.endsWith(".jsonl"));
+			const record = JSON.parse(
+				readFileSync(join(dir, file as string), "utf8").trim(),
+			);
+			expect(record.orchestration_basis).toBe(basis);
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}

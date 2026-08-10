@@ -5196,6 +5196,131 @@ describe("CodexProvider.transformRequestBody", () => {
 		expect(body.tool_choice).toBe("none");
 	});
 
+	it("leaves tool_choice unset when StructuredOutput coexists with another current tool", async () => {
+		const provider = new CodexProvider();
+		const request = new Request("https://example.com/v1/messages", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				model: "claude-opus-4-8",
+				max_tokens: 10,
+				messages: [
+					{ role: "user", content: "read then return structured output" },
+				],
+				tools: [
+					{
+						name: "Read",
+						description: "Read a file.",
+						input_schema: { type: "object" },
+					},
+					{
+						name: "StructuredOutput",
+						description: "Return structured output.",
+						input_schema: { type: "object" },
+					},
+				],
+			}),
+		});
+
+		const transformed = await provider.transformRequestBody(request);
+		const body = await transformed.json();
+		expect(body.tools.map((t: { name: string }) => t.name)).toEqual([
+			"Read",
+			"StructuredOutput",
+		]);
+		expect(body.tool_choice).toBeUndefined();
+	});
+
+	it("forces StructuredOutput tool_choice once orchestration filtering leaves it as the sole current tool for an attributed descendant", async () => {
+		const provider = new CodexProvider();
+		const request = new Request("https://example.com/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"x-better-ccflare-attributed-agent": "true",
+			},
+			body: JSON.stringify({
+				model: "claude-opus-4-8",
+				max_tokens: 10,
+				messages: [
+					{ role: "user", content: "delegate then return structured output" },
+				],
+				tools: [
+					{
+						name: "Agent",
+						description: "Delegate work.",
+						input_schema: { type: "object" },
+					},
+					{
+						name: "StructuredOutput",
+						description: "Return structured output.",
+						input_schema: { type: "object" },
+					},
+				],
+			}),
+		});
+
+		const transformed = await provider.transformRequestBody(request);
+		const body = await transformed.json();
+		// Agent is filtered by descendant admission, leaving StructuredOutput as
+		// the sole current tool, so the implicit function choice now applies.
+		expect(body.tools.map((t: { name: string }) => t.name)).toEqual([
+			"StructuredOutput",
+		]);
+		expect(body.tool_choice).toEqual({
+			type: "function",
+			name: "StructuredOutput",
+		});
+	});
+
+	it("leaves tool_choice unset when orchestration filtering still leaves multiple current tools for an attributed descendant", async () => {
+		const provider = new CodexProvider();
+		const request = new Request("https://example.com/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"x-better-ccflare-attributed-agent": "true",
+			},
+			body: JSON.stringify({
+				model: "claude-opus-4-8",
+				max_tokens: 10,
+				messages: [
+					{
+						role: "user",
+						content: "delegate, read, then return structured output",
+					},
+				],
+				tools: [
+					{
+						name: "Agent",
+						description: "Delegate work.",
+						input_schema: { type: "object" },
+					},
+					{
+						name: "Read",
+						description: "Read a file.",
+						input_schema: { type: "object" },
+					},
+					{
+						name: "StructuredOutput",
+						description: "Return structured output.",
+						input_schema: { type: "object" },
+					},
+				],
+			}),
+		});
+
+		const transformed = await provider.transformRequestBody(request);
+		const body = await transformed.json();
+		// Agent is filtered by descendant admission, but Read + StructuredOutput
+		// still coexist, so the implicit function choice must stay unset.
+		expect(body.tools.map((t: { name: string }) => t.name)).toEqual([
+			"Read",
+			"StructuredOutput",
+		]);
+		expect(body.tool_choice).toBeUndefined();
+	});
+
 	it("sanitizes tool input_schema: strips lookaround pattern and $schema", async () => {
 		const provider = new CodexProvider();
 		const request = new Request("https://example.com/v1/messages", {
@@ -5316,7 +5441,7 @@ describe("CodexProvider.transformRequestBody", () => {
 		).toEqual(["Read"]);
 	});
 
-	it("documents today's bug: a compaction-shaped follow-up turn loses Agent/Task at the provider boundary", async () => {
+	it("keeps Agent/Task for a compaction-shaped follow-up turn via shared call_id lineage", async () => {
 		const provider = new CodexProvider();
 		const sessionId = "44444444-4444-4444-8444-444444444444";
 		const tools = ["Agent", "Task", "Read"].map((name) => ({
@@ -5392,11 +5517,133 @@ describe("CodexProvider.transformRequestBody", () => {
 					record.phase === "request" &&
 					record.request_id === "compacted-follow-up",
 			);
-			// BUG (documented, not fixed here): the demotion diagnostics confirm
-			// this was a session that already had an elected root.
+			// FIXED: the compacted turn still carries the "agent-1" call_id as a
+			// function_call/function_call_output pair, so it overlaps the root's
+			// recorded lineage and is admitted as root (basis: lineage_match), not
+			// demoted.
 			expect(requestTrace).toMatchObject({
-				trace_schema_version: 12,
+				trace_schema_version: 13,
+				orchestration_admission: "root",
+				orchestration_basis: "lineage_match",
+				orchestration_demotion_observed: false,
+			});
+			expect(requestTrace?.elapsed_ms_since_root).toBeNull();
+		} finally {
+			delete process.env[CODEX_TRACE_DIR_ENV];
+			rmSync(traceDir, { recursive: true, force: true });
+		}
+
+		// FIXED: Agent/Task survive for what is still logically the
+		// orchestrator's own session, because the shared call_id lineage
+		// carries continuity across the compaction-reshaped identity.
+		expect(compacted.tools.map((tool: { name: string }) => tool.name)).toEqual([
+			"Agent",
+			"Task",
+			"Read",
+		]);
+	});
+
+	it("rejects a same-session sibling turn whose call_id lineage does not overlap the elected root", async () => {
+		const provider = new CodexProvider();
+		const sessionId = "55555555-5555-4555-8555-555555555555";
+		const tools = ["Agent", "Task", "Read"].map((name) => ({
+			name,
+			input_schema: { type: "object" },
+		}));
+		const send = async (
+			messages: unknown[],
+			headers: Record<string, string> = {},
+		) => {
+			const transformed = await provider.transformRequestBody(
+				new Request("https://example.com/v1/messages", {
+					method: "POST",
+					headers: { "content-type": "application/json", ...headers },
+					body: JSON.stringify({
+						model: "claude-opus-4-8",
+						max_tokens: 10,
+						metadata: { user_id: JSON.stringify({ session_id: sessionId }) },
+						messages,
+						tools,
+					}),
+				}),
+			);
+			return transformed.json();
+		};
+
+		const rootMessages = [
+			{ role: "user", content: "start the task" },
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "tool_use",
+						id: "root-call",
+						name: "Agent",
+						input: { prompt: "look into it" },
+					},
+				],
+			},
+			{
+				role: "user",
+				content: [
+					{
+						type: "tool_result",
+						tool_use_id: "root-call",
+						content: "findings",
+					},
+				],
+			},
+		];
+		const root = await send(rootMessages);
+		expect(root.tools.map((tool: { name: string }) => tool.name)).toEqual([
+			"Agent",
+			"Task",
+			"Read",
+		]);
+
+		// A same-session sibling turn with its own, unrelated call_id: same
+		// instructions, same session, but no lineage overlap with the elected
+		// root and a different derived identity (different first input item).
+		const siblingMessages = [
+			{ role: "user", content: "spawn a sibling task" },
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "tool_use",
+						id: "sibling-call",
+						name: "Agent",
+						input: { prompt: "unrelated" },
+					},
+				],
+			},
+			{
+				role: "user",
+				content: [
+					{
+						type: "tool_result",
+						tool_use_id: "sibling-call",
+						content: "unrelated findings",
+					},
+				],
+			},
+		];
+
+		const traceDir = mkdtempSync(join(tmpdir(), "codex-trace-"));
+		process.env[CODEX_TRACE_DIR_ENV] = traceDir;
+		let sibling: { tools: Array<{ name: string }> };
+		try {
+			sibling = await send(siblingMessages, {
+				"x-better-ccflare-request-id": "unrelated-sibling",
+			});
+			const requestTrace = readTraceRecords(traceDir).find(
+				(record) =>
+					record.phase === "request" &&
+					record.request_id === "unrelated-sibling",
+			);
+			expect(requestTrace).toMatchObject({
 				orchestration_admission: "non_root",
+				orchestration_basis: "rejected",
 				orchestration_demotion_observed: true,
 			});
 			expect(requestTrace?.elapsed_ms_since_root).toBeTypeOf("number");
@@ -5408,10 +5655,7 @@ describe("CodexProvider.transformRequestBody", () => {
 			rmSync(traceDir, { recursive: true, force: true });
 		}
 
-		// BUG (documented, not fixed here): Agent/Task are incorrectly filtered
-		// out of the request for what is still logically the orchestrator's own
-		// session, purely because compaction reshaped the derived identity.
-		expect(compacted.tools.map((tool: { name: string }) => tool.name)).toEqual([
+		expect(sibling.tools.map((tool: { name: string }) => tool.name)).toEqual([
 			"Read",
 		]);
 	});
@@ -5525,8 +5769,9 @@ describe("CodexProvider.transformRequestBody", () => {
 				(record) => record.phase === "request",
 			);
 			expect(requestTrace).toMatchObject({
-				trace_schema_version: 12,
-				orchestration_admission: "no_session",
+				trace_schema_version: 13,
+				orchestration_admission: "attributed_descendant",
+				orchestration_basis: null,
 				is_descendant: true,
 				tools_before_count: 3,
 				tools_after_count: 1,
@@ -5557,6 +5802,55 @@ describe("CodexProvider.transformRequestBody", () => {
 				output: "historical result",
 			}),
 		);
+	});
+
+	it("never lets an attributed descendant claim the empty orchestration root slot for its session", async () => {
+		const provider = new CodexProvider();
+		const sessionId = "66666666-6666-4666-8666-666666666666";
+		const tools = ["Agent", "Task", "Read"].map((name) => ({
+			name,
+			input_schema: { type: "object" },
+		}));
+		const send = async (attributed: boolean, content: string) => {
+			const transformed = await provider.transformRequestBody(
+				new Request("https://example.com/v1/messages", {
+					method: "POST",
+					headers: {
+						"content-type": "application/json",
+						...(attributed
+							? { "x-better-ccflare-attributed-agent": "true" }
+							: {}),
+					},
+					body: JSON.stringify({
+						model: "claude-opus-4-8",
+						max_tokens: 10,
+						metadata: { user_id: JSON.stringify({ session_id: sessionId }) },
+						messages: [{ role: "user", content }],
+						tools,
+					}),
+				}),
+			);
+			return transformed.json();
+		};
+
+		// A descendant request lands first in this session, with a valid
+		// session id. It must be filtered immediately (attributed_descendant)
+		// and must never touch election: no snapshot, no derived identity, no
+		// admit() call, no recorded root.
+		const descendant = await send(true, "delegated subtask");
+		expect(descendant.tools.map((tool: { name: string }) => tool.name)).toEqual(
+			["Read"],
+		);
+
+		// An ordinary (non-attributed) root request follows in the very same
+		// session. Because the descendant above never claimed the slot, this
+		// is still an uncontested initial claim and keeps Agent/Task.
+		const root = await send(false, "the real orchestrator turn");
+		expect(root.tools.map((tool: { name: string }) => tool.name)).toEqual([
+			"Agent",
+			"Task",
+			"Read",
+		]);
 	});
 
 	it.each([

@@ -46,8 +46,8 @@ import {
 	deriveConversationIdentity,
 	electOrchestrationRoot,
 	type OrchestrationAdmission,
-	peekOrchestrationRoot,
-	recordOrchestrationRootInstructions,
+	type OrchestrationAdmissionBasis,
+	snapshotOrchestrationRoot,
 } from "./orchestration-election";
 import {
 	createCodexHostedSearchAttemptPlan,
@@ -489,6 +489,15 @@ interface CodexConversionResult {
 	cacheKeyDecision: CodexPromptCacheKeyDecision;
 	explicitBreakpointDecision: CodexExplicitBreakpointDecision;
 	orchestrationAdmission: OrchestrationAdmission;
+	/**
+	 * Diagnostic-only reasoning basis behind orchestrationAdmission, when an
+	 * election actually ran ("initial_claim" | "identity_match" |
+	 * "lineage_match" | "rejected"). Null when no election ran at all (e.g.
+	 * no_orchestration_tools, attributed_descendant, disabled, no_session,
+	 * no_conversation). Written verbatim to trace.ts's TraceInputs as
+	 * orchestrationBasis.
+	 */
+	orchestrationBasis: OrchestrationAdmissionBasis | null;
 	filteredToolNames: string[];
 	/** Diagnostic: see orchestrationDemotionObserved in trace.ts's TraceInputs. */
 	orchestrationDemotionObserved: boolean;
@@ -1037,6 +1046,7 @@ export class CodexProvider extends BaseProvider {
 				cacheKeyDecision,
 				explicitBreakpointDecision,
 				orchestrationAdmission,
+				orchestrationBasis,
 				filteredToolNames,
 				orchestrationDemotionObserved,
 				elapsedMsSinceRoot,
@@ -1095,6 +1105,7 @@ export class CodexProvider extends BaseProvider {
 				pacingAction: request.headers.get("x-better-ccflare-pacing-action"),
 				isDescendant: isAttributedAgent,
 				orchestrationAdmission,
+				orchestrationBasis,
 				orchestrationDemotionObserved,
 				elapsedMsSinceRoot,
 				toolsBeforeCount: body.tools?.length ?? 0,
@@ -2092,10 +2103,19 @@ export class CodexProvider extends BaseProvider {
 			body.tools?.some((tool) => orchestrationToolNames.has(tool.name)) ??
 			false;
 		let orchestrationAdmission: OrchestrationAdmission;
+		let orchestrationBasis: OrchestrationAdmissionBasis | null = null;
 		let orchestrationDemotionObserved = false;
 		let elapsedMsSinceRoot: number | null = null;
 		if (!offersOrchestrationTools) {
 			orchestrationAdmission = "no_orchestration_tools";
+		} else if (isAttributedAgent) {
+			// Attributed descendants (subagents) are never contenders in root
+			// election: they must not claim an empty slot, must not extend an
+			// existing root's continuity state, and must not observe or report a
+			// demotion. Their current Agent/Task declarations are unconditionally
+			// filtered below using only this admission tag -- no snapshot, no
+			// derived conversation identity, no admit() call, no root recording.
+			orchestrationAdmission = "attributed_descendant";
 		} else if (process.env[CODEX_SINGLE_ORCHESTRATION_ROOT_ENV] === "0") {
 			orchestrationAdmission = "disabled";
 		} else {
@@ -2105,30 +2125,36 @@ export class CodexProvider extends BaseProvider {
 			} else {
 				// Captured before electOrchestrationRoot() mutates the entry, so a
 				// demotion below can still report how long the prior root was idle.
-				const priorRoot = peekOrchestrationRoot(sessionId);
+				const priorRootSnapshot = snapshotOrchestrationRoot(sessionId);
 				const conversationId = deriveConversationIdentity(
 					sessionId,
 					finalInstructions,
 					input,
 				);
-				orchestrationAdmission = conversationId
-					? electOrchestrationRoot(sessionId, conversationId)
-					: "no_conversation";
-				if (orchestrationAdmission === "root") {
-					recordOrchestrationRootInstructions(sessionId, finalInstructions);
-				} else if (orchestrationAdmission === "non_root" && priorRoot) {
-					// This session already had an elected root, and this turn's
-					// derived identity no longer matches it. Compaction that drops
-					// the earliest input item reshapes deriveConversationIdentity's
-					// hash for what is otherwise the same conversation, so this
-					// signal is diagnostic, not proof of a genuine sibling turn.
-					orchestrationDemotionObserved = true;
-					elapsedMsSinceRoot = Date.now() - priorRoot.lastActiveAt;
-					const instructionsMatchedPriorRoot =
-						finalInstructions === priorRoot.instructions;
-					log.warn(
-						`orchestration demotion observed: session=${sessionId} elapsed_ms_since_root=${elapsedMsSinceRoot} isAttributedAgent=${isAttributedAgent} instructionsMatchedPriorRoot=${instructionsMatchedPriorRoot}`,
+				if (!conversationId) {
+					orchestrationAdmission = "no_conversation";
+				} else {
+					const electionResult = electOrchestrationRoot(
+						sessionId,
+						conversationId,
+						finalInstructions,
+						input,
 					);
+					orchestrationAdmission = electionResult.admission;
+					orchestrationBasis = electionResult.basis;
+					if (electionResult.admission === "non_root" && priorRootSnapshot) {
+						// This session already had an elected root, and this turn was
+						// rejected as an ordinary contender (categorical basis:
+						// "rejected"): neither its derived identity nor its call_id
+						// lineage matched. Diagnostic only, and privacy-safe: no raw
+						// session id, instructions text, or call ids are ever logged,
+						// only the request id and a domain-separated session digest.
+						orchestrationDemotionObserved = true;
+						elapsedMsSinceRoot = Date.now() - priorRootSnapshot.lastActiveAt;
+						log.warn(
+							`orchestration demotion observed: request=${requestId ?? "unknown"} session_digest=${this.hashSessionKey(body) ?? "none"} elapsed_ms_since_root=${elapsedMsSinceRoot} isAttributedAgent=${isAttributedAgent} basis=${electionResult.basis}`,
+						);
+					}
 				}
 			}
 		}
@@ -2137,7 +2163,8 @@ export class CodexProvider extends BaseProvider {
 		// root retains current Agent and Task declarations. Historical calls and
 		// results are already represented in input and remain untouched.
 		const shouldFilterOrchestrationTools =
-			isAttributedAgent || orchestrationAdmission === "non_root";
+			orchestrationAdmission === "attributed_descendant" ||
+			orchestrationAdmission === "non_root";
 		const filteredToolNames = shouldFilterOrchestrationTools
 			? (body.tools ?? [])
 					.filter((tool) => orchestrationToolNames.has(tool.name))
@@ -2213,11 +2240,14 @@ export class CodexProvider extends BaseProvider {
 		);
 		if (explicitToolChoice) {
 			codexRequest.tool_choice = explicitToolChoice;
-		} else if (tools?.some((t) => t.name === "StructuredOutput")) {
+		} else if (tools?.length === 1 && tools[0].name === "StructuredOutput") {
 			// Claude Code schema agents provide a StructuredOutput tool but do not set
 			// Anthropic tool_choice. Native Claude reliably follows the hidden schema
 			// instruction; Codex models often end_turn with text instead. Force the
-			// function when this sentinel tool is present to preserve workflow semantics.
+			// function when this sentinel tool is the sole *current* tool remaining
+			// after orchestration filtering above -- if it coexists with any other
+			// current tool (e.g. Read), the model may still legitimately need that
+			// other tool first, so tool_choice is intentionally left unset.
 			codexRequest.tool_choice = {
 				type: "function",
 				name: "StructuredOutput",
@@ -2252,6 +2282,7 @@ export class CodexProvider extends BaseProvider {
 			cacheKeyDecision,
 			explicitBreakpointDecision,
 			orchestrationAdmission,
+			orchestrationBasis,
 			filteredToolNames,
 			orchestrationDemotionObserved,
 			elapsedMsSinceRoot,

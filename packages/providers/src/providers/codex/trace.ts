@@ -25,6 +25,10 @@ import type {
 	AnthropicReasoningEffortSource,
 	ReasoningEffort,
 } from "@better-ccflare/openai-formats";
+import type {
+	OrchestrationAdmission,
+	OrchestrationAdmissionBasis,
+} from "./orchestration-election";
 
 export const CODEX_TRACE_DIR_ENV = "CCFLARE_CODEX_TRACE_DIR";
 export const CODEX_TRACE_FULL_ENV = "CCFLARE_CODEX_TRACE_FULL";
@@ -32,7 +36,7 @@ export const CODEX_TRACE_HMAC_KEY_ENV = "CCFLARE_CODEX_TRACE_HMAC_KEY";
 /** Warn when one response spawns at least this many subagents (0 disables). */
 export const CODEX_FANOUT_WARN_ENV = "CCFLARE_CODEX_FANOUT_WARN";
 
-const TRACE_SCHEMA_VERSION = 12;
+const TRACE_SCHEMA_VERSION = 13;
 const DEFAULT_FANOUT_WARN = 8;
 const MAX_INPUT_ITEM_FINGERPRINTS = 64;
 /**
@@ -233,13 +237,22 @@ interface TraceInputs {
 	pacingAction?: string | null;
 	instructions?: string;
 	isDescendant?: boolean;
-	orchestrationAdmission?:
-		| "root"
-		| "non_root"
-		| "no_session"
-		| "no_conversation"
-		| "no_orchestration_tools"
-		| "disabled";
+	/**
+	 * Reuses the OrchestrationAdmission union from orchestration-election.ts
+	 * (type-only import) rather than duplicating it here, so
+	 * "attributed_descendant" is a first-class member without a cast at any
+	 * call site.
+	 */
+	orchestrationAdmission?: OrchestrationAdmission;
+	/**
+	 * Categorical reasoning basis behind orchestrationAdmission, when an
+	 * election actually ran ("initial_claim" | "identity_match" |
+	 * "lineage_match" | "rejected"; see OrchestrationAdmissionBasis in
+	 * orchestration-election.ts). Null when no election ran at all (e.g.
+	 * no_orchestration_tools, attributed_descendant, disabled, no_session,
+	 * no_conversation). Introduced in schema 13; a missing value writes null.
+	 */
+	orchestrationBasis?: OrchestrationAdmissionBasis | null;
 	toolsBeforeCount?: number;
 	filteredToolNames?: readonly string[];
 	/**
@@ -391,6 +404,7 @@ export function writeCodexTrace(inputs: TraceInputs): void {
 		is_descendant: inputs.isDescendant ?? false,
 		orchestration_admission:
 			inputs.orchestrationAdmission ?? "no_orchestration_tools",
+		orchestration_basis: inputs.orchestrationBasis ?? null,
 		orchestration_demotion_observed:
 			inputs.orchestrationDemotionObserved ?? null,
 		elapsed_ms_since_root: inputs.elapsedMsSinceRoot ?? null,
