@@ -121,6 +121,7 @@ async function buildFleetResponse(
 ): Promise<FleetUsageHistoryResponse> {
 	const accounts = await context.dbOps.getAllAccounts();
 	const results: FleetAccountUsageSeries[] = [];
+	const failedAccounts: string[] = [];
 
 	// Bucket in SQL so database work is bounded BEFORE rows leave the DB
 	// (pro-gate finding): bucket width targets <=MAX_FLEET_POINTS_PER_SERIES
@@ -146,10 +147,13 @@ async function buildFleetResponse(
 		} catch (error) {
 			// One account's transient failure must not 500 the whole fleet
 			// response — that would also let layered client retries replay the
-			// entire sequential fan-out. Log, skip, serve a partial fleet.
+			// entire sequential fan-out. Log, skip, serve a partial fleet and
+			// SAY it is partial so an outage is distinguishable from absent
+			// snapshots (pro-gate finding).
 			log.warn(
 				`Fleet usage history: query failed for account ${account.name}, skipping: ${error}`,
 			);
+			failedAccounts.push(account.name);
 			continue;
 		}
 		if (rows.length === 0) continue; // no snapshots in range — skip entirely
@@ -168,5 +172,10 @@ async function buildFleetResponse(
 		});
 	}
 
-	return { range: opts.range, accounts: results };
+	return {
+		range: opts.range,
+		accounts: results,
+		partial: failedAccounts.length > 0,
+		failedAccounts,
+	};
 }

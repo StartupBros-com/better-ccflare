@@ -200,24 +200,22 @@ export function extractUsageWindows(
 		const v = value as {
 			utilization?: unknown;
 			percentage?: unknown;
-			percentUsed?: unknown;
 			resets_at?: unknown;
 			resetAt?: unknown;
 		};
-		// Tolerant window matcher: anthropic/codex/xai use
-		// {utilization, resets_at: ISO}; minimax uses {utilization, resetAt: ms};
-		// zai limits use {percentage, resetAt: ms}; nanogpt/alibaba use
-		// {percentUsed, ...}. One matcher keeps every polled provider's
-		// percent-shaped windows alert-eligible (pro-gate finding: alerts were
-		// wired only for refresh-backed providers).
+		// Tolerant window matcher for VERIFIED 0-100 percent shapes only:
+		// anthropic/codex/xai use {utilization, resets_at: ISO}; minimax uses
+		// {utilization, resetAt: ms}; zai limits use {percentage, resetAt: ms}.
+		// Deliberately NOT matched: nanogpt/alibaba `percentUsed` (0-1 scale —
+		// reading it as 0-100 would silently never alert) and kilo's scalar
+		// credits. Those need a real per-provider normalizer feeding BOTH
+		// history and alerts — tracked as a follow-up issue.
 		const utilization =
 			typeof v.utilization === "number"
 				? v.utilization
 				: typeof v.percentage === "number"
 					? v.percentage
-					: typeof v.percentUsed === "number"
-						? v.percentUsed
-						: null;
+					: null;
 		if (utilization === null) continue;
 		if (!("resets_at" in v) && !("resetAt" in v)) continue;
 		let resetsAtMs: number | null = null;
@@ -689,23 +687,14 @@ export class AlertService {
 		// instant sits near a half-minute boundary — treat an alert already
 		// persisted in an adjacent bucket as the same cycle so a
 		// boundary-straddling jitter cannot double-fire (review finding,
-		// corroborated cross-model).
-		if (await this.usageWindowNeighborBucketExists(alert.id)) return;
-		await this.persistAndEmit(alert, webhookUrl);
-	}
-
-	private async usageWindowNeighborBucketExists(
-		alertId: string,
-	): Promise<boolean> {
-		const m = alertId.match(/^(.*):(-?\d+)$/);
-		if (!m) return false;
-		const [, prefix, bucketStr] = m;
-		const bucket = Number(bucketStr);
-		const rows = await this.db.query<{ id: string }>(
-			`SELECT id FROM alerts WHERE id IN (?, ?) LIMIT 1`,
-			[`${prefix}:${bucket - 1}`, `${prefix}:${bucket + 1}`],
-		);
-		return rows.length > 0;
+		// corroborated cross-model). The guard rides INSIDE the insert
+		// statement (WHERE NOT EXISTS) so it holds under one snapshot rather
+		// than a raceable check-then-insert (pro-gate round-3 finding).
+		const m = alert.id.match(/^(.*):(-?\d+)$/);
+		const neighborIds = m
+			? [`${m[1]}:${Number(m[2]) - 1}`, `${m[1]}:${Number(m[2]) + 1}`]
+			: [];
+		await this.persistAndEmit(alert, webhookUrl, neighborIds);
 	}
 
 	private buildUsageWindowThresholdAlert(
@@ -1110,6 +1099,7 @@ export class AlertService {
 	private async persistAndEmit(
 		alert: AlertEvent,
 		webhookUrl: string,
+		suppressIfExistingIds: string[] = [],
 	): Promise<void> {
 		try {
 			// INSERT OR IGNORE is SQLite-only; PostgreSQL uses ON CONFLICT DO NOTHING.
@@ -1120,12 +1110,26 @@ export class AlertService {
 			// The unique alert ID is the cooldown guard. Only the caller whose insert
 			// actually wins may emit SSE or deliver the webhook; checking first would
 			// leave a race in which concurrent duplicates both deliver notifications.
+			//
+			// suppressIfExistingIds extends the guard to RELATED ids (the
+			// usage-window adjacent jitter buckets): the existence check rides
+			// inside the INSERT ... SELECT statement so it evaluates under the
+			// same snapshot as the insert instead of a separate, raceable
+			// pre-check.
+			const suppressClause =
+				suppressIfExistingIds.length > 0
+					? `WHERE NOT EXISTS (SELECT 1 FROM alerts WHERE id IN (${suppressIfExistingIds.map(() => "?").join(", ")}))`
+					: "";
+			const valuesSource =
+				suppressIfExistingIds.length > 0
+					? `SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? ${suppressClause}`
+					: "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 			const inserted = await this.db.runWithChanges(
 				`
 				${conflictClause} INTO alerts (
 					id, timestamp, type, severity, title, message, value, threshold,
 					account, model, project, request_id, acknowledged
-				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				) ${valuesSource}
 				${onConflictClause}
 			`,
 				[
@@ -1142,6 +1146,7 @@ export class AlertService {
 					alert.project,
 					alert.requestId,
 					alert.acknowledged ? 1 : 0,
+					...suppressIfExistingIds,
 				],
 			);
 			if (inserted === 0) return;

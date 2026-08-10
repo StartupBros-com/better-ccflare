@@ -64,4 +64,9 @@ export interface FleetAccountUsageSeries {
 export interface FleetUsageHistoryResponse {
 	range: string;
 	accounts: FleetAccountUsageSeries[];
+	/** True when at least one account's history query failed and was skipped
+	 * — the response is a partial fleet, not an authoritative empty state. */
+	partial: boolean;
+	/** Names of accounts whose queries failed (empty when partial is false). */
+	failedAccounts: string[];
 }
