@@ -1062,6 +1062,7 @@ class UsageCache {
 					} = await import("./nanogpt-usage-fetcher");
 
 					this.setAuthoritative(accountId, data);
+					this.notifySnapshot(accountId, data);
 					const utilization = getRepresentativeNanoGPTUtilization(
 						data as NanoGPTUsageData,
 					);
@@ -1087,6 +1088,7 @@ class UsageCache {
 					if (callback)
 						this.notifyWindowReset(accountId, data, "zai", callback);
 					this.setAuthoritative(accountId, data);
+					this.notifySnapshot(accountId, data);
 					const utilization = getRepresentativeZaiUtilization(
 						data as ZaiUsageData,
 					);
@@ -1101,6 +1103,7 @@ class UsageCache {
 				data = await fetchKiloUsageData(token);
 				if (data) {
 					this.setAuthoritative(accountId, data);
+					this.notifySnapshot(accountId, data);
 					const utilization = getRepresentativeKiloUtilization(
 						data as KiloUsageData,
 					);
@@ -1115,6 +1118,7 @@ class UsageCache {
 				data = await fetchAlibabaCodingPlanUsageData(token);
 				if (data) {
 					this.setAuthoritative(accountId, data);
+					this.notifySnapshot(accountId, data);
 					const utilization = getRepresentativeAlibabaCodingPlanUtilization(
 						data as AlibabaCodingPlanUsageData,
 					);
@@ -1134,6 +1138,7 @@ class UsageCache {
 					if (callback)
 						this.notifyWindowReset(accountId, data, "xai", callback);
 					this.setAuthoritative(accountId, data);
+					this.notifySnapshot(accountId, data);
 					const utilization = getRepresentativeXaiUtilization(
 						data as XaiUsageData,
 					);
@@ -1151,6 +1156,7 @@ class UsageCache {
 					if (callback)
 						this.notifyWindowReset(accountId, data, "minimax", callback);
 					this.cache.set(accountId, { data, timestamp: Date.now() });
+					this.notifySnapshot(accountId, data);
 					const utilization = getRepresentativeMinimaxUtilization(
 						data as MinimaxUsageData,
 					);
@@ -1180,8 +1186,7 @@ class UsageCache {
 					if (callback)
 						this.notifyWindowReset(accountId, result.data, "codex", callback);
 					this.setAuthoritative(accountId, result.data);
-					const snapshotCb = this.snapshotCallbacks.get(accountId);
-					if (snapshotCb) snapshotCb(accountId, result.data as UsageData);
+					this.notifySnapshot(accountId, result.data);
 					const utilization = getRepresentativeUtilization(
 						result.data as UsageData,
 					);
@@ -1223,8 +1228,7 @@ class UsageCache {
 							callback,
 						);
 					this.setAuthoritative(accountId, result.data);
-					const snapshotCb = this.snapshotCallbacks.get(accountId);
-					if (snapshotCb) snapshotCb(accountId, result.data as UsageData);
+					this.notifySnapshot(accountId, result.data);
 					const utilization = getRepresentativeUtilization(
 						result.data as UsageData,
 					);
@@ -1489,6 +1493,18 @@ class UsageCache {
 	clearReactiveScopedDepletions(accountId: string): void {
 		this.modelScopedDepletions.delete(accountId);
 		this.familyScopedDepletions.delete(accountId);
+	}
+
+	/**
+	 * Single dispatch point for successful-poll snapshots: history
+	 * persistence and usage-window alert evaluation ride this callback for
+	 * EVERY provider. Per-branch inline dispatch left the API-key providers
+	 * (nanogpt/zai/kilo/alibaba/minimax) silently unwired — the callback was
+	 * registered but never invoked for them (pro-gate finding).
+	 */
+	private notifySnapshot(accountId: string, data: AnyUsageData): void {
+		const snapshotCb = this.snapshotCallbacks.get(accountId);
+		if (snapshotCb) snapshotCb(accountId, data as UsageData);
 	}
 
 	private setAuthoritative(accountId: string, data: AnyUsageData): void {

@@ -4,12 +4,14 @@ import {
 	type AuthFailureEvt,
 	alertEvents,
 	authFailureEvents,
+	computeWindowStartMs,
 	getModelFamily,
 	getModelRates,
 	isValidModelId,
 	LATEST_MODEL_BY_FAMILY,
 	type RequestEvt,
 	requestEvents,
+	weeklyScopedWindowKey,
 } from "@better-ccflare/core";
 import type { BunSqlAdapter } from "@better-ccflare/database";
 import { Logger } from "@better-ccflare/logger";
@@ -17,6 +19,7 @@ import type {
 	AlertEvent,
 	AlertsConfigPayload,
 	AlertType,
+	PredictionPoint,
 	RequestResponse,
 	RunawayLoopGroup,
 } from "@better-ccflare/types";
@@ -25,10 +28,22 @@ import {
 	buildAnomalyInsightsResponse,
 	sanitizeProjectForDisplay,
 } from "./anomaly-insights";
+import { computeUsagePrediction } from "./usage-prediction";
 
 const log = new Logger("AlertsService");
 const HOUR_MS = 60 * 60 * 1000;
 const MAX_ANOMALY_ALERTS_PER_RUN = 25;
+/** Usage windows below this utilization are never worth projecting — too
+ * little signal, and a false-positive "exhaustion" alert on a near-empty
+ * window would train operators to ignore the channel. */
+const USAGE_WINDOW_EXHAUSTION_MIN_UTILIZATION = 50;
+/** Historical lookback bound when a window's fixed duration is unknown
+ * (computeWindowStartMs returns null for window keys outside
+ * FIXED_WINDOW_DURATION_MS, e.g. a provider-specific credits window). Covers
+ * the longest known fixed window (seven_day = 7d) plus slack; the
+ * segmentation inside computeUsagePrediction still cuts to the current
+ * window via resets_at, so over-fetching here is safe, just wasted rows. */
+const USAGE_WINDOW_HISTORY_FALLBACK_LOOKBACK_MS = 8 * 24 * 60 * 60 * 1000;
 
 interface AlertRow {
 	id: string;
@@ -54,6 +69,12 @@ interface TokensPerHourRow {
 	total: number | null;
 }
 
+interface UsageSnapshotSqlRow {
+	timestamp: number;
+	utilization: number;
+	resets_at: number | null;
+}
+
 interface AnomalySqlRow {
 	id: string;
 	timestamp: number;
@@ -73,6 +94,7 @@ export function getAlertsConfig(config: Config): AlertsConfigPayload {
 		dailySpendUsd: config.getAlertDailySpendUsd(),
 		tokensPerHour: config.getAlertTokensPerHour(),
 		requestTokens: config.getAlertRequestTokens(),
+		usageWindowThresholdPercent: config.getAlertUsageWindowThresholdPercent(),
 		anomalyEnabled: config.getAlertAnomalyEnabled(),
 		anomalyIntervalMinutes: config.getAlertAnomalyIntervalMinutes(),
 		loopMinRequests: config.getAlertAnomalyLoopMinRequests(),
@@ -92,6 +114,9 @@ export function setAlertsConfig(
 	config.setAlertDailySpendUsd(payload.dailySpendUsd);
 	config.setAlertTokensPerHour(payload.tokensPerHour);
 	config.setAlertRequestTokens(payload.requestTokens);
+	config.setAlertUsageWindowThresholdPercent(
+		payload.usageWindowThresholdPercent,
+	);
 	config.setAlertAnomalyEnabled(payload.anomalyEnabled);
 	config.setAlertAnomalyIntervalMinutes(payload.anomalyIntervalMinutes);
 	config.setAlertAnomalyLoopMinRequests(payload.loopMinRequests);
@@ -122,6 +147,145 @@ export function buildRunawayLoopAlertId(
 		loop.windowEndMs,
 		cooldownMinutes,
 	);
+}
+
+/** One usage window as reported by a provider's usage payload (mirrors the
+ * `{ utilization, resets_at }` shape recognized by usage-history.repository.ts's
+ * isWindow, so a window that lands in usage_snapshots is exactly the set this
+ * also evaluates). `resetsAtMs` is null when `resets_at` is absent, null, or
+ * unparseable. */
+export interface ExtractedUsageWindow {
+	windowKey: string;
+	utilization: number;
+	resetsAtMs: number | null;
+}
+
+/**
+ * Maps a `limits[]` entry to the internal window_key. MUST stay in lockstep
+ * with `limitWindowKey` in usage-history.repository.ts — the alert evaluator
+ * and the history recorder must agree on which windows exist, or an account
+ * gets a window persisted and charted but never alerted on (the exact gap
+ * this shared mapping closes).
+ */
+function alertLimitWindowKey(limit: {
+	kind?: string;
+	scope?: { model?: { display_name?: string } | null } | null;
+}): string | null {
+	if (limit.kind === "session") return "five_hour";
+	if (limit.kind === "weekly_all") return "seven_day";
+	if (limit.kind === "weekly_scoped") {
+		const name = limit.scope?.model?.display_name?.trim();
+		return name ? weeklyScopedWindowKey(name) : null;
+	}
+	return null;
+}
+
+/**
+ * Pulls every usage window out of a raw usage snapshot payload: the flat
+ * `{ utilization: number, resets_at: ... }`-shaped entries (Anthropic's
+ * five_hour/seven_day/..., Codex's mirrored shape, xAI's nested `credits`)
+ * AND the generic `limits[]` array (session/weekly_all/weekly_scoped) that
+ * limits-only Anthropic payloads carry INSTEAD of flat windows. The set of
+ * windows this returns matches what usage-history.repository.ts records, so
+ * everything persisted/charted is also alert-eligible.
+ */
+export function extractUsageWindows(
+	usage: Record<string, unknown>,
+): ExtractedUsageWindow[] {
+	const windows: ExtractedUsageWindow[] = [];
+	const seen = new Set<string>();
+	for (const [windowKey, value] of Object.entries(usage)) {
+		if (typeof value !== "object" || value === null || Array.isArray(value))
+			continue;
+		const v = value as {
+			utilization?: unknown;
+			percentage?: unknown;
+			resets_at?: unknown;
+			resetAt?: unknown;
+		};
+		// Tolerant window matcher for VERIFIED 0-100 percent shapes only:
+		// anthropic/codex/xai use {utilization, resets_at: ISO}; minimax uses
+		// {utilization, resetAt: ms}; zai limits use {percentage, resetAt: ms}.
+		// Deliberately NOT matched: nanogpt/alibaba `percentUsed` (0-1 scale —
+		// reading it as 0-100 would silently never alert) and kilo's scalar
+		// credits. Those need a real per-provider normalizer feeding BOTH
+		// history and alerts — tracked as a follow-up issue.
+		const utilization =
+			typeof v.utilization === "number"
+				? v.utilization
+				: typeof v.percentage === "number"
+					? v.percentage
+					: null;
+		if (utilization === null) continue;
+		if (!("resets_at" in v) && !("resetAt" in v)) continue;
+		let resetsAtMs: number | null = null;
+		if (typeof v.resets_at === "string") {
+			const ms = new Date(v.resets_at).getTime();
+			resetsAtMs = Number.isFinite(ms) ? ms : null;
+		} else if (typeof v.resetAt === "number" && Number.isFinite(v.resetAt)) {
+			resetsAtMs = v.resetAt;
+		}
+		windows.push({ windowKey, utilization, resetsAtMs });
+		seen.add(windowKey);
+	}
+	const limits = (usage as { limits?: unknown }).limits;
+	if (Array.isArray(limits)) {
+		for (const limit of limits) {
+			if (typeof limit !== "object" || limit === null || !("kind" in limit))
+				continue;
+			const l = limit as {
+				kind?: string;
+				percent?: unknown;
+				resets_at?: unknown;
+				scope?: { model?: { display_name?: string } | null } | null;
+			};
+			if (typeof l.percent !== "number") continue;
+			const windowKey = alertLimitWindowKey(l);
+			// Skip unmapped kinds and windows already present as flat entries
+			// (no double-evaluation of five_hour/seven_day).
+			if (!windowKey || seen.has(windowKey)) continue;
+			let resetsAtMs: number | null = null;
+			if (typeof l.resets_at === "string") {
+				const ms = new Date(l.resets_at).getTime();
+				resetsAtMs = Number.isFinite(ms) ? ms : null;
+			}
+			windows.push({ windowKey, utilization: l.percent, resetsAtMs });
+			seen.add(windowKey);
+		}
+	}
+	return windows;
+}
+
+/**
+ * Dedup key for the two usage-window alert types. Deliberately NOT bucketed
+ * by cooldown-minutes like buildThresholdAlertId: a usage window's resets_at
+ * is stable for the entire life of the window (polls run every ~90s but
+ * resets_at only changes when the window actually rolls over), so keying
+ * directly on resetsAtMs already gives exactly the required semantics —
+ * fires once per (account, window, cycle), and re-arms the instant resets_at
+ * advances to the next cycle.
+ */
+export function buildUsageWindowAlertId(
+	type: "usage_window_threshold" | "usage_window_exhaustion_projected",
+	accountId: string,
+	windowKey: string,
+	resetsAtMs: number,
+	/**
+	 * Escalation stage within the cycle. Without it, a warning at 90%
+	 * consumes the cycle's one id and the later 100% critical escalation is
+	 * silently deduped away (pro-gate finding). Threshold alerts pass
+	 * "warning" | "critical"; the projection type has a single stage.
+	 */
+	stage = "single",
+): string {
+	// Bucket to the nearest minute: providers recompute resets_at per
+	// response and it jitters by fractions of a second around the same
+	// instant (measured: 1554 of 1564 apparent advances were <2s jitter —
+	// see WINDOW_RESET_MIN_ADVANCE_MS in usage-fetcher.ts). Keying on the
+	// raw ms would re-fire the alert on nearly every poll; a real rollover
+	// advances by hours, which always lands in a new bucket.
+	const resetsAtMinuteBucket = Math.round(resetsAtMs / 60_000);
+	return `${type}:${stage}:${accountId}:${windowKey}:${resetsAtMinuteBucket}`;
 }
 
 function parseTimestamp(timestamp: string | number): number {
@@ -349,6 +513,11 @@ export class AlertService {
 	private readonly authFailureListener: (event: AuthFailureEvt) => void;
 	private readonly configChangeListener: ({ key }: { key: string }) => void;
 	private anomalyTimer: ReturnType<typeof setInterval> | null = null;
+	/** Last exhaustion-projection evaluation per `${accountId}:${windowKey}`
+	 * — in-memory rate limit on the history+regression work (see
+	 * buildUsageWindowExhaustionAlert). Reset on restart is fine: one extra
+	 * evaluation per window is the worst case. */
+	private readonly usageWindowExhaustionEvalAt = new Map<string, number>();
 
 	constructor(db: BunSqlAdapter, config: Config) {
 		this.db = db;
@@ -446,6 +615,229 @@ export class AlertService {
 		for (const alert of alerts) {
 			await this.persistAndEmit(alert, config.webhookUrl);
 		}
+	}
+
+	/**
+	 * Evaluates a single usage-window poll for the two OnWatch alert types.
+	 * Called directly (not via an event bus) from the usage-polling onSnapshot
+	 * callback in apps/server/src/server.ts, once per account per poll
+	 * (~every 90s) — dedup against re-firing every poll happens entirely via
+	 * buildUsageWindowAlertId's resets_at-keyed id (see persistAndEmit's
+	 * INSERT OR IGNORE / ON CONFLICT DO NOTHING).
+	 */
+	async evaluateUsageSnapshot(
+		accountId: string,
+		accountName: string,
+		usage: Record<string, unknown>,
+		timestamp: number,
+	): Promise<void> {
+		const windows = extractUsageWindows(usage);
+		if (windows.length === 0) return;
+		const config = getAlertsConfig(this.config);
+		for (const window of windows) {
+			// A window with no resets_at has no cycle boundary to dedup against
+			// or project toward — skip it rather than risk firing every poll.
+			if (window.resetsAtMs == null) continue;
+			const resetsAtMs = window.resetsAtMs;
+			// Threshold alerts persist immediately, before any projection work:
+			// they do not depend on history, and a projection-query failure
+			// must not discard them (pro-gate finding).
+			const thresholdAlert = this.buildUsageWindowThresholdAlert(
+				accountId,
+				accountName,
+				window.windowKey,
+				window.utilization,
+				resetsAtMs,
+				config,
+				timestamp,
+			);
+			if (thresholdAlert) {
+				await this.persistUsageWindowAlert(thresholdAlert, config.webhookUrl);
+			}
+			// Projection is best-effort per window: a history lookup failing for
+			// one window must not cancel evaluation of the remaining windows.
+			try {
+				const exhaustionAlert = await this.buildUsageWindowExhaustionAlert(
+					accountId,
+					accountName,
+					window.windowKey,
+					window.utilization,
+					resetsAtMs,
+					timestamp,
+				);
+				if (exhaustionAlert) {
+					await this.persistUsageWindowAlert(
+						exhaustionAlert,
+						config.webhookUrl,
+					);
+				}
+			} catch (error) {
+				log.warn(
+					`Usage-window exhaustion projection failed for ${accountName}/${window.windowKey}: ${error}`,
+				);
+			}
+		}
+	}
+
+	private async persistUsageWindowAlert(
+		alert: AlertEvent,
+		webhookUrl: string,
+	): Promise<void> {
+		// Jitter <2s can move the minute bucket by exactly one when the reset
+		// instant sits near a half-minute boundary — treat an alert already
+		// persisted in an adjacent bucket as the same cycle so a
+		// boundary-straddling jitter cannot double-fire (review finding,
+		// corroborated cross-model). The guard rides INSIDE the insert
+		// statement (WHERE NOT EXISTS) so it holds under one snapshot rather
+		// than a raceable check-then-insert (pro-gate round-3 finding).
+		const m = alert.id.match(/^(.*):(-?\d+)$/);
+		const neighborIds = m
+			? [`${m[1]}:${Number(m[2]) - 1}`, `${m[1]}:${Number(m[2]) + 1}`]
+			: [];
+		await this.persistAndEmit(alert, webhookUrl, neighborIds);
+	}
+
+	private buildUsageWindowThresholdAlert(
+		accountId: string,
+		accountName: string,
+		windowKey: string,
+		utilization: number,
+		resetsAtMs: number,
+		config: AlertsConfigPayload,
+		timestamp: number,
+	): AlertEvent | null {
+		if (!shouldFireAlert(config.usageWindowThresholdPercent, utilization)) {
+			return null;
+		}
+		// 100% is a hard cap (the window is fully exhausted, not just past a
+		// soft threshold) — operationally worse than crossing the configured
+		// percent, so it earns critical AND its own dedup stage: the earlier
+		// warning must not consume the cycle's only id and silently swallow
+		// the escalation (pro-gate finding).
+		const stage = utilization >= 100 ? "critical" : "warning";
+		return {
+			id: buildUsageWindowAlertId(
+				"usage_window_threshold",
+				accountId,
+				windowKey,
+				resetsAtMs,
+				stage,
+			),
+			timestamp,
+			type: "usage_window_threshold",
+			severity: stage,
+			title: "Usage window threshold exceeded",
+			message: `Account ${accountName}'s ${windowKey} usage window reached ${utilization.toFixed(1)}%, meeting the configured ${config.usageWindowThresholdPercent}% threshold.`,
+			value: utilization,
+			threshold: config.usageWindowThresholdPercent,
+			account: accountName,
+			model: null,
+			project: null,
+			requestId: null,
+			acknowledged: false,
+		};
+	}
+
+	private async buildUsageWindowExhaustionAlert(
+		accountId: string,
+		accountName: string,
+		windowKey: string,
+		utilization: number,
+		resetsAtMs: number,
+		timestamp: number,
+	): Promise<AlertEvent | null> {
+		if (utilization < USAGE_WINDOW_EXHAUSTION_MIN_UTILIZATION) return null;
+		if (utilization >= 100) {
+			// Factual exhaustion needs no projection (and no history query) —
+			// and it carries its own dedup stage: an earlier "projected" alert
+			// must not conflict-ignore the actual exhaustion, which would
+			// otherwise leave the stored alert a mere prediction (pro-gate
+			// round-2 finding).
+			return {
+				id: buildUsageWindowAlertId(
+					"usage_window_exhaustion_projected",
+					accountId,
+					windowKey,
+					resetsAtMs,
+					"exhausted",
+				),
+				timestamp,
+				type: "usage_window_exhaustion_projected",
+				severity: "critical",
+				title: "Usage window exhausted",
+				message: `Account ${accountName}'s ${windowKey} usage window is fully exhausted (${utilization.toFixed(1)}%). It resets at ${new Date(resetsAtMs).toISOString()}.`,
+				value: utilization,
+				threshold: null,
+				account: accountName,
+				model: null,
+				project: null,
+				requestId: null,
+				acknowledged: false,
+			};
+		}
+		// Rate-limit the history+regression work per (account, window): at the
+		// supported 10s poll interval a per-poll re-aggregation of the raw
+		// cycle is quadratic over the window's life (pro-gate finding). One
+		// evaluation per bucket width loses no fidelity — the regression input
+		// is 5-minute-bucketed anyway.
+		const evalKey = `${accountId}:${windowKey}`;
+		const lastEvalAt = this.usageWindowExhaustionEvalAt.get(evalKey);
+		if (lastEvalAt != null && timestamp - lastEvalAt < 4.5 * 60 * 1000) {
+			return null;
+		}
+		this.usageWindowExhaustionEvalAt.set(evalKey, timestamp);
+		const windowStartMs =
+			computeWindowStartMs(resetsAtMs, windowKey) ??
+			timestamp - USAGE_WINDOW_HISTORY_FALLBACK_LOOKBACK_MS;
+		// Bound the query at `timestamp` so the current poll is represented
+		// EXACTLY once regardless of insert/evaluate ordering: on SQLite the
+		// caller's un-awaited recordUsageSnapshot commits synchronously before
+		// this SELECT runs, and reading that row PLUS the push below would
+		// double-count the current point and bias the regression (pro-gate
+		// cross-model finding).
+		//
+		// Aggregate into 5-minute buckets (last sample time, mean utilization)
+		// so the regression input is bounded (~2016 rows for a 7d window) even
+		// at the supported 10s poll interval — re-reading every raw row per
+		// poll is quadratic over the cycle (pro-gate finding). Integer
+		// division truncates identically on SQLite and Postgres.
+		const rows = await this.db.query<UsageSnapshotSqlRow>(
+			`SELECT MAX(timestamp) AS timestamp, AVG(utilization) AS utilization, MAX(resets_at) AS resets_at
+			 FROM usage_snapshots
+			 WHERE account_id = ? AND window_key = ? AND timestamp >= ? AND timestamp < ?
+			 GROUP BY timestamp / 300000
+			 ORDER BY MAX(timestamp) ASC`,
+			[accountId, windowKey, windowStartMs, timestamp],
+		);
+		const points: PredictionPoint[] = rows.map((row) => ({
+			t: Number(row.timestamp),
+			utilization: Number(row.utilization),
+			resetsAt: row.resets_at == null ? null : Number(row.resets_at),
+		}));
+		points.push({ t: timestamp, utilization, resetsAt: resetsAtMs });
+		const prediction = computeUsagePrediction(points);
+		if (!prediction.willExhaustBeforeReset) return null;
+		return {
+			id: buildUsageWindowAlertId(
+				"usage_window_exhaustion_projected",
+				accountId,
+				windowKey,
+				resetsAtMs,
+				"projected",
+			),
+			timestamp,
+			type: "usage_window_exhaustion_projected",
+			severity: "critical",
+			title: "Usage window projected to exhaust before reset",
+			message: `Account ${accountName}'s ${windowKey} usage window is at ${utilization.toFixed(1)}% and trending toward exhaustion (${prediction.slopePerHour.toFixed(1)}pp/hr) before it resets at ${new Date(resetsAtMs).toISOString()}.`,
+			value: utilization,
+			threshold: null,
+			account: accountName,
+			model: null,
+			project: null,
+			requestId: null,
+			acknowledged: false,
+		};
 	}
 
 	async listAlerts(limit = 100): Promise<AlertEvent[]> {
@@ -707,6 +1099,7 @@ export class AlertService {
 	private async persistAndEmit(
 		alert: AlertEvent,
 		webhookUrl: string,
+		suppressIfExistingIds: string[] = [],
 	): Promise<void> {
 		try {
 			// INSERT OR IGNORE is SQLite-only; PostgreSQL uses ON CONFLICT DO NOTHING.
@@ -717,12 +1110,26 @@ export class AlertService {
 			// The unique alert ID is the cooldown guard. Only the caller whose insert
 			// actually wins may emit SSE or deliver the webhook; checking first would
 			// leave a race in which concurrent duplicates both deliver notifications.
+			//
+			// suppressIfExistingIds extends the guard to RELATED ids (the
+			// usage-window adjacent jitter buckets): the existence check rides
+			// inside the INSERT ... SELECT statement so it evaluates under the
+			// same snapshot as the insert instead of a separate, raceable
+			// pre-check.
+			const suppressClause =
+				suppressIfExistingIds.length > 0
+					? `WHERE NOT EXISTS (SELECT 1 FROM alerts WHERE id IN (${suppressIfExistingIds.map(() => "?").join(", ")}))`
+					: "";
+			const valuesSource =
+				suppressIfExistingIds.length > 0
+					? `SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? ${suppressClause}`
+					: "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 			const inserted = await this.db.runWithChanges(
 				`
 				${conflictClause} INTO alerts (
 					id, timestamp, type, severity, title, message, value, threshold,
 					account, model, project, request_id, acknowledged
-				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				) ${valuesSource}
 				${onConflictClause}
 			`,
 				[
@@ -739,6 +1146,7 @@ export class AlertService {
 					alert.project,
 					alert.requestId,
 					alert.acknowledged ? 1 : 0,
+					...suppressIfExistingIds,
 				],
 			);
 			if (inserted === 0) return;

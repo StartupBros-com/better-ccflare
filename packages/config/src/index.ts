@@ -853,6 +853,7 @@ export interface ConfigData {
 	alert_daily_spend_usd?: number;
 	alert_tokens_per_hour?: number;
 	alert_request_tokens?: number;
+	alert_usage_window_threshold_percent?: number;
 	alert_anomaly_enabled?: boolean;
 	alert_anomaly_interval_minutes?: number;
 	alert_anomaly_loop_min_requests?: number;
@@ -1555,6 +1556,21 @@ export class Config extends EventEmitter {
 		this.set("alert_request_tokens", this.clamp(value, 0, 1_000_000_000));
 	}
 
+	getAlertUsageWindowThresholdPercent(): number {
+		const fromEnv = process.env.ALERT_USAGE_WINDOW_THRESHOLD_PERCENT;
+		if (fromEnv) {
+			const n = Number.parseFloat(fromEnv);
+			if (!Number.isNaN(n)) return this.clamp(n, 0, 100);
+		}
+		const fromFile = this.data.alert_usage_window_threshold_percent;
+		if (typeof fromFile === "number") return this.clamp(fromFile, 0, 100);
+		return 90;
+	}
+
+	setAlertUsageWindowThresholdPercent(value: number): void {
+		this.set("alert_usage_window_threshold_percent", this.clamp(value, 0, 100));
+	}
+
 	getAlertAnomalyEnabled(): boolean {
 		const fromEnv = parseEnabledEnvFlag(process.env.ALERT_ANOMALY_ENABLED);
 		if (fromEnv !== undefined) {
@@ -1691,6 +1707,8 @@ export class Config extends EventEmitter {
 			alert_daily_spend_usd: this.getAlertDailySpendUsd(),
 			alert_tokens_per_hour: this.getAlertTokensPerHour(),
 			alert_request_tokens: this.getAlertRequestTokens(),
+			alert_usage_window_threshold_percent:
+				this.getAlertUsageWindowThresholdPercent(),
 			alert_anomaly_enabled: this.getAlertAnomalyEnabled(),
 			alert_anomaly_interval_minutes: this.getAlertAnomalyIntervalMinutes(),
 			alert_anomaly_loop_min_requests: this.getAlertAnomalyLoopMinRequests(),

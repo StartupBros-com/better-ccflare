@@ -184,6 +184,26 @@ export function updateAccountMetadata(
 				newResetAt !== prevResetAt &&
 				new Date(newResetAt).getTime() > new Date(prevResetAt).getTime();
 
+			// Preserve polling-only extras (plan_type, credits_balance,
+			// code_review_*) across header-derived writes: headers never carry
+			// them, and a full replace makes the dashboard's plan badge, credit
+			// stat, and code-review row flap in and out on every proxied
+			// request until the next wham poll (cross-model review finding on
+			// PR #130). A later wham response refreshes or clears them.
+			if (prevUsage) {
+				const prev = prevUsage as Record<string, unknown>;
+				const merged = codexUsage as Record<string, unknown>;
+				for (const key of [
+					"plan_type",
+					"credits_balance",
+					"code_review_used_percent",
+					"code_review_resets_at",
+				]) {
+					if (prev[key] !== undefined && merged[key] === undefined) {
+						merged[key] = prev[key];
+					}
+				}
+			}
 			usageCache.set(account.id, codexUsage);
 			log.debug(
 				`Updated Codex usage cache for ${account.name}: 5h=${codexUsage.five_hour?.utilization ?? "?"}%, 7d=${codexUsage.seven_day?.utilization ?? "?"}%`,

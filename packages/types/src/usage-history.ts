@@ -37,3 +37,36 @@ export interface UsageHistoryResponse {
 	range: string;
 	windows: UsageHistoryWindowSeries[];
 }
+
+/**
+ * One window's points for one account in the fleet-wide (all-accounts) view.
+ * No per-window `prediction` — the fleet chart only plots raw series, and
+ * computing/predicting per account × window for every account would be
+ * unnecessary work for a payload nobody reads insight cards from.
+ */
+export interface FleetWindowSeries {
+	window: string;
+	points: PredictionPoint[];
+}
+
+/** One account's series in the fleet-wide usage history view. */
+export interface FleetAccountUsageSeries {
+	accountId: string;
+	accountName: string;
+	windows: FleetWindowSeries[];
+}
+
+/**
+ * Response for GET /api/usage-history?account=all (account omitted defaults
+ * to the same fleet view). One entry per account that has at least one
+ * snapshot in range — accounts with none are omitted entirely.
+ */
+export interface FleetUsageHistoryResponse {
+	range: string;
+	accounts: FleetAccountUsageSeries[];
+	/** True when at least one account's history query failed and was skipped
+	 * — the response is a partial fleet, not an authoritative empty state. */
+	partial: boolean;
+	/** Names of accounts whose queries failed (empty when partial is false). */
+	failedAccounts: string[];
+}

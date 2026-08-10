@@ -1015,6 +1015,7 @@ OAuth tokens will need to be re-authenticated.
 		windowKey?: string;
 		since?: number;
 		until?: number;
+		bucketMs?: number;
 	}) {
 		return this.usageHistory.getSeries(opts);
 	}

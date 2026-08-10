@@ -56,6 +56,17 @@ export interface GetSeriesOptions {
 	windowKey?: string;
 	since?: number;
 	until?: number;
+	/**
+	 * When set, aggregate rows into fixed time buckets IN SQL (bucket-start
+	 * timestamp, mean utilization, max resets_at per window_key+bucket)
+	 * instead of returning every raw row. Bounds database work, memory, and
+	 * payload for wide ranges — a 30d fleet read at a 10s poll interval
+	 * would otherwise materialize hundreds of thousands of rows per window
+	 * before any JS-side downsampling (pro-gate finding). Bucket-start
+	 * timestamps are grid-aligned, so series from different accounts share
+	 * row keys when merged.
+	 */
+	bucketMs?: number;
 }
 
 export class UsageHistoryRepository extends BaseRepository<UsageSnapshotRow> {
@@ -127,26 +138,51 @@ export class UsageHistoryRepository extends BaseRepository<UsageSnapshotRow> {
 
 	async getSeries(opts: GetSeriesOptions): Promise<UsageSnapshotRow[]> {
 		const clauses = ["account_id = ?"];
-		const params: unknown[] = [opts.accountId];
+		const whereParams: unknown[] = [opts.accountId];
 		if (opts.windowKey) {
 			clauses.push("window_key = ?");
-			params.push(opts.windowKey);
+			whereParams.push(opts.windowKey);
 		}
 		if (opts.since != null) {
 			clauses.push("timestamp >= ?");
-			params.push(opts.since);
+			whereParams.push(opts.since);
 		}
 		if (opts.until != null) {
 			clauses.push("timestamp <= ?");
-			params.push(opts.until);
+			whereParams.push(opts.until);
 		}
-		const rows = await this.query<SnapshotDbRow>(
-			`SELECT account_id, timestamp, window_key, utilization, resets_at
-			 FROM usage_snapshots
-			 WHERE ${clauses.join(" AND ")}
-			 ORDER BY timestamp ASC`,
-			params,
-		);
+		const bucketMs =
+			opts.bucketMs != null && opts.bucketMs > 0
+				? Math.round(opts.bucketMs)
+				: null;
+		// Integer division truncates identically on SQLite and Postgres, so
+		// the bucketed variant runs unchanged on both adapters.
+		// The bucket expression is computed ONCE in a subquery and grouped by
+		// its alias: repeating `timestamp / ?` in SELECT and GROUP BY binds
+		// DISTINCT parameters after placeholder conversion ($1 vs $n), and
+		// PostgreSQL does not recognize those as the same grouping expression
+		// — every bucketed query would raise an ungrouped-column error
+		// (pro-gate finding).
+		const rows = bucketMs
+			? await this.query<SnapshotDbRow>(
+					`SELECT account_id, bucket * ? AS timestamp, window_key,
+					        AVG(utilization) AS utilization, MAX(resets_at) AS resets_at
+					 FROM (
+					   SELECT account_id, timestamp / ? AS bucket, window_key, utilization, resets_at
+					   FROM usage_snapshots
+					   WHERE ${clauses.join(" AND ")}
+					 ) bucketed
+					 GROUP BY account_id, window_key, bucket
+					 ORDER BY timestamp ASC`,
+					[bucketMs, bucketMs, ...whereParams],
+				)
+			: await this.query<SnapshotDbRow>(
+					`SELECT account_id, timestamp, window_key, utilization, resets_at
+					 FROM usage_snapshots
+					 WHERE ${clauses.join(" AND ")}
+					 ORDER BY timestamp ASC`,
+					whereParams,
+				);
 		return rows.map((r) => ({
 			accountId: r.account_id,
 			timestamp: Number(r.timestamp),
