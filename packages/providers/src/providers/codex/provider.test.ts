@@ -2329,6 +2329,353 @@ describe("CodexProvider.processResponse", () => {
 		]);
 	});
 
+	it("strips a schema-confirmed-empty optional string param from non-streaming tool_use input (refs #133)", async () => {
+		const provider = new CodexProvider();
+		const requestId = "req_non_stream_enterworktree_empty_name";
+		const originalRequest = new Request("https://example.test/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"x-better-ccflare-request-id": requestId,
+			},
+			body: JSON.stringify({
+				model: "claude-sonnet-4-5",
+				max_tokens: 16,
+				stream: false,
+				tools: [
+					{
+						name: "EnterWorktree",
+						description: "Switch into a worktree",
+						input_schema: {
+							type: "object",
+							properties: {
+								name: { type: "string" },
+								path: { type: "string" },
+							},
+						},
+					},
+				],
+				messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+			}),
+		});
+		await provider.transformRequestBody(originalRequest);
+
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_tool", model: "gpt-5.4" },
+			}),
+			...eventLine("response.output_item.added", {
+				item: {
+					type: "function_call",
+					call_id: "call_1",
+					name: "EnterWorktree",
+				},
+				output_index: 0,
+			}),
+			...eventLine("response.function_call_arguments.delta", {
+				delta: '{"name":"","path":"/x/y"}',
+				output_index: 0,
+			}),
+			...eventLine("response.output_item.done", {
+				item: {
+					type: "function_call",
+					call_id: "call_1",
+					name: "EnterWorktree",
+				},
+				output_index: 0,
+			}),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.4",
+					usage: { input_tokens: 9, output_tokens: 4 },
+				},
+			}),
+		]);
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: {
+				"content-type": "text/event-stream",
+				"x-better-ccflare-request-id": requestId,
+				"x-better-ccflare-request-stream": "false",
+			},
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const payload = JSON.parse(await transformed.text()) as Record<
+			string,
+			unknown
+		>;
+		expect(payload.content).toEqual([
+			{
+				type: "tool_use",
+				id: "call_1",
+				name: "EnterWorktree",
+				input: { path: "/x/y" },
+			},
+		]);
+	});
+
+	it("strips a schema-confirmed-empty optional string param from streaming tool-call arguments (refs #133)", async () => {
+		const provider = new CodexProvider();
+		const requestId = "req_stream_enterworktree_empty_name";
+		const originalRequest = new Request("https://example.test/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"x-better-ccflare-request-id": requestId,
+			},
+			body: JSON.stringify({
+				model: "claude-sonnet-4-5",
+				max_tokens: 16,
+				stream: true,
+				tools: [
+					{
+						name: "EnterWorktree",
+						description: "Switch into a worktree",
+						input_schema: {
+							type: "object",
+							properties: {
+								name: { type: "string" },
+								path: { type: "string" },
+							},
+						},
+					},
+				],
+				messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+			}),
+		});
+		await provider.transformRequestBody(originalRequest);
+
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_test", model: "gpt-5.4" },
+			}),
+			...eventLine("response.output_item.added", {
+				item: {
+					type: "function_call",
+					call_id: "call_1",
+					name: "EnterWorktree",
+				},
+				output_index: 0,
+			}),
+			...eventLine("response.function_call_arguments.delta", {
+				delta: '{"name":"",',
+				output_index: 0,
+			}),
+			...eventLine("response.function_call_arguments.delta", {
+				delta: '"path":"/x/y"}',
+				output_index: 0,
+			}),
+			...eventLine("response.output_item.done", {
+				item: {
+					type: "function_call",
+					call_id: "call_1",
+					name: "EnterWorktree",
+				},
+				output_index: 0,
+			}),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.4",
+					usage: { input_tokens: 1, output_tokens: 1 },
+				},
+			}),
+		]);
+
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: {
+				"content-type": "text/event-stream",
+				"x-better-ccflare-request-id": requestId,
+				"x-better-ccflare-request-stream": "true",
+			},
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const transformedBody = await transformed.text();
+
+		expect(transformedBody).toContain(
+			'"partial_json":"{\\"path\\":\\"/x/y\\"}"',
+		);
+		expect(transformedBody).not.toContain('\\"name\\":\\"\\"');
+	});
+
+	it("strips null-valued tool-call arguments even without a registered schema", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_test", model: "gpt-5.4" },
+			}),
+			...eventLine("response.output_item.added", {
+				item: { type: "function_call", call_id: "call_1", name: "AnyTool" },
+				output_index: 0,
+			}),
+			...eventLine("response.function_call_arguments.delta", {
+				delta: '{"a":null,"b":"keep"}',
+				output_index: 0,
+			}),
+			...eventLine("response.output_item.done", {
+				item: { type: "function_call", call_id: "call_1", name: "AnyTool" },
+				output_index: 0,
+			}),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.4",
+					usage: { input_tokens: 1, output_tokens: 1 },
+				},
+			}),
+		]);
+
+		// requestId is never passed through transformRequestBody, so no schema
+		// is ever registered for it -- this isolates the unconditional
+		// null-strip behavior from the schema-confirmed empty-string strip.
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: {
+				"content-type": "text/event-stream",
+				"x-better-ccflare-request-id": "req_never_registered_null_strip",
+			},
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const transformedBody = await transformed.text();
+
+		expect(transformedBody).toContain('"partial_json":"{\\"b\\":\\"keep\\"}"');
+		expect(transformedBody).not.toContain('\\"a\\"');
+	});
+
+	it("keeps a schema-confirmed empty string when the key is required", async () => {
+		const provider = new CodexProvider();
+		const requestId = "req_non_stream_required_guard";
+		const originalRequest = new Request("https://example.test/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"x-better-ccflare-request-id": requestId,
+			},
+			body: JSON.stringify({
+				model: "claude-sonnet-4-5",
+				max_tokens: 16,
+				stream: false,
+				tools: [
+					{
+						name: "WriteNote",
+						description: "Write a note",
+						input_schema: {
+							type: "object",
+							properties: {
+								content: { type: "string" },
+							},
+							required: ["content"],
+						},
+					},
+				],
+				messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+			}),
+		});
+		await provider.transformRequestBody(originalRequest);
+
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_tool", model: "gpt-5.4" },
+			}),
+			...eventLine("response.output_item.added", {
+				item: { type: "function_call", call_id: "call_1", name: "WriteNote" },
+				output_index: 0,
+			}),
+			...eventLine("response.function_call_arguments.delta", {
+				delta: '{"content":""}',
+				output_index: 0,
+			}),
+			...eventLine("response.output_item.done", {
+				item: { type: "function_call", call_id: "call_1", name: "WriteNote" },
+				output_index: 0,
+			}),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.4",
+					usage: { input_tokens: 9, output_tokens: 4 },
+				},
+			}),
+		]);
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: {
+				"content-type": "text/event-stream",
+				"x-better-ccflare-request-id": requestId,
+				"x-better-ccflare-request-stream": "false",
+			},
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const payload = JSON.parse(await transformed.text()) as Record<
+			string,
+			unknown
+		>;
+		expect(payload.content).toEqual([
+			{
+				type: "tool_use",
+				id: "call_1",
+				name: "WriteNote",
+				input: { content: "" },
+			},
+		]);
+	});
+
+	it("keeps empty-string tool-call arguments on a schema cache miss (planted negative, refs #133)", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_test", model: "gpt-5.4" },
+			}),
+			...eventLine("response.output_item.added", {
+				item: {
+					type: "function_call",
+					call_id: "call_1",
+					name: "EnterWorktree",
+				},
+				output_index: 0,
+			}),
+			...eventLine("response.function_call_arguments.delta", {
+				delta: '{"name":"","path":"/x"}',
+				output_index: 0,
+			}),
+			...eventLine("response.output_item.done", {
+				item: {
+					type: "function_call",
+					call_id: "call_1",
+					name: "EnterWorktree",
+				},
+				output_index: 0,
+			}),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.4",
+					usage: { input_tokens: 1, output_tokens: 1 },
+				},
+			}),
+		]);
+
+		// requestId is never passed through transformRequestBody: this tool's
+		// schema was never registered for this request id. On a cache miss the
+		// generic pass must not guess -- "" survives on every key, including
+		// `name`, exactly as it arrived from the model.
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: {
+				"content-type": "text/event-stream",
+				"x-better-ccflare-request-id": "req_never_registered_cache_miss",
+			},
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const transformedBody = await transformed.text();
+
+		expect(transformedBody).toContain(
+			'"partial_json":"{\\"name\\":\\"\\",\\"path\\":\\"/x\\"}"',
+		);
+	});
+
 	it("preserves non-object tool arguments in non-streaming SSE-to-JSON conversion", async () => {
 		const provider = new CodexProvider();
 		const requestId = "req_non_stream_non_object_tool_input";
