@@ -1382,6 +1382,16 @@ async function handleProxyCore(
 		};
 	};
 
+	// xAI cache-native affinity must be recorded only once a response is
+	// actually served, never at selection time — see recordXaiAffinitySuccess.
+	// A no-op for any non-xai / non-official-endpoint account, or when the
+	// feature is disabled (getXaiConvId returns null and the callee no-ops).
+	const recordXaiAffinityIfServed = (account: Account) => {
+		if (account.provider === "xai" && isOfficialXaiEndpoint(account)) {
+			recordXaiAffinitySuccess(requestMeta, account.id);
+		}
+	};
+
 	const returnComboSessionFallbackDisabled = async (
 		comboName: string,
 		failoverAttempts: number,
