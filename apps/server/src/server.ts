@@ -792,8 +792,18 @@ function startUsagePollingWithRefresh(
 					// depend on that insert's timing (see the comment in
 					// AlertService.buildUsageWindowExhaustionAlert), and a failure
 					// here is best-effort telemetry, never fatal to polling.
-					alertService
-						.evaluateUsageSnapshot(accountId, account.name, data, now)
+					// Resolve the CURRENT name at dispatch — the closure-captured
+					// name goes stale on rename (pro-gate round-2 finding).
+					proxyContext.dbOps
+						.getAccount(accountId)
+						.then((acc) =>
+							alertService.evaluateUsageSnapshot(
+								accountId,
+								acc?.name ?? account.name,
+								data,
+								now,
+							),
+						)
 						.catch((err) =>
 							logger.warn(
 								`Failed to evaluate usage-window alerts for account ${accountId}: ${err}`,
@@ -1180,8 +1190,20 @@ export default async function startServer(options?: {
 						`Failed to record usage snapshot for account ${accountId}: ${err}`,
 					),
 				);
-			alertService
-				.evaluateUsageSnapshot(accountId, accountName, data, now)
+			// Resolve the CURRENT name at dispatch: the closure-captured name
+			// goes stale on rename and could misattribute alerts if the freed
+			// name is reused (pro-gate round-2 finding). Captured name stays
+			// as the fallback when the row read fails.
+			dbOps
+				.getAccount(accountId)
+				.then((acc) =>
+					alertService.evaluateUsageSnapshot(
+						accountId,
+						acc?.name ?? accountName,
+						data,
+						now,
+					),
+				)
 				.catch((err) =>
 					log.warn(
 						`Failed to evaluate usage-window alerts for account ${accountId}: ${err}`,

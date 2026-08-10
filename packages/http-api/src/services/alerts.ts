@@ -200,20 +200,24 @@ export function extractUsageWindows(
 		const v = value as {
 			utilization?: unknown;
 			percentage?: unknown;
+			percentUsed?: unknown;
 			resets_at?: unknown;
 			resetAt?: unknown;
 		};
 		// Tolerant window matcher: anthropic/codex/xai use
 		// {utilization, resets_at: ISO}; minimax uses {utilization, resetAt: ms};
-		// zai limits use {percentage, resetAt: ms}. One matcher keeps every
-		// polled provider's percent-shaped windows alert-eligible (pro-gate
-		// finding: alerts were wired only for refresh-backed providers).
+		// zai limits use {percentage, resetAt: ms}; nanogpt/alibaba use
+		// {percentUsed, ...}. One matcher keeps every polled provider's
+		// percent-shaped windows alert-eligible (pro-gate finding: alerts were
+		// wired only for refresh-backed providers).
 		const utilization =
 			typeof v.utilization === "number"
 				? v.utilization
 				: typeof v.percentage === "number"
 					? v.percentage
-					: null;
+					: typeof v.percentUsed === "number"
+						? v.percentUsed
+						: null;
 		if (utilization === null) continue;
 		if (!("resets_at" in v) && !("resetAt" in v)) continue;
 		let resetsAtMs: number | null = null;
@@ -511,6 +515,11 @@ export class AlertService {
 	private readonly authFailureListener: (event: AuthFailureEvt) => void;
 	private readonly configChangeListener: ({ key }: { key: string }) => void;
 	private anomalyTimer: ReturnType<typeof setInterval> | null = null;
+	/** Last exhaustion-projection evaluation per `${accountId}:${windowKey}`
+	 * — in-memory rate limit on the history+regression work (see
+	 * buildUsageWindowExhaustionAlert). Reset on restart is fine: one extra
+	 * evaluation per window is the worst case. */
+	private readonly usageWindowExhaustionEvalAt = new Map<string, number>();
 
 	constructor(db: BunSqlAdapter, config: Config) {
 		this.db = db;
@@ -749,6 +758,45 @@ export class AlertService {
 		timestamp: number,
 	): Promise<AlertEvent | null> {
 		if (utilization < USAGE_WINDOW_EXHAUSTION_MIN_UTILIZATION) return null;
+		if (utilization >= 100) {
+			// Factual exhaustion needs no projection (and no history query) —
+			// and it carries its own dedup stage: an earlier "projected" alert
+			// must not conflict-ignore the actual exhaustion, which would
+			// otherwise leave the stored alert a mere prediction (pro-gate
+			// round-2 finding).
+			return {
+				id: buildUsageWindowAlertId(
+					"usage_window_exhaustion_projected",
+					accountId,
+					windowKey,
+					resetsAtMs,
+					"exhausted",
+				),
+				timestamp,
+				type: "usage_window_exhaustion_projected",
+				severity: "critical",
+				title: "Usage window exhausted",
+				message: `Account ${accountName}'s ${windowKey} usage window is fully exhausted (${utilization.toFixed(1)}%). It resets at ${new Date(resetsAtMs).toISOString()}.`,
+				value: utilization,
+				threshold: null,
+				account: accountName,
+				model: null,
+				project: null,
+				requestId: null,
+				acknowledged: false,
+			};
+		}
+		// Rate-limit the history+regression work per (account, window): at the
+		// supported 10s poll interval a per-poll re-aggregation of the raw
+		// cycle is quadratic over the window's life (pro-gate finding). One
+		// evaluation per bucket width loses no fidelity — the regression input
+		// is 5-minute-bucketed anyway.
+		const evalKey = `${accountId}:${windowKey}`;
+		const lastEvalAt = this.usageWindowExhaustionEvalAt.get(evalKey);
+		if (lastEvalAt != null && timestamp - lastEvalAt < 4.5 * 60 * 1000) {
+			return null;
+		}
+		this.usageWindowExhaustionEvalAt.set(evalKey, timestamp);
 		const windowStartMs =
 			computeWindowStartMs(resetsAtMs, windowKey) ??
 			timestamp - USAGE_WINDOW_HISTORY_FALLBACK_LOOKBACK_MS;
@@ -786,6 +834,7 @@ export class AlertService {
 				accountId,
 				windowKey,
 				resetsAtMs,
+				"projected",
 			),
 			timestamp,
 			type: "usage_window_exhaustion_projected",

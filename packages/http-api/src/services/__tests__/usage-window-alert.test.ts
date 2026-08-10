@@ -316,6 +316,60 @@ describe("AlertService usage-window alerts", () => {
 		expect(alert.account).toBe("Primary account");
 	});
 
+	it("fires a distinct exhausted alert after a projection, even with threshold alerts disabled", async () => {
+		// The projection must not consume the cycle's only exhaustion id: with
+		// threshold alerts disabled, actually REACHING 100% would otherwise be
+		// conflict-ignored and the stored alert would remain a mere prediction
+		// (pro-gate round-2 finding). The stages give projected and exhausted
+		// one firing each per cycle.
+		service = new AlertService(
+			new BunSqlAdapter(sqlite),
+			makeConfig({ usageWindowThresholdPercent: 0 }),
+		);
+		service.start();
+
+		const now = 1_800_000_000_000;
+		const resetsAtMs = now + 60 * 60 * 1000;
+		seedSnapshot(sqlite, {
+			accountId: "acct-1",
+			timestamp: now - 30 * 60 * 1000,
+			windowKey: "five_hour",
+			utilization: 40,
+			resetsAt: resetsAtMs,
+		});
+		seedSnapshot(sqlite, {
+			accountId: "acct-1",
+			timestamp: now - 15 * 60 * 1000,
+			windowKey: "five_hour",
+			utilization: 55,
+			resetsAt: resetsAtMs,
+		});
+
+		for (const [pollOffset, utilization] of [
+			[0, 70],
+			[90_000, 100],
+		] as const) {
+			await service.evaluateUsageSnapshot(
+				"acct-1",
+				"Primary account",
+				{
+					five_hour: {
+						utilization,
+						resets_at: new Date(resetsAtMs).toISOString(),
+					},
+				},
+				now + pollOffset,
+			);
+		}
+
+		const alerts = (await service.listAlerts())
+			.filter((a) => a.type === "usage_window_exhaustion_projected")
+			.sort((a, b) => a.timestamp - b.timestamp);
+		expect(alerts).toHaveLength(2);
+		expect((alerts[0] as AlertEvent).title).toContain("projected");
+		expect((alerts[1] as AlertEvent).title).toBe("Usage window exhausted");
+	});
+
 	it("does not fire the exhaustion projection for a flat trend, even above 50% utilization", async () => {
 		service = new AlertService(
 			new BunSqlAdapter(sqlite),

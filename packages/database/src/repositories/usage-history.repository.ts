@@ -157,15 +157,24 @@ export class UsageHistoryRepository extends BaseRepository<UsageSnapshotRow> {
 				: null;
 		// Integer division truncates identically on SQLite and Postgres, so
 		// the bucketed variant runs unchanged on both adapters.
+		// The bucket expression is computed ONCE in a subquery and grouped by
+		// its alias: repeating `timestamp / ?` in SELECT and GROUP BY binds
+		// DISTINCT parameters after placeholder conversion ($1 vs $n), and
+		// PostgreSQL does not recognize those as the same grouping expression
+		// — every bucketed query would raise an ungrouped-column error
+		// (pro-gate finding).
 		const rows = bucketMs
 			? await this.query<SnapshotDbRow>(
-					`SELECT account_id, (timestamp / ?) * ? AS timestamp, window_key,
+					`SELECT account_id, bucket * ? AS timestamp, window_key,
 					        AVG(utilization) AS utilization, MAX(resets_at) AS resets_at
-					 FROM usage_snapshots
-					 WHERE ${clauses.join(" AND ")}
-					 GROUP BY account_id, window_key, timestamp / ?
+					 FROM (
+					   SELECT account_id, timestamp / ? AS bucket, window_key, utilization, resets_at
+					   FROM usage_snapshots
+					   WHERE ${clauses.join(" AND ")}
+					 ) bucketed
+					 GROUP BY account_id, window_key, bucket
 					 ORDER BY timestamp ASC`,
-					[bucketMs, bucketMs, ...whereParams, bucketMs],
+					[bucketMs, bucketMs, ...whereParams],
 				)
 			: await this.query<SnapshotDbRow>(
 					`SELECT account_id, timestamp, window_key, utilization, resets_at
