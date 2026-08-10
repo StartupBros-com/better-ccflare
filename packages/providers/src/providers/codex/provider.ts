@@ -549,6 +549,24 @@ interface AnthropicTool {
 	input_schema?: Record<string, unknown>;
 }
 
+/**
+ * Flattened, top-level-only view of an AnthropicTool's input_schema, used to
+ * decide whether an empty-string tool-call argument is safe to strip. Only
+ * `properties` and `required` are read; nested schemas are not descended
+ * into. Built once per request in transformRequestBody and cached by
+ * request id (see CodexProvider#requestToolSchemasById) so the response-side
+ * sanitizer never needs to throw or guess on a cache miss.
+ */
+interface CodexToolSchemaPropInfo {
+	isString: boolean;
+	enumHasEmptyString: boolean;
+}
+
+interface CodexToolSchemaInfo {
+	required: Set<string>;
+	props: Map<string, CodexToolSchemaPropInfo>;
+}
+
 interface AnthropicToolChoice {
 	type: "auto" | "any" | "none" | "tool";
 	name?: string;
@@ -856,6 +874,86 @@ export class CodexProvider extends BaseProvider {
 		}
 	}
 
+	// Per-request, per-tool schema info derived from the Anthropic request's
+	// tools[].input_schema, used to decide whether a ""-valued tool-call
+	// argument is a genuinely-omitted optional string (safe to strip) versus
+	// an unknown field (kept, never guessed). Same 30s TTL sweep pattern as
+	// requestStreamById above; populated in transformRequestBody, read from
+	// the response-side sanitizers via requestId.
+	private requestToolSchemasById = new Map<
+		string,
+		{ tools: Map<string, CodexToolSchemaInfo>; ts: number }
+	>();
+
+	private sweepRequestToolSchemasById(): void {
+		const cutoff = Date.now() - 30_000;
+		for (const [id, entry] of this.requestToolSchemasById) {
+			if (entry.ts < cutoff) {
+				this.requestToolSchemasById.delete(id);
+			}
+		}
+	}
+
+	/** Guarded against malformed/missing schemas: never throws, worst case yields an empty map. */
+	private buildToolSchemaMap(
+		tools: AnthropicTool[] | undefined,
+	): Map<string, CodexToolSchemaInfo> {
+		const result = new Map<string, CodexToolSchemaInfo>();
+		if (!Array.isArray(tools)) return result;
+		for (const tool of tools) {
+			if (!tool || typeof tool.name !== "string") continue;
+			const schema = tool.input_schema;
+			if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+				continue;
+			}
+			const required = new Set<string>();
+			const requiredRaw = (schema as Record<string, unknown>).required;
+			if (Array.isArray(requiredRaw)) {
+				for (const key of requiredRaw) {
+					if (typeof key === "string") required.add(key);
+				}
+			}
+			const props = new Map<string, CodexToolSchemaPropInfo>();
+			const propsRaw = (schema as Record<string, unknown>).properties;
+			if (
+				propsRaw &&
+				typeof propsRaw === "object" &&
+				!Array.isArray(propsRaw)
+			) {
+				for (const [propName, propSchemaRaw] of Object.entries(
+					propsRaw as Record<string, unknown>,
+				)) {
+					if (
+						!propSchemaRaw ||
+						typeof propSchemaRaw !== "object" ||
+						Array.isArray(propSchemaRaw)
+					) {
+						continue;
+					}
+					const propSchema = propSchemaRaw as Record<string, unknown>;
+					const type = propSchema.type;
+					const isString =
+						type === "string" ||
+						(Array.isArray(type) && type.includes("string"));
+					const enumValues = propSchema.enum;
+					const enumHasEmptyString =
+						Array.isArray(enumValues) && enumValues.includes("");
+					props.set(propName, { isString, enumHasEmptyString });
+				}
+			}
+			result.set(tool.name, { required, props });
+		}
+		return result;
+	}
+
+	private getToolSchemaInfo(
+		requestId: string | undefined,
+		toolName: string,
+	): CodexToolSchemaInfo | undefined {
+		if (!requestId) return undefined;
+		return this.requestToolSchemasById.get(requestId)?.tools.get(toolName);
+	}
+
 	canHandle(path: string): boolean {
 		return path === "/v1/messages" || path === "/v1/messages/count_tokens";
 	}
@@ -1001,6 +1099,7 @@ export class CodexProvider extends BaseProvider {
 
 		try {
 			this.sweepRequestStreamById();
+			this.sweepRequestToolSchemasById();
 			const body = (await request.json()) as AnthropicRequest;
 			const logicalModelFamily =
 				trustedLogicalModelFamily ?? getModelFamily(body.model);
@@ -1036,6 +1135,10 @@ export class CodexProvider extends BaseProvider {
 			if (requestId) {
 				this.requestStreamById.set(requestId, {
 					stream: body.stream === true,
+					ts: Date.now(),
+				});
+				this.requestToolSchemasById.set(requestId, {
+					tools: this.buildToolSchemaMap(body.tools),
 					ts: Date.now(),
 				});
 			}
@@ -1893,7 +1996,11 @@ export class CodexProvider extends BaseProvider {
 		return items;
 	}
 
-	private sanitizeToolUseInput(name: string, input: unknown): unknown {
+	private sanitizeToolUseInput(
+		name: string,
+		input: unknown,
+		schema?: CodexToolSchemaInfo,
+	): unknown {
 		if (input === undefined) return {};
 		if (input === null || typeof input !== "object" || Array.isArray(input)) {
 			return input;
@@ -1902,6 +2009,31 @@ export class CodexProvider extends BaseProvider {
 		const sanitized: Record<string, unknown> = {
 			...(input as Record<string, unknown>),
 		};
+
+		// Generic, schema-aware pass over top-level keys, ahead of the
+		// per-tool cases below. GPT-family models routed through this
+		// provider never omit optional tool parameters (verified incident:
+		// EnterWorktree calls carrying `"name": ""` alongside `path`,
+		// tripping "at most one of name or path"), so this normalizes that
+		// shape back to what an Anthropic-native model would have sent.
+		for (const [key, value] of Object.entries(sanitized)) {
+			if (value === null) {
+				delete sanitized[key];
+				continue;
+			}
+			if (value === "" && schema) {
+				const prop = schema.props.get(key);
+				if (
+					prop?.isString &&
+					!prop.enumHasEmptyString &&
+					!schema.required.has(key)
+				) {
+					delete sanitized[key];
+				}
+			}
+			// value === "" with no schema (cache miss / unknown tool / schema
+			// never registered): keep it. Never guess.
+		}
 
 		if (name === "Read") {
 			const pages = sanitized.pages;
@@ -1944,13 +2076,20 @@ export class CodexProvider extends BaseProvider {
 	private sanitizeToolUsePartialJson(
 		name: string,
 		partialJson: string,
+		requestId?: string,
 	): string {
 		try {
 			const input = JSON.parse(partialJson) as unknown;
 			if (typeof input !== "object" || input === null || Array.isArray(input)) {
 				return partialJson;
 			}
-			return JSON.stringify(this.sanitizeToolUseInput(name, input));
+			return JSON.stringify(
+				this.sanitizeToolUseInput(
+					name,
+					input,
+					this.getToolSchemaInfo(requestId, name),
+				),
+			);
 		} catch {
 			return partialJson;
 		}
@@ -2434,7 +2573,11 @@ export class CodexProvider extends BaseProvider {
 					type: "tool_use",
 					id: tool.id || `call_${index}`,
 					name: tool.name,
-					input: this.sanitizeToolUseInput(tool.name, input),
+					input: this.sanitizeToolUseInput(
+						tool.name,
+						input,
+						this.getToolSchemaInfo(requestId, tool.name),
+					),
 				});
 			}
 		}
@@ -3280,6 +3423,7 @@ export class CodexProvider extends BaseProvider {
 						const partialJson = this.sanitizeToolUsePartialJson(
 							buffer.name,
 							buffer.arguments.join(""),
+							state.traceRequestId,
 						);
 						state.traceNewToolCalls.push({
 							name: buffer.name,
