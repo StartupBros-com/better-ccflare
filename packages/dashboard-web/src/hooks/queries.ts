@@ -534,6 +534,19 @@ export const useUsageHistory = (account: string, range: string) => {
 	});
 };
 
+/** Fleet-wide (all accounts) usage history, backing the "All accounts" chart. */
+export const useFleetUsageHistory = (range: string, enabled = true) => {
+	return useQuery({
+		queryKey: queryKeys.fleetUsageHistory(range),
+		queryFn: () => api.getFleetUsageHistory(range),
+		staleTime: 45000,
+		refetchInterval: 60000,
+		refetchIntervalInBackground: false,
+		gcTime: 15 * 60 * 1000,
+		enabled,
+	});
+};
+
 export const useContextInsights = (timeRange: string) => {
 	return useQuery({
 		queryKey: queryKeys.insightsContext(timeRange),

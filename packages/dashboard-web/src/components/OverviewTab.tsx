@@ -272,6 +272,27 @@ export const OverviewTab = React.memo(() => {
 					trend={trends.trendCost}
 					trendPeriod={trendPeriod}
 					icon={DollarSign}
+					subRows={[
+						...(analytics?.totals.avgDailyApiCostUsd != null
+							? [
+									{
+										label: "Avg / day",
+										value: formatCost(analytics.totals.avgDailyApiCostUsd),
+										tooltip: "Average daily API cost over the last 7 days",
+									},
+								]
+							: []),
+						...(analytics?.totals.avgWeeklyApiCostUsd != null
+							? [
+									{
+										label: "Avg / week",
+										value: formatCost(analytics.totals.avgWeeklyApiCostUsd),
+										tooltip:
+											"Average weekly API cost, derived from the last 30 days",
+									},
+								]
+							: []),
+					]}
 				/>
 				<MetricCard
 					title="Output Speed"

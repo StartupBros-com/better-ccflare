@@ -8,6 +8,7 @@ const ENV_KEYS = [
 	"ALERT_DAILY_SPEND_USD",
 	"ALERT_TOKENS_PER_HOUR",
 	"ALERT_REQUEST_TOKENS",
+	"ALERT_USAGE_WINDOW_THRESHOLD_PERCENT",
 	"ALERT_ANOMALY_ENABLED",
 	"ALERT_ANOMALY_INTERVAL_MINUTES",
 	"ALERT_ANOMALY_LOOP_MIN_REQUESTS",
@@ -50,6 +51,7 @@ describe("alert config settings", () => {
 			expect(config.getAlertDailySpendUsd()).toBe(0);
 			expect(config.getAlertTokensPerHour()).toBe(0);
 			expect(config.getAlertRequestTokens()).toBe(0);
+			expect(config.getAlertUsageWindowThresholdPercent()).toBe(90);
 			expect(config.getAlertAnomalyEnabled()).toBe(false);
 			expect(config.getAlertAnomalyIntervalMinutes()).toBe(15);
 			expect(config.getAlertAnomalyLoopMinRequests()).toBe(25);
@@ -64,6 +66,7 @@ describe("alert config settings", () => {
 		process.env.ALERT_DAILY_SPEND_USD = "25.5";
 		process.env.ALERT_TOKENS_PER_HOUR = "500000";
 		process.env.ALERT_REQUEST_TOKENS = "200000";
+		process.env.ALERT_USAGE_WINDOW_THRESHOLD_PERCENT = "75";
 		process.env.ALERT_ANOMALY_ENABLED = "true";
 		process.env.ALERT_ANOMALY_INTERVAL_MINUTES = "30";
 		process.env.ALERT_ANOMALY_LOOP_MIN_REQUESTS = "40";
@@ -75,6 +78,7 @@ describe("alert config settings", () => {
 			expect(config.getAlertDailySpendUsd()).toBe(25.5);
 			expect(config.getAlertTokensPerHour()).toBe(500000);
 			expect(config.getAlertRequestTokens()).toBe(200000);
+			expect(config.getAlertUsageWindowThresholdPercent()).toBe(75);
 			expect(config.getAlertAnomalyEnabled()).toBe(true);
 			expect(config.getAlertAnomalyIntervalMinutes()).toBe(30);
 			expect(config.getAlertAnomalyLoopMinRequests()).toBe(40);
@@ -100,6 +104,7 @@ describe("alert config settings", () => {
 		process.env.ALERT_DAILY_SPEND_USD = "-5";
 		process.env.ALERT_TOKENS_PER_HOUR = "9999999999";
 		process.env.ALERT_REQUEST_TOKENS = "-100";
+		process.env.ALERT_USAGE_WINDOW_THRESHOLD_PERCENT = "150";
 		process.env.ALERT_ANOMALY_INTERVAL_MINUTES = "2";
 		process.env.ALERT_ANOMALY_LOOP_MIN_REQUESTS = "9999";
 		process.env.ALERT_COOLDOWN_MINUTES = "0";
@@ -109,6 +114,7 @@ describe("alert config settings", () => {
 			expect(config.getAlertDailySpendUsd()).toBe(0);
 			expect(config.getAlertTokensPerHour()).toBe(1_000_000_000);
 			expect(config.getAlertRequestTokens()).toBe(0);
+			expect(config.getAlertUsageWindowThresholdPercent()).toBe(100);
 			expect(config.getAlertAnomalyIntervalMinutes()).toBe(5);
 			expect(config.getAlertAnomalyLoopMinRequests()).toBe(1000);
 			expect(config.getAlertCooldownMinutes()).toBe(1);
@@ -126,6 +132,12 @@ describe("alert config settings", () => {
 		try {
 			config.setAlertDailySpendUsd(2_000_000);
 			expect(config.getAlertDailySpendUsd()).toBe(1_000_000);
+
+			config.setAlertUsageWindowThresholdPercent(150);
+			expect(config.getAlertUsageWindowThresholdPercent()).toBe(100);
+
+			config.setAlertUsageWindowThresholdPercent(-10);
+			expect(config.getAlertUsageWindowThresholdPercent()).toBe(0);
 
 			config.setAlertAnomalyIntervalMinutes(3);
 			expect(config.getAlertAnomalyIntervalMinutes()).toBe(5);
@@ -156,6 +168,7 @@ describe("alert config settings", () => {
 			config.setAlertDailySpendUsd(50);
 			config.setAlertTokensPerHour(1_000_000);
 			config.setAlertRequestTokens(300_000);
+			config.setAlertUsageWindowThresholdPercent(80);
 			config.setAlertAnomalyEnabled(true);
 			config.setAlertCooldownMinutes(45);
 			config.setAlertWebhookUrl("https://hooks.example.com/alert");
@@ -163,6 +176,7 @@ describe("alert config settings", () => {
 			expect(config.getAlertDailySpendUsd()).toBe(50);
 			expect(config.getAlertTokensPerHour()).toBe(1_000_000);
 			expect(config.getAlertRequestTokens()).toBe(300_000);
+			expect(config.getAlertUsageWindowThresholdPercent()).toBe(80);
 			expect(config.getAlertAnomalyEnabled()).toBe(true);
 			expect(config.getAlertCooldownMinutes()).toBe(45);
 			expect(config.getAlertWebhookUrl()).toBe(
@@ -204,6 +218,7 @@ describe("alert config settings", () => {
 			expect(settings.alert_daily_spend_usd).toBe(0);
 			expect(settings.alert_tokens_per_hour).toBe(0);
 			expect(settings.alert_request_tokens).toBe(0);
+			expect(settings.alert_usage_window_threshold_percent).toBe(90);
 			expect(settings.alert_anomaly_enabled).toBe(false);
 			expect(settings.alert_anomaly_interval_minutes).toBe(15);
 			expect(settings.alert_anomaly_loop_min_requests).toBe(25);

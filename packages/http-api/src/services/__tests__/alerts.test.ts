@@ -13,6 +13,8 @@ import {
 	buildStalePolicyDriftAlert,
 	buildThresholdAlertId,
 	buildUnknownModelDriftAlert,
+	buildUsageWindowAlertId,
+	extractUsageWindows,
 	shouldFireAlert,
 } from "../alerts";
 
@@ -20,6 +22,7 @@ const CONFIG: AlertsConfigPayload = {
 	dailySpendUsd: 10,
 	tokensPerHour: 100_000,
 	requestTokens: 50_000,
+	usageWindowThresholdPercent: 90,
 	anomalyEnabled: false,
 	anomalyIntervalMinutes: 15,
 	loopMinRequests: 10,
@@ -132,6 +135,106 @@ describe("alert threshold helpers", () => {
 		expect(alert.model).toBe("model-a");
 		expect(alert.project).toBe("proj");
 		expect(alert.acknowledged).toBe(false);
+	});
+});
+
+describe("usage-window alert helpers", () => {
+	test("buildUsageWindowAlertId is stable for the same window cycle regardless of poll timestamp", () => {
+		const first = buildUsageWindowAlertId(
+			"usage_window_threshold",
+			"acct-1",
+			"five_hour",
+			1_800_000_000_000,
+		);
+		const second = buildUsageWindowAlertId(
+			"usage_window_threshold",
+			"acct-1",
+			"five_hour",
+			1_800_000_000_000,
+		);
+		expect(first).toBe(second);
+	});
+
+	test("buildUsageWindowAlertId re-arms when resets_at changes (new window cycle)", () => {
+		const cycleOne = buildUsageWindowAlertId(
+			"usage_window_threshold",
+			"acct-1",
+			"five_hour",
+			1_800_000_000_000,
+		);
+		const cycleTwo = buildUsageWindowAlertId(
+			"usage_window_threshold",
+			"acct-1",
+			"five_hour",
+			1_800_018_000_000, // +5h
+		);
+		expect(cycleOne).not.toBe(cycleTwo);
+	});
+
+	test("buildUsageWindowAlertId distinguishes account, window, and alert type", () => {
+		const base = buildUsageWindowAlertId(
+			"usage_window_threshold",
+			"acct-1",
+			"five_hour",
+			1_800_000_000_000,
+		);
+		expect(
+			buildUsageWindowAlertId(
+				"usage_window_threshold",
+				"acct-2",
+				"five_hour",
+				1_800_000_000_000,
+			),
+		).not.toBe(base);
+		expect(
+			buildUsageWindowAlertId(
+				"usage_window_threshold",
+				"acct-1",
+				"seven_day",
+				1_800_000_000_000,
+			),
+		).not.toBe(base);
+		expect(
+			buildUsageWindowAlertId(
+				"usage_window_exhaustion_projected",
+				"acct-1",
+				"five_hour",
+				1_800_000_000_000,
+			),
+		).not.toBe(base);
+	});
+
+	test("extractUsageWindows reads utilization + resets_at shaped windows and skips everything else", () => {
+		const windows = extractUsageWindows({
+			five_hour: { utilization: 42, resets_at: "2026-07-24T15:00:00.000Z" },
+			seven_day: { utilization: 10, resets_at: null },
+			// Not window-shaped: no numeric `utilization`.
+			extra_usage: { enabled: true },
+			// Not window-shaped: no `resets_at` key at all.
+			spend: { percent: 12 },
+			limits: [{ kind: "session", percent: 5 }],
+		});
+
+		expect(windows).toContainEqual({
+			windowKey: "five_hour",
+			utilization: 42,
+			resetsAtMs: new Date("2026-07-24T15:00:00.000Z").getTime(),
+		});
+		expect(windows).toContainEqual({
+			windowKey: "seven_day",
+			utilization: 10,
+			resetsAtMs: null,
+		});
+		expect(windows).toHaveLength(2);
+	});
+
+	test("extractUsageWindows treats an unparseable resets_at as null, not NaN", () => {
+		const windows = extractUsageWindows({
+			five_hour: { utilization: 42, resets_at: "not-a-date" },
+		});
+		expect(windows).toEqual([
+			{ windowKey: "five_hour", utilization: 42, resetsAtMs: null },
+		]);
 	});
 });
 

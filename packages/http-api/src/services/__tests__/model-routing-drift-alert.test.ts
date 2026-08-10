@@ -32,6 +32,7 @@ function makeConfig(
 		getAlertDailySpendUsd: () => 0,
 		getAlertTokensPerHour: () => 0,
 		getAlertRequestTokens: () => 0,
+		getAlertUsageWindowThresholdPercent: () => 0,
 		getAlertAnomalyEnabled: () => false,
 		getAlertAnomalyIntervalMinutes: () => 15,
 		getAlertAnomalyLoopMinRequests: () => 10,

@@ -19,7 +19,16 @@ export type AlertType =
 	| "anomaly_runaway_loop"
 	| "anomaly_model_misrouting"
 	| "auth_failure"
-	| "model_routing_drift";
+	| "model_routing_drift"
+	/** A usage window's (e.g. five_hour, seven_day) utilization crossed the
+	 * configured threshold percent. See AlertService.evaluateUsageSnapshot in
+	 * packages/http-api/src/services/alerts.ts. */
+	| "usage_window_threshold"
+	/** A usage window is at least 50% utilized and the server-side linear
+	 * projection (computeUsagePrediction, packages/http-api/src/services/
+	 * usage-prediction.ts) says it will exhaust before its resets_at. Fires
+	 * unconditionally (no separate enable toggle), like model_routing_drift. */
+	| "usage_window_exhaustion_projected";
 
 /**
  * Discriminates the two staleness classes detected under the
@@ -76,6 +85,10 @@ export interface AlertsConfigPayload {
 	tokensPerHour: number;
 	/** Per-request token threshold; 0 = disabled. */
 	requestTokens: number;
+	/** Usage-window utilization percent (0-100) that triggers
+	 * usage_window_threshold; 0 = disabled. Does not gate
+	 * usage_window_exhaustion_projected, which is unconditional. */
+	usageWindowThresholdPercent: number;
 	anomalyEnabled: boolean;
 	anomalyIntervalMinutes: number;
 	/**

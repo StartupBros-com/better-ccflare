@@ -683,6 +683,7 @@ export async function refreshPollingAccessToken(
 function startUsagePollingWithRefresh(
 	account: Account,
 	proxyContext: ProxyContext,
+	alertService: AlertService,
 	startupDelayMs: number = 0,
 	intervalMs: number = 90000,
 ) {
@@ -757,11 +758,24 @@ function startUsagePollingWithRefresh(
 						);
 				},
 				(accountId, data) => {
+					const now = Date.now();
 					proxyContext.dbOps
-						.recordUsageSnapshot(accountId, data, Date.now())
+						.recordUsageSnapshot(accountId, data, now)
 						.catch((err) =>
 							logger.warn(
 								`Failed to record usage snapshot for account ${accountId}: ${err}`,
+							),
+						);
+					// Usage-window threshold / exhaustion-projection alerts
+					// (OnWatch). Independent of recordUsageSnapshot above — must not
+					// depend on that insert's timing (see the comment in
+					// AlertService.buildUsageWindowExhaustionAlert), and a failure
+					// here is best-effort telemetry, never fatal to polling.
+					alertService
+						.evaluateUsageSnapshot(accountId, account.name, data, now)
+						.catch((err) =>
+							logger.warn(
+								`Failed to evaluate usage-window alerts for account ${accountId}: ${err}`,
 							),
 						);
 				},
@@ -1519,6 +1533,7 @@ export default async function startServer(options?: {
 		startUsagePollingWithRefresh(
 			account,
 			proxyContext,
+			alertService,
 			0,
 			config.getUsagePollIntervalMs(),
 		);
@@ -2116,6 +2131,7 @@ Available endpoints:
 				startUsagePollingWithRefresh(
 					account,
 					proxyContext,
+					alertService,
 					startupDelayMs,
 					config.getUsagePollIntervalMs(),
 				);

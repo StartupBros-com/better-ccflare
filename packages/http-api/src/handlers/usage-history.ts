@@ -1,12 +1,14 @@
 // packages/http-api/src/handlers/usage-history.ts
 import {
-	BadRequest,
 	errorResponse,
 	InternalServerError,
 	jsonResponse,
 } from "@better-ccflare/http-common";
 import { Logger } from "@better-ccflare/logger";
 import type {
+	FleetAccountUsageSeries,
+	FleetUsageHistoryResponse,
+	FleetWindowSeries,
 	PredictionPoint,
 	UsageHistoryResponse,
 	UsageHistoryWindowSeries,
@@ -17,14 +19,43 @@ import { getRangeConfig } from "../utils/query-filters";
 
 const log = new Logger("UsageHistoryHandler");
 
+// Fleet mode (account=all/omitted) can fan out across many accounts × windows;
+// cap each series so the payload/chart stay bounded regardless of retention.
+// Always keeps the first and last point so the chart's time domain is exact.
+const MAX_FLEET_POINTS_PER_SERIES = 500;
+
+export function downsamplePoints(
+	points: PredictionPoint[],
+	max = MAX_FLEET_POINTS_PER_SERIES,
+): PredictionPoint[] {
+	if (points.length <= max || max < 2) return points;
+	const result: PredictionPoint[] = [];
+	const step = (points.length - 1) / (max - 1);
+	let lastIndex = -1;
+	for (let i = 0; i < max; i++) {
+		const idx = Math.round(i * step);
+		if (idx === lastIndex) continue; // rounding can collide near the ends
+		result.push(points[idx]);
+		lastIndex = idx;
+	}
+	const lastPoint = points[points.length - 1];
+	if (result[result.length - 1] !== lastPoint) result.push(lastPoint);
+	return result;
+}
+
+function rowsToPoints(
+	rows: { timestamp: number; utilization: number; resetsAt: number | null }[],
+): PredictionPoint[] {
+	return rows.map((r) => ({
+		t: r.timestamp,
+		utilization: r.utilization,
+		resetsAt: r.resetsAt,
+	}));
+}
+
 export function createUsageHistoryHandler(context: APIContext) {
 	return async (searchParams: URLSearchParams): Promise<Response> => {
 		const accountId = searchParams.get("account");
-		if (!accountId) {
-			return errorResponse(
-				BadRequest("Missing required 'account' query parameter"),
-			);
-		}
 		// getRangeConfig returns the normalized effective `range` (unknown values
 		// fall back to 24h) — echo that in the response so it matches startMs.
 		const { startMs, range } = getRangeConfig(
@@ -33,6 +64,15 @@ export function createUsageHistoryHandler(context: APIContext) {
 		const windowKey = searchParams.get("window") ?? undefined;
 
 		try {
+			// account=all (or the param omitted entirely) requests the fleet-wide
+			// view: one series per account × window, for every account that has
+			// at least one snapshot in range.
+			if (!accountId || accountId === "all") {
+				return jsonResponse(
+					await buildFleetResponse(context, { range, startMs, windowKey }),
+				);
+			}
+
 			const rows = await context.dbOps.getUsageHistory({
 				accountId,
 				windowKey,
@@ -67,4 +107,43 @@ export function createUsageHistoryHandler(context: APIContext) {
 			);
 		}
 	};
+}
+
+async function buildFleetResponse(
+	context: APIContext,
+	opts: { range: string; startMs: number; windowKey?: string },
+): Promise<FleetUsageHistoryResponse> {
+	const accounts = await context.dbOps.getAllAccounts();
+	const results: FleetAccountUsageSeries[] = [];
+
+	for (const account of accounts) {
+		const rows = await context.dbOps.getUsageHistory({
+			accountId: account.id,
+			windowKey: opts.windowKey,
+			since: opts.startMs,
+		});
+		if (rows.length === 0) continue; // no snapshots in range — skip entirely
+
+		const byWindow = new Map<string, typeof rows>();
+		for (const r of rows) {
+			const arr = byWindow.get(r.windowKey) ?? [];
+			arr.push(r);
+			byWindow.set(r.windowKey, arr);
+		}
+
+		const windows: FleetWindowSeries[] = [...byWindow.entries()]
+			.sort(([a], [b]) => a.localeCompare(b))
+			.map(([window, windowRows]) => ({
+				window,
+				points: downsamplePoints(rowsToPoints(windowRows)),
+			}));
+
+		results.push({
+			accountId: account.id,
+			accountName: account.name,
+			windows,
+		});
+	}
+
+	return { range: opts.range, accounts: results };
 }

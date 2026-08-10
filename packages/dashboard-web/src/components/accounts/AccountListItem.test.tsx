@@ -11,6 +11,7 @@
  * directory.
  */
 import { describe, expect, it } from "bun:test";
+import type { FullUsageData } from "@better-ccflare/types";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { Account } from "../../api";
 import { AccountList } from "./AccountList";
@@ -339,5 +340,127 @@ describe("AccountListItem authoritative family routing", () => {
 		]);
 		expect(children[0]?.props.routingStates).toBe(firstRouting);
 		expect(children[1]?.props.routingStates).toBe(secondRouting);
+	});
+});
+
+describe("AccountListItem codex usage extras", () => {
+	// plan_type / credits_balance are polling-only extras from the free
+	// wham/usage endpoint (see api-usage.ts) -- NOT part of the public
+	// FullUsageData union, so callers cast. Live traffic can overwrite the
+	// cached snapshot and drop them at any moment, so every read must be
+	// null-safe and simply omit the element when absent (see
+	// RateLimitProgress.tsx's CodexUsageExtras for the sibling code_review_*
+	// extras, which follow the same contract).
+	function codexUsageData(
+		extras: Record<string, unknown>,
+	): NonNullable<Account["usageData"]> {
+		return {
+			five_hour: { utilization: 10, resets_at: null },
+			seven_day: { utilization: 20, resets_at: null },
+			...extras,
+		} as unknown as FullUsageData;
+	}
+
+	it("renders a plan_type badge near the account name when present", () => {
+		const html = renderToStaticMarkup(
+			<AccountListItem
+				account={makeAccount({
+					provider: "codex",
+					usageData: codexUsageData({ plan_type: "pro" }),
+				})}
+				{...requiredHandlers}
+			/>,
+		);
+
+		expect(html).toContain(">pro<");
+	});
+
+	it("omits the plan_type badge when absent from usageData", () => {
+		const html = renderToStaticMarkup(
+			<AccountListItem
+				account={makeAccount({
+					provider: "codex",
+					usageData: codexUsageData({}),
+				})}
+				{...requiredHandlers}
+			/>,
+		);
+
+		expect(html).not.toContain(">pro<");
+	});
+
+	it("renders credits_balance as a compact stat when positive", () => {
+		const html = renderToStaticMarkup(
+			<AccountListItem
+				account={makeAccount({
+					provider: "codex",
+					usageData: codexUsageData({ credits_balance: 1234 }),
+				})}
+				{...requiredHandlers}
+			/>,
+		);
+
+		expect(html).toContain("1,234 credits");
+	});
+
+	it("omits the credits_balance stat when it is zero (noise, not a real balance)", () => {
+		const html = renderToStaticMarkup(
+			<AccountListItem
+				account={makeAccount({
+					provider: "codex",
+					usageData: codexUsageData({ credits_balance: 0 }),
+				})}
+				{...requiredHandlers}
+			/>,
+		);
+
+		expect(html).not.toContain("credits</span>");
+		expect(html).not.toContain("0 credits");
+	});
+
+	it("omits the credits_balance stat when absent from usageData", () => {
+		const html = renderToStaticMarkup(
+			<AccountListItem
+				account={makeAccount({
+					provider: "codex",
+					usageData: codexUsageData({}),
+				})}
+				{...requiredHandlers}
+			/>,
+		);
+
+		expect(html).not.toContain("credits</span>");
+	});
+
+	it("omits the credits_balance stat when null", () => {
+		const html = renderToStaticMarkup(
+			<AccountListItem
+				account={makeAccount({
+					provider: "codex",
+					usageData: codexUsageData({ credits_balance: null }),
+				})}
+				{...requiredHandlers}
+			/>,
+		);
+
+		expect(html).not.toContain("credits</span>");
+	});
+
+	it("does not render plan_type or credits_balance extras for non-codex providers even if the shape is present", () => {
+		const html = renderToStaticMarkup(
+			<AccountListItem
+				account={makeAccount({
+					provider: "anthropic",
+					usageData: codexUsageData({
+						plan_type: "pro",
+						credits_balance: 1234,
+					}),
+				})}
+				{...requiredHandlers}
+			/>,
+		);
+
+		expect(html).not.toContain(">pro<");
+		expect(html).not.toContain("1,234 credits");
 	});
 });
