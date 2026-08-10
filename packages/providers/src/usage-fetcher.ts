@@ -440,10 +440,14 @@ export function getRepresentativeWindow(
 }
 
 function utilizationForProvider(
-	data: AnyUsageData,
+	data: AnyUsageData | null | undefined,
 	provider: string,
 	includeExtraUsage: boolean,
 ): number | null {
+	// Same defensive guard as getRepresentativeUsageResetMs — callers that
+	// derive a display label may hold a null payload for providers that expose
+	// no usage surface.
+	if (!data || typeof data !== "object") return null;
 	switch (provider) {
 		case "anthropic":
 		case "codex": {
