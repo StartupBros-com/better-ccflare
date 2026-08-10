@@ -195,15 +195,33 @@ export function extractUsageWindows(
 	const windows: ExtractedUsageWindow[] = [];
 	const seen = new Set<string>();
 	for (const [windowKey, value] of Object.entries(usage)) {
-		if (typeof value !== "object" || value === null) continue;
-		const utilization = (value as { utilization?: unknown }).utilization;
-		if (typeof utilization !== "number") continue;
-		if (!("resets_at" in (value as object))) continue;
-		const resetsAtRaw = (value as { resets_at?: unknown }).resets_at;
+		if (typeof value !== "object" || value === null || Array.isArray(value))
+			continue;
+		const v = value as {
+			utilization?: unknown;
+			percentage?: unknown;
+			resets_at?: unknown;
+			resetAt?: unknown;
+		};
+		// Tolerant window matcher: anthropic/codex/xai use
+		// {utilization, resets_at: ISO}; minimax uses {utilization, resetAt: ms};
+		// zai limits use {percentage, resetAt: ms}. One matcher keeps every
+		// polled provider's percent-shaped windows alert-eligible (pro-gate
+		// finding: alerts were wired only for refresh-backed providers).
+		const utilization =
+			typeof v.utilization === "number"
+				? v.utilization
+				: typeof v.percentage === "number"
+					? v.percentage
+					: null;
+		if (utilization === null) continue;
+		if (!("resets_at" in v) && !("resetAt" in v)) continue;
 		let resetsAtMs: number | null = null;
-		if (typeof resetsAtRaw === "string") {
-			const ms = new Date(resetsAtRaw).getTime();
+		if (typeof v.resets_at === "string") {
+			const ms = new Date(v.resets_at).getTime();
 			resetsAtMs = Number.isFinite(ms) ? ms : null;
+		} else if (typeof v.resetAt === "number" && Number.isFinite(v.resetAt)) {
+			resetsAtMs = v.resetAt;
 		}
 		windows.push({ windowKey, utilization, resetsAtMs });
 		seen.add(windowKey);
@@ -250,6 +268,13 @@ export function buildUsageWindowAlertId(
 	accountId: string,
 	windowKey: string,
 	resetsAtMs: number,
+	/**
+	 * Escalation stage within the cycle. Without it, a warning at 90%
+	 * consumes the cycle's one id and the later 100% critical escalation is
+	 * silently deduped away (pro-gate finding). Threshold alerts pass
+	 * "warning" | "critical"; the projection type has a single stage.
+	 */
+	stage = "single",
 ): string {
 	// Bucket to the nearest minute: providers recompute resets_at per
 	// response and it jitters by fractions of a second around the same
@@ -258,7 +283,7 @@ export function buildUsageWindowAlertId(
 	// raw ms would re-fire the alert on nearly every poll; a real rollover
 	// advances by hours, which always lands in a new bucket.
 	const resetsAtMinuteBucket = Math.round(resetsAtMs / 60_000);
-	return `${type}:${accountId}:${windowKey}:${resetsAtMinuteBucket}`;
+	return `${type}:${stage}:${accountId}:${windowKey}:${resetsAtMinuteBucket}`;
 }
 
 function parseTimestamp(timestamp: string | number): number {
@@ -602,12 +627,14 @@ export class AlertService {
 		const windows = extractUsageWindows(usage);
 		if (windows.length === 0) return;
 		const config = getAlertsConfig(this.config);
-		const alerts: AlertEvent[] = [];
 		for (const window of windows) {
 			// A window with no resets_at has no cycle boundary to dedup against
 			// or project toward — skip it rather than risk firing every poll.
 			if (window.resetsAtMs == null) continue;
 			const resetsAtMs = window.resetsAtMs;
+			// Threshold alerts persist immediately, before any projection work:
+			// they do not depend on history, and a projection-query failure
+			// must not discard them (pro-gate finding).
 			const thresholdAlert = this.buildUsageWindowThresholdAlert(
 				accountId,
 				accountName,
@@ -617,26 +644,45 @@ export class AlertService {
 				config,
 				timestamp,
 			);
-			if (thresholdAlert) alerts.push(thresholdAlert);
-			const exhaustionAlert = await this.buildUsageWindowExhaustionAlert(
-				accountId,
-				accountName,
-				window.windowKey,
-				window.utilization,
-				resetsAtMs,
-				timestamp,
-			);
-			if (exhaustionAlert) alerts.push(exhaustionAlert);
+			if (thresholdAlert) {
+				await this.persistUsageWindowAlert(thresholdAlert, config.webhookUrl);
+			}
+			// Projection is best-effort per window: a history lookup failing for
+			// one window must not cancel evaluation of the remaining windows.
+			try {
+				const exhaustionAlert = await this.buildUsageWindowExhaustionAlert(
+					accountId,
+					accountName,
+					window.windowKey,
+					window.utilization,
+					resetsAtMs,
+					timestamp,
+				);
+				if (exhaustionAlert) {
+					await this.persistUsageWindowAlert(
+						exhaustionAlert,
+						config.webhookUrl,
+					);
+				}
+			} catch (error) {
+				log.warn(
+					`Usage-window exhaustion projection failed for ${accountName}/${window.windowKey}: ${error}`,
+				);
+			}
 		}
-		for (const alert of alerts) {
-			// Jitter <2s can move the minute bucket by exactly one when the
-			// reset instant sits near a half-minute boundary — treat an alert
-			// already persisted in an adjacent bucket as the same cycle so a
-			// boundary-straddling jitter cannot double-fire (review finding,
-			// corroborated cross-model).
-			if (await this.usageWindowNeighborBucketExists(alert.id)) continue;
-			await this.persistAndEmit(alert, config.webhookUrl);
-		}
+	}
+
+	private async persistUsageWindowAlert(
+		alert: AlertEvent,
+		webhookUrl: string,
+	): Promise<void> {
+		// Jitter <2s can move the minute bucket by exactly one when the reset
+		// instant sits near a half-minute boundary — treat an alert already
+		// persisted in an adjacent bucket as the same cycle so a
+		// boundary-straddling jitter cannot double-fire (review finding,
+		// corroborated cross-model).
+		if (await this.usageWindowNeighborBucketExists(alert.id)) return;
+		await this.persistAndEmit(alert, webhookUrl);
 	}
 
 	private async usageWindowNeighborBucketExists(
@@ -665,19 +711,23 @@ export class AlertService {
 		if (!shouldFireAlert(config.usageWindowThresholdPercent, utilization)) {
 			return null;
 		}
+		// 100% is a hard cap (the window is fully exhausted, not just past a
+		// soft threshold) — operationally worse than crossing the configured
+		// percent, so it earns critical AND its own dedup stage: the earlier
+		// warning must not consume the cycle's only id and silently swallow
+		// the escalation (pro-gate finding).
+		const stage = utilization >= 100 ? "critical" : "warning";
 		return {
 			id: buildUsageWindowAlertId(
 				"usage_window_threshold",
 				accountId,
 				windowKey,
 				resetsAtMs,
+				stage,
 			),
 			timestamp,
 			type: "usage_window_threshold",
-			// 100% is a hard cap (the window is fully exhausted, not just past a
-			// soft threshold) — that state is operationally worse than merely
-			// crossing the configured percent, so it earns critical.
-			severity: utilization >= 100 ? "critical" : "warning",
+			severity: stage,
 			title: "Usage window threshold exceeded",
 			message: `Account ${accountName}'s ${windowKey} usage window reached ${utilization.toFixed(1)}%, meeting the configured ${config.usageWindowThresholdPercent}% threshold.`,
 			value: utilization,
@@ -708,10 +758,18 @@ export class AlertService {
 		// this SELECT runs, and reading that row PLUS the push below would
 		// double-count the current point and bias the regression (pro-gate
 		// cross-model finding).
+		//
+		// Aggregate into 5-minute buckets (last sample time, mean utilization)
+		// so the regression input is bounded (~2016 rows for a 7d window) even
+		// at the supported 10s poll interval — re-reading every raw row per
+		// poll is quadratic over the cycle (pro-gate finding). Integer
+		// division truncates identically on SQLite and Postgres.
 		const rows = await this.db.query<UsageSnapshotSqlRow>(
-			`SELECT timestamp, utilization, resets_at FROM usage_snapshots
+			`SELECT MAX(timestamp) AS timestamp, AVG(utilization) AS utilization, MAX(resets_at) AS resets_at
+			 FROM usage_snapshots
 			 WHERE account_id = ? AND window_key = ? AND timestamp >= ? AND timestamp < ?
-			 ORDER BY timestamp ASC`,
+			 GROUP BY timestamp / 300000
+			 ORDER BY MAX(timestamp) ASC`,
 			[accountId, windowKey, windowStartMs, timestamp],
 		);
 		const points: PredictionPoint[] = rows.map((row) => ({

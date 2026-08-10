@@ -122,6 +122,18 @@ async function buildFleetResponse(
 	const accounts = await context.dbOps.getAllAccounts();
 	const results: FleetAccountUsageSeries[] = [];
 
+	// Bucket in SQL so database work is bounded BEFORE rows leave the DB
+	// (pro-gate finding): bucket width targets <=MAX_FLEET_POINTS_PER_SERIES
+	// buckets across the range, floored at one minute. Bucket-start
+	// timestamps are grid-aligned across accounts, so the client-side merge
+	// collapses onto shared rows instead of one disjoint row set per account.
+	const bucketMs = Math.max(
+		60_000,
+		Math.ceil(
+			(Date.now() - opts.startMs) / MAX_FLEET_POINTS_PER_SERIES / 60_000,
+		) * 60_000,
+	);
+
 	for (const account of accounts) {
 		let rows: Awaited<ReturnType<typeof context.dbOps.getUsageHistory>>;
 		try {
@@ -129,6 +141,7 @@ async function buildFleetResponse(
 				accountId: account.id,
 				windowKey: opts.windowKey,
 				since: opts.startMs,
+				bucketMs,
 			});
 		} catch (error) {
 			// One account's transient failure must not 500 the whole fleet

@@ -49,6 +49,7 @@ import {
 	getRepresentativeUtilizationForProvider,
 	isCodexSubscriptionEndpoint,
 	resolveCodexEndpoint,
+	type UsageData,
 	usageCache,
 } from "@better-ccflare/providers";
 import {
@@ -230,6 +231,10 @@ export interface UsageCacheRegistrar {
 		tokenProvider: () => Promise<string>,
 		provider: string,
 		intervalMs: number,
+		customEndpoint?: string | null,
+		onWindowReset?: (accountId: string) => void,
+		onCapacityRestored?: (accountId: string) => void,
+		onSnapshot?: (accountId: string, data: UsageData) => void,
 	): void;
 }
 
@@ -255,6 +260,7 @@ export function registerMinimaxUsagePolling(
 	usageCache: UsageCacheRegistrar,
 	intervalMs: number,
 	logger?: Logger,
+	onSnapshot?: (accountId: string, data: UsageData) => void,
 ): boolean {
 	if (account.provider !== "minimax") return false;
 	if (!account.api_key) {
@@ -269,6 +275,10 @@ export function registerMinimaxUsagePolling(
 		apiKeyProvider,
 		account.provider,
 		intervalMs,
+		undefined,
+		undefined,
+		undefined,
+		onSnapshot,
 	);
 	return true;
 }
@@ -300,11 +310,22 @@ export function bootstrapMinimaxUsagePolling(
 	usageCache: UsageCacheRegistrar,
 	intervalMs: number,
 	logger?: Logger,
+	makeOnSnapshot?: (
+		account: Account,
+	) => (accountId: string, data: UsageData) => void,
 ): string[] {
 	const minimaxAccounts = accounts.filter((a) => a.provider === "minimax");
 	const registered: string[] = [];
 	for (const account of minimaxAccounts) {
-		if (registerMinimaxUsagePolling(account, usageCache, intervalMs, logger)) {
+		if (
+			registerMinimaxUsagePolling(
+				account,
+				usageCache,
+				intervalMs,
+				logger,
+				makeOnSnapshot?.(account),
+			)
+		) {
 			registered.push(account.id);
 		}
 	}
@@ -1143,6 +1164,30 @@ export default async function startServer(options?: {
 	const alertService = new AlertService(db, config);
 	alertService.start();
 	registerDisposable({ dispose: () => alertService.stop() });
+
+	// Shared successful-poll snapshot dispatch for the API-key pollers
+	// (nanogpt/zai/kilo/minimax): history persistence + usage-window alert
+	// evaluation, mirroring the refresh-backed path's onSnapshot callback.
+	// Without this these pollers were silently unwired from both surfaces
+	// (pro-gate finding). Best-effort on both calls — never fatal to polling.
+	const makeSnapshotDispatch =
+		(accountName: string) => (accountId: string, data: UsageData) => {
+			const now = Date.now();
+			dbOps
+				.recordUsageSnapshot(accountId, data, now)
+				.catch((err) =>
+					log.warn(
+						`Failed to record usage snapshot for account ${accountId}: ${err}`,
+					),
+				);
+			alertService
+				.evaluateUsageSnapshot(accountId, accountName, data, now)
+				.catch((err) =>
+					log.warn(
+						`Failed to evaluate usage-window alerts for account ${accountId}: ${err}`,
+					),
+				);
+		};
 
 	// Strategy is constructed below after RuntimeConfig is built. The router
 	// accepts a getter so it can read the live (post-hot-reload) instance.
@@ -2176,6 +2221,9 @@ Available endpoints:
 					account.provider,
 					config.getUsagePollIntervalMs(),
 					account.custom_endpoint,
+					undefined,
+					undefined,
+					makeSnapshotDispatch(account.name),
 				);
 				log.info(`Started usage polling for NanoGPT account ${account.name}`);
 			} else {
@@ -2222,6 +2270,8 @@ Available endpoints:
 								),
 							);
 					},
+					undefined,
+					makeSnapshotDispatch(account.name),
 				);
 				log.info(`Started usage polling for Zai account ${account.name}`);
 			} else {
@@ -2248,6 +2298,10 @@ Available endpoints:
 					apiKeyProvider,
 					account.provider,
 					config.getUsagePollIntervalMs(),
+					undefined,
+					undefined,
+					undefined,
+					makeSnapshotDispatch(account.name),
 				);
 				log.info(
 					`Started usage polling for Kilo Gateway account ${account.name}`,
@@ -2269,6 +2323,7 @@ Available endpoints:
 		usageCache,
 		config.getUsagePollIntervalMs(),
 		log,
+		(account) => makeSnapshotDispatch(account.name),
 	);
 	if (minimaxAccounts.length === 0) {
 		log.info(`No Minimax accounts found, usage polling will not start`);

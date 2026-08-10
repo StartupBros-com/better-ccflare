@@ -432,6 +432,40 @@ describe("AlertService usage-window alerts", () => {
 		expect(await service.listAlerts()).toHaveLength(0);
 	});
 
+	it("re-fires as critical when utilization escalates 92 -> 100 within one cycle", async () => {
+		// The earlier warning must not consume the cycle's only dedup id and
+		// silently swallow the exhaustion escalation (pro-gate finding): the
+		// stage segment in the alert id gives warning and critical one firing
+		// each per cycle.
+		service = new AlertService(new BunSqlAdapter(sqlite), makeConfig());
+		service.start();
+
+		const start = 1_800_000_000_000;
+		const resetsAtMs = start + FIVE_HOURS_MS;
+		for (const [pollOffset, utilization] of [
+			[0, 92],
+			[90_000, 100],
+			[180_000, 100], // third poll must NOT fire a second critical
+		] as const) {
+			await service.evaluateUsageSnapshot(
+				"acct-1",
+				"Primary account",
+				{
+					five_hour: {
+						utilization,
+						resets_at: new Date(resetsAtMs).toISOString(),
+					},
+				},
+				start + pollOffset,
+			);
+		}
+
+		const alerts = (await service.listAlerts())
+			.filter((a) => a.type === "usage_window_threshold")
+			.sort((a, b) => a.timestamp - b.timestamp);
+		expect(alerts.map((a) => a.severity)).toEqual(["warning", "critical"]);
+	});
+
 	it("escalates to critical severity at 100% utilization", async () => {
 		service = new AlertService(new BunSqlAdapter(sqlite), makeConfig());
 		service.start();
