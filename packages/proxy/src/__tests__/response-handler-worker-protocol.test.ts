@@ -1,5 +1,8 @@
 import { describe, expect, it, mock, spyOn } from "bun:test";
-import { requestEvents } from "@better-ccflare/core";
+import {
+	type CacheFlightCohortSealReceipt,
+	requestEvents,
+} from "@better-ccflare/core";
 import type { Account } from "@better-ccflare/types";
 import { ANTHROPIC_SEMANTIC_LIVENESS_ERROR_FRAME } from "../anthropic-semantic-liveness";
 import {
@@ -69,6 +72,79 @@ describe("forwardToClient usage-collector protocol", () => {
 			refreshInFlight: new Map<string, Promise<string>>(),
 			asyncWriter: {},
 		} as unknown as import("../handlers").ProxyContext;
+	}
+
+	function makeXaiAccount(overrides: Partial<Account> = {}): Account {
+		return {
+			id: "raw-serving-account-final",
+			name: "Grok Final",
+			provider: "xai",
+			api_key: "sk-redacted",
+			refresh_token: null,
+			access_token: null,
+			expires_at: null,
+			request_count: 0,
+			total_requests: 0,
+			last_used: null,
+			created_at: Date.now(),
+			rate_limited_until: null,
+			rate_limited_reason: null,
+			rate_limited_at: null,
+			session_start: null,
+			session_request_count: 0,
+			paused: false,
+			rate_limit_reset: null,
+			rate_limit_status: null,
+			rate_limit_remaining: null,
+			priority: 0,
+			auto_fallback_enabled: false,
+			auto_refresh_enabled: false,
+			auto_pause_on_overage_enabled: false,
+			peak_hours_pause_enabled: false,
+			custom_endpoint: null,
+			model_mappings: null,
+			cross_region_mode: null,
+			model_fallbacks: null,
+			billing_type: null,
+			pause_reason: null,
+			refresh_token_issued_at: null,
+			consecutive_rate_limits: 0,
+			...overrides,
+		};
+	}
+
+	function makeSealReceipt(): CacheFlightCohortSealReceipt {
+		const serviceEpoch = Object.freeze({
+			id: "cohort_service_epoch_safe",
+			occurrenceId: "cohort_service_occurrence_safe",
+			sealContractVersion: 1,
+			deploymentRevision: "abcdef123456",
+			serviceInstanceId: "cohort_service_instance_safe",
+			processStartedAt: "2026-08-08T00:00:00.000Z",
+			nativeCacheState: "enabled" as const,
+			recorderState: "enabled" as const,
+			keepalivePolicy: Object.freeze({
+				globalTtlMinutes: 5,
+				xaiTtlMinutes: 0,
+				effectiveXaiEnabled: true,
+				effectiveXaiTtlMinutes: 5,
+			}),
+			completeness: "complete" as const,
+			unavailableDimensions: Object.freeze([]),
+		});
+		return Object.freeze({
+			serviceEpoch,
+			observationPartition: Object.freeze({
+				id: "cohort_observation_partition_safe",
+				serviceEpochId: serviceEpoch.id,
+				servingAccountScope: "cohort_serving_account_scope_safe",
+				routeModelEpoch: "cohort_route_model_epoch_safe",
+				completeness: "complete" as const,
+				unavailableDimensions: Object.freeze([]),
+			}),
+			completeness: "complete" as const,
+			unavailableDimensions: Object.freeze([]),
+		});
 	}
 
 	it("calls handleStart with messageId", async () => {
@@ -237,6 +313,168 @@ describe("forwardToClient usage-collector protocol", () => {
 			response.headers.get("x-better-ccflare-cache-flight-recorder-id"),
 		).toBeNull();
 		expect(starts[0].cacheFlightRecorderConversationId).toBeUndefined();
+	});
+
+	it.each([
+		{ label: "streaming", streaming: true, body: "data: ok\n\n" },
+		{ label: "non-streaming", streaming: false, body: '{"ok":true}' },
+	])("attaches one frozen cohort receipt for an eligible official xAI $label final response", async ({
+		streaming,
+		body,
+	}) => {
+		const { starts } = createMockCollector();
+		const ctx = createCtx(false);
+		ctx.provider.name = "xai";
+		ctx.provider.isStreamingResponse = () => streaming;
+		const receipt = makeSealReceipt();
+		const captureReceipt = mock(() => receipt);
+		ctx.cacheFlightCohortSeal = { captureReceipt } as never;
+		const account = makeXaiAccount();
+
+		const response = await forwardToClient(
+			{
+				requestId: `req-cohort-seal-${streaming ? "stream" : "body"}`,
+				method: "POST",
+				path: "/v1/messages",
+				account,
+				requestHeaders: new Headers(),
+				requestBody: null,
+				response: new Response(body, {
+					status: 200,
+					headers: {
+						"content-type": streaming
+							? "text/event-stream"
+							: "application/json",
+					},
+				}),
+				timestamp: Date.now(),
+				retryAttempt: 0,
+				failoverAttempts: 1,
+				xaiCacheIdentityFingerprint: "identity-fingerprint-safe",
+				xaiCachePrefixFingerprint: "prefix-fingerprint-safe",
+				xaiCacheOfficialEndpoint: true,
+				xaiCacheKeyPresent: true,
+				cacheFlightRecorderConversationId:
+					"cfr_0123456789abcdef0123456789abcdef",
+				cacheFlightRecorderEligible: true,
+				cacheFlightRecorderNativeActive: true,
+				attemptedModel: "grok-4-final-attempt",
+				routeCandidateId: "raw-route-candidate-final",
+			},
+			ctx,
+		);
+
+		if (streaming) await response.text();
+
+		expect(captureReceipt).toHaveBeenCalledTimes(1);
+		expect(captureReceipt.mock.calls[0]?.[0]).toEqual({
+			finalServingAccount: account,
+			attemptedTransportModel: "grok-4-final-attempt",
+			routeCandidateId: "raw-route-candidate-final",
+		});
+		expect(starts[0].cacheFlightCohortSealReceipt).toBe(receipt);
+		expect("attemptedModel" in starts[0]).toBe(false);
+		expect("routeCandidateId" in starts[0]).toBe(false);
+
+		const serialized = JSON.stringify(starts[0]);
+		expect(serialized).toContain("cacheFlightCohortSealReceipt");
+		expect(serialized).not.toContain("grok-4-final-attempt");
+		expect(serialized).not.toContain("raw-route-candidate-final");
+		expect(serialized).not.toContain("sk-redacted");
+		const serializedReceipt = JSON.stringify(
+			starts[0].cacheFlightCohortSealReceipt,
+		);
+		expect(serializedReceipt).not.toContain("raw-serving-account-final");
+		expect(serializedReceipt).not.toContain("grok-4-final-attempt");
+		expect(serializedReceipt).not.toContain("raw-route-candidate-final");
+	});
+
+	it("omits the receipt and does not call the seal service for request-ineligible xAI metadata", async () => {
+		const { starts } = createMockCollector();
+		const ctx = createCtx(false);
+		ctx.provider.name = "xai";
+		const captureReceipt = mock(() => makeSealReceipt());
+		ctx.cacheFlightCohortSeal = { captureReceipt } as never;
+
+		await forwardToClient(
+			{
+				requestId: "req-cohort-seal-ineligible",
+				method: "POST",
+				path: "/v1/messages",
+				account: makeXaiAccount(),
+				requestHeaders: new Headers(),
+				requestBody: null,
+				response: new Response("{}", {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+				timestamp: Date.now(),
+				retryAttempt: 0,
+				failoverAttempts: 0,
+				xaiCacheOfficialEndpoint: true,
+				cacheFlightRecorderConversationId:
+					"cfr_0123456789abcdef0123456789abcdef",
+				cacheFlightRecorderEligible: false,
+				attemptedModel: "grok-4-ineligible",
+				routeCandidateId: "raw-route-candidate-ineligible",
+			},
+			ctx,
+		);
+
+		expect(captureReceipt).not.toHaveBeenCalled();
+		expect(starts[0].cacheFlightCohortSealReceipt).toBeUndefined();
+		expect(JSON.stringify(starts[0])).not.toContain(
+			"raw-route-candidate-ineligible",
+		);
+	});
+
+	it("omits the receipt and still delivers when cohort seal capture throws", async () => {
+		const { starts } = createMockCollector();
+		const ctx = createCtx(false);
+		ctx.provider.name = "xai";
+		const captureReceipt = mock(() => {
+			throw new Error("receipt repository unavailable");
+		});
+		ctx.cacheFlightCohortSeal = { captureReceipt } as never;
+		const account = makeXaiAccount();
+
+		const response = await forwardToClient(
+			{
+				requestId: "req-cohort-seal-capture-throws",
+				method: "POST",
+				path: "/v1/messages",
+				account,
+				requestHeaders: new Headers(),
+				requestBody: null,
+				response: new Response('{"ok":true}', {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+				timestamp: Date.now(),
+				retryAttempt: 0,
+				failoverAttempts: 0,
+				xaiCacheOfficialEndpoint: true,
+				cacheFlightRecorderConversationId:
+					"cfr_0123456789abcdef0123456789abcdef",
+				cacheFlightRecorderEligible: true,
+				attemptedModel: "grok-4-capture-throws",
+				routeCandidateId: "raw-route-candidate-capture-throws",
+			},
+			ctx,
+		);
+
+		expect(response.status).toBe(200);
+		await expect(response.text()).resolves.toBe('{"ok":true}');
+		expect(captureReceipt).toHaveBeenCalledTimes(1);
+		expect(captureReceipt.mock.calls[0]?.[0]).toEqual({
+			finalServingAccount: account,
+			attemptedTransportModel: "grok-4-capture-throws",
+			routeCandidateId: "raw-route-candidate-capture-throws",
+		});
+		expect(starts[0].cacheFlightCohortSealReceipt).toBeUndefined();
+		expect(JSON.stringify(starts[0])).not.toContain(
+			"raw-route-candidate-capture-throws",
+		);
 	});
 
 	it("does not throw when usage collector call succeeds", async () => {

@@ -1,4 +1,13 @@
-import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import {
+	afterEach,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	mock,
+	spyOn,
+} from "bun:test";
+import type { CacheFlightCohortSealReceipt } from "@better-ccflare/core";
 import type {
 	Provider,
 	ProviderAttemptPlan,
@@ -15,6 +24,7 @@ import type {
 	ServerToolRequirements,
 } from "@better-ccflare/types";
 import { ServerToolCandidateCapabilityError } from "../../server-tool-routing-errors";
+import type { StartMessage } from "../../worker-messages";
 import type { ProxyContext } from "../proxy-types";
 
 // Source worktrees intentionally omit generated database worker bundles. This
@@ -73,6 +83,7 @@ const {
 	proxyWithAccount,
 } = await import("../proxy-operations");
 const { RoutingAttemptLedger } = await import("../routing-attempt-ledger");
+const usageCollectorModule = await import("../../usage-collector");
 
 // Minimal Account fixture for openai-compatible provider
 function makeAccount(overrides: Partial<Account> = {}): Account {
@@ -221,6 +232,71 @@ function jsonResponse(body: object, status: number) {
 		status,
 		headers: { "Content-Type": "application/json" },
 	});
+}
+
+function makeSealReceipt(
+	id = "cohort_observation_partition_proxy_terminal",
+): CacheFlightCohortSealReceipt {
+	const serviceEpoch = Object.freeze({
+		id: "cohort_service_epoch_proxy_terminal",
+		occurrenceId: "cohort_service_occurrence_proxy_terminal",
+		sealContractVersion: 1,
+		deploymentRevision: "abcdef123456",
+		serviceInstanceId: "cohort_service_instance_proxy_terminal",
+		processStartedAt: "2026-08-08T00:00:00.000Z",
+		nativeCacheState: "enabled" as const,
+		recorderState: "enabled" as const,
+		keepalivePolicy: Object.freeze({
+			globalTtlMinutes: 5,
+			xaiTtlMinutes: 0,
+			effectiveXaiEnabled: true,
+			effectiveXaiTtlMinutes: 5,
+		}),
+		completeness: "complete" as const,
+		unavailableDimensions: Object.freeze([]),
+	});
+	return Object.freeze({
+		serviceEpoch,
+		observationPartition: Object.freeze({
+			id,
+			serviceEpochId: serviceEpoch.id,
+			servingAccountScope: "cohort_serving_account_scope_proxy_terminal",
+			routeModelEpoch: "cohort_route_model_epoch_proxy_terminal",
+			completeness: "complete" as const,
+			unavailableDimensions: Object.freeze([]),
+		}),
+		completeness: "complete" as const,
+		unavailableDimensions: Object.freeze([]),
+	});
+}
+
+function installUsageCollector() {
+	const handleStart = mock(() => undefined);
+	const collectorSpy = spyOn(
+		usageCollectorModule,
+		"getUsageCollector",
+	).mockReturnValue({
+		handleStart,
+		handleChunk: mock(() => undefined),
+		handleEnd: mock(async () => undefined),
+	} as unknown as usageCollectorModule.UsageCollector);
+	return {
+		handleStart,
+		restore: () => collectorSpy.mockRestore(),
+	};
+}
+
+function installCohortSeal(
+	ctx: ProxyContext,
+	receipt: CacheFlightCohortSealReceipt,
+) {
+	const captureReceipt = mock(() => receipt);
+	(
+		ctx as ProxyContext & {
+			cacheFlightCohortSeal: { captureReceipt: typeof captureReceipt };
+		}
+	).cacheFlightCohortSeal = { captureReceipt };
+	return captureReceipt;
 }
 
 function makeAttemptPlanningProvider(
@@ -3508,6 +3584,90 @@ describe("proxyWithAccount - native xAI capacity failover (R5-R10, AE3/AE4a)", (
 			expect(body.error).toBe("rate limited");
 		} else {
 			expect(threwUsageCollectorError).toBe(true);
+		}
+	});
+
+	it.each([
+		{
+			label: "capacity 402",
+			status: 402,
+			body: '{"error":"insufficient credits","code":"xai_402"}',
+			headers: { "content-type": "application/json" },
+		},
+		{
+			label: "rate-limit 429",
+			status: 429,
+			body: '{"error":"rate limited"}',
+			headers: { "content-type": "application/json", "retry-after": "30" },
+		},
+	])("captures a final-candidate xAI $label receipt with the attempt-local candidate and attempted model", async ({
+		status,
+		body,
+		headers,
+	}) => {
+		const { handleStart, restore } = installUsageCollector();
+		try {
+			globalThis.fetch = mock(
+				async () =>
+					new Response(body, {
+						status,
+						headers,
+					}),
+			);
+
+			const bodyBuffer = makeRequestBody("grok-4");
+			const req = makeRequest(bodyBuffer);
+			const ctx = makeProxyContext();
+			const receipt = makeSealReceipt(
+				`cohort_observation_partition_proxy_terminal_${status}`,
+			);
+			const captureReceipt = installCohortSeal(ctx, receipt);
+			const account = makeXaiAccount({
+				id: `xai-terminal-${status}`,
+				name: `xAI Terminal ${status}`,
+			});
+			const requestMeta = makeRequestMeta({
+				id: `req-xai-terminal-${status}`,
+				cacheFlightRecorderConversationId: `cfr_terminal${status}00000000000000000000`,
+				xaiCacheIdentityFingerprint: "identity12345678",
+				xaiCachePrefixFingerprint: "prefix123456789",
+				xaiCacheNativeActive: true,
+			});
+
+			const result = await proxyWithAccount(
+				req,
+				new URL("https://proxy.local/v1/messages"),
+				account,
+				requestMeta,
+				bodyBuffer,
+				() => undefined,
+				0,
+				ctx,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				true,
+			);
+
+			expect(result?.status).toBe(status);
+			await result?.text();
+			expect(captureReceipt).toHaveBeenCalledTimes(1);
+			const captureInput = captureReceipt.mock.calls[0]?.[0] as {
+				finalServingAccount: Account;
+				attemptedTransportModel: string | null;
+				routeCandidateId: string | null;
+			};
+			expect(captureInput.finalServingAccount).toBe(account);
+			expect(captureInput.attemptedTransportModel).toBe("grok-4");
+			expect(captureInput.routeCandidateId).toBe(`account:${account.id}`);
+			expect(handleStart).toHaveBeenCalledTimes(1);
+			const startMessage = handleStart.mock.calls[0]?.[0] as StartMessage;
+			expect(startMessage.cacheFlightCohortSealReceipt).toBe(receipt);
+			expect("attemptedModel" in startMessage).toBe(false);
+			expect("routeCandidateId" in startMessage).toBe(false);
+		} finally {
+			restore();
 		}
 	});
 

@@ -1,4 +1,8 @@
-import { requestEvents, TIME_CONSTANTS } from "@better-ccflare/core";
+import {
+	type CacheFlightCohortSealReceipt,
+	requestEvents,
+	TIME_CONSTANTS,
+} from "@better-ccflare/core";
 import {
 	sanitizeRequestHeaders,
 	withSanitizedProxyHeaders,
@@ -50,6 +54,44 @@ import {
 } from "./worker-messages";
 
 const log = new Logger("ResponseHandler");
+
+function captureCacheFlightCohortSealReceipt(
+	options: Pick<
+		ResponseHandlerOptions,
+		| "requestId"
+		| "account"
+		| "cacheFlightRecorderConversationId"
+		| "cacheFlightRecorderEligible"
+		| "xaiCacheOfficialEndpoint"
+		| "attemptedModel"
+		| "routeCandidateId"
+	>,
+	ctx: ProxyContext,
+): CacheFlightCohortSealReceipt | null {
+	if (
+		options.cacheFlightRecorderEligible !== true ||
+		!options.cacheFlightRecorderConversationId ||
+		options.xaiCacheOfficialEndpoint !== true ||
+		ctx.provider.name !== "xai" ||
+		!options.account ||
+		!ctx.cacheFlightCohortSeal
+	) {
+		return null;
+	}
+
+	try {
+		return ctx.cacheFlightCohortSeal.captureReceipt({
+			finalServingAccount: options.account,
+			attemptedTransportModel: options.attemptedModel ?? null,
+			routeCandidateId: options.routeCandidateId ?? null,
+		});
+	} catch {
+		log.warn("Cache flight cohort seal capture failed", {
+			requestId: options.requestId,
+		});
+		return null;
+	}
+}
 
 function fireAndForgetEnd(
 	msg: EndMessage,
@@ -405,6 +447,18 @@ export async function forwardToClient(
 
 	// Send START message immediately if not filtered
 	if (shouldProcessRequest) {
+		const cacheFlightCohortSealReceipt = captureCacheFlightCohortSealReceipt(
+			{
+				requestId,
+				account,
+				cacheFlightRecorderConversationId,
+				cacheFlightRecorderEligible,
+				xaiCacheOfficialEndpoint,
+				attemptedModel,
+				routeCandidateId,
+			},
+			ctx,
+		);
 		const startMessage: StartMessage = {
 			type: "start",
 			messageId: crypto.randomUUID(),
@@ -477,6 +531,9 @@ export async function forwardToClient(
 						cacheFlightRecorderEligible: true,
 						cacheFlightRecorderNativeActive:
 							cacheFlightRecorderNativeActive === true,
+						...(cacheFlightCohortSealReceipt
+							? { cacheFlightCohortSealReceipt }
+							: {}),
 					}
 				: {}),
 			failoverAttempts,

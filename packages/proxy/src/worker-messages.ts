@@ -3,6 +3,7 @@
  * Handles both streaming and non-streaming responses
  */
 
+import type { CacheFlightCohortSealReceipt } from "@better-ccflare/core";
 import type {
 	AgentAttributionSource,
 	ProjectAttributionSource,
@@ -85,6 +86,7 @@ export interface StartMessage {
 	cacheFlightRecorderConversationId?: string | null;
 	cacheFlightRecorderEligible?: boolean;
 	cacheFlightRecorderNativeActive?: boolean;
+	cacheFlightCohortSealReceipt?: CacheFlightCohortSealReceipt | null;
 
 	// Retry info
 	retryAttempt: number;

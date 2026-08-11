@@ -5427,6 +5427,7 @@ export async function proxyWithAccount(
 						cacheFlightRecorderEligible,
 						cacheFlightRecorderNativeActive:
 							requestMeta.xaiCacheNativeActive === true,
+						routeCandidateId,
 						routingMeta: requestMeta,
 						anthropicDegradedLifecycle: activeLifecycleForLatestResponse(),
 					},
@@ -5534,7 +5535,7 @@ export async function proxyWithAccount(
 				cacheFlightRecorderEligible,
 				cacheFlightRecorderNativeActive:
 					requestMeta.xaiCacheNativeActive === true,
-				routeCandidateId: modelFallbackPolicy?.routeCandidateId ?? null,
+				routeCandidateId,
 				routingMeta: requestMeta,
 				anthropicDegradedLifecycle: responseLifecycle,
 			},

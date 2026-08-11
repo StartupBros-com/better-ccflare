@@ -1,5 +1,6 @@
 import {
 	BUFFER_SIZES,
+	type CacheFlightCohortSealReceipt,
 	cacheOutcomeFromTokens,
 	estimateCostUSD,
 	formatXaiCacheCanary,
@@ -33,6 +34,7 @@ import {
 
 interface RequestState {
 	startMessage: StartMessage;
+	cacheFlightCohortSealReceipt?: CacheFlightCohortSealReceipt | null;
 	buffer: string;
 	streamDecoder: TextDecoder;
 	chunks: Uint8Array[];
@@ -429,6 +431,7 @@ export class UsageCollector {
 		const now = Date.now();
 		const state: RequestState = {
 			startMessage: msg,
+			cacheFlightCohortSealReceipt: msg.cacheFlightCohortSealReceipt ?? null,
 			buffer: "",
 			streamDecoder: new TextDecoder(),
 			chunks: [],
@@ -859,12 +862,22 @@ export class UsageCollector {
 					unavailableDimensions.length === 0 ? "complete" : "partial",
 				unavailableDimensions,
 			};
+			const sealReceipt = state.cacheFlightCohortSealReceipt ?? null;
 			const accepted = this.asyncWriter.enqueue(async () => {
 				try {
-					await this.dbOps.appendCacheFlightRecorderTurn(
-						recorderConversationId,
-						turn,
-					);
+					if (sealReceipt) {
+						await this.dbOps.appendCacheFlightRecorderTurn(
+							recorderConversationId,
+							turn,
+							undefined,
+							sealReceipt,
+						);
+					} else {
+						await this.dbOps.appendCacheFlightRecorderTurn(
+							recorderConversationId,
+							turn,
+						);
+					}
 				} catch {
 					log.warn("Cache flight recorder write failed", {
 						recorderConversationId,
