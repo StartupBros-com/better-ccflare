@@ -2026,7 +2026,7 @@ export class CodexProvider extends BaseProvider {
 					);
 					const encryptedContent = block.data.slice(separatorIndex + 1);
 					if (
-						/^[A-Za-z0-9_]*$/.test(reasoningId) &&
+						/^[A-Za-z0-9_-]*$/.test(reasoningId) &&
 						encryptedContent.length > 0
 					) {
 						flushText();
@@ -3570,16 +3570,30 @@ export class CodexProvider extends BaseProvider {
 				) {
 					await ensureMessageStart();
 					if (state.hasSentContentBlockStart) {
-						await writeSSE("content_block_stop", {
-							type: "content_block_stop",
-							index: state.contentBlockIndex,
-						});
+						// Only close the current block if it's not a still-open function-call
+						// block awaiting output_item.done — closing it here would produce a
+						// premature content_block_stop that output_item.done will duplicate.
+						const isOpenFunctionCallBlock = [
+							...state.functionCallBlocks.values(),
+						].some((b) => b.contentBlockIndex === state.contentBlockIndex);
+						if (!isOpenFunctionCallBlock) {
+							await writeSSE("content_block_stop", {
+								type: "content_block_stop",
+								index: state.contentBlockIndex,
+							});
+						}
 						state.contentBlockIndex++;
 						state.hasSentContentBlockStart = false;
 					}
 
 					const reasoningBlockIndex = state.contentBlockIndex;
-					const reasoningId = typeof item?.id === "string" ? item.id : "";
+					// The wrapper is dot-delimited, and the replay parser accepts
+					// [A-Za-z0-9_-] ids only — an id outside that set must degrade to ""
+					// at emit time or our own block would fail its own parse on replay.
+					const rawReasoningId = typeof item?.id === "string" ? item.id : "";
+					const reasoningId = /^[A-Za-z0-9_-]*$/.test(rawReasoningId)
+						? rawReasoningId
+						: "";
 					await writeSSE("content_block_start", {
 						type: "content_block_start",
 						index: reasoningBlockIndex,

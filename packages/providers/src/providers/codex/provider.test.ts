@@ -401,7 +401,7 @@ describe("CodexProvider request conversion", () => {
 							},
 							{
 								type: "redacted_thinking",
-								data: "bccfr1.rs-invalid.ciphertext",
+								data: "bccfr1.rs$invalid.ciphertext",
 							},
 							{
 								type: "redacted_thinking",
@@ -1934,6 +1934,170 @@ describe("CodexProvider.processResponse", () => {
 		expect(body).not.toContain("rawSilenceTimeoutMs");
 		expect(body).not.toContain("upstream_stream_read_error");
 		expect(body).not.toContain("abrupt_stream_eof");
+	});
+
+	it("does not prematurely close an in-flight function-call block when reasoning completes", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_interleaved", model: "gpt-5.6-sol" },
+			}),
+			...eventLine("response.output_item.added", {
+				item: { type: "function_call", call_id: "call_1", name: "Read" },
+				output_index: 0,
+			}),
+			...eventLine("response.function_call_arguments.delta", {
+				delta: '{"path":',
+				output_index: 0,
+			}),
+			...eventLine("response.output_item.done", {
+				item: {
+					type: "reasoning",
+					id: "rs_mid",
+					encrypted_content: "midstream",
+				},
+				output_index: 1,
+			}),
+			...eventLine("response.function_call_arguments.delta", {
+				delta: '"x"}',
+				output_index: 0,
+			}),
+			...eventLine("response.output_item.done", {
+				item: { type: "function_call", call_id: "call_1", name: "Read" },
+				output_index: 0,
+			}),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.6-sol",
+					usage: { input_tokens: 1, output_tokens: 1 },
+				},
+			}),
+		]);
+		const transformed = await provider.processResponse(
+			new Response(upstreamBody, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+
+		const transformedBody = await transformed.text();
+		const events = transformedBody
+			.split("\n")
+			.filter((line) => line.startsWith("data:"))
+			.map(
+				(line) =>
+					JSON.parse(line.slice("data:".length).trim()) as Record<
+						string,
+						unknown
+					>,
+			);
+
+		// Exactly one content_block_stop per index — no duplicate stop for the
+		// tool_use block the reasoning item interleaved with.
+		const stopsByIndex = new Map<number, number>();
+		for (const event of events) {
+			if (event.type === "content_block_stop") {
+				const index = event.index as number;
+				stopsByIndex.set(index, (stopsByIndex.get(index) ?? 0) + 1);
+			}
+		}
+		for (const [index, count] of stopsByIndex) {
+			expect({ index, count }).toEqual({ index, count: 1 });
+		}
+
+		// The tool_use block's input_json_delta must precede its own stop.
+		const toolDeltaAt = events.findIndex(
+			(event) =>
+				event.type === "content_block_delta" &&
+				(event.delta as Record<string, unknown>)?.type === "input_json_delta",
+		);
+		const toolStopAt = events.findIndex(
+			(event) => event.type === "content_block_stop" && event.index === 0,
+		);
+		expect(toolDeltaAt).toBeGreaterThan(-1);
+		expect(toolStopAt).toBeGreaterThan(toolDeltaAt);
+
+		// Reasoning landed atomically at its own index.
+		expect(events).toContainEqual({
+			type: "content_block_start",
+			index: 1,
+			content_block: {
+				type: "redacted_thinking",
+				data: "bccfr1.rs_mid.midstream",
+			},
+		});
+	});
+
+	it("keeps emit and replay id charsets symmetric", async () => {
+		const provider = new CodexProvider();
+		const emit = async (id: string) => {
+			const upstreamBody = sseBody([
+				...eventLine("response.created", {
+					response: { id: "resp_ids", model: "gpt-5.6-sol" },
+				}),
+				...eventLine("response.output_item.done", {
+					item: { type: "reasoning", id, encrypted_content: "enc" },
+					output_index: 0,
+				}),
+				...eventLine("response.completed", {
+					response: {
+						model: "gpt-5.6-sol",
+						usage: { input_tokens: 1, output_tokens: 1 },
+					},
+				}),
+			]);
+			const transformed = await provider.processResponse(
+				new Response(upstreamBody, {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				}),
+				null,
+			);
+			return await transformed.text();
+		};
+
+		// A hyphenated id is representable and must survive emit.
+		expect(await emit("rs-hyphen-probe")).toContain(
+			'"data":"bccfr1.rs-hyphen-probe.enc"',
+		);
+		// A dotted id cannot be represented in the dot-delimited wrapper: it
+		// degrades to an empty id rather than minting a block that would fail
+		// its own replay parse.
+		expect(await emit("rs.dotted")).toContain('"data":"bccfr1..enc"');
+
+		// The hyphenated block replays as a reasoning input item.
+		const request = new Request("http://localhost/v1/messages", {
+			method: "POST",
+			body: JSON.stringify({
+				model: "gpt-5.6-sol",
+				max_tokens: 10,
+				messages: [
+					{
+						role: "assistant",
+						content: [
+							{
+								type: "redacted_thinking",
+								data: "bccfr1.rs-hyphen-probe.enc",
+							},
+							{ type: "text", text: "ok" },
+						],
+					},
+					{ role: "user", content: "next" },
+				],
+			}),
+			headers: { "content-type": "application/json" },
+		});
+		const transformedRequest = await provider.transformRequestBody(request);
+		const body = (await transformedRequest.json()) as {
+			input: Array<Record<string, unknown>>;
+		};
+		expect(body.input).toContainEqual({
+			type: "reasoning",
+			id: "rs-hyphen-probe",
+			summary: [],
+			encrypted_content: "enc",
+		});
 	});
 
 	it("emits retained reasoning atomically before following text", async () => {
