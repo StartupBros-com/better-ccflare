@@ -1558,6 +1558,208 @@ describe("UsageCollector request lifecycle", () => {
 			});
 			expect(fallbackLogs.events).toHaveLength(1);
 		});
+
+		it("excludes a pre-output declined iteration from the split price (documented shape)", async () => {
+			useDeterministicModelPricing();
+			const { collector, savedUsages } = harness();
+			const requestId = "stream-pre-output-decline-excluded";
+			const fallbackLogs = captureFallbackUsageLogs();
+
+			try {
+				collector.handleStart(makeStartMessage(requestId));
+				collector.handleChunk(
+					requestId,
+					new TextEncoder().encode(
+						`event: message_start\ndata: ${JSON.stringify({
+							type: "message_start",
+							message: {
+								model: FABLE_MODEL,
+								usage: {
+									input_tokens: 947,
+									output_tokens: 264,
+									iterations: [
+										{
+											type: "message",
+											model: FABLE_MODEL,
+											input_tokens: 535,
+											output_tokens: 0,
+										},
+										{
+											type: "fallback_message",
+											model: OPUS_MODEL,
+											input_tokens: 412,
+											output_tokens: 264,
+										},
+									],
+								},
+							},
+						})}\n\n`,
+					),
+				);
+
+				await collector.handleEnd({ type: "end", requestId, success: true });
+				await collector.drain();
+			} finally {
+				fallbackLogs.stop();
+			}
+
+			// Only the OPUS entry actually produced output; the FABLE entry
+			// declined before producing any and must never reach pricing.
+			expect(estimateCostUSD).toHaveBeenCalledTimes(1);
+			expect(estimateCostUSD).toHaveBeenCalledWith(OPUS_MODEL, {
+				inputTokens: 412,
+				outputTokens: 264,
+				cacheReadInputTokens: undefined,
+				cacheCreationInputTokens: undefined,
+			});
+			expect(savedUsages.get(requestId)).toMatchObject({
+				model: OPUS_MODEL,
+				costUsd: 6_104,
+			});
+			expect(fallbackLogs.events).toHaveLength(1);
+			expect(fallbackLogs.events[0]?.data).toEqual({
+				requestId,
+				from: FABLE_MODEL,
+				to: OPUS_MODEL,
+				iterationCount: 2,
+				priced: "iterations",
+			});
+		});
+
+		it("still bills a mid-output decline for the tokens it actually produced", async () => {
+			useDeterministicModelPricing();
+			const { collector, savedUsages } = harness();
+			const requestId = "stream-mid-output-decline-billed";
+			const fallbackLogs = captureFallbackUsageLogs();
+
+			try {
+				collector.handleStart(makeStartMessage(requestId));
+				collector.handleChunk(
+					requestId,
+					new TextEncoder().encode(
+						`event: message_start\ndata: ${JSON.stringify({
+							type: "message_start",
+							message: {
+								model: FABLE_MODEL,
+								usage: {
+									input_tokens: 220,
+									output_tokens: 240,
+									iterations: [
+										{
+											type: "message",
+											model: FABLE_MODEL,
+											input_tokens: 100,
+											output_tokens: 40,
+										},
+										{
+											type: "fallback_message",
+											model: OPUS_MODEL,
+											input_tokens: 120,
+											output_tokens: 200,
+										},
+									],
+								},
+							},
+						})}\n\n`,
+					),
+				);
+
+				await collector.handleEnd({ type: "end", requestId, success: true });
+				await collector.drain();
+			} finally {
+				fallbackLogs.stop();
+			}
+
+			// Both iterations produced output, so both are billed and summed —
+			// this is the case a stop_reason-based rule would wrongly drop.
+			expect(estimateCostUSD).toHaveBeenCalledTimes(2);
+			expect(estimateCostUSD).toHaveBeenNthCalledWith(1, FABLE_MODEL, {
+				inputTokens: 100,
+				outputTokens: 40,
+				cacheReadInputTokens: undefined,
+				cacheCreationInputTokens: undefined,
+			});
+			expect(estimateCostUSD).toHaveBeenNthCalledWith(2, OPUS_MODEL, {
+				inputTokens: 120,
+				outputTokens: 200,
+				cacheReadInputTokens: undefined,
+				cacheCreationInputTokens: undefined,
+			});
+			expect(savedUsages.get(requestId)).toMatchObject({
+				model: OPUS_MODEL,
+				costUsd: 4_740,
+			});
+			expect(fallbackLogs.events).toHaveLength(1);
+			expect(fallbackLogs.events[0]?.data).toEqual({
+				requestId,
+				from: FABLE_MODEL,
+				to: OPUS_MODEL,
+				iterationCount: 2,
+				priced: "iterations",
+			});
+		});
+
+		it("prices a fully pre-output-refused chain at zero without pricing any iteration", async () => {
+			useDeterministicModelPricing();
+			const { collector, savedUsages } = harness();
+			const requestId = "stream-fully-refused-chain-zero-cost";
+			const fallbackLogs = captureFallbackUsageLogs();
+
+			try {
+				collector.handleStart(makeStartMessage(requestId));
+				collector.handleChunk(
+					requestId,
+					new TextEncoder().encode(
+						`event: message_start\ndata: ${JSON.stringify({
+							type: "message_start",
+							message: {
+								model: FABLE_MODEL,
+								usage: {
+									input_tokens: 80,
+									output_tokens: 0,
+									iterations: [
+										{
+											type: "message",
+											model: FABLE_MODEL,
+											input_tokens: 50,
+											output_tokens: 0,
+										},
+										{
+											type: "fallback_message",
+											model: OPUS_MODEL,
+											input_tokens: 30,
+											output_tokens: 0,
+										},
+									],
+								},
+							},
+						})}\n\n`,
+					),
+				);
+
+				await collector.handleEnd({ type: "end", requestId, success: true });
+				await collector.drain();
+			} finally {
+				fallbackLogs.stop();
+			}
+
+			// Every iteration declined before producing output — genuinely $0,
+			// but it must be a deliberate branch, never the legacy empty-sum bug.
+			expect(estimateCostUSD).toHaveBeenCalledTimes(0);
+			expect(savedUsages.get(requestId)).toMatchObject({
+				model: OPUS_MODEL,
+				costUsd: 0,
+			});
+			expect(fallbackLogs.events).toHaveLength(1);
+			expect(fallbackLogs.events[0]?.data).toEqual({
+				requestId,
+				from: FABLE_MODEL,
+				to: OPUS_MODEL,
+				iterationCount: 2,
+				priced: "iterations",
+				billableIterations: 0,
+			});
+		});
 	});
 
 	it.each([

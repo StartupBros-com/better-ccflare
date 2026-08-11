@@ -820,6 +820,16 @@ export class UsageCollector {
 			iterations.length > 0 &&
 			state.usage.iterationsTruncated !== true &&
 			!iterationsStale;
+		// Anthropic does not bill an iteration that declined before producing
+		// any output: its tokens are reported on its usage.iterations entry
+		// but never charged ("Refusals and fallback" docs). This holds
+		// regardless of type/chain position/stop_reason, including the
+		// terminal entry of a fully-refused chain — so exclude every
+		// zero/undefined-output iteration from the split price. A
+		// mid-output decline is still billed for what it actually produced.
+		const billableIterations = hasFallbackBillingSplit
+			? iterations.filter((iteration) => (iteration.output_tokens ?? 0) > 0)
+			: undefined;
 		if (state.usage.model) {
 			const model = state.usage.model;
 			// Use provider's authoritative count if available, fallback to computed
@@ -844,8 +854,16 @@ export class UsageCollector {
 					startMessage.requestId,
 					model,
 					async () => {
+						const billable = billableIterations ?? [];
+						if (billable.length === 0) {
+							// Every iteration was a pre-output decline (a fully
+							// refused chain): this genuinely costs ~$0, but it
+							// must be an explicit, commented branch so a future
+							// reader does not "restore" the missing sum.
+							return 0;
+						}
 						const iterationCosts = await Promise.all(
-							iterations.map((iteration) =>
+							billable.map((iteration) =>
 								estimateCostUSD(iteration.model ?? model, {
 									inputTokens: iteration.input_tokens,
 									outputTokens: iteration.output_tokens,
@@ -975,6 +993,9 @@ export class UsageCollector {
 				to: state.usage.model,
 				iterationCount,
 				priced: hasFallbackBillingSplit ? "iterations" : "top_level",
+				...(hasFallbackBillingSplit && billableIterations?.length === 0
+					? { billableIterations: 0 }
+					: {}),
 				...(state.usage.iterationsTruncated === true
 					? { iterationsTruncated: true }
 					: {}),
