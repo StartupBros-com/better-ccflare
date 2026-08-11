@@ -71,6 +71,16 @@ describe("repository agent instructions", () => {
 		}
 	});
 
+	test("the canonical instructions keep the account-ban safety invariant", () => {
+		// A rewrite that neutralizes wording must not narrow this rule to "testing":
+		// any scripted call to the named claude account risks the account, so the
+		// clause naming it has to survive verbatim rewording.
+		const instructions = readRepositoryFile("AGENTS.md");
+
+		expect(instructions).toContain("`claude` account");
+		expect(instructions).toMatch(/must only be used through a real interactive/);
+	});
+
 	test("the canonical instructions omit stale repository guidance", () => {
 		const instructions = readRepositoryFile("AGENTS.md").toLowerCase();
 		const staleGuidance = [

@@ -4,19 +4,27 @@ Repository instructions for any agent working on better-ccflare, a load balancer
 
 ## ⚠️ CRITICAL: Testing Restrictions
 
-**Never send scripted test traffic to Anthropic-backed accounts** — directly or through the proxy. Automated/scripted usage can get real Anthropic accounts banned. Every agent must use non-Anthropic accounts (ollama, litellm, omniroute, etc.) for scripted testing and force-route with `x-better-ccflare-account-id`.
+**Never send scripted traffic to Anthropic-backed accounts** — not directly, and not through the proxy. Real Anthropic accounts can get banned for automated/scripted usage. The `claude` account must only be used through a real interactive Claude Code session: no curl, no test harness, no diagnostic script, whether or not you would call it "testing". For any scripted request, use a non-Anthropic account (ollama, litellm, omniroute, etc.) and force-route with `x-better-ccflare-account-id`.
 
 ## ⚠️ CRITICAL: File Exclusions
 
 **README files** - Only modify `./README.md` (root). Do NOT modify `apps/cli/README.md`.
 
 **NEVER TOUCH these auto-generated files** — must be excluded from all reads, edits, searches, and commits:
-- `packages/proxy/src/inline-worker.ts`
 - `packages/database/src/inline-vacuum-worker.ts`
 - `packages/database/src/inline-integrity-check-worker.ts`
 - `packages/database/src/inline-incremental-vacuum-worker.ts`
+- `packages/proxy/src/inline-worker.ts` (orphaned — see below)
 
-If one is accidentally modified, do not stage or commit it. Regenerate it with its owning build if needed.
+All three `packages/database` files are gitignored build output of `bun run build:cli`.
+If one is accidentally modified, do not stage or commit it; re-run that build to
+restore it. A fresh worktree will not have them at all, and `bun test` crashes on
+import until you build once.
+
+`packages/proxy/src/inline-worker.ts` is different: its source worker was retired
+(`3ad4b5bce8`, `417520840d`), nothing regenerates it, and its `EMBEDDED_WORKER_CODE`
+export has no importers left. Still do not touch or commit it, but there is no build
+that will bring it back — deleting it is a deliberate cleanup decision, not a recovery.
 
 ## Git Refspecs
 This repo has both a `main` branch and a `main` tag. **Always use `refs/heads/main`** (not `main`) for local branch operations (push, checkout). For merge-base and log comparisons against the remote, use `origin/main` (the remote ref) to avoid the ambiguous refspec warning from the local tag.
@@ -134,7 +142,7 @@ If ever needed manually: update both `package.json` (root) and `apps/cli/package
 
 ### Account Management
 - Add: `bun run cli --add-account <name> --mode <mode> --priority <number>`
-- Accepted modes: `bun run cli --help` and `apps/cli/src/main.ts` own the current accepted list.
+- Accepted modes: the `validModes` array in `apps/cli/src/main.ts` is authoritative. Read it rather than trusting any list in docs — including `--help`, whose printed list is currently missing modes that `validModes` accepts.
 - List: `bun run cli --list`
 - Remove: `bun run cli --remove <name>`
 - Reauth: `bun run cli --reauthenticate <name>` (preserves metadata, auto-notifies servers)
