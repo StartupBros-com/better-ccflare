@@ -22,20 +22,28 @@ import {
 } from "../session-account-observer";
 import type { UsageCollector } from "../usage-collector";
 
-mock.module("@better-ccflare/database", () => ({
-	AsyncDbWriter: class AsyncDbWriter {},
-	DatabaseFactory: class DatabaseFactory {},
-	DatabaseOperations: class DatabaseOperations {},
-	ModelTranslationRepository: class ModelTranslationRepository {},
-}));
+const profileTestCatalog = Object.freeze({
+	models: [],
+	fetchedAt: 0,
+	source: "fallback" as const,
+});
+let useProfileTestCatalog = false;
+const actualModelCatalog = await import("../model-catalog");
+const actualGetModelCatalog = actualModelCatalog.getModelCatalog;
+const actualIngestModelsListing = actualModelCatalog.ingestModelsListing;
 
 mock.module("../model-catalog", () => ({
-	getModelCatalog: async () => ({
-		models: [],
-		fetchedAt: 0,
-		source: "fallback",
-	}),
-	ingestModelsListing: async () => undefined,
+	...actualModelCatalog,
+	getModelCatalog: () =>
+		useProfileTestCatalog
+			? Promise.resolve(profileTestCatalog)
+			: actualGetModelCatalog(),
+	ingestModelsListing: (
+		...args: Parameters<typeof actualIngestModelsListing>
+	) =>
+		useProfileTestCatalog
+			? Promise.resolve()
+			: actualIngestModelsListing(...args),
 }));
 
 const usageCollectorModule = await import("../usage-collector");
@@ -53,6 +61,7 @@ let restoreUsageCollector = (): void => {};
 let usageHandleStart = mock(() => undefined);
 
 beforeEach(() => {
+	useProfileTestCatalog = true;
 	usageHandleStart = mock(() => undefined);
 	const collector = {
 		handleStart: usageHandleStart,
@@ -74,6 +83,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+	useProfileTestCatalog = false;
 	restoreUsageCollector();
 	restoreUsageCollector = (): void => {};
 	globalThis.fetch = originalFetch;

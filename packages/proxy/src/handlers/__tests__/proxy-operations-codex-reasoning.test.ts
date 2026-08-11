@@ -109,11 +109,22 @@ function codexSuccessResponse(): Response {
 	);
 }
 
-function makeReasoningRequestBody(): ArrayBuffer {
+function makeReasoningRequestBody(includeCacheControl = false): ArrayBuffer {
 	return encodeBody({
 		model: "claude-sonnet-4-5",
 		max_tokens: 16,
 		stream: true,
+		...(includeCacheControl
+			? {
+					system: [
+						{
+							type: "text",
+							text: "stable system prefix",
+							cache_control: { type: "ephemeral" },
+						},
+					],
+				}
+			: {}),
 		metadata: {
 			user_id: JSON.stringify({
 				session_id: "11111111-1111-4111-8111-111111111111",
@@ -659,5 +670,184 @@ describe("proxyWithAccount Codex reasoning recovery", () => {
 		expect(scenario.physicalAttemptCount).toBe(1);
 		expect(scenario.response).toBeInstanceOf(Response);
 		expect((scenario.response as Response).status).toBe(400);
+	});
+
+	it("keeps reasoning stripped through a following cache-control retry", async () => {
+		const previousTraceDirectory = process.env.CCFLARE_CODEX_TRACE_DIR;
+		const traceDirectory = mkdtempSync(
+			join(tmpdir(), "codex-reasoning-cache-control-retry-"),
+		);
+		const requestId = "codex-reasoning-cache-control-retry";
+
+		try {
+			process.env.CCFLARE_CODEX_TRACE_DIR = traceDirectory;
+			const scenario = await runCodexRecoveryScenario(
+				requestId,
+				(attempt) => {
+					if (attempt === 1) {
+						return jsonErrorResponse(
+							"The encrypted content for item rs_bound could not be verified. Reason: Encrypted content could not be decrypted or parsed.",
+						);
+					}
+					if (attempt === 2) {
+						return jsonErrorResponse(
+							"cache_control: Extra inputs are not permitted",
+						);
+					}
+					return codexSuccessResponse();
+				},
+				makeReasoningRequestBody(true),
+			);
+
+			expect(scenario.response).toBeInstanceOf(Response);
+			expect((scenario.response as Response).status).toBe(200);
+			expect(scenario.logicalAttemptCount).toBe(1);
+			expect(scenario.physicalAttemptCount).toBe(3);
+			expect(scenario.outboundBodies).toHaveLength(3);
+			expect(
+				scenario.outboundBodies.map((body) =>
+					(body.input as Array<Record<string, unknown>>).some(
+						(item) => item.type === "reasoning",
+					),
+				),
+			).toEqual([true, false, false]);
+
+			const traces = readRequestTraces(traceDirectory, requestId);
+			expect(traces.map((trace) => trace.attempt_cause)).toEqual([
+				"initial",
+				"reasoning_retry",
+				"cache_control_retry",
+			]);
+			expect(traces.map((trace) => trace.attempt_ordinal)).toEqual([1, 2, 3]);
+		} finally {
+			if (previousTraceDirectory === undefined) {
+				delete process.env.CCFLARE_CODEX_TRACE_DIR;
+			} else {
+				process.env.CCFLARE_CODEX_TRACE_DIR = previousTraceDirectory;
+			}
+			rmSync(traceDirectory, { recursive: true, force: true });
+		}
+	});
+	it("keeps reasoning stripped when a model fallback follows the retry", async () => {
+		const originalFetch = globalThis.fetch;
+		const previousTraceDirectory = process.env.CCFLARE_CODEX_TRACE_DIR;
+		const traceDirectory = mkdtempSync(
+			join(tmpdir(), "codex-reasoning-fallback-"),
+		);
+		const requestId = "codex-reasoning-fallback";
+		const outboundBodies: Array<Record<string, unknown>> = [];
+		const websocketAttempt = spyOn(
+			codexWebSocketTransport,
+			"tryRequest",
+		).mockResolvedValue(null);
+		const usageCollector = spyOn(
+			usageCollectorModule,
+			"getUsageCollector",
+		).mockReturnValue({
+			handleStart: mock(() => undefined),
+			handleChunk: mock(() => undefined),
+			handleEnd: mock(() => Promise.resolve()),
+		} as never);
+
+		try {
+			process.env.CCFLARE_CODEX_TRACE_DIR = traceDirectory;
+			// 1: reasoning-verification 400 -> strip+retry.
+			// 2: the stripped retry is rate-limited -> model fallback.
+			// 3: the fallback candidate must NOT carry the stripped block back.
+			globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+				const request =
+					input instanceof Request ? input : new Request(String(input));
+				outboundBodies.push(
+					(await request.clone().json()) as Record<string, unknown>,
+				);
+				if (outboundBodies.length === 1) {
+					return jsonErrorResponse(
+						"The encrypted content for item rs_bound could not be verified. Reason: Encrypted content could not be decrypted or parsed.",
+					);
+				}
+				if (outboundBodies.length === 2) {
+					return jsonErrorResponse("model not found", 404);
+				}
+				return codexSuccessResponse();
+			});
+
+			const bodyBuffer = encodeBody({
+				model: "claude-sonnet-4-5",
+				max_tokens: 16,
+				stream: true,
+				metadata: {
+					user_id: JSON.stringify({
+						session_id: "22222222-2222-4222-8222-222222222222",
+					}),
+				},
+				messages: [
+					{ role: "user", content: "initial" },
+					{
+						role: "assistant",
+						content: [
+							{ type: "text", text: "before" },
+							{
+								type: "redacted_thinking",
+								data: "bccfr1.rs_bound.encrypted-payload",
+							},
+						],
+					},
+					{ role: "user", content: "continue" },
+				],
+			});
+			const request = new Request("https://proxy.local/v1/messages", {
+				method: "POST",
+				headers: {
+					"content-type": "application/json",
+					"anthropic-version": "2023-06-01",
+				},
+				body: bodyBuffer,
+			});
+			const account = makeCodexAccount();
+			// getModelList reads model_mappings: [primary, ...fallbacks].
+			account.model_mappings = JSON.stringify({
+				sonnet: ["gpt-5.4", "gpt-5.4-mini"],
+			});
+			const ledger = new RoutingAttemptLedger();
+
+			await proxyWithAccount(
+				request,
+				new URL(request.url),
+				account,
+				makeRequestMeta(requestId),
+				bodyBuffer,
+				() => undefined,
+				0,
+				makeProxyContext(),
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				false,
+				undefined,
+				ledger,
+			);
+
+			expect(outboundBodies.length).toBeGreaterThanOrEqual(3);
+			const reasoningItems = (index: number) =>
+				(
+					(outboundBodies[index]?.input as Array<Record<string, unknown>>) ?? []
+				).filter((item) => item.type === "reasoning");
+			// The first attempt carries it, the strip removes it, and the model
+			// fallback must not resurrect it from the pre-strip body.
+			expect(reasoningItems(0)).toHaveLength(1);
+			expect(reasoningItems(1)).toHaveLength(0);
+			expect(reasoningItems(2)).toHaveLength(0);
+		} finally {
+			globalThis.fetch = originalFetch;
+			if (previousTraceDirectory === undefined) {
+				delete process.env.CCFLARE_CODEX_TRACE_DIR;
+			} else {
+				process.env.CCFLARE_CODEX_TRACE_DIR = previousTraceDirectory;
+			}
+			rmSync(traceDirectory, { recursive: true, force: true });
+			websocketAttempt.mockRestore();
+			usageCollector.mockRestore();
+		}
 	});
 });

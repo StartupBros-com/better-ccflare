@@ -27,13 +27,6 @@ import {
 } from "../model-route-profiles";
 
 // Focused proxy tests must not load ignored embedded worker artifacts.
-mock.module("@better-ccflare/database", () => ({
-	AsyncDbWriter: class AsyncDbWriter {},
-	DatabaseFactory: class DatabaseFactory {},
-	DatabaseOperations: class DatabaseOperations {},
-	ModelTranslationRepository: class ModelTranslationRepository {},
-}));
-
 const { buildServerToolCapabilityProofKey, usageCache } = await import(
 	"@better-ccflare/providers"
 );

@@ -2152,6 +2152,41 @@ describe("CodexProvider.processResponse", () => {
 		expect(validBody).toContain('"data":"bccfr1.rs_deadbeef.enc"');
 		expect(validBody.match(/event: message_delta/g)).toHaveLength(1);
 		expect(validBody.match(/event: message_stop/g)).toHaveLength(1);
+
+		const hyphenatedBody = await emit({
+			type: "reasoning",
+			id: "rs-hyphen-probe",
+			encrypted_content: "enc",
+		});
+		expect(hyphenatedBody).toContain('"data":"bccfr1.rs-hyphen-probe.enc"');
+
+		const replayed = await provider.transformRequestBody(
+			new Request("http://localhost/v1/messages", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					model: "gpt-5.6-sol",
+					max_tokens: 10,
+					messages: [
+						{
+							role: "assistant",
+							content: [
+								{
+									type: "redacted_thinking",
+									data: "bccfr1.rs-hyphen-probe.enc",
+								},
+							],
+						},
+					],
+				}),
+			}),
+		);
+		expect((await replayed.json()).input).toContainEqual({
+			type: "reasoning",
+			id: "rs-hyphen-probe",
+			summary: [],
+			encrypted_content: "enc",
+		});
 	});
 
 	it("emits retained reasoning atomically before following text", async () => {

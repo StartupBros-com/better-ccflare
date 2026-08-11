@@ -138,4 +138,54 @@ describe("stripCodexReasoningRetention", () => {
 			messages: [body.messages[2], preExistingEmptyText, body.messages[4]],
 		});
 	});
+	it("merges adjacent same-role turns exposed by a dropped reasoning-only message", () => {
+		const body = {
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "turn 1" }] },
+				{
+					role: "assistant",
+					content: [
+						{ type: "redacted_thinking", data: "bccfr1.rs_only.cipher" },
+					],
+				},
+				{ role: "user", content: [{ type: "text", text: "turn 2" }] },
+			],
+		};
+
+		const result = stripCodexReasoningRetention(body);
+
+		// The reasoning-only assistant turn is dropped, and the two user turns it
+		// separated are merged so no upstream sees an invalid role sequence.
+		expect(result.strippedCount).toBe(1);
+		expect(result.body.messages.map((m) => m.role)).toEqual(["user"]);
+		expect(result.body.messages[0].content).toEqual([
+			{ type: "text", text: "turn 1" },
+			{ type: "text", text: "turn 2" },
+		]);
+	});
+
+	it("leaves string-content neighbours unmerged", () => {
+		const body = {
+			messages: [
+				{ role: "user", content: "turn 1" },
+				{
+					role: "assistant",
+					content: [
+						{ type: "redacted_thinking", data: "bccfr1.rs_only.cipher" },
+					],
+				},
+				{ role: "user", content: "turn 2" },
+			],
+		};
+
+		const result = stripCodexReasoningRetention(body);
+
+		expect(result.strippedCount).toBe(1);
+		// String content is not merged: the neighbours survive as-is rather than
+		// guessing at a concatenation the upstream may format differently.
+		expect(result.body.messages).toEqual([
+			{ role: "user", content: "turn 1" },
+			{ role: "user", content: "turn 2" },
+		]);
+	});
 });

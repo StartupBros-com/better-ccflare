@@ -27,13 +27,6 @@ import type { ProxyContext } from "../proxy-types";
 
 // Source worktrees intentionally exclude generated database worker bundles.
 // This harness injects dbOps and never constructs these classes.
-mock.module("@better-ccflare/database", () => ({
-	AsyncDbWriter: class AsyncDbWriter {},
-	DatabaseFactory: class DatabaseFactory {},
-	DatabaseOperations: class DatabaseOperations {},
-	ModelTranslationRepository: class ModelTranslationRepository {},
-}));
-
 const usageCollectorModule = await import("../../usage-collector");
 const {
 	deriveServerToolRequirement,

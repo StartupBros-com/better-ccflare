@@ -17,6 +17,42 @@ export function isProxyMintedCodexReasoningBlock(block: unknown): boolean {
 }
 
 /**
+ * Repair role alternation after a stripped-empty assistant message is dropped.
+ *
+ * Dropping a reasoning-only assistant turn can leave two adjacent user turns.
+ * Native Anthropic documents combining consecutive same-role turns server-side,
+ * but this helper also runs for every Anthropic-COMPATIBLE upstream (minimax,
+ * zai, ollama, nanogpt, muse-spark, alibaba-coding-plan, ...), and those are
+ * third-party validators with no such guarantee — Muse Spark's own notes
+ * describe a strict validator behind the shim. Merging here keeps a valid
+ * history for all of them and preserves content that a server-side merge would
+ * silently collapse. Mirrors mergeConsecutiveSameRole in
+ * packages/openai-responses-adapter/src/request-translator.ts.
+ *
+ * Only array-content messages are merged: string content is left untouched
+ * rather than guessing at a concatenation the upstream may format differently.
+ */
+function canMergeAcrossDrop(previous: unknown, next: unknown): boolean {
+	return (
+		isRecord(previous) &&
+		isRecord(next) &&
+		previous.role === next.role &&
+		Array.isArray(previous.content) &&
+		Array.isArray(next.content)
+	);
+}
+
+function mergeAcrossDrop(previous: JsonRecord, next: JsonRecord): JsonRecord {
+	return {
+		...previous,
+		content: [
+			...(previous.content as unknown[]),
+			...(next.content as unknown[]),
+		],
+	};
+}
+
+/**
  * Remove proxy-minted Codex reasoning from an Anthropic Messages request. The
  * input is never mutated; when nothing is removed, the original body object is
  * returned by identity.
@@ -78,6 +114,21 @@ export function stripCodexReasoningRetention<T>(body: T): {
 				soleBlock.text === "");
 		if (!isEffectivelyEmpty) {
 			messages.push({ ...message, content: retainedContent });
+			continue;
+		}
+
+		// The message is being DROPPED. If that exposes two same-role neighbours,
+		// merge them so no upstream sees a broken role sequence. Scoped to the
+		// drop site: messages that were already adjacent before this strip are
+		// left exactly as the caller sent them.
+		const previous = messages[messages.length - 1];
+		const next = originalMessages[messageIndex + 1];
+		if (canMergeAcrossDrop(previous, next)) {
+			messages[messages.length - 1] = mergeAcrossDrop(
+				previous as JsonRecord,
+				next as JsonRecord,
+			);
+			messageIndex++;
 		}
 	}
 

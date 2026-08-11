@@ -22,12 +22,6 @@ import type { UsageCollector } from "../usage-collector";
 // Unit-test loading must not require the CLI build's ignored embedded worker
 // artifacts. handleProxy does not use DatabaseFactory; keep that package at its
 // boundary before dynamically loading the proxy module.
-mock.module("@better-ccflare/database", () => ({
-	AsyncDbWriter: class AsyncDbWriter {},
-	DatabaseFactory: class DatabaseFactory {},
-	DatabaseOperations: class DatabaseOperations {},
-	ModelTranslationRepository: class ModelTranslationRepository {},
-}));
 const providersModule = await import("@better-ccflare/providers");
 const { usageCache } = providersModule;
 const usageCollectorModule = await import("../usage-collector");

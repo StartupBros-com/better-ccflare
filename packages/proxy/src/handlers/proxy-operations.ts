@@ -3403,9 +3403,9 @@ export async function proxyWithAccount(
 			);
 
 			// Filter thinking blocks from the request body
-			const filteredBodyBuffer = filterThinkingBlocks(effectiveBodyContext);
+			const filteredBodyBuffer = filterThinkingBlocks(currentReplayBody);
 
-			if (filteredBodyBuffer && filteredBodyBuffer !== effectiveBodyBuffer) {
+			if (filteredBodyBuffer && filteredBodyBuffer !== currentReplayBody) {
 				// Retry the request with filtered body
 				const retryRequestInit: RequestInit & { duplex?: "half" } = {
 					method: req.method,
@@ -3462,10 +3462,9 @@ export async function proxyWithAccount(
 				readAttemptBoundJson,
 			))
 		) {
-			const strippedBodyBuffer =
-				filterCodexReasoningBlocks(effectiveBodyContext);
+			const strippedBodyBuffer = filterCodexReasoningBlocks(currentReplayBody);
 
-			if (strippedBodyBuffer && strippedBodyBuffer !== effectiveBodyBuffer) {
+			if (strippedBodyBuffer && strippedBodyBuffer !== currentReplayBody) {
 				log.info(
 					`Codex rejected retained encrypted reasoning for account ${account.name}, retrying with proxy-minted reasoning blocks removed`,
 				);
@@ -3523,9 +3522,9 @@ export async function proxyWithAccount(
 				readAttemptBoundJson,
 			))
 		) {
-			const strippedBodyBuffer = filterClearThinkingEdits(effectiveBodyContext);
+			const strippedBodyBuffer = filterClearThinkingEdits(currentReplayBody);
 
-			if (strippedBodyBuffer && strippedBodyBuffer !== effectiveBodyBuffer) {
+			if (strippedBodyBuffer && strippedBodyBuffer !== currentReplayBody) {
 				log.info(
 					`Claude rejected clear_thinking context edit without thinking enabled for account ${account.name}, retrying with the edit removed`,
 				);
@@ -3667,15 +3666,17 @@ export async function proxyWithAccount(
 					await discardUpstreamBody(rawResponse);
 					const retryHeaders = new Headers(providerRequest.headers);
 					stampCodexAttempt(retryHeaders, "cache_control_retry");
-					const retrySourceBody = await providerRequest.clone().json();
-					stripCacheControlFromOpenAIRequest(retrySourceBody);
-					const retrySourceText = JSON.stringify(retrySourceBody);
+					const retryReplayBody =
+						stripCacheControlFromReplayBody(currentReplayBody);
+					if (!retryReplayBody) {
+						throw new Error("Failed to strip cache_control from replay body");
+					}
 					const retrySource = new Request(providerRequest.url, {
 						method: providerRequest.method,
 						headers: retryHeaders,
-						body: retrySourceText,
+						body: new Uint8Array(retryReplayBody),
 					});
-					currentReplayBody = new TextEncoder().encode(retrySourceText).buffer;
+					currentReplayBody = retryReplayBody;
 					currentCacheIdentityHasCacheControl = undefined;
 					retrySourceRequest = retrySource.clone();
 					const retryTransformed = await transformWithCurrentAttemptPlan(
@@ -4649,8 +4650,20 @@ export async function proxyWithAccount(
 						// mapModelName internally which remaps non-Claude names back to the primary
 						// model (no family match → sonnet fallback). We always want nextModel to
 						// reach the upstream provider verbatim.
-						const patchedContext =
-							effectiveBodyContext.withPatchedModel(nextModel);
+						// Patch from the LIVE replay body, not the frozen original: an
+						// earlier retry in this same request may have rewritten it
+						// (thinking-block filter, clear_thinking strip, Codex reasoning
+						// strip). Rebuilding from effectiveBodyContext here resurrects
+						// exactly the content that retry proved the upstream rejects, and
+						// those classifiers are sequential `if`s that already ran — the
+						// resurrected rejection would reach the fallback candidates with
+						// no handler left. Falls back to the original context when no
+						// retry has replaced the body.
+						const replayContext =
+							currentReplayBody && currentReplayBody !== effectiveBodyBuffer
+								? new RequestBodyContext(currentReplayBody)
+								: effectiveBodyContext;
+						const patchedContext = replayContext.withPatchedModel(nextModel);
 						const patchedBody = patchedContext?.getBuffer() ?? null;
 						if (!patchedBody) {
 							log.warn("Failed to patch request body for model retry");
