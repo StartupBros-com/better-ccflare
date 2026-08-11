@@ -241,6 +241,42 @@ describe("classifyPreByte429", () => {
 		});
 	});
 
+	// Shape taken from the live 2026-08-11 payload, not hand-built: Anthropic marks
+	// only the BINDING limit is_active, so on the three accounts that were wrongly
+	// benched the sole active row was weekly_scoped Fable while session/weekly_all
+	// sat inactive with headroom (72%). Verified against all five production
+	// accounts — the two genuinely spent ones (weekly_all 100 active / session 100
+	// active) still classify account-wide.
+	it("narrows the live inactive-account-window payload to family scope under a hard header", () => {
+		const liveFixture = snapshot(NOW - 30_000, { weeklyAll: 72 });
+		const limits = (
+			liveFixture.data as {
+				limits: Array<{ kind: string; is_active?: boolean }>;
+			}
+		).limits;
+		for (const limit of limits) {
+			if (limit.kind === "session" || limit.kind === "weekly_all") {
+				limit.is_active = false;
+			}
+		}
+
+		const decision = classifyPreByte429({
+			isAnthropic: true,
+			response: response({
+				"anthropic-ratelimit-unified-status": "rejected",
+			}),
+			attemptedModel: "claude-fable-5",
+			snapshot: liveFixture,
+			now: NOW,
+		});
+
+		expect(decision).toMatchObject({
+			scope: "family",
+			family: "fable",
+			reason: "matching_scoped_limit",
+		});
+	});
+
 	it("narrows an explicit unified-remaining zero when fresh usage proves a matching per-model cap", () => {
 		const decision = classifyPreByte429({
 			isAnthropic: true,
