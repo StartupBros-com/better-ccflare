@@ -5,6 +5,261 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { ensureSchema, runMigrations } from "../src/migrations";
 
+function sqliteColumns(db: Database, table: string): string[] {
+	return (
+		db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
+	).map((column) => column.name);
+}
+
+function sqliteIndexes(db: Database, table: string): string[] {
+	return (
+		db.prepare(`PRAGMA index_list(${table})`).all() as Array<{ name: string }>
+	).map((index) => index.name);
+}
+
+function sqliteForeignKeys(
+	db: Database,
+	table: string,
+): Array<{ from: string; table: string; to: string }> {
+	return db.prepare(`PRAGMA foreign_key_list(${table})`).all() as Array<{
+		from: string;
+		table: string;
+		to: string;
+	}>;
+}
+
+describe("Cache flight cohort seal migrations", () => {
+	it("creates fresh SQLite registry tables, nullable turn reference, foreign keys, and cleanup indexes", () => {
+		const db = new Database(":memory:");
+		db.run("PRAGMA foreign_keys = ON");
+		try {
+			ensureSchema(db);
+			runMigrations(db);
+
+			const tables = (
+				db
+					.prepare(
+						"SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'cache_flight_recorder_%' ORDER BY name",
+					)
+					.all() as Array<{ name: string }>
+			).map((row) => row.name);
+			expect(tables).toEqual([
+				"cache_flight_recorder_conversations",
+				"cache_flight_recorder_partitions",
+				"cache_flight_recorder_service_epochs",
+				"cache_flight_recorder_tombstones",
+				"cache_flight_recorder_turns",
+			]);
+
+			expect(sqliteColumns(db, "cache_flight_recorder_service_epochs")).toEqual(
+				[
+					"id",
+					"seal_contract_version",
+					"deployment_revision",
+					"service_instance_id",
+					"process_started_at",
+					"native_cache_state",
+					"recorder_state",
+					"keepalive_global_ttl_minutes",
+					"keepalive_xai_ttl_minutes",
+					"keepalive_effective_xai_enabled",
+					"keepalive_effective_xai_ttl_minutes",
+					"occurrence_id",
+					"completeness",
+					"unavailable_dimensions",
+					"created_at",
+				],
+			);
+			expect(sqliteColumns(db, "cache_flight_recorder_partitions")).toEqual([
+				"id",
+				"service_epoch_id",
+				"serving_account_scope",
+				"route_model_epoch",
+				"completeness",
+				"unavailable_dimensions",
+				"seal_completeness",
+				"seal_unavailable_dimensions",
+				"created_at",
+			]);
+			const turnColumn = (
+				db
+					.prepare("PRAGMA table_info(cache_flight_recorder_turns)")
+					.all() as Array<{ name: string; notnull: number }>
+			).find((column) => column.name === "observation_partition_id");
+			expect(turnColumn).toEqual(
+				expect.objectContaining({
+					name: "observation_partition_id",
+					notnull: 0,
+				}),
+			);
+
+			expect(sqliteForeignKeys(db, "cache_flight_recorder_partitions")).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						from: "service_epoch_id",
+						table: "cache_flight_recorder_service_epochs",
+						to: "id",
+					}),
+				]),
+			);
+			expect(sqliteForeignKeys(db, "cache_flight_recorder_turns")).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						from: "observation_partition_id",
+						table: "cache_flight_recorder_partitions",
+						to: "id",
+					}),
+				]),
+			);
+
+			expect(sqliteIndexes(db, "cache_flight_recorder_turns")).toEqual(
+				expect.arrayContaining([
+					"idx_cache_flight_recorder_turns_partition",
+					"idx_cache_flight_recorder_turns_cleanup",
+				]),
+			);
+			expect(sqliteIndexes(db, "cache_flight_recorder_partitions")).toEqual(
+				expect.arrayContaining(["idx_cache_flight_recorder_partitions_epoch"]),
+			);
+		} finally {
+			db.close();
+		}
+	});
+
+	it("upgrades legacy recorder rows without inferred seals and preserves prior-binary SQL compatibility", () => {
+		const db = new Database(":memory:");
+		db.run("PRAGMA foreign_keys = ON");
+		try {
+			db.exec(`
+				CREATE TABLE cache_flight_recorder_conversations (
+					recorder_conversation_id TEXT PRIMARY KEY,
+					created_at INTEGER NOT NULL,
+					updated_at INTEGER NOT NULL,
+					incomplete INTEGER NOT NULL DEFAULT 0,
+					dropped_events INTEGER NOT NULL DEFAULT 0
+				);
+				CREATE TABLE cache_flight_recorder_tombstones (
+					recorder_conversation_id TEXT PRIMARY KEY,
+					expires_at INTEGER NOT NULL
+				);
+				CREATE TABLE cache_flight_recorder_turns (
+					recorder_conversation_id TEXT NOT NULL,
+					sequence INTEGER NOT NULL,
+					timestamp TEXT NOT NULL,
+					identity_fingerprint TEXT,
+					serving_account_id TEXT,
+					prefix_fingerprint TEXT,
+					cache_outcome TEXT NOT NULL,
+					input_tokens INTEGER,
+					cached_tokens INTEGER,
+					completeness TEXT NOT NULL,
+					unavailable_dimensions TEXT NOT NULL DEFAULT '[]',
+					gap_before INTEGER NOT NULL DEFAULT 0,
+					PRIMARY KEY (recorder_conversation_id, sequence),
+					FOREIGN KEY (recorder_conversation_id)
+						REFERENCES cache_flight_recorder_conversations(recorder_conversation_id)
+						ON DELETE CASCADE
+				);
+			`);
+			db.prepare(`
+				INSERT INTO cache_flight_recorder_conversations
+					(recorder_conversation_id, created_at, updated_at, incomplete, dropped_events)
+				VALUES (?, ?, ?, 0, 0)
+			`).run("legacy-id", 1_000, 1_000);
+			db.prepare(`
+				INSERT INTO cache_flight_recorder_turns (
+					recorder_conversation_id, sequence, timestamp,
+					identity_fingerprint, serving_account_id, prefix_fingerprint,
+					cache_outcome, input_tokens, cached_tokens, completeness,
+					unavailable_dimensions, gap_before
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			`).run(
+				"legacy-id",
+				0,
+				new Date(1_000).toISOString(),
+				"identity",
+				"account",
+				"prefix",
+				"hit",
+				100,
+				80,
+				"complete",
+				"[]",
+				0,
+			);
+
+			runMigrations(db);
+
+			expect(sqliteColumns(db, "cache_flight_recorder_turns")).toContain(
+				"observation_partition_id",
+			);
+			const historical = db
+				.prepare(
+					`SELECT observation_partition_id
+					 FROM cache_flight_recorder_turns
+					 WHERE recorder_conversation_id = ? AND sequence = 0`,
+				)
+				.get("legacy-id") as { observation_partition_id: string | null };
+			expect(historical.observation_partition_id).toBeNull();
+
+			db.prepare(`
+				INSERT INTO cache_flight_recorder_turns (
+					recorder_conversation_id, sequence, timestamp,
+					identity_fingerprint, serving_account_id, prefix_fingerprint,
+					cache_outcome, input_tokens, cached_tokens, completeness,
+					unavailable_dimensions, gap_before
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			`).run(
+				"legacy-id",
+				1,
+				new Date(2_000).toISOString(),
+				"identity",
+				"account",
+				"prefix",
+				"miss",
+				110,
+				0,
+				"complete",
+				"[]",
+				0,
+			);
+			const legacyRead = db
+				.prepare(
+					`SELECT sequence, cache_outcome
+					 FROM cache_flight_recorder_turns
+					 WHERE recorder_conversation_id = ?
+					 ORDER BY sequence`,
+				)
+				.all("legacy-id") as Array<{
+				sequence: number;
+				cache_outcome: string;
+			}>;
+			expect(legacyRead).toEqual([
+				{ sequence: 0, cache_outcome: "hit" },
+				{ sequence: 1, cache_outcome: "miss" },
+			]);
+
+			db.prepare(
+				"DELETE FROM cache_flight_recorder_conversations WHERE recorder_conversation_id = ?",
+			).run("legacy-id");
+			const remainingTurns = db
+				.prepare(
+					"SELECT COUNT(*) AS count FROM cache_flight_recorder_turns WHERE recorder_conversation_id = ?",
+				)
+				.get("legacy-id") as { count: number };
+			expect(remainingTurns.count).toBe(0);
+			expect(
+				sqliteColumns(db, "cache_flight_recorder_service_epochs"),
+			).toContain("seal_contract_version");
+			expect(sqliteColumns(db, "cache_flight_recorder_partitions")).toContain(
+				"seal_completeness",
+			);
+		} finally {
+			db.close();
+		}
+	});
+});
+
 describe("Database Migrations - Tier Column Removal", () => {
 	let db: Database;
 

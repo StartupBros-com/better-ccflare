@@ -85,6 +85,69 @@ function pruneOldBackups(absoluteSourcePath: string): void {
 	}
 }
 
+function cacheFlightRecorderTurnColumns(db: Database): string[] {
+	return (
+		db
+			.prepare("PRAGMA table_info(cache_flight_recorder_turns)")
+			.all() as Array<{
+			name: string;
+		}>
+	).map((column) => column.name);
+}
+
+function ensureCacheFlightRecorderSealSchema(db: Database): void {
+	db.run(`
+		CREATE TABLE IF NOT EXISTS cache_flight_recorder_service_epochs (
+			id TEXT PRIMARY KEY,
+			seal_contract_version INTEGER NOT NULL,
+			deployment_revision TEXT,
+			service_instance_id TEXT,
+			process_started_at TEXT,
+			native_cache_state TEXT,
+			recorder_state TEXT,
+			keepalive_global_ttl_minutes INTEGER,
+			keepalive_xai_ttl_minutes INTEGER,
+			keepalive_effective_xai_enabled INTEGER,
+			keepalive_effective_xai_ttl_minutes INTEGER,
+			occurrence_id TEXT,
+			completeness TEXT NOT NULL,
+			unavailable_dimensions TEXT NOT NULL DEFAULT '[]',
+			created_at INTEGER NOT NULL
+		)
+	`);
+	db.run(`
+		CREATE TABLE IF NOT EXISTS cache_flight_recorder_partitions (
+			id TEXT PRIMARY KEY,
+			service_epoch_id TEXT NOT NULL,
+			serving_account_scope TEXT,
+			route_model_epoch TEXT,
+			completeness TEXT NOT NULL,
+			unavailable_dimensions TEXT NOT NULL DEFAULT '[]',
+			seal_completeness TEXT NOT NULL,
+			seal_unavailable_dimensions TEXT NOT NULL DEFAULT '[]',
+			created_at INTEGER NOT NULL,
+			FOREIGN KEY (service_epoch_id)
+				REFERENCES cache_flight_recorder_service_epochs(id)
+				ON DELETE CASCADE
+		)
+	`);
+	db.run(
+		`CREATE INDEX IF NOT EXISTS idx_cache_flight_recorder_partitions_epoch
+		 ON cache_flight_recorder_partitions(service_epoch_id)`,
+	);
+	const turnColumns = cacheFlightRecorderTurnColumns(db);
+	if (turnColumns.includes("observation_partition_id")) {
+		db.run(
+			`CREATE INDEX IF NOT EXISTS idx_cache_flight_recorder_turns_partition
+			 ON cache_flight_recorder_turns(observation_partition_id)`,
+		);
+		db.run(
+			`CREATE INDEX IF NOT EXISTS idx_cache_flight_recorder_turns_cleanup
+			 ON cache_flight_recorder_turns(timestamp, observation_partition_id)`,
+		);
+	}
+}
+
 const ROUTING_REVISION_POLICY_TABLES = [
 	"combos",
 	"combo_slots",
@@ -662,12 +725,17 @@ export function ensureSchema(db: Database): void {
 			completeness TEXT NOT NULL,
 			unavailable_dimensions TEXT NOT NULL DEFAULT '[]',
 			gap_before INTEGER NOT NULL DEFAULT 0,
+			observation_partition_id TEXT,
 			PRIMARY KEY (recorder_conversation_id, sequence),
 			FOREIGN KEY (recorder_conversation_id)
 				REFERENCES cache_flight_recorder_conversations(recorder_conversation_id)
-				ON DELETE CASCADE
+				ON DELETE CASCADE,
+			FOREIGN KEY (observation_partition_id)
+				REFERENCES cache_flight_recorder_partitions(id)
+				ON DELETE SET NULL
 		)
 	`);
+	ensureCacheFlightRecorderSealSchema(db);
 
 	// Create instance_heartbeats table: per-process heartbeat for the
 	// multi-instance guard (see packages/database/src/multi-instance-guard.ts
@@ -1146,6 +1214,7 @@ export function runMigrations(db: Database, dbPath?: string): void {
 	const comboFamilyAssignmentColumnNames = comboFamilyAssignmentsInfo.map(
 		(column) => column.name,
 	);
+	const cacheFlightRecorderTurnColumnNames = cacheFlightRecorderTurnColumns(db);
 
 	const refreshTokenCol = accountsInfo.find(
 		(col) => col.name === "refresh_token",
@@ -1251,6 +1320,17 @@ export function runMigrations(db: Database, dbPath?: string): void {
 			).run();
 			log.info("Added managed logical model to family assignments");
 		}
+		if (
+			!cacheFlightRecorderTurnColumnNames.includes("observation_partition_id")
+		) {
+			db.prepare(
+				`ALTER TABLE cache_flight_recorder_turns
+				 ADD COLUMN observation_partition_id TEXT
+				 REFERENCES cache_flight_recorder_partitions(id) ON DELETE SET NULL`,
+			).run();
+			log.info("Added cache flight recorder observation partition reference");
+		}
+		ensureCacheFlightRecorderSealSchema(db);
 
 		// Add rate_limited_until column if it doesn't exist
 		if (!initialAccountsColumnNames.includes("rate_limited_until")) {
