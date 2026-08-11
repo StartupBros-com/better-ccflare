@@ -45,6 +45,7 @@ afterEach(() => {
 	delete process.env[CODEX_CACHE_KEY_MODE_ENV];
 	delete process.env[CODEX_CACHE_KEY_SESSION_PERCENT_ENV];
 	delete process.env[CODEX_SINGLE_ORCHESTRATION_ROOT_ENV];
+	delete process.env.CCFLARE_CODEX_REASONING_RETENTION;
 	delete process.env[CODEX_TRACE_DIR_ENV];
 	delete process.env[CODEX_TRACE_HMAC_KEY_ENV];
 	resetOrchestrationElectionForTest();
@@ -282,6 +283,210 @@ describe("CodexProvider request conversion", () => {
 			role: "system",
 			content: [{ type: "input_text", text: "follow policy" }],
 		});
+	});
+
+	it("replays retained assistant reasoning before later text and tool items", async () => {
+		const provider = new CodexProvider();
+		const request = new Request("https://example.com/v1/messages", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				model: "claude-3-5-sonnet-20241022",
+				max_tokens: 100,
+				messages: [
+					{
+						role: "assistant",
+						content: [
+							{ type: "text", text: "Let me inspect it." },
+							{
+								type: "redacted_thinking",
+								data: "bccfr1.rs_turn_1.cipher.part.more",
+							},
+							{ type: "text", text: "I found it." },
+							{
+								type: "tool_use",
+								id: "call_1",
+								name: "search",
+								input: { query: "reasoning retention" },
+							},
+						],
+					},
+				],
+			}),
+		});
+
+		const transformed = await provider.transformRequestBody(request);
+		const body = await transformed.json();
+
+		expect(body.input).toEqual([
+			{
+				role: "assistant",
+				content: [{ type: "output_text", text: "Let me inspect it." }],
+			},
+			{
+				type: "reasoning",
+				id: "rs_turn_1",
+				summary: [],
+				encrypted_content: "cipher.part.more",
+			},
+			{
+				role: "assistant",
+				content: [{ type: "output_text", text: "I found it." }],
+			},
+			{
+				type: "function_call",
+				call_id: "call_1",
+				name: "search",
+				arguments: JSON.stringify({ query: "reasoning retention" }),
+				status: "completed",
+			},
+		]);
+		expect(body.include).toEqual(["reasoning.encrypted_content"]);
+	});
+
+	it("replays retained reasoning when the source item id was absent", async () => {
+		const provider = new CodexProvider();
+		const transformed = await provider.transformRequestBody(
+			new Request("https://example.com/v1/messages", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					model: "claude-3-5-sonnet-20241022",
+					max_tokens: 100,
+					messages: [
+						{
+							role: "assistant",
+							content: [
+								{
+									type: "redacted_thinking",
+									data: "bccfr1..ciphertext",
+								},
+							],
+						},
+					],
+				}),
+			}),
+		);
+
+		expect((await transformed.json()).input).toEqual([
+			{
+				type: "reasoning",
+				id: "",
+				summary: [],
+				encrypted_content: "ciphertext",
+			},
+		]);
+	});
+
+	it("skips foreign redacted and signed thinking while preserving siblings", async () => {
+		const provider = new CodexProvider();
+		const request = new Request("https://example.com/v1/messages", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				model: "claude-3-5-sonnet-20241022",
+				max_tokens: 100,
+				messages: [
+					{
+						role: "assistant",
+						content: [
+							{ type: "text", text: "before" },
+							{
+								type: "redacted_thinking",
+								data: "foreign-provider-ciphertext",
+							},
+							{
+								type: "redacted_thinking",
+								data: "bccfr1.missing_second_separator",
+							},
+							{
+								type: "redacted_thinking",
+								data: "bccfr1.rs$invalid.ciphertext",
+							},
+							{
+								type: "redacted_thinking",
+								data: "bccfr1.rs_empty.",
+							},
+							{
+								type: "thinking",
+								thinking: "private thought",
+								signature: "anthropic-signature",
+							},
+							{ type: "text", text: "after" },
+							{
+								type: "tool_use",
+								id: "call_2",
+								name: "lookup",
+								input: { term: "value" },
+							},
+						],
+					},
+				],
+			}),
+		});
+
+		const transformed = await provider.transformRequestBody(request);
+		const body = await transformed.json();
+
+		expect(body.input).toEqual([
+			{
+				role: "assistant",
+				content: [
+					{ type: "output_text", text: "before" },
+					{ type: "output_text", text: "after" },
+				],
+			},
+			{
+				type: "function_call",
+				call_id: "call_2",
+				name: "lookup",
+				arguments: JSON.stringify({ term: "value" }),
+				status: "completed",
+			},
+		]);
+		expect(
+			body.input.some((item: { type?: string }) => item.type === "reasoning"),
+		).toBeFalse();
+	});
+
+	it("restores legacy request behavior when reasoning retention is disabled", async () => {
+		process.env.CCFLARE_CODEX_REASONING_RETENTION = "0";
+		const provider = new CodexProvider();
+		const request = new Request("https://example.com/v1/messages", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				model: "claude-3-5-sonnet-20241022",
+				max_tokens: 100,
+				messages: [
+					{
+						role: "assistant",
+						content: [
+							{ type: "text", text: "before" },
+							{
+								type: "redacted_thinking",
+								data: "bccfr1.rs_disabled.do-not-replay",
+							},
+							{ type: "text", text: "after" },
+						],
+					},
+				],
+			}),
+		});
+
+		const transformed = await provider.transformRequestBody(request);
+		const body = await transformed.json();
+
+		expect(body.input).toEqual([
+			{
+				role: "assistant",
+				content: [
+					{ type: "output_text", text: "before" },
+					{ type: "output_text", text: "after" },
+				],
+			},
+		]);
+		expect(body.include).toBeUndefined();
 	});
 
 	it("marks replayed tool call items as completed", async () => {
@@ -1731,6 +1936,632 @@ describe("CodexProvider.processResponse", () => {
 		expect(body).not.toContain("abrupt_stream_eof");
 	});
 
+	it("does not prematurely close an in-flight function-call block when reasoning completes", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_interleaved", model: "gpt-5.6-sol" },
+			}),
+			...eventLine("response.output_item.added", {
+				item: { type: "function_call", call_id: "call_1", name: "Read" },
+				output_index: 0,
+			}),
+			...eventLine("response.function_call_arguments.delta", {
+				delta: '{"path":',
+				output_index: 0,
+			}),
+			...eventLine("response.output_item.done", {
+				item: {
+					type: "reasoning",
+					id: "rs_mid",
+					encrypted_content: "midstream",
+				},
+				output_index: 1,
+			}),
+			...eventLine("response.function_call_arguments.delta", {
+				delta: '"x"}',
+				output_index: 0,
+			}),
+			...eventLine("response.output_item.done", {
+				item: { type: "function_call", call_id: "call_1", name: "Read" },
+				output_index: 0,
+			}),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.6-sol",
+					usage: { input_tokens: 1, output_tokens: 1 },
+				},
+			}),
+		]);
+		const transformed = await provider.processResponse(
+			new Response(upstreamBody, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+
+		const transformedBody = await transformed.text();
+		const events = transformedBody
+			.split("\n")
+			.filter((line) => line.startsWith("data:"))
+			.map(
+				(line) =>
+					JSON.parse(line.slice("data:".length).trim()) as Record<
+						string,
+						unknown
+					>,
+			);
+
+		// Block lifecycles must be strictly sequential on the wire: the deferred
+		// reasoning block emits only after the in-flight tool block fully closes.
+		const blockEvents = events
+			.filter((event) =>
+				[
+					"content_block_start",
+					"content_block_delta",
+					"content_block_stop",
+				].includes(event.type as string),
+			)
+			.map((event) => ({
+				type: event.type,
+				index: event.index,
+				blockType:
+					(event.content_block as Record<string, unknown>)?.type ??
+					(event.delta as Record<string, unknown>)?.type,
+			}));
+		expect(blockEvents).toEqual([
+			{ type: "content_block_start", index: 0, blockType: "tool_use" },
+			{ type: "content_block_delta", index: 0, blockType: "input_json_delta" },
+			{ type: "content_block_stop", index: 0, blockType: undefined },
+			{
+				type: "content_block_start",
+				index: 1,
+				blockType: "redacted_thinking",
+			},
+			{ type: "content_block_stop", index: 1, blockType: undefined },
+		]);
+		expect(events).toContainEqual({
+			type: "content_block_start",
+			index: 1,
+			content_block: {
+				type: "redacted_thinking",
+				data: "bccfr1.rs_mid.midstream",
+			},
+		});
+	});
+
+	it("flushes deferred reasoning at stream end when the tool block never closes", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_truncated", model: "gpt-5.6-sol" },
+			}),
+			...eventLine("response.output_item.added", {
+				item: { type: "function_call", call_id: "call_1", name: "Read" },
+				output_index: 0,
+			}),
+			...eventLine("response.output_item.done", {
+				item: {
+					type: "reasoning",
+					id: "rs_trunc",
+					encrypted_content: "kept",
+				},
+				output_index: 1,
+			}),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.6-sol",
+					usage: { input_tokens: 1, output_tokens: 1 },
+				},
+			}),
+		]);
+		const transformed = await provider.processResponse(
+			new Response(upstreamBody, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+
+		const transformedBody = await transformed.text();
+		const events = transformedBody
+			.split("\n")
+			.filter((line) => line.startsWith("data:"))
+			.map(
+				(line) =>
+					JSON.parse(line.slice("data:".length).trim()) as Record<
+						string,
+						unknown
+					>,
+			);
+
+		// The truncated tool block is closed by the terminal path, then the
+		// deferred reasoning flushes at the next index — never lost, never
+		// interleaved.
+		expect(events).toContainEqual({
+			type: "content_block_start",
+			index: 1,
+			content_block: {
+				type: "redacted_thinking",
+				data: "bccfr1.rs_trunc.kept",
+			},
+		});
+		const stopsByIndex = events
+			.filter((event) => event.type === "content_block_stop")
+			.map((event) => event.index);
+		expect(stopsByIndex).toEqual([0, 1]);
+		const messageStopAt = events.findIndex(
+			(event) => event.type === "message_stop",
+		);
+		const reasoningStopAt = events.findIndex(
+			(event) => event.type === "content_block_stop" && event.index === 1,
+		);
+		expect(messageStopAt).toBeGreaterThan(reasoningStopAt);
+	});
+
+	it("keeps emit and replay id charsets symmetric", async () => {
+		const provider = new CodexProvider();
+		const emit = async (id: string) => {
+			const upstreamBody = sseBody([
+				...eventLine("response.created", {
+					response: { id: "resp_ids", model: "gpt-5.6-sol" },
+				}),
+				...eventLine("response.output_item.done", {
+					item: { type: "reasoning", id, encrypted_content: "enc" },
+					output_index: 0,
+				}),
+				...eventLine("response.completed", {
+					response: {
+						model: "gpt-5.6-sol",
+						usage: { input_tokens: 1, output_tokens: 1 },
+					},
+				}),
+			]);
+			const transformed = await provider.processResponse(
+				new Response(upstreamBody, {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				}),
+				null,
+			);
+			return await transformed.text();
+		};
+
+		// A hyphenated id is representable and must survive emit.
+		expect(await emit("rs-hyphen-probe")).toContain(
+			'"data":"bccfr1.rs-hyphen-probe.enc"',
+		);
+		// A dotted id cannot be represented in the dot-delimited wrapper: it
+		// degrades to an empty id rather than minting a block that would fail
+		// its own replay parse.
+		expect(await emit("rs.dotted")).toContain('"data":"bccfr1..enc"');
+
+		// The hyphenated block replays as a reasoning input item.
+		const request = new Request("http://localhost/v1/messages", {
+			method: "POST",
+			body: JSON.stringify({
+				model: "gpt-5.6-sol",
+				max_tokens: 10,
+				messages: [
+					{
+						role: "assistant",
+						content: [
+							{
+								type: "redacted_thinking",
+								data: "bccfr1.rs-hyphen-probe.enc",
+							},
+							{ type: "text", text: "ok" },
+						],
+					},
+					{ role: "user", content: "next" },
+				],
+			}),
+			headers: { "content-type": "application/json" },
+		});
+		const transformedRequest = await provider.transformRequestBody(request);
+		const body = (await transformedRequest.json()) as {
+			input: Array<Record<string, unknown>>;
+		};
+		expect(body.input).toContainEqual({
+			type: "reasoning",
+			id: "rs-hyphen-probe",
+			summary: [],
+			encrypted_content: "enc",
+		});
+	});
+
+	it("emits retained reasoning atomically before following text", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_reasoning", model: "gpt-5.6-sol" },
+			}),
+			...eventLine("response.output_item.done", {
+				item: {
+					type: "reasoning",
+					id: "rs_x",
+					encrypted_content: "abc.def",
+				},
+				output_index: 0,
+			}),
+			...eventLine("response.output_item.added", {
+				item: { type: "message" },
+				output_index: 1,
+			}),
+			...eventLine("response.content_part.added", {
+				part: { type: "output_text" },
+			}),
+			...eventLine("response.output_text.delta", { delta: "hello" }),
+			...eventLine("response.output_item.done", {
+				item: { type: "message" },
+				output_index: 1,
+			}),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.6-sol",
+					usage: { input_tokens: 1, output_tokens: 1 },
+				},
+			}),
+		]);
+		const transformed = await provider.processResponse(
+			new Response(upstreamBody, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+
+		const transformedBody = await transformed.text();
+		const events = transformedBody
+			.split("\n")
+			.filter((line) => line.startsWith("data:"))
+			.map(
+				(line) =>
+					JSON.parse(line.slice("data:".length).trim()) as Record<
+						string,
+						unknown
+					>,
+			);
+		const reasoningStartIndex = events.findIndex(
+			(event) =>
+				event.type === "content_block_start" &&
+				(event.content_block as Record<string, unknown>)?.type ===
+					"redacted_thinking",
+		);
+
+		expect(events[reasoningStartIndex]).toEqual({
+			type: "content_block_start",
+			index: 0,
+			content_block: {
+				type: "redacted_thinking",
+				data: "bccfr1.rs_x.abc.def",
+			},
+		});
+		expect(events[reasoningStartIndex + 1]).toEqual({
+			type: "content_block_stop",
+			index: 0,
+		});
+		expect(events).toContainEqual({
+			type: "content_block_start",
+			index: 1,
+			content_block: { type: "text", text: "" },
+		});
+		expect(events.at(-2)?.type).toBe("message_delta");
+		expect(events.at(-1)?.type).toBe("message_stop");
+	});
+
+	it("defers reasoning that completes between text deltas of a live block", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_text_interleave", model: "gpt-5.6-sol" },
+			}),
+			...eventLine("response.output_item.added", {
+				item: { type: "message" },
+				output_index: 0,
+			}),
+			...eventLine("response.content_part.added", {
+				part: { type: "output_text" },
+			}),
+			...eventLine("response.output_text.delta", { delta: "he" }),
+			...eventLine("response.output_item.done", {
+				item: {
+					type: "reasoning",
+					id: "rs_between",
+					encrypted_content: "mid",
+				},
+				output_index: 1,
+			}),
+			...eventLine("response.output_text.delta", { delta: "llo" }),
+			...eventLine("response.output_item.done", {
+				item: { type: "message" },
+				output_index: 0,
+			}),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.6-sol",
+					usage: { input_tokens: 1, output_tokens: 1 },
+				},
+			}),
+		]);
+		const transformed = await provider.processResponse(
+			new Response(upstreamBody, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+		const events = (await transformed.text())
+			.split("\n")
+			.filter((line) => line.startsWith("data:"))
+			.map(
+				(line) =>
+					JSON.parse(line.slice("data:".length).trim()) as Record<
+						string,
+						unknown
+					>,
+			);
+
+		// Both text deltas must land at index 0 inside one open block — the
+		// pre-fix behavior closed the block at the reasoning boundary and
+		// orphaned the second delta at an unstarted index.
+		const blockEvents = events
+			.filter((event) =>
+				[
+					"content_block_start",
+					"content_block_delta",
+					"content_block_stop",
+				].includes(event.type as string),
+			)
+			.map((event) => ({
+				type: event.type,
+				index: event.index,
+				blockType:
+					(event.content_block as Record<string, unknown>)?.type ??
+					(event.delta as Record<string, unknown>)?.type,
+			}));
+		expect(blockEvents).toEqual([
+			{ type: "content_block_start", index: 0, blockType: "text" },
+			{ type: "content_block_delta", index: 0, blockType: "text_delta" },
+			{ type: "content_block_delta", index: 0, blockType: "text_delta" },
+			{ type: "content_block_stop", index: 0, blockType: undefined },
+			{
+				type: "content_block_start",
+				index: 1,
+				blockType: "redacted_thinking",
+			},
+			{ type: "content_block_stop", index: 1, blockType: undefined },
+		]);
+		expect(events).toContainEqual({
+			type: "content_block_start",
+			index: 1,
+			content_block: {
+				type: "redacted_thinking",
+				data: "bccfr1.rs_between.mid",
+			},
+		});
+	});
+
+	it("closes open text before emitting retained reasoning atomically", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_reasoning_after_text", model: "gpt-5.6-sol" },
+			}),
+			...eventLine("response.output_item.added", {
+				item: { type: "message" },
+				output_index: 0,
+			}),
+			...eventLine("response.content_part.added", {
+				part: { type: "output_text" },
+			}),
+			...eventLine("response.output_text.delta", { delta: "before" }),
+			...eventLine("response.output_item.done", {
+				item: {
+					type: "reasoning",
+					id: "rs_after_text",
+					encrypted_content: "ciphertext",
+				},
+				output_index: 1,
+			}),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.6-sol",
+					usage: { input_tokens: 1, output_tokens: 1 },
+				},
+			}),
+		]);
+		const transformed = await provider.processResponse(
+			new Response(upstreamBody, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+		const events = (await transformed.text())
+			.split("\n")
+			.filter((line) => line.startsWith("data:"))
+			.map(
+				(line) =>
+					JSON.parse(line.slice("data:".length).trim()) as Record<
+						string,
+						unknown
+					>,
+			);
+		const textStopIndex = events.findIndex(
+			(event) => event.type === "content_block_stop" && event.index === 0,
+		);
+
+		expect(events.slice(textStopIndex, textStopIndex + 3)).toEqual([
+			{ type: "content_block_stop", index: 0 },
+			{
+				type: "content_block_start",
+				index: 1,
+				content_block: {
+					type: "redacted_thinking",
+					data: "bccfr1.rs_after_text.ciphertext",
+				},
+			},
+			{ type: "content_block_stop", index: 1 },
+		]);
+	});
+
+	it("round-trips retained reasoning through Anthropic content", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_round_trip", model: "gpt-5.6-sol" },
+			}),
+			...eventLine("response.output_item.done", {
+				item: {
+					type: "reasoning",
+					id: "rs_round_trip",
+					encrypted_content: "cipher.with.dots",
+				},
+				output_index: 0,
+			}),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.6-sol",
+					usage: { input_tokens: 1, output_tokens: 1 },
+				},
+			}),
+		]);
+		const inbound = await provider.processResponse(
+			new Response(upstreamBody, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+		const retainedBlock = (await inbound.text())
+			.split("\n")
+			.filter((line) => line.startsWith("data:"))
+			.map(
+				(line) =>
+					JSON.parse(line.slice("data:".length).trim()) as Record<
+						string,
+						unknown
+					>,
+			)
+			.find(
+				(event) =>
+					event.type === "content_block_start" &&
+					(event.content_block as Record<string, unknown>)?.type ===
+						"redacted_thinking",
+			)?.content_block;
+		expect(retainedBlock).toBeDefined();
+
+		const outbound = await provider.transformRequestBody(
+			new Request("https://example.test/v1/messages", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					model: "claude-sonnet-4-5",
+					max_tokens: 16,
+					messages: [
+						{
+							role: "assistant",
+							content: [retainedBlock, { type: "text", text: "answer" }],
+						},
+					],
+				}),
+			}),
+		);
+		const outboundBody = await outbound.json();
+
+		expect(outboundBody.input[0]).toEqual({
+			type: "reasoning",
+			id: "rs_round_trip",
+			summary: [],
+			encrypted_content: "cipher.with.dots",
+		});
+	});
+
+	it("does not emit redacted thinking for unencrypted reasoning items", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_reasoning", model: "gpt-5.6-sol" },
+			}),
+			...eventLine("response.output_item.done", {
+				item: { type: "reasoning", id: "rs_plain", summary: [] },
+				output_index: 0,
+			}),
+			...eventLine("response.output_item.added", {
+				item: { type: "message" },
+				output_index: 1,
+			}),
+			...eventLine("response.content_part.added", {
+				part: { type: "output_text" },
+			}),
+			...eventLine("response.output_text.delta", { delta: "hello" }),
+			...eventLine("response.output_item.done", {
+				item: { type: "message" },
+				output_index: 1,
+			}),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.6-sol",
+					usage: { input_tokens: 1, output_tokens: 1 },
+				},
+			}),
+		]);
+		const transformed = await provider.processResponse(
+			new Response(upstreamBody, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+
+		const transformedBody = await transformed.text();
+
+		expect(transformedBody).not.toContain("redacted_thinking");
+		expect(transformedBody).toContain(
+			'"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}',
+		);
+		expect(transformedBody).toContain("event: message_delta");
+		expect(transformedBody).toContain("event: message_stop");
+	});
+
+	it("restores legacy response behavior when reasoning retention is disabled", async () => {
+		process.env.CCFLARE_CODEX_REASONING_RETENTION = "0";
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_disabled", model: "gpt-5.6-sol" },
+			}),
+			...eventLine("response.output_item.done", {
+				item: {
+					type: "reasoning",
+					id: "rs_disabled",
+					encrypted_content: "do-not-emit",
+				},
+				output_index: 0,
+			}),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.6-sol",
+					usage: { input_tokens: 1, output_tokens: 1 },
+				},
+			}),
+		]);
+		const transformed = await provider.processResponse(
+			new Response(upstreamBody, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+		const transformedBody = await transformed.text();
+
+		expect(transformedBody).not.toContain("redacted_thinking");
+		expect(transformedBody).toContain("event: message_delta");
+		expect(transformedBody).toContain("event: message_stop");
+	});
+
 	it("buffers tool-call arguments and emits them once before content_block_stop", async () => {
 		const provider = new CodexProvider();
 		const upstreamBody = sseBody([
@@ -2168,6 +2999,79 @@ describe("CodexProvider.processResponse", () => {
 			cache_read_input_tokens: 0,
 			cache_creation_input_tokens: 0,
 		});
+	});
+
+	it("preserves retained reasoning in non-streaming SSE-to-JSON conversion", async () => {
+		const provider = new CodexProvider();
+		const requestId = "req_non_stream_reasoning_1";
+		const originalRequest = new Request("https://example.test/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"x-better-ccflare-request-id": requestId,
+			},
+			body: JSON.stringify({
+				model: "claude-sonnet-4-5",
+				max_tokens: 16,
+				stream: false,
+				messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+			}),
+		});
+		await provider.transformRequestBody(originalRequest);
+
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_reasoning_json", model: "gpt-5.6-sol" },
+			}),
+			...eventLine("response.output_item.done", {
+				item: {
+					type: "reasoning",
+					id: "rs_json",
+					encrypted_content: "json.ciphertext",
+				},
+				output_index: 0,
+			}),
+			...eventLine("response.output_item.added", {
+				item: { type: "message" },
+				output_index: 1,
+			}),
+			...eventLine("response.content_part.added", {
+				part: { type: "output_text" },
+			}),
+			...eventLine("response.output_text.delta", { delta: "Hi" }),
+			...eventLine("response.output_item.done", {
+				item: { type: "message" },
+				output_index: 1,
+			}),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.6-sol",
+					usage: { input_tokens: 7, output_tokens: 2 },
+				},
+			}),
+		]);
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: {
+				"content-type": "text/event-stream",
+				"x-better-ccflare-request-id": requestId,
+				"x-better-ccflare-request-stream": "false",
+			},
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const payload = JSON.parse(await transformed.text()) as Record<
+			string,
+			unknown
+		>;
+
+		expect(payload.content).toEqual([
+			{
+				type: "redacted_thinking",
+				data: "bccfr1.rs_json.json.ciphertext",
+			},
+			{ type: "text", text: "Hi" },
+		]);
 	});
 
 	it("preserves tool_use content in non-streaming SSE->JSON conversion", async () => {
@@ -5869,7 +6773,7 @@ describe("CodexProvider.transformRequestBody", () => {
 			// recorded lineage and is admitted as root (basis: lineage_match), not
 			// demoted.
 			expect(requestTrace).toMatchObject({
-				trace_schema_version: 13,
+				trace_schema_version: 14,
 				orchestration_admission: "root",
 				orchestration_basis: "lineage_match",
 				orchestration_demotion_observed: false,
@@ -6116,7 +7020,7 @@ describe("CodexProvider.transformRequestBody", () => {
 				(record) => record.phase === "request",
 			);
 			expect(requestTrace).toMatchObject({
-				trace_schema_version: 13,
+				trace_schema_version: 14,
 				orchestration_admission: "attributed_descendant",
 				orchestration_basis: null,
 				is_descendant: true,

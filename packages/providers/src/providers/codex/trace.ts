@@ -6,9 +6,10 @@
  * native Anthropic path. Production payload capture is usually off, so this
  * writes JSONL records that make a live session inspectable offline.
  *
- * Request records summarize historical tool-call load replayed into Codex.
- * Response records summarize newly emitted tool calls from the current Codex
- * response, which is the real signal for fresh subagent fan-out.
+ * Request records summarize historical tool-call load and reasoning items
+ * replayed into Codex. Response records summarize newly emitted tool calls and
+ * reasoning items from the current Codex response; tool calls remain the real
+ * signal for fresh subagent fan-out.
  *
  * Enable:
  *   CCFLARE_CODEX_TRACE_DIR=/path/to/dir     # summaries only, no prompt content
@@ -36,7 +37,7 @@ export const CODEX_TRACE_HMAC_KEY_ENV = "CCFLARE_CODEX_TRACE_HMAC_KEY";
 /** Warn when one response spawns at least this many subagents (0 disables). */
 export const CODEX_FANOUT_WARN_ENV = "CCFLARE_CODEX_FANOUT_WARN";
 
-const TRACE_SCHEMA_VERSION = 13;
+const TRACE_SCHEMA_VERSION = 14;
 const DEFAULT_FANOUT_WARN = 8;
 const MAX_INPUT_ITEM_FINGERPRINTS = 64;
 /**
@@ -57,6 +58,8 @@ export interface ToolCallSummary {
 
 export interface CodexTransformSummary {
 	input_item_count: number;
+	/** Stateless GPT reasoning items replayed as top-level Codex input siblings. */
+	reasoning_input_item_count: number;
 	input_bytes: number;
 	input_hmac: string | null;
 	input_except_last_item_bytes: number | null;
@@ -86,6 +89,10 @@ export interface CodexTransformSummary {
 }
 
 export interface CodexResponseSummary {
+	/** Reasoning output items observed in this physical response. */
+	reasoning_output_item_count: number;
+	/** Whether any observed reasoning item carried replayable encrypted content. */
+	reasoning_encrypted_present: boolean;
 	new_tool_call_count: number;
 	/** Newly emitted Task/Agent calls: the recursive fan-out signal. */
 	new_subagent_spawn_count: number;
@@ -106,12 +113,18 @@ export interface CodexResponseSummary {
 	error_status?: string;
 }
 
+export interface CodexReasoningResponseMetrics {
+	outputItemCount: number;
+	encryptedPresent: boolean;
+}
+
 /**
  * Pure summarizer over the Codex `input` array. No I/O, no env — unit-testable.
  */
 export function summarizeCodexTransform(
 	codexInput: readonly unknown[],
 ): CodexTransformSummary {
+	let reasoning_input_item_count = 0;
 	let function_call_count = 0;
 	let function_call_output_count = 0;
 	let empty_output_count = 0;
@@ -123,7 +136,9 @@ export function summarizeCodexTransform(
 		if (!item || typeof item !== "object") continue;
 		const it = item as Record<string, unknown>;
 
-		if (it.type === "function_call") {
+		if (it.type === "reasoning") {
+			reasoning_input_item_count++;
+		} else if (it.type === "function_call") {
 			function_call_count++;
 			const name = typeof it.name === "string" ? it.name : "?";
 			tool_use_by_name[name] = (tool_use_by_name[name] ?? 0) + 1;
@@ -152,6 +167,7 @@ export function summarizeCodexTransform(
 
 	return {
 		input_item_count: codexInput.length,
+		reasoning_input_item_count,
 		input_bytes: fullInput.bytes,
 		input_hmac: fullInput.hmac,
 		input_except_last_item_bytes: inputExceptLastItem?.bytes ?? null,
@@ -309,6 +325,7 @@ export function summarizeCodexResponse(
 	},
 	stopReason: CodexResponseSummary["stop_reason"],
 	error?: { type?: string; message?: string; code?: string; status?: string },
+	reasoning?: Partial<CodexReasoningResponseMetrics>,
 ): CodexResponseSummary {
 	const newToolUseByName: Record<string, number> = {};
 	let subagentSpawnCount = 0;
@@ -329,6 +346,8 @@ export function summarizeCodexResponse(
 				typeof usage.cache_creation_input_tokens === "number"
 			: typeof usage.cache_creation_input_tokens === "number";
 	return {
+		reasoning_output_item_count: reasoning?.outputItemCount ?? 0,
+		reasoning_encrypted_present: reasoning?.encryptedPresent ?? false,
 		new_tool_call_count: toolCalls.length,
 		new_subagent_spawn_count: subagentSpawnCount,
 		new_tool_use_by_name: newToolUseByName,
