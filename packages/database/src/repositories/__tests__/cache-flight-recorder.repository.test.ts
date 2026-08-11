@@ -1,11 +1,13 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, it } from "bun:test";
-import type {
-	CacheFlightCohortSealReceipt,
-	CacheFlightKeepalivePolicySnapshot,
-	CacheFlightPersistedSeal,
-	CacheFlightSealDimension,
-	TurnEvidence,
+import {
+	type CacheFlightCohortSealReceipt,
+	type CacheFlightKeepalivePolicySnapshot,
+	type CacheFlightPersistedSeal,
+	type CacheFlightSealDimension,
+	PARTITION_DIMENSION_ORDER as CORE_PARTITION_DIMENSION_ORDER,
+	SERVICE_DIMENSION_ORDER as CORE_SERVICE_DIMENSION_ORDER,
+	type TurnEvidence,
 } from "@better-ccflare/core";
 import { BunSqlAdapter } from "../../adapters/bun-sql-adapter";
 import { ensureSchema, runMigrations } from "../../migrations";
@@ -1447,6 +1449,111 @@ describe("CacheFlightRecorderRepository", () => {
 			});
 			db.close();
 		}
+	});
+
+	// This repository keeps its own SERVICE_DIMENSION_ORDER / PARTITION_DIMENSION_ORDER
+	// literal arrays (see module scope above) instead of importing
+	// @better-ccflare/core's canonical order, because assertPrivacySafeSealReceipt
+	// must not trust anything the proxy-side capture path computed — including
+	// which order it used. That independence is deliberate, but it means the
+	// two copies can silently drift. expectedServiceUnavailable/
+	// expectedPartitionUnavailable recompute the expected unavailable-dimension
+	// list from this repository's own order and then require the receipt's
+	// declared list to match it *positionally* (assertExactUnavailable), so a
+	// receipt whose declared dimensions are listed in core's canonical order is
+	// accepted only if this repository's own order still agrees with core's,
+	// and a receipt using any other order is rejected. That makes order
+	// agreement directly observable through the public appendTurn API without
+	// needing to export this repository's private order constants.
+	it("keeps its own PARTITION_DIMENSION_ORDER positionally aligned with @better-ccflare/core's canonical order", async () => {
+		const db = makeDb();
+		const repo = new CacheFlightRecorderRepository(new BunSqlAdapter(db));
+		await repo.appendTurn(
+			"partition-order-id",
+			turn(1),
+			1_000,
+			sealReceipt({
+				servingAccountScope: null,
+				routeModelEpoch: null,
+				partitionUnavailable: [...CORE_PARTITION_DIMENSION_ORDER],
+			}),
+		);
+		const timeline = await repo.loadTimeline("partition-order-id");
+		expect(
+			(timeline?.turns as LoadedTurnWithSeal[] | undefined)?.[0]?.seal
+				?.observationPartition.unavailableDimensions,
+		).toEqual([...CORE_PARTITION_DIMENSION_ORDER]);
+		db.close();
+
+		const db2 = makeDb();
+		const repo2 = new CacheFlightRecorderRepository(new BunSqlAdapter(db2));
+		await expect(
+			repo2.appendTurn(
+				"partition-order-id",
+				turn(1),
+				1_000,
+				sealReceipt({
+					servingAccountScope: null,
+					routeModelEpoch: null,
+					partitionUnavailable: [...CORE_PARTITION_DIMENSION_ORDER].reverse(),
+				}),
+			),
+		).rejects.toThrow("unknown seal dimensions must be explicit");
+		db2.close();
+	});
+
+	it("keeps its own SERVICE_DIMENSION_ORDER positionally aligned with @better-ccflare/core's canonical order", async () => {
+		// seal_contract_version is excluded: an out-of-contract version throws
+		// its own dedicated error before assertExactUnavailable ever runs, so
+		// it can never appear as a declared-unavailable dimension in a receipt
+		// that reaches the order check. The other seven service dimensions can
+		// all be forced unavailable simultaneously, which is enough to pin
+		// their full relative order.
+		const reachableServiceOrder = CORE_SERVICE_DIMENSION_ORDER.filter(
+			(dimension) => dimension !== "seal_contract_version",
+		);
+		const nulledFields = {
+			deploymentRevision: null,
+			serviceInstanceId: null,
+			processStartedAt: null,
+			nativeCacheState: null,
+			recorderState: null,
+			keepalive: null,
+			occurrenceId: null,
+		} as const;
+
+		const db = makeDb();
+		const repo = new CacheFlightRecorderRepository(new BunSqlAdapter(db));
+		await repo.appendTurn(
+			"service-order-id",
+			turn(1),
+			1_000,
+			sealReceipt({
+				...nulledFields,
+				serviceUnavailable: [...reachableServiceOrder],
+			}),
+		);
+		const timeline = await repo.loadTimeline("service-order-id");
+		expect(
+			(timeline?.turns as LoadedTurnWithSeal[] | undefined)?.[0]?.seal
+				?.serviceEpoch.unavailableDimensions,
+		).toEqual([...reachableServiceOrder]);
+		db.close();
+
+		const db2 = makeDb();
+		const repo2 = new CacheFlightRecorderRepository(new BunSqlAdapter(db2));
+		await expect(
+			repo2.appendTurn(
+				"service-order-id",
+				turn(1),
+				1_000,
+				sealReceipt({
+					...nulledFields,
+					serviceUnavailable: [...reachableServiceOrder].reverse(),
+				}),
+			),
+		).rejects.toThrow("unknown seal dimensions must be explicit");
+		db2.close();
 	});
 
 	it("sanitizes corrupted stored seal identities and timestamps before projecting health", async () => {

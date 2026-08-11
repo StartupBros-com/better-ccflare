@@ -1,7 +1,22 @@
+import { Database } from "bun:sqlite";
 import { describe, expect, it } from "bun:test";
 import type { Config } from "@better-ccflare/config";
+import {
+	type CacheFlightCohortSealReceipt,
+	type CacheFlightKeepalivePolicySnapshot,
+	PARTITION_DIMENSION_ORDER as CORE_PARTITION_DIMENSION_ORDER,
+	SERVICE_DIMENSION_ORDER as CORE_SERVICE_DIMENSION_ORDER,
+	type TurnEvidence,
+} from "@better-ccflare/core";
+import {
+	BunSqlAdapter,
+	CacheFlightRecorderRepository,
+	ensureSchema,
+	runMigrations,
+} from "@better-ccflare/database";
 import type { Account } from "@better-ccflare/types";
 import {
+	COHORT_SEAL_CONTRACT_VERSION,
 	COHORT_SEAL_PROFILE_CONFIG_KEYS,
 	CohortSealService,
 } from "../cache-flight-cohort-seal";
@@ -9,7 +24,10 @@ import {
 	resolveEffectiveXaiKeepalivePolicy,
 	resolveKeepaliveTtlMinutes as resolveKeepaliveTtlMinutesFromPolicy,
 } from "../cache-keepalive-policy";
-import { createOpaqueRuntimeIdFactory } from "../opaque-runtime-id";
+import {
+	createOpaqueRuntimeIdFactory,
+	type OpaqueRuntimeIdFactory,
+} from "../opaque-runtime-id";
 
 type ConfigChangeListener = (event: { key: string; newValue: unknown }) => void;
 
@@ -112,15 +130,18 @@ function makeService(
 		bootNonceFill?: number;
 		gitSha?: string | null;
 		env?: Record<string, string | undefined>;
+		idFactory?: OpaqueRuntimeIdFactory;
 	} = {},
 ): CohortSealService {
 	return new CohortSealService({
 		config,
 		env: options.env ?? { ...enabledEnv },
-		idFactory: createOpaqueRuntimeIdFactory({
-			secret: new Uint8Array(32).fill(options.secretFill ?? 3),
-			bootNonce: new Uint8Array(32).fill(options.bootNonceFill ?? 5),
-		}),
+		idFactory:
+			options.idFactory ??
+			createOpaqueRuntimeIdFactory({
+				secret: new Uint8Array(32).fill(options.secretFill ?? 3),
+				bootNonce: new Uint8Array(32).fill(options.bootNonceFill ?? 5),
+			}),
 		processStartedAt: "2026-08-08T10:00:00.000Z",
 		readBuildProvenance: () => ({
 			version: "2.1.226",
@@ -138,6 +159,82 @@ function capture(service: CohortSealService, overrides = {}) {
 		routeCandidateId: "candidate:primary-xai",
 		...overrides,
 	});
+}
+
+/**
+ * An idFactory whose bootId is the empty string, so
+ * `unavailableServiceDimensions()`'s `service_instance` check (which treats a
+ * blank string as unknown, same as `knownString`) can be forced from the
+ * public `captureReceipt()` API without any production change.
+ */
+function makeEmptyBootIdFactory(): OpaqueRuntimeIdFactory {
+	const base = createOpaqueRuntimeIdFactory({
+		secret: new Uint8Array(32).fill(9),
+		bootNonce: new Uint8Array(32).fill(11),
+	});
+	return {
+		bootId: "" as OpaqueRuntimeIdFactory["bootId"],
+		id: base.id.bind(base),
+	};
+}
+
+/** Fresh in-memory recorder repository, same wiring as the database package's
+ * own test suite (`packages/database/src/repositories/__tests__/cache-flight-recorder.repository.test.ts`). */
+function freshRepo(): CacheFlightRecorderRepository {
+	const db = new Database(":memory:");
+	db.run("PRAGMA foreign_keys = ON");
+	ensureSchema(db);
+	runMigrations(db);
+	return new CacheFlightRecorderRepository(new BunSqlAdapter(db));
+}
+
+function baseTurn(overrides: Partial<TurnEvidence> = {}): TurnEvidence {
+	return {
+		sequence: 1,
+		timestamp: "2026-08-08T10:00:01.000Z",
+		identityFingerprint: "identity-fingerprint",
+		servingAccountId: "account-safe-id",
+		prefixFingerprint: "prefix-fingerprint",
+		cacheOutcome: "hit",
+		inputTokens: 100,
+		cachedTokens: 80,
+		completeness: "complete",
+		unavailableDimensions: [],
+		...overrides,
+	};
+}
+
+/** A fully-populated, complete receipt built by hand (not via CohortSealService)
+ * so the keepalive-derivation agreement test below is isolated to the
+ * keepalive policy field alone. */
+function minimalCompleteReceipt(
+	keepalive: CacheFlightKeepalivePolicySnapshot,
+): CacheFlightCohortSealReceipt {
+	return {
+		serviceEpoch: {
+			id: "epoch-safe-id",
+			occurrenceId: "occurrence-safe-id",
+			sealContractVersion: COHORT_SEAL_CONTRACT_VERSION,
+			deploymentRevision: "deploy-safe-id",
+			serviceInstanceId: "service-safe-id",
+			processStartedAt: "2026-08-08T10:00:00.000Z",
+			nativeCacheState: "enabled",
+			recorderState: "enabled",
+			keepalivePolicy: keepalive,
+			completeness: "complete",
+			unavailableDimensions: [],
+		},
+		observationPartition: {
+			id: "partition-safe-id",
+			serviceEpochId: "epoch-safe-id",
+			servingAccountScope: "serving-scope-safe-id",
+			routeModelEpoch: "route-model-safe-id",
+			completeness: "complete",
+			unavailableDimensions: [],
+		},
+		completeness: "complete",
+		unavailableDimensions: [],
+	};
 }
 
 describe("CohortSealService", () => {
@@ -415,5 +512,216 @@ describe("CohortSealService", () => {
 		expect(harness.listenerCount()).toBe(0);
 		service.dispose();
 		expect(harness.listenerCount()).toBe(0);
+	});
+});
+
+// --- Drift guards -----------------------------------------------------
+//
+// Two independent reviewers found the same seal-dimension rule implemented
+// separately in packages/core, packages/proxy, and packages/database. Each
+// implementation is intentionally kept independent (see
+// packages/database/src/repositories/cache-flight-recorder.repository.ts,
+// assertPrivacySafeSealReceipt: the database validator must not trust the
+// receipt it is checking, so it may not import the predicate the proxy used
+// to build that receipt). These tests do not consolidate that duplication;
+// they exist to catch the two implementations silently drifting apart.
+
+describe("dimension order matches @better-ccflare/core's canonical order", () => {
+	it("declares partition-unavailable dimensions in core's canonical PARTITION_DIMENSION_ORDER", () => {
+		// If this package's private PARTITION_DIMENSION_ORDER (in
+		// ../cache-flight-cohort-seal.ts) is ever reordered independently of
+		// core's canonical order, unavailablePartitionDimensions() pushes in the
+		// new (wrong) order and this assertion goes red.
+		const service = makeService(makeConfig(20, 0).config);
+		const receipt = capture(service, {
+			finalServingAccount: makeAccount({ id: "" }),
+			attemptedTransportModel: null,
+			routeCandidateId: null,
+		});
+
+		expect(receipt?.observationPartition.unavailableDimensions).toEqual(
+			CORE_PARTITION_DIMENSION_ORDER,
+		);
+	});
+
+	it("declares the publicly-reachable service-unavailable dimensions in core's canonical SERVICE_DIMENSION_ORDER order", () => {
+		// Only deployment_revision and service_instance can legitimately be
+		// forced null through the public captureReceipt() API today: the other
+		// six dimensions in SERVICE_DIMENSION_ORDER (seal_contract_version,
+		// process_started_at, native_cache_state, recorder_state,
+		// keepalive_policy, service_epoch_occurrence) are structurally
+		// guaranteed non-null by buildProfile()/normalizeProcessStartedAt().
+		// That structural guarantee is exactly the P1 invariant this drift
+		// guard exists to police: unavailableServiceDimensions() still has an
+		// explicit disjunct per dimension, and if a future change lets one of
+		// the other six legitimately become null without adding its disjunct,
+		// nothing here (or in production) will catch it until a real seal
+		// silently fails to declare that dimension unavailable.
+		const service = makeService(makeConfig(20, 0).config, {
+			gitSha: null,
+			idFactory: makeEmptyBootIdFactory(),
+		});
+		const receipt = capture(service);
+
+		const reachable = CORE_SERVICE_DIMENSION_ORDER.filter(
+			(dimension) =>
+				dimension === "deployment_revision" || dimension === "service_instance",
+		);
+		expect(receipt?.serviceEpoch.unavailableDimensions).toEqual(reachable);
+	});
+});
+
+describe("capture-to-validate agreement with the database seal validator", () => {
+	// Pipes a REAL CohortSealService.captureReceipt() output through the
+	// database's assertPrivacySafeSealReceipt (via
+	// CacheFlightRecorderRepository.appendTurn). The database independently
+	// recomputes expectedServiceUnavailable/expectedPartitionUnavailable from
+	// the receipt's own field values and rejects any receipt whose declared
+	// unavailableDimensions disagree - so if this package's
+	// unavailableServiceDimensions()/unavailablePartitionDimensions() ever
+	// fails to declare a dimension that is actually null (the P1 risk), the
+	// resulting receipt is rejected here with
+	// "unknown seal dimensions must be explicit", and this test goes red.
+
+	it("accepts a fully-populated, complete receipt", async () => {
+		const repo = freshRepo();
+		const service = makeService(makeConfig(20, 5).config);
+		const receipt = capture(service);
+		expect(receipt?.completeness).toBe("complete");
+
+		await expect(
+			repo.appendTurn(
+				"proxy-capture-complete",
+				baseTurn(),
+				1_000,
+				receipt ?? undefined,
+			),
+		).resolves.toBeUndefined();
+
+		const timeline = await repo.loadTimeline("proxy-capture-complete");
+		expect(timeline?.turns[0]?.seal).toEqual(receipt);
+	});
+
+	it("accepts a receipt with a missing deployment revision", async () => {
+		const repo = freshRepo();
+		const service = makeService(makeConfig(20, 5).config, { gitSha: null });
+		const receipt = capture(service);
+		expect(receipt?.serviceEpoch.unavailableDimensions).toContain(
+			"deployment_revision",
+		);
+
+		await expect(
+			repo.appendTurn(
+				"proxy-capture-missing-revision",
+				baseTurn(),
+				1_000,
+				receipt ?? undefined,
+			),
+		).resolves.toBeUndefined();
+	});
+
+	it("accepts a receipt with a missing serving-account scope", async () => {
+		const repo = freshRepo();
+		const service = makeService(makeConfig(20, 5).config);
+		const receipt = capture(service, {
+			finalServingAccount: makeAccount({ id: "" }),
+		});
+		expect(receipt?.observationPartition.unavailableDimensions).toContain(
+			"serving_account_scope",
+		);
+
+		await expect(
+			repo.appendTurn(
+				"proxy-capture-missing-scope",
+				baseTurn(),
+				1_000,
+				receipt ?? undefined,
+			),
+		).resolves.toBeUndefined();
+	});
+
+	it("accepts a receipt with missing route/model evidence", async () => {
+		const repo = freshRepo();
+		const service = makeService(makeConfig(20, 5).config);
+		const receipt = capture(service, {
+			attemptedTransportModel: null,
+			routeCandidateId: null,
+		});
+		expect(receipt?.observationPartition.unavailableDimensions).toContain(
+			"route_model_epoch",
+		);
+
+		await expect(
+			repo.appendTurn(
+				"proxy-capture-missing-route-model",
+				baseTurn(),
+				1_000,
+				receipt ?? undefined,
+			),
+		).resolves.toBeUndefined();
+	});
+
+	it("accepts every xAI/global keepalive TTL combination the scheduler can produce", async () => {
+		for (const [globalTtl, xaiTtl] of [
+			[20, 5],
+			[20, 0],
+			[0, 0],
+			[0, 5],
+		] as const) {
+			const repo = freshRepo();
+			const service = makeService(makeConfig(globalTtl, xaiTtl).config);
+			const receipt = capture(service);
+
+			await expect(
+				repo.appendTurn(
+					`proxy-capture-keepalive-${globalTtl}-${xaiTtl}`,
+					baseTurn(),
+					1_000,
+					receipt ?? undefined,
+				),
+			).resolves.toBeUndefined();
+		}
+	});
+});
+
+describe("keepalive derivation agreement with the database seal validator", () => {
+	it("pins the database's canonical v1 xAI derivation against the proxy's resolver over the precedence matrix", async () => {
+		// The database's (private) keepalivePolicyMatchesCanonicalV1XaiDerivation
+		// recomputes the expected snapshot from the receipt's own
+		// globalTtlMinutes/xaiTtlMinutes and rejects any mismatch. Feeding it a
+		// snapshot built by this package's resolveEffectiveXaiKeepalivePolicy
+		// therefore pins the two independent derivations together: if either
+		// side's precedence rule changes without the other, appendTurn starts
+		// throwing "cache flight keepalive policy must match canonical v1 xAI
+		// derivation" and this test goes red.
+		for (const [globalTtl, xaiTtl, expectedTtl, expectedEnabled] of [
+			[20, 5, 5, true], // positive xAI TTL wins
+			[20, 0, 20, true], // else positive global TTL wins
+			[0, 0, 0, false], // else disabled
+			[0, 5, 5, true], // positive xAI TTL wins even with global disabled/zero
+		] as const) {
+			const resolvedTtl = resolveKeepaliveTtlMinutesFromPolicy(
+				"xai",
+				globalTtl,
+				xaiTtl,
+			);
+			expect(resolvedTtl).toBe(expectedTtl);
+
+			const policy = resolveEffectiveXaiKeepalivePolicy(globalTtl, xaiTtl);
+			expect(policy.effectiveXaiEnabled).toBe(expectedEnabled);
+			expect(policy.effectiveXaiTtlMinutes).toBe(
+				expectedEnabled ? expectedTtl : null,
+			);
+
+			const repo = freshRepo();
+			await expect(
+				repo.appendTurn(
+					`keepalive-agreement-${globalTtl}-${xaiTtl}`,
+					baseTurn(),
+					1_000,
+					minimalCompleteReceipt(policy),
+				),
+			).resolves.toBeUndefined();
+		}
 	});
 });

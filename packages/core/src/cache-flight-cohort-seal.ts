@@ -179,7 +179,18 @@ type CohortGroup = {
 	readonly observations: CacheFlightCohortObservation[];
 };
 
-const SEAL_DIMENSION_ORDER: readonly CacheFlightSealDimension[] = [
+/**
+ * Canonical seal-dimension order. `packages/proxy/src/cache-flight-cohort-seal.ts`
+ * (capture time) and `packages/database/src/repositories/cache-flight-recorder.repository.ts`
+ * (write-time validation) each keep an independent literal copy of the
+ * service/partition slices of this order for reasons documented at their
+ * call sites (the database validator must not trust the receipt it is
+ * checking). This export exists so tests in those packages can assert their
+ * local copies deep-equal this canonical order instead of silently drifting
+ * from it. Do not import this export into either package's production code —
+ * only into their tests.
+ */
+export const SEAL_DIMENSION_ORDER: readonly CacheFlightSealDimension[] = [
 	"seal_contract_version",
 	"deployment_revision",
 	"service_instance",
@@ -193,7 +204,7 @@ const SEAL_DIMENSION_ORDER: readonly CacheFlightSealDimension[] = [
 	"seal_receipt",
 ];
 
-const SERVICE_DIMENSION_ORDER: readonly CacheFlightSealDimension[] = [
+export const SERVICE_DIMENSION_ORDER: readonly CacheFlightSealDimension[] = [
 	"seal_contract_version",
 	"deployment_revision",
 	"service_instance",
@@ -204,7 +215,7 @@ const SERVICE_DIMENSION_ORDER: readonly CacheFlightSealDimension[] = [
 	"service_epoch_occurrence",
 ];
 
-const PARTITION_DIMENSION_ORDER: readonly CacheFlightSealDimension[] = [
+export const PARTITION_DIMENSION_ORDER: readonly CacheFlightSealDimension[] = [
 	"serving_account_scope",
 	"route_model_epoch",
 ];
