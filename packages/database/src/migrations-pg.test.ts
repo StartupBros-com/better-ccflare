@@ -325,11 +325,30 @@ describe("SQLite <-> PostgreSQL migration schema parity (static)", () => {
 		expect(pgSource).toContain("idx_cache_flight_recorder_turns_partition");
 		expect(pgSource).toContain("idx_cache_flight_recorder_partitions_epoch");
 		expect(pgSource).toContain("idx_cache_flight_recorder_turns_cleanup");
+		// last_verified_at liveness column: closes the retention-sweep gap
+		// where created_at alone never reflects a long-lived registry row
+		// being re-verified by a live append (see
+		// cache-flight-recorder.repository.ts registryStatements() /
+		// expireOlderThan()).
+		expect(pgSource).toContain(
+			"ALTER TABLE cache_flight_recorder_service_epochs ADD COLUMN last_verified_at BIGINT",
+		);
+		expect(pgSource).toContain(
+			"ALTER TABLE cache_flight_recorder_partitions ADD COLUMN last_verified_at BIGINT",
+		);
+		expect(pgSource).toContain(
+			"idx_cache_flight_recorder_service_epochs_last_verified_at",
+		);
+		expect(pgSource).toContain(
+			"idx_cache_flight_recorder_partitions_last_verified_at",
+		);
 	});
 
 	it("creates cache flight seal registry tables before adding the legacy turn foreign key", async () => {
 		const statements: string[] = [];
 		let observationPartitionColumnAdded = false;
+		let serviceEpochLastVerifiedAtAdded = false;
+		let partitionLastVerifiedAtAdded = false;
 		const legacyLikeAdapter = {
 			unsafe: async (sql: string) => {
 				const normalized = sql.replace(/\s+/g, " ").trim();
@@ -343,6 +362,28 @@ describe("SQLite <-> PostgreSQL migration schema parity (static)", () => {
 						"turn observation_partition_id index was created before the legacy column ALTER",
 					);
 				}
+				if (
+					normalized.includes("CREATE INDEX") &&
+					normalized.includes(
+						"idx_cache_flight_recorder_service_epochs_last_verified_at",
+					) &&
+					!serviceEpochLastVerifiedAtAdded
+				) {
+					throw new Error(
+						"service epoch last_verified_at index was created before the legacy column ALTER",
+					);
+				}
+				if (
+					normalized.includes("CREATE INDEX") &&
+					normalized.includes(
+						"idx_cache_flight_recorder_partitions_last_verified_at",
+					) &&
+					!partitionLastVerifiedAtAdded
+				) {
+					throw new Error(
+						"partition last_verified_at index was created before the legacy column ALTER",
+					);
+				}
 				statements.push(normalized);
 				if (
 					normalized.includes(
@@ -350,6 +391,20 @@ describe("SQLite <-> PostgreSQL migration schema parity (static)", () => {
 					)
 				) {
 					observationPartitionColumnAdded = true;
+				}
+				if (
+					normalized.includes(
+						"ALTER TABLE cache_flight_recorder_service_epochs ADD COLUMN last_verified_at",
+					)
+				) {
+					serviceEpochLastVerifiedAtAdded = true;
+				}
+				if (
+					normalized.includes(
+						"ALTER TABLE cache_flight_recorder_partitions ADD COLUMN last_verified_at",
+					)
+				) {
+					partitionLastVerifiedAtAdded = true;
 				}
 				return [];
 			},
@@ -359,13 +414,14 @@ describe("SQLite <-> PostgreSQL migration schema parity (static)", () => {
 			): Promise<T | null> => {
 				if (sql.includes("information_schema.columns")) {
 					const [table, column] = params ?? [];
-					return {
-						exists:
-							table === "cache_flight_recorder_turns" &&
-							column === "observation_partition_id"
-								? 0
-								: 1,
-					} as T;
+					const missingLegacyColumn =
+						(table === "cache_flight_recorder_turns" &&
+							column === "observation_partition_id") ||
+						(table === "cache_flight_recorder_service_epochs" &&
+							column === "last_verified_at") ||
+						(table === "cache_flight_recorder_partitions" &&
+							column === "last_verified_at");
+					return { exists: missingLegacyColumn ? 0 : 1 } as T;
 				}
 				if (sql.includes("pg_indexes")) {
 					return { exists: 1 } as T;
@@ -413,6 +469,38 @@ describe("SQLite <-> PostgreSQL migration schema parity (static)", () => {
 		);
 		expect(turnPartitionIndex).toBeGreaterThan(turnReferenceAlterIndex);
 		expect(turnCleanupIndex).toBeGreaterThan(turnReferenceAlterIndex);
+
+		// Same before/after ordering guarantee for last_verified_at: the ALTER
+		// must run (via columnsToAdd) before either covering index is
+		// created.
+		const serviceEpochLastVerifiedAtAlterIndex = statements.findIndex((sql) =>
+			sql.includes(
+				"ALTER TABLE cache_flight_recorder_service_epochs ADD COLUMN last_verified_at",
+			),
+		);
+		const partitionLastVerifiedAtAlterIndex = statements.findIndex((sql) =>
+			sql.includes(
+				"ALTER TABLE cache_flight_recorder_partitions ADD COLUMN last_verified_at",
+			),
+		);
+		const serviceEpochLastVerifiedAtCreateIndex = statements.findIndex((sql) =>
+			sql.includes(
+				"CREATE INDEX IF NOT EXISTS idx_cache_flight_recorder_service_epochs_last_verified_at",
+			),
+		);
+		const partitionLastVerifiedAtCreateIndex = statements.findIndex((sql) =>
+			sql.includes(
+				"CREATE INDEX IF NOT EXISTS idx_cache_flight_recorder_partitions_last_verified_at",
+			),
+		);
+		expect(serviceEpochLastVerifiedAtAlterIndex).toBeGreaterThanOrEqual(0);
+		expect(partitionLastVerifiedAtAlterIndex).toBeGreaterThanOrEqual(0);
+		expect(serviceEpochLastVerifiedAtCreateIndex).toBeGreaterThan(
+			serviceEpochLastVerifiedAtAlterIndex,
+		);
+		expect(partitionLastVerifiedAtCreateIndex).toBeGreaterThan(
+			partitionLastVerifiedAtAlterIndex,
+		);
 	});
 });
 

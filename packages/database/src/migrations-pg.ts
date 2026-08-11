@@ -46,7 +46,10 @@ async function _tableExists(
 
 async function ensureCacheFlightRecorderTablesPg(
 	adapter: BunSqlAdapter,
-	options: { installTurnObservationIndexes?: boolean } = {},
+	options: {
+		installTurnObservationIndexes?: boolean;
+		installLastVerifiedAtIndexes?: boolean;
+	} = {},
 ): Promise<void> {
 	await adapter.unsafe(`
 		CREATE TABLE IF NOT EXISTS cache_flight_recorder_service_epochs (
@@ -64,7 +67,8 @@ async function ensureCacheFlightRecorderTablesPg(
 			occurrence_id TEXT,
 			completeness TEXT NOT NULL,
 			unavailable_dimensions TEXT NOT NULL DEFAULT '[]',
-			created_at BIGINT NOT NULL
+			created_at BIGINT NOT NULL,
+			last_verified_at BIGINT NOT NULL
 		)
 	`);
 	await adapter.unsafe(`
@@ -78,6 +82,7 @@ async function ensureCacheFlightRecorderTablesPg(
 			seal_completeness TEXT NOT NULL,
 			seal_unavailable_dimensions TEXT NOT NULL DEFAULT '[]',
 			created_at BIGINT NOT NULL,
+			last_verified_at BIGINT NOT NULL,
 			FOREIGN KEY (service_epoch_id)
 				REFERENCES cache_flight_recorder_service_epochs(id)
 				ON DELETE CASCADE
@@ -87,6 +92,22 @@ async function ensureCacheFlightRecorderTablesPg(
 		`CREATE INDEX IF NOT EXISTS idx_cache_flight_recorder_partitions_epoch
 		 ON cache_flight_recorder_partitions(service_epoch_id)`,
 	);
+	// Deferred the same way installTurnObservationIndexes defers the turn
+	// indexes below: the first runMigrationsPg() call happens before the
+	// columnsToAdd loop that ALTERs last_verified_at onto legacy tables, so
+	// creating these indexes unconditionally here would fail against a
+	// pre-existing table that doesn't have the column yet. The second call
+	// (after columnsToAdd has run) installs them.
+	if (options.installLastVerifiedAtIndexes !== false) {
+		await adapter.unsafe(
+			`CREATE INDEX IF NOT EXISTS idx_cache_flight_recorder_service_epochs_last_verified_at
+			 ON cache_flight_recorder_service_epochs(last_verified_at)`,
+		);
+		await adapter.unsafe(
+			`CREATE INDEX IF NOT EXISTS idx_cache_flight_recorder_partitions_last_verified_at
+			 ON cache_flight_recorder_partitions(last_verified_at)`,
+		);
+	}
 	await adapter.unsafe(`
 		CREATE TABLE IF NOT EXISTS cache_flight_recorder_conversations (
 			recorder_conversation_id TEXT PRIMARY KEY,
@@ -1103,9 +1124,11 @@ export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 	// registry tables, so legacy upgrades must create the recorder tables before
 	// the additive column loop attempts the ALTER. The turn observation indexes
 	// are deferred until after that loop because legacy turn tables may exist
-	// without observation_partition_id.
+	// without observation_partition_id. Same reasoning for last_verified_at:
+	// legacy epoch/partition tables may not have that column yet either.
 	await ensureCacheFlightRecorderTablesPg(adapter, {
 		installTurnObservationIndexes: false,
+		installLastVerifiedAtIndexes: false,
 	});
 
 	// Add columns that might be missing from older schema versions
@@ -1288,6 +1311,23 @@ export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 			definition:
 				"ALTER TABLE cache_flight_recorder_turns ADD COLUMN observation_partition_id TEXT REFERENCES cache_flight_recorder_partitions(id) ON DELETE SET NULL",
 		},
+		{
+			// Nullable, not NOT NULL: PostgreSQL can't add a NOT NULL column
+			// to a non-empty table without a DEFAULT, and a DEFAULT would
+			// falsely backdate every legacy row to "verified now". The
+			// backfill below sets every existing row's last_verified_at
+			// explicitly instead, matching the SQLite migration.
+			table: "cache_flight_recorder_service_epochs",
+			column: "last_verified_at",
+			definition:
+				"ALTER TABLE cache_flight_recorder_service_epochs ADD COLUMN last_verified_at BIGINT",
+		},
+		{
+			table: "cache_flight_recorder_partitions",
+			column: "last_verified_at",
+			definition:
+				"ALTER TABLE cache_flight_recorder_partitions ADD COLUMN last_verified_at BIGINT",
+		},
 	];
 
 	for (const col of columnsToAdd) {
@@ -1296,6 +1336,19 @@ export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 			await addColumnTolerant(adapter, col);
 		}
 	}
+	// Backfill choice: created_at, not "now" — see the SQLite mirror in
+	// migrations.ts (runMigrations()) for the full rationale. Conditioned on
+	// IS NULL so this is a no-op once every row has been backfilled once.
+	await adapter.unsafe(
+		`UPDATE cache_flight_recorder_service_epochs
+		 SET last_verified_at = created_at
+		 WHERE last_verified_at IS NULL`,
+	);
+	await adapter.unsafe(
+		`UPDATE cache_flight_recorder_partitions
+		 SET last_verified_at = created_at
+		 WHERE last_verified_at IS NULL`,
+	);
 	await ensureDeviceSetupJobsSchemaPg(adapter);
 	await ensureServerToolReplayIssuanceSchemaPg(adapter);
 

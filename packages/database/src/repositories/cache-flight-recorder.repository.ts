@@ -513,13 +513,34 @@ export class CacheFlightRecorderRepository extends BaseRepository<Timeline> {
 				// cleanup run as separate transactions (bun-sql-adapter.ts
 				// runBatchWithChanges), so this DELETE's snapshot can miss
 				// the appending transaction's uncommitted turn row under
-				// READ COMMITTED. Restricting to rows created before this
-				// pass's own cutoff means a partition legitimately created
-				// or re-verified within the current retention window can
-				// never be swept in the same pass; it only becomes reapable
-				// once it is genuinely older than the cutoff.
+				// READ COMMITTED.
+				//
+				// Gating on created_at alone is not enough: the registry
+				// verify UPDATE is a no-op guard (`id = id` historically, now
+				// a last_verified_at refresh — see registryStatements()), so
+				// created_at is written once at first creation and never
+				// changes again. partitionFor() memoizes partition ids per
+				// process, so a low-traffic account/route combination that
+				// goes quiet longer than the retention window and then
+				// resumes traffic reuses the same long-lived partition id —
+				// permanently older than any cutoff, so a created_at-only
+				// guard never protects it once past its first retention
+				// window, including inside the very race window this guard
+				// exists to close.
+				//
+				// last_verified_at lives on the SAME row this DELETE
+				// targets, so PostgreSQL's EvalPlanQual recheck (after a
+				// concurrent append's FK KEY SHARE lock unblocks this
+				// DELETE) observes the freshly committed refresh — closing
+				// the gap a created_at-only guard cannot, since a live
+				// append always writes recordedAt strictly after this pass's
+				// own cutoffTs. created_at <= last_verified_at always holds
+				// by construction (both set to the same value at first
+				// insert; only last_verified_at is refreshed thereafter), so
+				// gating on last_verified_at alone strictly dominates and
+				// subsumes the created_at check.
 				sql: `DELETE FROM cache_flight_recorder_partitions
-				 WHERE created_at < ?
+				 WHERE last_verified_at < ?
 					AND NOT EXISTS (
 					SELECT 1 FROM cache_flight_recorder_turns t
 					WHERE t.observation_partition_id = cache_flight_recorder_partitions.id
@@ -530,7 +551,7 @@ export class CacheFlightRecorderRepository extends BaseRepository<Timeline> {
 				// Same race and guard as the partition cleanup above, one
 				// level up the registry.
 				sql: `DELETE FROM cache_flight_recorder_service_epochs
-				 WHERE created_at < ?
+				 WHERE last_verified_at < ?
 					AND NOT EXISTS (
 					SELECT 1 FROM cache_flight_recorder_partitions p
 					WHERE p.service_epoch_id = cache_flight_recorder_service_epochs.id
@@ -572,8 +593,9 @@ export class CacheFlightRecorderRepository extends BaseRepository<Timeline> {
 					process_started_at, native_cache_state, recorder_state,
 					keepalive_global_ttl_minutes, keepalive_xai_ttl_minutes,
 					keepalive_effective_xai_enabled, keepalive_effective_xai_ttl_minutes,
-					occurrence_id, completeness, unavailable_dimensions, created_at
-				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+					occurrence_id, completeness, unavailable_dimensions, created_at,
+					last_verified_at
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 				ON CONFLICT (id) DO NOTHING`,
 				params: [
 					epoch.id,
@@ -591,11 +613,22 @@ export class CacheFlightRecorderRepository extends BaseRepository<Timeline> {
 					epoch.completeness,
 					epochUnavailable,
 					recordedAt,
+					recordedAt,
 				],
 			},
 			{
+				// The equality guard below only compares immutable evidence
+				// columns (never last_verified_at itself, which changes on
+				// every append and would break re-verification of an
+				// unchanged row). The SET clause refreshes last_verified_at
+				// to recordedAt on every successful re-verify — including
+				// when this INSERT/verify pair fires for a row that already
+				// existed — so a long-lived registry row's liveness reflects
+				// the most recent append that touched it, not just its
+				// original creation time. See expireOlderThan() below for
+				// why that distinction closes a retention-sweep race.
 				sql: `UPDATE cache_flight_recorder_service_epochs
-				 SET id = id
+				 SET last_verified_at = ?
 				 WHERE id = ?
 					AND seal_contract_version = ?
 					AND ${nullableEquals("deployment_revision")}
@@ -611,6 +644,7 @@ export class CacheFlightRecorderRepository extends BaseRepository<Timeline> {
 					AND completeness = ?
 					AND unavailable_dimensions = ?`,
 				params: [
+					recordedAt,
 					epoch.id,
 					epoch.sealContractVersion,
 					epoch.deploymentRevision,
@@ -642,8 +676,8 @@ export class CacheFlightRecorderRepository extends BaseRepository<Timeline> {
 				sql: `INSERT INTO cache_flight_recorder_partitions (
 					id, service_epoch_id, serving_account_scope, route_model_epoch,
 					completeness, unavailable_dimensions, seal_completeness,
-					seal_unavailable_dimensions, created_at
-				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+					seal_unavailable_dimensions, created_at, last_verified_at
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 				ON CONFLICT (id) DO NOTHING`,
 				params: [
 					partition.id,
@@ -655,11 +689,15 @@ export class CacheFlightRecorderRepository extends BaseRepository<Timeline> {
 					receipt.completeness,
 					sealUnavailable,
 					recordedAt,
+					recordedAt,
 				],
 			},
 			{
+				// Same last_verified_at refresh as the service-epoch verify
+				// above, and same rule: never add last_verified_at to the
+				// equality guard.
 				sql: `UPDATE cache_flight_recorder_partitions
-				 SET id = id
+				 SET last_verified_at = ?
 				 WHERE id = ?
 					AND service_epoch_id = ?
 					AND ${nullableEquals("serving_account_scope")}
@@ -669,6 +707,7 @@ export class CacheFlightRecorderRepository extends BaseRepository<Timeline> {
 					AND seal_completeness = ?
 					AND seal_unavailable_dimensions = ?`,
 				params: [
+					recordedAt,
 					partition.id,
 					partition.serviceEpochId,
 					partition.servingAccountScope,

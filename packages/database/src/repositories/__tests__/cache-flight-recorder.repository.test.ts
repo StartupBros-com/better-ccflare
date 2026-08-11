@@ -879,6 +879,177 @@ describe("CacheFlightRecorderRepository", () => {
 		db.close();
 	});
 
+	it("keeps a partition alive across a retention pass when a live re-append refreshed last_verified_at, even though created_at predates the cutoff", async () => {
+		const db = makeDb();
+		const repo = new CacheFlightRecorderRepository(new BunSqlAdapter(db));
+		const receipt = sealReceipt();
+		await repo.appendTurn(
+			"reverify-partition-id",
+			turn(0, { timestamp: iso(1_000) }),
+			1_000,
+			receipt,
+		);
+		// Re-append with the SAME immutable identity (identical receipt) much
+		// later: the registry INSERTs no-op via ON CONFLICT DO NOTHING, but the
+		// verify UPDATEs re-run and must refresh last_verified_at to 9_000 —
+		// created_at (1_000) never changes, by design.
+		await repo.appendTurn(
+			"reverify-partition-id",
+			turn(1, { timestamp: iso(9_000) }),
+			9_000,
+			receipt,
+		);
+
+		// Simulate the same race window as the orphan-guard test above, but
+		// now on a long-lived registry row: force both turns away so the
+		// registry rows look like zero-turn orphans.
+		db.query(
+			`DELETE FROM cache_flight_recorder_turns WHERE recorder_conversation_id = ?`,
+		).run("reverify-partition-id");
+
+		// cutoffTs (5_000) is AFTER created_at (1_000) but BEFORE
+		// last_verified_at (9_000). A created_at-only guard would reap this
+		// row right now (this is the regression under test); the
+		// last_verified_at guard must not, because the row was genuinely
+		// re-verified live inside the current retention window.
+		await repo.expireOlderThan(5_000, 20_000);
+		expect(
+			(
+				db
+					.query(
+						"SELECT COUNT(*) AS count FROM cache_flight_recorder_partitions",
+					)
+					.get() as { count: number }
+			).count,
+		).toBe(1);
+		expect(
+			(
+				db
+					.query(
+						"SELECT COUNT(*) AS count FROM cache_flight_recorder_service_epochs",
+					)
+					.get() as { count: number }
+			).count,
+		).toBe(1);
+		db.close();
+	});
+
+	it("reaps a genuinely dead partition/epoch orphan whose last_verified_at (never refreshed by a second append) predates the cutoff", async () => {
+		const db = makeDb();
+		const repo = new CacheFlightRecorderRepository(new BunSqlAdapter(db));
+		await repo.appendTurn(
+			"dead-orphan-pair-id",
+			turn(0, { timestamp: iso(1_000) }),
+			1_000,
+			sealReceipt({
+				epochId: "dead-pair-epoch-id",
+				partitionId: "dead-pair-partition-id",
+			}),
+		);
+		db.query(
+			`DELETE FROM cache_flight_recorder_turns WHERE recorder_conversation_id = ?`,
+		).run("dead-orphan-pair-id");
+
+		// Single append only: last_verified_at equals created_at (1_000),
+		// never refreshed by a re-verify. A cutoff past that point must still
+		// reap both registry rows.
+		await repo.expireOlderThan(5_000, 20_000);
+		expect(
+			(
+				db
+					.query(
+						"SELECT COUNT(*) AS count FROM cache_flight_recorder_partitions",
+					)
+					.get() as { count: number }
+			).count,
+		).toBe(0);
+		expect(
+			(
+				db
+					.query(
+						"SELECT COUNT(*) AS count FROM cache_flight_recorder_service_epochs",
+					)
+					.get() as { count: number }
+			).count,
+		).toBe(0);
+		db.close();
+	});
+
+	it("keeps a service epoch alive across a retention pass when a live re-append refreshed its own last_verified_at, even though created_at predates the cutoff", async () => {
+		const db = makeDb();
+		const repo = new CacheFlightRecorderRepository(new BunSqlAdapter(db));
+		const receipt = sealReceipt({
+			epochId: "reverify-epoch-id",
+			partitionId: "reverify-epoch-partition-id",
+		});
+		await repo.appendTurn(
+			"reverify-epoch-conv-id",
+			turn(0, { timestamp: iso(1_000) }),
+			1_000,
+			receipt,
+		);
+		await repo.appendTurn(
+			"reverify-epoch-conv-id",
+			turn(1, { timestamp: iso(9_000) }),
+			9_000,
+			receipt,
+		);
+
+		db.query(
+			`DELETE FROM cache_flight_recorder_turns WHERE recorder_conversation_id = ?`,
+		).run("reverify-epoch-conv-id");
+		// Force the partition away directly (bypassing its own retention
+		// guard) so the epoch's own last_verified_at — independent of the
+		// partition surviving on its own merits — is what's under test here.
+		db.query(`DELETE FROM cache_flight_recorder_partitions WHERE id = ?`).run(
+			"reverify-epoch-partition-id",
+		);
+
+		await repo.expireOlderThan(5_000, 20_000);
+		expect(
+			(
+				db
+					.query(
+						"SELECT COUNT(*) AS count FROM cache_flight_recorder_service_epochs",
+					)
+					.get() as { count: number }
+			).count,
+		).toBe(1);
+		db.close();
+	});
+
+	it("reaps a genuinely dead service-epoch orphan whose last_verified_at (never refreshed) predates the cutoff, isolated from partition state", async () => {
+		const db = makeDb();
+		const repo = new CacheFlightRecorderRepository(new BunSqlAdapter(db));
+		await repo.appendTurn(
+			"dead-epoch-conv-id",
+			turn(0, { timestamp: iso(1_000) }),
+			1_000,
+			sealReceipt({
+				epochId: "dead-epoch-only-id",
+				partitionId: "dead-epoch-only-partition-id",
+			}),
+		);
+		db.query(
+			`DELETE FROM cache_flight_recorder_turns WHERE recorder_conversation_id = ?`,
+		).run("dead-epoch-conv-id");
+		db.query(`DELETE FROM cache_flight_recorder_partitions WHERE id = ?`).run(
+			"dead-epoch-only-partition-id",
+		);
+
+		await repo.expireOlderThan(5_000, 20_000);
+		expect(
+			(
+				db
+					.query(
+						"SELECT COUNT(*) AS count FROM cache_flight_recorder_service_epochs",
+					)
+					.get() as { count: number }
+			).count,
+		).toBe(0);
+		db.close();
+	});
+
 	it("expires an active conversation whose entire timeline predates the cutoff despite a recent updated_at", async () => {
 		const db = makeDb();
 		const repo = new CacheFlightRecorderRepository(new BunSqlAdapter(db));
