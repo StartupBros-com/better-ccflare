@@ -559,6 +559,11 @@ export async function refreshAccessTokenSafe(
 		// Get the provider for this account
 		const provider = getProvider(account.provider) || ctx.provider;
 
+		// Captured for the rotation-race guard in the catch handler: if the DB's
+		// refresh token differs from this one by the time the refresh fails, the
+		// failure condemned a superseded token, not the account.
+		const attemptedRefreshToken = account.refresh_token;
+
 		// Create a new refresh promise and store it
 		const refreshPromise = provider
 			.refreshToken(refreshAccount, ctx.runtime.clientId)
