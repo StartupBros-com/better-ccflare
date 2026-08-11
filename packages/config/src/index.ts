@@ -968,6 +968,14 @@ function validateDatabaseConfig(
 	}
 }
 
+export function getCodexReasoningRetention(): boolean {
+	const fromEnv = process.env.CCFLARE_CODEX_REASONING_RETENTION;
+	if (fromEnv) {
+		return fromEnv !== "false" && fromEnv !== "0";
+	}
+	return true;
+}
+
 export class Config extends EventEmitter {
 	private configPath: string;
 	private data: ConfigData = {};

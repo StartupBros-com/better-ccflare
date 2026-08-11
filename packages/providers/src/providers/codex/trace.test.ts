@@ -17,7 +17,65 @@ afterEach(() => {
 	delete process.env[CODEX_TRACE_HMAC_KEY_ENV];
 });
 
-describe("writeCodexTrace schema 13 cache experiments", () => {
+describe("reasoning retention telemetry (schema 14)", () => {
+	test("writes a counts-only request record", () => {
+		const dir = mkdtempSync(join(tmpdir(), "codex-trace-reasoning-"));
+		process.env[CODEX_TRACE_DIR_ENV] = dir;
+		try {
+			writeCodexTrace({
+				codexInput: [
+					{
+						type: "reasoning",
+						id: "rs_private",
+						summary: [],
+						encrypted_content: "must-not-appear-in-trace",
+					},
+				],
+			});
+
+			const file = readdirSync(dir).find((name) => name.endsWith(".jsonl"));
+			const rawTrace = readFileSync(join(dir, file as string), "utf8");
+			const record = JSON.parse(rawTrace.trim());
+			expect(record).toMatchObject({
+				trace_schema_version: 14,
+				phase: "request",
+				reasoning_input_item_count: 1,
+			});
+			expect(rawTrace).not.toContain("rs_private");
+			expect(rawTrace).not.toContain("must-not-appear-in-trace");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("writes a counts-only response record", () => {
+		const dir = mkdtempSync(join(tmpdir(), "codex-trace-reasoning-"));
+		process.env[CODEX_TRACE_DIR_ENV] = dir;
+		try {
+			writeCodexResponseTrace({
+				summary: summarizeCodexResponse([], {}, "end_turn", undefined, {
+					outputItemCount: 3,
+					encryptedPresent: true,
+				}),
+			});
+
+			const file = readdirSync(dir).find((name) => name.endsWith(".jsonl"));
+			const record = JSON.parse(
+				readFileSync(join(dir, file as string), "utf8").trim(),
+			);
+			expect(record).toMatchObject({
+				trace_schema_version: 14,
+				phase: "response",
+				reasoning_output_item_count: 3,
+				reasoning_encrypted_present: true,
+			});
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("writeCodexTrace schema 14 cache experiments", () => {
 	test("writes bounded decision fields without reconstructing their semantics", () => {
 		const dir = mkdtempSync(join(tmpdir(), "codex-trace-schema-"));
 		process.env[CODEX_TRACE_DIR_ENV] = dir;
@@ -42,7 +100,7 @@ describe("writeCodexTrace schema 13 cache experiments", () => {
 				readFileSync(join(dir, file as string), "utf8").trim(),
 			);
 			expect(record).toMatchObject({
-				trace_schema_version: 13,
+				trace_schema_version: 14,
 				request_id: "logical-1",
 				attempt_id: "attempt-1",
 				attempt_ordinal: 2,
@@ -78,7 +136,7 @@ describe("writeCodexTrace schema 13 cache experiments", () => {
 	});
 });
 
-describe("orchestration demotion diagnostics (preserved in schema 13)", () => {
+describe("orchestration demotion diagnostics (preserved in schema 14)", () => {
 	test("writes the demotion signal and elapsed time when supplied", () => {
 		const dir = mkdtempSync(join(tmpdir(), "codex-trace-schema-"));
 		process.env[CODEX_TRACE_DIR_ENV] = dir;
@@ -94,7 +152,7 @@ describe("orchestration demotion diagnostics (preserved in schema 13)", () => {
 				readFileSync(join(dir, file as string), "utf8").trim(),
 			);
 			expect(record).toMatchObject({
-				trace_schema_version: 13,
+				trace_schema_version: 14,
 				orchestration_demotion_observed: true,
 				elapsed_ms_since_root: 4_242,
 			});
@@ -113,7 +171,7 @@ describe("orchestration demotion diagnostics (preserved in schema 13)", () => {
 			const record = JSON.parse(
 				readFileSync(join(dir, file as string), "utf8").trim(),
 			);
-			expect(record.trace_schema_version).toBe(13);
+			expect(record.trace_schema_version).toBe(14);
 			expect(record.orchestration_demotion_observed).toBeNull();
 			expect(record.elapsed_ms_since_root).toBeNull();
 		} finally {
@@ -141,7 +199,7 @@ describe("orchestration demotion diagnostics (preserved in schema 13)", () => {
 	});
 });
 
-describe("orchestration admission basis (introduced in schema 13)", () => {
+describe("orchestration admission basis (introduced in schema 13, preserved in schema 14)", () => {
 	test("writes an explicit categorical basis alongside its admission", () => {
 		const dir = mkdtempSync(join(tmpdir(), "codex-trace-basis-"));
 		process.env[CODEX_TRACE_DIR_ENV] = dir;
@@ -157,7 +215,7 @@ describe("orchestration admission basis (introduced in schema 13)", () => {
 				readFileSync(join(dir, file as string), "utf8").trim(),
 			);
 			expect(record).toMatchObject({
-				trace_schema_version: 13,
+				trace_schema_version: 14,
 				orchestration_admission: "root",
 				orchestration_basis: "lineage_match",
 			});
@@ -291,7 +349,30 @@ describe("summarizeCodexTransform (request/history phase)", () => {
 	test("ignores malformed items without throwing", () => {
 		const s = summarizeCodexTransform([null, undefined, 42, "str", {}]);
 		expect(s.history_function_call_count).toBe(0);
+		expect(s.reasoning_input_item_count).toBe(0);
 		expect(s.input_item_count).toBe(5);
+	});
+
+	test("counts replayed reasoning input items without retaining their content", () => {
+		const s = summarizeCodexTransform([
+			{
+				type: "reasoning",
+				id: "rs_first",
+				summary: [],
+				encrypted_content: "private-first",
+			},
+			{ role: "assistant", content: [{ type: "output_text", text: "answer" }] },
+			{
+				type: "reasoning",
+				id: "rs_second",
+				summary: [],
+				encrypted_content: "private-second",
+			},
+		]);
+
+		expect(s.reasoning_input_item_count).toBe(2);
+		expect(JSON.stringify(s)).not.toContain("private-first");
+		expect(JSON.stringify(s)).not.toContain("private-second");
 	});
 
 	test("records byte sizes but no fingerprints without an HMAC key", () => {
@@ -368,6 +449,19 @@ describe("summarizeCodexTransform (request/history phase)", () => {
 });
 
 describe("summarizeCodexResponse (response phase)", () => {
+	test("records reasoning output counts and encrypted payload presence", () => {
+		const s = summarizeCodexResponse(
+			[],
+			{ input_tokens: 10 },
+			"end_turn",
+			undefined,
+			{ outputItemCount: 2, encryptedPresent: true },
+		);
+
+		expect(s.reasoning_output_item_count).toBe(2);
+		expect(s.reasoning_encrypted_present).toBe(true);
+	});
+
 	test("counts newly emitted tool calls and computes cache hit pct", () => {
 		const s = summarizeCodexResponse(
 			[
@@ -404,6 +498,8 @@ describe("summarizeCodexResponse (response phase)", () => {
 	test("text-only responses report zero subagent spawns", () => {
 		const s = summarizeCodexResponse([], { input_tokens: 10 }, "end_turn");
 		expect(s.new_subagent_spawn_count).toBe(0);
+		expect(s.reasoning_output_item_count).toBe(0);
+		expect(s.reasoning_encrypted_present).toBe(false);
 	});
 
 	test("contextUtilizationPct reports input pressure against the window", () => {

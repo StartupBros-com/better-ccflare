@@ -17,6 +17,7 @@ import {
 import type { ServerToolHistoryReplacement } from "../../server-tools/history-projection";
 import officialSearchStream from "./__fixtures__/server-tools/official-search-stream.sanitized.json";
 import { CODEX_DEFAULT_ENDPOINT, CodexProvider } from "./provider";
+import { createCodexHostedSearchAttemptPlan } from "./server-tool-attempt-plan";
 import {
 	CodexServerToolConversionError,
 	hasCodexServerToolDeclaration,
@@ -942,6 +943,59 @@ describe("Codex exact hosted-search attempt plan", () => {
 		).toEqual({ decision: "executing_or_ambiguous" });
 	});
 
+	test("unions hosted-search includes with existing converted includes without duplicates", async () => {
+		const body = hostedRequestBody();
+		const sourceRequest = new Request(CODEX_DEFAULT_ENDPOINT, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(body),
+		});
+		const plan = createCodexHostedSearchAttemptPlan(
+			{
+				request: sourceRequest,
+				requestBodyBuffer: requestBodyBuffer(body),
+				account: codexOAuthAccount(),
+				path: "/v1/messages",
+				query: "",
+				physicalModel: "gpt-5.6-sol",
+				capabilityProofKey: "codex-hosted-search-proof",
+				inputReplayMode: [],
+				outputReplayMode: ["proxy-evidence-v1"],
+				serverToolReplayIssuer: async () => "bccf2.fixture",
+			},
+			{
+				prepareHeaders: (headers) => headers,
+				transformOrdinaryRequest: async (request) =>
+					new Request(request.url, {
+						method: request.method,
+						headers: request.headers,
+						body: JSON.stringify({
+							model: "gpt-5.6-sol",
+							stream: true,
+							store: false,
+							input: [],
+							tools: [],
+							include: [
+								"reasoning.encrypted_content",
+								"web_search_call.action.sources",
+							],
+						}),
+					}),
+				processHostedResponse: async (response) => response,
+				parseRateLimit: () => ({ isRateLimited: false }),
+			},
+		);
+
+		const transformed = await plan.transformRequestBody(sourceRequest);
+		const mapped = (await transformed.json()) as { include: string[] };
+
+		expect(mapped.include).toEqual([
+			"reasoning.encrypted_content",
+			"web_search_call.action.sources",
+		]);
+		expect(new Set(mapped.include).size).toBe(mapped.include.length);
+	});
+
 	test("projects first, preserves current conversion, then replaces only the hosted declaration", async () => {
 		const body = hostedRequestBody();
 		let projectedMessages: unknown;
@@ -970,7 +1024,10 @@ describe("Codex exact hosted-search attempt plan", () => {
 			model: "gpt-5.6-sol",
 			stream: true,
 			store: false,
-			include: ["web_search_call.action.sources"],
+			include: [
+				"reasoning.encrypted_content",
+				"web_search_call.action.sources",
+			],
 			max_tool_calls: 2,
 			tools: [
 				{

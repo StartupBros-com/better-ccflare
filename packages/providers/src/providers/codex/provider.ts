@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { getCodexReasoningRetention } from "@better-ccflare/config";
 import {
 	BUFFER_SIZES,
 	getModelFamily,
@@ -379,6 +380,7 @@ const TOOL_ARGS_PER_CALL_BYTE_CAP =
 	BUFFER_SIZES.TOOL_ARGUMENTS_PER_CALL_MAX_BYTES;
 const TOOL_ARGS_TOTAL_BYTE_CAP = BUFFER_SIZES.TOOL_ARGUMENTS_TOTAL_MAX_BYTES;
 const byteEncoder = new TextEncoder();
+const CODEX_REASONING_RETENTION_PREFIX = "bccfr1.";
 
 // When enabled, telemetry reports the effective Codex context capacity rather
 // than the raw model maximum.
@@ -418,6 +420,13 @@ interface CodexFunctionCallOutputItem {
 	status?: "in_progress" | "completed" | "incomplete";
 }
 
+interface CodexReasoningItem {
+	type: "reasoning";
+	id: string;
+	summary: [];
+	encrypted_content: string;
+}
+
 type CodexContentItem =
 	| CodexInputTextItem
 	| CodexOutputTextItem
@@ -438,9 +447,15 @@ interface CodexTool {
 
 interface CodexRequest {
 	model: string;
-	input: (CodexMessage | CodexFunctionCallItem | CodexFunctionCallOutputItem)[];
+	input: (
+		| CodexMessage
+		| CodexFunctionCallItem
+		| CodexFunctionCallOutputItem
+		| CodexReasoningItem
+	)[];
 	stream: boolean;
 	store: false;
+	include?: string[];
 	reasoning?: { effort: ReasoningEffort };
 	instructions?: string;
 	prompt_cache_key?: string;
@@ -533,10 +548,23 @@ interface AnthropicToolResult {
 		  }>;
 }
 
+interface AnthropicRedactedThinkingBlock {
+	type: "redacted_thinking";
+	data: string;
+}
+
+interface AnthropicThinkingBlock {
+	type: "thinking";
+	thinking: string;
+	signature?: string;
+}
+
 type AnthropicContentBlock =
 	| AnthropicTextContent
 	| AnthropicToolUse
-	| AnthropicToolResult;
+	| AnthropicToolResult
+	| AnthropicRedactedThinkingBlock
+	| AnthropicThinkingBlock;
 
 interface AnthropicMessage {
 	role: "user" | "assistant";
@@ -652,6 +680,12 @@ interface StreamState {
 	};
 	// Newly emitted tool calls from this response only (not historical replay).
 	traceNewToolCalls: ToolCallSummary[];
+	traceReasoningOutputItemCount: number;
+	traceReasoningEncryptedPresent: boolean;
+	// Wrapped redacted_thinking payloads whose emission is deferred while a
+	// function-call block is still streaming: emitting mid-lifecycle would
+	// interleave block lifecycles on the wire (pro-gate P1, PR #139).
+	pendingReasoningBlocks: string[];
 	traceRequestId: string;
 	traceAttemptId?: string;
 	traceTurnStateHeaderPresent: boolean;
@@ -707,6 +741,10 @@ function writeCodexStreamTerminalTrace(
 				: {},
 			stopReason,
 			error,
+			{
+				outputItemCount: state.traceReasoningOutputItemCount,
+				encryptedPresent: state.traceReasoningEncryptedPresent,
+			},
 		),
 	});
 }
@@ -1900,11 +1938,17 @@ export class CodexProvider extends BaseProvider {
 	private convertMessage(
 		msg: AnthropicMessage,
 		sourceMessageIndex: number,
-	): (CodexMessage | CodexFunctionCallItem | CodexFunctionCallOutputItem)[] {
+	): (
+		| CodexMessage
+		| CodexFunctionCallItem
+		| CodexFunctionCallOutputItem
+		| CodexReasoningItem
+	)[] {
 		const items: (
 			| CodexMessage
 			| CodexFunctionCallItem
 			| CodexFunctionCallOutputItem
+			| CodexReasoningItem
 		)[] = [];
 
 		// Codex API only accepts user/assistant/system roles.
@@ -1968,6 +2012,36 @@ export class CodexProvider extends BaseProvider {
 					});
 				}
 				pendingText.push(textItem);
+			} else if (
+				block.type === "redacted_thinking" &&
+				role === "assistant" &&
+				getCodexReasoningRetention() &&
+				typeof block.data === "string" &&
+				block.data.startsWith(CODEX_REASONING_RETENTION_PREFIX)
+			) {
+				const separatorIndex = block.data.indexOf(
+					".",
+					CODEX_REASONING_RETENTION_PREFIX.length,
+				);
+				if (separatorIndex !== -1) {
+					const reasoningId = block.data.slice(
+						CODEX_REASONING_RETENTION_PREFIX.length,
+						separatorIndex,
+					);
+					const encryptedContent = block.data.slice(separatorIndex + 1);
+					if (
+						/^[A-Za-z0-9_-]*$/.test(reasoningId) &&
+						encryptedContent.length > 0
+					) {
+						flushText();
+						items.push({
+							type: "reasoning",
+							id: reasoningId,
+							summary: [],
+							encrypted_content: encryptedContent,
+						});
+					}
+				}
 			} else if (block.type === "tool_use") {
 				flushText();
 				items.push({
@@ -2347,6 +2421,9 @@ export class CodexProvider extends BaseProvider {
 			input,
 			stream: true,
 			store: false,
+			...(getCodexReasoningRetention()
+				? { include: ["reasoning.encrypted_content"] }
+				: {}),
 			reasoning: {
 				effort: reasoningResolution.effort ?? defaultReasoningEffort,
 			},
@@ -2451,6 +2528,10 @@ export class CodexProvider extends BaseProvider {
 		let errorPayload: Record<string, unknown> | null = null;
 		const content: Array<Record<string, unknown>> = [];
 		const textByIndex = new Map<number, string>();
+		const redactedThinkingByIndex = new Map<
+			number,
+			{ type: "redacted_thinking"; data: string }
+		>();
 		const toolByIndex = new Map<
 			number,
 			{ id: string; name: string; partialJson: string }
@@ -2518,6 +2599,14 @@ export class CodexProvider extends BaseProvider {
 							name: typeof block.name === "string" ? block.name : "",
 							partialJson: toolByIndex.get(index)?.partialJson ?? "",
 						});
+					} else if (
+						block.type === "redacted_thinking" &&
+						typeof block.data === "string"
+					) {
+						redactedThinkingByIndex.set(index, {
+							type: "redacted_thinking",
+							data: block.data,
+						});
 					}
 				}
 			}
@@ -2553,8 +2642,16 @@ export class CodexProvider extends BaseProvider {
 			});
 		}
 
-		const allIndices = new Set([...textByIndex.keys(), ...toolByIndex.keys()]);
+		const allIndices = new Set([
+			...textByIndex.keys(),
+			...redactedThinkingByIndex.keys(),
+			...toolByIndex.keys(),
+		]);
 		for (const index of [...allIndices].sort((a, b) => a - b)) {
+			const redactedThinking = redactedThinkingByIndex.get(index);
+			if (redactedThinking !== undefined) {
+				content.push(redactedThinking);
+			}
 			const text = textByIndex.get(index);
 			if (text !== undefined) {
 				content.push({ type: "text", text });
@@ -2668,6 +2765,9 @@ export class CodexProvider extends BaseProvider {
 			functionCallBytesTotal: 0,
 			sawToolUse: false,
 			traceNewToolCalls: [],
+			traceReasoningOutputItemCount: 0,
+			traceReasoningEncryptedPresent: false,
+			pendingReasoningBlocks: [],
 			traceRequestId: requestId,
 			traceAttemptId: attemptId,
 			traceTurnStateHeaderPresent: response.headers.has("x-codex-turn-state"),
@@ -3412,6 +3512,17 @@ export class CodexProvider extends BaseProvider {
 			case "response.output_item.done": {
 				const item = data.item as Record<string, unknown> | undefined;
 				const itemType = item?.type as string | undefined;
+				const encryptedReasoning = item?.encrypted_content;
+
+				if (itemType === "reasoning") {
+					state.traceReasoningOutputItemCount++;
+					if (
+						typeof encryptedReasoning === "string" &&
+						encryptedReasoning.length > 0
+					) {
+						state.traceReasoningEncryptedPresent = true;
+					}
+				}
 
 				if (itemType === "function_call") {
 					const outputIndex = data.output_index as number | undefined;
@@ -3452,7 +3563,77 @@ export class CodexProvider extends BaseProvider {
 							state.contentBlockIndex++;
 							state.hasSentContentBlockStart = false;
 						}
+						if (
+							state.functionCallBlocks.size === 0 &&
+							!state.hasSentContentBlockStart &&
+							state.pendingReasoningBlocks.length > 0
+						) {
+							for (const pendingData of state.pendingReasoningBlocks) {
+								const pendingIndex = state.contentBlockIndex;
+								await writeSSE("content_block_start", {
+									type: "content_block_start",
+									index: pendingIndex,
+									content_block: {
+										type: "redacted_thinking",
+										data: pendingData,
+									},
+								});
+								await writeSSE("content_block_stop", {
+									type: "content_block_stop",
+									index: pendingIndex,
+								});
+								state.contentBlockIndex++;
+							}
+							state.pendingReasoningBlocks = [];
+						}
 					}
+					break;
+				}
+
+				if (
+					itemType === "reasoning" &&
+					getCodexReasoningRetention() &&
+					typeof encryptedReasoning === "string" &&
+					encryptedReasoning.length > 0
+				) {
+					await ensureMessageStart();
+					// The wrapper is dot-delimited, and the replay parser accepts
+					// [A-Za-z0-9_-] ids only — an id outside that set must degrade to ""
+					// at emit time or our own block would fail its own parse on replay.
+					const rawReasoningId = typeof item?.id === "string" ? item.id : "";
+					const reasoningId = /^[A-Za-z0-9_-]*$/.test(rawReasoningId)
+						? rawReasoningId
+						: "";
+					const reasoningData = `${CODEX_REASONING_RETENTION_PREFIX}${reasoningId}.${encryptedReasoning}`;
+
+					if (
+						state.functionCallBlocks.size > 0 ||
+						state.hasSentContentBlockStart
+					) {
+						// ANY still-open block (streaming tool call or live text) defers
+						// emission: closing a live text block here would orphan its later
+						// deltas at an index with no content_block_start. Flushed after
+						// the owning output item closes, or at stream end.
+						state.pendingReasoningBlocks.push(reasoningData);
+						break;
+					}
+
+					const reasoningBlockIndex = state.contentBlockIndex;
+					await writeSSE("content_block_start", {
+						type: "content_block_start",
+						index: reasoningBlockIndex,
+						content_block: {
+							type: "redacted_thinking",
+							data: reasoningData,
+						},
+					});
+					state.hasSentContentBlockStart = true;
+					await writeSSE("content_block_stop", {
+						type: "content_block_stop",
+						index: reasoningBlockIndex,
+					});
+					state.contentBlockIndex++;
+					state.hasSentContentBlockStart = false;
 					break;
 				}
 
@@ -3463,6 +3644,28 @@ export class CodexProvider extends BaseProvider {
 					});
 					state.contentBlockIndex++;
 					state.hasSentContentBlockStart = false;
+				}
+				if (
+					state.functionCallBlocks.size === 0 &&
+					state.pendingReasoningBlocks.length > 0
+				) {
+					for (const pendingData of state.pendingReasoningBlocks) {
+						const pendingIndex = state.contentBlockIndex;
+						await writeSSE("content_block_start", {
+							type: "content_block_start",
+							index: pendingIndex,
+							content_block: {
+								type: "redacted_thinking",
+								data: pendingData,
+							},
+						});
+						await writeSSE("content_block_stop", {
+							type: "content_block_stop",
+							index: pendingIndex,
+						});
+						state.contentBlockIndex++;
+					}
+					state.pendingReasoningBlocks = [];
 				}
 				break;
 			}
@@ -3583,7 +3786,27 @@ export class CodexProvider extends BaseProvider {
 						index: state.contentBlockIndex,
 					});
 					state.hasSentContentBlockStart = false;
+					state.contentBlockIndex++;
 				}
+				// Flush reasoning deferred behind a tool block whose done never
+				// arrived (truncated stream): retention must not lose the payload.
+				for (const pendingData of state.pendingReasoningBlocks) {
+					const pendingIndex = state.contentBlockIndex;
+					await writeSSE("content_block_start", {
+						type: "content_block_start",
+						index: pendingIndex,
+						content_block: {
+							type: "redacted_thinking",
+							data: pendingData,
+						},
+					});
+					await writeSSE("content_block_stop", {
+						type: "content_block_stop",
+						index: pendingIndex,
+					});
+					state.contentBlockIndex++;
+				}
+				state.pendingReasoningBlocks = [];
 
 				const incompleteDetails = resp?.incomplete_details as
 					| { reason?: string }
