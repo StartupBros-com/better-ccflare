@@ -33,7 +33,7 @@ import {
 
 interface UsageIteration {
 	type: string | undefined;
-	model: string;
+	model: string | undefined;
 	input_tokens: number | undefined;
 	output_tokens: number | undefined;
 	cache_read_input_tokens: number | undefined;
@@ -84,6 +84,7 @@ const MAX_REQUESTS_MAP_SIZE = 10000;
 const MAX_MISSING_STATE_WARNINGS = 1000;
 const DEFAULT_PRICING_TIMEOUT_MS = 5_000;
 const MAX_PRICING_TIMEOUT_MS = 60_000;
+const MAX_USAGE_ITERATIONS = 64;
 const MAX_RESPONSE_BODY_BYTES = 256 * 1024; // 256KB - cap stored response body
 const MAX_REQUEST_BODY_BYTES = 4 * 1024 * 1024; // 4MB - afterburn needs full conversation history
 // Bound on distinct conversation IDs buffered for dropped recorder evidence
@@ -181,13 +182,25 @@ function captureUsageIterations(usage: unknown, state: RequestState): void {
 	if (!usage || typeof usage !== "object") return;
 	const rawIterations = (usage as Record<string, unknown>).iterations;
 	if (!Array.isArray(rawIterations)) return;
+	if (rawIterations.length > MAX_USAGE_ITERATIONS) {
+		log.warn("Usage iterations exceeded limit; truncating", {
+			requestId: state.startMessage.requestId,
+			observedLength: rawIterations.length,
+			maxIterations: MAX_USAGE_ITERATIONS,
+		});
+	}
 
 	const iterations: UsageIteration[] = [];
-	for (const rawIteration of rawIterations) {
-		if (!rawIteration || typeof rawIteration !== "object") continue;
+	for (const rawIteration of rawIterations.slice(0, MAX_USAGE_ITERATIONS)) {
+		if (
+			!rawIteration ||
+			typeof rawIteration !== "object" ||
+			Array.isArray(rawIteration)
+		) {
+			continue;
+		}
 		const raw = rawIteration as Record<string, unknown>;
 		const model = normalizeNonEmptyString(raw.model);
-		if (!model) continue;
 
 		iterations.push({
 			type: typeof raw.type === "string" ? raw.type : undefined,
@@ -210,6 +223,7 @@ function captureUsageIterations(usage: unknown, state: RequestState): void {
 function extractUsageFromJson(
 	json: {
 		model?: string;
+		content?: unknown;
 		usage?: {
 			input_tokens?: number;
 			cache_read_input_tokens?: number;
@@ -221,6 +235,35 @@ function extractUsageFromJson(
 	state: RequestState,
 ): void {
 	if (!json) return;
+	if (Array.isArray(json.content)) {
+		for (const rawContentBlock of json.content) {
+			if (
+				!rawContentBlock ||
+				typeof rawContentBlock !== "object" ||
+				Array.isArray(rawContentBlock)
+			) {
+				continue;
+			}
+			const contentBlock = rawContentBlock as Record<string, unknown>;
+			if (contentBlock.type !== "fallback") continue;
+
+			state.fallbackBlockSeen = true;
+			const from = contentBlock.from;
+			const to = contentBlock.to;
+			const fromModel = normalizeNonEmptyString(
+				from && typeof from === "object" && !Array.isArray(from)
+					? (from as Record<string, unknown>).model
+					: undefined,
+			);
+			const toModel = normalizeNonEmptyString(
+				to && typeof to === "object" && !Array.isArray(to)
+					? (to as Record<string, unknown>).model
+					: undefined,
+			);
+			if (fromModel) state.fallbackFromModel = fromModel;
+			if (toModel && json.model === undefined) state.usage.model = toModel;
+		}
+	}
 
 	const usageObj = json.usage;
 	if (!usageObj) return;
@@ -289,7 +332,7 @@ function extractUsageFromData(
 			eventType === "content_block_start";
 
 		// Track streaming start time on first content block
-		if (isContentBlockStart && !state.firstTokenTimestamp) {
+		if (parsed.type === "content_block_start" && !state.firstTokenTimestamp) {
 			state.firstTokenTimestamp = Date.now();
 		}
 
@@ -714,6 +757,11 @@ export class UsageCollector {
 		}
 
 		// Calculate total tokens and cost
+		const hasFallbackBillingSplit =
+			state.fallbackBlockSeen === true ||
+			state.usage.iterations?.some(
+				(iteration) => iteration.type === "fallback_message",
+			) === true;
 		if (state.usage.model) {
 			const model = state.usage.model;
 			const iterations = state.usage.iterations ?? [];
@@ -734,20 +782,14 @@ export class UsageCollector {
 				(state.usage.cacheReadInputTokens || 0) +
 				(state.usage.cacheCreationInputTokens || 0);
 
-			const topLevelTokens = {
-				inputTokens: state.usage.inputTokens,
-				outputTokens: finalOutputTokens,
-				cacheReadInputTokens: state.usage.cacheReadInputTokens,
-				cacheCreationInputTokens: state.usage.cacheCreationInputTokens,
-			};
-			if (iterations.length > 0) {
+			if (hasFallbackBillingSplit) {
 				state.usage.costUsd = await this.estimateCostWithDeadline(
 					startMessage.requestId,
 					model,
 					async () => {
 						const iterationCosts = await Promise.all(
 							iterations.map((iteration) =>
-								estimateCostUSD(iteration.model, {
+								estimateCostUSD(iteration.model ?? model, {
 									inputTokens: iteration.input_tokens,
 									outputTokens: iteration.output_tokens,
 									cacheReadInputTokens: iteration.cache_read_input_tokens,
@@ -763,7 +805,13 @@ export class UsageCollector {
 				state.usage.costUsd = await this.estimateCostWithDeadline(
 					startMessage.requestId,
 					model,
-					() => estimateCostUSD(model, topLevelTokens),
+					() =>
+						estimateCostUSD(model, {
+							inputTokens: state.usage.inputTokens,
+							outputTokens: finalOutputTokens,
+							cacheReadInputTokens: state.usage.cacheReadInputTokens,
+							cacheCreationInputTokens: state.usage.cacheCreationInputTokens,
+						}),
 				);
 			}
 
@@ -852,15 +900,21 @@ export class UsageCollector {
 			}
 		}
 
-		const iterationsSeen = state.usage.iterations !== undefined;
 		const iterationCount = state.usage.iterations?.length ?? 0;
-		if (state.fallbackBlockSeen || iterationsSeen) {
+		if (hasFallbackBillingSplit) {
+			let fallbackFromModel = state.fallbackFromModel;
+			if (!fallbackFromModel && state.usage.iterations) {
+				for (let i = state.usage.iterations.length - 1; i >= 0; i--) {
+					const iteration = state.usage.iterations[i];
+					if (iteration.type !== "fallback_message" && iteration.model) {
+						fallbackFromModel = iteration.model;
+						break;
+					}
+				}
+			}
 			log.info("anthropic_server_side_fallback", {
 				requestId: startMessage.requestId,
-				from:
-					state.fallbackFromModel ??
-					state.usage.iterations?.[0]?.model ??
-					state.usage.model,
+				from: fallbackFromModel ?? state.usage.model,
 				to: state.usage.model,
 				iterationCount,
 			});

@@ -392,8 +392,8 @@ describe("UsageCollector request lifecycle", () => {
 					content: [
 						{
 							type: "fallback",
-							from: { model: FABLE_MODEL },
-							to: { model: OPUS_MODEL },
+							from: { model: HAIKU_MODEL },
+							to: { model: FABLE_MODEL },
 						},
 						{ type: "text", text: "done" },
 					],
@@ -460,7 +460,7 @@ describe("UsageCollector request lifecycle", () => {
 			expect(fallbackLogs.events).toHaveLength(1);
 			expect(fallbackLogs.events[0]?.data).toEqual({
 				requestId,
-				from: FABLE_MODEL,
+				from: HAIKU_MODEL,
 				to: OPUS_MODEL,
 				iterationCount: 2,
 			});
@@ -524,13 +524,7 @@ describe("UsageCollector request lifecycle", () => {
 				cacheReadInputTokens: 5,
 				cacheCreationInputTokens: 7,
 			});
-			expect(fallbackLogs.events).toHaveLength(1);
-			expect(fallbackLogs.events[0]?.data).toEqual({
-				requestId,
-				from: FABLE_MODEL,
-				to: FABLE_MODEL,
-				iterationCount: 0,
-			});
+			expect(fallbackLogs.events).toEqual([]);
 		});
 
 		it("shares one pricing deadline across all fallback iterations", async () => {
@@ -598,15 +592,194 @@ describe("UsageCollector request lifecycle", () => {
 
 			expect(savedUsages.get(requestId)).toMatchObject({
 				model: FABLE_MODEL,
-				costUsd: 41_682,
+				costUsd: 40_413,
+			});
+			expect(estimateCostUSD).toHaveBeenCalledTimes(1);
+			expect(estimateCostUSD).toHaveBeenCalledWith(FABLE_MODEL, {
+				inputTokens: 23,
+				outputTokens: 29,
+				cacheReadInputTokens: 31,
+				cacheCreationInputTokens: 37,
+			});
+			expect(fallbackLogs.events).toEqual([]);
+		});
+
+		it("prices model-less compaction usage at the serving model during fallback", async () => {
+			useDeterministicModelPricing();
+			const { collector, savedUsages } = harness();
+			const requestId = "stream-compaction-fallback-iterations";
+			const fallbackLogs = captureFallbackUsageLogs();
+
+			try {
+				collector.handleStart(makeStartMessage(requestId));
+				collector.handleChunk(
+					requestId,
+					new TextEncoder().encode(
+						`event: message_start\ndata: {"type":"message_start","message":{"model":"${OPUS_MODEL}","usage":{"input_tokens":23,"output_tokens":0}}}\n\nevent: response.completed\ndata: {"usage":{"input_tokens":23,"output_tokens":29,"cache_read_input_tokens":31,"cache_creation_input_tokens":37,"iterations":[{"type":"compaction","input_tokens":2,"output_tokens":3,"cache_read_input_tokens":5,"cache_creation_input_tokens":7},{"type":"fallback_message","model":"${OPUS_MODEL}","input_tokens":11,"output_tokens":13,"cache_read_input_tokens":17,"cache_creation_input_tokens":19}]}}\n\n`,
+					),
+				);
+				await collector.handleEnd({ type: "end", requestId, success: true });
+				await collector.drain();
+			} finally {
+				fallbackLogs.stop();
+			}
+
+			expect(savedUsages.get(requestId)).toMatchObject({
+				model: OPUS_MODEL,
+				costUsd: 56_746,
+			});
+			expect(estimateCostUSD).toHaveBeenCalledTimes(2);
+			expect(estimateCostUSD).toHaveBeenNthCalledWith(1, OPUS_MODEL, {
+				inputTokens: 2,
+				outputTokens: 3,
+				cacheReadInputTokens: 5,
+				cacheCreationInputTokens: 7,
+			});
+			expect(estimateCostUSD).toHaveBeenNthCalledWith(2, OPUS_MODEL, {
+				inputTokens: 11,
+				outputTokens: 13,
+				cacheReadInputTokens: 17,
+				cacheCreationInputTokens: 19,
 			});
 			expect(fallbackLogs.events).toHaveLength(1);
 			expect(fallbackLogs.events[0]?.data).toEqual({
 				requestId,
-				from: FABLE_MODEL,
-				to: FABLE_MODEL,
+				from: OPUS_MODEL,
+				to: OPUS_MODEL,
 				iterationCount: 2,
 			});
+		});
+
+		it("uses legacy top-level pricing for compaction-only iterations", async () => {
+			useDeterministicModelPricing();
+			const { collector, savedUsages } = harness();
+			const requestId = "stream-compaction-only-iterations";
+			const fallbackLogs = captureFallbackUsageLogs();
+
+			try {
+				collector.handleStart(makeStartMessage(requestId));
+				collector.handleChunk(
+					requestId,
+					new TextEncoder().encode(
+						`event: message_start\ndata: {"type":"message_start","message":{"model":"${FABLE_MODEL}","usage":{"input_tokens":23,"output_tokens":0}}}\n\nevent: response.completed\ndata: {"usage":{"input_tokens":23,"output_tokens":29,"cache_read_input_tokens":31,"cache_creation_input_tokens":37,"iterations":[{"type":"compaction","input_tokens":2,"output_tokens":3,"cache_read_input_tokens":5,"cache_creation_input_tokens":7}]}}\n\n`,
+					),
+				);
+				await collector.handleEnd({ type: "end", requestId, success: true });
+				await collector.drain();
+			} finally {
+				fallbackLogs.stop();
+			}
+
+			expect(savedUsages.get(requestId)).toMatchObject({
+				model: FABLE_MODEL,
+				costUsd: 40_413,
+			});
+			expect(estimateCostUSD).toHaveBeenCalledTimes(1);
+			expect(estimateCostUSD).toHaveBeenCalledWith(FABLE_MODEL, {
+				inputTokens: 23,
+				outputTokens: 29,
+				cacheReadInputTokens: 31,
+				cacheCreationInputTokens: 37,
+			});
+			expect(fallbackLogs.events).toEqual([]);
+		});
+
+		it("caps fallback usage iterations before pricing", async () => {
+			useDeterministicModelPricing();
+			const { collector, savedUsages } = harness();
+			const requestId = "stream-capped-fallback-iterations";
+			const fallbackLogs = captureFallbackUsageLogs();
+			const iterationWarnings: LogEvent[] = [];
+			const onLog = (event: LogEvent) => {
+				if (event.msg === "Usage iterations exceeded limit; truncating") {
+					iterationWarnings.push(event);
+				}
+			};
+			logBus.on("log", onLog);
+			const iterations = Array.from({ length: 65 }, () => ({
+				type: "fallback_message",
+				model: OPUS_MODEL,
+				input_tokens: 1,
+			}));
+
+			try {
+				collector.handleStart(makeStartMessage(requestId));
+				collector.handleChunk(
+					requestId,
+					new TextEncoder().encode(
+						`event: message_start\ndata: {"type":"message_start","message":{"model":"${OPUS_MODEL}","usage":{"input_tokens":65,"output_tokens":0}}}\n\nevent: response.completed\ndata: ${JSON.stringify({ usage: { input_tokens: 65, output_tokens: 0, iterations } })}\n\n`,
+					),
+				);
+				await collector.handleEnd({ type: "end", requestId, success: true });
+				await collector.drain();
+			} finally {
+				logBus.off("log", onLog);
+				fallbackLogs.stop();
+			}
+
+			expect(savedUsages.get(requestId)).toMatchObject({
+				model: OPUS_MODEL,
+				costUsd: 128,
+			});
+			expect(estimateCostUSD).toHaveBeenCalledTimes(64);
+			expect(estimateCostUSD).toHaveBeenCalledWith(OPUS_MODEL, {
+				inputTokens: 1,
+				outputTokens: undefined,
+				cacheReadInputTokens: undefined,
+				cacheCreationInputTokens: undefined,
+			});
+			expect(iterationWarnings).toHaveLength(1);
+			expect(iterationWarnings[0]).toMatchObject({
+				level: "WARN",
+				data: {
+					requestId,
+					observedLength: 65,
+					maxIterations: 64,
+				},
+			});
+			expect(fallbackLogs.events).toHaveLength(1);
+			expect(fallbackLogs.events[0]?.data).toEqual({
+				requestId,
+				from: OPUS_MODEL,
+				to: OPUS_MODEL,
+				iterationCount: 64,
+			});
+		});
+
+		it("detects fallback from SSE event context without starting token timing", async () => {
+			useDeterministicModelPricing();
+			const { collector, savedUsages } = harness();
+			const requestId = "stream-event-context-fallback";
+			const fallbackLogs = captureFallbackUsageLogs();
+
+			try {
+				collector.handleStart(makeStartMessage(requestId));
+				now += 1_000;
+				collector.handleChunk(
+					requestId,
+					new TextEncoder().encode(
+						`event: message_start\ndata: {"type":"message_start","message":{"model":"${FABLE_MODEL}","usage":{"input_tokens":2,"output_tokens":0}}}\n\nevent: content_block_start\ndata: {"index":0,"content_block":{"type":"fallback","from":{"model":"${FABLE_MODEL}"},"to":{"model":"${OPUS_MODEL}"}}}\n\n`,
+					),
+				);
+				now += 2_000;
+				collector.handleChunk(
+					requestId,
+					new TextEncoder().encode(
+						'event: message_delta\ndata: {"type":"message_delta","usage":{"input_tokens":2,"output_tokens":10}}\n\n',
+					),
+				);
+				now += 2_000;
+				await collector.handleEnd({ type: "end", requestId, success: true });
+				await collector.drain();
+			} finally {
+				fallbackLogs.stop();
+			}
+
+			expect(savedUsages.get(requestId)).toMatchObject({
+				model: OPUS_MODEL,
+				tokensPerSecond: 2,
+			});
+			expect(fallbackLogs.events).toHaveLength(1);
 		});
 	});
 
