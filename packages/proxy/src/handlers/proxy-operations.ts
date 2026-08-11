@@ -2057,6 +2057,12 @@ export async function proxyWithAccount(
 		}
 	};
 	try {
+		// Dedicated controller so a stuck-upstream drain deadline (see
+		// anthropic-terminal-recovery.ts) can abort this request's fetch
+		// connection after the fact — a signal not part of `init.signal` at
+		// fetch-creation time cannot retroactively attach to it.
+		const drainAbortController = new AbortController();
+
 		// Every upstream call stays tied to the client connection: when the client
 		// disconnects, the upstream fetch must be aborted instead of running on.
 		// Call sites pass `req.signal` to makeProxyRequest explicitly instead of
