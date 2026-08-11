@@ -78,6 +78,7 @@ interface RequestState {
 	currentEvent?: string; // Track SSE event type across chunks
 	fallbackBlockSeen?: boolean;
 	fallbackFromModel?: string;
+	servingModelAuthoritative?: boolean;
 }
 
 const log = new Logger("UsageCollector");
@@ -231,9 +232,6 @@ function captureUsageIterations(usage: unknown, state: RequestState): void {
 	state.usage.fallbackIterationSeen = fallbackIterationSeen;
 	state.usage.fallbackIterationModel = fallbackIterationModel;
 	state.usage.iterationsTruncated = rawIterations.length > MAX_USAGE_ITERATIONS;
-	if (state.fallbackBlockSeen !== true && fallbackIterationModel) {
-		state.usage.model = fallbackIterationModel;
-	}
 }
 
 // Extract usage data from non-stream JSON response bodies
@@ -288,6 +286,9 @@ function extractUsageFromJson(
 	captureUsageIterations(usageObj, state);
 	// The non-stream response model is authoritative over both fallback signals.
 	state.usage.model = json.model ?? state.usage.model;
+	if (normalizeNonEmptyString(json.model)) {
+		state.servingModelAuthoritative = true;
+	}
 
 	if (usageObj.input_tokens !== undefined) {
 		state.usage.inputTokens = usageObj.input_tokens;
@@ -471,6 +472,7 @@ function freeRequestState(state: RequestState): void {
 	state.usage.fallbackIterationSeen = undefined;
 	state.usage.fallbackIterationModel = undefined;
 	state.usage.iterationsTruncated = undefined;
+	state.servingModelAuthoritative = undefined;
 	// Release request body and headers held in startMessage.
 	// Without this, orphaned requests retain full request bodies until the
 	// inactivity cleanup configured by CF_STREAM_TIMEOUT_MS runs. See #67.
@@ -776,6 +778,17 @@ export class UsageCollector {
 			} catch {
 				// Ignore parse errors
 			}
+		}
+
+		// The streaming message_start names the REQUESTED model; a fallback content
+		// block or a fallback_message iteration names the model that actually served.
+		// A non-stream body's top-level model is already the serving model, so it wins.
+		if (
+			state.servingModelAuthoritative !== true &&
+			state.fallbackBlockSeen !== true &&
+			state.usage.fallbackIterationModel
+		) {
+			state.usage.model = state.usage.fallbackIterationModel;
 		}
 
 		// Calculate total tokens and cost
