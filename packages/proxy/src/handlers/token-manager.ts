@@ -595,10 +595,15 @@ export async function refreshAccessTokenSafe(
 
 				// Update the live in-memory account object immediately
 				// This prevents subsequent requests from seeing stale token data
-				account.access_token = result.accessToken;
-				account.expires_at = result.expiresAt;
-				if (result.refreshToken) {
-					account.refresh_token = result.refreshToken;
+				// — unless the persist-CAS-loss branch above already adopted the
+				// authoritative DB row, in which case installing these (losing)
+				// result values would overwrite it right back.
+				if (!adoptAuthoritative) {
+					account.access_token = result.accessToken;
+					account.expires_at = result.expiresAt;
+					if (result.refreshToken) {
+						account.refresh_token = result.refreshToken;
+					}
 				}
 				account.last_used = Date.now();
 
