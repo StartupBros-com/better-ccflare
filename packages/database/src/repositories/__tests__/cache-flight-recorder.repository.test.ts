@@ -1050,6 +1050,109 @@ describe("CacheFlightRecorderRepository", () => {
 		db.close();
 	});
 
+	it("reaps a genuinely dead partition/epoch orphan whose last_verified_at is NULL, falling back to its old created_at", async () => {
+		const db = makeDb();
+		const repo = new CacheFlightRecorderRepository(new BunSqlAdapter(db));
+		await repo.appendTurn(
+			"null-verified-dead-pair-id",
+			turn(0, { timestamp: iso(1_000) }),
+			1_000,
+			sealReceipt({
+				epochId: "null-verified-dead-epoch-id",
+				partitionId: "null-verified-dead-partition-id",
+			}),
+		);
+		db.query(
+			`DELETE FROM cache_flight_recorder_turns WHERE recorder_conversation_id = ?`,
+		).run("null-verified-dead-pair-id");
+
+		// Simulate the nullable last_verified_at states expireOlderThan()
+		// documents: the upgrade path ALTERs the column on before backfilling
+		// it, the fresh-install schema leaves it nullable so a rolled-back
+		// prior binary can still insert, and a mid-rolling-deploy instance on
+		// the old binary can insert after a backfill already ran.
+		db.query(
+			`UPDATE cache_flight_recorder_partitions SET last_verified_at = NULL WHERE id = ?`,
+		).run("null-verified-dead-partition-id");
+		db.query(
+			`UPDATE cache_flight_recorder_service_epochs SET last_verified_at = NULL WHERE id = ?`,
+		).run("null-verified-dead-epoch-id");
+
+		// cutoffTs (5_000) is past created_at (1_000). With last_verified_at
+		// NULL, `NULL < cutoff` is NULL (never true), so without the
+		// COALESCE(last_verified_at, created_at) fallback these rows would be
+		// immortal despite having no referencing turns. This is the core
+		// regression this test guards against.
+		await repo.expireOlderThan(5_000, 20_000);
+		expect(
+			(
+				db
+					.query(
+						"SELECT COUNT(*) AS count FROM cache_flight_recorder_partitions",
+					)
+					.get() as { count: number }
+			).count,
+		).toBe(0);
+		expect(
+			(
+				db
+					.query(
+						"SELECT COUNT(*) AS count FROM cache_flight_recorder_service_epochs",
+					)
+					.get() as { count: number }
+			).count,
+		).toBe(0);
+		db.close();
+	});
+
+	it("keeps a NULL last_verified_at partition/epoch orphan alive when its created_at fallback is still within the retention window", async () => {
+		const db = makeDb();
+		const repo = new CacheFlightRecorderRepository(new BunSqlAdapter(db));
+		await repo.appendTurn(
+			"null-verified-recent-pair-id",
+			turn(0, { timestamp: iso(9_000) }),
+			9_000,
+			sealReceipt({
+				epochId: "null-verified-recent-epoch-id",
+				partitionId: "null-verified-recent-partition-id",
+			}),
+		);
+		db.query(
+			`DELETE FROM cache_flight_recorder_turns WHERE recorder_conversation_id = ?`,
+		).run("null-verified-recent-pair-id");
+		db.query(
+			`UPDATE cache_flight_recorder_partitions SET last_verified_at = NULL WHERE id = ?`,
+		).run("null-verified-recent-partition-id");
+		db.query(
+			`UPDATE cache_flight_recorder_service_epochs SET last_verified_at = NULL WHERE id = ?`,
+		).run("null-verified-recent-epoch-id");
+
+		// cutoffTs (5_000) predates created_at (9_000): the COALESCE fallback
+		// must use created_at as a real retention signal rather than treating
+		// a NULL last_verified_at as "always eligible to reap", which would be
+		// the opposite bug.
+		await repo.expireOlderThan(5_000, 20_000);
+		expect(
+			(
+				db
+					.query(
+						"SELECT COUNT(*) AS count FROM cache_flight_recorder_partitions",
+					)
+					.get() as { count: number }
+			).count,
+		).toBe(1);
+		expect(
+			(
+				db
+					.query(
+						"SELECT COUNT(*) AS count FROM cache_flight_recorder_service_epochs",
+					)
+					.get() as { count: number }
+			).count,
+		).toBe(1);
+		db.close();
+	});
+
 	it("expires an active conversation whose entire timeline predates the cutoff despite a recent updated_at", async () => {
 		const db = makeDb();
 		const repo = new CacheFlightRecorderRepository(new BunSqlAdapter(db));

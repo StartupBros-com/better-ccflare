@@ -675,6 +675,181 @@ describe("analyzeCacheFlightCohorts", () => {
 		]);
 	});
 
+	it("scopes a same-dimension changed and not_comparable blocker pair so they read as two non-contradictory facts", () => {
+		// Two summaries share one known service_instance (interleaved accounts
+		// within one process lifetime) with a genuine serving_account_scope
+		// difference between them; a third summary sits in a different service
+		// instance entirely (a restart). The analyzer must report BOTH facts
+		// without contradiction: the within-instance difference IS known
+		// (changed), and the cross-instance comparison is withheld
+		// (not_comparable) - and each blocker must carry which comparison it
+		// describes so the pair does not read as a flat "known to differ" /
+		// "not known to differ" contradiction.
+		const sharedEpoch = serviceEpoch("epoch-shared");
+		const restartedEpoch = serviceEpoch("epoch-restarted", {
+			occurrenceId: "epoch-restarted-occurrence",
+			serviceInstanceId: "service-instance-b",
+			processStartedAt: "2026-08-08T11:00:00.000Z",
+		});
+		const result = analyzeCacheFlightCohorts([
+			observation(1, {
+				seal: seal(sharedEpoch, {
+					partitionId: "partition-1",
+					servingAccountScope: "scope-1",
+					routeModelEpoch: "route-model-shared",
+				}),
+			}),
+			observation(2, {
+				seal: seal(sharedEpoch, {
+					partitionId: "partition-2",
+					servingAccountScope: "scope-2",
+					routeModelEpoch: "route-model-shared",
+				}),
+			}),
+			observation(3, {
+				seal: seal(restartedEpoch, {
+					partitionId: "partition-3",
+					servingAccountScope: "scope-3",
+					routeModelEpoch: "route-model-after-restart",
+				}),
+			}),
+		]);
+
+		const scopeBlockers = result.blockers.filter(
+			(blocker) => blocker.dimension === "serving_account_scope",
+		);
+		expect(scopeBlockers).toContainEqual({
+			dimension: "serving_account_scope",
+			kind: "changed",
+			detail: "serving_account_scope_changed",
+			scope: "within_service_instance",
+		});
+		expect(scopeBlockers).toContainEqual({
+			dimension: "serving_account_scope",
+			kind: "not_comparable",
+			detail: "serving_account_scope_not_comparable_across_restart",
+			scope: "cross_service_instance",
+		});
+		expect(scopeBlockers).toHaveLength(2);
+
+		// route_model_epoch is identical within the shared-instance group, so
+		// only the unconditional cross-instance not_comparable blocker fires -
+		// no changed blocker, scoped or otherwise.
+		expect(
+			result.blockers.filter(
+				(blocker) => blocker.dimension === "route_model_epoch",
+			),
+		).toEqual([
+			{
+				dimension: "route_model_epoch",
+				kind: "not_comparable",
+				detail: "route_model_epoch_not_comparable_across_restart",
+				scope: "cross_service_instance",
+			},
+		]);
+	});
+
+	it("never merges two summaries whose own service_instance is unknown into one comparability group", () => {
+		const unknownInstanceEpochOne = serviceEpoch("epoch-unknown-instance-1", {
+			serviceInstanceId: null,
+			completeness: "incomplete",
+			unavailableDimensions: ["service_instance"],
+		});
+		const unknownInstanceEpochTwo = serviceEpoch("epoch-unknown-instance-2", {
+			occurrenceId: "epoch-unknown-instance-2-occurrence",
+			serviceInstanceId: null,
+			completeness: "incomplete",
+			unavailableDimensions: ["service_instance"],
+		});
+		const result = analyzeCacheFlightCohorts([
+			observation(1, {
+				seal: seal(unknownInstanceEpochOne, {
+					partitionId: "partition-unknown-1",
+					servingAccountScope: "scope-x",
+					sealCompleteness: "incomplete",
+				}),
+			}),
+			observation(2, {
+				seal: seal(unknownInstanceEpochTwo, {
+					partitionId: "partition-unknown-2",
+					servingAccountScope: "scope-y",
+					sealCompleteness: "incomplete",
+				}),
+			}),
+		]);
+
+		// If the two unknown-instance summaries were wrongly merged into one
+		// comparability group (e.g. both keyed by a shared "unknown" key), their
+		// genuinely differing serving_account_scope values would produce a
+		// "changed" blocker via the non-crossing branch and no not_comparable
+		// blocker at all, since a single merged group would never trip
+		// `crossesServiceInstances`. Each unknown-instance summary must instead
+		// be its own singleton group.
+		expect(
+			result.blockers.filter(
+				(blocker) => blocker.dimension === "serving_account_scope",
+			),
+		).toEqual([
+			{
+				dimension: "serving_account_scope",
+				kind: "not_comparable",
+				detail: "serving_account_scope_not_comparable_across_restart",
+				scope: "cross_service_instance",
+			},
+		]);
+	});
+
+	it("renders not_comparable and unknown together coherently when a value is genuinely missing across a restart", () => {
+		const beforeRestart = serviceEpoch("epoch-before-restart");
+		const afterRestartMissingScope = serviceEpoch("epoch-after-restart", {
+			occurrenceId: "epoch-after-restart-occurrence",
+			serviceInstanceId: "service-instance-after-restart",
+			processStartedAt: "2026-08-08T12:00:00.000Z",
+		});
+		const result = analyzeCacheFlightCohorts([
+			observation(1, {
+				seal: seal(beforeRestart, {
+					partitionId: "partition-before",
+					servingAccountScope: "scope-before",
+				}),
+			}),
+			observation(2, {
+				seal: seal(afterRestartMissingScope, {
+					partitionId: "partition-after",
+					servingAccountScope: null,
+					partitionCompleteness: "incomplete",
+					partitionUnavailableDimensions: ["serving_account_scope"],
+					sealCompleteness: "incomplete",
+				}),
+			}),
+		]);
+
+		// Two distinct, coherent facts about the same dimension: a value is
+		// genuinely missing on one side (unknown), and separately, whatever
+		// values ARE known cannot be compared across the restart boundary
+		// (not_comparable). Neither implies the other, and neither asserts a
+		// "changed" claim this data cannot support. Order is not asserted here
+		// (the "unknown" blocker is contributed by the affected cohort's own
+		// per-seal evidence and happens to surface before the cross-instance
+		// selection pass runs) - only that both facts are present, undeduped
+		// against each other, and no "changed" claim sneaks in.
+		const missingScopeBlockers = result.blockers.filter(
+			(blocker) => blocker.dimension === "serving_account_scope",
+		);
+		expect(missingScopeBlockers).toContainEqual({
+			dimension: "serving_account_scope",
+			kind: "not_comparable",
+			detail: "serving_account_scope_not_comparable_across_restart",
+			scope: "cross_service_instance",
+		});
+		expect(missingScopeBlockers).toContainEqual({
+			dimension: "serving_account_scope",
+			kind: "unknown",
+			detail: "serving_account_scope_unknown",
+		});
+		expect(missingScopeBlockers).toHaveLength(2);
+	});
+
 	it("uses only retained contributors in summaries and counts", () => {
 		const epoch = serviceEpoch("epoch-a");
 		const persistedSeal = seal(epoch);

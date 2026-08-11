@@ -38,6 +38,24 @@ export type CacheFlightCohortBlockerKind =
 	| "unknown"
 	| "not_comparable";
 
+/**
+ * Disambiguates a `changed` or `not_comparable` blocker when both can appear
+ * for the same dimension at once: observations spanning more than one
+ * service instance can show a genuine difference among summaries that share
+ * one instance (`within_service_instance`, always paired with `changed`)
+ * alongside a withheld cross-instance comparison for the same dimension
+ * (`cross_service_instance`, always paired with `not_comparable`). Without
+ * this field the two blockers render as a flat contradiction - "known to
+ * differ" next to "not known to differ" - even though each is true within
+ * its own comparison. Omitted (undefined) when a blocker has no comparison
+ * boundary to disambiguate against, e.g. an ordinary `changed` blocker for a
+ * service-lifetime dimension, or a partition-dimension `changed`/
+ * `not_comparable` blocker when every summary shares one service instance.
+ */
+export type CacheFlightCohortBlockerScope =
+	| "within_service_instance"
+	| "cross_service_instance";
+
 export interface CacheFlightServiceEpoch {
 	readonly id: string;
 	readonly occurrenceId: string | null;
@@ -119,11 +137,13 @@ export type CacheFlightCohortBlocker =
 			readonly dimension: CacheFlightSealDimension;
 			readonly kind: "changed";
 			readonly detail: string;
+			readonly scope?: CacheFlightCohortBlockerScope;
 	  }
 	| {
 			readonly dimension: CacheFlightSealDimension;
 			readonly kind: "not_comparable";
 			readonly detail: string;
+			readonly scope?: CacheFlightCohortBlockerScope;
 	  }
 	| {
 			readonly dimension: CacheFlightCohortBlockerDimension;
@@ -313,11 +333,13 @@ function unknownBlocker(
 
 function changedBlocker(
 	dimension: CacheFlightSealDimension,
+	scope?: CacheFlightCohortBlockerScope,
 ): CacheFlightCohortBlocker {
 	return {
 		dimension,
 		kind: "changed",
 		detail: `${dimension}_changed`,
+		...(scope === undefined ? {} : { scope }),
 	};
 }
 
@@ -331,6 +353,11 @@ function changedBlocker(
  * reporting `unknown` would misstate that the value is missing. Declining to
  * compare (this kind) asserts nothing about equivalence, which is the R7
  * posture: withhold the conclusion rather than guess it either way.
+ *
+ * This blocker is only ever produced for the cross-instance comparison
+ * itself (its one call site guards on `crossesServiceInstances`), so its
+ * `scope` is unconditionally `cross_service_instance` - see
+ * `CacheFlightCohortBlockerScope`.
  */
 function notComparableBlocker(
 	dimension: CacheFlightSealDimension,
@@ -339,6 +366,7 @@ function notComparableBlocker(
 		dimension,
 		kind: "not_comparable",
 		detail: `${dimension}_not_comparable_across_restart`,
+		scope: "cross_service_instance",
 	};
 }
 
@@ -784,11 +812,18 @@ function selectionBlockers(
 				// the cross-instance comparison itself.
 				blockers.push(notComparableBlocker(dimension));
 				// Within a single service instance's group, the pseudonyms ARE
-				// comparable, so a real difference there is still reported.
+				// comparable, so a real difference there is still reported. This
+				// "changed" blocker and the "not_comparable" blocker just pushed
+				// above can both land on the same dimension - scope each one so
+				// they read as two true, non-contradictory facts about different
+				// comparisons rather than a flat contradiction (see
+				// CacheFlightCohortBlockerScope).
 				for (const group of partitionGroups.values()) {
 					if (group.length < 2) continue;
 					const { values } = knownComparableValues(group, dimension);
-					if (values.size > 1) blockers.push(changedBlocker(dimension));
+					if (values.size > 1) {
+						blockers.push(changedBlocker(dimension, "within_service_instance"));
+					}
 				}
 				const { unknown: hasUnknown } = knownComparableValues(
 					summaries,

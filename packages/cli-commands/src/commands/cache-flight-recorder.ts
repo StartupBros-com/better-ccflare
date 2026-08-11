@@ -2,6 +2,7 @@ import {
 	analyzeCacheFlightCohorts,
 	type CacheFlightCohortAnalysisResult,
 	type CacheFlightCohortBlocker,
+	type CacheFlightCohortBlockerScope,
 	type CacheFlightCohortContributor,
 	type CacheFlightCohortOutcomeCounts,
 	type CacheFlightVisibleSealDimension,
@@ -264,6 +265,11 @@ function formatContributors(
 	);
 }
 
+const BLOCKER_SCOPE_LABELS: Record<CacheFlightCohortBlockerScope, string> = {
+	within_service_instance: "within one service instance",
+	cross_service_instance: "across service instances",
+};
+
 function formatCohortBlockers(
 	blockers: readonly CacheFlightCohortBlocker[],
 ): string {
@@ -278,9 +284,24 @@ function formatCohortBlockers(
 				// account/route identity is impossible - not that it is known to
 				// differ (that would be "changed") and not that it is missing
 				// (that would be "unknown").
-				return blocker.kind === "not_comparable"
-					? `${base} (pseudonym rotates per process restart; not comparable across a restart, not known to differ)`
-					: base;
+				const notComparableSuffix =
+					blocker.kind === "not_comparable"
+						? " (pseudonym rotates per process restart; not comparable across a restart, not known to differ)"
+						: "";
+				// A "changed" and a "not_comparable" blocker can legitimately
+				// co-occur for the SAME dimension when observations span more than
+				// one service instance: a genuine difference among summaries
+				// sharing one instance, alongside a withheld cross-instance
+				// comparison. Left unscoped that pair reads as a flat
+				// contradiction ("known to differ" beside "not known to differ").
+				// Tagging each blocker's scope makes clear they describe two
+				// different, non-contradictory comparisons.
+				const scopeSuffix =
+					(blocker.kind === "changed" || blocker.kind === "not_comparable") &&
+					blocker.scope
+						? ` [scope: ${BLOCKER_SCOPE_LABELS[blocker.scope]}]`
+						: "";
+				return `${base}${notComparableSuffix}${scopeSuffix}`;
 			})
 			.join(", ") || "none"
 	);

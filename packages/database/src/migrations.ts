@@ -121,7 +121,7 @@ function ensureCacheFlightRecorderSealSchema(db: Database): void {
 			completeness TEXT NOT NULL,
 			unavailable_dimensions TEXT NOT NULL DEFAULT '[]',
 			created_at INTEGER NOT NULL,
-			last_verified_at INTEGER NOT NULL
+			last_verified_at INTEGER
 		)
 	`);
 	db.run(`
@@ -135,7 +135,7 @@ function ensureCacheFlightRecorderSealSchema(db: Database): void {
 			seal_completeness TEXT NOT NULL,
 			seal_unavailable_dimensions TEXT NOT NULL DEFAULT '[]',
 			created_at INTEGER NOT NULL,
-			last_verified_at INTEGER NOT NULL,
+			last_verified_at INTEGER,
 			FOREIGN KEY (service_epoch_id)
 				REFERENCES cache_flight_recorder_service_epochs(id)
 				ON DELETE CASCADE

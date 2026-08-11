@@ -131,6 +131,102 @@ describe("Cache flight cohort seal migrations", () => {
 					"idx_cache_flight_recorder_service_epochs_last_verified_at",
 				]),
 			);
+
+			// last_verified_at must stay nullable on a fresh install: it must
+			// match the ALTER TABLE upgrade path below, which has always
+			// added the column without NOT NULL (see the backfill comment
+			// there for why a DEFAULT would be wrong too).
+			const serviceEpochLastVerifiedAt = (
+				db
+					.prepare("PRAGMA table_info(cache_flight_recorder_service_epochs)")
+					.all() as Array<{ name: string; notnull: number }>
+			).find((column) => column.name === "last_verified_at");
+			expect(serviceEpochLastVerifiedAt?.notnull).toBe(0);
+			const partitionLastVerifiedAt = (
+				db
+					.prepare("PRAGMA table_info(cache_flight_recorder_partitions)")
+					.all() as Array<{ name: string; notnull: number }>
+			).find((column) => column.name === "last_verified_at");
+			expect(partitionLastVerifiedAt?.notnull).toBe(0);
+		} finally {
+			db.close();
+		}
+	});
+
+	it("permits a pre-diff binary's registryStatements() INSERT (which never mentions last_verified_at) to succeed on a fresh-install schema — rollback compatibility", () => {
+		const db = new Database(":memory:");
+		db.run("PRAGMA foreign_keys = ON");
+		try {
+			ensureSchema(db);
+			runMigrations(db);
+
+			// This is the exact column list (and therefore param count) the
+			// pre-diff binary's registryStatements() used: it stops at
+			// created_at and never supplies last_verified_at. If the
+			// fresh-install CREATE TABLE declared last_verified_at NOT NULL,
+			// rolling back to that binary against a database created fresh
+			// after this column shipped would fail every registry write with
+			// a NOT NULL constraint violation.
+			expect(() => {
+				db.prepare(`
+					INSERT INTO cache_flight_recorder_service_epochs (
+						id, seal_contract_version, deployment_revision, service_instance_id,
+						process_started_at, native_cache_state, recorder_state,
+						keepalive_global_ttl_minutes, keepalive_xai_ttl_minutes,
+						keepalive_effective_xai_enabled, keepalive_effective_xai_ttl_minutes,
+						occurrence_id, completeness, unavailable_dimensions, created_at
+					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				`).run(
+					"rollback-epoch-id",
+					1,
+					"deploy",
+					"service",
+					"2026-01-01T00:00:00.000Z",
+					"enabled",
+					"enabled",
+					20,
+					20,
+					1,
+					20,
+					"occurrence",
+					"complete",
+					"[]",
+					12_345,
+				);
+			}).not.toThrow();
+
+			expect(() => {
+				db.prepare(`
+					INSERT INTO cache_flight_recorder_partitions (
+						id, service_epoch_id, serving_account_scope, route_model_epoch,
+						completeness, unavailable_dimensions, seal_completeness,
+						seal_unavailable_dimensions, created_at
+					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+				`).run(
+					"rollback-partition-id",
+					"rollback-epoch-id",
+					"scope",
+					"route",
+					"complete",
+					"[]",
+					"complete",
+					"[]",
+					67_890,
+				);
+			}).not.toThrow();
+
+			const insertedEpoch = db
+				.prepare(
+					"SELECT last_verified_at FROM cache_flight_recorder_service_epochs WHERE id = ?",
+				)
+				.get("rollback-epoch-id") as { last_verified_at: number | null };
+			expect(insertedEpoch.last_verified_at).toBeNull();
+			const insertedPartition = db
+				.prepare(
+					"SELECT last_verified_at FROM cache_flight_recorder_partitions WHERE id = ?",
+				)
+				.get("rollback-partition-id") as { last_verified_at: number | null };
+			expect(insertedPartition.last_verified_at).toBeNull();
 		} finally {
 			db.close();
 		}
@@ -297,6 +393,43 @@ describe("Cache flight cohort seal migrations", () => {
 					"idx_cache_flight_recorder_service_epochs_last_verified_at",
 				]),
 			);
+
+			// Fresh installs and upgraded databases must agree on
+			// last_verified_at's nullability — both nullable, never NOT
+			// NULL — otherwise the two paths diverge on what a pre-diff
+			// binary is allowed to write.
+			const upgradedNotNull = (
+				db
+					.prepare("PRAGMA table_info(cache_flight_recorder_service_epochs)")
+					.all() as Array<{ name: string; notnull: number }>
+			).find((column) => column.name === "last_verified_at")?.notnull;
+			expect(upgradedNotNull).toBe(0);
+			const upgradedPartitionNotNull = (
+				db
+					.prepare("PRAGMA table_info(cache_flight_recorder_partitions)")
+					.all() as Array<{ name: string; notnull: number }>
+			).find((column) => column.name === "last_verified_at")?.notnull;
+			expect(upgradedPartitionNotNull).toBe(0);
+
+			const freshDb = new Database(":memory:");
+			try {
+				ensureSchema(freshDb);
+				runMigrations(freshDb);
+				const freshNotNull = (
+					freshDb
+						.prepare("PRAGMA table_info(cache_flight_recorder_service_epochs)")
+						.all() as Array<{ name: string; notnull: number }>
+				).find((column) => column.name === "last_verified_at")?.notnull;
+				const freshPartitionNotNull = (
+					freshDb
+						.prepare("PRAGMA table_info(cache_flight_recorder_partitions)")
+						.all() as Array<{ name: string; notnull: number }>
+				).find((column) => column.name === "last_verified_at")?.notnull;
+				expect(freshNotNull).toBe(upgradedNotNull);
+				expect(freshPartitionNotNull).toBe(upgradedPartitionNotNull);
+			} finally {
+				freshDb.close();
+			}
 		} finally {
 			db.close();
 		}

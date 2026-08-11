@@ -539,8 +539,18 @@ export class CacheFlightRecorderRepository extends BaseRepository<Timeline> {
 				// insert; only last_verified_at is refreshed thereafter), so
 				// gating on last_verified_at alone strictly dominates and
 				// subsumes the created_at check.
+				// COALESCE because the column is nullable: the upgrade path
+				// ALTERs it on before backfilling, the fresh-install schema
+				// leaves it nullable so a rolled-back prior binary can still
+				// insert, and on PostgreSQL a mid-rolling-deploy instance on
+				// the old binary can write a row after this pass's backfill
+				// already ran. `NULL < cutoff` is NULL, not true, so without
+				// the fallback any such row would never satisfy this
+				// predicate and would be immortal. Falling back to created_at
+				// restores exactly the pre-liveness behavior for a row that
+				// has no stamp yet.
 				sql: `DELETE FROM cache_flight_recorder_partitions
-				 WHERE last_verified_at < ?
+				 WHERE COALESCE(last_verified_at, created_at) < ?
 					AND NOT EXISTS (
 					SELECT 1 FROM cache_flight_recorder_turns t
 					WHERE t.observation_partition_id = cache_flight_recorder_partitions.id
@@ -551,7 +561,7 @@ export class CacheFlightRecorderRepository extends BaseRepository<Timeline> {
 				// Same race and guard as the partition cleanup above, one
 				// level up the registry.
 				sql: `DELETE FROM cache_flight_recorder_service_epochs
-				 WHERE last_verified_at < ?
+				 WHERE COALESCE(last_verified_at, created_at) < ?
 					AND NOT EXISTS (
 					SELECT 1 FROM cache_flight_recorder_partitions p
 					WHERE p.service_epoch_id = cache_flight_recorder_service_epochs.id

@@ -68,7 +68,7 @@ async function ensureCacheFlightRecorderTablesPg(
 			completeness TEXT NOT NULL,
 			unavailable_dimensions TEXT NOT NULL DEFAULT '[]',
 			created_at BIGINT NOT NULL,
-			last_verified_at BIGINT NOT NULL
+			last_verified_at BIGINT
 		)
 	`);
 	await adapter.unsafe(`
@@ -82,7 +82,7 @@ async function ensureCacheFlightRecorderTablesPg(
 			seal_completeness TEXT NOT NULL,
 			seal_unavailable_dimensions TEXT NOT NULL DEFAULT '[]',
 			created_at BIGINT NOT NULL,
-			last_verified_at BIGINT NOT NULL,
+			last_verified_at BIGINT,
 			FOREIGN KEY (service_epoch_id)
 				REFERENCES cache_flight_recorder_service_epochs(id)
 				ON DELETE CASCADE

@@ -648,11 +648,13 @@ describe("cache flight recorder report", () => {
 				dimension: "serving_account_scope",
 				kind: "not_comparable",
 				detail: "serving_account_scope_not_comparable_across_restart",
+				scope: "cross_service_instance",
 			},
 			{
 				dimension: "route_model_epoch",
 				kind: "not_comparable",
 				detail: "route_model_epoch_not_comparable_across_restart",
+				scope: "cross_service_instance",
 			},
 		]);
 
@@ -712,6 +714,151 @@ describe("cache flight recorder report", () => {
 				dimension: "serving_account_scope",
 				kind: "not_comparable",
 				detail: "serving_account_scope_not_comparable_across_restart",
+				scope: "cross_service_instance",
+			});
+			expect(humanOutput.stdout).toEqual([
+				renderCacheFlightRecorderReport(report),
+			]);
+		});
+	});
+
+	it("scopes a within-instance changed blocker and a cross-instance not_comparable blocker for the same dimension so human and JSON output both read as two non-contradictory facts", () => {
+		// Two turns share one known service instance (interleaved accounts
+		// within one process lifetime) with a genuine serving_account_scope
+		// difference between them; a third turn sits behind a restart into a
+		// different service instance. Before the fix, the operator would see
+		// "changed:serving_account_scope:..." and
+		// "not_comparable:serving_account_scope:..." rendered adjacently with no
+		// indication that they describe different comparisons - a
+		// self-contradictory pair for the same dimension.
+		const withinInstanceSeal: CacheFlightPersistedSeal = {
+			...completeSeal,
+			observationPartition: {
+				...completeSeal.observationPartition,
+				id: "partition-opaque-2",
+				servingAccountScope: "scope-opaque-2",
+			},
+		};
+		const restartedSeal: CacheFlightPersistedSeal = {
+			...completeSeal,
+			serviceEpoch: {
+				...completeSeal.serviceEpoch,
+				id: "epoch-opaque-2",
+				occurrenceId: "occurrence-2",
+				serviceInstanceId: "instance-opaque-2",
+				processStartedAt: "2026-07-15T00:01:30.000Z",
+			},
+			observationPartition: {
+				...completeSeal.observationPartition,
+				id: "partition-opaque-3",
+				serviceEpochId: "epoch-opaque-2",
+				servingAccountScope: "scope-opaque-3",
+			},
+		};
+		const dto = buildCacheFlightRecorderReport({
+			...hitTimeline,
+			turns: [
+				{ ...baselineTurn, seal: completeSeal },
+				{ ...hitTurn, seal: withinInstanceSeal },
+				{
+					...hitTurn,
+					sequence: 2,
+					timestamp: "2026-07-15T00:02:00.000Z",
+					seal: restartedSeal,
+				},
+			],
+		});
+
+		const scopeBlockers = dto.cohortAnalysis.blockers.filter(
+			(blocker) => blocker.dimension === "serving_account_scope",
+		);
+		expect(scopeBlockers).toContainEqual({
+			dimension: "serving_account_scope",
+			kind: "changed",
+			detail: "serving_account_scope_changed",
+			scope: "within_service_instance",
+		});
+		expect(scopeBlockers).toContainEqual({
+			dimension: "serving_account_scope",
+			kind: "not_comparable",
+			detail: "serving_account_scope_not_comparable_across_restart",
+			scope: "cross_service_instance",
+		});
+		expect(scopeBlockers).toHaveLength(2);
+
+		const human = renderCacheFlightRecorderReport(dto);
+		const cohortBlockersLine = human
+			.split("\n")
+			.find((line) => line.startsWith("Cohort blockers: "));
+		expect(cohortBlockersLine).toBeDefined();
+		// Detail text for "not_comparable" contains its own internal comma, so
+		// individual entries can't be recovered by splitting the joined line on
+		// ", " - assert on the exact rendered substring for each blocker
+		// instead. This directly proves each carries distinguishing scope
+		// language attached to the right blocker, so the pair reads as two
+		// facts about different comparisons rather than one flat contradiction.
+		expect(cohortBlockersLine).toContain(
+			"changed:serving_account_scope:serving_account_scope_changed [scope: within one service instance]",
+		);
+		expect(cohortBlockersLine).toContain(
+			"not_comparable:serving_account_scope:serving_account_scope_not_comparable_across_restart (pseudonym rotates per process restart; not comparable across a restart, not known to differ) [scope: across service instances]",
+		);
+
+		const jsonOutput = capture();
+		const humanOutput = capture();
+		const command = {
+			action: "report" as const,
+			recorderConversationId: "recorder-safe-id",
+		};
+		const mixedDb = db({
+			lookupCacheFlightRecorderTimeline: async () => ({
+				status: "found" as const,
+				timeline: {
+					...hitTimeline,
+					turns: [
+						{ ...baselineTurn, seal: completeSeal },
+						{ ...hitTurn, seal: withinInstanceSeal },
+						{
+							...hitTurn,
+							sequence: 2,
+							timestamp: "2026-07-15T00:02:00.000Z",
+							seal: restartedSeal,
+						},
+					],
+				},
+			}),
+		});
+
+		return Promise.all([
+			runCacheFlightRecorderCommand(
+				mixedDb,
+				{ ...command, json: true },
+				{ enabled: true, retentionHours: 72 },
+				jsonOutput.io,
+			),
+			runCacheFlightRecorderCommand(
+				mixedDb,
+				{ ...command, json: false },
+				{ enabled: true, retentionHours: 72 },
+				humanOutput.io,
+			),
+		]).then(() => {
+			const report = JSON.parse(jsonOutput.stdout.at(0) ?? "");
+			const jsonScopeBlockers = report.cohortAnalysis.blockers.filter(
+				(blocker: { dimension: string }) =>
+					blocker.dimension === "serving_account_scope",
+			);
+			expect(jsonScopeBlockers).toContainEqual({
+				dimension: "serving_account_scope",
+				kind: "changed",
+				detail: "serving_account_scope_changed",
+				scope: "within_service_instance",
+			});
+			expect(jsonScopeBlockers).toContainEqual({
+				dimension: "serving_account_scope",
+				kind: "not_comparable",
+				detail: "serving_account_scope_not_comparable_across_restart",
+				scope: "cross_service_instance",
 			});
 			expect(humanOutput.stdout).toEqual([
 				renderCacheFlightRecorderReport(report),

@@ -202,6 +202,26 @@ function parsePgColumnsToAdd(
 	return entries;
 }
 
+/**
+ * Extract the raw body text (everything between the balanced parens) of the
+ * first `CREATE TABLE IF NOT EXISTS <tableName> (...)` block in source. Used
+ * where a test needs the literal column definition text (e.g. to check for
+ * `NOT NULL`), not just the extracted column name that `parsePgCreateTables`
+ * produces.
+ */
+function _extractCreateTableBody(source: string, tableName: string): string {
+	const headerRe = new RegExp(`CREATE TABLE IF NOT EXISTS ${tableName}\\s*\\(`);
+	const match = headerRe.exec(source);
+	if (!match) {
+		throw new Error(
+			`CREATE TABLE IF NOT EXISTS ${tableName} not found in source`,
+		);
+	}
+	const openParenIndex = match.index + match[0].length - 1;
+	const closeParenIndex = findMatchingParen(source, openParenIndex);
+	return source.slice(openParenIndex + 1, closeParenIndex);
+}
+
 function buildPgInventory(source: string): SchemaInventory {
 	const tables = parsePgCreateTables(source);
 
