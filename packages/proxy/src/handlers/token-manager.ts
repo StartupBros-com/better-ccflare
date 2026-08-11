@@ -14,6 +14,12 @@ import {
 } from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
 import { TOKEN_REFRESH_BACKOFF_MS, TOKEN_SAFETY_WINDOW_MS } from "../constants";
+import {
+	clearPendingRotation,
+	flushPendingRotation,
+	getPendingRotation,
+	recordPendingRotation,
+} from "./pending-rotation-registry";
 import { ERROR_MESSAGES, type ProxyContext } from "./proxy-types";
 import {
 	checkRefreshTokenHealth,
