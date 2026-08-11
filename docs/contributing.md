@@ -160,15 +160,11 @@ bun run typecheck
 bun run format
 ```
 
-### CLAUDE.md File
+### Repository Agent Instructions
 
-The project includes a `CLAUDE.md` file in the root directory that provides guidance to Claude Code (claude.ai/code) when working with the codebase. This file contains:
-- Project overview and purpose
-- Important commands to run after making changes
-- Development and maintenance commands
-- Project-specific guidelines
+The root `AGENTS.md` file is the canonical repository policy for agents working with the codebase. The root `CLAUDE.md` file imports `AGENTS.md` instead of maintaining a duplicate full copy.
 
-When contributing, ensure any major architectural changes or new patterns are documented in CLAUDE.md to help future AI-assisted development.
+When contributing, document major architectural changes or new patterns in `AGENTS.md` to help future agent-assisted development.
 
 ## Project Structure
 
