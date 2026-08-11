@@ -17,7 +17,7 @@ afterEach(() => {
 	delete process.env[CODEX_TRACE_HMAC_KEY_ENV];
 });
 
-describe("reasoning retention telemetry (schema 14)", () => {
+describe("reasoning retention telemetry (schema 15)", () => {
 	test("writes a counts-only request record", () => {
 		const dir = mkdtempSync(join(tmpdir(), "codex-trace-reasoning-"));
 		process.env[CODEX_TRACE_DIR_ENV] = dir;
@@ -37,7 +37,7 @@ describe("reasoning retention telemetry (schema 14)", () => {
 			const rawTrace = readFileSync(join(dir, file as string), "utf8");
 			const record = JSON.parse(rawTrace.trim());
 			expect(record).toMatchObject({
-				trace_schema_version: 14,
+				trace_schema_version: 15,
 				phase: "request",
 				reasoning_input_item_count: 1,
 			});
@@ -56,6 +56,7 @@ describe("reasoning retention telemetry (schema 14)", () => {
 				summary: summarizeCodexResponse([], {}, "end_turn", undefined, {
 					outputItemCount: 3,
 					encryptedPresent: true,
+					unrepresentableIdSkipCount: 2,
 				}),
 			});
 
@@ -64,10 +65,11 @@ describe("reasoning retention telemetry (schema 14)", () => {
 				readFileSync(join(dir, file as string), "utf8").trim(),
 			);
 			expect(record).toMatchObject({
-				trace_schema_version: 14,
+				trace_schema_version: 15,
 				phase: "response",
 				reasoning_output_item_count: 3,
 				reasoning_encrypted_present: true,
+				reasoning_unrepresentable_id_skip_count: 2,
 			});
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
@@ -75,7 +77,7 @@ describe("reasoning retention telemetry (schema 14)", () => {
 	});
 });
 
-describe("writeCodexTrace schema 14 cache experiments", () => {
+describe("writeCodexTrace schema 15 cache experiments", () => {
 	test("writes bounded decision fields without reconstructing their semantics", () => {
 		const dir = mkdtempSync(join(tmpdir(), "codex-trace-schema-"));
 		process.env[CODEX_TRACE_DIR_ENV] = dir;
@@ -100,7 +102,7 @@ describe("writeCodexTrace schema 14 cache experiments", () => {
 				readFileSync(join(dir, file as string), "utf8").trim(),
 			);
 			expect(record).toMatchObject({
-				trace_schema_version: 14,
+				trace_schema_version: 15,
 				request_id: "logical-1",
 				attempt_id: "attempt-1",
 				attempt_ordinal: 2,
@@ -136,7 +138,7 @@ describe("writeCodexTrace schema 14 cache experiments", () => {
 	});
 });
 
-describe("orchestration demotion diagnostics (preserved in schema 14)", () => {
+describe("orchestration demotion diagnostics (preserved in schema 15)", () => {
 	test("writes the demotion signal and elapsed time when supplied", () => {
 		const dir = mkdtempSync(join(tmpdir(), "codex-trace-schema-"));
 		process.env[CODEX_TRACE_DIR_ENV] = dir;
@@ -152,7 +154,7 @@ describe("orchestration demotion diagnostics (preserved in schema 14)", () => {
 				readFileSync(join(dir, file as string), "utf8").trim(),
 			);
 			expect(record).toMatchObject({
-				trace_schema_version: 14,
+				trace_schema_version: 15,
 				orchestration_demotion_observed: true,
 				elapsed_ms_since_root: 4_242,
 			});
@@ -171,7 +173,7 @@ describe("orchestration demotion diagnostics (preserved in schema 14)", () => {
 			const record = JSON.parse(
 				readFileSync(join(dir, file as string), "utf8").trim(),
 			);
-			expect(record.trace_schema_version).toBe(14);
+			expect(record.trace_schema_version).toBe(15);
 			expect(record.orchestration_demotion_observed).toBeNull();
 			expect(record.elapsed_ms_since_root).toBeNull();
 		} finally {
@@ -199,7 +201,7 @@ describe("orchestration demotion diagnostics (preserved in schema 14)", () => {
 	});
 });
 
-describe("orchestration admission basis (introduced in schema 13, preserved in schema 14)", () => {
+describe("orchestration admission basis (introduced in schema 13, preserved in schema 15)", () => {
 	test("writes an explicit categorical basis alongside its admission", () => {
 		const dir = mkdtempSync(join(tmpdir(), "codex-trace-basis-"));
 		process.env[CODEX_TRACE_DIR_ENV] = dir;
@@ -215,7 +217,7 @@ describe("orchestration admission basis (introduced in schema 13, preserved in s
 				readFileSync(join(dir, file as string), "utf8").trim(),
 			);
 			expect(record).toMatchObject({
-				trace_schema_version: 14,
+				trace_schema_version: 15,
 				orchestration_admission: "root",
 				orchestration_basis: "lineage_match",
 			});
@@ -460,6 +462,7 @@ describe("summarizeCodexResponse (response phase)", () => {
 
 		expect(s.reasoning_output_item_count).toBe(2);
 		expect(s.reasoning_encrypted_present).toBe(true);
+		expect(s.reasoning_unrepresentable_id_skip_count).toBe(0);
 	});
 
 	test("counts newly emitted tool calls and computes cache hit pct", () => {

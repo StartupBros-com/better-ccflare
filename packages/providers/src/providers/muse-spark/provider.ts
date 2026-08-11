@@ -2,6 +2,8 @@ import { getModelFamily, mapModelName } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import type { Account, LogicalModelCapability } from "@better-ccflare/types";
 import type { RateLimitInfo } from "../../types";
+import { stripCodexReasoningRetention } from "../../utils/codex-reasoning-retention";
+import { transformRequestBodyModel } from "../../utils/model-mapping";
 import { BaseAnthropicCompatibleProvider } from "../base-anthropic-compatible";
 import { sanitizeMuseSparkRequestBody } from "./request-sanitizer";
 
@@ -211,11 +213,10 @@ export class MuseSparkProvider extends BaseAnthropicCompatibleProvider {
 			return request;
 		}
 
-		// The allowlist below describes the Messages contract specifically. Any
-		// other JSON endpoint (files, uploads) has a different field set, so it is
-		// forwarded untouched rather than gutted by a contract it does not share.
+		// Other JSON endpoints retain their own schema, but still cannot receive
+		// proxy-minted reasoning if they carry a Messages transcript.
 		if (!isMuseSparkMessagesPath(request.url)) {
-			return request;
+			return transformRequestBodyModel(request);
 		}
 
 		// Sanitization changes the body length, so the inbound content-length must
@@ -247,15 +248,24 @@ export class MuseSparkProvider extends BaseAnthropicCompatibleProvider {
 			}
 
 			const body = parsed as Record<string, unknown>;
-			if (typeof body.model === "string") {
-				const mapped = this.resolveModel(body.model, account);
-				if (mapped !== body.model) {
-					log.debug(`Mapped model: ${body.model} -> ${mapped}`);
-					body.model = mapped;
+			const { body: reasoningFiltered, strippedCount } =
+				stripCodexReasoningRetention(body);
+
+			if (typeof reasoningFiltered.model === "string") {
+				const mapped = this.resolveModel(reasoningFiltered.model, account);
+				if (mapped !== reasoningFiltered.model) {
+					log.debug(`Mapped model: ${reasoningFiltered.model} -> ${mapped}`);
+					reasoningFiltered.model = mapped;
 				}
 			}
 
-			const { body: sanitized, changes } = sanitizeMuseSparkRequestBody(body);
+			const { body: sanitized, changes } =
+				sanitizeMuseSparkRequestBody(reasoningFiltered);
+			if (strippedCount > 0) {
+				log.debug(
+					`Removed ${strippedCount} retained Codex reasoning block(s) before forwarding`,
+				);
+			}
 			if (changes.length > 0) {
 				log.debug(
 					`Sanitized request for Meta Model API: ${changes.join(", ")}`,

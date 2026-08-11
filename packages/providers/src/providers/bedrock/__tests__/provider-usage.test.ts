@@ -5,6 +5,8 @@ mock.module("@better-ccflare/core", () => ({
 }));
 mock.module("@better-ccflare/database", () => ({
 	DatabaseFactory: {
+		initialize: mock(() => {}),
+		reset: mock(() => {}),
 		getInstance: mock(() => ({
 			getDatabase: mock(() => ({})),
 		})),

@@ -1,6 +1,7 @@
 import { mapModelName } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import type { Account } from "@better-ccflare/types";
+import { stripCodexReasoningRetention } from "./codex-reasoning-retention";
 
 const log = new Logger("ModelMappingUtils");
 
@@ -128,7 +129,9 @@ export async function transformRequestBodyModel<T extends TransformRequestBody>(
 	if (!bytes) return request;
 
 	try {
-		const body: T = JSON.parse(new TextDecoder().decode(bytes));
+		const parsedBody: T = JSON.parse(new TextDecoder().decode(bytes));
+		const { body, strippedCount } = stripCodexReasoningRetention(parsedBody);
+		let modelChanged = false;
 
 		// Only transform if model field exists
 		if (body.model) {
@@ -140,14 +143,18 @@ export async function transformRequestBodyModel<T extends TransformRequestBody>(
 			// Only rewrite the body if the model actually changed
 			if (mappedModel !== originalModel) {
 				body.model = mappedModel;
+				modelChanged = true;
 				log.debug(
 					`Mapped model in request: ${originalModel} -> ${mappedModel}`,
 				);
-				return rebuild(JSON.stringify(body));
 			}
 		}
 
-		// No model change, forward the original bytes untouched.
+		if (modelChanged || strippedCount > 0) {
+			return rebuild(JSON.stringify(body));
+		}
+
+		// No model or reasoning change, forward the original bytes untouched.
 		return rebuild(bytes);
 	} catch (error) {
 		log.debug("Failed to transform request body model:", error);

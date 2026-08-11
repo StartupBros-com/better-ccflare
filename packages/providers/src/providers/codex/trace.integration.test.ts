@@ -92,6 +92,14 @@ describe("Codex trace wiring (integration)", () => {
 				output_index: 1,
 				item: { type: "reasoning", id: "rs_without_encrypted_content" },
 			}),
+			event("response.output_item.done", {
+				output_index: 2,
+				item: {
+					type: "reasoning",
+					id: "private.invalid-id",
+					encrypted_content: "another-private-payload",
+				},
+			}),
 			event("response.completed", {
 				response: {
 					model: "gpt-5.6-sol",
@@ -113,13 +121,16 @@ describe("Codex trace wiring (integration)", () => {
 		const rawTrace = readFileSync(join(dir, file as string), "utf8");
 		const record = JSON.parse(rawTrace.trim());
 		expect(record).toMatchObject({
-			trace_schema_version: 14,
+			trace_schema_version: 15,
 			phase: "response",
-			reasoning_output_item_count: 2,
+			reasoning_output_item_count: 3,
 			reasoning_encrypted_present: true,
+			reasoning_unrepresentable_id_skip_count: 1,
 		});
 		expect(rawTrace).not.toContain("rs_reasoning_private");
 		expect(rawTrace).not.toContain("encrypted-private-payload");
+		expect(rawTrace).not.toContain("private.invalid-id");
+		expect(rawTrace).not.toContain("another-private-payload");
 	});
 
 	test("traces replayed reasoning input counts without retaining its payload", async () => {
@@ -149,7 +160,7 @@ describe("Codex trace wiring (integration)", () => {
 		const rawTrace = readFileSync(join(dir, file as string), "utf8");
 		const record = JSON.parse(rawTrace.trim());
 		expect(record).toMatchObject({
-			trace_schema_version: 14,
+			trace_schema_version: 15,
 			phase: "request",
 			reasoning_input_item_count: 1,
 		});
@@ -180,7 +191,7 @@ describe("Codex trace wiring (integration)", () => {
 		const files = readdirSync(dir).filter((f) => f.endsWith(".jsonl"));
 		expect(files.length).toBe(1);
 		const rec = JSON.parse(readFileSync(join(dir, files[0]), "utf8").trim());
-		expect(rec.trace_schema_version).toBe(14);
+		expect(rec.trace_schema_version).toBe(15);
 		expect(rec.phase).toBe("request");
 		expect(rec.orchestration_admission).toBe("no_orchestration_tools");
 		expect(rec.request_id).toBe("req_trace_1");
@@ -247,7 +258,7 @@ describe("Codex trace wiring (integration)", () => {
 			readFileSync(join(dir, file as string), "utf8").trim(),
 		);
 		expect(record).toMatchObject({
-			trace_schema_version: 14,
+			trace_schema_version: 15,
 			request_id: "req_trace_fable_default",
 			model_in: "claude-fable-5",
 			model_out: "gpt-5.6-sol",
@@ -301,7 +312,7 @@ describe("Codex trace wiring (integration)", () => {
 			.trim()
 			.split("\n")
 			.map((line) => JSON.parse(line));
-		expect(records.every((record) => record.trace_schema_version === 14)).toBe(
+		expect(records.every((record) => record.trace_schema_version === 15)).toBe(
 			true,
 		);
 		expect(records.map((record) => record.cache_key_assignment)).toEqual([

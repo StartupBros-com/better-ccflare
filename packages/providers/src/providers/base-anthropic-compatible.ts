@@ -170,12 +170,12 @@ export abstract class BaseAnthropicCompatibleProvider extends BaseProvider {
 		request: Request,
 		account?: Account,
 	): Promise<Request> {
-		if (!this.config.supportsStreaming) {
-			return request;
-		}
-
-		// Use the shared utility for model mapping
+		// Retained Codex reasoning must be removed for every Anthropic-compatible
+		// upstream. Keep the historical no-model-mapping behavior for providers
+		// that disable streaming, while still allowing the shared filter to run.
 		return transformRequestBodyModel(request, account, (model, acc) => {
+			if (!this.config.supportsStreaming) return model;
+
 			if (acc) {
 				// Use core mapModelName which handles arrays, fallbacks, env overrides, and defaults
 				return mapModelName(model, acc);

@@ -31,6 +31,7 @@ import {
 	resolveCodexRequestModel,
 	resolveModelContextCapability,
 	resolveProviderForAccount,
+	stripCodexReasoningRetention,
 	suppressCodexExplicitCacheBreakpoint,
 	usageCache,
 } from "@better-ccflare/providers";
@@ -1023,6 +1024,45 @@ function filterThinkingBlocks(
 }
 
 /**
+ * Removes proxy-minted Codex reasoning retention blocks from assistant
+ * history while preserving genuine Anthropic redacted-thinking blocks.
+ */
+export function filterCodexReasoningBlocks(
+	requestBody: ArrayBuffer | RequestBodyContext | null,
+): ArrayBuffer | null {
+	const bodyContext =
+		requestBody instanceof RequestBodyContext
+			? requestBody
+			: new RequestBodyContext(requestBody);
+	const requestBodyBuffer = bodyContext.getBuffer();
+	if (!requestBodyBuffer) return null;
+
+	try {
+		const body = bodyContext.getParsedJson();
+		if (!body) {
+			if (bodyContext.hasParseFailed) {
+				log.warn(
+					"Failed to filter Codex reasoning blocks: request body is not valid JSON",
+				);
+			}
+			return null;
+		}
+
+		const { body: filteredBody, strippedCount } =
+			stripCodexReasoningRetention(body);
+		if (strippedCount === 0) return requestBodyBuffer;
+
+		return RequestBodyContext.fromParsed(
+			requestBodyBuffer,
+			filteredBody,
+		).getBuffer();
+	} catch (error) {
+		log.warn("Failed to filter Codex reasoning blocks:", error);
+		return null;
+	}
+}
+
+/**
  * Checks if a response error is due to invalid thinking block signatures or thinking-related errors
  * @param response - The response to check
  * @returns True if the error is about invalid thinking blocks
@@ -1073,6 +1113,41 @@ async function isInvalidThinkingSignatureError(
 	}
 
 	return false;
+}
+
+/**
+ * Checks whether Codex rejected a retained encrypted reasoning item because
+ * its payload cannot be verified against the item ID.
+ */
+export async function isCodexReasoningVerificationError(
+	response: Response,
+	readJson: ResponseJsonReader = readResponseCloneJson,
+): Promise<boolean> {
+	if (response.status !== 400) return false;
+	const contentType = response.headers.get("content-type");
+	if (!contentType?.includes("application/json")) return false;
+
+	// Cloned only after the content-type gate above. Cloning before it would
+	// tee the body and then return early for every non-JSON body, stranding
+	// that copy unread — the tee keeps buffering for whoever consumes the
+	// original. Reachable in normal operation: providers such as Qwen do
+	// return non-JSON error bodies. See issue #356.
+	const json = (await readJson(response)) as {
+		error?: { message?: unknown };
+	} | null;
+	if (typeof json?.error?.message !== "string") return false;
+
+	const rawMessage = json.error.message;
+	if (/invalid\s+['"]input\[\d+\]\.id['"]/i.test(rawMessage)) {
+		return true;
+	}
+
+	const message = rawMessage.toLowerCase();
+	return (
+		message.includes("encrypted content") &&
+		(message.includes("could not be verified") ||
+			message.includes("could not be decrypted"))
+	);
 }
 
 /**
@@ -2403,6 +2478,7 @@ export async function proxyWithAccount(
 				| "model_fallback"
 				| "overload_529"
 				| "thinking_retry"
+				| "reasoning_retry"
 				| "cache_control_retry"
 				| "prompt_cache_breakpoint_retry"
 				| "cache_lane_rescue"
@@ -3370,6 +3446,65 @@ export async function proxyWithAccount(
 			} else {
 				log.warn(
 					"Failed to filter thinking blocks or no changes made, proceeding with original error response",
+				);
+			}
+		}
+
+		// A retained Codex encrypted-reasoning block that can no longer be
+		// verified is resent by Claude Code on every later turn. Strip only the
+		// proxy-minted retention blocks and replay this physical route once so a
+		// single rejected history item cannot permanently wedge the conversation.
+		if (
+			!hostedDispatchCommitted() &&
+			attemptPlan.providerName === "codex" &&
+			(await isCodexReasoningVerificationError(
+				rawResponse,
+				readAttemptBoundJson,
+			))
+		) {
+			const strippedBodyBuffer =
+				filterCodexReasoningBlocks(effectiveBodyContext);
+
+			if (strippedBodyBuffer && strippedBodyBuffer !== effectiveBodyBuffer) {
+				log.info(
+					`Codex rejected retained encrypted reasoning for account ${account.name}, retrying with proxy-minted reasoning blocks removed`,
+				);
+				const retryRequestInit: RequestInit & { duplex?: "half" } = {
+					method: req.method,
+					headers,
+					body: new Uint8Array(strippedBodyBuffer),
+					duplex: "half",
+					signal: req.signal,
+				};
+
+				await finalizeCurrentCodexTransport(rawResponse);
+				await discardUpstreamBody(rawResponse);
+				stampCodexAttempt(headers, "reasoning_retry");
+				const retryProviderRequest = new Request(targetUrl, retryRequestInit);
+				retrySourceRequest = retryProviderRequest.clone();
+
+				let retryTransformedRequest = await transformWithCurrentAttemptPlan(
+					attemptPlan,
+					retryProviderRequest,
+				);
+				retryTransformedRequest = await enforcePhysicalModelAfterTransform(
+					retryTransformedRequest,
+					currentTransportModel,
+				);
+				retryTransformedTemplate = retryTransformedRequest.clone();
+
+				const retryTransportRequest = retryTransformedTemplate.clone();
+				currentReplayBody = strippedBodyBuffer;
+				currentCacheIdentityHasCacheControl = undefined;
+				rawResponse = await executeCacheAwareProviderAttempt(
+					retryTransportRequest,
+					currentReplayBody,
+					currentCacheIdentityHasCacheControl,
+					currentTransportModel,
+				);
+			} else {
+				log.warn(
+					"No proxy-minted Codex reasoning blocks to strip or filtering failed, proceeding with original error response",
 				);
 			}
 		}

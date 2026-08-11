@@ -291,6 +291,41 @@ describe("AnthropicCompatibleProvider", () => {
 			expect(body.model).toBe("claude-3-opus");
 		});
 
+		test("filters proxy-minted reasoning even when streaming is disabled without mapping the model", async () => {
+			const provider = new AnthropicCompatibleProvider({
+				supportsStreaming: false,
+				modelMappings: { "claude-3-sonnet": "must-not-map" },
+			});
+			const transformed = await provider.transformRequestBody(
+				new Request("http://example.com", {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({
+						model: "claude-3-sonnet",
+						messages: [
+							{
+								role: "assistant",
+								content: [
+									{ type: "redacted_thinking", data: "bccfr1.rs_strip.cipher" },
+									{ type: "redacted_thinking", data: "anthropic-genuine" },
+								],
+							},
+						],
+					}),
+				}),
+			);
+
+			expect(await transformed.json()).toEqual({
+				model: "claude-3-sonnet",
+				messages: [
+					{
+						role: "assistant",
+						content: [{ type: "redacted_thinking", data: "anthropic-genuine" }],
+					},
+				],
+			});
+		});
+
 		test("should not transform non-JSON requests", async () => {
 			const config: AnthropicCompatibleConfig = {
 				modelMappings: {

@@ -3,13 +3,14 @@ import { Logger } from "@better-ccflare/logger";
 import type { Account } from "@better-ccflare/types";
 import { GoogleAuth } from "google-auth-library";
 import type { TokenRefreshResult } from "../../types";
+import { stripCodexReasoningRetention } from "../../utils/codex-reasoning-retention";
 import { getModelName } from "../../utils/model-mapping";
 import {
 	type AnthropicCompatibleConfig,
 	BaseAnthropicCompatibleProvider,
 } from "../base-anthropic-compatible";
 
-const _log = new Logger("VertexAIProvider");
+const log = new Logger("VertexAIProvider");
 
 // Vertex AI configuration stored in custom_endpoint field
 export interface VertexAIConfig {
@@ -31,7 +32,7 @@ function convertToVertexAIModel(anthropicModel: string): string {
 	const vertexModel = anthropicModel.replace(/-(\d{8})$/, "@$1");
 
 	if (vertexModel !== anthropicModel) {
-		console.log(
+		log.debug(
 			`[Vertex AI] Converted Anthropic model to Vertex AI format: ${anthropicModel} -> ${vertexModel}`,
 		);
 	}
@@ -105,7 +106,7 @@ export class VertexAIProvider extends BaseAnthropicCompatibleProvider {
 				throw new Error("Failed to obtain access token from Google Auth");
 			}
 
-			console.log(
+			log.info(
 				`[Vertex AI] Successfully refreshed access token for account ${account.name}`,
 			);
 
@@ -116,7 +117,7 @@ export class VertexAIProvider extends BaseAnthropicCompatibleProvider {
 				refreshToken: "", // Empty to prevent DB update
 			};
 		} catch (error) {
-			console.log(
+			log.error(
 				`[Vertex AI] Failed to refresh token for account ${account.name}:`,
 				error,
 			);
@@ -138,7 +139,7 @@ export class VertexAIProvider extends BaseAnthropicCompatibleProvider {
 	): void {
 		try {
 			if (!requestBodyBuffer) {
-				console.log("[Vertex AI] No request body, using fallback model");
+				log.debug("No request body, using fallback model");
 				return;
 			}
 
@@ -147,7 +148,7 @@ export class VertexAIProvider extends BaseAnthropicCompatibleProvider {
 			const body = JSON.parse(bodyText);
 			const originalModel = body.model || "claude-sonnet-4-5-20250929";
 
-			console.log(
+			log.debug(
 				`[Vertex AI] prepareRequest - extracted model: ${originalModel}`,
 			);
 
@@ -155,14 +156,14 @@ export class VertexAIProvider extends BaseAnthropicCompatibleProvider {
 			let transformedModel = originalModel;
 			if (account?.model_mappings) {
 				transformedModel = getModelName(originalModel, account);
-				console.log(
+				log.debug(
 					`[Vertex AI] prepareRequest - after mapping: ${transformedModel}`,
 				);
 			}
 
 			// Convert to Vertex AI format
 			const vertexModel = convertToVertexAIModel(transformedModel);
-			console.log(`[Vertex AI] prepareRequest - Vertex format: ${vertexModel}`);
+			log.debug(`prepareRequest - Vertex format: ${vertexModel}`);
 
 			// Store models in account for buildUrl to use
 			(
@@ -178,10 +179,7 @@ export class VertexAIProvider extends BaseAnthropicCompatibleProvider {
 				}
 			)._originalModel = originalModel;
 		} catch (error) {
-			console.log(
-				"[Vertex AI] prepareRequest - failed to extract model:",
-				error,
-			);
+			log.error("[Vertex AI] prepareRequest - failed to extract model:", error);
 		}
 	}
 
@@ -205,7 +203,7 @@ export class VertexAIProvider extends BaseAnthropicCompatibleProvider {
 			(account as Account & { _vertexModel?: string })._vertexModel ||
 			"claude-sonnet-4-5@20250929";
 
-		console.log(`[Vertex AI] buildUrl called - using model: ${model}`);
+		log.debug(`buildUrl called - using model: ${model}`);
 
 		// Determine if streaming based on path
 		const isStreaming =
@@ -221,7 +219,7 @@ export class VertexAIProvider extends BaseAnthropicCompatibleProvider {
 		// Build full Vertex AI URL with model in path
 		const fullUrl = `${baseUrl}/v1/projects/${config.projectId}/locations/${config.region}/publishers/anthropic/models/${model}:${specifier}`;
 
-		console.log(`[Vertex AI] Full Vertex AI URL: ${fullUrl}`);
+		log.debug(`Full Vertex AI URL: ${fullUrl}`);
 
 		return fullUrl;
 	}
@@ -240,23 +238,22 @@ export class VertexAIProvider extends BaseAnthropicCompatibleProvider {
 		try {
 			const body = await request.json();
 
-			console.log(
-				`[Vertex AI] transformRequestBody - removing model from body`,
-			);
+			log.debug("transformRequestBody - removing model from body");
+			const { body: reasoningFiltered } = stripCodexReasoningRetention(body);
 
 			// Remove model from body (Vertex AI requires it in URL, not body)
-			delete body.model;
+			delete reasoningFiltered.model;
 
 			// Add Vertex-specific version field (must be in body, not header)
-			body.anthropic_version = "vertex-2023-10-16";
+			reasoningFiltered.anthropic_version = "vertex-2023-10-16";
 
 			return new Request(request.url, {
 				method: request.method,
 				headers: request.headers,
-				body: JSON.stringify(body),
+				body: JSON.stringify(reasoningFiltered),
 			});
 		} catch (error) {
-			console.log("[Vertex AI] Failed to transform request body:", error);
+			log.error("Failed to transform request body:", error);
 			throw error;
 		}
 	}
@@ -272,15 +269,11 @@ export class VertexAIProvider extends BaseAnthropicCompatibleProvider {
 		const originalModel = (account as Account & { _originalModel?: string })
 			?._originalModel;
 
-		console.log(
-			`[Vertex AI] processResponse - originalModel stored: ${originalModel}`,
-		);
+		log.debug(`processResponse - originalModel stored: ${originalModel}`);
 
 		// If no original model stored, return response as-is
 		if (!originalModel) {
-			console.log(
-				"[Vertex AI] No original model stored, returning response as-is",
-			);
+			log.debug("No original model stored, returning response as-is");
 			return super.processResponse(response, account);
 		}
 
@@ -289,25 +282,23 @@ export class VertexAIProvider extends BaseAnthropicCompatibleProvider {
 			const clonedResponse = response.clone();
 			const contentType = response.headers.get("content-type") || "";
 
-			console.log(`[Vertex AI] Response content-type: ${contentType}`);
+			log.debug(`Response content-type: ${contentType}`);
 
 			// Only process JSON responses
 			if (!contentType.includes("application/json")) {
-				console.log(
-					"[Vertex AI] Not JSON response, skipping model restoration",
-				);
+				log.debug("Not JSON response, skipping model restoration");
 				return super.processResponse(response, account);
 			}
 
 			const text = await clonedResponse.text();
 			const data = JSON.parse(text);
 
-			console.log(`[Vertex AI] Response model from Vertex AI: ${data.model}`);
+			log.debug(`Response model from Vertex AI: ${data.model}`);
 
 			// Replace Vertex AI model format with original Anthropic format
 			if (data.model) {
 				data.model = originalModel;
-				console.log(
+				log.debug(
 					`[Vertex AI] Restored original model in response: ${data.model}`,
 				);
 			}
@@ -322,7 +313,7 @@ export class VertexAIProvider extends BaseAnthropicCompatibleProvider {
 			return super.processResponse(newResponse, account);
 		} catch (error) {
 			// If anything fails, return original response
-			console.log(
+			log.error(
 				"[Vertex AI] Failed to restore original model in response:",
 				error,
 			);

@@ -90,6 +90,38 @@ function contextFor(
 }
 
 describe("VertexAIProvider attempt-plan concurrency", () => {
+	test("filters proxy-minted retained reasoning in its transform override", async () => {
+		const provider = new VertexAIProvider();
+		const transformed = await provider.transformRequestBody(
+			new Request("http://proxy.local/v1/messages", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					model: "claude-sonnet-4-5-20250929",
+					messages: [
+						{
+							role: "assistant",
+							content: [
+								{ type: "redacted_thinking", data: "bccfr1.rs_strip.cipher" },
+								{ type: "redacted_thinking", data: "anthropic-genuine" },
+							],
+						},
+					],
+				}),
+			}),
+		);
+
+		expect(await transformed.json()).toEqual({
+			anthropic_version: "vertex-2023-10-16",
+			messages: [
+				{
+					role: "assistant",
+					content: [{ type: "redacted_thinking", data: "anthropic-genuine" }],
+				},
+			],
+		});
+	});
+
 	test("retains isolated model state for interleaved attempts on one account", async () => {
 		const provider = new VertexAIProvider();
 		const sharedAccount = accountFixture();

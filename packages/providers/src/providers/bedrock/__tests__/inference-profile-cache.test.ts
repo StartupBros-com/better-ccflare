@@ -9,6 +9,12 @@ import {
 // Mock AWS SDK
 const mockSend = mock();
 const mockBedrockClient = mock(() => ({ send: mockSend }));
+// Bun's mock wrapper is constructible but has no prototype. Provide the AWS
+// client surface so this process-global module mock remains compatible with
+// tests that replace BedrockClient.prototype.send.
+Object.defineProperty(mockBedrockClient, "prototype", {
+	value: { send: mockSend },
+});
 
 mock.module("@aws-sdk/client-bedrock", () => ({
 	BedrockClient: mockBedrockClient,

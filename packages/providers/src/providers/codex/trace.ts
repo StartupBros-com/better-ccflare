@@ -37,7 +37,7 @@ export const CODEX_TRACE_HMAC_KEY_ENV = "CCFLARE_CODEX_TRACE_HMAC_KEY";
 /** Warn when one response spawns at least this many subagents (0 disables). */
 export const CODEX_FANOUT_WARN_ENV = "CCFLARE_CODEX_FANOUT_WARN";
 
-const TRACE_SCHEMA_VERSION = 14;
+const TRACE_SCHEMA_VERSION = 15;
 const DEFAULT_FANOUT_WARN = 8;
 const MAX_INPUT_ITEM_FINGERPRINTS = 64;
 /**
@@ -93,6 +93,8 @@ export interface CodexResponseSummary {
 	reasoning_output_item_count: number;
 	/** Whether any observed reasoning item carried replayable encrypted content. */
 	reasoning_encrypted_present: boolean;
+	/** Encrypted reasoning items not retained because their id was unrepresentable. */
+	reasoning_unrepresentable_id_skip_count: number;
 	new_tool_call_count: number;
 	/** Newly emitted Task/Agent calls: the recursive fan-out signal. */
 	new_subagent_spawn_count: number;
@@ -116,6 +118,7 @@ export interface CodexResponseSummary {
 export interface CodexReasoningResponseMetrics {
 	outputItemCount: number;
 	encryptedPresent: boolean;
+	unrepresentableIdSkipCount: number;
 }
 
 /**
@@ -203,6 +206,7 @@ interface TraceInputs {
 		| "model_fallback"
 		| "overload_529"
 		| "thinking_retry"
+		| "reasoning_retry"
 		| "cache_control_retry"
 		| "prompt_cache_breakpoint_retry"
 		| "cache_lane_rescue"
@@ -348,6 +352,8 @@ export function summarizeCodexResponse(
 	return {
 		reasoning_output_item_count: reasoning?.outputItemCount ?? 0,
 		reasoning_encrypted_present: reasoning?.encryptedPresent ?? false,
+		reasoning_unrepresentable_id_skip_count:
+			reasoning?.unrepresentableIdSkipCount ?? 0,
 		new_tool_call_count: toolCalls.length,
 		new_subagent_spawn_count: subagentSpawnCount,
 		new_tool_use_by_name: newToolUseByName,
