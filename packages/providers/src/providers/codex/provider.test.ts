@@ -2251,6 +2251,98 @@ describe("CodexProvider.processResponse", () => {
 		expect(events.at(-1)?.type).toBe("message_stop");
 	});
 
+	it("defers reasoning that completes between text deltas of a live block", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_text_interleave", model: "gpt-5.6-sol" },
+			}),
+			...eventLine("response.output_item.added", {
+				item: { type: "message" },
+				output_index: 0,
+			}),
+			...eventLine("response.content_part.added", {
+				part: { type: "output_text" },
+			}),
+			...eventLine("response.output_text.delta", { delta: "he" }),
+			...eventLine("response.output_item.done", {
+				item: {
+					type: "reasoning",
+					id: "rs_between",
+					encrypted_content: "mid",
+				},
+				output_index: 1,
+			}),
+			...eventLine("response.output_text.delta", { delta: "llo" }),
+			...eventLine("response.output_item.done", {
+				item: { type: "message" },
+				output_index: 0,
+			}),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.6-sol",
+					usage: { input_tokens: 1, output_tokens: 1 },
+				},
+			}),
+		]);
+		const transformed = await provider.processResponse(
+			new Response(upstreamBody, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+		const events = (await transformed.text())
+			.split("\n")
+			.filter((line) => line.startsWith("data:"))
+			.map(
+				(line) =>
+					JSON.parse(line.slice("data:".length).trim()) as Record<
+						string,
+						unknown
+					>,
+			);
+
+		// Both text deltas must land at index 0 inside one open block — the
+		// pre-fix behavior closed the block at the reasoning boundary and
+		// orphaned the second delta at an unstarted index.
+		const blockEvents = events
+			.filter((event) =>
+				[
+					"content_block_start",
+					"content_block_delta",
+					"content_block_stop",
+				].includes(event.type as string),
+			)
+			.map((event) => ({
+				type: event.type,
+				index: event.index,
+				blockType:
+					(event.content_block as Record<string, unknown>)?.type ??
+					(event.delta as Record<string, unknown>)?.type,
+			}));
+		expect(blockEvents).toEqual([
+			{ type: "content_block_start", index: 0, blockType: "text" },
+			{ type: "content_block_delta", index: 0, blockType: "text_delta" },
+			{ type: "content_block_delta", index: 0, blockType: "text_delta" },
+			{ type: "content_block_stop", index: 0, blockType: undefined },
+			{
+				type: "content_block_start",
+				index: 1,
+				blockType: "redacted_thinking",
+			},
+			{ type: "content_block_stop", index: 1, blockType: undefined },
+		]);
+		expect(events).toContainEqual({
+			type: "content_block_start",
+			index: 1,
+			content_block: {
+				type: "redacted_thinking",
+				data: "bccfr1.rs_between.mid",
+			},
+		});
+	});
+
 	it("closes open text before emitting retained reasoning atomically", async () => {
 		const provider = new CodexProvider();
 		const upstreamBody = sseBody([

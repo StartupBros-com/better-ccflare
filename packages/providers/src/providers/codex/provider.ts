@@ -3606,21 +3606,16 @@ export class CodexProvider extends BaseProvider {
 						: "";
 					const reasoningData = `${CODEX_REASONING_RETENTION_PREFIX}${reasoningId}.${encryptedReasoning}`;
 
-					if (state.functionCallBlocks.size > 0) {
-						// A function-call block is still streaming: defer emission so
-						// block lifecycles stay strictly sequential on the wire. Flushed
-						// after the last in-flight tool block closes, or at stream end.
+					if (
+						state.functionCallBlocks.size > 0 ||
+						state.hasSentContentBlockStart
+					) {
+						// ANY still-open block (streaming tool call or live text) defers
+						// emission: closing a live text block here would orphan its later
+						// deltas at an index with no content_block_start. Flushed after
+						// the owning output item closes, or at stream end.
 						state.pendingReasoningBlocks.push(reasoningData);
 						break;
-					}
-
-					if (state.hasSentContentBlockStart) {
-						await writeSSE("content_block_stop", {
-							type: "content_block_stop",
-							index: state.contentBlockIndex,
-						});
-						state.contentBlockIndex++;
-						state.hasSentContentBlockStart = false;
 					}
 
 					const reasoningBlockIndex = state.contentBlockIndex;
@@ -3649,6 +3644,28 @@ export class CodexProvider extends BaseProvider {
 					});
 					state.contentBlockIndex++;
 					state.hasSentContentBlockStart = false;
+				}
+				if (
+					state.functionCallBlocks.size === 0 &&
+					state.pendingReasoningBlocks.length > 0
+				) {
+					for (const pendingData of state.pendingReasoningBlocks) {
+						const pendingIndex = state.contentBlockIndex;
+						await writeSSE("content_block_start", {
+							type: "content_block_start",
+							index: pendingIndex,
+							content_block: {
+								type: "redacted_thinking",
+								data: pendingData,
+							},
+						});
+						await writeSSE("content_block_stop", {
+							type: "content_block_stop",
+							index: pendingIndex,
+						});
+						state.contentBlockIndex++;
+					}
+					state.pendingReasoningBlocks = [];
 				}
 				break;
 			}
