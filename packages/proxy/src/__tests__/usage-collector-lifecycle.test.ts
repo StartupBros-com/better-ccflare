@@ -101,6 +101,11 @@ interface TestRequestState {
 	buffer: string;
 	chunks: Uint8Array[];
 	chunksBytes: number;
+	usage: {
+		iterations?: unknown[];
+		fallbackIterationSeen?: boolean;
+		iterationsTruncated?: boolean;
+	};
 }
 
 interface TestableCollector {
@@ -687,7 +692,7 @@ describe("UsageCollector request lifecycle", () => {
 			expect(fallbackLogs.events).toEqual([]);
 		});
 
-		it("caps fallback usage iterations before pricing", async () => {
+		it("detects fallback beyond the retained iteration cap without partial pricing", async () => {
 			useDeterministicModelPricing();
 			const { collector, savedUsages } = harness();
 			const requestId = "stream-capped-fallback-iterations";
@@ -699,11 +704,18 @@ describe("UsageCollector request lifecycle", () => {
 				}
 			};
 			logBus.on("log", onLog);
-			const iterations = Array.from({ length: 65 }, () => ({
-				type: "fallback_message",
-				model: OPUS_MODEL,
-				input_tokens: 1,
-			}));
+			const iterations = [
+				...Array.from({ length: 64 }, () => ({
+					type: "message",
+					model: FABLE_MODEL,
+					input_tokens: 1,
+				})),
+				{
+					type: "fallback_message",
+					model: OPUS_MODEL,
+					input_tokens: 1,
+				},
+			];
 
 			try {
 				collector.handleStart(makeStartMessage(requestId));
@@ -722,12 +734,12 @@ describe("UsageCollector request lifecycle", () => {
 
 			expect(savedUsages.get(requestId)).toMatchObject({
 				model: OPUS_MODEL,
-				costUsd: 128,
+				costUsd: 130,
 			});
-			expect(estimateCostUSD).toHaveBeenCalledTimes(64);
+			expect(estimateCostUSD).toHaveBeenCalledTimes(1);
 			expect(estimateCostUSD).toHaveBeenCalledWith(OPUS_MODEL, {
-				inputTokens: 1,
-				outputTokens: undefined,
+				inputTokens: 65,
+				outputTokens: 0,
 				cacheReadInputTokens: undefined,
 				cacheCreationInputTokens: undefined,
 			});
@@ -743,11 +755,80 @@ describe("UsageCollector request lifecycle", () => {
 			expect(fallbackLogs.events).toHaveLength(1);
 			expect(fallbackLogs.events[0]?.data).toEqual({
 				requestId,
-				from: OPUS_MODEL,
+				from: FABLE_MODEL,
 				to: OPUS_MODEL,
 				iterationCount: 64,
-				priced: "iterations",
+				priced: "top_level",
+				iterationsTruncated: true,
 			});
+		});
+
+		it("lets a later empty iteration snapshot clear an earlier overflowing fallback signal", async () => {
+			useDeterministicModelPricing();
+			const { collector, savedUsages } = harness();
+			const requestId = "stream-replaced-overflowing-fallback-iterations";
+			const fallbackLogs = captureFallbackUsageLogs();
+			const iterations = [
+				...Array.from({ length: 64 }, () => ({
+					type: "message",
+					model: FABLE_MODEL,
+					input_tokens: 1,
+				})),
+				{
+					type: "fallback_message",
+					model: OPUS_MODEL,
+					input_tokens: 1,
+				},
+			];
+
+			try {
+				collector.handleStart(makeStartMessage(requestId));
+				collector.handleChunk(
+					requestId,
+					new TextEncoder().encode(
+						`event: message_start\ndata: ${JSON.stringify({
+							type: "message_start",
+							message: {
+								model: FABLE_MODEL,
+								usage: {
+									input_tokens: 65,
+									output_tokens: 0,
+									iterations,
+								},
+							},
+						})}\n\n`,
+					),
+				);
+				collector.handleChunk(
+					requestId,
+					new TextEncoder().encode(
+						'event: message_delta\ndata: {"type":"message_delta","usage":{"input_tokens":2,"output_tokens":3,"iterations":[]}}\n\n',
+					),
+				);
+
+				const state = testable(collector).requests.get(requestId);
+				expect(state?.usage.iterations).toEqual([]);
+				expect(state?.usage.fallbackIterationSeen).toBe(false);
+				expect(state?.usage.iterationsTruncated).toBe(false);
+
+				await collector.handleEnd({ type: "end", requestId, success: true });
+				await collector.drain();
+			} finally {
+				fallbackLogs.stop();
+			}
+
+			expect(savedUsages.get(requestId)).toMatchObject({
+				model: FABLE_MODEL,
+				costUsd: 32,
+			});
+			expect(estimateCostUSD).toHaveBeenCalledTimes(1);
+			expect(estimateCostUSD).toHaveBeenCalledWith(FABLE_MODEL, {
+				inputTokens: 2,
+				outputTokens: 3,
+				cacheReadInputTokens: undefined,
+				cacheCreationInputTokens: undefined,
+			});
+			expect(fallbackLogs.events).toEqual([]);
 		});
 
 		it("keeps split pricing when a fallback stream has a non-empty iteration snapshot", async () => {

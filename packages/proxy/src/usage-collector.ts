@@ -60,6 +60,8 @@ interface RequestState {
 		costUsd?: number;
 		tokensPerSecond?: number;
 		iterations?: UsageIteration[];
+		fallbackIterationSeen?: boolean;
+		iterationsTruncated?: boolean;
 	};
 	lastActivity: number;
 	createdAt: number; // Capacity eviction ordering
@@ -191,7 +193,8 @@ function captureUsageIterations(usage: unknown, state: RequestState): void {
 	}
 
 	const iterations: UsageIteration[] = [];
-	for (const rawIteration of rawIterations.slice(0, MAX_USAGE_ITERATIONS)) {
+	let fallbackIterationSeen = false;
+	for (const rawIteration of rawIterations) {
 		if (
 			!rawIteration ||
 			typeof rawIteration !== "object" ||
@@ -200,6 +203,8 @@ function captureUsageIterations(usage: unknown, state: RequestState): void {
 			continue;
 		}
 		const raw = rawIteration as Record<string, unknown>;
+		if (raw.type === "fallback_message") fallbackIterationSeen = true;
+		if (iterations.length >= MAX_USAGE_ITERATIONS) continue;
 		const model = normalizeNonEmptyString(raw.model);
 
 		iterations.push({
@@ -217,6 +222,8 @@ function captureUsageIterations(usage: unknown, state: RequestState): void {
 	// Each provider payload is a complete snapshot. A later array supersedes
 	// the earlier one, including when every later entry is invalid.
 	state.usage.iterations = iterations;
+	state.usage.fallbackIterationSeen = fallbackIterationSeen;
+	state.usage.iterationsTruncated = rawIterations.length > MAX_USAGE_ITERATIONS;
 }
 
 // Extract usage data from non-stream JSON response bodies
@@ -308,6 +315,7 @@ function extractUsageFromData(
 		if (isMessageStart) {
 			if (parsed.message?.usage) {
 				const usage = parsed.message.usage;
+				captureUsageIterations(usage, state);
 				if (usage.input_tokens !== undefined) {
 					state.usage.inputTokens = usage.input_tokens;
 					state.usage.inputTokensPresent = true;
@@ -449,6 +457,8 @@ function freeRequestState(state: RequestState): void {
 	state.chunksBytes = 0;
 	state.buffer = "";
 	state.usage.iterations = undefined;
+	state.usage.fallbackIterationSeen = undefined;
+	state.usage.iterationsTruncated = undefined;
 	// Release request body and headers held in startMessage.
 	// Without this, orphaned requests retain full request bodies until the
 	// inactivity cleanup configured by CF_STREAM_TIMEOUT_MS runs. See #67.
@@ -760,8 +770,11 @@ export class UsageCollector {
 		const iterations = state.usage.iterations ?? [];
 		const hasFallbackSignal =
 			state.fallbackBlockSeen === true ||
-			iterations.some((iteration) => iteration.type === "fallback_message");
-		const hasFallbackBillingSplit = hasFallbackSignal && iterations.length > 0;
+			state.usage.fallbackIterationSeen === true;
+		const hasFallbackBillingSplit =
+			hasFallbackSignal &&
+			iterations.length > 0 &&
+			state.usage.iterationsTruncated !== true;
 		if (state.usage.model) {
 			const model = state.usage.model;
 			// Use provider's authoritative count if available, fallback to computed
@@ -917,6 +930,9 @@ export class UsageCollector {
 				to: state.usage.model,
 				iterationCount,
 				priced: hasFallbackBillingSplit ? "iterations" : "top_level",
+				...(state.usage.iterationsTruncated === true
+					? { iterationsTruncated: true }
+					: {}),
 			});
 		}
 
