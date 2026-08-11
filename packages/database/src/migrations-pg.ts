@@ -46,7 +46,68 @@ async function _tableExists(
 
 async function ensureCacheFlightRecorderTablesPg(
 	adapter: BunSqlAdapter,
+	options: {
+		installTurnObservationIndexes?: boolean;
+		installLastVerifiedAtIndexes?: boolean;
+	} = {},
 ): Promise<void> {
+	await adapter.unsafe(`
+		CREATE TABLE IF NOT EXISTS cache_flight_recorder_service_epochs (
+			id TEXT PRIMARY KEY,
+			seal_contract_version INTEGER NOT NULL,
+			deployment_revision TEXT,
+			service_instance_id TEXT,
+			process_started_at TEXT,
+			native_cache_state TEXT,
+			recorder_state TEXT,
+			keepalive_global_ttl_minutes INTEGER,
+			keepalive_xai_ttl_minutes INTEGER,
+			keepalive_effective_xai_enabled INTEGER,
+			keepalive_effective_xai_ttl_minutes INTEGER,
+			occurrence_id TEXT,
+			completeness TEXT NOT NULL,
+			unavailable_dimensions TEXT NOT NULL DEFAULT '[]',
+			created_at BIGINT NOT NULL,
+			last_verified_at BIGINT
+		)
+	`);
+	await adapter.unsafe(`
+		CREATE TABLE IF NOT EXISTS cache_flight_recorder_partitions (
+			id TEXT PRIMARY KEY,
+			service_epoch_id TEXT NOT NULL,
+			serving_account_scope TEXT,
+			route_model_epoch TEXT,
+			completeness TEXT NOT NULL,
+			unavailable_dimensions TEXT NOT NULL DEFAULT '[]',
+			seal_completeness TEXT NOT NULL,
+			seal_unavailable_dimensions TEXT NOT NULL DEFAULT '[]',
+			created_at BIGINT NOT NULL,
+			last_verified_at BIGINT,
+			FOREIGN KEY (service_epoch_id)
+				REFERENCES cache_flight_recorder_service_epochs(id)
+				ON DELETE CASCADE
+		)
+	`);
+	await adapter.unsafe(
+		`CREATE INDEX IF NOT EXISTS idx_cache_flight_recorder_partitions_epoch
+		 ON cache_flight_recorder_partitions(service_epoch_id)`,
+	);
+	// Deferred the same way installTurnObservationIndexes defers the turn
+	// indexes below: the first runMigrationsPg() call happens before the
+	// columnsToAdd loop that ALTERs last_verified_at onto legacy tables, so
+	// creating these indexes unconditionally here would fail against a
+	// pre-existing table that doesn't have the column yet. The second call
+	// (after columnsToAdd has run) installs them.
+	if (options.installLastVerifiedAtIndexes !== false) {
+		await adapter.unsafe(
+			`CREATE INDEX IF NOT EXISTS idx_cache_flight_recorder_service_epochs_last_verified_at
+			 ON cache_flight_recorder_service_epochs(last_verified_at)`,
+		);
+		await adapter.unsafe(
+			`CREATE INDEX IF NOT EXISTS idx_cache_flight_recorder_partitions_last_verified_at
+			 ON cache_flight_recorder_partitions(last_verified_at)`,
+		);
+	}
 	await adapter.unsafe(`
 		CREATE TABLE IF NOT EXISTS cache_flight_recorder_conversations (
 			recorder_conversation_id TEXT PRIMARY KEY,
@@ -84,12 +145,27 @@ async function ensureCacheFlightRecorderTablesPg(
 			completeness TEXT NOT NULL,
 			unavailable_dimensions TEXT NOT NULL DEFAULT '[]',
 			gap_before INTEGER NOT NULL DEFAULT 0,
+			observation_partition_id TEXT,
 			PRIMARY KEY (recorder_conversation_id, sequence),
 			FOREIGN KEY (recorder_conversation_id)
 				REFERENCES cache_flight_recorder_conversations(recorder_conversation_id)
-				ON DELETE CASCADE
+				ON DELETE CASCADE,
+			FOREIGN KEY (observation_partition_id)
+				REFERENCES cache_flight_recorder_partitions(id)
+			ON DELETE SET NULL
 		)
 	`);
+	if (options.installTurnObservationIndexes === false) {
+		return;
+	}
+	await adapter.unsafe(
+		`CREATE INDEX IF NOT EXISTS idx_cache_flight_recorder_turns_partition
+		 ON cache_flight_recorder_turns(observation_partition_id)`,
+	);
+	await adapter.unsafe(
+		`CREATE INDEX IF NOT EXISTS idx_cache_flight_recorder_turns_cleanup
+		 ON cache_flight_recorder_turns(timestamp, observation_partition_id)`,
+	);
 }
 
 async function ensureDeviceSetupJobsSchemaPg(
@@ -1044,6 +1120,17 @@ export async function collapseAccountDuplicatesPreservingStatePg(
  * Run PostgreSQL-specific migrations
  */
 export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
+	// The turn observation column below carries a foreign key to the new
+	// registry tables, so legacy upgrades must create the recorder tables before
+	// the additive column loop attempts the ALTER. The turn observation indexes
+	// are deferred until after that loop because legacy turn tables may exist
+	// without observation_partition_id. Same reasoning for last_verified_at:
+	// legacy epoch/partition tables may not have that column yet either.
+	await ensureCacheFlightRecorderTablesPg(adapter, {
+		installTurnObservationIndexes: false,
+		installLastVerifiedAtIndexes: false,
+	});
+
 	// Add columns that might be missing from older schema versions
 	const columnsToAdd: ColumnToAdd[] = [
 		{
@@ -1218,6 +1305,29 @@ export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 			definition:
 				"ALTER TABLE oauth_sessions ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
 		},
+		{
+			table: "cache_flight_recorder_turns",
+			column: "observation_partition_id",
+			definition:
+				"ALTER TABLE cache_flight_recorder_turns ADD COLUMN observation_partition_id TEXT REFERENCES cache_flight_recorder_partitions(id) ON DELETE SET NULL",
+		},
+		{
+			// Nullable, not NOT NULL: PostgreSQL can't add a NOT NULL column
+			// to a non-empty table without a DEFAULT, and a DEFAULT would
+			// falsely backdate every legacy row to "verified now". The
+			// backfill below sets every existing row's last_verified_at
+			// explicitly instead, matching the SQLite migration.
+			table: "cache_flight_recorder_service_epochs",
+			column: "last_verified_at",
+			definition:
+				"ALTER TABLE cache_flight_recorder_service_epochs ADD COLUMN last_verified_at BIGINT",
+		},
+		{
+			table: "cache_flight_recorder_partitions",
+			column: "last_verified_at",
+			definition:
+				"ALTER TABLE cache_flight_recorder_partitions ADD COLUMN last_verified_at BIGINT",
+		},
 	];
 
 	for (const col of columnsToAdd) {
@@ -1226,6 +1336,19 @@ export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 			await addColumnTolerant(adapter, col);
 		}
 	}
+	// Backfill choice: created_at, not "now" — see the SQLite mirror in
+	// migrations.ts (runMigrations()) for the full rationale. Conditioned on
+	// IS NULL so this is a no-op once every row has been backfilled once.
+	await adapter.unsafe(
+		`UPDATE cache_flight_recorder_service_epochs
+		 SET last_verified_at = created_at
+		 WHERE last_verified_at IS NULL`,
+	);
+	await adapter.unsafe(
+		`UPDATE cache_flight_recorder_partitions
+		 SET last_verified_at = created_at
+		 WHERE last_verified_at IS NULL`,
+	);
 	await ensureDeviceSetupJobsSchemaPg(adapter);
 	await ensureServerToolReplayIssuanceSchemaPg(adapter);
 
@@ -1542,7 +1665,8 @@ export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 		`CREATE INDEX IF NOT EXISTS idx_usage_snapshots_ts ON usage_snapshots(timestamp)`,
 	);
 
-	// New recorder tables must also be created on upgrades, not only fresh installs.
+	// Install the full recorder schema after additive columns are present,
+	// including indexes that reference cache_flight_recorder_turns.
 	await ensureCacheFlightRecorderTablesPg(adapter);
 
 	// Rename oauth_sessions.mode 'max' → 'claude-oauth'

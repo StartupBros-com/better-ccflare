@@ -8,6 +8,7 @@ import type { LoadBalancingStrategy } from "@better-ccflare/types";
 import type { AnthropicDegradedModeCoordinator } from "../anthropic-degraded-mode";
 import type { DegradedModeObservability } from "../anthropic-degraded-observability";
 import type { CacheAffinityOrderer } from "../cache-affinity-orderer";
+import type { CohortSealService } from "../cache-flight-cohort-seal";
 import type { DegradedOwnerOverlay } from "../degraded-owner-overlay";
 import type { ModelRouteSessionRegistry } from "../model-route-profiles";
 import type { ServerToolReplayRuntimeState } from "../server-tool-replay-runtime";
@@ -16,6 +17,8 @@ import type { GuardCorrelationVerifier } from "./guard-correlation-auth";
 export interface ProxyContext {
 	strategy: LoadBalancingStrategy;
 	cacheAffinityOrderer?: CacheAffinityOrderer;
+	/** Process-local producer for immutable cache-flight cohort receipts. */
+	cacheFlightCohortSeal?: CohortSealService;
 	/** One restart-scoped coordinator shared by every request in this server. */
 	anthropicDegradedMode: AnthropicDegradedModeCoordinator;
 	/** Process-local aggregate counters plus default-off detailed diagnostics. */

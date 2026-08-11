@@ -53,6 +53,22 @@ export {
 export { AutoRefreshScheduler } from "./auto-refresh-scheduler";
 export { CacheAffinityOrderer } from "./cache-affinity-orderer";
 export { handleCacheDiagnosisRequest } from "./cache-diagnosis";
+export {
+	COHORT_SEAL_CONTRACT_VERSION,
+	COHORT_SEAL_PROFILE_CONFIG_KEYS,
+	type CohortSealCaptureInput,
+	type CohortSealFinalServingAccount,
+	type CohortSealProfileConfigKey,
+	CohortSealService,
+	type CohortSealServiceOptions,
+	type CohortSealServiceProfileV1,
+} from "./cache-flight-cohort-seal";
+export {
+	type CacheKeepalivePolicyConfig,
+	readEffectiveXaiKeepalivePolicy,
+	resolveEffectiveXaiKeepalivePolicy,
+	resolveKeepaliveTtlMinutes,
+} from "./cache-keepalive-policy";
 export { CacheKeepaliveScheduler } from "./cache-keepalive-scheduler";
 export {
 	type CachePacingFamilyStats,
