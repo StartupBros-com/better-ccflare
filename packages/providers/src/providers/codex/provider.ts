@@ -682,6 +682,10 @@ interface StreamState {
 	traceNewToolCalls: ToolCallSummary[];
 	traceReasoningOutputItemCount: number;
 	traceReasoningEncryptedPresent: boolean;
+	// Wrapped redacted_thinking payloads whose emission is deferred while a
+	// function-call block is still streaming: emitting mid-lifecycle would
+	// interleave block lifecycles on the wire (pro-gate P1, PR #139).
+	pendingReasoningBlocks: string[];
 	traceRequestId: string;
 	traceAttemptId?: string;
 	traceTurnStateHeaderPresent: boolean;
@@ -2763,6 +2767,7 @@ export class CodexProvider extends BaseProvider {
 			traceNewToolCalls: [],
 			traceReasoningOutputItemCount: 0,
 			traceReasoningEncryptedPresent: false,
+			pendingReasoningBlocks: [],
 			traceRequestId: requestId,
 			traceAttemptId: attemptId,
 			traceTurnStateHeaderPresent: response.headers.has("x-codex-turn-state"),
@@ -3558,6 +3563,29 @@ export class CodexProvider extends BaseProvider {
 							state.contentBlockIndex++;
 							state.hasSentContentBlockStart = false;
 						}
+						if (
+							state.functionCallBlocks.size === 0 &&
+							!state.hasSentContentBlockStart &&
+							state.pendingReasoningBlocks.length > 0
+						) {
+							for (const pendingData of state.pendingReasoningBlocks) {
+								const pendingIndex = state.contentBlockIndex;
+								await writeSSE("content_block_start", {
+									type: "content_block_start",
+									index: pendingIndex,
+									content_block: {
+										type: "redacted_thinking",
+										data: pendingData,
+									},
+								});
+								await writeSSE("content_block_stop", {
+									type: "content_block_stop",
+									index: pendingIndex,
+								});
+								state.contentBlockIndex++;
+							}
+							state.pendingReasoningBlocks = [];
+						}
 					}
 					break;
 				}
@@ -3569,24 +3597,6 @@ export class CodexProvider extends BaseProvider {
 					encryptedReasoning.length > 0
 				) {
 					await ensureMessageStart();
-					if (state.hasSentContentBlockStart) {
-						// Only close the current block if it's not a still-open function-call
-						// block awaiting output_item.done — closing it here would produce a
-						// premature content_block_stop that output_item.done will duplicate.
-						const isOpenFunctionCallBlock = [
-							...state.functionCallBlocks.values(),
-						].some((b) => b.contentBlockIndex === state.contentBlockIndex);
-						if (!isOpenFunctionCallBlock) {
-							await writeSSE("content_block_stop", {
-								type: "content_block_stop",
-								index: state.contentBlockIndex,
-							});
-						}
-						state.contentBlockIndex++;
-						state.hasSentContentBlockStart = false;
-					}
-
-					const reasoningBlockIndex = state.contentBlockIndex;
 					// The wrapper is dot-delimited, and the replay parser accepts
 					// [A-Za-z0-9_-] ids only — an id outside that set must degrade to ""
 					// at emit time or our own block would fail its own parse on replay.
@@ -3594,12 +3604,32 @@ export class CodexProvider extends BaseProvider {
 					const reasoningId = /^[A-Za-z0-9_-]*$/.test(rawReasoningId)
 						? rawReasoningId
 						: "";
+					const reasoningData = `${CODEX_REASONING_RETENTION_PREFIX}${reasoningId}.${encryptedReasoning}`;
+
+					if (state.functionCallBlocks.size > 0) {
+						// A function-call block is still streaming: defer emission so
+						// block lifecycles stay strictly sequential on the wire. Flushed
+						// after the last in-flight tool block closes, or at stream end.
+						state.pendingReasoningBlocks.push(reasoningData);
+						break;
+					}
+
+					if (state.hasSentContentBlockStart) {
+						await writeSSE("content_block_stop", {
+							type: "content_block_stop",
+							index: state.contentBlockIndex,
+						});
+						state.contentBlockIndex++;
+						state.hasSentContentBlockStart = false;
+					}
+
+					const reasoningBlockIndex = state.contentBlockIndex;
 					await writeSSE("content_block_start", {
 						type: "content_block_start",
 						index: reasoningBlockIndex,
 						content_block: {
 							type: "redacted_thinking",
-							data: `${CODEX_REASONING_RETENTION_PREFIX}${reasoningId}.${encryptedReasoning}`,
+							data: reasoningData,
 						},
 					});
 					state.hasSentContentBlockStart = true;
@@ -3739,7 +3769,27 @@ export class CodexProvider extends BaseProvider {
 						index: state.contentBlockIndex,
 					});
 					state.hasSentContentBlockStart = false;
+					state.contentBlockIndex++;
 				}
+				// Flush reasoning deferred behind a tool block whose done never
+				// arrived (truncated stream): retention must not lose the payload.
+				for (const pendingData of state.pendingReasoningBlocks) {
+					const pendingIndex = state.contentBlockIndex;
+					await writeSSE("content_block_start", {
+						type: "content_block_start",
+						index: pendingIndex,
+						content_block: {
+							type: "redacted_thinking",
+							data: pendingData,
+						},
+					});
+					await writeSSE("content_block_stop", {
+						type: "content_block_stop",
+						index: pendingIndex,
+					});
+					state.contentBlockIndex++;
+				}
+				state.pendingReasoningBlocks = [];
 
 				const incompleteDetails = resp?.incomplete_details as
 					| { reason?: string }

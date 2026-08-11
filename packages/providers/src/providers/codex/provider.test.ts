@@ -1993,32 +1993,34 @@ describe("CodexProvider.processResponse", () => {
 					>,
 			);
 
-		// Exactly one content_block_stop per index — no duplicate stop for the
-		// tool_use block the reasoning item interleaved with.
-		const stopsByIndex = new Map<number, number>();
-		for (const event of events) {
-			if (event.type === "content_block_stop") {
-				const index = event.index as number;
-				stopsByIndex.set(index, (stopsByIndex.get(index) ?? 0) + 1);
-			}
-		}
-		for (const [index, count] of stopsByIndex) {
-			expect({ index, count }).toEqual({ index, count: 1 });
-		}
-
-		// The tool_use block's input_json_delta must precede its own stop.
-		const toolDeltaAt = events.findIndex(
-			(event) =>
-				event.type === "content_block_delta" &&
-				(event.delta as Record<string, unknown>)?.type === "input_json_delta",
-		);
-		const toolStopAt = events.findIndex(
-			(event) => event.type === "content_block_stop" && event.index === 0,
-		);
-		expect(toolDeltaAt).toBeGreaterThan(-1);
-		expect(toolStopAt).toBeGreaterThan(toolDeltaAt);
-
-		// Reasoning landed atomically at its own index.
+		// Block lifecycles must be strictly sequential on the wire: the deferred
+		// reasoning block emits only after the in-flight tool block fully closes.
+		const blockEvents = events
+			.filter((event) =>
+				[
+					"content_block_start",
+					"content_block_delta",
+					"content_block_stop",
+				].includes(event.type as string),
+			)
+			.map((event) => ({
+				type: event.type,
+				index: event.index,
+				blockType:
+					(event.content_block as Record<string, unknown>)?.type ??
+					(event.delta as Record<string, unknown>)?.type,
+			}));
+		expect(blockEvents).toEqual([
+			{ type: "content_block_start", index: 0, blockType: "tool_use" },
+			{ type: "content_block_delta", index: 0, blockType: "input_json_delta" },
+			{ type: "content_block_stop", index: 0, blockType: undefined },
+			{
+				type: "content_block_start",
+				index: 1,
+				blockType: "redacted_thinking",
+			},
+			{ type: "content_block_stop", index: 1, blockType: undefined },
+		]);
 		expect(events).toContainEqual({
 			type: "content_block_start",
 			index: 1,
@@ -2027,6 +2029,75 @@ describe("CodexProvider.processResponse", () => {
 				data: "bccfr1.rs_mid.midstream",
 			},
 		});
+	});
+
+	it("flushes deferred reasoning at stream end when the tool block never closes", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_truncated", model: "gpt-5.6-sol" },
+			}),
+			...eventLine("response.output_item.added", {
+				item: { type: "function_call", call_id: "call_1", name: "Read" },
+				output_index: 0,
+			}),
+			...eventLine("response.output_item.done", {
+				item: {
+					type: "reasoning",
+					id: "rs_trunc",
+					encrypted_content: "kept",
+				},
+				output_index: 1,
+			}),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.6-sol",
+					usage: { input_tokens: 1, output_tokens: 1 },
+				},
+			}),
+		]);
+		const transformed = await provider.processResponse(
+			new Response(upstreamBody, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+
+		const transformedBody = await transformed.text();
+		const events = transformedBody
+			.split("\n")
+			.filter((line) => line.startsWith("data:"))
+			.map(
+				(line) =>
+					JSON.parse(line.slice("data:".length).trim()) as Record<
+						string,
+						unknown
+					>,
+			);
+
+		// The truncated tool block is closed by the terminal path, then the
+		// deferred reasoning flushes at the next index — never lost, never
+		// interleaved.
+		expect(events).toContainEqual({
+			type: "content_block_start",
+			index: 1,
+			content_block: {
+				type: "redacted_thinking",
+				data: "bccfr1.rs_trunc.kept",
+			},
+		});
+		const stopsByIndex = events
+			.filter((event) => event.type === "content_block_stop")
+			.map((event) => event.index);
+		expect(stopsByIndex).toEqual([0, 1]);
+		const messageStopAt = events.findIndex(
+			(event) => event.type === "message_stop",
+		);
+		const reasoningStopAt = events.findIndex(
+			(event) => event.type === "content_block_stop" && event.index === 1,
+		);
+		expect(messageStopAt).toBeGreaterThan(reasoningStopAt);
 	});
 
 	it("keeps emit and replay id charsets symmetric", async () => {
