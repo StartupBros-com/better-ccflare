@@ -416,6 +416,12 @@ describe("UsageCollector request lifecycle", () => {
 				iterationCount: 2,
 				priced: "top_level",
 				iterationsStale: true,
+				// Both retained iterations are pre-output declines (output_tokens:
+				// 0), so the aggregate built alongside the stale snapshot is
+				// empty, not usable-and-nonempty — top-level pricing applies, and
+				// billingIncomplete marks the row as potentially under-billed
+				// rather than silently dropping the advisor-spend question.
+				billingIncomplete: true,
 			});
 		});
 
@@ -917,24 +923,24 @@ describe("UsageCollector request lifecycle", () => {
 				fallbackLogs.stop();
 			}
 
+			// Every one of the 65 raw entries lacks output_tokens (all
+			// pre-output declines), so none is billable: the aggregate built
+			// alongside this truncated snapshot is valid but empty, and prices
+			// to $0 — not the old top-level fallback of $130, which would have
+			// billed 65 FABLE-counted input tokens at OPUS rates for work that
+			// was never actually produced.
 			expect(savedUsages.get(requestId)).toMatchObject({
 				model: OPUS_MODEL,
-				costUsd: 130,
+				costUsd: 0,
 			});
-			expect(estimateCostUSD).toHaveBeenCalledTimes(1);
-			expect(estimateCostUSD).toHaveBeenCalledWith(OPUS_MODEL, {
-				inputTokens: 65,
-				outputTokens: 0,
-				cacheReadInputTokens: undefined,
-				cacheCreationInputTokens: undefined,
-			});
+			expect(estimateCostUSD).not.toHaveBeenCalled();
 			expect(fallbackLogs.events).toHaveLength(1);
 			expect(fallbackLogs.events[0]?.data).toEqual({
 				requestId,
 				from: FABLE_MODEL,
 				to: OPUS_MODEL,
 				iterationCount: 64,
-				priced: "top_level",
+				priced: "aggregate",
 				iterationsTruncated: true,
 			});
 		});
@@ -1328,17 +1334,14 @@ describe("UsageCollector request lifecycle", () => {
 				fallbackLogs.stop();
 			}
 
+			// As in the message_start variant of this scenario: all 65 raw
+			// entries lack output_tokens, so the aggregate is valid but empty
+			// and prices to $0, not the stale top-level fallback of $130.
 			expect(savedUsages.get(requestId)).toMatchObject({
 				model: OPUS_MODEL,
-				costUsd: 130,
+				costUsd: 0,
 			});
-			expect(estimateCostUSD).toHaveBeenCalledTimes(1);
-			expect(estimateCostUSD).toHaveBeenCalledWith(OPUS_MODEL, {
-				inputTokens: 65,
-				outputTokens: 0,
-				cacheReadInputTokens: undefined,
-				cacheCreationInputTokens: undefined,
-			});
+			expect(estimateCostUSD).not.toHaveBeenCalled();
 			expect(iterationWarnings).toHaveLength(1);
 			expect(iterationWarnings[0]).toMatchObject({
 				level: "WARN",
@@ -1354,8 +1357,244 @@ describe("UsageCollector request lifecycle", () => {
 				from: FABLE_MODEL,
 				to: OPUS_MODEL,
 				iterationCount: 64,
+				priced: "aggregate",
+				iterationsTruncated: true,
+			});
+		});
+
+		it("prices a truncated fallback snapshot from the aggregate, capturing dropped advisor spend", async () => {
+			useDeterministicModelPricing();
+			const { collector, savedUsages } = harness();
+			const requestId = "stream-truncated-aggregate-advisor-billing";
+			const fallbackLogs = captureFallbackUsageLogs();
+			const iterations = [
+				{
+					type: "message",
+					model: FABLE_MODEL,
+					input_tokens: 5,
+					output_tokens: 7,
+				},
+				{
+					type: "advisor_message",
+					model: HAIKU_MODEL,
+					input_tokens: 11,
+					output_tokens: 13,
+				},
+				{
+					type: "advisor_message",
+					model: HAIKU_MODEL,
+					input_tokens: 17,
+					output_tokens: 19,
+				},
+				{
+					type: "fallback_message",
+					model: OPUS_MODEL,
+					input_tokens: 23,
+					output_tokens: 29,
+				},
+				...Array.from({ length: 61 }, () => ({
+					type: "message",
+					model: FABLE_MODEL,
+					input_tokens: 1,
+				})),
+			];
+
+			try {
+				collector.handleStart(makeStartMessage(requestId));
+				collector.handleChunk(
+					requestId,
+					new TextEncoder().encode(
+						`event: message_start\ndata: {"type":"message_start","message":{"model":"${FABLE_MODEL}","usage":{"input_tokens":5,"output_tokens":0}}}\n\nevent: response.completed\ndata: ${JSON.stringify(
+							{ usage: { input_tokens: 5, output_tokens: 7, iterations } },
+						)}\n\n`,
+					),
+				);
+				await collector.handleEnd({ type: "end", requestId, success: true });
+				await collector.drain();
+			} finally {
+				fallbackLogs.stop();
+			}
+
+			// Top-level totals only reflect the executor's own tokens (5 in / 7
+			// out); the two advisor_message entries at HAIKU_MODEL and the
+			// fallback_message at OPUS_MODEL would be silently dropped if this
+			// truncated snapshot fell back to top-level pricing.
+			expect(savedUsages.get(requestId)).toMatchObject({
+				model: OPUS_MODEL,
+				costUsd: 1_745,
+			});
+			expect(estimateCostUSD).toHaveBeenCalledTimes(3);
+			expect(estimateCostUSD).toHaveBeenNthCalledWith(1, FABLE_MODEL, {
+				inputTokens: 5,
+				outputTokens: 7,
+				cacheReadInputTokens: 0,
+				cacheCreationInputTokens: 0,
+			});
+			expect(estimateCostUSD).toHaveBeenNthCalledWith(2, HAIKU_MODEL, {
+				inputTokens: 28,
+				outputTokens: 32,
+				cacheReadInputTokens: 0,
+				cacheCreationInputTokens: 0,
+			});
+			expect(estimateCostUSD).toHaveBeenNthCalledWith(3, OPUS_MODEL, {
+				inputTokens: 23,
+				outputTokens: 29,
+				cacheReadInputTokens: 0,
+				cacheCreationInputTokens: 0,
+			});
+			expect(fallbackLogs.events).toHaveLength(1);
+			expect(fallbackLogs.events[0]?.data).toEqual({
+				requestId,
+				from: FABLE_MODEL,
+				to: OPUS_MODEL,
+				iterationCount: 64,
+				priced: "aggregate",
+				iterationsTruncated: true,
+			});
+		});
+
+		it("excludes zero-output entries from the aggregate while summing billable ones", async () => {
+			useDeterministicModelPricing();
+			const { collector, savedUsages } = harness();
+			const requestId = "stream-truncated-aggregate-billable-predicate";
+			const fallbackLogs = captureFallbackUsageLogs();
+			const iterations = [
+				{
+					type: "fallback_message",
+					model: OPUS_MODEL,
+					input_tokens: 10,
+					output_tokens: 20,
+				},
+				{
+					type: "advisor_message",
+					model: HAIKU_MODEL,
+					input_tokens: 5,
+					output_tokens: 0,
+				},
+				{
+					type: "advisor_message",
+					model: HAIKU_MODEL,
+					input_tokens: 8,
+					output_tokens: 6,
+				},
+				...Array.from({ length: 62 }, () => ({
+					type: "message",
+					model: FABLE_MODEL,
+					input_tokens: 1,
+				})),
+			];
+
+			try {
+				collector.handleStart(makeStartMessage(requestId));
+				collector.handleChunk(
+					requestId,
+					new TextEncoder().encode(
+						`event: message_start\ndata: {"type":"message_start","message":{"model":"${FABLE_MODEL}","usage":{"input_tokens":2,"output_tokens":0}}}\n\nevent: response.completed\ndata: ${JSON.stringify(
+							{ usage: { input_tokens: 2, output_tokens: 0, iterations } },
+						)}\n\n`,
+					),
+				);
+				await collector.handleEnd({ type: "end", requestId, success: true });
+				await collector.drain();
+			} finally {
+				fallbackLogs.stop();
+			}
+
+			// The declined advisor_message entry (output_tokens: 0) must never
+			// reach the aggregate sum — only the billable HAIKU entry does.
+			expect(savedUsages.get(requestId)).toMatchObject({
+				model: OPUS_MODEL,
+				costUsd: 624,
+			});
+			expect(estimateCostUSD).toHaveBeenCalledTimes(2);
+			expect(estimateCostUSD).toHaveBeenNthCalledWith(1, OPUS_MODEL, {
+				inputTokens: 10,
+				outputTokens: 20,
+				cacheReadInputTokens: 0,
+				cacheCreationInputTokens: 0,
+			});
+			expect(estimateCostUSD).toHaveBeenNthCalledWith(2, HAIKU_MODEL, {
+				inputTokens: 8,
+				outputTokens: 6,
+				cacheReadInputTokens: 0,
+				cacheCreationInputTokens: 0,
+			});
+			expect(fallbackLogs.events).toHaveLength(1);
+			expect(fallbackLogs.events[0]?.data).toEqual({
+				requestId,
+				from: FABLE_MODEL,
+				to: OPUS_MODEL,
+				iterationCount: 64,
+				priced: "aggregate",
+				iterationsTruncated: true,
+			});
+		});
+
+		it("marks the aggregate unusable past the distinct-model cap and falls back to top-level pricing", async () => {
+			useDeterministicModelPricing();
+			const { collector, savedUsages } = harness();
+			const requestId = "stream-truncated-aggregate-model-cap-exceeded";
+			const fallbackLogs = captureFallbackUsageLogs();
+			const billableModels = Array.from(
+				{ length: 17 },
+				(_, i) => `cap-test-model-${i}`,
+			);
+			const iterations = [
+				...billableModels.map((model) => ({
+					type: "message",
+					model,
+					input_tokens: 1,
+					output_tokens: 1,
+				})),
+				{
+					type: "fallback_message",
+					model: OPUS_MODEL,
+					input_tokens: 1,
+					output_tokens: 0,
+				},
+				...Array.from({ length: 47 }, () => ({
+					type: "message",
+					model: FABLE_MODEL,
+					input_tokens: 1,
+				})),
+			];
+
+			try {
+				collector.handleStart(makeStartMessage(requestId));
+				collector.handleChunk(
+					requestId,
+					new TextEncoder().encode(
+						`event: message_start\ndata: {"type":"message_start","message":{"model":"${FABLE_MODEL}","usage":{"input_tokens":65,"output_tokens":0}}}\n\nevent: response.completed\ndata: ${JSON.stringify(
+							{ usage: { input_tokens: 65, output_tokens: 0, iterations } },
+						)}\n\n`,
+					),
+				);
+				await collector.handleEnd({ type: "end", requestId, success: true });
+				await collector.drain();
+			} finally {
+				fallbackLogs.stop();
+			}
+
+			expect(savedUsages.get(requestId)).toMatchObject({
+				model: OPUS_MODEL,
+				costUsd: 130,
+			});
+			expect(estimateCostUSD).toHaveBeenCalledTimes(1);
+			expect(estimateCostUSD).toHaveBeenCalledWith(OPUS_MODEL, {
+				inputTokens: 65,
+				outputTokens: 0,
+				cacheReadInputTokens: undefined,
+				cacheCreationInputTokens: undefined,
+			});
+			expect(fallbackLogs.events).toHaveLength(1);
+			expect(fallbackLogs.events[0]?.data).toEqual({
+				requestId,
+				from: FABLE_MODEL,
+				to: OPUS_MODEL,
+				iterationCount: 64,
 				priced: "top_level",
 				iterationsTruncated: true,
+				billingIncomplete: true,
 			});
 		});
 
@@ -1522,6 +1761,44 @@ describe("UsageCollector request lifecycle", () => {
 			});
 		});
 
+		it("prices a fallback stream with no later usage payload at zero, not the new model's rate", async () => {
+			useDeterministicModelPricing();
+			const { collector, savedUsages } = harness();
+			const requestId = "stream-fallback-no-later-usage-payload";
+			const fallbackLogs = captureFallbackUsageLogs();
+
+			try {
+				collector.handleStart(makeStartMessage(requestId));
+				collector.handleChunk(
+					requestId,
+					new TextEncoder().encode(
+						`event: message_start\ndata: {"type":"message_start","message":{"model":"${FABLE_MODEL}","usage":{"input_tokens":500,"output_tokens":0}}}\n\nevent: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"fallback","from":{"model":"${FABLE_MODEL}"},"to":{"model":"${OPUS_MODEL}"}}}\n\n`,
+					),
+				);
+				// Stream dies here: no later message_delta refreshes the
+				// counters after the fallback rewrite, so the retained 500
+				// FABLE-counted input tokens must not be priced at OPUS rates.
+				await collector.handleEnd({ type: "end", requestId, success: true });
+				await collector.drain();
+			} finally {
+				fallbackLogs.stop();
+			}
+
+			expect(savedUsages.get(requestId)).toMatchObject({
+				model: OPUS_MODEL,
+				costUsd: 0,
+			});
+			expect(estimateCostUSD).not.toHaveBeenCalled();
+			expect(fallbackLogs.events).toHaveLength(1);
+			expect(fallbackLogs.events[0]?.data).toEqual({
+				requestId,
+				from: FABLE_MODEL,
+				to: OPUS_MODEL,
+				iterationCount: 0,
+				priced: "unpriced_pre_output",
+			});
+		});
+
 		it("detects fallback from SSE event context without starting token timing", async () => {
 			useDeterministicModelPricing();
 			const { collector, savedUsages } = harness();
@@ -1534,7 +1811,17 @@ describe("UsageCollector request lifecycle", () => {
 				collector.handleChunk(
 					requestId,
 					new TextEncoder().encode(
-						`event: message_start\ndata: {"type":"message_start","message":{"model":"${FABLE_MODEL}","usage":{"input_tokens":2,"output_tokens":0}}}\n\nevent: content_block_start\ndata: {"index":0,"content_block":{"type":"fallback","from":{"model":"${FABLE_MODEL}"},"to":{"model":"${OPUS_MODEL}"}}}\n\n`,
+						`event: message_start\ndata: {"type":"message_start","message":{"model":"${FABLE_MODEL}","usage":{"input_tokens":2,"output_tokens":0}}}\n\nevent: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"fallback","from":{"model":"${FABLE_MODEL}"},"to":{"model":"${OPUS_MODEL}"}}}\n\n`,
+					),
+				);
+				now += 1_000;
+				// A real (non-fallback) content block: this is the one that
+				// should start the token-timing clock, not the fallback seam
+				// above (a content_block_start/stop pair with no deltas).
+				collector.handleChunk(
+					requestId,
+					new TextEncoder().encode(
+						'event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}\n\n',
 					),
 				);
 				now += 2_000;
@@ -1551,12 +1838,23 @@ describe("UsageCollector request lifecycle", () => {
 				fallbackLogs.stop();
 			}
 
+			// firstTokenTimestamp must come from the real content block (2s
+			// in), not the fallback seam (1s in): 10 output tokens over the
+			// 2s from the real block to message_delta is 5 tok/s, not the
+			// 2.5 tok/s a fallback-seam-started clock would report (10/4s).
 			expect(savedUsages.get(requestId)).toMatchObject({
 				model: OPUS_MODEL,
-				tokensPerSecond: 2,
+				tokensPerSecond: 5,
 				costUsd: 204,
 			});
 			expect(fallbackLogs.events).toHaveLength(1);
+			expect(fallbackLogs.events[0]?.data).toEqual({
+				requestId,
+				from: FABLE_MODEL,
+				to: OPUS_MODEL,
+				iterationCount: 0,
+				priced: "top_level",
+			});
 		});
 
 		it("excludes a pre-output declined iteration from the split price (documented shape)", async () => {
