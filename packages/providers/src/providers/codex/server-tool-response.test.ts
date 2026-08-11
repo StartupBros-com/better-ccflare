@@ -1310,3 +1310,59 @@ describe("Codex native hosted-search response decoder", () => {
 		});
 	});
 });
+
+describe("opaque id shape (issue #149)", () => {
+	// base64url's alphabet ends in '-' (62) and '_' (63), but PUBLIC_CALL_ID in
+	// server-tools/hosted-search-lifecycle.ts requires the character right after
+	// the prefix to be alphanumeric. Before the fix, a leading '-'/'_' minted an
+	// id that failed its own downstream validation on ~2/64 of draws, surfacing
+	// as "Codex server-tool response decoding failed" for the entire response
+	// (and as an intermittent CI failure). The mint-side retry loop re-drew only
+	// on duplicate ids, never on a bad shape.
+
+	// base64url takes the top 6 bits of byte 0 for the first output character.
+	function firstByteFor(sextet: number): number {
+		return (sextet << 2) & 0xff;
+	}
+
+	function riggedRandomBytes(
+		leadingSextets: readonly number[],
+	): (length: number) => Uint8Array {
+		let call = 0;
+		return (length) => {
+			const sextet = leadingSextets[call] ?? 0;
+			call += 1;
+			const bytes = Uint8Array.from(
+				{ length },
+				(_, index) => (call * 31 + index) & 0xff,
+			);
+			bytes[0] = firstByteFor(sextet);
+			return bytes;
+		};
+	}
+
+	function declaredCallId(randomBytes: (length: number) => Uint8Array): string {
+		const stream = fixture(
+			"official-search-stream.sanitized.json",
+		) as unknown[];
+		const instance = createCodexServerToolResponseDecoder({ randomBytes });
+		const events: HostedSearchLifecycleInput[] = [];
+		for (const event of stream) events.push(...instance.acceptSseEvent(event));
+		const declared = events.find((event) => event.type === "declared") as
+			| Extract<HostedSearchLifecycleInput, { type: "declared" }>
+			| undefined;
+		if (!declared) throw new Error("expected a declared hosted-search call");
+		return declared.callId;
+	}
+
+	it("re-draws instead of minting a call id that fails PUBLIC_CALL_ID", () => {
+		// First draw yields '-', second '_', third an alphanumeric character.
+		const callId = declaredCallId(riggedRandomBytes([62, 63, 0]));
+		expect(callId).toMatch(/^srvtoolu_[A-Za-z0-9][A-Za-z0-9_-]*$/u);
+	});
+
+	it("keeps an alphanumeric leading character on the first draw", () => {
+		const callId = declaredCallId(riggedRandomBytes([0]));
+		expect(callId).toMatch(/^srvtoolu_A/u);
+	});
+});
