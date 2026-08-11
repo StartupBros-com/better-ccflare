@@ -3,7 +3,11 @@ import { mkdirSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { RuntimeConfig } from "@better-ccflare/config";
-import type { Disposable, TurnEvidence } from "@better-ccflare/core";
+import type {
+	CacheFlightCohortSealReceipt,
+	Disposable,
+	TurnEvidence,
+} from "@better-ccflare/core";
 import {
 	PAUSE_REASON_NEEDS_REAUTH,
 	TIME_CONSTANTS,
@@ -1032,11 +1036,13 @@ OAuth tokens will need to be re-authenticated.
 		recorderConversationId: string,
 		turn: TurnEvidence,
 		recordedAt?: number,
+		sealReceipt?: CacheFlightCohortSealReceipt | null,
 	): Promise<void> {
 		await this.cacheFlightRecorder.appendTurn(
 			recorderConversationId,
 			turn,
 			recordedAt,
+			sealReceipt,
 		);
 	}
 

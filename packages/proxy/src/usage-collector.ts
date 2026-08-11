@@ -1,5 +1,6 @@
 import {
 	BUFFER_SIZES,
+	type CacheFlightCohortSealReceipt,
 	cacheOutcomeFromTokens,
 	estimateCostUSD,
 	formatXaiCacheCanary,
@@ -42,6 +43,7 @@ interface UsageIteration {
 
 interface RequestState {
 	startMessage: StartMessage;
+	cacheFlightCohortSealReceipt?: CacheFlightCohortSealReceipt | null;
 	buffer: string;
 	streamDecoder: TextDecoder;
 	chunks: Uint8Array[];
@@ -675,6 +677,7 @@ export class UsageCollector {
 		const now = Date.now();
 		const state: RequestState = {
 			startMessage: msg,
+			cacheFlightCohortSealReceipt: msg.cacheFlightCohortSealReceipt ?? null,
 			buffer: "",
 			streamDecoder: new TextDecoder(),
 			chunks: [],
@@ -1268,15 +1271,26 @@ export class UsageCollector {
 					unavailableDimensions.length === 0 ? "complete" : "partial",
 				unavailableDimensions,
 			};
+			const sealReceipt = state.cacheFlightCohortSealReceipt ?? null;
 			const accepted = this.asyncWriter.enqueue(async () => {
 				try {
-					await this.dbOps.appendCacheFlightRecorderTurn(
-						recorderConversationId,
-						turn,
-					);
-				} catch {
+					if (sealReceipt) {
+						await this.dbOps.appendCacheFlightRecorderTurn(
+							recorderConversationId,
+							turn,
+							undefined,
+							sealReceipt,
+						);
+					} else {
+						await this.dbOps.appendCacheFlightRecorderTurn(
+							recorderConversationId,
+							turn,
+						);
+					}
+				} catch (error) {
 					log.warn("Cache flight recorder write failed", {
 						recorderConversationId,
+						error: error instanceof Error ? error.message : String(error),
 					});
 					// The turn is irrecoverably lost, so it is dropped evidence, not
 					// merely an incomplete dimension.

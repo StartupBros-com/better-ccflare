@@ -737,6 +737,13 @@ Interactive apply can preview, show exact deltas, require an explicit proposal s
 - Advanced filtering by accounts, models, API keys, and request status
 - API key performance tracking and detailed analytics
 
+### 🧭 Service-Lifetime Cohort Seal
+
+- **Opt-in cache evidence** - Eligible official-xAI cache-flight observations can carry privacy-safe provenance for the service/profile occurrence and its concurrent serving-account plus route/model partition
+- **Descriptive operator reports** - Human and JSON recorder reports show cohort boundaries, blockers, contributors, and safe within-cohort subsets without changing routing, native cache, keepalive, or provider behavior
+
+See [Service-Lifetime Cohort Seal configuration and operator guidance](docs/configuration.md#service-lifetime-cohort-seal) for activation, report and health commands, retention, privacy, and the mandatory pre-transport runtime-safety gate.
+
 ### 🛠️ Developer Tools
 - Powerful CLI (`better-ccflare`)
 - Web dashboard (`http://localhost:8080/dashboard`)

@@ -7,6 +7,7 @@ import {
 	it,
 	mock,
 } from "bun:test";
+import type { CacheFlightCohortSealReceipt } from "@better-ccflare/core";
 import { logBus } from "@better-ccflare/logger";
 import type { LogEvent } from "@better-ccflare/types";
 import { cacheBodyStore } from "../cache-body-store";
@@ -72,6 +73,7 @@ const INACTIVITY_TIMEOUT_MS = 2 * 60 * 1000;
 interface RecorderWrite {
 	recorderConversationId: string;
 	turn: import("@better-ccflare/core").TurnEvidence;
+	sealReceipt?: CacheFlightCohortSealReceipt | null;
 }
 
 interface TestHarness {
@@ -189,9 +191,15 @@ function createHarness(options: HarnessOptions | boolean = {}): TestHarness {
 		async appendCacheFlightRecorderTurn(
 			recorderConversationId: string,
 			turn: import("@better-ccflare/core").TurnEvidence,
+			_recordedAt?: number,
+			sealReceipt?: CacheFlightCohortSealReceipt | null,
 		): Promise<void> {
 			if (resolved.recorderFailure) throw resolved.recorderFailure;
-			recorderWrites.push({ recorderConversationId, turn });
+			recorderWrites.push({
+				recorderConversationId,
+				turn,
+				...(sealReceipt !== undefined ? { sealReceipt } : {}),
+			});
 		},
 		async markCacheFlightRecorderIncomplete(
 			recorderConversationId: string,
@@ -305,6 +313,42 @@ function captureFallbackUsageLogs(): {
 		events,
 		stop: () => logBus.off("log", onLog),
 	};
+}
+
+function makeSealReceipt(
+	id = "cohort_observation_partition_safe",
+): CacheFlightCohortSealReceipt {
+	const serviceEpoch = Object.freeze({
+		id: "cohort_service_epoch_safe",
+		occurrenceId: "cohort_service_occurrence_safe",
+		sealContractVersion: 1,
+		deploymentRevision: "abcdef123456",
+		serviceInstanceId: "cohort_service_instance_safe",
+		processStartedAt: "2026-08-08T00:00:00.000Z",
+		nativeCacheState: "enabled" as const,
+		recorderState: "enabled" as const,
+		keepalivePolicy: Object.freeze({
+			globalTtlMinutes: 5,
+			xaiTtlMinutes: 0,
+			effectiveXaiEnabled: true,
+			effectiveXaiTtlMinutes: 5,
+		}),
+		completeness: "complete" as const,
+		unavailableDimensions: Object.freeze([]),
+	});
+	return Object.freeze({
+		serviceEpoch,
+		observationPartition: Object.freeze({
+			id,
+			serviceEpochId: serviceEpoch.id,
+			servingAccountScope: "cohort_serving_account_scope_safe",
+			routeModelEpoch: "cohort_route_model_epoch_safe",
+			completeness: "complete" as const,
+			unavailableDimensions: Object.freeze([]),
+		}),
+		completeness: "complete" as const,
+		unavailableDimensions: Object.freeze([]),
+	});
 }
 
 describe("UsageCollector request lifecycle", () => {
@@ -2361,6 +2405,228 @@ describe("UsageCollector request lifecycle", () => {
 		);
 	});
 
+	it.each([
+		{ label: "streaming", streaming: true },
+		{ label: "non-streaming", streaming: false },
+	])("passes the exact frozen cohort receipt to the recorder append for a completed $label turn", async ({
+		streaming,
+	}) => {
+		const { collector, recorderWrites } = createHarness();
+		collectors.push(collector);
+		const receipt = makeSealReceipt(
+			`cohort_observation_partition_${streaming ? "stream" : "body"}`,
+		);
+		const requestId = `recorder-sealed-${streaming ? "stream" : "body"}`;
+
+		collector.handleStart(
+			makeStartMessage(requestId, {
+				accountId: "xai-account",
+				providerName: "xai",
+				responseHeaders: {
+					"content-type": streaming ? "text/event-stream" : "application/json",
+				},
+				isStream: streaming,
+				xaiCacheIdentityFingerprint: "identity12345678",
+				xaiCachePrefixFingerprint: "prefix123456789",
+				xaiCacheOfficialEndpoint: true,
+				xaiCacheKeyPresent: true,
+				cacheFlightRecorderConversationId: "cfr_sealed000000000000000000000000",
+				cacheFlightRecorderEligible: true,
+				cacheFlightRecorderNativeActive: true,
+				cacheFlightCohortSealReceipt: receipt,
+			}),
+		);
+
+		if (streaming) {
+			collector.handleChunk(
+				requestId,
+				new TextEncoder().encode(
+					'event: message_start\ndata: {"type":"message_start","message":{"model":"grok-4","usage":{"input_tokens":20,"output_tokens":0}}}\n\nevent: message_delta\ndata: {"type":"message_delta","usage":{"input_tokens":20,"output_tokens":5,"cache_read_input_tokens":12}}\n\n',
+				),
+			);
+			await collector.handleEnd({ type: "end", requestId, success: true });
+		} else {
+			await collector.handleEnd({
+				type: "end",
+				requestId,
+				responseBody: Buffer.from(
+					JSON.stringify({
+						model: "grok-4",
+						usage: {
+							input_tokens: 20,
+							output_tokens: 5,
+							cache_read_input_tokens: 12,
+						},
+					}),
+				).toString("base64"),
+				success: true,
+			});
+		}
+		await collector.drain();
+
+		expect(recorderWrites).toHaveLength(1);
+		expect(recorderWrites[0]?.sealReceipt).toBe(receipt);
+		expect(recorderWrites[0]?.turn).toMatchObject({
+			cacheOutcome: "hit",
+			inputTokens: 32,
+			cachedTokens: 12,
+			completeness: "complete",
+			unavailableDimensions: [],
+		});
+	});
+
+	it.each([
+		{
+			label: "stream error",
+			requestId: "recorder-sealed-stream-error",
+			partitionId: "cohort_observation_partition_stream_error",
+			end: {
+				type: "end" as const,
+				requestId: "recorder-sealed-stream-error",
+				success: false,
+				error: "upstream socket reset",
+				streamTerminalState: "error" as const,
+			},
+		},
+		{
+			label: "truncated",
+			requestId: "recorder-sealed-truncated",
+			partitionId: "cohort_observation_partition_truncated",
+			end: {
+				type: "end" as const,
+				requestId: "recorder-sealed-truncated",
+				success: false,
+				error: "Response stalled after partial output",
+				streamTerminalState: "truncated" as const,
+			},
+		},
+		{
+			label: "client-cancelled",
+			requestId: "recorder-sealed-client-cancelled",
+			partitionId: "cohort_observation_partition_client_cancelled",
+			end: {
+				type: "end" as const,
+				requestId: "recorder-sealed-client-cancelled",
+				success: false,
+				error: "downstream_cancelled",
+				streamTerminalState: "client_cancelled" as const,
+			},
+		},
+	])("keeps the frozen receipt on an incomplete $label terminal turn without making the turn complete", async ({
+		requestId,
+		partitionId,
+		end,
+	}) => {
+		const { collector, recorderWrites, summaries } = createHarness();
+		collectors.push(collector);
+		const receipt = makeSealReceipt(partitionId);
+		collector.handleStart(
+			makeStartMessage(requestId, {
+				accountId: "xai-account",
+				providerName: "xai",
+				xaiCacheIdentityFingerprint: "identity12345678",
+				xaiCachePrefixFingerprint: "prefix123456789",
+				xaiCacheOfficialEndpoint: true,
+				xaiCacheKeyPresent: true,
+				cacheFlightRecorderConversationId: "cfr_incomplete0000000000000000000",
+				cacheFlightRecorderEligible: true,
+				cacheFlightRecorderNativeActive: true,
+				cacheFlightCohortSealReceipt: receipt,
+			}),
+		);
+
+		await collector.handleEnd(end);
+		await collector.drain();
+
+		expect(summaries).toContain(requestId);
+		expect(recorderWrites).toHaveLength(1);
+		expect(recorderWrites[0]?.sealReceipt).toBe(receipt);
+		expect(recorderWrites[0]?.turn.completeness).toBe("partial");
+		expect(recorderWrites[0]?.turn.unavailableDimensions).toEqual([
+			"cache_outcome",
+			"token_accounting",
+		]);
+	});
+
+	it("keeps the frozen receipt on contradictory cache telemetry without upgrading partial evidence", async () => {
+		const { collector, recorderWrites } = createHarness();
+		collectors.push(collector);
+		const receipt = makeSealReceipt(
+			"cohort_observation_partition_contradictory",
+		);
+		const requestId = "recorder-sealed-contradictory";
+		collector.handleStart(
+			makeStartMessage(requestId, {
+				accountId: "xai-account",
+				providerName: "xai",
+				xaiCacheIdentityFingerprint: "identity12345678",
+				xaiCachePrefixFingerprint: "prefix123456789",
+				xaiCacheOfficialEndpoint: true,
+				xaiCacheKeyPresent: false,
+				cacheFlightRecorderConversationId:
+					"cfr_contradictory000000000000000000",
+				cacheFlightRecorderEligible: true,
+				cacheFlightRecorderNativeActive: false,
+				cacheFlightCohortSealReceipt: receipt,
+			}),
+		);
+		collector.handleChunk(
+			requestId,
+			new TextEncoder().encode(
+				'event: message_delta\ndata: {"type":"message_delta","usage":{"input_tokens":20,"output_tokens":5,"cache_read_input_tokens":12}}\n\n',
+			),
+		);
+		await collector.handleEnd({
+			type: "end",
+			requestId,
+			success: true,
+		});
+		await collector.drain();
+
+		expect(recorderWrites).toHaveLength(1);
+		expect(recorderWrites[0]?.sealReceipt).toBe(receipt);
+		expect(recorderWrites[0]?.turn).toMatchObject({
+			cacheOutcome: "hit",
+			inputTokens: 32,
+			cachedTokens: 12,
+			completeness: "partial",
+			unavailableDimensions: ["identity", "cacheable_prefix"],
+		});
+	});
+
+	it("does not pass a seal receipt when no frozen receipt was captured", async () => {
+		const { collector, recorderWrites } = createHarness();
+		collectors.push(collector);
+		collector.handleStart(
+			makeStartMessage("recorder-unsealed-eligible", {
+				accountId: "xai-account",
+				providerName: "xai",
+				xaiCacheIdentityFingerprint: "identity12345678",
+				xaiCachePrefixFingerprint: "prefix123456789",
+				xaiCacheOfficialEndpoint: true,
+				xaiCacheKeyPresent: true,
+				cacheFlightRecorderConversationId: "cfr_unsealed000000000000000000000",
+				cacheFlightRecorderEligible: true,
+				cacheFlightRecorderNativeActive: true,
+			}),
+		);
+		collector.handleChunk(
+			"recorder-unsealed-eligible",
+			new TextEncoder().encode(
+				'event: message_start\ndata: {"type":"message_start","message":{"model":"grok-4","usage":{"input_tokens":20,"output_tokens":0}}}\n\nevent: message_delta\ndata: {"type":"message_delta","usage":{"input_tokens":20,"output_tokens":5,"cache_read_input_tokens":12}}\n\n',
+			),
+		);
+		await collector.handleEnd({
+			type: "end",
+			requestId: "recorder-unsealed-eligible",
+			success: true,
+		});
+		await collector.drain();
+
+		expect(recorderWrites).toHaveLength(1);
+		expect(Object.hasOwn(recorderWrites[0] ?? {}, "sealReceipt")).toBe(false);
+	});
+
 	it("records partial recorder-only evidence without inventing native dimensions", async () => {
 		const { collector, recorderWrites } = createHarness();
 		collectors.push(collector);
@@ -2532,6 +2798,9 @@ describe("UsageCollector request lifecycle", () => {
 				cacheFlightRecorderConversationId:
 					"cfr_dddddddddddddddddddddddddddddddd",
 				cacheFlightRecorderEligible: true,
+				cacheFlightCohortSealReceipt: makeSealReceipt(
+					"cohort_observation_partition_rejected",
+				),
 			}),
 		);
 		collector.handleChunk("recorder-rejected", modelBearingChunk());
@@ -2577,6 +2846,9 @@ describe("UsageCollector request lifecycle", () => {
 					cacheFlightRecorderConversationId:
 						"cfr_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
 					cacheFlightRecorderEligible: true,
+					cacheFlightCohortSealReceipt: makeSealReceipt(
+						"cohort_observation_partition_failure",
+					),
 				}),
 			);
 			collector.handleChunk("recorder-failure", modelBearingChunk());
@@ -2593,7 +2865,10 @@ describe("UsageCollector request lifecycle", () => {
 		expect(recorderWrites).toEqual([]);
 		expect(summaries).toContain("recorder-failure");
 		expect(warnings).toHaveLength(1);
-		expect(JSON.stringify(warnings[0])).not.toContain("repository unavailable");
+		// The error message is the whole point of the observability fix: without
+		// it, a seal-contract rejection is indistinguishable from a transient DB
+		// error. Only the message may be logged, never payload/prompt content.
+		expect(JSON.stringify(warnings[0])).toContain("repository unavailable");
 		expect(JSON.stringify(warnings[0])).not.toContain("raw prompt");
 		expect(markedIncomplete).toEqual([
 			{ id: "cfr_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", dropped: true },

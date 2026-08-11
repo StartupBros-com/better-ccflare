@@ -112,7 +112,11 @@ function makeCtxWithReason() {
 	return { ctx, calls };
 }
 
-function setFreshScopedUsage(accountId: string, family = "Fable"): void {
+function setFreshScopedUsage(
+	accountId: string,
+	family = "Fable",
+	weeklyAll = 72,
+): void {
 	usageCache.set(accountId, {
 		limits: [
 			{
@@ -123,7 +127,7 @@ function setFreshScopedUsage(accountId: string, family = "Fable"): void {
 			},
 			{
 				kind: "weekly_all",
-				percent: 72,
+				percent: weeklyAll,
 				resets_at: new Date(Date.now() + 6 * 24 * 60 * 60_000).toISOString(),
 				is_active: true,
 			},
@@ -498,13 +502,52 @@ describe("forwardToClient — model-scoped Anthropic 429 after SSE bytes", () =>
 		}
 	});
 
-	it("preserves account cooldown for an explicit unified hard status", async () => {
+	// A hard unified status does not name the limit that rejected the request, and
+	// Anthropic sends it for per-model weekly caps too. With account-wide headroom
+	// (weekly_all 72%) and this family's cap spent, the mid-stream 429 is Fable-only:
+	// mark the family and leave the account serving every other lane. Benching the
+	// account here is what removed the two healthiest accounts from the pool for 12h
+	// on 2026-08-11.
+	it("keeps an explicit unified hard status family-scoped when the account still has headroom", async () => {
 		const now = 1_800_000_000_000;
 		const realDateNow = Date.now;
 		Date.now = () => now;
 		const account = makeAccount({ id: "acct-mid-explicit-hard-signal" });
 		const { ctx, calls } = makeCtxWithReason();
 		setFreshScopedUsage(account.id);
+
+		try {
+			await forwardAndConsumeMidStream(
+				account,
+				ctx,
+				midStreamErrorResponse("rate_limit_error", {
+					"anthropic-ratelimit-unified-status": "rate_limited",
+					"retry-after": "60",
+				}),
+				"claude-fable-5-20260701",
+			);
+
+			expect(calls.markRateLimited).toHaveLength(0);
+			expect(account.rate_limited_until).toBeNull();
+			expect(
+				usageCache.getFamilyScopedExhaustion(
+					account.id,
+					"claude-fable-5-20260701",
+				),
+			).not.toBeNull();
+		} finally {
+			usageCache.delete(account.id);
+			Date.now = realDateNow;
+		}
+	});
+
+	it("preserves account cooldown for a hard status once account-wide capacity is spent", async () => {
+		const now = 1_800_000_000_000;
+		const realDateNow = Date.now;
+		Date.now = () => now;
+		const account = makeAccount({ id: "acct-mid-hard-signal-no-headroom" });
+		const { ctx, calls } = makeCtxWithReason();
+		setFreshScopedUsage(account.id, "Fable", 100);
 
 		try {
 			await forwardAndConsumeMidStream(

@@ -20,6 +20,7 @@ import {
 	mock,
 	spyOn,
 } from "bun:test";
+import type { CacheFlightCohortSealReceipt } from "@better-ccflare/core";
 import type { Account, RequestMeta } from "@better-ccflare/types";
 import * as usageCollectorModule from "../../usage-collector";
 import type { StartMessage } from "../../worker-messages";
@@ -140,6 +141,76 @@ function jsonResponse(body: object, status: number) {
 		status,
 		headers: { "Content-Type": "application/json" },
 	});
+}
+
+function makeOpenAiChatCompletion(model: string): object {
+	return {
+		id: "chatcmpl_route_candidate",
+		object: "chat.completion",
+		created: 1_700_000_000,
+		model,
+		choices: [
+			{
+				index: 0,
+				message: { role: "assistant", content: "hi" },
+				finish_reason: "stop",
+			},
+		],
+		usage: {
+			prompt_tokens: 1,
+			completion_tokens: 1,
+			total_tokens: 2,
+		},
+	};
+}
+
+function makeSealReceipt(
+	id = "cohort_observation_partition_proxy_success",
+): CacheFlightCohortSealReceipt {
+	const serviceEpoch = Object.freeze({
+		id: "cohort_service_epoch_proxy_success",
+		occurrenceId: "cohort_service_occurrence_proxy_success",
+		sealContractVersion: 1,
+		deploymentRevision: "abcdef123456",
+		serviceInstanceId: "cohort_service_instance_proxy_success",
+		processStartedAt: "2026-08-08T00:00:00.000Z",
+		nativeCacheState: "enabled" as const,
+		recorderState: "enabled" as const,
+		keepalivePolicy: Object.freeze({
+			globalTtlMinutes: 5,
+			xaiTtlMinutes: 0,
+			effectiveXaiEnabled: true,
+			effectiveXaiTtlMinutes: 5,
+		}),
+		completeness: "complete" as const,
+		unavailableDimensions: Object.freeze([]),
+	});
+	return Object.freeze({
+		serviceEpoch,
+		observationPartition: Object.freeze({
+			id,
+			serviceEpochId: serviceEpoch.id,
+			servingAccountScope: "cohort_serving_account_scope_proxy_success",
+			routeModelEpoch: "cohort_route_model_epoch_proxy_success",
+			completeness: "complete" as const,
+			unavailableDimensions: Object.freeze([]),
+		}),
+		completeness: "complete" as const,
+		unavailableDimensions: Object.freeze([]),
+	});
+}
+
+function installCohortSeal(
+	ctx: ProxyContext,
+	receipt: CacheFlightCohortSealReceipt,
+) {
+	const captureReceipt = mock(() => receipt);
+	(
+		ctx as ProxyContext & {
+			cacheFlightCohortSeal: { captureReceipt: typeof captureReceipt };
+		}
+	).cacheFlightCohortSeal = { captureReceipt };
+	return captureReceipt;
 }
 
 describe("proxyWithAccount — combo override success-conditioning / observability", () => {
@@ -287,5 +358,73 @@ describe("proxyWithAccount — combo override success-conditioning / observabili
 		expect(startMessage.appliedModel == null).toBe(true);
 		expect(startMessage.comboModelOverrideFrom == null).toBe(true);
 		expect(startMessage.comboModelOverrideTo == null).toBe(true);
+	});
+
+	it("captures an xAI success receipt with the exact model fallback route candidate", async () => {
+		const handleStart = installUsageCollector();
+		globalThis.fetch = mock(async () =>
+			jsonResponse(makeOpenAiChatCompletion("grok-4"), 200),
+		);
+
+		const bodyBuffer = makeRequestBody("grok-4");
+		const req = makeRequest(bodyBuffer);
+		const ctx = makeProxyContext();
+		const receipt = makeSealReceipt();
+		const captureReceipt = installCohortSeal(ctx, receipt);
+		const account = makeAccount({
+			id: "xai-success-account",
+			name: "xAI Success Account",
+			provider: "xai",
+			custom_endpoint: null,
+			model_mappings: null,
+		});
+		const requestMeta = makeRequestMeta({
+			id: "req-xai-route-candidate-success",
+			cacheFlightRecorderConversationId: "cfr_success0000000000000000000000",
+			xaiCacheIdentityFingerprint: "identity12345678",
+			xaiCachePrefixFingerprint: "prefix123456789",
+			xaiCacheNativeActive: true,
+		});
+		const modelFallbackPolicy: ModelFallbackExecutionPolicy = {
+			routeCandidateId: "route-candidate-policy-success",
+		};
+
+		const result = await proxyWithAccount(
+			req,
+			new URL("https://proxy.local/v1/messages"),
+			account,
+			requestMeta,
+			bodyBuffer,
+			() => undefined,
+			0,
+			ctx,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			false,
+			undefined,
+			undefined,
+			modelFallbackPolicy,
+		);
+
+		expect(result?.status).toBe(200);
+		await result?.text();
+		expect(captureReceipt).toHaveBeenCalledTimes(1);
+		const captureInput = captureReceipt.mock.calls[0]?.[0] as {
+			finalServingAccount: Account;
+			attemptedTransportModel: string | null;
+			routeCandidateId: string | null;
+		};
+		expect(captureInput.finalServingAccount).toBe(account);
+		expect(captureInput.attemptedTransportModel).toBe("grok-4");
+		expect(captureInput.routeCandidateId).toBe(
+			"route-candidate-policy-success",
+		);
+		expect(handleStart).toHaveBeenCalledTimes(1);
+		const startMessage = handleStart.mock.calls[0]?.[0] as StartMessage;
+		expect(startMessage.cacheFlightCohortSealReceipt).toBe(receipt);
+		expect("attemptedModel" in startMessage).toBe(false);
+		expect("routeCandidateId" in startMessage).toBe(false);
 	});
 });

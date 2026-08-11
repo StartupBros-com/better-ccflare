@@ -85,6 +85,105 @@ function pruneOldBackups(absoluteSourcePath: string): void {
 	}
 }
 
+function cacheFlightRecorderTurnColumns(db: Database): string[] {
+	return (
+		db
+			.prepare("PRAGMA table_info(cache_flight_recorder_turns)")
+			.all() as Array<{
+			name: string;
+		}>
+	).map((column) => column.name);
+}
+
+function tableHasColumn(db: Database, table: string, column: string): boolean {
+	return (
+		db.prepare(`PRAGMA table_info(${table})`).all() as Array<{
+			name: string;
+		}>
+	).some((c) => c.name === column);
+}
+
+function ensureCacheFlightRecorderSealSchema(db: Database): void {
+	db.run(`
+		CREATE TABLE IF NOT EXISTS cache_flight_recorder_service_epochs (
+			id TEXT PRIMARY KEY,
+			seal_contract_version INTEGER NOT NULL,
+			deployment_revision TEXT,
+			service_instance_id TEXT,
+			process_started_at TEXT,
+			native_cache_state TEXT,
+			recorder_state TEXT,
+			keepalive_global_ttl_minutes INTEGER,
+			keepalive_xai_ttl_minutes INTEGER,
+			keepalive_effective_xai_enabled INTEGER,
+			keepalive_effective_xai_ttl_minutes INTEGER,
+			occurrence_id TEXT,
+			completeness TEXT NOT NULL,
+			unavailable_dimensions TEXT NOT NULL DEFAULT '[]',
+			created_at INTEGER NOT NULL,
+			last_verified_at INTEGER
+		)
+	`);
+	db.run(`
+		CREATE TABLE IF NOT EXISTS cache_flight_recorder_partitions (
+			id TEXT PRIMARY KEY,
+			service_epoch_id TEXT NOT NULL,
+			serving_account_scope TEXT,
+			route_model_epoch TEXT,
+			completeness TEXT NOT NULL,
+			unavailable_dimensions TEXT NOT NULL DEFAULT '[]',
+			seal_completeness TEXT NOT NULL,
+			seal_unavailable_dimensions TEXT NOT NULL DEFAULT '[]',
+			created_at INTEGER NOT NULL,
+			last_verified_at INTEGER,
+			FOREIGN KEY (service_epoch_id)
+				REFERENCES cache_flight_recorder_service_epochs(id)
+				ON DELETE CASCADE
+		)
+	`);
+	db.run(
+		`CREATE INDEX IF NOT EXISTS idx_cache_flight_recorder_partitions_epoch
+		 ON cache_flight_recorder_partitions(service_epoch_id)`,
+	);
+	// Gated on column presence rather than created unconditionally: this
+	// function runs once before the legacy-upgrade ALTER TABLE (inside
+	// runMigrations(), via ensureSchema()) that adds last_verified_at to
+	// pre-existing tables, so an unconditional CREATE INDEX here would fail
+	// against a legacy database on that first pass. The second call (after
+	// the ALTER has run) sees the column and installs the index.
+	if (
+		tableHasColumn(
+			db,
+			"cache_flight_recorder_service_epochs",
+			"last_verified_at",
+		)
+	) {
+		db.run(
+			`CREATE INDEX IF NOT EXISTS idx_cache_flight_recorder_service_epochs_last_verified_at
+			 ON cache_flight_recorder_service_epochs(last_verified_at)`,
+		);
+	}
+	if (
+		tableHasColumn(db, "cache_flight_recorder_partitions", "last_verified_at")
+	) {
+		db.run(
+			`CREATE INDEX IF NOT EXISTS idx_cache_flight_recorder_partitions_last_verified_at
+			 ON cache_flight_recorder_partitions(last_verified_at)`,
+		);
+	}
+	const turnColumns = cacheFlightRecorderTurnColumns(db);
+	if (turnColumns.includes("observation_partition_id")) {
+		db.run(
+			`CREATE INDEX IF NOT EXISTS idx_cache_flight_recorder_turns_partition
+			 ON cache_flight_recorder_turns(observation_partition_id)`,
+		);
+		db.run(
+			`CREATE INDEX IF NOT EXISTS idx_cache_flight_recorder_turns_cleanup
+			 ON cache_flight_recorder_turns(timestamp, observation_partition_id)`,
+		);
+	}
+}
+
 const ROUTING_REVISION_POLICY_TABLES = [
 	"combos",
 	"combo_slots",
@@ -674,12 +773,17 @@ export function ensureSchema(db: Database): void {
 			completeness TEXT NOT NULL,
 			unavailable_dimensions TEXT NOT NULL DEFAULT '[]',
 			gap_before INTEGER NOT NULL DEFAULT 0,
+			observation_partition_id TEXT,
 			PRIMARY KEY (recorder_conversation_id, sequence),
 			FOREIGN KEY (recorder_conversation_id)
 				REFERENCES cache_flight_recorder_conversations(recorder_conversation_id)
-				ON DELETE CASCADE
+				ON DELETE CASCADE,
+			FOREIGN KEY (observation_partition_id)
+				REFERENCES cache_flight_recorder_partitions(id)
+				ON DELETE SET NULL
 		)
 	`);
+	ensureCacheFlightRecorderSealSchema(db);
 
 	// Create instance_heartbeats table: per-process heartbeat for the
 	// multi-instance guard (see packages/database/src/multi-instance-guard.ts
@@ -1158,6 +1262,17 @@ export function runMigrations(db: Database, dbPath?: string): void {
 	const comboFamilyAssignmentColumnNames = comboFamilyAssignmentsInfo.map(
 		(column) => column.name,
 	);
+	const cacheFlightRecorderTurnColumnNames = cacheFlightRecorderTurnColumns(db);
+	const cacheFlightRecorderServiceEpochHasLastVerifiedAt = tableHasColumn(
+		db,
+		"cache_flight_recorder_service_epochs",
+		"last_verified_at",
+	);
+	const cacheFlightRecorderPartitionHasLastVerifiedAt = tableHasColumn(
+		db,
+		"cache_flight_recorder_partitions",
+		"last_verified_at",
+	);
 
 	const refreshTokenCol = accountsInfo.find(
 		(col) => col.name === "refresh_token",
@@ -1263,6 +1378,58 @@ export function runMigrations(db: Database, dbPath?: string): void {
 			).run();
 			log.info("Added managed logical model to family assignments");
 		}
+		if (
+			!cacheFlightRecorderTurnColumnNames.includes("observation_partition_id")
+		) {
+			db.prepare(
+				`ALTER TABLE cache_flight_recorder_turns
+				 ADD COLUMN observation_partition_id TEXT
+				 REFERENCES cache_flight_recorder_partitions(id) ON DELETE SET NULL`,
+			).run();
+			log.info("Added cache flight recorder observation partition reference");
+		}
+		if (!cacheFlightRecorderServiceEpochHasLastVerifiedAt) {
+			// Nullable, not NOT NULL: SQLite can't add a NOT NULL column to a
+			// non-empty table without a DEFAULT, and a DEFAULT would falsely
+			// backdate every legacy row to "verified now". The backfill below
+			// sets every existing row's last_verified_at explicitly instead,
+			// and registryStatements() always supplies a value for new rows
+			// going forward, so the column is non-null in practice.
+			db.prepare(
+				`ALTER TABLE cache_flight_recorder_service_epochs
+				 ADD COLUMN last_verified_at INTEGER`,
+			).run();
+			// Backfill choice: created_at, not "now". This is the conservative
+			// option — it treats a pre-existing row as last verified when it
+			// was created, leaving its retention-sweep eligibility exactly as
+			// it was under the old created_at-only guard (immediately
+			// sweepable once past the cutoff). Backfilling to "now" would
+			// silently grant every legacy row a fresh, unearned retention
+			// window it never actually had live traffic to justify.
+			db.prepare(
+				`UPDATE cache_flight_recorder_service_epochs
+				 SET last_verified_at = created_at
+				 WHERE last_verified_at IS NULL`,
+			).run();
+			log.info(
+				"Added last_verified_at liveness column to cache flight recorder service epochs",
+			);
+		}
+		if (!cacheFlightRecorderPartitionHasLastVerifiedAt) {
+			db.prepare(
+				`ALTER TABLE cache_flight_recorder_partitions
+				 ADD COLUMN last_verified_at INTEGER`,
+			).run();
+			db.prepare(
+				`UPDATE cache_flight_recorder_partitions
+				 SET last_verified_at = created_at
+				 WHERE last_verified_at IS NULL`,
+			).run();
+			log.info(
+				"Added last_verified_at liveness column to cache flight recorder partitions",
+			);
+		}
+		ensureCacheFlightRecorderSealSchema(db);
 
 		// Add rate_limited_until column if it doesn't exist
 		if (!initialAccountsColumnNames.includes("rate_limited_until")) {

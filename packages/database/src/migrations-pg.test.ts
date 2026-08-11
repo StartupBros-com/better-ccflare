@@ -30,7 +30,13 @@ import { Database } from "bun:sqlite";
 import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import type {
+	CacheFlightCohortSealReceipt,
+	CacheFlightKeepalivePolicySnapshot,
+	TurnEvidence,
+} from "@better-ccflare/core";
 import { ensureSchema, runMigrations } from "./migrations";
+import { runMigrationsPg } from "./migrations-pg";
 
 const PG_SOURCE_PATH = path.join(__dirname, "migrations-pg.ts");
 
@@ -196,6 +202,26 @@ function parsePgColumnsToAdd(
 	return entries;
 }
 
+/**
+ * Extract the raw body text (everything between the balanced parens) of the
+ * first `CREATE TABLE IF NOT EXISTS <tableName> (...)` block in source. Used
+ * where a test needs the literal column definition text (e.g. to check for
+ * `NOT NULL`), not just the extracted column name that `parsePgCreateTables`
+ * produces.
+ */
+function _extractCreateTableBody(source: string, tableName: string): string {
+	const headerRe = new RegExp(`CREATE TABLE IF NOT EXISTS ${tableName}\\s*\\(`);
+	const match = headerRe.exec(source);
+	if (!match) {
+		throw new Error(
+			`CREATE TABLE IF NOT EXISTS ${tableName} not found in source`,
+		);
+	}
+	const openParenIndex = match.index + match[0].length - 1;
+	const closeParenIndex = findMatchingParen(source, openParenIndex);
+	return source.slice(openParenIndex + 1, closeParenIndex);
+}
+
 function buildPgInventory(source: string): SchemaInventory {
 	const tables = parsePgCreateTables(source);
 
@@ -299,20 +325,254 @@ describe("SQLite <-> PostgreSQL migration schema parity (static)", () => {
 		expect(pgSource).toContain("idx_requests_summary_covering");
 		expect(pgSource).toContain("idx_requests_analytics_covering");
 	});
+
+	it("spot check: cache flight cohort seal registry DDL and indexes are ported to PostgreSQL", () => {
+		expect(pgSource).toContain(
+			"CREATE TABLE IF NOT EXISTS cache_flight_recorder_service_epochs",
+		);
+		expect(pgSource).toContain(
+			"CREATE TABLE IF NOT EXISTS cache_flight_recorder_partitions",
+		);
+		expect(pgSource).toContain(
+			"ALTER TABLE cache_flight_recorder_turns ADD COLUMN observation_partition_id TEXT",
+		);
+		expect(pgSource).toContain(
+			"REFERENCES cache_flight_recorder_service_epochs(id)",
+		);
+		expect(pgSource).toContain(
+			"REFERENCES cache_flight_recorder_partitions(id)",
+		);
+		expect(pgSource).toContain("idx_cache_flight_recorder_turns_partition");
+		expect(pgSource).toContain("idx_cache_flight_recorder_partitions_epoch");
+		expect(pgSource).toContain("idx_cache_flight_recorder_turns_cleanup");
+		// last_verified_at liveness column: closes the retention-sweep gap
+		// where created_at alone never reflects a long-lived registry row
+		// being re-verified by a live append (see
+		// cache-flight-recorder.repository.ts registryStatements() /
+		// expireOlderThan()).
+		expect(pgSource).toContain(
+			"ALTER TABLE cache_flight_recorder_service_epochs ADD COLUMN last_verified_at BIGINT",
+		);
+		expect(pgSource).toContain(
+			"ALTER TABLE cache_flight_recorder_partitions ADD COLUMN last_verified_at BIGINT",
+		);
+		expect(pgSource).toContain(
+			"idx_cache_flight_recorder_service_epochs_last_verified_at",
+		);
+		expect(pgSource).toContain(
+			"idx_cache_flight_recorder_partitions_last_verified_at",
+		);
+	});
+
+	it("creates cache flight seal registry tables before adding the legacy turn foreign key", async () => {
+		const statements: string[] = [];
+		let observationPartitionColumnAdded = false;
+		let serviceEpochLastVerifiedAtAdded = false;
+		let partitionLastVerifiedAtAdded = false;
+		const legacyLikeAdapter = {
+			unsafe: async (sql: string) => {
+				const normalized = sql.replace(/\s+/g, " ").trim();
+				if (
+					normalized.includes("CREATE INDEX") &&
+					normalized.includes("cache_flight_recorder_turns") &&
+					normalized.includes("observation_partition_id") &&
+					!observationPartitionColumnAdded
+				) {
+					throw new Error(
+						"turn observation_partition_id index was created before the legacy column ALTER",
+					);
+				}
+				if (
+					normalized.includes("CREATE INDEX") &&
+					normalized.includes(
+						"idx_cache_flight_recorder_service_epochs_last_verified_at",
+					) &&
+					!serviceEpochLastVerifiedAtAdded
+				) {
+					throw new Error(
+						"service epoch last_verified_at index was created before the legacy column ALTER",
+					);
+				}
+				if (
+					normalized.includes("CREATE INDEX") &&
+					normalized.includes(
+						"idx_cache_flight_recorder_partitions_last_verified_at",
+					) &&
+					!partitionLastVerifiedAtAdded
+				) {
+					throw new Error(
+						"partition last_verified_at index was created before the legacy column ALTER",
+					);
+				}
+				statements.push(normalized);
+				if (
+					normalized.includes(
+						"ALTER TABLE cache_flight_recorder_turns ADD COLUMN observation_partition_id TEXT REFERENCES cache_flight_recorder_partitions(id)",
+					)
+				) {
+					observationPartitionColumnAdded = true;
+				}
+				if (
+					normalized.includes(
+						"ALTER TABLE cache_flight_recorder_service_epochs ADD COLUMN last_verified_at",
+					)
+				) {
+					serviceEpochLastVerifiedAtAdded = true;
+				}
+				if (
+					normalized.includes(
+						"ALTER TABLE cache_flight_recorder_partitions ADD COLUMN last_verified_at",
+					)
+				) {
+					partitionLastVerifiedAtAdded = true;
+				}
+				return [];
+			},
+			get: async <T>(
+				sql: string,
+				params?: readonly unknown[],
+			): Promise<T | null> => {
+				if (sql.includes("information_schema.columns")) {
+					const [table, column] = params ?? [];
+					const missingLegacyColumn =
+						(table === "cache_flight_recorder_turns" &&
+							column === "observation_partition_id") ||
+						(table === "cache_flight_recorder_service_epochs" &&
+							column === "last_verified_at") ||
+						(table === "cache_flight_recorder_partitions" &&
+							column === "last_verified_at");
+					return { exists: missingLegacyColumn ? 0 : 1 } as T;
+				}
+				if (sql.includes("pg_indexes")) {
+					return { exists: 1 } as T;
+				}
+				return null;
+			},
+			query: async () => [],
+			run: async () => {},
+			runWithChanges: async () => 0,
+		};
+
+		await runMigrationsPg(legacyLikeAdapter as never);
+
+		const serviceEpochCreateIndex = statements.findIndex((sql) =>
+			sql.includes(
+				"CREATE TABLE IF NOT EXISTS cache_flight_recorder_service_epochs",
+			),
+		);
+		const partitionCreateIndex = statements.findIndex((sql) =>
+			sql.includes(
+				"CREATE TABLE IF NOT EXISTS cache_flight_recorder_partitions",
+			),
+		);
+		const turnReferenceAlterIndex = statements.findIndex((sql) =>
+			sql.includes(
+				"ALTER TABLE cache_flight_recorder_turns ADD COLUMN observation_partition_id TEXT REFERENCES cache_flight_recorder_partitions(id)",
+			),
+		);
+
+		expect(serviceEpochCreateIndex).toBeGreaterThanOrEqual(0);
+		expect(partitionCreateIndex).toBeGreaterThanOrEqual(0);
+		expect(turnReferenceAlterIndex).toBeGreaterThanOrEqual(0);
+		expect(serviceEpochCreateIndex).toBeLessThan(turnReferenceAlterIndex);
+		expect(partitionCreateIndex).toBeLessThan(turnReferenceAlterIndex);
+
+		const turnPartitionIndex = statements.findIndex((sql) =>
+			sql.includes(
+				"CREATE INDEX IF NOT EXISTS idx_cache_flight_recorder_turns_partition",
+			),
+		);
+		const turnCleanupIndex = statements.findIndex((sql) =>
+			sql.includes(
+				"CREATE INDEX IF NOT EXISTS idx_cache_flight_recorder_turns_cleanup",
+			),
+		);
+		expect(turnPartitionIndex).toBeGreaterThan(turnReferenceAlterIndex);
+		expect(turnCleanupIndex).toBeGreaterThan(turnReferenceAlterIndex);
+
+		// Same before/after ordering guarantee for last_verified_at: the ALTER
+		// must run (via columnsToAdd) before either covering index is
+		// created.
+		const serviceEpochLastVerifiedAtAlterIndex = statements.findIndex((sql) =>
+			sql.includes(
+				"ALTER TABLE cache_flight_recorder_service_epochs ADD COLUMN last_verified_at",
+			),
+		);
+		const partitionLastVerifiedAtAlterIndex = statements.findIndex((sql) =>
+			sql.includes(
+				"ALTER TABLE cache_flight_recorder_partitions ADD COLUMN last_verified_at",
+			),
+		);
+		const serviceEpochLastVerifiedAtCreateIndex = statements.findIndex((sql) =>
+			sql.includes(
+				"CREATE INDEX IF NOT EXISTS idx_cache_flight_recorder_service_epochs_last_verified_at",
+			),
+		);
+		const partitionLastVerifiedAtCreateIndex = statements.findIndex((sql) =>
+			sql.includes(
+				"CREATE INDEX IF NOT EXISTS idx_cache_flight_recorder_partitions_last_verified_at",
+			),
+		);
+		expect(serviceEpochLastVerifiedAtAlterIndex).toBeGreaterThanOrEqual(0);
+		expect(partitionLastVerifiedAtAlterIndex).toBeGreaterThanOrEqual(0);
+		expect(serviceEpochLastVerifiedAtCreateIndex).toBeGreaterThan(
+			serviceEpochLastVerifiedAtAlterIndex,
+		);
+		expect(partitionLastVerifiedAtCreateIndex).toBeGreaterThan(
+			partitionLastVerifiedAtAlterIndex,
+		);
+	});
 });
 
 // ---------------------------------------------------------------------------
 // Live PostgreSQL smoke test — only runs when a real PG server is reachable.
 // ---------------------------------------------------------------------------
 
-function hasLivePg(): boolean {
-	const url = process.env.DATABASE_URL;
-	return (
-		!!url && (url.startsWith("postgres://") || url.startsWith("postgresql://"))
-	);
+function isSafeDisposableLoopbackTestPgUrl(value: string | undefined): boolean {
+	if (!value) return false;
+	let url: URL;
+	try {
+		url = new URL(value);
+	} catch {
+		return false;
+	}
+	if (url.protocol !== "postgres:" && url.protocol !== "postgresql:") {
+		return false;
+	}
+	const host = url.hostname.toLowerCase();
+	const loopback =
+		host === "localhost" ||
+		host === "127.0.0.1" ||
+		host === "::1" ||
+		host === "[::1]";
+	const dbName = decodeURIComponent(url.pathname.replace(/^\//, ""));
+	return loopback && dbName.toLowerCase().includes("test");
 }
 
-const livePgAvailable = hasLivePg();
+describe("PostgreSQL live test safety gate", () => {
+	it("only permits disposable loopback database URLs whose database name includes test", () => {
+		expect(
+			isSafeDisposableLoopbackTestPgUrl(
+				"postgres://user:pass@127.0.0.1:5432/better_ccflare_test",
+			),
+		).toBe(true);
+		expect(
+			isSafeDisposableLoopbackTestPgUrl(
+				"postgres://user:pass@localhost/better_ccflare",
+			),
+		).toBe(false);
+		expect(
+			isSafeDisposableLoopbackTestPgUrl(
+				"postgres://user:pass@db.internal/better_ccflare_test",
+			),
+		).toBe(false);
+		expect(isSafeDisposableLoopbackTestPgUrl(undefined)).toBe(false);
+	});
+});
+
+const livePgAvailable = isSafeDisposableLoopbackTestPgUrl(
+	process.env.DATABASE_URL,
+);
 
 describe.skipIf(!livePgAvailable)(
 	"PostgreSQL migrations (live, requires DATABASE_URL)",
@@ -482,6 +742,173 @@ describe.skipIf(!livePgAvailable)(
 				await adapter.unsafe(`DELETE FROM accounts WHERE name = $1`, [
 					"pg-dedup-cred-test",
 				]);
+				await adapter.close();
+			}
+		});
+
+		it("round trips sealed cache flight recorder rows, rejects immutable conflicts, and cleans orphaned registries", async () => {
+			const { SQL } = await import("bun");
+			const { BunSqlAdapter } = await import("./adapters/bun-sql-adapter");
+			const { ensureSchemaPg, runMigrationsPg } = await import(
+				"./migrations-pg"
+			);
+			const { CacheFlightRecorderRepository } = await import(
+				"./repositories/cache-flight-recorder.repository"
+			);
+
+			// biome-ignore lint/style/noNonNullAssertion: guarded by describe.skipIf(!livePgAvailable)
+			const databaseUrl = process.env.DATABASE_URL!;
+			const sqlClient = new SQL({ url: databaseUrl });
+			const adapter = new BunSqlAdapter(sqlClient, false);
+
+			const runId = `u3-live-${Date.now()}`;
+			const recorderConversationId = `${runId}-conversation`;
+			const epochId = `${runId}-epoch`;
+			const partitionId = `${runId}-partition`;
+			const keepalivePolicy: CacheFlightKeepalivePolicySnapshot = {
+				globalTtlMinutes: 20,
+				xaiTtlMinutes: 20,
+				effectiveXaiEnabled: true,
+				effectiveXaiTtlMinutes: 20,
+			};
+			const receipt: CacheFlightCohortSealReceipt = {
+				serviceEpoch: {
+					id: epochId,
+					occurrenceId: `${runId}-occurrence`,
+					sealContractVersion: 1,
+					deploymentRevision: `${runId}-deploy`,
+					serviceInstanceId: `${runId}-service`,
+					processStartedAt: "2026-08-08T10:00:00.000Z",
+					nativeCacheState: "enabled",
+					recorderState: "enabled",
+					keepalivePolicy,
+					completeness: "complete",
+					unavailableDimensions: [],
+				},
+				observationPartition: {
+					id: partitionId,
+					serviceEpochId: epochId,
+					servingAccountScope: `${runId}-serving`,
+					routeModelEpoch: `${runId}-route`,
+					completeness: "complete",
+					unavailableDimensions: [],
+				},
+				completeness: "complete",
+				unavailableDimensions: [],
+			};
+			const makeTurn = (timestampMs: number): TurnEvidence => ({
+				sequence: 0,
+				timestamp: new Date(timestampMs).toISOString(),
+				identityFingerprint: `${runId}-identity`,
+				servingAccountId: `${runId}-account`,
+				prefixFingerprint: `${runId}-prefix`,
+				cacheOutcome: "hit",
+				inputTokens: 100,
+				cachedTokens: 80,
+				completeness: "complete",
+				unavailableDimensions: [],
+			});
+			const countWhere = async (
+				table: string,
+				column: string,
+				value: string,
+			): Promise<number> => {
+				const row = await adapter.get<{ count: number | string }>(
+					`SELECT COUNT(*) AS count FROM ${table} WHERE ${column} = ?`,
+					[value],
+				);
+				return Number(row?.count ?? 0);
+			};
+
+			try {
+				await expect(ensureSchemaPg(adapter)).resolves.toBeUndefined();
+				await expect(runMigrationsPg(adapter)).resolves.toBeUndefined();
+
+				const repo = new CacheFlightRecorderRepository(adapter);
+				await repo.appendTurn(
+					recorderConversationId,
+					makeTurn(1_000),
+					1_000,
+					receipt,
+				);
+
+				const loaded = await repo.loadTimeline(recorderConversationId);
+				expect(loaded?.turns).toHaveLength(1);
+				expect(loaded?.turns[0]?.seal).toEqual(receipt);
+				expect(loaded?.turns[0]?.seal?.completeness).toBe("complete");
+				expect(
+					await countWhere(
+						"cache_flight_recorder_service_epochs",
+						"id",
+						epochId,
+					),
+				).toBe(1);
+				expect(
+					await countWhere(
+						"cache_flight_recorder_partitions",
+						"id",
+						partitionId,
+					),
+				).toBe(1);
+
+				const conflictingReceipt: CacheFlightCohortSealReceipt = {
+					...receipt,
+					serviceEpoch: {
+						...receipt.serviceEpoch,
+						deploymentRevision: `${runId}-conflict`,
+					},
+				};
+				await expect(
+					repo.appendTurn(
+						recorderConversationId,
+						makeTurn(1_500),
+						1_500,
+						conflictingReceipt,
+					),
+				).rejects.toThrow("immutable cache flight service epoch");
+				expect(
+					await countWhere(
+						"cache_flight_recorder_turns",
+						"recorder_conversation_id",
+						recorderConversationId,
+					),
+				).toBe(1);
+
+				await expect(repo.expireOlderThan(2_000, 3_000)).resolves.toBe(1);
+				expect(await repo.loadTimeline(recorderConversationId)).toBeNull();
+				expect(
+					await countWhere(
+						"cache_flight_recorder_partitions",
+						"id",
+						partitionId,
+					),
+				).toBe(0);
+				expect(
+					await countWhere(
+						"cache_flight_recorder_service_epochs",
+						"id",
+						epochId,
+					),
+				).toBe(0);
+			} finally {
+				await adapter.unsafe(
+					`DELETE FROM cache_flight_recorder_conversations
+					 WHERE recorder_conversation_id = ?`,
+					[recorderConversationId],
+				);
+				await adapter.unsafe(
+					`DELETE FROM cache_flight_recorder_tombstones
+					 WHERE recorder_conversation_id = ?`,
+					[recorderConversationId],
+				);
+				await adapter.unsafe(
+					`DELETE FROM cache_flight_recorder_partitions WHERE id = ?`,
+					[partitionId],
+				);
+				await adapter.unsafe(
+					`DELETE FROM cache_flight_recorder_service_epochs WHERE id = ?`,
+					[epochId],
+				);
 				await adapter.close();
 			}
 		});
