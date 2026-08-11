@@ -25,13 +25,6 @@ import { RoutingAttemptLedger } from "../handlers/routing-attempt-ledger";
 
 // Loading proxy-operations in a focused test must not require ignored embedded
 // database worker artifacts from the packaged CLI build.
-mock.module("@better-ccflare/database", () => ({
-	AsyncDbWriter: class AsyncDbWriter {},
-	DatabaseFactory: class DatabaseFactory {},
-	DatabaseOperations: class DatabaseOperations {},
-	ModelTranslationRepository: class ModelTranslationRepository {},
-}));
-
 const usageCollectorModule = await import("../usage-collector");
 spyOn(usageCollectorModule, "getUsageCollector").mockReturnValue({
 	handleStart: mock(() => undefined),

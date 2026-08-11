@@ -41,6 +41,11 @@ export * from "./server-tools/replay-envelope";
 export * from "./types";
 // Export usage fetcher
 export * from "./usage-fetcher";
+export {
+	CODEX_REASONING_RETENTION_PREFIX,
+	isProxyMintedCodexReasoningBlock,
+	stripCodexReasoningRetention,
+} from "./utils/codex-reasoning-retention";
 // Export xAI usage fetcher
 export * from "./xai-usage-fetcher";
 // Export Zai usage fetcher

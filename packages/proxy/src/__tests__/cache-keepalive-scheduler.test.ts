@@ -25,6 +25,8 @@ import {
 import type { Config } from "@better-ccflare/config";
 import type { ProxyContext } from "../proxy";
 
+const originalFetch = globalThis.fetch;
+
 // ---------------------------------------------------------------------------
 // Module mock — must be declared before importing the scheduler so that bun's
 // module resolution picks up the mock when it resolves @better-ccflare/core.
@@ -208,9 +210,7 @@ describe("CacheKeepaliveScheduler", () => {
 	});
 
 	afterEach(() => {
-		// Restore fetch to the real implementation.
-		// @ts-expect-error — resetting to undefined lets bun restore native fetch.
-		globalThis.fetch = undefined;
+		globalThis.fetch = originalFetch;
 		resetStore();
 	});
 

@@ -1,19 +1,10 @@
-import { describe, expect, it, mock, spyOn } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import type { ServerToolReplayKeysState } from "@better-ccflare/config";
 import type {
 	ServerToolReplayEnvelopeBinding,
 	ServerToolReplayEnvelopePayload,
 	ServerToolReplayIssuanceClaim,
 } from "@better-ccflare/providers";
-
-// Focused source-worktree tests must not require generated database workers
-// pulled in transitively by the providers package root.
-mock.module("@better-ccflare/database", () => ({
-	AsyncDbWriter: class AsyncDbWriter {},
-	DatabaseFactory: class DatabaseFactory {},
-	DatabaseOperations: class DatabaseOperations {},
-	ModelTranslationRepository: class ModelTranslationRepository {},
-}));
 
 const {
 	createServerToolReplayEnvelopeCodec,

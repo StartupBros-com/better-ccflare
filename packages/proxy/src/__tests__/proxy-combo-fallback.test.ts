@@ -10,13 +10,6 @@ import { DegradedOwnerOverlay } from "../degraded-owner-overlay";
 import type { ProxyContext } from "../handlers";
 import type { UsageCollector } from "../usage-collector";
 
-mock.module("@better-ccflare/database", () => ({
-	AsyncDbWriter: class AsyncDbWriter {},
-	DatabaseFactory: class DatabaseFactory {},
-	DatabaseOperations: class DatabaseOperations {},
-	ModelTranslationRepository: class ModelTranslationRepository {},
-}));
-
 const { usageCache } = await import("@better-ccflare/providers");
 const usageCollectorModule = await import("../usage-collector");
 const { handleProxy } = await import("../proxy");

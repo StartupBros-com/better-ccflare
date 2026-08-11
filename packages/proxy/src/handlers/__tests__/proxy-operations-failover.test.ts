@@ -17,15 +17,6 @@ import type {
 import { ServerToolCandidateCapabilityError } from "../../server-tool-routing-errors";
 import type { ProxyContext } from "../proxy-types";
 
-// Source worktrees intentionally omit generated database worker bundles. This
-// harness injects dbOps and never constructs the database classes.
-mock.module("@better-ccflare/database", () => ({
-	AsyncDbWriter: class AsyncDbWriter {},
-	DatabaseFactory: class DatabaseFactory {},
-	DatabaseOperations: class DatabaseOperations {},
-	ModelTranslationRepository: class ModelTranslationRepository {},
-}));
-
 // Records every response handed to cancelDiscardedResponseBody, so the
 // "releases the rate-limit-check clone" test below (529 failover describe
 // block) can observe the release. Since the v3.5.48 sync, that call site

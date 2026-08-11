@@ -12,16 +12,6 @@ import { logBus } from "@better-ccflare/logger";
 import type { Account, RequestMeta } from "@better-ccflare/types";
 import type { ProxyContext } from "../proxy-types";
 
-// Source worktrees intentionally exclude generated database worker bundles.
-// This focused proxy harness supplies dbOps directly and never constructs these
-// classes, so keep the unit test independent from generated build artifacts.
-mock.module("@better-ccflare/database", () => ({
-	AsyncDbWriter: class AsyncDbWriter {},
-	DatabaseFactory: class DatabaseFactory {},
-	DatabaseOperations: class DatabaseOperations {},
-	ModelTranslationRepository: class ModelTranslationRepository {},
-}));
-
 const { CodexProvider, estimateAnthropicAdmissionTokens, getProvider } =
 	await import("@better-ccflare/providers");
 const usageCollectorModule = await import("../../usage-collector");

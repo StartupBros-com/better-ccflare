@@ -16,13 +16,6 @@ import type { ProxyContext } from "../handlers";
 
 // Loading proxy.ts in a focused unit test must not require ignored embedded
 // worker artifacts from the CLI build.
-mock.module("@better-ccflare/database", () => ({
-	AsyncDbWriter: class AsyncDbWriter {},
-	DatabaseFactory: class DatabaseFactory {},
-	DatabaseOperations: class DatabaseOperations {},
-	ModelTranslationRepository: class ModelTranslationRepository {},
-}));
-
 const { usageCache } = await import("@better-ccflare/providers");
 const usageCollectorModule = await import("../usage-collector");
 const { handleProxy } = await import("../proxy");
