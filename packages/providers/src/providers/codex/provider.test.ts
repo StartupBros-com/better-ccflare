@@ -45,6 +45,7 @@ afterEach(() => {
 	delete process.env[CODEX_CACHE_KEY_MODE_ENV];
 	delete process.env[CODEX_CACHE_KEY_SESSION_PERCENT_ENV];
 	delete process.env[CODEX_SINGLE_ORCHESTRATION_ROOT_ENV];
+	delete process.env.CCFLARE_CODEX_REASONING_RETENTION;
 	delete process.env[CODEX_TRACE_DIR_ENV];
 	delete process.env[CODEX_TRACE_HMAC_KEY_ENV];
 	resetOrchestrationElectionForTest();
@@ -282,6 +283,213 @@ describe("CodexProvider request conversion", () => {
 			role: "system",
 			content: [{ type: "input_text", text: "follow policy" }],
 		});
+	});
+
+	it("replays retained assistant reasoning before later text and tool items", async () => {
+		const provider = new CodexProvider();
+		const request = new Request("https://example.com/v1/messages", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				model: "claude-3-5-sonnet-20241022",
+				max_tokens: 100,
+				messages: [
+					{
+						role: "assistant",
+						content: [
+							{ type: "text", text: "Let me inspect it." },
+							{
+								type: "redacted_thinking",
+								data: "bccfr1.rs_turn_1.cipher.part.more",
+							},
+							{ type: "text", text: "I found it." },
+							{
+								type: "tool_use",
+								id: "call_1",
+								name: "search",
+								input: { query: "reasoning retention" },
+							},
+						],
+					},
+				],
+			}),
+		});
+
+		const transformed = await provider.transformRequestBody(request);
+		const body = await transformed.json();
+
+		expect(body.input).toEqual([
+			{
+				role: "assistant",
+				content: [{ type: "output_text", text: "Let me inspect it." }],
+			},
+			{
+				type: "reasoning",
+				id: "rs_turn_1",
+				summary: [],
+				encrypted_content: "cipher.part.more",
+			},
+			{
+				role: "assistant",
+				content: [{ type: "output_text", text: "I found it." }],
+			},
+			{
+				type: "function_call",
+				call_id: "call_1",
+				name: "search",
+				arguments: JSON.stringify({ query: "reasoning retention" }),
+				status: "completed",
+			},
+		]);
+		expect(body.include).toEqual(["reasoning.encrypted_content"]);
+	});
+
+	it("drops legacy retained reasoning with an empty id while preserving siblings", async () => {
+		const provider = new CodexProvider();
+		const transformed = await provider.transformRequestBody(
+			new Request("https://example.com/v1/messages", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					model: "claude-3-5-sonnet-20241022",
+					max_tokens: 100,
+					messages: [
+						{
+							role: "assistant",
+							content: [
+								{ type: "text", text: "before" },
+								{
+									type: "redacted_thinking",
+									data: "bccfr1..ciphertext",
+								},
+								{ type: "text", text: "after" },
+							],
+						},
+					],
+				}),
+			}),
+		);
+
+		expect((await transformed.json()).input).toEqual([
+			{
+				role: "assistant",
+				content: [
+					{ type: "output_text", text: "before" },
+					{ type: "output_text", text: "after" },
+				],
+			},
+		]);
+	});
+
+	it("skips foreign redacted and signed thinking while preserving siblings", async () => {
+		const provider = new CodexProvider();
+		const request = new Request("https://example.com/v1/messages", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				model: "claude-3-5-sonnet-20241022",
+				max_tokens: 100,
+				messages: [
+					{
+						role: "assistant",
+						content: [
+							{ type: "text", text: "before" },
+							{
+								type: "redacted_thinking",
+								data: "foreign-provider-ciphertext",
+							},
+							{
+								type: "redacted_thinking",
+								data: "bccfr1.missing_second_separator",
+							},
+							{
+								type: "redacted_thinking",
+								data: "bccfr1.rs$invalid.ciphertext",
+							},
+							{
+								type: "redacted_thinking",
+								data: "bccfr1.rs_empty.",
+							},
+							{
+								type: "thinking",
+								thinking: "private thought",
+								signature: "anthropic-signature",
+							},
+							{ type: "text", text: "after" },
+							{
+								type: "tool_use",
+								id: "call_2",
+								name: "lookup",
+								input: { term: "value" },
+							},
+						],
+					},
+				],
+			}),
+		});
+
+		const transformed = await provider.transformRequestBody(request);
+		const body = await transformed.json();
+
+		expect(body.input).toEqual([
+			{
+				role: "assistant",
+				content: [
+					{ type: "output_text", text: "before" },
+					{ type: "output_text", text: "after" },
+				],
+			},
+			{
+				type: "function_call",
+				call_id: "call_2",
+				name: "lookup",
+				arguments: JSON.stringify({ term: "value" }),
+				status: "completed",
+			},
+		]);
+		expect(
+			body.input.some((item: { type?: string }) => item.type === "reasoning"),
+		).toBeFalse();
+	});
+
+	it("restores legacy request behavior when reasoning retention is disabled", async () => {
+		process.env.CCFLARE_CODEX_REASONING_RETENTION = "0";
+		const provider = new CodexProvider();
+		const request = new Request("https://example.com/v1/messages", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				model: "claude-3-5-sonnet-20241022",
+				max_tokens: 100,
+				messages: [
+					{
+						role: "assistant",
+						content: [
+							{ type: "text", text: "before" },
+							{
+								type: "redacted_thinking",
+								data: "bccfr1.rs_disabled.do-not-replay",
+							},
+							{ type: "text", text: "after" },
+						],
+					},
+				],
+			}),
+		});
+
+		const transformed = await provider.transformRequestBody(request);
+		const body = await transformed.json();
+
+		expect(body.input).toEqual([
+			{
+				role: "assistant",
+				content: [
+					{ type: "output_text", text: "before" },
+					{ type: "output_text", text: "after" },
+				],
+			},
+		]);
+		expect(body.include).toBeUndefined();
 	});
 
 	it("marks replayed tool call items as completed", async () => {
@@ -1731,6 +1939,734 @@ describe("CodexProvider.processResponse", () => {
 		expect(body).not.toContain("abrupt_stream_eof");
 	});
 
+	it("does not prematurely close an in-flight function-call block when reasoning completes", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_interleaved", model: "gpt-5.6-sol" },
+			}),
+			...eventLine("response.output_item.added", {
+				item: { type: "function_call", call_id: "call_1", name: "Read" },
+				output_index: 0,
+			}),
+			...eventLine("response.function_call_arguments.delta", {
+				delta: '{"path":',
+				output_index: 0,
+			}),
+			...eventLine("response.output_item.done", {
+				item: {
+					type: "reasoning",
+					id: "rs_mid",
+					encrypted_content: "midstream",
+				},
+				output_index: 1,
+			}),
+			...eventLine("response.function_call_arguments.delta", {
+				delta: '"x"}',
+				output_index: 0,
+			}),
+			...eventLine("response.output_item.done", {
+				item: { type: "function_call", call_id: "call_1", name: "Read" },
+				output_index: 0,
+			}),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.6-sol",
+					usage: { input_tokens: 1, output_tokens: 1 },
+				},
+			}),
+		]);
+		const transformed = await provider.processResponse(
+			new Response(upstreamBody, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+
+		const transformedBody = await transformed.text();
+		const events = transformedBody
+			.split("\n")
+			.filter((line) => line.startsWith("data:"))
+			.map(
+				(line) =>
+					JSON.parse(line.slice("data:".length).trim()) as Record<
+						string,
+						unknown
+					>,
+			);
+
+		// Block lifecycles must be strictly sequential on the wire: the deferred
+		// reasoning block emits only after the in-flight tool block fully closes.
+		const blockEvents = events
+			.filter((event) =>
+				[
+					"content_block_start",
+					"content_block_delta",
+					"content_block_stop",
+				].includes(event.type as string),
+			)
+			.map((event) => ({
+				type: event.type,
+				index: event.index,
+				blockType:
+					(event.content_block as Record<string, unknown>)?.type ??
+					(event.delta as Record<string, unknown>)?.type,
+			}));
+		expect(blockEvents).toEqual([
+			{ type: "content_block_start", index: 0, blockType: "tool_use" },
+			{ type: "content_block_delta", index: 0, blockType: "input_json_delta" },
+			{ type: "content_block_stop", index: 0, blockType: undefined },
+			{
+				type: "content_block_start",
+				index: 1,
+				blockType: "redacted_thinking",
+			},
+			{ type: "content_block_stop", index: 1, blockType: undefined },
+		]);
+		expect(events).toContainEqual({
+			type: "content_block_start",
+			index: 1,
+			content_block: {
+				type: "redacted_thinking",
+				data: "bccfr1.rs_mid.midstream",
+			},
+		});
+	});
+
+	it("flushes deferred reasoning at stream end when the tool block never closes", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_truncated", model: "gpt-5.6-sol" },
+			}),
+			...eventLine("response.output_item.added", {
+				item: { type: "function_call", call_id: "call_1", name: "Read" },
+				output_index: 0,
+			}),
+			...eventLine("response.output_item.done", {
+				item: {
+					type: "reasoning",
+					id: "rs_trunc",
+					encrypted_content: "kept",
+				},
+				output_index: 1,
+			}),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.6-sol",
+					usage: { input_tokens: 1, output_tokens: 1 },
+				},
+			}),
+		]);
+		const transformed = await provider.processResponse(
+			new Response(upstreamBody, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+
+		const transformedBody = await transformed.text();
+		const events = transformedBody
+			.split("\n")
+			.filter((line) => line.startsWith("data:"))
+			.map(
+				(line) =>
+					JSON.parse(line.slice("data:".length).trim()) as Record<
+						string,
+						unknown
+					>,
+			);
+
+		// The truncated tool block is closed by the terminal path, then the
+		// deferred reasoning flushes at the next index — never lost, never
+		// interleaved.
+		expect(events).toContainEqual({
+			type: "content_block_start",
+			index: 1,
+			content_block: {
+				type: "redacted_thinking",
+				data: "bccfr1.rs_trunc.kept",
+			},
+		});
+		const stopsByIndex = events
+			.filter((event) => event.type === "content_block_stop")
+			.map((event) => event.index);
+		expect(stopsByIndex).toEqual([0, 1]);
+		const messageStopAt = events.findIndex(
+			(event) => event.type === "message_stop",
+		);
+		const reasoningStopAt = events.findIndex(
+			(event) => event.type === "content_block_stop" && event.index === 1,
+		);
+		expect(messageStopAt).toBeGreaterThan(reasoningStopAt);
+	});
+
+	it("skips retained reasoning with unrepresentable ids and terminates the stream", async () => {
+		const provider = new CodexProvider();
+		const emit = async (item: Record<string, unknown>) => {
+			const upstreamBody = sseBody([
+				...eventLine("response.created", {
+					response: { id: "resp_ids", model: "gpt-5.6-sol" },
+				}),
+				...eventLine("response.output_item.done", {
+					item,
+					output_index: 0,
+				}),
+				...eventLine("response.completed", {
+					response: {
+						model: "gpt-5.6-sol",
+						usage: { input_tokens: 1, output_tokens: 1 },
+					},
+				}),
+			]);
+			const transformed = await provider.processResponse(
+				new Response(upstreamBody, {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				}),
+				null,
+			);
+			return await transformed.text();
+		};
+
+		for (const item of [
+			{ type: "reasoning", encrypted_content: "enc" },
+			{ type: "reasoning", id: "", encrypted_content: "enc" },
+			{ type: "reasoning", id: "rs.dotted", encrypted_content: "enc" },
+			{ type: "reasoning", id: "rs$invalid", encrypted_content: "enc" },
+		]) {
+			const body = await emit(item);
+			expect(body).not.toContain("redacted_thinking");
+			expect(body).not.toContain("bccfr1.");
+			expect(body.match(/event: message_delta/g)).toHaveLength(1);
+			expect(body.match(/event: message_stop/g)).toHaveLength(1);
+		}
+
+		const validBody = await emit({
+			type: "reasoning",
+			id: "rs_deadbeef",
+			encrypted_content: "enc",
+		});
+		expect(validBody).toContain('"data":"bccfr1.rs_deadbeef.enc"');
+		expect(validBody.match(/event: message_delta/g)).toHaveLength(1);
+		expect(validBody.match(/event: message_stop/g)).toHaveLength(1);
+
+		const hyphenatedBody = await emit({
+			type: "reasoning",
+			id: "rs-hyphen-probe",
+			encrypted_content: "enc",
+		});
+		expect(hyphenatedBody).toContain('"data":"bccfr1.rs-hyphen-probe.enc"');
+
+		const replayed = await provider.transformRequestBody(
+			new Request("http://localhost/v1/messages", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					model: "gpt-5.6-sol",
+					max_tokens: 10,
+					messages: [
+						{
+							role: "assistant",
+							content: [
+								{
+									type: "redacted_thinking",
+									data: "bccfr1.rs-hyphen-probe.enc",
+								},
+							],
+						},
+					],
+				}),
+			}),
+		);
+		expect((await replayed.json()).input).toContainEqual({
+			type: "reasoning",
+			id: "rs-hyphen-probe",
+			summary: [],
+			encrypted_content: "enc",
+		});
+	});
+
+	it("emits retained reasoning atomically before following text", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_reasoning", model: "gpt-5.6-sol" },
+			}),
+			...eventLine("response.output_item.done", {
+				item: {
+					type: "reasoning",
+					id: "rs_x",
+					encrypted_content: "abc.def",
+				},
+				output_index: 0,
+			}),
+			...eventLine("response.output_item.added", {
+				item: { type: "message" },
+				output_index: 1,
+			}),
+			...eventLine("response.content_part.added", {
+				part: { type: "output_text" },
+			}),
+			...eventLine("response.output_text.delta", { delta: "hello" }),
+			...eventLine("response.output_item.done", {
+				item: { type: "message" },
+				output_index: 1,
+			}),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.6-sol",
+					usage: { input_tokens: 1, output_tokens: 1 },
+				},
+			}),
+		]);
+		const transformed = await provider.processResponse(
+			new Response(upstreamBody, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+
+		const transformedBody = await transformed.text();
+		const events = transformedBody
+			.split("\n")
+			.filter((line) => line.startsWith("data:"))
+			.map(
+				(line) =>
+					JSON.parse(line.slice("data:".length).trim()) as Record<
+						string,
+						unknown
+					>,
+			);
+		const reasoningStartIndex = events.findIndex(
+			(event) =>
+				event.type === "content_block_start" &&
+				(event.content_block as Record<string, unknown>)?.type ===
+					"redacted_thinking",
+		);
+
+		expect(events[reasoningStartIndex]).toEqual({
+			type: "content_block_start",
+			index: 0,
+			content_block: {
+				type: "redacted_thinking",
+				data: "bccfr1.rs_x.abc.def",
+			},
+		});
+		expect(events[reasoningStartIndex + 1]).toEqual({
+			type: "content_block_stop",
+			index: 0,
+		});
+		expect(events).toContainEqual({
+			type: "content_block_start",
+			index: 1,
+			content_block: { type: "text", text: "" },
+		});
+		expect(events.at(-2)?.type).toBe("message_delta");
+		expect(events.at(-1)?.type).toBe("message_stop");
+	});
+
+	it("does not close a live text block when an invalid-id reasoning item is skipped", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_skip_interleave", model: "gpt-5.6-sol" },
+			}),
+			...eventLine("response.output_item.added", {
+				item: { type: "message" },
+				output_index: 0,
+			}),
+			...eventLine("response.content_part.added", {
+				part: { type: "output_text" },
+			}),
+			...eventLine("response.output_text.delta", { delta: "he" }),
+			// Unrepresentable id: nothing may be minted, and the live text block
+			// must stay open so its remaining delta is not orphaned.
+			...eventLine("response.output_item.done", {
+				item: {
+					type: "reasoning",
+					id: "rs.invalid",
+					encrypted_content: "cipher",
+				},
+				output_index: 1,
+			}),
+			...eventLine("response.output_text.delta", { delta: "llo" }),
+			...eventLine("response.output_item.done", {
+				item: { type: "message" },
+				output_index: 0,
+			}),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.6-sol",
+					usage: { input_tokens: 1, output_tokens: 1 },
+				},
+			}),
+		]);
+		const transformed = await provider.processResponse(
+			new Response(upstreamBody, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+		const events = (await transformed.text())
+			.split("\n")
+			.filter((line) => line.startsWith("data:"))
+			.map(
+				(line) =>
+					JSON.parse(line.slice("data:".length).trim()) as Record<
+						string,
+						unknown
+					>,
+			);
+
+		const blockEvents = events
+			.filter((event) =>
+				[
+					"content_block_start",
+					"content_block_delta",
+					"content_block_stop",
+				].includes(event.type as string),
+			)
+			.map((event) => ({
+				type: event.type,
+				index: event.index,
+				blockType:
+					(event.content_block as Record<string, unknown>)?.type ??
+					(event.delta as Record<string, unknown>)?.type,
+			}));
+
+		// Both deltas land inside the single open text block, which closes once.
+		expect(blockEvents).toEqual([
+			{ type: "content_block_start", index: 0, blockType: "text" },
+			{ type: "content_block_delta", index: 0, blockType: "text_delta" },
+			{ type: "content_block_delta", index: 0, blockType: "text_delta" },
+			{ type: "content_block_stop", index: 0, blockType: undefined },
+		]);
+		// Nothing was minted for the unrepresentable id.
+		expect(
+			events.some(
+				(event) =>
+					(event.content_block as Record<string, unknown>)?.type ===
+					"redacted_thinking",
+			),
+		).toBe(false);
+	});
+
+	it("defers reasoning that completes between text deltas of a live block", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_text_interleave", model: "gpt-5.6-sol" },
+			}),
+			...eventLine("response.output_item.added", {
+				item: { type: "message" },
+				output_index: 0,
+			}),
+			...eventLine("response.content_part.added", {
+				part: { type: "output_text" },
+			}),
+			...eventLine("response.output_text.delta", { delta: "he" }),
+			...eventLine("response.output_item.done", {
+				item: {
+					type: "reasoning",
+					id: "rs_between",
+					encrypted_content: "mid",
+				},
+				output_index: 1,
+			}),
+			...eventLine("response.output_text.delta", { delta: "llo" }),
+			...eventLine("response.output_item.done", {
+				item: { type: "message" },
+				output_index: 0,
+			}),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.6-sol",
+					usage: { input_tokens: 1, output_tokens: 1 },
+				},
+			}),
+		]);
+		const transformed = await provider.processResponse(
+			new Response(upstreamBody, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+		const events = (await transformed.text())
+			.split("\n")
+			.filter((line) => line.startsWith("data:"))
+			.map(
+				(line) =>
+					JSON.parse(line.slice("data:".length).trim()) as Record<
+						string,
+						unknown
+					>,
+			);
+
+		// Both text deltas must land at index 0 inside one open block — the
+		// pre-fix behavior closed the block at the reasoning boundary and
+		// orphaned the second delta at an unstarted index.
+		const blockEvents = events
+			.filter((event) =>
+				[
+					"content_block_start",
+					"content_block_delta",
+					"content_block_stop",
+				].includes(event.type as string),
+			)
+			.map((event) => ({
+				type: event.type,
+				index: event.index,
+				blockType:
+					(event.content_block as Record<string, unknown>)?.type ??
+					(event.delta as Record<string, unknown>)?.type,
+			}));
+		expect(blockEvents).toEqual([
+			{ type: "content_block_start", index: 0, blockType: "text" },
+			{ type: "content_block_delta", index: 0, blockType: "text_delta" },
+			{ type: "content_block_delta", index: 0, blockType: "text_delta" },
+			{ type: "content_block_stop", index: 0, blockType: undefined },
+			{
+				type: "content_block_start",
+				index: 1,
+				blockType: "redacted_thinking",
+			},
+			{ type: "content_block_stop", index: 1, blockType: undefined },
+		]);
+		expect(events).toContainEqual({
+			type: "content_block_start",
+			index: 1,
+			content_block: {
+				type: "redacted_thinking",
+				data: "bccfr1.rs_between.mid",
+			},
+		});
+	});
+
+	it("closes open text before emitting retained reasoning atomically", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_reasoning_after_text", model: "gpt-5.6-sol" },
+			}),
+			...eventLine("response.output_item.added", {
+				item: { type: "message" },
+				output_index: 0,
+			}),
+			...eventLine("response.content_part.added", {
+				part: { type: "output_text" },
+			}),
+			...eventLine("response.output_text.delta", { delta: "before" }),
+			...eventLine("response.output_item.done", {
+				item: {
+					type: "reasoning",
+					id: "rs_after_text",
+					encrypted_content: "ciphertext",
+				},
+				output_index: 1,
+			}),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.6-sol",
+					usage: { input_tokens: 1, output_tokens: 1 },
+				},
+			}),
+		]);
+		const transformed = await provider.processResponse(
+			new Response(upstreamBody, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+		const events = (await transformed.text())
+			.split("\n")
+			.filter((line) => line.startsWith("data:"))
+			.map(
+				(line) =>
+					JSON.parse(line.slice("data:".length).trim()) as Record<
+						string,
+						unknown
+					>,
+			);
+		const textStopIndex = events.findIndex(
+			(event) => event.type === "content_block_stop" && event.index === 0,
+		);
+
+		expect(events.slice(textStopIndex, textStopIndex + 3)).toEqual([
+			{ type: "content_block_stop", index: 0 },
+			{
+				type: "content_block_start",
+				index: 1,
+				content_block: {
+					type: "redacted_thinking",
+					data: "bccfr1.rs_after_text.ciphertext",
+				},
+			},
+			{ type: "content_block_stop", index: 1 },
+		]);
+	});
+
+	it("round-trips retained reasoning through Anthropic content", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_round_trip", model: "gpt-5.6-sol" },
+			}),
+			...eventLine("response.output_item.done", {
+				item: {
+					type: "reasoning",
+					id: "rs_round_trip",
+					encrypted_content: "cipher.with.dots",
+				},
+				output_index: 0,
+			}),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.6-sol",
+					usage: { input_tokens: 1, output_tokens: 1 },
+				},
+			}),
+		]);
+		const inbound = await provider.processResponse(
+			new Response(upstreamBody, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+		const retainedBlock = (await inbound.text())
+			.split("\n")
+			.filter((line) => line.startsWith("data:"))
+			.map(
+				(line) =>
+					JSON.parse(line.slice("data:".length).trim()) as Record<
+						string,
+						unknown
+					>,
+			)
+			.find(
+				(event) =>
+					event.type === "content_block_start" &&
+					(event.content_block as Record<string, unknown>)?.type ===
+						"redacted_thinking",
+			)?.content_block;
+		expect(retainedBlock).toBeDefined();
+
+		const outbound = await provider.transformRequestBody(
+			new Request("https://example.test/v1/messages", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					model: "claude-sonnet-4-5",
+					max_tokens: 16,
+					messages: [
+						{
+							role: "assistant",
+							content: [retainedBlock, { type: "text", text: "answer" }],
+						},
+					],
+				}),
+			}),
+		);
+		const outboundBody = await outbound.json();
+
+		expect(outboundBody.input[0]).toEqual({
+			type: "reasoning",
+			id: "rs_round_trip",
+			summary: [],
+			encrypted_content: "cipher.with.dots",
+		});
+	});
+
+	it("does not emit redacted thinking for unencrypted reasoning items", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_reasoning", model: "gpt-5.6-sol" },
+			}),
+			...eventLine("response.output_item.done", {
+				item: { type: "reasoning", id: "rs_plain", summary: [] },
+				output_index: 0,
+			}),
+			...eventLine("response.output_item.added", {
+				item: { type: "message" },
+				output_index: 1,
+			}),
+			...eventLine("response.content_part.added", {
+				part: { type: "output_text" },
+			}),
+			...eventLine("response.output_text.delta", { delta: "hello" }),
+			...eventLine("response.output_item.done", {
+				item: { type: "message" },
+				output_index: 1,
+			}),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.6-sol",
+					usage: { input_tokens: 1, output_tokens: 1 },
+				},
+			}),
+		]);
+		const transformed = await provider.processResponse(
+			new Response(upstreamBody, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+
+		const transformedBody = await transformed.text();
+
+		expect(transformedBody).not.toContain("redacted_thinking");
+		expect(transformedBody).toContain(
+			'"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}',
+		);
+		expect(transformedBody).toContain("event: message_delta");
+		expect(transformedBody).toContain("event: message_stop");
+	});
+
+	it("restores legacy response behavior when reasoning retention is disabled", async () => {
+		process.env.CCFLARE_CODEX_REASONING_RETENTION = "0";
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_disabled", model: "gpt-5.6-sol" },
+			}),
+			...eventLine("response.output_item.done", {
+				item: {
+					type: "reasoning",
+					id: "rs_disabled",
+					encrypted_content: "do-not-emit",
+				},
+				output_index: 0,
+			}),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.6-sol",
+					usage: { input_tokens: 1, output_tokens: 1 },
+				},
+			}),
+		]);
+		const transformed = await provider.processResponse(
+			new Response(upstreamBody, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+		const transformedBody = await transformed.text();
+
+		expect(transformedBody).not.toContain("redacted_thinking");
+		expect(transformedBody).toContain("event: message_delta");
+		expect(transformedBody).toContain("event: message_stop");
+	});
+
 	it("buffers tool-call arguments and emits them once before content_block_stop", async () => {
 		const provider = new CodexProvider();
 		const upstreamBody = sseBody([
@@ -2170,6 +3106,155 @@ describe("CodexProvider.processResponse", () => {
 		});
 	});
 
+	it("preserves retained reasoning with a representable id in non-streaming SSE-to-JSON conversion", async () => {
+		const provider = new CodexProvider();
+		const requestId = "req_non_stream_reasoning_1";
+		const originalRequest = new Request("https://example.test/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"x-better-ccflare-request-id": requestId,
+			},
+			body: JSON.stringify({
+				model: "claude-sonnet-4-5",
+				max_tokens: 16,
+				stream: false,
+				messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+			}),
+		});
+		await provider.transformRequestBody(originalRequest);
+
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_reasoning_json", model: "gpt-5.6-sol" },
+			}),
+			...eventLine("response.output_item.done", {
+				item: {
+					type: "reasoning",
+					id: "rs_c0ffee",
+					encrypted_content: "json.ciphertext",
+				},
+				output_index: 0,
+			}),
+			...eventLine("response.output_item.added", {
+				item: { type: "message" },
+				output_index: 1,
+			}),
+			...eventLine("response.content_part.added", {
+				part: { type: "output_text" },
+			}),
+			...eventLine("response.output_text.delta", { delta: "Hi" }),
+			...eventLine("response.output_item.done", {
+				item: { type: "message" },
+				output_index: 1,
+			}),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.6-sol",
+					usage: { input_tokens: 7, output_tokens: 2 },
+				},
+			}),
+		]);
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: {
+				"content-type": "text/event-stream",
+				"x-better-ccflare-request-id": requestId,
+				"x-better-ccflare-request-stream": "false",
+			},
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const payload = JSON.parse(await transformed.text()) as Record<
+			string,
+			unknown
+		>;
+
+		expect(payload.content).toEqual([
+			{
+				type: "redacted_thinking",
+				data: "bccfr1.rs_c0ffee.json.ciphertext",
+			},
+			{ type: "text", text: "Hi" },
+		]);
+	});
+
+	it("skips retained reasoning with unrepresentable ids in non-streaming responses", async () => {
+		const invalidItems: Array<Record<string, unknown>> = [
+			{ type: "reasoning", encrypted_content: "json.ciphertext" },
+			{ type: "reasoning", id: "", encrypted_content: "json.ciphertext" },
+			{
+				type: "reasoning",
+				id: "rs.dotted",
+				encrypted_content: "json.ciphertext",
+			},
+			{
+				type: "reasoning",
+				id: "rs$invalid",
+				encrypted_content: "json.ciphertext",
+			},
+		];
+
+		for (const [index, item] of invalidItems.entries()) {
+			const provider = new CodexProvider();
+			const requestId = `req_non_stream_invalid_reasoning_${index}`;
+			await provider.transformRequestBody(
+				new Request("https://example.test/v1/messages", {
+					method: "POST",
+					headers: {
+						"content-type": "application/json",
+						"x-better-ccflare-request-id": requestId,
+					},
+					body: JSON.stringify({
+						model: "claude-sonnet-4-5",
+						max_tokens: 16,
+						stream: false,
+						messages: [{ role: "user", content: "hi" }],
+					}),
+				}),
+			);
+
+			const upstreamBody = sseBody([
+				...eventLine("response.created", {
+					response: { id: `resp_invalid_${index}`, model: "gpt-5.6-sol" },
+				}),
+				...eventLine("response.output_item.done", {
+					item,
+					output_index: 0,
+				}),
+				...eventLine("response.content_part.added", {
+					part: { type: "output_text" },
+				}),
+				...eventLine("response.output_text.delta", { delta: "Hi" }),
+				...eventLine("response.output_item.done", {
+					item: { type: "message" },
+					output_index: 1,
+				}),
+				...eventLine("response.completed", {
+					response: {
+						model: "gpt-5.6-sol",
+						usage: { input_tokens: 7, output_tokens: 2 },
+					},
+				}),
+			]);
+			const transformed = await provider.processResponse(
+				new Response(upstreamBody, {
+					status: 200,
+					headers: {
+						"content-type": "text/event-stream",
+						"x-better-ccflare-request-id": requestId,
+						"x-better-ccflare-request-stream": "false",
+					},
+				}),
+				null,
+			);
+			const payload = await transformed.json();
+
+			expect(payload.content).toEqual([{ type: "text", text: "Hi" }]);
+			expect(JSON.stringify(payload)).not.toContain("bccfr1.");
+		}
+	});
+
 	it("preserves tool_use content in non-streaming SSE->JSON conversion", async () => {
 		const provider = new CodexProvider();
 		const requestId = "req_non_stream_tool_1";
@@ -2327,6 +3412,353 @@ describe("CodexProvider.processResponse", () => {
 				input: { query: "earnings", allowed_domains: ["reuters.com"] },
 			},
 		]);
+	});
+
+	it("strips a schema-confirmed-empty optional string param from non-streaming tool_use input (refs #133)", async () => {
+		const provider = new CodexProvider();
+		const requestId = "req_non_stream_enterworktree_empty_name";
+		const originalRequest = new Request("https://example.test/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"x-better-ccflare-request-id": requestId,
+			},
+			body: JSON.stringify({
+				model: "claude-sonnet-4-5",
+				max_tokens: 16,
+				stream: false,
+				tools: [
+					{
+						name: "EnterWorktree",
+						description: "Switch into a worktree",
+						input_schema: {
+							type: "object",
+							properties: {
+								name: { type: "string" },
+								path: { type: "string" },
+							},
+						},
+					},
+				],
+				messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+			}),
+		});
+		await provider.transformRequestBody(originalRequest);
+
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_tool", model: "gpt-5.4" },
+			}),
+			...eventLine("response.output_item.added", {
+				item: {
+					type: "function_call",
+					call_id: "call_1",
+					name: "EnterWorktree",
+				},
+				output_index: 0,
+			}),
+			...eventLine("response.function_call_arguments.delta", {
+				delta: '{"name":"","path":"/x/y"}',
+				output_index: 0,
+			}),
+			...eventLine("response.output_item.done", {
+				item: {
+					type: "function_call",
+					call_id: "call_1",
+					name: "EnterWorktree",
+				},
+				output_index: 0,
+			}),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.4",
+					usage: { input_tokens: 9, output_tokens: 4 },
+				},
+			}),
+		]);
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: {
+				"content-type": "text/event-stream",
+				"x-better-ccflare-request-id": requestId,
+				"x-better-ccflare-request-stream": "false",
+			},
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const payload = JSON.parse(await transformed.text()) as Record<
+			string,
+			unknown
+		>;
+		expect(payload.content).toEqual([
+			{
+				type: "tool_use",
+				id: "call_1",
+				name: "EnterWorktree",
+				input: { path: "/x/y" },
+			},
+		]);
+	});
+
+	it("strips a schema-confirmed-empty optional string param from streaming tool-call arguments (refs #133)", async () => {
+		const provider = new CodexProvider();
+		const requestId = "req_stream_enterworktree_empty_name";
+		const originalRequest = new Request("https://example.test/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"x-better-ccflare-request-id": requestId,
+			},
+			body: JSON.stringify({
+				model: "claude-sonnet-4-5",
+				max_tokens: 16,
+				stream: true,
+				tools: [
+					{
+						name: "EnterWorktree",
+						description: "Switch into a worktree",
+						input_schema: {
+							type: "object",
+							properties: {
+								name: { type: "string" },
+								path: { type: "string" },
+							},
+						},
+					},
+				],
+				messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+			}),
+		});
+		await provider.transformRequestBody(originalRequest);
+
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_test", model: "gpt-5.4" },
+			}),
+			...eventLine("response.output_item.added", {
+				item: {
+					type: "function_call",
+					call_id: "call_1",
+					name: "EnterWorktree",
+				},
+				output_index: 0,
+			}),
+			...eventLine("response.function_call_arguments.delta", {
+				delta: '{"name":"",',
+				output_index: 0,
+			}),
+			...eventLine("response.function_call_arguments.delta", {
+				delta: '"path":"/x/y"}',
+				output_index: 0,
+			}),
+			...eventLine("response.output_item.done", {
+				item: {
+					type: "function_call",
+					call_id: "call_1",
+					name: "EnterWorktree",
+				},
+				output_index: 0,
+			}),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.4",
+					usage: { input_tokens: 1, output_tokens: 1 },
+				},
+			}),
+		]);
+
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: {
+				"content-type": "text/event-stream",
+				"x-better-ccflare-request-id": requestId,
+				"x-better-ccflare-request-stream": "true",
+			},
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const transformedBody = await transformed.text();
+
+		expect(transformedBody).toContain(
+			'"partial_json":"{\\"path\\":\\"/x/y\\"}"',
+		);
+		expect(transformedBody).not.toContain('\\"name\\":\\"\\"');
+	});
+
+	it("strips null-valued tool-call arguments even without a registered schema", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_test", model: "gpt-5.4" },
+			}),
+			...eventLine("response.output_item.added", {
+				item: { type: "function_call", call_id: "call_1", name: "AnyTool" },
+				output_index: 0,
+			}),
+			...eventLine("response.function_call_arguments.delta", {
+				delta: '{"a":null,"b":"keep"}',
+				output_index: 0,
+			}),
+			...eventLine("response.output_item.done", {
+				item: { type: "function_call", call_id: "call_1", name: "AnyTool" },
+				output_index: 0,
+			}),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.4",
+					usage: { input_tokens: 1, output_tokens: 1 },
+				},
+			}),
+		]);
+
+		// requestId is never passed through transformRequestBody, so no schema
+		// is ever registered for it -- this isolates the unconditional
+		// null-strip behavior from the schema-confirmed empty-string strip.
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: {
+				"content-type": "text/event-stream",
+				"x-better-ccflare-request-id": "req_never_registered_null_strip",
+			},
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const transformedBody = await transformed.text();
+
+		expect(transformedBody).toContain('"partial_json":"{\\"b\\":\\"keep\\"}"');
+		expect(transformedBody).not.toContain('\\"a\\"');
+	});
+
+	it("keeps a schema-confirmed empty string when the key is required", async () => {
+		const provider = new CodexProvider();
+		const requestId = "req_non_stream_required_guard";
+		const originalRequest = new Request("https://example.test/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"x-better-ccflare-request-id": requestId,
+			},
+			body: JSON.stringify({
+				model: "claude-sonnet-4-5",
+				max_tokens: 16,
+				stream: false,
+				tools: [
+					{
+						name: "WriteNote",
+						description: "Write a note",
+						input_schema: {
+							type: "object",
+							properties: {
+								content: { type: "string" },
+							},
+							required: ["content"],
+						},
+					},
+				],
+				messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+			}),
+		});
+		await provider.transformRequestBody(originalRequest);
+
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_tool", model: "gpt-5.4" },
+			}),
+			...eventLine("response.output_item.added", {
+				item: { type: "function_call", call_id: "call_1", name: "WriteNote" },
+				output_index: 0,
+			}),
+			...eventLine("response.function_call_arguments.delta", {
+				delta: '{"content":""}',
+				output_index: 0,
+			}),
+			...eventLine("response.output_item.done", {
+				item: { type: "function_call", call_id: "call_1", name: "WriteNote" },
+				output_index: 0,
+			}),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.4",
+					usage: { input_tokens: 9, output_tokens: 4 },
+				},
+			}),
+		]);
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: {
+				"content-type": "text/event-stream",
+				"x-better-ccflare-request-id": requestId,
+				"x-better-ccflare-request-stream": "false",
+			},
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const payload = JSON.parse(await transformed.text()) as Record<
+			string,
+			unknown
+		>;
+		expect(payload.content).toEqual([
+			{
+				type: "tool_use",
+				id: "call_1",
+				name: "WriteNote",
+				input: { content: "" },
+			},
+		]);
+	});
+
+	it("keeps empty-string tool-call arguments on a schema cache miss (planted negative, refs #133)", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_test", model: "gpt-5.4" },
+			}),
+			...eventLine("response.output_item.added", {
+				item: {
+					type: "function_call",
+					call_id: "call_1",
+					name: "EnterWorktree",
+				},
+				output_index: 0,
+			}),
+			...eventLine("response.function_call_arguments.delta", {
+				delta: '{"name":"","path":"/x"}',
+				output_index: 0,
+			}),
+			...eventLine("response.output_item.done", {
+				item: {
+					type: "function_call",
+					call_id: "call_1",
+					name: "EnterWorktree",
+				},
+				output_index: 0,
+			}),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.4",
+					usage: { input_tokens: 1, output_tokens: 1 },
+				},
+			}),
+		]);
+
+		// requestId is never passed through transformRequestBody: this tool's
+		// schema was never registered for this request id. On a cache miss the
+		// generic pass must not guess -- "" survives on every key, including
+		// `name`, exactly as it arrived from the model.
+		const response = new Response(upstreamBody, {
+			status: 200,
+			headers: {
+				"content-type": "text/event-stream",
+				"x-better-ccflare-request-id": "req_never_registered_cache_miss",
+			},
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const transformedBody = await transformed.text();
+
+		expect(transformedBody).toContain(
+			'"partial_json":"{\\"name\\":\\"\\",\\"path\\":\\"/x\\"}"',
+		);
 	});
 
 	it("preserves non-object tool arguments in non-streaming SSE-to-JSON conversion", async () => {
@@ -5196,6 +6628,131 @@ describe("CodexProvider.transformRequestBody", () => {
 		expect(body.tool_choice).toBe("none");
 	});
 
+	it("leaves tool_choice unset when StructuredOutput coexists with another current tool", async () => {
+		const provider = new CodexProvider();
+		const request = new Request("https://example.com/v1/messages", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				model: "claude-opus-4-8",
+				max_tokens: 10,
+				messages: [
+					{ role: "user", content: "read then return structured output" },
+				],
+				tools: [
+					{
+						name: "Read",
+						description: "Read a file.",
+						input_schema: { type: "object" },
+					},
+					{
+						name: "StructuredOutput",
+						description: "Return structured output.",
+						input_schema: { type: "object" },
+					},
+				],
+			}),
+		});
+
+		const transformed = await provider.transformRequestBody(request);
+		const body = await transformed.json();
+		expect(body.tools.map((t: { name: string }) => t.name)).toEqual([
+			"Read",
+			"StructuredOutput",
+		]);
+		expect(body.tool_choice).toBeUndefined();
+	});
+
+	it("forces StructuredOutput tool_choice once orchestration filtering leaves it as the sole current tool for an attributed descendant", async () => {
+		const provider = new CodexProvider();
+		const request = new Request("https://example.com/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"x-better-ccflare-attributed-agent": "true",
+			},
+			body: JSON.stringify({
+				model: "claude-opus-4-8",
+				max_tokens: 10,
+				messages: [
+					{ role: "user", content: "delegate then return structured output" },
+				],
+				tools: [
+					{
+						name: "Agent",
+						description: "Delegate work.",
+						input_schema: { type: "object" },
+					},
+					{
+						name: "StructuredOutput",
+						description: "Return structured output.",
+						input_schema: { type: "object" },
+					},
+				],
+			}),
+		});
+
+		const transformed = await provider.transformRequestBody(request);
+		const body = await transformed.json();
+		// Agent is filtered by descendant admission, leaving StructuredOutput as
+		// the sole current tool, so the implicit function choice now applies.
+		expect(body.tools.map((t: { name: string }) => t.name)).toEqual([
+			"StructuredOutput",
+		]);
+		expect(body.tool_choice).toEqual({
+			type: "function",
+			name: "StructuredOutput",
+		});
+	});
+
+	it("leaves tool_choice unset when orchestration filtering still leaves multiple current tools for an attributed descendant", async () => {
+		const provider = new CodexProvider();
+		const request = new Request("https://example.com/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"x-better-ccflare-attributed-agent": "true",
+			},
+			body: JSON.stringify({
+				model: "claude-opus-4-8",
+				max_tokens: 10,
+				messages: [
+					{
+						role: "user",
+						content: "delegate, read, then return structured output",
+					},
+				],
+				tools: [
+					{
+						name: "Agent",
+						description: "Delegate work.",
+						input_schema: { type: "object" },
+					},
+					{
+						name: "Read",
+						description: "Read a file.",
+						input_schema: { type: "object" },
+					},
+					{
+						name: "StructuredOutput",
+						description: "Return structured output.",
+						input_schema: { type: "object" },
+					},
+				],
+			}),
+		});
+
+		const transformed = await provider.transformRequestBody(request);
+		const body = await transformed.json();
+		// Agent is filtered by descendant admission, but Read + StructuredOutput
+		// still coexist, so the implicit function choice must stay unset.
+		expect(body.tools.map((t: { name: string }) => t.name)).toEqual([
+			"Read",
+			"StructuredOutput",
+		]);
+		expect(body.tool_choice).toBeUndefined();
+	});
+
 	it("sanitizes tool input_schema: strips lookaround pattern and $schema", async () => {
 		const provider = new CodexProvider();
 		const request = new Request("https://example.com/v1/messages", {
@@ -5316,7 +6873,7 @@ describe("CodexProvider.transformRequestBody", () => {
 		).toEqual(["Read"]);
 	});
 
-	it("documents today's bug: a compaction-shaped follow-up turn loses Agent/Task at the provider boundary", async () => {
+	it("keeps Agent/Task for a compaction-shaped follow-up turn via shared call_id lineage", async () => {
 		const provider = new CodexProvider();
 		const sessionId = "44444444-4444-4444-8444-444444444444";
 		const tools = ["Agent", "Task", "Read"].map((name) => ({
@@ -5392,11 +6949,133 @@ describe("CodexProvider.transformRequestBody", () => {
 					record.phase === "request" &&
 					record.request_id === "compacted-follow-up",
 			);
-			// BUG (documented, not fixed here): the demotion diagnostics confirm
-			// this was a session that already had an elected root.
+			// FIXED: the compacted turn still carries the "agent-1" call_id as a
+			// function_call/function_call_output pair, so it overlaps the root's
+			// recorded lineage and is admitted as root (basis: lineage_match), not
+			// demoted.
 			expect(requestTrace).toMatchObject({
-				trace_schema_version: 12,
+				trace_schema_version: 15,
+				orchestration_admission: "root",
+				orchestration_basis: "lineage_match",
+				orchestration_demotion_observed: false,
+			});
+			expect(requestTrace?.elapsed_ms_since_root).toBeNull();
+		} finally {
+			delete process.env[CODEX_TRACE_DIR_ENV];
+			rmSync(traceDir, { recursive: true, force: true });
+		}
+
+		// FIXED: Agent/Task survive for what is still logically the
+		// orchestrator's own session, because the shared call_id lineage
+		// carries continuity across the compaction-reshaped identity.
+		expect(compacted.tools.map((tool: { name: string }) => tool.name)).toEqual([
+			"Agent",
+			"Task",
+			"Read",
+		]);
+	});
+
+	it("rejects a same-session sibling turn whose call_id lineage does not overlap the elected root", async () => {
+		const provider = new CodexProvider();
+		const sessionId = "55555555-5555-4555-8555-555555555555";
+		const tools = ["Agent", "Task", "Read"].map((name) => ({
+			name,
+			input_schema: { type: "object" },
+		}));
+		const send = async (
+			messages: unknown[],
+			headers: Record<string, string> = {},
+		) => {
+			const transformed = await provider.transformRequestBody(
+				new Request("https://example.com/v1/messages", {
+					method: "POST",
+					headers: { "content-type": "application/json", ...headers },
+					body: JSON.stringify({
+						model: "claude-opus-4-8",
+						max_tokens: 10,
+						metadata: { user_id: JSON.stringify({ session_id: sessionId }) },
+						messages,
+						tools,
+					}),
+				}),
+			);
+			return transformed.json();
+		};
+
+		const rootMessages = [
+			{ role: "user", content: "start the task" },
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "tool_use",
+						id: "root-call",
+						name: "Agent",
+						input: { prompt: "look into it" },
+					},
+				],
+			},
+			{
+				role: "user",
+				content: [
+					{
+						type: "tool_result",
+						tool_use_id: "root-call",
+						content: "findings",
+					},
+				],
+			},
+		];
+		const root = await send(rootMessages);
+		expect(root.tools.map((tool: { name: string }) => tool.name)).toEqual([
+			"Agent",
+			"Task",
+			"Read",
+		]);
+
+		// A same-session sibling turn with its own, unrelated call_id: same
+		// instructions, same session, but no lineage overlap with the elected
+		// root and a different derived identity (different first input item).
+		const siblingMessages = [
+			{ role: "user", content: "spawn a sibling task" },
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "tool_use",
+						id: "sibling-call",
+						name: "Agent",
+						input: { prompt: "unrelated" },
+					},
+				],
+			},
+			{
+				role: "user",
+				content: [
+					{
+						type: "tool_result",
+						tool_use_id: "sibling-call",
+						content: "unrelated findings",
+					},
+				],
+			},
+		];
+
+		const traceDir = mkdtempSync(join(tmpdir(), "codex-trace-"));
+		process.env[CODEX_TRACE_DIR_ENV] = traceDir;
+		let sibling: { tools: Array<{ name: string }> };
+		try {
+			sibling = await send(siblingMessages, {
+				"x-better-ccflare-request-id": "unrelated-sibling",
+			});
+			const requestTrace = readTraceRecords(traceDir).find(
+				(record) =>
+					record.phase === "request" &&
+					record.request_id === "unrelated-sibling",
+			);
+			expect(requestTrace).toMatchObject({
 				orchestration_admission: "non_root",
+				orchestration_basis: "rejected",
 				orchestration_demotion_observed: true,
 			});
 			expect(requestTrace?.elapsed_ms_since_root).toBeTypeOf("number");
@@ -5408,10 +7087,7 @@ describe("CodexProvider.transformRequestBody", () => {
 			rmSync(traceDir, { recursive: true, force: true });
 		}
 
-		// BUG (documented, not fixed here): Agent/Task are incorrectly filtered
-		// out of the request for what is still logically the orchestrator's own
-		// session, purely because compaction reshaped the derived identity.
-		expect(compacted.tools.map((tool: { name: string }) => tool.name)).toEqual([
+		expect(sibling.tools.map((tool: { name: string }) => tool.name)).toEqual([
 			"Read",
 		]);
 	});
@@ -5525,8 +7201,9 @@ describe("CodexProvider.transformRequestBody", () => {
 				(record) => record.phase === "request",
 			);
 			expect(requestTrace).toMatchObject({
-				trace_schema_version: 12,
-				orchestration_admission: "no_session",
+				trace_schema_version: 15,
+				orchestration_admission: "attributed_descendant",
+				orchestration_basis: null,
 				is_descendant: true,
 				tools_before_count: 3,
 				tools_after_count: 1,
@@ -5557,6 +7234,55 @@ describe("CodexProvider.transformRequestBody", () => {
 				output: "historical result",
 			}),
 		);
+	});
+
+	it("never lets an attributed descendant claim the empty orchestration root slot for its session", async () => {
+		const provider = new CodexProvider();
+		const sessionId = "66666666-6666-4666-8666-666666666666";
+		const tools = ["Agent", "Task", "Read"].map((name) => ({
+			name,
+			input_schema: { type: "object" },
+		}));
+		const send = async (attributed: boolean, content: string) => {
+			const transformed = await provider.transformRequestBody(
+				new Request("https://example.com/v1/messages", {
+					method: "POST",
+					headers: {
+						"content-type": "application/json",
+						...(attributed
+							? { "x-better-ccflare-attributed-agent": "true" }
+							: {}),
+					},
+					body: JSON.stringify({
+						model: "claude-opus-4-8",
+						max_tokens: 10,
+						metadata: { user_id: JSON.stringify({ session_id: sessionId }) },
+						messages: [{ role: "user", content }],
+						tools,
+					}),
+				}),
+			);
+			return transformed.json();
+		};
+
+		// A descendant request lands first in this session, with a valid
+		// session id. It must be filtered immediately (attributed_descendant)
+		// and must never touch election: no snapshot, no derived identity, no
+		// admit() call, no recorded root.
+		const descendant = await send(true, "delegated subtask");
+		expect(descendant.tools.map((tool: { name: string }) => tool.name)).toEqual(
+			["Read"],
+		);
+
+		// An ordinary (non-attributed) root request follows in the very same
+		// session. Because the descendant above never claimed the slot, this
+		// is still an uncontested initial claim and keeps Agent/Task.
+		const root = await send(false, "the real orchestrator turn");
+		expect(root.tools.map((tool: { name: string }) => tool.name)).toEqual([
+			"Agent",
+			"Task",
+			"Read",
+		]);
 	});
 
 	it.each([

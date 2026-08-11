@@ -11,6 +11,7 @@ import {
 import { sanitizeAnthropicRetryAfterSeconds } from "../anthropic-degraded-mode";
 import type { RoutingCapacityContext } from "./account-selector";
 import type { RequestRateLimitOutcome } from "./rate-limit-scope";
+import type { HostedDispatchState } from "./routing-attempt-ledger";
 
 const PROTECTED_ANTHROPIC_RETRY_CONFIG = Object.freeze({
 	retryMinMs: 5_000,
@@ -52,6 +53,11 @@ export interface RoutingTerminalOptions {
 	readonly routeCircuitRecoveryHint?: RouteCircuitRecoveryHint | null;
 	/** Request-local finite recovery learned after the selection snapshot. */
 	readonly modelRecoveryAt?: number | null;
+	/**
+	 * A committed hosted server tool can never be replayed by the guard. Omitted
+	 * preserves the legacy ordinary-request contract for non-ledger callers.
+	 */
+	readonly hostedDispatchState?: HostedDispatchState;
 }
 
 export type ProtectedAnthropicOverloadInput =
@@ -542,6 +548,21 @@ export function createRoutingTerminalResponse(
 	options: RoutingTerminalOptions,
 ): RoutingTerminalResult {
 	const now = options.now ?? Date.now();
+	if (options.hostedDispatchState === "hosted_dispatched") {
+		return {
+			kind: "route_unavailable",
+			response: createRouteUnavailableResponse({
+				accounts: options.accounts,
+				now,
+				message: options.message,
+				attemptedRoutes:
+					options.source === "attempts" ? options.upstreamAttempts : undefined,
+				// Do not expose even a finite circuit reopen time: any recovery marker,
+				// Retry-After hint, or legacy pool body would authorize guard replay.
+				routeCircuitRecoveryHint: null,
+			}),
+		};
+	}
 	const modelExhausted =
 		options.source === "selection"
 			? modelOnlyCapacity(options.capacityContext, options.accounts, now)

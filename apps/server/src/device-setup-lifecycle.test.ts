@@ -26,10 +26,13 @@ mock.module("@better-ccflare/openai-responses-adapter", () => ({
 }));
 mock.module("@better-ccflare/providers", () => ({
 	CODEX_DEFAULT_ENDPOINT: "https://example.invalid",
+	fetchCodexUsageData: async () => null,
 	fetchCodexUsageOnDemand: async () => null,
 	getOAuthProvider: () => ({ getOAuthConfig: () => ({ clientId: "test" }) }),
 	getProvider: () => null,
 	getRepresentativeUtilizationForProvider: () => null,
+	isCodexSubscriptionEndpoint: () => false,
+	resolveCodexEndpoint: (endpoint: string) => endpoint,
 	usageCache: { clear: () => {} },
 }));
 mock.module("@better-ccflare/providers/bedrock", () => ({
@@ -49,6 +52,11 @@ mock.module("@better-ccflare/proxy", () => {
 		clearAccountRefreshCache: () => {},
 		createAnthropicDegradedDetailedEventSink: () => undefined,
 		createAnthropicDegradedRuntimeHealth: () => ({}),
+		createDurableServerToolReplayWriterAdmission: () => ({
+			status: "unavailable" as const,
+			reason: "invalid_store" as const,
+			writerAdmission: { enabled: false as const },
+		}),
 		createGuardCorrelationVerifier: () => undefined,
 		createServerToolReplayRuntime: async () => ({
 			status: "disabled" as const,

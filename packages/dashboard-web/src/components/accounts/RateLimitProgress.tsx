@@ -1,13 +1,14 @@
 import { computeWindowStartMs, registerUIRefresh } from "@better-ccflare/core";
 import type { AnthropicUsageData, FullUsageData } from "@better-ccflare/types";
 import { useEffect, useState } from "react";
-import { cn } from "../../lib/utils";
+import { cn, formatShortDuration } from "../../lib/utils";
 import {
 	isAnthropicPeakHour,
 	isZaiPeakHour,
 	providerShowsCreditsBalance,
 	providerShowsWeeklyUsage,
 } from "../../utils/provider-utils";
+import { LiveCountdown } from "../LiveCountdown";
 import { Progress } from "../ui/progress";
 import {
 	collectAnthropicUsageRows,
@@ -16,6 +17,19 @@ import {
 	severityColor,
 	type UsageDisplay,
 } from "./rate-limit-helpers";
+
+/**
+ * Codex-only usage extras (plan_type, credits_balance,
+ * code_review_used_percent, code_review_resets_at) come from the free
+ * wham/usage poller and can be ABSENT from usageData at any moment -- live
+ * traffic overwrites cached extras between polls. Not part of the public
+ * FullUsageData union (see @better-ccflare/types), so every read here is
+ * null-safe and simply omits the corresponding element when absent.
+ */
+interface CodexUsageExtras {
+	code_review_used_percent?: number | null;
+	code_review_resets_at?: string | null;
+}
 
 interface RateLimitProgressProps {
 	resetIso: string | null;
@@ -74,14 +88,6 @@ function computeWindowThrottleUntil(
 	return resumeAt > now ? resumeAt : null;
 }
 
-function formatDuration(ms: number): string {
-	const totalMinutes = Math.round(ms / 60000);
-	const hours = Math.floor(totalMinutes / 60);
-	const minutes = totalMinutes % 60;
-	if (hours > 0) return `${hours}h ${minutes}m`;
-	return `${minutes}m`;
-}
-
 function formatThrottledUntil(throttledUntilMs: number, now: number): string {
 	const remainingMs = throttledUntilMs - now;
 	if (remainingMs < 60 * 1000) {
@@ -123,9 +129,9 @@ function computeProjectedMessage(
 	if (f <= 0) return "No usage recorded yet in this window";
 	const timeToExhaustMs = ((1 - f) / f) * elapsed;
 	if (timeToExhaustMs < remaining) {
-		return `Runs out ${formatDuration(remaining - timeToExhaustMs)} before reset`;
+		return `Runs out ${formatShortDuration(remaining - timeToExhaustMs)} before reset`;
 	}
-	return `Resets ${formatDuration(timeToExhaustMs - remaining)} before exhaustion`;
+	return `Resets ${formatShortDuration(timeToExhaustMs - remaining)} before exhaustion`;
 }
 
 export function RateLimitProgress({
@@ -208,10 +214,6 @@ export function RateLimitProgress({
 	}
 
 	const resetTime = resetIso ? new Date(resetIso).getTime() : Date.now();
-	const remainingMs = Math.max(0, resetTime - now);
-	const remainingMinutes = Math.ceil(remainingMs / 60000);
-	const _remainingHours = Math.floor(remainingMinutes / 60);
-	const _remainingMins = remainingMinutes % 60;
 
 	// Determine which usage windows to display
 	const usages: UsageDisplay[] = [];
@@ -451,6 +453,25 @@ export function RateLimitProgress({
 		});
 	}
 
+	// Codex code-review quota: a flat scalar pair on usageData (NOT a
+	// window-shaped object -- see api-usage.ts), rendered as its own row
+	// styled like the other window bars. Absent whenever the wham/usage
+	// poller hasn't reported it yet or a live-traffic snapshot dropped it.
+	if (provider === "codex" && showWeekly && usageData) {
+		const codexExtras = usageData as CodexUsageExtras;
+		if (
+			typeof codexExtras.code_review_used_percent === "number" &&
+			Number.isFinite(codexExtras.code_review_used_percent)
+		) {
+			usages.push({
+				utilization: codexExtras.code_review_used_percent,
+				window: "code_review",
+				resetTime: codexExtras.code_review_resets_at ?? null,
+				label: "Code Review",
+			});
+		}
+	}
+
 	const isZaiPeak = provider === "zai" && isZaiPeakHour(now);
 	const isAnthropicPeak = provider === "anthropic" && isAnthropicPeakHour(now);
 	const throttledWindowSet = new Set(usageThrottledWindows);
@@ -500,29 +521,19 @@ export function RateLimitProgress({
 					usage.group != null && usage.group !== usages[_index - 1]?.group;
 				const groupTitle = usage.group === "session" ? "Session" : "Weekly";
 
-				// Calculate time remaining for this specific window
+				// Time remaining for this specific window: rendered live via
+				// LiveCountdown (its own 1s setInterval) when a resetTime exists;
+				// windowTimeText only covers the two no-resetTime placeholder cases.
 				let windowTimeText = "";
-				if (usage.resetTime) {
-					const windowResetTime = new Date(usage.resetTime).getTime();
-					const windowRemainingMs = Math.max(0, windowResetTime - now);
-					const windowRemainingMinutes = Math.ceil(windowRemainingMs / 60000);
-					const windowRemainingHours = Math.floor(windowRemainingMinutes / 60);
-					const windowRemainingMins = windowRemainingMinutes % 60;
-
-					if (windowRemainingMs <= 0) {
-						windowTimeText = "Ready to refresh";
-					} else if (windowRemainingHours > 0) {
-						windowTimeText = `${windowRemainingHours}h ${windowRemainingMins}m`;
-					} else {
-						windowTimeText = `${windowRemainingMinutes}m`;
+				if (!usage.resetTime) {
+					if (usage.window && isWeeklyWindow(usage.window)) {
+						// Weekly account/tier windows (seven_day, seven_day_opus,
+						// seven_day_sonnet, seven_day_fable, …) when reset time is unavailable.
+						windowTimeText = "Data unavailable";
+					} else if (usage.window === "daily" || usage.window === "monthly") {
+						// Special handling for NanoGPT when no subscription is active (PayG mode)
+						windowTimeText = "No subscription (PayG mode)";
 					}
-				} else if (usage.window && isWeeklyWindow(usage.window)) {
-					// Weekly account/tier windows (seven_day, seven_day_opus,
-					// seven_day_sonnet, seven_day_fable, …) when reset time is unavailable.
-					windowTimeText = "Data unavailable";
-				} else if (usage.window === "daily" || usage.window === "monthly") {
-					// Special handling for NanoGPT when no subscription is active (PayG mode)
-					windowTimeText = "No subscription (PayG mode)";
 				}
 
 				// Special rendering for PayG mode - just show message without progress bar
@@ -684,11 +695,11 @@ export function RateLimitProgress({
 						})()}
 						{usage.resetTime && (
 							<div className="flex items-center justify-between">
-								<span className="text-xs text-muted-foreground">
-									{windowTimeText === "Ready to refresh"
-										? windowTimeText
-										: `${windowTimeText} until refresh`}
-								</span>
+								<LiveCountdown
+									target={usage.resetTime}
+									suffix=" until refresh"
+									className="text-xs text-muted-foreground"
+								/>
 								<span className="text-xs text-muted-foreground">
 									{(usage.window && isWeeklyWindow(usage.window)) ||
 									usage.window === "weekly" ||

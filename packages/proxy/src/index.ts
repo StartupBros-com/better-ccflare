@@ -163,8 +163,18 @@ export {
 	type ResponseHandlerOptions,
 } from "./response-handler";
 export {
+	createDurableServerToolReplayWriterAdmission,
 	createServerToolReplayRuntime,
+	SERVER_TOOL_REPLAY_ISSUANCE_RANGE_SIZE,
+	type ServerToolReplayIssuanceLeaseInput,
+	type ServerToolReplayIssuanceReservation,
+	type ServerToolReplayIssuanceReservationInput,
+	type ServerToolReplayIssuanceStore,
+	type ServerToolReplayRuntimeOptions,
 	type ServerToolReplayRuntimeState,
+	type ServerToolReplayWriterAdmissionBuildResult,
+	type ServerToolReplayWriterAdmissionUnavailableReason,
+	type ServerToolReplayWriterLeaseAdmission,
 } from "./server-tool-replay-runtime";
 export {
 	clearSession,

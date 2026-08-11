@@ -99,7 +99,7 @@ describe("RequestBodyContext server-tool finalization", () => {
 		const requirements = context.finalizeServerToolRequirements();
 
 		expect(requirements).toMatchObject({
-			revision: 1,
+			revision: 2,
 			declarations: [
 				{
 					type: "web_search_20250305",

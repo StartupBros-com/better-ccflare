@@ -5,7 +5,7 @@
  * See LICENSE.md in the project root for license terms.
  */
 
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, setSystemTime } from "bun:test";
 import type {
 	AnthropicUsageData,
 	MinimaxUsageData,
@@ -369,5 +369,153 @@ describe("RateLimitProgress", () => {
 		expect(html).toContain("Usage (Weekly)");
 		expect(html).toContain("10%");
 		expect(html).toContain("20%");
+	});
+});
+
+describe("RateLimitProgress codex extras: code-review row + live countdowns", () => {
+	const FIXED_NOW = new Date("2026-08-10T12:00:00.000Z").getTime();
+
+	afterEach(() => {
+		setSystemTime();
+	});
+
+	it("renders a Code Review progress row with its own countdown when code_review_used_percent and code_review_resets_at are present", () => {
+		setSystemTime(FIXED_NOW);
+		const fiveHourReset = new Date(FIXED_NOW + 60 * 60 * 1000).toISOString();
+		const codeReviewReset = new Date(FIXED_NOW + 90 * 60 * 1000).toISOString(); // 1h30m away
+		const html = renderToStaticMarkup(
+			<RateLimitProgress
+				resetIso={fiveHourReset}
+				usageUtilization={10}
+				usageWindow="five_hour"
+				usageData={
+					{
+						five_hour: { utilization: 10, resets_at: fiveHourReset },
+						seven_day: { utilization: 20, resets_at: fiveHourReset },
+						code_review_used_percent: 7,
+						code_review_resets_at: codeReviewReset,
+					} as unknown as AnthropicUsageData
+				}
+				provider="codex"
+				showWeekly
+			/>,
+		);
+		expect(html).toContain("Code Review");
+		expect(html).toContain("7%");
+		// The countdown ticks live via LiveCountdown, not the old static "Xh Ym" text.
+		expect(html).toContain("1h 30m 0s until refresh");
+	});
+
+	it("omits the Code Review row entirely when code_review_used_percent is absent (extras dropped between polls)", () => {
+		setSystemTime(FIXED_NOW);
+		const fiveHourReset = new Date(FIXED_NOW + 60 * 60 * 1000).toISOString();
+		const html = renderToStaticMarkup(
+			<RateLimitProgress
+				resetIso={fiveHourReset}
+				usageUtilization={10}
+				usageWindow="five_hour"
+				usageData={{
+					five_hour: { utilization: 10, resets_at: fiveHourReset },
+					seven_day: { utilization: 20, resets_at: fiveHourReset },
+				}}
+				provider="codex"
+				showWeekly
+			/>,
+		);
+		expect(html).not.toContain("Code Review");
+	});
+
+	it("renders the Code Review bar without a countdown row when code_review_resets_at is absent", () => {
+		setSystemTime(FIXED_NOW);
+		const fiveHourReset = new Date(FIXED_NOW + 60 * 60 * 1000).toISOString();
+		const html = renderToStaticMarkup(
+			<RateLimitProgress
+				resetIso={fiveHourReset}
+				usageUtilization={10}
+				usageWindow="five_hour"
+				usageData={
+					{
+						five_hour: { utilization: 10, resets_at: fiveHourReset },
+						seven_day: { utilization: 20, resets_at: fiveHourReset },
+						code_review_used_percent: 0,
+						code_review_resets_at: null,
+					} as unknown as AnthropicUsageData
+				}
+				provider="codex"
+				showWeekly
+			/>,
+		);
+		expect(html).toContain("Code Review");
+		expect(html).toContain("0%");
+		// Code Review is the last row pushed -- everything after its label is
+		// its own row markup, which must have no countdown (no resetTime).
+		const codeReviewRowHtml = html.split("Code Review").at(-1) ?? "";
+		expect(codeReviewRowHtml).not.toContain("until refresh");
+		expect(codeReviewRowHtml).not.toContain("resetting…");
+	});
+
+	it("does not render a Code Review row for non-codex providers even if the shape is present", () => {
+		setSystemTime(FIXED_NOW);
+		const fiveHourReset = new Date(FIXED_NOW + 60 * 60 * 1000).toISOString();
+		const html = renderToStaticMarkup(
+			<RateLimitProgress
+				resetIso={fiveHourReset}
+				usageUtilization={10}
+				usageWindow="five_hour"
+				usageData={
+					{
+						five_hour: { utilization: 10, resets_at: fiveHourReset },
+						seven_day: { utilization: 20, resets_at: fiveHourReset },
+						code_review_used_percent: 7,
+						code_review_resets_at: fiveHourReset,
+					} as unknown as AnthropicUsageData
+				}
+				provider="anthropic"
+				showWeekly
+			/>,
+		);
+		expect(html).not.toContain("Code Review");
+	});
+
+	it("ticks the five_hour window reset countdown live instead of the old static Xh Ym text", () => {
+		setSystemTime(FIXED_NOW);
+		const fiveHourReset = new Date(FIXED_NOW + 45 * 1000).toISOString(); // 45s away
+		const html = renderToStaticMarkup(
+			<RateLimitProgress
+				resetIso={fiveHourReset}
+				usageUtilization={10}
+				usageWindow="five_hour"
+				usageData={{
+					five_hour: { utilization: 10, resets_at: fiveHourReset },
+					seven_day: { utilization: 20, resets_at: fiveHourReset },
+				}}
+				provider="codex"
+				showWeekly
+			/>,
+		);
+		// Under a minute: seconds only, per the LiveCountdown contract.
+		expect(html).toContain("45s until refresh");
+		expect(html).not.toContain("Ready to refresh");
+	});
+
+	it("shows 'resetting…' (not the old 'Ready to refresh' text) once a window's reset time has passed", () => {
+		setSystemTime(FIXED_NOW);
+		const pastReset = new Date(FIXED_NOW - 1000).toISOString();
+		const html = renderToStaticMarkup(
+			<RateLimitProgress
+				resetIso={pastReset}
+				usageUtilization={10}
+				usageWindow="five_hour"
+				usageData={{
+					five_hour: { utilization: 10, resets_at: pastReset },
+					seven_day: { utilization: 20, resets_at: pastReset },
+				}}
+				provider="codex"
+				showWeekly
+			/>,
+		);
+		expect(html).toContain("resetting…");
+		expect(html).not.toContain("Ready to refresh");
+		expect(html).not.toContain("resetting… until refresh");
 	});
 });

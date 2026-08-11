@@ -804,6 +804,265 @@ describe("CodexWebSocketTransport replay boundary", () => {
 		await first?.response.text();
 	});
 
+	test("runs the pre-write hook immediately before response.create and post-write telemetry after send", async () => {
+		enableCanary();
+		const order: string[] = [];
+		let preWriteCalls = 0;
+		const h = harness({
+			configureSocket(socket) {
+				socket.onSend = (ws) => {
+					order.push("send");
+					queueMicrotask(() => {
+						ws.emitJson({ type: "response.created", response: { id: "r1" } });
+						ws.emitJson({
+							type: "response.output_text.delta",
+							delta: "hello",
+						});
+						ws.emitJson({
+							type: "response.completed",
+							response: { id: "r1" },
+						});
+					});
+				};
+			},
+		});
+
+		const result = await h.transport.tryRequest({
+			accountId: "acct-pro",
+			providerName: "codex",
+			conversationIdentity: testConversationIdentity("private-cache-key"),
+			request: request(),
+			signal: new AbortController().signal,
+			requestId: "request-pre-write-order",
+			attemptId: "attempt-pre-write-order",
+			onBeforeFrameWrite: () => {
+				preWriteCalls++;
+				order.push("before");
+				expect(h.sockets[0]?.sent).toHaveLength(0);
+			},
+			onFrameWritten: () => {
+				order.push("after");
+				expect(h.sockets[0]?.sent).toHaveLength(1);
+			},
+		});
+		await result?.response.text();
+
+		expect(preWriteCalls).toBe(1);
+		expect(order).toEqual(["before", "send", "after"]);
+	});
+
+	test("invokes the pre-write hook once per request and never from later frames", async () => {
+		enableCanary();
+		let preWriteCalls = 0;
+		const h = harness({
+			configureSocket(socket) {
+				socket.onSend = (ws) => {
+					const responseId = `r${ws.sent.length}`;
+					queueMicrotask(() => {
+						ws.emitJson({
+							type: "response.created",
+							response: { id: responseId },
+						});
+						ws.emitJson({
+							type: "response.output_text.delta",
+							delta: "one",
+						});
+						ws.emitJson({
+							type: "response.output_text.delta",
+							delta: "two",
+						});
+						ws.emitJson({
+							type: "response.completed",
+							response: { id: responseId },
+						});
+					});
+				};
+			},
+		});
+		const onBeforeFrameWrite = () => {
+			preWriteCalls++;
+		};
+
+		const first = await h.transport.tryRequest({
+			accountId: "acct-pro",
+			providerName: "codex",
+			conversationIdentity: testConversationIdentity("private-cache-key"),
+			request: request(),
+			signal: new AbortController().signal,
+			requestId: "request-pre-write-once-1",
+			attemptId: "attempt-pre-write-once-1",
+			onBeforeFrameWrite,
+		});
+		await first?.response.text();
+		expect(preWriteCalls).toBe(1);
+
+		const second = await h.transport.tryRequest({
+			accountId: "acct-pro",
+			providerName: "codex",
+			conversationIdentity: testConversationIdentity("private-cache-key"),
+			request: request(),
+			signal: new AbortController().signal,
+			requestId: "request-pre-write-once-2",
+			attemptId: "attempt-pre-write-once-2",
+			onBeforeFrameWrite,
+		});
+		await second?.response.text();
+
+		expect(preWriteCalls).toBe(2);
+		expect(h.sockets).toHaveLength(1);
+		expect(h.sockets[0]?.sent).toHaveLength(2);
+	});
+
+	test("writes zero frames and releases active resources when the pre-write hook throws", async () => {
+		enableCanary();
+		const h = harness();
+		const failure = new Error("hosted dispatch rejected");
+		const controller = new AbortController();
+		let frameWrittenCalls = 0;
+
+		await expect(
+			h.transport.tryRequest({
+				accountId: "acct-pro",
+				providerName: "codex",
+				conversationIdentity: testConversationIdentity("private-cache-key"),
+				request: request(),
+				signal: controller.signal,
+				requestId: "request-pre-write-rejected",
+				attemptId: "attempt-pre-write-rejected",
+				onBeforeFrameWrite: () => {
+					throw failure;
+				},
+				onFrameWritten: () => {
+					frameWrittenCalls++;
+				},
+			}),
+		).rejects.toBe(failure);
+
+		expect(h.sockets[0]?.sent).toHaveLength(0);
+		expect(frameWrittenCalls).toBe(0);
+		expect(h.transport.getStats()).toMatchObject({
+			poolSize: 1,
+			stickyHttpSize: 0,
+			pool: [{ busy: false }],
+		});
+		controller.abort("late abort must not retain the failed request");
+		expect(h.transport.getStats().counters.aborts).toBe(0);
+
+		h.sockets[0].onSend = (ws) =>
+			queueMicrotask(() => {
+				ws.emitJson({ type: "response.created", response: { id: "r2" } });
+				ws.emitJson({ type: "response.completed", response: { id: "r2" } });
+			});
+		const next = await attempt(h.transport, request(), {
+			requestId: "request-after-pre-write-rejection",
+			attemptId: "attempt-after-pre-write-rejection",
+		});
+		expect(next?.receipt.reused).toBe(true);
+		await next?.response.text();
+		expect(h.sockets).toHaveLength(1);
+		expect(h.sockets[0]?.sent).toHaveLength(1);
+	});
+
+	test("rejects an abort observed after parsing before claiming a reused socket", async () => {
+		enableCanary();
+		const abortReason = new Error("cancelled after request parsing");
+		const controller = new AbortController();
+		let abortBeforeNextTimestamp = false;
+		let now = 1_000;
+		let preWriteCalls = 0;
+		let frameWrittenCalls = 0;
+		const h = harness({
+			now: () => {
+				now++;
+				if (abortBeforeNextTimestamp) {
+					abortBeforeNextTimestamp = false;
+					controller.abort(abortReason);
+				}
+				return now;
+			},
+			configureSocket(socket) {
+				socket.onSend = (ws) => {
+					if (ws.sent.length !== 1) return;
+					queueMicrotask(() => {
+						ws.emitJson({ type: "response.created", response: { id: "seed" } });
+						ws.emitJson({
+							type: "response.completed",
+							response: { id: "seed" },
+						});
+					});
+				};
+			},
+		});
+
+		const seeded = await attempt(h.transport, request(), {
+			requestId: "request-abort-after-parse-seed",
+			attemptId: "attempt-abort-after-parse-seed",
+		});
+		await seeded?.response.text();
+		expect(h.sockets[0]?.sent).toHaveLength(1);
+
+		const parsedThenAbortedRequest = request();
+		const cloneRequest = parsedThenAbortedRequest.clone.bind(
+			parsedThenAbortedRequest,
+		);
+		parsedThenAbortedRequest.clone = () => {
+			const clone = cloneRequest();
+			const parseJson = clone.json.bind(clone);
+			clone.json = async () => {
+				const payload = await parseJson();
+				abortBeforeNextTimestamp = true;
+				return payload;
+			};
+			return clone;
+		};
+
+		await expect(
+			h.transport.tryRequest({
+				accountId: "acct-pro",
+				providerName: "codex",
+				conversationIdentity: testConversationIdentity("private-cache-key"),
+				request: parsedThenAbortedRequest,
+				signal: controller.signal,
+				requestId: "request-abort-after-parse",
+				attemptId: "attempt-abort-after-parse",
+				onBeforeFrameWrite: () => {
+					preWriteCalls++;
+				},
+				onFrameWritten: () => {
+					frameWrittenCalls++;
+				},
+			}),
+		).rejects.toBe(abortReason);
+
+		expect(controller.signal.aborted).toBe(true);
+		expect(preWriteCalls).toBe(0);
+		expect(frameWrittenCalls).toBe(0);
+		expect(h.sockets[0]?.sent).toHaveLength(1);
+		expect(h.transport.getStats()).toMatchObject({
+			poolSize: 1,
+			stickyHttpSize: 0,
+			pool: [{ busy: false }],
+			counters: { aborts: 0 },
+		});
+
+		h.sockets[0].onSend = (ws) =>
+			queueMicrotask(() => {
+				ws.emitJson({ type: "response.created", response: { id: "reused" } });
+				ws.emitJson({
+					type: "response.completed",
+					response: { id: "reused" },
+				});
+			});
+		const next = await attempt(h.transport, request(), {
+			requestId: "request-after-abort-after-parse",
+			attemptId: "attempt-after-abort-after-parse",
+		});
+		expect(next?.receipt.reused).toBe(true);
+		await next?.response.text();
+		expect(h.sockets).toHaveLength(1);
+		expect(h.sockets[0]?.sent).toHaveLength(2);
+	});
+
 	test("allows HTTP fallback only when handshake fails before response.create", async () => {
 		enableCanary();
 		const h = harness({ autoOpen: false });
@@ -855,6 +1114,51 @@ describe("CodexWebSocketTransport replay boundary", () => {
 				fallbackReason: "send_failed_before_write",
 				fallbackAllowedBeforeWrite: true,
 			}),
+		);
+	});
+
+	test("surfaces a send failure after the pre-write hook as ambiguous", async () => {
+		enableCanary();
+		const failure = new Error("ambiguous frame write");
+		let preWriteCalls = 0;
+		let frameWrittenCalls = 0;
+		const h = harness({
+			configureSocket(socket) {
+				socket.onSend = () => {
+					throw failure;
+				};
+			},
+		});
+
+		await expect(
+			h.transport.tryRequest({
+				accountId: "acct-pro",
+				providerName: "codex",
+				conversationIdentity: testConversationIdentity("private-cache-key"),
+				request: request(),
+				signal: new AbortController().signal,
+				requestId: "request-ambiguous-write",
+				attemptId: "attempt-ambiguous-write",
+				onBeforeFrameWrite: () => {
+					preWriteCalls++;
+				},
+				onFrameWritten: () => {
+					frameWrittenCalls++;
+				},
+			}),
+		).rejects.toBe(failure);
+
+		expect(preWriteCalls).toBe(1);
+		expect(frameWrittenCalls).toBe(0);
+		// The fake records the attempted frame before surfacing its send failure,
+		// which models why the outcome cannot be called fallback-safe.
+		expect(h.sockets[0]?.sent).toHaveLength(1);
+		expect(h.transport.getStats()).toMatchObject({
+			poolSize: 0,
+			counters: { preWriteHttpFallbacks: 0 },
+		});
+		expect(h.observations).not.toContainEqual(
+			expect.objectContaining({ fallbackAllowedBeforeWrite: true }),
 		);
 	});
 

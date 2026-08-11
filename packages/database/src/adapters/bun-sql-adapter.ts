@@ -103,8 +103,9 @@ function assertExpectedChanges(
  * For SQLite: wraps the existing bun:sqlite Database for synchronous operations.
  * For PostgreSQL: wraps Bun.SQL for async operations.
  *
- * The `query`, `get`, `run`, `runWithChanges` methods return Promises in both
- * cases — for SQLite they resolve synchronously under the hood.
+ * The `query`, `get`, `run`, `runWithChanges`, and `runReturningOne` methods
+ * return Promises in both cases — for SQLite they resolve synchronously under
+ * the hood.
  */
 export class BunSqlAdapter {
 	readonly isSQLite: boolean;
@@ -191,8 +192,9 @@ export class BunSqlAdapter {
 	 * fresh pool connection self-heals it. The callback re-issues the query
 	 * (rather than re-awaiting the original promise) since the corruption
 	 * happens during the original send/receive cycle and can't be recovered
-	 * from after the fact. Only used for read paths (query/get) — DML never
-	 * decodes column data here (no RETURNING clauses), so it isn't at risk.
+	 * from after the fact. Only used for read paths (query/get). Returning DML
+	 * goes through runReturningOne(), which must never retry a possibly committed
+	 * mutation.
 	 */
 	private async withPgIntegerSizeRetry<T>(run: () => Promise<T>): Promise<T> {
 		try {
@@ -281,6 +283,40 @@ export class BunSqlAdapter {
 				PG_CLIENT_QUERY_TIMEOUT_MS,
 				sqlStr,
 			),
+		);
+		return ((rows as unknown as R[])[0] ?? null) as R | null;
+	}
+
+	/**
+	 * Execute one DML statement with a RETURNING clause and return its row.
+	 *
+	 * Unlike get(), the PostgreSQL path deliberately does not retry
+	 * ERR_POSTGRES_UNSUPPORTED_INTEGER_SIZE. The mutation may already have
+	 * committed before the driver reports a decode error, so issuing the
+	 * statement again could double-apply it. Callers should cast portable
+	 * integer/timestamp values to text and validate them after return.
+	 */
+	async runReturningOne<R>(
+		sqlStr: string,
+		params: unknown[] = [],
+	): Promise<R | null> {
+		if (this.isSQLite && this.sqliteDb) {
+			const db = this.sqliteDb;
+			const result = await this.withBusyRetry(() =>
+				// biome-ignore lint/suspicious/noExplicitAny: SQLite params can be any binding type
+				db.query<R, any[]>(sqlStr).get(...(params as any[])),
+			);
+			return (result as R) ?? null;
+		}
+		if (!this.sql) {
+			throw new Error("SQL client not available for returning DML");
+		}
+		const pgQuery = this.pgSql(sqlStr);
+		const rows = await this.withPgTimeout(
+			// biome-ignore lint/suspicious/noExplicitAny: Bun.SQL accepts various binding types
+			this.sql.unsafe(pgQuery, params as any[]) as Promise<unknown>,
+			PG_CLIENT_QUERY_TIMEOUT_MS,
+			sqlStr,
 		);
 		return ((rows as unknown as R[])[0] ?? null) as R | null;
 	}

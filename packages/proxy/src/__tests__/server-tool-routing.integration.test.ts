@@ -27,23 +27,27 @@ import {
 } from "../model-route-profiles";
 
 // Focused proxy tests must not load ignored embedded worker artifacts.
-mock.module("@better-ccflare/database", () => ({
-	AsyncDbWriter: class AsyncDbWriter {},
-	DatabaseFactory: class DatabaseFactory {},
-	DatabaseOperations: class DatabaseOperations {},
-	ModelTranslationRepository: class ModelTranslationRepository {},
-}));
-
 const { buildServerToolCapabilityProofKey, usageCache } = await import(
 	"@better-ccflare/providers"
 );
 const usageCollectorModule = await import("../usage-collector");
 const { handleProxy } = await import("../proxy");
+const { codexWebSocketTransport } = await import(
+	"../codex-websocket-transport"
+);
+const {
+	createDurableServerToolReplayWriterAdmission,
+	createServerToolReplayRuntime,
+} = await import("../server-tool-replay-runtime");
+const { createReadyServerToolReplayRuntimeForTest } = await import(
+	"./helpers/server-tool-replay-runtime"
+);
+const READY_SERVER_TOOL_REPLAY_RUNTIME =
+	await createReadyServerToolReplayRuntimeForTest();
 
 const MODEL = "claude-sonnet-4-5";
 const originalFetch = globalThis.fetch;
 const originalPassthrough = process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
-const originalServerToolWebSearch = process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH;
 let restoreUsageCollectors = (): void => {};
 
 function makeAccount(overrides: Partial<Account> = {}): Account {
@@ -90,6 +94,10 @@ function makeTuple(
 	context: ProviderServerToolCapabilityContext,
 	providerName: string,
 ): ServerToolCapabilityTuple {
+	const { optionProfileId, responseMode, mixedToolMode } = context.requirements;
+	if (!optionProfileId || !responseMode || !mixedToolMode) {
+		throw new Error("Expected exact server-tool requirement profile");
+	}
 	return {
 		candidateId: context.candidateId,
 		provider: providerName,
@@ -99,6 +107,9 @@ function makeTuple(
 		model: context.physicalModel,
 		toolType: "web_search_20250305",
 		profile: context.requirements.profileId ?? "missing-profile",
+		optionProfile: optionProfileId,
+		responseMode,
+		mixedToolMode,
 		inputReplay: ["native-Anthropic", "proxy-evidence-v1"],
 		outputReplay: ["native-Anthropic", "proxy-evidence-v1"],
 		providerContractRevision: "capability-test-v1",
@@ -227,7 +238,7 @@ function makeContext(
 		provider,
 		refreshInFlight: new Map(),
 		asyncWriter: { enqueue: mutations.asyncWrite },
-		serverToolReplay: Object.freeze({ status: "disabled" }),
+		serverToolReplay: READY_SERVER_TOOL_REPLAY_RUNTIME,
 	} as unknown as ProxyContext;
 	return { ctx, refreshCalls, mutations, getAgentPreference, provider };
 }
@@ -284,12 +295,20 @@ function makeServerToolRequest(
 		forcedAccountId?: string;
 		model?: string;
 		query?: string;
+		replayIdentity?: "valid" | "missing" | "ambiguous";
 	} = {},
 ): Request {
 	const headers = new Headers({
 		"content-type": "application/json",
 		"anthropic-version": "2023-06-01",
 	});
+	if (options.replayIdentity !== "missing") {
+		headers.set("authorization", "Bearer server-tool-test-client");
+		headers.set("x-claude-code-session-id", "server-tool-test-session");
+	}
+	if (options.replayIdentity === "ambiguous") {
+		headers.set("x-api-key", "second-server-tool-test-client");
+	}
 	if (options.agentId) {
 		headers.set("x-better-ccflare-agent-id", options.agentId);
 	}
@@ -323,7 +342,6 @@ function makeServerToolRequest(
 
 beforeEach(() => {
 	process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL = "1";
-	process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH = "1";
 	const collector = {
 		handleStart: mock(() => undefined),
 		handleChunk: mock(() => undefined),
@@ -352,16 +370,10 @@ afterEach(() => {
 	} else {
 		process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL = originalPassthrough;
 	}
-	if (originalServerToolWebSearch === undefined) {
-		delete process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH;
-	} else {
-		process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH = originalServerToolWebSearch;
-	}
 });
 
 describe("server-tool routing integration", () => {
-	it("preserves native server-tool passthrough while admission is default-off", async () => {
-		delete process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH;
+	it("validates server-tool requirements without an activation flag", async () => {
 		const account = makeAccount({
 			access_token: "test-token",
 			expires_at: Date.now() + 60 * 60_000,
@@ -378,19 +390,20 @@ describe("server-tool routing integration", () => {
 		const request = makeServerToolRequest({ invalid: true });
 
 		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = (await response.json()) as {
+			error: { type: string; code: string; reason: string };
+		};
 
-		expect(response.status).toBe(200);
-		expect(ctx.strategy.select).toHaveBeenCalledTimes(1);
+		expect(response.status).toBe(400);
+		expect(body.error).toMatchObject({
+			type: "invalid_request_error",
+			code: "server_tool_invalid_requirement",
+			reason: "invalid_requirement",
+		});
+		expect(ctx.strategy.select).toHaveBeenCalledTimes(0);
 		expect(refreshCalls.value).toBe(0);
-		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
-		expect(forwardedBody?.tools).toEqual([
-			{
-				type: "web_search_20250305",
-				name: "web_search",
-				allowed_domains: ["example.com"],
-				blocked_domains: ["blocked.example"],
-			},
-		]);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+		expect(forwardedBody).toBeUndefined();
 		expect(mutations.pauseAccount).toHaveBeenCalledTimes(0);
 		expect(mutations.markAccountRateLimited).toHaveBeenCalledTimes(0);
 	});
@@ -427,6 +440,125 @@ describe("server-tool routing integration", () => {
 		expect(refreshCalls.value).toBe(0);
 		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
 		expect(mutations.asyncWrite).toHaveBeenCalledTimes(0);
+	});
+
+	it.each([
+		"missing",
+		"ambiguous",
+	] as const)("fails a %s request-private replay identity before selection or provider I/O", async (replayIdentity) => {
+		const account = makeAccount({
+			access_token: "test-token",
+			expires_at: Date.now() + 60 * 60_000,
+		});
+		const providerIo = {
+			buildUrl: mock(() => "https://capability.invalid/v1/responses"),
+			prepareHeaders: mock((headers: Headers) => new Headers(headers)),
+			processResponse: mock(async (response: Response) => response),
+			transformRequestBody: mock(async (request: Request) => request),
+		};
+		const { ctx, refreshCalls, mutations } = makeContext(
+			account,
+			(provider) => {
+				provider.buildUrl = providerIo.buildUrl;
+				provider.prepareHeaders = providerIo.prepareHeaders;
+				provider.processResponse = providerIo.processResponse;
+				provider.transformRequestBody = providerIo.transformRequestBody;
+			},
+		);
+		globalThis.fetch = mock(async () => new Response(null, { status: 500 }));
+		const request = makeServerToolRequest({ replayIdentity });
+
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.json();
+
+		expect(response.status).toBe(503);
+		expect(body).toMatchObject({
+			type: "error",
+			error: {
+				code: "server_tool_replay_unavailable",
+				reason: "replay_unavailable",
+			},
+		});
+		expect(ctx.strategy.select).toHaveBeenCalledTimes(0);
+		expect(refreshCalls.value).toBe(0);
+		expect(providerIo.buildUrl).toHaveBeenCalledTimes(0);
+		expect(providerIo.prepareHeaders).toHaveBeenCalledTimes(0);
+		expect(providerIo.processResponse).toHaveBeenCalledTimes(0);
+		expect(providerIo.transformRequestBody).toHaveBeenCalledTimes(0);
+		expect(mutations.asyncWrite).toHaveBeenCalledTimes(0);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+	});
+
+	it("fails the first durable replay reservation before selection or any provider I/O", async () => {
+		const account = makeAccount({
+			access_token: "test-token",
+			expires_at: Date.now() + 60 * 60_000,
+		});
+		const providerIo = {
+			buildUrl: mock(() => "https://capability.invalid/v1/responses"),
+			prepareHeaders: mock((headers: Headers) => new Headers(headers)),
+			processResponse: mock(async (response: Response) => response),
+			transformRequestBody: mock(async (request: Request) => request),
+		};
+		const { ctx, refreshCalls, mutations } = makeContext(
+			account,
+			(provider) => {
+				provider.buildUrl = providerIo.buildUrl;
+				provider.prepareHeaders = providerIo.prepareHeaders;
+				provider.processResponse = providerIo.processResponse;
+				provider.transformRequestBody = providerIo.transformRequestBody;
+			},
+		);
+		let reservationCalls = 0;
+		const admission = createDurableServerToolReplayWriterAdmission({
+			reserveReplayIssuanceRange: async () => {
+				reservationCalls += 1;
+				throw new Error("durable issuance unavailable");
+			},
+		});
+		ctx.serverToolReplay = await createServerToolReplayRuntime(
+			{
+				status: "ready",
+				activeKeyId: "integration-active",
+				keys: [
+					{
+						id: "integration-active",
+						status: "active",
+						key: Array.from({ length: 32 }, (_, index) => index + 1),
+					},
+				],
+			},
+			{ writerAdmission: admission.writerAdmission },
+		);
+		const websocketAttempt = spyOn(
+			codexWebSocketTransport,
+			"tryRequest",
+		).mockImplementation(async () => null);
+		globalThis.fetch = mock(async () => new Response(null, { status: 500 }));
+		const request = makeServerToolRequest();
+
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.json();
+
+		expect(response.status).toBe(503);
+		expect(body).toMatchObject({
+			type: "error",
+			error: {
+				code: "server_tool_replay_unavailable",
+				reason: "replay_unavailable",
+			},
+		});
+		expect(reservationCalls).toBe(1);
+		expect(ctx.strategy.select).toHaveBeenCalledTimes(0);
+		expect(refreshCalls.value).toBe(0);
+		expect(providerIo.buildUrl).toHaveBeenCalledTimes(0);
+		expect(providerIo.prepareHeaders).toHaveBeenCalledTimes(0);
+		expect(providerIo.processResponse).toHaveBeenCalledTimes(0);
+		expect(providerIo.transformRequestBody).toHaveBeenCalledTimes(0);
+		expect(mutations.asyncWrite).toHaveBeenCalledTimes(0);
+		expect(websocketAttempt).toHaveBeenCalledTimes(0);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(0);
+		websocketAttempt.mockRestore();
 	});
 
 	it("stops an incapable pool before refresh, transport, mutation, or unauthenticated passthrough", async () => {
@@ -470,7 +602,7 @@ describe("server-tool routing integration", () => {
 		expect(response.headers.has("x-better-ccflare-recovery-scope")).toBeFalse();
 	});
 
-	it("stops a declaration-proven replay-ineligible pool before strategy, credentials, provider I/O, mutation, or dispatch", async () => {
+	it("stops a writer-disabled replay runtime before capability work or provider I/O", async () => {
 		const first = makeAccount({
 			id: "replay-ineligible-first",
 			name: "replay-ineligible-first",
@@ -514,6 +646,17 @@ describe("server-tool routing integration", () => {
 				provider.resolveServerToolCapability = resolveCapability;
 			},
 		);
+		ctx.serverToolReplay = await createServerToolReplayRuntime({
+			status: "ready",
+			activeKeyId: "writer-disabled-active",
+			keys: [
+				{
+					id: "writer-disabled-active",
+					status: "active",
+					key: Array.from({ length: 32 }, (_, index) => index + 1),
+				},
+			],
+		});
 		globalThis.fetch = mock(
 			async () =>
 				new Response(JSON.stringify({ unexpected: true }), { status: 500 }),
@@ -532,18 +675,9 @@ describe("server-tool routing integration", () => {
 				reason: "replay_unavailable",
 				message:
 					"Server-tool replay configuration cannot satisfy this request.",
-				capability: {
-					structuralCandidateCount: 2,
-					provenCandidateCount: 2,
-					unsupportedCandidateCount: 0,
-					unknownCandidateCount: 0,
-					replayIneligibleCandidateCount: 2,
-					temporarilyUnavailableProvenCandidateCount: 0,
-					eligibleCandidateCount: 0,
-				},
 			},
 		});
-		expect(resolveCapability).toHaveBeenCalledTimes(2);
+		expect(resolveCapability).toHaveBeenCalledTimes(0);
 		expect(ctx.strategy.select).toHaveBeenCalledTimes(0);
 		expect(ctx.strategy.reportCandidateSuccess).toHaveBeenCalledTimes(0);
 		expect(refreshCalls.value).toBe(0);

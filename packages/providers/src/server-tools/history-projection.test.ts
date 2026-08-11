@@ -25,8 +25,7 @@ const replayCodec = createServerToolReplayEnvelopeCodec({
 	retainedKeys: [],
 	writerAdmission: {
 		enabled: true,
-		readFleetIssuedCount: () => 0,
-		recordIssued: () => undefined,
+		claimIssuance: async () => 1,
 	},
 });
 

@@ -52,6 +52,25 @@ function formatRoutingFamily(family: string): string {
 	return family.charAt(0).toUpperCase() + family.slice(1);
 }
 
+/**
+ * Codex-only usage extras (plan_type, credits_balance) come from the free
+ * wham/usage poller and can be ABSENT from usageData at any moment -- live
+ * traffic overwrites cached extras between polls. Not part of the public
+ * FullUsageData union (see @better-ccflare/types), so every read here is
+ * null-safe and simply omits the corresponding element when absent. Mirrors
+ * the CodexUsageExtras cast in RateLimitProgress.tsx for the sibling
+ * code_review_* extras.
+ */
+interface CodexUsageExtras {
+	plan_type?: string | null;
+	credits_balance?: number | null;
+}
+
+function getCodexUsageExtras(account: Account): CodexUsageExtras | null {
+	if (account.provider !== "codex" || !account.usageData) return null;
+	return account.usageData as CodexUsageExtras;
+}
+
 function routingAvailabilityOverlay(
 	state: AccountFamilyRoutingState,
 ): { label: string; variant: "destructive" | "warning" } | null {
@@ -146,6 +165,12 @@ export function AccountListItem({
 	const isUsageThrottled =
 		typeof account.usageThrottledUntil === "number" &&
 		account.usageThrottledUntil > Date.now();
+	const codexUsageExtras = getCodexUsageExtras(account);
+	const codexCreditsBalance =
+		typeof codexUsageExtras?.credits_balance === "number" &&
+		codexUsageExtras.credits_balance > 0
+			? codexUsageExtras.credits_balance
+			: null;
 
 	// Parse Bedrock profile and region from custom_endpoint
 	let bedrockProfile: string | null = null;
@@ -181,6 +206,11 @@ export function AccountListItem({
 							<span className="px-2 py-0.5 text-xs font-medium bg-secondary text-secondary-foreground rounded-full">
 								Priority: {account.priority}
 							</span>
+							{codexUsageExtras?.plan_type && (
+								<span className="px-2 py-0.5 text-xs font-medium bg-secondary text-secondary-foreground rounded-full">
+									{codexUsageExtras.plan_type}
+								</span>
+							)}
 							<OAuthTokenStatusWithBoundary
 								accountName={account.name}
 								hasRefreshToken={account.hasRefreshToken}
@@ -298,6 +328,11 @@ export function AccountListItem({
 						<span className="text-sm text-muted-foreground">
 							{presenter.sessionInfo}
 						</span>
+						{codexCreditsBalance !== null && (
+							<span className="text-sm text-muted-foreground">
+								{codexCreditsBalance.toLocaleString()} credits
+							</span>
+						)}
 						{reauthRequired ? (
 							<Badge
 								variant="destructive"

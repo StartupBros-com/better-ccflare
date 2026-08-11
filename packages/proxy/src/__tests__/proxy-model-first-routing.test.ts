@@ -22,16 +22,13 @@ import type { UsageCollector } from "../usage-collector";
 // Unit-test loading must not require the CLI build's ignored embedded worker
 // artifacts. handleProxy does not use DatabaseFactory; keep that package at its
 // boundary before dynamically loading the proxy module.
-mock.module("@better-ccflare/database", () => ({
-	AsyncDbWriter: class AsyncDbWriter {},
-	DatabaseFactory: class DatabaseFactory {},
-	DatabaseOperations: class DatabaseOperations {},
-	ModelTranslationRepository: class ModelTranslationRepository {},
-}));
 const providersModule = await import("@better-ccflare/providers");
 const { usageCache } = providersModule;
 const usageCollectorModule = await import("../usage-collector");
 const { handleProxy } = await import("../proxy");
+const { createReadyServerToolReplayRuntimeForTest } = await import(
+	"./helpers/server-tool-replay-runtime"
+);
 const { getRateLimitProbeAdmission, resetRateLimitProbeGatesForTests } =
 	await import("../handlers/rate-limit-cooldown");
 
@@ -43,7 +40,6 @@ const SONNET = "claude-sonnet-4-5";
 
 const originalFetch = globalThis.fetch;
 const originalOverloadRetry = process.env.CCFLARE_OVERLOAD_RETRY_ENABLED;
-const originalServerToolWebSearch = process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH;
 const cachedUsageAccountIds = new Set<string>();
 let restoreUsageCollector = (): void => {};
 let usageHandleStart = mock(() => undefined);
@@ -185,6 +181,10 @@ function makeContext(accounts: Account[], combo: ComboWithSlots): ProxyContext {
 	} as unknown as ProxyContext;
 }
 
+async function installReadyServerToolReplay(ctx: ProxyContext): Promise<void> {
+	ctx.serverToolReplay = await createReadyServerToolReplayRuntimeForTest();
+}
+
 function makeRequest(extraHeaders: Record<string, string> = {}): Request {
 	return new Request("https://proxy.local/v1/messages", {
 		method: "POST",
@@ -203,6 +203,8 @@ function makeServerToolRequest(): Request {
 		headers: {
 			"content-type": "application/json",
 			"anthropic-version": "2023-06-01",
+			authorization: "Bearer model-first-server-tool-test",
+			"x-claude-code-session-id": "model-first-server-tool-session",
 		},
 		body: JSON.stringify({
 			model: FABLE,
@@ -217,6 +219,10 @@ function makeServerToolRequest(): Request {
 function makeServerToolTuple(
 	context: ProviderServerToolCapabilityContext,
 ): ServerToolCapabilityTuple {
+	const { optionProfileId, responseMode, mixedToolMode } = context.requirements;
+	if (!optionProfileId || !responseMode || !mixedToolMode) {
+		throw new Error("Expected exact server-tool requirement profile");
+	}
 	return {
 		candidateId: context.candidateId,
 		provider: context.account.provider,
@@ -226,6 +232,9 @@ function makeServerToolTuple(
 		model: context.physicalModel,
 		toolType: context.requirements.declarations?.[0]?.type ?? "unknown",
 		profile: context.requirements.profileId ?? "unknown",
+		optionProfile: optionProfileId,
+		responseMode,
+		mixedToolMode,
 		inputReplay: context.requirements.replay.input,
 		outputReplay: ["native-Anthropic"],
 		providerContractRevision: "model-first-test-v1",
@@ -447,7 +456,6 @@ beforeEach(() => {
 	resetRateLimitProbeGatesForTests();
 	installUsageCollector();
 	process.env.CCFLARE_OVERLOAD_RETRY_ENABLED = "false";
-	process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH = "1";
 });
 
 afterEach(() => {
@@ -461,11 +469,6 @@ afterEach(() => {
 		delete process.env.CCFLARE_OVERLOAD_RETRY_ENABLED;
 	} else {
 		process.env.CCFLARE_OVERLOAD_RETRY_ENABLED = originalOverloadRetry;
-	}
-	if (originalServerToolWebSearch === undefined) {
-		delete process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH;
-	} else {
-		process.env.CCFLARE_SERVER_TOOL_WEB_SEARCH = originalServerToolWebSearch;
 	}
 });
 
@@ -1141,6 +1144,7 @@ describe("global model-first routing", () => {
 	it("runs only the exact proven Opus tail when a server-tool Fable route is capacity-blocked", async () => {
 		const blocked = makeAccount("server-tool-capacity-tail");
 		const ctx = makeContext([blocked], makeCombo({ account: blocked }));
+		await installReadyServerToolReplay(ctx);
 		ctx.dbOps.getComboRoutingPolicy = mock(async (family: ComboFamily) =>
 			makeRoutingPolicy(null, family),
 		);
@@ -1191,6 +1195,7 @@ describe("global model-first routing", () => {
 	it("returns a capability terminal when the only deferred server-tool proof drifts before transport", async () => {
 		const blocked = makeAccount("server-tool-drifted-capacity-tail");
 		const ctx = makeContext([blocked], makeCombo({ account: blocked }));
+		await installReadyServerToolReplay(ctx);
 		ctx.dbOps.getComboRoutingPolicy = mock(async (family: ComboFamily) =>
 			makeRoutingPolicy(null, family),
 		);

@@ -27,6 +27,7 @@ import type {
 	DeviceSetupRoutingSelection,
 	DeviceSetupStartResult,
 	EffectiveComboRoutingView,
+	FleetUsageHistoryResponse,
 	LogEvent,
 	ModelCatalogRefreshResponse,
 	ModelCatalogResponse,
@@ -1078,6 +1079,16 @@ class API extends HttpClient {
 	): Promise<UsageHistoryResponse> {
 		const params = new URLSearchParams({ account, range });
 		return this.get<UsageHistoryResponse>(
+			`/api/usage-history?${params.toString()}`,
+		);
+	}
+
+	/** Fleet-wide (all accounts) usage history — GET /api/usage-history?account=all. */
+	async getFleetUsageHistory(
+		range = "24h",
+	): Promise<FleetUsageHistoryResponse> {
+		const params = new URLSearchParams({ account: "all", range });
+		return this.get<FleetUsageHistoryResponse>(
 			`/api/usage-history?${params.toString()}`,
 		);
 	}

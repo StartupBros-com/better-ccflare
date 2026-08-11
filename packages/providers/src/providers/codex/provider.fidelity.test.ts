@@ -15,7 +15,12 @@
  *  - is_error signal preservation
  */
 import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { resetOrchestrationElectionForTest } from "./orchestration-election";
 import { CODEX_PROMPT_CACHE_KEY_ENV, CodexProvider } from "./provider";
+import { CODEX_TRACE_DIR_ENV } from "./trace";
 
 const CONTINUATION_NUDGE = "Continue the user's original request now";
 
@@ -46,6 +51,18 @@ async function transform(body: unknown): Promise<CodexBody> {
 
 const outputs = (input: CodexBody["input"]) =>
 	input.filter((it) => it.type === "function_call_output");
+const calls = (input: CodexBody["input"]) =>
+	input.filter((it) => it.type === "function_call");
+
+function readTraceRecords(dir: string): Array<Record<string, unknown>> {
+	const file = readdirSync(dir).find((f) => f.endsWith(".jsonl"));
+	if (!file) return [];
+	return readFileSync(join(dir, file), "utf8")
+		.trim()
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => JSON.parse(line) as Record<string, unknown>);
+}
 
 function nudges(input: CodexBody["input"]): number {
 	return input.filter(
@@ -90,6 +107,7 @@ function taskTurn(
 
 afterEach(() => {
 	delete process.env[CODEX_PROMPT_CACHE_KEY_ENV];
+	resetOrchestrationElectionForTest();
 });
 
 describe("Codex transform, tool_result content robustness", () => {
@@ -398,5 +416,457 @@ describe("Codex transform, is_error signal preservation", () => {
 	test("successful tool results carry no marker", async () => {
 		const body = await transform(taskTurn([{ type: "text", text: "fine" }]));
 		expect(outputs(body.input)[0]?.output).toBe("fine");
+	});
+});
+
+// ── Sanitized direct-Messages planning-session regression ─────────────────
+//
+// Shaped after a reported Claude Code planning session, with every prompt,
+// tool input, and result text replaced by generic, non-sensitive placeholder
+// content. No real credentials, endpoints, or external calls are involved:
+// every request in this section targets the same in-process CodexProvider
+// transform used elsewhere in this file.
+describe("Codex transform, sanitized Claude Code planning session regression", () => {
+	const PLANNING_SESSION_ID = "77777777-7777-4777-8777-777777777777";
+	const PLANNING_SESSION_INSTRUCTIONS =
+		"You are Claude Code, an AI assistant for software engineering tasks. You can read files, run tools, and delegate work to specialized subagents.";
+	const PLANNING_SESSION_TOOLS = [
+		{
+			name: "Agent",
+			description: "Delegate work to a specialized subagent.",
+			input_schema: { type: "object" },
+		},
+		{
+			name: "Task",
+			description: "Run a parallel background task.",
+			input_schema: { type: "object" },
+		},
+		{
+			name: "Skill",
+			description: "Load a named skill's additional instructions.",
+			input_schema: { type: "object" },
+		},
+		{
+			name: "Read",
+			description: "Read a file from the workspace.",
+			input_schema: { type: "object" },
+		},
+		{
+			name: "StructuredOutput",
+			description: "Return the final response as structured JSON.",
+			input_schema: { type: "object" },
+		},
+	];
+	// Sanitized stand-in for the connector-auth warning class reported in the
+	// incident: plain text carried inside a tool_result, which the transform
+	// must pass through byte-for-byte rather than parse or rewrite.
+	const CONNECTOR_AUTH_WARNING_TEXT =
+		"Warning: connector authentication for the external issue tracker expired mid-session; results may reflect cached data until re-authorization completes.";
+
+	/**
+	 * One logical root session: an initial user turn, a parallel Agent/Task
+	 * dispatch whose results return out of call order, a ToolSearch round trip
+	 * returning tool_reference blocks, and a final turn that mixes a Skill
+	 * result with another tool's result.
+	 */
+	function planningSessionRootMessages(): unknown[] {
+		return [
+			{
+				role: "user",
+				content:
+					"Plan and coordinate the rollout of the requested feature across the repository, delegating research and implementation work as needed.",
+			},
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "tool_use",
+						id: "call_agent_1",
+						name: "Agent",
+						input: { prompt: "research the affected modules" },
+					},
+					{
+						type: "tool_use",
+						id: "call_task_1",
+						name: "Task",
+						input: { prompt: "draft the implementation outline" },
+					},
+				],
+			},
+			{
+				role: "user",
+				content: [
+					// Results are supplied in the opposite order from the calls above
+					// (Task before Agent), paired only by tool_use_id.
+					{
+						type: "tool_result",
+						tool_use_id: "call_task_1",
+						content: [
+							{
+								type: "text",
+								text: "Task complete: identified the modules requiring changes.",
+							},
+						],
+					},
+					{
+						type: "tool_result",
+						tool_use_id: "call_agent_1",
+						content: [
+							{ type: "text", text: CONNECTOR_AUTH_WARNING_TEXT },
+							{
+								type: "text",
+								text: "Subagent research complete: proposed a 3-step implementation plan.",
+							},
+						],
+					},
+				],
+			},
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "tool_use",
+						id: "call_toolsearch_1",
+						name: "ToolSearch",
+						input: { query: "task management tools" },
+					},
+				],
+			},
+			{
+				role: "user",
+				content: [
+					{
+						type: "tool_result",
+						tool_use_id: "call_toolsearch_1",
+						content: [
+							{ type: "tool_reference", tool_name: "TaskCreate" },
+							{ type: "tool_reference", tool_name: "TaskUpdate" },
+						],
+					},
+				],
+			},
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "tool_use",
+						id: "call_skill_1",
+						name: "Skill",
+						input: { skill: "planning-mode" },
+					},
+					{
+						type: "tool_use",
+						id: "call_read_1",
+						name: "Read",
+						input: { file_path: "docs/plan.md" },
+					},
+				],
+			},
+			{
+				role: "user",
+				content: [
+					{
+						type: "tool_result",
+						tool_use_id: "call_read_1",
+						content: [
+							{
+								type: "text",
+								text: "plan.md contents: outline of proposed workstreams.",
+							},
+						],
+					},
+					// Skill result mixed with another (Read) result in the same, final
+					// turn: exactly one continuation nudge should be appended.
+					{
+						type: "tool_result",
+						tool_use_id: "call_skill_1",
+						content: [{ type: "text", text: "planning-mode skill loaded." }],
+					},
+				],
+			},
+		];
+	}
+
+	/**
+	 * A fresh parallel Skill/Read round trip, appended as the new turn after
+	 * compaction. This is what makes the compacted request's final message a
+	 * genuine new Skill completion, independent of the (now mid-history)
+	 * Skill result carried over from the root turn.
+	 */
+	function planningSessionContinuationTurn(): unknown[] {
+		return [
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "tool_use",
+						id: "call_skill_2",
+						name: "Skill",
+						input: { skill: "execution-mode" },
+					},
+					{
+						type: "tool_use",
+						id: "call_read_2",
+						name: "Read",
+						input: { file_path: "docs/execution-notes.md" },
+					},
+				],
+			},
+			{
+				role: "user",
+				content: [
+					{
+						type: "tool_result",
+						tool_use_id: "call_read_2",
+						content: [
+							{
+								type: "text",
+								text: "execution-notes.md contents: no blocking issues found.",
+							},
+						],
+					},
+					{
+						type: "tool_result",
+						tool_use_id: "call_skill_2",
+						content: [{ type: "text", text: "execution-mode skill loaded." }],
+					},
+				],
+			},
+		];
+	}
+
+	async function sendPlanningSession(
+		provider: CodexProvider,
+		messages: unknown[],
+		headers: Record<string, string> = {},
+	): Promise<CodexBody> {
+		const request = new Request("https://example.com/v1/messages", {
+			method: "POST",
+			headers: { "content-type": "application/json", ...headers },
+			body: JSON.stringify({
+				model: "claude-opus-4-8",
+				max_tokens: 10,
+				system: PLANNING_SESSION_INSTRUCTIONS,
+				metadata: {
+					user_id: JSON.stringify({ session_id: PLANNING_SESSION_ID }),
+				},
+				messages,
+				tools: PLANNING_SESSION_TOOLS,
+			}),
+		});
+		const transformed = await provider.transformRequestBody(request, undefined);
+		return (await transformed.json()) as CodexBody;
+	}
+
+	test("root turn establishes admission and preserves parallel-fan-out fidelity", async () => {
+		const provider = new CodexProvider();
+		const body = await sendPlanningSession(
+			provider,
+			planningSessionRootMessages(),
+		);
+
+		// Agent and Task are offered for the elected root, alongside every other
+		// current tool, in source order.
+		expect(body.tools?.map((t) => t.name)).toEqual([
+			"Agent",
+			"Task",
+			"Skill",
+			"Read",
+			"StructuredOutput",
+		]);
+		// StructuredOutput coexists with other current working tools, so the
+		// implicit forced tool_choice must stay unset.
+		expect(body.tool_choice).toBeUndefined();
+
+		// Calls preserve source order (Agent dispatched before Task).
+		const callAgent = calls(body.input).find(
+			(c) => c.call_id === "call_agent_1",
+		);
+		const callTask = calls(body.input).find((c) => c.call_id === "call_task_1");
+		expect(callAgent?.name).toBe("Agent");
+		expect(callTask?.name).toBe("Task");
+		expect(body.input.indexOf(callAgent as never)).toBeLessThan(
+			body.input.indexOf(callTask as never),
+		);
+
+		// Results pair correctly by tool_use_id despite arriving in the opposite
+		// order from the calls, and that authored order (Task before Agent) is
+		// preserved rather than re-sorted to match call order.
+		const taskOutput = outputs(body.input).find(
+			(o) => o.call_id === "call_task_1",
+		);
+		const agentOutput = outputs(body.input).find(
+			(o) => o.call_id === "call_agent_1",
+		);
+		expect(taskOutput?.output).toBe(
+			"Task complete: identified the modules requiring changes.",
+		);
+		expect(agentOutput?.output).toBe(
+			`${CONNECTOR_AUTH_WARNING_TEXT}\nSubagent research complete: proposed a 3-step implementation plan.`,
+		);
+		expect(body.input.indexOf(taskOutput as never)).toBeLessThan(
+			body.input.indexOf(agentOutput as never),
+		);
+
+		// The connector-auth warning-shaped text survives byte-for-byte: it is
+		// opaque payload to the transform, never parsed or rewritten.
+		expect(agentOutput?.output as string).toContain(
+			CONNECTOR_AUTH_WARNING_TEXT,
+		);
+
+		// ToolSearch's tool_reference result blocks remain fully serialized.
+		const toolSearchOutput = outputs(body.input).find(
+			(o) => o.call_id === "call_toolsearch_1",
+		);
+		expect(toolSearchOutput?.output).toBe(
+			'{"type":"tool_reference","tool_name":"TaskCreate"}\n' +
+				'{"type":"tool_reference","tool_name":"TaskUpdate"}',
+		);
+
+		// Exactly one Skill nudge, appended at the tail so the cached prefix
+		// stays stable.
+		expect(nudges(body.input)).toBe(1);
+		expect(nudges([body.input[body.input.length - 1]])).toBe(1);
+	});
+
+	test("compaction-shaped continuation stays root via lineage and preserves the same fidelity", async () => {
+		const provider = new CodexProvider();
+		// Establish root admission for this session first.
+		await sendPlanningSession(provider, planningSessionRootMessages());
+
+		// Compaction drops the original first user item but keeps every
+		// function_call/function_call_output pair (including call_agent_1 and
+		// call_task_1, which the election store recorded as this session's
+		// lineage), and appends a brand-new Skill/Read turn.
+		const compactedMessages = [
+			...planningSessionRootMessages().slice(1),
+			...planningSessionContinuationTurn(),
+		];
+
+		const traceDir = mkdtempSync(
+			join(tmpdir(), "codex-fidelity-planning-trace-"),
+		);
+		process.env[CODEX_TRACE_DIR_ENV] = traceDir;
+		let body: CodexBody;
+		try {
+			body = await sendPlanningSession(provider, compactedMessages, {
+				"x-better-ccflare-request-id": "planning-session-continuation",
+			});
+			const requestTrace = readTraceRecords(traceDir).find(
+				(record) =>
+					record.phase === "request" &&
+					record.request_id === "planning-session-continuation",
+			);
+			// No demotion at the provider boundary: the compacted turn is
+			// re-admitted as root via the surviving call_id lineage, not rejected
+			// and not silently downgraded.
+			expect(requestTrace).toMatchObject({
+				orchestration_admission: "root",
+				orchestration_basis: "lineage_match",
+				orchestration_demotion_observed: false,
+			});
+		} finally {
+			delete process.env[CODEX_TRACE_DIR_ENV];
+			rmSync(traceDir, { recursive: true, force: true });
+		}
+
+		// Agent/Task remain offered for what is still logically the same root.
+		expect(body.tools?.map((t) => t.name)).toEqual([
+			"Agent",
+			"Task",
+			"Skill",
+			"Read",
+			"StructuredOutput",
+		]);
+		expect(body.tool_choice).toBeUndefined();
+
+		// Source/pair ordering from the retained history is unchanged.
+		const taskOutput = outputs(body.input).find(
+			(o) => o.call_id === "call_task_1",
+		);
+		const agentOutput = outputs(body.input).find(
+			(o) => o.call_id === "call_agent_1",
+		);
+		expect(taskOutput?.output).toBe(
+			"Task complete: identified the modules requiring changes.",
+		);
+		expect(agentOutput?.output).toBe(
+			`${CONNECTOR_AUTH_WARNING_TEXT}\nSubagent research complete: proposed a 3-step implementation plan.`,
+		);
+		expect(body.input.indexOf(taskOutput as never)).toBeLessThan(
+			body.input.indexOf(agentOutput as never),
+		);
+
+		// The warning text is still preserved opaquely after compaction.
+		expect(agentOutput?.output as string).toContain(
+			CONNECTOR_AUTH_WARNING_TEXT,
+		);
+
+		// The structured tool-reference result blocks remain serialized.
+		const toolSearchOutput = outputs(body.input).find(
+			(o) => o.call_id === "call_toolsearch_1",
+		);
+		expect(toolSearchOutput?.output).toBe(
+			'{"type":"tool_reference","tool_name":"TaskCreate"}\n' +
+				'{"type":"tool_reference","tool_name":"TaskUpdate"}',
+		);
+
+		// Exactly one Skill nudge: the replayed, now mid-history call_skill_1
+		// result does not double-fire, and the new final call_skill_2 result
+		// fires exactly once, at the tail.
+		expect(nudges(body.input)).toBe(1);
+		expect(nudges([body.input[body.input.length - 1]])).toBe(1);
+	});
+
+	test("attributed descendant form removes current Agent/Task but preserves history, other tools, and unset tool_choice", async () => {
+		const provider = new CodexProvider();
+		const body = await sendPlanningSession(
+			provider,
+			planningSessionRootMessages(),
+			{ "x-better-ccflare-attributed-agent": "true" },
+		);
+
+		// Current Agent/Task declarations are removed for the attributed
+		// descendant; every other current tool is preserved, in source order.
+		expect(body.tools?.map((t) => t.name)).toEqual([
+			"Skill",
+			"Read",
+			"StructuredOutput",
+		]);
+		// Multiple non-orchestration tools remain (Skill, Read, StructuredOutput),
+		// so the implicit forced tool_choice must stay unset.
+		expect(body.tool_choice).toBeUndefined();
+
+		// Historical Agent/Task calls and their results are preserved: filtering
+		// only ever touches the *declared* current tools, never already-authored
+		// history.
+		const callNames = calls(body.input)
+			.map((c) => c.name)
+			.sort();
+		expect(callNames).toEqual(
+			["Agent", "Read", "Skill", "Task", "ToolSearch"].sort(),
+		);
+
+		const outs = outputs(body.input);
+		expect(outs.find((o) => o.call_id === "call_task_1")?.output).toBe(
+			"Task complete: identified the modules requiring changes.",
+		);
+		expect(outs.find((o) => o.call_id === "call_agent_1")?.output).toBe(
+			`${CONNECTOR_AUTH_WARNING_TEXT}\nSubagent research complete: proposed a 3-step implementation plan.`,
+		);
+		expect(outs.find((o) => o.call_id === "call_toolsearch_1")?.output).toBe(
+			'{"type":"tool_reference","tool_name":"TaskCreate"}\n' +
+				'{"type":"tool_reference","tool_name":"TaskUpdate"}',
+		);
+		expect(outs.find((o) => o.call_id === "call_skill_1")?.output).toBe(
+			"planning-mode skill loaded.",
+		);
+		expect(outs.find((o) => o.call_id === "call_read_1")?.output).toBe(
+			"plan.md contents: outline of proposed workstreams.",
+		);
+
+		// The final Skill result mixed with the Read result still nudges exactly
+		// once for an attributed descendant, same as for the root.
+		expect(nudges(body.input)).toBe(1);
 	});
 });

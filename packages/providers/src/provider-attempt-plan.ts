@@ -7,6 +7,8 @@ import type {
 	ProviderAttemptNoExecutionSnapshot,
 	ProviderAttemptPlan,
 	ProviderAttemptPlanContext,
+	ProviderServerToolHistoryProjector,
+	ProviderServerToolReplayIssuer,
 	ProviderUsageInfo,
 	RateLimitInfo,
 } from "./types";
@@ -57,6 +59,8 @@ type ValidatedProviderAttemptPlanContext = Readonly<{
 	capabilityProofKey: string | null;
 	inputReplayMode: readonly ServerToolReplayAtom[];
 	outputReplayMode: readonly ServerToolReplayAtom[];
+	serverToolHistoryProjector?: ProviderServerToolHistoryProjector;
+	serverToolReplayIssuer?: ProviderServerToolReplayIssuer;
 }>;
 
 function isRecord(value: unknown): value is UnknownRecord {
@@ -139,6 +143,32 @@ function optionalFunction<T extends (...args: never[]) => unknown>(
 ): T | undefined {
 	if (value === undefined) return undefined;
 	return requireFunction<T>(value, field);
+}
+
+function snapshotServerToolHistoryProjector(
+	value: unknown,
+): ProviderServerToolHistoryProjector | undefined {
+	const projector = optionalFunction<ProviderServerToolHistoryProjector>(
+		value,
+		"serverToolHistoryProjector",
+	);
+	if (projector === undefined) return undefined;
+	return Object.freeze((messages: unknown) =>
+		Reflect.apply(projector, undefined, [messages]),
+	);
+}
+
+function snapshotServerToolReplayIssuer(
+	value: unknown,
+): ProviderServerToolReplayIssuer | undefined {
+	const issuer = optionalFunction<ProviderServerToolReplayIssuer>(
+		value,
+		"serverToolReplayIssuer",
+	);
+	if (issuer === undefined) return undefined;
+	return Object.freeze((binding, payload) =>
+		Reflect.apply(issuer, undefined, [binding, payload]),
+	);
 }
 
 function captureProviderDescriptor(
@@ -555,6 +585,12 @@ function validateContext(
 		),
 		inputReplayMode: normalizeReplayMode(context.inputReplayMode),
 		outputReplayMode: normalizeReplayMode(context.outputReplayMode),
+		serverToolHistoryProjector: snapshotServerToolHistoryProjector(
+			context.serverToolHistoryProjector,
+		),
+		serverToolReplayIssuer: snapshotServerToolReplayIssuer(
+			context.serverToolReplayIssuer,
+		),
 	};
 }
 
@@ -852,13 +888,15 @@ export function materializeProviderAttemptPlan(
 	const validatedContext = validateContext(context);
 	const providerDescriptor = captureProviderDescriptor(provider);
 	requireStableProviderDescriptor(provider, providerDescriptor);
+	const useCustomPlanner =
+		validatedContext.capabilityProofKey !== null &&
+		providerDescriptor.createAttemptPlan !== undefined;
 	// Defensive body-sized copies exist only for hooks that can observe them.
 	const planningContext =
-		providerDescriptor.createAttemptPlan !== undefined ||
-		providerDescriptor.prepareRequest !== undefined
+		useCustomPlanner || providerDescriptor.prepareRequest !== undefined
 			? copyPlanningInputs(validatedContext)
 			: validatedContext;
-	if (providerDescriptor.createAttemptPlan !== undefined) {
+	if (useCustomPlanner) {
 		return materializeCustomPlan(provider, planningContext, providerDescriptor);
 	}
 	return materializeLegacyPlan(provider, planningContext, providerDescriptor);

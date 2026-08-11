@@ -49,6 +49,47 @@ describe("AnthropicProvider", () => {
 		});
 	});
 
+	it("strips only proxy-minted retained reasoning before forwarding to Anthropic", async () => {
+		const transformed = await provider.transformRequestBody(
+			new Request("https://api.anthropic.example/v1/messages", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					model: "claude-sonnet",
+					messages: [
+						{
+							role: "user",
+							content: [
+								{ type: "redacted_thinking", data: "bccfr1.rs_user.keep" },
+							],
+						},
+						{
+							role: "assistant",
+							content: [
+								{ type: "redacted_thinking", data: "bccfr1.rs_strip.cipher" },
+								{ type: "redacted_thinking", data: "anthropic-genuine" },
+							],
+						},
+					],
+				}),
+			}),
+			mockAccount,
+		);
+
+		expect(await transformed.json()).toMatchObject({
+			messages: [
+				{
+					role: "user",
+					content: [{ type: "redacted_thinking", data: "bccfr1.rs_user.keep" }],
+				},
+				{
+					role: "assistant",
+					content: [{ type: "redacted_thinking", data: "anthropic-genuine" }],
+				},
+			],
+		});
+	});
+
 	describe("processResponse", () => {
 		it("preserves body and status", async () => {
 			const body = JSON.stringify({ type: "message", content: "hello" });

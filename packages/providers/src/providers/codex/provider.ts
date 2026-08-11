@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { getCodexReasoningRetention } from "@better-ccflare/config";
 import {
 	BUFFER_SIZES,
 	getModelFamily,
@@ -22,21 +23,42 @@ import {
 	resolveAnthropicReasoningEffort,
 	sanitizeSchemaForOpenAI,
 } from "@better-ccflare/openai-formats";
-import type { Account, LogicalModelCapability } from "@better-ccflare/types";
+import type {
+	Account,
+	LogicalModelCapability,
+	ServerToolCapabilityDecision,
+	ServerToolCapabilityTuple,
+	ServerToolRequirements,
+} from "@better-ccflare/types";
 import { BaseProvider } from "../../base";
 import {
 	estimateAnthropicRequestTokens,
 	resolveModelContextCapability,
 } from "../../request-capabilities";
-import type { RateLimitInfo, TokenRefreshResult } from "../../types";
+import type {
+	ProviderAttemptPlanContext,
+	ProviderServerToolCapabilityContext,
+	ProviderServerToolReplayIssuer,
+	RateLimitInfo,
+	TokenRefreshResult,
+} from "../../types";
+import { CODEX_REASONING_RETENTION_PREFIX } from "../../utils/codex-reasoning-retention";
 import {
 	CODEX_SINGLE_ORCHESTRATION_ROOT_ENV,
 	deriveConversationIdentity,
 	electOrchestrationRoot,
 	type OrchestrationAdmission,
-	peekOrchestrationRoot,
-	recordOrchestrationRootInstructions,
+	type OrchestrationAdmissionBasis,
+	snapshotOrchestrationRoot,
 } from "./orchestration-election";
+import {
+	createCodexHostedSearchAttemptPlan,
+	processCodexHostedSearchResponse,
+} from "./server-tool-attempt-plan";
+import {
+	createCodexServerToolCapabilityTuple,
+	resolveCodexServerToolCapability,
+} from "./server-tools";
 import {
 	CodexStreamLiveness,
 	type CodexStreamLivenessOptions,
@@ -359,6 +381,7 @@ const TOOL_ARGS_PER_CALL_BYTE_CAP =
 	BUFFER_SIZES.TOOL_ARGUMENTS_PER_CALL_MAX_BYTES;
 const TOOL_ARGS_TOTAL_BYTE_CAP = BUFFER_SIZES.TOOL_ARGUMENTS_TOTAL_MAX_BYTES;
 const byteEncoder = new TextEncoder();
+const CODEX_REASONING_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
 
 // When enabled, telemetry reports the effective Codex context capacity rather
 // than the raw model maximum.
@@ -398,6 +421,13 @@ interface CodexFunctionCallOutputItem {
 	status?: "in_progress" | "completed" | "incomplete";
 }
 
+interface CodexReasoningItem {
+	type: "reasoning";
+	id: string;
+	summary: [];
+	encrypted_content: string;
+}
+
 type CodexContentItem =
 	| CodexInputTextItem
 	| CodexOutputTextItem
@@ -418,9 +448,15 @@ interface CodexTool {
 
 interface CodexRequest {
 	model: string;
-	input: (CodexMessage | CodexFunctionCallItem | CodexFunctionCallOutputItem)[];
+	input: (
+		| CodexMessage
+		| CodexFunctionCallItem
+		| CodexFunctionCallOutputItem
+		| CodexReasoningItem
+	)[];
 	stream: boolean;
 	store: false;
+	include?: string[];
 	reasoning?: { effort: ReasoningEffort };
 	instructions?: string;
 	prompt_cache_key?: string;
@@ -469,6 +505,15 @@ interface CodexConversionResult {
 	cacheKeyDecision: CodexPromptCacheKeyDecision;
 	explicitBreakpointDecision: CodexExplicitBreakpointDecision;
 	orchestrationAdmission: OrchestrationAdmission;
+	/**
+	 * Diagnostic-only reasoning basis behind orchestrationAdmission, when an
+	 * election actually ran ("initial_claim" | "identity_match" |
+	 * "lineage_match" | "rejected"). Null when no election ran at all (e.g.
+	 * no_orchestration_tools, attributed_descendant, disabled, no_session,
+	 * no_conversation). Written verbatim to trace.ts's TraceInputs as
+	 * orchestrationBasis.
+	 */
+	orchestrationBasis: OrchestrationAdmissionBasis | null;
 	filteredToolNames: string[];
 	/** Diagnostic: see orchestrationDemotionObserved in trace.ts's TraceInputs. */
 	orchestrationDemotionObserved: boolean;
@@ -504,10 +549,23 @@ interface AnthropicToolResult {
 		  }>;
 }
 
+interface AnthropicRedactedThinkingBlock {
+	type: "redacted_thinking";
+	data: string;
+}
+
+interface AnthropicThinkingBlock {
+	type: "thinking";
+	thinking: string;
+	signature?: string;
+}
+
 type AnthropicContentBlock =
 	| AnthropicTextContent
 	| AnthropicToolUse
-	| AnthropicToolResult;
+	| AnthropicToolResult
+	| AnthropicRedactedThinkingBlock
+	| AnthropicThinkingBlock;
 
 interface AnthropicMessage {
 	role: "user" | "assistant";
@@ -518,6 +576,24 @@ interface AnthropicTool {
 	name: string;
 	description?: string;
 	input_schema?: Record<string, unknown>;
+}
+
+/**
+ * Flattened, top-level-only view of an AnthropicTool's input_schema, used to
+ * decide whether an empty-string tool-call argument is safe to strip. Only
+ * `properties` and `required` are read; nested schemas are not descended
+ * into. Built once per request in transformRequestBody and cached by
+ * request id (see CodexProvider#requestToolSchemasById) so the response-side
+ * sanitizer never needs to throw or guess on a cache miss.
+ */
+interface CodexToolSchemaPropInfo {
+	isString: boolean;
+	enumHasEmptyString: boolean;
+}
+
+interface CodexToolSchemaInfo {
+	required: Set<string>;
+	props: Map<string, CodexToolSchemaPropInfo>;
 }
 
 interface AnthropicToolChoice {
@@ -605,6 +681,13 @@ interface StreamState {
 	};
 	// Newly emitted tool calls from this response only (not historical replay).
 	traceNewToolCalls: ToolCallSummary[];
+	traceReasoningOutputItemCount: number;
+	traceReasoningEncryptedPresent: boolean;
+	traceReasoningUnrepresentableIdSkipCount: number;
+	// Wrapped redacted_thinking payloads whose emission is deferred while a
+	// function-call block is still streaming: emitting mid-lifecycle would
+	// interleave block lifecycles on the wire (pro-gate P1, PR #139).
+	pendingReasoningBlocks: string[];
 	traceRequestId: string;
 	traceAttemptId?: string;
 	traceTurnStateHeaderPresent: boolean;
@@ -660,6 +743,12 @@ function writeCodexStreamTerminalTrace(
 				: {},
 			stopReason,
 			error,
+			{
+				outputItemCount: state.traceReasoningOutputItemCount,
+				encryptedPresent: state.traceReasoningEncryptedPresent,
+				unrepresentableIdSkipCount:
+					state.traceReasoningUnrepresentableIdSkipCount,
+			},
 		),
 	});
 }
@@ -721,6 +810,69 @@ export class CodexProvider extends BaseProvider {
 		};
 	}
 
+	createServerToolCapabilityTuple(
+		context: ProviderServerToolCapabilityContext,
+	): ServerToolCapabilityTuple | undefined {
+		return createCodexServerToolCapabilityTuple(context);
+	}
+
+	resolveServerToolCapability(
+		requirements: ServerToolRequirements,
+		tuple: ServerToolCapabilityTuple,
+	): ServerToolCapabilityDecision {
+		return resolveCodexServerToolCapability(requirements, tuple);
+	}
+
+	createAttemptPlan(context: ProviderAttemptPlanContext) {
+		return createCodexHostedSearchAttemptPlan(context, {
+			prepareHeaders: (headers, accessToken) =>
+				this.prepareHeaders(headers, accessToken),
+			transformOrdinaryRequest: (request) =>
+				this.transformRequestBody(request, context.account),
+			processHostedResponse: (
+				response,
+				_requestHeaders,
+				requestedStream,
+				replayIssuer: ProviderServerToolReplayIssuer,
+				capabilityProofKey,
+				physicalModel,
+			) => {
+				const requestId = response.headers.get("x-better-ccflare-request-id");
+				if (requestId) this.requestStreamById.delete(requestId);
+				return processCodexHostedSearchResponse({
+					response,
+					requestedStream,
+					replayIssuer,
+					capabilityProofKey,
+					physicalModel,
+					sanitizeHeaders: sanitizeResponseHeaders,
+					sanitizeClientFunctionArguments: (name, argumentsJson) =>
+						this.sanitizeToolUsePartialJson(name, argumentsJson),
+					fallback: () => this.processResponse(response, context.account),
+				});
+			},
+			parseRateLimit: (response) => this.parseRateLimit(response),
+			...(this.isStreamingResponse
+				? {
+						isStreamingResponse: (response: Response) =>
+							this.isStreamingResponse?.(response) ?? false,
+					}
+				: {}),
+			...(this.extractTierInfo
+				? {
+						extractTierInfo: (response: Response) =>
+							this.extractTierInfo?.(response) ?? Promise.resolve(null),
+					}
+				: {}),
+			...(this.extractUsageInfo
+				? {
+						extractUsageInfo: (response: Response) =>
+							this.extractUsageInfo?.(response) ?? Promise.resolve(null),
+					}
+				: {}),
+		});
+	}
+
 	getLogicalModelCapability(
 		logicalModel: string,
 		_account: Account,
@@ -762,6 +914,86 @@ export class CodexProvider extends BaseProvider {
 				this.requestStreamById.delete(id);
 			}
 		}
+	}
+
+	// Per-request, per-tool schema info derived from the Anthropic request's
+	// tools[].input_schema, used to decide whether a ""-valued tool-call
+	// argument is a genuinely-omitted optional string (safe to strip) versus
+	// an unknown field (kept, never guessed). Same 30s TTL sweep pattern as
+	// requestStreamById above; populated in transformRequestBody, read from
+	// the response-side sanitizers via requestId.
+	private requestToolSchemasById = new Map<
+		string,
+		{ tools: Map<string, CodexToolSchemaInfo>; ts: number }
+	>();
+
+	private sweepRequestToolSchemasById(): void {
+		const cutoff = Date.now() - 30_000;
+		for (const [id, entry] of this.requestToolSchemasById) {
+			if (entry.ts < cutoff) {
+				this.requestToolSchemasById.delete(id);
+			}
+		}
+	}
+
+	/** Guarded against malformed/missing schemas: never throws, worst case yields an empty map. */
+	private buildToolSchemaMap(
+		tools: AnthropicTool[] | undefined,
+	): Map<string, CodexToolSchemaInfo> {
+		const result = new Map<string, CodexToolSchemaInfo>();
+		if (!Array.isArray(tools)) return result;
+		for (const tool of tools) {
+			if (!tool || typeof tool.name !== "string") continue;
+			const schema = tool.input_schema;
+			if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+				continue;
+			}
+			const required = new Set<string>();
+			const requiredRaw = (schema as Record<string, unknown>).required;
+			if (Array.isArray(requiredRaw)) {
+				for (const key of requiredRaw) {
+					if (typeof key === "string") required.add(key);
+				}
+			}
+			const props = new Map<string, CodexToolSchemaPropInfo>();
+			const propsRaw = (schema as Record<string, unknown>).properties;
+			if (
+				propsRaw &&
+				typeof propsRaw === "object" &&
+				!Array.isArray(propsRaw)
+			) {
+				for (const [propName, propSchemaRaw] of Object.entries(
+					propsRaw as Record<string, unknown>,
+				)) {
+					if (
+						!propSchemaRaw ||
+						typeof propSchemaRaw !== "object" ||
+						Array.isArray(propSchemaRaw)
+					) {
+						continue;
+					}
+					const propSchema = propSchemaRaw as Record<string, unknown>;
+					const type = propSchema.type;
+					const isString =
+						type === "string" ||
+						(Array.isArray(type) && type.includes("string"));
+					const enumValues = propSchema.enum;
+					const enumHasEmptyString =
+						Array.isArray(enumValues) && enumValues.includes("");
+					props.set(propName, { isString, enumHasEmptyString });
+				}
+			}
+			result.set(tool.name, { required, props });
+		}
+		return result;
+	}
+
+	private getToolSchemaInfo(
+		requestId: string | undefined,
+		toolName: string,
+	): CodexToolSchemaInfo | undefined {
+		if (!requestId) return undefined;
+		return this.requestToolSchemasById.get(requestId)?.tools.get(toolName);
 	}
 
 	canHandle(path: string): boolean {
@@ -909,6 +1141,7 @@ export class CodexProvider extends BaseProvider {
 
 		try {
 			this.sweepRequestStreamById();
+			this.sweepRequestToolSchemasById();
 			const body = (await request.json()) as AnthropicRequest;
 			const logicalModelFamily =
 				trustedLogicalModelFamily ?? getModelFamily(body.model);
@@ -946,6 +1179,10 @@ export class CodexProvider extends BaseProvider {
 					stream: body.stream === true,
 					ts: Date.now(),
 				});
+				this.requestToolSchemasById.set(requestId, {
+					tools: this.buildToolSchemaMap(body.tools),
+					ts: Date.now(),
+				});
 			}
 			const {
 				codexBody,
@@ -954,6 +1191,7 @@ export class CodexProvider extends BaseProvider {
 				cacheKeyDecision,
 				explicitBreakpointDecision,
 				orchestrationAdmission,
+				orchestrationBasis,
 				filteredToolNames,
 				orchestrationDemotionObserved,
 				elapsedMsSinceRoot,
@@ -1012,6 +1250,7 @@ export class CodexProvider extends BaseProvider {
 				pacingAction: request.headers.get("x-better-ccflare-pacing-action"),
 				isDescendant: isAttributedAgent,
 				orchestrationAdmission,
+				orchestrationBasis,
 				orchestrationDemotionObserved,
 				elapsedMsSinceRoot,
 				toolsBeforeCount: body.tools?.length ?? 0,
@@ -1703,11 +1942,17 @@ export class CodexProvider extends BaseProvider {
 	private convertMessage(
 		msg: AnthropicMessage,
 		sourceMessageIndex: number,
-	): (CodexMessage | CodexFunctionCallItem | CodexFunctionCallOutputItem)[] {
+	): (
+		| CodexMessage
+		| CodexFunctionCallItem
+		| CodexFunctionCallOutputItem
+		| CodexReasoningItem
+	)[] {
 		const items: (
 			| CodexMessage
 			| CodexFunctionCallItem
 			| CodexFunctionCallOutputItem
+			| CodexReasoningItem
 		)[] = [];
 
 		// Codex API only accepts user/assistant/system roles.
@@ -1771,6 +2016,38 @@ export class CodexProvider extends BaseProvider {
 					});
 				}
 				pendingText.push(textItem);
+			} else if (
+				block.type === "redacted_thinking" &&
+				role === "assistant" &&
+				getCodexReasoningRetention() &&
+				typeof block.data === "string" &&
+				block.data.startsWith(CODEX_REASONING_RETENTION_PREFIX)
+			) {
+				const separatorIndex = block.data.indexOf(
+					".",
+					CODEX_REASONING_RETENTION_PREFIX.length,
+				);
+				if (separatorIndex !== -1) {
+					const reasoningId = block.data.slice(
+						CODEX_REASONING_RETENTION_PREFIX.length,
+						separatorIndex,
+					);
+					const encryptedContent = block.data.slice(separatorIndex + 1);
+					// Older builds could mint bccfr1 blocks with an empty id. Drop those
+					// legacy poison blocks so a live transcript cannot replay a guaranteed 400.
+					if (
+						CODEX_REASONING_ID_PATTERN.test(reasoningId) &&
+						encryptedContent.length > 0
+					) {
+						flushText();
+						items.push({
+							type: "reasoning",
+							id: reasoningId,
+							summary: [],
+							encrypted_content: encryptedContent,
+						});
+					}
+				}
 			} else if (block.type === "tool_use") {
 				flushText();
 				items.push({
@@ -1799,7 +2076,11 @@ export class CodexProvider extends BaseProvider {
 		return items;
 	}
 
-	private sanitizeToolUseInput(name: string, input: unknown): unknown {
+	private sanitizeToolUseInput(
+		name: string,
+		input: unknown,
+		schema?: CodexToolSchemaInfo,
+	): unknown {
 		if (input === undefined) return {};
 		if (input === null || typeof input !== "object" || Array.isArray(input)) {
 			return input;
@@ -1808,6 +2089,31 @@ export class CodexProvider extends BaseProvider {
 		const sanitized: Record<string, unknown> = {
 			...(input as Record<string, unknown>),
 		};
+
+		// Generic, schema-aware pass over top-level keys, ahead of the
+		// per-tool cases below. GPT-family models routed through this
+		// provider never omit optional tool parameters (verified incident:
+		// EnterWorktree calls carrying `"name": ""` alongside `path`,
+		// tripping "at most one of name or path"), so this normalizes that
+		// shape back to what an Anthropic-native model would have sent.
+		for (const [key, value] of Object.entries(sanitized)) {
+			if (value === null) {
+				delete sanitized[key];
+				continue;
+			}
+			if (value === "" && schema) {
+				const prop = schema.props.get(key);
+				if (
+					prop?.isString &&
+					!prop.enumHasEmptyString &&
+					!schema.required.has(key)
+				) {
+					delete sanitized[key];
+				}
+			}
+			// value === "" with no schema (cache miss / unknown tool / schema
+			// never registered): keep it. Never guess.
+		}
 
 		if (name === "Read") {
 			const pages = sanitized.pages;
@@ -1850,13 +2156,20 @@ export class CodexProvider extends BaseProvider {
 	private sanitizeToolUsePartialJson(
 		name: string,
 		partialJson: string,
+		requestId?: string,
 	): string {
 		try {
 			const input = JSON.parse(partialJson) as unknown;
 			if (typeof input !== "object" || input === null || Array.isArray(input)) {
 				return partialJson;
 			}
-			return JSON.stringify(this.sanitizeToolUseInput(name, input));
+			return JSON.stringify(
+				this.sanitizeToolUseInput(
+					name,
+					input,
+					this.getToolSchemaInfo(requestId, name),
+				),
+			);
 		} catch {
 			return partialJson;
 		}
@@ -2009,10 +2322,19 @@ export class CodexProvider extends BaseProvider {
 			body.tools?.some((tool) => orchestrationToolNames.has(tool.name)) ??
 			false;
 		let orchestrationAdmission: OrchestrationAdmission;
+		let orchestrationBasis: OrchestrationAdmissionBasis | null = null;
 		let orchestrationDemotionObserved = false;
 		let elapsedMsSinceRoot: number | null = null;
 		if (!offersOrchestrationTools) {
 			orchestrationAdmission = "no_orchestration_tools";
+		} else if (isAttributedAgent) {
+			// Attributed descendants (subagents) are never contenders in root
+			// election: they must not claim an empty slot, must not extend an
+			// existing root's continuity state, and must not observe or report a
+			// demotion. Their current Agent/Task declarations are unconditionally
+			// filtered below using only this admission tag -- no snapshot, no
+			// derived conversation identity, no admit() call, no root recording.
+			orchestrationAdmission = "attributed_descendant";
 		} else if (process.env[CODEX_SINGLE_ORCHESTRATION_ROOT_ENV] === "0") {
 			orchestrationAdmission = "disabled";
 		} else {
@@ -2022,30 +2344,36 @@ export class CodexProvider extends BaseProvider {
 			} else {
 				// Captured before electOrchestrationRoot() mutates the entry, so a
 				// demotion below can still report how long the prior root was idle.
-				const priorRoot = peekOrchestrationRoot(sessionId);
+				const priorRootSnapshot = snapshotOrchestrationRoot(sessionId);
 				const conversationId = deriveConversationIdentity(
 					sessionId,
 					finalInstructions,
 					input,
 				);
-				orchestrationAdmission = conversationId
-					? electOrchestrationRoot(sessionId, conversationId)
-					: "no_conversation";
-				if (orchestrationAdmission === "root") {
-					recordOrchestrationRootInstructions(sessionId, finalInstructions);
-				} else if (orchestrationAdmission === "non_root" && priorRoot) {
-					// This session already had an elected root, and this turn's
-					// derived identity no longer matches it. Compaction that drops
-					// the earliest input item reshapes deriveConversationIdentity's
-					// hash for what is otherwise the same conversation, so this
-					// signal is diagnostic, not proof of a genuine sibling turn.
-					orchestrationDemotionObserved = true;
-					elapsedMsSinceRoot = Date.now() - priorRoot.lastActiveAt;
-					const instructionsMatchedPriorRoot =
-						finalInstructions === priorRoot.instructions;
-					log.warn(
-						`orchestration demotion observed: session=${sessionId} elapsed_ms_since_root=${elapsedMsSinceRoot} isAttributedAgent=${isAttributedAgent} instructionsMatchedPriorRoot=${instructionsMatchedPriorRoot}`,
+				if (!conversationId) {
+					orchestrationAdmission = "no_conversation";
+				} else {
+					const electionResult = electOrchestrationRoot(
+						sessionId,
+						conversationId,
+						finalInstructions,
+						input,
 					);
+					orchestrationAdmission = electionResult.admission;
+					orchestrationBasis = electionResult.basis;
+					if (electionResult.admission === "non_root" && priorRootSnapshot) {
+						// This session already had an elected root, and this turn was
+						// rejected as an ordinary contender (categorical basis:
+						// "rejected"): neither its derived identity nor its call_id
+						// lineage matched. Diagnostic only, and privacy-safe: no raw
+						// session id, instructions text, or call ids are ever logged,
+						// only the request id and a domain-separated session digest.
+						orchestrationDemotionObserved = true;
+						elapsedMsSinceRoot = Date.now() - priorRootSnapshot.lastActiveAt;
+						log.warn(
+							`orchestration demotion observed: request=${requestId ?? "unknown"} session_digest=${this.hashSessionKey(body) ?? "none"} elapsed_ms_since_root=${elapsedMsSinceRoot} isAttributedAgent=${isAttributedAgent} basis=${electionResult.basis}`,
+						);
+					}
 				}
 			}
 		}
@@ -2054,7 +2382,8 @@ export class CodexProvider extends BaseProvider {
 		// root retains current Agent and Task declarations. Historical calls and
 		// results are already represented in input and remain untouched.
 		const shouldFilterOrchestrationTools =
-			isAttributedAgent || orchestrationAdmission === "non_root";
+			orchestrationAdmission === "attributed_descendant" ||
+			orchestrationAdmission === "non_root";
 		const filteredToolNames = shouldFilterOrchestrationTools
 			? (body.tools ?? [])
 					.filter((tool) => orchestrationToolNames.has(tool.name))
@@ -2098,6 +2427,9 @@ export class CodexProvider extends BaseProvider {
 			input,
 			stream: true,
 			store: false,
+			...(getCodexReasoningRetention()
+				? { include: ["reasoning.encrypted_content"] }
+				: {}),
 			reasoning: {
 				effort: reasoningResolution.effort ?? defaultReasoningEffort,
 			},
@@ -2130,11 +2462,14 @@ export class CodexProvider extends BaseProvider {
 		);
 		if (explicitToolChoice) {
 			codexRequest.tool_choice = explicitToolChoice;
-		} else if (tools?.some((t) => t.name === "StructuredOutput")) {
+		} else if (tools?.length === 1 && tools[0].name === "StructuredOutput") {
 			// Claude Code schema agents provide a StructuredOutput tool but do not set
 			// Anthropic tool_choice. Native Claude reliably follows the hidden schema
 			// instruction; Codex models often end_turn with text instead. Force the
-			// function when this sentinel tool is present to preserve workflow semantics.
+			// function when this sentinel tool is the sole *current* tool remaining
+			// after orchestration filtering above -- if it coexists with any other
+			// current tool (e.g. Read), the model may still legitimately need that
+			// other tool first, so tool_choice is intentionally left unset.
 			codexRequest.tool_choice = {
 				type: "function",
 				name: "StructuredOutput",
@@ -2169,6 +2504,7 @@ export class CodexProvider extends BaseProvider {
 			cacheKeyDecision,
 			explicitBreakpointDecision,
 			orchestrationAdmission,
+			orchestrationBasis,
 			filteredToolNames,
 			orchestrationDemotionObserved,
 			elapsedMsSinceRoot,
@@ -2198,6 +2534,10 @@ export class CodexProvider extends BaseProvider {
 		let errorPayload: Record<string, unknown> | null = null;
 		const content: Array<Record<string, unknown>> = [];
 		const textByIndex = new Map<number, string>();
+		const redactedThinkingByIndex = new Map<
+			number,
+			{ type: "redacted_thinking"; data: string }
+		>();
 		const toolByIndex = new Map<
 			number,
 			{ id: string; name: string; partialJson: string }
@@ -2265,6 +2605,14 @@ export class CodexProvider extends BaseProvider {
 							name: typeof block.name === "string" ? block.name : "",
 							partialJson: toolByIndex.get(index)?.partialJson ?? "",
 						});
+					} else if (
+						block.type === "redacted_thinking" &&
+						typeof block.data === "string"
+					) {
+						redactedThinkingByIndex.set(index, {
+							type: "redacted_thinking",
+							data: block.data,
+						});
 					}
 				}
 			}
@@ -2300,8 +2648,16 @@ export class CodexProvider extends BaseProvider {
 			});
 		}
 
-		const allIndices = new Set([...textByIndex.keys(), ...toolByIndex.keys()]);
+		const allIndices = new Set([
+			...textByIndex.keys(),
+			...redactedThinkingByIndex.keys(),
+			...toolByIndex.keys(),
+		]);
 		for (const index of [...allIndices].sort((a, b) => a - b)) {
+			const redactedThinking = redactedThinkingByIndex.get(index);
+			if (redactedThinking !== undefined) {
+				content.push(redactedThinking);
+			}
 			const text = textByIndex.get(index);
 			if (text !== undefined) {
 				content.push({ type: "text", text });
@@ -2320,7 +2676,11 @@ export class CodexProvider extends BaseProvider {
 					type: "tool_use",
 					id: tool.id || `call_${index}`,
 					name: tool.name,
-					input: this.sanitizeToolUseInput(tool.name, input),
+					input: this.sanitizeToolUseInput(
+						tool.name,
+						input,
+						this.getToolSchemaInfo(requestId, tool.name),
+					),
 				});
 			}
 		}
@@ -2411,6 +2771,10 @@ export class CodexProvider extends BaseProvider {
 			functionCallBytesTotal: 0,
 			sawToolUse: false,
 			traceNewToolCalls: [],
+			traceReasoningOutputItemCount: 0,
+			traceReasoningEncryptedPresent: false,
+			traceReasoningUnrepresentableIdSkipCount: 0,
+			pendingReasoningBlocks: [],
 			traceRequestId: requestId,
 			traceAttemptId: attemptId,
 			traceTurnStateHeaderPresent: response.headers.has("x-codex-turn-state"),
@@ -3155,6 +3519,17 @@ export class CodexProvider extends BaseProvider {
 			case "response.output_item.done": {
 				const item = data.item as Record<string, unknown> | undefined;
 				const itemType = item?.type as string | undefined;
+				const encryptedReasoning = item?.encrypted_content;
+
+				if (itemType === "reasoning") {
+					state.traceReasoningOutputItemCount++;
+					if (
+						typeof encryptedReasoning === "string" &&
+						encryptedReasoning.length > 0
+					) {
+						state.traceReasoningEncryptedPresent = true;
+					}
+				}
 
 				if (itemType === "function_call") {
 					const outputIndex = data.output_index as number | undefined;
@@ -3166,6 +3541,7 @@ export class CodexProvider extends BaseProvider {
 						const partialJson = this.sanitizeToolUsePartialJson(
 							buffer.name,
 							buffer.arguments.join(""),
+							state.traceRequestId,
 						);
 						state.traceNewToolCalls.push({
 							name: buffer.name,
@@ -3194,7 +3570,82 @@ export class CodexProvider extends BaseProvider {
 							state.contentBlockIndex++;
 							state.hasSentContentBlockStart = false;
 						}
+						if (
+							state.functionCallBlocks.size === 0 &&
+							!state.hasSentContentBlockStart &&
+							state.pendingReasoningBlocks.length > 0
+						) {
+							for (const pendingData of state.pendingReasoningBlocks) {
+								const pendingIndex = state.contentBlockIndex;
+								await writeSSE("content_block_start", {
+									type: "content_block_start",
+									index: pendingIndex,
+									content_block: {
+										type: "redacted_thinking",
+										data: pendingData,
+									},
+								});
+								await writeSSE("content_block_stop", {
+									type: "content_block_stop",
+									index: pendingIndex,
+								});
+								state.contentBlockIndex++;
+							}
+							state.pendingReasoningBlocks = [];
+						}
 					}
+					break;
+				}
+
+				if (
+					itemType === "reasoning" &&
+					getCodexReasoningRetention() &&
+					typeof encryptedReasoning === "string" &&
+					encryptedReasoning.length > 0
+				) {
+					const rawReasoningId = typeof item?.id === "string" ? item.id : "";
+					if (CODEX_REASONING_ID_PATTERN.test(rawReasoningId)) {
+						await ensureMessageStart();
+						const reasoningData = `${CODEX_REASONING_RETENTION_PREFIX}${rawReasoningId}.${encryptedReasoning}`;
+
+						if (
+							state.functionCallBlocks.size > 0 ||
+							state.hasSentContentBlockStart
+						) {
+							// ANY still-open block (streaming tool call or live text) defers
+							// emission: closing a live text block here would orphan its later
+							// deltas at an index with no content_block_start. Flushed after
+							// the owning output item closes, or at stream end.
+							state.pendingReasoningBlocks.push(reasoningData);
+							break;
+						}
+
+						const reasoningBlockIndex = state.contentBlockIndex;
+						await writeSSE("content_block_start", {
+							type: "content_block_start",
+							index: reasoningBlockIndex,
+							content_block: {
+								type: "redacted_thinking",
+								data: reasoningData,
+							},
+						});
+						state.hasSentContentBlockStart = true;
+						await writeSSE("content_block_stop", {
+							type: "content_block_stop",
+							index: reasoningBlockIndex,
+						});
+						state.contentBlockIndex++;
+						state.hasSentContentBlockStart = false;
+						break;
+					}
+					// An encrypted item without a representable id cannot be replayed,
+					// so nothing is minted. Do NOT fall through to the generic close
+					// below: a reasoning item never owns the open content block, and
+					// closing someone else's block here orphans its later deltas at an
+					// index with no content_block_start (the interleaving bug fixed for
+					// minted blocks in PR #139, on the skip path). The owning output
+					// item's own `done` closes it.
+					state.traceReasoningUnrepresentableIdSkipCount++;
 					break;
 				}
 
@@ -3205,6 +3656,28 @@ export class CodexProvider extends BaseProvider {
 					});
 					state.contentBlockIndex++;
 					state.hasSentContentBlockStart = false;
+				}
+				if (
+					state.functionCallBlocks.size === 0 &&
+					state.pendingReasoningBlocks.length > 0
+				) {
+					for (const pendingData of state.pendingReasoningBlocks) {
+						const pendingIndex = state.contentBlockIndex;
+						await writeSSE("content_block_start", {
+							type: "content_block_start",
+							index: pendingIndex,
+							content_block: {
+								type: "redacted_thinking",
+								data: pendingData,
+							},
+						});
+						await writeSSE("content_block_stop", {
+							type: "content_block_stop",
+							index: pendingIndex,
+						});
+						state.contentBlockIndex++;
+					}
+					state.pendingReasoningBlocks = [];
 				}
 				break;
 			}
@@ -3325,7 +3798,27 @@ export class CodexProvider extends BaseProvider {
 						index: state.contentBlockIndex,
 					});
 					state.hasSentContentBlockStart = false;
+					state.contentBlockIndex++;
 				}
+				// Flush reasoning deferred behind a tool block whose done never
+				// arrived (truncated stream): retention must not lose the payload.
+				for (const pendingData of state.pendingReasoningBlocks) {
+					const pendingIndex = state.contentBlockIndex;
+					await writeSSE("content_block_start", {
+						type: "content_block_start",
+						index: pendingIndex,
+						content_block: {
+							type: "redacted_thinking",
+							data: pendingData,
+						},
+					});
+					await writeSSE("content_block_stop", {
+						type: "content_block_stop",
+						index: pendingIndex,
+					});
+					state.contentBlockIndex++;
+				}
+				state.pendingReasoningBlocks = [];
 
 				const incompleteDetails = resp?.incomplete_details as
 					| { reason?: string }

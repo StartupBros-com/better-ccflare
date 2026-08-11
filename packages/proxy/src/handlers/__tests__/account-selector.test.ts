@@ -20,15 +20,6 @@ import { CacheAffinityOrderer } from "../../cache-affinity-orderer";
 import { DegradedOwnerOverlay } from "../../degraded-owner-overlay";
 import type { ProxyContext } from "../proxy-types";
 
-// Focused source-worktree tests do not have the ignored CLI-embedded database
-// workers. Keep account selection tests independent of those packaged artifacts.
-mock.module("@better-ccflare/database", () => ({
-	AsyncDbWriter: class AsyncDbWriter {},
-	DatabaseFactory: class DatabaseFactory {},
-	DatabaseOperations: class DatabaseOperations {},
-	ModelTranslationRepository: class ModelTranslationRepository {},
-}));
-
 const { getProvider, registerProvider, usageCache } = await import(
 	"@better-ccflare/providers"
 );
@@ -171,8 +162,12 @@ function useSessionStrategy(ctx: ProxyContext): {
 }
 
 const SERVER_TOOL_REQUIREMENTS: ServerToolRequirements = Object.freeze({
-	revision: 1,
+	revision: 2,
 	profileId: "web-search:test-profile",
+	optionProfileId:
+		"server-tool-option-profile-v1.sha256.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	responseMode: "json",
+	mixedToolMode: "server_only",
 	declarations: Object.freeze([
 		Object.freeze({ type: "web_search_20250305" as const, maxUses: 1 }),
 	]),
@@ -228,6 +223,11 @@ function installCapabilityProvider(input: {
 		}),
 		createServerToolCapabilityTuple(context: CapabilityProviderContext) {
 			input.onTuple?.(context);
+			const { optionProfileId, responseMode, mixedToolMode } =
+				context.requirements;
+			if (!optionProfileId || !responseMode || !mixedToolMode) {
+				throw new Error("Expected exact server-tool requirement profile");
+			}
 			const tuple = {
 				candidateId: context.candidateId,
 				provider: input.name,
@@ -236,6 +236,9 @@ function installCapabilityProvider(input: {
 				model: context.physicalModel,
 				toolType: context.requirements.declarations?.[0]?.type ?? "unknown",
 				profile: context.requirements.profileId ?? "unknown",
+				optionProfile: optionProfileId,
+				responseMode,
+				mixedToolMode,
 				inputReplay: context.requirements.replay.input,
 				outputReplay: context.physicalModel.includes("proxy-replay")
 					? ["proxy-evidence-v1" as const]

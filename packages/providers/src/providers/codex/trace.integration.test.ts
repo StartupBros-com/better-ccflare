@@ -72,6 +72,102 @@ describe("Codex trace wiring (integration)", () => {
 		rmSync(dir, { recursive: true, force: true });
 	});
 
+	test("traces reasoning response metadata without retaining its payload", async () => {
+		process.env[CODEX_TRACE_DIR_ENV] = dir;
+		const event = (name: string, data: unknown) =>
+			`event: ${name}\ndata: ${JSON.stringify(data)}\n\n`;
+		const upstreamBody = [
+			event("response.created", {
+				response: { id: "resp_reasoning_private", model: "gpt-5.6-sol" },
+			}),
+			event("response.output_item.done", {
+				output_index: 0,
+				item: {
+					type: "reasoning",
+					id: "rs_reasoning_private",
+					encrypted_content: "encrypted-private-payload",
+				},
+			}),
+			event("response.output_item.done", {
+				output_index: 1,
+				item: { type: "reasoning", id: "rs_without_encrypted_content" },
+			}),
+			event("response.output_item.done", {
+				output_index: 2,
+				item: {
+					type: "reasoning",
+					id: "private.invalid-id",
+					encrypted_content: "another-private-payload",
+				},
+			}),
+			event("response.completed", {
+				response: {
+					model: "gpt-5.6-sol",
+					usage: { input_tokens: 12, output_tokens: 3 },
+				},
+			}),
+		].join("");
+
+		const transformed = await new CodexProvider().processResponse(
+			new Response(upstreamBody, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+		await transformed.text();
+
+		const file = readdirSync(dir).find((name) => name.endsWith(".jsonl"));
+		const rawTrace = readFileSync(join(dir, file as string), "utf8");
+		const record = JSON.parse(rawTrace.trim());
+		expect(record).toMatchObject({
+			trace_schema_version: 15,
+			phase: "response",
+			reasoning_output_item_count: 3,
+			reasoning_encrypted_present: true,
+			reasoning_unrepresentable_id_skip_count: 1,
+		});
+		expect(rawTrace).not.toContain("rs_reasoning_private");
+		expect(rawTrace).not.toContain("encrypted-private-payload");
+		expect(rawTrace).not.toContain("private.invalid-id");
+		expect(rawTrace).not.toContain("another-private-payload");
+	});
+
+	test("traces replayed reasoning input counts without retaining its payload", async () => {
+		process.env[CODEX_TRACE_DIR_ENV] = dir;
+		await new CodexProvider().transformRequestBody(
+			messagesRequest({
+				model: "claude-opus-4-8",
+				max_tokens: 10,
+				messages: [
+					{ role: "user", content: "start" },
+					{
+						role: "assistant",
+						content: [
+							{
+								type: "redacted_thinking",
+								data: "bccfr1.rs_request_private.encrypted.request.private",
+							},
+							{ type: "text", text: "answer" },
+						],
+					},
+					{ role: "user", content: "continue" },
+				],
+			}),
+		);
+
+		const file = readdirSync(dir).find((name) => name.endsWith(".jsonl"));
+		const rawTrace = readFileSync(join(dir, file as string), "utf8");
+		const record = JSON.parse(rawTrace.trim());
+		expect(record).toMatchObject({
+			trace_schema_version: 15,
+			phase: "request",
+			reasoning_input_item_count: 1,
+		});
+		expect(rawTrace).not.toContain("rs_request_private");
+		expect(rawTrace).not.toContain("encrypted.request.private");
+	});
+
 	test("transformRequestBody traces the physical attempt and strips internal identity", async () => {
 		process.env[CODEX_TRACE_DIR_ENV] = dir;
 		const transformed = await new CodexProvider().transformRequestBody(
@@ -95,7 +191,7 @@ describe("Codex trace wiring (integration)", () => {
 		const files = readdirSync(dir).filter((f) => f.endsWith(".jsonl"));
 		expect(files.length).toBe(1);
 		const rec = JSON.parse(readFileSync(join(dir, files[0]), "utf8").trim());
-		expect(rec.trace_schema_version).toBe(12);
+		expect(rec.trace_schema_version).toBe(15);
 		expect(rec.phase).toBe("request");
 		expect(rec.orchestration_admission).toBe("no_orchestration_tools");
 		expect(rec.request_id).toBe("req_trace_1");
@@ -162,7 +258,7 @@ describe("Codex trace wiring (integration)", () => {
 			readFileSync(join(dir, file as string), "utf8").trim(),
 		);
 		expect(record).toMatchObject({
-			trace_schema_version: 12,
+			trace_schema_version: 15,
 			request_id: "req_trace_fable_default",
 			model_in: "claude-fable-5",
 			model_out: "gpt-5.6-sol",
@@ -216,7 +312,7 @@ describe("Codex trace wiring (integration)", () => {
 			.trim()
 			.split("\n")
 			.map((line) => JSON.parse(line));
-		expect(records.every((record) => record.trace_schema_version === 12)).toBe(
+		expect(records.every((record) => record.trace_schema_version === 15)).toBe(
 			true,
 		);
 		expect(records.map((record) => record.cache_key_assignment)).toEqual([
@@ -386,24 +482,128 @@ describe("Codex trace wiring (integration)", () => {
 		const byId = new Map(records.map((record) => [record.request_id, record]));
 		expect(byId.get("root")).toMatchObject({
 			orchestration_admission: "root",
+			orchestration_basis: "initial_claim",
 			tools_before_count: 3,
 			tools_after_count: 3,
 			filtered_tool_names: [],
 		});
 		expect(byId.get("non-root")).toMatchObject({
 			orchestration_admission: "non_root",
+			orchestration_basis: "rejected",
 			tools_before_count: 3,
 			tools_after_count: 1,
 			filtered_tool_names: ["Agent", "Task"],
 		});
 		expect(byId.get("no-session").orchestration_admission).toBe("no_session");
+		expect(byId.get("no-session").orchestration_basis).toBeNull();
 		expect(byId.get("no-conversation").orchestration_admission).toBe(
 			"no_conversation",
 		);
+		expect(byId.get("no-conversation").orchestration_basis).toBeNull();
 		expect(byId.get("no-tools").orchestration_admission).toBe(
 			"no_orchestration_tools",
 		);
+		expect(byId.get("no-tools").orchestration_basis).toBeNull();
 		expect(byId.get("disabled").orchestration_admission).toBe("disabled");
+		expect(byId.get("disabled").orchestration_basis).toBeNull();
+	});
+
+	test("traces stable-root identity_match, compacted-continuation lineage_match, and a null basis for attributed descendants", async () => {
+		process.env[CODEX_TRACE_DIR_ENV] = dir;
+		const provider = new CodexProvider();
+		const sessionId = "33333333-3333-4333-8333-333333333333";
+		const tools = ["Agent", "Task", "Read"].map((name) => ({
+			name,
+			input_schema: { type: "object" },
+		}));
+		const metadata = { user_id: JSON.stringify({ session_id: sessionId }) };
+		const send = async (
+			requestId: string,
+			messages: unknown[],
+			headers: Record<string, string> = {},
+		) =>
+			provider.transformRequestBody(
+				messagesRequest(
+					{
+						model: "claude-opus-4-8",
+						max_tokens: 10,
+						metadata,
+						messages,
+						tools,
+					},
+					requestId,
+					headers,
+				),
+			);
+
+		const initialMessages = [
+			{ role: "user", content: "start the task" },
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "tool_use",
+						id: "shared-call",
+						name: "Agent",
+						input: { prompt: "look into it" },
+					},
+				],
+			},
+			{
+				role: "user",
+				content: [
+					{ type: "tool_result", tool_use_id: "shared-call", content: "ok" },
+				],
+			},
+		];
+		await send("initial-root", initialMessages);
+		// Identical messages re-sent for the same session derive the same
+		// conversation identity, so this turn re-affirms the existing root
+		// rather than initially claiming it.
+		await send("stable-root", initialMessages);
+		// Compaction reshapes the derived identity (a new first input item) but
+		// the surviving call_id lineage still overlaps the elected root's.
+		const compactedMessages = [
+			...initialMessages.slice(1),
+			{ role: "user", content: "continue the task" },
+		];
+		await send("compacted-continuation", compactedMessages);
+
+		await send("descendant", initialMessages, {
+			"x-better-ccflare-attributed-agent": "true",
+		});
+
+		const file = readdirSync(dir).find((f) => f.endsWith(".jsonl")) as string;
+		const records = readFileSync(join(dir, file), "utf8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line));
+		const byId = new Map(records.map((record) => [record.request_id, record]));
+
+		expect(byId.get("initial-root")).toMatchObject({
+			orchestration_admission: "root",
+			orchestration_basis: "initial_claim",
+		});
+		expect(byId.get("stable-root")).toMatchObject({
+			orchestration_admission: "root",
+			orchestration_basis: "identity_match",
+		});
+		expect(byId.get("compacted-continuation")).toMatchObject({
+			orchestration_admission: "root",
+			orchestration_basis: "lineage_match",
+		});
+		expect(byId.get("descendant")).toMatchObject({
+			orchestration_admission: "attributed_descendant",
+			orchestration_basis: null,
+			filtered_tool_names: ["Agent", "Task"],
+		});
+
+		// No raw call ids, instructions, or the session UUID ever appear in the
+		// sink, regardless of which admission/basis category produced a record.
+		const rawTrace = readFileSync(join(dir, file), "utf8");
+		expect(rawTrace).not.toContain("shared-call");
+		expect(rawTrace).not.toContain(sessionId);
+		expect(rawTrace).not.toContain("You are a helpful assistant");
 	});
 
 	test("traces canary arm and cohort digest, then strips both headers", async () => {

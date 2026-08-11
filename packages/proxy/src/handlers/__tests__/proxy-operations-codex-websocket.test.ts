@@ -27,15 +27,9 @@ import type { ProxyContext } from "../proxy-types";
 
 // Source worktrees intentionally exclude generated database worker bundles.
 // This harness injects dbOps and never constructs these classes.
-mock.module("@better-ccflare/database", () => ({
-	AsyncDbWriter: class AsyncDbWriter {},
-	DatabaseFactory: class DatabaseFactory {},
-	DatabaseOperations: class DatabaseOperations {},
-	ModelTranslationRepository: class ModelTranslationRepository {},
-}));
-
 const usageCollectorModule = await import("../../usage-collector");
 const {
+	deriveServerToolRequirement,
 	getProvider,
 	isCodexExplicitCacheBreakpointSuppressed,
 	resetCodexExplicitBreakpointSuppressionsForTest,
@@ -45,6 +39,18 @@ const { ForceRouteUnavailableError, selectAccountsForRequest } = await import(
 );
 const { proxyWithAccount } = await import("../proxy-operations");
 const { createRoutingTerminalResponse } = await import("../routing-terminal");
+const { RoutingAttemptLedger } = await import("../routing-attempt-ledger");
+const { bindRequestPrivateServerToolReplay } = await import(
+	"../../server-tool-replay-runtime"
+);
+const { createReadyServerToolReplayRuntimeForTest } = await import(
+	"../../__tests__/helpers/server-tool-replay-runtime"
+);
+const { opaqueRuntimeId } = await import("../../opaque-runtime-id");
+
+const HOSTED_REPLAY_CREDENTIAL = "Bearer codex-websocket-hosted-test";
+const HOSTED_REPLAY_LINEAGE = "codex-websocket-hosted-session";
+const HOSTED_REPLAY_RUNTIME = await createReadyServerToolReplayRuntimeForTest();
 
 function makeCodexAccount(overrides: Partial<Account> = {}): Account {
 	return {
@@ -317,6 +323,8 @@ async function runProxy(
 	account = makeCodexAccount(),
 	requestMetaOverrides: Partial<RequestMeta> = {},
 	comboModel?: string,
+	routingAttemptLedger?: InstanceType<typeof RoutingAttemptLedger>,
+	proxyContext = makeProxyContext(),
 ): Promise<Response | null> {
 	return proxyWithAccount(
 		request,
@@ -326,16 +334,28 @@ async function runProxy(
 		body,
 		() => undefined,
 		0,
-		makeProxyContext(),
+		proxyContext,
 		comboModel,
 		undefined,
 		undefined,
 		undefined,
 		false,
 		undefined,
-		undefined,
+		routingAttemptLedger,
 		policy,
 	);
+}
+
+function makeHostedRequestBody(): ArrayBuffer {
+	return new TextEncoder().encode(
+		JSON.stringify({
+			model: "claude-sonnet-4-5",
+			messages: [{ role: "user", content: "find the source" }],
+			tools: [{ type: "web_search_20250305", name: "web_search" }],
+			max_tokens: 16,
+			stream: true,
+		}),
+	).buffer;
 }
 
 function makeGpt56RequestBody(): ArrayBuffer {
@@ -493,9 +513,87 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 			restorePlanner();
 		}
 
-		expect(plannedModels).toEqual(["gpt-5.4", "gpt-5.4"]);
+		// The Codex custom planner is proof-only. Ordinary proof-null requests keep
+		// the legacy plan while retaining the same WS/HTTP transport behavior.
+		expect(plannedModels).toEqual([]);
 		expect(websocketCalls).toBe(2);
 		expect(httpCalls).toBe(1);
+	});
+
+	it("claims before response.create and never rescues an ambiguous hosted write to HTTP", async () => {
+		installUsageCollector();
+		const ledger = new RoutingAttemptLedger();
+		const proxyContext = makeProxyContext();
+		proxyContext.serverToolReplay = HOSTED_REPLAY_RUNTIME as never;
+		let httpCalls = 0;
+		globalThis.fetch = mock(async () => {
+			httpCalls++;
+			return new Response("unexpected HTTP rescue", { status: 500 });
+		});
+		const websocketAttempt = spyOn(
+			codexWebSocketTransport,
+			"tryRequest",
+		).mockImplementation(async (input) => {
+			input.onBeforeFrameWrite?.();
+			throw new Error("ambiguous response.create write");
+		});
+
+		const body = makeHostedRequestBody();
+		const request = makeRequest(body, {
+			authorization: HOSTED_REPLAY_CREDENTIAL,
+			"x-claude-code-session-id": HOSTED_REPLAY_LINEAGE,
+		});
+		const requirements = deriveServerToolRequirement(
+			JSON.parse(new TextDecoder().decode(body)),
+		);
+		if (!requirements) throw new Error("expected hosted-search requirements");
+		const meta = makeRequestMeta("codex-ws-hosted-ambiguous-write", {
+			serverToolRequirements: requirements,
+		});
+		expect(
+			await bindRequestPrivateServerToolReplay(meta, HOSTED_REPLAY_RUNTIME, {
+				request,
+				apiKeyId: null,
+				audience: opaqueRuntimeId(
+					"model-route-caller",
+					HOSTED_REPLAY_CREDENTIAL,
+				),
+				lineage: HOSTED_REPLAY_LINEAGE,
+			}),
+		).toBe(true);
+		const policy: ModelFallbackExecutionPolicy = {
+			...makePolicy(500),
+			recomputeServerToolCapability: true,
+		};
+		const response = await proxyWithAccount(
+			request,
+			new URL(request.url),
+			makeCodexAccount({
+				model_mappings: JSON.stringify({ sonnet: "gpt-5.6-sol" }),
+			}),
+			meta,
+			body,
+			() => undefined,
+			0,
+			proxyContext,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			false,
+			undefined,
+			ledger,
+			policy,
+		);
+
+		expect(response?.status).toBe(502);
+		expect(await response?.json()).toMatchObject({
+			error: { code: "server_tool_dispatch_terminal" },
+		});
+
+		expect(websocketAttempt).toHaveBeenCalledTimes(1);
+		expect(httpCalls).toBe(0);
+		expect(ledger.hostedDispatchState).toBe("hosted_dispatched");
 	});
 
 	it("passes a compaction-stable sibling-safe identity despite one shared session cache key", async () => {

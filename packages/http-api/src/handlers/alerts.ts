@@ -49,6 +49,10 @@ export function createAlertsConfigSetHandler(context: APIContext) {
 				dailySpendUsd: Number(body.dailySpendUsd ?? current.dailySpendUsd),
 				tokensPerHour: Number(body.tokensPerHour ?? current.tokensPerHour),
 				requestTokens: Number(body.requestTokens ?? current.requestTokens),
+				usageWindowThresholdPercent: Number(
+					body.usageWindowThresholdPercent ??
+						current.usageWindowThresholdPercent,
+				),
 				anomalyEnabled:
 					body.anomalyEnabled === undefined
 						? current.anomalyEnabled

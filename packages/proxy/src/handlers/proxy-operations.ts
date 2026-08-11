@@ -31,6 +31,7 @@ import {
 	resolveCodexRequestModel,
 	resolveModelContextCapability,
 	resolveProviderForAccount,
+	stripCodexReasoningRetention,
 	suppressCodexExplicitCacheBreakpoint,
 	usageCache,
 } from "@better-ccflare/providers";
@@ -103,6 +104,10 @@ import {
 	handleAnthropicSseRateLimit,
 } from "../response-handler";
 import { evaluateServerToolReplayEligibility } from "../server-tool-replay-eligibility";
+import {
+	type RequestPrivateServerToolReplay,
+	resolveRequestPrivateServerToolReplay,
+} from "../server-tool-replay-runtime";
 import { ServerToolCandidateCapabilityError } from "../server-tool-routing-errors";
 import {
 	recordServedAccount,
@@ -133,6 +138,49 @@ import { createProtectedAnthropicOverloadResponse } from "./routing-terminal";
 import { getValidAccessToken } from "./token-manager";
 
 const log = new Logger("ProxyOperations");
+
+type HostedDispatchTerminalReason =
+	| "ledger_missing"
+	| "already_dispatched"
+	| "ambiguous_transport";
+
+/**
+ * Request-local terminal raised only at or after the irreversible hosted-tool
+ * boundary. It is deliberately not a candidate error: once a hosted dispatch
+ * may have happened, no sibling route, retry loop, or guard replay is safe.
+ */
+class HostedDispatchTerminalError extends Error {
+	readonly reason: HostedDispatchTerminalReason;
+
+	constructor(reason: HostedDispatchTerminalReason, cause?: unknown) {
+		super("Hosted server-tool dispatch is terminal for this request", {
+			cause,
+		});
+		this.name = "HostedDispatchTerminalError";
+		this.reason = reason;
+	}
+}
+
+function createHostedDispatchTerminalResponse(
+	error: HostedDispatchTerminalError,
+): Response {
+	return new Response(
+		JSON.stringify({
+			type: "error",
+			error: {
+				type: "api_error",
+				code: "server_tool_dispatch_terminal",
+				reason: error.reason,
+				message:
+					"The hosted server-tool attempt ended after its non-replayable dispatch boundary.",
+			},
+		}),
+		{
+			status: 502,
+			headers: { "content-type": "application/json" },
+		},
+	);
+}
 
 interface AnthropicDegradedNoAccountSuppressionDecision {
 	readonly action: "suppress";
@@ -976,6 +1024,45 @@ function filterThinkingBlocks(
 }
 
 /**
+ * Removes proxy-minted Codex reasoning retention blocks from assistant
+ * history while preserving genuine Anthropic redacted-thinking blocks.
+ */
+export function filterCodexReasoningBlocks(
+	requestBody: ArrayBuffer | RequestBodyContext | null,
+): ArrayBuffer | null {
+	const bodyContext =
+		requestBody instanceof RequestBodyContext
+			? requestBody
+			: new RequestBodyContext(requestBody);
+	const requestBodyBuffer = bodyContext.getBuffer();
+	if (!requestBodyBuffer) return null;
+
+	try {
+		const body = bodyContext.getParsedJson();
+		if (!body) {
+			if (bodyContext.hasParseFailed) {
+				log.warn(
+					"Failed to filter Codex reasoning blocks: request body is not valid JSON",
+				);
+			}
+			return null;
+		}
+
+		const { body: filteredBody, strippedCount } =
+			stripCodexReasoningRetention(body);
+		if (strippedCount === 0) return requestBodyBuffer;
+
+		return RequestBodyContext.fromParsed(
+			requestBodyBuffer,
+			filteredBody,
+		).getBuffer();
+	} catch (error) {
+		log.warn("Failed to filter Codex reasoning blocks:", error);
+		return null;
+	}
+}
+
+/**
  * Checks if a response error is due to invalid thinking block signatures or thinking-related errors
  * @param response - The response to check
  * @returns True if the error is about invalid thinking blocks
@@ -1026,6 +1113,54 @@ async function isInvalidThinkingSignatureError(
 	}
 
 	return false;
+}
+
+/**
+ * Checks whether Codex rejected a retained encrypted reasoning item because
+ * its payload cannot be verified against the item ID.
+ */
+export async function isCodexReasoningVerificationError(
+	response: Response,
+	readJson: ResponseJsonReader = readResponseCloneJson,
+): Promise<boolean> {
+	if (response.status !== 400) return false;
+	// A MISSING content-type is allowed here, unlike the Anthropic-facing
+	// classifiers above. The Codex backend routinely answers without one — the
+	// provider already logs and works around that on the success path ("Codex
+	// returned successful response without SSE content-type"). Measured on the
+	// live wire 2026-08-11: an item-id mismatch returned a 400 whose JSON body
+	// carried the verification message but no content-type at all, so a copied
+	// `includes("application/json")` gate skipped the check and left the
+	// conversation wedged. An explicitly non-JSON content-type still short
+	// circuits, which keeps the issue-#356 discipline: never tee a body we
+	// cannot parse.
+	const contentType = response.headers.get("content-type");
+	if (contentType && !contentType.includes("application/json")) return false;
+
+	const json = (await readJson(response)) as {
+		error?: { message?: unknown };
+	} | null;
+	if (typeof json?.error?.message !== "string") return false;
+
+	const rawMessage = json.error.message;
+	if (/invalid\s+['"]input\[\d+\]\.id['"]/i.test(rawMessage)) {
+		return true;
+	}
+
+	const message = rawMessage.toLowerCase();
+	// Observed wordings (live, 2026-08-11):
+	//   "The encrypted content for item <id> could not be verified. Reason:
+	//    Encrypted content could not be decrypted or parsed."
+	//   "The encrypted content for item <id> could not be verified. Reason:
+	//    Encrypted content item_id did not match the target item id."
+	// Both share the "encrypted content" subject; the reason clause varies, so
+	// match the subject plus any known failure phrasing rather than one reason.
+	return (
+		message.includes("encrypted content") &&
+		(message.includes("could not be verified") ||
+			message.includes("could not be decrypted") ||
+			message.includes("did not match"))
+	);
 }
 
 /**
@@ -2104,6 +2239,7 @@ export async function proxyWithAccount(
 			proofKey: string;
 			inputReplayMode: readonly ServerToolReplayAtom[];
 			outputReplayMode: readonly ServerToolReplayAtom[];
+			replay: RequestPrivateServerToolReplay;
 		}>;
 		const serverToolRequirements = requestMeta.serverToolRequirements;
 		const routeCandidateId =
@@ -2185,6 +2321,12 @@ export async function proxyWithAccount(
 			if (!replayEligibility.eligible) {
 				throw candidateCapabilityError("replay_unavailable");
 			}
+			const replay = resolveRequestPrivateServerToolReplay(requestMeta, {
+				request: req,
+				apiKeyId,
+				lineage: sessionIdForObservation(req.headers),
+			});
+			if (!replay) throw candidateCapabilityError("replay_unavailable");
 			if (requireSelectedCandidateBinding) {
 				const selected = requestMeta.routingCandidates?.find(
 					(candidate) =>
@@ -2214,6 +2356,7 @@ export async function proxyWithAccount(
 				proofKey,
 				inputReplayMode,
 				outputReplayMode,
+				replay,
 			});
 		};
 
@@ -2248,6 +2391,9 @@ export async function proxyWithAccount(
 				capabilityProofKey: capability?.proofKey ?? null,
 				inputReplayMode: capability?.inputReplayMode ?? [],
 				outputReplayMode: capability?.outputReplayMode ?? [],
+				serverToolHistoryProjector:
+					capability?.replay.serverToolHistoryProjector,
+				serverToolReplayIssuer: capability?.replay.serverToolReplayIssuer,
 			});
 		};
 		const assertAttemptPlanCapabilityIsCurrent = (
@@ -2269,6 +2415,8 @@ export async function proxyWithAccount(
 				throw candidateCapabilityError("proof_drift");
 			}
 		};
+		const hostedDispatchCommitted = (): boolean =>
+			routingAttemptLedger?.hostedDispatchState === "hosted_dispatched";
 		const transformWithCurrentAttemptPlan = async (
 			plan: ProviderAttemptPlan,
 			request: Request,
@@ -2286,6 +2434,18 @@ export async function proxyWithAccount(
 			...ctx,
 			provider: attemptProvider,
 		});
+		const claimCurrentHostedDispatch = (): void => {
+			if (attemptPlan.capabilityProofKey === null) return;
+			// Revalidate after every fallible local staging step and immediately before
+			// the irreversible fetch/frame-write callback.
+			assertAttemptPlanCapabilityIsCurrent(attemptPlan);
+			if (!routingAttemptLedger) {
+				throw new HostedDispatchTerminalError("ledger_missing");
+			}
+			if (!routingAttemptLedger.claimHostedDispatch()) {
+				throw new HostedDispatchTerminalError("already_dispatched");
+			}
+		};
 		let currentReplayBody = effectiveBodyBuffer;
 
 		const isSyntheticCodexCountTokens =
@@ -2331,6 +2491,7 @@ export async function proxyWithAccount(
 				| "model_fallback"
 				| "overload_529"
 				| "thinking_retry"
+				| "reasoning_retry"
 				| "cache_control_retry"
 				| "prompt_cache_breakpoint_retry"
 				| "cache_lane_rescue"
@@ -2855,8 +3016,12 @@ export async function proxyWithAccount(
 					// The physical send remains authoritative over telemetry.
 				}
 			};
+			const hostedAttempt = attemptPlan.capabilityProofKey !== null;
+			const httpTransportRequest = hostedAttempt
+				? new Request(transportRequest, { redirect: "manual" })
+				: transportRequest;
 			const response = await makeAttemptRequest(
-				transportRequest,
+				httpTransportRequest,
 				attemptPlan.providerName === "codex"
 					? async (signal) => {
 							currentCodexWebSocketReceipt = null;
@@ -2874,6 +3039,9 @@ export async function proxyWithAccount(
 									conversationIdentity: webSocketConversationIdentity,
 									request: transportRequest,
 									signal,
+									...(hostedAttempt
+										? { onBeforeFrameWrite: claimCurrentHostedDispatch }
+										: {}),
 									onFrameWritten: (receipt) => {
 										recordPhysicalDispatch();
 										currentCodexWebSocketReceipt = receipt;
@@ -2893,7 +3061,10 @@ export async function proxyWithAccount(
 							return websocketAttempt.response;
 						}
 					: undefined,
-				recordPhysicalDispatch,
+				() => {
+					claimCurrentHostedDispatch();
+					recordPhysicalDispatch();
+				},
 			);
 			observeTrustedHttpOverload(response, transportRequest, resolvedModel);
 			return response;
@@ -3236,6 +3407,7 @@ export async function proxyWithAccount(
 
 		// Check if this is a Claude provider and we got an invalid thinking signature error
 		if (
+			!hostedDispatchCommitted() &&
 			isClaudeProvider &&
 			(await isInvalidThinkingSignatureError(rawResponse, readAttemptBoundJson))
 		) {
@@ -3244,9 +3416,9 @@ export async function proxyWithAccount(
 			);
 
 			// Filter thinking blocks from the request body
-			const filteredBodyBuffer = filterThinkingBlocks(effectiveBodyContext);
+			const filteredBodyBuffer = filterThinkingBlocks(currentReplayBody);
 
-			if (filteredBodyBuffer && filteredBodyBuffer !== effectiveBodyBuffer) {
+			if (filteredBodyBuffer && filteredBodyBuffer !== currentReplayBody) {
 				// Retry the request with filtered body
 				const retryRequestInit: RequestInit & { duplex?: "half" } = {
 					method: req.method,
@@ -3291,6 +3463,64 @@ export async function proxyWithAccount(
 			}
 		}
 
+		// A retained Codex encrypted-reasoning block that can no longer be
+		// verified is resent by Claude Code on every later turn. Strip only the
+		// proxy-minted retention blocks and replay this physical route once so a
+		// single rejected history item cannot permanently wedge the conversation.
+		if (
+			!hostedDispatchCommitted() &&
+			attemptPlan.providerName === "codex" &&
+			(await isCodexReasoningVerificationError(
+				rawResponse,
+				readAttemptBoundJson,
+			))
+		) {
+			const strippedBodyBuffer = filterCodexReasoningBlocks(currentReplayBody);
+
+			if (strippedBodyBuffer && strippedBodyBuffer !== currentReplayBody) {
+				log.info(
+					`Codex rejected retained encrypted reasoning for account ${account.name}, retrying with proxy-minted reasoning blocks removed`,
+				);
+				const retryRequestInit: RequestInit & { duplex?: "half" } = {
+					method: req.method,
+					headers,
+					body: new Uint8Array(strippedBodyBuffer),
+					duplex: "half",
+					signal: req.signal,
+				};
+
+				await finalizeCurrentCodexTransport(rawResponse);
+				await discardUpstreamBody(rawResponse);
+				stampCodexAttempt(headers, "reasoning_retry");
+				const retryProviderRequest = new Request(targetUrl, retryRequestInit);
+				retrySourceRequest = retryProviderRequest.clone();
+
+				let retryTransformedRequest = await transformWithCurrentAttemptPlan(
+					attemptPlan,
+					retryProviderRequest,
+				);
+				retryTransformedRequest = await enforcePhysicalModelAfterTransform(
+					retryTransformedRequest,
+					currentTransportModel,
+				);
+				retryTransformedTemplate = retryTransformedRequest.clone();
+
+				const retryTransportRequest = retryTransformedTemplate.clone();
+				currentReplayBody = strippedBodyBuffer;
+				currentCacheIdentityHasCacheControl = undefined;
+				rawResponse = await executeCacheAwareProviderAttempt(
+					retryTransportRequest,
+					currentReplayBody,
+					currentCacheIdentityHasCacheControl,
+					currentTransportModel,
+				);
+			} else {
+				log.warn(
+					"No proxy-minted Codex reasoning blocks to strip or filtering failed, proceeding with original error response",
+				);
+			}
+		}
+
 		// Claude rejects requests that pair a clear_thinking context-management
 		// edit with thinking disabled (400 "`clear_thinking_20251015` strategy
 		// requires `thinking` to be enabled or adaptive"). Claude Code sends this
@@ -3298,15 +3528,16 @@ export async function proxyWithAccount(
 		// turn, so the session stays wedged unless the edit is dropped. Retry
 		// once with the offending edits removed; everything else is preserved.
 		if (
+			!hostedDispatchCommitted() &&
 			isClaudeProvider &&
 			(await isClearThinkingRequiresThinkingError(
 				rawResponse,
 				readAttemptBoundJson,
 			))
 		) {
-			const strippedBodyBuffer = filterClearThinkingEdits(effectiveBodyContext);
+			const strippedBodyBuffer = filterClearThinkingEdits(currentReplayBody);
 
-			if (strippedBodyBuffer && strippedBodyBuffer !== effectiveBodyBuffer) {
+			if (strippedBodyBuffer && strippedBodyBuffer !== currentReplayBody) {
 				log.info(
 					`Claude rejected clear_thinking context edit without thinking enabled for account ${account.name}, retrying with the edit removed`,
 				);
@@ -3364,7 +3595,7 @@ export async function proxyWithAccount(
 				transformedRequestHadExplicitBreakpoint,
 				readAttemptBoundJson,
 			));
-		if (explicitBreakpointRejection) {
+		if (explicitBreakpointRejection && !hostedDispatchCommitted()) {
 			suppressCodexExplicitCacheBreakpoint(
 				account.id,
 				transformedModel,
@@ -3424,7 +3655,10 @@ export async function proxyWithAccount(
 
 		// Retry without cache_control if provider rejected it (e.g. GLM-5.1 strict validation).
 		// Mark (accountId, model) so subsequent requests skip cache_control immediately.
-		if (await isCacheControlRejectionError(rawResponse, readAttemptBoundJson)) {
+		if (
+			!hostedDispatchCommitted() &&
+			(await isCacheControlRejectionError(rawResponse, readAttemptBoundJson))
+		) {
 			const rejectorKey = cacheControlRejectorKey(account.id, transformedModel);
 			if (!cacheControlRejectors.has(rejectorKey)) {
 				// Mark before retry so subsequent requests pre-strip without a round-trip.
@@ -3445,15 +3679,17 @@ export async function proxyWithAccount(
 					await discardUpstreamBody(rawResponse);
 					const retryHeaders = new Headers(providerRequest.headers);
 					stampCodexAttempt(retryHeaders, "cache_control_retry");
-					const retrySourceBody = await providerRequest.clone().json();
-					stripCacheControlFromOpenAIRequest(retrySourceBody);
-					const retrySourceText = JSON.stringify(retrySourceBody);
+					const retryReplayBody =
+						stripCacheControlFromReplayBody(currentReplayBody);
+					if (!retryReplayBody) {
+						throw new Error("Failed to strip cache_control from replay body");
+					}
 					const retrySource = new Request(providerRequest.url, {
 						method: providerRequest.method,
 						headers: retryHeaders,
-						body: retrySourceText,
+						body: new Uint8Array(retryReplayBody),
 					});
-					currentReplayBody = new TextEncoder().encode(retrySourceText).buffer;
+					currentReplayBody = retryReplayBody;
 					currentCacheIdentityHasCacheControl = undefined;
 					retrySourceRequest = retrySource.clone();
 					const retryTransformed = await transformWithCurrentAttemptPlan(
@@ -4088,7 +4324,10 @@ export async function proxyWithAccount(
 		// A committed enforced degraded-mode send owns this request's only
 		// physical attempt. Preserve its response before any raw classifier,
 		// model fallback, cooldown failover, or body drain can consume it.
-		if (!wasProtectedLifecycleForLatestResponse()) {
+		if (
+			!wasProtectedLifecycleForLatestResponse() &&
+			!hostedDispatchCommitted()
+		) {
 			rawFailureClassification = await handleRawAttemptFailure(rawResponse);
 			if (rawFailureClassification.returnOriginalResponse) {
 				return withSanitizedProxyHeaders(rawResponse);
@@ -4424,8 +4663,20 @@ export async function proxyWithAccount(
 						// mapModelName internally which remaps non-Claude names back to the primary
 						// model (no family match → sonnet fallback). We always want nextModel to
 						// reach the upstream provider verbatim.
-						const patchedContext =
-							effectiveBodyContext.withPatchedModel(nextModel);
+						// Patch from the LIVE replay body, not the frozen original: an
+						// earlier retry in this same request may have rewritten it
+						// (thinking-block filter, clear_thinking strip, Codex reasoning
+						// strip). Rebuilding from effectiveBodyContext here resurrects
+						// exactly the content that retry proved the upstream rejects, and
+						// those classifiers are sequential `if`s that already ran — the
+						// resurrected rejection would reach the fallback candidates with
+						// no handler left. Falls back to the original context when no
+						// retry has replaced the body.
+						const replayContext =
+							currentReplayBody && currentReplayBody !== effectiveBodyBuffer
+								? new RequestBodyContext(currentReplayBody)
+								: effectiveBodyContext;
+						const patchedContext = replayContext.withPatchedModel(nextModel);
 						const patchedBody = patchedContext?.getBuffer() ?? null;
 						if (!patchedBody) {
 							log.warn("Failed to patch request body for model retry");
@@ -4671,12 +4922,15 @@ export async function proxyWithAccount(
 			finalizedCodexAttemptIds.add(currentTransportAttemptId);
 		}
 
-		if (await handleProcessedCodexContextOverflow(response)) {
+		if (
+			!hostedDispatchCommitted() &&
+			(await handleProcessedCodexContextOverflow(response))
+		) {
 			return null;
 		}
 
 		// Failover to next account on upstream 401 — credentials are invalid/expired
-		if (response.status === 401) {
+		if (response.status === 401 && !hostedDispatchCommitted()) {
 			log.warn(
 				`Authentication failed (401) for account ${account.name}${wasProtectedLifecycleForLatestResponse() ? "; protected response remains terminal" : ", failing over to next account"}`,
 			);
@@ -4693,6 +4947,7 @@ export async function proxyWithAccount(
 		// synthetic (keepalive / auto-refresh) requests to avoid loop amplification.
 		if (
 			response.status === 529 &&
+			!hostedDispatchCommitted() &&
 			!isSyntheticInternal &&
 			!wasProtectedLifecycleForLatestResponse()
 		) {
@@ -4854,7 +5109,7 @@ export async function proxyWithAccount(
 		// between the initial 529 and a retry response. The guard above only covered
 		// the initial response; a retry 401 would have updated `response` and broken
 		// out of the loop, so we need to catch it here before forwarding to the client.
-		if (response.status === 401) {
+		if (response.status === 401 && !hostedDispatchCommitted()) {
 			log.warn(
 				`Authentication failed (401) on 529 retry for account ${account.name}${wasProtectedLifecycleForLatestResponse() ? "; protected response remains terminal" : ", failing over to next account"}`,
 			);
@@ -4877,6 +5132,7 @@ export async function proxyWithAccount(
 		// pre-commit stall wait indefinitely. In Bun, merely reading Response.body
 		// before a later classification clone can also disturb the retained branch.
 		const officialCodexPrecommitSseRetryRouteEligible =
+			!hostedDispatchCommitted() &&
 			attemptPlan.providerName === "codex" &&
 			account.provider === "codex" &&
 			url.pathname === "/v1/messages" &&
@@ -4970,6 +5226,7 @@ export async function proxyWithAccount(
 					? undefined
 					: attemptCommitmentDeadlineAt - cacheLaneRescueReserveMs;
 			const codexAuthoritativeContextOverflowCanBeHandled =
+				!hostedDispatchCommitted() &&
 				attemptPlan.providerName === "codex" &&
 				account.provider === "codex" &&
 				(canReplayContextOverflow() || hasRetainedLegacyContextOverflow());
@@ -5433,6 +5690,15 @@ export async function proxyWithAccount(
 					},
 					attemptProxyContext(),
 				);
+			if (hostedDispatchCommitted()) {
+				// The first hosted provider response is authoritative for this inbound
+				// request. Preserve it exactly; converting it into an account miss would
+				// invite model/account/guard replay after an irreversible execution.
+				return await forwardTerminalRateLimitResponse(
+					response,
+					failoverAttempts,
+				);
+			}
 			if (wasProtectedLifecycleForLatestResponse()) {
 				return await forwardTerminalRateLimitResponse(
 					response.status === 529
@@ -5541,18 +5807,44 @@ export async function proxyWithAccount(
 			},
 			attemptProxyContext(),
 		);
-		if (responseLifecycle?.enforced) {
+		if (responseLifecycle?.enforced || hostedDispatchCommitted()) {
 			return await forwardedResponse;
 		}
 		return forwardedResponse;
 	} catch (err) {
+		const committedLifecycle = anthropicDegradedState?.lifecycle;
+		if (req.signal.aborted) {
+			if (
+				committedLifecycle &&
+				!committedLifecycle.isTransferred &&
+				!committedLifecycle.isSettled
+			) {
+				committedLifecycle.settle("cancelled");
+			}
+			// Client disconnected: the socket is gone, so failing over to another
+			// account would burn pool capacity answering nobody. End the request
+			// with nginx's 499 (client closed request).
+			log.info(
+				`Client disconnected during request to ${account.name} — ending instead of failing over`,
+			);
+			return new Response(null, { status: 499 });
+		}
+		if (
+			err instanceof HostedDispatchTerminalError ||
+			routingAttemptLedger?.hostedDispatchState === "hosted_dispatched"
+		) {
+			const terminalError =
+				err instanceof HostedDispatchTerminalError
+					? err
+					: new HostedDispatchTerminalError("ambiguous_transport", err);
+			return createHostedDispatchTerminalResponse(terminalError);
+		}
 		if (err instanceof ServerToolCandidateCapabilityError) {
 			// Exact capability drift is request-local. It must not pause the account,
 			// poison route health, or be collapsed into a generic transport failure;
 			// the request orchestrator owns sibling failover and the final terminal.
 			throw err;
 		}
-		const committedLifecycle = anthropicDegradedState?.lifecycle;
 		if (
 			committedLifecycle &&
 			!committedLifecycle.isTransferred &&
@@ -5580,16 +5872,6 @@ export async function proxyWithAccount(
 		}
 		if (err instanceof AnthropicDegradedSendDeniedError) {
 			return err.denial;
-		}
-		if (req.signal.aborted) {
-			// Client disconnected: the socket is gone, so failing over to another
-			// account would burn pool capacity answering nobody. End the request
-			// with nginx's 499 (client closed request) — the status matters only
-			// for the log and the request record. (upstream cec5b5b99f)
-			log.info(
-				`Client disconnected during request to ${account.name} — ending instead of failing over`,
-			);
-			return new Response(null, { status: 499 });
 		}
 		if (
 			routingSignal.aborted ||

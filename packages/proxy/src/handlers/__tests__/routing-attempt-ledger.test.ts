@@ -5,6 +5,53 @@ import {
 } from "../routing-attempt-ledger";
 
 describe("RoutingAttemptLedger", () => {
+	it("claims hosted dispatch exactly once and exposes its monotonic state", () => {
+		const ledger = new RoutingAttemptLedger();
+
+		expect(ledger.hostedDispatchState).toBe("undispatched");
+		expect(ledger.claimHostedDispatch()).toBe(true);
+		expect(ledger.hostedDispatchState).toBe("hosted_dispatched");
+		expect(ledger.claimHostedDispatch()).toBe(false);
+		expect(ledger.hostedDispatchState).toBe("hosted_dispatched");
+	});
+
+	it("allows exactly one competing microtask to claim hosted dispatch", async () => {
+		const ledger = new RoutingAttemptLedger();
+		const claims = await Promise.all(
+			Array.from({ length: 8 }, async () => {
+				await Promise.resolve();
+				return ledger.claimHostedDispatch();
+			}),
+		);
+
+		expect(claims.filter(Boolean)).toHaveLength(1);
+		expect(ledger.hostedDispatchState).toBe("hosted_dispatched");
+	});
+
+	it("keeps hosted dispatch ownership independent from route claims", () => {
+		const ledger = new RoutingAttemptLedger();
+
+		expect(ledger.claim("account-a", "claude-opus-4-8")).toBe(true);
+		expect(ledger.claimHostedDispatch()).toBe(true);
+		expect(ledger.claim("account-a", "claude-fable-5")).toBe(true);
+		expect(ledger.claim("account-a", "claude-opus-4-8")).toBe(false);
+
+		expect(ledger.attemptedCount).toBe(2);
+		expect(ledger.physicalAttemptCount).toBe(0);
+		expect(ledger.hostedDispatchState).toBe("hosted_dispatched");
+	});
+
+	it("does not count hosted dispatch ownership as physical-attempt telemetry", () => {
+		const ledger = new RoutingAttemptLedger();
+
+		expect(ledger.claimHostedDispatch()).toBe(true);
+		expect(ledger.physicalAttemptCount).toBe(0);
+		expect(ledger.recordPhysicalAttempt()).toBe(1);
+		expect(ledger.recordPhysicalAttempt()).toBe(2);
+		expect(ledger.physicalAttemptCount).toBe(2);
+		expect(ledger.claimHostedDispatch()).toBe(false);
+	});
+
 	it("claims each account and normalized concrete model only once", () => {
 		const ledger = new RoutingAttemptLedger();
 

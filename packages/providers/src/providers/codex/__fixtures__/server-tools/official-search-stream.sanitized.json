@@ -1,0 +1,202 @@
+[
+	{
+		"type": "response.created",
+		"sequence_number": 0,
+		"response": {
+			"id": "resp_fixture_alpha",
+			"status": "in_progress",
+			"output": []
+		}
+	},
+	{
+		"type": "response.output_item.added",
+		"sequence_number": 1,
+		"output_index": 0,
+		"item": {
+			"id": "ws_fixture_alpha",
+			"type": "web_search_call",
+			"status": "in_progress",
+			"action": {
+				"type": "search",
+				"query": "not-authoritative-until-item-done",
+				"sources": [
+					{
+						"type": "url",
+						"url": "https://untrusted-progress.example.test/not-evidence"
+					}
+				]
+			}
+		}
+	},
+	{
+		"type": "response.web_search_call.in_progress",
+		"sequence_number": 2,
+		"output_index": 0,
+		"item_id": "ws_fixture_alpha"
+	},
+	{
+		"type": "response.web_search_call.searching",
+		"sequence_number": 3,
+		"output_index": 0,
+		"item_id": "ws_fixture_alpha"
+	},
+	{
+		"type": "response.web_search_call.completed",
+		"sequence_number": 4,
+		"output_index": 0,
+		"item_id": "ws_fixture_alpha"
+	},
+	{
+		"type": "response.output_item.done",
+		"sequence_number": 5,
+		"output_index": 0,
+		"item": {
+			"id": "ws_fixture_alpha",
+			"type": "web_search_call",
+			"status": "completed",
+			"action": {
+				"type": "search",
+				"query": "fixture launch query",
+				"queries": ["fixture launch query"],
+				"sources": [
+					{
+						"type": "url",
+						"url": "https://docs.example.test/launch"
+					},
+					{
+						"type": "url",
+						"url": "https://docs.example.test/launch"
+					},
+					{
+						"type": "url",
+						"url": "https://status.example.test/archive"
+					}
+				]
+			}
+		}
+	},
+	{
+		"type": "response.output_item.added",
+		"sequence_number": 6,
+		"output_index": 1,
+		"item": {
+			"id": "msg_fixture_alpha",
+			"type": "message",
+			"status": "in_progress",
+			"role": "assistant",
+			"content": []
+		}
+	},
+	{
+		"type": "response.output_text.annotation.added",
+		"sequence_number": 7,
+		"output_index": 1,
+		"content_index": 0,
+		"annotation_index": 0,
+		"item_id": "msg_fixture_alpha",
+		"annotation": {
+			"type": "url_citation",
+			"start_index": 4,
+			"end_index": 13,
+			"title": "Fixture Launch Notes",
+			"url": "https://docs.example.test/launch"
+		}
+	},
+	{
+		"type": "response.output_text.done",
+		"sequence_number": 8,
+		"output_index": 1,
+		"content_index": 0,
+		"item_id": "msg_fixture_alpha",
+		"text": "See 🚀 launch."
+	},
+	{
+		"type": "response.output_item.done",
+		"sequence_number": 9,
+		"output_index": 1,
+		"item": {
+			"id": "msg_fixture_alpha",
+			"type": "message",
+			"status": "completed",
+			"role": "assistant",
+			"content": [
+				{
+					"type": "output_text",
+					"text": "See 🚀 launch.",
+					"annotations": [
+						{
+							"type": "url_citation",
+							"start_index": 4,
+							"end_index": 13,
+							"title": "Fixture Launch Notes",
+							"url": "https://docs.example.test/launch"
+						}
+					]
+				}
+			]
+		}
+	},
+	{
+		"type": "response.completed",
+		"sequence_number": 10,
+		"response": {
+			"id": "resp_fixture_alpha",
+			"object": "response",
+			"created_at": 1770000000,
+			"model": "gpt-fixture",
+			"status": "completed",
+			"output": [
+				{
+					"id": "ws_fixture_alpha",
+					"type": "web_search_call",
+					"status": "completed",
+					"action": {
+						"type": "search",
+						"query": "fixture launch query",
+						"queries": ["fixture launch query"],
+						"sources": [
+							{
+								"type": "url",
+								"url": "https://docs.example.test/launch"
+							},
+							{
+								"type": "url",
+								"url": "https://docs.example.test/launch"
+							},
+							{
+								"type": "url",
+								"url": "https://status.example.test/archive"
+							}
+						]
+					}
+				},
+				{
+					"id": "msg_fixture_alpha",
+					"type": "message",
+					"status": "completed",
+					"role": "assistant",
+					"content": [
+						{
+							"type": "output_text",
+							"text": "See 🚀 launch.",
+							"annotations": [
+								{
+									"type": "url_citation",
+									"start_index": 4,
+									"end_index": 13,
+									"title": "Fixture Launch Notes",
+									"url": "https://docs.example.test/launch"
+								}
+							]
+						}
+					]
+				}
+			],
+			"usage": {
+				"input_tokens": 12,
+				"output_tokens": 7,
+				"total_tokens": 19
+			}
+		}
+	}
+]

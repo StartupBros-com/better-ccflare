@@ -43,6 +43,8 @@ const FLEET_FINGERPRINT_DOMAIN =
 const FLEET_FINGERPRINT_PREFIX = "better-ccflare.aes-256-gcm.keyfp.v1.";
 const FLEET_ROTATION_COUNT = 2 ** 31;
 const FLEET_EXHAUSTED_COUNT = 2 ** 32;
+const MAX_FUTURE_SKEW_MS = 5 * 60 * 1000;
+const MAX_REPLAY_AGE_MS = 90 * 24 * 60 * 60 * 1000;
 
 export const INVALID_SERVER_TOOL_REPLAY_ENVELOPE_CODE =
 	"invalid_server_tool_replay_envelope" as const;
@@ -117,12 +119,18 @@ export type ServerToolReplayEnvelopeHeader = Readonly<{
 	sourceLocator: string;
 }>;
 
+export type ServerToolReplayIssuanceClaim = Readonly<{
+	counterIdentity: string;
+	issuedAtMs: number;
+}>;
+
 export type ServerToolReplayWriterAdmission =
 	| Readonly<{ enabled: false }>
 	| Readonly<{
 			enabled: true;
-			readFleetIssuedCount: (keyFingerprint: string) => number | undefined;
-			recordIssued: (keyFingerprint: string) => void | Promise<void>;
+			claimIssuance: (
+				claim: ServerToolReplayIssuanceClaim,
+			) => Promise<number | undefined>;
 	  }>;
 
 export type ServerToolReplayWriterReadiness = Readonly<{
@@ -154,9 +162,26 @@ export interface ServerToolReplayEnvelopeCodec {
 	): Promise<DecodedServerToolReplayEnvelope>;
 }
 
+export interface ServerToolReplayEnvelopeWriter {
+	encode(
+		binding: ServerToolReplayEnvelopeBinding,
+		payload: ServerToolReplayEnvelopePayload,
+	): Promise<string>;
+}
+
 const replayEnvelopeCodecReadiness = new WeakMap<
 	ServerToolReplayEnvelopeCodec,
 	Promise<void>
+>();
+const replayEnvelopeCodecCounterIdentity = new WeakMap<
+	ServerToolReplayEnvelopeCodec,
+	string
+>();
+const replayEnvelopeCodecWriterFactory = new WeakMap<
+	ServerToolReplayEnvelopeCodec,
+	(
+		writerAdmission: ServerToolReplayWriterAdmission,
+	) => ServerToolReplayEnvelopeWriter
 >();
 
 type ImportedKey = {
@@ -220,8 +245,9 @@ type WriterAdmissionSnapshot =
 	| Readonly<{
 			enabled: true;
 			valid: true;
-			readFleetIssuedCount: (keyFingerprint: string) => number | undefined;
-			recordIssued: (keyFingerprint: string) => void | Promise<void>;
+			claimIssuance: (
+				claim: ServerToolReplayIssuanceClaim,
+			) => Promise<number | undefined>;
 	  }>;
 
 type ParsedPlaintext = Readonly<
@@ -263,10 +289,10 @@ function admissionError(): ServerToolReplayAdmissionError {
 }
 
 function snapshotWriterAdmission(
-	options: ServerToolReplayEnvelopeCodecOptions,
+	admissionInput: unknown,
 ): WriterAdmissionSnapshot {
 	try {
-		const admission: unknown = options.writerAdmission;
+		const admission = admissionInput;
 		if (admission === undefined) return disabledWriterAdmission;
 		if (typeof admission !== "object" || admission === null) {
 			return invalidWriterAdmission;
@@ -275,54 +301,57 @@ function snapshotWriterAdmission(
 		if (enabled === false) return disabledWriterAdmission;
 		if (enabled !== true) return invalidWriterAdmission;
 
-		const readFleetIssuedCount = Reflect.get(admission, "readFleetIssuedCount");
-		const recordIssued = Reflect.get(admission, "recordIssued");
-		if (
-			typeof readFleetIssuedCount !== "function" ||
-			typeof recordIssued !== "function"
-		) {
+		const claimIssuance = Reflect.get(admission, "claimIssuance");
+		if (typeof claimIssuance !== "function") {
 			return invalidWriterAdmission;
 		}
 		return Object.freeze({
 			enabled: true,
 			valid: true,
-			readFleetIssuedCount,
-			recordIssued,
+			claimIssuance,
 		});
 	} catch {
 		return invalidWriterAdmission;
 	}
 }
 
-function getWriterReadiness(
+function initialWriterReadiness(
 	admission: WriterAdmissionSnapshot,
-	activeKeyFingerprint: string,
 ): ServerToolReplayWriterReadiness {
 	if (!admission.enabled) return writerReadiness.disabled;
 	if (!admission.valid) return writerReadiness.telemetryUnavailable;
-
-	let fleetIssuedCount: number | undefined;
-	try {
-		fleetIssuedCount = admission.readFleetIssuedCount(activeKeyFingerprint);
-	} catch {
-		return writerReadiness.telemetryUnavailable;
-	}
-	if (
-		!Number.isSafeInteger(fleetIssuedCount) ||
-		(fleetIssuedCount as number) < 0
-	) {
-		return writerReadiness.telemetryUnavailable;
-	}
-
-	// This fleet budget is an operational, probabilistic AES-GCM nonce limit,
-	// not an atomic allocation or uniqueness guarantee across concurrent writers.
-	if ((fleetIssuedCount as number) >= FLEET_EXHAUSTED_COUNT) {
-		return writerReadiness.exhausted;
-	}
-	if ((fleetIssuedCount as number) >= FLEET_ROTATION_COUNT) {
-		return writerReadiness.rotateRequired;
-	}
 	return writerReadiness.ready;
+}
+
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+	if (
+		(typeof value !== "object" && typeof value !== "function") ||
+		value === null
+	)
+		return false;
+	try {
+		return typeof Reflect.get(value, "then") === "function";
+	} catch {
+		return false;
+	}
+}
+
+function validNowMs(nowMs: () => number): number {
+	const value = nowMs();
+	if (!Number.isSafeInteger(value) || value < 0) throw invalidEnvelope();
+	return value;
+}
+
+function assertAuthenticatedAge(
+	issuedAtMs: number,
+	currentTimeMs: number,
+): void {
+	if (
+		issuedAtMs - currentTimeMs > MAX_FUTURE_SKEW_MS ||
+		currentTimeMs - issuedAtMs > MAX_REPLAY_AGE_MS
+	) {
+		throw invalidEnvelope();
+	}
 }
 
 function copyBytes(bytes: Uint8Array): CryptoBytes {
@@ -1039,6 +1068,32 @@ export async function awaitServerToolReplayEnvelopeCodecReady(
 	await readiness;
 }
 
+export function getServerToolReplayEnvelopeCounterIdentity(
+	codec: ServerToolReplayEnvelopeCodec,
+): string {
+	const counterIdentity = replayEnvelopeCodecCounterIdentity.get(codec);
+	if (!counterIdentity) {
+		throw new TypeError("Unknown server-tool replay codec instance.");
+	}
+	return counterIdentity;
+}
+
+/**
+ * Create an isolated writer over an existing codec. The supplied admission is
+ * snapshotted into the returned closure and is never attached to the codec or
+ * exposed through a serializable request object.
+ */
+export function createServerToolReplayEnvelopeWriter(
+	codec: ServerToolReplayEnvelopeCodec,
+	writerAdmission: ServerToolReplayWriterAdmission,
+): ServerToolReplayEnvelopeWriter {
+	const factory = replayEnvelopeCodecWriterFactory.get(codec);
+	if (!factory) {
+		throw new TypeError("Unknown server-tool replay codec instance.");
+	}
+	return factory(writerAdmission);
+}
+
 export function createServerToolReplayEnvelopeCodec(
 	options: ServerToolReplayEnvelopeCodecOptions,
 ): ServerToolReplayEnvelopeCodec {
@@ -1086,9 +1141,153 @@ export function createServerToolReplayEnvelopeCodec(
 	}
 	const randomBytes = options.randomBytes ?? defaultRandomBytes;
 	const nowMs = options.nowMs ?? Date.now;
-	const writerAdmission = snapshotWriterAdmission(options);
-	const readWriterReadiness = (): ServerToolReplayWriterReadiness =>
-		getWriterReadiness(writerAdmission, activeKey.fleetFingerprint);
+	type WriterController = Readonly<{
+		getWriterReadiness: () => ServerToolReplayWriterReadiness;
+		claimWriterIssuance: (issuedAtMs: number) => Promise<void>;
+	}>;
+	const createWriterController = (
+		admissionInput: unknown,
+	): WriterController => {
+		const writerAdmission = snapshotWriterAdmission(admissionInput);
+		let currentWriterReadiness = initialWriterReadiness(writerAdmission);
+		const readWriterReadiness = (): ServerToolReplayWriterReadiness =>
+			currentWriterReadiness;
+		const unavailableAdmissionError = (): ServerToolReplayAdmissionError => {
+			currentWriterReadiness = writerReadiness.telemetryUnavailable;
+			return admissionError();
+		};
+		const claimWriterIssuance = async (issuedAtMs: number): Promise<void> => {
+			if (!writerAdmission.enabled || !writerAdmission.valid) {
+				throw unavailableAdmissionError();
+			}
+			const claim = Object.freeze({
+				counterIdentity: activeKey.fleetFingerprint,
+				issuedAtMs,
+			});
+			let pendingClaim: unknown;
+			try {
+				pendingClaim = writerAdmission.claimIssuance(claim);
+			} catch {
+				throw unavailableAdmissionError();
+			}
+			if (!isPromiseLike(pendingClaim)) throw unavailableAdmissionError();
+
+			let admittedCount: unknown;
+			try {
+				admittedCount = await pendingClaim;
+			} catch {
+				throw unavailableAdmissionError();
+			}
+			if (
+				!Number.isSafeInteger(admittedCount) ||
+				(admittedCount as number) < 1
+			) {
+				throw unavailableAdmissionError();
+			}
+			if ((admittedCount as number) >= FLEET_EXHAUSTED_COUNT) {
+				currentWriterReadiness = writerReadiness.exhausted;
+				throw admissionError();
+			}
+			if ((admittedCount as number) >= FLEET_ROTATION_COUNT) {
+				currentWriterReadiness = writerReadiness.rotateRequired;
+				throw admissionError();
+			}
+		};
+		return Object.freeze({
+			getWriterReadiness: readWriterReadiness,
+			claimWriterIssuance,
+		});
+	};
+	const defaultWriter = createWriterController(options.writerAdmission);
+	const encodeWithWriter = async (
+		writer: WriterController,
+		binding: ServerToolReplayEnvelopeBinding,
+		payload: ServerToolReplayEnvelopePayload,
+	): Promise<string> => {
+		if (writer.getWriterReadiness().status !== "ready") {
+			throw admissionError();
+		}
+		try {
+			const canonicalBinding = canonicalizeBinding(binding);
+			const canonicalPayload = canonicalizePayload(payload);
+			const issuedAtMs = validNowMs(nowMs);
+			const counts = evidenceCounts(canonicalBinding);
+			const predictedPlaintext = plaintextBytes(
+				issuedAtMs,
+				canonicalPayload,
+				placeholderDigests(canonicalBinding),
+				counts,
+			);
+			const predictedLength = predictTokenLength(
+				activeKey.id,
+				predictedPlaintext.byteLength,
+			);
+			if (predictedLength > MAX_TOKEN_BYTES) throw invalidEnvelope();
+			await writer.claimWriterIssuance(issuedAtMs);
+			const keyMaterial = await activeKey.material;
+			const digests = await protectedDigests(
+				webCrypto.subtle,
+				keyMaterial.digestKey,
+				canonicalBinding,
+			);
+			const sourceLocator = await deriveSourceLocator(
+				webCrypto.subtle,
+				keyMaterial.locatorKey,
+				canonicalBinding,
+				digests,
+			);
+			const plaintext = plaintextBytes(
+				issuedAtMs,
+				canonicalPayload,
+				digests,
+				counts,
+			);
+			if (plaintext.byteLength !== predictedPlaintext.byteLength) {
+				throw invalidEnvelope();
+			}
+			const generatedNonce = randomBytes(NONCE_BYTES);
+			if (
+				!(generatedNonce instanceof Uint8Array) ||
+				generatedNonce.byteLength !== NONCE_BYTES
+			) {
+				throw invalidEnvelope();
+			}
+			const nonce = copyBytes(generatedNonce);
+
+			const ciphertext = new Uint8Array(
+				await webCrypto.subtle.encrypt(
+					{
+						name: "AES-GCM",
+						iv: nonce,
+						additionalData: aadBytes(
+							activeKey.id,
+							sourceLocator.text,
+							canonicalBinding,
+							digests,
+						),
+						tagLength: TAG_BITS,
+					},
+					keyMaterial.encryptionKey,
+					plaintext,
+				),
+			);
+			const token = [
+				PROTOCOL,
+				SUITE,
+				activeKey.id,
+				sourceLocator.text,
+				encodeBase64Url(nonce),
+				encodeBase64Url(ciphertext),
+			].join(".");
+			if (token.length !== predictedLength || token.length > MAX_TOKEN_BYTES) {
+				throw invalidEnvelope();
+			}
+			return token;
+		} catch (error) {
+			if (error instanceof ServerToolReplayAdmissionError) throw error;
+			throw invalidEnvelope();
+		}
+	};
 
 	const readiness = Promise.allSettled(
 		[...importedKeys.values()].map(({ material }) => material),
@@ -1104,101 +1303,13 @@ export function createServerToolReplayEnvelopeCodec(
 	void readiness.catch(() => undefined);
 
 	const codec: ServerToolReplayEnvelopeCodec = Object.freeze({
-		getWriterReadiness: readWriterReadiness,
+		getWriterReadiness: defaultWriter.getWriterReadiness,
 
 		async encode(
 			binding: ServerToolReplayEnvelopeBinding,
 			payload: ServerToolReplayEnvelopePayload,
 		): Promise<string> {
-			if (readWriterReadiness().status !== "ready") throw admissionError();
-			if (!writerAdmission.enabled || !writerAdmission.valid) {
-				throw admissionError();
-			}
-			const { recordIssued } = writerAdmission;
-			try {
-				const canonicalBinding = canonicalizeBinding(binding);
-				const canonicalPayload = canonicalizePayload(payload);
-				const issuedAtMs = nowMs();
-				if (!Number.isSafeInteger(issuedAtMs) || issuedAtMs < 0)
-					throw invalidEnvelope();
-				const counts = evidenceCounts(canonicalBinding);
-				const predictedPlaintext = plaintextBytes(
-					issuedAtMs,
-					canonicalPayload,
-					placeholderDigests(canonicalBinding),
-					counts,
-				);
-				const predictedLength = predictTokenLength(
-					activeKey.id,
-					predictedPlaintext.byteLength,
-				);
-				if (predictedLength > MAX_TOKEN_BYTES) throw invalidEnvelope();
-				const keyMaterial = await activeKey.material;
-				const digests = await protectedDigests(
-					webCrypto.subtle,
-					keyMaterial.digestKey,
-					canonicalBinding,
-				);
-				const sourceLocator = await deriveSourceLocator(
-					webCrypto.subtle,
-					keyMaterial.locatorKey,
-					canonicalBinding,
-					digests,
-				);
-				const plaintext = plaintextBytes(
-					issuedAtMs,
-					canonicalPayload,
-					digests,
-					counts,
-				);
-				if (plaintext.byteLength !== predictedPlaintext.byteLength)
-					throw invalidEnvelope();
-				const generatedNonce = randomBytes(NONCE_BYTES);
-				if (
-					!(generatedNonce instanceof Uint8Array) ||
-					generatedNonce.byteLength !== NONCE_BYTES
-				) {
-					throw invalidEnvelope();
-				}
-				const nonce = copyBytes(generatedNonce);
-
-				const ciphertext = new Uint8Array(
-					await webCrypto.subtle.encrypt(
-						{
-							name: "AES-GCM",
-							iv: nonce,
-							additionalData: aadBytes(
-								activeKey.id,
-								sourceLocator.text,
-								canonicalBinding,
-								digests,
-							),
-							tagLength: TAG_BITS,
-						},
-						keyMaterial.encryptionKey,
-						plaintext,
-					),
-				);
-				const token = [
-					PROTOCOL,
-					SUITE,
-					activeKey.id,
-					sourceLocator.text,
-					encodeBase64Url(nonce),
-					encodeBase64Url(ciphertext),
-				].join(".");
-				if (token.length !== predictedLength || token.length > MAX_TOKEN_BYTES)
-					throw invalidEnvelope();
-				try {
-					await recordIssued(activeKey.fleetFingerprint);
-				} catch {
-					throw admissionError();
-				}
-				return token;
-			} catch (error) {
-				if (error instanceof ServerToolReplayAdmissionError) throw error;
-				throw invalidEnvelope();
-			}
+			return await encodeWithWriter(defaultWriter, binding, payload);
 		},
 
 		async decode(
@@ -1244,6 +1355,7 @@ export function createServerToolReplayEnvelopeCodec(
 					),
 				);
 				const parsed = parsePlaintext(plaintext);
+				assertAuthenticatedAge(parsed.issuedAtMs, validNowMs(nowMs));
 				assertProtectedBinding(parsed, digests, counts);
 				return freezeDecoded(canonicalBinding, parsed);
 			} catch {
@@ -1252,5 +1364,19 @@ export function createServerToolReplayEnvelopeCodec(
 		},
 	});
 	replayEnvelopeCodecReadiness.set(codec, readiness);
+	replayEnvelopeCodecCounterIdentity.set(codec, activeKey.fleetFingerprint);
+	replayEnvelopeCodecWriterFactory.set(codec, (writerAdmission) => {
+		const writer = createWriterController(writerAdmission);
+		if (writer.getWriterReadiness().status !== "ready") {
+			throw admissionError();
+		}
+		const encode = Object.freeze(
+			(
+				binding: ServerToolReplayEnvelopeBinding,
+				payload: ServerToolReplayEnvelopePayload,
+			) => encodeWithWriter(writer, binding, payload),
+		);
+		return Object.freeze({ encode });
+	});
 	return codec;
 }
