@@ -3638,9 +3638,15 @@ export class CodexProvider extends BaseProvider {
 						state.hasSentContentBlockStart = false;
 						break;
 					}
-					// An encrypted item without a representable id cannot be replayed.
-					// Fall through to the generic pre-retention handling below.
+					// An encrypted item without a representable id cannot be replayed,
+					// so nothing is minted. Do NOT fall through to the generic close
+					// below: a reasoning item never owns the open content block, and
+					// closing someone else's block here orphans its later deltas at an
+					// index with no content_block_start (the interleaving bug fixed for
+					// minted blocks in PR #139, on the skip path). The owning output
+					// item's own `done` closes it.
 					state.traceReasoningUnrepresentableIdSkipCount++;
+					break;
 				}
 
 				if (state.hasSentContentBlockStart) {

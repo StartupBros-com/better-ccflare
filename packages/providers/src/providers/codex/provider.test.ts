@@ -2269,6 +2269,93 @@ describe("CodexProvider.processResponse", () => {
 		expect(events.at(-1)?.type).toBe("message_stop");
 	});
 
+	it("does not close a live text block when an invalid-id reasoning item is skipped", async () => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("response.created", {
+				response: { id: "resp_skip_interleave", model: "gpt-5.6-sol" },
+			}),
+			...eventLine("response.output_item.added", {
+				item: { type: "message" },
+				output_index: 0,
+			}),
+			...eventLine("response.content_part.added", {
+				part: { type: "output_text" },
+			}),
+			...eventLine("response.output_text.delta", { delta: "he" }),
+			// Unrepresentable id: nothing may be minted, and the live text block
+			// must stay open so its remaining delta is not orphaned.
+			...eventLine("response.output_item.done", {
+				item: {
+					type: "reasoning",
+					id: "rs.invalid",
+					encrypted_content: "cipher",
+				},
+				output_index: 1,
+			}),
+			...eventLine("response.output_text.delta", { delta: "llo" }),
+			...eventLine("response.output_item.done", {
+				item: { type: "message" },
+				output_index: 0,
+			}),
+			...eventLine("response.completed", {
+				response: {
+					model: "gpt-5.6-sol",
+					usage: { input_tokens: 1, output_tokens: 1 },
+				},
+			}),
+		]);
+		const transformed = await provider.processResponse(
+			new Response(upstreamBody, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+		const events = (await transformed.text())
+			.split("\n")
+			.filter((line) => line.startsWith("data:"))
+			.map(
+				(line) =>
+					JSON.parse(line.slice("data:".length).trim()) as Record<
+						string,
+						unknown
+					>,
+			);
+
+		const blockEvents = events
+			.filter((event) =>
+				[
+					"content_block_start",
+					"content_block_delta",
+					"content_block_stop",
+				].includes(event.type as string),
+			)
+			.map((event) => ({
+				type: event.type,
+				index: event.index,
+				blockType:
+					(event.content_block as Record<string, unknown>)?.type ??
+					(event.delta as Record<string, unknown>)?.type,
+			}));
+
+		// Both deltas land inside the single open text block, which closes once.
+		expect(blockEvents).toEqual([
+			{ type: "content_block_start", index: 0, blockType: "text" },
+			{ type: "content_block_delta", index: 0, blockType: "text_delta" },
+			{ type: "content_block_delta", index: 0, blockType: "text_delta" },
+			{ type: "content_block_stop", index: 0, blockType: undefined },
+		]);
+		// Nothing was minted for the unrepresentable id.
+		expect(
+			events.some(
+				(event) =>
+					(event.content_block as Record<string, unknown>)?.type ===
+					"redacted_thinking",
+			),
+		).toBe(false);
+	});
+
 	it("defers reasoning that completes between text deltas of a live block", async () => {
 		const provider = new CodexProvider();
 		const upstreamBody = sseBody([
