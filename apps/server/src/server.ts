@@ -61,6 +61,7 @@ import {
 	AutoRefreshScheduler,
 	CacheAffinityOrderer,
 	CacheKeepaliveScheduler,
+	CohortSealService,
 	createAnthropicDegradedDetailedEventSink,
 	createAnthropicDegradedRuntimeHealth,
 	createGuardCorrelationVerifier,
@@ -412,6 +413,7 @@ let stopIntegritySchedulerJob: (() => void) | null = null;
 let stopModelCatalogRefreshJob: (() => void) | null = null;
 let stopDeviceSetupRecoveryJob: (() => Promise<void>) | null = null;
 let autoRefreshScheduler: AutoRefreshScheduler | null = null;
+let cacheFlightCohortSealService: CohortSealService | null = null;
 let cacheKeepaliveScheduler: CacheKeepaliveScheduler | null = null;
 let memoryMonitorInterval: Timer | null = null;
 // Track usage polling retry timeouts for cleanup
@@ -1449,11 +1451,14 @@ export default async function startServer(options?: {
 	const guardCorrelationVerifier = createGuardCorrelationVerifier(
 		readGuardCorrelationSecret(),
 	);
+	cacheFlightCohortSealService?.dispose();
+	cacheFlightCohortSealService = new CohortSealService({ config });
 	const proxyContext: ProxyContext = {
 		strategy,
 		cacheAffinityOrderer: new CacheAffinityOrderer(
 			runtimeConfig.sessionDurationMs,
 		),
+		cacheFlightCohortSeal: cacheFlightCohortSealService,
 		anthropicDegradedMode,
 		anthropicDegradedObservability,
 		degradedOwnerOverlay,
@@ -2580,6 +2585,10 @@ async function handleGracefulShutdown(signal: string) {
 		if (cacheKeepaliveScheduler) {
 			cacheKeepaliveScheduler.stop();
 			cacheKeepaliveScheduler = null;
+		}
+		if (cacheFlightCohortSealService) {
+			cacheFlightCohortSealService.dispose();
+			cacheFlightCohortSealService = null;
 		}
 
 		// Stop memory monitoring

@@ -3,6 +3,7 @@ import type { Config } from "@better-ccflare/config";
 import { registerHeartbeat } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import { type CachedRequestEntry, cacheBodyStore } from "./cache-body-store";
+import { resolveKeepaliveTtlMinutes } from "./cache-keepalive-policy";
 import { CACHE_REPLAY_MODEL_HEADER } from "./cache-transport-staging";
 import { INTERNAL_PROBE_SECRET_HEADER } from "./handlers";
 import { stampInternalAutoRefreshAuth } from "./internal-probe-auth";
@@ -64,21 +65,7 @@ export function sanitizeKeepaliveBody(
 	return bytes.slice().buffer;
 }
 
-/** Effective keepalive TTL for one staged entry given global + xAI knobs. */
-export function resolveKeepaliveTtlMinutes(
-	providerName: string | null | undefined,
-	globalTtlMinutes: number,
-	xaiTtlMinutes: number,
-): number {
-	if (providerName === "xai") {
-		// Prefer the xAI-specific knob when set so Grok can be canaried without
-		// enabling Anthropic keepalives. Fall back to the global TTL when the
-		// operator only configured CACHE_KEEPALIVE_TTL_MINUTES.
-		if (xaiTtlMinutes > 0) return xaiTtlMinutes;
-		return globalTtlMinutes > 0 ? globalTtlMinutes : 0;
-	}
-	return globalTtlMinutes > 0 ? globalTtlMinutes : 0;
-}
+export { resolveKeepaliveTtlMinutes } from "./cache-keepalive-policy";
 
 /**
  * Skip synthetic keepalive when real traffic is still fresher than half the

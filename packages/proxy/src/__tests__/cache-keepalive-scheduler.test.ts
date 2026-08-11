@@ -64,6 +64,10 @@ afterAll(() => {
 });
 
 import { cacheBodyStore } from "../cache-body-store";
+import {
+	resolveEffectiveXaiKeepalivePolicy,
+	resolveKeepaliveTtlMinutes as resolveKeepaliveTtlMinutesFromPolicy,
+} from "../cache-keepalive-policy";
 // Import AFTER mock.module so the scheduler gets the mocked registerHeartbeat.
 import {
 	CacheKeepaliveScheduler,
@@ -791,6 +795,27 @@ describe("keepalive provider TTL helpers", () => {
 		expect(resolveKeepaliveTtlMinutes("xai", 5, 0)).toBe(5);
 		expect(resolveKeepaliveTtlMinutes("anthropic", 5, 2)).toBe(5);
 		expect(resolveKeepaliveTtlMinutes("anthropic", 0, 2)).toBe(0);
+		expect(resolveKeepaliveTtlMinutes("xai", 5, 2)).toBe(
+			resolveKeepaliveTtlMinutesFromPolicy("xai", 5, 2),
+		);
+		expect(resolveEffectiveXaiKeepalivePolicy(0, 0)).toEqual({
+			globalTtlMinutes: 0,
+			xaiTtlMinutes: 0,
+			effectiveXaiEnabled: false,
+			effectiveXaiTtlMinutes: null,
+		});
+		expect(resolveEffectiveXaiKeepalivePolicy(5, 0)).toEqual({
+			globalTtlMinutes: 5,
+			xaiTtlMinutes: 0,
+			effectiveXaiEnabled: true,
+			effectiveXaiTtlMinutes: 5,
+		});
+		expect(resolveEffectiveXaiKeepalivePolicy(5, 2)).toEqual({
+			globalTtlMinutes: 5,
+			xaiTtlMinutes: 2,
+			effectiveXaiEnabled: true,
+			effectiveXaiTtlMinutes: 2,
+		});
 	});
 
 	it("skips keepalive while the entry is still fresh relative to TTL", () => {

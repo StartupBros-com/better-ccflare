@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { readDockerBuildProvenance } from "./build-provenance";
 import {
 	extractClaudeVersion,
 	getClientVersion,
@@ -99,5 +100,32 @@ describe("trackClientVersion and getClientVersion", () => {
 
 		trackClientVersion(null);
 		expect(getClientVersion()).toBe(beforeVersion);
+	});
+});
+
+describe("readDockerBuildProvenance", () => {
+	it("preserves Docker-style provenance env precedence and explicit unknowns", () => {
+		expect(
+			readDockerBuildProvenance({
+				CCFLARE_VERSION: "9.9.9-ccflare",
+				BETTER_CCFLARE_VERSION: "8.8.8-better",
+				npm_package_version: "7.7.7-npm",
+				CCFLARE_GIT_SHA: "abcdef1234567890abcdef1234567890abcdef12",
+				CCFLARE_GIT_REF: "deploy/test",
+				CCFLARE_BUILD_DATE: "2026-08-01T00:00:00Z",
+			}),
+		).toEqual({
+			version: "9.9.9-ccflare",
+			git_sha: "abcdef1234567890abcdef1234567890abcdef12",
+			git_ref: "deploy/test",
+			build_date: "2026-08-01T00:00:00Z",
+		});
+
+		expect(readDockerBuildProvenance({})).toEqual({
+			version: "unknown",
+			git_sha: "unknown",
+			git_ref: "unknown",
+			build_date: "unknown",
+		});
 	});
 });
