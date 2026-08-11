@@ -873,23 +873,41 @@ export class AutoRefreshScheduler {
 					.refreshToken(account, this.proxyContext.runtime.clientId)
 					.then(async (result) => {
 						const newRefreshToken = result.refreshToken ?? row.refresh_token;
-						await this.db.run(
-							`UPDATE accounts SET access_token = ?, expires_at = ?, refresh_token = ?, refresh_token_issued_at = ? WHERE id = ?`,
+						// CAS: only persist if the row still holds the refresh token this
+						// attempt used — a rotation that landed underneath (manual re-auth,
+						// or a request-triggered refresh joining the same account) must not
+						// be overwritten with the tokens from this now-superseded attempt.
+						const changes = await this.db.runWithChanges(
+							`UPDATE accounts SET access_token = ?, expires_at = ?, refresh_token = ?, refresh_token_issued_at = ? WHERE id = ? AND refresh_token = ?`,
 							[
 								result.accessToken,
 								result.expiresAt,
 								newRefreshToken,
 								Date.now(),
 								row.id,
+								row.refresh_token,
 							],
 						);
-						log.info(
-							`${row.provider} token refreshed for ${row.name}, expires at ${new Date(result.expiresAt).toISOString()}`,
-						);
+						if (changes === 0) {
+							log.warn(
+								`Skipped persisting refreshed ${row.provider} token for ${row.name}: refresh token changed underneath (superseded by a newer rotation or manual re-auth)`,
+							);
+						} else {
+							log.info(
+								`${row.provider} token refreshed for ${row.name}, expires at ${new Date(result.expiresAt).toISOString()}`,
+							);
+						}
 						return result.accessToken;
 					})
 					.finally(() => {
-						this.proxyContext.refreshInFlight.delete(row.id);
+						// Identity-safe: never delete a newer entry installed by a manual
+						// reauth or a concurrent request-triggered refresh that ran while
+						// this promise was still settling.
+						if (
+							this.proxyContext.refreshInFlight.get(row.id) === refreshPromise
+						) {
+							this.proxyContext.refreshInFlight.delete(row.id);
+						}
 					});
 
 				this.proxyContext.refreshInFlight.set(row.id, refreshPromise);
@@ -1020,23 +1038,41 @@ export class AutoRefreshScheduler {
 					.refreshToken(account, this.proxyContext.runtime.clientId)
 					.then(async (result) => {
 						const newRefreshToken = result.refreshToken ?? row.refresh_token;
-						await this.db.run(
-							`UPDATE accounts SET access_token = ?, expires_at = ?, refresh_token = ?, refresh_token_issued_at = ? WHERE id = ?`,
+						// CAS: only persist if the row still holds the refresh token this
+						// attempt used — a rotation that landed underneath (manual re-auth,
+						// or a request-triggered refresh joining the same account) must not
+						// be overwritten with the tokens from this now-superseded attempt.
+						const changes = await this.db.runWithChanges(
+							`UPDATE accounts SET access_token = ?, expires_at = ?, refresh_token = ?, refresh_token_issued_at = ? WHERE id = ? AND refresh_token = ?`,
 							[
 								result.accessToken,
 								result.expiresAt,
 								newRefreshToken,
 								Date.now(),
 								row.id,
+								row.refresh_token,
 							],
 						);
-						log.info(
-							`Codex token refreshed for ${row.name}, expires at ${new Date(result.expiresAt).toISOString()}`,
-						);
+						if (changes === 0) {
+							log.warn(
+								`Skipped persisting refreshed Codex token for ${row.name}: refresh token changed underneath (superseded by a newer rotation or manual re-auth)`,
+							);
+						} else {
+							log.info(
+								`Codex token refreshed for ${row.name}, expires at ${new Date(result.expiresAt).toISOString()}`,
+							);
+						}
 						return result.accessToken;
 					})
 					.finally(() => {
-						this.proxyContext.refreshInFlight.delete(row.id);
+						// Identity-safe: never delete a newer entry installed by a manual
+						// reauth or a concurrent request-triggered refresh that ran while
+						// this promise was still settling.
+						if (
+							this.proxyContext.refreshInFlight.get(row.id) === refreshPromise
+						) {
+							this.proxyContext.refreshInFlight.delete(row.id);
+						}
 					});
 
 				this.proxyContext.refreshInFlight.set(row.id, refreshPromise);
