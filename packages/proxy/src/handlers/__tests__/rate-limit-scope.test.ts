@@ -212,14 +212,190 @@ describe("classifyPreByte429", () => {
 		expect(decision.reason).toBe("account_capacity_signal");
 	});
 
-	it("lets a hard live response header override scoped cached evidence", () => {
+	// 2026-08-11 production incident. Anthropic returned a hard unified status on a
+	// 429 caused solely by the per-model weekly Fable cap. classifyPreByte429
+	// short-circuited on the header — logging `family=fable` while benching the whole
+	// account for 12h — which removed the two healthiest accounts from every model
+	// lane and emptied the pool into non-retryable `503 route_unavailable`.
+	//
+	// A hard unified status reports THAT the request was rate limited, never WHICH
+	// limit rejected it. Fresh evidence of a matching per-model cap at 100% alongside
+	// account-wide windows that still have headroom is strictly more specific, so it
+	// narrows the scope. This mirrors the veto hasSpentUnifiedWindowEvidence already
+	// applies for a positive `unified-remaining`.
+	it("narrows a hard response header to family scope when fresh usage proves a matching per-model cap", () => {
+		const decision = classifyPreByte429({
+			isAnthropic: true,
+			response: response({
+				"anthropic-ratelimit-unified-status": "rejected",
+			}),
+			attemptedModel: "claude-fable-5",
+			snapshot: snapshot(NOW - 120_000, { weeklyAll: 64 }),
+			now: NOW,
+		});
+		expect(decision).toMatchObject({
+			scope: "family",
+			family: "fable",
+			reason: "matching_scoped_limit",
+			markerExpiresAt: NOW + 60_000,
+		});
+	});
+
+	// Shape taken from the live 2026-08-11 payload, not hand-built: Anthropic marks
+	// only the BINDING limit is_active, so on the three accounts that were wrongly
+	// benched the sole active row was weekly_scoped Fable while session/weekly_all
+	// sat inactive with headroom (72%). Verified against all five production
+	// accounts — the two genuinely spent ones (weekly_all 100 active / session 100
+	// active) still classify account-wide.
+	it("narrows the live inactive-account-window payload to family scope under a hard header", () => {
+		const liveFixture = snapshot(NOW - 30_000, { weeklyAll: 72 });
+		const limits = (
+			liveFixture.data as {
+				limits: Array<{ kind: string; is_active?: boolean }>;
+			}
+		).limits;
+		for (const limit of limits) {
+			if (limit.kind === "session" || limit.kind === "weekly_all") {
+				limit.is_active = false;
+			}
+		}
+
+		const decision = classifyPreByte429({
+			isAnthropic: true,
+			response: response({
+				"anthropic-ratelimit-unified-status": "rejected",
+			}),
+			attemptedModel: "claude-fable-5",
+			snapshot: liveFixture,
+			now: NOW,
+		});
+
+		expect(decision).toMatchObject({
+			scope: "family",
+			family: "fable",
+			reason: "matching_scoped_limit",
+		});
+	});
+
+	it("narrows an explicit unified-remaining zero when fresh usage proves a matching per-model cap", () => {
+		const decision = classifyPreByte429({
+			isAnthropic: true,
+			response: response({
+				"anthropic-ratelimit-unified-remaining": "0",
+			}),
+			attemptedModel: "claude-fable-5",
+			snapshot: snapshot(NOW - 120_000),
+			now: NOW,
+		});
+		expect(decision).toMatchObject({
+			scope: "family",
+			family: "fable",
+			reason: "matching_scoped_limit",
+		});
+	});
+
+	// The widening path stays intact for every shape that does NOT positively prove a
+	// per-model cap. Under-benching a genuinely exhausted account costs repeated 429s,
+	// so narrowing is only ever allowed on affirmative evidence.
+	it("keeps a hard response header account scoped when the account-wide window is also spent", () => {
 		const decision = classifyPreByte429({
 			isAnthropic: true,
 			response: response({
 				"anthropic-ratelimit-unified-status": "rate_limited",
 			}),
 			attemptedModel: "claude-fable-5",
+			snapshot: snapshot(NOW - 120_000, { weeklyAll: 100 }),
+			now: NOW,
+		});
+		expect(decision.scope).toBe("account");
+		expect(decision.reason).toBe("hard_response_signal");
+	});
+
+	it("keeps a hard response header account scoped when no scoped cap matches the family", () => {
+		const decision = classifyPreByte429({
+			isAnthropic: true,
+			response: response({
+				"anthropic-ratelimit-unified-status": "rate_limited",
+			}),
+			attemptedModel: "claude-opus-4-8",
 			snapshot: snapshot(NOW - 120_000),
+			now: NOW,
+		});
+		expect(decision.scope).toBe("account");
+		expect(decision.reason).toBe("hard_response_signal");
+	});
+
+	it("keeps a hard response header account scoped when the snapshot is stale", () => {
+		const decision = classifyPreByte429({
+			isAnthropic: true,
+			response: response({
+				"anthropic-ratelimit-unified-status": "rate_limited",
+			}),
+			attemptedModel: "claude-fable-5",
+			snapshot: snapshot(NOW - 181_000),
+			now: NOW,
+		});
+		expect(decision.scope).toBe("account");
+		expect(decision.reason).toBe("hard_response_signal");
+	});
+
+	it("keeps a hard response header account scoped with no usage snapshot at all", () => {
+		const decision = classifyPreByte429({
+			isAnthropic: true,
+			response: response({
+				"anthropic-ratelimit-unified-status": "rate_limited",
+			}),
+			attemptedModel: "claude-fable-5",
+			snapshot: null,
+			now: NOW,
+		});
+		expect(decision.scope).toBe("account");
+		expect(decision.reason).toBe("hard_response_signal");
+	});
+
+	it("keeps a hard response header account scoped when the matching scoped cap has already reset", () => {
+		const decision = classifyPreByte429({
+			isAnthropic: true,
+			response: response({
+				"anthropic-ratelimit-unified-status": "rate_limited",
+			}),
+			attemptedModel: "claude-fable-5",
+			snapshot: snapshot(NOW - 120_000, { scopedReset: NOW - 1 }),
+			now: NOW,
+		});
+		expect(decision.scope).toBe("account");
+		expect(decision.reason).toBe("hard_response_signal");
+	});
+
+	it("keeps a hard response header account scoped when the model family is unknown", () => {
+		const decision = classifyPreByte429({
+			isAnthropic: true,
+			response: response({
+				"anthropic-ratelimit-unified-status": "rate_limited",
+			}),
+			attemptedModel: null,
+			snapshot: snapshot(NOW - 120_000),
+			now: NOW,
+		});
+		expect(decision.scope).toBe("account");
+		expect(decision.reason).toBe("hard_response_signal");
+	});
+
+	// A malformed payload reaches classifyFreshSnapshot's missing_account_headroom
+	// exit, which is NOT affirmative proof of a per-model cap. The hard-signal branch
+	// must discard it and keep the account-wide reading rather than narrow on the
+	// absence of evidence.
+	it("keeps a hard response header account scoped when the limits payload is malformed", () => {
+		const decision = classifyPreByte429({
+			isAnthropic: true,
+			response: response({
+				"anthropic-ratelimit-unified-status": "rate_limited",
+			}),
+			attemptedModel: "claude-fable-5",
+			snapshot: {
+				observedAt: NOW - 120_000,
+				data: { limits: "not-an-array" },
+			} as unknown as UsageSnapshot,
 			now: NOW,
 		});
 		expect(decision.scope).toBe("account");

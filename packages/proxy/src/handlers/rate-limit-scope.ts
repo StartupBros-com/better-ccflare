@@ -200,59 +200,27 @@ function hasSpentUnifiedWindowEvidence(response: Response): boolean {
 }
 
 /**
- * Scope a generic Anthropic 429 using only positive capacity evidence. Explicit
- * account-wide exhaustion stays account scoped; fresh matching scoped usage is
- * family scoped; every ambiguous recognized-Claude case is isolated to the
- * exact model + client-beta candidate by the caller.
+ * Classify a 429 against a snapshot the caller has already proven fresh.
+ *
+ * Split out of {@link classifyPreByte429} so the hard-account-signal branch can
+ * weigh the very same evidence before widening to account scope, instead of
+ * re-implementing the limit parsing. Two independent copies of these rules are
+ * exactly how the header path and the snapshot path drifted apart in the first
+ * place (see the 2026-08-11 note in classifyPreByte429).
+ *
+ * Only `matching_scoped_limit` is a positive, affirmative proof that the 429
+ * belongs to one model family; every other outcome here is an absence of
+ * evidence, which callers must not read as evidence of absence.
  */
-export function classifyPreByte429(
+function classifyFreshSnapshot(
 	options: ClassifyPreByte429Options,
+	snapshot: UsageSnapshot,
+	family: string,
+	snapshotAgeMs: number,
+	now: number,
+	maxAgeMs: number,
 ): RateLimitScopeDecision {
-	const now = options.now ?? Date.now();
-	const family = options.attemptedModel
-		? getModelFamily(options.attemptedModel)
-		: null;
-	if (options.response.status !== 429) {
-		return accountDecision(options, "not_429", family, null);
-	}
-	if (!options.isAnthropic) {
-		return accountDecision(options, "non_anthropic", family, null);
-	}
-	if (hasHardAnthropicAccountSignal(options.response)) {
-		return accountDecision(options, "hard_response_signal", family, null);
-	}
-	if (family === null) {
-		return accountDecision(options, "unknown_model", null, null);
-	}
-	if (options.snapshot === null) {
-		// No usage evidence to refine the scope. If the response itself reports
-		// a spent unified window, that is account-level evidence from the
-		// server — bench rather than model-mark (upstream #301 counterpart).
-		if (hasSpentUnifiedWindowEvidence(options.response)) {
-			return accountDecision(options, "spent_window_signal", family, null);
-		}
-		return modelDecision(options, "missing_usage", family, null, now);
-	}
-
-	const maxAgeMs = options.maxUsageAgeMs ?? REACTIVE_429_MAX_USAGE_AGE_MS;
-	const snapshotAgeMs = now - options.snapshot.observedAt;
-	if (
-		!Number.isFinite(snapshotAgeMs) ||
-		snapshotAgeMs < 0 ||
-		snapshotAgeMs > maxAgeMs
-	) {
-		if (hasSpentUnifiedWindowEvidence(options.response)) {
-			return accountDecision(
-				options,
-				"spent_window_signal",
-				family,
-				snapshotAgeMs,
-			);
-		}
-		return modelDecision(options, "stale_usage", family, snapshotAgeMs, now);
-	}
-
-	const rawLimits = (options.snapshot.data as { limits?: unknown }).limits;
+	const rawLimits = (snapshot.data as { limits?: unknown }).limits;
 	if (!Array.isArray(rawLimits)) {
 		return modelDecision(
 			options,
@@ -338,7 +306,7 @@ export function classifyPreByte429(
 		if (typeof reset === "number") futureResets.push(reset);
 	}
 
-	const evidenceExpiresAt = options.snapshot.observedAt + maxAgeMs;
+	const evidenceExpiresAt = snapshot.observedAt + maxAgeMs;
 	const markerExpiresAt = Math.min(
 		getScoped429MarkerExpiry(options.response, now),
 		evidenceExpiresAt,
@@ -361,6 +329,95 @@ export function classifyPreByte429(
 		markerExpiresAt,
 		snapshotAgeMs,
 	};
+}
+
+/**
+ * Scope a generic Anthropic 429 using only positive capacity evidence. Explicit
+ * account-wide exhaustion stays account scoped; fresh matching scoped usage is
+ * family scoped; every ambiguous recognized-Claude case is isolated to the
+ * exact model + client-beta candidate by the caller.
+ */
+export function classifyPreByte429(
+	options: ClassifyPreByte429Options,
+): RateLimitScopeDecision {
+	const now = options.now ?? Date.now();
+	const family = options.attemptedModel
+		? getModelFamily(options.attemptedModel)
+		: null;
+	if (options.response.status !== 429) {
+		return accountDecision(options, "not_429", family, null);
+	}
+	if (!options.isAnthropic) {
+		return accountDecision(options, "non_anthropic", family, null);
+	}
+	const maxAgeMs = options.maxUsageAgeMs ?? REACTIVE_429_MAX_USAGE_AGE_MS;
+	const snapshot = options.snapshot;
+	const snapshotIsFresh =
+		snapshot !== null &&
+		Number.isFinite(now - snapshot.observedAt) &&
+		now - snapshot.observedAt >= 0 &&
+		now - snapshot.observedAt <= maxAgeMs;
+
+	if (hasHardAnthropicAccountSignal(options.response)) {
+		// A hard unified status reports THAT the request was rejected, never WHICH
+		// limit rejected it — Anthropic sends the same status for per-model weekly
+		// caps. Short-circuiting straight to account scope here benched whole
+		// accounts for a Fable-only cap on 2026-08-11: the two healthiest accounts
+		// left every model lane for 12h and the pool emptied into
+		// `503 route_unavailable`.
+		//
+		// Narrow ONLY on affirmative proof — a fresh snapshot showing this family's
+		// scoped cap spent while the account-wide windows still have headroom.
+		// Every other outcome is an absence of evidence and keeps the account-wide
+		// reading, because under-benching a genuinely exhausted account costs one
+		// repeated 429 while over-benching costs a multi-hour pool outage.
+		if (family !== null && snapshot !== null && snapshotIsFresh) {
+			const refined = classifyFreshSnapshot(
+				options,
+				snapshot,
+				family,
+				now - snapshot.observedAt,
+				now,
+				maxAgeMs,
+			);
+			if (refined.reason === "matching_scoped_limit") return refined;
+		}
+		return accountDecision(options, "hard_response_signal", family, null);
+	}
+	if (family === null) {
+		return accountDecision(options, "unknown_model", null, null);
+	}
+	if (snapshot === null) {
+		// No usage evidence to refine the scope. If the response itself reports
+		// a spent unified window, that is account-level evidence from the
+		// server — bench rather than model-mark (upstream #301 counterpart).
+		if (hasSpentUnifiedWindowEvidence(options.response)) {
+			return accountDecision(options, "spent_window_signal", family, null);
+		}
+		return modelDecision(options, "missing_usage", family, null, now);
+	}
+
+	const snapshotAgeMs = now - snapshot.observedAt;
+	if (!snapshotIsFresh) {
+		if (hasSpentUnifiedWindowEvidence(options.response)) {
+			return accountDecision(
+				options,
+				"spent_window_signal",
+				family,
+				snapshotAgeMs,
+			);
+		}
+		return modelDecision(options, "stale_usage", family, snapshotAgeMs, now);
+	}
+
+	return classifyFreshSnapshot(
+		options,
+		snapshot,
+		family,
+		snapshotAgeMs,
+		now,
+		maxAgeMs,
+	);
 }
 
 export interface RequestRateLimitOutcome {
