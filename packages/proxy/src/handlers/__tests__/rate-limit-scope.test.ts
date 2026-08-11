@@ -381,6 +381,27 @@ describe("classifyPreByte429", () => {
 		expect(decision.reason).toBe("hard_response_signal");
 	});
 
+	// A malformed payload reaches classifyFreshSnapshot's missing_account_headroom
+	// exit, which is NOT affirmative proof of a per-model cap. The hard-signal branch
+	// must discard it and keep the account-wide reading rather than narrow on the
+	// absence of evidence.
+	it("keeps a hard response header account scoped when the limits payload is malformed", () => {
+		const decision = classifyPreByte429({
+			isAnthropic: true,
+			response: response({
+				"anthropic-ratelimit-unified-status": "rate_limited",
+			}),
+			attemptedModel: "claude-fable-5",
+			snapshot: {
+				observedAt: NOW - 120_000,
+				data: { limits: "not-an-array" },
+			} as unknown as UsageSnapshot,
+			now: NOW,
+		});
+		expect(decision.scope).toBe("account");
+		expect(decision.reason).toBe("hard_response_signal");
+	});
+
 	it("treats explicit unified remaining zero as account-wide evidence", () => {
 		const decision = classifyPreByte429({
 			isAnthropic: true,

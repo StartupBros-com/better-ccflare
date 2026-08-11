@@ -1407,6 +1407,55 @@ describe("proxyWithAccount — scoped same-account model continuation", () => {
 		]);
 	});
 
+	// The 2026-08-11 incident scenario, end to end. Narrowing a hard-status 429 to
+	// family scope is only useful if the request then continues to a sibling model
+	// on the SAME account — that same-account model fallback is the recovery path
+	// circuit-breaker.ts deliberately protects by excluding model-scoped reasons.
+	// The adjacent continuation tests use a headerless 429, which already narrowed
+	// before this fix; this one carries the hard unified status that used to bench
+	// the account outright, so it is the only test proving the fallback survives.
+	it("continues to a sibling model after a hard-status 429 narrows to family scope", async () => {
+		cacheIncidentUsage("acc-anthropic-1", INCIDENT_NOW - 120_000, {
+			weeklyAll: 72,
+		});
+		const hardFable = observableErrorResponse(429, {
+			"anthropic-ratelimit-unified-status": "rate_limited",
+		});
+		const attemptedModels: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const request = input instanceof Request ? input : new Request(input);
+			const body = (await request.clone().json()) as { model?: string };
+			const model = body.model ?? "missing";
+			attemptedModels.push(model);
+			return attemptedModels.length === 1
+				? hardFable.response
+				: successfulClaudeResponse(model);
+		});
+		const ctx = makeProxyContextWithAsyncExec();
+		const account = makeAccount({
+			model_mappings: JSON.stringify({
+				fable: ["claude-fable-5", "claude-opus-4-8"],
+			}),
+		});
+		const bodyBuffer = makeRequestBody("claude-fable-5");
+		const req = makeRequest(bodyBuffer);
+
+		await proxyUntilSuccessfulTransport(req, account, ctx, bodyBuffer);
+
+		expect(attemptedModels).toEqual(["claude-fable-5", "claude-opus-4-8"]);
+		expect(await hardFable.releaseCount()).toBe(1);
+		expect(account.rate_limited_until).toBeNull();
+		expect(ctx.dbOps.markAccountRateLimited).not.toHaveBeenCalled();
+		expect(getRequestRateLimitOutcomes(req)).toEqual([
+			expect.objectContaining({
+				scope: "family",
+				family: "fable",
+				attemptedModel: "claude-fable-5",
+				reason: "matching_scoped_limit",
+			}),
+		]);
+	});
+
 	it("continues past an intermediate Fable family failure to Opus", async () => {
 		cacheIncidentUsage("acc-anthropic-1", INCIDENT_NOW - 120_000);
 		const scopedFable = observableErrorResponse(429);
@@ -1897,5 +1946,57 @@ describe("proxyWithAccount — scoped failures returned by a 529 retry", () => {
 				),
 			).toBeNull();
 		}
+	});
+
+	// The pre-byte and mid-stream paths both cover hard-status narrowing; the 529
+	// retry path reaches the same classifier through a different call site, so it
+	// gets its own proof that a Fable-only cap does not bench the account there.
+	it("narrows a hard-status 429 to family scope after a 529 retry when the account has headroom", async () => {
+		usageCache.delete("acc-anthropic-1");
+		cacheIncidentUsage("acc-anthropic-1", INCIDENT_NOW - 120_000, {
+			weeklyAll: 72,
+		});
+		const initial529 = observableErrorResponse(529);
+		const retry429 = observableErrorResponse(429, {
+			"anthropic-ratelimit-unified-status": "rate_limited",
+		});
+		let calls = 0;
+		globalThis.fetch = mock(async () =>
+			++calls === 1 ? initial529.response : retry429.response,
+		);
+		const ctx = make529RetryContext();
+		const account = makeAccount();
+		const bodyBuffer = makeRequestBody("claude-fable-5");
+		const req = makeRequest(bodyBuffer);
+
+		const result = await proxyWithAccount(
+			req,
+			new URL(req.url),
+			account,
+			makeRequestMeta(),
+			bodyBuffer,
+			() => undefined,
+			0,
+			ctx,
+		);
+
+		expect(result).toBeNull();
+		expect(calls).toBe(2);
+		expect(account.rate_limited_until).toBeNull();
+		expect(ctx.dbOps.markAccountRateLimited).not.toHaveBeenCalled();
+		expect(getRequestRateLimitOutcomes(req)).toEqual([
+			expect.objectContaining({
+				scope: "family",
+				family: "fable",
+				reason: "matching_scoped_limit",
+			}),
+		]);
+		expect(
+			usageCache.getFamilyScopedExhaustion(
+				account.id,
+				"claude-fable-5",
+				INCIDENT_NOW,
+			),
+		).not.toBeNull();
 	});
 });
