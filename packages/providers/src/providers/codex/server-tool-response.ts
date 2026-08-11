@@ -802,7 +802,20 @@ export class CodexServerToolResponseDecoder {
 			) {
 				fail();
 			}
-			const opaque = `${prefix}${base64url(Uint8Array.from(bytes))}`;
+			const suffix = base64url(Uint8Array.from(bytes));
+			// base64url's alphabet ends in '-' and '_' (indices 62/63), but the
+			// consumer that validates these ids downstream — PUBLIC_CALL_ID in
+			// server-tools/hosted-search-lifecycle.ts — requires the character
+			// right after the prefix to be alphanumeric. A leading '-'/'_' is
+			// therefore a 2-in-64 (~3.1%) chance of minting an id that fails its
+			// own validation, surfacing as "Codex server-tool response decoding
+			// failed" for the whole response. The retry loop below only re-drew
+			// on duplicates, so a bad shape was never retried. Re-draw on it too.
+			// Applied to both prefixes: srvtext_'s consumer has no such rule
+			// today, but narrowing the output space is safe for a consumer that
+			// already accepts a superset, and one uniform check beats a branch.
+			if (!/^[A-Za-z0-9]/.test(suffix)) continue;
+			const opaque = `${prefix}${suffix}`;
 			if (this.issuedOpaqueIds.has(opaque)) continue;
 			this.issuedOpaqueIds.add(opaque);
 			this.enforceAggregateBounds();
