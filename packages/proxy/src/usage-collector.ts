@@ -31,6 +31,15 @@ import {
 	type StartMessage,
 } from "./worker-messages";
 
+interface UsageIteration {
+	type: string | undefined;
+	model: string;
+	input_tokens: number | undefined;
+	output_tokens: number | undefined;
+	cache_read_input_tokens: number | undefined;
+	cache_creation_input_tokens: number | undefined;
+}
+
 interface RequestState {
 	startMessage: StartMessage;
 	buffer: string;
@@ -50,6 +59,7 @@ interface RequestState {
 		totalTokens?: number;
 		costUsd?: number;
 		tokensPerSecond?: number;
+		iterations?: UsageIteration[];
 	};
 	lastActivity: number;
 	createdAt: number; // Capacity eviction ordering
@@ -63,6 +73,8 @@ interface RequestState {
 	providerFinalOutputTokens?: number;
 	shouldSkipLogging?: boolean;
 	currentEvent?: string; // Track SSE event type across chunks
+	fallbackBlockSeen?: boolean;
+	fallbackFromModel?: string;
 }
 
 const log = new Logger("UsageCollector");
@@ -153,6 +165,47 @@ function processSSELine(line: string, state: RequestState): void {
 	}
 }
 
+function normalizeNonEmptyString(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const normalized = value.trim();
+	return normalized.length > 0 ? normalized : undefined;
+}
+
+function normalizeTokenCount(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0
+		? value
+		: undefined;
+}
+
+function captureUsageIterations(usage: unknown, state: RequestState): void {
+	if (!usage || typeof usage !== "object") return;
+	const rawIterations = (usage as Record<string, unknown>).iterations;
+	if (!Array.isArray(rawIterations)) return;
+
+	const iterations: UsageIteration[] = [];
+	for (const rawIteration of rawIterations) {
+		if (!rawIteration || typeof rawIteration !== "object") continue;
+		const raw = rawIteration as Record<string, unknown>;
+		const model = normalizeNonEmptyString(raw.model);
+		if (!model) continue;
+
+		iterations.push({
+			type: typeof raw.type === "string" ? raw.type : undefined,
+			model,
+			input_tokens: normalizeTokenCount(raw.input_tokens),
+			output_tokens: normalizeTokenCount(raw.output_tokens),
+			cache_read_input_tokens: normalizeTokenCount(raw.cache_read_input_tokens),
+			cache_creation_input_tokens: normalizeTokenCount(
+				raw.cache_creation_input_tokens,
+			),
+		});
+	}
+
+	// Each provider payload is a complete snapshot. A later array supersedes
+	// the earlier one, including when every later entry is invalid.
+	state.usage.iterations = iterations;
+}
+
 // Extract usage data from non-stream JSON response bodies
 function extractUsageFromJson(
 	json: {
@@ -162,6 +215,7 @@ function extractUsageFromJson(
 			cache_read_input_tokens?: number;
 			cache_creation_input_tokens?: number;
 			output_tokens?: number;
+			iterations?: unknown;
 		};
 	},
 	state: RequestState,
@@ -172,6 +226,7 @@ function extractUsageFromJson(
 	if (!usageObj) return;
 
 	state.usage.model = json.model ?? state.usage.model;
+	captureUsageIterations(usageObj, state);
 
 	if (usageObj.input_tokens !== undefined) {
 		state.usage.inputTokens = usageObj.input_tokens;
@@ -229,9 +284,23 @@ function extractUsageFromData(
 			}
 		}
 
+		const isContentBlockStart =
+			parsed.type === "content_block_start" ||
+			eventType === "content_block_start";
+
 		// Track streaming start time on first content block
-		if (parsed.type === "content_block_start" && !state.firstTokenTimestamp) {
+		if (isContentBlockStart && !state.firstTokenTimestamp) {
 			state.firstTokenTimestamp = Date.now();
+		}
+
+		if (isContentBlockStart && parsed.content_block?.type === "fallback") {
+			state.fallbackBlockSeen = true;
+			const fromModel = normalizeNonEmptyString(
+				parsed.content_block.from?.model,
+			);
+			const toModel = normalizeNonEmptyString(parsed.content_block.to?.model);
+			if (fromModel) state.fallbackFromModel = fromModel;
+			if (toModel) state.usage.model = toModel;
 		}
 
 		// Handle message_delta - check both parsed.type and eventType
@@ -241,6 +310,7 @@ function extractUsageFromData(
 			state.lastTokenTimestamp = Date.now();
 
 			if (parsed.usage) {
+				captureUsageIterations(parsed.usage, state);
 				// Update all token counts from message_delta (authoritative for zai)
 				if (parsed.usage.output_tokens !== undefined) {
 					state.providerFinalOutputTokens = parsed.usage.output_tokens;
@@ -269,6 +339,7 @@ function extractUsageFromData(
 
 		// Handle any usage field in the data
 		if (parsed.usage) {
+			captureUsageIterations(parsed.usage, state);
 			if (parsed.usage.input_tokens !== undefined) {
 				state.usage.inputTokens = parsed.usage.input_tokens;
 				state.usage.inputTokensPresent = true;
@@ -334,6 +405,7 @@ function freeRequestState(state: RequestState): void {
 	state.chunks.length = 0;
 	state.chunksBytes = 0;
 	state.buffer = "";
+	state.usage.iterations = undefined;
 	// Release request body and headers held in startMessage.
 	// Without this, orphaned requests retain full request bodies until the
 	// inactivity cleanup configured by CF_STREAM_TIMEOUT_MS runs. See #67.
@@ -644,6 +716,7 @@ export class UsageCollector {
 		// Calculate total tokens and cost
 		if (state.usage.model) {
 			const model = state.usage.model;
+			const iterations = state.usage.iterations ?? [];
 			// Use provider's authoritative count if available, fallback to computed
 			const finalOutputTokens =
 				state.providerFinalOutputTokens ??
@@ -661,17 +734,38 @@ export class UsageCollector {
 				(state.usage.cacheReadInputTokens || 0) +
 				(state.usage.cacheCreationInputTokens || 0);
 
-			state.usage.costUsd = await this.estimateCostWithDeadline(
-				startMessage.requestId,
-				model,
-				() =>
-					estimateCostUSD(model, {
-						inputTokens: state.usage.inputTokens,
-						outputTokens: finalOutputTokens,
-						cacheReadInputTokens: state.usage.cacheReadInputTokens,
-						cacheCreationInputTokens: state.usage.cacheCreationInputTokens,
-					}),
-			);
+			const topLevelTokens = {
+				inputTokens: state.usage.inputTokens,
+				outputTokens: finalOutputTokens,
+				cacheReadInputTokens: state.usage.cacheReadInputTokens,
+				cacheCreationInputTokens: state.usage.cacheCreationInputTokens,
+			};
+			if (iterations.length > 0) {
+				state.usage.costUsd = await this.estimateCostWithDeadline(
+					startMessage.requestId,
+					model,
+					async () => {
+						const iterationCosts = await Promise.all(
+							iterations.map((iteration) =>
+								estimateCostUSD(iteration.model, {
+									inputTokens: iteration.input_tokens,
+									outputTokens: iteration.output_tokens,
+									cacheReadInputTokens: iteration.cache_read_input_tokens,
+									cacheCreationInputTokens:
+										iteration.cache_creation_input_tokens,
+								}),
+							),
+						);
+						return iterationCosts.reduce((total, cost) => total + cost, 0);
+					},
+				);
+			} else {
+				state.usage.costUsd = await this.estimateCostWithDeadline(
+					startMessage.requestId,
+					model,
+					() => estimateCostUSD(model, topLevelTokens),
+				);
+			}
 
 			// Calculate tokens per second - zai specific vs other providers
 			if (finalOutputTokens > 0) {
@@ -756,6 +850,20 @@ export class UsageCollector {
 					}
 				}
 			}
+		}
+
+		const iterationsSeen = state.usage.iterations !== undefined;
+		const iterationCount = state.usage.iterations?.length ?? 0;
+		if (state.fallbackBlockSeen || iterationsSeen) {
+			log.info("anthropic_server_side_fallback", {
+				requestId: startMessage.requestId,
+				from:
+					state.fallbackFromModel ??
+					state.usage.iterations?.[0]?.model ??
+					state.usage.model,
+				to: state.usage.model,
+				iterationCount,
+			});
 		}
 
 		const totalInputForOutcome =
