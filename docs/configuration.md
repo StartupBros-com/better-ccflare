@@ -9,6 +9,7 @@ This guide covers all configuration options for better-ccflare, including file-b
 - [Configuration File Format](#configuration-file-format)
 - [Configuration Options](#configuration-options)
 - [Environment Variables](#environment-variables)
+- [Service-Lifetime Cohort Seal](#service-lifetime-cohort-seal)
 - [Claude Code Model Route Profiles](#claude-code-model-route-profiles)
 - [Anthropic Degraded Mode](#anthropic-degraded-mode)
 - [Model Catalog](#model-catalog)
@@ -164,6 +165,91 @@ These environment variables are not stored in the configuration file and must be
 | `CF_STREAM_USAGE_BUFFER_KB` | Stream usage buffer size in KB | `64` | `CF_STREAM_USAGE_BUFFER_KB=128` |
 | `CF_STREAM_TIMEOUT_MS` | Stream processing timeout in milliseconds | `60000` (1 minute) | `CF_STREAM_TIMEOUT_MS=120000` |
 | `BETTER_CCFLARE_OUTBOUND_PROXY` | Routes all outbound HTTP(S) traffic through a forward proxy | unset | `BETTER_CCFLARE_OUTBOUND_PROXY=http://127.0.0.1:3636` |
+
+## Service-Lifetime Cohort Seal
+
+The Service-Lifetime Cohort Seal is opt-in, passive evidence provenance for eligible official-xAI cache-flight recorder observations. It records which service/profile occurrence and concurrent observation partition produced a retained turn. It does not enable, disable, or tune routing, native cache, keepalive, or provider behavior.
+
+### Activation and eligibility
+
+There is no independent seal flag. A seal receipt follows the existing recorder and native-cache eligibility gates; both environment variables must equal the exact string `1`:
+
+| Setting | Default | Operator contract |
+|---|---:|---|
+| `CCFLARE_CACHE_FLIGHT_RECORDER` | unset (disabled) | `1` enables privacy-safe recorder IDs and turn capture. Other values, including `true`, are disabled |
+| `CCFLARE_XAI_CACHE_NATIVE` | unset (disabled) | `1` enables the native xAI cache path. Other values, including `true`, are disabled |
+| `CACHE_FLIGHT_RECORDER_RETENTION_HOURS` / `cache_flight_recorder_retention_hours` | `72` | Retains recorder evidence for 1–336 hours; the environment value takes precedence and values are clamped to that range |
+| `CACHE_KEEPALIVE_TTL_MINUTES` / `cache_keepalive_ttl_minutes` | `0` | Captured global keepalive input, clamped to 0–60 minutes; `0` is disabled |
+| `CCFLARE_XAI_CACHE_KEEPALIVE_TTL_MINUTES` / `xai_cache_keepalive_ttl_minutes` | `0` | Captured official-xAI override, clamped to 0–60 minutes; a positive value overrides the global TTL for xAI, otherwise xAI inherits a positive global TTL |
+
+A receipt is issued only for a delivered recorder observation when both opt-ins are active, the attempt is for `/v1/messages`, the recorder derived an opaque conversation ID, and the final serving account/provider is xAI on the official xAI endpoint. `CCFLARE_CACHE_FLIGHT_RECORDER=1` can record an otherwise eligible turn while native cache is disabled; that turn remains unsealed. When either opt-in is inactive or the request is ineligible, no seal is issued and the existing provider, routing, cache, and keepalive behavior is unchanged.
+
+### Service epochs and observation partitions
+
+A **service epoch** identifies one occurrence of the captured service profile. Its visible dimensions cover seal-contract semantics, deployment revision, opaque service instance, process start, native-cache state, recorder state, the captured xAI keepalive profile, and a distinct occurrence ID. Any captured profile change or process restart creates a new occurrence. Returning from profile A to B and later to A creates a third occurrence; the original A occurrence is never reopened.
+
+An **observation partition** identifies a concurrent privacy-safe serving-account scope plus route/model epoch inside that service occurrence. Interleaved accounts, routes, or models create or reuse their own partitions without rotating, closing, or merging the service epoch. A report cohort ID combines the privacy-safe service-epoch ID and observation-partition ID as `<serviceEpochId>:<observationPartitionId>`.
+
+This distinction matters operationally: a deployment, restart, recorder/native-cache state change, or changed keepalive profile is a service-lifetime boundary; ordinary interleaving among serving accounts and route/model choices is not.
+
+### Report and health commands
+
+The recorder commands are standalone CLI operations; only the optional `--json` flag may accompany them:
+
+```text
+--cache-flight-recorder-report <id> [--json]
+--cache-flight-recorder-health [--json]
+```
+
+`--cache-flight-recorder-report` reads one retained recorder conversation by opaque ID. Its existing report fields remain unchanged, and the cohort projection is additive under `cohortAnalysis` in JSON and under `Cohort analysis` in human output. Both forms are produced from the same report object and expose the same boundaries, eligibility decisions, unknowns, and rejection reasons; they are not byte-for-byte renderings of one another.
+
+The cohort analysis shows:
+
+- privacy-safe cohort, service-epoch, occurrence, and observation-partition IDs;
+- first/last retained observation boundaries, observation counts, and hit/miss/unknown descriptive counts;
+- visible `seal_contract_version`, `deployment_revision`, `service_instance`, `process_started_at`, `native_cache_state`, `recorder_state`, `keepalive_policy`, `service_epoch_occurrence`, `serving_account_scope`, `route_model_epoch`, and `seal_receipt` dimensions as known values or `unknown`;
+- deterministic, chronologically ordered contributors, represented as recorder conversation ID plus turn sequence;
+- blockers whose kind is `changed` when multiple known cohort-selection values differ, or `unknown` when required seal or turn evidence cannot support a conclusion; and
+- safe within-cohort subsets containing only complete, dimension-complete, gap-free turns with a known cache outcome under a complete seal with no `changed` blocker. An ineligible cohort can still expose a smaller safe subset when only some of its turns are unsound.
+
+`crossCohortMetric` and `cachePolicyRecommendation` are explicitly `null` in every report. Cohort output is descriptive evidence: never pool incompatible cohorts or infer a cache-policy change across them.
+
+`--cache-flight-recorder-health` is recorder-wide rather than conversation-specific. Its `enabled` field reflects `CCFLARE_CACHE_FLIGHT_RECORDER`, not the combined seal gate. Count units and persistence ratings are:
+
+| Health field | Unit or rule |
+|---|---|
+| `Retained` / `retainedCount` | Retained conversation count |
+| `Incomplete` / `incompleteCount` | Conversations marked incomplete |
+| `Dropped` / `droppedCount` | Accumulated lost-evidence events; any value above zero is `unhealthy` |
+| `Sealed turns` / `sealedTurnCount` | Turns with a complete projected seal |
+| `Unsealed turns` / `unsealedTurnCount` | Turns with no seal reference, including historical turns |
+| `Incomplete-seal turns` / `incompleteSealTurnCount` | Turns whose present seal reference is incomplete or malformed |
+| `Persistence` / `persistenceHealth` | `unhealthy` for any drop; otherwise `degraded` for an incomplete conversation or incomplete-seal turn; otherwise `healthy` |
+
+Historical unsealed turns alone do not degrade persistence health.
+
+### Evidence completeness and retention
+
+Required facts are captured from the delivered response attempt at write time only. Missing deployment, serving-account-scope, route, or model facts remain `unknown` and make the relevant seal incomplete. An absent or ineligible final serving account produces no receipt instead. A historical null seal reference remains explicitly unsealed. Nothing is reconstructed, inferred, or backfilled from later state.
+
+Seal completeness and turn completeness are independent. A complete seal never upgrades partial, incomplete, gapped, lost, or contradictory turn evidence. Unsound turns remain visible descriptively and are excluded from safe subsets; their evidence is not silently repaired.
+
+There is no durable cohort summary or aggregate. Normalized epoch/partition provenance and turn references are durable, while each report recomputes `cohortAnalysis` from the retained turns in the one requested recorder conversation. Deleting or expiring the final retained contributor removes its cohort summary on the next query. Retention pruning also removes orphan observation partitions and then orphan service epochs after their retained turn references disappear.
+
+### Privacy and behavior boundaries
+
+The seal and additive `cohortAnalysis` store and expose evidence provenance only. No prompt text, request body, credential, raw cache key, raw host, raw serving account ID, raw model, raw route candidate, or secret configuration value enters seal storage or seal output. Serving-account and route/model dimensions are restart-scoped privacy-safe identifiers, and the captured keepalive policy values are non-secret evidence dimensions.
+
+These guarantees apply to the seal additions. Existing legacy recorder report fields are neither removed nor narrowed. The seal observes final routing/native-cache/recorder/keepalive conditions; it does not select an account, alter cache control, schedule keepalives, rewrite a request, or change provider behavior. A seal-capture failure leaves the delivered request behavior intact and records no receipt.
+
+### Runtime verification safety
+
+> [!CAUTION]
+> Current builds treat `x-better-ccflare-account-id` as an exact-account, fail-closed route: a conflicting directive, missing or unavailable target, lookup failure, provider exclusion, or exhausted account/model capacity fails before transport instead of entering ordinary account selection. Verify the runtime build before relying on that contract. For evidence-boundary testing, the header is still only an attribution assertion—not the sole isolation boundary—and does not replace disposable catalog isolation.
+
+Live runtime verification may proceed only after proving, before startup and before transport, that the **complete disposable account catalog contains exactly one available approved official-xAI non-Anthropic fixture**. Use a disposable database and runtime, never a normal user or production catalog. If any Anthropic account is present, the intended target is unavailable, or no safe official-xAI non-Anthropic fixture exists, skip the smoke test before sending a proxy request.
+
+Only after that preflight may the request carry `x-better-ccflare-account-id` for attribution. Afterward, verify the persisted serving account and provider match the approved fixture, then compare the human and JSON conversation report boundaries and contributors. A force-route header alone is never evidence that the safe account served the request.
 
 ## Claude Code Model Route Profiles
 
