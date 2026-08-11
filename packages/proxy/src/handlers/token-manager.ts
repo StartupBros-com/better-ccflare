@@ -617,7 +617,7 @@ export async function refreshAccessTokenSafe(
 					newRefreshToken: result.refreshToken !== account.refresh_token,
 					provider: account.provider,
 				});
-				return result.accessToken;
+				return resolveWithToken;
 			})
 			.catch(async (error) => {
 				// Record the failure timestamp for backoff
