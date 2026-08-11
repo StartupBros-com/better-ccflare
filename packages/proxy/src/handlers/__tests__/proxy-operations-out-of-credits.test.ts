@@ -883,11 +883,11 @@ describe("proxyWithAccount — generic Anthropic 429 scope", () => {
 		).not.toBeNull();
 	});
 
-	it("keeps weekly-all100 and a hard response signal account-scoped", async () => {
+	it("keeps weekly-all100 account-scoped with or without a hard response signal", async () => {
 		for (const fixture of [
 			{ weeklyAll: 100, headers: {} },
 			{
-				weeklyAll: 72,
+				weeklyAll: 100,
 				headers: {
 					"anthropic-ratelimit-unified-status": "rate_limited",
 				},
@@ -914,6 +914,48 @@ describe("proxyWithAccount — generic Anthropic 429 scope", () => {
 			expect(account.rate_limited_until).not.toBeNull();
 			expect(ctx.dbOps.markAccountRateLimited).toHaveBeenCalledTimes(1);
 		}
+	});
+
+	// 2026-08-11 incident: Anthropic returns the hard unified status on per-model
+	// weekly caps too. With account-wide headroom and this family's cap spent, the
+	// 429 belongs to the family — benching the account removed the two healthiest
+	// accounts from every lane for 12h and emptied the pool into route_unavailable.
+	it("keeps a hard response signal family-scoped while account-wide capacity remains", async () => {
+		usageCache.delete("acc-anthropic-1");
+		cacheIncidentUsage("acc-anthropic-1", INCIDENT_NOW - 120_000, {
+			weeklyAll: 72,
+		});
+		globalThis.fetch = mock(async () =>
+			generic429Response({
+				"anthropic-ratelimit-unified-status": "rate_limited",
+			}),
+		);
+		const ctx = makeProxyContextWithAsyncExec();
+		const account = makeAccount();
+		const bodyBuffer = makeRequestBody("claude-fable-5");
+		const req = makeRequest(bodyBuffer);
+
+		await proxyWithAccount(
+			req,
+			new URL("https://proxy.local/v1/messages"),
+			account,
+			makeRequestMeta(),
+			bodyBuffer,
+			() => undefined,
+			0,
+			ctx,
+		);
+
+		expect(account.rate_limited_until).toBeNull();
+		expect(ctx.dbOps.markAccountRateLimited).not.toHaveBeenCalled();
+		expect(getRequestRateLimitOutcomes(req)).toEqual([
+			expect.objectContaining({
+				scope: "family",
+				family: "fable",
+				attemptedModel: "claude-fable-5",
+				reason: "matching_scoped_limit",
+			}),
+		]);
 	});
 
 	it("keeps an unknown concrete model account-scoped", async () => {
@@ -1246,7 +1288,14 @@ describe("proxyWithAccount — scoped same-account model continuation", () => {
 	});
 
 	it("stops before a sibling-model fallback when the first 429 proves account exhaustion", async () => {
-		cacheIncidentUsage("acc-anthropic-1", INCIDENT_NOW - 120_000);
+		// weekly_all spent, so the hard status really does prove account exhaustion
+		// and suppressing same-account model fallback is correct. Previously this
+		// fixture left weekly_all at 72% — only Fable was capped — so it asserted
+		// that a family-scoped 429 killed the model-fallback recovery path that
+		// circuit-breaker.ts exists to protect.
+		cacheIncidentUsage("acc-anthropic-1", INCIDENT_NOW - 120_000, {
+			weeklyAll: 100,
+		});
 		const hardAccount429 = observableErrorResponse(429, {
 			"anthropic-ratelimit-unified-status": "rate_limited",
 			"retry-after": "120",
@@ -1767,11 +1816,17 @@ describe("proxyWithAccount — scoped failures returned by a 529 retry", () => {
 		for (const fixture of [
 			{
 				observedAt: INCIDENT_NOW - 181_000,
+				weeklyAll: 72,
 				headers: {},
 				expectAccountCooldown: false,
 			},
 			{
+				// weekly_all spent: the hard status is genuinely account-wide here.
+				// With headroom instead, the same status is Fable-only — covered by
+				// "keeps a hard response signal family-scoped while account-wide
+				// capacity remains".
 				observedAt: INCIDENT_NOW - 120_000,
+				weeklyAll: 100,
 				headers: {
 					"anthropic-ratelimit-unified-status": "rate_limited",
 				},
@@ -1779,7 +1834,9 @@ describe("proxyWithAccount — scoped failures returned by a 529 retry", () => {
 			},
 		]) {
 			usageCache.delete("acc-anthropic-1");
-			cacheIncidentUsage("acc-anthropic-1", fixture.observedAt);
+			cacheIncidentUsage("acc-anthropic-1", fixture.observedAt, {
+				weeklyAll: fixture.weeklyAll,
+			});
 			const initial529 = observableErrorResponse(529);
 			const retry429 = observableErrorResponse(429, fixture.headers);
 			let calls = 0;
