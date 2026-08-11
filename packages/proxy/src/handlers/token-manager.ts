@@ -535,7 +535,18 @@ export async function refreshAccessTokenSafe(
 		backoffCounters.delete(account.id);
 	}
 
-	// Check if a refresh is already in progress for this account
+	// The caller's account object may be a stale snapshot (the auto-refresh
+	// scheduler builds one from a loop-start SELECT). Re-read the row and adopt
+	// fresher credentials before initiating a refresh — refreshing with an
+	// already-rotated refresh token produces a false-definitive invalid_grant.
+	if (!ctx.refreshInFlight.has(account.id)) {
+		const adopted = await adoptDbTokensIfFresher(account, ctx);
+		if (adopted) return adopted;
+	}
+
+	// Check if a refresh is already in progress for this account.
+	// NOTE: no await may sit between this check and refreshInFlight.set() —
+	// microtask atomicity is what deduplicates concurrent callers.
 	if (!ctx.refreshInFlight.has(account.id)) {
 		// Snapshot the credential before creating the provider promise. Reauth can
 		// replace the mutable account object while the network call is in flight;
