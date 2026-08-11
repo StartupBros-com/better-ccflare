@@ -1097,7 +1097,10 @@ describe("UsageCollector request lifecycle", () => {
 		expect(recorderWrites).toEqual([]);
 		expect(summaries).toContain("recorder-failure");
 		expect(warnings).toHaveLength(1);
-		expect(JSON.stringify(warnings[0])).not.toContain("repository unavailable");
+		// The error message is the whole point of the observability fix: without
+		// it, a seal-contract rejection is indistinguishable from a transient DB
+		// error. Only the message may be logged, never payload/prompt content.
+		expect(JSON.stringify(warnings[0])).toContain("repository unavailable");
 		expect(JSON.stringify(warnings[0])).not.toContain("raw prompt");
 		expect(markedIncomplete).toEqual([
 			{ id: "cfr_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", dropped: true },

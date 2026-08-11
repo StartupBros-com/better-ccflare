@@ -878,9 +878,10 @@ export class UsageCollector {
 							turn,
 						);
 					}
-				} catch {
+				} catch (error) {
 					log.warn("Cache flight recorder write failed", {
 						recorderConversationId,
+						error: error instanceof Error ? error.message : String(error),
 					});
 					// The turn is irrecoverably lost, so it is dropped evidence, not
 					// merely an incomplete dimension.

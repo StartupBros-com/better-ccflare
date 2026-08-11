@@ -809,6 +809,74 @@ describe("CacheFlightRecorderRepository", () => {
 		db.close();
 	});
 
+	it("protects a recently-created orphan registry row from a same-pass reap, then reaps it once it is older than the cutoff", async () => {
+		const db = makeDb();
+		const repo = new CacheFlightRecorderRepository(new BunSqlAdapter(db));
+		await repo.appendTurn(
+			"orphan-guard-id",
+			turn(1, { timestamp: iso(1_000) }),
+			1_000,
+			sealReceipt(),
+		);
+
+		// Simulate the race window directly: the registry rows become true
+		// zero-turn orphans (their only referencing turn is gone) while their
+		// created_at (1_000) is still within the current retention window.
+		// A live append reusing this cached partition/epoch id would be in
+		// exactly this state mid-transaction on PostgreSQL, where the
+		// insert-or-verify batch and this cleanup run as separate
+		// transactions (see bun-sql-adapter.ts runBatchWithChanges).
+		db.query(
+			`DELETE FROM cache_flight_recorder_turns WHERE recorder_conversation_id = ?`,
+		).run("orphan-guard-id");
+
+		// cutoffTs (500) predates the registry rows' created_at (1_000): the
+		// orphan cleanup must not reap them yet, even though they are
+		// currently unreferenced.
+		await repo.expireOlderThan(500, 10_000);
+		expect(
+			(
+				db
+					.query(
+						"SELECT COUNT(*) AS count FROM cache_flight_recorder_partitions",
+					)
+					.get() as { count: number }
+			).count,
+		).toBe(1);
+		expect(
+			(
+				db
+					.query(
+						"SELECT COUNT(*) AS count FROM cache_flight_recorder_service_epochs",
+					)
+					.get() as { count: number }
+			).count,
+		).toBe(1);
+
+		// Once the cutoff advances past created_at (1_000), the same orphan
+		// rows are still eligible and get reaped.
+		await repo.expireOlderThan(2_000, 10_000);
+		expect(
+			(
+				db
+					.query(
+						"SELECT COUNT(*) AS count FROM cache_flight_recorder_partitions",
+					)
+					.get() as { count: number }
+			).count,
+		).toBe(0);
+		expect(
+			(
+				db
+					.query(
+						"SELECT COUNT(*) AS count FROM cache_flight_recorder_service_epochs",
+					)
+					.get() as { count: number }
+			).count,
+		).toBe(0);
+		db.close();
+	});
+
 	it("expires an active conversation whose entire timeline predates the cutoff despite a recent updated_at", async () => {
 		const db = makeDb();
 		const repo = new CacheFlightRecorderRepository(new BunSqlAdapter(db));
@@ -1310,6 +1378,77 @@ describe("CacheFlightRecorderRepository", () => {
 		}
 	});
 
+	it("rejects seal receipts whose declared completeness contradicts their own unavailable dimensions before writing any recorder rows", async () => {
+		const cases: Array<{
+			name: string;
+			receipt: CacheFlightCohortSealReceipt;
+			expectedMessage: string;
+		}> = [
+			{
+				name: "service epoch completeness contradicts its unavailable dimensions",
+				receipt: (() => {
+					const receipt = sealReceipt();
+					return {
+						...receipt,
+						serviceEpoch: {
+							...receipt.serviceEpoch,
+							completeness: "incomplete",
+						},
+					} as CacheFlightCohortSealReceipt;
+				})(),
+				expectedMessage:
+					"cache flight service epoch completeness is inconsistent",
+			},
+			{
+				name: "partition completeness contradicts its unavailable dimensions",
+				receipt: (() => {
+					const receipt = sealReceipt();
+					return {
+						...receipt,
+						observationPartition: {
+							...receipt.observationPartition,
+							completeness: "incomplete",
+						},
+					} as CacheFlightCohortSealReceipt;
+				})(),
+				expectedMessage: "cache flight partition completeness is inconsistent",
+			},
+			{
+				name: "seal receipt completeness contradicts its unavailable dimensions",
+				receipt: (() => {
+					const receipt = sealReceipt();
+					return {
+						...receipt,
+						completeness: "incomplete",
+					} as CacheFlightCohortSealReceipt;
+				})(),
+				expectedMessage: "cache flight seal completeness is inconsistent",
+			},
+		];
+
+		for (const testCase of cases) {
+			const db = makeDb();
+			const repo = new CacheFlightRecorderRepository(new BunSqlAdapter(db));
+
+			await expect(
+				repo.appendTurn(
+					"completeness-mismatch-id",
+					turn(1),
+					1_000,
+					testCase.receipt,
+				),
+				testCase.name,
+			).rejects.toThrow(testCase.expectedMessage);
+			expect(recorderRowCounts(db), testCase.name).toEqual({
+				conversations: 0,
+				turns: 0,
+				serviceEpochs: 0,
+				partitions: 0,
+			});
+			db.close();
+		}
+	});
+
 	it("sanitizes corrupted stored seal identities and timestamps before projecting health", async () => {
 		const db = makeDb();
 		const repo = new CacheFlightRecorderRepository(new BunSqlAdapter(db));
@@ -1476,6 +1615,220 @@ describe("CacheFlightRecorderRepository", () => {
 			incompleteSeal: 1,
 		});
 		db.close();
+	});
+
+	it("projects out-of-domain stored enum states as unavailable evidence", async () => {
+		const cases: Array<{
+			name: string;
+			corrupt: (db: Database) => void;
+			assertSeal: (seal: CacheFlightPersistedSeal | null | undefined) => void;
+		}> = [
+			{
+				name: "native cache state outside {enabled, disabled, NULL}",
+				corrupt: (db) => {
+					db.query(
+						`UPDATE cache_flight_recorder_service_epochs
+						 SET native_cache_state = ?
+						 WHERE id = ?`,
+					).run("half-enabled", "epoch-safe-id");
+				},
+				assertSeal: (seal) => {
+					expect(seal?.serviceEpoch.nativeCacheState).toBeNull();
+					expect(seal?.serviceEpoch.unavailableDimensions).toContain(
+						"native_cache_state",
+					);
+				},
+			},
+			{
+				name: "recorder state outside {enabled, disabled, NULL}",
+				corrupt: (db) => {
+					db.query(
+						`UPDATE cache_flight_recorder_service_epochs
+						 SET recorder_state = ?
+						 WHERE id = ?`,
+					).run("half-enabled", "epoch-safe-id");
+				},
+				assertSeal: (seal) => {
+					expect(seal?.serviceEpoch.recorderState).toBeNull();
+					expect(seal?.serviceEpoch.unavailableDimensions).toContain(
+						"recorder_state",
+					);
+				},
+			},
+		];
+
+		for (const testCase of cases) {
+			const db = makeDb();
+			const repo = new CacheFlightRecorderRepository(new BunSqlAdapter(db));
+			await repo.appendTurn("state-health-id", turn(1), 1_000, sealReceipt());
+
+			testCase.corrupt(db);
+
+			const timeline = await repo.loadTimeline("state-health-id");
+			const seal = (timeline?.turns as LoadedTurnWithSeal[] | undefined)?.[0]
+				?.seal;
+			testCase.assertSeal(seal);
+			expect(seal?.serviceEpoch.completeness, testCase.name).toBe("incomplete");
+			expect(seal?.unavailableDimensions, testCase.name).toContain(
+				"seal_receipt",
+			);
+			expect(seal?.completeness, testCase.name).toBe("incomplete");
+			expect(await repo.countDroppedIncomplete(), testCase.name).toEqual({
+				dropped: 0,
+				incomplete: 0,
+				sealed: 0,
+				unsealed: 0,
+				incompleteSeal: 1,
+			});
+			db.close();
+		}
+	});
+
+	it("projects an out-of-domain stored keepalive boolean as unavailable evidence", async () => {
+		const db = makeDb();
+		const repo = new CacheFlightRecorderRepository(new BunSqlAdapter(db));
+		await repo.appendTurn("boolean-health-id", turn(1), 1_000, sealReceipt());
+
+		db.query(
+			`UPDATE cache_flight_recorder_service_epochs
+			 SET keepalive_effective_xai_enabled = ?
+			 WHERE id = ?`,
+		).run(2, "epoch-safe-id");
+
+		const timeline = await repo.loadTimeline("boolean-health-id");
+		const seal = (timeline?.turns as LoadedTurnWithSeal[] | undefined)?.[0]
+			?.seal;
+		expect(seal?.serviceEpoch.keepalivePolicy).toBeNull();
+		expect(seal?.serviceEpoch.unavailableDimensions).toContain(
+			"keepalive_policy",
+		);
+		expect(seal?.serviceEpoch.completeness).toBe("incomplete");
+		expect(seal?.unavailableDimensions).toContain("seal_receipt");
+		expect(seal?.completeness).toBe("incomplete");
+		expect(await repo.countDroppedIncomplete()).toEqual({
+			dropped: 0,
+			incomplete: 0,
+			sealed: 0,
+			unsealed: 0,
+			incompleteSeal: 1,
+		});
+		db.close();
+	});
+
+	it("projects out-of-bounds stored keepalive TTLs as unavailable evidence", async () => {
+		const cases: Array<{ name: string; value: number }> = [
+			{ name: "negative TTL", value: -1 },
+			{ name: "TTL above the one-year bound", value: 525_601 },
+		];
+
+		for (const testCase of cases) {
+			const db = makeDb();
+			const repo = new CacheFlightRecorderRepository(new BunSqlAdapter(db));
+			await repo.appendTurn("ttl-health-id", turn(1), 1_000, sealReceipt());
+
+			db.query(
+				`UPDATE cache_flight_recorder_service_epochs
+				 SET keepalive_global_ttl_minutes = ?
+				 WHERE id = ?`,
+			).run(testCase.value, "epoch-safe-id");
+
+			const timeline = await repo.loadTimeline("ttl-health-id");
+			const seal = (timeline?.turns as LoadedTurnWithSeal[] | undefined)?.[0]
+				?.seal;
+			expect(seal?.serviceEpoch.keepalivePolicy, testCase.name).toBeNull();
+			expect(seal?.serviceEpoch.unavailableDimensions, testCase.name).toContain(
+				"keepalive_policy",
+			);
+			expect(seal?.serviceEpoch.completeness, testCase.name).toBe("incomplete");
+			expect(seal?.unavailableDimensions, testCase.name).toContain(
+				"seal_receipt",
+			);
+			expect(seal?.completeness, testCase.name).toBe("incomplete");
+			db.close();
+		}
+	});
+
+	it("projects stored completeness columns that disagree with their own unavailable-dimensions column as unavailable", async () => {
+		const cases: Array<{
+			name: string;
+			corrupt: (db: Database) => void;
+			assertSeal: (seal: CacheFlightPersistedSeal | null | undefined) => void;
+		}> = [
+			{
+				name: "service epoch completeness vs its own unavailable_dimensions",
+				corrupt: (db) => {
+					db.query(
+						`UPDATE cache_flight_recorder_service_epochs
+						 SET completeness = ?
+						 WHERE id = ?`,
+					).run("incomplete", "epoch-safe-id");
+				},
+				assertSeal: (seal) => {
+					expect(seal?.serviceEpoch.completeness).toBe("incomplete");
+				},
+			},
+			{
+				name: "partition completeness vs its own unavailable_dimensions",
+				corrupt: (db) => {
+					db.query(
+						`UPDATE cache_flight_recorder_partitions
+						 SET completeness = ?
+						 WHERE id = ?`,
+					).run("incomplete", "partition-safe-id");
+				},
+				assertSeal: (seal) => {
+					expect(seal?.observationPartition.completeness).toBe("incomplete");
+				},
+			},
+			{
+				name: "seal completeness vs its own seal_unavailable_dimensions",
+				corrupt: (db) => {
+					db.query(
+						`UPDATE cache_flight_recorder_partitions
+						 SET seal_completeness = ?
+						 WHERE id = ?`,
+					).run("incomplete", "partition-safe-id");
+				},
+				assertSeal: (seal) => {
+					// Sub-levels remain individually complete on their own
+					// terms; only the top-level receipt is marked
+					// unavailable, proving this contradiction is caught even
+					// when neither sub-level's own gate would have caught it.
+					expect(seal?.serviceEpoch.completeness).toBe("complete");
+					expect(seal?.observationPartition.completeness).toBe("complete");
+				},
+			},
+		];
+
+		for (const testCase of cases) {
+			const db = makeDb();
+			const repo = new CacheFlightRecorderRepository(new BunSqlAdapter(db));
+			await repo.appendTurn(
+				"completeness-contradiction-id",
+				turn(1),
+				1_000,
+				sealReceipt(),
+			);
+
+			testCase.corrupt(db);
+
+			const timeline = await repo.loadTimeline("completeness-contradiction-id");
+			const seal = (timeline?.turns as LoadedTurnWithSeal[] | undefined)?.[0]
+				?.seal;
+			testCase.assertSeal(seal);
+			expect(seal?.unavailableDimensions, testCase.name).toContain(
+				"seal_receipt",
+			);
+			expect(seal?.completeness, testCase.name).toBe("incomplete");
+			expect(await repo.countDroppedIncomplete(), testCase.name).toEqual({
+				dropped: 0,
+				incomplete: 0,
+				sealed: 0,
+				unsealed: 0,
+				incompleteSeal: 1,
+			});
+			db.close();
+		}
 	});
 
 	it("stores only the privacy-safe evidence columns", async () => {
