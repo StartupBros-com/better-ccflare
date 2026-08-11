@@ -61,6 +61,7 @@ interface RequestState {
 		tokensPerSecond?: number;
 		iterations?: UsageIteration[];
 		fallbackIterationSeen?: boolean;
+		fallbackIterationModel?: string;
 		iterationsTruncated?: boolean;
 	};
 	lastActivity: number;
@@ -194,6 +195,7 @@ function captureUsageIterations(usage: unknown, state: RequestState): void {
 
 	const iterations: UsageIteration[] = [];
 	let fallbackIterationSeen = false;
+	let fallbackIterationModel: string | undefined;
 	for (const rawIteration of rawIterations) {
 		if (
 			!rawIteration ||
@@ -203,7 +205,11 @@ function captureUsageIterations(usage: unknown, state: RequestState): void {
 			continue;
 		}
 		const raw = rawIteration as Record<string, unknown>;
-		if (raw.type === "fallback_message") fallbackIterationSeen = true;
+		if (raw.type === "fallback_message") {
+			fallbackIterationSeen = true;
+			const model = normalizeNonEmptyString(raw.model);
+			if (model) fallbackIterationModel = model;
+		}
 		if (iterations.length >= MAX_USAGE_ITERATIONS) continue;
 		const model = normalizeNonEmptyString(raw.model);
 
@@ -223,7 +229,11 @@ function captureUsageIterations(usage: unknown, state: RequestState): void {
 	// the earlier one, including when every later entry is invalid.
 	state.usage.iterations = iterations;
 	state.usage.fallbackIterationSeen = fallbackIterationSeen;
+	state.usage.fallbackIterationModel = fallbackIterationModel;
 	state.usage.iterationsTruncated = rawIterations.length > MAX_USAGE_ITERATIONS;
+	if (state.fallbackBlockSeen !== true && fallbackIterationModel) {
+		state.usage.model = fallbackIterationModel;
+	}
 }
 
 // Extract usage data from non-stream JSON response bodies
@@ -275,8 +285,9 @@ function extractUsageFromJson(
 	const usageObj = json.usage;
 	if (!usageObj) return;
 
-	state.usage.model = json.model ?? state.usage.model;
 	captureUsageIterations(usageObj, state);
+	// The non-stream response model is authoritative over both fallback signals.
+	state.usage.model = json.model ?? state.usage.model;
 
 	if (usageObj.input_tokens !== undefined) {
 		state.usage.inputTokens = usageObj.input_tokens;
@@ -458,6 +469,7 @@ function freeRequestState(state: RequestState): void {
 	state.buffer = "";
 	state.usage.iterations = undefined;
 	state.usage.fallbackIterationSeen = undefined;
+	state.usage.fallbackIterationModel = undefined;
 	state.usage.iterationsTruncated = undefined;
 	// Release request body and headers held in startMessage.
 	// Without this, orphaned requests retain full request bodies until the

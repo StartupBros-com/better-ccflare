@@ -104,6 +104,7 @@ interface TestRequestState {
 	usage: {
 		iterations?: unknown[];
 		fallbackIterationSeen?: boolean;
+		fallbackIterationModel?: string;
 		iterationsTruncated?: boolean;
 	};
 }
@@ -267,7 +268,13 @@ const OPUS_MODEL = "claude-opus-test";
 function useDeterministicModelPricing(): void {
 	pricingImplementation = async (model, tokens) => {
 		const modelFactor =
-			model === FABLE_MODEL ? 1 : model === OPUS_MODEL ? 2 : undefined;
+			model === FABLE_MODEL
+				? 1
+				: model === OPUS_MODEL
+					? 2
+					: model === HAIKU_MODEL
+						? 3
+						: undefined;
 		if (modelFactor === undefined) {
 			throw new Error(`Unexpected model passed to pricing: ${model}`);
 		}
@@ -469,6 +476,68 @@ describe("UsageCollector request lifecycle", () => {
 				from: HAIKU_MODEL,
 				to: OPUS_MODEL,
 				iterationCount: 2,
+				priced: "iterations",
+			});
+		});
+
+		it("keeps the non-stream top-level model authoritative over a fallback iteration", async () => {
+			useDeterministicModelPricing();
+			const { collector, savedUsages } = harness();
+			const requestId = "json-top-level-model-over-fallback-iteration";
+			const fallbackLogs = captureFallbackUsageLogs();
+			const responseBody = Buffer.from(
+				JSON.stringify({
+					model: OPUS_MODEL,
+					usage: {
+						input_tokens: 5,
+						output_tokens: 7,
+						iterations: [
+							{
+								type: "fallback_message",
+								model: HAIKU_MODEL,
+								input_tokens: 5,
+								output_tokens: 7,
+							},
+						],
+					},
+				}),
+			).toString("base64");
+
+			try {
+				collector.handleStart(
+					makeStartMessage(requestId, {
+						isStream: false,
+						responseHeaders: { "content-type": "application/json" },
+					}),
+				);
+				await collector.handleEnd({
+					type: "end",
+					requestId,
+					success: true,
+					responseBody,
+				});
+				await collector.drain();
+			} finally {
+				fallbackLogs.stop();
+			}
+
+			expect(savedUsages.get(requestId)).toMatchObject({
+				model: OPUS_MODEL,
+				costUsd: 225,
+			});
+			expect(estimateCostUSD).toHaveBeenCalledTimes(1);
+			expect(estimateCostUSD).toHaveBeenCalledWith(HAIKU_MODEL, {
+				inputTokens: 5,
+				outputTokens: 7,
+				cacheReadInputTokens: undefined,
+				cacheCreationInputTokens: undefined,
+			});
+			expect(fallbackLogs.events).toHaveLength(1);
+			expect(fallbackLogs.events[0]?.data).toEqual({
+				requestId,
+				from: OPUS_MODEL,
+				to: OPUS_MODEL,
+				iterationCount: 1,
 				priced: "iterations",
 			});
 		});
@@ -722,7 +791,7 @@ describe("UsageCollector request lifecycle", () => {
 				collector.handleChunk(
 					requestId,
 					new TextEncoder().encode(
-						`event: message_start\ndata: {"type":"message_start","message":{"model":"${OPUS_MODEL}","usage":{"input_tokens":65,"output_tokens":0}}}\n\nevent: response.completed\ndata: ${JSON.stringify({ usage: { input_tokens: 65, output_tokens: 0, iterations } })}\n\n`,
+						`event: message_start\ndata: {"type":"message_start","message":{"model":"${FABLE_MODEL}","usage":{"input_tokens":65,"output_tokens":0}}}\n\nevent: response.completed\ndata: ${JSON.stringify({ usage: { input_tokens: 65, output_tokens: 0, iterations } })}\n\n`,
 					),
 				);
 				await collector.handleEnd({ type: "end", requestId, success: true });
@@ -799,6 +868,8 @@ describe("UsageCollector request lifecycle", () => {
 						})}\n\n`,
 					),
 				);
+				const overflowingState = testable(collector).requests.get(requestId);
+				expect(overflowingState?.usage.fallbackIterationModel).toBe(OPUS_MODEL);
 				collector.handleChunk(
 					requestId,
 					new TextEncoder().encode(
@@ -809,6 +880,7 @@ describe("UsageCollector request lifecycle", () => {
 				const state = testable(collector).requests.get(requestId);
 				expect(state?.usage.iterations).toEqual([]);
 				expect(state?.usage.fallbackIterationSeen).toBe(false);
+				expect(state?.usage.fallbackIterationModel).toBeUndefined();
 				expect(state?.usage.iterationsTruncated).toBe(false);
 
 				await collector.handleEnd({ type: "end", requestId, success: true });
@@ -831,7 +903,7 @@ describe("UsageCollector request lifecycle", () => {
 			expect(fallbackLogs.events).toEqual([]);
 		});
 
-		it("keeps split pricing when a fallback stream has a non-empty iteration snapshot", async () => {
+		it("keeps the fallback content-block target authoritative over iteration metadata", async () => {
 			useDeterministicModelPricing();
 			const { collector, savedUsages } = harness();
 			const requestId = "stream-fallback-non-empty-iterations";
@@ -842,7 +914,7 @@ describe("UsageCollector request lifecycle", () => {
 				collector.handleChunk(
 					requestId,
 					new TextEncoder().encode(
-						`event: message_start\ndata: {"type":"message_start","message":{"model":"${FABLE_MODEL}","usage":{"input_tokens":23,"output_tokens":0}}}\n\nevent: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"fallback","from":{"model":"${FABLE_MODEL}"},"to":{"model":"${OPUS_MODEL}"}}}\n\nevent: message_delta\ndata: {"type":"message_delta","usage":{"input_tokens":23,"output_tokens":29,"iterations":[{"type":"message","model":"${FABLE_MODEL}","input_tokens":2,"output_tokens":3},{"type":"fallback_message","model":"${OPUS_MODEL}","input_tokens":11,"output_tokens":13}]}}\n\n`,
+						`event: message_start\ndata: {"type":"message_start","message":{"model":"${FABLE_MODEL}","usage":{"input_tokens":23,"output_tokens":0}}}\n\nevent: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"fallback","from":{"model":"${FABLE_MODEL}"},"to":{"model":"${OPUS_MODEL}"}}}\n\nevent: message_delta\ndata: {"type":"message_delta","usage":{"input_tokens":23,"output_tokens":29,"iterations":[{"type":"message","model":"${FABLE_MODEL}","input_tokens":2,"output_tokens":3},{"type":"fallback_message","model":"${HAIKU_MODEL}","input_tokens":11,"output_tokens":13}]}}\n\n`,
 					),
 				);
 				await collector.handleEnd({ type: "end", requestId, success: true });
@@ -853,7 +925,7 @@ describe("UsageCollector request lifecycle", () => {
 
 			expect(savedUsages.get(requestId)).toMatchObject({
 				model: OPUS_MODEL,
-				costUsd: 314,
+				costUsd: 455,
 			});
 			expect(estimateCostUSD).toHaveBeenCalledTimes(2);
 			expect(estimateCostUSD).toHaveBeenNthCalledWith(1, FABLE_MODEL, {
@@ -862,7 +934,7 @@ describe("UsageCollector request lifecycle", () => {
 				cacheReadInputTokens: undefined,
 				cacheCreationInputTokens: undefined,
 			});
-			expect(estimateCostUSD).toHaveBeenNthCalledWith(2, OPUS_MODEL, {
+			expect(estimateCostUSD).toHaveBeenNthCalledWith(2, HAIKU_MODEL, {
 				inputTokens: 11,
 				outputTokens: 13,
 				cacheReadInputTokens: undefined,
