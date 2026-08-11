@@ -663,7 +663,12 @@ async function transformHostedRequest(
 	});
 	if (mapping === undefined) throw rejected();
 	converted.tools = mapping.tools;
-	converted.include = mapping.include;
+	converted.include = [
+		...new Set([
+			...(Array.isArray(converted.include) ? converted.include : []),
+			...mapping.include,
+		]),
+	];
 	if (mapping.max_tool_calls === undefined) delete converted.max_tool_calls;
 	else converted.max_tool_calls = mapping.max_tool_calls;
 	if (

@@ -72,6 +72,91 @@ describe("Codex trace wiring (integration)", () => {
 		rmSync(dir, { recursive: true, force: true });
 	});
 
+	test("traces reasoning response metadata without retaining its payload", async () => {
+		process.env[CODEX_TRACE_DIR_ENV] = dir;
+		const event = (name: string, data: unknown) =>
+			`event: ${name}\ndata: ${JSON.stringify(data)}\n\n`;
+		const upstreamBody = [
+			event("response.created", {
+				response: { id: "resp_reasoning_private", model: "gpt-5.6-sol" },
+			}),
+			event("response.output_item.done", {
+				output_index: 0,
+				item: {
+					type: "reasoning",
+					id: "rs_reasoning_private",
+					encrypted_content: "encrypted-private-payload",
+				},
+			}),
+			event("response.output_item.done", {
+				output_index: 1,
+				item: { type: "reasoning", id: "rs_without_encrypted_content" },
+			}),
+			event("response.completed", {
+				response: {
+					model: "gpt-5.6-sol",
+					usage: { input_tokens: 12, output_tokens: 3 },
+				},
+			}),
+		].join("");
+
+		const transformed = await new CodexProvider().processResponse(
+			new Response(upstreamBody, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+		await transformed.text();
+
+		const file = readdirSync(dir).find((name) => name.endsWith(".jsonl"));
+		const rawTrace = readFileSync(join(dir, file as string), "utf8");
+		const record = JSON.parse(rawTrace.trim());
+		expect(record).toMatchObject({
+			trace_schema_version: 14,
+			phase: "response",
+			reasoning_output_item_count: 2,
+			reasoning_encrypted_present: true,
+		});
+		expect(rawTrace).not.toContain("rs_reasoning_private");
+		expect(rawTrace).not.toContain("encrypted-private-payload");
+	});
+
+	test("traces replayed reasoning input counts without retaining its payload", async () => {
+		process.env[CODEX_TRACE_DIR_ENV] = dir;
+		await new CodexProvider().transformRequestBody(
+			messagesRequest({
+				model: "claude-opus-4-8",
+				max_tokens: 10,
+				messages: [
+					{ role: "user", content: "start" },
+					{
+						role: "assistant",
+						content: [
+							{
+								type: "redacted_thinking",
+								data: "bccfr1.rs_request_private.encrypted.request.private",
+							},
+							{ type: "text", text: "answer" },
+						],
+					},
+					{ role: "user", content: "continue" },
+				],
+			}),
+		);
+
+		const file = readdirSync(dir).find((name) => name.endsWith(".jsonl"));
+		const rawTrace = readFileSync(join(dir, file as string), "utf8");
+		const record = JSON.parse(rawTrace.trim());
+		expect(record).toMatchObject({
+			trace_schema_version: 14,
+			phase: "request",
+			reasoning_input_item_count: 1,
+		});
+		expect(rawTrace).not.toContain("rs_request_private");
+		expect(rawTrace).not.toContain("encrypted.request.private");
+	});
+
 	test("transformRequestBody traces the physical attempt and strips internal identity", async () => {
 		process.env[CODEX_TRACE_DIR_ENV] = dir;
 		const transformed = await new CodexProvider().transformRequestBody(
@@ -95,7 +180,7 @@ describe("Codex trace wiring (integration)", () => {
 		const files = readdirSync(dir).filter((f) => f.endsWith(".jsonl"));
 		expect(files.length).toBe(1);
 		const rec = JSON.parse(readFileSync(join(dir, files[0]), "utf8").trim());
-		expect(rec.trace_schema_version).toBe(13);
+		expect(rec.trace_schema_version).toBe(14);
 		expect(rec.phase).toBe("request");
 		expect(rec.orchestration_admission).toBe("no_orchestration_tools");
 		expect(rec.request_id).toBe("req_trace_1");
@@ -162,7 +247,7 @@ describe("Codex trace wiring (integration)", () => {
 			readFileSync(join(dir, file as string), "utf8").trim(),
 		);
 		expect(record).toMatchObject({
-			trace_schema_version: 13,
+			trace_schema_version: 14,
 			request_id: "req_trace_fable_default",
 			model_in: "claude-fable-5",
 			model_out: "gpt-5.6-sol",
@@ -216,7 +301,7 @@ describe("Codex trace wiring (integration)", () => {
 			.trim()
 			.split("\n")
 			.map((line) => JSON.parse(line));
-		expect(records.every((record) => record.trace_schema_version === 13)).toBe(
+		expect(records.every((record) => record.trace_schema_version === 14)).toBe(
 			true,
 		);
 		expect(records.map((record) => record.cache_key_assignment)).toEqual([
