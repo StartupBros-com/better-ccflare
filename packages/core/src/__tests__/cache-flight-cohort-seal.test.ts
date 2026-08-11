@@ -555,6 +555,126 @@ describe("analyzeCacheFlightCohorts", () => {
 		});
 	});
 
+	it("reports partition dimensions as not comparable across a restart while service-epoch dimensions still report changed", () => {
+		// Same underlying account/route, but a restart: serviceInstanceId,
+		// processStartedAt, and the epoch occurrence all rotate (as intended -
+		// R2/KTD2). The partition pseudonyms (serving_account_scope,
+		// route_model_epoch) are HMAC-derived per-process, so they take on
+		// different opaque string values across the restart too - but that
+		// difference is an artifact of the restart, not evidence the
+		// underlying account or route actually changed. The analyzer must not
+		// claim "changed" for those two dimensions across this boundary.
+		const beforeRestart = serviceEpoch("epoch-a", {
+			occurrenceId: "occurrence-a",
+			serviceInstanceId: "service-instance-a",
+			processStartedAt: "2026-08-08T10:00:00.000Z",
+		});
+		const afterRestart = serviceEpoch("epoch-b", {
+			occurrenceId: "occurrence-b",
+			serviceInstanceId: "service-instance-b",
+			processStartedAt: "2026-08-08T11:00:00.000Z",
+		});
+		const result = analyzeCacheFlightCohorts([
+			observation(1, {
+				seal: seal(beforeRestart, {
+					partitionId: "partition-a",
+					servingAccountScope: "scope-pseudonym-before",
+					routeModelEpoch: "route-pseudonym-before",
+				}),
+			}),
+			observation(2, {
+				seal: seal(afterRestart, {
+					partitionId: "partition-b",
+					servingAccountScope: "scope-pseudonym-after",
+					routeModelEpoch: "route-pseudonym-after",
+				}),
+			}),
+		]);
+
+		expect(
+			result.blockers
+				.filter((blocker) => blocker.kind === "changed")
+				.map((blocker) => blocker.dimension),
+		).toEqual([
+			"service_instance",
+			"process_started_at",
+			"service_epoch_occurrence",
+		]);
+		expect(
+			result.blockers
+				.filter((blocker) => blocker.kind === "not_comparable")
+				.map((blocker) => blocker.dimension),
+		).toEqual(["serving_account_scope", "route_model_epoch"]);
+		expect(
+			result.blockers.some(
+				(blocker) =>
+					blocker.dimension === "serving_account_scope" ||
+					blocker.dimension === "route_model_epoch",
+			),
+		).toBe(true);
+		expect(
+			result.blockers.filter(
+				(blocker) =>
+					(blocker.dimension === "serving_account_scope" ||
+						blocker.dimension === "route_model_epoch") &&
+					blocker.kind === "changed",
+			),
+		).toEqual([]);
+	});
+
+	it("keeps a genuinely missing partition dimension reported as unknown, distinct from not-comparable, when service instance is shared", () => {
+		const epoch = serviceEpoch("epoch-a");
+		const result = analyzeCacheFlightCohorts([
+			observation(1, {
+				seal: seal(epoch, {
+					partitionId: "partition-a",
+					servingAccountScope: "scope-a",
+					routeModelEpoch: "route-model-a",
+				}),
+			}),
+			observation(2, {
+				seal: seal(epoch, {
+					partitionId: "partition-b",
+					servingAccountScope: null,
+					routeModelEpoch: "route-model-b",
+					partitionCompleteness: "incomplete",
+					partitionUnavailableDimensions: ["serving_account_scope"],
+					sealCompleteness: "incomplete",
+				}),
+			}),
+		]);
+
+		expect(
+			result.blockers.filter(
+				(blocker) => blocker.dimension === "serving_account_scope",
+			),
+		).toEqual([
+			{
+				dimension: "serving_account_scope",
+				kind: "unknown",
+				detail: "serving_account_scope_unknown",
+			},
+		]);
+		expect(
+			result.blockers.some(
+				(blocker) =>
+					blocker.dimension === "serving_account_scope" &&
+					blocker.kind === "not_comparable",
+			),
+		).toBe(false);
+		expect(
+			result.blockers.filter(
+				(blocker) => blocker.dimension === "route_model_epoch",
+			),
+		).toEqual([
+			{
+				dimension: "route_model_epoch",
+				kind: "changed",
+				detail: "route_model_epoch_changed",
+			},
+		]);
+	});
+
 	it("uses only retained contributors in summaries and counts", () => {
 		const epoch = serviceEpoch("epoch-a");
 		const persistedSeal = seal(epoch);

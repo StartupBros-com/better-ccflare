@@ -269,9 +269,19 @@ function formatCohortBlockers(
 ): string {
 	return (
 		blockers
-			.map(
-				(blocker) => `${blocker.kind}:${blocker.dimension}:${blocker.detail}`,
-			)
+			.map((blocker) => {
+				const base = `${blocker.kind}:${blocker.dimension}:${blocker.detail}`;
+				// The default kind:dimension:detail triple already names the
+				// dimension and a machine detail, but "not_comparable" needs an
+				// explicit human explanation: the pseudonyms for this dimension
+				// rotate per process, so a cross-restart comparison of
+				// account/route identity is impossible - not that it is known to
+				// differ (that would be "changed") and not that it is missing
+				// (that would be "unknown").
+				return blocker.kind === "not_comparable"
+					? `${base} (pseudonym rotates per process restart; not comparable across a restart, not known to differ)`
+					: base;
+			})
 			.join(", ") || "none"
 	);
 }

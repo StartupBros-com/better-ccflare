@@ -33,7 +33,10 @@ export type CacheFlightCohortBlockerDimension =
 	| "turn_gap"
 	| "historical_unsealed";
 
-export type CacheFlightCohortBlockerKind = "changed" | "unknown";
+export type CacheFlightCohortBlockerKind =
+	| "changed"
+	| "unknown"
+	| "not_comparable";
 
 export interface CacheFlightServiceEpoch {
 	readonly id: string;
@@ -115,6 +118,11 @@ export type CacheFlightCohortBlocker =
 	| {
 			readonly dimension: CacheFlightSealDimension;
 			readonly kind: "changed";
+			readonly detail: string;
+	  }
+	| {
+			readonly dimension: CacheFlightSealDimension;
+			readonly kind: "not_comparable";
 			readonly detail: string;
 	  }
 	| {
@@ -310,6 +318,27 @@ function changedBlocker(
 		dimension,
 		kind: "changed",
 		detail: `${dimension}_changed`,
+	};
+}
+
+/**
+ * Distinct from both `changed` and `unknown`: the values on both sides are
+ * perfectly well known, but they cannot be compared because the underlying
+ * pseudonym (HMAC-derived from a per-process secret and boot nonce - see
+ * `packages/proxy/src/opaque-runtime-id.ts`) rotates on every process
+ * restart. Reporting `changed` here would assert that the account or
+ * route/model identity differed, which is not something this data can show;
+ * reporting `unknown` would misstate that the value is missing. Declining to
+ * compare (this kind) asserts nothing about equivalence, which is the R7
+ * posture: withhold the conclusion rather than guess it either way.
+ */
+function notComparableBlocker(
+	dimension: CacheFlightSealDimension,
+): CacheFlightCohortBlocker {
+	return {
+		dimension,
+		kind: "not_comparable",
+		detail: `${dimension}_not_comparable_across_restart`,
 	};
 }
 
@@ -697,6 +726,38 @@ function knownComparableValues(
 	return { unknown: hasUnknown, values };
 }
 
+/**
+ * Groups summaries by the service instance whose partition dimensions were
+ * observed. Partition pseudonyms (`serving_account_scope`,
+ * `route_model_epoch`) are only meaningfully comparable within one service
+ * instance's lifetime - across instances they are HMAC outputs of different
+ * per-process secrets, so equal or unequal string values carry no signal.
+ * A summary whose `service_instance` is itself unknown cannot be asserted
+ * comparable to anything (not even another unknown), so it becomes its own
+ * singleton group.
+ */
+function partitionComparabilityGroups(
+	summaries: readonly CacheFlightCohortSummary[],
+): ReadonlyMap<string, CacheFlightCohortSummary[]> {
+	const groups = new Map<string, CacheFlightCohortSummary[]>();
+	summaries.forEach((summary, index) => {
+		const visible = summary.visibleSealDimensions.find(
+			(item) => item.dimension === "service_instance",
+		);
+		const key =
+			visible &&
+			visible.state === "known" &&
+			typeof visible.value === "string" &&
+			visible.value.length > 0
+				? `known:${visible.value}`
+				: `unknown:${index}`;
+		const existing = groups.get(key);
+		if (existing) existing.push(summary);
+		else groups.set(key, [summary]);
+	});
+	return groups;
+}
+
 function selectionBlockers(
 	summaries: readonly CacheFlightCohortSummary[],
 	unsealed: CacheFlightUnsealedSummary,
@@ -710,7 +771,32 @@ function selectionBlockers(
 		);
 	}
 	if (summaries.length > 1) {
+		const partitionGroups = partitionComparabilityGroups(summaries);
+		const crossesServiceInstances = partitionGroups.size > 1;
 		for (const dimension of COHORT_SELECTION_DIMENSION_ORDER) {
+			if (
+				crossesServiceInstances &&
+				PARTITION_DIMENSION_ORDER.includes(dimension)
+			) {
+				// The pseudonyms rotate per process, so a value difference across
+				// this boundary is not evidence of a real change - withhold the
+				// conclusion rather than assert either "changed" or "unknown" for
+				// the cross-instance comparison itself.
+				blockers.push(notComparableBlocker(dimension));
+				// Within a single service instance's group, the pseudonyms ARE
+				// comparable, so a real difference there is still reported.
+				for (const group of partitionGroups.values()) {
+					if (group.length < 2) continue;
+					const { values } = knownComparableValues(group, dimension);
+					if (values.size > 1) blockers.push(changedBlocker(dimension));
+				}
+				const { unknown: hasUnknown } = knownComparableValues(
+					summaries,
+					dimension,
+				);
+				if (hasUnknown) blockers.push(unknownBlocker(dimension));
+				continue;
+			}
 			const { unknown: hasUnknown, values } = knownComparableValues(
 				summaries,
 				dimension,

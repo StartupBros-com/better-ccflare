@@ -592,6 +592,133 @@ describe("cache flight recorder report", () => {
 		expect(human).toContain("Cache policy recommendation: null");
 	});
 
+	it("reports not-comparable partition dimensions across a restart consistently in human and JSON output", () => {
+		const restartedInstanceSeal: CacheFlightPersistedSeal = {
+			...completeSeal,
+			serviceEpoch: {
+				...completeSeal.serviceEpoch,
+				id: "epoch-opaque-2",
+				occurrenceId: "occurrence-2",
+				serviceInstanceId: "instance-opaque-2",
+				processStartedAt: "2026-07-15T00:01:30.000Z",
+			},
+			observationPartition: {
+				...completeSeal.observationPartition,
+				id: "partition-opaque-2",
+				serviceEpochId: "epoch-opaque-2",
+				servingAccountScope: "scope-opaque-2",
+				routeModelEpoch: "route-opaque-2",
+			},
+		};
+		const dto = buildCacheFlightRecorderReport({
+			...hitTimeline,
+			turns: [
+				{ ...baselineTurn, seal: completeSeal },
+				{ ...hitTurn, seal: restartedInstanceSeal },
+			],
+		});
+
+		expect(dto.cohortAnalysis.blockers).toEqual(
+			expect.arrayContaining([
+				{
+					dimension: "service_instance",
+					kind: "changed",
+					detail: "service_instance_changed",
+				},
+				{
+					dimension: "process_started_at",
+					kind: "changed",
+					detail: "process_started_at_changed",
+				},
+				{
+					dimension: "service_epoch_occurrence",
+					kind: "changed",
+					detail: "service_epoch_occurrence_changed",
+				},
+			]),
+		);
+		expect(
+			dto.cohortAnalysis.blockers.filter(
+				(blocker) =>
+					blocker.dimension === "serving_account_scope" ||
+					blocker.dimension === "route_model_epoch",
+			),
+		).toEqual([
+			{
+				dimension: "serving_account_scope",
+				kind: "not_comparable",
+				detail: "serving_account_scope_not_comparable_across_restart",
+			},
+			{
+				dimension: "route_model_epoch",
+				kind: "not_comparable",
+				detail: "route_model_epoch_not_comparable_across_restart",
+			},
+		]);
+
+		const human = renderCacheFlightRecorderReport(dto);
+		expect(human).toContain(
+			"not_comparable:serving_account_scope:serving_account_scope_not_comparable_across_restart",
+		);
+		expect(human).toContain(
+			"not_comparable:route_model_epoch:route_model_epoch_not_comparable_across_restart",
+		);
+		// The rendering must tell the operator the truth: the pseudonyms rotate
+		// per process, so a cross-restart comparison of identity is impossible -
+		// not that the account or route changed.
+		expect(human).toContain("not comparable across a restart");
+		expect(human).not.toContain(
+			"changed:serving_account_scope:serving_account_scope_changed",
+		);
+		expect(human).not.toContain(
+			"changed:route_model_epoch:route_model_epoch_changed",
+		);
+
+		const jsonOutput = capture();
+		const humanOutput = capture();
+		const command = {
+			action: "report" as const,
+			recorderConversationId: "recorder-safe-id",
+		};
+		const restartedDb = db({
+			lookupCacheFlightRecorderTimeline: async () => ({
+				status: "found" as const,
+				timeline: {
+					...hitTimeline,
+					turns: [
+						{ ...baselineTurn, seal: completeSeal },
+						{ ...hitTurn, seal: restartedInstanceSeal },
+					],
+				},
+			}),
+		});
+
+		return Promise.all([
+			runCacheFlightRecorderCommand(
+				restartedDb,
+				{ ...command, json: true },
+				{ enabled: true, retentionHours: 72 },
+				jsonOutput.io,
+			),
+			runCacheFlightRecorderCommand(
+				restartedDb,
+				{ ...command, json: false },
+				{ enabled: true, retentionHours: 72 },
+				humanOutput.io,
+			),
+		]).then(() => {
+			const report = JSON.parse(jsonOutput.stdout.at(0) ?? "");
+			expect(report.cohortAnalysis.blockers).toContainEqual({
+				dimension: "serving_account_scope",
+				kind: "not_comparable",
+				detail: "serving_account_scope_not_comparable_across_restart",
+			});
+			expect(humanOutput.stdout).toEqual([
+				renderCacheFlightRecorderReport(report),
+			]);
+		});
+	});
+
 	it("keeps unknown seal evidence and historical unsealed turns descriptive-only", () => {
 		const unknownRevisionSeal: CacheFlightPersistedSeal = {
 			...completeSeal,
