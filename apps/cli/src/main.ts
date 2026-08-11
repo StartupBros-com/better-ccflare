@@ -53,6 +53,183 @@ import type { DatabaseOperations } from "@better-ccflare/database";
 import { Logger } from "@better-ccflare/logger";
 import type { ComboFamily } from "@better-ccflare/types";
 
+/**
+ * Single source of truth for the account modes accepted by
+ * `--add-account --mode`. Every place in this file that used to hand-list
+ * the modes (the --mode validator, the --help text, and the "Available
+ * modes" error printed when --add-account is given without --mode) now
+ * derives from this constant instead of duplicating the list — see
+ * ACCOUNT_MODE_DESCRIPTIONS below for the corresponding drift guard on
+ * per-mode descriptions. (issue #152)
+ */
+export const ACCOUNT_MODES = [
+	"claude-oauth",
+	"console",
+	"zai",
+	"minimax",
+	"nanogpt",
+	"anthropic-compatible",
+	"openai-compatible",
+	"bedrock",
+	"kilo",
+	"alibaba-coding-plan",
+	"codex",
+	"xai",
+	"ollama",
+	"muse-spark",
+] as const;
+
+type AccountMode = (typeof ACCOUNT_MODES)[number];
+
+/**
+ * One-line human description per mode, used by both the --help breakdown
+ * and the "Available modes" error. Typed as a Record<AccountMode, string>
+ * so adding a mode to ACCOUNT_MODES without adding its description here is
+ * a TYPE ERROR rather than a silently missing help/error line.
+ */
+const ACCOUNT_MODE_DESCRIPTIONS: Record<AccountMode, string> = {
+	"claude-oauth": "Claude CLI account (OAuth, Max subscription)",
+	console: "Claude API account (OAuth)",
+	zai: "z.ai account (API key)",
+	minimax: "Minimax account (API key)",
+	nanogpt: "NanoGPT provider (API key)",
+	"anthropic-compatible": "Anthropic-compatible provider (API key)",
+	"openai-compatible": "OpenAI-compatible provider (API key)",
+	bedrock: "AWS Bedrock account (AWS profile credentials)",
+	kilo: "Kilo Gateway provider (API key)",
+	"alibaba-coding-plan": "Alibaba Coding Plan International provider (API key)",
+	codex: "Codex (OpenAI OAuth) provider",
+	xai: "xAI/Grok provider (imports local Grok CLI OAuth credentials)",
+	ollama: "Ollama local provider (no API key required)",
+	"muse-spark": "Muse Spark provider (API key)",
+};
+
+/**
+ * Renders the per-mode --help breakdown lines derived from ACCOUNT_MODES.
+ * bedrock is the one mode with extra sub-flags (--profile,
+ * --cross-region-mode), so it gets nested lines appended after its
+ * description; every other mode is a single line.
+ */
+function formatModeHelpBreakdown(): string {
+	return ACCOUNT_MODES.map((mode) => {
+		const line = `      ${mode}: ${ACCOUNT_MODE_DESCRIPTIONS[mode]}`;
+		if (mode === "bedrock") {
+			return [
+				line,
+				"        --profile <name>  AWS profile name from ~/.aws/credentials (required)",
+				"        --cross-region-mode <mode>   Cross-region inference mode: geographic (default), global, or regional",
+			].join("\n");
+		}
+		return line;
+	}).join("\n");
+}
+
+/**
+ * Renders the flat "  --mode <mode>  <description>" lines shared by the
+ * --help breakdown's alignment and the "Available modes" error, columns
+ * auto-padded to the longest mode name.
+ */
+function formatModeUsageLines(): string[] {
+	const modeColumnWidth = Math.max(...ACCOUNT_MODES.map((mode) => mode.length));
+	return ACCOUNT_MODES.map(
+		(mode) =>
+			`  --mode ${mode.padEnd(modeColumnWidth)}  ${ACCOUNT_MODE_DESCRIPTIONS[mode]}`,
+	);
+}
+
+/**
+ * Pure renderer for the full --help text. Exported so tests can assert on
+ * its content directly (loop ACCOUNT_MODES) instead of spawning the CLI.
+ */
+export function renderHelpText(version: string): string {
+	return `
+🎯 better-ccflare v${version} - Load Balancer for Claude
+
+Usage: better-ccflare [options]
+
+Options:
+  --version, -v       Show version number
+  --serve              Start API server with dashboard
+  --port <number>      Server port (default: 8080, or PORT env var)
+  --ssl-key <path>     Path to SSL private key file (enables HTTPS)
+  --ssl-cert <path>    Path to SSL certificate file (enables HTTPS)
+  --stats              Show statistics (JSON output)
+  --add-account <name> Add a new account
+    --mode <${ACCOUNT_MODES.join("|")}>  Account mode (default: claude-oauth)
+${formatModeHelpBreakdown()}
+    --priority <number>   Account priority (default: 0)
+  --list               List all accounts
+  --remove <name>      Remove an account
+  --reauthenticate <name> Re-authenticate an account (preserves metadata)
+  --pause <name>       Pause an account
+  --resume <name>      Resume an account
+  --force-reset-rate-limit <name> Force-clear stale rate-limit lock for an account
+  --set-priority <name> <priority>  Set account priority
+
+${getManagedRoutingHelpText()}
+
+  --analyze            Analyze database performance
+  --repair-db          Check and repair database integrity
+  --doctor             Run database integrity check and storage diagnostics
+  --doctor-full        Run exhaustive integrity check (slower)
+  --doctor-recover     Generate recovery instructions for corrupted database
+  --resolve-family-policy-aliases  Rewrite stored family-alias values (e.g. "opus") to
+                       their currently-resolved concrete models (run before rolling back
+                       to a pre-alias-feature binary)
+  --cache-flight-recorder-report <id>  Report a retained recorder timeline
+    --json             Emit exactly one structured JSON object
+  --cache-flight-recorder-health       Show minimal recorder health
+    --json             Emit exactly one structured JSON object
+  --reset-stats        Reset usage statistics
+  --clear-history      Clear request history
+  --compact            Compact database (WAL checkpoint + VACUUM)
+  --get-model          Show current default agent model
+  --set-model <model>  Set default agent model (opus-4 or sonnet-4)
+
+API Key Management:
+  --generate-api-key <name>  Generate a new API key
+    --admin                  Grant admin privileges (dashboard access)
+  --list-api-keys            List all API keys
+  --disable-api-key <name>   Disable an API key
+  --enable-api-key <name>    Enable a disabled API key
+  --delete-api-key <name>    Delete an API key permanently
+
+Debugging:
+  --show-config              Show all configuration variables with their sources
+  --help, -h                 Show this help message
+
+Examples:
+  better-ccflare --serve                # Start server
+  better-ccflare --serve --ssl-key /path/to/key.pem --ssl-cert /path/to/cert.pem  # Start server with HTTPS
+  better-ccflare --add-account work --mode claude-oauth --priority 0  # Add account
+  better-ccflare --add-account my-bedrock --mode bedrock --profile default  # Add Bedrock account
+  better-ccflare --reauthenticate work  # Re-authenticate account (preserves metadata)
+  better-ccflare --force-reset-rate-limit work  # Force-clear stale rate-limit lock
+  better-ccflare --pause work           # Pause account
+  better-ccflare --analyze              # Run performance analysis
+  better-ccflare --stats                # View stats
+  better-ccflare --generate-api-key "My App"  # Generate API-only key
+  better-ccflare --generate-api-key "Admin Key" --admin  # Generate admin key
+  better-ccflare --list-api-keys               # List all API keys
+  better-ccflare --disable-api-key "My App"    # Disable an API key
+`;
+}
+
+/**
+ * Pure renderer for the "Available modes" error printed when --add-account
+ * is given without --mode. Exported so tests can assert on its content
+ * directly instead of spawning the CLI.
+ */
+export function renderAddAccountModeUsageError(): string {
+	return [
+		"Available modes:",
+		...formatModeUsageLines(),
+		"",
+		"Example:",
+		"  better-ccflare --add-account work --mode claude-oauth --priority 0",
+	].join("\n");
+}
+
 interface ParsedArgs {
 	version: boolean;
 	help: boolean;
@@ -62,22 +239,7 @@ interface ParsedArgs {
 	sslCert: string | null;
 	stats: boolean;
 	addAccount: string | null;
-	mode:
-		| "claude-oauth"
-		| "console"
-		| "zai"
-		| "minimax"
-		| "anthropic-compatible"
-		| "openai-compatible"
-		| "nanogpt"
-		| "bedrock"
-		| "kilo"
-		| "alibaba-coding-plan"
-		| "codex"
-		| "xai"
-		| "ollama"
-		| "muse-spark"
-		| null;
+	mode: AccountMode | null;
 	priority: number | null;
 	profile: string | null;
 	crossRegionMode?: "geographic" | "global" | "regional";
@@ -169,7 +331,10 @@ function fastExit(code: 0 | 1 | 2 = 0): never {
 /**
  * Helper function to suggest similar mode values for common typos
  */
-function getModeSuggestions(input: string, validModes: string[]): string[] {
+function getModeSuggestions(
+	input: string,
+	validModes: readonly string[],
+): string[] {
 	const suggestions: string[] = [];
 
 	for (const mode of validModes) {
@@ -538,22 +703,7 @@ function parseArgs(args: string[]): ParsedArgs {
 					console.error("❌ --mode requires a value");
 					fastExit(1);
 				}
-				let modeValue = args[++i] as
-					| "claude-oauth"
-					| "console"
-					| "zai"
-					| "minimax"
-					| "anthropic-compatible"
-					| "openai-compatible"
-					| "nanogpt"
-					| "bedrock"
-					| "kilo"
-					| "alibaba-coding-plan"
-					| "codex"
-					| "xai"
-					| "ollama"
-					| "muse-spark"
-					| "max";
+				let modeValue = args[++i] as AccountMode | "max";
 
 				// Handle deprecated "max" mode with warning
 				if (modeValue === "max") {
@@ -563,58 +713,13 @@ function parseArgs(args: string[]): ParsedArgs {
 					modeValue = "claude-oauth";
 				}
 
-				parsed.mode = modeValue as
-					| "claude-oauth"
-					| "console"
-					| "zai"
-					| "minimax"
-					| "nanogpt"
-					| "anthropic-compatible"
-					| "openai-compatible"
-					| "bedrock"
-					| "kilo"
-					| "alibaba-coding-plan"
-					| "codex"
-					| "xai"
-					| "ollama"
-					| "muse-spark";
-				const validModes: Array<
-					| "claude-oauth"
-					| "console"
-					| "zai"
-					| "minimax"
-					| "nanogpt"
-					| "anthropic-compatible"
-					| "openai-compatible"
-					| "bedrock"
-					| "kilo"
-					| "alibaba-coding-plan"
-					| "codex"
-					| "xai"
-					| "ollama"
-					| "muse-spark"
-				> = [
-					"claude-oauth",
-					"console",
-					"zai",
-					"minimax",
-					"nanogpt",
-					"anthropic-compatible",
-					"openai-compatible",
-					"bedrock",
-					"kilo",
-					"alibaba-coding-plan",
-					"codex",
-					"xai",
-					"ollama",
-					"muse-spark",
-				];
-				if (!validModes.includes(modeValue)) {
+				parsed.mode = modeValue as AccountMode;
+				if (!ACCOUNT_MODES.includes(modeValue)) {
 					console.error(`❌ Invalid mode: ${modeValue}`);
-					console.error(`Valid modes: ${validModes.join(", ")}`);
+					console.error(`Valid modes: ${ACCOUNT_MODES.join(", ")}`);
 
 					// Provide suggestions for common typos
-					const suggestions = getModeSuggestions(modeValue, validModes);
+					const suggestions = getModeSuggestions(modeValue, ACCOUNT_MODES);
 					if (suggestions.length > 0) {
 						console.error(`Did you mean: ${suggestions.join(", ")}?`);
 					}
@@ -1037,90 +1142,7 @@ async function main() {
 	if (parsed.help) {
 		// Use sync version to avoid async overhead
 		const version = getVersionSync();
-		console.log(`
-🎯 better-ccflare v${version} - Load Balancer for Claude
-
-Usage: better-ccflare [options]
-
-Options:
-  --version, -v       Show version number
-  --serve              Start API server with dashboard
-  --port <number>      Server port (default: 8080, or PORT env var)
-  --ssl-key <path>     Path to SSL private key file (enables HTTPS)
-  --ssl-cert <path>    Path to SSL certificate file (enables HTTPS)
-  --stats              Show statistics (JSON output)
-  --add-account <name> Add a new account
-    --mode <claude-oauth|console|zai|minimax|nanogpt|anthropic-compatible|openai-compatible|bedrock|kilo|alibaba-coding-plan|codex|xai>  Account mode (default: claude-oauth)
-      claude-oauth: Claude CLI account (OAuth)
-      console: Claude API account (OAuth)
-      zai: z.ai account (API key)
-      minimax: Minimax account (API key)
-      nanogpt: NanoGPT provider (API key)
-      anthropic-compatible: Anthropic-compatible provider (API key)
-      openai-compatible: OpenAI-compatible provider (API key)
-      bedrock: AWS Bedrock account (AWS profile credentials)
-        --profile <name>  AWS profile name from ~/.aws/credentials (required)
-        --cross-region-mode <mode>   Cross-region inference mode: geographic (default), global, or regional
-      kilo: Kilo Gateway provider (API key)
-      alibaba-coding-plan: Alibaba Coding Plan International provider (API key)
-      codex: Codex (OpenAI OAuth) provider
-      xai: xAI/Grok provider (imports local Grok CLI OAuth credentials)
-    --priority <number>   Account priority (default: 0)
-  --list               List all accounts
-  --remove <name>      Remove an account
-  --reauthenticate <name> Re-authenticate an account (preserves metadata)
-  --pause <name>       Pause an account
-  --resume <name>      Resume an account
-  --force-reset-rate-limit <name> Force-clear stale rate-limit lock for an account
-  --set-priority <name> <priority>  Set account priority
-
-${getManagedRoutingHelpText()}
-
-  --analyze            Analyze database performance
-  --repair-db          Check and repair database integrity
-  --doctor             Run database integrity check and storage diagnostics
-  --doctor-full        Run exhaustive integrity check (slower)
-  --doctor-recover     Generate recovery instructions for corrupted database
-  --resolve-family-policy-aliases  Rewrite stored family-alias values (e.g. "opus") to
-                       their currently-resolved concrete models (run before rolling back
-                       to a pre-alias-feature binary)
-  --cache-flight-recorder-report <id>  Report a retained recorder timeline
-    --json             Emit exactly one structured JSON object
-  --cache-flight-recorder-health       Show minimal recorder health
-    --json             Emit exactly one structured JSON object
-  --reset-stats        Reset usage statistics
-  --clear-history      Clear request history
-  --compact            Compact database (WAL checkpoint + VACUUM)
-  --get-model          Show current default agent model
-  --set-model <model>  Set default agent model (opus-4 or sonnet-4)
-
-API Key Management:
-  --generate-api-key <name>  Generate a new API key
-    --admin                  Grant admin privileges (dashboard access)
-  --list-api-keys            List all API keys
-  --disable-api-key <name>   Disable an API key
-  --enable-api-key <name>    Enable a disabled API key
-  --delete-api-key <name>    Delete an API key permanently
-
-Debugging:
-  --show-config              Show all configuration variables with their sources
-  --help, -h                 Show this help message
-
-Examples:
-  better-ccflare --serve                # Start server
-  better-ccflare --serve --ssl-key /path/to/key.pem --ssl-cert /path/to/cert.pem  # Start server with HTTPS
-  better-ccflare --add-account work --mode claude-oauth --priority 0  # Add account
-  better-ccflare --add-account my-bedrock --mode bedrock --profile default  # Add Bedrock account
-  better-ccflare --reauthenticate work  # Re-authenticate account (preserves metadata)
-  better-ccflare --force-reset-rate-limit work  # Force-clear stale rate-limit lock
-  better-ccflare --pause work           # Pause account
-  better-ccflare --analyze              # Run performance analysis
-  better-ccflare --stats                # View stats
-  better-ccflare --generate-api-key "My App"  # Generate API-only key
-  better-ccflare --generate-api-key "Admin Key" --admin  # Generate admin key
-  better-ccflare --list-api-keys               # List all API keys
-  better-ccflare --disable-api-key "My App"    # Disable an API key
-`);
+		console.log(renderHelpText(version));
 		fastExit(0);
 		return;
 	}
@@ -1274,35 +1296,7 @@ Examples:
 		// Require explicit --mode flag to avoid silent defaults
 		if (!parsed.mode) {
 			console.error("❌ Please provide --mode to specify account type");
-			console.error("Available modes:");
-			console.error(
-				"  --mode claude-oauth    Claude CLI OAuth account (Max subscription)",
-			);
-			console.error("  --mode console         Claude API account (OAuth)");
-			console.error("  --mode zai             z.ai account (API key)");
-			console.error("  --mode minimax         Minimax account (API key)");
-			console.error("  --mode nanogpt         NanoGPT account (API key)");
-			console.error(
-				"  --mode anthropic-compatible  Anthropic-compatible provider",
-			);
-			console.error(
-				"  --mode openai-compatible     OpenAI-compatible provider",
-			);
-			console.error("  --mode bedrock         AWS Bedrock (AWS profile)");
-			console.error("  --mode kilo            Kilo Gateway provider (API key)");
-			console.error(
-				"  --mode alibaba-coding-plan  Alibaba Coding Plan International (API key)",
-			);
-			console.error(
-				"  --mode codex               Codex (OpenAI OAuth) provider",
-			);
-			console.error(
-				"  --mode xai                 xAI/Grok (Grok CLI OAuth) provider",
-			);
-			console.error("\nExample:");
-			console.error(
-				"  better-ccflare --add-account work --mode claude-oauth --priority 0",
-			);
+			console.error(renderAddAccountModeUsageError());
 			await exitGracefully(1);
 		}
 

@@ -5,6 +5,570 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { ensureSchema, runMigrations } from "../src/migrations";
 
+function sqliteColumns(db: Database, table: string): string[] {
+	return (
+		db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
+	).map((column) => column.name);
+}
+
+function sqliteIndexes(db: Database, table: string): string[] {
+	return (
+		db.prepare(`PRAGMA index_list(${table})`).all() as Array<{ name: string }>
+	).map((index) => index.name);
+}
+
+function sqliteForeignKeys(
+	db: Database,
+	table: string,
+): Array<{ from: string; table: string; to: string }> {
+	return db.prepare(`PRAGMA foreign_key_list(${table})`).all() as Array<{
+		from: string;
+		table: string;
+		to: string;
+	}>;
+}
+
+describe("Cache flight cohort seal migrations", () => {
+	it("creates fresh SQLite registry tables, nullable turn reference, foreign keys, and cleanup indexes", () => {
+		const db = new Database(":memory:");
+		db.run("PRAGMA foreign_keys = ON");
+		try {
+			ensureSchema(db);
+			runMigrations(db);
+
+			const tables = (
+				db
+					.prepare(
+						"SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'cache_flight_recorder_%' ORDER BY name",
+					)
+					.all() as Array<{ name: string }>
+			).map((row) => row.name);
+			expect(tables).toEqual([
+				"cache_flight_recorder_conversations",
+				"cache_flight_recorder_partitions",
+				"cache_flight_recorder_service_epochs",
+				"cache_flight_recorder_tombstones",
+				"cache_flight_recorder_turns",
+			]);
+
+			expect(sqliteColumns(db, "cache_flight_recorder_service_epochs")).toEqual(
+				[
+					"id",
+					"seal_contract_version",
+					"deployment_revision",
+					"service_instance_id",
+					"process_started_at",
+					"native_cache_state",
+					"recorder_state",
+					"keepalive_global_ttl_minutes",
+					"keepalive_xai_ttl_minutes",
+					"keepalive_effective_xai_enabled",
+					"keepalive_effective_xai_ttl_minutes",
+					"occurrence_id",
+					"completeness",
+					"unavailable_dimensions",
+					"created_at",
+					"last_verified_at",
+				],
+			);
+			expect(sqliteColumns(db, "cache_flight_recorder_partitions")).toEqual([
+				"id",
+				"service_epoch_id",
+				"serving_account_scope",
+				"route_model_epoch",
+				"completeness",
+				"unavailable_dimensions",
+				"seal_completeness",
+				"seal_unavailable_dimensions",
+				"created_at",
+				"last_verified_at",
+			]);
+			const turnColumn = (
+				db
+					.prepare("PRAGMA table_info(cache_flight_recorder_turns)")
+					.all() as Array<{ name: string; notnull: number }>
+			).find((column) => column.name === "observation_partition_id");
+			expect(turnColumn).toEqual(
+				expect.objectContaining({
+					name: "observation_partition_id",
+					notnull: 0,
+				}),
+			);
+
+			expect(sqliteForeignKeys(db, "cache_flight_recorder_partitions")).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						from: "service_epoch_id",
+						table: "cache_flight_recorder_service_epochs",
+						to: "id",
+					}),
+				]),
+			);
+			expect(sqliteForeignKeys(db, "cache_flight_recorder_turns")).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						from: "observation_partition_id",
+						table: "cache_flight_recorder_partitions",
+						to: "id",
+					}),
+				]),
+			);
+
+			expect(sqliteIndexes(db, "cache_flight_recorder_turns")).toEqual(
+				expect.arrayContaining([
+					"idx_cache_flight_recorder_turns_partition",
+					"idx_cache_flight_recorder_turns_cleanup",
+				]),
+			);
+			expect(sqliteIndexes(db, "cache_flight_recorder_partitions")).toEqual(
+				expect.arrayContaining([
+					"idx_cache_flight_recorder_partitions_epoch",
+					"idx_cache_flight_recorder_partitions_last_verified_at",
+				]),
+			);
+			expect(sqliteIndexes(db, "cache_flight_recorder_service_epochs")).toEqual(
+				expect.arrayContaining([
+					"idx_cache_flight_recorder_service_epochs_last_verified_at",
+				]),
+			);
+
+			// last_verified_at must stay nullable on a fresh install: it must
+			// match the ALTER TABLE upgrade path below, which has always
+			// added the column without NOT NULL (see the backfill comment
+			// there for why a DEFAULT would be wrong too).
+			const serviceEpochLastVerifiedAt = (
+				db
+					.prepare("PRAGMA table_info(cache_flight_recorder_service_epochs)")
+					.all() as Array<{ name: string; notnull: number }>
+			).find((column) => column.name === "last_verified_at");
+			expect(serviceEpochLastVerifiedAt?.notnull).toBe(0);
+			const partitionLastVerifiedAt = (
+				db
+					.prepare("PRAGMA table_info(cache_flight_recorder_partitions)")
+					.all() as Array<{ name: string; notnull: number }>
+			).find((column) => column.name === "last_verified_at");
+			expect(partitionLastVerifiedAt?.notnull).toBe(0);
+		} finally {
+			db.close();
+		}
+	});
+
+	it("permits a pre-diff binary's registryStatements() INSERT (which never mentions last_verified_at) to succeed on a fresh-install schema — rollback compatibility", () => {
+		const db = new Database(":memory:");
+		db.run("PRAGMA foreign_keys = ON");
+		try {
+			ensureSchema(db);
+			runMigrations(db);
+
+			// This is the exact column list (and therefore param count) the
+			// pre-diff binary's registryStatements() used: it stops at
+			// created_at and never supplies last_verified_at. If the
+			// fresh-install CREATE TABLE declared last_verified_at NOT NULL,
+			// rolling back to that binary against a database created fresh
+			// after this column shipped would fail every registry write with
+			// a NOT NULL constraint violation.
+			expect(() => {
+				db.prepare(`
+					INSERT INTO cache_flight_recorder_service_epochs (
+						id, seal_contract_version, deployment_revision, service_instance_id,
+						process_started_at, native_cache_state, recorder_state,
+						keepalive_global_ttl_minutes, keepalive_xai_ttl_minutes,
+						keepalive_effective_xai_enabled, keepalive_effective_xai_ttl_minutes,
+						occurrence_id, completeness, unavailable_dimensions, created_at
+					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				`).run(
+					"rollback-epoch-id",
+					1,
+					"deploy",
+					"service",
+					"2026-01-01T00:00:00.000Z",
+					"enabled",
+					"enabled",
+					20,
+					20,
+					1,
+					20,
+					"occurrence",
+					"complete",
+					"[]",
+					12_345,
+				);
+			}).not.toThrow();
+
+			expect(() => {
+				db.prepare(`
+					INSERT INTO cache_flight_recorder_partitions (
+						id, service_epoch_id, serving_account_scope, route_model_epoch,
+						completeness, unavailable_dimensions, seal_completeness,
+						seal_unavailable_dimensions, created_at
+					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+				`).run(
+					"rollback-partition-id",
+					"rollback-epoch-id",
+					"scope",
+					"route",
+					"complete",
+					"[]",
+					"complete",
+					"[]",
+					67_890,
+				);
+			}).not.toThrow();
+
+			const insertedEpoch = db
+				.prepare(
+					"SELECT last_verified_at FROM cache_flight_recorder_service_epochs WHERE id = ?",
+				)
+				.get("rollback-epoch-id") as { last_verified_at: number | null };
+			expect(insertedEpoch.last_verified_at).toBeNull();
+			const insertedPartition = db
+				.prepare(
+					"SELECT last_verified_at FROM cache_flight_recorder_partitions WHERE id = ?",
+				)
+				.get("rollback-partition-id") as { last_verified_at: number | null };
+			expect(insertedPartition.last_verified_at).toBeNull();
+		} finally {
+			db.close();
+		}
+	});
+
+	it("upgrades legacy service-epoch and partition registries by adding and backfilling last_verified_at", () => {
+		const db = new Database(":memory:");
+		db.run("PRAGMA foreign_keys = ON");
+		try {
+			// Recreate the pre-migration registry shape by hand (no
+			// last_verified_at column): ensureSchema() now creates the column
+			// directly on a fresh install, so a fresh install can never
+			// exercise the ALTER TABLE upgrade path under test here.
+			db.exec(`
+				CREATE TABLE cache_flight_recorder_service_epochs (
+					id TEXT PRIMARY KEY,
+					seal_contract_version INTEGER NOT NULL,
+					deployment_revision TEXT,
+					service_instance_id TEXT,
+					process_started_at TEXT,
+					native_cache_state TEXT,
+					recorder_state TEXT,
+					keepalive_global_ttl_minutes INTEGER,
+					keepalive_xai_ttl_minutes INTEGER,
+					keepalive_effective_xai_enabled INTEGER,
+					keepalive_effective_xai_ttl_minutes INTEGER,
+					occurrence_id TEXT,
+					completeness TEXT NOT NULL,
+					unavailable_dimensions TEXT NOT NULL DEFAULT '[]',
+					created_at INTEGER NOT NULL
+				);
+				CREATE TABLE cache_flight_recorder_partitions (
+					id TEXT PRIMARY KEY,
+					service_epoch_id TEXT NOT NULL,
+					serving_account_scope TEXT,
+					route_model_epoch TEXT,
+					completeness TEXT NOT NULL,
+					unavailable_dimensions TEXT NOT NULL DEFAULT '[]',
+					seal_completeness TEXT NOT NULL,
+					seal_unavailable_dimensions TEXT NOT NULL DEFAULT '[]',
+					created_at INTEGER NOT NULL,
+					FOREIGN KEY (service_epoch_id)
+						REFERENCES cache_flight_recorder_service_epochs(id)
+						ON DELETE CASCADE
+				);
+				CREATE TABLE cache_flight_recorder_conversations (
+					recorder_conversation_id TEXT PRIMARY KEY,
+					created_at INTEGER NOT NULL,
+					updated_at INTEGER NOT NULL,
+					incomplete INTEGER NOT NULL DEFAULT 0,
+					dropped_events INTEGER NOT NULL DEFAULT 0
+				);
+				CREATE TABLE cache_flight_recorder_tombstones (
+					recorder_conversation_id TEXT PRIMARY KEY,
+					expires_at INTEGER NOT NULL
+				);
+				CREATE TABLE cache_flight_recorder_turns (
+					recorder_conversation_id TEXT NOT NULL,
+					sequence INTEGER NOT NULL,
+					timestamp TEXT NOT NULL,
+					identity_fingerprint TEXT,
+					serving_account_id TEXT,
+					prefix_fingerprint TEXT,
+					cache_outcome TEXT NOT NULL,
+					input_tokens INTEGER,
+					cached_tokens INTEGER,
+					completeness TEXT NOT NULL,
+					unavailable_dimensions TEXT NOT NULL DEFAULT '[]',
+					gap_before INTEGER NOT NULL DEFAULT 0,
+					PRIMARY KEY (recorder_conversation_id, sequence),
+					FOREIGN KEY (recorder_conversation_id)
+						REFERENCES cache_flight_recorder_conversations(recorder_conversation_id)
+						ON DELETE CASCADE
+				);
+			`);
+			db.prepare(`
+				INSERT INTO cache_flight_recorder_service_epochs (
+					id, seal_contract_version, deployment_revision, service_instance_id,
+					process_started_at, native_cache_state, recorder_state,
+					keepalive_global_ttl_minutes, keepalive_xai_ttl_minutes,
+					keepalive_effective_xai_enabled, keepalive_effective_xai_ttl_minutes,
+					occurrence_id, completeness, unavailable_dimensions, created_at
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			`).run(
+				"legacy-epoch-id",
+				1,
+				"deploy",
+				"service",
+				"2026-01-01T00:00:00.000Z",
+				"enabled",
+				"enabled",
+				20,
+				20,
+				1,
+				20,
+				"occurrence",
+				"complete",
+				"[]",
+				12_345,
+			);
+			db.prepare(`
+				INSERT INTO cache_flight_recorder_partitions (
+					id, service_epoch_id, serving_account_scope, route_model_epoch,
+					completeness, unavailable_dimensions, seal_completeness,
+					seal_unavailable_dimensions, created_at
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			`).run(
+				"legacy-partition-id",
+				"legacy-epoch-id",
+				"scope",
+				"route",
+				"complete",
+				"[]",
+				"complete",
+				"[]",
+				67_890,
+			);
+
+			runMigrations(db);
+
+			expect(
+				sqliteColumns(db, "cache_flight_recorder_service_epochs"),
+			).toContain("last_verified_at");
+			expect(sqliteColumns(db, "cache_flight_recorder_partitions")).toContain(
+				"last_verified_at",
+			);
+
+			// Backfill choice: existing rows are treated as last verified when
+			// created (conservative — matches pre-migration sweep eligibility
+			// exactly), not backfilled to "now".
+			const epochRow = db
+				.prepare(
+					`SELECT created_at, last_verified_at
+					 FROM cache_flight_recorder_service_epochs WHERE id = ?`,
+				)
+				.get("legacy-epoch-id") as {
+				created_at: number;
+				last_verified_at: number;
+			};
+			expect(epochRow.last_verified_at).toBe(epochRow.created_at);
+			expect(epochRow.last_verified_at).toBe(12_345);
+
+			const partitionRow = db
+				.prepare(
+					`SELECT created_at, last_verified_at
+					 FROM cache_flight_recorder_partitions WHERE id = ?`,
+				)
+				.get("legacy-partition-id") as {
+				created_at: number;
+				last_verified_at: number;
+			};
+			expect(partitionRow.last_verified_at).toBe(partitionRow.created_at);
+			expect(partitionRow.last_verified_at).toBe(67_890);
+
+			// The new covering indexes must also be installed on the upgrade
+			// path, not just on a fresh install.
+			expect(sqliteIndexes(db, "cache_flight_recorder_partitions")).toEqual(
+				expect.arrayContaining([
+					"idx_cache_flight_recorder_partitions_last_verified_at",
+				]),
+			);
+			expect(sqliteIndexes(db, "cache_flight_recorder_service_epochs")).toEqual(
+				expect.arrayContaining([
+					"idx_cache_flight_recorder_service_epochs_last_verified_at",
+				]),
+			);
+
+			// Fresh installs and upgraded databases must agree on
+			// last_verified_at's nullability — both nullable, never NOT
+			// NULL — otherwise the two paths diverge on what a pre-diff
+			// binary is allowed to write.
+			const upgradedNotNull = (
+				db
+					.prepare("PRAGMA table_info(cache_flight_recorder_service_epochs)")
+					.all() as Array<{ name: string; notnull: number }>
+			).find((column) => column.name === "last_verified_at")?.notnull;
+			expect(upgradedNotNull).toBe(0);
+			const upgradedPartitionNotNull = (
+				db
+					.prepare("PRAGMA table_info(cache_flight_recorder_partitions)")
+					.all() as Array<{ name: string; notnull: number }>
+			).find((column) => column.name === "last_verified_at")?.notnull;
+			expect(upgradedPartitionNotNull).toBe(0);
+
+			const freshDb = new Database(":memory:");
+			try {
+				ensureSchema(freshDb);
+				runMigrations(freshDb);
+				const freshNotNull = (
+					freshDb
+						.prepare("PRAGMA table_info(cache_flight_recorder_service_epochs)")
+						.all() as Array<{ name: string; notnull: number }>
+				).find((column) => column.name === "last_verified_at")?.notnull;
+				const freshPartitionNotNull = (
+					freshDb
+						.prepare("PRAGMA table_info(cache_flight_recorder_partitions)")
+						.all() as Array<{ name: string; notnull: number }>
+				).find((column) => column.name === "last_verified_at")?.notnull;
+				expect(freshNotNull).toBe(upgradedNotNull);
+				expect(freshPartitionNotNull).toBe(upgradedPartitionNotNull);
+			} finally {
+				freshDb.close();
+			}
+		} finally {
+			db.close();
+		}
+	});
+
+	it("upgrades legacy recorder rows without inferred seals and preserves prior-binary SQL compatibility", () => {
+		const db = new Database(":memory:");
+		db.run("PRAGMA foreign_keys = ON");
+		try {
+			db.exec(`
+				CREATE TABLE cache_flight_recorder_conversations (
+					recorder_conversation_id TEXT PRIMARY KEY,
+					created_at INTEGER NOT NULL,
+					updated_at INTEGER NOT NULL,
+					incomplete INTEGER NOT NULL DEFAULT 0,
+					dropped_events INTEGER NOT NULL DEFAULT 0
+				);
+				CREATE TABLE cache_flight_recorder_tombstones (
+					recorder_conversation_id TEXT PRIMARY KEY,
+					expires_at INTEGER NOT NULL
+				);
+				CREATE TABLE cache_flight_recorder_turns (
+					recorder_conversation_id TEXT NOT NULL,
+					sequence INTEGER NOT NULL,
+					timestamp TEXT NOT NULL,
+					identity_fingerprint TEXT,
+					serving_account_id TEXT,
+					prefix_fingerprint TEXT,
+					cache_outcome TEXT NOT NULL,
+					input_tokens INTEGER,
+					cached_tokens INTEGER,
+					completeness TEXT NOT NULL,
+					unavailable_dimensions TEXT NOT NULL DEFAULT '[]',
+					gap_before INTEGER NOT NULL DEFAULT 0,
+					PRIMARY KEY (recorder_conversation_id, sequence),
+					FOREIGN KEY (recorder_conversation_id)
+						REFERENCES cache_flight_recorder_conversations(recorder_conversation_id)
+						ON DELETE CASCADE
+				);
+			`);
+			db.prepare(`
+				INSERT INTO cache_flight_recorder_conversations
+					(recorder_conversation_id, created_at, updated_at, incomplete, dropped_events)
+				VALUES (?, ?, ?, 0, 0)
+			`).run("legacy-id", 1_000, 1_000);
+			db.prepare(`
+				INSERT INTO cache_flight_recorder_turns (
+					recorder_conversation_id, sequence, timestamp,
+					identity_fingerprint, serving_account_id, prefix_fingerprint,
+					cache_outcome, input_tokens, cached_tokens, completeness,
+					unavailable_dimensions, gap_before
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			`).run(
+				"legacy-id",
+				0,
+				new Date(1_000).toISOString(),
+				"identity",
+				"account",
+				"prefix",
+				"hit",
+				100,
+				80,
+				"complete",
+				"[]",
+				0,
+			);
+
+			runMigrations(db);
+
+			expect(sqliteColumns(db, "cache_flight_recorder_turns")).toContain(
+				"observation_partition_id",
+			);
+			const historical = db
+				.prepare(
+					`SELECT observation_partition_id
+					 FROM cache_flight_recorder_turns
+					 WHERE recorder_conversation_id = ? AND sequence = 0`,
+				)
+				.get("legacy-id") as { observation_partition_id: string | null };
+			expect(historical.observation_partition_id).toBeNull();
+
+			db.prepare(`
+				INSERT INTO cache_flight_recorder_turns (
+					recorder_conversation_id, sequence, timestamp,
+					identity_fingerprint, serving_account_id, prefix_fingerprint,
+					cache_outcome, input_tokens, cached_tokens, completeness,
+					unavailable_dimensions, gap_before
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			`).run(
+				"legacy-id",
+				1,
+				new Date(2_000).toISOString(),
+				"identity",
+				"account",
+				"prefix",
+				"miss",
+				110,
+				0,
+				"complete",
+				"[]",
+				0,
+			);
+			const legacyRead = db
+				.prepare(
+					`SELECT sequence, cache_outcome
+					 FROM cache_flight_recorder_turns
+					 WHERE recorder_conversation_id = ?
+					 ORDER BY sequence`,
+				)
+				.all("legacy-id") as Array<{
+				sequence: number;
+				cache_outcome: string;
+			}>;
+			expect(legacyRead).toEqual([
+				{ sequence: 0, cache_outcome: "hit" },
+				{ sequence: 1, cache_outcome: "miss" },
+			]);
+
+			db.prepare(
+				"DELETE FROM cache_flight_recorder_conversations WHERE recorder_conversation_id = ?",
+			).run("legacy-id");
+			const remainingTurns = db
+				.prepare(
+					"SELECT COUNT(*) AS count FROM cache_flight_recorder_turns WHERE recorder_conversation_id = ?",
+				)
+				.get("legacy-id") as { count: number };
+			expect(remainingTurns.count).toBe(0);
+			expect(
+				sqliteColumns(db, "cache_flight_recorder_service_epochs"),
+			).toContain("seal_contract_version");
+			expect(sqliteColumns(db, "cache_flight_recorder_partitions")).toContain(
+				"seal_completeness",
+			);
+		} finally {
+			db.close();
+		}
+	});
+});
+
 describe("Database Migrations - Tier Column Removal", () => {
 	let db: Database;
 
