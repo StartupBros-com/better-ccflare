@@ -374,6 +374,7 @@ describe("UsageCollector request lifecycle", () => {
 					from: HAIKU_MODEL,
 					to: OPUS_MODEL,
 					iterationCount: 2,
+					priced: "iterations",
 				},
 			});
 		});
@@ -463,6 +464,7 @@ describe("UsageCollector request lifecycle", () => {
 				from: HAIKU_MODEL,
 				to: OPUS_MODEL,
 				iterationCount: 2,
+				priced: "iterations",
 			});
 		});
 
@@ -647,6 +649,7 @@ describe("UsageCollector request lifecycle", () => {
 				from: OPUS_MODEL,
 				to: OPUS_MODEL,
 				iterationCount: 2,
+				priced: "iterations",
 			});
 		});
 
@@ -743,6 +746,99 @@ describe("UsageCollector request lifecycle", () => {
 				from: OPUS_MODEL,
 				to: OPUS_MODEL,
 				iterationCount: 64,
+				priced: "iterations",
+			});
+		});
+
+		it("keeps split pricing when a fallback stream has a non-empty iteration snapshot", async () => {
+			useDeterministicModelPricing();
+			const { collector, savedUsages } = harness();
+			const requestId = "stream-fallback-non-empty-iterations";
+			const fallbackLogs = captureFallbackUsageLogs();
+
+			try {
+				collector.handleStart(makeStartMessage(requestId));
+				collector.handleChunk(
+					requestId,
+					new TextEncoder().encode(
+						`event: message_start\ndata: {"type":"message_start","message":{"model":"${FABLE_MODEL}","usage":{"input_tokens":23,"output_tokens":0}}}\n\nevent: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"fallback","from":{"model":"${FABLE_MODEL}"},"to":{"model":"${OPUS_MODEL}"}}}\n\nevent: message_delta\ndata: {"type":"message_delta","usage":{"input_tokens":23,"output_tokens":29,"iterations":[{"type":"message","model":"${FABLE_MODEL}","input_tokens":2,"output_tokens":3},{"type":"fallback_message","model":"${OPUS_MODEL}","input_tokens":11,"output_tokens":13}]}}\n\n`,
+					),
+				);
+				await collector.handleEnd({ type: "end", requestId, success: true });
+				await collector.drain();
+			} finally {
+				fallbackLogs.stop();
+			}
+
+			expect(savedUsages.get(requestId)).toMatchObject({
+				model: OPUS_MODEL,
+				costUsd: 314,
+			});
+			expect(estimateCostUSD).toHaveBeenCalledTimes(2);
+			expect(estimateCostUSD).toHaveBeenNthCalledWith(1, FABLE_MODEL, {
+				inputTokens: 2,
+				outputTokens: 3,
+				cacheReadInputTokens: undefined,
+				cacheCreationInputTokens: undefined,
+			});
+			expect(estimateCostUSD).toHaveBeenNthCalledWith(2, OPUS_MODEL, {
+				inputTokens: 11,
+				outputTokens: 13,
+				cacheReadInputTokens: undefined,
+				cacheCreationInputTokens: undefined,
+			});
+			expect(fallbackLogs.events).toHaveLength(1);
+			expect(fallbackLogs.events[0]?.data).toEqual({
+				requestId,
+				from: FABLE_MODEL,
+				to: OPUS_MODEL,
+				iterationCount: 2,
+				priced: "iterations",
+			});
+		});
+
+		it("uses serving-model top-level pricing when fallback iterations are missing", async () => {
+			useDeterministicModelPricing();
+			const { collector, savedUsages } = harness();
+			const requestId = "stream-fallback-without-iterations";
+			const fallbackLogs = captureFallbackUsageLogs();
+
+			try {
+				collector.handleStart(makeStartMessage(requestId));
+				collector.handleChunk(
+					requestId,
+					new TextEncoder().encode(
+						`event: message_start\ndata: {"type":"message_start","message":{"model":"${FABLE_MODEL}","usage":{"input_tokens":23,"output_tokens":0}}}\n\nevent: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"fallback","from":{"model":"${FABLE_MODEL}"},"to":{"model":"${OPUS_MODEL}"}}}\n\nevent: message_delta\ndata: {"type":"message_delta","usage":{"input_tokens":23,"output_tokens":29,"cache_read_input_tokens":31,"cache_creation_input_tokens":37}}\n\n`,
+					),
+				);
+				await collector.handleEnd({ type: "end", requestId, success: true });
+				await collector.drain();
+			} finally {
+				fallbackLogs.stop();
+			}
+
+			expect(savedUsages.get(requestId)).toMatchObject({
+				model: OPUS_MODEL,
+				costUsd: 80_826,
+				inputTokens: 23,
+				outputTokens: 29,
+				cacheReadInputTokens: 31,
+				cacheCreationInputTokens: 37,
+			});
+			expect(estimateCostUSD).toHaveBeenCalledTimes(1);
+			expect(estimateCostUSD).toHaveBeenCalledWith(OPUS_MODEL, {
+				inputTokens: 23,
+				outputTokens: 29,
+				cacheReadInputTokens: 31,
+				cacheCreationInputTokens: 37,
+			});
+			expect(fallbackLogs.events).toHaveLength(1);
+			expect(fallbackLogs.events[0]?.data).toEqual({
+				requestId,
+				from: FABLE_MODEL,
+				to: OPUS_MODEL,
+				iterationCount: 0,
+				priced: "top_level",
 			});
 		});
 
@@ -778,6 +874,7 @@ describe("UsageCollector request lifecycle", () => {
 			expect(savedUsages.get(requestId)).toMatchObject({
 				model: OPUS_MODEL,
 				tokensPerSecond: 2,
+				costUsd: 204,
 			});
 			expect(fallbackLogs.events).toHaveLength(1);
 		});

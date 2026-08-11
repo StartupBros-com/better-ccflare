@@ -757,14 +757,13 @@ export class UsageCollector {
 		}
 
 		// Calculate total tokens and cost
-		const hasFallbackBillingSplit =
+		const iterations = state.usage.iterations ?? [];
+		const hasFallbackSignal =
 			state.fallbackBlockSeen === true ||
-			state.usage.iterations?.some(
-				(iteration) => iteration.type === "fallback_message",
-			) === true;
+			iterations.some((iteration) => iteration.type === "fallback_message");
+		const hasFallbackBillingSplit = hasFallbackSignal && iterations.length > 0;
 		if (state.usage.model) {
 			const model = state.usage.model;
-			const iterations = state.usage.iterations ?? [];
 			// Use provider's authoritative count if available, fallback to computed
 			const finalOutputTokens =
 				state.providerFinalOutputTokens ??
@@ -901,7 +900,7 @@ export class UsageCollector {
 		}
 
 		const iterationCount = state.usage.iterations?.length ?? 0;
-		if (hasFallbackBillingSplit) {
+		if (hasFallbackSignal) {
 			let fallbackFromModel = state.fallbackFromModel;
 			if (!fallbackFromModel && state.usage.iterations) {
 				for (let i = state.usage.iterations.length - 1; i >= 0; i--) {
@@ -917,6 +916,7 @@ export class UsageCollector {
 				from: fallbackFromModel ?? state.usage.model,
 				to: state.usage.model,
 				iterationCount,
+				priced: hasFallbackBillingSplit ? "iterations" : "top_level",
 			});
 		}
 
