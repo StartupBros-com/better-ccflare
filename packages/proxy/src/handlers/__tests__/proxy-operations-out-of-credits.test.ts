@@ -958,6 +958,55 @@ describe("proxyWithAccount — generic Anthropic 429 scope", () => {
 		]);
 	});
 
+	// Issue #157, reproduced end to end. A restart wipes the in-memory usage
+	// cache, so the classifier has no snapshot and correctly reads a hard-status
+	// 429 as account-wide. The trap is the DURATION: the upstream reset header
+	// carries the per-model Fable window, days out, and the ceiling clamped it to
+	// a 12h account bench. On 2026-08-11 that removed three healthy accounts 19
+	// seconds after a deploy and ~60 requests died as 503 route_unavailable.
+	//
+	// Account scope still stands here — the fix is that an unattributable reset
+	// buys a probe, not half a day.
+	it("gives a cold-cache account bench a probe cooldown, not the reset ceiling", async () => {
+		usageCache.delete("acc-anthropic-1");
+		globalThis.fetch = mock(async () =>
+			generic429Response({
+				"anthropic-ratelimit-unified-status": "rate_limited",
+				"anthropic-ratelimit-unified-reset": String(
+					Math.floor((INCIDENT_NOW + 3 * 24 * 60 * 60 * 1000) / 1000),
+				),
+			}),
+		);
+		const ctx = makeProxyContextWithAsyncExec();
+		const account = makeAccount();
+		const bodyBuffer = makeRequestBody("claude-fable-5");
+		const req = makeRequest(bodyBuffer);
+
+		await proxyWithAccount(
+			req,
+			new URL("https://proxy.local/v1/messages"),
+			account,
+			makeRequestMeta(),
+			bodyBuffer,
+			() => undefined,
+			0,
+			ctx,
+		);
+
+		expect(getRequestRateLimitOutcomes(req)).toEqual([
+			expect.objectContaining({
+				scope: "account",
+				reason: "hard_response_signal",
+			}),
+		]);
+		expect(account.rate_limited_until).not.toBeNull();
+		const heldForMs = (account.rate_limited_until as number) - INCIDENT_NOW;
+		expect(heldForMs).toBeGreaterThan(0);
+		// The incident value was exactly the 12h ceiling. Anything near it is the
+		// bug; a probe-scale hold is the fix.
+		expect(heldForMs).toBeLessThan(60 * 60 * 1000);
+	});
+
 	it("keeps an unknown concrete model account-scoped", async () => {
 		cacheIncidentUsage("acc-anthropic-1", INCIDENT_NOW - 120_000);
 		globalThis.fetch = mock(async () => generic429Response());
@@ -1350,7 +1399,10 @@ describe("proxyWithAccount — scoped same-account model continuation", () => {
 				scope: "account",
 				family: "fable",
 				attemptedModel: "claude-fable-5",
-				reason: "hard_response_signal",
+				// weekly_all is spent, so the verdict is reported against that
+				// window rather than the bare header — and because the window is
+				// attributable, the upstream reset still sizes the hold.
+				reason: "account_capacity_signal",
 				availableAt: INCIDENT_NOW + 120_000,
 			}),
 		]);
@@ -1916,7 +1968,9 @@ describe("proxyWithAccount — scoped failures returned by a 529 retry", () => {
 				expect(getRequestRateLimitOutcomes(req)).toEqual([
 					expect.objectContaining({
 						scope: "account",
-						reason: "hard_response_signal",
+						// weekly_all spent -> attributable window, so the reason
+						// names the capacity evidence rather than the header.
+						reason: "account_capacity_signal",
 						availableAt: account.rate_limited_until,
 					}),
 				]);
