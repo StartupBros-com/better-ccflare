@@ -47,6 +47,7 @@ interface RequestState {
 	chunks: Uint8Array[];
 	chunksBytes: number;
 	chunksTruncated: boolean;
+	usagePayloadSeq?: number;
 	usage: {
 		model?: string;
 		inputTokens?: number;
@@ -60,6 +61,7 @@ interface RequestState {
 		costUsd?: number;
 		tokensPerSecond?: number;
 		iterations?: UsageIteration[];
+		iterationsSeq?: number;
 		fallbackIterationSeen?: boolean;
 		fallbackIterationModel?: string;
 		iterationsTruncated?: boolean;
@@ -229,6 +231,7 @@ function captureUsageIterations(usage: unknown, state: RequestState): void {
 	// Each provider payload is a complete snapshot. A later array supersedes
 	// the earlier one, including when every later entry is invalid.
 	state.usage.iterations = iterations;
+	state.usage.iterationsSeq = state.usagePayloadSeq;
 	state.usage.fallbackIterationSeen = fallbackIterationSeen;
 	state.usage.fallbackIterationModel = fallbackIterationModel;
 	state.usage.iterationsTruncated = rawIterations.length > MAX_USAGE_ITERATIONS;
@@ -250,6 +253,7 @@ function extractUsageFromJson(
 	state: RequestState,
 ): void {
 	if (!json) return;
+	const normalizedModel = normalizeNonEmptyString(json.model);
 	if (Array.isArray(json.content)) {
 		for (const rawContentBlock of json.content) {
 			if (
@@ -276,17 +280,18 @@ function extractUsageFromJson(
 					: undefined,
 			);
 			if (fromModel) state.fallbackFromModel = fromModel;
-			if (toModel && json.model === undefined) state.usage.model = toModel;
+			if (toModel && !normalizedModel) state.usage.model = toModel;
 		}
 	}
 
 	const usageObj = json.usage;
 	if (!usageObj) return;
 
+	state.usagePayloadSeq = (state.usagePayloadSeq ?? 0) + 1;
 	captureUsageIterations(usageObj, state);
 	// The non-stream response model is authoritative over both fallback signals.
-	state.usage.model = json.model ?? state.usage.model;
-	if (normalizeNonEmptyString(json.model)) {
+	state.usage.model = normalizedModel ?? state.usage.model;
+	if (normalizedModel) {
 		state.servingModelAuthoritative = true;
 	}
 
@@ -319,6 +324,12 @@ function extractUsageFromData(
 ): void {
 	try {
 		const parsed = JSON.parse(data);
+		let usagePayloadCounted = false;
+		const countUsagePayload = () => {
+			if (usagePayloadCounted) return;
+			usagePayloadCounted = true;
+			state.usagePayloadSeq = (state.usagePayloadSeq ?? 0) + 1;
+		};
 
 		// Handle message_start - check both parsed.type and eventType
 		// (Some providers put type in event line, Anthropic puts it in JSON)
@@ -327,6 +338,7 @@ function extractUsageFromData(
 		if (isMessageStart) {
 			if (parsed.message?.usage) {
 				const usage = parsed.message.usage;
+				countUsagePayload();
 				captureUsageIterations(usage, state);
 				if (usage.input_tokens !== undefined) {
 					state.usage.inputTokens = usage.input_tokens;
@@ -373,6 +385,7 @@ function extractUsageFromData(
 			state.lastTokenTimestamp = Date.now();
 
 			if (parsed.usage) {
+				countUsagePayload();
 				captureUsageIterations(parsed.usage, state);
 				// Update all token counts from message_delta (authoritative for zai)
 				if (parsed.usage.output_tokens !== undefined) {
@@ -402,6 +415,7 @@ function extractUsageFromData(
 
 		// Handle any usage field in the data
 		if (parsed.usage) {
+			countUsagePayload();
 			captureUsageIterations(parsed.usage, state);
 			if (parsed.usage.input_tokens !== undefined) {
 				state.usage.inputTokens = parsed.usage.input_tokens;
@@ -469,9 +483,13 @@ function freeRequestState(state: RequestState): void {
 	state.chunksBytes = 0;
 	state.buffer = "";
 	state.usage.iterations = undefined;
+	state.usage.iterationsSeq = undefined;
 	state.usage.fallbackIterationSeen = undefined;
 	state.usage.fallbackIterationModel = undefined;
 	state.usage.iterationsTruncated = undefined;
+	state.usagePayloadSeq = undefined;
+	state.fallbackBlockSeen = undefined;
+	state.fallbackFromModel = undefined;
 	state.servingModelAuthoritative = undefined;
 	// Release request body and headers held in startMessage.
 	// Without this, orphaned requests retain full request bodies until the
@@ -796,10 +814,12 @@ export class UsageCollector {
 		const hasFallbackSignal =
 			state.fallbackBlockSeen === true ||
 			state.usage.fallbackIterationSeen === true;
+		const iterationsStale = state.usage.iterationsSeq !== state.usagePayloadSeq;
 		const hasFallbackBillingSplit =
 			hasFallbackSignal &&
 			iterations.length > 0 &&
-			state.usage.iterationsTruncated !== true;
+			state.usage.iterationsTruncated !== true &&
+			!iterationsStale;
 		if (state.usage.model) {
 			const model = state.usage.model;
 			// Use provider's authoritative count if available, fallback to computed
@@ -957,6 +977,9 @@ export class UsageCollector {
 				priced: hasFallbackBillingSplit ? "iterations" : "top_level",
 				...(state.usage.iterationsTruncated === true
 					? { iterationsTruncated: true }
+					: {}),
+				...(iterations.length > 0 && iterationsStale
+					? { iterationsStale: true }
 					: {}),
 			});
 		}
