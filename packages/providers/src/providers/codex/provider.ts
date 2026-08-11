@@ -42,6 +42,7 @@ import type {
 	RateLimitInfo,
 	TokenRefreshResult,
 } from "../../types";
+import { CODEX_REASONING_RETENTION_PREFIX } from "../../utils/codex-reasoning-retention";
 import {
 	CODEX_SINGLE_ORCHESTRATION_ROOT_ENV,
 	deriveConversationIdentity,
@@ -380,7 +381,7 @@ const TOOL_ARGS_PER_CALL_BYTE_CAP =
 	BUFFER_SIZES.TOOL_ARGUMENTS_PER_CALL_MAX_BYTES;
 const TOOL_ARGS_TOTAL_BYTE_CAP = BUFFER_SIZES.TOOL_ARGUMENTS_TOTAL_MAX_BYTES;
 const byteEncoder = new TextEncoder();
-const CODEX_REASONING_RETENTION_PREFIX = "bccfr1.";
+const CODEX_REASONING_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
 
 // When enabled, telemetry reports the effective Codex context capacity rather
 // than the raw model maximum.
@@ -682,6 +683,7 @@ interface StreamState {
 	traceNewToolCalls: ToolCallSummary[];
 	traceReasoningOutputItemCount: number;
 	traceReasoningEncryptedPresent: boolean;
+	traceReasoningUnrepresentableIdSkipCount: number;
 	// Wrapped redacted_thinking payloads whose emission is deferred while a
 	// function-call block is still streaming: emitting mid-lifecycle would
 	// interleave block lifecycles on the wire (pro-gate P1, PR #139).
@@ -744,6 +746,8 @@ function writeCodexStreamTerminalTrace(
 			{
 				outputItemCount: state.traceReasoningOutputItemCount,
 				encryptedPresent: state.traceReasoningEncryptedPresent,
+				unrepresentableIdSkipCount:
+					state.traceReasoningUnrepresentableIdSkipCount,
 			},
 		),
 	});
@@ -2029,8 +2033,10 @@ export class CodexProvider extends BaseProvider {
 						separatorIndex,
 					);
 					const encryptedContent = block.data.slice(separatorIndex + 1);
+					// Older builds could mint bccfr1 blocks with an empty id. Drop those
+					// legacy poison blocks so a live transcript cannot replay a guaranteed 400.
 					if (
-						/^[A-Za-z0-9_-]*$/.test(reasoningId) &&
+						CODEX_REASONING_ID_PATTERN.test(reasoningId) &&
 						encryptedContent.length > 0
 					) {
 						flushText();
@@ -2767,6 +2773,7 @@ export class CodexProvider extends BaseProvider {
 			traceNewToolCalls: [],
 			traceReasoningOutputItemCount: 0,
 			traceReasoningEncryptedPresent: false,
+			traceReasoningUnrepresentableIdSkipCount: 0,
 			pendingReasoningBlocks: [],
 			traceRequestId: requestId,
 			traceAttemptId: attemptId,
@@ -3596,44 +3603,49 @@ export class CodexProvider extends BaseProvider {
 					typeof encryptedReasoning === "string" &&
 					encryptedReasoning.length > 0
 				) {
-					await ensureMessageStart();
-					// The wrapper is dot-delimited, and the replay parser accepts
-					// [A-Za-z0-9_-] ids only — an id outside that set must degrade to ""
-					// at emit time or our own block would fail its own parse on replay.
 					const rawReasoningId = typeof item?.id === "string" ? item.id : "";
-					const reasoningId = /^[A-Za-z0-9_-]*$/.test(rawReasoningId)
-						? rawReasoningId
-						: "";
-					const reasoningData = `${CODEX_REASONING_RETENTION_PREFIX}${reasoningId}.${encryptedReasoning}`;
+					if (CODEX_REASONING_ID_PATTERN.test(rawReasoningId)) {
+						await ensureMessageStart();
+						const reasoningData = `${CODEX_REASONING_RETENTION_PREFIX}${rawReasoningId}.${encryptedReasoning}`;
 
-					if (
-						state.functionCallBlocks.size > 0 ||
-						state.hasSentContentBlockStart
-					) {
-						// ANY still-open block (streaming tool call or live text) defers
-						// emission: closing a live text block here would orphan its later
-						// deltas at an index with no content_block_start. Flushed after
-						// the owning output item closes, or at stream end.
-						state.pendingReasoningBlocks.push(reasoningData);
+						if (
+							state.functionCallBlocks.size > 0 ||
+							state.hasSentContentBlockStart
+						) {
+							// ANY still-open block (streaming tool call or live text) defers
+							// emission: closing a live text block here would orphan its later
+							// deltas at an index with no content_block_start. Flushed after
+							// the owning output item closes, or at stream end.
+							state.pendingReasoningBlocks.push(reasoningData);
+							break;
+						}
+
+						const reasoningBlockIndex = state.contentBlockIndex;
+						await writeSSE("content_block_start", {
+							type: "content_block_start",
+							index: reasoningBlockIndex,
+							content_block: {
+								type: "redacted_thinking",
+								data: reasoningData,
+							},
+						});
+						state.hasSentContentBlockStart = true;
+						await writeSSE("content_block_stop", {
+							type: "content_block_stop",
+							index: reasoningBlockIndex,
+						});
+						state.contentBlockIndex++;
+						state.hasSentContentBlockStart = false;
 						break;
 					}
-
-					const reasoningBlockIndex = state.contentBlockIndex;
-					await writeSSE("content_block_start", {
-						type: "content_block_start",
-						index: reasoningBlockIndex,
-						content_block: {
-							type: "redacted_thinking",
-							data: reasoningData,
-						},
-					});
-					state.hasSentContentBlockStart = true;
-					await writeSSE("content_block_stop", {
-						type: "content_block_stop",
-						index: reasoningBlockIndex,
-					});
-					state.contentBlockIndex++;
-					state.hasSentContentBlockStart = false;
+					// An encrypted item without a representable id cannot be replayed,
+					// so nothing is minted. Do NOT fall through to the generic close
+					// below: a reasoning item never owns the open content block, and
+					// closing someone else's block here orphans its later deltas at an
+					// index with no content_block_start (the interleaving bug fixed for
+					// minted blocks in PR #139, on the skip path). The owning output
+					// item's own `done` closes it.
+					state.traceReasoningUnrepresentableIdSkipCount++;
 					break;
 				}
 

@@ -4,15 +4,6 @@ import { AnthropicDegradedResponseLifecycle } from "../../anthropic-degraded-res
 import type { AnthropicDegradedRequestSendState } from "../proxy-operations";
 import type { ProxyContext } from "../proxy-types";
 
-// Source worktrees intentionally omit generated database worker bundles. This
-// harness injects dbOps and never constructs the database classes.
-mock.module("@better-ccflare/database", () => ({
-	AsyncDbWriter: class AsyncDbWriter {},
-	DatabaseFactory: class DatabaseFactory {},
-	DatabaseOperations: class DatabaseOperations {},
-	ModelTranslationRepository: class ModelTranslationRepository {},
-}));
-
 const { proxyWithAccount } = await import("../proxy-operations");
 
 /**

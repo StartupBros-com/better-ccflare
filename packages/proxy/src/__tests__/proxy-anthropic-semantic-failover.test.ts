@@ -47,13 +47,6 @@ import type { UsageCollector } from "../usage-collector";
 
 // Loading proxy.ts in a focused unit test must not require ignored embedded
 // worker artifacts from the CLI build.
-mock.module("@better-ccflare/database", () => ({
-	AsyncDbWriter: class AsyncDbWriter {},
-	DatabaseFactory: class DatabaseFactory {},
-	DatabaseOperations: class DatabaseOperations {},
-	ModelTranslationRepository: class ModelTranslationRepository {},
-}));
-
 // Records every response handed to cancelDiscardedResponseBody, so the
 // "bounds hanging JSON classifiers inside the same private attempt deadline"
 // test below can observe the release of the abandoned original branch. When

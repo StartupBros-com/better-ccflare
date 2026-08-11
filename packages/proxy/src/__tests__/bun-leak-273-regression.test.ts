@@ -115,7 +115,13 @@ describe("issue #273 — Group A: helper contract", () => {
 // `discardUpstreamBody`, which since the v3.5.48 sync delegates to
 // `cancelDiscardedResponseBody` (the chunked-drain primitive). Call sites
 // therefore appear under either name; both are drain-backed.
-const EXPECTED_SITE_COUNT = 14;
+//
+// This is a census, not a ceiling: a new body-replacing retry legitimately adds
+// a site, and the count moves with it in the same commit. What the guard
+// catches is a site DISAPPEARING (a leak) or being added without the drain.
+// 15 since the Codex reasoning strip-and-retry (issue #144) joined the
+// thinking-signature, clear-thinking, cache-control and breakpoint retries.
+const EXPECTED_SITE_COUNT = 15;
 
 describe("issue #273 — Group B: call-site coverage in proxy-operations.ts", () => {
 	it("proxy-operations.ts has the expected drain-backed discard call sites", () => {

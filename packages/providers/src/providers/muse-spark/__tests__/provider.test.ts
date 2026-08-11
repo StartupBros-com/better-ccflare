@@ -284,6 +284,34 @@ describe("MuseSparkProvider", () => {
 			expect(body).not.toHaveProperty("thinking");
 		});
 
+		it("strips proxy-minted retained reasoning while retaining genuine Anthropic blocks", async () => {
+			const body = await bodyOf(
+				await provider.transformRequestBody(
+					jsonRequest({
+						model: "muse-spark-1.2",
+						max_tokens: 64,
+						messages: [
+							{
+								role: "assistant",
+								content: [
+									{ type: "redacted_thinking", data: "bccfr1.rs_strip.cipher" },
+									{ type: "redacted_thinking", data: "anthropic-genuine" },
+								],
+							},
+						],
+					}),
+					account,
+				),
+			);
+
+			expect(body.messages).toEqual([
+				{
+					role: "assistant",
+					content: [{ type: "redacted_thinking", data: "anthropic-genuine" }],
+				},
+			]);
+		});
+
 		it("leaves a non-JSON body untouched", async () => {
 			const request = new Request("https://proxy.local/v1/messages", {
 				method: "POST",
@@ -362,6 +390,45 @@ describe("MuseSparkProvider", () => {
 				await provider.transformRequestBody(request, account),
 			);
 			expect(body).toEqual(original);
+		});
+
+		it("filters retained reasoning on non-Messages JSON endpoints without applying the Messages sanitizer", async () => {
+			const body = await bodyOf(
+				await provider.transformRequestBody(
+					new Request("https://proxy.local/v1/files", {
+						method: "POST",
+						headers: { "content-type": "application/json" },
+						body: JSON.stringify({
+							purpose: "assistants",
+							unknown_file_field: true,
+							messages: [
+								{
+									role: "assistant",
+									content: [
+										{
+											type: "redacted_thinking",
+											data: "bccfr1.rs_strip.cipher",
+										},
+										{ type: "redacted_thinking", data: "anthropic-genuine" },
+									],
+								},
+							],
+						}),
+					}),
+					account,
+				),
+			);
+
+			expect(body).toEqual({
+				purpose: "assistants",
+				unknown_file_field: true,
+				messages: [
+					{
+						role: "assistant",
+						content: [{ type: "redacted_thinking", data: "anthropic-genuine" }],
+					},
+				],
+			});
 		});
 	});
 

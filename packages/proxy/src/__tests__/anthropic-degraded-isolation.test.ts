@@ -9,13 +9,6 @@ import { DegradedModeObservability } from "../anthropic-degraded-observability";
 import { DegradedOwnerOverlay } from "../degraded-owner-overlay";
 import type { ProxyContext } from "../handlers/proxy-types";
 
-mock.module("@better-ccflare/database", () => ({
-	AsyncDbWriter: class AsyncDbWriter {},
-	DatabaseFactory: class DatabaseFactory {},
-	DatabaseOperations: class DatabaseOperations {},
-	ModelTranslationRepository: class ModelTranslationRepository {},
-}));
-
 const usageCollectorModule = await import("../usage-collector");
 spyOn(usageCollectorModule, "getUsageCollector").mockReturnValue({
 	handleStart: mock(() => undefined),

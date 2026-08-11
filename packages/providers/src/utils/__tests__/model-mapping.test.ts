@@ -139,6 +139,55 @@ describe("transformRequestBodyModel", () => {
 		expect(resultBody.messages).toEqual([{ role: "user", content: "test" }]);
 	});
 
+	it("keeps raw JSON bytes exact when neither mapping nor filtering changes the body", async () => {
+		const raw =
+			'{\n  "model" : "same-model", "messages" : [{"role":"assistant","content":[{"type":"redacted_thinking","data":"anthropic-genuine"}]}]\n}';
+		const result = await transformRequestBodyModel(
+			new Request("http://test.com", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: raw,
+			}),
+			undefined,
+			() => "same-model",
+		);
+
+		expect(await result.text()).toBe(raw);
+	});
+
+	it("serializes once when mapping and retention filtering change the body", async () => {
+		const result = await transformRequestBodyModel(
+			new Request("http://test.com", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					model: "source-model",
+					messages: [
+						{
+							role: "assistant",
+							content: [
+								{ type: "redacted_thinking", data: "bccfr1.rs_strip.cipher" },
+								{ type: "redacted_thinking", data: "anthropic-genuine" },
+							],
+						},
+					],
+				}),
+			}),
+			undefined,
+			() => "mapped-model",
+		);
+
+		expect(await result.json()).toEqual({
+			model: "mapped-model",
+			messages: [
+				{
+					role: "assistant",
+					content: [{ type: "redacted_thinking", data: "anthropic-genuine" }],
+				},
+			],
+		});
+	});
+
 	it("handles provider-specific mapping callback", async () => {
 		const requestBody = {
 			model: "claude-sonnet-4-5-20250929",

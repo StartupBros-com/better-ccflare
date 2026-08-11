@@ -1,12 +1,4 @@
-import { describe, expect, it, mock } from "bun:test";
-
-// Focused source-worktree tests must not require generated database workers.
-mock.module("@better-ccflare/database", () => ({
-	AsyncDbWriter: class AsyncDbWriter {},
-	DatabaseFactory: class DatabaseFactory {},
-	DatabaseOperations: class DatabaseOperations {},
-	ModelTranslationRepository: class ModelTranslationRepository {},
-}));
+import { describe, expect, it } from "bun:test";
 
 const { createReadyServerToolReplayRuntimeForTest } = await import(
 	"./server-tool-replay-runtime"

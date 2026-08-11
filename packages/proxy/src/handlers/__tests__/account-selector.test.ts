@@ -20,15 +20,6 @@ import { CacheAffinityOrderer } from "../../cache-affinity-orderer";
 import { DegradedOwnerOverlay } from "../../degraded-owner-overlay";
 import type { ProxyContext } from "../proxy-types";
 
-// Focused source-worktree tests do not have the ignored CLI-embedded database
-// workers. Keep account selection tests independent of those packaged artifacts.
-mock.module("@better-ccflare/database", () => ({
-	AsyncDbWriter: class AsyncDbWriter {},
-	DatabaseFactory: class DatabaseFactory {},
-	DatabaseOperations: class DatabaseOperations {},
-	ModelTranslationRepository: class ModelTranslationRepository {},
-}));
-
 const { getProvider, registerProvider, usageCache } = await import(
 	"@better-ccflare/providers"
 );
