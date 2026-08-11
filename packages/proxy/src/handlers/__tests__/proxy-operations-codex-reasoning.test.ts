@@ -329,6 +329,38 @@ describe("isCodexReasoningVerificationError", () => {
 	});
 });
 
+it("matches a verification 400 that carries no content-type header", async () => {
+	// The Codex backend routinely omits content-type; a copied
+	// application/json gate skipped the check and left the conversation
+	// wedged (measured live 2026-08-11).
+	const response = new Response(
+		JSON.stringify({
+			error: {
+				message:
+					"The encrypted content for item rs_wrongid00 could not be verified. Reason: Encrypted content item_id did not match the target item id.",
+			},
+		}),
+		{ status: 400 },
+	);
+	expect(response.headers.get("content-type")).toBe(null);
+	expect(await isCodexReasoningVerificationError(response)).toBe(true);
+});
+
+it("matches the item_id mismatch reason wording", async () => {
+	const response = jsonErrorResponse(
+		"The encrypted content for item rs_x could not be verified. Reason: Encrypted content item_id did not match the target item id.",
+	);
+	expect(await isCodexReasoningVerificationError(response)).toBe(true);
+});
+
+it("still ignores unrelated 400s without a content-type", async () => {
+	const response = new Response(
+		JSON.stringify({ error: { message: "model not found" } }),
+		{ status: 400 },
+	);
+	expect(await isCodexReasoningVerificationError(response)).toBe(false);
+});
+
 describe("filterCodexReasoningBlocks", () => {
 	it("removes only proxy-minted reasoning blocks from assistant arrays", () => {
 		const original = {

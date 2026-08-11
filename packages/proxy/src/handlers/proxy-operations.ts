@@ -1124,14 +1124,19 @@ export async function isCodexReasoningVerificationError(
 	readJson: ResponseJsonReader = readResponseCloneJson,
 ): Promise<boolean> {
 	if (response.status !== 400) return false;
+	// A MISSING content-type is allowed here, unlike the Anthropic-facing
+	// classifiers above. The Codex backend routinely answers without one — the
+	// provider already logs and works around that on the success path ("Codex
+	// returned successful response without SSE content-type"). Measured on the
+	// live wire 2026-08-11: an item-id mismatch returned a 400 whose JSON body
+	// carried the verification message but no content-type at all, so a copied
+	// `includes("application/json")` gate skipped the check and left the
+	// conversation wedged. An explicitly non-JSON content-type still short
+	// circuits, which keeps the issue-#356 discipline: never tee a body we
+	// cannot parse.
 	const contentType = response.headers.get("content-type");
-	if (!contentType?.includes("application/json")) return false;
+	if (contentType && !contentType.includes("application/json")) return false;
 
-	// Cloned only after the content-type gate above. Cloning before it would
-	// tee the body and then return early for every non-JSON body, stranding
-	// that copy unread — the tee keeps buffering for whoever consumes the
-	// original. Reachable in normal operation: providers such as Qwen do
-	// return non-JSON error bodies. See issue #356.
 	const json = (await readJson(response)) as {
 		error?: { message?: unknown };
 	} | null;
@@ -1143,10 +1148,18 @@ export async function isCodexReasoningVerificationError(
 	}
 
 	const message = rawMessage.toLowerCase();
+	// Observed wordings (live, 2026-08-11):
+	//   "The encrypted content for item <id> could not be verified. Reason:
+	//    Encrypted content could not be decrypted or parsed."
+	//   "The encrypted content for item <id> could not be verified. Reason:
+	//    Encrypted content item_id did not match the target item id."
+	// Both share the "encrypted content" subject; the reason clause varies, so
+	// match the subject plus any known failure phrasing rather than one reason.
 	return (
 		message.includes("encrypted content") &&
 		(message.includes("could not be verified") ||
-			message.includes("could not be decrypted"))
+			message.includes("could not be decrypted") ||
+			message.includes("did not match"))
 	);
 }
 
