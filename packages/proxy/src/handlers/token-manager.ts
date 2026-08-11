@@ -449,6 +449,15 @@ export async function refreshAccessTokenSafe(
 	account: Account,
 	ctx: ProxyContext,
 ): Promise<string> {
+	// (finding 5) Join an in-flight refresh FIRST — before backoff — so a
+	// concurrent caller shares the outcome instead of failing on a backoff
+	// seeded by an earlier, unrelated failure (e.g. the auto-refresh
+	// scheduler registers its own in-flight promise into this same map;
+	// a request-triggered caller must join that refresh, not bounce off a
+	// stale backoff record for the account).
+	const inFlight = ctx.refreshInFlight.get(account.id);
+	if (inFlight) return inFlight;
+
 	// Proactively clean expired entries before checking
 	cleanupExpiredFailures();
 
@@ -578,7 +587,7 @@ export async function refreshAccessTokenSafe(
 					),
 				);
 
-				// 2. Update the live in-memory account object immediately
+				// Update the live in-memory account object immediately
 				// This prevents subsequent requests from seeing stale token data
 				account.access_token = result.accessToken;
 				account.expires_at = result.expiresAt;
@@ -638,8 +647,12 @@ export async function refreshAccessTokenSafe(
 				throw wrappedError;
 			})
 			.finally(() => {
-				// Clean up the map when done (success or failure)
-				ctx.refreshInFlight.delete(account.id);
+				// (finding 4) Identity-safe: never delete a newer entry installed by
+				// a manual reauth or cache-clear that ran while this promise was
+				// still settling.
+				if (ctx.refreshInFlight.get(account.id) === refreshPromise) {
+					ctx.refreshInFlight.delete(account.id);
+				}
 			});
 		ctx.refreshInFlight.set(account.id, refreshPromise);
 	}
