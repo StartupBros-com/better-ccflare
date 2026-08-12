@@ -83,7 +83,9 @@ export {
 	unregisterCodexUsageRefresher,
 } from "./token-manager";
 export {
+	type BindingConstraint,
 	createUsageThrottledResponse,
+	getBindingConstraint,
 	getUsageThrottleStatus,
 	getUsageThrottleUntil,
 } from "./usage-throttling";

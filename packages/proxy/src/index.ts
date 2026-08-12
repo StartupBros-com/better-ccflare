@@ -111,6 +111,7 @@ export {
 	formatTokenHealthReport,
 	type GuardCorrelationVerifier,
 	getAccountsNeedingReauth,
+	getBindingConstraint,
 	getUsageThrottleStatus,
 	getUsageThrottleUntil,
 	getValidAccessToken,
