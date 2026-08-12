@@ -525,26 +525,6 @@ export function boundedAccountHoldReset(
 	return Math.min(provenReset, upstreamStatedReset);
 }
 
-/**
- * Is an account-scoped verdict backed by a window we can attribute to the
- * account, or only by a header that never says which window rejected the
- * request?
- *
- * Only `account_capacity_signal` carries positive evidence that the
- * account-wide window itself is spent, so only it may size a durable
- * account-wide hold from an upstream reset. `hard_response_signal` and
- * `spent_window_signal` are header-derived: correct as a *scope* call when no
- * fresh snapshot refutes them, but they name no window, and Anthropic puts the
- * per-model weekly reset in that header on a model-scoped 429. Sizing an
- * account hold from it is what turned a Fable-only cap into a 12h whole-account
- * bench when a restart left the usage cache cold (#157).
- *
- * Pairs with `ResetTimeScope` in rate-limit-cooldown.ts.
- */
-export function isAccountScopeConfirmed(reason: RateLimitScopeReason): boolean {
-	return reason === "account_capacity_signal";
-}
-
 export interface RequestRateLimitOutcome {
 	readonly accountId: string;
 	readonly status: number;
