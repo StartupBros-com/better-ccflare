@@ -8,6 +8,7 @@ import {
 	getAnthropicRateLimitResetAt,
 	getRequestRateLimitOutcomes,
 	hasHardAnthropicAccountSignal,
+	isAccountScopeConfirmed,
 	recordRequestRateLimitOutcome,
 } from "../rate-limit-scope";
 
@@ -297,7 +298,12 @@ describe("classifyPreByte429", () => {
 	// The widening path stays intact for every shape that does NOT positively prove a
 	// per-model cap. Under-benching a genuinely exhausted account costs repeated 429s,
 	// so narrowing is only ever allowed on affirmative evidence.
-	it("keeps a hard response header account scoped when the account-wide window is also spent", () => {
+	// Same account scope the header implies, but reported against the capacity
+	// evidence rather than the header. That distinction is load-bearing: only
+	// `account_capacity_signal` names a window attributable to the account, so
+	// only it lets the cooldown honour that window's reset instead of the probe
+	// backoff (see isAccountScopeConfirmed / ResetTimeScope, #157).
+	it("reports the spent account window as the reason, not the bare header", () => {
 		const decision = classifyPreByte429({
 			isAnthropic: true,
 			response: response({
@@ -308,7 +314,26 @@ describe("classifyPreByte429", () => {
 			now: NOW,
 		});
 		expect(decision.scope).toBe("account");
+		expect(decision.reason).toBe("account_capacity_signal");
+		expect(isAccountScopeConfirmed(decision.reason)).toBe(true);
+	});
+
+	// The cold-cache shape from #157: account scope is still the right call, but
+	// nothing attributes a window to it, so the cooldown must not be sized from
+	// the upstream reset.
+	it("marks a header-only account verdict as unconfirmed", () => {
+		const decision = classifyPreByte429({
+			isAnthropic: true,
+			response: response({
+				"anthropic-ratelimit-unified-status": "rate_limited",
+			}),
+			attemptedModel: "claude-fable-5",
+			snapshot: null,
+			now: NOW,
+		});
+		expect(decision.scope).toBe("account");
 		expect(decision.reason).toBe("hard_response_signal");
+		expect(isAccountScopeConfirmed(decision.reason)).toBe(false);
 	});
 
 	it("keeps a hard response header account scoped when no scoped cap matches the family", () => {

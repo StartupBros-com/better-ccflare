@@ -128,6 +128,7 @@ import {
 import {
 	classifyPreByte429,
 	getAnthropicRateLimitResetAt,
+	isAccountScopeConfirmed,
 	recordRequestRateLimitOutcome,
 } from "./rate-limit-scope";
 import { makeProxyRequest, validateProviderPath } from "./request-handler";
@@ -3999,7 +4000,17 @@ export async function proxyWithAccount(
 				const auditReason: RateLimitReason = "model_fallback_429";
 				await applyRateLimitCooldownAwaitingPersist(
 					account,
-					{ resetTime: cooldownUntil, reason: auditReason },
+					{
+						resetTime: cooldownUntil,
+						reason: auditReason,
+						// The upstream reset only sizes this account-wide hold when
+						// capacity evidence attributes it to the account window. A
+						// header-derived verdict (no fresh snapshot, or one that
+						// proved nothing) gets the probe backoff instead — see #157.
+						resetTimeScope: isAccountScopeConfirmed(decision.reason)
+							? "confirmed"
+							: "unattributed",
+					},
 					ctx,
 				);
 				routingAttemptLedger?.blockAccount(account.id);
