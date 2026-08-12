@@ -2175,6 +2175,214 @@ describe("UsageCollector request lifecycle", () => {
 			});
 		});
 
+		it("flags ambiguous model-less attribution when a zero-output modeled attempt is the only signal (#141)", async () => {
+			useDeterministicModelPricing();
+			const { collector, savedUsages } = harness();
+			const requestId =
+				"stream-compaction-zero-output-modeled-attempt-ambiguous";
+			const fallbackLogs = captureFallbackUsageLogs();
+
+			try {
+				collector.handleStart(makeStartMessage(requestId));
+				collector.handleChunk(
+					requestId,
+					new TextEncoder().encode(
+						`event: message_start\ndata: {"type":"message_start","message":{"model":"${FABLE_MODEL}","usage":{"input_tokens":23,"output_tokens":0}}}\n\nevent: response.completed\ndata: {"usage":{"input_tokens":23,"output_tokens":29,"cache_read_input_tokens":31,"cache_creation_input_tokens":37,"iterations":[{"type":"compaction","input_tokens":2,"output_tokens":3,"cache_read_input_tokens":5,"cache_creation_input_tokens":7},{"type":"message","model":"${FABLE_MODEL}","input_tokens":10,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},{"type":"fallback_message","model":"${OPUS_MODEL}","input_tokens":11,"output_tokens":13,"cache_read_input_tokens":17,"cache_creation_input_tokens":19}]}}\n\n`,
+					),
+				);
+				// The reviewer's failing shape (#141 v12, round 4): a zero-output
+				// FABLE attempt (a declined primary) sits between a model-less
+				// compaction and an OPUS fallback_message. FABLE produced no
+				// output, so the billable-only aggregate never sees it and
+				// distinctModeledKeys stays at 1 (OPUS only) — pre-fix, the
+				// compaction is silently priced at OPUS's rate instead of being
+				// flagged. FABLE is still a model that participated, so the fix
+				// must count it from the full observed-model set, not the
+				// billable aggregate.
+				await collector.handleEnd({ type: "end", requestId, success: true });
+				await collector.drain();
+			} finally {
+				fallbackLogs.stop();
+			}
+
+			expect(savedUsages.get(requestId)).toMatchObject({
+				model: OPUS_MODEL,
+				costUsd: 56_746,
+			});
+			expect(estimateCostUSD).toHaveBeenCalledTimes(2);
+			expect(estimateCostUSD).toHaveBeenNthCalledWith(1, OPUS_MODEL, {
+				inputTokens: 2,
+				outputTokens: 3,
+				cacheReadInputTokens: 5,
+				cacheCreationInputTokens: 7,
+			});
+			expect(estimateCostUSD).toHaveBeenNthCalledWith(2, OPUS_MODEL, {
+				inputTokens: 11,
+				outputTokens: 13,
+				cacheReadInputTokens: 17,
+				cacheCreationInputTokens: 19,
+			});
+			expect(fallbackLogs.events).toHaveLength(1);
+			expect(fallbackLogs.events[0]?.data).toEqual({
+				requestId,
+				from: FABLE_MODEL,
+				to: OPUS_MODEL,
+				iterationCount: 3,
+				priced: "iterations",
+				billingIncomplete: true,
+				unresolvedIterationModels: 1,
+			});
+		});
+
+		it("does not flag model-less attribution when the same model appears twice, once with zero output", async () => {
+			useDeterministicModelPricing();
+			const { collector, savedUsages } = harness();
+			const requestId =
+				"stream-compaction-single-model-zero-output-not-ambiguous";
+			const fallbackLogs = captureFallbackUsageLogs();
+
+			try {
+				collector.handleStart(makeStartMessage(requestId));
+				collector.handleChunk(
+					requestId,
+					new TextEncoder().encode(
+						`event: message_start\ndata: {"type":"message_start","message":{"model":"${FABLE_MODEL}","usage":{"input_tokens":23,"output_tokens":0}}}\n\nevent: response.completed\ndata: {"usage":{"input_tokens":23,"output_tokens":29,"cache_read_input_tokens":31,"cache_creation_input_tokens":37,"iterations":[{"type":"compaction","input_tokens":2,"output_tokens":3,"cache_read_input_tokens":5,"cache_creation_input_tokens":7},{"type":"message","model":"${OPUS_MODEL}","input_tokens":10,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},{"type":"fallback_message","model":"${OPUS_MODEL}","input_tokens":11,"output_tokens":13,"cache_read_input_tokens":17,"cache_creation_input_tokens":19}]}}\n\n`,
+					),
+				);
+				// Same shape as the zero-output-ambiguity test above, but the
+				// zero-output entry is OPUS (the same model as the
+				// fallback_message) rather than a third distinct model. Only one
+				// model was actually observed, so attributing the model-less
+				// compaction to it is unambiguous even though a zero-output
+				// entry is now part of the observed set.
+				await collector.handleEnd({ type: "end", requestId, success: true });
+				await collector.drain();
+			} finally {
+				fallbackLogs.stop();
+			}
+
+			expect(savedUsages.get(requestId)).toMatchObject({
+				model: OPUS_MODEL,
+				costUsd: 56_746,
+			});
+			expect(estimateCostUSD).toHaveBeenCalledTimes(2);
+			expect(estimateCostUSD).toHaveBeenNthCalledWith(1, OPUS_MODEL, {
+				inputTokens: 2,
+				outputTokens: 3,
+				cacheReadInputTokens: 5,
+				cacheCreationInputTokens: 7,
+			});
+			expect(estimateCostUSD).toHaveBeenNthCalledWith(2, OPUS_MODEL, {
+				inputTokens: 11,
+				outputTokens: 13,
+				cacheReadInputTokens: 17,
+				cacheCreationInputTokens: 19,
+			});
+			expect(fallbackLogs.events).toHaveLength(1);
+			expect(fallbackLogs.events[0]?.data).toEqual({
+				requestId,
+				from: OPUS_MODEL,
+				to: OPUS_MODEL,
+				iterationCount: 3,
+				priced: "iterations",
+			});
+		});
+
+		it("flags attribution as ambiguous when the observed-model set overflows its cap (fail toward flagging)", async () => {
+			useDeterministicModelPricing();
+			const { collector, savedUsages } = harness();
+			const requestId = "stream-compaction-overflow-models-forces-ambiguous";
+			const fallbackLogs = captureFallbackUsageLogs();
+
+			// 16 distinct zero-output padding models plus the OPUS
+			// fallback_message model below is 17 distinct observed models, one
+			// past MAX_BILLING_MODELS (16). None of the padding entries
+			// produced output, so they never reach estimateCostUSD — only the
+			// model-less compaction and the OPUS fallback_message are billable
+			// — but they must still count toward the observed set, overflowing
+			// its cap and forcing the ambiguity flag on rather than silently
+			// trusting an undercounted (capped) tally.
+			const paddingModels = Array.from(
+				{ length: 16 },
+				(_, i) => `overflow-model-${i + 1}`,
+			);
+			const iterations = [
+				{
+					type: "compaction",
+					input_tokens: 2,
+					output_tokens: 3,
+					cache_read_input_tokens: 5,
+					cache_creation_input_tokens: 7,
+				},
+				...paddingModels.map((model) => ({
+					type: "message",
+					model,
+					input_tokens: 1,
+					output_tokens: 0,
+				})),
+				{
+					type: "fallback_message",
+					model: OPUS_MODEL,
+					input_tokens: 11,
+					output_tokens: 13,
+					cache_read_input_tokens: 17,
+					cache_creation_input_tokens: 19,
+				},
+			];
+
+			try {
+				collector.handleStart(makeStartMessage(requestId));
+				collector.handleChunk(
+					requestId,
+					new TextEncoder().encode(
+						`event: message_start\ndata: {"type":"message_start","message":{"model":"${FABLE_MODEL}","usage":{"input_tokens":23,"output_tokens":0}}}\n\nevent: response.completed\ndata: ${JSON.stringify(
+							{
+								usage: {
+									input_tokens: 23,
+									output_tokens: 29,
+									cache_read_input_tokens: 31,
+									cache_creation_input_tokens: 37,
+									iterations,
+								},
+							},
+						)}\n\n`,
+					),
+				);
+				await collector.handleEnd({ type: "end", requestId, success: true });
+				await collector.drain();
+			} finally {
+				fallbackLogs.stop();
+			}
+
+			expect(savedUsages.get(requestId)).toMatchObject({
+				model: OPUS_MODEL,
+				costUsd: 56_746,
+			});
+			expect(estimateCostUSD).toHaveBeenCalledTimes(2);
+			expect(estimateCostUSD).toHaveBeenNthCalledWith(1, OPUS_MODEL, {
+				inputTokens: 2,
+				outputTokens: 3,
+				cacheReadInputTokens: 5,
+				cacheCreationInputTokens: 7,
+			});
+			expect(estimateCostUSD).toHaveBeenNthCalledWith(2, OPUS_MODEL, {
+				inputTokens: 11,
+				outputTokens: 13,
+				cacheReadInputTokens: 17,
+				cacheCreationInputTokens: 19,
+			});
+			expect(fallbackLogs.events).toHaveLength(1);
+			expect(fallbackLogs.events[0]?.data).toEqual({
+				requestId,
+				from: "overflow-model-16",
+				to: OPUS_MODEL,
+				iterationCount: 18,
+				priced: "iterations",
+				billingIncomplete: true,
+				unresolvedIterationModels: 1,
+			});
+		});
+
 		it("detects fallback from SSE event context without starting token timing", async () => {
 			useDeterministicModelPricing();
 			const { collector, savedUsages } = harness();

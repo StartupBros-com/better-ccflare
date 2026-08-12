@@ -86,6 +86,16 @@ interface RequestState {
 			}
 		>;
 		iterationsAggregateUsable?: boolean;
+		// Distinct non-empty model strings observed on ANY raw iteration entry,
+		// regardless of output_tokens — unlike iterationsAggregate, a
+		// zero-output modeled attempt (e.g. a declined primary) still counts
+		// here. Built over the FULL raw array in the same loop as the billing
+		// aggregate. Complete-snapshot state: replaced wholesale by a later
+		// snapshot exactly like `iterations`, cleared in freeRequestState.
+		// Bounded by MAX_BILLING_MODELS; overflow sets
+		// observedIterationModelsUsable to false rather than growing.
+		observedIterationModels?: Set<string>;
+		observedIterationModelsUsable?: boolean;
 	};
 	lastActivity: number;
 	createdAt: number; // Capacity eviction ordering
@@ -267,6 +277,15 @@ function captureUsageIterations(usage: unknown, state: RequestState): void {
 		}
 	>();
 	let billingAggregateUsable = true;
+	// Every distinct non-empty model string seen on ANY entry, regardless of
+	// output_tokens — a zero-output modeled attempt (e.g. a declined primary)
+	// is still a model that participated, so it must raise this count even
+	// though it never enters billingAggregate above. Bounded by the same
+	// MAX_BILLING_MODELS cap; overflow marks the set unusable rather than
+	// growing it, and the ambiguity check below fails toward flagging on that
+	// overflow instead of trusting an undercounted tally.
+	const observedIterationModels = new Set<string>();
+	let observedIterationModelsUsable = true;
 	for (const rawIteration of rawIterations) {
 		if (
 			!rawIteration ||
@@ -282,6 +301,13 @@ function captureUsageIterations(usage: unknown, state: RequestState): void {
 			if (model) fallbackIterationModel = model;
 		}
 		const model = normalizeNonEmptyString(raw.model);
+		if (model && !observedIterationModels.has(model)) {
+			if (observedIterationModels.size >= MAX_BILLING_MODELS) {
+				observedIterationModelsUsable = false;
+			} else {
+				observedIterationModels.add(model);
+			}
+		}
 		const outputTokens = normalizeTokenCount(raw.output_tokens);
 		if ((outputTokens ?? 0) > 0) {
 			const key = model ?? UNRESOLVED_MODEL_KEY;
@@ -333,6 +359,8 @@ function captureUsageIterations(usage: unknown, state: RequestState): void {
 	state.usage.iterationsTruncated = rawIterations.length > MAX_USAGE_ITERATIONS;
 	state.usage.iterationsAggregate = billingAggregate;
 	state.usage.iterationsAggregateUsable = billingAggregateUsable;
+	state.usage.observedIterationModels = observedIterationModels;
+	state.usage.observedIterationModelsUsable = observedIterationModelsUsable;
 }
 
 // Extract usage data from non-stream JSON response bodies
@@ -636,6 +664,8 @@ function freeRequestState(state: RequestState): void {
 	state.usage.iterationsTruncated = undefined;
 	state.usage.iterationsAggregate = undefined;
 	state.usage.iterationsAggregateUsable = undefined;
+	state.usage.observedIterationModels = undefined;
+	state.usage.observedIterationModelsUsable = undefined;
 	state.usagePayloadSeq = undefined;
 	state.fallbackBlockSeen = undefined;
 	state.fallbackFromModel = undefined;
@@ -1047,18 +1077,25 @@ export class UsageCollector {
 		// billing. Instead: keep pricing model-less entries at the serving
 		// model (unchanged — `iteration.model ?? model` / the aggregate's
 		// UNRESOLVED_MODEL_KEY bucket), and flag the row as billingIncomplete
-		// when that estimate is genuinely ambiguous (>=2 distinct modeled
-		// keys were also observed), so it is auditable instead of silently
-		// maybe-wrong.
+		// when that estimate is genuinely ambiguous. The ambiguity count comes
+		// from observedIterationModels (every model seen, regardless of
+		// output_tokens), NOT from billingAggregate (billable-only): a
+		// zero-output modeled attempt (e.g. a declined primary) is still a
+		// model that participated and could plausibly own the model-less
+		// entry, so it must raise the count even though it produced nothing
+		// billable. When the observed set overflowed its cap, its true
+		// cardinality is unknown, so ambiguity fails open (flagged) rather
+		// than trusting an undercounted tally.
 		const billingAggregate = state.usage.iterationsAggregate;
 		const unresolvedIterationModels =
 			billingAggregate?.get(UNRESOLVED_MODEL_KEY)?.count ?? 0;
-		const distinctModeledKeys = billingAggregate
-			? billingAggregate.size -
-				(billingAggregate.has(UNRESOLVED_MODEL_KEY) ? 1 : 0)
-			: 0;
+		const observedDistinctModels =
+			state.usage.observedIterationModels?.size ?? 0;
+		const observedIterationModelsOverflowed =
+			state.usage.observedIterationModelsUsable === false;
 		const iterationAttributionAmbiguous =
-			unresolvedIterationModels > 0 && distinctModeledKeys >= 2;
+			unresolvedIterationModels > 0 &&
+			(observedIterationModelsOverflowed || observedDistinctModels >= 2);
 		// None of the accurate pricing paths applied, but an iterations
 		// snapshot was seen at all: top-level pricing proceeds (unchanged
 		// behavior), but the row is marked so an under-billed row is
