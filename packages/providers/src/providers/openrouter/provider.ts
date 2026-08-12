@@ -26,6 +26,15 @@ export class OpenRouterProvider extends AnthropicCompatibleProvider {
 		const baseUrl = (
 			account?.custom_endpoint || OPENROUTER_DEFAULT_ENDPOINT
 		).replace(/\/$/, "");
-		return `${baseUrl}${pathname}${search}`;
+
+		// OpenRouter's documented Anthropic endpoint is /api/v1/messages.
+		// Claude Code sends /v1/messages; concatenating that onto a base that
+		// already ends in /v1 produced /api/v1/v1/messages and a 404.
+		let path = pathname;
+		if (/\/v1$/.test(baseUrl) && (path === "/v1" || path.startsWith("/v1/"))) {
+			path = path.slice(3) || "/";
+		}
+
+		return `${baseUrl}${path}${search}`;
 	}
 }
