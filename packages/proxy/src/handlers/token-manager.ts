@@ -55,6 +55,7 @@ const OAUTH_REACTIVE_REFRESH_PROVIDERS: ReadonlySet<string> = new Set([
 export function canAttemptStaleTokenRefresh(account: Account): boolean {
 	return (
 		Boolean(account.refresh_token?.trim()) &&
+		!account.api_key?.trim() &&
 		OAUTH_REACTIVE_REFRESH_PROVIDERS.has(account.provider.trim().toLowerCase())
 	);
 }

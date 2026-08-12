@@ -22,6 +22,7 @@ import {
 import { registerProvider } from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
 import {
+	canAttemptStaleTokenRefresh,
 	clearAccountRefreshCache,
 	clearStaleTokenRefreshState,
 	isStaleTokenRefreshCoolingDown,
@@ -194,6 +195,27 @@ describe("pauseAccountForReauthIfInvalidGrant", () => {
 				makeAccount({ provider: "xai", refresh_token: "rt-xai" }),
 			),
 		).toBe("oauth_invalid_grant");
+	});
+
+	it("does not reactively refresh accounts that also expose an API key", () => {
+		expect(
+			canAttemptStaleTokenRefresh(
+				makeAccount({
+					provider: "codex",
+					refresh_token: "rt-mixed-credential",
+					api_key: "sk-mixed-credential",
+				}),
+			),
+		).toBe(false);
+		expect(
+			canAttemptStaleTokenRefresh(
+				makeAccount({
+					provider: "codex",
+					refresh_token: "rt-oauth-only",
+					api_key: null,
+				}),
+			),
+		).toBe(true);
 	});
 
 	it("bounds reactive refresh reservations and clears them after reauth", () => {
