@@ -1805,7 +1805,7 @@ describe("UsageCollector request lifecycle", () => {
 			});
 		});
 
-		it("prices a fallback stream with no later usage payload at zero, not the new model's rate", async () => {
+		it("prices a fallback stream with no later usage payload at the counters-owner model, not zero or the new model's rate", async () => {
 			useDeterministicModelPricing();
 			const { collector, savedUsages } = harness();
 			const requestId = "stream-fallback-no-later-usage-payload";
@@ -1820,8 +1820,156 @@ describe("UsageCollector request lifecycle", () => {
 					),
 				);
 				// Stream dies here: no later message_delta refreshes the
-				// counters after the fallback rewrite, so the retained 500
-				// FABLE-counted input tokens must not be priced at OPUS rates.
+				// counters after the fallback rewrite. The retained 500
+				// FABLE-counted input tokens are real and authoritative — they
+				// must be priced at FABLE (the model that actually produced
+				// them), not at OPUS's rate and not zeroed out (see Fix 1:
+				// message_start.usage.output_tokens is a placeholder, but
+				// input_tokens is not, and $0 would silently drop real spend).
+				await collector.handleEnd({ type: "end", requestId, success: true });
+				await collector.drain();
+			} finally {
+				fallbackLogs.stop();
+			}
+
+			expect(savedUsages.get(requestId)).toMatchObject({
+				model: OPUS_MODEL,
+				costUsd: 500,
+				inputTokens: 500,
+				outputTokens: 0,
+			});
+			expect(estimateCostUSD).toHaveBeenCalledTimes(1);
+			expect(estimateCostUSD).toHaveBeenCalledWith(FABLE_MODEL, {
+				inputTokens: 500,
+				outputTokens: 0,
+				cacheReadInputTokens: undefined,
+				cacheCreationInputTokens: undefined,
+			});
+			expect(fallbackLogs.events).toHaveLength(1);
+			expect(fallbackLogs.events[0]?.data).toEqual({
+				requestId,
+				from: FABLE_MODEL,
+				to: OPUS_MODEL,
+				iterationCount: 0,
+				priced: "top_level",
+			});
+		});
+
+		it("prices fallback-seam input at FABLE (the counters owner) when message_start ships a nonzero output placeholder", async () => {
+			useDeterministicModelPricing();
+			const { collector, savedUsages } = harness();
+			const requestId = "stream-fallback-seam-placeholder-output";
+			const fallbackLogs = captureFallbackUsageLogs();
+
+			try {
+				collector.handleStart(makeStartMessage(requestId));
+				collector.handleChunk(
+					requestId,
+					new TextEncoder().encode(
+						`event: message_start\ndata: {"type":"message_start","message":{"model":"${FABLE_MODEL}","usage":{"input_tokens":500,"output_tokens":2}}}\n\nevent: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"fallback","from":{"model":"${FABLE_MODEL}"},"to":{"model":"${OPUS_MODEL}"}}}\n\n`,
+					),
+				);
+				// message_start's output_tokens:2 is Anthropic's documented
+				// nonzero PLACEHOLDER before any real content — it must not be
+				// read as "output happened" or gate anything. No message_delta
+				// ever arrives to refresh the counters after the seam.
+				await collector.handleEnd({ type: "end", requestId, success: true });
+				await collector.drain();
+			} finally {
+				fallbackLogs.stop();
+			}
+
+			expect(savedUsages.get(requestId)).toMatchObject({
+				model: OPUS_MODEL,
+				costUsd: 520,
+				inputTokens: 500,
+				outputTokens: 2,
+			});
+			expect(estimateCostUSD).toHaveBeenCalledTimes(1);
+			expect(estimateCostUSD).toHaveBeenCalledWith(FABLE_MODEL, {
+				inputTokens: 500,
+				outputTokens: 2,
+				cacheReadInputTokens: undefined,
+				cacheCreationInputTokens: undefined,
+			});
+			expect(fallbackLogs.events).toHaveLength(1);
+			expect(fallbackLogs.events[0]?.data).toEqual({
+				requestId,
+				from: FABLE_MODEL,
+				to: OPUS_MODEL,
+				iterationCount: 0,
+				priced: "top_level",
+			});
+		});
+
+		it("flags billingIncomplete when real content streamed before a fallback seam left it unaccounted for", async () => {
+			useDeterministicModelPricing();
+			const { collector, savedUsages } = harness();
+			const requestId = "stream-fallback-seam-real-content-unaccounted";
+			const fallbackLogs = captureFallbackUsageLogs();
+
+			try {
+				collector.handleStart(makeStartMessage(requestId));
+				collector.handleChunk(
+					requestId,
+					new TextEncoder().encode(
+						`event: message_start\ndata: {"type":"message_start","message":{"model":"${FABLE_MODEL}","usage":{"input_tokens":500,"output_tokens":2}}}\n\nevent: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\nevent: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}\n\nevent: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\nevent: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"fallback","from":{"model":"${FABLE_MODEL}"},"to":{"model":"${OPUS_MODEL}"}}}\n\n`,
+					),
+				);
+				// Real text streamed via content_block_delta BEFORE the seam —
+				// but content_block_delta never updates state.usage.outputTokens
+				// (see usage-collector.ts note near extractUsageFromData), and no
+				// message_delta ever arrives afterward either. That real content
+				// is genuinely invisible to the counters: the row must be
+				// flagged billingIncomplete, not silently priced as if nothing
+				// happened.
+				await collector.handleEnd({ type: "end", requestId, success: true });
+				await collector.drain();
+			} finally {
+				fallbackLogs.stop();
+			}
+
+			expect(savedUsages.get(requestId)).toMatchObject({
+				model: OPUS_MODEL,
+				costUsd: 520,
+				inputTokens: 500,
+				outputTokens: 2,
+			});
+			expect(estimateCostUSD).toHaveBeenCalledTimes(1);
+			expect(estimateCostUSD).toHaveBeenCalledWith(FABLE_MODEL, {
+				inputTokens: 500,
+				outputTokens: 2,
+				cacheReadInputTokens: undefined,
+				cacheCreationInputTokens: undefined,
+			});
+			expect(fallbackLogs.events).toHaveLength(1);
+			expect(fallbackLogs.events[0]?.data).toEqual({
+				requestId,
+				from: FABLE_MODEL,
+				to: OPUS_MODEL,
+				iterationCount: 0,
+				priced: "top_level",
+				billingIncomplete: true,
+			});
+		});
+
+		it("prices a fallback seam with no real content and no billable counters at a genuine zero", async () => {
+			useDeterministicModelPricing();
+			const { collector, savedUsages } = harness();
+			const requestId = "stream-fallback-seam-genuine-zero";
+			const fallbackLogs = captureFallbackUsageLogs();
+
+			try {
+				collector.handleStart(makeStartMessage(requestId));
+				collector.handleChunk(
+					requestId,
+					new TextEncoder().encode(
+						`event: message_start\ndata: {"type":"message_start","message":{"model":"${FABLE_MODEL}","usage":{"input_tokens":0,"output_tokens":0}}}\n\nevent: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"fallback","from":{"model":"${FABLE_MODEL}"},"to":{"model":"${OPUS_MODEL}"}}}\n\n`,
+					),
+				);
+				// No real content block, and the retained counters carry
+				// nothing billable either — this is the one case that survives
+				// as a direct, non-estimated $0 (no estimateCostUSD call).
 				await collector.handleEnd({ type: "end", requestId, success: true });
 				await collector.drain();
 			} finally {
@@ -1840,6 +1988,190 @@ describe("UsageCollector request lifecycle", () => {
 				to: OPUS_MODEL,
 				iterationCount: 0,
 				priced: "unpriced_pre_output",
+			});
+		});
+
+		it("non-stream fallback content block still prices through top_level at the serving model (structurally unreachable seam, unchanged)", async () => {
+			useDeterministicModelPricing();
+			const { collector, savedUsages } = harness();
+			const requestId = "json-fallback-seam-unreachable-control";
+			const fallbackLogs = captureFallbackUsageLogs();
+			const responseBody = Buffer.from(
+				JSON.stringify({
+					content: [
+						{
+							type: "fallback",
+							from: { model: FABLE_MODEL },
+							to: { model: OPUS_MODEL },
+						},
+					],
+					usage: { input_tokens: 500, output_tokens: 2 },
+				}),
+			).toString("base64");
+
+			try {
+				collector.handleStart(
+					makeStartMessage(requestId, {
+						isStream: false,
+						responseHeaders: { "content-type": "application/json" },
+					}),
+				);
+				await collector.handleEnd({
+					type: "end",
+					requestId,
+					success: true,
+					responseBody,
+				});
+				await collector.drain();
+			} finally {
+				fallbackLogs.stop();
+			}
+
+			// Mirrors the streaming seam test above (same input/output values)
+			// but as the non-stream JSON body: extractUsageFromJson records
+			// fallbackModelRewriteSeq BEFORE incrementing usagePayloadSeq in
+			// the same call, so the seam condition can never match here (see
+			// comment at its call site) — this must keep pricing at OPUS (the
+			// serving model) through plain top_level, never at FABLE like the
+			// streaming case above.
+			expect(savedUsages.get(requestId)).toMatchObject({
+				model: OPUS_MODEL,
+				costUsd: 1_040,
+				inputTokens: 500,
+				outputTokens: 2,
+			});
+			expect(estimateCostUSD).toHaveBeenCalledTimes(1);
+			expect(estimateCostUSD).toHaveBeenCalledWith(OPUS_MODEL, {
+				inputTokens: 500,
+				outputTokens: 2,
+				cacheReadInputTokens: undefined,
+				cacheCreationInputTokens: undefined,
+			});
+			expect(fallbackLogs.events).toHaveLength(1);
+			expect(fallbackLogs.events[0]?.data).toEqual({
+				requestId,
+				from: FABLE_MODEL,
+				to: OPUS_MODEL,
+				iterationCount: 0,
+				priced: "top_level",
+			});
+		});
+
+		it("flags ambiguous model-less attribution when a model-less entry co-occurs with two or more distinct models", async () => {
+			useDeterministicModelPricing();
+			const { collector, savedUsages } = harness();
+			const requestId = "stream-compaction-ambiguous-multi-model";
+			const fallbackLogs = captureFallbackUsageLogs();
+
+			try {
+				collector.handleStart(makeStartMessage(requestId));
+				collector.handleChunk(
+					requestId,
+					new TextEncoder().encode(
+						`event: message_start\ndata: {"type":"message_start","message":{"model":"${FABLE_MODEL}","usage":{"input_tokens":23,"output_tokens":0}}}\n\nevent: response.completed\ndata: {"usage":{"input_tokens":23,"output_tokens":29,"cache_read_input_tokens":31,"cache_creation_input_tokens":37,"iterations":[{"type":"message","model":"${FABLE_MODEL}","input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},{"type":"compaction","input_tokens":2,"output_tokens":3,"cache_read_input_tokens":5,"cache_creation_input_tokens":7},{"type":"fallback_message","model":"${OPUS_MODEL}","input_tokens":11,"output_tokens":13,"cache_read_input_tokens":17,"cache_creation_input_tokens":19}]}}\n\n`,
+					),
+				);
+				// The compaction entry has no model field at all, and TWO
+				// distinct modeled entries (FABLE, OPUS) are also present —
+				// Anthropic's docs give no rule for which side a model-less
+				// entry belongs to here, so this must be flagged rather than
+				// silently priced as if the serving-model estimate were
+				// certain.
+				await collector.handleEnd({ type: "end", requestId, success: true });
+				await collector.drain();
+			} finally {
+				fallbackLogs.stop();
+			}
+
+			expect(savedUsages.get(requestId)).toMatchObject({
+				model: OPUS_MODEL,
+				costUsd: 56_806,
+			});
+			expect(estimateCostUSD).toHaveBeenCalledTimes(3);
+			expect(estimateCostUSD).toHaveBeenNthCalledWith(1, FABLE_MODEL, {
+				inputTokens: 10,
+				outputTokens: 5,
+				cacheReadInputTokens: 0,
+				cacheCreationInputTokens: 0,
+			});
+			expect(estimateCostUSD).toHaveBeenNthCalledWith(2, OPUS_MODEL, {
+				inputTokens: 2,
+				outputTokens: 3,
+				cacheReadInputTokens: 5,
+				cacheCreationInputTokens: 7,
+			});
+			expect(estimateCostUSD).toHaveBeenNthCalledWith(3, OPUS_MODEL, {
+				inputTokens: 11,
+				outputTokens: 13,
+				cacheReadInputTokens: 17,
+				cacheCreationInputTokens: 19,
+			});
+			expect(fallbackLogs.events).toHaveLength(1);
+			expect(fallbackLogs.events[0]?.data).toEqual({
+				requestId,
+				from: FABLE_MODEL,
+				to: OPUS_MODEL,
+				iterationCount: 3,
+				priced: "iterations",
+				billingIncomplete: true,
+				unresolvedIterationModels: 1,
+			});
+		});
+
+		it("does not flag model-less attribution as ambiguous when only one model is in play", async () => {
+			useDeterministicModelPricing();
+			const { collector, savedUsages } = harness();
+			const requestId = "stream-compaction-single-model-no-ambiguity";
+			const fallbackLogs = captureFallbackUsageLogs();
+
+			try {
+				collector.handleStart(makeStartMessage(requestId));
+				collector.handleChunk(
+					requestId,
+					new TextEncoder().encode(
+						`event: message_start\ndata: {"type":"message_start","message":{"model":"${FABLE_MODEL}","usage":{"input_tokens":23,"output_tokens":0}}}\n\nevent: response.completed\ndata: {"usage":{"input_tokens":23,"output_tokens":29,"cache_read_input_tokens":31,"cache_creation_input_tokens":37,"iterations":[{"type":"message","model":"${FABLE_MODEL}","input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},{"type":"compaction","input_tokens":2,"output_tokens":3,"cache_read_input_tokens":5,"cache_creation_input_tokens":7},{"type":"fallback_message","model":"${FABLE_MODEL}","input_tokens":11,"output_tokens":13,"cache_read_input_tokens":17,"cache_creation_input_tokens":19}]}}\n\n`,
+					),
+				);
+				// Same shape as the ambiguity test above, but the
+				// fallback_message entry is also FABLE — only one model is
+				// actually in play, so attributing the model-less compaction
+				// entry to it is unambiguous. No flag.
+				await collector.handleEnd({ type: "end", requestId, success: true });
+				await collector.drain();
+			} finally {
+				fallbackLogs.stop();
+			}
+
+			expect(savedUsages.get(requestId)).toMatchObject({
+				model: FABLE_MODEL,
+				costUsd: 28_433,
+			});
+			expect(estimateCostUSD).toHaveBeenCalledTimes(3);
+			expect(estimateCostUSD).toHaveBeenNthCalledWith(1, FABLE_MODEL, {
+				inputTokens: 10,
+				outputTokens: 5,
+				cacheReadInputTokens: 0,
+				cacheCreationInputTokens: 0,
+			});
+			expect(estimateCostUSD).toHaveBeenNthCalledWith(2, FABLE_MODEL, {
+				inputTokens: 2,
+				outputTokens: 3,
+				cacheReadInputTokens: 5,
+				cacheCreationInputTokens: 7,
+			});
+			expect(estimateCostUSD).toHaveBeenNthCalledWith(3, FABLE_MODEL, {
+				inputTokens: 11,
+				outputTokens: 13,
+				cacheReadInputTokens: 17,
+				cacheCreationInputTokens: 19,
+			});
+			expect(fallbackLogs.events).toHaveLength(1);
+			expect(fallbackLogs.events[0]?.data).toEqual({
+				requestId,
+				from: FABLE_MODEL,
+				to: FABLE_MODEL,
+				iterationCount: 3,
+				priced: "iterations",
 			});
 		});
 

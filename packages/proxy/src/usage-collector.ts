@@ -72,7 +72,9 @@ interface RequestState {
 		// truncated snapshot can still be priced without silently dropping
 		// advisor spend. Complete-snapshot state: replaced wholesale by a
 		// later snapshot exactly like `iterations`, cleared in
-		// freeRequestState.
+		// freeRequestState. `count` tracks how many billable raw iterations
+		// fell into each bucket, used to size the model-less (UNRESOLVED_
+		// MODEL_KEY) bucket for the attribution-ambiguity flag (Fix 2).
 		iterationsAggregate?: Map<
 			string,
 			{
@@ -80,6 +82,7 @@ interface RequestState {
 				output: number;
 				cacheRead: number;
 				cacheCreation: number;
+				count: number;
 			}
 		>;
 		iterationsAggregateUsable?: boolean;
@@ -105,6 +108,24 @@ interface RequestState {
 	// after that rewrite, the retained counters are stale-model attempts
 	// that were never actually billed at the new model's rate.
 	fallbackModelRewriteSeq?: number;
+	// Model that owned state.usage counters immediately before the fallback
+	// rewrite recorded by fallbackModelRewriteSeq. A chained rewrite within
+	// the same usage-payload epoch (e.g. FABLE->HAIKU->OPUS with no usage
+	// payload between them) must not overwrite this — it always names the
+	// FIRST pre-rewrite model, which is the model the retained counters
+	// were actually produced under.
+	countersOwnerModel?: string;
+	// Sequence mirroring usagePayloadSeq: incremented once per REAL
+	// (non-fallback) content_block_start. content_block_delta never updates
+	// state.usage.outputTokens (tiktoken-based per-delta counting was
+	// removed), so this is the only categorical signal that genuine
+	// billable content streamed at all.
+	realContentBlockSeq?: number;
+	// realContentBlockSeq snapshotted at the moment of the most recent usage
+	// payload. If realContentBlockSeq has advanced past this value by
+	// finalization, real content streamed that no usage payload has
+	// accounted for since.
+	realContentBlockSeqAtLastUsagePayload?: number;
 }
 
 const log = new Logger("UsageCollector");
@@ -237,7 +258,13 @@ function captureUsageIterations(usage: unknown, state: RequestState): void {
 	// pre-output declines stay free, matching the split-pricing predicate.
 	const billingAggregate = new Map<
 		string,
-		{ input: number; output: number; cacheRead: number; cacheCreation: number }
+		{
+			input: number;
+			output: number;
+			cacheRead: number;
+			cacheCreation: number;
+			count: number;
+		}
 	>();
 	let billingAggregateUsable = true;
 	for (const rawIteration of rawIterations) {
@@ -263,7 +290,13 @@ function captureUsageIterations(usage: unknown, state: RequestState): void {
 				if (billingAggregate.size >= MAX_BILLING_MODELS) {
 					billingAggregateUsable = false;
 				} else {
-					bucket = { input: 0, output: 0, cacheRead: 0, cacheCreation: 0 };
+					bucket = {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheCreation: 0,
+						count: 0,
+					};
 					billingAggregate.set(key, bucket);
 				}
 			}
@@ -274,6 +307,7 @@ function captureUsageIterations(usage: unknown, state: RequestState): void {
 					normalizeTokenCount(raw.cache_read_input_tokens) ?? 0;
 				bucket.cacheCreation +=
 					normalizeTokenCount(raw.cache_creation_input_tokens) ?? 0;
+				bucket.count += 1;
 			}
 		}
 
@@ -401,6 +435,12 @@ function extractUsageFromData(
 			if (usagePayloadCounted) return;
 			usagePayloadCounted = true;
 			state.usagePayloadSeq = (state.usagePayloadSeq ?? 0) + 1;
+			// Snapshot the real-content sequence at the moment this usage
+			// payload lands, so finalization can tell whether any real
+			// content streamed AFTER the last payload that could have
+			// accounted for it.
+			state.realContentBlockSeqAtLastUsagePayload =
+				state.realContentBlockSeq ?? 0;
 		};
 
 		// Handle message_start - check both parsed.type and eventType
@@ -451,6 +491,16 @@ function extractUsageFromData(
 			state.firstTokenTimestamp = Date.now();
 		}
 
+		// Real (non-fallback) content blocks carry no usage of their own —
+		// content_block_delta never updates state.usage.outputTokens — so
+		// this sequence is the only signal that genuine billable content
+		// streamed at all. Compared against
+		// realContentBlockSeqAtLastUsagePayload at finalization to detect
+		// content that no usage payload has accounted for.
+		if (isContentBlockStart && !isFallbackContentBlock) {
+			state.realContentBlockSeq = (state.realContentBlockSeq ?? 0) + 1;
+		}
+
 		if (isFallbackContentBlock) {
 			state.fallbackBlockSeen = true;
 			const fromModel = normalizeNonEmptyString(
@@ -459,6 +509,15 @@ function extractUsageFromData(
 			const toModel = normalizeNonEmptyString(parsed.content_block.to?.model);
 			if (fromModel) state.fallbackFromModel = fromModel;
 			if (toModel) {
+				if (state.fallbackModelRewriteSeq !== state.usagePayloadSeq) {
+					// First rewrite since counters were last refreshed by a
+					// usage payload: capture the model that actually owns the
+					// CURRENT counters before it is overwritten below. A later
+					// rewrite in the same epoch (chained fallback) must not
+					// clobber this — the counters still belong to the FIRST
+					// pre-rewrite model.
+					state.countersOwnerModel = state.usage.model;
+				}
 				state.usage.model = toModel;
 				// Sequence-guard site 1 (streaming): mirror of the non-stream
 				// site above. See its comment for the pricing consequence.
@@ -582,6 +641,9 @@ function freeRequestState(state: RequestState): void {
 	state.fallbackFromModel = undefined;
 	state.servingModelAuthoritative = undefined;
 	state.fallbackModelRewriteSeq = undefined;
+	state.countersOwnerModel = undefined;
+	state.realContentBlockSeq = undefined;
+	state.realContentBlockSeqAtLastUsagePayload = undefined;
 	// Release request body and headers held in startMessage.
 	// Without this, orphaned requests retain full request bodies until the
 	// inactivity cleanup configured by CF_STREAM_TIMEOUT_MS runs. See #67.
@@ -935,25 +997,82 @@ export class UsageCollector {
 			state.usage.iterationsAggregateUsable === true &&
 			!iterationsStale;
 		// A fallback rewrite with no later usage payload means the retained
-		// counters were never refreshed for the new model — they are a
-		// pre-output attempt at the OLD model, and pricing them at the new
-		// model's rate matches no real invoice line (see Finding 2).
-		const isUnpricedPreOutputFallback =
+		// counters were never refreshed for the new model. Whether that is a
+		// genuine $0 or real (under-tracked) spend depends on what actually
+		// happened before the request ended — see the sub-conditions below.
+		const isFallbackSeamNoLaterUsage =
 			hasFallbackSignal &&
 			!hasFallbackBillingSplit &&
 			!canPriceFromAggregate &&
 			state.fallbackModelRewriteSeq !== undefined &&
 			state.fallbackModelRewriteSeq === state.usagePayloadSeq;
+		// message_start.usage.output_tokens is routinely a nonzero PLACEHOLDER
+		// (Anthropic's streaming docs show small values like 1-3 before any
+		// real content), and content_block_delta NEVER updates
+		// state.usage.outputTokens (tiktoken-based per-delta counting was
+		// removed) — so "outputTokens > 0" cannot distinguish real streamed
+		// content from a placeholder. realContentBlockSeq is the only
+		// categorical signal for "something real happened here."
+		const seamRealContentUnaccounted =
+			isFallbackSeamNoLaterUsage &&
+			(state.realContentBlockSeq ?? 0) >
+				(state.realContentBlockSeqAtLastUsagePayload ?? 0);
+		const seamHasBillableCounters =
+			isFallbackSeamNoLaterUsage &&
+			((state.usage.inputTokens ?? 0) > 0 ||
+				(state.usage.cacheReadInputTokens ?? 0) > 0 ||
+				(state.usage.cacheCreationInputTokens ?? 0) > 0 ||
+				(state.usage.outputTokens ?? 0) > 0);
+		// Genuine no-content case: nothing streamed and nothing counted — a
+		// real $0, not a guess. Narrower than before: a fallback rewrite with
+		// billable counters or unaccounted real content now prices below
+		// instead of being zeroed out.
+		const isUnpricedPreOutputFallback =
+			isFallbackSeamNoLaterUsage &&
+			!seamRealContentUnaccounted &&
+			!seamHasBillableCounters;
+		// The seam produced something real (billable counters and/or
+		// unaccounted real content): price the authoritative input/cache
+		// tokens at the model that actually owned them (pre-rewrite), never
+		// at the fallback target and never at $0 (see Fix 1).
+		const isFallbackSeamPricedAtCountersOwner =
+			isFallbackSeamNoLaterUsage && !isUnpricedPreOutputFallback;
+		// Fix 2 — model-less iteration entries (e.g. BetaCompactionIterationUsage)
+		// carry no `model` field at all, unlike message/advisor/fallback_message
+		// entries. Anthropic's docs are silent on which model a model-less
+		// entry belongs to when more than one model is in play (a mid-request
+		// compaction between a declined attempt and a fallback_message could
+		// belong to either side) — so no positional "activeModel" cursor is
+		// implemented here; that would encode an undocumented guess into
+		// billing. Instead: keep pricing model-less entries at the serving
+		// model (unchanged — `iteration.model ?? model` / the aggregate's
+		// UNRESOLVED_MODEL_KEY bucket), and flag the row as billingIncomplete
+		// when that estimate is genuinely ambiguous (>=2 distinct modeled
+		// keys were also observed), so it is auditable instead of silently
+		// maybe-wrong.
+		const billingAggregate = state.usage.iterationsAggregate;
+		const unresolvedIterationModels =
+			billingAggregate?.get(UNRESOLVED_MODEL_KEY)?.count ?? 0;
+		const distinctModeledKeys = billingAggregate
+			? billingAggregate.size -
+				(billingAggregate.has(UNRESOLVED_MODEL_KEY) ? 1 : 0)
+			: 0;
+		const iterationAttributionAmbiguous =
+			unresolvedIterationModels > 0 && distinctModeledKeys >= 2;
 		// None of the accurate pricing paths applied, but an iterations
 		// snapshot was seen at all: top-level pricing proceeds (unchanged
 		// behavior), but the row is marked so an under-billed row is
-		// identifiable rather than silently wrong.
+		// identifiable rather than silently wrong. Also set whenever the
+		// fallback seam left real content unaccounted for (Fix 1), or a
+		// model-less entry's attribution is genuinely ambiguous (Fix 2).
 		const billingIncomplete =
-			hasFallbackSignal &&
-			!hasFallbackBillingSplit &&
-			!canPriceFromAggregate &&
-			!isUnpricedPreOutputFallback &&
-			iterations.length > 0;
+			(hasFallbackSignal &&
+				!hasFallbackBillingSplit &&
+				!canPriceFromAggregate &&
+				!isFallbackSeamNoLaterUsage &&
+				iterations.length > 0) ||
+			seamRealContentUnaccounted ||
+			iterationAttributionAmbiguous;
 		if (state.usage.model) {
 			const model = state.usage.model;
 			// Use provider's authoritative count if available, fallback to computed
@@ -1035,11 +1154,20 @@ export class UsageCollector {
 				// This is a direct $0, not an estimate — no estimateCostUSD call.
 				state.usage.costUsd = 0;
 			} else {
+				// Plain top-level pricing. When a fallback seam left the
+				// retained counters unrefreshed by any later usage payload
+				// (isFallbackSeamPricedAtCountersOwner), those counters were
+				// produced by the PRE-rewrite model, not state.usage.model
+				// (which now names the fallback target) — price them at
+				// countersOwnerModel instead (see Fix 1).
+				const pricingModel = isFallbackSeamPricedAtCountersOwner
+					? (state.countersOwnerModel ?? model)
+					: model;
 				state.usage.costUsd = await this.estimateCostWithDeadline(
 					startMessage.requestId,
-					model,
+					pricingModel,
 					() =>
-						estimateCostUSD(model, {
+						estimateCostUSD(pricingModel, {
 							inputTokens: state.usage.inputTokens,
 							outputTokens: finalOutputTokens,
 							cacheReadInputTokens: state.usage.cacheReadInputTokens,
@@ -1167,6 +1295,7 @@ export class UsageCollector {
 					? { iterationsStale: true }
 					: {}),
 				...(billingIncomplete ? { billingIncomplete: true } : {}),
+				...(iterationAttributionAmbiguous ? { unresolvedIterationModels } : {}),
 			});
 		}
 
