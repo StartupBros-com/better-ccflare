@@ -148,6 +148,7 @@ export {
 	type ModelRouteProfile,
 	type ModelRouteResolution,
 	type ModelRouteResolutionInput,
+	type ModelRouteSelection,
 	ModelRouteSessionRegistry,
 	type ModelRouteSessionRegistryOptions,
 	parseModelRouteProfiles,

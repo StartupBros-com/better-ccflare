@@ -62,6 +62,19 @@ describe("RoutingAttemptLedger", () => {
 		expect(ledger.attemptedCount).toBe(3);
 	});
 
+	it("allows one bounded retry only for an existing unblocked route", () => {
+		const ledger = new RoutingAttemptLedger();
+
+		expect(ledger.claimRetry("account-a", "claude-opus-4-8")).toBe(false);
+		expect(ledger.claim("account-a", "claude-opus-4-8")).toBe(true);
+		expect(ledger.claimRetry("account-a", "claude-opus-4-8")).toBe(true);
+		expect(ledger.claimRetry("account-a", "claude-opus-4-8")).toBe(false);
+		expect(ledger.claimRetry("account-a", "claude-fable-5")).toBe(false);
+
+		ledger.blockAccount("account-a");
+		expect(ledger.claimRetry("account-a", "claude-opus-4-8")).toBe(false);
+	});
+
 	it("uses a stable null lane when no concrete model is available", () => {
 		const ledger = new RoutingAttemptLedger();
 
@@ -81,6 +94,23 @@ describe("RoutingAttemptLedger", () => {
 		expect(ledger.claim("account-a", "claude-haiku-4-5")).toBe(false);
 		expect(ledger.claim("account-b", "claude-haiku-4-5")).toBe(true);
 		expect(ledger.attemptedCount).toBe(3);
+	});
+
+	it("records one definitive auth failure per account and blocks sibling models", () => {
+		const ledger = new RoutingAttemptLedger();
+
+		ledger.recordAuthFailure("account-a", "oauth_invalid_grant");
+		ledger.recordAuthFailure("account-a", "auth_failure");
+		ledger.recordAuthFailure("account-b", "auth_failure");
+
+		expect(ledger.hasAuthFailures).toBe(true);
+		expect(ledger.authFailureCount).toBe(2);
+		expect(ledger.authFailureEntries).toEqual([
+			{ accountId: "account-a", reason: "oauth_invalid_grant" },
+			{ accountId: "account-b", reason: "auth_failure" },
+		]);
+		expect(ledger.claim("account-a", "claude-opus-4-8")).toBe(false);
+		expect(ledger.claim("account-b", "claude-opus-4-8")).toBe(false);
 	});
 
 	it("counts deferred concrete routes while excluding pretransport, duplicate, and blocked skips", () => {
@@ -116,6 +146,21 @@ describe("RoutingAttemptLedger", () => {
 			),
 		).toBe(
 			"All compatible upstream routes failed to proxy the request (1 unique account/model route attempted)",
+		);
+	});
+
+	it("labels auth failures instead of presenting them as generic capacity", () => {
+		const ledger = new RoutingAttemptLedger();
+		ledger.claim("account-a", "claude-opus-4-8");
+		ledger.recordAuthFailure("account-a", "oauth_invalid_grant");
+
+		expect(
+			formatRoutingAttemptMessage(
+				"All compatible upstream routes failed to proxy the request",
+				ledger,
+			),
+		).toBe(
+			"All compatible upstream routes failed to proxy the request (1 unique account/model route attempted; upstream authentication failed for 1 account)",
 		);
 	});
 

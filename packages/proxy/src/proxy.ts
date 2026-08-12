@@ -908,8 +908,12 @@ async function handleProxyCore(
 	}
 	if (modelRouteResolution?.kind === "route") {
 		const { profile, source } = modelRouteResolution;
-		requestMeta.forcedAccountId = profile.accountId;
+		requestMeta.forcedAccountId = profile.accountId ?? null;
 		requestMeta.routeProfileId = profile.id;
+		requestMeta.routeProfileSelection = profile.selection ?? null;
+		requestMeta.routeProfileLogicalModel = profile.logicalModel;
+		requestMeta.routeProfileExpectedPhysicalModel =
+			profile.expectedPhysicalModel ?? null;
 		requestMeta.routeExpectedProvider = profile.expectedProvider;
 		const inheritedPickerModel =
 			source === "inherited" && configuredEffectivePicker;
@@ -1708,9 +1712,12 @@ async function handleProxyCore(
 	if (
 		modelRouteResolution?.kind === "route" &&
 		modelRouteResolution.source === "explicit" &&
-		accounts.some(
-			(account) => account.id === modelRouteResolution.profile.accountId,
-		)
+		(modelRouteResolution.profile.selection === "capability"
+			? accounts.length > 0
+			: modelRouteResolution.profile.accountId !== undefined &&
+				accounts.some(
+					(account) => account.id === modelRouteResolution.profile.accountId,
+				))
 	) {
 		modelRouteRegistry?.commitExplicit(
 			modelRouteResolutionInput,
@@ -3117,6 +3124,7 @@ async function handleProxyCore(
 		capacityContext: getRoutingCapacityContext(requestMeta),
 		rateLimitOutcomes: getRequestRateLimitOutcomes(req),
 		upstreamAttempts: actualUpstreamAttempts,
+		authFailureCount: routingAttemptLedger.authFailureCount,
 		hostedDispatchState: routingAttemptLedger.hostedDispatchState,
 		modelRecoveryAt: reactiveModelRecoveryAt,
 		message: formatRoutingAttemptMessage(

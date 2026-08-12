@@ -136,9 +136,41 @@ import { handleProxyError, processProxyResponse } from "./response-processor";
 import { isRetryable429 } from "./retryable-429";
 import type { RoutingAttemptLedger } from "./routing-attempt-ledger";
 import { createProtectedAnthropicOverloadResponse } from "./routing-terminal";
-import { getValidAccessToken } from "./token-manager";
+import {
+	canAttemptStaleTokenRefresh,
+	clearStaleTokenRefreshState,
+	getRefreshTokenUsedForFailure,
+	getValidAccessToken,
+	isStaleTokenRefreshCoolingDown,
+	isTerminalTokenRefreshFailure,
+	pauseAccountForUpstreamAuthFailure,
+	refreshAccessTokenSafe,
+	tryAcquireStaleTokenRefresh,
+	upstreamAuthFailureReason,
+} from "./token-manager";
 
 const log = new Logger("ProxyOperations");
+
+/**
+ * A provider-issued 401 gets one bounded same-account OAuth refresh/retry.  A
+ * second 401 (or an API-key 401) is a credential failure, not a capacity
+ * signal; the account is quarantined and the request fails over once.
+ */
+const STALE_TOKEN_MAX_RETRY = 1;
+
+function shouldAttemptStaleTokenRefresh(
+	account: Account,
+	staleTokenRetryAttempt: number,
+	isSyntheticInternal: boolean,
+): boolean {
+	if (
+		staleTokenRetryAttempt >= STALE_TOKEN_MAX_RETRY ||
+		isSyntheticInternal ||
+		!canAttemptStaleTokenRefresh(account)
+	)
+		return false;
+	return tryAcquireStaleTokenRefresh(account.id);
+}
 
 type HostedDispatchTerminalReason =
 	| "ledger_missing"
@@ -1897,7 +1929,20 @@ export async function proxyWithAccount(
 	anthropicDegraded?:
 		| AnthropicDegradedRequestAdmission
 		| AnthropicDegradedRequestSendState,
+	/** Request-local bound for reactive stale-token refresh after a 401. */
+	staleTokenRetryAttempt = 0,
+	/** Refresh credential snapshot carried into the bounded same-account retry. */
+	staleTokenRefreshTokenAtStart?: string | null,
 ): Promise<ProxyWithAccountResult> {
+	// Snapshot before any credential lookup. A recursive stale-token retry carries
+	// its original identity; an initial request captures the generation that was
+	// present before getValidAccessToken can await or mutate shared state. A later
+	// 401 must never read a newer mutable token and pause the wrong credential.
+	let requestRefreshTokenAtStart: string | null =
+		staleTokenRefreshTokenAtStart !== undefined
+			? staleTokenRefreshTokenAtStart
+			: account.refresh_token;
+	const refreshTokenBeforeCredentialResolution = requestRefreshTokenAtStart;
 	const anthropicDegradedState: AnthropicDegradedRequestSendState | undefined =
 		anthropicDegraded &&
 		"admission" in anthropicDegraded &&
@@ -2475,7 +2520,9 @@ export async function proxyWithAccount(
 				throw error;
 			}
 		}
-
+		if (staleTokenRefreshTokenAtStart === undefined) {
+			requestRefreshTokenAtStart = refreshTokenBeforeCredentialResolution;
+		}
 		const replayResolvedModel =
 			attemptPlan.cacheReplayModelStrategy === "transformed-body"
 				? cacheReplayPhysicalModel
@@ -3150,7 +3197,9 @@ export async function proxyWithAccount(
 		let currentTransportModel = transformedModel || concreteAttemptModel;
 		if (
 			routingAttemptLedger &&
-			!routingAttemptLedger.claim(account.id, currentTransportModel)
+			!(staleTokenRetryAttempt > 0
+				? routingAttemptLedger.claimRetry(account.id, currentTransportModel)
+				: routingAttemptLedger.claim(account.id, currentTransportModel))
 		) {
 			if (attemptAdmissionTracker) {
 				attemptAdmissionTracker.nonCapacitySkipCount++;
@@ -3249,6 +3298,168 @@ export async function proxyWithAccount(
 			} catch {
 				// Body may already be locked/disturbed; ignore synchronous throws too.
 			}
+		};
+
+		/**
+		 * Handle one provider-issued 401 at the request-local failover seam.
+		 *
+		 * OAuth accounts get one same-account refresh/retry when the access token
+		 * could be stale. If that retry cannot produce a different token, or the
+		 * retry itself returns 401, persist a credential quarantine and let the
+		 * outer account loop choose a sibling. API-key accounts skip refresh and
+		 * are quarantined immediately. Protected/hosted responses remain owned by
+		 * their terminal lifecycle and deliberately return `undefined` here.
+		 */
+		const handleUpstreamAuthFailure = async (
+			failedResponse: Response,
+			discardReason: string,
+		): Promise<ProxyWithAccountResult | undefined> => {
+			if (
+				failedResponse.status !== 401 ||
+				hostedDispatchCommitted() ||
+				wasProtectedLifecycleForLatestResponse()
+			) {
+				return undefined;
+			}
+			// Keep the credential identity that produced this request stable across
+			// concurrent reauth. The mutable Account object may already contain a new
+			// token by the time the response is handled.
+			const refreshEligible = canAttemptStaleTokenRefresh(account);
+			const refreshAttempted = shouldAttemptStaleTokenRefresh(
+				account,
+				staleTokenRetryAttempt,
+				isSyntheticInternal,
+			);
+			let refreshTokenUsedByFailure = requestRefreshTokenAtStart;
+			if (refreshAttempted) {
+				// Release the rejected response before awaiting token refresh. A slow
+				// OAuth endpoint must not pin the upstream 401 socket/body.
+				await discardUpstreamBody(failedResponse);
+				// `accessToken` is the exact bearer used by this invocation's
+				// transport. Reading account.access_token here would race a concurrent
+				// reauth and could incorrectly classify a genuinely new token as a
+				// no-op refresh.
+				const tokenBefore = accessToken;
+				let refreshedToken: string | null = null;
+				try {
+					refreshedToken = await runWithPreTransportDeadline({
+						phase: "credential_resolution",
+						timeoutMs:
+							getPreTransportDeadlineConfig().credentialResolutionTimeoutMs,
+						signal: routingSignal,
+						operation: () => refreshAccessTokenSafe(account, ctx),
+					});
+				} catch (error) {
+					const capturedRefreshToken = getRefreshTokenUsedForFailure(error);
+					if (capturedRefreshToken !== undefined) {
+						refreshTokenUsedByFailure = capturedRefreshToken;
+					}
+					log.warn(
+						`Stale-token refresh failed for account ${account.name}: ${
+							error instanceof Error ? error.message : String(error)
+						}; failing over`,
+					);
+					// The token manager already durably pauses terminal invalid_grant
+					// failures. A timeout/backoff failure is not enough evidence to
+					// quarantine a healthy OAuth account; keep this request-local.
+					if (!isTerminalTokenRefreshFailure(error)) {
+						routingAttemptLedger?.blockAccount(account.id);
+						await discardUnusedResponse(failedResponse, discardReason);
+						return null;
+					}
+				}
+				// A no-op refresh would just repeat the same rejected credential.
+				if (refreshedToken && refreshedToken !== tokenBefore) {
+					log.info(
+						`Refreshed token for account ${account.name} after 401; retrying the same account`,
+					);
+					return proxyWithAccount(
+						req,
+						url,
+						account,
+						requestMeta,
+						requestBodyBuffer,
+						_createBodyStream,
+						failoverAttempts,
+						ctx,
+						modelOverride,
+						apiKeyId,
+						apiKeyName,
+						requestBodyContext,
+						returnRateLimitedResponseOnExhaustion,
+						contextAdmissionTracker,
+						routingAttemptLedger,
+						modelFallbackPolicy,
+						anthropicDegraded,
+						staleTokenRetryAttempt + 1,
+						requestRefreshTokenAtStart,
+					);
+				}
+			}
+
+			// Another request may already be refreshing this OAuth account. Its
+			// 401 must not race that refresh into a durable pause; block only this
+			// request and let the shared refresh result decide the next attempt.
+			if (
+				!refreshAttempted &&
+				refreshEligible &&
+				staleTokenRetryAttempt === 0 &&
+				isStaleTokenRefreshCoolingDown(account.id)
+			) {
+				routingAttemptLedger?.blockAccount(account.id);
+				await discardUnusedResponse(failedResponse, discardReason);
+				return null;
+			}
+
+			// Internal synthetic probes are intentionally non-destructive: a probe
+			// 401 should not pause a real OAuth account based on probe credentials.
+			if (isSyntheticInternal) {
+				routingAttemptLedger?.blockAccount(account.id);
+				await discardUnusedResponse(failedResponse, discardReason);
+				return null;
+			}
+
+			// A single upstream 401 is not sufficient evidence for an account-wide
+			// credential quarantine. Custom endpoints and model-scoped gateways can
+			// reject one route while the credential remains valid elsewhere. The
+			// only safe durable signal here is a second 401 after a genuine OAuth
+			// refresh/retry on the same account. Terminal invalid-grant refresh
+			// failures are quarantined by the token manager itself. Every other
+			// 401 remains request-local so one bad route cannot DoS the account.
+			if (!refreshEligible || staleTokenRetryAttempt === 0) {
+				routingAttemptLedger?.blockAccount(account.id);
+				await discardUnusedResponse(failedResponse, discardReason);
+				return null;
+			}
+
+			const failedCredentialRefreshToken = refreshTokenUsedByFailure ?? null;
+			const reason = upstreamAuthFailureReason({
+				provider: account.provider,
+				refresh_token: failedCredentialRefreshToken,
+			});
+			routingAttemptLedger?.recordAuthFailure(account.id, reason);
+			try {
+				await runWithPreTransportDeadline({
+					phase: "credential_resolution",
+					timeoutMs:
+						getPreTransportDeadlineConfig().credentialResolutionTimeoutMs,
+					signal: routingSignal,
+					operation: () =>
+						pauseAccountForUpstreamAuthFailure(
+							account,
+							ctx.dbOps,
+							failedCredentialRefreshToken,
+						),
+				});
+			} catch (error) {
+				log.warn(
+					`Account ${account.name} auth quarantine did not complete before the credential-resolution deadline: ${
+						error instanceof Error ? error.message : String(error)
+					}`,
+				);
+			}
+			await discardUnusedResponse(failedResponse, discardReason);
+			return null;
 		};
 		const retainCodexContextOverflowResponse = async (
 			retainedContextOverflowResponse: Response,
@@ -4951,16 +5162,15 @@ export async function proxyWithAccount(
 			return null;
 		}
 
-		// Failover to next account on upstream 401 — credentials are invalid/expired
+		// A provider-issued 401 is either repaired by one bounded same-account
+		// OAuth refresh/retry or quarantined and failed over. Protected/hosted
+		// lifecycles remain terminal and are intentionally untouched.
 		if (response.status === 401 && !hostedDispatchCommitted()) {
-			log.warn(
-				`Authentication failed (401) for account ${account.name}${wasProtectedLifecycleForLatestResponse() ? "; protected response remains terminal" : ", failing over to next account"}`,
+			const authResult = await handleUpstreamAuthFailure(
+				response,
+				"auth_failed_401",
 			);
-			routingAttemptLedger?.blockAccount(account.id);
-			if (!wasProtectedLifecycleForLatestResponse()) {
-				await discardUnusedResponse(response, "auth_failed_401");
-				return null;
-			}
+			if (authResult !== undefined) return authResult;
 		}
 
 		// In-place retry for reset-less 529 (overloaded_error) — bounded attempts with
@@ -5127,19 +5337,17 @@ export async function proxyWithAccount(
 			}
 		}
 
-		// Re-check 401 after in-place retry — credentials might have been revoked
-		// between the initial 529 and a retry response. The guard above only covered
-		// the initial response; a retry 401 would have updated `response` and broken
-		// out of the loop, so we need to catch it here before forwarding to the client.
+		// Re-check 401 after an in-place 529 retry. The same bounded auth handler
+		// prevents a revoked credential from being sent again on later requests.
 		if (response.status === 401 && !hostedDispatchCommitted()) {
-			log.warn(
-				`Authentication failed (401) on 529 retry for account ${account.name}${wasProtectedLifecycleForLatestResponse() ? "; protected response remains terminal" : ", failing over to next account"}`,
+			const authResult = await handleUpstreamAuthFailure(
+				response,
+				"auth_failed_401_after_retry",
 			);
-			routingAttemptLedger?.blockAccount(account.id);
-			if (!wasProtectedLifecycleForLatestResponse()) {
-				await discardUnusedResponse(response, "auth_failed_401_after_retry");
-				return null;
-			}
+			if (authResult !== undefined) return authResult;
+		}
+		if (response.status >= 200 && response.status < 400) {
+			clearStaleTokenRefreshState(account.id);
 		}
 
 		// At this boundary provider.processResponse has already converted any
@@ -5520,14 +5728,16 @@ export async function proxyWithAccount(
 						return null;
 					}
 					if (response.status === 401) {
-						routingAttemptLedger?.blockAccount(account.id);
-						await discardUnusedResponse(
+						const authResult = await handleUpstreamAuthFailure(
 							response,
 							isPrecommitSseRetry
 								? "auth_failed_401_after_precommit_sse_retry"
 								: "auth_failed_401_after_cache_lane_rescue",
 						);
-						return null;
+						if (authResult !== undefined) return authResult;
+					}
+					if (response.status >= 200 && response.status < 400) {
+						clearStaleTokenRefreshState(account.id);
 					}
 					continue;
 				}

@@ -173,6 +173,60 @@ async function body(response: Response) {
 }
 
 describe("routing terminal responses", () => {
+	it("returns a non-retryable 401 when every attempted route rejects authentication", async () => {
+		const terminal = createRoutingTerminalResponse({
+			source: "attempts",
+			accounts: [makeAccount()],
+			capacityContext: null,
+			rateLimitOutcomes: [],
+			upstreamAttempts: 1,
+			authFailureCount: 1,
+			message: "Every candidate rejected the credential",
+		});
+
+		expect(terminal.kind).toBe("route_unavailable");
+		expect(terminal.response.status).toBe(401);
+		expect(terminal.response.headers.get("retry-after")).toBeNull();
+		expect(
+			terminal.response.headers.get("x-better-ccflare-pool-status"),
+		).toBeNull();
+		expect(
+			terminal.response.headers.get("x-better-ccflare-recovery-scope"),
+		).toBeNull();
+		const parsed = await body(terminal.response);
+		expect(parsed.type).toBe("error");
+		expect(parsed.error.type).toBe("authentication_error");
+		expect(parsed.error.code).toBe("authentication_failed");
+		expect(parsed.error.message).toBe(
+			"Every candidate rejected the credential",
+		);
+	});
+
+	it("keeps the generic 503 contract for mixed authentication and capacity failures", async () => {
+		const terminal = createRoutingTerminalResponse({
+			source: "attempts",
+			accounts: [makeAccount()],
+			capacityContext: null,
+			rateLimitOutcomes: [
+				{
+					accountId: "account-1",
+					status: 429,
+					scope: "account",
+					family: null,
+					attemptedModel: null,
+					reason: "account_capacity_signal",
+					availableAt: Date.now() + 60_000,
+				},
+			],
+			upstreamAttempts: 2,
+			authFailureCount: 1,
+		});
+
+		expect(terminal.response.status).toBe(503);
+		const parsed = await body(terminal.response);
+		expect(parsed.error.code).toBe("route_unavailable");
+	});
+
 	it("authorizes finite route-circuit recovery at route scope, without claiming whole-pool exhaustion", async () => {
 		const now = Date.UTC(2026, 6, 17, 12);
 		const retryAt = now + 30_001;

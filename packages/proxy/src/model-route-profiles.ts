@@ -17,6 +17,7 @@ const PROFILE_KEYS = new Set([
 	"displayName",
 	"description",
 	"accountId",
+	"selection",
 	"logicalModel",
 	"defaultEffort",
 	"expectedProvider",
@@ -27,12 +28,21 @@ const EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
 export type ModelRouteEffort = (typeof EFFORTS)[number];
 
+/**
+ * How a route profile chooses its upstream account.  Profiles created before
+ * capability routing existed omit this field and retain their exact-account
+ * semantics.  Capability profiles deliberately carry no account id: the
+ * selector resolves the current eligible account pool at request time.
+ */
+export type ModelRouteSelection = "capability";
+
 export interface ModelRouteProfile {
 	readonly id: string;
 	readonly publicModelId: string;
 	readonly displayName: string;
 	readonly description?: string;
-	readonly accountId: string;
+	readonly accountId?: string;
+	readonly selection?: ModelRouteSelection;
 	readonly logicalModel: string;
 	readonly defaultEffort?: ModelRouteEffort;
 	readonly expectedProvider?: string;
@@ -147,12 +157,58 @@ export function parseModelRouteProfiles(
 			defaultEffort = defaultEffortValue as ModelRouteEffort;
 		}
 
+		const selectionValue = candidate.selection;
+		let selection: ModelRouteSelection | undefined;
+		if (selectionValue !== undefined) {
+			if (selectionValue !== "capability") {
+				throw configError(
+					`profile ${index} field selection must be capability`,
+				);
+			}
+			selection = selectionValue;
+		}
+		const accountId = optionalString(
+			candidate,
+			"accountId",
+			index,
+			MAX_ACCOUNT_ID_LENGTH,
+		);
+		if (selection === "capability" && accountId !== undefined) {
+			throw configError(
+				`profile ${index} capability selection must omit accountId`,
+			);
+		}
+		if (selection !== "capability" && accountId === undefined) {
+			throw configError(
+				`profile ${index} accountId is required unless selection is capability`,
+			);
+		}
+
 		const expectedProvider = optionalString(
 			candidate,
 			"expectedProvider",
 			index,
 			MAX_PROVIDER_LENGTH,
 		)?.toLowerCase();
+		const expectedPhysicalModel = optionalString(
+			candidate,
+			"expectedPhysicalModel",
+			index,
+			MAX_MODEL_ID_LENGTH,
+		);
+		if (selection === "capability") {
+			if (!expectedProvider) {
+				throw configError(
+					`profile ${index} capability selection requires expectedProvider`,
+				);
+			}
+			if (!expectedPhysicalModel) {
+				throw configError(
+					`profile ${index} capability selection requires expectedPhysicalModel`,
+				);
+			}
+		}
+
 		return {
 			id,
 			publicModelId,
@@ -168,12 +224,8 @@ export function parseModelRouteProfiles(
 				index,
 				MAX_DESCRIPTION_LENGTH,
 			),
-			accountId: requiredString(
-				candidate,
-				"accountId",
-				index,
-				MAX_ACCOUNT_ID_LENGTH,
-			),
+			...(accountId === undefined ? {} : { accountId }),
+			...(selection === undefined ? {} : { selection }),
 			logicalModel: requiredString(
 				candidate,
 				"logicalModel",
@@ -182,12 +234,7 @@ export function parseModelRouteProfiles(
 			),
 			defaultEffort,
 			expectedProvider,
-			expectedPhysicalModel: optionalString(
-				candidate,
-				"expectedPhysicalModel",
-				index,
-				MAX_MODEL_ID_LENGTH,
-			),
+			expectedPhysicalModel,
 		};
 	});
 }

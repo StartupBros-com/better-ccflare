@@ -48,6 +48,12 @@ export interface RoutingTerminalOptions {
 	readonly capacityContext: RoutingCapacityContext | null;
 	readonly rateLimitOutcomes: readonly RequestRateLimitOutcome[];
 	readonly upstreamAttempts: number;
+	/**
+	 * Number of request-local routes that returned a definitive upstream 401.
+	 * When this equals every attempted route (and no rate-limit outcomes exist),
+	 * the terminal is an authentication failure rather than retryable capacity.
+	 */
+	readonly authFailureCount?: number;
 	readonly now?: number;
 	readonly message?: string;
 	readonly routeCircuitRecoveryHint?: RouteCircuitRecoveryHint | null;
@@ -540,6 +546,31 @@ function createRouteUnavailableResponse(options: {
 }
 
 /**
+ * Return a non-retryable authentication terminal after every attempted route
+ * rejected its credential. Keep the body Anthropic-compatible while exposing a
+ * stable machine code for clients; deliberately omit Retry-After and recovery
+ * headers so Claude Code does not retry a credential failure indefinitely.
+ */
+function createAuthenticationFailureResponse(message?: string): Response {
+	return new Response(
+		JSON.stringify({
+			type: "error",
+			error: {
+				type: "authentication_error",
+				code: "authentication_failed",
+				message:
+					message ||
+					"All compatible upstream account routes rejected the supplied credentials.",
+			},
+		}),
+		{
+			status: 401,
+			headers: { "content-type": "application/json" },
+		},
+	);
+}
+
+/**
  * Build the terminal response from positively-known routing state. Retryable
  * pool- or model-scoped recovery is deliberately narrow; absent complete,
  * finite automatic recovery evidence, requests fail once as route_unavailable.
@@ -561,6 +592,17 @@ export function createRoutingTerminalResponse(
 				// Retry-After hint, or legacy pool body would authorize guard replay.
 				routeCircuitRecoveryHint: null,
 			}),
+		};
+	}
+	const allAttemptedRoutesAuthFailed =
+		options.source === "attempts" &&
+		(options.authFailureCount ?? 0) > 0 &&
+		(options.authFailureCount ?? 0) === options.upstreamAttempts &&
+		options.rateLimitOutcomes.length === 0;
+	if (allAttemptedRoutesAuthFailed) {
+		return {
+			kind: "route_unavailable",
+			response: createAuthenticationFailureResponse(options.message),
 		};
 	}
 	const modelExhausted =

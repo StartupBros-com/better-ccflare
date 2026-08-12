@@ -42,7 +42,7 @@ This project builds upon the excellent foundation of [snipeship/ccflare](https:/
 **🛠️ Developer Experience:**
 - **Powerful CLI** - Complete command-line interface for account management and configuration
 - **REST API** - Complete API for automation and integration
-- **Claude Code `/model` Route Profiles** - Discover operator-defined, exact-account routes in Claude Code's native picker and pin one authenticated session tree when caller/session identity is available, without changing other sessions. See [configuration](docs/configuration.md#claude-code-model-route-profiles) and [routing semantics](docs/routing-architecture.md#claude-code-model-route-profiles)
+- **Claude Code `/model` Route Profiles** - Discover operator-defined exact-account or capability-pool routes in Claude Code's native picker and pin one authenticated session tree when caller/session identity is available, without changing other sessions. See [configuration](docs/configuration.md#claude-code-model-route-profiles) and [routing semantics](docs/routing-architecture.md#claude-code-model-route-profiles)
 - **Cross-Platform Binary** - Pre-compiled binary works with Node.js or Bun
 - **Comprehensive Logging** - Request/response tracking with searchable history
 - **Database Integration** - SQLite (default) or PostgreSQL for persistent storage and analytics, supporting Kubernetes multi-pod deployments
