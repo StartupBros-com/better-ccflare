@@ -5,8 +5,9 @@
  * Verifies that:
  *  - pauseIfActive(id, reason)                     pauses only if currently active
  *  - pauseIfActive(id, reason, expectedRefreshToken) additionally requires the
- *    account to still hold that exact refresh token (guards a stale/in-flight
- *    refresh from re-pausing an account that was just re-authenticated)
+ *    account to still hold that exact refresh token (or NULL for an explicit
+ *    null snapshot), guarding a stale/in-flight refresh from re-pausing an
+ *    account that was just re-authenticated; omitted remains unguarded
  *  - resumeIfPausedWithReason(id, reason)           resumes only when paused for
  *    that specific reason, leaving other pause reasons untouched
  */
@@ -63,18 +64,24 @@ function makeDb(): { db: Database; repo: AccountRepository } {
 function insertAccount(
 	db: Database,
 	id: string,
-	opts: { paused?: number; refreshToken?: string } = {},
+	opts: { paused?: number; refreshToken?: string | null } = {},
 ): void {
 	db.run(
 		`INSERT INTO accounts (id, name, created_at, paused, refresh_token) VALUES (?, ?, ?, ?, ?)`,
-		[id, id, Date.now(), opts.paused ?? 0, opts.refreshToken ?? "rt-original"],
+		[
+			id,
+			id,
+			Date.now(),
+			opts.paused ?? 0,
+			opts.refreshToken === undefined ? "rt-original" : opts.refreshToken,
+		],
 	);
 }
 
 interface RawAccount {
 	paused: number;
 	pause_reason: string | null;
-	refresh_token: string;
+	refresh_token: string | null;
 }
 
 function getAccount(db: Database, id: string): RawAccount {
@@ -145,6 +152,28 @@ describe("AccountRepository — pauseIfActive", () => {
 
 		expect(paused).toBe(false);
 		const row = getAccount(db, "acc-4");
+		expect(row.paused).toBe(0);
+		expect(row.pause_reason).toBeNull();
+	});
+
+	it("with explicit null expectedRefreshToken: pauses when the account still has no token", async () => {
+		insertAccount(db, "acc-5", { refreshToken: null });
+
+		const paused = await repo.pauseIfActive("acc-5", "auth_failure", null);
+
+		expect(paused).toBe(true);
+		const row = getAccount(db, "acc-5");
+		expect(row.paused).toBe(1);
+		expect(row.pause_reason).toBe("auth_failure");
+	});
+
+	it("with explicit null expectedRefreshToken: does NOT pause after a token appears", async () => {
+		insertAccount(db, "acc-6", { refreshToken: "rt-new-after-reauth" });
+
+		const paused = await repo.pauseIfActive("acc-6", "auth_failure", null);
+
+		expect(paused).toBe(false);
+		const row = getAccount(db, "acc-6");
 		expect(row.paused).toBe(0);
 		expect(row.pause_reason).toBeNull();
 	});

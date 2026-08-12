@@ -17,13 +17,20 @@ import {
 	type AuthFailureEvt,
 	authFailureEvents,
 	OAuthRefreshTokenError,
+	TokenRefreshError,
 } from "@better-ccflare/core";
 import { registerProvider } from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
 import {
 	clearAccountRefreshCache,
+	clearStaleTokenRefreshState,
+	isStaleTokenRefreshCoolingDown,
+	isTerminalTokenRefreshFailure,
 	pauseAccountForReauthIfInvalidGrant,
+	pauseAccountForUpstreamAuthFailure,
 	refreshAccessTokenSafe,
+	tryAcquireStaleTokenRefresh,
+	upstreamAuthFailureReason,
 } from "../handlers/token-manager";
 
 function makeAccount(overrides: Partial<Account> = {}): Account {
@@ -72,6 +79,153 @@ function makeDbOps(pauseResult = true) {
 }
 
 describe("pauseAccountForReauthIfInvalidGrant", () => {
+	it("maps OAuth upstream 401s to the re-auth pause reason", async () => {
+		const pauseAccountIfActive = mock(async () => true);
+		const account = makeAccount({
+			provider: "codex",
+			refresh_token: "rt-upstream",
+		});
+
+		expect(upstreamAuthFailureReason(account)).toBe("oauth_invalid_grant");
+		await expect(
+			pauseAccountForUpstreamAuthFailure(account, { pauseAccountIfActive }),
+		).resolves.toBe(true);
+		expect(pauseAccountIfActive).toHaveBeenCalledWith(
+			account.id,
+			"oauth_invalid_grant",
+			"rt-upstream",
+		);
+	});
+
+	it("quarantines API-key upstream 401s without suggesting OAuth re-auth", async () => {
+		const pauseAccountIfActive = mock(async () => true);
+		const account = makeAccount({
+			provider: "openai-compatible",
+			refresh_token: "",
+			api_key: "sk-test",
+		});
+
+		expect(upstreamAuthFailureReason(account)).toBe("auth_failure");
+		await expect(
+			pauseAccountForUpstreamAuthFailure(account, { pauseAccountIfActive }),
+		).resolves.toBe(true);
+		expect(pauseAccountIfActive).toHaveBeenCalledWith(
+			account.id,
+			"auth_failure",
+			undefined,
+		);
+	});
+
+	it("treats blank refresh tokens as API-key auth failures", () => {
+		expect(
+			upstreamAuthFailureReason(makeAccount({ refresh_token: "  " })),
+		).toBe("auth_failure");
+	});
+
+	it("preserves an explicit null credential snapshot for the quarantine CAS", async () => {
+		const pauseAccountIfActive = mock(async () => true);
+		const account = makeAccount({
+			provider: "openai-compatible",
+			refresh_token: null,
+		});
+
+		await pauseAccountForUpstreamAuthFailure(
+			account,
+			{ pauseAccountIfActive },
+			null,
+		);
+
+		expect(pauseAccountIfActive).toHaveBeenCalledWith(
+			account.id,
+			"auth_failure",
+			null,
+		);
+	});
+
+	it("preserves the exact nonblank refresh token for the pause CAS guard", async () => {
+		const pauseAccountIfActive = mock(async () => true);
+		const account = makeAccount({
+			provider: "anthropic",
+			refresh_token: " rt-with-padding ",
+		});
+
+		await expect(
+			pauseAccountForUpstreamAuthFailure(account, { pauseAccountIfActive }),
+		).resolves.toBe(true);
+		expect(pauseAccountIfActive).toHaveBeenCalledWith(
+			account.id,
+			"oauth_invalid_grant",
+			" rt-with-padding ",
+		);
+	});
+
+	it("uses the explicit failed credential instead of a newly reauthed token", async () => {
+		const pauseAccountIfActive = mock(async () => true);
+		const account = makeAccount({
+			provider: "anthropic",
+			refresh_token: "rt-new-after-reauth",
+		});
+
+		await expect(
+			pauseAccountForUpstreamAuthFailure(
+				account,
+				{ pauseAccountIfActive },
+				"rt-rejected",
+			),
+		).resolves.toBe(true);
+		expect(pauseAccountIfActive).toHaveBeenCalledWith(
+			account.id,
+			"oauth_invalid_grant",
+			"rt-rejected",
+		);
+	});
+
+	it("does not classify a Qwen refresh token as OAuth", () => {
+		expect(
+			upstreamAuthFailureReason(
+				makeAccount({ provider: "qwen", refresh_token: "rt-qwen" }),
+			),
+		).toBe("auth_failure");
+	});
+
+	it("classifies an xAI refresh token as OAuth", () => {
+		expect(
+			upstreamAuthFailureReason(
+				makeAccount({ provider: "xai", refresh_token: "rt-xai" }),
+			),
+		).toBe("oauth_invalid_grant");
+	});
+
+	it("bounds reactive refresh reservations and clears them after reauth", () => {
+		clearStaleTokenRefreshState("acc-cooldown");
+		expect(tryAcquireStaleTokenRefresh("acc-cooldown", 1_000)).toBe(true);
+		expect(tryAcquireStaleTokenRefresh("acc-cooldown", 1_001)).toBe(false);
+		expect(isStaleTokenRefreshCoolingDown("acc-cooldown", 1_001)).toBe(true);
+		clearStaleTokenRefreshState("acc-cooldown");
+		expect(isStaleTokenRefreshCoolingDown("acc-cooldown", 1_001)).toBe(false);
+	});
+
+	it("recognizes terminal refresh errors without classifying timeouts as auth", () => {
+		expect(
+			isTerminalTokenRefreshFailure(new OAuthRefreshTokenError("acc-1")),
+		).toBe(true);
+		expect(
+			isTerminalTokenRefreshFailure(
+				new TokenRefreshError("acc-1", new Error("invalid_grant")),
+			),
+		).toBe(true);
+		expect(
+			isTerminalTokenRefreshFailure(new Error("fetch failed: ETIMEDOUT")),
+		).toBe(false);
+	});
+
+	it("is safe when a legacy context has no pause operation", async () => {
+		const account = makeAccount({ refresh_token: "rt-legacy" });
+		await expect(pauseAccountForUpstreamAuthFailure(account, {})).resolves.toBe(
+			false,
+		);
+	});
+
 	it("publishes exactly one auth-failure event after winning the canonical pause guard", async () => {
 		const dbOps = makeDbOps(true);
 		const account = {
@@ -242,7 +396,67 @@ describe("refreshAccessTokenSafe — pause-for-reauth at the chokepoint", () => 
 		expect(pauseAccountIfActive).toHaveBeenCalledTimes(1);
 		expect(pauseAccountIfActive.mock.calls[0][0]).toBe("acc-1");
 		expect(pauseAccountIfActive.mock.calls[0][1]).toBe("oauth_invalid_grant");
+		expect(pauseAccountIfActive.mock.calls[0][2]).toBe("rt-original");
 
+		clearAccountRefreshCache(account.id);
+	});
+
+	it("retains terminal classification when the health wrapper hides the provider marker", async () => {
+		registerProvider({
+			name: "test-reauth-provider-expired",
+			canHandle: () => true,
+			refreshToken: async () => {
+				throw new OAuthRefreshTokenError("acc-expired", "invalid_grant");
+			},
+		} as never);
+
+		const account = makeAccount({
+			id: "acc-expired",
+			provider: "test-reauth-provider-expired",
+			refresh_token_issued_at: Date.now() - 366 * 24 * 60 * 60 * 1000,
+		});
+		const { ctx, pauseAccountIfActive } = makeCtx(true);
+		let thrown: unknown;
+		try {
+			await refreshAccessTokenSafe(account, ctx as never);
+		} catch (error) {
+			thrown = error;
+		}
+
+		expect(thrown).toBeInstanceOf(TokenRefreshError);
+		expect(isTerminalTokenRefreshFailure(thrown)).toBe(true);
+		expect(pauseAccountIfActive).toHaveBeenCalledWith(
+			account.id,
+			"oauth_invalid_grant",
+			"rt-original",
+		);
+		clearAccountRefreshCache(account.id);
+	});
+
+	it("captures the refresh token before a concurrent reauth mutates the account", async () => {
+		const providerName = "test-reauth-token-snapshot-provider";
+		registerProvider({
+			name: providerName,
+			canHandle: () => true,
+			refreshToken: async (providerAccount: Account) => {
+				expect(providerAccount.refresh_token).toBe("rt-original");
+				// Simulate a successful reauth racing the stale refresh failure.
+				account.refresh_token = "rt-new-after-reauth";
+				throw new OAuthRefreshTokenError(account.id, "revoked");
+			},
+		} as never);
+
+		const account = makeAccount({ provider: providerName });
+		const { ctx, pauseAccountIfActive } = makeCtx(true);
+		await expect(
+			refreshAccessTokenSafe(account, ctx as never),
+		).rejects.toThrow();
+
+		expect(pauseAccountIfActive).toHaveBeenCalledWith(
+			account.id,
+			"oauth_invalid_grant",
+			"rt-original",
+		);
 		clearAccountRefreshCache(account.id);
 	});
 

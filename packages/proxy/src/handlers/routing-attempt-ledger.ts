@@ -20,6 +20,9 @@ export type RetainedTerminalKind =
 	| "authoritative_context_overflow"
 	| "legacy_context_overflow";
 
+/** Durable account-level authentication outcomes observed in this request. */
+export type UpstreamAuthFailureReason = "oauth_invalid_grant" | "auth_failure";
+
 export interface RetainedTerminalResponse {
 	readonly terminalKind?: RetainedTerminalKind;
 	deliver(failoverAttempts: number): Promise<Response>;
@@ -43,7 +46,9 @@ export type HostedDispatchState = "undispatched" | "hosted_dispatched";
  */
 export class RoutingAttemptLedger {
 	private readonly attempted = new Set<string>();
+	private readonly retried = new Set<string>();
 	private readonly blockedAccounts = new Set<string>();
+	private readonly authFailures = new Map<string, UpstreamAuthFailureReason>();
 	private physicalAttempts = 0;
 	private degradedTracker: DegradedModeRequestTracker | null = null;
 	private guardAttemptOrdinal: number | undefined;
@@ -53,6 +58,27 @@ export class RoutingAttemptLedger {
 
 	get attemptedCount(): number {
 		return this.attempted.size;
+	}
+
+	/** Number of unique accounts that returned a definitive upstream 401. */
+	get authFailureCount(): number {
+		return this.authFailures.size;
+	}
+
+	/** True when at least one candidate was quarantined for upstream auth. */
+	get hasAuthFailures(): boolean {
+		return this.authFailures.size > 0;
+	}
+
+	/** Snapshot of account/reason pairs for terminal telemetry. */
+	get authFailureEntries(): readonly {
+		accountId: string;
+		reason: UpstreamAuthFailureReason;
+	}[] {
+		return Array.from(this.authFailures, ([accountId, reason]) => ({
+			accountId,
+			reason,
+		}));
 	}
 
 	/** Number of actual provider transports, including in-place retries. */
@@ -145,8 +171,40 @@ export class RoutingAttemptLedger {
 		return true;
 	}
 
+	/**
+	 * Claim the one bounded same-route retry used for a stale OAuth token.
+	 *
+	 * Normal route claims are intentionally one-shot so combo/model fallback
+	 * surfaces cannot send the same account/model pair twice. A stale-token
+	 * recovery is different: it has already claimed the route and is an
+	 * explicit in-place transport retry after a refreshed credential. Keep this
+	 * escape hatch narrow: it succeeds only for an existing claim and never for
+	 * an account that has since been blocked by another response.
+	 */
+	claimRetry(accountId: string, concreteModel?: string | null): boolean {
+		if (this.blockedAccounts.has(accountId)) return false;
+		const key = JSON.stringify([
+			"routing-attempt-v1",
+			accountId,
+			normalizeConcreteModel(concreteModel),
+		]);
+		if (!this.attempted.has(key) || this.retried.has(key)) return false;
+		this.retried.add(key);
+		return true;
+	}
+
 	/** Prevent every later sibling-model route for an account-wide failure. */
 	blockAccount(accountId: string): void {
+		this.blockedAccounts.add(accountId);
+	}
+
+	/** Record a definitive upstream auth result before the account is blocked. */
+	recordAuthFailure(
+		accountId: string,
+		reason: UpstreamAuthFailureReason,
+	): void {
+		if (!accountId || this.authFailures.has(accountId)) return;
+		this.authFailures.set(accountId, reason);
 		this.blockedAccounts.add(accountId);
 	}
 
@@ -180,8 +238,14 @@ export class RoutingAttemptLedger {
 /** Build user-facing attempt telemetry from the authoritative transport ledger. */
 export function formatRoutingAttemptMessage(
 	message: string,
-	ledger: Pick<RoutingAttemptLedger, "attemptedCount">,
+	ledger: Pick<RoutingAttemptLedger, "attemptedCount"> &
+		Partial<Pick<RoutingAttemptLedger, "authFailureCount">>,
 ): string {
 	const routeLabel = ledger.attemptedCount === 1 ? "route" : "routes";
-	return `${message} (${ledger.attemptedCount} unique account/model ${routeLabel} attempted)`;
+	const authFailureCount = ledger.authFailureCount ?? 0;
+	const authSuffix =
+		authFailureCount > 0
+			? `; upstream authentication failed for ${authFailureCount} account${authFailureCount === 1 ? "" : "s"}`
+			: "";
+	return `${message} (${ledger.attemptedCount} unique account/model ${routeLabel} attempted${authSuffix})`;
 }

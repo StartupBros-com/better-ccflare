@@ -300,6 +300,13 @@ with a route-unavailable response and never falls back to an unrelated account.
 Adding a new account later therefore requires no profile edit, provided its
 provider and mapping satisfy the same capability predicate.
 
+To migrate an existing single-account Sol picker without changing the public
+model ID that Claude Code has saved, keep its `id` and replace `accountId` with
+`selection: "capability"`, `expectedProvider: "codex"`, and
+`expectedPhysicalModel: "gpt-5.6-sol"`. The next process start will resolve the
+same picker against every currently eligible matching account; no session or
+account UUID is copied into the public discovery response.
+
 | Field | Required | Contract |
 |---|---:|---|
 | `id` | yes | Unique lowercase kebab-case slug, up to 48 characters. better-ccflare generates the reserved public model ID `claude-bccf-route-<id>`; clients cannot configure a different public ID |

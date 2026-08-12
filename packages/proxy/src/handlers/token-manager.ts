@@ -35,13 +35,14 @@ const log = new Logger("TokenManager");
  * refresh token and retry upstream with the wrong bearer (credential corruption),
  * so a denylist that forgets one is a security bug. An allowlist fails safe: an
  * unlisted provider simply falls over on 401 as before. `anthropic` and `codex`
- * are the only providers with a real OAuth refresh; `claude-oauth` is the legacy
- * alias for anthropic OAuth accounts.
+ * and `xai` are the providers with a real OAuth refresh; `claude-oauth` is the
+ * legacy alias for anthropic OAuth accounts.
  */
 const OAUTH_REACTIVE_REFRESH_PROVIDERS: ReadonlySet<string> = new Set([
 	"anthropic",
 	"claude-oauth",
 	"codex",
+	"xai",
 ]);
 
 /**
@@ -53,18 +54,204 @@ const OAUTH_REACTIVE_REFRESH_PROVIDERS: ReadonlySet<string> = new Set([
  */
 export function canAttemptStaleTokenRefresh(account: Account): boolean {
 	return (
-		Boolean(account.refresh_token) &&
-		OAUTH_REACTIVE_REFRESH_PROVIDERS.has(account.provider)
+		Boolean(account.refresh_token?.trim()) &&
+		OAUTH_REACTIVE_REFRESH_PROVIDERS.has(account.provider.trim().toLowerCase())
 	);
+}
+
+/**
+ * Reactive refreshes are shared across requests by account id. Keep a short
+ * cooldown in this module (next to the refresh-in-flight/backoff state) so a
+ * server with several request contexts cannot hammer an OAuth endpoint after a
+ * provider-issued 401. The map is bounded because account ids are user data.
+ */
+const STALE_TOKEN_REFRESH_COOLDOWN_MS = 60_000;
+const MAX_STALE_TOKEN_REFRESH_ENTRIES = 1_000;
+const lastStaleTokenRefreshAt = new Map<string, number>();
+
+/** Atomically reserve the next reactive refresh window for an account. */
+export function tryAcquireStaleTokenRefresh(
+	accountId: string,
+	now = Date.now(),
+): boolean {
+	const lastAttempt = lastStaleTokenRefreshAt.get(accountId);
+	if (
+		lastAttempt !== undefined &&
+		now - lastAttempt < STALE_TOKEN_REFRESH_COOLDOWN_MS
+	) {
+		return false;
+	}
+	lastStaleTokenRefreshAt.set(accountId, now);
+	if (lastStaleTokenRefreshAt.size > MAX_STALE_TOKEN_REFRESH_ENTRIES) {
+		let oldestId: string | undefined;
+		let oldestAt = Number.POSITIVE_INFINITY;
+		for (const [id, at] of lastStaleTokenRefreshAt) {
+			if (at < oldestAt) {
+				oldestId = id;
+				oldestAt = at;
+			}
+		}
+		if (oldestId) lastStaleTokenRefreshAt.delete(oldestId);
+	}
+	return true;
+}
+
+/** True when another request recently reserved a refresh for this account. */
+export function isStaleTokenRefreshCoolingDown(
+	accountId: string,
+	now = Date.now(),
+): boolean {
+	const lastAttempt = lastStaleTokenRefreshAt.get(accountId);
+	return (
+		lastAttempt !== undefined &&
+		now - lastAttempt < STALE_TOKEN_REFRESH_COOLDOWN_MS
+	);
+}
+
+/** Clear reactive refresh state after a successful response or re-auth. */
+export function clearStaleTokenRefreshState(accountId: string): void {
+	lastStaleTokenRefreshAt.delete(accountId);
+}
+
+/**
+ * Distinguish a revoked/invalid OAuth refresh token from a transient refresh
+ * transport failure. `refreshAccessTokenSafe` wraps provider errors in a
+ * TokenRefreshError, preserving the provider message in `context.originalError`;
+ * inspect both layers so callers do not durably pause an account for a timeout.
+ */
+export function isTerminalTokenRefreshFailure(error: unknown): boolean {
+	if (typeof error === "object" && error !== null) {
+		if (terminalRefreshFailures.has(error)) return true;
+	}
+	if (error instanceof OAuthRefreshTokenError) return true;
+	const messages: string[] = [];
+	if (error instanceof Error) messages.push(error.message);
+	if (typeof error === "object" && error !== null) {
+		const context = (error as { context?: unknown }).context;
+		if (typeof context === "object" && context !== null) {
+			const originalError = (context as { originalError?: unknown })
+				.originalError;
+			if (typeof originalError === "string") messages.push(originalError);
+		}
+	}
+	return messages.some((message) => isInvalidGrantMessage(message));
+}
+
+// Keep the refresh credential identity alongside a wrapped failure without
+// putting the raw token into Error.context/toJSON/log output. A WeakMap also
+// means this metadata disappears with the error and cannot grow with traffic.
+const refreshFailureTokens = new WeakMap<object, string | null>();
+const terminalRefreshFailures = new WeakSet<object>();
+
+/** Return the refresh token captured by the refresh operation that failed. */
+export function getRefreshTokenUsedForFailure(
+	error: unknown,
+): string | null | undefined {
+	if (typeof error !== "object" || error === null) return undefined;
+	return refreshFailureTokens.get(error);
+}
+
+/**
+ * Return the durable pause reason for an upstream authentication failure.
+ *
+ * A refresh-token account needs a real re-authentication, while a static
+ * API-key account needs its credential repaired or replaced.  Keep the latter
+ * distinct from `oauth_invalid_grant`: the dashboard/CLI should not suggest an
+ * OAuth flow for an API key, but both states must leave the account out of the
+ * routing pool after a definitive 401.
+ */
+export function upstreamAuthFailureReason(
+	account: Pick<Account, "refresh_token"> & Partial<Pick<Account, "provider">>,
+): "oauth_invalid_grant" | "auth_failure" {
+	const provider = account.provider?.trim().toLowerCase();
+	return account.refresh_token?.trim() &&
+		provider !== undefined &&
+		OAUTH_REACTIVE_REFRESH_PROVIDERS.has(provider)
+		? "oauth_invalid_grant"
+		: "auth_failure";
 }
 
 /** Minimal slice of DatabaseOperations needed to pause an account for reauth. */
 interface ReauthPauser {
-	pauseAccountIfActive(
+	pauseAccountIfActive?(
 		accountId: string,
 		reason: string,
 		expectedRefreshToken?: string | null,
 	): Promise<boolean>;
+}
+
+/**
+ * Persist a definitive upstream 401 as an account quarantine.
+ *
+ * This is deliberately separate from refresh-token error handling: an access
+ * token can be rejected while its expiry metadata still says "valid".  The
+ * caller has already completed the bounded stale-token refresh/retry decision
+ * before invoking this helper.  The DB operation is compare-and-set-like
+ * (`pauseAccountIfActive`), so concurrent requests produce one durable write and
+ * one alert event; already-paused/manual accounts are left untouched.
+ *
+ * Older test/runtime contexts may not expose the optional pause method.  In that
+ * case this helper remains a safe no-op and the request-local routing ledger is
+ * still responsible for preventing another send in the same request.
+ */
+export async function pauseAccountForUpstreamAuthFailure(
+	account: Pick<Account, "id" | "name" | "provider" | "refresh_token">,
+	dbOps: ReauthPauser,
+	/** Explicit credential identity used by the failed request, when known. */
+	expectedRefreshToken?: string | null,
+): Promise<boolean> {
+	const pause = dbOps.pauseAccountIfActive;
+	if (typeof pause !== "function") return false;
+	// `undefined` preserves the legacy call contract (derive from the live
+	// account). `null` is an explicit snapshot for a non-OAuth credential and
+	// must not fall through to a newly reauthenticated token on the account.
+	const refreshTokenForFailure =
+		expectedRefreshToken === undefined
+			? account.refresh_token
+			: expectedRefreshToken;
+	const reason = upstreamAuthFailureReason({
+		provider: account.provider,
+		refresh_token: refreshTokenForFailure,
+	});
+	// Compare the exact stored token in the CAS.  Trimming here would make a
+	// legitimate token containing surrounding whitespace fail the guard even
+	// though the account still holds the rejected credential; trimming is only
+	// used for classification (OAuth vs API key).
+	const expectedTokenForCas =
+		expectedRefreshToken === undefined
+			? refreshTokenForFailure?.trim()
+				? refreshTokenForFailure
+				: undefined
+			: refreshTokenForFailure;
+	try {
+		const paused = await pause(account.id, reason, expectedTokenForCas);
+		if (paused) {
+			log.error(
+				`Account "${account.name}" PAUSED — upstream authentication failed (401; ${reason}). Repair the credential before resuming it.`,
+			);
+			try {
+				authFailureEvents.emit("event", {
+					accountId: account.id,
+					accountName: account.name,
+					provider: account.provider,
+					reason,
+				});
+			} catch (eventErr) {
+				// Alerting is best-effort and must never undo a committed quarantine.
+				log.error(
+					`Failed to publish upstream auth-failure event for ${account.name}:`,
+					eventErr,
+				);
+			}
+		}
+		return paused;
+	} catch (pauseErr) {
+		log.error(
+			`Failed to quarantine account ${account.name} after upstream 401:`,
+			pauseErr,
+		);
+		return false;
+	}
 }
 
 /**
@@ -88,16 +275,24 @@ export async function pauseAccountForReauthIfInvalidGrant(
 		refresh_token: string | null;
 	},
 	dbOps: ReauthPauser,
+	/** Refresh-token snapshot captured before the provider call. */
+	expectedRefreshToken?: string | null,
 ): Promise<boolean> {
 	const message = error instanceof Error ? error.message : String(error);
 	const isInvalidGrant =
 		error instanceof OAuthRefreshTokenError || isInvalidGrantMessage(message);
 	if (!isInvalidGrant) return false;
+	const pause = dbOps.pauseAccountIfActive;
+	if (typeof pause !== "function") return false;
 	try {
-		const paused = await dbOps.pauseAccountIfActive(
+		const refreshTokenForCas =
+			expectedRefreshToken === undefined
+				? account.refresh_token
+				: expectedRefreshToken;
+		const paused = await pause(
 			account.id,
 			PAUSE_REASON_NEEDS_REAUTH,
-			account.refresh_token ?? undefined,
+			refreshTokenForCas?.trim() ? refreshTokenForCas : undefined,
 		);
 		if (paused) {
 			log.error(
@@ -184,6 +379,7 @@ registerDisposable({
 		stopTokenCleanupInterval();
 		refreshFailures.clear();
 		backoffCounters.clear();
+		lastStaleTokenRefreshAt.clear();
 	},
 });
 
@@ -340,12 +536,20 @@ export async function refreshAccessTokenSafe(
 
 	// Check if a refresh is already in progress for this account
 	if (!ctx.refreshInFlight.has(account.id)) {
+		// Snapshot the credential before creating the provider promise. Reauth can
+		// replace the mutable account object while the network call is in flight;
+		// the provider and CAS pause must both refer to this exact credential.
+		const refreshTokenAtStart = account.refresh_token;
+		const refreshAccount = {
+			...account,
+			refresh_token: refreshTokenAtStart,
+		};
 		// Get the provider for this account
 		const provider = getProvider(account.provider) || ctx.provider;
 
 		// Create a new refresh promise and store it
 		const refreshPromise = provider
-			.refreshToken(account, ctx.runtime.clientId)
+			.refreshToken(refreshAccount, ctx.runtime.clientId)
 			.then((result: TokenRefreshResult) => {
 				// 1. Persist to database asynchronously
 				ctx.asyncWriter.enqueue(() =>
@@ -397,8 +601,24 @@ export async function refreshAccessTokenSafe(
 				// leaving it in rotation to fail every request. Awaited so the pause
 				// lands before any caller (e.g. the auto-refresh scheduler) records a
 				// generic failure that could otherwise mask the specific reason.
-				await pauseAccountForReauthIfInvalidGrant(error, account, ctx.dbOps);
-				throw new TokenRefreshError(account.id, new Error(enhancedMessage));
+				const terminalRefreshFailure = isTerminalTokenRefreshFailure(error);
+				await pauseAccountForReauthIfInvalidGrant(
+					error,
+					account,
+					ctx.dbOps,
+					refreshTokenAtStart,
+				);
+				const wrappedError = new TokenRefreshError(
+					account.id,
+					new Error(enhancedMessage),
+				);
+				refreshFailureTokens.set(wrappedError, refreshTokenAtStart);
+				if (terminalRefreshFailure) {
+					// Preserve definitive classification even when getOAuthErrorMessage
+					// replaces the provider marker with a health/reauth hint.
+					terminalRefreshFailures.add(wrappedError);
+				}
+				throw wrappedError;
 			})
 			.finally(() => {
 				// Clean up the map when done (success or failure)
@@ -580,6 +800,7 @@ export function clearAccountRefreshCache(accountId: string): void {
 	// registered yet.
 	refreshFailures.delete(accountId);
 	backoffCounters.delete(accountId);
+	clearStaleTokenRefreshState(accountId);
 	for (const [serverId, clearer] of refreshClearers) {
 		try {
 			clearer(accountId);
@@ -609,6 +830,7 @@ function _clearAccountRefreshCacheWithContext(
 	// Clear refresh failure records and backoff
 	refreshFailures.delete(accountId);
 	backoffCounters.delete(accountId);
+	clearStaleTokenRefreshState(accountId);
 
 	log.info(`Cleared refresh cache for account ${accountId}`);
 }

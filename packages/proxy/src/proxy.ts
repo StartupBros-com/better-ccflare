@@ -3124,6 +3124,7 @@ async function handleProxyCore(
 		capacityContext: getRoutingCapacityContext(requestMeta),
 		rateLimitOutcomes: getRequestRateLimitOutcomes(req),
 		upstreamAttempts: actualUpstreamAttempts,
+		authFailureCount: routingAttemptLedger.authFailureCount,
 		hostedDispatchState: routingAttemptLedger.hostedDispatchState,
 		modelRecoveryAt: reactiveModelRecoveryAt,
 		message: formatRoutingAttemptMessage(

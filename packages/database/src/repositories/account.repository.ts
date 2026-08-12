@@ -304,14 +304,24 @@ export class AccountRepository extends BaseRepository<Account> {
 	 * the account still holding that exact refresh token. This guards the
 	 * OAuth-invalid-grant pause against a stale/in-flight refresh (using an old
 	 * token) re-pausing an account that was just re-authenticated, after reauth
-	 * the stored refresh token differs, so the guarded UPDATE no-ops.
+	 * the stored refresh token differs, so the guarded UPDATE no-ops. An explicit
+	 * `null` is also a credential snapshot: it requires the row to still have a
+	 * NULL refresh_token. Only an omitted argument (`undefined`) retains the
+	 * legacy unguarded behavior.
 	 */
 	async pauseIfActive(
 		accountId: string,
 		reason: string,
 		expectedRefreshToken?: string | null,
 	): Promise<boolean> {
-		if (expectedRefreshToken != null) {
+		if (expectedRefreshToken !== undefined) {
+			if (expectedRefreshToken === null) {
+				const changes = await this.runWithChanges(
+					`UPDATE accounts SET paused = 1, pause_reason = ? WHERE id = ? AND COALESCE(paused, 0) = 0 AND refresh_token IS NULL`,
+					[reason, accountId],
+				);
+				return changes > 0;
+			}
 			const changes = await this.runWithChanges(
 				`UPDATE accounts SET paused = 1, pause_reason = ? WHERE id = ? AND COALESCE(paused, 0) = 0 AND refresh_token = ?`,
 				[reason, accountId, expectedRefreshToken],
