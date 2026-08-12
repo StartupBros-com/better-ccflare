@@ -617,15 +617,24 @@ export function deriveAffinityLaneKey(
 	const path = normalizePath(meta.path);
 	const family = getModelFamily(model) ?? "unknown";
 	const beta = canonicalizeBetaSignature(meta.headers?.get("anthropic-beta"));
-	return JSON.stringify([
+	const legacyLane = [
 		"routing-lane-v1",
-		meta.routeProfileId?.trim() || null,
 		session,
 		getProtocolFamily(path),
 		path,
 		family,
 		model,
 		beta,
+	] as const;
+	const routeProfileId = meta.routeProfileId?.trim();
+	if (!routeProfileId) return JSON.stringify(legacyLane);
+	// Profile-scoped lanes intentionally use a distinct version/tag. This keeps
+	// the long-standing ordinary-traffic JSON shape/indexes stable while making
+	// capability pools unable to inherit an owner retained by a native lane.
+	return JSON.stringify([
+		"routing-lane-profile-v1",
+		routeProfileId,
+		...legacyLane.slice(1),
 	]);
 }
 

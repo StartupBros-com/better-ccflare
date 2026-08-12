@@ -26,6 +26,7 @@ const { getProvider, registerProvider, usageCache } = await import(
 const { SessionStrategy } = await import("@better-ccflare/load-balancer");
 const {
 	ForceRouteUnavailableError,
+	deriveAffinityLaneKey,
 	getClientVisibleServerToolAccountId,
 	getCapacityDeferredModelRoutes,
 	getComboSlotInfo,
@@ -3289,6 +3290,39 @@ describe("selectAccountsForRequest — lane identity and quota pressure", () => 
 		expect(fableA.affinityLaneKey).not.toBe(opus.affinityLaneKey);
 		expect(fableA.affinityLaneKey).toContain("/v1/messages");
 		expect(fableA.affinityLaneKey).toContain("fable");
+	});
+
+	it("preserves the legacy lane tuple and namespaces profile lanes separately", () => {
+		const ordinary = makeRequestMeta({
+			clientSessionId: "conversation-legacy",
+			headers: new Headers({ "anthropic-beta": "beta-b, context-1m" }),
+		});
+		const ordinaryLane = deriveAffinityLaneKey(ordinary, "claude-opus-4-8");
+		expect(ordinaryLane).not.toBeNull();
+		expect(JSON.parse(ordinaryLane as string)).toEqual([
+			"routing-lane-v1",
+			"conversation-legacy",
+			"messages",
+			"/v1/messages",
+			"opus",
+			"claude-opus-4-8",
+			"beta-b,context-1m",
+		]);
+
+		const profiledLane = deriveAffinityLaneKey(
+			{ ...ordinary, routeProfileId: "gpt-sol-capability" },
+			"claude-opus-4-8",
+		);
+		expect(JSON.parse(profiledLane as string)).toEqual([
+			"routing-lane-profile-v1",
+			"gpt-sol-capability",
+			"conversation-legacy",
+			"messages",
+			"/v1/messages",
+			"opus",
+			"claude-opus-4-8",
+			"beta-b,context-1m",
+		]);
 	});
 
 	it("derives comparable quota metadata for OAuth subscription accounts with null billing_type", async () => {
