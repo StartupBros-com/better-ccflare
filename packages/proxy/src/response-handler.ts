@@ -30,8 +30,10 @@ import {
 import { isInternalProbe, type ProxyContext } from "./handlers";
 import { applyRateLimitCooldown } from "./handlers/rate-limit-cooldown";
 import {
+	boundedAccountHoldReset,
 	classifyPreByte429,
 	getAnthropicRateLimitResetAt,
+	type RateLimitScopeDecision,
 } from "./handlers/rate-limit-scope";
 import { createSseRateLimitSniffer } from "./handlers/sse-rate-limit-sniffer";
 import { ingestModelsListing } from "./model-catalog";
@@ -140,6 +142,11 @@ export function handleAnthropicSseRateLimit(
 	ctx: ProxyContext,
 	betaSignature: string | null = null,
 ): void {
+	// Hoisted out of the branch below: the cooldown call at the end of this
+	// function needs the verdict to know whether any reset it has is attributable
+	// to the account window. Without it that call defaulted to "confirmed" and
+	// could still write a 12h whole-account bench from a per-model reset (#160).
+	let decision: RateLimitScopeDecision | null = null;
 	if (firedReason === "rate_limit_error") {
 		// Reuse the same conservative policy as a pre-byte generic 429. The SSE
 		// response itself is 200, so synthesize only the status while preserving
@@ -148,7 +155,7 @@ export function handleAnthropicSseRateLimit(
 			status: 429,
 			headers: response.headers,
 		});
-		const decision = classifyPreByte429({
+		decision = classifyPreByte429({
 			isAnthropic:
 				ctx.provider.name === "anthropic" ||
 				account.provider === "claude-oauth",
@@ -216,15 +223,27 @@ export function handleAnthropicSseRateLimit(
 	// applyRateLimitCooldown's upstream_529_overloaded_no_reset handling).
 	// A genuine rate_limit_error still honors the original HTTP 200 headers
 	// exactly as before — they can positively describe a real quota window.
+	// The header below never names its window and carries the per-model weekly
+	// reset on a model-scoped 429, and the fallback is a value ccflare invents.
+	// Neither is attributable, so only the classifier's proven account window may
+	// size a durable hold — bounded by the header, which may shorten it but never
+	// stretch it (#160).
+	const attributedReset = boundedAccountHoldReset(
+		decision?.accountWindowResetAt ?? null,
+		getAnthropicRateLimitResetAt(response, now),
+	);
 	applyRateLimitCooldown(
 		account,
 		isOverload
 			? { reason: midStreamReason }
 			: {
 					resetTime:
+						attributedReset ??
 						getAnthropicRateLimitResetAt(response, now) ??
 						now + getMidStreamRateLimitCooldownMs(),
 					reason: midStreamReason,
+					resetTimeScope:
+						attributedReset !== null ? "confirmed" : "unattributed",
 				},
 		ctx,
 	);

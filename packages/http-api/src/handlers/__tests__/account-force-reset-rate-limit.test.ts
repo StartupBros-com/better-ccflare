@@ -16,8 +16,14 @@ mock.module("@better-ccflare/cli-commands", () => ({
 	resumeAccount: mock(async () => ({ success: true })),
 }));
 
+// Must cover every symbol ../accounts imports from this module: a partial mock
+// makes the missing name a hard SyntaxError at import time, not a runtime
+// undefined, so omitting one fails the whole file rather than one assertion.
+// Only visible when this file runs ALONE — a batch run may already have loaded
+// the real module — which is exactly what CI's isolated-file pass is for.
 mock.module("@better-ccflare/proxy", () => ({
 	clearAccountRefreshCache: mock(() => {}),
+	getBindingConstraint: mock(() => null),
 	getUsageThrottleStatus: mock(() => ({ throttled: false })),
 	refreshCodexUsageForAccount: mock(async () => false),
 	restartUsagePollingForAccount: mock(() => {}),

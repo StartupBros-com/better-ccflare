@@ -472,6 +472,7 @@ function cacheIncidentUsage(
 	observedAt: number,
 	overrides: {
 		weeklyAll?: number;
+		weeklyAllReset?: number;
 		family?: string;
 		accountWindowsActive?: boolean;
 	} = {},
@@ -491,7 +492,7 @@ function cacheIncidentUsage(
 					kind: "weekly_all",
 					percent: overrides.weeklyAll ?? 72,
 					resets_at: new Date(
-						INCIDENT_NOW + 6 * 24 * 60 * 60 * 1000,
+						overrides.weeklyAllReset ?? INCIDENT_NOW + 6 * 24 * 60 * 60 * 1000,
 					).toISOString(),
 					is_active: overrides.accountWindowsActive ?? true,
 				},
@@ -1005,6 +1006,54 @@ describe("proxyWithAccount — generic Anthropic 429 scope", () => {
 		// The incident value was exactly the 12h ceiling. Anything near it is the
 		// bug; a probe-scale hold is the fix.
 		expect(heldForMs).toBeLessThan(60 * 60 * 1000);
+	});
+
+	// #160 finding 1, end to end. The account IS genuinely spent, so an
+	// account-wide bench is right — but its length must come from the window that
+	// proved it (2h), not from the response header's per-model reset (3 days,
+	// which the ceiling clamps to 12h). #158 gated on the verdict's reason and
+	// then passed extractCooldownUntil's independent pick, so this shape still
+	// benched a recoverable account for half a day.
+	it("sizes a confirmed account bench from the proving window, not the header", async () => {
+		const accountReset = INCIDENT_NOW + 2 * 60 * 60 * 1000;
+		usageCache.delete("acc-anthropic-1");
+		cacheIncidentUsage("acc-anthropic-1", INCIDENT_NOW - 120_000, {
+			weeklyAll: 100,
+			weeklyAllReset: accountReset,
+		});
+		globalThis.fetch = mock(async () =>
+			generic429Response({
+				"anthropic-ratelimit-unified-status": "rate_limited",
+				"anthropic-ratelimit-unified-reset": String(
+					Math.floor((INCIDENT_NOW + 3 * 24 * 60 * 60 * 1000) / 1000),
+				),
+			}),
+		);
+		const ctx = makeProxyContextWithAsyncExec();
+		const account = makeAccount();
+		const bodyBuffer = makeRequestBody("claude-fable-5");
+		const req = makeRequest(bodyBuffer);
+
+		await proxyWithAccount(
+			req,
+			new URL("https://proxy.local/v1/messages"),
+			account,
+			makeRequestMeta(),
+			bodyBuffer,
+			() => undefined,
+			0,
+			ctx,
+		);
+
+		expect(getRequestRateLimitOutcomes(req)).toEqual([
+			expect.objectContaining({
+				scope: "account",
+				reason: "account_capacity_signal",
+			}),
+		]);
+		// Exactly the proving window's reset — not the 3-day header, and not the
+		// 12h ceiling that header would have been clamped to.
+		expect(account.rate_limited_until).toBe(accountReset);
 	});
 
 	it("keeps an unknown concrete model account-scoped", async () => {

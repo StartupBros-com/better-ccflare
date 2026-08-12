@@ -116,6 +116,7 @@ function setFreshScopedUsage(
 	accountId: string,
 	family = "Fable",
 	weeklyAll = 72,
+	weeklyAllReset = Date.now() + 6 * 24 * 60 * 60_000,
 ): void {
 	usageCache.set(accountId, {
 		limits: [
@@ -128,7 +129,7 @@ function setFreshScopedUsage(
 			{
 				kind: "weekly_all",
 				percent: weeklyAll,
-				resets_at: new Date(Date.now() + 6 * 24 * 60 * 60_000).toISOString(),
+				resets_at: new Date(weeklyAllReset).toISOString(),
 				is_active: true,
 			},
 			{
@@ -570,6 +571,49 @@ describe("forwardToClient — model-scoped Anthropic 429 after SSE bytes", () =>
 					"claude-fable-5-20260701",
 				),
 			).toBeNull();
+		} finally {
+			usageCache.delete(account.id);
+			Date.now = realDateNow;
+		}
+	});
+
+	// The mid-stream twin of proxy-operations-out-of-credits.test.ts's
+	// "sizes a confirmed account bench from the proving window, not the header".
+	//
+	// Every other fixture in this file pairs a SHORT header reset with a long or
+	// absent account window, so the header wins under both the old and the new
+	// logic and cannot tell them apart — reverting response-handler.ts to the
+	// pre-#161 version leaves this whole file at 17/17. This test reverses the
+	// relationship: the proving account window clears in 2h while the header
+	// advertises 3 days, so it fails loudly if the hold is ever sized from the
+	// header again.
+	it("sizes the mid-stream account hold from the proving window, not the header", async () => {
+		const now = 1_800_000_000_000;
+		const accountReset = now + 2 * 60 * 60 * 1000;
+		const realDateNow = Date.now;
+		Date.now = () => now;
+		const account = makeAccount({ id: "acct-mid-attributed-window" });
+		const { ctx, calls } = makeCtxWithReason();
+		setFreshScopedUsage(account.id, "Fable", 100, accountReset);
+
+		try {
+			await forwardAndConsumeMidStream(
+				account,
+				ctx,
+				midStreamErrorResponse("rate_limit_error", {
+					"anthropic-ratelimit-unified-status": "rate_limited",
+					"anthropic-ratelimit-unified-reset": String(
+						Math.floor((now + 3 * 24 * 60 * 60 * 1000) / 1000),
+					),
+				}),
+				"claude-fable-5-20260701",
+			);
+
+			expect(calls.markRateLimited).toHaveLength(1);
+			// The proving window, not the 3-day header and not the 12h ceiling it
+			// would have been clamped to.
+			expect(calls.markRateLimited[0]?.resetTime).toBe(accountReset);
+			expect(account.rate_limited_until).toBe(accountReset);
 		} finally {
 			usageCache.delete(account.id);
 			Date.now = realDateNow;
