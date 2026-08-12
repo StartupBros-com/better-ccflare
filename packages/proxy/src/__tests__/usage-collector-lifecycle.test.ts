@@ -2383,6 +2383,233 @@ describe("UsageCollector request lifecycle", () => {
 			});
 		});
 
+		it("flags ambiguous model-less attribution when 16 distinct billable models fill the billing aggregate's cap before a model-less entry arrives (#141 round 5)", async () => {
+			const { collector, savedUsages } = harness();
+			const requestId =
+				"stream-billing-aggregate-cap-swallows-unresolved-bucket";
+			const fallbackLogs = captureFallbackUsageLogs();
+
+			// 16 distinct billable modeled entries fill BOTH the billing
+			// aggregate and the observed-model set to exactly MAX_BILLING_MODELS
+			// (16) — neither overflows. The model-less (compaction) billable
+			// entry that follows would be the aggregate's 17th distinct KEY
+			// (UNRESOLVED_MODEL_KEY): `billingAggregate.size >=
+			// MAX_BILLING_MODELS` trips and its bucket is NEVER created —
+			// pre-fix, unresolvedIterationModels (read from that bucket's
+			// .count) silently reads 0 no matter how many model-less billable
+			// entries follow. The trailing fallback_message reuses cap-model-1
+			// (already observed), so the observed-model set does NOT overflow
+			// either — that escape hatch does not save it. This is the
+			// reviewer's round-5 failing shape; DECISIVE for the fix.
+			const cappedModels = Array.from(
+				{ length: 16 },
+				(_, i) => `cap-model-${i + 1}`,
+			);
+			const iterations = [
+				...cappedModels.map((model) => ({
+					type: "message",
+					model,
+					input_tokens: 1,
+					output_tokens: 1,
+				})),
+				{
+					type: "compaction",
+					input_tokens: 2,
+					output_tokens: 3,
+					cache_read_input_tokens: 5,
+					cache_creation_input_tokens: 7,
+				},
+				{
+					type: "fallback_message",
+					model: cappedModels[0],
+					input_tokens: 11,
+					output_tokens: 13,
+					cache_read_input_tokens: 17,
+					cache_creation_input_tokens: 19,
+				},
+			];
+
+			try {
+				collector.handleStart(makeStartMessage(requestId));
+				collector.handleChunk(
+					requestId,
+					new TextEncoder().encode(
+						`event: message_start\ndata: {"type":"message_start","message":{"model":"${cappedModels[0]}","usage":{"input_tokens":23,"output_tokens":0}}}\n\nevent: response.completed\ndata: ${JSON.stringify(
+							{
+								usage: {
+									input_tokens: 23,
+									output_tokens: 29,
+									cache_read_input_tokens: 31,
+									cache_creation_input_tokens: 37,
+									iterations,
+								},
+							},
+						)}\n\n`,
+					),
+				);
+				// 16 + compaction + fallback_message = 18 raw entries, well under
+				// MAX_USAGE_ITERATIONS (64) — the snapshot is not truncated, so
+				// this exercises the normal (non-truncated) split-pricing path.
+				await collector.handleEnd({ type: "end", requestId, success: true });
+				await collector.drain();
+			} finally {
+				fallbackLogs.stop();
+			}
+
+			expect(savedUsages.get(requestId)).toMatchObject({
+				model: cappedModels[0],
+			});
+			expect(fallbackLogs.events).toHaveLength(1);
+			expect(fallbackLogs.events[0]?.data).toMatchObject({
+				billingIncomplete: true,
+				unresolvedIterationModels: 1,
+			});
+		});
+
+		it("still flags ambiguous model-less attribution when well under the billing-aggregate cap (control, #141 round 5)", async () => {
+			const { collector, savedUsages } = harness();
+			const requestId =
+				"stream-billing-aggregate-under-cap-still-flags-ambiguous";
+			const fallbackLogs = captureFallbackUsageLogs();
+
+			// Same shape as the cap-swallowing test above (N modeled billable
+			// entries, then a model-less billable entry, then a fallback_message
+			// reusing the first model), but N=2 — nowhere near
+			// MAX_BILLING_MODELS (16). The UNRESOLVED_MODEL_KEY bucket is
+			// created normally here both before and after the fix; this pins
+			// that the fix does not change the well-under-cap case.
+			const smallModels = ["small-model-1", "small-model-2"];
+			const iterations = [
+				...smallModels.map((model) => ({
+					type: "message",
+					model,
+					input_tokens: 1,
+					output_tokens: 1,
+				})),
+				{
+					type: "compaction",
+					input_tokens: 2,
+					output_tokens: 3,
+					cache_read_input_tokens: 5,
+					cache_creation_input_tokens: 7,
+				},
+				{
+					type: "fallback_message",
+					model: smallModels[0],
+					input_tokens: 11,
+					output_tokens: 13,
+					cache_read_input_tokens: 17,
+					cache_creation_input_tokens: 19,
+				},
+			];
+
+			try {
+				collector.handleStart(makeStartMessage(requestId));
+				collector.handleChunk(
+					requestId,
+					new TextEncoder().encode(
+						`event: message_start\ndata: {"type":"message_start","message":{"model":"${smallModels[0]}","usage":{"input_tokens":23,"output_tokens":0}}}\n\nevent: response.completed\ndata: ${JSON.stringify(
+							{
+								usage: {
+									input_tokens: 23,
+									output_tokens: 29,
+									cache_read_input_tokens: 31,
+									cache_creation_input_tokens: 37,
+									iterations,
+								},
+							},
+						)}\n\n`,
+					),
+				);
+				await collector.handleEnd({ type: "end", requestId, success: true });
+				await collector.drain();
+			} finally {
+				fallbackLogs.stop();
+			}
+
+			expect(savedUsages.get(requestId)).toMatchObject({
+				model: smallModels[0],
+			});
+			expect(fallbackLogs.events).toHaveLength(1);
+			expect(fallbackLogs.events[0]?.data).toMatchObject({
+				billingIncomplete: true,
+				unresolvedIterationModels: 1,
+			});
+		});
+
+		it("does not flag a single-model snapshot with a model-less entry, even near the billing-aggregate cap (control, #141 round 5)", async () => {
+			const { collector, savedUsages } = harness();
+			const requestId = "stream-billing-aggregate-single-model-not-ambiguous";
+			const fallbackLogs = captureFallbackUsageLogs();
+
+			// Only ONE distinct model is ever observed (every modeled entry is
+			// the same model), plus a model-less billable compaction entry.
+			// unresolvedBillableIterationCount is still incremented (the
+			// counter fires on every billable model-less entry regardless of
+			// how many models are in play), but iterationAttributionAmbiguous
+			// requires observedDistinctModels >= 2 (or overflow) as well — a
+			// single-model attribution is not ambiguous, so this must stay
+			// unflagged.
+			const iterations = [
+				{
+					type: "message",
+					model: "only-model",
+					input_tokens: 1,
+					output_tokens: 1,
+				},
+				{
+					type: "compaction",
+					input_tokens: 2,
+					output_tokens: 3,
+					cache_read_input_tokens: 5,
+					cache_creation_input_tokens: 7,
+				},
+				{
+					type: "fallback_message",
+					model: "only-model",
+					input_tokens: 11,
+					output_tokens: 13,
+					cache_read_input_tokens: 17,
+					cache_creation_input_tokens: 19,
+				},
+			];
+
+			try {
+				collector.handleStart(makeStartMessage(requestId));
+				collector.handleChunk(
+					requestId,
+					new TextEncoder().encode(
+						`event: message_start\ndata: {"type":"message_start","message":{"model":"only-model","usage":{"input_tokens":23,"output_tokens":0}}}\n\nevent: response.completed\ndata: ${JSON.stringify(
+							{
+								usage: {
+									input_tokens: 23,
+									output_tokens: 29,
+									cache_read_input_tokens: 31,
+									cache_creation_input_tokens: 37,
+									iterations,
+								},
+							},
+						)}\n\n`,
+					),
+				);
+				await collector.handleEnd({ type: "end", requestId, success: true });
+				await collector.drain();
+			} finally {
+				fallbackLogs.stop();
+			}
+
+			expect(savedUsages.get(requestId)).toMatchObject({
+				model: "only-model",
+			});
+			expect(fallbackLogs.events).toHaveLength(1);
+			expect(fallbackLogs.events[0]?.data).not.toHaveProperty(
+				"billingIncomplete",
+			);
+			expect(fallbackLogs.events[0]?.data).not.toHaveProperty(
+				"unresolvedIterationModels",
+			);
+		});
+
 		it("detects fallback from SSE event context without starting token timing", async () => {
 			useDeterministicModelPricing();
 			const { collector, savedUsages } = harness();

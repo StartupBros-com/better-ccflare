@@ -96,6 +96,18 @@ interface RequestState {
 		// observedIterationModelsUsable to false rather than growing.
 		observedIterationModels?: Set<string>;
 		observedIterationModelsUsable?: boolean;
+		// Count of billable (output_tokens > 0) model-less iteration entries,
+		// tracked as a plain counter independent of iterationsAggregate's
+		// MAX_BILLING_MODELS cap. iterationsAggregate can fill its cap on
+		// distinct MODELED keys alone before a model-less entry is ever seen —
+		// at that point its UNRESOLVED_MODEL_KEY bucket is never created, so
+		// reading the unresolved count from the capped map would silently
+		// undercount (see #141 round 5). This counter increments on every
+		// billable model-less entry regardless of whether the aggregate had
+		// room for its bucket, so no cap-ordering interaction can suppress it.
+		// Complete-snapshot state: replaced wholesale by a later snapshot
+		// exactly like `iterations`, cleared in freeRequestState.
+		unresolvedBillableIterationCount?: number;
 	};
 	lastActivity: number;
 	createdAt: number; // Capacity eviction ordering
@@ -286,6 +298,14 @@ function captureUsageIterations(usage: unknown, state: RequestState): void {
 	// overflow instead of trusting an undercounted tally.
 	const observedIterationModels = new Set<string>();
 	let observedIterationModelsUsable = true;
+	// Independent of billingAggregate's MAX_BILLING_MODELS cap (see the
+	// unresolvedBillableIterationCount field comment on RequestState.usage):
+	// incremented on every billable model-less entry, regardless of whether
+	// the aggregate had room to create a bucket for it. This is the ONLY
+	// source the ambiguity flag below reads for that count — never
+	// billingAggregate.get(UNRESOLVED_MODEL_KEY), which can be starved by
+	// 16 distinct modeled keys arriving first.
+	let unresolvedBillableIterationCount = 0;
 	for (const rawIteration of rawIterations) {
 		if (
 			!rawIteration ||
@@ -311,6 +331,9 @@ function captureUsageIterations(usage: unknown, state: RequestState): void {
 		const outputTokens = normalizeTokenCount(raw.output_tokens);
 		if ((outputTokens ?? 0) > 0) {
 			const key = model ?? UNRESOLVED_MODEL_KEY;
+			if (key === UNRESOLVED_MODEL_KEY) {
+				unresolvedBillableIterationCount += 1;
+			}
 			let bucket = billingAggregate.get(key);
 			if (!bucket) {
 				if (billingAggregate.size >= MAX_BILLING_MODELS) {
@@ -361,6 +384,8 @@ function captureUsageIterations(usage: unknown, state: RequestState): void {
 	state.usage.iterationsAggregateUsable = billingAggregateUsable;
 	state.usage.observedIterationModels = observedIterationModels;
 	state.usage.observedIterationModelsUsable = observedIterationModelsUsable;
+	state.usage.unresolvedBillableIterationCount =
+		unresolvedBillableIterationCount;
 }
 
 // Extract usage data from non-stream JSON response bodies
@@ -666,6 +691,7 @@ function freeRequestState(state: RequestState): void {
 	state.usage.iterationsAggregateUsable = undefined;
 	state.usage.observedIterationModels = undefined;
 	state.usage.observedIterationModelsUsable = undefined;
+	state.usage.unresolvedBillableIterationCount = undefined;
 	state.usagePayloadSeq = undefined;
 	state.fallbackBlockSeen = undefined;
 	state.fallbackFromModel = undefined;
@@ -1086,9 +1112,22 @@ export class UsageCollector {
 		// billable. When the observed set overflowed its cap, its true
 		// cardinality is unknown, so ambiguity fails open (flagged) rather
 		// than trusting an undercounted tally.
-		const billingAggregate = state.usage.iterationsAggregate;
+		//
+		// unresolvedIterationModels must come from
+		// unresolvedBillableIterationCount, NEVER from
+		// billingAggregate.get(UNRESOLVED_MODEL_KEY)?.count: billingAggregate is
+		// capped at MAX_BILLING_MODELS distinct KEYS (including
+		// UNRESOLVED_MODEL_KEY itself). If MAX_BILLING_MODELS distinct MODELED
+		// entries arrive before the first model-less billable entry, the cap is
+		// already full and the UNRESOLVED_MODEL_KEY bucket is never created —
+		// the map-based read would then silently stay 0 forever, no matter how
+		// many model-less billable entries follow, and the flag below would
+		// never fire (#141 round 5). unresolvedBillableIterationCount is a
+		// plain counter incremented on every billable model-less entry
+		// regardless of whether its bucket could be created, so it cannot be
+		// suppressed by any cap-ordering interaction.
 		const unresolvedIterationModels =
-			billingAggregate?.get(UNRESOLVED_MODEL_KEY)?.count ?? 0;
+			state.usage.unresolvedBillableIterationCount ?? 0;
 		const observedDistinctModels =
 			state.usage.observedIterationModels?.size ?? 0;
 		const observedIterationModelsOverflowed =
