@@ -842,6 +842,49 @@ describe("selectAccountsForRequest — server-derived route profile", () => {
 		expect(ctx.strategy.select).toHaveBeenCalledTimes(1);
 	});
 
+	it("filters a usage-exhausted matching account before capability strategy order", async () => {
+		const exhausted = makeAccount({
+			id: "usage-exhausted-sol",
+			provider: "codex",
+			model_mappings: JSON.stringify({ opus: "gpt-5.6-sol" }),
+		});
+		const healthy = makeAccount({
+			id: "usage-healthy-sol",
+			provider: "codex",
+			priority: 1,
+			model_mappings: JSON.stringify({ opus: "gpt-5.6-sol" }),
+		});
+		cacheUsage(exhausted.id, {
+			limits: [
+				{
+					kind: "session",
+					percent: 100,
+					resets_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+					scope: null,
+				},
+			],
+		});
+		const ctx = makeCtx({ accounts: [exhausted, healthy] });
+		const meta = makeRequestMeta({
+			routeProfileId: "sol-capability",
+			routeProfileSelection: "capability",
+			routeProfileLogicalModel: "claude-opus-5",
+			routeProfileExpectedPhysicalModel: "gpt-5.6-sol",
+			routeExpectedProvider: "codex",
+		});
+
+		const result = await selectAccountsForRequest(meta, ctx, "claude-opus-5");
+
+		expect(result.map(({ id }) => id)).toEqual([healthy.id]);
+		expect(meta.hardExcludedAccountIds).toEqual(new Set([exhausted.id]));
+		expect(ctx.strategy.select).toHaveBeenCalledTimes(1);
+		expect(
+			(ctx.strategy.select as ReturnType<typeof mock>).mock.calls[0]?.[0].map(
+				(account: Account) => account.id,
+			),
+		).toEqual([healthy.id]);
+	});
+
 	it("keeps a child request inside the root capability pool", async () => {
 		const sol = makeAccount({
 			id: "sol-child-pool",
