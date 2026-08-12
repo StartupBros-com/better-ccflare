@@ -3502,6 +3502,37 @@ describe("proxyWithAccount — 401 failover", () => {
 		expect(result).toBeNull();
 	});
 
+	it("keeps a single API-key 401 request-local without durable quarantine", async () => {
+		globalThis.fetch = mock(async () =>
+			jsonResponse(
+				{ error: { type: "authentication_error", message: "route rejected" } },
+				401,
+			),
+		);
+		const bodyBuffer = makeRequestBody();
+		const ctx = makeProxyContext();
+		const pauseAccountIfActive = mock(async () => true);
+		(
+			ctx.dbOps as unknown as {
+				pauseAccountIfActive: typeof pauseAccountIfActive;
+			}
+		).pauseAccountIfActive = pauseAccountIfActive;
+
+		const result = await proxyWithAccount(
+			makeRequest(bodyBuffer),
+			new URL("https://proxy.local/v1/messages"),
+			makeAccount(),
+			makeRequestMeta(),
+			bodyBuffer,
+			() => undefined,
+			0,
+			ctx,
+		);
+
+		expect(result).toBeNull();
+		expect(pauseAccountIfActive).not.toHaveBeenCalled();
+	});
+
 	it("does not failover on successful 200 response", async () => {
 		globalThis.fetch = mock(async () =>
 			jsonResponse(

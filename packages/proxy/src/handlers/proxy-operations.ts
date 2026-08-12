@@ -3419,6 +3419,19 @@ export async function proxyWithAccount(
 				return null;
 			}
 
+			// A single upstream 401 is not sufficient evidence for an account-wide
+			// credential quarantine. Custom endpoints and model-scoped gateways can
+			// reject one route while the credential remains valid elsewhere. The
+			// only safe durable signal here is a second 401 after a genuine OAuth
+			// refresh/retry on the same account. Terminal invalid-grant refresh
+			// failures are quarantined by the token manager itself. Every other
+			// 401 remains request-local so one bad route cannot DoS the account.
+			if (!refreshEligible || staleTokenRetryAttempt === 0) {
+				routingAttemptLedger?.blockAccount(account.id);
+				await discardUnusedResponse(failedResponse, discardReason);
+				return null;
+			}
+
 			const failedCredentialRefreshToken = refreshTokenUsedByFailure ?? null;
 			const reason = upstreamAuthFailureReason({
 				provider: account.provider,
