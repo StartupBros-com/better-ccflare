@@ -4,11 +4,11 @@ import {
 	type UsageSnapshot,
 } from "@better-ccflare/providers";
 import {
+	boundedAccountHoldReset,
 	classifyPreByte429,
 	getAnthropicRateLimitResetAt,
 	getRequestRateLimitOutcomes,
 	hasHardAnthropicAccountSignal,
-	isAccountScopeConfirmed,
 	recordRequestRateLimitOutcome,
 } from "../rate-limit-scope";
 
@@ -18,7 +18,9 @@ function snapshot(
 	observedAt: number,
 	overrides: {
 		session?: number;
+		sessionReset?: number;
 		weeklyAll?: number;
+		weeklyAllReset?: number;
 		family?: string;
 		scoped?: number;
 		scopedReset?: number | null;
@@ -26,7 +28,9 @@ function snapshot(
 ): UsageSnapshot {
 	const {
 		session = 0,
+		sessionReset = NOW + 60 * 60 * 1000,
 		weeklyAll = 72,
+		weeklyAllReset = NOW + 6 * 24 * 60 * 60 * 1000,
 		family = "Fable",
 		scoped = 100,
 		scopedReset = NOW + 60 * 60 * 1000,
@@ -38,13 +42,13 @@ function snapshot(
 				{
 					kind: "session",
 					percent: session,
-					resets_at: new Date(NOW + 60 * 60 * 1000).toISOString(),
+					resets_at: new Date(sessionReset).toISOString(),
 					is_active: true,
 				},
 				{
 					kind: "weekly_all",
 					percent: weeklyAll,
-					resets_at: new Date(NOW + 6 * 24 * 60 * 60 * 1000).toISOString(),
+					resets_at: new Date(weeklyAllReset).toISOString(),
 					is_active: true,
 				},
 				{
@@ -302,7 +306,7 @@ describe("classifyPreByte429", () => {
 	// evidence rather than the header. That distinction is load-bearing: only
 	// `account_capacity_signal` names a window attributable to the account, so
 	// only it lets the cooldown honour that window's reset instead of the probe
-	// backoff (see isAccountScopeConfirmed / ResetTimeScope, #157).
+	// backoff (see accountWindowResetAt / ResetTimeScope, #157, #160).
 	it("reports the spent account window as the reason, not the bare header", () => {
 		const decision = classifyPreByte429({
 			isAnthropic: true,
@@ -315,7 +319,119 @@ describe("classifyPreByte429", () => {
 		});
 		expect(decision.scope).toBe("account");
 		expect(decision.reason).toBe("account_capacity_signal");
-		expect(isAccountScopeConfirmed(decision.reason)).toBe(true);
+		// What the bench site actually keys on.
+		expect(decision.accountWindowResetAt).not.toBeNull();
+	});
+
+	// #160, the core finding. Proving the account is spent says nothing about
+	// WHICH reset belongs to it. Here the account window clears in 2h while the
+	// response header advertises a per-model reset 3 days out; the verdict must
+	// carry the 2h window's reset, because that is the one it proved. Pairing
+	// the verdict with the header's value is how a spent short window still
+	// produced a 12h whole-account bench.
+	it("carries the proving account window's reset, not the header's", () => {
+		const accountReset = NOW + 2 * 60 * 60 * 1000;
+		const decision = classifyPreByte429({
+			isAnthropic: true,
+			response: response({
+				"anthropic-ratelimit-unified-status": "rate_limited",
+				"anthropic-ratelimit-unified-reset": String(
+					Math.floor((NOW + 3 * 24 * 60 * 60 * 1000) / 1000),
+				),
+			}),
+			attemptedModel: "claude-fable-5",
+			snapshot: snapshot(NOW - 120_000, {
+				weeklyAll: 100,
+				weeklyAllReset: accountReset,
+			}),
+			now: NOW,
+		});
+
+		expect(decision.scope).toBe("account");
+		expect(decision.reason).toBe("account_capacity_signal");
+		expect(decision.accountWindowResetAt).toBe(accountReset);
+	});
+
+	// #160 finding 3: account exhaustion must be provable without a recognized
+	// family. Nested under `family !== null`, a new or custom model against a
+	// spent account fell through to a probe cooldown and re-hit it every
+	// 30s-5min until reset.
+	it("proves account exhaustion for an unknown model family", () => {
+		const accountReset = NOW + 90 * 60 * 1000;
+		const decision = classifyPreByte429({
+			isAnthropic: true,
+			response: response({
+				"anthropic-ratelimit-unified-status": "rate_limited",
+			}),
+			attemptedModel: "custom-model-without-family",
+			snapshot: snapshot(NOW - 120_000, {
+				weeklyAll: 100,
+				weeklyAllReset: accountReset,
+			}),
+			now: NOW,
+		});
+
+		expect(decision.scope).toBe("account");
+		expect(decision.reason).toBe("account_capacity_signal");
+		expect(decision.accountWindowResetAt).toBe(accountReset);
+	});
+
+	// Both account windows spent with very different resets. The hold takes the
+	// EARLIER one: the account only truly frees at the later, but re-probing at
+	// the earlier and re-benching if still spent is the cheap error, while
+	// holding for the later one on possibly-stale evidence is the expensive one.
+	it("takes the earliest reset when several account windows are spent", () => {
+		const sessionReset = NOW + 90 * 60 * 1000;
+		const weeklyAllReset = NOW + 5 * 24 * 60 * 60 * 1000;
+		const decision = classifyPreByte429({
+			isAnthropic: true,
+			response: response({
+				"anthropic-ratelimit-unified-status": "rate_limited",
+			}),
+			attemptedModel: "claude-fable-5",
+			snapshot: snapshot(NOW - 120_000, {
+				session: 100,
+				sessionReset,
+				weeklyAll: 100,
+				weeklyAllReset,
+			}),
+			now: NOW,
+		});
+
+		expect(decision.reason).toBe("account_capacity_signal");
+		expect(decision.accountWindowResetAt).toBe(sessionReset);
+	});
+
+	it("leaves the account window reset null on a family verdict", () => {
+		const decision = classifyPreByte429({
+			isAnthropic: true,
+			response: response(),
+			attemptedModel: "claude-fable-5",
+			snapshot: snapshot(NOW - 120_000),
+			now: NOW,
+		});
+
+		expect(decision.scope).toBe("family");
+		expect(decision.accountWindowResetAt).toBeNull();
+	});
+
+	it("leaves the account window reset null when a spent window has no future reset", () => {
+		const decision = classifyPreByte429({
+			isAnthropic: true,
+			response: response({
+				"anthropic-ratelimit-unified-status": "rate_limited",
+			}),
+			attemptedModel: "claude-fable-5",
+			snapshot: snapshot(NOW - 120_000, {
+				weeklyAll: 100,
+				weeklyAllReset: NOW - 1,
+			}),
+			now: NOW,
+		});
+
+		expect(decision.reason).toBe("account_capacity_signal");
+		// Spent, but nothing usable to size a hold from -> caller must back off.
+		expect(decision.accountWindowResetAt).toBeNull();
 	});
 
 	// The cold-cache shape from #157: account scope is still the right call, but
@@ -333,7 +449,8 @@ describe("classifyPreByte429", () => {
 		});
 		expect(decision.scope).toBe("account");
 		expect(decision.reason).toBe("hard_response_signal");
-		expect(isAccountScopeConfirmed(decision.reason)).toBe(false);
+		// Nothing attributable -> the bench site must fall back to the backoff ramp.
+		expect(decision.accountWindowResetAt).toBeNull();
 	});
 
 	it("keeps a hard response header account scoped when no scoped cap matches the family", () => {
@@ -682,5 +799,38 @@ describe("request-local rate-limit outcome ledger", () => {
 		]);
 		expect(getRequestRateLimitOutcomes(second)).toEqual([]);
 		expect(Object.isFrozen(getRequestRateLimitOutcomes(first))).toBe(true);
+	});
+});
+
+describe("boundedAccountHoldReset", () => {
+	// An upstream instruction may only ever SHORTEN a hold, never lengthen it.
+	// The first cut of #161 preferred the proven window unconditionally, which
+	// turned a `retry-after: 120` next to a six-day weekly window into a 12h
+	// bench — the same over-benching this seam keeps producing, merely sourced
+	// from our own snapshot instead of the header.
+	const PROVEN = NOW + 6 * 24 * 60 * 60 * 1000;
+
+	it("lets a shorter upstream instruction win", () => {
+		const upstream = NOW + 120_000;
+		expect(boundedAccountHoldReset(PROVEN, upstream)).toBe(upstream);
+	});
+
+	it("never lets a longer upstream value stretch the proven window", () => {
+		const upstream = NOW + 30 * 24 * 60 * 60 * 1000;
+		expect(boundedAccountHoldReset(PROVEN, upstream)).toBe(PROVEN);
+	});
+
+	it("uses the proven window when upstream stated nothing", () => {
+		expect(boundedAccountHoldReset(PROVEN, null)).toBe(PROVEN);
+	});
+
+	// No proven window means nothing may size a durable hold, however confident
+	// the header sounds — the caller falls back to the backoff ramp.
+	it("returns null with no proven window, even when upstream states one", () => {
+		expect(boundedAccountHoldReset(null, NOW + 120_000)).toBeNull();
+	});
+
+	it("returns null when neither side has a value", () => {
+		expect(boundedAccountHoldReset(null, null)).toBeNull();
 	});
 });
