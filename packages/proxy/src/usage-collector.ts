@@ -32,6 +32,15 @@ import {
 	type StartMessage,
 } from "./worker-messages";
 
+interface UsageIteration {
+	type: string | undefined;
+	model: string | undefined;
+	input_tokens: number | undefined;
+	output_tokens: number | undefined;
+	cache_read_input_tokens: number | undefined;
+	cache_creation_input_tokens: number | undefined;
+}
+
 interface RequestState {
 	startMessage: StartMessage;
 	cacheFlightCohortSealReceipt?: CacheFlightCohortSealReceipt | null;
@@ -40,6 +49,7 @@ interface RequestState {
 	chunks: Uint8Array[];
 	chunksBytes: number;
 	chunksTruncated: boolean;
+	usagePayloadSeq?: number;
 	usage: {
 		model?: string;
 		inputTokens?: number;
@@ -52,6 +62,52 @@ interface RequestState {
 		totalTokens?: number;
 		costUsd?: number;
 		tokensPerSecond?: number;
+		iterations?: UsageIteration[];
+		iterationsSeq?: number;
+		fallbackIterationSeen?: boolean;
+		fallbackIterationModel?: string;
+		iterationsTruncated?: boolean;
+		// Per-model token aggregate built while scanning the FULL raw
+		// iterations array (not just the retained/capped slice), so a
+		// truncated snapshot can still be priced without silently dropping
+		// advisor spend. Complete-snapshot state: replaced wholesale by a
+		// later snapshot exactly like `iterations`, cleared in
+		// freeRequestState. `count` tracks how many billable raw iterations
+		// fell into each bucket, used to size the model-less (UNRESOLVED_
+		// MODEL_KEY) bucket for the attribution-ambiguity flag (Fix 2).
+		iterationsAggregate?: Map<
+			string,
+			{
+				input: number;
+				output: number;
+				cacheRead: number;
+				cacheCreation: number;
+				count: number;
+			}
+		>;
+		iterationsAggregateUsable?: boolean;
+		// Distinct non-empty model strings observed on ANY raw iteration entry,
+		// regardless of output_tokens — unlike iterationsAggregate, a
+		// zero-output modeled attempt (e.g. a declined primary) still counts
+		// here. Built over the FULL raw array in the same loop as the billing
+		// aggregate. Complete-snapshot state: replaced wholesale by a later
+		// snapshot exactly like `iterations`, cleared in freeRequestState.
+		// Bounded by MAX_BILLING_MODELS; overflow sets
+		// observedIterationModelsUsable to false rather than growing.
+		observedIterationModels?: Set<string>;
+		observedIterationModelsUsable?: boolean;
+		// Count of billable (output_tokens > 0) model-less iteration entries,
+		// tracked as a plain counter independent of iterationsAggregate's
+		// MAX_BILLING_MODELS cap. iterationsAggregate can fill its cap on
+		// distinct MODELED keys alone before a model-less entry is ever seen —
+		// at that point its UNRESOLVED_MODEL_KEY bucket is never created, so
+		// reading the unresolved count from the capped map would silently
+		// undercount (see #141 round 5). This counter increments on every
+		// billable model-less entry regardless of whether the aggregate had
+		// room for its bucket, so no cap-ordering interaction can suppress it.
+		// Complete-snapshot state: replaced wholesale by a later snapshot
+		// exactly like `iterations`, cleared in freeRequestState.
+		unresolvedBillableIterationCount?: number;
 	};
 	lastActivity: number;
 	createdAt: number; // Capacity eviction ordering
@@ -65,6 +121,33 @@ interface RequestState {
 	providerFinalOutputTokens?: number;
 	shouldSkipLogging?: boolean;
 	currentEvent?: string; // Track SSE event type across chunks
+	fallbackBlockSeen?: boolean;
+	fallbackFromModel?: string;
+	servingModelAuthoritative?: boolean;
+	// usagePayloadSeq recorded at the moment a fallback signal rewrites
+	// state.usage.model (either the streaming content-block site or the
+	// non-stream content[] scan site). If no later usage payload arrives
+	// after that rewrite, the retained counters are stale-model attempts
+	// that were never actually billed at the new model's rate.
+	fallbackModelRewriteSeq?: number;
+	// Model that owned state.usage counters immediately before the fallback
+	// rewrite recorded by fallbackModelRewriteSeq. A chained rewrite within
+	// the same usage-payload epoch (e.g. FABLE->HAIKU->OPUS with no usage
+	// payload between them) must not overwrite this — it always names the
+	// FIRST pre-rewrite model, which is the model the retained counters
+	// were actually produced under.
+	countersOwnerModel?: string;
+	// Sequence mirroring usagePayloadSeq: incremented once per REAL
+	// (non-fallback) content_block_start. content_block_delta never updates
+	// state.usage.outputTokens (tiktoken-based per-delta counting was
+	// removed), so this is the only categorical signal that genuine
+	// billable content streamed at all.
+	realContentBlockSeq?: number;
+	// realContentBlockSeq snapshotted at the moment of the most recent usage
+	// payload. If realContentBlockSeq has advanced past this value by
+	// finalization, real content streamed that no usage payload has
+	// accounted for since.
+	realContentBlockSeqAtLastUsagePayload?: number;
 }
 
 const log = new Logger("UsageCollector");
@@ -74,6 +157,15 @@ const MAX_REQUESTS_MAP_SIZE = 10000;
 const MAX_MISSING_STATE_WARNINGS = 1000;
 const DEFAULT_PRICING_TIMEOUT_MS = 5_000;
 const MAX_PRICING_TIMEOUT_MS = 60_000;
+const MAX_USAGE_ITERATIONS = 64;
+// Distinct-model cap for the billing aggregate built alongside a (possibly
+// truncated) iterations snapshot. Bounds the aggregate Map's growth
+// independent of MAX_USAGE_ITERATIONS; exceeding it marks the aggregate
+// unusable rather than growing unboundedly.
+const MAX_BILLING_MODELS = 16;
+// Aggregate bucket key for iteration entries with no model field (e.g.
+// compaction), matching the `iteration.model ?? model` serving-model rule.
+const UNRESOLVED_MODEL_KEY = "<unresolved>";
 const MAX_RESPONSE_BODY_BYTES = 256 * 1024; // 256KB - cap stored response body
 const MAX_REQUEST_BODY_BYTES = 4 * 1024 * 1024; // 4MB - afterburn needs full conversation history
 // Bound on distinct conversation IDs buffered for dropped recorder evidence
@@ -155,25 +247,212 @@ function processSSELine(line: string, state: RequestState): void {
 	}
 }
 
+function normalizeNonEmptyString(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const normalized = value.trim();
+	return normalized.length > 0 ? normalized : undefined;
+}
+
+function normalizeTokenCount(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0
+		? value
+		: undefined;
+}
+
+function captureUsageIterations(usage: unknown, state: RequestState): void {
+	if (!usage || typeof usage !== "object") return;
+	const rawIterations = (usage as Record<string, unknown>).iterations;
+	if (!Array.isArray(rawIterations)) return;
+	if (rawIterations.length > MAX_USAGE_ITERATIONS) {
+		log.warn("Usage iterations exceeded limit; truncating", {
+			requestId: state.startMessage.requestId,
+			observedLength: rawIterations.length,
+			maxIterations: MAX_USAGE_ITERATIONS,
+		});
+	}
+
+	const iterations: UsageIteration[] = [];
+	let fallbackIterationSeen = false;
+	let fallbackIterationModel: string | undefined;
+	// Per-model billing aggregate, built over the FULL raw array (not just
+	// the retained/capped slice) so a truncated snapshot never loses billing
+	// accuracy. Only entries that actually produced output are billable —
+	// pre-output declines stay free, matching the split-pricing predicate.
+	const billingAggregate = new Map<
+		string,
+		{
+			input: number;
+			output: number;
+			cacheRead: number;
+			cacheCreation: number;
+			count: number;
+		}
+	>();
+	let billingAggregateUsable = true;
+	// Every distinct non-empty model string seen on ANY entry, regardless of
+	// output_tokens — a zero-output modeled attempt (e.g. a declined primary)
+	// is still a model that participated, so it must raise this count even
+	// though it never enters billingAggregate above. Bounded by the same
+	// MAX_BILLING_MODELS cap; overflow marks the set unusable rather than
+	// growing it, and the ambiguity check below fails toward flagging on that
+	// overflow instead of trusting an undercounted tally.
+	const observedIterationModels = new Set<string>();
+	let observedIterationModelsUsable = true;
+	// Independent of billingAggregate's MAX_BILLING_MODELS cap (see the
+	// unresolvedBillableIterationCount field comment on RequestState.usage):
+	// incremented on every billable model-less entry, regardless of whether
+	// the aggregate had room to create a bucket for it. This is the ONLY
+	// source the ambiguity flag below reads for that count — never
+	// billingAggregate.get(UNRESOLVED_MODEL_KEY), which can be starved by
+	// 16 distinct modeled keys arriving first.
+	let unresolvedBillableIterationCount = 0;
+	for (const rawIteration of rawIterations) {
+		if (
+			!rawIteration ||
+			typeof rawIteration !== "object" ||
+			Array.isArray(rawIteration)
+		) {
+			continue;
+		}
+		const raw = rawIteration as Record<string, unknown>;
+		if (raw.type === "fallback_message") {
+			fallbackIterationSeen = true;
+			const model = normalizeNonEmptyString(raw.model);
+			if (model) fallbackIterationModel = model;
+		}
+		const model = normalizeNonEmptyString(raw.model);
+		if (model && !observedIterationModels.has(model)) {
+			if (observedIterationModels.size >= MAX_BILLING_MODELS) {
+				observedIterationModelsUsable = false;
+			} else {
+				observedIterationModels.add(model);
+			}
+		}
+		const outputTokens = normalizeTokenCount(raw.output_tokens);
+		if ((outputTokens ?? 0) > 0) {
+			const key = model ?? UNRESOLVED_MODEL_KEY;
+			if (key === UNRESOLVED_MODEL_KEY) {
+				unresolvedBillableIterationCount += 1;
+			}
+			let bucket = billingAggregate.get(key);
+			if (!bucket) {
+				if (billingAggregate.size >= MAX_BILLING_MODELS) {
+					billingAggregateUsable = false;
+				} else {
+					bucket = {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheCreation: 0,
+						count: 0,
+					};
+					billingAggregate.set(key, bucket);
+				}
+			}
+			if (bucket) {
+				bucket.input += normalizeTokenCount(raw.input_tokens) ?? 0;
+				bucket.output += outputTokens ?? 0;
+				bucket.cacheRead +=
+					normalizeTokenCount(raw.cache_read_input_tokens) ?? 0;
+				bucket.cacheCreation +=
+					normalizeTokenCount(raw.cache_creation_input_tokens) ?? 0;
+				bucket.count += 1;
+			}
+		}
+
+		if (iterations.length >= MAX_USAGE_ITERATIONS) continue;
+		iterations.push({
+			type: typeof raw.type === "string" ? raw.type : undefined,
+			model,
+			input_tokens: normalizeTokenCount(raw.input_tokens),
+			output_tokens: outputTokens,
+			cache_read_input_tokens: normalizeTokenCount(raw.cache_read_input_tokens),
+			cache_creation_input_tokens: normalizeTokenCount(
+				raw.cache_creation_input_tokens,
+			),
+		});
+	}
+
+	// Each provider payload is a complete snapshot. A later array supersedes
+	// the earlier one, including when every later entry is invalid.
+	state.usage.iterations = iterations;
+	state.usage.iterationsSeq = state.usagePayloadSeq;
+	state.usage.fallbackIterationSeen = fallbackIterationSeen;
+	state.usage.fallbackIterationModel = fallbackIterationModel;
+	state.usage.iterationsTruncated = rawIterations.length > MAX_USAGE_ITERATIONS;
+	state.usage.iterationsAggregate = billingAggregate;
+	state.usage.iterationsAggregateUsable = billingAggregateUsable;
+	state.usage.observedIterationModels = observedIterationModels;
+	state.usage.observedIterationModelsUsable = observedIterationModelsUsable;
+	state.usage.unresolvedBillableIterationCount =
+		unresolvedBillableIterationCount;
+}
+
 // Extract usage data from non-stream JSON response bodies
 function extractUsageFromJson(
 	json: {
 		model?: string;
+		content?: unknown;
 		usage?: {
 			input_tokens?: number;
 			cache_read_input_tokens?: number;
 			cache_creation_input_tokens?: number;
 			output_tokens?: number;
+			iterations?: unknown;
 		};
 	},
 	state: RequestState,
 ): void {
 	if (!json) return;
+	const normalizedModel = normalizeNonEmptyString(json.model);
+	if (Array.isArray(json.content)) {
+		for (const rawContentBlock of json.content) {
+			if (
+				!rawContentBlock ||
+				typeof rawContentBlock !== "object" ||
+				Array.isArray(rawContentBlock)
+			) {
+				continue;
+			}
+			const contentBlock = rawContentBlock as Record<string, unknown>;
+			if (contentBlock.type !== "fallback") continue;
+
+			state.fallbackBlockSeen = true;
+			const from = contentBlock.from;
+			const to = contentBlock.to;
+			const fromModel = normalizeNonEmptyString(
+				from && typeof from === "object" && !Array.isArray(from)
+					? (from as Record<string, unknown>).model
+					: undefined,
+			);
+			const toModel = normalizeNonEmptyString(
+				to && typeof to === "object" && !Array.isArray(to)
+					? (to as Record<string, unknown>).model
+					: undefined,
+			);
+			if (fromModel) state.fallbackFromModel = fromModel;
+			if (toModel && !normalizedModel) {
+				state.usage.model = toModel;
+				// Sequence-guard site 2 (non-stream): record the seq at the
+				// moment of the rewrite. If no later usage payload arrives to
+				// advance usagePayloadSeq past this value, the pricing branch
+				// treats the retained counters as pre-output and refuses to
+				// price them at the new model's rate.
+				state.fallbackModelRewriteSeq = state.usagePayloadSeq;
+			}
+		}
+	}
 
 	const usageObj = json.usage;
 	if (!usageObj) return;
 
-	state.usage.model = json.model ?? state.usage.model;
+	state.usagePayloadSeq = (state.usagePayloadSeq ?? 0) + 1;
+	captureUsageIterations(usageObj, state);
+	// The non-stream response model is authoritative over both fallback signals.
+	state.usage.model = normalizedModel ?? state.usage.model;
+	if (normalizedModel) {
+		state.servingModelAuthoritative = true;
+	}
 
 	if (usageObj.input_tokens !== undefined) {
 		state.usage.inputTokens = usageObj.input_tokens;
@@ -204,6 +483,18 @@ function extractUsageFromData(
 ): void {
 	try {
 		const parsed = JSON.parse(data);
+		let usagePayloadCounted = false;
+		const countUsagePayload = () => {
+			if (usagePayloadCounted) return;
+			usagePayloadCounted = true;
+			state.usagePayloadSeq = (state.usagePayloadSeq ?? 0) + 1;
+			// Snapshot the real-content sequence at the moment this usage
+			// payload lands, so finalization can tell whether any real
+			// content streamed AFTER the last payload that could have
+			// accounted for it.
+			state.realContentBlockSeqAtLastUsagePayload =
+				state.realContentBlockSeq ?? 0;
+		};
 
 		// Handle message_start - check both parsed.type and eventType
 		// (Some providers put type in event line, Anthropic puts it in JSON)
@@ -212,6 +503,8 @@ function extractUsageFromData(
 		if (isMessageStart) {
 			if (parsed.message?.usage) {
 				const usage = parsed.message.usage;
+				countUsagePayload();
+				captureUsageIterations(usage, state);
 				if (usage.input_tokens !== undefined) {
 					state.usage.inputTokens = usage.input_tokens;
 					state.usage.inputTokensPresent = true;
@@ -231,9 +524,58 @@ function extractUsageFromData(
 			}
 		}
 
-		// Track streaming start time on first content block
-		if (parsed.type === "content_block_start" && !state.firstTokenTimestamp) {
+		const isContentBlockStart =
+			parsed.type === "content_block_start" ||
+			eventType === "content_block_start";
+
+		const isFallbackContentBlock =
+			isContentBlockStart && parsed.content_block?.type === "fallback";
+
+		// Track streaming start time on first content block. A fallback seam
+		// is itself a content_block_start/stop pair with no deltas (per
+		// Anthropic's streaming docs), so it must not start the clock — doing
+		// so deflates tokensPerSecond by counting handoff latency as
+		// generation time.
+		if (
+			isContentBlockStart &&
+			!isFallbackContentBlock &&
+			!state.firstTokenTimestamp
+		) {
 			state.firstTokenTimestamp = Date.now();
+		}
+
+		// Real (non-fallback) content blocks carry no usage of their own —
+		// content_block_delta never updates state.usage.outputTokens — so
+		// this sequence is the only signal that genuine billable content
+		// streamed at all. Compared against
+		// realContentBlockSeqAtLastUsagePayload at finalization to detect
+		// content that no usage payload has accounted for.
+		if (isContentBlockStart && !isFallbackContentBlock) {
+			state.realContentBlockSeq = (state.realContentBlockSeq ?? 0) + 1;
+		}
+
+		if (isFallbackContentBlock) {
+			state.fallbackBlockSeen = true;
+			const fromModel = normalizeNonEmptyString(
+				parsed.content_block.from?.model,
+			);
+			const toModel = normalizeNonEmptyString(parsed.content_block.to?.model);
+			if (fromModel) state.fallbackFromModel = fromModel;
+			if (toModel) {
+				if (state.fallbackModelRewriteSeq !== state.usagePayloadSeq) {
+					// First rewrite since counters were last refreshed by a
+					// usage payload: capture the model that actually owns the
+					// CURRENT counters before it is overwritten below. A later
+					// rewrite in the same epoch (chained fallback) must not
+					// clobber this — the counters still belong to the FIRST
+					// pre-rewrite model.
+					state.countersOwnerModel = state.usage.model;
+				}
+				state.usage.model = toModel;
+				// Sequence-guard site 1 (streaming): mirror of the non-stream
+				// site above. See its comment for the pricing consequence.
+				state.fallbackModelRewriteSeq = state.usagePayloadSeq;
+			}
 		}
 
 		// Handle message_delta - check both parsed.type and eventType
@@ -243,6 +585,8 @@ function extractUsageFromData(
 			state.lastTokenTimestamp = Date.now();
 
 			if (parsed.usage) {
+				countUsagePayload();
+				captureUsageIterations(parsed.usage, state);
 				// Update all token counts from message_delta (authoritative for zai)
 				if (parsed.usage.output_tokens !== undefined) {
 					state.providerFinalOutputTokens = parsed.usage.output_tokens;
@@ -271,6 +615,8 @@ function extractUsageFromData(
 
 		// Handle any usage field in the data
 		if (parsed.usage) {
+			countUsagePayload();
+			captureUsageIterations(parsed.usage, state);
 			if (parsed.usage.input_tokens !== undefined) {
 				state.usage.inputTokens = parsed.usage.input_tokens;
 				state.usage.inputTokensPresent = true;
@@ -336,6 +682,24 @@ function freeRequestState(state: RequestState): void {
 	state.chunks.length = 0;
 	state.chunksBytes = 0;
 	state.buffer = "";
+	state.usage.iterations = undefined;
+	state.usage.iterationsSeq = undefined;
+	state.usage.fallbackIterationSeen = undefined;
+	state.usage.fallbackIterationModel = undefined;
+	state.usage.iterationsTruncated = undefined;
+	state.usage.iterationsAggregate = undefined;
+	state.usage.iterationsAggregateUsable = undefined;
+	state.usage.observedIterationModels = undefined;
+	state.usage.observedIterationModelsUsable = undefined;
+	state.usage.unresolvedBillableIterationCount = undefined;
+	state.usagePayloadSeq = undefined;
+	state.fallbackBlockSeen = undefined;
+	state.fallbackFromModel = undefined;
+	state.servingModelAuthoritative = undefined;
+	state.fallbackModelRewriteSeq = undefined;
+	state.countersOwnerModel = undefined;
+	state.realContentBlockSeq = undefined;
+	state.realContentBlockSeqAtLastUsagePayload = undefined;
 	// Release request body and headers held in startMessage.
 	// Without this, orphaned requests retain full request bodies until the
 	// inactivity cleanup configured by CF_STREAM_TIMEOUT_MS runs. See #67.
@@ -644,7 +1008,147 @@ export class UsageCollector {
 			}
 		}
 
+		// The streaming message_start names the REQUESTED model; a fallback content
+		// block or a fallback_message iteration names the model that actually served.
+		// A non-stream body's top-level model is already the serving model, so it wins.
+		if (
+			state.servingModelAuthoritative !== true &&
+			state.fallbackBlockSeen !== true &&
+			state.usage.fallbackIterationModel
+		) {
+			state.usage.model = state.usage.fallbackIterationModel;
+		}
+
 		// Calculate total tokens and cost
+		const iterations = state.usage.iterations ?? [];
+		const hasFallbackSignal =
+			state.fallbackBlockSeen === true ||
+			state.usage.fallbackIterationSeen === true;
+		const iterationsStale = state.usage.iterationsSeq !== state.usagePayloadSeq;
+		const hasFallbackBillingSplit =
+			hasFallbackSignal &&
+			iterations.length > 0 &&
+			state.usage.iterationsTruncated !== true &&
+			!iterationsStale;
+		// Anthropic does not bill an iteration that declined before producing
+		// any output: its tokens are reported on its usage.iterations entry
+		// but never charged ("Refusals and fallback" docs). This holds
+		// regardless of type/chain position/stop_reason, including the
+		// terminal entry of a fully-refused chain — so exclude every
+		// zero/undefined-output iteration from the split price. A
+		// mid-output decline is still billed for what it actually produced.
+		const billableIterations = hasFallbackBillingSplit
+			? iterations.filter((iteration) => (iteration.output_tokens ?? 0) > 0)
+			: undefined;
+		// Top-level usage fields reflect executor tokens only — advisor_message
+		// iterations are billed at a different rate and are never rolled into
+		// the top level (Anthropic advisor-tool docs). When the retained
+		// per-iteration snapshot was truncated (>MAX_USAGE_ITERATIONS), the
+		// per-model aggregate built alongside it (over the FULL raw array) is
+		// the only way to avoid silently dropping that spend.
+		const canPriceFromAggregate =
+			hasFallbackSignal &&
+			!hasFallbackBillingSplit &&
+			state.usage.iterationsTruncated === true &&
+			state.usage.iterationsAggregateUsable === true &&
+			!iterationsStale;
+		// A fallback rewrite with no later usage payload means the retained
+		// counters were never refreshed for the new model. Whether that is a
+		// genuine $0 or real (under-tracked) spend depends on what actually
+		// happened before the request ended — see the sub-conditions below.
+		const isFallbackSeamNoLaterUsage =
+			hasFallbackSignal &&
+			!hasFallbackBillingSplit &&
+			!canPriceFromAggregate &&
+			state.fallbackModelRewriteSeq !== undefined &&
+			state.fallbackModelRewriteSeq === state.usagePayloadSeq;
+		// message_start.usage.output_tokens is routinely a nonzero PLACEHOLDER
+		// (Anthropic's streaming docs show small values like 1-3 before any
+		// real content), and content_block_delta NEVER updates
+		// state.usage.outputTokens (tiktoken-based per-delta counting was
+		// removed) — so "outputTokens > 0" cannot distinguish real streamed
+		// content from a placeholder. realContentBlockSeq is the only
+		// categorical signal for "something real happened here."
+		const seamRealContentUnaccounted =
+			isFallbackSeamNoLaterUsage &&
+			(state.realContentBlockSeq ?? 0) >
+				(state.realContentBlockSeqAtLastUsagePayload ?? 0);
+		const seamHasBillableCounters =
+			isFallbackSeamNoLaterUsage &&
+			((state.usage.inputTokens ?? 0) > 0 ||
+				(state.usage.cacheReadInputTokens ?? 0) > 0 ||
+				(state.usage.cacheCreationInputTokens ?? 0) > 0 ||
+				(state.usage.outputTokens ?? 0) > 0);
+		// Genuine no-content case: nothing streamed and nothing counted — a
+		// real $0, not a guess. Narrower than before: a fallback rewrite with
+		// billable counters or unaccounted real content now prices below
+		// instead of being zeroed out.
+		const isUnpricedPreOutputFallback =
+			isFallbackSeamNoLaterUsage &&
+			!seamRealContentUnaccounted &&
+			!seamHasBillableCounters;
+		// The seam produced something real (billable counters and/or
+		// unaccounted real content): price the authoritative input/cache
+		// tokens at the model that actually owned them (pre-rewrite), never
+		// at the fallback target and never at $0 (see Fix 1).
+		const isFallbackSeamPricedAtCountersOwner =
+			isFallbackSeamNoLaterUsage && !isUnpricedPreOutputFallback;
+		// Fix 2 — model-less iteration entries (e.g. BetaCompactionIterationUsage)
+		// carry no `model` field at all, unlike message/advisor/fallback_message
+		// entries. Anthropic's docs are silent on which model a model-less
+		// entry belongs to when more than one model is in play (a mid-request
+		// compaction between a declined attempt and a fallback_message could
+		// belong to either side) — so no positional "activeModel" cursor is
+		// implemented here; that would encode an undocumented guess into
+		// billing. Instead: keep pricing model-less entries at the serving
+		// model (unchanged — `iteration.model ?? model` / the aggregate's
+		// UNRESOLVED_MODEL_KEY bucket), and flag the row as billingIncomplete
+		// when that estimate is genuinely ambiguous. The ambiguity count comes
+		// from observedIterationModels (every model seen, regardless of
+		// output_tokens), NOT from billingAggregate (billable-only): a
+		// zero-output modeled attempt (e.g. a declined primary) is still a
+		// model that participated and could plausibly own the model-less
+		// entry, so it must raise the count even though it produced nothing
+		// billable. When the observed set overflowed its cap, its true
+		// cardinality is unknown, so ambiguity fails open (flagged) rather
+		// than trusting an undercounted tally.
+		//
+		// unresolvedIterationModels must come from
+		// unresolvedBillableIterationCount, NEVER from
+		// billingAggregate.get(UNRESOLVED_MODEL_KEY)?.count: billingAggregate is
+		// capped at MAX_BILLING_MODELS distinct KEYS (including
+		// UNRESOLVED_MODEL_KEY itself). If MAX_BILLING_MODELS distinct MODELED
+		// entries arrive before the first model-less billable entry, the cap is
+		// already full and the UNRESOLVED_MODEL_KEY bucket is never created —
+		// the map-based read would then silently stay 0 forever, no matter how
+		// many model-less billable entries follow, and the flag below would
+		// never fire (#141 round 5). unresolvedBillableIterationCount is a
+		// plain counter incremented on every billable model-less entry
+		// regardless of whether its bucket could be created, so it cannot be
+		// suppressed by any cap-ordering interaction.
+		const unresolvedIterationModels =
+			state.usage.unresolvedBillableIterationCount ?? 0;
+		const observedDistinctModels =
+			state.usage.observedIterationModels?.size ?? 0;
+		const observedIterationModelsOverflowed =
+			state.usage.observedIterationModelsUsable === false;
+		const iterationAttributionAmbiguous =
+			unresolvedIterationModels > 0 &&
+			(observedIterationModelsOverflowed || observedDistinctModels >= 2);
+		// None of the accurate pricing paths applied, but an iterations
+		// snapshot was seen at all: top-level pricing proceeds (unchanged
+		// behavior), but the row is marked so an under-billed row is
+		// identifiable rather than silently wrong. Also set whenever the
+		// fallback seam left real content unaccounted for (Fix 1), or a
+		// model-less entry's attribution is genuinely ambiguous (Fix 2).
+		const billingIncomplete =
+			(hasFallbackSignal &&
+				!hasFallbackBillingSplit &&
+				!canPriceFromAggregate &&
+				!isFallbackSeamNoLaterUsage &&
+				iterations.length > 0) ||
+			seamRealContentUnaccounted ||
+			iterationAttributionAmbiguous;
 		if (state.usage.model) {
 			const model = state.usage.model;
 			// Use provider's authoritative count if available, fallback to computed
@@ -664,17 +1168,89 @@ export class UsageCollector {
 				(state.usage.cacheReadInputTokens || 0) +
 				(state.usage.cacheCreationInputTokens || 0);
 
-			state.usage.costUsd = await this.estimateCostWithDeadline(
-				startMessage.requestId,
-				model,
-				() =>
-					estimateCostUSD(model, {
-						inputTokens: state.usage.inputTokens,
-						outputTokens: finalOutputTokens,
-						cacheReadInputTokens: state.usage.cacheReadInputTokens,
-						cacheCreationInputTokens: state.usage.cacheCreationInputTokens,
-					}),
-			);
+			if (hasFallbackBillingSplit) {
+				state.usage.costUsd = await this.estimateCostWithDeadline(
+					startMessage.requestId,
+					model,
+					async () => {
+						const billable = billableIterations ?? [];
+						if (billable.length === 0) {
+							// Every iteration was a pre-output decline (a fully
+							// refused chain): this genuinely costs ~$0, but it
+							// must be an explicit, commented branch so a future
+							// reader does not "restore" the missing sum.
+							return 0;
+						}
+						const iterationCosts = await Promise.all(
+							billable.map((iteration) =>
+								estimateCostUSD(iteration.model ?? model, {
+									inputTokens: iteration.input_tokens,
+									outputTokens: iteration.output_tokens,
+									cacheReadInputTokens: iteration.cache_read_input_tokens,
+									cacheCreationInputTokens:
+										iteration.cache_creation_input_tokens,
+								}),
+							),
+						);
+						return iterationCosts.reduce((total, cost) => total + cost, 0);
+					},
+				);
+			} else if (canPriceFromAggregate) {
+				const aggregate = state.usage.iterationsAggregate;
+				state.usage.costUsd = await this.estimateCostWithDeadline(
+					startMessage.requestId,
+					model,
+					async () => {
+						const entries = aggregate ? Array.from(aggregate.entries()) : [];
+						if (entries.length === 0) {
+							// Nothing billable in the truncated snapshot (e.g. a
+							// fully pre-output-declined chain): genuinely $0.
+							return 0;
+						}
+						const modelCosts = await Promise.all(
+							entries.map(([aggModel, tokens]) =>
+								estimateCostUSD(
+									aggModel === UNRESOLVED_MODEL_KEY ? model : aggModel,
+									{
+										inputTokens: tokens.input,
+										outputTokens: tokens.output,
+										cacheReadInputTokens: tokens.cacheRead,
+										cacheCreationInputTokens: tokens.cacheCreation,
+									},
+								),
+							),
+						);
+						return modelCosts.reduce((total, cost) => total + cost, 0);
+					},
+				);
+			} else if (isUnpricedPreOutputFallback) {
+				// The retained counters were never refreshed by a usage payload
+				// after the fallback rewrite: they are a pre-output attempt at
+				// the old model, not billable work at the new model's rate.
+				// This is a direct $0, not an estimate — no estimateCostUSD call.
+				state.usage.costUsd = 0;
+			} else {
+				// Plain top-level pricing. When a fallback seam left the
+				// retained counters unrefreshed by any later usage payload
+				// (isFallbackSeamPricedAtCountersOwner), those counters were
+				// produced by the PRE-rewrite model, not state.usage.model
+				// (which now names the fallback target) — price them at
+				// countersOwnerModel instead (see Fix 1).
+				const pricingModel = isFallbackSeamPricedAtCountersOwner
+					? (state.countersOwnerModel ?? model)
+					: model;
+				state.usage.costUsd = await this.estimateCostWithDeadline(
+					startMessage.requestId,
+					pricingModel,
+					() =>
+						estimateCostUSD(pricingModel, {
+							inputTokens: state.usage.inputTokens,
+							outputTokens: finalOutputTokens,
+							cacheReadInputTokens: state.usage.cacheReadInputTokens,
+							cacheCreationInputTokens: state.usage.cacheCreationInputTokens,
+						}),
+				);
+			}
 
 			// Calculate tokens per second - zai specific vs other providers
 			if (finalOutputTokens > 0) {
@@ -759,6 +1335,44 @@ export class UsageCollector {
 					}
 				}
 			}
+		}
+
+		const iterationCount = state.usage.iterations?.length ?? 0;
+		if (hasFallbackSignal) {
+			let fallbackFromModel = state.fallbackFromModel;
+			if (!fallbackFromModel && state.usage.iterations) {
+				for (let i = state.usage.iterations.length - 1; i >= 0; i--) {
+					const iteration = state.usage.iterations[i];
+					if (iteration.type !== "fallback_message" && iteration.model) {
+						fallbackFromModel = iteration.model;
+						break;
+					}
+				}
+			}
+			log.info("anthropic_server_side_fallback", {
+				requestId: startMessage.requestId,
+				from: fallbackFromModel ?? state.usage.model,
+				to: state.usage.model,
+				iterationCount,
+				priced: hasFallbackBillingSplit
+					? "iterations"
+					: canPriceFromAggregate
+						? "aggregate"
+						: isUnpricedPreOutputFallback
+							? "unpriced_pre_output"
+							: "top_level",
+				...(hasFallbackBillingSplit && billableIterations?.length === 0
+					? { billableIterations: 0 }
+					: {}),
+				...(state.usage.iterationsTruncated === true
+					? { iterationsTruncated: true }
+					: {}),
+				...(iterations.length > 0 && iterationsStale
+					? { iterationsStale: true }
+					: {}),
+				...(billingIncomplete ? { billingIncomplete: true } : {}),
+				...(iterationAttributionAmbiguous ? { unresolvedIterationModels } : {}),
+			});
 		}
 
 		const totalInputForOutcome =
