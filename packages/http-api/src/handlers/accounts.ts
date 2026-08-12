@@ -37,6 +37,7 @@ import {
 } from "@better-ccflare/providers";
 import {
 	clearAccountRefreshCache,
+	getBindingConstraint,
 	getUsageThrottleStatus,
 	refreshCodexUsageForAccount,
 	restartUsagePollingForAccount,
@@ -634,6 +635,15 @@ export function createAccountsListHandler(
 					modelMappings,
 					usageUtilization,
 					usageWindow,
+					// The window actually closest to blocking this account, including
+					// per-model caps. `usageUtilization` above is the routing-side
+					// number and deliberately excludes them, so on 2026-08-11 the
+					// dashboard read 64-92% while `seven_day_fable` sat at 100% and
+					// the Fable lane was unroutable. Display-only — see
+					// getBindingConstraint.
+					bindingConstraint: usageData
+						? getBindingConstraint(usageData as AnyUsageData)
+						: null,
 					usageData: fullUsageData, // Full usage data for UI
 					usageRateLimitedUntil: usageCache.getRateLimitedUntil(account.id),
 					usageThrottledUntil,

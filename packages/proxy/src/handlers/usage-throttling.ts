@@ -307,6 +307,72 @@ function isWindowThrottlingEnabled(
 	return settings.weeklyEnabled;
 }
 
+export interface BindingConstraint {
+	readonly window: string;
+	readonly utilization: number;
+	readonly resetAtMs: number | null;
+	readonly scope: "account" | "family";
+	readonly modelFamily: string | null;
+}
+
+/**
+ * The window actually closest to blocking this account — including per-model
+ * (`weekly_scoped`) caps.
+ *
+ * **Display only. Never route on this.** The routing-side representative
+ * utilization (`getRepresentativeUtilizationForProvider`) deliberately excludes
+ * scoped windows, and that exclusion is correct: it feeds
+ * `StrategyStore.getAccountUtilization` and the shared exhaustion predicate, so
+ * counting a Fable-only cap there would read the whole account as exhausted and
+ * remove every lane — which is exactly the 2026-08-11 incident. The two answers
+ * are different on purpose:
+ *
+ * - routing asks "how much account-wide capacity is left?"  -> account windows
+ * - an operator asks "what is stopping me right now?"        -> this function
+ *
+ * Splitting them is why this lives beside `collectWindows` rather than being
+ * folded into the representative helpers.
+ *
+ * With `requestModel`, only that family's scoped rows compete. Without it,
+ * every scoped row competes, so a dashboard can surface `Fable 100%` next to an
+ * account-wide 64% instead of reporting only the 64% and reading as healthy.
+ */
+export function getBindingConstraint(
+	data: AnyUsageData | null,
+	options?: { requestModel?: string | null },
+): BindingConstraint | null {
+	const requestFamily = options?.requestModel
+		? getModelFamily(options.requestModel)
+		: null;
+
+	let best: BindingConstraint | null = null;
+	for (const window of collectWindows(data)) {
+		if (
+			window.kind !== "session" &&
+			window.kind !== "weekly_all" &&
+			window.kind !== "weekly_scoped"
+		) {
+			continue;
+		}
+		if (!Number.isFinite(window.utilization)) continue;
+		if (window.kind === "weekly_scoped" && requestFamily !== null) {
+			// A caller asking about one model must not be shown another family's cap.
+			if (window.modelFamily !== requestFamily) continue;
+		}
+		const candidate: BindingConstraint = {
+			window: window.window,
+			utilization: window.utilization,
+			resetAtMs: window.resetAtMs,
+			scope: window.kind === "weekly_scoped" ? "family" : "account",
+			modelFamily: window.modelFamily ?? null,
+		};
+		if (best === null || candidate.utilization > best.utilization) {
+			best = candidate;
+		}
+	}
+	return best;
+}
+
 export type HardCapacityScope = "account" | "family";
 
 export interface HardCapacityExclusion {
