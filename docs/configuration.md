@@ -253,7 +253,7 @@ Only after that preflight may the request carry `x-better-ccflare-account-id` fo
 
 ## Claude Code Model Route Profiles
 
-`CCFLARE_MODEL_ROUTE_PROFILES_JSON` adds operator-defined, exact-account routes to Claude Code's native `/model` picker. The setting is read once at process start. Unset or whitespace-only input configures no profiles and preserves the existing `/v1/models` pass-through behavior. A nonblank value must be valid and conform to the schema below; malformed JSON, unknown fields, duplicate IDs, or invalid values abort startup instead of silently disabling an intended pin.
+`CCFLARE_MODEL_ROUTE_PROFILES_JSON` adds operator-defined routes to Claude Code's native `/model` picker. A profile can retain the legacy exact-account behavior or use an additive capability pool that resolves an eligible account at request time. The setting is read once at process start. Unset or whitespace-only input configures no profiles and preserves the existing `/v1/models` pass-through behavior. A nonblank value must be valid and conform to the schema below; malformed JSON, unknown fields, duplicate IDs, or invalid values abort startup instead of silently disabling an intended route.
 
 The value is a JSON array with at most 32 objects. This example deliberately uses placeholder account and model values:
 
@@ -272,18 +272,47 @@ CCFLARE_MODEL_ROUTE_PROFILES_JSON='[
 ]'
 ```
 
+To let one picker entry use every current and future account that serves the same
+provider/model capability, omit `accountId` and set `selection` to `capability`:
+
+```bash
+CCFLARE_MODEL_ROUTE_PROFILES_JSON='[
+  {
+    "id": "sol-capability",
+    "displayName": "GPT 5.6 Sol pool",
+    "description": "Uses any healthy Codex account mapped to GPT 5.6 Sol",
+    "selection": "capability",
+    "logicalModel": "claude-opus-5",
+    "defaultEffort": "xhigh",
+    "expectedProvider": "codex",
+    "expectedPhysicalModel": "gpt-5.6-sol"
+  }
+]'
+```
+
+Capability profiles are evaluated against the live account catalog on every
+request. An account joins when its provider matches `expectedProvider` and the
+first physical model produced by its mapping for `logicalModel` matches
+`expectedPhysicalModel`. The normal strategy, availability checks, and model or
+account capacity checks then order and filter that matching set. Paused,
+rate-limited, or exhausted candidates are skipped; an empty set fails closed
+with a route-unavailable response and never falls back to an unrelated account.
+Adding a new account later therefore requires no profile edit, provided its
+provider and mapping satisfy the same capability predicate.
+
 | Field | Required | Contract |
 |---|---:|---|
 | `id` | yes | Unique lowercase kebab-case slug, up to 48 characters. better-ccflare generates the reserved public model ID `claude-bccf-route-<id>`; clients cannot configure a different public ID |
 | `displayName` | yes | Picker label, 1–120 characters |
 | `description` | no | Operator-facing description, up to 500 characters |
-| `accountId` | yes | Exact better-ccflare account ID to pin. It is never returned by the discovery endpoint |
+| `selection` | no | Set to `capability` for a live matching-account pool. When omitted, the profile retains legacy exact-account selection |
+| `accountId` | conditional | Required for legacy profiles; omit it for `selection: "capability"`. It is never returned by the discovery endpoint |
 | `logicalModel` | yes | Claude request model written on an explicit root selection before the account's normal model mapping is applied |
 | `defaultEffort` | no | Default used only when the request omits effort. Accepted values: `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`; an explicit client effort always wins |
-| `expectedProvider` | no | Lowercase provider guard. If the target account's provider differs, the route fails closed |
-| `expectedPhysicalModel` | no | Guard for the first physical model produced by the account's mapping for `logicalModel`. A mismatch fails closed |
+| `expectedProvider` | capability: yes; legacy: no | Lowercase provider guard. Capability profiles use it to build the candidate pool; legacy profiles fail closed if the pinned account differs |
+| `expectedPhysicalModel` | capability: yes; legacy: no | Guard for the first physical model produced by the account's mapping for `logicalModel`. Capability profiles use it as the pool predicate; legacy profiles fail closed if the pinned account differs |
 
-At startup, better-ccflare logs only the configured profile count, never the JSON, account IDs, logical models, or physical models. Because this configuration names exact account IDs, keep it in a protected environment file or service-manager credential rather than committing a real deployment value.
+At startup, better-ccflare logs only the configured profile count, never the JSON, account IDs, logical models, or physical models. Legacy profiles name exact account IDs, so keep those values in a protected environment file or service-manager credential rather than committing a real deployment value. Capability profiles contain no account IDs, but their provider/model constraints are still operational configuration and should be protected accordingly.
 
 ### Claude Code `/model` setup
 
@@ -306,9 +335,9 @@ ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES=effort,xhigh_effort,max_eff
 
 Gateway discovery can list multiple profiles; Claude Code's custom-model variables describe one option. Pairing the exact same ID augments that discovered row with the declared capabilities instead of creating a different route. `xhigh` and `max` remain explicit picker/request overrides: choosing the route does not silently force `max`, and `defaultEffort` applies only when Claude Code sends no effort.
 
-Selecting a profile on a root agent pins only that authenticated caller's Claude Code session tree. Child agents inherit the exact account but keep their own requested logical model, so a Sonnet subagent can still use that account's Sonnet mapping. Other sessions continue through ordinary better-ccflare routing. Switching the same root session back to a native Claude model clears its profile binding on the next root request.
+Selecting a profile on a root agent pins only that authenticated caller's Claude Code session tree. Legacy profiles inherit the exact account. Capability profiles inherit the root capability predicate (provider plus root logical/physical mapping), then use each child request's own model for capacity and dispatch; children cannot broaden the pool to accounts that do not satisfy the root predicate. Other sessions continue through ordinary better-ccflare routing. Switching the same root session back to a native Claude model clears its profile binding on the next root request.
 
-Bindings are process-local, bounded, and restart-scoped. Their TTL matches `session_duration_ms`, and a restart clears every binding. Missing, paused, unavailable, rate-limited, or quota-exhausted accounts fail closed without falling back to another account. Configured provider and physical-model guards also fail closed, as does a conflicting `x-better-ccflare-account-id` header. See [Account Routing Architecture](./routing-architecture.md#claude-code-model-route-profiles) for the request flow and inheritance boundary.
+Bindings are process-local, bounded, and restart-scoped. Their TTL matches `session_duration_ms`, and a restart clears every binding. Missing, paused, unavailable, rate-limited, or quota-exhausted exact accounts fail closed; capability profiles fail closed when no matching candidate remains, without falling back outside the profile. Configured provider and physical-model guards also fail closed, as does a conflicting `x-better-ccflare-account-id` header. Matching is exact: an OpenRouter account mapped to `fusion`, for example, does not satisfy a capability profile expecting provider `codex` and physical model `gpt-5.6-sol`. See [Account Routing Architecture](./routing-architecture.md#claude-code-model-route-profiles) for the request flow and inheritance boundary.
 
 ## Anthropic Degraded Mode
 
