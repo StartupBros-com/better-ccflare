@@ -1887,7 +1887,12 @@ async function selectAccountsForRequestInternal(
 		// A custom strategy is allowed to return stale/unavailable candidates;
 		// dynamic profiles must not let those candidates turn into a passthrough
 		// or an unrelated normal-pool route.
-		const available = selected.filter((account) => isAccountAvailable(account));
+		const available = selected.filter(
+			(account) =>
+				matchesCapabilityRouteProfile(account, meta) &&
+				!isProviderExcludedForRequest(account, excludedProviders) &&
+				isAccountAvailable(account),
+		);
 		if (available.length === 0) {
 			throw capabilityRouteUnavailable(meta, matchingAccounts);
 		}

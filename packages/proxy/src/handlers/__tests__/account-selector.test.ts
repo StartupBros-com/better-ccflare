@@ -870,6 +870,32 @@ describe("selectAccountsForRequest — server-derived route profile", () => {
 		expect(result.map(({ id }) => id)).toEqual([sol.id]);
 	});
 
+	it("rejects a stale strategy result that escapes the capability pool", async () => {
+		const sol = makeAccount({
+			id: "sol-capability",
+			provider: "codex",
+			model_mappings: JSON.stringify({ opus: "gpt-5.6-sol" }),
+		});
+		const unrelated = makeAccount({
+			id: "unrelated-capability",
+			provider: "codex",
+			model_mappings: JSON.stringify({ opus: "gpt-5.6-terra" }),
+		});
+		const ctx = makeCtx({ accounts: [sol, unrelated] });
+		ctx.strategy.select = mock(() => [unrelated, sol]);
+		const meta = makeRequestMeta({
+			routeProfileId: "sol-capability",
+			routeProfileSelection: "capability",
+			routeProfileLogicalModel: "claude-opus-5",
+			routeProfileExpectedPhysicalModel: "gpt-5.6-sol",
+			routeExpectedProvider: "codex",
+		});
+
+		const result = await selectAccountsForRequest(meta, ctx, "claude-opus-5");
+
+		expect(result.map(({ id }) => id)).toEqual([sol.id]);
+	});
+
 	it("uses the server-derived forced account without consulting normal routing", async () => {
 		const forced = makeAccount({
 			id: "route-account",
