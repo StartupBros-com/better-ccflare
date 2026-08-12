@@ -43,6 +43,24 @@ export interface RateLimitScopeDecision {
 	readonly reason: RateLimitScopeReason;
 	readonly markerExpiresAt: number | null;
 	readonly snapshotAgeMs: number | null;
+	/**
+	 * Future reset of the ACCOUNT-level window that positively justified an
+	 * account-scoped verdict — the one timestamp a caller may use to size a
+	 * durable account-wide hold.
+	 *
+	 * Null on every other verdict, including an account-scoped one reached only
+	 * because a header said so. A caller that finds this null must fall back to
+	 * the backoff ramp rather than to a reset from some other source.
+	 *
+	 * This exists because proving the *scope* of the evidence is not the same as
+	 * proving the provenance of a *timestamp*. `extractCooldownUntil`
+	 * independently picks the upstream header, the usage-poller value, or a
+	 * synthetic fallback — none of which is checked against the window that
+	 * justified the verdict — so pairing "the account is spent" with "…and here
+	 * is some reset" still produced 12h whole-account benches from a per-model
+	 * window (#160, found by the pro-gate review of #158).
+	 */
+	readonly accountWindowResetAt: number | null;
 }
 
 interface AnthropicLimitLike {
@@ -69,6 +87,7 @@ function accountDecision(
 	reason: RateLimitScopeReason,
 	family: string | null,
 	snapshotAgeMs: number | null,
+	accountWindowResetAt: number | null = null,
 ): RateLimitScopeDecision {
 	return {
 		scope: "account",
@@ -77,6 +96,7 @@ function accountDecision(
 		reason,
 		markerExpiresAt: null,
 		snapshotAgeMs,
+		accountWindowResetAt,
 	};
 }
 
@@ -94,6 +114,7 @@ function modelDecision(
 		reason,
 		markerExpiresAt: getScoped429MarkerExpiry(options.response, now),
 		snapshotAgeMs,
+		accountWindowResetAt: null,
 	};
 }
 
@@ -200,6 +221,44 @@ function hasSpentUnifiedWindowEvidence(response: Response): boolean {
 }
 
 /**
+ * Positive proof that an ACCOUNT-level window is spent, plus the reset that
+ * belongs to it.
+ *
+ * Deliberately independent of the request's model family. #158 nested this
+ * check under `family !== null`, so a new or custom Anthropic model against a
+ * genuinely exhausted account fell through to a header-only verdict and got the
+ * probe cooldown — re-hitting the exhausted account every 30s-5min until reset
+ * (#160).
+ *
+ * Returns the EARLIEST future reset among spent account windows. When several
+ * are spent the account only truly frees at the last, but re-probing at the
+ * first and re-benching if still spent is the cheap error; over-benching from a
+ * stale later window is the expensive one. `resetAt: null` (spent window with no
+ * usable future reset) means the caller must fall back to the backoff ramp.
+ */
+function spentAccountWindow(
+	data: unknown,
+	now: number,
+): { resetAt: number | null } | null {
+	const rawLimits = (data as { limits?: unknown } | null)?.limits;
+	if (!Array.isArray(rawLimits)) return null;
+	let spent = false;
+	let earliest: number | null = null;
+	for (const value of rawLimits as AnthropicLimitLike[]) {
+		if (!value || value.is_active === false) continue;
+		if (value.kind !== "session" && value.kind !== "weekly_all") continue;
+		const percent = finitePercent(value.percent);
+		if (percent === null || percent < 100) continue;
+		spent = true;
+		const reset = parseReset(value.resets_at);
+		if (typeof reset === "number" && reset > now) {
+			earliest = earliest === null ? reset : Math.min(earliest, reset);
+		}
+	}
+	return spent ? { resetAt: earliest } : null;
+}
+
+/**
  * Classify a 429 against a snapshot the caller has already proven fresh.
  *
  * Split out of {@link classifyPreByte429} so the hard-account-signal branch can
@@ -234,19 +293,18 @@ function classifyFreshSnapshot(
 		(limit) => limit != null,
 	);
 	const activeLimits = limits.filter((limit) => limit.is_active !== false);
-	const activeAccountLimits = activeLimits.filter(
-		(limit) => limit.kind === "session" || limit.kind === "weekly_all",
-	);
-	for (const limit of activeAccountLimits) {
-		const percent = finitePercent(limit.percent);
-		if (percent !== null && percent >= 100) {
-			return accountDecision(
-				options,
-				"account_capacity_signal",
-				family,
-				snapshotAgeMs,
-			);
-		}
+	// Shared with the hard-signal branch so the "is the account itself spent?"
+	// rule has exactly one implementation, and so the reset that justifies the
+	// verdict travels with it.
+	const accountSpent = spentAccountWindow(snapshot.data, now);
+	if (accountSpent) {
+		return accountDecision(
+			options,
+			"account_capacity_signal",
+			family,
+			snapshotAgeMs,
+			accountSpent.resetAt,
+		);
 	}
 	for (const kind of ["session", "weekly_all"] as const) {
 		const matching = limits.filter((limit) => limit.kind === kind);
@@ -328,6 +386,8 @@ function classifyFreshSnapshot(
 		reason: "matching_scoped_limit",
 		markerExpiresAt,
 		snapshotAgeMs,
+		// A family verdict never sizes an account-wide hold.
+		accountWindowResetAt: null,
 	};
 }
 
@@ -371,24 +431,35 @@ export function classifyPreByte429(
 		// Every other outcome is an absence of evidence and keeps the account-wide
 		// reading, because under-benching a genuinely exhausted account costs one
 		// repeated 429 while over-benching costs a multi-hour pool outage.
-		if (family !== null && snapshot !== null && snapshotIsFresh) {
-			const refined = classifyFreshSnapshot(
-				options,
-				snapshot,
-				family,
-				now - snapshot.observedAt,
-				now,
-				maxAgeMs,
-			);
-			if (refined.reason === "matching_scoped_limit") return refined;
-			// The account window is positively spent. Same scope the header
-			// already implied, but naming the capacity evidence rather than the
-			// header matters downstream: `account_capacity_signal` is the only
-			// account-scoped reason backed by a window we can attribute, so it
-			// is what lets the cooldown honour that window's reset instead of
-			// falling back to a probe. Discarding it here would give a genuinely
-			// exhausted account the short unattributed cooldown and re-hammer it.
-			if (refined.reason === "account_capacity_signal") return refined;
+		if (snapshot !== null && snapshotIsFresh) {
+			// Account-level exhaustion is checked FIRST and without requiring a
+			// recognized family. Same scope the header already implied, but
+			// naming the capacity evidence — and carrying that window's reset —
+			// is what lets the cooldown size a real hold instead of a probe.
+			// #158 nested this under `family !== null`, so an unknown model
+			// against a spent account got the probe cooldown and re-hit it every
+			// 30s-5min (#160).
+			const accountSpent = spentAccountWindow(snapshot.data, now);
+			if (accountSpent) {
+				return accountDecision(
+					options,
+					"account_capacity_signal",
+					family,
+					now - snapshot.observedAt,
+					accountSpent.resetAt,
+				);
+			}
+			if (family !== null) {
+				const refined = classifyFreshSnapshot(
+					options,
+					snapshot,
+					family,
+					now - snapshot.observedAt,
+					now,
+					maxAgeMs,
+				);
+				if (refined.reason === "matching_scoped_limit") return refined;
+			}
 		}
 		return accountDecision(options, "hard_response_signal", family, null);
 	}
@@ -426,6 +497,32 @@ export function classifyPreByte429(
 		now,
 		maxAgeMs,
 	);
+}
+
+/**
+ * Size an account-wide hold from the window that proved it, bounded by any
+ * explicit upstream instruction.
+ *
+ * An upstream reset may only ever SHORTEN a hold, never lengthen it.
+ * `retry-after: 120` next to a weekly window six days out means the server
+ * expects us back in two minutes; benching for the window would be the same
+ * over-benching this seam keeps producing, just sourced from our own snapshot
+ * instead of the header. Conversely a longer or unattributable upstream value
+ * can never stretch a hold beyond the window that actually justified it.
+ *
+ * `null` means nothing may size a durable hold and the caller must fall back to
+ * the backoff ramp. Pass only a genuinely upstream-stated reset as
+ * `upstreamStatedReset` — never `extractCooldownUntil`'s output, which
+ * collapses the header, the usage-poller value and a synthetic fallback into
+ * one number and so cannot tell an instruction from a guess.
+ */
+export function boundedAccountHoldReset(
+	provenReset: number | null,
+	upstreamStatedReset: number | null,
+): number | null {
+	if (provenReset === null) return null;
+	if (upstreamStatedReset === null) return provenReset;
+	return Math.min(provenReset, upstreamStatedReset);
 }
 
 /**

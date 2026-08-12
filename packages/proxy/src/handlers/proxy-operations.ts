@@ -126,9 +126,9 @@ import {
 	applyRateLimitCooldownAwaitingPersist,
 } from "./rate-limit-cooldown";
 import {
+	boundedAccountHoldReset,
 	classifyPreByte429,
 	getAnthropicRateLimitResetAt,
-	isAccountScopeConfirmed,
 	recordRequestRateLimitOutcome,
 } from "./rate-limit-scope";
 import { makeProxyRequest, validateProviderPath } from "./request-handler";
@@ -3998,18 +3998,29 @@ export async function proxyWithAccount(
 					usageCache.getRateLimitedUntil.bind(usageCache),
 				);
 				const auditReason: RateLimitReason = "model_fallback_429";
+				// Read the header directly, never extractCooldownUntil's output: that
+				// collapses header, usage-poller and synthetic values into one number
+				// and cannot tell an instruction from a guess.
+				const attributedReset = boundedAccountHoldReset(
+					decision.accountWindowResetAt,
+					getAnthropicRateLimitResetAt(failureResponse, Date.now()),
+				);
 				await applyRateLimitCooldownAwaitingPersist(
 					account,
 					{
-						resetTime: cooldownUntil,
+						// ONLY the account window that proved this verdict may size the
+						// hold, and the classifier hands that timestamp over directly.
+						// #158 keyed on the verdict's reason and then passed
+						// extractCooldownUntil's independently-chosen value, which is a
+						// different question: it picks the response header, the
+						// usage-poller value, or a synthetic fallback, none checked
+						// against the proving window. A spent 2h session window paired
+						// with a per-model reset days out still wrote a 12h whole-account
+						// bench (#160). No attributed reset -> the backoff ramp decides.
+						resetTime: attributedReset ?? cooldownUntil,
 						reason: auditReason,
-						// The upstream reset only sizes this account-wide hold when
-						// capacity evidence attributes it to the account window. A
-						// header-derived verdict (no fresh snapshot, or one that
-						// proved nothing) gets the probe backoff instead — see #157.
-						resetTimeScope: isAccountScopeConfirmed(decision.reason)
-							? "confirmed"
-							: "unattributed",
+						resetTimeScope:
+							attributedReset !== null ? "confirmed" : "unattributed",
 					},
 					ctx,
 				);

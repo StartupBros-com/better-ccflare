@@ -19,6 +19,7 @@ function snapshot(
 	overrides: {
 		session?: number;
 		weeklyAll?: number;
+		weeklyAllReset?: number;
 		family?: string;
 		scoped?: number;
 		scopedReset?: number | null;
@@ -27,6 +28,7 @@ function snapshot(
 	const {
 		session = 0,
 		weeklyAll = 72,
+		weeklyAllReset = NOW + 6 * 24 * 60 * 60 * 1000,
 		family = "Fable",
 		scoped = 100,
 		scopedReset = NOW + 60 * 60 * 1000,
@@ -44,7 +46,7 @@ function snapshot(
 				{
 					kind: "weekly_all",
 					percent: weeklyAll,
-					resets_at: new Date(NOW + 6 * 24 * 60 * 60 * 1000).toISOString(),
+					resets_at: new Date(weeklyAllReset).toISOString(),
 					is_active: true,
 				},
 				{
@@ -316,6 +318,91 @@ describe("classifyPreByte429", () => {
 		expect(decision.scope).toBe("account");
 		expect(decision.reason).toBe("account_capacity_signal");
 		expect(isAccountScopeConfirmed(decision.reason)).toBe(true);
+	});
+
+	// #160, the core finding. Proving the account is spent says nothing about
+	// WHICH reset belongs to it. Here the account window clears in 2h while the
+	// response header advertises a per-model reset 3 days out; the verdict must
+	// carry the 2h window's reset, because that is the one it proved. Pairing
+	// the verdict with the header's value is how a spent short window still
+	// produced a 12h whole-account bench.
+	it("carries the proving account window's reset, not the header's", () => {
+		const accountReset = NOW + 2 * 60 * 60 * 1000;
+		const decision = classifyPreByte429({
+			isAnthropic: true,
+			response: response({
+				"anthropic-ratelimit-unified-status": "rate_limited",
+				"anthropic-ratelimit-unified-reset": String(
+					Math.floor((NOW + 3 * 24 * 60 * 60 * 1000) / 1000),
+				),
+			}),
+			attemptedModel: "claude-fable-5",
+			snapshot: snapshot(NOW - 120_000, {
+				weeklyAll: 100,
+				weeklyAllReset: accountReset,
+			}),
+			now: NOW,
+		});
+
+		expect(decision.scope).toBe("account");
+		expect(decision.reason).toBe("account_capacity_signal");
+		expect(decision.accountWindowResetAt).toBe(accountReset);
+	});
+
+	// #160 finding 3: account exhaustion must be provable without a recognized
+	// family. Nested under `family !== null`, a new or custom model against a
+	// spent account fell through to a probe cooldown and re-hit it every
+	// 30s-5min until reset.
+	it("proves account exhaustion for an unknown model family", () => {
+		const accountReset = NOW + 90 * 60 * 1000;
+		const decision = classifyPreByte429({
+			isAnthropic: true,
+			response: response({
+				"anthropic-ratelimit-unified-status": "rate_limited",
+			}),
+			attemptedModel: "custom-model-without-family",
+			snapshot: snapshot(NOW - 120_000, {
+				weeklyAll: 100,
+				weeklyAllReset: accountReset,
+			}),
+			now: NOW,
+		});
+
+		expect(decision.scope).toBe("account");
+		expect(decision.reason).toBe("account_capacity_signal");
+		expect(decision.accountWindowResetAt).toBe(accountReset);
+	});
+
+	it("leaves the account window reset null on a family verdict", () => {
+		const decision = classifyPreByte429({
+			isAnthropic: true,
+			response: response(),
+			attemptedModel: "claude-fable-5",
+			snapshot: snapshot(NOW - 120_000),
+			now: NOW,
+		});
+
+		expect(decision.scope).toBe("family");
+		expect(decision.accountWindowResetAt).toBeNull();
+	});
+
+	it("leaves the account window reset null when a spent window has no future reset", () => {
+		const decision = classifyPreByte429({
+			isAnthropic: true,
+			response: response({
+				"anthropic-ratelimit-unified-status": "rate_limited",
+			}),
+			attemptedModel: "claude-fable-5",
+			snapshot: snapshot(NOW - 120_000, {
+				weeklyAll: 100,
+				weeklyAllReset: NOW - 1,
+			}),
+			now: NOW,
+		});
+
+		expect(decision.reason).toBe("account_capacity_signal");
+		// Spent, but nothing usable to size a hold from -> caller must back off.
+		expect(decision.accountWindowResetAt).toBeNull();
 	});
 
 	// The cold-cache shape from #157: account scope is still the right call, but
