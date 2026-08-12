@@ -159,6 +159,36 @@ export function resetRateLimitProbeGatesForTests(): void {
 }
 
 /**
+ * Whether `resetTime` is known to describe the same scope as the hold it is
+ * about to size.
+ *
+ * - `confirmed` — the reset came from a window whose scope matches this hold:
+ *   fresh capacity evidence proved the account-wide window is spent, and this
+ *   is an account-wide hold.
+ * - `unattributed` — the reset came from an upstream header that never names
+ *   the window it describes. Anthropic returns the per-model weekly reset there
+ *   on a model-scoped 429, so honouring it as an account-wide duration converts
+ *   a Fable-only cap into a 12h whole-account bench.
+ *
+ * An unattributed reset may not outlive a probe. Sizing a durable hold from a
+ * window we cannot attribute is how a restart with a cold usage cache benched
+ * three healthy accounts for 12h on 2026-08-11 and emptied the pool into
+ * `503 route_unavailable` (issue #157).
+ *
+ * Omitted means `confirmed`: every caller predating this distinction keeps its
+ * existing behaviour, so the narrowing is opt-in at the sites that actually
+ * know their evidence is header-only.
+ */
+export type ResetTimeScope = "confirmed" | "unattributed";
+
+export interface RateLimitCooldownInput {
+	resetTime?: number;
+	remaining?: number;
+	reason?: RateLimitReason;
+	resetTimeScope?: ResetTimeScope;
+}
+
+/**
  * In-memory half of applyRateLimitCooldown / applyRateLimitCooldownAwaitingPersist:
  * computes the cooldown (429 exponential backoff capped by upstream reset, or a
  * 529 overload duration — see the doc comment on applyRateLimitCooldown below)
@@ -168,11 +198,7 @@ export function resetRateLimitProbeGatesForTests(): void {
  */
 function applyRateLimitCooldownInMemory(
 	account: Account,
-	rateLimitInfo: {
-		resetTime?: number;
-		remaining?: number;
-		reason?: RateLimitReason;
-	},
+	rateLimitInfo: RateLimitCooldownInput,
 ): {
 	cooldownUntil: number;
 	reason: RateLimitReason;
@@ -208,6 +234,15 @@ function applyRateLimitCooldownInMemory(
 				: capUntil;
 	} else {
 		const backoffMs = computeRateLimitBackoffMs(nextCount);
+		// An unattributed reset describes a window we cannot match to this hold's
+		// scope, so it is withheld and the backoff ramp decides instead. Dropping
+		// it here rather than inside resolveCooldownUntil keeps that helper a pure
+		// clamp and puts the evidence rule at the single place every 429 caller
+		// already funnels through — see ResetTimeScope.
+		const attributedResetTime =
+			rateLimitInfo.resetTimeScope === "unattributed"
+				? undefined
+				: rateLimitInfo.resetTime;
 		// When the upstream reset is known, bench until that reset (bounded above by
 		// the safety ceiling) instead of discarding a far-future reset and
 		// re-probing every ~5min — see resolveCooldownUntil.
@@ -215,7 +250,7 @@ function applyRateLimitCooldownInMemory(
 			now,
 			backoffMs,
 			maxCooldownMs: getRateLimitMaxCooldownMs(),
-			resetTime: rateLimitInfo.resetTime,
+			resetTime: attributedResetTime,
 		});
 	}
 
@@ -323,11 +358,7 @@ function applyRateLimitCooldownInMemory(
  */
 export function applyRateLimitCooldown(
 	account: Account,
-	rateLimitInfo: {
-		resetTime?: number;
-		remaining?: number;
-		reason?: RateLimitReason;
-	},
+	rateLimitInfo: RateLimitCooldownInput,
 	ctx: ProxyContext,
 	breaker: CircuitBreaker = getDefaultCircuitBreaker(),
 ): void {
@@ -576,11 +607,7 @@ function getOrStartMarkAccountRateLimited(
  */
 export async function applyRateLimitCooldownAwaitingPersist(
 	account: Account,
-	rateLimitInfo: {
-		resetTime?: number;
-		remaining?: number;
-		reason?: RateLimitReason;
-	},
+	rateLimitInfo: RateLimitCooldownInput,
 	ctx: ProxyContext,
 ): Promise<void> {
 	const { cooldownUntil, reason, isOverload, skipped } =

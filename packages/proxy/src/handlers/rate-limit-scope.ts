@@ -381,6 +381,14 @@ export function classifyPreByte429(
 				maxAgeMs,
 			);
 			if (refined.reason === "matching_scoped_limit") return refined;
+			// The account window is positively spent. Same scope the header
+			// already implied, but naming the capacity evidence rather than the
+			// header matters downstream: `account_capacity_signal` is the only
+			// account-scoped reason backed by a window we can attribute, so it
+			// is what lets the cooldown honour that window's reset instead of
+			// falling back to a probe. Discarding it here would give a genuinely
+			// exhausted account the short unattributed cooldown and re-hammer it.
+			if (refined.reason === "account_capacity_signal") return refined;
 		}
 		return accountDecision(options, "hard_response_signal", family, null);
 	}
@@ -418,6 +426,26 @@ export function classifyPreByte429(
 		now,
 		maxAgeMs,
 	);
+}
+
+/**
+ * Is an account-scoped verdict backed by a window we can attribute to the
+ * account, or only by a header that never says which window rejected the
+ * request?
+ *
+ * Only `account_capacity_signal` carries positive evidence that the
+ * account-wide window itself is spent, so only it may size a durable
+ * account-wide hold from an upstream reset. `hard_response_signal` and
+ * `spent_window_signal` are header-derived: correct as a *scope* call when no
+ * fresh snapshot refutes them, but they name no window, and Anthropic puts the
+ * per-model weekly reset in that header on a model-scoped 429. Sizing an
+ * account hold from it is what turned a Fable-only cap into a 12h whole-account
+ * bench when a restart left the usage cache cold (#157).
+ *
+ * Pairs with `ResetTimeScope` in rate-limit-cooldown.ts.
+ */
+export function isAccountScopeConfirmed(reason: RateLimitScopeReason): boolean {
+	return reason === "account_capacity_signal";
 }
 
 export interface RequestRateLimitOutcome {
