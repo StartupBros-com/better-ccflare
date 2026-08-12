@@ -87,6 +87,27 @@ describe("parseModelRouteProfiles", () => {
 		});
 	});
 
+	it("parses a capability profile without pinning an account", () => {
+		const [configured] = parseModelRouteProfiles(
+			JSON.stringify([
+				{
+					id: "sol-capability",
+					displayName: "GPT-5.6 Sol · available account",
+					selection: "capability",
+					logicalModel: "claude-opus-5",
+					expectedProvider: "CODEX",
+					expectedPhysicalModel: "gpt-5.6-sol",
+				},
+			]),
+		);
+		expect(configured).toMatchObject({
+			selection: "capability",
+			expectedProvider: "codex",
+			expectedPhysicalModel: "gpt-5.6-sol",
+		});
+		expect(configured?.accountId).toBeUndefined();
+	});
+
 	it("accepts every supported effort and omits optional fields", () => {
 		for (const defaultEffort of [
 			"minimal",
@@ -151,6 +172,35 @@ describe("parseModelRouteProfiles", () => {
 					accountId: "account",
 					logicalModel: "claude-opus-5",
 					unexpected: true,
+				},
+			]),
+			JSON.stringify([
+				{
+					id: "route",
+					displayName: "Route",
+					selection: "capability",
+					logicalModel: "claude-opus-5",
+					expectedProvider: "codex",
+				},
+			]),
+			JSON.stringify([
+				{
+					id: "route",
+					displayName: "Route",
+					selection: "capability",
+					accountId: "account",
+					logicalModel: "claude-opus-5",
+					expectedProvider: "codex",
+					expectedPhysicalModel: "gpt-5.6-sol",
+				},
+			]),
+			JSON.stringify([
+				{
+					id: "route",
+					displayName: "Route",
+					selection: "other",
+					logicalModel: "claude-opus-5",
+					accountId: "account",
 				},
 			]),
 		]) {

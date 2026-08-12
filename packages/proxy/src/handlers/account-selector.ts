@@ -619,6 +619,7 @@ export function deriveAffinityLaneKey(
 	const beta = canonicalizeBetaSignature(meta.headers?.get("anthropic-beta"));
 	return JSON.stringify([
 		"routing-lane-v1",
+		meta.routeProfileId?.trim() || null,
 		session,
 		getProtocolFamily(path),
 		path,
@@ -1406,6 +1407,58 @@ function isProviderExcludedForRequest(
 	return false;
 }
 
+/**
+ * Match an account against the root capability declared by a dynamic model
+ * route profile.  The profile's logical model is intentionally used here,
+ * rather than the current child-agent model: a session must remain inside the
+ * account pool that can serve the model the operator selected.  Capacity and
+ * availability for the current request are evaluated later by the normal
+ * selector and strategy.
+ */
+function matchesCapabilityRouteProfile(
+	account: Account,
+	meta: RequestMeta,
+): boolean {
+	const expectedProvider = meta.routeExpectedProvider?.trim().toLowerCase();
+	const expectedPhysicalModel = meta.routeProfileExpectedPhysicalModel?.trim();
+	const logicalModel = meta.routeProfileLogicalModel?.trim();
+	if (!expectedProvider || !expectedPhysicalModel || !logicalModel) {
+		return false;
+	}
+	if (account.provider.trim().toLowerCase() !== expectedProvider) return false;
+	const mappedModels = getModelList(logicalModel, account);
+	const firstPhysicalModel = mappedModels?.[0]?.trim() ?? logicalModel;
+	return firstPhysicalModel === expectedPhysicalModel;
+}
+
+function capabilityRouteUnavailable(
+	meta: RequestMeta,
+	matchingAccounts: readonly Account[],
+): ForceRouteUnavailableError {
+	const accountId = meta.routeProfileId?.trim() || "capability-route";
+	if (matchingAccounts.length === 0) {
+		return new ForceRouteUnavailableError(accountId, "model_mapping_mismatch");
+	}
+	if (matchingAccounts.every((account) => account.paused)) {
+		return new ForceRouteUnavailableError(accountId, "paused");
+	}
+	if (
+		meta.hardExcludedAccountIds &&
+		matchingAccounts.every((account) =>
+			meta.hardExcludedAccountIds?.has(account.id),
+		)
+	) {
+		return new ForceRouteUnavailableError(
+			accountId,
+			"account_capacity_exhausted",
+		);
+	}
+	return new ForceRouteUnavailableError(
+		accountId,
+		"rate_limited_or_unavailable",
+	);
+}
+
 function reportAccountDatabaseError(error: unknown): void {
 	log.error("Failed to get accounts from database:", error);
 	console.error("\n❌ DATABASE ERROR DETECTED");
@@ -1578,6 +1631,7 @@ async function selectAccountsForRequestInternal(
 		"x-better-ccflare-account-id",
 	);
 	const serverForcedAccountId = meta.forcedAccountId?.trim();
+	const capabilityProfileRoute = meta.routeProfileSelection === "capability";
 	if (
 		serverForcedAccountId &&
 		publicForcedAccountId &&
@@ -1589,6 +1643,14 @@ async function selectAccountsForRequestInternal(
 		);
 	}
 	const forcedAccountId = serverForcedAccountId || publicForcedAccountId;
+	if (capabilityProfileRoute && forcedAccountId) {
+		// A capability profile owns its candidate set.  Do not let a caller's
+		// public force header (or a stale server pin) escape that set.
+		throw new ForceRouteUnavailableError(
+			forcedAccountId,
+			"conflicting_force_route",
+		);
+	}
 	if (forcedAccountId) {
 		try {
 			const allAccounts = await ctx.dbOps.getAllAccounts();
@@ -1787,6 +1849,51 @@ async function selectAccountsForRequestInternal(
 		}
 	}
 
+	if (capabilityProfileRoute) {
+		let allAccounts: Account[];
+		try {
+			allAccounts = await ctx.dbOps.getAllAccounts();
+		} catch (error) {
+			log.error(
+				"Failed to get accounts from database for capability route lookup:",
+				error,
+			);
+			throw new ForceRouteUnavailableError(
+				meta.routeProfileId?.trim() || "capability-route",
+				"lookup_failed",
+			);
+		}
+		const excludedProviders = getExcludedProviders(meta);
+		const matchingAccounts = allAccounts.filter(
+			(account) =>
+				matchesCapabilityRouteProfile(account, meta) &&
+				!isProviderExcludedForRequest(account, excludedProviders),
+		);
+		const selected = await getOrderedAccounts(
+			meta,
+			ctx,
+			effectiveModel,
+			options.syntheticProbe === true,
+			allAccounts,
+			undefined,
+			[],
+			(accounts) =>
+				accounts.filter(
+					(account) =>
+						matchesCapabilityRouteProfile(account, meta) &&
+						!isProviderExcludedForRequest(account, excludedProviders),
+				),
+		);
+		// A custom strategy is allowed to return stale/unavailable candidates;
+		// dynamic profiles must not let those candidates turn into a passthrough
+		// or an unrelated normal-pool route.
+		const available = selected.filter((account) => isAccountAvailable(account));
+		if (available.length === 0) {
+			throw capabilityRouteUnavailable(meta, matchingAccounts);
+		}
+		return available;
+	}
+
 	// Filter out excluded providers (e.g. claude-oauth excluded by the responses adapter)
 	const excludeProviders = getExcludedProviders(meta);
 	const isProviderExcluded = (account: Account): boolean => {
@@ -1809,7 +1916,11 @@ async function selectAccountsForRequestInternal(
 	let priorServerToolCatalog: readonly RoutingCandidateMetadata[] = [];
 
 	// Try combo-aware routing if a concrete effective model is available.
-	if (effectiveModel && !options.skipCombo) {
+	if (
+		effectiveModel &&
+		!options.skipCombo &&
+		meta.routeProfileSelection !== "capability"
+	) {
 		const family = getModelFamily(effectiveModel);
 		if (family) {
 			const validFamilies: readonly string[] = [

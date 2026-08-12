@@ -752,6 +752,124 @@ describe("selectAccountsForRequest — x-better-ccflare-account-id header", () =
 });
 
 describe("selectAccountsForRequest — server-derived route profile", () => {
+	it("selects every currently eligible account in a capability pool", async () => {
+		const pausedPrimary = makeAccount({
+			id: "pro-primary-wmgm",
+			provider: "codex",
+			paused: true,
+			model_mappings: JSON.stringify({ opus: "gpt-5.6-sol" }),
+		});
+		const availableSecondary = makeAccount({
+			id: "pro-secondary-bros",
+			provider: "codex",
+			priority: 1,
+			model_mappings: JSON.stringify({ opus: "gpt-5.6-sol" }),
+		});
+		const futureAccount = makeAccount({
+			id: "future-sol-account",
+			provider: "codex",
+			priority: 2,
+			model_mappings: JSON.stringify({ opus: "gpt-5.6-sol" }),
+		});
+		const unrelated = makeAccount({
+			id: "terra-account",
+			provider: "codex",
+			model_mappings: JSON.stringify({ opus: "gpt-5.6-terra" }),
+		});
+		const ctx = makeCtx({
+			accounts: [pausedPrimary, availableSecondary, futureAccount, unrelated],
+		});
+		ctx.strategy.select = mock((accounts: Account[]) =>
+			accounts.filter(
+				(account) => !account.paused && !account.rate_limited_until,
+			),
+		);
+		const meta = makeRequestMeta({
+			routeProfileId: "sol-capability",
+			routeProfileSelection: "capability",
+			routeProfileLogicalModel: "claude-opus-5",
+			routeProfileExpectedPhysicalModel: "gpt-5.6-sol",
+			routeExpectedProvider: "codex",
+		});
+
+		const result = await selectAccountsForRequest(meta, ctx, "claude-opus-5");
+
+		expect(result.map(({ id }) => id)).toEqual([
+			availableSecondary.id,
+			futureAccount.id,
+		]);
+		expect(
+			(ctx.strategy.select as ReturnType<typeof mock>).mock.calls[0]?.[0].map(
+				(account: Account) => account.id,
+			),
+		).toEqual([pausedPrimary.id, availableSecondary.id, futureAccount.id]);
+	});
+
+	it("fails closed when every matching capability account is paused or exhausted", async () => {
+		const paused = makeAccount({
+			id: "paused-sol",
+			provider: "codex",
+			paused: true,
+			model_mappings: JSON.stringify({ opus: "gpt-5.6-sol" }),
+		});
+		const exhausted = makeAccount({
+			id: "exhausted-sol",
+			provider: "codex",
+			rate_limited_until: Date.now() + 60_000,
+			model_mappings: JSON.stringify({ opus: "gpt-5.6-sol" }),
+		});
+		const unrelated = makeAccount({
+			id: "unrelated",
+			provider: "codex",
+			model_mappings: JSON.stringify({ opus: "gpt-5.6-terra" }),
+		});
+		const ctx = makeCtx({ accounts: [paused, exhausted, unrelated] });
+		const meta = makeRequestMeta({
+			routeProfileId: "sol-capability",
+			routeProfileSelection: "capability",
+			routeProfileLogicalModel: "claude-opus-5",
+			routeProfileExpectedPhysicalModel: "gpt-5.6-sol",
+			routeExpectedProvider: "codex",
+		});
+
+		await expect(
+			selectAccountsForRequest(meta, ctx, "claude-opus-5"),
+		).rejects.toMatchObject({
+			name: "ForceRouteUnavailableError",
+			reason: "rate_limited_or_unavailable",
+		});
+		expect(ctx.strategy.select).toHaveBeenCalledTimes(1);
+	});
+
+	it("keeps a child request inside the root capability pool", async () => {
+		const sol = makeAccount({
+			id: "sol-child-pool",
+			provider: "codex",
+			model_mappings: JSON.stringify({ opus: "gpt-5.6-sol" }),
+		});
+		const terraOnly = makeAccount({
+			id: "terra-only-child",
+			provider: "codex",
+			model_mappings: JSON.stringify({ sonnet: "gpt-5.6-terra" }),
+		});
+		const ctx = makeCtx({ accounts: [sol, terraOnly] });
+		const meta = makeRequestMeta({
+			routeProfileId: "sol-capability",
+			routeProfileSelection: "capability",
+			routeProfileLogicalModel: "claude-opus-5",
+			routeProfileExpectedPhysicalModel: "gpt-5.6-sol",
+			routeExpectedProvider: "codex",
+		});
+
+		const result = await selectAccountsForRequest(
+			meta,
+			ctx,
+			"claude-sonnet-4-5",
+		);
+
+		expect(result.map(({ id }) => id)).toEqual([sol.id]);
+	});
+
 	it("uses the server-derived forced account without consulting normal routing", async () => {
 		const forced = makeAccount({
 			id: "route-account",

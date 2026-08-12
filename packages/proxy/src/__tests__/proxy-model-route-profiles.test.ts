@@ -50,6 +50,7 @@ const usageCollectorModule = await import("../usage-collector");
 const { handleProxy } = await import("../proxy");
 
 const PROFILE_MODEL = "claude-bccf-route-pro-primary-sol";
+const CAPABILITY_PROFILE_MODEL = "claude-bccf-route-sol-capability";
 const LOGICAL_MODEL = "claude-opus-5";
 const CHILD_MODEL = "claude-sonnet-4-5";
 const HAIKU_MODEL = "claude-haiku-4-5";
@@ -141,6 +142,24 @@ function makeRegistry(profileOverrides: Record<string, unknown> = {}) {
 					defaultEffort: "xhigh",
 					expectedProvider: "test-provider",
 					...profileOverrides,
+				},
+			]),
+		),
+	);
+}
+
+function makeCapabilityRegistry() {
+	return new ModelRouteSessionRegistry(
+		parseModelRouteProfiles(
+			JSON.stringify([
+				{
+					id: "sol-capability",
+					displayName: "GPT-5.6 Sol · available account",
+					selection: "capability",
+					logicalModel: LOGICAL_MODEL,
+					defaultEffort: "xhigh",
+					expectedProvider: "test-provider",
+					expectedPhysicalModel: "gpt-5.6-sol",
 				},
 			]),
 		),
@@ -305,6 +324,40 @@ async function fetchedJson(
 }
 
 describe("Claude Code gateway model route profiles", () => {
+	it("routes a capability profile through the currently available matching account", async () => {
+		const pausedPrimary = makeAccount("paused-primary");
+		pausedPrimary.paused = true;
+		pausedPrimary.model_mappings = JSON.stringify({ opus: "gpt-5.6-sol" });
+		const healthySecondary = makeAccount("healthy-secondary");
+		healthySecondary.model_mappings = JSON.stringify({ opus: "gpt-5.6-sol" });
+		const unrelated = makeAccount("unrelated-terra");
+		unrelated.model_mappings = JSON.stringify({ opus: "gpt-5.6-terra" });
+		const harness = makeContext(makeCapabilityRegistry(), {
+			accounts: [pausedPrimary, healthySecondary, unrelated],
+		});
+		harness.strategySelect.mockImplementation(
+			(accounts: Account[]) => accounts,
+		);
+		const { requests } = installJsonUpstream();
+		const request = apiRequest("/v1/messages", CAPABILITY_PROFILE_MODEL, {
+			"x-claude-code-session-id": "capability-session",
+		});
+
+		const response = await handleProxy(
+			request,
+			new URL(request.url),
+			harness.ctx,
+			"key-1",
+		);
+
+		expect(response.status).toBe(200);
+		expect(requests[0]?.url).toContain("/healthy-secondary/v1/messages");
+		expect(await fetchedJson(requests[0])).toMatchObject({
+			model: LOGICAL_MODEL,
+			output_config: { effort: "xhigh" },
+		});
+	});
+
 	it("serves exact safe discovery rows locally with no provider, database, strategy, or fetch work", async () => {
 		const harness = makeContext(
 			makeRegistry({ expectedPhysicalModel: "physical-model-secret" }),

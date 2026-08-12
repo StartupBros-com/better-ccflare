@@ -138,6 +138,12 @@ export interface RequestMeta {
 	forcedAccountId?: string | null;
 	/** Restart-scoped model route profile that produced the server-derived route. */
 	routeProfileId?: string | null;
+	/** Selection mode of the route profile; capability profiles use a live account pool. */
+	routeProfileSelection?: "capability" | null;
+	/** Logical model that defines a capability profile's root capability predicate. */
+	routeProfileLogicalModel?: string | null;
+	/** Physical model required by the capability profile's root predicate. */
+	routeProfileExpectedPhysicalModel?: string | null;
 	/** Optional provider invariant for a route profile; mismatches fail closed. */
 	routeExpectedProvider?: string | null;
 	/** Optional first physical-model invariant for a route profile; mismatches fail closed. */
