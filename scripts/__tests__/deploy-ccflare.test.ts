@@ -251,6 +251,13 @@ async function runRunnerGatewayProbe(
 				AI_GATEWAY_TUNNEL_ENABLED: "1",
 				AI_GATEWAY_TUNNEL_REQUIRED: required ? "1" : "0",
 				AI_GATEWAY_LOCAL_PORT: String(port),
+				// This helper probes the tunnel admission boundary with deliberately
+				// inert child binaries. Keep each probe one-shot so the suite does not
+				// spend its timeout budget exercising the production restart policy.
+				RUNNER_RESTART_MAX_FAILURES: "1",
+				RUNNER_RESTART_BACKOFF_BASE_MS: "0",
+				RUNNER_RESTART_BACKOFF_MAX_MS: "0",
+				RUNNER_CIRCUIT_HOLD: "false",
 				// If the local probe is rejected, make the attempted SSH child fail
 				// locally and immediately instead of touching the network.
 				AI_GATEWAY_SSH_HOST: "-Z",
@@ -382,6 +389,9 @@ describe("render_systemd_pin", () => {
 		expect(readFileSync(output, "utf8")).toBe(
 			[
 				"# BEGIN better-ccflare managed deployment",
+				"[Unit]",
+				"StartLimitIntervalSec=300s",
+				"StartLimitBurst=5",
 				"[Service]",
 				"Environment=CCFLARE_BIN=/new/bin",
 				`Environment=GUARD_SCRIPT=${guardScript}`,
@@ -397,6 +407,9 @@ describe("render_systemd_pin", () => {
 				"Environment=GUARD_SHUTDOWN_GRACE_MS=600000",
 				"KillMode=mixed",
 				"TimeoutStopSec=720s",
+				"Restart=on-failure",
+				"RestartSec=5s",
+				"RestartPreventExitStatus=143",
 				"ExecStart=",
 				`ExecStart=${runnerScriptFixture}`,
 				"# END better-ccflare managed deployment",
@@ -817,6 +830,11 @@ describe("effective systemd policy validation", () => {
 				"  exit 0",
 				"fi",
 				'if [[ "$*" == *"--property=TimeoutStopUSec"* ]]; then printf \'%s\\n\' "$CCFLARE_TEST_TIMEOUT"; exit 0; fi',
+				'if [[ "$*" == *"--property=StartLimitIntervalUSec"* ]]; then printf \'%s\\n\' "${CCFLARE_TEST_START_LIMIT_INTERVAL_SEC:-300s}"; exit 0; fi',
+				'if [[ "$*" == *"--property=StartLimitBurst"* ]]; then printf \'%s\\n\' "${CCFLARE_TEST_START_LIMIT_BURST:-5}"; exit 0; fi',
+				'if [[ "$*" == *"--property=RestartUSec"* ]]; then printf \'%s\\n\' "${CCFLARE_TEST_RESTART_SEC:-5s}"; exit 0; fi',
+				'if [[ "$*" == *"--property=RestartPreventExitStatus"* ]]; then printf \'%s\\n\' "${CCFLARE_TEST_RESTART_PREVENT_EXIT_STATUS:-143}"; exit 0; fi',
+				'if [[ "$*" == *"--property=Restart"* ]]; then printf \'%s\\n\' "${CCFLARE_TEST_RESTART:-on-failure}"; exit 0; fi',
 				'if [[ "$*" == *"--property=Environment"* ]]; then',
 				'  if [[ -n "${CCFLARE_TEST_SAFE_POLICY_PIN:-}" && -n "${CCFLARE_TEST_SAFE_POLICY_BACKUP:-}" ]] && cmp -s "$CCFLARE_TEST_SAFE_POLICY_PIN" "$CCFLARE_TEST_SAFE_POLICY_BACKUP" && [[ -n "${CCFLARE_TEST_RESTORED_ENVIRONMENT+x}" ]]; then',
 				'    printf \'%s\\n\' "$CCFLARE_TEST_RESTORED_ENVIRONMENT"',
@@ -856,6 +874,31 @@ describe("effective systemd policy validation", () => {
 			"guard_max_recovery_sleep_ms=120000",
 		);
 		expect(good.stdout.toString()).toContain("guard_max_recovery_waits=12");
+
+		for (const restart of ["always", "no"] as const) {
+			const invalidRestart = bash(
+				[
+					...base,
+					`export CCFLARE_TEST_RESTART=${shellQuote(restart)}`,
+					"validate_effective_systemd_policy ccflare-stack.service",
+				].join("\n"),
+			);
+			expect(invalidRestart.exitCode).not.toBe(0);
+		}
+		for (const [interval, burst] of [
+			["299999999", "5"],
+			["300000000", "6"],
+		] as const) {
+			const invalidStartLimit = bash(
+				[
+					...base,
+					`export CCFLARE_TEST_START_LIMIT_INTERVAL_SEC=${interval === "299999999" ? "299s" : "300s"}`,
+					`export CCFLARE_TEST_START_LIMIT_BURST=${burst}`,
+					"validate_effective_systemd_policy ccflare-stack.service",
+				].join("\n"),
+			);
+			expect(invalidStartLimit.exitCode).not.toBe(0);
+		}
 
 		const safeOperatorOverride = bash(
 			[
@@ -931,6 +974,25 @@ describe("effective systemd policy validation", () => {
 		expect(missingHeadroom.exitCode).not.toBe(0);
 	});
 
+	test("allows a legacy restart policy only for rollback compatibility", () => {
+		const dir = tempDir();
+		const { binDir, log } = writeSystemctlMock(dir);
+		const base = [
+			`export PATH=${shellQuote(shellPath(binDir))}:$PATH`,
+			`export CCFLARE_TEST_SYSTEMCTL_LOG=${shellQuote(shellPath(log))}`,
+			"export CCFLARE_TEST_KILL_MODE=mixed",
+			"export CCFLARE_TEST_TIMEOUT=12min",
+			"export CCFLARE_TEST_RESTART=always",
+			"export CCFLARE_TEST_RESTART_SEC=10s",
+			"export CCFLARE_TEST_RESTART_PREVENT_EXIT_STATUS=''",
+			"export CCFLARE_TEST_ENVIRONMENT='GUARD_TOTAL_DEADLINE_MS=600000 GUARD_RETRY_ATTEMPT_HEADROOM_MS=30000 GUARD_MAX_RECOVERY_SLEEP_MS=120000 GUARD_MAX_RECOVERY_WAITS=12 GUARD_SHUTDOWN_GRACE_MS=600000'",
+			`source ${shellQuote(helperScriptForShell)}`,
+		];
+		const strict = bash([...base, "validate_effective_systemd_policy ccflare-stack.service"].join("\n"));
+		expect(strict.exitCode).not.toBe(0);
+		const rollback = bash([...base, "validate_effective_systemd_policy ccflare-stack.service 1"].join("\n"));
+		expect(rollback.exitCode).toBe(0);
+	});
 	test("restores and accepts a safe pre-headroom pin without restarting", () => {
 		const dir = tempDir();
 		const { binDir, log } = writeSystemctlMock(dir);
@@ -1455,7 +1517,7 @@ describe("source-controlled stack runner", () => {
 		expect(source).toContain("GUARD_MAX_INSPECTION_BYTES=65536");
 		expect(source).toContain("start_ai_gateway_tunnel");
 		expect(source).toContain('GUARD_UPSTREAM_PID="${upstream_pid}"');
-		expect(source).toContain('wait -n "$upstream_pid" "$guard_pid"');
+		expect(source).toContain('wait -n -p exited_pid "${child_pids[@]}"');
 		expect(source).toContain(
 			'stop_child "better-ccflare upstream" "$upstream_pid" 5000',
 		);

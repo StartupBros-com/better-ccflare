@@ -144,6 +144,8 @@ render_systemd_pin() {
 	local guard_script="$5" source_id="$6" policy_id="$7" guard_policy_script="$8"
 	local deadline_ms=600000 retry_attempt_headroom_ms=30000 max_recovery_sleep_ms=120000 shutdown_grace_ms=600000 max_recovery_waits=12
 	local kill_mode=mixed stop_timeout=720s
+	local restart=on-failure restart_sec=5s restart_prevent_exit_status=143
+	local start_limit_interval=300s start_limit_burst=5
 	local managed_begin="# BEGIN better-ccflare managed deployment"
 	local managed_end="# END better-ccflare managed deployment"
 
@@ -165,6 +167,9 @@ render_systemd_pin() {
 
 	{
 		printf '%s\n' "$managed_begin"
+		printf '%s\n' "[Unit]"
+		printf 'StartLimitIntervalSec=%s\n' "$start_limit_interval"
+		printf 'StartLimitBurst=%s\n' "$start_limit_burst"
 		printf '%s\n' "[Service]"
 		printf 'Environment=%s\n' "CCFLARE_BIN=$binary"
 		printf 'Environment=%s\n' "GUARD_SCRIPT=$guard_script"
@@ -180,6 +185,9 @@ render_systemd_pin() {
 		printf 'Environment=%s\n' "GUARD_SHUTDOWN_GRACE_MS=$shutdown_grace_ms"
 		printf 'KillMode=%s\n' "$kill_mode"
 		printf 'TimeoutStopSec=%s\n' "$stop_timeout"
+		printf 'Restart=%s\n' "$restart"
+		printf 'RestartSec=%s\n' "$restart_sec"
+		printf 'RestartPreventExitStatus=%s\n' "$restart_prevent_exit_status"
 		printf '%s\n' "ExecStart="
 		printf 'ExecStart=%s\n' "$runner"
 		printf '%s\n' "$managed_end"
@@ -569,10 +577,12 @@ validate_effective_systemd_policy() {
 		return 2
 	fi
 	local service="$1" allow_missing_new_guard_limits=0
-	local kill_mode stop_timeout effective_environment effective_deadline_ms
+	local kill_mode stop_timeout restart restart_sec restart_prevent_exit_status
+	local start_limit_interval start_limit_burst effective_environment effective_deadline_ms
 	local effective_retry_attempt_headroom_ms effective_max_recovery_sleep_ms effective_shutdown_grace_ms effective_max_recovery_waits
-	local stop_timeout_usec stop_timeout_ms
+	local stop_timeout_usec restart_sec_usec start_limit_interval_usec stop_timeout_ms
 	local minimum_stop_timeout_usec
+	local minimum_start_limit_interval_usec=300000000 minimum_restart_sec_usec=5000000
 	if [[ "$#" -eq 2 ]]; then
 		allow_missing_new_guard_limits="$2"
 	fi
@@ -583,6 +593,13 @@ validate_effective_systemd_policy() {
 
 	kill_mode="$(systemctl show "$service" --property=KillMode --value)" || return 1
 	stop_timeout="$(systemctl show "$service" --property=TimeoutStopUSec --value)" || return 1
+	if [[ "$allow_missing_new_guard_limits" == "0" ]]; then
+		restart="$(systemctl show "$service" --property=Restart --value)" || return 1
+		restart_sec="$(systemctl show "$service" --property=RestartUSec --value)" || return 1
+		restart_prevent_exit_status="$(systemctl show "$service" --property=RestartPreventExitStatus --value)" || return 1
+		start_limit_interval="$(systemctl show "$service" --property=StartLimitIntervalUSec --value)" || return 1
+		start_limit_burst="$(systemctl show "$service" --property=StartLimitBurst --value)" || return 1
+	fi
 	effective_environment="$(systemctl show "$service" --property=Environment --value)" || return 1
 	effective_deadline_ms="$(
 		systemd_environment_text_value "$effective_environment" GUARD_TOTAL_DEADLINE_MS
@@ -638,6 +655,36 @@ validate_effective_systemd_policy() {
 	if [[ "$kill_mode" != "mixed" ]]; then
 		echo "effective KillMode=${kill_mode}; expected mixed" >&2
 		return 1
+	fi
+	if [[ "$allow_missing_new_guard_limits" == "0" ]]; then
+		if [[ "$restart" != "on-failure" ]]; then
+			echo "effective Restart=${restart}; expected on-failure" >&2
+			return 1
+		fi
+		restart_sec_usec="$(systemd_duration_to_microseconds "$restart_sec")" || {
+			echo "unsupported effective RestartUSec=${restart_sec}" >&2
+			return 1
+		}
+		if ((restart_sec_usec < minimum_restart_sec_usec)); then
+			echo "unsafe effective RestartUSec=${restart_sec}; expected at least ${minimum_restart_sec_usec}us" >&2
+			return 1
+		fi
+		if [[ ! " $restart_prevent_exit_status " == *" 143 "* ]]; then
+			echo "effective RestartPreventExitStatus=${restart_prevent_exit_status}; expected status 143" >&2
+			return 1
+		fi
+		start_limit_interval_usec="$(systemd_duration_to_microseconds "$start_limit_interval")" || {
+			echo "unsupported effective StartLimitIntervalUSec=${start_limit_interval}" >&2
+			return 1
+		}
+		if ((start_limit_interval_usec < minimum_start_limit_interval_usec)); then
+			echo "unsafe effective StartLimitIntervalUSec=${start_limit_interval}; expected at least ${minimum_start_limit_interval_usec}us" >&2
+			return 1
+		fi
+		if [[ ! "$start_limit_burst" =~ ^[1-9][0-9]*$ ]] || ((start_limit_burst > 5)); then
+			echo "unsafe effective StartLimitBurst=${start_limit_burst}; expected 1..5" >&2
+			return 1
+		fi
 	fi
 	validate_guard_timing_values \
 		"$effective_deadline_ms" \
