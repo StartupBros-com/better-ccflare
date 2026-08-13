@@ -104,11 +104,17 @@ describe("analyzeCodexCacheExperiments", () => {
 					zeroHitRatePct: 0,
 				},
 				outcomes: {
-					observedFallbackAttempts: 1,
+					observedExtraAttempts: 1,
+					observedFallbackAttempts: 0,
 					terminalActions: { advanced: 1 },
 				},
 				tokenHmac: { matched: 1, mismatched: 0, unavailable: 0 },
 				requestActions: { replay: 1 },
+				promptKeyConcentration: {
+					distinctKeys: 1,
+					maxRequestsPerKeyMinute: 2,
+					keysOver15RequestsPerMinute: 0,
+				},
 			},
 		]);
 		const text = formatCacheExperimentReport(report);

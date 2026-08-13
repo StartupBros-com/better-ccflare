@@ -408,6 +408,7 @@ export interface TurnStateExperimentRow {
 		observed400Responses: number;
 		observedErrorResponses: number;
 		finalAttemptFallbacks: number;
+		observedExtraAttempts: number;
 		observedFallbackAttempts: number;
 		terminalActions: Record<string, number>;
 	};
@@ -1375,6 +1376,12 @@ interface CacheExperimentRowAccumulator extends CacheExperimentRow {
 }
 
 type CacheExperimentKind = "pacing" | "explicitBreakpoint";
+
+function traceTimestamp(record: TraceRecord): number | null {
+	if (!record.ts) return null;
+	const parsed = Date.parse(record.ts);
+	return Number.isFinite(parsed) ? parsed : null;
+}
 
 function appendRecord(
 	map: Map<string, TraceRecord[]>,
@@ -2793,6 +2800,7 @@ function turnStateRowAccumulator(
 			observed400Responses: 0,
 			observedErrorResponses: 0,
 			finalAttemptFallbacks: 0,
+			observedExtraAttempts: 0,
 			observedFallbackAttempts: 0,
 			terminalActions: {},
 		},
@@ -2916,20 +2924,26 @@ function analyzeTurnStateCacheExperiments(
 			row.replayAppliedRequests++;
 		if (sample.requestAction === "would_replay") row.wouldReplayRequests++;
 		increment(row.requestActions, sample.requestAction);
-		row.outcomes.observedFallbackAttempts += Math.max(
+		row.outcomes.observedExtraAttempts += Math.max(
 			0,
 			sample.attempts.length - 1,
 		);
+		row.outcomes.observedFallbackAttempts += sample.attempts.filter((attempt) =>
+			FALLBACK_CAUSES.has(attempt.attempt_cause ?? ""),
+		).length;
 		if (FALLBACK_CAUSES.has(sample.request.attempt_cause ?? ""))
 			row.outcomes.finalAttemptFallbacks++;
-		const key = sample.request.prompt_cache_key_id;
-		if (
-			typeof key === "string" &&
-			key.length > 0 &&
-			sample.logicalTimestamp !== null
-		) {
+		for (const attempt of sample.attempts) {
+			const key = attempt.prompt_cache_key_id;
+			const attemptTimestamp = traceTimestamp(attempt);
+			if (
+				typeof key !== "string" ||
+				key.length === 0 ||
+				attemptTimestamp === null
+			)
+				continue;
 			const timestamps = row.keyTimestamps.get(key) ?? [];
-			timestamps.push(sample.logicalTimestamp);
+			timestamps.push(attemptTimestamp);
 			row.keyTimestamps.set(key, timestamps);
 		}
 		const response = sample.response;

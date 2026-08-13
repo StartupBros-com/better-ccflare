@@ -216,6 +216,71 @@ describe("CodexProvider HTTP turn state", () => {
 	it.each([
 		true,
 		false,
+	])("captures turn state when successful upstream SSE omits content-type and stream=%s", async (stream) => {
+		enableTreatment();
+		const provider = new CodexProvider();
+		const initialMessages = [{ role: "user", content: firstUserText }];
+		await provider.transformRequestBody(
+			requestFor(
+				"missing-type-request-1",
+				"missing-type-attempt-1",
+				initialMessages,
+				stream,
+			),
+			account,
+		);
+		const upstream = toolResponse(
+			"missing-type-request-1",
+			"missing-type-attempt-1",
+			"missing-type-call-1",
+			"missing-type-turn-token",
+			stream,
+		);
+		upstream.headers.delete("content-type");
+		const transformed = await provider.processResponse(upstream, null);
+		expect(transformed.headers.get(turnStateHeader)).toBeNull();
+		await transformed.text();
+
+		const continuation = await provider.transformRequestBody(
+			requestFor(
+				"missing-type-request-2",
+				"missing-type-attempt-2",
+				[
+					...initialMessages,
+					{
+						role: "assistant",
+						content: [
+							{
+								type: "tool_use",
+								id: "missing-type-call-1",
+								name: "search",
+								input: {},
+							},
+						],
+					},
+					{
+						role: "user",
+						content: [
+							{
+								type: "tool_result",
+								tool_use_id: "missing-type-call-1",
+								content: "result",
+							},
+						],
+					},
+				],
+				stream,
+			),
+			account,
+		);
+		expect(continuation.headers.get(turnStateHeader)).toBe(
+			"missing-type-turn-token",
+		);
+	});
+
+	it.each([
+		true,
+		false,
 	])("captures and replays one unchanged same-turn token when stream=%s", async (stream) => {
 		enableTreatment();
 		const provider = new CodexProvider();

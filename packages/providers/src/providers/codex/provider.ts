@@ -1525,7 +1525,9 @@ export class CodexProvider extends BaseProvider {
 			log.warn(
 				`Codex returned successful response without SSE content-type (<missing>); transforming as ${requestedStream ? "SSE" : "JSON"}`,
 			);
-			const headers = sanitizeResponseHeaders(response.headers);
+			// Keep private upstream headers until the normal response transformer has
+			// captured them. That transformer sanitizes the downstream response.
+			const headers = new Headers(response.headers);
 			headers.set("content-type", "text/event-stream");
 			const sseResponse = new Response(response.body, {
 				status: response.status,

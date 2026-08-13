@@ -154,6 +154,7 @@ interface AttemptEntry {
 	arm: CodexTurnStateArm;
 	requestId: string;
 	replayApplied: boolean;
+	terminalMutationAllowed: boolean;
 	updatedAt: number;
 }
 
@@ -567,6 +568,8 @@ export class CodexTurnStateCoordinator {
 				false,
 				now,
 				config,
+				undefined,
+				false,
 			);
 		}
 		pending.leaseRequestId = input.requestId;
@@ -625,6 +628,7 @@ export class CodexTurnStateCoordinator {
 		this.attempts.delete(input.attemptId);
 		if (!attempt) return "unknown_attempt";
 		if (!attempt.scopeKey || attempt.generation === null) return "ineligible";
+		if (!attempt.terminalMutationAllowed) return "stale_generation";
 		const generation = this.generations.get(attempt.scopeKey);
 		if (!generation || generation.generation !== attempt.generation) {
 			return "stale_generation";
@@ -707,6 +711,16 @@ export class CodexTurnStateCoordinator {
 		return { arm: "treatment", action: "new_turn" };
 	}
 
+	/**
+	 * Registers the attempt context that `finalizeAttempt` later resolves.
+	 *
+	 * `terminalMutationAllowed` must be `false` for any attempt that lost the
+	 * lease or was otherwise suppressed. Those attempts still reach a terminal
+	 * state, and without the flag they would capture or advance turn state that
+	 * belongs to the owning logical request. The default is `true` because the
+	 * ordinary owner path is the common caller; every new suppression call site
+	 * has to pass `false` explicitly.
+	 */
 	private recordAttempt(
 		input: CodexTurnStateBeginInput,
 		scopeKey: string,
@@ -717,6 +731,7 @@ export class CodexTurnStateCoordinator {
 		now: number,
 		config: CodexTurnStateConfig,
 		turnState?: string,
+		terminalMutationAllowed = true,
 	): CodexTurnStateRequestDecision {
 		const generation = this.generations.get(scopeKey)?.generation ?? null;
 		if (input.attemptId && input.requestId) {
@@ -726,6 +741,7 @@ export class CodexTurnStateCoordinator {
 				arm,
 				requestId: input.requestId,
 				replayApplied,
+				terminalMutationAllowed,
 				updatedAt: now,
 			});
 			this.enforceEntryLimit(config.maxEntries);

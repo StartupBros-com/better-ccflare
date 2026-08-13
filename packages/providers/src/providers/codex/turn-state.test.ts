@@ -375,6 +375,30 @@ describe("CodexTurnStateCoordinator", () => {
 			action: "concurrent_suppressed",
 			replayApplied: false,
 		});
+		expect(
+			coordinator.finalizeAttempt({
+				attemptId: "attempt-conflict",
+				stopReason: "tool_use",
+				responseTurnState: "conflict-token-must-not-win",
+				outputLineage: lineage("conflict-call"),
+			}),
+		).toBe("stale_generation");
+		const retiringConflict = coordinator.beginAttempt(
+			beginInput({
+				requestId: "request-retiring-conflict",
+				attemptId: "attempt-retiring-conflict",
+				lineage: lineage("call-1"),
+			}),
+		);
+		expect(retiringConflict.action).toBe("concurrent_suppressed");
+		expect(
+			coordinator.finalizeAttempt({
+				attemptId: "attempt-retiring-conflict",
+				stopReason: "end_turn",
+				responseTurnState: "conflict-token-must-not-retire",
+				outputLineage: { kind: "none" },
+			}),
+		).toBe("stale_generation");
 		const retry = coordinator.beginAttempt(
 			beginInput({
 				requestId: "request-owner",
