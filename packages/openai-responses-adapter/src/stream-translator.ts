@@ -481,15 +481,40 @@ function processSseFrame(
 ): void {
 	if (!rawEvent.trim()) return;
 
-	const lines = rawEvent.split(/\r?\n/);
 	let eventType = "";
 	let dataStr = "";
 
-	for (const line of lines) {
-		if (line.startsWith("event: ")) {
-			eventType = line.slice(7).trim();
-		} else if (line.startsWith("data: ")) {
-			dataStr = line.slice(6).trim();
+	// The hot path is the canonical two-line LF form. Avoid regex splitting the
+	// entire (potentially near-4MiB) data line, while retaining the general
+	// scanner for CRLF, multi-line data, and every unusual line arrangement.
+	const firstNewline = rawEvent.indexOf("\n");
+	const secondNewline =
+		firstNewline === -1 ? -1 : rawEvent.indexOf("\n", firstNewline + 1);
+	if (
+		firstNewline !== -1 &&
+		secondNewline === -1 &&
+		(firstNewline === 0 || rawEvent.charCodeAt(firstNewline - 1) !== 13)
+	) {
+		const firstLine = rawEvent.slice(0, firstNewline);
+		const secondLine = rawEvent.slice(firstNewline + 1);
+		if (firstLine.startsWith("event: ")) {
+			eventType = firstLine.slice(7).trim();
+		} else if (firstLine.startsWith("data: ")) {
+			dataStr = firstLine.slice(6).trim();
+		}
+		if (secondLine.startsWith("event: ")) {
+			eventType = secondLine.slice(7).trim();
+		} else if (secondLine.startsWith("data: ")) {
+			dataStr = secondLine.slice(6).trim();
+		}
+	} else {
+		const lines = rawEvent.split(/\r?\n/);
+		for (const line of lines) {
+			if (line.startsWith("event: ")) {
+				eventType = line.slice(7).trim();
+			} else if (line.startsWith("data: ")) {
+				dataStr = line.slice(6).trim();
+			}
 		}
 	}
 
