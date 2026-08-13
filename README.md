@@ -869,7 +869,7 @@ Full documentation available in [`docs/`](docs/):
 
 Inspired by [snipeship/ccflare](https://github.com/snipeship/ccflare) - thanks for the original idea and implementation!
 
-**Special thanks to our contributors:**
+**Special thanks to our contributors** (see [full details](./docs/acknowledgements.md)):
 - [@bitcoin4cashqc](https://github.com/bitcoin4cashqc) - SSL/HTTPS support implementation with comprehensive documentation
 - [@anonym-uz](https://github.com/anonym-uz) - Critical auto-pause bug fix, analytics performance optimizations, request body truncation, and incremental vacuum implementation
 - [@makhweeb](https://github.com/makhweeb) - Enhanced request handling and analytics improvements
