@@ -102,7 +102,10 @@ describe("pauseAccountForReauthIfInvalidGrant", () => {
 
 		await expect(
 			pauseAccountForReauthIfInvalidGrant(
-				new Error("invalid_grant: refresh token expired"),
+				new OAuthRefreshTokenError(
+					"acc-1",
+					"invalid_grant: refresh token expired",
+				),
 				account,
 				dbOps,
 				"rt-revoked",
@@ -273,7 +276,7 @@ describe("pauseAccountForReauthIfInvalidGrant", () => {
 			isTerminalTokenRefreshFailure(
 				new TokenRefreshError("acc-1", new Error("invalid_grant")),
 			),
-		).toBe(true);
+		).toBe(false);
 		expect(
 			isTerminalTokenRefreshFailure(new Error("fetch failed: ETIMEDOUT")),
 		).toBe(false);
@@ -341,7 +344,7 @@ describe("pauseAccountForReauthIfInvalidGrant", () => {
 		}
 	});
 
-	it("pauses on a message-based invalid_grant marker (non-typed Error)", async () => {
+	it("does not pause on a message-only invalid_grant marker", async () => {
 		const dbOps = makeDbOps(true);
 		const account = {
 			id: "acc-2",
@@ -356,8 +359,8 @@ describe("pauseAccountForReauthIfInvalidGrant", () => {
 			dbOps as never,
 		);
 
-		expect(paused).toBe(true);
-		expect(dbOps.pauseAccountIfActive).toHaveBeenCalledTimes(1);
+		expect(paused).toBe(false);
+		expect(dbOps.pauseAccountIfActive).not.toHaveBeenCalled();
 	});
 
 	it("pauses on a structured invalid_grant payload", async () => {
@@ -390,6 +393,29 @@ describe("pauseAccountForReauthIfInvalidGrant", () => {
 
 		const paused = await pauseAccountForReauthIfInvalidGrant(
 			{ error: { message: "provider mentioned invalid_grant in prose" } },
+			account,
+			dbOps as never,
+		);
+
+		expect(paused).toBe(false);
+		expect(dbOps.pauseAccountIfActive).not.toHaveBeenCalled();
+	});
+
+	it("does not pause when nested JSON prose merely mentions invalid_grant", async () => {
+		const dbOps = makeDbOps(true);
+		const account = {
+			id: "acc-json-prose",
+			name: "test",
+			provider: "codex",
+			refresh_token: "rt-json-prose",
+		};
+
+		const paused = await pauseAccountForReauthIfInvalidGrant(
+			new Error(
+				JSON.stringify({
+					error: { message: "provider mentioned invalid_grant in prose" },
+				}),
+			),
 			account,
 			dbOps as never,
 		);
@@ -592,6 +618,31 @@ describe("refreshAccessTokenSafe — pause-for-reauth at the chokepoint", () => 
 
 		expect(pauseAccountIfActive).not.toHaveBeenCalled();
 
+		clearAccountRefreshCache(account.id);
+	});
+
+	it("does not pause on provider prose that mentions invalid_grant", async () => {
+		registerProvider({
+			name: "test-reauth-provider-prose",
+			canHandle: () => true,
+			refreshToken: async () => {
+				throw new Error(
+					JSON.stringify({
+						error: { message: "provider mentioned invalid_grant in prose" },
+					}),
+				);
+			},
+		} as never);
+
+		const account = makeAccount({
+			id: "acc-prose",
+			provider: "test-reauth-provider-prose",
+		});
+		const { ctx, pauseAccountIfActive } = makeCtx(true);
+		await expect(
+			refreshAccessTokenSafe(account, ctx as never),
+		).rejects.toThrow();
+		expect(pauseAccountIfActive).not.toHaveBeenCalled();
 		clearAccountRefreshCache(account.id);
 	});
 });

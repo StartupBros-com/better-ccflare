@@ -2,6 +2,9 @@ import {
 	formatOAuthErrorMessage,
 	getEndpointUrl,
 	getModelFamily,
+	isExactInvalidGrantMessage,
+	isStructuredInvalidGrant,
+	OAuthRefreshTokenError,
 	validateEndpointUrl,
 } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
@@ -86,8 +89,11 @@ export class XaiProvider extends OpenAICompatibleProvider {
 			let message =
 				formatOAuthErrorMessage(response.statusText) ||
 				"OAuth token endpoint rejected request";
+			let responseText = "";
+			let data: unknown;
 			try {
-				const data = (await response.json()) as unknown;
+				responseText = await response.text();
+				data = JSON.parse(responseText) as unknown;
 				// Preserve the machine-readable OAuth error code (e.g. "invalid_grant")
 				// ahead of the human description so the token-manager's requires_reauth
 				// detection can classify a dead xAI refresh token.
@@ -97,9 +103,14 @@ export class XaiProvider extends OpenAICompatibleProvider {
 				// should not echo credentials, but keeping messages structured avoids
 				// accidental token exposure if that ever changes.
 			}
-			throw new Error(
-				`Failed to refresh xAI token for account ${account.name}: ${response.status} ${message}`,
-			);
+			const failureMessage = `Failed to refresh xAI token for account ${account.name}: ${response.status} ${message}`;
+			if (
+				isStructuredInvalidGrant(data) ||
+				isExactInvalidGrantMessage(responseText)
+			) {
+				throw new OAuthRefreshTokenError(account.id, failureMessage);
+			}
+			throw new Error(failureMessage);
 		}
 
 		const json = (await response.json()) as {

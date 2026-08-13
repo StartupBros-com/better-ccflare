@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { OAuthRefreshTokenError } from "@better-ccflare/core";
 import type { Account } from "@better-ccflare/types";
 import { XAI_CACHE_NATIVE_ENV, XAI_CONV_ID_HEADER } from "./cache-native";
 import {
@@ -233,6 +234,7 @@ describe("XaiProvider", () => {
 
 		// The code must survive alongside the description so token management can
 		// classify a definitively dead xAI refresh token.
+		expect(thrown).toBeInstanceOf(OAuthRefreshTokenError);
 		expect(thrown?.message).toContain("invalid_grant");
 	});
 
@@ -257,7 +259,7 @@ describe("XaiProvider", () => {
 		} catch (error) {
 			thrown = error;
 		}
-		expect(thrown).toBeInstanceOf(Error);
+		expect(thrown).toBeInstanceOf(OAuthRefreshTokenError);
 		expect((thrown as Error).message).toContain("invalid_grant");
 	});
 
