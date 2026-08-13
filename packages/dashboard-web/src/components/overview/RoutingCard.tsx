@@ -19,15 +19,17 @@ import {
 
 // Only session-class strategies are offered from the dashboard. Per-request
 // spreading strategies (least-used, session-affinity) can trip Claude's
-// anti-abuse systems and get accounts banned, so they are deliberately not
-// listed here even though StrategyName defines them. Values come from the
-// shared StrategyName enum (not hardcoded strings) so this list can never
-// drift from the authoritative 3 values in @better-ccflare/core.
-//
-// Upstream also offers "session-drain-soonest" here; this fork does not carry
-// that strategy (see packages/load-balancer/src/strategies), so it is omitted.
+// anti-abuse systems and get accounts banned, so they remain deliberately
+// hidden even though StrategyName defines them. The drain variant preserves
+// client/lane affinity and is exposed as an explicit opt-in. Values come from
+// the shared StrategyName enum (not hardcoded strings) so this list cannot
+// drift from the authoritative enum in @better-ccflare/core.
 const STRATEGY_OPTIONS: ReadonlyArray<{ label: string; value: string }> = [
 	{ label: "Session", value: StrategyName.Session },
+	{
+		label: "Session drain soonest (opt-in)",
+		value: StrategyName.SessionDrainSoonest,
+	},
 ];
 
 export interface StrategySelectItem {
@@ -37,8 +39,8 @@ export interface StrategySelectItem {
 }
 
 /**
- * Build the strategy Select's item list. The dashboard only offers the
- * session-class strategy above, but the server's effective strategy
+ * Build the strategy Select's item list. The dashboard offers the safe
+ * session-class options above, but the server's effective strategy
  * (getStrategy()) can be any of the StrategyName values — settable via
  * LB_STRATEGY, an older config file, or a hand-edited one. An out-of-list
  * value used to leave the Select's trigger blank with no indication it was
@@ -134,9 +136,11 @@ export function RoutingCardView({
 							</SelectContent>
 						</Select>
 						<div className="text-xs text-muted-foreground">
-							⚠️ Only session-class strategies are shown. Strategies that spread
-							individual requests across accounts can trigger Claude's
-							anti-abuse systems and risk account bans.
+							⚠️ The opt-in drain variant preserves client/lane stickiness and
+							only changes fresh-session or failover ordering when a future
+							weekly reset is known. Per-request spreading strategies can
+							trigger Claude's anti-abuse systems and risk account bans, so they
+							are not offered here.
 						</div>
 					</div>
 

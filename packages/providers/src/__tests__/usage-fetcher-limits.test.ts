@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import type { UsageData } from "../usage-fetcher";
 import {
+	extractWeeklyResetTime,
 	getRepresentativeUtilization,
 	getRepresentativeUtilizationForProvider,
 	getRepresentativeWindow,
@@ -57,5 +58,70 @@ describe("getRepresentativeUtilizationForProvider — limits[] (P1)", () => {
 		expect(
 			getRepresentativeUtilizationForProvider(limitsOnly, "anthropic"),
 		).toBe(70);
+	});
+});
+
+describe("extractWeeklyResetTime", () => {
+	it("reads the legacy flat seven_day reset for Codex-shaped data", () => {
+		const reset = "2030-02-03T04:05:06.000Z";
+		const data = {
+			seven_day: { utilization: 40, resets_at: reset },
+		} as UsageData;
+		expect(extractWeeklyResetTime(data, "codex")).toBe(
+			new Date(reset).getTime(),
+		);
+	});
+
+	it("reads limits[].weekly_all when the flat window is absent", () => {
+		const reset = "2030-03-04T05:06:07.000Z";
+		const data = {
+			limits: [
+				{ kind: "session", percent: 20, resets_at: "2030-03-04T01:00:00.000Z" },
+				{ kind: "weekly_all", percent: 40, resets_at: reset },
+			],
+		} as unknown as UsageData;
+		expect(extractWeeklyResetTime(data, "codex")).toBe(
+			new Date(reset).getTime(),
+		);
+	});
+
+	it("returns null for unsupported providers, missing, malformed, or unrelated windows", () => {
+		expect(
+			extractWeeklyResetTime(
+				{
+					seven_day: {
+						utilization: 40,
+						resets_at: "2030-01-01T00:00:00.000Z",
+					},
+				} as UsageData,
+				"xai",
+			),
+		).toBeNull();
+		expect(
+			extractWeeklyResetTime({ limits: [] } as unknown as UsageData),
+			"codex",
+		).toBeNull();
+		expect(
+			extractWeeklyResetTime(
+				{
+					seven_day: { utilization: 40, resets_at: "not-a-date" },
+				} as UsageData,
+				"codex",
+			),
+		).toBeNull();
+		expect(
+			extractWeeklyResetTime(
+				{
+					limits: [
+						{
+							kind: "weekly_scoped",
+							percent: 40,
+							resets_at: "2030-01-01T00:00:00.000Z",
+						},
+					],
+				} as unknown as UsageData,
+				"codex",
+			),
+		).toBeNull();
 	});
 });

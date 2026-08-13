@@ -22,6 +22,7 @@ import {
 
 export { LeastUsedStrategy } from "./least-used";
 export { SessionAffinityStrategy } from "./session-affinity";
+export { SessionDrainSoonestStrategy } from "./session-drain-soonest";
 
 export class SessionStrategy implements LoadBalancingStrategy {
 	private sessionDurationMs: number;

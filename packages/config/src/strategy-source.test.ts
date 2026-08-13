@@ -81,6 +81,17 @@ describe("getStrategy / getStrategySource", () => {
 		}
 	});
 
+	it("honors the opt-in session-drain-soonest env override", () => {
+		process.env.LB_STRATEGY = "session-drain-soonest";
+		const { config, cleanup } = makeConfig();
+		try {
+			expect(config.getStrategy()).toBe(StrategyName.SessionDrainSoonest);
+			expect(config.getStrategySource()).toBe("env");
+		} finally {
+			cleanup();
+		}
+	});
+
 	it("falls back to the default for an invalid env value when the file predates lb_strategy", () => {
 		process.env.LB_STRATEGY = "not-a-real-strategy";
 		const { config, cleanup } = makeConfigFromRawFile({});
