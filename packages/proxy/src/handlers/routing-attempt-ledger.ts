@@ -23,6 +23,30 @@ export type RetainedTerminalKind =
 /** Durable account-level authentication outcomes observed in this request. */
 export type UpstreamAuthFailureReason = "oauth_invalid_grant" | "auth_failure";
 
+/**
+ * One request-local deterministic failure bound to a concrete provider
+ * capability. Account identity is deliberately absent: equivalent accounts
+ * must not replay a failure that the endpoint/model capability already proved.
+ */
+export interface DeterministicFailureCapabilityKey {
+	readonly failureKind: "authoritative_context_overflow";
+	readonly provider: "codex";
+	readonly endpoint: string;
+	readonly model?: string | null;
+}
+
+function deterministicFailureCapabilityKey(
+	input: DeterministicFailureCapabilityKey,
+): string {
+	return JSON.stringify([
+		"deterministic-failure-capability-v1",
+		input.failureKind,
+		input.provider,
+		input.endpoint.trim(),
+		normalizeConcreteModel(input.model),
+	]);
+}
+
 export interface RetainedTerminalResponse {
 	readonly terminalKind?: RetainedTerminalKind;
 	deliver(failoverAttempts: number): Promise<Response>;
@@ -49,6 +73,7 @@ export class RoutingAttemptLedger {
 	private readonly retried = new Set<string>();
 	private readonly blockedAccounts = new Set<string>();
 	private readonly authFailures = new Map<string, UpstreamAuthFailureReason>();
+	private readonly deterministicFailures = new Set<string>();
 	private physicalAttempts = 0;
 	private degradedTracker: DegradedModeRequestTracker | null = null;
 	private guardAttemptOrdinal: number | undefined;
@@ -206,6 +231,24 @@ export class RoutingAttemptLedger {
 		if (!accountId || this.authFailures.has(accountId)) return;
 		this.authFailures.set(accountId, reason);
 		this.blockedAccounts.add(accountId);
+	}
+
+	/** Record deterministic evidence without mutating account health or claims. */
+	recordDeterministicFailure(
+		capability: DeterministicFailureCapabilityKey,
+	): void {
+		this.deterministicFailures.add(
+			deterministicFailureCapabilityKey(capability),
+		);
+	}
+
+	/** Whether this request already proved the exact capability cannot succeed. */
+	hasDeterministicFailure(
+		capability: DeterministicFailureCapabilityKey,
+	): boolean {
+		return this.deterministicFailures.has(
+			deterministicFailureCapabilityKey(capability),
+		);
 	}
 
 	/** Replace the deferred terminal response, releasing prior ownership once. */

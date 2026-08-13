@@ -14,11 +14,15 @@ import type {
 	ComboWithSlots,
 	RequestMeta,
 } from "@better-ccflare/types";
-import { AnthropicDegradedModeCoordinator } from "../anthropic-degraded-mode";
+import {
+	AnthropicDegradedModeCoordinator,
+	buildAnthropicDegradedCohortKey,
+} from "../anthropic-degraded-mode";
 import {
 	ANTHROPIC_PRECOMMIT_RESCUE_ACTIVATION_ENV,
 	ANTHROPIC_PRECOMMIT_RESCUE_ACTIVATION_MS,
 	ANTHROPIC_PRECOMMIT_RESCUE_COMMITMENT_DEADLINE_MS,
+	ANTHROPIC_PRECOMMIT_RESCUE_CONTEXT_OVERFLOW_FRAME,
 	ANTHROPIC_PRECOMMIT_RESCUE_DEADLINE_ENV,
 	ANTHROPIC_PRECOMMIT_RESCUE_ERROR_FRAME,
 	ANTHROPIC_PRECOMMIT_RESCUE_PING_FRAME,
@@ -91,7 +95,13 @@ mock.module("../handlers/discard-body-cancel", () => ({
 }));
 
 const usageCollectorModule = await import("../usage-collector");
-const { usageCache } = await import("@better-ccflare/providers");
+const {
+	clearDerivedProviderModelDefaults,
+	getProvider,
+	setDerivedProviderModelDefaults,
+	usageCache,
+} = await import("@better-ccflare/providers");
+const { clearCodexModelCacheForTests } = await import("../codex-model-catalog");
 const { alignRouteCandidateIds, handleProxy } = await import("../proxy");
 
 const MODEL = "claude-opus-4-8";
@@ -130,6 +140,7 @@ const originalEnv = new Map(
 	].map((name) => [name, process.env[name]] as const),
 );
 let restoreUsageCollector = (): void => {};
+let restoreCodexRefreshToken = (): void => {};
 let usageHandleStart = mock((_message: unknown) => undefined);
 let usageHandleChunk = mock(
 	(_requestId: string, _data: Uint8Array) => undefined,
@@ -173,8 +184,13 @@ function installPersistingUsageCollector() {
 		usageCollectorModule,
 		"getUsageCollector",
 	).mockReturnValue(collector);
+	const optionalCollectorSpy = spyOn(
+		usageCollectorModule,
+		"tryGetUsageCollector",
+	).mockReturnValue(collector);
 	restoreUsageCollector = () => {
 		collectorSpy.mockRestore();
+		optionalCollectorSpy.mockRestore();
 		collector.dispose();
 	};
 	return { collector, handleStart, handleEnd, savedRequests };
@@ -924,11 +940,16 @@ beforeEach(() => {
 		handleEnd: usageHandleEnd,
 	} as unknown as UsageCollector);
 	restoreUsageCollector = () => collectorSpy.mockRestore();
+	restoreCodexRefreshToken = (): void => {};
 });
 
 afterEach(() => {
 	restoreUsageCollector();
 	restoreUsageCollector = (): void => {};
+	restoreCodexRefreshToken();
+	restoreCodexRefreshToken = (): void => {};
+	clearCodexModelCacheForTests();
+	clearDerivedProviderModelDefaults();
 	globalThis.fetch = originalFetch;
 	for (const [name, value] of originalEnv) {
 		if (value === undefined) delete process.env[name];
@@ -1578,6 +1599,127 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		expect(codex.consecutive_rate_limits).toBe(0);
 	});
 
+	it("keeps a distinct larger Codex model eligible after an authoritative overflow", async () => {
+		process.env[CONTEXT_ADMISSION_ENV] = "1";
+		const codex = makeCodexAccount("codex-authoritative-larger-model");
+		codex.model_mappings = JSON.stringify({
+			opus: ["gpt-5.3-codex-spark", "gpt-5.6-sol"],
+		});
+		const xai = makeXaiAccount("must-not-fetch-after-larger-model-success");
+		const { ctx, reportCandidateFailure } = makeContext(
+			[codex, xai],
+			makeCombo([codex]),
+		);
+		const fetchedCodexModels: string[] = [];
+		let xaiFetches = 0;
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			if (
+				upstreamRequest.headers.get("authorization") ===
+				`Bearer access-${codex.id}`
+			) {
+				const body = (await upstreamRequest.clone().json()) as {
+					model: string;
+				};
+				fetchedCodexModels.push(body.model);
+				return sseResponse(
+					byteStream(
+						body.model === "gpt-5.3-codex-spark"
+							? codexContextOverflowStream()
+							: CODEX_SUCCESS_STREAM,
+					),
+				);
+			}
+			xaiFetches++;
+			return sseResponse(
+				completedOpenAiStream([openAiContentChunk("must not be fetched")]),
+			);
+		}) as unknown as typeof fetch;
+
+		const request = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"anthropic-version": "2023-06-01",
+			},
+			body: JSON.stringify({
+				model: MODEL,
+				messages: [{ role: "user", content: "x".repeat(440_000) }],
+				metadata: {
+					user_id: JSON.stringify({ session_id: CODEX_SESSION }),
+				},
+				max_tokens: 50_000,
+				stream: true,
+			}),
+		});
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.text();
+
+		expect(fetchedCodexModels).toEqual(["gpt-5.3-codex-spark", "gpt-5.6-sol"]);
+		expect(xaiFetches).toBe(0);
+		expect(response.status).toBe(200);
+		expect(body).toContain('"text":"codex recovered"');
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+		expect(codex.rate_limited_until).toBeNull();
+		expect(codex.consecutive_rate_limits).toBe(0);
+	});
+
+	it("tries the preferred larger Codex model first without dropping a distinct model rescue", async () => {
+		process.env[CONTEXT_ADMISSION_ENV] = "1";
+		const codex = makeCodexAccount("codex-preferred-larger-overflow");
+		codex.model_mappings = JSON.stringify({
+			opus: ["gpt-5.3-codex-spark", "gpt-5.6-sol", "gpt-distinct-rescue"],
+		});
+		const { ctx, reportCandidateFailure } = makeContext([codex]);
+		const routeOrder: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			const body = (await upstreamRequest.clone().json()) as {
+				model: string;
+			};
+			routeOrder.push(body.model);
+			return sseResponse(
+				byteStream(
+					body.model === "gpt-distinct-rescue"
+						? CODEX_SUCCESS_STREAM
+						: codexContextOverflowStream(),
+				),
+			);
+		}) as unknown as typeof fetch;
+
+		const request = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"anthropic-version": "2023-06-01",
+			},
+			body: JSON.stringify({
+				model: MODEL,
+				messages: [{ role: "user", content: "x".repeat(440_000) }],
+				metadata: {
+					user_id: JSON.stringify({ session_id: CODEX_SESSION }),
+				},
+				max_tokens: 50_000,
+				stream: true,
+			}),
+		});
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.text();
+
+		expect(routeOrder).toEqual([
+			"gpt-5.3-codex-spark",
+			"gpt-5.6-sol",
+			"gpt-distinct-rescue",
+		]);
+		expect(response.status).toBe(200);
+		expect(body).toContain('"text":"codex recovered"');
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+		expect(codex.rate_limited_until).toBeNull();
+		expect(codex.consecutive_rate_limits).toBe(0);
+	});
+
 	it.each([
 		{ stream: false, authoritativeKind: "processed JSON" },
 		{ stream: true, authoritativeKind: "precommit SSE" },
@@ -1956,8 +2098,631 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		expect(codex.consecutive_rate_limits).toBe(0);
 	});
 
+	it("preserves an authoritative overflow after equivalent Codex accounts are exhausted", async () => {
+		const primary = makeCodexAccount("codex-equivalent-overflow-primary");
+		const secondary = makeCodexAccount("codex-equivalent-overflow-secondary");
+		const { ctx, reportCandidateFailure } = makeContext([primary, secondary]);
+		const fetchedAccounts: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			const authorization = upstreamRequest.headers.get("authorization") ?? "";
+			fetchedAccounts.push(authorization.replace("Bearer access-", ""));
+			return sseResponse(byteStream(codexContextOverflowStream()));
+		}) as unknown as typeof fetch;
+
+		const request = makeCodexRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.text();
+
+		expect(fetchedAccounts).toEqual([primary.id]);
+		expect(response.status).toBe(400);
+		expect(body).toContain('"code":"context_length_exceeded"');
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+		expect(primary.rate_limited_until).toBeNull();
+		expect(secondary.rate_limited_until).toBeNull();
+	});
+
+	it("preserves one direct JSON overflow across equivalent Codex accounts for a non-streaming request", async () => {
+		clearCodexModelCacheForTests();
+		clearDerivedProviderModelDefaults();
+		const primary = makeCodexAccount("codex-equivalent-json-overflow-primary");
+		const secondary = makeCodexAccount(
+			"codex-equivalent-json-overflow-secondary",
+		);
+		secondary.priority = 1;
+		secondary.model_mappings = JSON.stringify({
+			opus: ["gpt-5.3-codex"],
+		});
+		secondary.access_token = `expired-${secondary.id}`;
+		secondary.refresh_token = `refresh-${secondary.id}`;
+		secondary.expires_at = Date.now() - 1;
+		const secondaryCredentials = {
+			accessToken: secondary.access_token,
+			refreshToken: secondary.refresh_token,
+			expiresAt: secondary.expires_at,
+		};
+		const codexProvider = getProvider("codex");
+		if (!codexProvider) throw new Error("codex provider not registered");
+		const refreshToken = spyOn(
+			codexProvider,
+			"refreshToken",
+		).mockImplementation(async () => {
+			throw new Error("equivalent overflow route must not refresh credentials");
+		});
+		restoreCodexRefreshToken = () => refreshToken.mockRestore();
+		const persistence = installPersistingUsageCollector();
+		const { ctx } = makeContext([primary, secondary]);
+		ctx.dbOps.getAccount = mock(async (accountId: string) =>
+			[primary, secondary].find((account) => account.id === accountId),
+		);
+		const strategy = new SessionAffinityStrategy();
+		strategy.initialize({ resetAccountSession: () => undefined });
+		const reportCandidateFailure = spyOn(strategy, "reportCandidateFailure");
+		const markModelScopedExhausted = spyOn(
+			usageCache,
+			"markModelScopedExhausted",
+		);
+		const markFamilyScopedExhausted = spyOn(
+			usageCache,
+			"markFamilyScopedExhausted",
+		);
+		ctx.strategy = strategy;
+		const fetchedAccounts: string[] = [];
+		const catalogAccounts: string[] = [];
+		globalThis.fetch = mock(
+			async (input: RequestInfo | URL, init?: RequestInit) => {
+				const upstreamRequest =
+					input instanceof Request ? input : new Request(input, init);
+				const authorization =
+					upstreamRequest.headers.get("authorization") ??
+					new Headers(init?.headers).get("authorization") ??
+					"";
+				const accountId = authorization.replace("Bearer access-", "");
+				if (
+					new URL(upstreamRequest.url).pathname === "/backend-api/codex/models"
+				) {
+					catalogAccounts.push(accountId);
+					return Response.json({
+						models: [
+							{
+								slug: "gpt-5.3-codex",
+								display_name: "GPT-5.3 Codex",
+								visibility: "list",
+								priority: 1,
+							},
+						],
+					});
+				}
+				fetchedAccounts.push(accountId);
+				return codexContextOverflowResponse("equivalent-direct-json-overflow");
+			},
+		) as unknown as typeof fetch;
+
+		const request = makeCodexRequest({ stream: false });
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.text();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		await persistence.collector.drain();
+
+		expect(fetchedAccounts).toEqual([primary.id]);
+		expect(catalogAccounts).toEqual([primary.id]);
+		expect(response.status).toBe(400);
+		expect(response.headers.get("content-type")).toContain("application/json");
+		expect(response.headers.get("x-upstream-proof")).toBe(
+			"equivalent-direct-json-overflow",
+		);
+		expect(JSON.parse(body)).toEqual({
+			error: {
+				type: "invalid_request_error",
+				code: "context_length_exceeded",
+				message: "Input is too large",
+			},
+		});
+		expect(body).not.toContain("No compatible account route committed");
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+		expect(strategy.routeSuppressionEntries).toBe(0);
+		for (const account of [primary, secondary]) {
+			expect(account.paused).toBe(false);
+			expect(account.rate_limited_until).toBeNull();
+			expect(account.consecutive_rate_limits).toBe(0);
+			expect(
+				usageCache.getModelScopedExhaustion(account.id, MODEL, null),
+			).toBeNull();
+			expect(
+				usageCache.getModelScopedExhaustion(account.id, "gpt-5.3-codex", null),
+			).toBeNull();
+		}
+		expect(markModelScopedExhausted).not.toHaveBeenCalled();
+		expect(markFamilyScopedExhausted).not.toHaveBeenCalled();
+		expect(refreshToken).not.toHaveBeenCalled();
+		expect({
+			accessToken: secondary.access_token,
+			refreshToken: secondary.refresh_token,
+			expiresAt: secondary.expires_at,
+		}).toEqual(secondaryCredentials);
+		expect(persistence.handleEnd).toHaveBeenCalledTimes(1);
+		expect(persistence.handleEnd).toHaveBeenCalledWith({
+			type: "end",
+			requestId: expect.any(String),
+			success: false,
+			error: "context_length_exceeded",
+		});
+		expect(persistence.savedRequests).toHaveLength(1);
+		expect(persistence.savedRequests[0]?.[3]).toBe(primary.id);
+		expect(persistence.savedRequests[0]?.[4]).toBe(400);
+		expect(persistence.savedRequests[0]?.[5]).toBe(false);
+		expect(persistence.savedRequests[0]?.[6]).toBe("context_length_exceeded");
+		expect(persistence.savedRequests[0]?.[8]).toBe(0);
+		markModelScopedExhausted.mockRestore();
+		markFamilyScopedExhausted.mockRestore();
+	});
+
+	it("binds hydrated Codex model identity before suppressing only equivalent routes", async () => {
+		clearCodexModelCacheForTests();
+		clearDerivedProviderModelDefaults();
+		const primary = makeCodexAccount("codex-hydrated-frontier-primary");
+		const equivalent = makeCodexAccount("codex-hydrated-frontier-equivalent");
+		equivalent.priority = 1;
+		equivalent.access_token = `expired-${equivalent.id}`;
+		equivalent.refresh_token = `refresh-${equivalent.id}`;
+		equivalent.expires_at = Date.now() - 1;
+		equivalent.model_mappings = JSON.stringify({
+			opus: ["gpt-5.6-sol"],
+		});
+		const distinct = makeCodexAccount("codex-hydrated-explicit-distinct");
+		distinct.priority = 2;
+		distinct.model_mappings = JSON.stringify({
+			opus: ["gpt-explicit-distinct"],
+		});
+		const codexProvider = getProvider("codex");
+		if (!codexProvider) throw new Error("codex provider not registered");
+		const refreshToken = spyOn(
+			codexProvider,
+			"refreshToken",
+		).mockImplementation(async () => {
+			throw new Error("equivalent hydrated route must skip before refresh");
+		});
+		restoreCodexRefreshToken = () => refreshToken.mockRestore();
+		const { ctx, reportCandidateFailure } = makeContext([
+			primary,
+			equivalent,
+			distinct,
+		]);
+		ctx.dbOps.getAccount = mock(async (accountId: string) =>
+			[primary, equivalent, distinct].find(
+				(account) => account.id === accountId,
+			),
+		);
+		const catalogAccounts: string[] = [];
+		const transported: Array<{ accountId: string; model: string }> = [];
+		globalThis.fetch = mock(
+			async (input: RequestInfo | URL, init?: RequestInit) => {
+				const upstreamRequest =
+					input instanceof Request ? input : new Request(input, init);
+				const authorization =
+					upstreamRequest.headers.get("authorization") ??
+					new Headers(init?.headers).get("authorization") ??
+					"";
+				const accountId = authorization.replace(
+					/^Bearer (?:access-|expired-)/,
+					"",
+				);
+				if (
+					new URL(upstreamRequest.url).pathname === "/backend-api/codex/models"
+				) {
+					catalogAccounts.push(accountId);
+					return Response.json({
+						models: [
+							{
+								slug: "gpt-5.6-sol",
+								display_name: "GPT-5.6 Sol",
+								visibility: "list",
+								priority: 1,
+							},
+							{
+								slug: "gpt-5.4-mini",
+								display_name: "GPT-5.4 Mini",
+								visibility: "list",
+								priority: 2,
+							},
+						],
+					});
+				}
+				const body = (await upstreamRequest.clone().json()) as {
+					model: string;
+				};
+				transported.push({ accountId, model: body.model });
+				return accountId === primary.id
+					? codexContextOverflowResponse("hydrated-frontier-overflow")
+					: sseResponse(byteStream(CODEX_SUCCESS_STREAM));
+			},
+		) as unknown as typeof fetch;
+
+		const request = makeCodexRequest({ stream: false });
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const payload = (await response.json()) as {
+			content?: Array<{ type?: string; text?: string }>;
+		};
+
+		expect(catalogAccounts).toEqual([primary.id, distinct.id]);
+		expect(transported).toEqual([
+			{ accountId: primary.id, model: "gpt-5.6-sol" },
+			{ accountId: distinct.id, model: "gpt-explicit-distinct" },
+		]);
+		expect(response.status).toBe(200);
+		expect(payload.content).toContainEqual({
+			type: "text",
+			text: "codex recovered",
+		});
+		expect(refreshToken).not.toHaveBeenCalled();
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+		for (const account of [primary, equivalent, distinct]) {
+			expect(account.rate_limited_until).toBeNull();
+			expect(account.consecutive_rate_limits).toBe(0);
+		}
+	});
+
+	it("keeps an already-derived sibling Codex frontier eligible when its physical model is distinct", async () => {
+		process.env[CONTEXT_ADMISSION_ENV] = "1";
+		clearCodexModelCacheForTests();
+		clearDerivedProviderModelDefaults();
+		const primary = makeCodexAccount("codex-derived-frontier-primary");
+		const secondary = makeCodexAccount("codex-derived-frontier-secondary");
+		secondary.priority = 1;
+		setDerivedProviderModelDefaults("codex", primary.id, {
+			fable: "gpt-5.6-sol",
+			opus: "gpt-5.6-sol",
+			sonnet: "gpt-5.6-terra",
+			haiku: "gpt-5.6-terra",
+		});
+		setDerivedProviderModelDefaults("codex", secondary.id, {
+			fable: "gpt-5.6-terra",
+			opus: "gpt-5.6-terra",
+			sonnet: "gpt-5.4-mini",
+			haiku: "gpt-5.4-mini",
+		});
+		const { ctx, reportCandidateFailure } = makeContext([primary, secondary]);
+		ctx.dbOps.getAccount = mock(async (accountId: string) =>
+			[primary, secondary].find((account) => account.id === accountId),
+		);
+		const catalogAccounts: string[] = [];
+		const transported: Array<{ accountId: string; model: string }> = [];
+		globalThis.fetch = mock(
+			async (input: RequestInfo | URL, init?: RequestInit) => {
+				const upstreamRequest =
+					input instanceof Request ? input : new Request(input, init);
+				const accountId = (
+					upstreamRequest.headers.get("authorization") ??
+					new Headers(init?.headers).get("authorization") ??
+					""
+				).replace("Bearer access-", "");
+				if (
+					new URL(upstreamRequest.url).pathname === "/backend-api/codex/models"
+				) {
+					catalogAccounts.push(accountId);
+					return Response.json({ models: [] });
+				}
+				const body = (await upstreamRequest.clone().json()) as {
+					model: string;
+				};
+				transported.push({ accountId, model: body.model });
+				return accountId === primary.id
+					? codexContextOverflowResponse("primary-derived-overflow")
+					: sseResponse(byteStream(CODEX_SUCCESS_STREAM));
+			},
+		) as unknown as typeof fetch;
+
+		const request = makeCodexRequest({ stream: false });
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const payload = (await response.json()) as {
+			content?: Array<{ type?: string; text?: string }>;
+		};
+
+		expect(catalogAccounts).toEqual([]);
+		expect(transported).toEqual([
+			{ accountId: primary.id, model: "gpt-5.6-sol" },
+			{ accountId: secondary.id, model: "gpt-5.6-terra" },
+		]);
+		expect(response.status).toBe(200);
+		expect(payload.content).toContainEqual({
+			type: "text",
+			text: "codex recovered",
+		});
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+		for (const account of [primary, secondary]) {
+			expect(account.rate_limited_until).toBeNull();
+			expect(account.consecutive_rate_limits).toBe(0);
+		}
+	});
+
+	it("does not treat an unrelated account mapping as proof of Codex physical-model equivalence", async () => {
+		process.env[CONTEXT_ADMISSION_ENV] = "1";
+		clearCodexModelCacheForTests();
+		clearDerivedProviderModelDefaults();
+		const primary = makeCodexAccount("codex-unrelated-map-primary");
+		const secondary = makeCodexAccount("codex-unrelated-map-secondary");
+		secondary.priority = 1;
+		secondary.model_mappings = JSON.stringify({
+			sonnet: ["gpt-unrelated-sonnet"],
+		});
+		setDerivedProviderModelDefaults("codex", primary.id, {
+			fable: "gpt-5.6-sol",
+			opus: "gpt-5.6-sol",
+			sonnet: "gpt-5.6-terra",
+			haiku: "gpt-5.6-terra",
+		});
+		const { ctx, reportCandidateFailure } = makeContext([primary, secondary]);
+		ctx.dbOps.getAccount = mock(async (accountId: string) =>
+			[primary, secondary].find((account) => account.id === accountId),
+		);
+		const catalogAccounts: string[] = [];
+		const transported: Array<{ accountId: string; model: string }> = [];
+		globalThis.fetch = mock(
+			async (input: RequestInfo | URL, init?: RequestInit) => {
+				const upstreamRequest =
+					input instanceof Request ? input : new Request(input, init);
+				const accountId = (
+					upstreamRequest.headers.get("authorization") ??
+					new Headers(init?.headers).get("authorization") ??
+					""
+				).replace("Bearer access-", "");
+				if (
+					new URL(upstreamRequest.url).pathname === "/backend-api/codex/models"
+				) {
+					catalogAccounts.push(accountId);
+					return Response.json({
+						models: [
+							{
+								slug: "gpt-5.6-terra",
+								display_name: "GPT-5.6 Terra",
+								visibility: "list",
+								priority: 1,
+							},
+							{
+								slug: "gpt-5.4-mini",
+								display_name: "GPT-5.4 Mini",
+								visibility: "list",
+								priority: 2,
+							},
+						],
+					});
+				}
+				const body = (await upstreamRequest.clone().json()) as {
+					model: string;
+				};
+				transported.push({ accountId, model: body.model });
+				return accountId === primary.id
+					? codexContextOverflowResponse("unrelated-map-primary-overflow")
+					: sseResponse(byteStream(CODEX_SUCCESS_STREAM));
+			},
+		) as unknown as typeof fetch;
+
+		const request = makeCodexRequest({ stream: false });
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const payload = (await response.json()) as {
+			content?: Array<{ type?: string; text?: string }>;
+		};
+
+		expect(catalogAccounts).toEqual([secondary.id]);
+		expect(transported).toEqual([
+			{ accountId: primary.id, model: "gpt-5.6-sol" },
+			{ accountId: secondary.id, model: "gpt-5.6-terra" },
+		]);
+		expect(response.status).toBe(200);
+		expect(payload.content).toContainEqual({
+			type: "text",
+			text: "codex recovered",
+		});
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		{ stream: false, rescued: false, expectedStatus: 400 },
+		{ stream: true, rescued: true, expectedStatus: 200 },
+	])("keeps a retained Codex overflow authoritative over an enforce-mode Anthropic denial (rescued=$rescued)", async ({
+		stream,
+		rescued,
+		expectedStatus,
+	}) => {
+		if (rescued) {
+			process.env[RESCUE_ACTIVATION_ENV] = "1";
+			process.env[RESCUE_PING_ENV] = "50";
+			process.env[RESCUE_DEADLINE_ENV] = "200";
+		}
+		const codex = makeCodexAccount(
+			`codex-before-degraded-denial-${String(rescued)}`,
+		);
+		const anthropic = {
+			...makeAccount(`anthropic-degraded-denied-${String(rescued)}`),
+			api_key: null,
+			refresh_token: "oauth-refresh-token",
+			access_token: "oauth-access-token",
+			expires_at: Date.now() + 60 * 60 * 1000,
+		};
+		const persistence = installPersistingUsageCollector();
+		const { ctx, reportCandidateFailure } = makeContext([codex, anthropic]);
+		const anthropicProvider = getProvider("anthropic");
+		if (!anthropicProvider)
+			throw new Error("anthropic provider not registered");
+		ctx.provider = anthropicProvider;
+		ctx.dbOps.getAccount = mock(async (accountId: string) =>
+			[codex, anthropic].find((account) => account.id === accountId),
+		);
+		const coordinator = new AnthropicDegradedModeCoordinator({
+			config: {
+				...ANTHROPIC_DEGRADED_MODE_DEFAULTS,
+				mode: "enforce",
+				largeRequestByteThreshold: 64 * 1024,
+			},
+		});
+		const cohortKey = buildAnthropicDegradedCohortKey({
+			provider: "anthropic",
+			endpoint: "https://api.anthropic.com/v1/messages",
+			path: "/v1/messages",
+			protocol: "messages",
+			model: MODEL,
+			betaSignature: "oauth-2025-04-20",
+		});
+		if (!cohortKey) throw new Error("expected Anthropic degraded cohort key");
+		for (const accountId of ["evidence-a", "evidence-b"]) {
+			coordinator.observeTrustedOverload({
+				cohortKey,
+				accountId,
+				outcome: "http_529",
+				phase: "pre_commit",
+				forceRouted: false,
+				retryAfter: "30",
+			});
+		}
+		expect(coordinator.getCohortState(cohortKey).state).toBe("open");
+		ctx.anthropicDegradedMode = coordinator;
+		let anthropicFetches = 0;
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			const upstreamUrl = new URL(upstreamRequest.url);
+			if (upstreamUrl.pathname === "/backend-api/codex/models") {
+				return Response.json({
+					models: [
+						{
+							slug: "gpt-5.3-codex",
+							display_name: "GPT-5.3 Codex",
+							visibility: "list",
+							priority: 1,
+						},
+					],
+				});
+			}
+			if (upstreamUrl.hostname === "api.anthropic.com") {
+				anthropicFetches++;
+				return new Response("must not fetch Anthropic", { status: 500 });
+			}
+			if (rescued) {
+				await new Promise((resolve) => setTimeout(resolve, 10));
+			}
+			return codexContextOverflowResponse("before-degraded-denial");
+		}) as unknown as typeof fetch;
+
+		const request = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"anthropic-version": "2023-06-01",
+			},
+			body: JSON.stringify({
+				model: MODEL,
+				messages: [{ role: "user", content: "x".repeat(70 * 1024) }],
+				metadata: {
+					user_id: JSON.stringify({ session_id: CODEX_SESSION }),
+				},
+				max_tokens: 16,
+				stream,
+			}),
+		});
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.text();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		await persistence.collector.drain();
+
+		expect(anthropicFetches).toBe(0);
+		expect(response.status).toBe(expectedStatus);
+		expect(body).toContain('"code":"context_length_exceeded"');
+		expect(body).not.toContain("Overloaded");
+		if (rescued) {
+			expect(response.headers.get("content-type")).toContain(
+				"text/event-stream",
+			);
+			expect(response.headers.get("x-better-ccflare-precommit-rescue")).toBe(
+				"active",
+			);
+		} else {
+			expect(response.headers.get("x-upstream-proof")).toBe(
+				"before-degraded-denial",
+			);
+		}
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+		expect(codex.rate_limited_until).toBeNull();
+		expect(codex.consecutive_rate_limits).toBe(0);
+		expect(anthropic.rate_limited_until).toBeNull();
+		expect(anthropic.consecutive_rate_limits).toBe(0);
+		expect(persistence.handleEnd).toHaveBeenCalledTimes(1);
+		expect(persistence.handleEnd).toHaveBeenCalledWith({
+			type: "end",
+			requestId: expect.any(String),
+			success: false,
+			error: "context_length_exceeded",
+		});
+		expect(persistence.savedRequests).toHaveLength(1);
+		expect(persistence.savedRequests[0]?.[3]).toBe(codex.id);
+		expect(persistence.savedRequests[0]?.[4]).toBe(expectedStatus);
+		expect(persistence.savedRequests[0]?.[5]).toBe(false);
+		expect(persistence.savedRequests[0]?.[6]).toBe("context_length_exceeded");
+	});
+
+	it("preserves authoritative overflow semantics after precommit rescue activates", async () => {
+		process.env[RESCUE_ACTIVATION_ENV] = "1";
+		process.env[RESCUE_PING_ENV] = "50";
+		process.env[RESCUE_DEADLINE_ENV] = "200";
+		const codex = makeCodexAccount("codex-delayed-authoritative-overflow");
+		const { ctx, reportCandidateFailure } = makeContext([codex]);
+		globalThis.fetch = mock(async () => {
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			return sseResponse(byteStream(codexContextOverflowStream()));
+		}) as unknown as typeof fetch;
+
+		const request = makeCodexRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.text();
+
+		expect(response.status).toBe(200);
+		expect(response.headers.get("x-better-ccflare-precommit-rescue")).toBe(
+			"active",
+		);
+		expect(body).toContain('"code":"context_length_exceeded"');
+		expect(body).toContain("Input exceeds the context window");
+		expect(body).not.toContain("No compatible account route committed");
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+		expect(codex.rate_limited_until).toBeNull();
+	});
+
+	it("keeps a distinct custom Codex endpoint eligible after an authoritative overflow", async () => {
+		const overflowing = makeCodexAccount(
+			"codex-custom-overflow",
+			"https://overflow.example.test/v1/responses",
+		);
+		const rescue = makeCodexAccount(
+			"codex-custom-rescue",
+			"https://rescue.example.test/v1/responses",
+		);
+		const { ctx, reportCandidateFailure } = makeContext([overflowing, rescue]);
+		const fetchedAccounts: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			const authorization = upstreamRequest.headers.get("authorization") ?? "";
+			const accountId = authorization.replace("Bearer access-", "");
+			fetchedAccounts.push(accountId);
+			return accountId === overflowing.id
+				? sseResponse(byteStream(codexContextOverflowStream()))
+				: sseResponse(byteStream(CODEX_SUCCESS_STREAM));
+		}) as unknown as typeof fetch;
+
+		const request = makeCodexRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.text();
+
+		expect(fetchedAccounts).toEqual([overflowing.id, rescue.id]);
+		expect(response.status).toBe(200);
+		expect(body).toContain('"text":"codex recovered"');
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+		expect(overflowing.rate_limited_until).toBeNull();
+		expect(rescue.rate_limited_until).toBeNull();
+	});
+
 	it("preserves a forced Codex direct context overflow response", async () => {
 		const codex = makeCodexAccount("codex-http-context-terminal");
+		const persistence = installPersistingUsageCollector();
 		const { ctx, reportCandidateFailure } = makeContext([codex]);
 		globalThis.fetch = mock(async () =>
 			codexContextOverflowResponse("forced-codex-overflow"),
@@ -1975,6 +2740,8 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		const payload = (await response.json()) as {
 			error?: { type?: string; code?: string; message?: string };
 		};
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		await persistence.collector.drain();
 
 		expect(response.status).toBe(400);
 		expect(response.headers.get("x-upstream-proof")).toBe(
@@ -1988,6 +2755,73 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		expect(reportCandidateFailure).not.toHaveBeenCalled();
 		expect(codex.rate_limited_until).toBeNull();
 		expect(codex.consecutive_rate_limits).toBe(0);
+		expect(persistence.handleStart).toHaveBeenCalledTimes(1);
+		expect(persistence.handleEnd).toHaveBeenCalledTimes(1);
+		expect(persistence.handleEnd).toHaveBeenCalledWith({
+			type: "end",
+			requestId: expect.any(String),
+			success: false,
+			error: "context_length_exceeded",
+		});
+		expect(persistence.savedRequests).toHaveLength(1);
+		expect(persistence.savedRequests[0]?.[3]).toBe(codex.id);
+		expect(persistence.savedRequests[0]?.[4]).toBe(400);
+		expect(persistence.savedRequests[0]?.[5]).toBe(false);
+		expect(persistence.savedRequests[0]?.[6]).toBe("context_length_exceeded");
+		expect(persistence.savedRequests[0]?.[8]).toBe(0);
+	});
+
+	it("preserves a forced direct Codex overflow after precommit rescue activates", async () => {
+		process.env[RESCUE_ACTIVATION_ENV] = "1";
+		process.env[RESCUE_PING_ENV] = "50";
+		process.env[RESCUE_DEADLINE_ENV] = "200";
+		const codex = makeCodexAccount("codex-delayed-http-context-terminal");
+		const persistence = installPersistingUsageCollector();
+		const { ctx, reportCandidateFailure } = makeContext([codex]);
+		globalThis.fetch = mock(async () => {
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			return codexContextOverflowResponse("delayed-forced-codex-overflow");
+		}) as unknown as typeof fetch;
+		const baseRequest = makeCodexRequest();
+		const headers = new Headers(baseRequest.headers);
+		headers.set("x-better-ccflare-account-id", codex.id);
+		const request = new Request(baseRequest.url, {
+			method: baseRequest.method,
+			headers,
+			body: await baseRequest.text(),
+		});
+
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.text();
+		// The retained route starts an account-backed lifecycle before the outer
+		// rescue replaces its deferred success with the translated terminal.
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		await persistence.collector.drain();
+
+		expect(response.status).toBe(200);
+		expect(response.headers.get("content-type")).toContain("text/event-stream");
+		expect(response.headers.get("x-better-ccflare-precommit-rescue")).toBe(
+			"active",
+		);
+		expect(body).toEndWith(ANTHROPIC_PRECOMMIT_RESCUE_CONTEXT_OVERFLOW_FRAME);
+		expect(body).not.toContain("No compatible account route committed");
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+		expect(codex.rate_limited_until).toBeNull();
+		expect(codex.consecutive_rate_limits).toBe(0);
+		expect(persistence.handleStart).toHaveBeenCalledTimes(1);
+		expect(persistence.handleEnd).toHaveBeenCalledTimes(1);
+		expect(persistence.handleEnd).toHaveBeenCalledWith({
+			type: "end",
+			requestId: expect.any(String),
+			success: false,
+			error: "context_length_exceeded",
+		});
+		expect(persistence.savedRequests).toHaveLength(1);
+		expect(persistence.savedRequests[0]?.[3]).toBe(codex.id);
+		expect(persistence.savedRequests[0]?.[4]).toBe(200);
+		expect(persistence.savedRequests[0]?.[5]).toBe(false);
+		expect(persistence.savedRequests[0]?.[6]).toBe("context_length_exceeded");
+		expect(persistence.savedRequests[0]?.[8]).toBe(0);
 	});
 
 	it("returns the existing 503 after exactly two stalled Codex cache-lane attempts", async () => {

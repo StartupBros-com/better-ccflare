@@ -83,6 +83,38 @@ describe("RoutingAttemptLedger", () => {
 		expect(ledger.claim("account-a", "   ")).toBe(false);
 	});
 
+	it("matches deterministic failures by endpoint capability and normalized model", () => {
+		const ledger = new RoutingAttemptLedger();
+		const officialOverflow = {
+			failureKind: "authoritative_context_overflow",
+			provider: "codex",
+			endpoint: "https://chatgpt.com/backend-api/codex/responses",
+			model: " GPT-5.4 ",
+		} as const;
+
+		expect(ledger.hasDeterministicFailure(officialOverflow)).toBe(false);
+		ledger.recordDeterministicFailure(officialOverflow);
+
+		expect(
+			ledger.hasDeterministicFailure({
+				...officialOverflow,
+				model: "gpt-5.4",
+			}),
+		).toBe(true);
+		expect(
+			ledger.hasDeterministicFailure({
+				...officialOverflow,
+				model: "gpt-5.6-sol",
+			}),
+		).toBe(false);
+		expect(
+			ledger.hasDeterministicFailure({
+				...officialOverflow,
+				endpoint: "https://custom.example.test/v1/responses",
+			}),
+		).toBe(false);
+	});
+
 	it("blocks every sibling model after an account-wide failure", () => {
 		const ledger = new RoutingAttemptLedger();
 

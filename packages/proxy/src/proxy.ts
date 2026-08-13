@@ -39,6 +39,7 @@ import {
 	createAnthropicPreCommitRescueRouteContext,
 	getAnthropicPreCommitRescueConfig,
 	isPotentialDownstreamAnthropicMessagesRequest,
+	markAnthropicContextOverflowTerminal,
 } from "./anthropic-precommit-rescue";
 import { cacheBodyStore } from "./cache-body-store";
 import { recordDiagnosisCandidate } from "./cache-diagnosis";
@@ -588,6 +589,7 @@ export async function handleProxy(
 				requestStartedAt: rescueRequestStartedAt,
 				commitmentDeadlineAt: routeContext.commitmentDeadlineAt,
 				onRescueTerminal: routeContext.reportTerminal,
+				onRescueCommitted: routeContext.markRescueCommitted,
 				onResponseAccepted: routeContext.releaseResponseLifecycle,
 				abortRouting(reason) {
 					if (!routingAbortController.signal.aborted) {
@@ -2023,20 +2025,30 @@ async function handleProxyCore(
 			},
 		};
 	};
-	const hasPreferredLegacyContextOverflowRoute = (): boolean =>
+	const hasPreferredContextOverflowRoute = (): boolean =>
 		preferredContextOverflowRouteKey !== null &&
-		routingAttemptLedger.hasRetainedTerminalKind("legacy_context_overflow");
-	const deliverRetainedTerminalResponse =
-		async (): Promise<Response | null> => {
-			const retainedTerminalResponse =
-				routingAttemptLedger.takeTerminalResponse();
-			if (!retainedTerminalResponse) return null;
-			const terminalFailoverAttempts = Math.max(
-				0,
-				routingAttemptLedger.attemptedCount - 1,
-			);
-			return retainedTerminalResponse.deliver(terminalFailoverAttempts);
-		};
+		(routingAttemptLedger.hasRetainedTerminalKind("legacy_context_overflow") ||
+			routingAttemptLedger.hasRetainedTerminalKind(
+				"authoritative_context_overflow",
+			));
+	const deliverRetainedTerminalResponse = async (
+		retainedTerminalResponse = routingAttemptLedger.takeTerminalResponse(),
+	): Promise<Response | null> => {
+		if (!retainedTerminalResponse) return null;
+		const terminalFailoverAttempts = Math.max(
+			0,
+			routingAttemptLedger.attemptedCount - 1,
+		);
+		const delivered = await retainedTerminalResponse.deliver(
+			terminalFailoverAttempts,
+		);
+		if (
+			retainedTerminalResponse.terminalKind === "authoritative_context_overflow"
+		) {
+			markAnthropicContextOverflowTerminal(delivered);
+		}
+		return delivered;
+	};
 	const settleRoutedResponse = async (
 		candidateResponse: Response,
 	): Promise<Response> => {
@@ -2164,6 +2176,18 @@ async function handleProxyCore(
 				response: denial.retainedTrustedResponse,
 				retryAfter: denial.decision.retryAfterSeconds,
 			});
+		}
+		// A local pretransport suppression cannot replace an already-proven Codex
+		// context terminal. Inspect before the delivery helper transfers ownership;
+		// trusted upstream Anthropic overloads above and retained 529s below keep
+		// their existing precedence.
+		if (
+			routingAttemptLedger.hasRetainedTerminalKind(
+				"authoritative_context_overflow",
+			)
+		) {
+			const retainedContextOverflow = await deliverRetainedTerminalResponse();
+			if (retainedContextOverflow) return retainedContextOverflow;
 		}
 		const retainedTerminalResponse = await deliverRetainedTerminalResponse();
 		if (retainedTerminalResponse?.status === 529) {
@@ -2349,7 +2373,7 @@ async function handleProxyCore(
 			);
 			return finishPacing(pacingSlot, response);
 		}
-		if (hasPreferredLegacyContextOverflowRoute()) {
+		if (hasPreferredContextOverflowRoute()) {
 			break;
 		}
 
@@ -2470,10 +2494,7 @@ async function handleProxyCore(
 	let reactivelyDepletedFallbackAccounts: Account[] = [];
 	let throttledFallbackAccounts: Account[] = [];
 	let fallbackSelectionHadNoAvailable = false;
-	if (
-		filteredComboInfo?.comboName &&
-		!hasPreferredLegacyContextOverflowRoute()
-	) {
+	if (filteredComboInfo?.comboName && !hasPreferredContextOverflowRoute()) {
 		if (isComboSessionFallbackDisabled()) {
 			if (hasExhaustedLocalServerToolCapabilityFailures()) {
 				cacheBodyStore.discardStaged(requestMeta.id);
@@ -2515,14 +2536,11 @@ async function handleProxyCore(
 					retainedTerminalResponse?.terminalKind ===
 					"authoritative_context_overflow"
 				) {
-					const terminalFailoverAttempts = Math.max(
-						0,
-						routingAttemptLedger.attemptedCount - 1,
+					const delivered = await deliverRetainedTerminalResponse(
+						retainedTerminalResponse,
 					);
-					return finishPacing(
-						pacingSlot,
-						await retainedTerminalResponse.deliver(terminalFailoverAttempts),
-					);
+					if (!delivered) return accountSelectionTimeoutResponse(pacingSlot);
+					return finishPacing(pacingSlot, delivered);
 				}
 				if (retainedTerminalResponse) {
 					await retainedTerminalResponse.discard();
@@ -2716,7 +2734,7 @@ async function handleProxyCore(
 					);
 					return finishPacing(pacingSlot, response);
 				}
-				if (hasPreferredLegacyContextOverflowRoute()) {
+				if (hasPreferredContextOverflowRoute()) {
 					break;
 				}
 			}
@@ -2913,29 +2931,36 @@ async function handleProxyCore(
 					route.normalStrategyManaged,
 			});
 		}
-		const orderedDeferredModelRoutes = hasPreferredLegacyContextOverflowRoute()
-			? deferredModelRoutes.filter(
-					(route) => route.routeKey === preferredContextOverflowRouteKey,
-				)
-			: [...deferredModelRoutes].sort((a, b) => {
-					const aGroup = deferredFallbackGroups.get(a.fallbackWave);
-					const bGroup = deferredFallbackGroups.get(b.fallbackWave);
-					if (!aGroup || !bGroup) return a.sequence - b.sequence;
-					const groupOrder =
-						aGroup.requestedFamilyTier - bGroup.requestedFamilyTier ||
-						aGroup.minimumFallbackRank - bGroup.minimumFallbackRank ||
-						aGroup.firstSeen - bGroup.firstSeen;
-					if (groupOrder !== 0) return groupOrder;
-					if (aGroup.normalStrategyManagedOnly) {
-						const accountOrder =
-							(strategyManagedAccountOrder.get(a.account.id) ??
-								Number.MAX_SAFE_INTEGER) -
-							(strategyManagedAccountOrder.get(b.account.id) ??
-								Number.MAX_SAFE_INTEGER);
-						if (accountOrder !== 0) return accountOrder;
-					}
-					return a.sequence - b.sequence;
-				});
+		const preferContextOverflowRoute = hasPreferredContextOverflowRoute();
+		const orderedDeferredModelRoutes = [...deferredModelRoutes].sort((a, b) => {
+			// Promotion changes only the first route. Keep every distinct deferred
+			// capability in its existing stable wave/account/sequence order so a
+			// failed or locally skipped larger-model attempt can still reach a
+			// custom endpoint or cross-provider rescue.
+			if (preferContextOverflowRoute) {
+				const preferredOrder =
+					Number(b.routeKey === preferredContextOverflowRouteKey) -
+					Number(a.routeKey === preferredContextOverflowRouteKey);
+				if (preferredOrder !== 0) return preferredOrder;
+			}
+			const aGroup = deferredFallbackGroups.get(a.fallbackWave);
+			const bGroup = deferredFallbackGroups.get(b.fallbackWave);
+			if (!aGroup || !bGroup) return a.sequence - b.sequence;
+			const groupOrder =
+				aGroup.requestedFamilyTier - bGroup.requestedFamilyTier ||
+				aGroup.minimumFallbackRank - bGroup.minimumFallbackRank ||
+				aGroup.firstSeen - bGroup.firstSeen;
+			if (groupOrder !== 0) return groupOrder;
+			if (aGroup.normalStrategyManagedOnly) {
+				const accountOrder =
+					(strategyManagedAccountOrder.get(a.account.id) ??
+						Number.MAX_SAFE_INTEGER) -
+					(strategyManagedAccountOrder.get(b.account.id) ??
+						Number.MAX_SAFE_INTEGER);
+				if (accountOrder !== 0) return accountOrder;
+			}
+			return a.sequence - b.sequence;
+		});
 		log.info(
 			`Requested-family routes exhausted; trying ${orderedDeferredModelRoutes.length} deferred degradation route(s)`,
 		);
