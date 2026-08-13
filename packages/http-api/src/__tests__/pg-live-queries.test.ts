@@ -70,6 +70,7 @@ import {
 // pre-existing cycle that crashes when types is the first module evaluated.
 import "@better-ccflare/core";
 import type { Config } from "@better-ccflare/config";
+import { normalizeProviderUsageWindows } from "@better-ccflare/core";
 import type {
 	BunSqlAdapter,
 	DatabaseOperations,
@@ -936,7 +937,10 @@ describe.skipIf(!livePgAvailable)(
 				await seedAccount({ id: "acct-1", name: "primary" });
 				await dbOps.recordUsageSnapshot(
 					"acct-1",
-					{ five_hour: { utilization: 12, resets_at: now + HOUR } },
+					normalizeProviderUsageWindows(
+						{ five_hour: { utilization: 12, resets_at: now + HOUR } },
+						"anthropic",
+					),
 					now - HOUR,
 				);
 				const res = await createUsageHistoryHandler(context)(
@@ -1376,7 +1380,10 @@ describe.skipIf(!livePgAvailable)(
 				await seedAccount({ id: "acct-1", name: "primary" });
 				await dbOps.recordUsageSnapshot(
 					"acct-1",
-					{ five_hour: { utilization: 40, resets_at: now + HOUR } },
+					normalizeProviderUsageWindows(
+						{ five_hour: { utilization: 40, resets_at: now + HOUR } },
+						"anthropic",
+					),
 					now - HOUR,
 				);
 				expect(

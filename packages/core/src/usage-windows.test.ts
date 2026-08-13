@@ -94,6 +94,41 @@ describe("normalizeProviderUsageWindows", () => {
 		]);
 	});
 
+	it("keeps an over-limit NanoGPT window instead of dropping it", () => {
+		// percentUsed can legitimately exceed 1 when the user has overridden the
+		// daily limit — the fetcher documents this. Rejecting it as out of range
+		// would remove the window from history AND from alert evaluation, muting
+		// the exhaustion alert exactly while the account is over its limit.
+		expect(
+			normalizeProviderUsageWindows(
+				{
+					active: true,
+					daily: { percentUsed: 1.5, resetAt: resetMs },
+					monthly: { percentUsed: 0.5, resetAt: resetMs },
+				},
+				"nanogpt",
+			),
+		).toEqual([
+			windowShape("daily", 100, resetMs),
+			windowShape("monthly", 50, resetMs),
+		]);
+	});
+
+	it("still rejects a negative utilization as malformed", () => {
+		// Saturating overage must not turn into "accept anything": a negative
+		// reading is broken data, and coercing it to 0% would invent capacity.
+		expect(
+			normalizeProviderUsageWindows(
+				{
+					active: true,
+					daily: { percentUsed: -0.5, resetAt: resetMs },
+					monthly: { percentUsed: 0.5, resetAt: resetMs },
+				},
+				"nanogpt",
+			),
+		).toEqual([windowShape("monthly", 50, resetMs)]);
+	});
+
 	it("reports no windows for an inactive NanoGPT subscription", () => {
 		expect(
 			normalizeProviderUsageWindows(
@@ -183,6 +218,9 @@ describe("normalizeProviderUsageWindows", () => {
 	});
 
 	it("skips malformed values and preserves Kilo history without a reset", () => {
+		// NaN and an unparseable reset are broken readings and are dropped. An
+		// over-100 reading is NOT broken — it is an exhausted account — so it is
+		// retained, saturated at 100.
 		expect(
 			normalizeProviderUsageWindows(
 				{
@@ -192,7 +230,7 @@ describe("normalizeProviderUsageWindows", () => {
 				},
 				"anthropic",
 			),
-		).toEqual([]);
+		).toEqual([windowShape("seven_day", 100, resetMs)]);
 		expect(
 			normalizeProviderUsageWindows({ utilizationPercent: 20 }, "kilo")[0],
 		).toMatchObject({

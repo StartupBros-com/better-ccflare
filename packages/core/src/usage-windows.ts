@@ -9,12 +9,24 @@ function asRecord(value: unknown): UsageRecord | null {
 		: null;
 }
 
+/**
+ * Coerce a provider's utilization onto the canonical 0-100 scale.
+ *
+ * A value above 100 is NOT malformed — it is an account past its limit, and
+ * several providers report it. NanoGPT's fetcher documents it explicitly
+ * ("Can exceed 100% if daily limit is overridden by user"). Rejecting it would
+ * drop the window from both usage history and alert evaluation, suppressing the
+ * exhaustion alert precisely while the account is exhausted, so overage
+ * saturates at 100 instead.
+ *
+ * Negative and non-finite values are still rejected: those are malformed
+ * readings, and coercing them to 0% would invent capacity that does not exist.
+ */
 function finitePercent(value: unknown, scale = 1): number | null {
 	if (typeof value !== "number" || !Number.isFinite(value)) return null;
 	const percent = value * scale;
-	return Number.isFinite(percent) && percent >= 0 && percent <= 100
-		? percent
-		: null;
+	if (!Number.isFinite(percent) || percent < 0) return null;
+	return Math.min(percent, 100);
 }
 
 function resetMs(

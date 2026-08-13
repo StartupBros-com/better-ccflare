@@ -37,14 +37,14 @@ export class UsageHistoryRepository extends BaseRepository<UsageSnapshotRow> {
 	 * poll (NO dedup) — the prediction fit and the chart both need a faithful,
 	 * near-uniform series; collapsing flat stretches to a single row makes idle
 	 * windows fall out of range queries and biases the regression. Volume is
-	 * bounded by retention pruning instead. `usage` is the raw UsageData-shaped
-	 * record from the provider cache; non-window fields (extra_usage, unknown
-	 * keys) are ignored. A malformed `resets_at` is stored as null, never NaN.
+	 * bounded by retention pruning instead.
 	 *
-	 * Anthropic's `limits[]` array (session/weekly_all/weekly_scoped) is folded
-	 * in under the same window_key convention as the flat windows (five_hour,
-	 * seven_day, seven_day_<slug>) so a limits-only payload — e.g. a per-model
-	 * Fable cap with five_hour/seven_day both null — still gets recorded.
+	 * `windows` is already canonical: every provider shape — Anthropic's flat
+	 * windows, its `limits[]` array, NanoGPT's 0-1 fractions, Kilo's resetless
+	 * credits — has been resolved by `normalizeProviderUsageWindows` before it
+	 * reaches here, including scaling, reset parsing and duplicate-key
+	 * suppression. This repository stays provider-agnostic on purpose: adding a
+	 * provider must never mean editing persistence.
 	 */
 	async recordSnapshot(
 		accountId: string,
