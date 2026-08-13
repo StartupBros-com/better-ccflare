@@ -16,7 +16,8 @@ This document explains how better-ccflare picks an account for each proxied requ
    - [least-used](#least-used-leastusedstrategy)
 6. [Usage Throttling](#usage-throttling)
 7. [Model-Capacity Routing](#model-capacity-routing)
-8. [Auto-Fallback](#auto-fallback)
+8. [Selection Diagnostics](#selection-diagnostics)
+9. [Auto-Fallback](#auto-fallback)
 
 ## Overview: Three Orthogonal Axes
 
@@ -261,7 +262,23 @@ flowchart TD
     I -->|"No"| K["Return the remaining accounts"]
 ```
 
-*Source: this fork implements the filter inline rather than in upstream's standalone `model-capacity.ts` module — see `packages/proxy/src/handlers/account-selector.ts` (`getReactiveModelCapacityBlocker`, the hard-capacity exclusion path), `packages/proxy/src/handlers/usage-throttling.ts` (`evaluateHardCapacity`), `packages/proxy/src/handlers/routing-terminal.ts` (the `model_pool_exhausted` terminal outcome), and `packages/proxy/src/handlers/proxy-operations.ts` (the `out_of_credits` 429 handler that feeds the reactive cache — distinct from the unrelated `all_models_exhausted_429` per-account cooldown reason used when an account's own configured model-fallback list is exhausted).*
+*Source: this fork implements the filter inline rather than in upstream's standalone `model-capacity.ts` module — see `packages/proxy/src/handlers/account-selector.ts` (`getReactiveModelCapacityBlocker`, the hard-capacity exclusion path), `packages/proxy/src/handlers/usage-throttling.ts` (`evaluateHardCapacity`), `packages/proxy/src/handlers/routing-terminal.ts` (the `model_pool_exhausted` terminal outcome), and `packages/proxy/src/handlers/proxy-operations.ts` (the `out_of_credits` 429 handler that feeds the reactive cache — distinct from the unrelated `all_models_exhausted_429` per-account cooldown reason used when an account's own configured model-fallback list is exhausted`).*
+
+## Selection Diagnostics
+
+When selection ends without an upstream dispatch, the proxy emits a bounded `routing_diagnostics` object in the `route_unavailable` error and records the same shape in structured logs. It contains only candidate counts and policy/profile flags — never account IDs, names, headers, request bodies, or provider messages. Selection-origin terminals always include `attempted_routes: 0`; this is the authoritative distinction between “no route was sent” and a terminal produced after upstream attempts.
+
+| Field | Meaning |
+|---|---|
+| `mode` | Restart-scoped implicit fallback mode: `off`, `observe`, or `enforce`. |
+| `structural_candidate_count` | Bounded candidates entering the relevant implicit selection lane. |
+| `eligible_candidate_count` | Candidates remaining after policy and structural admission. |
+| `excluded_candidate_count` | Structural minus eligible candidates. |
+| `selected_candidate_count` | Candidates returned by the final strategy ordering. |
+| `zero_attempt_reason` | `policy_excluded`, `no_eligible_candidates`, `all_unavailable`, or `selection_timeout`. |
+| `forced_route`, `capability_profile`, `route_profile` | Boolean indicators that explain whether an explicit route/profile boundary was present. |
+
+Interpret the reason conservatively. `policy_excluded` is emitted only when the enforce filter itself removed every implicit candidate. `all_unavailable` covers a structurally known pool whose accounts were paused, rate-limited, or capacity-blocked; `no_eligible_candidates` means no structural candidate was available to describe; and `selection_timeout` means the bounded selection phase expired before it completed. A 503 with `attempted_routes: 0` is therefore a local routing decision, not evidence of a provider 403/503.
 
 ## Auto-Fallback
 

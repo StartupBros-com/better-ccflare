@@ -1,5 +1,8 @@
 import { describe, expect, it } from "bun:test";
-import type { Account } from "@better-ccflare/types";
+import type {
+	Account,
+	RoutingSelectionDiagnostics,
+} from "@better-ccflare/types";
 import type { RoutingCapacityContext } from "../account-selector";
 import type { RequestRateLimitOutcome } from "../rate-limit-scope";
 import {
@@ -336,12 +339,24 @@ describe("routing terminal responses", () => {
 	it("returns retryable model_pool_exhausted for finite model-only capacity", async () => {
 		const now = Date.UTC(2026, 6, 17, 12);
 		const next = now + 60_001;
+		const routingSelectionDiagnostics: RoutingSelectionDiagnostics = {
+			mode: "observe",
+			structuralCandidateCount: 3,
+			eligibleCandidateCount: 0,
+			excludedCandidateCount: 3,
+			selectedCandidateCount: 0,
+			zeroAttemptReason: "all_unavailable",
+			forcedRoute: false,
+			capabilityProfile: false,
+			routeProfile: false,
+		};
 		const terminal = createRoutingTerminalResponse({
 			source: "selection",
 			accounts: [makeAccount()],
 			capacityContext: familyCapacityContext(next),
 			rateLimitOutcomes: [],
 			upstreamAttempts: 0,
+			routingSelectionDiagnostics,
 			now,
 		});
 
@@ -361,6 +376,18 @@ describe("routing terminal responses", () => {
 		expect(parsed.error.model).toBe("claude-fable-4-5");
 		expect(parsed.error.family).toBe("fable");
 		expect(parsed.error.next_available_at).toBe(new Date(next).toISOString());
+		expect(parsed.error.attempted_routes).toBe(0);
+		expect(parsed.error.routing_diagnostics).toEqual({
+			mode: "observe",
+			structural_candidate_count: 3,
+			eligible_candidate_count: 0,
+			excluded_candidate_count: 3,
+			selected_candidate_count: 0,
+			zero_attempt_reason: "all_unavailable",
+			forced_route: false,
+			capability_profile: false,
+			route_profile: false,
+		});
 	});
 
 	it("keeps unknown, past, and non-finite model recovery unmarked", async () => {
@@ -482,6 +509,8 @@ describe("routing terminal responses", () => {
 		expect(
 			terminal.response.headers.get("x-better-ccflare-recovery-scope"),
 		).toBe("model");
+		expect("attempted_routes" in parsed.error).toBe(false);
+		expect("routing_diagnostics" in parsed.error).toBe(false);
 	});
 
 	it("does not call mixed or incomplete attempted failures model exhaustion", async () => {
@@ -554,6 +583,9 @@ describe("routing terminal responses", () => {
 		expect(terminal.response.headers.get("x-better-ccflare-pool-status")).toBe(
 			"exhausted",
 		);
+		const parsed = await body(terminal.response);
+		expect("attempted_routes" in parsed.error).toBe(false);
+		expect("routing_diagnostics" in parsed.error).toBe(false);
 	});
 
 	it.each([
@@ -610,6 +642,17 @@ describe("routing terminal responses", () => {
 	it("marks a finite unpaused global cooldown as retryable pool exhaustion", async () => {
 		const now = Date.UTC(2026, 6, 17, 12);
 		const next = now + 3_600_000;
+		const routingSelectionDiagnostics: RoutingSelectionDiagnostics = {
+			mode: "enforce",
+			structuralCandidateCount: 2,
+			eligibleCandidateCount: 0,
+			excludedCandidateCount: 2,
+			selectedCandidateCount: 0,
+			zeroAttemptReason: "all_unavailable",
+			forcedRoute: false,
+			capabilityProfile: true,
+			routeProfile: false,
+		};
 		const terminal = createRoutingTerminalResponse({
 			source: "selection",
 			accounts: [
@@ -621,6 +664,7 @@ describe("routing terminal responses", () => {
 			capacityContext: null,
 			rateLimitOutcomes: [],
 			upstreamAttempts: 0,
+			routingSelectionDiagnostics,
 			now,
 		});
 
@@ -636,6 +680,18 @@ describe("routing terminal responses", () => {
 		expect(parsed.error.type).toBe("pool_exhausted");
 		expect(parsed.error.code).toBe("pool_exhausted");
 		expect(parsed.error.next_available_at).toBe(new Date(next).toISOString());
+		expect(parsed.error.attempted_routes).toBe(0);
+		expect(parsed.error.routing_diagnostics).toEqual({
+			mode: "enforce",
+			structural_candidate_count: 2,
+			eligible_candidate_count: 0,
+			excluded_candidate_count: 2,
+			selected_candidate_count: 0,
+			zero_attempt_reason: "all_unavailable",
+			forced_route: false,
+			capability_profile: true,
+			route_profile: false,
+		});
 	});
 
 	it("marks a pool exhausted purely by xai_capacity_402 cooldowns as retryable pool exhaustion (R5-R10)", async () => {
@@ -784,6 +840,60 @@ describe("routing terminal responses", () => {
 			const parsed = await body(terminal.response);
 			expect(parsed.error.code).toBe("route_unavailable");
 		}
+	});
+
+	it("reports bounded selection diagnostics without account or request data", async () => {
+		const routingSelectionDiagnostics: RoutingSelectionDiagnostics = {
+			mode: "enforce",
+			structuralCandidateCount: 3,
+			eligibleCandidateCount: 0,
+			excludedCandidateCount: 3,
+			selectedCandidateCount: 0,
+			zeroAttemptReason: "policy_excluded",
+			forcedRoute: false,
+			capabilityProfile: false,
+			routeProfile: false,
+		};
+		const terminal = createRoutingTerminalResponse({
+			source: "selection",
+			accounts: [makeAccount({ name: "private-account-name" })],
+			capacityContext: null,
+			rateLimitOutcomes: [],
+			upstreamAttempts: 0,
+			routingSelectionDiagnostics,
+			message: "request body must never be copied here",
+		});
+
+		expect(terminal.kind).toBe("route_unavailable");
+		const parsed = await body(terminal.response);
+		expect(parsed.error.attempted_routes).toBe(0);
+		expect(parsed.error.routing_diagnostics).toEqual({
+			mode: "enforce",
+			structural_candidate_count: 3,
+			eligible_candidate_count: 0,
+			excluded_candidate_count: 3,
+			selected_candidate_count: 0,
+			zero_attempt_reason: "policy_excluded",
+			forced_route: false,
+			capability_profile: false,
+			route_profile: false,
+		});
+		const serialized = JSON.stringify(parsed.error.routing_diagnostics);
+		expect(serialized).not.toContain("private-account-name");
+		expect(serialized).not.toContain("request body");
+		expect(
+			Object.keys(parsed.error.routing_diagnostics as object).sort(),
+		).toEqual([
+			"capability_profile",
+			"eligible_candidate_count",
+			"excluded_candidate_count",
+			"forced_route",
+			"mode",
+			"route_profile",
+			"selected_candidate_count",
+			"structural_candidate_count",
+			"zero_attempt_reason",
+		]);
 	});
 
 	it("ignores family capacity evidence that belongs only to a manually paused account", async () => {

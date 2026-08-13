@@ -5,6 +5,10 @@ import { repairTruncatedToolJson } from "./utils";
 
 const log = new Logger("openai-formats");
 
+const SAFE_STREAM_ERROR_TYPE = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
+const SAFE_STREAM_ERROR_CODE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const MAX_STREAM_ERROR_MESSAGE_LENGTH = 1_024;
+
 /**
  * Sanitize headers by removing provider-specific headers
  */
@@ -164,6 +168,98 @@ function emitStreamEnd(
 	);
 }
 
+function emitMessageStart(
+	controller: TransformStreamDefaultController,
+	encoder: TextEncoder,
+	context: TransformStreamContext,
+): void {
+	if (context.hasSentStart) return;
+	context.hasSentStart = true;
+	const messageStart = {
+		type: "message_start",
+		message: {
+			id: `msg_${Date.now()}`,
+			type: "message",
+			role: "assistant",
+			content: [],
+			model: context.extractedModel,
+			stop_reason: null,
+			stop_sequence: null,
+			usage: {
+				input_tokens: 0,
+				output_tokens: 0,
+			},
+		},
+	};
+	controller.enqueue(encoder.encode(`event: message_start\n`));
+	controller.enqueue(
+		encoder.encode(`data: ${JSON.stringify(messageStart)}\n\n`),
+	);
+	const ping = { type: "ping" };
+	controller.enqueue(encoder.encode(`event: ping\n`));
+	controller.enqueue(encoder.encode(`data: ${JSON.stringify(ping)}\n\n`));
+}
+
+function emitContentBlockStop(
+	controller: TransformStreamDefaultController,
+	encoder: TextEncoder,
+	index: number,
+): void {
+	const contentBlockStop = { type: "content_block_stop", index };
+	controller.enqueue(encoder.encode(`event: content_block_stop\n`));
+	controller.enqueue(
+		encoder.encode(`data: ${JSON.stringify(contentBlockStop)}\n\n`),
+	);
+}
+
+function emitStreamError(
+	controller: TransformStreamDefaultController,
+	encoder: TextEncoder,
+	context: TransformStreamContext,
+	errorValue: unknown,
+): void {
+	if (context.terminalErrorSeen) return;
+	emitMessageStart(controller, encoder, context);
+
+	// Close any blocks that were opened before the provider reported the error;
+	// never follow the error with a synthetic message_delta/message_stop pair.
+	if (context.hasSentThinkingBlockStart && !context.thinkingBlockClosed) {
+		emitContentBlockStop(controller, encoder, context.thinkingBlockIndex);
+		context.thinkingBlockClosed = true;
+	}
+	if (context.hasSentContentBlockStart && !context.textBlockClosed) {
+		emitContentBlockStop(controller, encoder, context.textBlockIndex);
+		context.textBlockClosed = true;
+	}
+	for (const anthropicIndex of Object.values(context.toolCallBlockIndices)) {
+		emitContentBlockStop(controller, encoder, anthropicIndex);
+	}
+
+	const error =
+		typeof errorValue === "object" && errorValue !== null
+			? (errorValue as Record<string, unknown>)
+			: {};
+	const rawType = typeof error.type === "string" ? error.type : "";
+	const type = SAFE_STREAM_ERROR_TYPE.test(rawType) ? rawType : "api_error";
+	const rawMessage = typeof error.message === "string" ? error.message : "";
+	const message =
+		rawMessage.slice(0, MAX_STREAM_ERROR_MESSAGE_LENGTH) ||
+		"Upstream provider error";
+	const rawCode = typeof error.code === "string" ? error.code : "";
+	const code = SAFE_STREAM_ERROR_CODE.test(rawCode) ? rawCode : undefined;
+	const payload = {
+		type: "error",
+		error: {
+			type,
+			message,
+			...(code ? { code } : {}),
+		},
+	};
+	controller.enqueue(encoder.encode(`event: error\n`));
+	controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`));
+	context.terminalErrorSeen = true;
+}
+
 /**
  * Transform OpenAI Server-Sent Events (SSE) streaming response to Anthropic SSE format.
  *
@@ -202,6 +298,7 @@ export function transformStreamingResponse(response: Response): Response {
 					promptTokens: undefined,
 					completionTokens: 0,
 					encounteredToolCall: false,
+					terminalErrorSeen: false,
 					toolCallAccumulators: {},
 					nextBlockIndex: 0,
 					toolCallBlockIndices: {},
@@ -235,6 +332,10 @@ export function transformStreamingResponse(response: Response): Response {
 
 						// Handle [DONE] marker
 						if (dataStr === "[DONE]") {
+							if (context.terminalErrorSeen) {
+								streamContext = null;
+								continue;
+							}
 							if (context.encounteredToolCall) {
 								// Emit buffered JSON for all tool calls, then stop events.
 								// Use Anthropic block indices (from toolCallBlockIndices), not OpenAI tool_call indices.
@@ -301,11 +402,20 @@ export function transformStreamingResponse(response: Response): Response {
 						// Parse OpenAI chunk
 						try {
 							const data = JSON.parse(dataStr);
+							if (context.terminalErrorSeen) continue;
 
 							// Extract model from first chunk
 							if (!context.hasStarted && data.model) {
 								context.extractedModel = data.model;
 								context.hasStarted = true;
+							}
+
+							// OpenAI-compatible providers can send an error object inside an
+							// nominally successful SSE transport. Surface it as an Anthropic
+							// terminal error instead of manufacturing a normal completion.
+							if (data.error !== null && typeof data.error === "object") {
+								emitStreamError(controller, encoder, context, data.error);
+								continue;
 							}
 
 							// Extract usage data if present (typically in last chunk before [DONE])
@@ -332,37 +442,8 @@ export function transformStreamingResponse(response: Response): Response {
 								}
 							}
 
-							// Send message_start on first chunk
-							if (!context.hasSentStart) {
-								context.hasSentStart = true;
-								const messageStart = {
-									type: "message_start",
-									message: {
-										id: `msg_${Date.now()}`,
-										type: "message",
-										role: "assistant",
-										content: [],
-										model: context.extractedModel,
-										stop_reason: null,
-										stop_sequence: null,
-										usage: {
-											input_tokens: 0,
-											output_tokens: 0,
-										},
-									},
-								};
-								controller.enqueue(encoder.encode(`event: message_start\n`));
-								controller.enqueue(
-									encoder.encode(`data: ${JSON.stringify(messageStart)}\n\n`),
-								);
-
-								// Send ping
-								const ping = { type: "ping" };
-								controller.enqueue(encoder.encode(`event: ping\n`));
-								controller.enqueue(
-									encoder.encode(`data: ${JSON.stringify(ping)}\n\n`),
-								);
-							}
+							// Send message_start on the first ordinary chunk.
+							emitMessageStart(controller, encoder, context);
 
 							const delta = data.choices?.[0]?.delta;
 
@@ -604,6 +685,10 @@ export function transformStreamingResponse(response: Response): Response {
 				// Bind to a non-null local so TypeScript's null-narrowing holds for
 				// the rest of this call (see `transform` above for why).
 				const context = streamContext;
+				if (context.terminalErrorSeen) {
+					streamContext = null;
+					return;
+				}
 
 				// Stream ended without [DONE] (e.g. timeout/truncation).
 				// Emit buffered JSON + stop events so the client gets a valid response.

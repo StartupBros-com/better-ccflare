@@ -12,6 +12,8 @@ This guide covers all configuration options for better-ccflare, including file-b
 - [Service-Lifetime Cohort Seal](#service-lifetime-cohort-seal)
 - [Claude Code Model Route Profiles](#claude-code-model-route-profiles)
 - [Anthropic Degraded Mode](#anthropic-degraded-mode)
+- [Implicit Fallback Drain Policy](#implicit-fallback-drain-policy)
+- [Guard Request-Body and Admission Limits](#guard-request-body-and-admission-limits)
 - [Model Catalog](#model-catalog)
 - [Runtime Configuration API](#runtime-configuration-api)
 - [Example Configurations](#example-configurations)
@@ -146,6 +148,12 @@ These environment variables are not stored in the configuration file and must be
 | `CCFLARE_RATE_LIMIT_RESET_STABILITY_MS` | Window after which a clean streak resets the consecutive-429 counter | `300000` (5min) | `CCFLARE_RATE_LIMIT_RESET_STABILITY_MS=600000` |
 | `HEALTH_DETAIL_ENABLED` | Expose per-account status on `GET /health?detail=1` | `false` | `HEALTH_DETAIL_ENABLED=true` |
 | `CCFLARE_DISABLE_COMBO_SESSION_FALLBACK` | When enabled, combo-routed requests stop after every combo slot fails instead of falling through to normal SessionStrategy routing. This keeps explicit combo chains isolated, which is useful when combos intentionally separate provider pools (for example Anthropic-only Opus/Fable combos next to Codex-only Sonnet/Haiku combos). Disabled by default to preserve existing behavior | `false` | `CCFLARE_DISABLE_COMBO_SESSION_FALLBACK=true` |
+| `CCFLARE_IMPLICIT_FALLBACK_MODE` | Restart-scoped policy for implicit normal/combo fallback. `observe` reports what enforcement would exclude; `enforce` removes denied route classes. Explicit forced and capability-profile routes are outside this policy | `off` | `CCFLARE_IMPLICIT_FALLBACK_MODE=observe` |
+| `CCFLARE_IMPLICIT_FALLBACK_ALLOWED_CLASSES` | Comma-separated route classes that are explicit exceptions to the active denial set: `oauth-subscription`, `api-key`, `local`, or `cloud-credential` | empty | `CCFLARE_IMPLICIT_FALLBACK_ALLOWED_CLASSES=oauth-subscription,local` |
+| `CCFLARE_IMPLICIT_FALLBACK_DENIED_CLASSES` | Comma-separated route classes to deny for implicit fallback. In `observe`/`enforce`, `api-key` and `cloud-credential` are denied by default unless allowed explicitly | empty (plus active defaults) | `CCFLARE_IMPLICIT_FALLBACK_DENIED_CLASSES=api-key,cloud-credential` |
+| `GUARD_MAX_REQUEST_BODY_BYTES` | Maximum request body retained by the front guard before it returns a local 413. Limited requests acquire guard admission before body buffering | `4194304` (4 MiB) | `GUARD_MAX_REQUEST_BODY_BYTES=8388608` (8 MiB; hard max 16 MiB) |
+| `GUARD_MAX_BODY_READERS` | Maximum concurrent bounded request-body readers. This pool is separate from upstream permits so trickle uploads cannot monopolize provider concurrency; completed bodies retain a reader slot until an upstream permit is available | `8` (or `2 * GUARD_MAX_ACTIVE`, whichever is larger; hard max 256) | `GUARD_MAX_BODY_READERS=16` |
+| `GUARD_REQUEST_DRAIN_TIMEOUT_MS` | Maximum time the guard spends draining a rejected or oversized upload before it destroys the request socket. Prevents stalled clients from pinning file descriptors | `10000` (10s; range 1s-60s) | `GUARD_REQUEST_DRAIN_TIMEOUT_MS=5000` |
 | `BETTER_CCFLARE_DISCOVER_PLUGIN_AGENTS` | Discover agents distributed by Claude Code plugins (reads `~/.claude/plugins/installed_plugins.json`) | `false` | `BETTER_CCFLARE_DISCOVER_PLUGIN_AGENTS=true` |
 | `STORE_PAYLOADS` | Set to `false` to stop storing request/response bodies (token counts, cost, model, status, and timing are still recorded) | `true` | `STORE_PAYLOADS=false` |
 | `PAYLOAD_ENCRYPTION_KEY` | AES-256-GCM key encrypting `request_payloads` at rest. 64-char hex (32 bytes), generate with `openssl rand -hex 32`. Unset = plaintext storage. Losing the key makes encrypted rows unreadable; read once at process start (and per Bun worker), so rotation needs a re-encrypt migration (not yet built) | - (plaintext) | `PAYLOAD_ENCRYPTION_KEY=$(openssl rand -hex 32)` |
@@ -426,6 +434,63 @@ bun run packages/providers/src/providers/codex/analyze-trace.ts --cache-experime
 The raw journal export still contains ephemeral join identities and must be protected and deleted after analysis. The formatted report never emits request or attempt IDs, cohort hashes, account IDs, endpoints, model strings, prompts, or unknown action values.
 
 Model-family capacity handling is integrated into account selection and does not require a standalone feature flag. Fresh Anthropic `limits[]` telemetry is interpreted by scope: exhausted `session` and `weekly_all` windows exclude the account, while an exhausted `weekly_scoped` row excludes only requests for the matching model family when paid overage is confirmed unavailable. Stale, malformed, unrelated, or incomplete scoped telemetry fails open, and observed upstream capacity responses provide short-lived reactive evidence while telemetry catches up.
+
+## Implicit Fallback Drain Policy
+
+The implicit fallback drain is a **restart-scoped** policy for ordinary and combo candidate selection. It is `off` by default. The process snapshots the policy at startup; changing an environment variable or config-file value does not hot-switch a running process. This documentation is an operator example and does not imply that any current live deployment has been changed.
+
+| Mode | Behavior |
+|---|---|
+| `off` | Preserve existing implicit normal/combo candidate admission and ordering. |
+| `observe` | Evaluate the policy and emit bounded diagnostics, but return the original candidates; no candidate order, provider send, response, or retry changes. Unknown route classes are observed but allowed. |
+| `enforce` | Remove denied route classes from implicit normal/combo candidates. Unknown route classes fail closed. If every implicit candidate is removed, selection ends locally with no provider attempt. |
+
+Route classes are derived from provider and credential shape, not from secret values:
+
+| Route class | Examples |
+|---|---|
+| `oauth-subscription` | Native subscription/OAuth credentials. |
+| `api-key` | API-key routes, including OpenRouter and compatible API providers. |
+| `local` | Local Ollama routes. |
+| `cloud-credential` | Cloud-credential routes such as Bedrock or Vertex AI. |
+
+`CCFLARE_IMPLICIT_FALLBACK_ALLOWED_CLASSES` and `CCFLARE_IMPLICIT_FALLBACK_DENIED_CLASSES` accept comma-separated, case-insensitive class names (duplicates are ignored). In an active mode, the conservative default denial set is `api-key,cloud-credential`; an allowed class removes that class from the denial set, and a denied class adds to it. The allowed list is therefore an exception list, not an exclusive allowlist. Malformed modes or class names resolve the entire policy to the built-in `off` policy and write a warning. The equivalent file fields are `implicit_fallback_mode`, `implicit_fallback_allowed_classes`, and `implicit_fallback_denied_classes`; environment values win per field.
+
+The policy applies only to **implicit** normal and combo fallback. An explicit `x-better-ccflare-account-id` route, an exact model route profile, and a capability model route profile retain their own fail-closed admission and bypass this drain policy. This lets an operator stop accidental OpenRouter/API-key spillover while preserving intentional, explicitly selected routes.
+
+### Safe production activation example
+
+For a deployment that should keep OAuth and local routes in the implicit pool while excluding OpenRouter/API-key and cloud-credential spillover, stage `observe` first, then use `enforce` after reviewing the bounded diagnostics. The following shell values are illustrative; apply them to the service environment and restart the service for each mode change:
+
+```sh
+# Stage first: no routing behavior changes, only policy observations.
+export CCFLARE_IMPLICIT_FALLBACK_MODE=observe
+export CCFLARE_IMPLICIT_FALLBACK_ALLOWED_CLASSES=oauth-subscription,local
+export CCFLARE_IMPLICIT_FALLBACK_DENIED_CLASSES=api-key,cloud-credential
+
+# After review, switch the same environment to:
+# export CCFLARE_IMPLICIT_FALLBACK_MODE=enforce
+```
+
+OpenRouter accounts classify as `api-key` and are consequently excluded from **implicit** fallback in the enforced example. OAuth and local accounts remain eligible. An explicit force route or capability profile can still select its declared route by design.
+
+### Monitoring, guardrails, and rollback
+
+After an activation restart, inspect the service journal for the rate-limited terms `Implicit fallback policy` (candidate counts by `normal`/`combo` lane) and `Routing selection terminal diagnostics` (selection-terminal counts and reason). Sample route-unavailable responses for the bounded `error.routing_diagnostics` object described in [Account Routing Architecture](./routing-architecture.md#selection-diagnostics). Do not treat a policy observation as proof that a provider was contacted: `attempted_routes: 0` means selection ended before any provider attempt.
+
+The front guard exposes its effective body limit and bounded counters at `GET /_guard/health`; monitor `maxRequestBodyBytes`, `maxBodyReaders`, `requestDrainTimeoutMs`, `active`, `queued`, `bodyReaders`, `draining`, and `counters.oversizedRequestBodies`/`counters.requestDrainTimeouts`. Useful journal terms are `guard_request_body_too_large`, `guard_request_drain_timeout`, `guard_queue_full`, `guard_body_reader_queue_full`, `guard_admission_error`, and `guard_draining`. These records contain bounded metadata only; request bodies and credentials are not logged.
+
+To roll back the drain, set `CCFLARE_IMPLICIT_FALLBACK_MODE=off` in the service environment and **restart** the process (run `systemctl daemon-reload` first if a systemd drop-in changed). Restarting clears the process-local policy snapshot and diagnostics; it does not alter account data or current production state outside that restart.
+
+## Guard Request-Body and Admission Limits
+
+`GUARD_MAX_REQUEST_BODY_BYTES` bounds the body buffer used by the local front guard. The default is **4 MiB** (`4,194,304` bytes); values may be lowered to 1 KiB, but the hard maximum is **16 MiB** (`16,777,216` bytes). Invalid or out-of-range values prevent an unbounded override. A declared `Content-Length` above the limit is rejected before buffering. Chunked or misleading uploads are counted as bytes arrive and are stopped at the same limit; the guard drains the remainder so keep-alive parsing stays synchronized. The client receives `413` with error type `guard_request_body_too_large`.
+
+The limit applies to every guarded request body. For limited inference paths (`/v1/messages` except `count_tokens`, and `/v1/complete`), the guard first reserves fair admission **before** attaching body listeners or buffering bytes. It then releases the upstream permit while the bounded body-reader pool handles the upload, so a slow client cannot consume provider concurrency. A completed body keeps its body-reader slot until it acquires an upstream permit; this bounds retained body buffers while preserving fair upstream ordering. Queue-full, shutdown, and abort decisions therefore happen before an unadmitted request can consume an aggregate body buffer. Other paths still receive the body-size bound but do not consume a limited-path admission slot.
+
+Rejected, oversized, invalid-target, and shutdown uploads are drained only for the configured drain window (`GUARD_REQUEST_DRAIN_TIMEOUT_MS`). If the client does not finish, the guard destroys that request socket and emits `guard_request_drain_timeout`; this prevents a stalled peer from pinning a keep-alive connection or file descriptor indefinitely. The effective body-reader count, queue, and timeout appear in `/_guard/health` and in the `runtime.limits` object.
+
+The effective limit is restart-scoped in the guard process. Confirm it after restart in `/_guard/health` (`maxRequestBodyBytes` and `runtime.limits.maxRequestBodyBytes`) and correlate 413s with `guard_request_body_too_large` and `counters.oversizedRequestBodies`; no request content is retained in these diagnostics.
 
 ## Outbound Proxy
 

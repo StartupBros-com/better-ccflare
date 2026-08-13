@@ -6284,6 +6284,79 @@ describe("CodexProvider upstream error code classification", () => {
 		expect(body.error.type).toBe("api_error");
 		expect(status).toBe(502);
 	});
+
+	it.each([
+		{ transportStatus: 401, code: "login_required", expectedType: "api_error" },
+		{
+			transportStatus: 403,
+			code: "usage_not_included",
+			expectedType: "permission_error",
+		},
+		{
+			transportStatus: 429,
+			code: "permission_denied",
+			expectedType: "api_error",
+		},
+		{
+			transportStatus: 529,
+			code: "permission_denied",
+			expectedType: "api_error",
+		},
+	] as const)("preserves a definitive transport status ($transportStatus) over a less-specific SSE body mapping", async ({
+		transportStatus,
+		code,
+		expectedType,
+	}) => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("error", {
+				type: "error",
+				code,
+				message: `Codex reported ${code}`,
+			}),
+		]);
+		const response = new Response(upstreamBody, {
+			status: transportStatus,
+			statusText: `Upstream ${transportStatus}`,
+			headers: {
+				"content-type": "text/event-stream",
+				"x-better-ccflare-request-stream": "false",
+			},
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const body = (await transformed.json()) as {
+			error: { type: string; code?: string };
+		};
+
+		expect(transformed.status).toBe(transportStatus);
+		expect(transformed.statusText).toBe(`Upstream ${transportStatus}`);
+		expect(body.error.type).toBe(expectedType);
+		expect(body.error.code).toBe(code);
+	});
+
+	it("keeps body-derived status for HTTP 200 even when the body is a permission error", async () => {
+		const provider = new CodexProvider();
+		const response = new Response(
+			sseBody([
+				...eventLine("error", {
+					type: "error",
+					code: "usage_not_included",
+					message: "Codex plan does not include usage",
+				}),
+			]),
+			{
+				status: 200,
+				headers: {
+					"content-type": "text/event-stream",
+					"x-better-ccflare-request-stream": "false",
+				},
+			},
+		);
+
+		const transformed = await provider.processResponse(response, null);
+		expect(transformed.status).toBe(403);
+	});
 });
 
 describe("CodexProvider.transformRequestBody", () => {
