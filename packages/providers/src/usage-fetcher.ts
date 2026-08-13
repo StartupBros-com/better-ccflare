@@ -217,6 +217,34 @@ export function extractWindowResetTime(
 }
 
 /**
+ * Extract the all-model weekly reset (`seven_day` or `limits[].weekly_all`)
+ * from the Anthropic/Codex usage contract. Other providers may expose a
+ * seven-day-looking credit window with different semantics; those payloads
+ * deliberately fail open instead of becoming an account-drain signals. This
+ * is intentionally separate from `extractWindowResetTime`, whose contract is
+ * the representative (often five-hour) window. Unknown or malformed
+ * telemetry is represented as `null` so callers can fail open to their normal
+ * ordering.
+ */
+export function extractWeeklyResetTime(
+	data: AnyUsageData,
+	provider: string,
+): number | null {
+	if (provider !== "anthropic" && provider !== "codex") return null;
+	if (!data || typeof data !== "object") return null;
+	const usage = data as UsageData;
+	const resetsAt =
+		usage.seven_day?.resets_at ??
+		(Array.isArray(usage.limits)
+			? (usage.limits.find((limit) => limit?.kind === "weekly_all")
+					?.resets_at ?? null)
+			: null);
+	if (typeof resetsAt !== "string" || resetsAt.length === 0) return null;
+	const timestamp = new Date(resetsAt).getTime();
+	return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+/**
  * Fetch usage data from Anthropic's OAuth usage endpoint
  */
 export interface UsageFetchResult {

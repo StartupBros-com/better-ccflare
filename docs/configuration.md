@@ -73,7 +73,7 @@ The configuration file is stored at:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `lb_strategy` | string | `"session"` | Load balancing strategy. Supported values are `"session"` (default), `"session-affinity"`, and `"least-used"`. Prefer a session-based strategy for OAuth accounts; per-request spreading can trigger provider anti-abuse systems |
+| `lb_strategy` | string | `"session"` | Load balancing strategy. Supported values are `"session"` (default), `"session-affinity"`, `"session-drain-soonest"`, and `"least-used"`. Prefer a session-based strategy for OAuth accounts; per-request spreading can trigger provider anti-abuse systems |
 | `client_id` | string | `"9d1c250a-e61b-44d9-88ed-5944d1962f5e"` | OAuth client ID for authentication |
 | `retry_attempts` | number | `3` | Maximum number of retry attempts for failed requests |
 | `retry_delay_ms` | number | `1000` | Initial delay in milliseconds between retry attempts |
@@ -83,12 +83,13 @@ The configuration file is stored at:
 
 ### Load Balancing Strategy
 
-⚠️ **WARNING**: Prefer `session` or `session-affinity` for Anthropic OAuth traffic because they preserve account stickiness. `least-used` can spread individual requests across accounts and may trigger Claude's anti-abuse systems; reserve it for providers and credentials where per-request balancing is safe.
+⚠️ **WARNING**: Prefer `session`, `session-affinity`, or the opt-in `session-drain-soonest` for Anthropic OAuth traffic because they preserve account stickiness. `least-used` can spread individual requests across accounts and may trigger Claude's anti-abuse systems; reserve it for providers and credentials where per-request balancing is safe. `session-drain-soonest` only changes fresh-session/failover ordering when a known future all-model weekly reset is available; it does not replace an existing client-affinity owner.
 
 | Strategy | Description | Use Case |
 |----------|-------------|----------|
 | `session` | Maintains client-account affinity for session duration, with automatic alignment to Anthropic OAuth usage window resets | Default and recommended - mimics natural usage patterns and optimizes resource utilization |
 | `session-affinity` | Maintains independent client-to-account affinity while preserving automatic failover and session expiry | Multiple concurrent clients that need sticky routing without sharing one global active account |
+| `session-drain-soonest` | Opt-in session-affinity variant that ranks fresh candidates by earliest known future all-model weekly reset, then priority/utilization; unknown or stale resets fail open | OAuth pools where weekly capacity should be consumed before it expires while preserving per-client/lane stickiness |
 | `least-used` | Orders available accounts by utilization rather than maintaining sticky OAuth sessions | API-key and compatible-provider pools where per-request spreading is explicitly acceptable |
 
 ### Logging Configuration (Environment Only)
@@ -666,10 +667,14 @@ GET /api/strategies
 
 Response:
 ```json
-["session"]
+["session", "least-used", "session-affinity", "session-drain-soonest"]
 ```
 
-⚠️ **NOTE**: Only the `"session"` strategy is available in better-ccflare. Other strategies (round-robin, least-requests, weighted) have been removed from the codebase as they can trigger Claude's anti-abuse systems and result in account bans.
+The `session-drain-soonest` strategy is opt-in. It preserves the current
+session-affinity owner and route/profile class; only a fresh assignment or
+account failover can use a known future `weekly_all`/`seven_day` reset to rank
+candidates. Missing, malformed, or past reset telemetry falls back to the
+ordinary affinity ranking.
 
 ### Runtime Update Behavior
 
@@ -907,7 +912,9 @@ If migrating from environment variables to file-based configuration:
 
 1. **Configuration location**: Move from `~/.better-ccflare/config.json` to platform-specific paths
 2. **Field naming**: Update any deprecated field names (none currently deprecated)
-3. **Strategy names**: Only `"session"` strategy is available (must be lowercase)
+3. **Strategy names**: Use one of the supported lowercase values: `"session"`,
+   `"least-used"`, `"session-affinity"`, or the opt-in
+   `"session-drain-soonest"`.
 
 ### Configuration Backup
 

@@ -40,8 +40,10 @@ describe("RoutingCardView", () => {
 	it("explains the session strategy in the strategy description", () => {
 		const html = render();
 		expect(html).toContain("keeps each client on");
-		// The safety note about not offering per-request spreading strategies.
-		expect(html).toContain("Only session-class strategies are shown");
+		// The opt-in drain variant is affinity-compatible; per-request spreading
+		// remains deliberately absent from the dashboard.
+		expect(html).toContain("preserves client/lane stickiness");
+		expect(html).toContain("not offered here");
 	});
 
 	it("locks the strategy select and shows an env-locked badge when strategySource is env", () => {
@@ -73,7 +75,7 @@ describe("RoutingCardView", () => {
 	});
 
 	it("does not throw when the effective strategy is not one of the listed options", () => {
-		// least-used/session-affinity are valid StrategyName values that are
+		// least-used/session-affinity are valid StrategyName values that remain
 		// deliberately not offered (see STRATEGY_OPTIONS), but the server can
 		// still report them as the effective strategy (env/config/older
 		// default). The view must render without error in that case.
@@ -85,6 +87,10 @@ describe("RoutingCardView", () => {
 describe("getStrategySelectItems", () => {
 	const listed: readonly StrategySelectItem[] = [
 		{ label: "Session", value: "session" },
+		{
+			label: "Session drain soonest (opt-in)",
+			value: "session-drain-soonest",
+		},
 	];
 
 	it("returns only the listed options when the current strategy is one of them", () => {
@@ -107,5 +113,9 @@ describe("getStrategySelectItems", () => {
 				disabled: true,
 			},
 		]);
+	});
+
+	it("keeps session-drain-soonest selectable when it is current", () => {
+		expect(getStrategySelectItems("session-drain-soonest")).toEqual(listed);
 	});
 });
