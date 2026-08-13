@@ -1,0 +1,30 @@
+event: response.created
+data: {"sequence_number":0,"type":"response.created","response":{"id":"resp_golden","object":"response","created_at":1700000000,"model":"test-model","status":"in_progress","output":[]}}
+
+event: response.in_progress
+data: {"sequence_number":1,"type":"response.in_progress","response":{"id":"resp_golden","object":"response","created_at":1700000000,"model":"test-model","status":"in_progress","output":[]}}
+
+event: response.output_item.added
+data: {"sequence_number":2,"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"resp_golden_msg_0","role":"assistant","content":[],"status":"in_progress"}}
+
+event: response.content_part.added
+data: {"sequence_number":3,"type":"response.content_part.added","item_id":"resp_golden_msg_0","output_index":0,"content_index":0,"part":{"type":"output_text","text":""}}
+
+event: response.output_text.delta
+data: {"sequence_number":4,"type":"response.output_text.delta","item_id":"resp_golden_msg_0","output_index":0,"content_index":0,"delta":"Hello "}
+
+event: response.output_text.delta
+data: {"sequence_number":5,"type":"response.output_text.delta","item_id":"resp_golden_msg_0","output_index":0,"content_index":0,"delta":"world"}
+
+event: response.output_text.done
+data: {"sequence_number":6,"type":"response.output_text.done","item_id":"resp_golden_msg_0","output_index":0,"content_index":0,"text":"Hello world"}
+
+event: response.content_part.done
+data: {"sequence_number":7,"type":"response.content_part.done","item_id":"resp_golden_msg_0","output_index":0,"content_index":0,"part":{"type":"output_text","text":"Hello world"}}
+
+event: response.output_item.done
+data: {"sequence_number":8,"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"resp_golden_msg_0","role":"assistant","content":[{"type":"output_text","text":"Hello world"}],"status":"completed"}}
+
+event: response.completed
+data: {"sequence_number":9,"type":"response.completed","response":{"id":"resp_golden","object":"response","created_at":1700000000,"model":"test-model","status":"completed","output":[{"type":"message","id":"resp_golden_msg_0","role":"assistant","content":[{"type":"output_text","text":"Hello world"}],"status":"completed"}],"usage":{"input_tokens":5,"output_tokens":3,"total_tokens":8}}}
+

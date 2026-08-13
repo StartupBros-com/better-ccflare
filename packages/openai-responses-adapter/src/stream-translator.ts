@@ -14,7 +14,7 @@ interface State {
 	outputIndex: number;
 	sequenceNumber: number;
 	blockIndexToOutput: Map<number, number>;
-	textByBlock: Map<number, { text: string }>;
+	textByBlock: Map<number, { chunks: string[] }>;
 	toolByBlock: Map<
 		number,
 		{ callId: string; name: string; argsBuf: string; bytes: number }
@@ -171,7 +171,7 @@ function processEvent(
 		state.blockIndexToOutput.set(blockIndex, outputIdx);
 
 		if (contentBlock.type === "text") {
-			state.textByBlock.set(blockIndex, { text: "" });
+			state.textByBlock.set(blockIndex, { chunks: [] });
 			emitSse(
 				controller,
 				"response.output_item.added",
@@ -255,7 +255,7 @@ function processEvent(
 						state.translatedOutputBytesTotal,
 					);
 				}
-				block.text += text;
+				block.chunks.push(text);
 
 				emitSse(
 					controller,
@@ -327,7 +327,7 @@ function processEvent(
 		}
 
 		if (state.textByBlock.has(blockIndex)) {
-			const fullText = state.textByBlock.get(blockIndex)?.text ?? "";
+			const fullText = state.textByBlock.get(blockIndex)?.chunks.join("") ?? "";
 			emitSse(
 				controller,
 				"response.output_text.done",
