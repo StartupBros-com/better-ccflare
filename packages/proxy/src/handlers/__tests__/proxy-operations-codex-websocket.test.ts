@@ -521,6 +521,65 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 		expect(httpCalls).toBe(1);
 	});
 
+	it("keeps a provider-owned Codex turn-state replay on HTTP", async () => {
+		installUsageCollector();
+		const provider = getProvider("codex");
+		if (!provider?.transformRequestBody) {
+			throw new Error("Codex provider transformation is unavailable");
+		}
+		const originalTransformRequestBody = provider.transformRequestBody;
+		provider.transformRequestBody = async (request, account) => {
+			const transformed = await originalTransformRequestBody.call(
+				provider,
+				request,
+				account,
+			);
+			const headers = new Headers(transformed.headers);
+			headers.set("x-codex-turn-state", "trusted-provider-turn-state");
+			return new Request(transformed, { headers });
+		};
+
+		const upstreamTurnStates: Array<string | null> = [];
+		globalThis.fetch = mock(async (request: Request) => {
+			upstreamTurnStates.push(request.headers.get("x-codex-turn-state"));
+			return new Response(
+				[
+					'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_http_turn_state","model":"gpt-5.4"}}\n\n',
+					'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"http"}\n\n',
+					'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_http_turn_state","model":"gpt-5.4","status":"completed","usage":{"input_tokens":2,"output_tokens":1,"input_tokens_details":{"cached_tokens":0}}}}\n\n',
+					"data: [DONE]\n\n",
+				].join(""),
+				{
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				},
+			);
+		});
+		const websocketAttempt = spyOn(
+			codexWebSocketTransport,
+			"tryRequest",
+		).mockResolvedValue(null);
+
+		try {
+			const body = makeRequestBody();
+			const response = await runProxy(
+				makeRequest(body, {
+					"x-codex-turn-state": "client-controlled-turn-state",
+				}),
+				body,
+				makePolicy(1_000),
+				"codex-http-turn-state-only",
+			);
+			expect(response?.status).toBe(200);
+			expect(await response?.text()).toContain("http");
+		} finally {
+			provider.transformRequestBody = originalTransformRequestBody;
+		}
+
+		expect(websocketAttempt).not.toHaveBeenCalled();
+		expect(upstreamTurnStates).toEqual(["trusted-provider-turn-state"]);
+	});
+
 	it("claims before response.create and never rescues an ambiguous hosted write to HTTP", async () => {
 		installUsageCollector();
 		const ledger = new RoutingAttemptLedger();

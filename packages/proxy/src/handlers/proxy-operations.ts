@@ -21,6 +21,7 @@ import {
 	applyXaiConvIdHeader,
 	buildServerToolCapabilityProofKey,
 	CODEX_CONVERSATION_ID_HEADER,
+	CODEX_TURN_STATE_HEADER,
 	decideContextAdmission,
 	isAnthropicExtraUsageExhausted,
 	isAnthropicOutOfCredits,
@@ -3109,12 +3110,17 @@ export async function proxyWithAccount(
 				}
 			};
 			const hostedAttempt = attemptPlan.capabilityProofKey !== null;
+			// A provider-issued turn-state token is scoped to this HTTP turn. Never
+			// offer the same transformed request to the persistent WebSocket lane.
+			const hasCodexTurnStateReplay =
+				attemptPlan.providerName === "codex" &&
+				transportRequest.headers.has(CODEX_TURN_STATE_HEADER);
 			const httpTransportRequest = hostedAttempt
 				? new Request(transportRequest, { redirect: "manual" })
 				: transportRequest;
 			const response = await makeAttemptRequest(
 				httpTransportRequest,
-				attemptPlan.providerName === "codex"
+				attemptPlan.providerName === "codex" && !hasCodexTurnStateReplay
 					? async (signal) => {
 							currentCodexWebSocketReceipt = null;
 							// Capture the concrete stamped attempt before any later retry mutates the

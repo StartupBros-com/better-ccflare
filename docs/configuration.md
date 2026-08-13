@@ -179,6 +179,36 @@ Use a staged rollout on naturally initiated, authorized Codex traffic:
 
 Rollback is fail-safe: set `CCFLARE_CODEX_CACHE_KEY_CONTINUITY_PERCENT=0` and restart the process. No migration or data cleanup is required; restart also clears the process-local continuity state. Do not validate this feature with scripted traffic against Anthropic-backed or Codex accounts; use focused fixtures or naturally initiated authorized traffic instead.
 
+| `CCFLARE_CODEX_TURN_STATE_PERCENT` | Default-off deterministic percentage for the official Codex HTTP same-turn sticky-routing canary. Account and model allowlists are required first; exact cohort allowlisting is required before an assigned treatment may retain or replay a token. Malformed values become `0`, and valid values above `100` clamp to `100` | `0` | `CCFLARE_CODEX_TURN_STATE_PERCENT=100` |
+| `CCFLARE_CODEX_TURN_STATE_ACCOUNT_IDS` | Comma-separated exact account IDs eligible for observe/control/treatment attribution. Empty means no accounts are eligible | empty | `CCFLARE_CODEX_TURN_STATE_ACCOUNT_IDS=account-uuid` |
+| `CCFLARE_CODEX_TURN_STATE_MODELS` | Comma-separated exact physical Codex model allowlist, matched case-insensitively. Empty means no models are eligible | empty | `CCFLARE_CODEX_TURN_STATE_MODELS=gpt-5.6-sol` |
+| `CCFLARE_CODEX_TURN_STATE_COHORT_IDS` | Comma-separated exact opaque 16-hex cohort IDs discovered through observe-only telemetry. A percentage-selected cohort that is not listed remains token-free control; an empty list permits no treatment | empty | `CCFLARE_CODEX_TURN_STATE_COHORT_IDS=0123456789abcdef` |
+| `CCFLARE_CODEX_TURN_STATE_OBSERVE_ONLY` | Set exactly to `1` or `true` to emit bounded eligible cohort/action telemetry without retaining a token or tool lineage and without changing requests. Account and model allowlists are still required | unset | `CCFLARE_CODEX_TURN_STATE_OBSERVE_ONLY=1` |
+| `CCFLARE_CODEX_TURN_STATE_MAX_ENTRIES` | Combined process-local ceiling across generation, pending-turn, and attempt records. Only unsigned integers from 1 through 10,000 are accepted; invalid or out-of-range values use the default. Eviction suppresses replay rather than request handling | `2048` | `CCFLARE_CODEX_TURN_STATE_MAX_ENTRIES=1024` |
+| `CCFLARE_CODEX_TURN_STATE_IDLE_TTL_MS` | Idle expiry for all process-local turn-state bookkeeping. Only unsigned integers from 1 ms through 24 hours are accepted; invalid or out-of-range values use the default. Active requests are not interrupted | `1800000` (30min) | `CCFLARE_CODEX_TURN_STATE_IDLE_TTL_MS=900000` |
+
+### Codex HTTP same-turn sticky-routing rollout
+
+`x-codex-turn-state` is not a conversation identifier or a durable `previous_response_id`. It follows the official Codex per-turn contract: the first successful tool-use response may supply one token; that exact first token is replayed only on matching tool-result continuations and compatible physical retries in the same logical turn; a new user turn starts without it. Later response tokens cannot replace the first token. Successful `end_turn`, `max_tokens`, and `refusal` terminals retire the state.
+
+The scope is exact account ID + lowercase physical model + the existing privacy-safe selected conversation identity. Continuation requires exact equality with the bounded tool-call lineage in the latest user message. Mixed latest-user content, malformed or duplicate IDs, more than 64 IDs, IDs over 512 UTF-8 bytes, and response tokens over 4 KiB fail closed. One logical request leases a pending lineage; a concurrent request cannot consume it. State is process-local, bounded, idle-expiring, and cleared on restart.
+
+The canary applies only to the official ChatGPT-subscription Responses endpoint. A trusted replay-bearing request is forced onto the ordinary HTTP transport and is never offered to the persistent WebSocket lane. Keep WebSocket treatment disabled while evaluating this canary. Client-supplied turn-state headers are removed before conversion, and the provider removes the upstream header from downstream streaming and non-streaming responses.
+
+| Situation | Turn-state behavior |
+|---|---|
+| Initial request or new user turn | Advance the scoped generation, clear pending state, and send no token |
+| Exact latest-user tool-result continuation | Treatment replays the immutable first token; control records only that it would replay |
+| `thinking_retry`, `reasoning_retry`, `cache_control_retry`, `prompt_cache_breakpoint_retry`, `overload_529`, or `other_retry` | Reuse only the exact same logical-request lease on the same account/model/conversation |
+| `cache_lane_rescue` or `precommit_sse_retry` | Invalidate and suppress, preserving rescue cache-key rotation |
+| `account_failover` or `model_fallback` | Invalidate and suppress; a token never crosses the physical account/model boundary |
+| Custom endpoint, hosted-search request, synthetic count request, missing binding, ambiguous lineage, expiry, eviction, or concurrent lease | No replay; scoped state is invalidated where a safe scope exists |
+| Error, abrupt EOF, cancellation, malformed/incomplete tool call, or stale generation | Never capture or advance state; only a compatible retry of an existing exact lease may continue |
+
+Treatment retains the raw token only in bounded process memory. Observe mode retains no token or lineage; control shadow state retains only token presence and domain-separated call-ID fingerprints. Schema-18 Codex traces store bounded arm/action/terminal categories, an opaque cohort, and keyed token HMACs for request/response matching. They never store the raw token, raw call IDs, lineage sets, session/account IDs, or full cache keys. The cache-experiment analyzer reports only aggregate treatment/control cache, error, retry, latency, context/gap, HMAC-match, and prompt-key-concentration metrics.
+
+Roll out only on naturally initiated authorized Codex traffic. First obtain fresh operator approval to enable observe-only for one exact account/model scope. After reviewing aggregate cohorts and confirming WebSocket treatment remains off, obtain separate fresh approval before setting a nonzero percentage plus one exact cohort. Require no error/fallback/context-overflow/latency regression and keep every prompt key at or below 15 requests per minute. Roll back by setting `CCFLARE_CODEX_TURN_STATE_PERCENT=0`, clearing `CCFLARE_CODEX_TURN_STATE_COHORT_IDS`, and restarting; no migration or data cleanup is required. Never infer Anthropic parity from fixtures, unmatched windows, or aggregate correlation.
+
 | `CCFLARE_CODEX_WS_PERCENT` | Default-off deterministic percentage for the official ChatGPT-subscription Responses WebSocket canary. Assignment is stable per account and `prompt_cache_key`; both account and model allowlists below are also required | `0` | `CCFLARE_CODEX_WS_PERCENT=10` |
 | `CCFLARE_CODEX_WS_ACCOUNT_IDS` | Comma-separated exact account IDs eligible for the WebSocket canary. Empty means no accounts are eligible | empty | `CCFLARE_CODEX_WS_ACCOUNT_IDS=account-uuid` |
 | `CCFLARE_CODEX_WS_MODELS` | Comma-separated physical Codex model allowlist for the WebSocket canary, matched case-insensitively. Empty means no models are eligible | empty | `CCFLARE_CODEX_WS_MODELS=gpt-5.6-sol` |

@@ -7,6 +7,124 @@ import {
 } from "./analyze-trace";
 
 describe("analyzeCodexCacheExperiments", () => {
+	test("attributes HTTP turn-state by first attempt and final outcome", () => {
+		const report = analyzeCodexCacheExperiments([
+			{
+				trace_schema_version: 18,
+				phase: "request",
+				ts: "2026-08-13T00:00:00.000Z",
+				request_id: "private-logical-first",
+				attempt_id: "private-attempt-first",
+				attempt_ordinal: 1,
+				attempt_cause: "initial",
+				model_out: "gpt-5.6-sol",
+				prompt_cache_key_id: "private-key",
+				codex_turn_state_arm: "treatment",
+				codex_turn_state_cohort_id: "0123456789abcdef",
+				codex_turn_state_request_action: "replay",
+				codex_turn_state_replay_applied: true,
+				codex_turn_state_request_hmac: "matched-hmac",
+			},
+			{
+				trace_schema_version: 18,
+				phase: "request",
+				ts: "2026-08-13T00:00:01.000Z",
+				request_id: "private-logical-first",
+				attempt_id: "private-attempt-final",
+				attempt_ordinal: 2,
+				attempt_cause: "reasoning_retry",
+				model_out: "gpt-5.6-sol",
+				prompt_cache_key_id: "private-key",
+				codex_turn_state_arm: "ineligible",
+				codex_turn_state_cohort_id: "fedcba9876543210",
+				codex_turn_state_request_action: "rescue_suppressed",
+				codex_turn_state_replay_applied: false,
+			},
+			{
+				trace_schema_version: 18,
+				phase: "response",
+				ts: "2026-08-13T00:00:03.000Z",
+				request_id: "private-logical-first",
+				attempt_id: "private-attempt-final",
+				stop_reason: "end_turn",
+				input_tokens: 1_000,
+				cache_read_input_tokens: 900,
+				cache_creation_input_tokens: 0,
+				cache_creation_measurement_available: true,
+				context_utilization_pct: 75,
+				codex_turn_state_hmac: "matched-hmac",
+				codex_turn_state_terminal_action: "advanced",
+			},
+			{
+				trace_schema_version: 18,
+				phase: "request",
+				ts: "2026-08-13T00:02:00.000Z",
+				request_id: "private-control",
+				attempt_id: "private-control-attempt",
+				attempt_ordinal: 1,
+				attempt_cause: "initial",
+				model_out: "gpt-5.6-sol",
+				codex_turn_state_arm: "control",
+				codex_turn_state_cohort_id: "0123456789abcdef",
+				codex_turn_state_request_action: "would_replay",
+				codex_turn_state_replay_applied: false,
+			},
+		]);
+
+		expect(report.schemaVersion).toBe(2);
+		expect(report.turnState.assignmentCounts).toEqual({
+			observe: 0,
+			control: 1,
+			treatment: 1,
+			ineligible: 0,
+			unassigned: 0,
+		});
+		expect(report.turnState.rows).toMatchObject([
+			{
+				arm: "control",
+				model: "gpt-5.6-sol",
+				turn: "follow_up_observed",
+				gapBand: "from_1m_to_5m",
+				contextBand: "unavailable",
+				requests: 1,
+				unjoinedRequests: 1,
+				requestActions: { would_replay: 1 },
+			},
+			{
+				arm: "treatment",
+				model: "gpt-5.6-sol",
+				turn: "first_observed",
+				gapBand: "unknown",
+				contextBand: "from_50_to_80",
+				requests: 1,
+				joinedResponses: 1,
+				cache: {
+					weightedCachedReadPct: 90,
+					positiveHitRatePct: 100,
+					zeroHitRatePct: 0,
+				},
+				outcomes: {
+					observedFallbackAttempts: 1,
+					terminalActions: { advanced: 1 },
+				},
+				tokenHmac: { matched: 1, mismatched: 0, unavailable: 0 },
+				requestActions: { replay: 1 },
+			},
+		]);
+		const text = formatCacheExperimentReport(report);
+		expect(text).toContain("HTTP TURN STATE CANARY");
+		for (const privateValue of [
+			"private-logical-first",
+			"private-attempt-first",
+			"private-attempt-final",
+			"private-key",
+			"0123456789abcdef",
+			"matched-hmac",
+		]) {
+			expect(text).not.toContain(privateValue);
+		}
+	});
+
 	test("groups the pacing canary by arm, model, turn, and gap band", () => {
 		const report = analyzeCodexCacheExperiments([
 			{
@@ -84,7 +202,7 @@ describe("analyzeCodexCacheExperiments", () => {
 			},
 		]);
 
-		expect(report.schemaVersion).toBe(1);
+		expect(report.schemaVersion).toBe(2);
 		expect(report.attribution.unit).toBe("final_observed_codex_attempt");
 		expect(report.attribution.pacingWaitMs).toBe("unavailable");
 		expect(report.pacing.assignmentCounts).toEqual({

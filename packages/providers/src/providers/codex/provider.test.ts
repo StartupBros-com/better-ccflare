@@ -8,6 +8,7 @@ import { setDerivedProviderModelDefaults } from "../../provider-model-defaults";
 import { fetchCodexUsageOnDemand } from "./on-demand-fetch";
 import {
 	CODEX_SINGLE_ORCHESTRATION_ROOT_ENV,
+	deriveConversationIdentity,
 	resetOrchestrationElectionForTest,
 } from "./orchestration-election";
 import {
@@ -26,6 +27,14 @@ import {
 	resolveCodexRequestModel,
 } from "./provider";
 import { CODEX_TRACE_DIR_ENV, CODEX_TRACE_HMAC_KEY_ENV } from "./trace";
+import {
+	CODEX_TURN_STATE_ACCOUNT_IDS_ENV,
+	CODEX_TURN_STATE_COHORT_IDS_ENV,
+	CODEX_TURN_STATE_MODELS_ENV,
+	CODEX_TURN_STATE_OBSERVE_ONLY_ENV,
+	CODEX_TURN_STATE_PERCENT_ENV,
+	deriveCodexTurnStateCohortId,
+} from "./turn-state";
 import { parseCodexUsageHeaders } from "./usage";
 
 const sseBody = (lines: string[]) => `${lines.join("\n")}\n`;
@@ -44,6 +53,14 @@ const readTraceRecords = (dir: string): Array<Record<string, unknown>> => {
 		.map((line) => JSON.parse(line) as Record<string, unknown>);
 };
 
+const CODEX_TURN_STATE_ENV_KEYS = [
+	CODEX_TURN_STATE_PERCENT_ENV,
+	CODEX_TURN_STATE_ACCOUNT_IDS_ENV,
+	CODEX_TURN_STATE_MODELS_ENV,
+	CODEX_TURN_STATE_COHORT_IDS_ENV,
+	CODEX_TURN_STATE_OBSERVE_ONLY_ENV,
+] as const;
+
 afterEach(() => {
 	delete process.env[CODEX_PROMPT_CACHE_KEY_ENV];
 	delete process.env[CODEX_CACHE_KEY_CONTINUITY_PERCENT_ENV];
@@ -53,7 +70,506 @@ afterEach(() => {
 	delete process.env.CCFLARE_CODEX_REASONING_RETENTION;
 	delete process.env[CODEX_TRACE_DIR_ENV];
 	delete process.env[CODEX_TRACE_HMAC_KEY_ENV];
+	for (const key of CODEX_TURN_STATE_ENV_KEYS) delete process.env[key];
 	resetOrchestrationElectionForTest();
+});
+
+describe("CodexProvider HTTP turn state", () => {
+	const turnStateHeader = "x-codex-turn-state";
+	const account = {
+		id: "account-a",
+		name: "codex-test",
+		provider: "codex",
+		custom_endpoint: null,
+		model_mappings: JSON.stringify({ sonnet: "gpt-5.6-sol" }),
+	} as Parameters<CodexProvider["transformRequestBody"]>[1];
+	const sessionId = "11111111-1111-4111-8111-111111111111";
+	const physicalModel = "gpt-5.6-sol";
+	const firstUserText = "inspect the cache";
+	const instructions = "Keep the same turn.";
+	const firstCodexInput = [
+		{
+			role: "user",
+			content: [{ type: "input_text", text: firstUserText }],
+		},
+	];
+	const conversationIdentity = deriveConversationIdentity(
+		sessionId,
+		instructions,
+		firstCodexInput,
+	);
+	if (!conversationIdentity)
+		throw new Error("turn-state fixture has no identity");
+
+	function enableTreatment(): void {
+		process.env[CODEX_TURN_STATE_PERCENT_ENV] = "100";
+		process.env[CODEX_TURN_STATE_ACCOUNT_IDS_ENV] = "account-a";
+		process.env[CODEX_TURN_STATE_MODELS_ENV] = physicalModel;
+		process.env[CODEX_TURN_STATE_COHORT_IDS_ENV] = deriveCodexTurnStateCohortId(
+			{
+				accountId: "account-a",
+				model: physicalModel,
+				conversationIdentity,
+			},
+		);
+	}
+
+	function requestFor(
+		requestId: string,
+		attemptId: string,
+		messages: unknown[],
+		stream: boolean,
+		attemptCause = "initial",
+	): Request {
+		return new Request(CODEX_DEFAULT_ENDPOINT, {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"x-better-ccflare-request-id": requestId,
+				"x-better-ccflare-attempt-id": attemptId,
+				"x-better-ccflare-attempt-ordinal": "1",
+				"x-better-ccflare-attempt-cause": attemptCause,
+				"x-better-ccflare-final-model": physicalModel,
+			},
+			body: JSON.stringify({
+				model: "claude-sonnet-4-5",
+				max_tokens: 100,
+				stream,
+				system: instructions,
+				metadata: { user_id: JSON.stringify({ session_id: sessionId }) },
+				tools: [
+					{
+						name: "search",
+						description: "search",
+						input_schema: { type: "object", properties: {} },
+					},
+				],
+				messages,
+			}),
+		});
+	}
+
+	function toolResponse(
+		requestId: string,
+		attemptId: string,
+		callId: string,
+		turnState: string,
+		stream: boolean,
+	): Response {
+		return new Response(
+			sseBody([
+				...eventLine("response.created", {
+					type: "response.created",
+					response: { id: `resp_${attemptId}`, model: physicalModel },
+				}),
+				...eventLine("response.output_item.added", {
+					type: "response.output_item.added",
+					item: { type: "function_call", call_id: callId, name: "search" },
+					output_index: 0,
+				}),
+				...eventLine("response.function_call_arguments.delta", {
+					type: "response.function_call_arguments.delta",
+					delta: "{}",
+					output_index: 0,
+				}),
+				...eventLine("response.output_item.done", {
+					type: "response.output_item.done",
+					item: { type: "function_call", call_id: callId, name: "search" },
+					output_index: 0,
+				}),
+				...eventLine("response.completed", {
+					type: "response.completed",
+					response: {
+						id: `resp_${attemptId}`,
+						model: physicalModel,
+						usage: {
+							input_tokens: 10,
+							output_tokens: 1,
+							input_tokens_details: { cached_tokens: 0 },
+						},
+					},
+				}),
+			]),
+			{
+				status: 200,
+				headers: {
+					"content-type": "text/event-stream",
+					"x-better-ccflare-request-id": requestId,
+					"x-better-ccflare-attempt-id": attemptId,
+					"x-better-ccflare-final-model": physicalModel,
+					"x-better-ccflare-request-stream": stream ? "true" : "false",
+					[turnStateHeader]: turnState,
+				},
+			},
+		);
+	}
+
+	it("strips an untrusted client turn-state header before conversion", async () => {
+		const provider = new CodexProvider();
+		const prepared = provider.prepareHeaders(
+			new Headers({ [turnStateHeader]: "client-controlled" }),
+			"access-token",
+		);
+		expect(prepared.get(turnStateHeader)).toBeNull();
+	});
+
+	it.each([
+		true,
+		false,
+	])("captures and replays one unchanged same-turn token when stream=%s", async (stream) => {
+		enableTreatment();
+		const provider = new CodexProvider();
+		const initialMessages = [{ role: "user", content: firstUserText }];
+		const initial = await provider.transformRequestBody(
+			requestFor("request-1", "attempt-1", initialMessages, stream),
+			account,
+		);
+		expect(initial.headers.get(turnStateHeader)).toBeNull();
+
+		const firstResponse = await provider.processResponse(
+			toolResponse("request-1", "attempt-1", "call-1", "turn-token-1", stream),
+			null,
+		);
+		expect(firstResponse.headers.get(turnStateHeader)).toBeNull();
+		await firstResponse.text();
+
+		const continuationMessages = [
+			...initialMessages,
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "tool_use",
+						id: "call-1",
+						name: "search",
+						input: {},
+					},
+				],
+			},
+			{
+				role: "user",
+				content: [
+					{
+						type: "tool_result",
+						tool_use_id: "call-1",
+						content: "result",
+					},
+				],
+			},
+		];
+		const continuation = await provider.transformRequestBody(
+			requestFor("request-2", "attempt-2", continuationMessages, stream),
+			account,
+		);
+		expect(continuation.headers.get(turnStateHeader)).toBe("turn-token-1");
+
+		const secondResponse = await provider.processResponse(
+			toolResponse(
+				"request-2",
+				"attempt-2",
+				"call-2",
+				"turn-token-2-must-be-ignored",
+				stream,
+			),
+			null,
+		);
+		await secondResponse.text();
+
+		const nextMessages = [
+			...continuationMessages,
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "tool_use",
+						id: "call-2",
+						name: "search",
+						input: {},
+					},
+				],
+			},
+			{
+				role: "user",
+				content: [
+					{
+						type: "tool_result",
+						tool_use_id: "call-2",
+						content: "next result",
+					},
+				],
+			},
+		];
+		const next = await provider.transformRequestBody(
+			requestFor("request-3", "attempt-3", nextMessages, stream),
+			account,
+		);
+		expect(next.headers.get(turnStateHeader)).toBe("turn-token-1");
+
+		const newTurn = await provider.transformRequestBody(
+			requestFor(
+				"request-4",
+				"attempt-4",
+				[
+					...nextMessages,
+					{ role: "assistant", content: "done" },
+					{ role: "user", content: "new turn" },
+				],
+				stream,
+			),
+			account,
+		);
+		expect(newTurn.headers.get(turnStateHeader)).toBeNull();
+	});
+});
+
+describe("CodexProvider HTTP turn-state failure paths", () => {
+	const turnStateHeader = "x-codex-turn-state";
+	const account = {
+		id: "account-a",
+		name: "codex-test",
+		provider: "codex",
+		custom_endpoint: null,
+		model_mappings: JSON.stringify({ sonnet: "gpt-5.6-sol" }),
+	} as Parameters<CodexProvider["transformRequestBody"]>[1];
+	const sessionId = "11111111-1111-4111-8111-111111111111";
+	const physicalModel = "gpt-5.6-sol";
+	const firstUserText = "inspect the cache";
+	const instructions = "Keep the same turn.";
+	const conversationIdentity = deriveConversationIdentity(
+		sessionId,
+		instructions,
+		[
+			{
+				role: "user",
+				content: [{ type: "input_text", text: firstUserText }],
+			},
+		],
+	);
+	if (!conversationIdentity)
+		throw new Error("turn-state fixture has no identity");
+
+	function enableTreatment(): void {
+		process.env[CODEX_TURN_STATE_PERCENT_ENV] = "100";
+		process.env[CODEX_TURN_STATE_ACCOUNT_IDS_ENV] = account.id;
+		process.env[CODEX_TURN_STATE_MODELS_ENV] = physicalModel;
+		process.env[CODEX_TURN_STATE_COHORT_IDS_ENV] = deriveCodexTurnStateCohortId(
+			{
+				accountId: account.id,
+				model: physicalModel,
+				conversationIdentity,
+			},
+		);
+	}
+
+	function requestFor(
+		requestId: string,
+		attemptId: string,
+		messages: unknown[],
+		attemptCause = "initial",
+	): Request {
+		return new Request(CODEX_DEFAULT_ENDPOINT, {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"x-better-ccflare-request-id": requestId,
+				"x-better-ccflare-attempt-id": attemptId,
+				"x-better-ccflare-attempt-ordinal": "1",
+				"x-better-ccflare-attempt-cause": attemptCause,
+				"x-better-ccflare-final-model": physicalModel,
+			},
+			body: JSON.stringify({
+				model: "claude-sonnet-4-5",
+				max_tokens: 100,
+				stream: true,
+				system: instructions,
+				metadata: { user_id: JSON.stringify({ session_id: sessionId }) },
+				tools: [
+					{
+						name: "search",
+						description: "search",
+						input_schema: { type: "object", properties: {} },
+					},
+				],
+				messages,
+			}),
+		});
+	}
+
+	function rawSseResponse(
+		requestId: string,
+		attemptId: string,
+		lines: string[],
+		turnState?: string,
+	): Response {
+		const headers = new Headers({
+			"content-type": "text/event-stream",
+			"x-better-ccflare-request-id": requestId,
+			"x-better-ccflare-attempt-id": attemptId,
+			"x-better-ccflare-final-model": physicalModel,
+			"x-better-ccflare-request-stream": "true",
+		});
+		if (turnState !== undefined) headers.set(turnStateHeader, turnState);
+		return new Response(sseBody(lines), { status: 200, headers });
+	}
+
+	function callEvents(callId: string, outputIndex = 0): string[] {
+		return [
+			...eventLine("response.output_item.added", {
+				type: "response.output_item.added",
+				item: { type: "function_call", call_id: callId, name: "search" },
+				output_index: outputIndex,
+			}),
+			...eventLine("response.output_item.done", {
+				type: "response.output_item.done",
+				item: { type: "function_call", call_id: callId, name: "search" },
+				output_index: outputIndex,
+			}),
+		];
+	}
+
+	function continuationMessages(callId: string): unknown[] {
+		return [
+			{ role: "user", content: firstUserText },
+			{
+				role: "assistant",
+				content: [{ type: "tool_use", id: callId, name: "search", input: {} }],
+			},
+			{
+				role: "user",
+				content: [
+					{
+						type: "tool_result",
+						tool_use_id: callId,
+						content: "result",
+					},
+				],
+			},
+		];
+	}
+
+	async function seedTurnState(
+		provider: CodexProvider,
+		callId: string,
+	): Promise<void> {
+		await provider.transformRequestBody(
+			requestFor("request-seed", "attempt-seed", [
+				{ role: "user", content: firstUserText },
+			]),
+			account,
+		);
+		const response = await provider.processResponse(
+			rawSseResponse(
+				"request-seed",
+				"attempt-seed",
+				[
+					...callEvents(callId),
+					...eventLine("response.completed", {
+						type: "response.completed",
+						response: { model: physicalModel },
+					}),
+				],
+				"turn-token-seed",
+			),
+			null,
+		);
+		await response.text();
+	}
+
+	it.each([
+		["missing-token", "call-missing", undefined, "complete"],
+		["oversized-token", "call-oversized", "x".repeat(4_097), "complete"],
+		["duplicate-calls", "call-duplicate", "turn-token", "duplicate"],
+		["incomplete-call", "call-incomplete", "turn-token", "incomplete"],
+		["upstream-failure", "call-failed", "turn-token", "failed"],
+		["abrupt-eof", "call-abrupt", "turn-token", "abrupt"],
+	] as const)("fails closed for %s", async (suffix, callId, responseToken, outcome) => {
+		enableTreatment();
+		const provider = new CodexProvider();
+		const requestId = `request-${suffix}`;
+		const attemptId = `attempt-${suffix}`;
+		await provider.transformRequestBody(
+			requestFor(requestId, attemptId, [
+				{ role: "user", content: firstUserText },
+			]),
+			account,
+		);
+		const events =
+			outcome === "failed"
+				? eventLine("response.failed", {
+						type: "response.failed",
+						response: { model: physicalModel, error: { message: "failed" } },
+					})
+				: outcome === "abrupt"
+					? []
+					: [
+							...(outcome === "incomplete"
+								? callEvents(callId).slice(0, 3)
+								: callEvents(callId)),
+							...(outcome === "duplicate" ? callEvents(callId, 1) : []),
+							...eventLine("response.completed", {
+								type: "response.completed",
+								response: { model: physicalModel },
+							}),
+						];
+		const transformed = await provider.processResponse(
+			rawSseResponse(requestId, attemptId, events, responseToken),
+			null,
+		);
+		await transformed.text();
+		const continuation = await provider.transformRequestBody(
+			requestFor(
+				`${requestId}-continuation`,
+				`${attemptId}-continuation`,
+				continuationMessages(callId),
+			),
+			account,
+		);
+		expect(continuation.headers.get(turnStateHeader)).toBeNull();
+	});
+
+	it("reuses an exact lease on a compatible retry", async () => {
+		enableTreatment();
+		const provider = new CodexProvider();
+		await seedTurnState(provider, "call-retry");
+		const messages = continuationMessages("call-retry");
+		const first = await provider.transformRequestBody(
+			requestFor("request-retry", "attempt-retry-1", messages),
+			account,
+		);
+		expect(first.headers.get(turnStateHeader)).toBe("turn-token-seed");
+		const retry = await provider.transformRequestBody(
+			requestFor(
+				"request-retry",
+				"attempt-retry-2",
+				messages,
+				"reasoning_retry",
+			),
+			account,
+		);
+		expect(retry.headers.get(turnStateHeader)).toBe("turn-token-seed");
+	});
+
+	it.each([
+		"cache_lane_rescue",
+		"precommit_sse_retry",
+		"account_failover",
+		"model_fallback",
+	] as const)("suppresses %s attempts", async (attemptCause) => {
+		enableTreatment();
+		const provider = new CodexProvider();
+		const callId = `call-${attemptCause}`;
+		await seedTurnState(provider, callId);
+		const suppressed = await provider.transformRequestBody(
+			requestFor(
+				`request-${attemptCause}`,
+				`attempt-${attemptCause}`,
+				continuationMessages(callId),
+				attemptCause,
+			),
+			account,
+		);
+		expect(suppressed.headers.get(turnStateHeader)).toBeNull();
+	});
 });
 
 describe("CodexProvider stream liveness", () => {
@@ -7238,7 +7754,7 @@ describe("CodexProvider.transformRequestBody", () => {
 			// recorded lineage and is admitted as root (basis: lineage_match), not
 			// demoted.
 			expect(requestTrace).toMatchObject({
-				trace_schema_version: 17,
+				trace_schema_version: 18,
 				orchestration_admission: "root",
 				orchestration_basis: "lineage_match",
 				cache_key_continuity_basis: "lineage_match",
@@ -7488,7 +8004,7 @@ describe("CodexProvider.transformRequestBody", () => {
 				(record) => record.phase === "request",
 			);
 			expect(requestTrace).toMatchObject({
-				trace_schema_version: 17,
+				trace_schema_version: 18,
 				orchestration_admission: "attributed_descendant",
 				orchestration_basis: null,
 				is_descendant: true,
@@ -7779,11 +8295,11 @@ describe("CodexProvider.transformRequestBody", () => {
 				(record) => record.request_id === "treated-compacted",
 			);
 			expect(treatedRootTrace).toMatchObject({
-				trace_schema_version: 17,
+				trace_schema_version: 18,
 				cache_key_continuity_applied: true,
 			});
 			expect(treatedCompactedTrace).toMatchObject({
-				trace_schema_version: 17,
+				trace_schema_version: 18,
 				cache_key_continuity_basis: "lineage_match",
 				cache_key_continuity_applied: true,
 			});

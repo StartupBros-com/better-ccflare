@@ -17,7 +17,85 @@ afterEach(() => {
 	delete process.env[CODEX_TRACE_HMAC_KEY_ENV];
 });
 
-describe("reasoning retention telemetry (schema 17)", () => {
+describe("Codex HTTP turn-state telemetry (schema 18)", () => {
+	test("writes only bounded request and response attribution", () => {
+		const dir = mkdtempSync(join(tmpdir(), "codex-trace-turn-state-"));
+		process.env[CODEX_TRACE_DIR_ENV] = dir;
+		process.env[CODEX_TRACE_HMAC_KEY_ENV] = "trace-test-key";
+		try {
+			writeCodexTrace({
+				codexInput: [],
+				turnStateArm: "treatment",
+				turnStateCohortId: "0123456789abcdef",
+				turnStateRequestAction: "replay",
+				turnStateReplayApplied: true,
+				turnState: "private-request-turn-state",
+			});
+			writeCodexResponseTrace({
+				turnStateTerminalAction: "advanced",
+				summary: summarizeCodexResponse([], {}, "end_turn"),
+			});
+
+			const file = readdirSync(dir).find((name) => name.endsWith(".jsonl"));
+			const rawTrace = readFileSync(join(dir, file as string), "utf8");
+			const [request, response] = rawTrace
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line));
+			expect(request).toMatchObject({
+				trace_schema_version: 18,
+				codex_turn_state_arm: "treatment",
+				codex_turn_state_cohort_id: "0123456789abcdef",
+				codex_turn_state_request_action: "replay",
+				codex_turn_state_replay_applied: true,
+			});
+			expect(request.codex_turn_state_request_hmac).toMatch(/^[0-9a-f]{64}$/);
+			expect(response).toMatchObject({
+				trace_schema_version: 18,
+				codex_turn_state_terminal_action: "advanced",
+			});
+			expect(rawTrace).not.toContain("private-request-turn-state");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("collapses invalid or future attribution instead of echoing it", () => {
+		const dir = mkdtempSync(join(tmpdir(), "codex-trace-turn-state-"));
+		process.env[CODEX_TRACE_DIR_ENV] = dir;
+		try {
+			writeCodexTrace({
+				codexInput: [],
+				turnStateArm: "future" as never,
+				turnStateCohortId: "private-cohort-value",
+				turnStateRequestAction: "private-action" as never,
+				turnStateReplayApplied: true,
+			});
+			writeCodexResponseTrace({
+				turnStateTerminalAction: "private-terminal" as never,
+				summary: summarizeCodexResponse([], {}, "end_turn"),
+			});
+			const file = readdirSync(dir).find((name) => name.endsWith(".jsonl"));
+			const rawTrace = readFileSync(join(dir, file as string), "utf8");
+			const [request, response] = rawTrace
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line));
+			expect(request.codex_turn_state_arm).toBe("ineligible");
+			expect(request.codex_turn_state_cohort_id).toBeNull();
+			expect(request.codex_turn_state_request_action).toBe("missing_binding");
+			expect(request.codex_turn_state_replay_applied).toBe(false);
+			expect(response.codex_turn_state_terminal_action).toBe("ineligible");
+			expect(rawTrace).not.toContain("private-cohort-value");
+			expect(rawTrace).not.toContain("private-action");
+			expect(rawTrace).not.toContain("private-terminal");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("reasoning retention telemetry (schema 18)", () => {
 	test("writes a counts-only request record", () => {
 		const dir = mkdtempSync(join(tmpdir(), "codex-trace-reasoning-"));
 		process.env[CODEX_TRACE_DIR_ENV] = dir;
@@ -37,7 +115,7 @@ describe("reasoning retention telemetry (schema 17)", () => {
 			const rawTrace = readFileSync(join(dir, file as string), "utf8");
 			const record = JSON.parse(rawTrace.trim());
 			expect(record).toMatchObject({
-				trace_schema_version: 17,
+				trace_schema_version: 18,
 				phase: "request",
 				reasoning_input_item_count: 1,
 			});
@@ -65,7 +143,7 @@ describe("reasoning retention telemetry (schema 17)", () => {
 				readFileSync(join(dir, file as string), "utf8").trim(),
 			);
 			expect(record).toMatchObject({
-				trace_schema_version: 17,
+				trace_schema_version: 18,
 				phase: "response",
 				reasoning_output_item_count: 3,
 				reasoning_encrypted_present: true,
@@ -77,7 +155,7 @@ describe("reasoning retention telemetry (schema 17)", () => {
 	});
 });
 
-describe("writeCodexTrace schema 17 cache experiments", () => {
+describe("writeCodexTrace schema 18 cache experiments", () => {
 	test("writes bounded decision fields without reconstructing their semantics", () => {
 		const dir = mkdtempSync(join(tmpdir(), "codex-trace-schema-"));
 		process.env[CODEX_TRACE_DIR_ENV] = dir;
@@ -104,7 +182,7 @@ describe("writeCodexTrace schema 17 cache experiments", () => {
 				readFileSync(join(dir, file as string), "utf8").trim(),
 			);
 			expect(record).toMatchObject({
-				trace_schema_version: 17,
+				trace_schema_version: 18,
 				cache_key_continuity_applied: false,
 				continuity_evidence_id: "0123456789abcdef",
 				request_id: "logical-1",
@@ -144,7 +222,7 @@ describe("writeCodexTrace schema 17 cache experiments", () => {
 	});
 });
 
-describe("orchestration demotion diagnostics (preserved in schema 17)", () => {
+describe("orchestration demotion diagnostics (preserved in schema 18)", () => {
 	test("writes the demotion signal and elapsed time when supplied", () => {
 		const dir = mkdtempSync(join(tmpdir(), "codex-trace-schema-"));
 		process.env[CODEX_TRACE_DIR_ENV] = dir;
@@ -160,7 +238,7 @@ describe("orchestration demotion diagnostics (preserved in schema 17)", () => {
 				readFileSync(join(dir, file as string), "utf8").trim(),
 			);
 			expect(record).toMatchObject({
-				trace_schema_version: 17,
+				trace_schema_version: 18,
 				orchestration_demotion_observed: true,
 				elapsed_ms_since_root: 4_242,
 			});
@@ -179,7 +257,7 @@ describe("orchestration demotion diagnostics (preserved in schema 17)", () => {
 			const record = JSON.parse(
 				readFileSync(join(dir, file as string), "utf8").trim(),
 			);
-			expect(record.trace_schema_version).toBe(17);
+			expect(record.trace_schema_version).toBe(18);
 			expect(record.orchestration_demotion_observed).toBeNull();
 			expect(record.elapsed_ms_since_root).toBeNull();
 		} finally {
@@ -207,7 +285,7 @@ describe("orchestration demotion diagnostics (preserved in schema 17)", () => {
 	});
 });
 
-describe("orchestration admission basis (introduced in schema 13, preserved in schema 17)", () => {
+describe("orchestration admission basis (introduced in schema 13, preserved in schema 18)", () => {
 	test("writes an explicit categorical basis alongside its admission", () => {
 		const dir = mkdtempSync(join(tmpdir(), "codex-trace-basis-"));
 		process.env[CODEX_TRACE_DIR_ENV] = dir;
@@ -223,7 +301,7 @@ describe("orchestration admission basis (introduced in schema 13, preserved in s
 				readFileSync(join(dir, file as string), "utf8").trim(),
 			);
 			expect(record).toMatchObject({
-				trace_schema_version: 17,
+				trace_schema_version: 18,
 				orchestration_admission: "root",
 				orchestration_basis: "lineage_match",
 			});

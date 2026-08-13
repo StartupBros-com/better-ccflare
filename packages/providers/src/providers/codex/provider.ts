@@ -76,6 +76,15 @@ import {
 	writeCodexResponseTrace,
 	writeCodexTrace,
 } from "./trace";
+import {
+	type CodexTurnStateAttemptCause,
+	CodexTurnStateCoordinator,
+	type CodexTurnStateLineage,
+	type CodexTurnStateTerminalAction,
+	extractCodexTurnStateLineage,
+	fingerprintCodexTurnStateCallId,
+	normalizeCodexTurnStateFingerprints,
+} from "./turn-state";
 import { normalizeCodexResponseInputUsage } from "./usage";
 
 const log = new Logger("CodexProvider");
@@ -100,6 +109,7 @@ function sanitizeResponseHeaders(headers: Headers): Headers {
 	for (const h of INTERNAL_HEADERS) {
 		sanitized.delete(h);
 	}
+	sanitized.delete(CODEX_TURN_STATE_HEADER);
 	return sanitized;
 }
 
@@ -123,6 +133,7 @@ export const CODEX_PROMPT_CACHE_KEY_ENV = "CCFLARE_CODEX_PROMPT_CACHE_KEY";
  */
 export const CODEX_CONVERSATION_ID_HEADER =
 	"x-better-ccflare-codex-conversation-id";
+export const CODEX_TURN_STATE_HEADER = "x-codex-turn-state";
 /** "conversation" (default) or "session"; see derivePromptCacheKey. */
 export const CODEX_CACHE_KEY_MODE_ENV = "CCFLARE_CODEX_CACHE_KEY_MODE";
 export const CODEX_CACHE_KEY_SESSION_PERCENT_ENV =
@@ -692,6 +703,7 @@ interface AnthropicRequest {
 interface FunctionCallBuffer {
 	contentBlockIndex: number;
 	name: string;
+	callIdFingerprint: string | null;
 	arguments: string[];
 	/** Running byte total of buffered argument deltas, capped by TOOL_ARGS_PER_CALL_BYTE_CAP. */
 	bytes: number;
@@ -746,6 +758,8 @@ interface StreamState {
 	};
 	// Newly emitted tool calls from this response only (not historical replay).
 	traceNewToolCalls: ToolCallSummary[];
+	turnStateOutputCallFingerprints: string[];
+	turnStateOutputCallsInvalid: boolean;
 	traceReasoningOutputItemCount: number;
 	traceReasoningEncryptedPresent: boolean;
 	traceReasoningUnrepresentableIdSkipCount: number;
@@ -757,6 +771,11 @@ interface StreamState {
 	traceAttemptId?: string;
 	traceTurnStateHeaderPresent: boolean;
 	traceTurnState: string | null;
+	turnStateTerminalAction: CodexTurnStateTerminalAction | null;
+	finalizeTurnState: (
+		stopReason: "error" | "end_turn" | "tool_use" | "max_tokens" | "refusal",
+		outputLineage: CodexTurnStateLineage,
+	) => CodexTurnStateTerminalAction;
 	traceResponseId: string | null;
 	/** Last canonical Anthropic ping translated from allowlisted Codex progress. */
 	lastProgressPingAt: number | null;
@@ -777,6 +796,18 @@ function writeCodexStreamTerminalTrace(
 ): void {
 	if (state.terminalTraceWritten) return;
 	state.terminalTraceWritten = true;
+	const outputLineage =
+		stopReason === "tool_use" && !state.turnStateOutputCallsInvalid
+			? normalizeCodexTurnStateFingerprints(
+					state.turnStateOutputCallFingerprints,
+				)
+			: stopReason === "tool_use"
+				? ({ kind: "invalid" } as const)
+				: ({ kind: "none" } as const);
+	state.turnStateTerminalAction = state.finalizeTurnState(
+		stopReason,
+		outputLineage,
+	);
 	writeCodexResponseTrace({
 		requestId: state.traceRequestId,
 		attemptId: state.traceAttemptId,
@@ -785,6 +816,7 @@ function writeCodexStreamTerminalTrace(
 			?.rawContextWindow,
 		turnStateHeaderPresent: state.traceTurnStateHeaderPresent,
 		turnState: state.traceTurnState,
+		turnStateTerminalAction: state.turnStateTerminalAction ?? "unknown_attempt",
 		responseId: state.traceResponseId,
 		summary: summarizeCodexResponse(
 			state.traceNewToolCalls,
@@ -863,9 +895,14 @@ export interface CodexProviderOptionsForTests {
 	streamRawSilenceTimeoutMs?: number;
 }
 
+interface CodexTransformOptions {
+	hosted?: boolean;
+}
+
 export class CodexProvider extends BaseProvider {
 	name = "codex";
 	private readonly streamLivenessOptions: CodexStreamLivenessOptions;
+	private readonly turnStateCoordinator = new CodexTurnStateCoordinator();
 
 	constructor(options: CodexProviderOptionsForTests = {}) {
 		super();
@@ -893,7 +930,7 @@ export class CodexProvider extends BaseProvider {
 			prepareHeaders: (headers, accessToken) =>
 				this.prepareHeaders(headers, accessToken),
 			transformOrdinaryRequest: (request) =>
-				this.transformRequestBody(request, context.account),
+				this.transformRequestBody(request, context.account, { hosted: true }),
 			processHostedResponse: (
 				response,
 				_requestHeaders,
@@ -1183,6 +1220,7 @@ export class CodexProvider extends BaseProvider {
 		newHeaders.delete("anthropic-beta");
 		newHeaders.delete("x-api-key");
 		newHeaders.delete("host");
+		newHeaders.delete(CODEX_TURN_STATE_HEADER);
 
 		// Set Codex-required headers
 		if (accessToken) {
@@ -1199,6 +1237,7 @@ export class CodexProvider extends BaseProvider {
 	async transformRequestBody(
 		request: Request,
 		account?: Account,
+		options: CodexTransformOptions = {},
 	): Promise<Request> {
 		const trustedLogicalModelFamily = request.headers.has(
 			CODEX_LOGICAL_MODEL_FAMILY_HEADER,
@@ -1207,9 +1246,13 @@ export class CodexProvider extends BaseProvider {
 					.trim()
 					.toLowerCase()
 			: null;
-		if (request.headers.has(CODEX_LOGICAL_MODEL_FAMILY_HEADER)) {
+		if (
+			request.headers.has(CODEX_LOGICAL_MODEL_FAMILY_HEADER) ||
+			request.headers.has(CODEX_TURN_STATE_HEADER)
+		) {
 			const sanitizedHeaders = new Headers(request.headers);
 			sanitizedHeaders.delete(CODEX_LOGICAL_MODEL_FAMILY_HEADER);
+			sanitizedHeaders.delete(CODEX_TURN_STATE_HEADER);
 			request = new Request(request, { headers: sanitizedHeaders });
 		}
 		const isSyntheticCountTokens = this.isSyntheticCountTokensRequest(
@@ -1302,6 +1345,19 @@ export class CodexProvider extends BaseProvider {
 				// ChatGPT's subscription Responses endpoint rejects this API-only field.
 				delete codexBody.max_output_tokens;
 			}
+			const turnStateDecision = this.turnStateCoordinator.beginAttempt({
+				accountId: account?.id,
+				model: codexBody.model,
+				conversationIdentity:
+					cacheKeyDecision.selectedConversationIdentity ??
+					cacheKeyDecision.conversationIdentity,
+				requestId,
+				attemptId,
+				attemptCause: attemptCause as CodexTurnStateAttemptCause | null,
+				eligibleEndpoint: isSubscriptionEndpoint,
+				hosted: options.hosted === true,
+				lineage: extractCodexTurnStateLineage(body.messages),
+			});
 			// Best-effort, env-gated observability (no-op unless CCFLARE_CODEX_TRACE_DIR set).
 			writeCodexTrace({
 				requestId: requestId ?? undefined,
@@ -1347,6 +1403,11 @@ export class CodexProvider extends BaseProvider {
 					"x-better-ccflare-pacing-cohort-id",
 				),
 				pacingAction: request.headers.get("x-better-ccflare-pacing-action"),
+				turnStateArm: turnStateDecision.arm,
+				turnStateCohortId: turnStateDecision.cohortId,
+				turnStateRequestAction: turnStateDecision.action,
+				turnStateReplayApplied: turnStateDecision.replayApplied,
+				turnState: turnStateDecision.turnState,
 				isDescendant: isAttributedAgent,
 				orchestrationAdmission,
 				orchestrationBasis,
@@ -1363,6 +1424,10 @@ export class CodexProvider extends BaseProvider {
 
 			const newHeaders = new Headers(request.headers);
 			newHeaders.set("content-type", "application/json");
+			newHeaders.delete(CODEX_TURN_STATE_HEADER);
+			if (turnStateDecision.turnState) {
+				newHeaders.set(CODEX_TURN_STATE_HEADER, turnStateDecision.turnState);
+			}
 			newHeaders.set(
 				"x-better-ccflare-request-stream",
 				body.stream === true ? "true" : "false",
@@ -1415,8 +1480,10 @@ export class CodexProvider extends BaseProvider {
 		const contentType = response.headers.get("content-type");
 		const requestId = response.headers.get("x-better-ccflare-request-id");
 		const attemptId = response.headers.get("x-better-ccflare-attempt-id");
-		const turnStateHeaderPresent = response.headers.has("x-codex-turn-state");
-		const turnState = response.headers.get("x-codex-turn-state");
+		const turnStateHeaderPresent = response.headers.has(
+			CODEX_TURN_STATE_HEADER,
+		);
+		const turnState = response.headers.get(CODEX_TURN_STATE_HEADER);
 		const finalModel =
 			response.headers.get("x-better-ccflare-final-model") ?? undefined;
 		const headerRequestedStream = response.headers.get(
@@ -1481,12 +1548,21 @@ export class CodexProvider extends BaseProvider {
 			);
 		}
 
+		const turnStateTerminalAction = attemptId
+			? this.turnStateCoordinator.finalizeAttempt({
+					attemptId,
+					stopReason: "error",
+					responseTurnState: turnState,
+					outputLineage: { kind: "none" },
+				})
+			: "unknown_attempt";
 		writeCodexResponseTrace({
 			requestId: requestId ?? "unknown",
 			attemptId: attemptId ?? undefined,
 			modelOut: finalModel ?? "unknown",
 			turnStateHeaderPresent,
 			turnState,
+			turnStateTerminalAction,
 			summary: summarizeCodexResponse(
 				[],
 				{},
@@ -2928,14 +3004,28 @@ export class CodexProvider extends BaseProvider {
 			functionCallBytesTotal: 0,
 			sawToolUse: false,
 			traceNewToolCalls: [],
+			turnStateOutputCallFingerprints: [],
+			turnStateOutputCallsInvalid: false,
 			traceReasoningOutputItemCount: 0,
 			traceReasoningEncryptedPresent: false,
 			traceReasoningUnrepresentableIdSkipCount: 0,
 			pendingReasoningBlocks: [],
 			traceRequestId: requestId,
 			traceAttemptId: attemptId,
-			traceTurnStateHeaderPresent: response.headers.has("x-codex-turn-state"),
-			traceTurnState: response.headers.get("x-codex-turn-state"),
+			traceTurnStateHeaderPresent: response.headers.has(
+				CODEX_TURN_STATE_HEADER,
+			),
+			traceTurnState: response.headers.get(CODEX_TURN_STATE_HEADER),
+			turnStateTerminalAction: null,
+			finalizeTurnState: (stopReason, outputLineage) =>
+				attemptId
+					? this.turnStateCoordinator.finalizeAttempt({
+							attemptId,
+							stopReason,
+							responseTurnState: response.headers.get(CODEX_TURN_STATE_HEADER),
+							outputLineage,
+						})
+					: "unknown_attempt",
 			traceResponseId: null,
 			lastProgressPingAt: null,
 			terminalTraceWritten: false,
@@ -3584,9 +3674,14 @@ export class CodexProvider extends BaseProvider {
 					});
 					state.hasSentContentBlockStart = true;
 					if (outputIndex !== undefined) {
+						const callIdFingerprint = fingerprintCodexTurnStateCallId(callId);
+						if (!callIdFingerprint) {
+							state.turnStateOutputCallsInvalid = true;
+						}
 						state.functionCallBlocks.set(outputIndex, {
 							contentBlockIndex: blockIdx,
 							name,
+							callIdFingerprint,
 							arguments: [],
 							bytes: 0,
 						});
@@ -3704,6 +3799,13 @@ export class CodexProvider extends BaseProvider {
 							name: buffer.name,
 							arg_preview: partialJson.slice(0, 120),
 						});
+						if (buffer.callIdFingerprint) {
+							state.turnStateOutputCallFingerprints.push(
+								buffer.callIdFingerprint,
+							);
+						} else {
+							state.turnStateOutputCallsInvalid = true;
+						}
 						await writeSSE("content_block_delta", {
 							type: "content_block_delta",
 							index: buffer.contentBlockIndex,
