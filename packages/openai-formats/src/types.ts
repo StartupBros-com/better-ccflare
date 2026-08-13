@@ -167,6 +167,8 @@ export interface TransformStreamContext {
 	cacheReadInputTokens?: number;
 	cacheCreationInputTokens?: number;
 	encounteredToolCall: boolean;
+	/** A provider error terminal was emitted; no synthetic success may follow. */
+	terminalErrorSeen: boolean;
 	toolCallAccumulators: Record<number, string>;
 	/**
 	 * Monotonic counter for Anthropic content_block indices.

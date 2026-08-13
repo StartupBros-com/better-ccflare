@@ -425,6 +425,88 @@ describe("transformStreamingResponse — text responses", () => {
 		const types = events.map((e) => e.event);
 		expect(types).toContain("content_block_stop");
 	});
+
+	it("surfaces an upstream SSE error object without fabricating success", async () => {
+		const upstream = makeOpenAIStream([
+			JSON.stringify({
+				error: {
+					type: "permission_error",
+					code: "login_required",
+					message: "Sign-in is required",
+				},
+			}),
+			"[DONE]",
+		]);
+
+		const transformed = transformStreamingResponse(upstream);
+		const events = parseSSEEvents(await readStream(transformed.body));
+		const errorEvent = events.find((event) => event.event === "error");
+
+		expect(errorEvent).toBeDefined();
+		if (!errorEvent) throw new Error("expected an Anthropic error event");
+		expect(parseEventData(errorEvent)).toEqual({
+			type: "error",
+			error: {
+				type: "permission_error",
+				code: "login_required",
+				message: "Sign-in is required",
+			},
+		});
+		expect(events.some((event) => event.event === "message_start")).toBe(true);
+		expect(events.some((event) => event.event === "message_delta")).toBe(false);
+		expect(events.some((event) => event.event === "message_stop")).toBe(false);
+	});
+
+	it("closes committed content before a streaming provider error", async () => {
+		const upstream = makeOpenAIStream([
+			JSON.stringify({
+				model: "grok-4",
+				choices: [{ delta: { content: "partial" }, finish_reason: null }],
+			}),
+			JSON.stringify({
+				error: {
+					type: "permission_error",
+					code: "usage_not_included",
+					message: "Plan does not include usage",
+				},
+			}),
+			"[DONE]",
+		]);
+
+		const transformed = transformStreamingResponse(upstream);
+		const events = parseSSEEvents(await readStream(transformed.body));
+		const types = events.map((event) => event.event);
+		const errorIndex = types.indexOf("error");
+		const stopIndex = types.indexOf("content_block_stop");
+
+		expect(stopIndex).toBeGreaterThan(-1);
+		expect(stopIndex).toBeLessThan(errorIndex);
+		expect(types.filter((type) => type === "error")).toHaveLength(1);
+		expect(types).not.toContain("message_stop");
+	});
+
+	it("bounds unsafe streaming provider error fields", async () => {
+		const upstream = makeOpenAIStream([
+			JSON.stringify({
+				error: {
+					type: "permission error with spaces",
+					code: "bad code\nwith controls",
+					message: "x".repeat(2_000),
+				},
+			}),
+		]);
+
+		const transformed = transformStreamingResponse(upstream);
+		const events = parseSSEEvents(await readStream(transformed.body));
+		const errorEvent = events.find((event) => event.event === "error");
+
+		expect(errorEvent).toBeDefined();
+		if (!errorEvent) throw new Error("expected an Anthropic error event");
+		const payload = parseEventData(errorEvent);
+		expect(payload.error.type).toBe("api_error");
+		expect(payload.error.code).toBeUndefined();
+		expect(payload.error.message).toHaveLength(1_024);
+	});
 });
 
 // ── transformStreamingResponse — tool call stream ────────────────────────────
