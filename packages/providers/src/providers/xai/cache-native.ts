@@ -8,6 +8,7 @@ import {
 	formatXaiCacheCanary,
 	isOfficialXaiEndpoint,
 } from "@better-ccflare/core";
+import type { Account } from "@better-ccflare/types";
 
 /** Opt-in: set to "1" to enable the Grok Chat cache-native vertical slice. */
 export const XAI_CACHE_NATIVE_ENV = "CCFLARE_XAI_CACHE_NATIVE";
@@ -28,6 +29,23 @@ export function isXaiCacheNativeEnabled(
 	env: NodeJS.ProcessEnv = process.env,
 ): boolean {
 	return env[XAI_CACHE_NATIVE_ENV] === "1";
+}
+
+/**
+ * Replace an untrusted client affinity header only for an eligible official xAI
+ * request. Stripping happens before every guard so feature-off, non-xAI, custom
+ * endpoint, and missing-identity paths cannot forward a caller-supplied value.
+ */
+export function applyXaiConvIdHeader(
+	headers: Headers,
+	providerName: string,
+	account: Account | null | undefined,
+	convId: string | null,
+): void {
+	headers.delete(XAI_CONV_ID_HEADER);
+	if (providerName === "xai" && convId && isOfficialXaiEndpoint(account)) {
+		headers.set(XAI_CONV_ID_HEADER, convId);
+	}
 }
 
 export function deriveXaiConvId(

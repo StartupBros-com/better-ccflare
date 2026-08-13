@@ -15,6 +15,7 @@ import {
 import type { RateLimitInfo, TokenRefreshResult } from "../../types";
 import { OpenAICompatibleProvider } from "../openai/provider";
 import {
+	applyXaiConvIdHeader,
 	deriveXaiConversationIdentity,
 	isOfficialXaiEndpoint,
 	isXaiCacheNativeEnabled,
@@ -244,38 +245,51 @@ export class XaiProvider extends OpenAICompatibleProvider {
 		request: Request,
 		account?: Account,
 	): Promise<Request> {
+		const sanitizedHeaders = new Headers(request.headers);
+		applyXaiConvIdHeader(sanitizedHeaders, this.name, account, null);
+		const sanitizedRequest = new Request(request, {
+			headers: sanitizedHeaders,
+		});
 		if (!isXaiCacheNativeEnabled() || !isOfficialXaiEndpoint(account)) {
-			return super.transformRequestBody(request, account);
+			return super.transformRequestBody(sanitizedRequest, account);
 		}
 
 		let originalBody: Record<string, unknown> | null = null;
 		try {
-			const contentType = request.headers.get("content-type");
+			const contentType = sanitizedRequest.headers.get("content-type");
 			if (contentType?.includes("application/json")) {
-				const clone = request.clone();
+				const clone = sanitizedRequest.clone();
 				originalBody = (await clone.json()) as Record<string, unknown>;
 			}
 		} catch {
 			originalBody = null;
 		}
 
-		const transformed = await super.transformRequestBody(request, account);
-		if (!originalBody) return transformed;
-
-		const identity = deriveXaiConversationIdentity(originalBody);
-		if (!identity) {
+		const transformed = await super.transformRequestBody(
+			sanitizedRequest,
+			account,
+		);
+		const identity = originalBody
+			? deriveXaiConversationIdentity(originalBody)
+			: undefined;
+		if (originalBody && !identity) {
 			cacheLog.debug(
 				"cache-native enabled but conversation identity omitted (bad metadata)",
 			);
-			return transformed;
 		}
 
 		const headers = new Headers(transformed.headers);
-		// Always overwrite any client-supplied value with the provider-derived one.
-		headers.set(XAI_CONV_ID_HEADER, identity.headerValue);
-		cacheLog.info(
-			`attach ${XAI_CONV_ID_HEADER} id=${identity.identityFingerprint} prefix=${identity.prefixFingerprint} account=${account?.id ?? "none"}`,
+		applyXaiConvIdHeader(
+			headers,
+			this.name,
+			account,
+			identity?.headerValue ?? null,
 		);
+		if (identity) {
+			cacheLog.info(
+				`attach ${XAI_CONV_ID_HEADER} id=${identity.identityFingerprint} prefix=${identity.prefixFingerprint} account=${account?.id ?? "none"}`,
+			);
+		}
 
 		return new Request(transformed.url, {
 			method: transformed.method,

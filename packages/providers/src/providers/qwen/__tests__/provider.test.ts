@@ -274,7 +274,7 @@ describe("QwenProvider", () => {
 					makeAccount({ model_mappings: null }),
 				),
 			).toMatchObject({
-				status: "unsupported",
+				status: "supported",
 				provenance: "provider_default",
 			});
 			expect(

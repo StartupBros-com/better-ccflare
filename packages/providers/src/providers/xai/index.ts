@@ -1,4 +1,5 @@
 export {
+	applyXaiConvIdHeader,
 	CACHE_FLIGHT_RECORDER_ENV,
 	cacheOutcomeFromTokens,
 	deriveCacheFlightRecorderId,

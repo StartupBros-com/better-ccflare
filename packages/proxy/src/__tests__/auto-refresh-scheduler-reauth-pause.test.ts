@@ -9,7 +9,6 @@
 import { describe, expect, it, mock } from "bun:test";
 import { OAuthRefreshTokenError } from "@better-ccflare/core";
 import { registerProvider } from "@better-ccflare/providers";
-import type { AutoRefreshScheduler } from "../auto-refresh-scheduler";
 
 function makeDb(rows: Array<Record<string, unknown>>) {
 	return {
@@ -19,15 +18,17 @@ function makeDb(rows: Array<Record<string, unknown>>) {
 	};
 }
 
-function makeProxyContext(pauseResult = true) {
-	const pauseAccountIfActive = mock(async () => pauseResult);
+function makeProxyContext(flagResult = true) {
+	const flagRequiresReauthIfTokenMatches = mock(
+		async (_accountId: string, _refreshToken: string) => flagResult,
+	);
 	return {
 		context: {
 			runtime: { port: 8080, clientId: "test-client" },
 			refreshInFlight: new Map(),
-			dbOps: { pauseAccountIfActive },
+			dbOps: { flagRequiresReauthIfTokenMatches },
 		},
-		pauseAccountIfActive,
+		flagRequiresReauthIfTokenMatches,
 	};
 }
 
@@ -39,7 +40,7 @@ async function makeScheduler(
 	return new AutoRefreshScheduler(
 		db as never,
 		proxyContext as never,
-	) as AutoRefreshScheduler & {
+	) as unknown as {
 		checkAndRefreshOpenAICompatibleOAuthTokens(): Promise<void>;
 		checkAndRefreshCodexTokens(): Promise<void>;
 	};
@@ -67,14 +68,17 @@ describe("AutoRefreshScheduler — proactive refresh pause-for-reauth", () => {
 		const db = makeDb([
 			{ ...baseRow, provider: "test-openai-compat-provider" },
 		]);
-		const { context, pauseAccountIfActive } = makeProxyContext(true);
+		const { context, flagRequiresReauthIfTokenMatches } =
+			makeProxyContext(true);
 		const scheduler = await makeScheduler(db, context);
 
 		await scheduler.checkAndRefreshOpenAICompatibleOAuthTokens();
 
-		expect(pauseAccountIfActive).toHaveBeenCalledTimes(1);
-		expect(pauseAccountIfActive.mock.calls[0][0]).toBe("acc-oauth-proactive");
-		expect(pauseAccountIfActive.mock.calls[0][1]).toBe("oauth_invalid_grant");
+		expect(flagRequiresReauthIfTokenMatches).toHaveBeenCalledTimes(1);
+		expect(flagRequiresReauthIfTokenMatches).toHaveBeenCalledWith(
+			"acc-oauth-proactive",
+			"rt-1",
+		);
 	});
 
 	it("does not pause a qwen/xai-provider account on a transient refresh failure", async () => {
@@ -89,12 +93,13 @@ describe("AutoRefreshScheduler — proactive refresh pause-for-reauth", () => {
 		const db = makeDb([
 			{ ...baseRow, provider: "test-openai-compat-provider" },
 		]);
-		const { context, pauseAccountIfActive } = makeProxyContext(true);
+		const { context, flagRequiresReauthIfTokenMatches } =
+			makeProxyContext(true);
 		const scheduler = await makeScheduler(db, context);
 
 		await scheduler.checkAndRefreshOpenAICompatibleOAuthTokens();
 
-		expect(pauseAccountIfActive).not.toHaveBeenCalled();
+		expect(flagRequiresReauthIfTokenMatches).not.toHaveBeenCalled();
 	});
 
 	it("pauses a codex account when refreshToken throws OAuthRefreshTokenError", async () => {
@@ -107,14 +112,17 @@ describe("AutoRefreshScheduler — proactive refresh pause-for-reauth", () => {
 		} as never);
 
 		const db = makeDb([{ ...baseRow, provider: "test-codex-provider" }]);
-		const { context, pauseAccountIfActive } = makeProxyContext(true);
+		const { context, flagRequiresReauthIfTokenMatches } =
+			makeProxyContext(true);
 		const scheduler = await makeScheduler(db, context);
 
 		await scheduler.checkAndRefreshCodexTokens();
 
-		expect(pauseAccountIfActive).toHaveBeenCalledTimes(1);
-		expect(pauseAccountIfActive.mock.calls[0][0]).toBe("acc-oauth-proactive");
-		expect(pauseAccountIfActive.mock.calls[0][1]).toBe("oauth_invalid_grant");
+		expect(flagRequiresReauthIfTokenMatches).toHaveBeenCalledTimes(1);
+		expect(flagRequiresReauthIfTokenMatches).toHaveBeenCalledWith(
+			"acc-oauth-proactive",
+			"rt-1",
+		);
 	});
 
 	it("does not pause a codex account on a transient refresh failure", async () => {
@@ -127,11 +135,12 @@ describe("AutoRefreshScheduler — proactive refresh pause-for-reauth", () => {
 		} as never);
 
 		const db = makeDb([{ ...baseRow, provider: "test-codex-provider" }]);
-		const { context, pauseAccountIfActive } = makeProxyContext(true);
+		const { context, flagRequiresReauthIfTokenMatches } =
+			makeProxyContext(true);
 		const scheduler = await makeScheduler(db, context);
 
 		await scheduler.checkAndRefreshCodexTokens();
 
-		expect(pauseAccountIfActive).not.toHaveBeenCalled();
+		expect(flagRequiresReauthIfTokenMatches).not.toHaveBeenCalled();
 	});
 });

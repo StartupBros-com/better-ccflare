@@ -2,6 +2,7 @@ import {
 	authFailureEvents,
 	CLAUDE_MODEL_IDS,
 	getClientVersion,
+	OAuthRefreshTokenError,
 	PAUSE_REASON_NEEDS_REAUTH,
 	registerHeartbeat,
 	requestEvents,
@@ -804,6 +805,7 @@ export class AutoRefreshScheduler {
 				-- Never probe an account already flagged for manual re-auth: its
 				-- refresh token is known dead, so the probe is a guaranteed fail and
 				-- recovery is only the manual re-auth clear-site.
+				AND COALESCE(paused, 0) = 0
 				AND COALESCE(requires_reauth, 0) = 0
 				AND (
 					access_token IS NULL
@@ -999,6 +1001,7 @@ export class AutoRefreshScheduler {
 				-- Never probe an account already flagged for manual re-auth: its
 				-- refresh token is known dead, so the probe is a guaranteed fail and
 				-- recovery is only the manual re-auth clear-site.
+				AND COALESCE(paused, 0) = 0
 				AND COALESCE(requires_reauth, 0) = 0
 				AND (
 					access_token IS NULL
@@ -1197,7 +1200,10 @@ export class AutoRefreshScheduler {
 		row: { id: string; name: string; provider: string; refresh_token: string },
 	): Promise<void> {
 		const message = error instanceof Error ? error.message : String(error);
-		const reason = extractAuthFailureReason(message, row.name);
+		const reason =
+			error instanceof OAuthRefreshTokenError
+				? "invalid_grant"
+				: extractAuthFailureReason(message, row.name);
 		if (!reason) return;
 
 		if (getPendingRotation(row.id)) {

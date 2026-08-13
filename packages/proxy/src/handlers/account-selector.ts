@@ -586,43 +586,6 @@ export function getXaiConvId(meta: RequestMeta): string | null {
 	return xaiConvIdMap.get(meta) ?? null;
 }
 
-export const XAI_AFFINITY_TTL_MS = 30 * 60 * 1000;
-export const XAI_AFFINITY_MAX_ENTRIES = 1024;
-
-interface XaiAffinityEntry {
-	accountId: string;
-	assignedAt: number;
-}
-
-const xaiConvAffinity = new Map<string, XaiAffinityEntry>();
-
-export function resetXaiCacheAffinityForTests(): void {
-	xaiConvAffinity.clear();
-}
-
-function evictOldestXaiAffinityEntryIfOverCap(): void {
-	if (xaiConvAffinity.size <= XAI_AFFINITY_MAX_ENTRIES) return;
-	let oldestKey: string | null = null;
-	let oldestAssignedAt = Number.POSITIVE_INFINITY;
-	for (const [key, entry] of xaiConvAffinity) {
-		if (entry.assignedAt < oldestAssignedAt) {
-			oldestAssignedAt = entry.assignedAt;
-			oldestKey = key;
-		}
-	}
-	if (oldestKey !== null) xaiConvAffinity.delete(oldestKey);
-}
-
-export function recordXaiAffinitySuccess(
-	meta: RequestMeta,
-	accountId: string,
-): void {
-	const convId = getXaiConvId(meta);
-	if (!convId) return;
-	xaiConvAffinity.set(convId, { accountId, assignedAt: Date.now() });
-	evictOldestXaiAffinityEntryIfOverCap();
-}
-
 // Deliberately kept even though our fork replaced upstream's model-capacity.ts
 // module wholesale (see account-selector's hard-capacity system below): this
 // one flag is an unrelated, additive combo-isolation safety valve with no
@@ -1881,6 +1844,7 @@ async function selectAccountsForRequestInternal(
 			if (!forcedAccount) {
 				throw new ForceRouteUnavailableError(forcedAccountId, "not_found");
 			}
+			setXaiCacheEligibleAccounts(meta, [forcedAccount]);
 			if (
 				serverForcedAccountId &&
 				isProviderExcludedForRequest(forcedAccount, getExcludedProviders(meta))

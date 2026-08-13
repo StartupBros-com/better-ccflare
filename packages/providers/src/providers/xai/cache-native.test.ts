@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import type { Account } from "@better-ccflare/types";
 import {
+	applyXaiConvIdHeader,
 	CACHE_FLIGHT_RECORDER_ENV,
 	cacheOutcomeFromTokens,
 	deriveCacheFlightRecorderId,
@@ -11,6 +12,7 @@ import {
 	isOfficialXaiEndpoint,
 	isXaiCacheNativeEnabled,
 	XAI_CACHE_NATIVE_ENV,
+	XAI_CONV_ID_HEADER,
 } from "./cache-native";
 
 const SESSION_A = "11111111-1111-4111-8111-111111111111";

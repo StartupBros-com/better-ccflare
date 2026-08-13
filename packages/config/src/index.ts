@@ -1274,7 +1274,26 @@ export class Config extends EventEmitter {
 	getProviderModelDefaultOverrides(): ProviderModelDefaultOverrides {
 		const value = this.data.provider_model_default_overrides;
 		if (!value || typeof value !== "object" || Array.isArray(value)) return {};
-		return value as ProviderModelDefaultOverrides;
+
+		const sanitized: ProviderModelDefaultOverrides = {};
+		for (const [provider, rawFamilies] of Object.entries(value)) {
+			if (
+				!provider.trim() ||
+				typeof rawFamilies !== "object" ||
+				rawFamilies === null ||
+				Array.isArray(rawFamilies)
+			) {
+				continue;
+			}
+			const families: Record<string, string> = {};
+			for (const [family, rawModel] of Object.entries(rawFamilies)) {
+				if (!family.trim() || typeof rawModel !== "string") continue;
+				const model = rawModel.trim();
+				if (model) families[family] = model;
+			}
+			if (Object.keys(families).length > 0) sanitized[provider] = families;
+		}
+		return sanitized;
 	}
 
 	setProviderModelDefaultOverrides(
@@ -1292,10 +1311,13 @@ export class Config extends EventEmitter {
 		if (!raw?.trim()) {
 			return [..._DEFAULT_PROVIDER_MODEL_DEFAULTS_PROVIDERS];
 		}
-		return raw
+		const providers = raw
 			.split(",")
 			.map((provider) => provider.trim())
 			.filter(Boolean);
+		return providers.length > 0
+			? providers
+			: [..._DEFAULT_PROVIDER_MODEL_DEFAULTS_PROVIDERS];
 	}
 
 	getOutboundProxy(): string | undefined {

@@ -7,8 +7,12 @@ import {
 	mock,
 	spyOn,
 } from "bun:test";
+import { ANTHROPIC_DEGRADED_MODE_DEFAULTS } from "@better-ccflare/config";
 import { CodexProvider, XaiProvider } from "@better-ccflare/providers";
 import type { Account, RequestMeta } from "@better-ccflare/types";
+import { AnthropicDegradedModeCoordinator } from "../../anthropic-degraded-mode";
+import { DegradedModeObservability } from "../../anthropic-degraded-observability";
+import { DegradedOwnerOverlay } from "../../degraded-owner-overlay";
 import * as usageCollectorModule from "../../usage-collector";
 import { setXaiConvId } from "../account-selector";
 import { proxyWithAccount } from "../proxy-operations";
@@ -43,6 +47,7 @@ function makeXaiAccount(overrides: Partial<Account> = {}): Account {
 		session_start: null,
 		session_request_count: 0,
 		paused: false,
+		requires_reauth: false,
 		rate_limit_reset: null,
 		rate_limit_status: null,
 		rate_limit_remaining: null,
@@ -82,6 +87,7 @@ function makeCodexAccount(overrides: Partial<Account> = {}): Account {
 		session_start: null,
 		session_request_count: 0,
 		paused: false,
+		requires_reauth: false,
 		rate_limit_reset: null,
 		rate_limit_status: null,
 		rate_limit_remaining: null,
@@ -113,8 +119,25 @@ function makeRequestMeta(path = "/v1/messages"): RequestMeta {
 }
 
 function makeProxyContext(provider: XaiProvider | CodexProvider): ProxyContext {
+	const anthropicDegradedMode = new AnthropicDegradedModeCoordinator({
+		config: {
+			...ANTHROPIC_DEGRADED_MODE_DEFAULTS,
+			mode: "off",
+		},
+	});
 	return {
 		strategy: { getNextAccount: () => null } as never,
+		anthropicDegradedMode,
+		anthropicDegradedObservability: new DegradedModeObservability({
+			mode: "off",
+			largeRequestTokenThreshold:
+				anthropicDegradedMode.config.largeRequestTokenThreshold,
+			largeRequestByteThreshold:
+				anthropicDegradedMode.config.largeRequestByteThreshold,
+		}),
+		degradedOwnerOverlay: new DegradedOwnerOverlay(),
+		degradedOwnerShadowOverlay: new DegradedOwnerOverlay(),
+		serverToolReplay: Object.freeze({ status: "disabled" }),
 		dbOps: {
 			markAccountRateLimited: mock(() =>
 				Promise.resolve({ consecutiveRateLimits: 1, applied: true }),
@@ -215,7 +238,7 @@ describe("proxyWithAccount — xAI cache-native conv-id header attachment", () =
 			0,
 			ctx,
 		);
-		await result?.text();
+		if (result instanceof Response) await result.text();
 		return result;
 	}
 
@@ -266,7 +289,7 @@ describe("proxyWithAccount — xAI cache-native conv-id header attachment", () =
 			0,
 			ctx,
 		);
-		await result?.text();
+		if (result instanceof Response) await result.text();
 
 		expect(fetchMock).toHaveBeenCalledTimes(1);
 		expect(fetchedRequest?.headers.get(XAI_CONV_ID_HEADER)).toBeNull();

@@ -107,6 +107,39 @@ export class CacheAffinityOrderer {
 		private readonly maxEntries = DEFAULT_MAX_ENTRIES,
 	) {}
 
+	recordSuccess(
+		meta: RequestMeta,
+		candidateId: string,
+		accountId: string,
+	): void {
+		const key = meta.cacheAffinityKey;
+		const eligibleIds = meta.xaiCacheEligibleAccountIds;
+		if (
+			!meta.xaiCacheNativeActive ||
+			!key ||
+			!eligibleIds ||
+			eligibleIds.size === 0
+		) {
+			return;
+		}
+
+		if (!eligibleIds.has(accountId)) return;
+		const knownCandidate = [
+			...(meta.routingCandidates ?? []),
+			...(meta.routingCandidateCatalog ?? []),
+		].find(
+			(entry) =>
+				entry.candidateId === candidateId && entry.accountId === accountId,
+		);
+		const syntheticCandidate =
+			candidateId === `account:${accountId}` ||
+			candidateId.startsWith(`capacity-deferred:${accountId}:`);
+		if (!knownCandidate && !syntheticCandidate) return;
+
+		if (!this.affinity.has(key)) this.evictOldestIfFull();
+		this.affinity.set(key, { candidateId, assignedAt: Date.now() });
+	}
+
 	order(accounts: Account[], meta: RequestMeta): Account[] {
 		const key = meta.cacheAffinityKey;
 		const eligibleIds = meta.xaiCacheEligibleAccountIds;
@@ -135,17 +168,8 @@ export class CacheAffinityOrderer {
 		const eligible = pairs.filter((pair) => eligibleIds.has(pair.account.id));
 		if (eligible.length === 0) return accounts;
 
-		let mapping = this.affinity.get(key);
-		if (!mapping) {
-			const owner = eligible[0];
-			if (!owner) return accounts;
-			this.evictOldestIfFull();
-			mapping = {
-				candidateId: owner.routing.candidateId,
-				assignedAt: now,
-			};
-			this.affinity.set(key, mapping);
-		}
+		const mapping = this.affinity.get(key);
+		if (!mapping) return accounts;
 
 		const best = eligible[0];
 		if (!best) return accounts;
@@ -154,31 +178,27 @@ export class CacheAffinityOrderer {
 		);
 		if (!owner) {
 			const catalogOwner = meta.routingCandidateCatalog?.find(
-				(candidate) => candidate.candidateId === mapping?.candidateId,
+				(candidate) => candidate.candidateId === mapping.candidateId,
 			);
 			const bestTier =
 				minimumRoutableTier(eligible.map((pair) => pair.routing.tier)) ??
 				best.routing.tier;
 			if (catalogOwner && catalogOwner.tier < bestTier) {
-				// Legal snapback: only a configured strictly-better owner survives a
-				// transient absence. Refresh while the conversation remains active.
-				mapping.assignedAt = now;
+				// Legal snapback: a confirmed, strictly-better configured owner may
+				// survive a transient absence, but selection never refreshes its TTL.
 				return accounts;
 			}
 
-			// Equal/worse (or removed) unavailable owners are stale ownership, not
-			// cache affinity. The current authoritative candidate becomes owner.
-			mapping.candidateId = best.routing.candidateId;
-			mapping.assignedAt = now;
+			// Equal/worse (or removed) unavailable owners cannot legally snap back.
+			// Clear the stale mapping without presuming the current leader succeeded.
+			this.affinity.delete(key);
 			return accounts;
 		}
 
 		const ownerVsBest = compareRoutingClass(owner, best, meta);
 		if (ownerVsBest > 0) {
-			// A routable better tier, or a comparable higher-pressure candidate
-			// inside the same tier, replaces the old owner immediately.
-			mapping.candidateId = best.routing.candidateId;
-			mapping.assignedAt = now;
+			// Configured tier and comparable quota pressure outrank affinity. Keep
+			// the confirmed mapping until a candidate actually serves the request.
 			return accounts;
 		}
 
@@ -190,13 +210,9 @@ export class CacheAffinityOrderer {
 			// R13 anti-thrash: SessionAffinityStrategy already declined to
 			// promote this same candidate this request because it flapped
 			// inside the anti-thrash window. Honor that suppression instead of
-			// re-promoting it ahead of the already-committed first candidate;
-			// the mapping itself is left untouched so promotion resumes on its
-			// own once the window elapses and the annotation stops appearing.
-			mapping.assignedAt = now;
+			// re-promoting it ahead of the already-committed first candidate.
 			return accounts;
 		}
-		mapping.assignedAt = now;
 
 		const ownerIndex = eligible.indexOf(owner);
 		const orderedEligible = [

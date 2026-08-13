@@ -1360,13 +1360,12 @@ describe("selectAccountsForRequest — Grok cache-native ownership", () => {
 		});
 		ctx.cacheAffinityOrderer = new CacheAffinityOrderer(60_000);
 
-		const first = await selectAccountsForRequest(
-			makeRequestMeta({
-				xaiCacheNativeActive: true,
-				cacheAffinityKey: "conversation",
-			}),
-			ctx,
-		);
+		const firstMeta = makeRequestMeta({
+			xaiCacheNativeActive: true,
+			cacheAffinityKey: "conversation",
+		});
+		const first = await selectAccountsForRequest(firstMeta, ctx);
+		ctx.cacheAffinityOrderer.recordSuccess(firstMeta, "account:xai-a", a.id);
 		const second = await selectAccountsForRequest(
 			makeRequestMeta({
 				xaiCacheNativeActive: true,
@@ -1421,11 +1420,16 @@ describe("selectAccountsForRequest — Grok cache-native ownership", () => {
 			cacheAffinityKey: "managed-conversation",
 		};
 
+		const firstMeta = makeRequestMeta(affinity);
 		const first = await selectAccountsForRequest(
-			makeRequestMeta(affinity),
+			firstMeta,
 			ctx,
 			"claude-fable-5",
 		);
+		const firstCandidateId = firstMeta.routingCandidates?.[0]?.candidateId;
+		if (!firstCandidateId)
+			throw new Error("expected managed candidate identity");
+		ctx.cacheAffinityOrderer.recordSuccess(firstMeta, firstCandidateId, a.id);
 		reverseStrategy = true;
 		const equalTierMeta = makeRequestMeta({ ...affinity, id: "req-equal" });
 		const equalTier = await selectAccountsForRequest(
@@ -1489,10 +1493,15 @@ describe("selectAccountsForRequest — Grok cache-native ownership", () => {
 			cacheAffinityKey: "conversation",
 		};
 
-		await selectAccountsForRequest(
-			makeRequestMeta(affinity),
-			ctx,
-			"claude-sonnet-4-5",
+		const initialMeta = makeRequestMeta(affinity);
+		await selectAccountsForRequest(initialMeta, ctx, "claude-sonnet-4-5");
+		const initialCandidateId = initialMeta.routingCandidates?.[0]?.candidateId;
+		if (!initialCandidateId)
+			throw new Error("expected combo candidate identity");
+		ctx.cacheAffinityOrderer.recordSuccess(
+			initialMeta,
+			initialCandidateId,
+			a.id,
 		);
 		const reversedCombo = makeCombo([
 			{
@@ -1590,10 +1599,15 @@ describe("selectAccountsForRequest — Grok cache-native ownership", () => {
 			cacheAffinityKey: "repeated-slot-conversation",
 		};
 
-		await selectAccountsForRequest(
-			makeRequestMeta(affinity),
-			ctx,
-			"claude-sonnet-4-5",
+		const initialMeta = makeRequestMeta(affinity);
+		await selectAccountsForRequest(initialMeta, ctx, "claude-sonnet-4-5");
+		const initialCandidateId = initialMeta.routingCandidates?.[0]?.candidateId;
+		if (!initialCandidateId)
+			throw new Error("expected combo candidate identity");
+		ctx.cacheAffinityOrderer.recordSuccess(
+			initialMeta,
+			initialCandidateId,
+			account.id,
 		);
 		(
 			ctx.dbOps.getComboRoutingPolicy as ReturnType<typeof mock>
@@ -2234,6 +2248,38 @@ describe("selectAccountsForRequest — combo routing", () => {
 		expect(slotInfo?.comboName).toBe("Test Combo");
 		expect(slotInfo?.slots[0]?.accountId).toBe("acc-1");
 		expect(slotInfo?.slots[0]?.modelOverride).toBe("claude-opus-4-5");
+	});
+
+	it("propagates an empty slot model as an empty passthrough override", async () => {
+		const account = makeAccount({ id: "acc-passthrough" });
+		const combo = makeCombo([
+			{
+				id: "slot-passthrough",
+				combo_id: "combo-1",
+				account_id: account.id,
+				model: "",
+				priority: 0,
+				enabled: true,
+			},
+		]);
+		const meta = makeRequestMeta();
+
+		const result = await selectAccountsForRequest(
+			meta,
+			makeCtx({ accounts: [account], activeCombo: combo }),
+			"claude-sonnet-4-5",
+		);
+
+		expect(result).toEqual([account]);
+		expect(getComboSlotInfo(meta)).toEqual({
+			comboName: "Test Combo",
+			slots: [{ accountId: account.id, modelOverride: "" }],
+		});
+		expect(meta.routingCandidates?.[0]).toMatchObject({
+			accountId: account.id,
+			comboSlotId: "slot-passthrough",
+			modelOverride: "",
+		});
 	});
 
 	it("sets meta.comboName when combo routing is active", async () => {

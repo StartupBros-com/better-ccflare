@@ -124,10 +124,12 @@ describe("device setup authentication", () => {
 	const protectedPaths = [
 		["/api/oauth/qwen/init", "POST"],
 		["/api/oauth/codex/init", "POST"],
-		["/api/oauth/qwen/status/job-1", "GET"],
-		["/api/oauth/codex/status/job-1", "GET"],
 		["/api/oauth/device-setup/jobs", "GET"],
 		["/api/oauth/device-setup/jobs/job-1", "GET"],
+	] as const;
+	const publicStatusPaths = [
+		["/api/oauth/qwen/status/job-1", "GET"],
+		["/api/oauth/codex/status/job-1", "GET"],
 	] as const;
 
 	function authWithActiveKeyCount(count: number): AuthService {
@@ -138,7 +140,7 @@ describe("device setup authentication", () => {
 		} as never);
 	}
 
-	test("does not exempt init, status, list, or job routes", async () => {
+	test("protects init, list, and job routes while exempting read-only status routes", async () => {
 		const auth = authWithActiveKeyCount(1);
 		for (const [path, method] of protectedPaths) {
 			expect(await auth.isPathExempt(path, method)).toBe(false);
@@ -148,6 +150,18 @@ describe("device setup authentication", () => {
 				method,
 			);
 			expect(result.isAuthenticated).toBe(false);
+		}
+		for (const [path, method] of publicStatusPaths) {
+			expect(await auth.isPathExempt(path, method)).toBe(true);
+			expect(
+				(
+					await auth.authenticateRequest(
+						new Request(`http://localhost${path}`, { method }),
+						path,
+						method,
+					)
+				).isAuthenticated,
+			).toBe(true);
 		}
 	});
 
@@ -170,7 +184,7 @@ describe("device setup authentication", () => {
 			(
 				await auth.authorizeEndpoint(
 					{ role: "admin" } as never,
-					protectedPaths[4][0],
+					protectedPaths[2][0],
 					"GET",
 				)
 			).authorized,
@@ -179,7 +193,7 @@ describe("device setup authentication", () => {
 			(
 				await auth.authorizeEndpoint(
 					{ role: "api-only" } as never,
-					protectedPaths[4][0],
+					protectedPaths[2][0],
 					"GET",
 				)
 			).authorized,

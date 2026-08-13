@@ -6,7 +6,6 @@ export {
 	ForceRouteUnavailableError,
 	getComboSlotInfo,
 	getRoutingCapacityContext,
-	recordXaiAffinitySuccess,
 	resolveEffectiveModel,
 	selectAccountsForRequest,
 	setComboSlotInfo,

@@ -62,6 +62,7 @@ export { OpenAICompatibleProvider } from "./openai/index";
 export { OpenRouterProvider } from "./openrouter/index";
 export { type VertexAIConfig, VertexAIProvider } from "./vertex-ai/index";
 export {
+	applyXaiConvIdHeader,
 	CACHE_FLIGHT_RECORDER_ENV,
 	cacheOutcomeFromTokens,
 	deriveCacheFlightRecorderId,

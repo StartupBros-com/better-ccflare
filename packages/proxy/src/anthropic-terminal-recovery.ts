@@ -485,7 +485,14 @@ export function createAnthropicTerminalRecoveryStream(
 			// purely for observability via streamTerminalState.
 			clientCancelled = true;
 			fireTerminalState();
-			return cancelUpstream(reason);
+			// A downstream cancel must resolve promptly. Continue the Bun native-buffer
+			// cleanup drain in the background, but abort the exact fetch-level signal
+			// immediately so a stuck reader cannot hold reader.cancel() until the drain
+			// deadline. Forced semantic recovery still uses the bounded background drain.
+			drainAbort?.abort(reason);
+			void cancelUpstream(reason).catch(() => {
+				// Client departure already owns the terminal; cleanup is best-effort.
+			});
 		},
 	});
 }

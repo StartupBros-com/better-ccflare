@@ -21,6 +21,8 @@ import {
 	ensureSchema,
 	runMigrations,
 } from "@better-ccflare/database";
+import { clearSession, recordServedAccount } from "@better-ccflare/proxy";
+import type { Account } from "@better-ccflare/types";
 import { APIRouter } from "../router";
 import type { APIContext } from "../types";
 
@@ -44,6 +46,8 @@ describe("APIRouter — GET /api/sessions/:sessionId/account (#318)", () => {
 			// routing/decode-guard behavior.
 			countActiveApiKeys: async () => 0,
 			getActiveApiKeys: async () => [],
+			getAllAccounts: async () =>
+				adapter.query<Account>("SELECT * FROM accounts"),
 			// createAccountsListHandler (called via the session-account route)
 			// also reads session-window token stats — none in these fixtures.
 			getStatsRepository: () => ({
@@ -70,6 +74,7 @@ describe("APIRouter — GET /api/sessions/:sessionId/account (#318)", () => {
 	});
 
 	afterEach(() => {
+		clearSession("session-abc");
 		db.close();
 	});
 
@@ -99,16 +104,18 @@ describe("APIRouter — GET /api/sessions/:sessionId/account (#318)", () => {
 			["r1", 1000, "POST", "/v1/messages", "acc-1", "session-abc"],
 		);
 
+		recordServedAccount("session-abc", "acc-1");
 		const url = new URL("http://localhost/api/sessions/session-abc/account");
 		const req = new Request(url);
 		const res = await router.handleRequest(url, req);
 		expect(res?.status).toBe(200);
 		const body = (await res?.json()) as {
-			status: string;
-			account?: { id: string };
+			success: boolean;
+			data: { status: string; account?: { id: string } };
 		};
-		expect(body.status).toBe("known");
-		expect(body.account?.id).toBe("acc-1");
+		expect(body.success).toBe(true);
+		expect(body.data.status).toBe("known");
+		expect(body.data.account?.id).toBe("acc-1");
 	});
 
 	it("does not match a POST to the same path (falls through to 404)", async () => {

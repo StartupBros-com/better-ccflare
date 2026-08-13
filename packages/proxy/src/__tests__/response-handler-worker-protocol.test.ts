@@ -624,7 +624,7 @@ describe("forwardToClient usage-collector protocol", () => {
 		await Promise.resolve();
 
 		expect(chunks).toHaveLength(1);
-		expect(upstreamCancel).toHaveBeenCalledTimes(1);
+		expect(upstreamCancel).not.toHaveBeenCalled();
 		expect(ends).toHaveLength(1);
 		expect(ends[0]).toMatchObject({
 			type: "end",
@@ -823,7 +823,7 @@ describe("forwardToClient usage-collector protocol", () => {
 		await Promise.resolve();
 
 		expect(chunks).toHaveLength(1);
-		expect(upstreamCancel).toHaveBeenCalledTimes(1);
+		expect(upstreamCancel).not.toHaveBeenCalled();
 		expect(ends).toHaveLength(1);
 		expect(ends[0]).toMatchObject({
 			type: "end",
@@ -852,7 +852,7 @@ describe("forwardToClient usage-collector protocol", () => {
 		await Promise.resolve();
 
 		expect(chunks).toHaveLength(1);
-		expect(upstreamCancel).toHaveBeenCalledTimes(1);
+		expect(upstreamCancel).not.toHaveBeenCalled();
 		expect(ends).toHaveLength(1);
 		expect(ends[0]).toMatchObject({
 			type: "end",
@@ -880,7 +880,7 @@ describe("forwardToClient usage-collector protocol", () => {
 		await waitFor(() => ends.length > 0);
 
 		expect(chunks).toHaveLength(1);
-		expect(upstreamCancel).toHaveBeenCalledTimes(1);
+		expect(upstreamCancel).not.toHaveBeenCalled();
 		expect(ends).toHaveLength(1);
 		expect(ends[0]).toMatchObject({
 			type: "end",
@@ -911,7 +911,7 @@ describe("forwardToClient usage-collector protocol", () => {
 		await Promise.resolve();
 
 		expect(chunks).toHaveLength(1);
-		expect(upstreamCancel).toHaveBeenCalledTimes(1);
+		expect(upstreamCancel).not.toHaveBeenCalled();
 		expect(ends).toHaveLength(1);
 		expect(ends[0]).toMatchObject({
 			type: "end",

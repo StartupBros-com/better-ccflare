@@ -18,6 +18,7 @@ import { Logger } from "@better-ccflare/logger";
 import { stripCacheControlFromOpenAIRequest } from "@better-ccflare/openai-formats";
 import type { Provider, ProviderAttemptPlan } from "@better-ccflare/providers";
 import {
+	applyXaiConvIdHeader,
 	buildServerToolCapabilityProofKey,
 	CODEX_CONVERSATION_ID_HEADER,
 	decideContextAdmission,
@@ -116,6 +117,7 @@ import {
 } from "../session-account-observer";
 import { combineChunks } from "../stream-tee";
 import { isModelRewrite } from "../worker-messages";
+import { getXaiConvId } from "./account-selector";
 import { cancelDiscardedResponseBody } from "./discard-body-cancel";
 import {
 	ERROR_MESSAGES,
@@ -2601,6 +2603,12 @@ export async function proxyWithAccount(
 				accessToken,
 				account.api_key || undefined,
 			);
+			applyXaiConvIdHeader(
+				prepared,
+				plan.providerName,
+				account,
+				getXaiConvId(requestMeta),
+			);
 			prepared.delete(CACHE_REPLAY_MODEL_HEADER);
 			if (plan.providerName === "codex") {
 				const logicalModel =
@@ -3037,6 +3045,16 @@ export async function proxyWithAccount(
 			// Preserve only trusted local synthetic-response markers; no
 			// x-better-ccflare-* metadata may reach a real upstream transport.
 			transportRequest = sanitizeInternalTransportHeaders(transportRequest);
+			const trustedTransportHeaders = new Headers(transportRequest.headers);
+			applyXaiConvIdHeader(
+				trustedTransportHeaders,
+				attemptPlan.providerName,
+				account,
+				getXaiConvId(requestMeta),
+			);
+			transportRequest = new Request(transportRequest, {
+				headers: trustedTransportHeaders,
+			});
 			const isSynthetic = isSyntheticProviderResponse(transportRequest);
 			latestPhysicalAnthropicCohortKey = isSynthetic
 				? null
@@ -3192,8 +3210,12 @@ export async function proxyWithAccount(
 		const internalRequestStream = transformedRequest.headers.get(
 			"x-better-ccflare-request-stream",
 		);
-		const xaiCacheKeyPresent = transformedRequest.headers.has("x-grok-conv-id");
 		const xaiCacheOfficialEndpoint = isOfficialXaiEndpoint(account);
+		const xaiCacheKeyPresent =
+			transformedRequest.headers.has("x-grok-conv-id") ||
+			(attemptPlan.providerName === "xai" &&
+				xaiCacheOfficialEndpoint &&
+				getXaiConvId(requestMeta) !== null);
 		const cacheFlightRecorderEligible =
 			attemptPlan.providerName === "xai" &&
 			url.pathname === "/v1/messages" &&

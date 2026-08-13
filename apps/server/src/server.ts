@@ -725,7 +725,21 @@ export async function refreshPollingAccessToken(
 		markAccountTokensFresh(account);
 	}
 
-	return getValidAccessToken(account, proxyContext);
+	const accessToken = await getValidAccessToken(account, proxyContext);
+	// The caller that started the refresh is mutated by getValidAccessToken. A
+	// concurrent caller can instead join an in-flight refresh owned by a different
+	// Account snapshot, so adopt the persisted winner only when this snapshot did
+	// not receive the returned access token itself.
+	if (account.access_token !== accessToken) {
+		const refreshedAccount = await proxyContext.dbOps.getAccount(account.id);
+		if (refreshedAccount?.access_token === accessToken) {
+			account.access_token = refreshedAccount.access_token;
+			account.refresh_token = refreshedAccount.refresh_token;
+			account.expires_at = refreshedAccount.expires_at;
+			markAccountTokensFresh(account);
+		}
+	}
+	return accessToken;
 }
 
 /**
