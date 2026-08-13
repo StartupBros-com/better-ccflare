@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
 import {
 	chmodSync,
+	existsSync,
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
@@ -56,7 +57,7 @@ function writeFixturePrograms(dir: string): {
 			'import http from "node:http";',
 			'const portIndex = process.argv.indexOf("--port");',
 			"const port = Number(process.argv[portIndex + 1]);",
-			'appendFileSync(`${process.env.CAPTURE_DIR}/upstream.json`, JSON.stringify({ secret: process.env.CCFLARE_GUARD_CORRELATION_SECRET, argv: process.argv }) + "\\n");',
+			'appendFileSync(`${process.env.CAPTURE_DIR}/upstream.json`, JSON.stringify({ pid: process.pid, secret: process.env.CCFLARE_GUARD_CORRELATION_SECRET, argv: process.argv }) + "\\n");',
 			"const server = http.createServer((_req, res) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{}'); });",
 			"server.listen(port, '127.0.0.1');",
 			"process.on('SIGTERM', () => server.close(() => process.exit(0)));",
@@ -67,12 +68,10 @@ function writeFixturePrograms(dir: string): {
 		[
 			'import { appendFileSync } from "node:fs";',
 			'import http from "node:http";',
-			'appendFileSync(`${process.env.CAPTURE_DIR}/guard.json`, JSON.stringify({ secret: process.env.CCFLARE_GUARD_CORRELATION_SECRET, argv: process.argv }) + "\\n");',
-			"let exitScheduled = false;",
+			'appendFileSync(`${process.env.CAPTURE_DIR}/guard.json`, JSON.stringify({ pid: process.pid, secret: process.env.CCFLARE_GUARD_CORRELATION_SECRET, argv: process.argv }) + "\\n");',
 			"const server = http.createServer((_req, res) => {",
 			"  res.writeHead(200, { 'content-type': 'application/json' });",
 			"  res.end('{}');",
-			"  if (!exitScheduled) { exitScheduled = true; setTimeout(() => server.close(() => process.exit(0)), 350); }",
 			"});",
 			"server.listen(Number(process.env.GUARD_PORT), '127.0.0.1');",
 			"process.on('SIGTERM', () => server.close(() => process.exit(0)));",
@@ -83,8 +82,105 @@ function writeFixturePrograms(dir: string): {
 	return { upstream, guard };
 }
 
+function writeGuardExitFixture(
+	dir: string,
+	exitCode: number,
+): { upstream: string; guard: string } {
+	const programs = writeFixturePrograms(dir);
+	writeFileSync(
+		programs.guard,
+		[
+			'import { appendFileSync } from "node:fs";',
+			'import http from "node:http";',
+			'appendFileSync(`${process.env.CAPTURE_DIR}/guard-exits.log`, JSON.stringify({ pid: process.pid }) + "\\n");',
+			"const server = http.createServer((_req, res) => {",
+			"  res.writeHead(200, { 'content-type': 'application/json' });",
+			`  res.end('{}'); setTimeout(() => server.close(() => process.exit(${exitCode})), 5);`,
+			"});",
+			"server.listen(Number(process.env.GUARD_PORT), '127.0.0.1');",
+			"process.on('SIGTERM', () => server.close(() => process.exit(0)));",
+		].join("\n"),
+	);
+	chmodSync(programs.guard, 0o755);
+	return programs;
+}
+
+function writeStubbornGuardFixture(dir: string): {
+	upstream: string;
+	guard: string;
+} {
+	const programs = writeFixturePrograms(dir);
+	writeFileSync(
+		programs.upstream,
+		[
+			"#!/usr/bin/env node",
+			'import http from "node:http";',
+			'const portIndex = process.argv.indexOf("--port");',
+			"const port = Number(process.argv[portIndex + 1]);",
+			"const server = http.createServer((_req, res) => { res.writeHead(200); res.end('{}'); });",
+			"server.listen(port, '127.0.0.1', () => setTimeout(() => server.close(() => process.exit(42)), 300));",
+		].join("\n"),
+	);
+	writeFileSync(
+		programs.guard,
+		[
+			'import http from "node:http";',
+			"const server = http.createServer((_req, res) => { res.writeHead(200); res.end('{}'); });",
+			"server.listen(Number(process.env.GUARD_PORT), '127.0.0.1');",
+			"// This fixture deliberately ignores TERM so failure cleanup must enforce its short budget.",
+			"process.on('SIGTERM', () => {});",
+		].join("\n"),
+	);
+	chmodSync(programs.upstream, 0o755);
+	chmodSync(programs.guard, 0o755);
+	return programs;
+}
+
+function writeStableFixturePrograms(dir: string): {
+	upstream: string;
+	guard: string;
+} {
+	const programs = writeFixturePrograms(dir);
+	writeFileSync(
+		programs.guard,
+		[
+			'import { appendFileSync } from "node:fs";',
+			'import http from "node:http";',
+			'appendFileSync(`${process.env.CAPTURE_DIR}/guard-stable.log`, "start\\n");',
+			"const server = http.createServer((_req, res) => {",
+			"  res.writeHead(200, { 'content-type': 'application/json' }); res.end('{}');",
+			"});",
+			"server.listen(Number(process.env.GUARD_PORT), '127.0.0.1');",
+			"process.on('SIGTERM', () => server.close(() => process.exit(0)));",
+		].join("\n"),
+	);
+	chmodSync(programs.guard, 0o755);
+	return programs;
+}
+
+function writeOptionalTunnelFixture(dir: string): string {
+	const tunnel = join(dir, "fake-ssh-tunnel.mjs");
+	writeFileSync(
+		tunnel,
+		[
+			"#!/usr/bin/env node",
+			'import { existsSync } from "node:fs";',
+			'import http from "node:http";',
+			"const exitFile = process.env.TUNNEL_EXIT_FILE;",
+			"const server = http.createServer((_req, res) => { res.writeHead(200); res.end('{}'); });",
+			"server.listen(Number(process.env.AI_GATEWAY_LOCAL_PORT), '127.0.0.1');",
+			"const stop = () => { server.close(() => process.exit(0)); };",
+			"const timer = setInterval(() => { if (exitFile && existsSync(exitFile)) { clearInterval(timer); stop(); } }, 10);",
+			"process.on('SIGTERM', stop);",
+		].join("\n"),
+	);
+	chmodSync(tunnel, 0o755);
+	return tunnel;
+}
+
 async function runStackInvocation(
 	programs: { upstream: string; guard: string },
+	extraEnv: Record<string, string> = {},
 ): Promise<{
 	upstream: { secret: string; argv: string[] };
 	guard: { secret: string; argv: string[] };
@@ -95,6 +191,7 @@ async function runStackInvocation(
 	mkdirSync(captureDir, { recursive: true });
 	const upstreamPort = await allocatePort();
 	const guardPort = await allocatePort();
+	const tunnelPort = await allocatePort();
 	const child = spawn("bash", [runnerScript], {
 		cwd: repoRoot,
 		env: {
@@ -105,8 +202,15 @@ async function runStackInvocation(
 			NODE_BIN: process.execPath,
 			CCFLARE_UPSTREAM_PORT: String(upstreamPort),
 			GUARD_PORT: String(guardPort),
+			AI_GATEWAY_LOCAL_PORT: String(tunnelPort),
 			AI_GATEWAY_TUNNEL_ENABLED: "0",
+			AI_GATEWAY_TUNNEL_REQUIRED: "1",
 			CCFLARE_GUARD_CORRELATION_SECRET: "inherited-value-must-be-replaced",
+			RUNNER_HEALTH_POLL_INTERVAL_MS: "10",
+			RUNNER_HEALTH_MAX_ATTEMPTS: "100",
+			RUNNER_HEALTH_STABILITY_DELAY_MS: "0",
+			RUNNER_CIRCUIT_HOLD: "false",
+			...extraEnv,
 		},
 		stdio: ["ignore", "pipe", "pipe"],
 	});
@@ -118,17 +222,23 @@ async function runStackInvocation(
 	child.stderr.on("data", (chunk) => {
 		stderr += chunk.toString();
 	});
-	const exitCode = await Promise.race([
-		new Promise<number | null>((resolve) => child.once("exit", resolve)),
-		Bun.sleep(10_000).then(() => {
-			throw new Error(`runner fixture timed out:\n${stdout}\n${stderr}`);
-		}),
-	]).finally(() => {
-		if (child.exitCode === null && child.signalCode === null) {
-			child.kill("SIGKILL");
-		}
-	});
-	if (exitCode !== 0) {
+	const started = Date.now();
+	while (
+		(!existsSync(join(captureDir, "upstream.json")) ||
+			!existsSync(join(captureDir, "guard.json"))) &&
+		Date.now() - started < 10_000
+	) {
+		await Bun.sleep(10);
+	}
+	if (!existsSync(join(captureDir, "upstream.json")) || !existsSync(join(captureDir, "guard.json"))) {
+		child.kill("SIGKILL");
+		throw new Error(`runner fixture timed out:\n${stdout}\n${stderr}`);
+	}
+	child.kill("SIGTERM");
+	const exitCode = await new Promise<number | null>((resolve) =>
+		child.once("exit", resolve),
+	);
+	if (exitCode !== 143) {
 		throw new Error(
 			`runner fixture exited ${exitCode}:\nstdout:\n${stdout}\nstderr:\n${stderr}`,
 		);
@@ -140,6 +250,92 @@ async function runStackInvocation(
 		readFileSync(join(captureDir, "guard.json"), "utf8").trim(),
 	);
 	return { upstream, guard, stdout, stderr };
+}
+
+async function spawnRunner(
+	programs: { upstream: string; guard: string },
+	extraEnv: Record<string, string> = {},
+): Promise<{
+	child: ReturnType<typeof spawn>;
+	captureDir: string;
+	getOutput: () => { stdout: string; stderr: string };
+}> {
+	const captureDir = tempDir("ccflare-stack-capture-");
+	mkdirSync(captureDir, { recursive: true });
+	const upstreamPort = await allocatePort();
+	const guardPort = await allocatePort();
+	const tunnelPort = await allocatePort();
+	const child = spawn("bash", [runnerScript], {
+		cwd: repoRoot,
+		env: {
+			...process.env,
+			CAPTURE_DIR: captureDir,
+			CCFLARE_BIN: programs.upstream,
+			GUARD_SCRIPT: programs.guard,
+			NODE_BIN: process.execPath,
+			CCFLARE_UPSTREAM_PORT: String(upstreamPort),
+			GUARD_PORT: String(guardPort),
+			AI_GATEWAY_LOCAL_PORT: String(tunnelPort),
+			AI_GATEWAY_TUNNEL_ENABLED: "0",
+			AI_GATEWAY_TUNNEL_REQUIRED: "1",
+			CCFLARE_GUARD_CORRELATION_SECRET: "inherited-value-must-be-replaced",
+			RUNNER_HEALTH_POLL_INTERVAL_MS: "10",
+			RUNNER_HEALTH_MAX_ATTEMPTS: "100",
+			RUNNER_HEALTH_STABILITY_DELAY_MS: "0",
+			RUNNER_CIRCUIT_HOLD: "false",
+			...extraEnv,
+		},
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	let stdout = "";
+	let stderr = "";
+	child.stdout.on("data", (chunk) => {
+		stdout += chunk.toString();
+	});
+	child.stderr.on("data", (chunk) => {
+		stderr += chunk.toString();
+	});
+	return {
+		child,
+		captureDir,
+		getOutput: () => ({ stdout, stderr }),
+	};
+}
+
+async function waitForOutput(
+	runner: Awaited<ReturnType<typeof spawnRunner>>,
+	needle: string,
+	timeoutMs = 5_000,
+): Promise<void> {
+	const started = Date.now();
+	while (Date.now() - started < timeoutMs) {
+		if (runner.getOutput().stdout.includes(needle)) return;
+		if (runner.child.exitCode !== null || runner.child.signalCode !== null) {
+			throw new Error(
+				`runner exited before '${needle}': ${JSON.stringify(runner.getOutput())}`,
+			);
+		}
+		await Bun.sleep(10);
+	}
+	throw new Error(
+		`runner did not emit '${needle}': ${JSON.stringify(runner.getOutput())}`,
+	);
+}
+
+async function waitForExit(
+	child: ReturnType<typeof spawn>,
+	timeoutMs = 5_000,
+): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+	return await Promise.race([
+		new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+			(resolve) => {
+				child.once("exit", (code, signal) => resolve({ code, signal }));
+			},
+		),
+		Bun.sleep(timeoutMs).then(() => {
+			throw new Error("runner fixture did not exit in time");
+		}),
+	]);
 }
 
 describe("run-ccflare-stack guard correlation credential", () => {
@@ -183,5 +379,342 @@ describe("run-ccflare-stack guard correlation credential", () => {
 			expect(second.upstream.secret).not.toBe(first.upstream.secret);
 		},
 		20_000,
+	);
+});
+
+describe("run-ccflare-stack supervisor lifecycle", () => {
+	test(
+		"classifies an unexpected child failure and opens a bounded restart circuit",
+		async () => {
+			const fixtureDir = tempDir("ccflare-stack-failure-fixture-");
+			const programs = writeGuardExitFixture(fixtureDir, 42);
+			const runner = await spawnRunner(programs, {
+				RUNNER_RESTART_BACKOFF_BASE_MS: "20",
+				RUNNER_RESTART_BACKOFF_MAX_MS: "40",
+				RUNNER_RESTART_MAX_FAILURES: "3",
+				RUNNER_RESTART_WINDOW_MS: "1000",
+				RUNNER_RESTART_STABLE_MS: "1000",
+			});
+			const result = await waitForExit(runner.child, 5_000);
+			const output = runner.getOutput();
+
+			expect(result.code).toBe(1);
+			expect(output.stdout).toContain("class=failure");
+			expect(output.stdout).toContain("child=ccflare guard");
+			expect(output.stdout).toContain("restart circuit open");
+			expect(output.stdout).toContain("backoff_ms=20");
+			expect(output.stdout).toContain("backoff_ms=40");
+			const starts = (output.stdout.match(/starting better-ccflare upstream/g) ?? [])
+				.length;
+			expect(starts).toBe(3);
+			const secrets = readFileSync(join(runner.captureDir, "upstream.json"), "utf8")
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line).secret);
+			expect(secrets).toHaveLength(3);
+			expect(new Set(secrets).size).toBe(3);
+		},
+		10_000,
+	);
+
+	test(
+		"bounds failure cleanup when the guard ignores TERM without shortening intentional stop grace",
+		async () => {
+			const fixtureDir = tempDir("ccflare-stack-stubborn-guard-fixture-");
+			const programs = writeStubbornGuardFixture(fixtureDir);
+			const runner = await spawnRunner(programs, {
+				RUNNER_FAILURE_STOP_BUDGET_MS: "120",
+				RUNNER_RESTART_BACKOFF_BASE_MS: "0",
+				RUNNER_RESTART_BACKOFF_MAX_MS: "0",
+				RUNNER_RESTART_MAX_FAILURES: "1",
+				RUNNER_RESTART_WINDOW_MS: "1000",
+			});
+			const startedAt = Date.now();
+			const result = await waitForExit(runner.child, 3_000);
+			const elapsedMs = Date.now() - startedAt;
+			const output = runner.getOutput();
+
+			expect(result.code).toBe(1);
+			expect(result.signal).toBeNull();
+			expect(elapsedMs).toBeLessThan(1_500);
+			expect(output.stdout).toContain(
+				"failure_cleanup_budget_ms=120",
+			);
+			const forcedStop = output.stdout.match(
+				/did not stop after (\d+)ms; sending SIGKILL/,
+			);
+			expect(forcedStop).not.toBeNull();
+			expect(Number(forcedStop?.[1])).toBeLessThanOrEqual(120);
+			expect(output.stdout).toContain("restart circuit open");
+			expect(output.stdout).toContain("intentional_stop_budget_ms=605000");
+		},
+		8_000,
+	);
+
+	test(
+		"treats a runner SIGTERM as intentional and never restarts the stack",
+		async () => {
+			const fixtureDir = tempDir("ccflare-stack-term-fixture-");
+			const programs = writeStableFixturePrograms(fixtureDir);
+			const runner = await spawnRunner(programs, {
+				RUNNER_RESTART_BACKOFF_BASE_MS: "20",
+				RUNNER_RESTART_MAX_FAILURES: "3",
+			});
+			await waitForOutput(runner, "ccflare stack ready");
+			expect(runner.child.kill("SIGTERM")).toBe(true);
+			const result = await waitForExit(runner.child, 5_000);
+			const output = runner.getOutput();
+
+			expect(result.code).toBe(143);
+			expect(output.stdout).toContain("shutdown requested");
+			expect(output.stdout).not.toContain("restart circuit open");
+			expect(output.stdout).not.toContain("restarting stack");
+		},
+		10_000,
+	);
+
+	test(
+		"interrupts a restart backoff promptly on an intentional SIGTERM",
+		async () => {
+			const fixtureDir = tempDir("ccflare-stack-backoff-term-fixture-");
+			const programs = writeGuardExitFixture(fixtureDir, 42);
+			const runner = await spawnRunner(programs, {
+				RUNNER_RESTART_BACKOFF_BASE_MS: "1000",
+				RUNNER_RESTART_BACKOFF_MAX_MS: "1000",
+				RUNNER_RESTART_MAX_FAILURES: "5",
+			});
+			await waitForOutput(runner, "backoff_ms=1000");
+			const sentAt = Date.now();
+			expect(runner.child.kill("SIGTERM")).toBe(true);
+			const result = await waitForExit(runner.child, 2_000);
+
+			expect(result.code).toBe(143);
+			expect(Date.now() - sentAt).toBeLessThan(1_000);
+		},
+		10_000,
+	);
+
+	test(
+		"supervises a child that exits zero without a runner shutdown signal",
+		async () => {
+			const fixtureDir = tempDir("ccflare-stack-clean-exit-fixture-");
+			const programs = writeGuardExitFixture(fixtureDir, 0);
+			const runner = await spawnRunner(programs, {
+				RUNNER_RESTART_BACKOFF_BASE_MS: "10",
+				RUNNER_RESTART_BACKOFF_MAX_MS: "20",
+				RUNNER_RESTART_MAX_FAILURES: "2",
+				RUNNER_RESTART_WINDOW_MS: "1000",
+				RUNNER_RESTART_STABLE_MS: "1000",
+			});
+			const result = await waitForExit(runner.child, 5_000);
+			const output = runner.getOutput();
+
+			expect(result.code).toBe(1);
+			expect(output.stdout).toContain("class=clean");
+			expect(output.stdout).toContain("restarting stack via supervisor");
+			expect(output.stdout).toContain("restart circuit open");
+			const starts = (output.stdout.match(/starting better-ccflare upstream/g) ?? [])
+				.length;
+			expect(starts).toBe(2);
+		},
+		10_000,
+	);
+
+	test(
+		"keeps a required tunnel fail-closed while applying the bounded restart cap",
+		async () => {
+			const fixtureDir = tempDir("ccflare-stack-required-tunnel-fixture-");
+			const programs = writeStableFixturePrograms(fixtureDir);
+			const runner = await spawnRunner(programs, {
+				AI_GATEWAY_TUNNEL_ENABLED: "1",
+				AI_GATEWAY_TUNNEL_REQUIRED: "1",
+				AI_GATEWAY_SSH_HOST: "127.0.0.1",
+				AI_GATEWAY_LOCAL_PORT: "1",
+				AI_GATEWAY_REMOTE_PORT: "1",
+				AI_GATEWAY_TUNNEL_READY_ATTEMPTS: "1",
+				AI_GATEWAY_TUNNEL_POLL_INTERVAL_MS: "1",
+				AI_GATEWAY_SSH_CONNECT_TIMEOUT_SECONDS: "1",
+				RUNNER_RESTART_BACKOFF_BASE_MS: "10",
+				RUNNER_RESTART_BACKOFF_MAX_MS: "20",
+				RUNNER_RESTART_MAX_FAILURES: "2",
+				RUNNER_RESTART_WINDOW_MS: "1000",
+				RUNNER_RESTART_STABLE_MS: "1000",
+			});
+			const result = await waitForExit(runner.child, 8_000);
+			const output = runner.getOutput();
+
+			expect(result.code).toBe(1);
+			expect(output.stdout).toContain("ai-gateway tunnel is required");
+			expect(output.stdout).toContain("restart circuit open");
+			expect(output.stdout).not.toContain("starting better-ccflare upstream");
+		},
+		12_000,
+	);
+
+	test(
+		"supervises an optional tunnel after startup and restarts on tunnel death",
+		async () => {
+			const fixtureDir = tempDir("ccflare-stack-optional-tunnel-fixture-");
+			const programs = writeStableFixturePrograms(fixtureDir);
+			const tunnel = writeOptionalTunnelFixture(fixtureDir);
+			const tunnelExitFile = join(fixtureDir, "stop-tunnel");
+			const runner = await spawnRunner(programs, {
+				AI_GATEWAY_TUNNEL_ENABLED: "1",
+				AI_GATEWAY_TUNNEL_REQUIRED: "0",
+				AI_GATEWAY_SSH_BIN: tunnel,
+				AI_GATEWAY_SSH_HOST: "fixture",
+				AI_GATEWAY_TUNNEL_READY_ATTEMPTS: "100",
+				AI_GATEWAY_TUNNEL_POLL_INTERVAL_MS: "10",
+				TUNNEL_EXIT_FILE: tunnelExitFile,
+				RUNNER_RESTART_BACKOFF_BASE_MS: "10",
+				RUNNER_RESTART_BACKOFF_MAX_MS: "20",
+				RUNNER_RESTART_MAX_FAILURES: "3",
+				RUNNER_RESTART_WINDOW_MS: "1000",
+			});
+			await waitForOutput(runner, "ccflare stack ready");
+			writeFileSync(tunnelExitFile, "stop\n");
+			await waitForOutput(runner, "child=ai-gateway ssh tunnel");
+			await waitForOutput(runner, "restarting stack via supervisor");
+			const restartStartedAt = Date.now();
+			while (
+				(runner
+					.getOutput()
+					.stdout.match(/starting ai-gateway tunnel/g) ?? []).length < 2 &&
+				Date.now() - restartStartedAt < 5_000
+			) {
+				await Bun.sleep(10);
+			}
+			expect(runner.child.kill("SIGTERM")).toBe(true);
+			const result = await waitForExit(runner.child, 5_000);
+			const output = runner.getOutput();
+
+			expect(result.code).toBe(143);
+			expect(output.stdout).toContain("class=clean");
+			expect(
+				(output.stdout.match(/starting ai-gateway tunnel/g) ?? []).length,
+			).toBeGreaterThanOrEqual(2);
+		},
+		12_000,
+	);
+
+	test(
+		"exits with a bounded circuit status under a service auto invocation",
+		async () => {
+			const fixtureDir = tempDir("ccflare-stack-circuit-auto-fixture-");
+			const programs = writeGuardExitFixture(fixtureDir, 42);
+			const runner = await spawnRunner(programs, {
+				// systemd sets INVOCATION_ID. Auto mode must exit with a distinct
+				// failure so Restart=on-failure and StartLimit own recovery; it must
+				// never report an active service while its children are down.
+				INVOCATION_ID: "fixture-invocation",
+				RUNNER_CIRCUIT_HOLD: "auto",
+				RUNNER_RESTART_BACKOFF_BASE_MS: "10",
+				RUNNER_RESTART_BACKOFF_MAX_MS: "20",
+				RUNNER_RESTART_MAX_FAILURES: "2",
+				RUNNER_RESTART_WINDOW_MS: "1000",
+			});
+			const result = await waitForExit(runner.child, 5_000);
+			const output = runner.getOutput();
+
+			expect(result.code).toBe(75);
+			expect(result.signal).toBeNull();
+			expect(output.stdout).toContain(
+				"restart circuit open; exiting for service supervisor",
+			);
+			expect(output.stdout).not.toContain("paused until operator restart");
+			expect(
+				(output.stdout.match(/starting better-ccflare upstream/g) ?? []).length,
+			).toBe(2);
+
+			const upstreamRecords = readFileSync(
+				join(runner.captureDir, "upstream.json"),
+				"utf8",
+			)
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line) as { pid: number });
+			const guardRecords = readFileSync(
+				join(runner.captureDir, "guard-exits.log"),
+				"utf8",
+			)
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line) as { pid: number });
+			const processStillExists = (pid: number): boolean => {
+				try {
+					process.kill(pid, 0);
+					return true;
+				} catch {
+					return false;
+				}
+			};
+			for (const record of [...upstreamRecords, ...guardRecords]) {
+				expect(processStillExists(record.pid)).toBe(false);
+			}
+		},
+		10_000,
+	);
+
+	test(
+		"holds an explicitly requested circuit until an operator TERM",
+		async () => {
+			const fixtureDir = tempDir("ccflare-stack-circuit-hold-fixture-");
+			const programs = writeGuardExitFixture(fixtureDir, 42);
+			const runner = await spawnRunner(programs, {
+				// Explicit hold is retained for operator-controlled one-shot fixtures;
+				// production auto mode exits for systemd's bounded restart policy.
+				INVOCATION_ID: "",
+				RUNNER_CIRCUIT_HOLD: "true",
+				RUNNER_RESTART_BACKOFF_BASE_MS: "10",
+				RUNNER_RESTART_BACKOFF_MAX_MS: "20",
+				RUNNER_RESTART_MAX_FAILURES: "2",
+				RUNNER_RESTART_WINDOW_MS: "1000",
+			});
+			await waitForOutput(
+				runner,
+				"restart circuit open; supervisor paused until operator restart",
+				5_000,
+			);
+			const startsBefore = (runner
+				.getOutput()
+				.stdout.match(/starting better-ccflare upstream/g) ?? []).length;
+			expect(startsBefore).toBe(2);
+			expect(runner.child.kill("SIGTERM")).toBe(true);
+			const result = await waitForExit(runner.child, 5_000);
+			await Bun.sleep(50);
+			const output = runner.getOutput();
+
+			expect(result.code).toBe(143);
+			expect(
+				(output.stdout.match(/starting better-ccflare upstream/g) ?? []).length,
+			).toBe(startsBefore);
+			expect(output.stdout).toContain("shutdown requested");
+		},
+		10_000,
+	);
+
+	test(
+		"ignores explicit hold under a systemd invocation",
+		async () => {
+			const fixtureDir = tempDir("ccflare-stack-circuit-service-override-fixture-");
+			const programs = writeGuardExitFixture(fixtureDir, 42);
+			const runner = await spawnRunner(programs, {
+				INVOCATION_ID: "fixture-invocation",
+				RUNNER_CIRCUIT_HOLD: "true",
+				RUNNER_RESTART_BACKOFF_BASE_MS: "10",
+				RUNNER_RESTART_BACKOFF_MAX_MS: "10",
+				RUNNER_RESTART_MAX_FAILURES: "1",
+				RUNNER_RESTART_WINDOW_MS: "1000",
+			});
+			const result = await waitForExit(runner.child, 5_000);
+			const output = runner.getOutput();
+
+			expect(result.code).toBe(75);
+			expect(output.stdout).toContain(
+				"restart circuit open; exiting for service supervisor",
+			);
+			expect(output.stdout).not.toContain("paused until operator restart");
+		},
+		10_000,
 	);
 });

@@ -1,10 +1,12 @@
 import {
 	BUFFER_SIZES,
-	formatOAuthErrorMessage,
+	getExactOAuthErrorCode,
 	getModelFamily,
-	isInvalidGrantMessage,
+	getOAuthErrorCode,
+	MAX_OAUTH_ERROR_INPUT_LENGTH,
 	mapModelName,
 	OAuthRefreshTokenError,
+	readBoundedOAuthResponseText,
 	validateEndpointUrl,
 } from "@better-ccflare/core";
 import { sanitizeProxyHeaders } from "@better-ccflare/http-common";
@@ -158,13 +160,10 @@ export class AnthropicProvider extends BaseProvider {
 			`Refreshing OAuth token for account ${account.name} with client ID: ${clientId}`,
 		);
 
-		// Debug: Log the refresh attempt details
+		// Keep refresh diagnostics useful without exposing credential material.
 		log.debug(`Token refresh attempt for ${account.name}:`, {
-			refreshTokenPreview: account.refresh_token
-				? `${account.refresh_token.substring(0, 30)}...`
-				: "null/undefined",
 			clientId,
-			refreshTokenLength: account.refresh_token?.length || 0,
+			refreshTokenLength: account.refresh_token.length,
 		});
 
 		const requestBody = {
@@ -172,8 +171,6 @@ export class AnthropicProvider extends BaseProvider {
 			refresh_token: account.refresh_token,
 			client_id: clientId,
 		};
-
-		log.debug("Request body:", requestBody);
 
 		const response = await fetch("https://platform.claude.com/v1/oauth/token", {
 			method: "POST",
@@ -183,54 +180,53 @@ export class AnthropicProvider extends BaseProvider {
 			body: JSON.stringify(requestBody),
 		});
 
-		log.debug(`Response status: ${response.status} ${response.statusText}`, {
-			headers: Object.fromEntries(response.headers.entries()),
+		// Keep refresh diagnostics useful without dumping provider headers such as
+		// Set-Cookie or authorization-like values into logs.
+		log.debug(`Response status: ${response.status}`, {
+			headers: {
+				contentType: response.headers.get("content-type"),
+				retryAfter: response.headers.get("retry-after"),
+			},
 		});
 
 		if (!response.ok) {
-			let errorMessage =
-				formatOAuthErrorMessage(response.statusText) ||
-				"OAuth token endpoint rejected request";
 			let errorData: unknown = null;
 			let responseText = "";
+			let responseTextTruncated = false;
 			try {
-				responseText = await response.text();
+				const bounded = await readBoundedOAuthResponseText(response);
+				responseText = bounded.text;
+				responseTextTruncated = bounded.truncated;
 				errorData = JSON.parse(responseText);
-				// Preserve the machine-readable RFC-6749 error code (e.g.
-				// "invalid_grant") ahead of any human-readable description. When only
-				// error_description is surfaced the code is discarded, and the
-				// token-manager's requires_reauth detection — which keys on that code —
-				// silently misses a dead refresh token (the exact 43h-undetected
-				// incident this feature exists for).
-				errorMessage = formatOAuthErrorMessage(errorData) || errorMessage;
-
-				// Log specific OAuth authentication errors
-				if (response.status === 401 && typeof errorMessage === "string") {
-					if (
-						errorMessage.includes(
-							"OAuth authentication is currently not supported",
-						)
-					) {
-						log.error(
-							`OAuth authentication not supported for ${account.name} - the refresh token may be revoked or invalid. Account may need re-authentication.`,
-						);
-					} else if (
-						errorMessage.includes("invalid_grant") ||
-						errorMessage.includes("invalid_refresh_token")
-					) {
-						log.error(
-							`Refresh token invalid or expired for ${account.name} - account needs re-authentication`,
-						);
-					}
-				}
 			} catch {
-				// If we can't parse the error response, use the status text
 				log.error(
-					`Failed to parse token refresh error response for ${account.name}: ${response.statusText}`,
+					`Failed to parse token refresh error response for ${account.name}: HTTP ${response.status}`,
 				);
 			}
+			// A response that hit the bound is not authoritative. Even if the
+			// bounded prefix happens to be valid JSON, trailing bytes could change
+			// its meaning, so it must never quarantine an account.
+			const errorCode = responseTextTruncated
+				? ""
+				: getOAuthErrorCode(errorData) || getExactOAuthErrorCode(responseText);
+			if (response.status === 401 && errorCode) {
+				if (errorCode === "oauth authentication is currently not supported") {
+					log.error(
+						`OAuth authentication not supported for ${account.name}; account may need re-authentication`,
+					);
+				} else if (
+					errorCode === "invalid_grant" ||
+					errorCode === "invalid_refresh_token"
+				) {
+					log.error(
+						`Refresh token rejected for ${account.name}; account needs re-authentication`,
+					);
+				}
+			}
+			const errorMessage = errorCode || `HTTP ${response.status}`;
 			log.error(
-				`Token refresh failed for ${account.name}: Status ${response.status}, Error: ${errorMessage}`,
+				`Token refresh failed for ${account.name}: Status ${response.status}`,
+				{ code: errorCode || "unknown" },
 			);
 			const failureMessage = `Failed to refresh token for account ${account.name}: ${errorMessage}`;
 			// A revoked/invalid refresh token is terminal (not retryable) and is
@@ -239,20 +235,35 @@ export class AnthropicProvider extends BaseProvider {
 			// body (non-JSON bodies never reach errorMessage) and throw a typed
 			// error so callers can pause the account for re-authentication instead
 			// of treating it as a transient refresh failure.
-			if (
-				isInvalidGrantMessage(errorMessage) ||
-				isInvalidGrantMessage(responseText)
-			) {
+			if (errorCode) {
 				throw new OAuthRefreshTokenError(account.id, failureMessage);
 			}
 			throw new Error(failureMessage);
 		}
 
-		const json = (await response.json()) as {
+		const bounded = await readBoundedOAuthResponseText(response);
+		if (bounded.truncated) {
+			throw new Error(
+				`Anthropic token refresh response exceeded ${MAX_OAUTH_ERROR_INPUT_LENGTH} bytes`,
+			);
+		}
+		let json: {
 			access_token: string;
 			expires_in: number;
 			refresh_token?: string;
 		};
+		try {
+			json = JSON.parse(bounded.text) as typeof json;
+		} catch {
+			throw new Error(
+				`Anthropic token refresh response for ${account.name} was not valid JSON`,
+			);
+		}
+		if (!json || typeof json.access_token !== "string" || !json.access_token) {
+			throw new Error(
+				`Anthropic token refresh response for ${account.name} did not include an access token`,
+			);
+		}
 
 		log.debug(`token response for ${account.name}:`, {
 			expiresIn: json.expires_in,

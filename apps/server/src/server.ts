@@ -39,12 +39,14 @@ import {
 import {
 	LeastUsedStrategy,
 	SessionAffinityStrategy,
+	SessionDrainSoonestStrategy,
 	SessionStrategy,
 } from "@better-ccflare/load-balancer";
 import { Logger, setConsoleLogging } from "@better-ccflare/logger";
 import { handleResponsesRequest } from "@better-ccflare/openai-responses-adapter";
 import {
 	CODEX_DEFAULT_ENDPOINT,
+	extractWeeklyResetTime,
 	fetchCodexUsageData,
 	fetchCodexUsageOnDemand,
 	getProvider,
@@ -121,6 +123,8 @@ function buildStrategy(
 			return new LeastUsedStrategy();
 		case StrategyName.SessionAffinity:
 			return new SessionAffinityStrategy(sessionDurationMs);
+		case StrategyName.SessionDrainSoonest:
+			return new SessionDrainSoonestStrategy(sessionDurationMs);
 		default:
 			return new SessionStrategy(sessionDurationMs);
 	}
@@ -1596,6 +1600,12 @@ export default async function startServer(options?: {
 			// across same-priority accounts, where a spent extra_usage pool is a
 			// legitimate reason to prefer another account.
 			return getRankingUtilizationForProvider(data, provider);
+		},
+		getAccountWeeklyReset(accountId: string, provider: string): number | null {
+			const data = usageCache.get(accountId);
+			if (!data) return null;
+			const reset = extractWeeklyResetTime(data, provider);
+			return reset !== null && reset > Date.now() ? reset : null;
 		},
 	});
 

@@ -91,7 +91,7 @@ bun run cli --add-account myaccount --mode max --priority 0
 ```bash
 # Environment variables for development
 export PORT=8080
-export LB_STRATEGY=session  # Only 'session' strategy is supported
+export LB_STRATEGY=session  # session (default), least-used, session-affinity, or session-drain-soonest (opt-in)
 export LOG_LEVEL=DEBUG
 export LOG_FORMAT=pretty  # Options: pretty, json
 
@@ -206,14 +206,18 @@ sudo cat > /etc/systemd/system/better-ccflare.service << 'EOF'
 Description=better-ccflare Load Balancer
 After=network.target
 
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
 [Service]
 Type=simple
 User=better-ccflare
 Group=better-ccflare
 WorkingDirectory=/opt/better-ccflare
 ExecStart=/opt/better-ccflare/better-ccflare --serve
-Restart=always
+Restart=on-failure
 RestartSec=5
+RestartPreventExitStatus=143
 
 # Environment
 Environment="PORT=8080"
@@ -240,6 +244,14 @@ LimitNPROC=4096
 [Install]
 WantedBy=multi-user.target
 EOF
+
+When this unit is backed by `scripts/run-ccflare-stack.sh`, unexpected child
+failures use the runner's bounded aggregate cleanup setting
+`RUNNER_FAILURE_STOP_BUDGET_MS` (30,000 ms by default; hard maximum 120,000 ms).
+It is failure-only: an operator `TERM`/`INT` still receives the full guard
+shutdown grace and cushion so active requests can drain. Keep the failure
+budget below the unit's `StartLimitIntervalSec` window and verify the runner's
+startup log reports both budgets after changing the environment.
 
 # Create user and directories
 sudo useradd -r -s /bin/false better-ccflare
@@ -1181,7 +1193,7 @@ find /backup/better-ccflare -name "*.tar.gz" -mtime +30 -delete
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | 8080 | Server port |
-| `LB_STRATEGY` | session | Load balancing strategy (only 'session' is supported) |
+| `LB_STRATEGY` | session | Load balancing strategy: `session`, `least-used`, `session-affinity`, or opt-in `session-drain-soonest`. Session-based strategies preserve OAuth stickiness; `least-used` spreads requests by utilization. |
 | `LOG_LEVEL` | INFO | Logging level: `DEBUG`, `INFO`, `WARN`, `ERROR` |
 | `LOG_FORMAT` | pretty | Log format: `pretty` (human-readable) or `json` (structured) |
 | `better-ccflare_DEBUG` | 0 | Enable debug mode (1/0) - enables console output |
@@ -1228,7 +1240,7 @@ better-ccflare is designed to be flexible and scalable, supporting everything fr
 - **Integrated Binary**: Single executable combining CLI and server functionality
 - **Web Dashboard**: Access analytics and logs through a modern web interface
 - **Async Database Writer**: Improved performance for high-throughput scenarios
-- **Session-based Load Balancing**: Maintains session affinity for optimal performance
+- **Four Load-Balancing Strategies**: Choose account-level sessions, per-client affinity, utilization-based spreading, or the opt-in drain-soonest ordering
 - **Binary Compilation**: Deploy as standalone executable without runtime dependencies
 
 ### Additional Resources

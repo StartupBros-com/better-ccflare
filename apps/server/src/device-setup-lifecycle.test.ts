@@ -28,6 +28,7 @@ mock.module("@better-ccflare/providers", () => ({
 	CODEX_DEFAULT_ENDPOINT: "https://example.invalid",
 	fetchCodexUsageData: async () => null,
 	fetchCodexUsageOnDemand: async () => null,
+	extractWeeklyResetTime: () => null,
 	getOAuthProvider: () => ({ getOAuthConfig: () => ({ clientId: "test" }) }),
 	getProvider: () => null,
 	getRankingUtilizationForProvider: () => null,

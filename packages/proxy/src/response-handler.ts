@@ -47,6 +47,7 @@ import {
 	sessionIdForObservation,
 } from "./session-account-observer";
 import { combineChunks, teeStream } from "./stream-tee";
+import { extractUpstreamErrorTelemetry } from "./upstream-error-observability";
 import { getUsageCollector } from "./usage-collector";
 import {
 	type EndMessage,
@@ -303,6 +304,31 @@ function isExpectedResponse(path: string, response: Response): boolean {
 
 	// Otherwise use standard HTTP success logic
 	return response.ok;
+}
+
+/**
+ * Emit categorical metadata for a consumed, non-streaming upstream 403.
+ *
+ * The body parser is deliberately bounded and drops provider messages and
+ * unsafe fields. This is diagnostics only: the response status, headers, and
+ * bytes sent to the client remain untouched, and no routing decision consumes
+ * this signal.
+ */
+function logNonStreamingUpstream403(
+	requestId: string,
+	provider: string,
+	accountId: string | null,
+	body: Uint8Array | null,
+	status: number,
+): void {
+	const telemetry = extractUpstreamErrorTelemetry(body, status);
+	if (!telemetry) return;
+	log.warn("upstream_non_stream_403", {
+		requestId,
+		provider,
+		accountId,
+		...telemetry,
+	});
 }
 
 export interface ResponseHandlerOptions {
@@ -989,6 +1015,15 @@ export async function forwardToClient(
 	 *  NON-STREAMING RESPONSES — read body in background, send END once
 	 *********************************************************************/
 	if (!response.body) {
+		if (shouldProcessRequest) {
+			logNonStreamingUpstream403(
+				requestId,
+				ctx.provider.name,
+				account?.id ?? null,
+				null,
+				response.status,
+			);
+		}
 		const lifecycleOutcome =
 			response.status === 529
 				? "overloaded"
@@ -1037,9 +1072,29 @@ export async function forwardToClient(
 
 	const MAX_NON_STREAM_BODY_BYTES = 256 * 1024; // 256KB cap for stored body
 
+	// A non-streaming body can terminate with EOF, an upstream read error, or
+	// downstream cancellation. Observe each response at most once so a
+	// terminal callback race cannot duplicate the diagnostic event.
+	let nonStreaming403Observed = false;
+	const observeNonStreaming403 = (body: Uint8Array | null): void => {
+		if (nonStreaming403Observed) return;
+		nonStreaming403Observed = true;
+		logNonStreamingUpstream403(
+			requestId,
+			ctx.provider.name,
+			account?.id ?? null,
+			body,
+			response.status,
+		);
+	};
+
 	const passthroughBody = teeStream(response.body, {
 		maxBytes: MAX_NON_STREAM_BODY_BYTES,
 		onClose(buffered) {
+			const cappedBuf = combineChunks(buffered);
+			if (shouldProcessRequest) {
+				observeNonStreaming403(cappedBuf);
+			}
 			const lifecycleOutcome =
 				response.status === 529
 					? "overloaded"
@@ -1056,8 +1111,6 @@ export async function forwardToClient(
 			// capture is independent of the analytics/logging filter above (it's
 			// not analytics, and must still run e.g. for a filtered synthetic
 			// request that nonetheless carries a real GET /v1/models response).
-			const cappedBuf = combineChunks(buffered);
-
 			if (
 				method === "GET" &&
 				path === "/v1/models" &&
@@ -1080,6 +1133,7 @@ export async function forwardToClient(
 			);
 		},
 		onError(err) {
+			if (shouldProcessRequest) observeNonStreaming403(null);
 			anthropicDegradedLifecycle?.settle("failed");
 			if (!shouldProcessRequest) return;
 			fireAndForgetEnd(
@@ -1093,6 +1147,7 @@ export async function forwardToClient(
 			);
 		},
 		onCancel() {
+			if (shouldProcessRequest) observeNonStreaming403(null);
 			anthropicDegradedLifecycle?.settle("cancelled");
 			if (!shouldProcessRequest) return;
 			fireAndForgetEnd(

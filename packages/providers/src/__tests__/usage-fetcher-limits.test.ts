@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import type { UsageData } from "../usage-fetcher";
 import {
+	extractWeeklyResetTime,
 	getRepresentativeUtilization,
 	getRepresentativeUtilizationForProvider,
 	getRepresentativeWindow,
@@ -57,5 +58,135 @@ describe("getRepresentativeUtilizationForProvider — limits[] (P1)", () => {
 		expect(
 			getRepresentativeUtilizationForProvider(limitsOnly, "anthropic"),
 		).toBe(70);
+	});
+});
+
+describe("extractWeeklyResetTime", () => {
+	it("reads the legacy flat seven_day reset for Codex-shaped data", () => {
+		const reset = "2030-02-03T04:05:06.000Z";
+		const data = {
+			seven_day: { utilization: 40, resets_at: reset },
+		} as UsageData;
+		expect(extractWeeklyResetTime(data, "codex")).toBe(
+			new Date(reset).getTime(),
+		);
+	});
+
+	it("reads limits[].weekly_all when the flat window is absent", () => {
+		const reset = "2030-03-04T05:06:07.000Z";
+		const data = {
+			limits: [
+				{ kind: "session", percent: 20, resets_at: "2030-03-04T01:00:00.000Z" },
+				{ kind: "weekly_all", percent: 40, resets_at: reset },
+			],
+		} as unknown as UsageData;
+		expect(extractWeeklyResetTime(data, "codex")).toBe(
+			new Date(reset).getTime(),
+		);
+	});
+
+	it("falls back to a valid limits reset when the flat reset is malformed", () => {
+		const reset = "2030-04-05T06:07:08.000Z";
+		const nowMs = new Date("2029-01-01T00:00:00.000Z").getTime();
+		const data = {
+			seven_day: { utilization: 40, resets_at: "not-a-date" },
+			limits: [{ kind: "weekly_all", percent: 40, resets_at: reset }],
+		} as unknown as UsageData;
+
+		expect(extractWeeklyResetTime(data, "codex", nowMs)).toBe(
+			new Date(reset).getTime(),
+		);
+	});
+
+	it("falls back to a future limits reset when the flat reset is already past", () => {
+		const reset = "2030-05-06T07:08:09.000Z";
+		const nowMs = new Date("2029-01-01T00:00:00.000Z").getTime();
+		const data = {
+			seven_day: {
+				utilization: 40,
+				resets_at: "2020-01-01T00:00:00.000Z",
+			},
+			limits: [{ kind: "weekly_all", percent: 40, resets_at: reset }],
+		} as unknown as UsageData;
+
+		expect(extractWeeklyResetTime(data, "codex", nowMs)).toBe(
+			new Date(reset).getTime(),
+		);
+	});
+
+	it("falls back when the flat reset is exactly at the observation boundary", () => {
+		const nowMs = new Date("2030-06-01T00:00:00.000Z").getTime();
+		const reset = "2030-06-02T00:00:00.000Z";
+		const data = {
+			seven_day: {
+				utilization: 40,
+				resets_at: "2030-06-01T00:00:00.000Z",
+			},
+			limits: [{ kind: "weekly_all", percent: 40, resets_at: reset }],
+		} as unknown as UsageData;
+
+		expect(extractWeeklyResetTime(data, "codex", nowMs)).toBe(
+			new Date(reset).getTime(),
+		);
+	});
+
+	it("ignores inactive weekly_all limits", () => {
+		const activeReset = "2030-06-07T08:09:10.000Z";
+		const nowMs = new Date("2029-01-01T00:00:00.000Z").getTime();
+		const data = {
+			limits: [
+				{
+					kind: "weekly_all",
+					percent: 100,
+					resets_at: "2030-01-01T00:00:00.000Z",
+					is_active: false,
+				},
+				{ kind: "weekly_all", percent: 40, resets_at: activeReset },
+			],
+		} as unknown as UsageData;
+
+		expect(extractWeeklyResetTime(data, "codex", nowMs)).toBe(
+			new Date(activeReset).getTime(),
+		);
+	});
+
+	it("returns null for unsupported providers, missing, malformed, or unrelated windows", () => {
+		expect(
+			extractWeeklyResetTime(
+				{
+					seven_day: {
+						utilization: 40,
+						resets_at: "2030-01-01T00:00:00.000Z",
+					},
+				} as UsageData,
+				"xai",
+			),
+		).toBeNull();
+		expect(
+			extractWeeklyResetTime({ limits: [] } as unknown as UsageData),
+			"codex",
+		).toBeNull();
+		expect(
+			extractWeeklyResetTime(
+				{
+					seven_day: { utilization: 40, resets_at: "not-a-date" },
+				} as UsageData,
+				"codex",
+			),
+		).toBeNull();
+		expect(
+			extractWeeklyResetTime(
+				{
+					limits: [
+						{
+							kind: "weekly_scoped",
+							percent: 40,
+							resets_at: "2030-01-01T00:00:00.000Z",
+						},
+					],
+				} as unknown as UsageData,
+				"codex",
+			),
+		).toBeNull();
 	});
 });

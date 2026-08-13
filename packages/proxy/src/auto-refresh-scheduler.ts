@@ -2,6 +2,7 @@ import {
 	authFailureEvents,
 	CLAUDE_MODEL_IDS,
 	getClientVersion,
+	getOAuthErrorCode,
 	OAuthRefreshTokenError,
 	PAUSE_REASON_NEEDS_REAUTH,
 	registerHeartbeat,
@@ -12,11 +13,7 @@ import { Logger } from "@better-ccflare/logger";
 import { fetchUsageData, getProvider } from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
 import { TOKEN_SAFETY_WINDOW_MS } from "./constants";
-import {
-	extractAuthFailureReason,
-	getValidAccessToken,
-	INTERNAL_PROBE_SECRET_HEADER,
-} from "./handlers";
+import { getValidAccessToken, INTERNAL_PROBE_SECRET_HEADER } from "./handlers";
 import {
 	flushPendingRotation,
 	getPendingRotation,
@@ -1199,11 +1196,10 @@ export class AutoRefreshScheduler {
 		error: unknown,
 		row: { id: string; name: string; provider: string; refresh_token: string },
 	): Promise<void> {
-		const message = error instanceof Error ? error.message : String(error);
 		const reason =
 			error instanceof OAuthRefreshTokenError
 				? "invalid_grant"
-				: extractAuthFailureReason(message, row.name);
+				: getOAuthErrorCode(error);
 		if (!reason) return;
 
 		if (getPendingRotation(row.id)) {

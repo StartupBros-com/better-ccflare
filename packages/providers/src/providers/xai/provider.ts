@@ -1,7 +1,11 @@
 import {
-	formatOAuthErrorMessage,
 	getEndpointUrl,
+	getExactOAuthErrorCode,
 	getModelFamily,
+	getOAuthErrorCode,
+	MAX_OAUTH_ERROR_INPUT_LENGTH,
+	OAuthRefreshTokenError,
+	readBoundedOAuthResponseText,
 	validateEndpointUrl,
 } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
@@ -99,32 +103,52 @@ export class XaiProvider extends OpenAICompatibleProvider {
 		});
 
 		if (!response.ok) {
-			let message =
-				formatOAuthErrorMessage(response.statusText) ||
-				"OAuth token endpoint rejected request";
+			let responseText = "";
+			let responseTextTruncated = false;
+			let data: unknown;
 			try {
-				const data = (await response.json()) as unknown;
-				// Preserve the machine-readable OAuth error code (e.g. "invalid_grant")
-				// ahead of the human description so the token-manager's requires_reauth
-				// detection can classify a dead xAI refresh token.
-				message = formatOAuthErrorMessage(data) || message;
+				const bounded = await readBoundedOAuthResponseText(response);
+				responseText = bounded.text;
+				responseTextTruncated = bounded.truncated;
+				data = JSON.parse(responseText) as unknown;
 			} catch {
 				// Do not include raw response bodies in refresh errors; auth servers
 				// should not echo credentials, but keeping messages structured avoids
 				// accidental token exposure if that ever changes.
 			}
-			throw new Error(
-				`Failed to refresh xAI token for account ${account.name}: ${response.status} ${message}`,
-			);
+			// A response that hit the bound is not authoritative. Even if the
+			// bounded prefix happens to be valid JSON, trailing bytes could change
+			// its meaning, so it must never quarantine an account.
+			const errorCode = responseTextTruncated
+				? ""
+				: getOAuthErrorCode(data) || getExactOAuthErrorCode(responseText);
+			const failureMessage = `Failed to refresh xAI token for account ${account.name}: ${response.status} ${errorCode || "OAuth token endpoint rejected request"}`;
+			if (errorCode) {
+				throw new OAuthRefreshTokenError(account.id, failureMessage);
+			}
+			throw new Error(failureMessage);
 		}
 
-		const json = (await response.json()) as {
+		const bounded = await readBoundedOAuthResponseText(response);
+		if (bounded.truncated) {
+			throw new Error(
+				`xAI token refresh response exceeded ${MAX_OAUTH_ERROR_INPUT_LENGTH} bytes`,
+			);
+		}
+		let json: {
 			access_token: string;
 			refresh_token?: string;
 			expires_in?: number;
 		};
+		try {
+			json = JSON.parse(bounded.text) as typeof json;
+		} catch {
+			throw new Error(
+				`xAI token refresh response for ${account.name} was not valid JSON`,
+			);
+		}
 
-		if (!json.access_token) {
+		if (!json || typeof json.access_token !== "string" || !json.access_token) {
 			throw new Error(
 				`xAI refresh response for account ${account.name} did not include an access token`,
 			);

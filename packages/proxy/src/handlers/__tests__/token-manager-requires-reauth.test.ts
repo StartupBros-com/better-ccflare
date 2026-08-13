@@ -1,5 +1,9 @@
 import { describe, expect, it, mock } from "bun:test";
-import { type AuthFailureEvt, authFailureEvents } from "@better-ccflare/core";
+import {
+	type AuthFailureEvt,
+	authFailureEvents,
+	OAuthRefreshTokenError,
+} from "@better-ccflare/core";
 import type { Account } from "@better-ccflare/types";
 import {
 	extractAuthFailureReason,
@@ -140,7 +144,8 @@ describe("extractAuthFailureReason / isDefinitiveAuthFailure", () => {
 describe("refreshAccessTokenSafe requires_reauth detection", () => {
 	it("flags requires_reauth via the direct CAS write for a realistic invalid_grant refresh error and propagates it", async () => {
 		const { ctx } = makeContext(
-			new Error(
+			new OAuthRefreshTokenError(
+				"invalid-grant",
 				"Failed to refresh token for account test-account: invalid_grant: Refresh token is invalid or has been revoked.",
 			),
 		);

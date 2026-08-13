@@ -2,11 +2,13 @@ import { createHash } from "node:crypto";
 import { getCodexReasoningRetention } from "@better-ccflare/config";
 import {
 	BUFFER_SIZES,
-	formatOAuthErrorMessage,
+	getExactOAuthErrorCode,
 	getModelFamily,
-	isInvalidGrantMessage,
+	getOAuthErrorCode,
+	MAX_OAUTH_ERROR_INPUT_LENGTH,
 	mapModelName,
 	OAuthRefreshTokenError,
+	readBoundedOAuthResponseText,
 	SseFrameBuffer,
 	StreamResourceLimitError,
 	ValidationError,
@@ -527,7 +529,12 @@ export interface CodexPromptCacheKeyDecision {
 	effectiveMode: "conversation" | "session" | null;
 	cohortId: string | null;
 	conversationIdentity: string | null;
+	/** Canonical identity authorized by orchestration admission, if any. */
 	canonicalConversationIdentity: string | null;
+	/** Identity selected for the base cache key before any rescue salt. */
+	selectedConversationIdentity: string | null;
+	/** Whether canonical continuity was selected; null when ineligible/inapplicable. */
+	continuityApplied: boolean | null;
 	continuityBasis:
 		| "derived"
 		| "identity_match"
@@ -1085,25 +1092,23 @@ export class CodexProvider extends BaseProvider {
 		if (!response.ok) {
 			let errorData: unknown = null;
 			let responseText = "";
+			let responseTextTruncated = false;
 			try {
-				if (typeof response.text === "function") {
-					responseText = await response.text();
-					errorData = JSON.parse(responseText);
-				} else {
-					errorData = await response.json();
-				}
+				const bounded = await readBoundedOAuthResponseText(response);
+				responseText = bounded.text;
+				responseTextTruncated = bounded.truncated;
+				errorData = JSON.parse(responseText);
 			} catch {
 				// ignore
 			}
 
-			// Preserve the RFC-6749 machine code ahead of its human-readable
-			// description. Terminal-auth detection must not lose markers such as
-			// invalid_grant or refresh_token_reused when a description is present.
-			const errorMessage =
-				formatOAuthErrorMessage(errorData) ||
-				formatOAuthErrorMessage(response.statusText) ||
-				"OAuth token endpoint rejected request";
-			const errorCode = errorMessage.split(":", 1)[0]?.trim();
+			// A response that hit the bound is not authoritative. Even if the
+			// bounded prefix happens to be valid JSON, trailing bytes could change
+			// its meaning, so it must never quarantine an account.
+			const errorCode = responseTextTruncated
+				? ""
+				: getOAuthErrorCode(errorData) || getExactOAuthErrorCode(responseText);
+			const errorMessage = errorCode || `HTTP ${response.status}`;
 
 			// Rotating refresh tokens: reuse → terminal, must re-auth. Throw the
 			// typed error so the refresh chokepoint pauses the account for reauth
@@ -1116,20 +1121,35 @@ export class CodexProvider extends BaseProvider {
 			}
 
 			const failureMessage = `Failed to refresh Codex token for account ${account.name}: ${errorMessage}`;
-			if (
-				isInvalidGrantMessage(errorMessage) ||
-				isInvalidGrantMessage(responseText)
-			) {
+			if (errorCode) {
 				throw new OAuthRefreshTokenError(account.id, failureMessage);
 			}
 			throw new Error(failureMessage);
 		}
 
-		const json = (await response.json()) as {
+		const bounded = await readBoundedOAuthResponseText(response);
+		if (bounded.truncated) {
+			throw new Error(
+				`Codex token refresh response exceeded ${MAX_OAUTH_ERROR_INPUT_LENGTH} bytes`,
+			);
+		}
+		let json: {
 			access_token: string;
 			refresh_token: string;
 			expires_in: number;
 		};
+		try {
+			json = JSON.parse(bounded.text) as typeof json;
+		} catch {
+			throw new Error(
+				`Codex token refresh response for ${account.name} was not valid JSON`,
+			);
+		}
+		if (!json || typeof json.access_token !== "string" || !json.access_token) {
+			throw new Error(
+				`Codex token refresh response for ${account.name} did not include an access token`,
+			);
+		}
 
 		log.debug(`[CodexProvider] token refresh response for ${account.name}:`, {
 			expiresIn: json.expires_in,
@@ -1308,8 +1328,16 @@ export class CodexProvider extends BaseProvider {
 					cacheKeyDecision.conversationIdentity?.slice(0, 16) ?? null,
 				cacheKeyAssignmentSource: cacheKeyDecision.assignmentSource,
 				cacheKeyContinuityBasis: cacheKeyDecision.continuityBasis,
-				canonicalConversationId:
-					cacheKeyDecision.canonicalConversationIdentity?.slice(0, 16) ?? null,
+				cacheKeyContinuityApplied: cacheKeyDecision.continuityApplied,
+				continuityEvidenceId:
+					cacheKeyDecision.effectiveMode === "conversation"
+						? (cacheKeyDecision.canonicalConversationIdentity?.slice(0, 16) ??
+							null)
+						: null,
+				canonicalConversationId: cacheKeyDecision.continuityApplied
+					? (cacheKeyDecision.selectedConversationIdentity?.slice(0, 16) ??
+						null)
+					: null,
 				explicitBreakpointCanary: explicitBreakpointDecision.canary,
 				explicitBreakpointCohortId: explicitBreakpointDecision.cohortId,
 				explicitBreakpointAction: explicitBreakpointDecision.action,
@@ -1754,6 +1782,8 @@ export class CodexProvider extends BaseProvider {
 			cohortId: null,
 			conversationIdentity: null,
 			canonicalConversationIdentity: null,
+			selectedConversationIdentity: null,
+			continuityApplied: null,
 			continuityBasis: "ineligible",
 			webSocketConversationIdentity: null,
 		};
@@ -1796,6 +1826,10 @@ export class CodexProvider extends BaseProvider {
 						: orchestrationResult?.basis === "rejected"
 							? "rejected"
 							: "derived";
+		const continuityApplied =
+			effectiveMode === "conversation"
+				? Boolean(continuityTreatment && canonicalConversationIdentity)
+				: null;
 		const selectedConversationIdentity =
 			effectiveMode === "conversation" &&
 			continuityTreatment &&
@@ -1835,6 +1869,8 @@ export class CodexProvider extends BaseProvider {
 				.slice(0, 16),
 			conversationIdentity,
 			canonicalConversationIdentity,
+			selectedConversationIdentity,
+			continuityApplied,
 			continuityBasis,
 			webSocketConversationIdentity,
 		};

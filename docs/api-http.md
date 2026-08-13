@@ -442,7 +442,7 @@ curl -X POST http://localhost:8080/api/accounts/uuid-here/priority \
 
 Enable or disable auto-fallback for an account. When enabled, the system will automatically switch back to this account when its usage window resets and it has higher priority than the currently active account.
 
-**Important**: Auto-fallback is only available for Anthropic accounts since only they provide rate limit reset information via the API. Attempts to enable auto-fallback on non-Anthropic accounts will result in an error.
+**Important**: Auto-fallback is available for `anthropic`, `codex`, and `zai` accounts because they expose the reset telemetry used by the scheduler. Attempts to enable auto-fallback on other providers will result in an error.
 
 **Request:**
 ```json
@@ -790,9 +790,12 @@ Update load balancing strategy.
 ```
 
 **Available Strategies:**
-- `session` - Session-based routing that maintains 5-hour sessions with individual accounts to avoid rate limits and account bans
+- `session` - The default account-level session strategy. For providers with session-window tracking (including Anthropic OAuth and Codex OAuth), it keeps requests on the active account for the configured session duration.
+- `least-used` - Orders available accounts by utilization for per-request spreading. It does not preserve OAuth stickiness; use it only where spreading traffic across credentials is safe.
+- `session-affinity` - Assigns each client or affinity lane a sticky account, with automatic failover and expiry, so concurrent clients can spread across the pool while each client keeps prompt-cache locality.
+- `session-drain-soonest` - Opt-in `session-affinity` variant. It preserves an existing owner and only ranks fresh assignments or account failover by the earliest known future all-model weekly reset, then normal priority/utilization tie-breakers. Unknown, malformed, or stale reset telemetry fails open to ordinary affinity ordering.
 
-**⚠️ WARNING:** Only the session strategy is supported. Other strategies have been removed as they can trigger Claude's anti-abuse systems.
+For Anthropic OAuth traffic, prefer `session`, `session-affinity`, or the opt-in `session-drain-soonest` because they preserve account stickiness. Per-request spreading with `least-used` can create provider anti-abuse patterns.
 
 **Example:**
 ```bash
@@ -807,7 +810,7 @@ List all available load balancing strategies.
 
 **Response:**
 ```json
-["session"]
+["session", "least-used", "session-affinity", "session-drain-soonest"]
 ```
 
 **Example:**
@@ -1279,7 +1282,7 @@ better-ccflare can be configured using the following environment variables:
 
 - `PORT` - Server port (default: 8080)
 - `LB_STRATEGY` - Load balancing strategy (default: session)
-- `SESSION_DURATION_MS` - Session duration in milliseconds (default: 18000000 / 5 hours)
+- `SESSION_DURATION_MS` - Session/affinity lifetime in milliseconds for session-based strategies (default: 18000000 / 5 hours)
 - `CLIENT_ID` - OAuth client ID for Anthropic authentication (default: 9d1c250a-e61b-44d9-88ed-5944d1962f5e)
 - `CF_STREAM_BODY_MAX_BYTES` - Maximum bytes to capture from streaming responses (default: 262144 / 256KB)
 - `RETRY_ATTEMPTS` - Number of retry attempts for failed requests (default: 3)
@@ -1315,10 +1318,13 @@ In addition to environment variables, better-ccflare supports configuration thro
 
 ### Load Balancing Strategies
 
-The following strategy is available:
-- `session` - Session-based routing that maintains 5-hour sessions with individual accounts
+The following strategies are supported:
+- `session` (default) - Account-level sticky sessions for providers with session-window tracking; Anthropic OAuth sessions also align to the provider's `rate_limit_reset` when available.
+- `least-used` - Utilization-first ordering with no sticky OAuth session; appropriate for API-key or compatible-provider pools where per-request spreading is acceptable.
+- `session-affinity` - Per-client or per-lane sticky ownership with automatic failover and session expiry; useful when several concurrent clients need cache-local routing.
+- `session-drain-soonest` (opt-in) - Keeps the current affinity owner. Only a fresh assignment or account failover uses a known future all-model weekly reset to rank candidates; unknown or stale reset data falls back to ordinary affinity ordering.
 
-**⚠️ WARNING:** Only use the session strategy. Other strategies can trigger Claude's anti-abuse systems and result in account bans.
+For Anthropic OAuth accounts, prefer a session-based strategy (`session`, `session-affinity`, or `session-drain-soonest`) to preserve natural account stickiness. `least-used` may spread requests across accounts and can trigger provider anti-abuse controls.
 
 ## Notes
 
@@ -1332,11 +1338,10 @@ The following strategy is available:
 
 5. **Account Priority System**: Accounts can have different priority values (0-100) which determine their order in load balancing.
 
-6. **Session Affinity**: The "session" strategy maintains sticky sessions for consistent routing within a time window.
+6. **Session Affinity**: `session` maintains one active account-level session for providers that require session tracking; `session-affinity` maintains independent client/lane owners. The opt-in `session-drain-soonest` changes only fresh or failover ordering and never replaces a live owner.
 
 7. **Rate Limit Tracking**: Rate limit information is automatically extracted from responses and stored for each account, including reset times and remaining requests.
 
 8. **Provider Filtering**: Accounts are automatically filtered by provider when selecting for requests, ensuring compatibility.
 
 ---
-

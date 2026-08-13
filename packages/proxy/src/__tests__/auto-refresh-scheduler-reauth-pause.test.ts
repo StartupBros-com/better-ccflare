@@ -102,6 +102,59 @@ describe("AutoRefreshScheduler — proactive refresh pause-for-reauth", () => {
 		expect(flagRequiresReauthIfTokenMatches).not.toHaveBeenCalled();
 	});
 
+	it("does not pause when provider prose merely mentions invalid_grant", async () => {
+		registerProvider({
+			name: "test-openai-compat-provider",
+			canHandle: () => true,
+			refreshToken: async () => {
+				throw new Error(
+					JSON.stringify({
+						error: { message: "provider mentioned invalid_grant in prose" },
+					}),
+				);
+			},
+		} as never);
+
+		const db = makeDb([
+			{ ...baseRow, provider: "test-openai-compat-provider" },
+		]);
+		const { context, flagRequiresReauthIfTokenMatches } =
+			makeProxyContext(true);
+		const scheduler = await makeScheduler(db, context);
+
+		await scheduler.checkAndRefreshOpenAICompatibleOAuthTokens();
+
+		expect(flagRequiresReauthIfTokenMatches).not.toHaveBeenCalled();
+	});
+
+	it("pauses on an explicit structured OAuth machine code", async () => {
+		registerProvider({
+			name: "test-openai-compat-provider",
+			canHandle: () => true,
+			refreshToken: async () => {
+				const error = new Error("structured OAuth failure") as Error & {
+					error: { code: string };
+				};
+				error.error = { code: "invalid_grant" };
+				throw error;
+			},
+		} as never);
+
+		const db = makeDb([
+			{ ...baseRow, provider: "test-openai-compat-provider" },
+		]);
+		const { context, flagRequiresReauthIfTokenMatches } =
+			makeProxyContext(true);
+		const scheduler = await makeScheduler(db, context);
+
+		await scheduler.checkAndRefreshOpenAICompatibleOAuthTokens();
+
+		expect(flagRequiresReauthIfTokenMatches).toHaveBeenCalledWith(
+			"acc-oauth-proactive",
+			"rt-1",
+		);
+	});
+
 	it("pauses a codex account when refreshToken throws OAuthRefreshTokenError", async () => {
 		registerProvider({
 			name: "test-codex-provider",

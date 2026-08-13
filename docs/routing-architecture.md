@@ -1,8 +1,8 @@
 # Account Routing Architecture
 
-This document explains how better-ccflare picks an account for each proxied request: the master pipeline, Claude Code model route profiles, the three load-balancing strategies, usage-throttling, model-family capacity routing, and auto-fallback. It is a technical reference for understanding *why* a given request landed on a given account — for user-facing setup guides see [Load Balancing](./load-balancing.md), [Auto-Fallback Configuration](./auto-fallback.md), [Combos](./combos.md), and [Configuration](./configuration.md).
+This document explains how better-ccflare picks an account for each proxied request: the master pipeline, Claude Code model route profiles, the four load-balancing strategies, usage-throttling, model-family capacity routing, and auto-fallback. It is a technical reference for understanding *why* a given request landed on a given account — for user-facing setup guides see [Load Balancing](./load-balancing.md), [Auto-Fallback Configuration](./auto-fallback.md), [Combos](./combos.md), and [Configuration](./configuration.md).
 
-> **Fork note.** This reference was ported from upstream (`tombii/better-ccflare`) and adjusted for this fork. Two upstream features it originally documented are not shipped here: the `session-drain-soonest` strategy (this fork registers only `session`, `least-used`, and `session-affinity`), and the `model_scoped_capacity_routing` on/off toggle (this fork's capacity routing is always on — see [Model-Capacity Routing](#model-capacity-routing)). This document also describes only the strategy layer; when a [Combo](./combos.md) or managed family routing is active, this fork runs an additional authoritative routing layer above it.
+> **Fork note.** This reference was ported from upstream (`tombii/better-ccflare`) and adjusted for this fork. The `session-drain-soonest` strategy is available as an explicit opt-in and preserves this fork's session-affinity/route-profile safeguards; the `model_scoped_capacity_routing` on/off toggle remains absent because this fork's capacity routing is always on — see [Model-Capacity Routing](#model-capacity-routing). This document also describes only the strategy layer; when a [Combo](./combos.md) or managed family routing is active, this fork runs an additional authoritative routing layer above it.
 
 ## Table of Contents
 
@@ -10,9 +10,10 @@ This document explains how better-ccflare picks an account for each proxied requ
 2. [Master Pipeline](#master-pipeline)
 3. [Claude Code Model Route Profiles](#claude-code-model-route-profiles)
 4. [Anthropic Degraded Mode](#anthropic-degraded-mode)
-5. [The Three Load-Balancing Strategies](#the-three-load-balancing-strategies)
+5. [The Four Load-Balancing Strategies](#the-four-load-balancing-strategies)
    - [session](#session-sessionstrategy)
    - [session-affinity](#session-affinity-sessionaffinitystrategy)
+   - [session-drain-soonest](#session-drain-soonest-sessiondrainsooneststrategy)
    - [least-used](#least-used-leastusedstrategy)
 6. [Usage Throttling](#usage-throttling)
 7. [Model-Capacity Routing](#model-capacity-routing)
@@ -21,7 +22,7 @@ This document explains how better-ccflare picks an account for each proxied requ
 
 ## Overview: Three Orthogonal Axes
 
-Ordinary account routing is controlled by two independent runtime settings plus one always-on filter: the **load-balancing strategy** (`lb_strategy` — which of the three strategies below picks the candidate order), **usage-throttling** (`usage_throttling_five_hour_enabled` / `usage_throttling_weekly_enabled` — an optional pacing gate applied after strategy selection), and **model-family capacity routing** (always on in this fork; no `model_scoped_capacity_routing` toggle — a per-model-family exclusion filter). Any runtime "combination" you observe (e.g. `least-used` with weekly throttling on) is not a special combined mode — it is simply the master pipeline below with the configured strategy plugged into the `Strategy.select` step. Understanding the pipeline once is enough to reason about every valid combination. An explicit or inherited [Claude Code model route profile](#claude-code-model-route-profiles) is a profile-scoped override above those ordinary candidate-order mechanisms: legacy profiles select one exact account, while capability profiles build a constrained account pool before applying the normal strategy and capacity checks.
+Ordinary account routing is controlled by two independent runtime settings plus one always-on filter: the **load-balancing strategy** (`lb_strategy` — which of the four strategies below picks the candidate order), **usage-throttling** (`usage_throttling_five_hour_enabled` / `usage_throttling_weekly_enabled` — an optional pacing gate applied after strategy selection), and **model-family capacity routing** (always on in this fork; no `model_scoped_capacity_routing` toggle — a per-model-family exclusion filter). Any runtime "combination" you observe (e.g. `least-used` with weekly throttling on) is not a special combined mode — it is simply the master pipeline below with the configured strategy plugged into the `Strategy.select` step. Understanding the pipeline once is enough to reason about every valid combination. An explicit or inherited [Claude Code model route profile](#claude-code-model-route-profiles) is a profile-scoped override above those ordinary candidate-order mechanisms: legacy profiles select one exact account, while capability profiles build a constrained account pool before applying the normal strategy and capacity checks.
 
 ## Master Pipeline
 
@@ -164,9 +165,9 @@ The single-probe guarantee is process-local. `enforce` is supported only when ev
 
 *Source: `packages/proxy/src/anthropic-degraded-eligibility.ts`, `packages/proxy/src/anthropic-degraded-mode.ts`, `packages/proxy/src/degraded-owner-overlay.ts`, `packages/proxy/src/handlers/proxy-operations.ts`, and `packages/proxy/src/handlers/routing-terminal.ts`. Configuration and safe bounds are documented in [Configuration](./configuration.md#anthropic-degraded-mode).*
 
-## The Three Load-Balancing Strategies
+## The Four Load-Balancing Strategies
 
-`lb_strategy` selects one of three implementations (`packages/load-balancer/src/strategies/`), all constructed in `apps/server/src/server.ts`. All three return an ordered list of candidate accounts; the first entry is tried first, the rest are failover order.
+`lb_strategy` selects one of four implementations (`packages/load-balancer/src/strategies/`), all constructed in `apps/server/src/server.ts`. All four return an ordered list of candidate accounts; the first entry is tried first, the rest are failover order.
 
 ### session (SessionStrategy)
 
@@ -209,6 +210,34 @@ flowchart TD
 ```
 
 *Source: `packages/load-balancer/src/strategies/session-affinity.ts`.*
+
+### session-drain-soonest (SessionDrainSoonestStrategy)
+
+This is an explicit opt-in variant of `session-affinity`, not a replacement
+for the account-level `session` strategy. It keeps the inherited per-client
+and per-lane owner map, temporary failover/snapback behavior, anti-thrash
+guard, route circuits, and candidate sidecar identity. A request with no
+`clientSessionId` still receives a fresh order and records no sticky owner.
+
+Only a fresh assignment or an account-level failover invokes the drain ranking.
+The comparator first preserves the exact structural routing class (candidate
+tier and comparable quota-pressure band), so reset urgency cannot cross a
+provider/model/tier or route-profile boundary. Within one class it prefers the
+earliest known **future** all-model weekly reset, then account priority,
+utilization, the bounded recency score, and stable candidate identity. Missing,
+malformed, stale, or past reset telemetry is unknown and sorts after a known
+future reset; if every reset is unknown, the ordinary affinity ordering is
+effectively retained. The provider-neutral usage helper accepts only the
+canonical flat `seven_day` or `limits[].weekly_all` shapes, so unrelated
+provider credit windows cannot become drain signals.
+
+`peek()` uses the same fresh-candidate hook as `select()` for dashboard parity;
+it has no client key and therefore does not mutate affinity. Existing sticky
+owners remain authoritative even when another account's weekly reset is sooner.
+
+*Source: `packages/load-balancer/src/strategies/session-drain-soonest.ts`, the
+protected ranking hook in `session-affinity.ts`, and
+`packages/providers/src/usage-fetcher.ts`.*
 
 ### least-used (LeastUsedStrategy)
 

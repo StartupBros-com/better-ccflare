@@ -5,8 +5,12 @@
  * not 401 — so detection cannot be gated on status.
  */
 
-import { describe, expect, it } from "bun:test";
-import { OAuthRefreshTokenError } from "@better-ccflare/core";
+import { describe, expect, it, spyOn } from "bun:test";
+import {
+	MAX_OAUTH_ERROR_INPUT_LENGTH,
+	OAuthRefreshTokenError,
+} from "@better-ccflare/core";
+import { Logger } from "@better-ccflare/logger";
 import type { Account } from "@better-ccflare/types";
 import { AnthropicProvider } from "../provider";
 
@@ -15,9 +19,20 @@ function mockFetchOnce(response: {
 	status: number;
 	statusText: string;
 	text: () => Promise<string>;
+	headers?: HeadersInit;
 }) {
 	const originalFetch = globalThis.fetch;
-	const fullResponse = { ...response, headers: new Headers() };
+	const body = new ReadableStream<Uint8Array>({
+		async start(controller) {
+			controller.enqueue(new TextEncoder().encode(await response.text()));
+			controller.close();
+		},
+	});
+	const fullResponse = {
+		...response,
+		headers: new Headers(response.headers),
+		body,
+	};
 	globalThis.fetch = (async () => fullResponse) as never;
 	return () => {
 		globalThis.fetch = originalFetch;
@@ -64,6 +79,77 @@ function makeAccount(overrides: Partial<Account> = {}): Account {
 }
 
 describe("AnthropicProvider.refreshToken — invalid_grant detection", () => {
+	it("never emits OAuth refresh-token material through debug diagnostics", async () => {
+		const refreshToken = "oauth-refresh-secret-SENTINEL-do-not-log-0123456789";
+		const debugCalls: unknown[][] = [];
+		const debug = spyOn(Logger.prototype, "debug").mockImplementation(
+			(message, data) => debugCalls.push([message, data]),
+		);
+		const restoreFetch = mockFetchOnce({
+			ok: false,
+			status: 500,
+			statusText: "Internal Server Error",
+			text: async () => "Internal Server Error",
+			headers: {
+				"content-type": "text/plain",
+				"retry-after": "7",
+				"set-cookie": "oauth-secret-cookie=do-not-log",
+				authorization: "Bearer oauth-secret-header",
+			},
+		});
+
+		try {
+			const provider = new AnthropicProvider();
+			await expect(
+				provider.refreshToken(
+					makeAccount({ refresh_token: refreshToken }),
+					"test-client",
+				),
+			).rejects.toBeInstanceOf(Error);
+
+			const diagnostics = JSON.stringify(debugCalls);
+			expect(diagnostics).not.toContain(refreshToken);
+			expect(diagnostics).not.toContain("oauth-refresh-secret-SENTINEL");
+			expect(diagnostics).not.toContain("oauth-secret-cookie");
+			expect(diagnostics).not.toContain("oauth-secret-header");
+			expect(diagnostics).toContain("contentType");
+			expect(diagnostics).toContain("retryAfter");
+		} finally {
+			debug.mockRestore();
+			restoreFetch();
+		}
+	});
+
+	it("does not interpolate an untrusted HTTP status text into debug diagnostics", async () => {
+		const statusText = "provider-status\ncredential-like=oauth-secret\r\n";
+		const debugCalls: unknown[][] = [];
+		const debug = spyOn(Logger.prototype, "debug").mockImplementation(
+			(message, data) => debugCalls.push([message, data]),
+		);
+		const restoreFetch = mockFetchOnce({
+			ok: false,
+			status: 503,
+			statusText,
+			text: async () => "temporarily unavailable",
+			headers: { "content-type": "text/plain" },
+		});
+
+		try {
+			const provider = new AnthropicProvider();
+			await expect(
+				provider.refreshToken(makeAccount(), "test-client"),
+			).rejects.toBeInstanceOf(Error);
+
+			const diagnostics = JSON.stringify(debugCalls);
+			expect(diagnostics).not.toContain(statusText);
+			expect(diagnostics).not.toContain("credential-like=oauth-secret");
+			expect(diagnostics).toContain("Response status: 503");
+		} finally {
+			debug.mockRestore();
+			restoreFetch();
+		}
+	});
+
 	it("throws OAuthRefreshTokenError for HTTP 400 invalid_grant (not gated on 401)", async () => {
 		const restore = mockFetchOnce({
 			ok: false,
@@ -144,6 +230,44 @@ describe("AnthropicProvider.refreshToken — invalid_grant detection", () => {
 				expect(err).toBeInstanceOf(OAuthRefreshTokenError);
 				expect((err as OAuthRefreshTokenError).accountId).toBe("acc-xyz");
 			}
+		} finally {
+			restore();
+		}
+	});
+
+	it("rejects an oversized successful token payload before accepting it", async () => {
+		const payload = `${JSON.stringify({
+			access_token: "new-access-token",
+			expires_in: 3600,
+		})}${" ".repeat(MAX_OAUTH_ERROR_INPUT_LENGTH)}trailing-data`;
+		const restore = mockFetchOnce({
+			ok: true,
+			status: 200,
+			statusText: "OK",
+			text: async () => payload,
+		});
+		try {
+			const provider = new AnthropicProvider();
+			await expect(
+				provider.refreshToken(makeAccount(), "test-client"),
+			).rejects.toThrow(/exceeded/);
+		} finally {
+			restore();
+		}
+	});
+
+	it("rejects a successful response that omits the access token", async () => {
+		const restore = mockFetchOnce({
+			ok: true,
+			status: 200,
+			statusText: "OK",
+			text: async () => JSON.stringify({ expires_in: 3600 }),
+		});
+		try {
+			const provider = new AnthropicProvider();
+			await expect(
+				provider.refreshToken(makeAccount(), "test-client"),
+			).rejects.toThrow(/did not include an access token/);
 		} finally {
 			restore();
 		}
