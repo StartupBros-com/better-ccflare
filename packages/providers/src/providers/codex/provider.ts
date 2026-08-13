@@ -120,10 +120,14 @@ export const CODEX_CONVERSATION_ID_HEADER =
 export const CODEX_CACHE_KEY_MODE_ENV = "CCFLARE_CODEX_CACHE_KEY_MODE";
 export const CODEX_CACHE_KEY_SESSION_PERCENT_ENV =
 	"CCFLARE_CODEX_CACHE_KEY_SESSION_PERCENT";
+export const CODEX_CACHE_KEY_CONTINUITY_PERCENT_ENV =
+	"CCFLARE_CODEX_CACHE_KEY_CONTINUITY_PERCENT";
 export const CODEX_EXPLICIT_CACHE_BREAKPOINT_PERCENT_ENV =
 	"CCFLARE_CODEX_GPT56_EXPLICIT_CACHE_BREAKPOINT_PERCENT";
 const CODEX_CACHE_KEY_SESSION_BUCKET_DOMAIN =
 	"better-ccflare:codex-cache-key-session-canary:v1\0";
+const CODEX_CACHE_KEY_CONTINUITY_BUCKET_DOMAIN =
+	"better-ccflare:codex-cache-key-continuity-canary:v1\0";
 const CODEX_CACHE_KEY_COHORT_DOMAIN =
 	"better-ccflare:codex-cache-key-cohort:v1\0";
 const CODEX_CACHE_LANE_RESCUE_DOMAIN =
@@ -200,6 +204,21 @@ export function readCodexCacheKeySessionPercent(
 export function deriveCodexCacheKeySessionBucket(sessionId: string): number {
 	const digest = createHash("sha256")
 		.update(CODEX_CACHE_KEY_SESSION_BUCKET_DOMAIN)
+		.update(sessionId.toLowerCase())
+		.digest();
+	return digest.readUInt32BE(0) % 100;
+}
+
+export function readCodexCacheKeyContinuityPercent(
+	raw = process.env[CODEX_CACHE_KEY_CONTINUITY_PERCENT_ENV],
+): number {
+	if (raw === undefined || !/^\d+$/.test(raw)) return 0;
+	return Math.min(Number.parseInt(raw, 10), 100);
+}
+
+export function deriveCodexCacheKeyContinuityBucket(sessionId: string): number {
+	const digest = createHash("sha256")
+		.update(CODEX_CACHE_KEY_CONTINUITY_BUCKET_DOMAIN)
 		.update(sessionId.toLowerCase())
 		.digest();
 	return digest.readUInt32BE(0) % 100;
@@ -477,6 +496,14 @@ export interface CodexPromptCacheKeyDecision {
 	effectiveMode: "conversation" | "session" | null;
 	cohortId: string | null;
 	conversationIdentity: string | null;
+	canonicalConversationIdentity: string | null;
+	continuityBasis:
+		| "derived"
+		| "identity_match"
+		| "lineage_match"
+		| "rejected"
+		| "session"
+		| "ineligible";
 	webSocketConversationIdentity: string | null;
 }
 
@@ -1240,6 +1267,9 @@ export class CodexProvider extends BaseProvider {
 				conversationId:
 					cacheKeyDecision.conversationIdentity?.slice(0, 16) ?? null,
 				cacheKeyAssignmentSource: cacheKeyDecision.assignmentSource,
+				cacheKeyContinuityBasis: cacheKeyDecision.continuityBasis,
+				canonicalConversationId:
+					cacheKeyDecision.canonicalConversationIdentity?.slice(0, 16) ?? null,
 				explicitBreakpointCanary: explicitBreakpointDecision.canary,
 				explicitBreakpointCohortId: explicitBreakpointDecision.cohortId,
 				explicitBreakpointAction: explicitBreakpointDecision.action,
@@ -1671,6 +1701,10 @@ export class CodexProvider extends BaseProvider {
 		input: readonly unknown[],
 		account?: Account,
 		cacheLaneRescueSalt?: string,
+		orchestrationResult?: {
+			basis: OrchestrationAdmissionBasis | null;
+			canonicalConversationIdentity: string | null;
+		},
 	): CodexPromptCacheKeyDecision {
 		const ineligible: CodexPromptCacheKeyDecision = {
 			key: null,
@@ -1679,6 +1713,8 @@ export class CodexProvider extends BaseProvider {
 			effectiveMode: null,
 			cohortId: null,
 			conversationIdentity: null,
+			canonicalConversationIdentity: null,
+			continuityBasis: "ineligible",
 			webSocketConversationIdentity: null,
 		};
 		if (process.env[CODEX_PROMPT_CACHE_KEY_ENV] === "0") return ineligible;
@@ -1703,14 +1739,37 @@ export class CodexProvider extends BaseProvider {
 			explicitSessionOverride || assignment === "session" || input.length === 0
 				? "session"
 				: "conversation";
+		const continuityPercent = readCodexCacheKeyContinuityPercent();
+		const continuityTreatment =
+			continuityPercent === 100 ||
+			(continuityPercent > 0 &&
+				deriveCodexCacheKeyContinuityBucket(sessionId) < continuityPercent);
+		const canonicalConversationIdentity =
+			orchestrationResult?.canonicalConversationIdentity ?? null;
+		const continuityBasis =
+			effectiveMode === "session"
+				? "session"
+				: orchestrationResult?.basis === "identity_match"
+					? "identity_match"
+					: orchestrationResult?.basis === "lineage_match"
+						? "lineage_match"
+						: orchestrationResult?.basis === "rejected"
+							? "rejected"
+							: "derived";
+		const selectedConversationIdentity =
+			effectiveMode === "conversation" &&
+			continuityTreatment &&
+			canonicalConversationIdentity
+				? canonicalConversationIdentity
+				: conversationIdentity;
 		let key =
 			effectiveMode === "session"
 				? `ccflare-session-${createHash("sha256")
 						.update(sessionId)
 						.digest("hex")
 						.slice(0, 48)}`
-				: conversationIdentity
-					? `ccflare-convo-${conversationIdentity.slice(0, 48)}`
+				: selectedConversationIdentity
+					? `ccflare-convo-${selectedConversationIdentity.slice(0, 48)}`
 					: null;
 		if (key && cacheLaneRescueSalt) {
 			key = `ccflare-rescue-${createHash("sha256")
@@ -1735,6 +1794,8 @@ export class CodexProvider extends BaseProvider {
 				.digest("hex")
 				.slice(0, 16),
 			conversationIdentity,
+			canonicalConversationIdentity,
+			continuityBasis,
 			webSocketConversationIdentity,
 		};
 	}
@@ -2323,6 +2384,10 @@ export class CodexProvider extends BaseProvider {
 			false;
 		let orchestrationAdmission: OrchestrationAdmission;
 		let orchestrationBasis: OrchestrationAdmissionBasis | null = null;
+		let orchestrationCacheKeyResult: {
+			basis: OrchestrationAdmissionBasis;
+			canonicalConversationIdentity: string | null;
+		} | null = null;
 		let orchestrationDemotionObserved = false;
 		let elapsedMsSinceRoot: number | null = null;
 		if (!offersOrchestrationTools) {
@@ -2361,6 +2426,11 @@ export class CodexProvider extends BaseProvider {
 					);
 					orchestrationAdmission = electionResult.admission;
 					orchestrationBasis = electionResult.basis;
+					orchestrationCacheKeyResult = {
+						basis: electionResult.basis,
+						canonicalConversationIdentity:
+							electionResult.canonicalConversationIdentity,
+					};
 					if (electionResult.admission === "non_root" && priorRootSnapshot) {
 						// This session already had an elected root, and this turn was
 						// rejected as an ordinary contender (categorical basis:
@@ -2442,6 +2512,7 @@ export class CodexProvider extends BaseProvider {
 			input,
 			account,
 			cacheLaneRescueSalt,
+			orchestrationCacheKeyResult ?? undefined,
 		);
 		if (cacheKeyDecision.key) {
 			codexRequest.prompt_cache_key = cacheKeyDecision.key;

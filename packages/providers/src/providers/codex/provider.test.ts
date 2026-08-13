@@ -10,6 +10,7 @@ import {
 	resetOrchestrationElectionForTest,
 } from "./orchestration-election";
 import {
+	CODEX_CACHE_KEY_CONTINUITY_PERCENT_ENV,
 	CODEX_CACHE_KEY_MODE_ENV,
 	CODEX_CACHE_KEY_SESSION_PERCENT_ENV,
 	CODEX_DEFAULT_ENDPOINT,
@@ -17,7 +18,9 @@ import {
 	CODEX_VERSION,
 	CodexProvider,
 	codexEventCommitsOutput,
+	deriveCodexCacheKeyContinuityBucket,
 	deriveCodexCacheKeySessionBucket,
+	readCodexCacheKeyContinuityPercent,
 	readCodexCacheKeySessionPercent,
 	resolveCodexRequestModel,
 } from "./provider";
@@ -42,6 +45,7 @@ const readTraceRecords = (dir: string): Array<Record<string, unknown>> => {
 
 afterEach(() => {
 	delete process.env[CODEX_PROMPT_CACHE_KEY_ENV];
+	delete process.env[CODEX_CACHE_KEY_CONTINUITY_PERCENT_ENV];
 	delete process.env[CODEX_CACHE_KEY_MODE_ENV];
 	delete process.env[CODEX_CACHE_KEY_SESSION_PERCENT_ENV];
 	delete process.env[CODEX_SINGLE_ORCHESTRATION_ROOT_ENV];
@@ -6954,7 +6958,7 @@ describe("CodexProvider.transformRequestBody", () => {
 			// recorded lineage and is admitted as root (basis: lineage_match), not
 			// demoted.
 			expect(requestTrace).toMatchObject({
-				trace_schema_version: 15,
+				trace_schema_version: 16,
 				orchestration_admission: "root",
 				orchestration_basis: "lineage_match",
 				orchestration_demotion_observed: false,
@@ -7201,7 +7205,7 @@ describe("CodexProvider.transformRequestBody", () => {
 				(record) => record.phase === "request",
 			);
 			expect(requestTrace).toMatchObject({
-				trace_schema_version: 15,
+				trace_schema_version: 16,
 				orchestration_admission: "attributed_descendant",
 				orchestration_basis: null,
 				is_descendant: true,
@@ -7325,6 +7329,7 @@ describe("CodexProvider.transformRequestBody", () => {
 			system = "shared system prompt",
 			messages?: Array<Record<string, unknown>>,
 			account?: Parameters<CodexProvider["transformRequestBody"]>[1],
+			tools?: Array<Record<string, unknown>>,
 		) => {
 			const request = new Request("https://example.com/v1/messages", {
 				method: "POST",
@@ -7335,6 +7340,7 @@ describe("CodexProvider.transformRequestBody", () => {
 					system,
 					metadata: { user_id: JSON.stringify({ session_id: sessionId }) },
 					messages: messages ?? [{ role: "user", content }],
+					...(tools ? { tools } : {}),
 				}),
 			});
 			return new CodexProvider()
@@ -7359,6 +7365,26 @@ describe("CodexProvider.transformRequestBody", () => {
 			["nope", 0],
 		] as const)("strictly parses session percentage %p", (raw, expected) => {
 			expect(readCodexCacheKeySessionPercent(raw)).toBe(expected);
+		});
+
+		it("strictly parses the continuity percentage and keeps its bucket stable", () => {
+			for (const [raw, expected] of [
+				[undefined, 0],
+				["", 0],
+				["0", 0],
+				["37", 37],
+				["100", 100],
+				["101", 100],
+				["-1", 0],
+				["1.5", 0],
+				[" 10", 0],
+				["nope", 0],
+			] as const) {
+				expect(readCodexCacheKeyContinuityPercent(raw)).toBe(expected);
+			}
+			expect(deriveCodexCacheKeyContinuityBucket(sessionA)).toBe(
+				deriveCodexCacheKeyContinuityBucket(sessionA.toUpperCase()),
+			);
 		});
 
 		it("uses stable domain-separated bucket fixtures and normalizes UUID case", () => {
@@ -7410,6 +7436,73 @@ describe("CodexProvider.transformRequestBody", () => {
 			expect(later.prompt_cache_key).toBe(first.prompt_cache_key);
 			expect(sibling.prompt_cache_key).toMatch(/^ccflare-convo-/);
 			expect(sibling.prompt_cache_key).not.toBe(first.prompt_cache_key);
+		});
+
+		it("reuses the canonical root key for treated compaction continuations only", async () => {
+			process.env[CODEX_PROMPT_CACHE_KEY_ENV] = "1";
+			process.env[CODEX_CACHE_KEY_CONTINUITY_PERCENT_ENV] = "100";
+			const tools = [{ name: "Agent", input_schema: { type: "object" } }];
+			const rootMessages = [
+				{ role: "user", content: "start" },
+				{
+					role: "assistant",
+					content: [
+						{ type: "tool_use", id: "call_1", name: "Agent", input: {} },
+					],
+				},
+				{
+					role: "user",
+					content: [
+						{ type: "tool_result", tool_use_id: "call_1", content: "done" },
+					],
+				},
+			];
+			const compactedMessages = [
+				rootMessages[1],
+				rootMessages[2],
+				{ role: "user", content: "continue" },
+			];
+			const treatedRoot = await transform(
+				sessionA,
+				"start",
+				"shared system prompt",
+				rootMessages,
+				undefined,
+				tools,
+			);
+			const treatedCompacted = await transform(
+				sessionA,
+				"continue",
+				"shared system prompt",
+				compactedMessages,
+				undefined,
+				tools,
+			);
+			expect(treatedCompacted.prompt_cache_key).toBe(
+				treatedRoot.prompt_cache_key,
+			);
+
+			process.env[CODEX_CACHE_KEY_CONTINUITY_PERCENT_ENV] = "0";
+			resetOrchestrationElectionForTest();
+			const controlRoot = await transform(
+				sessionA,
+				"start",
+				"shared system prompt",
+				rootMessages,
+				undefined,
+				tools,
+			);
+			const controlCompacted = await transform(
+				sessionA,
+				"continue",
+				"shared system prompt",
+				compactedMessages,
+				undefined,
+				tools,
+			);
+			expect(controlCompacted.prompt_cache_key).not.toBe(
+				controlRoot.prompt_cache_key,
+			);
 		});
 
 		it("shares one session key across sibling conversations in treatment", async () => {
