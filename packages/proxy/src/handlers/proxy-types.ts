@@ -1,4 +1,8 @@
-import type { Config, RuntimeConfig } from "@better-ccflare/config";
+import type {
+	Config,
+	ImplicitFallbackPolicyConfig,
+	RuntimeConfig,
+} from "@better-ccflare/config";
 import type {
 	AsyncDbWriter,
 	DatabaseOperations,
@@ -32,6 +36,8 @@ export interface ProxyContext {
 	dbOps: DatabaseOperations;
 	runtime: RuntimeConfig;
 	config: Config;
+	/** Restart-scoped admission policy for implicit normal/combo fallback. */
+	implicitFallbackPolicy?: ImplicitFallbackPolicyConfig;
 	provider: Provider;
 	refreshInFlight: Map<string, Promise<string>>;
 	asyncWriter: AsyncDbWriter;

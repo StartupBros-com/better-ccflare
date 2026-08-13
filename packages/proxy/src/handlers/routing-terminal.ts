@@ -2,6 +2,7 @@ import type {
 	Account,
 	RateLimitReason,
 	RouteCircuitRecoveryHint,
+	RoutingSelectionDiagnostics,
 } from "@better-ccflare/types";
 import {
 	RECOVERY_SCOPE_HEADER,
@@ -48,6 +49,8 @@ export interface RoutingTerminalOptions {
 	readonly capacityContext: RoutingCapacityContext | null;
 	readonly rateLimitOutcomes: readonly RequestRateLimitOutcome[];
 	readonly upstreamAttempts: number;
+	/** Request-local bounded evidence for a selection-origin terminal. */
+	readonly routingSelectionDiagnostics?: RoutingSelectionDiagnostics | null;
 	/**
 	 * Number of request-local routes that returned a definitive upstream 401.
 	 * When this equals every attempted route (and no rate-limit outcomes exist),
@@ -64,6 +67,51 @@ export interface RoutingTerminalOptions {
 	 * preserves the legacy ordinary-request contract for non-ledger callers.
 	 */
 	readonly hostedDispatchState?: HostedDispatchState;
+}
+
+const MAX_ROUTING_SELECTION_DIAGNOSTIC_COUNT = 1_000_000;
+
+function boundedDiagnosticCount(value: number): number {
+	if (!Number.isFinite(value)) return 0;
+	return Math.min(
+		MAX_ROUTING_SELECTION_DIAGNOSTIC_COUNT,
+		Math.max(0, Math.floor(value)),
+	);
+}
+
+function serializeRoutingSelectionDiagnostics(
+	diagnostics: RoutingSelectionDiagnostics,
+): Record<string, unknown> {
+	const mode =
+		diagnostics.mode === "observe" || diagnostics.mode === "enforce"
+			? diagnostics.mode
+			: "off";
+	const zeroAttemptReason =
+		diagnostics.zeroAttemptReason === "policy_excluded" ||
+		diagnostics.zeroAttemptReason === "no_eligible_candidates" ||
+		diagnostics.zeroAttemptReason === "all_unavailable" ||
+		diagnostics.zeroAttemptReason === "selection_timeout"
+			? diagnostics.zeroAttemptReason
+			: "no_eligible_candidates";
+	return {
+		mode,
+		structural_candidate_count: boundedDiagnosticCount(
+			diagnostics.structuralCandidateCount,
+		),
+		eligible_candidate_count: boundedDiagnosticCount(
+			diagnostics.eligibleCandidateCount,
+		),
+		excluded_candidate_count: boundedDiagnosticCount(
+			diagnostics.excludedCandidateCount,
+		),
+		selected_candidate_count: boundedDiagnosticCount(
+			diagnostics.selectedCandidateCount,
+		),
+		zero_attempt_reason: zeroAttemptReason,
+		forced_route: diagnostics.forcedRoute === true,
+		capability_profile: diagnostics.capabilityProfile === true,
+		route_profile: diagnostics.routeProfile === true,
+	};
 }
 
 export type ProtectedAnthropicOverloadInput =
@@ -383,8 +431,17 @@ export function createModelPoolExhaustedResponse(options: {
 	rateLimitOutcomes: readonly RequestRateLimitOutcome[];
 	now: number;
 	modelRecoveryAt?: number | null;
+	attemptedRoutes?: number;
+	routingSelectionDiagnostics?: RoutingSelectionDiagnostics | null;
 }): Response {
-	const { capacityContext, rateLimitOutcomes, now, modelRecoveryAt } = options;
+	const {
+		capacityContext,
+		rateLimitOutcomes,
+		now,
+		modelRecoveryAt,
+		attemptedRoutes,
+		routingSelectionDiagnostics,
+	} = options;
 	const nextAvailableAt = earliestFuture(
 		[
 			capacityContext?.blockedUntil,
@@ -410,6 +467,14 @@ export function createModelPoolExhaustedResponse(options: {
 	if (nextAvailableAt !== null) {
 		error.next_available_at = new Date(nextAvailableAt).toISOString();
 	}
+	if (attemptedRoutes !== undefined) {
+		error.attempted_routes = attemptedRoutes;
+	}
+	if (routingSelectionDiagnostics != null) {
+		error.routing_diagnostics = serializeRoutingSelectionDiagnostics(
+			routingSelectionDiagnostics,
+		);
+	}
 	const headers = new Headers({ "content-type": "application/json" });
 	if (nextAvailableAt !== null) {
 		const retryAfterSeconds = Math.max(
@@ -430,8 +495,16 @@ function createPoolExhaustedResponse(options: {
 	accounts: readonly Account[];
 	recoveries: readonly AutomaticRecovery[];
 	now: number;
+	attemptedRoutes?: number;
+	routingSelectionDiagnostics?: RoutingSelectionDiagnostics | null;
 }): Response {
-	const { accounts, recoveries, now } = options;
+	const {
+		accounts,
+		recoveries,
+		now,
+		attemptedRoutes,
+		routingSelectionDiagnostics,
+	} = options;
 	const nextAvailableAt = Math.min(
 		...recoveries.map((recovery) => recovery.availableAt),
 	);
@@ -452,16 +525,25 @@ function createPoolExhaustedResponse(options: {
 		1,
 		Math.ceil((nextAvailableAt - now) / 1000),
 	);
+	const error: Record<string, unknown> = {
+		type: "pool_exhausted",
+		code: "pool_exhausted",
+		message: "All compatible account routes are temporarily unavailable.",
+		next_available_at: new Date(nextAvailableAt).toISOString(),
+		accounts: accountInfos,
+	};
+	if (attemptedRoutes !== undefined) {
+		error.attempted_routes = attemptedRoutes;
+	}
+	if (routingSelectionDiagnostics != null) {
+		error.routing_diagnostics = serializeRoutingSelectionDiagnostics(
+			routingSelectionDiagnostics,
+		);
+	}
 	return new Response(
 		JSON.stringify({
 			type: "error",
-			error: {
-				type: "pool_exhausted",
-				code: "pool_exhausted",
-				message: "All compatible account routes are temporarily unavailable.",
-				next_available_at: new Date(nextAvailableAt).toISOString(),
-				accounts: accountInfos,
-			},
+			error,
 		}),
 		{
 			status: 503,
@@ -480,6 +562,7 @@ function createRouteUnavailableResponse(options: {
 	now: number;
 	message?: string;
 	attemptedRoutes?: number;
+	routingSelectionDiagnostics?: RoutingSelectionDiagnostics | null;
 	routeCircuitRecoveryHint?: RouteCircuitRecoveryHint | null;
 }): Response {
 	const { accounts, now } = options;
@@ -496,6 +579,11 @@ function createRouteUnavailableResponse(options: {
 	};
 	if (options.attemptedRoutes !== undefined) {
 		error.attempted_routes = options.attemptedRoutes;
+	}
+	if (options.routingSelectionDiagnostics != null) {
+		error.routing_diagnostics = serializeRoutingSelectionDiagnostics(
+			options.routingSelectionDiagnostics,
+		);
 	}
 	const headers = new Headers({ "content-type": "application/json" });
 	if (
@@ -587,7 +675,11 @@ export function createRoutingTerminalResponse(
 				now,
 				message: options.message,
 				attemptedRoutes:
-					options.source === "attempts" ? options.upstreamAttempts : undefined,
+					options.source === "selection" ? 0 : options.upstreamAttempts,
+				routingSelectionDiagnostics:
+					options.source === "selection"
+						? options.routingSelectionDiagnostics
+						: undefined,
 				// Do not expose even a finite circuit reopen time: any recovery marker,
 				// Retry-After hint, or legacy pool body would authorize guard replay.
 				routeCircuitRecoveryHint: null,
@@ -621,6 +713,11 @@ export function createRoutingTerminalResponse(
 				rateLimitOutcomes: options.rateLimitOutcomes,
 				now,
 				modelRecoveryAt: options.modelRecoveryAt,
+				attemptedRoutes: options.source === "selection" ? 0 : undefined,
+				routingSelectionDiagnostics:
+					options.source === "selection"
+						? options.routingSelectionDiagnostics
+						: undefined,
 			}),
 		};
 	}
@@ -639,8 +736,8 @@ export function createRoutingTerminalResponse(
 				accounts: options.accounts,
 				now,
 				message: options.message,
-				attemptedRoutes:
-					options.source === "attempts" ? options.upstreamAttempts : undefined,
+				attemptedRoutes: options.upstreamAttempts,
+				routingSelectionDiagnostics: undefined,
 				routeCircuitRecoveryHint: options.routeCircuitRecoveryHint,
 			}),
 		};
@@ -679,6 +776,11 @@ export function createRoutingTerminalResponse(
 				accounts: options.accounts,
 				recoveries,
 				now,
+				attemptedRoutes: options.source === "selection" ? 0 : undefined,
+				routingSelectionDiagnostics:
+					options.source === "selection"
+						? options.routingSelectionDiagnostics
+						: undefined,
 			}),
 		};
 	}
@@ -690,7 +792,11 @@ export function createRoutingTerminalResponse(
 			now,
 			message: options.message,
 			attemptedRoutes:
-				options.source === "attempts" ? options.upstreamAttempts : undefined,
+				options.source === "selection" ? 0 : options.upstreamAttempts,
+			routingSelectionDiagnostics:
+				options.source === "selection"
+					? options.routingSelectionDiagnostics
+					: undefined,
 			routeCircuitRecoveryHint: options.routeCircuitRecoveryHint,
 		}),
 	};

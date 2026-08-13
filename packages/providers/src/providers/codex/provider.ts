@@ -389,6 +389,24 @@ const CODEX_ERROR_TYPE_BY_CODE: Record<string, string> = {
 	usage_not_included: "permission_error",
 };
 
+// A Codex SSE body is often delivered with HTTP 200 even when its terminal
+// event carries an error. Conversely, a definitive transport response (401,
+// 403, 429, or 529) can still contain an SSE-shaped error body. The latter
+// status is authoritative for non-streaming callers; otherwise the normalized
+// body mapping remains the source of truth (especially for HTTP 200).
+const CODEX_DEFINITIVE_TRANSPORT_STATUSES = new Set([401, 403, 429, 529]);
+const CODEX_MAPPED_ERROR_STATUSES = new Set([400, 401, 403, 429, 502, 529]);
+
+function shouldPreserveCodexTransportStatus(
+	transportStatus: number,
+	bodyStatus: number,
+): boolean {
+	return (
+		CODEX_DEFINITIVE_TRANSPORT_STATUSES.has(transportStatus) &&
+		CODEX_MAPPED_ERROR_STATUSES.has(bodyStatus)
+	);
+}
+
 // Buffered tool-call argument bytes are bounded by two independent policies
 // (packages/core/src/constants.ts): a per-call cap on any single function
 // call's accumulated argument buffer, and a separate aggregate cap across
@@ -2710,8 +2728,17 @@ export class CodexProvider extends BaseProvider {
 		if (errorPayload) {
 			const headers = sanitizeResponseHeaders(response.headers);
 			headers.set("content-type", "application/json");
-			const { status, statusText } =
-				this.httpStatusForAnthropicErrorPayload(errorPayload);
+			const bodyStatus = this.httpStatusForAnthropicErrorPayload(errorPayload);
+			const preserveTransportStatus = shouldPreserveCodexTransportStatus(
+				response.status,
+				bodyStatus.status,
+			);
+			const status = preserveTransportStatus
+				? response.status
+				: bodyStatus.status;
+			const statusText = preserveTransportStatus
+				? response.statusText || bodyStatus.statusText
+				: bodyStatus.statusText;
 			return new Response(JSON.stringify(errorPayload), {
 				status,
 				statusText,
