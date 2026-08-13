@@ -233,6 +233,7 @@ async function requestWhamUsage(
  */
 export async function fetchCodexUsageData(
 	accessToken: string,
+	externalSignal?: AbortSignal,
 ): Promise<UsageFetchResult> {
 	if (!accessToken || accessToken.trim() === "") {
 		return { data: null, retryAfterMs: null };
@@ -246,6 +247,9 @@ export async function fetchCodexUsageData(
 	// wedging the per-account in-flight dedup and the polling loop.
 	const controller = new AbortController();
 	const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+	const abort = () => controller.abort();
+	externalSignal?.addEventListener("abort", abort, { once: true });
+	if (externalSignal?.aborted) controller.abort();
 	// Snapshot the module global BEFORE any await: a concurrent call may flip
 	// it mid-flight, and the 404 counterpart must derive from the URL this
 	// call actually tried, not from whatever the global says afterwards.
@@ -322,5 +326,6 @@ export async function fetchCodexUsageData(
 		return { data: null, retryAfterMs: null };
 	} finally {
 		clearTimeout(timeoutId);
+		externalSignal?.removeEventListener("abort", abort);
 	}
 }
