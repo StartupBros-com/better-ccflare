@@ -17,6 +17,7 @@ import {
 } from "../ui/select";
 import { formatPredictionAnnotation } from "./chart-data";
 import {
+	fleetTruncationNotice,
 	pickDefaultAccount,
 	rangeToMs,
 	sortAccountsActiveFirst,
@@ -49,6 +50,8 @@ export function UsageHistoryTab() {
 		isFleet,
 	);
 	const windows = data?.windows ?? [];
+	// Null unless the server capped the fleet response by its point budget.
+	const truncationNotice = fleetTruncationNotice(fleetData);
 	// Bucket "now" to 1-minute granularity (matching the chart's nowBucket) so the
 	// per-window annotations use a single, stable reference rather than a fresh
 	// Date.now() per window per render — avoids sub-minute ETA display drift.
@@ -86,7 +89,11 @@ export function UsageHistoryTab() {
 			</div>
 
 			{isFleet ? (
-				<Card className="p-4">
+				<Card className="p-4 space-y-2">
+					{truncationNotice && (
+						// Informational, not an error: the fleet view is capped, not broken.
+						<p className="text-xs text-muted-foreground">{truncationNotice}</p>
+					)}
 					<FleetUsageChart
 						accounts={fleetData?.accounts ?? []}
 						loading={fleetLoading}

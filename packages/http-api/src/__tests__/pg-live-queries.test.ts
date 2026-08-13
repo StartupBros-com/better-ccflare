@@ -945,11 +945,85 @@ describe.skipIf(!livePgAvailable)(
 				expect(res.status).toBe(200);
 			});
 
-			liveIt("returns 400 without the account parameter", async () => {
+			// An omitted account param is fleet mode, not an error. This
+			// previously asserted 400 — a behaviour the handler had already
+			// dropped, hidden because the whole block skips without a live PG.
+			liveIt("treats an omitted account parameter as fleet mode", async () => {
 				const res = await createUsageHistoryHandler(context)(
 					new URLSearchParams("range=24h"),
 				);
-				expect(res.status).toBe(400);
+				expect(res.status).toBe(200);
+			});
+
+			liveIt(
+				"executes the set-based fleet query across accounts on PostgreSQL",
+				async () => {
+					// The fleet read buckets in SQL and filters with `account_id IN
+					// (...)`; both are dialect hazards SQLite would not surface.
+					await seedAccount({ id: "fleet-1", name: "fleet one" });
+					await seedAccount({ id: "fleet-2", name: "fleet two" });
+					for (const id of ["fleet-1", "fleet-2"]) {
+						await dbOps.recordUsageSnapshot(
+							id,
+							{
+								five_hour: { utilization: 12, resets_at: now + HOUR },
+								seven_day: { utilization: 34, resets_at: now + 24 * HOUR },
+							},
+							now - HOUR,
+						);
+					}
+
+					const res = await createUsageHistoryHandler(context)(
+						new URLSearchParams("account=all&range=24h"),
+					);
+					expect(res.status).toBe(200);
+					const body = (await readJson(res)) as {
+						accounts: {
+							accountId: string;
+							accountName: string;
+							windows: { window: string; points: unknown[] }[];
+						}[];
+						truncated: boolean;
+						returnedPointCount: number;
+					};
+					const seeded = body.accounts.filter((a) =>
+						a.accountId.startsWith("fleet-"),
+					);
+					expect(seeded.map((a) => a.accountId)).toEqual([
+						"fleet-1",
+						"fleet-2",
+					]);
+					expect(seeded[0].accountName).toBe("fleet one");
+					expect(seeded[0].windows.map((w) => w.window).sort()).toEqual([
+						"five_hour",
+						"seven_day",
+					]);
+					expect(body.truncated).toBe(false);
+					expect(body.returnedPointCount).toBeGreaterThanOrEqual(4);
+				},
+			);
+
+			liveIt("applies the fleet window filter on PostgreSQL", async () => {
+				await seedAccount({ id: "fleet-w", name: "fleet window" });
+				await dbOps.recordUsageSnapshot(
+					"fleet-w",
+					{
+						five_hour: { utilization: 12, resets_at: now + HOUR },
+						seven_day: { utilization: 34, resets_at: now + 24 * HOUR },
+					},
+					now - HOUR,
+				);
+
+				const res = await createUsageHistoryHandler(context)(
+					new URLSearchParams("account=all&range=24h&window=seven_day"),
+				);
+				expect(res.status).toBe(200);
+				const body = (await readJson(res)) as {
+					accounts: { windows: { window: string }[] }[];
+				};
+				for (const account of body.accounts) {
+					expect(account.windows.map((w) => w.window)).toEqual(["seven_day"]);
+				}
 			});
 		});
 
