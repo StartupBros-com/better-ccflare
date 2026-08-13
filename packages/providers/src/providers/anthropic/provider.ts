@@ -181,7 +181,7 @@ export class AnthropicProvider extends BaseProvider {
 
 		// Keep refresh diagnostics useful without dumping provider headers such as
 		// Set-Cookie or authorization-like values into logs.
-		log.debug(`Response status: ${response.status} ${response.statusText}`, {
+		log.debug(`Response status: ${response.status}`, {
 			headers: {
 				contentType: response.headers.get("content-type"),
 				retryAfter: response.headers.get("retry-after"),
