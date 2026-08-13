@@ -52,9 +52,40 @@ describe("sanitizeProxyHeaders", () => {
 		expect(sanitized.has(CODEX_LOGICAL_MODEL_FAMILY_HEADER)).toBe(false);
 		expect(sanitized.get("content-type")).toBe("application/json");
 	});
+
+	test("strips the Codex turn-state routing token from raw upstream responses", () => {
+		const original = new Headers({
+			"content-type": "application/json",
+			"X-Codex-Turn-State": "server-private-turn-state",
+		});
+
+		const sanitized = sanitizeProxyHeaders(original);
+
+		expect(sanitized.has("x-codex-turn-state")).toBe(false);
+		expect(sanitized.get("content-type")).toBe("application/json");
+	});
 });
 
 describe("withSanitizedProxyHeaders", () => {
+	test("does not leak the Codex turn-state token on a raw error response", () => {
+		// Terminal 400/404 and retained responses are returned raw through this
+		// helper, bypassing the Codex provider's own response sanitizer.
+		for (const status of [400, 404]) {
+			const upstream = new Response("upstream error", {
+				status,
+				headers: {
+					"content-type": "application/json",
+					"x-codex-turn-state": "server-private-turn-state",
+				},
+			});
+
+			const sanitized = withSanitizedProxyHeaders(upstream);
+
+			expect(sanitized.headers.has("x-codex-turn-state")).toBe(false);
+			expect(sanitized.status).toBe(status);
+		}
+	});
+
 	test("produces a response without the reserved pool-status header", () => {
 		const upstream = new Response("body", {
 			status: 503,

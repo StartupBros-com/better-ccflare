@@ -4130,10 +4130,18 @@ export class CodexProvider extends BaseProvider {
 					messageDelta.context_window = state.contextWindow;
 				}
 
-				writeCodexStreamTerminalTrace(state, messageDelta.delta.stop_reason);
+				// Commit turn state only once both terminal frames are enqueued.
+				// `writeCodexStreamTerminalTrace` finalizes the coordinator entry,
+				// so running it first would capture or advance a turn whose response
+				// the client never receives: a cancel or enqueue failure between the
+				// two awaits would leave the next request replaying a token for a
+				// turn that did not complete. If either write throws, the cancel
+				// callback and the stream catch block finalize as `error` instead,
+				// which never mutates turn state.
 				await writeSSE("message_delta", messageDelta);
 				await writeSSE("message_stop", { type: "message_stop" });
 				state.hasSentTerminalEvents = true;
+				writeCodexStreamTerminalTrace(state, messageDelta.delta.stop_reason);
 				break;
 			}
 			default:

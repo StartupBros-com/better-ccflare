@@ -534,6 +534,10 @@ export class CodexTurnStateCoordinator {
 			);
 		}
 		generationEntry ??= this.advanceGeneration(scopeKey, arm, now, config);
+		// `touch` only reorders the LRU. Without refreshing the timestamp the sweep
+		// expires a scope measured from turn creation, so an active turn whose
+		// continuations keep arriving is still dropped once it outlives the TTL.
+		generationEntry.updatedAt = now;
 		this.touch(this.generations, scopeKey, generationEntry);
 		this.enforceEntryLimit(config.maxEntries);
 
@@ -544,6 +548,17 @@ export class CodexTurnStateCoordinator {
 			pending.lineageKey !== input.lineage.key ||
 			pending.generation !== generationEntry.generation
 		) {
+			// This attempt is not continuing the pending turn. It may still capture
+			// state when there is nothing to protect -- no entry, or only a stale
+			// one from a superseded generation. But a live entry in this generation
+			// belongs to another logical request, whether that request currently
+			// holds the lease or merely captured and has not sent its continuation
+			// yet. Letting this attempt reach a mutating terminal would overwrite
+			// the owner's token on `tool_use` or delete it outright on `end_turn`.
+			const foreignPending =
+				pending !== undefined &&
+				pending.generation === generationEntry.generation &&
+				pending.leaseRequestId !== input.requestId;
 			return this.recordAttempt(
 				input,
 				scopeKey,
@@ -553,6 +568,8 @@ export class CodexTurnStateCoordinator {
 				false,
 				now,
 				config,
+				undefined,
+				!foreignPending,
 			);
 		}
 		if (
@@ -633,9 +650,26 @@ export class CodexTurnStateCoordinator {
 		if (!generation || generation.generation !== attempt.generation) {
 			return "stale_generation";
 		}
+		// Resolving a terminal is activity on this scope; keep it from expiring
+		// mid-turn (see the matching refresh in `beginAttempt`).
+		generation.updatedAt = now;
+		this.touch(this.generations, attempt.scopeKey, generation);
 		if (attempt.arm === "observe") return "observed";
 		if (attempt.arm === "ineligible") return "ineligible";
 		if (input.stopReason === "error") return "error_ignored";
+		// Only the request holding the pending lease may mutate it. A request that
+		// arrived with a different lineage, or that lost the lease race, still
+		// reaches a terminal on this scope; capturing over the entry or retiring it
+		// here would corrupt the owner's turn.
+		const leased = this.pending.get(attempt.scopeKey);
+		if (
+			leased &&
+			leased.generation === attempt.generation &&
+			leased.leaseRequestId !== undefined &&
+			leased.leaseRequestId !== attempt.requestId
+		) {
+			return "stale_generation";
+		}
 		if (input.stopReason !== "tool_use") {
 			this.pending.delete(attempt.scopeKey);
 			return "retired";

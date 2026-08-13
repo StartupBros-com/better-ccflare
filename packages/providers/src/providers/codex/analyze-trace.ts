@@ -423,6 +423,18 @@ export interface TurnStateExperimentRow {
 
 export interface TurnStateCacheExperimentReport {
 	assignmentCounts: Record<TurnStateExperimentArm, number>;
+	/**
+	 * Report-wide prompt-key pressure, aggregated over every physical attempt
+	 * before rows are partitioned. Row-level concentration divides one key across
+	 * arm/model/turn/gap/context rows, so a key that exceeds the documented
+	 * 15 requests/minute/key guard can sit below the threshold in every row. This
+	 * field is the guard's authoritative view.
+	 */
+	promptKeyConcentration: {
+		distinctKeys: number;
+		maxRequestsPerKeyMinute: number;
+		keysOver15RequestsPerMinute: number;
+	};
 	rows: TurnStateExperimentRow[];
 }
 
@@ -2905,6 +2917,11 @@ function analyzeTurnStateCacheExperiments(
 		unassigned: 0,
 	};
 	const rows = new Map<string, TurnStateExperimentRowAccumulator>();
+	// Row-level concentration answers "was this cohort hot"; the guard asks
+	// "was this key hot", and one key legitimately spans several arm/model/turn/
+	// gap/context rows. Accumulate the same attempt timestamps once more here so
+	// the 15 requests/minute/key ceiling is evaluated on the whole key.
+	const reportKeyTimestamps = new Map<string, number[]>();
 	for (const sample of annotated) {
 		assignmentCounts[sample.arm]++;
 		const rowKey = [
@@ -2945,6 +2962,9 @@ function analyzeTurnStateCacheExperiments(
 			const timestamps = row.keyTimestamps.get(key) ?? [];
 			timestamps.push(attemptTimestamp);
 			row.keyTimestamps.set(key, timestamps);
+			const reportTimestamps = reportKeyTimestamps.get(key) ?? [];
+			reportTimestamps.push(attemptTimestamp);
+			reportKeyTimestamps.set(key, reportTimestamps);
 		}
 		const response = sample.response;
 		if (!response) {
@@ -3042,7 +3062,20 @@ function analyzeTurnStateCacheExperiments(
 			GAP_ORDER.indexOf(a.gapBand) - GAP_ORDER.indexOf(b.gapBand) ||
 			a.contextBand.localeCompare(b.contextBand),
 	);
-	return { assignmentCounts, rows: finishedRows };
+	const reportConcentrations = [...reportKeyTimestamps.values()].map(
+		maximumRequestsPerMinute,
+	);
+	return {
+		assignmentCounts,
+		promptKeyConcentration: {
+			distinctKeys: reportKeyTimestamps.size,
+			maxRequestsPerKeyMinute: Math.max(0, ...reportConcentrations),
+			keysOver15RequestsPerMinute: reportConcentrations.filter(
+				(concentration) => concentration > 15,
+			).length,
+		},
+		rows: finishedRows,
+	};
 }
 
 /**
@@ -3664,7 +3697,7 @@ export function formatCacheExperimentReport(
 	append("EXPLICIT BREAKPOINT CANARY", report.explicitBreakpoint);
 	lines.push(
 		"",
-		`HTTP TURN STATE CANARY: assignments=${JSON.stringify(report.turnState.assignmentCounts)}`,
+		`HTTP TURN STATE CANARY: assignments=${JSON.stringify(report.turnState.assignmentCounts)} prompt_key_concentration=${JSON.stringify(report.turnState.promptKeyConcentration)}`,
 	);
 	for (const row of report.turnState.rows)
 		lines.push(`  ${JSON.stringify(row)}`);

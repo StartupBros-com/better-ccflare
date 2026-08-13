@@ -131,6 +131,64 @@ describe("analyzeCodexCacheExperiments", () => {
 		}
 	});
 
+	test("reports prompt-key pressure across rows, not only within one row", () => {
+		// One key receiving 16 requests inside a minute, split evenly across two
+		// context bands. Row-level concentration sees 8 per row and reports no
+		// violation; the 15 requests/minute/key guard has to see all 16.
+		const records = Array.from({ length: 16 }, (_, index) => {
+			const ts = `2026-08-13T00:00:${String(index).padStart(2, "0")}.000Z`;
+			return [
+				{
+					trace_schema_version: 18 as const,
+					phase: "request" as const,
+					ts,
+					request_id: `private-logical-${index}`,
+					attempt_id: `private-attempt-${index}`,
+					attempt_ordinal: 1,
+					attempt_cause: "initial" as const,
+					model_out: "gpt-5.6-sol",
+					prompt_cache_key_id: "private-shared-key",
+					codex_turn_state_arm: "treatment" as const,
+					codex_turn_state_cohort_id: "0123456789abcdef",
+					codex_turn_state_request_action: "replay" as const,
+					codex_turn_state_replay_applied: true,
+				},
+				{
+					trace_schema_version: 18 as const,
+					phase: "response" as const,
+					ts,
+					request_id: `private-logical-${index}`,
+					attempt_id: `private-attempt-${index}`,
+					stop_reason: "end_turn" as const,
+					input_tokens: 1_000,
+					cache_read_input_tokens: 900,
+					cache_creation_input_tokens: 0,
+					cache_creation_measurement_available: true,
+					// Alternating bands put the same key in two different rows.
+					context_utilization_pct: index % 2 === 0 ? 40 : 75,
+					codex_turn_state_terminal_action: "advanced" as const,
+				},
+			];
+		}).flat();
+
+		const report = analyzeCodexCacheExperiments(records);
+
+		for (const row of report.turnState.rows) {
+			expect(row.promptKeyConcentration.keysOver15RequestsPerMinute).toBe(0);
+			expect(row.promptKeyConcentration.maxRequestsPerKeyMinute).toBeLessThan(
+				16,
+			);
+		}
+		expect(report.turnState.promptKeyConcentration).toEqual({
+			distinctKeys: 1,
+			maxRequestsPerKeyMinute: 16,
+			keysOver15RequestsPerMinute: 1,
+		});
+		expect(formatCacheExperimentReport(report)).not.toContain(
+			"private-shared-key",
+		);
+	});
+
 	test("groups the pacing canary by arm, model, turn, and gap band", () => {
 		const report = analyzeCodexCacheExperiments([
 			{

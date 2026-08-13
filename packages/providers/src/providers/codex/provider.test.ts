@@ -385,6 +385,84 @@ describe("CodexProvider HTTP turn state", () => {
 		);
 		expect(newTurn.headers.get(turnStateHeader)).toBeNull();
 	});
+
+	it("does not capture turn state when the client disconnects before the terminal frames", async () => {
+		enableTreatment();
+		const provider = new CodexProvider();
+		const initialMessages = [{ role: "user", content: firstUserText }];
+		await provider.transformRequestBody(
+			requestFor("cancel-request-1", "cancel-attempt-1", initialMessages, true),
+			account,
+		);
+
+		const transformed = await provider.processResponse(
+			toolResponse(
+				"cancel-request-1",
+				"cancel-attempt-1",
+				"cancel-call-1",
+				"cancelled-turn-token",
+				true,
+			),
+			null,
+		);
+		const body = transformed.body;
+		if (!body) throw new Error("expected a streaming downstream body");
+		const reader = body.getReader();
+		const decoder = new TextDecoder();
+		let seen = "";
+		let sawTerminalDelta = false;
+		// Stop reading the instant message_delta lands and cancel before the
+		// transform can enqueue message_stop. This is the exact window the fix
+		// covers: the turn has reached its terminal event upstream, but the
+		// client never receives the completed response.
+		while (!sawTerminalDelta) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			seen += decoder.decode(value, { stream: true });
+			sawTerminalDelta = seen.includes("event: message_delta");
+		}
+		expect(sawTerminalDelta).toBe(true);
+		expect(seen).not.toContain("event: message_stop");
+		// Synchronous with the read that drained message_delta, so the transform
+		// observes the cancellation before its next enqueue.
+		await reader.cancel("client disconnected");
+
+		// The turn never completed downstream, so its token must not become
+		// replayable state for the next physical request.
+		const continuation = await provider.transformRequestBody(
+			requestFor(
+				"cancel-request-2",
+				"cancel-attempt-2",
+				[
+					...initialMessages,
+					{
+						role: "assistant",
+						content: [
+							{
+								type: "tool_use",
+								id: "cancel-call-1",
+								name: "search",
+								input: {},
+							},
+						],
+					},
+					{
+						role: "user",
+						content: [
+							{
+								type: "tool_result",
+								tool_use_id: "cancel-call-1",
+								content: "result",
+							},
+						],
+					},
+				],
+				true,
+			),
+			account,
+		);
+		expect(continuation.headers.get(turnStateHeader)).toBeNull();
+	});
 });
 
 describe("CodexProvider HTTP turn-state failure paths", () => {

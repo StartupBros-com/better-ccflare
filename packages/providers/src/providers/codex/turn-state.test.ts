@@ -470,6 +470,185 @@ describe("CodexTurnStateCoordinator", () => {
 		expect(continuation.replayApplied).toBe(false);
 	});
 
+	test("refuses terminal mutation from a request that never held the pending lease", () => {
+		enableTreatment();
+		for (const intruderStop of ["tool_use", "end_turn"] as const) {
+			const coordinator = new CodexTurnStateCoordinator();
+			coordinator.beginAttempt(
+				beginInput({
+					requestId: "request-owner-1",
+					attemptId: "attempt-owner-1",
+				}),
+			);
+			expect(
+				coordinator.finalizeAttempt({
+					attemptId: "attempt-owner-1",
+					stopReason: "tool_use",
+					responseTurnState: "turn-token-1",
+					outputLineage: lineage("call-1"),
+				}),
+			).toBe("captured");
+
+			// The owner leases the pending lineage for its continuation.
+			expect(
+				coordinator.beginAttempt(
+					beginInput({
+						requestId: "request-owner-2",
+						attemptId: "attempt-owner-2",
+						lineage: lineage("call-1"),
+					}),
+				),
+			).toMatchObject({ replayApplied: true, turnState: "turn-token-1" });
+
+			// A different logical request, carrying a different lineage, reaches a
+			// terminal on the same scope. It must not capture over the leased entry
+			// nor retire it.
+			coordinator.beginAttempt(
+				beginInput({
+					requestId: "request-intruder",
+					attemptId: "attempt-intruder",
+					lineage: lineage("call-999"),
+				}),
+			);
+			expect(
+				coordinator.finalizeAttempt({
+					attemptId: "attempt-intruder",
+					stopReason: intruderStop,
+					responseTurnState: "intruder-token",
+					outputLineage:
+						intruderStop === "tool_use"
+							? lineage("call-intruder")
+							: { kind: "none" },
+				}),
+			).toBe("stale_generation");
+
+			// The owner still advances its own turn with its own unchanged token.
+			expect(
+				coordinator.finalizeAttempt({
+					attemptId: "attempt-owner-2",
+					stopReason: "tool_use",
+					responseTurnState: "turn-token-1",
+					outputLineage: lineage("call-2"),
+				}),
+			).toBe("advanced");
+			expect(
+				coordinator.beginAttempt(
+					beginInput({
+						requestId: "request-owner-3",
+						attemptId: "attempt-owner-3",
+						lineage: lineage("call-2"),
+					}),
+				),
+			).toMatchObject({ replayApplied: true, turnState: "turn-token-1" });
+		}
+	});
+
+	test("refuses terminal mutation from a foreign lineage while the captured turn sits unleased", () => {
+		enableTreatment();
+		for (const intruderStop of ["tool_use", "end_turn"] as const) {
+			const coordinator = new CodexTurnStateCoordinator();
+			coordinator.beginAttempt(
+				beginInput({
+					requestId: "request-owner-1",
+					attemptId: "attempt-owner-1",
+				}),
+			);
+			expect(
+				coordinator.finalizeAttempt({
+					attemptId: "attempt-owner-1",
+					stopReason: "tool_use",
+					responseTurnState: "turn-token-1",
+					outputLineage: lineage("call-1"),
+				}),
+			).toBe("captured");
+
+			// A capture leaves the pending entry unleased until the owner's
+			// continuation arrives. A divergent request landing in that window is
+			// still not the turn's owner: it must neither capture over the entry
+			// nor retire it.
+			coordinator.beginAttempt(
+				beginInput({
+					requestId: "request-intruder",
+					attemptId: "attempt-intruder",
+					lineage: lineage("call-999"),
+				}),
+			);
+			expect(
+				coordinator.finalizeAttempt({
+					attemptId: "attempt-intruder",
+					stopReason: intruderStop,
+					responseTurnState: "intruder-token",
+					outputLineage:
+						intruderStop === "tool_use"
+							? lineage("call-intruder")
+							: { kind: "none" },
+				}),
+			).toBe("stale_generation");
+
+			// The owner's continuation still replays the original token.
+			expect(
+				coordinator.beginAttempt(
+					beginInput({
+						requestId: "request-owner-2",
+						attemptId: "attempt-owner-2",
+						lineage: lineage("call-1"),
+					}),
+				),
+			).toMatchObject({ replayApplied: true, turnState: "turn-token-1" });
+		}
+	});
+
+	test("keeps an active turn alive across the idle TTL boundary", () => {
+		enableTreatment();
+		process.env[CODEX_TURN_STATE_IDLE_TTL_MS_ENV] = "60000";
+		let clock = 0;
+		const coordinator = new CodexTurnStateCoordinator({ now: () => clock });
+
+		coordinator.beginAttempt(beginInput({ attemptId: "attempt-1" }));
+		expect(
+			coordinator.finalizeAttempt({
+				attemptId: "attempt-1",
+				stopReason: "tool_use",
+				responseTurnState: "turn-token-1",
+				outputLineage: lineage("call-1"),
+			}),
+		).toBe("captured");
+
+		// Activity at 40s is inside the TTL and must refresh the whole scope, not
+		// just the pending entry.
+		clock = 40_000;
+		expect(
+			coordinator.beginAttempt(
+				beginInput({
+					requestId: "request-2",
+					attemptId: "attempt-2",
+					lineage: lineage("call-1"),
+				}),
+			),
+		).toMatchObject({ replayApplied: true, turnState: "turn-token-1" });
+		expect(
+			coordinator.finalizeAttempt({
+				attemptId: "attempt-2",
+				stopReason: "tool_use",
+				responseTurnState: "turn-token-1",
+				outputLineage: lineage("call-2"),
+			}),
+		).toBe("advanced");
+
+		// 80s is past the TTL measured from turn creation, but only 40s since the
+		// last activity, so the turn must survive.
+		clock = 80_000;
+		expect(
+			coordinator.beginAttempt(
+				beginInput({
+					requestId: "request-3",
+					attemptId: "attempt-3",
+					lineage: lineage("call-2"),
+				}),
+			),
+		).toMatchObject({ replayApplied: true, turnState: "turn-token-1" });
+	});
+
 	test("fences in-flight treatment responses when policy becomes observe-only", () => {
 		enableTreatment();
 		const coordinator = new CodexTurnStateCoordinator();
