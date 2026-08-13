@@ -39,6 +39,19 @@ describe("OpenRouterProvider", () => {
 		});
 	});
 
+	describe("prepareHeaders", () => {
+		it("should send OpenRouter API keys as bearer authorization", () => {
+			const headers = provider.prepareHeaders(
+				new Headers({ authorization: "Bearer client-token" }),
+				undefined,
+				"test-api-key",
+			);
+
+			expect(headers.get("authorization")).toBe("Bearer test-api-key");
+			expect(headers.get("x-api-key")).toBeNull();
+		});
+	});
+
 	describe("buildUrl", () => {
 		it("should join Claude Code /v1/messages onto OpenRouter's /api/v1 base without duplicating /v1", () => {
 			const url = provider.buildUrl("/v1/messages", "", mockAccount);

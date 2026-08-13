@@ -145,7 +145,10 @@ export abstract class BaseAnthropicCompatibleProvider extends BaseProvider {
 				const headerName = this.getAuthHeader();
 				const authType = this.getAuthType();
 
-				if (headerName === "authorization" && authType === "bearer") {
+				if (
+					headerName.toLowerCase() === "authorization" &&
+					authType === "bearer"
+				) {
 					newHeaders.set(headerName, `Bearer ${token}`);
 				} else {
 					newHeaders.set(headerName, token);
