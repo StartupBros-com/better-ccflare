@@ -2,6 +2,8 @@
  * Custom error classes for standardized error handling across the application
  */
 
+import { MAX_OAUTH_ERROR_INPUT_LENGTH } from "./oauth-response";
+
 /**
  * Base error class for all application errors
  */
@@ -90,7 +92,6 @@ const MAX_OAUTH_ERROR_MESSAGE_LENGTH = 1024;
 // Do not parse arbitrarily large provider error bodies. The response has
 // already been bounded by the provider's fetch path where possible, but this
 // helper is also called on caught/forwarded values from shared refresh code.
-const MAX_OAUTH_ERROR_INPUT_LENGTH = 64 * 1024;
 
 const INVALID_GRANT_CODES = new Set<string>(INVALID_GRANT_MARKERS);
 
@@ -199,6 +200,33 @@ export function getOAuthErrorCode(input: unknown): string {
 /** True only for an explicit structured terminal OAuth machine code. */
 export function isStructuredInvalidGrant(input: unknown): boolean {
 	return Boolean(getOAuthErrorCode(input));
+}
+
+/** True only when a non-JSON provider body is exactly a terminal OAuth code. */
+export function isExactInvalidGrantMessage(input: unknown): boolean {
+	if (typeof input !== "string") return false;
+	if (input.length > MAX_OAUTH_ERROR_INPUT_LENGTH) return false;
+	const normalized = input
+		.replace(/\p{Cc}/gu, " ")
+		.replace(/\s+/g, " ")
+		.trim()
+		.toLowerCase();
+	return INVALID_GRANT_CODES.has(normalized);
+}
+
+/**
+ * Return the terminal OAuth marker only when a raw response is exactly one of
+ * the known machine codes. This is intentionally separate from
+ * `getOAuthErrorCode`, which only accepts structured payload fields; callers
+ * must also prove that the response was not truncated before using this value.
+ */
+export function getExactOAuthErrorCode(input: unknown): string {
+	if (!isExactInvalidGrantMessage(input)) return "";
+	return (input as string)
+		.replace(/\p{Cc}/gu, " ")
+		.replace(/\s+/g, " ")
+		.trim()
+		.toLowerCase();
 }
 
 /**

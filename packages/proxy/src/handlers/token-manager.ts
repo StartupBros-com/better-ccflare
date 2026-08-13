@@ -1,7 +1,6 @@
 import {
 	authFailureEvents,
 	formatOAuthErrorMessage,
-	isInvalidGrantMessage,
 	isStructuredInvalidGrant,
 	OAuthRefreshTokenError,
 	PAUSE_REASON_NEEDS_REAUTH,
@@ -118,28 +117,26 @@ export function clearStaleTokenRefreshState(accountId: string): void {
 
 /**
  * Distinguish a revoked/invalid OAuth refresh token from a transient refresh
- * transport failure. `refreshAccessTokenSafe` wraps provider errors in a
- * TokenRefreshError, preserving the provider message in `context.originalError`;
- * inspect both layers so callers do not durably pause an account for a timeout.
+ * transport failure. Durable classification requires typed provider evidence,
+ * an explicit structured OAuth machine code, or terminal evidence preserved in
+ * the private WeakSet when `refreshAccessTokenSafe` wraps the provider error.
+ * Human-readable Error messages are intentionally never scanned for markers.
  */
 export function isTerminalTokenRefreshFailure(error: unknown): boolean {
 	if (typeof error === "object" && error !== null) {
 		if (terminalRefreshFailures.has(error)) return true;
 	}
 	if (error instanceof OAuthRefreshTokenError) return true;
-	const messages: string[] = [];
 	if (isStructuredInvalidGrant(error)) return true;
-	if (error instanceof Error) messages.push(error.message);
 	if (typeof error === "object" && error !== null) {
 		const context = (error as { context?: unknown }).context;
 		if (typeof context === "object" && context !== null) {
 			const originalError = (context as { originalError?: unknown })
 				.originalError;
 			if (isStructuredInvalidGrant(originalError)) return true;
-			if (typeof originalError === "string") messages.push(originalError);
 		}
 	}
-	return messages.some((message) => isInvalidGrantMessage(message));
+	return false;
 }
 
 // Keep the refresh credential identity alongside a wrapped failure without
@@ -268,8 +265,10 @@ export async function pauseAccountForUpstreamAuthFailure(
  * balancer fails over and the account is flagged for re-auth. Guarded on the
  * account still being active *and* still holding the refresh token that failed,
  * so it never clobbers a manual pause or re-pauses a freshly re-authenticated
- * account. Detection covers both the typed `OAuthRefreshTokenError` and the
- * message string (other OAuth providers). Returns true if it paused.
+ * account. Detection accepts only a typed `OAuthRefreshTokenError` or an
+ * explicit structured OAuth machine code, including structured evidence in a
+ * legacy error context. Human-readable Error messages cannot trigger a durable
+ * pause. Returns true if it paused.
  *
  * Shared by every refresh path: `refreshAccessTokenSafe` (real requests) and
  * the proactive Codex refresher in the auto-refresh scheduler.
@@ -295,20 +294,10 @@ export async function pauseAccountForReauthIfInvalidGrant(
 			? (error as { context: { originalError?: unknown } }).context
 					.originalError
 			: undefined;
-	const message =
-		error instanceof Error
-			? error.message
-			: typeof error === "string"
-				? error
-				: "";
-	const contextOriginalMessage =
-		typeof contextOriginalError === "string" ? contextOriginalError : undefined;
 	const isInvalidGrant =
 		error instanceof OAuthRefreshTokenError ||
 		structuredTerminal ||
-		isStructuredInvalidGrant(contextOriginalError) ||
-		isInvalidGrantMessage(message) ||
-		isInvalidGrantMessage(contextOriginalMessage);
+		isStructuredInvalidGrant(contextOriginalError);
 	if (!isInvalidGrant) return false;
 	if (typeof dbOps.pauseAccountIfActive !== "function") return false;
 	try {

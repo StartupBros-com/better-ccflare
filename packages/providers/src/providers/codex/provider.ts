@@ -2,11 +2,13 @@ import { createHash } from "node:crypto";
 import { getCodexReasoningRetention } from "@better-ccflare/config";
 import {
 	BUFFER_SIZES,
-	formatOAuthErrorMessage,
+	getExactOAuthErrorCode,
 	getModelFamily,
-	isInvalidGrantMessage,
+	getOAuthErrorCode,
+	MAX_OAUTH_ERROR_INPUT_LENGTH,
 	mapModelName,
 	OAuthRefreshTokenError,
+	readBoundedOAuthResponseText,
 	SseFrameBuffer,
 	StreamResourceLimitError,
 	ValidationError,
@@ -1078,25 +1080,23 @@ export class CodexProvider extends BaseProvider {
 		if (!response.ok) {
 			let errorData: unknown = null;
 			let responseText = "";
+			let responseTextTruncated = false;
 			try {
-				if (typeof response.text === "function") {
-					responseText = await response.text();
-					errorData = JSON.parse(responseText);
-				} else {
-					errorData = await response.json();
-				}
+				const bounded = await readBoundedOAuthResponseText(response);
+				responseText = bounded.text;
+				responseTextTruncated = bounded.truncated;
+				errorData = JSON.parse(responseText);
 			} catch {
 				// ignore
 			}
 
-			// Preserve the RFC-6749 machine code ahead of its human-readable
-			// description. Terminal-auth detection must not lose markers such as
-			// invalid_grant or refresh_token_reused when a description is present.
-			const errorMessage =
-				formatOAuthErrorMessage(errorData) ||
-				formatOAuthErrorMessage(response.statusText) ||
-				"OAuth token endpoint rejected request";
-			const errorCode = errorMessage.split(":", 1)[0]?.trim();
+			// A response that hit the bound is not authoritative. Even if the
+			// bounded prefix happens to be valid JSON, trailing bytes could change
+			// its meaning, so it must never quarantine an account.
+			const errorCode = responseTextTruncated
+				? ""
+				: getOAuthErrorCode(errorData) || getExactOAuthErrorCode(responseText);
+			const errorMessage = errorCode || `HTTP ${response.status}`;
 
 			// Rotating refresh tokens: reuse → terminal, must re-auth. Throw the
 			// typed error so the refresh chokepoint pauses the account for reauth
@@ -1109,20 +1109,35 @@ export class CodexProvider extends BaseProvider {
 			}
 
 			const failureMessage = `Failed to refresh Codex token for account ${account.name}: ${errorMessage}`;
-			if (
-				isInvalidGrantMessage(errorMessage) ||
-				isInvalidGrantMessage(responseText)
-			) {
+			if (errorCode) {
 				throw new OAuthRefreshTokenError(account.id, failureMessage);
 			}
 			throw new Error(failureMessage);
 		}
 
-		const json = (await response.json()) as {
+		const bounded = await readBoundedOAuthResponseText(response);
+		if (bounded.truncated) {
+			throw new Error(
+				`Codex token refresh response exceeded ${MAX_OAUTH_ERROR_INPUT_LENGTH} bytes`,
+			);
+		}
+		let json: {
 			access_token: string;
 			refresh_token: string;
 			expires_in: number;
 		};
+		try {
+			json = JSON.parse(bounded.text) as typeof json;
+		} catch {
+			throw new Error(
+				`Codex token refresh response for ${account.name} was not valid JSON`,
+			);
+		}
+		if (!json || typeof json.access_token !== "string" || !json.access_token) {
+			throw new Error(
+				`Codex token refresh response for ${account.name} did not include an access token`,
+			);
+		}
 
 		log.debug(`[CodexProvider] token refresh response for ${account.name}:`, {
 			expiresIn: json.expires_in,

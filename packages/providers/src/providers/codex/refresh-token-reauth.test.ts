@@ -6,7 +6,10 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { OAuthRefreshTokenError } from "@better-ccflare/core";
+import {
+	MAX_OAUTH_ERROR_INPUT_LENGTH,
+	OAuthRefreshTokenError,
+} from "@better-ccflare/core";
 import type { Account } from "@better-ccflare/types";
 import { CodexProvider } from "./provider";
 
@@ -15,9 +18,20 @@ function mockFetchOnce(response: {
 	status: number;
 	statusText: string;
 	json: () => Promise<unknown>;
+	bodyText?: string;
 }) {
 	const originalFetch = globalThis.fetch;
-	const fullResponse = { ...response, headers: new Headers() };
+	const body = new ReadableStream<Uint8Array>({
+		async start(controller) {
+			controller.enqueue(
+				new TextEncoder().encode(
+					response.bodyText ?? JSON.stringify(await response.json()),
+				),
+			);
+			controller.close();
+		},
+	});
+	const fullResponse = { ...response, headers: new Headers(), body };
 	globalThis.fetch = (async () => fullResponse) as never;
 	return () => {
 		globalThis.fetch = originalFetch;
@@ -125,6 +139,46 @@ describe("CodexProvider.refreshToken — invalid_grant detection", () => {
 			}
 			expect(caught).toBeInstanceOf(Error);
 			expect(caught).not.toBeInstanceOf(OAuthRefreshTokenError);
+		} finally {
+			restore();
+		}
+	});
+
+	it("rejects an oversized successful token payload before accepting it", async () => {
+		const bodyText = `${JSON.stringify({
+			access_token: "new-access-token",
+			refresh_token: "new-refresh-token",
+			expires_in: 3600,
+		})}${" ".repeat(MAX_OAUTH_ERROR_INPUT_LENGTH)}trailing-data`;
+		const restore = mockFetchOnce({
+			ok: true,
+			status: 200,
+			statusText: "OK",
+			json: async () => ({}),
+			bodyText,
+		});
+		try {
+			const provider = new CodexProvider();
+			await expect(
+				provider.refreshToken(makeAccount(), "test-client"),
+			).rejects.toThrow(/exceeded/);
+		} finally {
+			restore();
+		}
+	});
+
+	it("rejects a successful response that omits the access token", async () => {
+		const restore = mockFetchOnce({
+			ok: true,
+			status: 200,
+			statusText: "OK",
+			json: async () => ({ expires_in: 3600 }),
+		});
+		try {
+			const provider = new CodexProvider();
+			await expect(
+				provider.refreshToken(makeAccount(), "test-client"),
+			).rejects.toThrow(/did not include an access token/);
 		} finally {
 			restore();
 		}
