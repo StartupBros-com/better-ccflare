@@ -47,6 +47,10 @@ import {
 	type ServerToolRoutingErrorReason,
 } from "../server-tool-routing-errors";
 import { buildComboMembershipDiagnostics } from "./managed-routing-diagnostics";
+import {
+	emitPoolFloorEvent,
+	poolFloorApproachingThreshold,
+} from "./pool-floor-event";
 import type { ProxyContext } from "./proxy-types";
 import { boundedRoutingSelectionCount } from "./routing-selection-diagnostics";
 import {
@@ -896,27 +900,45 @@ function candidateExclusion(
 	};
 }
 
+/** Throttle state for the pool-floor alarm, keyed by lane and severity. */
+const poolFloorAlarmState = new Map<string, number>();
+
 function saveCapacityContext(
 	meta: RequestMeta,
 	effectiveModel: string | null,
 	exclusions: readonly RoutingCapacityCandidateExclusion[],
 ): void {
+	const now = Date.now();
 	const futureRecoveries = exclusions
 		.map((entry) => entry.blockedUntil)
 		.filter(
 			(value): value is number =>
-				typeof value === "number" &&
-				Number.isFinite(value) &&
-				value > Date.now(),
+				typeof value === "number" && Number.isFinite(value) && value > now,
 		);
+	const effectiveModelFamily = effectiveModel
+		? getModelFamily(effectiveModel)
+		: null;
 	routingCapacityContextMap.set(meta, {
 		effectiveModel,
-		effectiveModelFamily: effectiveModel
-			? getModelFamily(effectiveModel)
-			: null,
+		effectiveModelFamily,
 		exclusions,
 		blockedUntil:
 			futureRecoveries.length > 0 ? Math.min(...futureRecoveries) : null,
+	});
+
+	// Every path that excludes candidates for capacity funnels through here, so
+	// this is the one place the pool-floor alarm can see both the pool and the
+	// evidence that shrank it. Telemetry only — nothing below affects routing.
+	emitPoolFloorEvent(log, poolFloorAlarmState, {
+		lane: effectiveModel,
+		modelFamily: effectiveModelFamily,
+		candidatesBefore: meta.routingCandidateCatalog?.length ?? null,
+		candidatesAfter: meta.routingCandidates?.length ?? null,
+		exclusions,
+		now,
+		approachingThreshold: poolFloorApproachingThreshold(
+			process.env.CCFLARE_POOL_FLOOR_THRESHOLD,
+		),
 	});
 }
 
