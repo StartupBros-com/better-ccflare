@@ -85,6 +85,71 @@ describe("extractWeeklyResetTime", () => {
 		);
 	});
 
+	it("falls back to a valid limits reset when the flat reset is malformed", () => {
+		const reset = "2030-04-05T06:07:08.000Z";
+		const nowMs = new Date("2029-01-01T00:00:00.000Z").getTime();
+		const data = {
+			seven_day: { utilization: 40, resets_at: "not-a-date" },
+			limits: [{ kind: "weekly_all", percent: 40, resets_at: reset }],
+		} as unknown as UsageData;
+
+		expect(extractWeeklyResetTime(data, "codex", nowMs)).toBe(
+			new Date(reset).getTime(),
+		);
+	});
+
+	it("falls back to a future limits reset when the flat reset is already past", () => {
+		const reset = "2030-05-06T07:08:09.000Z";
+		const nowMs = new Date("2029-01-01T00:00:00.000Z").getTime();
+		const data = {
+			seven_day: {
+				utilization: 40,
+				resets_at: "2020-01-01T00:00:00.000Z",
+			},
+			limits: [{ kind: "weekly_all", percent: 40, resets_at: reset }],
+		} as unknown as UsageData;
+
+		expect(extractWeeklyResetTime(data, "codex", nowMs)).toBe(
+			new Date(reset).getTime(),
+		);
+	});
+
+	it("falls back when the flat reset is exactly at the observation boundary", () => {
+		const nowMs = new Date("2030-06-01T00:00:00.000Z").getTime();
+		const reset = "2030-06-02T00:00:00.000Z";
+		const data = {
+			seven_day: {
+				utilization: 40,
+				resets_at: "2030-06-01T00:00:00.000Z",
+			},
+			limits: [{ kind: "weekly_all", percent: 40, resets_at: reset }],
+		} as unknown as UsageData;
+
+		expect(extractWeeklyResetTime(data, "codex", nowMs)).toBe(
+			new Date(reset).getTime(),
+		);
+	});
+
+	it("ignores inactive weekly_all limits", () => {
+		const activeReset = "2030-06-07T08:09:10.000Z";
+		const nowMs = new Date("2029-01-01T00:00:00.000Z").getTime();
+		const data = {
+			limits: [
+				{
+					kind: "weekly_all",
+					percent: 100,
+					resets_at: "2030-01-01T00:00:00.000Z",
+					is_active: false,
+				},
+				{ kind: "weekly_all", percent: 40, resets_at: activeReset },
+			],
+		} as unknown as UsageData;
+
+		expect(extractWeeklyResetTime(data, "codex", nowMs)).toBe(
+			new Date(activeReset).getTime(),
+		);
+	});
+
 	it("returns null for unsupported providers, missing, malformed, or unrelated windows", () => {
 		expect(
 			extractWeeklyResetTime(

@@ -229,19 +229,39 @@ export function extractWindowResetTime(
 export function extractWeeklyResetTime(
 	data: AnyUsageData,
 	provider: string,
+	nowMs: number = Date.now(),
 ): number | null {
 	if (provider !== "anthropic" && provider !== "codex") return null;
 	if (!data || typeof data !== "object") return null;
 	const usage = data as UsageData;
-	const resetsAt =
-		usage.seven_day?.resets_at ??
-		(Array.isArray(usage.limits)
-			? (usage.limits.find((limit) => limit?.kind === "weekly_all")
-					?.resets_at ?? null)
-			: null);
-	if (typeof resetsAt !== "string" || resetsAt.length === 0) return null;
-	const timestamp = new Date(resetsAt).getTime();
-	return Number.isFinite(timestamp) ? timestamp : null;
+
+	// Keep source precedence (flat seven_day before limits[]) while parsing each
+	// source independently. A malformed/stale flat value must not mask a usable
+	// weekly_all entry during the limits[] migration.
+	const candidates: number[] = [];
+	const parseReset = (value: unknown): number | null => {
+		if (typeof value !== "string" || value.length === 0) return null;
+		const timestamp = new Date(value).getTime();
+		return Number.isFinite(timestamp) ? timestamp : null;
+	};
+
+	const flatReset = parseReset(usage.seven_day?.resets_at);
+	if (flatReset !== null) candidates.push(flatReset);
+
+	if (Array.isArray(usage.limits)) {
+		for (const limit of usage.limits) {
+			if (!limit || limit.kind !== "weekly_all" || limit.is_active === false)
+				continue;
+			const limitsReset = parseReset(limit.resets_at);
+			if (limitsReset !== null) candidates.push(limitsReset);
+		}
+	}
+
+	if (candidates.length === 0) return null;
+	const referenceNow = Number.isFinite(nowMs) ? nowMs : Date.now();
+	return (
+		candidates.find((candidate) => candidate > referenceNow) ?? candidates[0]
+	);
 }
 
 /**
