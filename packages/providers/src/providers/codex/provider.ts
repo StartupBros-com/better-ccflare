@@ -98,6 +98,50 @@ function sanitizeResponseHeaders(headers: Headers): Headers {
 
 const TOKEN_URL = "https://auth.openai.com/oauth/token";
 const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
+
+const CODEX_OAUTH_ERROR_FIELDS = [
+	"code",
+	"error_code",
+	"errorCode",
+	"type",
+	"message",
+	"error",
+	"error_description",
+	"detail",
+	"description",
+	"reason",
+	"title",
+] as const;
+
+/**
+ * Codex has returned both RFC-style string errors and structured error objects.
+ * Keep machine markers and human context while avoiding implicit
+ * `[object Object]` coercion in refresh failures.
+ */
+function normalizeCodexOAuthErrorValue(
+	value: unknown,
+	seen = new Set<object>(),
+): string[] {
+	if (typeof value === "string") return value ? [value] : [];
+	if (typeof value === "number" || typeof value === "boolean") {
+		return [String(value)];
+	}
+	if (value === null || value === undefined) return [];
+	if (typeof value !== "object") return [];
+	if (seen.has(value)) return [];
+	seen.add(value);
+
+	if (Array.isArray(value)) {
+		return value.flatMap((entry) => normalizeCodexOAuthErrorValue(entry, seen));
+	}
+
+	const record = value as Record<string, unknown>;
+	const prioritized = CODEX_OAUTH_ERROR_FIELDS.flatMap((field) =>
+		normalizeCodexOAuthErrorValue(record[field], seen),
+	);
+	return [...new Set(prioritized)];
+}
+
 export const CODEX_DEFAULT_ENDPOINT =
 	"https://chatgpt.com/backend-api/codex/responses";
 export const CODEX_VERSION = "0.147.0";
@@ -1070,10 +1114,12 @@ export class CodexProvider extends BaseProvider {
 		});
 
 		if (!response.ok) {
-			let errorData: { error?: string; error_description?: string } | null =
-				null;
+			let errorData: Record<string, unknown> | null = null;
 			try {
-				errorData = await response.json();
+				const parsed = await response.json();
+				if (parsed && typeof parsed === "object") {
+					errorData = parsed as Record<string, unknown>;
+				}
 			} catch {
 				// ignore
 			}
@@ -1081,15 +1127,19 @@ export class CodexProvider extends BaseProvider {
 			// Preserve the RFC-6749 machine code ahead of its human-readable
 			// description. Terminal-auth detection must not lose markers such as
 			// invalid_grant or refresh_token_reused when a description is present.
-			const errorMessage =
-				[errorData?.error, errorData?.error_description]
-					.filter(Boolean)
-					.join(": ") || response.statusText;
+			const errorParts = [
+				...normalizeCodexOAuthErrorValue(errorData?.error),
+				...normalizeCodexOAuthErrorValue(errorData?.error_description),
+			];
+			if (errorParts.length === 0 && errorData) {
+				errorParts.push(...normalizeCodexOAuthErrorValue(errorData));
+			}
+			const errorMessage = errorParts.join(": ") || response.statusText;
 
 			// Rotating refresh tokens: reuse → terminal, must re-auth. Throw the
 			// typed error so the refresh chokepoint pauses the account for reauth
 			// (detection is by type, not by message wording).
-			if (errorData?.error === "refresh_token_reused") {
+			if (errorMessage.toLowerCase().includes("refresh_token_reused")) {
 				throw new OAuthRefreshTokenError(
 					account.id,
 					`Codex refresh_token_reused for account ${account.name}. Please re-authenticate with: bun run cli --reauthenticate ${account.name}`,

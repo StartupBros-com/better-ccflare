@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { OAuthRefreshTokenError } from "@better-ccflare/core";
 import type { Account } from "@better-ccflare/types";
 import { CodexProvider } from "../provider";
 
@@ -96,5 +97,63 @@ describe("CodexProvider.refreshToken preserves the OAuth error code", () => {
 		// The reused case must keep the machine marker so detection fires; the
 		// friendly re-auth hint alone ("token was reused") would not match.
 		expect(thrown?.message).toContain("refresh_token_reused");
+	});
+
+	it("normalizes nested error objects and preserves terminal markers", async () => {
+		const provider = new CodexProvider();
+		globalThis.fetch = mock(
+			async () =>
+				new Response(
+					JSON.stringify({
+						error: {
+							code: "invalid_refresh_token",
+							type: "invalid_request_error",
+							message: "The refresh token has expired.",
+						},
+					}),
+					{ status: 400, headers: { "content-type": "application/json" } },
+				),
+		) as unknown as typeof fetch;
+
+		let thrown: Error | null = null;
+		try {
+			await provider.refreshToken(codexAccount(), "test-client");
+		} catch (error) {
+			thrown = error as Error;
+		}
+
+		expect(thrown?.message).toContain("invalid_refresh_token");
+		expect(thrown?.message).not.toContain("[object Object]");
+		expect(thrown).toBeInstanceOf(OAuthRefreshTokenError);
+		expect((thrown as OAuthRefreshTokenError).accountId).toBe("codex-1");
+	});
+
+	it("keeps nested transient error objects as plain Error", async () => {
+		const provider = new CodexProvider();
+		globalThis.fetch = mock(
+			async () =>
+				new Response(
+					JSON.stringify({
+						error: {
+							code: "temporarily_unavailable",
+							type: "server_error",
+							message: "Please retry shortly.",
+						},
+					}),
+					{ status: 503, headers: { "content-type": "application/json" } },
+				),
+		) as unknown as typeof fetch;
+
+		let thrown: Error | null = null;
+		try {
+			await provider.refreshToken(codexAccount(), "test-client");
+		} catch (error) {
+			thrown = error as Error;
+		}
+
+		expect(thrown).toBeInstanceOf(Error);
+		expect(thrown).not.toBeInstanceOf(OAuthRefreshTokenError);
+		expect(thrown?.message).toContain("temporarily_unavailable");
+		expect(thrown?.message).not.toContain("[object Object]");
 	});
 });
