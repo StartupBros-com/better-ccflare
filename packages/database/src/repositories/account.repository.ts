@@ -113,6 +113,75 @@ export class AccountRepository extends BaseRepository<Account> {
 		}
 	}
 
+	/** Compatibility alias retained for upstream repository tests and callers. */
+	async setRequiresReauth(accountId: string, value: boolean): Promise<void> {
+		await this.run(`UPDATE accounts SET requires_reauth = ? WHERE id = ?`, [
+			value ? 1 : 0,
+			accountId,
+		]);
+	}
+
+	async updateTokensIfRefreshTokenMatches(
+		accountId: string,
+		expectedRefreshToken: string,
+		accessToken: string,
+		expiresAt: number,
+		refreshToken?: string,
+	): Promise<boolean> {
+		const now = Date.now();
+		if (refreshToken) {
+			const changes = await this.runWithChanges(
+				`UPDATE accounts SET access_token = ?, expires_at = ?, refresh_token = ?, refresh_token_issued_at = ?, requires_reauth = 0 WHERE id = ? AND refresh_token = ?`,
+				[
+					accessToken,
+					expiresAt,
+					refreshToken,
+					now,
+					accountId,
+					expectedRefreshToken,
+				],
+			);
+			return changes > 0;
+		}
+		const changes = await this.runWithChanges(
+			`UPDATE accounts SET access_token = ?, expires_at = ?, requires_reauth = 0 WHERE id = ? AND refresh_token = ?`,
+			[accessToken, expiresAt, accountId, expectedRefreshToken],
+		);
+		return changes > 0;
+	}
+
+	async updateTokensIfRefreshTokenAbsent(
+		accountId: string,
+		accessToken: string,
+		expiresAt: number,
+		refreshToken?: string,
+	): Promise<boolean> {
+		const now = Date.now();
+		if (refreshToken) {
+			const changes = await this.runWithChanges(
+				`UPDATE accounts SET access_token = ?, expires_at = ?, refresh_token = ?, refresh_token_issued_at = ?, requires_reauth = 0 WHERE id = ? AND (refresh_token IS NULL OR refresh_token = '')`,
+				[accessToken, expiresAt, refreshToken, now, accountId],
+			);
+			return changes > 0;
+		}
+		const changes = await this.runWithChanges(
+			`UPDATE accounts SET access_token = ?, expires_at = ?, requires_reauth = 0 WHERE id = ? AND (refresh_token IS NULL OR refresh_token = '')`,
+			[accessToken, expiresAt, accountId],
+		);
+		return changes > 0;
+	}
+
+	async flagRequiresReauthIfTokenMatches(
+		accountId: string,
+		expectedRefreshToken: string,
+	): Promise<boolean> {
+		const changes = await this.runWithChanges(
+			`UPDATE accounts SET requires_reauth = 1 WHERE id = ? AND refresh_token = ?`,
+			[accountId, expectedRefreshToken],
+		);
+		return changes > 0;
+	}
+
 	async incrementUsage(
 		accountId: string,
 		sessionDurationMs: number,

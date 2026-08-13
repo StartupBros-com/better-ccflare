@@ -21,6 +21,22 @@ export function providerSupportsAutoFeatures(provider: string): boolean {
 }
 
 /**
+ * Whether a provider natively accepts the client's Claude model id.
+ *
+ * Model picker controls use this to decide whether an empty model override can
+ * represent passthrough. The combo API still validates its own model contract.
+ */
+export function providerAllowsClientModelPassthrough(
+	provider?: string | null,
+): boolean {
+	const normalized = (provider ?? "").trim();
+	return (
+		normalized === PROVIDER_NAMES.ANTHROPIC ||
+		normalized === PROVIDER_NAMES.CLAUDE_CONSOLE_API
+	);
+}
+
+/**
  * Check if a provider supports custom billing type configuration
  * (anthropic-compatible and openai-compatible providers)
  */

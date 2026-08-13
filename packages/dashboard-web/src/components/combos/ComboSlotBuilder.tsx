@@ -29,6 +29,7 @@ import {
 	useRestoreAccountToFamily,
 	useUpdateComboSlot,
 } from "../../hooks/queries";
+import { providerAllowsClientModelPassthrough } from "../../utils/provider-utils";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "../ui/card";
@@ -130,6 +131,24 @@ function SortableManualMemberRow({
 			/>
 		</div>
 	);
+}
+
+/**
+ * Help line under the model field — must state the rule that applies TO THE
+ * SELECTED ACCOUNT, not a universal "Empty = passthrough" that only holds
+ * on the Anthropic provider.
+ */
+function _modelFieldHint(
+	provider: string | null,
+	passthroughAllowed: boolean,
+): string {
+	if (!provider) {
+		return "Pick an account first: whether the model is required depends on the provider.";
+	}
+	if (passthroughAllowed) {
+		return "Empty = passthrough: the model sent by the client goes upstream untouched.";
+	}
+	return `Required for ${provider}: this provider does not serve Claude model ids, so there is no passthrough.`;
 }
 
 interface ComboSlotBuilderProps {
@@ -281,6 +300,11 @@ export function ComboSlotBuilder({ combo }: ComboSlotBuilderProps) {
 	);
 
 	const accounts = accountsQuery.data ?? [];
+	const selectedProvider =
+		accounts.find((account) => account.id === newAccountId)?.provider ?? null;
+	const passthroughAllowed =
+		providerAllowsClientModelPassthrough(selectedProvider);
+	const missingRequiredModel = !passthroughAllowed && !newModel.trim();
 	const families = familiesQuery.data?.families ?? [];
 	const effectiveRoutingUnavailable =
 		effectiveRoutingQuery.isError || effectiveRoutingQuery.isRefetchError;
@@ -533,6 +557,11 @@ export function ComboSlotBuilder({ combo }: ComboSlotBuilderProps) {
 									!newModel.trim() ||
 									parsedNewPriority === null ||
 									addSlot.isPending
+								}
+								title={
+									missingRequiredModel
+										? `A model is required for ${selectedProvider}: this provider does not serve Claude model ids, so there is no passthrough.`
+										: undefined
 								}
 							>
 								{addSlot.isPending ? "Adding..." : "Add"}

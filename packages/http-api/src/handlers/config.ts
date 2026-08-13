@@ -1,4 +1,8 @@
-import type { Config } from "@better-ccflare/config";
+import {
+	type Config,
+	filterEnabledProviderModelDefaultOverrides,
+	PROVIDER_MODEL_DEFAULTS_ENV_VAR,
+} from "@better-ccflare/config";
 import {
 	DEFAULT_AGENT_MODEL,
 	NETWORK,
@@ -13,6 +17,11 @@ import {
 	errorResponse,
 	jsonResponse,
 } from "@better-ccflare/http-common";
+import {
+	getProviderModelDefaultFactories,
+	resolveProviderModelDefault,
+	setProviderModelDefaultOverrides,
+} from "@better-ccflare/providers";
 import type { APIContext } from "@better-ccflare/types";
 import {
 	allowedModelErrorMessage,
@@ -28,10 +37,83 @@ export function createConfigHandlers(
 	runtime?: { port: number; tlsEnabled: boolean },
 	modelCatalog?: APIContext["modelCatalog"],
 ) {
+	const getProviderModelDefaults = (): Response => {
+		const enabled = config.getEnabledProviderModelDefaultProviders();
+		const factories = getProviderModelDefaultFactories();
+		const saved = config.getProviderModelDefaultOverrides();
+		const providers = enabled.map((provider) => {
+			const families = new Set([
+				...Object.keys(factories[provider] ?? {}),
+				...Object.keys(saved[provider] ?? {}),
+				"fable",
+				"opus",
+				"sonnet",
+				"haiku",
+			]);
+			return {
+				provider,
+				fields: [...families].sort().map((family) => ({
+					family,
+					factory: factories[provider]?.[family] ?? null,
+					override: saved[provider]?.[family] ?? null,
+					effective: resolveProviderModelDefault(provider, family) ?? "",
+				})),
+			};
+		});
+		return jsonResponse({ providers });
+	};
+
 	return {
-		/**
-		 * Get all configuration settings
-		 */
+		/** Get editable provider model defaults. */
+		getProviderModelDefaults,
+
+		setProviderModelDefaults: async (req: Request): Promise<Response> => {
+			const body = (await req.json()) as { overrides?: unknown };
+			if (!Array.isArray(body.overrides)) {
+				return errorResponse(BadRequest("'overrides' must be an array"));
+			}
+			const enabled = new Set(config.getEnabledProviderModelDefaultProviders());
+			const next = structuredClone(config.getProviderModelDefaultOverrides());
+			for (const raw of body.overrides) {
+				if (!raw || typeof raw !== "object") {
+					return errorResponse(BadRequest("Invalid override entry"));
+				}
+				const item = raw as Record<string, unknown>;
+				const provider =
+					typeof item.provider === "string" ? item.provider.trim() : "";
+				const family =
+					typeof item.family === "string" ? item.family.trim() : "";
+				const model = typeof item.model === "string" ? item.model.trim() : "";
+				if (!provider || !family || !enabled.has(provider)) {
+					return errorResponse(
+						BadRequest(
+							`Provider '${provider}' is not enabled by ${PROVIDER_MODEL_DEFAULTS_ENV_VAR}`,
+						),
+					);
+				}
+				const knownFamilies = new Set([
+					"fable",
+					"opus",
+					"sonnet",
+					"haiku",
+					...Object.keys(getProviderModelDefaultFactories()[provider] ?? {}),
+				]);
+				if (!knownFamilies.has(family) || (model && model.length > 200)) {
+					return errorResponse(
+						BadRequest(`Invalid model default family or model for ${provider}`),
+					);
+				}
+				if (!next[provider]) next[provider] = {};
+				if (model) next[provider][family] = model;
+				else delete next[provider][family];
+			}
+			config.setProviderModelDefaultOverrides(next);
+			setProviderModelDefaultOverrides(
+				filterEnabledProviderModelDefaultOverrides(enabled, next),
+			);
+			return getProviderModelDefaults();
+		},
+
 		getConfig: (): Response => {
 			const settings = config.getAllSettings();
 			const response: ConfigResponse = {

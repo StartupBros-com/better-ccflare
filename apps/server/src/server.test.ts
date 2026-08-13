@@ -1,17 +1,69 @@
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { BunSqlAdapter } from "@better-ccflare/database";
 import { Logger, logBus } from "@better-ccflare/logger";
 import { CODEX_DEFAULT_ENDPOINT } from "@better-ccflare/providers";
 import type { LogEvent } from "@better-ccflare/types";
 import {
 	accountSupportsRefreshBackedUsagePolling,
 	bootstrapMinimaxUsagePolling,
+	persistForwardOnlyCodexRateLimitReset,
 	registerMinimaxUsagePolling,
 	resolveDashboardRoute,
 	supportsRefreshBackedUsagePolling,
 	type UsageCacheRegistrar,
 } from "./server";
+
+describe("persistForwardOnlyCodexRateLimitReset", () => {
+	it("only advances the reset and preserves a newer concurrent value", async () => {
+		const sqlite = new Database(":memory:");
+		const db = new BunSqlAdapter(sqlite);
+		sqlite.run(
+			"CREATE TABLE accounts (id TEXT PRIMARY KEY, rate_limit_reset INTEGER)",
+		);
+		sqlite.run("INSERT INTO accounts (id, rate_limit_reset) VALUES (?, ?)", [
+			"acct-forward",
+			null,
+		]);
+
+		await persistForwardOnlyCodexRateLimitReset(db, "acct-forward", 2_000);
+		expect(
+			(
+				await db.get<{ rate_limit_reset: number }>(
+					"SELECT rate_limit_reset FROM accounts WHERE id = ?",
+					["acct-forward"],
+				)
+			)?.rate_limit_reset,
+		).toBe(2_000);
+
+		sqlite.run("UPDATE accounts SET rate_limit_reset = ? WHERE id = ?", [
+			5_000,
+			"acct-forward",
+		]);
+		await persistForwardOnlyCodexRateLimitReset(db, "acct-forward", 3_000);
+		expect(
+			(
+				await db.get<{ rate_limit_reset: number }>(
+					"SELECT rate_limit_reset FROM accounts WHERE id = ?",
+					["acct-forward"],
+				)
+			)?.rate_limit_reset,
+		).toBe(5_000);
+
+		await persistForwardOnlyCodexRateLimitReset(db, "acct-forward", 6_000);
+		expect(
+			(
+				await db.get<{ rate_limit_reset: number }>(
+					"SELECT rate_limit_reset FROM accounts WHERE id = ?",
+					["acct-forward"],
+				)
+			)?.rate_limit_reset,
+		).toBe(6_000);
+		sqlite.close();
+	});
+});
 
 describe("supportsRefreshBackedUsagePolling", () => {
 	it("includes pollable OAuth providers that need token refresh", () => {

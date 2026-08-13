@@ -14,6 +14,7 @@ export * from "./nanogpt-usage-fetcher";
 export * from "./oauth";
 // Export pure request capability and admission primitives
 export * from "./provider-attempt-plan";
+export * from "./provider-model-defaults";
 // Factory functions for creating providers
 export {
 	type AnthropicCompatibleConfig,

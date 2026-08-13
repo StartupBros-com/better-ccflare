@@ -28,6 +28,19 @@ export const DEFAULT_GUARD_MAX_RECOVERY_SLEEP_MS = 120_000;
 export const MAX_GUARD_RECOVERY_SILENCE_MS = 120_000;
 export const DEFAULT_GUARD_RETRY_JITTER_MS = 2_000;
 export const DEFAULT_GUARD_MAX_INSPECTION_BYTES = 64 * 1_024;
+// Keep request-body retention aligned with the proxy's 4 MiB payload cap while
+// allowing operators to lower it for a smaller admission footprint. The hard
+// ceiling prevents an environment override from reintroducing an effectively
+// unbounded per-request allocation.
+export const DEFAULT_GUARD_MAX_REQUEST_BODY_BYTES = 4 * 1024 * 1024;
+export const MIN_GUARD_REQUEST_BODY_BYTES = 1 * 1024;
+export const MAX_GUARD_REQUEST_BODY_BYTES = 16 * 1024 * 1024;
+export const DEFAULT_GUARD_REQUEST_DRAIN_TIMEOUT_MS = 10_000;
+export const MIN_GUARD_REQUEST_DRAIN_TIMEOUT_MS = 1_000;
+export const MAX_GUARD_REQUEST_DRAIN_TIMEOUT_MS = 60_000;
+export const DEFAULT_GUARD_MAX_BODY_READERS = 8;
+export const MIN_GUARD_MAX_BODY_READERS = 1;
+export const MAX_GUARD_MAX_BODY_READERS = 256;
 export const DEFAULT_GUARD_RESPONSE_IDLE_TIMEOUT_MS = 120_000;
 // P1 ordering: once the reserved marker confirms a trusted finite recovery,
 // retry is already authorized (see recoveryHeaderStatus). Any
@@ -44,12 +57,10 @@ export const GUARD_REQUEST_ID_HEADER = "x-better-ccflare-guard-request-id";
 export const GUARD_CORRELATION_SECRET_HEADER =
 	"x-better-ccflare-guard-correlation-secret";
 const PROXY_REQUEST_ID_HEADER = "x-better-ccflare-request-id";
-export const GUARD_CORRELATION_SECRET_ENV =
-	"CCFLARE_GUARD_CORRELATION_SECRET";
+export const GUARD_CORRELATION_SECRET_ENV = "CCFLARE_GUARD_CORRELATION_SECRET";
 
 const GUARD_CORRELATION_VERSION = "v1";
-const GUARD_CORRELATION_SIGNING_DOMAIN =
-	"better-ccflare/guard-correlation/v1";
+const GUARD_CORRELATION_SIGNING_DOMAIN = "better-ccflare/guard-correlation/v1";
 const MAX_GUARD_ATTEMPT_ORDINAL = 1_000_000;
 const CANONICAL_UUID_V4_PATTERN =
 	/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -170,7 +181,9 @@ function configuredBoundedInteger(value, fallback, { name, min, max }) {
 	if (value == null || value === "") return fallback;
 	const parsed = Number(value);
 	if (!Number.isSafeInteger(parsed) || parsed < min || parsed > max) {
-		throw new RangeError(`${name} must be an integer from ${min} through ${max}`);
+		throw new RangeError(
+			`${name} must be an integer from ${min} through ${max}`,
+		);
 	}
 	return parsed;
 }
@@ -194,6 +207,19 @@ function deadlineError() {
 	const error = new Error("guard request deadline exceeded");
 	error.name = "AbortError";
 	error.code = "GUARD_DEADLINE_EXCEEDED";
+	return error;
+}
+
+function requestBodyTooLargeError(
+	maxBytes,
+	{ declaredBytes = null, receivedBytes = maxBytes + 1 } = {},
+) {
+	const error = new Error("guard request body exceeds configured limit");
+	error.code = "GUARD_REQUEST_BODY_TOO_LARGE";
+	error.maxBytes = maxBytes;
+	if (declaredBytes != null) error.declaredBytes = declaredBytes;
+	// Keep telemetry itself bounded even if a single parser chunk is very large.
+	error.receivedBytes = Math.min(maxBytes + 1, Math.max(0, receivedBytes));
 	return error;
 }
 
@@ -301,9 +327,95 @@ function createGuardCorrelationSigner(encodedSecret) {
 	};
 }
 
-async function readBody(req, signal) {
+function parseDeclaredContentLength(req) {
+	const raw = req.headers?.["content-length"];
+	if (Array.isArray(raw)) return null;
+	if (typeof raw !== "string" || !/^\s*\d+\s*$/.test(raw)) return null;
+	try {
+		const parsed = BigInt(raw.trim());
+		return parsed > BigInt(Number.MAX_SAFE_INTEGER)
+			? Number.MAX_SAFE_INTEGER
+			: Number(parsed);
+	} catch {
+		return null;
+	}
+}
+
+function drainRequest(
+	req,
+	timeoutMs = DEFAULT_GUARD_REQUEST_DRAIN_TIMEOUT_MS,
+	onTimeout,
+) {
+	let drained = false;
+	let timer;
+	const cleanup = () => {
+		if (drained) return;
+		drained = true;
+		if (timer) clearTimeout(timer);
+		req.off("error", onError);
+		req.off("end", cleanup);
+		req.off("close", cleanup);
+		req.off("aborted", cleanup);
+	};
+	const onError = () => cleanup();
+	// Install the error listener before switching to flowing mode. An oversized
+	// request has already been classified; any later parser/socket error must not
+	// become an uncaught exception while its remaining bytes are discarded.
+	req.once("error", onError);
+	req.once("end", cleanup);
+	req.once("close", cleanup);
+	req.once("aborted", cleanup);
+	timer = setTimeout(() => {
+		if (drained) return;
+		timer = undefined;
+		// A rejected upload has no useful continuation. Destroying the request
+		// socket after the bounded drain window prevents a peer that never sends
+		// the remaining bytes from pinning a keep-alive connection forever.
+		try {
+			req.destroy();
+		} catch {
+			try {
+				req.socket?.destroy();
+			} catch {
+				// Best effort; the server may already have closed the socket.
+			}
+		}
+		try {
+			onTimeout?.();
+		} catch {
+			// Telemetry callbacks must never prevent the socket teardown.
+		}
+	}, Math.max(1, timeoutMs));
+	timer.unref?.();
+	try {
+		req.resume();
+	} catch {
+		cleanup();
+	}
+}
+
+async function readBody(
+	req,
+	signal,
+	maxBytes = DEFAULT_GUARD_MAX_REQUEST_BODY_BYTES,
+	drainTimeoutMs = DEFAULT_GUARD_REQUEST_DRAIN_TIMEOUT_MS,
+	onDrainTimeout,
+) {
+	const declaredLength = parseDeclaredContentLength(req);
+	if (signal?.aborted) {
+		drainRequest(req, drainTimeoutMs, onDrainTimeout);
+		throw signal.reason || abortError();
+	}
+	if (declaredLength != null && declaredLength > maxBytes) {
+		drainRequest(req, drainTimeoutMs, onDrainTimeout);
+		throw requestBodyTooLargeError(maxBytes, {
+			declaredBytes: Math.min(maxBytes + 1, declaredLength),
+		});
+	}
+
 	return new Promise((resolve, reject) => {
 		const chunks = [];
+		let totalBytes = 0;
 		let settled = false;
 		const cleanup = () => {
 			req.off("data", onData);
@@ -317,14 +429,32 @@ async function readBody(req, signal) {
 			cleanup();
 			callback();
 		};
-		const onData = (chunk) => chunks.push(Buffer.from(chunk));
-		const onEnd = () => finish(() => resolve(Buffer.concat(chunks)));
+		const onData = (chunk) => {
+			if (settled) return;
+			if (signal?.aborted) {
+				onAbort();
+				return;
+			}
+			const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+			const remainingBytes = maxBytes - totalBytes;
+			if (buffer.byteLength > remainingBytes) {
+				totalBytes = maxBytes;
+				const error = requestBodyTooLargeError(maxBytes);
+				drainRequest(req, drainTimeoutMs, onDrainTimeout);
+				finish(() => reject(error));
+				return;
+			}
+			if (buffer.byteLength > 0) chunks.push(buffer);
+			totalBytes += buffer.byteLength;
+		};
+		const onEnd = () =>
+			finish(() => resolve(Buffer.concat(chunks, totalBytes)));
 		const onError = (error) => finish(() => reject(error));
 		const onAbort = () => {
-			finish(() => reject(signal.reason || abortError()));
 			// Keep the connection usable long enough to return a finite deadline
 			// response while discarding any remaining upload bytes.
-			req.resume();
+			drainRequest(req, drainTimeoutMs, onDrainTimeout);
+			finish(() => reject(signal.reason || abortError()));
 		};
 
 		req.on("data", onData);
@@ -358,8 +488,11 @@ function responseBodyIdleTimeoutError() {
 
 function isEventStreamResponse(response) {
 	return (
-		response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase() ===
-		"text/event-stream"
+		response.headers
+			.get("content-type")
+			?.split(";", 1)[0]
+			?.trim()
+			.toLowerCase() === "text/event-stream"
 	);
 }
 
@@ -556,9 +689,7 @@ function createSseOutcomeObserver({ requireMessageStop = false } = {}) {
 			// a blank line. Retain only the fact that framing was incomplete.
 			if (
 				!parserDisabled &&
-				(pendingLine.trim() !== "" ||
-					eventName !== "" ||
-					dataLineSeen)
+				(pendingLine.trim() !== "" || eventName !== "" || dataLineSeen)
 			) {
 				markMalformed("unterminated_event");
 			}
@@ -584,12 +715,12 @@ function createSseOutcomeObserver({ requireMessageStop = false } = {}) {
 						};
 			if (errorType !== null) {
 				return {
-						semanticEvent: "error",
-						semanticErrorType: errorType,
-						semanticParseState,
-						...parseReasonFields,
-						...compatibilityFields,
-					};
+					semanticEvent: "error",
+					semanticErrorType: errorType,
+					semanticParseState,
+					...parseReasonFields,
+					...compatibilityFields,
+				};
 			}
 			// Once bounded observation stops, absence of message_stop is unknown,
 			// not evidence that the upstream omitted it. Preserve any error already
@@ -789,7 +920,12 @@ const SOFT_INSPECTION_TIMEOUT = Symbol("soft-inspection-timeout");
 // races, but never cancels, the in-flight read: ownership of the prefix,
 // pending read, and tail is returned together so a terminal response can be
 // reconstructed byte-for-byte or a retry can explicitly cancel it.
-async function readResponseForInspection(response, maxBytes, signal, softSignal) {
+async function readResponseForInspection(
+	response,
+	maxBytes,
+	signal,
+	softSignal,
+) {
 	if (!response.body) {
 		return { oversized: false, buffer: Buffer.alloc(0) };
 	}
@@ -805,8 +941,8 @@ async function readResponseForInspection(response, maxBytes, signal, softSignal)
 	let resolveSoftAbort;
 	const softAbortPromise = softSignal
 		? new Promise((resolve) => {
-			resolveSoftAbort = resolve;
-		})
+				resolveSoftAbort = resolve;
+			})
 		: null;
 	const onSoftAbort = () => {
 		resolveSoftAbort?.(SOFT_INSPECTION_TIMEOUT);
@@ -858,7 +994,11 @@ async function readResponseForInspection(response, maxBytes, signal, softSignal)
 					buffer: Buffer.concat(chunks, bytes),
 				};
 			}
-			const chunk = Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+			const chunk = Buffer.from(
+				value.buffer,
+				value.byteOffset,
+				value.byteLength,
+			);
 			if (bytes + chunk.length > maxBytes) {
 				return {
 					oversized: true,
@@ -1059,15 +1199,26 @@ export function createGuard(options = {}) {
 	const upstreamUrl = new URL(upstreamBase);
 	const maxActive = Math.max(
 		1,
-		Math.floor(
-			configuredNumber(options.maxActive ?? env.GUARD_MAX_ACTIVE, 4),
-		),
+		Math.floor(configuredNumber(options.maxActive ?? env.GUARD_MAX_ACTIVE, 4)),
 	);
 	const maxQueue = Math.max(
 		0,
-		Math.floor(
-			configuredNumber(options.maxQueue ?? env.GUARD_MAX_QUEUE, 500),
+		Math.floor(configuredNumber(options.maxQueue ?? env.GUARD_MAX_QUEUE, 500)),
+	);
+	// Body readers are intentionally independent from upstream permits. The
+	// default allows a small amount of inbound overlap (at least eight readers)
+	// while the hard cap keeps aggregate request buffering bounded.
+	const maxBodyReaders = configuredBoundedInteger(
+		options.maxBodyReaders ?? env.GUARD_MAX_BODY_READERS,
+		Math.min(
+			MAX_GUARD_MAX_BODY_READERS,
+			Math.max(DEFAULT_GUARD_MAX_BODY_READERS, maxActive * 2),
 		),
+		{
+			name: "GUARD_MAX_BODY_READERS",
+			min: MIN_GUARD_MAX_BODY_READERS,
+			max: MAX_GUARD_MAX_BODY_READERS,
+		},
 	);
 	const maxRecoveryWaits = configuredBoundedInteger(
 		options.maxRecoveryWaits ?? env.GUARD_MAX_RECOVERY_WAITS,
@@ -1092,8 +1243,7 @@ export function createGuard(options = {}) {
 		1,
 		Math.floor(
 			configuredNumber(
-				options.retryAttemptHeadroomMs ??
-					env.GUARD_RETRY_ATTEMPT_HEADROOM_MS,
+				options.retryAttemptHeadroomMs ?? env.GUARD_RETRY_ATTEMPT_HEADROOM_MS,
 				DEFAULT_GUARD_RETRY_ATTEMPT_HEADROOM_MS,
 			),
 		),
@@ -1132,12 +1282,29 @@ export function createGuard(options = {}) {
 			),
 		),
 	);
+	const maxRequestBodyBytes = configuredBoundedInteger(
+		options.maxRequestBodyBytes ?? env.GUARD_MAX_REQUEST_BODY_BYTES,
+		DEFAULT_GUARD_MAX_REQUEST_BODY_BYTES,
+		{
+			name: "GUARD_MAX_REQUEST_BODY_BYTES",
+			min: MIN_GUARD_REQUEST_BODY_BYTES,
+			max: MAX_GUARD_REQUEST_BODY_BYTES,
+		},
+	);
+	const requestDrainTimeoutMs = configuredBoundedInteger(
+		options.requestDrainTimeoutMs ?? env.GUARD_REQUEST_DRAIN_TIMEOUT_MS,
+		DEFAULT_GUARD_REQUEST_DRAIN_TIMEOUT_MS,
+		{
+			name: "GUARD_REQUEST_DRAIN_TIMEOUT_MS",
+			min: MIN_GUARD_REQUEST_DRAIN_TIMEOUT_MS,
+			max: MAX_GUARD_REQUEST_DRAIN_TIMEOUT_MS,
+		},
+	);
 	const responseIdleTimeoutMs = Math.max(
 		1,
 		Math.floor(
 			configuredNumber(
-				options.responseIdleTimeoutMs ??
-					env.GUARD_RESPONSE_IDLE_TIMEOUT_MS,
+				options.responseIdleTimeoutMs ?? env.GUARD_RESPONSE_IDLE_TIMEOUT_MS,
 				DEFAULT_GUARD_RESPONSE_IDLE_TIMEOUT_MS,
 			),
 		),
@@ -1199,6 +1366,11 @@ export function createGuard(options = {}) {
 		recoveryWaitRejectedByScope: { pool: 0, model: 0, route: 0, legacy: 0 },
 		attemptsExhausted: 0,
 		oversizedInspectionBodies: 0,
+		oversizedRequestBodies: 0,
+		requestDrainTimeouts: 0,
+		bodyReaderQueued: 0,
+		bodyReaderQueueAborted: 0,
+		bodyReaderQueueFull: 0,
 		responseBodyIdleTimeouts: 0,
 		drainingRejected: 0,
 		// R21: per-outcome counts for terminal upstream-driven responses logged
@@ -1207,10 +1379,13 @@ export function createGuard(options = {}) {
 		finalError: 0,
 	};
 	let active = 0;
+	let bodyReadersActive = 0;
+	let peakBodyReaders = 0;
 	let activeRecoveryWaits = 0;
 	let peakRecoveryWaits = 0;
 	let draining = false;
 	const queue = [];
+	const bodyReaderQueue = [];
 
 	function log(event, data = {}) {
 		logger(
@@ -1225,6 +1400,23 @@ export function createGuard(options = {}) {
 				...data,
 			}),
 		);
+	}
+
+	function onRequestDrainTimeout(context) {
+		counters.requestDrainTimeouts += 1;
+		log("guard_request_drain_timeout", {
+			id: context?.id ?? null,
+			requestDrainTimeoutMs,
+			elapsedMs: context ? now() - context.acceptedAt : null,
+		});
+	}
+
+	function drainRequestForContext(req, context) {
+		const timeoutMs = Math.min(
+			requestDrainTimeoutMs,
+			Math.max(1, context.remainingMs()),
+		);
+		drainRequest(req, timeoutMs, () => onRequestDrainTimeout(context));
 	}
 
 	function grantLease(queuedMs) {
@@ -1249,6 +1441,80 @@ export function createGuard(options = {}) {
 			next.signal?.removeEventListener("abort", next.abort);
 			next.resolve(grantLease(now() - next.enqueuedAt));
 		}
+	}
+
+	function grantBodyReaderLease(queuedMs) {
+		bodyReadersActive += 1;
+		peakBodyReaders = Math.max(peakBodyReaders, bodyReadersActive);
+		let released = false;
+		return {
+			queuedMs,
+			release() {
+				if (released) return;
+				released = true;
+				bodyReadersActive = Math.max(0, bodyReadersActive - 1);
+				drainBodyReaderQueue();
+			},
+		};
+	}
+
+	function drainBodyReaderQueue() {
+		while (
+			bodyReadersActive < maxBodyReaders &&
+			bodyReaderQueue.length > 0
+		) {
+			const next = bodyReaderQueue.shift();
+			if (!next || next.settled) continue;
+			next.settled = true;
+			next.signal?.removeEventListener("abort", next.abort);
+			next.resolve(grantBodyReaderLease(now() - next.enqueuedAt));
+		}
+	}
+
+	function acquireBodyReader(id, signal) {
+		if (signal?.aborted) {
+			return Promise.reject(signal.reason || abortError());
+		}
+		if (bodyReadersActive < maxBodyReaders && bodyReaderQueue.length === 0) {
+			return Promise.resolve(grantBodyReaderLease(0));
+		}
+		if (bodyReaderQueue.length >= maxQueue) {
+			counters.bodyReaderQueueFull += 1;
+			const error = new Error("guard body-reader queue full");
+			error.code = "GUARD_BODY_READER_QUEUE_FULL";
+			return Promise.reject(error);
+		}
+
+		const enqueuedAt = now();
+		counters.bodyReaderQueued += 1;
+		return new Promise((resolve, reject) => {
+			const entry = {
+				id,
+				enqueuedAt,
+				resolve,
+				reject,
+				signal,
+				abort: null,
+				settled: false,
+			};
+			const abort = () => {
+				if (entry.settled) return;
+				entry.settled = true;
+				const index = bodyReaderQueue.indexOf(entry);
+				if (index !== -1) bodyReaderQueue.splice(index, 1);
+				counters.bodyReaderQueueAborted += 1;
+				reject(signal?.reason || abortError());
+			};
+			entry.abort = abort;
+			if (signal) {
+				if (signal.aborted) {
+					abort();
+					return;
+				}
+				signal.addEventListener("abort", abort, { once: true });
+			}
+			bodyReaderQueue.push(entry);
+		});
 	}
 
 	function acquire(id, signal) {
@@ -1373,11 +1639,7 @@ export function createGuard(options = {}) {
 		);
 		const init = {
 			method: req.method,
-			headers: requestHeaders(
-				req,
-				body.length,
-				guardCorrelationEnvelope,
-			),
+			headers: requestHeaders(req, body.length, guardCorrelationEnvelope),
 			redirect: "manual",
 			signal,
 		};
@@ -1553,6 +1815,17 @@ export function createGuard(options = {}) {
 		);
 	}
 
+	function sendBodyReaderQueueFull(res, context) {
+		sendJsonError(
+			res,
+			context,
+			503,
+			"guard_body_reader_queue_full",
+			"local guard body-reader queue is full",
+			{ "retry-after": "1" },
+		);
+	}
+
 	function sendAttemptsExhausted(res, context, attempt) {
 		counters.attemptsExhausted += 1;
 		log("guard_attempts_exhausted", {
@@ -1637,28 +1910,39 @@ export function createGuard(options = {}) {
 		});
 	}
 
-	async function handleLimited(req, res, body, context, upstreamTarget) {
+	async function handleLimited(
+		req,
+		res,
+		body,
+		context,
+		upstreamTarget,
+		initialLease = null,
+	) {
 		const { id } = context;
 		counters.total += 1;
 		let attempt = 0;
 		let responseTelemetry = null;
+		let lease = initialLease;
 		try {
 			while (true) {
 				context.ensureBudget();
 				if (attempt >= maxAttempts) {
+					lease?.release();
+					lease = null;
 					sendAttemptsExhausted(res, context, attempt);
 					return;
 				}
 
-				let lease;
-				try {
-					lease = await acquire(id, context.signal);
-				} catch (error) {
-					if (error?.code === "GUARD_QUEUE_FULL") {
-						sendQueueFull(res, context);
-						return;
+				if (!lease) {
+					try {
+						lease = await acquire(id, context.signal);
+					} catch (error) {
+						if (error?.code === "GUARD_QUEUE_FULL") {
+							sendQueueFull(res, context);
+							return;
+						}
+						throw error;
 					}
-					throw error;
 				}
 
 				let upstreamResponse;
@@ -1689,6 +1973,7 @@ export function createGuard(options = {}) {
 					);
 				} catch (error) {
 					lease.release();
+					lease = null;
 					throw error;
 				}
 
@@ -1711,8 +1996,7 @@ export function createGuard(options = {}) {
 					} finally {
 						lease.release();
 					}
-					const telemetryFields =
-						rawResponseTelemetryFields(responseTelemetry);
+					const telemetryFields = rawResponseTelemetryFields(responseTelemetry);
 					const outcome =
 						telemetryFields.semanticEvent === "error" ||
 						telemetryFields.semanticEvent === "incomplete_eof"
@@ -1753,6 +2037,7 @@ export function createGuard(options = {}) {
 					// nothing past this point should hold a concurrency permit
 					// hostage to upstream body I/O.
 					lease.release();
+					lease = null;
 
 					const headerHint = evaluateGuardRetry({
 						status: upstreamResponse.status,
@@ -1800,8 +2085,7 @@ export function createGuard(options = {}) {
 					// bounded peek. A complete body may reveal a later blocker, but
 					// can never shorten the authoritative Retry-After minimum; an
 					// incomplete body cannot change the seeded header-time hint.
-					const inspectionSlackMs =
-						headerAction.availableDelayMs - delayMs;
+					const inspectionSlackMs = headerAction.availableDelayMs - delayMs;
 					const peekTimeoutMs = Math.min(
 						delayInspectionTimeoutMs,
 						Math.max(0, Math.floor(inspectionSlackMs / 2)),
@@ -1868,8 +2152,8 @@ export function createGuard(options = {}) {
 							{
 								buffer:
 									inspection?.oversized || inspection?.incomplete
-									? undefined
-									: inspection?.buffer,
+										? undefined
+										: inspection?.buffer,
 								inspection,
 								recoveryDelayMs: delayMs,
 								recoverySource,
@@ -1922,6 +2206,7 @@ export function createGuard(options = {}) {
 					} finally {
 						waitLease.release();
 					}
+					lease = null;
 					continue;
 				}
 
@@ -1941,6 +2226,7 @@ export function createGuard(options = {}) {
 						);
 					} catch (error) {
 						lease.release();
+						lease = null;
 						throw error;
 					}
 					if (inspection.oversized) {
@@ -1964,11 +2250,13 @@ export function createGuard(options = {}) {
 							);
 						} finally {
 							lease.release();
+							lease = null;
 						}
 						return;
 					}
 
 					lease.release();
+					lease = null;
 					const buffer = inspection.buffer;
 					const decision = evaluateGuardRetry({
 						status: upstreamResponse.status,
@@ -2063,6 +2351,7 @@ export function createGuard(options = {}) {
 					} finally {
 						waitLease.release();
 					}
+					lease = null;
 					continue;
 				}
 
@@ -2091,10 +2380,13 @@ export function createGuard(options = {}) {
 					);
 				} finally {
 					lease.release();
+					lease = null;
 				}
 				return;
 			}
 		} catch (error) {
+			lease?.release();
+			lease = null;
 			if (
 				handleResponseBodyIdleTimeout(
 					error,
@@ -2116,13 +2408,7 @@ export function createGuard(options = {}) {
 			if (res.headersSent) {
 				res.destroy(error);
 			} else {
-				sendJsonError(
-					res,
-					context,
-					502,
-					"guard_upstream_error",
-					error.message,
-				);
+				sendJsonError(res, context, 502, "guard_upstream_error", error.message);
 			}
 		}
 	}
@@ -2151,13 +2437,7 @@ export function createGuard(options = {}) {
 			);
 		} catch (error) {
 			if (
-				handleResponseBodyIdleTimeout(
-					error,
-					res,
-					context,
-					1,
-					responseTelemetry,
-				)
+				handleResponseBodyIdleTimeout(error, res, context, 1, responseTelemetry)
 			) {
 				return;
 			}
@@ -2171,13 +2451,7 @@ export function createGuard(options = {}) {
 			if (res.headersSent) {
 				res.destroy(error);
 			} else {
-				sendJsonError(
-					res,
-					context,
-					502,
-					"guard_upstream_error",
-					error.message,
-				);
+				sendJsonError(res, context, 502, "guard_upstream_error", error.message);
 			}
 		}
 	}
@@ -2191,7 +2465,7 @@ export function createGuard(options = {}) {
 			const context = createRequestContext(req, res);
 			counters.drainingRejected += 1;
 			log("guard_draining", { id: context.id });
-			req.resume();
+			drainRequestForContext(req, context);
 			sendJsonError(
 				res,
 				context,
@@ -2220,6 +2494,7 @@ export function createGuard(options = {}) {
 					listenPort,
 					upstreamBase,
 					maxActive,
+					maxBodyReaders,
 					maxRecoveryWaits,
 					maxAttempts,
 					totalDeadlineMs,
@@ -2228,6 +2503,8 @@ export function createGuard(options = {}) {
 					recoverySilenceBudgetMs: maxRecoverySleepMs,
 					jitterMs,
 					maxInspectionBytes,
+					maxRequestBodyBytes,
+					requestDrainTimeoutMs,
 					responseIdleTimeoutMs,
 					delayInspectionTimeoutMs,
 					allowLegacyPoolBody,
@@ -2243,17 +2520,28 @@ export function createGuard(options = {}) {
 							maxAttempts,
 							jitterMs,
 							maxInspectionBytes,
+							maxRequestBodyBytes,
+							requestDrainTimeoutMs,
 							responseIdleTimeoutMs,
 							delayInspectionTimeoutMs,
 							allowLegacyPoolBody,
 							shutdownGraceMs,
 							maxActive,
 							maxQueue,
+							maxBodyReaders,
+							maxBodyReaderQueue: maxQueue,
 							maxRecoveryWaits,
 						},
 					},
 					active,
 					queued: queue.length,
+					bodyReaders: {
+						configured: maxBodyReaders,
+						queueLimit: maxQueue,
+						current: bodyReadersActive,
+						queued: bodyReaderQueue.length,
+						peak: peakBodyReaders,
+					},
 					recoveryWaits: {
 						configured: maxRecoveryWaits,
 						current: activeRecoveryWaits,
@@ -2268,7 +2556,7 @@ export function createGuard(options = {}) {
 		const context = createRequestContext(req, res);
 		const upstreamTarget = resolveUpstreamTarget(req.url, upstreamUrl);
 		if (!upstreamTarget) {
-			req.resume();
+			drainRequestForContext(req, context);
 			sendJsonError(
 				res,
 				context,
@@ -2280,30 +2568,132 @@ export function createGuard(options = {}) {
 			return;
 		}
 
+		const limited = isLimitedPath(req);
+		let admissionLease = null;
+		let bodyReaderLease = null;
+		if (limited) {
+			try {
+				// Admission owns the concurrency slot before any request-body bytes
+				// are read. A queued request therefore consumes only the stream
+				// parser's bounded socket buffer, never an aggregate body buffer.
+				admissionLease = await acquire(context.id, context.signal);
+			} catch (error) {
+				// Queue rejection/expiry happens before body listeners are attached;
+				// drain the upload so keep-alive parsing remains synchronized.
+				drainRequestForContext(req, context);
+				if (error?.code === "GUARD_QUEUE_FULL") {
+					sendQueueFull(res, context);
+				} else if (!handleAbort(error, res, context, 0, null)) {
+					sendJsonError(
+						res,
+						context,
+						502,
+						"guard_admission_error",
+						error?.message || "guard admission failed",
+					);
+				}
+				context.dispose();
+				return;
+			}
+			// This first lease is an admission reservation used to preserve the
+			// existing upstream queue ordering. Release the physical upstream
+			// permit before reading bytes; body readers have their own bounded pool.
+			admissionLease.release();
+			admissionLease = null;
+		}
+
 		let body;
+		let bodyReadStarted = false;
 		try {
-			body = await readBody(req, context.signal);
+			bodyReaderLease = await acquireBodyReader(
+				context.id,
+				context.signal,
+			);
+			bodyReadStarted = true;
+			body = await readBody(
+				req,
+				context.signal,
+				maxRequestBodyBytes,
+				Math.min(
+					requestDrainTimeoutMs,
+					Math.max(1, context.remainingMs()),
+				),
+				() => onRequestDrainTimeout(context),
+			);
 		} catch (error) {
-			if (!handleAbort(error, res, context, 0, null)) {
+			admissionLease?.release();
+			admissionLease = null;
+			bodyReaderLease?.release();
+			bodyReaderLease = null;
+			if (!bodyReadStarted) drainRequestForContext(req, context);
+			if (error?.code === "GUARD_BODY_READER_QUEUE_FULL") {
+				sendBodyReaderQueueFull(res, context);
+				context.dispose();
+				return;
+			}
+			if (handleAbort(error, res, context, 0, null)) {
+				context.dispose();
+				return;
+			}
+			if (error?.code === "GUARD_REQUEST_BODY_TOO_LARGE") {
+				counters.oversizedRequestBodies += 1;
+				log("guard_request_body_too_large", {
+					id: context.id,
+					maxRequestBodyBytes,
+					declaredBytes: error.declaredBytes ?? null,
+					receivedBytes: error.receivedBytes ?? maxRequestBodyBytes + 1,
+					elapsedMs: now() - context.acceptedAt,
+				});
 				sendJsonError(
 					res,
 					context,
-					400,
-					"guard_bad_request",
-					error.message,
+					413,
+					"guard_request_body_too_large",
+					"request body exceeds the local guard limit",
 				);
+			} else {
+				sendJsonError(res, context, 400, "guard_bad_request", error.message);
 			}
 			context.dispose();
 			return;
 		}
 
 		try {
-			if (isLimitedPath(req)) {
-				await handleLimited(req, res, body, context, upstreamTarget);
+			if (limited) {
+				// Keep the bounded body-reader lease while the completed body waits
+				// for its physical upstream permit. This caps retained body buffers
+				// independently from the upstream attempt queue.
+				try {
+					admissionLease = await acquire(context.id, context.signal);
+				} catch (error) {
+					bodyReaderLease?.release();
+					bodyReaderLease = null;
+					if (error?.code === "GUARD_QUEUE_FULL") {
+						sendQueueFull(res, context);
+					} else if (!handleAbort(error, res, context, 0, null)) {
+						sendJsonError(
+							res,
+							context,
+							502,
+							"guard_admission_error",
+							error?.message || "guard admission failed",
+						);
+					}
+					return;
+				}
+				const lease = admissionLease;
+				admissionLease = null;
+				bodyReaderLease?.release();
+				bodyReaderLease = null;
+				await handleLimited(req, res, body, context, upstreamTarget, lease);
 			} else {
+				bodyReaderLease?.release();
+				bodyReaderLease = null;
 				await handlePassthrough(req, res, body, context, upstreamTarget);
 			}
 		} finally {
+			admissionLease?.release();
+			bodyReaderLease?.release();
 			context.dispose();
 		}
 	});
@@ -2331,12 +2721,15 @@ export function createGuard(options = {}) {
 					upstreamBase,
 					maxActive,
 					maxQueue,
+					maxBodyReaders,
 					maxRecoveryWaits,
 					maxAttempts,
 					totalDeadlineMs,
 					retryAttemptHeadroomMs,
 					maxRecoverySleepMs,
 					maxInspectionBytes,
+					maxRequestBodyBytes,
+					requestDrainTimeoutMs,
 					responseIdleTimeoutMs,
 					delayInspectionTimeoutMs,
 					allowLegacyPoolBody,
@@ -2382,6 +2775,15 @@ export function createGuard(options = {}) {
 			},
 			get queued() {
 				return queue.length;
+			},
+			get bodyReaders() {
+				return {
+					configured: maxBodyReaders,
+					queueLimit: maxQueue,
+					active: bodyReadersActive,
+					queued: bodyReaderQueue.length,
+					peak: peakBodyReaders,
+				};
 			},
 			get recoveryWaits() {
 				return {

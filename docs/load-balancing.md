@@ -2,16 +2,17 @@
 
 ## Table of Contents
 1. [Overview](#overview)
-2. [Session-Based Strategy](#session-based-strategy)
-3. [Account Priorities](#account-priorities)
-4. [Configuration](#configuration)
-5. [Account Selection Process](#account-selection-process)
-6. [Performance Considerations](#performance-considerations)
-7. [Important: Why Only Session-Based Strategy](#important-why-only-session-based-strategy)
+2. [Available Strategies](#available-strategies)
+3. [Session-Based Strategy](#session-based-strategy)
+4. [Account Priorities](#account-priorities)
+5. [Configuration](#configuration)
+6. [Account Selection Process](#account-selection-process)
+7. [Performance Considerations](#performance-considerations)
+8. [Strategy Selection and OAuth Safety](#strategy-selection-and-oauth-safety)
 
 ## Overview
 
-better-ccflare implements a session-based load balancing system to distribute requests across multiple Claude CLI OAuth accounts, avoiding rate limits and ensuring high availability. The system maintains configurable sessions (default: 5 hours) with individual accounts to minimize rate limit issues.
+better-ccflare supports four load-balancing strategies for distributing requests across compatible accounts: `session` (the default), `least-used`, `session-affinity`, and the opt-in `session-drain-soonest`. Session-based strategies preserve account or client stickiness where prompt-cache locality and provider safety matter; `least-used` is available when per-request spreading is appropriate.
 
 ### Key Features
 - **Account Health Monitoring**: Automatically filters out rate-limited or paused accounts
@@ -23,9 +24,22 @@ better-ccflare implements a session-based load balancing system to distribute re
 - **Real-time Configuration**: Change settings without restarting the server
 - **Provider Filtering**: Accounts are filtered by provider compatibility
 
+## Available Strategies
+
+The strategy is selected with `LB_STRATEGY`, the `lb_strategy` configuration key, or the HTTP configuration endpoint. All four values are valid:
+
+| Strategy | Routing behavior | OAuth and provider guidance |
+|----------|------------------|-----------------------------|
+| `session` (default) | Maintains one account-level session and returns ordered fallbacks. Session duration is configurable (5 hours by default). | Preserves stickiness for providers that require session-window tracking, including Anthropic OAuth and Codex OAuth. Anthropic OAuth sessions also reset when a known `rate_limit_reset` has passed. |
+| `least-used` | Orders available accounts by priority and utilization, with a short recency penalty to spread bursts. Each request can select a different account. | Does not preserve OAuth stickiness. Use for API-key or compatible-provider pools where per-request spreading is explicitly safe. |
+| `session-affinity` | Maps each client session or affinity lane to a sticky account, while retaining automatic failover and expiry. New clients are spread across the pool. | Recommended when multiple concurrent clients need cache-local routing without one global account owner. |
+| `session-drain-soonest` (opt-in) | Extends `session-affinity`. Existing owners remain in place; only a fresh assignment or account failover ranks candidates by the earliest known future all-model weekly reset, then priority/utilization. | Unknown, malformed, or past reset telemetry is treated as unavailable and falls back to ordinary affinity ordering. Enable deliberately for pools where draining expiring weekly capacity is useful. |
+
+For Anthropic OAuth accounts, prefer `session`, `session-affinity`, or the opt-in `session-drain-soonest`. These preserve natural account stickiness. `least-used` intentionally spreads requests and may trigger provider anti-abuse controls when used with OAuth credentials.
+
 ## Session-Based Strategy
 
-**Description**: Maintains sticky sessions with individual accounts for a configurable duration (default: 5 hours). This is the only load balancing strategy available in better-ccflare, designed to minimize account switching and reduce the likelihood of hitting rate limits.
+**Description**: Maintains one sticky session with an individual account for a configurable duration (default: 5 hours). This is the default strategy and is designed to minimize account switching and reduce the likelihood of hitting rate limits.
 
 **Use Case**: Optimal for production environments where minimizing rate limits is crucial. Particularly effective for applications with sustained user sessions.
 
@@ -90,15 +104,15 @@ export class SessionStrategy implements LoadBalancingStrategy {
 
 ## Usage Window Alignment for Anthropic OAuth
 
-**Description**: For Anthropic OAuth accounts, the session strategy includes intelligent optimization that aligns session resets with the actual 5-hour usage windows provided by Anthropic's API, ensuring optimal resource utilization. Other providers (like API-key-based accounts) do not use fixed-duration session tracking and instead operate on a pay-as-you-go basis without session windows.
+**Description**: Session duration tracking is provider-specific. Anthropic OAuth has a 5-hour usage window and additionally resets a session when the API's `rate_limit_reset` has passed. Codex OAuth and Zai are also configured for session-window tracking; API-key and other pay-as-you-go providers generally do not use fixed-duration session stickiness.
 
 **How It Works**:
 
 The system implements provider-specific session reset logic:
 
-1. **Provider Check**: First determines if the account's provider requires session duration tracking (currently only Anthropic providers do)
-2. **Fixed Duration Check**: For providers that require session duration tracking (like Anthropic), sessions reset after the configured duration (default: 5 hours)
-3. **Usage Window Reset Check**: For Anthropic OAuth accounts only, sessions also reset when the API's usage window expires (based on `rate_limit_reset` timestamp)
+1. **Provider Check**: First determines if the account's provider requires session duration tracking (for example, Anthropic OAuth, Codex OAuth, and Zai)
+2. **Fixed Duration Check**: For providers that require session duration tracking (such as Anthropic OAuth, Codex OAuth, and Zai), sessions reset after the configured duration (default: 5 hours)
+3. **Usage Window Reset Check**: For Anthropic OAuth accounts, sessions also reset when the API's usage window expires (based on the `rate_limit_reset` timestamp)
 
 ```typescript
 // Provider-specific session duration tracking
@@ -127,8 +141,9 @@ if (fixedDurationExpired || rateLimitWindowReset) {
 
 **Provider Compatibility**:
 
-- ✅ **Anthropic OAuth**: Full usage window alignment support with 5-hour session tracking
-- ✅ **Other Providers** (API-key-based, OpenAI-compatible, etc.): No fixed-duration session tracking - operate on pay-as-you-go basis
+- ✅ **Anthropic OAuth**: Full usage window alignment support with 5-hour session tracking and `rate_limit_reset` checks
+- ✅ **Codex OAuth and Zai**: Provider configuration enables fixed-duration session tracking
+- ✅ **Other Providers** (API-key-based, OpenAI-compatible, etc.): No fixed-duration session tracking - operate on a pay-as-you-go basis
 - ✅ **Mixed Environments**: Works seamlessly with accounts from different providers
 
 **Race Condition Prevention**: The implementation uses strict `<` comparisons instead of `<=` to prevent race conditions where sessions might reset prematurely at the exact moment the usage window resets.
@@ -232,10 +247,10 @@ The auto-fallback feature provides intelligent automatic switching back to highe
 
 Auto-fallback operates at the account level and uses the API's rate limit reset information to determine when accounts become available:
 
-1. **Anthropic Only**: Auto-fallback is only available for Anthropic accounts since only they provide rate limit reset information via the API
-2. **Per-Account Setting**: Each Anthropic account can have auto-fallback enabled or disabled independently
+1. **Supported window providers**: Auto-fallback is available for `anthropic`, `codex`, and `zai` accounts, which expose the reset telemetry used by the scheduler
+2. **Per-Account Setting**: Each supported account can have auto-fallback enabled or disabled independently
 3. **Priority-Based Selection**: When multiple accounts have auto-fallback enabled and become available, the system selects the one with the highest priority (lowest priority number)
-4. **API Reset Detection**: Uses the `rate_limit_reset` timestamp from the Anthropic API to detect when usage windows have reset
+4. **API Reset Detection**: Uses the provider's `rate_limit_reset` timestamp to detect when a usage window has reset
 5. **Automatic Switching**: Before processing each request, the system checks for higher priority accounts with auto-fallback enabled that have become available
 
 ### Auto-Fallback Logic
@@ -329,7 +344,8 @@ better-ccflare uses a hierarchical configuration system where environment variab
 ### Environment Variables
 
 ```bash
-# Load balancing strategy (only 'session' is supported)
+# Load balancing strategy: session (default), least-used, session-affinity, or
+# session-drain-soonest (opt-in)
 LB_STRATEGY=session
 
 # Session duration in milliseconds (default: 18000000ms = 5 hours)
@@ -377,7 +393,7 @@ The strategy configuration can be changed at runtime via the HTTP API:
 # Get current strategy
 curl http://localhost:8080/api/config/strategy
 
-# Update strategy (only 'session' is valid)
+# Update strategy (all four values are valid; session-drain-soonest is opt-in)
 curl -X PUT http://localhost:8080/api/config/strategy \
   -H "Content-Type: application/json" \
   -d '{"strategy": "session"}'
@@ -428,7 +444,26 @@ export function isAccountAvailable(account: Account, now = Date.now()): boolean 
 - Rate-limited accounts are excluded if their rate limit hasn't expired
 
 ### 3. Session Management
-The SessionStrategy manages account sessions through the following process:
+The active strategy then applies its routing semantics:
+
+- `session` finds the most recent active account-level session, keeps it while
+  it remains available and in the best routing class, and returns ordered
+  fallbacks. A new session starts with the highest-priority available account,
+  using utilization as a same-priority tiebreaker.
+- `session-affinity` keys ownership by the request's client session or affinity
+  lane. Each client/lane stays on its owner until expiry; a temporary fallback
+  can serve while the preferred owner is unavailable without deleting the
+  preferred mapping.
+- `session-drain-soonest` uses the same sticky-owner lifecycle as
+  `session-affinity`. It changes only fresh-assignment and account-failover
+  ordering, preferring the earliest known future all-model weekly reset within
+  the same structural route class. Unknown or stale reset telemetry fails open
+  to ordinary affinity ordering.
+- `least-used` has no sticky owner. It orders available accounts by priority and
+  utilization for each request and uses a bounded recency penalty to spread
+  concurrent bursts.
+
+For the account-level `session` strategy, the detailed process is:
 
 1. **Active Session Search**: Finds the account with the most recent active session
 2. **Session Validation**: Checks if the session is within the configured duration
@@ -490,40 +525,52 @@ Monitor these key metrics:
 - Session duration effectiveness
 - Failover frequency
 
-## Important: Why Only Session-Based Strategy
+## Strategy Selection and OAuth Safety
 
-**⚠️ WARNING: Only the session-based load balancer strategy is available in better-ccflare.**
+All four built-in strategies are supported. The right choice depends on whether
+the provider and credential type benefit from account stickiness:
 
-Other strategies like round-robin, least-requests, or weighted distribution have been removed from the codebase as they can trigger Claude's anti-abuse systems and result in automatic account bans. Here's why they were removed:
+### Account and client stickiness
 
-### Account Ban Risks
+- `session` is the default account-level strategy. Providers configured for
+  session duration tracking (including Anthropic OAuth and Codex OAuth) keep an
+  active account session for the configured duration; Anthropic OAuth also
+  honors a known `rate_limit_reset` when starting the next session.
+- `session-affinity` keeps a separate sticky owner for each client session or
+  affinity lane. This spreads concurrent clients across healthy accounts while
+  preserving prompt-cache locality within each client.
+- `session-drain-soonest` is deliberately opt-in. It inherits the
+  `session-affinity` owner lifecycle, so it never displaces an existing owner
+  just because another account has an earlier reset. On a fresh assignment or
+  account-level failover only, a known future all-model weekly reset is used to
+  order candidates within the same structural route class, followed by normal
+  priority and utilization tie-breakers. Missing, malformed, or past reset
+  telemetry is unknown and fails open to ordinary affinity ordering.
 
-1. **Rapid Account Switching**: Strategies that frequently switch between accounts create suspicious patterns that Claude's systems detect as potential abuse.
+### Per-request spreading
 
-2. **Unnatural Usage Patterns**: Round-robin and similar strategies create artificial request patterns that don't match normal human usage.
+`least-used` orders available accounts by priority and utilization on every
+request, with a bounded recency penalty to prevent concurrent bursts from
+converging on one account. It intentionally does not preserve OAuth stickiness.
+Use it for API-key or compatible-provider pools where per-request spreading is
+safe and prompt-cache reuse is less important.
 
-3. **Rate Limit Triggering**: Frequent account switching increases the likelihood of hitting rate limits across multiple accounts simultaneously.
+### Anti-abuse guidance
 
-### Why Session-Based is Safe
+Rapidly switching among Anthropic OAuth accounts can look unlike normal user
+behavior and may trigger provider anti-abuse controls. For Anthropic OAuth,
+prefer `session`, `session-affinity`, or the opt-in `session-drain-soonest` and
+monitor account health and rate-limit telemetry. `least-used` is not unsafe by
+definition, but should be reserved for credentials and providers where that
+traffic pattern is explicitly acceptable.
 
-The session-based strategy mimics natural user behavior:
-- Maintains consistent sessions with individual accounts
-- Reduces account switching to once every 5 hours (configurable)
-- Creates usage patterns similar to a regular Claude user
-- Minimizes the risk of triggering anti-abuse systems
+If you need to tune the default account-level behavior, adjust
+`session_duration_ms` rather than inventing a custom strategy:
 
-### Best Practices
-
-1. **Always use session-based strategy**: This is the only strategy that won't risk your accounts
-2. **Configure appropriate session duration**: Default 5 hours is recommended
-3. **Monitor account health**: Watch for any rate limit issues or warnings
-4. **Avoid custom strategies**: Do not implement custom load balancing strategies unless you fully understand the risks
-
-If you need different behavior, adjust the session duration rather than switching strategies:
 ```json
 {
     "lb_strategy": "session",
-    "session_duration_ms": 18000000  // 5 hours (recommended)
+    "session_duration_ms": 18000000  // 5 hours (recommended default)
 }
 ```
 
@@ -556,11 +603,17 @@ The `RequestMeta` object contains:
 - `timestamp`: Request timestamp
 - `agentUsed`: Optional agent identifier
 
-Currently, only the `SessionStrategy` implementation exists in the codebase at `/packages/load-balancer/src/strategies/index.ts`.
+The built-in implementations are `SessionStrategy`, `LeastUsedStrategy`,
+`SessionAffinityStrategy`, and `SessionDrainSoonestStrategy` under
+`/packages/load-balancer/src/strategies/`. The latter is selected only when
+`LB_STRATEGY=session-drain-soonest` (or the equivalent config/API value) is
+explicitly set.
 
 ## Migration Notes
 
-When upgrading to this version, non-Anthropic providers (Zai, Minimax, OpenAI-compatible, Claude console API)
-will no longer have 5-hour session windows. This is expected behavior as these providers operate on a
-pay-as-you-go model without usage windows. Existing Claude console accounts will be automatically migrated
-to the new `claude-console-api` provider type. No manual configuration changes are required.
+When upgrading to this version, session duration tracking remains provider-specific:
+Anthropic OAuth, Codex OAuth, and Zai accounts retain the configured session-window
+behavior, while Minimax, OpenAI-compatible, and Claude console API accounts operate
+without fixed-duration session stickiness. Existing Claude console accounts will be
+automatically migrated to the new `claude-console-api` provider type. No manual
+configuration changes are required.

@@ -4,12 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BUFFER_SIZES } from "@better-ccflare/core";
 import { CODEX_LOGICAL_MODEL_FAMILY_HEADER } from "@better-ccflare/http-common";
+import { setDerivedProviderModelDefaults } from "../../provider-model-defaults";
 import { fetchCodexUsageOnDemand } from "./on-demand-fetch";
 import {
 	CODEX_SINGLE_ORCHESTRATION_ROOT_ENV,
 	resetOrchestrationElectionForTest,
 } from "./orchestration-election";
 import {
+	CODEX_CACHE_KEY_CONTINUITY_PERCENT_ENV,
 	CODEX_CACHE_KEY_MODE_ENV,
 	CODEX_CACHE_KEY_SESSION_PERCENT_ENV,
 	CODEX_DEFAULT_ENDPOINT,
@@ -17,7 +19,9 @@ import {
 	CODEX_VERSION,
 	CodexProvider,
 	codexEventCommitsOutput,
+	deriveCodexCacheKeyContinuityBucket,
 	deriveCodexCacheKeySessionBucket,
+	readCodexCacheKeyContinuityPercent,
 	readCodexCacheKeySessionPercent,
 	resolveCodexRequestModel,
 } from "./provider";
@@ -42,6 +46,7 @@ const readTraceRecords = (dir: string): Array<Record<string, unknown>> => {
 
 afterEach(() => {
 	delete process.env[CODEX_PROMPT_CACHE_KEY_ENV];
+	delete process.env[CODEX_CACHE_KEY_CONTINUITY_PERCENT_ENV];
 	delete process.env[CODEX_CACHE_KEY_MODE_ENV];
 	delete process.env[CODEX_CACHE_KEY_SESSION_PERCENT_ENV];
 	delete process.env[CODEX_SINGLE_ORCHESTRATION_ROOT_ENV];
@@ -49,6 +54,163 @@ afterEach(() => {
 	delete process.env[CODEX_TRACE_DIR_ENV];
 	delete process.env[CODEX_TRACE_HMAC_KEY_ENV];
 	resetOrchestrationElectionForTest();
+});
+
+describe("CodexProvider stream liveness", () => {
+	it("keeps a silent SSE stream alive until response.completed arrives", async () => {
+		const provider = new CodexProvider({
+			streamHeartbeatIntervalMs: 20,
+			streamRawSilenceTimeoutMs: 200,
+		});
+		let upstreamController: ReadableStreamDefaultController<Uint8Array>;
+		let upstreamCancelReason: unknown;
+		const upstream = new ReadableStream<Uint8Array>({
+			start(controller) {
+				upstreamController = controller;
+				controller.enqueue(
+					new TextEncoder().encode(
+						sseBody(
+							eventLine("response.in_progress", {
+								type: "response.in_progress",
+								response: { id: "resp_silent", model: "gpt-5.6-sol" },
+							}),
+						),
+					),
+				);
+			},
+			cancel(reason) {
+				upstreamCancelReason = reason;
+			},
+		});
+		const transformed = await provider.processResponse(
+			new Response(upstream, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+		const reader = transformed.body?.getReader();
+		if (!reader) throw new Error("transformed response has no body");
+		const decoder = new TextDecoder();
+
+		const first = await reader.read();
+		expect(decoder.decode(first.value)).toBe(
+			'event: ping\ndata: {"type":"ping"}\n\n',
+		);
+		const second = await Promise.race([
+			reader.read(),
+			Bun.sleep(100).then(() => {
+				throw new Error("Codex heartbeat did not arrive");
+			}),
+		]);
+		expect(decoder.decode(second.value)).toBe(
+			'event: ping\ndata: {"type":"ping"}\n\n',
+		);
+
+		upstreamController.enqueue(
+			new TextEncoder().encode(
+				sseBody(
+					eventLine("response.completed", {
+						type: "response.completed",
+						response: {
+							id: "resp_silent",
+							model: "gpt-5.6-sol",
+							usage: { input_tokens: 1, output_tokens: 0 },
+						},
+					}),
+				),
+			),
+		);
+
+		let terminalBody = "";
+		while (true) {
+			const { value, done } = await reader.read();
+			if (done) break;
+			terminalBody += decoder.decode(value, { stream: true });
+		}
+		expect(terminalBody).toContain("event: message_stop");
+		expect(terminalBody).not.toContain("event: ping");
+		expect(upstreamCancelReason).toBeDefined();
+	});
+
+	it("terminates raw upstream silence after synthetic heartbeats", async () => {
+		const provider = new CodexProvider({
+			streamHeartbeatIntervalMs: 15,
+			streamRawSilenceTimeoutMs: 70,
+		});
+		let upstreamCancelReason: unknown;
+		const upstream = new ReadableStream<Uint8Array>({
+			cancel(reason) {
+				upstreamCancelReason = reason;
+				return new Promise<void>(() => {});
+			},
+		});
+		const transformed = await provider.processResponse(
+			new Response(upstream, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+
+		const body = await Promise.race([
+			transformed.text(),
+			Bun.sleep(300).then(() => {
+				throw new Error("timed-out Codex stream did not terminate");
+			}),
+		]);
+		expect(upstreamCancelReason).toBeInstanceOf(Error);
+		expect(body).toContain("event: error");
+		expect(body).toContain(
+			"Codex upstream timed out while waiting for response data.",
+		);
+		expect(body).not.toContain("rawSilenceTimeoutMs");
+	});
+
+	it("does not await a hanging upstream cancellation after a terminal event", async () => {
+		const provider = new CodexProvider({
+			streamHeartbeatIntervalMs: 100,
+			streamRawSilenceTimeoutMs: 500,
+		});
+		let cancelCalls = 0;
+		const upstream = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(
+					new TextEncoder().encode(
+						sseBody(
+							eventLine("response.completed", {
+								type: "response.completed",
+								response: {
+									id: "resp_terminal_cancel",
+									model: "gpt-5.6-sol",
+									usage: { input_tokens: 1, output_tokens: 0 },
+								},
+							}),
+						),
+					),
+				);
+			},
+			cancel() {
+				cancelCalls++;
+				return new Promise<void>(() => {});
+			},
+		});
+		const transformed = await provider.processResponse(
+			new Response(upstream, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+		const body = await Promise.race([
+			transformed.text(),
+			Bun.sleep(300).then(() => {
+				throw new Error("terminal Codex stream did not reach EOF");
+			}),
+		]);
+		expect(body).toContain("event: message_stop");
+		expect(cancelCalls).toBe(1);
+	});
 });
 
 describe("CodexProvider request conversion", () => {
@@ -66,8 +228,10 @@ describe("CodexProvider request conversion", () => {
 		}
 		expect(
 			provider.getLogicalModelCapability("claude-fable-5", {} as never),
-		).toMatchObject({ status: "unsupported", provenance: "provider_default" });
-		expect(resolveCodexRequestModel("claude-fable-5")).toBe("claude-fable-5");
+		).toMatchObject({ status: "supported", provenance: "provider_default" });
+		expect(resolveCodexRequestModel("claude-fable-5")).not.toBe(
+			"claude-fable-5",
+		);
 	});
 
 	it("handles messages and synthetic count_tokens paths", () => {
@@ -6280,6 +6444,79 @@ describe("CodexProvider upstream error code classification", () => {
 		expect(body.error.type).toBe("api_error");
 		expect(status).toBe(502);
 	});
+
+	it.each([
+		{ transportStatus: 401, code: "login_required", expectedType: "api_error" },
+		{
+			transportStatus: 403,
+			code: "usage_not_included",
+			expectedType: "permission_error",
+		},
+		{
+			transportStatus: 429,
+			code: "permission_denied",
+			expectedType: "api_error",
+		},
+		{
+			transportStatus: 529,
+			code: "permission_denied",
+			expectedType: "api_error",
+		},
+	] as const)("preserves a definitive transport status ($transportStatus) over a less-specific SSE body mapping", async ({
+		transportStatus,
+		code,
+		expectedType,
+	}) => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("error", {
+				type: "error",
+				code,
+				message: `Codex reported ${code}`,
+			}),
+		]);
+		const response = new Response(upstreamBody, {
+			status: transportStatus,
+			statusText: `Upstream ${transportStatus}`,
+			headers: {
+				"content-type": "text/event-stream",
+				"x-better-ccflare-request-stream": "false",
+			},
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const body = (await transformed.json()) as {
+			error: { type: string; code?: string };
+		};
+
+		expect(transformed.status).toBe(transportStatus);
+		expect(transformed.statusText).toBe(`Upstream ${transportStatus}`);
+		expect(body.error.type).toBe(expectedType);
+		expect(body.error.code).toBe(code);
+	});
+
+	it("keeps body-derived status for HTTP 200 even when the body is a permission error", async () => {
+		const provider = new CodexProvider();
+		const response = new Response(
+			sseBody([
+				...eventLine("error", {
+					type: "error",
+					code: "usage_not_included",
+					message: "Codex plan does not include usage",
+				}),
+			]),
+			{
+				status: 200,
+				headers: {
+					"content-type": "text/event-stream",
+					"x-better-ccflare-request-stream": "false",
+				},
+			},
+		);
+
+		const transformed = await provider.processResponse(response, null);
+		expect(transformed.status).toBe(403);
+	});
 });
 
 describe("CodexProvider.transformRequestBody", () => {
@@ -6398,7 +6635,40 @@ describe("CodexProvider.transformRequestBody", () => {
 		const transformed = await provider.transformRequestBody(request, undefined);
 		const body = await transformed.json();
 
-		expect(body.model).toBe("gpt-5.3-codex");
+		expect(body.model).toBe(resolveCodexRequestModel("claude-3-7-sonnet"));
+	});
+
+	// Regression: mapModel translates by substring and had no branch for
+	// `fable`, so the family was not resolvable at all. It is resolvable now —
+	// what it resolves TO comes from the account, not from a constant.
+	it("resolves a fable-family model from the account listing", async () => {
+		const provider = new CodexProvider();
+		const request = new Request("https://example.com/v1/messages", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				model: "claude-fable-5",
+				max_tokens: 10,
+				messages: [{ role: "user", content: "hello" }],
+			}),
+		});
+
+		// What the account's own listing implied, recorded when it was read.
+		setDerivedProviderModelDefaults("codex", "acc-1", {
+			fable: "gpt-5.6-sol",
+			opus: "gpt-5.6-sol",
+			sonnet: "gpt-5.6-terra",
+			haiku: "gpt-5.6-luna",
+		});
+		const account = {
+			id: "acc-1",
+			provider: "codex",
+		} as Parameters<typeof provider.transformRequestBody>[1];
+
+		const transformed = await provider.transformRequestBody(request, account);
+		const body = await transformed.json();
+
+		expect(body.model).toBe("gpt-5.6-sol");
 	});
 
 	it("uses account sonnet mapping for sonnet-family models", async () => {
@@ -6445,9 +6715,21 @@ describe("CodexProvider.transformRequestBody", () => {
 		expect(body.model).toBe("gpt-5.3-codex");
 	});
 
-	it("uses default Codex mapping for families missing from account mappings", async () => {
+	// Before, this asserted the compiled fallback. Now the fallback IS the
+	// account's listing, so the test says which model that listing implied.
+	it("fills families missing from the account mappings from its listing", async () => {
+		setDerivedProviderModelDefaults("codex", "acc-1", {
+			fable: "gpt-5.6-sol",
+			opus: "gpt-5.6-sol",
+			sonnet: "gpt-5.6-terra",
+			haiku: "gpt-5.6-luna",
+		});
 		const provider = new CodexProvider();
 		const account = {
+			// The derived map is keyed by account: two accounts of the same
+			// provider can be on different plans, so there is nothing to look up
+			// without an id.
+			id: "acc-1",
 			model_mappings: JSON.stringify({ sonnet: "gpt-5.3-codex" }),
 		} as Parameters<typeof provider.transformRequestBody>[1];
 		const request = new Request("https://example.com/v1/messages", {
@@ -6463,7 +6745,9 @@ describe("CodexProvider.transformRequestBody", () => {
 		const transformed = await provider.transformRequestBody(request, account);
 		const body = await transformed.json();
 
-		expect(body.model).toBe("gpt-5.4-mini");
+		// The account maps some families explicitly; the ones it does not are
+		// filled from its own listing, never from a constant.
+		expect(body.model).toBe("gpt-5.6-luna");
 	});
 
 	it("passes through unknown model names unchanged", async () => {
@@ -6954,9 +7238,12 @@ describe("CodexProvider.transformRequestBody", () => {
 			// recorded lineage and is admitted as root (basis: lineage_match), not
 			// demoted.
 			expect(requestTrace).toMatchObject({
-				trace_schema_version: 15,
+				trace_schema_version: 17,
 				orchestration_admission: "root",
 				orchestration_basis: "lineage_match",
+				cache_key_continuity_basis: "lineage_match",
+				cache_key_continuity_applied: false,
+				canonical_conversation_id: null,
 				orchestration_demotion_observed: false,
 			});
 			expect(requestTrace?.elapsed_ms_since_root).toBeNull();
@@ -7201,7 +7488,7 @@ describe("CodexProvider.transformRequestBody", () => {
 				(record) => record.phase === "request",
 			);
 			expect(requestTrace).toMatchObject({
-				trace_schema_version: 15,
+				trace_schema_version: 17,
 				orchestration_admission: "attributed_descendant",
 				orchestration_basis: null,
 				is_descendant: true,
@@ -7325,16 +7612,19 @@ describe("CodexProvider.transformRequestBody", () => {
 			system = "shared system prompt",
 			messages?: Array<Record<string, unknown>>,
 			account?: Parameters<CodexProvider["transformRequestBody"]>[1],
+			tools?: Array<Record<string, unknown>>,
+			headers: Record<string, string> = {},
 		) => {
 			const request = new Request("https://example.com/v1/messages", {
 				method: "POST",
-				headers: { "content-type": "application/json" },
+				headers: { "content-type": "application/json", ...headers },
 				body: JSON.stringify({
 					model: "claude-opus-4-8",
 					max_tokens: 10,
 					system,
 					metadata: { user_id: JSON.stringify({ session_id: sessionId }) },
 					messages: messages ?? [{ role: "user", content }],
+					...(tools ? { tools } : {}),
 				}),
 			});
 			return new CodexProvider()
@@ -7359,6 +7649,26 @@ describe("CodexProvider.transformRequestBody", () => {
 			["nope", 0],
 		] as const)("strictly parses session percentage %p", (raw, expected) => {
 			expect(readCodexCacheKeySessionPercent(raw)).toBe(expected);
+		});
+
+		it("strictly parses the continuity percentage and keeps its bucket stable", () => {
+			for (const [raw, expected] of [
+				[undefined, 0],
+				["", 0],
+				["0", 0],
+				["37", 37],
+				["100", 100],
+				["101", 100],
+				["-1", 0],
+				["1.5", 0],
+				[" 10", 0],
+				["nope", 0],
+			] as const) {
+				expect(readCodexCacheKeyContinuityPercent(raw)).toBe(expected);
+			}
+			expect(deriveCodexCacheKeyContinuityBucket(sessionA)).toBe(
+				deriveCodexCacheKeyContinuityBucket(sessionA.toUpperCase()),
+			);
 		});
 
 		it("uses stable domain-separated bucket fixtures and normalizes UUID case", () => {
@@ -7412,6 +7722,107 @@ describe("CodexProvider.transformRequestBody", () => {
 			expect(sibling.prompt_cache_key).not.toBe(first.prompt_cache_key);
 		});
 
+		it("reuses and traces the canonical root key for treated compaction continuations only", async () => {
+			process.env[CODEX_PROMPT_CACHE_KEY_ENV] = "1";
+			process.env[CODEX_CACHE_KEY_CONTINUITY_PERCENT_ENV] = "100";
+			const traceDir = mkdtempSync(join(tmpdir(), "codex-continuity-trace-"));
+			process.env[CODEX_TRACE_DIR_ENV] = traceDir;
+			const tools = [{ name: "Agent", input_schema: { type: "object" } }];
+			const rootMessages = [
+				{ role: "user", content: "start" },
+				{
+					role: "assistant",
+					content: [
+						{ type: "tool_use", id: "call_1", name: "Agent", input: {} },
+					],
+				},
+				{
+					role: "user",
+					content: [
+						{ type: "tool_result", tool_use_id: "call_1", content: "done" },
+					],
+				},
+			];
+			const compactedMessages = [
+				rootMessages[1],
+				rootMessages[2],
+				{ role: "user", content: "continue" },
+			];
+			const treatedRoot = await transform(
+				sessionA,
+				"start",
+				"shared system prompt",
+				rootMessages,
+				undefined,
+				tools,
+				{ "x-better-ccflare-request-id": "treated-root" },
+			);
+			const treatedCompacted = await transform(
+				sessionA,
+				"continue",
+				"shared system prompt",
+				compactedMessages,
+				undefined,
+				tools,
+				{ "x-better-ccflare-request-id": "treated-compacted" },
+			);
+			expect(treatedCompacted.prompt_cache_key).toBe(
+				treatedRoot.prompt_cache_key,
+			);
+			const treatedRecords = readTraceRecords(traceDir).filter(
+				(record) => record.phase === "request",
+			);
+			const treatedRootTrace = treatedRecords.find(
+				(record) => record.request_id === "treated-root",
+			);
+			const treatedCompactedTrace = treatedRecords.find(
+				(record) => record.request_id === "treated-compacted",
+			);
+			expect(treatedRootTrace).toMatchObject({
+				trace_schema_version: 17,
+				cache_key_continuity_applied: true,
+			});
+			expect(treatedCompactedTrace).toMatchObject({
+				trace_schema_version: 17,
+				cache_key_continuity_basis: "lineage_match",
+				cache_key_continuity_applied: true,
+			});
+			expect(treatedRootTrace?.continuity_evidence_id).toBeString();
+			expect(treatedCompactedTrace?.continuity_evidence_id).toBe(
+				treatedRootTrace?.continuity_evidence_id,
+			);
+			expect(treatedRootTrace?.canonical_conversation_id).toBe(
+				treatedRootTrace?.continuity_evidence_id,
+			);
+			expect(treatedCompactedTrace?.canonical_conversation_id).toBe(
+				treatedRootTrace?.canonical_conversation_id,
+			);
+
+			delete process.env[CODEX_TRACE_DIR_ENV];
+			rmSync(traceDir, { recursive: true, force: true });
+			process.env[CODEX_CACHE_KEY_CONTINUITY_PERCENT_ENV] = "0";
+			resetOrchestrationElectionForTest();
+			const controlRoot = await transform(
+				sessionA,
+				"start",
+				"shared system prompt",
+				rootMessages,
+				undefined,
+				tools,
+			);
+			const controlCompacted = await transform(
+				sessionA,
+				"continue",
+				"shared system prompt",
+				compactedMessages,
+				undefined,
+				tools,
+			);
+			expect(controlCompacted.prompt_cache_key).not.toBe(
+				controlRoot.prompt_cache_key,
+			);
+		});
+
 		it("shares one session key across sibling conversations in treatment", async () => {
 			process.env[CODEX_PROMPT_CACHE_KEY_ENV] = "1";
 			process.env[CODEX_CACHE_KEY_SESSION_PERCENT_ENV] = "100";
@@ -7424,12 +7835,37 @@ describe("CodexProvider.transformRequestBody", () => {
 			expect(sibling.prompt_cache_key).toBe(first.prompt_cache_key);
 		});
 
-		it("gives the explicit session override precedence over canary control", async () => {
+		it("gives the explicit session override precedence and marks continuity inapplicable", async () => {
 			process.env[CODEX_PROMPT_CACHE_KEY_ENV] = "1";
 			process.env[CODEX_CACHE_KEY_SESSION_PERCENT_ENV] = "0";
 			process.env[CODEX_CACHE_KEY_MODE_ENV] = "session";
-			const body = await transform(sessionA);
-			expect(body.prompt_cache_key).toMatch(/^ccflare-session-/);
+			const traceDir = mkdtempSync(join(tmpdir(), "codex-session-trace-"));
+			process.env[CODEX_TRACE_DIR_ENV] = traceDir;
+			try {
+				const body = await transform(
+					sessionA,
+					"task A",
+					"shared system prompt",
+					undefined,
+					undefined,
+					undefined,
+					{ "x-better-ccflare-request-id": "session-mode" },
+				);
+				expect(body.prompt_cache_key).toMatch(/^ccflare-session-/);
+				const trace = readTraceRecords(traceDir).find(
+					(record) => record.request_id === "session-mode",
+				);
+				expect(trace).toMatchObject({
+					cache_key_mode: "session",
+					cache_key_continuity_basis: "session",
+					cache_key_continuity_applied: null,
+					continuity_evidence_id: null,
+					canonical_conversation_id: null,
+				});
+			} finally {
+				delete process.env[CODEX_TRACE_DIR_ENV];
+				rmSync(traceDir, { recursive: true, force: true });
+			}
 		});
 
 		it("preserves the session-key empty-input fallback", async () => {

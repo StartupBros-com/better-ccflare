@@ -1,4 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import {
+	MAX_OAUTH_ERROR_INPUT_LENGTH,
+	OAuthRefreshTokenError,
+} from "@better-ccflare/core";
 import type { Account } from "@better-ccflare/types";
 import { XAI_CACHE_NATIVE_ENV, XAI_CONV_ID_HEADER } from "./cache-native";
 import {
@@ -233,7 +237,121 @@ describe("XaiProvider", () => {
 
 		// The code must survive alongside the description so token management can
 		// classify a definitively dead xAI refresh token.
+		expect(thrown).toBeInstanceOf(OAuthRefreshTokenError);
 		expect(thrown?.message).toContain("invalid_grant");
+	});
+
+	it("rejects an oversized successful token payload before accepting it", async () => {
+		const provider = new XaiProvider();
+		const body = `${JSON.stringify({
+			access_token: "new-access-token",
+			expires_in: 3600,
+		})}${" ".repeat(MAX_OAUTH_ERROR_INPUT_LENGTH)}trailing-data`;
+		globalThis.fetch = mock(
+			async () => new Response(body, { status: 200 }),
+		) as unknown as typeof fetch;
+
+		await expect(provider.refreshToken(account(), "unused")).rejects.toThrow(
+			/exceeded/,
+		);
+	});
+
+	it("rejects a successful response that omits the access token", async () => {
+		const provider = new XaiProvider();
+		globalThis.fetch = mock(
+			async () =>
+				new Response(JSON.stringify({ expires_in: 3600 }), { status: 200 }),
+		) as unknown as typeof fetch;
+
+		await expect(provider.refreshToken(account(), "unused")).rejects.toThrow(
+			/did not include an access token/,
+		);
+	});
+
+	it("classifies a nested structured invalid_grant response as terminal", async () => {
+		const provider = new XaiProvider();
+		globalThis.fetch = mock(
+			async () =>
+				new Response(
+					JSON.stringify({
+						error: {
+							code: "invalid_grant",
+							message: "The refresh token has expired.",
+						},
+					}),
+					{ status: 400, headers: { "content-type": "application/json" } },
+				),
+		) as unknown as typeof fetch;
+
+		let thrown: unknown;
+		try {
+			await provider.refreshToken(account(), "unused");
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).toBeInstanceOf(OAuthRefreshTokenError);
+		expect((thrown as Error).message).toContain("invalid_grant");
+	});
+
+	it("does not classify a structured code from a truncated response as terminal", async () => {
+		const provider = new XaiProvider();
+		const prefix = JSON.stringify({
+			error: "invalid_grant",
+			error_description: "credential-like-description-must-not-leak",
+		});
+		const body = `${prefix}${" ".repeat(MAX_OAUTH_ERROR_INPUT_LENGTH - prefix.length)}trailing-data`;
+		globalThis.fetch = mock(
+			async () =>
+				new Response(body, {
+					status: 400,
+					headers: { "content-type": "application/json" },
+				}),
+		) as unknown as typeof fetch;
+
+		let thrown: unknown;
+		try {
+			await provider.refreshToken(account(), "unused");
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).toBeInstanceOf(Error);
+		expect(thrown).not.toBeInstanceOf(OAuthRefreshTokenError);
+		expect((thrown as Error).message).not.toContain("invalid_grant");
+		expect((thrown as Error).message).not.toContain(
+			"credential-like-description-must-not-leak",
+		);
+	});
+
+	it("classifies an exact non-JSON invalid_grant body as terminal", async () => {
+		const provider = new XaiProvider();
+		globalThis.fetch = mock(
+			async () =>
+				new Response(" \r\ninvalid_grant\u0000\t ", {
+					status: 400,
+					statusText: "Bad Request",
+				}),
+		) as unknown as typeof fetch;
+
+		await expect(
+			provider.refreshToken(account(), "unused"),
+		).rejects.toBeInstanceOf(OAuthRefreshTokenError);
+	});
+
+	it("does not classify a root JSON prose message mentioning invalid_grant as terminal", async () => {
+		const provider = new XaiProvider();
+		globalThis.fetch = mock(
+			async () =>
+				new Response(
+					JSON.stringify({
+						message: "The upstream documentation mentions invalid_grant.",
+					}),
+					{ status: 400, headers: { "content-type": "application/json" } },
+				),
+		) as unknown as typeof fetch;
+
+		await expect(
+			provider.refreshToken(account(), "unused"),
+		).rejects.not.toBeInstanceOf(OAuthRefreshTokenError);
 	});
 
 	it("extracts cached_tokens from non-stream OpenAI-compatible usage", async () => {

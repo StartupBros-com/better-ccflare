@@ -815,6 +815,47 @@ export interface RuntimeConfig {
 	};
 }
 
+export type ProviderModelDefaultOverrides = Record<
+	string,
+	Record<string, string>
+>;
+
+/**
+ * Env var that expands which providers accept editable model-default
+ * overrides (via the config file, the API, and the dashboard tab).
+ * Absent or empty => only "codex" is editable. This gates only the
+ * override SURFACE (listing, accepting POSTs, showing a dashboard
+ * tab) — the built-in factory maps for every provider (xai, qwen,
+ * ...) keep translating models exactly as before; nothing here
+ * touches model resolution itself.
+ */
+export const PROVIDER_MODEL_DEFAULTS_ENV_VAR =
+	"CCFLARE_MODEL_DEFAULTS_PROVIDERS";
+
+const _DEFAULT_PROVIDER_MODEL_DEFAULTS_PROVIDERS: readonly string[] = ["codex"];
+
+/**
+ * Drops overrides for providers outside `enabledProviders` without
+ * mutating the input. Callers pass in the full, persisted overrides
+ * map and push the filtered result into the in-memory registry (see
+ * setProviderModelDefaultOverrides in @better-ccflare/providers) at
+ * boot and after a successful POST. The persisted file always keeps
+ * the full map — a disabled provider's stored override is never
+ * erased, just excluded here, so it re-applies automatically once
+ * CCFLARE_MODEL_DEFAULTS_PROVIDERS re-enables that provider.
+ */
+export function filterEnabledProviderModelDefaultOverrides(
+	enabledProviders: Iterable<string>,
+	overrides: ProviderModelDefaultOverrides,
+): ProviderModelDefaultOverrides {
+	const enabled = new Set(enabledProviders);
+	const filtered: ProviderModelDefaultOverrides = {};
+	for (const [provider, families] of Object.entries(overrides)) {
+		if (enabled.has(provider)) filtered[provider] = families;
+	}
+	return filtered;
+}
+
 export interface ConfigData {
 	lb_strategy?: StrategyName;
 	client_id?: string;
@@ -837,6 +878,9 @@ export interface ConfigData {
 	usage_throttling_weekly_enabled?: boolean;
 	agent_frontmatter_model_fallback?: boolean;
 	model_catalog_oauth_refresh_enabled?: boolean;
+	implicit_fallback_mode?: string;
+	implicit_fallback_allowed_classes?: string;
+	implicit_fallback_denied_classes?: string;
 	health_detail_enabled?: boolean;
 	anthropic_degraded_mode?: AnthropicDegradedMode;
 	anthropic_degraded_large_request_tokens?: number;
@@ -878,7 +922,12 @@ export interface ConfigData {
 	db_retry_delay_ms?: number;
 	db_retry_backoff?: number;
 	db_retry_max_delay_ms?: number;
-	[key: string]: string | number | boolean | undefined;
+	[key: string]:
+		| string
+		| number
+		| boolean
+		| ProviderModelDefaultOverrides
+		| undefined;
 }
 
 /**
@@ -976,6 +1025,133 @@ export function getCodexReasoningRetention(): boolean {
 	return true;
 }
 
+/**
+ * Restart-scoped policy for implicit normal/combo fallback. Explicit account
+ * routes and capability-profile routes are intentionally outside this policy.
+ *
+ * The route-class values mirror the provider enrollment classes used by combo
+ * routing, but are kept local to this package to avoid making config depend on
+ * the provider registry (which would create a package cycle).
+ */
+export type ImplicitFallbackPolicyMode = "off" | "observe" | "enforce";
+export type ImplicitFallbackRouteClass =
+	| "oauth-subscription"
+	| "api-key"
+	| "local"
+	| "cloud-credential";
+
+export interface ImplicitFallbackPolicyConfig {
+	readonly mode: ImplicitFallbackPolicyMode;
+	readonly allowedClasses: readonly ImplicitFallbackRouteClass[];
+	readonly deniedClasses: readonly ImplicitFallbackRouteClass[];
+}
+
+export const IMPLICIT_FALLBACK_POLICY_DEFAULTS: Readonly<ImplicitFallbackPolicyConfig> =
+	Object.freeze({
+		mode: "off" as const,
+		allowedClasses: Object.freeze([]) as readonly ImplicitFallbackRouteClass[],
+		deniedClasses: Object.freeze([]) as readonly ImplicitFallbackRouteClass[],
+	});
+
+const IMPLICIT_FALLBACK_ACTIVE_DEFAULT_DENIALS: readonly ImplicitFallbackRouteClass[] =
+	Object.freeze(["api-key", "cloud-credential"] as const);
+
+const IMPLICIT_FALLBACK_ROUTE_CLASSES: ReadonlySet<string> = new Set([
+	"oauth-subscription",
+	"api-key",
+	"local",
+	"cloud-credential",
+]);
+const MAX_IMPLICIT_FALLBACK_CLASS_LIST_ITEMS = 16;
+
+export interface ImplicitFallbackPolicyConfigInput {
+	mode?: unknown;
+	allowedClasses?: unknown;
+	deniedClasses?: unknown;
+}
+
+function parseImplicitFallbackClassList(
+	value: unknown,
+): readonly ImplicitFallbackRouteClass[] | undefined | null {
+	if (value === undefined) return undefined;
+	const rawValues = Array.isArray(value)
+		? value
+		: typeof value === "string"
+			? value.split(",")
+			: null;
+	if (rawValues === null) return null;
+	if (rawValues.length > MAX_IMPLICIT_FALLBACK_CLASS_LIST_ITEMS) return null;
+
+	const seen = new Set<ImplicitFallbackRouteClass>();
+	const normalized: ImplicitFallbackRouteClass[] = [];
+	for (const raw of rawValues) {
+		if (typeof raw !== "string") return null;
+		const candidate = raw.trim().toLowerCase();
+		if (!candidate) continue;
+		if (!IMPLICIT_FALLBACK_ROUTE_CLASSES.has(candidate)) return null;
+		if (seen.has(candidate as ImplicitFallbackRouteClass)) continue;
+		seen.add(candidate as ImplicitFallbackRouteClass);
+		normalized.push(candidate as ImplicitFallbackRouteClass);
+		// Four is the complete class universe. A larger list is necessarily
+		// malformed (or an attempt to smuggle unbounded config into health/logs).
+		if (normalized.length > IMPLICIT_FALLBACK_ROUTE_CLASSES.size) return null;
+	}
+	return Object.freeze(normalized);
+}
+
+/**
+ * Resolve an implicit fallback policy atomically. Invalid modes or classes
+ * return the default-off policy. When observe/enforce is explicitly enabled,
+ * API-key and cloud-credential classes are denied by default; an allowed class
+ * is an explicit exception and removes that class from the denial set.
+ */
+export function resolveImplicitFallbackPolicyConfig(
+	input: ImplicitFallbackPolicyConfigInput,
+	onInvalid?: (field: "mode" | "allowedClasses" | "deniedClasses") => void,
+): ImplicitFallbackPolicyConfig {
+	const rawMode = input.mode ?? "off";
+	const normalizedMode =
+		typeof rawMode === "string" ? rawMode.trim().toLowerCase() : "";
+	if (
+		normalizedMode !== "off" &&
+		normalizedMode !== "observe" &&
+		normalizedMode !== "enforce"
+	) {
+		onInvalid?.("mode");
+		return IMPLICIT_FALLBACK_POLICY_DEFAULTS;
+	}
+
+	const allowed = parseImplicitFallbackClassList(input.allowedClasses);
+	if (allowed === null) {
+		onInvalid?.("allowedClasses");
+		return IMPLICIT_FALLBACK_POLICY_DEFAULTS;
+	}
+	const denied = parseImplicitFallbackClassList(input.deniedClasses);
+	if (denied === null) {
+		onInvalid?.("deniedClasses");
+		return IMPLICIT_FALLBACK_POLICY_DEFAULTS;
+	}
+
+	const allowedSet = new Set(allowed ?? []);
+	const requestedDenials =
+		normalizedMode === "off"
+			? (denied ?? [])
+			: [...IMPLICIT_FALLBACK_ACTIVE_DEFAULT_DENIALS, ...(denied ?? [])];
+	const effectiveDenials: ImplicitFallbackRouteClass[] = [];
+	const seenDenials = new Set<ImplicitFallbackRouteClass>();
+	for (const routeClass of requestedDenials) {
+		if (allowedSet.has(routeClass) || seenDenials.has(routeClass)) continue;
+		seenDenials.add(routeClass);
+		effectiveDenials.push(routeClass);
+	}
+
+	return Object.freeze({
+		mode: normalizedMode,
+		allowedClasses: allowed ?? Object.freeze([]),
+		deniedClasses: Object.freeze(effectiveDenials),
+	});
+}
+
 export class Config extends EventEmitter {
 	private configPath: string;
 	private data: ConfigData = {};
@@ -1026,7 +1202,12 @@ export class Config extends EventEmitter {
 		defaultValue?: string | number | boolean,
 	): string | number | boolean | undefined {
 		if (key in this.data) {
-			return this.data[key];
+			const value = this.data[key];
+			// Settings with an object value (e.g.
+			// provider_model_default_overrides) have their own typed getter.
+			// This generic accessor serves scalars only — returning the object
+			// here would misrepresent the declared type.
+			return typeof value === "object" ? undefined : value;
 		}
 
 		if (defaultValue !== undefined) {
@@ -1088,6 +1269,55 @@ export class Config extends EventEmitter {
 
 	setDefaultAgentModel(model: string): void {
 		this.set("default_agent_model", model);
+	}
+
+	getProviderModelDefaultOverrides(): ProviderModelDefaultOverrides {
+		const value = this.data.provider_model_default_overrides;
+		if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+
+		const sanitized: ProviderModelDefaultOverrides = {};
+		for (const [provider, rawFamilies] of Object.entries(value)) {
+			if (
+				!provider.trim() ||
+				typeof rawFamilies !== "object" ||
+				rawFamilies === null ||
+				Array.isArray(rawFamilies)
+			) {
+				continue;
+			}
+			const families: Record<string, string> = {};
+			for (const [family, rawModel] of Object.entries(rawFamilies)) {
+				if (!family.trim() || typeof rawModel !== "string") continue;
+				const model = rawModel.trim();
+				if (model) families[family] = model;
+			}
+			if (Object.keys(families).length > 0) sanitized[provider] = families;
+		}
+		return sanitized;
+	}
+
+	setProviderModelDefaultOverrides(
+		overrides: ProviderModelDefaultOverrides,
+	): void {
+		const key = "provider_model_default_overrides";
+		const oldValue = this.data[key];
+		this.data[key] = overrides;
+		this.saveConfig();
+		this.emit("change", { key, oldValue, newValue: overrides });
+	}
+
+	getEnabledProviderModelDefaultProviders(): string[] {
+		const raw = process.env[PROVIDER_MODEL_DEFAULTS_ENV_VAR];
+		if (!raw?.trim()) {
+			return [..._DEFAULT_PROVIDER_MODEL_DEFAULTS_PROVIDERS];
+		}
+		const providers = raw
+			.split(",")
+			.map((provider) => provider.trim())
+			.filter(Boolean);
+		return providers.length > 0
+			? providers
+			: [..._DEFAULT_PROVIDER_MODEL_DEFAULTS_PROVIDERS];
 	}
 
 	getOutboundProxy(): string | undefined {
@@ -1384,6 +1614,37 @@ export class Config extends EventEmitter {
 		const fromFile = this.data.model_catalog_oauth_refresh_enabled;
 		if (typeof fromFile === "boolean") return fromFile;
 		return false;
+	}
+
+	/**
+	 * Resolve the restart-scoped implicit normal/combo fallback policy. The
+	 * environment wins per field over the config file, and malformed input
+	 * atomically returns the default-off policy.
+	 */
+	getImplicitFallbackPolicyConfig(): ImplicitFallbackPolicyConfig {
+		let invalidField: "mode" | "allowedClasses" | "deniedClasses" | null = null;
+		const resolved = resolveImplicitFallbackPolicyConfig(
+			{
+				mode:
+					process.env.CCFLARE_IMPLICIT_FALLBACK_MODE ??
+					this.data.implicit_fallback_mode,
+				allowedClasses:
+					process.env.CCFLARE_IMPLICIT_FALLBACK_ALLOWED_CLASSES ??
+					this.data.implicit_fallback_allowed_classes,
+				deniedClasses:
+					process.env.CCFLARE_IMPLICIT_FALLBACK_DENIED_CLASSES ??
+					this.data.implicit_fallback_denied_classes,
+			},
+			(field) => {
+				invalidField ??= field;
+			},
+		);
+		if (invalidField !== null) {
+			log.warn(
+				`Invalid implicit fallback policy setting "${invalidField}"; policy is off until configuration is corrected and the process restarts`,
+			);
+		}
+		return resolved;
 	}
 
 	setUsageThrottlingFiveHourEnabled(value: boolean): void {

@@ -2,6 +2,8 @@
  * Custom error classes for standardized error handling across the application
  */
 
+import { MAX_OAUTH_ERROR_INPUT_LENGTH } from "./oauth-response";
+
 /**
  * Base error class for all application errors
  */
@@ -86,6 +88,147 @@ const INVALID_GRANT_MARKERS = [
 	"oauth authentication is currently not supported",
 ] as const;
 
+const MAX_OAUTH_ERROR_MESSAGE_LENGTH = 1024;
+// Do not parse arbitrarily large provider error bodies. The response has
+// already been bounded by the provider's fetch path where possible, but this
+// helper is also called on caught/forwarded values from shared refresh code.
+
+const INVALID_GRANT_CODES = new Set<string>(INVALID_GRANT_MARKERS);
+
+function boundedOAuthText(value: unknown): string {
+	if (typeof value !== "string") return "";
+	const text = value
+		.replace(/\p{Cc}/gu, " ")
+		.replace(/\s+/g, " ")
+		.trim();
+	return text.slice(0, MAX_OAUTH_ERROR_MESSAGE_LENGTH);
+}
+
+function parseOAuthErrorValue(value: unknown): unknown {
+	if (typeof value !== "string") return value;
+	const text = value.trim();
+	if (text.length > MAX_OAUTH_ERROR_INPUT_LENGTH) return "";
+	if (!text.startsWith("{") && !text.startsWith("[")) return text;
+	try {
+		return JSON.parse(text);
+	} catch {
+		return text;
+	}
+}
+
+/**
+ * Extract a bounded, machine-code-first message from an OAuth error payload.
+ * OAuth implementations disagree about whether the error is a string, an
+ * RFC-6749 object, or a nested provider object. Only well-known error fields
+ * are admitted; stringifying an entire payload can lose codes or leak tokens.
+ */
+export function formatOAuthErrorMessage(input: unknown): string {
+	const parsed = parseOAuthErrorValue(input);
+	if (typeof parsed === "string") return boundedOAuthText(parsed);
+	if (typeof parsed !== "object" || parsed === null) return "";
+
+	const root = parsed as Record<string, unknown>;
+	const nestedValue = parseOAuthErrorValue(root.error);
+	const nested =
+		typeof nestedValue === "object" && nestedValue !== null
+			? (nestedValue as Record<string, unknown>)
+			: undefined;
+	const read = (...values: unknown[]): string => {
+		for (const value of values) {
+			const text = boundedOAuthText(value);
+			if (text) return text;
+		}
+		return "";
+	};
+
+	const code = read(
+		nested?.error_code,
+		nested?.code,
+		nested?.type,
+		nested?.error,
+		root.error_code,
+		root.code,
+		root.type,
+		typeof nestedValue === "string" ? nestedValue : undefined,
+		typeof root.error === "string" ? root.error : undefined,
+	);
+	const description = read(
+		nested?.error_description,
+		nested?.message,
+		nested?.detail,
+		nested?.description,
+		root.error_description,
+		root.message,
+		root.detail,
+		root.description,
+	);
+
+	return boundedOAuthText([code, description].filter(Boolean).join(": "));
+}
+
+/**
+ * Return only a machine-readable terminal OAuth code from a structured
+ * payload. Human descriptions are intentionally excluded from this helper so
+ * an incidental mention of `invalid_grant` cannot quarantine an account.
+ */
+export function getOAuthErrorCode(input: unknown): string {
+	const parsed = parseOAuthErrorValue(input);
+	if (typeof parsed !== "object" || parsed === null) return "";
+	const root = parsed as Record<string, unknown>;
+	const nestedValue = parseOAuthErrorValue(root.error);
+	const nested =
+		typeof nestedValue === "object" && nestedValue !== null
+			? (nestedValue as Record<string, unknown>)
+			: undefined;
+	const candidates = [
+		nested?.error_code,
+		nested?.code,
+		nested?.type,
+		root.error_code,
+		root.code,
+		root.type,
+		typeof nestedValue === "string" ? nestedValue : undefined,
+		typeof root.error === "string" ? root.error : undefined,
+	];
+	for (const candidate of candidates) {
+		const code = boundedOAuthText(candidate).toLowerCase();
+		if (INVALID_GRANT_CODES.has(code)) return code;
+	}
+	return "";
+}
+
+/** True only for an explicit structured terminal OAuth machine code. */
+export function isStructuredInvalidGrant(input: unknown): boolean {
+	return Boolean(getOAuthErrorCode(input));
+}
+
+/** True only when a non-JSON provider body is exactly a terminal OAuth code. */
+export function isExactInvalidGrantMessage(input: unknown): boolean {
+	if (typeof input !== "string") return false;
+	if (input.length > MAX_OAUTH_ERROR_INPUT_LENGTH) return false;
+	const normalized = input
+		.replace(/\p{Cc}/gu, " ")
+		.replace(/\s+/g, " ")
+		.trim()
+		.toLowerCase();
+	return INVALID_GRANT_CODES.has(normalized);
+}
+
+/**
+ * Return the terminal OAuth marker only when a raw response is exactly one of
+ * the known machine codes. This is intentionally separate from
+ * `getOAuthErrorCode`, which only accepts structured payload fields; callers
+ * must also prove that the response was not truncated before using this value.
+ */
+export function getExactOAuthErrorCode(input: unknown): string {
+	if (!isExactInvalidGrantMessage(input)) return "";
+	return (input as string)
+		.replace(/\p{Cc}/gu, " ")
+		.replace(/\s+/g, " ")
+		.trim()
+		.toLowerCase();
+}
+
 /**
  * True when an OAuth token-refresh error message/body indicates the refresh
  * token itself was rejected (terminal, needs reauth). Case-insensitive; pass
@@ -108,11 +251,25 @@ export function isInvalidGrantMessage(
  * `AuthError`, which hardcodes the `AUTH_ERROR` code) to carry its own code.
  */
 export class OAuthRefreshTokenError extends AppError {
+	public readonly oauthErrorCode: string;
+
 	constructor(
 		public readonly accountId: string,
 		message = "OAuth refresh token rejected, re-authentication required",
+		oauthErrorCode = "invalid_grant",
 	) {
-		super(message, "OAUTH_INVALID_GRANT", 401, { accountId });
+		const normalizedOAuthErrorCode =
+			boundedOAuthText(oauthErrorCode).toLowerCase();
+		const verifiedOAuthErrorCode = INVALID_GRANT_CODES.has(
+			normalizedOAuthErrorCode,
+		)
+			? normalizedOAuthErrorCode
+			: "invalid_grant";
+		super(message, "OAUTH_INVALID_GRANT", 401, {
+			accountId,
+			oauthErrorCode: verifiedOAuthErrorCode,
+		});
+		this.oauthErrorCode = verifiedOAuthErrorCode;
 	}
 }
 

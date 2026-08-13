@@ -512,13 +512,10 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 		meta?: RequestMeta,
 	): StrategyCandidate[] {
 		const scored = candidates.map((candidate) => {
-			const { account } = candidate;
-			const util =
-				this.store?.getAccountUtilization?.(account.id, account.provider) ?? 0;
-			const lastPick = this.lastPickedAt.get(account.id) ?? 0;
-			const recencyPenalty =
-				now - lastPick < RECENT_PICK_WINDOW_MS ? RECENT_PICK_PENALTY : 0;
-			return { candidate, score: util + recencyPenalty };
+			return {
+				candidate,
+				score: this.getLeastUsedScore(candidate.account, now),
+			};
 		});
 
 		return scored
@@ -532,6 +529,30 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 				return a.score - b.score;
 			})
 			.map((entry) => entry.candidate);
+	}
+
+	/** Return the ordinary least-used score, including the bounded recency penalty. */
+	protected getLeastUsedScore(account: Account, now: number): number {
+		const util =
+			this.store?.getAccountUtilization?.(account.id, account.provider) ?? 0;
+		const lastPick = this.lastPickedAt.get(account.id) ?? 0;
+		const recencyPenalty =
+			now - lastPick < RECENT_PICK_WINDOW_MS ? RECENT_PICK_PENALTY : 0;
+		return util + recencyPenalty;
+	}
+
+	/**
+	 * Rank candidates for a fresh assignment or account-level failover.
+	 * The base implementation is intentionally the existing least-used order;
+	 * opt-in strategy variants may override it without changing sticky-owner or
+	 * route-circuit decisions.
+	 */
+	protected rankFreshCandidates(
+		candidates: StrategyCandidate[],
+		now: number,
+		meta?: RequestMeta,
+	): StrategyCandidate[] {
+		return this.rankByLeastUsed(candidates, now, meta);
 	}
 
 	/**
@@ -550,8 +571,11 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 		available: StrategyCandidate[],
 		now: number,
 		meta?: RequestMeta,
+		freshSelection = false,
 	): StrategyCandidate[] {
-		const ranked = this.rankByLeastUsed(available, now, meta);
+		const ranked = freshSelection
+			? this.rankFreshCandidates(available, now, meta)
+			: this.rankByLeastUsed(available, now, meta);
 		const chosen = ranked[0];
 		if (chosen) {
 			this.lastPickedAt.set(chosen.account.id, now);
@@ -579,7 +603,7 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 	): StrategyCandidate[] {
 		// The lane is active even while its preferred owner is absent/probing.
 		mapping.assignedAt = now;
-		const ranked = this.rankByLeastUsed(available, now, meta);
+		const ranked = this.rankFreshCandidates(available, now, meta);
 		const best = ranked[0];
 		const fallback = mapping.fallbackCandidateId
 			? available.find(
@@ -602,7 +626,7 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 			];
 		}
 
-		const ordered = this.pickAndMark(available, now, meta);
+		const ordered = this.pickAndMark(available, now, meta, true);
 		mapping.fallbackCandidateId = ordered[0]?.routing.candidateId ?? null;
 		return ordered;
 	}
@@ -632,8 +656,8 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 		const available = accounts.filter((a) => isPeekAvailable(a, now));
 		if (available.length === 0) return null;
 		return (
-			this.rankByLeastUsed(zipStrategyCandidates(available), now)[0]?.account
-				.id ?? null
+			this.rankFreshCandidates(zipStrategyCandidates(available), now)[0]
+				?.account.id ?? null
 		);
 	}
 
@@ -963,7 +987,7 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 
 					// A routable better tier (or comparable higher-pressure class inside
 					// the same tier) is authoritative and becomes the new sticky owner.
-					const ordered = this.pickAndMark(available, now, meta);
+					const ordered = this.pickAndMark(available, now, meta, true);
 					const replacement = ordered[0];
 					if (replacement) {
 						mapping.candidateId = replacement.routing.candidateId;
@@ -1027,7 +1051,7 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 					const fastFailAfterUpgrade = stillConfigured && recentlyUpgraded;
 
 					if (fastFailAfterUpgrade && upgradedAt !== null) {
-						const ordered = this.pickAndMark(available, now, meta);
+						const ordered = this.pickAndMark(available, now, meta, true);
 						const fallback = ordered[0];
 						// The owner this session was just upgraded to has already failed:
 						// arm suppression for the remainder of the window (measured from
@@ -1075,7 +1099,7 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 						return commitStrategyCandidateOrder(ordered, meta);
 					}
 
-					const ordered = this.pickAndMark(available, now, meta);
+					const ordered = this.pickAndMark(available, now, meta, true);
 					const fallback = ordered[0];
 					if (fallback) {
 						mapping.candidateId = fallback.routing.candidateId;
@@ -1096,7 +1120,7 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 		// New (or expired) client-session, or a request with no client id: assign
 		// the least-loaded available account (marking it picked for spread) and
 		// stick the client to it.
-		const ranked = this.pickAndMark(available, now, meta);
+		const ranked = this.pickAndMark(available, now, meta, true);
 		const chosen = ranked[0];
 
 		if (

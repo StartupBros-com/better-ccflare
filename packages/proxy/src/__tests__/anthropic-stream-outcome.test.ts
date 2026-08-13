@@ -176,7 +176,7 @@ describe("AnthropicStreamOutcomeTracker", () => {
 
 	it("reports a midstream error and retains only a bounded safe error type", () => {
 		const outcome = track([
-			'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"secret upstream details"}}\n\n',
+			'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","code":"upstream_busy","status":"529","message":"secret upstream details"}}\n\n',
 		]);
 
 		expect(outcome).toMatchObject({
@@ -185,6 +185,8 @@ describe("AnthropicStreamOutcomeTracker", () => {
 			errorEventSeen: true,
 			errorEventCount: 1,
 			errorType: "overloaded_error",
+			errorCode: "upstream_busy",
+			upstreamStatus: "529",
 		});
 		expect(JSON.stringify(outcome)).not.toContain("secret upstream details");
 	});
@@ -202,6 +204,63 @@ describe("AnthropicStreamOutcomeTracker", () => {
 
 		expect(unsafe.errorType).toBe("unknown_error");
 		expect(oversized.errorType).toBe("unknown_error");
+	});
+
+	it("omits unsafe error codes and statuses without retaining provider details", () => {
+		const outcome = track([
+			`event: error\ndata: ${JSON.stringify({
+				type: "error",
+				error: {
+					type: "api_error",
+					code: "bad code with spaces and private details",
+					status: "status\nprivate",
+				},
+			})}\n\n`,
+		]);
+
+		expect(outcome).not.toHaveProperty("errorCode");
+		expect(outcome).not.toHaveProperty("upstreamStatus");
+		expect(JSON.stringify(outcome)).not.toContain("private");
+	});
+
+	it("normalizes only finite integer HTTP-like numeric statuses", () => {
+		const numericStatus = track([
+			'event: error\ndata: {"type":"error","error":{"type":"api_error","status":429}}\n\n',
+		]);
+		expect(numericStatus.upstreamStatus).toBe("429");
+
+		for (const status of [99, 600, 429.5, -429]) {
+			const outcome = track([
+				`event: error\ndata: ${JSON.stringify({
+					type: "error",
+					error: { type: "api_error", status },
+				})}\n\n`,
+			]);
+			expect(outcome).not.toHaveProperty("upstreamStatus");
+		}
+
+		for (const status of ["099", "600", "429.5", "42", "429 "]) {
+			const outcome = track([
+				`event: error\ndata: ${JSON.stringify({
+					type: "error",
+					error: { type: "api_error", status },
+				})}\n\n`,
+			]);
+			expect(outcome).not.toHaveProperty("upstreamStatus");
+		}
+	});
+
+	it("retains only the first bounded code and status from repeated error events", () => {
+		const outcome = track([
+			'event: error\ndata: {"type":"error","error":{"type":"api_error","code":"first_code","status":"429"}}\n\n',
+			'event: error\ndata: {"type":"error","error":{"type":"api_error","code":"second_code","status":"529"}}\n\n',
+		]);
+
+		expect(outcome).toMatchObject({
+			errorCode: "first_code",
+			upstreamStatus: "429",
+			errorEventCount: 2,
+		});
 	});
 
 	it("lets any later error event override an earlier message_stop", () => {

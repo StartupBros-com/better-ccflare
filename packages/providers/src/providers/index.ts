@@ -19,6 +19,7 @@ export {
 	CODEX_DEFAULT_ENDPOINT,
 	CODEX_EXPLICIT_CACHE_BREAKPOINT_PERCENT_ENV,
 	CODEX_LOGICAL_MODEL_FAMILY_HEADER,
+	CODEX_VERSION,
 	CODEX_WHAM_USAGE_ENDPOINT,
 	CODEX_WHAM_USAGE_FALLBACK_ENDPOINT,
 	CodexOAuthProvider,
@@ -61,10 +62,12 @@ export { OpenAICompatibleProvider } from "./openai/index";
 export { OpenRouterProvider } from "./openrouter/index";
 export { type VertexAIConfig, VertexAIProvider } from "./vertex-ai/index";
 export {
+	applyXaiConvIdHeader,
 	CACHE_FLIGHT_RECORDER_ENV,
 	cacheOutcomeFromTokens,
 	deriveCacheFlightRecorderId,
 	deriveXaiConversationIdentity,
+	deriveXaiConvId,
 	extractClaudeSessionId,
 	formatXaiCacheCanary,
 	isCacheFlightRecorderEnabled,

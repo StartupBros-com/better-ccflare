@@ -1,8 +1,10 @@
 export {
+	applyXaiConvIdHeader,
 	CACHE_FLIGHT_RECORDER_ENV,
 	cacheOutcomeFromTokens,
 	deriveCacheFlightRecorderId,
 	deriveXaiConversationIdentity,
+	deriveXaiConvId,
 	extractClaudeSessionId,
 	formatXaiCacheCanary,
 	isCacheFlightRecorderEnabled,

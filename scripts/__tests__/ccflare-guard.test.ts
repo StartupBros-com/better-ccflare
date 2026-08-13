@@ -7,22 +7,26 @@ import net from "node:net";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { GUARD_CORRELATION_SECRET_HEADER } from "../../packages/http-common/src/headers";
-import {
-	createGuardCorrelationVerifier,
-} from "../../packages/proxy/src/handlers/guard-correlation-auth";
+import { createGuardCorrelationVerifier } from "../../packages/proxy/src/handlers/guard-correlation-auth";
 import { GUARD_REQUEST_ID_HEADER } from "../../packages/proxy/src/handlers/internal-transport-headers";
 import { createRequestMetadata } from "../../packages/proxy/src/handlers/request-handler";
 
 import {
 	DEFAULT_GUARD_MAX_ATTEMPTS,
+	DEFAULT_GUARD_MAX_BODY_READERS,
 	DEFAULT_GUARD_MAX_INSPECTION_BYTES,
+	DEFAULT_GUARD_MAX_REQUEST_BODY_BYTES,
 	DEFAULT_GUARD_MAX_RECOVERY_SLEEP_MS,
 	DEFAULT_GUARD_RETRY_ATTEMPT_HEADROOM_MS,
 	DEFAULT_GUARD_RESPONSE_IDLE_TIMEOUT_MS,
 	DEFAULT_GUARD_RETRY_JITTER_MS,
+	DEFAULT_GUARD_REQUEST_DRAIN_TIMEOUT_MS,
 	DEFAULT_GUARD_SOURCE_ID,
 	DEFAULT_GUARD_TOTAL_DEADLINE_MS,
+	MAX_GUARD_MAX_BODY_READERS,
 	MAX_GUARD_RECOVERY_SILENCE_MS,
+	MAX_GUARD_REQUEST_DRAIN_TIMEOUT_MS,
+	MIN_GUARD_REQUEST_DRAIN_TIMEOUT_MS,
 	createGuard,
 	planRecoveryAction,
 } from "../ccflare-guard.mjs";
@@ -68,7 +72,8 @@ async function allocatePort() {
 		probe.listen(0, "127.0.0.1", () => resolve());
 	});
 	const address = probe.address();
-	if (!address || typeof address === "string") throw new Error("missing address");
+	if (!address || typeof address === "string")
+		throw new Error("missing address");
 	await new Promise<void>((resolve) => probe.close(() => resolve()));
 	return address.port;
 }
@@ -142,7 +147,8 @@ async function listen(server: Server) {
 		});
 	});
 	const address = server.address();
-	if (!address || typeof address === "string") throw new Error("missing address");
+	if (!address || typeof address === "string")
+		throw new Error("missing address");
 	return `http://127.0.0.1:${address.port}`;
 }
 
@@ -176,7 +182,8 @@ async function waitFor(
 ): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
 	while (!predicate()) {
-		if (Date.now() >= deadline) throw new Error("timed out waiting for condition");
+		if (Date.now() >= deadline)
+			throw new Error("timed out waiting for condition");
 		await new Promise((resolve) => setTimeout(resolve, 5));
 	}
 }
@@ -371,6 +378,9 @@ describe("source-controlled guard", () => {
 				maxAttempts: 3,
 				jitterMs: 0,
 				maxInspectionBytes: 64 * 1_024,
+				maxRequestBodyBytes: DEFAULT_GUARD_MAX_REQUEST_BODY_BYTES,
+				requestDrainTimeoutMs: DEFAULT_GUARD_REQUEST_DRAIN_TIMEOUT_MS,
+				maxBodyReaders: DEFAULT_GUARD_MAX_BODY_READERS,
 			},
 		});
 		expect(DEFAULT_GUARD_MAX_ATTEMPTS).toBe(3);
@@ -379,7 +389,100 @@ describe("source-controlled guard", () => {
 		expect(DEFAULT_GUARD_MAX_RECOVERY_SLEEP_MS).toBe(120_000);
 		expect(DEFAULT_GUARD_RETRY_JITTER_MS).toBe(2_000);
 		expect(DEFAULT_GUARD_MAX_INSPECTION_BYTES).toBe(64 * 1_024);
+		expect(DEFAULT_GUARD_MAX_REQUEST_BODY_BYTES).toBe(4 * 1024 * 1024);
+		expect(DEFAULT_GUARD_MAX_BODY_READERS).toBe(8);
+		expect(DEFAULT_GUARD_REQUEST_DRAIN_TIMEOUT_MS).toBe(10_000);
+		expect(MIN_GUARD_REQUEST_DRAIN_TIMEOUT_MS).toBe(1_000);
+		expect(MAX_GUARD_REQUEST_DRAIN_TIMEOUT_MS).toBe(60_000);
+		expect(() =>
+			createGuard({ requestDrainTimeoutMs: 999, logger: () => {} }),
+		).toThrow(/GUARD_REQUEST_DRAIN_TIMEOUT_MS/);
+		expect(() =>
+			createGuard({
+				maxBodyReaders: MAX_GUARD_MAX_BODY_READERS + 1,
+				logger: () => {},
+			}),
+		).toThrow(/GUARD_MAX_BODY_READERS/);
 		expect(DEFAULT_GUARD_RESPONSE_IDLE_TIMEOUT_MS).toBe(120_000);
+	});
+
+	test("bounds the drain of a stalled rejected upload and tears down the socket", async () => {
+		const events: Array<Record<string, unknown>> = [];
+		const { baseUrl, guard } = await startGuard("http://127.0.0.1:1", {
+			maxRequestBodyBytes: 1_024,
+			requestDrainTimeoutMs: 1_000,
+			logger: (line: string) => events.push(JSON.parse(line)),
+		});
+		const guardUrl = new URL(baseUrl);
+		const socket = await openRawRequest(
+			baseUrl,
+			"POST /v1/messages HTTP/1.1\r\n" +
+				`Host: ${guardUrl.host}\r\n` +
+				"Transfer-Encoding: chunked\r\n" +
+				"Connection: close\r\n\r\n" +
+				"401\r\n" +
+				"x".repeat(1_025),
+		);
+
+		const rawResponse = await readRawResponsesUntil(
+			socket,
+			"guard_request_body_too_large",
+		);
+		expect(rawResponse).toContain("HTTP/1.1 413");
+		await waitFor(() => guard.state.counters.requestDrainTimeouts === 1, 2_500);
+		expect(socket.destroyed).toBe(true);
+		const timeoutEvent = events.find(
+			(event) => event.event === "guard_request_drain_timeout",
+		);
+		expect(timeoutEvent).toMatchObject({
+			requestDrainTimeoutMs: 1_000,
+		});
+	});
+
+	test("does not let a slow body reader monopolize an upstream permit", async () => {
+		let attempts = 0;
+		const upstreamBase = await listen(
+			http.createServer((_req, res) => {
+				attempts += 1;
+				res.end("upstream-ok");
+			}),
+		);
+		const { baseUrl, guard } = await startGuard(upstreamBase, {
+			maxActive: 1,
+			maxQueue: 1,
+			maxBodyReaders: 2,
+			totalDeadlineMs: 5_000,
+			requestDrainTimeoutMs: 1_000,
+		});
+		const guardUrl = new URL(baseUrl);
+		const slowSocket = await openRawRequest(
+			baseUrl,
+			"POST /v1/messages HTTP/1.1\r\n" +
+				`Host: ${guardUrl.host}\r\n` +
+				"Transfer-Encoding: chunked\r\n" +
+				"Connection: close\r\n\r\n" +
+				"1\r\nx\r\n",
+		);
+		await waitFor(() => guard.state.bodyReaders.active === 1);
+
+		const fastResponse = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "fast",
+		});
+		expect(fastResponse.status).toBe(200);
+		expect(await fastResponse.text()).toBe("upstream-ok");
+		expect(attempts).toBe(1);
+		expect(guard.state.active).toBe(0);
+
+		slowSocket.write("0\r\n\r\n");
+		const slowResponse = await readRawResponsesUntil(
+			slowSocket,
+			"upstream-ok",
+		);
+		expect(slowResponse).toContain("HTTP/1.1 200");
+		await waitFor(
+			() => guard.state.active === 0 && guard.state.bodyReaders.active === 0,
+		);
 	});
 
 	test.each([
@@ -455,6 +558,104 @@ describe("source-controlled guard", () => {
 				authorization: "Bearer intended-upstream-only",
 			},
 		]);
+	});
+
+	test("rejects a declared oversized body without upstream fetch", async () => {
+		let fetchCalls = 0;
+		const events: Array<Record<string, unknown>> = [];
+		const { baseUrl, guard } = await startGuard("http://127.0.0.1:8789", {
+			maxRequestBodyBytes: 1_024,
+			logger: (line: string) => events.push(JSON.parse(line)),
+			fetchImpl: async () => {
+				fetchCalls += 1;
+				return new Response("must-not-forward", { status: 200 });
+			},
+		});
+
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "x".repeat(1_025),
+		});
+		const payload = await response.json();
+
+		expect(response.status).toBe(413);
+		expect(payload).toMatchObject({
+			type: "error",
+			error: { type: "guard_request_body_too_large" },
+		});
+		expect(fetchCalls).toBe(0);
+		expect(guard.state.active).toBe(0);
+		expect(guard.state.queued).toBe(0);
+		expect(guard.state.counters.oversizedRequestBodies).toBe(1);
+		const event = events.find(
+			(candidate) => candidate.event === "guard_request_body_too_large",
+		);
+		expect(event).toMatchObject({
+			maxRequestBodyBytes: 1_024,
+			declaredBytes: 1_025,
+		});
+	});
+
+	test("rejects an oversized chunked body without retaining or forwarding it", async () => {
+		let fetchCalls = 0;
+		const events: Array<Record<string, unknown>> = [];
+		const { baseUrl, guard } = await startGuard("http://127.0.0.1:8789", {
+			maxRequestBodyBytes: 1_024,
+			logger: (line: string) => events.push(JSON.parse(line)),
+			fetchImpl: async () => {
+				fetchCalls += 1;
+				return new Response("must-not-forward", { status: 200 });
+			},
+		});
+		const guardUrl = new URL(baseUrl);
+		const socket = await openRawRequest(
+			baseUrl,
+			"POST /v1/messages HTTP/1.1\r\n" +
+				`Host: ${guardUrl.host}\r\n` +
+				"Transfer-Encoding: chunked\r\n" +
+				"Connection: close\r\n\r\n" +
+				"400\r\n" +
+				"x".repeat(1_024) +
+				"\r\n" +
+				"1\r\nx\r\n" +
+				"0\r\n\r\n",
+		);
+
+		const rawResponse = await readRawResponsesUntil(
+			socket,
+			"guard_request_body_too_large",
+		);
+
+		expect(rawResponse).toContain("HTTP/1.1 413");
+		expect(fetchCalls).toBe(0);
+		expect(guard.state.active).toBe(0);
+		expect(guard.state.queued).toBe(0);
+		expect(guard.state.counters.oversizedRequestBodies).toBe(1);
+		const event = events.find(
+			(candidate) => candidate.event === "guard_request_body_too_large",
+		);
+		expect(event).toMatchObject({ maxRequestBodyBytes: 1_024 });
+		expect(Number(event?.receivedBytes)).toBeLessThanOrEqual(1_025);
+	});
+
+	test("forwards a body at or below the configured request-body limit unchanged", async () => {
+		let forwardedBody: string | null = null;
+		const { baseUrl } = await startGuard("http://127.0.0.1:8789", {
+			maxRequestBodyBytes: 1_024,
+			fetchImpl: async (_url: URL, init: RequestInit) => {
+				forwardedBody = Buffer.from(init.body as Uint8Array).toString("utf8");
+				return new Response("forwarded", { status: 200 });
+			},
+		});
+
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "x".repeat(1_024),
+		});
+
+		expect(response.status).toBe(200);
+		expect(await response.text()).toBe("forwarded");
+		expect(forwardedBody).toBe("x".repeat(1_024));
 	});
 
 	test("overwrites client correlation metadata and joins guard and proxy request IDs", async () => {
@@ -579,9 +780,10 @@ describe("source-controlled guard", () => {
 				const guardEnvelope = new Headers(init.headers).get(
 					GUARD_REQUEST_ID_HEADER,
 				);
-				trustedId = createGuardCorrelationVerifier(
-					GUARD_CORRELATION_SECRET,
-				)(new Headers(init.headers))?.requestId ?? null;
+				trustedId =
+					createGuardCorrelationVerifier(GUARD_CORRELATION_SECRET)(
+						new Headers(init.headers),
+					)?.requestId ?? null;
 				localId = createRequestMetadata(
 					request,
 					new URL(url),
@@ -610,34 +812,31 @@ describe("source-controlled guard", () => {
 	test.each([
 		["missing", undefined],
 		["malformed", "not-a-canonical-32-byte-secret"],
-	])(
-		"discards client correlation when the guard credential is %s",
-		async (_name, guardCorrelationSecret) => {
-			let forwardedEnvelope: string | null = "not-observed";
-			const { baseUrl } = await startGuard("http://127.0.0.1:8789", {
-				env: {},
-				guardCorrelationSecret,
-				fetchImpl: async (_url: URL, init: RequestInit) => {
-					forwardedEnvelope = new Headers(init.headers).get(
-						GUARD_REQUEST_ID_HEADER,
-					);
-					return new Response("ok", { status: 200 });
-				},
-			});
+	])("discards client correlation when the guard credential is %s", async (_name, guardCorrelationSecret) => {
+		let forwardedEnvelope: string | null = "not-observed";
+		const { baseUrl } = await startGuard("http://127.0.0.1:8789", {
+			env: {},
+			guardCorrelationSecret,
+			fetchImpl: async (_url: URL, init: RequestInit) => {
+				forwardedEnvelope = new Headers(init.headers).get(
+					GUARD_REQUEST_ID_HEADER,
+				);
+				return new Response("ok", { status: 200 });
+			},
+		});
 
-			const response = await fetch(`${baseUrl}/v1/messages`, {
-				method: "POST",
-				headers: {
-					[GUARD_REQUEST_ID_HEADER]:
-						"v1.76110a75-9e91-4ab9-89a7-3e5d25a318fc.1.spoofed",
-				},
-				body: "{}",
-			});
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			headers: {
+				[GUARD_REQUEST_ID_HEADER]:
+					"v1.76110a75-9e91-4ab9-89a7-3e5d25a318fc.1.spoofed",
+			},
+			body: "{}",
+		});
 
-			expect(await response.text()).toBe("ok");
-			expect(forwardedEnvelope).toBeNull();
-		},
-	);
+		expect(await response.text()).toBe("ok");
+		expect(forwardedEnvelope).toBeNull();
+	});
 
 	test("forwards a protected 529 exactly once while stripping internal response headers", async () => {
 		const protectedBody = JSON.stringify({
@@ -882,9 +1081,7 @@ describe("source-controlled guard", () => {
 		expect(await response.text()).toBe(chunks.join(""));
 		await waitFor(() => guard.state.active === 0);
 
-		const completion = events.find(
-			(event) => event.event === "proxy_response",
-		);
+		const completion = events.find((event) => event.event === "proxy_response");
 		const firstBodyByteMs = completion?.firstBodyByteMs;
 		const maxInterChunkGapMs = completion?.maxInterChunkGapMs;
 		const lastChunkAgeMs = completion?.lastChunkAgeMs;
@@ -946,9 +1143,7 @@ describe("source-controlled guard", () => {
 		expect(await response.text()).toBe(chunks.join(""));
 		await waitFor(() => guard.state.active === 0);
 
-		const completion = events.find(
-			(event) => event.event === "proxy_response",
-		);
+		const completion = events.find((event) => event.event === "proxy_response");
 		expect(completion).toMatchObject({
 			status: 200,
 			outcome: "final_error",
@@ -1144,9 +1339,7 @@ describe("source-controlled guard", () => {
 		expect(await response.text()).toBe(body);
 		await waitFor(() => guard.state.active === 0);
 
-		const completion = events.find(
-			(event) => event.event === "proxy_response",
-		);
+		const completion = events.find((event) => event.event === "proxy_response");
 		expect(completion).toMatchObject({ status: 200, outcome: "success" });
 		expect(completion).not.toHaveProperty("semanticParseState");
 		expect(completion).not.toHaveProperty("semanticEvent");
@@ -1173,9 +1366,7 @@ describe("source-controlled guard", () => {
 		expect(await response.text()).toBe(body);
 		await waitFor(() => guard.state.active === 0);
 
-		const completion = events.find(
-			(event) => event.event === "proxy_response",
-		);
+		const completion = events.find((event) => event.event === "proxy_response");
 		expect(completion).toMatchObject({
 			status: 200,
 			outcome: "final_error",
@@ -1318,9 +1509,7 @@ describe("source-controlled guard", () => {
 		expect(await response.text()).toBe(body);
 		await waitFor(() => guard.state.active === 0);
 
-		const completion = events.find(
-			(event) => event.event === "proxy_response",
-		);
+		const completion = events.find((event) => event.event === "proxy_response");
 		expect(completion).toMatchObject({
 			status: 200,
 			outcome: "success",
@@ -1356,9 +1545,7 @@ describe("source-controlled guard", () => {
 		expect(await response.text()).toBe(body);
 		await waitFor(() => guard.state.active === 0);
 
-		const completion = events.find(
-			(event) => event.event === "proxy_response",
-		);
+		const completion = events.find((event) => event.event === "proxy_response");
 		expect(completion).toMatchObject({
 			status: 200,
 			outcome: "final_error",
@@ -1391,9 +1578,7 @@ describe("source-controlled guard", () => {
 		expect(await response.text()).toBe(body);
 		await waitFor(() => guard.state.active === 0);
 
-		const completion = events.find(
-			(event) => event.event === "proxy_response",
-		);
+		const completion = events.find((event) => event.event === "proxy_response");
 		expect(completion).toMatchObject({
 			status: 200,
 			outcome: "final_error",
@@ -1596,9 +1781,7 @@ describe("source-controlled guard", () => {
 		expect(await response.text()).toBe("ok");
 		await waitFor(() => guard.state.active === 0);
 
-		const completion = events.find(
-			(event) => event.event === "proxy_response",
-		);
+		const completion = events.find((event) => event.event === "proxy_response");
 		expect(completion).toMatchObject({
 			attempt: 2,
 			rawResponseChunkCount: 1,
@@ -1891,9 +2074,7 @@ describe("source-controlled guard", () => {
 			status: 200,
 			outcome: "success",
 		});
-		expect(events.some((event) => event.outcome === "final_error")).toBe(
-			false,
-		);
+		expect(events.some((event) => event.outcome === "final_error")).toBe(false);
 		expect(guard.state.counters.success).toBe(1);
 		expect(guard.state.counters.finalError).toBe(0);
 	});
@@ -1951,11 +2132,117 @@ describe("source-controlled guard", () => {
 			fetch(`${baseUrl}/v1/messages`, { method: "POST", body: "two" }),
 		]);
 
-		expect(await Promise.all(responses.map((response) => response.text()))).toEqual([
-			"ok",
-			"ok",
-		]);
+		expect(
+			await Promise.all(responses.map((response) => response.text())),
+		).toEqual(["ok", "ok"]);
 		expect(peakActive).toBe(1);
+	});
+
+	test("does not consume a queued request body before its admission lease", async () => {
+		let attempts = 0;
+		let releaseFirst: (() => void) | undefined;
+		const firstCanFinish = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		const upstreamBase = await listen(
+			http.createServer(async (_req, res) => {
+				attempts += 1;
+				if (attempts === 1) await firstCanFinish;
+				res.end(`upstream-${attempts}`);
+			}),
+		);
+		const { baseUrl, guard } = await startGuard(upstreamBase, {
+			maxActive: 1,
+			maxQueue: 1,
+			maxRequestBodyBytes: 1_024,
+			totalDeadlineMs: 5_000,
+		});
+
+		const firstResponse = fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "first",
+		});
+		await waitFor(() => attempts === 1);
+
+		// An oversized body must remain queued behind the active request. If the
+		// guard reads bodies before admission, this resolves immediately with 413
+		// and never occupies the queue.
+		const queuedResponse = fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "x".repeat(2_048),
+		});
+		await waitFor(() => guard.state.queued === 1);
+		const beforeAdmission = await Promise.race([
+			queuedResponse.then(() => "resolved" as const),
+			new Promise<"pending">((resolve) =>
+				setTimeout(() => resolve("pending"), 40),
+			),
+		]);
+		expect(beforeAdmission).toBe("pending");
+		expect(guard.state.active).toBe(1);
+		expect(guard.state.queued).toBe(1);
+
+		releaseFirst?.();
+		expect(await (await firstResponse).text()).toBe("upstream-1");
+		const rejected = await queuedResponse;
+		expect(rejected.status).toBe(413);
+		expect(await rejected.json()).toMatchObject({
+			error: { type: "guard_request_body_too_large" },
+		});
+		await waitFor(() => guard.state.active === 0 && guard.state.queued === 0);
+		expect(attempts).toBe(1);
+	});
+
+	test("drains a queue-full upload and releases the active lease exactly once", async () => {
+		let attempts = 0;
+		let releaseFirst: (() => void) | undefined;
+		const firstCanFinish = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		const upstreamBase = await listen(
+			http.createServer(async (_req, res) => {
+				attempts += 1;
+				if (attempts === 1) await firstCanFinish;
+				res.end(`upstream-${attempts}`);
+			}),
+		);
+		const { baseUrl, guard } = await startGuard(upstreamBase, {
+			maxActive: 1,
+			maxQueue: 0,
+			maxRequestBodyBytes: 1_024,
+			totalDeadlineMs: 5_000,
+		});
+
+		const firstResponse = fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "first",
+		});
+		await waitFor(() => attempts === 1 && guard.state.active === 1);
+
+		// Queue-full is an admission decision, so it must win over body-size
+		// validation and safely drain the upload before returning the bounded 503.
+		const rejected = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "x".repeat(2_048),
+		});
+		expect(rejected.status).toBe(503);
+		expect(await rejected.json()).toMatchObject({
+			error: { type: "guard_queue_full" },
+		});
+		expect(guard.state.active).toBe(1);
+		expect(guard.state.queued).toBe(0);
+
+		releaseFirst?.();
+		expect(await (await firstResponse).text()).toBe("upstream-1");
+		await waitFor(() => guard.state.active === 0);
+
+		const next = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "next",
+		});
+		expect(await next.text()).toBe("upstream-2");
+		await waitFor(() => guard.state.active === 0 && guard.state.queued === 0);
+		expect(attempts).toBe(2);
 	});
 
 	test("releases the attempt slot while a pool retry sleeps", async () => {
@@ -1976,9 +2263,7 @@ describe("source-controlled guard", () => {
 							JSON.stringify({
 								error: {
 									type: "pool_exhausted",
-									next_available_at: new Date(
-										Date.now() + 400,
-									).toISOString(),
+									next_available_at: new Date(Date.now() + 400).toISOString(),
 								},
 							}),
 						);
@@ -2034,9 +2319,7 @@ describe("source-controlled guard", () => {
 						JSON.stringify({
 							error: {
 								type: "model_pool_exhausted",
-								next_available_at: new Date(
-									Date.now() + delayMs,
-								).toISOString(),
+								next_available_at: new Date(Date.now() + delayMs).toISOString(),
 							},
 						}),
 					);
@@ -2071,7 +2354,9 @@ describe("source-controlled guard", () => {
 				}),
 			),
 		);
-		expect(rejected.map((response) => response.status)).toEqual([503, 503, 503]);
+		expect(rejected.map((response) => response.status)).toEqual([
+			503, 503, 503,
+		]);
 		expect(guard.state.recoveryWaits).toEqual({
 			configured: 1,
 			current: 1,
@@ -2096,12 +2381,14 @@ describe("source-controlled guard", () => {
 		expect(guard.state.counters.recoveryWaitAdmitted).toBe(2);
 		expect(guard.state.counters.recoveryWaitReleased).toBe(2);
 
-		const health = (await (
-			await fetch(`${baseUrl}/_guard/health`)
-		).json()) as {
+		const health = (await (await fetch(`${baseUrl}/_guard/health`)).json()) as {
 			recoveryWaits: { configured: number; current: number; peak: number };
 		};
-		expect(health.recoveryWaits).toEqual({ configured: 1, current: 0, peak: 1 });
+		expect(health.recoveryWaits).toEqual({
+			configured: 1,
+			current: 0,
+			peak: 1,
+		});
 	});
 
 	test("counts a route-scoped recovery under route, not legacy", async () => {
@@ -2566,9 +2853,7 @@ describe("source-controlled guard", () => {
 							error: {
 								type: "service_unavailable",
 								code: "model_pool_exhausted",
-								next_available_at: new Date(
-									Date.now() + 1_000,
-								).toISOString(),
+								next_available_at: new Date(Date.now() + 1_000).toISOString(),
 							},
 						}),
 					);
@@ -2625,17 +2910,13 @@ describe("source-controlled guard", () => {
 								...JSON.parse(secondBody),
 								error: {
 									...JSON.parse(secondBody).error,
-									next_available_at: new Date(
-										Date.now() + 80,
-									).toISOString(),
+									next_available_at: new Date(Date.now() + 80).toISOString(),
 								},
 							})
 						: JSON.stringify({
 								error: {
 									type: "model_pool_exhausted",
-									next_available_at: new Date(
-										Date.now() + 80,
-									).toISOString(),
+									next_available_at: new Date(Date.now() + 80).toISOString(),
 								},
 							});
 				res.writeHead(503, {
@@ -2710,67 +2991,65 @@ describe("source-controlled guard", () => {
 	test.each([
 		{ name: "trusted header", headers: true, allowLegacyPoolBody: false },
 		{ name: "legacy body", headers: false, allowLegacyPoolBody: true },
-	])(
-		"preserves a body-only recovery hint above the request-wide silence ceiling on the $name path",
-		async ({ headers, allowLegacyPoolBody }) => {
-			const events: Array<Record<string, unknown>> = [];
-			let attempts = 0;
-			const body = JSON.stringify({
-				error: {
-					type: "pool_exhausted",
-					next_available_at: new Date(Date.now() + 1_000).toISOString(),
-				},
-			});
-			const upstreamBase = await listen(
-				http.createServer((_req, res) => {
-					attempts += 1;
-					if (attempts === 1) {
-						res.writeHead(503, {
-							"content-type": "application/json",
-							...(headers
-								? { "x-better-ccflare-pool-status": "exhausted" }
-								: {}),
-						});
-						res.end(body);
-						return;
-					}
-					res.end("recovered");
-				}),
-			);
-			const { baseUrl, guard } = await startGuard(upstreamBase, {
-				allowLegacyPoolBody,
-				logger: (line: string) => events.push(JSON.parse(line)),
-				maxAttempts: 3,
-				maxRecoverySleepMs: 300,
-				retryAttemptHeadroomMs: 100,
-				totalDeadlineMs: 2_000,
-			});
+	])("preserves a body-only recovery hint above the request-wide silence ceiling on the $name path", async ({
+		headers,
+		allowLegacyPoolBody,
+	}) => {
+		const events: Array<Record<string, unknown>> = [];
+		let attempts = 0;
+		const body = JSON.stringify({
+			error: {
+				type: "pool_exhausted",
+				next_available_at: new Date(Date.now() + 1_000).toISOString(),
+			},
+		});
+		const upstreamBase = await listen(
+			http.createServer((_req, res) => {
+				attempts += 1;
+				if (attempts === 1) {
+					res.writeHead(503, {
+						"content-type": "application/json",
+						...(headers ? { "x-better-ccflare-pool-status": "exhausted" } : {}),
+					});
+					res.end(body);
+					return;
+				}
+				res.end("recovered");
+			}),
+		);
+		const { baseUrl, guard } = await startGuard(upstreamBase, {
+			allowLegacyPoolBody,
+			logger: (line: string) => events.push(JSON.parse(line)),
+			maxAttempts: 3,
+			maxRecoverySleepMs: 300,
+			retryAttemptHeadroomMs: 100,
+			totalDeadlineMs: 2_000,
+		});
 
-			const startedAt = Date.now();
-			const response = await fetch(`${baseUrl}/v1/messages`, {
-				method: "POST",
-				body: "{}",
-			});
+		const startedAt = Date.now();
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
 
-			expect(response.status).toBe(503);
-			expect(await response.text()).toBe(body);
-			expect(Date.now() - startedAt).toBeLessThan(250);
-			expect(attempts).toBe(1);
-			expect(
-				events.find((event) => event.event === "proxy_final_error"),
-			).toMatchObject({
-				status: 503,
-				outcome: "final_error",
-				reason: "recovery_silence_budget_exceeded",
-				recoverySource: "error.next_available_at",
-			});
-			expect(guard.state.counters.poolExhausted).toBe(1);
-			expect(guard.state.counters.retried).toBe(0);
-			expect(guard.state.counters.deadlineExceeded).toBe(0);
-			expect(guard.state.counters.recoverySilenceBudgetExceeded).toBe(1);
-			expect(guard.state.counters.finalError).toBe(1);
-		},
-	);
+		expect(response.status).toBe(503);
+		expect(await response.text()).toBe(body);
+		expect(Date.now() - startedAt).toBeLessThan(250);
+		expect(attempts).toBe(1);
+		expect(
+			events.find((event) => event.event === "proxy_final_error"),
+		).toMatchObject({
+			status: 503,
+			outcome: "final_error",
+			reason: "recovery_silence_budget_exceeded",
+			recoverySource: "error.next_available_at",
+		});
+		expect(guard.state.counters.poolExhausted).toBe(1);
+		expect(guard.state.counters.retried).toBe(0);
+		expect(guard.state.counters.deadlineExceeded).toBe(0);
+		expect(guard.state.counters.recoverySilenceBudgetExceeded).toBe(1);
+		expect(guard.state.counters.finalError).toBe(1);
+	});
 
 	test("reserves retry headroom and caps only optional jitter for a feasible recovery hint", async () => {
 		const events: Array<Record<string, unknown>> = [];
@@ -2787,9 +3066,7 @@ describe("source-controlled guard", () => {
 						JSON.stringify({
 							error: {
 								type: "pool_exhausted",
-								next_available_at: new Date(
-									Date.now() + 50,
-								).toISOString(),
+								next_available_at: new Date(Date.now() + 50).toISOString(),
 							},
 						}),
 					);
@@ -2844,9 +3121,7 @@ describe("source-controlled guard", () => {
 						JSON.stringify({
 							error: {
 								type: "pool_exhausted",
-								next_available_at: new Date(
-									Date.now() + 50,
-								).toISOString(),
+								next_available_at: new Date(Date.now() + 50).toISOString(),
 							},
 						}),
 					);
@@ -3232,5 +3507,4 @@ describe("source-controlled guard", () => {
 		expect(attempts).toBe(2);
 		await waitFor(() => guard.state.active === 0 && guard.state.queued === 0);
 	});
-
 });

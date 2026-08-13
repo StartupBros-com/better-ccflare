@@ -2,10 +2,13 @@ import { createHash } from "node:crypto";
 import { getCodexReasoningRetention } from "@better-ccflare/config";
 import {
 	BUFFER_SIZES,
+	getExactOAuthErrorCode,
 	getModelFamily,
-	isInvalidGrantMessage,
+	getOAuthErrorCode,
+	MAX_OAUTH_ERROR_INPUT_LENGTH,
 	mapModelName,
 	OAuthRefreshTokenError,
+	readBoundedOAuthResponseText,
 	SseFrameBuffer,
 	StreamResourceLimitError,
 	ValidationError,
@@ -31,6 +34,10 @@ import type {
 	ServerToolRequirements,
 } from "@better-ccflare/types";
 import { BaseProvider } from "../../base";
+import {
+	registerProviderModelDefaultFactory,
+	resolveProviderModelDefault,
+} from "../../provider-model-defaults";
 import {
 	estimateAnthropicRequestTokens,
 	resolveModelContextCapability,
@@ -120,10 +127,14 @@ export const CODEX_CONVERSATION_ID_HEADER =
 export const CODEX_CACHE_KEY_MODE_ENV = "CCFLARE_CODEX_CACHE_KEY_MODE";
 export const CODEX_CACHE_KEY_SESSION_PERCENT_ENV =
 	"CCFLARE_CODEX_CACHE_KEY_SESSION_PERCENT";
+export const CODEX_CACHE_KEY_CONTINUITY_PERCENT_ENV =
+	"CCFLARE_CODEX_CACHE_KEY_CONTINUITY_PERCENT";
 export const CODEX_EXPLICIT_CACHE_BREAKPOINT_PERCENT_ENV =
 	"CCFLARE_CODEX_GPT56_EXPLICIT_CACHE_BREAKPOINT_PERCENT";
 const CODEX_CACHE_KEY_SESSION_BUCKET_DOMAIN =
 	"better-ccflare:codex-cache-key-session-canary:v1\0";
+const CODEX_CACHE_KEY_CONTINUITY_BUCKET_DOMAIN =
+	"better-ccflare:codex-cache-key-continuity-canary:v1\0";
 const CODEX_CACHE_KEY_COHORT_DOMAIN =
 	"better-ccflare:codex-cache-key-cohort:v1\0";
 const CODEX_CACHE_LANE_RESCUE_DOMAIN =
@@ -200,6 +211,21 @@ export function readCodexCacheKeySessionPercent(
 export function deriveCodexCacheKeySessionBucket(sessionId: string): number {
 	const digest = createHash("sha256")
 		.update(CODEX_CACHE_KEY_SESSION_BUCKET_DOMAIN)
+		.update(sessionId.toLowerCase())
+		.digest();
+	return digest.readUInt32BE(0) % 100;
+}
+
+export function readCodexCacheKeyContinuityPercent(
+	raw = process.env[CODEX_CACHE_KEY_CONTINUITY_PERCENT_ENV],
+): number {
+	if (raw === undefined || !/^\d+$/.test(raw)) return 0;
+	return Math.min(Number.parseInt(raw, 10), 100);
+}
+
+export function deriveCodexCacheKeyContinuityBucket(sessionId: string): number {
+	const digest = createHash("sha256")
+		.update(CODEX_CACHE_KEY_CONTINUITY_BUCKET_DOMAIN)
 		.update(sessionId.toLowerCase())
 		.digest();
 	return digest.readUInt32BE(0) % 100;
@@ -330,10 +356,12 @@ const _normalizeUsage = (value: unknown): Record<string, number> => {
 
 // Default model mapping: Anthropic model name prefixes → Codex model names
 const DEFAULT_MODEL_MAP: Record<string, string> = {
+	fable: "gpt-5.3-codex",
 	opus: "gpt-5.3-codex",
 	sonnet: "gpt-5.3-codex",
 	haiku: "gpt-5.4-mini",
 };
+registerProviderModelDefaultFactory("codex", DEFAULT_MODEL_MAP);
 
 /** Resolve the concrete Codex model exactly as request transformation will. */
 export function resolveCodexRequestModel(
@@ -346,9 +374,15 @@ export function resolveCodexRequestModel(
 	}
 
 	const lower = anthropicModel.toLowerCase();
-	if (lower.includes("haiku")) return DEFAULT_MODEL_MAP.haiku;
-	if (lower.includes("sonnet")) return DEFAULT_MODEL_MAP.sonnet;
-	if (lower.includes("opus")) return DEFAULT_MODEL_MAP.opus;
+	const family = ["fable", "haiku", "sonnet", "opus"].find((candidate) =>
+		lower.includes(candidate),
+	);
+	if (family) {
+		return (
+			resolveProviderModelDefault("codex", family, account?.id) ??
+			DEFAULT_MODEL_MAP[family]
+		);
+	}
 	return anthropicModel;
 }
 
@@ -369,6 +403,24 @@ const CODEX_ERROR_TYPE_BY_CODE: Record<string, string> = {
 	cyber_policy: "invalid_request_error",
 	usage_not_included: "permission_error",
 };
+
+// A Codex SSE body is often delivered with HTTP 200 even when its terminal
+// event carries an error. Conversely, a definitive transport response (401,
+// 403, 429, or 529) can still contain an SSE-shaped error body. The latter
+// status is authoritative for non-streaming callers; otherwise the normalized
+// body mapping remains the source of truth (especially for HTTP 200).
+const CODEX_DEFINITIVE_TRANSPORT_STATUSES = new Set([401, 403, 429, 529]);
+const CODEX_MAPPED_ERROR_STATUSES = new Set([400, 401, 403, 429, 502, 529]);
+
+function shouldPreserveCodexTransportStatus(
+	transportStatus: number,
+	bodyStatus: number,
+): boolean {
+	return (
+		CODEX_DEFINITIVE_TRANSPORT_STATUSES.has(transportStatus) &&
+		CODEX_MAPPED_ERROR_STATUSES.has(bodyStatus)
+	);
+}
 
 // Buffered tool-call argument bytes are bounded by two independent policies
 // (packages/core/src/constants.ts): a per-call cap on any single function
@@ -477,6 +529,19 @@ export interface CodexPromptCacheKeyDecision {
 	effectiveMode: "conversation" | "session" | null;
 	cohortId: string | null;
 	conversationIdentity: string | null;
+	/** Canonical identity authorized by orchestration admission, if any. */
+	canonicalConversationIdentity: string | null;
+	/** Identity selected for the base cache key before any rescue salt. */
+	selectedConversationIdentity: string | null;
+	/** Whether canonical continuity was selected; null when ineligible/inapplicable. */
+	continuityApplied: boolean | null;
+	continuityBasis:
+		| "derived"
+		| "identity_match"
+		| "lineage_match"
+		| "rejected"
+		| "session"
+		| "ineligible";
 	webSocketConversationIdentity: string | null;
 }
 
@@ -1025,44 +1090,67 @@ export class CodexProvider extends BaseProvider {
 		});
 
 		if (!response.ok) {
-			let errorData: { error?: string; error_description?: string } | null =
-				null;
+			let errorData: unknown = null;
+			let responseText = "";
+			let responseTextTruncated = false;
 			try {
-				errorData = await response.json();
+				const bounded = await readBoundedOAuthResponseText(response);
+				responseText = bounded.text;
+				responseTextTruncated = bounded.truncated;
+				errorData = JSON.parse(responseText);
 			} catch {
 				// ignore
 			}
 
-			// Preserve the RFC-6749 machine code ahead of its human-readable
-			// description. Terminal-auth detection must not lose markers such as
-			// invalid_grant or refresh_token_reused when a description is present.
-			const errorMessage =
-				[errorData?.error, errorData?.error_description]
-					.filter(Boolean)
-					.join(": ") || response.statusText;
+			// A response that hit the bound is not authoritative. Even if the
+			// bounded prefix happens to be valid JSON, trailing bytes could change
+			// its meaning, so it must never quarantine an account.
+			const errorCode = responseTextTruncated
+				? ""
+				: getOAuthErrorCode(errorData) || getExactOAuthErrorCode(responseText);
+			const errorMessage = errorCode || `HTTP ${response.status}`;
 
 			// Rotating refresh tokens: reuse → terminal, must re-auth. Throw the
 			// typed error so the refresh chokepoint pauses the account for reauth
 			// (detection is by type, not by message wording).
-			if (errorData?.error === "refresh_token_reused") {
+			if (errorCode === "refresh_token_reused") {
 				throw new OAuthRefreshTokenError(
 					account.id,
 					`Codex refresh_token_reused for account ${account.name}. Please re-authenticate with: bun run cli --reauthenticate ${account.name}`,
+					errorCode,
 				);
 			}
 
 			const failureMessage = `Failed to refresh Codex token for account ${account.name}: ${errorMessage}`;
-			if (isInvalidGrantMessage(errorMessage)) {
-				throw new OAuthRefreshTokenError(account.id, failureMessage);
+			if (errorCode) {
+				throw new OAuthRefreshTokenError(account.id, failureMessage, errorCode);
 			}
 			throw new Error(failureMessage);
 		}
 
-		const json = (await response.json()) as {
+		const bounded = await readBoundedOAuthResponseText(response);
+		if (bounded.truncated) {
+			throw new Error(
+				`Codex token refresh response exceeded ${MAX_OAUTH_ERROR_INPUT_LENGTH} bytes`,
+			);
+		}
+		let json: {
 			access_token: string;
 			refresh_token: string;
 			expires_in: number;
 		};
+		try {
+			json = JSON.parse(bounded.text) as typeof json;
+		} catch {
+			throw new Error(
+				`Codex token refresh response for ${account.name} was not valid JSON`,
+			);
+		}
+		if (!json || typeof json.access_token !== "string" || !json.access_token) {
+			throw new Error(
+				`Codex token refresh response for ${account.name} did not include an access token`,
+			);
+		}
 
 		log.debug(`[CodexProvider] token refresh response for ${account.name}:`, {
 			expiresIn: json.expires_in,
@@ -1240,6 +1328,17 @@ export class CodexProvider extends BaseProvider {
 				conversationId:
 					cacheKeyDecision.conversationIdentity?.slice(0, 16) ?? null,
 				cacheKeyAssignmentSource: cacheKeyDecision.assignmentSource,
+				cacheKeyContinuityBasis: cacheKeyDecision.continuityBasis,
+				cacheKeyContinuityApplied: cacheKeyDecision.continuityApplied,
+				continuityEvidenceId:
+					cacheKeyDecision.effectiveMode === "conversation"
+						? (cacheKeyDecision.canonicalConversationIdentity?.slice(0, 16) ??
+							null)
+						: null,
+				canonicalConversationId: cacheKeyDecision.continuityApplied
+					? (cacheKeyDecision.selectedConversationIdentity?.slice(0, 16) ??
+						null)
+					: null,
 				explicitBreakpointCanary: explicitBreakpointDecision.canary,
 				explicitBreakpointCohortId: explicitBreakpointDecision.cohortId,
 				explicitBreakpointAction: explicitBreakpointDecision.action,
@@ -1671,6 +1770,10 @@ export class CodexProvider extends BaseProvider {
 		input: readonly unknown[],
 		account?: Account,
 		cacheLaneRescueSalt?: string,
+		orchestrationResult?: {
+			basis: OrchestrationAdmissionBasis | null;
+			canonicalConversationIdentity: string | null;
+		},
 	): CodexPromptCacheKeyDecision {
 		const ineligible: CodexPromptCacheKeyDecision = {
 			key: null,
@@ -1679,6 +1782,10 @@ export class CodexProvider extends BaseProvider {
 			effectiveMode: null,
 			cohortId: null,
 			conversationIdentity: null,
+			canonicalConversationIdentity: null,
+			selectedConversationIdentity: null,
+			continuityApplied: null,
+			continuityBasis: "ineligible",
 			webSocketConversationIdentity: null,
 		};
 		if (process.env[CODEX_PROMPT_CACHE_KEY_ENV] === "0") return ineligible;
@@ -1703,14 +1810,41 @@ export class CodexProvider extends BaseProvider {
 			explicitSessionOverride || assignment === "session" || input.length === 0
 				? "session"
 				: "conversation";
+		const continuityPercent = readCodexCacheKeyContinuityPercent();
+		const continuityTreatment =
+			continuityPercent === 100 ||
+			(continuityPercent > 0 &&
+				deriveCodexCacheKeyContinuityBucket(sessionId) < continuityPercent);
+		const canonicalConversationIdentity =
+			orchestrationResult?.canonicalConversationIdentity ?? null;
+		const continuityBasis =
+			effectiveMode === "session"
+				? "session"
+				: orchestrationResult?.basis === "identity_match"
+					? "identity_match"
+					: orchestrationResult?.basis === "lineage_match"
+						? "lineage_match"
+						: orchestrationResult?.basis === "rejected"
+							? "rejected"
+							: "derived";
+		const continuityApplied =
+			effectiveMode === "conversation"
+				? Boolean(continuityTreatment && canonicalConversationIdentity)
+				: null;
+		const selectedConversationIdentity =
+			effectiveMode === "conversation" &&
+			continuityTreatment &&
+			canonicalConversationIdentity
+				? canonicalConversationIdentity
+				: conversationIdentity;
 		let key =
 			effectiveMode === "session"
 				? `ccflare-session-${createHash("sha256")
 						.update(sessionId)
 						.digest("hex")
 						.slice(0, 48)}`
-				: conversationIdentity
-					? `ccflare-convo-${conversationIdentity.slice(0, 48)}`
+				: selectedConversationIdentity
+					? `ccflare-convo-${selectedConversationIdentity.slice(0, 48)}`
 					: null;
 		if (key && cacheLaneRescueSalt) {
 			key = `ccflare-rescue-${createHash("sha256")
@@ -1735,6 +1869,10 @@ export class CodexProvider extends BaseProvider {
 				.digest("hex")
 				.slice(0, 16),
 			conversationIdentity,
+			canonicalConversationIdentity,
+			selectedConversationIdentity,
+			continuityApplied,
+			continuityBasis,
 			webSocketConversationIdentity,
 		};
 	}
@@ -2323,6 +2461,10 @@ export class CodexProvider extends BaseProvider {
 			false;
 		let orchestrationAdmission: OrchestrationAdmission;
 		let orchestrationBasis: OrchestrationAdmissionBasis | null = null;
+		let orchestrationCacheKeyResult: {
+			basis: OrchestrationAdmissionBasis;
+			canonicalConversationIdentity: string | null;
+		} | null = null;
 		let orchestrationDemotionObserved = false;
 		let elapsedMsSinceRoot: number | null = null;
 		if (!offersOrchestrationTools) {
@@ -2361,6 +2503,11 @@ export class CodexProvider extends BaseProvider {
 					);
 					orchestrationAdmission = electionResult.admission;
 					orchestrationBasis = electionResult.basis;
+					orchestrationCacheKeyResult = {
+						basis: electionResult.basis,
+						canonicalConversationIdentity:
+							electionResult.canonicalConversationIdentity,
+					};
 					if (electionResult.admission === "non_root" && priorRootSnapshot) {
 						// This session already had an elected root, and this turn was
 						// rejected as an ordinary contender (categorical basis:
@@ -2442,6 +2589,7 @@ export class CodexProvider extends BaseProvider {
 			input,
 			account,
 			cacheLaneRescueSalt,
+			orchestrationCacheKeyResult ?? undefined,
 		);
 		if (cacheKeyDecision.key) {
 			codexRequest.prompt_cache_key = cacheKeyDecision.key;
@@ -2639,8 +2787,17 @@ export class CodexProvider extends BaseProvider {
 		if (errorPayload) {
 			const headers = sanitizeResponseHeaders(response.headers);
 			headers.set("content-type", "application/json");
-			const { status, statusText } =
-				this.httpStatusForAnthropicErrorPayload(errorPayload);
+			const bodyStatus = this.httpStatusForAnthropicErrorPayload(errorPayload);
+			const preserveTransportStatus = shouldPreserveCodexTransportStatus(
+				response.status,
+				bodyStatus.status,
+			);
+			const status = preserveTransportStatus
+				? response.status
+				: bodyStatus.status;
+			const statusText = preserveTransportStatus
+				? response.statusText || bodyStatus.statusText
+				: bodyStatus.statusText;
 			return new Response(JSON.stringify(errorPayload), {
 				status,
 				statusText,

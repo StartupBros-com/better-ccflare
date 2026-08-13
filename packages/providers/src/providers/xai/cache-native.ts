@@ -8,6 +8,7 @@ import {
 	formatXaiCacheCanary,
 	isOfficialXaiEndpoint,
 } from "@better-ccflare/core";
+import type { Account } from "@better-ccflare/types";
 
 /** Opt-in: set to "1" to enable the Grok Chat cache-native vertical slice. */
 export const XAI_CACHE_NATIVE_ENV = "CCFLARE_XAI_CACHE_NATIVE";
@@ -18,6 +19,9 @@ export const CACHE_FLIGHT_RECORDER_ENV = "CCFLARE_CACHE_FLIGHT_RECORDER";
 /** Official Chat Completions affinity header (xAI docs). */
 export const XAI_CONV_ID_HEADER = "x-grok-conv-id";
 
+const CONV_ID_PREFIX = "ccflare-xai-";
+const CONV_ID_HASH_LENGTH = 32;
+
 const SESSION_UUID_RE =
 	/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -25,6 +29,40 @@ export function isXaiCacheNativeEnabled(
 	env: NodeJS.ProcessEnv = process.env,
 ): boolean {
 	return env[XAI_CACHE_NATIVE_ENV] === "1";
+}
+
+/**
+ * Replace an untrusted client affinity header only for an eligible official xAI
+ * request. Stripping happens before every guard so feature-off, non-xAI, custom
+ * endpoint, and missing-identity paths cannot forward a caller-supplied value.
+ */
+export function applyXaiConvIdHeader(
+	headers: Headers,
+	providerName: string,
+	account: Account | null | undefined,
+	convId: string | null,
+): void {
+	headers.delete(XAI_CONV_ID_HEADER);
+	if (providerName === "xai" && convId && isOfficialXaiEndpoint(account)) {
+		headers.set(XAI_CONV_ID_HEADER, convId);
+	}
+}
+
+export function deriveXaiConvId(
+	clientSessionId: string | null | undefined,
+	env: NodeJS.ProcessEnv = process.env,
+): string | null {
+	if (!isXaiCacheNativeEnabled(env)) return null;
+	if (
+		typeof clientSessionId !== "string" ||
+		!SESSION_UUID_RE.test(clientSessionId)
+	) {
+		return null;
+	}
+	const digest = createHash("sha256")
+		.update(clientSessionId.toLowerCase())
+		.digest("hex");
+	return `${CONV_ID_PREFIX}${digest.slice(0, CONV_ID_HASH_LENGTH)}`;
 }
 
 export function isCacheFlightRecorderEnabled(
@@ -35,6 +73,12 @@ export function isCacheFlightRecorderEnabled(
 
 export type { XaiCacheCanaryFields, XaiCacheOutcome };
 export { cacheOutcomeFromTokens, formatXaiCacheCanary, isOfficialXaiEndpoint };
+
+export function isValidSessionId(
+	sessionId: string | null | undefined,
+): sessionId is string {
+	return typeof sessionId === "string" && SESSION_UUID_RE.test(sessionId);
+}
 
 export function extractClaudeSessionId(
 	body: Record<string, unknown>,

@@ -1,5 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import type { Account, RequestMeta } from "@better-ccflare/types";
+import type {
+	Account,
+	RequestMeta,
+	RoutingCandidateMetadata,
+} from "@better-ccflare/types";
 import { CacheAffinityOrderer } from "../cache-affinity-orderer";
 
 function account(id: string, provider = "xai"): Account {
@@ -21,6 +25,7 @@ function account(id: string, provider = "xai"): Account {
 		session_start: null,
 		session_request_count: 0,
 		paused: false,
+		requires_reauth: false,
 		rate_limit_reset: null,
 		rate_limit_status: null,
 		rate_limit_remaining: null,
@@ -40,7 +45,10 @@ function account(id: string, provider = "xai"): Account {
 	};
 }
 
-function meta(key: string): RequestMeta {
+function meta(
+	key: string,
+	eligibleAccountIds: readonly string[] = ["xai-a", "xai-b"],
+): RequestMeta {
 	return {
 		id: "request",
 		method: "POST",
@@ -48,7 +56,7 @@ function meta(key: string): RequestMeta {
 		timestamp: Date.now(),
 		cacheAffinityKey: key,
 		xaiCacheNativeActive: true,
-		xaiCacheEligibleAccountIds: new Set(["xai-a", "xai-b"]),
+		xaiCacheEligibleAccountIds: new Set(eligibleAccountIds),
 	};
 }
 
@@ -58,7 +66,7 @@ function candidate(
 	tier: number,
 	ordinal: number,
 	options: { comboSlotId?: string; modelOverride?: string } = {},
-) {
+): RoutingCandidateMetadata {
 	return {
 		candidateId,
 		accountId,
@@ -72,23 +80,38 @@ function candidate(
 
 function candidateMeta(
 	key: string,
-	catalog: ReturnType<typeof candidate>[],
+	catalog: RoutingCandidateMetadata[],
 	current = catalog,
 ): RequestMeta {
-	return Object.assign(meta(key), {
-		routingCandidateCatalog: catalog,
-		routingCandidates: current,
-	});
+	return Object.assign(
+		meta(key, [...new Set(catalog.map((entry) => entry.accountId))]),
+		{
+			routingCandidateCatalog: catalog,
+			routingCandidates: current,
+		},
+	);
 }
 
 describe("CacheAffinityOrderer", () => {
-	it("keeps an owner across changing base-strategy order", () => {
+	it("does not create ownership during selection", () => {
 		const orderer = new CacheAffinityOrderer(60_000);
 		const a = account("xai-a");
 		const b = account("xai-b");
 
-		expect(orderer.order([a, b], meta("conversation"))[0]?.id).toBe("xai-a");
-		expect(orderer.order([b, a], meta("conversation"))[0]?.id).toBe("xai-a");
+		expect(orderer.order([a, b], meta("conversation"))).toEqual([a, b]);
+		expect(orderer.order([b, a], meta("conversation"))).toEqual([b, a]);
+	});
+
+	it("keeps a confirmed owner across changing base-strategy order", () => {
+		const orderer = new CacheAffinityOrderer(60_000);
+		const a = account("xai-a");
+		const b = account("xai-b");
+		const firstMeta = meta("conversation");
+
+		orderer.order([a, b], firstMeta);
+		orderer.recordSuccess(firstMeta, "account:xai-a", a.id);
+
+		expect(orderer.order([b, a], meta("conversation"))).toEqual([a, b]);
 	});
 
 	it("preserves ineligible provider slots", () => {
@@ -96,39 +119,47 @@ describe("CacheAffinityOrderer", () => {
 		const codex = account("codex", "codex");
 		const a = account("xai-a");
 		const b = account("xai-b");
+		const firstMeta = meta("conversation");
 
-		orderer.order([a, b], meta("conversation"));
+		orderer.order([a, b], firstMeta);
+		orderer.recordSuccess(firstMeta, "account:xai-a", a.id);
+
 		expect(
 			orderer
 				.order([codex, b, a], meta("conversation"))
-				.map((candidate) => candidate.id),
+				.map((entry) => entry.id),
 		).toEqual(["codex", "xai-a", "xai-b"]);
 	});
 
-	it("preserves an unavailable owner only when its configured tier is strictly better", () => {
+	it("retains an absent confirmed owner only for legal better-tier snapback", () => {
 		const orderer = new CacheAffinityOrderer(60_000);
-		const a = account("xai-a");
-		const b = account("xai-b");
-		a.priority = 0;
-		b.priority = 1;
+		const better = account("xai-a");
+		const worse = account("xai-b");
 		const catalog = [
-			candidate("account:xai-a", a.id, 0, 0),
-			candidate("account:xai-b", b.id, 1, 1),
+			candidate("account:xai-a", better.id, 0, 0),
+			candidate("account:xai-b", worse.id, 1, 1),
 		];
+		const firstMeta = candidateMeta("conversation", catalog);
+		orderer.recordSuccess(firstMeta, "account:xai-a", better.id);
 
-		orderer.order([a, b], candidateMeta("conversation", catalog));
 		expect(
 			orderer.order(
-				[b],
+				[worse],
 				candidateMeta("conversation", catalog, [catalog[1]]),
-			)[0]?.id,
-		).toBe("xai-b");
-		expect(
-			orderer.order([a, b], candidateMeta("conversation", catalog))[0]?.id,
-		).toBe("xai-a");
+			),
+		).toEqual([worse]);
+
+		const recoveredMeta = candidateMeta("conversation", catalog, [
+			catalog[1],
+			catalog[0],
+		]);
+		expect(orderer.order([worse, better], recoveredMeta)).toEqual([
+			better,
+			worse,
+		]);
 	});
 
-	it("replaces an unavailable equal-tier owner instead of snapping back", () => {
+	it("clears an absent equal-tier owner without assigning a replacement on selection", () => {
 		const orderer = new CacheAffinityOrderer(60_000);
 		const a = account("xai-a");
 		const b = account("xai-b");
@@ -136,123 +167,78 @@ describe("CacheAffinityOrderer", () => {
 			candidate("account:xai-a", a.id, 0, 0),
 			candidate("account:xai-b", b.id, 0, 1),
 		];
-
-		orderer.order([a], candidateMeta("conversation", catalog, [catalog[0]]));
-		expect(
-			orderer
-				.order([b], candidateMeta("conversation", catalog, [catalog[1]]))
-				.map((candidate) => candidate.id),
-		).toEqual(["xai-b"]);
-
-		expect(
-			orderer
-				.order([a, b], candidateMeta("conversation", catalog))
-				.map((candidate) => candidate.id),
-		).toEqual(["xai-b", "xai-a"]);
-	});
-
-	it("replaces an unavailable worse-tier owner", () => {
-		const orderer = new CacheAffinityOrderer(60_000);
-		const worse = account("xai-a");
-		const better = account("xai-b");
-		worse.priority = 1;
-		better.priority = 0;
-		const firstCatalog = [candidate("account:xai-a", worse.id, 1, 0)];
-		orderer.order([worse], candidateMeta("conversation", firstCatalog));
-
-		const catalog = [
-			candidate("account:xai-b", better.id, 0, 0),
-			candidate("account:xai-a", worse.id, 1, 1),
-		];
-		expect(
-			orderer.order(
-				[better],
-				candidateMeta("conversation", catalog, [catalog[0]]),
-			)[0]?.id,
-		).toBe("xai-b");
-		expect(
-			orderer.order([better, worse], candidateMeta("conversation", catalog))[0]
-				?.id,
-		).toBe("xai-b");
-		const equalCatalog = [
-			candidate("account:xai-a", worse.id, 1, 0),
-			candidate("account:xai-b", better.id, 1, 1),
-		];
-		expect(
-			orderer.order(
-				[worse, better],
-				candidateMeta("conversation", equalCatalog),
-			)[0]?.id,
-		).toBe("xai-b");
-	});
-
-	it("replaces the current owner when a better tier recovers", () => {
-		const orderer = new CacheAffinityOrderer(60_000);
-		const worse = account("xai-a");
-		const better = account("xai-b");
-		worse.priority = 1;
-		better.priority = 0;
-		const firstCatalog = [candidate("account:xai-a", worse.id, 1, 0)];
-		orderer.order([worse], candidateMeta("conversation", firstCatalog));
-
-		const catalog = [
-			candidate("account:xai-b", better.id, 0, 0),
-			candidate("account:xai-a", worse.id, 1, 1),
-		];
-		expect(
-			orderer.order([better, worse], candidateMeta("conversation", catalog))[0]
-				?.id,
-		).toBe("xai-b");
-		const equalCatalog = [
-			candidate("account:xai-a", worse.id, 1, 0),
-			candidate("account:xai-b", better.id, 1, 1),
-		];
-		expect(
-			orderer.order(
-				[worse, better],
-				candidateMeta("conversation", equalCatalog),
-			)[0]?.id,
-		).toBe("xai-b");
-		// The recovered better owner is now the mapping and legally snaps back
-		// across a temporary fallback to the worse configured tier.
-		orderer.order(
-			[worse],
-			candidateMeta("conversation", catalog, [catalog[1]]),
+		orderer.recordSuccess(
+			candidateMeta("conversation", catalog),
+			"account:xai-a",
+			a.id,
 		);
+
+		const onlyB = candidateMeta("conversation", catalog, [catalog[1]]);
+		expect(orderer.order([b], onlyB)).toEqual([b]);
+
+		const both = candidateMeta("conversation", catalog, [
+			catalog[1],
+			catalog[0],
+		]);
+		expect(orderer.order([b, a], both)).toEqual([b, a]);
+	});
+
+	it("lets a better tier lead but transfers ownership only after confirmed success", () => {
+		const orderer = new CacheAffinityOrderer(60_000);
+		const worse = account("xai-a");
+		const better = account("xai-b");
+		const catalog = [
+			candidate("account:xai-b", better.id, 0, 0),
+			candidate("account:xai-a", worse.id, 1, 1),
+		];
+		const initialMeta = candidateMeta("conversation", catalog, [catalog[1]]);
+		orderer.recordSuccess(initialMeta, "account:xai-a", worse.id);
+
+		const betterFirst = candidateMeta("conversation", catalog);
+		expect(orderer.order([better, worse], betterFirst)).toEqual([
+			better,
+			worse,
+		]);
+
+		const equalCatalog = [
+			candidate("account:xai-a", worse.id, 1, 0),
+			candidate("account:xai-b", better.id, 1, 1),
+		];
 		expect(
-			orderer.order([better, worse], candidateMeta("conversation", catalog))[0]
-				?.id,
-		).toBe("xai-b");
+			orderer.order(
+				[worse, better],
+				candidateMeta("conversation", equalCatalog),
+			),
+		).toEqual([worse, better]);
+
+		orderer.recordSuccess(betterFirst, "account:xai-b", better.id);
+		expect(
+			orderer.order(
+				[worse, better],
+				candidateMeta("conversation", equalCatalog),
+			),
+		).toEqual([better, worse]);
 	});
 
 	it("never moves an owner ahead of a higher comparable pressure band", () => {
 		const orderer = new CacheAffinityOrderer(60_000);
 		const owner = account("xai-a");
 		const urgent = account("xai-b");
-		orderer.order([owner, urgent], meta("conversation"));
+		const firstMeta = meta("conversation");
+		orderer.recordSuccess(firstMeta, "account:xai-a", owner.id);
 
 		const pressured = meta("conversation");
 		pressured.quotaPressureByAccountId = new Map([
-			[
-				owner.id,
-				{ band: "cold", comparisonKey: "anthropic:subscription:weekly" },
-			],
+			[owner.id, { band: "cold", comparisonKey: "xai:subscription:weekly" }],
 			[
 				urgent.id,
-				{
-					band: "critical",
-					comparisonKey: "anthropic:subscription:weekly",
-				},
+				{ band: "critical", comparisonKey: "xai:subscription:weekly" },
 			],
 		]);
-		expect(
-			orderer
-				.order([urgent, owner], pressured)
-				.map((candidate) => candidate.id),
-		).toEqual(["xai-b", "xai-a"]);
+		expect(orderer.order([urgent, owner], pressured)).toEqual([urgent, owner]);
 	});
 
-	it("tracks repeated-account combo slots by slot identity and reorders metadata atomically", () => {
+	it("tracks repeated-account combo slots by exact candidate identity", () => {
 		const orderer = new CacheAffinityOrderer(60_000);
 		const repeated = account("xai-a");
 		const opus = candidate("slot:opus", repeated.id, 0, 0, {
@@ -263,10 +249,8 @@ describe("CacheAffinityOrderer", () => {
 			comboSlotId: "slot-fable",
 			modelOverride: "claude-fable-5",
 		});
-		orderer.order(
-			[repeated, repeated],
-			candidateMeta("combo-conversation", [opus, fable]),
-		);
+		const firstMeta = candidateMeta("combo-conversation", [opus, fable]);
+		orderer.recordSuccess(firstMeta, "slot:opus", repeated.id);
 
 		const reversed = candidateMeta(
 			"combo-conversation",
@@ -277,14 +261,7 @@ describe("CacheAffinityOrderer", () => {
 
 		expect(ordered).toHaveLength(2);
 		expect(
-			(
-				reversed as RequestMeta & {
-					routingCandidates: Array<{
-						candidateId: string;
-						modelOverride: string;
-					}>;
-				}
-			).routingCandidates.map((entry) => [
+			reversed.routingCandidates?.map((entry) => [
 				entry.candidateId,
 				entry.modelOverride,
 			]),
@@ -294,45 +271,64 @@ describe("CacheAffinityOrderer", () => {
 		]);
 	});
 
-	it("honors an active anti-thrash suppression instead of re-promoting the flapping owner over the committed fallback", () => {
+	it("honors active anti-thrash suppression without changing ownership", () => {
 		const orderer = new CacheAffinityOrderer(60_000);
 		const fallback = account("xai-a");
 		const flapping = account("xai-b");
-		fallback.priority = 1;
-		flapping.priority = 0;
 		const catalog = [
 			candidate("account:xai-a", fallback.id, 1, 0),
 			candidate("account:xai-b", flapping.id, 0, 1),
 		];
+		orderer.recordSuccess(
+			candidateMeta("conversation", catalog),
+			"account:xai-b",
+			flapping.id,
+		);
 
-		// Establish ownership on the better-tier account, as an earlier
-		// successful upgrade would have done.
-		expect(
-			orderer.order(
-				[flapping, fallback],
-				candidateMeta("conversation", catalog),
-			)[0]?.id,
-		).toBe("xai-b");
-
-		// SessionAffinityStrategy has committed a fallback-first order this
-		// request because R13 anti-thrash is actively suppressing an upgrade
-		// back to "xai-b" (it flapped inside the anti-thrash window). The
-		// orderer must not undo that by promoting the suppressed candidate.
 		const suppressedMeta = candidateMeta("conversation", catalog);
 		suppressedMeta.affinityUpgradeSuppressedCandidateId = "account:xai-b";
-		expect(
-			orderer
-				.order([fallback, flapping], suppressedMeta)
-				.map((entry) => entry.id),
-		).toEqual(["xai-a", "xai-b"]);
+		expect(orderer.order([fallback, flapping], suppressedMeta)).toEqual([
+			fallback,
+			flapping,
+		]);
 
-		// Once the window elapses, SessionAffinityStrategy stops annotating the
-		// suppression and promotion resumes as normal.
 		expect(
-			orderer
-				.order([fallback, flapping], candidateMeta("conversation", catalog))
-				.map((entry) => entry.id),
-		).toEqual(["xai-b", "xai-a"]);
+			orderer.order(
+				[fallback, flapping],
+				candidateMeta("conversation", catalog),
+			),
+		).toEqual([flapping, fallback]);
+	});
+
+	it("expires confirmed ownership without refreshing TTL on reads", () => {
+		const orderer = new CacheAffinityOrderer(100);
+		const a = account("xai-a");
+		const b = account("xai-b");
+		const realDateNow = Date.now;
+		const startedAt = realDateNow();
+
+		try {
+			Date.now = () => startedAt;
+			orderer.recordSuccess(meta("conversation"), "account:xai-a", a.id);
+			Date.now = () => startedAt + 50;
+			expect(orderer.order([b, a], meta("conversation"))).toEqual([a, b]);
+			Date.now = () => startedAt + 101;
+			expect(orderer.order([b, a], meta("conversation"))).toEqual([b, a]);
+		} finally {
+			Date.now = realDateNow;
+		}
+	});
+
+	it("evicts the oldest confirmed owner when capacity is full", () => {
+		const orderer = new CacheAffinityOrderer(60_000, 2);
+		orderer.recordSuccess(meta("first"), "account:xai-a", "xai-a");
+		orderer.recordSuccess(meta("second"), "account:xai-b", "xai-b");
+		orderer.recordSuccess(meta("third"), "account:xai-a", "xai-a");
+
+		const a = account("xai-a");
+		const b = account("xai-b");
+		expect(orderer.order([b, a], meta("first"))).toEqual([b, a]);
+		expect(orderer.order([a, b], meta("second"))).toEqual([b, a]);
 	});
 
 	it("does nothing outside an active xAI cache-native route", () => {
@@ -342,10 +338,7 @@ describe("CacheAffinityOrderer", () => {
 		const inactive = meta("conversation");
 		inactive.xaiCacheNativeActive = false;
 
-		orderer.order([a, b], inactive);
-		expect(orderer.order([b, a], inactive).map((entry) => entry.id)).toEqual([
-			"xai-b",
-			"xai-a",
-		]);
+		orderer.recordSuccess(inactive, "account:xai-a", a.id);
+		expect(orderer.order([b, a], inactive)).toEqual([b, a]);
 	});
 });

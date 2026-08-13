@@ -1,4 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import {
+	MAX_OAUTH_ERROR_INPUT_LENGTH,
+	OAuthRefreshTokenError,
+} from "@better-ccflare/core";
 import type { Account } from "@better-ccflare/types";
 import { CodexProvider } from "../provider";
 
@@ -96,5 +100,103 @@ describe("CodexProvider.refreshToken preserves the OAuth error code", () => {
 		// The reused case must keep the machine marker so detection fires; the
 		// friendly re-auth hint alone ("token was reused") would not match.
 		expect(thrown?.message).toContain("refresh_token_reused");
+	});
+
+	it("does not classify refresh_token_reused from a truncated response", async () => {
+		const provider = new CodexProvider();
+		const prefix = JSON.stringify({
+			error: "refresh_token_reused",
+			error_description: "credential-like-description-must-not-leak",
+		});
+		const body = `${prefix}${" ".repeat(MAX_OAUTH_ERROR_INPUT_LENGTH - prefix.length)}trailing-data`;
+		globalThis.fetch = mock(
+			async () =>
+				new Response(body, {
+					status: 400,
+					headers: { "content-type": "application/json" },
+				}),
+		) as unknown as typeof fetch;
+
+		let thrown: unknown;
+		try {
+			await provider.refreshToken(codexAccount(), "test-client");
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).toBeInstanceOf(Error);
+		expect(thrown).not.toBeInstanceOf(OAuthRefreshTokenError);
+		expect((thrown as Error).message).not.toContain("refresh_token_reused");
+		expect((thrown as Error).message).not.toContain(
+			"credential-like-description-must-not-leak",
+		);
+	});
+
+	it("classifies an exact non-JSON invalid_grant body as terminal", async () => {
+		const provider = new CodexProvider();
+		globalThis.fetch = mock(
+			async () =>
+				new Response(" \r\ninvalid_grant\u0000\t ", {
+					status: 400,
+					statusText: "Bad Request",
+				}),
+		) as unknown as typeof fetch;
+
+		await expect(
+			provider.refreshToken(codexAccount(), "test-client"),
+		).rejects.toBeInstanceOf(OAuthRefreshTokenError);
+	});
+
+	it("classifies a nested structured invalid_grant response as terminal", async () => {
+		const provider = new CodexProvider();
+		globalThis.fetch = mock(
+			async () =>
+				new Response(
+					JSON.stringify({
+						error: {
+							code: "invalid_grant",
+							message: "The refresh token has expired.",
+						},
+					}),
+					{ status: 400, headers: { "content-type": "application/json" } },
+				),
+		) as unknown as typeof fetch;
+
+		await expect(
+			provider.refreshToken(codexAccount(), "test-client"),
+		).rejects.toBeInstanceOf(OAuthRefreshTokenError);
+	});
+
+	it("classifies a nested type-based invalid_grant response as terminal", async () => {
+		const provider = new CodexProvider();
+		globalThis.fetch = mock(
+			async () =>
+				new Response(
+					JSON.stringify({
+						error: { type: "invalid_grant", message: "expired" },
+					}),
+					{ status: 400, headers: { "content-type": "application/json" } },
+				),
+		) as unknown as typeof fetch;
+
+		await expect(
+			provider.refreshToken(codexAccount(), "test-client"),
+		).rejects.toBeInstanceOf(OAuthRefreshTokenError);
+	});
+
+	it("does not classify an incidental invalid_grant mention as terminal", async () => {
+		const provider = new CodexProvider();
+		globalThis.fetch = mock(
+			async () =>
+				new Response(
+					JSON.stringify({
+						error: { message: "provider mentioned invalid_grant in prose" },
+					}),
+					{ status: 400, headers: { "content-type": "application/json" } },
+				),
+		) as unknown as typeof fetch;
+
+		await expect(
+			provider.refreshToken(codexAccount(), "test-client"),
+		).rejects.not.toBeInstanceOf(OAuthRefreshTokenError);
 	});
 });

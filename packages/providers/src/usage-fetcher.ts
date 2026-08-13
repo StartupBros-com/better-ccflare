@@ -224,6 +224,54 @@ export function extractWindowResetTime(
 }
 
 /**
+ * Extract the all-model weekly reset (`seven_day` or `limits[].weekly_all`)
+ * from the Anthropic/Codex usage contract. Other providers may expose a
+ * seven-day-looking credit window with different semantics; those payloads
+ * deliberately fail open instead of becoming an account-drain signals. This
+ * is intentionally separate from `extractWindowResetTime`, whose contract is
+ * the representative (often five-hour) window. Unknown or malformed
+ * telemetry is represented as `null` so callers can fail open to their normal
+ * ordering.
+ */
+export function extractWeeklyResetTime(
+	data: AnyUsageData,
+	provider: string,
+	nowMs: number = Date.now(),
+): number | null {
+	if (provider !== "anthropic" && provider !== "codex") return null;
+	if (!data || typeof data !== "object") return null;
+	const usage = data as UsageData;
+
+	// Keep source precedence (flat seven_day before limits[]) while parsing each
+	// source independently. A malformed/stale flat value must not mask a usable
+	// weekly_all entry during the limits[] migration.
+	const candidates: number[] = [];
+	const parseReset = (value: unknown): number | null => {
+		if (typeof value !== "string" || value.length === 0) return null;
+		const timestamp = new Date(value).getTime();
+		return Number.isFinite(timestamp) ? timestamp : null;
+	};
+
+	const flatReset = parseReset(usage.seven_day?.resets_at);
+	if (flatReset !== null) candidates.push(flatReset);
+
+	if (Array.isArray(usage.limits)) {
+		for (const limit of usage.limits) {
+			if (!limit || limit.kind !== "weekly_all" || limit.is_active === false)
+				continue;
+			const limitsReset = parseReset(limit.resets_at);
+			if (limitsReset !== null) candidates.push(limitsReset);
+		}
+	}
+
+	if (candidates.length === 0) return null;
+	const referenceNow = Number.isFinite(nowMs) ? nowMs : Date.now();
+	return (
+		candidates.find((candidate) => candidate > referenceNow) ?? candidates[0]
+	);
+}
+
+/**
  * Fetch usage data from Anthropic's OAuth usage endpoint
  */
 export interface UsageFetchResult {
@@ -233,9 +281,13 @@ export interface UsageFetchResult {
 
 export async function fetchUsageData(
 	accessToken: string,
+	externalSignal?: AbortSignal,
 ): Promise<UsageFetchResult> {
 	const controller = new AbortController();
 	const timeoutId = setTimeout(() => controller.abort(), 5000);
+	const abort = () => controller.abort();
+	externalSignal?.addEventListener("abort", abort, { once: true });
+	if (externalSignal?.aborted) controller.abort();
 	try {
 		const response = await fetch("https://api.anthropic.com/api/oauth/usage", {
 			method: "GET",
@@ -320,6 +372,7 @@ export async function fetchUsageData(
 		return { data: null, retryAfterMs: null };
 	} finally {
 		clearTimeout(timeoutId);
+		externalSignal?.removeEventListener("abort", abort);
 	}
 }
 
@@ -386,12 +439,9 @@ export function getRepresentativeUtilization(
 	return utilizations.length > 0 ? Math.max(...utilizations) : null;
 }
 
-/**
- * Determine which window is the most restrictive (highest utilization)
- * Dynamically handles any usage window fields in the response
- */
-export function getRepresentativeWindow(
+function representativeWindow(
 	usage: UsageData | null,
+	includeExtraUsage: boolean,
 ): string | null {
 	if (!usage) return null;
 
@@ -399,6 +449,7 @@ export function getRepresentativeWindow(
 
 	// Iterate through all properties to find UsageWindow objects
 	for (const [key, value] of Object.entries(usage)) {
+		if (key === "extra_usage" && !includeExtraUsage) continue;
 		// Check if this is a UsageWindow object
 		if (
 			value &&
@@ -434,13 +485,29 @@ export function getRepresentativeWindow(
 }
 
 /**
- * Get the representative utilization for any supported provider type.
- * Returns null if the provider is not supported or data is unavailable.
+ * Determine which window is the most restrictive (highest utilization)
+ * Dynamically handles any usage window fields in the response.
+ *
+ * Display surface — `extra_usage` is included, because a dashboard showing a
+ * 100%-spent overage pool is telling the truth. Reset derivation for the
+ * admission path deliberately uses the hard-limit-only variant instead, so the
+ * reset it reports belongs to a window that actually has one.
  */
-export function getRepresentativeUtilizationForProvider(
-	data: AnyUsageData,
+export function getRepresentativeWindow(
+	usage: UsageData | null,
+): string | null {
+	return representativeWindow(usage, true);
+}
+
+function utilizationForProvider(
+	data: AnyUsageData | null | undefined,
 	provider: string,
+	includeExtraUsage: boolean,
 ): number | null {
+	// Same defensive guard as getRepresentativeUsageResetMs — callers that
+	// derive a display label may hold a null payload for providers that expose
+	// no usage surface.
+	if (!data || typeof data !== "object") return null;
 	switch (provider) {
 		case "anthropic":
 		case "codex": {
@@ -457,8 +524,9 @@ export function getRepresentativeUtilizationForProvider(
 				const w = d[key] as UsageWindow | undefined;
 				if (w?.utilization != null) utils.push(w.utilization);
 			}
-			// extra_usage has utilization: number | null
-			if (d.extra_usage?.utilization != null)
+			// extra_usage has utilization: number | null. Ranking only — see the
+			// exported wrappers below for why it must never gate admission.
+			if (includeExtraUsage && d.extra_usage?.utilization != null)
 				utils.push(d.extra_usage.utilization);
 			// Account-level limits[] caps (session / weekly_all) for limits-only payloads.
 			for (const { util } of accountLevelLimitWindows(d)) utils.push(util);
@@ -492,6 +560,22 @@ export function getRepresentativeUtilizationForProvider(
 		default:
 			return null;
 	}
+}
+
+/** Routing/health utilization: excludes extra_usage from hard capacity gates. */
+export function getRepresentativeUtilizationForProvider(
+	data: AnyUsageData | null | undefined,
+	provider: string,
+): number | null {
+	return utilizationForProvider(data, provider, false);
+}
+
+/** Ranking utilization includes extra usage, because it reflects total spend. */
+export function getRankingUtilizationForProvider(
+	data: AnyUsageData | null | undefined,
+	provider: string,
+): number | null {
+	return utilizationForProvider(data, provider, true);
 }
 
 /**
@@ -645,13 +729,19 @@ export function getRepresentativeUsageResetMs(
 		switch (provider) {
 			case "anthropic":
 			case "codex": {
-				const windowName = getRepresentativeWindow(data as UsageData);
+				// Hard-limit windows only — must stay in lockstep with
+				// getRepresentativeUtilizationForProvider, which also excludes
+				// extra_usage. Pairing a utilization drawn from the hard-limit
+				// set with a reset drawn from a set that includes extra_usage
+				// would report the wrong window's recovery time (and extra_usage
+				// has no resets_at at all, so it would report none).
+				const windowName = representativeWindow(data as UsageData, false);
 				// Flat legacy shape: the window name is an actual property
 				// (five_hour/seven_day/...) carrying its own resets_at.
 				const flatReset = extractUsageResetMs(data, windowName);
 				if (flatReset !== null) return flatReset;
 				// limits[]-only payloads (2026 API): five_hour/seven_day are
-				// absent as properties — getRepresentativeWindow derives those
+				// absent as properties — representativeWindow derives those
 				// same names synthetically from limits[] kind "session" /
 				// "weekly_all". Fall back to the matching limits[] entry's own
 				// resets_at so the staleness guard still has a real reset time.
@@ -757,17 +847,35 @@ export interface UsageSnapshotPayload {
 	windows: CanonicalUsageWindow[];
 }
 
+type PollRegistration = {
+	accountId: string;
+	epoch: number;
+	tokenProvider: AccessTokenProvider;
+	provider?: string;
+	customEndpoint?: string | null;
+	baseIntervalMs: number;
+	onWindowReset?: (accountId: string) => void;
+	onCapacityRestored?: (accountId: string) => void;
+	onSnapshot?: (payload: UsageSnapshotPayload) => void;
+	timer?: NodeJS.Timeout;
+	abortController: AbortController;
+	failureCount: number;
+};
+
 /**
  * In-memory cache for usage data per account
  */
 class UsageCache {
 	private cache = new Map<string, { data: AnyUsageData; timestamp: number }>();
-	private pollTimeouts = new Map<string, NodeJS.Timeout>();
-	private failureCounts = new Map<string, number>();
-	private tokenProviders = new Map<string, AccessTokenProvider>();
-	private providerTypes = new Map<string, string>(); // Track provider type for each account
-	private customEndpoints = new Map<string, string | null>(); // Track custom endpoints
-	private windowResetCallbacks = new Map<string, (accountId: string) => void>();
+	/**
+	 * Exactly one live registration per account, created by each startPolling
+	 * call. Registration identity — not the account id — is the correctness
+	 * guard: a stop→start pair replaces the map entry, so every async
+	 * continuation belonging to the previous generation fails its identity
+	 * check and writes nothing.
+	 */
+	private registrations = new Map<string, PollRegistration>();
+	private nextEpoch = 0;
 	private usageRateLimitedUntil = new Map<string, number>(); // Tracks when usage API 429 clears
 	private modelScopedDepletions = new Map<
 		string,
@@ -777,33 +885,110 @@ class UsageCache {
 		string,
 		Map<string, FamilyScopedDepletion>
 	>();
-	private capacityRestoredCallbacks = new Map<
-		string,
-		(accountId: string) => void
-	>();
-	private snapshotCallbacks = new Map<
-		string,
-		(payload: UsageSnapshotPayload) => void
-	>();
 	private inFlightFetches = new Map<
 		string,
-		Promise<{ success: boolean; retryAfterMs: number | null }>
+		{
+			registration: PollRegistration;
+			promise: Promise<{ success: boolean; retryAfterMs: number | null }>;
+		}
 	>();
+
+	/** True only while this exact registration still owns its account. */
+	private isCurrent(registration: PollRegistration): boolean {
+		return this.registrations.get(registration.accountId) === registration;
+	}
+
+	/**
+	 * Drop the in-flight entry only when it still references this exact
+	 * registration AND this exact promise: an older generation completing after
+	 * a stop→start must not delete the replacement's live fetch (which would
+	 * un-deduplicate concurrent refreshes and let a second request fly).
+	 */
+	private clearInFlight(
+		registration: PollRegistration,
+		promise: Promise<{ success: boolean; retryAfterMs: number | null }>,
+	): void {
+		const current = this.inFlightFetches.get(registration.accountId);
+		if (current?.registration === registration && current.promise === promise) {
+			this.inFlightFetches.delete(registration.accountId);
+		}
+	}
+
+	/**
+	 * Deduplicate concurrent fetches per registration. Dedup is keyed on the
+	 * registration, so a stale generation's promise is never handed to the
+	 * replacement.
+	 */
+	private fetchRegistration(
+		registration: PollRegistration,
+	): Promise<{ success: boolean; retryAfterMs: number | null }> {
+		const current = this.inFlightFetches.get(registration.accountId);
+		if (current?.registration === registration) {
+			log.debug(
+				`Reusing in-flight fetch for account ${registration.accountId} — skipping duplicate request`,
+			);
+			return current.promise;
+		}
+
+		const promise = this._doFetchAndCache(registration);
+		this.inFlightFetches.set(registration.accountId, { registration, promise });
+		promise.finally(() => this.clearInFlight(registration, promise));
+		return promise;
+	}
+
+	private setRegistrationCache(
+		registration: PollRegistration,
+		data: AnyUsageData,
+	): void {
+		if (!this.isCurrent(registration)) return;
+		this.setAuthoritative(registration.accountId, data);
+	}
+
+	private notifySnapshot(
+		registration: PollRegistration,
+		data: AnyUsageData,
+	): void {
+		if (!this.isCurrent(registration)) return;
+		// Normalize once, here, so history persistence and alert evaluation both
+		// receive the same canonical windows instead of re-deriving them from the
+		// raw payload with their own copy of each provider's shape rules.
+		const provider = registration.provider ?? "anthropic";
+		registration.onSnapshot?.({
+			accountId: registration.accountId,
+			data,
+			provider,
+			windows: normalizeProviderUsageWindows(data, provider),
+		});
+	}
+
+	private notifyRegistrationWindowReset(
+		registration: PollRegistration,
+		data: AnyUsageData,
+		provider: string,
+	): void {
+		if (!this.isCurrent(registration) || !registration.onWindowReset) return;
+		this.notifyWindowReset(
+			registration.accountId,
+			data,
+			provider,
+			registration.onWindowReset,
+		);
+	}
 
 	/**
 	 * Schedule the next poll with exponential backoff on failures.
 	 * If retryAfterMs is provided (from a 429 retry-after header), it takes
-	 * precedence over the calculated backoff delay.
+	 * precedence over the calculated backoff delay. Failure streaks live on the
+	 * registration, so a stopped generation cannot inflate the replacement's
+	 * backoff or add a second concurrent timer chain.
 	 */
 	private scheduleNextPoll(
-		accountId: string,
-		tokenProvider: AccessTokenProvider,
-		baseIntervalMs: number,
-		provider?: string,
-		customEndpoint?: string | null,
+		registration: PollRegistration,
 		retryAfterMs?: number | null,
 	) {
-		const failures = this.failureCounts.get(accountId) ?? 0;
+		if (!this.isCurrent(registration)) return;
+		const failures = registration.failureCount;
+		const baseIntervalMs = registration.baseIntervalMs;
 		// Add ±20% random jitter to the base interval so accounts spread out
 		// and don't lock into sync with each other over time.
 		const jitter = (Math.random() - 0.5) * 0.4 * baseIntervalMs;
@@ -817,42 +1002,21 @@ class UsageCache {
 
 		if (failures > 0) {
 			log.info(
-				`Usage poll backoff for account ${accountId}: retry in ${Math.round(delay / 1000)}s (${failures} consecutive failure(s))${retryAfterMs != null ? " [server retry-after]" : ""}`,
+				`Usage poll backoff for account ${registration.accountId}: retry in ${Math.round(delay / 1000)}s (${failures} consecutive failure(s))${retryAfterMs != null ? " [server retry-after]" : ""}`,
 			);
 		}
 
-		const timeoutId = setTimeout(async () => {
-			this.pollTimeouts.delete(accountId);
-			// Bail if polling was stopped
-			if (!this.tokenProviders.has(accountId)) return;
+		registration.timer = setTimeout(async () => {
+			registration.timer = undefined;
+			// Bail if this generation was stopped or replaced.
+			if (!this.isCurrent(registration)) return;
 
 			const { success, retryAfterMs: nextRetryAfterMs } =
-				await this.fetchAndCache(
-					accountId,
-					tokenProvider,
-					provider,
-					customEndpoint,
-				);
-			if (success) {
-				this.failureCounts.delete(accountId); // reset streak on success
-			} else {
-				const count = (this.failureCounts.get(accountId) ?? 0) + 1;
-				this.failureCounts.set(accountId, count);
-			}
-			// Schedule the next poll if still active
-			if (this.tokenProviders.has(accountId)) {
-				this.scheduleNextPoll(
-					accountId,
-					tokenProvider,
-					baseIntervalMs,
-					provider,
-					customEndpoint,
-					nextRetryAfterMs,
-				);
-			}
+				await this.fetchRegistration(registration);
+			if (!this.isCurrent(registration)) return;
+			registration.failureCount = success ? 0 : registration.failureCount + 1;
+			this.scheduleNextPoll(registration, nextRetryAfterMs);
 		}, delay);
-
-		this.pollTimeouts.set(accountId, timeoutId);
 	}
 
 	/**
@@ -876,164 +1040,102 @@ class UsageCache {
 			return;
 		}
 
-		// Stop existing polling if any to prevent leaks
-		const existing = this.pollTimeouts.get(accountId);
-		if (existing) {
-			clearTimeout(existing);
+		// Retire any previous generation first: its timer is cleared, its fetch
+		// is aborted, and its identity check now fails permanently.
+		if (this.registrations.has(accountId)) {
 			log.warn(
-				`Clearing existing polling timeout for account ${accountId} before starting new one`,
+				`Clearing existing polling registration for account ${accountId} before starting new one`,
 			);
+			this.stopPolling(accountId);
 		}
-
-		// Reset failure count for fresh start
-		this.failureCounts.delete(accountId);
 
 		// Store the token provider (either a static token or a function)
 		const tokenProvider: AccessTokenProvider =
 			typeof accessTokenOrProvider === "string"
 				? async () => accessTokenOrProvider
 				: accessTokenOrProvider;
-		this.tokenProviders.set(accountId, tokenProvider);
 
-		// Store provider type, custom endpoint, and window-reset callback for this account
-		if (provider) {
-			this.providerTypes.set(accountId, provider);
-		}
-		if (customEndpoint !== undefined) {
-			this.customEndpoints.set(accountId, customEndpoint);
-		}
-		if (onWindowReset) {
-			this.windowResetCallbacks.set(accountId, onWindowReset);
-		} else {
-			this.windowResetCallbacks.delete(accountId);
-		}
-		if (onCapacityRestored) {
-			this.capacityRestoredCallbacks.set(accountId, onCapacityRestored);
-		} else {
-			this.capacityRestoredCallbacks.delete(accountId);
-		}
-		if (onSnapshot) {
-			this.snapshotCallbacks.set(accountId, onSnapshot);
-		} else {
-			this.snapshotCallbacks.delete(accountId);
-		}
-
-		// Default to 90s if not provided
-		const baseIntervalMs = intervalMs ?? 90000;
+		const registration: PollRegistration = {
+			accountId,
+			epoch: ++this.nextEpoch,
+			tokenProvider,
+			provider,
+			customEndpoint,
+			// Default to 90s if not provided
+			baseIntervalMs: intervalMs ?? 90000,
+			onWindowReset,
+			onCapacityRestored,
+			onSnapshot,
+			abortController: new AbortController(),
+			failureCount: 0,
+		};
+		this.registrations.set(accountId, registration);
 
 		// Immediate fetch
-		this.fetchAndCache(accountId, tokenProvider, provider, customEndpoint).then(
+		void this.fetchRegistration(registration).then(
 			({ success, retryAfterMs }) => {
-				if (!success) {
-					this.failureCounts.set(accountId, 1);
-				}
-				if (this.tokenProviders.has(accountId)) {
-					this.scheduleNextPoll(
-						accountId,
-						tokenProvider,
-						baseIntervalMs,
-						provider,
-						customEndpoint,
-						retryAfterMs,
-					);
-				}
+				if (!this.isCurrent(registration)) return;
+				registration.failureCount = success ? 0 : 1;
+				this.scheduleNextPoll(registration, retryAfterMs);
 			},
 		);
 
 		log.debug(
-			`Started usage polling for account ${accountId} (provider: ${provider}) with base interval ${Math.round(baseIntervalMs / 1000)}s`,
+			`Started usage polling for account ${accountId} (provider: ${provider}) with base interval ${Math.round(registration.baseIntervalMs / 1000)}s`,
 		);
 	}
 
 	/**
 	 * Trigger an immediate usage fetch for an account that already has polling configured.
 	 * Returns false when no polling/token provider is configured or when the fetch fails.
+	 * A refresh whose registration was stopped or replaced mid-flight reports
+	 * failure rather than publishing a result for a generation that is gone.
 	 */
 	async refreshNow(accountId: string): Promise<boolean> {
-		const tokenProvider = this.tokenProviders.get(accountId);
-		if (!tokenProvider) {
+		const registration = this.registrations.get(accountId);
+		if (!registration) {
 			return false;
 		}
 
-		const provider = this.providerTypes.get(accountId);
-		const customEndpoint = this.customEndpoints.get(accountId);
-		const { success } = await this.fetchAndCache(
-			accountId,
-			tokenProvider,
-			provider,
-			customEndpoint,
-		);
-		return success;
+		const { success } = await this.fetchRegistration(registration);
+		return success && this.isCurrent(registration);
 	}
 
 	/**
 	 * Stop polling for an account
 	 */
 	stopPolling(accountId: string) {
-		const timeout = this.pollTimeouts.get(accountId);
-		if (timeout) {
-			clearTimeout(timeout);
-			this.pollTimeouts.delete(accountId);
+		const registration = this.registrations.get(accountId);
+		if (!registration) return;
+
+		this.registrations.delete(accountId);
+		if (registration.timer) {
+			clearTimeout(registration.timer);
+			registration.timer = undefined;
 		}
-		if (this.tokenProviders.has(accountId)) {
-			this.tokenProviders.delete(accountId);
-			this.failureCounts.delete(accountId);
-			this.windowResetCallbacks.delete(accountId);
-			this.capacityRestoredCallbacks.delete(accountId);
-			this.snapshotCallbacks.delete(accountId);
-			// Clean up cache entry when polling stops to prevent memory leaks
-			this.cache.delete(accountId);
-			this.usageRateLimitedUntil.delete(accountId);
-			this.modelScopedDepletions.delete(accountId);
-			this.familyScopedDepletions.delete(accountId);
-			// Clear any in-flight fetch so it doesn't linger after polling stops.
+		// Best-effort cancellation of the generation's outstanding request where
+		// the provider fetcher accepts a signal; the identity checks in
+		// _doFetchAndCache remain the correctness guard for fetchers that don't.
+		registration.abortController.abort();
+		// Clean up cache entry when polling stops to prevent memory leaks
+		this.cache.delete(accountId);
+		this.usageRateLimitedUntil.delete(accountId);
+		this.modelScopedDepletions.delete(accountId);
+		this.familyScopedDepletions.delete(accountId);
+		// Drop the in-flight entry only if it still belongs to this generation.
+		const inFlight = this.inFlightFetches.get(accountId);
+		if (inFlight?.registration === registration) {
 			this.inFlightFetches.delete(accountId);
-			log.info(
-				`Stopped usage polling and cleared cache for account ${accountId}`,
-			);
 		}
-	}
-
-	/**
-	 * Fetch and cache usage data.
-	 * Returns { success, retryAfterMs } where retryAfterMs is set when the
-	 * server returns a retry-after header on a 429 response.
-	 */
-	private async fetchAndCache(
-		accountId: string,
-		tokenProvider: AccessTokenProvider,
-		provider?: string,
-		customEndpoint?: string | null,
-	): Promise<{ success: boolean; retryAfterMs: number | null }> {
-		// Deduplicate concurrent fetches for the same account — return the
-		// existing in-flight promise rather than starting a second HTTP request.
-		const inflight = this.inFlightFetches.get(accountId);
-		if (inflight) {
-			log.debug(
-				`Reusing in-flight fetch for account ${accountId} — skipping duplicate request`,
-			);
-			return inflight;
-		}
-
-		const promise = this._doFetchAndCache(
-			accountId,
-			tokenProvider,
-			provider,
-			customEndpoint,
+		log.info(
+			`Stopped usage polling and cleared cache for account ${accountId}`,
 		);
-		this.inFlightFetches.set(accountId, promise);
-		promise.finally(() => {
-			this.inFlightFetches.delete(accountId);
-		});
-		return promise;
 	}
 
 	private async _doFetchAndCache(
-		accountId: string,
-		tokenProvider: AccessTokenProvider,
-		provider?: string,
-		customEndpoint?: string | null,
+		registration: PollRegistration,
 	): Promise<{ success: boolean; retryAfterMs: number | null }> {
+		const { accountId, tokenProvider, provider, customEndpoint } = registration;
 		try {
 			// Get a fresh access token or API key on each fetch
 			let token: string;
@@ -1053,7 +1155,6 @@ class UsageCache {
 				);
 				return { success: false, retryAfterMs: null };
 			}
-
 			// Validate token before proceeding
 			if (!token || (typeof token === "string" && token.trim() === "")) {
 				log.warn(
@@ -1068,15 +1169,21 @@ class UsageCache {
 			if (provider === "nanogpt") {
 				// Fetch NanoGPT usage data
 				data = await fetchNanoGPTUsageData(token, customEndpoint);
+				if (!this.isCurrent(registration)) {
+					return { success: false, retryAfterMs: null };
+				}
 				if (data) {
 					// Import NanoGPT helper functions
 					const {
 						getRepresentativeNanoGPTUtilization,
 						getRepresentativeNanoGPTWindow,
 					} = await import("./nanogpt-usage-fetcher");
+					if (!this.isCurrent(registration)) {
+						return { success: false, retryAfterMs: null };
+					}
 
-					this.setAuthoritative(accountId, data);
-					this.notifySnapshot(accountId, data);
+					this.setRegistrationCache(registration, data);
+					this.notifySnapshot(registration, data);
 					const utilization = getRepresentativeNanoGPTUtilization(
 						data as NanoGPTUsageData,
 					);
@@ -1091,18 +1198,22 @@ class UsageCache {
 			} else if (provider === "zai") {
 				// Fetch Zai usage data
 				data = await fetchZaiUsageData(token);
+				if (!this.isCurrent(registration)) {
+					return { success: false, retryAfterMs: null };
+				}
 				if (data) {
 					// Import Zai helper functions
 					const {
 						getRepresentativeZaiUtilization,
 						getRepresentativeZaiWindow,
 					} = await import("./zai-usage-fetcher");
+					if (!this.isCurrent(registration)) {
+						return { success: false, retryAfterMs: null };
+					}
 
-					const callback = this.windowResetCallbacks.get(accountId);
-					if (callback)
-						this.notifyWindowReset(accountId, data, "zai", callback);
-					this.setAuthoritative(accountId, data);
-					this.notifySnapshot(accountId, data);
+					this.notifyRegistrationWindowReset(registration, data, "zai");
+					this.setRegistrationCache(registration, data);
+					this.notifySnapshot(registration, data);
 					const utilization = getRepresentativeZaiUtilization(
 						data as ZaiUsageData,
 					);
@@ -1115,9 +1226,12 @@ class UsageCache {
 			} else if (provider === "kilo") {
 				// Fetch Kilo usage data
 				data = await fetchKiloUsageData(token);
+				if (!this.isCurrent(registration)) {
+					return { success: false, retryAfterMs: null };
+				}
 				if (data) {
-					this.setAuthoritative(accountId, data);
-					this.notifySnapshot(accountId, data);
+					this.setRegistrationCache(registration, data);
+					this.notifySnapshot(registration, data);
 					const utilization = getRepresentativeKiloUtilization(
 						data as KiloUsageData,
 					);
@@ -1130,9 +1244,12 @@ class UsageCache {
 			} else if (provider === "alibaba-coding-plan") {
 				// Fetch Alibaba Coding Plan usage data
 				data = await fetchAlibabaCodingPlanUsageData(token);
+				if (!this.isCurrent(registration)) {
+					return { success: false, retryAfterMs: null };
+				}
 				if (data) {
-					this.setAuthoritative(accountId, data);
-					this.notifySnapshot(accountId, data);
+					this.setRegistrationCache(registration, data);
+					this.notifySnapshot(registration, data);
 					const utilization = getRepresentativeAlibabaCodingPlanUtilization(
 						data as AlibabaCodingPlanUsageData,
 					);
@@ -1147,12 +1264,13 @@ class UsageCache {
 			} else if (provider === "xai") {
 				// Fetch xAI/Grok Build credits data via grok.com gRPC-web.
 				data = await fetchXaiUsageData(token);
+				if (!this.isCurrent(registration)) {
+					return { success: false, retryAfterMs: null };
+				}
 				if (data) {
-					const callback = this.windowResetCallbacks.get(accountId);
-					if (callback)
-						this.notifyWindowReset(accountId, data, "xai", callback);
-					this.setAuthoritative(accountId, data);
-					this.notifySnapshot(accountId, data);
+					this.notifyRegistrationWindowReset(registration, data, "xai");
+					this.setRegistrationCache(registration, data);
+					this.notifySnapshot(registration, data);
 					const utilization = getRepresentativeXaiUtilization(
 						data as XaiUsageData,
 					);
@@ -1165,12 +1283,13 @@ class UsageCache {
 			} else if (provider === "minimax") {
 				// Fetch Minimax Token Plan remains (metadata-only GET, zero quota).
 				data = await fetchMinimaxUsageData(token);
+				if (!this.isCurrent(registration)) {
+					return { success: false, retryAfterMs: null };
+				}
 				if (data) {
-					const callback = this.windowResetCallbacks.get(accountId);
-					if (callback)
-						this.notifyWindowReset(accountId, data, "minimax", callback);
-					this.cache.set(accountId, { data, timestamp: Date.now() });
-					this.notifySnapshot(accountId, data);
+					this.notifyRegistrationWindowReset(registration, data, "minimax");
+					this.setRegistrationCache(registration, data);
+					this.notifySnapshot(registration, data);
 					const utilization = getRepresentativeMinimaxUtilization(
 						data as MinimaxUsageData,
 					);
@@ -1186,8 +1305,11 @@ class UsageCache {
 				// Codex/ChatGPT subscription usage via the free wham/usage
 				// introspection endpoint — no quota consumed, unlike the
 				// quota-consuming ping in on-demand-fetch.ts.
-				const result = await fetchCodexUsageData(token);
-				if (!this.tokenProviders.has(accountId)) {
+				const result = await fetchCodexUsageData(
+					token,
+					registration.abortController.signal,
+				);
+				if (!this.isCurrent(registration)) {
 					// Polling was stopped while this fetch was in flight (e.g. the
 					// account's endpoint changed away from the subscription
 					// backend): discard the snapshot rather than resurrecting
@@ -1195,12 +1317,15 @@ class UsageCache {
 					return { success: false, retryAfterMs: null };
 				}
 				if (result.data) {
-					this.usageRateLimitedUntil.delete(accountId);
-					const callback = this.windowResetCallbacks.get(accountId);
-					if (callback)
-						this.notifyWindowReset(accountId, result.data, "codex", callback);
-					this.setAuthoritative(accountId, result.data);
-					this.notifySnapshot(accountId, result.data);
+					if (this.isCurrent(registration))
+						this.usageRateLimitedUntil.delete(accountId);
+					this.notifyRegistrationWindowReset(
+						registration,
+						result.data,
+						"codex",
+					);
+					this.setRegistrationCache(registration, result.data);
+					this.notifySnapshot(registration, result.data);
 					const utilization = getRepresentativeUtilization(
 						result.data as UsageData,
 					);
@@ -1216,33 +1341,44 @@ class UsageCache {
 					);
 					return { success: true, retryAfterMs: null };
 				}
-				if (result.retryAfterMs != null && result.retryAfterMs > 0) {
+				if (
+					this.isCurrent(registration) &&
+					result.retryAfterMs != null &&
+					result.retryAfterMs > 0
+				) {
 					this.usageRateLimitedUntil.set(
 						accountId,
 						Date.now() + result.retryAfterMs,
 					);
-				} else if (result.retryAfterMs == null) {
+				} else if (
+					this.isCurrent(registration) &&
+					result.retryAfterMs == null
+				) {
 					// Non-429 failure: clear any stale rate-limit marker
 					this.usageRateLimitedUntil.delete(accountId);
 				}
 				return { success: false, retryAfterMs: result.retryAfterMs };
 			} else {
 				// Default to Anthropic usage data
-				const result = await fetchUsageData(token);
+				const result = await fetchUsageData(
+					token,
+					registration.abortController.signal,
+				);
+				if (!this.isCurrent(registration)) {
+					return { success: false, retryAfterMs: null };
+				}
 				if (result.data) {
 					// Snapshot before clearing — needed for the capacity-restored guard below.
 					const wasRateLimited = this.usageRateLimitedUntil.has(accountId);
-					this.usageRateLimitedUntil.delete(accountId);
-					const callback = this.windowResetCallbacks.get(accountId);
-					if (callback)
-						this.notifyWindowReset(
-							accountId,
-							result.data,
-							"anthropic",
-							callback,
-						);
-					this.setAuthoritative(accountId, result.data);
-					this.notifySnapshot(accountId, result.data);
+					if (this.isCurrent(registration))
+						this.usageRateLimitedUntil.delete(accountId);
+					this.notifyRegistrationWindowReset(
+						registration,
+						result.data,
+						"anthropic",
+					);
+					this.setRegistrationCache(registration, result.data);
+					this.notifySnapshot(registration, result.data);
 					const utilization = getRepresentativeUtilization(
 						result.data as UsageData,
 					);
@@ -1251,10 +1387,13 @@ class UsageCache {
 					// This handles seat-reassignment: org admin reassigns a seat mid-window,
 					// Anthropic resets usage, polling detects available capacity and lets
 					// the caller clear stale rate_limited_until in the DB.
-					if (utilization !== null && utilization < 100 && wasRateLimited) {
-						const capacityCallback =
-							this.capacityRestoredCallbacks.get(accountId);
-						if (capacityCallback) capacityCallback(accountId);
+					if (
+						this.isCurrent(registration) &&
+						utilization !== null &&
+						utilization < 100 &&
+						wasRateLimited
+					) {
+						registration.onCapacityRestored?.(accountId);
 					}
 					const window = getRepresentativeWindow(result.data as UsageData);
 					log.debug(
@@ -1262,12 +1401,19 @@ class UsageCache {
 					);
 					return { success: true, retryAfterMs: null };
 				}
-				if (result.retryAfterMs != null && result.retryAfterMs > 0) {
+				if (
+					this.isCurrent(registration) &&
+					result.retryAfterMs != null &&
+					result.retryAfterMs > 0
+				) {
 					this.usageRateLimitedUntil.set(
 						accountId,
 						Date.now() + result.retryAfterMs,
 					);
-				} else if (result.retryAfterMs == null) {
+				} else if (
+					this.isCurrent(registration) &&
+					result.retryAfterMs == null
+				) {
 					// Non-429 failure: clear any stale rate-limit marker
 					this.usageRateLimitedUntil.delete(accountId);
 				}
@@ -1516,19 +1662,6 @@ class UsageCache {
 	 * (nanogpt/zai/kilo/alibaba/minimax) silently unwired — the callback was
 	 * registered but never invoked for them (pro-gate finding).
 	 */
-	private notifySnapshot(accountId: string, data: AnyUsageData): void {
-		const snapshotCb = this.snapshotCallbacks.get(accountId);
-		if (snapshotCb) {
-			const provider = this.providerTypes.get(accountId) ?? "anthropic";
-			snapshotCb({
-				accountId,
-				data,
-				provider,
-				windows: normalizeProviderUsageWindows(data, provider),
-			});
-		}
-	}
-
 	private setAuthoritative(accountId: string, data: AnyUsageData): void {
 		this.cache.set(accountId, { data, timestamp: Date.now() });
 		// Ordinary usage snapshots do not prove a recent model+client-beta-specific
@@ -1629,7 +1762,7 @@ class UsageCache {
 	 * Clear all cached data and stop all polling
 	 */
 	clear() {
-		for (const accountId of this.tokenProviders.keys()) {
+		for (const accountId of this.registrations.keys()) {
 			this.stopPolling(accountId);
 		}
 		this.cache.clear();

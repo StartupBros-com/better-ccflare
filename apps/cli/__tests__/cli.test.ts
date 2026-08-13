@@ -339,13 +339,27 @@ describe("CLI Integration Tests", () => {
 			expect(result.stdout).not.toContain("--admin-api-key");
 		});
 
-		it("should show account mode options", async () => {
+		it("should show every accepted account mode", async () => {
 			const result = await runCLI(["--help"]);
 
-			expect(result.stdout).toContain("claude-oauth");
-			expect(result.stdout).toContain("console");
-			expect(result.stdout).toContain("zai");
-			expect(result.stdout).toContain("openai-compatible");
+			for (const mode of [
+				"claude-oauth",
+				"console",
+				"zai",
+				"minimax",
+				"nanogpt",
+				"anthropic-compatible",
+				"openai-compatible",
+				"bedrock",
+				"kilo",
+				"alibaba-coding-plan",
+				"codex",
+				"xai",
+				"ollama",
+				"muse-spark",
+			]) {
+				expect(result.stdout).toContain(mode);
+			}
 		});
 
 		it("should exit quickly for help command", async () => {

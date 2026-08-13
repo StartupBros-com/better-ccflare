@@ -37,7 +37,7 @@ export const CODEX_TRACE_HMAC_KEY_ENV = "CCFLARE_CODEX_TRACE_HMAC_KEY";
 /** Warn when one response spawns at least this many subagents (0 disables). */
 export const CODEX_FANOUT_WARN_ENV = "CCFLARE_CODEX_FANOUT_WARN";
 
-const TRACE_SCHEMA_VERSION = 15;
+const TRACE_SCHEMA_VERSION = 17;
 const DEFAULT_FANOUT_WARN = 8;
 const MAX_INPUT_ITEM_FINGERPRINTS = 64;
 /**
@@ -243,6 +243,20 @@ interface TraceInputs {
 	conversationId?: string | null;
 	/** Why the effective cache-key mode was selected. */
 	cacheKeyAssignmentSource?: "canary" | "explicit_session_override" | null;
+	/** Low-cardinality continuity provenance for the outbound cache key. */
+	cacheKeyContinuityBasis?:
+		| "derived"
+		| "identity_match"
+		| "lineage_match"
+		| "rejected"
+		| "session"
+		| "ineligible";
+	/** Whether the canonical continuity identity was actually applied to the key. */
+	cacheKeyContinuityApplied?: boolean | null;
+	/** Bounded canonical identity used only to sequence validated continuity evidence. */
+	continuityEvidenceId?: string | null;
+	/** Bounded prefix of the canonical identity used for the cache key. */
+	canonicalConversationId?: string | null;
 	/** Explicit GPT-5.6 breakpoint experiment arm; contains no prompt/key data. */
 	explicitBreakpointCanary?: "treatment" | "control" | "ineligible";
 	/** Domain-separated conversation cohort digest. */
@@ -420,6 +434,10 @@ export function writeCodexTrace(inputs: TraceInputs): void {
 		cache_key_cohort_id: inputs.cacheKeyCohortId ?? null,
 		conversation_id: inputs.conversationId ?? null,
 		cache_key_assignment_source: inputs.cacheKeyAssignmentSource ?? null,
+		cache_key_continuity_basis: inputs.cacheKeyContinuityBasis ?? null,
+		cache_key_continuity_applied: inputs.cacheKeyContinuityApplied ?? null,
+		continuity_evidence_id: inputs.continuityEvidenceId ?? null,
+		canonical_conversation_id: inputs.canonicalConversationId ?? null,
 		explicit_breakpoint_canary: inputs.explicitBreakpointCanary ?? null,
 		explicit_breakpoint_cohort_id: inputs.explicitBreakpointCohortId ?? null,
 		explicit_breakpoint_action: inputs.explicitBreakpointAction ?? null,

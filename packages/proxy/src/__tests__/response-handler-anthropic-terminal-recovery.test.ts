@@ -498,8 +498,12 @@ describe("forwardToClient SSE terminal-state propagation", () => {
 
 		try {
 			const requestId = "client-cancelled-request";
+			let sourceController:
+				| ReadableStreamDefaultController<Uint8Array>
+				| undefined;
 			const source = new ReadableStream<Uint8Array>({
 				start(controller) {
+					sourceController = controller;
 					controller.enqueue(bytes(terminalDelta));
 				},
 			});
@@ -524,13 +528,16 @@ describe("forwardToClient SSE terminal-state propagation", () => {
 				nativeAnthropicCtx(),
 			);
 
-			// Client disconnect — simulates user hitting Esc mid-response.
-			// We cancel the downstream reader directly and swallow any
-			// upstream-cancel rejection (the immediateStream source has
-			// already closed, so cancelling it surfaces "Invalid state" —
-			// irrelevant to the recording semantics we're testing).
+			// Client disconnect — simulates user hitting Esc mid-response. The
+			// classification fires synchronously inside cancel(), before the bounded
+			// raw-body drain settles. Close this hand-rolled source after that callback
+			// so this handler-level test does not wait for the production 30s drain
+			// deadline; the deadline/abort contract has dedicated unit coverage.
 			const reader = response.body?.getReader();
-			await reader.cancel("client disconnect").catch(() => undefined);
+			const cancellation = reader.cancel("client disconnect");
+			await new Promise((resolve) => setTimeout(resolve, 0));
+			sourceController?.close();
+			await cancellation.catch(() => undefined);
 			await new Promise((resolve) => setTimeout(resolve, 0));
 
 			// Find the end emitted with client_cancelled (the close path

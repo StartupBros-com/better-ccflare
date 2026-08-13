@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
+import type { Provider } from "@better-ccflare/providers";
 import type {
 	Account,
 	ComboFamily,
@@ -11,6 +12,9 @@ import type { ProxyContext } from "../handlers";
 import type { UsageCollector } from "../usage-collector";
 
 const { usageCache } = await import("@better-ccflare/providers");
+const { getProvider, registerProvider } = await import(
+	"@better-ccflare/providers"
+);
 const usageCollectorModule = await import("../usage-collector");
 const { handleProxy } = await import("../proxy");
 
@@ -51,6 +55,61 @@ function makeAccount(id: string): Account {
 		refresh_token_issued_at: null,
 		consecutive_rate_limits: 0,
 	};
+}
+
+function makeMockRoutingProvider(name: string): Provider {
+	return {
+		name,
+		canHandle: () => true,
+		refreshToken: async (account) => ({
+			accessToken: account.access_token || "mock-access-token",
+			expiresAt: Date.now() + 60 * 60 * 1000,
+			refreshToken: account.refresh_token || "mock-refresh-token",
+		}),
+		buildUrl: (_path, _search, account) =>
+			`https://upstream.test/${name}/${account?.id ?? "anonymous"}`,
+		prepareHeaders: (headers, accessToken, apiKey) => {
+			const prepared = new Headers(headers);
+			if (accessToken) prepared.set("authorization", `Bearer ${accessToken}`);
+			if (apiKey) prepared.set("x-api-key", apiKey);
+			return prepared;
+		},
+		transformRequestBody: async (request) => request,
+		processResponse: async (response) => response,
+		parseRateLimit: () => ({ isRateLimited: false, resetTime: null }),
+		isStreamingResponse: () => false,
+	};
+}
+
+function installMockRoutingProviders(names: readonly string[]): () => void {
+	const previous = names.map((name) => ({ name, provider: getProvider(name) }));
+	for (const name of names) registerProvider(makeMockRoutingProvider(name));
+	return () => {
+		for (const entry of previous) {
+			if (entry.provider) registerProvider(entry.provider);
+		}
+	};
+}
+
+function makeOpenRouterAccount(id: string): Account {
+	const account = makeAccount(id);
+	account.provider = "openrouter";
+	account.api_key = "openrouter-test-key";
+	account.refresh_token = "";
+	account.access_token = null;
+	account.custom_endpoint = "https://upstream.test/openrouter";
+	return account;
+}
+
+function makeCodexOAuthAccount(id: string): Account {
+	const account = makeAccount(id);
+	account.provider = "codex";
+	account.api_key = null;
+	account.refresh_token = "codex-test-refresh";
+	account.access_token = "codex-test-access";
+	account.expires_at = Date.now() + 60 * 60 * 1000;
+	account.custom_endpoint = null;
+	return account;
 }
 
 const originalFetch = globalThis.fetch;
@@ -1003,6 +1062,7 @@ describe("post-combo normal fallback", () => {
 			error: {
 				type: "rate_limit_error",
 				message: "insufficient credits",
+				code: "xai_402",
 			},
 		});
 		expect(ctx.dbOps.markAccountRateLimited).toHaveBeenCalledTimes(1);
@@ -1181,6 +1241,7 @@ describe("post-combo normal fallback", () => {
 			error: {
 				type: "rate_limit_error",
 				message: "retained predictive proof",
+				code: "xai_402",
 			},
 		});
 		expect(handleStart).toHaveBeenCalledTimes(1);
@@ -1189,5 +1250,141 @@ describe("post-combo normal fallback", () => {
 				.failoverAttempts,
 		).toBe(0);
 		expect(ctx.dbOps.markAccountRateLimited).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("implicit fallback policy integration", () => {
+	it("drains an OpenRouter API-key route across combo and normal fallback while preserving an OAuth sibling", async () => {
+		installUsageCollector();
+		const restoreProviders = installMockRoutingProviders([
+			"openrouter",
+			"codex",
+		]);
+		try {
+			const openRouter = makeOpenRouterAccount("openrouter-drained");
+			const oauthSibling = makeCodexOAuthAccount("oauth-sibling");
+			const combo: ComboWithSlots = {
+				id: "combo-openrouter-drain",
+				name: "OpenRouter drain",
+				description: null,
+				enabled: true,
+				created_at: 0,
+				updated_at: 0,
+				slots: [
+					{
+						id: "slot-openrouter-drain",
+						combo_id: "combo-openrouter-drain",
+						account_id: openRouter.id,
+						model: "claude-opus-4-5",
+						priority: 0,
+						enabled: true,
+					},
+				],
+			};
+			const ctx = makeContext(
+				[openRouter, oauthSibling],
+				combo,
+				(accounts) => accounts,
+			);
+			ctx.implicitFallbackPolicy = {
+				mode: "enforce",
+				allowedClasses: [],
+				deniedClasses: ["api-key"],
+			};
+
+			const upstreamUrls: string[] = [];
+			globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+				const request = input instanceof Request ? input : new Request(input);
+				upstreamUrls.push(request.url);
+				return new Response(JSON.stringify({ type: "message", content: [] }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}) as unknown as typeof fetch;
+
+			const request = makeProxyRequest("claude-opus-4-5", false);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+
+			expect(response.status).toBe(200);
+			expect(upstreamUrls).toEqual([
+				"https://upstream.test/codex/oauth-sibling",
+			]);
+			expect(upstreamUrls.some((url) => url.includes(openRouter.id))).toBe(
+				false,
+			);
+		} finally {
+			restoreProviders();
+		}
+	});
+
+	it("returns a zero-attempt terminal when every implicit candidate is policy-denied", async () => {
+		const restoreProviders = installMockRoutingProviders(["openrouter"]);
+		const previousPassthrough = process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
+		// The enforce policy must close the legacy passthrough escape hatch too;
+		// otherwise a paid route can still receive the request after selection
+		// reports policy_excluded.
+		process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL = "1";
+		try {
+			const openRouter = makeOpenRouterAccount("openrouter-only-denied");
+			const combo: ComboWithSlots = {
+				id: "combo-openrouter-only-denied",
+				name: "OpenRouter-only drain",
+				description: null,
+				enabled: true,
+				created_at: 0,
+				updated_at: 0,
+				slots: [
+					{
+						id: "slot-openrouter-only-denied",
+						combo_id: "combo-openrouter-only-denied",
+						account_id: openRouter.id,
+						model: "claude-opus-4-5",
+						priority: 0,
+						enabled: true,
+					},
+				],
+			};
+			const ctx = makeContext([openRouter], combo, (accounts) => accounts);
+			ctx.implicitFallbackPolicy = {
+				mode: "enforce",
+				allowedClasses: [],
+				deniedClasses: ["api-key"],
+			};
+			const upstreamFetch = mock(async () => {
+				throw new Error("policy-denied account must not reach upstream");
+			});
+			globalThis.fetch = upstreamFetch as unknown as typeof fetch;
+
+			const request = makeProxyRequest("claude-opus-4-5", false);
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			const payload = (await response.json()) as {
+				error?: {
+					attempted_routes?: number;
+					routing_diagnostics?: {
+						mode?: string;
+						structural_candidate_count?: number;
+						eligible_candidate_count?: number;
+						zero_attempt_reason?: string;
+					};
+				};
+			};
+
+			expect(response.status).toBe(503);
+			expect(upstreamFetch).not.toHaveBeenCalled();
+			expect(payload.error?.attempted_routes).toBe(0);
+			expect(payload.error?.routing_diagnostics).toMatchObject({
+				mode: "enforce",
+				structural_candidate_count: 1,
+				eligible_candidate_count: 0,
+				zero_attempt_reason: "policy_excluded",
+			});
+		} finally {
+			restoreProviders();
+			if (previousPassthrough === undefined) {
+				delete process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL;
+			} else {
+				process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL = previousPassthrough;
+			}
+		}
 	});
 });

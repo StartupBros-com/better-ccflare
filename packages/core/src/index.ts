@@ -20,7 +20,12 @@ export {
 	TIME_CONSTANTS,
 } from "./constants";
 export {
+	formatOAuthErrorMessage,
+	getExactOAuthErrorCode,
+	getOAuthErrorCode,
+	isExactInvalidGrantMessage,
 	isInvalidGrantMessage,
+	isStructuredInvalidGrant,
 	logError,
 	OAuthError,
 	OAuthRefreshTokenError,
@@ -33,6 +38,11 @@ export {
 	ValidationError,
 } from "./errors";
 export * from "./lifecycle";
+export {
+	type BoundedOAuthResponseText,
+	MAX_OAUTH_ERROR_INPUT_LENGTH,
+	readBoundedOAuthResponseText,
+} from "./oauth-response";
 
 // Export types for model mappings - defined inline in model-mappings.ts
 export type ModelMapping = { [anthropicModel: string]: string | string[] };
@@ -95,9 +105,11 @@ export {
 	uninstallOutboundProxy,
 } from "./outbound-proxy";
 export {
+	type CatalogueModelEntry,
 	estimateCostUSD,
 	getModelRates,
 	initializeNanoGPTPricingIfAccountsExist,
+	listCatalogueModels,
 	type ModelRates,
 	resetNanoGPTPricingCacheForTest,
 	setPricingLogger,

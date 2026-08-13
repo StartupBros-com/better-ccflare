@@ -613,13 +613,11 @@ describe("proxyWithAccount — immutable provider attempt plans", () => {
 			inputReplayMode: readonly string[];
 			outputReplayMode: readonly string[];
 		}> = [];
-		let refreshCalls = 0;
 		globalThis.fetch = mock(async () =>
 			jsonResponse({ error: "unexpected" }, 500),
 		);
 		const provider = makeAttemptPlanningProvider({
 			throwDuringPlanning: true,
-			onRefresh: () => refreshCalls++,
 			onPlan: (context) => {
 				const body = context.requestBodyBuffer
 					? (JSON.parse(
@@ -641,8 +639,8 @@ describe("proxyWithAccount — immutable provider attempt plans", () => {
 		const account = makeAccount({
 			provider: "attempt-plan-test",
 			api_key: null,
-			access_token: null,
-			expires_at: null,
+			access_token: "valid-access-token",
+			expires_at: Date.now() + 60 * 60 * 1000,
 			refresh_token: "refresh-token",
 		});
 		const bodyBuffer = makeRequestBody("source-model");
@@ -670,7 +668,9 @@ describe("proxyWithAccount — immutable provider attempt plans", () => {
 
 		expect(result).toBeNull();
 		expect(planningContexts).toEqual([]);
-		expect(refreshCalls).toBe(1);
+		// attempt-plan-test is intentionally outside the positive OAuth refresh
+		// allowlist: carrying a refresh_token alone must not opt a custom provider
+		// into a potentially destructive reactive token exchange.
 		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
 	});
 
@@ -2745,6 +2745,17 @@ describe("proxyWithAccount — 529 failover", () => {
 			{ status: 529, headers: { "content-type": "application/json" } },
 		);
 		expect(await isModelUnavailableError(response)).toBe(false);
+	});
+
+	it("isModelUnavailableError returns true for a top-level detail field naming an unsupported model (issue #393)", async () => {
+		const response = new Response(
+			JSON.stringify({
+				detail:
+					"The 'gpt-5.3-codex' model is not supported when using Codex with a ChatGPT account.",
+			}),
+			{ status: 400, headers: { "content-type": "application/json" } },
+		);
+		expect(await isModelUnavailableError(response)).toBe(true);
 	});
 });
 

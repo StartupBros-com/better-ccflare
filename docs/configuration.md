@@ -12,7 +12,10 @@ This guide covers all configuration options for better-ccflare, including file-b
 - [Service-Lifetime Cohort Seal](#service-lifetime-cohort-seal)
 - [Claude Code Model Route Profiles](#claude-code-model-route-profiles)
 - [Anthropic Degraded Mode](#anthropic-degraded-mode)
+- [Implicit Fallback Drain Policy](#implicit-fallback-drain-policy)
+- [Guard Request-Body and Admission Limits](#guard-request-body-and-admission-limits)
 - [Model Catalog](#model-catalog)
+- [Editable Provider Model Defaults](#editable-provider-model-defaults)
 - [Runtime Configuration API](#runtime-configuration-api)
 - [Example Configurations](#example-configurations)
 - [Auto-Fallback Setup](#auto-fallback-setup)
@@ -71,7 +74,7 @@ The configuration file is stored at:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `lb_strategy` | string | `"session"` | Load balancing strategy. Supported values are `"session"` (default), `"session-affinity"`, and `"least-used"`. Prefer a session-based strategy for OAuth accounts; per-request spreading can trigger provider anti-abuse systems |
+| `lb_strategy` | string | `"session"` | Load balancing strategy. Supported values are `"session"` (default), `"session-affinity"`, `"session-drain-soonest"`, and `"least-used"`. Prefer a session-based strategy for OAuth accounts; per-request spreading can trigger provider anti-abuse systems |
 | `client_id` | string | `"9d1c250a-e61b-44d9-88ed-5944d1962f5e"` | OAuth client ID for authentication |
 | `retry_attempts` | number | `3` | Maximum number of retry attempts for failed requests |
 | `retry_delay_ms` | number | `1000` | Initial delay in milliseconds between retry attempts |
@@ -81,12 +84,13 @@ The configuration file is stored at:
 
 ### Load Balancing Strategy
 
-⚠️ **WARNING**: Prefer `session` or `session-affinity` for Anthropic OAuth traffic because they preserve account stickiness. `least-used` can spread individual requests across accounts and may trigger Claude's anti-abuse systems; reserve it for providers and credentials where per-request balancing is safe.
+⚠️ **WARNING**: Prefer `session`, `session-affinity`, or the opt-in `session-drain-soonest` for Anthropic OAuth traffic because they preserve account stickiness. `least-used` can spread individual requests across accounts and may trigger Claude's anti-abuse systems; reserve it for providers and credentials where per-request balancing is safe. `session-drain-soonest` only changes fresh-session/failover ordering when a known future all-model weekly reset is available; it does not replace an existing client-affinity owner.
 
 | Strategy | Description | Use Case |
 |----------|-------------|----------|
 | `session` | Maintains client-account affinity for session duration, with automatic alignment to Anthropic OAuth usage window resets | Default and recommended - mimics natural usage patterns and optimizes resource utilization |
 | `session-affinity` | Maintains independent client-to-account affinity while preserving automatic failover and session expiry | Multiple concurrent clients that need sticky routing without sharing one global active account |
+| `session-drain-soonest` | Opt-in session-affinity variant that ranks fresh candidates by earliest known future all-model weekly reset, then priority/utilization; unknown or stale resets fail open | OAuth pools where weekly capacity should be consumed before it expires while preserving per-client/lane stickiness |
 | `least-used` | Orders available accounts by utilization rather than maintaining sticky OAuth sessions | API-key and compatible-provider pools where per-request spreading is explicitly acceptable |
 
 ### Logging Configuration (Environment Only)
@@ -146,12 +150,35 @@ These environment variables are not stored in the configuration file and must be
 | `CCFLARE_RATE_LIMIT_RESET_STABILITY_MS` | Window after which a clean streak resets the consecutive-429 counter | `300000` (5min) | `CCFLARE_RATE_LIMIT_RESET_STABILITY_MS=600000` |
 | `HEALTH_DETAIL_ENABLED` | Expose per-account status on `GET /health?detail=1` | `false` | `HEALTH_DETAIL_ENABLED=true` |
 | `CCFLARE_DISABLE_COMBO_SESSION_FALLBACK` | When enabled, combo-routed requests stop after every combo slot fails instead of falling through to normal SessionStrategy routing. This keeps explicit combo chains isolated, which is useful when combos intentionally separate provider pools (for example Anthropic-only Opus/Fable combos next to Codex-only Sonnet/Haiku combos). Disabled by default to preserve existing behavior | `false` | `CCFLARE_DISABLE_COMBO_SESSION_FALLBACK=true` |
+| `CCFLARE_IMPLICIT_FALLBACK_MODE` | Restart-scoped policy for implicit normal/combo fallback. `observe` reports what enforcement would exclude; `enforce` removes denied route classes. Explicit forced and capability-profile routes are outside this policy | `off` | `CCFLARE_IMPLICIT_FALLBACK_MODE=observe` |
+| `CCFLARE_IMPLICIT_FALLBACK_ALLOWED_CLASSES` | Comma-separated route classes that are explicit exceptions to the active denial set: `oauth-subscription`, `api-key`, `local`, or `cloud-credential` | empty | `CCFLARE_IMPLICIT_FALLBACK_ALLOWED_CLASSES=oauth-subscription,local` |
+| `CCFLARE_IMPLICIT_FALLBACK_DENIED_CLASSES` | Comma-separated route classes to deny for implicit fallback. In `observe`/`enforce`, `api-key` and `cloud-credential` are denied by default unless allowed explicitly | empty (plus active defaults) | `CCFLARE_IMPLICIT_FALLBACK_DENIED_CLASSES=api-key,cloud-credential` |
+| `GUARD_MAX_REQUEST_BODY_BYTES` | Maximum request body retained by the front guard before it returns a local 413. Limited requests acquire guard admission before body buffering | `4194304` (4 MiB) | `GUARD_MAX_REQUEST_BODY_BYTES=8388608` (8 MiB; hard max 16 MiB) |
+| `GUARD_MAX_BODY_READERS` | Maximum concurrent bounded request-body readers. This pool is separate from upstream permits so trickle uploads cannot monopolize provider concurrency; completed bodies retain a reader slot until an upstream permit is available | `8` (or `2 * GUARD_MAX_ACTIVE`, whichever is larger; hard max 256) | `GUARD_MAX_BODY_READERS=16` |
+| `GUARD_REQUEST_DRAIN_TIMEOUT_MS` | Maximum time the guard spends draining a rejected or oversized upload before it destroys the request socket. Prevents stalled clients from pinning file descriptors | `10000` (10s; range 1s-60s) | `GUARD_REQUEST_DRAIN_TIMEOUT_MS=5000` |
 | `BETTER_CCFLARE_DISCOVER_PLUGIN_AGENTS` | Discover agents distributed by Claude Code plugins (reads `~/.claude/plugins/installed_plugins.json`) | `false` | `BETTER_CCFLARE_DISCOVER_PLUGIN_AGENTS=true` |
 | `STORE_PAYLOADS` | Set to `false` to stop storing request/response bodies (token counts, cost, model, status, and timing are still recorded) | `true` | `STORE_PAYLOADS=false` |
 | `PAYLOAD_ENCRYPTION_KEY` | AES-256-GCM key encrypting `request_payloads` at rest. 64-char hex (32 bytes), generate with `openssl rand -hex 32`. Unset = plaintext storage. Losing the key makes encrypted rows unreadable; read once at process start (and per Bun worker), so rotation needs a re-encrypt migration (not yet built) | - (plaintext) | `PAYLOAD_ENCRYPTION_KEY=$(openssl rand -hex 32)` |
 | `CCFLARE_CODEX_PROMPT_CACHE_KEY` | Enabled by default: attach an OpenAI `prompt_cache_key` to converted Codex requests, per [OpenAI's prompt-caching guidance](https://platform.openai.com/docs/guides/prompt-caching) for GPT-5.6-family models. Only applies when the account's resolved endpoint is OpenAI's own `chatgpt.com` / `api.openai.com` — custom/self-hosted OpenAI-compatible endpoints and native Anthropic accounts are unaffected regardless of this setting. Set to `0` to opt out | `1` | `CCFLARE_CODEX_PROMPT_CACHE_KEY=0` |
 | `CCFLARE_CODEX_CACHE_KEY_MODE` | Cache key granularity when the above is enabled. `conversation` keys off session id + instructions + first input item, stable per conversation turn and distinct per subagent, so concurrent subagent fan-out does not thrash one OpenAI cache machine. `session` explicitly uses one coarse key per session, shared by all subagents in it. Independent of `LB_STRATEGY`/`SESSION_DURATION_MS`, which pick the upstream *account* for a session rather than the OpenAI-side cache key | `conversation` | `CCFLARE_CODEX_CACHE_KEY_MODE=session` |
 | `CCFLARE_CODEX_CACHE_KEY_SESSION_PERCENT` | Deterministic session-level canary percentage for comparing conversation and session cache-key modes on eligible OpenAI endpoints. Only unsigned base-10 integers are accepted; malformed values become `0`, and valid values above `100` clamp to `100`. `0` preserves conversation assignment, while `100` assigns every eligible session to session mode. An explicit `CCFLARE_CODEX_CACHE_KEY_MODE=session` still takes precedence | `0` | `CCFLARE_CODEX_CACHE_KEY_SESSION_PERCENT=10` |
+| `CCFLARE_CODEX_CACHE_KEY_CONTINUITY_PERCENT` | Default-off deterministic canary for reusing the bounded orchestration root cache identity across safe conversation continuations such as context compaction. Only unsigned base-10 integers are accepted; malformed values become `0`, and valid values above `100` clamp to `100`. Treatment requires conversation mode, an eligible official OpenAI/Codex endpoint, unchanged orchestration instructions, and validated overlapping `function_call`/`function_call_output` lineage. It never merges rejected siblings, attributed descendants, unrelated instructions, custom endpoints, or explicit session-mode traffic | `0` | `CCFLARE_CODEX_CACHE_KEY_CONTINUITY_PERCENT=10` |
+
+### Codex cache-key continuity rollout
+
+`CCFLARE_CODEX_CACHE_KEY_CONTINUITY_PERCENT` is intentionally independent of `CCFLARE_CODEX_CACHE_KEY_SESSION_PERCENT`: it changes only the conversation identity selected after the existing bounded orchestration election accepts a continuation. The default is `0`, so existing conversation-key behavior is unchanged. The election state is process-local, bounded, and cleared on restart; it is not a durable identity registry and does not authorize cache reuse from a read-only snapshot.
+
+The opt-in Codex JSONL trace records categorical continuity evidence plus whether the canonical identity was actually applied. `lineage_match` means validated continuity evidence was present; it does not by itself mean the canary selected the canonical cache key. A bounded `continuity_evidence_id` sequences those validated turns, while `canonical_conversation_id` is emitted only for applied treatment. The analyzer therefore keeps derived control compaction turns together, counts their key rotations, and reports rows by application (`canonical`, `derived`, or `unknown`), basis, safe model family, observed turn/gap band, cache-read and cache-write measurements, effective-key concentration, joined responses, and unknown measurements. It never adds prompts, instructions, raw call IDs, raw session UUIDs, credentials, or full cache keys to this provenance output. Existing legacy traces without schema-17 application fields remain readable but are conservatively classified as unknown.
+
+Use a staged rollout on naturally initiated, authorized Codex traffic:
+
+1. Keep the setting at `0` while collecting a baseline trace. Confirm trace joins are healthy and record the control's cache-read ratio, positive-hit rate, zero-hit count, and effective-key concentration.
+2. Enable a small deterministic treatment cohort, such as `10`, while retaining a permanent `0`-cohort control. Compare `lineage_match` continuations with `derived` conversation traffic by model and turn/gap band; require more cache reads without higher error/fallback rates or sibling-contamination evidence.
+3. Before expanding, confirm `keysOver15RequestsPerMinute` remains `0` for the continuity rows and that `maxRequestsPerKeyMinute` does not create a sustained hotspot. Treat missing or ambiguous joins and unavailable usage as unknown, not as cache misses.
+4. Expand only after the compacted-continuation evidence is consistently favorable. The setting does not change retry/rescue-key rotation, WebSocket identity, database schemas, or dashboard analytics.
+
+Rollback is fail-safe: set `CCFLARE_CODEX_CACHE_KEY_CONTINUITY_PERCENT=0` and restart the process. No migration or data cleanup is required; restart also clears the process-local continuity state. Do not validate this feature with scripted traffic against Anthropic-backed or Codex accounts; use focused fixtures or naturally initiated authorized traffic instead.
+
 | `CCFLARE_CODEX_WS_PERCENT` | Default-off deterministic percentage for the official ChatGPT-subscription Responses WebSocket canary. Assignment is stable per account and `prompt_cache_key`; both account and model allowlists below are also required | `0` | `CCFLARE_CODEX_WS_PERCENT=10` |
 | `CCFLARE_CODEX_WS_ACCOUNT_IDS` | Comma-separated exact account IDs eligible for the WebSocket canary. Empty means no accounts are eligible | empty | `CCFLARE_CODEX_WS_ACCOUNT_IDS=account-uuid` |
 | `CCFLARE_CODEX_WS_MODELS` | Comma-separated physical Codex model allowlist for the WebSocket canary, matched case-insensitively. Empty means no models are eligible | empty | `CCFLARE_CODEX_WS_MODELS=gpt-5.6-sol` |
@@ -165,6 +192,8 @@ These environment variables are not stored in the configuration file and must be
 | `CF_STREAM_USAGE_BUFFER_KB` | Stream usage buffer size in KB | `64` | `CF_STREAM_USAGE_BUFFER_KB=128` |
 | `CF_STREAM_TIMEOUT_MS` | Stream processing timeout in milliseconds | `60000` (1 minute) | `CF_STREAM_TIMEOUT_MS=120000` |
 | `BETTER_CCFLARE_OUTBOUND_PROXY` | Routes all outbound HTTP(S) traffic through a forward proxy | unset | `BETTER_CCFLARE_OUTBOUND_PROXY=http://127.0.0.1:3636` |
+| `CCFLARE_MODEL_DEFAULTS_PROVIDERS` | Comma-separated list of providers whose model-default map is editable via `POST /api/config/provider-model-defaults` and the dashboard's Advanced Settings card. Gates only the override *surface* — every provider's built-in factory map keeps translating models regardless | `codex` | `CCFLARE_MODEL_DEFAULTS_PROVIDERS=codex,xai,qwen` |
+| `CCFLARE_XAI_CACHE_NATIVE` | Opt-in: derive a privacy-safe conversation id from the client's Claude session id and attach it as `x-grok-conv-id` on requests to `api.x.ai`, with sticky account affinity so a conversation stays on the account owning its upstream cache partition. Byte-for-byte no-op when unset | unset (off) | `CCFLARE_XAI_CACHE_NATIVE=1` |
 
 ## Service-Lifetime Cohort Seal
 
@@ -410,6 +439,63 @@ The raw journal export still contains ephemeral join identities and must be prot
 
 Model-family capacity handling is integrated into account selection and does not require a standalone feature flag. Fresh Anthropic `limits[]` telemetry is interpreted by scope: exhausted `session` and `weekly_all` windows exclude the account, while an exhausted `weekly_scoped` row excludes only requests for the matching model family when paid overage is confirmed unavailable. Stale, malformed, unrelated, or incomplete scoped telemetry fails open, and observed upstream capacity responses provide short-lived reactive evidence while telemetry catches up.
 
+## Implicit Fallback Drain Policy
+
+The implicit fallback drain is a **restart-scoped** policy for ordinary and combo candidate selection. It is `off` by default. The process snapshots the policy at startup; changing an environment variable or config-file value does not hot-switch a running process. This documentation is an operator example and does not imply that any current live deployment has been changed.
+
+| Mode | Behavior |
+|---|---|
+| `off` | Preserve existing implicit normal/combo candidate admission and ordering. |
+| `observe` | Evaluate the policy and emit bounded diagnostics, but return the original candidates; no candidate order, provider send, response, or retry changes. Unknown route classes are observed but allowed. |
+| `enforce` | Remove denied route classes from implicit normal/combo candidates. Unknown route classes fail closed. If every implicit candidate is removed, selection ends locally with no provider attempt. |
+
+Route classes are derived from provider and credential shape, not from secret values:
+
+| Route class | Examples |
+|---|---|
+| `oauth-subscription` | Native subscription/OAuth credentials. |
+| `api-key` | API-key routes, including OpenRouter and compatible API providers. |
+| `local` | Local Ollama routes. |
+| `cloud-credential` | Cloud-credential routes such as Bedrock or Vertex AI. |
+
+`CCFLARE_IMPLICIT_FALLBACK_ALLOWED_CLASSES` and `CCFLARE_IMPLICIT_FALLBACK_DENIED_CLASSES` accept comma-separated, case-insensitive class names (duplicates are ignored). In an active mode, the conservative default denial set is `api-key,cloud-credential`; an allowed class removes that class from the denial set, and a denied class adds to it. The allowed list is therefore an exception list, not an exclusive allowlist. Malformed modes or class names resolve the entire policy to the built-in `off` policy and write a warning. The equivalent file fields are `implicit_fallback_mode`, `implicit_fallback_allowed_classes`, and `implicit_fallback_denied_classes`; environment values win per field.
+
+The policy applies only to **implicit** normal and combo fallback. An explicit `x-better-ccflare-account-id` route, an exact model route profile, and a capability model route profile retain their own fail-closed admission and bypass this drain policy. This lets an operator stop accidental OpenRouter/API-key spillover while preserving intentional, explicitly selected routes.
+
+### Safe production activation example
+
+For a deployment that should keep OAuth and local routes in the implicit pool while excluding OpenRouter/API-key and cloud-credential spillover, stage `observe` first, then use `enforce` after reviewing the bounded diagnostics. The following shell values are illustrative; apply them to the service environment and restart the service for each mode change:
+
+```sh
+# Stage first: no routing behavior changes, only policy observations.
+export CCFLARE_IMPLICIT_FALLBACK_MODE=observe
+export CCFLARE_IMPLICIT_FALLBACK_ALLOWED_CLASSES=oauth-subscription,local
+export CCFLARE_IMPLICIT_FALLBACK_DENIED_CLASSES=api-key,cloud-credential
+
+# After review, switch the same environment to:
+# export CCFLARE_IMPLICIT_FALLBACK_MODE=enforce
+```
+
+OpenRouter accounts classify as `api-key` and are consequently excluded from **implicit** fallback in the enforced example. OAuth and local accounts remain eligible. An explicit force route or capability profile can still select its declared route by design.
+
+### Monitoring, guardrails, and rollback
+
+After an activation restart, inspect the service journal for the rate-limited terms `Implicit fallback policy` (candidate counts by `normal`/`combo` lane) and `Routing selection terminal diagnostics` (selection-terminal counts and reason). Sample route-unavailable responses for the bounded `error.routing_diagnostics` object described in [Account Routing Architecture](./routing-architecture.md#selection-diagnostics). Do not treat a policy observation as proof that a provider was contacted: `attempted_routes: 0` means selection ended before any provider attempt.
+
+The front guard exposes its effective body limit and bounded counters at `GET /_guard/health`; monitor `maxRequestBodyBytes`, `maxBodyReaders`, `requestDrainTimeoutMs`, `active`, `queued`, `bodyReaders`, `draining`, and `counters.oversizedRequestBodies`/`counters.requestDrainTimeouts`. Useful journal terms are `guard_request_body_too_large`, `guard_request_drain_timeout`, `guard_queue_full`, `guard_body_reader_queue_full`, `guard_admission_error`, and `guard_draining`. These records contain bounded metadata only; request bodies and credentials are not logged.
+
+To roll back the drain, set `CCFLARE_IMPLICIT_FALLBACK_MODE=off` in the service environment and **restart** the process (run `systemctl daemon-reload` first if a systemd drop-in changed). Restarting clears the process-local policy snapshot and diagnostics; it does not alter account data or current production state outside that restart.
+
+## Guard Request-Body and Admission Limits
+
+`GUARD_MAX_REQUEST_BODY_BYTES` bounds the body buffer used by the local front guard. The default is **4 MiB** (`4,194,304` bytes); values may be lowered to 1 KiB, but the hard maximum is **16 MiB** (`16,777,216` bytes). Invalid or out-of-range values prevent an unbounded override. A declared `Content-Length` above the limit is rejected before buffering. Chunked or misleading uploads are counted as bytes arrive and are stopped at the same limit; the guard drains the remainder so keep-alive parsing stays synchronized. The client receives `413` with error type `guard_request_body_too_large`.
+
+The limit applies to every guarded request body. For limited inference paths (`/v1/messages` except `count_tokens`, and `/v1/complete`), the guard first reserves fair admission **before** attaching body listeners or buffering bytes. It then releases the upstream permit while the bounded body-reader pool handles the upload, so a slow client cannot consume provider concurrency. A completed body keeps its body-reader slot until it acquires an upstream permit; this bounds retained body buffers while preserving fair upstream ordering. Queue-full, shutdown, and abort decisions therefore happen before an unadmitted request can consume an aggregate body buffer. Other paths still receive the body-size bound but do not consume a limited-path admission slot.
+
+Rejected, oversized, invalid-target, and shutdown uploads are drained only for the configured drain window (`GUARD_REQUEST_DRAIN_TIMEOUT_MS`). If the client does not finish, the guard destroys that request socket and emits `guard_request_drain_timeout`; this prevents a stalled peer from pinning a keep-alive connection or file descriptor indefinitely. The effective body-reader count, queue, and timeout appear in `/_guard/health` and in the `runtime.limits` object.
+
+The effective limit is restart-scoped in the guard process. Confirm it after restart in `/_guard/health` (`maxRequestBodyBytes` and `runtime.limits.maxRequestBodyBytes`) and correlate 413s with `guard_request_body_too_large` and `counters.oversizedRequestBodies`; no request content is retained in these diagnostics.
+
 ## Outbound Proxy
 
 better-ccflare can route all of its outbound HTTP(S) traffic — provider requests, OAuth flows, usage polling, and webhooks — through an explicit forward proxy using HTTP CONNECT. This is useful for enterprises that want every egress connection from better-ccflare to pass through a security/inspection proxy.
@@ -525,6 +611,22 @@ Any successful `GET /v1/models` response proxied through better-ccflare from a c
 
 If no live fetch has ever succeeded (fresh install, no eligible account, or `BETTER_CCFLARE_MODELS_OFFLINE=1`), `GET /api/models` serves a static list bundled with better-ccflare (`CLAUDE_MODEL_IDS` in `packages/core/src/models.ts`). Its response reports `source: "fallback"` and a `fetchedAt` timestamp equal to the bundled list's snapshot date (`BUNDLED_MODELS_AS_OF`), not the current time — this is an intentional, honest "as of `<date>`" provenance rather than a `Date.now()` that would misleadingly imply the list was just fetched. The dashboard surfaces this distinction next to the model catalog's refresh button ("Live model list · fetched ..." vs. "Bundled model list · as of ...").
 
+## Editable Provider Model Defaults
+
+When a request has no combo-slot model and no account-level model mapping, better-ccflare falls back to a per-provider, per-family default model map. For most providers that map is compiled in; for Codex it's derived live from the account's own model listing (`chatgpt.com/backend-api/codex/models`), since the compiled guess (`gpt-5.3-codex` for opus/sonnet) 400s on ChatGPT-subscription accounts that don't support it.
+
+Resolution order:
+
+```
+combo slot model -> account.model_mappings -> global override -> account listing (Codex only) -> factory map
+```
+
+The **global override** is an editable layer in between: an operator-set default per provider+family that applies when no combo slot or account mapping specifies a model. It's stored in the config file, applied via an in-memory registry populated at boot and refreshed on every `POST`, and takes effect immediately — no restart required. Overrides are merged per family, so setting `codex.opus` never clears `codex.haiku`. Setting a family to an empty string removes its override rather than mapping it to an empty model.
+
+Only `codex` is editable by default. `xai` and `qwen` use the same mechanism but are gated behind `CCFLARE_MODEL_DEFAULTS_PROVIDERS` (see [Additional Environment Variables](#additional-environment-variables)) since they haven't been exercised against real accounts as extensively. Disabling a provider doesn't discard its stored override — it just stops applying until the provider is re-enabled.
+
+Manage this via the dashboard (Settings → Advanced → Provider Model Defaults) or directly through the API — see [api-http.md](api-http.md#get-apiconfigprovider-model-defaults).
+
 ## Runtime Configuration API
 
 Some configuration values can be updated at runtime through the HTTP API without restarting the server.
@@ -584,10 +686,14 @@ GET /api/strategies
 
 Response:
 ```json
-["session"]
+["session", "least-used", "session-affinity", "session-drain-soonest"]
 ```
 
-⚠️ **NOTE**: Only the `"session"` strategy is available in better-ccflare. Other strategies (round-robin, least-requests, weighted) have been removed from the codebase as they can trigger Claude's anti-abuse systems and result in account bans.
+The `session-drain-soonest` strategy is opt-in. It preserves the current
+session-affinity owner and route/profile class; only a fresh assignment or
+account failover can use a known future `weekly_all`/`seven_day` reset to rank
+candidates. Missing, malformed, or past reset telemetry falls back to the
+ordinary affinity ranking.
 
 ### Runtime Update Behavior
 
@@ -825,7 +931,9 @@ If migrating from environment variables to file-based configuration:
 
 1. **Configuration location**: Move from `~/.better-ccflare/config.json` to platform-specific paths
 2. **Field naming**: Update any deprecated field names (none currently deprecated)
-3. **Strategy names**: Only `"session"` strategy is available (must be lowercase)
+3. **Strategy names**: Use one of the supported lowercase values: `"session"`,
+   `"least-used"`, `"session-affinity"`, or the opt-in
+   `"session-drain-soonest"`.
 
 ### Configuration Backup
 
