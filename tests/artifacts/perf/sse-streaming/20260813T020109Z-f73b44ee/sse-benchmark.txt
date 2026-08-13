@@ -1,0 +1,42 @@
+SSE resource-limit benchmark (informational only; no thresholds, never exits non-zero on measured numbers).
+Policy caps in effect: SSE_TRANSPORT_FRAME_MAX_BYTES=4194304, SSE_TRANSPORT_TAIL_MAX_BYTES=4194304, TOOL_ARGUMENTS_PER_CALL_MAX_BYTES=65536, TOOL_ARGUMENTS_TOTAL_MAX_BYTES=65536, TRANSLATED_OUTPUT_TOTAL_MAX_BYTES=4194304
+Matrix: translators=[codex,responses-adapter] frameShapes=[incident-110079b,near-4mib] chunkShapes=[whole-frame,64kib,256b] concurrency=[1,12,24] waves=5
+
+translator         frame             chunking     concurrency  median ms  median MB/s  peak heap delta MiB  settled heap delta MiB
+-----------------  ----------------  -----------  -----------  ---------  -----------  -------------------  ----------------------
+codex              incident-110079b  whole-frame  1            0.7        146.5        0.0                  0.0
+codex              incident-110079b  whole-frame  12           3.1        403.2        0.0                  0.0
+codex              incident-110079b  whole-frame  24           5.2        482.1        0.0                  0.0
+codex              incident-110079b  64kib        1            0.5        196.8        0.0                  0.0
+codex              incident-110079b  64kib        12           2.4        527.5        0.0                  0.0
+codex              incident-110079b  64kib        24           5.3        481.0        0.0                  0.0
+codex              incident-110079b  256b         1            1.0        100.7        0.0                  0.0
+codex              incident-110079b  256b         12           8.1        155.2        0.0                  0.0
+codex              incident-110079b  256b         24           18.9       134.0        3.4                  3.4
+codex              near-4mib         whole-frame  1            9.7        393.0        24.7                 24.7
+codex              near-4mib         whole-frame  12           109.4      418.4        72.3                 72.3
+codex              near-4mib         whole-frame  24           215.4      425.1        313.0                313.0
+codex              near-4mib         64kib        1            8.2        467.1        17.1                 17.1
+codex              near-4mib         64kib        12           99.4       460.4        137.5                137.5
+codex              near-4mib         64kib        24           201.5      454.3        389.5                389.5
+codex              near-4mib         256b         1            28.0       136.1        14.0                 14.0
+codex              near-4mib         256b         12           387.9      118.0        254.5                254.5
+codex              near-4mib         256b         24           886.3      103.3        372.3                372.3
+responses-adapter  incident-110079b  whole-frame  1            1.0        103.6        0.0                  0.0
+responses-adapter  incident-110079b  whole-frame  12           7.1        178.8        14.9                 14.9
+responses-adapter  incident-110079b  whole-frame  24           16.3       155.2        38.8                 38.8
+responses-adapter  incident-110079b  64kib        1            0.6        169.3        0.0                  0.0
+responses-adapter  incident-110079b  64kib        12           7.3        173.3        12.4                 12.4
+responses-adapter  incident-110079b  64kib        24           12.6       201.0        33.1                 33.1
+responses-adapter  incident-110079b  256b         1            1.1        99.5         0.0                  0.0
+responses-adapter  incident-110079b  256b         12           11.1       113.6        5.9                  5.9
+responses-adapter  incident-110079b  256b         24           27.0       93.7         36.8                 36.8
+responses-adapter  near-4mib         whole-frame  1            27.7       137.9        61.8                 61.8
+responses-adapter  near-4mib         whole-frame  12           345.0      132.7        473.6                473.6
+responses-adapter  near-4mib         whole-frame  24           658.8      139.0        1423.4               1423.4
+responses-adapter  near-4mib         64kib        1            18.2       209.2        60.1                 60.1
+responses-adapter  near-4mib         64kib        12           217.4      210.6        454.8                454.8
+responses-adapter  near-4mib         64kib        24           770.3      118.9        1523.7               1523.7
+responses-adapter  near-4mib         256b         1            56.7       67.3         55.4                 55.4
+responses-adapter  near-4mib         256b         12           872.8      52.5         874.9                874.9
+responses-adapter  near-4mib         256b         24           1818.9     50.3         1478.1               1478.1
