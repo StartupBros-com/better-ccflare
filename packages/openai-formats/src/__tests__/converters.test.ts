@@ -936,6 +936,18 @@ describe("convertOpenAIResponseToAnthropic — error cases", () => {
 		});
 	});
 
+	it("bounds non-stream upstream error type and message", () => {
+		const result = convertOpenAIResponseToAnthropic({
+			error: {
+				type: "permission error\nforged-log-line",
+				message: "x".repeat(2_000),
+			},
+		});
+
+		expect(result.error?.type).toBe("api_error");
+		expect(result.error?.message).toBe("x".repeat(1_024));
+	});
+
 	it("returns error when choices array is missing", () => {
 		// Intentionally malformed input (missing model/usage) to exercise the
 		// invalid-response path — the cast bypasses OpenAIResponse's shape on purpose.
