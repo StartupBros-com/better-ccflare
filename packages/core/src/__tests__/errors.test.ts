@@ -66,6 +66,7 @@ describe("formatOAuthErrorMessage", () => {
 	});
 });
 
+
 describe("isInvalidGrantMessage", () => {
 	it("matches the terminal OAuth markers (case-insensitive)", () => {
 		const positives = [

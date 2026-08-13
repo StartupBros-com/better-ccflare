@@ -398,6 +398,7 @@ describe("pauseAccountForReauthIfInvalidGrant", () => {
 		expect(dbOps.pauseAccountIfActive).not.toHaveBeenCalled();
 	});
 
+
 	it("does not publish when another writer wins the pause guard", async () => {
 		const dbOps = makeDbOps(false);
 		const account = {
