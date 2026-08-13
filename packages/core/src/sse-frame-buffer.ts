@@ -206,10 +206,7 @@ export class SseFrameBuffer {
 		}
 		// See the `carry` field comment: this is last3(parts.join("")),
 		// computed without ever joining `parts`.
-		this.carry =
-			frames.length > 0
-				? remainder.slice(-3)
-				: (this.carry + decoded).slice(-3);
+		this.carry = frames.length > 0 ? remainder.slice(-3) : searchText.slice(-3);
 
 		if (this.tailBytes > this.maxBufferBytes) {
 			throw new SseLimitError(
