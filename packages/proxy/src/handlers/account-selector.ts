@@ -48,6 +48,7 @@ import {
 } from "../server-tool-routing-errors";
 import { buildComboMembershipDiagnostics } from "./managed-routing-diagnostics";
 import type { ProxyContext } from "./proxy-types";
+import { boundedRoutingSelectionCount } from "./routing-selection-diagnostics";
 import {
 	evaluateHardCapacity,
 	getWeeklyQuotaPressure,
@@ -1475,16 +1476,6 @@ export function isImplicitFallbackAccountAllowed(
 	policy: ImplicitFallbackPolicyConfig,
 ): boolean {
 	return evaluateImplicitFallbackPolicy(account, policy).allowed;
-}
-
-const MAX_ROUTING_SELECTION_DIAGNOSTIC_COUNT = 1_000_000;
-
-function boundedRoutingSelectionCount(value: number): number {
-	if (!Number.isFinite(value)) return 0;
-	return Math.min(
-		MAX_ROUTING_SELECTION_DIAGNOSTIC_COUNT,
-		Math.max(0, Math.floor(value)),
-	);
 }
 
 function setImplicitFallbackSelectionDiagnostics(

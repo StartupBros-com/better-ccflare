@@ -13,6 +13,7 @@ import { sanitizeAnthropicRetryAfterSeconds } from "../anthropic-degraded-mode";
 import type { RoutingCapacityContext } from "./account-selector";
 import type { RequestRateLimitOutcome } from "./rate-limit-scope";
 import type { HostedDispatchState } from "./routing-attempt-ledger";
+import { boundedRoutingSelectionCount } from "./routing-selection-diagnostics";
 
 const PROTECTED_ANTHROPIC_RETRY_CONFIG = Object.freeze({
 	retryMinMs: 5_000,
@@ -69,16 +70,6 @@ export interface RoutingTerminalOptions {
 	readonly hostedDispatchState?: HostedDispatchState;
 }
 
-const MAX_ROUTING_SELECTION_DIAGNOSTIC_COUNT = 1_000_000;
-
-function boundedDiagnosticCount(value: number): number {
-	if (!Number.isFinite(value)) return 0;
-	return Math.min(
-		MAX_ROUTING_SELECTION_DIAGNOSTIC_COUNT,
-		Math.max(0, Math.floor(value)),
-	);
-}
-
 function serializeRoutingSelectionDiagnostics(
 	diagnostics: RoutingSelectionDiagnostics,
 ): Record<string, unknown> {
@@ -95,16 +86,16 @@ function serializeRoutingSelectionDiagnostics(
 			: "no_eligible_candidates";
 	return {
 		mode,
-		structural_candidate_count: boundedDiagnosticCount(
+		structural_candidate_count: boundedRoutingSelectionCount(
 			diagnostics.structuralCandidateCount,
 		),
-		eligible_candidate_count: boundedDiagnosticCount(
+		eligible_candidate_count: boundedRoutingSelectionCount(
 			diagnostics.eligibleCandidateCount,
 		),
-		excluded_candidate_count: boundedDiagnosticCount(
+		excluded_candidate_count: boundedRoutingSelectionCount(
 			diagnostics.excludedCandidateCount,
 		),
-		selected_candidate_count: boundedDiagnosticCount(
+		selected_candidate_count: boundedRoutingSelectionCount(
 			diagnostics.selectedCandidateCount,
 		),
 		zero_attempt_reason: zeroAttemptReason,
