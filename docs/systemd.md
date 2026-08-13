@@ -158,6 +158,16 @@ opens. That keeps systemd from reporting an active service while the proxy and
 guard children are stopped; `Restart=on-failure` and the `StartLimit*` bounds
 own the outer recovery budget.
 
+For unexpected child failures, `scripts/run-ccflare-stack.sh` uses a separate
+aggregate cleanup budget: `RUNNER_FAILURE_STOP_BUDGET_MS` defaults to 30 seconds
+and is bounded to 1--120 seconds. It limits how long a stubborn child can delay
+the next restart or circuit decision. This budget applies only to failure
+cleanup; an intentional TERM/INT keeps the full `GUARD_SHUTDOWN_GRACE_MS` plus
+its cushion (605 seconds with the defaults) so in-flight requests can drain.
+The runner logs both budgets at startup and when the guard starts. Operators
+may override the failure budget in the service environment, but should keep it
+below the systemd `StartLimitIntervalSec` window.
+
 Without the preflight script, an invalid `BUN_JSC_*` variable would burn through all 5 restart attempts in ~25 seconds, causing total proxy downtime until an operator notices.
 
 ## Common Pitfalls

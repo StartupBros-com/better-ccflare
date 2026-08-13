@@ -245,6 +245,14 @@ LimitNPROC=4096
 WantedBy=multi-user.target
 EOF
 
+When this unit is backed by `scripts/run-ccflare-stack.sh`, unexpected child
+failures use the runner's bounded aggregate cleanup setting
+`RUNNER_FAILURE_STOP_BUDGET_MS` (30,000 ms by default; hard maximum 120,000 ms).
+It is failure-only: an operator `TERM`/`INT` still receives the full guard
+shutdown grace and cushion so active requests can drain. Keep the failure
+budget below the unit's `StartLimitIntervalSec` window and verify the runner's
+startup log reports both budgets after changing the environment.
+
 # Create user and directories
 sudo useradd -r -s /bin/false better-ccflare
 sudo mkdir -p /opt/better-ccflare/{config,data/logs}

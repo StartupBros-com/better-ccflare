@@ -183,6 +183,7 @@ render_systemd_pin() {
 		printf 'Environment=%s\n' "GUARD_MAX_RECOVERY_SLEEP_MS=$max_recovery_sleep_ms"
 		printf 'Environment=%s\n' "GUARD_MAX_RECOVERY_WAITS=$max_recovery_waits"
 		printf 'Environment=%s\n' "GUARD_SHUTDOWN_GRACE_MS=$shutdown_grace_ms"
+		printf '%s\n' "Environment=RUNNER_FAILURE_STOP_BUDGET_MS=30000"
 		printf 'KillMode=%s\n' "$kill_mode"
 		printf 'TimeoutStopSec=%s\n' "$stop_timeout"
 		printf 'Restart=%s\n' "$restart"
@@ -579,7 +580,7 @@ validate_effective_systemd_policy() {
 	local service="$1" allow_missing_new_guard_limits=0
 	local kill_mode stop_timeout restart restart_sec restart_prevent_exit_status
 	local start_limit_interval start_limit_burst effective_environment effective_deadline_ms
-	local effective_retry_attempt_headroom_ms effective_max_recovery_sleep_ms effective_shutdown_grace_ms effective_max_recovery_waits
+	local effective_retry_attempt_headroom_ms effective_max_recovery_sleep_ms effective_shutdown_grace_ms effective_max_recovery_waits effective_failure_stop_budget_ms
 	local stop_timeout_usec restart_sec_usec start_limit_interval_usec stop_timeout_ms
 	local minimum_stop_timeout_usec
 	local minimum_start_limit_interval_usec=300000000 minimum_restart_sec_usec=5000000
@@ -651,6 +652,23 @@ validate_effective_systemd_policy() {
 		echo "effective systemd environment is missing GUARD_SHUTDOWN_GRACE_MS" >&2
 		return 1
 	}
+	if ! effective_failure_stop_budget_ms="$(
+		systemd_environment_text_value "$effective_environment" RUNNER_FAILURE_STOP_BUDGET_MS
+	)"; then
+		if [[ "$allow_missing_new_guard_limits" == "1" ]]; then
+			# Pins created before the failure-cleanup budget was deploy-owned may be
+			# restored during rollback; validate them against the safe default.
+			effective_failure_stop_budget_ms=30000
+		else
+			echo "effective systemd environment is missing RUNNER_FAILURE_STOP_BUDGET_MS" >&2
+			return 1
+		fi
+	fi
+	if [[ ! "$effective_failure_stop_budget_ms" =~ ^[1-9][0-9]{0,5}$ ]] \
+		|| ((effective_failure_stop_budget_ms > 120000)); then
+		echo "unsafe effective RUNNER_FAILURE_STOP_BUDGET_MS=${effective_failure_stop_budget_ms}; expected 1..120000ms" >&2
+		return 1
+	fi
 
 	if [[ "$kill_mode" != "mixed" ]]; then
 		echo "effective KillMode=${kill_mode}; expected mixed" >&2
@@ -710,6 +728,7 @@ validate_effective_systemd_policy() {
 		"$effective_shutdown_grace_ms" \
 		"$effective_max_recovery_waits" \
 		"$stop_timeout_ms"
+	printf 'runner_failure_stop_budget_ms=%s\n' "$effective_failure_stop_budget_ms"
 }
 
 reload_validate_or_restore_systemd_policy() {

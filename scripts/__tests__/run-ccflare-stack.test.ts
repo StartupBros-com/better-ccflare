@@ -105,6 +105,37 @@ function writeGuardExitFixture(
 	return programs;
 }
 
+function writeStubbornGuardFixture(dir: string): {
+	upstream: string;
+	guard: string;
+} {
+	const programs = writeFixturePrograms(dir);
+	writeFileSync(
+		programs.upstream,
+		[
+			"#!/usr/bin/env node",
+			'import http from "node:http";',
+			'const portIndex = process.argv.indexOf("--port");',
+			"const port = Number(process.argv[portIndex + 1]);",
+			"const server = http.createServer((_req, res) => { res.writeHead(200); res.end('{}'); });",
+			"server.listen(port, '127.0.0.1', () => setTimeout(() => server.close(() => process.exit(42)), 300));",
+		].join("\n"),
+	);
+	writeFileSync(
+		programs.guard,
+		[
+			'import http from "node:http";',
+			"const server = http.createServer((_req, res) => { res.writeHead(200); res.end('{}'); });",
+			"server.listen(Number(process.env.GUARD_PORT), '127.0.0.1');",
+			"// This fixture deliberately ignores TERM so failure cleanup must enforce its short budget.",
+			"process.on('SIGTERM', () => {});",
+		].join("\n"),
+	);
+	chmodSync(programs.upstream, 0o755);
+	chmodSync(programs.guard, 0o755);
+	return programs;
+}
+
 function writeStableFixturePrograms(dir: string): {
 	upstream: string;
 	guard: string;
@@ -384,6 +415,40 @@ describe("run-ccflare-stack supervisor lifecycle", () => {
 			expect(new Set(secrets).size).toBe(3);
 		},
 		10_000,
+	);
+
+	test(
+		"bounds failure cleanup when the guard ignores TERM without shortening intentional stop grace",
+		async () => {
+			const fixtureDir = tempDir("ccflare-stack-stubborn-guard-fixture-");
+			const programs = writeStubbornGuardFixture(fixtureDir);
+			const runner = await spawnRunner(programs, {
+				RUNNER_FAILURE_STOP_BUDGET_MS: "120",
+				RUNNER_RESTART_BACKOFF_BASE_MS: "0",
+				RUNNER_RESTART_BACKOFF_MAX_MS: "0",
+				RUNNER_RESTART_MAX_FAILURES: "1",
+				RUNNER_RESTART_WINDOW_MS: "1000",
+			});
+			const startedAt = Date.now();
+			const result = await waitForExit(runner.child, 3_000);
+			const elapsedMs = Date.now() - startedAt;
+			const output = runner.getOutput();
+
+			expect(result.code).toBe(1);
+			expect(result.signal).toBeNull();
+			expect(elapsedMs).toBeLessThan(1_500);
+			expect(output.stdout).toContain(
+				"failure_cleanup_budget_ms=120",
+			);
+			const forcedStop = output.stdout.match(
+				/did not stop after (\d+)ms; sending SIGKILL/,
+			);
+			expect(forcedStop).not.toBeNull();
+			expect(Number(forcedStop?.[1])).toBeLessThanOrEqual(120);
+			expect(output.stdout).toContain("restart circuit open");
+			expect(output.stdout).toContain("intentional_stop_budget_ms=605000");
+		},
+		8_000,
 	);
 
 	test(
