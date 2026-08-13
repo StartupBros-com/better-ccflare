@@ -198,25 +198,25 @@ describe("OrchestrationElectionStore", () => {
 		const store = createStore();
 		expect(
 			store.admit("session", "conversation-a", "instructions", []),
-		).toEqual({
+		).toMatchObject({
 			admission: "root",
 			basis: "initial_claim",
 		});
 		expect(
 			store.admit("session", "conversation-b", "instructions", []),
-		).toEqual({
+		).toMatchObject({
 			admission: "non_root",
 			basis: "rejected",
 		});
 		expect(
 			store.admit("session", "conversation-a", "instructions", []),
-		).toEqual({
+		).toMatchObject({
 			admission: "root",
 			basis: "identity_match",
 		});
 		expect(
 			store.admit("session", "conversation-b", "instructions", []),
-		).toEqual({
+		).toMatchObject({
 			admission: "non_root",
 			basis: "rejected",
 		});
@@ -331,7 +331,7 @@ describe("OrchestrationElectionStore lineage continuity", () => {
 				ORCHESTRATOR_INSTRUCTIONS,
 				firstTurnInput,
 			),
-		).toEqual({ admission: "root", basis: "initial_claim" });
+		).toMatchObject({ admission: "root", basis: "initial_claim" });
 
 		// Compaction drops the earliest input item, keeps the tail (still
 		// carrying call_id "c1"), and appends a fresh turn. Same session, same
@@ -354,7 +354,7 @@ describe("OrchestrationElectionStore lineage continuity", () => {
 				ORCHESTRATOR_INSTRUCTIONS,
 				compactedInput,
 			),
-		).toEqual({ admission: "root", basis: "lineage_match" });
+		).toMatchObject({ admission: "root", basis: "lineage_match" });
 
 		// The accepted new identity is now also a recognized alias, and the
 		// lastActiveAt was renewed by the accepted call.
@@ -364,6 +364,62 @@ describe("OrchestrationElectionStore lineage continuity", () => {
 			compactedConversationId,
 		]);
 		expect(snapshot?.lastActiveAt).toBe(now);
+	});
+
+	test("returns the stable canonical identity for accepted admissions and null for rejection", () => {
+		const store = createStore();
+		const firstTurnInput = [
+			userTurn("start the task"),
+			functionCall("c1"),
+			functionCallOutput("c1"),
+		];
+		const rootConversationId = deriveConversationIdentity(
+			ORCHESTRATOR_SESSION_ID,
+			ORCHESTRATOR_INSTRUCTIONS,
+			firstTurnInput,
+		) as string;
+
+		const initial = store.admit(
+			ORCHESTRATOR_SESSION_ID,
+			rootConversationId,
+			ORCHESTRATOR_INSTRUCTIONS,
+			firstTurnInput,
+		);
+		expect(initial).toMatchObject({
+			admission: "root",
+			basis: "initial_claim",
+			canonicalConversationIdentity: rootConversationId,
+		});
+
+		const compactedInput = [...firstTurnInput.slice(1), userTurn("continue")];
+		const compactedConversationId = deriveConversationIdentity(
+			ORCHESTRATOR_SESSION_ID,
+			ORCHESTRATOR_INSTRUCTIONS,
+			compactedInput,
+		) as string;
+		const lineageMatch = store.admit(
+			ORCHESTRATOR_SESSION_ID,
+			compactedConversationId,
+			ORCHESTRATOR_INSTRUCTIONS,
+			compactedInput,
+		);
+		expect(lineageMatch).toMatchObject({
+			admission: "root",
+			basis: "lineage_match",
+			canonicalConversationIdentity: rootConversationId,
+		});
+
+		const rejected = store.admit(
+			ORCHESTRATOR_SESSION_ID,
+			"unrelated-conversation",
+			"different instructions",
+			[userTurn("unrelated")],
+		);
+		expect(rejected).toMatchObject({
+			admission: "non_root",
+			basis: "rejected",
+			canonicalConversationIdentity: null,
+		});
 	});
 
 	test("rejects a changed identity with no lineage at all", () => {
@@ -399,7 +455,7 @@ describe("OrchestrationElectionStore lineage continuity", () => {
 				ORCHESTRATOR_INSTRUCTIONS,
 				otherInput,
 			),
-		).toEqual({ admission: "non_root", basis: "rejected" });
+		).toMatchObject({ admission: "non_root", basis: "rejected" });
 	});
 
 	test("rejects a changed identity with matching lineage but changed instructions", () => {
@@ -436,7 +492,7 @@ describe("OrchestrationElectionStore lineage continuity", () => {
 				"different instructions",
 				compactedInput,
 			),
-		).toEqual({ admission: "non_root", basis: "rejected" });
+		).toMatchObject({ admission: "non_root", basis: "rejected" });
 	});
 
 	test("rejects a changed identity with matching instructions but unrelated lineage", () => {
@@ -477,7 +533,7 @@ describe("OrchestrationElectionStore lineage continuity", () => {
 				ORCHESTRATOR_INSTRUCTIONS,
 				unrelatedInput,
 			),
-		).toEqual({ admission: "non_root", basis: "rejected" });
+		).toMatchObject({ admission: "non_root", basis: "rejected" });
 	});
 
 	test("invalid call_id items are excluded from lineage extraction and cannot spuriously grant lineage_match", () => {
@@ -533,7 +589,7 @@ describe("OrchestrationElectionStore lineage continuity", () => {
 				ORCHESTRATOR_INSTRUCTIONS,
 				invalidLineageInput,
 			),
-		).toEqual({ admission: "non_root", basis: "rejected" });
+		).toMatchObject({ admission: "non_root", basis: "rejected" });
 	});
 
 	test("accepted roots renew lastActiveAt and merge new lineage hashes", () => {
@@ -564,7 +620,7 @@ describe("OrchestrationElectionStore lineage continuity", () => {
 				ORCHESTRATOR_INSTRUCTIONS,
 				secondTurnInput,
 			),
-		).toEqual({ admission: "root", basis: "identity_match" });
+		).toMatchObject({ admission: "root", basis: "identity_match" });
 
 		const snapshot = store.snapshot(ORCHESTRATOR_SESSION_ID);
 		expect(snapshot?.lastActiveAt).toBe(now);
@@ -601,7 +657,7 @@ describe("OrchestrationElectionStore lineage continuity", () => {
 				"different instructions",
 				[userTurn("spawn subagent")],
 			),
-		).toEqual({ admission: "non_root", basis: "rejected" });
+		).toMatchObject({ admission: "non_root", basis: "rejected" });
 
 		const after = store.snapshot(ORCHESTRATOR_SESSION_ID);
 		expect(after).toEqual(before);
@@ -655,7 +711,7 @@ describe("OrchestrationElectionStore lineage continuity", () => {
 				ORCHESTRATOR_INSTRUCTIONS,
 				[userTurn("fresh start")],
 			),
-		).toEqual({ admission: "root", basis: "initial_claim" });
+		).toMatchObject({ admission: "root", basis: "initial_claim" });
 	});
 
 	test("bounds identity aliases to the newest 8, evicting the oldest first", () => {
@@ -718,7 +774,10 @@ describe("OrchestrationElectionStore lineage continuity", () => {
 				ORCHESTRATOR_INSTRUCTIONS,
 				[functionCall(callId), functionCallOutput(callId)],
 			);
-			expect(result).toEqual({ admission: "root", basis: "identity_match" });
+			expect(result).toMatchObject({
+				admission: "root",
+				basis: "identity_match",
+			});
 		}
 
 		const snapshot = store.snapshot(ORCHESTRATOR_SESSION_ID);
@@ -786,7 +845,7 @@ describe("OrchestrationElectionStore restart limitation (documents an inherent c
 				"different instructions",
 				siblingInput,
 			),
-		).toEqual({ admission: "root", basis: "initial_claim" });
+		).toMatchObject({ admission: "root", basis: "initial_claim" });
 
 		// LIMITATION (inherent, not fixed here): the true orchestrator's own
 		// continuing turn, whose derived identity never changed, still loses
@@ -800,7 +859,7 @@ describe("OrchestrationElectionStore restart limitation (documents an inherent c
 				ORCHESTRATOR_INSTRUCTIONS,
 				rootInput,
 			),
-		).toEqual({ admission: "non_root", basis: "rejected" });
+		).toMatchObject({ admission: "non_root", basis: "rejected" });
 	});
 });
 

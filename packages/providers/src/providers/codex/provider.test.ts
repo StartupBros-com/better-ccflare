@@ -11,6 +11,7 @@ import {
 	resetOrchestrationElectionForTest,
 } from "./orchestration-election";
 import {
+	CODEX_CACHE_KEY_CONTINUITY_PERCENT_ENV,
 	CODEX_CACHE_KEY_MODE_ENV,
 	CODEX_CACHE_KEY_SESSION_PERCENT_ENV,
 	CODEX_DEFAULT_ENDPOINT,
@@ -18,7 +19,9 @@ import {
 	CODEX_VERSION,
 	CodexProvider,
 	codexEventCommitsOutput,
+	deriveCodexCacheKeyContinuityBucket,
 	deriveCodexCacheKeySessionBucket,
+	readCodexCacheKeyContinuityPercent,
 	readCodexCacheKeySessionPercent,
 	resolveCodexRequestModel,
 } from "./provider";
@@ -43,6 +46,7 @@ const readTraceRecords = (dir: string): Array<Record<string, unknown>> => {
 
 afterEach(() => {
 	delete process.env[CODEX_PROMPT_CACHE_KEY_ENV];
+	delete process.env[CODEX_CACHE_KEY_CONTINUITY_PERCENT_ENV];
 	delete process.env[CODEX_CACHE_KEY_MODE_ENV];
 	delete process.env[CODEX_CACHE_KEY_SESSION_PERCENT_ENV];
 	delete process.env[CODEX_SINGLE_ORCHESTRATION_ROOT_ENV];
@@ -6440,6 +6444,79 @@ describe("CodexProvider upstream error code classification", () => {
 		expect(body.error.type).toBe("api_error");
 		expect(status).toBe(502);
 	});
+
+	it.each([
+		{ transportStatus: 401, code: "login_required", expectedType: "api_error" },
+		{
+			transportStatus: 403,
+			code: "usage_not_included",
+			expectedType: "permission_error",
+		},
+		{
+			transportStatus: 429,
+			code: "permission_denied",
+			expectedType: "api_error",
+		},
+		{
+			transportStatus: 529,
+			code: "permission_denied",
+			expectedType: "api_error",
+		},
+	] as const)("preserves a definitive transport status ($transportStatus) over a less-specific SSE body mapping", async ({
+		transportStatus,
+		code,
+		expectedType,
+	}) => {
+		const provider = new CodexProvider();
+		const upstreamBody = sseBody([
+			...eventLine("error", {
+				type: "error",
+				code,
+				message: `Codex reported ${code}`,
+			}),
+		]);
+		const response = new Response(upstreamBody, {
+			status: transportStatus,
+			statusText: `Upstream ${transportStatus}`,
+			headers: {
+				"content-type": "text/event-stream",
+				"x-better-ccflare-request-stream": "false",
+			},
+		});
+
+		const transformed = await provider.processResponse(response, null);
+		const body = (await transformed.json()) as {
+			error: { type: string; code?: string };
+		};
+
+		expect(transformed.status).toBe(transportStatus);
+		expect(transformed.statusText).toBe(`Upstream ${transportStatus}`);
+		expect(body.error.type).toBe(expectedType);
+		expect(body.error.code).toBe(code);
+	});
+
+	it("keeps body-derived status for HTTP 200 even when the body is a permission error", async () => {
+		const provider = new CodexProvider();
+		const response = new Response(
+			sseBody([
+				...eventLine("error", {
+					type: "error",
+					code: "usage_not_included",
+					message: "Codex plan does not include usage",
+				}),
+			]),
+			{
+				status: 200,
+				headers: {
+					"content-type": "text/event-stream",
+					"x-better-ccflare-request-stream": "false",
+				},
+			},
+		);
+
+		const transformed = await provider.processResponse(response, null);
+		expect(transformed.status).toBe(403);
+	});
 });
 
 describe("CodexProvider.transformRequestBody", () => {
@@ -7161,7 +7238,7 @@ describe("CodexProvider.transformRequestBody", () => {
 			// recorded lineage and is admitted as root (basis: lineage_match), not
 			// demoted.
 			expect(requestTrace).toMatchObject({
-				trace_schema_version: 15,
+				trace_schema_version: 16,
 				orchestration_admission: "root",
 				orchestration_basis: "lineage_match",
 				orchestration_demotion_observed: false,
@@ -7408,7 +7485,7 @@ describe("CodexProvider.transformRequestBody", () => {
 				(record) => record.phase === "request",
 			);
 			expect(requestTrace).toMatchObject({
-				trace_schema_version: 15,
+				trace_schema_version: 16,
 				orchestration_admission: "attributed_descendant",
 				orchestration_basis: null,
 				is_descendant: true,
@@ -7532,6 +7609,7 @@ describe("CodexProvider.transformRequestBody", () => {
 			system = "shared system prompt",
 			messages?: Array<Record<string, unknown>>,
 			account?: Parameters<CodexProvider["transformRequestBody"]>[1],
+			tools?: Array<Record<string, unknown>>,
 		) => {
 			const request = new Request("https://example.com/v1/messages", {
 				method: "POST",
@@ -7542,6 +7620,7 @@ describe("CodexProvider.transformRequestBody", () => {
 					system,
 					metadata: { user_id: JSON.stringify({ session_id: sessionId }) },
 					messages: messages ?? [{ role: "user", content }],
+					...(tools ? { tools } : {}),
 				}),
 			});
 			return new CodexProvider()
@@ -7566,6 +7645,26 @@ describe("CodexProvider.transformRequestBody", () => {
 			["nope", 0],
 		] as const)("strictly parses session percentage %p", (raw, expected) => {
 			expect(readCodexCacheKeySessionPercent(raw)).toBe(expected);
+		});
+
+		it("strictly parses the continuity percentage and keeps its bucket stable", () => {
+			for (const [raw, expected] of [
+				[undefined, 0],
+				["", 0],
+				["0", 0],
+				["37", 37],
+				["100", 100],
+				["101", 100],
+				["-1", 0],
+				["1.5", 0],
+				[" 10", 0],
+				["nope", 0],
+			] as const) {
+				expect(readCodexCacheKeyContinuityPercent(raw)).toBe(expected);
+			}
+			expect(deriveCodexCacheKeyContinuityBucket(sessionA)).toBe(
+				deriveCodexCacheKeyContinuityBucket(sessionA.toUpperCase()),
+			);
 		});
 
 		it("uses stable domain-separated bucket fixtures and normalizes UUID case", () => {
@@ -7617,6 +7716,73 @@ describe("CodexProvider.transformRequestBody", () => {
 			expect(later.prompt_cache_key).toBe(first.prompt_cache_key);
 			expect(sibling.prompt_cache_key).toMatch(/^ccflare-convo-/);
 			expect(sibling.prompt_cache_key).not.toBe(first.prompt_cache_key);
+		});
+
+		it("reuses the canonical root key for treated compaction continuations only", async () => {
+			process.env[CODEX_PROMPT_CACHE_KEY_ENV] = "1";
+			process.env[CODEX_CACHE_KEY_CONTINUITY_PERCENT_ENV] = "100";
+			const tools = [{ name: "Agent", input_schema: { type: "object" } }];
+			const rootMessages = [
+				{ role: "user", content: "start" },
+				{
+					role: "assistant",
+					content: [
+						{ type: "tool_use", id: "call_1", name: "Agent", input: {} },
+					],
+				},
+				{
+					role: "user",
+					content: [
+						{ type: "tool_result", tool_use_id: "call_1", content: "done" },
+					],
+				},
+			];
+			const compactedMessages = [
+				rootMessages[1],
+				rootMessages[2],
+				{ role: "user", content: "continue" },
+			];
+			const treatedRoot = await transform(
+				sessionA,
+				"start",
+				"shared system prompt",
+				rootMessages,
+				undefined,
+				tools,
+			);
+			const treatedCompacted = await transform(
+				sessionA,
+				"continue",
+				"shared system prompt",
+				compactedMessages,
+				undefined,
+				tools,
+			);
+			expect(treatedCompacted.prompt_cache_key).toBe(
+				treatedRoot.prompt_cache_key,
+			);
+
+			process.env[CODEX_CACHE_KEY_CONTINUITY_PERCENT_ENV] = "0";
+			resetOrchestrationElectionForTest();
+			const controlRoot = await transform(
+				sessionA,
+				"start",
+				"shared system prompt",
+				rootMessages,
+				undefined,
+				tools,
+			);
+			const controlCompacted = await transform(
+				sessionA,
+				"continue",
+				"shared system prompt",
+				compactedMessages,
+				undefined,
+				tools,
+			);
+			expect(controlCompacted.prompt_cache_key).not.toBe(
+				controlRoot.prompt_cache_key,
+			);
 		});
 
 		it("shares one session key across sibling conversations in treatment", async () => {

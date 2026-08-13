@@ -236,6 +236,31 @@ describe("XaiProvider", () => {
 		expect(thrown?.message).toContain("invalid_grant");
 	});
 
+	it("classifies a nested structured invalid_grant response as terminal", async () => {
+		const provider = new XaiProvider();
+		globalThis.fetch = mock(
+			async () =>
+				new Response(
+					JSON.stringify({
+						error: {
+							code: "invalid_grant",
+							message: "The refresh token has expired.",
+						},
+					}),
+					{ status: 400, headers: { "content-type": "application/json" } },
+				),
+		) as unknown as typeof fetch;
+
+		let thrown: unknown;
+		try {
+			await provider.refreshToken(account(), "unused");
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).toBeInstanceOf(Error);
+		expect((thrown as Error).message).toContain("invalid_grant");
+	});
+
 	it("extracts cached_tokens from non-stream OpenAI-compatible usage", async () => {
 		const provider = new XaiProvider();
 		const response = new Response(

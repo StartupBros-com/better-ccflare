@@ -878,6 +878,9 @@ export interface ConfigData {
 	usage_throttling_weekly_enabled?: boolean;
 	agent_frontmatter_model_fallback?: boolean;
 	model_catalog_oauth_refresh_enabled?: boolean;
+	implicit_fallback_mode?: string;
+	implicit_fallback_allowed_classes?: string;
+	implicit_fallback_denied_classes?: string;
 	health_detail_enabled?: boolean;
 	anthropic_degraded_mode?: AnthropicDegradedMode;
 	anthropic_degraded_large_request_tokens?: number;
@@ -1020,6 +1023,133 @@ export function getCodexReasoningRetention(): boolean {
 		return fromEnv !== "false" && fromEnv !== "0";
 	}
 	return true;
+}
+
+/**
+ * Restart-scoped policy for implicit normal/combo fallback. Explicit account
+ * routes and capability-profile routes are intentionally outside this policy.
+ *
+ * The route-class values mirror the provider enrollment classes used by combo
+ * routing, but are kept local to this package to avoid making config depend on
+ * the provider registry (which would create a package cycle).
+ */
+export type ImplicitFallbackPolicyMode = "off" | "observe" | "enforce";
+export type ImplicitFallbackRouteClass =
+	| "oauth-subscription"
+	| "api-key"
+	| "local"
+	| "cloud-credential";
+
+export interface ImplicitFallbackPolicyConfig {
+	readonly mode: ImplicitFallbackPolicyMode;
+	readonly allowedClasses: readonly ImplicitFallbackRouteClass[];
+	readonly deniedClasses: readonly ImplicitFallbackRouteClass[];
+}
+
+export const IMPLICIT_FALLBACK_POLICY_DEFAULTS: Readonly<ImplicitFallbackPolicyConfig> =
+	Object.freeze({
+		mode: "off" as const,
+		allowedClasses: Object.freeze([]) as readonly ImplicitFallbackRouteClass[],
+		deniedClasses: Object.freeze([]) as readonly ImplicitFallbackRouteClass[],
+	});
+
+const IMPLICIT_FALLBACK_ACTIVE_DEFAULT_DENIALS: readonly ImplicitFallbackRouteClass[] =
+	Object.freeze(["api-key", "cloud-credential"] as const);
+
+const IMPLICIT_FALLBACK_ROUTE_CLASSES: ReadonlySet<string> = new Set([
+	"oauth-subscription",
+	"api-key",
+	"local",
+	"cloud-credential",
+]);
+const MAX_IMPLICIT_FALLBACK_CLASS_LIST_ITEMS = 16;
+
+export interface ImplicitFallbackPolicyConfigInput {
+	mode?: unknown;
+	allowedClasses?: unknown;
+	deniedClasses?: unknown;
+}
+
+function parseImplicitFallbackClassList(
+	value: unknown,
+): readonly ImplicitFallbackRouteClass[] | undefined | null {
+	if (value === undefined) return undefined;
+	const rawValues = Array.isArray(value)
+		? value
+		: typeof value === "string"
+			? value.split(",")
+			: null;
+	if (rawValues === null) return null;
+	if (rawValues.length > MAX_IMPLICIT_FALLBACK_CLASS_LIST_ITEMS) return null;
+
+	const seen = new Set<ImplicitFallbackRouteClass>();
+	const normalized: ImplicitFallbackRouteClass[] = [];
+	for (const raw of rawValues) {
+		if (typeof raw !== "string") return null;
+		const candidate = raw.trim().toLowerCase();
+		if (!candidate) continue;
+		if (!IMPLICIT_FALLBACK_ROUTE_CLASSES.has(candidate)) return null;
+		if (seen.has(candidate as ImplicitFallbackRouteClass)) continue;
+		seen.add(candidate as ImplicitFallbackRouteClass);
+		normalized.push(candidate as ImplicitFallbackRouteClass);
+		// Four is the complete class universe. A larger list is necessarily
+		// malformed (or an attempt to smuggle unbounded config into health/logs).
+		if (normalized.length > IMPLICIT_FALLBACK_ROUTE_CLASSES.size) return null;
+	}
+	return Object.freeze(normalized);
+}
+
+/**
+ * Resolve an implicit fallback policy atomically. Invalid modes or classes
+ * return the default-off policy. When observe/enforce is explicitly enabled,
+ * API-key and cloud-credential classes are denied by default; an allowed class
+ * is an explicit exception and removes that class from the denial set.
+ */
+export function resolveImplicitFallbackPolicyConfig(
+	input: ImplicitFallbackPolicyConfigInput,
+	onInvalid?: (field: "mode" | "allowedClasses" | "deniedClasses") => void,
+): ImplicitFallbackPolicyConfig {
+	const rawMode = input.mode ?? "off";
+	const normalizedMode =
+		typeof rawMode === "string" ? rawMode.trim().toLowerCase() : "";
+	if (
+		normalizedMode !== "off" &&
+		normalizedMode !== "observe" &&
+		normalizedMode !== "enforce"
+	) {
+		onInvalid?.("mode");
+		return IMPLICIT_FALLBACK_POLICY_DEFAULTS;
+	}
+
+	const allowed = parseImplicitFallbackClassList(input.allowedClasses);
+	if (allowed === null) {
+		onInvalid?.("allowedClasses");
+		return IMPLICIT_FALLBACK_POLICY_DEFAULTS;
+	}
+	const denied = parseImplicitFallbackClassList(input.deniedClasses);
+	if (denied === null) {
+		onInvalid?.("deniedClasses");
+		return IMPLICIT_FALLBACK_POLICY_DEFAULTS;
+	}
+
+	const allowedSet = new Set(allowed ?? []);
+	const requestedDenials =
+		normalizedMode === "off"
+			? (denied ?? [])
+			: [...IMPLICIT_FALLBACK_ACTIVE_DEFAULT_DENIALS, ...(denied ?? [])];
+	const effectiveDenials: ImplicitFallbackRouteClass[] = [];
+	const seenDenials = new Set<ImplicitFallbackRouteClass>();
+	for (const routeClass of requestedDenials) {
+		if (allowedSet.has(routeClass) || seenDenials.has(routeClass)) continue;
+		seenDenials.add(routeClass);
+		effectiveDenials.push(routeClass);
+	}
+
+	return Object.freeze({
+		mode: normalizedMode,
+		allowedClasses: allowed ?? Object.freeze([]),
+		deniedClasses: Object.freeze(effectiveDenials),
+	});
 }
 
 export class Config extends EventEmitter {
@@ -1462,6 +1592,37 @@ export class Config extends EventEmitter {
 		const fromFile = this.data.model_catalog_oauth_refresh_enabled;
 		if (typeof fromFile === "boolean") return fromFile;
 		return false;
+	}
+
+	/**
+	 * Resolve the restart-scoped implicit normal/combo fallback policy. The
+	 * environment wins per field over the config file, and malformed input
+	 * atomically returns the default-off policy.
+	 */
+	getImplicitFallbackPolicyConfig(): ImplicitFallbackPolicyConfig {
+		let invalidField: "mode" | "allowedClasses" | "deniedClasses" | null = null;
+		const resolved = resolveImplicitFallbackPolicyConfig(
+			{
+				mode:
+					process.env.CCFLARE_IMPLICIT_FALLBACK_MODE ??
+					this.data.implicit_fallback_mode,
+				allowedClasses:
+					process.env.CCFLARE_IMPLICIT_FALLBACK_ALLOWED_CLASSES ??
+					this.data.implicit_fallback_allowed_classes,
+				deniedClasses:
+					process.env.CCFLARE_IMPLICIT_FALLBACK_DENIED_CLASSES ??
+					this.data.implicit_fallback_denied_classes,
+			},
+			(field) => {
+				invalidField ??= field;
+			},
+		);
+		if (invalidField !== null) {
+			log.warn(
+				`Invalid implicit fallback policy setting "${invalidField}"; policy is off until configuration is corrected and the process restarts`,
+			);
+		}
+		return resolved;
 	}
 
 	setUsageThrottlingFiveHourEnabled(value: boolean): void {

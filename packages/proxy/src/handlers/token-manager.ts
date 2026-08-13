@@ -1,6 +1,9 @@
 import {
 	authFailureEvents,
+	formatOAuthErrorMessage,
+	getOAuthErrorCode,
 	isInvalidGrantMessage,
+	isStructuredInvalidGrant,
 	OAuthRefreshTokenError,
 	PAUSE_REASON_NEEDS_REAUTH,
 	registerDisposable,
@@ -137,12 +140,14 @@ export function isTerminalTokenRefreshFailure(error: unknown): boolean {
 	}
 	if (error instanceof OAuthRefreshTokenError) return true;
 	const messages: string[] = [];
+	if (isStructuredInvalidGrant(error)) return true;
 	if (error instanceof Error) messages.push(error.message);
 	if (typeof error === "object" && error !== null) {
 		const context = (error as { context?: unknown }).context;
 		if (typeof context === "object" && context !== null) {
 			const originalError = (context as { originalError?: unknown })
 				.originalError;
+			if (isStructuredInvalidGrant(originalError)) return true;
 			if (typeof originalError === "string") messages.push(originalError);
 		}
 	}
@@ -214,6 +219,18 @@ export function extractAuthFailureReason(
 const refreshFailureTokens = new WeakMap<object, string | null>();
 const terminalRefreshFailures = new WeakSet<object>();
 
+function wrapTokenRefreshFailure(
+	accountId: string,
+	message: string,
+	attemptedRefreshToken: string | null,
+	terminal: boolean,
+): TokenRefreshError {
+	const wrapped = new TokenRefreshError(accountId, new Error(message));
+	refreshFailureTokens.set(wrapped, attemptedRefreshToken);
+	if (terminal) terminalRefreshFailures.add(wrapped);
+	return wrapped;
+}
+
 /** Return the refresh token captured by the refresh operation that failed. */
 export function getRefreshTokenUsedForFailure(
 	error: unknown,
@@ -271,8 +288,7 @@ export async function pauseAccountForUpstreamAuthFailure(
 	/** Explicit credential identity used by the failed request, when known. */
 	expectedRefreshToken?: string | null,
 ): Promise<boolean> {
-	const pause = dbOps.pauseAccountIfActive;
-	if (typeof pause !== "function") return false;
+	if (typeof dbOps.pauseAccountIfActive !== "function") return false;
 	// `undefined` preserves the legacy call contract (derive from the live
 	// account). `null` is an explicit snapshot for a non-OAuth credential and
 	// must not fall through to a newly reauthenticated token on the account.
@@ -295,7 +311,11 @@ export async function pauseAccountForUpstreamAuthFailure(
 				: undefined
 			: refreshTokenForFailure;
 	try {
-		const paused = await pause(account.id, reason, expectedTokenForCas);
+		const paused = await dbOps.pauseAccountIfActive(
+			account.id,
+			reason,
+			expectedTokenForCas,
+		);
 		if (paused) {
 			log.error(
 				`Account "${account.name}" PAUSED — upstream authentication failed (401; ${reason}). Repair the credential before resuming it.`,
@@ -349,18 +369,37 @@ export async function pauseAccountForReauthIfInvalidGrant(
 	/** Refresh-token snapshot captured before the provider call. */
 	expectedRefreshToken?: string | null,
 ): Promise<boolean> {
-	const message = error instanceof Error ? error.message : String(error);
+	const structuredTerminal = isStructuredInvalidGrant(error);
+	const contextOriginalError =
+		typeof error === "object" &&
+		error !== null &&
+		typeof (error as { context?: unknown }).context === "object" &&
+		(error as { context: { originalError?: unknown } }).context !== null
+			? (error as { context: { originalError?: unknown } }).context
+					.originalError
+			: undefined;
+	const message =
+		error instanceof Error
+			? error.message
+			: typeof error === "string"
+				? error
+				: "";
+	const contextOriginalMessage =
+		typeof contextOriginalError === "string" ? contextOriginalError : undefined;
 	const isInvalidGrant =
-		error instanceof OAuthRefreshTokenError || isInvalidGrantMessage(message);
+		error instanceof OAuthRefreshTokenError ||
+		structuredTerminal ||
+		isStructuredInvalidGrant(contextOriginalError) ||
+		isInvalidGrantMessage(message) ||
+		isInvalidGrantMessage(contextOriginalMessage);
 	if (!isInvalidGrant) return false;
-	const pause = dbOps.pauseAccountIfActive;
-	if (typeof pause !== "function") return false;
+	if (typeof dbOps.pauseAccountIfActive !== "function") return false;
 	try {
 		const refreshTokenForCas =
 			expectedRefreshToken === undefined
 				? account.refresh_token
 				: expectedRefreshToken;
-		const paused = await pause(
+		const paused = await dbOps.pauseAccountIfActive(
 			account.id,
 			PAUSE_REASON_NEEDS_REAUTH,
 			refreshTokenForCas?.trim() ? refreshTokenForCas : undefined,
@@ -835,7 +874,9 @@ export async function refreshAccessTokenSafe(
 				enforceMaxSize();
 
 				const originalError =
-					error instanceof Error ? error.message : String(error);
+					error instanceof Error
+						? error.message
+						: formatOAuthErrorMessage(error) || String(error);
 				const enhancedMessage = getOAuthErrorMessage(account, originalError);
 
 				// Definitive dead-refresh-token signal (invalid_grant /
@@ -845,10 +886,13 @@ export async function refreshAccessTokenSafe(
 				// preserves the machine error code) here, BEFORE it is wrapped into
 				// TokenRefreshError (whose .message is a fixed string). Transient failures
 				// never match.
-				const authFailureReason = extractAuthFailureReason(
-					originalError,
-					account.name,
-				);
+				const structuredAuthFailureReason = getOAuthErrorCode(error);
+				const typedAuthFailureReason =
+					error instanceof OAuthRefreshTokenError ? "invalid_grant" : null;
+				const authFailureReason =
+					structuredAuthFailureReason ||
+					typedAuthFailureReason ||
+					extractAuthFailureReason(originalError, account.name);
 				if (authFailureReason) {
 					// (round-3 item 1) A pending unpersisted rotation means WE
 					// rotated successfully moments ago — this failure is a
@@ -857,7 +901,12 @@ export async function refreshAccessTokenSafe(
 						log.warn(
 							`Skipping requires_reauth for ${account.name}: a successful rotation is awaiting persist (replayed a consumed token)`,
 						);
-						throw new TokenRefreshError(account.id, new Error(enhancedMessage));
+						throw wrapTokenRefreshFailure(
+							account.id,
+							enhancedMessage,
+							attemptedRefreshToken,
+							true,
+						);
 					}
 					// Rotation-race guard: a definitive rejection of a refresh token
 					// that is no longer the account's current one means another
@@ -897,38 +946,71 @@ export async function refreshAccessTokenSafe(
 						log.warn(
 							`Refresh for ${account.name} used a superseded refresh token (${authFailureReason}) — not flagging re-auth; the rotated token will be used after the refresh backoff`,
 						);
-						throw new TokenRefreshError(account.id, new Error(enhancedMessage));
+						throw wrapTokenRefreshFailure(
+							account.id,
+							enhancedMessage,
+							attemptedRefreshToken,
+							true,
+						);
 					}
 					// (finding 3) Unverifiable → do NOT flag; the backoff entry recorded
 					// above already keeps this account out of routing for a while.
 					if (dbReadFailed || !attemptedRefreshToken) {
-						throw new TokenRefreshError(account.id, new Error(enhancedMessage));
-					}
-					// (finding 2) Atomic flag: only condemn the account if the DB still
-					// holds the exact refresh token the provider just rejected — a CAS
-					// write closes the gap between this read and the flag write itself.
-					// Emit the auth-failure event only when the flag actually lands.
-					try {
-						const flagged = await ctx.dbOps.flagRequiresReauthIfTokenMatches(
+						throw wrapTokenRefreshFailure(
 							account.id,
+							enhancedMessage,
 							attemptedRefreshToken,
+							true,
 						);
-						if (flagged) {
-							authFailureEvents.emit("event", {
-								accountId: account.id,
-								accountName: account.name,
-								provider: account.provider,
-								reason: authFailureReason,
-							});
-						} else {
+					}
+					// Atomic quarantine writes: both durable states are guarded on the exact
+					// refresh token rejected by the provider. The requires_reauth flag keeps
+					// proactive selectors from retrying it; the pause reason preserves the
+					// public resume/reauth contract. Older test/runtime contexts may expose
+					// only one seam, so treat either successful CAS as the one event-worthy
+					// quarantine without weakening the credential guard.
+					let quarantined = false;
+					const flagRequiresReauth = ctx.dbOps.flagRequiresReauthIfTokenMatches;
+					if (typeof flagRequiresReauth === "function") {
+						try {
+							quarantined =
+								(await flagRequiresReauth.call(
+									ctx.dbOps,
+									account.id,
+									attemptedRefreshToken,
+								)) || quarantined;
+						} catch (flagError) {
 							log.warn(
-								`Skipped requires_reauth for ${account.name}: refresh token rotated between verification and flag write (rotation race)`,
+								`Could not persist requires_reauth for ${account.name} — leaving that flag unset (unverified)`,
+								flagError,
 							);
 						}
-					} catch (flagError) {
+					}
+					if (typeof ctx.dbOps.pauseAccountIfActive === "function") {
+						try {
+							quarantined =
+								(await ctx.dbOps.pauseAccountIfActive(
+									account.id,
+									PAUSE_REASON_NEEDS_REAUTH,
+									attemptedRefreshToken,
+								)) || quarantined;
+						} catch (pauseError) {
+							log.warn(
+								`Could not pause ${account.name} for re-authentication — leaving pause state unchanged (unverified)`,
+								pauseError,
+							);
+						}
+					}
+					if (quarantined) {
+						authFailureEvents.emit("event", {
+							accountId: account.id,
+							accountName: account.name,
+							provider: account.provider,
+							reason: authFailureReason,
+						});
+					} else {
 						log.warn(
-							`Could not persist requires_reauth for ${account.name} — leaving unset (unverified)`,
-							flagError,
+							`Skipped auth quarantine for ${account.name}: refresh token rotated or no compatible CAS write was available`,
 						);
 					}
 				}
@@ -936,7 +1018,12 @@ export async function refreshAccessTokenSafe(
 					`Token refresh failed for account ${account.name}: ${enhancedMessage}`,
 					error,
 				);
-				throw new TokenRefreshError(account.id, new Error(enhancedMessage));
+				throw wrapTokenRefreshFailure(
+					account.id,
+					enhancedMessage,
+					attemptedRefreshToken,
+					Boolean(authFailureReason),
+				);
 			})
 			.finally(() => {
 				// (finding 4) Identity-safe: never delete a newer entry installed by

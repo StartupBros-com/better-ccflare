@@ -1,4 +1,5 @@
 import {
+	formatOAuthErrorMessage,
 	getEndpointUrl,
 	getModelFamily,
 	validateEndpointUrl,
@@ -97,18 +98,15 @@ export class XaiProvider extends OpenAICompatibleProvider {
 		});
 
 		if (!response.ok) {
-			let message = response.statusText;
+			let message =
+				formatOAuthErrorMessage(response.statusText) ||
+				"OAuth token endpoint rejected request";
 			try {
-				const data = (await response.json()) as {
-					error?: string;
-					error_description?: string;
-				};
+				const data = (await response.json()) as unknown;
 				// Preserve the machine-readable OAuth error code (e.g. "invalid_grant")
 				// ahead of the human description so the token-manager's requires_reauth
 				// detection can classify a dead xAI refresh token.
-				message =
-					[data.error, data.error_description].filter(Boolean).join(": ") ||
-					message;
+				message = formatOAuthErrorMessage(data) || message;
 			} catch {
 				// Do not include raw response bodies in refresh errors; auth servers
 				// should not echo credentials, but keeping messages structured avoids

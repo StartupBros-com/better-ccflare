@@ -19,7 +19,12 @@ import {
 	isXaiCacheNativeEnabled,
 	usageCache,
 } from "@better-ccflare/providers";
-import type { Account, RequestMeta } from "@better-ccflare/types";
+import type {
+	Account,
+	RequestMeta,
+	RoutingSelectionDiagnostics,
+	RoutingSelectionZeroAttemptReason,
+} from "@better-ccflare/types";
 import {
 	type AnthropicDegradedCohortFacts,
 	type AnthropicDegradedRouteInspection,
@@ -307,6 +312,33 @@ export function alignRouteCandidateIds(
 
 const log = new Logger("Proxy");
 const ANTHROPIC_OAUTH_BETA = "oauth-2025-04-20";
+const ROUTING_SELECTION_DIAGNOSTIC_LOG_INTERVAL_MS = 60_000;
+let routingSelectionDiagnosticLastLoggedAt = 0;
+
+function logRoutingSelectionDiagnostics(
+	diagnostics: RoutingSelectionDiagnostics,
+): void {
+	const now = Date.now();
+	if (
+		now - routingSelectionDiagnosticLastLoggedAt <
+		ROUTING_SELECTION_DIAGNOSTIC_LOG_INTERVAL_MS
+	) {
+		return;
+	}
+	routingSelectionDiagnosticLastLoggedAt = now;
+	log.info("Routing selection terminal diagnostics", {
+		source: "selection",
+		mode: diagnostics.mode,
+		structural_candidate_count: diagnostics.structuralCandidateCount,
+		eligible_candidate_count: diagnostics.eligibleCandidateCount,
+		excluded_candidate_count: diagnostics.excludedCandidateCount,
+		selected_candidate_count: diagnostics.selectedCandidateCount,
+		zero_attempt_reason: diagnostics.zeroAttemptReason,
+		forced_route: diagnostics.forcedRoute,
+		capability_profile: diagnostics.capabilityProfile,
+		route_profile: diagnostics.routeProfile,
+	});
+}
 
 function physicalAnthropicOAuthBetaSignature(headers: Headers): string {
 	const features = new Set(
@@ -1180,6 +1212,58 @@ async function handleProxyCore(
 					},
 				),
 		});
+	const getRoutingSelectionDiagnostics = (
+		zeroAttemptReason?: RoutingSelectionZeroAttemptReason,
+		fallbackStructuralCandidateCount = 0,
+	): RoutingSelectionDiagnostics => {
+		const existing = requestMeta.routingSelectionDiagnostics;
+		const structuralCandidateCount = Math.max(
+			existing?.structuralCandidateCount ?? 0,
+			requestMeta.routingCandidateCatalog?.length ?? 0,
+			requestMeta.routingCandidates?.length ?? 0,
+			fallbackStructuralCandidateCount,
+		);
+		const eligibleCandidateCount = Math.min(
+			structuralCandidateCount,
+			existing?.eligibleCandidateCount ??
+				requestMeta.routingCandidates?.length ??
+				0,
+		);
+		const excludedCandidateCount = Math.max(
+			0,
+			structuralCandidateCount - eligibleCandidateCount,
+		);
+		// A zero eligible count alone is not proof that the implicit policy
+		// excluded every candidate: all structurally known accounts may simply be
+		// paused, rate-limited, or capacity-blocked. The selector publishes an
+		// exact `policy_excluded` reason only when its policy filter observed that
+		// transition; otherwise classify conservatively as unavailable.
+		const inferredZeroAttemptReason =
+			structuralCandidateCount > 0
+				? "all_unavailable"
+				: "no_eligible_candidates";
+		const forcedRoute =
+			requestMeta.forcedAccountId != null ||
+			requestMeta.headers?.has("x-better-ccflare-account-id") === true;
+		return {
+			mode: existing?.mode ?? ctx.implicitFallbackPolicy?.mode ?? "off",
+			structuralCandidateCount,
+			eligibleCandidateCount,
+			excludedCandidateCount:
+				existing?.excludedCandidateCount ?? excludedCandidateCount,
+			selectedCandidateCount: existing?.selectedCandidateCount ?? 0,
+			zeroAttemptReason:
+				zeroAttemptReason ??
+				existing?.zeroAttemptReason ??
+				inferredZeroAttemptReason,
+			forcedRoute: existing?.forcedRoute ?? forcedRoute,
+			capabilityProfile:
+				existing?.capabilityProfile ??
+				requestMeta.routeProfileSelection === "capability",
+			routeProfile:
+				existing?.routeProfile ?? requestMeta.routeProfileId != null,
+		};
+	};
 	const getRouteCircuitRecoveryHint = () =>
 		ctx.strategy.getRouteCircuitRecoveryHint?.(requestMeta) ?? null;
 	const accountSelectionTimeoutResponse = (
@@ -1187,12 +1271,16 @@ async function handleProxyCore(
 	): Response => {
 		cacheBodyStore.discardStaged(requestMeta.id);
 		if (sessionId) clearSession(sessionId, requestMeta.timestamp);
+		const routingSelectionDiagnostics =
+			getRoutingSelectionDiagnostics("selection_timeout");
+		logRoutingSelectionDiagnostics(routingSelectionDiagnostics);
 		const terminal = createRoutingTerminalResponse({
 			source: "selection",
 			accounts: [],
 			capacityContext: null,
 			rateLimitOutcomes: [],
 			upstreamAttempts: 0,
+			routingSelectionDiagnostics,
 			hostedDispatchState: routingAttemptLedger.hostedDispatchState,
 		});
 		// A phase timeout is transient incomplete evidence, so keep the canonical
@@ -1623,6 +1711,8 @@ async function handleProxyCore(
 					rateLimitOutcomes: getRequestRateLimitOutcomes(req),
 					now: Date.now(),
 					modelRecoveryAt: reactiveModelRecoveryAt,
+					attemptedRoutes: 0,
+					routingSelectionDiagnostics: requestMeta.routingSelectionDiagnostics,
 				}),
 			);
 		}
@@ -1634,8 +1724,20 @@ async function handleProxyCore(
 			);
 		}
 
-		// Check feature flag for backwards compatibility
-		if (process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL === "1") {
+		// Check feature flag for backwards compatibility. An enforce-mode
+		// policy exclusion is an intentional local drain decision, not an
+		// empty/unknown pool; allowing the legacy unauthenticated passthrough
+		// here would silently send the very paid route the policy blocked.
+		const policyExcludedByImplicitFallback =
+			requestMeta.routingSelectionDiagnostics?.mode === "enforce" &&
+			requestMeta.routingSelectionDiagnostics.zeroAttemptReason ===
+				"policy_excluded" &&
+			requestMeta.routingSelectionDiagnostics.structuralCandidateCount > 0 &&
+			requestMeta.routingSelectionDiagnostics.eligibleCandidateCount === 0;
+		if (
+			process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL === "1" &&
+			!policyExcludedByImplicitFallback
+		) {
 			// An unauthenticated passthrough cannot supply independent account
 			// evidence and must never claim the protected cohort's recovery lease.
 			// Inspecting is deliberately non-mutating: protected large requests
@@ -1694,15 +1796,23 @@ async function handleProxyCore(
 		} catch (error) {
 			log.error("Failed to load terminal account state", error);
 		}
+		const routingSelectionDiagnostics = getRoutingSelectionDiagnostics(
+			undefined,
+			allAccounts.length,
+		);
 		const terminal = createRoutingTerminalResponse({
 			source: "selection",
 			accounts: allAccounts,
 			capacityContext: getRoutingCapacityContext(requestMeta),
 			rateLimitOutcomes: getRequestRateLimitOutcomes(req),
 			upstreamAttempts: 0,
+			routingSelectionDiagnostics,
 			hostedDispatchState: routingAttemptLedger.hostedDispatchState,
 			routeCircuitRecoveryHint: getRouteCircuitRecoveryHint(),
 		});
+		if (terminal.kind === "route_unavailable") {
+			logRoutingSelectionDiagnostics(routingSelectionDiagnostics);
+		}
 		log.error(`Routing terminal: ${terminal.kind}`);
 
 		// Skip request-log staging for synthetic auto-refresh probes that
@@ -2697,6 +2807,11 @@ async function handleProxyCore(
 					rateLimitOutcomes: getRequestRateLimitOutcomes(req),
 					now: Date.now(),
 					modelRecoveryAt: reactiveModelRecoveryAt,
+					attemptedRoutes: upstreamAttempts === 0 ? 0 : undefined,
+					routingSelectionDiagnostics:
+						upstreamAttempts === 0
+							? requestMeta.routingSelectionDiagnostics
+							: undefined,
 				}),
 			);
 		} else if (
@@ -3024,6 +3139,11 @@ async function handleProxyCore(
 				rateLimitOutcomes: getRequestRateLimitOutcomes(req),
 				now: Date.now(),
 				modelRecoveryAt: reactiveModelRecoveryAt,
+				attemptedRoutes: upstreamAttempts === 0 ? 0 : undefined,
+				routingSelectionDiagnostics:
+					upstreamAttempts === 0
+						? requestMeta.routingSelectionDiagnostics
+						: undefined,
 			}),
 		);
 	}
@@ -3043,6 +3163,11 @@ async function handleProxyCore(
 				rateLimitOutcomes: getRequestRateLimitOutcomes(req),
 				now: Date.now(),
 				modelRecoveryAt: reactiveModelRecoveryAt,
+				attemptedRoutes: upstreamAttempts === 0 ? 0 : undefined,
+				routingSelectionDiagnostics:
+					upstreamAttempts === 0
+						? requestMeta.routingSelectionDiagnostics
+						: undefined,
 			}),
 		);
 	}

@@ -48,9 +48,13 @@ export type OrchestrationAdmissionBasis =
 export interface OrchestrationAdmissionResult {
 	readonly admission: "root" | "non_root";
 	readonly basis: OrchestrationAdmissionBasis;
+	/** Stable root identity for accepted admissions; null when rejected. */
+	readonly canonicalConversationIdentity: string | null;
 }
 
 interface ElectionEntry {
+	/** Stable conversation identity used as the root's canonical cache identity. */
+	canonicalIdentity: string;
 	/** Bounded FIFO of conversation identity hashes accepted as this root. */
 	identities: string[];
 	/** Bounded FIFO of the newest session-scoped call_id lineage hashes seen. */
@@ -214,18 +218,27 @@ export class OrchestrationElectionStore {
 				this.evictLeastRecentlyActive();
 			}
 			this.entries.set(sessionId, {
+				canonicalIdentity: conversationId,
 				identities: [conversationId],
 				lineageHashes: [...callLineageHashes],
 				instructionHash,
 				lastActiveAt: now,
 			});
-			return { admission: "root", basis: "initial_claim" };
+			return {
+				admission: "root",
+				basis: "initial_claim",
+				canonicalConversationIdentity: conversationId,
+			};
 		}
 
 		if (existing.identities.includes(conversationId)) {
 			existing.lastActiveAt = now;
 			this.mergeLineage(existing, callLineageHashes);
-			return { admission: "root", basis: "identity_match" };
+			return {
+				admission: "root",
+				basis: "identity_match",
+				canonicalConversationIdentity: existing.canonicalIdentity,
+			};
 		}
 
 		const sameInstructions = existing.instructionHash === instructionHash;
@@ -241,13 +254,21 @@ export class OrchestrationElectionStore {
 				ORCHESTRATION_MAX_IDENTITY_ALIASES,
 			);
 			this.mergeLineage(existing, callLineageHashes);
-			return { admission: "root", basis: "lineage_match" };
+			return {
+				admission: "root",
+				basis: "lineage_match",
+				canonicalConversationIdentity: existing.canonicalIdentity,
+			};
 		}
 
 		// Rejected: no mutation whatsoever. Timestamps, identities, and lineage
 		// hashes are left exactly as they were, so a rejected sibling can never
 		// renew the true root's TTL or pollute its continuity state.
-		return { admission: "non_root", basis: "rejected" };
+		return {
+			admission: "non_root",
+			basis: "rejected",
+			canonicalConversationIdentity: null,
+		};
 	}
 
 	reset(): void {

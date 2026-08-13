@@ -1232,6 +1232,106 @@ describe("analyzeCodexTrace", () => {
 		expect(report.request.maxInputItems).toBe(1);
 	});
 
+	test("aggregates continuity provenance without echoing unknown values", () => {
+		const report = analyzeCodexTrace([
+			{
+				trace_schema_version: 16,
+				phase: "request",
+				request_id: "root-request",
+				attempt_id: "root-attempt",
+				ts: "2026-07-10T00:00:00Z",
+				conversation_id: "derived-root",
+				canonical_conversation_id: "canonical-root",
+				cache_key_continuity_basis: "derived",
+				prompt_cache_key_id: "effective-key",
+				model_out: "gpt-5.6-sol-2026-05-13",
+			},
+			{
+				trace_schema_version: 16,
+				phase: "response",
+				request_id: "root-request",
+				attempt_id: "root-attempt",
+				input_tokens: 100,
+				cache_read_input_tokens: 0,
+				cache_creation_input_tokens: 20,
+				cache_creation_measurement_available: true,
+			},
+			{
+				trace_schema_version: 16,
+				phase: "request",
+				request_id: "continuation-request",
+				attempt_id: "continuation-attempt",
+				ts: "2026-07-10T00:02:00Z",
+				conversation_id: "derived-compacted",
+				canonical_conversation_id: "canonical-root",
+				cache_key_continuity_basis: "lineage_match",
+				prompt_cache_key_id: "effective-key",
+				model_out: "gpt-5.6-sol-2026-05-13",
+			},
+			{
+				trace_schema_version: 16,
+				phase: "response",
+				request_id: "continuation-request",
+				attempt_id: "continuation-attempt",
+				input_tokens: 200,
+				cache_read_input_tokens: 100,
+				cache_creation_input_tokens: 10,
+				cache_creation_measurement_available: true,
+			},
+			{
+				trace_schema_version: 15,
+				phase: "request",
+				request_id: "legacy-request",
+				attempt_id: "legacy-attempt",
+				ts: "2026-07-10T00:03:00Z",
+				cache_key_continuity_basis: "raw-private-value",
+				prompt_cache_key_id: "legacy-key",
+				model_out: "private-model-name",
+			},
+		]);
+
+		const lineage = report.continuity.rows.find(
+			(row) => row.basis === "lineage_match",
+		);
+		expect(lineage).toMatchObject({
+			model: "gpt-5.6-sol",
+			turn: "follow_up_observed",
+			gapBand: "from_1m_to_5m",
+			requests: 1,
+			joinedResponses: 1,
+			unjoinedRequests: 0,
+			measuredResponses: 1,
+			weightedCachedReadPct: 50,
+			positiveHitResponses: 1,
+			positiveHitRatePct: 100,
+			zeroHitResponses: 0,
+			cacheWriteMeasuredResponses: 1,
+			cacheWriteTokens: 10,
+			compactionContinuations: 1,
+			keyRotations: 0,
+			distinctEffectiveKeys: 1,
+			maxRequestsPerKeyMinute: 1,
+			keysOver15RequestsPerMinute: 0,
+		});
+		const unknown = report.continuity.rows.find(
+			(row) => row.basis === "unknown",
+		);
+		expect(unknown).toMatchObject({
+			model: "other_or_custom",
+			turn: "unknown",
+			gapBand: "unknown",
+			requests: 1,
+			unjoinedRequests: 1,
+		});
+		const text = formatReport(report);
+		const continuityText = text.slice(
+			text.indexOf("CACHE KEY CONTINUITY PROVENANCE"),
+		);
+		expect(continuityText).toContain("CACHE KEY CONTINUITY PROVENANCE");
+		expect(continuityText).not.toContain("raw-private-value");
+		expect(continuityText).not.toContain("private-model-name");
+	});
+
 	test("parseTraceJsonl skips blank, malformed, and non-object lines", () => {
 		const recs = parseTraceJsonl(
 			'{"phase":"request"}\n\nnot-json\nnull\n42\n[]\n{"phase":"response"}\n',

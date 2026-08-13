@@ -79,7 +79,45 @@ function makeDbOps(pauseResult = true) {
 	return { pauseAccountIfActive };
 }
 
+class ReceiverBoundDbOps {
+	calls: Array<[string, string, string | undefined]> = [];
+
+	async pauseAccountIfActive(
+		accountId: string,
+		reason: string,
+		expectedRefreshToken?: string,
+	): Promise<boolean> {
+		this.calls.push([accountId, reason, expectedRefreshToken]);
+		return true;
+	}
+}
+
 describe("pauseAccountForReauthIfInvalidGrant", () => {
+	it("invokes receiver-bound database pause methods with their owner", async () => {
+		const dbOps = new ReceiverBoundDbOps();
+		const account = makeAccount({
+			provider: "codex",
+			refresh_token: "rt-revoked",
+		});
+
+		await expect(
+			pauseAccountForReauthIfInvalidGrant(
+				new Error("invalid_grant: refresh token expired"),
+				account,
+				dbOps,
+				"rt-revoked",
+			),
+		).resolves.toBe(true);
+		await expect(
+			pauseAccountForUpstreamAuthFailure(account, dbOps, "rt-revoked"),
+		).resolves.toBe(true);
+
+		expect(dbOps.calls).toEqual([
+			[account.id, "oauth_invalid_grant", "rt-revoked"],
+			[account.id, "oauth_invalid_grant", "rt-revoked"],
+		]);
+	});
+
 	it("maps OAuth upstream 401s to the re-auth pause reason", async () => {
 		const pauseAccountIfActive = mock(async () => true);
 		const account = makeAccount({
@@ -241,6 +279,22 @@ describe("pauseAccountForReauthIfInvalidGrant", () => {
 		).toBe(false);
 	});
 
+	it("recognizes structured OAuth error payloads without object coercion", () => {
+		expect(
+			isTerminalTokenRefreshFailure({
+				error: { code: "invalid_grant", message: "refresh token expired" },
+			}),
+		).toBe(true);
+	});
+
+	it("does not quarantine on an incidental invalid_grant mention in structured prose", () => {
+		expect(
+			isTerminalTokenRefreshFailure({
+				error: { message: "provider mentioned invalid_grant in prose" },
+			}),
+		).toBe(false);
+	});
+
 	it("is safe when a legacy context has no pause operation", async () => {
 		const account = makeAccount({ refresh_token: "rt-legacy" });
 		await expect(pauseAccountForUpstreamAuthFailure(account, {})).resolves.toBe(
@@ -304,6 +358,44 @@ describe("pauseAccountForReauthIfInvalidGrant", () => {
 
 		expect(paused).toBe(true);
 		expect(dbOps.pauseAccountIfActive).toHaveBeenCalledTimes(1);
+	});
+
+	it("pauses on a structured invalid_grant payload", async () => {
+		const dbOps = makeDbOps(true);
+		const account = {
+			id: "acc-structured",
+			name: "test",
+			provider: "codex",
+			refresh_token: "rt-structured",
+		};
+
+		const paused = await pauseAccountForReauthIfInvalidGrant(
+			{ error: { code: "invalid_grant", message: "expired" } },
+			account,
+			dbOps as never,
+		);
+
+		expect(paused).toBe(true);
+		expect(dbOps.pauseAccountIfActive).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not pause on a structured prose-only invalid_grant mention", async () => {
+		const dbOps = makeDbOps(true);
+		const account = {
+			id: "acc-structured-prose",
+			name: "test",
+			provider: "codex",
+			refresh_token: "rt-structured-prose",
+		};
+
+		const paused = await pauseAccountForReauthIfInvalidGrant(
+			{ error: { message: "provider mentioned invalid_grant in prose" } },
+			account,
+			dbOps as never,
+		);
+
+		expect(paused).toBe(false);
+		expect(dbOps.pauseAccountIfActive).not.toHaveBeenCalled();
 	});
 
 	it("does not publish when another writer wins the pause guard", async () => {

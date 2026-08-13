@@ -9,6 +9,8 @@ const DEFAULT_MAX_FRAME_BYTES = BUFFER_SIZES.SSE_TRANSPORT_FRAME_MAX_BYTES;
 const DEFAULT_MAX_BUFFER_BYTES = BUFFER_SIZES.SSE_TRANSPORT_TAIL_MAX_BYTES;
 const MAX_SAFE_ERROR_TYPE_LENGTH = 64;
 const SAFE_ERROR_TYPE = /^[A-Za-z0-9._:-]+$/;
+const MAX_SAFE_ERROR_CODE_LENGTH = 64;
+const SAFE_ERROR_CODE = /^[A-Za-z0-9._:-]+$/;
 
 const KNOWN_ANTHROPIC_EVENTS = new Set([
 	"message_start",
@@ -54,6 +56,10 @@ export interface AnthropicStreamOutcome {
 	parseState: AnthropicStreamParseState;
 	limitKind?: Extract<StreamResourceLimitKind, "sse_frame" | "sse_tail">;
 	errorType?: string;
+	/** Bounded machine-readable nested error.code, when supplied upstream. */
+	errorCode?: string;
+	/** Bounded machine-readable nested error.status, when supplied upstream. */
+	upstreamStatus?: string;
 	messageStopSeen: boolean;
 	errorEventSeen: boolean;
 	truncatedTailSeen: boolean;
@@ -103,6 +109,8 @@ export class AnthropicStreamOutcomeTracker {
 		| Extract<StreamResourceLimitKind, "sse_frame" | "sse_tail">
 		| undefined;
 	private errorType: string | undefined;
+	private errorCode: string | undefined;
+	private upstreamStatus: string | undefined;
 	private messageStopSeen = false;
 	private errorEventSeen = false;
 	private truncatedTailSeen = false;
@@ -178,6 +186,8 @@ export class AnthropicStreamOutcomeTracker {
 			parseState,
 			...(this.limitKind ? { limitKind: this.limitKind } : {}),
 			...(this.errorType ? { errorType: this.errorType } : {}),
+			...(this.errorCode ? { errorCode: this.errorCode } : {}),
+			...(this.upstreamStatus ? { upstreamStatus: this.upstreamStatus } : {}),
 			messageStopSeen: this.messageStopSeen,
 			errorEventSeen: this.errorEventSeen,
 			truncatedTailSeen: this.truncatedTailSeen,
@@ -287,11 +297,17 @@ export class AnthropicStreamOutcomeTracker {
 		if (resolvedType === "error") {
 			this.errorEventSeen = true;
 			this.errorEventCount = saturatingAdd(this.errorEventCount, 1);
+			const nestedError = isRecord(parsed) ? parsed.error : undefined;
 			if (!this.errorType) {
-				const nestedError = isRecord(parsed) ? parsed.error : undefined;
 				this.errorType = safeErrorType(
 					isRecord(nestedError) ? nestedError.type : undefined,
 				);
+			}
+			if (!this.errorCode && isRecord(nestedError)) {
+				this.errorCode = safeErrorCode(nestedError.code);
+			}
+			if (!this.upstreamStatus && isRecord(nestedError)) {
+				this.upstreamStatus = safeUpstreamStatus(nestedError.status);
 			}
 			return;
 		}
@@ -319,4 +335,32 @@ export class AnthropicStreamOutcomeTracker {
 		}
 		this.markMalformed();
 	}
+}
+
+function safeErrorCode(value: unknown): string | undefined {
+	if (
+		typeof value !== "string" ||
+		value.length === 0 ||
+		value.length > MAX_SAFE_ERROR_CODE_LENGTH ||
+		!SAFE_ERROR_CODE.test(value)
+	) {
+		return undefined;
+	}
+	return value;
+}
+
+function safeUpstreamStatus(value: unknown): string | undefined {
+	if (typeof value === "number") {
+		return Number.isFinite(value) &&
+			Number.isInteger(value) &&
+			value >= 100 &&
+			value <= 599
+			? String(value)
+			: undefined;
+	}
+	if (typeof value !== "string" || !/^\d{3}$/.test(value)) {
+		return undefined;
+	}
+	const parsed = Number(value);
+	return parsed >= 100 && parsed <= 599 ? value : undefined;
 }

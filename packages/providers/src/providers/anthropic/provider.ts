@@ -1,5 +1,6 @@
 import {
 	BUFFER_SIZES,
+	formatOAuthErrorMessage,
 	getModelFamily,
 	isInvalidGrantMessage,
 	mapModelName,
@@ -187,28 +188,21 @@ export class AnthropicProvider extends BaseProvider {
 		});
 
 		if (!response.ok) {
-			let errorMessage = response.statusText;
+			let errorMessage =
+				formatOAuthErrorMessage(response.statusText) ||
+				"OAuth token endpoint rejected request";
 			let errorData: unknown = null;
 			let responseText = "";
 			try {
 				responseText = await response.text();
-				log.debug("Error response body:", responseText);
 				errorData = JSON.parse(responseText);
-				const errorObj = errorData as {
-					error?: string;
-					error_description?: string;
-					message?: string;
-				};
 				// Preserve the machine-readable RFC-6749 error code (e.g.
 				// "invalid_grant") ahead of any human-readable description. When only
 				// error_description is surfaced the code is discarded, and the
 				// token-manager's requires_reauth detection — which keys on that code —
 				// silently misses a dead refresh token (the exact 43h-undetected
 				// incident this feature exists for).
-				errorMessage =
-					[errorObj.error, errorObj.error_description || errorObj.message]
-						.filter(Boolean)
-						.join(": ") || errorMessage;
+				errorMessage = formatOAuthErrorMessage(errorData) || errorMessage;
 
 				// Log specific OAuth authentication errors
 				if (response.status === 401 && typeof errorMessage === "string") {
@@ -237,7 +231,6 @@ export class AnthropicProvider extends BaseProvider {
 			}
 			log.error(
 				`Token refresh failed for ${account.name}: Status ${response.status}, Error: ${errorMessage}`,
-				errorData,
 			);
 			const failureMessage = `Failed to refresh token for account ${account.name}: ${errorMessage}`;
 			// A revoked/invalid refresh token is terminal (not retryable) and is

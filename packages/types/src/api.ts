@@ -122,6 +122,32 @@ export interface AccountQuotaPressure {
 	comparisonKey: string | null;
 }
 
+/**
+ * Request-local, bounded evidence for a selection terminal. This deliberately
+ * contains only policy flags and cardinalities: account identities, headers,
+ * request bodies, and provider messages must never cross the terminal
+ * response boundary.
+ */
+export type RoutingSelectionMode = "off" | "observe" | "enforce";
+
+export type RoutingSelectionZeroAttemptReason =
+	| "policy_excluded"
+	| "no_eligible_candidates"
+	| "all_unavailable"
+	| "selection_timeout";
+
+export interface RoutingSelectionDiagnostics {
+	readonly mode: RoutingSelectionMode;
+	readonly structuralCandidateCount: number;
+	readonly eligibleCandidateCount: number;
+	readonly excludedCandidateCount: number;
+	readonly selectedCandidateCount: number;
+	readonly zeroAttemptReason: RoutingSelectionZeroAttemptReason;
+	readonly forcedRoute: boolean;
+	readonly capabilityProfile: boolean;
+	readonly routeProfile: boolean;
+}
+
 export interface RequestMeta {
 	id: string;
 	/** Authenticated guard attempt join key. Absent for direct or invalid traffic. */
@@ -189,6 +215,8 @@ export interface RequestMeta {
 	routingCandidateCatalog?: readonly RoutingCandidateMetadata[] | null;
 	/** Candidate metadata aligned index-for-index with the current account list. */
 	routingCandidates?: readonly RoutingCandidateMetadata[] | null;
+	/** Request-local bounded selection evidence for a zero-attempt terminal. */
+	routingSelectionDiagnostics?: RoutingSelectionDiagnostics | null;
 	/**
 	 * Set by SessionAffinityStrategy (R13 anti-thrash) when an active
 	 * suppression window prevents this request from upgrading to an

@@ -1,3 +1,4 @@
+import type { ImplicitFallbackPolicyConfig } from "@better-ccflare/config";
 import {
 	getConfiguredModelMapping,
 	getModelFamily,
@@ -24,12 +25,14 @@ import type {
 	AffinityOwnerDirective,
 	ComboFamily,
 	ComboMembershipSource,
+	ComboRouteClass,
 	ComboRoutingPolicySnapshot,
 	ComboSlotInfo,
 	RequestMeta,
 	RoutingCandidateMetadata,
 	RoutingCandidateServerToolCapability,
 	RoutingCandidateServerToolCapabilityReason,
+	RoutingSelectionDiagnostics,
 	ServerToolCapabilityTuple,
 	ServerToolRoutingCapabilitySummary,
 } from "@better-ccflare/types";
@@ -45,6 +48,7 @@ import {
 } from "../server-tool-routing-errors";
 import { buildComboMembershipDiagnostics } from "./managed-routing-diagnostics";
 import type { ProxyContext } from "./proxy-types";
+import { boundedRoutingSelectionCount } from "./routing-selection-diagnostics";
 import {
 	evaluateHardCapacity,
 	getWeeklyQuotaPressure,
@@ -61,6 +65,9 @@ const PRESSURE_RANK = {
 	urgent: 4,
 	critical: 5,
 } as const;
+
+const IMPLICIT_FALLBACK_DIAGNOSTIC_INTERVAL_MS = 60_000;
+let implicitFallbackDiagnosticLastLoggedAt = 0;
 
 export {
 	buildComboMembershipDiagnostics,
@@ -1466,6 +1473,159 @@ function isProviderExcludedForRequest(
 	return false;
 }
 
+export type ImplicitFallbackPolicyDecisionReason =
+	| "off"
+	| "allowed"
+	| "denied"
+	| "unknown";
+
+export interface ImplicitFallbackPolicyDecision {
+	readonly allowed: boolean;
+	readonly routeClass: ComboRouteClass | null;
+	readonly reason: ImplicitFallbackPolicyDecisionReason;
+}
+
+const IMPLICIT_FALLBACK_POLICY_OFF: ImplicitFallbackPolicyConfig =
+	Object.freeze({
+		mode: "off",
+		allowedClasses: Object.freeze([]),
+		deniedClasses: Object.freeze([]),
+	});
+
+/**
+ * Pure account admission predicate for implicit normal/combo fallback. The
+ * route class is derived from the provider's existing credential-shape rules;
+ * no billing status or provider price assumptions are made here.
+ */
+export function evaluateImplicitFallbackPolicy(
+	account: Account,
+	policy: ImplicitFallbackPolicyConfig,
+): ImplicitFallbackPolicyDecision {
+	const routeClass = deriveComboRouteClass(account);
+	if (policy.mode === "off") {
+		return { allowed: true, routeClass, reason: "off" };
+	}
+	if (routeClass === null) {
+		return {
+			allowed: policy.mode !== "enforce",
+			routeClass: null,
+			reason: "unknown",
+		};
+	}
+	if (policy.allowedClasses.includes(routeClass)) {
+		return { allowed: true, routeClass, reason: "allowed" };
+	}
+	if (policy.deniedClasses.includes(routeClass)) {
+		return { allowed: false, routeClass, reason: "denied" };
+	}
+	return { allowed: true, routeClass, reason: "allowed" };
+}
+
+export function isImplicitFallbackAccountAllowed(
+	account: Account,
+	policy: ImplicitFallbackPolicyConfig,
+): boolean {
+	return evaluateImplicitFallbackPolicy(account, policy).allowed;
+}
+
+function setImplicitFallbackSelectionDiagnostics(
+	meta: RequestMeta,
+	policy: ImplicitFallbackPolicyConfig,
+	structuralCandidateCount: number,
+	eligibleCandidateCount: number,
+): void {
+	if (policy.mode === "off" || structuralCandidateCount <= 0) return;
+	const structural = boundedRoutingSelectionCount(structuralCandidateCount);
+	const eligible = Math.min(
+		structural,
+		boundedRoutingSelectionCount(eligibleCandidateCount),
+	);
+	const existing = meta.routingSelectionDiagnostics;
+	const forcedRoute =
+		meta.forcedAccountId != null ||
+		meta.headers?.has("x-better-ccflare-account-id") === true;
+	const exactPolicyExclusion = policy.mode === "enforce" && eligible === 0;
+	const diagnostics: RoutingSelectionDiagnostics = {
+		mode: policy.mode,
+		structuralCandidateCount: structural,
+		eligibleCandidateCount: eligible,
+		excludedCandidateCount: structural - eligible,
+		selectedCandidateCount: existing?.selectedCandidateCount ?? 0,
+		zeroAttemptReason: exactPolicyExclusion
+			? "policy_excluded"
+			: "all_unavailable",
+		forcedRoute,
+		capabilityProfile: meta.routeProfileSelection === "capability",
+		routeProfile: meta.routeProfileId != null,
+	};
+	meta.routingSelectionDiagnostics = diagnostics;
+}
+
+function finalizeSelectionDiagnostics(
+	meta: RequestMeta,
+	selectedCandidateCount: number,
+): void {
+	const existing = meta.routingSelectionDiagnostics;
+	if (!existing) return;
+	meta.routingSelectionDiagnostics = {
+		...existing,
+		selectedCandidateCount: boundedRoutingSelectionCount(
+			selectedCandidateCount,
+		),
+		zeroAttemptReason:
+			selectedCandidateCount === 0
+				? existing.zeroAttemptReason
+				: existing.zeroAttemptReason === "policy_excluded"
+					? "all_unavailable"
+					: existing.zeroAttemptReason,
+	};
+}
+
+/**
+ * Apply the process snapshot to an implicit candidate pool. Observe mode emits
+ * aggregate diagnostics but deliberately returns the original order and set.
+ */
+function applyImplicitFallbackPolicy(
+	accounts: Account[],
+	ctx: ProxyContext,
+	lane: "normal" | "combo",
+	meta?: RequestMeta,
+): Account[] {
+	const policy = ctx.implicitFallbackPolicy ?? IMPLICIT_FALLBACK_POLICY_OFF;
+	if (policy.mode === "off") return accounts;
+
+	let deniedCount = 0;
+	let unknownCount = 0;
+	const filtered = accounts.filter((account) => {
+		const decision = evaluateImplicitFallbackPolicy(account, policy);
+		if (decision.reason === "unknown") unknownCount += 1;
+		if (!decision.allowed) deniedCount += 1;
+		return decision.allowed;
+	});
+	if (meta) {
+		setImplicitFallbackSelectionDiagnostics(
+			meta,
+			policy,
+			accounts.length,
+			filtered.length,
+		);
+	}
+
+	if (deniedCount > 0 || unknownCount > 0) {
+		const now = Date.now();
+		if (
+			now - implicitFallbackDiagnosticLastLoggedAt >=
+			IMPLICIT_FALLBACK_DIAGNOSTIC_INTERVAL_MS
+		) {
+			implicitFallbackDiagnosticLastLoggedAt = now;
+			log.info(
+				`Implicit fallback policy ${policy.mode} ${lane} candidates: denied=${deniedCount}, unknown=${unknownCount}`,
+			);
+		}
+	}
+	return policy.mode === "observe" ? accounts : filtered;
+}
+
 /**
  * Match an account against the root capability declared by a dynamic model
  * route profile.  The profile's logical model is intentionally used here,
@@ -1638,6 +1798,7 @@ export async function getOrderedAccounts(
 				throwServerToolCapabilityPoolError(meta);
 			}
 		}
+		finalizeSelectionDiagnostics(meta, affinityOrdered.length);
 		return affinityOrdered;
 	} catch (error) {
 		capacityDeferredModelRoutesMap.delete(meta);
@@ -1679,6 +1840,7 @@ async function selectAccountsForRequestInternal(
 	meta.quotaPressureByAccountId = null;
 	meta.routingCandidateCatalog = null;
 	meta.routingCandidates = null;
+	meta.routingSelectionDiagnostics = null;
 	meta.serverToolCapabilitySummary = undefined;
 	saveCapacityContext(meta, effectiveModel, []);
 
@@ -1975,6 +2137,8 @@ async function selectAccountsForRequestInternal(
 		}
 		return filtered;
 	};
+	const applyNormalImplicitFallbackPolicy = (accounts: Account[]): Account[] =>
+		applyImplicitFallbackPolicy(accounts, ctx, "normal", meta);
 
 	let preloadedAccounts: Account[] | undefined;
 	let priorServerToolCatalog: readonly RoutingCandidateMetadata[] = [];
@@ -2060,6 +2224,26 @@ async function selectAccountsForRequestInternal(
 					for (const account of allAccounts) {
 						accountMap.set(account.id, account);
 					}
+					// Policy diagnostics must describe concrete combo slots, not the
+					// entire account table. A single account may occupy multiple model
+					// slots, while provider exclusions remove rows before they can be
+					// routed; using allAccounts here misreports both counts and the
+					// zero-attempt reason.
+					const comboPolicyAccounts = resolution.members
+						.map((member) => accountMap.get(member.account_id))
+						.filter(
+							(account): account is Account =>
+								account !== undefined && !isProviderExcluded(account),
+						);
+					const implicitComboAccounts = applyImplicitFallbackPolicy(
+						comboPolicyAccounts,
+						ctx,
+						"combo",
+						meta,
+					);
+					const implicitComboAccountIds = new Set(
+						implicitComboAccounts.map((account) => account.id),
+					);
 
 					const eligibleEntries: Array<{
 						account: Account;
@@ -2092,7 +2276,11 @@ async function selectAccountsForRequestInternal(
 							continue;
 						}
 
-						if (isProviderExcluded(account)) continue;
+						if (
+							isProviderExcluded(account) ||
+							!implicitComboAccountIds.has(account.id)
+						)
+							continue;
 						const routing: RoutingCandidateMetadata = {
 							candidateId: member.id,
 							accountId: account.id,
@@ -2167,8 +2355,10 @@ async function selectAccountsForRequestInternal(
 					setXaiCacheEligibleAccounts(
 						meta,
 						meta.serverToolRequirements
-							? allAccounts.filter((account) => !isProviderExcluded(account))
-							: allAccounts,
+							? implicitComboAccounts.filter(
+									(account) => !isProviderExcluded(account),
+								)
+							: implicitComboAccounts,
 					);
 					const fullyExcludedAccountIds = new Set<string>();
 					for (const [accountId, count] of candidateCountsByAccount) {
@@ -2318,6 +2508,7 @@ async function selectAccountsForRequestInternal(
 							};
 							setComboSlotInfo(meta, slotInfo);
 							meta.comboName = combo.name;
+							finalizeSelectionDiagnostics(meta, orderedEntries.length);
 							return orderedEntries.map((entry) => entry.account);
 						}
 					}
@@ -2368,7 +2559,7 @@ async function selectAccountsForRequestInternal(
 		preloadedAccounts,
 		options.degradedOwner,
 		priorServerToolCatalog,
-		applyExclusions,
+		(accounts) => applyNormalImplicitFallbackPolicy(applyExclusions(accounts)),
 	);
 }
 

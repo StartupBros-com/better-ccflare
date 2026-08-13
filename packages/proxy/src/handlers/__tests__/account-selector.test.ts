@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, mock } from "bun:test";
+import type { ImplicitFallbackPolicyConfig } from "@better-ccflare/config";
 import type { Provider } from "@better-ccflare/providers";
 import type {
 	Account,
@@ -32,6 +33,8 @@ const {
 	getComboSlotInfo,
 	getReactiveModelCapacityBlocker,
 	getRoutingCapacityContext,
+	evaluateImplicitFallbackPolicy,
+	isImplicitFallbackAccountAllowed,
 	resolveEffectiveModel,
 	selectAccountsForRequest,
 	setComboSlotInfo,
@@ -322,6 +325,212 @@ describe("setComboSlotInfo / getComboSlotInfo", () => {
 			slots: [{ accountId: "a", modelOverride: "m" }],
 		});
 		expect(getComboSlotInfo(meta2)).toBeNull();
+	});
+});
+
+describe("selectAccountsForRequest — implicit fallback drain policy", () => {
+	const enforcePaidDrain: ImplicitFallbackPolicyConfig = {
+		mode: "enforce",
+		allowedClasses: [],
+		deniedClasses: ["api-key", "cloud-credential"],
+	};
+
+	function openRouterAccount(id = "openrouter"): Account {
+		return makeAccount({
+			id,
+			provider: "openrouter",
+			api_key: "sk-test",
+			refresh_token: null,
+			access_token: null,
+		});
+	}
+
+	it("filters paid and cloud credentials in enforce mode but keeps OAuth/local classes", () => {
+		const oauth = makeAccount({ id: "oauth" });
+		const local = makeAccount({
+			id: "local",
+			provider: "ollama",
+			api_key: null,
+			refresh_token: null,
+			access_token: null,
+		});
+		const paid = openRouterAccount();
+		const cloud = makeAccount({
+			id: "cloud",
+			provider: "bedrock",
+			api_key: null,
+			refresh_token: null,
+			access_token: null,
+		});
+		const ctx = makeCtx({ accounts: [oauth, paid, local, cloud] });
+		ctx.implicitFallbackPolicy = enforcePaidDrain;
+
+		return selectAccountsForRequest(
+			makeRequestMeta(),
+			ctx,
+			"claude-opus-4-8",
+		).then((result) => {
+			expect(result.map(({ id }) => id)).toEqual([oauth.id, local.id]);
+		});
+	});
+
+	it("preserves candidate order in observe mode even when the same classes would be denied", async () => {
+		const paid = openRouterAccount();
+		const oauth = makeAccount({ id: "oauth" });
+		const ctx = makeCtx({ accounts: [paid, oauth] });
+		ctx.implicitFallbackPolicy = {
+			...enforcePaidDrain,
+			mode: "observe",
+		};
+
+		const meta = makeRequestMeta();
+		const result = await selectAccountsForRequest(meta, ctx, "claude-opus-4-8");
+		expect(result.map(({ id }) => id)).toEqual([paid.id, oauth.id]);
+		expect(meta.routingSelectionDiagnostics).toMatchObject({
+			mode: "observe",
+			structuralCandidateCount: 2,
+			eligibleCandidateCount: 1,
+			excludedCandidateCount: 1,
+			selectedCandidateCount: 2,
+			zeroAttemptReason: "all_unavailable",
+		});
+	});
+
+	it("fails closed for an unknown route class only in enforce mode", () => {
+		const unknown = makeAccount({
+			id: "unknown",
+			provider: "future-provider",
+			api_key: null,
+			refresh_token: null,
+			access_token: null,
+		});
+		expect(isImplicitFallbackAccountAllowed(unknown, enforcePaidDrain)).toBe(
+			false,
+		);
+		expect(
+			isImplicitFallbackAccountAllowed(unknown, {
+				...enforcePaidDrain,
+				mode: "observe",
+			}),
+		).toBe(true);
+		expect(
+			evaluateImplicitFallbackPolicy(unknown, enforcePaidDrain),
+		).toMatchObject({
+			allowed: false,
+			routeClass: null,
+			reason: "unknown",
+		});
+	});
+
+	it("does not block an explicit forced account even when its class is denied", async () => {
+		const paid = openRouterAccount("forced-openrouter");
+		const fallback = makeAccount({ id: "oauth-fallback" });
+		const ctx = makeCtx({ accounts: [paid, fallback] });
+		ctx.implicitFallbackPolicy = enforcePaidDrain;
+		const meta = makeRequestMeta({
+			headers: new Headers({ "x-better-ccflare-account-id": paid.id }),
+		});
+
+		const result = await selectAccountsForRequest(meta, ctx, "claude-opus-4-8");
+		expect(result).toEqual([paid]);
+	});
+
+	it("applies enforcement to combo candidates before normal fallback", async () => {
+		const paid = openRouterAccount("combo-openrouter");
+		const oauth = makeAccount({ id: "combo-oauth" });
+		const unrelatedPaid = openRouterAccount("unrelated-openrouter");
+		const combo = makeCombo([
+			{
+				id: "slot-paid",
+				combo_id: "combo-1",
+				account_id: paid.id,
+				model: "claude-sonnet-4-5",
+				priority: 0,
+				enabled: true,
+			},
+			{
+				id: "slot-oauth",
+				combo_id: "combo-1",
+				account_id: oauth.id,
+				model: "claude-sonnet-4-5",
+				priority: 1,
+				enabled: true,
+			},
+		]);
+		const ctx = makeCtx({
+			accounts: [paid, oauth, unrelatedPaid],
+			activeCombo: combo,
+		});
+		ctx.implicitFallbackPolicy = enforcePaidDrain;
+		const meta = makeRequestMeta();
+
+		const result = await selectAccountsForRequest(
+			meta,
+			ctx,
+			"claude-sonnet-4-5",
+		);
+		expect(result.map(({ id }) => id)).toEqual([oauth.id]);
+		expect(
+			getComboSlotInfo(meta)?.slots.map(({ accountId }) => accountId),
+		).toEqual([oauth.id]);
+		expect(meta.routingSelectionDiagnostics).toMatchObject({
+			structuralCandidateCount: 2,
+			eligibleCandidateCount: 1,
+			excludedCandidateCount: 1,
+		});
+	});
+
+	it("classifies an enforce-mode zero pool as all_unavailable when the remaining account is paused", async () => {
+		const pausedOauth = makeAccount({ id: "paused-oauth", paused: true });
+		const ctx = makeCtx({ accounts: [pausedOauth] });
+		ctx.implicitFallbackPolicy = enforcePaidDrain;
+		useSessionStrategy(ctx);
+		const meta = makeRequestMeta();
+
+		const result = await selectAccountsForRequest(meta, ctx, "claude-opus-4-8");
+		expect(result).toEqual([]);
+		expect(meta.routingSelectionDiagnostics).toMatchObject({
+			mode: "enforce",
+			structuralCandidateCount: 1,
+			eligibleCandidateCount: 1,
+			zeroAttemptReason: "all_unavailable",
+		});
+	});
+
+	it("records policy_excluded only when enforce mode removes every implicit candidate", async () => {
+		const paid = openRouterAccount("only-paid");
+		const ctx = makeCtx({ accounts: [paid] });
+		ctx.implicitFallbackPolicy = enforcePaidDrain;
+		const meta = makeRequestMeta();
+
+		const result = await selectAccountsForRequest(meta, ctx, "claude-opus-4-8");
+		expect(result).toEqual([]);
+		expect(meta.routingSelectionDiagnostics).toMatchObject({
+			mode: "enforce",
+			structuralCandidateCount: 1,
+			eligibleCandidateCount: 0,
+			excludedCandidateCount: 1,
+			zeroAttemptReason: "policy_excluded",
+		});
+	});
+
+	it("bypasses implicit fallback policy for an explicit capability-profile API-key route", async () => {
+		const paid = openRouterAccount("capability-paid");
+		paid.model_mappings = JSON.stringify({ opus: "openrouter/physical-opus" });
+		const fallback = makeAccount({ id: "oauth-fallback" });
+		const ctx = makeCtx({ accounts: [paid, fallback] });
+		ctx.implicitFallbackPolicy = enforcePaidDrain;
+		const meta = makeRequestMeta({
+			routeProfileId: "capability-openrouter-opus",
+			routeProfileSelection: "capability",
+			routeProfileLogicalModel: "claude-opus-5",
+			routeProfileExpectedPhysicalModel: "openrouter/physical-opus",
+			routeExpectedProvider: "openrouter",
+		});
+
+		const result = await selectAccountsForRequest(meta, ctx, "claude-opus-5");
+		expect(result).toEqual([paid]);
+		expect(meta.routingSelectionDiagnostics).toBeNull();
 	});
 });
 

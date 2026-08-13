@@ -916,6 +916,8 @@ export async function forwardToClient(
 					parseState: anthropicOutcome.parseState,
 					limitKind: anthropicOutcome.limitKind ?? null,
 					errorType: anthropicOutcome.errorType ?? null,
+					errorCode: anthropicOutcome.errorCode ?? null,
+					upstreamStatus: anthropicOutcome.upstreamStatus ?? null,
 					messageStopSeen: anthropicOutcome.messageStopSeen,
 					errorEventSeen: anthropicOutcome.errorEventSeen,
 					truncatedTailSeen: anthropicOutcome.truncatedTailSeen,

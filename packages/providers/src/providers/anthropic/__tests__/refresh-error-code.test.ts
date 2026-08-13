@@ -98,4 +98,28 @@ describe("AnthropicProvider.refreshToken preserves the OAuth error code", () => 
 
 		expect(thrown?.message).toContain("invalid_grant");
 	});
+
+	it("classifies a nested structured invalid_grant response as terminal", async () => {
+		const provider = new AnthropicProvider();
+		globalThis.fetch = mock(
+			async () =>
+				new Response(
+					JSON.stringify({
+						error: {
+							code: "invalid_grant",
+							message: "The refresh token has expired.",
+						},
+					}),
+					{ status: 400, headers: { "content-type": "application/json" } },
+				),
+		) as unknown as typeof fetch;
+
+		let thrown: unknown;
+		try {
+			await provider.refreshToken(oauthAccount(), "test-client");
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).toHaveProperty("code", "OAUTH_INVALID_GRANT");
+	});
 });

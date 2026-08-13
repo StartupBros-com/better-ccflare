@@ -180,6 +180,28 @@ export function accountSupportsRefreshBackedUsagePolling(account: {
 }
 
 /**
+ * Persist a Codex ping's reset timestamp without allowing a stale response to
+ * move the account's current reset backwards. The comparison belongs in the
+ * UPDATE's WHERE clause so it is evaluated atomically against the row that is
+ * being written (a concurrent 429 can therefore win even after this refresh
+ * started).
+ */
+export async function persistForwardOnlyCodexRateLimitReset(
+	db: {
+		run(sql: string, params?: unknown[]): Promise<void>;
+	},
+	accountId: string,
+	resetTime: number,
+): Promise<void> {
+	await db.run(
+		`UPDATE accounts SET rate_limit_reset = ?
+		 WHERE id = ?
+		   AND (rate_limit_reset IS NULL OR rate_limit_reset < ?)`,
+		[resetTime, accountId, resetTime],
+	);
+}
+
+/**
  * Routing decision for a request against the dashboard SPA, decoupled from
  * actual file I/O so the "never shadow an API route, the health endpoint,
  * or a proxy request" invariant is unit testable without booting the
@@ -1588,6 +1610,7 @@ export default async function startServer(options?: {
 		dbOps,
 		runtime: runtimeConfig,
 		config,
+		implicitFallbackPolicy: config.getImplicitFallbackPolicyConfig(),
 		provider,
 		refreshInFlight: new Map(),
 		asyncWriter,
@@ -1827,9 +1850,10 @@ export default async function startServer(options?: {
 			const rl = codexProvider.parseRateLimit(fetchResult.response);
 			if (rl.resetTime != null) {
 				try {
-					await db.run(
-						"UPDATE accounts SET rate_limit_reset = ? WHERE id = ?",
-						[rl.resetTime, account.id],
+					await persistForwardOnlyCodexRateLimitReset(
+						db,
+						account.id,
+						rl.resetTime,
 					);
 				} catch (error) {
 					log.warn(
