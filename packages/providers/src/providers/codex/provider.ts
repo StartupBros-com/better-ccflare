@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { getCodexReasoningRetention } from "@better-ccflare/config";
 import {
 	BUFFER_SIZES,
+	formatOAuthErrorMessage,
 	getModelFamily,
 	isInvalidGrantMessage,
 	mapModelName,
@@ -1070,10 +1071,15 @@ export class CodexProvider extends BaseProvider {
 		});
 
 		if (!response.ok) {
-			let errorData: { error?: string; error_description?: string } | null =
-				null;
+			let errorData: unknown = null;
+			let responseText = "";
 			try {
-				errorData = await response.json();
+				if (typeof response.text === "function") {
+					responseText = await response.text();
+					errorData = JSON.parse(responseText);
+				} else {
+					errorData = await response.json();
+				}
 			} catch {
 				// ignore
 			}
@@ -1082,14 +1088,15 @@ export class CodexProvider extends BaseProvider {
 			// description. Terminal-auth detection must not lose markers such as
 			// invalid_grant or refresh_token_reused when a description is present.
 			const errorMessage =
-				[errorData?.error, errorData?.error_description]
-					.filter(Boolean)
-					.join(": ") || response.statusText;
+				formatOAuthErrorMessage(errorData) ||
+				formatOAuthErrorMessage(response.statusText) ||
+				"OAuth token endpoint rejected request";
+			const errorCode = errorMessage.split(":", 1)[0]?.trim();
 
 			// Rotating refresh tokens: reuse → terminal, must re-auth. Throw the
 			// typed error so the refresh chokepoint pauses the account for reauth
 			// (detection is by type, not by message wording).
-			if (errorData?.error === "refresh_token_reused") {
+			if (errorCode === "refresh_token_reused") {
 				throw new OAuthRefreshTokenError(
 					account.id,
 					`Codex refresh_token_reused for account ${account.name}. Please re-authenticate with: bun run cli --reauthenticate ${account.name}`,
@@ -1097,7 +1104,10 @@ export class CodexProvider extends BaseProvider {
 			}
 
 			const failureMessage = `Failed to refresh Codex token for account ${account.name}: ${errorMessage}`;
-			if (isInvalidGrantMessage(errorMessage)) {
+			if (
+				isInvalidGrantMessage(errorMessage) ||
+				isInvalidGrantMessage(responseText)
+			) {
 				throw new OAuthRefreshTokenError(account.id, failureMessage);
 			}
 			throw new Error(failureMessage);
