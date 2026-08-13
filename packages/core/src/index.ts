@@ -20,7 +20,10 @@ export {
 	TIME_CONSTANTS,
 } from "./constants";
 export {
+	formatOAuthErrorMessage,
+	getOAuthErrorCode,
 	isInvalidGrantMessage,
+	isStructuredInvalidGrant,
 	logError,
 	OAuthError,
 	OAuthRefreshTokenError,

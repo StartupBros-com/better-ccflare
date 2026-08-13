@@ -279,6 +279,22 @@ describe("pauseAccountForReauthIfInvalidGrant", () => {
 		).toBe(false);
 	});
 
+	it("recognizes structured OAuth error payloads without object coercion", () => {
+		expect(
+			isTerminalTokenRefreshFailure({
+				error: { code: "invalid_grant", message: "refresh token expired" },
+			}),
+		).toBe(true);
+	});
+
+	it("does not quarantine on an incidental invalid_grant mention in structured prose", () => {
+		expect(
+			isTerminalTokenRefreshFailure({
+				error: { message: "provider mentioned invalid_grant in prose" },
+			}),
+		).toBe(false);
+	});
+
 	it("is safe when a legacy context has no pause operation", async () => {
 		const account = makeAccount({ refresh_token: "rt-legacy" });
 		await expect(pauseAccountForUpstreamAuthFailure(account, {})).resolves.toBe(
@@ -342,6 +358,44 @@ describe("pauseAccountForReauthIfInvalidGrant", () => {
 
 		expect(paused).toBe(true);
 		expect(dbOps.pauseAccountIfActive).toHaveBeenCalledTimes(1);
+	});
+
+	it("pauses on a structured invalid_grant payload", async () => {
+		const dbOps = makeDbOps(true);
+		const account = {
+			id: "acc-structured",
+			name: "test",
+			provider: "codex",
+			refresh_token: "rt-structured",
+		};
+
+		const paused = await pauseAccountForReauthIfInvalidGrant(
+			{ error: { code: "invalid_grant", message: "expired" } },
+			account,
+			dbOps as never,
+		);
+
+		expect(paused).toBe(true);
+		expect(dbOps.pauseAccountIfActive).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not pause on a structured prose-only invalid_grant mention", async () => {
+		const dbOps = makeDbOps(true);
+		const account = {
+			id: "acc-structured-prose",
+			name: "test",
+			provider: "codex",
+			refresh_token: "rt-structured-prose",
+		};
+
+		const paused = await pauseAccountForReauthIfInvalidGrant(
+			{ error: { message: "provider mentioned invalid_grant in prose" } },
+			account,
+			dbOps as never,
+		);
+
+		expect(paused).toBe(false);
+		expect(dbOps.pauseAccountIfActive).not.toHaveBeenCalled();
 	});
 
 	it("does not publish when another writer wins the pause guard", async () => {
