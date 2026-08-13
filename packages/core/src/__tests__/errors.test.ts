@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import {
 	formatOAuthErrorMessage,
+	getExactOAuthErrorCode,
 	isExactInvalidGrantMessage,
 	isInvalidGrantMessage,
 	isStructuredInvalidGrant,
@@ -68,6 +69,19 @@ describe("formatOAuthErrorMessage", () => {
 		expect(isExactInvalidGrantMessage("provider mentioned invalid_grant")).toBe(
 			false,
 		);
+	});
+
+	it("normalizes bounded whitespace and control characters for exact codes", () => {
+		expect(isExactInvalidGrantMessage("\u0000  INVALID_GRANT\r\n")).toBe(true);
+		expect(getExactOAuthErrorCode("\u0000  INVALID_GRANT\r\n")).toBe(
+			"invalid_grant",
+		);
+		expect(getExactOAuthErrorCode("provider mentioned invalid_grant")).toBe("");
+	});
+
+	it("rejects oversized exact-code bodies before normalization", () => {
+		const oversized = `${" ".repeat(64 * 1024)}invalid_grant`;
+		expect(isExactInvalidGrantMessage(oversized)).toBe(false);
 	});
 });
 
