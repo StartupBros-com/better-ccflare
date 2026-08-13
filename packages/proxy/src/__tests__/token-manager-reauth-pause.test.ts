@@ -79,7 +79,45 @@ function makeDbOps(pauseResult = true) {
 	return { pauseAccountIfActive };
 }
 
+class ReceiverBoundDbOps {
+	calls: Array<[string, string, string | undefined]> = [];
+
+	async pauseAccountIfActive(
+		accountId: string,
+		reason: string,
+		expectedRefreshToken?: string,
+	): Promise<boolean> {
+		this.calls.push([accountId, reason, expectedRefreshToken]);
+		return true;
+	}
+}
+
 describe("pauseAccountForReauthIfInvalidGrant", () => {
+	it("invokes receiver-bound database pause methods with their owner", async () => {
+		const dbOps = new ReceiverBoundDbOps();
+		const account = makeAccount({
+			provider: "codex",
+			refresh_token: "rt-revoked",
+		});
+
+		await expect(
+			pauseAccountForReauthIfInvalidGrant(
+				new Error("invalid_grant: refresh token expired"),
+				account,
+				dbOps,
+				"rt-revoked",
+			),
+		).resolves.toBe(true);
+		await expect(
+			pauseAccountForUpstreamAuthFailure(account, dbOps, "rt-revoked"),
+		).resolves.toBe(true);
+
+		expect(dbOps.calls).toEqual([
+			[account.id, "oauth_invalid_grant", "rt-revoked"],
+			[account.id, "oauth_invalid_grant", "rt-revoked"],
+		]);
+	});
+
 	it("maps OAuth upstream 401s to the re-auth pause reason", async () => {
 		const pauseAccountIfActive = mock(async () => true);
 		const account = makeAccount({

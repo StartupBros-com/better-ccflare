@@ -201,8 +201,7 @@ export async function pauseAccountForUpstreamAuthFailure(
 	/** Explicit credential identity used by the failed request, when known. */
 	expectedRefreshToken?: string | null,
 ): Promise<boolean> {
-	const pause = dbOps.pauseAccountIfActive;
-	if (typeof pause !== "function") return false;
+	if (typeof dbOps.pauseAccountIfActive !== "function") return false;
 	// `undefined` preserves the legacy call contract (derive from the live
 	// account). `null` is an explicit snapshot for a non-OAuth credential and
 	// must not fall through to a newly reauthenticated token on the account.
@@ -225,7 +224,11 @@ export async function pauseAccountForUpstreamAuthFailure(
 				: undefined
 			: refreshTokenForFailure;
 	try {
-		const paused = await pause(account.id, reason, expectedTokenForCas);
+		const paused = await dbOps.pauseAccountIfActive(
+			account.id,
+			reason,
+			expectedTokenForCas,
+		);
 		if (paused) {
 			log.error(
 				`Account "${account.name}" PAUSED — upstream authentication failed (401; ${reason}). Repair the credential before resuming it.`,
@@ -283,14 +286,13 @@ export async function pauseAccountForReauthIfInvalidGrant(
 	const isInvalidGrant =
 		error instanceof OAuthRefreshTokenError || isInvalidGrantMessage(message);
 	if (!isInvalidGrant) return false;
-	const pause = dbOps.pauseAccountIfActive;
-	if (typeof pause !== "function") return false;
+	if (typeof dbOps.pauseAccountIfActive !== "function") return false;
 	try {
 		const refreshTokenForCas =
 			expectedRefreshToken === undefined
 				? account.refresh_token
 				: expectedRefreshToken;
-		const paused = await pause(
+		const paused = await dbOps.pauseAccountIfActive(
 			account.id,
 			PAUSE_REASON_NEEDS_REAUTH,
 			refreshTokenForCas?.trim() ? refreshTokenForCas : undefined,
