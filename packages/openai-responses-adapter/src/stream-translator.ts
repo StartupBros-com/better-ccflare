@@ -328,6 +328,11 @@ function processEvent(
 
 		if (state.textByBlock.has(blockIndex)) {
 			const fullText = state.textByBlock.get(blockIndex)?.chunks.join("") ?? "";
+			// Once joined, only fullText is needed for the three final events and
+			// outputItems. Release the per-delta chunks before serializing them.
+			// translatedOutputBytesTotal remains unchanged because it tracks
+			// cumulative stream output, not currently-buffered memory.
+			state.textByBlock.delete(blockIndex);
 			emitSse(
 				controller,
 				"response.output_text.done",
