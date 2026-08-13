@@ -3,6 +3,7 @@ import type { AnthropicUsageData, UsageLimit } from "@better-ccflare/types";
 import {
 	collectAnthropicLimitRows,
 	collectAnthropicUsageRows,
+	describeBindingConstraint,
 	displayLabel,
 	formatWindowName,
 	isUsageWindow,
@@ -378,5 +379,76 @@ describe("collectAnthropicLimitRows — scoped identity (Greptile P2)", () => {
 		const windows = rows.map((r) => r.window);
 		expect(new Set(windows).size).toBe(3); // all distinct -> no duplicate React keys
 		expect(windows[0]).toBe("seven_day_fable"); // first stays byte-stable
+	});
+});
+
+describe("describeBindingConstraint", () => {
+	const familyScoped = {
+		window: "seven_day_fable",
+		utilization: 100,
+		resetAtMs: 1_800_000_000_000,
+		scope: "family" as const,
+		modelFamily: "fable",
+	};
+	const accountWide = {
+		window: "five_hour",
+		utilization: 64,
+		resetAtMs: 1_800_000_000_000,
+		scope: "account" as const,
+		modelFamily: null,
+	};
+
+	it("returns null when the server sent no constraint", () => {
+		// Older servers omit the field; the UI must simply not render the row.
+		expect(describeBindingConstraint(null, "five_hour")).toBeNull();
+		expect(describeBindingConstraint(undefined, "five_hour")).toBeNull();
+	});
+
+	it("returns null for a non-finite utilization", () => {
+		expect(
+			describeBindingConstraint(
+				{ ...accountWide, utilization: Number.NaN },
+				"five_hour",
+			),
+		).toBeNull();
+	});
+
+	it("flags a family-scoped cap as diverging from the routing badge", () => {
+		const display = describeBindingConstraint(familyScoped, "five_hour");
+		// This is the 2026-08-11 shape: badge reads 64%, Fable weekly is at 100%.
+		expect(display).toEqual({
+			label: "Fable (Weekly)",
+			utilization: 100,
+			scope: "family",
+			resetAtMs: 1_800_000_000_000,
+			divergesFromRouting: true,
+		});
+	});
+
+	it("flags a family-scoped cap even when it names the routing window", () => {
+		// Routing excludes scoped windows outright, so a scoped constraint can
+		// never be what the badge is reporting, whatever the window key says.
+		const display = describeBindingConstraint(familyScoped, "seven_day_fable");
+		expect(display?.divergesFromRouting).toBe(true);
+	});
+
+	it("does not flag an account-wide constraint the badge already reports", () => {
+		const display = describeBindingConstraint(accountWide, "five_hour");
+		expect(display?.scope).toBe("account");
+		expect(display?.divergesFromRouting).toBe(false);
+		expect(display?.label).toBe("5-hour");
+	});
+
+	it("flags an account-wide constraint on a different window than the badge", () => {
+		const display = describeBindingConstraint(accountWide, "seven_day");
+		expect(display?.divergesFromRouting).toBe(true);
+	});
+
+	it("keeps a null reset as null rather than inventing a boundary", () => {
+		const display = describeBindingConstraint(
+			{ ...accountWide, resetAtMs: null },
+			"five_hour",
+		);
+		expect(display?.resetAtMs).toBeNull();
 	});
 });

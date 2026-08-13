@@ -4,7 +4,7 @@ import {
 	weeklyScopedWindowKey,
 } from "@better-ccflare/core";
 import type { AnyUsageData } from "@better-ccflare/providers";
-import type { Account } from "@better-ccflare/types";
+import type { Account, AccountBindingConstraint } from "@better-ccflare/types";
 
 const RETRY_AFTER_SECONDS = 60;
 /** Two default 90-second usage polls; independent from the cache's 10m maximum. */
@@ -307,13 +307,12 @@ function isWindowThrottlingEnabled(
 	return settings.weeklyEnabled;
 }
 
-export interface BindingConstraint {
-	readonly window: string;
-	readonly utilization: number;
-	readonly resetAtMs: number | null;
-	readonly scope: "account" | "family";
-	readonly modelFamily: string | null;
-}
+/**
+ * Alias of the shared API type so the producer here and the `AccountResponse`
+ * field the dashboard reads cannot drift apart. Kept exported under the
+ * original name — existing importers are unaffected.
+ */
+export type BindingConstraint = AccountBindingConstraint;
 
 /**
  * The window actually closest to blocking this account — including per-model
