@@ -1,6 +1,8 @@
 import {
 	authFailureEvents,
+	formatOAuthErrorMessage,
 	isInvalidGrantMessage,
+	isStructuredInvalidGrant,
 	OAuthRefreshTokenError,
 	PAUSE_REASON_NEEDS_REAUTH,
 	registerDisposable,
@@ -126,12 +128,14 @@ export function isTerminalTokenRefreshFailure(error: unknown): boolean {
 	}
 	if (error instanceof OAuthRefreshTokenError) return true;
 	const messages: string[] = [];
+	if (isStructuredInvalidGrant(error)) return true;
 	if (error instanceof Error) messages.push(error.message);
 	if (typeof error === "object" && error !== null) {
 		const context = (error as { context?: unknown }).context;
 		if (typeof context === "object" && context !== null) {
 			const originalError = (context as { originalError?: unknown })
 				.originalError;
+			if (isStructuredInvalidGrant(originalError)) return true;
 			if (typeof originalError === "string") messages.push(originalError);
 		}
 	}
@@ -282,9 +286,29 @@ export async function pauseAccountForReauthIfInvalidGrant(
 	/** Refresh-token snapshot captured before the provider call. */
 	expectedRefreshToken?: string | null,
 ): Promise<boolean> {
-	const message = error instanceof Error ? error.message : String(error);
+	const structuredTerminal = isStructuredInvalidGrant(error);
+	const contextOriginalError =
+		typeof error === "object" &&
+		error !== null &&
+		typeof (error as { context?: unknown }).context === "object" &&
+		(error as { context: { originalError?: unknown } }).context !== null
+			? (error as { context: { originalError?: unknown } }).context
+					.originalError
+			: undefined;
+	const message =
+		error instanceof Error
+			? error.message
+			: typeof error === "string"
+				? error
+				: "";
+	const contextOriginalMessage =
+		typeof contextOriginalError === "string" ? contextOriginalError : undefined;
 	const isInvalidGrant =
-		error instanceof OAuthRefreshTokenError || isInvalidGrantMessage(message);
+		error instanceof OAuthRefreshTokenError ||
+		structuredTerminal ||
+		isStructuredInvalidGrant(contextOriginalError) ||
+		isInvalidGrantMessage(message) ||
+		isInvalidGrantMessage(contextOriginalMessage);
 	if (!isInvalidGrant) return false;
 	if (typeof dbOps.pauseAccountIfActive !== "function") return false;
 	try {
@@ -592,7 +616,9 @@ export async function refreshAccessTokenSafe(
 				enforceMaxSize();
 
 				const originalError =
-					error instanceof Error ? error.message : String(error);
+					error instanceof Error
+						? error.message
+						: formatOAuthErrorMessage(error) || String(error);
 				const enhancedMessage = getOAuthErrorMessage(account, originalError);
 
 				log.error(
