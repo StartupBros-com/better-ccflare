@@ -57,7 +57,7 @@ function writeFixturePrograms(dir: string): {
 			'import http from "node:http";',
 			'const portIndex = process.argv.indexOf("--port");',
 			"const port = Number(process.argv[portIndex + 1]);",
-			'appendFileSync(`${process.env.CAPTURE_DIR}/upstream.json`, JSON.stringify({ secret: process.env.CCFLARE_GUARD_CORRELATION_SECRET, argv: process.argv }) + "\\n");',
+			'appendFileSync(`${process.env.CAPTURE_DIR}/upstream.json`, JSON.stringify({ pid: process.pid, secret: process.env.CCFLARE_GUARD_CORRELATION_SECRET, argv: process.argv }) + "\\n");',
 			"const server = http.createServer((_req, res) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{}'); });",
 			"server.listen(port, '127.0.0.1');",
 			"process.on('SIGTERM', () => server.close(() => process.exit(0)));",
@@ -68,7 +68,7 @@ function writeFixturePrograms(dir: string): {
 		[
 			'import { appendFileSync } from "node:fs";',
 			'import http from "node:http";',
-			'appendFileSync(`${process.env.CAPTURE_DIR}/guard.json`, JSON.stringify({ secret: process.env.CCFLARE_GUARD_CORRELATION_SECRET, argv: process.argv }) + "\\n");',
+			'appendFileSync(`${process.env.CAPTURE_DIR}/guard.json`, JSON.stringify({ pid: process.pid, secret: process.env.CCFLARE_GUARD_CORRELATION_SECRET, argv: process.argv }) + "\\n");',
 			"const server = http.createServer((_req, res) => {",
 			"  res.writeHead(200, { 'content-type': 'application/json' });",
 			"  res.end('{}');",
@@ -92,7 +92,7 @@ function writeGuardExitFixture(
 		[
 			'import { appendFileSync } from "node:fs";',
 			'import http from "node:http";',
-			'appendFileSync(`${process.env.CAPTURE_DIR}/guard-exits.log`, "start\\n");',
+			'appendFileSync(`${process.env.CAPTURE_DIR}/guard-exits.log`, JSON.stringify({ pid: process.pid }) + "\\n");',
 			"const server = http.createServer((_req, res) => {",
 			"  res.writeHead(200, { 'content-type': 'application/json' });",
 			`  res.end('{}'); setTimeout(() => server.close(() => process.exit(${exitCode})), 5);`,
@@ -101,6 +101,37 @@ function writeGuardExitFixture(
 			"process.on('SIGTERM', () => server.close(() => process.exit(0)));",
 		].join("\n"),
 	);
+	chmodSync(programs.guard, 0o755);
+	return programs;
+}
+
+function writeStubbornGuardFixture(dir: string): {
+	upstream: string;
+	guard: string;
+} {
+	const programs = writeFixturePrograms(dir);
+	writeFileSync(
+		programs.upstream,
+		[
+			"#!/usr/bin/env node",
+			'import http from "node:http";',
+			'const portIndex = process.argv.indexOf("--port");',
+			"const port = Number(process.argv[portIndex + 1]);",
+			"const server = http.createServer((_req, res) => { res.writeHead(200); res.end('{}'); });",
+			"server.listen(port, '127.0.0.1', () => setTimeout(() => server.close(() => process.exit(42)), 300));",
+		].join("\n"),
+	);
+	writeFileSync(
+		programs.guard,
+		[
+			'import http from "node:http";',
+			"const server = http.createServer((_req, res) => { res.writeHead(200); res.end('{}'); });",
+			"server.listen(Number(process.env.GUARD_PORT), '127.0.0.1');",
+			"// This fixture deliberately ignores TERM so failure cleanup must enforce its short budget.",
+			"process.on('SIGTERM', () => {});",
+		].join("\n"),
+	);
+	chmodSync(programs.upstream, 0o755);
 	chmodSync(programs.guard, 0o755);
 	return programs;
 }
@@ -387,6 +418,40 @@ describe("run-ccflare-stack supervisor lifecycle", () => {
 	);
 
 	test(
+		"bounds failure cleanup when the guard ignores TERM without shortening intentional stop grace",
+		async () => {
+			const fixtureDir = tempDir("ccflare-stack-stubborn-guard-fixture-");
+			const programs = writeStubbornGuardFixture(fixtureDir);
+			const runner = await spawnRunner(programs, {
+				RUNNER_FAILURE_STOP_BUDGET_MS: "120",
+				RUNNER_RESTART_BACKOFF_BASE_MS: "0",
+				RUNNER_RESTART_BACKOFF_MAX_MS: "0",
+				RUNNER_RESTART_MAX_FAILURES: "1",
+				RUNNER_RESTART_WINDOW_MS: "1000",
+			});
+			const startedAt = Date.now();
+			const result = await waitForExit(runner.child, 3_000);
+			const elapsedMs = Date.now() - startedAt;
+			const output = runner.getOutput();
+
+			expect(result.code).toBe(1);
+			expect(result.signal).toBeNull();
+			expect(elapsedMs).toBeLessThan(1_500);
+			expect(output.stdout).toContain(
+				"failure_cleanup_budget_ms=120",
+			);
+			const forcedStop = output.stdout.match(
+				/did not stop after (\d+)ms; sending SIGKILL/,
+			);
+			expect(forcedStop).not.toBeNull();
+			expect(Number(forcedStop?.[1])).toBeLessThanOrEqual(120);
+			expect(output.stdout).toContain("restart circuit open");
+			expect(output.stdout).toContain("intentional_stop_budget_ms=605000");
+		},
+		8_000,
+	);
+
+	test(
 		"treats a runner SIGTERM as intentional and never restarts the stack",
 		async () => {
 			const fixtureDir = tempDir("ccflare-stack-term-fixture-");
@@ -533,15 +598,73 @@ describe("run-ccflare-stack supervisor lifecycle", () => {
 	);
 
 	test(
-		"holds an opened circuit under a service invocation until an operator TERM",
+		"exits with a bounded circuit status under a service auto invocation",
+		async () => {
+			const fixtureDir = tempDir("ccflare-stack-circuit-auto-fixture-");
+			const programs = writeGuardExitFixture(fixtureDir, 42);
+			const runner = await spawnRunner(programs, {
+				// systemd sets INVOCATION_ID. Auto mode must exit with a distinct
+				// failure so Restart=on-failure and StartLimit own recovery; it must
+				// never report an active service while its children are down.
+				INVOCATION_ID: "fixture-invocation",
+				RUNNER_CIRCUIT_HOLD: "auto",
+				RUNNER_RESTART_BACKOFF_BASE_MS: "10",
+				RUNNER_RESTART_BACKOFF_MAX_MS: "20",
+				RUNNER_RESTART_MAX_FAILURES: "2",
+				RUNNER_RESTART_WINDOW_MS: "1000",
+			});
+			const result = await waitForExit(runner.child, 5_000);
+			const output = runner.getOutput();
+
+			expect(result.code).toBe(75);
+			expect(result.signal).toBeNull();
+			expect(output.stdout).toContain(
+				"restart circuit open; exiting for service supervisor",
+			);
+			expect(output.stdout).not.toContain("paused until operator restart");
+			expect(
+				(output.stdout.match(/starting better-ccflare upstream/g) ?? []).length,
+			).toBe(2);
+
+			const upstreamRecords = readFileSync(
+				join(runner.captureDir, "upstream.json"),
+				"utf8",
+			)
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line) as { pid: number });
+			const guardRecords = readFileSync(
+				join(runner.captureDir, "guard-exits.log"),
+				"utf8",
+			)
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line) as { pid: number });
+			const processStillExists = (pid: number): boolean => {
+				try {
+					process.kill(pid, 0);
+					return true;
+				} catch {
+					return false;
+				}
+			};
+			for (const record of [...upstreamRecords, ...guardRecords]) {
+				expect(processStillExists(record.pid)).toBe(false);
+			}
+		},
+		10_000,
+	);
+
+	test(
+		"holds an explicitly requested circuit until an operator TERM",
 		async () => {
 			const fixtureDir = tempDir("ccflare-stack-circuit-hold-fixture-");
 			const programs = writeGuardExitFixture(fixtureDir, 42);
 			const runner = await spawnRunner(programs, {
-				// systemd sets INVOCATION_ID; auto mode must hold instead of exiting
-				// and letting Restart=always reset the failure budget.
-				INVOCATION_ID: "fixture-invocation",
-				RUNNER_CIRCUIT_HOLD: "auto",
+				// Explicit hold is retained for operator-controlled one-shot fixtures;
+				// production auto mode exits for systemd's bounded restart policy.
+				INVOCATION_ID: "",
+				RUNNER_CIRCUIT_HOLD: "true",
 				RUNNER_RESTART_BACKOFF_BASE_MS: "10",
 				RUNNER_RESTART_BACKOFF_MAX_MS: "20",
 				RUNNER_RESTART_MAX_FAILURES: "2",
@@ -566,6 +689,31 @@ describe("run-ccflare-stack supervisor lifecycle", () => {
 				(output.stdout.match(/starting better-ccflare upstream/g) ?? []).length,
 			).toBe(startsBefore);
 			expect(output.stdout).toContain("shutdown requested");
+		},
+		10_000,
+	);
+
+	test(
+		"ignores explicit hold under a systemd invocation",
+		async () => {
+			const fixtureDir = tempDir("ccflare-stack-circuit-service-override-fixture-");
+			const programs = writeGuardExitFixture(fixtureDir, 42);
+			const runner = await spawnRunner(programs, {
+				INVOCATION_ID: "fixture-invocation",
+				RUNNER_CIRCUIT_HOLD: "true",
+				RUNNER_RESTART_BACKOFF_BASE_MS: "10",
+				RUNNER_RESTART_BACKOFF_MAX_MS: "10",
+				RUNNER_RESTART_MAX_FAILURES: "1",
+				RUNNER_RESTART_WINDOW_MS: "1000",
+			});
+			const result = await waitForExit(runner.child, 5_000);
+			const output = runner.getOutput();
+
+			expect(result.code).toBe(75);
+			expect(output.stdout).toContain(
+				"restart circuit open; exiting for service supervisor",
+			);
+			expect(output.stdout).not.toContain("paused until operator restart");
 		},
 		10_000,
 	);

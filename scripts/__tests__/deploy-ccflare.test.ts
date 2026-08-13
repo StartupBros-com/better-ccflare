@@ -21,6 +21,8 @@ const repoRoot = join(import.meta.dir, "..", "..");
 const deployScript = join(repoRoot, "scripts", "deploy-ccflare.sh");
 const helperScriptForShell = "scripts/deploy-ccflare-lib.sh";
 const runnerScript = join(repoRoot, "scripts", "run-ccflare-stack.sh");
+const systemdDocs = join(repoRoot, "docs", "systemd.md");
+const deploymentDocs = join(repoRoot, "docs", "deployment.md");
 const tempDirs: string[] = [];
 
 afterEach(() => {
@@ -336,6 +338,28 @@ function writeDigestFixtures(dir: string): {
 	return { guard, policy, runner };
 }
 
+describe("systemd documentation contracts", () => {
+	test("keeps StartLimit directives in the Unit section", () => {
+		for (const path of [systemdDocs, deploymentDocs]) {
+			const source = readFileSync(path, "utf8");
+			const unitStart = source.indexOf("[Unit]");
+			const serviceStart = source.indexOf("[Service]", unitStart + 1);
+			const interval = source.indexOf("StartLimitIntervalSec=300", unitStart + 1);
+			const burst = source.indexOf("StartLimitBurst=5", unitStart + 1);
+
+			expect(unitStart).toBeGreaterThanOrEqual(0);
+			expect(serviceStart).toBeGreaterThan(unitStart);
+			expect(interval).toBeGreaterThan(unitStart);
+			expect(interval).toBeLessThan(serviceStart);
+			expect(burst).toBeGreaterThan(unitStart);
+			expect(burst).toBeLessThan(serviceStart);
+			expect(source).not.toContain("Restart=always");
+			expect(source).not.toContain("StartLimitIntervalSec=120");
+			expect(source).toContain("RUNNER_FAILURE_STOP_BUDGET_MS");
+		}
+	});
+});
+
 describe("render_systemd_pin", () => {
 	test("renders only deploy-owned content, removes stale managed values, and is byte-idempotent", () => {
 		const dir = tempDir();
@@ -405,6 +429,7 @@ describe("render_systemd_pin", () => {
 				"Environment=GUARD_MAX_RECOVERY_SLEEP_MS=120000",
 				"Environment=GUARD_MAX_RECOVERY_WAITS=12",
 				"Environment=GUARD_SHUTDOWN_GRACE_MS=600000",
+				"Environment=RUNNER_FAILURE_STOP_BUDGET_MS=30000",
 				"KillMode=mixed",
 				"TimeoutStopSec=720s",
 				"Restart=on-failure",
@@ -537,6 +562,9 @@ describe("render_systemd_pin", () => {
 			"Environment=GUARD_MAX_RECOVERY_SLEEP_MS=120000",
 		);
 		expect(rendered).toContain("Environment=GUARD_SHUTDOWN_GRACE_MS=600000");
+		expect(rendered).toContain(
+			"Environment=RUNNER_FAILURE_STOP_BUDGET_MS=30000",
+		);
 		expect(rendered).toContain("KillMode=mixed");
 		expect(rendered).toContain("TimeoutStopSec=720s");
 	});
@@ -835,11 +863,13 @@ describe("effective systemd policy validation", () => {
 				'if [[ "$*" == *"--property=RestartUSec"* ]]; then printf \'%s\\n\' "${CCFLARE_TEST_RESTART_SEC:-5s}"; exit 0; fi',
 				'if [[ "$*" == *"--property=RestartPreventExitStatus"* ]]; then printf \'%s\\n\' "${CCFLARE_TEST_RESTART_PREVENT_EXIT_STATUS:-143}"; exit 0; fi',
 				'if [[ "$*" == *"--property=Restart"* ]]; then printf \'%s\\n\' "${CCFLARE_TEST_RESTART:-on-failure}"; exit 0; fi',
-				'if [[ "$*" == *"--property=Environment"* ]]; then',
-				'  if [[ -n "${CCFLARE_TEST_SAFE_POLICY_PIN:-}" && -n "${CCFLARE_TEST_SAFE_POLICY_BACKUP:-}" ]] && cmp -s "$CCFLARE_TEST_SAFE_POLICY_PIN" "$CCFLARE_TEST_SAFE_POLICY_BACKUP" && [[ -n "${CCFLARE_TEST_RESTORED_ENVIRONMENT+x}" ]]; then',
-				'    printf \'%s\\n\' "$CCFLARE_TEST_RESTORED_ENVIRONMENT"',
-				"  else",
-				'    printf \'%s\\n\' "$CCFLARE_TEST_ENVIRONMENT"',
+			'if [[ "$*" == *"--property=Environment"* ]]; then',
+			'  if [[ -n "${CCFLARE_TEST_SAFE_POLICY_PIN:-}" && -n "${CCFLARE_TEST_SAFE_POLICY_BACKUP:-}" ]] && cmp -s "$CCFLARE_TEST_SAFE_POLICY_PIN" "$CCFLARE_TEST_SAFE_POLICY_BACKUP" && [[ -n "${CCFLARE_TEST_RESTORED_ENVIRONMENT+x}" ]]; then',
+			'    printf \'%s\\n\' "$CCFLARE_TEST_RESTORED_ENVIRONMENT"',
+			"  else",
+			'    environment="$CCFLARE_TEST_ENVIRONMENT"',
+			'    if [[ "${CCFLARE_TEST_OMIT_FAILURE_STOP_BUDGET:-0}" != "1" && "$environment" != *"RUNNER_FAILURE_STOP_BUDGET_MS="* ]]; then environment="$environment RUNNER_FAILURE_STOP_BUDGET_MS=${CCFLARE_TEST_FAILURE_STOP_BUDGET:-30000}"; fi',
+			'    printf \'%s\\n\' "$environment"',
 				"  fi",
 				"  exit 0",
 				"fi",
@@ -874,6 +904,9 @@ describe("effective systemd policy validation", () => {
 			"guard_max_recovery_sleep_ms=120000",
 		);
 		expect(good.stdout.toString()).toContain("guard_max_recovery_waits=12");
+		expect(good.stdout.toString()).toContain(
+			"runner_failure_stop_budget_ms=30000",
+		);
 
 		for (const restart of ["always", "no"] as const) {
 			const invalidRestart = bash(
@@ -936,6 +969,26 @@ describe("effective systemd policy validation", () => {
 			].join("\n"),
 		);
 		expect(missingRecoveryWaits.exitCode).not.toBe(0);
+
+		const missingFailureStopBudget = bash(
+			[
+				...base,
+				"export CCFLARE_TEST_OMIT_FAILURE_STOP_BUDGET=1",
+				"validate_effective_systemd_policy ccflare-stack.service",
+			].join("\n"),
+		);
+		expect(missingFailureStopBudget.exitCode).not.toBe(0);
+
+		for (const budget of ["0", "120001", "malformed"]) {
+			const invalidFailureStopBudget = bash(
+				[
+					...base,
+					`export CCFLARE_TEST_FAILURE_STOP_BUDGET=${shellQuote(budget)}`,
+					"validate_effective_systemd_policy ccflare-stack.service",
+				].join("\n"),
+			);
+			expect(invalidFailureStopBudget.exitCode).not.toBe(0);
+		}
 
 		const missingRecoverySilence = bash(
 			[
@@ -1407,6 +1460,37 @@ describe("source-controlled stack runner", () => {
 		expect(zero.exitCode).toBe(64);
 	});
 
+	test("bounds failure cleanup separately from the intentional stop grace", () => {
+		for (const value of ["0", "120001", "-1", "12ms"]) {
+			const invalid = bash(
+				`RUNNER_FAILURE_STOP_BUDGET_MS=${shellQuote(value)} CCFLARE_BIN=/bin/true GUARD_SCRIPT=/bin/true NODE_BIN=/bin/true AI_GATEWAY_TUNNEL_ENABLED=0 bash ${shellQuote(shellPath(runnerScript))}`,
+			);
+			expect(invalid.exitCode).toBe(64);
+			expect(invalid.stdout.toString()).toContain(
+				`invalid RUNNER_FAILURE_STOP_BUDGET_MS=${value}`,
+			);
+		}
+
+		const source = readFileSync(runnerScript, "utf8");
+		expect(source).toContain(
+			"RUNNER_FAILURE_STOP_BUDGET_MS=${RUNNER_FAILURE_STOP_BUDGET_MS:-30000}",
+		);
+		expect(source).toContain(
+			'validate_bounded_ms RUNNER_FAILURE_STOP_BUDGET_MS "$RUNNER_FAILURE_STOP_BUDGET_MS" 1 120000',
+		);
+		expect(source).toContain(
+			'stop_stack_children "$RUNNER_FAILURE_STOP_BUDGET_MS"',
+		);
+		const cleanupStart = source.indexOf("cleanup() {");
+		const cleanupEnd = source.indexOf("\n}\n", cleanupStart) + 3;
+		const cleanupSource = source.slice(cleanupStart, cleanupEnd);
+		expect(cleanupSource).toContain("stop_stack_children");
+		expect(cleanupSource).not.toContain("RUNNER_FAILURE_STOP_BUDGET_MS");
+		expect(source).toContain(
+			"failure_cleanup_budget_ms=${RUNNER_FAILURE_STOP_BUDGET_MS}; intentional_stop_budget_ms=${GUARD_STOP_BUDGET_MS}",
+		);
+	});
+
 	test("rejects a zero deadline instead of letting the guard clamp it to 1ms", () => {
 		const result = bash(
 			`GUARD_TOTAL_DEADLINE_MS=0 CCFLARE_BIN=/bin/true GUARD_SCRIPT=/bin/true NODE_BIN=/bin/true AI_GATEWAY_TUNNEL_ENABLED=0 bash ${shellQuote(shellPath(runnerScript))}`,
@@ -1523,6 +1607,22 @@ describe("source-controlled stack runner", () => {
 		);
 		expect(source).toContain(
 			'stop_child "ai-gateway ssh tunnel" "$ai_gateway_tunnel_pid" 5000',
+		);
+	});
+
+	test("makes the service-mode circuit exit while explicit operator hold remains opt-in", () => {
+		const source = readFileSync(runnerScript, "utf8");
+		const holdStart = source.indexOf("circuit_hold_enabled() {");
+		const holdEnd = source.indexOf("\n}\n", holdStart) + 3;
+		const holdSource = source.slice(holdStart, holdEnd);
+		expect(holdStart).toBeGreaterThanOrEqual(0);
+		expect(source).toContain("RUNNER_CIRCUIT_EXIT_STATUS=75");
+		expect(source).toContain(
+			'auto | AUTO) printf \'%s\\n\' "$RUNNER_CIRCUIT_EXIT_STATUS"',
+		);
+		expect(source).toContain('return "$circuit_status"');
+		expect(holdSource).toContain(
+			'1 | true | TRUE | yes | YES) [[ -z "${INVOCATION_ID:-}" ]] ;;',
 		);
 	});
 

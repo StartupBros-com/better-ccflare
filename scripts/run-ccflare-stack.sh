@@ -27,6 +27,7 @@ GUARD_EFFECTIVE_MAX_ACTIVE=${CCFLARE_GUARD_MAX_ACTIVE:-${GUARD_MAX_ACTIVE:-12}}
 GUARD_MAX_RECOVERY_WAITS=${GUARD_MAX_RECOVERY_WAITS:-$GUARD_EFFECTIVE_MAX_ACTIVE}
 GUARD_SHUTDOWN_GRACE_MS=${GUARD_SHUTDOWN_GRACE_MS:-600000}
 GUARD_SHUTDOWN_CUSHION_MS=${GUARD_SHUTDOWN_CUSHION_MS:-5000}
+RUNNER_FAILURE_STOP_BUDGET_MS=${RUNNER_FAILURE_STOP_BUDGET_MS:-30000}
 STOP_POLL_INTERVAL_MS=200
 RUNNER_HEALTH_POLL_INTERVAL_MS=${RUNNER_HEALTH_POLL_INTERVAL_MS:-1000}
 RUNNER_HEALTH_MAX_ATTEMPTS=${RUNNER_HEALTH_MAX_ATTEMPTS:-60}
@@ -36,11 +37,14 @@ RUNNER_RESTART_BACKOFF_MAX_MS=${RUNNER_RESTART_BACKOFF_MAX_MS:-30000}
 RUNNER_RESTART_MAX_FAILURES=${RUNNER_RESTART_MAX_FAILURES:-3}
 RUNNER_RESTART_WINDOW_MS=${RUNNER_RESTART_WINDOW_MS:-300000}
 RUNNER_RESTART_STABLE_MS=${RUNNER_RESTART_STABLE_MS:-60000}
-# A systemd invocation must remain active when the local breaker opens. With
-# Restart=always, exiting would reset this process-local counter and create an
-# unbounded service restart loop. `auto` holds only when systemd exposes its
-# invocation identity; explicit 0/false keeps one-shot fixture behavior.
+# When the local breaker opens, a systemd-managed runner must exit so the
+# service is not reported active while its stack children are down. The
+# managed unit uses Restart=on-failure plus StartLimit* to own the outer
+# restart budget. An explicit `true` remains available for operator-controlled
+# one-shot fixtures; `auto` is always service-safe and exits with the distinct
+# bounded status below.
 RUNNER_CIRCUIT_HOLD=${RUNNER_CIRCUIT_HOLD:-auto}
+RUNNER_CIRCUIT_EXIT_STATUS=75
 
 upstream_pid=""
 guard_pid=""
@@ -82,6 +86,7 @@ validate_bounded_ms GUARD_EFFECTIVE_MAX_ACTIVE "$GUARD_EFFECTIVE_MAX_ACTIVE" 1 1
 validate_bounded_ms GUARD_MAX_RECOVERY_WAITS "$GUARD_MAX_RECOVERY_WAITS" 1 1000000
 validate_bounded_ms GUARD_SHUTDOWN_GRACE_MS "$GUARD_SHUTDOWN_GRACE_MS" 0 2147483647
 validate_bounded_ms GUARD_SHUTDOWN_CUSHION_MS "$GUARD_SHUTDOWN_CUSHION_MS" 0 60000
+validate_bounded_ms RUNNER_FAILURE_STOP_BUDGET_MS "$RUNNER_FAILURE_STOP_BUDGET_MS" 1 120000
 validate_bounded_ms RUNNER_HEALTH_POLL_INTERVAL_MS "$RUNNER_HEALTH_POLL_INTERVAL_MS" 1 60000
 validate_bounded_int RUNNER_HEALTH_MAX_ATTEMPTS "$RUNNER_HEALTH_MAX_ATTEMPTS" 1 1000000
 validate_bounded_ms RUNNER_HEALTH_STABILITY_DELAY_MS "$RUNNER_HEALTH_STABILITY_DELAY_MS" 0 60000
@@ -118,6 +123,8 @@ if ((RUNNER_RESTART_BACKOFF_MAX_MS < RUNNER_RESTART_BACKOFF_BASE_MS)); then
 fi
 GUARD_STOP_BUDGET_MS=$((GUARD_SHUTDOWN_GRACE_MS + GUARD_SHUTDOWN_CUSHION_MS))
 
+log "runner stop budgets configured; failure_cleanup_budget_ms=${RUNNER_FAILURE_STOP_BUDGET_MS}; intentional_stop_budget_ms=${GUARD_STOP_BUDGET_MS}"
+
 sleep_ms() {
 	local remaining_ms="$1" slice_ms
 	while ((remaining_ms > 0)); do
@@ -144,13 +151,20 @@ stop_child() {
 
 	log "stopping ${name} pid=${pid}"
 	kill "$pid" 2>/dev/null || true
-	local elapsed_ms=0
-	while ((elapsed_ms < stop_budget_ms)); do
+	local started_ms now_ms elapsed_ms remaining_ms poll_ms
+	started_ms="$(epoch_ms)"
+	while :; do
 		if ! kill -0 "$pid" 2>/dev/null; then
 			return 0
 		fi
-		sleep 0.2
-		elapsed_ms=$((elapsed_ms + STOP_POLL_INTERVAL_MS))
+		now_ms="$(epoch_ms)"
+		elapsed_ms=$((now_ms - started_ms))
+		if ((elapsed_ms >= stop_budget_ms)); then
+			break
+		fi
+		remaining_ms=$((stop_budget_ms - elapsed_ms))
+		poll_ms=$((remaining_ms < STOP_POLL_INTERVAL_MS ? remaining_ms : STOP_POLL_INTERVAL_MS))
+		sleep "$(printf '%d.%03d' "$((poll_ms / 1000))" "$((poll_ms % 1000))")" || true
 	done
 	if ! kill -0 "$pid" 2>/dev/null; then
 		return 0
@@ -160,10 +174,38 @@ stop_child() {
 	kill -KILL "$pid" 2>/dev/null || true
 }
 
+remaining_stop_budget() {
+	local deadline_ms="$1" now_ms
+	now_ms="$(epoch_ms)"
+	if ((now_ms >= deadline_ms)); then
+		printf '0\n'
+	else
+		printf '%s\n' "$((deadline_ms - now_ms))"
+	fi
+}
+
 stop_stack_children() {
-	stop_child "ccflare guard" "$guard_pid" "$GUARD_STOP_BUDGET_MS"
-	stop_child "better-ccflare upstream" "$upstream_pid" 5000
-	stop_child "ai-gateway ssh tunnel" "$ai_gateway_tunnel_pid" 5000
+	if (($# == 0)); then
+		# Intentional TERM/INT keeps the full guard drain grace and the existing
+		# short child budgets. It is deliberately not an aggregate deadline.
+		log "stopping stack children; cleanup_budget_ms=${GUARD_STOP_BUDGET_MS}; mode=intentional"
+		stop_child "ccflare guard" "$guard_pid" "$GUARD_STOP_BUDGET_MS"
+		stop_child "better-ccflare upstream" "$upstream_pid" 5000
+		stop_child "ai-gateway ssh tunnel" "$ai_gateway_tunnel_pid" 5000
+	else
+		# Unexpected failures use one aggregate deadline so a stubborn child
+		# cannot consume the entire guard grace before the restart circuit runs.
+		local total_budget_ms="$1"
+		local deadline_ms=$(( $(epoch_ms) + total_budget_ms ))
+		local remaining_ms
+		log "stopping stack children; cleanup_budget_ms=${total_budget_ms}; mode=failure"
+		remaining_ms="$(remaining_stop_budget "$deadline_ms")"
+		stop_child "ccflare guard" "$guard_pid" "$remaining_ms"
+		remaining_ms="$(remaining_stop_budget "$deadline_ms")"
+		stop_child "better-ccflare upstream" "$upstream_pid" "$remaining_ms"
+		remaining_ms="$(remaining_stop_budget "$deadline_ms")"
+		stop_child "ai-gateway ssh tunnel" "$ai_gateway_tunnel_pid" "$remaining_ms"
+	fi
 	wait "${guard_pid:-0}" 2>/dev/null || true
 	wait "${upstream_pid:-0}" 2>/dev/null || true
 	wait "${ai_gateway_tunnel_pid:-0}" 2>/dev/null || true
@@ -416,7 +458,7 @@ run_stack_once() {
 		return 1
 	fi
 
-	log "starting ccflare guard on 127.0.0.1:${GUARD_PORT} -> 127.0.0.1:${UPSTREAM_PORT}"
+	log "starting ccflare guard on 127.0.0.1:${GUARD_PORT} -> 127.0.0.1:${UPSTREAM_PORT}; failure_cleanup_budget_ms=${RUNNER_FAILURE_STOP_BUDGET_MS}; intentional_stop_budget_ms=${GUARD_STOP_BUDGET_MS}"
 	HOME="$HOME" \
 		USER="$USER" \
 		GUARD_HOST=127.0.0.1 \
@@ -473,17 +515,31 @@ run_stack_once() {
 
 circuit_hold_enabled() {
 	case "$RUNNER_CIRCUIT_HOLD" in
-		1 | true | TRUE | yes | YES) return 0 ;;
+		1 | true | TRUE | yes | YES) [[ -z "${INVOCATION_ID:-}" ]] ;;
 		0 | false | FALSE | no | NO) return 1 ;;
-		auto | AUTO) [[ -n "${INVOCATION_ID:-}" ]] ;;
+		auto | AUTO) return 1 ;;
 		*) return 1 ;; # validation above makes this unreachable
 	esac
 }
 
+circuit_open_exit_status() {
+	case "$RUNNER_CIRCUIT_HOLD" in
+		auto | AUTO) printf '%s\n' "$RUNNER_CIRCUIT_EXIT_STATUS" ;;
+		1 | true | TRUE | yes | YES)
+			if [[ -n "${INVOCATION_ID:-}" ]]; then
+				printf '%s\n' "$RUNNER_CIRCUIT_EXIT_STATUS"
+			else
+				printf '1\n'
+			fi
+			;;
+		*) printf '1\n' ;;
+	esac
+}
+
 wait_for_operator() {
-	# Keep the supervisor alive and signal-aware after the breaker opens. This is
-	# deliberate: a systemd Restart=always policy must not erase the in-process
-	# failure budget by starting a fresh runner every few seconds.
+	# Explicit operator hold is intentionally opt-in. Production `auto` mode
+	# exits through the service supervisor instead of leaving an active unit with
+	# no stack children.
 	while (( !shutdown_requested )); do
 		sleep_ms 1000
 	done
@@ -509,8 +565,10 @@ schedule_restart() {
 			wait_for_operator
 			return 0
 		fi
-		log "restart circuit open; child=${child_exit_name}; failures=${restart_failure_count}; cap=${RUNNER_RESTART_MAX_FAILURES}"
-		return 1
+		local circuit_status
+		circuit_status="$(circuit_open_exit_status)"
+		log "restart circuit open; exiting for service supervisor; status=${circuit_status}; child=${child_exit_name}; failures=${restart_failure_count}; cap=${RUNNER_RESTART_MAX_FAILURES}"
+		return "$circuit_status"
 	fi
 
 	delay=$RUNNER_RESTART_BACKOFF_BASE_MS
@@ -542,15 +600,18 @@ while :; do
 		exit 143
 	fi
 
-	stop_stack_children
+	stop_stack_children "$RUNNER_FAILURE_STOP_BUDGET_MS"
 	if ((shutdown_requested)); then
 		exit 143
 	fi
 	if ((fatal_startup)); then
 		exit "$child_exit_status"
 	fi
-	if ! schedule_restart; then
-		exit 1
+	if schedule_restart; then
+		:
+	else
+		schedule_status=$?
+		exit "$schedule_status"
 	fi
 	if ((shutdown_requested)); then
 		exit 143

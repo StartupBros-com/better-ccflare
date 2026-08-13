@@ -206,14 +206,18 @@ sudo cat > /etc/systemd/system/better-ccflare.service << 'EOF'
 Description=better-ccflare Load Balancer
 After=network.target
 
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
 [Service]
 Type=simple
 User=better-ccflare
 Group=better-ccflare
 WorkingDirectory=/opt/better-ccflare
 ExecStart=/opt/better-ccflare/better-ccflare --serve
-Restart=always
+Restart=on-failure
 RestartSec=5
+RestartPreventExitStatus=143
 
 # Environment
 Environment="PORT=8080"
@@ -240,6 +244,14 @@ LimitNPROC=4096
 [Install]
 WantedBy=multi-user.target
 EOF
+
+When this unit is backed by `scripts/run-ccflare-stack.sh`, unexpected child
+failures use the runner's bounded aggregate cleanup setting
+`RUNNER_FAILURE_STOP_BUDGET_MS` (30,000 ms by default; hard maximum 120,000 ms).
+It is failure-only: an operator `TERM`/`INT` still receives the full guard
+shutdown grace and cushion so active requests can drain. Keep the failure
+budget below the unit's `StartLimitIntervalSec` window and verify the runner's
+startup log reports both budgets after changing the environment.
 
 # Create user and directories
 sudo useradd -r -s /bin/false better-ccflare
