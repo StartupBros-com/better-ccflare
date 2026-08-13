@@ -206,14 +206,18 @@ sudo cat > /etc/systemd/system/better-ccflare.service << 'EOF'
 Description=better-ccflare Load Balancer
 After=network.target
 
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
 [Service]
 Type=simple
 User=better-ccflare
 Group=better-ccflare
 WorkingDirectory=/opt/better-ccflare
 ExecStart=/opt/better-ccflare/better-ccflare --serve
-Restart=always
+Restart=on-failure
 RestartSec=5
+RestartPreventExitStatus=143
 
 # Environment
 Environment="PORT=8080"

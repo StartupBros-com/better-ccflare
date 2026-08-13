@@ -21,6 +21,8 @@ const repoRoot = join(import.meta.dir, "..", "..");
 const deployScript = join(repoRoot, "scripts", "deploy-ccflare.sh");
 const helperScriptForShell = "scripts/deploy-ccflare-lib.sh";
 const runnerScript = join(repoRoot, "scripts", "run-ccflare-stack.sh");
+const systemdDocs = join(repoRoot, "docs", "systemd.md");
+const deploymentDocs = join(repoRoot, "docs", "deployment.md");
 const tempDirs: string[] = [];
 
 afterEach(() => {
@@ -335,6 +337,27 @@ function writeDigestFixtures(dir: string): {
 	writeFileSync(runner, "#!/usr/bin/env bash\n# runner fixture\n");
 	return { guard, policy, runner };
 }
+
+describe("systemd documentation contracts", () => {
+	test("keeps StartLimit directives in the Unit section", () => {
+		for (const path of [systemdDocs, deploymentDocs]) {
+			const source = readFileSync(path, "utf8");
+			const unitStart = source.indexOf("[Unit]");
+			const serviceStart = source.indexOf("[Service]", unitStart + 1);
+			const interval = source.indexOf("StartLimitIntervalSec=300", unitStart + 1);
+			const burst = source.indexOf("StartLimitBurst=5", unitStart + 1);
+
+			expect(unitStart).toBeGreaterThanOrEqual(0);
+			expect(serviceStart).toBeGreaterThan(unitStart);
+			expect(interval).toBeGreaterThan(unitStart);
+			expect(interval).toBeLessThan(serviceStart);
+			expect(burst).toBeGreaterThan(unitStart);
+			expect(burst).toBeLessThan(serviceStart);
+			expect(source).not.toContain("Restart=always");
+			expect(source).not.toContain("StartLimitIntervalSec=120");
+		}
+	});
+});
 
 describe("render_systemd_pin", () => {
 	test("renders only deploy-owned content, removes stale managed values, and is byte-idempotent", () => {
@@ -1523,6 +1546,22 @@ describe("source-controlled stack runner", () => {
 		);
 		expect(source).toContain(
 			'stop_child "ai-gateway ssh tunnel" "$ai_gateway_tunnel_pid" 5000',
+		);
+	});
+
+	test("makes the service-mode circuit exit while explicit operator hold remains opt-in", () => {
+		const source = readFileSync(runnerScript, "utf8");
+		const holdStart = source.indexOf("circuit_hold_enabled() {");
+		const holdEnd = source.indexOf("\n}\n", holdStart) + 3;
+		const holdSource = source.slice(holdStart, holdEnd);
+		expect(holdStart).toBeGreaterThanOrEqual(0);
+		expect(source).toContain("RUNNER_CIRCUIT_EXIT_STATUS=75");
+		expect(source).toContain(
+			'auto | AUTO) printf \'%s\\n\' "$RUNNER_CIRCUIT_EXIT_STATUS"',
+		);
+		expect(source).toContain('return "$circuit_status"');
+		expect(holdSource).toContain(
+			'1 | true | TRUE | yes | YES) [[ -z "${INVOCATION_ID:-}" ]] ;;',
 		);
 	});
 

@@ -36,11 +36,14 @@ RUNNER_RESTART_BACKOFF_MAX_MS=${RUNNER_RESTART_BACKOFF_MAX_MS:-30000}
 RUNNER_RESTART_MAX_FAILURES=${RUNNER_RESTART_MAX_FAILURES:-3}
 RUNNER_RESTART_WINDOW_MS=${RUNNER_RESTART_WINDOW_MS:-300000}
 RUNNER_RESTART_STABLE_MS=${RUNNER_RESTART_STABLE_MS:-60000}
-# A systemd invocation must remain active when the local breaker opens. With
-# Restart=always, exiting would reset this process-local counter and create an
-# unbounded service restart loop. `auto` holds only when systemd exposes its
-# invocation identity; explicit 0/false keeps one-shot fixture behavior.
+# When the local breaker opens, a systemd-managed runner must exit so the
+# service is not reported active while its stack children are down. The
+# managed unit uses Restart=on-failure plus StartLimit* to own the outer
+# restart budget. An explicit `true` remains available for operator-controlled
+# one-shot fixtures; `auto` is always service-safe and exits with the distinct
+# bounded status below.
 RUNNER_CIRCUIT_HOLD=${RUNNER_CIRCUIT_HOLD:-auto}
+RUNNER_CIRCUIT_EXIT_STATUS=75
 
 upstream_pid=""
 guard_pid=""
@@ -473,17 +476,31 @@ run_stack_once() {
 
 circuit_hold_enabled() {
 	case "$RUNNER_CIRCUIT_HOLD" in
-		1 | true | TRUE | yes | YES) return 0 ;;
+		1 | true | TRUE | yes | YES) [[ -z "${INVOCATION_ID:-}" ]] ;;
 		0 | false | FALSE | no | NO) return 1 ;;
-		auto | AUTO) [[ -n "${INVOCATION_ID:-}" ]] ;;
+		auto | AUTO) return 1 ;;
 		*) return 1 ;; # validation above makes this unreachable
 	esac
 }
 
+circuit_open_exit_status() {
+	case "$RUNNER_CIRCUIT_HOLD" in
+		auto | AUTO) printf '%s\n' "$RUNNER_CIRCUIT_EXIT_STATUS" ;;
+		1 | true | TRUE | yes | YES)
+			if [[ -n "${INVOCATION_ID:-}" ]]; then
+				printf '%s\n' "$RUNNER_CIRCUIT_EXIT_STATUS"
+			else
+				printf '1\n'
+			fi
+			;;
+		*) printf '1\n' ;;
+	esac
+}
+
 wait_for_operator() {
-	# Keep the supervisor alive and signal-aware after the breaker opens. This is
-	# deliberate: a systemd Restart=always policy must not erase the in-process
-	# failure budget by starting a fresh runner every few seconds.
+	# Explicit operator hold is intentionally opt-in. Production `auto` mode
+	# exits through the service supervisor instead of leaving an active unit with
+	# no stack children.
 	while (( !shutdown_requested )); do
 		sleep_ms 1000
 	done
@@ -509,8 +526,10 @@ schedule_restart() {
 			wait_for_operator
 			return 0
 		fi
-		log "restart circuit open; child=${child_exit_name}; failures=${restart_failure_count}; cap=${RUNNER_RESTART_MAX_FAILURES}"
-		return 1
+		local circuit_status
+		circuit_status="$(circuit_open_exit_status)"
+		log "restart circuit open; exiting for service supervisor; status=${circuit_status}; child=${child_exit_name}; failures=${restart_failure_count}; cap=${RUNNER_RESTART_MAX_FAILURES}"
+		return "$circuit_status"
 	fi
 
 	delay=$RUNNER_RESTART_BACKOFF_BASE_MS
@@ -549,8 +568,11 @@ while :; do
 	if ((fatal_startup)); then
 		exit "$child_exit_status"
 	fi
-	if ! schedule_restart; then
-		exit 1
+	if schedule_restart; then
+		:
+	else
+		schedule_status=$?
+		exit "$schedule_status"
 	fi
 	if ((shutdown_requested)); then
 		exit 143

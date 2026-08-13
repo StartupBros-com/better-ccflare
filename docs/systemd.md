@@ -10,6 +10,10 @@ Description=better-ccflare proxy
 After=network-online.target
 Wants=network-online.target
 
+# --- Restart limits are [Unit] directives ---
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
 [Service]
 Type=simple
 User=better-ccflare
@@ -32,10 +36,9 @@ MemoryHigh=2G
 CPUQuota=200%
 
 # --- Restart policy ---
-Restart=always
+Restart=on-failure
 RestartSec=5
-StartLimitIntervalSec=120
-StartLimitBurst=5
+RestartPreventExitStatus=143
 
 # --- Security hardening ---
 NoNewPrivileges=true
@@ -135,18 +138,25 @@ Adjust based on your expected request volume. For most single-proxy deployments,
 ## Restart Policy Best Practices
 
 ```ini
-Restart=always
+Restart=on-failure
 RestartSec=5
-StartLimitIntervalSec=120
+RestartPreventExitStatus=143
+StartLimitIntervalSec=300
 StartLimitBurst=5
 ```
 
 This means:
 
-- systemd restarts the process on any exit (including crashes)
+- systemd restarts the process on failures, including crashes and bounded
+  circuit-open exits, but does not restart an intentional SIGTERM exit (143)
 - It waits 5 seconds between restart attempts
-- If the process crashes 5 times within 120 seconds, systemd stops trying and marks the unit as failed
+- If the process fails 5 times within 300 seconds, systemd stops trying and marks the unit as failed
 - After a `StartLimitBurst` failure, manual intervention is required: `systemctl reset-failed better-ccflare && systemctl start better-ccflare`
+
+The managed stack runner exits with status 75 when its internal restart circuit
+opens. That keeps systemd from reporting an active service while the proxy and
+guard children are stopped; `Restart=on-failure` and the `StartLimit*` bounds
+own the outer recovery budget.
 
 Without the preflight script, an invalid `BUN_JSC_*` variable would burn through all 5 restart attempts in ~25 seconds, causing total proxy downtime until an operator notices.
 
