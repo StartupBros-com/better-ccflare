@@ -28,6 +28,16 @@ export interface TraceRecord {
 	cache_key_cohort_id?: string | null;
 	conversation_id?: string | null;
 	cache_key_assignment_source?: "canary" | "explicit_session_override" | null;
+	cache_key_continuity_basis?:
+		| "derived"
+		| "identity_match"
+		| "lineage_match"
+		| "rejected"
+		| "session"
+		| "ineligible"
+		| string
+		| null;
+	canonical_conversation_id?: string | null;
 	pacing_canary?: string | null;
 	pacing_cohort_id?: string | null;
 	pacing_action?: string | null;
@@ -142,6 +152,42 @@ export interface CanaryArmStats {
 	};
 }
 
+export type CacheKeyContinuityBasis =
+	| "derived"
+	| "identity_match"
+	| "lineage_match"
+	| "rejected"
+	| "session"
+	| "ineligible"
+	| "unknown";
+
+export interface CacheKeyContinuityRow {
+	basis: CacheKeyContinuityBasis;
+	model: string;
+	turn: CacheExperimentTurn;
+	gapBand: CacheExperimentGapBand;
+	requests: number;
+	joinedResponses: number;
+	unjoinedRequests: number;
+	measuredResponses: number;
+	weightedCachedReadPct: number | null;
+	positiveHitResponses: number;
+	positiveHitRatePct: number | null;
+	zeroHitResponses: number;
+	cacheWriteMeasuredResponses: number;
+	cacheWriteUnavailableResponses: number;
+	cacheWriteTokens: number;
+	compactionContinuations: number;
+	keyRotations: number;
+	distinctEffectiveKeys: number;
+	maxRequestsPerKeyMinute: number;
+	keysOver15RequestsPerMinute: number;
+}
+
+export interface CacheKeyContinuityReport {
+	rows: CacheKeyContinuityRow[];
+}
+
 export interface TraceReport {
 	requests: number;
 	responses: number;
@@ -168,6 +214,7 @@ export interface TraceReport {
 		maxRequestsPerKeyMinute: number;
 		keysOver15RequestsPerMinute: number;
 	};
+	continuity: CacheKeyContinuityReport;
 	span: { first?: string; last?: string };
 	canary: {
 		conversation: CanaryArmStats;
@@ -1400,6 +1447,275 @@ function gapBand(gapMs: number): CacheExperimentGapBand {
 	return "at_least_60m";
 }
 
+function continuityBasis(value: unknown): CacheKeyContinuityBasis {
+	switch (value) {
+		case "derived":
+		case "identity_match":
+		case "lineage_match":
+		case "rejected":
+		case "session":
+		case "ineligible":
+			return value;
+		default:
+			return "unknown";
+	}
+}
+
+interface ContinuityRowAccumulator extends CacheKeyContinuityRow {
+	inputTokens: number;
+	cachedReadTokens: number;
+	positiveHitResponses: number;
+	effectiveKeys: Set<string>;
+	keyTimestamps: Map<string, number[]>;
+}
+
+function continuityRowAccumulator(
+	basis: CacheKeyContinuityBasis,
+	model: string,
+	turn: CacheExperimentTurn,
+	gapBandValue: CacheExperimentGapBand,
+): ContinuityRowAccumulator {
+	return {
+		basis,
+		model,
+		turn,
+		gapBand: gapBandValue,
+		requests: 0,
+		joinedResponses: 0,
+		unjoinedRequests: 0,
+		measuredResponses: 0,
+		weightedCachedReadPct: null,
+		positiveHitResponses: 0,
+		positiveHitRatePct: null,
+		zeroHitResponses: 0,
+		cacheWriteMeasuredResponses: 0,
+		cacheWriteUnavailableResponses: 0,
+		cacheWriteTokens: 0,
+		compactionContinuations: 0,
+		keyRotations: 0,
+		distinctEffectiveKeys: 0,
+		maxRequestsPerKeyMinute: 0,
+		keysOver15RequestsPerMinute: 0,
+		inputTokens: 0,
+		cachedReadTokens: 0,
+		effectiveKeys: new Set(),
+		keyTimestamps: new Map(),
+	};
+}
+
+function continuityResponseFor(
+	request: TraceRecord,
+	requestsByAttemptId: ReadonlyMap<string, TraceRecord[]>,
+	responsesByAttemptId: ReadonlyMap<string, TraceRecord[]>,
+	legacyRequestsByLogicalId: ReadonlyMap<string, TraceRecord[]>,
+	legacyResponsesByLogicalId: ReadonlyMap<string, TraceRecord[]>,
+): TraceRecord | undefined {
+	const requests = request.attempt_id
+		? (requestsByAttemptId.get(request.attempt_id) ?? [])
+		: request.request_id && isLegacyJoinEligible(request)
+			? (legacyRequestsByLogicalId.get(request.request_id) ?? [])
+			: [];
+	const responses = request.attempt_id
+		? (responsesByAttemptId.get(request.attempt_id) ?? [])
+		: request.request_id && isLegacyJoinEligible(request)
+			? (legacyResponsesByLogicalId.get(request.request_id) ?? [])
+			: [];
+	const response = responses[0];
+	return requests.length === 1 &&
+		responses.length === 1 &&
+		response &&
+		matchingLogicalRequestIds(request, response)
+		? response
+		: undefined;
+}
+
+function finishContinuityRow(
+	row: ContinuityRowAccumulator,
+): CacheKeyContinuityRow {
+	let maxRequestsPerKeyMinute = 0;
+	for (const timestamps of row.keyTimestamps.values()) {
+		timestamps.sort((a, b) => a - b);
+		let left = 0;
+		for (let right = 0; right < timestamps.length; right++) {
+			while ((timestamps[right] ?? 0) - (timestamps[left] ?? 0) >= 60_000)
+				left++;
+			maxRequestsPerKeyMinute = Math.max(
+				maxRequestsPerKeyMinute,
+				right - left + 1,
+			);
+		}
+	}
+	return {
+		basis: row.basis,
+		model: row.model,
+		turn: row.turn,
+		gapBand: row.gapBand,
+		requests: row.requests,
+		joinedResponses: row.joinedResponses,
+		unjoinedRequests: row.unjoinedRequests,
+		measuredResponses: row.measuredResponses,
+		weightedCachedReadPct:
+			row.inputTokens > 0
+				? Math.round((1000 * row.cachedReadTokens) / row.inputTokens) / 10
+				: null,
+		positiveHitResponses: row.positiveHitResponses,
+		positiveHitRatePct:
+			row.measuredResponses > 0
+				? Math.round(
+						(1000 * row.positiveHitResponses) / row.measuredResponses,
+					) / 10
+				: null,
+		zeroHitResponses: row.zeroHitResponses,
+		cacheWriteMeasuredResponses: row.cacheWriteMeasuredResponses,
+		cacheWriteUnavailableResponses: row.cacheWriteUnavailableResponses,
+		cacheWriteTokens: row.cacheWriteTokens,
+		compactionContinuations: row.compactionContinuations,
+		keyRotations: row.keyRotations,
+		distinctEffectiveKeys: row.effectiveKeys.size,
+		maxRequestsPerKeyMinute,
+		keysOver15RequestsPerMinute: [...row.keyTimestamps.values()].filter(
+			(timestamps) => {
+				timestamps.sort((a, b) => a - b);
+				let left = 0;
+				for (let right = 0; right < timestamps.length; right++) {
+					while ((timestamps[right] ?? 0) - (timestamps[left] ?? 0) >= 60_000)
+						left++;
+					if (right - left + 1 > 15) return true;
+				}
+				return false;
+			},
+		).length,
+	};
+}
+
+function analyzeContinuityProvenance(
+	requestRecords: readonly TraceRecord[],
+	requestsByAttemptId: ReadonlyMap<string, TraceRecord[]>,
+	responsesByAttemptId: ReadonlyMap<string, TraceRecord[]>,
+	legacyRequestsByLogicalId: ReadonlyMap<string, TraceRecord[]>,
+	legacyResponsesByLogicalId: ReadonlyMap<string, TraceRecord[]>,
+): CacheKeyContinuityReport {
+	const timestampOf = (record: TraceRecord): number | null => {
+		if (!record.ts) return null;
+		const timestamp = Date.parse(record.ts);
+		return Number.isFinite(timestamp) ? timestamp : null;
+	};
+	const identityOf = (request: TraceRecord): string | null => {
+		const identity =
+			request.canonical_conversation_id ?? request.conversation_id;
+		return typeof identity === "string" && identity.length > 0
+			? identity
+			: null;
+	};
+	const grouped = new Map<string, TraceRecord[]>();
+	for (const request of requestRecords) {
+		const identity = identityOf(request);
+		if (!identity) continue;
+		const group = grouped.get(identity) ?? [];
+		group.push(request);
+		grouped.set(identity, group);
+	}
+	const position = new Map<
+		TraceRecord,
+		{
+			turn: CacheExperimentTurn;
+			gapBand: CacheExperimentGapBand;
+			previousKey: string | null;
+		}
+	>();
+	for (const group of grouped.values()) {
+		group.sort((a, b) => (timestampOf(a) ?? 0) - (timestampOf(b) ?? 0));
+		group.forEach((request, index) => {
+			const previous = group[index - 1];
+			const currentTs = timestampOf(request);
+			const previousTs = previous ? timestampOf(previous) : null;
+			position.set(request, {
+				turn: index === 0 ? "first_observed" : "follow_up_observed",
+				gapBand:
+					index === 0 ||
+					currentTs === null ||
+					previousTs === null ||
+					currentTs < previousTs
+						? "unknown"
+						: gapBand(currentTs - previousTs),
+				previousKey: previous?.prompt_cache_key_id ?? null,
+			});
+		});
+	}
+	const rows = new Map<string, ContinuityRowAccumulator>();
+	for (const request of requestRecords) {
+		const metadata = position.get(request) ?? {
+			turn: "unknown" as const,
+			gapBand: "unknown" as const,
+			previousKey: null,
+		};
+		const basis = continuityBasis(request.cache_key_continuity_basis);
+		const model = safeModel(request);
+		const rowKey = [basis, model, metadata.turn, metadata.gapBand].join("\0");
+		let row = rows.get(rowKey);
+		if (!row) {
+			row = continuityRowAccumulator(
+				basis,
+				model,
+				metadata.turn,
+				metadata.gapBand,
+			);
+			rows.set(rowKey, row);
+		}
+		row.requests++;
+		if (basis === "lineage_match") row.compactionContinuations++;
+		const effectiveKey = request.prompt_cache_key_id;
+		if (typeof effectiveKey === "string" && effectiveKey.length > 0) {
+			row.effectiveKeys.add(effectiveKey);
+			const timestamp = timestampOf(request);
+			if (timestamp !== null) {
+				const timestamps = row.keyTimestamps.get(effectiveKey) ?? [];
+				timestamps.push(timestamp);
+				row.keyTimestamps.set(effectiveKey, timestamps);
+			}
+			if (metadata.previousKey && metadata.previousKey !== effectiveKey)
+				row.keyRotations++;
+		}
+		const response = continuityResponseFor(
+			request,
+			requestsByAttemptId,
+			responsesByAttemptId,
+			legacyRequestsByLogicalId,
+			legacyResponsesByLogicalId,
+		);
+		if (!response) {
+			row.unjoinedRequests++;
+			continue;
+		}
+		row.joinedResponses++;
+		if (
+			response.cache_measurement_available !== false &&
+			safeTokenCount(response.input_tokens) &&
+			safeTokenCount(response.cache_read_input_tokens) &&
+			response.cache_read_input_tokens <= response.input_tokens
+		) {
+			row.measuredResponses++;
+			row.inputTokens += response.input_tokens;
+			row.cachedReadTokens += response.cache_read_input_tokens;
+			if (response.cache_read_input_tokens > 0) row.positiveHitResponses++;
+			else row.zeroHitResponses++;
+		}
+		if (hasMeasuredCacheWrite(response)) {
+			row.cacheWriteMeasuredResponses++;
+			row.cacheWriteTokens += response.cache_creation_input_tokens ?? 0;
+		} else row.cacheWriteUnavailableResponses++;
+	}
+	const finishedRows = [...rows.values()].map(finishContinuityRow);
+	finishedRows.sort(
+		(a, b) =>
+			a.basis.localeCompare(b.basis) ||
+			a.model.localeCompare(b.model) ||
+			a.turn.localeCompare(b.turn) ||
+			a.gapBand.localeCompare(b.gapBand),
+	);
+	return { rows: finishedRows };
+}
+
 function annotateExperimentSamples(
 	samples: readonly CacheExperimentLogicalSample[],
 	kind: CacheExperimentKind,
@@ -2212,6 +2528,13 @@ export function analyzeCodexTrace(
 	};
 	countJoinQuality(requestsByAttemptId, responsesByAttemptId);
 	countJoinQuality(legacyRequestsByLogicalId, legacyResponsesByLogicalId);
+	const continuity = analyzeContinuityProvenance(
+		requestRecords,
+		requestsByAttemptId,
+		responsesByAttemptId,
+		legacyRequestsByLogicalId,
+		legacyResponsesByLogicalId,
+	);
 	const measuredStats = (samples: readonly TraceRecord[]) => {
 		let input = 0;
 		let cacheRead = 0;
@@ -2538,6 +2861,7 @@ export function analyzeCodexTrace(
 			keysOver15RequestsPerMinute: concentration.filter((count) => count > 15)
 				.length,
 		},
+		continuity,
 		span: { first: timestamps[0], last: timestamps.at(-1) },
 		canary: analyzeCanary(requestRecords, responseRecords),
 		request: {
@@ -2681,6 +3005,9 @@ export function formatReport(report: TraceReport): string {
 		...formatCanaryArm("session", report.canary.session),
 		...formatCanaryArm("unassigned compatibility", report.canary.unassigned),
 		`  unjoined responses: ${report.canary.unjoinedResponses}`,
+		"",
+		"CACHE KEY CONTINUITY PROVENANCE:",
+		...report.continuity.rows.map((row) => `  ${JSON.stringify(row)}`),
 	];
 	if (report.response.worstRespawns.length > 0) {
 		lines.push("  worst within-response re-spawns:");
