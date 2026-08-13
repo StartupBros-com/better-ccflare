@@ -120,6 +120,36 @@ describe("AnthropicProvider.refreshToken — invalid_grant detection", () => {
 		}
 	});
 
+	it("does not interpolate an untrusted HTTP status text into debug diagnostics", async () => {
+		const statusText = "provider-status\ncredential-like=oauth-secret\r\n";
+		const debugCalls: unknown[][] = [];
+		const debug = spyOn(Logger.prototype, "debug").mockImplementation(
+			(message, data) => debugCalls.push([message, data]),
+		);
+		const restoreFetch = mockFetchOnce({
+			ok: false,
+			status: 503,
+			statusText,
+			text: async () => "temporarily unavailable",
+			headers: { "content-type": "text/plain" },
+		});
+
+		try {
+			const provider = new AnthropicProvider();
+			await expect(
+				provider.refreshToken(makeAccount(), "test-client"),
+			).rejects.toBeInstanceOf(Error);
+
+			const diagnostics = JSON.stringify(debugCalls);
+			expect(diagnostics).not.toContain(statusText);
+			expect(diagnostics).not.toContain("credential-like=oauth-secret");
+			expect(diagnostics).toContain("Response status: 503");
+		} finally {
+			debug.mockRestore();
+			restoreFetch();
+		}
+	});
+
 	it("throws OAuthRefreshTokenError for HTTP 400 invalid_grant (not gated on 401)", async () => {
 		const restore = mockFetchOnce({
 			ok: false,
