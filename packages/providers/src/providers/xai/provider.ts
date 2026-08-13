@@ -124,7 +124,7 @@ export class XaiProvider extends OpenAICompatibleProvider {
 				: getOAuthErrorCode(data) || getExactOAuthErrorCode(responseText);
 			const failureMessage = `Failed to refresh xAI token for account ${account.name}: ${response.status} ${errorCode || "OAuth token endpoint rejected request"}`;
 			if (errorCode) {
-				throw new OAuthRefreshTokenError(account.id, failureMessage);
+				throw new OAuthRefreshTokenError(account.id, failureMessage, errorCode);
 			}
 			throw new Error(failureMessage);
 		}

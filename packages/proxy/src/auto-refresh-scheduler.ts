@@ -1198,7 +1198,7 @@ export class AutoRefreshScheduler {
 	): Promise<void> {
 		const reason =
 			error instanceof OAuthRefreshTokenError
-				? "invalid_grant"
+				? error.oauthErrorCode
 				: getOAuthErrorCode(error);
 		if (!reason) return;
 

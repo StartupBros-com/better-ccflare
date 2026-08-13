@@ -873,7 +873,7 @@ export async function refreshAccessTokenSafe(
 				// invalid-grant marker as prose and must never authorize an account write.
 				const structuredAuthFailureReason = getOAuthErrorCode(error);
 				const typedAuthFailureReason =
-					error instanceof OAuthRefreshTokenError ? "invalid_grant" : null;
+					error instanceof OAuthRefreshTokenError ? error.oauthErrorCode : null;
 				const authFailureReason =
 					structuredAuthFailureReason || typedAuthFailureReason;
 				if (authFailureReason) {

@@ -1117,12 +1117,13 @@ export class CodexProvider extends BaseProvider {
 				throw new OAuthRefreshTokenError(
 					account.id,
 					`Codex refresh_token_reused for account ${account.name}. Please re-authenticate with: bun run cli --reauthenticate ${account.name}`,
+					errorCode,
 				);
 			}
 
 			const failureMessage = `Failed to refresh Codex token for account ${account.name}: ${errorMessage}`;
 			if (errorCode) {
-				throw new OAuthRefreshTokenError(account.id, failureMessage);
+				throw new OAuthRefreshTokenError(account.id, failureMessage, errorCode);
 			}
 			throw new Error(failureMessage);
 		}

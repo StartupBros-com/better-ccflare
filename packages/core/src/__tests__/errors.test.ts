@@ -121,12 +121,36 @@ describe("isInvalidGrantMessage", () => {
 });
 
 describe("OAuthRefreshTokenError", () => {
-	it("carries the OAUTH_INVALID_GRANT code and accountId", () => {
+	it("carries the OAUTH_INVALID_GRANT code, accountId, and default reason", () => {
 		const err = new OAuthRefreshTokenError("acct-1");
 		expect(err).toBeInstanceOf(Error);
 		expect(err.code).toBe("OAUTH_INVALID_GRANT");
 		expect(err.statusCode).toBe(401);
 		expect(err.accountId).toBe("acct-1");
+		expect(err.oauthErrorCode).toBe("invalid_grant");
+	});
+
+	it("preserves a validated terminal OAuth machine code", () => {
+		const err = new OAuthRefreshTokenError(
+			"acct-1",
+			"refresh token reused",
+			"refresh_token_reused",
+		);
+		expect(err.oauthErrorCode).toBe("refresh_token_reused");
+		expect(err.context).toMatchObject({
+			accountId: "acct-1",
+			oauthErrorCode: "refresh_token_reused",
+		});
+	});
+
+	it("falls back when an unrecognized reason is supplied", () => {
+		const err = new OAuthRefreshTokenError(
+			"acct-1",
+			"provider error",
+			"untrusted_provider_text",
+		);
+		expect(err.oauthErrorCode).toBe("invalid_grant");
+		expect(err.context).toMatchObject({ oauthErrorCode: "invalid_grant" });
 	});
 });
 

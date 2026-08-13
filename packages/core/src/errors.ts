@@ -251,11 +251,25 @@ export function isInvalidGrantMessage(
  * `AuthError`, which hardcodes the `AUTH_ERROR` code) to carry its own code.
  */
 export class OAuthRefreshTokenError extends AppError {
+	public readonly oauthErrorCode: string;
+
 	constructor(
 		public readonly accountId: string,
 		message = "OAuth refresh token rejected, re-authentication required",
+		oauthErrorCode = "invalid_grant",
 	) {
-		super(message, "OAUTH_INVALID_GRANT", 401, { accountId });
+		const normalizedOAuthErrorCode =
+			boundedOAuthText(oauthErrorCode).toLowerCase();
+		const verifiedOAuthErrorCode = INVALID_GRANT_CODES.has(
+			normalizedOAuthErrorCode,
+		)
+			? normalizedOAuthErrorCode
+			: "invalid_grant";
+		super(message, "OAUTH_INVALID_GRANT", 401, {
+			accountId,
+			oauthErrorCode: verifiedOAuthErrorCode,
+		});
+		this.oauthErrorCode = verifiedOAuthErrorCode;
 	}
 }
 

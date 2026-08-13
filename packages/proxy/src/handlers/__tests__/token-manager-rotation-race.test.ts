@@ -1,5 +1,9 @@
 import { beforeEach, describe, expect, it, mock } from "bun:test";
-import { type AuthFailureEvt, authFailureEvents } from "@better-ccflare/core";
+import {
+	type AuthFailureEvt,
+	authFailureEvents,
+	OAuthRefreshTokenError,
+} from "@better-ccflare/core";
 import type { Account } from "@better-ccflare/types";
 import {
 	clearAllPendingRotationsForTests,
@@ -249,7 +253,8 @@ describe("refreshAccessTokenSafe — rotation-race pre-refresh guard", () => {
 });
 
 describe("refreshAccessTokenSafe — benign race on invalid_grant", () => {
-	const invalidGrant = new Error(
+	const invalidGrant = new OAuthRefreshTokenError(
+		"rotation-race",
 		"Status 400, Error: invalid_grant: Refresh token not found or invalid",
 	);
 

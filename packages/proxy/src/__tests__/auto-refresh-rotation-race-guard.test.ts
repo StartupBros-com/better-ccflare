@@ -19,7 +19,11 @@
  * handled here is just a replay of the now-consumed token.
  */
 import { beforeEach, describe, expect, it, mock } from "bun:test";
-import { type AuthFailureEvt, authFailureEvents } from "@better-ccflare/core";
+import {
+	type AuthFailureEvt,
+	authFailureEvents,
+	OAuthRefreshTokenError,
+} from "@better-ccflare/core";
 import type { AutoRefreshScheduler } from "../auto-refresh-scheduler";
 import {
 	clearAllPendingRotationsForTests,
@@ -95,7 +99,8 @@ const row = {
 	provider: "qwen",
 	refresh_token: "RT1-consumed",
 };
-const invalidGrant = new Error(
+const invalidGrant = new OAuthRefreshTokenError(
+	"acc-1",
 	"Failed to refresh token for account test-account: invalid_grant: token expired",
 );
 

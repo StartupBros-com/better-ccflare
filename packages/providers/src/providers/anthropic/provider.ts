@@ -236,7 +236,7 @@ export class AnthropicProvider extends BaseProvider {
 			// error so callers can pause the account for re-authentication instead
 			// of treating it as a transient refresh failure.
 			if (errorCode) {
-				throw new OAuthRefreshTokenError(account.id, failureMessage);
+				throw new OAuthRefreshTokenError(account.id, failureMessage, errorCode);
 			}
 			throw new Error(failureMessage);
 		}
