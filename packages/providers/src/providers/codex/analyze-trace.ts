@@ -37,6 +37,8 @@ export interface TraceRecord {
 		| "ineligible"
 		| string
 		| null;
+	cache_key_continuity_applied?: boolean | null;
+	continuity_evidence_id?: string | null;
 	canonical_conversation_id?: string | null;
 	pacing_canary?: string | null;
 	pacing_cohort_id?: string | null;
@@ -160,9 +162,11 @@ export type CacheKeyContinuityBasis =
 	| "session"
 	| "ineligible"
 	| "unknown";
+export type CacheKeyContinuityApplication = "canonical" | "derived" | "unknown";
 
 export interface CacheKeyContinuityRow {
 	basis: CacheKeyContinuityBasis;
+	application: CacheKeyContinuityApplication;
 	model: string;
 	turn: CacheExperimentTurn;
 	gapBand: CacheExperimentGapBand;
@@ -1469,14 +1473,24 @@ interface ContinuityRowAccumulator extends CacheKeyContinuityRow {
 	keyTimestamps: Map<string, number[]>;
 }
 
+function continuityApplication(
+	request: TraceRecord,
+): CacheKeyContinuityApplication {
+	if (request.cache_key_continuity_applied === true) return "canonical";
+	if (request.cache_key_continuity_applied === false) return "derived";
+	return "unknown";
+}
+
 function continuityRowAccumulator(
 	basis: CacheKeyContinuityBasis,
+	application: CacheKeyContinuityApplication,
 	model: string,
 	turn: CacheExperimentTurn,
 	gapBandValue: CacheExperimentGapBand,
 ): ContinuityRowAccumulator {
 	return {
 		basis,
+		application,
 		model,
 		turn,
 		gapBand: gapBandValue,
@@ -1547,6 +1561,7 @@ function finishContinuityRow(
 	}
 	return {
 		basis: row.basis,
+		application: row.application,
 		model: row.model,
 		turn: row.turn,
 		gapBand: row.gapBand,
@@ -1601,19 +1616,34 @@ function analyzeContinuityProvenance(
 		return Number.isFinite(timestamp) ? timestamp : null;
 	};
 	const identityOf = (request: TraceRecord): string | null => {
-		const identity =
-			request.canonical_conversation_id ?? request.conversation_id;
-		return typeof identity === "string" && identity.length > 0
-			? identity
-			: null;
+		const boundedIdentity = (identity: unknown): string | null =>
+			typeof identity === "string" && identity.length > 0 ? identity : null;
+		if (request.cache_key_mode === "session") {
+			return boundedIdentity(request.conversation_id);
+		}
+		if (request.cache_key_continuity_applied === true) {
+			return boundedIdentity(request.canonical_conversation_id);
+		}
+		if (
+			request.trace_schema_version !== undefined &&
+			request.trace_schema_version >= 17
+		) {
+			return (
+				boundedIdentity(request.continuity_evidence_id) ??
+				boundedIdentity(request.conversation_id)
+			);
+		}
+		return boundedIdentity(request.conversation_id);
 	};
 	const grouped = new Map<string, TraceRecord[]>();
 	for (const request of requestRecords) {
 		const identity = identityOf(request);
 		if (!identity) continue;
-		const group = grouped.get(identity) ?? [];
+		const application = continuityApplication(request);
+		const groupKey = `${identity.length}:${identity}\0${application}`;
+		const group = grouped.get(groupKey) ?? [];
 		group.push(request);
-		grouped.set(identity, group);
+		grouped.set(groupKey, group);
 	}
 	const position = new Map<
 		TraceRecord,
@@ -1650,12 +1680,20 @@ function analyzeContinuityProvenance(
 			previousKey: null,
 		};
 		const basis = continuityBasis(request.cache_key_continuity_basis);
+		const application = continuityApplication(request);
 		const model = safeModel(request);
-		const rowKey = [basis, model, metadata.turn, metadata.gapBand].join("\0");
+		const rowKey = [
+			basis,
+			application,
+			model,
+			metadata.turn,
+			metadata.gapBand,
+		].join("\0");
 		let row = rows.get(rowKey);
 		if (!row) {
 			row = continuityRowAccumulator(
 				basis,
+				application,
 				model,
 				metadata.turn,
 				metadata.gapBand,
@@ -1709,6 +1747,7 @@ function analyzeContinuityProvenance(
 	finishedRows.sort(
 		(a, b) =>
 			a.basis.localeCompare(b.basis) ||
+			a.application.localeCompare(b.application) ||
 			a.model.localeCompare(b.model) ||
 			a.turn.localeCompare(b.turn) ||
 			a.gapBand.localeCompare(b.gapBand),
