@@ -1393,6 +1393,140 @@ describe("analyzeCodexTrace", () => {
 		expect(continuityText).not.toContain("private-model-name");
 	});
 
+	test("attributes one logical retry to its admitted continuity provenance", () => {
+		const report = analyzeCodexTrace([
+			{
+				trace_schema_version: 17,
+				phase: "request",
+				request_id: "root-request",
+				attempt_id: "root-attempt",
+				attempt_ordinal: 0,
+				ts: "2026-07-10T00:00:00Z",
+				conversation_id: "derived-root",
+				canonical_conversation_id: "canonical-root",
+				continuity_evidence_id: "canonical-root",
+				cache_key_continuity_applied: true,
+				cache_key_continuity_basis: "derived",
+				prompt_cache_key_id: "canonical-key",
+				model_out: "gpt-5.6-sol",
+			},
+			{
+				trace_schema_version: 17,
+				phase: "response",
+				request_id: "root-request",
+				attempt_id: "root-attempt",
+				input_tokens: 100,
+				cache_read_input_tokens: 0,
+				cache_creation_input_tokens: 20,
+				cache_creation_measurement_available: true,
+			},
+			{
+				trace_schema_version: 17,
+				phase: "request",
+				request_id: "continuation-request",
+				attempt_id: "continuation-initial",
+				attempt_ordinal: 0,
+				ts: "2026-07-10T00:02:00Z",
+				conversation_id: "derived-compacted",
+				canonical_conversation_id: "canonical-root",
+				continuity_evidence_id: "canonical-root",
+				cache_key_continuity_applied: true,
+				cache_key_continuity_basis: "lineage_match",
+				prompt_cache_key_id: "canonical-key",
+				model_out: "gpt-5.6-sol",
+			},
+			{
+				trace_schema_version: 17,
+				phase: "request",
+				request_id: "continuation-request",
+				attempt_id: "continuation-retry",
+				attempt_ordinal: 1,
+				attempt_cause: "cache_lane_rescue",
+				ts: "2026-07-10T00:02:01Z",
+				conversation_id: "derived-compacted",
+				canonical_conversation_id: "canonical-root",
+				continuity_evidence_id: "canonical-root",
+				cache_key_continuity_applied: true,
+				cache_key_continuity_basis: "identity_match",
+				prompt_cache_key_id: "rescue-key",
+				model_out: "gpt-5.6-sol",
+			},
+			{
+				trace_schema_version: 17,
+				phase: "response",
+				request_id: "continuation-request",
+				attempt_id: "continuation-retry",
+				input_tokens: 200,
+				cache_read_input_tokens: 120,
+				cache_creation_input_tokens: 10,
+				cache_creation_measurement_available: true,
+			},
+		]);
+
+		const continuation = report.continuity.rows.find(
+			(row) =>
+				row.basis === "lineage_match" &&
+				row.application === "canonical" &&
+				row.turn === "follow_up_observed",
+		);
+		expect(continuation).toMatchObject({
+			requests: 1,
+			joinedResponses: 1,
+			unjoinedRequests: 0,
+			measuredResponses: 1,
+			weightedCachedReadPct: 60,
+			positiveHitResponses: 1,
+			compactionContinuations: 1,
+			keyRotations: 1,
+			distinctEffectiveKeys: 1,
+		});
+		expect(
+			report.continuity.rows.find(
+				(row) => row.basis === "identity_match" && row.requests > 0,
+			),
+		).toBeUndefined();
+	});
+
+	test("sequences schema-16 compactions by their legacy canonical identity", () => {
+		const report = analyzeCodexTrace([
+			{
+				trace_schema_version: 16,
+				phase: "request",
+				request_id: "legacy-root-request",
+				attempt_id: "legacy-root-attempt",
+				ts: "2026-07-10T00:00:00Z",
+				conversation_id: "legacy-derived-root",
+				canonical_conversation_id: "legacy-canonical-root",
+				cache_key_continuity_basis: "derived",
+				prompt_cache_key_id: "legacy-root-key",
+				model_out: "gpt-5.6-sol",
+			},
+			{
+				trace_schema_version: 16,
+				phase: "request",
+				request_id: "legacy-continuation-request",
+				attempt_id: "legacy-continuation-attempt",
+				ts: "2026-07-10T00:02:00Z",
+				conversation_id: "legacy-derived-compacted",
+				canonical_conversation_id: "legacy-canonical-root",
+				cache_key_continuity_basis: "lineage_match",
+				prompt_cache_key_id: "legacy-compacted-key",
+				model_out: "gpt-5.6-sol",
+			},
+		]);
+
+		const continuation = report.continuity.rows.find(
+			(row) => row.basis === "lineage_match" && row.application === "unknown",
+		);
+		expect(continuation).toMatchObject({
+			turn: "follow_up_observed",
+			gapBand: "from_1m_to_5m",
+			requests: 1,
+			compactionContinuations: 1,
+			keyRotations: 1,
+		});
+	});
+
 	test("sequences schema-17 derived conversations without orchestration evidence", () => {
 		const report = analyzeCodexTrace([
 			{

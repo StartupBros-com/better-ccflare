@@ -1517,32 +1517,6 @@ function continuityRowAccumulator(
 	};
 }
 
-function continuityResponseFor(
-	request: TraceRecord,
-	requestsByAttemptId: ReadonlyMap<string, TraceRecord[]>,
-	responsesByAttemptId: ReadonlyMap<string, TraceRecord[]>,
-	legacyRequestsByLogicalId: ReadonlyMap<string, TraceRecord[]>,
-	legacyResponsesByLogicalId: ReadonlyMap<string, TraceRecord[]>,
-): TraceRecord | undefined {
-	const requests = request.attempt_id
-		? (requestsByAttemptId.get(request.attempt_id) ?? [])
-		: request.request_id && isLegacyJoinEligible(request)
-			? (legacyRequestsByLogicalId.get(request.request_id) ?? [])
-			: [];
-	const responses = request.attempt_id
-		? (responsesByAttemptId.get(request.attempt_id) ?? [])
-		: request.request_id && isLegacyJoinEligible(request)
-			? (legacyResponsesByLogicalId.get(request.request_id) ?? [])
-			: [];
-	const response = responses[0];
-	return requests.length === 1 &&
-		responses.length === 1 &&
-		response &&
-		matchingLogicalRequestIds(request, response)
-		? response
-		: undefined;
-}
-
 function finishContinuityRow(
 	row: ContinuityRowAccumulator,
 ): CacheKeyContinuityRow {
@@ -1603,21 +1577,104 @@ function finishContinuityRow(
 	};
 }
 
-function analyzeContinuityProvenance(
+function continuityLogicalSamples(
 	requestRecords: readonly TraceRecord[],
 	requestsByAttemptId: ReadonlyMap<string, TraceRecord[]>,
 	responsesByAttemptId: ReadonlyMap<string, TraceRecord[]>,
 	legacyRequestsByLogicalId: ReadonlyMap<string, TraceRecord[]>,
 	legacyResponsesByLogicalId: ReadonlyMap<string, TraceRecord[]>,
-): CacheKeyContinuityReport {
+): CacheExperimentLogicalSample[] {
+	const hasContinuityProvenance = (request: TraceRecord): boolean =>
+		request.cache_key_continuity_basis !== undefined ||
+		request.cache_key_continuity_applied !== undefined ||
+		request.continuity_evidence_id !== undefined ||
+		request.canonical_conversation_id !== undefined ||
+		request.conversation_id !== undefined ||
+		request.cache_key_mode !== undefined;
+	const selectedLogicalIds = new Set<string>();
+	let hasAnonymousProvenance = false;
+	for (const request of requestRecords) {
+		if (!hasContinuityProvenance(request)) continue;
+		if (request.request_id) selectedLogicalIds.add(request.request_id);
+		else hasAnonymousProvenance = true;
+	}
+	if (selectedLogicalIds.size === 0 && !hasAnonymousProvenance) return [];
+	const logicalRequests = new Map<string, TraceRecord[]>();
+	let anonymous = 0;
+	for (const request of requestRecords) {
+		const selected = request.request_id
+			? selectedLogicalIds.has(request.request_id)
+			: hasContinuityProvenance(request);
+		if (!selected) continue;
+		const key = request.request_id
+			? `logical:${request.request_id}`
+			: request.attempt_id
+				? `attempt:${request.attempt_id}`
+				: `anonymous:${anonymous++}`;
+		appendRecord(logicalRequests, key, request);
+	}
 	const timestampOf = (record: TraceRecord): number | null => {
 		if (!record.ts) return null;
-		const timestamp = Date.parse(record.ts);
-		return Number.isFinite(timestamp) ? timestamp : null;
+		const parsed = Date.parse(record.ts);
+		return Number.isFinite(parsed) ? parsed : null;
 	};
+	const samples: CacheExperimentLogicalSample[] = [];
+	for (const attempts of logicalRequests.values()) {
+		const ordered = [...attempts].sort(
+			(a, b) =>
+				(a.attempt_ordinal ?? 0) - (b.attempt_ordinal ?? 0) ||
+				(timestampOf(a) ?? Number.POSITIVE_INFINITY) -
+					(timestampOf(b) ?? Number.POSITIVE_INFINITY),
+		);
+		const request = ordered.at(-1);
+		if (!request) continue;
+		let response: TraceRecord | undefined;
+		if (request.attempt_id) {
+			const joinedRequests = requestsByAttemptId.get(request.attempt_id) ?? [];
+			const joinedResponses =
+				responsesByAttemptId.get(request.attempt_id) ?? [];
+			if (
+				joinedRequests.length === 1 &&
+				joinedResponses.length === 1 &&
+				joinedResponses[0] &&
+				matchingLogicalRequestIds(request, joinedResponses[0])
+			) {
+				response = joinedResponses[0];
+			}
+		} else if (request.request_id && isLegacyJoinEligible(request)) {
+			const joinedRequests =
+				legacyRequestsByLogicalId.get(request.request_id) ?? [];
+			const joinedResponses =
+				legacyResponsesByLogicalId.get(request.request_id) ?? [];
+			if (
+				joinedRequests.length === 1 &&
+				joinedResponses.length === 1 &&
+				joinedResponses[0] &&
+				matchingLogicalRequestIds(request, joinedResponses[0])
+			) {
+				response = joinedResponses[0];
+			}
+		}
+		const logicalTimestamp = ordered.reduce<number | null>(
+			(earliest, attempt) => {
+				const timestamp = timestampOf(attempt);
+				return timestamp !== null && (earliest === null || timestamp < earliest)
+					? timestamp
+					: earliest;
+			},
+			null,
+		);
+		samples.push({ request, attempts: ordered, response, logicalTimestamp });
+	}
+	return samples;
+}
+
+function analyzeContinuityProvenance(
+	samples: readonly CacheExperimentLogicalSample[],
+): CacheKeyContinuityReport {
+	const boundedIdentity = (identity: unknown): string | null =>
+		typeof identity === "string" && identity.length > 0 ? identity : null;
 	const identityOf = (request: TraceRecord): string | null => {
-		const boundedIdentity = (identity: unknown): string | null =>
-			typeof identity === "string" && identity.length > 0 ? identity : null;
 		if (request.cache_key_mode === "session") {
 			return boundedIdentity(request.conversation_id);
 		}
@@ -1633,20 +1690,35 @@ function analyzeContinuityProvenance(
 				boundedIdentity(request.conversation_id)
 			);
 		}
-		return boundedIdentity(request.conversation_id);
+		return (
+			boundedIdentity(request.canonical_conversation_id) ??
+			boundedIdentity(request.conversation_id)
+		);
 	};
-	const grouped = new Map<string, TraceRecord[]>();
-	for (const request of requestRecords) {
-		const identity = identityOf(request);
-		if (!identity) continue;
-		const application = continuityApplication(request);
-		const groupKey = `${identity.length}:${identity}\0${application}`;
+	type ContinuityLogicalSample = CacheExperimentLogicalSample & {
+		provenance: TraceRecord;
+		application: CacheKeyContinuityApplication;
+		identity: string | null;
+	};
+	const logicalSamples: ContinuityLogicalSample[] = samples.map((sample) => {
+		const provenance = sample.attempts[0] ?? sample.request;
+		return {
+			...sample,
+			provenance,
+			application: continuityApplication(provenance),
+			identity: identityOf(provenance),
+		};
+	});
+	const grouped = new Map<string, ContinuityLogicalSample[]>();
+	for (const sample of logicalSamples) {
+		if (!sample.identity) continue;
+		const groupKey = `${sample.identity.length}:${sample.identity}\0${sample.application}`;
 		const group = grouped.get(groupKey) ?? [];
-		group.push(request);
+		group.push(sample);
 		grouped.set(groupKey, group);
 	}
 	const position = new Map<
-		TraceRecord,
+		ContinuityLogicalSample,
 		{
 			turn: CacheExperimentTurn;
 			gapBand: CacheExperimentGapBand;
@@ -1654,12 +1726,12 @@ function analyzeContinuityProvenance(
 		}
 	>();
 	for (const group of grouped.values()) {
-		group.sort((a, b) => (timestampOf(a) ?? 0) - (timestampOf(b) ?? 0));
-		group.forEach((request, index) => {
+		group.sort((a, b) => (a.logicalTimestamp ?? 0) - (b.logicalTimestamp ?? 0));
+		group.forEach((sample, index) => {
 			const previous = group[index - 1];
-			const currentTs = timestampOf(request);
-			const previousTs = previous ? timestampOf(previous) : null;
-			position.set(request, {
+			const currentTs = sample.logicalTimestamp;
+			const previousTs = previous?.logicalTimestamp ?? null;
+			position.set(sample, {
 				turn: index === 0 ? "first_observed" : "follow_up_observed",
 				gapBand:
 					index === 0 ||
@@ -1668,20 +1740,20 @@ function analyzeContinuityProvenance(
 					currentTs < previousTs
 						? "unknown"
 						: gapBand(currentTs - previousTs),
-				previousKey: previous?.prompt_cache_key_id ?? null,
+				previousKey: previous?.request.prompt_cache_key_id ?? null,
 			});
 		});
 	}
 	const rows = new Map<string, ContinuityRowAccumulator>();
-	for (const request of requestRecords) {
-		const metadata = position.get(request) ?? {
+	for (const sample of logicalSamples) {
+		const metadata = position.get(sample) ?? {
 			turn: "unknown" as const,
 			gapBand: "unknown" as const,
 			previousKey: null,
 		};
-		const basis = continuityBasis(request.cache_key_continuity_basis);
-		const application = continuityApplication(request);
-		const model = safeModel(request);
+		const basis = continuityBasis(sample.provenance.cache_key_continuity_basis);
+		const application = sample.application;
+		const model = safeModel(sample.request);
 		const rowKey = [
 			basis,
 			application,
@@ -1702,25 +1774,18 @@ function analyzeContinuityProvenance(
 		}
 		row.requests++;
 		if (basis === "lineage_match") row.compactionContinuations++;
-		const effectiveKey = request.prompt_cache_key_id;
+		const effectiveKey = sample.request.prompt_cache_key_id;
 		if (typeof effectiveKey === "string" && effectiveKey.length > 0) {
 			row.effectiveKeys.add(effectiveKey);
-			const timestamp = timestampOf(request);
-			if (timestamp !== null) {
+			if (sample.logicalTimestamp !== null) {
 				const timestamps = row.keyTimestamps.get(effectiveKey) ?? [];
-				timestamps.push(timestamp);
+				timestamps.push(sample.logicalTimestamp);
 				row.keyTimestamps.set(effectiveKey, timestamps);
 			}
 			if (metadata.previousKey && metadata.previousKey !== effectiveKey)
 				row.keyRotations++;
 		}
-		const response = continuityResponseFor(
-			request,
-			requestsByAttemptId,
-			responsesByAttemptId,
-			legacyRequestsByLogicalId,
-			legacyResponsesByLogicalId,
-		);
+		const response = sample.response;
 		if (!response) {
 			row.unjoinedRequests++;
 			continue;
@@ -2568,11 +2633,13 @@ export function analyzeCodexTrace(
 	countJoinQuality(requestsByAttemptId, responsesByAttemptId);
 	countJoinQuality(legacyRequestsByLogicalId, legacyResponsesByLogicalId);
 	const continuity = analyzeContinuityProvenance(
-		requestRecords,
-		requestsByAttemptId,
-		responsesByAttemptId,
-		legacyRequestsByLogicalId,
-		legacyResponsesByLogicalId,
+		continuityLogicalSamples(
+			requestRecords,
+			requestsByAttemptId,
+			responsesByAttemptId,
+			legacyRequestsByLogicalId,
+			legacyResponsesByLogicalId,
+		),
 	);
 	const measuredStats = (samples: readonly TraceRecord[]) => {
 		let input = 0;
