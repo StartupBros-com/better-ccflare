@@ -573,6 +573,19 @@ export function getComboSlotInfo(meta: RequestMeta): ComboSlotInfo | null {
 	return comboSlotInfoMap.get(meta) ?? null;
 }
 
+// xAI cache-native conversation affinity is request-local at this seam and
+// process-wide only for confirmed account ownership. Keeping this side channel
+// separate from RequestMeta preserves the existing metadata shape.
+const xaiConvIdMap = new WeakMap<RequestMeta, string>();
+
+export function setXaiConvId(meta: RequestMeta, convId: string): void {
+	xaiConvIdMap.set(meta, convId);
+}
+
+export function getXaiConvId(meta: RequestMeta): string | null {
+	return xaiConvIdMap.get(meta) ?? null;
+}
+
 // Deliberately kept even though our fork replaced upstream's model-capacity.ts
 // module wholesale (see account-selector's hard-capacity system below): this
 // one flag is an unrelated, additive combo-isolation safety valve with no
@@ -1831,6 +1844,7 @@ async function selectAccountsForRequestInternal(
 			if (!forcedAccount) {
 				throw new ForceRouteUnavailableError(forcedAccountId, "not_found");
 			}
+			setXaiCacheEligibleAccounts(meta, [forcedAccount]);
 			if (
 				serverForcedAccountId &&
 				isProviderExcludedForRequest(forcedAccount, getExcludedProviders(meta))

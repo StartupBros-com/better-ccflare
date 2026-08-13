@@ -175,8 +175,8 @@ describe("refreshPollingAccessToken (R25: no temporary resume/restore)", () => {
  * resolves immediately with a rotated refresh token, no network involved.
  * proxyContext.asyncWriter.enqueue runs its job synchronously so the token
  * persistence (dbOps.updateAccountTokens) that would normally happen via the
- * async writer lands deterministically, modeling the worst-case timing the
- * bug depended on.
+ * CAS write lands deterministically inside the shared refresh promise,
+ * modeling the production persistence contract.
  */
 function makeRotationProxyContext(state: {
 	paused: boolean;
@@ -192,16 +192,19 @@ function makeRotationProxyContext(state: {
 			calls.push("getAccount");
 			return { ...state } as unknown as Account;
 		},
-		updateAccountTokens: async (
+		updateAccountTokensIfRefreshTokenMatches: async (
 			_id: string,
+			expectedRefreshToken: string,
 			accessToken: string,
 			expiresAt: number,
 			refreshToken?: string,
 		) => {
-			calls.push("updateAccountTokens");
+			calls.push("updateAccountTokensIfRefreshTokenMatches");
+			if (state.refresh_token !== expectedRefreshToken) return false;
 			state.access_token = accessToken;
 			state.expires_at = expiresAt;
 			if (refreshToken) state.refresh_token = refreshToken;
+			return true;
 		},
 		...makeNeverCalledPauseSpies(),
 	};
@@ -265,10 +268,12 @@ describe("refreshPollingAccessToken (R25: rotation no longer defeats the pause)"
 		// for the rotation to defeat.
 		expect(state.paused).toBe(true);
 		expect(state.pause_reason).toBe("manual");
+		expect(account.refresh_token).toBe("rt-rotated");
 		expect(calls).toEqual([
 			"getAccount",
+			"getAccount",
 			"provider.refreshToken",
-			"updateAccountTokens",
+			"updateAccountTokensIfRefreshTokenMatches",
 		]);
 	});
 });

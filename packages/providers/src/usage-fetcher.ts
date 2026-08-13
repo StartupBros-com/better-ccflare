@@ -432,12 +432,9 @@ export function getRepresentativeUtilization(
 	return utilizations.length > 0 ? Math.max(...utilizations) : null;
 }
 
-/**
- * Determine which window is the most restrictive (highest utilization)
- * Dynamically handles any usage window fields in the response
- */
-export function getRepresentativeWindow(
+function representativeWindow(
 	usage: UsageData | null,
+	includeExtraUsage: boolean,
 ): string | null {
 	if (!usage) return null;
 
@@ -445,6 +442,7 @@ export function getRepresentativeWindow(
 
 	// Iterate through all properties to find UsageWindow objects
 	for (const [key, value] of Object.entries(usage)) {
+		if (key === "extra_usage" && !includeExtraUsage) continue;
 		// Check if this is a UsageWindow object
 		if (
 			value &&
@@ -480,13 +478,29 @@ export function getRepresentativeWindow(
 }
 
 /**
- * Get the representative utilization for any supported provider type.
- * Returns null if the provider is not supported or data is unavailable.
+ * Determine which window is the most restrictive (highest utilization)
+ * Dynamically handles any usage window fields in the response.
+ *
+ * Display surface — `extra_usage` is included, because a dashboard showing a
+ * 100%-spent overage pool is telling the truth. Reset derivation for the
+ * admission path deliberately uses the hard-limit-only variant instead, so the
+ * reset it reports belongs to a window that actually has one.
  */
-export function getRepresentativeUtilizationForProvider(
-	data: AnyUsageData,
+export function getRepresentativeWindow(
+	usage: UsageData | null,
+): string | null {
+	return representativeWindow(usage, true);
+}
+
+function utilizationForProvider(
+	data: AnyUsageData | null | undefined,
 	provider: string,
+	includeExtraUsage: boolean,
 ): number | null {
+	// Same defensive guard as getRepresentativeUsageResetMs — callers that
+	// derive a display label may hold a null payload for providers that expose
+	// no usage surface.
+	if (!data || typeof data !== "object") return null;
 	switch (provider) {
 		case "anthropic":
 		case "codex": {
@@ -503,8 +517,9 @@ export function getRepresentativeUtilizationForProvider(
 				const w = d[key] as UsageWindow | undefined;
 				if (w?.utilization != null) utils.push(w.utilization);
 			}
-			// extra_usage has utilization: number | null
-			if (d.extra_usage?.utilization != null)
+			// extra_usage has utilization: number | null. Ranking only — see the
+			// exported wrappers below for why it must never gate admission.
+			if (includeExtraUsage && d.extra_usage?.utilization != null)
 				utils.push(d.extra_usage.utilization);
 			// Account-level limits[] caps (session / weekly_all) for limits-only payloads.
 			for (const { util } of accountLevelLimitWindows(d)) utils.push(util);
@@ -538,6 +553,22 @@ export function getRepresentativeUtilizationForProvider(
 		default:
 			return null;
 	}
+}
+
+/** Routing/health utilization: excludes extra_usage from hard capacity gates. */
+export function getRepresentativeUtilizationForProvider(
+	data: AnyUsageData | null | undefined,
+	provider: string,
+): number | null {
+	return utilizationForProvider(data, provider, false);
+}
+
+/** Ranking utilization includes extra usage, because it reflects total spend. */
+export function getRankingUtilizationForProvider(
+	data: AnyUsageData | null | undefined,
+	provider: string,
+): number | null {
+	return utilizationForProvider(data, provider, true);
 }
 
 /**
@@ -691,13 +722,19 @@ export function getRepresentativeUsageResetMs(
 		switch (provider) {
 			case "anthropic":
 			case "codex": {
-				const windowName = getRepresentativeWindow(data as UsageData);
+				// Hard-limit windows only — must stay in lockstep with
+				// getRepresentativeUtilizationForProvider, which also excludes
+				// extra_usage. Pairing a utilization drawn from the hard-limit
+				// set with a reset drawn from a set that includes extra_usage
+				// would report the wrong window's recovery time (and extra_usage
+				// has no resets_at at all, so it would report none).
+				const windowName = representativeWindow(data as UsageData, false);
 				// Flat legacy shape: the window name is an actual property
 				// (five_hour/seven_day/...) carrying its own resets_at.
 				const flatReset = extractUsageResetMs(data, windowName);
 				if (flatReset !== null) return flatReset;
 				// limits[]-only payloads (2026 API): five_hour/seven_day are
-				// absent as properties — getRepresentativeWindow derives those
+				// absent as properties — representativeWindow derives those
 				// same names synthetically from limits[] kind "session" /
 				// "weekly_all". Fall back to the matching limits[] entry's own
 				// resets_at so the staleness guard still has a real reset time.

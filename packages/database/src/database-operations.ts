@@ -925,6 +925,72 @@ OAuth tokens will need to be re-authenticated.
 		);
 	}
 
+	async updateAccountTokensIfRefreshTokenMatches(
+		accountId: string,
+		expectedRefreshToken: string,
+		accessToken: string,
+		expiresAt: number,
+		refreshToken?: string,
+	): Promise<boolean> {
+		return withDatabaseRetry(
+			() =>
+				this.accounts.updateTokensIfRefreshTokenMatches(
+					accountId,
+					expectedRefreshToken,
+					accessToken,
+					expiresAt,
+					refreshToken,
+				),
+			this.retryConfig,
+			"updateAccountTokensIfRefreshTokenMatches",
+		);
+	}
+
+	async updateAccountTokensIfRefreshTokenAbsent(
+		accountId: string,
+		accessToken: string,
+		expiresAt: number,
+		refreshToken?: string,
+	): Promise<boolean> {
+		return withDatabaseRetry(
+			() =>
+				this.accounts.updateTokensIfRefreshTokenAbsent(
+					accountId,
+					accessToken,
+					expiresAt,
+					refreshToken,
+				),
+			this.retryConfig,
+			"updateAccountTokensIfRefreshTokenAbsent",
+		);
+	}
+
+	async flagAccountRequiresReauthIfTokenMatches(
+		accountId: string,
+		expectedRefreshToken: string,
+	): Promise<boolean> {
+		return withDatabaseRetry(
+			() =>
+				this.accounts.flagRequiresReauthIfTokenMatches(
+					accountId,
+					expectedRefreshToken,
+				),
+			this.retryConfig,
+			"flagAccountRequiresReauthIfTokenMatches",
+		);
+	}
+
+	/** Compatibility alias for proxy callers using the repository method name. */
+	async flagRequiresReauthIfTokenMatches(
+		accountId: string,
+		expectedRefreshToken: string,
+	): Promise<boolean> {
+		return this.flagAccountRequiresReauthIfTokenMatches(
+			accountId,
+			expectedRefreshToken,
+		);
+	}
+
 	async updateAccountUsage(accountId: string): Promise<void> {
 		const sessionDuration =
 			this.runtime?.sessionDurationMs || 5 * 60 * 60 * 1000;

@@ -17,6 +17,7 @@ import type {
 	ProviderAttemptPlanContext,
 } from "@better-ccflare/providers";
 import type { Account, RequestMeta } from "@better-ccflare/types";
+import { ANTHROPIC_DRAIN_DEADLINE_MS } from "../../anthropic-terminal-recovery";
 import { CACHE_REPLAY_MODEL_HEADER } from "../../cache-transport-staging";
 import {
 	type CodexWebSocketReceipt,
@@ -784,6 +785,77 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 		expect(
 			webSocketRequest.headers.get(CODEX_LOGICAL_MODEL_FAMILY_HEADER),
 		).toBeNull();
+	});
+
+	it("aborts the WebSocket transport signal when terminal draining reaches its deadline", async () => {
+		installUsageCollector();
+		const originalSetTimeout = globalThis.setTimeout;
+		const timeoutSpy = spyOn(globalThis, "setTimeout").mockImplementation(((
+			...args: Parameters<typeof setTimeout>
+		) => {
+			const [callback, delay, ...rest] = args;
+			return originalSetTimeout(
+				callback,
+				delay === ANTHROPIC_DRAIN_DEADLINE_MS ? 10 : delay,
+				...rest,
+			);
+		}) as typeof setTimeout);
+		let webSocketSignal: AbortSignal | undefined;
+		let httpCalls = 0;
+		globalThis.fetch = mock(async () => {
+			httpCalls++;
+			return new Response("unexpected HTTP fallback", { status: 500 });
+		});
+		const receipt = makeReceipt(() => undefined);
+		const websocketAttempt = spyOn(
+			codexWebSocketTransport,
+			"tryRequest",
+		).mockImplementation(async (input) => {
+			webSocketSignal = input.signal;
+			input.onFrameWritten?.(receipt);
+			return {
+				receipt,
+				response: new Response(
+					new ReadableStream<Uint8Array>({
+						start(controller) {
+							controller.enqueue(
+								new TextEncoder().encode(
+									'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"partial"}\n\n',
+								),
+							);
+							// Stay open until terminal recovery's drain deadline.
+						},
+					}),
+					{
+						status: 200,
+						headers: { "content-type": "text/event-stream" },
+					},
+				),
+			};
+		});
+
+		try {
+			const body = makeRequestBody();
+			const response = await runProxy(
+				makeRequest(body),
+				body,
+				makePolicy(1_000),
+				"codex-ws-drain-abort",
+			);
+			expect(response).not.toBeNull();
+			expect(websocketAttempt).toHaveBeenCalledTimes(1);
+			expect(httpCalls).toBe(0);
+			expect(webSocketSignal).toBeDefined();
+			expect(webSocketSignal?.aborted).toBe(false);
+			const reader = response?.body?.getReader();
+			expect(reader).toBeDefined();
+			await expect(reader?.read()).resolves.toMatchObject({ done: false });
+			await reader?.cancel("client disconnect");
+
+			expect(webSocketSignal?.aborted).toBe(true);
+		} finally {
+			timeoutSpy.mockRestore();
+		}
 	});
 
 	it("keeps the private attempt deadline for pre-write WebSocket fallback and HTTP", async () => {

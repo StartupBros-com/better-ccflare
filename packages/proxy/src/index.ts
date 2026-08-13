@@ -95,6 +95,11 @@ export {
 	resetDefaultCircuitBreaker as resetDefaultCircuitBreakerProxy,
 	shouldCountAsCircuitFailure,
 } from "./circuit-breaker";
+export type {
+	CodexModelEntry,
+	CodexModelListing,
+} from "./codex-model-catalog";
+export { getCodexModels } from "./codex-model-catalog";
 export {
 	type DegradedOwnerDirectiveInput,
 	type DegradedOwnerEvidenceInput,
@@ -116,6 +121,7 @@ export {
 	getUsageThrottleUntil,
 	getValidAccessToken,
 	isRefreshTokenLikelyExpired,
+	markAccountTokensFresh,
 	refreshCodexUsageForAccount,
 	registerCodexUsageRefresher,
 	registerPollingRestarter,
@@ -127,6 +133,11 @@ export {
 	type TokenHealthStatus,
 	unregisterCodexUsageRefresher,
 } from "./handlers";
+export {
+	configurePendingRotationPersistence,
+	restorePendingRotations,
+} from "./handlers/pending-rotation-registry";
+export { createPendingRotationWal } from "./handlers/pending-rotation-wal";
 export {
 	runIntegrityCheckOnDemand,
 	startFullIntegrityCheckBackground,

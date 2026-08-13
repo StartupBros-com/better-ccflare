@@ -1,6 +1,15 @@
-import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import {
+	afterEach,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	mock,
+	spyOn,
+} from "bun:test";
 import type { Account, RequestMeta } from "@better-ccflare/types";
 import { AnthropicDegradedResponseLifecycle } from "../../anthropic-degraded-response-lifecycle";
+import { ANTHROPIC_DRAIN_DEADLINE_MS } from "../../anthropic-terminal-recovery";
 import type { AnthropicDegradedRequestSendState } from "../proxy-operations";
 import type { ProxyContext } from "../proxy-types";
 
@@ -225,6 +234,84 @@ describe("proxyWithAccount: client abort signal reaches the upstream fetch", () 
 
 		controller.abort();
 		expect(captured.signal?.aborted).toBe(true);
+	});
+
+	it("aborts the exact upstream fetch signal when terminal draining reaches its deadline", async () => {
+		const originalSetTimeout = globalThis.setTimeout;
+		const timeoutSpy = spyOn(globalThis, "setTimeout").mockImplementation(((
+			...args: Parameters<typeof setTimeout>
+		) => {
+			const [callback, delay, ...rest] = args;
+			return originalSetTimeout(
+				callback,
+				delay === ANTHROPIC_DRAIN_DEADLINE_MS ? 10 : delay,
+				...rest,
+			);
+		}) as typeof setTimeout);
+		let upstreamSignal: AbortSignal | undefined;
+		const streamBytes = new TextEncoder().encode(
+			'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}\n\n',
+		);
+		globalThis.fetch = mock(
+			async (input: RequestInfo | URL, init?: RequestInit) => {
+				upstreamSignal =
+					input instanceof Request ? input.signal : (init?.signal ?? undefined);
+				return new Response(
+					new ReadableStream<Uint8Array>({
+						start(controller) {
+							controller.enqueue(streamBytes);
+							// Deliberately stay open: only the terminal-drain deadline can
+							// release this simulated upstream fetch body.
+						},
+					}),
+					{
+						status: 200,
+						headers: { "content-type": "text/event-stream" },
+					},
+				);
+			},
+		) as unknown as typeof globalThis.fetch;
+
+		try {
+			const bodyBuffer = makeRequestBody();
+			const req = new Request("https://proxy.local/v1/messages", {
+				method: "POST",
+				body: bodyBuffer,
+				headers: {
+					"Content-Type": "application/json",
+					"x-better-ccflare-auto-refresh": "true",
+					"x-better-ccflare-internal-probe-secret": "test-secret",
+				},
+			});
+			const ctx = makeProxyContext();
+			ctx.provider.isStreamingResponse = () => true;
+			const response = await proxyWithAccount(
+				req,
+				new URL(req.url),
+				makeAccount(),
+				makeRequestMeta(),
+				bodyBuffer,
+				() => undefined,
+				0,
+				ctx,
+			);
+
+			expect(response).not.toBeNull();
+			expect(upstreamSignal).toBeDefined();
+			expect(upstreamSignal?.aborted).toBe(false);
+			const reader = response?.body?.getReader();
+			expect(reader).toBeDefined();
+			await expect(reader?.read()).resolves.toMatchObject({ done: false });
+			await reader?.cancel("client disconnect");
+
+			// This is the signal observed by the final global.fetch(Request), after
+			// every provider transform and request-handler signal composition. The
+			// deadline controller passed to response-handler must therefore be one of
+			// this exact signal's live abort sources, not an unrelated controller.
+			expect(upstreamSignal?.aborted).toBe(true);
+		} finally {
+			timeoutSpy.mockRestore();
+		}
 	});
 
 	it("does not abort the upstream fetch while the client stays connected", async () => {

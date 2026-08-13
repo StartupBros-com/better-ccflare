@@ -40,6 +40,7 @@ import {
 	isNativeAnthropicMessagesSse,
 } from "../anthropic-semantic-preflight";
 import { AnthropicStreamOutcomeTracker } from "../anthropic-stream-outcome";
+import { CacheAffinityOrderer } from "../cache-affinity-orderer";
 import { DegradedOwnerOverlay } from "../degraded-owner-overlay";
 import type { ProxyContext } from "../handlers";
 import { stampInternalAutoRefreshAuth } from "../internal-probe-auth";
@@ -795,6 +796,11 @@ function makeContext(accounts: Account[], combo: ComboWithSlots | null = null) {
 	const reportCandidateSuccess = mock(
 		(_meta: RequestMeta, _success: { candidateId: string }) => undefined,
 	);
+	const cacheAffinityOrderer = new CacheAffinityOrderer(60_000);
+	const recordCacheAffinitySuccess = spyOn(
+		cacheAffinityOrderer,
+		"recordSuccess",
+	);
 	const ctx = {
 		strategy: {
 			select: mock(async (selected: Account[]) => selected),
@@ -802,6 +808,7 @@ function makeContext(accounts: Account[], combo: ComboWithSlots | null = null) {
 			reportCandidateFailure,
 			reportCandidateSuccess,
 		},
+		cacheAffinityOrderer,
 		dbOps: {
 			getAllAccounts: mock(async () => accounts),
 			getActiveComboForFamily: mock(async () => combo),
@@ -834,7 +841,12 @@ function makeContext(accounts: Account[], combo: ComboWithSlots | null = null) {
 		refreshInFlight: new Map(),
 		asyncWriter: { enqueue: mock(() => undefined) },
 	} as unknown as ProxyContext;
-	return { ctx, reportCandidateFailure, reportCandidateSuccess };
+	return {
+		ctx,
+		recordCacheAffinitySuccess,
+		reportCandidateFailure,
+		reportCandidateSuccess,
+	};
 }
 
 function makeRequest(
@@ -1340,10 +1352,8 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		try {
 			const codex = makeCodexAccount("codex-context-overflow");
 			const xai = makeXaiAccount("xai-context-fallback");
-			const { ctx, reportCandidateFailure } = makeContext(
-				[codex, xai],
-				makeCombo([codex]),
-			);
+			const { ctx, recordCacheAffinitySuccess, reportCandidateFailure } =
+				makeContext([codex, xai], makeCombo([codex]));
 			const fetchedProviders: string[] = [];
 			const xaiConversationIds: string[] = [];
 			let codexCalls = 0;
@@ -1409,6 +1419,20 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			expect(xaiConversationIds).toHaveLength(2);
 			expect(xaiConversationIds[0]).toMatch(/^ccflare-xai-[0-9a-f]{48}$/);
 			expect(xaiConversationIds[1]).toBe(xaiConversationIds[0]);
+			expect(
+				recordCacheAffinitySuccess.mock.calls.map(
+					([, candidateId, accountId]) => ({ candidateId, accountId }),
+				),
+			).toEqual([
+				{
+					candidateId: `account:${xai.id}`,
+					accountId: xai.id,
+				},
+				{
+					candidateId: `account:${xai.id}`,
+					accountId: xai.id,
+				},
+			]);
 			expect(reportCandidateFailure).not.toHaveBeenCalled();
 			expect(codex.rate_limited_until).toBeNull();
 			expect(codex.consecutive_rate_limits).toBe(0);
@@ -1759,10 +1783,8 @@ describe("downstream Anthropic Messages SSE routing", () => {
 	it("preserves the coded Codex overflow when the xAI fallback fails", async () => {
 		const codex = makeCodexAccount("codex-context-before-failed-xai");
 		const xai = makeXaiAccount("xai-failed-context-fallback");
-		const { ctx, reportCandidateFailure } = makeContext(
-			[codex, xai],
-			makeCombo([codex]),
-		);
+		const { ctx, recordCacheAffinitySuccess, reportCandidateFailure } =
+			makeContext([codex, xai], makeCombo([codex]));
 		const fetchedProviders: string[] = [];
 		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
 			const upstreamRequest =
@@ -1799,6 +1821,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			code: "context_length_exceeded",
 		});
 		expect(payload.error?.message).toContain("Prompt is too long.");
+		expect(recordCacheAffinitySuccess).not.toHaveBeenCalled();
 		expect(reportCandidateFailure).not.toHaveBeenCalled();
 		expect(codex.rate_limited_until).toBeNull();
 		expect(codex.consecutive_rate_limits).toBe(0);

@@ -1,10 +1,12 @@
 import { existsSync, readFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import {
 	Config,
+	filterEnabledProviderModelDefaultOverrides,
 	loadServerToolReplayKeys,
 	type RuntimeConfig,
 	readGuardCorrelationSecret,
+	resolveConfigPath,
 } from "@better-ccflare/config";
 import {
 	CACHE,
@@ -48,9 +50,10 @@ import {
 	fetchCodexUsageData,
 	fetchCodexUsageOnDemand,
 	getProvider,
-	getRepresentativeUtilizationForProvider,
+	getRankingUtilizationForProvider,
 	isCodexSubscriptionEndpoint,
 	resolveCodexEndpoint,
+	setProviderModelDefaultOverrides,
 	type UsageData,
 	usageCache,
 } from "@better-ccflare/providers";
@@ -65,15 +68,18 @@ import {
 	CacheAffinityOrderer,
 	CacheKeepaliveScheduler,
 	CohortSealService,
+	configurePendingRotationPersistence,
 	createAnthropicDegradedDetailedEventSink,
 	createAnthropicDegradedRuntimeHealth,
 	createDurableServerToolReplayWriterAdmission,
 	createGuardCorrelationVerifier,
+	createPendingRotationWal,
 	createServerToolReplayRuntime,
 	DegradedModeObservability,
 	DegradedOwnerOverlay,
 	drainUsageCollector,
 	forceCloseCircuit,
+	getCodexModels,
 	getModelCatalog,
 	getUsageCollectorHealth,
 	getValidAccessToken,
@@ -81,12 +87,14 @@ import {
 	initModelCatalogRefresh,
 	initProxy,
 	ModelRouteSessionRegistry,
+	markAccountTokensFresh,
 	type ProxyContext,
 	parseModelRouteProfiles,
 	refreshModelCatalog,
 	registerCodexUsageRefresher,
 	registerPollingRestarter,
 	registerRefreshClearer,
+	restorePendingRotations,
 	startGlobalTokenHealthChecks,
 	startIntegrityScheduler,
 	stopGlobalTokenHealthChecks,
@@ -718,9 +726,24 @@ export async function refreshPollingAccessToken(
 		account.access_token = currentAccount.access_token;
 		account.refresh_token = currentAccount.refresh_token;
 		account.expires_at = currentAccount.expires_at;
+		markAccountTokensFresh(account);
 	}
 
-	return getValidAccessToken(account, proxyContext);
+	const accessToken = await getValidAccessToken(account, proxyContext);
+	// The caller that started the refresh is mutated by getValidAccessToken. A
+	// concurrent caller can instead join an in-flight refresh owned by a different
+	// Account snapshot, so adopt the persisted winner only when this snapshot did
+	// not receive the returned access token itself.
+	if (account.access_token !== accessToken) {
+		const refreshedAccount = await proxyContext.dbOps.getAccount(account.id);
+		if (refreshedAccount?.access_token === accessToken) {
+			account.access_token = refreshedAccount.access_token;
+			account.refresh_token = refreshedAccount.refresh_token;
+			account.expires_at = refreshedAccount.expires_at;
+			markAccountTokensFresh(account);
+		}
+	}
+	return accessToken;
 }
 
 /**
@@ -1092,6 +1115,12 @@ export default async function startServer(options?: {
 
 	// Initialize components
 	const config = container.resolve<Config>(SERVICE_KEYS.Config);
+	setProviderModelDefaultOverrides(
+		filterEnabledProviderModelDefaultOverrides(
+			config.getEnabledProviderModelDefaultProviders(),
+			config.getProviderModelDefaultOverrides(),
+		),
+	);
 	installOutboundProxy(() => config.getOutboundProxy());
 	const outboundProxyUrl = config.getOutboundProxy();
 	if (outboundProxyUrl) {
@@ -1121,6 +1150,18 @@ export default async function startServer(options?: {
 	// notify this locally-running server of DB-side changes even when
 	// API-key auth is enabled (issue #216). See AuthService#isLocalControlRequest.
 	const localControlSecret = config.getLocalControlSecret();
+
+	// Keep provider-committed rotations outside the primary DB: this WAL must
+	// remain writable when the DB outage that caused the token CAS failure is
+	// still active. One encrypted, atomically-replaced file per account avoids
+	// cross-account writer races and restores before any scheduler can refresh.
+	configurePendingRotationPersistence(
+		createPendingRotationWal({
+			directory: join(dirname(resolveConfigPath()), "pending-rotations"),
+			secret: localControlSecret,
+		}),
+	);
+	await restorePendingRotations();
 
 	DatabaseFactory.initialize(undefined, runtime);
 	const dbOps = await DatabaseFactory.getInstanceAsync();
@@ -1386,6 +1427,10 @@ export default async function startServer(options?: {
 			dbOps,
 			alertService,
 			modelCatalog: {
+				codexModels: async (accountId: string) => {
+					if (!modelCatalogProxyContext) return null;
+					return getCodexModels(accountId, modelCatalogProxyContext);
+				},
 				get: () => getModelCatalog(),
 				refresh: async () => {
 					if (!modelCatalogProxyContext) {
@@ -1551,7 +1596,10 @@ export default async function startServer(options?: {
 		getAccountUtilization(accountId: string, provider: string): number | null {
 			const data = usageCache.get(accountId);
 			if (!data) return null;
-			return getRepresentativeUtilizationForProvider(data, provider);
+			// Ranking, not gating: this feeds SessionStrategy's water-filling sort
+			// across same-priority accounts, where a spent extra_usage pool is a
+			// legitimate reason to prefer another account.
+			return getRankingUtilizationForProvider(data, provider);
 		},
 		getAccountWeeklyReset(accountId: string, provider: string): number | null {
 			const data = usageCache.get(accountId);

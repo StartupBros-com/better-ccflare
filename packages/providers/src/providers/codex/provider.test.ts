@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BUFFER_SIZES } from "@better-ccflare/core";
 import { CODEX_LOGICAL_MODEL_FAMILY_HEADER } from "@better-ccflare/http-common";
+import { setDerivedProviderModelDefaults } from "../../provider-model-defaults";
 import { fetchCodexUsageOnDemand } from "./on-demand-fetch";
 import {
 	CODEX_SINGLE_ORCHESTRATION_ROOT_ENV,
@@ -55,6 +56,163 @@ afterEach(() => {
 	resetOrchestrationElectionForTest();
 });
 
+describe("CodexProvider stream liveness", () => {
+	it("keeps a silent SSE stream alive until response.completed arrives", async () => {
+		const provider = new CodexProvider({
+			streamHeartbeatIntervalMs: 20,
+			streamRawSilenceTimeoutMs: 200,
+		});
+		let upstreamController: ReadableStreamDefaultController<Uint8Array>;
+		let upstreamCancelReason: unknown;
+		const upstream = new ReadableStream<Uint8Array>({
+			start(controller) {
+				upstreamController = controller;
+				controller.enqueue(
+					new TextEncoder().encode(
+						sseBody(
+							eventLine("response.in_progress", {
+								type: "response.in_progress",
+								response: { id: "resp_silent", model: "gpt-5.6-sol" },
+							}),
+						),
+					),
+				);
+			},
+			cancel(reason) {
+				upstreamCancelReason = reason;
+			},
+		});
+		const transformed = await provider.processResponse(
+			new Response(upstream, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+		const reader = transformed.body?.getReader();
+		if (!reader) throw new Error("transformed response has no body");
+		const decoder = new TextDecoder();
+
+		const first = await reader.read();
+		expect(decoder.decode(first.value)).toBe(
+			'event: ping\ndata: {"type":"ping"}\n\n',
+		);
+		const second = await Promise.race([
+			reader.read(),
+			Bun.sleep(100).then(() => {
+				throw new Error("Codex heartbeat did not arrive");
+			}),
+		]);
+		expect(decoder.decode(second.value)).toBe(
+			'event: ping\ndata: {"type":"ping"}\n\n',
+		);
+
+		upstreamController.enqueue(
+			new TextEncoder().encode(
+				sseBody(
+					eventLine("response.completed", {
+						type: "response.completed",
+						response: {
+							id: "resp_silent",
+							model: "gpt-5.6-sol",
+							usage: { input_tokens: 1, output_tokens: 0 },
+						},
+					}),
+				),
+			),
+		);
+
+		let terminalBody = "";
+		while (true) {
+			const { value, done } = await reader.read();
+			if (done) break;
+			terminalBody += decoder.decode(value, { stream: true });
+		}
+		expect(terminalBody).toContain("event: message_stop");
+		expect(terminalBody).not.toContain("event: ping");
+		expect(upstreamCancelReason).toBeDefined();
+	});
+
+	it("terminates raw upstream silence after synthetic heartbeats", async () => {
+		const provider = new CodexProvider({
+			streamHeartbeatIntervalMs: 15,
+			streamRawSilenceTimeoutMs: 70,
+		});
+		let upstreamCancelReason: unknown;
+		const upstream = new ReadableStream<Uint8Array>({
+			cancel(reason) {
+				upstreamCancelReason = reason;
+				return new Promise<void>(() => {});
+			},
+		});
+		const transformed = await provider.processResponse(
+			new Response(upstream, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+
+		const body = await Promise.race([
+			transformed.text(),
+			Bun.sleep(300).then(() => {
+				throw new Error("timed-out Codex stream did not terminate");
+			}),
+		]);
+		expect(upstreamCancelReason).toBeInstanceOf(Error);
+		expect(body).toContain("event: error");
+		expect(body).toContain(
+			"Codex upstream timed out while waiting for response data.",
+		);
+		expect(body).not.toContain("rawSilenceTimeoutMs");
+	});
+
+	it("does not await a hanging upstream cancellation after a terminal event", async () => {
+		const provider = new CodexProvider({
+			streamHeartbeatIntervalMs: 100,
+			streamRawSilenceTimeoutMs: 500,
+		});
+		let cancelCalls = 0;
+		const upstream = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(
+					new TextEncoder().encode(
+						sseBody(
+							eventLine("response.completed", {
+								type: "response.completed",
+								response: {
+									id: "resp_terminal_cancel",
+									model: "gpt-5.6-sol",
+									usage: { input_tokens: 1, output_tokens: 0 },
+								},
+							}),
+						),
+					),
+				);
+			},
+			cancel() {
+				cancelCalls++;
+				return new Promise<void>(() => {});
+			},
+		});
+		const transformed = await provider.processResponse(
+			new Response(upstream, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+		const body = await Promise.race([
+			transformed.text(),
+			Bun.sleep(300).then(() => {
+				throw new Error("terminal Codex stream did not reach EOF");
+			}),
+		]);
+		expect(body).toContain("event: message_stop");
+		expect(cancelCalls).toBe(1);
+	});
+});
+
 describe("CodexProvider request conversion", () => {
 	it("keeps capability defaults in parity with the request model resolver", () => {
 		const provider = new CodexProvider();
@@ -70,8 +228,10 @@ describe("CodexProvider request conversion", () => {
 		}
 		expect(
 			provider.getLogicalModelCapability("claude-fable-5", {} as never),
-		).toMatchObject({ status: "unsupported", provenance: "provider_default" });
-		expect(resolveCodexRequestModel("claude-fable-5")).toBe("claude-fable-5");
+		).toMatchObject({ status: "supported", provenance: "provider_default" });
+		expect(resolveCodexRequestModel("claude-fable-5")).not.toBe(
+			"claude-fable-5",
+		);
 	});
 
 	it("handles messages and synthetic count_tokens paths", () => {
@@ -6475,7 +6635,40 @@ describe("CodexProvider.transformRequestBody", () => {
 		const transformed = await provider.transformRequestBody(request, undefined);
 		const body = await transformed.json();
 
-		expect(body.model).toBe("gpt-5.3-codex");
+		expect(body.model).toBe(resolveCodexRequestModel("claude-3-7-sonnet"));
+	});
+
+	// Regression: mapModel translates by substring and had no branch for
+	// `fable`, so the family was not resolvable at all. It is resolvable now —
+	// what it resolves TO comes from the account, not from a constant.
+	it("resolves a fable-family model from the account listing", async () => {
+		const provider = new CodexProvider();
+		const request = new Request("https://example.com/v1/messages", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				model: "claude-fable-5",
+				max_tokens: 10,
+				messages: [{ role: "user", content: "hello" }],
+			}),
+		});
+
+		// What the account's own listing implied, recorded when it was read.
+		setDerivedProviderModelDefaults("codex", "acc-1", {
+			fable: "gpt-5.6-sol",
+			opus: "gpt-5.6-sol",
+			sonnet: "gpt-5.6-terra",
+			haiku: "gpt-5.6-luna",
+		});
+		const account = {
+			id: "acc-1",
+			provider: "codex",
+		} as Parameters<typeof provider.transformRequestBody>[1];
+
+		const transformed = await provider.transformRequestBody(request, account);
+		const body = await transformed.json();
+
+		expect(body.model).toBe("gpt-5.6-sol");
 	});
 
 	it("uses account sonnet mapping for sonnet-family models", async () => {
@@ -6522,9 +6715,21 @@ describe("CodexProvider.transformRequestBody", () => {
 		expect(body.model).toBe("gpt-5.3-codex");
 	});
 
-	it("uses default Codex mapping for families missing from account mappings", async () => {
+	// Before, this asserted the compiled fallback. Now the fallback IS the
+	// account's listing, so the test says which model that listing implied.
+	it("fills families missing from the account mappings from its listing", async () => {
+		setDerivedProviderModelDefaults("codex", "acc-1", {
+			fable: "gpt-5.6-sol",
+			opus: "gpt-5.6-sol",
+			sonnet: "gpt-5.6-terra",
+			haiku: "gpt-5.6-luna",
+		});
 		const provider = new CodexProvider();
 		const account = {
+			// The derived map is keyed by account: two accounts of the same
+			// provider can be on different plans, so there is nothing to look up
+			// without an id.
+			id: "acc-1",
 			model_mappings: JSON.stringify({ sonnet: "gpt-5.3-codex" }),
 		} as Parameters<typeof provider.transformRequestBody>[1];
 		const request = new Request("https://example.com/v1/messages", {
@@ -6540,7 +6745,9 @@ describe("CodexProvider.transformRequestBody", () => {
 		const transformed = await provider.transformRequestBody(request, account);
 		const body = await transformed.json();
 
-		expect(body.model).toBe("gpt-5.4-mini");
+		// The account maps some families explicitly; the ones it does not are
+		// filled from its own listing, never from a constant.
+		expect(body.model).toBe("gpt-5.6-luna");
 	});
 
 	it("passes through unknown model names unchanged", async () => {

@@ -326,7 +326,7 @@ describe("managed routing capabilities", () => {
 				"claude-fable-5",
 				getTestCapabilityProvider,
 			),
-		).toMatchObject({ status: "unsupported", provenance: "provider_default" });
+		).toMatchObject({ status: "supported", provenance: "provider_default" });
 		expect(
 			resolveAccountLogicalModelCapability(
 				routingAccount({ provider: "qwen" }),

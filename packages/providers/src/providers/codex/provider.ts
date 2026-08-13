@@ -35,6 +35,10 @@ import type {
 } from "@better-ccflare/types";
 import { BaseProvider } from "../../base";
 import {
+	registerProviderModelDefaultFactory,
+	resolveProviderModelDefault,
+} from "../../provider-model-defaults";
+import {
 	estimateAnthropicRequestTokens,
 	resolveModelContextCapability,
 } from "../../request-capabilities";
@@ -352,10 +356,12 @@ const _normalizeUsage = (value: unknown): Record<string, number> => {
 
 // Default model mapping: Anthropic model name prefixes → Codex model names
 const DEFAULT_MODEL_MAP: Record<string, string> = {
+	fable: "gpt-5.3-codex",
 	opus: "gpt-5.3-codex",
 	sonnet: "gpt-5.3-codex",
 	haiku: "gpt-5.4-mini",
 };
+registerProviderModelDefaultFactory("codex", DEFAULT_MODEL_MAP);
 
 /** Resolve the concrete Codex model exactly as request transformation will. */
 export function resolveCodexRequestModel(
@@ -368,9 +374,15 @@ export function resolveCodexRequestModel(
 	}
 
 	const lower = anthropicModel.toLowerCase();
-	if (lower.includes("haiku")) return DEFAULT_MODEL_MAP.haiku;
-	if (lower.includes("sonnet")) return DEFAULT_MODEL_MAP.sonnet;
-	if (lower.includes("opus")) return DEFAULT_MODEL_MAP.opus;
+	const family = ["fable", "haiku", "sonnet", "opus"].find((candidate) =>
+		lower.includes(candidate),
+	);
+	if (family) {
+		return (
+			resolveProviderModelDefault("codex", family, account?.id) ??
+			DEFAULT_MODEL_MAP[family]
+		);
+	}
 	return anthropicModel;
 }
 
@@ -1105,12 +1117,13 @@ export class CodexProvider extends BaseProvider {
 				throw new OAuthRefreshTokenError(
 					account.id,
 					`Codex refresh_token_reused for account ${account.name}. Please re-authenticate with: bun run cli --reauthenticate ${account.name}`,
+					errorCode,
 				);
 			}
 
 			const failureMessage = `Failed to refresh Codex token for account ${account.name}: ${errorMessage}`;
 			if (errorCode) {
-				throw new OAuthRefreshTokenError(account.id, failureMessage);
+				throw new OAuthRefreshTokenError(account.id, failureMessage, errorCode);
 			}
 			throw new Error(failureMessage);
 		}

@@ -1,6 +1,7 @@
 import {
 	authFailureEvents,
 	formatOAuthErrorMessage,
+	getOAuthErrorCode,
 	isStructuredInvalidGrant,
 	OAuthRefreshTokenError,
 	PAUSE_REASON_NEEDS_REAUTH,
@@ -15,6 +16,11 @@ import {
 } from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
 import { TOKEN_REFRESH_BACKOFF_MS, TOKEN_SAFETY_WINDOW_MS } from "../constants";
+import {
+	clearPendingRotation,
+	getPendingRotation,
+	recordPendingRotation,
+} from "./pending-rotation-registry";
 import { ERROR_MESSAGES, type ProxyContext } from "./proxy-types";
 import {
 	checkRefreshTokenHealth,
@@ -22,6 +28,12 @@ import {
 } from "./token-health-monitor";
 
 const log = new Logger("TokenManager");
+const freshlyLoadedAccounts = new WeakSet<Account>();
+
+/** Mark an account whose credentials were just re-read by a polling caller. */
+export function markAccountTokensFresh(account: Account): void {
+	freshlyLoadedAccounts.add(account);
+}
 
 /**
  * Providers whose `refreshToken()` performs a genuine OAuth access-token exchange
@@ -139,11 +151,82 @@ export function isTerminalTokenRefreshFailure(error: unknown): boolean {
 	return false;
 }
 
+/**
+ * Definitive dead-refresh-token signals. Providers preserve the machine-readable
+ * OAuth error code verbatim in their thrown message (invalid_grant /
+ * invalid_refresh_token from the RFC-6749 grant flow, refresh_token_reused from
+ * Codex's rotating-token reuse guard). Only these are definitive; transient
+ * failures (network / 5xx / timeout) never carry them, so a false positive that
+ * pulls the account from routing until a manual re-auth cannot occur from them.
+ */
+const DEFINITIVE_AUTH_FAILURE_RE =
+	/invalid_grant|invalid_refresh_token|refresh_token_reused/i;
+
+function stripAccountFraming(message: string, accountName: string): string {
+	if (!accountName) return message;
+	return message.split(`account ${accountName}`).join("account");
+}
+
+function extractCodeSegment(message: string, accountName: string): string {
+	const stripped = stripAccountFraming(message, accountName);
+	const firstSep = stripped.indexOf(": ");
+	if (firstSep === -1) return stripped;
+	const afterFraming = stripped.slice(firstSep + 2);
+	const secondSep = afterFraming.indexOf(": ");
+	return secondSep === -1 ? afterFraming : afterFraming.slice(0, secondSep);
+}
+
+export function isDefinitiveAuthFailure(
+	message: string,
+	accountName: string,
+): boolean {
+	return DEFINITIVE_AUTH_FAILURE_RE.test(
+		extractCodeSegment(message, accountName),
+	);
+}
+
+export function extractAuthFailureReason(
+	message: string,
+	accountName: string,
+): string | null {
+	const codeSegment = extractCodeSegment(message, accountName);
+	const match = DEFINITIVE_AUTH_FAILURE_RE.exec(codeSegment);
+	if (match) return match[0].toLowerCase();
+
+	// Codex's typed rotating-token error puts the machine code before the
+	// `for account ...` framing, unlike its ordinary HTTP error path. Restrict
+	// this fallback to that prefix so a code-like phrase in a description cannot
+	// fabricate a terminal-auth classification.
+	const stripped = stripAccountFraming(message, accountName);
+	const accountFrame = stripped.indexOf(" for account");
+	if (accountFrame !== -1) {
+		const prefixMatch = DEFINITIVE_AUTH_FAILURE_RE.exec(
+			stripped.slice(0, accountFrame),
+		);
+		if (prefixMatch?.[0].toLowerCase() === "refresh_token_reused") {
+			return "refresh_token_reused";
+		}
+	}
+	return null;
+}
+
 // Keep the refresh credential identity alongside a wrapped failure without
 // putting the raw token into Error.context/toJSON/log output. A WeakMap also
 // means this metadata disappears with the error and cannot grow with traffic.
 const refreshFailureTokens = new WeakMap<object, string | null>();
 const terminalRefreshFailures = new WeakSet<object>();
+
+function wrapTokenRefreshFailure(
+	accountId: string,
+	message: string,
+	attemptedRefreshToken: string | null,
+	terminal: boolean,
+): TokenRefreshError {
+	const wrapped = new TokenRefreshError(accountId, new Error(message));
+	refreshFailureTokens.set(wrapped, attemptedRefreshToken);
+	if (terminal) terminalRefreshFailures.add(wrapped);
+	return wrapped;
+}
 
 /** Return the refresh token captured by the refresh operation that failed. */
 export function getRefreshTokenUsedForFailure(
@@ -453,6 +536,67 @@ function enforceMaxSize(): void {
 }
 
 /**
+ * Re-reads the account row and adopts credentials that are fresher than the
+ * caller's long-lived in-memory snapshot before attempting another refresh.
+ */
+async function adoptDbTokensIfFresher(
+	account: Account,
+	ctx: ProxyContext,
+): Promise<string | null> {
+	const pendingRotation = getPendingRotation(account.id);
+	const flush = await (async () => {
+		const { flushPendingRotation } = await import(
+			"./pending-rotation-registry"
+		);
+		return flushPendingRotation(account.id, ctx.dbOps);
+	})();
+	const effectivePending = getPendingRotation(account.id) ?? pendingRotation;
+	if (effectivePending && (flush === "failed" || flush === "persisted")) {
+		account.access_token = effectivePending.accessToken;
+		account.expires_at = effectivePending.expiresAt;
+		if (effectivePending.refreshToken)
+			account.refresh_token = effectivePending.refreshToken;
+		if (effectivePending.expiresAt - Date.now() > TOKEN_SAFETY_WINDOW_MS) {
+			return account.access_token;
+		}
+	}
+	const dbAccount = await ctx.dbOps.getAccount(account.id);
+	if (!dbAccount) return null;
+	const dbTokenValid =
+		typeof dbAccount.access_token === "string" &&
+		typeof dbAccount.expires_at === "number" &&
+		dbAccount.expires_at - Date.now() > TOKEN_SAFETY_WINDOW_MS;
+	const dbIssuedAt = dbAccount.refresh_token_issued_at ?? null;
+	const memIssuedAt = account.refresh_token_issued_at ?? null;
+	const dbRefreshTokenNotOlder =
+		memIssuedAt === null || (dbIssuedAt !== null && dbIssuedAt >= memIssuedAt);
+	if (
+		dbTokenValid &&
+		typeof dbAccount.expires_at === "number" &&
+		dbAccount.expires_at > (account.expires_at ?? 0)
+	) {
+		account.access_token = dbAccount.access_token;
+		account.expires_at = dbAccount.expires_at;
+		if (dbAccount.refresh_token && dbRefreshTokenNotOlder) {
+			account.refresh_token = dbAccount.refresh_token;
+			account.refresh_token_issued_at = dbAccount.refresh_token_issued_at;
+		}
+		refreshFailures.delete(account.id);
+		backoffCounters.delete(account.id);
+		return dbAccount.access_token;
+	}
+	if (
+		dbAccount.refresh_token &&
+		dbAccount.refresh_token !== account.refresh_token &&
+		dbRefreshTokenNotOlder
+	) {
+		account.refresh_token = dbAccount.refresh_token;
+		account.refresh_token_issued_at = dbAccount.refresh_token_issued_at;
+	}
+	return null;
+}
+
+/**
  * Safely refreshes an access token with deduplication
  * @param account - The account to refresh token for
  * @param ctx - The proxy context
@@ -464,6 +608,15 @@ export async function refreshAccessTokenSafe(
 	account: Account,
 	ctx: ProxyContext,
 ): Promise<string> {
+	// (finding 5) Join an in-flight refresh FIRST — before backoff — so a
+	// concurrent caller shares the outcome instead of failing on a backoff
+	// seeded by an earlier, unrelated failure (e.g. the auto-refresh
+	// scheduler registers its own in-flight promise into this same map;
+	// a request-triggered caller must join that refresh, not bounce off a
+	// stale backoff record for the account).
+	const inFlight = ctx.refreshInFlight.get(account.id);
+	if (inFlight) return inFlight;
+
 	// Proactively clean expired entries before checking
 	cleanupExpiredFailures();
 
@@ -550,39 +703,144 @@ export async function refreshAccessTokenSafe(
 		backoffCounters.delete(account.id);
 	}
 
-	// Check if a refresh is already in progress for this account
+	// The caller's account object may be a stale snapshot (the auto-refresh
+	// scheduler builds one from a loop-start SELECT). Re-read the row and adopt
+	// fresher credentials before initiating a refresh — refreshing with an
+	// already-rotated refresh token produces a false-definitive invalid_grant.
 	if (!ctx.refreshInFlight.has(account.id)) {
-		// Snapshot the credential before creating the provider promise. Reauth can
-		// replace the mutable account object while the network call is in flight;
-		// the provider and CAS pause must both refer to this exact credential.
-		const refreshTokenAtStart = account.refresh_token;
-		const refreshAccount = {
-			...account,
-			refresh_token: refreshTokenAtStart,
-		};
+		const adopted = await adoptDbTokensIfFresher(account, ctx);
+		if (adopted) return adopted;
+	}
+
+	// Check if a refresh is already in progress for this account.
+	// NOTE: no await may sit between this check and refreshInFlight.set() —
+	// microtask atomicity is what deduplicates concurrent callers.
+	if (!ctx.refreshInFlight.has(account.id)) {
 		// Get the provider for this account
 		const provider = getProvider(account.provider) || ctx.provider;
 
+		// Captured for the rotation-race guard in the catch handler: if the DB's
+		// refresh token differs from this one by the time the refresh fails, the
+		// failure condemned a superseded token, not the account.
+		const attemptedRefreshToken = account.refresh_token;
+
 		// Create a new refresh promise and store it
 		const refreshPromise = provider
-			.refreshToken(refreshAccount, ctx.runtime.clientId)
-			.then((result: TokenRefreshResult) => {
-				// 1. Persist to database asynchronously
-				ctx.asyncWriter.enqueue(() =>
-					ctx.dbOps.updateAccountTokens(
-						account.id,
-						result.accessToken,
-						result.expiresAt,
-						result.refreshToken,
-					),
-				);
+			.refreshToken(account, ctx.runtime.clientId)
+			.then(async (result: TokenRefreshResult) => {
+				// (finding 1) Persist INSIDE the shared promise so refreshInFlight
+				// stays installed until the write commits, and never via the
+				// lossy asyncWriter queue (a queued write's failure was
+				// previously unobservable to anyone awaiting this refresh).
+				// (finding 4) CAS on the attempted refresh token so a refresh
+				// that lost a race to a manual re-auth cannot overwrite newer
+				// credentials with the stale ones it started with.
+				// Set when the persist CAS loses to a manual re-auth or a newer
+				// rotation and the authoritative DB row is adopted below — skips
+				// the general in-memory update further down so the live
+				// `account` object never installs the losing credentials.
+				let adoptAuthoritative = false;
+				// Token this call resolves with — defaults to the just-minted
+				// (possibly losing) refresh result; overwritten below if the
+				// adopted DB row's access token is itself servable, since the
+				// losing token's session family may have been revoked by the
+				// winning manual re-auth.
+				let resolveWithToken = result.accessToken;
+				try {
+					let persisted: boolean;
+					if (attemptedRefreshToken) {
+						persisted =
+							await ctx.dbOps.updateAccountTokensIfRefreshTokenMatches(
+								account.id,
+								attemptedRefreshToken,
+								result.accessToken,
+								result.expiresAt,
+								result.refreshToken,
+							);
+					} else {
+						// (round-3 item 4) Null-safe CAS: an account that refreshed
+						// without a refresh token must not blind-overwrite
+						// credentials a concurrent manual re-auth may have just
+						// written.
+						persisted = await ctx.dbOps.updateAccountTokensIfRefreshTokenAbsent(
+							account.id,
+							result.accessToken,
+							result.expiresAt,
+							result.refreshToken,
+						);
+					}
+					if (persisted) {
+						clearPendingRotation(account.id);
+					} else {
+						log.warn(
+							`Skipped persisting refreshed tokens for ${account.name}: refresh token changed underneath (superseded by a newer rotation or manual re-auth) — adopting the authoritative DB credentials instead`,
+						);
+						try {
+							const dbAccount = await ctx.dbOps.getAccount(account.id);
+							if (dbAccount) {
+								account.access_token = dbAccount.access_token;
+								account.expires_at = dbAccount.expires_at;
+								if (dbAccount.refresh_token) {
+									account.refresh_token = dbAccount.refresh_token;
+									account.refresh_token_issued_at =
+										dbAccount.refresh_token_issued_at;
+								}
+								adoptAuthoritative = true;
+								// The winning writer (manual re-auth or a newer rotation)
+								// may have revoked the losing token's session family —
+								// serve the adopted access token instead when it is
+								// itself servable, so the caller isn't handed a token
+								// that fails auth despite valid credentials sitting in
+								// memory.
+								const adoptedTokenIsServable =
+									typeof dbAccount.access_token === "string" &&
+									typeof dbAccount.expires_at === "number" &&
+									dbAccount.expires_at - Date.now() > TOKEN_SAFETY_WINDOW_MS;
+								if (adoptedTokenIsServable && dbAccount.access_token) {
+									resolveWithToken = dbAccount.access_token;
+								}
+								log.warn(
+									`Persist CAS lost for ${account.name} — serving the ${adoptedTokenIsServable ? "adopted authoritative" : "just-minted (losing)"} access token`,
+								);
+							}
+						} catch (readError) {
+							log.warn(
+								`Failed to re-read account ${account.name} after a lost persist CAS — falling back to the in-memory update`,
+								readError,
+							);
+						}
+					}
+				} catch (persistError) {
+					// (round-3 item 1) A rotation the provider has already
+					// committed must never be silently dropped: the DB still
+					// holds the consumed token, and a later stale consumer would
+					// replay it, get invalid_grant, and CAS-flag a healthy
+					// account. Record it so every subsequent touchpoint retries
+					// the persist, serves the rotated credentials, and
+					// suppresses flagging meanwhile.
+					await recordPendingRotation(account.id, {
+						accessToken: result.accessToken,
+						expiresAt: result.expiresAt,
+						refreshToken: result.refreshToken,
+						attemptedRefreshToken: attemptedRefreshToken ?? "",
+					});
+					log.error(
+						`Failed to persist refreshed tokens for ${account.name} — rotation queued for re-persist`,
+						persistError,
+					);
+				}
 
-				// 2. Update the live in-memory account object immediately
+				// Update the live in-memory account object immediately
 				// This prevents subsequent requests from seeing stale token data
-				account.access_token = result.accessToken;
-				account.expires_at = result.expiresAt;
-				if (result.refreshToken) {
-					account.refresh_token = result.refreshToken;
+				// — unless the persist-CAS-loss branch above already adopted the
+				// authoritative DB row, in which case installing these (losing)
+				// result values would overwrite it right back.
+				if (!adoptAuthoritative) {
+					account.access_token = result.accessToken;
+					account.expires_at = result.expiresAt;
+					if (result.refreshToken) {
+						account.refresh_token = result.refreshToken;
+					}
 				}
 				account.last_used = Date.now();
 
@@ -596,7 +854,7 @@ export async function refreshAccessTokenSafe(
 					newRefreshToken: result.refreshToken !== account.refresh_token,
 					provider: account.provider,
 				});
-				return result.accessToken;
+				return resolveWithToken;
 			})
 			.catch(async (error) => {
 				// Record the failure timestamp for backoff
@@ -610,37 +868,153 @@ export async function refreshAccessTokenSafe(
 						: formatOAuthErrorMessage(error) || String(error);
 				const enhancedMessage = getOAuthErrorMessage(account, originalError);
 
+				// Durable quarantine requires provider-typed evidence or an explicit
+				// structured OAuth machine code. Human-readable messages may mention an
+				// invalid-grant marker as prose and must never authorize an account write.
+				const structuredAuthFailureReason = getOAuthErrorCode(error);
+				const typedAuthFailureReason =
+					error instanceof OAuthRefreshTokenError ? error.oauthErrorCode : null;
+				const authFailureReason =
+					structuredAuthFailureReason || typedAuthFailureReason;
+				if (authFailureReason) {
+					// (round-3 item 1) A pending unpersisted rotation means WE
+					// rotated successfully moments ago — this failure is a
+					// replay of the consumed token, not a dead account.
+					if (getPendingRotation(account.id)) {
+						log.warn(
+							`Skipping requires_reauth for ${account.name}: a successful rotation is awaiting persist (replayed a consumed token)`,
+						);
+						throw wrapTokenRefreshFailure(
+							account.id,
+							enhancedMessage,
+							attemptedRefreshToken,
+							true,
+						);
+					}
+					// Rotation-race guard: a definitive rejection of a refresh token
+					// that is no longer the account's current one means another
+					// consumer rotated successfully after our snapshot was taken.
+					// Recover from the DB instead of condemning a healthy account.
+					let dbAccount: Account | null = null;
+					let dbReadFailed = false;
+					try {
+						dbAccount = await ctx.dbOps.getAccount(account.id);
+					} catch (readError) {
+						dbReadFailed = true;
+						log.warn(
+							`Could not re-read account ${account.name} after ${authFailureReason} — leaving requires_reauth unset (unverified)`,
+							readError,
+						);
+					}
+					if (
+						dbAccount?.refresh_token &&
+						dbAccount.refresh_token !== attemptedRefreshToken
+					) {
+						account.refresh_token = dbAccount.refresh_token;
+						account.refresh_token_issued_at = dbAccount.refresh_token_issued_at;
+						const dbTokenValid =
+							typeof dbAccount.access_token === "string" &&
+							typeof dbAccount.expires_at === "number" &&
+							dbAccount.expires_at - Date.now() > TOKEN_SAFETY_WINDOW_MS;
+						if (dbTokenValid && dbAccount.access_token) {
+							account.access_token = dbAccount.access_token;
+							account.expires_at = dbAccount.expires_at;
+							refreshFailures.delete(account.id);
+							backoffCounters.delete(account.id);
+							log.warn(
+								`Refresh for ${account.name} lost a rotation race (${authFailureReason} on a superseded token) — adopted current tokens from DB`,
+							);
+							return dbAccount.access_token;
+						}
+						log.warn(
+							`Refresh for ${account.name} used a superseded refresh token (${authFailureReason}) — not flagging re-auth; the rotated token will be used after the refresh backoff`,
+						);
+						throw wrapTokenRefreshFailure(
+							account.id,
+							enhancedMessage,
+							attemptedRefreshToken,
+							true,
+						);
+					}
+					// (finding 3) Unverifiable → do NOT flag; the backoff entry recorded
+					// above already keeps this account out of routing for a while.
+					if (dbReadFailed || !attemptedRefreshToken) {
+						throw wrapTokenRefreshFailure(
+							account.id,
+							enhancedMessage,
+							attemptedRefreshToken,
+							true,
+						);
+					}
+					// Atomic quarantine writes: both durable states are guarded on the exact
+					// refresh token rejected by the provider. The requires_reauth flag keeps
+					// proactive selectors from retrying it; the pause reason preserves the
+					// public resume/reauth contract. Older test/runtime contexts may expose
+					// only one seam, so treat either successful CAS as the one event-worthy
+					// quarantine without weakening the credential guard.
+					let quarantined = false;
+					const flagRequiresReauth = ctx.dbOps.flagRequiresReauthIfTokenMatches;
+					if (typeof flagRequiresReauth === "function") {
+						try {
+							quarantined =
+								(await flagRequiresReauth.call(
+									ctx.dbOps,
+									account.id,
+									attemptedRefreshToken,
+								)) || quarantined;
+						} catch (flagError) {
+							log.warn(
+								`Could not persist requires_reauth for ${account.name} — leaving that flag unset (unverified)`,
+								flagError,
+							);
+						}
+					}
+					if (typeof ctx.dbOps.pauseAccountIfActive === "function") {
+						try {
+							quarantined =
+								(await ctx.dbOps.pauseAccountIfActive(
+									account.id,
+									PAUSE_REASON_NEEDS_REAUTH,
+									attemptedRefreshToken,
+								)) || quarantined;
+						} catch (pauseError) {
+							log.warn(
+								`Could not pause ${account.name} for re-authentication — leaving pause state unchanged (unverified)`,
+								pauseError,
+							);
+						}
+					}
+					if (quarantined) {
+						authFailureEvents.emit("event", {
+							accountId: account.id,
+							accountName: account.name,
+							provider: account.provider,
+							reason: authFailureReason,
+						});
+					} else {
+						log.warn(
+							`Skipped auth quarantine for ${account.name}: refresh token rotated or no compatible CAS write was available`,
+						);
+					}
+				}
 				log.error(
 					`Token refresh failed for account ${account.name}: ${enhancedMessage}`,
 					error,
 				);
-				// Terminal auth failure (revoked/invalid refresh token): pause the
-				// account for re-auth immediately so the LB fails over instead of
-				// leaving it in rotation to fail every request. Awaited so the pause
-				// lands before any caller (e.g. the auto-refresh scheduler) records a
-				// generic failure that could otherwise mask the specific reason.
-				const terminalRefreshFailure = isTerminalTokenRefreshFailure(error);
-				await pauseAccountForReauthIfInvalidGrant(
-					error,
-					account,
-					ctx.dbOps,
-					refreshTokenAtStart,
-				);
-				const wrappedError = new TokenRefreshError(
+				throw wrapTokenRefreshFailure(
 					account.id,
-					new Error(enhancedMessage),
+					enhancedMessage,
+					attemptedRefreshToken,
+					Boolean(authFailureReason),
 				);
-				refreshFailureTokens.set(wrappedError, refreshTokenAtStart);
-				if (terminalRefreshFailure) {
-					// Preserve definitive classification even when getOAuthErrorMessage
-					// replaces the provider marker with a health/reauth hint.
-					terminalRefreshFailures.add(wrappedError);
-				}
-				throw wrappedError;
 			})
 			.finally(() => {
-				// Clean up the map when done (success or failure)
-				ctx.refreshInFlight.delete(account.id);
+				// (finding 4) Identity-safe: never delete a newer entry installed by
+				// a manual reauth or cache-clear that ran while this promise was
+				// still settling.
+				if (ctx.refreshInFlight.get(account.id) === refreshPromise) {
+					ctx.refreshInFlight.delete(account.id);
+				}
 			});
 		ctx.refreshInFlight.set(account.id, refreshPromise);
 	}

@@ -419,6 +419,12 @@ export class APIRouter {
 			requestsStreamHandler(req),
 		);
 		this.handlers.set("GET:/api/config", () => configHandlers.getConfig());
+		this.handlers.set("GET:/api/config/provider-model-defaults", () =>
+			configHandlers.getProviderModelDefaults(),
+		);
+		this.handlers.set("POST:/api/config/provider-model-defaults", (req) =>
+			configHandlers.setProviderModelDefaults(req),
+		);
 		this.handlers.set("GET:/api/config/strategy", () =>
 			configHandlers.getStrategy(),
 		);
@@ -552,7 +558,7 @@ export class APIRouter {
 		// Model catalog routes
 		const modelsHandler = createModelsHandler(this.context);
 		const modelsRefreshHandler = createModelsRefreshHandler(this.context);
-		this.handlers.set("GET:/api/models", () => modelsHandler());
+		this.handlers.set("GET:/api/models", (_req, url) => modelsHandler(url));
 		this.handlers.set("POST:/api/models/refresh", () => modelsRefreshHandler());
 	}
 

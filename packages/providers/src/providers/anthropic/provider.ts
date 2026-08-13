@@ -19,6 +19,7 @@ import type {
 	TokenRefreshResult,
 } from "../../types";
 import { transformRequestBodyModel } from "../../utils/model-mapping";
+import { drainReader } from "../../utils/stream-drain";
 import { parseAnthropicRateLimitResetAt } from "./rate-limit-reset";
 
 // Hard rate limit statuses that should block account usage
@@ -235,7 +236,7 @@ export class AnthropicProvider extends BaseProvider {
 			// error so callers can pause the account for re-authentication instead
 			// of treating it as a transient refresh failure.
 			if (errorCode) {
-				throw new OAuthRefreshTokenError(account.id, failureMessage);
+				throw new OAuthRefreshTokenError(account.id, failureMessage, errorCode);
 			}
 			throw new Error(failureMessage);
 		}
@@ -531,8 +532,10 @@ export class AnthropicProvider extends BaseProvider {
 					}
 				}
 			},
-			cancel(reason) {
-				reader.cancel(reason);
+			cancel() {
+				// reader.cancel() is a no-op on Bun and leaks the native buffer;
+				// drain to `done` instead — see drainReader() above (#382).
+				void drainReader(reader);
 			},
 		});
 
@@ -618,9 +621,9 @@ export class AnthropicProvider extends BaseProvider {
 
 				try {
 					while (buffered.length < maxBytes) {
-						// Check for timeout
+						// Check for timeout — the enclosing `finally` drains the
+						// reader on every exit path, including this throw.
 						if (Date.now() - startTime > READ_TIMEOUT_MS) {
-							await reader.cancel();
 							throw new Error(
 								"Stream read timeout while extracting usage info",
 							);
@@ -674,8 +677,8 @@ export class AnthropicProvider extends BaseProvider {
 						}
 					}
 				} finally {
-					// Cancel the reader to prevent hanging
-					reader.cancel().catch(() => {});
+					// Drain the reader to prevent hanging and release the native buffer
+					void drainReader(reader);
 				}
 
 				if (!foundMessageStart) return null;

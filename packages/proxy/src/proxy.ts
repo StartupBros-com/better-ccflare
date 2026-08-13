@@ -14,6 +14,7 @@ import {
 	deriveXaiConversationIdentity,
 	estimateAnthropicAdmissionTokens,
 	isCacheFlightRecorderEnabled,
+	isOfficialXaiEndpoint,
 	isXaiCacheNativeEnabled,
 	usageCache,
 } from "@better-ccflare/providers";
@@ -82,6 +83,7 @@ import {
 	RoutingAttemptLedger,
 	resolveEffectiveModel,
 	selectAccountsForRequest,
+	setXaiConvId,
 	validateProviderPath,
 } from "./handlers";
 import {
@@ -1135,6 +1137,9 @@ async function handleProxyCore(
 			requestMeta.xaiCacheNativeActive = true;
 			requestMeta.xaiCacheIdentityFingerprint = identity.identityFingerprint;
 			requestMeta.xaiCachePrefixFingerprint = identity.prefixFingerprint;
+			// Preserve the trusted body-derived identity across provider transforms
+			// and final private-header sanitization at every physical xAI attempt.
+			setXaiConvId(requestMeta, identity.headerValue);
 		}
 	}
 	// Model-rewrite provenance is serialized into a response header. Picker IDs
@@ -1249,8 +1254,14 @@ async function handleProxyCore(
 				existing?.routeProfile ?? requestMeta.routeProfileId != null,
 		};
 	};
-	const getRouteCircuitRecoveryHint = () =>
-		ctx.strategy.getRouteCircuitRecoveryHint?.(requestMeta) ?? null;
+	const getRouteCircuitRecoveryHint = () => {
+		try {
+			return ctx.strategy.getRouteCircuitRecoveryHint?.(requestMeta) ?? null;
+		} catch (error) {
+			log.warn("Failed to read optional route-circuit recovery hint", error);
+			return null;
+		}
+	};
 	const accountSelectionTimeoutResponse = (
 		pacingSlot: Parameters<typeof finishPacing>[0],
 	): Response => {
@@ -1456,6 +1467,28 @@ async function handleProxyCore(
 			predictivelyThrottled,
 			reactivelyDepletedAccounts,
 		};
+	};
+
+	// Cache ownership is a property of the physical candidate that actually
+	// served a successful response, never of the account ranked first. Carry
+	// candidate identity through this seam so repeated-account combo slots do
+	// not collapse onto one account-level owner.
+	const recordXaiAffinityIfServed = (
+		response: Response,
+		account: Account,
+		candidateId: string,
+	): void => {
+		if (
+			response.ok &&
+			account.provider === "xai" &&
+			isOfficialXaiEndpoint(account)
+		) {
+			ctx.cacheAffinityOrderer?.recordSuccess(
+				requestMeta,
+				candidateId,
+				account.id,
+			);
+		}
 	};
 
 	const returnComboSessionFallbackDisabled = async (
@@ -2301,6 +2334,7 @@ async function handleProxyCore(
 		}
 		if (response) {
 			response = await settleRoutedResponse(response);
+			recordXaiAffinityIfServed(response, accounts[i], candidateId);
 			recordCachePacingRoute(
 				pacingObservation,
 				{
@@ -2413,6 +2447,7 @@ async function handleProxyCore(
 		}
 		if (response) {
 			response = await settleRoutedResponse(response);
+			recordXaiAffinityIfServed(response, accounts[i], candidateId);
 			recordCachePacingRoute(
 				pacingObservation,
 				{
@@ -2666,6 +2701,7 @@ async function handleProxyCore(
 				}
 				if (response) {
 					response = await settleRoutedResponse(response);
+					recordXaiAffinityIfServed(response, fallbackAccounts[i], candidateId);
 					recordCachePacingRoute(
 						pacingObservation,
 						{
@@ -2753,6 +2789,7 @@ async function handleProxyCore(
 				}
 				if (response) {
 					response = await settleRoutedResponse(response);
+					recordXaiAffinityIfServed(response, fallbackAccounts[i], candidateId);
 					recordCachePacingRoute(
 						pacingObservation,
 						{
@@ -2971,6 +3008,7 @@ async function handleProxyCore(
 			if (!response) return null;
 
 			response = await settleRoutedResponse(response);
+			recordXaiAffinityIfServed(response, route.account, route.candidateId);
 			recordCachePacingRoute(
 				pacingObservation,
 				{

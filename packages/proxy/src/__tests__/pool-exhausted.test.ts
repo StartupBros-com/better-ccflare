@@ -7,11 +7,15 @@ import {
 	mock,
 	spyOn,
 } from "bun:test";
+import { ANTHROPIC_DEGRADED_MODE_DEFAULTS } from "@better-ccflare/config";
 import type { Account } from "@better-ccflare/types";
+import { AnthropicDegradedModeCoordinator } from "../anthropic-degraded-mode";
+import { DegradedModeObservability } from "../anthropic-degraded-observability";
 import {
 	ANTHROPIC_PRECOMMIT_RESCUE_ERROR_FRAME,
 	ANTHROPIC_PRECOMMIT_RESCUE_PING_FRAME,
 } from "../anthropic-precommit-rescue";
+import { DegradedOwnerOverlay } from "../degraded-owner-overlay";
 import type { ProxyContext } from "../handlers";
 
 // Loading proxy.ts in a focused unit test must not require ignored embedded
@@ -119,6 +123,12 @@ function makeContext(
 	accounts: Account[],
 	providerName = "codex",
 ): ProxyContext {
+	const anthropicDegradedMode = new AnthropicDegradedModeCoordinator({
+		config: {
+			...ANTHROPIC_DEGRADED_MODE_DEFAULTS,
+			mode: "off",
+		},
+	});
 	return {
 		strategy: {
 			select: (accs: Account[]) => {
@@ -131,6 +141,17 @@ function makeContext(
 				);
 			},
 		} as never,
+		anthropicDegradedMode,
+		anthropicDegradedObservability: new DegradedModeObservability({
+			mode: "off",
+			largeRequestTokenThreshold:
+				anthropicDegradedMode.config.largeRequestTokenThreshold,
+			largeRequestByteThreshold:
+				anthropicDegradedMode.config.largeRequestByteThreshold,
+		}),
+		degradedOwnerOverlay: new DegradedOwnerOverlay(),
+		degradedOwnerShadowOverlay: new DegradedOwnerOverlay(),
+		serverToolReplay: Object.freeze({ status: "disabled" }),
 		dbOps: {
 			getAllAccounts: mock(async () => accounts),
 			getActiveComboForFamily: mock(async () => null),
@@ -357,10 +378,10 @@ describe("routing terminal — 503 response", () => {
 			provider: "anthropic",
 			access_token: "test-access-token",
 			refresh_token: "test-refresh-token",
-			expires_at: Date.now() + 60_000,
+			expires_at: Date.now() + 60 * 60_000,
 		});
 		globalThis.fetch = mock(async () => {
-			await delay(10);
+			await delay(25);
 			throw new Error("simulated upstream connection failure");
 		}) as unknown as typeof fetch;
 
@@ -387,7 +408,7 @@ describe("routing terminal — 503 response", () => {
 		});
 	});
 
-	it("records an outer-rescue routing rejection once as the HTTP-200 terminal it emitted", async () => {
+	it("contains optional route-hint failures and records the rescued 503 terminal once", async () => {
 		process.env[MEANINGFUL_PROGRESS_ENV] = "100";
 		process.env[RESCUE_ACTIVATION_ENV] = "1";
 		process.env[RESCUE_PING_ENV] = "5";
@@ -396,14 +417,14 @@ describe("routing terminal — 503 response", () => {
 			provider: "anthropic",
 			access_token: "test-access-token",
 			refresh_token: "test-refresh-token",
-			expires_at: Date.now() + 60_000,
+			expires_at: Date.now() + 60 * 60_000,
 		});
 		const ctx = makeContext([account], "anthropic");
 		ctx.strategy.getRouteCircuitRecoveryHint = () => {
 			throw new Error("simulated terminal routing rejection");
 		};
 		globalThis.fetch = mock(async () => {
-			await delay(10);
+			await delay(25);
 			throw new Error("simulated upstream connection failure");
 		}) as unknown as typeof fetch;
 
@@ -421,12 +442,12 @@ describe("routing terminal — 503 response", () => {
 		expect(usageStarts[0]).toMatchObject({
 			requestId: usageEnds[0].requestId,
 			accountId: null,
-			responseStatus: 200,
-			isStream: true,
+			responseStatus: 503,
+			isStream: false,
 		});
 		expect(usageEnds[0]).toMatchObject({
 			success: false,
-			error: "anthropic_rescue_routing_error",
+			error: "route_unavailable",
 		});
 	});
 

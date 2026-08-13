@@ -9,6 +9,7 @@ export {
 	resolveEffectiveModel,
 	selectAccountsForRequest,
 	setComboSlotInfo,
+	setXaiConvId,
 } from "./account-selector";
 export {
 	type AgentInterceptResult,
@@ -73,7 +74,10 @@ export {
 export {
 	type CodexUsageRefreshOutcome,
 	clearAccountRefreshCache,
+	extractAuthFailureReason,
 	getValidAccessToken,
+	isDefinitiveAuthFailure,
+	markAccountTokensFresh,
 	pauseAccountForReauthIfInvalidGrant,
 	refreshCodexUsageForAccount,
 	registerCodexUsageRefresher,
