@@ -233,5 +233,7 @@ export interface AnthropicResponse {
 	error?: {
 		type: string;
 		message: string;
+		/** Bounded provider discriminator retained for diagnostics and clients. */
+		code?: string;
 	};
 }

@@ -20,6 +20,20 @@ import { mapOpenAIFinishReason, sanitizeSchemaForOpenAI } from "./utils";
 
 const log = new Logger("openai-formats/converters");
 
+const SAFE_UPSTREAM_ERROR_CODE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
+/**
+ * Preserve only a bounded machine-readable provider code. Error codes are
+ * useful for routing diagnostics (for example `usage_not_included` versus
+ * `login_required`), but arbitrary upstream strings must never become an
+ * unbounded response field or a place to reflect control characters.
+ */
+function safeUpstreamErrorCode(value: unknown): string | undefined {
+	return typeof value === "string" && SAFE_UPSTREAM_ERROR_CODE.test(value)
+		? value
+		: undefined;
+}
+
 /**
  * Safely parse JSON with error handling
  */
@@ -309,11 +323,13 @@ export function convertOpenAIResponseToAnthropic(
 ): AnthropicResponse {
 	// Handle error responses
 	if (openaiData.error) {
+		const code = safeUpstreamErrorCode(openaiData.error.code);
 		return {
 			type: "error",
 			error: {
 				type: openaiData.error.type || "api_error",
 				message: openaiData.error.message || "An error occurred",
+				...(code ? { code } : {}),
 			},
 		};
 	}
