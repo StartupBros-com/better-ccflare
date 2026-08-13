@@ -37,6 +37,7 @@ const STAINLESS_HEADERS: Record<string, string> = {
 
 // All Anthropic model tiers map to coder-model (Qwen's unified coding model)
 export const QWEN_MODEL_MAPPINGS = {
+	fable: "coder-model",
 	opus: "coder-model",
 	sonnet: "coder-model",
 	haiku: "coder-model",
