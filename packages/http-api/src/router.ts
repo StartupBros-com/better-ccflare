@@ -788,7 +788,6 @@ export class APIRouter {
 				)(req, url);
 			}
 
-
 			// Account removal
 			if (parts.length === 4 && method === "DELETE") {
 				const removeHandler = createAccountRemoveHandler(this.context.dbOps);

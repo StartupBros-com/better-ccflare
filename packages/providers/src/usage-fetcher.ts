@@ -502,6 +502,22 @@ function utilizationForProvider(
 	}
 }
 
+/** Routing/health utilization: excludes extra_usage from hard capacity gates. */
+export function getRepresentativeUtilizationForProvider(
+	data: AnyUsageData | null | undefined,
+	provider: string,
+): number | null {
+	return utilizationForProvider(data, provider, false);
+}
+
+/** Ranking utilization includes extra usage, because it reflects total spend. */
+export function getRankingUtilizationForProvider(
+	data: AnyUsageData | null | undefined,
+	provider: string,
+): number | null {
+	return utilizationForProvider(data, provider, true);
+}
+
 /**
  * DISPLAY utilization: the provider-aware counterpart that PAIRS with
  * {@link getRepresentativeWindowForProvider} and {@link getRepresentativeUsageResetMs}

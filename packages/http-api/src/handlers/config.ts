@@ -1,11 +1,6 @@
-import {
-	type Config,
-	filterEnabledProviderModelDefaultOverrides,
-	PROVIDER_MODEL_DEFAULTS_ENV_VAR,
-} from "@better-ccflare/config";
+import type { Config } from "@better-ccflare/config";
 import {
 	DEFAULT_AGENT_MODEL,
-	KNOWN_PATTERNS,
 	NETWORK,
 	STRATEGIES,
 	type StrategyName,
@@ -18,11 +13,6 @@ import {
 	errorResponse,
 	jsonResponse,
 } from "@better-ccflare/http-common";
-import {
-	getProviderModelDefaultFactories,
-	getProviderModelDefaultOverrides,
-	setProviderModelDefaultOverrides,
-} from "@better-ccflare/providers";
 import type { APIContext } from "@better-ccflare/types";
 import {
 	allowedModelErrorMessage,

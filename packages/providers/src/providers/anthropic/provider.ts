@@ -16,6 +16,7 @@ import type {
 	TokenRefreshResult,
 } from "../../types";
 import { transformRequestBodyModel } from "../../utils/model-mapping";
+import { drainReader } from "../../utils/stream-drain";
 import { parseAnthropicRateLimitResetAt } from "./rate-limit-reset";
 
 // Hard rate limit statuses that should block account usage

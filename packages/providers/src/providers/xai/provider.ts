@@ -7,6 +7,10 @@ import { Logger } from "@better-ccflare/logger";
 import type { OpenAIRequest } from "@better-ccflare/openai-formats";
 import type { Account, LogicalModelCapability } from "@better-ccflare/types";
 import { parseStandardRetryAfter429 } from "../../base";
+import {
+	registerProviderModelDefaultFactory,
+	resolveProviderModelDefault,
+} from "../../provider-model-defaults";
 import type { RateLimitInfo, TokenRefreshResult } from "../../types";
 import { OpenAICompatibleProvider } from "../openai/provider";
 import {

@@ -356,6 +356,16 @@ export class AuthService {
 			return true;
 		}
 
+		// Read-only OAuth status polling is safe to expose: it reports only
+		// job progress and never mutates credentials. Keep token-mutating OAuth
+		// paths behind normal authentication.
+		if (
+			(method === undefined || method === "GET") &&
+			/^\/api\/oauth\/(?:qwen|codex)\/status\/[^/]+$/.test(path)
+		) {
+			return true;
+		}
+
 		// IMPORTANT: do NOT blanket-exempt "any non-/api, non-/v1, non-/messages
 		// path". The dashboard SPA and its static assets are served directly by
 		// apps/server/src/server.ts BEFORE authentication is consulted, and

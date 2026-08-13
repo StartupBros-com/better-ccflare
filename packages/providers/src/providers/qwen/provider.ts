@@ -2,6 +2,10 @@ import { getModelFamily } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import type { OpenAIRequest } from "@better-ccflare/openai-formats";
 import type { Account, LogicalModelCapability } from "@better-ccflare/types";
+import {
+	registerProviderModelDefaultFactory,
+	resolveProviderModelDefault,
+} from "../../provider-model-defaults";
 import type { RateLimitInfo } from "../../types";
 import { OpenAICompatibleProvider } from "../openai/provider";
 

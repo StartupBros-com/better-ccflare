@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
 import {
 	Config,
+	filterEnabledProviderModelDefaultOverrides,
 	loadServerToolReplayKeys,
 	type RuntimeConfig,
 	readGuardCorrelationSecret,
@@ -46,9 +47,10 @@ import {
 	fetchCodexUsageData,
 	fetchCodexUsageOnDemand,
 	getProvider,
-	getRepresentativeUtilizationForProvider,
+	getRankingUtilizationForProvider,
 	isCodexSubscriptionEndpoint,
 	resolveCodexEndpoint,
+	setProviderModelDefaultOverrides,
 	type UsageData,
 	usageCache,
 } from "@better-ccflare/providers";
@@ -72,7 +74,6 @@ import {
 	DegradedOwnerOverlay,
 	drainUsageCollector,
 	forceCloseCircuit,
-	getCodexModels,
 	getModelCatalog,
 	getUsageCollectorHealth,
 	getValidAccessToken,
@@ -80,6 +81,7 @@ import {
 	initModelCatalogRefresh,
 	initProxy,
 	ModelRouteSessionRegistry,
+	markAccountTokensFresh,
 	type ProxyContext,
 	parseModelRouteProfiles,
 	refreshModelCatalog,
@@ -693,6 +695,7 @@ export async function refreshPollingAccessToken(
 		account.access_token = currentAccount.access_token;
 		account.refresh_token = currentAccount.refresh_token;
 		account.expires_at = currentAccount.expires_at;
+		markAccountTokensFresh(account);
 	}
 
 	return getValidAccessToken(account, proxyContext);

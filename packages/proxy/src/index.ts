@@ -121,6 +121,7 @@ export {
 	getUsageThrottleUntil,
 	getValidAccessToken,
 	isRefreshTokenLikelyExpired,
+	markAccountTokensFresh,
 	refreshCodexUsageForAccount,
 	registerCodexUsageRefresher,
 	registerPollingRestarter,

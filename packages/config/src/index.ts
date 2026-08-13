@@ -832,7 +832,7 @@ export type ProviderModelDefaultOverrides = Record<
 export const PROVIDER_MODEL_DEFAULTS_ENV_VAR =
 	"CCFLARE_MODEL_DEFAULTS_PROVIDERS";
 
-const DEFAULT_PROVIDER_MODEL_DEFAULTS_PROVIDERS: readonly string[] = ["codex"];
+const _DEFAULT_PROVIDER_MODEL_DEFAULTS_PROVIDERS: readonly string[] = ["codex"];
 
 /**
  * Drops overrides for providers outside `enabledProviders` without
@@ -1139,6 +1139,33 @@ export class Config extends EventEmitter {
 
 	setDefaultAgentModel(model: string): void {
 		this.set("default_agent_model", model);
+	}
+
+	getProviderModelDefaultOverrides(): ProviderModelDefaultOverrides {
+		const value = this.data.provider_model_default_overrides;
+		if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+		return value as ProviderModelDefaultOverrides;
+	}
+
+	setProviderModelDefaultOverrides(
+		overrides: ProviderModelDefaultOverrides,
+	): void {
+		const key = "provider_model_default_overrides";
+		const oldValue = this.data[key];
+		this.data[key] = overrides;
+		this.saveConfig();
+		this.emit("change", { key, oldValue, newValue: overrides });
+	}
+
+	getEnabledProviderModelDefaultProviders(): string[] {
+		const raw = process.env[PROVIDER_MODEL_DEFAULTS_ENV_VAR];
+		if (!raw?.trim()) {
+			return [..._DEFAULT_PROVIDER_MODEL_DEFAULTS_PROVIDERS];
+		}
+		return raw
+			.split(",")
+			.map((provider) => provider.trim())
+			.filter(Boolean);
 	}
 
 	getOutboundProxy(): string | undefined {

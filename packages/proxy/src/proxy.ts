@@ -12,8 +12,10 @@ import {
 	canonicalizeBetaSignature,
 	deriveCacheFlightRecorderId,
 	deriveXaiConversationIdentity,
+	deriveXaiConvId,
 	estimateAnthropicAdmissionTokens,
 	isCacheFlightRecorderEnabled,
+	isOfficialXaiEndpoint,
 	isXaiCacheNativeEnabled,
 	usageCache,
 } from "@better-ccflare/providers";
@@ -75,6 +77,7 @@ import {
 	RequestBodyContext,
 	type RequestJsonBody,
 	RoutingAttemptLedger,
+	recordXaiAffinitySuccess,
 	resolveEffectiveModel,
 	selectAccountsForRequest,
 	setXaiConvId,
@@ -1386,7 +1389,7 @@ async function handleProxyCore(
 	// actually served, never at selection time — see recordXaiAffinitySuccess.
 	// A no-op for any non-xai / non-official-endpoint account, or when the
 	// feature is disabled (getXaiConvId returns null and the callee no-ops).
-	const recordXaiAffinityIfServed = (account: Account) => {
+	const _recordXaiAffinityIfServed = (account: Account) => {
 		if (account.provider === "xai" && isOfficialXaiEndpoint(account)) {
 			recordXaiAffinitySuccess(requestMeta, account.id);
 		}

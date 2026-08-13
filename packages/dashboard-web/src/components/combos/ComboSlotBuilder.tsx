@@ -29,9 +29,11 @@ import {
 	useRestoreAccountToFamily,
 	useUpdateComboSlot,
 } from "../../hooks/queries";
+import { providerAllowsClientModelPassthrough } from "../../utils/provider-utils";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "../ui/card";
+import { Input } from "../ui/input";
 import { Label } from "../ui/label";
 import {
 	Select,
@@ -136,7 +138,7 @@ function SortableManualMemberRow({
  * SELECTED ACCOUNT, not a universal "Empty = passthrough" that only holds
  * on the Anthropic provider.
  */
-function modelFieldHint(
+function _modelFieldHint(
 	provider: string | null,
 	passthroughAllowed: boolean,
 ): string {
@@ -298,6 +300,11 @@ export function ComboSlotBuilder({ combo }: ComboSlotBuilderProps) {
 	);
 
 	const accounts = accountsQuery.data ?? [];
+	const selectedProvider =
+		accounts.find((account) => account.id === newAccountId)?.provider ?? null;
+	const passthroughAllowed =
+		providerAllowsClientModelPassthrough(selectedProvider);
+	const missingRequiredModel = !passthroughAllowed && !newModel.trim();
 	const families = familiesQuery.data?.families ?? [];
 	const effectiveRoutingUnavailable =
 		effectiveRoutingQuery.isError || effectiveRoutingQuery.isRefetchError;

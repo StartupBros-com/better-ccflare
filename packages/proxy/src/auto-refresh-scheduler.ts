@@ -1,4 +1,5 @@
 import {
+	authFailureEvents,
 	CLAUDE_MODEL_IDS,
 	getClientVersion,
 	PAUSE_REASON_NEEDS_REAUTH,
@@ -11,10 +12,15 @@ import { fetchUsageData, getProvider } from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
 import { TOKEN_SAFETY_WINDOW_MS } from "./constants";
 import {
+	extractAuthFailureReason,
 	getValidAccessToken,
 	INTERNAL_PROBE_SECRET_HEADER,
-	pauseAccountForReauthIfInvalidGrant,
 } from "./handlers";
+import {
+	flushPendingRotation,
+	getPendingRotation,
+	recordPendingRotation,
+} from "./handlers/pending-rotation-registry";
 import { stampInternalAutoRefreshAuth } from "./internal-probe-auth";
 import type { ProxyContext } from "./proxy";
 
@@ -795,7 +801,10 @@ export class AutoRefreshScheduler {
 			WHERE
 				provider IN ('qwen', 'xai')
 				AND refresh_token IS NOT NULL
-				AND COALESCE(paused, 0) = 0
+				-- Never probe an account already flagged for manual re-auth: its
+				-- refresh token is known dead, so the probe is a guaranteed fail and
+				-- recovery is only the manual re-auth clear-site.
+				AND COALESCE(requires_reauth, 0) = 0
 				AND (
 					access_token IS NULL
 					OR expires_at IS NULL
@@ -954,21 +963,14 @@ export class AutoRefreshScheduler {
 					error,
 				);
 				// This proactive path calls provider.refreshToken directly (bypassing
-				// refreshAccessTokenSafe), so pause-for-reauth on a revoked token here
-				// too. Harmless no-op for Qwen accounts, whose refreshToken currently
-				// echoes the stored token back rather than performing a real OAuth
-				// refresh, so it never throws an invalid_grant-shaped error; xAI's
-				// refreshToken performs a real OAuth refresh and can.
-				await pauseAccountForReauthIfInvalidGrant(
-					error,
-					{
-						id: row.id,
-						name: row.name,
-						provider: row.provider,
-						refresh_token: row.refresh_token,
-					},
-					this.proxyContext.dbOps,
-				);
+				// refreshAccessTokenSafe), so apply the same definitive-auth and
+				// rotation-race handling here too.
+				await this.flagIfDefinitiveAuthFailure(error, {
+					id: row.id,
+					name: row.name,
+					provider: row.provider,
+					refresh_token: row.refresh_token,
+				});
 			}
 		}
 	}
@@ -998,7 +1000,10 @@ export class AutoRefreshScheduler {
 			WHERE
 				provider = 'codex'
 				AND refresh_token IS NOT NULL
-				AND COALESCE(paused, 0) = 0
+				-- Never probe an account already flagged for manual re-auth: its
+				-- refresh token is known dead, so the probe is a guaranteed fail and
+				-- recovery is only the manual re-auth clear-site.
+				AND COALESCE(requires_reauth, 0) = 0
 				AND (
 					access_token IS NULL
 					OR expires_at IS NULL
@@ -1156,19 +1161,65 @@ export class AutoRefreshScheduler {
 					error,
 				);
 				// This proactive path calls provider.refreshToken directly (bypassing
-				// refreshAccessTokenSafe), so pause-for-reauth on a revoked token here too.
-				await pauseAccountForReauthIfInvalidGrant(
-					error,
-					{
-						id: row.id,
-						name: row.name,
-						provider: row.provider,
-						refresh_token: row.refresh_token,
-					},
-					this.proxyContext.dbOps,
-				);
+				// refreshAccessTokenSafe), so apply the same definitive-auth and
+				// rotation-race handling here too.
+				await this.flagIfDefinitiveAuthFailure(error, {
+					id: row.id,
+					name: row.name,
+					provider: row.provider,
+					refresh_token: row.refresh_token,
+				});
 			}
 		}
+	}
+
+	/**
+	 * Quarantine a proactive refresh failure only when it is definitive and the
+	 * failed attempt still owns the refresh token snapshot it used.
+	 */
+	private async flagIfDefinitiveAuthFailure(
+		error: unknown,
+		row: { id: string; name: string; provider: string; refresh_token: string },
+	): Promise<void> {
+		const message = error instanceof Error ? error.message : String(error);
+		const reason = extractAuthFailureReason(message, row.name);
+		if (!reason) return;
+
+		if (getPendingRotation(row.id)) {
+			log.warn(
+				`Skipping requires_reauth for ${row.name}: a successful rotation is awaiting persist (replayed a consumed token)`,
+			);
+			return;
+		}
+
+		let flagged = false;
+		try {
+			flagged = await this.proxyContext.dbOps.flagRequiresReauthIfTokenMatches(
+				row.id,
+				row.refresh_token,
+			);
+		} catch (writeError) {
+			log.warn(
+				`Could not verify-and-flag requires_reauth for ${row.name} — leaving unset (unverified ${reason})`,
+				writeError,
+			);
+			return;
+		}
+		if (!flagged) {
+			log.warn(
+				`Skipping requires_reauth for ${row.name}: the failed ${row.provider} refresh used a superseded refresh token (rotation race)`,
+			);
+			return;
+		}
+		log.error(
+			`Account ${row.name} requires re-authentication — proactive ${row.provider} refresh returned ${reason}`,
+		);
+		authFailureEvents.emit("event", {
+			accountId: row.id,
+			accountName: row.name,
+			provider: row.provider,
+			reason,
+		});
 	}
 
 	/**

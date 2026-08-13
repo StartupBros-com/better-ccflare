@@ -2061,7 +2061,7 @@ export async function proxyWithAccount(
 		// anthropic-terminal-recovery.ts) can abort this request's fetch
 		// connection after the fact — a signal not part of `init.signal` at
 		// fetch-creation time cannot retroactively attach to it.
-		const drainAbortController = new AbortController();
+		const _drainAbortController = new AbortController();
 
 		// Every upstream call stays tied to the client connection: when the client
 		// disconnects, the upstream fetch must be aborted instead of running on.

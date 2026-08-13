@@ -3,6 +3,7 @@ export {
 	cacheOutcomeFromTokens,
 	deriveCacheFlightRecorderId,
 	deriveXaiConversationIdentity,
+	deriveXaiConvId,
 	extractClaudeSessionId,
 	formatXaiCacheCanary,
 	isCacheFlightRecorderEnabled,
