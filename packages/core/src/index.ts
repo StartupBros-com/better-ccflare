@@ -22,6 +22,7 @@ export {
 export {
 	formatOAuthErrorMessage,
 	getOAuthErrorCode,
+	isExactInvalidGrantMessage,
 	isInvalidGrantMessage,
 	isStructuredInvalidGrant,
 	logError,

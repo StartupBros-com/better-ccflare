@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import {
 	formatOAuthErrorMessage,
+	isExactInvalidGrantMessage,
 	isInvalidGrantMessage,
 	isStructuredInvalidGrant,
 	OAuthRefreshTokenError,
@@ -62,6 +63,10 @@ describe("formatOAuthErrorMessage", () => {
 		).toBe(false);
 		expect(isStructuredInvalidGrant({ error: { code: "invalid_grant" } })).toBe(
 			true,
+		);
+		expect(isExactInvalidGrantMessage("invalid_grant")).toBe(true);
+		expect(isExactInvalidGrantMessage("provider mentioned invalid_grant")).toBe(
+			false,
 		);
 	});
 });

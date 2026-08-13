@@ -135,4 +135,21 @@ describe("CodexProvider.refreshToken preserves the OAuth error code", () => {
 			provider.refreshToken(codexAccount(), "test-client"),
 		).rejects.toBeInstanceOf(OAuthRefreshTokenError);
 	});
+
+	it("does not classify an incidental invalid_grant mention as terminal", async () => {
+		const provider = new CodexProvider();
+		globalThis.fetch = mock(
+			async () =>
+				new Response(
+					JSON.stringify({
+						error: { message: "provider mentioned invalid_grant in prose" },
+					}),
+					{ status: 400, headers: { "content-type": "application/json" } },
+				),
+		) as unknown as typeof fetch;
+
+		await expect(
+			provider.refreshToken(codexAccount(), "test-client"),
+		).rejects.not.toBeInstanceOf(OAuthRefreshTokenError);
+	});
 });

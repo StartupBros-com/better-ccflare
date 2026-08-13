@@ -2,7 +2,8 @@ import {
 	BUFFER_SIZES,
 	formatOAuthErrorMessage,
 	getModelFamily,
-	isInvalidGrantMessage,
+	isExactInvalidGrantMessage,
+	isStructuredInvalidGrant,
 	mapModelName,
 	OAuthRefreshTokenError,
 	validateEndpointUrl,
@@ -239,8 +240,8 @@ export class AnthropicProvider extends BaseProvider {
 			// error so callers can pause the account for re-authentication instead
 			// of treating it as a transient refresh failure.
 			if (
-				isInvalidGrantMessage(errorMessage) ||
-				isInvalidGrantMessage(responseText)
+				isStructuredInvalidGrant(errorData) ||
+				isExactInvalidGrantMessage(responseText)
 			) {
 				throw new OAuthRefreshTokenError(account.id, failureMessage);
 			}

@@ -4,7 +4,8 @@ import {
 	BUFFER_SIZES,
 	formatOAuthErrorMessage,
 	getModelFamily,
-	isInvalidGrantMessage,
+	isExactInvalidGrantMessage,
+	isStructuredInvalidGrant,
 	mapModelName,
 	OAuthRefreshTokenError,
 	SseFrameBuffer,
@@ -1110,8 +1111,8 @@ export class CodexProvider extends BaseProvider {
 
 			const failureMessage = `Failed to refresh Codex token for account ${account.name}: ${errorMessage}`;
 			if (
-				isInvalidGrantMessage(errorMessage) ||
-				isInvalidGrantMessage(responseText)
+				isStructuredInvalidGrant(errorData) ||
+				isExactInvalidGrantMessage(responseText)
 			) {
 				throw new OAuthRefreshTokenError(account.id, failureMessage);
 			}

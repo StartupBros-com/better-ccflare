@@ -201,6 +201,17 @@ export function isStructuredInvalidGrant(input: unknown): boolean {
 	return Boolean(getOAuthErrorCode(input));
 }
 
+/** True only when a non-JSON provider body is exactly a terminal OAuth code. */
+export function isExactInvalidGrantMessage(input: unknown): boolean {
+	if (typeof input !== "string") return false;
+	const normalized = input
+		.replace(/\p{Cc}/gu, " ")
+		.replace(/\s+/g, " ")
+		.trim()
+		.toLowerCase();
+	return INVALID_GRANT_CODES.has(normalized);
+}
+
 /**
  * True when an OAuth token-refresh error message/body indicates the refresh
  * token itself was rejected (terminal, needs reauth). Case-insensitive; pass

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { OAuthRefreshTokenError } from "@better-ccflare/core";
 import type { Account } from "@better-ccflare/types";
 import { AnthropicProvider } from "../provider";
 
@@ -121,5 +122,22 @@ describe("AnthropicProvider.refreshToken preserves the OAuth error code", () => 
 			thrown = error;
 		}
 		expect(thrown).toHaveProperty("code", "OAUTH_INVALID_GRANT");
+	});
+
+	it("does not classify an incidental invalid_grant mention as terminal", async () => {
+		const provider = new AnthropicProvider();
+		globalThis.fetch = mock(
+			async () =>
+				new Response(
+					JSON.stringify({
+						error: { message: "provider mentioned invalid_grant in prose" },
+					}),
+					{ status: 400, headers: { "content-type": "application/json" } },
+				),
+		) as unknown as typeof fetch;
+
+		await expect(
+			provider.refreshToken(oauthAccount(), "test-client"),
+		).rejects.not.toBeInstanceOf(OAuthRefreshTokenError);
 	});
 });
