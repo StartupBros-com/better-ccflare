@@ -251,6 +251,7 @@ async function spawnRunner(
 			RUNNER_HEALTH_POLL_INTERVAL_MS: "10",
 			RUNNER_HEALTH_MAX_ATTEMPTS: "100",
 			RUNNER_HEALTH_STABILITY_DELAY_MS: "0",
+			RUNNER_CIRCUIT_HOLD: "false",
 			...extraEnv,
 		},
 		stdio: ["ignore", "pipe", "pipe"],
