@@ -33,6 +33,7 @@ function makeDb(queryRows: ProactiveRow[]) {
 		}),
 	};
 	const dbOps = {
+		getAccount: mock(async (): Promise<Record<string, unknown> | null> => null),
 		// flagIfDefinitiveAuthFailure persists requires_reauth via this CAS
 		// helper — return true so the write reports as "landed" (matches the
 		// real UPDATE ... WHERE refresh_token = ? matching the row's current
@@ -110,6 +111,102 @@ describe("AutoRefreshScheduler proactive refresh — requires_reauth guard", () 
 		const sql = queries.find((q) => q.includes("provider = 'codex'"));
 		expect(sql).toBeDefined();
 		expect(sql).toContain("COALESCE(requires_reauth, 0) = 0");
+	});
+});
+
+describe("AutoRefreshScheduler proactive refresh — CAS loser adoption", () => {
+	for (const provider of ["xai", "codex"] as const) {
+		it(`serves the authoritative DB token when ${provider} refresh persistence loses its CAS`, async () => {
+			const id = `${provider}-cas-loser`;
+			const { db, dbOps } = makeDb([
+				{
+					id,
+					name: id,
+					provider,
+					refresh_token: "rt-old",
+					access_token: "at-old",
+					expires_at: 1,
+					custom_endpoint: null,
+				},
+			]);
+			dbOps.updateAccountTokensIfRefreshTokenMatches = mock(async () => false);
+			let releaseAuthoritativeRead: (() => void) | undefined;
+			const authoritativeReadGate = new Promise<void>((resolve) => {
+				releaseAuthoritativeRead = resolve;
+			});
+			dbOps.getAccount = mock(async () => {
+				await authoritativeReadGate;
+				return {
+					access_token: "authoritative-access",
+					expires_at: Date.now() + 3_600_000,
+				};
+			});
+			global.fetch = mock(
+				async () =>
+					new Response(
+						JSON.stringify({
+							access_token: "losing-access",
+							refresh_token: "losing-refresh",
+							expires_in: 3600,
+						}),
+						{ status: 200, headers: { "content-type": "application/json" } },
+					),
+			) as unknown as typeof fetch;
+
+			const scheduler = makeScheduler(db, dbOps);
+			const run =
+				provider === "codex"
+					? scheduler.checkAndRefreshCodexTokens()
+					: scheduler.checkAndRefreshOpenAICompatibleOAuthTokens();
+			const inFlight = (
+				scheduler as unknown as {
+					proxyContext: { refreshInFlight: Map<string, Promise<string>> };
+				}
+			).proxyContext.refreshInFlight;
+			for (let attempt = 0; attempt < 10 && !inFlight.has(id); attempt++) {
+				await Promise.resolve();
+			}
+			const joined = inFlight.get(id);
+			expect(joined).toBeDefined();
+			releaseAuthoritativeRead?.();
+			expect(await joined).toBe("authoritative-access");
+			await run;
+		});
+	}
+
+	it("rejects a CAS-losing scheduler promise when the authoritative token is unusable", async () => {
+		const id = "codex-cas-loser-expired";
+		const { db, dbOps } = makeDb([
+			{
+				id,
+				name: id,
+				provider: "codex",
+				refresh_token: "rt-old",
+				access_token: "at-old",
+				expires_at: 1,
+				custom_endpoint: null,
+			},
+		]);
+		dbOps.updateAccountTokensIfRefreshTokenMatches = mock(async () => false);
+		dbOps.getAccount = mock(async () => ({
+			access_token: "expired-authoritative-access",
+			expires_at: Date.now() - 1,
+		}));
+		global.fetch = mock(
+			async () =>
+				new Response(
+					JSON.stringify({
+						access_token: "losing-access",
+						refresh_token: "losing-refresh",
+						expires_in: 3600,
+					}),
+					{ status: 200, headers: { "content-type": "application/json" } },
+				),
+		) as unknown as typeof fetch;
+
+		const scheduler = makeScheduler(db, dbOps);
+		await scheduler.checkAndRefreshCodexTokens();
+		expect(dbOps.getAccount).toHaveBeenCalledWith(id);
 	});
 });
 

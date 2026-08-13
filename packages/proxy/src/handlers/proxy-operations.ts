@@ -78,6 +78,7 @@ import {
 	stripCacheControlFromReplayBody,
 } from "../cache-transport-staging";
 import { isClaudeCodeSubagent } from "../claude-code-request";
+import { ensureCodexModelDefaults } from "../codex-model-catalog";
 import {
 	type CodexWebSocketReceipt,
 	codexWebSocketTransport,
@@ -1445,6 +1446,7 @@ export async function isModelUnavailableError(
 	// return non-JSON error bodies. See issue #356.
 	const json = (await readJson(response)) as {
 		error?: { type?: unknown; code?: unknown; message?: unknown };
+		detail?: unknown;
 	} | null;
 	// Anthropic native format
 	if (json?.error?.type === "not_found_error") return true;
@@ -1452,12 +1454,18 @@ export async function isModelUnavailableError(
 	// OpenAI-compat format
 	if (json?.error?.code === "model_not_found") return true;
 
-	// Generic: message contains "model not found" or "does not exist"
-	if (typeof json?.error?.message === "string") {
-		const message = json.error.message;
+	// Generic: nested or top-level message names an unavailable model. Codex's
+	// ChatGPT-account endpoint uses a top-level `detail` string for this shape.
+	const messages = [json?.error?.message, json?.detail].filter(
+		(message): message is string => typeof message === "string",
+	);
+	for (const message of messages) {
+		const lower = message.toLowerCase();
 		if (
-			message.toLowerCase().includes("model not found") ||
-			message.toLowerCase().includes("does not exist") ||
+			lower.includes("model not found") ||
+			lower.includes("does not exist") ||
+			lower.includes("model is not supported") ||
+			lower.includes("model is unavailable") ||
 			message.includes("ResourceNotFoundException")
 		) {
 			return true;
@@ -1788,6 +1796,7 @@ export async function proxyUnauthenticated(
 		ctx.provider.prepareHeaders(req.headers, undefined, undefined),
 	);
 	const routingSignal = anthropicPreCommitRescue?.signal ?? req.signal;
+	const drainAbortController = new AbortController();
 	let attemptCommitment: AnthropicPreCommitAttemptScope | undefined;
 
 	try {
@@ -1816,8 +1825,13 @@ export async function proxyUnauthenticated(
 			// Abort upstream when the client disconnects; this path builds no
 			// Request object, so the signal has to be passed explicitly.
 			// routingSignal already falls back to req.signal when there is no
-			// active pre-commit rescue, so this chain covers both cases.
-			attemptCommitment?.signal ?? routingSignal,
+			// active pre-commit rescue, so this chain covers both cases. The
+			// drain controller must be present when fetch is created so terminal
+			// recovery can later tear down a stuck response body.
+			AbortSignal.any([
+				attemptCommitment?.signal ?? routingSignal,
+				drainAbortController.signal,
+			]),
 		);
 
 		if (
@@ -1871,6 +1885,7 @@ export async function proxyUnauthenticated(
 				apiKeyId,
 				apiKeyName,
 				routingMeta: requestMeta,
+				drainAbort: drainAbortController,
 			},
 			ctx,
 		);
@@ -1999,6 +2014,7 @@ export async function proxyWithAccount(
 		routingSignal.aborted ||
 		anthropicDegradedState?.lifecycle?.transportSignal.aborted === true ||
 		activeAttemptCommitment?.signal.aborted === true;
+	const drainAbortController = new AbortController();
 	const makeAttemptRequest = async (
 		request: Request,
 		optionalOutboundTransport?: (
@@ -2016,7 +2032,14 @@ export async function proxyWithAccount(
 		activeAttemptCommitment?.dispose();
 		activeAttemptCommitment = undefined;
 		const dispatch = async (signal: AbortSignal): Promise<Response> => {
-			const optionalResponse = await optionalOutboundTransport?.(signal);
+			// HTTP and optional transports must share the exact same live abort
+			// source. Terminal recovery cannot attach a controller after either
+			// transport has already created its connection.
+			const attemptSignal = AbortSignal.any([
+				signal,
+				drainAbortController.signal,
+			]);
+			const optionalResponse = await optionalOutboundTransport?.(attemptSignal);
 			if (optionalResponse) return optionalResponse;
 			onHttpDispatch?.();
 			return makeProxyRequest(
@@ -2025,7 +2048,7 @@ export async function proxyWithAccount(
 				undefined,
 				undefined,
 				undefined,
-				signal,
+				attemptSignal,
 			);
 		};
 		const transportSignal = currentTransportSignal();
@@ -2057,12 +2080,6 @@ export async function proxyWithAccount(
 		}
 	};
 	try {
-		// Dedicated controller so a stuck-upstream drain deadline (see
-		// anthropic-terminal-recovery.ts) can abort this request's fetch
-		// connection after the fact — a signal not part of `init.signal` at
-		// fetch-creation time cannot retroactively attach to it.
-		const _drainAbortController = new AbortController();
-
 		// Every upstream call stays tied to the client connection: when the client
 		// disconnects, the upstream fetch must be aborted instead of running on.
 		// Call sites pass `req.signal` to makeProxyRequest explicitly instead of
@@ -2476,6 +2493,9 @@ export async function proxyWithAccount(
 			assertAttemptPlanCapabilityIsCurrent(plan);
 			return plan.transformRequestBody(request);
 		};
+		if (provider.name === "codex") {
+			await ensureCodexModelDefaults(account, ctx);
+		}
 		let attemptPlan = materializeAttemptPlan(
 			effectiveBodyBuffer,
 			cacheReplayPhysicalModel ?? concreteAttemptModel,
@@ -4925,6 +4945,9 @@ export async function proxyWithAccount(
 						let fallbackHeaders: Headers;
 						let retryTransformedRequest: Request;
 						try {
+							if (provider.name === "codex") {
+								await ensureCodexModelDefaults(account, ctx);
+							}
 							// Exact capability and replay readiness are resolved before the
 							// request ledger can claim this physical fallback.
 							fallbackPlan = materializeAttemptPlan(
@@ -5925,6 +5948,7 @@ export async function proxyWithAccount(
 						routeCandidateId,
 						routingMeta: requestMeta,
 						anthropicDegradedLifecycle: activeLifecycleForLatestResponse(),
+						drainAbort: drainAbortController,
 					},
 					attemptProxyContext(),
 				);
@@ -6042,6 +6066,7 @@ export async function proxyWithAccount(
 				routeCandidateId,
 				routingMeta: requestMeta,
 				anthropicDegradedLifecycle: responseLifecycle,
+				drainAbort: drainAbortController,
 			},
 			attemptProxyContext(),
 		);

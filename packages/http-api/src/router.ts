@@ -419,6 +419,12 @@ export class APIRouter {
 			requestsStreamHandler(req),
 		);
 		this.handlers.set("GET:/api/config", () => configHandlers.getConfig());
+		this.handlers.set("GET:/api/config/provider-model-defaults", () =>
+			configHandlers.getProviderModelDefaults(),
+		);
+		this.handlers.set("POST:/api/config/provider-model-defaults", (req) =>
+			configHandlers.setProviderModelDefaults(req),
+		);
 		this.handlers.set("GET:/api/config/strategy", () =>
 			configHandlers.getStrategy(),
 		);

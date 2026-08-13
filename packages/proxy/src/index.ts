@@ -134,6 +134,11 @@ export {
 	unregisterCodexUsageRefresher,
 } from "./handlers";
 export {
+	configurePendingRotationPersistence,
+	restorePendingRotations,
+} from "./handlers/pending-rotation-registry";
+export { createPendingRotationWal } from "./handlers/pending-rotation-wal";
+export {
 	runIntegrityCheckOnDemand,
 	startFullIntegrityCheckBackground,
 	startIntegrityScheduler,

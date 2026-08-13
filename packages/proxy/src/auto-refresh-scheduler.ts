@@ -906,8 +906,9 @@ export class AutoRefreshScheduler {
 						// Routed through the retry-wrapped dbOps helper instead of raw SQL
 						// so this write benefits from the same transient-failure retries on
 						// Postgres as the token-manager funnel.
+						let persisted: boolean;
 						try {
-							const persisted =
+							persisted =
 								await this.proxyContext.dbOps.updateAccountTokensIfRefreshTokenMatches(
 									row.id,
 									row.refresh_token,
@@ -915,23 +916,11 @@ export class AutoRefreshScheduler {
 									result.expiresAt,
 									newRefreshToken,
 								);
-							if (!persisted) {
-								log.warn(
-									`Skipped persisting refreshed ${row.provider} token for ${row.name}: refresh token changed underneath (superseded by a newer rotation or manual re-auth)`,
-								);
-							} else {
-								log.info(
-									`${row.provider} token refreshed for ${row.name}, expires at ${new Date(result.expiresAt).toISOString()}`,
-								);
-							}
 						} catch (persistError) {
-							// (round-3 item 2) A rotation the provider has already
-							// committed must never be silently dropped: the DB still
-							// holds the consumed token, and a later stale consumer would
-							// replay it, get invalid_grant, and CAS-flag a healthy
-							// account. Record it so every subsequent touchpoint retries
-							// the persist and suppresses flagging meanwhile.
-							recordPendingRotation(row.id, {
+							// The provider already committed the rotation. Durably record it
+							// before resolving any joiner so a process crash cannot lose the
+							// only copy of the new refresh token.
+							await recordPendingRotation(row.id, {
 								accessToken: result.accessToken,
 								expiresAt: result.expiresAt,
 								refreshToken: newRefreshToken,
@@ -941,7 +930,14 @@ export class AutoRefreshScheduler {
 								`Failed to persist refreshed ${row.provider} token for ${row.name} — rotation queued for re-persist`,
 								persistError,
 							);
+							return result.accessToken;
 						}
+						if (!persisted) {
+							return this.readAuthoritativeTokenAfterLostCas(row);
+						}
+						log.info(
+							`${row.provider} token refreshed for ${row.name}, expires at ${new Date(result.expiresAt).toISOString()}`,
+						);
 						return result.accessToken;
 					})
 					.finally(() => {
@@ -1104,8 +1100,9 @@ export class AutoRefreshScheduler {
 						// Routed through the retry-wrapped dbOps helper instead of raw SQL
 						// so this write benefits from the same transient-failure retries on
 						// Postgres as the token-manager funnel.
+						let persisted: boolean;
 						try {
-							const persisted =
+							persisted =
 								await this.proxyContext.dbOps.updateAccountTokensIfRefreshTokenMatches(
 									row.id,
 									row.refresh_token,
@@ -1113,23 +1110,8 @@ export class AutoRefreshScheduler {
 									result.expiresAt,
 									newRefreshToken,
 								);
-							if (!persisted) {
-								log.warn(
-									`Skipped persisting refreshed Codex token for ${row.name}: refresh token changed underneath (superseded by a newer rotation or manual re-auth)`,
-								);
-							} else {
-								log.info(
-									`Codex token refreshed for ${row.name}, expires at ${new Date(result.expiresAt).toISOString()}`,
-								);
-							}
 						} catch (persistError) {
-							// (round-3 item 2) A rotation the provider has already
-							// committed must never be silently dropped: the DB still
-							// holds the consumed token, and a later stale consumer would
-							// replay it, get invalid_grant, and CAS-flag a healthy
-							// account. Record it so every subsequent touchpoint retries
-							// the persist and suppresses flagging meanwhile.
-							recordPendingRotation(row.id, {
+							await recordPendingRotation(row.id, {
 								accessToken: result.accessToken,
 								expiresAt: result.expiresAt,
 								refreshToken: newRefreshToken,
@@ -1139,7 +1121,14 @@ export class AutoRefreshScheduler {
 								`Failed to persist refreshed Codex token for ${row.name} — rotation queued for re-persist`,
 								persistError,
 							);
+							return result.accessToken;
 						}
+						if (!persisted) {
+							return this.readAuthoritativeTokenAfterLostCas(row);
+						}
+						log.info(
+							`Codex token refreshed for ${row.name}, expires at ${new Date(result.expiresAt).toISOString()}`,
+						);
 						return result.accessToken;
 					})
 					.finally(() => {
@@ -1171,6 +1160,32 @@ export class AutoRefreshScheduler {
 				});
 			}
 		}
+	}
+
+	/**
+	 * A failed token-persistence CAS means another writer owns the credential
+	 * generation now. Serve only that authoritative writer's still-valid access
+	 * token; the just-minted losing token may already be revoked.
+	 */
+	private async readAuthoritativeTokenAfterLostCas(row: {
+		id: string;
+		name: string;
+		provider: string;
+	}): Promise<string> {
+		const account = await this.proxyContext.dbOps.getAccount(row.id);
+		if (
+			account?.access_token &&
+			typeof account.expires_at === "number" &&
+			account.expires_at - Date.now() > TOKEN_SAFETY_WINDOW_MS
+		) {
+			log.warn(
+				`Persist CAS lost for ${row.name} — serving the authoritative DB access token`,
+			);
+			return account.access_token;
+		}
+		throw new Error(
+			`Persist CAS lost for ${row.name}, but the authoritative account has no usable access token`,
+		);
 	}
 
 	/**

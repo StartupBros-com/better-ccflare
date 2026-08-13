@@ -49,6 +49,50 @@ export type PendingRotationDbOps = {
 const MAX_PENDING_ROTATIONS = 1000;
 const pending = new Map<string, PendingRotation>();
 
+export type PendingRotationPersistence = {
+	save(accountId: string, rotation: PendingRotation): Promise<void>;
+	load(): Promise<Array<{ accountId: string; rotation: PendingRotation }>>;
+	remove(accountId: string): Promise<void>;
+};
+
+let persistence: PendingRotationPersistence | null = null;
+const persistenceWrites = new Map<string, Promise<void>>();
+
+async function enqueuePersistenceWrite(
+	accountId: string,
+	operation: (store: PendingRotationPersistence) => Promise<void>,
+): Promise<void> {
+	const store = persistence;
+	if (!store) return;
+	const previous = persistenceWrites.get(accountId) ?? Promise.resolve();
+	const current = previous.catch(() => undefined).then(() => operation(store));
+	persistenceWrites.set(accountId, current);
+	try {
+		await current;
+	} finally {
+		if (persistenceWrites.get(accountId) === current) {
+			persistenceWrites.delete(accountId);
+		}
+	}
+}
+
+/** Install the durable outbox used by production startup and refresh paths. */
+export function configurePendingRotationPersistence(
+	value: PendingRotationPersistence | null,
+): void {
+	persistence = value;
+}
+
+/** Restore encrypted outbox rows before any provider refresh can run. */
+export async function restorePendingRotations(): Promise<number> {
+	if (!persistence) return 0;
+	const rows = await persistence.load();
+	for (const { accountId, rotation } of rows) {
+		if (!pending.has(accountId)) pending.set(accountId, rotation);
+	}
+	return rows.length;
+}
+
 /**
  * Records a rotation that a provider call completed but that has not (yet)
  * been durably persisted. Replaces any existing entry for the account.
@@ -75,10 +119,10 @@ const pending = new Map<string, PendingRotation>();
  * refresh token entirely once the in-memory copy also ages out — so it is
  * logged as an error rather than silently dropped.
  */
-export function recordPendingRotation(
+export async function recordPendingRotation(
 	accountId: string,
 	rotation: Omit<PendingRotation, "recordedAt">,
-): void {
+): Promise<void> {
 	if (!pending.has(accountId) && pending.size >= MAX_PENDING_ROTATIONS) {
 		const oldestId = pending.keys().next().value;
 		if (oldestId !== undefined) {
@@ -89,13 +133,32 @@ export function recordPendingRotation(
 		}
 	}
 	const existing = pending.get(accountId);
-	pending.set(accountId, {
+	const next = {
 		...rotation,
 		attemptedRefreshToken: existing
 			? existing.attemptedRefreshToken
 			: rotation.attemptedRefreshToken,
 		recordedAt: existing ? existing.recordedAt : Date.now(),
-	});
+	};
+	pending.set(accountId, next);
+	await persistPendingRotation(accountId, next);
+}
+
+async function persistPendingRotation(
+	accountId: string,
+	rotation: PendingRotation,
+): Promise<void> {
+	try {
+		await enqueuePersistenceWrite(accountId, (store) =>
+			store.save(accountId, rotation),
+		);
+	} catch (error) {
+		log.error(
+			`Failed to persist pending rotation outbox for account ${accountId}`,
+			error,
+		);
+		throw error;
+	}
 }
 
 /** Returns the pending rotation for the account, if any. */
@@ -108,6 +171,14 @@ export function getPendingRotation(
 /** Removes any pending rotation for the account. No-op if none exists. */
 export function clearPendingRotation(accountId: string): void {
 	pending.delete(accountId);
+	void enqueuePersistenceWrite(accountId, (store) =>
+		store.remove(accountId),
+	).catch((error) =>
+		log.error(
+			`Failed to remove pending rotation outbox for account ${accountId}`,
+			error,
+		),
+	);
 }
 
 /** Test-only: clears the entire registry so tests don't leak state between runs. */
@@ -173,6 +244,9 @@ export async function flushPendingRotation(
 			const current = pending.get(accountId);
 			if (current === entry) {
 				pending.delete(accountId);
+				await enqueuePersistenceWrite(accountId, (store) =>
+					store.remove(accountId),
+				);
 			} else if (current) {
 				// A newer rotation was recorded while this flush's CAS write was
 				// still in flight. The CAS we just landed moved the DB's refresh
@@ -183,10 +257,18 @@ export async function flushPendingRotation(
 				// newest credentials.
 				current.attemptedRefreshToken =
 					entry.refreshToken ?? entry.attemptedRefreshToken;
+				await enqueuePersistenceWrite(accountId, (store) =>
+					store.save(accountId, current),
+				);
 			}
 			return "persisted";
 		}
-		if (pending.get(accountId) === entry) pending.delete(accountId);
+		if (pending.get(accountId) === entry) {
+			pending.delete(accountId);
+			await enqueuePersistenceWrite(accountId, (store) =>
+				store.remove(accountId),
+			);
+		}
 		log.warn(
 			`Pending rotation for account ${accountId} was superseded — the DB moved past the consumed token (manual re-auth or a newer rotation)`,
 		);

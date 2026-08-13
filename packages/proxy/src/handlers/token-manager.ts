@@ -790,7 +790,7 @@ export async function refreshAccessTokenSafe(
 					// account. Record it so every subsequent touchpoint retries
 					// the persist, serves the rotated credentials, and
 					// suppresses flagging meanwhile.
-					recordPendingRotation(account.id, {
+					await recordPendingRotation(account.id, {
 						accessToken: result.accessToken,
 						expiresAt: result.expiresAt,
 						refreshToken: result.refreshToken,

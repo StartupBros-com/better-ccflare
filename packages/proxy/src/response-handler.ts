@@ -349,6 +349,8 @@ export interface ResponseHandlerOptions {
 	routeCandidateId?: string | null;
 	/** Internal routing context used only for lane-local failure suppression. */
 	routingMeta?: RequestMeta;
+	/** Aborts the same upstream fetch when terminal stream draining times out. */
+	drainAbort?: AbortController;
 	/** One committed degraded-mode send, transferred after wrapping succeeds. */
 	anthropicDegradedLifecycle?: AnthropicDegradedResponseLifecycle | null;
 }
@@ -396,6 +398,7 @@ export async function forwardToClient(
 		attemptedModel = null,
 		routeCandidateId = null,
 		routingMeta,
+		drainAbort,
 		anthropicDegradedLifecycle,
 	} = options;
 
@@ -709,6 +712,7 @@ export async function forwardToClient(
 		let streamTerminalState: AnthropicTerminalState | null = null;
 		const responseBody = isAnthropicMessagesSseResponse
 			? createAnthropicTerminalRecoveryStream(semanticallyBoundedBody, {
+					drainAbort,
 					gracePeriodMs: anthropicStreamConfig?.terminalGraceMs,
 					onRecovery(reason) {
 						log.warn("anthropic_terminal_message_stop_recovered", {

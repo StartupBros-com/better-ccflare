@@ -32,6 +32,10 @@ import type {
 } from "@better-ccflare/types";
 import { BaseProvider } from "../../base";
 import {
+	registerProviderModelDefaultFactory,
+	resolveProviderModelDefault,
+} from "../../provider-model-defaults";
+import {
 	estimateAnthropicRequestTokens,
 	resolveModelContextCapability,
 } from "../../request-capabilities";
@@ -335,6 +339,7 @@ const DEFAULT_MODEL_MAP: Record<string, string> = {
 	sonnet: "gpt-5.3-codex",
 	haiku: "gpt-5.4-mini",
 };
+registerProviderModelDefaultFactory("codex", DEFAULT_MODEL_MAP);
 
 /** Resolve the concrete Codex model exactly as request transformation will. */
 export function resolveCodexRequestModel(
@@ -347,10 +352,15 @@ export function resolveCodexRequestModel(
 	}
 
 	const lower = anthropicModel.toLowerCase();
-	if (lower.includes("fable")) return DEFAULT_MODEL_MAP.fable;
-	if (lower.includes("haiku")) return DEFAULT_MODEL_MAP.haiku;
-	if (lower.includes("sonnet")) return DEFAULT_MODEL_MAP.sonnet;
-	if (lower.includes("opus")) return DEFAULT_MODEL_MAP.opus;
+	const family = ["fable", "haiku", "sonnet", "opus"].find((candidate) =>
+		lower.includes(candidate),
+	);
+	if (family) {
+		return (
+			resolveProviderModelDefault("codex", family, account?.id) ??
+			DEFAULT_MODEL_MAP[family]
+		);
+	}
 	return anthropicModel;
 }
 

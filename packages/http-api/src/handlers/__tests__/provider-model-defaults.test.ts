@@ -77,8 +77,11 @@ describe("provider model defaults", () => {
 			"opus",
 			"sonnet",
 		]);
-		// Nothing read yet is a state to show, not a reason to hide the row.
-		expect(codex?.fields.every((f) => f.factory === null)).toBe(true);
+		// The compiled Codex map remains visible until account discovery replaces
+		// it; a cold listing is a fallback state, not an empty settings surface.
+		expect(codex?.fields.every((f) => typeof f.factory === "string")).toBe(
+			true,
+		);
 	});
 
 	// The override exists for the case where discovery has not answered — a cold
@@ -175,7 +178,7 @@ describe("provider model defaults", () => {
 	});
 
 	it("resolver returns factory when no override exists", () => {
-		expect(resolveProviderModelDefault("xai", "sonnet")).toBe("grok-4.3");
+		expect(resolveProviderModelDefault("xai", "sonnet")).toBe("grok-4.5");
 	});
 
 	it("GET lists only codex by default (CCFLARE_MODEL_DEFAULTS_PROVIDERS unset)", async () => {
@@ -235,7 +238,7 @@ describe("provider model defaults", () => {
 		await handlers.setProviderModelDefaults(
 			request([{ provider: "codex", family: "opus", model: "gpt-custom" }]),
 		);
-		expect(resolveProviderModelDefault("xai", "sonnet")).toBe("grok-4.3");
+		expect(resolveProviderModelDefault("xai", "sonnet")).toBe("grok-4.5");
 	});
 
 	it("codex keeps translating even when left out of CCFLARE_MODEL_DEFAULTS_PROVIDERS", async () => {

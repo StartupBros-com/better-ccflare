@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BUFFER_SIZES } from "@better-ccflare/core";
 import { CODEX_LOGICAL_MODEL_FAMILY_HEADER } from "@better-ccflare/http-common";
+import { setDerivedProviderModelDefaults } from "../../provider-model-defaults";
 import { fetchCodexUsageOnDemand } from "./on-demand-fetch";
 import {
 	CODEX_SINGLE_ORCHESTRATION_ROOT_ENV,
@@ -66,8 +67,10 @@ describe("CodexProvider request conversion", () => {
 		}
 		expect(
 			provider.getLogicalModelCapability("claude-fable-5", {} as never),
-		).toMatchObject({ status: "unsupported", provenance: "provider_default" });
-		expect(resolveCodexRequestModel("claude-fable-5")).toBe("claude-fable-5");
+		).toMatchObject({ status: "supported", provenance: "provider_default" });
+		expect(resolveCodexRequestModel("claude-fable-5")).not.toBe(
+			"claude-fable-5",
+		);
 	});
 
 	it("handles messages and synthetic count_tokens paths", () => {
@@ -6398,7 +6401,7 @@ describe("CodexProvider.transformRequestBody", () => {
 		const transformed = await provider.transformRequestBody(request, undefined);
 		const body = await transformed.json();
 
-		expect(body.model).toBe("claude-3-7-sonnet");
+		expect(body.model).toBe(resolveCodexRequestModel("claude-3-7-sonnet"));
 	});
 
 	// Regression: mapModel translates by substring and had no branch for
