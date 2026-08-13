@@ -7031,9 +7031,12 @@ describe("CodexProvider.transformRequestBody", () => {
 			// recorded lineage and is admitted as root (basis: lineage_match), not
 			// demoted.
 			expect(requestTrace).toMatchObject({
-				trace_schema_version: 16,
+				trace_schema_version: 17,
 				orchestration_admission: "root",
 				orchestration_basis: "lineage_match",
+				cache_key_continuity_basis: "lineage_match",
+				cache_key_continuity_applied: false,
+				canonical_conversation_id: null,
 				orchestration_demotion_observed: false,
 			});
 			expect(requestTrace?.elapsed_ms_since_root).toBeNull();
@@ -7278,7 +7281,7 @@ describe("CodexProvider.transformRequestBody", () => {
 				(record) => record.phase === "request",
 			);
 			expect(requestTrace).toMatchObject({
-				trace_schema_version: 16,
+				trace_schema_version: 17,
 				orchestration_admission: "attributed_descendant",
 				orchestration_basis: null,
 				is_descendant: true,
@@ -7403,10 +7406,11 @@ describe("CodexProvider.transformRequestBody", () => {
 			messages?: Array<Record<string, unknown>>,
 			account?: Parameters<CodexProvider["transformRequestBody"]>[1],
 			tools?: Array<Record<string, unknown>>,
+			headers: Record<string, string> = {},
 		) => {
 			const request = new Request("https://example.com/v1/messages", {
 				method: "POST",
-				headers: { "content-type": "application/json" },
+				headers: { "content-type": "application/json", ...headers },
 				body: JSON.stringify({
 					model: "claude-opus-4-8",
 					max_tokens: 10,
@@ -7511,9 +7515,11 @@ describe("CodexProvider.transformRequestBody", () => {
 			expect(sibling.prompt_cache_key).not.toBe(first.prompt_cache_key);
 		});
 
-		it("reuses the canonical root key for treated compaction continuations only", async () => {
+		it("reuses and traces the canonical root key for treated compaction continuations only", async () => {
 			process.env[CODEX_PROMPT_CACHE_KEY_ENV] = "1";
 			process.env[CODEX_CACHE_KEY_CONTINUITY_PERCENT_ENV] = "100";
+			const traceDir = mkdtempSync(join(tmpdir(), "codex-continuity-trace-"));
+			process.env[CODEX_TRACE_DIR_ENV] = traceDir;
 			const tools = [{ name: "Agent", input_schema: { type: "object" } }];
 			const rootMessages = [
 				{ role: "user", content: "start" },
@@ -7542,6 +7548,7 @@ describe("CodexProvider.transformRequestBody", () => {
 				rootMessages,
 				undefined,
 				tools,
+				{ "x-better-ccflare-request-id": "treated-root" },
 			);
 			const treatedCompacted = await transform(
 				sessionA,
@@ -7550,11 +7557,42 @@ describe("CodexProvider.transformRequestBody", () => {
 				compactedMessages,
 				undefined,
 				tools,
+				{ "x-better-ccflare-request-id": "treated-compacted" },
 			);
 			expect(treatedCompacted.prompt_cache_key).toBe(
 				treatedRoot.prompt_cache_key,
 			);
+			const treatedRecords = readTraceRecords(traceDir).filter(
+				(record) => record.phase === "request",
+			);
+			const treatedRootTrace = treatedRecords.find(
+				(record) => record.request_id === "treated-root",
+			);
+			const treatedCompactedTrace = treatedRecords.find(
+				(record) => record.request_id === "treated-compacted",
+			);
+			expect(treatedRootTrace).toMatchObject({
+				trace_schema_version: 17,
+				cache_key_continuity_applied: true,
+			});
+			expect(treatedCompactedTrace).toMatchObject({
+				trace_schema_version: 17,
+				cache_key_continuity_basis: "lineage_match",
+				cache_key_continuity_applied: true,
+			});
+			expect(treatedRootTrace?.continuity_evidence_id).toBeString();
+			expect(treatedCompactedTrace?.continuity_evidence_id).toBe(
+				treatedRootTrace?.continuity_evidence_id,
+			);
+			expect(treatedRootTrace?.canonical_conversation_id).toBe(
+				treatedRootTrace?.continuity_evidence_id,
+			);
+			expect(treatedCompactedTrace?.canonical_conversation_id).toBe(
+				treatedRootTrace?.canonical_conversation_id,
+			);
 
+			delete process.env[CODEX_TRACE_DIR_ENV];
+			rmSync(traceDir, { recursive: true, force: true });
 			process.env[CODEX_CACHE_KEY_CONTINUITY_PERCENT_ENV] = "0";
 			resetOrchestrationElectionForTest();
 			const controlRoot = await transform(
@@ -7590,12 +7628,37 @@ describe("CodexProvider.transformRequestBody", () => {
 			expect(sibling.prompt_cache_key).toBe(first.prompt_cache_key);
 		});
 
-		it("gives the explicit session override precedence over canary control", async () => {
+		it("gives the explicit session override precedence and marks continuity inapplicable", async () => {
 			process.env[CODEX_PROMPT_CACHE_KEY_ENV] = "1";
 			process.env[CODEX_CACHE_KEY_SESSION_PERCENT_ENV] = "0";
 			process.env[CODEX_CACHE_KEY_MODE_ENV] = "session";
-			const body = await transform(sessionA);
-			expect(body.prompt_cache_key).toMatch(/^ccflare-session-/);
+			const traceDir = mkdtempSync(join(tmpdir(), "codex-session-trace-"));
+			process.env[CODEX_TRACE_DIR_ENV] = traceDir;
+			try {
+				const body = await transform(
+					sessionA,
+					"task A",
+					"shared system prompt",
+					undefined,
+					undefined,
+					undefined,
+					{ "x-better-ccflare-request-id": "session-mode" },
+				);
+				expect(body.prompt_cache_key).toMatch(/^ccflare-session-/);
+				const trace = readTraceRecords(traceDir).find(
+					(record) => record.request_id === "session-mode",
+				);
+				expect(trace).toMatchObject({
+					cache_key_mode: "session",
+					cache_key_continuity_basis: "session",
+					cache_key_continuity_applied: null,
+					continuity_evidence_id: null,
+					canonical_conversation_id: null,
+				});
+			} finally {
+				delete process.env[CODEX_TRACE_DIR_ENV];
+				rmSync(traceDir, { recursive: true, force: true });
+			}
 		});
 
 		it("preserves the session-key empty-input fallback", async () => {

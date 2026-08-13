@@ -515,7 +515,12 @@ export interface CodexPromptCacheKeyDecision {
 	effectiveMode: "conversation" | "session" | null;
 	cohortId: string | null;
 	conversationIdentity: string | null;
+	/** Canonical identity authorized by orchestration admission, if any. */
 	canonicalConversationIdentity: string | null;
+	/** Identity selected for the base cache key before any rescue salt. */
+	selectedConversationIdentity: string | null;
+	/** Whether canonical continuity was selected; null when ineligible/inapplicable. */
+	continuityApplied: boolean | null;
 	continuityBasis:
 		| "derived"
 		| "identity_match"
@@ -1296,8 +1301,16 @@ export class CodexProvider extends BaseProvider {
 					cacheKeyDecision.conversationIdentity?.slice(0, 16) ?? null,
 				cacheKeyAssignmentSource: cacheKeyDecision.assignmentSource,
 				cacheKeyContinuityBasis: cacheKeyDecision.continuityBasis,
-				canonicalConversationId:
-					cacheKeyDecision.canonicalConversationIdentity?.slice(0, 16) ?? null,
+				cacheKeyContinuityApplied: cacheKeyDecision.continuityApplied,
+				continuityEvidenceId:
+					cacheKeyDecision.effectiveMode === "conversation"
+						? (cacheKeyDecision.canonicalConversationIdentity?.slice(0, 16) ??
+							null)
+						: null,
+				canonicalConversationId: cacheKeyDecision.continuityApplied
+					? (cacheKeyDecision.selectedConversationIdentity?.slice(0, 16) ??
+						null)
+					: null,
 				explicitBreakpointCanary: explicitBreakpointDecision.canary,
 				explicitBreakpointCohortId: explicitBreakpointDecision.cohortId,
 				explicitBreakpointAction: explicitBreakpointDecision.action,
@@ -1742,6 +1755,8 @@ export class CodexProvider extends BaseProvider {
 			cohortId: null,
 			conversationIdentity: null,
 			canonicalConversationIdentity: null,
+			selectedConversationIdentity: null,
+			continuityApplied: null,
 			continuityBasis: "ineligible",
 			webSocketConversationIdentity: null,
 		};
@@ -1784,6 +1799,10 @@ export class CodexProvider extends BaseProvider {
 						: orchestrationResult?.basis === "rejected"
 							? "rejected"
 							: "derived";
+		const continuityApplied =
+			effectiveMode === "conversation"
+				? Boolean(continuityTreatment && canonicalConversationIdentity)
+				: null;
 		const selectedConversationIdentity =
 			effectiveMode === "conversation" &&
 			continuityTreatment &&
@@ -1823,6 +1842,8 @@ export class CodexProvider extends BaseProvider {
 				.slice(0, 16),
 			conversationIdentity,
 			canonicalConversationIdentity,
+			selectedConversationIdentity,
+			continuityApplied,
 			continuityBasis,
 			webSocketConversationIdentity,
 		};
