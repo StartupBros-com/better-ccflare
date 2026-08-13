@@ -7,6 +7,7 @@ import {
 	buildPoolFloorEvent,
 	emitPoolFloorEvent,
 	MAX_POOL_FLOOR_ACCOUNTS,
+	MAX_POOL_FLOOR_THROTTLE_KEYS,
 	poolFloorApproachingThreshold,
 	shouldEmitPoolFloorEvent,
 } from "../pool-floor-event";
@@ -310,6 +311,41 @@ describe("shouldEmitPoolFloorEvent", () => {
 		shouldEmitPoolFloorEvent(state, "sonnet", "approaching", NOW);
 		// Escalation must always get through — that is the alarm that matters.
 		expect(shouldEmitPoolFloorEvent(state, "sonnet", "floor", NOW)).toBe(true);
+	});
+
+	it("stays bounded when a caller sends unbounded distinct lanes", () => {
+		// `lane` is the effective model, which a client can vary freely. Without
+		// a cap this map would grow for the life of the process.
+		const state = new Map<string, number>();
+		for (let i = 0; i < MAX_POOL_FLOOR_THROTTLE_KEYS * 4; i++) {
+			shouldEmitPoolFloorEvent(state, `lane-${i}`, "floor", NOW);
+		}
+		expect(state.size).toBeLessThanOrEqual(MAX_POOL_FLOOR_THROTTLE_KEYS);
+	});
+
+	it("drops keys that are past the throttle window before evicting live ones", () => {
+		const state = new Map<string, number>();
+		for (let i = 0; i < MAX_POOL_FLOOR_THROTTLE_KEYS; i++) {
+			shouldEmitPoolFloorEvent(state, `stale-${i}`, "floor", NOW);
+		}
+		// Every prior key is now outside the window, so admitting a new lane
+		// should reclaim them rather than evict anything still suppressing.
+		const later = NOW + 60_001;
+		expect(shouldEmitPoolFloorEvent(state, "fresh", "floor", later)).toBe(true);
+		expect(state.size).toBe(1);
+	});
+
+	it("still admits a new lane once the map is saturated", () => {
+		// The cap must bound memory without ever costing an operator an alarm for
+		// a lane that has not been seen before.
+		const state = new Map<string, number>();
+		for (let i = 0; i < MAX_POOL_FLOOR_THROTTLE_KEYS * 2; i++) {
+			shouldEmitPoolFloorEvent(state, `lane-${i}`, "floor", NOW);
+		}
+		expect(
+			shouldEmitPoolFloorEvent(state, "brand-new-lane", "floor", NOW),
+		).toBe(true);
+		expect(state.size).toBeLessThanOrEqual(MAX_POOL_FLOOR_THROTTLE_KEYS);
 	});
 });
 

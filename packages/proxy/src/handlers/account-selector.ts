@@ -907,6 +907,16 @@ function saveCapacityContext(
 	meta: RequestMeta,
 	effectiveModel: string | null,
 	exclusions: readonly RoutingCapacityCandidateExclusion[],
+	/**
+	 * Pool sizes for the alarm, when the caller knows them but `meta` does not.
+	 *
+	 * The force-route path deliberately leaves `routingCandidateCatalog` and
+	 * `routingCandidates` null (it never builds a catalog), so reading them here
+	 * would report an unknown pool and silently skip the alarm on exactly the
+	 * path that produces route_unavailable. Telemetry only — passing counts here
+	 * does not write routing state.
+	 */
+	poolCounts?: { before: number | null; after: number | null },
 ): void {
 	const now = Date.now();
 	const futureRecoveries = exclusions
@@ -932,8 +942,12 @@ function saveCapacityContext(
 	emitPoolFloorEvent(log, poolFloorAlarmState, {
 		lane: effectiveModel,
 		modelFamily: effectiveModelFamily,
-		candidatesBefore: meta.routingCandidateCatalog?.length ?? null,
-		candidatesAfter: meta.routingCandidates?.length ?? null,
+		candidatesBefore: poolCounts
+			? poolCounts.before
+			: (meta.routingCandidateCatalog?.length ?? null),
+		candidatesAfter: poolCounts
+			? poolCounts.after
+			: (meta.routingCandidates?.length ?? null),
 		exclusions,
 		now,
 		approachingThreshold: poolFloorApproachingThreshold(
@@ -1996,7 +2010,13 @@ async function selectAccountsForRequestInternal(
 							evaluation,
 							"force",
 						);
-						saveCapacityContext(meta, effectiveModel, [exclusion]);
+						// A force-route considers exactly one account, and this branch
+						// is the case where capacity excluded it. That is a floor: the
+						// caller's lane has nothing left to route to.
+						saveCapacityContext(meta, effectiveModel, [exclusion], {
+							before: 1,
+							after: 0,
+						});
 						const accountWide = evaluation.blockers.some(
 							(blocker) => blocker.scope === "account",
 						);
