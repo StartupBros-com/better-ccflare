@@ -72,9 +72,11 @@ import {
 	getUsageThrottleUntil,
 	interceptAndModifyRequest,
 	isInternalProbe,
+	isPreparedProxyAccountResponse,
 	isRefreshTokenLikelyExpired,
 	type ModelFallbackExecutionPolicy,
 	mergeTerminalAccountState,
+	type PreparedProxyAccountResponse,
 	type ProxyContext,
 	prepareRequestBody,
 	proxyUnauthenticated,
@@ -1995,6 +1997,7 @@ async function handleProxyCore(
 		const comboSlotIndex = requestMeta.comboSlotIndex ?? null;
 		return {
 			routeCandidateId: candidateId,
+			prepareFinalResponse: true,
 			forwardModelUnavailableResponse,
 			comboModelOverrideFrom,
 			// proxyWithAccount combines this currently-known queue finality with its
@@ -2025,12 +2028,14 @@ async function handleProxyCore(
 			},
 		};
 	};
+	const hasRetainedContextOverflowTerminal = (): boolean =>
+		routingAttemptLedger.hasRetainedTerminalKind("legacy_context_overflow") ||
+		routingAttemptLedger.hasRetainedTerminalKind(
+			"authoritative_context_overflow",
+		);
 	const hasPreferredContextOverflowRoute = (): boolean =>
 		preferredContextOverflowRouteKey !== null &&
-		(routingAttemptLedger.hasRetainedTerminalKind("legacy_context_overflow") ||
-			routingAttemptLedger.hasRetainedTerminalKind(
-				"authoritative_context_overflow",
-			));
+		hasRetainedContextOverflowTerminal();
 	const deliverRetainedTerminalResponse = async (
 		retainedTerminalResponse = routingAttemptLedger.takeTerminalResponse(),
 	): Promise<Response | null> => {
@@ -2049,22 +2054,61 @@ async function handleProxyCore(
 		}
 		return delivered;
 	};
+	type SettledRouteResponse = {
+		readonly response: Response;
+		readonly candidateWon: boolean;
+	};
 	const settleRoutedResponse = async (
-		candidateResponse: Response,
-	): Promise<Response> => {
-		if (candidateResponse.ok) {
+		candidate: PreparedProxyAccountResponse | Response,
+	): Promise<SettledRouteResponse | null> => {
+		if (req.signal.aborted) {
+			try {
+				if (isPreparedProxyAccountResponse(candidate)) {
+					await candidate.discard("caller cancelled request");
+				} else {
+					await discardUpstreamBody(candidate);
+				}
+			} catch {
+				// Cancellation remains authoritative over best-effort body cleanup.
+			}
+			try {
+				await routingAttemptLedger.discardTerminalResponse();
+			} catch {
+				// Cancellation remains authoritative over best-effort body cleanup.
+			}
+			return {
+				response: new Response(null, { status: 499 }),
+				candidateWon: false,
+			};
+		}
+		if (!isPreparedProxyAccountResponse(candidate)) {
 			await routingAttemptLedger.discardTerminalResponse();
-			return candidateResponse;
+			return { response: candidate, candidateWon: true };
+		}
+		// Caller cancellation owns the terminal even when an earlier route left a
+		// retained upstream response. Key this to the request signal rather than an
+		// HTTP status: an upstream provider is allowed to return its own 499.
+		if (candidate.disposition === "irreversible_no_replay") {
+			await routingAttemptLedger.discardTerminalResponse();
+			return { response: await candidate.commit(), candidateWon: true };
+		}
+		if (candidate.response.ok && candidate.canSupersedeRetainedTerminal()) {
+			await routingAttemptLedger.discardTerminalResponse();
+			return { response: await candidate.commit(), candidateWon: true };
+		}
+		// A failed or rescue-incompatible non-final candidate is only one queue
+		// member. Release it without consuming the retained terminal, then let the
+		// caller resume the untouched selected/combo/session/deferred tail.
+		if (!candidate.isFinalAttempt && candidate.continueAfterOrdinaryFailure) {
+			await candidate.discard("non-final route did not produce a winner");
+			return null;
 		}
 		const retainedTerminalResponse = await deliverRetainedTerminalResponse();
-		if (!retainedTerminalResponse) return candidateResponse;
-		void candidateResponse.body
-			?.cancel("superseded by retained upstream terminal")
-			.catch(() => {
-				// Best-effort release: the chosen retained response must not wait on
-				// a failed fallback body's transport cleanup.
-			});
-		return retainedTerminalResponse;
+		if (!retainedTerminalResponse) {
+			return { response: await candidate.commit(), candidateWon: true };
+		}
+		await candidate.discard("superseded by retained upstream terminal");
+		return { response: retainedTerminalResponse, candidateWon: false };
 	};
 	const recordServerToolCandidateCapabilityFailure = (
 		error: ServerToolCandidateCapabilityError,
@@ -2171,6 +2215,14 @@ async function handleProxyCore(
 			// The typed denial already owns the terminal response.
 		}
 		if (denial.retainedTrustedResponse) {
+			try {
+				await routingAttemptLedger.discardTerminalResponse();
+			} catch (error) {
+				log.warn("retained_terminal_discard_failed_before_trusted_overload", {
+					requestId: requestMeta.id,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
 			return createProtectedAnthropicOverloadResponse({
 				kind: "trusted_upstream",
 				response: denial.retainedTrustedResponse,
@@ -2208,6 +2260,205 @@ async function handleProxyCore(
 	const reactiveDepletionSkips: Account[] = [];
 	const deferredReactiveDepletionSkips: Account[] = [];
 	const betaSignature = req.headers.get("anthropic-beta");
+	const attemptDeferredRoute = async (
+		route: DeferredModelRoute,
+		isFinalDeferredRoute: boolean,
+		probeAdmission: ReturnType<typeof getRateLimitProbeAdmission> | null,
+	): Promise<Response | null> => {
+		requestMeta.comboName = route.comboName;
+		requestMeta.comboSlotIndex = route.comboSlotIndex;
+		log.info(
+			`Attempting deferred route candidate=${route.candidateId} account=${route.account.name} model=${route.model}`,
+		);
+		const attemptedBefore = routingAttemptLedger.attemptedCount;
+		try {
+			response = await proxyWithAccount(
+				req,
+				url,
+				route.account,
+				requestMeta,
+				finalBodyBuffer,
+				finalCreateBodyStream,
+				upstreamAttempts,
+				ctx,
+				route.model,
+				apiKeyId,
+				apiKeyName,
+				finalRequestBodyContext,
+				isFinalDeferredRoute,
+				contextAdmissionTracker,
+				routingAttemptLedger,
+				{
+					routeCandidateId: route.candidateId,
+					prepareFinalResponse: true,
+					continueAfterPreparedFailure: !isFinalDeferredRoute,
+					recomputeServerToolCapability: true,
+					implicitFallbacksEnabled: false,
+					forwardModelUnavailableResponse: isFinalDeferredRoute,
+					isFinalSemanticAttempt: () => isFinalDeferredRoute,
+					anthropicPreCommitRescue: activeAnthropicPreCommitRescue,
+				},
+				anthropicDegradedSendState,
+			);
+		} catch (error) {
+			if (error instanceof ServerToolCandidateCapabilityError) {
+				upstreamAttempts +=
+					routingAttemptLedger.attemptedCount - attemptedBefore;
+				const forcedResponse = recordServerToolCandidateCapabilityFailure(
+					error,
+					attemptedBefore,
+				);
+				if (forcedResponse) {
+					return finishPacing(pacingSlot, forcedResponse);
+				}
+				return null;
+			}
+			await routingAttemptLedger.discardTerminalResponse();
+			throw error;
+		} finally {
+			if (probeAdmission === "admitted") {
+				completeRateLimitProbe(route.account, "abandoned");
+			}
+		}
+		upstreamAttempts += routingAttemptLedger.attemptedCount - attemptedBefore;
+
+		if (isAnthropicDegradedSendDenied(response)) {
+			return finishPacing(
+				pacingSlot,
+				await deliverAnthropicDegradedDenial(response),
+			);
+		}
+		if (!response) return null;
+
+		const settled = await settleRoutedResponse(response);
+		if (!settled) return null;
+		if (settled.candidateWon) {
+			recordXaiAffinityIfServed(
+				settled.response,
+				route.account,
+				route.candidateId,
+			);
+			recordCachePacingRoute(
+				pacingObservation,
+				{
+					accountId: route.account.id,
+					accountName: route.account.name,
+					provider: route.account.provider,
+				},
+				{
+					candidate: pacingEligible,
+					assignedBypass: assignedCodexPacingBypass,
+				},
+			);
+		}
+		return finishPacing(pacingSlot, settled.response);
+	};
+	const attemptPreferredContextOverflowRoute = async (
+		hasRemainingTailRoutes: boolean,
+	): Promise<Response | null> => {
+		if (
+			!hasPreferredContextOverflowRoute() ||
+			preferredContextOverflowRouteKey === null
+		) {
+			return null;
+		}
+		const preferredRouteIndex = deferredModelRoutes.findIndex(
+			(route) => route.routeKey === preferredContextOverflowRouteKey,
+		);
+		if (preferredRouteIndex < 0) {
+			preferredContextOverflowRouteKey = null;
+			return null;
+		}
+		const route = deferredModelRoutes[preferredRouteIndex];
+		const consumePreferredRoute = (): void => {
+			const currentIndex = deferredModelRoutes.findIndex(
+				(candidate) => candidate.routeKey === route.routeKey,
+			);
+			if (currentIndex >= 0) deferredModelRoutes.splice(currentIndex, 1);
+			// The key remains claimed in deferredModelRouteKeys so later discovery
+			// cannot retry the same exact account/model pair.
+			preferredContextOverflowRouteKey = null;
+		};
+
+		const now = Date.now();
+		const predictiveThrottleUntil =
+			trustedInternalAutoRefresh || trustedInternalKeepalive
+				? null
+				: getPredictiveThrottleUntil(route.account, route.model, now);
+		if (predictiveThrottleUntil !== null && predictiveThrottleUntil > now) {
+			consumePreferredRoute();
+			if (
+				!deferredPredictivelyThrottledAccounts.some(
+					(account) => account.id === route.account.id,
+				)
+			) {
+				deferredPredictivelyThrottledAccounts.push(route.account);
+			}
+			return null;
+		}
+
+		if (
+			hasReactiveModelDepletion({
+				accountId: route.account.id,
+				model: route.model,
+				betaSignature,
+				syntheticProbe,
+			})
+		) {
+			consumePreferredRoute();
+			reactiveDepletionSkips.push(route.account);
+			if (
+				!deferredReactiveDepletionSkips.some(
+					(account) => account.id === route.account.id,
+				)
+			) {
+				deferredReactiveDepletionSkips.push(route.account);
+			}
+			if (contextAdmissionTracker) {
+				contextAdmissionTracker.nonCapacitySkipCount++;
+			}
+			return null;
+		}
+		if (
+			pacingBypassed &&
+			!crossoverPacingRestored &&
+			route.account.provider !== "codex"
+		) {
+			pacingObservation = await observeCachePacing({
+				sessionKey: requestMeta.clientSessionId,
+				model: effectiveModel,
+			});
+			pacingSlot = pacingObservation?.slot ?? null;
+			crossoverPacingRestored = true;
+			pacingBypassed = false;
+			requestMeta.codexPacingAction = "crossover-paced";
+		}
+
+		const probeAdmission = getRateLimitProbeAdmission(route.account);
+		if (probeAdmission === "suppressed") {
+			// Suppression demotes rather than consumes this route. Clear only its
+			// immediate preference so the remaining account/session queues can run;
+			// the deferred phase retains one bounded ungated retry.
+			preferredContextOverflowRouteKey = null;
+			if (contextAdmissionTracker) {
+				contextAdmissionTracker.nonCapacitySkipCount++;
+			}
+			return null;
+		}
+
+		// Probe suppression is temporary and leaves the route in the deferred
+		// queue for its existing bounded ungated safeguard. Every admitted route
+		// is consumed exactly once before transport.
+		consumePreferredRoute();
+		// A promoted route is never terminal while execution can resume in the
+		// selected/combo/session queue that discovered it. Any stronger terminal
+		// it records stays retained and wins only if every tail route also fails.
+		return attemptDeferredRoute(
+			route,
+			!hasRemainingTailRoutes && deferredModelRoutes.length === 0,
+			probeAdmission,
+		);
+	};
 
 	for (let i = 0; i < accounts.length; i++) {
 		// A Codex treatment may fail over to Anthropic. Before the first
@@ -2357,25 +2608,34 @@ async function handleProxyCore(
 			);
 		}
 		if (response) {
-			response = await settleRoutedResponse(response);
-			recordXaiAffinityIfServed(response, accounts[i], candidateId);
-			recordCachePacingRoute(
-				pacingObservation,
-				{
-					accountId: accounts[i].id,
-					accountName: accounts[i].name,
-					provider: accounts[i].provider,
-				},
-				{
-					candidate: pacingEligible,
-					assignedBypass: assignedCodexPacingBypass,
-				},
-			);
-			return finishPacing(pacingSlot, response);
+			const settled = await settleRoutedResponse(response);
+			if (settled) {
+				if (settled.candidateWon) {
+					recordXaiAffinityIfServed(settled.response, accounts[i], candidateId);
+					recordCachePacingRoute(
+						pacingObservation,
+						{
+							accountId: accounts[i].id,
+							accountName: accounts[i].name,
+							provider: accounts[i].provider,
+						},
+						{
+							candidate: pacingEligible,
+							assignedBypass: assignedCodexPacingBypass,
+						},
+					);
+				}
+				return finishPacing(pacingSlot, settled.response);
+			}
 		}
-		if (hasPreferredContextOverflowRoute()) {
-			break;
-		}
+		const preferredResponse = await attemptPreferredContextOverflowRoute(
+			accounts
+				.slice(i + 1)
+				.some((candidate) => !wouldSuppressProbe(candidate)) ||
+				(filteredComboInfo?.comboName != null &&
+					!isComboSessionFallbackDisabled()),
+		);
+		if (preferredResponse) return preferredResponse;
 
 		// Log combo slot failure
 		if (filteredComboInfo) {
@@ -2470,22 +2730,30 @@ async function handleProxyCore(
 			);
 		}
 		if (response) {
-			response = await settleRoutedResponse(response);
-			recordXaiAffinityIfServed(response, accounts[i], candidateId);
-			recordCachePacingRoute(
-				pacingObservation,
-				{
-					accountId: accounts[i].id,
-					accountName: accounts[i].name,
-					provider: accounts[i].provider,
-				},
-				{
-					candidate: pacingEligible,
-					assignedBypass: assignedCodexPacingBypass,
-				},
-			);
-			return finishPacing(pacingSlot, response);
+			const settled = await settleRoutedResponse(response);
+			if (settled) {
+				if (settled.candidateWon) {
+					recordXaiAffinityIfServed(settled.response, accounts[i], candidateId);
+					recordCachePacingRoute(
+						pacingObservation,
+						{
+							accountId: accounts[i].id,
+							accountName: accounts[i].name,
+							provider: accounts[i].provider,
+						},
+						{
+							candidate: pacingEligible,
+							assignedBypass: assignedCodexPacingBypass,
+						},
+					);
+				}
+				return finishPacing(pacingSlot, settled.response);
+			}
 		}
+		const preferredResponse = await attemptPreferredContextOverflowRoute(
+			filteredComboInfo?.comboName != null && !isComboSessionFallbackDisabled(),
+		);
+		if (preferredResponse) return preferredResponse;
 	}
 
 	// 10. Combo fallback: if combo routing was active and all slots failed,
@@ -2494,8 +2762,12 @@ async function handleProxyCore(
 	let reactivelyDepletedFallbackAccounts: Account[] = [];
 	let throttledFallbackAccounts: Account[] = [];
 	let fallbackSelectionHadNoAvailable = false;
-	if (filteredComboInfo?.comboName && !hasPreferredContextOverflowRoute()) {
+	if (filteredComboInfo?.comboName) {
 		if (isComboSessionFallbackDisabled()) {
+			// Policy disables the only remaining queue. A retained upstream terminal
+			// has no future owner here, so release its body/lifecycle before returning
+			// the explicit local policy response.
+			await routingAttemptLedger.discardTerminalResponse();
 			if (hasExhaustedLocalServerToolCapabilityFailures()) {
 				cacheBodyStore.discardStaged(requestMeta.id);
 				return finishPacing(
@@ -2718,25 +2990,36 @@ async function handleProxyCore(
 					);
 				}
 				if (response) {
-					response = await settleRoutedResponse(response);
-					recordXaiAffinityIfServed(response, fallbackAccounts[i], candidateId);
-					recordCachePacingRoute(
-						pacingObservation,
-						{
-							accountId: fallbackAccounts[i].id,
-							accountName: fallbackAccounts[i].name,
-							provider: fallbackAccounts[i].provider,
-						},
-						{
-							candidate: pacingEligible,
-							assignedBypass: assignedCodexPacingBypass,
-						},
-					);
-					return finishPacing(pacingSlot, response);
+					const settled = await settleRoutedResponse(response);
+					if (settled) {
+						if (settled.candidateWon) {
+							recordXaiAffinityIfServed(
+								settled.response,
+								fallbackAccounts[i],
+								candidateId,
+							);
+							recordCachePacingRoute(
+								pacingObservation,
+								{
+									accountId: fallbackAccounts[i].id,
+									accountName: fallbackAccounts[i].name,
+									provider: fallbackAccounts[i].provider,
+								},
+								{
+									candidate: pacingEligible,
+									assignedBypass: assignedCodexPacingBypass,
+								},
+							);
+						}
+						return finishPacing(pacingSlot, settled.response);
+					}
 				}
-				if (hasPreferredContextOverflowRoute()) {
-					break;
-				}
+				const preferredResponse = await attemptPreferredContextOverflowRoute(
+					fallbackAccounts
+						.slice(i + 1)
+						.some((candidate) => !wouldSuppressProbe(candidate)),
+				);
+				if (preferredResponse) return preferredResponse;
 			}
 
 			// Every candidate was single-flight probe-gate suppressed — no account
@@ -2806,21 +3089,29 @@ async function handleProxyCore(
 					);
 				}
 				if (response) {
-					response = await settleRoutedResponse(response);
-					recordXaiAffinityIfServed(response, fallbackAccounts[i], candidateId);
-					recordCachePacingRoute(
-						pacingObservation,
-						{
-							accountId: fallbackAccounts[i].id,
-							accountName: fallbackAccounts[i].name,
-							provider: fallbackAccounts[i].provider,
-						},
-						{
-							candidate: pacingEligible,
-							assignedBypass: assignedCodexPacingBypass,
-						},
-					);
-					return finishPacing(pacingSlot, response);
+					const settled = await settleRoutedResponse(response);
+					if (settled) {
+						if (settled.candidateWon) {
+							recordXaiAffinityIfServed(
+								settled.response,
+								fallbackAccounts[i],
+								candidateId,
+							);
+							recordCachePacingRoute(
+								pacingObservation,
+								{
+									accountId: fallbackAccounts[i].id,
+									accountName: fallbackAccounts[i].name,
+									provider: fallbackAccounts[i].provider,
+								},
+								{
+									candidate: pacingEligible,
+									assignedBypass: assignedCodexPacingBypass,
+								},
+							);
+						}
+						return finishPacing(pacingSlot, settled.response);
+					}
 				}
 			}
 		} else if (
@@ -2964,92 +3255,31 @@ async function handleProxyCore(
 		log.info(
 			`Requested-family routes exhausted; trying ${orderedDeferredModelRoutes.length} deferred degradation route(s)`,
 		);
-		const attemptDeferredRoute = async (
-			route: DeferredModelRoute,
-			isFinalDeferredRoute: boolean,
-			probeAdmission: ReturnType<typeof getRateLimitProbeAdmission> | null,
-		): Promise<Response | null> => {
-			requestMeta.comboName = route.comboName;
-			requestMeta.comboSlotIndex = route.comboSlotIndex;
-			log.info(
-				`Attempting deferred route candidate=${route.candidateId} account=${route.account.name} model=${route.model}`,
-			);
-			const attemptedBefore = routingAttemptLedger.attemptedCount;
-			try {
-				response = await proxyWithAccount(
-					req,
-					url,
-					route.account,
-					requestMeta,
-					finalBodyBuffer,
-					finalCreateBodyStream,
-					upstreamAttempts,
-					ctx,
-					route.model,
-					apiKeyId,
-					apiKeyName,
-					finalRequestBodyContext,
-					isFinalDeferredRoute,
-					contextAdmissionTracker,
-					routingAttemptLedger,
-					{
-						routeCandidateId: route.candidateId,
-						recomputeServerToolCapability: true,
-						implicitFallbacksEnabled: false,
-						forwardModelUnavailableResponse: isFinalDeferredRoute,
-						isFinalSemanticAttempt: () => isFinalDeferredRoute,
-						anthropicPreCommitRescue: activeAnthropicPreCommitRescue,
-					},
-					anthropicDegradedSendState,
-				);
-			} catch (error) {
-				if (error instanceof ServerToolCandidateCapabilityError) {
-					upstreamAttempts +=
-						routingAttemptLedger.attemptedCount - attemptedBefore;
-					const forcedResponse = recordServerToolCandidateCapabilityFailure(
-						error,
-						attemptedBefore,
-					);
-					if (forcedResponse) {
-						return finishPacing(pacingSlot, forcedResponse);
-					}
-					return null;
-				}
-				await routingAttemptLedger.discardTerminalResponse();
-				throw error;
-			} finally {
-				if (probeAdmission === "admitted") {
-					completeRateLimitProbe(route.account, "abandoned");
-				}
-			}
-			upstreamAttempts += routingAttemptLedger.attemptedCount - attemptedBefore;
-
-			if (isAnthropicDegradedSendDenied(response)) {
-				return finishPacing(
-					pacingSlot,
-					await deliverAnthropicDegradedDenial(response),
-				);
-			}
-			if (!response) return null;
-
-			response = await settleRoutedResponse(response);
-			recordXaiAffinityIfServed(response, route.account, route.candidateId);
-			recordCachePacingRoute(
-				pacingObservation,
-				{
-					accountId: route.account.id,
-					accountName: route.account.name,
-					provider: route.account.provider,
-				},
-				{
-					candidate: pacingEligible,
-					assignedBypass: assignedCodexPacingBypass,
-				},
-			);
-			return finishPacing(pacingSlot, response);
-		};
 		let anyDeferredRouteCrossedTransport = false;
 		let firstProbeSuppressedDeferredRoute: DeferredModelRoute | null = null;
+		const deferredRouteWouldCrossTransport = (
+			route: DeferredModelRoute,
+		): boolean => {
+			const now = Date.now();
+			const predictiveThrottleUntil =
+				trustedInternalAutoRefresh || trustedInternalKeepalive
+					? null
+					: getPredictiveThrottleUntil(route.account, route.model, now);
+			if (predictiveThrottleUntil !== null && predictiveThrottleUntil > now) {
+				return false;
+			}
+			if (
+				hasReactiveModelDepletion({
+					accountId: route.account.id,
+					model: route.model,
+					betaSignature,
+					syntheticProbe,
+				})
+			) {
+				return false;
+			}
+			return !wouldSuppressProbe(route.account);
+		};
 		for (let i = 0; i < orderedDeferredModelRoutes.length; i++) {
 			const route = orderedDeferredModelRoutes[i];
 			requestMeta.comboName = route.comboName;
@@ -3116,9 +3346,12 @@ async function handleProxyCore(
 			}
 
 			const attemptedBeforeDeferredRoute = routingAttemptLedger.attemptedCount;
+			const isFinalExecutableDeferredRoute = orderedDeferredModelRoutes
+				.slice(i + 1)
+				.every((candidate) => !deferredRouteWouldCrossTransport(candidate));
 			const finalResponse = await attemptDeferredRoute(
 				route,
-				i === orderedDeferredModelRoutes.length - 1,
+				isFinalExecutableDeferredRoute,
 				probeAdmission,
 			);
 			if (routingAttemptLedger.attemptedCount > attemptedBeforeDeferredRoute) {

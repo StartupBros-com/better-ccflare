@@ -119,9 +119,11 @@ describe("issue #273 — Group A: helper contract", () => {
 // This is a census, not a ceiling: a new body-replacing retry legitimately adds
 // a site, and the count moves with it in the same commit. What the guard
 // catches is a site DISAPPEARING (a leak) or being added without the drain.
-// 15 since the Codex reasoning strip-and-retry (issue #144) joined the
-// thinking-signature, clear-thinking, cache-control and breakpoint retries.
-const EXPECTED_SITE_COUNT = 15;
+// 17 since every generic prepared response loser now uses the drain-backed
+// release seam, alongside the prepared model-unavailable and Codex retry
+// drains. This specifically guards outer winner arbitration from regressing
+// to Bun's ineffective direct body.cancel path.
+const EXPECTED_SITE_COUNT = 17;
 
 describe("issue #273 — Group B: call-site coverage in proxy-operations.ts", () => {
 	it("proxy-operations.ts has the expected drain-backed discard call sites", () => {

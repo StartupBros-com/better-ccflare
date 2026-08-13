@@ -374,7 +374,14 @@ function timer<T>(
 	};
 }
 
-function isSuccessfulSse(response: Response): boolean {
+/**
+ * Whether a routed response can be spliced into an already-committed rescue.
+ * Keep this shared with outer route arbitration: a generic HTTP 200 cannot
+ * displace a truthful retained terminal once the client has been promised SSE.
+ */
+export function isSuccessfulAnthropicPreCommitRescueSse(
+	response: Response,
+): boolean {
 	return (
 		response.ok &&
 		response.body !== null &&
@@ -451,12 +458,21 @@ function createRescueResponse(
 		}
 		await cancelResponseBody(response, reason);
 	};
-	const cancelLateResponse = (reason: unknown): void => {
-		void outcomePromise.then((lateOutcome) => {
-			if (lateOutcome.kind === "response") {
-				void cancelResolvedResponseOnce(lateOutcome.response, reason);
-			}
-		});
+	const cancelLateResponse = async (reason: unknown): Promise<void> => {
+		const lateOutcome = await outcomePromise;
+		if (lateOutcome.kind === "response") {
+			await cancelResolvedResponseOnce(lateOutcome.response, reason);
+		}
+	};
+	const waitForCancellationCleanup = async (
+		cleanup: Promise<void>,
+	): Promise<void> => {
+		// Give an abort-responsive route enough time to expose and release its
+		// upstream body, but never let a provider that ignores abort (or a reader
+		// whose cancel promise stalls) block downstream cancellation indefinitely.
+		const cleanupGrace = timer(Symbol("rescue-cancel-cleanup-grace"), 25);
+		await Promise.race([cleanup, cleanupGrace.promise]);
+		cleanupGrace.cancel();
 	};
 	const reportRescueTerminal = (
 		kind: AnthropicPreCommitRescueTerminalKind,
@@ -535,7 +551,7 @@ function createRescueResponse(
 				closeWithSanitizedError();
 				return;
 			}
-			if (!isSuccessfulSse(result.response)) {
+			if (!isSuccessfulAnthropicPreCommitRescueSse(result.response)) {
 				const authoritativeContextOverflow =
 					authoritativeContextOverflowTerminals.has(result.response);
 				reportRescueTerminal(
@@ -586,18 +602,20 @@ function createRescueResponse(
 			}
 		},
 
-		cancel(reason) {
+		async cancel(reason) {
 			if (cancelled) return;
 			cancelled = true;
 			stopTimers();
 			abortOnce(reason);
 			if (settledResult && settledResult !== DEADLINE_ELAPSED) {
 				if (settledResult.kind === "response") {
-					void cancelResolvedResponseOnce(settledResult.response, reason);
+					await waitForCancellationCleanup(
+						cancelResolvedResponseOnce(settledResult.response, reason),
+					);
 				}
 				return;
 			}
-			cancelLateResponse(reason);
+			await waitForCancellationCleanup(cancelLateResponse(reason));
 		},
 	});
 

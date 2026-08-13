@@ -45,8 +45,16 @@ import {
 } from "../anthropic-semantic-preflight";
 import { AnthropicStreamOutcomeTracker } from "../anthropic-stream-outcome";
 import { CacheAffinityOrderer } from "../cache-affinity-orderer";
+import { getCachePacingRouteStats, resetCachePacing } from "../cache-pacing";
+import type { CodexWebSocketReceipt } from "../codex-websocket-transport";
+import { codexWebSocketTransport } from "../codex-websocket-transport";
 import { DegradedOwnerOverlay } from "../degraded-owner-overlay";
 import type { ProxyContext } from "../handlers";
+import {
+	completeRateLimitProbe,
+	getRateLimitProbeAdmission,
+	resetRateLimitProbeGatesForTests,
+} from "../handlers/rate-limit-cooldown";
 import { stampInternalAutoRefreshAuth } from "../internal-probe-auth";
 import type { UsageCollector } from "../usage-collector";
 
@@ -87,9 +95,9 @@ mock.module("../handlers/discard-body-cancel", () => ({
 	drainBody,
 	cancelDiscardedResponseBody(response: Response | null | undefined): void {
 		if (!response) return;
+		discardedResponses.push(response);
 		const body = response.body;
 		if (!body || body.locked) return;
-		discardedResponses.push(response);
 		void drainBody(body).catch(() => {});
 	},
 }));
@@ -121,6 +129,8 @@ const RESCUE_DEADLINE_ENV = ANTHROPIC_PRECOMMIT_RESCUE_DEADLINE_ENV;
 const CONTEXT_ADMISSION_ENV = "CCFLARE_CONTEXT_ADMISSION";
 const CODEX_PROMPT_CACHE_KEY_ENV = "CCFLARE_CODEX_PROMPT_CACHE_KEY";
 const ACCOUNT_SELECTION_TIMEOUT_ENV = "CCFLARE_ACCOUNT_SELECTION_TIMEOUT_MS";
+const DISABLE_COMBO_SESSION_FALLBACK_ENV =
+	"CCFLARE_DISABLE_COMBO_SESSION_FALLBACK";
 
 const originalFetch = globalThis.fetch;
 const originalEnv = new Map(
@@ -137,10 +147,12 @@ const originalEnv = new Map(
 		CONTEXT_ADMISSION_ENV,
 		CODEX_PROMPT_CACHE_KEY_ENV,
 		ACCOUNT_SELECTION_TIMEOUT_ENV,
+		DISABLE_COMBO_SESSION_FALLBACK_ENV,
 	].map((name) => [name, process.env[name]] as const),
 );
 let restoreUsageCollector = (): void => {};
 let restoreCodexRefreshToken = (): void => {};
+let restoreCodexWebSocket = (): void => {};
 let usageHandleStart = mock((_message: unknown) => undefined);
 let usageHandleChunk = mock(
 	(_requestId: string, _data: Uint8Array) => undefined,
@@ -920,6 +932,7 @@ function makeCodexRequest(
 }
 
 beforeEach(() => {
+	resetCachePacing();
 	process.env[TIMEOUT_ENV] = "20";
 	delete process.env[POST_COMMIT_MEANINGFUL_PROGRESS_ENV];
 	process.env[TERMINAL_GRACE_ENV] = "10";
@@ -944,10 +957,13 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+	resetRateLimitProbeGatesForTests();
 	restoreUsageCollector();
 	restoreUsageCollector = (): void => {};
 	restoreCodexRefreshToken();
 	restoreCodexRefreshToken = (): void => {};
+	restoreCodexWebSocket();
+	restoreCodexWebSocket = (): void => {};
 	clearCodexModelCacheForTests();
 	clearDerivedProviderModelDefaults();
 	globalThis.fetch = originalFetch;
@@ -1720,10 +1736,231 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		expect(codex.consecutive_rate_limits).toBe(0);
 	});
 
+	it("resumes untouched selected accounts when the preferred larger Codex model cannot serve", async () => {
+		process.env[CONTEXT_ADMISSION_ENV] = "1";
+		const sharedEndpoint = "https://shared-overflow.example.test/v1/responses";
+		const primary = makeCodexAccount(
+			"codex-preferred-larger-primary",
+			sharedEndpoint,
+		);
+		primary.model_mappings = JSON.stringify({
+			opus: ["gpt-5.3-codex-spark", "gpt-5.6-sol"],
+		});
+		const secondary = makeCodexAccount(
+			"codex-selected-shared-endpoint-secondary",
+			sharedEndpoint,
+		);
+		secondary.priority = 1;
+		secondary.model_mappings = JSON.stringify({
+			opus: ["gpt-5.3-codex-spark"],
+		});
+		const { ctx, reportCandidateFailure } = makeContext([primary, secondary]);
+		const routeOrder: Array<{ accountId: string; model: string }> = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			const accountId = (
+				upstreamRequest.headers.get("authorization") ?? ""
+			).replace("Bearer access-", "");
+			const body = (await upstreamRequest.clone().json()) as {
+				model: string;
+			};
+			routeOrder.push({ accountId, model: body.model });
+			return accountId === secondary.id
+				? sseResponse(byteStream(CODEX_SUCCESS_STREAM))
+				: sseResponse(byteStream(codexContextOverflowStream()));
+		}) as unknown as typeof fetch;
+
+		const request = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"anthropic-version": "2023-06-01",
+			},
+			body: JSON.stringify({
+				model: MODEL,
+				messages: [{ role: "user", content: "x".repeat(440_000) }],
+				metadata: {
+					user_id: JSON.stringify({ session_id: CODEX_SESSION }),
+				},
+				max_tokens: 50_000,
+				stream: true,
+			}),
+		});
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.text();
+
+		expect(routeOrder).toEqual([
+			{ accountId: primary.id, model: "gpt-5.3-codex-spark" },
+			{ accountId: primary.id, model: "gpt-5.6-sol" },
+			{ accountId: secondary.id, model: "gpt-5.3-codex-spark" },
+		]);
+		expect(response.status).toBe(200);
+		expect(body).toContain('"text":"codex recovered"');
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+		for (const account of [primary, secondary]) {
+			expect(account.rate_limited_until).toBeNull();
+			expect(account.consecutive_rate_limits).toBe(0);
+		}
+	});
+
+	it("retains an upgraded authoritative overflow while the session tail succeeds", async () => {
+		process.env[CONTEXT_ADMISSION_ENV] = "1";
+		const codex = makeCodexAccount("codex-legacy-authoritative-tail-success");
+		codex.model_mappings = JSON.stringify({
+			opus: ["gpt-5.3-codex-spark", "gpt-5.6-sol"],
+		});
+		const xai = makeXaiAccount("xai-after-authoritative-upgrade");
+		const { ctx, reportCandidateFailure } = makeContext(
+			[codex, xai],
+			makeCombo([codex]),
+		);
+		const routeOrder: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			if (
+				upstreamRequest.headers.get("authorization") ===
+				`Bearer access-${codex.id}`
+			) {
+				const body = (await upstreamRequest.clone().json()) as {
+					model: string;
+				};
+				routeOrder.push(`codex:${body.model}`);
+				return sseResponse(
+					byteStream(
+						body.model === "gpt-5.3-codex-spark"
+							? codexMessageOnlyContextOverflowStream()
+							: codexContextOverflowStream(),
+					),
+				);
+			}
+			routeOrder.push("xai");
+			return sseResponse(
+				completedOpenAiStream([openAiContentChunk("session tail recovered")]),
+			);
+		}) as unknown as typeof fetch;
+
+		const request = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"anthropic-version": "2023-06-01",
+			},
+			body: JSON.stringify({
+				model: MODEL,
+				messages: [{ role: "user", content: "x".repeat(440_000) }],
+				metadata: {
+					user_id: JSON.stringify({ session_id: CODEX_SESSION }),
+				},
+				max_tokens: 50_000,
+				stream: true,
+			}),
+		});
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.text();
+
+		expect(routeOrder).toEqual([
+			"codex:gpt-5.3-codex-spark",
+			"codex:gpt-5.6-sol",
+			"xai",
+		]);
+		expect(response.status).toBe(200);
+		expect(body).toContain('"text":"session tail recovered"');
+		expect(body).not.toContain('"code":"context_length_exceeded"');
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+		for (const account of [codex, xai]) {
+			expect(account.rate_limited_until).toBeNull();
+			expect(account.consecutive_rate_limits).toBe(0);
+		}
+	});
+
+	it.each([
+		{ tailSucceeds: true, label: "succeeds" },
+		{ tailSucceeds: false, label: "fails" },
+	])("resumes the session tail after a promoted ordinary failure and the tail $label", async ({
+		tailSucceeds,
+	}) => {
+		process.env[CONTEXT_ADMISSION_ENV] = "1";
+		const codex = makeCodexAccount(
+			`codex-promoted-ordinary-failure-${String(tailSucceeds)}`,
+		);
+		codex.model_mappings = JSON.stringify({
+			opus: ["gpt-5.3-codex-spark", "gpt-5.6-sol"],
+		});
+		const xai = makeXaiAccount(
+			`xai-after-promoted-ordinary-failure-${String(tailSucceeds)}`,
+		);
+		const { ctx } = makeContext([codex, xai], makeCombo([codex]));
+		const routeOrder: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			if (
+				upstreamRequest.headers.get("authorization") ===
+				`Bearer access-${codex.id}`
+			) {
+				const body = (await upstreamRequest.clone().json()) as {
+					model: string;
+				};
+				routeOrder.push(`codex:${body.model}`);
+				return body.model === "gpt-5.3-codex-spark"
+					? sseResponse(byteStream(codexContextOverflowStream()))
+					: Response.json(
+							{ error: { type: "api_error", message: "promoted unavailable" } },
+							{ status: 500 },
+						);
+			}
+			routeOrder.push("xai");
+			return tailSucceeds
+				? sseResponse(
+						completedOpenAiStream([
+							openAiContentChunk("session tail recovered"),
+						]),
+					)
+				: Response.json(
+						{ error: { type: "api_error", message: "session tail failed" } },
+						{ status: 500 },
+					);
+		}) as unknown as typeof fetch;
+
+		const request = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"anthropic-version": "2023-06-01",
+			},
+			body: JSON.stringify({
+				model: MODEL,
+				messages: [{ role: "user", content: "x".repeat(440_000) }],
+				metadata: {
+					user_id: JSON.stringify({ session_id: CODEX_SESSION }),
+				},
+				max_tokens: 50_000,
+				stream: true,
+			}),
+		});
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.text();
+
+		expect(routeOrder).toEqual([
+			"codex:gpt-5.3-codex-spark",
+			"codex:gpt-5.6-sol",
+			"xai",
+		]);
+		if (tailSucceeds) {
+			expect(body).toContain('"text":"session tail recovered"');
+			expect(body).not.toContain("context_length_exceeded");
+		} else {
+			expect(body).toContain("context_length_exceeded");
+			expect(body).not.toContain("promoted unavailable");
+		}
+	});
+
 	it.each([
 		{ stream: false, authoritativeKind: "processed JSON" },
 		{ stream: true, authoritativeKind: "precommit SSE" },
-	])("lets a larger-model $authoritativeKind overflow supersede an older legacy terminal", async ({
+	])("delivers one larger-model $authoritativeKind terminal after the session tail fails", async ({
 		stream,
 	}) => {
 		process.env[CONTEXT_ADMISSION_ENV] = "1";
@@ -1740,6 +1977,7 @@ describe("downstream Anthropic Messages SSE routing", () => {
 			[codex, xai],
 			makeCombo([codex]),
 		);
+		const persistence = installPersistingUsageCollector();
 		const fetchedCodexModels: string[] = [];
 		let xaiFetches = 0;
 		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
@@ -1763,11 +2001,15 @@ describe("downstream Anthropic Messages SSE routing", () => {
 					: codexContextOverflowResponse("larger-authoritative");
 			}
 			xaiFetches++;
-			return stream
-				? sseResponse(
-						completedOpenAiStream([openAiContentChunk("must not be fetched")]),
-					)
-				: openAiJsonResponse("must not be fetched");
+			return new Response(
+				JSON.stringify({
+					error: { type: "api_error", message: "session tail unavailable" },
+				}),
+				{
+					status: 500,
+					headers: { "content-type": "application/json" },
+				},
+			);
 		}) as unknown as typeof fetch;
 
 		const request = new Request("https://proxy.local/v1/messages", {
@@ -1790,9 +2032,11 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		const payload = (await response.json()) as {
 			error?: { code?: string; message?: string };
 		};
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		await persistence.collector.drain();
 
 		expect(fetchedCodexModels).toEqual(["gpt-5.3-codex-spark", "gpt-5.6-sol"]);
-		expect(xaiFetches).toBe(0);
+		expect(xaiFetches).toBe(1);
 		expect(response.status).toBe(400);
 		expect(payload.error?.code).toBe("context_length_exceeded");
 		if (!stream) {
@@ -1807,6 +2051,640 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		expect(reportCandidateFailure).not.toHaveBeenCalled();
 		expect(codex.rate_limited_until).toBeNull();
 		expect(codex.consecutive_rate_limits).toBe(0);
+		expect(persistence.handleEnd).toHaveBeenCalledTimes(1);
+		expect(persistence.savedRequests).toHaveLength(1);
+		expect(persistence.savedRequests[0]?.[3]).toBe(codex.id);
+		expect(persistence.savedRequests[0]?.[4]).toBe(400);
+		expect(persistence.savedRequests[0]?.[6]).toBe("context_length_exceeded");
+		expect(persistence.savedRequests[0]?.[8]).toBe(2);
+	});
+
+	it("promotes an ungated combo overflow before resuming SessionStrategy", async () => {
+		process.env[CONTEXT_ADMISSION_ENV] = "1";
+		const codex = makeCodexAccount(
+			"codex-all-combo-probes-suppressed",
+			"https://ungated-promotion.example.test/v1/responses",
+		);
+		codex.model_mappings = JSON.stringify({
+			opus: ["gpt-5.3-codex-spark", "gpt-5.6-sol"],
+		});
+		codex.rate_limited_until = Date.now() - 1;
+		codex.rate_limited_reason = "upstream_529_overloaded_no_reset";
+		const xai = makeXaiAccount("xai-session-after-ungated-promotion");
+		const { ctx, reportCandidateFailure } = makeContext(
+			[codex, xai],
+			makeCombo([codex]),
+		);
+		// A concurrent request owns the recovery lease, so every initial combo
+		// candidate is suppressed and this request must enter the ungated retry.
+		expect(getRateLimitProbeAdmission(codex)).toBe("admitted");
+		const routeOrder: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			if (
+				upstreamRequest.headers.get("authorization") ===
+				`Bearer access-${codex.id}`
+			) {
+				const body = (await upstreamRequest.clone().json()) as {
+					model: string;
+				};
+				routeOrder.push(`codex:${body.model}`);
+				if (body.model === "gpt-5.3-codex-spark") {
+					// Model the concurrent owner completing while the ungated base route
+					// is in flight, making the promoted larger route admissible.
+					completeRateLimitProbe(codex, "abandoned");
+					return sseResponse(byteStream(codexContextOverflowStream()));
+				}
+				return sseResponse(byteStream(codexFailureStream("api_error")));
+			}
+			routeOrder.push("xai");
+			return sseResponse(
+				completedOpenAiStream([openAiContentChunk("session retry recovered")]),
+			);
+		}) as unknown as typeof fetch;
+
+		const request = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"anthropic-version": "2023-06-01",
+			},
+			body: JSON.stringify({
+				model: MODEL,
+				messages: [{ role: "user", content: "x".repeat(440_000) }],
+				metadata: {
+					user_id: JSON.stringify({ session_id: CODEX_SESSION }),
+				},
+				max_tokens: 50_000,
+				stream: true,
+			}),
+		});
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.text();
+
+		expect(routeOrder).toEqual([
+			"codex:gpt-5.3-codex-spark",
+			"codex:gpt-5.6-sol",
+			"xai",
+		]);
+		expect(response.status).toBe(200);
+		expect(body).toContain('"text":"session retry recovered"');
+		expect(reportCandidateFailure).toHaveBeenCalledTimes(1);
+		expect(reportCandidateFailure.mock.calls[0]?.[1]).toMatchObject({
+			reason: "anthropic_precommit_transient_sse_error:api_error",
+		});
+	});
+
+	it("keeps a probe-suppressed promoted route for one bounded ungated retry", async () => {
+		process.env[CONTEXT_ADMISSION_ENV] = "1";
+		const codex = makeCodexAccount("codex-promoted-probe-suppressed");
+		codex.model_mappings = JSON.stringify({
+			opus: ["gpt-5.3-codex-spark", "gpt-5.6-sol"],
+		});
+		const { ctx, reportCandidateFailure } = makeContext(
+			[codex],
+			makeCombo([codex]),
+		);
+		let selectionCalls = 0;
+		ctx.strategy.select = mock(async (selected: Account[]) => {
+			selectionCalls++;
+			return selectionCalls === 1 ? selected : [];
+		});
+		const routeOrder: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			const body = (await upstreamRequest.clone().json()) as {
+				model: string;
+			};
+			routeOrder.push(body.model);
+			if (body.model === "gpt-5.3-codex-spark") {
+				// Arm an independently-owned lease after the base route was admitted.
+				// Promotion must leave the route queued when this lease suppresses it.
+				codex.rate_limited_until = Date.now() - 1;
+				codex.rate_limited_reason = "upstream_529_overloaded_no_reset";
+				expect(getRateLimitProbeAdmission(codex)).toBe("admitted");
+				return sseResponse(byteStream(codexContextOverflowStream()));
+			}
+			return sseResponse(byteStream(CODEX_SUCCESS_STREAM));
+		}) as unknown as typeof fetch;
+
+		const request = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"anthropic-version": "2023-06-01",
+			},
+			body: JSON.stringify({
+				model: MODEL,
+				messages: [{ role: "user", content: "x".repeat(440_000) }],
+				metadata: {
+					user_id: JSON.stringify({ session_id: CODEX_SESSION }),
+				},
+				max_tokens: 50_000,
+				stream: true,
+			}),
+		});
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.text();
+
+		expect(routeOrder).toEqual(["gpt-5.3-codex-spark", "gpt-5.6-sol"]);
+		expect(response.status).toBe(200);
+		expect(body).toContain('"text":"codex recovered"');
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+	});
+
+	it("gives a sole promoted larger model the final commitment budget", async () => {
+		process.env[MEANINGFUL_PROGRESS_ENV] = "500";
+		process.env[RESCUE_ACTIVATION_ENV] = "1000";
+		process.env[RESCUE_PING_ENV] = "10";
+		process.env[CONTEXT_ADMISSION_ENV] = "1";
+		delete process.env[RESCUE_DEADLINE_ENV];
+		const codex = makeCodexAccount("codex-final-promoted-deadline");
+		codex.custom_endpoint = "https://final-promotion.example.test/v1/responses";
+		codex.model_mappings = JSON.stringify({
+			opus: ["gpt-5.3-codex-spark", "gpt-5.6-sol"],
+		});
+		const { ctx, reportCandidateFailure } = makeContext([codex]);
+		const routeOrder: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			const body = (await upstreamRequest.clone().json()) as {
+				model: string;
+			};
+			routeOrder.push(body.model);
+			if (body.model === "gpt-5.3-codex-spark") {
+				return sseResponse(byteStream(codexContextOverflowStream()));
+			}
+			return new Promise<Response>((resolve, reject) => {
+				const timer = setTimeout(
+					() => resolve(sseResponse(byteStream(CODEX_SUCCESS_STREAM))),
+					425,
+				);
+				const rejectOnAbort = (): void => {
+					clearTimeout(timer);
+					reject(
+						upstreamRequest.signal.reason ??
+							new DOMException("aborted", "AbortError"),
+					);
+				};
+				if (upstreamRequest.signal.aborted) rejectOnAbort();
+				else {
+					upstreamRequest.signal.addEventListener("abort", rejectOnAbort, {
+						once: true,
+					});
+				}
+			});
+		}) as unknown as typeof fetch;
+
+		const request = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"anthropic-version": "2023-06-01",
+			},
+			body: JSON.stringify({
+				model: MODEL,
+				messages: [{ role: "user", content: "x".repeat(440_000) }],
+				metadata: {
+					user_id: JSON.stringify({ session_id: CODEX_SESSION }),
+				},
+				max_tokens: 50_000,
+				stream: true,
+			}),
+		});
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.text();
+
+		expect(routeOrder).toEqual(["gpt-5.3-codex-spark", "gpt-5.6-sol"]);
+		expect(body).toContain('"text":"codex recovered"');
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+	});
+
+	it("gives the last executable deferred route final commitment budget", async () => {
+		process.env[MEANINGFUL_PROGRESS_ENV] = "500";
+		process.env[RESCUE_ACTIVATION_ENV] = "1000";
+		process.env[RESCUE_PING_ENV] = "10";
+		process.env[CONTEXT_ADMISSION_ENV] = "1";
+		delete process.env[RESCUE_DEADLINE_ENV];
+		const first = makeCodexAccount("codex-deferred-final-first");
+		const suppressedTail = makeCodexAccount("codex-deferred-final-suppressed");
+		for (const account of [first, suppressedTail]) {
+			account.model_mappings = JSON.stringify({
+				opus: ["gpt-5.3-codex-spark", "gpt-5.6-sol"],
+			});
+		}
+		const { ctx, reportCandidateFailure } = makeContext([
+			first,
+			suppressedTail,
+		]);
+		const routeOrder: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			const body = (await upstreamRequest.clone().json()) as { model: string };
+			const account =
+				upstreamRequest.headers.get("authorization") ===
+				`Bearer access-${first.id}`
+					? first
+					: suppressedTail;
+			routeOrder.push(`${account.id}:${body.model}`);
+			if (body.model === "gpt-5.3-codex-spark") {
+				if (account.id === suppressedTail.id) {
+					suppressedTail.rate_limited_until = Date.now() - 1;
+					suppressedTail.rate_limited_reason =
+						"upstream_529_overloaded_no_reset";
+					expect(getRateLimitProbeAdmission(suppressedTail)).toBe("admitted");
+				}
+				return Response.json(
+					{ error: { code: "model_not_found", message: "model not found" } },
+					{ status: 404 },
+				);
+			}
+			return new Promise<Response>((resolve, reject) => {
+				const timer = setTimeout(
+					() => resolve(sseResponse(byteStream(CODEX_SUCCESS_STREAM))),
+					425,
+				);
+				const rejectOnAbort = (): void => {
+					clearTimeout(timer);
+					reject(
+						upstreamRequest.signal.reason ??
+							new DOMException("aborted", "AbortError"),
+					);
+				};
+				if (upstreamRequest.signal.aborted) rejectOnAbort();
+				else {
+					upstreamRequest.signal.addEventListener("abort", rejectOnAbort, {
+						once: true,
+					});
+				}
+			});
+		}) as unknown as typeof fetch;
+
+		const request = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"anthropic-version": "2023-06-01",
+			},
+			body: JSON.stringify({
+				model: MODEL,
+				messages: [{ role: "user", content: "x".repeat(440_000) }],
+				metadata: {
+					user_id: JSON.stringify({ session_id: CODEX_SESSION }),
+				},
+				max_tokens: 50_000,
+				stream: true,
+			}),
+		});
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.text();
+
+		expect(routeOrder).toEqual([
+			`${first.id}:gpt-5.3-codex-spark`,
+			`${suppressedTail.id}:gpt-5.3-codex-spark`,
+			`${first.id}:gpt-5.6-sol`,
+		]);
+		expect(response.status).toBe(200);
+		expect(body).toContain('"text":"codex recovered"');
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+	});
+
+	it("releases a promoted authoritative terminal when combo session fallback is disabled", async () => {
+		process.env[DISABLE_COMBO_SESSION_FALLBACK_ENV] = "true";
+		process.env[CONTEXT_ADMISSION_ENV] = "1";
+		discardedResponses.length = 0;
+		const codex = makeCodexAccount("codex-disabled-session-authoritative");
+		codex.model_mappings = JSON.stringify({
+			opus: ["gpt-5.3-codex-spark", "gpt-5.6-sol"],
+		});
+		const { ctx, reportCandidateFailure } = makeContext(
+			[codex],
+			makeCombo([codex]),
+		);
+		const routeOrder: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			const body = (await upstreamRequest.clone().json()) as {
+				model: string;
+			};
+			routeOrder.push(body.model);
+			if (body.model === "gpt-5.3-codex-spark") {
+				return sseResponse(byteStream(codexMessageOnlyContextOverflowStream()));
+			}
+			return codexContextOverflowResponse("disabled-session-authoritative");
+		}) as unknown as typeof fetch;
+
+		const request = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"anthropic-version": "2023-06-01",
+			},
+			body: JSON.stringify({
+				model: MODEL,
+				messages: [{ role: "user", content: "x".repeat(440_000) }],
+				metadata: {
+					user_id: JSON.stringify({ session_id: CODEX_SESSION }),
+				},
+				max_tokens: 50_000,
+				stream: false,
+			}),
+		});
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.text();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(routeOrder).toEqual(["gpt-5.3-codex-spark", "gpt-5.6-sol"]);
+		expect(response.status).toBe(503);
+		expect(body).toContain('"code":"combo_session_fallback_disabled"');
+		expect(
+			discardedResponses.filter(
+				(discarded) =>
+					discarded.headers.get("x-upstream-proof") ===
+					"disabled-session-authoritative",
+			),
+		).toHaveLength(1);
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+	});
+
+	it("keeps caller cancellation authoritative over a retained promoted overflow", async () => {
+		process.env[CONTEXT_ADMISSION_ENV] = "1";
+		discardedResponses.length = 0;
+		const codex = makeCodexAccount("codex-retained-before-tail-cancel");
+		codex.model_mappings = JSON.stringify({
+			opus: ["gpt-5.3-codex-spark", "gpt-5.6-sol"],
+		});
+		const xai = makeXaiAccount("xai-cancelled-session-tail");
+		const { ctx, reportCandidateFailure } = makeContext(
+			[codex, xai],
+			makeCombo([codex]),
+		);
+		const persistence = installPersistingUsageCollector();
+		const callerAbort = new AbortController();
+		const routeOrder: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			if (
+				upstreamRequest.headers.get("authorization") ===
+				`Bearer access-${codex.id}`
+			) {
+				const body = (await upstreamRequest.clone().json()) as {
+					model: string;
+				};
+				routeOrder.push(`codex:${body.model}`);
+				return body.model === "gpt-5.3-codex-spark"
+					? sseResponse(byteStream(codexMessageOnlyContextOverflowStream()))
+					: codexContextOverflowResponse("retained-before-cancel");
+			}
+			routeOrder.push("xai");
+			callerAbort.abort("user cancelled during session fallback");
+			return new Response("upstream raced with caller cancellation", {
+				status: 500,
+			});
+		}) as unknown as typeof fetch;
+
+		const baseRequest = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"anthropic-version": "2023-06-01",
+			},
+			body: JSON.stringify({
+				model: MODEL,
+				messages: [{ role: "user", content: "x".repeat(440_000) }],
+				metadata: {
+					user_id: JSON.stringify({ session_id: CODEX_SESSION }),
+				},
+				max_tokens: 50_000,
+				stream: false,
+			}),
+		});
+		const request = new Request(baseRequest, { signal: callerAbort.signal });
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		await response.arrayBuffer();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		await persistence.collector.drain();
+
+		expect(routeOrder).toEqual([
+			"codex:gpt-5.3-codex-spark",
+			"codex:gpt-5.6-sol",
+			"xai",
+		]);
+		expect(response.status).toBe(499);
+		expect(
+			discardedResponses.filter(
+				(discarded) =>
+					discarded.headers.get("x-upstream-proof") ===
+					"retained-before-cancel",
+			),
+		).toHaveLength(1);
+		expect(
+			persistence.handleEnd.mock.calls.some(
+				([message]) => message.error === "context_length_exceeded",
+			),
+		).toBe(false);
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+	});
+
+	it("does not mistake an upstream 499 for caller cancellation", async () => {
+		process.env[CONTEXT_ADMISSION_ENV] = "1";
+		discardedResponses.length = 0;
+		const codex = makeCodexAccount("codex-retained-before-upstream-499");
+		codex.model_mappings = JSON.stringify({
+			opus: ["gpt-5.3-codex-spark", "gpt-5.6-sol"],
+		});
+		const xai = makeXaiAccount("xai-upstream-499");
+		const { ctx } = makeContext([codex, xai], makeCombo([codex]));
+		const routeOrder: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			if (
+				upstreamRequest.headers.get("authorization") ===
+				`Bearer access-${codex.id}`
+			) {
+				const body = (await upstreamRequest.clone().json()) as {
+					model: string;
+				};
+				routeOrder.push(`codex:${body.model}`);
+				return body.model === "gpt-5.3-codex-spark"
+					? sseResponse(byteStream(codexMessageOnlyContextOverflowStream()))
+					: codexContextOverflowResponse("retained-before-upstream-499");
+			}
+			routeOrder.push("xai");
+			return new Response(
+				JSON.stringify({ error: { message: "provider cancelled request" } }),
+				{
+					status: 499,
+					headers: { "content-type": "application/json" },
+				},
+			);
+		}) as unknown as typeof fetch;
+
+		const request = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"anthropic-version": "2023-06-01",
+			},
+			body: JSON.stringify({
+				model: MODEL,
+				messages: [{ role: "user", content: "x".repeat(440_000) }],
+				metadata: {
+					user_id: JSON.stringify({ session_id: CODEX_SESSION }),
+				},
+				max_tokens: 50_000,
+				stream: false,
+			}),
+		});
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const payload = (await response.json()) as {
+			error?: { code?: string };
+		};
+
+		expect(routeOrder).toEqual([
+			"codex:gpt-5.3-codex-spark",
+			"codex:gpt-5.6-sol",
+			"xai",
+		]);
+		expect(response.status).toBe(400);
+		expect(payload.error?.code).toBe("context_length_exceeded");
+		expect(response.headers.get("x-upstream-proof")).toBe(
+			"retained-before-upstream-499",
+		);
+	});
+
+	it.each([
+		{ tailKind: "model unavailable" as const },
+		{ tailKind: "final rate limit" as const },
+	])("keeps retained context ahead of a $tailKind tail", async ({
+		tailKind,
+	}) => {
+		const first = makeCodexAccount(
+			`codex-before-${tailKind.replaceAll(" ", "-")}`,
+			"https://retained-context.example.test/v1/responses",
+		);
+		const tail =
+			tailKind === "model unavailable"
+				? makeCodexAccount(
+						"codex-model-unavailable-tail",
+						"https://model-unavailable.example.test/v1/responses",
+					)
+				: makeXaiAccount("xai-final-rate-limit-tail");
+		const { ctx } = makeContext([first, tail]);
+		const routeOrder: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			if (
+				upstreamRequest.headers.get("authorization") ===
+				`Bearer access-${first.id}`
+			) {
+				routeOrder.push("context");
+				return codexContextOverflowResponse(`before-${tailKind}`);
+			}
+			routeOrder.push(tailKind);
+			return tailKind === "model unavailable"
+				? Response.json(
+						{
+							error: {
+								code: "model_not_found",
+								message: "model not found",
+							},
+						},
+						{ status: 404 },
+					)
+				: Response.json(
+						{ error: { message: "rate limited" } },
+						{ status: 429, headers: { "retry-after": "30" } },
+					);
+		}) as unknown as typeof fetch;
+
+		const request = makeCodexRequest({ stream: false });
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const payload = (await response.json()) as { error?: { code?: string } };
+
+		expect(routeOrder).toEqual(["context", tailKind]);
+		expect(response.status).toBe(400);
+		expect(payload.error?.code).toBe("context_length_exceeded");
+		expect(response.headers.get("x-upstream-proof")).toBe(`before-${tailKind}`);
+	});
+
+	it("keeps an irreversible Codex WebSocket terminal ahead of retained overflow", async () => {
+		process.env[CONTEXT_ADMISSION_ENV] = "1";
+		discardedResponses.length = 0;
+		const codex = makeCodexAccount("codex-retained-before-ws-terminal");
+		codex.model_mappings = JSON.stringify({
+			opus: ["gpt-5.3-codex-spark", "gpt-5.6-sol"],
+		});
+		const { ctx } = makeContext([codex], makeCombo([codex]));
+		const routeOrder: string[] = [];
+		let websocketCalls = 0;
+		const receipt: CodexWebSocketReceipt = {
+			connectionId: "conn-post-write-terminal",
+			cohortId: "cohort-post-write-terminal",
+			reused: false,
+			frameWritten: true,
+			stickyHttp: false,
+			markPostWriteFailure: () => {
+				receipt.stickyHttp = true;
+			},
+		};
+		const websocketAttempt = spyOn(
+			codexWebSocketTransport,
+			"tryRequest",
+		).mockImplementation(async (input) => {
+			websocketCalls++;
+			if (websocketCalls === 1) return null;
+			input.onFrameWritten?.(receipt);
+			return {
+				receipt,
+				response: sseResponse(byteStream(codexFailureStream("api_error"))),
+			};
+		});
+		restoreCodexWebSocket = () => websocketAttempt.mockRestore();
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			const body = (await upstreamRequest.clone().json()) as { model: string };
+			routeOrder.push(body.model);
+			return sseResponse(byteStream(codexContextOverflowStream()));
+		}) as unknown as typeof fetch;
+
+		const request = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"anthropic-version": "2023-06-01",
+			},
+			body: JSON.stringify({
+				model: MODEL,
+				messages: [{ role: "user", content: "x".repeat(440_000) }],
+				metadata: {
+					user_id: JSON.stringify({ session_id: CODEX_SESSION }),
+				},
+				max_tokens: 50_000,
+				stream: true,
+			}),
+		});
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const payload = (await response.json()) as { error?: { code?: string } };
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(routeOrder).toEqual(["gpt-5.3-codex-spark"]);
+		expect(websocketCalls).toBe(2);
+		expect(response.status).toBe(502);
+		expect(payload.error?.code).toBe("codex_websocket_post_write_error");
+		expect(receipt.stickyHttp).toBe(true);
+		expect(
+			discardedResponses.filter((discarded) => discarded.status === 400),
+		).toHaveLength(1);
 	});
 
 	it.each([
@@ -2660,6 +3538,117 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		expect(persistence.savedRequests[0]?.[6]).toBe("context_length_exceeded");
 	});
 
+	it("discards retained context ownership before a protected semantic overload wins", async () => {
+		const codex = makeCodexAccount("codex-before-protected-overload");
+		const anthropic = {
+			...makeAccount("anthropic-protected-overload"),
+			api_key: null,
+			refresh_token: "oauth-refresh-token",
+			access_token: "oauth-access-token",
+			expires_at: Date.now() + 60 * 60 * 1000,
+		};
+		const { ctx } = makeContext([codex, anthropic]);
+		const anthropicProvider = getProvider("anthropic");
+		if (!anthropicProvider)
+			throw new Error("anthropic provider not registered");
+		ctx.provider = anthropicProvider;
+		ctx.dbOps.getAccount = mock(async (accountId: string) =>
+			[codex, anthropic].find((account) => account.id === accountId),
+		);
+		let degradedNow = Date.now();
+		const coordinator = new AnthropicDegradedModeCoordinator({
+			config: {
+				...ANTHROPIC_DEGRADED_MODE_DEFAULTS,
+				mode: "enforce",
+				largeRequestByteThreshold: 64 * 1024,
+			},
+			now: () => degradedNow,
+		});
+		const cohortKey = buildAnthropicDegradedCohortKey({
+			provider: "anthropic",
+			endpoint: "https://api.anthropic.com/v1/messages",
+			path: "/v1/messages",
+			protocol: "messages",
+			model: MODEL,
+			betaSignature: "oauth-2025-04-20",
+		});
+		if (!cohortKey) throw new Error("expected Anthropic degraded cohort key");
+		for (const accountId of ["evidence-a", "evidence-b"]) {
+			coordinator.observeTrustedOverload({
+				cohortKey,
+				accountId,
+				outcome: "http_529",
+				phase: "pre_commit",
+				forceRouted: false,
+				retryAfter: "30",
+			});
+		}
+		const openState = coordinator.getCohortState(cohortKey);
+		if (openState.state !== "open") throw new Error("expected open cohort");
+		degradedNow = openState.nextProbeAt;
+		ctx.anthropicDegradedMode = coordinator;
+		discardedResponses.length = 0;
+		const routeOrder: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			const upstreamUrl = new URL(upstreamRequest.url);
+			if (upstreamUrl.pathname === "/backend-api/codex/models") {
+				return Response.json({
+					models: [
+						{
+							slug: "gpt-5.3-codex",
+							display_name: "GPT-5.3 Codex",
+							visibility: "list",
+							priority: 1,
+						},
+					],
+				});
+			}
+			if (upstreamUrl.hostname === "api.anthropic.com") {
+				routeOrder.push("anthropic");
+				return sseResponse(
+					byteStream(
+						'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}\n\n',
+					),
+				);
+			}
+			routeOrder.push("codex");
+			return codexContextOverflowResponse("discard-before-protected-overload");
+		}) as unknown as typeof fetch;
+
+		const request = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"anthropic-version": "2023-06-01",
+			},
+			body: JSON.stringify({
+				model: MODEL,
+				messages: [{ role: "user", content: "x".repeat(70 * 1024) }],
+				metadata: {
+					user_id: JSON.stringify({ session_id: CODEX_SESSION }),
+				},
+				max_tokens: 16,
+				stream: false,
+			}),
+		});
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const payload = (await response.json()) as { error?: { type?: string } };
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(routeOrder).toEqual(["codex", "anthropic"]);
+		expect(response.status).toBe(529);
+		expect(payload.error?.type).toBe("overloaded_error");
+		expect(
+			discardedResponses.filter(
+				(discarded) =>
+					discarded.headers.get("x-upstream-proof") ===
+					"discard-before-protected-overload",
+			),
+		).toHaveLength(1);
+	});
+
 	it("preserves authoritative overflow semantics after precommit rescue activates", async () => {
 		process.env[RESCUE_ACTIVATION_ENV] = "1";
 		process.env[RESCUE_PING_ENV] = "50";
@@ -2684,6 +3673,128 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		expect(body).not.toContain("No compatible account route committed");
 		expect(reportCandidateFailure).not.toHaveBeenCalled();
 		expect(codex.rate_limited_until).toBeNull();
+	});
+
+	it.each([
+		{
+			label: "application/json",
+			body: JSON.stringify({
+				id: "chatcmpl-invalid-rescue-winner",
+				choices: [{ message: { role: "assistant", content: "not SSE" } }],
+			}),
+			contentType: "application/json",
+		},
+		{ label: "a null body", body: null, contentType: null },
+	])("keeps retained overflow after rescue commits ahead of delayed HTTP 200 $label", async ({
+		body: tailBody,
+		contentType,
+		label,
+	}) => {
+		process.env[RESCUE_ACTIVATION_ENV] = "1";
+		process.env[RESCUE_PING_ENV] = "50";
+		process.env[RESCUE_DEADLINE_ENV] = "200";
+		discardedResponses.length = 0;
+		const persistence = installPersistingUsageCollector();
+		const codex = makeCodexAccount(
+			`codex-retained-before-${label.replaceAll(/[^a-z]+/g, "-")}`,
+			"https://retained-before-invalid-200.example.test/v1/responses",
+		);
+		const xai = makeXaiAccount(
+			`xai-invalid-200-${label.replaceAll(/[^a-z]+/g, "-")}`,
+		);
+		const { ctx, recordCacheAffinitySuccess } = makeContext([codex, xai]);
+		const routeOrder: string[] = [];
+		const tailProof = `invalid-rescue-tail-${label}`;
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			if (
+				upstreamRequest.headers.get("authorization") ===
+				`Bearer access-${codex.id}`
+			) {
+				routeOrder.push("codex");
+				return codexContextOverflowResponse("truthful-rescue-overflow");
+			}
+			routeOrder.push("xai");
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			const headers = new Headers({ "x-tail-proof": tailProof });
+			if (contentType) headers.set("content-type", contentType);
+			return new Response(tailBody, { status: 200, headers });
+		}) as unknown as typeof fetch;
+
+		const request = makeCodexRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const responseBody = await response.text();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		await persistence.collector.drain();
+
+		expect(routeOrder).toEqual(["codex", "xai"]);
+		expect(response.status).toBe(200);
+		expect(responseBody).toEndWith(
+			ANTHROPIC_PRECOMMIT_RESCUE_CONTEXT_OVERFLOW_FRAME,
+		);
+		expect(responseBody).not.toContain("No compatible account route committed");
+		expect(
+			discardedResponses.filter(
+				(discarded) => discarded.headers.get("x-tail-proof") === tailProof,
+			),
+		).toHaveLength(1);
+		expect(recordCacheAffinitySuccess).not.toHaveBeenCalled();
+		expect(getCachePacingRouteStats()[xai.id]).toBeUndefined();
+		expect(persistence.handleStart).toHaveBeenCalledTimes(1);
+		expect(persistence.handleEnd).toHaveBeenCalledTimes(1);
+		expect(persistence.savedRequests).toHaveLength(1);
+		expect(persistence.savedRequests[0]?.[3]).toBe(codex.id);
+		expect(persistence.savedRequests[0]?.[4]).toBe(200);
+		expect(persistence.savedRequests[0]?.[6]).toBe("context_length_exceeded");
+	});
+
+	it("lets a delayed successful SSE supersede retained overflow after rescue commits", async () => {
+		process.env[RESCUE_ACTIVATION_ENV] = "1";
+		process.env[RESCUE_PING_ENV] = "50";
+		process.env[RESCUE_DEADLINE_ENV] = "200";
+		discardedResponses.length = 0;
+		const codex = makeCodexAccount(
+			"codex-retained-before-valid-sse",
+			"https://retained-before-valid-sse.example.test/v1/responses",
+		);
+		const xai = makeXaiAccount("xai-valid-sse-after-rescue");
+		const { ctx, recordCacheAffinitySuccess } = makeContext([codex, xai]);
+		const routeOrder: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			if (
+				upstreamRequest.headers.get("authorization") ===
+				`Bearer access-${codex.id}`
+			) {
+				routeOrder.push("codex");
+				return codexContextOverflowResponse("discarded-for-valid-sse");
+			}
+			routeOrder.push("xai");
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			return sseResponse(
+				completedOpenAiStream([openAiContentChunk("valid delayed SSE")]),
+			);
+		}) as unknown as typeof fetch;
+
+		const request = makeCodexRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.text();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(routeOrder).toEqual(["codex", "xai"]);
+		expect(body).toContain('"text":"valid delayed SSE"');
+		expect(body).not.toContain("context_length_exceeded");
+		expect(
+			discardedResponses.filter(
+				(discarded) =>
+					discarded.headers.get("x-upstream-proof") ===
+					"discarded-for-valid-sse",
+			),
+		).toHaveLength(1);
+		expect(recordCacheAffinitySuccess).toHaveBeenCalledTimes(1);
+		expect(getCachePacingRouteStats()[xai.id]?.requestsServed).toBe(1);
 	});
 
 	it("keeps a distinct custom Codex endpoint eligible after an authoritative overflow", async () => {
@@ -2718,6 +3829,50 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		expect(reportCandidateFailure).not.toHaveBeenCalled();
 		expect(overflowing.rate_limited_until).toBeNull();
 		expect(rescue.rate_limited_until).toBeNull();
+	});
+
+	it("keeps credential-scoped custom Codex routes eligible at one shared URL", async () => {
+		const sharedEndpoint = "https://shared.example.test/v1/responses";
+		const overflowing = makeCodexAccount(
+			"codex-shared-custom-overflow",
+			sharedEndpoint,
+		);
+		overflowing.model_mappings = JSON.stringify({
+			opus: ["gpt-5.3-codex"],
+		});
+		const rescue = makeCodexAccount(
+			"codex-shared-custom-rescue",
+			sharedEndpoint,
+		);
+		rescue.priority = 1;
+		rescue.model_mappings = JSON.stringify({
+			opus: ["gpt-5.3-codex"],
+		});
+		const { ctx, reportCandidateFailure } = makeContext([overflowing, rescue]);
+		const fetchedAccounts: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			const authorization = upstreamRequest.headers.get("authorization") ?? "";
+			const accountId = authorization.replace("Bearer access-", "");
+			fetchedAccounts.push(accountId);
+			return accountId === overflowing.id
+				? sseResponse(byteStream(codexContextOverflowStream()))
+				: sseResponse(byteStream(CODEX_SUCCESS_STREAM));
+		}) as unknown as typeof fetch;
+
+		const request = makeCodexRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.text();
+
+		expect(fetchedAccounts).toEqual([overflowing.id, rescue.id]);
+		expect(response.status).toBe(200);
+		expect(body).toContain('"text":"codex recovered"');
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+		for (const account of [overflowing, rescue]) {
+			expect(account.rate_limited_until).toBeNull();
+			expect(account.consecutive_rate_limits).toBe(0);
+		}
 	});
 
 	it("preserves a forced Codex direct context overflow response", async () => {
@@ -4464,6 +5619,50 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		expect(body).not.toContain("route_unavailable");
 		expect(body).not.toContain("service_unavailable");
 		expect(reportCandidateSuccess).not.toHaveBeenCalled();
+	});
+
+	it("attributes a delayed model-unavailable winner after rescue activation", async () => {
+		process.env[TIMEOUT_ENV] = "1000";
+		process.env[RESCUE_ACTIVATION_ENV] = "1";
+		process.env[RESCUE_PING_ENV] = "5";
+		process.env[RESCUE_DEADLINE_ENV] = "100";
+		const persistence = installPersistingUsageCollector();
+		const codex = makeCodexAccount(
+			"codex-delayed-model-unavailable",
+			"https://delayed-model-unavailable.example.test/v1/responses",
+		);
+		const { ctx } = makeContext([codex]);
+		let fetchCount = 0;
+		globalThis.fetch = mock(async () => {
+			fetchCount++;
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			return Response.json(
+				{
+					error: {
+						code: "model_not_found",
+						message: "model not found",
+					},
+				},
+				{ status: 404 },
+			);
+		}) as unknown as typeof fetch;
+
+		const request = makeCodexRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.text();
+		await persistence.collector.drain();
+
+		expect(fetchCount).toBe(1);
+		expect(response.status).toBe(200);
+		expect(body).toEndWith(ANTHROPIC_PRECOMMIT_RESCUE_ERROR_FRAME);
+		expect(persistence.handleStart).toHaveBeenCalledTimes(1);
+		expect(persistence.handleEnd).toHaveBeenCalledTimes(1);
+		expect(persistence.savedRequests).toHaveLength(1);
+		expect(persistence.savedRequests[0]?.[3]).toBe(codex.id);
+		expect(persistence.savedRequests[0]?.[4]).toBe(404);
+		expect(persistence.savedRequests[0]?.[6]).toBe(
+			"anthropic_rescue_non_sse_response",
+		);
 	});
 
 	for (const responseBody of [
