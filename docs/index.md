@@ -18,14 +18,16 @@ When working with Claude API at scale, rate limits can become a significant bott
 - **🚀 Zero Rate Limit Errors**: Automatically distributes requests across multiple accounts with intelligent failover
 - **📊 Request-Level Analytics**: Track latency, token usage, and costs in real-time with <10ms overhead
 - **🔍 Deep Debugging**: Full request/response logging and error traces for complete visibility
-- **💸 Session-Based Routing**: Default 5-hour sessions maximize prompt cache efficiency, reducing costs
+- **💸 Session-Based Routing**: Default 5-hour sessions for providers with session windows maximize prompt-cache efficiency, reducing costs
 - **⚡ Production Ready**: Built for scale with SQLite persistence, OAuth token refresh, and configurable retry logic
 
 ## Key Features
 
 ### 🎯 Intelligent Load Balancing
-- **Session-based** (only supported strategy): Maintains conversation context with 5-hour sessions to avoid rate limits and account bans
-- **⚠️ WARNING**: Other strategies (round-robin, least-requests, weighted) have been removed as they can trigger Claude's anti-abuse systems
+- **Four supported strategies**: `session` (the default), `least-used`, `session-affinity`, and the opt-in `session-drain-soonest`
+- **OAuth stickiness**: `session` keeps an account-level session for providers with session windows (including Anthropic OAuth and Codex OAuth); `session-affinity` keeps each client or lane on its own account for prompt-cache locality
+- **Drain-soonest is opt-in**: `session-drain-soonest` preserves an existing affinity owner and only changes fresh-assignment or failover ordering when a known future all-model weekly reset is available; missing or stale telemetry falls back to ordinary affinity ordering
+- **Provider-aware safety**: `least-used` spreads requests by utilization and does not preserve OAuth stickiness, so reserve it for providers and credentials where per-request spreading is safe
 
 ### 📈 Real-Time Monitoring & Analytics
 - **Web Dashboard**: Interactive UI at `/dashboard` with live metrics
@@ -54,7 +56,7 @@ When working with Claude API at scale, rate limits can become a significant bott
 - [Data Flow](./data-flow.md) - Request lifecycle through the system
 
 ### Core Features
-- [Load Balancing Strategy](./load-balancing.md) - Session-based strategy for safe account usage
+- [Load Balancing Strategies](./load-balancing.md) - Choose among session, least-used, session-affinity, and session-drain-soonest
 - [Provider System](./providers.md) - Provider abstraction and OAuth implementation
 - [Database Schema](./database.md) - SQLite structure, migrations, and maintenance
 - [Model Mappings](./models.md) - Claude AI model definitions and constants
@@ -98,7 +100,7 @@ bun run server
 # Start server on specific port
 bun run server --port 8081
 
-# Specify session duration (default: 5 hours)
+# Specify session duration for session-based strategies (default: 5 hours)
 SESSION_DURATION_MS=21600000 bun run server  # 6 hours
 
 # Run CLI directly with Bun (if not using npm scripts)
@@ -221,7 +223,7 @@ For more detailed CLI documentation, see [CLI Commands](./cli.md).
 ```bash
 # Server Configuration
 PORT=8080                        # Server port (default: 8080)
-LB_STRATEGY=session             # Load balancing strategy (only 'session' supported)
+LB_STRATEGY=session             # Load balancing strategy: session, least-used, session-affinity, or session-drain-soonest
 SESSION_DURATION_MS=18000000    # Session duration in ms (default: 5 hours)
 
 # OAuth Configuration

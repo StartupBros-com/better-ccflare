@@ -91,7 +91,7 @@ bun run cli --add-account myaccount --mode max --priority 0
 ```bash
 # Environment variables for development
 export PORT=8080
-export LB_STRATEGY=session  # Only 'session' strategy is supported
+export LB_STRATEGY=session  # session (default), least-used, session-affinity, or session-drain-soonest (opt-in)
 export LOG_LEVEL=DEBUG
 export LOG_FORMAT=pretty  # Options: pretty, json
 
@@ -1181,7 +1181,7 @@ find /backup/better-ccflare -name "*.tar.gz" -mtime +30 -delete
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | 8080 | Server port |
-| `LB_STRATEGY` | session | Load balancing strategy (only 'session' is supported) |
+| `LB_STRATEGY` | session | Load balancing strategy: `session`, `least-used`, `session-affinity`, or opt-in `session-drain-soonest`. Session-based strategies preserve OAuth stickiness; `least-used` spreads requests by utilization. |
 | `LOG_LEVEL` | INFO | Logging level: `DEBUG`, `INFO`, `WARN`, `ERROR` |
 | `LOG_FORMAT` | pretty | Log format: `pretty` (human-readable) or `json` (structured) |
 | `better-ccflare_DEBUG` | 0 | Enable debug mode (1/0) - enables console output |
@@ -1228,7 +1228,7 @@ better-ccflare is designed to be flexible and scalable, supporting everything fr
 - **Integrated Binary**: Single executable combining CLI and server functionality
 - **Web Dashboard**: Access analytics and logs through a modern web interface
 - **Async Database Writer**: Improved performance for high-throughput scenarios
-- **Session-based Load Balancing**: Maintains session affinity for optimal performance
+- **Four Load-Balancing Strategies**: Choose account-level sessions, per-client affinity, utilization-based spreading, or the opt-in drain-soonest ordering
 - **Binary Compilation**: Deploy as standalone executable without runtime dependencies
 
 ### Additional Resources
