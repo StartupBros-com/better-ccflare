@@ -1062,6 +1062,7 @@ describe("post-combo normal fallback", () => {
 			error: {
 				type: "rate_limit_error",
 				message: "insufficient credits",
+				code: "xai_402",
 			},
 		});
 		expect(ctx.dbOps.markAccountRateLimited).toHaveBeenCalledTimes(1);
@@ -1240,6 +1241,7 @@ describe("post-combo normal fallback", () => {
 			error: {
 				type: "rate_limit_error",
 				message: "retained predictive proof",
+				code: "xai_402",
 			},
 		});
 		expect(handleStart).toHaveBeenCalledTimes(1);
