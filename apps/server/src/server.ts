@@ -49,7 +49,7 @@ import {
 	getRepresentativeUtilizationForProvider,
 	isCodexSubscriptionEndpoint,
 	resolveCodexEndpoint,
-	type UsageData,
+	type UsageSnapshotPayload,
 	usageCache,
 } from "@better-ccflare/providers";
 import {
@@ -235,7 +235,7 @@ export interface UsageCacheRegistrar {
 		customEndpoint?: string | null,
 		onWindowReset?: (accountId: string) => void,
 		onCapacityRestored?: (accountId: string) => void,
-		onSnapshot?: (accountId: string, data: UsageData) => void,
+		onSnapshot?: (payload: UsageSnapshotPayload) => void,
 	): void;
 }
 
@@ -261,7 +261,7 @@ export function registerMinimaxUsagePolling(
 	usageCache: UsageCacheRegistrar,
 	intervalMs: number,
 	logger?: Logger,
-	onSnapshot?: (accountId: string, data: UsageData) => void,
+	onSnapshot?: (payload: UsageSnapshotPayload) => void,
 ): boolean {
 	if (account.provider !== "minimax") return false;
 	if (!account.api_key) {
@@ -313,7 +313,7 @@ export function bootstrapMinimaxUsagePolling(
 	logger?: Logger,
 	makeOnSnapshot?: (
 		account: Account,
-	) => (accountId: string, data: UsageData) => void,
+	) => (payload: UsageSnapshotPayload) => void,
 ): string[] {
 	const minimaxAccounts = accounts.filter((a) => a.provider === "minimax");
 	const registered: string[] = [];
@@ -780,10 +780,11 @@ function startUsagePollingWithRefresh(
 							),
 						);
 				},
-				(accountId, data) => {
+				(payload) => {
+					const { accountId, windows } = payload;
 					const now = Date.now();
 					proxyContext.dbOps
-						.recordUsageSnapshot(accountId, data, now)
+						.recordUsageSnapshot(accountId, windows, now)
 						.catch((err) =>
 							logger.warn(
 								`Failed to record usage snapshot for account ${accountId}: ${err}`,
@@ -802,7 +803,7 @@ function startUsagePollingWithRefresh(
 							alertService.evaluateUsageSnapshot(
 								accountId,
 								acc?.name ?? account.name,
-								data,
+								windows,
 								now,
 							),
 						)
@@ -1183,26 +1184,23 @@ export default async function startServer(options?: {
 	// Without this these pollers were silently unwired from both surfaces
 	// (pro-gate finding). Best-effort on both calls — never fatal to polling.
 	const makeSnapshotDispatch =
-		(accountName: string) => (accountId: string, data: UsageData) => {
+		(accountName: string) => (payload: UsageSnapshotPayload) => {
+			const { accountId, windows } = payload;
 			const now = Date.now();
 			dbOps
-				.recordUsageSnapshot(accountId, data, now)
+				.recordUsageSnapshot(accountId, windows, now)
 				.catch((err) =>
 					log.warn(
 						`Failed to record usage snapshot for account ${accountId}: ${err}`,
 					),
 				);
-			// Resolve the CURRENT name at dispatch: the closure-captured name
-			// goes stale on rename and could misattribute alerts if the freed
-			// name is reused (pro-gate round-2 finding). Captured name stays
-			// as the fallback when the row read fails.
 			dbOps
 				.getAccount(accountId)
 				.then((acc) =>
 					alertService.evaluateUsageSnapshot(
 						accountId,
 						acc?.name ?? accountName,
-						data,
+						windows,
 						now,
 					),
 				)

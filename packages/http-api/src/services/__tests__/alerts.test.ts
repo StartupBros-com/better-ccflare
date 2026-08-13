@@ -228,9 +228,19 @@ describe("usage-window alert helpers", () => {
 		expect(windows).toHaveLength(2);
 	});
 
-	test("extractUsageWindows treats an unparseable resets_at as null, not NaN", () => {
+	test("extractUsageWindows drops a window whose resets_at is unparseable", () => {
+		// A malformed reset is rejected by the canonical normalizer rather than
+		// coerced to null, which would make it indistinguishable from a window
+		// that legitimately has no cycle boundary (and from NaN arithmetic).
 		const windows = extractUsageWindows({
 			five_hour: { utilization: 42, resets_at: "not-a-date" },
+		});
+		expect(windows).toEqual([]);
+	});
+
+	test("extractUsageWindows keeps a window whose resets_at is explicitly null", () => {
+		const windows = extractUsageWindows({
+			five_hour: { utilization: 42, resets_at: null },
 		});
 		expect(windows).toEqual([
 			{ windowKey: "five_hour", utilization: 42, resetsAtMs: null },

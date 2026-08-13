@@ -5,6 +5,7 @@ import { join } from "node:path";
 import * as cliCommands from "@better-ccflare/cli-commands";
 import type { Config } from "@better-ccflare/config";
 import {
+	normalizeProviderUsageWindows,
 	PAUSE_REASON_NEEDS_REAUTH,
 	patterns,
 	REAUTHENTICATION_REQUIRED_CODE,
@@ -3275,7 +3276,11 @@ export function createAccountForceResetRateLimitHandler(
 				if (usageData) {
 					usageCache.set(account.id, usageData);
 					dbOps
-						.recordUsageSnapshot(account.id, usageData, Date.now())
+						.recordUsageSnapshot(
+							account.id,
+							normalizeProviderUsageWindows(usageData, account.provider),
+							Date.now(),
+						)
 						.catch((err) =>
 							log.warn(
 								`Failed to record usage snapshot for ${account.name}: ${err}`,

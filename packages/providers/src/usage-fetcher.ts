@@ -1,6 +1,13 @@
-import { CLAUDE_CLI_VERSION, getModelFamily } from "@better-ccflare/core";
+import {
+	CLAUDE_CLI_VERSION,
+	getModelFamily,
+	normalizeProviderUsageWindows,
+} from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
-import { supportsUsageTracking } from "@better-ccflare/types";
+import {
+	type CanonicalUsageWindow,
+	supportsUsageTracking,
+} from "@better-ccflare/types";
 import {
 	type AlibabaCodingPlanUsageData,
 	fetchAlibabaCodingPlanUsageData,
@@ -743,6 +750,13 @@ export function getRepresentativeUsageSnapshotForProvider(
  */
 export type AccessTokenProvider = () => Promise<string>;
 
+export interface UsageSnapshotPayload {
+	accountId: string;
+	data: AnyUsageData;
+	provider: string;
+	windows: CanonicalUsageWindow[];
+}
+
 /**
  * In-memory cache for usage data per account
  */
@@ -769,7 +783,7 @@ class UsageCache {
 	>();
 	private snapshotCallbacks = new Map<
 		string,
-		(accountId: string, data: UsageData) => void
+		(payload: UsageSnapshotPayload) => void
 	>();
 	private inFlightFetches = new Map<
 		string,
@@ -852,7 +866,7 @@ class UsageCache {
 		customEndpoint?: string | null,
 		onWindowReset?: (accountId: string) => void,
 		onCapacityRestored?: (accountId: string) => void,
-		onSnapshot?: (accountId: string, data: UsageData) => void,
+		onSnapshot?: (payload: UsageSnapshotPayload) => void,
 	) {
 		// Check if provider supports usage tracking
 		if (provider && !supportsUsageTracking(provider)) {
@@ -1504,7 +1518,15 @@ class UsageCache {
 	 */
 	private notifySnapshot(accountId: string, data: AnyUsageData): void {
 		const snapshotCb = this.snapshotCallbacks.get(accountId);
-		if (snapshotCb) snapshotCb(accountId, data as UsageData);
+		if (snapshotCb) {
+			const provider = this.providerTypes.get(accountId) ?? "anthropic";
+			snapshotCb({
+				accountId,
+				data,
+				provider,
+				windows: normalizeProviderUsageWindows(data, provider),
+			});
+		}
 	}
 
 	private setAuthoritative(accountId: string, data: AnyUsageData): void {
