@@ -12,6 +12,7 @@ import {
 	sanitizers,
 	validateAndSanitizeModelMappings,
 	validateEndpointUrl,
+	validateModelMappings,
 	validateNumber,
 	validatePriority,
 	validateString,
@@ -1378,7 +1379,10 @@ export function createOpenAIAccountAddHandler(dbOps: DatabaseOperations) {
 				}) || 0;
 
 			// Handle model mappings
-			const modelMappings = body.modelMappings || {};
+			const modelMappings = validateModelMappings(
+				body.modelMappings ?? {},
+				"modelMappings",
+			);
 			const finalModelMappings =
 				Object.keys(modelMappings).length > 0
 					? JSON.stringify(modelMappings)
@@ -3048,68 +3052,12 @@ export function createAccountModelMappingsUpdateHandler(
 				return errorResponse(NotFound("Account not found"));
 			}
 
-			// Handle model mappings update
-			const modelMappings = body.modelMappings || {};
-
-			// Validate model mappings - values can be string or string[]
-			if (typeof modelMappings !== "object" || Array.isArray(modelMappings)) {
-				return errorResponse(BadRequest("Model mappings must be an object"));
-			}
-
-			for (const [_key, value] of Object.entries(modelMappings)) {
-				if (typeof value === "string") {
-					if (!value.trim()) {
-						return errorResponse(
-							BadRequest(
-								`Model mapping value for key '${_key}' must not be empty`,
-							),
-						);
-					}
-				} else if (Array.isArray(value)) {
-					if (value.length === 0) {
-						return errorResponse(
-							BadRequest(
-								`Model mapping array for key '${_key}' must not be empty`,
-							),
-						);
-					}
-					for (const item of value) {
-						if (typeof item !== "string" || !item.trim()) {
-							return errorResponse(
-								BadRequest(
-									`All model mapping array values for key '${_key}' must be non-empty strings`,
-								),
-							);
-						}
-					}
-				} else {
-					return errorResponse(
-						BadRequest(
-							"Model mapping values must be strings or arrays of strings",
-						),
-					);
-				}
-			}
-
 			// Build the new model mappings as a full replacement (not a merge).
 			// This ensures that sending an empty {} correctly clears all mappings.
-			const mergedModelMappings: Record<string, string | string[]> = {};
-
-			for (const [modelType, modelValue] of Object.entries(modelMappings)) {
-				if (typeof modelValue === "string") {
-					if (modelValue.trim()) {
-						mergedModelMappings[modelType] = modelValue.trim();
-					}
-				} else if (Array.isArray(modelValue)) {
-					const trimmed = modelValue
-						.map((v) => (typeof v === "string" ? v.trim() : ""))
-						.filter(Boolean);
-					if (trimmed.length > 0) {
-						mergedModelMappings[modelType] =
-							trimmed.length === 1 ? trimmed[0] : trimmed;
-					}
-				}
-			}
+			const mergedModelMappings = validateModelMappings(
+				body.modelMappings ?? {},
+				"modelMappings",
+			);
 
 			// Update the model_mappings field
 			const finalModelMappings =
@@ -3162,15 +3110,17 @@ export function createAccountModelFallbacksUpdateHandler(
 				return errorResponse(NotFound("Account not found"));
 			}
 
-			// Validate fallbacks input
-			const modelFallbacks = body.modelFallbacks || {};
-			if (typeof modelFallbacks !== "object" || Array.isArray(modelFallbacks)) {
-				return errorResponse(BadRequest("Model fallbacks must be an object"));
-			}
-			for (const [_key, value] of Object.entries(modelFallbacks)) {
-				if (typeof value !== "string" || !value.trim()) {
-					return errorResponse(
-						BadRequest("All model fallback values must be non-empty strings"),
+			// Validate fallbacks input. This deprecated endpoint only accepts one
+			// fallback string per key, even though the shared mapping validator also
+			// supports arrays for the replacement endpoint.
+			const validatedFallbacks = validateModelMappings(
+				body.modelFallbacks ?? {},
+				"modelFallbacks",
+			);
+			for (const value of Object.values(validatedFallbacks)) {
+				if (Array.isArray(value)) {
+					throw BadRequest(
+						"All model fallback values must be non-empty strings",
 					);
 				}
 			}
@@ -3184,15 +3134,27 @@ export function createAccountModelFallbacksUpdateHandler(
 
 			if (result?.model_mappings) {
 				try {
-					const parsed = JSON.parse(result.model_mappings);
-					existingMappings = parsed.modelMappings || parsed || {};
+					const parsed = JSON.parse(result.model_mappings) as unknown;
+					existingMappings = validateModelMappings(
+						parsed &&
+							typeof parsed === "object" &&
+							!Array.isArray(parsed) &&
+							"modelMappings" in parsed
+							? (parsed as { modelMappings: unknown }).modelMappings
+							: parsed,
+						"storedModelMappings",
+					);
 				} catch {
-					existingMappings = {};
+					throw BadRequest(
+						"Existing model mappings are invalid; replace them before adding fallbacks",
+					);
 				}
 			}
 
 			// Merge: for each fallback, append to existing mapping array
-			for (const [modelType, fallbackValue] of Object.entries(modelFallbacks)) {
+			for (const [modelType, fallbackValue] of Object.entries(
+				validatedFallbacks,
+			)) {
 				const existing = existingMappings[modelType];
 				const fallback = (fallbackValue as string).trim();
 
@@ -3207,6 +3169,11 @@ export function createAccountModelFallbacksUpdateHandler(
 					existingMappings[modelType] = fallback;
 				}
 			}
+
+			existingMappings = validateModelMappings(
+				existingMappings,
+				"modelMappings",
+			);
 
 			const finalMappings =
 				Object.keys(existingMappings).length > 0
