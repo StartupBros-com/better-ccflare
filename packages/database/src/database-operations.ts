@@ -1074,7 +1074,7 @@ OAuth tokens will need to be re-authenticated.
 
 	async recordUsageSnapshot(
 		accountId: string,
-		usage: Record<string, unknown>,
+		usage: import("@better-ccflare/types").CanonicalUsageWindow[],
 		now: number,
 	): Promise<void> {
 		await this.usageHistory.recordSnapshot(accountId, usage, now);
@@ -1088,6 +1088,21 @@ OAuth tokens will need to be re-authenticated.
 		bucketMs?: number;
 	}) {
 		return this.usageHistory.getSeries(opts);
+	}
+
+	/**
+	 * Fleet-wide history in one set-based query, instead of one query per
+	 * account awaited in turn (#137).
+	 */
+	async getFleetUsageHistory(opts: {
+		accountIds: string[];
+		windowKey?: string;
+		since?: number;
+		until?: number;
+		bucketMs?: number;
+		pointBudget?: number;
+	}) {
+		return this.usageHistory.getFleetUsageHistory(opts);
 	}
 
 	async pruneUsageSnapshots(cutoffTs: number): Promise<number> {

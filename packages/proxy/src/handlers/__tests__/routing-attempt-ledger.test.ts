@@ -83,6 +83,45 @@ describe("RoutingAttemptLedger", () => {
 		expect(ledger.claim("account-a", "   ")).toBe(false);
 	});
 
+	it("matches deterministic failures by endpoint capability and normalized model", () => {
+		const ledger = new RoutingAttemptLedger();
+		const officialOverflow = {
+			failureKind: "authoritative_context_overflow",
+			provider: "codex",
+			endpoint: "https://chatgpt.com/backend-api/codex/responses",
+			capabilityScope: "shared-subscription",
+			model: " GPT-5.4 ",
+		} as const;
+
+		expect(ledger.hasDeterministicFailure(officialOverflow)).toBe(false);
+		ledger.recordDeterministicFailure(officialOverflow);
+
+		expect(
+			ledger.hasDeterministicFailure({
+				...officialOverflow,
+				model: "gpt-5.4",
+			}),
+		).toBe(true);
+		expect(
+			ledger.hasDeterministicFailure({
+				...officialOverflow,
+				model: "gpt-5.6-sol",
+			}),
+		).toBe(false);
+		expect(
+			ledger.hasDeterministicFailure({
+				...officialOverflow,
+				endpoint: "https://custom.example.test/v1/responses",
+			}),
+		).toBe(false);
+		expect(
+			ledger.hasDeterministicFailure({
+				...officialOverflow,
+				capabilityScope: "account:credential-scoped-custom-route",
+			}),
+		).toBe(false);
+	});
+
 	it("blocks every sibling model after an account-wide failure", () => {
 		const ledger = new RoutingAttemptLedger();
 
@@ -191,6 +230,55 @@ describe("RoutingAttemptLedger", () => {
 		expect(await response?.text()).toBe("3");
 		expect(ledger.takeTerminalResponse()).toBeNull();
 		expect(secondDiscard).not.toHaveBeenCalled();
+	});
+
+	it("keeps authoritative context overflow ahead of a later legacy terminal", async () => {
+		const ledger = new RoutingAttemptLedger();
+		const authoritativeDiscard = mock(async () => undefined);
+		const legacyDiscard = mock(async () => undefined);
+
+		await ledger.retainTerminalResponse({
+			terminalKind: "authoritative_context_overflow",
+			deliver: async () =>
+				new Response("authoritative", {
+					status: 400,
+					headers: { "x-upstream-proof": "authoritative" },
+				}),
+			discard: authoritativeDiscard,
+		});
+		await ledger.retainTerminalResponse({
+			terminalKind: "legacy_context_overflow",
+			deliver: async () => new Response("legacy", { status: 400 }),
+			discard: legacyDiscard,
+		});
+
+		expect(authoritativeDiscard).not.toHaveBeenCalled();
+		expect(legacyDiscard).toHaveBeenCalledTimes(1);
+		const retained = ledger.takeTerminalResponse();
+		const response = await retained?.deliver(2);
+		expect(response?.headers.get("x-upstream-proof")).toBe("authoritative");
+	});
+
+	it("keeps context overflow ahead of a later untyped terminal", async () => {
+		const ledger = new RoutingAttemptLedger();
+		const contextDiscard = mock(async () => undefined);
+		const untypedDiscard = mock(async () => undefined);
+
+		await ledger.retainTerminalResponse({
+			terminalKind: "legacy_context_overflow",
+			deliver: async () => new Response("context", { status: 400 }),
+			discard: contextDiscard,
+		});
+		await ledger.retainTerminalResponse({
+			deliver: async () => new Response("model unavailable", { status: 503 }),
+			discard: untypedDiscard,
+		});
+
+		expect(contextDiscard).not.toHaveBeenCalled();
+		expect(untypedDiscard).toHaveBeenCalledTimes(1);
+		const response = await ledger.takeTerminalResponse()?.deliver(1);
+		expect(response?.status).toBe(400);
+		expect(await response?.text()).toBe("context");
 	});
 
 	it("discards retained terminal ownership idempotently", async () => {

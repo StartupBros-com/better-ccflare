@@ -375,6 +375,8 @@ export interface ResponseHandlerOptions {
 	routeCandidateId?: string | null;
 	/** Internal routing context used only for lane-local failure suppression. */
 	routingMeta?: RequestMeta;
+	/** Classified native terminal recorded when this response closes normally. */
+	terminalError?: string | null;
 	/** Aborts the same upstream fetch when terminal stream draining times out. */
 	drainAbort?: AbortController;
 	/** One committed degraded-mode send, transferred after wrapping succeeds. */
@@ -424,6 +426,7 @@ export async function forwardToClient(
 		attemptedModel = null,
 		routeCandidateId = null,
 		routingMeta,
+		terminalError = null,
 		drainAbort,
 		anthropicDegradedLifecycle,
 	} = options;
@@ -1031,12 +1034,14 @@ export async function forwardToClient(
 					? "success"
 					: "failed";
 		if (shouldProcessRequest) {
+			const success = isExpectedResponse(path, response);
 			fireAndForgetEnd(
 				{
 					type: "end",
 					requestId,
-					responseBody: null,
-					success: isExpectedResponse(path, response),
+					...(terminalError ? {} : { responseBody: null }),
+					success,
+					...(!success && terminalError ? { error: terminalError } : {}),
 				},
 				lifecycleCoordinator,
 			);
@@ -1121,13 +1126,21 @@ export async function forwardToClient(
 			}
 
 			if (!shouldProcessRequest) return;
+			const success = isExpectedResponse(path, response);
 			fireAndForgetEnd(
 				{
 					type: "end",
 					requestId,
-					responseBody:
-						cappedBuf.byteLength > 0 ? cappedBuf.toString("base64") : null,
-					success: isExpectedResponse(path, response),
+					...(terminalError
+						? {}
+						: {
+								responseBody:
+									cappedBuf.byteLength > 0
+										? cappedBuf.toString("base64")
+										: null,
+							}),
+					success,
+					...(!success && terminalError ? { error: terminalError } : {}),
 				},
 				lifecycleCoordinator,
 			);

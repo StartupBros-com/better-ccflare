@@ -207,6 +207,8 @@ function makePolicy(
 		anthropicPreCommitRescue: {
 			activate: () => undefined,
 			signal: routeAbort.signal,
+			isRescueCommitted: () => false,
+			markRescueCommitted: () => undefined,
 			commitmentDeadlineAt: deadlineAt,
 			getAttemptCommitmentDeadlineAt: (isFinalAttempt) =>
 				isFinalAttempt ? deadlineAt : attemptDeadlineAt,

@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, it } from "bun:test";
+import { normalizeProviderUsageWindows } from "@better-ccflare/core";
 import { BunSqlAdapter } from "../../adapters/bun-sql-adapter";
 import { DatabaseOperations } from "../../database-operations";
 import { ensureSchema, runMigrations } from "../../migrations";
@@ -40,11 +41,34 @@ function makeRepo(db: Database): UsageHistoryRepository {
 	return new UsageHistoryRepository(new BunSqlAdapter(db));
 }
 
+function canonicalWindows(usage: Record<string, unknown>) {
+	return normalizeProviderUsageWindows(usage, "anthropic");
+}
+
+async function writeSnapshot(
+	repo: UsageHistoryRepository,
+	accountId: string,
+	usage: Record<string, unknown>,
+	now: number,
+): Promise<void> {
+	await repo.recordSnapshot(accountId, canonicalWindows(usage), now);
+}
+
+async function writeDbSnapshot(
+	dbOps: DatabaseOperations,
+	accountId: string,
+	usage: Record<string, unknown>,
+	now: number,
+): Promise<void> {
+	await dbOps.recordUsageSnapshot(accountId, canonicalWindows(usage), now);
+}
+
 describe("UsageHistoryRepository", () => {
 	it("records one row per usage window", async () => {
 		const db = makeDb();
 		const repo = makeRepo(db);
-		await repo.recordSnapshot(
+		await writeSnapshot(
+			repo,
 			"acc1",
 			{
 				five_hour: { utilization: 10, resets_at: "2026-07-05T12:00:00Z" },
@@ -73,7 +97,8 @@ describe("UsageHistoryRepository", () => {
 	it("records limits[]-only payload (session/weekly_all/weekly_scoped, no flat windows)", async () => {
 		const db = makeDb();
 		const repo = makeRepo(db);
-		await repo.recordSnapshot(
+		await writeSnapshot(
+			repo,
 			"acc1",
 			{
 				limits: [
@@ -106,7 +131,8 @@ describe("UsageHistoryRepository", () => {
 	it("does not double-count a flat window already present in limits[]", async () => {
 		const db = makeDb();
 		const repo = makeRepo(db);
-		await repo.recordSnapshot(
+		await writeSnapshot(
+			repo,
 			"acc1",
 			{
 				five_hour: { utilization: 10, resets_at: null },
@@ -127,7 +153,8 @@ describe("UsageHistoryRepository", () => {
 	it("ignores limits[] entries with unknown kind or missing model name", async () => {
 		const db = makeDb();
 		const repo = makeRepo(db);
-		await repo.recordSnapshot(
+		await writeSnapshot(
+			repo,
 			"acc1",
 			{
 				limits: [
@@ -146,9 +173,10 @@ describe("UsageHistoryRepository", () => {
 		const db = makeDb();
 		const repo = makeRepo(db);
 		const usage = { five_hour: { utilization: 10, resets_at: null } };
-		await repo.recordSnapshot("acc1", usage, 1000);
-		await repo.recordSnapshot("acc1", usage, 2000); // same value → still stored
-		await repo.recordSnapshot(
+		await writeSnapshot(repo, "acc1", usage, 1000);
+		await writeSnapshot(repo, "acc1", usage, 2000); // same value → still stored
+		await writeSnapshot(
+			repo,
 			"acc1",
 			{ five_hour: { utilization: 11, resets_at: null } },
 			3000,
@@ -162,15 +190,34 @@ describe("UsageHistoryRepository", () => {
 		db.close();
 	});
 
-	it("skips malformed resets_at (stores null, not NaN)", async () => {
+	it("drops a window whose explicit resets_at is malformed", async () => {
 		const db = makeDb();
 		const repo = makeRepo(db);
-		await repo.recordSnapshot(
+		await writeSnapshot(
+			repo,
 			"acc1",
 			{ five_hour: { utilization: 5, resets_at: "not-a-date" } },
 			1000,
 		);
+		// A malformed reset is rejected upstream by the canonical normalizer, so
+		// the row never reaches history. Storing it as a null reset would make it
+		// indistinguishable from a provider that legitimately has no cycle.
 		const rows = await repo.getSeries({ accountId: "acc1" });
+		expect(rows).toEqual([]);
+		db.close();
+	});
+
+	it("keeps a window whose resets_at is explicitly absent", async () => {
+		const db = makeDb();
+		const repo = makeRepo(db);
+		await writeSnapshot(
+			repo,
+			"acc1",
+			{ five_hour: { utilization: 5, resets_at: null } },
+			1000,
+		);
+		const rows = await repo.getSeries({ accountId: "acc1" });
+		expect(rows).toHaveLength(1);
 		expect(rows[0].resetsAt).toBeNull();
 		db.close();
 	});
@@ -178,17 +225,20 @@ describe("UsageHistoryRepository", () => {
 	it("filters getSeries by time range and orders ascending", async () => {
 		const db = makeDb();
 		const repo = makeRepo(db);
-		await repo.recordSnapshot(
+		await writeSnapshot(
+			repo,
 			"acc1",
 			{ five_hour: { utilization: 1, resets_at: null } },
 			1000,
 		);
-		await repo.recordSnapshot(
+		await writeSnapshot(
+			repo,
 			"acc1",
 			{ five_hour: { utilization: 2, resets_at: null } },
 			2000,
 		);
-		await repo.recordSnapshot(
+		await writeSnapshot(
+			repo,
 			"acc1",
 			{ five_hour: { utilization: 3, resets_at: null } },
 			3000,
@@ -205,12 +255,14 @@ describe("UsageHistoryRepository", () => {
 	it("deleteOlderThan prunes by timestamp", async () => {
 		const db = makeDb();
 		const repo = makeRepo(db);
-		await repo.recordSnapshot(
+		await writeSnapshot(
+			repo,
 			"acc1",
 			{ five_hour: { utilization: 1, resets_at: null } },
 			1000,
 		);
-		await repo.recordSnapshot(
+		await writeSnapshot(
+			repo,
 			"acc1",
 			{ five_hour: { utilization: 2, resets_at: null } },
 			5000,
@@ -233,7 +285,8 @@ describe("DatabaseOperations usage-history facade", () => {
 	it("round-trips a snapshot through recordUsageSnapshot / getUsageHistory", async () => {
 		const dbOps = new DatabaseOperations(":memory:", { walMode: false });
 		try {
-			await dbOps.recordUsageSnapshot(
+			await writeDbSnapshot(
+				dbOps,
 				"acc1",
 				{ five_hour: { utilization: 42, resets_at: "2026-07-05T12:00:00Z" } },
 				1000,
@@ -252,17 +305,20 @@ describe("DatabaseOperations usage-history facade", () => {
 	it("getUsageHistory forwards windowKey/since/until to getSeries", async () => {
 		const dbOps = new DatabaseOperations(":memory:", { walMode: false });
 		try {
-			await dbOps.recordUsageSnapshot(
+			await writeDbSnapshot(
+				dbOps,
 				"acc1",
 				{ five_hour: { utilization: 1, resets_at: null } },
 				1000,
 			);
-			await dbOps.recordUsageSnapshot(
+			await writeDbSnapshot(
+				dbOps,
 				"acc1",
 				{ five_hour: { utilization: 2, resets_at: null } },
 				2000,
 			);
-			await dbOps.recordUsageSnapshot(
+			await writeDbSnapshot(
+				dbOps,
 				"acc1",
 				{ seven_day: { utilization: 9, resets_at: null } },
 				2000,
@@ -283,12 +339,14 @@ describe("DatabaseOperations usage-history facade", () => {
 	it("pruneUsageSnapshots deletes rows older than the cutoff and returns the count", async () => {
 		const dbOps = new DatabaseOperations(":memory:", { walMode: false });
 		try {
-			await dbOps.recordUsageSnapshot(
+			await writeDbSnapshot(
+				dbOps,
 				"acc1",
 				{ five_hour: { utilization: 1, resets_at: null } },
 				1000,
 			);
-			await dbOps.recordUsageSnapshot(
+			await writeDbSnapshot(
+				dbOps,
 				"acc1",
 				{ five_hour: { utilization: 2, resets_at: null } },
 				5000,

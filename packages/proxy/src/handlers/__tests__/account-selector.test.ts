@@ -1,5 +1,6 @@
-import { afterEach, describe, expect, it, mock } from "bun:test";
+import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import type { ImplicitFallbackPolicyConfig } from "@better-ccflare/config";
+import { Logger } from "@better-ccflare/logger";
 import type { Provider } from "@better-ccflare/providers";
 import type {
 	Account,
@@ -5131,5 +5132,65 @@ describe("selectAccountsForRequest — server-tool capability-first routing", ()
 		});
 		expect(meta.routingCandidates).toEqual([]);
 		expect(meta.hardExcludedAccountIds).toBeNull();
+	});
+});
+
+describe("selectAccountsForRequest — pool-floor alarm on the force-route path", () => {
+	it("alarms when capacity excludes the only force-routed candidate", async () => {
+		// Regression fence. The force-route path never builds a candidate catalog,
+		// so it leaves routingCandidateCatalog/routingCandidates null. Deriving the
+		// alarm's pool sizes from meta therefore reported an unknown pool, and
+		// buildPoolFloorEvent bails on an unknown pool — so the alarm silently
+		// never fired on the one path that actually produces route_unavailable.
+		const forced = makeAccount({
+			id: "acc-force-poolfloor",
+			name: "forced-capacity",
+		});
+		const ctx = makeCtx({ accounts: [forced] });
+		cacheUsage(forced.id, {
+			spend: { enabled: false },
+			limits: [
+				{
+					kind: "weekly_scoped",
+					percent: 100,
+					resets_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+					scope: {
+						model: { id: null, display_name: "Fable" },
+						surface: null,
+					},
+				},
+			],
+		});
+		const meta = makeRequestMeta({
+			id: "req-force-poolfloor",
+			headers: new Headers({ "x-better-ccflare-account-id": forced.id }),
+		});
+
+		// A lane string unique to this test: the alarm throttles per (lane,
+		// severity) in module-level state, so a shared model name would make this
+		// assertion depend on which other tests ran first.
+		const lane = "claude-fable-5-poolfloor-fence";
+		const errors = spyOn(Logger.prototype, "error").mockImplementation(
+			() => {},
+		);
+		try {
+			await expect(
+				selectAccountsForRequest(meta, ctx, lane),
+			).rejects.toBeInstanceOf(ForceRouteUnavailableError);
+
+			const alarm = errors.mock.calls.find(
+				(call) =>
+					typeof call[0] === "string" && call[0].includes("Routing pool floor"),
+			);
+			expect(alarm).toBeDefined();
+			expect(alarm?.[1]).toMatchObject({
+				severity: "floor",
+				lane,
+				candidatesBefore: 1,
+				candidatesAfter: 0,
+			});
+		} finally {
+			errors.mockRestore();
+		}
 	});
 });

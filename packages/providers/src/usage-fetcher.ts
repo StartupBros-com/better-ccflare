@@ -1,6 +1,13 @@
-import { CLAUDE_CLI_VERSION, getModelFamily } from "@better-ccflare/core";
+import {
+	CLAUDE_CLI_VERSION,
+	getModelFamily,
+	normalizeProviderUsageWindows,
+} from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
-import { supportsUsageTracking } from "@better-ccflare/types";
+import {
+	type CanonicalUsageWindow,
+	supportsUsageTracking,
+} from "@better-ccflare/types";
 import {
 	type AlibabaCodingPlanUsageData,
 	fetchAlibabaCodingPlanUsageData,
@@ -833,6 +840,13 @@ export function getRepresentativeUsageSnapshotForProvider(
  */
 export type AccessTokenProvider = () => Promise<string>;
 
+export interface UsageSnapshotPayload {
+	accountId: string;
+	data: AnyUsageData;
+	provider: string;
+	windows: CanonicalUsageWindow[];
+}
+
 type PollRegistration = {
 	accountId: string;
 	epoch: number;
@@ -842,7 +856,7 @@ type PollRegistration = {
 	baseIntervalMs: number;
 	onWindowReset?: (accountId: string) => void;
 	onCapacityRestored?: (accountId: string) => void;
-	onSnapshot?: (accountId: string, data: UsageData) => void;
+	onSnapshot?: (payload: UsageSnapshotPayload) => void;
 	timer?: NodeJS.Timeout;
 	abortController: AbortController;
 	failureCount: number;
@@ -935,7 +949,16 @@ class UsageCache {
 		data: AnyUsageData,
 	): void {
 		if (!this.isCurrent(registration)) return;
-		registration.onSnapshot?.(registration.accountId, data as UsageData);
+		// Normalize once, here, so history persistence and alert evaluation both
+		// receive the same canonical windows instead of re-deriving them from the
+		// raw payload with their own copy of each provider's shape rules.
+		const provider = registration.provider ?? "anthropic";
+		registration.onSnapshot?.({
+			accountId: registration.accountId,
+			data,
+			provider,
+			windows: normalizeProviderUsageWindows(data, provider),
+		});
 	}
 
 	private notifyRegistrationWindowReset(
@@ -1007,7 +1030,7 @@ class UsageCache {
 		customEndpoint?: string | null,
 		onWindowReset?: (accountId: string) => void,
 		onCapacityRestored?: (accountId: string) => void,
-		onSnapshot?: (accountId: string, data: UsageData) => void,
+		onSnapshot?: (payload: UsageSnapshotPayload) => void,
 	) {
 		// Check if provider supports usage tracking
 		if (provider && !supportsUsageTracking(provider)) {

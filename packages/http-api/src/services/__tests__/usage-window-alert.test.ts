@@ -19,6 +19,7 @@ import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { EventEmitter } from "node:events";
 import type { Config } from "@better-ccflare/config";
+import { normalizeProviderUsageWindows } from "@better-ccflare/core";
 import { BunSqlAdapter, ensureSchema } from "@better-ccflare/database";
 import type { AlertEvent } from "@better-ccflare/types";
 import { AlertService } from "../alerts";
@@ -47,6 +48,10 @@ const FIVE_HOURS_MS = 5 * 60 * 60 * 1000;
 
 /** Insert a historical usage_snapshots row directly (mirrors what
  * dbOps.recordUsageSnapshot would have written on an earlier poll). */
+function anthropicWindows(usage: unknown) {
+	return normalizeProviderUsageWindows(usage, "anthropic");
+}
+
 function seedSnapshot(
 	sqlite: Database,
 	opts: {
@@ -93,12 +98,12 @@ describe("AlertService usage-window alerts", () => {
 		await service.evaluateUsageSnapshot(
 			"acct-1",
 			"Primary account",
-			{
+			anthropicWindows({
 				five_hour: {
 					utilization: 92,
 					resets_at: new Date(resetsAtMs).toISOString(),
 				},
-			},
+			}),
 			now,
 		);
 
@@ -128,12 +133,12 @@ describe("AlertService usage-window alerts", () => {
 			await service.evaluateUsageSnapshot(
 				"acct-1",
 				"Primary account",
-				{
+				anthropicWindows({
 					five_hour: {
 						utilization: 92,
 						resets_at: new Date(resetsAtMs + jitterMs).toISOString(),
 					},
-				},
+				}),
 				start + 90_000,
 			);
 		}
@@ -153,14 +158,14 @@ describe("AlertService usage-window alerts", () => {
 			await service.evaluateUsageSnapshot(
 				"acct-1",
 				"Primary account",
-				{
+				anthropicWindows({
 					five_hour: {
 						utilization: 92,
 						resets_at: new Date(
 							start + FIVE_HOURS_MS * (cycle + 1),
 						).toISOString(),
 					},
-				},
+				}),
 				start + cycle * FIVE_HOURS_MS,
 			);
 		}
@@ -187,7 +192,7 @@ describe("AlertService usage-window alerts", () => {
 		await service.evaluateUsageSnapshot(
 			"acct-1",
 			"Primary account",
-			usage,
+			anthropicWindows(usage),
 			start,
 		);
 		// Re-poll ~90s later, same window cycle (same resets_at), still above
@@ -195,7 +200,7 @@ describe("AlertService usage-window alerts", () => {
 		await service.evaluateUsageSnapshot(
 			"acct-1",
 			"Primary account",
-			usage,
+			anthropicWindows(usage),
 			start + 90_000,
 		);
 
@@ -215,12 +220,12 @@ describe("AlertService usage-window alerts", () => {
 		await service.evaluateUsageSnapshot(
 			"acct-1",
 			"Primary account",
-			{
+			anthropicWindows({
 				five_hour: {
 					utilization: 95,
 					resets_at: new Date(firstResetMs).toISOString(),
 				},
-			},
+			}),
 			start,
 		);
 
@@ -230,12 +235,12 @@ describe("AlertService usage-window alerts", () => {
 		await service.evaluateUsageSnapshot(
 			"acct-1",
 			"Primary account",
-			{
+			anthropicWindows({
 				five_hour: {
 					utilization: 91,
 					resets_at: new Date(secondResetMs).toISOString(),
 				},
-			},
+			}),
 			secondPollTs,
 		);
 
@@ -253,12 +258,12 @@ describe("AlertService usage-window alerts", () => {
 		await service.evaluateUsageSnapshot(
 			"acct-1",
 			"Primary account",
-			{
+			anthropicWindows({
 				five_hour: {
 					utilization: 89,
 					resets_at: new Date(now + FIVE_HOURS_MS).toISOString(),
 				},
-			},
+			}),
 			now,
 		);
 
@@ -297,12 +302,12 @@ describe("AlertService usage-window alerts", () => {
 		await service.evaluateUsageSnapshot(
 			"acct-1",
 			"Primary account",
-			{
+			anthropicWindows({
 				five_hour: {
 					utilization: 70,
 					resets_at: new Date(resetsAtMs).toISOString(),
 				},
-			},
+			}),
 			now,
 		);
 
@@ -352,12 +357,12 @@ describe("AlertService usage-window alerts", () => {
 			await service.evaluateUsageSnapshot(
 				"acct-1",
 				"Primary account",
-				{
+				anthropicWindows({
 					five_hour: {
 						utilization,
 						resets_at: new Date(resetsAtMs).toISOString(),
 					},
-				},
+				}),
 				now + pollOffset,
 			);
 		}
@@ -397,12 +402,12 @@ describe("AlertService usage-window alerts", () => {
 		await service.evaluateUsageSnapshot(
 			"acct-1",
 			"Primary account",
-			{
+			anthropicWindows({
 				five_hour: {
 					utilization: 60,
 					resets_at: new Date(resetsAtMs).toISOString(),
 				},
-			},
+			}),
 			now,
 		);
 
@@ -436,12 +441,12 @@ describe("AlertService usage-window alerts", () => {
 		await service.evaluateUsageSnapshot(
 			"acct-1",
 			"Primary account",
-			{
+			anthropicWindows({
 				five_hour: {
 					utilization: 40,
 					resets_at: new Date(resetsAtMs).toISOString(),
 				},
-			},
+			}),
 			now,
 		);
 
@@ -459,12 +464,12 @@ describe("AlertService usage-window alerts", () => {
 		await service.evaluateUsageSnapshot(
 			"acct-1",
 			"Primary account",
-			{
+			anthropicWindows({
 				five_hour: {
 					utilization: 30,
 					resets_at: new Date(now + FIVE_HOURS_MS).toISOString(),
 				},
-			},
+			}),
 			now,
 		);
 
@@ -479,7 +484,31 @@ describe("AlertService usage-window alerts", () => {
 		await service.evaluateUsageSnapshot(
 			"acct-1",
 			"Primary account",
-			{ five_hour: { utilization: 99, resets_at: null } },
+			anthropicWindows({ five_hour: { utilization: 99, resets_at: null } }),
+			now,
+		);
+
+		expect(await service.listAlerts()).toHaveLength(0);
+	});
+
+	it("does not alert for inactive capacity rows", async () => {
+		service = new AlertService(new BunSqlAdapter(sqlite), makeConfig());
+		service.start();
+
+		const now = 1_800_000_000_000;
+		await service.evaluateUsageSnapshot(
+			"acct-1",
+			"Primary account",
+			anthropicWindows({
+				limits: [
+					{
+						kind: "session",
+						percent: 99,
+						resets_at: new Date(now + FIVE_HOURS_MS).toISOString(),
+						is_active: false,
+					},
+				],
+			}),
 			now,
 		);
 
@@ -504,12 +533,12 @@ describe("AlertService usage-window alerts", () => {
 			await service.evaluateUsageSnapshot(
 				"acct-1",
 				"Primary account",
-				{
+				anthropicWindows({
 					five_hour: {
 						utilization,
 						resets_at: new Date(resetsAtMs).toISOString(),
 					},
-				},
+				}),
 				start + pollOffset,
 			);
 		}
@@ -528,12 +557,12 @@ describe("AlertService usage-window alerts", () => {
 		await service.evaluateUsageSnapshot(
 			"acct-1",
 			"Primary account",
-			{
+			anthropicWindows({
 				five_hour: {
 					utilization: 100,
 					resets_at: new Date(now + FIVE_HOURS_MS).toISOString(),
 				},
-			},
+			}),
 			now,
 		);
 
@@ -555,7 +584,7 @@ describe("AlertService usage-window alerts", () => {
 		await service.evaluateUsageSnapshot(
 			"acct-1",
 			"Primary account",
-			{
+			anthropicWindows({
 				limits: [
 					{
 						kind: "session",
@@ -564,7 +593,7 @@ describe("AlertService usage-window alerts", () => {
 					},
 					{ kind: "weekly_all", percent: 12, resets_at: null },
 				],
-			},
+			}),
 			now,
 		);
 
@@ -615,12 +644,12 @@ describe("AlertService usage-window alerts", () => {
 		await service.evaluateUsageSnapshot(
 			"acct-1",
 			"Primary account",
-			{
+			anthropicWindows({
 				five_hour: {
 					utilization: 70,
 					resets_at: new Date(resetsAtMs).toISOString(),
 				},
-			},
+			}),
 			now,
 		);
 
@@ -646,12 +675,12 @@ describe("AlertService usage-window alerts", () => {
 			await service.evaluateUsageSnapshot(
 				"acct-1",
 				"Primary account",
-				{
+				anthropicWindows({
 					five_hour: {
 						utilization: 92,
 						resets_at: new Date(resetsAtMs + jitterMs).toISOString(),
 					},
-				},
+				}),
 				start + 90_000,
 			);
 		}

@@ -1,5 +1,6 @@
 import {
 	type AccountUsageSnapshot,
+	getConfiguredModelMapping,
 	getInPlaceRetryDrainTimeoutMs,
 	getModelFamily,
 	getModelList,
@@ -63,7 +64,10 @@ import type {
 } from "../anthropic-degraded-observability";
 import { AnthropicDegradedResponseLifecycle } from "../anthropic-degraded-response-lifecycle";
 import { finishDegradedRequestFromPermitOutcome } from "../anthropic-degraded-runtime";
-import type { AnthropicPreCommitRescueRouteContext } from "../anthropic-precommit-rescue";
+import {
+	type AnthropicPreCommitRescueRouteContext,
+	isSuccessfulAnthropicPreCommitRescueSse,
+} from "../anthropic-precommit-rescue";
 import {
 	AnthropicPreCommitAbortedError,
 	AnthropicPreCommitStallError,
@@ -105,6 +109,7 @@ import { RequestBodyContext } from "../request-body-context";
 import {
 	forwardToClient,
 	handleAnthropicSseRateLimit,
+	type ResponseHandlerOptions,
 } from "../response-handler";
 import { evaluateServerToolReplayEligibility } from "../server-tool-replay-eligibility";
 import {
@@ -138,7 +143,10 @@ import {
 import { makeProxyRequest, validateProviderPath } from "./request-handler";
 import { handleProxyError, processProxyResponse } from "./response-processor";
 import { isRetryable429 } from "./retryable-429";
-import type { RoutingAttemptLedger } from "./routing-attempt-ledger";
+import type {
+	DeterministicFailureCapabilityKey,
+	RoutingAttemptLedger,
+} from "./routing-attempt-ledger";
 import { createProtectedAnthropicOverloadResponse } from "./routing-terminal";
 import {
 	canAttemptStaleTokenRefresh,
@@ -282,10 +290,41 @@ export interface AnthropicDegradedRequestSendState {
 	readonly tracker?: DegradedModeRequestTracker | null;
 }
 
+export type ProxyAccountResponseDisposition =
+	| "ordinary"
+	| "irreversible_no_replay";
+
+export interface PreparedProxyAccountResponse {
+	readonly kind: "prepared_proxy_account_response";
+	readonly response: Response;
+	readonly disposition: ProxyAccountResponseDisposition;
+	readonly account: Account;
+	readonly candidateId: string;
+	/** Snapshot after this attempt has completed all implicit route discovery. */
+	readonly isFinalAttempt: boolean;
+	/** Whether an ordinary failure resumes the outer route queue. */
+	readonly continueAfterOrdinaryFailure: boolean;
+	/** Evaluated by the outer arbiter immediately before terminal ownership. */
+	canSupersedeRetainedTerminal(): boolean;
+	commit(): Promise<Response>;
+	discard(reason?: string): Promise<void>;
+}
+
 export type ProxyWithAccountResult =
+	| PreparedProxyAccountResponse
 	| Response
 	| null
 	| AnthropicDegradedSendDenied;
+
+export function isPreparedProxyAccountResponse(
+	value: unknown,
+): value is PreparedProxyAccountResponse {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		(value as { kind?: unknown }).kind === "prepared_proxy_account_response"
+	);
+}
 
 class AnthropicDegradedSendDeniedError extends Error {
 	constructor(readonly denial: AnthropicDegradedSendDenied) {
@@ -440,6 +479,10 @@ export interface ContextAdmissionEstimate {
 export interface ModelFallbackExecutionPolicy {
 	/** Immutable ID of the exact route candidate being executed. */
 	readonly routeCandidateId: string;
+	/** Defer final forwarding until the request scheduler chooses the winner. */
+	readonly prepareFinalResponse?: boolean;
+	/** A scheduler-promoted/deferred miss must resume its untouched queue tail. */
+	readonly continueAfterPreparedFailure?: boolean;
 	/**
 	 * A globally deferred physical-model route may outlive replacement of the
 	 * selector sidecar that admitted its source candidate. It must recompute an
@@ -1393,6 +1436,27 @@ async function classifyCodexContextOverflowError(
 		: null;
 }
 
+function buildCodexContextOverflowCapabilityKey(
+	endpoint: string,
+	model: string | null | undefined,
+	accountId: string,
+): DeterministicFailureCapabilityKey {
+	const subscriptionEndpoint = isCodexSubscriptionEndpoint(endpoint);
+	return {
+		failureKind: "authoritative_context_overflow",
+		provider: "codex",
+		// All official subscription-account URLs share one wire capability even
+		// when harmless query/trailing-slash variants differ. A custom gateway may
+		// select a different deployment from each account's bearer token, so URL
+		// equality alone is never proof that two custom-account routes are equivalent.
+		endpoint: subscriptionEndpoint ? "codex-subscription" : endpoint,
+		capabilityScope: subscriptionEndpoint
+			? "shared-subscription"
+			: `account:${accountId}`,
+		model,
+	};
+}
+
 function createCodexContextOverflowTerminalResponse(
 	authoritative: boolean,
 ): Response {
@@ -1970,6 +2034,12 @@ export async function proxyWithAccount(
 				? { admission: anthropicDegraded, lifecycle: null, tracker: null }
 				: undefined;
 	const preCommitRescue = modelFallbackPolicy?.anthropicPreCommitRescue;
+	let preparedResponseOwnsLifecycle = false;
+	const canPreparedResponseSupersedeRetainedTerminal = (
+		candidate: Response,
+	): boolean =>
+		preCommitRescue?.isRescueCommitted() !== true ||
+		isSuccessfulAnthropicPreCommitRescueSse(candidate);
 	const routingSignal = preCommitRescue?.signal ?? req.signal;
 	const currentTransportSignal = (): AbortSignal => {
 		const lifecycle = anthropicDegradedState?.lifecycle;
@@ -2162,6 +2232,29 @@ export async function proxyWithAccount(
 			});
 		}
 		const requestedModelBeforeAdmission = effectiveBodyContext.getModel();
+		const cacheReplayPhysicalModel = req.headers.get(CACHE_REPLAY_MODEL_HEADER);
+		const requestedConfiguredModelMapping = requestedModelBeforeAdmission
+			? getConfiguredModelMapping(requestedModelBeforeAdmission, account)
+			: null;
+		const hasExactPreAdmissionModelIdentity =
+			cacheReplayPhysicalModel !== null ||
+			(requestedModelBeforeAdmission !== null &&
+				getModelFamily(requestedModelBeforeAdmission) === null) ||
+			(requestedConfiguredModelMapping !== null &&
+				requestedConfiguredModelMapping.models.length > 0 &&
+				requestedConfiguredModelMapping.models.every(
+					(model) => getModelFamily(model) === null,
+				));
+		// Context admission itself resolves logical families. An unhydrated Codex
+		// account must first learn its own defaults, otherwise the provider-wide
+		// fallback can make a sibling's model look candidate-specific and suppress a
+		// legitimately distinct frontier. Exact replay, operator mapping, and
+		// concrete input identities remain safe to admit without credential work.
+		const ensuredCodexDefaultsBeforeAdmission =
+			account.provider === "codex" && !hasExactPreAdmissionModelIdentity;
+		if (ensuredCodexDefaultsBeforeAdmission) {
+			await ensureCodexModelDefaults(account, ctx);
+		}
 		const concreteCodexModels =
 			account.provider === "codex" && requestedModelBeforeAdmission
 				? getConcreteCodexModelList(account, requestedModelBeforeAdmission)
@@ -2270,7 +2363,7 @@ export async function proxyWithAccount(
 		}
 		const admittedRequestModel =
 			admission.model ?? requestedModelBeforeAdmission ?? null;
-		const concreteAttemptModel =
+		const preEnsureConcreteAttemptModel =
 			account.provider === "codex" && admittedRequestModel
 				? resolveCodexRequestModel(admittedRequestModel, account)
 				: admittedRequestModel
@@ -2432,7 +2525,6 @@ export async function proxyWithAccount(
 			});
 		};
 
-		const cacheReplayPhysicalModel = req.headers.get(CACHE_REPLAY_MODEL_HEADER);
 		const createPlanningRequest = (bodyBuffer: ArrayBuffer | null): Request => {
 			const init: RequestInit & { duplex?: "half" } = {
 				method: req.method,
@@ -2496,14 +2588,104 @@ export async function proxyWithAccount(
 			assertAttemptPlanCapabilityIsCurrent(plan);
 			return plan.transformRequestBody(request);
 		};
-		if (provider.name === "codex") {
+		const preflightEndpoint =
+			provider.name === "codex" && account.provider === "codex"
+				? provider.buildUrl(url.pathname, url.search, account)
+				: null;
+		const explicitlyMappedModel = requestedConfiguredModelMapping
+			? admission.model &&
+				requestedConfiguredModelMapping.models.includes(admission.model)
+				? admission.model
+				: admission.model === requestedModelBeforeAdmission
+					? (requestedConfiguredModelMapping.models[0] ?? null)
+					: null
+			: null;
+		const concreteInputModel =
+			requestedModelBeforeAdmission &&
+			getModelFamily(requestedModelBeforeAdmission) === null
+				? requestedModelBeforeAdmission
+				: null;
+		// A compiled family default is only a guess until catalog hydration. It
+		// must not suppress a sibling account before that account can reveal a
+		// distinct live frontier. Cache replay, actual explicit mappings, and
+		// concrete model IDs are the only exact pre-credential identities.
+		const preflightPhysicalModel =
+			cacheReplayPhysicalModel ??
+			(explicitlyMappedModel && getModelFamily(explicitlyMappedModel) === null
+				? explicitlyMappedModel
+				: null) ??
+			concreteInputModel;
+		const preflightContextOverflowCapability =
+			routingAttemptLedger &&
+			preflightEndpoint &&
+			serverToolRequirements === undefined
+				? buildCodexContextOverflowCapabilityKey(
+						preflightEndpoint,
+						preflightPhysicalModel,
+						account.id,
+					)
+				: null;
+		if (
+			preflightContextOverflowCapability &&
+			routingAttemptLedger?.hasDeterministicFailure(
+				preflightContextOverflowCapability,
+			)
+		) {
+			if (attemptAdmissionTracker) {
+				attemptAdmissionTracker.nonCapacitySkipCount++;
+			}
+			log.debug(
+				`Skipping request-local deterministic Codex context overflow before credential resolution account=${account.name} model=${preflightPhysicalModel ?? "unknown"}`,
+			);
+			return null;
+		}
+		if (provider.name === "codex" && !ensuredCodexDefaultsBeforeAdmission) {
 			await ensureCodexModelDefaults(account, ctx);
 		}
+		// Catalog hydration can change a logical Claude-family request from the
+		// compiled Codex fallback to the account/provider's live frontier. Resolve
+		// again after `ensureCodexModelDefaults`, then bind the plan and transform to
+		// that account's exact physical identity. The preflight key above remains a
+		// cheap request-local skip only when an explicit or cache-replay identity was
+		// already known; a legitimate account-specific catalog change is not plan
+		// drift.
+		const concreteAttemptModel =
+			account.provider === "codex" && admittedRequestModel
+				? resolveCodexRequestModel(admittedRequestModel, account)
+				: preEnsureConcreteAttemptModel;
+		const plannedPhysicalModel =
+			cacheReplayPhysicalModel ?? concreteAttemptModel;
 		let attemptPlan = materializeAttemptPlan(
 			effectiveBodyBuffer,
-			cacheReplayPhysicalModel ?? concreteAttemptModel,
+			plannedPhysicalModel,
 			modelFallbackPolicy?.recomputeServerToolCapability !== true,
 		);
+		const contextOverflowCapabilityForPlan = (
+			plan: ProviderAttemptPlan,
+		): DeterministicFailureCapabilityKey | null =>
+			plan.providerName === "codex" && account.provider === "codex"
+				? buildCodexContextOverflowCapabilityKey(
+						plan.targetUrl,
+						plan.physicalModel,
+						account.id,
+					)
+				: null;
+		let currentContextOverflowCapability =
+			contextOverflowCapabilityForPlan(attemptPlan);
+		if (
+			currentContextOverflowCapability &&
+			routingAttemptLedger?.hasDeterministicFailure(
+				currentContextOverflowCapability,
+			)
+		) {
+			if (attemptAdmissionTracker) {
+				attemptAdmissionTracker.nonCapacitySkipCount++;
+			}
+			log.debug(
+				`Skipping request-local deterministic Codex context overflow account=${account.name} model=${attemptPlan.physicalModel ?? "unknown"}`,
+			);
+			return null;
+		}
 		let attemptProvider = bindProviderAttemptPlan(attemptPlan);
 		const attemptProxyContext = (): ProxyContext => ({
 			...ctx,
@@ -3221,7 +3403,9 @@ export async function proxyWithAccount(
 		);
 		transformedRequest = await enforcePhysicalModelAfterTransform(
 			transformedRequest,
-			replayResolvedModel,
+			attemptPlan.providerName === "codex"
+				? attemptPlan.physicalModel
+				: replayResolvedModel,
 		);
 		// Provider-local stream intent must reach processResponse, not upstream.
 		// Capture it before transport sanitization and reattach only to the local
@@ -3537,20 +3721,87 @@ export async function proxyWithAccount(
 			authoritative: boolean,
 		): Promise<void> => {
 			if (routingAttemptLedger) {
+				// This response may outlive later account/model attempts. Freeze the exact
+				// route contract now so delayed delivery cannot inherit mutable provider or
+				// model state from whichever attempt happens to run last.
+				const retainedProxyContext = attemptProxyContext();
+				const retainedForwardOptions: Omit<
+					ResponseHandlerOptions,
+					"response" | "failoverAttempts" | "terminalError"
+				> = {
+					requestId: requestMeta.id,
+					method: req.method,
+					path: url.pathname,
+					account,
+					requestHeaders: req.headers,
+					requestBody: effectiveBodyBuffer,
+					project: requestMeta.project,
+					clientSessionId: requestMeta.clientSessionId ?? null,
+					query: url.search || null,
+					projectAttributionSource:
+						requestMeta.projectAttributionSource ?? null,
+					timestamp: requestMeta.timestamp,
+					retryAttempt: 0,
+					agentUsed: requestMeta.agentUsed,
+					originalModel: requestMeta.originalModel,
+					appliedModel: attemptAppliedModel,
+					attemptedModel: currentTransportModel,
+					agentAttributionSource: requestMeta.agentAttributionSource ?? null,
+					comboName: requestMeta.comboName ?? null,
+					comboModelOverrideFrom,
+					comboModelOverrideTo,
+					apiKeyId,
+					apiKeyName,
+					xaiCacheIdentityFingerprint: requestMeta.xaiCacheIdentityFingerprint,
+					xaiCachePrefixFingerprint: requestMeta.xaiCachePrefixFingerprint,
+					xaiCacheOfficialEndpoint,
+					xaiCacheKeyPresent,
+					cacheFlightRecorderConversationId:
+						requestMeta.cacheFlightRecorderConversationId,
+					cacheFlightRecorderEligible,
+					cacheFlightRecorderNativeActive:
+						requestMeta.xaiCacheNativeActive === true,
+					routeCandidateId,
+					routingMeta: requestMeta,
+					anthropicDegradedLifecycle: activeLifecycleForLatestResponse(),
+					drainAbort: drainAbortController,
+				};
 				await routingAttemptLedger.retainTerminalResponse({
 					terminalKind: authoritative
 						? "authoritative_context_overflow"
 						: "legacy_context_overflow",
-					deliver: async () => {
-						const retainedSessionId = sessionIdForObservation(req.headers);
-						if (retainedSessionId) {
-							recordServedAccount(
-								retainedSessionId,
-								account.id,
-								requestMeta.timestamp,
+					deliver: async (terminalFailoverAttempts) => {
+						if (preCommitRescue?.isRescueCommitted()) {
+							// The committed rescue owns the HTTP-200 wire response. Start its
+							// deferred account-backed lifecycle through the ordinary seam using a
+							// bodyless response shell; the outer terminal recorder then replaces
+							// this pending success with context_length_exceeded exactly once.
+							await forwardToClient(
+								{
+									...retainedForwardOptions,
+									response: new Response(null, {
+										status: 200,
+										headers: {
+											"cache-control": "no-cache",
+											"content-type": "text/event-stream; charset=utf-8",
+											"x-better-ccflare-precommit-rescue": "active",
+										},
+									}),
+									failoverAttempts: terminalFailoverAttempts,
+								},
+								retainedProxyContext,
 							);
+							return withSanitizedProxyHeaders(retainedContextOverflowResponse);
 						}
-						return withSanitizedProxyHeaders(retainedContextOverflowResponse);
+						return forwardToClient(
+							{
+								...retainedForwardOptions,
+								response: retainedContextOverflowResponse,
+								failoverAttempts: terminalFailoverAttempts,
+								terminalError: "context_length_exceeded",
+							},
+							retainedProxyContext,
+						);
 					},
 					discard: () => discardUpstreamBody(retainedContextOverflowResponse),
 				});
@@ -3578,14 +3829,20 @@ export async function proxyWithAccount(
 			);
 			if (!classification) return false;
 			const authoritative = classification === "authoritative";
-			if (
-				authoritative
-					? !canReplayContextOverflow() && !hasRetainedLegacyContextOverflow()
-					: codexContextOverflowFallbackModel === null
-			) {
+			const retainedLegacyContextOverflow = hasRetainedLegacyContextOverflow();
+			const canReplayAuthoritativeOverflow =
+				authoritative && canReplayContextOverflow();
+			if (authoritative) {
+				if (currentContextOverflowCapability) {
+					routingAttemptLedger?.recordDeterministicFailure(
+						currentContextOverflowCapability,
+					);
+				}
+			}
+			if (!authoritative && codexContextOverflowFallbackModel === null) {
 				return false;
 			}
-			if (!authoritative && codexContextOverflowFallbackModel) {
+			if (codexContextOverflowFallbackModel) {
 				modelFallbackPolicy?.preferContextOverflowFallback?.(
 					codexContextOverflowFallbackModel,
 				);
@@ -3595,9 +3852,11 @@ export async function proxyWithAccount(
 				accountId: account.id,
 				attemptedModel: currentTransportModel,
 				fallbackScope: authoritative
-					? hasRetainedLegacyContextOverflow()
+					? retainedLegacyContextOverflow
 						? "larger_model_terminal"
-						: "remaining_route"
+						: canReplayAuthoritativeOverflow
+							? "remaining_route"
+							: "final_route_terminal"
 					: "larger_model",
 				responseStatus: candidateResponse.status,
 			});
@@ -4875,6 +5134,50 @@ export async function proxyWithAccount(
 						// badge here too — otherwise a force-routed request that ends in
 						// model-not-found leaves the badge showing a previously-served
 						// account (skips synthetic keepalive/auto-refresh traffic).
+						const modelUnavailableProxyContext = attemptProxyContext();
+						const modelUnavailableForwardBase: Omit<
+							ResponseHandlerOptions,
+							"response" | "failoverAttempts"
+						> = {
+							requestId: requestMeta.id,
+							method: req.method,
+							path: url.pathname,
+							account,
+							requestHeaders: req.headers,
+							requestBody: effectiveBodyBuffer,
+							project: requestMeta.project,
+							clientSessionId: requestMeta.clientSessionId ?? null,
+							query: url.search || null,
+							projectAttributionSource:
+								requestMeta.projectAttributionSource ?? null,
+							timestamp: requestMeta.timestamp,
+							retryAttempt: 0,
+							agentUsed: requestMeta.agentUsed,
+							originalModel: requestMeta.originalModel,
+							appliedModel: attemptAppliedModel,
+							attemptedModel: currentTransportModel,
+							agentAttributionSource:
+								requestMeta.agentAttributionSource ?? null,
+							comboName: requestMeta.comboName,
+							comboModelOverrideFrom,
+							comboModelOverrideTo,
+							apiKeyId,
+							apiKeyName,
+							xaiCacheIdentityFingerprint:
+								requestMeta.xaiCacheIdentityFingerprint,
+							xaiCachePrefixFingerprint: requestMeta.xaiCachePrefixFingerprint,
+							xaiCacheOfficialEndpoint,
+							xaiCacheKeyPresent,
+							cacheFlightRecorderConversationId:
+								requestMeta.cacheFlightRecorderConversationId,
+							cacheFlightRecorderEligible,
+							cacheFlightRecorderNativeActive:
+								requestMeta.xaiCacheNativeActive === true,
+							routeCandidateId,
+							routingMeta: requestMeta,
+							anthropicDegradedLifecycle: activeLifecycleForLatestResponse(),
+							drainAbort: drainAbortController,
+						};
 						if (
 							modelFallbackPolicy?.forwardModelUnavailableResponse === false
 						) {
@@ -4885,19 +5188,14 @@ export async function proxyWithAccount(
 							if (routingAttemptLedger) {
 								const retainedModelUnavailableResponse = rawResponse;
 								await routingAttemptLedger.retainTerminalResponse({
-									deliver: async () => {
-										const retainedSessionId = sessionIdForObservation(
-											req.headers,
-										);
-										if (retainedSessionId) {
-											recordServedAccount(
-												retainedSessionId,
-												account.id,
-												requestMeta.timestamp,
-											);
-										}
-										return withSanitizedProxyHeaders(
-											retainedModelUnavailableResponse,
+									deliver: async (terminalFailoverAttempts) => {
+										return forwardToClient(
+											{
+												...modelUnavailableForwardBase,
+												response: retainedModelUnavailableResponse,
+												failoverAttempts: terminalFailoverAttempts,
+											},
+											modelUnavailableProxyContext,
 										);
 									},
 									discard: () =>
@@ -4908,6 +5206,59 @@ export async function proxyWithAccount(
 							}
 							return null;
 						}
+						await finalizeCurrentCodexTransport(rawResponse);
+						if (modelFallbackPolicy?.prepareFinalResponse === true) {
+							const modelUnavailableForwardOptions: ResponseHandlerOptions = {
+								...modelUnavailableForwardBase,
+								response: rawResponse,
+								failoverAttempts,
+							};
+							const modelUnavailableLifecycle =
+								modelUnavailableForwardOptions.anthropicDegradedLifecycle;
+							let settled = false;
+							preparedResponseOwnsLifecycle =
+								modelUnavailableLifecycle !== null &&
+								modelUnavailableLifecycle !== undefined;
+							return {
+								kind: "prepared_proxy_account_response",
+								response: rawResponse,
+								disposition: "ordinary",
+								account,
+								candidateId: routeCandidateId,
+								isFinalAttempt: true,
+								continueAfterOrdinaryFailure: false,
+								canSupersedeRetainedTerminal: () =>
+									canPreparedResponseSupersedeRetainedTerminal(rawResponse),
+								async commit() {
+									if (settled) {
+										throw new Error(
+											"prepared account response already settled",
+										);
+									}
+									settled = true;
+									preparedResponseOwnsLifecycle = false;
+									return await forwardToClient(
+										modelUnavailableForwardOptions,
+										modelUnavailableProxyContext,
+									);
+								},
+								async discard() {
+									if (settled) return;
+									settled = true;
+									preparedResponseOwnsLifecycle = false;
+									await discardUpstreamBody(rawResponse);
+									if (
+										modelUnavailableLifecycle &&
+										!modelUnavailableLifecycle.isTransferred &&
+										!modelUnavailableLifecycle.isSettled
+									) {
+										modelUnavailableLifecycle.settle(
+											req.signal.aborted ? "cancelled" : "failed",
+										);
+									}
+								},
+							} satisfies PreparedProxyAccountResponse;
+						}
 						const observedSessionId = sessionIdForObservation(req.headers);
 						if (observedSessionId) {
 							recordServedAccount(
@@ -4916,7 +5267,6 @@ export async function proxyWithAccount(
 								requestMeta.timestamp,
 							);
 						}
-						await finalizeCurrentCodexTransport(rawResponse);
 						return withSanitizedProxyHeaders(rawResponse);
 					}
 
@@ -5054,9 +5404,15 @@ export async function proxyWithAccount(
 						// getModelList returns concrete provider models, and the transformed
 						// request is force-patched to this exact value. Claim only after the
 						// proof-equality transform gate has succeeded.
+						const fallbackContextOverflowCapability =
+							contextOverflowCapabilityForPlan(fallbackPlan);
 						if (
 							routingAttemptLedger &&
-							!routingAttemptLedger.claim(account.id, nextModel)
+							((fallbackContextOverflowCapability !== null &&
+								routingAttemptLedger.hasDeterministicFailure(
+									fallbackContextOverflowCapability,
+								)) ||
+								!routingAttemptLedger.claim(account.id, nextModel))
 						) {
 							if (attemptAdmissionTracker) {
 								attemptAdmissionTracker.nonCapacitySkipCount++;
@@ -5082,6 +5438,8 @@ export async function proxyWithAccount(
 							await discardUpstreamBody(rawResponse);
 						}
 						attemptPlan = fallbackPlan;
+						currentContextOverflowCapability =
+							fallbackContextOverflowCapability;
 						attemptProvider = bindProviderAttemptPlan(fallbackPlan);
 						headers = fallbackHeaders;
 						currentTransportModel = nextModel;
@@ -5556,8 +5914,7 @@ export async function proxyWithAccount(
 			const codexAuthoritativeContextOverflowCanBeHandled =
 				!hostedDispatchCommitted() &&
 				attemptPlan.providerName === "codex" &&
-				account.provider === "codex" &&
-				(canReplayContextOverflow() || hasRetainedLegacyContextOverflow());
+				account.provider === "codex";
 			try {
 				const gatedBody = await gateAnthropicSsePreCommit(
 					downstreamAnthropicResponseBody,
@@ -5613,6 +5970,23 @@ export async function proxyWithAccount(
 				) {
 					throw error;
 				}
+				const authoritativeContextOverflow =
+					error instanceof AnthropicPreCommitStallError &&
+					error.reason === "context_length_exceeded" &&
+					error.contextOverflowAuthoritative === true;
+				// Consult the request-level replay policy before applying the stronger
+				// WebSocket no-replay boundary. A written response.create vetoes even a
+				// safe cross-provider candidate, but the authoritative capability evidence
+				// must still be retained for every later request-local routing decision.
+				const authoritativeContextOverflowCanReplay =
+					authoritativeContextOverflow && canReplayContextOverflow();
+				if (authoritativeContextOverflow) {
+					if (currentContextOverflowCapability) {
+						routingAttemptLedger?.recordDeterministicFailure(
+							currentContextOverflowCapability,
+						);
+					}
+				}
 				// A Responses WebSocket request cannot be replayed once response.create
 				// has been written: the server may have accepted the turn even when no
 				// meaningful downstream event arrived. Surface one final error and pin
@@ -5635,10 +6009,7 @@ export async function proxyWithAccount(
 						(error.contextOverflowAuthoritative === true &&
 							codexAuthoritativeContextOverflowCanBeHandled))
 				) {
-					if (
-						error.contextOverflowAuthoritative !== true &&
-						codexContextOverflowFallbackModel
-					) {
+					if (codexContextOverflowFallbackModel) {
 						modelFallbackPolicy?.preferContextOverflowFallback?.(
 							codexContextOverflowFallbackModel,
 						);
@@ -5652,7 +6023,9 @@ export async function proxyWithAccount(
 								? "larger_model"
 								: hasRetainedLegacyContextOverflow()
 									? "larger_model_terminal"
-									: "remaining_route",
+									: authoritativeContextOverflowCanReplay
+										? "remaining_route"
+										: "final_route_terminal",
 						bufferedBytes: error.bufferedBytes,
 						framesSeen: error.framesSeen,
 					});
@@ -6049,6 +6422,36 @@ export async function proxyWithAccount(
 				log.warn(
 					`Account ${account.name} returned final ${response.status} rate-limit/capacity response, forwarding upstream response instead of pool_exhausted`,
 				);
+				if (modelFallbackPolicy?.prepareFinalResponse === true) {
+					let settled = false;
+					const retainedResponse = response;
+					return {
+						kind: "prepared_proxy_account_response",
+						response: retainedResponse,
+						disposition: "ordinary",
+						account,
+						candidateId: routeCandidateId,
+						isFinalAttempt: isFinalSemanticAttempt(),
+						continueAfterOrdinaryFailure: false,
+						canSupersedeRetainedTerminal: () =>
+							canPreparedResponseSupersedeRetainedTerminal(retainedResponse),
+						async commit() {
+							if (settled) {
+								throw new Error("prepared account response already settled");
+							}
+							settled = true;
+							return await forwardTerminalRateLimitResponse(
+								retainedResponse,
+								failoverAttempts,
+							);
+						},
+						async discard() {
+							if (settled) return;
+							settled = true;
+							await discardUpstreamBody(retainedResponse);
+						},
+					} satisfies PreparedProxyAccountResponse;
+				}
 				return forwardTerminalRateLimitResponse(response, failoverAttempts);
 			}
 			if (isTerminalRateLimitStatus && routingAttemptLedger) {
@@ -6091,58 +6494,106 @@ export async function proxyWithAccount(
 			usageCache.clearFamilyScopedExhaustion(account.id, currentTransportModel);
 		}
 
-		// Forward response to client. Preserve the established tail-passthrough
-		// boundary for ordinary and observe-mode requests: a rejection from
-		// forwardToClient belongs to its caller, not this account failover catch.
-		// Enforced sends are different because this scope owns their committed
-		// lifecycle and must settle a pre-transfer forwarding failure.
+		// Prepare the response without claiming request history, session ownership,
+		// or downstream body delivery. The outer request scheduler arbitrates this
+		// candidate against any retained terminal before committing exactly one
+		// winner; every losing body is released exactly once.
 		const responseLifecycle = activeLifecycleForLatestResponse();
-		const forwardedResponse = forwardToClient(
-			{
-				requestId: requestMeta.id,
-				method: req.method,
-				path: url.pathname,
-				account,
-				requestHeaders: req.headers,
-				requestBody: effectiveBodyBuffer,
-				project: requestMeta.project,
-				clientSessionId: requestMeta.clientSessionId ?? null,
-				query: url.search || null,
-				projectAttributionSource: requestMeta.projectAttributionSource ?? null,
-				response,
-				timestamp: requestMeta.timestamp,
-				retryAttempt: 0,
-				failoverAttempts,
-				agentUsed: requestMeta.agentUsed,
-				originalModel: requestMeta.originalModel,
-				appliedModel: attemptAppliedModel,
-				attemptedModel: currentTransportModel,
-				agentAttributionSource: requestMeta.agentAttributionSource ?? null,
-				comboName: requestMeta.comboName,
-				comboModelOverrideFrom,
-				comboModelOverrideTo,
-				apiKeyId,
-				apiKeyName,
-				xaiCacheIdentityFingerprint: requestMeta.xaiCacheIdentityFingerprint,
-				xaiCachePrefixFingerprint: requestMeta.xaiCachePrefixFingerprint,
-				xaiCacheOfficialEndpoint,
-				xaiCacheKeyPresent,
-				cacheFlightRecorderConversationId:
-					requestMeta.cacheFlightRecorderConversationId,
-				cacheFlightRecorderEligible,
-				cacheFlightRecorderNativeActive:
-					requestMeta.xaiCacheNativeActive === true,
-				routeCandidateId,
-				routingMeta: requestMeta,
-				anthropicDegradedLifecycle: responseLifecycle,
-				drainAbort: drainAbortController,
-			},
-			attemptProxyContext(),
-		);
-		if (responseLifecycle?.enforced || hostedDispatchCommitted()) {
-			return await forwardedResponse;
+		const forwardOptions = {
+			requestId: requestMeta.id,
+			method: req.method,
+			path: url.pathname,
+			account,
+			requestHeaders: req.headers,
+			requestBody: effectiveBodyBuffer,
+			project: requestMeta.project,
+			clientSessionId: requestMeta.clientSessionId ?? null,
+			query: url.search || null,
+			projectAttributionSource: requestMeta.projectAttributionSource ?? null,
+			response,
+			timestamp: requestMeta.timestamp,
+			retryAttempt: 0,
+			failoverAttempts,
+			agentUsed: requestMeta.agentUsed,
+			originalModel: requestMeta.originalModel,
+			appliedModel: attemptAppliedModel,
+			attemptedModel: currentTransportModel,
+			agentAttributionSource: requestMeta.agentAttributionSource ?? null,
+			comboName: requestMeta.comboName,
+			comboModelOverrideFrom,
+			comboModelOverrideTo,
+			apiKeyId,
+			apiKeyName,
+			xaiCacheIdentityFingerprint: requestMeta.xaiCacheIdentityFingerprint,
+			xaiCachePrefixFingerprint: requestMeta.xaiCachePrefixFingerprint,
+			xaiCacheOfficialEndpoint,
+			xaiCacheKeyPresent,
+			cacheFlightRecorderConversationId:
+				requestMeta.cacheFlightRecorderConversationId,
+			cacheFlightRecorderEligible,
+			cacheFlightRecorderNativeActive:
+				requestMeta.xaiCacheNativeActive === true,
+			routeCandidateId,
+			routingMeta: requestMeta,
+			anthropicDegradedLifecycle: responseLifecycle,
+			drainAbort: drainAbortController,
+		};
+		const forwardContext = attemptProxyContext();
+		if (modelFallbackPolicy?.prepareFinalResponse !== true) {
+			const forwardedResponse = forwardToClient(forwardOptions, forwardContext);
+			if (responseLifecycle?.enforced || hostedDispatchCommitted()) {
+				return await forwardedResponse;
+			}
+			return forwardedResponse;
 		}
-		return forwardedResponse;
+		let settled = false;
+		preparedResponseOwnsLifecycle = responseLifecycle !== null;
+		return {
+			kind: "prepared_proxy_account_response",
+			response,
+			disposition:
+				getCurrentCodexWebSocketReceipt()?.frameWritten === true && !response.ok
+					? "irreversible_no_replay"
+					: "ordinary",
+			account,
+			candidateId: routeCandidateId,
+			isFinalAttempt: isFinalSemanticAttempt(),
+			continueAfterOrdinaryFailure:
+				modelFallbackPolicy?.continueAfterPreparedFailure === true,
+			canSupersedeRetainedTerminal: () =>
+				canPreparedResponseSupersedeRetainedTerminal(response),
+			async commit() {
+				if (settled)
+					throw new Error("prepared account response already settled");
+				settled = true;
+				preparedResponseOwnsLifecycle = false;
+				try {
+					return await forwardToClient(forwardOptions, forwardContext);
+				} catch (error) {
+					if (
+						responseLifecycle &&
+						!responseLifecycle.isTransferred &&
+						!responseLifecycle.isSettled
+					) {
+						responseLifecycle.settle("failed");
+					}
+					throw error;
+				}
+			},
+			async discard(_reason = "superseded by routing winner") {
+				if (settled) return;
+				settled = true;
+				preparedResponseOwnsLifecycle = false;
+				await discardUpstreamBody(response);
+				if (
+					responseLifecycle &&
+					!responseLifecycle.isTransferred &&
+					!responseLifecycle.isSettled
+				) {
+					responseLifecycle.settle(req.signal.aborted ? "cancelled" : "failed");
+				}
+			},
+		} satisfies PreparedProxyAccountResponse;
 	} catch (err) {
 		const committedLifecycle = anthropicDegradedState?.lifecycle;
 		if (req.signal.aborted) {
@@ -6179,6 +6630,7 @@ export async function proxyWithAccount(
 		}
 		if (
 			committedLifecycle &&
+			!preparedResponseOwnsLifecycle &&
 			!committedLifecycle.isTransferred &&
 			!committedLifecycle.isSettled
 		) {
@@ -6231,6 +6683,7 @@ export async function proxyWithAccount(
 		const committedLifecycle = anthropicDegradedState?.lifecycle;
 		if (
 			committedLifecycle &&
+			!preparedResponseOwnsLifecycle &&
 			!committedLifecycle.isTransferred &&
 			!committedLifecycle.isSettled
 		) {

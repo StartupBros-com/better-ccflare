@@ -3,6 +3,7 @@ import {
 	CLAUDE_MODEL_IDS,
 	getClientVersion,
 	getOAuthErrorCode,
+	normalizeProviderUsageWindows,
 	OAuthRefreshTokenError,
 	PAUSE_REASON_NEEDS_REAUTH,
 	registerHeartbeat,
@@ -637,7 +638,11 @@ export class AutoRefreshScheduler {
 								`Fetched usage data for ${accountRow.name}: 5h=${usageData.five_hour?.utilization ?? "?"}%, 7d=${usageData.seven_day?.utilization ?? "?"}%`,
 							);
 							this.proxyContext.dbOps
-								.recordUsageSnapshot(accountRow.id, usageData, Date.now())
+								.recordUsageSnapshot(
+									accountRow.id,
+									normalizeProviderUsageWindows(usageData, accountRow.provider),
+									Date.now(),
+								)
 								.catch((err) =>
 									log.warn(
 										`Failed to record usage snapshot for ${accountRow.name}: ${err}`,

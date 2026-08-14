@@ -464,3 +464,93 @@ describe("AccountListItem codex usage extras", () => {
 		expect(html).not.toContain("1,234 credits");
 	});
 });
+
+describe("AccountListItem (binding constraint display)", () => {
+	function render(account: Account): string {
+		return renderToStaticMarkup(
+			<AccountListItem
+				account={account}
+				{...requiredHandlers}
+				onAnthropicReauth={noop}
+			/>,
+		);
+	}
+
+	it("renders nothing when the server sent no binding constraint", () => {
+		// Older servers omit the field entirely — no empty row, no placeholder.
+		const html = render(makeAccount({ paused: false }));
+		expect(html).not.toContain("Binding limit");
+	});
+
+	it("marks a family-scoped cap as not counted in the routing percentage", () => {
+		// The 2026-08-11 incident: routing badge reads 64% account-wide while a
+		// per-model weekly cap sits at 100% and that lane is unroutable.
+		const html = render(
+			makeAccount({
+				paused: false,
+				usageUtilization: 64,
+				usageWindow: "five_hour",
+				bindingConstraint: {
+					window: "seven_day_fable",
+					utilization: 100,
+					resetAtMs: 1_800_000_000_000,
+					scope: "family",
+					modelFamily: "fable",
+				},
+			}),
+		);
+
+		expect(html).toContain("Binding limit");
+		expect(html).toContain("Fable (Weekly)");
+		expect(html).toContain("100%");
+		expect(html).toContain("model-scoped, not counted in the routing % above");
+	});
+
+	it("labels an account-wide constraint as account-wide", () => {
+		const html = render(
+			makeAccount({
+				paused: false,
+				usageUtilization: 64,
+				usageWindow: "five_hour",
+				bindingConstraint: {
+					window: "five_hour",
+					utilization: 64,
+					resetAtMs: 1_800_000_000_000,
+					scope: "account",
+					modelFamily: null,
+				},
+			}),
+		);
+
+		expect(html).toContain("Binding limit");
+		expect(html).toContain("5-hour");
+		expect(html).toContain("account-wide");
+		expect(html).not.toContain("model-scoped");
+	});
+
+	it("keeps the routing utilization badge alongside the binding constraint", () => {
+		// The binding constraint must ADD an answer, never replace the routing
+		// one — the two questions are different and collapsing them is the bug.
+		const html = render(
+			makeAccount({
+				paused: false,
+				usageUtilization: 64,
+				usageWindow: "five_hour",
+				usageData: {
+					five_hour: { utilization: 64, resets_at: null },
+				} as FullUsageData,
+				bindingConstraint: {
+					window: "seven_day_fable",
+					utilization: 100,
+					resetAtMs: null,
+					scope: "family",
+					modelFamily: "fable",
+				},
+			}),
+		);
+
+		expect(html).toContain("Binding limit");
+		expect(html).toContain("64%");
+		expect(html).toContain("100%");
+	});
+});
