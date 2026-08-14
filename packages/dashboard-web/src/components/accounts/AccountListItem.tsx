@@ -26,6 +26,7 @@ import { Switch } from "../ui/switch";
 import type { AccountFamilyRoutingState } from "./account-routing";
 import { pauseStatusDisplay } from "./pause-status";
 import { RateLimitProgress } from "./RateLimitProgress";
+import { describeBindingConstraint } from "./rate-limit-helpers";
 
 function formatTokenCount(n: number): string {
 	if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
@@ -135,6 +136,12 @@ export function AccountListItem({
 	const [isRefreshingUsage, setIsRefreshingUsage] = useState(false);
 	const presenter = new AccountPresenter(account);
 	const pauseStatus = pauseStatusDisplay(account.pauseReason);
+	// Display-only: the window actually closest to blocking this account,
+	// including per-model caps that the routing utilization deliberately omits.
+	const bindingConstraint = describeBindingConstraint(
+		account.bindingConstraint,
+		account.usageWindow,
+	);
 	// requiresReauth is derived from the authoritative oauth_invalid_grant
 	// pause reason by the API. The OR keeps older API payloads compatible.
 	const reauthRequired = account.requiresReauth || pauseStatus.reauthRequired;
@@ -624,6 +631,31 @@ export function AccountListItem({
 					{account.sessionStats.apiCostUsd > 0 && (
 						<>
 							{" · "}${account.sessionStats.apiCostUsd.toFixed(2)} api
+						</>
+					)}
+				</div>
+			)}
+			{bindingConstraint && (
+				// Deliberately NOT a replacement for the routing utilization badge
+				// above: routing asks how much account-wide capacity is left, this
+				// asks what is actually stopping you. Collapsing the two is what let
+				// a 100% model-scoped cap hide behind a 64% account-wide badge.
+				<div
+					className="text-xs text-muted-foreground"
+					data-testid="binding-constraint"
+				>
+					{bindingConstraint.divergesFromRouting ? (
+						<>
+							Binding limit: {bindingConstraint.label}{" "}
+							{Math.round(bindingConstraint.utilization)}%
+							{bindingConstraint.scope === "family"
+								? " — model-scoped, not counted in the routing % above"
+								: " — not the window shown above"}
+						</>
+					) : (
+						<>
+							Binding limit: {bindingConstraint.label}{" "}
+							{Math.round(bindingConstraint.utilization)}% — account-wide
 						</>
 					)}
 				</div>

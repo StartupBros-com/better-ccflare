@@ -89,6 +89,57 @@ export function displayLabel(row: UsageDisplay): string {
 	return row.label ?? formatWindowName(row.window);
 }
 
+/** Rendered form of the server's display-only binding constraint. */
+export interface BindingConstraintDisplay {
+	/** Human label for the binding window, e.g. "Fable (Weekly)". */
+	label: string;
+	utilization: number;
+	scope: "account" | "family";
+	resetAtMs: number | null;
+	/**
+	 * True when the routing utilization badge does NOT reflect this constraint —
+	 * either it is a per-model cap (which routing deliberately excludes) or it is
+	 * simply a different window. This is the case an operator must be able to
+	 * see: on 2026-08-11 the badge read 64-92% while a scoped weekly cap sat at
+	 * 100% and that lane was unroutable.
+	 */
+	divergesFromRouting: boolean;
+}
+
+/**
+ * Describe the binding constraint for display, or null when the server did not
+ * send one (older servers omit the field entirely).
+ *
+ * This deliberately does NOT replace the routing utilization badge. The two
+ * answer different questions — routing asks how much account-wide capacity is
+ * left, an operator asks what is stopping them right now — and collapsing them
+ * is the conflation that caused the incident.
+ */
+export function describeBindingConstraint(
+	constraint:
+		| {
+				window: string;
+				utilization: number;
+				resetAtMs: number | null;
+				scope: "account" | "family";
+				modelFamily: string | null;
+		  }
+		| null
+		| undefined,
+	routingWindow: string | null,
+): BindingConstraintDisplay | null {
+	if (!constraint) return null;
+	if (!Number.isFinite(constraint.utilization)) return null;
+	return {
+		label: formatWindowName(constraint.window),
+		utilization: constraint.utilization,
+		scope: constraint.scope,
+		resetAtMs: constraint.resetAtMs,
+		divergesFromRouting:
+			constraint.scope === "family" || constraint.window !== routingWindow,
+	};
+}
+
 /** Map an Anthropic severity (or a >=100% fallback) to a bar-color token. */
 export function severityColor(
 	severity: string | undefined,

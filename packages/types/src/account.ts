@@ -273,6 +273,29 @@ export interface SessionStats {
 	apiCostUsd: number;
 }
 
+/**
+ * The usage window actually closest to blocking an account right now,
+ * INCLUDING per-model (`weekly_scoped`) caps.
+ *
+ * **Display only. Never route on this.** `usageUtilization` below is the
+ * routing-side number and deliberately excludes scoped windows, because
+ * counting a single family's cap there would read the whole account as
+ * exhausted and remove every lane. The two answers differ on purpose:
+ *
+ * - routing asks "how much account-wide capacity is left?"
+ * - an operator asks "what is stopping me right now?"
+ *
+ * Produced by `getBindingConstraint()` in the proxy package, which aliases this
+ * type so both sides cannot drift.
+ */
+export interface AccountBindingConstraint {
+	readonly window: string;
+	readonly utilization: number;
+	readonly resetAtMs: number | null;
+	readonly scope: "account" | "family";
+	readonly modelFamily: string | null;
+}
+
 // API response type - what clients receive
 export interface AccountResponse {
 	id: string;
@@ -307,6 +330,12 @@ export interface AccountResponse {
 	modelMappings: { [key: string]: string | string[] } | null; // Parsed model mappings (arrays = cycling models)
 	usageUtilization: number | null; // Percentage utilization (0-100) from API
 	usageWindow: string | null; // Most restrictive window (e.g., "five_hour")
+	/**
+	 * Display-only binding constraint — see AccountBindingConstraint. The server
+	 * has always sent this; it was previously undeclared, so no client could
+	 * read it without a type error. Optional because older servers omit it.
+	 */
+	bindingConstraint?: AccountBindingConstraint | null;
 	usageData: FullUsageData | null; // Full usage data for Anthropic accounts
 	usageRateLimitedUntil: number | null; // Timestamp (ms) until usage API 429 clears; null if not rate-limited
 	usageThrottledUntil: number | null; // Timestamp (ms) until proactive usage throttling clears; null if not throttled
