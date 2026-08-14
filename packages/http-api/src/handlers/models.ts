@@ -81,8 +81,7 @@ export function createModelsHandler(context: APIContext) {
 	return async (url?: URL): Promise<Response> => {
 		const requested = url?.searchParams.get("provider")?.trim() || "";
 		const accountId = url?.searchParams.get("accountId")?.trim() || "";
-		const hasScopedQuery =
-			url?.searchParams.has("provider") || url?.searchParams.has("accountId");
+		const hasScopedQuery = requested.length > 0 || accountId.length > 0;
 
 		if (!hasScopedQuery) {
 			if (!context.modelCatalog) {

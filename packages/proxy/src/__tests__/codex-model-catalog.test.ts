@@ -362,6 +362,123 @@ describe("derived-default provenance", () => {
 		);
 		expect(resolveProviderModelDefault("codex", "fable")).toBe("gpt-6-codex");
 	});
+
+	it("keeps newer provider-wide evidence when an older account finishes later", async () => {
+		let fetches = 0;
+		const pending: Array<(response: Response) => void> = [];
+		const olderAccount = makeAccount({ id: "acc-older-publication" });
+		const newerAccount = makeAccount({ id: "acc-newer-publication" });
+		globalThis.fetch = (() => {
+			fetches++;
+			return new Promise<Response>((resolve) => pending.push(resolve));
+		}) as typeof globalThis.fetch;
+
+		const olderRequest = getCodexModels(olderAccount.id, makeCtx(olderAccount));
+		await waitForFetchCount(() => fetches, 1);
+		const newerRequest = getCodexModels(newerAccount.id, makeCtx(newerAccount));
+		await waitForFetchCount(() => fetches, 2);
+
+		pending[1](
+			new Response(JSON.stringify(NEW_FRONTIER_BODY), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			}),
+		);
+		const newerListing = await newerRequest;
+		expect(newerListing?.models[0].id).toBe("gpt-6-codex");
+
+		pending[0](
+			new Response(JSON.stringify(LIVE_BODY), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			}),
+		);
+		const olderListing = await olderRequest;
+		expect(olderListing?.models[0].id).toBe("gpt-5.6-sol");
+		expect(resolveProviderModelDefault("codex", "fable")).toBe("gpt-6-codex");
+		expect(resolveProviderModelDefault("codex", "fable", olderAccount.id)).toBe(
+			"gpt-5.6-sol",
+		);
+		expect(resolveProviderModelDefault("codex", "fable", newerAccount.id)).toBe(
+			"gpt-6-codex",
+		);
+
+		globalThis.fetch = (async () =>
+			new Response("nope", { status: 500 })) as typeof globalThis.fetch;
+		const shared = await getCodexModels(
+			"acc-publication-borrower",
+			makeCtx(makeAccount({ id: "acc-publication-borrower" })),
+		);
+		expect(shared?.source).toBe("shared");
+		expect(shared?.borrowedFrom).toBe(newerAccount.id);
+		expect(shared?.models[0].id).toBe("gpt-6-codex");
+
+		const olderCached = await getCodexModels(
+			olderAccount.id,
+			makeCtx(olderAccount),
+		);
+		expect(olderCached?.source).toBe("cached");
+		expect(olderCached?.models[0].id).toBe("gpt-5.6-sol");
+	});
+
+	it("keeps post-reset provider evidence ahead of an older pre-reset request", async () => {
+		let fetches = 0;
+		const pending: Array<(response: Response) => void> = [];
+		const preResetAccount = makeAccount({ id: "acc-pre-reset" });
+		const postResetAccount = makeAccount({ id: "acc-post-reset" });
+		globalThis.fetch = (() => {
+			fetches++;
+			return new Promise<Response>((resolve) => pending.push(resolve));
+		}) as typeof globalThis.fetch;
+
+		const preResetRequest = getCodexModels(
+			preResetAccount.id,
+			makeCtx(preResetAccount),
+		);
+		await waitForFetchCount(() => fetches, 1);
+		clearCodexModelCacheForTests();
+		clearDerivedProviderModelDefaults();
+		const postResetRequest = getCodexModels(
+			postResetAccount.id,
+			makeCtx(postResetAccount),
+		);
+		await waitForFetchCount(() => fetches, 2);
+
+		pending[1](
+			new Response(JSON.stringify(NEW_FRONTIER_BODY), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			}),
+		);
+		const postResetListing = await postResetRequest;
+		expect(postResetListing?.models[0].id).toBe("gpt-6-codex");
+
+		pending[0](
+			new Response(JSON.stringify(LIVE_BODY), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			}),
+		);
+		const preResetListing = await preResetRequest;
+		expect(preResetListing?.models[0].id).toBe("gpt-5.6-sol");
+		expect(resolveProviderModelDefault("codex", "fable")).toBe("gpt-6-codex");
+		expect(
+			resolveProviderModelDefault("codex", "fable", preResetAccount.id),
+		).toBe("gpt-5.6-sol");
+		expect(
+			resolveProviderModelDefault("codex", "fable", postResetAccount.id),
+		).toBe("gpt-6-codex");
+
+		globalThis.fetch = (async () =>
+			new Response("nope", { status: 500 })) as typeof globalThis.fetch;
+		const shared = await getCodexModels(
+			"acc-reset-borrower",
+			makeCtx(makeAccount({ id: "acc-reset-borrower" })),
+		);
+		expect(shared?.source).toBe("shared");
+		expect(shared?.borrowedFrom).toBe(postResetAccount.id);
+		expect(shared?.models[0].id).toBe("gpt-6-codex");
+	});
 });
 
 describe("ensureCodexModelDefaults", () => {
@@ -442,6 +559,56 @@ describe("ensureCodexModelDefaults", () => {
 
 		expect(fetches).toBe(1);
 		expect(hasDerivedProviderModelDefaults("codex", account.id)).toBe(true);
+	});
+
+	it("does not let an older direct fetch overwrite a newer ensured listing", async () => {
+		let fetches = 0;
+		const pending: Array<(response: Response) => void> = [];
+		const account = makeAccount({ id: "acc-publication-order" });
+		globalThis.fetch = (() => {
+			fetches++;
+			return new Promise<Response>((resolve) => pending.push(resolve));
+		}) as typeof globalThis.fetch;
+
+		const olderDirect = getCodexModels(account.id, makeCtx(account));
+		await waitForFetchCount(() => fetches, 1);
+		const newerEnsure = ensureCodexModelDefaults(account, makeCtx(account));
+		await waitForFetchCount(() => fetches, 2);
+
+		pending[1](
+			new Response(JSON.stringify(NEW_FRONTIER_BODY), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			}),
+		);
+		await newerEnsure;
+		expect(resolveProviderModelDefault("codex", "fable")).toBe("gpt-6-codex");
+		expect(resolveProviderModelDefault("codex", "fable", account.id)).toBe(
+			"gpt-6-codex",
+		);
+
+		pending[0](
+			new Response(JSON.stringify(LIVE_BODY), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			}),
+		);
+		const olderListing = await olderDirect;
+		expect(olderListing?.models[0].id).toBe("gpt-5.6-sol");
+		expect(resolveProviderModelDefault("codex", "fable")).toBe("gpt-6-codex");
+		expect(resolveProviderModelDefault("codex", "fable", account.id)).toBe(
+			"gpt-6-codex",
+		);
+
+		globalThis.fetch = (async () =>
+			new Response("nope", { status: 500 })) as typeof globalThis.fetch;
+		const cached = await getCodexModels(account.id, makeCtx(account));
+		expect(cached?.source).toBe("cached");
+		expect(cached?.models[0].id).toBe("gpt-6-codex");
+		expect(resolveProviderModelDefault("codex", "fable")).toBe("gpt-6-codex");
+		expect(resolveProviderModelDefault("codex", "fable", account.id)).toBe(
+			"gpt-6-codex",
+		);
 	});
 
 	it("does not let an old completion clear a newer in-flight ensure", async () => {

@@ -98,9 +98,9 @@ export function getAllowedModelsMessage(): string {
 }
 
 /**
- * Parse custom endpoint data from account's custom_endpoint field
+ * Parse custom endpoint data with candidate arrays for internal routing.
  */
-export function parseCustomEndpointData(customEndpoint: string | null): {
+function parseCustomEndpointDataWithCandidates(customEndpoint: string | null): {
 	endpoint?: string;
 	modelMappings?: Record<string, string | string[]>;
 } | null {
@@ -148,6 +148,35 @@ export function parseCustomEndpointData(customEndpoint: string | null): {
 		);
 		return { endpoint: parsed.endpoint };
 	}
+}
+
+/**
+ * Parse custom endpoint data from an account's custom_endpoint field.
+ *
+ * The public contract predates candidate arrays and intentionally remains
+ * string-only. Internal routing callers that understand ordered candidates use
+ * parseCustomEndpointDataWithCandidates instead.
+ */
+export function parseCustomEndpointData(
+	customEndpoint: string | null,
+): { endpoint?: string; modelMappings?: Record<string, string> } | null {
+	const parsed = parseCustomEndpointDataWithCandidates(customEndpoint);
+	if (!parsed) {
+		return null;
+	}
+	if (!parsed.modelMappings) {
+		return { endpoint: parsed.endpoint };
+	}
+
+	const modelMappings: Record<string, string> = {};
+	for (const [key, value] of Object.entries(parsed.modelMappings)) {
+		modelMappings[key] = Array.isArray(value) ? value[0] : value;
+	}
+
+	return {
+		endpoint: parsed.endpoint,
+		modelMappings,
+	};
 }
 
 function parseRuntimeModelMappings(
@@ -225,7 +254,9 @@ export function getModelMappings(
 	}
 
 	// Check for legacy mappings in custom_endpoint JSON payload (fallback)
-	const customEndpointData = parseCustomEndpointData(account.custom_endpoint);
+	const customEndpointData = parseCustomEndpointDataWithCandidates(
+		account.custom_endpoint,
+	);
 	if (customEndpointData?.modelMappings) {
 		log.warn(
 			`Found model mappings in custom_endpoint for account ${account.name} - this is deprecated. Use model_mappings field instead.`,
@@ -292,7 +323,9 @@ function hasAccountModelMappings(account: Account): boolean {
 	if (account.model_mappings) return true;
 	if (account.model_fallbacks) return true;
 
-	const customEndpointData = parseCustomEndpointData(account.custom_endpoint);
+	const customEndpointData = parseCustomEndpointDataWithCandidates(
+		account.custom_endpoint,
+	);
 	if (customEndpointData?.modelMappings) return true;
 
 	// Check env override

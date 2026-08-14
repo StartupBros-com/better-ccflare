@@ -657,7 +657,7 @@ async function handleProxyCore(
 			hostedDispatchState: error.hostedDispatchState,
 			nextAccountId: error.nextAccountId,
 			nextCandidateId: error.nextCandidateId,
-			nextLaneKey: error.nextLaneKey,
+			nextLanePresent: error.nextLaneKey !== null,
 		});
 		return error.terminalize();
 	}

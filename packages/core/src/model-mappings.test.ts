@@ -10,6 +10,7 @@ import {
 	LATEST_MODEL_BY_FAMILY,
 	MAX_MODEL_MAPPING_CANDIDATES,
 	mapModelName,
+	parseCustomEndpointData,
 	parseModelMappings,
 	resolveFamilyAliasModel,
 	ValidationError,
@@ -68,6 +69,26 @@ describe("Model Mapping", () => {
 	test("parseModelMappings handles null/empty", () => {
 		expect(parseModelMappings(null)).toBeNull();
 		expect(parseModelMappings("")).toBeNull();
+	});
+
+	test("parseCustomEndpointData preserves its string-only public runtime contract", () => {
+		expect(
+			parseCustomEndpointData(
+				JSON.stringify({
+					endpoint: "https://example.invalid",
+					modelMappings: {
+						sonnet: ["physical-primary", "physical-fallback"],
+						opus: "physical-opus",
+					},
+				}),
+			),
+		).toEqual({
+			endpoint: "https://example.invalid",
+			modelMappings: {
+				sonnet: "physical-primary",
+				opus: "physical-opus",
+			},
+		});
 	});
 
 	test("validateModelMappings accepts exactly 16 candidates", () => {
@@ -129,6 +150,26 @@ describe("Model Mapping", () => {
 				process.env.OPENAI_COMPATIBLE_MODEL_MAPPINGS = previous;
 			}
 		}
+	});
+
+	test("retains bounded custom-endpoint candidates for internal routing", () => {
+		const account = {
+			id: "legacy-candidates",
+			name: "legacy-candidates",
+			model_mappings: null,
+			model_fallbacks: null,
+			custom_endpoint: JSON.stringify({
+				endpoint: "https://example.invalid",
+				modelMappings: {
+					sonnet: ["physical-primary", "physical-fallback"],
+				},
+			}),
+		} as Account;
+
+		expect(getModelList("claude-sonnet-4-5", account)).toEqual([
+			"physical-primary",
+			"physical-fallback",
+		]);
 	});
 
 	test("does not append deprecated model_fallbacks beyond the candidate limit", () => {

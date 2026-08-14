@@ -66,14 +66,20 @@ interface EnsureRetryState {
 }
 
 /**
- * Last good listing per account, for this process only.
+ * Last good listing and its publication generation per account, for this
+ * process only.
  *
  * Deliberately not written to disk: a snapshot that outlives the process is a
  * second place where the truth can quietly go stale. A failed refresh keeps
  * serving what is already here; a restart starts empty and stays empty until
  * a read succeeds, which is honest about what is actually known.
  */
-const lastGood = new Map<string, CodexModelListing>();
+interface CachedAccountCatalog {
+	listing: CodexModelListing;
+	generation: number;
+}
+
+const lastGood = new Map<string, CachedAccountCatalog>();
 
 /**
  * The last listing any account of this provider managed to read.
@@ -96,6 +102,21 @@ const ensureRetryByAccount = new Map<string, EnsureRetryState>();
 const ensureInFlight = new Map<string, Promise<void>>();
 
 /**
+ * Successful live reads publish in start order, not completion order.
+ *
+ * Direct catalog reads and the best-effort ensure path can overlap for the
+ * same account, and independent account reads can overlap with one another. A
+ * slower older response is still a valid answer for its own caller and exact
+ * account state, but it must not roll the provider-wide cache and defaults
+ * back after a newer response has already landed.
+ *
+ * The counter deliberately survives the test reset. That keeps attempts that
+ * were already running before a reset distinct from attempts started after it.
+ */
+let nextCatalogFetchGeneration = 0;
+let publishedProviderCatalogGeneration = 0;
+
+/**
  * Test seam: forget every process-wide catalog registry between cases.
  * Already-running fetches are not cancelled and may still record their result.
  */
@@ -104,6 +125,7 @@ export function clearCodexModelCacheForTests(): void {
 	providerWide = null;
 	ensureRetryByAccount.clear();
 	ensureInFlight.clear();
+	publishedProviderCatalogGeneration = 0;
 }
 
 function scheduleEnsureRetry(accountId: string, now: number): void {
@@ -127,7 +149,7 @@ function scheduleEnsureRetry(accountId: string, now: number): void {
 }
 
 function readCache(accountId: string): CodexModelListing | null {
-	const own = lastGood.get(accountId);
+	const own = lastGood.get(accountId)?.listing;
 	if (own) return { ...own, source: "cached" };
 	// Nothing of this account's own: fall back to whatever another account of
 	// the same provider read, labelled so nobody mistakes it for this one's.
@@ -140,11 +162,6 @@ function readCache(accountId: string): CodexModelListing | null {
 		};
 	}
 	return null;
-}
-
-function writeCache(listing: CodexModelListing): void {
-	lastGood.set(listing.accountId, listing);
-	providerWide = listing;
 }
 
 interface CodexModelsResponse {
@@ -330,6 +347,7 @@ export async function getCodexModels(
 ): Promise<CodexModelListing | null> {
 	const account = await ctx.dbOps.getAccount(accountId);
 	if (!account || account.provider !== "codex") return null;
+	const fetchGeneration = ++nextCatalogFetchGeneration;
 
 	try {
 		const models = await fetchLive(account, ctx);
@@ -345,13 +363,22 @@ export async function getCodexModels(
 			fetchedAt: Date.now(),
 			source: "live",
 		};
-		// Kept before returning, so a later failure still has something to serve.
-		writeCache(listing);
-		setDerivedProviderModelDefaults(
-			"codex",
-			accountId,
-			deriveFamilyDefaults(models),
-		);
+		const families = deriveFamilyDefaults(models);
+		const publishedAccountGeneration = lastGood.get(accountId)?.generation;
+		if (
+			publishedAccountGeneration === undefined ||
+			fetchGeneration > publishedAccountGeneration
+		) {
+			// This account's exact evidence advances independently of the shared
+			// frontier, so a late response from another account still remains useful.
+			lastGood.set(accountId, { listing, generation: fetchGeneration });
+			setDerivedAccountModelDefaults("codex", accountId, families);
+		}
+		if (fetchGeneration > publishedProviderCatalogGeneration) {
+			providerWide = listing;
+			setDerivedProviderModelDefaults("codex", accountId, families);
+			publishedProviderCatalogGeneration = fetchGeneration;
+		}
 		return listing;
 	} catch (error) {
 		const cached = readCache(accountId);

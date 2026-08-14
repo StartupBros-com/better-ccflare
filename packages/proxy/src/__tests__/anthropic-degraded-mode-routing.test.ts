@@ -8,9 +8,11 @@ import {
 	spyOn,
 } from "bun:test";
 import { ANTHROPIC_DEGRADED_MODE_DEFAULTS } from "@better-ccflare/config";
+import { logBus } from "@better-ccflare/logger";
 import type {
 	Account,
 	ComboWithSlots,
+	LogEvent,
 	RequestMeta,
 } from "@better-ccflare/types";
 import {
@@ -1116,12 +1118,22 @@ describe("Anthropic degraded-mode physical-send admission", () => {
 		expect(coordinator.getCohortState(cohortKey).state).toBe("open");
 	});
 
-	it("terminalizes a real 32-to-33 account failover with outer request cleanup", async () => {
+	it("terminalizes a real 32-to-33 account failover without logging the private lane", async () => {
 		const previousPacingMs = process.env[CACHE_PACING_MS_ENV];
 		process.env[CACHE_PACING_MS_ENV] = "1000";
 		resetCachePacing();
-		const sessionId = "physical-budget-terminal-session";
+		const sessionId = `physical-budget-sensitive-user/${"x".repeat(256)}`;
 		recordServedAccount(sessionId, "previous-serving-account", 0);
+		const terminalWarnings: LogEvent[] = [];
+		const collectTerminalWarning = (event: LogEvent) => {
+			if (
+				event.level === "WARN" &&
+				event.msg === "physical_attempt_budget_exhausted"
+			) {
+				terminalWarnings.push(event);
+			}
+		};
+		logBus.on("log", collectTerminalWarning);
 
 		const coordinator = new AnthropicDegradedModeCoordinator({
 			config: {
@@ -1241,6 +1253,12 @@ describe("Anthropic degraded-mode physical-send admission", () => {
 			expect(reportCandidateFailure.mock.calls.length).toBeLessThanOrEqual(
 				fetchCount,
 			);
+			expect(terminalWarnings).toHaveLength(1);
+			expect(terminalWarnings[0]?.data).toMatchObject({
+				nextLanePresent: true,
+			});
+			expect(terminalWarnings[0]?.data).not.toHaveProperty("nextLaneKey");
+			expect(JSON.stringify(terminalWarnings)).not.toContain(sessionId);
 
 			followUpPacing = await observeCachePacing({
 				sessionKey: sessionId,
@@ -1248,6 +1266,7 @@ describe("Anthropic degraded-mode physical-send admission", () => {
 			});
 			expect(followUpPacing?.role).toBe("leader");
 		} finally {
+			logBus.off("log", collectTerminalWarning);
 			followUpPacing?.slot?.abandon();
 			discardRetainedSpy.mockRestore();
 			discardStagedSpy.mockRestore();

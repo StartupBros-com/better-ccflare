@@ -117,6 +117,38 @@ describe("GET /api/models", () => {
 		});
 	});
 
+	for (const query of [
+		"provider=",
+		"provider=%20%20",
+		"accountId=",
+		"accountId=%20%09",
+		"provider=%20&accountId=%09",
+	]) {
+		it(`treats an empty scoped query as the legacy bare endpoint: ${query}`, async () => {
+			const context = makeContext({
+				anthropic: {
+					models: [{ id: "claude-opus-5", displayName: "Claude Opus 5" }],
+					source: "fallback",
+				},
+			});
+			const response = await createModelsHandler(context)(
+				new URL(`http://local/api/models?${query}`),
+			);
+
+			expect(await response.json()).toEqual({
+				models: [
+					{
+						id: "claude-opus-5",
+						displayName: "Claude Opus 5",
+						createdAt: null,
+					},
+				],
+				fetchedAt: 1_000,
+				source: "fallback",
+			});
+		});
+	}
+
 	it("returns what the codex account itself reported", async () => {
 		const context = makeContext({
 			codex: {

@@ -845,7 +845,11 @@ export class BedrockProvider extends BaseProvider implements Provider {
 
 		// Step 5: If no custom model, translate client model name to Bedrock model ID using fuzzy matching
 		if (!bedrockModelId) {
-			bedrockModelId = await translateModelName(body.model, account);
+			bedrockModelId = await translateModelName(
+				body.model,
+				account,
+				beforePhysicalTransport,
+			);
 		}
 
 		if (!bedrockModelId) {
@@ -875,6 +879,7 @@ export class BedrockProvider extends BaseProvider implements Provider {
 				transformedModelId,
 				crossRegionMode,
 				account,
+				beforePhysicalTransport,
 			);
 
 			if (!supportsMode) {
@@ -882,6 +887,7 @@ export class BedrockProvider extends BaseProvider implements Provider {
 					transformedModelId,
 					crossRegionMode,
 					account,
+					beforePhysicalTransport,
 				);
 				if (fallback) {
 					log.warn(
