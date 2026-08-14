@@ -73,6 +73,7 @@ import {
 import {
 	summarizeCodexResponse,
 	type ToolCallSummary,
+	writeCodexAbortedAttemptTrace,
 	writeCodexResponseTrace,
 	writeCodexTrace,
 } from "./trace";
@@ -916,9 +917,16 @@ export class CodexProvider extends BaseProvider {
 	 * Releases turn-state context for an attempt that was registered during
 	 * request transformation but will never be dispatched. Idempotent; see
 	 * `CodexTurnStateCoordinator.abortAttempt`.
+	 *
+	 * Also annuls the attempt's request trace, so analysis does not count a
+	 * candidate that never reached the wire as a physical request. That is
+	 * deliberately not conditional on turn-state eligibility: the request record
+	 * was written for this attempt whatever arm it landed in, so the correction
+	 * has to be written the same way.
 	 */
 	abortTurnStateAttempt(attemptId: string | null | undefined): void {
-		this.turnStateCoordinator.abortAttempt(attemptId);
+		const requestId = this.turnStateCoordinator.abortAttempt(attemptId);
+		writeCodexAbortedAttemptTrace({ attemptId, requestId });
 	}
 
 	createServerToolCapabilityTuple(

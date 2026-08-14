@@ -7,6 +7,88 @@ import {
 } from "./analyze-trace";
 
 describe("analyzeCodexCacheExperiments", () => {
+	test("excludes attempts annulled before dispatch from rollout evidence", () => {
+		const report = analyzeCodexCacheExperiments([
+			{
+				trace_schema_version: 18,
+				phase: "request",
+				ts: "2026-08-13T00:00:00.000Z",
+				request_id: "private-logical",
+				attempt_id: "private-attempt-sent",
+				attempt_ordinal: 1,
+				attempt_cause: "initial",
+				model_out: "gpt-5.6-sol",
+				prompt_cache_key_id: "private-key",
+				codex_turn_state_arm: "treatment",
+				codex_turn_state_cohort_id: "0123456789abcdef",
+				codex_turn_state_request_action: "replay",
+				codex_turn_state_replay_applied: true,
+			},
+			{
+				// Registered while its body was transformed, then abandoned before
+				// route claiming: a higher ordinal that never reached the wire.
+				trace_schema_version: 18,
+				phase: "request",
+				ts: "2026-08-13T00:00:01.000Z",
+				request_id: "private-logical",
+				attempt_id: "private-attempt-abandoned",
+				attempt_ordinal: 2,
+				attempt_cause: "model_fallback",
+				model_out: "gpt-5.6-sol",
+				prompt_cache_key_id: "private-key",
+				codex_turn_state_arm: "ineligible",
+				codex_turn_state_request_action: "failover_suppressed",
+				codex_turn_state_replay_applied: false,
+			},
+			{
+				trace_schema_version: 18,
+				phase: "attempt_aborted",
+				ts: "2026-08-13T00:00:01.500Z",
+				request_id: "private-logical",
+				attempt_id: "private-attempt-abandoned",
+			},
+			{
+				trace_schema_version: 18,
+				phase: "response",
+				ts: "2026-08-13T00:00:03.000Z",
+				request_id: "private-logical",
+				attempt_id: "private-attempt-sent",
+				stop_reason: "tool_use",
+				input_tokens: 1_000,
+				cache_read_input_tokens: 900,
+				cache_creation_input_tokens: 0,
+				cache_creation_measurement_available: true,
+				codex_turn_state_terminal_action: "advanced",
+			},
+		]);
+
+		// The dispatched attempt keeps final-attempt attribution, so its response
+		// still joins; the phantom neither inflates key pressure and fallback
+		// counts nor strands the real response as unjoined.
+		expect(report.turnState.rows).toMatchObject([
+			{
+				arm: "treatment",
+				requests: 1,
+				joinedResponses: 1,
+				unjoinedRequests: 0,
+				outcomes: {
+					observedExtraAttempts: 0,
+					observedFallbackAttempts: 0,
+					finalAttemptFallbacks: 0,
+					terminalActions: { advanced: 1 },
+				},
+				promptKeyConcentration: {
+					distinctKeys: 1,
+					maxRequestsPerKeyMinute: 1,
+					keysOver15RequestsPerMinute: 0,
+				},
+			},
+		]);
+		expect(
+			report.turnState.promptKeyConcentration.maxRequestsPerKeyMinute,
+		).toBe(1);
+	});
+
 	test("attributes HTTP turn-state by first attempt and final outcome", () => {
 		const report = analyzeCodexCacheExperiments([
 			{

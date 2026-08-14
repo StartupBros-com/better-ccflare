@@ -14,7 +14,7 @@ interface InputFingerprint {
 
 export interface TraceRecord {
 	trace_schema_version?: number;
-	phase?: "request" | "response";
+	phase?: "request" | "response" | "attempt_aborted";
 	ts?: string;
 	request_id?: string | null;
 	attempt_id?: string | null;
@@ -1388,6 +1388,45 @@ interface CacheExperimentRowAccumulator extends CacheExperimentRow {
 }
 
 type CacheExperimentKind = "pacing" | "explicitBreakpoint";
+
+/**
+ * Phase of the tombstone written by `writeCodexAbortedAttemptTrace` in
+ * `trace.ts`. This analyzer reads JSONL off disk and deliberately imports
+ * nothing from the provider, so the string is duplicated rather than shared;
+ * changing it needs both sides.
+ */
+const ABORTED_ATTEMPT_PHASE = "attempt_aborted";
+
+/**
+ * Remove every attempt that was registered but never physically dispatched,
+ * together with the tombstones that annul them.
+ *
+ * A request record is written while the body is transformed -- before route
+ * claiming -- so a candidate later abandoned still leaves one behind. Counting
+ * it as a physical attempt inflates requests-per-key pressure and fallback
+ * totals, and an abandoned candidate holding the highest ordinal also takes
+ * final-attempt attribution from the attempt that really ran, leaving that
+ * attempt's response unjoined. Filtering at the entry points keeps one guard
+ * for every downstream report instead of one per metric.
+ */
+function withoutAbortedAttempts(
+	records: readonly TraceRecord[],
+): readonly TraceRecord[] {
+	const aborted = new Set<string>();
+	for (const record of records) {
+		if (record.phase !== ABORTED_ATTEMPT_PHASE) continue;
+		if (typeof record.attempt_id === "string" && record.attempt_id.length > 0) {
+			aborted.add(record.attempt_id);
+		}
+	}
+	return records.filter(
+		(record) =>
+			record.phase !== ABORTED_ATTEMPT_PHASE &&
+			!(
+				typeof record.attempt_id === "string" && aborted.has(record.attempt_id)
+			),
+	);
+}
 
 function traceTimestamp(record: TraceRecord): number | null {
 	if (!record.ts) return null;
@@ -3083,9 +3122,10 @@ function analyzeTurnStateCacheExperiments(
  * are used only in-memory and never appear in the returned report.
  */
 export function analyzeCodexCacheExperiments(
-	records: readonly TraceRecord[],
+	allRecords: readonly TraceRecord[],
 	websocketObservations = emptyParsedCodexWebSocketObservations(),
 ): CodexCacheExperimentReport {
+	const records = withoutAbortedAttempts(allRecords);
 	const samples = cacheExperimentLogicalSamples(records);
 	return {
 		schemaVersion: 2,
@@ -3106,8 +3146,9 @@ export function analyzeCodexCacheExperiments(
 }
 
 export function analyzeCodexTrace(
-	records: readonly TraceRecord[],
+	allRecords: readonly TraceRecord[],
 ): TraceReport {
+	const records = withoutAbortedAttempts(allRecords);
 	const timestamps: string[] = [];
 	const requestRecords = records.filter(
 		(record) => (record.phase ?? "request") === "request",

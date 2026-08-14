@@ -8,6 +8,7 @@ import {
 	contextUtilizationPct,
 	summarizeCodexResponse,
 	summarizeCodexTransform,
+	writeCodexAbortedAttemptTrace,
 	writeCodexResponseTrace,
 	writeCodexTrace,
 } from "./trace";
@@ -18,6 +19,43 @@ afterEach(() => {
 });
 
 describe("Codex HTTP turn-state telemetry (schema 18)", () => {
+	test("annuls an attempt that never reached the wire", () => {
+		const dir = mkdtempSync(join(tmpdir(), "codex-trace-abort-"));
+		process.env[CODEX_TRACE_DIR_ENV] = dir;
+		try {
+			// An attempt with no ID cannot be annulled and must not write a record.
+			writeCodexAbortedAttemptTrace({
+				attemptId: null,
+				requestId: "logical-1",
+			});
+			expect(readdirSync(dir)).toHaveLength(0);
+
+			writeCodexAbortedAttemptTrace({
+				attemptId: "private-attempt-abandoned",
+				requestId: "private-logical",
+			});
+			const file = readdirSync(dir).find((name) => name.endsWith(".jsonl"));
+			const [tombstone] = readFileSync(join(dir, file as string), "utf8")
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line));
+			expect(tombstone).toMatchObject({
+				trace_schema_version: 18,
+				// The analyzer duplicates this literal (it imports nothing from the
+				// provider); both sides are pinned so either one drifting fails here.
+				phase: "attempt_aborted",
+				request_id: "private-logical",
+				attempt_id: "private-attempt-abandoned",
+			});
+			// Neither an existing request nor an existing response reader may pick
+			// this record up.
+			expect(tombstone.phase).not.toBe("request");
+			expect(tombstone.phase).not.toBe("response");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	test("writes only bounded request and response attribution", () => {
 		const dir = mkdtempSync(join(tmpdir(), "codex-trace-turn-state-"));
 		process.env[CODEX_TRACE_DIR_ENV] = dir;

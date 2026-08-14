@@ -879,6 +879,104 @@ describe("CodexTurnStateCoordinator", () => {
 		});
 	});
 
+	test("frees the lease of a logical request whose attempt ended in error", () => {
+		enableTreatment();
+		const coordinator = new CodexTurnStateCoordinator();
+		coordinator.beginAttempt(beginInput());
+		expect(
+			coordinator.finalizeAttempt({
+				attemptId: "attempt-1",
+				stopReason: "tool_use",
+				responseTurnState: "turn-token-1",
+				outputLineage: lineage("call-1"),
+			}),
+		).toBe("captured");
+
+		// This continuation takes the lease and then fails terminally. Routing is
+		// exhausted, so no failover registration and no abort ever follows to
+		// release the claim.
+		expect(
+			coordinator.beginAttempt(
+				beginInput({
+					requestId: "request-failed",
+					attemptId: "attempt-failed",
+					lineage: lineage("call-1"),
+				}),
+			),
+		).toMatchObject({ replayApplied: true });
+		expect(
+			coordinator.finalizeAttempt({
+				attemptId: "attempt-failed",
+				stopReason: "error",
+				responseTurnState: null,
+				outputLineage: { kind: "none" },
+			}),
+		).toBe("error_ignored");
+
+		// The caller retries, which is a new logical request. The turn itself never
+		// moved and its token is still valid, so a lease belonging to a request
+		// that can no longer act must not suppress the replay.
+		expect(
+			coordinator.beginAttempt(
+				beginInput({
+					requestId: "request-retry",
+					attemptId: "attempt-retry",
+					lineage: lineage("call-1"),
+				}),
+			),
+		).toMatchObject({
+			action: "replay",
+			replayApplied: true,
+			turnState: "turn-token-1",
+		});
+	});
+
+	test("keeps a control turn advancing when a duplicate candidate aborts", () => {
+		enableEligibleControl();
+		const coordinator = new CodexTurnStateCoordinator();
+		coordinator.beginAttempt(beginInput());
+		expect(
+			coordinator.finalizeAttempt({
+				attemptId: "attempt-1",
+				stopReason: "tool_use",
+				responseTurnState: "turn-token-1",
+				outputLineage: lineage("call-1"),
+			}),
+		).toBe("captured");
+
+		// The continuation that is actually dispatched.
+		expect(
+			coordinator.beginAttempt(
+				beginInput({
+					requestId: "request-2",
+					attemptId: "attempt-2",
+					lineage: lineage("call-1"),
+				}),
+			),
+		).toMatchObject({ action: "would_replay" });
+		// A second candidate for the same logical request -- a duplicate route
+		// claim -- registers while its body is transformed and is then abandoned.
+		// It changes nothing about the pending turn, so it must not fence the
+		// attempt that is still producing it.
+		coordinator.beginAttempt(
+			beginInput({
+				requestId: "request-2",
+				attemptId: "attempt-2-duplicate",
+				lineage: lineage("call-1"),
+			}),
+		);
+		coordinator.abortAttempt("attempt-2-duplicate");
+
+		expect(
+			coordinator.finalizeAttempt({
+				attemptId: "attempt-2",
+				stopReason: "tool_use",
+				responseTurnState: "turn-token-2",
+				outputLineage: lineage("call-2"),
+			}),
+		).toBe("advanced");
+	});
+
 	test("stops protecting a scope once an attempt is far past the idle TTL", () => {
 		enableTreatment();
 		process.env[CODEX_TURN_STATE_IDLE_TTL_MS_ENV] = "60000";

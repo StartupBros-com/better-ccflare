@@ -591,6 +591,38 @@ export function writeCodexResponseTrace(inputs: ResponseTraceInputs): void {
 	});
 }
 
+/**
+ * Append one attempt-abort JSONL tombstone. No-op (and never throws) when
+ * disabled or when the attempt has no ID.
+ *
+ * A request record is written while the body is transformed, which happens
+ * before route claiming and physical dispatch. A candidate abandoned after that
+ * point -- a duplicate route claim, a superseded fallback -- therefore leaves a
+ * request record behind for a request that never reached the wire. Without this
+ * tombstone the analyzer counts it as a physical attempt: it inflates
+ * requests-per-key pressure and fallback counts, and when the abandoned
+ * candidate holds the highest ordinal it also steals final-attempt attribution
+ * from the attempt that really was dispatched, leaving that one's response
+ * unjoined.
+ *
+ * The record carries no new identity: `request_id` and `attempt_id` already
+ * appear on the request record it annuls. Its phase is neither `request` nor
+ * `response`, so every existing reader ignores it.
+ */
+export function writeCodexAbortedAttemptTrace(inputs: {
+	attemptId?: string | null;
+	requestId?: string | null;
+}): void {
+	if (!inputs.attemptId) return;
+	appendTraceRecord({
+		trace_schema_version: TRACE_SCHEMA_VERSION,
+		phase: "attempt_aborted",
+		ts: new Date().toISOString(),
+		request_id: inputs.requestId ?? null,
+		attempt_id: inputs.attemptId,
+	});
+}
+
 function privacyHmac(
 	domain: "turn-state" | "response-id",
 	value: string | null | undefined,

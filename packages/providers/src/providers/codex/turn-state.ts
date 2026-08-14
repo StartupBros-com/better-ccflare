@@ -624,9 +624,21 @@ export class CodexTurnStateCoordinator {
 				!foreignPending,
 			);
 		}
+		// The lease exists to stop two *live* logical requests racing to advance one
+		// turn. Held against a request that no longer has an attempt in flight it
+		// fences nothing, because that request can never mutate the turn again:
+		// `finalizeAttempt` deletes the attempt before it returns `error_ignored`
+		// or any `stale_generation`, and when routing is exhausted or the caller
+		// cancels, no failover registration and no `abortAttempt` follows to
+		// release the claim. The client's next retry is a new logical request, so
+		// without this liveness test it would be suppressed -- unable to replay a
+		// token that is still perfectly valid -- for the rest of the idle TTL.
+		// Requiring a live attempt makes the lease self-releasing on every
+		// abandonment path while keeping the concurrency guarantee exact.
 		if (
 			pending.leaseRequestId !== undefined &&
-			pending.leaseRequestId !== input.requestId
+			pending.leaseRequestId !== input.requestId &&
+			this.hasLiveAttempt(scopeKey, pending.leaseRequestId)
 		) {
 			return this.recordAttempt(
 				input,
@@ -644,9 +656,19 @@ export class CodexTurnStateCoordinator {
 		pending.leaseRequestId = input.requestId;
 		pending.updatedAt = now;
 		if (arm === "control") {
+			// Downgrading a treatment turn to control really does change the pending
+			// entry, and every attempt that began before it must be fenced. Merely
+			// re-registering an entry that is already token-free control changes
+			// nothing, and bumping there fences the attempt still producing this very
+			// turn: a second candidate for the same logical request -- a duplicate
+			// route claim, a superseded fallback -- passes the lease check, bumps, and
+			// is then aborted, leaving the dispatched attempt to finalize as
+			// `stale_generation` with its lineage unadvanced. Bump only on real change.
+			const downgraded =
+				pending.arm !== "control" || pending.token !== undefined;
 			delete pending.token;
 			pending.arm = "control";
-			this.bumpPendingRevision(scopeKey);
+			if (downgraded) this.bumpPendingRevision(scopeKey);
 			this.touch(this.pending, scopeKey, pending);
 			this.enforceEntryLimit(config.maxEntries);
 			return this.recordAttempt(
@@ -802,28 +824,44 @@ export class CodexTurnStateCoordinator {
 	 * Idempotent: an unknown or already-finalized attempt is a no-op. Callers
 	 * that cannot reach this (an unexpected throw, a cancellation) still self-heal
 	 * through the bounded attempt TTL, just not promptly.
+	 *
+	 * Returns the logical request the attempt belonged to when the coordinator
+	 * knew it, so the caller can bind its abort telemetry to the same request the
+	 * attempt's own trace record carries; `null` for an unknown attempt.
 	 */
-	abortAttempt(attemptId: string | null | undefined): void {
-		if (!attemptId) return;
+	abortAttempt(attemptId: string | null | undefined): string | null {
+		if (!attemptId) return null;
 		const attempt = this.attempts.get(attemptId);
-		if (!attempt) return;
+		if (!attempt) return null;
 		this.attempts.delete(attemptId);
-		if (!attempt.scopeKey) return;
+		if (!attempt.scopeKey) return attempt.requestId;
 		const pending = this.pending.get(attempt.scopeKey);
-		if (pending?.leaseRequestId !== attempt.requestId) return;
+		if (pending?.leaseRequestId !== attempt.requestId) return attempt.requestId;
 		// The lease is held by the logical request, not this physical attempt, so
 		// it may only be released once that request has no other attempt live on
 		// this scope. A superseded fallback abandoned while the attempt it replaced
 		// is still running must leave that attempt's lease intact.
-		for (const other of this.attempts.values()) {
-			if (
-				other.scopeKey === attempt.scopeKey &&
-				other.requestId === attempt.requestId
-			) {
-				return;
-			}
+		if (this.hasLiveAttempt(attempt.scopeKey, attempt.requestId)) {
+			return attempt.requestId;
 		}
 		delete pending.leaseRequestId;
+		return attempt.requestId;
+	}
+
+	/**
+	 * Whether one logical request still has a registered, unfinalized attempt on
+	 * this scope. Both the lease guard in `beginAttempt` and the release in
+	 * `abortAttempt` ask this same question: an attempt is removed from the map at
+	 * its terminal and at its abort, so a request with none left can no longer
+	 * reach any state-mutating path and has nothing left to fence.
+	 */
+	private hasLiveAttempt(scopeKey: string, requestId: string): boolean {
+		for (const attempt of this.attempts.values()) {
+			if (attempt.scopeKey === scopeKey && attempt.requestId === requestId) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	private assignArm(
