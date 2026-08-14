@@ -2,10 +2,6 @@ import { TIME_CONSTANTS } from "@better-ccflare/core";
 
 const DRAIN_DEADLINE = Symbol("drain-deadline");
 const responseDrainTransports = new WeakMap<Response, AbortController>();
-const bodyDrainTransports = new WeakMap<
-	ReadableStream<Uint8Array>,
-	AbortController
->();
 
 export interface DrainReaderOptions {
 	/** Total time allowed for this best-effort drain. */
@@ -28,9 +24,6 @@ export function registerResponseDrainTransport(
 	transportAbort: AbortController,
 ): void {
 	responseDrainTransports.set(response, transportAbort);
-	if (response.body) {
-		bodyDrainTransports.set(response.body, transportAbort);
-	}
 }
 
 /**
@@ -52,10 +45,7 @@ export function transferResponseDrainTransport(
 export function getResponseDrainTransport(
 	response: Response,
 ): AbortController | undefined {
-	return (
-		responseDrainTransports.get(response) ??
-		(response.body ? bodyDrainTransports.get(response.body) : undefined)
-	);
+	return responseDrainTransports.get(response);
 }
 
 /**

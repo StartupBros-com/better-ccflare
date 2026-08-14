@@ -3,6 +3,7 @@ import {
 	drainReader,
 	getResponseDrainTransport,
 	registerResponseDrainTransport,
+	transferResponseDrainTransport,
 } from "../stream-drain";
 
 function neverSettlingReader(onCancel?: (reason: unknown) => void) {
@@ -16,6 +17,26 @@ function neverSettlingReader(onCancel?: (reason: unknown) => void) {
 }
 
 describe("drainReader", () => {
+	it("tracks and transfers exact transports without reading response bodies", () => {
+		let bodyAccesses = 0;
+		const observeBodyAccess = (response: Response): Response =>
+			new Proxy(response, {
+				get(target, property) {
+					if (property === "body") bodyAccesses += 1;
+					return Reflect.get(target, property, target);
+				},
+			});
+		const source = observeBodyAccess(new Response("source"));
+		const target = observeBodyAccess(new Response("target"));
+		const transportAbort = new AbortController();
+
+		registerResponseDrainTransport(source, transportAbort);
+		expect(getResponseDrainTransport(source)).toBe(transportAbort);
+		transferResponseDrainTransport(source, target);
+		expect(getResponseDrainTransport(target)).toBe(transportAbort);
+		expect(bodyAccesses).toBe(0);
+	});
+
 	it("settles by the deadline when reader.read never settles", async () => {
 		let cancelReason: unknown;
 		const { reader } = neverSettlingReader((reason) => {

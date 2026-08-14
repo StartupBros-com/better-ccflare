@@ -164,6 +164,25 @@ import {
 const log = new Logger("ProxyOperations");
 
 /**
+ * Replace an upstream response with the stream released by the Anthropic
+ * precommit gate while preserving ownership of that response's exact fetch.
+ * The source body is already owned by the gate, so this handoff intentionally
+ * reads only response metadata and never touches `sourceResponse.body`.
+ */
+export function wrapAnthropicPrecommitGatedResponse(
+	sourceResponse: Response,
+	gatedBody: ReadableStream<Uint8Array>,
+): Response {
+	const gatedResponse = new Response(gatedBody, {
+		status: sourceResponse.status,
+		statusText: sourceResponse.statusText,
+		headers: sourceResponse.headers,
+	});
+	transferResponseDrainTransport(sourceResponse, gatedResponse);
+	return gatedResponse;
+}
+
+/**
  * A provider-issued 401 gets one bounded same-account OAuth refresh/retry.  A
  * second 401 (or an API-key 401) is a credential failure, not a capacity
  * signal; the account is quarantined and the request fails over once.
@@ -1921,11 +1940,7 @@ export async function proxyUnauthenticated(
 				maxBufferedBytes: streamConfig.maxBufferedBytes,
 				signal: routingSignal,
 			});
-			response = new Response(gatedBody, {
-				status: response.status,
-				statusText: response.statusText,
-				headers: response.headers,
-			});
+			response = wrapAnthropicPrecommitGatedResponse(response, gatedBody);
 		}
 
 		return forwardToClient(
@@ -5890,11 +5905,7 @@ export async function proxyWithAccount(
 						signal: activeAttemptCommitment?.signal ?? currentTransportSignal(),
 					},
 				);
-				response = new Response(gatedBody, {
-					status: response.status,
-					statusText: response.statusText,
-					headers: response.headers,
-				});
+				response = wrapAnthropicPrecommitGatedResponse(response, gatedBody);
 				if (protectedPrecommitBackup) {
 					await discardUnusedResponse(
 						protectedPrecommitBackup,
