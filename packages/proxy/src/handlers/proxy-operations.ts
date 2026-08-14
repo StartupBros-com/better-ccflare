@@ -2804,6 +2804,20 @@ export async function proxyWithAccount(
 		// internal header before the request is sent upstream.
 		let transportAttemptOrdinal = requestMeta.codexTransportAttemptOrdinal ?? 0;
 		let currentTransportAttemptId: string | null = null;
+		/**
+		 * The last-route stamp as it stood before the current attempt overwrote it.
+		 *
+		 * `stampCodexAttempt` runs while an attempt's body is transformed, well
+		 * before that attempt can reach the wire, so an attempt vetoed pre-dispatch
+		 * leaves the request pointing at a route that never sent. Captured here on
+		 * every stamp so the pre-dispatch guard can undo exactly the stamp it is
+		 * abandoning, rather than rolling back to this invocation's entry state and
+		 * discarding an earlier attempt that really did dispatch.
+		 */
+		let codexAttemptRouteRollback: {
+			accountId: string | null | undefined;
+			model: string | null | undefined;
+		} | null = null;
 		/** Physical models compare case-insensitively; unknown never matches. */
 		const normalizeCodexAttemptModel = (
 			model: string | null | undefined,
@@ -2825,6 +2839,10 @@ export async function proxyWithAccount(
 			finalModel?: string,
 		) => {
 			if (attemptPlan.providerName !== "codex") return;
+			codexAttemptRouteRollback = {
+				accountId: requestMeta.codexLastAttemptAccountId,
+				model: requestMeta.codexLastAttemptModel,
+			};
 			transportAttemptOrdinal++;
 			requestMeta.codexTransportAttemptOrdinal = transportAttemptOrdinal;
 			requestMeta.codexLastAttemptAccountId = account.id;
@@ -3338,6 +3356,17 @@ export async function proxyWithAccount(
 					} catch {
 						// Turn-state bookkeeping never replaces the transport failure.
 					}
+					// Rolled back separately from the abort above so a throw there
+					// cannot leave the stamp behind. The ordinal deliberately keeps
+					// counting: it identifies attempts rather than describing a route,
+					// and reusing a number would collide with the abandoned attempt's
+					// own records. Mirrors the duplicate-route-claim rollback below.
+					if (codexAttemptRouteRollback) {
+						requestMeta.codexLastAttemptAccountId =
+							codexAttemptRouteRollback.accountId;
+						requestMeta.codexLastAttemptModel = codexAttemptRouteRollback.model;
+						codexAttemptRouteRollback = null;
+					}
 				}
 				throw error;
 			}
@@ -3516,6 +3545,9 @@ export async function proxyWithAccount(
 						: recordPhysicalDispatch,
 					() => {
 						dispatchStarted = true;
+						// This attempt's stamp now describes a route that really was
+						// sent, so it must survive any later pre-dispatch rollback.
+						codexAttemptRouteRollback = null;
 					},
 				);
 				observeTrustedHttpOverload(response, transportRequest, resolvedModel);

@@ -47,6 +47,7 @@ export type CodexTurnStateRequestAction =
 	| "custom_endpoint_suppressed"
 	| "hosted_suppressed"
 	| "ambiguous_lineage"
+	| "appended_input_suppressed"
 	| "missing_binding"
 	| "account_not_allowlisted"
 	| "model_not_allowlisted"
@@ -110,6 +111,14 @@ export interface CodexTurnStateBeginInput extends CodexTurnStateScopeInput {
 	readonly eligibleEndpoint: boolean;
 	readonly hosted: boolean;
 	readonly lineage: CodexTurnStateLineage;
+	/**
+	 * Whether the converted request still ends at the tool output its lineage was
+	 * validated against. `false` means conversion appended something after it, so
+	 * the wire request is not an exact same-turn continuation. Optional because
+	 * absence means "nothing known to have been appended"; only an explicit
+	 * `false` suppresses.
+	 */
+	readonly continuationTailIntact?: boolean;
 }
 
 export interface CodexTurnStateRequestDecision {
@@ -361,6 +370,23 @@ export function normalizeCodexTurnStateCallIds(
 	return normalizeCodexTurnStateFingerprints(fingerprints);
 }
 
+/**
+ * Whether the converted Codex input still ends at a tool output.
+ *
+ * A same-turn tool continuation must reach upstream as exactly that. Conversion
+ * can append items after the tool outputs the lineage was derived from, so this
+ * reports the tail of what will actually be sent rather than of what the client
+ * supplied. Reports the fact only; `beginAttempt` owns what to do about it.
+ */
+export function codexInputEndsWithToolOutput(
+	input: readonly unknown[] | null | undefined,
+): boolean {
+	if (!Array.isArray(input) || input.length === 0) return false;
+	const last = input[input.length - 1];
+	if (!last || typeof last !== "object" || Array.isArray(last)) return false;
+	return (last as Record<string, unknown>).type === "function_call_output";
+}
+
 export function extractCodexTurnStateLineage(
 	messages: readonly unknown[],
 ): CodexTurnStateLineage {
@@ -473,16 +499,16 @@ export class CodexTurnStateCoordinator {
 		}
 		if (input.hosted) {
 			this.invalidate(scopeKey, now, config);
-			return this.recordAttempt(
-				input,
-				scopeKey,
-				"ineligible",
-				cohortId,
-				"hosted_suppressed",
-				false,
-				now,
-				config,
-			);
+			// Deliberately reports the decision without registering an attempt.
+			// Hosted search finalizes through its own response processor and never
+			// reaches `finalizeAttempt`, so a registered hosted attempt is one
+			// nothing can ever resolve. It would sit in the map for the whole idle
+			// TTL keeping `hasLiveAttempt` true for its logical request, which pins
+			// that request's lease and suppresses every later continuation on this
+			// scope, while also consuming the shared entry cap. Every other
+			// suppression here does reach `processResponse`, so only this one has to
+			// opt out of registration.
+			return this.decision("ineligible", cohortId, "hosted_suppressed", false);
 		}
 		if (input.lineage.kind === "invalid") {
 			this.invalidate(scopeKey, now, config);
@@ -492,6 +518,30 @@ export class CodexTurnStateCoordinator {
 				"ineligible",
 				cohortId,
 				"ambiguous_lineage",
+				false,
+				now,
+				config,
+			);
+		}
+		if (
+			input.lineage.kind === "valid" &&
+			input.continuationTailIntact === false
+		) {
+			// Lineage is validated against the client's Anthropic messages, but what
+			// reaches Codex is the converted body, and conversion can append to it --
+			// today a continue-now nudge after a final Skill result. That request is
+			// no longer an exact same-turn tool continuation even though its lineage
+			// still matches, which is precisely why the token would otherwise replay.
+			// The caller reports only the tail fact; deciding on it here keeps the
+			// policy with every other suppression, and guarding the converted tail
+			// rather than Skill specifically covers any future append for free.
+			this.invalidate(scopeKey, now, config);
+			return this.recordAttempt(
+				input,
+				scopeKey,
+				"ineligible",
+				cohortId,
+				"appended_input_suppressed",
 				false,
 				now,
 				config,

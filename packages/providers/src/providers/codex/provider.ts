@@ -83,6 +83,7 @@ import {
 	CodexTurnStateCoordinator,
 	type CodexTurnStateLineage,
 	type CodexTurnStateTerminalAction,
+	codexInputEndsWithToolOutput,
 	extractCodexTurnStateLineage,
 	fingerprintCodexTurnStateCallId,
 	normalizeCodexTurnStateFingerprints,
@@ -1388,6 +1389,10 @@ export class CodexProvider extends BaseProvider {
 				eligibleEndpoint: isSubscriptionEndpoint,
 				hosted: options.hosted === true,
 				lineage: extractCodexTurnStateLineage(body.messages),
+				// Reported from the converted body, not the client's messages: those
+				// are what lineage is derived from, but conversion is free to append
+				// after them (see the Skill nudge in convertToCodexFormat).
+				continuationTailIntact: codexInputEndsWithToolOutput(codexBody.input),
 			});
 			// Best-effort, env-gated observability (no-op unless CCFLARE_CODEX_TRACE_DIR set).
 			writeCodexTrace({

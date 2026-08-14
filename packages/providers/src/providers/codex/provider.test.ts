@@ -737,6 +737,44 @@ describe("CodexProvider HTTP turn-state failure paths", () => {
 		expect(continuation.headers.get(turnStateHeader)).toBeNull();
 	});
 
+	it("suppresses replay when a Skill result appends a nudge after the tool output", async () => {
+		enableTreatment();
+		const provider = new CodexProvider();
+		await seedTurnState(provider, "call-skill");
+		const continuation = await provider.transformRequestBody(
+			requestFor("request-skill", "attempt-skill", [
+				{ role: "user", content: firstUserText },
+				{
+					role: "assistant",
+					content: [
+						{ type: "tool_use", id: "call-skill", name: "Skill", input: {} },
+					],
+				},
+				{
+					role: "user",
+					content: [
+						{
+							type: "tool_result",
+							tool_use_id: "call-skill",
+							content: "result",
+						},
+					],
+				},
+			]),
+			account,
+		);
+
+		// Conversion appends a continue-now nudge after a final Skill result, so
+		// the request that actually reaches Codex ends with a user message rather
+		// than the tool output its lineage was validated against. The lineage
+		// still matches, which is exactly why the token would otherwise replay.
+		const converted = (await continuation.clone().json()) as {
+			input: Array<Record<string, unknown>>;
+		};
+		expect(converted.input.at(-1)).toMatchObject({ role: "user" });
+		expect(continuation.headers.get(turnStateHeader)).toBeNull();
+	});
+
 	it("reuses an exact lease on a compatible retry", async () => {
 		enableTreatment();
 		const provider = new CodexProvider();

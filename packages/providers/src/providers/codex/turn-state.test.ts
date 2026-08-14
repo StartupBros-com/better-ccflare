@@ -1346,3 +1346,52 @@ describe("CodexTurnStateCoordinator", () => {
 		).toBe(false);
 	});
 });
+
+describe("Codex turn-state attempt registration", () => {
+	test("never registers a hosted attempt, which has no reachable terminal", () => {
+		enableTreatment();
+		const coordinator = new CodexTurnStateCoordinator();
+
+		const decision = coordinator.beginAttempt(
+			beginInput({ hosted: true, attemptId: "attempt-hosted" }),
+		);
+
+		expect(decision.arm).toBe("ineligible");
+		expect(decision.action).toBe("hosted_suppressed");
+		// Hosted search finalizes through its own response processor, which never
+		// reaches turn-state finalization. A registered attempt would therefore
+		// stay live for the whole idle TTL: it keeps `hasLiveAttempt` true for its
+		// logical request, so the lease that request holds is never released and
+		// every later continuation on the scope is suppressed. `abortAttempt`
+		// returning null is how "was never registered" is observable.
+		expect(coordinator.abortAttempt("attempt-hosted")).toBeNull();
+	});
+
+	test("suppresses replay when input is appended after the tool result", () => {
+		enableTreatment();
+		const coordinator = new CodexTurnStateCoordinator();
+		coordinator.beginAttempt(beginInput());
+		coordinator.finalizeAttempt({
+			attemptId: "attempt-1",
+			stopReason: "tool_use",
+			responseTurnState: "turn-token",
+			outputLineage: lineage("call-a"),
+		});
+
+		const decision = coordinator.beginAttempt(
+			beginInput({
+				requestId: "request-2",
+				attemptId: "attempt-2",
+				lineage: lineage("call-a"),
+				continuationTailIntact: false,
+			}),
+		);
+
+		// The lineage still matches, but the request the proxy will actually send
+		// carries something after the final tool output, so it is not an exact
+		// same-turn continuation and must not carry the private token.
+		expect(decision.replayApplied).toBe(false);
+		expect(decision.turnState).toBeUndefined();
+		expect(decision.action).toBe("appended_input_suppressed");
+	});
+});

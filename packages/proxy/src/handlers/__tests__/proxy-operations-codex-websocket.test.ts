@@ -571,6 +571,55 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 		);
 	});
 
+	it("restores the previous Codex route stamp when an attempt is abandoned pre-dispatch", async () => {
+		installUsageCollector();
+		const websocketAttempt = spyOn(
+			codexWebSocketTransport,
+			"tryRequest",
+		).mockResolvedValue(null);
+		const httpAttempt = mock(async () =>
+			Promise.resolve(new Response("must not dispatch", { status: 500 })),
+		);
+		globalThis.fetch = httpAttempt as never;
+
+		const body = makeRequestBody();
+		const request = makeRequest(body);
+		const meta = makeRequestMeta("codex-stamp-rollback", {
+			codexTransportAttemptOrdinal: 1,
+			codexLastAttemptAccountId: "codex-previous-account",
+			codexLastAttemptModel: "gpt-5.4",
+		});
+
+		const response = await proxyWithAccount(
+			request,
+			new URL(request.url),
+			makeCodexAccount(),
+			meta,
+			body,
+			() => undefined,
+			0,
+			makeProxyContext(),
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			false,
+			undefined,
+			undefined,
+			makePolicy(0),
+		);
+
+		expect(response).toBeNull();
+		expect(websocketAttempt).not.toHaveBeenCalled();
+		expect(httpAttempt).not.toHaveBeenCalled();
+		// The attempt stamped itself as the request's last route before its body was
+		// transformed, then died before dispatch. Left stamped, the first attempt
+		// that actually reaches the wire compares itself against a route that never
+		// sent and reads as an account or model fallback.
+		expect(meta.codexLastAttemptAccountId).toBe("codex-previous-account");
+		expect(meta.codexLastAttemptModel).toBe("gpt-5.4");
+	});
+
 	it("keeps a provider-owned Codex turn-state replay on HTTP", async () => {
 		installUsageCollector();
 		const provider = getProvider("codex");

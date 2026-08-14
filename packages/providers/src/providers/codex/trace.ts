@@ -65,6 +65,7 @@ const TURN_STATE_REQUEST_ACTIONS = new Set<CodexTurnStateRequestAction>([
 	"custom_endpoint_suppressed",
 	"hosted_suppressed",
 	"ambiguous_lineage",
+	"appended_input_suppressed",
 	"missing_binding",
 	"account_not_allowlisted",
 	"model_not_allowlisted",
