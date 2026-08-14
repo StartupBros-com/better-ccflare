@@ -253,6 +253,15 @@ export interface Provider {
 	buildUrl(path: string, query: string, account?: Account): string;
 
 	/**
+	 * Optional: release provider-local per-attempt state for an attempt that was
+	 * registered while its request body was transformed but will never be
+	 * dispatched — a duplicate-route skip or a superseded fallback candidate.
+	 * Must be idempotent and safe for an unknown attempt ID. Providers that hold
+	 * no per-attempt state omit it.
+	 */
+	abortTurnStateAttempt?(attemptId: string | null | undefined): void;
+
+	/**
 	 * Optional: Pre-process the request before building URL
 	 * This allows providers to extract information from the request body
 	 * before buildUrl is called (e.g., for including model in URL path)

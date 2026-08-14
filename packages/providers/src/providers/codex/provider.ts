@@ -912,6 +912,15 @@ export class CodexProvider extends BaseProvider {
 		};
 	}
 
+	/**
+	 * Releases turn-state context for an attempt that was registered during
+	 * request transformation but will never be dispatched. Idempotent; see
+	 * `CodexTurnStateCoordinator.abortAttempt`.
+	 */
+	abortTurnStateAttempt(attemptId: string | null | undefined): void {
+		this.turnStateCoordinator.abortAttempt(attemptId);
+	}
+
 	createServerToolCapabilityTuple(
 		context: ProviderServerToolCapabilityContext,
 	): ServerToolCapabilityTuple | undefined {

@@ -666,7 +666,7 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 		);
 	});
 
-	it("classifies a Codex re-entry as failover only when the account changed", async () => {
+	it("classifies a Codex re-entry as a retry only when account and model both hold", async () => {
 		installUsageCollector();
 		const provider = getProvider("codex");
 		if (!provider?.transformRequestBody) {
@@ -694,9 +694,9 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 
 		const account = makeCodexAccount();
 		try {
-			// A second physical send on the same account: the bounded 401 retry after
-			// a credential refresh looks exactly like this. Its turn state is still
-			// valid, so it must not be classified as a route change.
+			// A second physical send on the same account and model: the bounded 401
+			// retry after a credential refresh looks exactly like this. Its turn
+			// state is still valid, so it must not be classified as a route change.
 			const sameAccountBody = makeRequestBody();
 			await runProxy(
 				makeRequest(sameAccountBody),
@@ -707,6 +707,23 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 				{
 					codexTransportAttemptOrdinal: 1,
 					codexLastAttemptAccountId: account.id,
+					codexLastAttemptModel: "gpt-5.4",
+				},
+			);
+			// Same account, different physical model: a deferred cross-family
+			// fallback re-enters exactly like this. The route changed, so turn state
+			// must be invalidated rather than replayed.
+			const sameAccountOtherModelBody = makeRequestBody();
+			await runProxy(
+				makeRequest(sameAccountOtherModelBody),
+				sameAccountOtherModelBody,
+				makePolicy(5_000),
+				"codex-reentry-same-account-other-model",
+				account,
+				{
+					codexTransportAttemptOrdinal: 1,
+					codexLastAttemptAccountId: account.id,
+					codexLastAttemptModel: "gpt-5.4-codex",
 				},
 			);
 			const otherAccountBody = makeRequestBody();
@@ -719,13 +736,18 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 				{
 					codexTransportAttemptOrdinal: 1,
 					codexLastAttemptAccountId: "codex-some-other-account",
+					codexLastAttemptModel: "gpt-5.4",
 				},
 			);
 		} finally {
 			provider.transformRequestBody = originalTransformRequestBody;
 		}
 
-		expect(causes).toEqual(["other_retry", "account_failover"]);
+		expect(causes).toEqual([
+			"other_retry",
+			"model_fallback",
+			"account_failover",
+		]);
 	});
 
 	it("claims before response.create and never rescues an ambiguous hosted write to HTTP", async () => {

@@ -168,6 +168,19 @@ interface AttemptEntry {
 	updatedAt: number;
 }
 
+/**
+ * How many idle periods an attempt may keep its scope from expiring.
+ *
+ * Attempts are exempt from the idle sweep because a slow response is live work,
+ * not idle state. That exemption needs a ceiling: `beginAttempt` registers an
+ * attempt during request transformation, before physical dispatch, so a
+ * candidate abandoned after registration -- on any path that does not reach
+ * `abortAttempt` -- would otherwise pin its scope and hold its lease forever.
+ * Four idle periods (two hours at the defaults) is far longer than any real
+ * response and still bounded.
+ */
+const ATTEMPT_TTL_MULTIPLIER = 4;
+
 function strictUnsignedInteger(
 	raw: string | undefined,
 	fallback: number,
@@ -767,6 +780,46 @@ export class CodexTurnStateCoordinator {
 		return "captured";
 	}
 
+	/**
+	 * Releases the context registered for one attempt that will never produce a
+	 * response.
+	 *
+	 * `beginAttempt` runs during request transformation, before route claiming
+	 * and physical dispatch, so a candidate can be abandoned after it registered:
+	 * a duplicate-route skip, a staging failure, or a superseded fallback. Such
+	 * an attempt keeps whatever lease it took and, because in-flight attempts
+	 * exempt their scope from the idle sweep, keeps that scope alive too --
+	 * suppressing every matching continuation. Aborting drops the attempt and
+	 * releases its lease without touching the turn itself, so the turn stays
+	 * replayable and no other request is fenced.
+	 *
+	 * Idempotent: an unknown or already-finalized attempt is a no-op. Callers
+	 * that cannot reach this (an unexpected throw, a cancellation) still self-heal
+	 * through the bounded attempt TTL, just not promptly.
+	 */
+	abortAttempt(attemptId: string | null | undefined): void {
+		if (!attemptId) return;
+		const attempt = this.attempts.get(attemptId);
+		if (!attempt) return;
+		this.attempts.delete(attemptId);
+		if (!attempt.scopeKey) return;
+		const pending = this.pending.get(attempt.scopeKey);
+		if (pending?.leaseRequestId !== attempt.requestId) return;
+		// The lease is held by the logical request, not this physical attempt, so
+		// it may only be released once that request has no other attempt live on
+		// this scope. A superseded fallback abandoned while the attempt it replaced
+		// is still running must leave that attempt's lease intact.
+		for (const other of this.attempts.values()) {
+			if (
+				other.scopeKey === attempt.scopeKey &&
+				other.requestId === attempt.requestId
+			) {
+				return;
+			}
+		}
+		delete pending.leaseRequestId;
+	}
+
 	private assignArm(
 		input: CodexTurnStateBeginInput,
 		cohortId: string | null,
@@ -909,8 +962,24 @@ export class CodexTurnStateCoordinator {
 		// cap and its LRU eviction keep the map bounded instead. For the same
 		// reason a scope with an attempt still in flight is not idle, so its turn
 		// and generation survive the sweep as well.
+		//
+		// `enforceEntryLimit` deliberately does not share this exemption. Under
+		// cap pressure it may evict the generation of a scope whose attempt is
+		// still running, which costs that attempt its terminal: it resolves
+		// `stale_generation` and the next continuation opens a fresh turn. That is
+		// the documented eviction contract -- bookkeeping loss suppresses replay
+		// and never corrupts a turn -- and keeping the cap unconditional is what
+		// makes it a hard bound rather than one a burst of long responses can
+		// exceed.
+		const attemptCutoff = now - config.idleTtlMs * ATTEMPT_TTL_MULTIPLIER;
 		const activeScopes = new Set<string>();
-		for (const entry of this.attempts.values()) {
+		for (const [key, entry] of this.attempts) {
+			// An attempt this old is no longer a request in flight; it was abandoned
+			// without a terminal. Drop it so the scope it was protecting can expire.
+			if (entry.updatedAt < attemptCutoff) {
+				this.attempts.delete(key);
+				continue;
+			}
 			if (entry.scopeKey) activeScopes.add(entry.scopeKey);
 		}
 		for (const [key, entry] of this.pending) {

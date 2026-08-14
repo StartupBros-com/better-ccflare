@@ -832,6 +832,110 @@ describe("CodexTurnStateCoordinator", () => {
 		).toMatchObject({ replayApplied: true, turnState: "turn-token-1" });
 	});
 
+	test("releases the lease of an attempt that never reached the wire", () => {
+		enableTreatment();
+		const coordinator = new CodexTurnStateCoordinator();
+		coordinator.beginAttempt(beginInput());
+		expect(
+			coordinator.finalizeAttempt({
+				attemptId: "attempt-1",
+				stopReason: "tool_use",
+				responseTurnState: "turn-token-1",
+				outputLineage: lineage("call-1"),
+			}),
+		).toBe("captured");
+
+		// This continuation registers during body transformation and takes the
+		// lease, then never dispatches -- a duplicate-route skip, for instance.
+		expect(
+			coordinator.beginAttempt(
+				beginInput({
+					requestId: "request-abandoned",
+					attemptId: "attempt-abandoned",
+					lineage: lineage("call-1"),
+				}),
+			),
+		).toMatchObject({ replayApplied: true, turnState: "turn-token-1" });
+		coordinator.abortAttempt("attempt-abandoned");
+		// Idempotent: aborting twice, or aborting an attempt that never existed,
+		// must not disturb the turn.
+		coordinator.abortAttempt("attempt-abandoned");
+		coordinator.abortAttempt("attempt-never-registered");
+
+		// The turn itself survives, and the next logical request is neither
+		// suppressed by the dead lease nor denied the token.
+		expect(
+			coordinator.beginAttempt(
+				beginInput({
+					requestId: "request-next",
+					attemptId: "attempt-next",
+					lineage: lineage("call-1"),
+				}),
+			),
+		).toMatchObject({
+			action: "replay",
+			replayApplied: true,
+			turnState: "turn-token-1",
+		});
+	});
+
+	test("stops protecting a scope once an attempt is far past the idle TTL", () => {
+		enableTreatment();
+		process.env[CODEX_TURN_STATE_IDLE_TTL_MS_ENV] = "60000";
+		let clock = 0;
+		const coordinator = new CodexTurnStateCoordinator({ now: () => clock });
+		coordinator.beginAttempt(beginInput());
+		expect(
+			coordinator.finalizeAttempt({
+				attemptId: "attempt-1",
+				stopReason: "tool_use",
+				responseTurnState: "turn-token-1",
+				outputLineage: lineage("call-1"),
+			}),
+		).toBe("captured");
+
+		// An attempt that registers and is then abandoned on a path with no abort
+		// call keeps its scope exempt from the idle sweep. That exemption is what
+		// makes a slow response safe, so it has to expire on its own -- otherwise
+		// one abandoned attempt suppresses this conversation forever.
+		coordinator.beginAttempt(
+			beginInput({
+				requestId: "request-abandoned",
+				attemptId: "attempt-abandoned",
+				lineage: lineage("call-1"),
+			}),
+		);
+
+		clock = 60_000 * 4 + 1;
+		coordinator.beginAttempt(
+			beginInput({
+				conversationIdentity: "conversation-unrelated",
+				requestId: "request-other",
+				attemptId: "attempt-other",
+			}),
+		);
+
+		// The scope expired with the abandoned attempt, so a fresh request starts a
+		// new turn instead of inheriting a suppressed one.
+		expect(
+			coordinator.beginAttempt(
+				beginInput({
+					requestId: "request-next",
+					attemptId: "attempt-next",
+					lineage: lineage("call-1"),
+				}),
+			),
+		).toMatchObject({ action: "no_pending", replayApplied: false });
+		expect(
+			coordinator.finalizeAttempt({
+				attemptId: "attempt-abandoned",
+				stopReason: "tool_use",
+				responseTurnState: "turn-token-late",
+				outputLineage: lineage("call-2"),
+			}),
+		).toBe("unknown_attempt");
+	});
+
 	test("keeps an active turn alive across the idle TTL boundary", () => {
 		enableTreatment();
 		process.env[CODEX_TURN_STATE_IDLE_TTL_MS_ENV] = "60000";

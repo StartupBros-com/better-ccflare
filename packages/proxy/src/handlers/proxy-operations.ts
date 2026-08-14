@@ -2743,6 +2743,10 @@ export async function proxyWithAccount(
 		// internal header before the request is sent upstream.
 		let transportAttemptOrdinal = requestMeta.codexTransportAttemptOrdinal ?? 0;
 		let currentTransportAttemptId: string | null = null;
+		/** Physical models compare case-insensitively; unknown never matches. */
+		const normalizeCodexAttemptModel = (
+			model: string | null | undefined,
+		): string | null => model?.trim().toLowerCase() || null;
 		const stampCodexAttempt = (
 			attemptHeaders: Headers,
 			cause:
@@ -2763,6 +2767,11 @@ export async function proxyWithAccount(
 			transportAttemptOrdinal++;
 			requestMeta.codexTransportAttemptOrdinal = transportAttemptOrdinal;
 			requestMeta.codexLastAttemptAccountId = account.id;
+			// `attemptPlan` still describes the attempt being superseded when a
+			// fallback stamps itself, so the explicit model wins where one is given.
+			requestMeta.codexLastAttemptModel = normalizeCodexAttemptModel(
+				finalModel ?? attemptPlan.physicalModel,
+			);
 			currentTransportAttemptId = crypto.randomUUID();
 			attemptHeaders.set(
 				"x-better-ccflare-attempt-id",
@@ -2848,20 +2857,34 @@ export async function proxyWithAccount(
 		};
 		let headers = prepareAttemptHeaders(attemptPlan);
 		// A nonzero ordinal only means this logical request has been sent before,
-		// not that it moved accounts. Re-entry on the same account -- the bounded
-		// 401 retry after refreshing credentials, for instance -- is a compatible
-		// retry: the rejected credential never committed the model turn, so its
-		// turn state is still valid and must not be discarded as failover would.
-		// An unknown previous account keeps the old failover classification: that
-		// side only discards state, while the retry side would preserve it.
+		// not that it moved. Re-entry on the same account AND the same physical
+		// model -- the bounded 401 retry after refreshing credentials, for
+		// instance -- is a compatible retry: the rejected credential never
+		// committed the model turn, so its turn state is still valid and must not
+		// be discarded as failover would. Any change of account or of physical
+		// model is a route change instead, and a route change must invalidate and
+		// suppress rather than replay: a deferred cross-family fallback re-enters
+		// with this same request metadata and only the model differs. An unknown
+		// account or model on either side keeps the route-change classification,
+		// because that side only discards state while the retry side preserves it.
 		const previousAttemptAccountId = requestMeta.codexLastAttemptAccountId;
+		const previousAttemptModel = requestMeta.codexLastAttemptModel;
+		const entryTransportModel = normalizeCodexAttemptModel(
+			replayResolvedModel ?? attemptPlan.physicalModel,
+		);
+		const sameAccountReentry = previousAttemptAccountId === account.id;
+		const sameModelReentry =
+			entryTransportModel !== null &&
+			previousAttemptModel === entryTransportModel;
 		stampCodexAttempt(
 			headers,
 			transportAttemptOrdinal === 0
 				? "initial"
-				: previousAttemptAccountId === account.id
+				: sameAccountReentry && sameModelReentry
 					? "other_retry"
-					: "account_failover",
+					: sameAccountReentry
+						? "model_fallback"
+						: "account_failover",
 			replayResolvedModel ?? undefined,
 		);
 		let targetUrl = attemptPlan.targetUrl;
@@ -3458,6 +3481,15 @@ export async function proxyWithAccount(
 			log.debug(
 				`Skipping duplicate request-local route account=${account.name} model=${currentTransportModel ?? "unknown"}`,
 			);
+			// The body transform above already registered this attempt's turn-state
+			// context, and nothing will ever dispatch it or process its response.
+			// Without this release it would hold its lease and keep its scope alive,
+			// suppressing every matching continuation. Its stamped route is rolled
+			// back for the same reason: a route that never sent must not be what a
+			// later re-entry compares itself against.
+			provider.abortTurnStateAttempt?.(currentTransportAttemptId);
+			requestMeta.codexLastAttemptAccountId = previousAttemptAccountId;
+			requestMeta.codexLastAttemptModel = previousAttemptModel;
 			return null;
 		}
 		if (routingAttemptLedger) {
@@ -5344,6 +5376,9 @@ export async function proxyWithAccount(
 						// stamp below.
 						const supersededCodexAttemptId: string | null =
 							currentTransportAttemptId;
+						const supersededCodexAccountId =
+							requestMeta.codexLastAttemptAccountId;
+						const supersededCodexModel = requestMeta.codexLastAttemptModel;
 						let fallbackAttemptStamped = false;
 						try {
 							if (provider.name === "codex") {
@@ -5392,7 +5427,11 @@ export async function proxyWithAccount(
 							// This candidate never sends, so the superseded response is still
 							// the live attempt for whatever runs next.
 							if (fallbackAttemptStamped) {
+								provider.abortTurnStateAttempt?.(currentTransportAttemptId);
 								currentTransportAttemptId = supersededCodexAttemptId;
+								requestMeta.codexLastAttemptAccountId =
+									supersededCodexAccountId;
+								requestMeta.codexLastAttemptModel = supersededCodexModel;
 							}
 							if (error instanceof ServerToolCandidateCapabilityError) {
 								lastModelFallbackCapabilityError = error;
@@ -5420,7 +5459,10 @@ export async function proxyWithAccount(
 							log.debug(
 								`Skipping duplicate request-local model fallback account=${account.name} model=${nextModel}`,
 							);
+							provider.abortTurnStateAttempt?.(currentTransportAttemptId);
 							currentTransportAttemptId = supersededCodexAttemptId;
+							requestMeta.codexLastAttemptAccountId = supersededCodexAccountId;
+							requestMeta.codexLastAttemptModel = supersededCodexModel;
 							continue;
 						}
 						lastModelFallbackCapabilityError = null;
