@@ -969,10 +969,13 @@ describe.skipIf(!livePgAvailable)(
 					for (const id of ["fleet-1", "fleet-2"]) {
 						await dbOps.recordUsageSnapshot(
 							id,
-							{
-								five_hour: { utilization: 12, resets_at: now + HOUR },
-								seven_day: { utilization: 34, resets_at: now + 24 * HOUR },
-							},
+							normalizeProviderUsageWindows(
+								{
+									five_hour: { utilization: 12, resets_at: now + HOUR },
+									seven_day: { utilization: 34, resets_at: now + 24 * HOUR },
+								},
+								"anthropic",
+							),
 							now - HOUR,
 						);
 					}
@@ -1011,10 +1014,13 @@ describe.skipIf(!livePgAvailable)(
 				await seedAccount({ id: "fleet-w", name: "fleet window" });
 				await dbOps.recordUsageSnapshot(
 					"fleet-w",
-					{
-						five_hour: { utilization: 12, resets_at: now + HOUR },
-						seven_day: { utilization: 34, resets_at: now + 24 * HOUR },
-					},
+					normalizeProviderUsageWindows(
+						{
+							five_hour: { utilization: 12, resets_at: now + HOUR },
+							seven_day: { utilization: 34, resets_at: now + 24 * HOUR },
+						},
+						"anthropic",
+					),
 					now - HOUR,
 				);
 

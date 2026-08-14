@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, it } from "bun:test";
+import type { CanonicalUsageWindow } from "@better-ccflare/types";
 import { BunSqlAdapter } from "../../adapters/bun-sql-adapter";
 import { ensureSchema, runMigrations } from "../../migrations";
 import { UsageHistoryRepository } from "../usage-history.repository";
@@ -39,10 +40,29 @@ async function seed(
 	for (const ts of stamps) {
 		await repo.recordSnapshot(
 			accountId,
-			{ [windowKey]: { utilization, resets_at: null } },
+			[canonicalWindow(windowKey, utilization)],
 			ts,
 		);
 	}
+}
+
+/**
+ * Build the canonical window shape directly rather than via a provider
+ * normalizer: this repository is provider-agnostic on purpose, so its tests
+ * should not need to know which provider happens to emit a given window key.
+ */
+function canonicalWindow(
+	windowKey: string,
+	utilization: number,
+): CanonicalUsageWindow {
+	return {
+		windowKey,
+		utilization,
+		resetsAtMs: null,
+		scope: "account",
+		modelFamily: null,
+		active: true,
+	};
 }
 
 describe("UsageHistoryRepository.getFleetUsageHistory", () => {
