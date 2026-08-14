@@ -114,6 +114,12 @@ interface SourceFile {
 	text: string;
 }
 
+const EXCLUDED_GENERATED_DATABASE_SOURCES = new Set([
+	"inline-vacuum-worker.ts",
+	"inline-integrity-check-worker.ts",
+	"inline-incremental-vacuum-worker.ts",
+]);
+
 /** Read every non-test .ts file under the two packages that own SQL. */
 async function collectSqlSources(): Promise<SourceFile[]> {
 	const files: SourceFile[] = [];
@@ -122,6 +128,8 @@ async function collectSqlSources(): Promise<SourceFile[]> {
 		for await (const rel of glob.scan({ cwd: root })) {
 			if (rel.includes("__tests__")) continue;
 			if (rel.endsWith(".test.ts")) continue;
+			if (root === DATABASE_SRC && EXCLUDED_GENERATED_DATABASE_SOURCES.has(rel))
+				continue;
 			const abs = `${root}/${rel}`;
 			files.push({ path: abs, text: await Bun.file(abs).text() });
 		}
@@ -220,12 +228,48 @@ describe("SQL dialect hazards (static, always runs)", () => {
 		expect(hits).toEqual([]);
 	});
 
-	it("does not mix `?` and `?N` placeholder styles in one statement", () => {
+	it("reserves positional placeholders for the bounded fleet-history query", () => {
 		// The bare-`?` counter is independent of the `?N` literals, so mixing
 		// them produces colliding $N and a parameter silently reads another
-		// parameter's value. Flag any `?N` usage at all — no call site needs it.
-		const hits = offendingLines(sources, /\?\d+/);
+		// parameter's value. The fleet-history query is the one deliberate
+		// exception: it reuses a constant set of binds across several CTEs so a
+		// large account fleet remains one JSON parameter. Keep that exception
+		// exact instead of weakening the repository-wide gate.
+		const hits = offendingLines(
+			sources.filter(
+				(source) => !source.path.endsWith("usage-history.repository.ts"),
+			),
+			/\?\d+/,
+		);
 		expect(hits).toEqual([]);
+
+		const usageHistory = sources.find((source) =>
+			source.path.endsWith("usage-history.repository.ts"),
+		);
+		expect(usageHistory).toBeDefined();
+		const start =
+			usageHistory?.text.indexOf("async getFleetUsageHistory(") ?? -1;
+		const end =
+			usageHistory?.text.indexOf("\n\tasync deleteOlderThan(", start) ?? -1;
+		expect(start).toBeGreaterThanOrEqual(0);
+		expect(end).toBeGreaterThan(start);
+		const fleetMethod = usageHistory?.text.slice(start, end) ?? "";
+		const outsideFleetMethod = `${usageHistory?.text.slice(0, start) ?? ""}${
+			usageHistory?.text.slice(end) ?? ""
+		}`;
+		expect(outsideFleetMethod).not.toMatch(/\?\d+/);
+		expect(fleetMethod).toContain("json_each(?1)");
+		expect(fleetMethod).toContain(
+			"jsonb_array_elements_text(CAST(?1 AS jsonb))",
+		);
+		expect(fleetMethod).toContain("COLLATE BINARY");
+		expect(fleetMethod).toContain('COLLATE "C"');
+		expect([...new Set(fleetMethod.match(/\?\d+/g) ?? [])]).toEqual(["?1"]);
+		expect(fleetMethod).toContain("let nextParamIndex = 2");
+		expect(fleetMethod).toMatch(/return `\?\$\{nextParamIndex\+\+\}`/);
+		expect(fleetMethod).toContain(
+			"this.query<FleetSnapshotDbRow>(fleetSql, params)",
+		);
 	});
 });
 
@@ -933,6 +977,75 @@ describe.skipIf(!livePgAvailable)(
 		});
 
 		describe("GET /api/usage-history", () => {
+			liveIt(
+				"selects the same strict fleet prefix for raw and bucketed PostgreSQL reads",
+				async () => {
+					const newest = "fleet-prefix-newest";
+					const blocked = "fleet-prefix-blocked";
+					const lower = "fleet-prefix-lower";
+					const record = async (accountId: string, timestamp: number) => {
+						await dbOps.recordUsageSnapshot(
+							accountId,
+							normalizeProviderUsageWindows(
+								{ five_hour: { utilization: 12, resets_at: now + HOUR } },
+								"anthropic",
+							),
+							timestamp,
+						);
+					};
+					for (const timestamp of [now - 6000, now - 4000, now - 2000]) {
+						await record(newest, timestamp);
+					}
+					for (const timestamp of [now - 16_000, now - 14_000, now - 12_000]) {
+						await record(blocked, timestamp);
+					}
+					await record(lower, now - 22_000);
+
+					const raw = await dbOps.getFleetUsageHistory({
+						accountIds: [newest, blocked, lower],
+						pointBudget: 4,
+					});
+					expect([...new Set(raw.rows.map((row) => row.accountId))]).toEqual([
+						newest,
+					]);
+					expect(raw.returnedPointCount).toBe(3);
+					expect(raw.truncated).toBe(true);
+					expect(raw.omittedSeriesCount).toBe(2);
+					expect(raw.omittedAccountCount).toBe(2);
+
+					const bucketed = await dbOps.getFleetUsageHistory({
+						accountIds: [newest, blocked, lower],
+						bucketMs: 1000,
+						pointBudget: 1,
+					});
+					expect([
+						...new Set(bucketed.rows.map((row) => row.accountId)),
+					]).toEqual([newest]);
+					expect(bucketed.returnedPointCount).toBe(3);
+					expect(bucketed.truncated).toBe(true);
+					expect(bucketed.omittedSeriesCount).toBe(2);
+					expect(bucketed.omittedAccountCount).toBe(2);
+
+					const binaryFirst = "fleet-collation-Z";
+					const binarySecond = "fleet-collation-a";
+					const binaryLast = "fleet-collation-é";
+					for (const accountId of [binaryLast, binarySecond, binaryFirst]) {
+						await record(accountId, now - 1000);
+					}
+					const tied = await dbOps.getFleetUsageHistory({
+						accountIds: [binaryLast, binarySecond, binaryFirst],
+						pointBudget: 2,
+					});
+					expect(tied.rows.map((row) => row.accountId)).toEqual([
+						binaryFirst,
+						binarySecond,
+					]);
+					expect(tied.truncated).toBe(true);
+					expect(tied.omittedSeriesCount).toBe(1);
+					expect(tied.omittedAccountCount).toBe(1);
+				},
+			);
+
 			liveIt("executes against usage_snapshots", async () => {
 				await seedAccount({ id: "acct-1", name: "primary" });
 				await dbOps.recordUsageSnapshot(
