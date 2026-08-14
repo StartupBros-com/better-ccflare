@@ -2353,6 +2353,104 @@ describe("downstream Anthropic Messages SSE routing", () => {
 		expect(reportCandidateFailure).not.toHaveBeenCalled();
 	});
 
+	it("keeps a later same-account deferred route executable after the current probe lease releases", async () => {
+		const codex = makeCodexAccount("codex-same-account-deferred-probe");
+		codex.model_mappings = JSON.stringify({
+			opus: [
+				"gpt-5.3-codex-spark",
+				"gpt-distinct-failure",
+				"gpt-distinct-rescue",
+			],
+		});
+		codex.rate_limited_until = Date.now() - 1;
+		codex.rate_limited_reason = "upstream_529_overloaded_no_reset";
+		const { ctx, reportCandidateFailure } = makeContext(
+			[codex],
+			makeCombo([codex]),
+		);
+		const routeOrder: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			const body = (await upstreamRequest.clone().json()) as { model: string };
+			routeOrder.push(body.model);
+			if (body.model === "gpt-distinct-rescue") {
+				return sseResponse(byteStream(CODEX_SUCCESS_STREAM));
+			}
+			return Response.json(
+				{ error: { code: "model_not_found", message: "model not found" } },
+				{ status: 404 },
+			);
+		}) as unknown as typeof fetch;
+
+		const request = makeCodexRequest();
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const body = await response.text();
+
+		expect(routeOrder).toEqual([
+			"gpt-5.3-codex-spark",
+			"gpt-distinct-failure",
+			"gpt-distinct-rescue",
+		]);
+		expect(response.status).toBe(200);
+		expect(body).toContain('"text":"codex recovered"');
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+	});
+
+	it("runs a queued probe-suppressed promotion before enforcing disabled session fallback", async () => {
+		process.env[DISABLE_COMBO_SESSION_FALLBACK_ENV] = "true";
+		process.env[CONTEXT_ADMISSION_ENV] = "1";
+		const codex = makeCodexAccount(
+			"codex-disabled-session-probe-suppressed-promotion",
+		);
+		codex.model_mappings = JSON.stringify({
+			opus: ["gpt-5.3-codex-spark", "gpt-5.6-sol"],
+		});
+		const { ctx, reportCandidateFailure } = makeContext(
+			[codex],
+			makeCombo([codex]),
+		);
+		const routeOrder: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const upstreamRequest =
+				input instanceof Request ? input : new Request(input);
+			const body = (await upstreamRequest.clone().json()) as { model: string };
+			routeOrder.push(body.model);
+			if (body.model === "gpt-5.3-codex-spark") {
+				codex.rate_limited_until = Date.now() - 1;
+				codex.rate_limited_reason = "upstream_529_overloaded_no_reset";
+				expect(getRateLimitProbeAdmission(codex)).toBe("admitted");
+				return sseResponse(byteStream(codexMessageOnlyContextOverflowStream()));
+			}
+			return sseResponse(byteStream(CODEX_SUCCESS_STREAM));
+		}) as unknown as typeof fetch;
+
+		const request = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"anthropic-version": "2023-06-01",
+			},
+			body: JSON.stringify({
+				model: MODEL,
+				messages: [{ role: "user", content: "x".repeat(440_000) }],
+				metadata: {
+					user_id: JSON.stringify({ session_id: CODEX_SESSION }),
+				},
+				max_tokens: 50_000,
+				stream: true,
+			}),
+		});
+		const response = await handleProxy(request, new URL(request.url), ctx);
+		const responseBody = await response.text();
+
+		expect(routeOrder).toEqual(["gpt-5.3-codex-spark", "gpt-5.6-sol"]);
+		expect(response.status).toBe(200);
+		expect(responseBody).toContain('"text":"codex recovered"');
+		expect(responseBody).not.toContain("combo_session_fallback_disabled");
+		expect(reportCandidateFailure).not.toHaveBeenCalled();
+	});
+
 	it("releases a promoted authoritative terminal when combo session fallback is disabled", async () => {
 		process.env[DISABLE_COMBO_SESSION_FALLBACK_ENV] = "true";
 		process.env[CONTEXT_ADMISSION_ENV] = "1";

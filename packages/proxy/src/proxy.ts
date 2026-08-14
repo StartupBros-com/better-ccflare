@@ -2762,33 +2762,11 @@ async function handleProxyCore(
 	let reactivelyDepletedFallbackAccounts: Account[] = [];
 	let throttledFallbackAccounts: Account[] = [];
 	let fallbackSelectionHadNoAvailable = false;
-	if (filteredComboInfo?.comboName) {
-		if (isComboSessionFallbackDisabled()) {
-			// Policy disables the only remaining queue. A retained upstream terminal
-			// has no future owner here, so release its body/lifecycle before returning
-			// the explicit local policy response.
-			await routingAttemptLedger.discardTerminalResponse();
-			if (hasExhaustedLocalServerToolCapabilityFailures()) {
-				cacheBodyStore.discardStaged(requestMeta.id);
-				return finishPacing(
-					pacingSlot,
-					createUnservedServerToolRoutingErrorResponse(
-						new ServerToolRoutingError({
-							reason: "no_implementation",
-							capabilitySummary: currentServerToolCapabilitySummary(),
-						}),
-					),
-				);
-			}
-			log.warn(
-				`All combo slots failed for combo "${filteredComboInfo.comboName}", session fallback disabled by CCFLARE_DISABLE_COMBO_SESSION_FALLBACK`,
-			);
-			return await returnComboSessionFallbackDisabled(
-				filteredComboInfo.comboName,
-				accounts.length,
-			);
-		}
-
+	const disabledComboSessionFallbackName =
+		filteredComboInfo?.comboName && isComboSessionFallbackDisabled()
+			? filteredComboInfo.comboName
+			: null;
+	if (filteredComboInfo?.comboName && !disabledComboSessionFallbackName) {
 		log.warn(
 			`All combo slots failed for combo "${filteredComboInfo.comboName}", falling back to SessionStrategy routing`,
 		);
@@ -3336,6 +3314,13 @@ async function handleProxyCore(
 				requestMeta.codexPacingAction = "crossover-paced";
 			}
 
+			// Snapshot finality before acquiring this route's probe lease. The current
+			// attempt releases that lease in attemptDeferredRoute's finally block, so
+			// lookahead must model the post-finally state while still respecting any
+			// independently owned lease already suppressing a later route.
+			const isFinalExecutableDeferredRoute = orderedDeferredModelRoutes
+				.slice(i + 1)
+				.every((candidate) => !deferredRouteWouldCrossTransport(candidate));
 			const probeAdmission = getRateLimitProbeAdmission(route.account);
 			if (probeAdmission === "suppressed") {
 				firstProbeSuppressedDeferredRoute ??= route;
@@ -3346,9 +3331,6 @@ async function handleProxyCore(
 			}
 
 			const attemptedBeforeDeferredRoute = routingAttemptLedger.attemptedCount;
-			const isFinalExecutableDeferredRoute = orderedDeferredModelRoutes
-				.slice(i + 1)
-				.every((candidate) => !deferredRouteWouldCrossTransport(candidate));
 			const finalResponse = await attemptDeferredRoute(
 				route,
 				isFinalExecutableDeferredRoute,
@@ -3378,6 +3360,32 @@ async function handleProxyCore(
 		}
 		requestMeta.comboName = null;
 		requestMeta.comboSlotIndex = null;
+	}
+	if (disabledComboSessionFallbackName) {
+		// This policy removes only the post-combo SessionStrategy queue. Already
+		// planned combo-local model routes remain authorized work and must exhaust
+		// their normal deferred/probe-ungated safeguards before the policy terminal
+		// takes ownership.
+		await routingAttemptLedger.discardTerminalResponse();
+		if (hasExhaustedLocalServerToolCapabilityFailures()) {
+			cacheBodyStore.discardStaged(requestMeta.id);
+			return finishPacing(
+				pacingSlot,
+				createUnservedServerToolRoutingErrorResponse(
+					new ServerToolRoutingError({
+						reason: "no_implementation",
+						capabilitySummary: currentServerToolCapabilitySummary(),
+					}),
+				),
+			);
+		}
+		log.warn(
+			`All combo slots and queued model routes failed for combo "${disabledComboSessionFallbackName}", session fallback disabled by CCFLARE_DISABLE_COMBO_SESSION_FALLBACK`,
+		);
+		return await returnComboSessionFallbackDisabled(
+			disabledComboSessionFallbackName,
+			accounts.length,
+		);
 	}
 
 	const retainedTerminalResponse = await deliverRetainedTerminalResponse();
