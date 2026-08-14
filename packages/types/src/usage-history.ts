@@ -62,4 +62,17 @@ export interface FleetUsageHistoryResponse {
 	accounts: FleetAccountUsageSeries[];
 	partial: boolean;
 	failedAccounts: string[];
+	/**
+	 * True when a global point budget excluded whole series from this response.
+	 * Distinct from `partial`, which means a query FAILED. A truncated response
+	 * is healthy but incomplete, and the UI must say so rather than presenting
+	 * a budgeted fleet as the whole fleet.
+	 */
+	truncated: boolean;
+	/** Accounts that had data in range but were entirely excluded by the budget. */
+	omittedAccountCount: number;
+	/** Account x window series excluded by the budget. */
+	omittedSeriesCount: number;
+	/** Points actually returned, after bucketing and the budget. */
+	returnedPointCount: number;
 }

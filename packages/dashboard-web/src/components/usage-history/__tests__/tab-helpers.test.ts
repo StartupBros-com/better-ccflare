@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import {
 	type AccountLike,
+	fleetTruncationNotice,
 	pickDefaultAccount,
 	rangeToMs,
 	sortAccountsActiveFirst,
@@ -111,5 +112,62 @@ describe("usageEmptyStateMessage", () => {
 		expect(usageEmptyStateMessage(acc("a", "A", false))).toContain(
 			"Collecting usage data",
 		);
+	});
+});
+
+describe("fleetTruncationNotice", () => {
+	it("returns null for a complete response", () => {
+		expect(
+			fleetTruncationNotice({
+				truncated: false,
+				omittedAccountCount: 0,
+				omittedSeriesCount: 0,
+				returnedPointCount: 42,
+			}),
+		).toBeNull();
+	});
+
+	it("returns null when there is no response yet", () => {
+		expect(fleetTruncationNotice(undefined)).toBeNull();
+	});
+
+	it("treats an older server that omits the field as complete", () => {
+		// Absent `truncated` must not render an alarming unknown state.
+		expect(fleetTruncationNotice({ returnedPointCount: 10 })).toBeNull();
+	});
+
+	it("reports omitted series and accounts when truncated", () => {
+		const msg = fleetTruncationNotice({
+			truncated: true,
+			omittedSeriesCount: 7,
+			omittedAccountCount: 3,
+			returnedPointCount: 20000,
+		});
+		expect(msg).toContain("point budget");
+		expect(msg).toContain("20,000 newest points");
+		expect(msg).toContain("7 series hidden");
+		expect(msg).toContain("3 accounts not shown");
+	});
+
+	it("omits the account clause when every account still has a series", () => {
+		const msg = fleetTruncationNotice({
+			truncated: true,
+			omittedSeriesCount: 2,
+			omittedAccountCount: 0,
+			returnedPointCount: 500,
+		});
+		expect(msg).toContain("2 series hidden");
+		expect(msg).not.toContain("not shown");
+	});
+
+	it("singularizes a single omitted account", () => {
+		const msg = fleetTruncationNotice({
+			truncated: true,
+			omittedSeriesCount: 1,
+			omittedAccountCount: 1,
+			returnedPointCount: 1,
+		});
+		expect(msg).toContain("1 newest point,");
+		expect(msg).toContain("1 account not shown");
 	});
 });

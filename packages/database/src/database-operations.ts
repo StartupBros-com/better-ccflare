@@ -1090,6 +1090,21 @@ OAuth tokens will need to be re-authenticated.
 		return this.usageHistory.getSeries(opts);
 	}
 
+	/**
+	 * Fleet-wide history in one set-based query, instead of one query per
+	 * account awaited in turn (#137).
+	 */
+	async getFleetUsageHistory(opts: {
+		accountIds: string[];
+		windowKey?: string;
+		since?: number;
+		until?: number;
+		bucketMs?: number;
+		pointBudget?: number;
+	}) {
+		return this.usageHistory.getFleetUsageHistory(opts);
+	}
+
 	async pruneUsageSnapshots(cutoffTs: number): Promise<number> {
 		return this.usageHistory.deleteOlderThan(cutoffTs);
 	}

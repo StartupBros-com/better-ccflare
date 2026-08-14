@@ -120,8 +120,7 @@ async function buildFleetResponse(
 	opts: { range: string; startMs: number; windowKey?: string },
 ): Promise<FleetUsageHistoryResponse> {
 	const accounts = await context.dbOps.getAllAccounts();
-	const results: FleetAccountUsageSeries[] = [];
-	const failedAccounts: string[] = [];
+	const nameById = new Map(accounts.map((a) => [a.id, a.name]));
 
 	// Bucket in SQL so database work is bounded BEFORE rows leave the DB
 	// (pro-gate finding): bucket width targets <=MAX_FLEET_POINTS_PER_SERIES
@@ -135,47 +134,65 @@ async function buildFleetResponse(
 		) * 60_000,
 	);
 
-	for (const account of accounts) {
-		let rows: Awaited<ReturnType<typeof context.dbOps.getUsageHistory>>;
-		try {
-			rows = await context.dbOps.getUsageHistory({
-				accountId: account.id,
-				windowKey: opts.windowKey,
-				since: opts.startMs,
-				bucketMs,
-			});
-		} catch (error) {
-			// One account's transient failure must not 500 the whole fleet
-			// response — that would also let layered client retries replay the
-			// entire sequential fan-out. Log, skip, serve a partial fleet and
-			// SAY it is partial so an outage is distinguishable from absent
-			// snapshots (pro-gate finding).
-			log.warn(
-				`Fleet usage history: query failed for account ${account.name}, skipping: ${error}`,
-			);
-			failedAccounts.push(account.name);
-			continue;
-		}
-		if (rows.length === 0) continue; // no snapshots in range — skip entirely
+	// ONE set-based read for the whole fleet. The previous shape awaited one
+	// query per account, so a 60s dashboard refresh cost O(accounts)
+	// sequential round trips and got slower as the fleet grew (#137).
+	const fleet = await context.dbOps.getFleetUsageHistory({
+		accountIds: accounts.map((a) => a.id),
+		windowKey: opts.windowKey,
+		since: opts.startMs,
+		bucketMs,
+	});
 
-		const windows: FleetWindowSeries[] = [...groupRowsByWindow(rows).entries()]
-			.sort(([a], [b]) => a.localeCompare(b))
-			.map(([window, windowRows]) => ({
-				window,
-				points: downsamplePoints(rowsToPoints(windowRows)),
-			}));
+	const rowsByAccount = new Map<string, typeof fleet.rows>();
+	for (const row of fleet.rows) {
+		const arr = rowsByAccount.get(row.accountId) ?? [];
+		arr.push(row);
+		rowsByAccount.set(row.accountId, arr);
+	}
 
-		results.push({
-			accountId: account.id,
-			accountName: account.name,
-			windows,
-		});
+	// Accounts with no snapshots in range never appear in `rows`, so they stay
+	// omitted from the response exactly as before.
+	const results: FleetAccountUsageSeries[] = [...rowsByAccount.entries()].map(
+		([accountId, rows]) => {
+			const windows: FleetWindowSeries[] = [
+				...groupRowsByWindow(rows).entries(),
+			]
+				.sort(([a], [b]) => a.localeCompare(b))
+				.map(([window, windowRows]) => ({
+					window,
+					points: downsamplePoints(rowsToPoints(windowRows)),
+				}));
+			return {
+				accountId,
+				accountName: nameById.get(accountId) ?? accountId,
+				windows,
+			};
+		},
+	);
+	results.sort(
+		(a, b) =>
+			a.accountName.localeCompare(b.accountName) ||
+			a.accountId.localeCompare(b.accountId),
+	);
+
+	if (fleet.truncated) {
+		log.warn(
+			`Fleet usage history truncated by point budget: ${fleet.omittedSeriesCount} series (${fleet.omittedAccountCount} account(s)) omitted, ${fleet.returnedPointCount} points returned`,
+		);
 	}
 
 	return {
 		range: opts.range,
 		accounts: results,
-		partial: failedAccounts.length > 0,
-		failedAccounts,
+		// A single set-based read has no per-account failure mode: it either
+		// succeeds for the whole fleet or throws and is surfaced as a 500 by the
+		// caller. These two fields are kept so existing clients keep parsing.
+		partial: false,
+		failedAccounts: [],
+		truncated: fleet.truncated,
+		omittedAccountCount: fleet.omittedAccountCount,
+		omittedSeriesCount: fleet.omittedSeriesCount,
+		returnedPointCount: fleet.returnedPointCount,
 	};
 }

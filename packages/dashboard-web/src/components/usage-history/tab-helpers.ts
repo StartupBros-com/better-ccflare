@@ -53,6 +53,43 @@ export function rangeToMs(range: string): number {
 	}
 }
 
+/** The truncation-relevant slice of the fleet usage-history response. */
+export interface FleetTruncationLike {
+	truncated?: boolean;
+	omittedAccountCount?: number;
+	omittedSeriesCount?: number;
+	returnedPointCount?: number;
+}
+
+/**
+ * Notice text when the fleet response was capped by the server's point budget,
+ * or null when the response is complete.
+ *
+ * A budgeted response is healthy, not broken — the chart shows the newest
+ * series and this says so, rather than letting a capped fleet read as the whole
+ * fleet. Older servers omit these fields entirely, so an absent `truncated` is
+ * treated as "complete" rather than surfacing a scary unknown state.
+ */
+export function fleetTruncationNotice(
+	fleet?: FleetTruncationLike,
+): string | null {
+	if (!fleet?.truncated) return null;
+	const series = fleet.omittedSeriesCount ?? 0;
+	const accounts = fleet.omittedAccountCount ?? 0;
+	const points = fleet.returnedPointCount ?? 0;
+
+	const parts = [
+		`Showing the ${points.toLocaleString()} newest point${points === 1 ? "" : "s"}`,
+	];
+	if (series > 0) {
+		parts.push(`${series} series hidden`);
+	}
+	if (accounts > 0) {
+		parts.push(`${accounts} account${accounts === 1 ? "" : "s"} not shown`);
+	}
+	return `Fleet view limited by the server's point budget — ${parts.join(", ")}. Narrow the range or pick a single account for the full history.`;
+}
+
 /** Empty-state message for the chart, based on the selected account. */
 export function usageEmptyStateMessage(account?: AccountLike): string {
 	if (!account) return "Select an account to view its usage history.";
