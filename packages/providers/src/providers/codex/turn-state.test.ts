@@ -1019,6 +1019,115 @@ describe("CodexTurnStateCoordinator", () => {
 		expect(continuation.replayApplied).toBe(false);
 	});
 
+	test("evicts an in-flight scope last when the entry cap is reached", () => {
+		enableTreatment();
+		// Small enough that unrelated churn alone exceeds the cap.
+		process.env[CODEX_TURN_STATE_MAX_ENTRIES_ENV] = "6";
+		let now = 0;
+		const coordinator = new CodexTurnStateCoordinator({ now: () => now });
+
+		const cohortFor = (conversationIdentity: string) => {
+			process.env[CODEX_TURN_STATE_COHORT_IDS_ENV] =
+				deriveCodexTurnStateCohortId({
+					accountId: ACCOUNT,
+					model: MODEL,
+					conversationIdentity,
+				});
+		};
+
+		// The scope under test captures a turn, then starts a continuation whose
+		// response is still streaming. Its generation is not touched again while
+		// that response runs, which is exactly what makes it the oldest entry.
+		cohortFor(CONVERSATION);
+		coordinator.beginAttempt(beginInput());
+		expect(
+			coordinator.finalizeAttempt({
+				attemptId: "attempt-1",
+				stopReason: "tool_use",
+				responseTurnState: "turn-token-1",
+				outputLineage: lineage("call-1"),
+			}),
+		).toBe("captured");
+		expect(
+			coordinator.beginAttempt(
+				beginInput({
+					requestId: "request-live",
+					attemptId: "attempt-live",
+					lineage: lineage("call-1"),
+				}),
+			),
+		).toMatchObject({ replayApplied: true, turnState: "turn-token-1" });
+
+		// Unrelated conversations churn through complete turns, each one newer
+		// than the scope that is still streaming.
+		for (let index = 0; index < 8; index++) {
+			now += 10;
+			const conversationIdentity = `conversation-churn-${index}`;
+			cohortFor(conversationIdentity);
+			coordinator.beginAttempt(
+				beginInput({
+					conversationIdentity,
+					requestId: `request-churn-${index}`,
+					attemptId: `attempt-churn-${index}`,
+				}),
+			);
+			coordinator.finalizeAttempt({
+				attemptId: `attempt-churn-${index}`,
+				stopReason: "tool_use",
+				responseTurnState: `token-churn-${index}`,
+				outputLineage: lineage(`call-churn-${index}`),
+			});
+		}
+
+		// The streaming attempt still resolves its own turn: it was never raced,
+		// so cap pressure from other conversations must not cost it its terminal.
+		now += 10;
+		cohortFor(CONVERSATION);
+		expect(
+			coordinator.finalizeAttempt({
+				attemptId: "attempt-live",
+				stopReason: "tool_use",
+				responseTurnState: "ignored",
+				outputLineage: lineage("call-2"),
+			}),
+		).toBe("advanced");
+	});
+
+	test("keeps the entry cap hard when every scope is in flight", () => {
+		enableTreatment();
+		process.env[CODEX_TURN_STATE_MAX_ENTRIES_ENV] = "4";
+		const coordinator = new CodexTurnStateCoordinator();
+		// Nothing is evictable by preference here -- every scope has an attempt
+		// registered -- so the unrestricted pass has to run or the map grows
+		// without bound.
+		for (let index = 0; index < 12; index++) {
+			const conversationIdentity = `conversation-live-${index}`;
+			process.env[CODEX_TURN_STATE_COHORT_IDS_ENV] =
+				deriveCodexTurnStateCohortId({
+					accountId: ACCOUNT,
+					model: MODEL,
+					conversationIdentity,
+				});
+			coordinator.beginAttempt(
+				beginInput({
+					conversationIdentity,
+					requestId: `request-live-${index}`,
+					attemptId: `attempt-live-${index}`,
+				}),
+			);
+		}
+		// Observable proof the bound held: the oldest attempt was evicted despite
+		// being in flight, so its terminal resolves nothing.
+		expect(
+			coordinator.finalizeAttempt({
+				attemptId: "attempt-live-0",
+				stopReason: "tool_use",
+				responseTurnState: "token-live-0",
+				outputLineage: lineage("call-live-0"),
+			}),
+		).toBe("unknown_attempt");
+	});
+
 	test("enforces max entries across generations, pending turns, and attempts", () => {
 		enableTreatment();
 		process.env[CODEX_TURN_STATE_MAX_ENTRIES_ENV] = "3";

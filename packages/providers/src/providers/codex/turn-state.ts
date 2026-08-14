@@ -181,6 +181,12 @@ interface AttemptEntry {
  */
 const ATTEMPT_TTL_MULTIPLIER = 4;
 
+interface CoordinatorEntryRef {
+	kind: "generation" | "pending" | "attempt";
+	key: string;
+	updatedAt: number;
+}
+
 function strictUnsignedInteger(
 	raw: string | undefined,
 	fallback: number,
@@ -962,15 +968,8 @@ export class CodexTurnStateCoordinator {
 		// cap and its LRU eviction keep the map bounded instead. For the same
 		// reason a scope with an attempt still in flight is not idle, so its turn
 		// and generation survive the sweep as well.
-		//
-		// `enforceEntryLimit` deliberately does not share this exemption. Under
-		// cap pressure it may evict the generation of a scope whose attempt is
-		// still running, which costs that attempt its terminal: it resolves
-		// `stale_generation` and the next continuation opens a fresh turn. That is
-		// the documented eviction contract -- bookkeeping loss suppresses replay
-		// and never corrupts a turn -- and keeping the cap unconditional is what
-		// makes it a hard bound rather than one a burst of long responses can
-		// exceed.
+		// `enforceEntryLimit` applies the same exemption as an eviction
+		// *preference* rather than a veto, so the cap stays a hard bound.
 		const attemptCutoff = now - config.idleTtlMs * ATTEMPT_TTL_MULTIPLIER;
 		const activeScopes = new Set<string>();
 		for (const [key, entry] of this.attempts) {
@@ -1001,25 +1000,31 @@ export class CodexTurnStateCoordinator {
 		map.set(key, value);
 	}
 
+	private totalEntries(): number {
+		return this.generations.size + this.pending.size + this.attempts.size;
+	}
+
 	private enforceEntryLimit(maximum: number): void {
-		while (
-			this.generations.size + this.pending.size + this.attempts.size >
-			maximum
-		) {
-			const oldestGeneration = this.oldestEntry("generation", this.generations);
-			const oldestPending = this.oldestEntry("pending", this.pending);
-			const oldestAttempt = this.oldestEntry("attempt", this.attempts);
-			const oldest = [oldestGeneration, oldestPending, oldestAttempt]
-				.filter(
-					(
-						entry,
-					): entry is {
-						kind: "generation" | "pending" | "attempt";
-						key: string;
-						updatedAt: number;
-					} => entry !== null,
-				)
-				.sort((left, right) => left.updatedAt - right.updatedAt)[0];
+		if (this.totalEntries() <= maximum) return;
+		// A generation's `updatedAt` is frozen for as long as its response runs,
+		// so a raw least-recently-touched scan makes the scope that is actively
+		// streaming the *first* candidate to evict. That inverts the intent: the
+		// one turn still being produced is the one destroyed. `finalizeAttempt`
+		// makes it sharper still -- it sweeps before deleting its own attempt and
+		// two statements before reading its own generation, so unguarded eviction
+		// can drop the entry it is about to look up and report `stale_generation`
+		// for a turn that never raced anything.
+		//
+		// Scopes with an attempt in flight are therefore evicted last, matching
+		// the exemption `sweep` already applies. The cap stays a hard bound: once
+		// nothing else remains, in-flight state is evicted too.
+		const activeScopes = new Set<string>();
+		for (const entry of this.attempts.values()) {
+			if (entry.scopeKey) activeScopes.add(entry.scopeKey);
+		}
+		while (this.totalEntries() > maximum) {
+			const oldest =
+				this.oldestEvictable(activeScopes) ?? this.oldestEvictable(null);
 			if (!oldest) return;
 			if (oldest.kind === "attempt") {
 				this.attempts.delete(oldest.key);
@@ -1030,20 +1035,38 @@ export class CodexTurnStateCoordinator {
 		}
 	}
 
+	/**
+	 * Oldest entry eligible for eviction. With `protectedScopes` set, scopes with
+	 * an attempt in flight are skipped and attempts themselves are never offered;
+	 * passing `null` runs the unrestricted pass that keeps the cap hard.
+	 */
+	private oldestEvictable(
+		protectedScopes: ReadonlySet<string> | null,
+	): CoordinatorEntryRef | null {
+		const candidates = [
+			this.oldestEntry("generation", this.generations, protectedScopes),
+			this.oldestEntry("pending", this.pending, protectedScopes),
+			protectedScopes === null
+				? this.oldestEntry("attempt", this.attempts, null)
+				: null,
+		].filter((entry): entry is CoordinatorEntryRef => entry !== null);
+		return (
+			candidates.sort((left, right) => left.updatedAt - right.updatedAt)[0] ??
+			null
+		);
+	}
+
 	private oldestEntry<V extends { updatedAt: number }>(
-		kind: "generation" | "pending" | "attempt",
+		kind: CoordinatorEntryRef["kind"],
 		map: Map<string, V>,
-	): {
-		kind: "generation" | "pending" | "attempt";
-		key: string;
-		updatedAt: number;
-	} | null {
-		const first = map.entries().next().value as [string, V] | undefined;
-		if (!first) return null;
-		return {
-			kind,
-			key: first[0],
-			updatedAt: first[1].updatedAt,
-		};
+		protectedKeys: ReadonlySet<string> | null,
+	): CoordinatorEntryRef | null {
+		// Insertion order is least-recently-touched order (`touch` re-inserts), so
+		// the first unprotected entry is also the oldest unprotected entry.
+		for (const [key, value] of map) {
+			if (protectedKeys?.has(key)) continue;
+			return { kind, key, updatedAt: value.updatedAt };
+		}
+		return null;
 	}
 }
