@@ -37,6 +37,7 @@ import {
 	suppressCodexExplicitCacheBreakpoint,
 	usageCache,
 } from "@better-ccflare/providers";
+import { transferResponseDrainTransport } from "@better-ccflare/providers/stream-drain";
 import type {
 	Account,
 	RateLimitReason,
@@ -5554,6 +5555,7 @@ export async function proxyWithAccount(
 			statusText: rawResponse.statusText,
 			headers: responseHeaders,
 		});
+		transferResponseDrainTransport(rawResponse, taggedRawResponse);
 
 		// Process response (transform format, sanitize headers, etc.) using account-specific provider
 		let response = await attemptPlan.processResponse(
@@ -5705,6 +5707,7 @@ export async function proxyWithAccount(
 							statusText: retryRaw.statusText,
 							headers: retryTaggedHeaders,
 						});
+						transferResponseDrainTransport(retryRaw, retryTaggedRaw);
 						const retryResponse = await attemptPlan.processResponse(
 							retryTaggedRaw,
 							req.headers,
@@ -6137,12 +6140,14 @@ export async function proxyWithAccount(
 							internalRequestStream,
 						);
 					}
+					const rescueTaggedRaw = new Response(rawResponse.body, {
+						status: rawResponse.status,
+						statusText: rawResponse.statusText,
+						headers: rescueResponseHeaders,
+					});
+					transferResponseDrainTransport(rawResponse, rescueTaggedRaw);
 					response = await attemptPlan.processResponse(
-						new Response(rawResponse.body, {
-							status: rawResponse.status,
-							statusText: rawResponse.statusText,
-							headers: rescueResponseHeaders,
-						}),
+						rescueTaggedRaw,
 						req.headers,
 					);
 					if (currentTransportAttemptId) {
