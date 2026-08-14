@@ -361,7 +361,15 @@ export class UsageHistoryRepository extends BaseRepository<UsageSnapshotRow> {
 			// Always admit the top-ranked series even if it alone blows the
 			// budget: returning nothing would render as "the fleet has no data",
 			// which is worse than returning one oversized series.
-			if (included.length > 0 && used + s.rows.length > budget) continue;
+			//
+			// STOP at the first series that does not fit rather than skipping it.
+			// `series` is rank-ordered (requested window, then freshest, then a
+			// stable key), so continuing past a series that did not fit would admit
+			// smaller lower-ranked ones in its place — dropping higher-priority
+			// data to keep lower-priority data, and making the result depend on
+			// row counts rather than rank. Breaking keeps the included set a strict
+			// prefix of the ranking, which is what "limited to the newest N" claims.
+			if (included.length > 0 && used + s.rows.length > budget) break;
 			included.push(s);
 			used += s.rows.length;
 		}

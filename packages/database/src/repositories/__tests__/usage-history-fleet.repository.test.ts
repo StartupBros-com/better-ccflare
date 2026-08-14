@@ -192,6 +192,30 @@ describe("UsageHistoryRepository.getFleetUsageHistory", () => {
 		db.close();
 	});
 
+	it("never keeps a lower-ranked series in place of one that did not fit", async () => {
+		const db = makeDb();
+		const repo = new UsageHistoryRepository(new BunSqlAdapter(db));
+		// Rank is by recency: acc1 (9000) > acc2 (5200) > acc3 (1000).
+		await seed(repo, "acc1", "five_hour", [9000]);
+		await seed(repo, "acc2", "five_hour", [5000, 5100, 5200]);
+		await seed(repo, "acc3", "five_hour", [1000]);
+
+		const result = await repo.getFleetUsageHistory({
+			accountIds: ["acc1", "acc2", "acc3"],
+			pointBudget: 3,
+		});
+
+		// acc1 fits. acc2 does not. Admitting acc3 afterwards purely because it is
+		// smaller would drop higher-priority data to keep lower-priority data and
+		// make the result depend on row counts rather than rank, so the included
+		// set must stay a strict prefix of the ranking.
+		expect([...new Set(result.rows.map((r) => r.accountId))]).toEqual(["acc1"]);
+		expect(result.truncated).toBe(true);
+		expect(result.omittedSeriesCount).toBe(2);
+		expect(result.omittedAccountCount).toBe(2);
+		db.close();
+	});
+
 	it("still returns the newest series when it alone exceeds the budget", async () => {
 		const db = makeDb();
 		const repo = new UsageHistoryRepository(new BunSqlAdapter(db));
