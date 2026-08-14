@@ -1909,6 +1909,61 @@ describe("source-controlled guard", () => {
 		expect(guard.state.counters.finalError).toBe(0);
 	});
 
+	test("forwards a complete physical-attempt budget terminal despite recovery-shaped headers", async () => {
+		const events: Array<Record<string, unknown>> = [];
+		let attempts = 0;
+		const responseBody = JSON.stringify({
+			type: "error",
+			error: {
+				type: "service_unavailable",
+				code: "physical_attempt_budget_exhausted",
+				message: "preserve this request-local terminal",
+				physical_attempts: 32,
+				physical_attempt_limit: 32,
+				attempted_routes: 16,
+			},
+		});
+		const upstreamBase = await listen(
+			http.createServer((_req, res) => {
+				attempts += 1;
+				res.writeHead(503, {
+					"content-type": "application/json",
+					"retry-after": "0.01",
+					"x-better-ccflare-pool-status": "exhausted",
+					"x-better-ccflare-recovery-scope": "pool",
+				});
+				res.end(responseBody);
+			}),
+		);
+		const { baseUrl, guard } = await startGuard(upstreamBase, {
+			delayInspectionTimeoutMs: 100,
+			logger: (line: string) => events.push(JSON.parse(line)),
+			maxAttempts: 3,
+			totalDeadlineMs: 2_000,
+		});
+
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+
+		expect(response.status).toBe(503);
+		expect(response.headers.get("retry-after")).toBe("0.01");
+		expect(response.headers.get("x-better-ccflare-pool-status")).toBe(
+			"exhausted",
+		);
+		expect(await response.text()).toBe(responseBody);
+		expect(attempts).toBe(1);
+		expect(guard.state.counters.retried).toBe(0);
+		expect(guard.state.counters.finalError).toBe(1);
+		expect(
+			events.find((event) => event.event === "proxy_final_error"),
+		).toMatchObject({ reason: "physical_attempt_budget_exhausted" });
+		expect(
+			events.find((event) => event.event === "proxy_retry_wait"),
+		).toBeUndefined();
+	});
+
 	// P1 spoofing (guard side, default posture): any upstream 503 body can be
 	// shaped like pool_exhausted. Without the header, and without the
 	// operator explicitly opting into the rolling-upgrade escape hatch, that

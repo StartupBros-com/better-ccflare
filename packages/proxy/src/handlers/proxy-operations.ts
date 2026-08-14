@@ -143,9 +143,10 @@ import {
 import { makeProxyRequest, validateProviderPath } from "./request-handler";
 import { handleProxyError, processProxyResponse } from "./response-processor";
 import { isRetryable429 } from "./retryable-429";
-import type {
-	DeterministicFailureCapabilityKey,
-	RoutingAttemptLedger,
+import type { DeterministicFailureCapabilityKey } from "./routing-attempt-ledger";
+import {
+	PhysicalAttemptBudgetExceededError,
+	type RoutingAttemptLedger,
 } from "./routing-attempt-ledger";
 import { createProtectedAnthropicOverloadResponse } from "./routing-terminal";
 import {
@@ -1901,7 +1902,9 @@ export async function proxyUnauthenticated(
 			}
 		}
 
-		routingAttemptLedger?.recordPhysicalAttempt();
+		routingAttemptLedger?.recordPhysicalAttempt({
+			laneKey: requestMeta.affinityLaneKey ?? null,
+		});
 		let response = await makeProxyRequest(
 			targetUrl,
 			req.method,
@@ -1972,6 +1975,7 @@ export async function proxyUnauthenticated(
 			ctx,
 		);
 	} catch (error) {
+		if (error instanceof PhysicalAttemptBudgetExceededError) throw error;
 		if (
 			routingSignal.aborted ||
 			attemptCommitment?.isPrivateDeadline() ||
@@ -2098,10 +2102,16 @@ export async function proxyWithAccount(
 		activeAttemptCommitment?.readJson(response) ??
 		readResponseCloneJson(response);
 	const isAttemptControlError = (error: unknown): boolean =>
+		error instanceof PhysicalAttemptBudgetExceededError ||
 		error instanceof AnthropicPreCommitAttemptDeadlineError ||
 		routingSignal.aborted ||
 		anthropicDegradedState?.lifecycle?.transportSignal.aborted === true ||
 		activeAttemptCommitment?.signal.aborted === true;
+	const physicalAttemptVetoContext = () => ({
+		accountId: account.id,
+		candidateId: modelFallbackPolicy?.routeCandidateId ?? null,
+		laneKey: requestMeta.affinityLaneKey ?? null,
+	});
 	const drainAbortController = new AbortController();
 	const makeAttemptRequest = async (
 		request: Request,
@@ -2570,6 +2580,15 @@ export async function proxyWithAccount(
 				capabilityProofKey: capability?.proofKey ?? null,
 				inputReplayMode: capability?.inputReplayMode ?? [],
 				outputReplayMode: capability?.outputReplayMode ?? [],
+				beforePhysicalTransport: routingAttemptLedger
+					? () => {
+							routingAttemptLedger.recordPhysicalAttempt({
+								accountId: account.id,
+								candidateId: modelFallbackPolicy?.routeCandidateId ?? null,
+								laneKey: requestMeta.affinityLaneKey ?? null,
+							});
+						}
+					: undefined,
 				serverToolHistoryProjector:
 					capability?.replay.serverToolHistoryProjector,
 				serverToolReplayIssuer: capability?.replay.serverToolReplayIssuer,
@@ -3257,6 +3276,22 @@ export async function proxyWithAccount(
 			latestPhysicalAnthropicCohortKey = isSynthetic
 				? null
 				: physicalAnthropicCohortKey(transportRequest, resolvedModel);
+			if (
+				!isSynthetic &&
+				(reservation !== undefined || latestPhysicalAnthropicCohortKey !== null)
+			) {
+				try {
+					routingAttemptLedger?.assertPhysicalAttemptAvailable(
+						physicalAttemptVetoContext(),
+					);
+				} catch (error) {
+					// A caller may have reserved before an in-place retry backoff. If a
+					// sibling send spent the last request-local slot meanwhile, release
+					// that uncommitted permit before propagating the veto.
+					if (reservation) cancelPhysicalSendReservation(reservation);
+					throw error;
+				}
+			}
 			const physicalReservation =
 				reservation ??
 				reservePhysicalSend(transportRequest, resolvedModel, null);
@@ -3307,6 +3342,21 @@ export async function proxyWithAccount(
 				}
 			};
 			const hostedAttempt = attemptPlan.capabilityProofKey !== null;
+			const claimHostedDispatchAfterBudgetAssertion = (): void => {
+				// onBeforeFrameSend asserted the budget immediately before this callback.
+				// Reassert defensively before crossing the irreversible hosted boundary.
+				routingAttemptLedger?.assertPhysicalAttemptAvailable(
+					physicalAttemptVetoContext(),
+				);
+				claimCurrentHostedDispatch();
+			};
+			const claimHostedAndRecordHttpDispatch = (): void => {
+				routingAttemptLedger?.assertPhysicalAttemptAvailable(
+					physicalAttemptVetoContext(),
+				);
+				claimCurrentHostedDispatch();
+				recordPhysicalDispatch();
+			};
 			const httpTransportRequest = hostedAttempt
 				? new Request(transportRequest, { redirect: "manual" })
 				: transportRequest;
@@ -3329,9 +3379,13 @@ export async function proxyWithAccount(
 									conversationIdentity: webSocketConversationIdentity,
 									request: transportRequest,
 									signal,
-									...(hostedAttempt
-										? { onBeforeFrameWrite: claimCurrentHostedDispatch }
-										: {}),
+									onBeforeFrameSend: () =>
+										routingAttemptLedger?.assertPhysicalAttemptAvailable(
+											physicalAttemptVetoContext(),
+										),
+									onBeforeFrameWrite: hostedAttempt
+										? claimHostedDispatchAfterBudgetAssertion
+										: undefined,
 									onFrameWritten: (receipt) => {
 										recordPhysicalDispatch();
 										currentCodexWebSocketReceipt = receipt;
@@ -3351,10 +3405,9 @@ export async function proxyWithAccount(
 							return websocketAttempt.response;
 						}
 					: undefined,
-				() => {
-					claimCurrentHostedDispatch();
-					recordPhysicalDispatch();
-				},
+				hostedAttempt
+					? claimHostedAndRecordHttpDispatch
+					: recordPhysicalDispatch,
 			);
 			observeTrustedHttpOverload(response, transportRequest, resolvedModel);
 			return response;
@@ -5370,6 +5423,17 @@ export async function proxyWithAccount(
 								lastModelFallbackCapabilityError = error;
 								continue;
 							}
+							if (
+								error instanceof PhysicalAttemptBudgetExceededError &&
+								!isScopedFailure(rawFailureClassification)
+							) {
+								// A provider-owned transform (currently Bedrock) may perform the
+								// next physical send before this fallback reaches the shared fetch
+								// boundary. If that send is vetoed, release the prior model failure
+								// that this loop still owns before crossing the account seam.
+								await finalizeCurrentCodexTransport(rawResponse);
+								await discardUpstreamBody(rawResponse);
+							}
 							throw error;
 						}
 
@@ -5619,6 +5683,16 @@ export async function proxyWithAccount(
 				const retryCfg = getOverloadRetryConfig();
 				if (retryCfg.enabled && retryCfg.maxAttempts > 1) {
 					for (let attempt = 1; attempt < retryCfg.maxAttempts; attempt++) {
+						try {
+							routingAttemptLedger?.assertPhysicalAttemptAvailable(
+								physicalAttemptVetoContext(),
+							);
+						} catch (error) {
+							// The current 529 is local ownership: the request terminalizer
+							// cannot see it after the budget veto crosses this account seam.
+							await discardUpstreamBody(response);
+							throw error;
+						}
 						let retryTransport = retryTransformedTemplate.clone();
 						// Reserve before backoff or touching the trusted 529. A denied
 						// follower returns it untouched to the outer terminal authority.
@@ -6580,6 +6654,14 @@ export async function proxyWithAccount(
 				`Client disconnected during request to ${account.name} — ending instead of failing over`,
 			);
 			return new Response(null, { status: 499 });
+		}
+		if (
+			err instanceof PhysicalAttemptBudgetExceededError &&
+			routingAttemptLedger?.hostedDispatchState !== "hosted_dispatched"
+		) {
+			// Request-local policy veto: do not classify it as account/provider
+			// health, and let the request orchestrator terminate every sibling loop.
+			throw err;
 		}
 		if (
 			err instanceof HostedDispatchTerminalError ||

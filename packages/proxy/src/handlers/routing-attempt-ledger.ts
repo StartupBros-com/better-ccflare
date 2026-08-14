@@ -78,6 +78,89 @@ export interface PhysicalAttemptTelemetryInput {
 
 export type HostedDispatchState = "undispatched" | "hosted_dispatched";
 
+/** Hard request-local ceiling for real provider transport sends. */
+export const MAX_REQUEST_PHYSICAL_ATTEMPTS = 32;
+
+export type PhysicalAttemptBudgetTerminalizer = (
+	error: PhysicalAttemptBudgetExceededError,
+) => Promise<Response>;
+
+/** Raised synchronously before a transport that would exceed the hard ceiling. */
+export class PhysicalAttemptBudgetExceededError extends Error {
+	readonly physicalAttempts: number;
+	readonly limit: number;
+	readonly attemptedRoutes: number;
+	readonly hostedDispatchState: HostedDispatchState;
+	readonly requestId: string | null;
+	readonly nextAccountId: string | null;
+	readonly nextCandidateId: string | null;
+	readonly nextLaneKey: string | null;
+	private readonly terminalizer?: PhysicalAttemptBudgetTerminalizer;
+	private terminalResponse: Promise<Response> | null = null;
+
+	constructor(input: {
+		physicalAttempts: number;
+		attemptedRoutes: number;
+		hostedDispatchState: HostedDispatchState;
+		requestId?: string | null;
+		nextAccountId?: string | null;
+		nextCandidateId?: string | null;
+		nextLaneKey?: string | null;
+		terminalizer?: PhysicalAttemptBudgetTerminalizer;
+		limit?: number;
+	}) {
+		super("Request physical-attempt budget exhausted");
+		this.name = "PhysicalAttemptBudgetExceededError";
+		this.physicalAttempts = input.physicalAttempts;
+		this.limit = input.limit ?? MAX_REQUEST_PHYSICAL_ATTEMPTS;
+		this.attemptedRoutes = input.attemptedRoutes;
+		this.hostedDispatchState = input.hostedDispatchState;
+		this.requestId = input.requestId?.trim() || null;
+		this.nextAccountId = input.nextAccountId?.trim() || null;
+		this.nextCandidateId = input.nextCandidateId?.trim() || null;
+		this.nextLaneKey = input.nextLaneKey?.trim() || null;
+		this.terminalizer = input.terminalizer;
+	}
+
+	/** Finalize the one request-local terminal, including outer ownership cleanup. */
+	terminalize(): Promise<Response> {
+		this.terminalResponse ??= this.terminalizer
+			? this.terminalizer(this)
+			: Promise.resolve(createPhysicalAttemptBudgetExceededResponse(this));
+		return this.terminalResponse;
+	}
+}
+
+/** Stable local response for a request that spent its physical-send budget. */
+export function createPhysicalAttemptBudgetExceededResponse(
+	error: Pick<
+		PhysicalAttemptBudgetExceededError,
+		"physicalAttempts" | "limit" | "attemptedRoutes"
+	>,
+): Response {
+	return new Response(
+		JSON.stringify({
+			type: "error",
+			error: {
+				type: "service_unavailable",
+				code: "physical_attempt_budget_exhausted",
+				message:
+					"Request stopped after reaching the upstream transport safety limit.",
+				physical_attempts: error.physicalAttempts,
+				physical_attempt_limit: error.limit,
+				attempted_routes: error.attemptedRoutes,
+			},
+		}),
+		{
+			status: 503,
+			headers: {
+				"content-type": "application/json; charset=utf-8",
+				"cache-control": "no-store",
+			},
+		},
+	);
+}
+
 /**
  * Request-local ledger of concrete upstream route candidates. It deliberately
  * lives above combo and normal fallback loops so the same account/model pair is
@@ -96,6 +179,11 @@ export class RoutingAttemptLedger {
 	private lastPhysicalAccountId: string | null | undefined;
 	private retainedTerminalResponse: RetainedTerminalResponse | null = null;
 	private hostedDispatch: HostedDispatchState = "undispatched";
+	private physicalBudgetRequestId: string | null = null;
+	private physicalBudgetTerminalizer:
+		| PhysicalAttemptBudgetTerminalizer
+		| undefined;
+	private physicalBudgetError: PhysicalAttemptBudgetExceededError | null = null;
 
 	get attemptedCount(): number {
 		return this.attempted.size;
@@ -160,10 +248,35 @@ export class RoutingAttemptLedger {
 				: undefined;
 	}
 
+	bindPhysicalAttemptBudgetTerminal(input: {
+		requestId: string;
+		terminalize: PhysicalAttemptBudgetTerminalizer;
+	}): void {
+		this.physicalBudgetRequestId = input.requestId.trim() || null;
+		this.physicalBudgetTerminalizer = input.terminalize;
+	}
+
+	/** Assert that one more real provider transport may start. */
+	assertPhysicalAttemptAvailable(
+		input: PhysicalAttemptTelemetryInput = {},
+	): void {
+		if (this.physicalAttempts < MAX_REQUEST_PHYSICAL_ATTEMPTS) return;
+		this.physicalBudgetError ??= new PhysicalAttemptBudgetExceededError({
+			physicalAttempts: this.physicalAttempts,
+			attemptedRoutes: this.attemptedCount,
+			hostedDispatchState: this.hostedDispatchState,
+			requestId: this.physicalBudgetRequestId,
+			nextAccountId: input.accountId,
+			nextCandidateId: input.candidateId,
+			nextLaneKey: input.laneKey,
+			terminalizer: this.physicalBudgetTerminalizer,
+		});
+		throw this.physicalBudgetError;
+	}
+
 	recordPhysicalAttempt(input: PhysicalAttemptTelemetryInput = {}): number {
-		if (this.physicalAttempts < Number.MAX_SAFE_INTEGER) {
-			this.physicalAttempts++;
-		}
+		this.assertPhysicalAttemptAvailable(input);
+		this.physicalAttempts++;
 		const accountId = input.accountId?.trim() || null;
 		let kind: DegradedModePhysicalAttemptKind;
 		if (input.recoveryProbe === true) {

@@ -760,6 +760,15 @@ export class CodexWebSocketTransport {
 			throw input.signal.reason;
 		}
 		try {
+			input.onBeforeFrameSend?.();
+		} catch (error) {
+			// A local policy veto before the hosted claim or socket.send is fully
+			// fallback-safe. Release the lane while preserving the healthy socket.
+			parsed.framePayload = {};
+			this.finishActive(entry, active, true);
+			throw error;
+		}
+		try {
 			input.onBeforeFrameWrite?.();
 		} catch (error) {
 			// A veto is still unambiguously pre-write. Release the active lane and

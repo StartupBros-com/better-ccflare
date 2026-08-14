@@ -67,6 +67,11 @@ export interface ProviderAttemptPlanContext {
 	readonly capabilityProofKey: string | null;
 	readonly inputReplayMode: readonly ServerToolReplayAtom[];
 	readonly outputReplayMode: readonly ServerToolReplayAtom[];
+	/**
+	 * Request-private synchronous gate invoked immediately before a provider-owned
+	 * transport that does not pass through the proxy's fetch boundary.
+	 */
+	readonly beforePhysicalTransport?: () => void;
 	/** Request-private, proof-only history projection authority. */
 	readonly serverToolHistoryProjector?: ProviderServerToolHistoryProjector;
 	/** Request-private, proof-only replay-envelope issuance authority. */
@@ -298,7 +303,11 @@ export interface Provider {
 	/**
 	 * Transform the request body before sending to the provider
 	 */
-	transformRequestBody?(request: Request, account?: Account): Promise<Request>;
+	transformRequestBody?(
+		request: Request,
+		account?: Account,
+		beforePhysicalTransport?: () => void,
+	): Promise<Request>;
 
 	/**
 	 * Extract tier information from response if available
