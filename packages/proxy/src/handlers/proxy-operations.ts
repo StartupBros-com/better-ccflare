@@ -2088,66 +2088,107 @@ export async function proxyWithAccount(
 		anthropicDegradedState?.lifecycle?.transportSignal.aborted === true ||
 		activeAttemptCommitment?.signal.aborted === true;
 	const drainAbortController = new AbortController();
+	/**
+	 * Single transport boundary for one physical attempt.
+	 *
+	 * Provider-local attempt state (Codex turn state) is registered earlier, while
+	 * the body is transformed, so an attempt can be abandoned after registration
+	 * without ever reaching the wire: the commitment budget can already be
+	 * exhausted when this wrapper runs, and the deadline error then propagates to
+	 * ordinary failover. `onPreDispatchAbort` fires on exactly those provably
+	 * pre-dispatch exits, which is what keeps an undispatched attempt from being
+	 * treated as live and suppressing the client's next replay.
+	 *
+	 * `dispatchStarted` is the class-wide guard rather than a per-error test: both
+	 * transports mark their own irreversible point (`markDispatched` — the
+	 * WebSocket frame write, or the final HTTP dispatch hook), so any later
+	 * failure keeps the attempt intact and its ordinary terminal owns it. That
+	 * ordering matters more than the specific error: a post-write WebSocket
+	 * failure must never be annulled, since its frame did reach upstream.
+	 */
 	const makeAttemptRequest = async (
 		request: Request,
 		optionalOutboundTransport?: (
 			signal: AbortSignal,
+			markDispatched: () => void,
 		) => Promise<Response | null>,
 		onHttpDispatch?: () => void,
+		onPreDispatchAbort?: () => void,
 	): Promise<Response> => {
-		// The outer context exists only for an Anthropic-shaped downstream request.
-		// Any real provider transport can hang before headers (including transformed
-		// OpenAI-compatible routes), so start rescue immediately before every fetch.
-		// Synthetic provider responses never call this wrapper and remain synchronous.
-		preCommitRescue?.activate();
-		const commitment = resolveAttemptCommitmentDeadline();
-		latestTransportCommitment = commitment;
-		activeAttemptCommitment?.dispose();
-		activeAttemptCommitment = undefined;
-		const dispatch = async (signal: AbortSignal): Promise<Response> => {
-			// HTTP and optional transports must share the exact same live abort
-			// source. Terminal recovery cannot attach a controller after either
-			// transport has already created its connection.
-			const attemptSignal = AbortSignal.any([
-				signal,
-				drainAbortController.signal,
-			]);
-			const optionalResponse = await optionalOutboundTransport?.(attemptSignal);
-			if (optionalResponse) return optionalResponse;
-			onHttpDispatch?.();
-			return makeProxyRequest(
-				request,
-				undefined,
-				undefined,
-				undefined,
-				undefined,
-				attemptSignal,
-			);
+		let dispatchStarted = false;
+		const markDispatched = (): void => {
+			dispatchStarted = true;
 		};
-		const transportSignal = currentTransportSignal();
-		if (!commitment) {
-			return dispatch(transportSignal);
-		}
-
-		const attemptCommitment = new AnthropicPreCommitAttemptScope(
-			transportSignal,
-			commitment,
-		);
-		activeAttemptCommitment = attemptCommitment;
-		if (commitment.budgetMs <= 0) {
-			throw attemptCommitment.deadlineError;
-		}
-
 		try {
-			return await dispatch(attemptCommitment.signal);
-		} catch (error) {
-			if (attemptCommitment.isPrivateDeadline()) {
-				const websocketReceipt = getCurrentCodexWebSocketReceipt();
-				if (websocketReceipt?.frameWritten) {
-					websocketReceipt.markPostWriteFailure("semantic_stall");
-					return createCodexWebSocketNoReplayResponse(504, "semantic_stall");
-				}
+			// The outer context exists only for an Anthropic-shaped downstream request.
+			// Any real provider transport can hang before headers (including transformed
+			// OpenAI-compatible routes), so start rescue immediately before every fetch.
+			// Synthetic provider responses never call this wrapper and remain synchronous.
+			preCommitRescue?.activate();
+			const commitment = resolveAttemptCommitmentDeadline();
+			latestTransportCommitment = commitment;
+			activeAttemptCommitment?.dispose();
+			activeAttemptCommitment = undefined;
+			const dispatch = async (signal: AbortSignal): Promise<Response> => {
+				// HTTP and optional transports must share the exact same live abort
+				// source. Terminal recovery cannot attach a controller after either
+				// transport has already created its connection.
+				const attemptSignal = AbortSignal.any([
+					signal,
+					drainAbortController.signal,
+				]);
+				const optionalResponse = await optionalOutboundTransport?.(
+					attemptSignal,
+					markDispatched,
+				);
+				if (optionalResponse) return optionalResponse;
+				// The final HTTP dispatch hook is the irreversible boundary: hosted
+				// claims must fail closed, and fetch follows immediately afterwards.
+				markDispatched();
+				onHttpDispatch?.();
+				return makeProxyRequest(
+					request,
+					undefined,
+					undefined,
+					undefined,
+					undefined,
+					attemptSignal,
+				);
+			};
+			const transportSignal = currentTransportSignal();
+			if (!commitment) {
+				return dispatch(transportSignal);
+			}
+
+			const attemptCommitment = new AnthropicPreCommitAttemptScope(
+				transportSignal,
+				commitment,
+			);
+			activeAttemptCommitment = attemptCommitment;
+			if (commitment.budgetMs <= 0) {
 				throw attemptCommitment.deadlineError;
+			}
+
+			try {
+				return await dispatch(attemptCommitment.signal);
+			} catch (error) {
+				if (attemptCommitment.isPrivateDeadline()) {
+					const websocketReceipt = getCurrentCodexWebSocketReceipt();
+					if (websocketReceipt?.frameWritten) {
+						websocketReceipt.markPostWriteFailure("semantic_stall");
+						return createCodexWebSocketNoReplayResponse(504, "semantic_stall");
+					}
+					throw attemptCommitment.deadlineError;
+				}
+				throw error;
+			}
+		} catch (error) {
+			if (!dispatchStarted) {
+				try {
+					onPreDispatchAbort?.();
+				} catch {
+					// Turn-state bookkeeping must never replace the transport failure.
+				}
 			}
 			throw error;
 		}
@@ -3339,7 +3380,7 @@ export async function proxyWithAccount(
 			const response = await makeAttemptRequest(
 				httpTransportRequest,
 				attemptPlan.providerName === "codex" && !hasCodexTurnStateReplay
-					? async (signal) => {
+					? async (signal, markDispatched) => {
 							currentCodexWebSocketReceipt = null;
 							// Capture the concrete stamped attempt before any later retry mutates the
 							// surrounding attempt variable. These are the same join keys written to
@@ -3356,9 +3397,15 @@ export async function proxyWithAccount(
 									request: transportRequest,
 									signal,
 									...(hostedAttempt
-										? { onBeforeFrameWrite: claimCurrentHostedDispatch }
+										? {
+												onBeforeFrameWrite: () => {
+													markDispatched();
+													claimCurrentHostedDispatch();
+												},
+											}
 										: {}),
 									onFrameWritten: (receipt) => {
+										markDispatched();
 										recordPhysicalDispatch();
 										currentCodexWebSocketReceipt = receipt;
 										// response.create is now irreversible, so neither the non-final
@@ -3380,6 +3427,11 @@ export async function proxyWithAccount(
 				() => {
 					claimCurrentHostedDispatch();
 					recordPhysicalDispatch();
+				},
+				() => {
+					if (attemptPlan.providerName === "codex") {
+						provider.abortTurnStateAttempt?.(currentTransportAttemptId);
+					}
 				},
 			);
 			observeTrustedHttpOverload(response, transportRequest, resolvedModel);

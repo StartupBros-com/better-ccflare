@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { BUFFER_SIZES } from "@better-ccflare/core";
 import { CODEX_LOGICAL_MODEL_FAMILY_HEADER } from "@better-ccflare/http-common";
 import { setDerivedProviderModelDefaults } from "../../provider-model-defaults";
+import { analyzeCodexCacheExperiments } from "./analyze-trace";
 import { fetchCodexUsageOnDemand } from "./on-demand-fetch";
 import {
 	CODEX_SINGLE_ORCHESTRATION_ROOT_ENV,
@@ -752,6 +753,44 @@ describe("CodexProvider HTTP turn-state failure paths", () => {
 			account,
 		);
 		expect(retry.headers.get(turnStateHeader)).toBe("turn-token-seed");
+	});
+
+	it("releases an abandoned attempt immediately and excludes its trace", async () => {
+		enableTreatment();
+		const traceDir = mkdtempSync(join(tmpdir(), "codex-turn-state-abort-"));
+		process.env[CODEX_TRACE_DIR_ENV] = traceDir;
+		process.env[CODEX_TRACE_HMAC_KEY_ENV] = "test-only-key";
+		const provider = new CodexProvider();
+		try {
+			await seedTurnState(provider, "call-abandoned");
+			const messages = continuationMessages("call-abandoned");
+			const abandoned = await provider.transformRequestBody(
+				requestFor("request-abandoned", "attempt-abandoned", messages),
+				account,
+			);
+			expect(abandoned.headers.get(turnStateHeader)).toBe("turn-token-seed");
+
+			provider.abortTurnStateAttempt("attempt-abandoned");
+
+			const immediateRetry = await provider.transformRequestBody(
+				requestFor("request-after-abort", "attempt-after-abort", messages),
+				account,
+			);
+			expect(immediateRetry.headers.get(turnStateHeader)).toBe(
+				"turn-token-seed",
+			);
+
+			const records = readTraceRecords(traceDir);
+			expect(
+				records.filter((record) => record.attempt_id === "attempt-abandoned"),
+			).toMatchObject([{ phase: "request" }, { phase: "attempt_aborted" }]);
+			const report = analyzeCodexCacheExperiments(records as never);
+			expect(
+				report.turnState.rows.reduce((sum, row) => sum + row.requests, 0),
+			).toBe(2);
+		} finally {
+			rmSync(traceDir, { recursive: true, force: true });
+		}
 	});
 
 	it.each([

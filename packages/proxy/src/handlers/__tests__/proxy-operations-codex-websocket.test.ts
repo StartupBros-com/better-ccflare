@@ -523,6 +523,50 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 		expect(httpCalls).toBe(1);
 	});
 
+	it("aborts a Codex attempt when its commitment budget expires before dispatch", async () => {
+		installUsageCollector();
+		const provider = getProvider("codex") as
+			| (NonNullable<ReturnType<typeof getProvider>> & {
+					abortTurnStateAttempt(attemptId: string | null | undefined): void;
+			  })
+			| undefined;
+		if (!provider) throw new Error("Codex provider is not registered");
+		const originalAbortAttempt = provider.abortTurnStateAttempt;
+		const abortedAttemptIds: Array<string | null | undefined> = [];
+		provider.abortTurnStateAttempt = (attemptId) => {
+			abortedAttemptIds.push(attemptId);
+			originalAbortAttempt.call(provider, attemptId);
+		};
+		const websocketAttempt = spyOn(
+			codexWebSocketTransport,
+			"tryRequest",
+		).mockResolvedValue(null);
+		const httpAttempt = mock(async () =>
+			Promise.resolve(new Response("must not dispatch", { status: 500 })),
+		);
+		globalThis.fetch = httpAttempt as never;
+
+		try {
+			const body = makeRequestBody();
+			const response = await runProxy(
+				makeRequest(body),
+				body,
+				makePolicy(0),
+				"codex-zero-commitment-budget",
+			);
+			expect(response).toBeNull();
+		} finally {
+			provider.abortTurnStateAttempt = originalAbortAttempt;
+		}
+
+		expect(websocketAttempt).not.toHaveBeenCalled();
+		expect(httpAttempt).not.toHaveBeenCalled();
+		expect(abortedAttemptIds).toHaveLength(1);
+		expect(abortedAttemptIds[0]).toMatch(
+			/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+		);
+	});
+
 	it("keeps a provider-owned Codex turn-state replay on HTTP", async () => {
 		installUsageCollector();
 		const provider = getProvider("codex");
