@@ -66,10 +66,10 @@ function isAnthropicProvider(provider: string): boolean {
  * GET /api/models[?provider=<name>] — list the models available for one
  * provider, each entry tagged with where the knowledge came from.
  *
- * Without `provider` (and for the Anthropic providers) the body is exactly
- * what this endpoint has always returned — the cached live catalog, or the
- * bundled static fallback — so existing callers keep working; `provider` and
- * the per-entry `source` are purely additive fields.
+ * Without a provider/account scope the body is exactly what this endpoint has
+ * always returned — the cached live catalog, or the bundled static fallback —
+ * so existing callers keep working. Explicit provider/account queries use the
+ * stricter entitlement-aware response below.
  *
  * For every other provider the answer is the union of what ccflare knows
  * built in and what the public models.dev catalogue lists, deduplicated by
@@ -81,6 +81,15 @@ export function createModelsHandler(context: APIContext) {
 	return async (url?: URL): Promise<Response> => {
 		const requested = url?.searchParams.get("provider")?.trim() || "";
 		const accountId = url?.searchParams.get("accountId")?.trim() || "";
+		const hasScopedQuery =
+			url?.searchParams.has("provider") || url?.searchParams.has("accountId");
+
+		if (!hasScopedQuery) {
+			if (!context.modelCatalog) {
+				return errorResponse("Model catalog is not available");
+			}
+			return jsonResponse(await context.modelCatalog.get());
+		}
 
 		// An account's own listing beats every catalogue: it is the only one
 		// that knows what this subscription may call. Providers without such a

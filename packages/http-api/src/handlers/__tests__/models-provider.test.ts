@@ -93,6 +93,30 @@ async function ask(context: APIContext, query: string): Promise<Body> {
 }
 
 describe("GET /api/models", () => {
+	it("preserves the legacy bundled fallback for the bare endpoint", async () => {
+		const context = makeContext({
+			anthropic: {
+				models: [{ id: "claude-opus-5", displayName: "Claude Opus 5" }],
+				source: "fallback",
+			},
+		});
+		const response = await createModelsHandler(context)(
+			new URL("http://local/api/models"),
+		);
+
+		expect(await response.json()).toEqual({
+			models: [
+				{
+					id: "claude-opus-5",
+					displayName: "Claude Opus 5",
+					createdAt: null,
+				},
+			],
+			fetchedAt: 1_000,
+			source: "fallback",
+		});
+	});
+
 	it("returns what the codex account itself reported", async () => {
 		const context = makeContext({
 			codex: {
