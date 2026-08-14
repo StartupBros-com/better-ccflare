@@ -117,6 +117,13 @@ When creating new functionality: write tests first, then implement, then run tes
 ## After Code Changes
 Always run: `bun run lint && bun run typecheck && bun run format`
 
+**`typecheck` does not cover test files.** The root `tsconfig.json` excludes
+`**/__tests__` and `**/*.test.ts`, so stale call sites in tests compile green and fail
+only when that suite actually runs. After changing a shared repository/facade signature,
+grep its call sites yourself (`grep -a`, not plain `grep` — see the doc) and run the
+affected suites, including any gated behind `DATABASE_URL`. Details:
+[docs/solutions/workflow-issues/typecheck-does-not-cover-test-call-sites.md](docs/solutions/workflow-issues/typecheck-does-not-cover-test-call-sites.md)
+
 ## Git Commits
 - **Before making any changes, run `git status` to check for pre-existing uncommitted changes.** Note which files were already modified so you can distinguish your changes from theirs throughout the session.
 - Use `git add <specific-files>` (not `git add .`) to avoid committing inline-worker.ts
