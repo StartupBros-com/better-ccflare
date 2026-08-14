@@ -2,6 +2,7 @@ import { Logger } from "@better-ccflare/logger";
 import {
 	CODEX_VERSION,
 	hasDerivedProviderModelDefaults,
+	setDerivedAccountModelDefaults,
 	setDerivedProviderModelDefaults,
 } from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
@@ -54,6 +55,15 @@ export interface CodexModelListing {
 }
 
 const FETCH_TIMEOUT_MS = 15_000;
+const ENSURE_RETRY_DELAYS_MS = [
+	60_000, 120_000, 240_000, 480_000, 900_000,
+] as const;
+const MAX_ENSURE_RETRY_ENTRIES = 1_000;
+
+interface EnsureRetryState {
+	failureCount: number;
+	nextAttemptAt: number;
+}
 
 /**
  * Last good listing per account, for this process only.
@@ -79,10 +89,41 @@ const lastGood = new Map<string, CodexModelListing>();
  */
 let providerWide: CodexModelListing | null = null;
 
-/** Test seam: both registries are process-wide and leak between cases. */
+/** Retry only unresolved accounts; exact live or cached-own evidence stops it. */
+const ensureRetryByAccount = new Map<string, EnsureRetryState>();
+
+/** One best-effort listing request per account at a time. */
+const ensureInFlight = new Map<string, Promise<void>>();
+
+/**
+ * Test seam: forget every process-wide catalog registry between cases.
+ * Already-running fetches are not cancelled and may still record their result.
+ */
 export function clearCodexModelCacheForTests(): void {
 	lastGood.clear();
 	providerWide = null;
+	ensureRetryByAccount.clear();
+	ensureInFlight.clear();
+}
+
+function scheduleEnsureRetry(accountId: string, now: number): void {
+	const previous = ensureRetryByAccount.get(accountId);
+	const failureCount = Math.min(
+		(previous?.failureCount ?? 0) + 1,
+		ENSURE_RETRY_DELAYS_MS.length,
+	);
+
+	if (!previous && ensureRetryByAccount.size >= MAX_ENSURE_RETRY_ENTRIES) {
+		const oldestAccountId = ensureRetryByAccount.keys().next().value;
+		if (oldestAccountId !== undefined) {
+			ensureRetryByAccount.delete(oldestAccountId);
+		}
+	}
+
+	ensureRetryByAccount.set(accountId, {
+		failureCount,
+		nextAttemptAt: now + ENSURE_RETRY_DELAYS_MS[failureCount - 1],
+	});
 }
 
 function readCache(accountId: string): CodexModelListing | null {
@@ -203,22 +244,52 @@ async function fetchLive(
  * Make sure this account has a derived default map before anything tries to
  * map a Claude family onto one of the provider's models.
  *
- * A no-op for every other provider, and for a codex account that already has
- * one — which, after the first request, is all of them.
+ * A no-op for every other provider, and for a Codex account with an exact live
+ * or cached-own map. A shared listing is intentionally not exact, so its
+ * account remains eligible for a bounded later retry.
  */
-export async function ensureCodexModelDefaults(
+export function ensureCodexModelDefaults(
 	account: Account | null | undefined,
 	ctx: ProxyContext,
+	now: () => number = Date.now,
 ): Promise<void> {
-	if (account?.provider !== "codex") return;
-	if (hasDerivedProviderModelDefaults("codex", account.id)) return;
-	try {
-		await getCodexModels(account.id, ctx);
-	} catch (err) {
-		// Never blocks the request: without a map the family falls through and
-		// the provider gets to say what it thinks, which the record then learns.
-		log.debug(`Could not load the model list for ${account.name}: ${err}`);
+	if (account?.provider !== "codex") return Promise.resolve();
+	if (hasDerivedProviderModelDefaults("codex", account.id)) {
+		ensureRetryByAccount.delete(account.id);
+		return Promise.resolve();
 	}
+
+	const current = ensureInFlight.get(account.id);
+	if (current) return current;
+
+	const retry = ensureRetryByAccount.get(account.id);
+	if (retry && now() < retry.nextAttemptAt) return Promise.resolve();
+
+	let attempt: Promise<void>;
+	attempt = (async () => {
+		try {
+			await getCodexModels(account.id, ctx);
+			if (hasDerivedProviderModelDefaults("codex", account.id)) {
+				ensureRetryByAccount.delete(account.id);
+				return;
+			}
+			scheduleEnsureRetry(account.id, now());
+		} catch (err) {
+			// Never blocks the request: without a map the family falls through and
+			// the provider gets to say what it thinks, which the record then learns.
+			scheduleEnsureRetry(account.id, now());
+			log.debug(`Could not load the model list for ${account.name}: ${err}`);
+		}
+	})().finally(() => {
+		// The test reset can forget a still-running attempt without cancelling it,
+		// then let a new one start. Only the promise currently registered may clear
+		// itself; the older completion may still record its best-effort outcome.
+		if (ensureInFlight.get(account.id) === attempt) {
+			ensureInFlight.delete(account.id);
+		}
+	});
+	ensureInFlight.set(account.id, attempt);
+	return attempt;
 }
 
 /**
@@ -286,8 +357,8 @@ export async function getCodexModels(
 		const cached = readCache(accountId);
 		// The cached listing is still this account's own answer, just an older
 		// one — far better than a map compiled months ago.
-		if (cached) {
-			setDerivedProviderModelDefaults(
+		if (cached?.source === "cached") {
+			setDerivedAccountModelDefaults(
 				"codex",
 				accountId,
 				deriveFamilyDefaults(cached.models),
