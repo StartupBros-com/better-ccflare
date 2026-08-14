@@ -386,6 +386,68 @@ describe("CodexProvider HTTP turn state", () => {
 		expect(newTurn.headers.get(turnStateHeader)).toBeNull();
 	});
 
+	it("captures and replays a turn whose first user message is a text block array", async () => {
+		// The block-array shape is what ordinary Claude Code traffic sends. If it
+		// is classified as ambiguous lineage the turn is marked ineligible and the
+		// canary never engages on real traffic at all.
+		enableTreatment();
+		const provider = new CodexProvider();
+		const initialMessages = [
+			{ role: "user", content: [{ type: "text", text: firstUserText }] },
+		];
+		const initial = await provider.transformRequestBody(
+			requestFor("array-request-1", "array-attempt-1", initialMessages, true),
+			account,
+		);
+		expect(initial.headers.get(turnStateHeader)).toBeNull();
+
+		const first = await provider.processResponse(
+			toolResponse(
+				"array-request-1",
+				"array-attempt-1",
+				"array-call-1",
+				"array-turn-token",
+				true,
+			),
+			null,
+		);
+		await first.text();
+
+		const continuation = await provider.transformRequestBody(
+			requestFor(
+				"array-request-2",
+				"array-attempt-2",
+				[
+					...initialMessages,
+					{
+						role: "assistant",
+						content: [
+							{
+								type: "tool_use",
+								id: "array-call-1",
+								name: "search",
+								input: {},
+							},
+						],
+					},
+					{
+						role: "user",
+						content: [
+							{
+								type: "tool_result",
+								tool_use_id: "array-call-1",
+								content: "result",
+							},
+						],
+					},
+				],
+				true,
+			),
+			account,
+		);
+		expect(continuation.headers.get(turnStateHeader)).toBe("array-turn-token");
+	});
+
 	it("does not capture turn state when the client disconnects before the terminal frames", async () => {
 		enableTreatment();
 		const provider = new CodexProvider();

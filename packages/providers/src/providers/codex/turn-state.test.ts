@@ -144,6 +144,36 @@ describe("Codex turn-state lineage", () => {
 		);
 	});
 
+	test("treats a tool-result-free user message as a new turn, not ambiguity", () => {
+		// Anthropic clients routinely send ordinary prompts in block-array form.
+		// Classifying those as invalid would mark the turn ineligible and stop it
+		// ever capturing a token.
+		expect(
+			extractCodexTurnStateLineage([
+				{
+					role: "user",
+					content: [{ type: "text", text: "inspect the cache" }],
+				},
+			]),
+		).toEqual({ kind: "none" });
+		expect(
+			extractCodexTurnStateLineage([
+				{
+					role: "user",
+					content: [
+						{ type: "text", text: "look at this" },
+						{ type: "image", source: { type: "base64", data: "x" } },
+					],
+				},
+			]),
+		).toEqual({ kind: "none" });
+		// A malformed block with no tool results is still just a new turn: no
+		// lineage can be replayed, so there is nothing to get wrong.
+		expect(
+			extractCodexTurnStateLineage([{ role: "user", content: [null] }]),
+		).toEqual({ kind: "none" });
+	});
+
 	test("rejects mixed, duplicate, control-character, oversized, and excessive lineages", () => {
 		expect(
 			extractCodexTurnStateLineage([
@@ -596,6 +626,98 @@ describe("CodexTurnStateCoordinator", () => {
 				),
 			).toMatchObject({ replayApplied: true, turnState: "turn-token-1" });
 		}
+	});
+
+	test("captures and replays a turn that began as a block-array text prompt", () => {
+		enableTreatment();
+		const coordinator = new CodexTurnStateCoordinator();
+		const initial = coordinator.beginAttempt(
+			beginInput({
+				lineage: extractCodexTurnStateLineage([
+					{
+						role: "user",
+						content: [{ type: "text", text: "inspect the cache" }],
+					},
+				]),
+			}),
+		);
+		expect(initial).toMatchObject({ arm: "treatment", action: "new_turn" });
+		expect(
+			coordinator.finalizeAttempt({
+				attemptId: "attempt-1",
+				stopReason: "tool_use",
+				responseTurnState: "turn-token-1",
+				outputLineage: lineage("call-1"),
+			}),
+		).toBe("captured");
+		expect(
+			coordinator.beginAttempt(
+				beginInput({
+					requestId: "request-2",
+					attemptId: "attempt-2",
+					lineage: lineage("call-1"),
+				}),
+			),
+		).toMatchObject({ replayApplied: true, turnState: "turn-token-1" });
+	});
+
+	test("releases a source-scope lease when the request fails over to another account", () => {
+		enableTreatment();
+		const coordinator = new CodexTurnStateCoordinator();
+		coordinator.beginAttempt(beginInput());
+		expect(
+			coordinator.finalizeAttempt({
+				attemptId: "attempt-1",
+				stopReason: "tool_use",
+				responseTurnState: "turn-token-1",
+				outputLineage: lineage("call-1"),
+			}),
+		).toBe("captured");
+
+		// The continuation leases the turn on the source account, then errors.
+		expect(
+			coordinator.beginAttempt(
+				beginInput({
+					requestId: "request-2",
+					attemptId: "attempt-2",
+					lineage: lineage("call-1"),
+				}),
+			),
+		).toMatchObject({ replayApplied: true, turnState: "turn-token-1" });
+		expect(
+			coordinator.finalizeAttempt({
+				attemptId: "attempt-2",
+				stopReason: "error",
+				responseTurnState: null,
+				outputLineage: { kind: "none" },
+			}),
+		).toBe("error_ignored");
+
+		// The same logical request retries on a different account. That attempt is
+		// suppressed on the destination scope, and the abandoned source lease has
+		// to be released with it.
+		expect(
+			coordinator.beginAttempt(
+				beginInput({
+					requestId: "request-2",
+					attemptId: "attempt-2-failover",
+					attemptCause: "account_failover",
+					accountId: "account-b",
+					lineage: lineage("call-1"),
+				}),
+			),
+		).toMatchObject({ arm: "ineligible", replayApplied: false });
+
+		// A later continuation returning to the source account still owns its turn.
+		expect(
+			coordinator.beginAttempt(
+				beginInput({
+					requestId: "request-3",
+					attemptId: "attempt-3",
+					lineage: lineage("call-1"),
+				}),
+			),
+		).toMatchObject({ replayApplied: true, turnState: "turn-token-1" });
 	});
 
 	test("keeps an active turn alive across the idle TTL boundary", () => {

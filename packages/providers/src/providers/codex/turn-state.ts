@@ -351,14 +351,28 @@ export function extractCodexTurnStateLineage(
 	if (!latestUser || !Array.isArray(latestUser.content))
 		return { kind: "none" };
 	const callIds: unknown[] = [];
+	let sawNonToolResultBlock = false;
 	for (const block of latestUser.content) {
 		if (!block || typeof block !== "object" || Array.isArray(block)) {
-			return { kind: "invalid" };
+			sawNonToolResultBlock = true;
+			continue;
 		}
 		const record = block as Record<string, unknown>;
-		if (record.type !== "tool_result") return { kind: "invalid" };
+		if (record.type !== "tool_result") {
+			sawNonToolResultBlock = true;
+			continue;
+		}
 		callIds.push(record.tool_use_id);
 	}
+	// A user message carrying no tool results is an ordinary new turn, not a
+	// malformed continuation. Anthropic clients routinely send plain text as
+	// `[{ type: "text", ... }]`, so rejecting every non-tool_result block would
+	// classify the common case as ambiguous and make it permanently ineligible.
+	// `invalid` stays reserved for a genuinely ambiguous continuation: tool
+	// results mixed with other or malformed blocks, where the exact lineage of
+	// the turn cannot be determined.
+	if (callIds.length === 0) return { kind: "none" };
+	if (sawNonToolResultBlock) return { kind: "invalid" };
 	return normalizeCodexTurnStateCallIds(callIds);
 }
 
@@ -469,6 +483,14 @@ export class CodexTurnStateCoordinator {
 		}
 		if (FAILOVER_CAUSES.has(input.attemptCause ?? "initial")) {
 			this.invalidate(scopeKey, now, config);
+			// A route change moves this logical request to a different scope key,
+			// so invalidating the destination cannot reach the lease its failed
+			// attempt still holds on the source account/model. Left in place, that
+			// lease belongs to a request that will never come back, and every later
+			// continuation on the source scope is suppressed for the rest of the
+			// turn. The source turn's token and lineage stay intact; only the
+			// ownership claim is released.
+			this.releaseLeases(input.requestId);
 			return this.recordAttempt(
 				input,
 				scopeKey,
@@ -822,6 +844,17 @@ export class CodexTurnStateCoordinator {
 	): void {
 		this.advanceGeneration(scopeKey, "ineligible", now, config);
 		this.pending.delete(scopeKey);
+	}
+
+	/**
+	 * Drops every pending lease held by one logical request, leaving the turns
+	 * themselves untouched. Used when a request leaves the scope it leased, where
+	 * scope-keyed invalidation cannot reach the abandoned claim.
+	 */
+	private releaseLeases(requestId: string): void {
+		for (const entry of this.pending.values()) {
+			if (entry.leaseRequestId === requestId) delete entry.leaseRequestId;
+		}
 	}
 
 	private sweep(now: number, config: CodexTurnStateConfig): void {
