@@ -1074,7 +1074,7 @@ OAuth tokens will need to be re-authenticated.
 
 	async recordUsageSnapshot(
 		accountId: string,
-		usage: Record<string, unknown>,
+		usage: import("@better-ccflare/types").CanonicalUsageWindow[],
 		now: number,
 	): Promise<void> {
 		await this.usageHistory.recordSnapshot(accountId, usage, now);
