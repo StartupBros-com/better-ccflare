@@ -14,7 +14,10 @@ import type {
 	TokenRefreshResult,
 } from "../types";
 import { transformRequestBodyModel } from "../utils/model-mapping";
-import { drainReader } from "../utils/stream-drain";
+import {
+	drainReader,
+	transferResponseDrainTransport,
+} from "../utils/stream-drain";
 
 // Configuration interface for Anthropic-compatible providers
 export interface AnthropicCompatibleConfig {
@@ -248,11 +251,13 @@ export abstract class BaseAnthropicCompatibleProvider extends BaseProvider {
 		// Sanitize headers by removing hop-by-hop headers
 		const headers = sanitizeProxyHeaders(response.headers);
 
-		return new Response(response.body, {
+		const sanitizedResponse = new Response(response.body, {
 			status: response.status,
 			statusText: response.statusText,
 			headers,
 		});
+		transferResponseDrainTransport(response, sanitizedResponse);
+		return sanitizedResponse;
 	}
 
 	async extractTierInfo(_response: Response): Promise<number | null> {

@@ -129,14 +129,17 @@ async function fetchInferenceProfilesFromBedrockWithRetry(
 	region: string,
 	credentials: ReturnType<typeof createBedrockCredentialChain>,
 	attempt: number = 0,
+	beforePhysicalTransport?: () => void,
 ): Promise<InferenceProfileInfo[]> {
 	const client = new BedrockClient({ region, credentials });
+	const command = new ListInferenceProfilesCommand({
+		maxResults: 1000, // Get as many as possible in one call
+	});
 
+	// Keep the request-private transport veto outside the retry catch so it
+	// cannot be mistaken for an AWS discovery failure and retried.
+	beforePhysicalTransport?.();
 	try {
-		const command = new ListInferenceProfilesCommand({
-			maxResults: 1000, // Get as many as possible in one call
-		});
-
 		const response = await client.send(command);
 
 		if (
@@ -254,6 +257,7 @@ async function fetchInferenceProfilesFromBedrockWithRetry(
 				region,
 				credentials,
 				attempt + 1,
+				beforePhysicalTransport,
 			);
 		}
 
@@ -299,6 +303,7 @@ function evictOldestRegionIfNeeded(): void {
 async function getOrRefreshCache(
 	region: string,
 	credentials: ReturnType<typeof createBedrockCredentialChain>,
+	beforePhysicalTransport?: () => void,
 ): Promise<InferenceProfileInfo[]> {
 	const now = Date.now();
 	const lastRefreshTime = lastRefresh.get(region) || 0;
@@ -323,6 +328,8 @@ async function getOrRefreshCache(
 	const profiles = await fetchInferenceProfilesFromBedrockWithRetry(
 		region,
 		credentials,
+		0,
+		beforePhysicalTransport,
 	);
 
 	inferenceProfileCache.set(region, profiles);
@@ -357,12 +364,14 @@ function extractModelShortName(modelId: string): string {
  * @param modelId - Model ID (e.g., "claude-opus-4-6", "us.anthropic.claude-3-5-sonnet-v2:0")
  * @param mode - Cross-region mode to check
  * @param account - Bedrock account with region/credentials
+ * @param beforePhysicalTransport - Optional request-private gate invoked before each AWS send
  * @returns True if the model supports the requested mode, false otherwise
  */
 export async function canUseInferenceProfile(
 	modelId: string,
 	mode: CrossRegionMode,
 	account: Account,
+	beforePhysicalTransport?: () => void,
 ): Promise<boolean> {
 	const config = parseBedrockConfig(account.custom_endpoint);
 
@@ -373,10 +382,28 @@ export async function canUseInferenceProfile(
 		return false;
 	}
 
+	let gateRejected = false;
+	let gateRejection: unknown;
+	const guardedBeforePhysicalTransport = beforePhysicalTransport
+		? () => {
+				try {
+					beforePhysicalTransport();
+				} catch (error) {
+					gateRejected = true;
+					gateRejection = error;
+					throw error;
+				}
+			}
+		: undefined;
+
 	try {
 		// Get or refresh inference profile cache for this region
 		const credentials = createBedrockCredentialChain(account);
-		const profiles = await getOrRefreshCache(config.region, credentials);
+		const profiles = await getOrRefreshCache(
+			config.region,
+			credentials,
+			guardedBeforePhysicalTransport,
+		);
 
 		if (profiles.length === 0) {
 			log.warn(
@@ -411,6 +438,9 @@ export async function canUseInferenceProfile(
 				return true;
 		}
 	} catch (error) {
+		if (gateRejected && Object.is(error, gateRejection)) {
+			throw error;
+		}
 		log.error(
 			`Error checking inference profile support for model "${modelId}" (mode: ${mode}): ${(error as Error).message}`,
 		);
@@ -426,18 +456,21 @@ export async function canUseInferenceProfile(
  * @param modelId - Model ID to check
  * @param requestedMode - The mode that was requested
  * @param account - Bedrock account with region/credentials
+ * @param beforePhysicalTransport - Optional request-private gate invoked before each AWS send
  * @returns Fallback mode or null
  */
 export async function getFallbackMode(
 	modelId: string,
 	requestedMode: CrossRegionMode,
 	account: Account,
+	beforePhysicalTransport?: () => void,
 ): Promise<CrossRegionMode | null> {
 	// Check if requested mode is supported
 	const supportsRequested = await canUseInferenceProfile(
 		modelId,
 		requestedMode,
 		account,
+		beforePhysicalTransport,
 	);
 
 	if (supportsRequested) {
@@ -457,6 +490,7 @@ export async function getFallbackMode(
 			modelId,
 			fallback,
 			account,
+			beforePhysicalTransport,
 		);
 
 		if (supportsFallback) {

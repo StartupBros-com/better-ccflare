@@ -198,6 +198,9 @@ export function evaluateGuardRetry({
 	const headerAbsent = headerDecision.kind === "absent";
 
 	const body = parseJson(bodyText);
+	if (body?.error?.code === "physical_attempt_budget_exhausted") {
+		return noRetry("physical_attempt_budget_exhausted");
+	}
 
 	if (!headerConfirmed) {
 		if (!headerAbsent) return noRetry("recovery_not_authorized");

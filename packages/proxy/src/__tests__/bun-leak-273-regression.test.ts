@@ -17,10 +17,10 @@
  *
  * This test imports the PRODUCTION helper
  * (`handlers/discard-body-cancel.ts:cancelDiscardedResponseBody`) directly
- * — the same function the 13 discard sites in proxy-operations.ts call.
- * The orchestrator's mandatory negative-control run removes ONLY those
- * 13 call sites (and/or the `void drainBody(...)` invocation inside the
- * helper); the assertions below verify both halves:
+ * — the same primitive every drain-backed discard path in
+ * proxy-operations.ts reaches. The orchestrator's mandatory negative-control
+ * run removes ONLY those call sites (and/or the `void drainBody(...)`
+ * invocation inside the helper); the assertions below verify both halves:
  *
  *   Group A (helper contract) — verifies `cancelDiscardedResponseBody`
  *   reads the body to completion on a non-locked Response, and is safe on
@@ -28,13 +28,13 @@
  *   `drainBody` call from inside the helper function flips these red.
  *
  *   Group B (call-site coverage) — performs static analysis of
- *   `proxy-operations.ts` to assert the 13 drain calls are present
+ *   `proxy-operations.ts` to assert the current drain calls are present
  *   and structurally well-formed. Removing any one of them flips this
  *   red. We don't import proxy-operations.ts (its transitive
  *   dependency chain loads @better-ccflare/database, which itself has
  *   missing modules in this worktree's `bun install`-blocked state —
  *   a pre-existing issue unrelated to this fix), but the source-level
- *   check is enough to detect the negative-control removal: 13 sites,
+ *   check is enough to detect the negative-control removal: every site,
  *   each line beginning with the helper name.
  *
  * Run: bun test packages/proxy/src/__tests__/bun-leak-273-regression.test.ts
@@ -105,10 +105,11 @@ describe("issue #273 — Group A: helper contract", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Group B — call-site coverage. Static check that the 13 drain sites the
-// spec calls out (429/529/401 failover return-null + retry-loop overwrite)
-// are wired into proxy-operations.ts. The negative-control run removes
-// these lines; this check fails if any are missing.
+// Group B — call-site coverage. Static check that the drain sites the spec
+// calls out (429/529/401 failover return-null + retry-loop overwrite +
+// request-budget veto cleanup) are wired into proxy-operations.ts. The
+// negative-control run removes these lines; this check fails if any are
+// missing.
 // ---------------------------------------------------------------------------
 
 // Fork architecture note: the fork centralizes discard-site release in
@@ -119,14 +120,15 @@ describe("issue #273 — Group A: helper contract", () => {
 // This is a census, not a ceiling: a new body-replacing retry legitimately adds
 // a site, and the count moves with it in the same commit. What the guard
 // catches is a site DISAPPEARING (a leak) or being added without the drain.
-// 17 since every generic prepared response loser now uses the drain-backed
-// release seam, alongside the prepared model-unavailable and Codex retry
-// drains. This specifically guards outer winner arbitration from regressing
-// to Bun's ineffective direct body.cancel path.
-const EXPECTED_SITE_COUNT = 17;
+// 19 helper invocations: one delegation from discardUpstreamBody plus 18
+// owned-response release sites. The latest two release a prior model-fallback
+// response and a current 529 before a physical-attempt budget veto escapes.
+// This specifically guards outer winner arbitration and request-budget exits
+// from regressing to Bun's ineffective direct body.cancel path.
+const EXPECTED_DRAIN_INVOCATION_COUNT = 19;
 
 describe("issue #273 — Group B: call-site coverage in proxy-operations.ts", () => {
-	it("proxy-operations.ts has the expected drain-backed discard call sites", () => {
+	it("proxy-operations.ts has the expected drain-backed helper invocations", () => {
 		const source = readFileSync(
 			"packages/proxy/src/handlers/proxy-operations.ts",
 			"utf-8",
@@ -138,7 +140,7 @@ describe("issue #273 — Group B: call-site coverage in proxy-operations.ts", ()
 			/^\s*(?:await )?(?:cancelDiscardedResponseBody|discardUpstreamBody)\((?:rawResponse|response)\);/gm,
 		);
 		const count = callMatches?.length ?? 0;
-		expect(count).toBe(EXPECTED_SITE_COUNT);
+		expect(count).toBe(EXPECTED_DRAIN_INVOCATION_COUNT);
 	});
 
 	it("proxy-operations.ts imports the helper module", () => {
@@ -151,7 +153,7 @@ describe("issue #273 — Group B: call-site coverage in proxy-operations.ts", ()
 		);
 	});
 
-	it("proxy-operations.ts has drain sites at the 13 expected line ranges", () => {
+	it("proxy-operations.ts retains failover and overwrite drain patterns", () => {
 		const source = readFileSync(
 			"packages/proxy/src/handlers/proxy-operations.ts",
 			"utf-8",
@@ -172,6 +174,26 @@ describe("issue #273 — Group B: call-site coverage in proxy-operations.ts", ()
 			/(?:await )?(?:cancelDiscardedResponseBody|discardUpstreamBody)\(rawResponse\);[\s\S]{0,300}?rawResponse\s*=/g,
 		);
 		expect(overwriteSites?.length ?? 0).toBeGreaterThanOrEqual(1);
+	});
+
+	it("drains locally owned responses before physical-attempt budget vetoes escape", () => {
+		const source = readFileSync(
+			"packages/proxy/src/handlers/proxy-operations.ts",
+			"utf-8",
+		);
+
+		// A Bedrock discovery call can consume the final physical-attempt slot
+		// while the model-fallback transform is running. The prior raw failure is
+		// still owned here and must be released before the veto crosses accounts.
+		expect(source).toMatch(
+			/error instanceof PhysicalAttemptBudgetExceededError &&\s*!isScopedFailure\(rawFailureClassification\)[\s\S]{0,500}?await finalizeCurrentCodexTransport\(rawResponse\);\s*await discardUpstreamBody\(rawResponse\);\s*}\s*throw error;/,
+		);
+
+		// A denied in-place 529 retry has not replaced `response`; this loop is
+		// therefore the only owner able to release it before propagating the veto.
+		expect(source).toMatch(
+			/routingAttemptLedger\?\.assertPhysicalAttemptAvailable\(\s*physicalAttemptVetoContext\(\),\s*\);\s*} catch \(error\) \{[\s\S]{0,300}?await discardUpstreamBody\(response\);\s*throw error;/,
+		);
 	});
 });
 

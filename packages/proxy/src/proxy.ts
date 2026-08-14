@@ -60,6 +60,7 @@ import {
 	createContextAdmissionTracker,
 	createContextLengthExceededResponse,
 	createModelPoolExhaustedResponse,
+	createPhysicalAttemptBudgetExceededResponse,
 	createRequestMetadata,
 	createRoutingTerminalResponse,
 	createUsageThrottledResponse,
@@ -76,6 +77,7 @@ import {
 	isRefreshTokenLikelyExpired,
 	type ModelFallbackExecutionPolicy,
 	mergeTerminalAccountState,
+	PhysicalAttemptBudgetExceededError,
 	type PreparedProxyAccountResponse,
 	type ProxyContext,
 	prepareRequestBody,
@@ -625,6 +627,43 @@ export async function handleProxy(
 }
 
 async function handleProxyCore(
+	req: Request,
+	url: URL,
+	ctx: ProxyContext,
+	apiKeyId?: string | null,
+	apiKeyName?: string | null,
+	rootIntentGeneration: number | null = null,
+	anthropicPreCommitRescue?: AnthropicPreCommitRescueRouteContext,
+	degradedTelemetry?: DegradedTelemetryHolder,
+): Promise<Response> {
+	try {
+		return await handleProxyCoreImpl(
+			req,
+			url,
+			ctx,
+			apiKeyId,
+			apiKeyName,
+			rootIntentGeneration,
+			anthropicPreCommitRescue,
+			degradedTelemetry,
+		);
+	} catch (error) {
+		if (!(error instanceof PhysicalAttemptBudgetExceededError)) throw error;
+		log.warn("physical_attempt_budget_exhausted", {
+			requestId: error.requestId,
+			count: error.physicalAttempts,
+			limit: error.limit,
+			uniqueRoutes: error.attemptedRoutes,
+			hostedDispatchState: error.hostedDispatchState,
+			nextAccountId: error.nextAccountId,
+			nextCandidateId: error.nextCandidateId,
+			nextLanePresent: error.nextLaneKey !== null,
+		});
+		return error.terminalize();
+	}
+}
+
+async function handleProxyCoreImpl(
 	req: Request,
 	url: URL,
 	ctx: ProxyContext,
@@ -1636,6 +1675,35 @@ async function handleProxyCore(
 	const selectedCapacityDeferredRoutes =
 		getCapacityDeferredModelRoutes(requestMeta);
 	let pacingSlot = pacingObservation?.slot ?? null;
+	routingAttemptLedger.bindPhysicalAttemptBudgetTerminal({
+		requestId: requestMeta.id,
+		terminalize: async (error) => {
+			await routingAttemptLedger.discardTerminalResponse();
+			cacheBodyStore.discardStaged(requestMeta.id);
+			if (sessionId) clearSession(sessionId, requestMeta.timestamp);
+			const terminalResponse =
+				createPhysicalAttemptBudgetExceededResponse(error);
+			void recordRoutingTerminalRequest({
+				collector: tryGetUsageCollector(),
+				requestMeta,
+				requestHeaders: req.headers,
+				response: terminalResponse,
+				providerName: ctx.provider.name,
+				terminalKind: "physical_attempt_budget_exhausted",
+				upstreamAttempts: error.physicalAttempts,
+				apiKeyId,
+				apiKeyName,
+				skip: trustedInternalAutoRefresh,
+				onError: (recordError) => {
+					log.error(
+						`handleEnd failed for physical_attempt_budget_exhausted request ${requestMeta.id}`,
+						recordError,
+					);
+				},
+			});
+			return finishPacing(pacingSlot, terminalResponse);
+		},
+	});
 	let crossoverPacingRestored = false;
 	requestMeta.codexPacingCanary = pacingEligible
 		? canaryCandidate

@@ -54,16 +54,34 @@ function derivedKey(provider: string, accountId: string): string {
 }
 
 /**
- * Record the family -> model map that an account's own listing implies. Called
- * whenever that listing is read, which is what keeps the defaults current
- * without anyone maintaining a table.
+ * Record only the family -> model map for one exact account listing.
+ *
+ * This deliberately leaves the provider-wide frontier untouched. It is used
+ * when an account falls back to its own older cached listing: that evidence is
+ * still exact for the account, but must not roll back a newer provider-wide
+ * listing learned from another account.
+ */
+export function setDerivedAccountModelDefaults(
+	provider: string,
+	accountId: string,
+	families: Record<string, string>,
+): void {
+	derivedByAccount.set(derivedKey(provider, accountId), { ...families });
+}
+
+/**
+ * Record the family -> model map that a fresh account listing implies.
+ *
+ * A live listing is both exact account evidence and the newest provider-wide
+ * fallback. Keeping both writes here makes that provenance explicit, while
+ * cached account evidence can use the narrower setter above.
  */
 export function setDerivedProviderModelDefaults(
 	provider: string,
 	accountId: string,
 	families: Record<string, string>,
 ): void {
-	derivedByAccount.set(derivedKey(provider, accountId), { ...families });
+	setDerivedAccountModelDefaults(provider, accountId, families);
 	// The same listing also refreshes the provider-wide default: what the
 	// settings screen shows, and what an account without its own listing falls
 	// back to. Safe because the models this resolves to — the provider's top

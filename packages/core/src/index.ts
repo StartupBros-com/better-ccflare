@@ -133,10 +133,12 @@ export { TtlCache } from "./ttl-cache";
 export * from "./usage-windows";
 export { levenshteinDistance } from "./utils";
 export {
+	MAX_MODEL_MAPPING_CANDIDATES,
 	patterns,
 	sanitizers,
 	validateApiKey,
 	validateEndpointUrl,
+	validateModelMappings,
 	validateNumber,
 	validatePriority,
 	validateString,

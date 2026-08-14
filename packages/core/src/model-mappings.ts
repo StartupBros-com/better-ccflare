@@ -1,7 +1,12 @@
 import { Logger } from "@better-ccflare/logger";
 import type { Account, ComboFamily } from "@better-ccflare/types";
+import { ValidationError } from "./errors";
 import { LATEST_MODEL_BY_FAMILY } from "./models";
-import { safeJsonParse, validateModelMappings } from "./validation";
+import {
+	MAX_MODEL_MAPPING_CANDIDATES,
+	safeJsonParse,
+	validateModelMappings,
+} from "./validation";
 
 const log = new Logger("ModelMappings");
 
@@ -93,11 +98,12 @@ export function getAllowedModelsMessage(): string {
 }
 
 /**
- * Parse custom endpoint data from account's custom_endpoint field
+ * Parse custom endpoint data with candidate arrays for internal routing.
  */
-export function parseCustomEndpointData(
-	customEndpoint: string | null,
-): { endpoint?: string; modelMappings?: Record<string, string> } | null {
+function parseCustomEndpointDataWithCandidates(customEndpoint: string | null): {
+	endpoint?: string;
+	modelMappings?: Record<string, string | string[]>;
+} | null {
 	if (!customEndpoint) {
 		return null;
 	}
@@ -108,10 +114,14 @@ export function parseCustomEndpointData(
 		return { endpoint: trimmed };
 	}
 
+	let parsed: {
+		endpoint?: string;
+		modelMappings?: unknown;
+	};
 	try {
-		return safeJsonParse<{
+		parsed = safeJsonParse<{
 			endpoint?: string;
-			modelMappings?: Record<string, string>;
+			modelMappings?: unknown;
 		}>(trimmed, "custom_endpoint");
 	} catch (error) {
 		log.warn(
@@ -119,6 +129,61 @@ export function parseCustomEndpointData(
 		);
 		return { endpoint: trimmed };
 	}
+
+	if (parsed.modelMappings === undefined) {
+		return { endpoint: parsed.endpoint };
+	}
+
+	try {
+		return {
+			endpoint: parsed.endpoint,
+			modelMappings: validateModelMappings(
+				parsed.modelMappings,
+				"custom_endpoint.modelMappings",
+			),
+		};
+	} catch (error) {
+		log.warn(
+			`Ignoring invalid custom_endpoint model mappings: ${error instanceof Error ? error.message : String(error)}`,
+		);
+		return { endpoint: parsed.endpoint };
+	}
+}
+
+/**
+ * Parse custom endpoint data from an account's custom_endpoint field.
+ *
+ * The public contract predates candidate arrays and intentionally remains
+ * string-only. Internal routing callers that understand ordered candidates use
+ * parseCustomEndpointDataWithCandidates instead.
+ */
+export function parseCustomEndpointData(
+	customEndpoint: string | null,
+): { endpoint?: string; modelMappings?: Record<string, string> } | null {
+	const parsed = parseCustomEndpointDataWithCandidates(customEndpoint);
+	if (!parsed) {
+		return null;
+	}
+	if (!parsed.modelMappings) {
+		return { endpoint: parsed.endpoint };
+	}
+
+	const modelMappings: Record<string, string> = {};
+	for (const [key, value] of Object.entries(parsed.modelMappings)) {
+		modelMappings[key] = Array.isArray(value) ? value[0] : value;
+	}
+
+	return {
+		endpoint: parsed.endpoint,
+		modelMappings,
+	};
+}
+
+function parseRuntimeModelMappings(
+	json: string,
+	field: string,
+): Record<string, string | string[]> {
+	return validateModelMappings(safeJsonParse<unknown>(json, field), field);
 }
 
 /**
@@ -133,10 +198,7 @@ export function parseModelMappings(
 	}
 
 	try {
-		return safeJsonParse<Record<string, string | string[]>>(
-			modelMappings,
-			"model_mappings",
-		);
+		return parseRuntimeModelMappings(modelMappings, "model_mappings");
 	} catch (error) {
 		log.warn(
 			`Failed to parse model_mappings JSON: ${error instanceof Error ? error.message : String(error)}`,
@@ -172,7 +234,7 @@ export function getModelMappings(
 		process.env?.OPENAI_COMPATIBLE_MODEL_MAPPINGS
 	) {
 		try {
-			const envMappings = safeJsonParse<Record<string, string | string[]>>(
+			const envMappings = parseRuntimeModelMappings(
 				process.env.OPENAI_COMPATIBLE_MODEL_MAPPINGS,
 				"OPENAI_COMPATIBLE_MODEL_MAPPINGS environment variable",
 			);
@@ -192,7 +254,9 @@ export function getModelMappings(
 	}
 
 	// Check for legacy mappings in custom_endpoint JSON payload (fallback)
-	const customEndpointData = parseCustomEndpointData(account.custom_endpoint);
+	const customEndpointData = parseCustomEndpointDataWithCandidates(
+		account.custom_endpoint,
+	);
 	if (customEndpointData?.modelMappings) {
 		log.warn(
 			`Found model mappings in custom_endpoint for account ${account.name} - this is deprecated. Use model_mappings field instead.`,
@@ -211,7 +275,13 @@ export function getModelMappings(
 				if (existing !== undefined) {
 					const arr = toArray(existing);
 					if (!arr.includes(fallbackModel)) {
-						mappings[family] = [...arr, fallbackModel];
+						if (arr.length >= MAX_MODEL_MAPPING_CANDIDATES) {
+							log.warn(
+								`Ignoring deprecated model_fallbacks value for '${family}' because the mapping already has ${MAX_MODEL_MAPPING_CANDIDATES} candidates`,
+							);
+						} else {
+							mappings[family] = [...arr, fallbackModel];
+						}
 					}
 				} else {
 					mappings[family] = fallbackModel;
@@ -253,7 +323,9 @@ function hasAccountModelMappings(account: Account): boolean {
 	if (account.model_mappings) return true;
 	if (account.model_fallbacks) return true;
 
-	const customEndpointData = parseCustomEndpointData(account.custom_endpoint);
+	const customEndpointData = parseCustomEndpointDataWithCandidates(
+		account.custom_endpoint,
+	);
 	if (customEndpointData?.modelMappings) return true;
 
 	// Check env override
@@ -262,7 +334,7 @@ function hasAccountModelMappings(account: Account): boolean {
 		process.env?.OPENAI_COMPATIBLE_MODEL_MAPPINGS
 	) {
 		try {
-			const envMappings = safeJsonParse<Record<string, string | string[]>>(
+			const envMappings = parseRuntimeModelMappings(
 				process.env.OPENAI_COMPATIBLE_MODEL_MAPPINGS,
 				"OPENAI_COMPATIBLE_MODEL_MAPPINGS environment variable",
 			);
@@ -372,10 +444,20 @@ export function parseModelFallbacks(
 	}
 
 	try {
-		return safeJsonParse<Record<string, string>>(
-			modelFallbacks,
-			"model_fallbacks",
-		);
+		const parsed = safeJsonParse<unknown>(modelFallbacks, "model_fallbacks");
+		const validated = validateModelMappings(parsed, "model_fallbacks");
+		for (const [key, value] of Object.entries(
+			parsed as Record<string, unknown>,
+		)) {
+			if (Array.isArray(value)) {
+				throw new ValidationError(
+					`model_fallbacks value for key '${key}' must be a non-empty string`,
+					`model_fallbacks.${key}`,
+					value,
+				);
+			}
+		}
+		return validated as Record<string, string>;
 	} catch (error) {
 		log.warn(
 			`Failed to parse model_fallbacks JSON: ${error instanceof Error ? error.message : String(error)}`,

@@ -835,6 +835,10 @@ describe("CodexWebSocketTransport replay boundary", () => {
 			signal: new AbortController().signal,
 			requestId: "request-pre-write-order",
 			attemptId: "attempt-pre-write-order",
+			onBeforeFrameSend: () => {
+				order.push("assert");
+				expect(h.sockets[0]?.sent).toHaveLength(0);
+			},
 			onBeforeFrameWrite: () => {
 				preWriteCalls++;
 				order.push("before");
@@ -848,7 +852,7 @@ describe("CodexWebSocketTransport replay boundary", () => {
 		await result?.response.text();
 
 		expect(preWriteCalls).toBe(1);
-		expect(order).toEqual(["before", "send", "after"]);
+		expect(order).toEqual(["assert", "before", "send", "after"]);
 	});
 
 	test("invokes the pre-write hook once per request and never from later frames", async () => {
@@ -1094,6 +1098,8 @@ describe("CodexWebSocketTransport replay boundary", () => {
 
 	test("observes send failures as joinable pre-write HTTP fallbacks", async () => {
 		enableCanary();
+		let beforeSendCalls = 0;
+		let frameWrittenCalls = 0;
 		const h = harness({
 			configureSocket(socket) {
 				socket.onSend = () => {
@@ -1102,11 +1108,24 @@ describe("CodexWebSocketTransport replay boundary", () => {
 			},
 		});
 		expect(
-			await attempt(h.transport, request(), {
+			await h.transport.tryRequest({
+				accountId: "acct-pro",
+				providerName: "codex",
+				conversationIdentity: testConversationIdentity("private-cache-key"),
+				request: request(),
+				signal: new AbortController().signal,
 				requestId: "request-send",
 				attemptId: "attempt-send",
+				onBeforeFrameSend: () => {
+					beforeSendCalls++;
+				},
+				onFrameWritten: () => {
+					frameWrittenCalls++;
+				},
 			}),
 		).toBeNull();
+		expect(beforeSendCalls).toBe(1);
+		expect(frameWrittenCalls).toBe(0);
 		expect(h.observations).toContainEqual(
 			expect.objectContaining({
 				requestId: "request-send",

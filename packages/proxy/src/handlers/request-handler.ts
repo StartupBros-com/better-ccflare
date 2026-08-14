@@ -5,6 +5,7 @@ import {
 	GUARD_REQUEST_ID_HEADER,
 } from "@better-ccflare/http-common";
 import type { Provider } from "@better-ccflare/providers";
+import { registerResponseDrainTransport } from "@better-ccflare/providers/stream-drain";
 import type { RequestMeta } from "@better-ccflare/types";
 import { chatGptCloudflareCookieJar } from "../chatgpt-cloudflare-cookies";
 import type { GuardCorrelationVerifier } from "./guard-correlation-auth";
@@ -118,13 +119,16 @@ export async function makeProxyRequest(
 	);
 	// Combine every abort source that can legitimately end this fetch: an
 	// explicit caller signal, the signal already carried by a Request target
-	// (Request derivation preserves it), and the header-phase timeout above.
-	// Any one of them can fire independently and must stay live for the whole
-	// stream lifetime, not just the header phase.
+	// (Request derivation preserves it), the header-phase timeout above, and a
+	// controller owned only by this response's discard lifecycle. The latter is
+	// registered after fetch resolves so a bounded abandoned-body drain can tear
+	// down this exact transport without poisoning a later retry.
+	const responseDrainController = new AbortController();
 	const signals = [
 		...(signal ? [signal] : []),
 		...(target instanceof Request ? [target.signal] : []),
 		headerTimeoutController.signal,
+		responseDrainController.signal,
 	];
 	const effectiveSignal =
 		signals.length === 1 ? signals[0] : AbortSignal.any(signals);
@@ -143,6 +147,7 @@ export async function makeProxyRequest(
 				}),
 			);
 			chatGptCloudflareCookieJar.captureFromResponse(targetUrl, response);
+			registerResponseDrainTransport(response, responseDrainController);
 			return response;
 		}
 
@@ -158,6 +163,7 @@ export async function makeProxyRequest(
 			...(hasBody ? ({ duplex: "half" } as RequestInit) : {}),
 		});
 		chatGptCloudflareCookieJar.captureFromResponse(target, response);
+		registerResponseDrainTransport(response, responseDrainController);
 		return response;
 	} finally {
 		clearTimeout(timeoutId);

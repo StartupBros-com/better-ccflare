@@ -730,6 +730,33 @@ describe("managed routing HTTP control plane", () => {
 		expect(contradiction.status).toBe(400);
 	});
 
+	it("rejects draft model mappings above the candidate limit", async () => {
+		const state = statefulDb();
+		const response = await createRoutingPreviewHandler(state.dbOps)(
+			request("/api/routing/preview", {
+				family: "opus",
+				draft: {
+					provider: "openai-compatible",
+					priority: 0,
+					auth_shape: "api-key",
+					model_mappings: {
+						opus: Array.from(
+							{ length: 17 },
+							(_, index) => `physical-${index + 1}`,
+						),
+					},
+				},
+			}),
+		);
+		const body = await response.json();
+
+		expect(response.status).toBe(400);
+		expect(body.error).toContain("draft.model_mappings");
+		expect(body.error).toContain("opus");
+		expect(body.error).toContain("16");
+		expect(state.applyFamilyPolicyChanges).not.toHaveBeenCalled();
+	});
+
 	it("re-previews a persisted automatic member and reuses its enabled rule without a write", async () => {
 		const state = statefulDb();
 		state.mutatePolicy((policy) => {

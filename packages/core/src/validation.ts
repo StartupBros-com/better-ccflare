@@ -459,6 +459,9 @@ export function safeJsonParse<T = unknown>(json: unknown, field = "json"): T {
 	}
 }
 
+/** Maximum ordered candidates permitted for one logical model mapping. */
+export const MAX_MODEL_MAPPING_CANDIDATES = 16;
+
 /**
  * Validate model mappings object.
  * Values may be a single model string or an ordered array of models to try.
@@ -494,6 +497,13 @@ export function validateModelMappings(
 					`${field} value for key '${key}' must not be an empty array`,
 					field,
 					mappings,
+				);
+			}
+			if (arr.length > MAX_MODEL_MAPPING_CANDIDATES) {
+				throw new ValidationError(
+					`${field} value for key '${key}' must contain at most ${MAX_MODEL_MAPPING_CANDIDATES} candidates`,
+					`${field}.${key}`,
+					arr.length,
 				);
 			}
 			const validated: string[] = [];

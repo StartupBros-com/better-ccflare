@@ -5,6 +5,10 @@ import { join } from "node:path";
 import { BUFFER_SIZES } from "@better-ccflare/core";
 import { CODEX_LOGICAL_MODEL_FAMILY_HEADER } from "@better-ccflare/http-common";
 import { setDerivedProviderModelDefaults } from "../../provider-model-defaults";
+import {
+	getResponseDrainTransport,
+	registerResponseDrainTransport,
+} from "../../utils/stream-drain";
 import { fetchCodexUsageOnDemand } from "./on-demand-fetch";
 import {
 	CODEX_SINGLE_ORCHESTRATION_ROOT_ENV,
@@ -1736,6 +1740,51 @@ describe("CodexProvider.parseRateLimit", () => {
 });
 
 describe("CodexProvider.processResponse", () => {
+	for (const contentType of ["text/event-stream", undefined]) {
+		it(`transfers the exact drain transport through the ${contentType ?? "missing content-type"} streaming transform`, async () => {
+			const provider = new CodexProvider();
+			const headers = new Headers({
+				"x-better-ccflare-request-stream": "true",
+			});
+			if (contentType) headers.set("content-type", contentType);
+			const upstream = new Response(
+				sseBody(
+					eventLine("response.completed", {
+						type: "response.completed",
+						response: {
+							id: "resp_drain_transport",
+							model: "gpt-5.6-sol",
+							usage: { input_tokens: 1, output_tokens: 0 },
+						},
+					}),
+				),
+				{ status: 200, headers },
+			);
+			const transportAbort = new AbortController();
+			registerResponseDrainTransport(upstream, transportAbort);
+
+			const transformed = await provider.processResponse(upstream, null);
+
+			expect(getResponseDrainTransport(transformed)).toBe(transportAbort);
+			await transformed.text();
+		});
+	}
+
+	it("transfers the exact drain transport to the non-SSE same-body wrapper", async () => {
+		const provider = new CodexProvider();
+		const upstream = new Response('{"ok":true}', {
+			status: 200,
+			headers: { "content-type": "application/json" },
+		});
+		const transportAbort = new AbortController();
+		registerResponseDrainTransport(upstream, transportAbort);
+
+		const transformed = await provider.processResponse(upstream, null);
+
+		expect(getResponseDrainTransport(transformed)).toBe(transportAbort);
+		expect(await transformed.text()).toBe('{"ok":true}');
+	});
+
 	it("throttles response.in_progress pings, reopens after one second, and resets per stream", async () => {
 		const provider = new CodexProvider();
 		const nowValues = [10_000, 10_999, 11_000, 11_100];

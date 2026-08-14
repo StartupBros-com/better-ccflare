@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, it, mock } from "bun:test";
+import { afterAll, beforeEach, describe, expect, it, mock } from "bun:test";
 import { BedrockClient } from "@aws-sdk/client-bedrock";
 import { BedrockRuntimeClient } from "@aws-sdk/client-bedrock-runtime";
 import type { Account } from "@better-ccflare/types";
@@ -55,11 +55,17 @@ mock.module("@better-ccflare/database", () => ({
 	})),
 }));
 
-const [{ BedrockProvider }, { materializeProviderAttemptPlan }] =
-	await Promise.all([
-		import("../provider"),
-		import("../../../provider-attempt-plan"),
-	]);
+const [
+	{ BedrockProvider },
+	{ materializeProviderAttemptPlan },
+	{ clearModelCache, translateModelName },
+	{ clearInferenceProfileCache },
+] = await Promise.all([
+	import("../provider"),
+	import("../../../provider-attempt-plan"),
+	import("../model-cache"),
+	import("../inference-profile-cache"),
+]);
 
 function account(modelId: string): Account {
 	return {
@@ -100,13 +106,14 @@ function account(modelId: string): Account {
 	};
 }
 
-function requestFixture(): Request {
+function requestFixture(stream = false): Request {
 	return new Request("https://localhost/v1/messages", {
 		method: "POST",
 		headers: { "content-type": "application/json" },
 		body: JSON.stringify({
 			model: "claude-sonnet-4-5",
 			max_tokens: 32,
+			...(stream ? { stream: true } : {}),
 			system: [
 				{
 					type: "text",
@@ -120,6 +127,170 @@ function requestFixture(): Request {
 }
 
 describe("BedrockProvider request model integration", () => {
+	beforeEach(() => {
+		profileSend.mockClear();
+		send.mockClear();
+	});
+
+	it("vetoes a cold-cache discovery request before any AWS send", async () => {
+		clearModelCache();
+		clearInferenceProfileCache();
+		const provider = new BedrockProvider();
+		const request = requestFixture();
+		const requestBodyBuffer = await request.clone().arrayBuffer();
+		const bedrockAccount = account("unused-custom-model");
+		bedrockAccount.model_mappings = null;
+		const veto = new Error("physical attempt budget exhausted");
+		const beforePhysicalTransport = mock(() => {
+			throw veto;
+		});
+		const runtimeSendsBefore = send.mock.calls.length;
+		const discoverySendsBefore = profileSend.mock.calls.length;
+
+		const plan = materializeProviderAttemptPlan(provider, {
+			request,
+			requestBodyBuffer,
+			account: bedrockAccount,
+			path: "/v1/messages",
+			query: "",
+			physicalModel: "claude-sonnet-4-5",
+			capabilityProofKey: null,
+			inputReplayMode: [],
+			outputReplayMode: [],
+			beforePhysicalTransport,
+		});
+
+		await expect(plan.transformRequestBody(request)).rejects.toBe(veto);
+		expect(beforePhysicalTransport).toHaveBeenCalledTimes(1);
+		expect(profileSend.mock.calls.length).toBe(discoverySendsBefore);
+		expect(send.mock.calls.length).toBe(runtimeSendsBefore);
+	});
+
+	it("counts every model-discovery retry as a physical transport", async () => {
+		clearModelCache();
+		const beforePhysicalTransport = mock(() => undefined);
+		const sendsBefore = profileSend.mock.calls.length;
+		profileSend
+			.mockImplementationOnce(async () => {
+				throw new Error("ThrottlingException: Rate exceeded");
+			})
+			.mockImplementationOnce(async () => ({
+				modelSummaries: [
+					{ modelId: "anthropic.claude-sonnet-4-5-20250929-v1:0" },
+				],
+			}));
+
+		const modelId = await translateModelName(
+			"claude-sonnet-4-5",
+			account("unused-custom-model"),
+			beforePhysicalTransport,
+		);
+
+		expect(modelId).toBe("anthropic.claude-sonnet-4-5-20250929-v1:0");
+		expect(beforePhysicalTransport).toHaveBeenCalledTimes(2);
+		expect(profileSend.mock.calls.length - sendsBefore).toBe(2);
+	});
+
+	it("runs the request-local physical transport hook before AWS client.send", async () => {
+		const provider = new BedrockProvider();
+		const request = requestFixture();
+		const requestBodyBuffer = await request.clone().arrayBuffer();
+		const veto = new Error("physical attempt budget exhausted");
+		const beforePhysicalTransport = mock(() => {
+			throw veto;
+		});
+		const sendsBefore = send.mock.calls.length;
+
+		const plan = materializeProviderAttemptPlan(provider, {
+			request,
+			requestBodyBuffer,
+			account: account(
+				"arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+			),
+			path: "/v1/messages",
+			query: "",
+			physicalModel: "claude-sonnet-4-5",
+			capabilityProofKey: null,
+			inputReplayMode: [],
+			outputReplayMode: [],
+			beforePhysicalTransport,
+		});
+
+		await expect(plan.transformRequestBody(request)).rejects.toBe(veto);
+		expect(beforePhysicalTransport).toHaveBeenCalledTimes(1);
+		expect(send.mock.calls.length).toBe(sendsBefore);
+	});
+
+	it("counts both AWS sends when streaming falls back to non-streaming", async () => {
+		const provider = new BedrockProvider();
+		const request = requestFixture(true);
+		const requestBodyBuffer = await request.clone().arrayBuffer();
+		const beforePhysicalTransport = mock(() => undefined);
+		const sendsBefore = send.mock.calls.length;
+		send.mockImplementationOnce(async () => {
+			const error = new Error("streaming is not supported");
+			error.name = "ValidationException";
+			throw error;
+		});
+
+		const plan = materializeProviderAttemptPlan(provider, {
+			request,
+			requestBodyBuffer,
+			account: account(
+				"arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+			),
+			path: "/v1/messages",
+			query: "",
+			physicalModel: "claude-sonnet-4-5",
+			capabilityProofKey: null,
+			inputReplayMode: [],
+			outputReplayMode: [],
+			beforePhysicalTransport,
+		});
+
+		const transformed = await plan.transformRequestBody(request);
+		expect(transformed.headers.get("x-bedrock-response")).toBe("true");
+		expect(beforePhysicalTransport).toHaveBeenCalledTimes(2);
+		expect(send.mock.calls.length - sendsBefore).toBe(2);
+	});
+
+	it("vetoes the non-streaming fallback before a second AWS send", async () => {
+		const provider = new BedrockProvider();
+		const request = requestFixture(true);
+		const requestBodyBuffer = await request.clone().arrayBuffer();
+		const veto = new Error("physical attempt budget exhausted");
+		let hookCallCount = 0;
+		const beforePhysicalTransport = mock(() => {
+			hookCallCount += 1;
+			if (hookCallCount === 2) throw veto;
+		});
+		const sendsBefore = send.mock.calls.length;
+		send.mockImplementationOnce(async () => {
+			const error = new Error("streaming is not supported");
+			error.name = "ValidationException";
+			throw error;
+		});
+
+		const plan = materializeProviderAttemptPlan(provider, {
+			request,
+			requestBodyBuffer,
+			account: account(
+				"arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+			),
+			path: "/v1/messages",
+			query: "",
+			physicalModel: "claude-sonnet-4-5",
+			capabilityProofKey: null,
+			inputReplayMode: [],
+			outputReplayMode: [],
+			beforePhysicalTransport,
+		});
+
+		await expect(plan.transformRequestBody(request)).rejects.toBe(veto);
+		expect(beforePhysicalTransport).toHaveBeenCalledTimes(2);
+		expect(send.mock.calls.length - sendsBefore).toBe(1);
+	});
+
 	it("preserves inference-profile ARNs under the default geographic mode", async () => {
 		const inferenceProfileArn =
 			"arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-sonnet-4-5-20250929-v1:0";

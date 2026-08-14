@@ -1,6 +1,8 @@
 import { describe, expect, it, mock } from "bun:test";
 import {
 	formatRoutingAttemptMessage,
+	MAX_REQUEST_PHYSICAL_ATTEMPTS,
+	PhysicalAttemptBudgetExceededError,
 	RoutingAttemptLedger,
 } from "../routing-attempt-ledger";
 
@@ -50,6 +52,126 @@ describe("RoutingAttemptLedger", () => {
 		expect(ledger.recordPhysicalAttempt()).toBe(2);
 		expect(ledger.physicalAttemptCount).toBe(2);
 		expect(ledger.claimHostedDispatch()).toBe(false);
+	});
+
+	it("admits exactly 32 physical transports and vetoes the 33rd without telemetry", () => {
+		const ledger = new RoutingAttemptLedger();
+
+		for (let ordinal = 1; ordinal <= MAX_REQUEST_PHYSICAL_ATTEMPTS; ordinal++) {
+			expect(ledger.assertPhysicalAttemptAvailable()).toBeUndefined();
+			expect(ledger.recordPhysicalAttempt()).toBe(ordinal);
+		}
+
+		expect(() => ledger.assertPhysicalAttemptAvailable()).toThrow(
+			PhysicalAttemptBudgetExceededError,
+		);
+		expect(() => ledger.recordPhysicalAttempt()).toThrow(
+			PhysicalAttemptBudgetExceededError,
+		);
+		expect(ledger.physicalAttemptCount).toBe(MAX_REQUEST_PHYSICAL_ATTEMPTS);
+	});
+
+	it("captures only low-cardinality next-route context at the veto boundary", () => {
+		const ledger = new RoutingAttemptLedger();
+		for (let attempt = 0; attempt < MAX_REQUEST_PHYSICAL_ATTEMPTS; attempt++) {
+			ledger.recordPhysicalAttempt();
+		}
+
+		let exhausted: PhysicalAttemptBudgetExceededError | null = null;
+		try {
+			ledger.assertPhysicalAttemptAvailable({
+				accountId: " account-next ",
+				candidateId: " candidate-next ",
+				laneKey: " lane-next ",
+			});
+		} catch (error) {
+			if (error instanceof PhysicalAttemptBudgetExceededError) {
+				exhausted = error;
+			}
+		}
+
+		expect(exhausted).toMatchObject({
+			nextAccountId: "account-next",
+			nextCandidateId: "candidate-next",
+			nextLaneKey: "lane-next",
+		});
+	});
+
+	it("emits a stable non-recoverable terminal with physical and unique-route counts", async () => {
+		const ledger = new RoutingAttemptLedger();
+		expect(ledger.claim("account-a", "model-a")).toBe(true);
+		expect(ledger.claim("account-b", "model-b")).toBe(true);
+		for (let attempt = 0; attempt < MAX_REQUEST_PHYSICAL_ATTEMPTS; attempt++) {
+			ledger.recordPhysicalAttempt();
+		}
+
+		let exhausted: PhysicalAttemptBudgetExceededError | null = null;
+		try {
+			ledger.recordPhysicalAttempt();
+		} catch (error) {
+			if (error instanceof PhysicalAttemptBudgetExceededError)
+				exhausted = error;
+		}
+		expect(exhausted).not.toBeNull();
+		const response = await exhausted?.terminalize();
+
+		expect(response?.status).toBe(503);
+		expect(response?.headers.get("retry-after")).toBeNull();
+		expect(response?.headers.get("x-better-ccflare-pool-status")).toBeNull();
+		expect(response?.headers.get("x-better-ccflare-recovery-scope")).toBeNull();
+		expect(response?.headers.get("x-should-retry")).toBeNull();
+		expect(await response?.json()).toEqual({
+			type: "error",
+			error: {
+				type: "service_unavailable",
+				code: "physical_attempt_budget_exhausted",
+				message:
+					"Request stopped after reaching the upstream transport safety limit.",
+				physical_attempts: MAX_REQUEST_PHYSICAL_ATTEMPTS,
+				physical_attempt_limit: MAX_REQUEST_PHYSICAL_ATTEMPTS,
+				attempted_routes: 2,
+			},
+		});
+	});
+
+	it("runs bound terminal cleanup once when competing owners observe exhaustion", async () => {
+		const ledger = new RoutingAttemptLedger();
+		const terminalize = mock(
+			async () => new Response("bounded", { status: 503 }),
+		);
+		ledger.bindPhysicalAttemptBudgetTerminal({
+			requestId: "request-budget-once",
+			terminalize,
+		});
+		for (let attempt = 0; attempt < MAX_REQUEST_PHYSICAL_ATTEMPTS; attempt++) {
+			ledger.recordPhysicalAttempt();
+		}
+		const errors: PhysicalAttemptBudgetExceededError[] = [];
+		try {
+			ledger.recordPhysicalAttempt();
+		} catch (error) {
+			if (error instanceof PhysicalAttemptBudgetExceededError)
+				errors.push(error);
+		}
+		try {
+			ledger.recordPhysicalAttempt();
+		} catch (error) {
+			if (error instanceof PhysicalAttemptBudgetExceededError)
+				errors.push(error);
+		}
+		const exhausted = errors[0];
+		if (!exhausted) throw new Error("expected physical attempt exhaustion");
+
+		const [first, second] = await Promise.all([
+			exhausted.terminalize(),
+			exhausted.terminalize(),
+		]);
+
+		expect(first).toBe(second);
+		expect(errors).toHaveLength(2);
+		expect(errors[1]).toBe(exhausted);
+		expect(exhausted.requestId).toBe("request-budget-once");
+		expect(terminalize).toHaveBeenCalledTimes(1);
 	});
 
 	it("claims each account and normalized concrete model only once", () => {

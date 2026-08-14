@@ -8,10 +8,12 @@ import {
 
 // Mock AWS SDK
 const mockSend = mock();
-const mockBedrockClient = mock(() => ({ send: mockSend }));
-// Bun's mock wrapper is constructible but has no prototype. Provide the AWS
-// client surface so this process-global module mock remains compatible with
-// tests that replace BedrockClient.prototype.send.
+const mockBedrockClient = mock(() =>
+	Object.create(mockBedrockClient.prototype),
+);
+// Bun's module mocks are process-global across test files. Keep `send` on the
+// prototype so another suite can temporarily replace it without an own
+// property from this constructor shadowing that replacement.
 Object.defineProperty(mockBedrockClient, "prototype", {
 	value: { send: mockSend },
 });
@@ -57,6 +59,24 @@ describe("Inference Profile Cache", () => {
 	});
 
 	describe("canUseInferenceProfile", () => {
+		it("vetoes cold-cache discovery before the first AWS send", async () => {
+			const veto = new Error("physical attempt budget exhausted");
+			const beforePhysicalTransport = mock(() => {
+				throw veto;
+			});
+
+			await expect(
+				canUseInferenceProfile(
+					"claude-opus-4-6",
+					"geographic",
+					mockAccount,
+					beforePhysicalTransport,
+				),
+			).rejects.toBe(veto);
+			expect(beforePhysicalTransport).toHaveBeenCalledTimes(1);
+			expect(mockSend).not.toHaveBeenCalled();
+		});
+
 		it("should return true for geographic mode when profile supports it", async () => {
 			// Mock API response with geographic profiles
 			mockSend.mockResolvedValueOnce({
@@ -275,6 +295,24 @@ describe("Inference Profile Cache", () => {
 	});
 
 	describe("getFallbackMode", () => {
+		it("propagates a cold-cache transport veto without sending", async () => {
+			const veto = new Error("physical attempt budget exhausted");
+			const beforePhysicalTransport = mock(() => {
+				throw veto;
+			});
+
+			await expect(
+				getFallbackMode(
+					"claude-opus-4-6",
+					"geographic",
+					mockAccount,
+					beforePhysicalTransport,
+				),
+			).rejects.toBe(veto);
+			expect(beforePhysicalTransport).toHaveBeenCalledTimes(1);
+			expect(mockSend).not.toHaveBeenCalled();
+		});
+
 		it("should return null when requested mode is supported", async () => {
 			// Mock API response with geographic profile
 			mockSend.mockResolvedValueOnce({
@@ -436,6 +474,7 @@ describe("Inference Profile Cache", () => {
 
 		it("should retry on throttling errors", async () => {
 			// Mock throttling error followed by success
+			const beforePhysicalTransport = mock(() => undefined);
 			mockSend
 				.mockRejectedValueOnce(new Error("ThrottlingException: Rate exceeded"))
 				.mockResolvedValueOnce({
@@ -453,9 +492,11 @@ describe("Inference Profile Cache", () => {
 				"claude-opus-4-6",
 				"geographic",
 				mockAccount,
+				beforePhysicalTransport,
 			);
 
 			expect(result).toBe(true);
+			expect(beforePhysicalTransport).toHaveBeenCalledTimes(2);
 			expect(mockSend).toHaveBeenCalledTimes(2);
 		});
 

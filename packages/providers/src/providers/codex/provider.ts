@@ -50,6 +50,7 @@ import type {
 	TokenRefreshResult,
 } from "../../types";
 import { CODEX_REASONING_RETENTION_PREFIX } from "../../utils/codex-reasoning-retention";
+import { transferResponseDrainTransport } from "../../utils/stream-drain";
 import {
 	CODEX_SINGLE_ORCHESTRATION_ROOT_ENV,
 	deriveConversationIdentity,
@@ -1465,6 +1466,7 @@ export class CodexProvider extends BaseProvider {
 				statusText: response.statusText,
 				headers,
 			});
+			transferResponseDrainTransport(response, sseResponse);
 			if (requestedStream) {
 				return this.transformStreamingResponse(
 					sseResponse,
@@ -1500,11 +1502,13 @@ export class CodexProvider extends BaseProvider {
 			),
 		});
 		const headers = sanitizeResponseHeaders(response.headers);
-		return new Response(response.body, {
+		const sanitized = new Response(response.body, {
 			status: response.status,
 			statusText: response.statusText,
 			headers,
 		});
+		transferResponseDrainTransport(response, sanitized);
+		return sanitized;
 	}
 
 	parseRateLimit(response: Response): RateLimitInfo {
@@ -3313,11 +3317,13 @@ export class CodexProvider extends BaseProvider {
 			log.error("Unhandled Codex SSE processing failure:", error);
 		});
 
-		return new Response(readable, {
+		const transformed = new Response(readable, {
 			status: response.status,
 			statusText: response.statusText,
 			headers,
 		});
+		transferResponseDrainTransport(response, transformed);
+		return transformed;
 	}
 
 	private normalizeCodexStreamError(

@@ -9,7 +9,11 @@ import {
 import { existsSync, unlinkSync } from "node:fs";
 import type { DatabaseOperations } from "@better-ccflare/database";
 import { DatabaseFactory } from "@better-ccflare/database";
-import { createAccountModelMappingsUpdateHandler } from "../accounts";
+import {
+	createAccountModelFallbacksUpdateHandler,
+	createAccountModelMappingsUpdateHandler,
+	createOpenAIAccountAddHandler,
+} from "../accounts";
 
 const TEST_DB_PATH = `${process.env.TMPDIR || "/tmp"}/test-model-mappings-update.db`;
 
@@ -61,12 +65,16 @@ function makeRequest(body: unknown): Request {
 describe("createAccountModelMappingsUpdateHandler — replace semantics", () => {
 	let dbOps: DatabaseOperations;
 	let handler: (req: Request, accountId: string) => Promise<Response>;
+	let fallbackHandler: (req: Request, accountId: string) => Promise<Response>;
+	let addHandler: (req: Request) => Promise<Response>;
 
 	beforeAll(() => {
 		if (existsSync(TEST_DB_PATH)) unlinkSync(TEST_DB_PATH);
 		DatabaseFactory.initialize(TEST_DB_PATH);
 		dbOps = DatabaseFactory.getInstance();
 		handler = createAccountModelMappingsUpdateHandler(dbOps);
+		fallbackHandler = createAccountModelFallbacksUpdateHandler(dbOps);
+		addHandler = createOpenAIAccountAddHandler(dbOps);
 	});
 
 	afterAll(() => {
@@ -193,6 +201,94 @@ describe("createAccountModelMappingsUpdateHandler — replace semantics", () => 
 
 		const stored = await readMappings(dbOps, id);
 		expect(stored).toEqual({ sonnet: "model-a" });
+	});
+
+	it("accepts exactly 16 candidates", async () => {
+		const id = await insertAccount(dbOps, "bounded", null);
+		const candidates = Array.from(
+			{ length: 16 },
+			(_, index) => `model-${index + 1}`,
+		);
+
+		const response = await handler(
+			makeRequest({ modelMappings: { sonnet: candidates } }),
+			id,
+		);
+
+		expect(response.status).toBe(200);
+		expect(await readMappings(dbOps, id)).toEqual({ sonnet: candidates });
+	});
+
+	it("rejects 17 candidates without mutating existing mappings", async () => {
+		const id = await insertAccount(dbOps, "overflow", {
+			sonnet: "existing-model",
+		});
+		const response = await handler(
+			makeRequest({
+				modelMappings: {
+					sonnet: Array.from(
+						{ length: 17 },
+						(_, index) => `model-${index + 1}`,
+					),
+				},
+			}),
+			id,
+		);
+		const body = (await response.json()) as { error: string };
+
+		expect(response.status).toBe(400);
+		expect(body.error).toContain("modelMappings");
+		expect(body.error).toContain("sonnet");
+		expect(body.error).toContain("16");
+		expect(await readMappings(dbOps, id)).toEqual({
+			sonnet: "existing-model",
+		});
+	});
+
+	it("deprecated fallback updates cannot append a 17th candidate", async () => {
+		const candidates = Array.from(
+			{ length: 16 },
+			(_, index) => `model-${index + 1}`,
+		);
+		const id = await insertAccount(dbOps, "fallback-overflow", {
+			sonnet: candidates,
+		});
+		const response = await fallbackHandler(
+			makeRequest({ modelFallbacks: { sonnet: "overflow-fallback" } }),
+			id,
+		);
+
+		expect(response.status).toBe(400);
+		expect(await readMappings(dbOps, id)).toEqual({ sonnet: candidates });
+	});
+
+	it("OpenAI-compatible creation rejects 17 candidates without inserting an account", async () => {
+		const response = await addHandler(
+			new Request("http://localhost/api/accounts/openai-compatible", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					name: "overflow-create",
+					apiKey: "test-key",
+					customEndpoint: "https://example.invalid",
+					modelMappings: {
+						sonnet: Array.from(
+							{ length: 17 },
+							(_, index) => `model-${index + 1}`,
+						),
+					},
+				}),
+			}),
+		);
+		const row = await dbOps
+			.getAdapter()
+			.get<{ count: number }>(
+				"SELECT COUNT(*) AS count FROM accounts WHERE name = ?",
+				["overflow-create"],
+			);
+
+		expect(response.status).toBe(400);
+		expect(row?.count).toBe(0);
 	});
 
 	it("returns 404 when the account does not exist", async () => {

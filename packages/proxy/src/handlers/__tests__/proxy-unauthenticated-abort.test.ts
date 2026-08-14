@@ -3,6 +3,11 @@ import type { RequestMeta } from "@better-ccflare/types";
 import { ANTHROPIC_DRAIN_DEADLINE_MS } from "../../anthropic-terminal-recovery";
 import { proxyUnauthenticated } from "../proxy-operations";
 import type { ProxyContext } from "../proxy-types";
+import {
+	MAX_REQUEST_PHYSICAL_ATTEMPTS,
+	PhysicalAttemptBudgetExceededError,
+	RoutingAttemptLedger,
+} from "../routing-attempt-ledger";
 
 const originalFetch = globalThis.fetch;
 
@@ -18,6 +23,49 @@ function fetchSignal(
 describe("proxyUnauthenticated abort lifecycle", () => {
 	afterEach(() => {
 		globalThis.fetch = originalFetch;
+	});
+
+	it("vetoes an unauthenticated 33rd transport before fetch", async () => {
+		const fetchMock = mock(async () => new Response("unexpected"));
+		globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
+		const ledger = new RoutingAttemptLedger();
+		for (let attempt = 0; attempt < MAX_REQUEST_PHYSICAL_ATTEMPTS; attempt++) {
+			ledger.recordPhysicalAttempt();
+		}
+		const req = new Request("https://proxy.test/v1/messages", {
+			method: "GET",
+		});
+		const requestMeta: RequestMeta = {
+			id: "unauthenticated-physical-budget",
+			method: req.method,
+			path: "/v1/messages",
+			timestamp: Date.now(),
+		};
+		const ctx = {
+			provider: {
+				name: "test-provider",
+				buildUrl: (path: string, search: string) =>
+					`https://provider.test${path}${search}`,
+				prepareHeaders: (headers: Headers) => new Headers(headers),
+			},
+		} as unknown as ProxyContext;
+
+		await expect(
+			proxyUnauthenticated(
+				req,
+				new URL(req.url),
+				requestMeta,
+				null,
+				() => undefined,
+				ctx,
+				undefined,
+				undefined,
+				undefined,
+				ledger,
+			),
+		).rejects.toBeInstanceOf(PhysicalAttemptBudgetExceededError);
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(ledger.physicalAttemptCount).toBe(MAX_REQUEST_PHYSICAL_ATTEMPTS);
 	});
 
 	it("propagates caller abort to the string-target request without wrapping it as 502", async () => {
