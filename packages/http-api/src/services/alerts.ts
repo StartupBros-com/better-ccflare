@@ -9,9 +9,9 @@ import {
 	getModelRates,
 	isValidModelId,
 	LATEST_MODEL_BY_FAMILY,
+	normalizeProviderUsageWindows,
 	type RequestEvt,
 	requestEvents,
-	weeklyScopedWindowKey,
 } from "@better-ccflare/core";
 import type { BunSqlAdapter } from "@better-ccflare/database";
 import { Logger } from "@better-ccflare/logger";
@@ -19,6 +19,7 @@ import type {
 	AlertEvent,
 	AlertsConfigPayload,
 	AlertType,
+	CanonicalUsageWindow,
 	PredictionPoint,
 	RequestResponse,
 	RunawayLoopGroup,
@@ -160,100 +161,18 @@ export interface ExtractedUsageWindow {
 	resetsAtMs: number | null;
 }
 
-/**
- * Maps a `limits[]` entry to the internal window_key. MUST stay in lockstep
- * with `limitWindowKey` in usage-history.repository.ts — the alert evaluator
- * and the history recorder must agree on which windows exist, or an account
- * gets a window persisted and charted but never alerted on (the exact gap
- * this shared mapping closes).
- */
-function alertLimitWindowKey(limit: {
-	kind?: string;
-	scope?: { model?: { display_name?: string } | null } | null;
-}): string | null {
-	if (limit.kind === "session") return "five_hour";
-	if (limit.kind === "weekly_all") return "seven_day";
-	if (limit.kind === "weekly_scoped") {
-		const name = limit.scope?.model?.display_name?.trim();
-		return name ? weeklyScopedWindowKey(name) : null;
-	}
-	return null;
-}
-
-/**
- * Pulls every usage window out of a raw usage snapshot payload: the flat
- * `{ utilization: number, resets_at: ... }`-shaped entries (Anthropic's
- * five_hour/seven_day/..., Codex's mirrored shape, xAI's nested `credits`)
- * AND the generic `limits[]` array (session/weekly_all/weekly_scoped) that
- * limits-only Anthropic payloads carry INSTEAD of flat windows. The set of
- * windows this returns matches what usage-history.repository.ts records, so
- * everything persisted/charted is also alert-eligible.
- */
+/** Compatibility wrapper for callers that still provide an Anthropic payload. */
 export function extractUsageWindows(
 	usage: Record<string, unknown>,
+	provider = "anthropic",
 ): ExtractedUsageWindow[] {
-	const windows: ExtractedUsageWindow[] = [];
-	const seen = new Set<string>();
-	for (const [windowKey, value] of Object.entries(usage)) {
-		if (typeof value !== "object" || value === null || Array.isArray(value))
-			continue;
-		const v = value as {
-			utilization?: unknown;
-			percentage?: unknown;
-			resets_at?: unknown;
-			resetAt?: unknown;
-		};
-		// Tolerant window matcher for VERIFIED 0-100 percent shapes only:
-		// anthropic/codex/xai use {utilization, resets_at: ISO}; minimax uses
-		// {utilization, resetAt: ms}; zai limits use {percentage, resetAt: ms}.
-		// Deliberately NOT matched: nanogpt/alibaba `percentUsed` (0-1 scale —
-		// reading it as 0-100 would silently never alert) and kilo's scalar
-		// credits. Those need a real per-provider normalizer feeding BOTH
-		// history and alerts — tracked as a follow-up issue.
-		const utilization =
-			typeof v.utilization === "number"
-				? v.utilization
-				: typeof v.percentage === "number"
-					? v.percentage
-					: null;
-		if (utilization === null) continue;
-		if (!("resets_at" in v) && !("resetAt" in v)) continue;
-		let resetsAtMs: number | null = null;
-		if (typeof v.resets_at === "string") {
-			const ms = new Date(v.resets_at).getTime();
-			resetsAtMs = Number.isFinite(ms) ? ms : null;
-		} else if (typeof v.resetAt === "number" && Number.isFinite(v.resetAt)) {
-			resetsAtMs = v.resetAt;
-		}
-		windows.push({ windowKey, utilization, resetsAtMs });
-		seen.add(windowKey);
-	}
-	const limits = (usage as { limits?: unknown }).limits;
-	if (Array.isArray(limits)) {
-		for (const limit of limits) {
-			if (typeof limit !== "object" || limit === null || !("kind" in limit))
-				continue;
-			const l = limit as {
-				kind?: string;
-				percent?: unknown;
-				resets_at?: unknown;
-				scope?: { model?: { display_name?: string } | null } | null;
-			};
-			if (typeof l.percent !== "number") continue;
-			const windowKey = alertLimitWindowKey(l);
-			// Skip unmapped kinds and windows already present as flat entries
-			// (no double-evaluation of five_hour/seven_day).
-			if (!windowKey || seen.has(windowKey)) continue;
-			let resetsAtMs: number | null = null;
-			if (typeof l.resets_at === "string") {
-				const ms = new Date(l.resets_at).getTime();
-				resetsAtMs = Number.isFinite(ms) ? ms : null;
-			}
-			windows.push({ windowKey, utilization: l.percent, resetsAtMs });
-			seen.add(windowKey);
-		}
-	}
-	return windows;
+	return normalizeProviderUsageWindows(usage, provider).map(
+		({ windowKey, utilization, resetsAtMs }) => ({
+			windowKey,
+			utilization,
+			resetsAtMs,
+		}),
+	);
 }
 
 /**
@@ -628,13 +547,15 @@ export class AlertService {
 	async evaluateUsageSnapshot(
 		accountId: string,
 		accountName: string,
-		usage: Record<string, unknown>,
+		windows: CanonicalUsageWindow[],
 		timestamp: number,
 	): Promise<void> {
-		const windows = extractUsageWindows(usage);
 		if (windows.length === 0) return;
 		const config = getAlertsConfig(this.config);
 		for (const window of windows) {
+			// Inactive provider rows remain available for history, but do not describe
+			// currently consumable capacity and must not trigger operator alerts.
+			if (!window.active) continue;
 			// A window with no resets_at has no cycle boundary to dedup against
 			// or project toward — skip it rather than risk firing every poll.
 			if (window.resetsAtMs == null) continue;

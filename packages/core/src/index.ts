@@ -130,6 +130,7 @@ export {
 	type SupportedWindow,
 } from "./throttle-utils";
 export { TtlCache } from "./ttl-cache";
+export * from "./usage-windows";
 export { levenshteinDistance } from "./utils";
 export {
 	patterns,
