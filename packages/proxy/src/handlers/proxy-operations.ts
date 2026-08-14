@@ -2580,6 +2580,7 @@ export async function proxyWithAccount(
 			if (attemptPlan.providerName !== "codex") return;
 			transportAttemptOrdinal++;
 			requestMeta.codexTransportAttemptOrdinal = transportAttemptOrdinal;
+			requestMeta.codexLastAttemptAccountId = account.id;
 			currentTransportAttemptId = crypto.randomUUID();
 			attemptHeaders.set(
 				"x-better-ccflare-attempt-id",
@@ -2664,9 +2665,21 @@ export async function proxyWithAccount(
 			return prepared;
 		};
 		let headers = prepareAttemptHeaders(attemptPlan);
+		// A nonzero ordinal only means this logical request has been sent before,
+		// not that it moved accounts. Re-entry on the same account -- the bounded
+		// 401 retry after refreshing credentials, for instance -- is a compatible
+		// retry: the rejected credential never committed the model turn, so its
+		// turn state is still valid and must not be discarded as failover would.
+		// An unknown previous account keeps the old failover classification: that
+		// side only discards state, while the retry side would preserve it.
+		const previousAttemptAccountId = requestMeta.codexLastAttemptAccountId;
 		stampCodexAttempt(
 			headers,
-			transportAttemptOrdinal > 0 ? "account_failover" : "initial",
+			transportAttemptOrdinal === 0
+				? "initial"
+				: previousAttemptAccountId === account.id
+					? "other_retry"
+					: "account_failover",
 			replayResolvedModel ?? undefined,
 		);
 		let targetUrl = attemptPlan.targetUrl;
@@ -3277,10 +3290,14 @@ export async function proxyWithAccount(
 		if (attemptAdmissionTracker) attemptAdmissionTracker.attemptedCount++;
 
 		const finalizedCodexAttemptIds = new Set<string>();
-		const finalizeCurrentCodexTransport = async (discarded: Response) => {
-			if (attemptPlan.providerName !== "codex" || !currentTransportAttemptId)
-				return;
-			const attemptId = currentTransportAttemptId;
+		const finalizeCurrentCodexTransport = async (
+			discarded: Response,
+			// Paths that stamp the next attempt before finalizing the one it
+			// supersedes pass that superseded ID explicitly.
+			attemptIdOverride?: string | null,
+		) => {
+			const attemptId = attemptIdOverride ?? currentTransportAttemptId;
+			if (attemptPlan.providerName !== "codex" || !attemptId) return;
 			if (finalizedCodexAttemptIds.has(attemptId)) return;
 			// Mark finalized before draining so a rejecting body cannot abort the
 			// intended retry/failover path or cause repeated finalization work.
@@ -4972,6 +4989,12 @@ export async function proxyWithAccount(
 						let fallbackPlan: ProviderAttemptPlan;
 						let fallbackHeaders: Headers;
 						let retryTransformedRequest: Request;
+						// The response this fallback supersedes is finalized further down,
+						// after the ledger claim, so its attempt identity has to survive the
+						// stamp below.
+						const supersededCodexAttemptId: string | null =
+							currentTransportAttemptId;
+						let fallbackAttemptStamped = false;
 						try {
 							if (provider.name === "codex") {
 								await ensureCodexModelDefaults(account, ctx);
@@ -4984,6 +5007,16 @@ export async function proxyWithAccount(
 								false,
 							);
 							fallbackHeaders = prepareAttemptHeaders(fallbackPlan);
+							// Stamp before the request is built and transformed: the Codex
+							// provider registers this attempt's turn-state context during the
+							// transform, reading the attempt ID and cause from these headers.
+							// Stamping afterwards registered the attempt under an identity the
+							// response never carries -- so its terminal resolved nothing -- and
+							// hid the model fallback behind the default `initial` cause, which
+							// skips the suppression a route change requires. Mirrors the
+							// in-place 529 retry, which stamps before transforming.
+							stampCodexAttempt(fallbackHeaders, "model_fallback", nextModel);
+							fallbackAttemptStamped = true;
 							const retryRequestInit: RequestInit & { duplex?: "half" } = {
 								method: req.method,
 								headers: fallbackHeaders,
@@ -5006,6 +5039,11 @@ export async function proxyWithAccount(
 									fallbackPlan,
 								);
 						} catch (error) {
+							// This candidate never sends, so the superseded response is still
+							// the live attempt for whatever runs next.
+							if (fallbackAttemptStamped) {
+								currentTransportAttemptId = supersededCodexAttemptId;
+							}
 							if (error instanceof ServerToolCandidateCapabilityError) {
 								lastModelFallbackCapabilityError = error;
 								continue;
@@ -5026,6 +5064,7 @@ export async function proxyWithAccount(
 							log.debug(
 								`Skipping duplicate request-local model fallback account=${account.name} model=${nextModel}`,
 							);
+							currentTransportAttemptId = supersededCodexAttemptId;
 							continue;
 						}
 						lastModelFallbackCapabilityError = null;
@@ -5036,13 +5075,15 @@ export async function proxyWithAccount(
 							);
 						}
 						if (!isScopedFailure(rawFailureClassification)) {
-							await finalizeCurrentCodexTransport(rawResponse);
+							await finalizeCurrentCodexTransport(
+								rawResponse,
+								supersededCodexAttemptId,
+							);
 							await discardUpstreamBody(rawResponse);
 						}
 						attemptPlan = fallbackPlan;
 						attemptProvider = bindProviderAttemptPlan(fallbackPlan);
 						headers = fallbackHeaders;
-						stampCodexAttempt(headers, "model_fallback", nextModel);
 						currentTransportModel = nextModel;
 						targetUrl = fallbackPlan.targetUrl;
 						retryTransformedTemplate = retryTransformedRequest.clone();

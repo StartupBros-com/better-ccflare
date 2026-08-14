@@ -135,6 +135,15 @@ export interface CodexTurnStateFinalizeInput {
 interface GenerationEntry {
 	generation: number;
 	arm: CodexTurnStateArm;
+	/**
+	 * Counts every change to this scope's pending turn state within the current
+	 * generation. The generation number alone cannot separate two logical
+	 * requests that legitimately began while the scope held nothing to protect:
+	 * both see the same generation, so both are allowed to mutate at their
+	 * terminal. Attempts carry the revision they observed at begin and may only
+	 * mutate while it still holds.
+	 */
+	pendingRevision: number;
 	updatedAt: number;
 }
 
@@ -151,6 +160,7 @@ interface PendingEntry {
 interface AttemptEntry {
 	scopeKey: string | null;
 	generation: number | null;
+	pendingRevision: number | null;
 	arm: CodexTurnStateArm;
 	requestId: string;
 	replayApplied: boolean;
@@ -528,6 +538,7 @@ export class CodexTurnStateCoordinator {
 		if (arm === "observe") {
 			generationEntry ??= this.advanceGeneration(scopeKey, arm, now, config);
 			this.pending.delete(scopeKey);
+			this.bumpPendingRevision(scopeKey);
 			return this.recordAttempt(
 				input,
 				scopeKey,
@@ -616,6 +627,7 @@ export class CodexTurnStateCoordinator {
 		if (arm === "control") {
 			delete pending.token;
 			pending.arm = "control";
+			this.bumpPendingRevision(scopeKey);
 			this.touch(this.pending, scopeKey, pending);
 			this.enforceEntryLimit(config.maxEntries);
 			return this.recordAttempt(
@@ -631,6 +643,7 @@ export class CodexTurnStateCoordinator {
 		}
 		if (!pending.token || pending.arm !== "treatment") {
 			this.pending.delete(scopeKey);
+			this.bumpPendingRevision(scopeKey);
 			return this.recordAttempt(
 				input,
 				scopeKey,
@@ -692,12 +705,22 @@ export class CodexTurnStateCoordinator {
 		) {
 			return "stale_generation";
 		}
+		// The lease check alone cannot fence two attempts that both began while
+		// the scope held no pending turn: neither holds a lease, both are allowed
+		// to mutate, and whichever finishes second overwrites or retires a turn it
+		// never saw. The revision pins each attempt to the pending state that
+		// existed when it began.
+		if (generation.pendingRevision !== attempt.pendingRevision) {
+			return "stale_generation";
+		}
 		if (input.stopReason !== "tool_use") {
 			this.pending.delete(attempt.scopeKey);
+			this.bumpPendingRevision(attempt.scopeKey);
 			return "retired";
 		}
 		if (input.outputLineage.kind !== "valid") {
 			this.pending.delete(attempt.scopeKey);
+			this.bumpPendingRevision(attempt.scopeKey);
 			return "ambiguous_calls";
 		}
 
@@ -718,6 +741,7 @@ export class CodexTurnStateCoordinator {
 			existing.lineageKey = input.outputLineage.key;
 			existing.updatedAt = now;
 			delete existing.leaseRequestId;
+			this.bumpPendingRevision(attempt.scopeKey);
 			this.touch(this.pending, attempt.scopeKey, existing);
 			this.enforceEntryLimit(config.maxEntries);
 			return "advanced";
@@ -726,6 +750,7 @@ export class CodexTurnStateCoordinator {
 		const responseToken = validateTurnState(input.responseTurnState);
 		if (!responseToken) {
 			this.pending.delete(attempt.scopeKey);
+			this.bumpPendingRevision(attempt.scopeKey);
 			return "invalid_token";
 		}
 		const pending: PendingEntry = {
@@ -736,6 +761,7 @@ export class CodexTurnStateCoordinator {
 			...(attempt.arm === "treatment" ? { token: responseToken } : {}),
 			updatedAt: now,
 		};
+		this.bumpPendingRevision(attempt.scopeKey);
 		this.touch(this.pending, attempt.scopeKey, pending);
 		this.enforceEntryLimit(config.maxEntries);
 		return "captured";
@@ -789,11 +815,15 @@ export class CodexTurnStateCoordinator {
 		turnState?: string,
 		terminalMutationAllowed = true,
 	): CodexTurnStateRequestDecision {
-		const generation = this.generations.get(scopeKey)?.generation ?? null;
+		const generationEntry = this.generations.get(scopeKey);
 		if (input.attemptId && input.requestId) {
 			this.touch(this.attempts, input.attemptId, {
 				scopeKey,
-				generation,
+				generation: generationEntry?.generation ?? null,
+				// Read after every begin-time mutation, so an attempt that itself
+				// cleared the scope carries the resulting revision, not the one it
+				// replaced.
+				pendingRevision: generationEntry?.pendingRevision ?? null,
 				arm,
 				requestId: input.requestId,
 				replayApplied,
@@ -830,6 +860,7 @@ export class CodexTurnStateCoordinator {
 		const entry = {
 			generation: this.nextGeneration++,
 			arm,
+			pendingRevision: 0,
 			updatedAt: now,
 		};
 		this.touch(this.generations, scopeKey, entry);
@@ -857,16 +888,38 @@ export class CodexTurnStateCoordinator {
 		}
 	}
 
+	/**
+	 * Marks this scope's pending turn state as changed, fencing any attempt that
+	 * began before the change. Call it next to every create, mutate, or delete of
+	 * a `pending` entry that other in-flight attempts could still act on.
+	 * Acquiring a lease is not such a change: the leasing attempt is the one that
+	 * goes on to mutate, and the existing lease checks already fence the rest.
+	 */
+	private bumpPendingRevision(scopeKey: string): void {
+		const generation = this.generations.get(scopeKey);
+		if (generation) generation.pendingRevision += 1;
+	}
+
 	private sweep(now: number, config: CodexTurnStateConfig): void {
 		const cutoff = now - config.idleTtlMs;
-		for (const [key, entry] of this.pending) {
-			if (entry.updatedAt < cutoff) this.pending.delete(key);
+		// Attempts are in-flight requests, not idle state. A response that takes
+		// longer than the idle TTL to produce its terminal is still active, and
+		// dropping its context makes that terminal `unknown_attempt`, which can
+		// neither capture nor retire the turn it just finished. The combined entry
+		// cap and its LRU eviction keep the map bounded instead. For the same
+		// reason a scope with an attempt still in flight is not idle, so its turn
+		// and generation survive the sweep as well.
+		const activeScopes = new Set<string>();
+		for (const entry of this.attempts.values()) {
+			if (entry.scopeKey) activeScopes.add(entry.scopeKey);
 		}
-		for (const [key, entry] of this.attempts) {
-			if (entry.updatedAt < cutoff) this.attempts.delete(key);
+		for (const [key, entry] of this.pending) {
+			if (entry.updatedAt < cutoff && !activeScopes.has(key)) {
+				this.pending.delete(key);
+			}
 		}
 		for (const [key, entry] of this.generations) {
-			if (entry.updatedAt < cutoff) {
+			if (entry.updatedAt < cutoff && !activeScopes.has(key)) {
 				this.generations.delete(key);
 				this.pending.delete(key);
 			}

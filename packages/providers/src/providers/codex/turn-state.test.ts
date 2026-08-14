@@ -720,6 +720,118 @@ describe("CodexTurnStateCoordinator", () => {
 		).toMatchObject({ replayApplied: true, turnState: "turn-token-1" });
 	});
 
+	test("refuses a late finisher that would overwrite state captured while it was in flight", () => {
+		enableTreatment();
+		for (const lateStop of ["tool_use", "end_turn"] as const) {
+			const coordinator = new CodexTurnStateCoordinator();
+			// Two continuations of the same conversation arrive while the scope
+			// holds no pending turn -- its state was retired, evicted, or lost to a
+			// restart. Both share the live generation and both are legitimately
+			// allowed to capture at the moment they begin.
+			coordinator.beginAttempt(
+				beginInput({
+					requestId: "request-a",
+					attemptId: "attempt-a",
+					lineage: lineage("call-seed"),
+				}),
+			);
+			coordinator.beginAttempt(
+				beginInput({
+					requestId: "request-b",
+					attemptId: "attempt-b",
+					lineage: lineage("call-seed"),
+				}),
+			);
+
+			expect(
+				coordinator.finalizeAttempt({
+					attemptId: "attempt-a",
+					stopReason: "tool_use",
+					responseTurnState: "turn-token-a",
+					outputLineage: lineage("call-a"),
+				}),
+			).toBe("captured");
+
+			// The second finisher began before that capture existed. It must not
+			// replace the newer token or delete the turn it never saw.
+			expect(
+				coordinator.finalizeAttempt({
+					attemptId: "attempt-b",
+					stopReason: lateStop,
+					responseTurnState: "turn-token-b",
+					outputLineage:
+						lateStop === "tool_use" ? lineage("call-b") : { kind: "none" },
+				}),
+			).toBe("stale_generation");
+
+			expect(
+				coordinator.beginAttempt(
+					beginInput({
+						requestId: "request-c",
+						attemptId: "attempt-c",
+						lineage: lineage("call-a"),
+					}),
+				),
+			).toMatchObject({ replayApplied: true, turnState: "turn-token-a" });
+		}
+	});
+
+	test("does not evict a turn whose response is still streaming past the idle TTL", () => {
+		enableTreatment();
+		process.env[CODEX_TURN_STATE_IDLE_TTL_MS_ENV] = "60000";
+		let clock = 0;
+		const coordinator = new CodexTurnStateCoordinator({ now: () => clock });
+		coordinator.beginAttempt(beginInput());
+		expect(
+			coordinator.finalizeAttempt({
+				attemptId: "attempt-1",
+				stopReason: "tool_use",
+				responseTurnState: "turn-token-1",
+				outputLineage: lineage("call-1"),
+			}),
+		).toBe("captured");
+
+		// A long-running continuation begins, then takes longer than the idle TTL
+		// to produce its terminal. Unrelated traffic keeps sweeping in the
+		// meantime.
+		expect(
+			coordinator.beginAttempt(
+				beginInput({
+					requestId: "request-2",
+					attemptId: "attempt-2",
+					lineage: lineage("call-1"),
+				}),
+			),
+		).toMatchObject({ replayApplied: true, turnState: "turn-token-1" });
+
+		clock = 200_000;
+		coordinator.beginAttempt(
+			beginInput({
+				conversationIdentity: "conversation-unrelated",
+				requestId: "request-other",
+				attemptId: "attempt-other",
+			}),
+		);
+
+		expect(
+			coordinator.finalizeAttempt({
+				attemptId: "attempt-2",
+				stopReason: "tool_use",
+				responseTurnState: "ignored",
+				outputLineage: lineage("call-2"),
+			}),
+		).toBe("advanced");
+		expect(
+			coordinator.beginAttempt(
+				beginInput({
+					requestId: "request-3",
+					attemptId: "attempt-3",
+					lineage: lineage("call-2"),
+				}),
+			),
+		).toMatchObject({ replayApplied: true, turnState: "turn-token-1" });
+	});
+
 	test("keeps an active turn alive across the idle TTL boundary", () => {
 		enableTreatment();
 		process.env[CODEX_TURN_STATE_IDLE_TTL_MS_ENV] = "60000";

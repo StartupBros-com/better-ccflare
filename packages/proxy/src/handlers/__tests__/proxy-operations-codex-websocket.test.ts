@@ -580,6 +580,152 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 		expect(upstreamTurnStates).toEqual(["trusted-provider-turn-state"]);
 	});
 
+	it("stamps a same-account model fallback before its request is transformed", async () => {
+		installUsageCollector();
+		const provider = getProvider("codex");
+		if (!provider?.transformRequestBody) {
+			throw new Error("Codex provider transformation is unavailable");
+		}
+		// The Codex provider registers each attempt's turn-state context during the
+		// transform, reading the attempt identity the proxy stamped into these
+		// headers. Capture what every transform actually observes.
+		const transformedAttempts: Array<{
+			attemptId: string | null;
+			cause: string | null;
+		}> = [];
+		const originalTransformRequestBody = provider.transformRequestBody;
+		provider.transformRequestBody = async (request, account) => {
+			transformedAttempts.push({
+				attemptId: request.headers.get("x-better-ccflare-attempt-id"),
+				cause: request.headers.get("x-better-ccflare-attempt-cause"),
+			});
+			return originalTransformRequestBody.call(provider, request, account);
+		};
+
+		const upstreamModels: string[] = [];
+		globalThis.fetch = mock(async (request: Request) => {
+			const body = (await request.clone().json()) as { model?: string };
+			upstreamModels.push(body.model ?? "");
+			if (upstreamModels.length === 1) {
+				return new Response(
+					JSON.stringify({
+						error: {
+							code: "model_not_found",
+							message: "The model gpt-5.4 does not exist",
+						},
+					}),
+					{ status: 404, headers: { "content-type": "application/json" } },
+				);
+			}
+			return new Response(
+				[
+					'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_fallback","model":"gpt-5.4-codex"}}\n\n',
+					'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"fallback"}\n\n',
+					'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_fallback","model":"gpt-5.4-codex","status":"completed","usage":{"input_tokens":2,"output_tokens":1,"input_tokens_details":{"cached_tokens":0}}}}\n\n',
+					"data: [DONE]\n\n",
+				].join(""),
+				{ status: 200, headers: { "content-type": "text/event-stream" } },
+			);
+		});
+		spyOn(codexWebSocketTransport, "tryRequest").mockResolvedValue(null);
+
+		try {
+			const body = makeRequestBody();
+			await runProxy(
+				makeRequest(body),
+				body,
+				// Deliberately not `makePolicy`: that policy forwards a
+				// model-unavailable response instead of falling back in place, which
+				// is the path under test here.
+				{ routeCandidateId: "codex-model-fallback-route" },
+				"codex-model-fallback-attempt-stamp",
+				makeCodexAccount({
+					model_fallbacks: JSON.stringify({ sonnet: "gpt-5.4-codex" }),
+				}),
+			);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			if (!message.includes("UsageCollector not initialized")) throw error;
+		} finally {
+			provider.transformRequestBody = originalTransformRequestBody;
+		}
+
+		expect(upstreamModels).toEqual(["gpt-5.4", "gpt-5.4-codex"]);
+		expect(transformedAttempts).toHaveLength(2);
+		expect(transformedAttempts[0]?.cause).toBe("initial");
+		expect(transformedAttempts[0]?.attemptId).toBeTruthy();
+		// The fallback must reach the transform already stamped. Stamping it
+		// afterwards registered the attempt under an identity its response never
+		// carries, and hid the route change behind the default `initial` cause.
+		expect(transformedAttempts[1]?.cause).toBe("model_fallback");
+		expect(transformedAttempts[1]?.attemptId).toBeTruthy();
+		expect(transformedAttempts[1]?.attemptId).not.toBe(
+			transformedAttempts[0]?.attemptId,
+		);
+	});
+
+	it("classifies a Codex re-entry as failover only when the account changed", async () => {
+		installUsageCollector();
+		const provider = getProvider("codex");
+		if (!provider?.transformRequestBody) {
+			throw new Error("Codex provider transformation is unavailable");
+		}
+		const causes: Array<string | null> = [];
+		const originalTransformRequestBody = provider.transformRequestBody;
+		provider.transformRequestBody = async (request, account) => {
+			causes.push(request.headers.get("x-better-ccflare-attempt-cause"));
+			return originalTransformRequestBody.call(provider, request, account);
+		};
+		globalThis.fetch = mock(
+			async () =>
+				new Response(
+					[
+						'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_reentry","model":"gpt-5.4"}}\n\n',
+						'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"ok"}\n\n',
+						'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_reentry","model":"gpt-5.4","status":"completed","usage":{"input_tokens":2,"output_tokens":1,"input_tokens_details":{"cached_tokens":0}}}}\n\n',
+						"data: [DONE]\n\n",
+					].join(""),
+					{ status: 200, headers: { "content-type": "text/event-stream" } },
+				),
+		);
+		spyOn(codexWebSocketTransport, "tryRequest").mockResolvedValue(null);
+
+		const account = makeCodexAccount();
+		try {
+			// A second physical send on the same account: the bounded 401 retry after
+			// a credential refresh looks exactly like this. Its turn state is still
+			// valid, so it must not be classified as a route change.
+			const sameAccountBody = makeRequestBody();
+			await runProxy(
+				makeRequest(sameAccountBody),
+				sameAccountBody,
+				makePolicy(5_000),
+				"codex-reentry-same-account",
+				account,
+				{
+					codexTransportAttemptOrdinal: 1,
+					codexLastAttemptAccountId: account.id,
+				},
+			);
+			const otherAccountBody = makeRequestBody();
+			await runProxy(
+				makeRequest(otherAccountBody),
+				otherAccountBody,
+				makePolicy(5_000),
+				"codex-reentry-other-account",
+				account,
+				{
+					codexTransportAttemptOrdinal: 1,
+					codexLastAttemptAccountId: "codex-some-other-account",
+				},
+			);
+		} finally {
+			provider.transformRequestBody = originalTransformRequestBody;
+		}
+
+		expect(causes).toEqual(["other_retry", "account_failover"]);
+	});
+
 	it("claims before response.create and never rescues an ambiguous hosted write to HTTP", async () => {
 		installUsageCollector();
 		const ledger = new RoutingAttemptLedger();
