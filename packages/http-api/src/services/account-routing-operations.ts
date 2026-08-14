@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { validateModelMappings as validateCoreModelMappings } from "@better-ccflare/core";
 import type { ComboResolverDependencies } from "@better-ccflare/core/managed-routing";
 import {
 	proposeComboEnrollmentRules,
@@ -168,29 +169,9 @@ export async function readEffectiveRouting(
 
 function validateModelMappings(value: unknown): string | null {
 	if (value === undefined || value === null) return null;
-	if (typeof value !== "object" || Array.isArray(value)) {
-		throw BadRequest("model_mappings must be an object when provided");
-	}
-	const sanitized: Record<string, string | string[]> = {};
-	for (const [key, mapping] of Object.entries(value)) {
-		if (!key.trim()) throw BadRequest("model_mappings keys must be non-empty");
-		if (typeof mapping === "string" && mapping.trim()) {
-			sanitized[key] = mapping.trim();
-			continue;
-		}
-		if (
-			Array.isArray(mapping) &&
-			mapping.length > 0 &&
-			mapping.every((item) => typeof item === "string" && item.trim())
-		) {
-			sanitized[key] = mapping.map((item) => item.trim());
-			continue;
-		}
-		throw BadRequest(
-			"model_mappings values must be non-empty strings or arrays",
-		);
-	}
-	return JSON.stringify(sanitized);
+	return JSON.stringify(
+		validateCoreModelMappings(value, "draft.model_mappings"),
+	);
 }
 
 function draftToAccount(draft: ComboRoutingAccountDraft): Account {

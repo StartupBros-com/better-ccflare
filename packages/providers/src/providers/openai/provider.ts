@@ -16,6 +16,7 @@ import {
 import type { Account } from "@better-ccflare/types";
 import { BaseProvider } from "../../base";
 import type { RateLimitInfo, TokenRefreshResult } from "../../types";
+import { transferResponseDrainTransport } from "../../utils/stream-drain";
 
 const log = new Logger("OpenAICompatibleProvider");
 
@@ -164,15 +165,19 @@ export class OpenAICompatibleProvider extends BaseProvider {
 
 		// For streaming responses, we need to transform the SSE stream
 		if (contentType?.includes("text/event-stream")) {
-			return transformStreamingResponse(response);
+			const transformed = transformStreamingResponse(response);
+			transferResponseDrainTransport(response, transformed);
+			return transformed;
 		}
 
 		// For non-JSON responses, return as-is with sanitized headers
-		return new Response(response.body, {
+		const sanitized = new Response(response.body, {
 			status: response.status,
 			statusText: response.statusText,
 			headers: sanitizeHeaders(response.headers),
 		});
+		transferResponseDrainTransport(response, sanitized);
+		return sanitized;
 	}
 
 	/**

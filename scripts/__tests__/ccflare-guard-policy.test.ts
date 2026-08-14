@@ -349,6 +349,32 @@ describe("evaluateGuardRetry", () => {
 		});
 	});
 
+	test("never retries a physical-attempt budget terminal even if recovery-shaped metadata is present", () => {
+		const decision = evaluate({
+			headers: {
+				"x-better-ccflare-pool-status": "exhausted",
+				"x-better-ccflare-recovery-scope": "pool",
+				"retry-after": "5",
+			},
+			body: {
+				type: "error",
+				error: {
+					type: "pool_exhausted",
+					code: "physical_attempt_budget_exhausted",
+				},
+			},
+			allowLegacyBody: true,
+		});
+
+		expect(decision).toEqual({
+			retry: false,
+			reason: "physical_attempt_budget_exhausted",
+			delayMs: 0,
+			recoverySource: null,
+			recoveryScope: null,
+		});
+	});
+
 	// P1 spoofing (guard side): any upstream 503 body can be shaped like
 	// pool_exhausted, which would otherwise authorize up to maxAttempts
 	// replays of a possibly non-idempotent request. The legacy body-only

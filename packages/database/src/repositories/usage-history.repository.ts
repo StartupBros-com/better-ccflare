@@ -13,6 +13,13 @@ interface SnapshotDbRow {
 	resets_at: number | null;
 }
 
+interface FleetSnapshotDbRow extends SnapshotDbRow {
+	total_series_count: number;
+	total_account_count: number;
+	selected_series_count: number;
+	selected_account_count: number;
+}
+
 export interface GetSeriesOptions {
 	accountId: string;
 	windowKey?: string;
@@ -63,13 +70,6 @@ export interface FleetSeriesResult {
  * unbounded result set.
  */
 export const DEFAULT_FLEET_POINT_BUDGET = 20_000;
-
-type FleetSeries = {
-	accountId: string;
-	windowKey: string;
-	lastTs: number;
-	rows: UsageSnapshotRow[];
-};
 
 export class UsageHistoryRepository extends BaseRepository<UsageSnapshotRow> {
 	/**
@@ -201,143 +201,189 @@ export class UsageHistoryRepository extends BaseRepository<UsageSnapshotRow> {
 			};
 		}
 
-		const clauses = [`account_id IN (${accountIds.map(() => "?").join(", ")})`];
-		const whereParams: unknown[] = [...accountIds];
-		if (opts.windowKey) {
-			clauses.push("window_key = ?");
-			whereParams.push(opts.windowKey);
-		}
-		if (opts.since != null) {
-			clauses.push("timestamp >= ?");
-			whereParams.push(opts.since);
-		}
-		if (opts.until != null) {
-			clauses.push("timestamp <= ?");
-			whereParams.push(opts.until);
-		}
-
 		const bucketMs =
 			opts.bucketMs != null && opts.bucketMs > 0
 				? Math.round(opts.bucketMs)
 				: null;
-		// Same bucket-in-a-subquery shape as getSeries: integer division
-		// truncates identically on SQLite and Postgres, and grouping by the
-		// alias avoids PG treating the repeated `timestamp / ?` placeholders as
-		// distinct expressions. Bucket starts are grid-aligned, so different
-		// accounts land on shared timestamps and the chart can merge them.
-		const dbRows = bucketMs
-			? await this.query<SnapshotDbRow>(
-					`SELECT account_id, bucket * ? AS timestamp, window_key,
-					        AVG(utilization) AS utilization, MAX(resets_at) AS resets_at
-					 FROM (
-					   SELECT account_id, timestamp / ? AS bucket, window_key, utilization, resets_at
-					   FROM usage_snapshots
-					   WHERE ${clauses.join(" AND ")}
-					 ) bucketed
-					 GROUP BY account_id, window_key, bucket
-					 ORDER BY account_id ASC, window_key ASC, timestamp ASC`,
-					[bucketMs, bucketMs, ...whereParams],
-				)
-			: await this.query<SnapshotDbRow>(
-					`SELECT account_id, timestamp, window_key, utilization, resets_at
-					 FROM usage_snapshots
-					 WHERE ${clauses.join(" AND ")}
-					 ORDER BY account_id ASC, window_key ASC, timestamp ASC`,
-					whereParams,
-				);
-
-		// Group into (account, window) series. Ordering is re-established in JS
-		// below rather than trusted from the driver, so the budget picks the
-		// same series on every dialect and every run.
-		const seriesByKey = new Map<string, FleetSeries>();
-		for (const r of dbRows) {
-			const row: UsageSnapshotRow = {
-				accountId: r.account_id,
-				timestamp: Number(r.timestamp),
-				windowKey: r.window_key,
-				utilization: Number(r.utilization),
-				resetsAt: r.resets_at == null ? null : Number(r.resets_at),
-			};
-			const key = `${row.accountId} ${row.windowKey}`;
-			const existing = seriesByKey.get(key);
-			if (existing) {
-				existing.rows.push(row);
-				if (row.timestamp > existing.lastTs) existing.lastTs = row.timestamp;
-			} else {
-				seriesByKey.set(key, {
-					accountId: row.accountId,
-					windowKey: row.windowKey,
-					lastTs: row.timestamp,
-					rows: [row],
-				});
-			}
-		}
-
-		const series = [...seriesByKey.values()];
-		for (const s of series) s.rows.sort((a, b) => a.timestamp - b.timestamp);
-
-		// Rank: the explicitly requested window first (defensive — the WHERE
-		// clause already filters to it), then freshest series, then a stable
-		// name ordering so equal-recency series never reorder between runs.
-		const requested = opts.windowKey;
-		series.sort((a, b) => {
-			if (requested) {
-				const ar = a.windowKey === requested ? 0 : 1;
-				const br = b.windowKey === requested ? 0 : 1;
-				if (ar !== br) return ar - br;
-			}
-			if (a.lastTs !== b.lastTs) return b.lastTs - a.lastTs;
-			if (a.accountId !== b.accountId)
-				return a.accountId < b.accountId ? -1 : 1;
-			return a.windowKey < b.windowKey ? -1 : 1;
-		});
-
 		const budget =
 			opts.pointBudget != null && opts.pointBudget > 0
-				? Math.floor(opts.pointBudget)
+				? Number.isFinite(opts.pointBudget)
+					? Math.floor(opts.pointBudget)
+					: Number.MAX_SAFE_INTEGER
 				: DEFAULT_FLEET_POINT_BUDGET;
-		const included: FleetSeries[] = [];
-		let used = 0;
-		for (const s of series) {
-			// Always admit the top-ranked series even if it alone blows the
-			// budget: returning nothing would render as "the fleet has no data",
-			// which is worse than returning one oversized series.
-			//
-			// STOP at the first series that does not fit rather than skipping it.
-			// `series` is rank-ordered (requested window, then freshest, then a
-			// stable key), so continuing past a series that did not fit would admit
-			// smaller lower-ranked ones in its place — dropping higher-priority
-			// data to keep lower-priority data, and making the result depend on
-			// row counts rather than rank. Breaking keeps the included set a strict
-			// prefix of the ranking, which is what "limited to the newest N" claims.
-			if (included.length > 0 && used + s.rows.length > budget) break;
-			included.push(s);
-			used += s.rows.length;
+		const requestedWindow = opts.windowKey || null;
+		const accountIdsJson = JSON.stringify(accountIds);
+		const params: unknown[] = [accountIdsJson];
+		let nextParamIndex = 2;
+		const bindParam = (value: unknown): string => {
+			params.push(value);
+			return `?${nextParamIndex++}`;
+		};
+		const requestedAccountsSql = this.adapter.isSQLite
+			? "SELECT DISTINCT CAST(value AS TEXT) AS account_id FROM json_each(?1)"
+			: "SELECT DISTINCT account_id FROM jsonb_array_elements_text(CAST(?1 AS jsonb)) AS requested(account_id)";
+		// Pin text ordering to raw UTF-8 bytes. SQLite's default BINARY collation
+		// happens to provide that today, but PostgreSQL inherits the database's
+		// locale unless `C` is explicit; equal-recency series could therefore
+		// select different strict prefixes on the two adapters.
+		const bytewiseCollationSql = this.adapter.isSQLite
+			? "COLLATE BINARY"
+			: 'COLLATE "C"';
+		const filterClauses: string[] = [];
+		const requestedWindowPlaceholder = requestedWindow
+			? bindParam(requestedWindow)
+			: null;
+		if (requestedWindowPlaceholder) {
+			filterClauses.push(
+				`snapshots.window_key = CAST(${requestedWindowPlaceholder} AS TEXT)`,
+			);
 		}
+		if (opts.since != null) {
+			const sincePlaceholder = bindParam(opts.since);
+			filterClauses.push(
+				`snapshots.timestamp >= CAST(${sincePlaceholder} AS BIGINT)`,
+			);
+		}
+		if (opts.until != null) {
+			const untilPlaceholder = bindParam(opts.until);
+			filterClauses.push(
+				`snapshots.timestamp <= CAST(${untilPlaceholder} AS BIGINT)`,
+			);
+		}
+		const filteredWhere =
+			filterClauses.length > 0
+				? `WHERE ${filterClauses.join("\n\t\t\t\tAND ")}`
+				: "";
+		const bucketPlaceholder = bucketMs ? bindParam(bucketMs) : null;
+		const bucketExpression = bucketPlaceholder
+			? `snapshots.timestamp / CAST(${bucketPlaceholder} AS BIGINT)`
+			: null;
+		const seriesPointStats = bucketExpression
+			? `COUNT(DISTINCT ${bucketExpression}) AS point_count, MAX(${bucketExpression}) AS last_ts`
+			: "COUNT(*) AS point_count, MAX(snapshots.timestamp) AS last_ts";
+		const budgetPlaceholder = bindParam(budget);
+		const requestedWindowOrderSql = requestedWindowPlaceholder
+			? `CASE WHEN window_key = CAST(${requestedWindowPlaceholder} AS TEXT) THEN 0 ELSE 1 END ASC,`
+			: "";
+		const commonCtes = `WITH requested_accounts(account_id) AS (
+				${requestedAccountsSql}
+			),
+			series_stats AS (
+				SELECT snapshots.account_id, snapshots.window_key,
+				       ${seriesPointStats}
+				FROM usage_snapshots snapshots
+				JOIN requested_accounts requested
+				  ON requested.account_id = snapshots.account_id
+				${filteredWhere}
+				GROUP BY snapshots.account_id, snapshots.window_key
+			),
+			ordered_series AS (
+				SELECT account_id, window_key, point_count, last_ts,
+				       ROW_NUMBER() OVER (
+				         ORDER BY ${requestedWindowOrderSql}
+				                  last_ts DESC,
+				                  account_id ${bytewiseCollationSql} ASC,
+				                  window_key ${bytewiseCollationSql} ASC
+				       ) AS series_rank
+				FROM series_stats
+			),
+			running_series AS (
+				SELECT account_id, window_key, point_count, series_rank,
+				       SUM(point_count) OVER (
+				         ORDER BY series_rank
+				         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+				       ) AS cumulative_points
+				FROM ordered_series
+			),
+			selected_series AS (
+				SELECT account_id, window_key
+				FROM running_series
+				WHERE series_rank = 1
+				   OR cumulative_points <= CAST(${budgetPlaceholder} AS BIGINT)
+			),
+			fleet_summary AS (
+				SELECT
+				  (SELECT COUNT(*) FROM series_stats) AS total_series_count,
+				  (SELECT COUNT(DISTINCT account_id) FROM series_stats) AS total_account_count,
+				  (SELECT COUNT(*) FROM selected_series) AS selected_series_count,
+				  (SELECT COUNT(DISTINCT account_id) FROM selected_series) AS selected_account_count
+			)`;
 
-		const includedAccounts = new Set(included.map((s) => s.accountId));
-		const omittedAccountCount = [
-			...new Set(series.map((s) => s.accountId)),
-		].filter((id) => !includedAccounts.has(id)).length;
-
-		const rows = included
-			.slice()
-			.sort(
-				(a, b) =>
-					(a.accountId < b.accountId
-						? -1
-						: a.accountId > b.accountId
-							? 1
-							: 0) ||
-					(a.windowKey < b.windowKey ? -1 : a.windowKey > b.windowKey ? 1 : 0),
-			)
-			.flatMap((s) => s.rows);
+		// Selection happens before the final row-producing SELECT. The adapter
+		// therefore receives only the strict prefix admitted by the fleet point
+		// budget instead of materializing every candidate series and discarding
+		// the tail in JavaScript. A JSON array keeps the bind count constant as
+		// the requested fleet grows; positional placeholders safely reuse the
+		// same values in every CTE on both adapters.
+		const fleetSql = bucketMs
+			? `${commonCtes},
+				selected_bucket_rows AS (
+					SELECT snapshots.account_id,
+					       ${bucketExpression} AS bucket,
+					       snapshots.window_key,
+					       snapshots.utilization,
+					       snapshots.resets_at
+					FROM usage_snapshots snapshots
+					JOIN selected_series selected
+					  ON selected.account_id = snapshots.account_id
+					 AND selected.window_key = snapshots.window_key
+					${filteredWhere}
+				)
+				SELECT bucketed.account_id,
+				       bucketed.bucket * CAST(${bucketPlaceholder} AS BIGINT) AS timestamp,
+				       bucketed.window_key,
+				       AVG(bucketed.utilization) AS utilization,
+				       MAX(bucketed.resets_at) AS resets_at,
+				       summary.total_series_count,
+				       summary.total_account_count,
+				       summary.selected_series_count,
+				       summary.selected_account_count
+				FROM selected_bucket_rows bucketed
+				CROSS JOIN fleet_summary summary
+				GROUP BY bucketed.account_id, bucketed.window_key, bucketed.bucket,
+				         summary.total_series_count, summary.total_account_count,
+				         summary.selected_series_count, summary.selected_account_count
+				ORDER BY bucketed.account_id ${bytewiseCollationSql} ASC,
+				         bucketed.window_key ${bytewiseCollationSql} ASC,
+				         timestamp ASC`
+			: `${commonCtes}
+				SELECT snapshots.account_id,
+				       snapshots.timestamp,
+				       snapshots.window_key,
+				       snapshots.utilization,
+				       snapshots.resets_at,
+				       summary.total_series_count,
+				       summary.total_account_count,
+				       summary.selected_series_count,
+				       summary.selected_account_count
+				FROM usage_snapshots snapshots
+				JOIN selected_series selected
+				  ON selected.account_id = snapshots.account_id
+				 AND selected.window_key = snapshots.window_key
+				CROSS JOIN fleet_summary summary
+				${filteredWhere}
+				ORDER BY snapshots.account_id ${bytewiseCollationSql} ASC,
+				         snapshots.window_key ${bytewiseCollationSql} ASC,
+				         snapshots.timestamp ASC`;
+		const dbRows = await this.query<FleetSnapshotDbRow>(fleetSql, params);
+		const rows = dbRows.map((r) => ({
+			accountId: r.account_id,
+			timestamp: Number(r.timestamp),
+			windowKey: r.window_key,
+			utilization: Number(r.utilization),
+			resetsAt: r.resets_at == null ? null : Number(r.resets_at),
+		}));
+		const summary = dbRows[0];
+		const totalSeriesCount = Number(summary?.total_series_count ?? 0);
+		const selectedSeriesCount = Number(summary?.selected_series_count ?? 0);
+		const totalAccountCount = Number(summary?.total_account_count ?? 0);
+		const selectedAccountCount = Number(summary?.selected_account_count ?? 0);
 
 		return {
 			rows,
-			truncated: included.length < series.length,
-			omittedAccountCount,
-			omittedSeriesCount: series.length - included.length,
+			truncated: selectedSeriesCount < totalSeriesCount,
+			omittedAccountCount: totalAccountCount - selectedAccountCount,
+			omittedSeriesCount: totalSeriesCount - selectedSeriesCount,
 			returnedPointCount: rows.length,
 		};
 	}

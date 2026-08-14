@@ -1,5 +1,9 @@
 import { describe, expect, it } from "bun:test";
 import type { Account } from "@better-ccflare/types";
+import {
+	getResponseDrainTransport,
+	registerResponseDrainTransport,
+} from "../../../utils/stream-drain";
 import { OpenAICompatibleProvider } from "../provider";
 
 // ---------------------------------------------------------------------------
@@ -319,6 +323,18 @@ describe("processResponse – JSON (application/json)", () => {
 // ---------------------------------------------------------------------------
 
 describe("processResponse – SSE (text/event-stream)", () => {
+	it("transfers the exact drain transport to the transformed stream", async () => {
+		const provider = makeProvider();
+		const upstream = makeOpenAIStream(["[DONE]"]);
+		const transportAbort = new AbortController();
+		registerResponseDrainTransport(upstream, transportAbort);
+
+		const result = await provider.processResponse(upstream, makeAccount());
+
+		expect(getResponseDrainTransport(result)).toBe(transportAbort);
+		await result.text();
+	});
+
 	it("returns a Response with a non-null body stream", async () => {
 		const provider = makeProvider();
 		const upstream = makeOpenAIStream([
@@ -449,6 +465,20 @@ describe("processResponse – SSE (text/event-stream)", () => {
 // ---------------------------------------------------------------------------
 
 describe("processResponse – other content types (fallback)", () => {
+	it("transfers the exact drain transport to the same-body wrapper", async () => {
+		const provider = makeProvider();
+		const upstream = new Response("plain body text", {
+			headers: { "content-type": "text/plain" },
+		});
+		const transportAbort = new AbortController();
+		registerResponseDrainTransport(upstream, transportAbort);
+
+		const result = await provider.processResponse(upstream, makeAccount());
+
+		expect(getResponseDrainTransport(result)).toBe(transportAbort);
+		expect(await result.text()).toBe("plain body text");
+	});
+
 	it("text/plain response preserves body, status, and strips provider headers", async () => {
 		const provider = makeProvider();
 		const upstream = new Response("plain body text", {

@@ -193,14 +193,17 @@ async function fetchModelsFromBedrockWithRetry(
 	region: string,
 	credentials: ReturnType<typeof createBedrockCredentialChain>,
 	attempt: number = 0,
+	beforePhysicalTransport?: () => void,
 ): Promise<BedrockModel[]> {
 	const client = new BedrockClient({ region, credentials });
+	const command = new ListFoundationModelsCommand({
+		byProvider: "Anthropic",
+	});
 
+	// Keep the request-private transport veto outside the retry catch so it
+	// cannot be mistaken for an AWS discovery failure and retried.
+	beforePhysicalTransport?.();
 	try {
-		const command = new ListFoundationModelsCommand({
-			byProvider: "Anthropic",
-		});
-
 		const response = await client.send(command);
 
 		if (!response.modelSummaries || response.modelSummaries.length === 0) {
@@ -249,7 +252,12 @@ async function fetchModelsFromBedrockWithRetry(
 			);
 
 			await sleep(delayMs);
-			return fetchModelsFromBedrockWithRetry(region, credentials, attempt + 1);
+			return fetchModelsFromBedrockWithRetry(
+				region,
+				credentials,
+				attempt + 1,
+				beforePhysicalTransport,
+			);
 		}
 
 		log.error(
@@ -294,6 +302,7 @@ function evictOldestRegionIfNeeded(): void {
 async function getOrRefreshCache(
 	region: string,
 	credentials: ReturnType<typeof createBedrockCredentialChain>,
+	beforePhysicalTransport?: () => void,
 ): Promise<BedrockModel[]> {
 	const now = Date.now();
 	const lastRefreshTime = lastRefresh.get(region) || 0;
@@ -313,7 +322,12 @@ async function getOrRefreshCache(
 
 	// Cache is stale or doesn't exist, refresh it
 	log.info(`Refreshing model cache for region ${region}`);
-	const models = await fetchModelsFromBedrockWithRetry(region, credentials);
+	const models = await fetchModelsFromBedrockWithRetry(
+		region,
+		credentials,
+		0,
+		beforePhysicalTransport,
+	);
 
 	modelCache.set(region, models);
 	lastRefresh.set(region, now);
@@ -377,11 +391,13 @@ function levenshteinDistance(a: string, b: string): number {
  *
  * @param clientModelName - Client-provided model name (e.g., "claude-opus-4-6")
  * @param account - Bedrock account with region/credentials
+ * @param beforePhysicalTransport - Optional request-private gate invoked before each AWS send
  * @returns Bedrock model ID or null if no match found
  */
 export async function translateModelName(
 	clientModelName: string,
 	account: Account,
+	beforePhysicalTransport?: () => void,
 ): Promise<string | null> {
 	const config = parseBedrockConfig(account.custom_endpoint);
 
@@ -394,7 +410,11 @@ export async function translateModelName(
 
 	// Get or refresh model cache for this region
 	const credentials = createBedrockCredentialChain(account);
-	const models = await getOrRefreshCache(config.region, credentials);
+	const models = await getOrRefreshCache(
+		config.region,
+		credentials,
+		beforePhysicalTransport,
+	);
 
 	if (models.length === 0) {
 		log.warn(`No models available in cache for region ${config.region}`);

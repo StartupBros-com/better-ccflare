@@ -3,14 +3,23 @@ import {
 	getAllowedModelsMessage,
 	getConfiguredModelMapping,
 	getModelFamily,
+	getModelList,
+	getModelMappings,
 	isFamilyAliasModel,
 	isValidClaudeModel,
 	LATEST_MODEL_BY_FAMILY,
+	MAX_MODEL_MAPPING_CANDIDATES,
 	mapModelName,
+	parseCustomEndpointData,
 	parseModelMappings,
 	resolveFamilyAliasModel,
+	ValidationError,
 } from "@better-ccflare/core";
 import type { Account } from "@better-ccflare/types";
+import { validateModelMappings } from "./validation";
+
+const candidateModels = (count: number) =>
+	Array.from({ length: count }, (_, index) => `physical-model-${index + 1}`);
 
 describe("Model Mapping", () => {
 	test("distinguishes an explicit mapping from ordinary pass-through", () => {
@@ -60,6 +69,135 @@ describe("Model Mapping", () => {
 	test("parseModelMappings handles null/empty", () => {
 		expect(parseModelMappings(null)).toBeNull();
 		expect(parseModelMappings("")).toBeNull();
+	});
+
+	test("parseCustomEndpointData preserves its string-only public runtime contract", () => {
+		expect(
+			parseCustomEndpointData(
+				JSON.stringify({
+					endpoint: "https://example.invalid",
+					modelMappings: {
+						sonnet: ["physical-primary", "physical-fallback"],
+						opus: "physical-opus",
+					},
+				}),
+			),
+		).toEqual({
+			endpoint: "https://example.invalid",
+			modelMappings: {
+				sonnet: "physical-primary",
+				opus: "physical-opus",
+			},
+		});
+	});
+
+	test("validateModelMappings accepts exactly 16 candidates", () => {
+		expect(
+			validateModelMappings(
+				{ sonnet: candidateModels(MAX_MODEL_MAPPING_CANDIDATES) },
+				"modelMappings",
+			),
+		).toEqual({ sonnet: candidateModels(MAX_MODEL_MAPPING_CANDIDATES) });
+	});
+
+	test("validateModelMappings rejects a 17th candidate with field and key context", () => {
+		let error: unknown;
+		try {
+			validateModelMappings(
+				{ sonnet: candidateModels(MAX_MODEL_MAPPING_CANDIDATES + 1) },
+				"modelMappings",
+			);
+		} catch (caught) {
+			error = caught;
+		}
+
+		expect(error).toBeInstanceOf(ValidationError);
+		expect((error as ValidationError).field).toBe("modelMappings.sonnet");
+		expect((error as ValidationError).message).toBe(
+			`modelMappings value for key 'sonnet' must contain at most ${MAX_MODEL_MAPPING_CANDIDATES} candidates`,
+		);
+	});
+
+	test("parseModelMappings rejects persisted arrays above the candidate limit", () => {
+		expect(
+			parseModelMappings(JSON.stringify({ sonnet: candidateModels(17) })),
+		).toBeNull();
+	});
+
+	test("ignores oversized environment and legacy custom-endpoint mappings", () => {
+		const previous = process.env.OPENAI_COMPATIBLE_MODEL_MAPPINGS;
+		process.env.OPENAI_COMPATIBLE_MODEL_MAPPINGS = JSON.stringify({
+			sonnet: candidateModels(17),
+		});
+		try {
+			const account = {
+				id: "runtime-defense",
+				name: "runtime-defense",
+				model_mappings: null,
+				model_fallbacks: null,
+				custom_endpoint: JSON.stringify({
+					endpoint: "https://example.invalid",
+					modelMappings: { opus: candidateModels(17) },
+				}),
+			} as Account;
+
+			expect(getModelMappings(account)).toEqual({});
+			expect(getModelList("claude-sonnet-4-5", account)).toBeNull();
+		} finally {
+			if (previous === undefined) {
+				delete process.env.OPENAI_COMPATIBLE_MODEL_MAPPINGS;
+			} else {
+				process.env.OPENAI_COMPATIBLE_MODEL_MAPPINGS = previous;
+			}
+		}
+	});
+
+	test("retains bounded custom-endpoint candidates for internal routing", () => {
+		const account = {
+			id: "legacy-candidates",
+			name: "legacy-candidates",
+			model_mappings: null,
+			model_fallbacks: null,
+			custom_endpoint: JSON.stringify({
+				endpoint: "https://example.invalid",
+				modelMappings: {
+					sonnet: ["physical-primary", "physical-fallback"],
+				},
+			}),
+		} as Account;
+
+		expect(getModelList("claude-sonnet-4-5", account)).toEqual([
+			"physical-primary",
+			"physical-fallback",
+		]);
+	});
+
+	test("does not append deprecated model_fallbacks beyond the candidate limit", () => {
+		const account = {
+			id: "bounded-fallback",
+			name: "bounded-fallback",
+			model_mappings: JSON.stringify({ sonnet: candidateModels(16) }),
+			model_fallbacks: JSON.stringify({ sonnet: "overflow-fallback" }),
+			custom_endpoint: null,
+		} as Account;
+
+		expect(getModelList("claude-sonnet-4-5", account)).toEqual(
+			candidateModels(16),
+		);
+	});
+
+	test("ignores persisted model_fallbacks values that are arrays or non-strings", () => {
+		for (const invalidFallback of [["fallback"], 42]) {
+			const account = {
+				id: "invalid-fallback",
+				name: "invalid-fallback",
+				model_mappings: JSON.stringify({ sonnet: "primary" }),
+				model_fallbacks: JSON.stringify({ sonnet: invalidFallback }),
+				custom_endpoint: null,
+			} as Account;
+
+			expect(getModelList("claude-sonnet-4-5", account)).toEqual(["primary"]);
+		}
 	});
 
 	test("mapModelName uses direct pattern matching", () => {

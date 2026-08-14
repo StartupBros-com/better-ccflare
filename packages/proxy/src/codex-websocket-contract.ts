@@ -183,6 +183,11 @@ export interface CodexWebSocketAttemptInput {
 	request: Request;
 	signal: AbortSignal;
 	/**
+	 * Called immediately before a frame send attempt. Unlike onBeforeFrameWrite,
+	 * this local gate does not claim irreversibility when socket.send throws.
+	 */
+	onBeforeFrameSend?: () => void;
+	/**
 	 * Called synchronously exactly once immediately before response.create is
 	 * written. Throwing vetoes the write, releases the active lane, and is
 	 * propagated to the caller.

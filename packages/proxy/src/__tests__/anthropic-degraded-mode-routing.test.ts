@@ -8,9 +8,11 @@ import {
 	spyOn,
 } from "bun:test";
 import { ANTHROPIC_DEGRADED_MODE_DEFAULTS } from "@better-ccflare/config";
+import { logBus } from "@better-ccflare/logger";
 import type {
 	Account,
 	ComboWithSlots,
+	LogEvent,
 	RequestMeta,
 } from "@better-ccflare/types";
 import {
@@ -19,18 +21,40 @@ import {
 	classifyAnthropicReplayRisk,
 } from "../anthropic-degraded-mode";
 import { DegradedModeObservability } from "../anthropic-degraded-observability";
+import { cacheBodyStore } from "../cache-body-store";
+import {
+	CACHE_PACING_MS_ENV,
+	observeCachePacing,
+	resetCachePacing,
+} from "../cache-pacing";
 import { DegradedOwnerOverlay } from "../degraded-owner-overlay";
 import type { ProxyContext } from "../handlers/proxy-types";
-import { RoutingAttemptLedger } from "../handlers/routing-attempt-ledger";
+import {
+	MAX_REQUEST_PHYSICAL_ATTEMPTS,
+	PhysicalAttemptBudgetExceededError,
+	RoutingAttemptLedger,
+} from "../handlers/routing-attempt-ledger";
+import {
+	getServedAccount,
+	recordServedAccount,
+} from "../session-account-observer";
 
 // Loading proxy-operations in a focused test must not require ignored embedded
 // database worker artifacts from the packaged CLI build.
 const usageCollectorModule = await import("../usage-collector");
-spyOn(usageCollectorModule, "getUsageCollector").mockReturnValue({
+const defaultUsageCollector = {
 	handleStart: mock(() => undefined),
 	handleChunk: mock(() => undefined),
 	handleEnd: mock(async () => undefined),
-} as unknown as usageCollectorModule.UsageCollector);
+} as unknown as usageCollectorModule.UsageCollector;
+const usageCollectorSpy = spyOn(
+	usageCollectorModule,
+	"getUsageCollector",
+).mockReturnValue(defaultUsageCollector);
+const tryUsageCollectorSpy = spyOn(
+	usageCollectorModule,
+	"tryGetUsageCollector",
+).mockReturnValue(defaultUsageCollector);
 
 const { isAnthropicDegradedSendDenied, proxyWithAccount } = await import(
 	"../handlers/proxy-operations"
@@ -407,6 +431,122 @@ describe("Anthropic degraded-mode physical-send admission", () => {
 		expect(result.decision.action).toBe("suppress");
 		expect(result.retainedTrustedResponse?.status).toBe(529);
 		expect(await result.retainedTrustedResponse?.text()).toBe(OVERLOAD_BODY);
+	});
+
+	it("vetoes a 33rd in-place 529 retry before reserving degraded lifecycle ownership", async () => {
+		let now = 40_000;
+		const coordinator = new AnthropicDegradedModeCoordinator({
+			config: {
+				...ANTHROPIC_DEGRADED_MODE_DEFAULTS,
+				mode: "enforce",
+				retryMinMs: 1,
+				retryFallbackMs: 1,
+				retryMaxMs: 1,
+			},
+			now: () => {
+				const current = now;
+				now += 2_000;
+				return current;
+			},
+		});
+		const cohortKey = makeCohortKey();
+		coordinator.observeTrustedOverload({
+			cohortKey,
+			accountId: "earlier-evidence",
+			outcome: "http_529",
+			phase: "pre_commit",
+			forceRouted: false,
+		});
+
+		const body = makeLargeBody(coordinator);
+		const admission = coordinator.createRequestAdmission({
+			cohortKey,
+			risk: classifyAnthropicReplayRisk({
+				body,
+				config: coordinator.config,
+			}),
+			ownerAccountId: null,
+			forceRouted: false,
+		});
+		const reserveSpy = spyOn(admission, "reserve");
+		const ledger = new RoutingAttemptLedger();
+		for (let attempt = 1; attempt < MAX_REQUEST_PHYSICAL_ATTEMPTS; attempt++) {
+			ledger.recordPhysicalAttempt();
+		}
+
+		let releaseLockCalls = 0;
+		let resolveReleased!: () => void;
+		const released = new Promise<void>((resolve) => {
+			resolveReleased = resolve;
+		});
+		const overloadStream = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(new TextEncoder().encode(OVERLOAD_BODY));
+				controller.close();
+			},
+		});
+		const originalGetReader = overloadStream.getReader.bind(overloadStream);
+		Object.defineProperty(overloadStream, "getReader", {
+			configurable: true,
+			value: () => {
+				const reader = originalGetReader();
+				const originalReleaseLock = reader.releaseLock.bind(reader);
+				Object.defineProperty(reader, "releaseLock", {
+					configurable: true,
+					value: () => {
+						releaseLockCalls += 1;
+						originalReleaseLock();
+						resolveReleased();
+					},
+				});
+				return reader;
+			},
+		});
+		let overloadResponse: Response | null = null;
+		let fetchCount = 0;
+		globalThis.fetch = mock(async () => {
+			fetchCount += 1;
+			overloadResponse = new Response(overloadStream, {
+				status: 529,
+				headers: { "content-type": "application/json" },
+			});
+			return overloadResponse;
+		}) as unknown as typeof fetch;
+		const request = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body,
+		});
+
+		await expect(
+			proxyWithAccount(
+				request,
+				new URL(request.url),
+				makeAccount("budgeted-retry-account"),
+				makeRequestMeta(),
+				body.buffer,
+				() => undefined,
+				0,
+				makeContext(coordinator),
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				false,
+				undefined,
+				ledger,
+				undefined,
+				admission,
+			),
+		).rejects.toBeInstanceOf(PhysicalAttemptBudgetExceededError);
+		await released;
+
+		expect(fetchCount).toBe(1);
+		expect(overloadResponse?.bodyUsed).toBe(true);
+		expect(releaseLockCalls).toBe(1);
+		expect(reserveSpy).toHaveBeenCalledTimes(1);
+		expect(admission.hasClaimedProtectedSend).toBe(false);
+		expect(ledger.physicalAttemptCount).toBe(MAX_REQUEST_PHYSICAL_ATTEMPTS);
 	});
 
 	it("observes a semantic pre-commit overload before the next account can send", async () => {
@@ -941,6 +1081,7 @@ describe("Anthropic degraded-mode physical-send admission", () => {
 			headers: { "content-type": "application/json" },
 			body,
 		});
+		const ledger = new RoutingAttemptLedger();
 		const result = await proxyWithAccount(
 			request,
 			new URL(request.url),
@@ -961,7 +1102,7 @@ describe("Anthropic degraded-mode physical-send admission", () => {
 			undefined,
 			false,
 			undefined,
-			new RoutingAttemptLedger(),
+			ledger,
 			undefined,
 			coordinator.createRequestAdmission({
 				cohortKey,
@@ -973,8 +1114,172 @@ describe("Anthropic degraded-mode physical-send admission", () => {
 
 		expect(fetchCount).toBe(0);
 		expect(result).toBeInstanceOf(Response);
+		expect(ledger.physicalAttemptCount).toBe(0);
 		expect(coordinator.getCohortState(cohortKey).state).toBe("open");
 	});
+
+	it("terminalizes a real 32-to-33 account failover without logging the private lane", async () => {
+		const previousPacingMs = process.env[CACHE_PACING_MS_ENV];
+		process.env[CACHE_PACING_MS_ENV] = "1000";
+		resetCachePacing();
+		const sessionId = `physical-budget-sensitive-user/${"x".repeat(256)}`;
+		recordServedAccount(sessionId, "previous-serving-account", 0);
+		const terminalWarnings: LogEvent[] = [];
+		const collectTerminalWarning = (event: LogEvent) => {
+			if (
+				event.level === "WARN" &&
+				event.msg === "physical_attempt_budget_exhausted"
+			) {
+				terminalWarnings.push(event);
+			}
+		};
+		logBus.on("log", collectTerminalWarning);
+
+		const coordinator = new AnthropicDegradedModeCoordinator({
+			config: {
+				...ANTHROPIC_DEGRADED_MODE_DEFAULTS,
+				mode: "off",
+			},
+		});
+		const accounts = Array.from(
+			{ length: MAX_REQUEST_PHYSICAL_ATTEMPTS + 1 },
+			(_, index) =>
+				({
+					...makeAccount(`physical-budget-account-${index + 1}`),
+					provider: "physical-budget-test-provider",
+					api_key: "test-key",
+					refresh_token: "",
+					access_token: null,
+				}) as Account,
+		);
+		const ctx = makeRoutedContext(coordinator, accounts, {
+			select: async (candidates) => candidates,
+		});
+		const pauseAccountIfActive = mock(async () => true);
+		Object.assign(ctx.dbOps as object, { pauseAccountIfActive });
+		const reportCandidateFailure = (
+			ctx.strategy as unknown as {
+				reportCandidateFailure: ReturnType<typeof mock>;
+			}
+		).reportCandidateFailure;
+		const discardRetainedSpy = spyOn(
+			RoutingAttemptLedger.prototype,
+			"discardTerminalResponse",
+		);
+		const discardStagedSpy = spyOn(cacheBodyStore, "discardStaged");
+		const handleStart = mock(() => undefined);
+		const handleEnd = mock(async () => undefined);
+		usageCollectorSpy.mockReturnValue({
+			handleStart,
+			handleChunk: mock(() => undefined),
+			handleEnd,
+		} as unknown as usageCollectorModule.UsageCollector);
+		tryUsageCollectorSpy.mockReturnValue({
+			handleStart,
+			handleChunk: mock(() => undefined),
+			handleEnd,
+		} as unknown as usageCollectorModule.UsageCollector);
+
+		let fetchCount = 0;
+		globalThis.fetch = mock(async () => {
+			fetchCount += 1;
+			return new Response(
+				JSON.stringify({
+					type: "error",
+					error: {
+						type: "authentication_error",
+						message: "route rejected",
+					},
+				}),
+				{
+					status: 401,
+					headers: { "content-type": "application/json" },
+				},
+			);
+		}) as unknown as typeof fetch;
+		const request = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: {
+				"anthropic-version": "2023-06-01",
+				"content-type": "application/json",
+				"x-claude-code-session-id": sessionId,
+			},
+			body: JSON.stringify({
+				model: "claude-opus-4-6",
+				messages: [{ role: "user", content: "exercise the route queue" }],
+				metadata: { user_id: sessionId },
+				max_tokens: 16,
+			}),
+		});
+		let followUpPacing: Awaited<ReturnType<typeof observeCachePacing>> | null =
+			null;
+
+		try {
+			const response = await handleProxy(request, new URL(request.url), ctx);
+			await Promise.resolve();
+			await Promise.resolve();
+
+			expect(fetchCount).toBe(MAX_REQUEST_PHYSICAL_ATTEMPTS);
+			expect(response.status).toBe(503);
+			expect(response.headers.get("retry-after")).toBeNull();
+			expect(response.headers.get("x-better-ccflare-pool-status")).toBeNull();
+			expect(
+				response.headers.get("x-better-ccflare-recovery-scope"),
+			).toBeNull();
+			expect(response.headers.get("x-should-retry")).toBeNull();
+			expect(await response.json()).toEqual({
+				type: "error",
+				error: {
+					type: "service_unavailable",
+					code: "physical_attempt_budget_exhausted",
+					message:
+						"Request stopped after reaching the upstream transport safety limit.",
+					physical_attempts: MAX_REQUEST_PHYSICAL_ATTEMPTS,
+					physical_attempt_limit: MAX_REQUEST_PHYSICAL_ATTEMPTS,
+					attempted_routes: MAX_REQUEST_PHYSICAL_ATTEMPTS + 1,
+				},
+			});
+			expect(discardRetainedSpy).toHaveBeenCalled();
+			expect(discardStagedSpy).toHaveBeenCalledTimes(1);
+			expect(getServedAccount(sessionId)).toBeUndefined();
+			expect(handleStart).toHaveBeenCalledTimes(1);
+			expect(handleEnd).toHaveBeenCalledTimes(1);
+			expect(handleEnd.mock.calls[0]?.[0]).toMatchObject({
+				success: false,
+				error: "physical_attempt_budget_exhausted",
+			});
+			expect(pauseAccountIfActive).not.toHaveBeenCalled();
+			expect(ctx.dbOps.markAccountRateLimited).not.toHaveBeenCalled();
+			expect(reportCandidateFailure.mock.calls.length).toBeLessThanOrEqual(
+				fetchCount,
+			);
+			expect(terminalWarnings).toHaveLength(1);
+			expect(terminalWarnings[0]?.data).toMatchObject({
+				nextLanePresent: true,
+			});
+			expect(terminalWarnings[0]?.data).not.toHaveProperty("nextLaneKey");
+			expect(JSON.stringify(terminalWarnings)).not.toContain(sessionId);
+
+			followUpPacing = await observeCachePacing({
+				sessionKey: sessionId,
+				model: "claude-opus-4-6",
+			});
+			expect(followUpPacing?.role).toBe("leader");
+		} finally {
+			logBus.off("log", collectTerminalWarning);
+			followUpPacing?.slot?.abandon();
+			discardRetainedSpy.mockRestore();
+			discardStagedSpy.mockRestore();
+			usageCollectorSpy.mockReturnValue(defaultUsageCollector);
+			tryUsageCollectorSpy.mockReturnValue(defaultUsageCollector);
+			resetCachePacing();
+			if (previousPacingMs === undefined) {
+				delete process.env[CACHE_PACING_MS_ENV];
+			} else {
+				process.env[CACHE_PACING_MS_ENV] = previousPacingMs;
+			}
+		}
+	}, 10_000);
 
 	it("denies matching large empty-pool passthrough without claiming a probe or fetching", async () => {
 		const coordinator = new AnthropicDegradedModeCoordinator({

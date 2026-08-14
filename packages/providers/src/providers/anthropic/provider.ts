@@ -19,7 +19,11 @@ import type {
 	TokenRefreshResult,
 } from "../../types";
 import { transformRequestBodyModel } from "../../utils/model-mapping";
-import { drainReader } from "../../utils/stream-drain";
+import {
+	drainReader,
+	getResponseDrainTransport,
+	transferResponseDrainTransport,
+} from "../../utils/stream-drain";
 import { parseAnthropicRateLimitResetAt } from "./rate-limit-reset";
 
 // Hard rate limit statuses that should block account usage
@@ -463,6 +467,7 @@ export class AnthropicProvider extends BaseProvider {
 			tool_use: "tool_calls",
 		};
 
+		const transportAbort = getResponseDrainTransport(response);
 		const stream = new ReadableStream({
 			async start(controller) {
 				// lineBuffer carries incomplete lines across chunk boundaries
@@ -535,15 +540,17 @@ export class AnthropicProvider extends BaseProvider {
 			cancel() {
 				// reader.cancel() is a no-op on Bun and leaks the native buffer;
 				// drain to `done` instead — see drainReader() above (#382).
-				void drainReader(reader);
+				void drainReader(reader, { transportAbort });
 			},
 		});
 
-		return new Response(stream, {
+		const transformedResponse = new Response(stream, {
 			headers: response.headers,
 			status: response.status,
 			statusText: response.statusText,
 		});
+		transferResponseDrainTransport(response, transformedResponse);
+		return transformedResponse;
 	}
 
 	async processResponse(
@@ -559,6 +566,7 @@ export class AnthropicProvider extends BaseProvider {
 			statusText: response.statusText,
 			headers,
 		});
+		transferResponseDrainTransport(response, sanitizedResponse);
 
 		// Add OpenAI-compatible finish_reason alongside Anthropic's stop_reason
 		return this.transformStreamToOpenAIFormat(

@@ -40,7 +40,11 @@ const { ForceRouteUnavailableError, selectAccountsForRequest } = await import(
 );
 const { proxyWithAccount } = await import("../proxy-operations");
 const { createRoutingTerminalResponse } = await import("../routing-terminal");
-const { RoutingAttemptLedger } = await import("../routing-attempt-ledger");
+const {
+	MAX_REQUEST_PHYSICAL_ATTEMPTS,
+	PhysicalAttemptBudgetExceededError,
+	RoutingAttemptLedger,
+} = await import("../routing-attempt-ledger");
 const { bindRequestPrivateServerToolReplay } = await import(
 	"../../server-tool-replay-runtime"
 );
@@ -794,6 +798,131 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 		]);
 	});
 
+	it("counts a non-hosted WebSocket frame at its pre-write transport boundary", async () => {
+		installUsageCollector();
+		const ledger = new RoutingAttemptLedger();
+		const fetchMock = mock(
+			async () => new Response("unexpected HTTP fallback"),
+		);
+		globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
+		spyOn(codexWebSocketTransport, "tryRequest").mockImplementation(
+			async (input) => {
+				input.onBeforeFrameSend?.();
+				input.onBeforeFrameWrite?.();
+				const receipt = makeReceipt(() => undefined);
+				input.onFrameWritten?.(receipt);
+				return {
+					receipt,
+					response: new Response(
+						[
+							'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_ws_budget","model":"gpt-5.4"}}\n\n',
+							'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_ws_budget","model":"gpt-5.4","status":"completed","usage":{"input_tokens":1,"output_tokens":1,"input_tokens_details":{"cached_tokens":0}}}}\n\n',
+							"data: [DONE]\n\n",
+						].join(""),
+						{
+							status: 200,
+							headers: { "content-type": "text/event-stream" },
+						},
+					),
+				};
+			},
+		);
+
+		const body = makeRequestBody();
+		const response = await runProxy(
+			makeRequest(body),
+			body,
+			makePolicy(1_000),
+			"codex-ws-physical-boundary",
+			undefined,
+			undefined,
+			undefined,
+			ledger,
+		);
+
+		expect(response?.status).toBe(200);
+		expect(ledger.physicalAttemptCount).toBe(1);
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
+	it("keeps a hosted WebSocket undispatched when the physical budget vetoes pre-write", async () => {
+		installUsageCollector();
+		const ledger = new RoutingAttemptLedger();
+		for (let attempt = 0; attempt < MAX_REQUEST_PHYSICAL_ATTEMPTS; attempt++) {
+			ledger.recordPhysicalAttempt();
+		}
+		const proxyContext = makeProxyContext();
+		proxyContext.serverToolReplay = HOSTED_REPLAY_RUNTIME as never;
+		const fetchMock = mock(async () => new Response("unexpected HTTP rescue"));
+		globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
+		let frameWrites = 0;
+		const websocketAttempt = spyOn(
+			codexWebSocketTransport,
+			"tryRequest",
+		).mockImplementation(async (input) => {
+			input.onBeforeFrameSend?.();
+			input.onBeforeFrameWrite?.();
+			frameWrites++;
+			return null;
+		});
+
+		const body = makeHostedRequestBody();
+		const request = makeRequest(body, {
+			authorization: HOSTED_REPLAY_CREDENTIAL,
+			"x-claude-code-session-id": HOSTED_REPLAY_LINEAGE,
+		});
+		const requirements = deriveServerToolRequirement(
+			JSON.parse(new TextDecoder().decode(body)),
+		);
+		if (!requirements) throw new Error("expected hosted-search requirements");
+		const meta = makeRequestMeta("codex-ws-hosted-physical-budget", {
+			serverToolRequirements: requirements,
+		});
+		expect(
+			await bindRequestPrivateServerToolReplay(meta, HOSTED_REPLAY_RUNTIME, {
+				request,
+				apiKeyId: null,
+				audience: opaqueRuntimeId(
+					"model-route-caller",
+					HOSTED_REPLAY_CREDENTIAL,
+				),
+				lineage: HOSTED_REPLAY_LINEAGE,
+			}),
+		).toBe(true);
+
+		await expect(
+			proxyWithAccount(
+				request,
+				new URL(request.url),
+				makeCodexAccount({
+					model_mappings: JSON.stringify({ sonnet: "gpt-5.6-sol" }),
+				}),
+				meta,
+				body,
+				() => undefined,
+				0,
+				proxyContext,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				false,
+				undefined,
+				ledger,
+				{
+					...makePolicy(500),
+					recomputeServerToolCapability: true,
+				},
+			),
+		).rejects.toBeInstanceOf(PhysicalAttemptBudgetExceededError);
+
+		expect(websocketAttempt).toHaveBeenCalledTimes(1);
+		expect(frameWrites).toBe(0);
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(ledger.hostedDispatchState).toBe("undispatched");
+		expect(ledger.physicalAttemptCount).toBe(MAX_REQUEST_PHYSICAL_ATTEMPTS);
+	});
+
 	it("claims before response.create and never rescues an ambiguous hosted write to HTTP", async () => {
 		installUsageCollector();
 		const ledger = new RoutingAttemptLedger();
@@ -808,6 +937,7 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 			codexWebSocketTransport,
 			"tryRequest",
 		).mockImplementation(async (input) => {
+			input.onBeforeFrameSend?.();
 			input.onBeforeFrameWrite?.();
 			throw new Error("ambiguous response.create write");
 		});
@@ -868,6 +998,7 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 		expect(websocketAttempt).toHaveBeenCalledTimes(1);
 		expect(httpCalls).toBe(0);
 		expect(ledger.hostedDispatchState).toBe("hosted_dispatched");
+		expect(ledger.physicalAttemptCount).toBe(0);
 	});
 
 	it("passes a compaction-stable sibling-safe identity despite one shared session cache key", async () => {

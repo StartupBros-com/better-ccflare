@@ -19,15 +19,37 @@ function makeDb(): Database {
 function countingAdapter(db: Database): {
 	adapter: BunSqlAdapter;
 	queries: () => number;
+	observations: () => {
+		sql: string;
+		params: unknown[];
+		returnedRowCount: number;
+	}[];
 } {
 	const adapter = new BunSqlAdapter(db);
 	let count = 0;
+	const observations: {
+		sql: string;
+		params: unknown[];
+		returnedRowCount: number;
+	}[] = [];
 	const realQuery = adapter.query.bind(adapter);
 	adapter.query = (async <R>(sql: string, params?: unknown[]) => {
 		count++;
-		return realQuery<R>(sql, params);
+		const rows = await realQuery<R>(sql, params);
+		observations.push({
+			sql,
+			params: [...(params ?? [])],
+			returnedRowCount: rows.length,
+		});
+		return rows;
 	}) as typeof adapter.query;
-	return { adapter, queries: () => count };
+	return { adapter, queries: () => count, observations: () => observations };
+}
+
+function positionalSlots(sql: string): number[] {
+	return [
+		...new Set([...sql.matchAll(/\?(\d+)/g)].map((match) => Number(match[1]))),
+	].sort((a, b) => a - b);
 }
 
 async function seed(
@@ -97,6 +119,25 @@ describe("UsageHistoryRepository.getFleetUsageHistory", () => {
 		db.close();
 	});
 
+	it("keeps duplicate requested account ids as set membership", async () => {
+		const db = makeDb();
+		const { adapter, observations } = countingAdapter(db);
+		const repo = new UsageHistoryRepository(adapter);
+		await seed(repo, "acc1", "five_hour", [1000]);
+
+		const result = await repo.getFleetUsageHistory({
+			accountIds: ["acc1", "acc1"],
+		});
+
+		expect(result.rows.map((row) => row.accountId)).toEqual(["acc1"]);
+		expect(result.returnedPointCount).toBe(1);
+		expect(result.truncated).toBe(false);
+		expect(observations().at(-1)?.sql).toContain(
+			"SELECT DISTINCT CAST(value AS TEXT) AS account_id FROM json_each(?1)",
+		);
+		db.close();
+	});
+
 	it("returns an empty result without querying when no accounts are requested", async () => {
 		const db = makeDb();
 		const { adapter, queries } = countingAdapter(db);
@@ -111,6 +152,25 @@ describe("UsageHistoryRepository.getFleetUsageHistory", () => {
 		expect(result.rows).toEqual([]);
 		expect(result.truncated).toBe(false);
 		expect(result.returnedPointCount).toBe(0);
+		db.close();
+	});
+
+	it("returns zero summary counts when requested accounts have no history", async () => {
+		const db = makeDb();
+		const repo = new UsageHistoryRepository(new BunSqlAdapter(db));
+		await seed(repo, "other-account", "five_hour", [1000]);
+
+		const result = await repo.getFleetUsageHistory({
+			accountIds: ["missing-account"],
+		});
+
+		expect(result).toEqual({
+			rows: [],
+			truncated: false,
+			omittedAccountCount: 0,
+			omittedSeriesCount: 0,
+			returnedPointCount: 0,
+		});
 		db.close();
 	});
 
@@ -143,6 +203,40 @@ describe("UsageHistoryRepository.getFleetUsageHistory", () => {
 			until: 2500,
 		});
 		expect(result.rows.map((r) => r.timestamp)).toEqual([2000]);
+		db.close();
+	});
+
+	it("keeps window and time filters sargable on the composite index", async () => {
+		const db = makeDb();
+		const { adapter, observations } = countingAdapter(db);
+		const repo = new UsageHistoryRepository(adapter);
+		await seed(repo, "acc1", "five_hour", [1000, 2000, 3000]);
+
+		await repo.getFleetUsageHistory({
+			accountIds: ["acc1"],
+			windowKey: "five_hour",
+			since: 1500,
+			until: 2500,
+		});
+
+		const observation = observations().at(-1);
+		expect(observation?.params).toHaveLength(5);
+		expect(positionalSlots(observation?.sql ?? "")).toEqual([1, 2, 3, 4, 5]);
+		const plan = await adapter.query<{ detail: string }>(
+			`EXPLAIN QUERY PLAN ${observation?.sql ?? ""}`,
+			observation?.params ?? [],
+		);
+		const snapshotSearches = plan
+			.map((row) => row.detail)
+			.filter((detail) => detail.includes("idx_usage_snapshots_acct_win_time"));
+		expect(snapshotSearches.length).toBeGreaterThanOrEqual(2);
+		expect(
+			snapshotSearches.every((detail) =>
+				/\(account_id=\? AND window_key=\? AND timestamp>\? AND timestamp<\?\)/.test(
+					detail,
+				),
+			),
+		).toBe(true);
 		db.close();
 	});
 
@@ -192,9 +286,47 @@ describe("UsageHistoryRepository.getFleetUsageHistory", () => {
 		db.close();
 	});
 
+	it("uses an explicit bytewise tie-break for equal-recency series", async () => {
+		const db = makeDb();
+		const { adapter, observations } = countingAdapter(db);
+		const repo = new UsageHistoryRepository(adapter);
+		// UTF-8 byte order is uppercase ASCII, lowercase ASCII, then non-ASCII.
+		// Locale-backed PostgreSQL collations can order the accented id near "e"
+		// instead, selecting a different strict prefix unless both dialects pin
+		// their bytewise collation explicitly.
+		for (const accountId of ["acct-é", "acct-a", "acct-Z"]) {
+			await seed(repo, accountId, "five_hour", [5000]);
+		}
+
+		const result = await repo.getFleetUsageHistory({
+			accountIds: ["acct-é", "acct-a", "acct-Z"],
+			pointBudget: 2,
+		});
+
+		expect(result.rows.map((row) => row.accountId)).toEqual([
+			"acct-Z",
+			"acct-a",
+		]);
+		expect(result.truncated).toBe(true);
+		expect(result.omittedSeriesCount).toBe(1);
+		expect(result.omittedAccountCount).toBe(1);
+		expect(
+			observations()
+				.at(-1)
+				?.sql.match(/account_id COLLATE BINARY ASC/g),
+		).toHaveLength(2);
+		expect(
+			observations()
+				.at(-1)
+				?.sql.match(/window_key COLLATE BINARY ASC/g),
+		).toHaveLength(2);
+		db.close();
+	});
+
 	it("drops whole series past the point budget and reports the truncation", async () => {
 		const db = makeDb();
-		const repo = new UsageHistoryRepository(new BunSqlAdapter(db));
+		const { adapter, observations } = countingAdapter(db);
+		const repo = new UsageHistoryRepository(adapter);
 		// acc1 is newest (ts 5000) so it survives; acc2 (ts 1000) is dropped.
 		await seed(repo, "acc1", "five_hour", [4000, 5000]);
 		await seed(repo, "acc2", "five_hour", [500, 1000]);
@@ -209,12 +341,16 @@ describe("UsageHistoryRepository.getFleetUsageHistory", () => {
 		expect(result.omittedSeriesCount).toBe(1);
 		expect(result.omittedAccountCount).toBe(1);
 		expect(result.returnedPointCount).toBe(2);
+		// The point budget must bound rows at the adapter boundary, not after the
+		// repository has already materialized every omitted series in JavaScript.
+		expect(observations().at(-1)?.returnedRowCount).toBe(2);
 		db.close();
 	});
 
 	it("never keeps a lower-ranked series in place of one that did not fit", async () => {
 		const db = makeDb();
-		const repo = new UsageHistoryRepository(new BunSqlAdapter(db));
+		const { adapter, observations } = countingAdapter(db);
+		const repo = new UsageHistoryRepository(adapter);
 		// Rank is by recency: acc1 (9000) > acc2 (5200) > acc3 (1000).
 		await seed(repo, "acc1", "five_hour", [9000]);
 		await seed(repo, "acc2", "five_hour", [5000, 5100, 5200]);
@@ -233,23 +369,116 @@ describe("UsageHistoryRepository.getFleetUsageHistory", () => {
 		expect(result.truncated).toBe(true);
 		expect(result.omittedSeriesCount).toBe(2);
 		expect(result.omittedAccountCount).toBe(2);
+		expect(observations().at(-1)?.returnedRowCount).toBe(1);
 		db.close();
 	});
 
 	it("still returns the newest series when it alone exceeds the budget", async () => {
 		const db = makeDb();
-		const repo = new UsageHistoryRepository(new BunSqlAdapter(db));
+		const { adapter, observations } = countingAdapter(db);
+		const repo = new UsageHistoryRepository(adapter);
 		await seed(repo, "acc1", "five_hour", [1000, 2000, 3000]);
+		await seed(repo, "acc2", "five_hour", [500]);
 
 		const result = await repo.getFleetUsageHistory({
-			accountIds: ["acc1"],
+			accountIds: ["acc1", "acc2"],
 			pointBudget: 1,
 		});
 
 		// Returning zero series would render as "fleet has no data", which is a lie.
 		expect(result.rows).toHaveLength(3);
-		expect(result.truncated).toBe(false);
-		expect(result.omittedSeriesCount).toBe(0);
+		expect(result.rows.every((row) => row.accountId === "acc1")).toBe(true);
+		expect(result.truncated).toBe(true);
+		expect(result.omittedSeriesCount).toBe(1);
+		expect(result.omittedAccountCount).toBe(1);
+		expect(observations().at(-1)?.returnedRowCount).toBe(3);
+		db.close();
+	});
+
+	it("selects a strict prefix by bucket count before aggregating selected series", async () => {
+		const db = makeDb();
+		const { adapter, observations } = countingAdapter(db);
+		const repo = new UsageHistoryRepository(adapter);
+		// Bucketed rank/count: acc1 has 1 newest bucket, acc2 has 3 buckets and
+		// does not fit after acc1, while lower-ranked acc3 would fit. The result
+		// must stop at acc2 and materialize only acc1's selected aggregate row.
+		await seed(repo, "acc1", "five_hour", [9_100, 9_200], 10);
+		await seed(repo, "acc2", "five_hour", [5_100, 6_100, 7_100], 20);
+		await seed(repo, "acc3", "five_hour", [1_100], 30);
+
+		const result = await repo.getFleetUsageHistory({
+			accountIds: ["acc1", "acc2", "acc3"],
+			bucketMs: 1000,
+			pointBudget: 3,
+		});
+
+		expect(result.rows.map((row) => row.accountId)).toEqual(["acc1"]);
+		expect(result.rows[0]?.timestamp).toBe(9000);
+		expect(result.truncated).toBe(true);
+		expect(result.omittedSeriesCount).toBe(2);
+		expect(result.omittedAccountCount).toBe(2);
+		expect(result.returnedPointCount).toBe(1);
+		const observation = observations().at(-1);
+		expect(observation?.returnedRowCount).toBe(1);
+		expect(observation?.params).toHaveLength(3);
+		expect(positionalSlots(observation?.sql ?? "")).toEqual([1, 2, 3]);
+		expect(observation?.sql).not.toMatch(/\?(?!\d)/);
+		db.close();
+	});
+
+	it("keeps the top bucketed series whole when its bucket count exceeds the budget", async () => {
+		const db = makeDb();
+		const { adapter, observations } = countingAdapter(db);
+		const repo = new UsageHistoryRepository(adapter);
+		await seed(repo, "acc1", "five_hour", [7_100, 8_100, 9_100], 10);
+		await seed(repo, "acc2", "five_hour", [1_100], 20);
+
+		const result = await repo.getFleetUsageHistory({
+			accountIds: ["acc1", "acc2"],
+			bucketMs: 1000,
+			pointBudget: 1,
+		});
+
+		expect(result.rows.map((row) => row.timestamp)).toEqual([7000, 8000, 9000]);
+		expect(result.rows.every((row) => row.accountId === "acc1")).toBe(true);
+		expect(result.truncated).toBe(true);
+		expect(result.omittedSeriesCount).toBe(1);
+		expect(result.omittedAccountCount).toBe(1);
+		expect(result.returnedPointCount).toBe(3);
+		expect(observations().at(-1)?.returnedRowCount).toBe(3);
+		db.close();
+	});
+
+	it("uses a constant number of bind parameters for large account fleets", async () => {
+		const db = makeDb();
+		const { adapter, observations } = countingAdapter(db);
+		const repo = new UsageHistoryRepository(adapter);
+		const accountIds = Array.from(
+			{ length: 1500 },
+			(_, index) => `account-${index}`,
+		);
+		await seed(repo, accountIds.at(-1) ?? "", "five_hour", [1000]);
+		await repo.getFleetUsageHistory({
+			accountIds: [accountIds.at(-1) ?? ""],
+			pointBudget: 10,
+		});
+		const smallFleetParamCount = observations().at(-1)?.params.length;
+
+		const result = await repo.getFleetUsageHistory({
+			accountIds,
+			pointBudget: 10,
+		});
+
+		const observation = observations().at(-1);
+		expect(result.rows.map((row) => row.accountId)).toEqual([
+			accountIds.at(-1),
+		]);
+		expect(observation?.params.length).toBe(smallFleetParamCount);
+		expect(observation?.params.length).toBe(2);
+		expect(positionalSlots(observation?.sql ?? "")).toEqual([1, 2]);
+		expect(observation?.sql).toContain("json_each(?1)");
+		expect(observation?.sql).not.toMatch(/\?(?!\d)/);
+		expect(observation?.params[0]).toBe(JSON.stringify(accountIds));
 		db.close();
 	});
 

@@ -73,7 +73,11 @@ const {
 	isModelUnavailableError,
 	proxyWithAccount,
 } = await import("../proxy-operations");
-const { RoutingAttemptLedger } = await import("../routing-attempt-ledger");
+const {
+	MAX_REQUEST_PHYSICAL_ATTEMPTS,
+	PhysicalAttemptBudgetExceededError,
+	RoutingAttemptLedger,
+} = await import("../routing-attempt-ledger");
 const { bindRequestPrivateServerToolReplay } = await import(
 	"../../server-tool-replay-runtime"
 );
@@ -306,6 +310,10 @@ function makeAttemptPlanningProvider(
 		onPlan?: (context: ProviderAttemptPlanContext) => void;
 		onRefresh?: () => void;
 		onPlanHook?: (hook: string, plan: ProviderAttemptPlan) => void;
+		onLegacyTransform?: (
+			request: Request,
+			beforePhysicalTransport?: () => void,
+		) => Request | Promise<Request>;
 		throwDuringPlanning?: boolean;
 	} = {},
 ): Provider {
@@ -323,7 +331,14 @@ function makeAttemptPlanningProvider(
 		},
 		buildUrl: () => "https://legacy.invalid/v1/messages",
 		prepareHeaders: (headers: Headers) => new Headers(headers),
-		transformRequestBody: async (request: Request) => request,
+		transformRequestBody: async (
+			request: Request,
+			_account?: Account,
+			beforePhysicalTransport?: () => void,
+		) =>
+			options.onLegacyTransform
+				? options.onLegacyTransform(request, beforePhysicalTransport)
+				: request,
 		processResponse: async (response: Response) => response,
 		parseRateLimit: (response: Response) => ({
 			isRateLimited: response.status === 529,
@@ -744,6 +759,59 @@ describe("proxyWithAccount — immutable provider attempt plans", () => {
 				model: "fallback",
 			},
 		]);
+	});
+
+	it("discards the previous model-unavailable response when a transform-owned fallback hits the physical budget", async () => {
+		discardedResponses.length = 0;
+		const provider = makeAttemptPlanningProvider({
+			onLegacyTransform: async (request, beforePhysicalTransport) => {
+				const body = (await request.clone().json()) as { model?: string };
+				if (body.model === "fallback") beforePhysicalTransport?.();
+				return request;
+			},
+		});
+		globalThis.fetch = mock(async () =>
+			jsonResponse({ error: { message: "rate limited" } }, 429),
+		);
+		const ctx = makeProxyContext();
+		ctx.provider = provider;
+		const account = makeAccount({
+			provider: "attempt-plan-test",
+			model_mappings: JSON.stringify({
+				primary: ["primary", "fallback"],
+			}),
+		});
+		const ledger = new RoutingAttemptLedger();
+		for (let attempt = 1; attempt < MAX_REQUEST_PHYSICAL_ATTEMPTS; attempt++) {
+			ledger.recordPhysicalAttempt();
+		}
+		const bodyBuffer = makeRequestBody("primary");
+
+		await expect(
+			proxyWithAccount(
+				makeRequest(bodyBuffer),
+				new URL("https://proxy.local/v1/messages"),
+				account,
+				makeRequestMeta(),
+				bodyBuffer,
+				() => undefined,
+				0,
+				ctx,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				false,
+				undefined,
+				ledger,
+			),
+		).rejects.toBeInstanceOf(PhysicalAttemptBudgetExceededError);
+
+		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+		expect(discardedResponses.some((response) => response.status === 429)).toBe(
+			true,
+		);
+		expect(ledger.physicalAttemptCount).toBe(MAX_REQUEST_PHYSICAL_ATTEMPTS);
 	});
 
 	it("does not invoke a proof-only planner for ordinary fallback rematerialization", async () => {
@@ -3542,6 +3610,74 @@ describe("proxyWithAccount — 401 failover", () => {
 
 		expect(result).toBeNull();
 		expect(pauseAccountIfActive).not.toHaveBeenCalled();
+	});
+
+	it("vetoes a stale-token retry at attempt 33 without quarantining the account", async () => {
+		const provider = makeAttemptPlanningProvider();
+		const ctx = makeProxyContext();
+		ctx.provider = provider;
+		const pauseAccountIfActive = mock(async () => true);
+		const updateAccountTokensIfRefreshTokenMatches = mock(async () => true);
+		Object.assign(ctx.dbOps as object, {
+			getAccount: mock(async () => null),
+			pauseAccountIfActive,
+			updateAccountTokensIfRefreshTokenMatches,
+		});
+		const account = makeAccount({
+			id: "budgeted-stale-token-account",
+			provider: "claude-oauth",
+			api_key: null,
+			access_token: "stale-access-token",
+			expires_at: Date.now() + 60 * 60 * 1000,
+			refresh_token: "refresh-token",
+		});
+		const ledger = new RoutingAttemptLedger();
+		for (let attempt = 1; attempt < MAX_REQUEST_PHYSICAL_ATTEMPTS; attempt++) {
+			ledger.recordPhysicalAttempt();
+		}
+		globalThis.fetch = mock(async () =>
+			jsonResponse(
+				{
+					error: {
+						type: "authentication_error",
+						message: "stale access token",
+					},
+				},
+				401,
+			),
+		);
+		const bodyBuffer = makeRequestBody();
+
+		await expect(
+			proxyWithAccount(
+				makeRequest(bodyBuffer),
+				new URL("https://proxy.local/v1/messages"),
+				account,
+				makeRequestMeta(),
+				bodyBuffer,
+				() => undefined,
+				0,
+				ctx,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				false,
+				undefined,
+				ledger,
+			),
+		).rejects.toBeInstanceOf(PhysicalAttemptBudgetExceededError);
+
+		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+		expect(updateAccountTokensIfRefreshTokenMatches).toHaveBeenCalledTimes(1);
+		expect(account.access_token).toBe("refreshed-token");
+		expect(ledger.physicalAttemptCount).toBe(MAX_REQUEST_PHYSICAL_ATTEMPTS);
+		expect(ledger.hasAuthFailures).toBe(false);
+		expect(ledger.authFailureCount).toBe(0);
+		expect(pauseAccountIfActive).not.toHaveBeenCalled();
+		expect(ctx.dbOps.markAccountRateLimited).not.toHaveBeenCalled();
+		expect(account.paused).toBe(false);
+		expect(account.rate_limited_until).toBeNull();
 	});
 
 	it("does not failover on successful 200 response", async () => {

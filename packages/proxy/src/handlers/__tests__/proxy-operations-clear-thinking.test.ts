@@ -3,7 +3,11 @@ import type { Provider } from "@better-ccflare/providers";
 import type { Account, RequestMeta } from "@better-ccflare/types";
 import { CACHE_REPLAY_MODEL_HEADER } from "../../cache-transport-staging";
 import type { ProxyContext } from "../proxy-types";
-import { RoutingAttemptLedger } from "../routing-attempt-ledger";
+import {
+	MAX_REQUEST_PHYSICAL_ATTEMPTS,
+	PhysicalAttemptBudgetExceededError,
+	RoutingAttemptLedger,
+} from "../routing-attempt-ledger";
 
 // Records every response handed to cancelDiscardedResponseBody, so the
 // "keeps the edit pre-send when thinking is enabled, but retries stripped
@@ -432,6 +436,53 @@ describe("proxyWithAccount clear_thinking context-management handling", () => {
 			).cache_control,
 		).toBeUndefined();
 		expect(routingAttemptLedger.attemptedCount).toBe(1);
+	});
+
+	it("propagates physical-attempt exhaustion from the cache_control retry boundary", async () => {
+		const routingAttemptLedger = new RoutingAttemptLedger();
+		for (let attempt = 1; attempt < MAX_REQUEST_PHYSICAL_ATTEMPTS; attempt++) {
+			routingAttemptLedger.recordPhysicalAttempt();
+		}
+
+		await expect(
+			runProxyCapturingBodies(
+				{
+					model: "claude-cache-budget-test",
+					max_tokens: 100,
+					messages: [
+						{
+							role: "user",
+							content: [
+								{
+									type: "text",
+									text: "hello",
+									cache_control: { type: "ephemeral" },
+								},
+							],
+						},
+					],
+				},
+				[
+					jsonResponse(
+						{
+							error: {
+								message: "cache_control: Extra inputs are not permitted",
+							},
+						},
+						400,
+					),
+				],
+				makeAccount({ id: "acc-cache-budget-test" }),
+				makeProxyContext(),
+				true,
+				routingAttemptLedger,
+			),
+		).rejects.toBeInstanceOf(PhysicalAttemptBudgetExceededError);
+
+		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+		expect(routingAttemptLedger.physicalAttemptCount).toBe(
+			MAX_REQUEST_PHYSICAL_ATTEMPTS,
+		);
 	});
 
 	it("strips clear_thinking edits before the first send when thinking is explicitly disabled", async () => {

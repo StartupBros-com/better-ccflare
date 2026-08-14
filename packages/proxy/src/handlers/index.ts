@@ -48,7 +48,10 @@ export {
 } from "./request-handler";
 export { handleProxyError } from "./response-processor";
 export {
+	createPhysicalAttemptBudgetExceededResponse,
 	formatRoutingAttemptMessage,
+	MAX_REQUEST_PHYSICAL_ATTEMPTS,
+	PhysicalAttemptBudgetExceededError,
 	RoutingAttemptLedger,
 } from "./routing-attempt-ledger";
 export {

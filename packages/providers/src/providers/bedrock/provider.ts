@@ -801,6 +801,7 @@ export class BedrockProvider extends BaseProvider implements Provider {
 	async transformRequestBody(
 		request: Request,
 		account?: Account,
+		beforePhysicalTransport?: () => void,
 	): Promise<Request> {
 		// Step 1: Parse config
 		if (!account) {
@@ -844,7 +845,11 @@ export class BedrockProvider extends BaseProvider implements Provider {
 
 		// Step 5: If no custom model, translate client model name to Bedrock model ID using fuzzy matching
 		if (!bedrockModelId) {
-			bedrockModelId = await translateModelName(body.model, account);
+			bedrockModelId = await translateModelName(
+				body.model,
+				account,
+				beforePhysicalTransport,
+			);
 		}
 
 		if (!bedrockModelId) {
@@ -874,6 +879,7 @@ export class BedrockProvider extends BaseProvider implements Provider {
 				transformedModelId,
 				crossRegionMode,
 				account,
+				beforePhysicalTransport,
 			);
 
 			if (!supportsMode) {
@@ -881,6 +887,7 @@ export class BedrockProvider extends BaseProvider implements Provider {
 					transformedModelId,
 					crossRegionMode,
 					account,
+					beforePhysicalTransport,
 				);
 				if (fallback) {
 					log.warn(
@@ -920,15 +927,16 @@ export class BedrockProvider extends BaseProvider implements Provider {
 			credentials,
 		});
 
-		// Step 8: Call Bedrock API with appropriate command
-		try {
-			if (isStreaming) {
-				// Streaming request using ConverseStreamCommand
-				const command = new ConverseStreamCommand({
-					modelId: transformedModelId,
-					...converseInput,
-				} as ConverseStreamCommandInput);
-
+		// Step 8: Call Bedrock API with appropriate command. The request-private
+		// gate sits outside the error translation block so its control error remains
+		// intact and can stop every outer routing loop without mutating account state.
+		if (isStreaming) {
+			const command = new ConverseStreamCommand({
+				modelId: transformedModelId,
+				...converseInput,
+			} as ConverseStreamCommandInput);
+			beforePhysicalTransport?.();
+			try {
 				const response = await client.send(command);
 
 				const clientModelName = generateClientModelName(transformedModelId);
@@ -947,47 +955,46 @@ export class BedrockProvider extends BaseProvider implements Provider {
 					},
 					body: stream,
 				});
-			} else {
-				// Non-streaming request using ConverseCommand
-				const command = new ConverseCommand({
-					modelId: transformedModelId,
-					...converseInput,
-				} as ConverseCommandInput);
+			} catch (error) {
+				const err = error as { name?: string; message?: string };
+				if (
+					err.name === "ValidationException" &&
+					err.message?.includes("streaming")
+				) {
+					log.warn(
+						`Model ${finalModelId} does not support streaming, falling back to non-streaming`,
+					);
 
-				const response = await client.send(command);
+					const fallbackCommand = new ConverseCommand({
+						modelId: transformedModelId,
+						...transformMessagesRequest(body, transformedModelId),
+					} as ConverseCommandInput);
+					beforePhysicalTransport?.();
+					const fallbackResponse = await client.send(fallbackCommand);
 
-				return this.createSyntheticJsonRequest({
-					...response,
-					model: generateClientModelName(transformedModelId),
-				});
+					return this.createSyntheticJsonRequest({
+						...fallbackResponse,
+						model: generateClientModelName(transformedModelId),
+					});
+				}
+
+				const { message: translatedError } = await translateBedrockError(error);
+				throw new Error(translatedError);
 			}
+		}
+
+		const command = new ConverseCommand({
+			modelId: transformedModelId,
+			...converseInput,
+		} as ConverseCommandInput);
+		beforePhysicalTransport?.();
+		try {
+			const response = await client.send(command);
+			return this.createSyntheticJsonRequest({
+				...response,
+				model: generateClientModelName(transformedModelId),
+			});
 		} catch (error) {
-			// Streaming fallback logic
-			const err = error as { name?: string; message?: string };
-			if (
-				isStreaming &&
-				err.name === "ValidationException" &&
-				err.message?.includes("streaming")
-			) {
-				log.warn(
-					`Model ${finalModelId} does not support streaming, falling back to non-streaming`,
-				);
-
-				// Retry without streaming
-				const command = new ConverseCommand({
-					modelId: transformedModelId,
-					...transformMessagesRequest(body, transformedModelId),
-				} as ConverseCommandInput);
-
-				const response = await client.send(command);
-
-				return this.createSyntheticJsonRequest({
-					...response,
-					model: generateClientModelName(transformedModelId),
-				});
-			}
-
-			// Re-throw Bedrock errors with translation
 			const { message: translatedError } = await translateBedrockError(error);
 			throw new Error(translatedError);
 		}

@@ -59,6 +59,7 @@ type ValidatedProviderAttemptPlanContext = Readonly<{
 	capabilityProofKey: string | null;
 	inputReplayMode: readonly ServerToolReplayAtom[];
 	outputReplayMode: readonly ServerToolReplayAtom[];
+	beforePhysicalTransport?: () => void;
 	serverToolHistoryProjector?: ProviderServerToolHistoryProjector;
 	serverToolReplayIssuer?: ProviderServerToolReplayIssuer;
 }>;
@@ -585,6 +586,13 @@ function validateContext(
 		),
 		inputReplayMode: normalizeReplayMode(context.inputReplayMode),
 		outputReplayMode: normalizeReplayMode(context.outputReplayMode),
+		beforePhysicalTransport:
+			context.beforePhysicalTransport === undefined
+				? undefined
+				: requireFunction<() => void>(
+						context.beforePhysicalTransport,
+						"beforePhysicalTransport",
+					),
 		serverToolHistoryProjector: snapshotServerToolHistoryProjector(
 			context.serverToolHistoryProjector,
 		),
@@ -832,7 +840,11 @@ function materializeLegacyPlan(
 			Reflect.apply(prepareHeaders, provider, [headers, accessToken, apiKey]),
 		transformRequestBody: transformRequestBody
 			? (request) =>
-					Reflect.apply(transformRequestBody, provider, [request, accountView])
+					Reflect.apply(transformRequestBody, provider, [
+						request,
+						accountView,
+						context.beforePhysicalTransport,
+					])
 			: async (request) => request,
 		processResponse: (response, requestHeaders) =>
 			Reflect.apply(processResponse, provider, [

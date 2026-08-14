@@ -50,6 +50,7 @@ import type {
 	TokenRefreshResult,
 } from "../../types";
 import { CODEX_REASONING_RETENTION_PREFIX } from "../../utils/codex-reasoning-retention";
+import { transferResponseDrainTransport } from "../../utils/stream-drain";
 import {
 	CODEX_SINGLE_ORCHESTRATION_ROOT_ENV,
 	deriveConversationIdentity,
@@ -947,7 +948,9 @@ export class CodexProvider extends BaseProvider {
 			prepareHeaders: (headers, accessToken) =>
 				this.prepareHeaders(headers, accessToken),
 			transformOrdinaryRequest: (request) =>
-				this.transformRequestBody(request, context.account, { hosted: true }),
+				this.transformRequestBody(request, context.account, undefined, {
+					hosted: true,
+				}),
 			processHostedResponse: (
 				response,
 				_requestHeaders,
@@ -1251,9 +1254,20 @@ export class CodexProvider extends BaseProvider {
 		return newHeaders;
 	}
 
+	/**
+	 * @param _beforePhysicalTransport - Third positional slot in the `Provider`
+	 * contract, reserved for providers whose transform performs the physical send
+	 * itself (Bedrock). Codex only rewrites the body — the proxy owns its
+	 * transport — so the gate is accepted to keep the shared signature and
+	 * deliberately never invoked. Asserting the attempt budget here would charge a
+	 * send that has not happened yet.
+	 * @param options - Codex-private transform options; keep them after the
+	 * contract's own parameters so a future shared parameter does not collide.
+	 */
 	async transformRequestBody(
 		request: Request,
 		account?: Account,
+		_beforePhysicalTransport?: () => void,
 		options: CodexTransformOptions = {},
 	): Promise<Request> {
 		const trustedLogicalModelFamily = request.headers.has(
@@ -1551,6 +1565,7 @@ export class CodexProvider extends BaseProvider {
 				statusText: response.statusText,
 				headers,
 			});
+			transferResponseDrainTransport(response, sseResponse);
 			if (requestedStream) {
 				return this.transformStreamingResponse(
 					sseResponse,
@@ -1595,11 +1610,13 @@ export class CodexProvider extends BaseProvider {
 			),
 		});
 		const headers = sanitizeResponseHeaders(response.headers);
-		return new Response(response.body, {
+		const sanitized = new Response(response.body, {
 			status: response.status,
 			statusText: response.statusText,
 			headers,
 		});
+		transferResponseDrainTransport(response, sanitized);
+		return sanitized;
 	}
 
 	parseRateLimit(response: Response): RateLimitInfo {
@@ -3422,11 +3439,13 @@ export class CodexProvider extends BaseProvider {
 			log.error("Unhandled Codex SSE processing failure:", error);
 		});
 
-		return new Response(readable, {
+		const transformed = new Response(readable, {
 			status: response.status,
 			statusText: response.statusText,
 			headers,
 		});
+		transferResponseDrainTransport(response, transformed);
+		return transformed;
 	}
 
 	private normalizeCodexStreamError(

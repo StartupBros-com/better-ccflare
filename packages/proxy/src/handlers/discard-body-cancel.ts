@@ -1,3 +1,9 @@
+import {
+	type DrainReaderOptions,
+	drainReader,
+	getResponseDrainTransport,
+} from "@better-ccflare/providers/stream-drain";
+
 /**
  * Best-effort drain of a discarded response body to release off-heap backing
  * storage (issue #273 — Bun's fetch leaks native body per abandoned
@@ -44,13 +50,13 @@
  * and bodies whose stream has already errored (which the `try/catch`
  * around the read loop handles).
  *
- * The drain is fire-and-forget — we deliberately do NOT await. The
- * ReadableStream spec guarantees the source is released as soon as the
- * reader reaches `done`, even though the promise returned by the drain
- * helper may still be in-flight when the failover path returns `null`.
- * Awaiting the drain would block the failover on the network round-trip
- * that is already being abandoned; the whole point is to release the buffer
- * quickly and move on.
+ * The drain is fire-and-forget — we deliberately do NOT await. Awaiting it
+ * would block failover on the network round-trip that is already being
+ * abandoned. The shared drain helper still bounds its own lifetime; when a
+ * response came from `makeProxyRequest`, its deadline aborts the dedicated
+ * controller for that exact fetch. Same-body and sole-owner response wrappers
+ * explicitly transfer that ownership. Concurrent clone branches deliberately
+ * do not, because their sibling may still be streaming to the client.
  *
  * Lives in its own module so the regression test can import the helper
  * directly without pulling in the proxy-operations.ts transitive
@@ -61,12 +67,16 @@
  */
 export function cancelDiscardedResponseBody(
 	response: Response | null | undefined,
+	options: Omit<DrainReaderOptions, "transportAbort"> = {},
 ): void {
 	if (!response) return;
 	const body = response.body;
 	if (!body || body.locked) return;
 	// Fire and forget — see comment above for why we do not await.
-	void drainBody(body).catch(() => {});
+	void drainBody(body, {
+		...options,
+		transportAbort: getResponseDrainTransport(response),
+	}).catch(() => {});
 }
 
 /**
@@ -77,18 +87,7 @@ export function cancelDiscardedResponseBody(
  */
 export async function drainBody(
 	body: ReadableStream<Uint8Array>,
+	options: DrainReaderOptions = {},
 ): Promise<void> {
-	const reader = body.getReader();
-	try {
-		while (true) {
-			const { done } = await reader.read();
-			if (done) return;
-			// Drop the chunk on the floor — we just want the native
-			// source drained so the off-heap buffer is released. The
-			// chunk's underlying ArrayBuffer is released when the loop
-			// overwrites `value` on the next read.
-		}
-	} finally {
-		reader.releaseLock();
-	}
+	await drainReader(body.getReader(), options);
 }

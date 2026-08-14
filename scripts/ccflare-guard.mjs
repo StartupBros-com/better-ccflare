@@ -1890,6 +1890,7 @@ export function createGuard(options = {}) {
 				break;
 			case "recovery_wait_capacity_full":
 			case "recovery_delay_invalid":
+			case "physical_attempt_budget_exhausted":
 				break;
 			default:
 				throw new Error(`unknown recovery forward reason: ${reason}`);
@@ -2050,6 +2051,7 @@ export function createGuard(options = {}) {
 					let recoverySource = headerHint.recoverySource;
 					const recoveryScope = headerDecision.scope;
 					let inspection;
+					let completeBodyVetoReason = null;
 					const headerRemainingMs = context.remainingMs();
 					const headerAction = planRecoveryAction({
 						recoveryDelayMs: delayMs,
@@ -2114,8 +2116,15 @@ export function createGuard(options = {}) {
 									nowMs: now(),
 									allowLegacyBody: allowLegacyPoolBody,
 								});
-								delayMs = hint.delayMs;
-								recoverySource = hint.recoverySource;
+								if (
+									!hint.retry &&
+									hint.reason === "physical_attempt_budget_exhausted"
+								) {
+									completeBodyVetoReason = hint.reason;
+								} else {
+									delayMs = hint.delayMs;
+									recoverySource = hint.recoverySource;
+								}
 							}
 						} catch (error) {
 							// A genuine deadline/client abort must still propagate; the
@@ -2125,6 +2134,28 @@ export function createGuard(options = {}) {
 						} finally {
 							clearTimeout(peekTimer);
 						}
+					}
+
+					// Header recovery metadata normally remains authoritative. The one
+					// request-local physical-attempt terminal is different: once its exact
+					// code is proven by a complete bounded body, replay would violate the
+					// upstream-send ceiling. Forward the bytes already inspected unchanged.
+					if (completeBodyVetoReason !== null) {
+						await forwardRecoveryWithoutRetry(
+							res,
+							context,
+							attempt,
+							upstreamResponse,
+							{
+								buffer: inspection.buffer,
+								inspection,
+								recoveryDelayMs: 0,
+								recoverySource: null,
+								remainingMs: context.remainingMs(),
+								reason: completeBodyVetoReason,
+							},
+						);
+						return;
 					}
 
 					try {
