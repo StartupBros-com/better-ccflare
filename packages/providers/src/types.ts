@@ -267,6 +267,18 @@ export interface Provider {
 	abortTurnStateAttempt?(attemptId: string | null | undefined): void;
 
 	/**
+	 * Optional: release provider-local per-attempt state for an attempt that DID
+	 * reach the wire but produced no response — a socket, TLS, timeout, or abort
+	 * failure after dispatch. Such an attempt never reaches `processResponse`, so
+	 * nothing else finalizes it. Distinct from `abortTurnStateAttempt` because the
+	 * request really was sent: implementations must not annul its request record.
+	 * Must be idempotent and safe for an unknown attempt ID.
+	 */
+	releaseDispatchedTurnStateAttempt?(
+		attemptId: string | null | undefined,
+	): void;
+
+	/**
 	 * Optional: Pre-process the request before building URL
 	 * This allows providers to extract information from the request body
 	 * before buildUrl is called (e.g., for including model in URL path)

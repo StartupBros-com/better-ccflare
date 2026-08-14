@@ -737,6 +737,51 @@ describe("CodexProvider HTTP turn-state failure paths", () => {
 		expect(continuation.headers.get(turnStateHeader)).toBeNull();
 	});
 
+	it("fails closed when one parallel tool call never completes", async () => {
+		enableTreatment();
+		const provider = new CodexProvider();
+		const requestId = "request-partial-parallel";
+		const attemptId = "attempt-partial-parallel";
+		await provider.transformRequestBody(
+			requestFor(requestId, attemptId, [
+				{ role: "user", content: firstUserText },
+			]),
+			account,
+		);
+		const transformed = await provider.processResponse(
+			rawSseResponse(
+				requestId,
+				attemptId,
+				[
+					...callEvents("call-done", 0),
+					// Announced to the client, never completed upstream.
+					...callEvents("call-open", 1).slice(0, 3),
+					...eventLine("response.completed", {
+						type: "response.completed",
+						response: { model: physicalModel },
+					}),
+				],
+				"turn-token",
+			),
+			null,
+		);
+		await transformed.text();
+
+		// The client was handed both tool calls, so a lineage holding only the
+		// completed one describes a different turn than the one upstream produced.
+		// Capturing it would let a continuation carrying just that call replay a
+		// token minted for the other turn.
+		const continuation = await provider.transformRequestBody(
+			requestFor(
+				`${requestId}-continuation`,
+				`${attemptId}-continuation`,
+				continuationMessages("call-done"),
+			),
+			account,
+		);
+		expect(continuation.headers.get(turnStateHeader)).toBeNull();
+	});
+
 	it("suppresses replay when a Skill result appends a nudge after the tool output", async () => {
 		enableTreatment();
 		const provider = new CodexProvider();

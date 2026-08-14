@@ -2870,6 +2870,23 @@ function turnStateRowAccumulator(
 	};
 }
 
+/**
+ * Largest value in a list, or 0 for an empty one.
+ *
+ * Deliberately a loop rather than `Math.max(0, ...values)`: these lists carry
+ * one entry per distinct prompt key, so on a large corpus the spread turns every
+ * key into a call argument and the runtime throws `RangeError` once it exceeds
+ * its argument limit -- failing exactly on the big traces this analyzer exists
+ * to summarize.
+ */
+function maxOfCounts(values: readonly number[]): number {
+	let maximum = 0;
+	for (const value of values) {
+		if (value > maximum) maximum = value;
+	}
+	return maximum;
+}
+
 function maximumRequestsPerMinute(timestamps: readonly number[]): number {
 	const ordered = [...timestamps].sort((a, b) => a - b);
 	let left = 0;
@@ -2938,7 +2955,7 @@ function finishTurnStateRow(
 		),
 		promptKeyConcentration: {
 			distinctKeys: row.keyTimestamps.size,
-			maxRequestsPerKeyMinute: Math.max(0, ...concentrations),
+			maxRequestsPerKeyMinute: maxOfCounts(concentrations),
 			keysOver15RequestsPerMinute: concentrations.filter((count) => count > 15)
 				.length,
 		},
@@ -3109,7 +3126,7 @@ function analyzeTurnStateCacheExperiments(
 		assignmentCounts,
 		promptKeyConcentration: {
 			distinctKeys: reportKeyTimestamps.size,
-			maxRequestsPerKeyMinute: Math.max(0, ...reportConcentrations),
+			maxRequestsPerKeyMinute: maxOfCounts(reportConcentrations),
 			keysOver15RequestsPerMinute: reportConcentrations.filter(
 				(concentration) => concentration > 15,
 			).length,

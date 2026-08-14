@@ -620,6 +620,138 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 		expect(meta.codexLastAttemptModel).toBe("gpt-5.4");
 	});
 
+	it("releases a Codex attempt whose transport fails after dispatch", async () => {
+		installUsageCollector();
+		const provider = getProvider("codex") as
+			| (NonNullable<ReturnType<typeof getProvider>> & {
+					abortTurnStateAttempt(attemptId: string | null | undefined): void;
+					releaseDispatchedTurnStateAttempt(
+						attemptId: string | null | undefined,
+					): void;
+			  })
+			| undefined;
+		if (!provider) throw new Error("Codex provider is not registered");
+		const originalAbort = provider.abortTurnStateAttempt;
+		const originalRelease = provider.releaseDispatchedTurnStateAttempt;
+		const aborted: Array<string | null | undefined> = [];
+		const released: Array<string | null | undefined> = [];
+		provider.abortTurnStateAttempt = (attemptId) => {
+			aborted.push(attemptId);
+			originalAbort.call(provider, attemptId);
+		};
+		provider.releaseDispatchedTurnStateAttempt = (attemptId) => {
+			released.push(attemptId);
+			originalRelease?.call(provider, attemptId);
+		};
+		spyOn(codexWebSocketTransport, "tryRequest").mockResolvedValue(null);
+		globalThis.fetch = mock(async () => {
+			throw new Error("socket hang up");
+		}) as never;
+
+		try {
+			const body = makeRequestBody();
+			await runProxy(
+				makeRequest(body),
+				body,
+				makePolicy(5_000),
+				"codex-post-dispatch-failure",
+			).catch(() => undefined);
+		} finally {
+			provider.abortTurnStateAttempt = originalAbort;
+			provider.releaseDispatchedTurnStateAttempt = originalRelease;
+		}
+
+		// The send really happened, so no "never sent" tombstone may be written --
+		// but the attempt must still be released. Left registered it keeps its
+		// logical request's lease held, and every later turn on the scope is
+		// suppressed until the attempt TTL expires.
+		expect(aborted).toHaveLength(0);
+		expect(released).toHaveLength(1);
+		expect(released[0]).toMatch(
+			/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+		);
+	});
+
+	it("treats the first dispatched Codex send as initial after a pre-dispatch abort", async () => {
+		installUsageCollector();
+		spyOn(codexWebSocketTransport, "tryRequest").mockResolvedValue(null);
+		const provider = getProvider("codex");
+		if (!provider?.transformRequestBody) {
+			throw new Error("Codex provider transformation is unavailable");
+		}
+		// The cause never reaches the wire -- the transport sanitizer strips every
+		// x-better-ccflare-* header -- so observe it where it is actually consumed.
+		const causes: Array<string | null> = [];
+		const originalTransformRequestBody = provider.transformRequestBody;
+		provider.transformRequestBody = async (request, account) => {
+			causes.push(request.headers.get("x-better-ccflare-attempt-cause"));
+			return originalTransformRequestBody.call(provider, request, account);
+		};
+		globalThis.fetch = mock(async () => {
+			return new Response(
+				[
+					'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_initial","model":"gpt-5.4"}}\n\n',
+					'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_initial","model":"gpt-5.4","status":"completed","usage":{"input_tokens":2,"output_tokens":1,"input_tokens_details":{"cached_tokens":0}}}}\n\n',
+					"data: [DONE]\n\n",
+				].join(""),
+				{ status: 200, headers: { "content-type": "text/event-stream" } },
+			);
+		}) as never;
+
+		// One logical request, two route candidates sharing its metadata. The first
+		// is abandoned before dispatch; the second is the first send that actually
+		// happens, so it is this request's initial attempt, not a fallback from a
+		// route that never reached upstream.
+		const body = makeRequestBody();
+		const meta = makeRequestMeta("codex-initial-after-abort");
+		try {
+			const abandoned = await proxyWithAccount(
+				makeRequest(body),
+				new URL(makeRequest(body).url),
+				makeCodexAccount(),
+				meta,
+				body,
+				() => undefined,
+				0,
+				makeProxyContext(),
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				false,
+				undefined,
+				undefined,
+				makePolicy(0),
+			);
+			expect(abandoned).toBeNull();
+
+			await proxyWithAccount(
+				makeRequest(body),
+				new URL(makeRequest(body).url),
+				makeCodexAccount(),
+				meta,
+				body,
+				() => undefined,
+				0,
+				makeProxyContext(),
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				false,
+				undefined,
+				undefined,
+				makePolicy(5_000),
+			);
+		} finally {
+			provider.transformRequestBody = originalTransformRequestBody;
+		}
+
+		// The abandoned candidate incremented the attempt ordinal, which must not be
+		// mistaken for evidence that a route already went out.
+		expect(causes.at(-1)).toBe("initial");
+	});
+
 	it("keeps a provider-owned Codex turn-state replay on HTTP", async () => {
 		installUsageCollector();
 		const provider = getProvider("codex");

@@ -2805,19 +2805,27 @@ export async function proxyWithAccount(
 		let transportAttemptOrdinal = requestMeta.codexTransportAttemptOrdinal ?? 0;
 		let currentTransportAttemptId: string | null = null;
 		/**
-		 * The last-route stamp as it stood before the current attempt overwrote it.
+		 * The route this attempt will use, held until it is irreversibly dispatched.
 		 *
 		 * `stampCodexAttempt` runs while an attempt's body is transformed, well
-		 * before that attempt can reach the wire, so an attempt vetoed pre-dispatch
-		 * leaves the request pointing at a route that never sent. Captured here on
-		 * every stamp so the pre-dispatch guard can undo exactly the stamp it is
-		 * abandoning, rather than rolling back to this invocation's entry state and
-		 * discarding an earlier attempt that really did dispatch.
+		 * before that attempt can reach the wire, so publishing the route there
+		 * would leave the request pointing at a candidate that may never send. The
+		 * only consumer of the published value asks "what route did we last send
+		 * on?" -- to classify the next attempt as a retry, a fallback, or the
+		 * initial send -- so it is committed from the dispatch callback instead,
+		 * and an abandoned candidate simply never publishes anything to undo.
 		 */
-		let codexAttemptRouteRollback: {
-			accountId: string | null | undefined;
-			model: string | null | undefined;
+		let pendingCodexAttemptRoute: {
+			accountId: string;
+			model: string | null;
 		} | null = null;
+		const commitCodexDispatchedRoute = (): void => {
+			if (!pendingCodexAttemptRoute) return;
+			requestMeta.codexLastAttemptAccountId =
+				pendingCodexAttemptRoute.accountId;
+			requestMeta.codexLastAttemptModel = pendingCodexAttemptRoute.model;
+			pendingCodexAttemptRoute = null;
+		};
 		/** Physical models compare case-insensitively; unknown never matches. */
 		const normalizeCodexAttemptModel = (
 			model: string | null | undefined,
@@ -2839,18 +2847,18 @@ export async function proxyWithAccount(
 			finalModel?: string,
 		) => {
 			if (attemptPlan.providerName !== "codex") return;
-			codexAttemptRouteRollback = {
-				accountId: requestMeta.codexLastAttemptAccountId,
-				model: requestMeta.codexLastAttemptModel,
-			};
 			transportAttemptOrdinal++;
 			requestMeta.codexTransportAttemptOrdinal = transportAttemptOrdinal;
-			requestMeta.codexLastAttemptAccountId = account.id;
-			// `attemptPlan` still describes the attempt being superseded when a
-			// fallback stamps itself, so the explicit model wins where one is given.
-			requestMeta.codexLastAttemptModel = normalizeCodexAttemptModel(
-				finalModel ?? attemptPlan.physicalModel,
-			);
+			// Held rather than published; `commitCodexDispatchedRoute` publishes it
+			// once this attempt actually reaches the wire. `attemptPlan` still
+			// describes the attempt being superseded when a fallback stamps itself,
+			// so the explicit model wins where one is given.
+			pendingCodexAttemptRoute = {
+				accountId: account.id,
+				model: normalizeCodexAttemptModel(
+					finalModel ?? attemptPlan.physicalModel,
+				),
+			};
 			currentTransportAttemptId = crypto.randomUUID();
 			attemptHeaders.set(
 				"x-better-ccflare-attempt-id",
@@ -2957,7 +2965,13 @@ export async function proxyWithAccount(
 			previousAttemptModel === entryTransportModel;
 		stampCodexAttempt(
 			headers,
-			transportAttemptOrdinal === 0
+			// Keyed on whether a route was ever dispatched, not on the attempt
+			// ordinal. The ordinal counts candidates, including ones abandoned before
+			// the wire, so using it here stamped the first real send of a request as
+			// a failover from a route that never sent -- which then invalidated and
+			// suppressed turn state that was still eligible.
+			previousAttemptAccountId === undefined ||
+				previousAttemptAccountId === null
 				? "initial"
 				: sameAccountReentry && sameModelReentry
 					? "other_retry"
@@ -3350,23 +3364,26 @@ export async function proxyWithAccount(
 			try {
 				return await runCacheAwareProviderAttempt();
 			} catch (error) {
-				if (!dispatchStarted && attemptPlan.providerName === "codex") {
+				if (attemptPlan.providerName === "codex") {
 					try {
-						provider.abortTurnStateAttempt?.(currentTransportAttemptId);
+						if (dispatchStarted) {
+							// Sent, but no response came back, so nothing downstream will
+							// ever finalize this attempt. Release it without the "never
+							// sent" tombstone, which would wrongly annul a real send.
+							provider.releaseDispatchedTurnStateAttempt?.(
+								currentTransportAttemptId,
+							);
+						} else {
+							provider.abortTurnStateAttempt?.(currentTransportAttemptId);
+						}
 					} catch {
 						// Turn-state bookkeeping never replaces the transport failure.
 					}
-					// Rolled back separately from the abort above so a throw there
-					// cannot leave the stamp behind. The ordinal deliberately keeps
-					// counting: it identifies attempts rather than describing a route,
-					// and reusing a number would collide with the abandoned attempt's
-					// own records. Mirrors the duplicate-route-claim rollback below.
-					if (codexAttemptRouteRollback) {
-						requestMeta.codexLastAttemptAccountId =
-							codexAttemptRouteRollback.accountId;
-						requestMeta.codexLastAttemptModel = codexAttemptRouteRollback.model;
-						codexAttemptRouteRollback = null;
-					}
+					// Nothing to undo when it never dispatched: this attempt's route was
+					// only ever held pending, so dropping it stops a later attempt
+					// inheriting a route this one merely intended to use. After dispatch
+					// the route is already published and must stay.
+					if (!dispatchStarted) pendingCodexAttemptRoute = null;
 				}
 				throw error;
 			}
@@ -3545,9 +3562,9 @@ export async function proxyWithAccount(
 						: recordPhysicalDispatch,
 					() => {
 						dispatchStarted = true;
-						// This attempt's stamp now describes a route that really was
-						// sent, so it must survive any later pre-dispatch rollback.
-						codexAttemptRouteRollback = null;
+						// The irreversible boundary: only now is this attempt's route
+						// something a later attempt should compare itself against.
+						commitCodexDispatchedRoute();
 					},
 				);
 				observeTrustedHttpOverload(response, transportRequest, resolvedModel);
@@ -3653,12 +3670,12 @@ export async function proxyWithAccount(
 			// The body transform above already registered this attempt's turn-state
 			// context, and nothing will ever dispatch it or process its response.
 			// Without this release it would hold its lease and keep its scope alive,
-			// suppressing every matching continuation. Its stamped route is rolled
-			// back for the same reason: a route that never sent must not be what a
-			// later re-entry compares itself against.
+			// suppressing every matching continuation. Its route is dropped for the
+			// same reason: a route that never sent must not be what a later re-entry
+			// compares itself against. It was only ever held pending, so dropping it
+			// is enough -- there is nothing published to restore.
 			provider.abortTurnStateAttempt?.(currentTransportAttemptId);
-			requestMeta.codexLastAttemptAccountId = previousAttemptAccountId;
-			requestMeta.codexLastAttemptModel = previousAttemptModel;
+			pendingCodexAttemptRoute = null;
 			return null;
 		}
 		if (routingAttemptLedger) {

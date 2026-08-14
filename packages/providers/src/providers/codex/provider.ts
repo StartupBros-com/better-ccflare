@@ -799,6 +799,14 @@ function writeCodexStreamTerminalTrace(
 ): void {
 	if (state.terminalTraceWritten) return;
 	state.terminalTraceWritten = true;
+	// A buffer still open at the terminal is a call the client was handed but that
+	// never completed upstream. Its fingerprint is missing, so the lineage would
+	// be an exact-looking subset of the turn upstream actually produced, and a
+	// continuation carrying only the completed calls would replay a token minted
+	// for a different turn. Only an exactly paired added/done set may be captured.
+	if (state.functionCallBlocks.size > 0) {
+		state.turnStateOutputCallsInvalid = true;
+	}
 	const outputLineage =
 		stopReason === "tool_use" && !state.turnStateOutputCallsInvalid
 			? normalizeCodexTurnStateFingerprints(
@@ -929,6 +937,28 @@ export class CodexProvider extends BaseProvider {
 	abortTurnStateAttempt(attemptId: string | null | undefined): void {
 		const requestId = this.turnStateCoordinator.abortAttempt(attemptId);
 		writeCodexAbortedAttemptTrace({ attemptId, requestId });
+	}
+
+	/**
+	 * Releases an attempt that reached the wire but never produced a response --
+	 * a socket, TLS, timeout, or abort failure after dispatch.
+	 *
+	 * Such an attempt never reaches `processResponse`, so nothing else finalizes
+	 * it. Left registered it reads as live, which keeps its logical request's
+	 * lease held and suppresses every later turn on the scope until the attempt
+	 * TTL expires. Deliberately writes no `attempt_aborted` tombstone: that record
+	 * means "never sent", and this request was sent -- annulling it would erase a
+	 * real physical attempt from requests-per-key and fallback accounting.
+	 *
+	 * The pending turn is left intact on purpose. The send's effect upstream is
+	 * unknown, and the official contract's answer to that is precisely to replay
+	 * the same token on a compatible retry, so discarding it here would forfeit
+	 * the reuse this canary exists to measure.
+	 */
+	releaseDispatchedTurnStateAttempt(
+		attemptId: string | null | undefined,
+	): void {
+		this.turnStateCoordinator.abortAttempt(attemptId);
 	}
 
 	createServerToolCapabilityTuple(
@@ -3716,9 +3746,20 @@ export class CodexProvider extends BaseProvider {
 						content_block: { type: "tool_use", id: callId, name, input: {} },
 					});
 					state.hasSentContentBlockStart = true;
+					if (outputIndex === undefined) {
+						// Untracked: without an index this call can never be paired with
+						// its done event, so its fingerprint would be silently missing
+						// from the lineage.
+						state.turnStateOutputCallsInvalid = true;
+					}
 					if (outputIndex !== undefined) {
 						const callIdFingerprint = fingerprintCodexTurnStateCallId(callId);
 						if (!callIdFingerprint) {
+							state.turnStateOutputCallsInvalid = true;
+						}
+						if (state.functionCallBlocks.has(outputIndex)) {
+							// A reused index overwrites the buffer still open under it, so
+							// one of the two calls can never contribute its fingerprint.
 							state.turnStateOutputCallsInvalid = true;
 						}
 						state.functionCallBlocks.set(outputIndex, {
@@ -3832,6 +3873,12 @@ export class CodexProvider extends BaseProvider {
 						outputIndex !== undefined
 							? state.functionCallBlocks.get(outputIndex)
 							: undefined;
+					if (!buffer) {
+						// Completed without a matching added event, so this call's
+						// fingerprint was never collected and the lineage cannot be an
+						// exact record of the turn.
+						state.turnStateOutputCallsInvalid = true;
+					}
 					if (buffer) {
 						const partialJson = this.sanitizeToolUsePartialJson(
 							buffer.name,
