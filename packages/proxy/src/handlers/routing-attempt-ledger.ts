@@ -20,8 +20,48 @@ export type RetainedTerminalKind =
 	| "authoritative_context_overflow"
 	| "legacy_context_overflow";
 
+function retainedTerminalPriority(
+	kind: RetainedTerminalKind | undefined,
+): number {
+	switch (kind) {
+		case "authoritative_context_overflow":
+			return 2;
+		case "legacy_context_overflow":
+			return 1;
+		default:
+			return 0;
+	}
+}
+
 /** Durable account-level authentication outcomes observed in this request. */
 export type UpstreamAuthFailureReason = "oauth_invalid_grant" | "auth_failure";
+
+/**
+ * One request-local deterministic failure bound to a concrete provider
+ * capability. Official subscription accounts deliberately share a scope;
+ * arbitrary custom endpoints remain account-scoped because their bearer token
+ * can select a distinct deployment behind the same URL.
+ */
+export interface DeterministicFailureCapabilityKey {
+	readonly failureKind: "authoritative_context_overflow";
+	readonly provider: "codex";
+	readonly endpoint: string;
+	readonly capabilityScope: string;
+	readonly model?: string | null;
+}
+
+function deterministicFailureCapabilityKey(
+	input: DeterministicFailureCapabilityKey,
+): string {
+	return JSON.stringify([
+		"deterministic-failure-capability-v2",
+		input.failureKind,
+		input.provider,
+		input.endpoint.trim(),
+		input.capabilityScope.trim(),
+		normalizeConcreteModel(input.model),
+	]);
+}
 
 export interface RetainedTerminalResponse {
 	readonly terminalKind?: RetainedTerminalKind;
@@ -49,6 +89,7 @@ export class RoutingAttemptLedger {
 	private readonly retried = new Set<string>();
 	private readonly blockedAccounts = new Set<string>();
 	private readonly authFailures = new Map<string, UpstreamAuthFailureReason>();
+	private readonly deterministicFailures = new Set<string>();
 	private physicalAttempts = 0;
 	private degradedTracker: DegradedModeRequestTracker | null = null;
 	private guardAttemptOrdinal: number | undefined;
@@ -208,11 +249,37 @@ export class RoutingAttemptLedger {
 		this.blockedAccounts.add(accountId);
 	}
 
+	/** Record deterministic evidence without mutating account health or claims. */
+	recordDeterministicFailure(
+		capability: DeterministicFailureCapabilityKey,
+	): void {
+		this.deterministicFailures.add(
+			deterministicFailureCapabilityKey(capability),
+		);
+	}
+
+	/** Whether this request already proved the exact capability cannot succeed. */
+	hasDeterministicFailure(
+		capability: DeterministicFailureCapabilityKey,
+	): boolean {
+		return this.deterministicFailures.has(
+			deterministicFailureCapabilityKey(capability),
+		);
+	}
+
 	/** Replace the deferred terminal response, releasing prior ownership once. */
 	async retainTerminalResponse(
 		response: RetainedTerminalResponse,
 	): Promise<void> {
 		const previous = this.retainedTerminalResponse;
+		if (
+			previous &&
+			retainedTerminalPriority(previous.terminalKind) >
+				retainedTerminalPriority(response.terminalKind)
+		) {
+			await response.discard();
+			return;
+		}
 		this.retainedTerminalResponse = response;
 		if (previous) await previous.discard();
 	}

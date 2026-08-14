@@ -6,6 +6,17 @@ export const ANTHROPIC_PRECOMMIT_RESCUE_ERROR_FRAME =
 	'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"No compatible account route committed before the recovery deadline"}}\n\n';
 export const ANTHROPIC_PRECOMMIT_RESCUE_PARTIAL_ERROR_FRAME =
 	'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"Response failed after partial output"}}\n\n';
+export const ANTHROPIC_PRECOMMIT_RESCUE_CONTEXT_OVERFLOW_FRAME =
+	'event: error\ndata: {"type":"error","error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"Prompt is too long. Codex reported: Input exceeds the context window."}}\n\n';
+
+// Process-local object identity is the trust boundary for a delayed terminal.
+// Upstream headers or bodies cannot opt into this handoff; only the routing
+// layer that already classified an authoritative overflow may mark a Response.
+const authoritativeContextOverflowTerminals = new WeakSet<Response>();
+
+export function markAnthropicContextOverflowTerminal(response: Response): void {
+	authoritativeContextOverflowTerminals.add(response);
+}
 
 export const CLAUDE_CODE_PRECOMMIT_WATCHDOG_MS = 180_000;
 export const CLAUDE_CODE_SEMANTIC_WATCHDOG_HEADROOM_MS = 30_000;
@@ -60,7 +71,8 @@ export interface AnthropicPreCommitRescueActivation {
 export type AnthropicPreCommitRescueTerminalKind =
 	| "anthropic_rescue_commitment_deadline"
 	| "anthropic_rescue_routing_error"
-	| "anthropic_rescue_non_sse_response";
+	| "anthropic_rescue_non_sse_response"
+	| "context_length_exceeded";
 
 export interface AnthropicPreCommitRescueRequestLifecycle {
 	deferFinalization(): void;
@@ -71,6 +83,10 @@ export interface AnthropicPreCommitRescueRequestLifecycle {
 export interface AnthropicPreCommitRescueRouteContext {
 	readonly activate: () => void;
 	readonly signal: AbortSignal;
+	/** Whether the outer HTTP-200 rescue response already won commitment. */
+	isRescueCommitted(): boolean;
+	/** Marks the outer rescue as the response owner before it is exposed. */
+	markRescueCommitted(): void;
 	/** Absolute request-wide boundary measured from handleProxy entry. */
 	readonly commitmentDeadlineAt: number;
 	/** Reserve fallback capacity only for a route known not to be final. */
@@ -103,6 +119,8 @@ export interface AnthropicPreCommitRescueOptions {
 	commitmentDeadlineAt?: number;
 	/** Called only when the committed rescue itself translates a terminal. */
 	onRescueTerminal?: (kind: AnthropicPreCommitRescueTerminalKind) => void;
+	/** Called immediately before the outer HTTP-200 rescue response is exposed. */
+	onRescueCommitted?: () => void;
 	/** Called once when the native response is accepted rather than translated. */
 	onResponseAccepted?: () => void;
 }
@@ -222,6 +240,7 @@ export function createAnthropicPreCommitRescueRouteContext(options: {
 	let terminalReported = false;
 	let requestLifecycle: AnthropicPreCommitRescueRequestLifecycle | undefined;
 	let responseLifecycleReleased = false;
+	let rescueCommitted = false;
 	const deliverPendingTerminal = (): void => {
 		if (terminalReported || !terminalRecorder || !pendingTerminal) return;
 		terminalReported = true;
@@ -235,6 +254,12 @@ export function createAnthropicPreCommitRescueRouteContext(options: {
 	return {
 		activate: options.activate,
 		signal: options.signal,
+		isRescueCommitted() {
+			return rescueCommitted;
+		},
+		markRescueCommitted() {
+			rescueCommitted = true;
+		},
 		commitmentDeadlineAt,
 		getAttemptCommitmentDeadlineAt(isFinalAttempt) {
 			return isFinalAttempt
@@ -321,6 +346,14 @@ function reportResponseAcceptedSafely(callback?: () => void): void {
 	}
 }
 
+function reportRescueCommittedSafely(callback?: () => void): void {
+	try {
+		callback?.();
+	} catch {
+		// Response ownership cannot be corrupted by an observer failure.
+	}
+}
+
 function timer<T>(
 	value: T,
 	delayMs: number,
@@ -341,7 +374,14 @@ function timer<T>(
 	};
 }
 
-function isSuccessfulSse(response: Response): boolean {
+/**
+ * Whether a routed response can be spliced into an already-committed rescue.
+ * Keep this shared with outer route arbitration: a generic HTTP 200 cannot
+ * displace a truthful retained terminal once the client has been promised SSE.
+ */
+export function isSuccessfulAnthropicPreCommitRescueSse(
+	response: Response,
+): boolean {
 	return (
 		response.ok &&
 		response.body !== null &&
@@ -418,12 +458,21 @@ function createRescueResponse(
 		}
 		await cancelResponseBody(response, reason);
 	};
-	const cancelLateResponse = (reason: unknown): void => {
-		void outcomePromise.then((lateOutcome) => {
-			if (lateOutcome.kind === "response") {
-				void cancelResolvedResponseOnce(lateOutcome.response, reason);
-			}
-		});
+	const cancelLateResponse = async (reason: unknown): Promise<void> => {
+		const lateOutcome = await outcomePromise;
+		if (lateOutcome.kind === "response") {
+			await cancelResolvedResponseOnce(lateOutcome.response, reason);
+		}
+	};
+	const waitForCancellationCleanup = async (
+		cleanup: Promise<void>,
+	): Promise<void> => {
+		// Give an abort-responsive route enough time to expose and release its
+		// upstream body, but never let a provider that ignores abort (or a reader
+		// whose cancel promise stalls) block downstream cancellation indefinitely.
+		const cleanupGrace = timer(Symbol("rescue-cancel-cleanup-grace"), 25);
+		await Promise.race([cleanup, cleanupGrace.promise]);
+		cleanupGrace.cancel();
 	};
 	const reportRescueTerminal = (
 		kind: AnthropicPreCommitRescueTerminalKind,
@@ -502,9 +551,19 @@ function createRescueResponse(
 				closeWithSanitizedError();
 				return;
 			}
-			if (!isSuccessfulSse(result.response)) {
-				reportRescueTerminal("anthropic_rescue_non_sse_response");
-				closeWithSanitizedError();
+			if (!isSuccessfulAnthropicPreCommitRescueSse(result.response)) {
+				const authoritativeContextOverflow =
+					authoritativeContextOverflowTerminals.has(result.response);
+				reportRescueTerminal(
+					authoritativeContextOverflow
+						? "context_length_exceeded"
+						: "anthropic_rescue_non_sse_response",
+				);
+				closeWithSanitizedError(
+					authoritativeContextOverflow
+						? ANTHROPIC_PRECOMMIT_RESCUE_CONTEXT_OVERFLOW_FRAME
+						: ANTHROPIC_PRECOMMIT_RESCUE_ERROR_FRAME,
+				);
 				void cancelResolvedResponseOnce(
 					result.response,
 					"translated delayed non-SSE response",
@@ -543,18 +602,20 @@ function createRescueResponse(
 			}
 		},
 
-		cancel(reason) {
+		async cancel(reason) {
 			if (cancelled) return;
 			cancelled = true;
 			stopTimers();
 			abortOnce(reason);
 			if (settledResult && settledResult !== DEADLINE_ELAPSED) {
 				if (settledResult.kind === "response") {
-					void cancelResolvedResponseOnce(settledResult.response, reason);
+					await waitForCancellationCleanup(
+						cancelResolvedResponseOnce(settledResult.response, reason),
+					);
 				}
 				return;
 			}
-			cancelLateResponse(reason);
+			await waitForCancellationCleanup(cancelLateResponse(reason));
 		},
 	});
 
@@ -612,6 +673,7 @@ export async function coordinateAnthropicPreCommitRescue(
 	]);
 	if (afterActivation === DEADLINE_ELAPSED) {
 		grace.cancel();
+		reportRescueCommittedSafely(options.onRescueCommitted);
 		return createRescueResponse(
 			outcomePromise,
 			options.abortRouting,
@@ -631,6 +693,7 @@ export async function coordinateAnthropicPreCommitRescue(
 		return unwrapOutcome(afterActivation);
 	}
 
+	reportRescueCommittedSafely(options.onRescueCommitted);
 	return createRescueResponse(
 		outcomePromise,
 		options.abortRouting,

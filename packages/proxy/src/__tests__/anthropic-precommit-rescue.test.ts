@@ -6,6 +6,7 @@ import {
 	coordinateAnthropicPreCommitRescue,
 	createAnthropicPreCommitRescueActivation,
 	createAnthropicPreCommitRescueRouteContext,
+	markAnthropicContextOverflowTerminal,
 } from "../anthropic-precommit-rescue";
 
 const encoder = new TextEncoder();
@@ -168,6 +169,88 @@ describe("coordinateAnthropicPreCommitRescue", () => {
 		expect(body.match(/event: error/g)).toHaveLength(1);
 		expect(body).toEndWith(ANTHROPIC_PRECOMMIT_RESCUE_ERROR_FRAME);
 		expect(body).not.toContain("private");
+	});
+
+	it("hands off a marked delayed context overflow as one canonical SSE error", async () => {
+		const activation = createAnthropicPreCommitRescueActivation();
+		const eventual = deferred<Response>();
+		const onRescueTerminal = mock((_kind: string) => undefined);
+		activation.activate();
+		const responsePromise = coordinateAnthropicPreCommitRescue({
+			response: eventual.promise,
+			activation: activation.promise,
+			abortRouting: () => undefined,
+			config: {
+				activationGraceMs: 1,
+				pingIntervalMs: 5,
+				commitmentDeadlineMs: 100,
+			},
+			onRescueTerminal,
+		});
+		await delay(5);
+		const terminal = new Response(
+			JSON.stringify({
+				error: {
+					code: "context_length_exceeded",
+					message: "private upstream wording must not escape",
+				},
+			}),
+			{
+				status: 400,
+				headers: {
+					"content-type": "application/json",
+					"x-private-route": "must-not-escape",
+				},
+			},
+		);
+		markAnthropicContextOverflowTerminal(terminal);
+		eventual.resolve(terminal);
+
+		const response = await responsePromise;
+		const body = await response.text();
+		expect(response.headers.get("x-private-route")).toBeNull();
+		expect(body.match(/event: error/g)).toHaveLength(1);
+		expect(body).toContain('"code":"context_length_exceeded"');
+		expect(body).toContain("Input exceeds the context window");
+		expect(body).not.toContain("private upstream wording");
+		expect(onRescueTerminal).toHaveBeenCalledTimes(1);
+		expect(onRescueTerminal).toHaveBeenCalledWith("context_length_exceeded");
+	});
+
+	it("does not trust a delayed response header to claim context-overflow handoff", async () => {
+		const activation = createAnthropicPreCommitRescueActivation();
+		const eventual = deferred<Response>();
+		const onRescueTerminal = mock((_kind: string) => undefined);
+		activation.activate();
+		const responsePromise = coordinateAnthropicPreCommitRescue({
+			response: eventual.promise,
+			activation: activation.promise,
+			abortRouting: () => undefined,
+			config: {
+				activationGraceMs: 1,
+				pingIntervalMs: 5,
+				commitmentDeadlineMs: 100,
+			},
+			onRescueTerminal,
+		});
+		await delay(5);
+		eventual.resolve(
+			new Response('{"error":{"code":"context_length_exceeded"}}', {
+				status: 400,
+				headers: {
+					"content-type": "application/json",
+					"x-better-ccflare-context-overflow": "authoritative",
+				},
+			}),
+		);
+
+		const body = await (await responsePromise).text();
+		expect(body).toEndWith(ANTHROPIC_PRECOMMIT_RESCUE_ERROR_FRAME);
+		expect(body).not.toContain('"code":"context_length_exceeded"');
+		expect(onRescueTerminal).toHaveBeenCalledTimes(1);
+		expect(onRescueTerminal).toHaveBeenCalledWith(
+			"anthropic_rescue_non_sse_response",
+		);
 	});
 
 	it("closes promptly with one sanitized error when discarded-body cancellation never settles", async () => {
@@ -563,8 +646,16 @@ describe("coordinateAnthropicPreCommitRescue", () => {
 	it("ends a rescue at its bounded commitment deadline and aborts routing once", async () => {
 		const activation = createAnthropicPreCommitRescueActivation();
 		const eventual = deferred<Response>();
-		const abortRouting = mock((_reason?: unknown) => undefined);
-		const onRescueTerminal = mock((_kind: string) => undefined);
+		const events: string[] = [];
+		const abortRouting = mock((_reason?: unknown) => {
+			events.push("routing-aborted");
+		});
+		const onRescueCommitted = mock(() => {
+			events.push("rescue-committed");
+		});
+		const onRescueTerminal = mock((kind: string) => {
+			events.push(`terminal:${kind}`);
+		});
 		activation.activate();
 
 		const response = await coordinateAnthropicPreCommitRescue({
@@ -576,22 +667,35 @@ describe("coordinateAnthropicPreCommitRescue", () => {
 				pingIntervalMs: 5,
 				commitmentDeadlineMs: 20,
 			},
+			onRescueCommitted,
 			onRescueTerminal,
 		});
+		events.push("response-owned");
 		const body = await response.text();
 
 		expect(body).toEndWith(ANTHROPIC_PRECOMMIT_RESCUE_ERROR_FRAME);
+		expect(onRescueCommitted).toHaveBeenCalledTimes(1);
 		expect(abortRouting).toHaveBeenCalledTimes(1);
 		expect(onRescueTerminal).toHaveBeenCalledTimes(1);
 		expect(onRescueTerminal).toHaveBeenCalledWith(
 			"anthropic_rescue_commitment_deadline",
+		);
+		expect(events[0]).toBe("rescue-committed");
+		expect(events.indexOf("rescue-committed")).toBeLessThan(
+			events.indexOf("response-owned"),
 		);
 	});
 
 	it("cancels a response that resolves after the rescue deadline exactly once", async () => {
 		const activation = createAnthropicPreCommitRescueActivation();
 		const eventual = deferred<Response>();
-		const abortRouting = mock((_reason?: unknown) => undefined);
+		const events: string[] = [];
+		const abortRouting = mock((_reason?: unknown) => {
+			events.push("routing-aborted");
+		});
+		const onRescueCommitted = mock(() => {
+			events.push("rescue-committed");
+		});
 		let lateBodyCancelCount = 0;
 		activation.activate();
 
@@ -604,7 +708,9 @@ describe("coordinateAnthropicPreCommitRescue", () => {
 				pingIntervalMs: 5,
 				commitmentDeadlineMs: 20,
 			},
+			onRescueCommitted,
 		});
+		events.push("response-owned");
 		const body = await response.text();
 		expect(body.match(/event: error/g)).toHaveLength(1);
 
@@ -613,6 +719,7 @@ describe("coordinateAnthropicPreCommitRescue", () => {
 				new ReadableStream<Uint8Array>({
 					cancel() {
 						lateBodyCancelCount++;
+						events.push("late-response-cancelled");
 					},
 				}),
 				{
@@ -622,8 +729,16 @@ describe("coordinateAnthropicPreCommitRescue", () => {
 		);
 		await delay(5);
 
+		expect(onRescueCommitted).toHaveBeenCalledTimes(1);
 		expect(abortRouting).toHaveBeenCalledTimes(1);
 		expect(lateBodyCancelCount).toBe(1);
+		expect(events[0]).toBe("rescue-committed");
+		expect(events.indexOf("rescue-committed")).toBeLessThan(
+			events.indexOf("response-owned"),
+		);
+		expect(events.indexOf("rescue-committed")).toBeLessThan(
+			events.indexOf("late-response-cancelled"),
+		);
 	});
 
 	it("consumes a routing rejection that arrives after the rescue deadline", async () => {
