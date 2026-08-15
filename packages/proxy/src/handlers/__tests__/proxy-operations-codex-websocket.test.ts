@@ -527,6 +527,458 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 		expect(httpCalls).toBe(1);
 	});
 
+	it("aborts a Codex attempt when its commitment budget expires before dispatch", async () => {
+		installUsageCollector();
+		const provider = getProvider("codex") as
+			| (NonNullable<ReturnType<typeof getProvider>> & {
+					abortTurnStateAttempt(attemptId: string | null | undefined): void;
+			  })
+			| undefined;
+		if (!provider) throw new Error("Codex provider is not registered");
+		const originalAbortAttempt = provider.abortTurnStateAttempt;
+		const abortedAttemptIds: Array<string | null | undefined> = [];
+		provider.abortTurnStateAttempt = (attemptId) => {
+			abortedAttemptIds.push(attemptId);
+			originalAbortAttempt.call(provider, attemptId);
+		};
+		const websocketAttempt = spyOn(
+			codexWebSocketTransport,
+			"tryRequest",
+		).mockResolvedValue(null);
+		const httpAttempt = mock(async () =>
+			Promise.resolve(new Response("must not dispatch", { status: 500 })),
+		);
+		globalThis.fetch = httpAttempt as never;
+
+		try {
+			const body = makeRequestBody();
+			const response = await runProxy(
+				makeRequest(body),
+				body,
+				makePolicy(0),
+				"codex-zero-commitment-budget",
+			);
+			expect(response).toBeNull();
+		} finally {
+			provider.abortTurnStateAttempt = originalAbortAttempt;
+		}
+
+		expect(websocketAttempt).not.toHaveBeenCalled();
+		expect(httpAttempt).not.toHaveBeenCalled();
+		expect(abortedAttemptIds).toHaveLength(1);
+		expect(abortedAttemptIds[0]).toMatch(
+			/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+		);
+	});
+
+	it("restores the previous Codex route stamp when an attempt is abandoned pre-dispatch", async () => {
+		installUsageCollector();
+		const websocketAttempt = spyOn(
+			codexWebSocketTransport,
+			"tryRequest",
+		).mockResolvedValue(null);
+		const httpAttempt = mock(async () =>
+			Promise.resolve(new Response("must not dispatch", { status: 500 })),
+		);
+		globalThis.fetch = httpAttempt as never;
+
+		const body = makeRequestBody();
+		const request = makeRequest(body);
+		const meta = makeRequestMeta("codex-stamp-rollback", {
+			codexTransportAttemptOrdinal: 1,
+			codexLastAttemptAccountId: "codex-previous-account",
+			codexLastAttemptModel: "gpt-5.4",
+		});
+
+		const response = await proxyWithAccount(
+			request,
+			new URL(request.url),
+			makeCodexAccount(),
+			meta,
+			body,
+			() => undefined,
+			0,
+			makeProxyContext(),
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			false,
+			undefined,
+			undefined,
+			makePolicy(0),
+		);
+
+		expect(response).toBeNull();
+		expect(websocketAttempt).not.toHaveBeenCalled();
+		expect(httpAttempt).not.toHaveBeenCalled();
+		// The attempt stamped itself as the request's last route before its body was
+		// transformed, then died before dispatch. Left stamped, the first attempt
+		// that actually reaches the wire compares itself against a route that never
+		// sent and reads as an account or model fallback.
+		expect(meta.codexLastAttemptAccountId).toBe("codex-previous-account");
+		expect(meta.codexLastAttemptModel).toBe("gpt-5.4");
+	});
+
+	it("releases a Codex attempt whose transport fails after dispatch", async () => {
+		installUsageCollector();
+		const provider = getProvider("codex") as
+			| (NonNullable<ReturnType<typeof getProvider>> & {
+					abortTurnStateAttempt(attemptId: string | null | undefined): void;
+					releaseDispatchedTurnStateAttempt(
+						attemptId: string | null | undefined,
+					): void;
+			  })
+			| undefined;
+		if (!provider) throw new Error("Codex provider is not registered");
+		const originalAbort = provider.abortTurnStateAttempt;
+		const originalRelease = provider.releaseDispatchedTurnStateAttempt;
+		const aborted: Array<string | null | undefined> = [];
+		const released: Array<string | null | undefined> = [];
+		provider.abortTurnStateAttempt = (attemptId) => {
+			aborted.push(attemptId);
+			originalAbort.call(provider, attemptId);
+		};
+		provider.releaseDispatchedTurnStateAttempt = (attemptId) => {
+			released.push(attemptId);
+			originalRelease?.call(provider, attemptId);
+		};
+		spyOn(codexWebSocketTransport, "tryRequest").mockResolvedValue(null);
+		globalThis.fetch = mock(async () => {
+			throw new Error("socket hang up");
+		}) as never;
+
+		try {
+			const body = makeRequestBody();
+			await runProxy(
+				makeRequest(body),
+				body,
+				makePolicy(5_000),
+				"codex-post-dispatch-failure",
+			).catch(() => undefined);
+		} finally {
+			provider.abortTurnStateAttempt = originalAbort;
+			provider.releaseDispatchedTurnStateAttempt = originalRelease;
+		}
+
+		// The send really happened, so no "never sent" tombstone may be written --
+		// but the attempt must still be released. Left registered it keeps its
+		// logical request's lease held, and every later turn on the scope is
+		// suppressed until the attempt TTL expires.
+		expect(aborted).toHaveLength(0);
+		expect(released).toHaveLength(1);
+		expect(released[0]).toMatch(
+			/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+		);
+	});
+
+	it("treats the first dispatched Codex send as initial after a pre-dispatch abort", async () => {
+		installUsageCollector();
+		spyOn(codexWebSocketTransport, "tryRequest").mockResolvedValue(null);
+		const provider = getProvider("codex");
+		if (!provider?.transformRequestBody) {
+			throw new Error("Codex provider transformation is unavailable");
+		}
+		// The cause never reaches the wire -- the transport sanitizer strips every
+		// x-better-ccflare-* header -- so observe it where it is actually consumed.
+		const causes: Array<string | null> = [];
+		const originalTransformRequestBody = provider.transformRequestBody;
+		provider.transformRequestBody = async (request, account) => {
+			causes.push(request.headers.get("x-better-ccflare-attempt-cause"));
+			return originalTransformRequestBody.call(provider, request, account);
+		};
+		globalThis.fetch = mock(async () => {
+			return new Response(
+				[
+					'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_initial","model":"gpt-5.4"}}\n\n',
+					'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_initial","model":"gpt-5.4","status":"completed","usage":{"input_tokens":2,"output_tokens":1,"input_tokens_details":{"cached_tokens":0}}}}\n\n',
+					"data: [DONE]\n\n",
+				].join(""),
+				{ status: 200, headers: { "content-type": "text/event-stream" } },
+			);
+		}) as never;
+
+		// One logical request, two route candidates sharing its metadata. The first
+		// is abandoned before dispatch; the second is the first send that actually
+		// happens, so it is this request's initial attempt, not a fallback from a
+		// route that never reached upstream.
+		const body = makeRequestBody();
+		const meta = makeRequestMeta("codex-initial-after-abort");
+		try {
+			const abandoned = await proxyWithAccount(
+				makeRequest(body),
+				new URL(makeRequest(body).url),
+				makeCodexAccount(),
+				meta,
+				body,
+				() => undefined,
+				0,
+				makeProxyContext(),
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				false,
+				undefined,
+				undefined,
+				makePolicy(0),
+			);
+			expect(abandoned).toBeNull();
+
+			await proxyWithAccount(
+				makeRequest(body),
+				new URL(makeRequest(body).url),
+				makeCodexAccount(),
+				meta,
+				body,
+				() => undefined,
+				0,
+				makeProxyContext(),
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				false,
+				undefined,
+				undefined,
+				makePolicy(5_000),
+			);
+		} finally {
+			provider.transformRequestBody = originalTransformRequestBody;
+		}
+
+		// The abandoned candidate incremented the attempt ordinal, which must not be
+		// mistaken for evidence that a route already went out.
+		expect(causes.at(-1)).toBe("initial");
+	});
+
+	it("keeps a provider-owned Codex turn-state replay on HTTP", async () => {
+		installUsageCollector();
+		const provider = getProvider("codex");
+		if (!provider?.transformRequestBody) {
+			throw new Error("Codex provider transformation is unavailable");
+		}
+		const originalTransformRequestBody = provider.transformRequestBody;
+		provider.transformRequestBody = async (request, account) => {
+			const transformed = await originalTransformRequestBody.call(
+				provider,
+				request,
+				account,
+			);
+			const headers = new Headers(transformed.headers);
+			headers.set("x-codex-turn-state", "trusted-provider-turn-state");
+			return new Request(transformed, { headers });
+		};
+
+		const upstreamTurnStates: Array<string | null> = [];
+		globalThis.fetch = mock(async (request: Request) => {
+			upstreamTurnStates.push(request.headers.get("x-codex-turn-state"));
+			return new Response(
+				[
+					'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_http_turn_state","model":"gpt-5.4"}}\n\n',
+					'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"http"}\n\n',
+					'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_http_turn_state","model":"gpt-5.4","status":"completed","usage":{"input_tokens":2,"output_tokens":1,"input_tokens_details":{"cached_tokens":0}}}}\n\n',
+					"data: [DONE]\n\n",
+				].join(""),
+				{
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				},
+			);
+		});
+		const websocketAttempt = spyOn(
+			codexWebSocketTransport,
+			"tryRequest",
+		).mockResolvedValue(null);
+
+		try {
+			const body = makeRequestBody();
+			const response = await runProxy(
+				makeRequest(body, {
+					"x-codex-turn-state": "client-controlled-turn-state",
+				}),
+				body,
+				makePolicy(1_000),
+				"codex-http-turn-state-only",
+			);
+			expect(response?.status).toBe(200);
+			expect(await response?.text()).toContain("http");
+		} finally {
+			provider.transformRequestBody = originalTransformRequestBody;
+		}
+
+		expect(websocketAttempt).not.toHaveBeenCalled();
+		expect(upstreamTurnStates).toEqual(["trusted-provider-turn-state"]);
+	});
+
+	it("stamps a same-account model fallback before its request is transformed", async () => {
+		installUsageCollector();
+		const provider = getProvider("codex");
+		if (!provider?.transformRequestBody) {
+			throw new Error("Codex provider transformation is unavailable");
+		}
+		// The Codex provider registers each attempt's turn-state context during the
+		// transform, reading the attempt identity the proxy stamped into these
+		// headers. Capture what every transform actually observes.
+		const transformedAttempts: Array<{
+			attemptId: string | null;
+			cause: string | null;
+		}> = [];
+		const originalTransformRequestBody = provider.transformRequestBody;
+		provider.transformRequestBody = async (request, account) => {
+			transformedAttempts.push({
+				attemptId: request.headers.get("x-better-ccflare-attempt-id"),
+				cause: request.headers.get("x-better-ccflare-attempt-cause"),
+			});
+			return originalTransformRequestBody.call(provider, request, account);
+		};
+
+		const upstreamModels: string[] = [];
+		globalThis.fetch = mock(async (request: Request) => {
+			const body = (await request.clone().json()) as { model?: string };
+			upstreamModels.push(body.model ?? "");
+			if (upstreamModels.length === 1) {
+				return new Response(
+					JSON.stringify({
+						error: {
+							code: "model_not_found",
+							message: "The model gpt-5.4 does not exist",
+						},
+					}),
+					{ status: 404, headers: { "content-type": "application/json" } },
+				);
+			}
+			return new Response(
+				[
+					'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_fallback","model":"gpt-5.4-codex"}}\n\n',
+					'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"fallback"}\n\n',
+					'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_fallback","model":"gpt-5.4-codex","status":"completed","usage":{"input_tokens":2,"output_tokens":1,"input_tokens_details":{"cached_tokens":0}}}}\n\n',
+					"data: [DONE]\n\n",
+				].join(""),
+				{ status: 200, headers: { "content-type": "text/event-stream" } },
+			);
+		});
+		spyOn(codexWebSocketTransport, "tryRequest").mockResolvedValue(null);
+
+		try {
+			const body = makeRequestBody();
+			await runProxy(
+				makeRequest(body),
+				body,
+				// Deliberately not `makePolicy`: that policy forwards a
+				// model-unavailable response instead of falling back in place, which
+				// is the path under test here.
+				{ routeCandidateId: "codex-model-fallback-route" },
+				"codex-model-fallback-attempt-stamp",
+				makeCodexAccount({
+					model_fallbacks: JSON.stringify({ sonnet: "gpt-5.4-codex" }),
+				}),
+			);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			if (!message.includes("UsageCollector not initialized")) throw error;
+		} finally {
+			provider.transformRequestBody = originalTransformRequestBody;
+		}
+
+		expect(upstreamModels).toEqual(["gpt-5.4", "gpt-5.4-codex"]);
+		expect(transformedAttempts).toHaveLength(2);
+		expect(transformedAttempts[0]?.cause).toBe("initial");
+		expect(transformedAttempts[0]?.attemptId).toBeTruthy();
+		// The fallback must reach the transform already stamped. Stamping it
+		// afterwards registered the attempt under an identity its response never
+		// carries, and hid the route change behind the default `initial` cause.
+		expect(transformedAttempts[1]?.cause).toBe("model_fallback");
+		expect(transformedAttempts[1]?.attemptId).toBeTruthy();
+		expect(transformedAttempts[1]?.attemptId).not.toBe(
+			transformedAttempts[0]?.attemptId,
+		);
+	});
+
+	it("classifies a Codex re-entry as a retry only when account and model both hold", async () => {
+		installUsageCollector();
+		const provider = getProvider("codex");
+		if (!provider?.transformRequestBody) {
+			throw new Error("Codex provider transformation is unavailable");
+		}
+		const causes: Array<string | null> = [];
+		const originalTransformRequestBody = provider.transformRequestBody;
+		provider.transformRequestBody = async (request, account) => {
+			causes.push(request.headers.get("x-better-ccflare-attempt-cause"));
+			return originalTransformRequestBody.call(provider, request, account);
+		};
+		globalThis.fetch = mock(
+			async () =>
+				new Response(
+					[
+						'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_reentry","model":"gpt-5.4"}}\n\n',
+						'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"ok"}\n\n',
+						'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_reentry","model":"gpt-5.4","status":"completed","usage":{"input_tokens":2,"output_tokens":1,"input_tokens_details":{"cached_tokens":0}}}}\n\n',
+						"data: [DONE]\n\n",
+					].join(""),
+					{ status: 200, headers: { "content-type": "text/event-stream" } },
+				),
+		);
+		spyOn(codexWebSocketTransport, "tryRequest").mockResolvedValue(null);
+
+		const account = makeCodexAccount();
+		try {
+			// A second physical send on the same account and model: the bounded 401
+			// retry after a credential refresh looks exactly like this. Its turn
+			// state is still valid, so it must not be classified as a route change.
+			const sameAccountBody = makeRequestBody();
+			await runProxy(
+				makeRequest(sameAccountBody),
+				sameAccountBody,
+				makePolicy(5_000),
+				"codex-reentry-same-account",
+				account,
+				{
+					codexTransportAttemptOrdinal: 1,
+					codexLastAttemptAccountId: account.id,
+					codexLastAttemptModel: "gpt-5.4",
+				},
+			);
+			// Same account, different physical model: a deferred cross-family
+			// fallback re-enters exactly like this. The route changed, so turn state
+			// must be invalidated rather than replayed.
+			const sameAccountOtherModelBody = makeRequestBody();
+			await runProxy(
+				makeRequest(sameAccountOtherModelBody),
+				sameAccountOtherModelBody,
+				makePolicy(5_000),
+				"codex-reentry-same-account-other-model",
+				account,
+				{
+					codexTransportAttemptOrdinal: 1,
+					codexLastAttemptAccountId: account.id,
+					codexLastAttemptModel: "gpt-5.4-codex",
+				},
+			);
+			const otherAccountBody = makeRequestBody();
+			await runProxy(
+				makeRequest(otherAccountBody),
+				otherAccountBody,
+				makePolicy(5_000),
+				"codex-reentry-other-account",
+				account,
+				{
+					codexTransportAttemptOrdinal: 1,
+					codexLastAttemptAccountId: "codex-some-other-account",
+					codexLastAttemptModel: "gpt-5.4",
+				},
+			);
+		} finally {
+			provider.transformRequestBody = originalTransformRequestBody;
+		}
+
+		expect(causes).toEqual([
+			"other_retry",
+			"model_fallback",
+			"account_failover",
+		]);
+	});
+
 	it("counts a non-hosted WebSocket frame at its pre-write transport boundary", async () => {
 		installUsageCollector();
 		const ledger = new RoutingAttemptLedger();

@@ -14,7 +14,7 @@ interface InputFingerprint {
 
 export interface TraceRecord {
 	trace_schema_version?: number;
-	phase?: "request" | "response";
+	phase?: "request" | "response" | "attempt_aborted";
 	ts?: string;
 	request_id?: string | null;
 	attempt_id?: string | null;
@@ -47,6 +47,14 @@ export interface TraceRecord {
 	explicit_breakpoint_canary?: string | null;
 	explicit_breakpoint_cohort_id?: string | null;
 	explicit_breakpoint_action?: string | null;
+	codex_turn_state_arm?: string | null;
+	codex_turn_state_cohort_id?: string | null;
+	codex_turn_state_request_action?: string | null;
+	codex_turn_state_replay_applied?: boolean | null;
+	codex_turn_state_request_hmac?: string | null;
+	codex_turn_state_present?: boolean;
+	codex_turn_state_hmac?: string | null;
+	codex_turn_state_terminal_action?: string | null;
 	input_item_count?: number;
 	input_item_total_count?: number;
 	input_item_fingerprints?: InputFingerprint[];
@@ -352,8 +360,86 @@ export interface CacheExperimentDimensionReport {
 	rows: CacheExperimentRow[];
 }
 
+export type TurnStateExperimentArm =
+	| "observe"
+	| "control"
+	| "treatment"
+	| "ineligible"
+	| "unassigned";
+export type TurnStateContextBand =
+	| "under_50"
+	| "from_50_to_80"
+	| "from_80_to_95"
+	| "at_least_95"
+	| "unavailable";
+
+export interface TurnStateExperimentRow {
+	arm: TurnStateExperimentArm;
+	model: string;
+	turn: CacheExperimentTurn;
+	gapBand: CacheExperimentGapBand;
+	contextBand: TurnStateContextBand;
+	requests: number;
+	joinedResponses: number;
+	unjoinedRequests: number;
+	replayAppliedRequests: number;
+	wouldReplayRequests: number;
+	cache: {
+		measuredResponses: number;
+		unavailableResponses: number;
+		inputTokens: number;
+		cachedReadTokens: number;
+		weightedCachedReadPct: number | null;
+		positiveHitResponses: number;
+		positiveHitRatePct: number | null;
+		zeroHitResponses: number;
+		zeroHitRatePct: number | null;
+		cacheWriteMeasuredResponses: number;
+		cacheWriteUnavailableResponses: number;
+		cacheWriteTokens: number;
+	};
+	latency: {
+		availableResponses: number;
+		unavailableResponses: number;
+		p50Ms: number | null;
+		p95Ms: number | null;
+	};
+	outcomes: {
+		observed400Responses: number;
+		observedErrorResponses: number;
+		finalAttemptFallbacks: number;
+		observedExtraAttempts: number;
+		observedFallbackAttempts: number;
+		terminalActions: Record<string, number>;
+	};
+	tokenHmac: { matched: number; mismatched: number; unavailable: number };
+	requestActions: Record<string, number>;
+	promptKeyConcentration: {
+		distinctKeys: number;
+		maxRequestsPerKeyMinute: number;
+		keysOver15RequestsPerMinute: number;
+	};
+}
+
+export interface TurnStateCacheExperimentReport {
+	assignmentCounts: Record<TurnStateExperimentArm, number>;
+	/**
+	 * Report-wide prompt-key pressure, aggregated over every physical attempt
+	 * before rows are partitioned. Row-level concentration divides one key across
+	 * arm/model/turn/gap/context rows, so a key that exceeds the documented
+	 * 15 requests/minute/key guard can sit below the threshold in every row. This
+	 * field is the guard's authoritative view.
+	 */
+	promptKeyConcentration: {
+		distinctKeys: number;
+		maxRequestsPerKeyMinute: number;
+		keysOver15RequestsPerMinute: number;
+	};
+	rows: TurnStateExperimentRow[];
+}
+
 export interface CodexCacheExperimentReport {
-	schemaVersion: 1;
+	schemaVersion: 2;
 	attribution: {
 		unit: "final_observed_codex_attempt";
 		responseScope: "codex_trace_only_no_cross_provider_terminal_visibility";
@@ -364,6 +450,7 @@ export interface CodexCacheExperimentReport {
 	};
 	pacing: CacheExperimentDimensionReport;
 	explicitBreakpoint: CacheExperimentDimensionReport;
+	turnState: TurnStateCacheExperimentReport;
 	websocket: WebSocketCacheExperimentReport;
 }
 
@@ -1006,6 +1093,46 @@ const OFFICIAL_CODEX_MODEL_FAMILIES: ReadonlyArray<readonly [RegExp, string]> =
 		[/^gpt-5\.4(?:-\d{4}-\d{2}-\d{2})?$/, "gpt-5.4"],
 		[/^gpt-5\.3-codex(?:-\d{4}-\d{2}-\d{2})?$/, "gpt-5.3-codex"],
 	];
+const TURN_STATE_ARMS = new Set<TurnStateExperimentArm>([
+	"observe",
+	"control",
+	"treatment",
+	"ineligible",
+]);
+const TURN_STATE_REQUEST_ACTIONS = new Set([
+	"new_turn",
+	"replay",
+	"retry_replay",
+	"would_replay",
+	"observe",
+	"no_pending",
+	"no_token",
+	"concurrent_suppressed",
+	"rescue_suppressed",
+	"failover_suppressed",
+	"custom_endpoint_suppressed",
+	"hosted_suppressed",
+	"ambiguous_lineage",
+	"appended_input_suppressed",
+	"evicted_suppressed",
+	"missing_binding",
+	"account_not_allowlisted",
+	"model_not_allowlisted",
+	"percent_control",
+	"cohort_not_allowlisted",
+]);
+const TURN_STATE_TERMINAL_ACTIONS = new Set([
+	"captured",
+	"advanced",
+	"retired",
+	"error_ignored",
+	"invalid_token",
+	"ambiguous_calls",
+	"stale_generation",
+	"observed",
+	"ineligible",
+	"unknown_attempt",
+]);
 const EXPLICIT_BREAKPOINT_ACTIONS = new Set([
 	"placed_source_marker",
 	"placed_first_user_text",
@@ -1263,6 +1390,51 @@ interface CacheExperimentRowAccumulator extends CacheExperimentRow {
 }
 
 type CacheExperimentKind = "pacing" | "explicitBreakpoint";
+
+/**
+ * Phase of the tombstone written by `writeCodexAbortedAttemptTrace` in
+ * `trace.ts`. This analyzer reads JSONL off disk and deliberately imports
+ * nothing from the provider, so the string is duplicated rather than shared;
+ * changing it needs both sides.
+ */
+const ABORTED_ATTEMPT_PHASE = "attempt_aborted";
+
+/**
+ * Remove every attempt that was registered but never physically dispatched,
+ * together with the tombstones that annul them.
+ *
+ * A request record is written while the body is transformed -- before route
+ * claiming -- so a candidate later abandoned still leaves one behind. Counting
+ * it as a physical attempt inflates requests-per-key pressure and fallback
+ * totals, and an abandoned candidate holding the highest ordinal also takes
+ * final-attempt attribution from the attempt that really ran, leaving that
+ * attempt's response unjoined. Filtering at the entry points keeps one guard
+ * for every downstream report instead of one per metric.
+ */
+function withoutAbortedAttempts(
+	records: readonly TraceRecord[],
+): readonly TraceRecord[] {
+	const aborted = new Set<string>();
+	for (const record of records) {
+		if (record.phase !== ABORTED_ATTEMPT_PHASE) continue;
+		if (typeof record.attempt_id === "string" && record.attempt_id.length > 0) {
+			aborted.add(record.attempt_id);
+		}
+	}
+	return records.filter(
+		(record) =>
+			record.phase !== ABORTED_ATTEMPT_PHASE &&
+			!(
+				typeof record.attempt_id === "string" && aborted.has(record.attempt_id)
+			),
+	);
+}
+
+function traceTimestamp(record: TraceRecord): number | null {
+	if (!record.ts) return null;
+	const parsed = Date.parse(record.ts);
+	return Number.isFinite(parsed) ? parsed : null;
+}
 
 function appendRecord(
 	map: Map<string, TraceRecord[]>,
@@ -2531,17 +2703,451 @@ function analyzeWebSocketCacheExperiments(
 	};
 }
 
+interface TurnStateAnnotatedSample extends CacheExperimentLogicalSample {
+	provenance: TraceRecord;
+	arm: TurnStateExperimentArm;
+	model: string;
+	turn: CacheExperimentTurn;
+	gapBand: CacheExperimentGapBand;
+	contextBand: TurnStateContextBand;
+	requestAction: string;
+}
+
+interface TurnStateExperimentRowAccumulator extends TurnStateExperimentRow {
+	inputTokens: number;
+	cachedReadTokens: number;
+	latencySamples: number[];
+	keyTimestamps: Map<string, number[]>;
+}
+
+function turnStateArm(value: unknown): TurnStateExperimentArm {
+	return typeof value === "string" &&
+		TURN_STATE_ARMS.has(value as TurnStateExperimentArm)
+		? (value as TurnStateExperimentArm)
+		: "unassigned";
+}
+
+function turnStateAction(
+	value: unknown,
+	allowlist: ReadonlySet<string>,
+): string {
+	if (value === null || value === undefined || value === "")
+		return "unavailable";
+	return typeof value === "string" && allowlist.has(value) ? value : "unknown";
+}
+
+function turnStateContextBand(
+	response: TraceRecord | undefined,
+): TurnStateContextBand {
+	const utilization = response?.context_utilization_pct;
+	if (typeof utilization !== "number" || !Number.isFinite(utilization))
+		return "unavailable";
+	if (utilization < 50) return "under_50";
+	if (utilization < 80) return "from_50_to_80";
+	if (utilization < 95) return "from_80_to_95";
+	return "at_least_95";
+}
+
+function annotateTurnStateSamples(
+	samples: readonly CacheExperimentLogicalSample[],
+): TurnStateAnnotatedSample[] {
+	const included = samples
+		.map((sample) => ({
+			...sample,
+			provenance: sample.attempts[0] ?? sample.request,
+		}))
+		.filter(
+			(sample) =>
+				sample.provenance.codex_turn_state_arm !== undefined ||
+				sample.provenance.codex_turn_state_request_action !== undefined,
+		);
+	const position = new Map<
+		CacheExperimentLogicalSample,
+		{ turn: CacheExperimentTurn; gapBand: CacheExperimentGapBand }
+	>();
+	const groups = new Map<string, Array<(typeof included)[number]>>();
+	for (const sample of included) {
+		const cohort = sample.provenance.codex_turn_state_cohort_id;
+		if (
+			typeof cohort !== "string" ||
+			!SAFE_COHORT.test(cohort) ||
+			sample.logicalTimestamp === null
+		) {
+			position.set(sample, { turn: "unknown", gapBand: "unknown" });
+			continue;
+		}
+		const normalized = cohort.toLowerCase();
+		const group = groups.get(normalized) ?? [];
+		group.push(sample);
+		groups.set(normalized, group);
+	}
+	for (const group of groups.values()) {
+		group.sort((a, b) => (a.logicalTimestamp ?? 0) - (b.logicalTimestamp ?? 0));
+		group.forEach((sample, index) => {
+			const previous = group[index - 1];
+			const currentTs = sample.logicalTimestamp;
+			const previousTs = previous?.logicalTimestamp ?? null;
+			position.set(sample, {
+				turn: index === 0 ? "first_observed" : "follow_up_observed",
+				gapBand:
+					index === 0 ||
+					currentTs === null ||
+					previousTs === null ||
+					currentTs < previousTs
+						? "unknown"
+						: gapBand(currentTs - previousTs),
+			});
+		});
+	}
+	return included.map((sample) => ({
+		...sample,
+		arm: turnStateArm(sample.provenance.codex_turn_state_arm),
+		model: safeModel(sample.provenance),
+		...(position.get(sample) ?? {
+			turn: "unknown" as const,
+			gapBand: "unknown" as const,
+		}),
+		contextBand: turnStateContextBand(sample.response),
+		requestAction: turnStateAction(
+			sample.provenance.codex_turn_state_request_action,
+			TURN_STATE_REQUEST_ACTIONS,
+		),
+	}));
+}
+
+function turnStateRowAccumulator(
+	sample: TurnStateAnnotatedSample,
+): TurnStateExperimentRowAccumulator {
+	return {
+		arm: sample.arm,
+		model: sample.model,
+		turn: sample.turn,
+		gapBand: sample.gapBand,
+		contextBand: sample.contextBand,
+		requests: 0,
+		joinedResponses: 0,
+		unjoinedRequests: 0,
+		replayAppliedRequests: 0,
+		wouldReplayRequests: 0,
+		cache: {
+			measuredResponses: 0,
+			unavailableResponses: 0,
+			inputTokens: 0,
+			cachedReadTokens: 0,
+			weightedCachedReadPct: null,
+			positiveHitResponses: 0,
+			positiveHitRatePct: null,
+			zeroHitResponses: 0,
+			zeroHitRatePct: null,
+			cacheWriteMeasuredResponses: 0,
+			cacheWriteUnavailableResponses: 0,
+			cacheWriteTokens: 0,
+		},
+		latency: {
+			availableResponses: 0,
+			unavailableResponses: 0,
+			p50Ms: null,
+			p95Ms: null,
+		},
+		outcomes: {
+			observed400Responses: 0,
+			observedErrorResponses: 0,
+			finalAttemptFallbacks: 0,
+			observedExtraAttempts: 0,
+			observedFallbackAttempts: 0,
+			terminalActions: {},
+		},
+		tokenHmac: { matched: 0, mismatched: 0, unavailable: 0 },
+		requestActions: {},
+		promptKeyConcentration: {
+			distinctKeys: 0,
+			maxRequestsPerKeyMinute: 0,
+			keysOver15RequestsPerMinute: 0,
+		},
+		inputTokens: 0,
+		cachedReadTokens: 0,
+		latencySamples: [],
+		keyTimestamps: new Map(),
+	};
+}
+
+/**
+ * Largest value in a list, or 0 for an empty one.
+ *
+ * Deliberately a loop rather than `Math.max(0, ...values)`: these lists carry
+ * one entry per distinct prompt key, so on a large corpus the spread turns every
+ * key into a call argument and the runtime throws `RangeError` once it exceeds
+ * its argument limit -- failing exactly on the big traces this analyzer exists
+ * to summarize.
+ */
+function maxOfCounts(values: readonly number[]): number {
+	let maximum = 0;
+	for (const value of values) {
+		if (value > maximum) maximum = value;
+	}
+	return maximum;
+}
+
+function maximumRequestsPerMinute(timestamps: readonly number[]): number {
+	const ordered = [...timestamps].sort((a, b) => a - b);
+	let left = 0;
+	let maximum = 0;
+	for (let right = 0; right < ordered.length; right++) {
+		while ((ordered[right] ?? 0) - (ordered[left] ?? 0) >= 60_000) left++;
+		maximum = Math.max(maximum, right - left + 1);
+	}
+	return maximum;
+}
+
+function finishTurnStateRow(
+	row: TurnStateExperimentRowAccumulator,
+): TurnStateExperimentRow {
+	const concentrations = [...row.keyTimestamps.values()].map(
+		maximumRequestsPerMinute,
+	);
+	return {
+		arm: row.arm,
+		model: row.model,
+		turn: row.turn,
+		gapBand: row.gapBand,
+		contextBand: row.contextBand,
+		requests: row.requests,
+		joinedResponses: row.joinedResponses,
+		unjoinedRequests: row.unjoinedRequests,
+		replayAppliedRequests: row.replayAppliedRequests,
+		wouldReplayRequests: row.wouldReplayRequests,
+		cache: {
+			...row.cache,
+			weightedCachedReadPct:
+				row.inputTokens > 0
+					? Math.round((1000 * row.cachedReadTokens) / row.inputTokens) / 10
+					: null,
+			positiveHitRatePct:
+				row.cache.measuredResponses > 0
+					? Math.round(
+							(1000 * row.cache.positiveHitResponses) /
+								row.cache.measuredResponses,
+						) / 10
+					: null,
+			zeroHitRatePct:
+				row.cache.measuredResponses > 0
+					? Math.round(
+							(1000 * row.cache.zeroHitResponses) / row.cache.measuredResponses,
+						) / 10
+					: null,
+		},
+		latency: {
+			availableResponses: row.latency.availableResponses,
+			unavailableResponses: row.latency.unavailableResponses,
+			p50Ms: percentile(row.latencySamples, 0.5),
+			p95Ms: percentile(row.latencySamples, 0.95),
+		},
+		outcomes: {
+			...row.outcomes,
+			terminalActions: Object.fromEntries(
+				Object.entries(row.outcomes.terminalActions).sort(([a], [b]) =>
+					a.localeCompare(b),
+				),
+			),
+		},
+		tokenHmac: row.tokenHmac,
+		requestActions: Object.fromEntries(
+			Object.entries(row.requestActions).sort(([a], [b]) => a.localeCompare(b)),
+		),
+		promptKeyConcentration: {
+			distinctKeys: row.keyTimestamps.size,
+			maxRequestsPerKeyMinute: maxOfCounts(concentrations),
+			keysOver15RequestsPerMinute: concentrations.filter((count) => count > 15)
+				.length,
+		},
+	};
+}
+
+function analyzeTurnStateCacheExperiments(
+	samples: readonly CacheExperimentLogicalSample[],
+): TurnStateCacheExperimentReport {
+	const annotated = annotateTurnStateSamples(samples);
+	const assignmentCounts: Record<TurnStateExperimentArm, number> = {
+		observe: 0,
+		control: 0,
+		treatment: 0,
+		ineligible: 0,
+		unassigned: 0,
+	};
+	const rows = new Map<string, TurnStateExperimentRowAccumulator>();
+	// Row-level concentration answers "was this cohort hot"; the guard asks
+	// "was this key hot", and one key legitimately spans several arm/model/turn/
+	// gap/context rows. Accumulate the same attempt timestamps once more here so
+	// the 15 requests/minute/key ceiling is evaluated on the whole key.
+	const reportKeyTimestamps = new Map<string, number[]>();
+	for (const sample of annotated) {
+		assignmentCounts[sample.arm]++;
+		const rowKey = [
+			sample.arm,
+			sample.model,
+			sample.turn,
+			sample.gapBand,
+			sample.contextBand,
+		].join("\0");
+		let row = rows.get(rowKey);
+		if (!row) {
+			row = turnStateRowAccumulator(sample);
+			rows.set(rowKey, row);
+		}
+		row.requests++;
+		if (sample.provenance.codex_turn_state_replay_applied === true)
+			row.replayAppliedRequests++;
+		if (sample.requestAction === "would_replay") row.wouldReplayRequests++;
+		increment(row.requestActions, sample.requestAction);
+		row.outcomes.observedExtraAttempts += Math.max(
+			0,
+			sample.attempts.length - 1,
+		);
+		row.outcomes.observedFallbackAttempts += sample.attempts.filter((attempt) =>
+			FALLBACK_CAUSES.has(attempt.attempt_cause ?? ""),
+		).length;
+		if (FALLBACK_CAUSES.has(sample.request.attempt_cause ?? ""))
+			row.outcomes.finalAttemptFallbacks++;
+		for (const attempt of sample.attempts) {
+			const key = attempt.prompt_cache_key_id;
+			const attemptTimestamp = traceTimestamp(attempt);
+			if (
+				typeof key !== "string" ||
+				key.length === 0 ||
+				attemptTimestamp === null
+			)
+				continue;
+			const timestamps = row.keyTimestamps.get(key) ?? [];
+			timestamps.push(attemptTimestamp);
+			row.keyTimestamps.set(key, timestamps);
+			const reportTimestamps = reportKeyTimestamps.get(key) ?? [];
+			reportTimestamps.push(attemptTimestamp);
+			reportKeyTimestamps.set(key, reportTimestamps);
+		}
+		const response = sample.response;
+		if (!response) {
+			row.unjoinedRequests++;
+			continue;
+		}
+		row.joinedResponses++;
+		if (response.stop_reason === "error") row.outcomes.observedErrorResponses++;
+		if (
+			Number(response.error_status) === 400 ||
+			response.error_type === "http_400"
+		)
+			row.outcomes.observed400Responses++;
+		increment(
+			row.outcomes.terminalActions,
+			turnStateAction(
+				response.codex_turn_state_terminal_action,
+				TURN_STATE_TERMINAL_ACTIONS,
+			),
+		);
+		if (
+			response.cache_measurement_available !== false &&
+			safeTokenCount(response.input_tokens) &&
+			safeTokenCount(response.cache_read_input_tokens) &&
+			response.cache_read_input_tokens <= response.input_tokens
+		) {
+			const nextInput = safeTokenSum(row.inputTokens, response.input_tokens);
+			const nextRead = safeTokenSum(
+				row.cachedReadTokens,
+				response.cache_read_input_tokens,
+			);
+			if (nextInput === null || nextRead === null) {
+				row.cache.unavailableResponses++;
+			} else {
+				row.cache.measuredResponses++;
+				row.inputTokens = nextInput;
+				row.cachedReadTokens = nextRead;
+				row.cache.inputTokens = nextInput;
+				row.cache.cachedReadTokens = nextRead;
+				if (response.cache_read_input_tokens > 0)
+					row.cache.positiveHitResponses++;
+				else row.cache.zeroHitResponses++;
+			}
+		} else row.cache.unavailableResponses++;
+		if (hasMeasuredCacheWrite(response)) {
+			const nextWrite = safeTokenSum(
+				row.cache.cacheWriteTokens,
+				response.cache_creation_input_tokens ?? 0,
+			);
+			if (nextWrite === null) row.cache.cacheWriteUnavailableResponses++;
+			else {
+				row.cache.cacheWriteMeasuredResponses++;
+				row.cache.cacheWriteTokens = nextWrite;
+			}
+		} else row.cache.cacheWriteUnavailableResponses++;
+		const requestTs = sample.request.ts
+			? Date.parse(sample.request.ts)
+			: Number.NaN;
+		const responseTs = response.ts ? Date.parse(response.ts) : Number.NaN;
+		const elapsed = responseTs - requestTs;
+		if (
+			Number.isFinite(requestTs) &&
+			Number.isFinite(responseTs) &&
+			responseTs >= requestTs &&
+			Number.isSafeInteger(elapsed)
+		) {
+			row.latency.availableResponses++;
+			row.latencySamples.push(elapsed);
+		} else row.latency.unavailableResponses++;
+		const requestHmac = sample.provenance.codex_turn_state_request_hmac;
+		const responseHmac = response.codex_turn_state_hmac;
+		if (
+			typeof requestHmac === "string" &&
+			requestHmac.length > 0 &&
+			typeof responseHmac === "string" &&
+			responseHmac.length > 0
+		) {
+			if (requestHmac === responseHmac) row.tokenHmac.matched++;
+			else row.tokenHmac.mismatched++;
+		} else row.tokenHmac.unavailable++;
+	}
+	const finishedRows = [...rows.values()].map(finishTurnStateRow);
+	const armOrder: TurnStateExperimentArm[] = [
+		"observe",
+		"control",
+		"treatment",
+		"ineligible",
+		"unassigned",
+	];
+	finishedRows.sort(
+		(a, b) =>
+			armOrder.indexOf(a.arm) - armOrder.indexOf(b.arm) ||
+			a.model.localeCompare(b.model) ||
+			TURN_ORDER.indexOf(a.turn) - TURN_ORDER.indexOf(b.turn) ||
+			GAP_ORDER.indexOf(a.gapBand) - GAP_ORDER.indexOf(b.gapBand) ||
+			a.contextBand.localeCompare(b.contextBand),
+	);
+	const reportConcentrations = [...reportKeyTimestamps.values()].map(
+		maximumRequestsPerMinute,
+	);
+	return {
+		assignmentCounts,
+		promptKeyConcentration: {
+			distinctKeys: reportKeyTimestamps.size,
+			maxRequestsPerKeyMinute: maxOfCounts(reportConcentrations),
+			keysOver15RequestsPerMinute: reportConcentrations.filter(
+				(concentration) => concentration > 15,
+			).length,
+		},
+		rows: finishedRows,
+	};
+}
+
 /**
  * Privacy-safe, opt-in cache experiment analysis. Cohort hashes and join IDs
  * are used only in-memory and never appear in the returned report.
  */
 export function analyzeCodexCacheExperiments(
-	records: readonly TraceRecord[],
+	allRecords: readonly TraceRecord[],
 	websocketObservations = emptyParsedCodexWebSocketObservations(),
 ): CodexCacheExperimentReport {
+	const records = withoutAbortedAttempts(allRecords);
 	const samples = cacheExperimentLogicalSamples(records);
 	return {
-		schemaVersion: 1,
+		schemaVersion: 2,
 		attribution: {
 			unit: "final_observed_codex_attempt",
 			responseScope: "codex_trace_only_no_cross_provider_terminal_visibility",
@@ -2553,13 +3159,15 @@ export function analyzeCodexCacheExperiments(
 		},
 		pacing: cacheExperimentDimension(samples, "pacing"),
 		explicitBreakpoint: cacheExperimentDimension(samples, "explicitBreakpoint"),
+		turnState: analyzeTurnStateCacheExperiments(samples),
 		websocket: analyzeWebSocketCacheExperiments(records, websocketObservations),
 	};
 }
 
 export function analyzeCodexTrace(
-	records: readonly TraceRecord[],
+	allRecords: readonly TraceRecord[],
 ): TraceReport {
+	const records = withoutAbortedAttempts(allRecords);
 	const timestamps: string[] = [];
 	const requestRecords = records.filter(
 		(record) => (record.phase ?? "request") === "request",
@@ -3147,6 +3755,12 @@ export function formatCacheExperimentReport(
 	};
 	append("PACING BYPASS CANARY", report.pacing);
 	append("EXPLICIT BREAKPOINT CANARY", report.explicitBreakpoint);
+	lines.push(
+		"",
+		`HTTP TURN STATE CANARY: assignments=${JSON.stringify(report.turnState.assignmentCounts)} prompt_key_concentration=${JSON.stringify(report.turnState.promptKeyConcentration)}`,
+	);
+	for (const row of report.turnState.rows)
+		lines.push(`  ${JSON.stringify(row)}`);
 	lines.push(
 		"",
 		`WEBSOCKET TRANSPORT CANARY: assignments=${JSON.stringify(report.websocket.assignmentCounts)} effective_transports=${JSON.stringify(report.websocket.effectiveTransportCounts)} ingestion=${JSON.stringify(report.websocket.ingestion)}`,

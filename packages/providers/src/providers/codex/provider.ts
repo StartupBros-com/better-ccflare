@@ -74,9 +74,20 @@ import {
 import {
 	summarizeCodexResponse,
 	type ToolCallSummary,
+	writeCodexAbortedAttemptTrace,
 	writeCodexResponseTrace,
 	writeCodexTrace,
 } from "./trace";
+import {
+	type CodexTurnStateAttemptCause,
+	CodexTurnStateCoordinator,
+	type CodexTurnStateLineage,
+	type CodexTurnStateTerminalAction,
+	codexInputEndsWithToolOutput,
+	extractCodexTurnStateLineage,
+	fingerprintCodexTurnStateCallId,
+	normalizeCodexTurnStateFingerprints,
+} from "./turn-state";
 import { normalizeCodexResponseInputUsage } from "./usage";
 
 const log = new Logger("CodexProvider");
@@ -101,6 +112,7 @@ function sanitizeResponseHeaders(headers: Headers): Headers {
 	for (const h of INTERNAL_HEADERS) {
 		sanitized.delete(h);
 	}
+	sanitized.delete(CODEX_TURN_STATE_HEADER);
 	return sanitized;
 }
 
@@ -124,6 +136,7 @@ export const CODEX_PROMPT_CACHE_KEY_ENV = "CCFLARE_CODEX_PROMPT_CACHE_KEY";
  */
 export const CODEX_CONVERSATION_ID_HEADER =
 	"x-better-ccflare-codex-conversation-id";
+export const CODEX_TURN_STATE_HEADER = "x-codex-turn-state";
 /** "conversation" (default) or "session"; see derivePromptCacheKey. */
 export const CODEX_CACHE_KEY_MODE_ENV = "CCFLARE_CODEX_CACHE_KEY_MODE";
 export const CODEX_CACHE_KEY_SESSION_PERCENT_ENV =
@@ -693,6 +706,7 @@ interface AnthropicRequest {
 interface FunctionCallBuffer {
 	contentBlockIndex: number;
 	name: string;
+	callIdFingerprint: string | null;
 	arguments: string[];
 	/** Running byte total of buffered argument deltas, capped by TOOL_ARGS_PER_CALL_BYTE_CAP. */
 	bytes: number;
@@ -747,6 +761,8 @@ interface StreamState {
 	};
 	// Newly emitted tool calls from this response only (not historical replay).
 	traceNewToolCalls: ToolCallSummary[];
+	turnStateOutputCallFingerprints: string[];
+	turnStateOutputCallsInvalid: boolean;
 	traceReasoningOutputItemCount: number;
 	traceReasoningEncryptedPresent: boolean;
 	traceReasoningUnrepresentableIdSkipCount: number;
@@ -758,6 +774,11 @@ interface StreamState {
 	traceAttemptId?: string;
 	traceTurnStateHeaderPresent: boolean;
 	traceTurnState: string | null;
+	turnStateTerminalAction: CodexTurnStateTerminalAction | null;
+	finalizeTurnState: (
+		stopReason: "error" | "end_turn" | "tool_use" | "max_tokens" | "refusal",
+		outputLineage: CodexTurnStateLineage,
+	) => CodexTurnStateTerminalAction;
 	traceResponseId: string | null;
 	/** Last canonical Anthropic ping translated from allowlisted Codex progress. */
 	lastProgressPingAt: number | null;
@@ -778,6 +799,26 @@ function writeCodexStreamTerminalTrace(
 ): void {
 	if (state.terminalTraceWritten) return;
 	state.terminalTraceWritten = true;
+	// A buffer still open at the terminal is a call the client was handed but that
+	// never completed upstream. Its fingerprint is missing, so the lineage would
+	// be an exact-looking subset of the turn upstream actually produced, and a
+	// continuation carrying only the completed calls would replay a token minted
+	// for a different turn. Only an exactly paired added/done set may be captured.
+	if (state.functionCallBlocks.size > 0) {
+		state.turnStateOutputCallsInvalid = true;
+	}
+	const outputLineage =
+		stopReason === "tool_use" && !state.turnStateOutputCallsInvalid
+			? normalizeCodexTurnStateFingerprints(
+					state.turnStateOutputCallFingerprints,
+				)
+			: stopReason === "tool_use"
+				? ({ kind: "invalid" } as const)
+				: ({ kind: "none" } as const);
+	state.turnStateTerminalAction = state.finalizeTurnState(
+		stopReason,
+		outputLineage,
+	);
 	writeCodexResponseTrace({
 		requestId: state.traceRequestId,
 		attemptId: state.traceAttemptId,
@@ -786,6 +827,7 @@ function writeCodexStreamTerminalTrace(
 			?.rawContextWindow,
 		turnStateHeaderPresent: state.traceTurnStateHeaderPresent,
 		turnState: state.traceTurnState,
+		turnStateTerminalAction: state.turnStateTerminalAction ?? "unknown_attempt",
 		responseId: state.traceResponseId,
 		summary: summarizeCodexResponse(
 			state.traceNewToolCalls,
@@ -864,9 +906,14 @@ export interface CodexProviderOptionsForTests {
 	streamRawSilenceTimeoutMs?: number;
 }
 
+interface CodexTransformOptions {
+	hosted?: boolean;
+}
+
 export class CodexProvider extends BaseProvider {
 	name = "codex";
 	private readonly streamLivenessOptions: CodexStreamLivenessOptions;
+	private readonly turnStateCoordinator = new CodexTurnStateCoordinator();
 
 	constructor(options: CodexProviderOptionsForTests = {}) {
 		super();
@@ -874,6 +921,44 @@ export class CodexProvider extends BaseProvider {
 			heartbeatIntervalMs: options.streamHeartbeatIntervalMs,
 			rawSilenceTimeoutMs: options.streamRawSilenceTimeoutMs,
 		};
+	}
+
+	/**
+	 * Releases turn-state context for an attempt that was registered during
+	 * request transformation but will never be dispatched. Idempotent; see
+	 * `CodexTurnStateCoordinator.abortAttempt`.
+	 *
+	 * Also annuls the attempt's request trace, so analysis does not count a
+	 * candidate that never reached the wire as a physical request. That is
+	 * deliberately not conditional on turn-state eligibility: the request record
+	 * was written for this attempt whatever arm it landed in, so the correction
+	 * has to be written the same way.
+	 */
+	abortTurnStateAttempt(attemptId: string | null | undefined): void {
+		const requestId = this.turnStateCoordinator.abortAttempt(attemptId);
+		writeCodexAbortedAttemptTrace({ attemptId, requestId });
+	}
+
+	/**
+	 * Releases an attempt that reached the wire but never produced a response --
+	 * a socket, TLS, timeout, or abort failure after dispatch.
+	 *
+	 * Such an attempt never reaches `processResponse`, so nothing else finalizes
+	 * it. Left registered it reads as live, which keeps its logical request's
+	 * lease held and suppresses every later turn on the scope until the attempt
+	 * TTL expires. Deliberately writes no `attempt_aborted` tombstone: that record
+	 * means "never sent", and this request was sent -- annulling it would erase a
+	 * real physical attempt from requests-per-key and fallback accounting.
+	 *
+	 * The pending turn is left intact on purpose. The send's effect upstream is
+	 * unknown, and the official contract's answer to that is precisely to replay
+	 * the same token on a compatible retry, so discarding it here would forfeit
+	 * the reuse this canary exists to measure.
+	 */
+	releaseDispatchedTurnStateAttempt(
+		attemptId: string | null | undefined,
+	): void {
+		this.turnStateCoordinator.abortAttempt(attemptId);
 	}
 
 	createServerToolCapabilityTuple(
@@ -894,7 +979,9 @@ export class CodexProvider extends BaseProvider {
 			prepareHeaders: (headers, accessToken) =>
 				this.prepareHeaders(headers, accessToken),
 			transformOrdinaryRequest: (request) =>
-				this.transformRequestBody(request, context.account),
+				this.transformRequestBody(request, context.account, undefined, {
+					hosted: true,
+				}),
 			processHostedResponse: (
 				response,
 				_requestHeaders,
@@ -1184,6 +1271,7 @@ export class CodexProvider extends BaseProvider {
 		newHeaders.delete("anthropic-beta");
 		newHeaders.delete("x-api-key");
 		newHeaders.delete("host");
+		newHeaders.delete(CODEX_TURN_STATE_HEADER);
 
 		// Set Codex-required headers
 		if (accessToken) {
@@ -1197,9 +1285,21 @@ export class CodexProvider extends BaseProvider {
 		return newHeaders;
 	}
 
+	/**
+	 * @param _beforePhysicalTransport - Third positional slot in the `Provider`
+	 * contract, reserved for providers whose transform performs the physical send
+	 * itself (Bedrock). Codex only rewrites the body — the proxy owns its
+	 * transport — so the gate is accepted to keep the shared signature and
+	 * deliberately never invoked. Asserting the attempt budget here would charge a
+	 * send that has not happened yet.
+	 * @param options - Codex-private transform options; keep them after the
+	 * contract's own parameters so a future shared parameter does not collide.
+	 */
 	async transformRequestBody(
 		request: Request,
 		account?: Account,
+		_beforePhysicalTransport?: () => void,
+		options: CodexTransformOptions = {},
 	): Promise<Request> {
 		const trustedLogicalModelFamily = request.headers.has(
 			CODEX_LOGICAL_MODEL_FAMILY_HEADER,
@@ -1208,9 +1308,13 @@ export class CodexProvider extends BaseProvider {
 					.trim()
 					.toLowerCase()
 			: null;
-		if (request.headers.has(CODEX_LOGICAL_MODEL_FAMILY_HEADER)) {
+		if (
+			request.headers.has(CODEX_LOGICAL_MODEL_FAMILY_HEADER) ||
+			request.headers.has(CODEX_TURN_STATE_HEADER)
+		) {
 			const sanitizedHeaders = new Headers(request.headers);
 			sanitizedHeaders.delete(CODEX_LOGICAL_MODEL_FAMILY_HEADER);
+			sanitizedHeaders.delete(CODEX_TURN_STATE_HEADER);
 			request = new Request(request, { headers: sanitizedHeaders });
 		}
 		const isSyntheticCountTokens = this.isSyntheticCountTokensRequest(
@@ -1303,6 +1407,23 @@ export class CodexProvider extends BaseProvider {
 				// ChatGPT's subscription Responses endpoint rejects this API-only field.
 				delete codexBody.max_output_tokens;
 			}
+			const turnStateDecision = this.turnStateCoordinator.beginAttempt({
+				accountId: account?.id,
+				model: codexBody.model,
+				conversationIdentity:
+					cacheKeyDecision.selectedConversationIdentity ??
+					cacheKeyDecision.conversationIdentity,
+				requestId,
+				attemptId,
+				attemptCause: attemptCause as CodexTurnStateAttemptCause | null,
+				eligibleEndpoint: isSubscriptionEndpoint,
+				hosted: options.hosted === true,
+				lineage: extractCodexTurnStateLineage(body.messages),
+				// Reported from the converted body, not the client's messages: those
+				// are what lineage is derived from, but conversion is free to append
+				// after them (see the Skill nudge in convertToCodexFormat).
+				continuationTailIntact: codexInputEndsWithToolOutput(codexBody.input),
+			});
 			// Best-effort, env-gated observability (no-op unless CCFLARE_CODEX_TRACE_DIR set).
 			writeCodexTrace({
 				requestId: requestId ?? undefined,
@@ -1348,6 +1469,11 @@ export class CodexProvider extends BaseProvider {
 					"x-better-ccflare-pacing-cohort-id",
 				),
 				pacingAction: request.headers.get("x-better-ccflare-pacing-action"),
+				turnStateArm: turnStateDecision.arm,
+				turnStateCohortId: turnStateDecision.cohortId,
+				turnStateRequestAction: turnStateDecision.action,
+				turnStateReplayApplied: turnStateDecision.replayApplied,
+				turnState: turnStateDecision.turnState,
 				isDescendant: isAttributedAgent,
 				orchestrationAdmission,
 				orchestrationBasis,
@@ -1364,6 +1490,10 @@ export class CodexProvider extends BaseProvider {
 
 			const newHeaders = new Headers(request.headers);
 			newHeaders.set("content-type", "application/json");
+			newHeaders.delete(CODEX_TURN_STATE_HEADER);
+			if (turnStateDecision.turnState) {
+				newHeaders.set(CODEX_TURN_STATE_HEADER, turnStateDecision.turnState);
+			}
 			newHeaders.set(
 				"x-better-ccflare-request-stream",
 				body.stream === true ? "true" : "false",
@@ -1416,8 +1546,10 @@ export class CodexProvider extends BaseProvider {
 		const contentType = response.headers.get("content-type");
 		const requestId = response.headers.get("x-better-ccflare-request-id");
 		const attemptId = response.headers.get("x-better-ccflare-attempt-id");
-		const turnStateHeaderPresent = response.headers.has("x-codex-turn-state");
-		const turnState = response.headers.get("x-codex-turn-state");
+		const turnStateHeaderPresent = response.headers.has(
+			CODEX_TURN_STATE_HEADER,
+		);
+		const turnState = response.headers.get(CODEX_TURN_STATE_HEADER);
 		const finalModel =
 			response.headers.get("x-better-ccflare-final-model") ?? undefined;
 		const headerRequestedStream = response.headers.get(
@@ -1459,7 +1591,9 @@ export class CodexProvider extends BaseProvider {
 			log.warn(
 				`Codex returned successful response without SSE content-type (<missing>); transforming as ${requestedStream ? "SSE" : "JSON"}`,
 			);
-			const headers = sanitizeResponseHeaders(response.headers);
+			// Keep private upstream headers until the normal response transformer has
+			// captured them. That transformer sanitizes the downstream response.
+			const headers = new Headers(response.headers);
 			headers.set("content-type", "text/event-stream");
 			const sseResponse = new Response(response.body, {
 				status: response.status,
@@ -1483,12 +1617,21 @@ export class CodexProvider extends BaseProvider {
 			);
 		}
 
+		const turnStateTerminalAction = attemptId
+			? this.turnStateCoordinator.finalizeAttempt({
+					attemptId,
+					stopReason: "error",
+					responseTurnState: turnState,
+					outputLineage: { kind: "none" },
+				})
+			: "unknown_attempt";
 		writeCodexResponseTrace({
 			requestId: requestId ?? "unknown",
 			attemptId: attemptId ?? undefined,
 			modelOut: finalModel ?? "unknown",
 			turnStateHeaderPresent,
 			turnState,
+			turnStateTerminalAction,
 			summary: summarizeCodexResponse(
 				[],
 				{},
@@ -2932,14 +3075,28 @@ export class CodexProvider extends BaseProvider {
 			functionCallBytesTotal: 0,
 			sawToolUse: false,
 			traceNewToolCalls: [],
+			turnStateOutputCallFingerprints: [],
+			turnStateOutputCallsInvalid: false,
 			traceReasoningOutputItemCount: 0,
 			traceReasoningEncryptedPresent: false,
 			traceReasoningUnrepresentableIdSkipCount: 0,
 			pendingReasoningBlocks: [],
 			traceRequestId: requestId,
 			traceAttemptId: attemptId,
-			traceTurnStateHeaderPresent: response.headers.has("x-codex-turn-state"),
-			traceTurnState: response.headers.get("x-codex-turn-state"),
+			traceTurnStateHeaderPresent: response.headers.has(
+				CODEX_TURN_STATE_HEADER,
+			),
+			traceTurnState: response.headers.get(CODEX_TURN_STATE_HEADER),
+			turnStateTerminalAction: null,
+			finalizeTurnState: (stopReason, outputLineage) =>
+				attemptId
+					? this.turnStateCoordinator.finalizeAttempt({
+							attemptId,
+							stopReason,
+							responseTurnState: response.headers.get(CODEX_TURN_STATE_HEADER),
+							outputLineage,
+						})
+					: "unknown_attempt",
 			traceResponseId: null,
 			lastProgressPingAt: null,
 			terminalTraceWritten: false,
@@ -3589,10 +3746,26 @@ export class CodexProvider extends BaseProvider {
 						content_block: { type: "tool_use", id: callId, name, input: {} },
 					});
 					state.hasSentContentBlockStart = true;
+					if (outputIndex === undefined) {
+						// Untracked: without an index this call can never be paired with
+						// its done event, so its fingerprint would be silently missing
+						// from the lineage.
+						state.turnStateOutputCallsInvalid = true;
+					}
 					if (outputIndex !== undefined) {
+						const callIdFingerprint = fingerprintCodexTurnStateCallId(callId);
+						if (!callIdFingerprint) {
+							state.turnStateOutputCallsInvalid = true;
+						}
+						if (state.functionCallBlocks.has(outputIndex)) {
+							// A reused index overwrites the buffer still open under it, so
+							// one of the two calls can never contribute its fingerprint.
+							state.turnStateOutputCallsInvalid = true;
+						}
 						state.functionCallBlocks.set(outputIndex, {
 							contentBlockIndex: blockIdx,
 							name,
+							callIdFingerprint,
 							arguments: [],
 							bytes: 0,
 						});
@@ -3700,7 +3873,27 @@ export class CodexProvider extends BaseProvider {
 						outputIndex !== undefined
 							? state.functionCallBlocks.get(outputIndex)
 							: undefined;
+					if (!buffer) {
+						// Completed without a matching added event, so this call's
+						// fingerprint was never collected and the lineage cannot be an
+						// exact record of the turn.
+						state.turnStateOutputCallsInvalid = true;
+					}
 					if (buffer) {
+						// Pairing is by output index alone, so the completion has to be
+						// checked against the call the start announced. Upstream completing
+						// a different call at the same index would otherwise record the
+						// started id -- the one the client was handed -- and a continuation
+						// carrying it would match a lineage minted for another call set.
+						const doneCallIdFingerprint = fingerprintCodexTurnStateCallId(
+							item?.call_id,
+						);
+						if (
+							!doneCallIdFingerprint ||
+							doneCallIdFingerprint !== buffer.callIdFingerprint
+						) {
+							state.turnStateOutputCallsInvalid = true;
+						}
 						const partialJson = this.sanitizeToolUsePartialJson(
 							buffer.name,
 							buffer.arguments.join(""),
@@ -3710,6 +3903,13 @@ export class CodexProvider extends BaseProvider {
 							name: buffer.name,
 							arg_preview: partialJson.slice(0, 120),
 						});
+						if (buffer.callIdFingerprint) {
+							state.turnStateOutputCallFingerprints.push(
+								buffer.callIdFingerprint,
+							);
+						} else {
+							state.turnStateOutputCallsInvalid = true;
+						}
 						await writeSSE("content_block_delta", {
 							type: "content_block_delta",
 							index: buffer.contentBlockIndex,
@@ -4032,10 +4232,18 @@ export class CodexProvider extends BaseProvider {
 					messageDelta.context_window = state.contextWindow;
 				}
 
-				writeCodexStreamTerminalTrace(state, messageDelta.delta.stop_reason);
+				// Commit turn state only once both terminal frames are enqueued.
+				// `writeCodexStreamTerminalTrace` finalizes the coordinator entry,
+				// so running it first would capture or advance a turn whose response
+				// the client never receives: a cancel or enqueue failure between the
+				// two awaits would leave the next request replaying a token for a
+				// turn that did not complete. If either write throws, the cancel
+				// callback and the stream catch block finalize as `error` instead,
+				// which never mutates turn state.
 				await writeSSE("message_delta", messageDelta);
 				await writeSSE("message_stop", { type: "message_stop" });
 				state.hasSentTerminalEvents = true;
+				writeCodexStreamTerminalTrace(state, messageDelta.delta.stop_reason);
 				break;
 			}
 			default:

@@ -4,16 +4,30 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	CODEX_SINGLE_ORCHESTRATION_ROOT_ENV,
+	deriveConversationIdentity,
 	resetOrchestrationElectionForTest,
 } from "./orchestration-election";
 import {
 	CODEX_CACHE_KEY_MODE_ENV,
 	CODEX_CACHE_KEY_SESSION_PERCENT_ENV,
+	CODEX_DEFAULT_ENDPOINT,
 	CODEX_LOGICAL_MODEL_FAMILY_HEADER,
 	CODEX_PROMPT_CACHE_KEY_ENV,
 	CodexProvider,
 } from "./provider";
-import { CODEX_TRACE_DIR_ENV, CODEX_TRACE_FULL_ENV } from "./trace";
+import {
+	CODEX_TRACE_DIR_ENV,
+	CODEX_TRACE_FULL_ENV,
+	CODEX_TRACE_HMAC_KEY_ENV,
+} from "./trace";
+import {
+	CODEX_TURN_STATE_ACCOUNT_IDS_ENV,
+	CODEX_TURN_STATE_COHORT_IDS_ENV,
+	CODEX_TURN_STATE_MODELS_ENV,
+	CODEX_TURN_STATE_OBSERVE_ONLY_ENV,
+	CODEX_TURN_STATE_PERCENT_ENV,
+	deriveCodexTurnStateCohortId,
+} from "./turn-state";
 
 function messagesRequest(
 	body: unknown,
@@ -64,10 +78,16 @@ describe("Codex trace wiring (integration)", () => {
 	afterEach(() => {
 		delete process.env[CODEX_TRACE_DIR_ENV];
 		delete process.env[CODEX_TRACE_FULL_ENV];
+		delete process.env[CODEX_TRACE_HMAC_KEY_ENV];
 		delete process.env[CODEX_PROMPT_CACHE_KEY_ENV];
 		delete process.env[CODEX_CACHE_KEY_MODE_ENV];
 		delete process.env[CODEX_CACHE_KEY_SESSION_PERCENT_ENV];
 		delete process.env[CODEX_SINGLE_ORCHESTRATION_ROOT_ENV];
+		delete process.env[CODEX_TURN_STATE_PERCENT_ENV];
+		delete process.env[CODEX_TURN_STATE_ACCOUNT_IDS_ENV];
+		delete process.env[CODEX_TURN_STATE_MODELS_ENV];
+		delete process.env[CODEX_TURN_STATE_COHORT_IDS_ENV];
+		delete process.env[CODEX_TURN_STATE_OBSERVE_ONLY_ENV];
 		resetOrchestrationElectionForTest();
 		rmSync(dir, { recursive: true, force: true });
 	});
@@ -121,7 +141,7 @@ describe("Codex trace wiring (integration)", () => {
 		const rawTrace = readFileSync(join(dir, file as string), "utf8");
 		const record = JSON.parse(rawTrace.trim());
 		expect(record).toMatchObject({
-			trace_schema_version: 17,
+			trace_schema_version: 18,
 			phase: "response",
 			reasoning_output_item_count: 3,
 			reasoning_encrypted_present: true,
@@ -160,12 +180,241 @@ describe("Codex trace wiring (integration)", () => {
 		const rawTrace = readFileSync(join(dir, file as string), "utf8");
 		const record = JSON.parse(rawTrace.trim());
 		expect(record).toMatchObject({
-			trace_schema_version: 17,
+			trace_schema_version: 18,
 			phase: "request",
 			reasoning_input_item_count: 1,
 		});
 		expect(rawTrace).not.toContain("rs_request_private");
 		expect(rawTrace).not.toContain("encrypted.request.private");
+	});
+
+	test("traces a treatment capture and same-turn replay without private state", async () => {
+		process.env[CODEX_TRACE_DIR_ENV] = dir;
+		process.env[CODEX_TRACE_HMAC_KEY_ENV] = "test-only-turn-state-hmac-key";
+		process.env[CODEX_TURN_STATE_PERCENT_ENV] = "100";
+		process.env[CODEX_TURN_STATE_ACCOUNT_IDS_ENV] = "private-account-id";
+		process.env[CODEX_TURN_STATE_MODELS_ENV] = "gpt-5.6-sol";
+
+		const sessionId = "99999999-9999-4999-8999-999999999999";
+		const instructions = "Keep this private turn together.";
+		const firstUserText = "inspect this private cache turn";
+		const conversationIdentity = deriveConversationIdentity(
+			sessionId,
+			instructions,
+			[
+				{
+					role: "user",
+					content: [{ type: "input_text", text: firstUserText }],
+				},
+			],
+		);
+		expect(conversationIdentity).not.toBeNull();
+		process.env[CODEX_TURN_STATE_COHORT_IDS_ENV] = deriveCodexTurnStateCohortId(
+			{
+				accountId: "private-account-id",
+				model: "gpt-5.6-sol",
+				conversationIdentity,
+			},
+		);
+
+		const account = {
+			id: "private-account-id",
+			name: "codex-test",
+			provider: "codex",
+			custom_endpoint: null,
+			model_mappings: JSON.stringify({ sonnet: "gpt-5.6-sol" }),
+		} as Parameters<CodexProvider["transformRequestBody"]>[1];
+		const provider = new CodexProvider();
+		const requestFor = (
+			requestId: string,
+			attemptId: string,
+			messages: unknown[],
+		) =>
+			new Request(CODEX_DEFAULT_ENDPOINT, {
+				method: "POST",
+				headers: {
+					"content-type": "application/json",
+					"x-better-ccflare-request-id": requestId,
+					"x-better-ccflare-attempt-id": attemptId,
+					"x-better-ccflare-attempt-ordinal": "1",
+					"x-better-ccflare-attempt-cause": "initial",
+					"x-better-ccflare-final-model": "gpt-5.6-sol",
+					"x-codex-turn-state": "client-supplied-turn-state",
+				},
+				body: JSON.stringify({
+					model: "claude-sonnet-4-5",
+					max_tokens: 100,
+					stream: true,
+					system: instructions,
+					metadata: { user_id: JSON.stringify({ session_id: sessionId }) },
+					tools: [
+						{
+							name: "search",
+							description: "search",
+							input_schema: { type: "object", properties: {} },
+						},
+					],
+					messages,
+				}),
+			});
+		const event = (name: string, data: unknown) =>
+			`event: ${name}\ndata: ${JSON.stringify(data)}\n\n`;
+		const toolResponse = (
+			requestId: string,
+			attemptId: string,
+			callId: string,
+		) =>
+			new Response(
+				[
+					event("response.created", {
+						response: { id: `resp_${attemptId}`, model: "gpt-5.6-sol" },
+					}),
+					event("response.output_item.added", {
+						item: { type: "function_call", call_id: callId, name: "search" },
+						output_index: 0,
+					}),
+					event("response.function_call_arguments.delta", {
+						delta: "{}",
+						output_index: 0,
+					}),
+					event("response.output_item.done", {
+						item: { type: "function_call", call_id: callId, name: "search" },
+						output_index: 0,
+					}),
+					event("response.completed", {
+						response: {
+							id: `resp_${attemptId}`,
+							model: "gpt-5.6-sol",
+							usage: {
+								input_tokens: 10,
+								output_tokens: 1,
+								input_tokens_details: { cached_tokens: 9 },
+							},
+						},
+					}),
+				].join(""),
+				{
+					status: 200,
+					headers: {
+						"content-type": "text/event-stream",
+						"x-better-ccflare-request-id": requestId,
+						"x-better-ccflare-attempt-id": attemptId,
+						"x-better-ccflare-final-model": "gpt-5.6-sol",
+						"x-better-ccflare-request-stream": "true",
+						"x-codex-turn-state": "private-server-turn-state",
+					},
+				},
+			);
+
+		const initialMessages = [{ role: "user", content: firstUserText }];
+		const initial = await provider.transformRequestBody(
+			requestFor("turn-request-1", "turn-attempt-1", initialMessages),
+			account,
+		);
+		expect(initial.headers.get("x-codex-turn-state")).toBeNull();
+		const initialResponse = await provider.processResponse(
+			toolResponse("turn-request-1", "turn-attempt-1", "private-call-1"),
+			null,
+		);
+		expect(initialResponse.headers.get("x-codex-turn-state")).toBeNull();
+		await initialResponse.text();
+
+		const continuationMessages = [
+			...initialMessages,
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "tool_use",
+						id: "private-call-1",
+						name: "search",
+						input: {},
+					},
+				],
+			},
+			{
+				role: "user",
+				content: [
+					{
+						type: "tool_result",
+						tool_use_id: "private-call-1",
+						content: "private tool result",
+					},
+				],
+			},
+		];
+		const continuation = await provider.transformRequestBody(
+			requestFor("turn-request-2", "turn-attempt-2", continuationMessages),
+			account,
+		);
+		expect(continuation.headers.get("x-codex-turn-state")).toBe(
+			"private-server-turn-state",
+		);
+		const continuationResponse = await provider.processResponse(
+			toolResponse("turn-request-2", "turn-attempt-2", "private-call-2"),
+			null,
+		);
+		expect(continuationResponse.headers.get("x-codex-turn-state")).toBeNull();
+		await continuationResponse.text();
+
+		const traceFile = readdirSync(dir).find((name) => name.endsWith(".jsonl"));
+		expect(traceFile).toBeString();
+		const rawTrace = readFileSync(join(dir, traceFile as string), "utf8");
+		const records = rawTrace
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as Record<string, unknown>);
+		const byAttemptAndPhase = new Map(
+			records.map((record) => [`${record.attempt_id}:${record.phase}`, record]),
+		);
+		const initialRequest = byAttemptAndPhase.get("turn-attempt-1:request");
+		const initialTerminal = byAttemptAndPhase.get("turn-attempt-1:response");
+		const replayRequest = byAttemptAndPhase.get("turn-attempt-2:request");
+		const replayTerminal = byAttemptAndPhase.get("turn-attempt-2:response");
+
+		expect(initialRequest).toMatchObject({
+			trace_schema_version: 18,
+			codex_turn_state_arm: "treatment",
+			codex_turn_state_request_action: "new_turn",
+			codex_turn_state_replay_applied: false,
+			codex_turn_state_request_hmac: null,
+		});
+		expect(initialRequest?.codex_turn_state_cohort_id).toMatch(
+			/^[0-9a-f]{16}$/,
+		);
+		expect(initialTerminal).toMatchObject({
+			trace_schema_version: 18,
+			codex_turn_state_terminal_action: "captured",
+			codex_turn_state_present: true,
+		});
+		expect(replayRequest).toMatchObject({
+			trace_schema_version: 18,
+			codex_turn_state_arm: "treatment",
+			codex_turn_state_request_action: "replay",
+			codex_turn_state_replay_applied: true,
+		});
+		expect(replayTerminal).toMatchObject({
+			trace_schema_version: 18,
+			codex_turn_state_terminal_action: "advanced",
+			codex_turn_state_present: true,
+		});
+		expect(replayRequest?.codex_turn_state_request_hmac).toBeString();
+		expect(replayRequest?.codex_turn_state_request_hmac).toBe(
+			initialTerminal?.codex_turn_state_hmac,
+		);
+		expect(replayRequest?.codex_turn_state_request_hmac).toBe(
+			replayTerminal?.codex_turn_state_hmac,
+		);
+		for (const privateValue of [
+			"private-server-turn-state",
+			"client-supplied-turn-state",
+			"private-call-1",
+			"private-call-2",
+			"private-account-id",
+			sessionId,
+		]) {
+			expect(rawTrace).not.toContain(privateValue);
+		}
 	});
 
 	test("transformRequestBody traces the physical attempt and strips internal identity", async () => {
@@ -191,7 +440,7 @@ describe("Codex trace wiring (integration)", () => {
 		const files = readdirSync(dir).filter((f) => f.endsWith(".jsonl"));
 		expect(files.length).toBe(1);
 		const rec = JSON.parse(readFileSync(join(dir, files[0]), "utf8").trim());
-		expect(rec.trace_schema_version).toBe(17);
+		expect(rec.trace_schema_version).toBe(18);
 		expect(rec.phase).toBe("request");
 		expect(rec.orchestration_admission).toBe("no_orchestration_tools");
 		expect(rec.request_id).toBe("req_trace_1");
@@ -258,7 +507,7 @@ describe("Codex trace wiring (integration)", () => {
 			readFileSync(join(dir, file as string), "utf8").trim(),
 		);
 		expect(record).toMatchObject({
-			trace_schema_version: 17,
+			trace_schema_version: 18,
 			request_id: "req_trace_fable_default",
 			model_in: "claude-fable-5",
 			model_out: "gpt-5.6-sol",
@@ -312,7 +561,7 @@ describe("Codex trace wiring (integration)", () => {
 			.trim()
 			.split("\n")
 			.map((line) => JSON.parse(line));
-		expect(records.every((record) => record.trace_schema_version === 17)).toBe(
+		expect(records.every((record) => record.trace_schema_version === 18)).toBe(
 			true,
 		);
 		expect(records.map((record) => record.cache_key_assignment)).toEqual([

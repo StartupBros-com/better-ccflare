@@ -22,6 +22,7 @@ import {
 	applyXaiConvIdHeader,
 	buildServerToolCapabilityProofKey,
 	CODEX_CONVERSATION_ID_HEADER,
+	CODEX_TURN_STATE_HEADER,
 	decideContextAdmission,
 	isAnthropicExtraUsageExhausted,
 	isAnthropicOutOfCredits,
@@ -2113,68 +2114,94 @@ export async function proxyWithAccount(
 		laneKey: requestMeta.affinityLaneKey ?? null,
 	});
 	const drainAbortController = new AbortController();
+	/**
+	 * Single transport boundary for one physical attempt.
+	 *
+	 * `onDispatchStarted` reports the irreversible point — the WebSocket frame
+	 * write, or the final HTTP dispatch hook that immediately precedes fetch —
+	 * so the caller can tell an attempt that reached the wire from one abandoned
+	 * before it. Both transports report it themselves rather than the wrapper
+	 * inferring it from an error type, because the hooks that run just before
+	 * each send can still refuse it: they assert the request-local physical
+	 * budget and throw instead of returning.
+	 */
 	const makeAttemptRequest = async (
 		request: Request,
 		optionalOutboundTransport?: (
 			signal: AbortSignal,
+			markDispatched: () => void,
 		) => Promise<Response | null>,
 		onHttpDispatch?: () => void,
+		onDispatchStarted?: () => void,
 	): Promise<Response> => {
-		// The outer context exists only for an Anthropic-shaped downstream request.
-		// Any real provider transport can hang before headers (including transformed
-		// OpenAI-compatible routes), so start rescue immediately before every fetch.
-		// Synthetic provider responses never call this wrapper and remain synchronous.
-		preCommitRescue?.activate();
-		const commitment = resolveAttemptCommitmentDeadline();
-		latestTransportCommitment = commitment;
-		activeAttemptCommitment?.dispose();
-		activeAttemptCommitment = undefined;
-		const dispatch = async (signal: AbortSignal): Promise<Response> => {
-			// HTTP and optional transports must share the exact same live abort
-			// source. Terminal recovery cannot attach a controller after either
-			// transport has already created its connection.
-			const attemptSignal = AbortSignal.any([
-				signal,
-				drainAbortController.signal,
-			]);
-			const optionalResponse = await optionalOutboundTransport?.(attemptSignal);
-			if (optionalResponse) return optionalResponse;
-			onHttpDispatch?.();
-			return makeProxyRequest(
-				request,
-				undefined,
-				undefined,
-				undefined,
-				undefined,
-				attemptSignal,
-			);
+		const markDispatched = (): void => {
+			onDispatchStarted?.();
 		};
-		const transportSignal = currentTransportSignal();
-		if (!commitment) {
-			return dispatch(transportSignal);
-		}
+		{
+			// The outer context exists only for an Anthropic-shaped downstream request.
+			// Any real provider transport can hang before headers (including transformed
+			// OpenAI-compatible routes), so start rescue immediately before every fetch.
+			// Synthetic provider responses never call this wrapper and remain synchronous.
+			preCommitRescue?.activate();
+			const commitment = resolveAttemptCommitmentDeadline();
+			latestTransportCommitment = commitment;
+			activeAttemptCommitment?.dispose();
+			activeAttemptCommitment = undefined;
+			const dispatch = async (signal: AbortSignal): Promise<Response> => {
+				// HTTP and optional transports must share the exact same live abort
+				// source. Terminal recovery cannot attach a controller after either
+				// transport has already created its connection.
+				const attemptSignal = AbortSignal.any([
+					signal,
+					drainAbortController.signal,
+				]);
+				const optionalResponse = await optionalOutboundTransport?.(
+					attemptSignal,
+					markDispatched,
+				);
+				if (optionalResponse) return optionalResponse;
+				// This hook is the last thing that can refuse the send: it asserts the
+				// request-local physical budget and claims a hosted dispatch, and it
+				// throws instead of returning when either fails. Mark only after it
+				// returns, when nothing remains between here and the fetch below.
+				onHttpDispatch?.();
+				markDispatched();
+				return makeProxyRequest(
+					request,
+					undefined,
+					undefined,
+					undefined,
+					undefined,
+					attemptSignal,
+				);
+			};
+			const transportSignal = currentTransportSignal();
+			if (!commitment) {
+				return dispatch(transportSignal);
+			}
 
-		const attemptCommitment = new AnthropicPreCommitAttemptScope(
-			transportSignal,
-			commitment,
-		);
-		activeAttemptCommitment = attemptCommitment;
-		if (commitment.budgetMs <= 0) {
-			throw attemptCommitment.deadlineError;
-		}
-
-		try {
-			return await dispatch(attemptCommitment.signal);
-		} catch (error) {
-			if (attemptCommitment.isPrivateDeadline()) {
-				const websocketReceipt = getCurrentCodexWebSocketReceipt();
-				if (websocketReceipt?.frameWritten) {
-					websocketReceipt.markPostWriteFailure("semantic_stall");
-					return createCodexWebSocketNoReplayResponse(504, "semantic_stall");
-				}
+			const attemptCommitment = new AnthropicPreCommitAttemptScope(
+				transportSignal,
+				commitment,
+			);
+			activeAttemptCommitment = attemptCommitment;
+			if (commitment.budgetMs <= 0) {
 				throw attemptCommitment.deadlineError;
 			}
-			throw error;
+
+			try {
+				return await dispatch(attemptCommitment.signal);
+			} catch (error) {
+				if (attemptCommitment.isPrivateDeadline()) {
+					const websocketReceipt = getCurrentCodexWebSocketReceipt();
+					if (websocketReceipt?.frameWritten) {
+						websocketReceipt.markPostWriteFailure("semantic_stall");
+						return createCodexWebSocketNoReplayResponse(504, "semantic_stall");
+					}
+					throw attemptCommitment.deadlineError;
+				}
+				throw error;
+			}
 		}
 	};
 	try {
@@ -2777,6 +2804,32 @@ export async function proxyWithAccount(
 		// internal header before the request is sent upstream.
 		let transportAttemptOrdinal = requestMeta.codexTransportAttemptOrdinal ?? 0;
 		let currentTransportAttemptId: string | null = null;
+		/**
+		 * The route this attempt will use, held until it is irreversibly dispatched.
+		 *
+		 * `stampCodexAttempt` runs while an attempt's body is transformed, well
+		 * before that attempt can reach the wire, so publishing the route there
+		 * would leave the request pointing at a candidate that may never send. The
+		 * only consumer of the published value asks "what route did we last send
+		 * on?" -- to classify the next attempt as a retry, a fallback, or the
+		 * initial send -- so it is committed from the dispatch callback instead,
+		 * and an abandoned candidate simply never publishes anything to undo.
+		 */
+		let pendingCodexAttemptRoute: {
+			accountId: string;
+			model: string | null;
+		} | null = null;
+		const commitCodexDispatchedRoute = (): void => {
+			if (!pendingCodexAttemptRoute) return;
+			requestMeta.codexLastAttemptAccountId =
+				pendingCodexAttemptRoute.accountId;
+			requestMeta.codexLastAttemptModel = pendingCodexAttemptRoute.model;
+			pendingCodexAttemptRoute = null;
+		};
+		/** Physical models compare case-insensitively; unknown never matches. */
+		const normalizeCodexAttemptModel = (
+			model: string | null | undefined,
+		): string | null => model?.trim().toLowerCase() || null;
 		const stampCodexAttempt = (
 			attemptHeaders: Headers,
 			cause:
@@ -2796,6 +2849,16 @@ export async function proxyWithAccount(
 			if (attemptPlan.providerName !== "codex") return;
 			transportAttemptOrdinal++;
 			requestMeta.codexTransportAttemptOrdinal = transportAttemptOrdinal;
+			// Held rather than published; `commitCodexDispatchedRoute` publishes it
+			// once this attempt actually reaches the wire. `attemptPlan` still
+			// describes the attempt being superseded when a fallback stamps itself,
+			// so the explicit model wins where one is given.
+			pendingCodexAttemptRoute = {
+				accountId: account.id,
+				model: normalizeCodexAttemptModel(
+					finalModel ?? attemptPlan.physicalModel,
+				),
+			};
 			currentTransportAttemptId = crypto.randomUUID();
 			attemptHeaders.set(
 				"x-better-ccflare-attempt-id",
@@ -2880,9 +2943,41 @@ export async function proxyWithAccount(
 			return prepared;
 		};
 		let headers = prepareAttemptHeaders(attemptPlan);
+		// A nonzero ordinal only means this logical request has been sent before,
+		// not that it moved. Re-entry on the same account AND the same physical
+		// model -- the bounded 401 retry after refreshing credentials, for
+		// instance -- is a compatible retry: the rejected credential never
+		// committed the model turn, so its turn state is still valid and must not
+		// be discarded as failover would. Any change of account or of physical
+		// model is a route change instead, and a route change must invalidate and
+		// suppress rather than replay: a deferred cross-family fallback re-enters
+		// with this same request metadata and only the model differs. An unknown
+		// account or model on either side keeps the route-change classification,
+		// because that side only discards state while the retry side preserves it.
+		const previousAttemptAccountId = requestMeta.codexLastAttemptAccountId;
+		const previousAttemptModel = requestMeta.codexLastAttemptModel;
+		const entryTransportModel = normalizeCodexAttemptModel(
+			replayResolvedModel ?? attemptPlan.physicalModel,
+		);
+		const sameAccountReentry = previousAttemptAccountId === account.id;
+		const sameModelReentry =
+			entryTransportModel !== null &&
+			previousAttemptModel === entryTransportModel;
 		stampCodexAttempt(
 			headers,
-			transportAttemptOrdinal > 0 ? "account_failover" : "initial",
+			// Keyed on whether a route was ever dispatched, not on the attempt
+			// ordinal. The ordinal counts candidates, including ones abandoned before
+			// the wire, so using it here stamped the first real send of a request as
+			// a failover from a route that never sent -- which then invalidated and
+			// suppressed turn state that was still eligible.
+			previousAttemptAccountId === undefined ||
+				previousAttemptAccountId === null
+				? "initial"
+				: sameAccountReentry && sameModelReentry
+					? "other_retry"
+					: sameAccountReentry
+						? "model_fallback"
+						: "account_failover",
 			replayResolvedModel ?? undefined,
 		);
 		let targetUrl = attemptPlan.targetUrl;
@@ -3244,6 +3339,20 @@ export async function proxyWithAccount(
 			);
 		};
 
+		/**
+		 * Runs one physical attempt, from the final transport boundary through the
+		 * upstream response.
+		 *
+		 * Codex registers an attempt's turn-state context earlier, while its body is
+		 * transformed, so an attempt can be abandoned here without ever reaching the
+		 * wire: the request-local physical budget can veto the send, the attempt's
+		 * commitment budget can already be exhausted, or staging can fail. Left
+		 * registered, such an attempt keeps its lease and reads as live, suppressing
+		 * the client's next replay for the full attempt TTL and leaving a request
+		 * record for a send that never happened. Releasing it on every pre-dispatch
+		 * exit is one guard for the whole class, so a new veto added ahead of the
+		 * transport is covered without a matching release beside it.
+		 */
 		const executeCacheAwareProviderAttempt = async (
 			transportRequest: Request,
 			replayBody: ArrayBuffer | null,
@@ -3251,166 +3360,216 @@ export async function proxyWithAccount(
 			resolvedModel?: string | null,
 			reservation?: PhysicalSendReservation,
 		): Promise<Response> => {
-			// Codex replaces any client copy with its trusted, derived conversation
-			// identity during transformation. Capture that local transport hint before
-			// the broad private-header sanitizer removes it from the wire request.
-			const webSocketConversationIdentity =
-				attemptPlan.providerName === "codex"
-					? transportRequest.headers.get(CODEX_CONVERSATION_ID_HEADER)
-					: null;
-			// Every transport attempt, including retries, passes this final boundary.
-			// Preserve only trusted local synthetic-response markers; no
-			// x-better-ccflare-* metadata may reach a real upstream transport.
-			transportRequest = sanitizeInternalTransportHeaders(transportRequest);
-			const trustedTransportHeaders = new Headers(transportRequest.headers);
-			applyXaiConvIdHeader(
-				trustedTransportHeaders,
-				attemptPlan.providerName,
-				account,
-				getXaiConvId(requestMeta),
-			);
-			transportRequest = new Request(transportRequest, {
-				headers: trustedTransportHeaders,
-			});
-			const isSynthetic = isSyntheticProviderResponse(transportRequest);
-			latestPhysicalAnthropicCohortKey = isSynthetic
-				? null
-				: physicalAnthropicCohortKey(transportRequest, resolvedModel);
-			if (
-				!isSynthetic &&
-				(reservation !== undefined || latestPhysicalAnthropicCohortKey !== null)
-			) {
-				try {
+			let dispatchStarted = false;
+			try {
+				return await runCacheAwareProviderAttempt();
+			} catch (error) {
+				if (attemptPlan.providerName === "codex") {
+					try {
+						if (dispatchStarted) {
+							// Sent, but no response came back, so nothing downstream will
+							// ever finalize this attempt. Release it without the "never
+							// sent" tombstone, which would wrongly annul a real send.
+							provider.releaseDispatchedTurnStateAttempt?.(
+								currentTransportAttemptId,
+							);
+						} else {
+							provider.abortTurnStateAttempt?.(currentTransportAttemptId);
+						}
+					} catch {
+						// Turn-state bookkeeping never replaces the transport failure.
+					}
+					// Nothing to undo when it never dispatched: this attempt's route was
+					// only ever held pending, so dropping it stops a later attempt
+					// inheriting a route this one merely intended to use. After dispatch
+					// the route is already published and must stay.
+					if (!dispatchStarted) pendingCodexAttemptRoute = null;
+				}
+				throw error;
+			}
+
+			async function runCacheAwareProviderAttempt(): Promise<Response> {
+				// Codex replaces any client copy with its trusted, derived conversation
+				// identity during transformation. Capture that local transport hint before
+				// the broad private-header sanitizer removes it from the wire request.
+				const webSocketConversationIdentity =
+					attemptPlan.providerName === "codex"
+						? transportRequest.headers.get(CODEX_CONVERSATION_ID_HEADER)
+						: null;
+				// Every transport attempt, including retries, passes this final boundary.
+				// Preserve only trusted local synthetic-response markers; no
+				// x-better-ccflare-* metadata may reach a real upstream transport.
+				transportRequest = sanitizeInternalTransportHeaders(transportRequest);
+				const trustedTransportHeaders = new Headers(transportRequest.headers);
+				applyXaiConvIdHeader(
+					trustedTransportHeaders,
+					attemptPlan.providerName,
+					account,
+					getXaiConvId(requestMeta),
+				);
+				transportRequest = new Request(transportRequest, {
+					headers: trustedTransportHeaders,
+				});
+				const isSynthetic = isSyntheticProviderResponse(transportRequest);
+				latestPhysicalAnthropicCohortKey = isSynthetic
+					? null
+					: physicalAnthropicCohortKey(transportRequest, resolvedModel);
+				if (
+					!isSynthetic &&
+					(reservation !== undefined ||
+						latestPhysicalAnthropicCohortKey !== null)
+				) {
+					try {
+						routingAttemptLedger?.assertPhysicalAttemptAvailable(
+							physicalAttemptVetoContext(),
+						);
+					} catch (error) {
+						// A caller may have reserved before an in-place retry backoff. If a
+						// sibling send spent the last request-local slot meanwhile, release
+						// that uncommitted permit before propagating the veto.
+						if (reservation) cancelPhysicalSendReservation(reservation);
+						throw error;
+					}
+				}
+				const physicalReservation =
+					reservation ??
+					reservePhysicalSend(transportRequest, resolvedModel, null);
+				// The reservation is already exclusive. Commit synchronously before
+				// cache staging or provider I/O; no second contender can steal it.
+				commitPhysicalSendReservation(physicalReservation);
+				await stageCacheBodyForTransportAttempt({
+					requestId: requestMeta.id,
+					accountId: account.id,
+					providerName: attemptPlan.providerName,
+					replayBody,
+					transportRequest,
+					clientHeaders: req.headers,
+					path: url.pathname,
+					cacheIdentityHasCacheControl,
+					isSyntheticProviderTransport: isSynthetic,
+					resolvedModel:
+						attemptPlan.cacheReplayModelStrategy === "transformed-body"
+							? resolvedModel
+							: null,
+				});
+				if (isSynthetic) {
+					currentCodexWebSocketReceipt = null;
+					return materializeSyntheticResponse(transportRequest);
+				}
+				const recordPhysicalDispatch = (): void => {
+					routingAttemptLedger?.recordPhysicalAttempt({
+						accountId: account.id,
+						candidateId: modelFallbackPolicy?.routeCandidateId ?? null,
+						laneKey: requestMeta.affinityLaneKey ?? null,
+						recoveryProbe:
+							physicalReservation.kind === "reserved" &&
+							physicalReservation.permit.kind === "probe",
+					});
+					if (
+						physicalReservation.kind !== "reserved" ||
+						physicalReservation.permit.kind !== "probe" ||
+						!physicalReservation.enforced ||
+						physicalReservation.probeSendObserved
+					) {
+						return;
+					}
+					physicalReservation.probeSendObserved = true;
+					try {
+						anthropicDegradedState?.tracker?.recordProbe("sent");
+					} catch {
+						// The physical send remains authoritative over telemetry.
+					}
+				};
+				const hostedAttempt = attemptPlan.capabilityProofKey !== null;
+				// A provider-issued turn-state token is scoped to this HTTP turn. Never
+				// offer the same transformed request to the persistent WebSocket lane.
+				const hasCodexTurnStateReplay =
+					attemptPlan.providerName === "codex" &&
+					transportRequest.headers.has(CODEX_TURN_STATE_HEADER);
+				const claimHostedDispatchAfterBudgetAssertion = (): void => {
+					// onBeforeFrameSend asserted the budget immediately before this callback.
+					// Reassert defensively before crossing the irreversible hosted boundary.
 					routingAttemptLedger?.assertPhysicalAttemptAvailable(
 						physicalAttemptVetoContext(),
 					);
-				} catch (error) {
-					// A caller may have reserved before an in-place retry backoff. If a
-					// sibling send spent the last request-local slot meanwhile, release
-					// that uncommitted permit before propagating the veto.
-					if (reservation) cancelPhysicalSendReservation(reservation);
-					throw error;
-				}
-			}
-			const physicalReservation =
-				reservation ??
-				reservePhysicalSend(transportRequest, resolvedModel, null);
-			// The reservation is already exclusive. Commit synchronously before
-			// cache staging or provider I/O; no second contender can steal it.
-			commitPhysicalSendReservation(physicalReservation);
-			await stageCacheBodyForTransportAttempt({
-				requestId: requestMeta.id,
-				accountId: account.id,
-				providerName: attemptPlan.providerName,
-				replayBody,
-				transportRequest,
-				clientHeaders: req.headers,
-				path: url.pathname,
-				cacheIdentityHasCacheControl,
-				isSyntheticProviderTransport: isSynthetic,
-				resolvedModel:
-					attemptPlan.cacheReplayModelStrategy === "transformed-body"
-						? resolvedModel
-						: null,
-			});
-			if (isSynthetic) {
-				currentCodexWebSocketReceipt = null;
-				return materializeSyntheticResponse(transportRequest);
-			}
-			const recordPhysicalDispatch = (): void => {
-				routingAttemptLedger?.recordPhysicalAttempt({
-					accountId: account.id,
-					candidateId: modelFallbackPolicy?.routeCandidateId ?? null,
-					laneKey: requestMeta.affinityLaneKey ?? null,
-					recoveryProbe:
-						physicalReservation.kind === "reserved" &&
-						physicalReservation.permit.kind === "probe",
-				});
-				if (
-					physicalReservation.kind !== "reserved" ||
-					physicalReservation.permit.kind !== "probe" ||
-					!physicalReservation.enforced ||
-					physicalReservation.probeSendObserved
-				) {
-					return;
-				}
-				physicalReservation.probeSendObserved = true;
-				try {
-					anthropicDegradedState?.tracker?.recordProbe("sent");
-				} catch {
-					// The physical send remains authoritative over telemetry.
-				}
-			};
-			const hostedAttempt = attemptPlan.capabilityProofKey !== null;
-			const claimHostedDispatchAfterBudgetAssertion = (): void => {
-				// onBeforeFrameSend asserted the budget immediately before this callback.
-				// Reassert defensively before crossing the irreversible hosted boundary.
-				routingAttemptLedger?.assertPhysicalAttemptAvailable(
-					physicalAttemptVetoContext(),
+					claimCurrentHostedDispatch();
+				};
+				const claimHostedAndRecordHttpDispatch = (): void => {
+					routingAttemptLedger?.assertPhysicalAttemptAvailable(
+						physicalAttemptVetoContext(),
+					);
+					claimCurrentHostedDispatch();
+					recordPhysicalDispatch();
+				};
+				const httpTransportRequest = hostedAttempt
+					? new Request(transportRequest, { redirect: "manual" })
+					: transportRequest;
+				const response = await makeAttemptRequest(
+					httpTransportRequest,
+					attemptPlan.providerName === "codex" && !hasCodexTurnStateReplay
+						? async (signal, markDispatched) => {
+								currentCodexWebSocketReceipt = null;
+								// Capture the concrete stamped attempt before any later retry mutates the
+								// surrounding attempt variable. These are the same join keys written to
+								// Codex usage/cache traces during response finalization.
+								const websocketAttemptId = currentTransportAttemptId;
+								if (!websocketAttemptId) return null;
+								const websocketAttempt =
+									await codexWebSocketTransport.tryRequest({
+										requestId: requestMeta.id,
+										attemptId: websocketAttemptId,
+										accountId: account.id,
+										providerName: attemptPlan.providerName,
+										conversationIdentity: webSocketConversationIdentity,
+										request: transportRequest,
+										signal,
+										onBeforeFrameSend: () =>
+											routingAttemptLedger?.assertPhysicalAttemptAvailable(
+												physicalAttemptVetoContext(),
+											),
+										onBeforeFrameWrite: hostedAttempt
+											? () => {
+													// Order matters: the budget assertion inside this claim
+													// can still veto, and a vetoed attempt never wrote a
+													// frame. Only once the hosted claim succeeds has the
+													// attempt passed the point where annulling it would
+													// discard a send that may have reached upstream.
+													claimHostedDispatchAfterBudgetAssertion();
+													markDispatched();
+												}
+											: undefined,
+										onFrameWritten: (receipt) => {
+											markDispatched();
+											recordPhysicalDispatch();
+											currentCodexWebSocketReceipt = receipt;
+											// response.create is now irreversible, so neither the non-final
+											// fallback reserve nor the cache-lane retry reserve can be used.
+											// Promote the existing composite signal to the request-wide deadline.
+											if (preCommitRescue) {
+												activeAttemptCommitment?.promoteDeadlineTo(
+													preCommitRescue.commitmentDeadlineAt,
+												);
+											}
+										},
+									});
+								if (!websocketAttempt) return null;
+								currentCodexWebSocketReceipt = websocketAttempt.receipt;
+								return websocketAttempt.response;
+							}
+						: undefined,
+					hostedAttempt
+						? claimHostedAndRecordHttpDispatch
+						: recordPhysicalDispatch,
+					() => {
+						dispatchStarted = true;
+						// The irreversible boundary: only now is this attempt's route
+						// something a later attempt should compare itself against.
+						commitCodexDispatchedRoute();
+					},
 				);
-				claimCurrentHostedDispatch();
-			};
-			const claimHostedAndRecordHttpDispatch = (): void => {
-				routingAttemptLedger?.assertPhysicalAttemptAvailable(
-					physicalAttemptVetoContext(),
-				);
-				claimCurrentHostedDispatch();
-				recordPhysicalDispatch();
-			};
-			const httpTransportRequest = hostedAttempt
-				? new Request(transportRequest, { redirect: "manual" })
-				: transportRequest;
-			const response = await makeAttemptRequest(
-				httpTransportRequest,
-				attemptPlan.providerName === "codex"
-					? async (signal) => {
-							currentCodexWebSocketReceipt = null;
-							// Capture the concrete stamped attempt before any later retry mutates the
-							// surrounding attempt variable. These are the same join keys written to
-							// Codex usage/cache traces during response finalization.
-							const websocketAttemptId = currentTransportAttemptId;
-							if (!websocketAttemptId) return null;
-							const websocketAttempt = await codexWebSocketTransport.tryRequest(
-								{
-									requestId: requestMeta.id,
-									attemptId: websocketAttemptId,
-									accountId: account.id,
-									providerName: attemptPlan.providerName,
-									conversationIdentity: webSocketConversationIdentity,
-									request: transportRequest,
-									signal,
-									onBeforeFrameSend: () =>
-										routingAttemptLedger?.assertPhysicalAttemptAvailable(
-											physicalAttemptVetoContext(),
-										),
-									onBeforeFrameWrite: hostedAttempt
-										? claimHostedDispatchAfterBudgetAssertion
-										: undefined,
-									onFrameWritten: (receipt) => {
-										recordPhysicalDispatch();
-										currentCodexWebSocketReceipt = receipt;
-										// response.create is now irreversible, so neither the non-final
-										// fallback reserve nor the cache-lane retry reserve can be used.
-										// Promote the existing composite signal to the request-wide deadline.
-										if (preCommitRescue) {
-											activeAttemptCommitment?.promoteDeadlineTo(
-												preCommitRescue.commitmentDeadlineAt,
-											);
-										}
-									},
-								},
-							);
-							if (!websocketAttempt) return null;
-							currentCodexWebSocketReceipt = websocketAttempt.receipt;
-							return websocketAttempt.response;
-						}
-					: undefined,
-				hostedAttempt
-					? claimHostedAndRecordHttpDispatch
-					: recordPhysicalDispatch,
-			);
-			observeTrustedHttpOverload(response, transportRequest, resolvedModel);
-			return response;
+				observeTrustedHttpOverload(response, transportRequest, resolvedModel);
+				return response;
+			}
 		};
 		const enforcePhysicalModelAfterTransform = async (
 			transportRequest: Request,
@@ -3508,6 +3667,15 @@ export async function proxyWithAccount(
 			log.debug(
 				`Skipping duplicate request-local route account=${account.name} model=${currentTransportModel ?? "unknown"}`,
 			);
+			// The body transform above already registered this attempt's turn-state
+			// context, and nothing will ever dispatch it or process its response.
+			// Without this release it would hold its lease and keep its scope alive,
+			// suppressing every matching continuation. Its route is dropped for the
+			// same reason: a route that never sent must not be what a later re-entry
+			// compares itself against. It was only ever held pending, so dropping it
+			// is enough -- there is nothing published to restore.
+			provider.abortTurnStateAttempt?.(currentTransportAttemptId);
+			pendingCodexAttemptRoute = null;
 			return null;
 		}
 		if (routingAttemptLedger) {
@@ -3524,10 +3692,14 @@ export async function proxyWithAccount(
 		if (attemptAdmissionTracker) attemptAdmissionTracker.attemptedCount++;
 
 		const finalizedCodexAttemptIds = new Set<string>();
-		const finalizeCurrentCodexTransport = async (discarded: Response) => {
-			if (attemptPlan.providerName !== "codex" || !currentTransportAttemptId)
-				return;
-			const attemptId = currentTransportAttemptId;
+		const finalizeCurrentCodexTransport = async (
+			discarded: Response,
+			// Paths that stamp the next attempt before finalizing the one it
+			// supersedes pass that superseded ID explicitly.
+			attemptIdOverride?: string | null,
+		) => {
+			const attemptId = attemptIdOverride ?? currentTransportAttemptId;
+			if (attemptPlan.providerName !== "codex" || !attemptId) return;
 			if (finalizedCodexAttemptIds.has(attemptId)) return;
 			// Mark finalized before draining so a rejecting body cannot abort the
 			// intended retry/failover path or cause repeated finalization work.
@@ -5385,6 +5557,15 @@ export async function proxyWithAccount(
 						let fallbackPlan: ProviderAttemptPlan;
 						let fallbackHeaders: Headers;
 						let retryTransformedRequest: Request;
+						// The response this fallback supersedes is finalized further down,
+						// after the ledger claim, so its attempt identity has to survive the
+						// stamp below.
+						const supersededCodexAttemptId: string | null =
+							currentTransportAttemptId;
+						const supersededCodexAccountId =
+							requestMeta.codexLastAttemptAccountId;
+						const supersededCodexModel = requestMeta.codexLastAttemptModel;
+						let fallbackAttemptStamped = false;
 						try {
 							if (provider.name === "codex") {
 								await ensureCodexModelDefaults(account, ctx);
@@ -5397,6 +5578,16 @@ export async function proxyWithAccount(
 								false,
 							);
 							fallbackHeaders = prepareAttemptHeaders(fallbackPlan);
+							// Stamp before the request is built and transformed: the Codex
+							// provider registers this attempt's turn-state context during the
+							// transform, reading the attempt ID and cause from these headers.
+							// Stamping afterwards registered the attempt under an identity the
+							// response never carries -- so its terminal resolved nothing -- and
+							// hid the model fallback behind the default `initial` cause, which
+							// skips the suppression a route change requires. Mirrors the
+							// in-place 529 retry, which stamps before transforming.
+							stampCodexAttempt(fallbackHeaders, "model_fallback", nextModel);
+							fallbackAttemptStamped = true;
 							const retryRequestInit: RequestInit & { duplex?: "half" } = {
 								method: req.method,
 								headers: fallbackHeaders,
@@ -5419,6 +5610,15 @@ export async function proxyWithAccount(
 									fallbackPlan,
 								);
 						} catch (error) {
+							// This candidate never sends, so the superseded response is still
+							// the live attempt for whatever runs next.
+							if (fallbackAttemptStamped) {
+								provider.abortTurnStateAttempt?.(currentTransportAttemptId);
+								currentTransportAttemptId = supersededCodexAttemptId;
+								requestMeta.codexLastAttemptAccountId =
+									supersededCodexAccountId;
+								requestMeta.codexLastAttemptModel = supersededCodexModel;
+							}
 							if (error instanceof ServerToolCandidateCapabilityError) {
 								lastModelFallbackCapabilityError = error;
 								continue;
@@ -5456,6 +5656,10 @@ export async function proxyWithAccount(
 							log.debug(
 								`Skipping duplicate request-local model fallback account=${account.name} model=${nextModel}`,
 							);
+							provider.abortTurnStateAttempt?.(currentTransportAttemptId);
+							currentTransportAttemptId = supersededCodexAttemptId;
+							requestMeta.codexLastAttemptAccountId = supersededCodexAccountId;
+							requestMeta.codexLastAttemptModel = supersededCodexModel;
 							continue;
 						}
 						lastModelFallbackCapabilityError = null;
@@ -5466,7 +5670,10 @@ export async function proxyWithAccount(
 							);
 						}
 						if (!isScopedFailure(rawFailureClassification)) {
-							await finalizeCurrentCodexTransport(rawResponse);
+							await finalizeCurrentCodexTransport(
+								rawResponse,
+								supersededCodexAttemptId,
+							);
 							await discardUpstreamBody(rawResponse);
 						}
 						attemptPlan = fallbackPlan;
@@ -5474,7 +5681,6 @@ export async function proxyWithAccount(
 							fallbackContextOverflowCapability;
 						attemptProvider = bindProviderAttemptPlan(fallbackPlan);
 						headers = fallbackHeaders;
-						stampCodexAttempt(headers, "model_fallback", nextModel);
 						currentTransportModel = nextModel;
 						targetUrl = fallbackPlan.targetUrl;
 						retryTransformedTemplate = retryTransformedRequest.clone();

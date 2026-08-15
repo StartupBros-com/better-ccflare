@@ -30,6 +30,11 @@ import type {
 	OrchestrationAdmission,
 	OrchestrationAdmissionBasis,
 } from "./orchestration-election";
+import type {
+	CodexTurnStateArm,
+	CodexTurnStateRequestAction,
+	CodexTurnStateTerminalAction,
+} from "./turn-state";
 
 export const CODEX_TRACE_DIR_ENV = "CCFLARE_CODEX_TRACE_DIR";
 export const CODEX_TRACE_FULL_ENV = "CCFLARE_CODEX_TRACE_FULL";
@@ -37,8 +42,49 @@ export const CODEX_TRACE_HMAC_KEY_ENV = "CCFLARE_CODEX_TRACE_HMAC_KEY";
 /** Warn when one response spawns at least this many subagents (0 disables). */
 export const CODEX_FANOUT_WARN_ENV = "CCFLARE_CODEX_FANOUT_WARN";
 
-const TRACE_SCHEMA_VERSION = 17;
+const TRACE_SCHEMA_VERSION = 18;
 const DEFAULT_FANOUT_WARN = 8;
+const TURN_STATE_COHORT_PATTERN = /^[0-9a-f]{16}$/;
+const TURN_STATE_ARMS = new Set<CodexTurnStateArm>([
+	"observe",
+	"control",
+	"treatment",
+	"ineligible",
+]);
+const TURN_STATE_REQUEST_ACTIONS = new Set<CodexTurnStateRequestAction>([
+	"new_turn",
+	"replay",
+	"retry_replay",
+	"would_replay",
+	"observe",
+	"no_pending",
+	"no_token",
+	"concurrent_suppressed",
+	"rescue_suppressed",
+	"failover_suppressed",
+	"custom_endpoint_suppressed",
+	"hosted_suppressed",
+	"ambiguous_lineage",
+	"appended_input_suppressed",
+	"evicted_suppressed",
+	"missing_binding",
+	"account_not_allowlisted",
+	"model_not_allowlisted",
+	"percent_control",
+	"cohort_not_allowlisted",
+]);
+const TURN_STATE_TERMINAL_ACTIONS = new Set<CodexTurnStateTerminalAction>([
+	"captured",
+	"advanced",
+	"retired",
+	"error_ignored",
+	"invalid_token",
+	"ambiguous_calls",
+	"stale_generation",
+	"observed",
+	"ineligible",
+	"unknown_attempt",
+]);
 const MAX_INPUT_ITEM_FINGERPRINTS = 64;
 /**
  * Tool names that spawn subagents in Claude Code ("Task" historically,
@@ -269,6 +315,12 @@ interface TraceInputs {
 	pacingCohortId?: string | null;
 	/** Effective request action: paced | bypassed | crossover-paced. */
 	pacingAction?: string | null;
+	turnStateArm?: CodexTurnStateArm;
+	turnStateCohortId?: string | null;
+	turnStateRequestAction?: CodexTurnStateRequestAction;
+	turnStateReplayApplied?: boolean;
+	/** Never written raw; converted to a keyed, domain-separated fingerprint. */
+	turnState?: string | null;
 	instructions?: string;
 	isDescendant?: boolean;
 	/**
@@ -320,6 +372,7 @@ interface ResponseTraceInputs {
 	turnState?: string | null;
 	/** Never written raw; converted to a keyed, domain-separated fingerprint. */
 	responseId?: string | null;
+	turnStateTerminalAction?: CodexTurnStateTerminalAction;
 	summary: CodexResponseSummary;
 }
 
@@ -404,6 +457,24 @@ export function summarizeCodexResponse(
  * Append one request JSONL trace record. No-op (and never throws) when disabled.
  */
 export function writeCodexTrace(inputs: TraceInputs): void {
+	const turnStateArm = TURN_STATE_ARMS.has(inputs.turnStateArm ?? "ineligible")
+		? (inputs.turnStateArm ?? "ineligible")
+		: "ineligible";
+	const turnStateRequestAction = TURN_STATE_REQUEST_ACTIONS.has(
+		inputs.turnStateRequestAction ?? "missing_binding",
+	)
+		? (inputs.turnStateRequestAction ?? "missing_binding")
+		: "missing_binding";
+	const turnStateCohortId =
+		typeof inputs.turnStateCohortId === "string" &&
+		TURN_STATE_COHORT_PATTERN.test(inputs.turnStateCohortId)
+			? inputs.turnStateCohortId
+			: null;
+	const turnStateReplayApplied =
+		turnStateArm === "treatment" &&
+		(turnStateRequestAction === "replay" ||
+			turnStateRequestAction === "retry_replay") &&
+		inputs.turnStateReplayApplied === true;
 	const instructionsMetrics = inputs.instructions
 		? serializedMetrics(inputs.instructions)
 		: null;
@@ -444,6 +515,13 @@ export function writeCodexTrace(inputs: TraceInputs): void {
 		pacing_canary: inputs.pacingCanary ?? null,
 		pacing_cohort_id: inputs.pacingCohortId ?? null,
 		pacing_action: inputs.pacingAction ?? null,
+		codex_turn_state_arm: turnStateArm,
+		codex_turn_state_cohort_id: turnStateCohortId,
+		codex_turn_state_request_action: turnStateRequestAction,
+		codex_turn_state_replay_applied: turnStateReplayApplied,
+		codex_turn_state_request_hmac: turnStateReplayApplied
+			? privacyHmac("turn-state", inputs.turnState)
+			: null,
 		is_descendant: inputs.isDescendant ?? false,
 		orchestration_admission:
 			inputs.orchestrationAdmission ?? "no_orchestration_tools",
@@ -486,6 +564,11 @@ export function writeCodexResponseTrace(inputs: ResponseTraceInputs): void {
 			`response ${inputs.requestId ?? "unknown"} (${inputs.modelOut ?? "unknown model"}) spawned ${inputs.summary.new_subagent_spawn_count} subagents in one turn (warn threshold ${warnThreshold}). Possible recursive fan-out.`,
 		);
 	}
+	const turnStateTerminalAction = TURN_STATE_TERMINAL_ACTIONS.has(
+		inputs.turnStateTerminalAction ?? "ineligible",
+	)
+		? (inputs.turnStateTerminalAction ?? "ineligible")
+		: "ineligible";
 	appendTraceRecord({
 		trace_schema_version: TRACE_SCHEMA_VERSION,
 		phase: "response",
@@ -496,6 +579,7 @@ export function writeCodexResponseTrace(inputs: ResponseTraceInputs): void {
 		codex_turn_state_present:
 			inputs.turnStateHeaderPresent ?? Boolean(inputs.turnState),
 		codex_turn_state_hmac: privacyHmac("turn-state", inputs.turnState),
+		codex_turn_state_terminal_action: turnStateTerminalAction,
 		response_id_present: Boolean(inputs.responseId),
 		response_id_hmac: privacyHmac("response-id", inputs.responseId),
 		context_utilization_pct:
@@ -506,6 +590,38 @@ export function writeCodexResponseTrace(inputs: ResponseTraceInputs): void {
 					)
 				: null,
 		...inputs.summary,
+	});
+}
+
+/**
+ * Append one attempt-abort JSONL tombstone. No-op (and never throws) when
+ * disabled or when the attempt has no ID.
+ *
+ * A request record is written while the body is transformed, which happens
+ * before route claiming and physical dispatch. A candidate abandoned after that
+ * point -- a duplicate route claim, a superseded fallback -- therefore leaves a
+ * request record behind for a request that never reached the wire. Without this
+ * tombstone the analyzer counts it as a physical attempt: it inflates
+ * requests-per-key pressure and fallback counts, and when the abandoned
+ * candidate holds the highest ordinal it also steals final-attempt attribution
+ * from the attempt that really was dispatched, leaving that one's response
+ * unjoined.
+ *
+ * The record carries no new identity: `request_id` and `attempt_id` already
+ * appear on the request record it annuls. Its phase is neither `request` nor
+ * `response`, so every existing reader ignores it.
+ */
+export function writeCodexAbortedAttemptTrace(inputs: {
+	attemptId?: string | null;
+	requestId?: string | null;
+}): void {
+	if (!inputs.attemptId) return;
+	appendTraceRecord({
+		trace_schema_version: TRACE_SCHEMA_VERSION,
+		phase: "attempt_aborted",
+		ts: new Date().toISOString(),
+		request_id: inputs.requestId ?? null,
+		attempt_id: inputs.attemptId,
 	});
 }
 

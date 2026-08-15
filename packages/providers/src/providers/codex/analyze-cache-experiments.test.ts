@@ -7,6 +7,270 @@ import {
 } from "./analyze-trace";
 
 describe("analyzeCodexCacheExperiments", () => {
+	test("excludes attempts annulled before dispatch from rollout evidence", () => {
+		const report = analyzeCodexCacheExperiments([
+			{
+				trace_schema_version: 18,
+				phase: "request",
+				ts: "2026-08-13T00:00:00.000Z",
+				request_id: "private-logical",
+				attempt_id: "private-attempt-sent",
+				attempt_ordinal: 1,
+				attempt_cause: "initial",
+				model_out: "gpt-5.6-sol",
+				prompt_cache_key_id: "private-key",
+				codex_turn_state_arm: "treatment",
+				codex_turn_state_cohort_id: "0123456789abcdef",
+				codex_turn_state_request_action: "replay",
+				codex_turn_state_replay_applied: true,
+			},
+			{
+				// Registered while its body was transformed, then abandoned before
+				// route claiming: a higher ordinal that never reached the wire.
+				trace_schema_version: 18,
+				phase: "request",
+				ts: "2026-08-13T00:00:01.000Z",
+				request_id: "private-logical",
+				attempt_id: "private-attempt-abandoned",
+				attempt_ordinal: 2,
+				attempt_cause: "model_fallback",
+				model_out: "gpt-5.6-sol",
+				prompt_cache_key_id: "private-key",
+				codex_turn_state_arm: "ineligible",
+				codex_turn_state_request_action: "failover_suppressed",
+				codex_turn_state_replay_applied: false,
+			},
+			{
+				trace_schema_version: 18,
+				phase: "attempt_aborted",
+				ts: "2026-08-13T00:00:01.500Z",
+				request_id: "private-logical",
+				attempt_id: "private-attempt-abandoned",
+			},
+			{
+				trace_schema_version: 18,
+				phase: "response",
+				ts: "2026-08-13T00:00:03.000Z",
+				request_id: "private-logical",
+				attempt_id: "private-attempt-sent",
+				stop_reason: "tool_use",
+				input_tokens: 1_000,
+				cache_read_input_tokens: 900,
+				cache_creation_input_tokens: 0,
+				cache_creation_measurement_available: true,
+				codex_turn_state_terminal_action: "advanced",
+			},
+		]);
+
+		// The dispatched attempt keeps final-attempt attribution, so its response
+		// still joins; the phantom neither inflates key pressure and fallback
+		// counts nor strands the real response as unjoined.
+		expect(report.turnState.rows).toMatchObject([
+			{
+				arm: "treatment",
+				requests: 1,
+				joinedResponses: 1,
+				unjoinedRequests: 0,
+				outcomes: {
+					observedExtraAttempts: 0,
+					observedFallbackAttempts: 0,
+					finalAttemptFallbacks: 0,
+					terminalActions: { advanced: 1 },
+				},
+				promptKeyConcentration: {
+					distinctKeys: 1,
+					maxRequestsPerKeyMinute: 1,
+					keysOver15RequestsPerMinute: 0,
+				},
+			},
+		]);
+		expect(
+			report.turnState.promptKeyConcentration.maxRequestsPerKeyMinute,
+		).toBe(1);
+	});
+
+	test("attributes HTTP turn-state by first attempt and final outcome", () => {
+		const report = analyzeCodexCacheExperiments([
+			{
+				trace_schema_version: 18,
+				phase: "request",
+				ts: "2026-08-13T00:00:00.000Z",
+				request_id: "private-logical-first",
+				attempt_id: "private-attempt-first",
+				attempt_ordinal: 1,
+				attempt_cause: "initial",
+				model_out: "gpt-5.6-sol",
+				prompt_cache_key_id: "private-key",
+				codex_turn_state_arm: "treatment",
+				codex_turn_state_cohort_id: "0123456789abcdef",
+				codex_turn_state_request_action: "replay",
+				codex_turn_state_replay_applied: true,
+				codex_turn_state_request_hmac: "matched-hmac",
+			},
+			{
+				trace_schema_version: 18,
+				phase: "request",
+				ts: "2026-08-13T00:00:01.000Z",
+				request_id: "private-logical-first",
+				attempt_id: "private-attempt-final",
+				attempt_ordinal: 2,
+				attempt_cause: "reasoning_retry",
+				model_out: "gpt-5.6-sol",
+				prompt_cache_key_id: "private-key",
+				codex_turn_state_arm: "ineligible",
+				codex_turn_state_cohort_id: "fedcba9876543210",
+				codex_turn_state_request_action: "rescue_suppressed",
+				codex_turn_state_replay_applied: false,
+			},
+			{
+				trace_schema_version: 18,
+				phase: "response",
+				ts: "2026-08-13T00:00:03.000Z",
+				request_id: "private-logical-first",
+				attempt_id: "private-attempt-final",
+				stop_reason: "end_turn",
+				input_tokens: 1_000,
+				cache_read_input_tokens: 900,
+				cache_creation_input_tokens: 0,
+				cache_creation_measurement_available: true,
+				context_utilization_pct: 75,
+				codex_turn_state_hmac: "matched-hmac",
+				codex_turn_state_terminal_action: "advanced",
+			},
+			{
+				trace_schema_version: 18,
+				phase: "request",
+				ts: "2026-08-13T00:02:00.000Z",
+				request_id: "private-control",
+				attempt_id: "private-control-attempt",
+				attempt_ordinal: 1,
+				attempt_cause: "initial",
+				model_out: "gpt-5.6-sol",
+				codex_turn_state_arm: "control",
+				codex_turn_state_cohort_id: "0123456789abcdef",
+				codex_turn_state_request_action: "would_replay",
+				codex_turn_state_replay_applied: false,
+			},
+		]);
+
+		expect(report.schemaVersion).toBe(2);
+		expect(report.turnState.assignmentCounts).toEqual({
+			observe: 0,
+			control: 1,
+			treatment: 1,
+			ineligible: 0,
+			unassigned: 0,
+		});
+		expect(report.turnState.rows).toMatchObject([
+			{
+				arm: "control",
+				model: "gpt-5.6-sol",
+				turn: "follow_up_observed",
+				gapBand: "from_1m_to_5m",
+				contextBand: "unavailable",
+				requests: 1,
+				unjoinedRequests: 1,
+				requestActions: { would_replay: 1 },
+			},
+			{
+				arm: "treatment",
+				model: "gpt-5.6-sol",
+				turn: "first_observed",
+				gapBand: "unknown",
+				contextBand: "from_50_to_80",
+				requests: 1,
+				joinedResponses: 1,
+				cache: {
+					weightedCachedReadPct: 90,
+					positiveHitRatePct: 100,
+					zeroHitRatePct: 0,
+				},
+				outcomes: {
+					observedExtraAttempts: 1,
+					observedFallbackAttempts: 0,
+					terminalActions: { advanced: 1 },
+				},
+				tokenHmac: { matched: 1, mismatched: 0, unavailable: 0 },
+				requestActions: { replay: 1 },
+				promptKeyConcentration: {
+					distinctKeys: 1,
+					maxRequestsPerKeyMinute: 2,
+					keysOver15RequestsPerMinute: 0,
+				},
+			},
+		]);
+		const text = formatCacheExperimentReport(report);
+		expect(text).toContain("HTTP TURN STATE CANARY");
+		for (const privateValue of [
+			"private-logical-first",
+			"private-attempt-first",
+			"private-attempt-final",
+			"private-key",
+			"0123456789abcdef",
+			"matched-hmac",
+		]) {
+			expect(text).not.toContain(privateValue);
+		}
+	});
+
+	test("reports prompt-key pressure across rows, not only within one row", () => {
+		// One key receiving 16 requests inside a minute, split evenly across two
+		// context bands. Row-level concentration sees 8 per row and reports no
+		// violation; the 15 requests/minute/key guard has to see all 16.
+		const records = Array.from({ length: 16 }, (_, index) => {
+			const ts = `2026-08-13T00:00:${String(index).padStart(2, "0")}.000Z`;
+			return [
+				{
+					trace_schema_version: 18 as const,
+					phase: "request" as const,
+					ts,
+					request_id: `private-logical-${index}`,
+					attempt_id: `private-attempt-${index}`,
+					attempt_ordinal: 1,
+					attempt_cause: "initial" as const,
+					model_out: "gpt-5.6-sol",
+					prompt_cache_key_id: "private-shared-key",
+					codex_turn_state_arm: "treatment" as const,
+					codex_turn_state_cohort_id: "0123456789abcdef",
+					codex_turn_state_request_action: "replay" as const,
+					codex_turn_state_replay_applied: true,
+				},
+				{
+					trace_schema_version: 18 as const,
+					phase: "response" as const,
+					ts,
+					request_id: `private-logical-${index}`,
+					attempt_id: `private-attempt-${index}`,
+					stop_reason: "end_turn" as const,
+					input_tokens: 1_000,
+					cache_read_input_tokens: 900,
+					cache_creation_input_tokens: 0,
+					cache_creation_measurement_available: true,
+					// Alternating bands put the same key in two different rows.
+					context_utilization_pct: index % 2 === 0 ? 40 : 75,
+					codex_turn_state_terminal_action: "advanced" as const,
+				},
+			];
+		}).flat();
+
+		const report = analyzeCodexCacheExperiments(records);
+
+		for (const row of report.turnState.rows) {
+			expect(row.promptKeyConcentration.keysOver15RequestsPerMinute).toBe(0);
+			expect(row.promptKeyConcentration.maxRequestsPerKeyMinute).toBeLessThan(
+				16,
+			);
+		}
+		expect(report.turnState.promptKeyConcentration).toEqual({
+			distinctKeys: 1,
+			maxRequestsPerKeyMinute: 16,
+			keysOver15RequestsPerMinute: 1,
+		});
+		expect(formatCacheExperimentReport(report)).not.toContain(
+			"private-shared-key",
+		);
+	});
+
 	test("groups the pacing canary by arm, model, turn, and gap band", () => {
 		const report = analyzeCodexCacheExperiments([
 			{
@@ -84,7 +348,7 @@ describe("analyzeCodexCacheExperiments", () => {
 			},
 		]);
 
-		expect(report.schemaVersion).toBe(1);
+		expect(report.schemaVersion).toBe(2);
 		expect(report.attribution.unit).toBe("final_observed_codex_attempt");
 		expect(report.attribution.pacingWaitMs).toBe("unavailable");
 		expect(report.pacing.assignmentCounts).toEqual({

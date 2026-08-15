@@ -253,6 +253,21 @@ export interface RequestMeta {
 	codexPacingCohortId?: string | null;
 	/** One-based physical Codex transport sequence for this logical request. */
 	codexTransportAttemptOrdinal?: number;
+	/**
+	 * Account the previous physical Codex attempt was stamped against. A later
+	 * attempt is an account failover only when the selected account actually
+	 * changed; a same-account re-entry (a credential refresh, for example) must
+	 * not be classified as one, because failover discards still-valid turn state.
+	 */
+	codexLastAttemptAccountId?: string | null;
+	/**
+	 * Normalized physical model the previous Codex attempt was stamped against.
+	 * A same-account re-entry that changes the physical model is a route change,
+	 * not a compatible retry: replaying turn state across it would defeat the
+	 * invalidation a route change requires. Null when the model is unknown, which
+	 * is deliberately treated as a route change.
+	 */
+	codexLastAttemptModel?: string | null;
 }
 
 export interface AgentUpdatePayload {
