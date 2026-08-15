@@ -48,6 +48,7 @@ export type CodexTurnStateRequestAction =
 	| "hosted_suppressed"
 	| "ambiguous_lineage"
 	| "appended_input_suppressed"
+	| "evicted_suppressed"
 	| "missing_binding"
 	| "account_not_allowlisted"
 	| "model_not_allowlisted"
@@ -978,8 +979,47 @@ export class CodexTurnStateCoordinator {
 				updatedAt: now,
 			});
 			this.enforceEntryLimit(config.maxEntries);
+			// The cap is a hard bound: once nothing unprotected is left it evicts
+			// in-flight state too, including the generation and pending record this
+			// decision just consulted to approve a replay. Sending the token anyway
+			// would put it on the wire with nothing left to track it -- the turn
+			// finalizes as `stale_generation` and its lineage never advances -- so
+			// eviction has to take the replay with it, not just the bookkeeping.
+			if (
+				turnState !== undefined &&
+				!this.replayStateSurvivedEviction(
+					scopeKey,
+					input.attemptId,
+					generationEntry?.generation ?? null,
+				)
+			) {
+				return this.decision(arm, cohortId, "evicted_suppressed", false);
+			}
 		}
 		return this.decision(arm, cohortId, action, replayApplied, turnState);
+	}
+
+	/**
+	 * Whether the state a replay decision rested on outlived cap enforcement.
+	 *
+	 * Checks all three records the replay depends on: the attempt that will carry
+	 * the terminal, the pending turn the token belongs to, and the generation it
+	 * was minted under -- the last by value, since an evicted scope can be
+	 * recreated under a newer number.
+	 */
+	private replayStateSurvivedEviction(
+		scopeKey: string,
+		attemptId: string,
+		generationAtDecision: number | null,
+	): boolean {
+		if (!this.attempts.has(attemptId)) return false;
+		if (!this.pending.has(scopeKey)) return false;
+		const generation = this.generations.get(scopeKey);
+		if (!generation) return false;
+		return (
+			generationAtDecision === null ||
+			generation.generation === generationAtDecision
+		);
 	}
 
 	private decision(

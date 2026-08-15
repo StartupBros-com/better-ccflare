@@ -1367,6 +1367,35 @@ describe("Codex turn-state attempt registration", () => {
 		expect(coordinator.abortAttempt("attempt-hosted")).toBeNull();
 	});
 
+	test("suppresses replay when the entry cap evicts the state it just approved", () => {
+		enableTreatment();
+		process.env[CODEX_TURN_STATE_MAX_ENTRIES_ENV] = "2";
+		const coordinator = new CodexTurnStateCoordinator();
+		coordinator.beginAttempt(beginInput());
+		coordinator.finalizeAttempt({
+			attemptId: "attempt-1",
+			stopReason: "tool_use",
+			responseTurnState: "turn-token",
+			outputLineage: lineage("call-a"),
+		});
+
+		const decision = coordinator.beginAttempt(
+			beginInput({
+				requestId: "request-2",
+				attemptId: "attempt-2",
+				lineage: lineage("call-a"),
+			}),
+		);
+
+		// The cap is a hard bound, so enforcing it after this decision was made can
+		// drop the very generation and pending record the decision consulted. A
+		// token whose state is gone can never be tracked to a terminal -- the turn
+		// finalizes as stale_generation and its lineage is lost -- so eviction has
+		// to suppress the replay, not just the bookkeeping.
+		expect(decision.turnState).toBeUndefined();
+		expect(decision.replayApplied).toBe(false);
+	});
+
 	test("a compatible retry candidate never re-advances a dispatched turn", () => {
 		enableTreatment();
 		const coordinator = new CodexTurnStateCoordinator();

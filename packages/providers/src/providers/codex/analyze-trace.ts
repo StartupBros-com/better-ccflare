@@ -1114,6 +1114,7 @@ const TURN_STATE_REQUEST_ACTIONS = new Set([
 	"hosted_suppressed",
 	"ambiguous_lineage",
 	"appended_input_suppressed",
+	"evicted_suppressed",
 	"missing_binding",
 	"account_not_allowlisted",
 	"model_not_allowlisted",
