@@ -783,7 +783,10 @@ export class CodexTurnStateCoordinator {
 		this.touch(this.generations, attempt.scopeKey, generation);
 		if (attempt.arm === "observe") return "observed";
 		if (attempt.arm === "ineligible") return "ineligible";
-		if (input.stopReason === "error") return "error_ignored";
+		if (input.stopReason === "error") {
+			this.preserveReplayAfterTerminal(attempt, now);
+			return "error_ignored";
+		}
 		// Only the request holding the pending lease may mutate it. A request that
 		// arrived with a different lineage, or that lost the lease race, still
 		// reaches a terminal on this scope; capturing over the entry or retiring it
@@ -885,18 +888,47 @@ export class CodexTurnStateCoordinator {
 		const attempt = this.attempts.get(attemptId);
 		if (!attempt) return null;
 		this.attempts.delete(attemptId);
-		if (!attempt.scopeKey) return attempt.requestId;
-		const pending = this.pending.get(attempt.scopeKey);
-		if (pending?.leaseRequestId !== attempt.requestId) return attempt.requestId;
-		// The lease is held by the logical request, not this physical attempt, so
-		// it may only be released once that request has no other attempt live on
-		// this scope. A superseded fallback abandoned while the attempt it replaced
-		// is still running must leave that attempt's lease intact.
-		if (this.hasLiveAttempt(attempt.scopeKey, attempt.requestId)) {
-			return attempt.requestId;
-		}
-		delete pending.leaseRequestId;
+		this.preserveReplayAfterTerminal(attempt, this.now());
 		return attempt.requestId;
+	}
+
+	/**
+	 * Keeps replay/shadow state alive when an attempt ends without consuming it.
+	 *
+	 * In-flight attempts protect their scope from idle expiry, so one can run
+	 * beyond the pending turn's nominal TTL. Once the attempt is deleted that
+	 * protection disappears; without refreshing here, the next request's sweep
+	 * immediately expires the otherwise-preserved token using its pre-attempt
+	 * timestamp. Error terminals and explicit aborts share this exact lifecycle.
+	 *
+	 * Only the logical request holding this pending lease may refresh it. The
+	 * lease itself is released once that request has no other attempt live on the
+	 * scope, preserving concurrent physical retries while never fencing a future
+	 * logical request behind one that can no longer act.
+	 */
+	private preserveReplayAfterTerminal(
+		attempt: AttemptEntry,
+		now: number,
+	): void {
+		if (!attempt.scopeKey || attempt.generation === null) return;
+		const pending = this.pending.get(attempt.scopeKey);
+		if (
+			!pending ||
+			pending.generation !== attempt.generation ||
+			pending.leaseRequestId !== attempt.requestId
+		) {
+			return;
+		}
+		const generation = this.generations.get(attempt.scopeKey);
+		if (!generation || generation.generation !== attempt.generation) return;
+
+		generation.updatedAt = now;
+		this.touch(this.generations, attempt.scopeKey, generation);
+		pending.updatedAt = now;
+		if (!this.hasLiveAttempt(attempt.scopeKey, attempt.requestId)) {
+			delete pending.leaseRequestId;
+		}
+		this.touch(this.pending, attempt.scopeKey, pending);
 	}
 
 	/**

@@ -1367,6 +1367,61 @@ describe("Codex turn-state attempt registration", () => {
 		expect(coordinator.abortAttempt("attempt-hosted")).toBeNull();
 	});
 
+	test.each([
+		"error",
+		"abort",
+	] as const)("keeps replay state fresh after a long %s attempt", (terminal) => {
+		enableTreatment();
+		process.env[CODEX_TURN_STATE_IDLE_TTL_MS_ENV] = "1000";
+		let now = 0;
+		const coordinator = new CodexTurnStateCoordinator({ now: () => now });
+		coordinator.beginAttempt(beginInput());
+		coordinator.finalizeAttempt({
+			attemptId: "attempt-1",
+			stopReason: "tool_use",
+			responseTurnState: "turn-token",
+			outputLineage: lineage("call-a"),
+		});
+
+		const longAttempt = beginInput({
+			requestId: "request-2",
+			attemptId: "attempt-long",
+			lineage: lineage("call-a"),
+		});
+		expect(coordinator.beginAttempt(longAttempt).replayApplied).toBe(true);
+
+		// In-flight attempts protect their scope from idle expiry, so this attempt
+		// remains valid while it runs past the pending entry's nominal TTL.
+		now = 2_000;
+		if (terminal === "error") {
+			expect(
+				coordinator.finalizeAttempt({
+					attemptId: "attempt-long",
+					stopReason: "error",
+					responseTurnState: null,
+					outputLineage: { kind: "none" },
+				}),
+			).toBe("error_ignored");
+		} else {
+			expect(coordinator.abortAttempt("attempt-long")).toBe("request-2");
+		}
+
+		// Once the attempt is removed the scope loses that in-flight protection.
+		// The retained turn must have been refreshed by the terminal itself, or
+		// this begin-time sweep immediately expires it using its pre-attempt time.
+		now = 2_001;
+		const retry = coordinator.beginAttempt(
+			beginInput({
+				requestId: "request-2",
+				attemptId: "attempt-retry",
+				attemptCause: "other_retry",
+				lineage: lineage("call-a"),
+			}),
+		);
+		expect(retry.replayApplied).toBe(true);
+		expect(retry.turnState).toBe("turn-token");
+	});
+
 	test("suppresses replay when the entry cap evicts the state it just approved", () => {
 		enableTreatment();
 		process.env[CODEX_TURN_STATE_MAX_ENTRIES_ENV] = "2";
