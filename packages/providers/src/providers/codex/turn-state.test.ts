@@ -1367,6 +1367,33 @@ describe("Codex turn-state attempt registration", () => {
 		expect(coordinator.abortAttempt("attempt-hosted")).toBeNull();
 	});
 
+	test("a compatible retry candidate never re-advances a dispatched turn", () => {
+		enableTreatment();
+		const coordinator = new CodexTurnStateCoordinator();
+
+		// Candidate 1 opens the turn and dispatches.
+		coordinator.beginAttempt(beginInput());
+		// Candidate 2 belongs to the same logical request. The proxy classifies every
+		// candidate after a dispatch as a compatible retry, never as a new turn --
+		// that is what keeps this from advancing the generation and fencing the
+		// attempt already on the wire into `stale_generation`. The invariant lives in
+		// proxy-operations.ts (the attempt-cause ternary), so lock it here: if a
+		// second candidate for one request ever reached the new-turn path again, the
+		// dispatched attempt would silently stop capturing.
+		coordinator.beginAttempt(
+			beginInput({ attemptId: "attempt-1b", attemptCause: "other_retry" }),
+		);
+
+		expect(
+			coordinator.finalizeAttempt({
+				attemptId: "attempt-1",
+				stopReason: "tool_use",
+				responseTurnState: "turn-token",
+				outputLineage: lineage("call-a"),
+			}),
+		).toBe("captured");
+	});
+
 	test("suppresses replay when input is appended after the tool result", () => {
 		enableTreatment();
 		const coordinator = new CodexTurnStateCoordinator();

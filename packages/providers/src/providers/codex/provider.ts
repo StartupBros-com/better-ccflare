@@ -3880,6 +3880,20 @@ export class CodexProvider extends BaseProvider {
 						state.turnStateOutputCallsInvalid = true;
 					}
 					if (buffer) {
+						// Pairing is by output index alone, so the completion has to be
+						// checked against the call the start announced. Upstream completing
+						// a different call at the same index would otherwise record the
+						// started id -- the one the client was handed -- and a continuation
+						// carrying it would match a lineage minted for another call set.
+						const doneCallIdFingerprint = fingerprintCodexTurnStateCallId(
+							item?.call_id,
+						);
+						if (
+							!doneCallIdFingerprint ||
+							doneCallIdFingerprint !== buffer.callIdFingerprint
+						) {
+							state.turnStateOutputCallsInvalid = true;
+						}
 						const partialJson = this.sanitizeToolUsePartialJson(
 							buffer.name,
 							buffer.arguments.join(""),

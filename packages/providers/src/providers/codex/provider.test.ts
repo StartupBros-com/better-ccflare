@@ -737,6 +737,67 @@ describe("CodexProvider HTTP turn-state failure paths", () => {
 		expect(continuation.headers.get(turnStateHeader)).toBeNull();
 	});
 
+	it("fails closed when a completion carries a different call id than its start", async () => {
+		enableTreatment();
+		const provider = new CodexProvider();
+		const requestId = "request-mismatched-call";
+		const attemptId = "attempt-mismatched-call";
+		await provider.transformRequestBody(
+			requestFor(requestId, attemptId, [
+				{ role: "user", content: firstUserText },
+			]),
+			account,
+		);
+		const transformed = await provider.processResponse(
+			rawSseResponse(
+				requestId,
+				attemptId,
+				[
+					...eventLine("response.output_item.added", {
+						type: "response.output_item.added",
+						item: {
+							type: "function_call",
+							call_id: "call-started",
+							name: "search",
+						},
+						output_index: 0,
+					}),
+					// Same output index, different call: only the index is used to pair
+					// these events, so the lineage would record the started id.
+					...eventLine("response.output_item.done", {
+						type: "response.output_item.done",
+						item: {
+							type: "function_call",
+							call_id: "call-completed",
+							name: "search",
+						},
+						output_index: 0,
+					}),
+					...eventLine("response.completed", {
+						type: "response.completed",
+						response: { model: physicalModel },
+					}),
+				],
+				"turn-token",
+			),
+			null,
+		);
+		await transformed.text();
+
+		// The client was told the call was "call-started", so it returns that id and
+		// the lineage matches -- while upstream completed a different call. Capturing
+		// here would let that continuation replay a token minted for another turn.
+		const continuation = await provider.transformRequestBody(
+			requestFor(
+				`${requestId}-continuation`,
+				`${attemptId}-continuation`,
+				continuationMessages("call-started"),
+			),
+			account,
+		);
+		expect(continuation.headers.get(turnStateHeader)).toBeNull();
+	});
+
 	it("fails closed when one parallel tool call never completes", async () => {
 		enableTreatment();
 		const provider = new CodexProvider();
