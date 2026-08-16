@@ -1,12 +1,25 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
+	TURN_STATE_ARMS as analyzerArms,
+	TURN_STATE_REQUEST_ACTIONS as analyzerRequestActions,
+	TURN_STATE_TERMINAL_ACTIONS as analyzerTerminalActions,
+} from "./analyze-trace";
+import {
+	TURN_STATE_ARMS as traceArms,
+	TURN_STATE_REQUEST_ACTIONS as traceRequestActions,
+	TURN_STATE_TERMINAL_ACTIONS as traceTerminalActions,
+} from "./trace";
+import {
 	CODEX_TURN_STATE_ACCOUNT_IDS_ENV,
+	CODEX_TURN_STATE_ARMS,
 	CODEX_TURN_STATE_COHORT_IDS_ENV,
 	CODEX_TURN_STATE_IDLE_TTL_MS_ENV,
 	CODEX_TURN_STATE_MAX_ENTRIES_ENV,
 	CODEX_TURN_STATE_MODELS_ENV,
 	CODEX_TURN_STATE_OBSERVE_ONLY_ENV,
 	CODEX_TURN_STATE_PERCENT_ENV,
+	CODEX_TURN_STATE_REQUEST_ACTIONS,
+	CODEX_TURN_STATE_TERMINAL_ACTIONS,
 	type CodexTurnStateBeginInput,
 	CodexTurnStateCoordinator,
 	deriveCodexTurnStateCohortId,
@@ -1347,7 +1360,96 @@ describe("CodexTurnStateCoordinator", () => {
 	});
 });
 
+describe("Codex turn-state vocabularies", () => {
+	test("every emitted category survives trace serialization and analysis", () => {
+		// The invariant this file exists to protect: a category that beginAttempt or
+		// finalizeAttempt can emit must also be serializable by trace.ts and
+		// accepted by analyze-trace.ts. When those three lists were maintained by
+		// hand, missing one failed silently and in the worst direction -- the action
+		// was emitted but dropped from analysis, so a fail-closed guard became
+		// invisible to the measurement meant to prove it works.
+		expect([...traceArms].sort()).toEqual([...CODEX_TURN_STATE_ARMS].sort());
+		expect([...analyzerArms].sort()).toEqual([...CODEX_TURN_STATE_ARMS].sort());
+
+		expect([...traceRequestActions].sort()).toEqual(
+			[...CODEX_TURN_STATE_REQUEST_ACTIONS].sort(),
+		);
+		expect([...analyzerRequestActions].sort()).toEqual(
+			[...CODEX_TURN_STATE_REQUEST_ACTIONS].sort(),
+		);
+
+		expect([...traceTerminalActions].sort()).toEqual(
+			[...CODEX_TURN_STATE_TERMINAL_ACTIONS].sort(),
+		);
+		expect([...analyzerTerminalActions].sort()).toEqual(
+			[...CODEX_TURN_STATE_TERMINAL_ACTIONS].sort(),
+		);
+	});
+
+	test("an unknown category is still rejected rather than passed through", () => {
+		// Deriving the allowlists must not turn them into pass-throughs.
+		expect(traceRequestActions.has("not_a_real_action")).toBe(false);
+		expect(analyzerRequestActions.has("not_a_real_action")).toBe(false);
+		expect(traceTerminalActions.has("not_a_real_terminal")).toBe(false);
+		expect(analyzerTerminalActions.has("not_a_real_terminal")).toBe(false);
+	});
+});
+
 describe("Codex turn-state attempt registration", () => {
+	test("percent-gated cohort sentinel reaches treatment without pre-naming a cohort", () => {
+		// A cohort is account+model+conversation, so it only exists once that
+		// conversation is already running and it dies with it. Pre-naming one can
+		// never enrol future traffic, which is why the sentinel exists.
+		process.env[CODEX_TURN_STATE_PERCENT_ENV] = "100";
+		process.env[CODEX_TURN_STATE_ACCOUNT_IDS_ENV] = ACCOUNT;
+		process.env[CODEX_TURN_STATE_MODELS_ENV] = MODEL;
+		process.env[CODEX_TURN_STATE_COHORT_IDS_ENV] = "*";
+		const coordinator = new CodexTurnStateCoordinator();
+
+		expect(coordinator.beginAttempt(beginInput()).arm).toBe("treatment");
+	});
+
+	test("an empty cohort allowlist still cannot reach treatment at any percent", () => {
+		// The deployed default. This is the property that makes shipping dark safe,
+		// so it must hold even at percent=100.
+		process.env[CODEX_TURN_STATE_PERCENT_ENV] = "100";
+		process.env[CODEX_TURN_STATE_ACCOUNT_IDS_ENV] = ACCOUNT;
+		process.env[CODEX_TURN_STATE_MODELS_ENV] = MODEL;
+		process.env[CODEX_TURN_STATE_COHORT_IDS_ENV] = "";
+		const coordinator = new CodexTurnStateCoordinator();
+
+		expect(coordinator.beginAttempt(beginInput()).arm).toBe("control");
+	});
+
+	test("the sentinel is still gated by percent, account and model", () => {
+		process.env[CODEX_TURN_STATE_COHORT_IDS_ENV] = "*";
+		process.env[CODEX_TURN_STATE_ACCOUNT_IDS_ENV] = ACCOUNT;
+		process.env[CODEX_TURN_STATE_MODELS_ENV] = MODEL;
+
+		process.env[CODEX_TURN_STATE_PERCENT_ENV] = "0";
+		expect(new CodexTurnStateCoordinator().beginAttempt(beginInput()).arm).toBe(
+			"control",
+		);
+
+		process.env[CODEX_TURN_STATE_PERCENT_ENV] = "100";
+		expect(
+			new CodexTurnStateCoordinator().beginAttempt(
+				beginInput({ accountId: "account-not-listed" }),
+			).arm,
+		).toBe("ineligible");
+		expect(
+			new CodexTurnStateCoordinator().beginAttempt(
+				beginInput({ model: "gpt-not-listed" }),
+			).arm,
+		).toBe("ineligible");
+
+		// Observe-only still wins over the sentinel.
+		process.env[CODEX_TURN_STATE_OBSERVE_ONLY_ENV] = "1";
+		expect(new CodexTurnStateCoordinator().beginAttempt(beginInput()).arm).toBe(
+			"observe",
+		);
+	});
+
 	test("never registers a hosted attempt, which has no reachable terminal", () => {
 		enableTreatment();
 		const coordinator = new CodexTurnStateCoordinator();
