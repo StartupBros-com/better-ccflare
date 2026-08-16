@@ -163,10 +163,29 @@ If ever needed manually: update both `package.json` (root) and `apps/cli/package
 - `POST /api/accounts/:id/reload|pause|resume`
 
 ### Testing OpenRouter
-Always use model `z-ai/glm-4.5-air:free`:
+Use a **currently free** model, and look one up rather than trusting a slug written
+here — OpenRouter rotates which models carry the `:free` tier, so any pinned slug
+rots. (`z-ai/glm-4.5-air:free` was named here until 2026-08-16, when it started
+returning HTTP 404 `This model is unavailable for free. The paid version is
+available now`. A pinned paid slug silently spends real money instead.)
+
+Pick one:
 ```bash
-curl -X POST http://localhost:8081/v1/messages -H "Content-Type: application/json" -H "Authorization: Bearer test" -d '{"model":"z-ai/glm-4.5-air:free","messages":[{"role":"user","content":"test"}],"max_tokens":10}'
+curl -s https://openrouter.ai/api/v1/models | \
+  python3 -c "import json,sys; print('\n'.join(m['id'] for m in json.load(sys.stdin)['data'] if m['id'].endswith(':free')))"
 ```
+
+Then send it, force-routing to the openrouter account so the request cannot land
+on an Anthropic-backed one (see the testing restriction at the top of this file):
+```bash
+curl -X POST http://localhost:8081/v1/messages \
+  -H "Content-Type: application/json" -H "Authorization: Bearer test" \
+  -H "x-better-ccflare-account-id: $(sqlite3 ~/.config/better-ccflare/better-ccflare.db "SELECT id FROM accounts WHERE provider='openrouter' LIMIT 1;")" \
+  -d '{"model":"<free-slug>","messages":[{"role":"user","content":"test"}],"max_tokens":10}'
+```
+
+Add `"stream":true` to exercise the SSE translation path; a healthy stream ends
+with a `message_stop` event.
 
 ## Qwen Provider
 - When working on the Qwen provider or streaming transform, **always mirror the qwen-code implementation** using a locally available checkout of `QwenLM/qwen-code`. In the final response, state the checkout path and revision compared; if the comparison was not performed, explicitly say so and explain why.
