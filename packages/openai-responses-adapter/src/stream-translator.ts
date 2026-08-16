@@ -474,6 +474,76 @@ function processEvent(
  * the caller, which routes it through the terminal error/cancellation path
  * instead of being logged and ignored.
  */
+/** The `event:` and `data:` field values of one SSE frame, already trimmed. */
+export interface SseFrameFields {
+	eventType: string;
+	dataStr: string;
+}
+
+/**
+ * Read the `event:` and `data:` fields out of one complete SSE frame.
+ *
+ * Hot path: the canonical two-line, LF-terminated frame
+ * ("event: <type>\ndata: <json>"). Splitting that on /\r?\n/ walks and
+ * re-slices the entire frame, which for a near-4MiB data line is the dominant
+ * cost of parsing it. `indexOf` plus two slices reads the same two fields
+ * without materializing an intermediate array.
+ *
+ * The fast path is taken only when the frame contains exactly one LF and that
+ * LF is not part of a CRLF; every other arrangement (CRLF framing, multi-line
+ * data, comment/id lines, no newline at all) falls through to the original
+ * scanner, which stays the authority on those shapes. Both paths assign the
+ * fields in first-to-last order, so a LATER line still wins over an earlier
+ * one.
+ *
+ * Deliberately NOT the same parser as the Codex provider's
+ * `findCodexSseFrameLines` (packages/providers/src/providers/codex/provider.ts),
+ * and the two must not be unified: that one matches the prefixes WITHOUT a
+ * trailing space (`data:` as well as `data: `) and takes the FIRST matching
+ * line rather than the last. Each mirrors what its own upstream emits, and each
+ * is pinned by its own differential test suite. See
+ * docs/solutions/sse-translation-hot-path-and-benchmark-noise.md.
+ *
+ * Exported for the differential tests that pin the fast path to the fallback;
+ * not part of the package's public surface (see src/index.ts).
+ */
+export function parseSseFrameFields(rawEvent: string): SseFrameFields {
+	let eventType = "";
+	let dataStr = "";
+
+	const firstNewline = rawEvent.indexOf("\n");
+	const secondNewline =
+		firstNewline === -1 ? -1 : rawEvent.indexOf("\n", firstNewline + 1);
+	if (
+		firstNewline !== -1 &&
+		secondNewline === -1 &&
+		(firstNewline === 0 || rawEvent.charCodeAt(firstNewline - 1) !== 13)
+	) {
+		const firstLine = rawEvent.slice(0, firstNewline);
+		const secondLine = rawEvent.slice(firstNewline + 1);
+		if (firstLine.startsWith("event: ")) {
+			eventType = firstLine.slice(7).trim();
+		} else if (firstLine.startsWith("data: ")) {
+			dataStr = firstLine.slice(6).trim();
+		}
+		if (secondLine.startsWith("event: ")) {
+			eventType = secondLine.slice(7).trim();
+		} else if (secondLine.startsWith("data: ")) {
+			dataStr = secondLine.slice(6).trim();
+		}
+	} else {
+		for (const line of rawEvent.split(/\r?\n/)) {
+			if (line.startsWith("event: ")) {
+				eventType = line.slice(7).trim();
+			} else if (line.startsWith("data: ")) {
+				dataStr = line.slice(6).trim();
+			}
+		}
+	}
+
+	return { eventType, dataStr };
+}
+
 function processSseFrame(
 	rawEvent: string,
 	controller: TransformStreamDefaultController,
@@ -481,17 +551,7 @@ function processSseFrame(
 ): void {
 	if (!rawEvent.trim()) return;
 
-	const lines = rawEvent.split(/\r?\n/);
-	let eventType = "";
-	let dataStr = "";
-
-	for (const line of lines) {
-		if (line.startsWith("event: ")) {
-			eventType = line.slice(7).trim();
-		} else if (line.startsWith("data: ")) {
-			dataStr = line.slice(6).trim();
-		}
-	}
+	const { eventType, dataStr } = parseSseFrameFields(rawEvent);
 
 	if (!eventType || !dataStr) return;
 

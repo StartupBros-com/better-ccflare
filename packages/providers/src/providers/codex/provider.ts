@@ -436,6 +436,76 @@ function shouldPreserveCodexTransportStatus(
 	);
 }
 
+/**
+ * The `event:` and `data:` lines of one complete SSE frame, or `undefined` for
+ * whichever line the frame does not carry.
+ */
+export interface CodexSseFrameLines {
+	eventLine: string | undefined;
+	dataLine: string | undefined;
+}
+
+/**
+ * Locate the `event:` and `data:` lines of an SSE frame.
+ *
+ * A Codex `data:` line can approach the 4MiB transport frame cap
+ * (BUFFER_SIZES.SSE_TRANSPORT_FRAME_MAX_BYTES), and this runs once per frame on
+ * the streaming hot path, so how the frame is scanned matters. The hot shape is
+ * the canonical two-line, LF-terminated frame; it is read with `indexOf` plus
+ * two slices rather than by splitting the whole frame into an array.
+ *
+ * Semantics are exactly those of the two `.find()` scans this replaces, and are
+ * deliberately NOT the same as the OpenAI Responses adapter's frame parser
+ * (`parseSseFrameFields` in
+ * packages/openai-responses-adapter/src/stream-translator.ts). The two must not
+ * be unified:
+ *
+ *   - the prefixes have no trailing space (`event:`, not `event: `), so a
+ *     space-less `data:{...}` line still matches, and
+ *   - the FIRST matching line wins for each field, not the last.
+ *
+ * Each mirrors what its own upstream emits, and each is pinned by its own
+ * differential test suite. See
+ * docs/solutions/performance-issues/sse-translation-hot-path-and-benchmark-noise.md.
+ *
+ * The fast path is taken only for a frame holding exactly one LF that is not
+ * part of a CRLF. CRLF framing, multi-line data, id/comment lines and
+ * newline-free frames all fall through to the array scan, which stays the
+ * authority on those shapes — except that it now splits once instead of twice.
+ */
+export function findCodexSseFrameLines(eventText: string): CodexSseFrameLines {
+	const firstNewline = eventText.indexOf("\n");
+	const secondNewline =
+		firstNewline === -1 ? -1 : eventText.indexOf("\n", firstNewline + 1);
+
+	if (
+		firstNewline !== -1 &&
+		secondNewline === -1 &&
+		(firstNewline === 0 || eventText.charCodeAt(firstNewline - 1) !== 13)
+	) {
+		const firstLine = eventText.slice(0, firstNewline);
+		const secondLine = eventText.slice(firstNewline + 1);
+		return {
+			eventLine: firstLine.startsWith("event:")
+				? firstLine
+				: secondLine.startsWith("event:")
+					? secondLine
+					: undefined,
+			dataLine: firstLine.startsWith("data:")
+				? firstLine
+				: secondLine.startsWith("data:")
+					? secondLine
+					: undefined,
+		};
+	}
+
+	const lines = eventText.split(/\r?\n/);
+	return {
+		eventLine: lines.find((l) => l.startsWith("event:")),
+		dataLine: lines.find((l) => l.startsWith("data:")),
+	};
+}
+
 // Buffered tool-call argument bytes are bounded by two independent policies
 // (packages/core/src/constants.ts): a per-call cap on any single function
 // call's accumulated argument buffer, and a separate aggregate cap across
@@ -3376,12 +3446,7 @@ export class CodexProvider extends BaseProvider {
 
 					// Process complete SSE events extracted from this chunk
 					for (const eventText of frames) {
-						const eventLine = eventText
-							.split(/\r?\n/)
-							.find((l) => l.startsWith("event:"));
-						const dataLine = eventText
-							.split(/\r?\n/)
-							.find((l) => l.startsWith("data:"));
+						const { eventLine, dataLine } = findCodexSseFrameLines(eventText);
 
 						if (!eventLine || !dataLine) continue;
 
