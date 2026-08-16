@@ -98,7 +98,7 @@ describe("findCodexSseFrameLines", () => {
 		expectMatchesReference(frame, label);
 	});
 
-	test("matches the reference scan across randomized frame assemblies", () => {
+	test("matches the reference scan across 400,000 randomized frames", () => {
 		// Deterministic LCG so a failure is reproducible.
 		const tokens = [
 			"event: ",
@@ -125,7 +125,8 @@ describe("findCodexSseFrameLines", () => {
 			return seed / 0x100000000;
 		};
 
-		for (let i = 0; i < 20_000; i++) {
+		let fastPathTaken = 0;
+		for (let i = 0; i < 400_000; i++) {
 			const n = 1 + Math.floor(rnd() * 7);
 			let frame = "";
 			for (let j = 0; j < n; j++) {
@@ -141,7 +142,19 @@ describe("findCodexSseFrameLines", () => {
 					`divergence for ${JSON.stringify(frame)}: got ${JSON.stringify(actual)}, expected ${JSON.stringify(expected)}`,
 				);
 			}
+			const f = frame.indexOf("\n");
+			if (
+				f !== -1 &&
+				frame.indexOf("\n", f + 1) === -1 &&
+				(f === 0 || frame.charCodeAt(f - 1) !== 13)
+			) {
+				fastPathTaken++;
+			}
 		}
+		// Guard against a corpus that silently stops reaching the optimized
+		// branch: without this, a change that disabled the fast path entirely
+		// would still pass every assertion above.
+		expect(fastPathTaken).toBeGreaterThan(1000);
 	});
 
 	test("a large data line is returned intact", () => {

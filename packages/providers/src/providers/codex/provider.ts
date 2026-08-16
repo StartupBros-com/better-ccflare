@@ -455,11 +455,18 @@ export interface CodexSseFrameLines {
  * two slices rather than by splitting the whole frame into an array.
  *
  * Semantics are exactly those of the two `.find()` scans this replaces, and are
- * deliberately NOT the same as the OpenAI Responses adapter's frame parser:
+ * deliberately NOT the same as the OpenAI Responses adapter's frame parser
+ * (`parseSseFrameFields` in
+ * packages/openai-responses-adapter/src/stream-translator.ts). The two must not
+ * be unified:
  *
  *   - the prefixes have no trailing space (`event:`, not `event: `), so a
  *     space-less `data:{...}` line still matches, and
  *   - the FIRST matching line wins for each field, not the last.
+ *
+ * Each mirrors what its own upstream emits, and each is pinned by its own
+ * differential test suite. See
+ * docs/solutions/performance-issues/sse-translation-hot-path-and-benchmark-noise.md.
  *
  * The fast path is taken only for a frame holding exactly one LF that is not
  * part of a CRLF. CRLF framing, multi-line data, id/comment lines and

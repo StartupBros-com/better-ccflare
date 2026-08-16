@@ -1,9 +1,9 @@
 ---
 title: SSE translation hot path — what actually helps, and why the matrix benchmark lies under load
 date: 2026-08-16
-category: performance
+category: performance-issues
 module: sse-stream-translation
-problem_type: performance_optimization
+problem_type: performance_issue
 component: openai_responses_adapter
 severity: medium
 applies_when:
@@ -54,8 +54,18 @@ newline at all — still falls through to the original scanner. The fast path is
 guarded to exactly one LF that is not preceded by CR, so it is deliberately
 conservative: shapes it is unsure about get the old code, not a new code path.
 
-A 400,000-input differential fuzz (hand-written adversarial corpus plus randomized
-token assembly) found zero divergence between the two parsers.
+The fast path is pinned to the scanner it replaced by a committed differential
+test: `packages/openai-responses-adapter/src/__tests__/sse-frame-fields.test.ts`
+holds a verbatim copy of the pre-change scanner as `referenceParse` and compares
+the two across a hand-written adversarial corpus plus **400,000 randomized
+frames** (fixed LCG seed, so any divergence is reproducible and the thrown error
+names the frame). It also asserts the corpus actually reaches the optimized
+branch, so a change that silently disabled the fast path would fail rather than
+pass vacuously.
+
+Run it with `bun test packages/openai-responses-adapter/src/__tests__/sse-frame-fields.test.ts`.
+Do not trust a fuzz number that is not committed — see
+[validate-against-live-payloads.md](../validate-against-live-payloads.md).
 
 ### The same fix applies to the Codex provider, and is worth more there
 
@@ -66,8 +76,23 @@ regex splits and two array scans.
 
 `findCodexSseFrameLines()` applies the same guarded fast path there and, on the
 fallback, splits once instead of twice. Measured **~88% faster** on a 1MB frame
-(−89.0%, −87.9%, −88.6% across three runs), with a separate 400,000-input
-differential fuzz showing zero divergence.
+(−89.0%, −87.9%, −88.6% across three runs), and pinned by its own committed
+differential suite (`packages/providers/src/providers/codex/sse-frame-lines.test.ts`,
+same shape: verbatim reference scanner, adversarial corpus, 400,000 randomized
+frames, plus the fast-path-reached assertion).
+
+### Known cost: the guard scans the frame twice on a fallback
+
+Proving "exactly one LF" requires a second `indexOf` over the remainder, so a
+frame that ends up on the fallback has already paid one full scan before the
+`split` scans again. The worst case is a frame whose only two LFs sit at the
+very start and very end — a crafted `"\n" + 4MiB + "\n"` measures roughly **1.5x
+the pre-change cost**. This is accepted rather than mitigated: `indexOf` is a
+byte-scan and the regex `split` it avoids is far more expensive, so the trade is
+strongly positive on every real frame shape, and bounding the second scan would
+risk missing a genuine second LF and wrongly taking the fast path. If it ever
+matters, the safe lever is a per-stream circuit breaker (stop attempting the
+fast path once wasted guard bytes exceed a threshold), never a narrower guard.
 
 **The two parsers are deliberately NOT unified.** Their semantics differ and
 both are load-bearing:
@@ -178,3 +203,18 @@ strictly removes a redundant `this.carry + decoded` concatenation. It was kept a
 a correctness-preserving simplification, not as a measured speedup: `searchText`
 is assigned at the top of `push()` and `this.carry` is not reassigned until the
 line in question, so the two expressions are provably the same string.
+
+## Related
+
+- [validate-against-live-payloads.md](../validate-against-live-payloads.md) —
+  the same failure mode this document had to fix in review: a coverage claim
+  written down without being checked against what was actually run. An earlier
+  draft of this page cited a 400,000-input fuzz that existed only as a throwaway
+  script; four reviewers caught it independently. Both fuzzes are now committed
+  tests, and the numbers above are reproducible from the repo.
+- [typecheck-does-not-cover-test-call-sites.md](../workflow-issues/typecheck-does-not-cover-test-call-sites.md) —
+  `bun run typecheck` excludes test files, so the differential suites named here
+  are only as good as the last time they were actually run. Run them, don't
+  assume a green typecheck covered them.
+- [rate-limit-scope-and-duration.md](../rate-limit-scope-and-duration.md) —
+  unrelated subsystem, but the same lesson about measuring the thing you claim.
