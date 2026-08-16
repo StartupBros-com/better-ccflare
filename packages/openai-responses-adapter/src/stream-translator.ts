@@ -481,15 +481,48 @@ function processSseFrame(
 ): void {
 	if (!rawEvent.trim()) return;
 
-	const lines = rawEvent.split(/\r?\n/);
 	let eventType = "";
 	let dataStr = "";
 
-	for (const line of lines) {
-		if (line.startsWith("event: ")) {
-			eventType = line.slice(7).trim();
-		} else if (line.startsWith("data: ")) {
-			dataStr = line.slice(6).trim();
+	// Hot path: the canonical two-line, LF-terminated frame
+	// ("event: <type>\ndata: <json>"). Splitting that on /\r?\n/ walks and
+	// re-slices the entire frame, which for a near-4MiB data line is the
+	// dominant cost of parsing it. `indexOf` plus two slices reads the same
+	// two fields without materializing an intermediate array.
+	//
+	// The fast path is taken only when the frame contains exactly one LF and
+	// that LF is not part of a CRLF; every other arrangement (CRLF framing,
+	// multi-line data, comment/id lines, no newline at all) falls through to
+	// the original scanner, which stays the authority on those shapes. Both
+	// paths assign the fields in first-to-last order, so a later line still
+	// wins over an earlier one.
+	const firstNewline = rawEvent.indexOf("\n");
+	const secondNewline =
+		firstNewline === -1 ? -1 : rawEvent.indexOf("\n", firstNewline + 1);
+	if (
+		firstNewline !== -1 &&
+		secondNewline === -1 &&
+		(firstNewline === 0 || rawEvent.charCodeAt(firstNewline - 1) !== 13)
+	) {
+		const firstLine = rawEvent.slice(0, firstNewline);
+		const secondLine = rawEvent.slice(firstNewline + 1);
+		if (firstLine.startsWith("event: ")) {
+			eventType = firstLine.slice(7).trim();
+		} else if (firstLine.startsWith("data: ")) {
+			dataStr = firstLine.slice(6).trim();
+		}
+		if (secondLine.startsWith("event: ")) {
+			eventType = secondLine.slice(7).trim();
+		} else if (secondLine.startsWith("data: ")) {
+			dataStr = secondLine.slice(6).trim();
+		}
+	} else {
+		for (const line of rawEvent.split(/\r?\n/)) {
+			if (line.startsWith("event: ")) {
+				eventType = line.slice(7).trim();
+			} else if (line.startsWith("data: ")) {
+				dataStr = line.slice(6).trim();
+			}
 		}
 	}
 

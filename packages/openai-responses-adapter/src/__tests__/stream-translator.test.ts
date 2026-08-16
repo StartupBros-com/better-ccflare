@@ -1322,3 +1322,198 @@ describe("translateAnthropicStreamToResponses bounded memory under concurrency",
 		expect(minDelta).toBeLessThan(budget);
 	}, 60_000);
 });
+
+// processSseFrame parses the canonical two-line LF frame with indexOf instead
+// of splitting on /\r?\n/, because splitting re-slices the whole frame and a
+// data line can approach the 4MiB transport cap. Every other frame shape falls
+// through to the original scanner. These tests pin the two paths together: a
+// shape that stops taking the fast path must still translate identically, so
+// the optimization can never silently change how a frame is read.
+describe("translateAnthropicStreamToResponses frame shape parsing", () => {
+	const logicalEvents: Array<[string, unknown]> = [
+		[
+			"message_start",
+			{
+				type: "message_start",
+				message: {
+					id: "msg_shape",
+					usage: { input_tokens: 4, output_tokens: 0 },
+				},
+			},
+		],
+		[
+			"content_block_start",
+			{
+				type: "content_block_start",
+				index: 0,
+				content_block: { type: "text", text: "" },
+			},
+		],
+		[
+			"content_block_delta",
+			{
+				type: "content_block_delta",
+				index: 0,
+				delta: { type: "text_delta", text: "Hello" },
+			},
+		],
+		[
+			"content_block_delta",
+			{
+				type: "content_block_delta",
+				index: 0,
+				delta: { type: "text_delta", text: " world" },
+			},
+		],
+		["content_block_stop", { type: "content_block_stop", index: 0 }],
+		[
+			"message_delta",
+			{
+				type: "message_delta",
+				delta: { stop_reason: "end_turn" },
+				usage: { output_tokens: 2 },
+			},
+		],
+		["message_stop", { type: "message_stop" }],
+	];
+
+	/**
+	 * Frame shapers. `fastPath` records whether processSseFrame's indexOf
+	 * branch handles that shape (exactly one LF, not preceded by CR); the
+	 * rest must reach the same result via the fallback scanner.
+	 */
+	const shapes: Array<{
+		name: string;
+		fastPath: boolean;
+		frame: (type: string, data: unknown) => string;
+		delimiter: string;
+	}> = [
+		{
+			name: "canonical event-then-data (LF)",
+			fastPath: true,
+			frame: (t, d) => `event: ${t}\ndata: ${JSON.stringify(d)}`,
+			delimiter: "\n\n",
+		},
+		{
+			name: "reversed data-then-event (LF)",
+			fastPath: true,
+			frame: (t, d) => `data: ${JSON.stringify(d)}\nevent: ${t}`,
+			delimiter: "\n\n",
+		},
+		{
+			name: "with a leading id: line",
+			fastPath: false,
+			frame: (t, d) => `id: 1\nevent: ${t}\ndata: ${JSON.stringify(d)}`,
+			delimiter: "\n\n",
+		},
+		{
+			name: "with a leading comment line",
+			fastPath: false,
+			frame: (t, d) => `: keep-alive\nevent: ${t}\ndata: ${JSON.stringify(d)}`,
+			delimiter: "\n\n",
+		},
+		{
+			name: "CRLF framing",
+			fastPath: false,
+			frame: (t, d) => `event: ${t}\r\ndata: ${JSON.stringify(d)}`,
+			delimiter: "\r\n\r\n",
+		},
+		{
+			name: "trailing blank line inside the frame",
+			fastPath: false,
+			frame: (t, d) => `event: ${t}\ndata: ${JSON.stringify(d)}\n`,
+			delimiter: "\n\n",
+		},
+	];
+
+	async function translateShape(shape: (typeof shapes)[number]) {
+		const body = `${logicalEvents
+			.map(([type, data]) => shape.frame(type, data))
+			.join(shape.delimiter)}${shape.delimiter}`;
+		const upstream = new Response(body, {
+			headers: { "Content-Type": "text/event-stream" },
+		});
+		const result = translateAnthropicStreamToResponses(
+			upstream,
+			"resp_shape",
+			"claude-3-5-sonnet-20241022",
+		);
+		return collectSseEvents(result);
+	}
+
+	test("every frame shape yields the identical translated event stream", async () => {
+		const canonical = await translateShape(shapes[0]);
+		expect(canonical.length).toBeGreaterThan(0);
+		expect(canonical[canonical.length - 1].event).toBe("response.completed");
+
+		for (const shape of shapes) {
+			const parsed = await translateShape(shape);
+			expect(
+				parsed.map((e) => e.event),
+				`event sequence differs for shape: ${shape.name}`,
+			).toEqual(canonical.map((e) => e.event));
+			expect(
+				JSON.stringify(parsed),
+				`payloads differ for shape: ${shape.name}`,
+			).toBe(JSON.stringify(canonical));
+		}
+	});
+
+	test("assembled text is identical whichever parse path a frame takes", async () => {
+		for (const shape of shapes) {
+			const parsed = await translateShape(shape);
+			const textDone = parsed.find(
+				(e) => e.event === "response.output_text.done",
+			);
+			expect(
+				(textDone?.data as Record<string, unknown> | undefined)?.text,
+				`assembled text differs for shape: ${shape.name}`,
+			).toBe("Hello world");
+		}
+	});
+
+	test("a data line containing escaped newlines stays on the fast path intact", async () => {
+		// The payload's newlines are JSON-escaped (\\n), so the raw frame still
+		// holds exactly one real LF and takes the fast path. The decoded text
+		// must keep its embedded newlines.
+		const multiline = "line one\nline two\nline three";
+		const events = [
+			sseEvent("message_start", {
+				type: "message_start",
+				message: {
+					id: "msg_escaped",
+					usage: { input_tokens: 1, output_tokens: 0 },
+				},
+			}),
+			sseEvent("content_block_start", {
+				type: "content_block_start",
+				index: 0,
+				content_block: { type: "text", text: "" },
+			}),
+			sseEvent("content_block_delta", {
+				type: "content_block_delta",
+				index: 0,
+				delta: { type: "text_delta", text: multiline },
+			}),
+			sseEvent("content_block_stop", { type: "content_block_stop", index: 0 }),
+			sseEvent("message_delta", {
+				type: "message_delta",
+				delta: { stop_reason: "end_turn" },
+				usage: { output_tokens: 1 },
+			}),
+			sseEvent("message_stop", { type: "message_stop" }),
+		];
+
+		const parsed = await collectSseEvents(
+			translateAnthropicStreamToResponses(
+				makeAnthropicStream(events),
+				"resp_escaped",
+				"claude-3-5-sonnet-20241022",
+			),
+		);
+		const textDone = parsed.find(
+			(e) => e.event === "response.output_text.done",
+		);
+		expect((textDone?.data as Record<string, unknown>).text).toBe(multiline);
+	});
+});
