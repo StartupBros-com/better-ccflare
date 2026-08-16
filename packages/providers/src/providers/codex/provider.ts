@@ -910,6 +910,16 @@ interface CodexTransformOptions {
 	hosted?: boolean;
 }
 
+interface CodexProcessResponseOptions {
+	/**
+	 * Whether this response belongs to a hosted-search attempt. Hosted attempts
+	 * are never registered with the turn-state coordinator, so they must not try
+	 * to finalize one: the lookup would miss and report `unknown_attempt`, which
+	 * is reserved for an attempt that was registered and then lost.
+	 */
+	hosted?: boolean;
+}
+
 export class CodexProvider extends BaseProvider {
 	name = "codex";
 	private readonly streamLivenessOptions: CodexStreamLivenessOptions;
@@ -1001,7 +1011,16 @@ export class CodexProvider extends BaseProvider {
 					sanitizeHeaders: sanitizeResponseHeaders,
 					sanitizeClientFunctionArguments: (name, argumentsJson) =>
 						this.sanitizeToolUsePartialJson(name, argumentsJson),
-					fallback: () => this.processResponse(response, context.account),
+					fallback: () =>
+						// Hosted search never registers a turn-state attempt (it has no
+						// reachable turn-state terminal), so finalizing here would look
+						// up an attempt the coordinator was never told about and report
+						// `unknown_attempt` -- a counter that otherwise means "we lost
+						// an attempt we should still have". Say `ineligible` instead,
+						// which is what this attempt actually was.
+						this.processResponse(response, context.account, undefined, {
+							hosted: true,
+						}),
 				});
 			},
 			parseRateLimit: (response) => this.parseRateLimit(response),
@@ -1539,9 +1558,18 @@ export class CodexProvider extends BaseProvider {
 		}
 	}
 
+	/**
+	 * @param _requestHeaders - Third positional slot in the `Provider` contract.
+	 * Codex does not read it, but it is accepted so this stays assignable to the
+	 * shared signature -- the same collision that bit `transformRequestBody`.
+	 * @param options - Codex-private options; keep them after the contract's own
+	 * parameters so a future shared parameter does not collide.
+	 */
 	async processResponse(
 		response: Response,
 		_account: Account | null,
+		_requestHeaders?: Headers,
+		options: CodexProcessResponseOptions = {},
 	): Promise<Response> {
 		const contentType = response.headers.get("content-type");
 		const requestId = response.headers.get("x-better-ccflare-request-id");
@@ -1574,6 +1602,7 @@ export class CodexProvider extends BaseProvider {
 					requestId ?? undefined,
 					attemptId ?? undefined,
 					finalModel,
+					options.hosted === true,
 				);
 			}
 			// Wire keepalives belong only on a streaming Anthropic response.
@@ -1584,6 +1613,7 @@ export class CodexProvider extends BaseProvider {
 				requestId ?? undefined,
 				attemptId ?? undefined,
 				finalModel,
+				options.hosted === true,
 			);
 		}
 
@@ -1607,6 +1637,7 @@ export class CodexProvider extends BaseProvider {
 					requestId ?? undefined,
 					attemptId ?? undefined,
 					finalModel,
+					options.hosted === true,
 				);
 			}
 			return this.transformSseResponseToJson(
@@ -1614,6 +1645,7 @@ export class CodexProvider extends BaseProvider {
 				requestId ?? undefined,
 				attemptId ?? undefined,
 				finalModel,
+				options.hosted === true,
 			);
 		}
 
@@ -2814,12 +2846,14 @@ export class CodexProvider extends BaseProvider {
 			undefined,
 		finalModel = response.headers.get("x-better-ccflare-final-model") ??
 			undefined,
+		hosted = false,
 	): Promise<Response> {
 		const transformed = this.transformStreamingResponse(
 			response,
 			requestId,
 			attemptId,
 			finalModel,
+			hosted,
 		);
 		const reader = transformed.body
 			?.pipeThrough(new TextDecoderStream())
@@ -3054,6 +3088,7 @@ export class CodexProvider extends BaseProvider {
 			undefined,
 		finalModel = response.headers.get("x-better-ccflare-final-model") ??
 			"unknown",
+		hosted = false,
 	): Response {
 		const state: StreamState = {
 			messageId: `msg_${crypto.randomUUID().replace(/-/g, "").substring(0, 24)}`,
@@ -3089,14 +3124,18 @@ export class CodexProvider extends BaseProvider {
 			traceTurnState: response.headers.get(CODEX_TURN_STATE_HEADER),
 			turnStateTerminalAction: null,
 			finalizeTurnState: (stopReason, outputLineage) =>
-				attemptId
-					? this.turnStateCoordinator.finalizeAttempt({
-							attemptId,
-							stopReason,
-							responseTurnState: response.headers.get(CODEX_TURN_STATE_HEADER),
-							outputLineage,
-						})
-					: "unknown_attempt",
+				hosted
+					? "ineligible"
+					: attemptId
+						? this.turnStateCoordinator.finalizeAttempt({
+								attemptId,
+								stopReason,
+								responseTurnState: response.headers.get(
+									CODEX_TURN_STATE_HEADER,
+								),
+								outputLineage,
+							})
+						: "unknown_attempt",
 			traceResponseId: null,
 			lastProgressPingAt: null,
 			terminalTraceWritten: false,

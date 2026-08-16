@@ -838,6 +838,15 @@ describe("xAI-only keepalive canary", () => {
 		resetStore();
 	});
 
+	afterEach(() => {
+		// These cases replace globalThis.fetch. Without restoring it the mock
+		// outlives this file and every later file in the same `bun test` process
+		// sees a fetch that never reaches the network -- which is how a real
+		// socket test elsewhere starts failing only in batch runs.
+		globalThis.fetch = originalFetch;
+		resetStore();
+	});
+
 	it("starts from xAI TTL alone and skips anthropic accounts", async () => {
 		const fetchMock = mock(
 			async (_input: RequestInfo | URL, _init?: RequestInit) =>

@@ -1,5 +1,10 @@
 /** Analyze Codex JSONL traces without retaining prompt content. */
 import { readFileSync } from "node:fs";
+import {
+	CODEX_TURN_STATE_ARMS,
+	CODEX_TURN_STATE_REQUEST_ACTIONS,
+	CODEX_TURN_STATE_TERMINAL_ACTIONS,
+} from "./turn-state";
 
 interface ToolCall {
 	name: string;
@@ -1093,46 +1098,22 @@ const OFFICIAL_CODEX_MODEL_FAMILIES: ReadonlyArray<readonly [RegExp, string]> =
 		[/^gpt-5\.4(?:-\d{4}-\d{2}-\d{2})?$/, "gpt-5.4"],
 		[/^gpt-5\.3-codex(?:-\d{4}-\d{2}-\d{2})?$/, "gpt-5.3-codex"],
 	];
-const TURN_STATE_ARMS = new Set<TurnStateExperimentArm>([
-	"observe",
-	"control",
-	"treatment",
-	"ineligible",
-]);
-const TURN_STATE_REQUEST_ACTIONS = new Set([
-	"new_turn",
-	"replay",
-	"retry_replay",
-	"would_replay",
-	"observe",
-	"no_pending",
-	"no_token",
-	"concurrent_suppressed",
-	"rescue_suppressed",
-	"failover_suppressed",
-	"custom_endpoint_suppressed",
-	"hosted_suppressed",
-	"ambiguous_lineage",
-	"appended_input_suppressed",
-	"evicted_suppressed",
-	"missing_binding",
-	"account_not_allowlisted",
-	"model_not_allowlisted",
-	"percent_control",
-	"cohort_not_allowlisted",
-]);
-const TURN_STATE_TERMINAL_ACTIONS = new Set([
-	"captured",
-	"advanced",
-	"retired",
-	"error_ignored",
-	"invalid_token",
-	"ambiguous_calls",
-	"stale_generation",
-	"observed",
-	"ineligible",
-	"unknown_attempt",
-]);
+// Derived from the canonical vocabularies in turn-state.ts. Repeating the
+// literals here once meant a newly emitted action could be silently dropped by
+// this allowlist -- making a fail-closed guard invisible to the analysis meant
+// to prove it works.
+/** @internal Exported only so the vocabulary invariant can be asserted. */
+export const TURN_STATE_ARMS = new Set<TurnStateExperimentArm>(
+	CODEX_TURN_STATE_ARMS,
+);
+/** @internal Exported only so the vocabulary invariant can be asserted. */
+export const TURN_STATE_REQUEST_ACTIONS = new Set<string>(
+	CODEX_TURN_STATE_REQUEST_ACTIONS,
+);
+/** @internal Exported only so the vocabulary invariant can be asserted. */
+export const TURN_STATE_TERMINAL_ACTIONS = new Set<string>(
+	CODEX_TURN_STATE_TERMINAL_ACTIONS,
+);
 const EXPLICIT_BREAKPOINT_ACTIONS = new Set([
 	"placed_source_marker",
 	"placed_first_user_text",

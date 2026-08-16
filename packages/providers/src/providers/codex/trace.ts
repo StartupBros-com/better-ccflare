@@ -30,10 +30,13 @@ import type {
 	OrchestrationAdmission,
 	OrchestrationAdmissionBasis,
 } from "./orchestration-election";
-import type {
-	CodexTurnStateArm,
-	CodexTurnStateRequestAction,
-	CodexTurnStateTerminalAction,
+import {
+	CODEX_TURN_STATE_ARMS,
+	CODEX_TURN_STATE_REQUEST_ACTIONS,
+	CODEX_TURN_STATE_TERMINAL_ACTIONS,
+	type CodexTurnStateArm,
+	type CodexTurnStateRequestAction,
+	type CodexTurnStateTerminalAction,
 } from "./turn-state";
 
 export const CODEX_TRACE_DIR_ENV = "CCFLARE_CODEX_TRACE_DIR";
@@ -45,46 +48,19 @@ export const CODEX_FANOUT_WARN_ENV = "CCFLARE_CODEX_FANOUT_WARN";
 const TRACE_SCHEMA_VERSION = 18;
 const DEFAULT_FANOUT_WARN = 8;
 const TURN_STATE_COHORT_PATTERN = /^[0-9a-f]{16}$/;
-const TURN_STATE_ARMS = new Set<CodexTurnStateArm>([
-	"observe",
-	"control",
-	"treatment",
-	"ineligible",
-]);
-const TURN_STATE_REQUEST_ACTIONS = new Set<CodexTurnStateRequestAction>([
-	"new_turn",
-	"replay",
-	"retry_replay",
-	"would_replay",
-	"observe",
-	"no_pending",
-	"no_token",
-	"concurrent_suppressed",
-	"rescue_suppressed",
-	"failover_suppressed",
-	"custom_endpoint_suppressed",
-	"hosted_suppressed",
-	"ambiguous_lineage",
-	"appended_input_suppressed",
-	"evicted_suppressed",
-	"missing_binding",
-	"account_not_allowlisted",
-	"model_not_allowlisted",
-	"percent_control",
-	"cohort_not_allowlisted",
-]);
-const TURN_STATE_TERMINAL_ACTIONS = new Set<CodexTurnStateTerminalAction>([
-	"captured",
-	"advanced",
-	"retired",
-	"error_ignored",
-	"invalid_token",
-	"ambiguous_calls",
-	"stale_generation",
-	"observed",
-	"ineligible",
-	"unknown_attempt",
-]);
+// Derived from the canonical vocabularies so a new category cannot be emitted
+// without also being serializable here. See turn-state.ts for why.
+/** @internal Exported only so the vocabulary invariant can be asserted. */
+export const TURN_STATE_ARMS = new Set<CodexTurnStateArm>(
+	CODEX_TURN_STATE_ARMS,
+);
+/** @internal Exported only so the vocabulary invariant can be asserted. */
+export const TURN_STATE_REQUEST_ACTIONS = new Set<CodexTurnStateRequestAction>(
+	CODEX_TURN_STATE_REQUEST_ACTIONS,
+);
+/** @internal Exported only so the vocabulary invariant can be asserted. */
+export const TURN_STATE_TERMINAL_ACTIONS =
+	new Set<CodexTurnStateTerminalAction>(CODEX_TURN_STATE_TERMINAL_ACTIONS);
 const MAX_INPUT_ITEM_FINGERPRINTS = 64;
 /**
  * Tool names that spawn subagents in Claude Code ("Task" historically,

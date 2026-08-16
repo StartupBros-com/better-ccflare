@@ -21,51 +21,78 @@ const MAX_CALL_IDS = 64;
 const MAX_CALL_ID_BYTES = 512;
 const MAX_TURN_STATE_BYTES = 4_096;
 const COHORT_PATTERN = /^[0-9a-f]{16}$/;
+/**
+ * Opt-in token for `CCFLARE_CODEX_TURN_STATE_COHORT_IDS` meaning "any cohort the
+ * deterministic percentage selects". Cannot collide with a real cohort ID, which
+ * is always 16 lowercase hex characters.
+ */
+const COHORT_WILDCARD = "*";
 const SCOPE_DOMAIN = "better-ccflare:codex-turn-state-scope:v1\0";
 const COHORT_DOMAIN = "better-ccflare:codex-turn-state-cohort:v1\0";
 const BUCKET_DOMAIN = "better-ccflare:codex-turn-state-bucket:v1\0";
 const CALL_ID_DOMAIN = "better-ccflare:codex-turn-state-call-id:v1\0";
 const encoder = new TextEncoder();
 
-export type CodexTurnStateArm =
-	| "observe"
-	| "control"
-	| "treatment"
-	| "ineligible";
+/**
+ * The canonical vocabularies, declared as runtime values with their types
+ * derived from them.
+ *
+ * Every one of these categories has to be serialized by `trace.ts` and accepted
+ * by `analyze-trace.ts`, and each of those files used to repeat the literals in
+ * its own allowlist. A union type cannot be enumerated at runtime, so the
+ * duplication was the only way to filter -- and adding a category meant editing
+ * three lists by hand. Missing one fails silently in the worst possible
+ * direction: the action is emitted but dropped by the allowlist, so a
+ * fail-closed guard becomes invisible to the very analysis meant to prove it
+ * works. Exporting the arrays makes that impossible; the type follows the value.
+ */
+export const CODEX_TURN_STATE_ARMS = [
+	"observe",
+	"control",
+	"treatment",
+	"ineligible",
+] as const;
+export type CodexTurnStateArm = (typeof CODEX_TURN_STATE_ARMS)[number];
 
+export const CODEX_TURN_STATE_REQUEST_ACTIONS = [
+	"new_turn",
+	"replay",
+	"retry_replay",
+	"would_replay",
+	"observe",
+	"no_pending",
+	"no_token",
+	"concurrent_suppressed",
+	"rescue_suppressed",
+	"failover_suppressed",
+	"custom_endpoint_suppressed",
+	"hosted_suppressed",
+	"ambiguous_lineage",
+	"appended_input_suppressed",
+	"evicted_suppressed",
+	"missing_binding",
+	"account_not_allowlisted",
+	"model_not_allowlisted",
+	"percent_control",
+	"cohort_not_allowlisted",
+] as const;
 export type CodexTurnStateRequestAction =
-	| "new_turn"
-	| "replay"
-	| "retry_replay"
-	| "would_replay"
-	| "observe"
-	| "no_pending"
-	| "no_token"
-	| "concurrent_suppressed"
-	| "rescue_suppressed"
-	| "failover_suppressed"
-	| "custom_endpoint_suppressed"
-	| "hosted_suppressed"
-	| "ambiguous_lineage"
-	| "appended_input_suppressed"
-	| "evicted_suppressed"
-	| "missing_binding"
-	| "account_not_allowlisted"
-	| "model_not_allowlisted"
-	| "percent_control"
-	| "cohort_not_allowlisted";
+	(typeof CODEX_TURN_STATE_REQUEST_ACTIONS)[number];
 
+export const CODEX_TURN_STATE_TERMINAL_ACTIONS = [
+	"captured",
+	"advanced",
+	"retired",
+	"error_ignored",
+	"invalid_token",
+	"ambiguous_calls",
+	"stale_generation",
+	"observed",
+	"ineligible",
+	"unknown_attempt",
+] as const;
 export type CodexTurnStateTerminalAction =
-	| "captured"
-	| "advanced"
-	| "retired"
-	| "error_ignored"
-	| "invalid_token"
-	| "ambiguous_calls"
-	| "stale_generation"
-	| "observed"
-	| "ineligible"
-	| "unknown_attempt";
+	(typeof CODEX_TURN_STATE_TERMINAL_ACTIONS)[number];
 
 export type CodexTurnStateAttemptCause =
 	| "initial"
@@ -94,6 +121,8 @@ export interface CodexTurnStateConfig {
 	readonly accountIds: ReadonlySet<string>;
 	readonly models: ReadonlySet<string>;
 	readonly cohortIds: ReadonlySet<string>;
+	/** Whether the cohort allowlist opted in to percentage-selected cohorts. */
+	readonly cohortWildcard: boolean;
 	readonly observeOnly: boolean;
 	readonly maxEntries: number;
 	readonly idleTtlMs: number;
@@ -229,11 +258,21 @@ function readCsvSet(raw: string | undefined, normalize = false): Set<string> {
 }
 
 export function readCodexTurnStateConfig(): CodexTurnStateConfig {
-	const cohortIds = new Set(
-		[...readCsvSet(process.env[CODEX_TURN_STATE_COHORT_IDS_ENV], true)].filter(
-			(value) => COHORT_PATTERN.test(value),
-		),
+	const rawCohortIds = readCsvSet(
+		process.env[CODEX_TURN_STATE_COHORT_IDS_ENV],
+		true,
 	);
+	const cohortIds = new Set(
+		[...rawCohortIds].filter((value) => COHORT_PATTERN.test(value)),
+	);
+	// A cohort is scoped to one conversation, so it cannot exist until that
+	// conversation is already running and it dies with it. Naming one in advance
+	// therefore enrols nothing, which makes the exact-cohort gate unusable for a
+	// forward-looking rollout. This sentinel is the explicit opt-in that lets the
+	// deterministic percentage do the selecting instead. It is deliberately a
+	// separate token rather than "empty means all": an empty allowlist keeps
+	// meaning NO treatment, which is what makes shipping dark safe.
+	const cohortWildcard = rawCohortIds.has(COHORT_WILDCARD);
 	return {
 		percent: Math.min(
 			strictUnsignedInteger(
@@ -247,6 +286,7 @@ export function readCodexTurnStateConfig(): CodexTurnStateConfig {
 		accountIds: readCsvSet(process.env[CODEX_TURN_STATE_ACCOUNT_IDS_ENV]),
 		models: readCsvSet(process.env[CODEX_TURN_STATE_MODELS_ENV], true),
 		cohortIds,
+		cohortWildcard,
 		observeOnly:
 			process.env[CODEX_TURN_STATE_OBSERVE_ONLY_ENV] === "1" ||
 			process.env[CODEX_TURN_STATE_OBSERVE_ONLY_ENV] === "true",
@@ -967,7 +1007,10 @@ export class CodexTurnStateCoordinator {
 		) {
 			return { arm: "control", action: "percent_control" };
 		}
-		if (!cohortId || !config.cohortIds.has(cohortId)) {
+		if (
+			!cohortId ||
+			!(config.cohortWildcard || config.cohortIds.has(cohortId))
+		) {
 			return { arm: "control", action: "cohort_not_allowlisted" };
 		}
 		return { arm: "treatment", action: "new_turn" };
