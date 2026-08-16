@@ -205,11 +205,11 @@ export class SseFrameBuffer {
 			this.parts.push(remainder);
 		}
 		// See the `carry` field comment: this is last3(parts.join("")),
-		// computed without ever joining `parts`.
-		this.carry =
-			frames.length > 0
-				? remainder.slice(-3)
-				: (this.carry + decoded).slice(-3);
+		// computed without ever joining `parts`. The no-frame branch reuses
+		// `searchText` rather than rebuilding `this.carry + decoded`: they are
+		// the same string (searchText is assigned above and `this.carry` is not
+		// reassigned until here), so the second concatenation was redundant.
+		this.carry = frames.length > 0 ? remainder.slice(-3) : searchText.slice(-3);
 
 		if (this.tailBytes > this.maxBufferBytes) {
 			throw new SseLimitError(
