@@ -15,6 +15,7 @@ import {
 import type {
 	Account,
 	AnthropicDegradedRuntimeHealth,
+	RoutingHealth,
 } from "@better-ccflare/types";
 import type {
 	HealthResponse,
@@ -171,6 +172,7 @@ export function createHealthHandler(
 	getAccountUsageInfo: AccountUsageInfoFn = usageCacheUsageInfo,
 	getAnthropicDegradedHealth?: AnthropicDegradedHealthFn,
 	getRetentionStatus?: RetentionStatusFn,
+	getRoutingHealth?: () => RoutingHealth | undefined,
 ) {
 	const normalCache = new TtlCache<HealthResponse>(2000);
 	const detailCache = new TtlCache<HealthResponse>(2000);
@@ -195,6 +197,7 @@ export function createHealthHandler(
 		const usageWorkerHealth = getUsageWorkerHealth
 			? getUsageWorkerHealth()
 			: null;
+		const routing = getRoutingHealth?.();
 
 		// Determine runtime health from stored results
 		const asyncWriterHealthy = asyncWriterHealth
@@ -222,6 +225,9 @@ export function createHealthHandler(
 			git_sha: getGitSha(),
 			pool,
 		};
+		if (routing) {
+			response.routing = routing;
+		}
 
 		// Build runtime section from stored results
 		if (asyncWriterHealth && usageWorkerHealth) {

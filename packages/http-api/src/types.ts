@@ -16,6 +16,7 @@ export type {
 	RetentionGetResponse,
 	RetentionSetRequest,
 	RetentionStatus,
+	RoutingHealth,
 	StatsResponse,
 	StrategyUpdateRequest,
 	TimePoint,

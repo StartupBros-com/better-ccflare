@@ -38,6 +38,7 @@ import {
 } from "@better-ccflare/http-api";
 import {
 	LeastUsedStrategy,
+	RoutingTransitionRecorder,
 	SessionAffinityStrategy,
 	SessionDrainSoonestStrategy,
 	SessionStrategy,
@@ -117,14 +118,29 @@ import { serve } from "bun";
 function buildStrategy(
 	name: StrategyName,
 	sessionDurationMs: number,
+	routingTransitions: RoutingTransitionRecorder,
 ): LoadBalancingStrategy {
 	switch (name) {
 		case StrategyName.LeastUsed:
 			return new LeastUsedStrategy();
 		case StrategyName.SessionAffinity:
-			return new SessionAffinityStrategy(sessionDurationMs);
+			return new SessionAffinityStrategy(
+				sessionDurationMs,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				routingTransitions,
+			);
 		case StrategyName.SessionDrainSoonest:
-			return new SessionDrainSoonestStrategy(sessionDurationMs);
+			return new SessionDrainSoonestStrategy(
+				sessionDurationMs,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				routingTransitions,
+			);
 		default:
 			return new SessionStrategy(sessionDurationMs);
 	}
@@ -1281,6 +1297,7 @@ export default async function startServer(options?: {
 	// Strategy is constructed below after RuntimeConfig is built. The router
 	// accepts a getter so it can read the live (post-hot-reload) instance.
 	let currentStrategy: LoadBalancingStrategy | null = null;
+	const routingTransitions = new RoutingTransitionRecorder();
 
 	// The model catalog needs a ProxyContext (account credentials, provider)
 	// that is only constructed later in this function. The router is built
@@ -1587,6 +1604,7 @@ export default async function startServer(options?: {
 	const strategy = buildStrategy(
 		config.getStrategy(),
 		runtimeConfig.sessionDurationMs,
+		routingTransitions,
 	);
 	log.info(`Load-balancing strategy: ${config.getStrategy()}`);
 
@@ -1937,6 +1955,7 @@ export default async function startServer(options?: {
 			const strategy = buildStrategy(
 				newStrategyName,
 				runtimeConfig.sessionDurationMs,
+				routingTransitions,
 			);
 			strategy.initialize?.(strategyStore);
 			proxyContext.degradedOwnerOverlay.clear();

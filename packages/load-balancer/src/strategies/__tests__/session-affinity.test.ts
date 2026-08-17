@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it, spyOn } from "bun:test";
-import { SessionAffinityStrategy } from "@better-ccflare/load-balancer";
+import {
+	RoutingTransitionRecorder,
+	SessionAffinityStrategy,
+} from "@better-ccflare/load-balancer";
 import { Logger, logBus } from "@better-ccflare/logger";
 import type {
 	Account,
@@ -89,6 +92,284 @@ describe("SessionAffinityStrategy", () => {
 		store = new MockStore();
 		strategy = new SessionAffinityStrategy();
 		strategy.initialize(store);
+	});
+
+	describe("routing health", () => {
+		it("preserves transition counters across strategy replacement without sharing gauges", async () => {
+			const recorder = new RoutingTransitionRecorder();
+			const first = new SessionAffinityStrategy(
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				recorder,
+			);
+			first.initialize(store);
+			const owner = makeAccount({ id: "owner", priority: 5 });
+			const laneMeta = {
+				...metaFor("replacement-health-client"),
+				affinityLaneKey: "replacement-health-client:anthropic:opus",
+			} as RequestMeta;
+
+			expect((await first.select([owner], laneMeta))[0].id).toBe("owner");
+			const better = makeAccount({ id: "better", priority: 0 });
+			expect((await first.select([owner, better], laneMeta))[0].id).toBe(
+				"owner",
+			);
+			first.reportCandidateFailure(laneMeta, {
+				candidateId: "account:owner",
+				reason: "semantic_stream_stall",
+				suppressForMs: 60_000,
+			});
+
+			expect(first.getRoutingHealth()).toEqual({
+				affinityEntries: 1,
+				routeSuppressionEntries: 1,
+				routeSuppressionGcSweeps: 1,
+				transitions: {
+					atHomeProtections: 1,
+					outclassRemaps: { crossTier: 0, sameTier: 0 },
+					failoverRemaps: 0,
+					snapbackPreservations: 0,
+				},
+			});
+
+			const replacement = new SessionAffinityStrategy(
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				recorder,
+			);
+			replacement.initialize(store);
+
+			expect(replacement.getRoutingHealth()).toEqual({
+				affinityEntries: 0,
+				routeSuppressionEntries: 0,
+				routeSuppressionGcSweeps: 0,
+				transitions: {
+					atHomeProtections: 1,
+					outclassRemaps: { crossTier: 0, sameTier: 0 },
+					failoverRemaps: 0,
+					snapbackPreservations: 0,
+				},
+			});
+		});
+
+		it("reports fresh snapshots of affinity and route-suppression state", async () => {
+			const owner = makeAccount({ id: "owner" });
+			const laneMeta = {
+				...metaFor("routing-health-client"),
+				affinityLaneKey: "routing-health-client:anthropic:opus",
+			} as RequestMeta;
+
+			await strategy.select([owner], laneMeta);
+			strategy.reportCandidateFailure(laneMeta, {
+				candidateId: "account:owner",
+				reason: "semantic_stream_stall",
+				suppressForMs: 60_000,
+			});
+
+			const first = strategy.getRoutingHealth();
+			const second = strategy.getRoutingHealth();
+			expect(first).toEqual({
+				affinityEntries: 1,
+				routeSuppressionEntries: 1,
+				routeSuppressionGcSweeps: 1,
+				transitions: {
+					atHomeProtections: 0,
+					outclassRemaps: { crossTier: 0, sameTier: 0 },
+					failoverRemaps: 0,
+					snapbackPreservations: 0,
+				},
+			});
+			expect(second).toEqual(first);
+			expect(second).not.toBe(first);
+			expect(second.transitions).not.toBe(first.transitions);
+			expect(second.transitions.outclassRemaps).not.toBe(
+				first.transitions.outclassRemaps,
+			);
+		});
+
+		it("counts only an at-home protection when a new better tier appears", async () => {
+			const owner = makeAccount({ id: "owner", priority: 5 });
+			const laneMeta = {
+				...metaFor("at-home-health-client"),
+				affinityLaneKey: "at-home-health-client:anthropic:opus",
+			} as RequestMeta;
+
+			expect((await strategy.select([owner], laneMeta))[0].id).toBe("owner");
+			const better = makeAccount({ id: "better", priority: 0 });
+			expect((await strategy.select([owner, better], laneMeta))[0].id).toBe(
+				"owner",
+			);
+			expect((await strategy.select([owner, better], laneMeta))[0].id).toBe(
+				"owner",
+			);
+			expect(strategy.getRoutingHealth().transitions).toEqual({
+				atHomeProtections: 2,
+				outclassRemaps: { crossTier: 0, sameTier: 0 },
+				failoverRemaps: 0,
+				snapbackPreservations: 0,
+			});
+		});
+
+		it("counts only a cross-tier outclass remap when a displaced owner upgrades home", async () => {
+			const low = makeAccount({ id: "low", priority: 5 });
+			const highDown = makeAccount({
+				id: "high",
+				priority: 0,
+				rate_limited_until: Date.now() + 60_000,
+			});
+			const laneMeta = {
+				...metaFor("cross-tier-health-client"),
+				affinityLaneKey: "cross-tier-health-client:anthropic:opus",
+			} as RequestMeta;
+
+			expect((await strategy.select([low, highDown], laneMeta))[0].id).toBe(
+				"low",
+			);
+			const high = makeAccount({ id: "high", priority: 0 });
+			expect((await strategy.select([low, high], laneMeta))[0].id).toBe("high");
+			expect(strategy.getRoutingHealth().transitions).toEqual({
+				atHomeProtections: 0,
+				outclassRemaps: { crossTier: 1, sameTier: 0 },
+				failoverRemaps: 0,
+				snapbackPreservations: 0,
+			});
+		});
+
+		it("counts only a same-tier outclass remap under comparable pressure", async () => {
+			const cold = makeAccount({ id: "cold" });
+			const critical = makeAccount({ id: "critical" });
+			const laneMeta = {
+				...metaFor("same-tier-health-client"),
+				affinityLaneKey: "same-tier-health-client:anthropic:opus",
+			} as RequestMeta;
+
+			expect((await strategy.select([cold], laneMeta))[0].id).toBe("cold");
+			const pressureMeta = {
+				...laneMeta,
+				quotaPressureByAccountId: new Map([
+					["cold", { band: "cold", comparisonKey: "same" }],
+					["critical", { band: "critical", comparisonKey: "same" }],
+				]),
+			} as RequestMeta;
+			expect(
+				(await strategy.select([cold, critical], pressureMeta))[0].id,
+			).toBe("critical");
+			expect(strategy.getRoutingHealth().transitions).toEqual({
+				atHomeProtections: 0,
+				outclassRemaps: { crossTier: 0, sameTier: 1 },
+				failoverRemaps: 0,
+				snapbackPreservations: 0,
+			});
+		});
+
+		it("counts only an ordinary failover remap for an unavailable equal-tier owner", async () => {
+			const owner = makeAccount({ id: "owner", priority: 0 });
+			const fallback = makeAccount({ id: "fallback", priority: 0 });
+			const laneMeta = {
+				...metaFor("ordinary-failover-health-client"),
+				affinityLaneKey: "ordinary-failover-health-client:anthropic:opus",
+			} as RequestMeta;
+
+			expect((await strategy.select([owner], laneMeta))[0].id).toBe("owner");
+			const ownerDown = makeAccount({
+				id: "owner",
+				priority: 0,
+				rate_limited_until: Date.now() + 60_000,
+			});
+			expect(
+				(await strategy.select([ownerDown, fallback], laneMeta))[0].id,
+			).toBe("fallback");
+			expect(strategy.getRoutingHealth().transitions).toEqual({
+				atHomeProtections: 0,
+				outclassRemaps: { crossTier: 0, sameTier: 0 },
+				failoverRemaps: 1,
+				snapbackPreservations: 0,
+			});
+		});
+
+		it("counts the anti-thrash fast-fail owner replacement as one failover remap", async () => {
+			let now = 1_000;
+			const clocked = new SessionAffinityStrategy(
+				undefined,
+				undefined,
+				1_000,
+				undefined,
+				() => now,
+			);
+			clocked.initialize(store);
+			const low = makeAccount({ id: "low", priority: 1 });
+			const highDown = makeAccount({
+				id: "high",
+				priority: 0,
+				rate_limited_until: now + 60_000,
+			});
+			const laneMeta = {
+				...metaFor("fast-fail-health-client"),
+				affinityLaneKey: "fast-fail-health-client:anthropic:opus",
+			} as RequestMeta;
+
+			expect((await clocked.select([low, highDown], laneMeta))[0].id).toBe(
+				"low",
+			);
+			now += 10;
+			const high = makeAccount({ id: "high", priority: 0 });
+			expect((await clocked.select([low, high], laneMeta))[0].id).toBe("high");
+			const beforeFastFail = clocked.getRoutingHealth().transitions;
+			expect(beforeFastFail).toEqual({
+				atHomeProtections: 0,
+				outclassRemaps: { crossTier: 1, sameTier: 0 },
+				failoverRemaps: 0,
+				snapbackPreservations: 0,
+			});
+
+			now += 10;
+			const highDownAfterUpgrade = makeAccount({
+				id: "high",
+				priority: 0,
+				rate_limited_until: now + 60_000,
+			});
+			expect(
+				(await clocked.select([low, highDownAfterUpgrade], laneMeta))[0].id,
+			).toBe("low");
+			const afterFastFail = clocked.getRoutingHealth().transitions;
+			expect(afterFastFail).toEqual({
+				...beforeFastFail,
+				failoverRemaps: beforeFastFail.failoverRemaps + 1,
+			});
+		});
+
+		it("counts only a better-tier unavailable-owner snapback preservation", async () => {
+			const owner = makeAccount({ id: "owner", priority: 0 });
+			const fallback = makeAccount({ id: "fallback", priority: 1 });
+			const laneMeta = {
+				...metaFor("snapback-health-client"),
+				affinityLaneKey: "snapback-health-client:anthropic:opus",
+			} as RequestMeta;
+
+			expect((await strategy.select([owner, fallback], laneMeta))[0].id).toBe(
+				"owner",
+			);
+			const ownerDown = makeAccount({
+				id: "owner",
+				priority: 0,
+				rate_limited_until: Date.now() + 60_000,
+			});
+			expect(
+				(await strategy.select([ownerDown, fallback], laneMeta))[0].id,
+			).toBe("fallback");
+			expect(strategy.getRoutingHealth().transitions).toEqual({
+				atHomeProtections: 0,
+				outclassRemaps: { crossTier: 0, sameTier: 0 },
+				failoverRemaps: 0,
+				snapbackPreservations: 1,
+			});
+		});
 	});
 
 	it("assigns a new client an account and sticks it there (sticky)", async () => {

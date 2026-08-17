@@ -2216,7 +2216,7 @@ export async function proxyWithAccount(
 			process.env.DEBUG === "true" ||
 			process.env.NODE_ENV === "development"
 		) {
-			log.info(
+			log.debug(
 				`Attempting request with account: ${account.name} (provider: ${account.provider})`,
 			);
 		}
@@ -2242,7 +2242,7 @@ export async function proxyWithAccount(
 					process.env.DEBUG === "true" ||
 					process.env.NODE_ENV === "development"
 				) {
-					log.info(
+					log.debug(
 						`Combo model override: applying model "${modelOverride}" for account ${account.name}`,
 					);
 				}
