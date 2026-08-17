@@ -1,6 +1,6 @@
-import { beforeEach, describe, expect, it } from "bun:test";
+import { beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { SessionAffinityStrategy } from "@better-ccflare/load-balancer";
-import { logBus } from "@better-ccflare/logger";
+import { Logger, logBus } from "@better-ccflare/logger";
 import type {
 	Account,
 	LogEvent,
@@ -1151,7 +1151,7 @@ describe("SessionAffinityStrategy", () => {
 		});
 	});
 
-	it("replaces a sticky lower-priority owner when a better tier becomes routable", async () => {
+	it("replaces a displaced fallback owner once a recovered better tier becomes routable", async () => {
 		const low = makeAccount({ id: "low", priority: 1 });
 		const high = makeAccount({ id: "high", priority: 0 });
 		const laneMeta = {
@@ -1159,7 +1159,17 @@ describe("SessionAffinityStrategy", () => {
 			affinityLaneKey: "same-client:anthropic:opus",
 		} as RequestMeta;
 
-		expect((await strategy.select([low], laneMeta))[0].id).toBe("low");
+		// high is CONFIGURED (present in the accounts array) but unavailable at
+		// install time, so low installs as a genuine displaced fallback -- not
+		// "at home" -- and remains eligible to upgrade once high recovers.
+		const highDownAtInstall = makeAccount({
+			id: "high",
+			priority: 0,
+			rate_limited_until: Date.now() + 60_000,
+		});
+		expect(
+			(await strategy.select([low, highDownAtInstall], laneMeta))[0].id,
+		).toBe("low");
 		expect((await strategy.select([low, high], laneMeta))[0].id).toBe("high");
 		// The better-tier owner replaces the old mapping; making the two accounts
 		// equal later must not resurrect the displaced lower-tier owner.
@@ -1179,6 +1189,484 @@ describe("SessionAffinityStrategy", () => {
 		expect((await strategy.select([low, high], highExcluded))[0].id).toBe(
 			"low",
 		);
+	});
+
+	describe("cross-tier outclass never remaps a healthy at-home owner", () => {
+		it("keeps a healthy at-home owner sticky across a later cross-tier config change", async () => {
+			const low = makeAccount({ id: "low", priority: 5 });
+			const laneMeta = {
+				...metaFor("config-change-client"),
+				affinityLaneKey: "config-change-client:anthropic:opus",
+			} as RequestMeta;
+
+			// low is the only configured candidate at install time: it is
+			// installed "at home" (no strictly better tier was configured).
+			expect((await strategy.select([low], laneMeta))[0].id).toBe("low");
+
+			// An operator adds a higher-priority account after the fact (or edits
+			// priorities). This is a pure config change, not a recovery: the
+			// healthy at-home owner must not be silently remapped mid-session.
+			const high = makeAccount({ id: "high", priority: 0 });
+			const afterConfigChange = await strategy.select([low, high], laneMeta);
+			expect(afterConfigChange.map((a) => a.id)).toEqual(["low", "high"]);
+
+			// Repeat to prove this is durable stickiness, not a one-shot grace.
+			const again = await strategy.select([low, high], laneMeta);
+			expect(again[0].id).toBe("low");
+		});
+
+		it("keeps a healthy at-home owner sticky through a pure priority edit", async () => {
+			// A template, not a single reused RequestMeta: each select() call below
+			// spreads a fresh copy so the strategy's own commitStrategyCandidateOrder
+			// bookkeeping from one call (meta.routingCandidates) never leaks into the
+			// next and masks the priority values this test is deliberately changing
+			// -- exactly like a new incoming request would look after a live config
+			// edit.
+			const laneMetaTemplate = {
+				...metaFor("priority-edit-client"),
+				affinityLaneKey: "priority-edit-client:anthropic:opus",
+			} as RequestMeta;
+			const aInit = makeAccount({ id: "a", priority: 0 });
+			const bInit = makeAccount({ id: "b", priority: 25 });
+
+			// Both a and b are configured at install time; a wins on priority and
+			// is installed at the best configured tier -- "at home".
+			expect(
+				(await strategy.select([aInit, bInit], { ...laneMetaTemplate }))[0].id,
+			).toBe("a");
+
+			// The operator edits priorities so a is now numerically worse than b.
+			// Both accounts stay healthy throughout: this is a pure config change,
+			// not a's owner failing or disappearing.
+			const aEdited = makeAccount({ id: "a", priority: 30 });
+			const bEdited = makeAccount({ id: "b", priority: 25 });
+			expect(
+				(await strategy.select([aEdited, bEdited], { ...laneMetaTemplate }))[0]
+					.id,
+			).toBe("a");
+		});
+
+		it("still fails an at-home owner over immediately when it becomes unavailable, and does not resurrect it once it is merely worse-tier", async () => {
+			// See the priority-edit test above for why this is a template spread
+			// fresh at each call rather than one reused RequestMeta.
+			const laneMetaTemplate = {
+				...metaFor("at-home-unavailable-client"),
+				affinityLaneKey: "at-home-unavailable-client:anthropic:opus",
+			} as RequestMeta;
+			const aInit = makeAccount({ id: "a", priority: 0 });
+			const bInit = makeAccount({ id: "b", priority: 25 });
+			expect(
+				(await strategy.select([aInit, bInit], { ...laneMetaTemplate }))[0].id,
+			).toBe("a");
+
+			// Same priority-edit config change as above: a (at-home) stays put.
+			const aEdited = makeAccount({ id: "a", priority: 30 });
+			const bEdited = makeAccount({ id: "b", priority: 25 });
+			expect(
+				(await strategy.select([aEdited, bEdited], { ...laneMetaTemplate }))[0]
+					.id,
+			).toBe("a");
+
+			// a now becomes genuinely unavailable (rate-limited). Every existing
+			// failover path is untouched by the at-home guard: the session must
+			// fail over immediately.
+			const aRateLimited = makeAccount({
+				id: "a",
+				priority: 30,
+				rate_limited_until: Date.now() + 60_000,
+			});
+			expect(
+				(
+					await strategy.select([aRateLimited, bEdited], {
+						...laneMetaTemplate,
+					})
+				)[0].id,
+			).toBe("b");
+
+			// a recovers, but it is now the worse tier (30 vs b's 25) -- not an
+			// outclass candidate for b at all (b, installed at its own
+			// best-configured tier of 25, is itself "at home"). The session simply
+			// stays on b; nothing here exercises a snapback or an outclass remap.
+			const aRecovered = makeAccount({ id: "a", priority: 30 });
+			expect(
+				(
+					await strategy.select([aRecovered, bEdited], { ...laneMetaTemplate })
+				)[0].id,
+			).toBe("b");
+		});
+
+		it("still upgrades a displaced owner home once the better configured tier recovers (regression pin)", async () => {
+			const low = makeAccount({ id: "low", priority: 5 });
+			const highDown = makeAccount({
+				id: "high",
+				priority: 0,
+				rate_limited_until: Date.now() + 60_000,
+			});
+			const laneMeta = {
+				...metaFor("displaced-recovery-client"),
+				affinityLaneKey: "displaced-recovery-client:anthropic:opus",
+			} as RequestMeta;
+
+			// high is CONFIGURED (present in the accounts array) but unavailable
+			// at install time: low installs as a genuine displaced fallback, not
+			// "at home".
+			expect((await strategy.select([low, highDown], laneMeta))[0].id).toBe(
+				"low",
+			);
+
+			// high recovers: the displaced owner must still upgrade home, exactly
+			// like today's behavior.
+			const highRecovered = makeAccount({ id: "high", priority: 0 });
+			expect(
+				(await strategy.select([low, highRecovered], laneMeta))[0].id,
+			).toBe("high");
+
+			// Once remapped, the session stays on high even after low disappears.
+			expect((await strategy.select([highRecovered], laneMeta))[0].id).toBe(
+				"high",
+			);
+		});
+
+		it("defaults a commitAffinityOwner install without a routing catalog to protected", async () => {
+			const laneMeta = {
+				...metaFor("commit-no-catalog-client"),
+				affinityLaneKey: "commit-no-catalog-client:anthropic:opus",
+			} as RequestMeta;
+			const owner = makeAccount({ id: "owner", priority: 5 });
+
+			expect(
+				strategy.commitAffinityOwner(laneMeta, {
+					candidateId: "account:owner",
+					accountId: "owner",
+				}),
+			).toBe(true);
+
+			// No routingCandidateCatalog was present on the committed meta, so the
+			// conservative default treats the owner as installed at-home: a
+			// later-appearing better tier must not remap it.
+			const better = makeAccount({ id: "better", priority: 0 });
+			const result = await strategy.select([owner, better], laneMeta);
+			expect(result[0].id).toBe("owner");
+		});
+
+		it("commitAffinityOwner: an owner below the best CATALOG tier installs displaced and later upgrades (contrast with the no-catalog default above)", async () => {
+			const laneMeta = {
+				...metaFor("commit-catalog-client"),
+				affinityLaneKey: "commit-catalog-client:anthropic:opus",
+				routingCandidateCatalog: [
+					{
+						candidateId: "account:owner",
+						accountId: "owner",
+						tier: 1,
+						ordinal: 0,
+						comboSlotId: null,
+						modelOverride: "claude-opus-4-8",
+						quotaPressure: null,
+					},
+					{
+						candidateId: "account:better",
+						accountId: "better",
+						tier: 0,
+						ordinal: 1,
+						comboSlotId: null,
+						modelOverride: "claude-opus-4-8",
+						quotaPressure: null,
+					},
+				],
+			} as RequestMeta;
+
+			expect(
+				strategy.commitAffinityOwner(laneMeta, {
+					candidateId: "account:owner",
+					accountId: "owner",
+				}),
+			).toBe(true);
+
+			const owner = makeAccount({ id: "owner", priority: 5 });
+			// better is CONFIGURED (present in the catalog at tier 0) but not yet
+			// routable this request: owner is a genuine displaced fallback here,
+			// unlike the catalog-absent conservative default above.
+			const betterDown = makeAccount({
+				id: "better",
+				priority: 0,
+				rate_limited_until: Date.now() + 60_000,
+			});
+			expect((await strategy.select([owner, betterDown], laneMeta))[0].id).toBe(
+				"owner",
+			);
+
+			// better recovers: the displaced owner upgrades home.
+			const betterRecovered = makeAccount({ id: "better", priority: 0 });
+			expect(
+				(await strategy.select([owner, betterRecovered], laneMeta))[0].id,
+			).toBe("better");
+		});
+	});
+
+	describe("at-home marker install-site regression coverage", () => {
+		it("regression: a same-owner retain-owner refresh must NOT recompute the at-home marker mid-episode (critical fix pin)", async () => {
+			const low = makeAccount({ id: "low", priority: 5 });
+			const laneMeta = {
+				...metaFor("retain-refresh-critical-client"),
+				affinityLaneKey: "retain-refresh-critical-client:anthropic:opus",
+			} as RequestMeta;
+
+			// (a) low is the sole configured candidate at install time: it
+			// installs "at home" (marker false).
+			expect((await strategy.select([low], laneMeta))[0].id).toBe("low");
+			const snapshot = strategy.snapshotAffinityOwner(laneMeta);
+			expect(snapshot).toEqual({
+				candidateId: "account:low",
+				accountId: "low",
+			});
+
+			// (b) A retain-owner directive fires for the SAME owner (a same-owner
+			// refresh -- e.g. a degraded-mode overlay in force for an unrelated
+			// reason) while a strictly better-tier account is now
+			// configured/healthy. The directive must keep low first, exactly as
+			// it does today.
+			const high = makeAccount({ id: "high", priority: 0 });
+			const degradedMeta = {
+				...laneMeta,
+				affinityOwnerDirective: { kind: "retain-owner", owner: snapshot },
+			} as RequestMeta;
+			expect((await strategy.select([low, high], degradedMeta))[0].id).toBe(
+				"low",
+			);
+
+			// (c) Drop the directive: with both accounts healthy, the at-home
+			// owner MUST still be first. Pre-fix, the same-owner refresh in (b)
+			// would have silently re-labelled low as displaced (a strictly
+			// better tier was configured), and this ordinary cross-tier outclass
+			// would have remapped the live session to high.
+			expect((await strategy.select([low, high], laneMeta))[0].id).toBe("low");
+		});
+
+		it("retain-owner directive that installs a genuinely at-home new owner protects it from a later cross-tier outclass", async () => {
+			const seed = makeAccount({ id: "seed", priority: 5 });
+			const target = makeAccount({ id: "target", priority: 2 });
+			const laneMeta = {
+				...metaFor("retain-change-athome-client"),
+				affinityLaneKey: "retain-change-athome-client:anthropic:opus",
+			} as RequestMeta;
+
+			// An existing mapping to a different owner (seed).
+			expect((await strategy.select([seed], laneMeta))[0].id).toBe("seed");
+
+			// The directive names a DIFFERENT owner (target). At this exact
+			// moment target IS the best configured tier among [seed, target]:
+			// this owner-change install must compute it as genuinely at-home,
+			// not a hardcoded value.
+			const directiveMeta = {
+				...laneMeta,
+				affinityOwnerDirective: {
+					kind: "retain-owner",
+					owner: { candidateId: "account:target", accountId: "target" },
+				},
+			} as RequestMeta;
+			expect((await strategy.select([seed, target], directiveMeta))[0].id).toBe(
+				"target",
+			);
+
+			// Drop the directive. A still-higher tier appearing afterwards must
+			// NOT move target: it was correctly recomputed as at-home.
+			const higher = makeAccount({ id: "higher", priority: 0 });
+			expect(
+				(await strategy.select([seed, target, higher], laneMeta))[0].id,
+			).toBe("target");
+		});
+
+		it("retain-owner directive that installs a genuinely displaced new owner upgrades it home on recovery", async () => {
+			const seed = makeAccount({ id: "seed", priority: 5 });
+			const mid = makeAccount({ id: "mid", priority: 3 });
+			const highDown = makeAccount({
+				id: "high",
+				priority: 0,
+				rate_limited_until: Date.now() + 60_000,
+			});
+			const laneMeta = {
+				...metaFor("retain-change-displaced-client"),
+				affinityLaneKey: "retain-change-displaced-client:anthropic:opus",
+			} as RequestMeta;
+
+			expect((await strategy.select([seed], laneMeta))[0].id).toBe("seed");
+
+			// The directive names a DIFFERENT owner (mid) while a strictly
+			// better tier (high) is configured but currently unroutable: a
+			// genuine displaced install, not at-home.
+			const directiveMeta = {
+				...laneMeta,
+				affinityOwnerDirective: {
+					kind: "retain-owner",
+					owner: { candidateId: "account:mid", accountId: "mid" },
+				},
+			} as RequestMeta;
+			expect(
+				(await strategy.select([seed, mid, highDown], directiveMeta))[0].id,
+			).toBe("mid");
+
+			// Drop the directive. high recovers: the displaced owner must still
+			// upgrade home, exactly like a plain displaced fallback would.
+			const highRecovered = makeAccount({ id: "high", priority: 0 });
+			expect(
+				(await strategy.select([seed, mid, highRecovered], laneMeta))[0].id,
+			).toBe("high");
+		});
+
+		it("unavailable equal-tier remap installs a genuinely at-home new owner, protecting it from a later cross-tier outclass", async () => {
+			const x = makeAccount({ id: "x", priority: 1 });
+			const y = makeAccount({ id: "y", priority: 1 });
+			const laneMeta = {
+				...metaFor("unavailable-remap-athome-client"),
+				affinityLaneKey: "unavailable-remap-athome-client:anthropic:opus",
+			} as RequestMeta;
+
+			expect((await strategy.select([x], laneMeta))[0].id).toBe("x");
+
+			// x becomes unavailable; y (equal tier) is the only OTHER configured
+			// candidate this request, so the remap makes y the sole configured
+			// tier: genuinely at-home.
+			const xDown = makeAccount({
+				id: "x",
+				priority: 1,
+				rate_limited_until: Date.now() + 60_000,
+			});
+			expect((await strategy.select([xDown, y], laneMeta))[0].id).toBe("y");
+
+			// A later cross-tier outclass must NOT move the freshly-remapped
+			// at-home owner y.
+			const higher = makeAccount({ id: "higher", priority: 0 });
+			expect((await strategy.select([y, higher], laneMeta))[0].id).toBe("y");
+		});
+
+		it("unavailable equal-tier remap installs a genuinely displaced new owner, upgrading it once the better configured tier recovers", async () => {
+			const x = makeAccount({ id: "x", priority: 1 });
+			const laneMeta = {
+				...metaFor("unavailable-remap-displaced-client"),
+				affinityLaneKey: "unavailable-remap-displaced-client:anthropic:opus",
+			} as RequestMeta;
+
+			expect((await strategy.select([x], laneMeta))[0].id).toBe("x");
+
+			// x becomes unavailable; y (equal tier) is the least-used pick, but a
+			// strictly better tier z is ALSO configured for this request while
+			// itself unroutable: the remap to y must be recorded as displaced.
+			const xDown = makeAccount({
+				id: "x",
+				priority: 1,
+				rate_limited_until: Date.now() + 60_000,
+			});
+			const y = makeAccount({ id: "y", priority: 1 });
+			const zDown = makeAccount({
+				id: "z",
+				priority: 0,
+				rate_limited_until: Date.now() + 60_000,
+			});
+			expect((await strategy.select([xDown, y, zDown], laneMeta))[0].id).toBe(
+				"y",
+			);
+
+			// z recovers: y must still upgrade home, exactly like a genuine
+			// displaced fallback -- proving the remap correctly recorded
+			// "displaced", not a hardcoded default.
+			const zRecovered = makeAccount({ id: "z", priority: 0 });
+			expect((await strategy.select([y, zRecovered], laneMeta))[0].id).toBe(
+				"z",
+			);
+		});
+
+		it("outclass upgrade replacement marks the new owner at-home, protecting it from a subsequent priority edit", async () => {
+			const low = makeAccount({ id: "low", priority: 5 });
+			const highDown = makeAccount({
+				id: "high",
+				priority: 2,
+				rate_limited_until: Date.now() + 60_000,
+			});
+			const laneMeta = {
+				...metaFor("outclass-upgrade-athome-client"),
+				affinityLaneKey: "outclass-upgrade-athome-client:anthropic:opus",
+			} as RequestMeta;
+
+			// low installs displaced (high is configured but down).
+			expect((await strategy.select([low, highDown], laneMeta))[0].id).toBe(
+				"low",
+			);
+
+			// high recovers: the displaced owner upgrades home.
+			const highRecovered = makeAccount({ id: "high", priority: 2 });
+			expect(
+				(await strategy.select([low, highRecovered], laneMeta))[0].id,
+			).toBe("high");
+
+			// high is now installed AT the best configured tier -- at-home. A
+			// later, even-better account must NOT move it.
+			const evenHigher = makeAccount({ id: "evenHigher", priority: 0 });
+			expect(
+				(await strategy.select([low, highRecovered, evenHigher], laneMeta))[0]
+					.id,
+			).toBe("high");
+		});
+
+		it("logs at-home protection at info once per episode, then debug, and resets on an ordinary sticky hit", async () => {
+			const low = makeAccount({ id: "low", priority: 5 });
+			const laneMeta = {
+				...metaFor("protection-log-client"),
+				affinityLaneKey: "protection-log-client:anthropic:opus",
+			} as RequestMeta;
+
+			expect((await strategy.select([low], laneMeta))[0].id).toBe("low");
+
+			const protectionMsg =
+				"At-home route owner protected from cross-tier outclass";
+			const infoSpy = spyOn(Logger.prototype, "info").mockImplementation(
+				() => {},
+			);
+			const debugSpy = spyOn(Logger.prototype, "debug").mockImplementation(
+				() => {},
+			);
+			try {
+				const high = makeAccount({ id: "high", priority: 0 });
+
+				// First cross-tier outclass of the episode: logs at INFO.
+				await strategy.select([low, high], laneMeta);
+				expect(
+					infoSpy.mock.calls.some((call) => call[0] === protectionMsg),
+				).toBe(true);
+				expect(
+					debugSpy.mock.calls.some((call) => call[0] === protectionMsg),
+				).toBe(false);
+				infoSpy.mockClear();
+				debugSpy.mockClear();
+
+				// Second cross-tier outclass, same episode: logs at DEBUG only.
+				await strategy.select([low, high], laneMeta);
+				expect(
+					infoSpy.mock.calls.some((call) => call[0] === protectionMsg),
+				).toBe(false);
+				expect(
+					debugSpy.mock.calls.some((call) => call[0] === protectionMsg),
+				).toBe(true);
+				infoSpy.mockClear();
+				debugSpy.mockClear();
+
+				// An ordinary sticky hit (no outclass pressure) ends the episode.
+				expect((await strategy.select([low], laneMeta))[0].id).toBe("low");
+				infoSpy.mockClear();
+				debugSpy.mockClear();
+
+				// The next cross-tier outclass after the reset logs at INFO again.
+				await strategy.select([low, high], laneMeta);
+				expect(
+					infoSpy.mock.calls.some((call) => call[0] === protectionMsg),
+				).toBe(true);
+				expect(
+					debugSpy.mock.calls.some((call) => call[0] === protectionMsg),
+				).toBe(false);
+			} finally {
+				infoSpy.mockRestore();
+				debugSpy.mockRestore();
+			}
+		});
 	});
 
 	it("preserves a temporarily excluded owner only when its tier is strictly better", async () => {
@@ -1731,7 +2219,17 @@ describe("SessionAffinityStrategy", () => {
 				affinityLaneKey: "anti-thrash-first-upgrade:anthropic:opus",
 			} as RequestMeta;
 
-			expect((await strategy.select([low], laneMeta))[0].id).toBe("low");
+			// high is CONFIGURED but unavailable at install time, so low installs
+			// as a genuine displaced fallback (not "at home") and remains eligible
+			// to upgrade.
+			const highDownAtInstall = makeAccount({
+				id: "high",
+				priority: 0,
+				rate_limited_until: Date.now() + 60_000,
+			});
+			expect(
+				(await strategy.select([low, highDownAtInstall], laneMeta))[0].id,
+			).toBe("low");
 			// The very first upgrade to a routable better tier is never suppressed.
 			expect((await strategy.select([low, high], laneMeta))[0].id).toBe("high");
 		});
@@ -1752,8 +2250,17 @@ describe("SessionAffinityStrategy", () => {
 				affinityLaneKey: "flapping-client:anthropic:opus",
 			} as RequestMeta;
 
-			// Initial assignment lands on the only available (worse-tier) account.
-			expect((await flappy.select([low], laneMeta))[0].id).toBe("low");
+			// high is CONFIGURED but unavailable at install time, so low installs
+			// as a genuine displaced fallback (not "at home") and remains
+			// eligible for the deterministic first upgrade below.
+			const highDownAtInstall = makeAccount({
+				id: "high",
+				priority: 0,
+				rate_limited_until: Date.now() + 60_000,
+			});
+			expect(
+				(await flappy.select([low, highDownAtInstall], laneMeta))[0].id,
+			).toBe("low");
 
 			// The better tier becomes routable: deterministic first upgrade, immediate.
 			expect((await flappy.select([low, high], laneMeta))[0].id).toBe("high");
@@ -1804,9 +2311,20 @@ describe("SessionAffinityStrategy", () => {
 				affinityLaneKey: "other-client-2:anthropic:opus",
 			} as RequestMeta;
 
+			// high is CONFIGURED but unavailable at install time for both
+			// sessions, so each installs low as a genuine displaced fallback (not
+			// "at home") and remains eligible for its own first upgrade.
+			const highDownAtInstall = makeAccount({
+				id: "high",
+				priority: 0,
+				rate_limited_until: Date.now() + 60_000,
+			});
+
 			// Session A upgrades, then its new owner fails fast: suppression is
 			// armed for session A only.
-			expect((await flappy.select([low], flappingMeta))[0].id).toBe("low");
+			expect(
+				(await flappy.select([low, highDownAtInstall], flappingMeta))[0].id,
+			).toBe("low");
 			expect((await flappy.select([low, high], flappingMeta))[0].id).toBe(
 				"high",
 			);
@@ -1825,7 +2343,9 @@ describe("SessionAffinityStrategy", () => {
 			// Session B (a different client) still gets its own immediate upgrade
 			// to the very same physical "high" account: suppression never leaked
 			// across sessions.
-			expect((await flappy.select([low], otherMeta))[0].id).toBe("low");
+			expect(
+				(await flappy.select([low, highDownAtInstall], otherMeta))[0].id,
+			).toBe("low");
 			expect((await flappy.select([low, high], otherMeta))[0].id).toBe("high");
 		});
 
@@ -1845,7 +2365,17 @@ describe("SessionAffinityStrategy", () => {
 				affinityLaneKey: "excluded-not-flapping-client:anthropic:opus",
 			} as RequestMeta;
 
-			expect((await flappy.select([low], laneMeta))[0].id).toBe("low");
+			// high is CONFIGURED but unavailable at install time, so low installs
+			// as a genuine displaced fallback (not "at home") and remains
+			// eligible to upgrade.
+			const highDownAtInstall = makeAccount({
+				id: "high",
+				priority: 0,
+				rate_limited_until: Date.now() + 60_000,
+			});
+			expect(
+				(await flappy.select([low, highDownAtInstall], laneMeta))[0].id,
+			).toBe("low");
 			expect((await flappy.select([low, high], laneMeta))[0].id).toBe("high");
 
 			// high is excluded for one request (e.g. model mismatch), not failing.
@@ -1936,6 +2466,160 @@ describe("SessionAffinityStrategy", () => {
 			// Upgrade resumes once the window has passed.
 			expect((await flappy.select([low, high], comboMeta()))[0].id).toBe(
 				"high",
+			);
+		});
+
+		it("regression: retain-owner directive installing a DIFFERENT owner must not inherit the previous owner's upgradedAt -- its own later unavailability is preserved-for-snapback, not wrongly treated as a just-upgraded owner flapping (critical fix pin)", async () => {
+			const windowMs = 1_000;
+			let now = Date.now();
+			const clocked = new SessionAffinityStrategy(
+				undefined,
+				undefined,
+				windowMs,
+				undefined,
+				() => now,
+			);
+			clocked.initialize(store);
+
+			const low = makeAccount({ id: "low", priority: 2 });
+			const mid = makeAccount({ id: "mid", priority: 1 });
+			const high = makeAccount({ id: "high", priority: 0 });
+			const laneMeta = {
+				...metaFor("owner-swap-upgradedat-client"),
+				affinityLaneKey: "owner-swap-upgradedat-client:anthropic:opus",
+			} as RequestMeta;
+
+			// Install low as a genuine displaced fallback (high is CONFIGURED but
+			// down at install time).
+			const highDown = makeAccount({
+				id: "high",
+				priority: 0,
+				rate_limited_until: now + 60_000,
+			});
+			expect((await clocked.select([low, highDown], laneMeta))[0].id).toBe(
+				"low",
+			);
+
+			// high recovers: a REAL R13 upgrade. mapping.upgradedAt is set to this
+			// moment (T1).
+			now += 10;
+			expect((await clocked.select([low, high], laneMeta))[0].id).toBe("high");
+
+			// A retain-owner directive fires for a DIFFERENT owner (mid), not
+			// high. This is the exact ownerChanged branch the fix touches.
+			now += 10;
+			const directiveMeta = {
+				...laneMeta,
+				affinityOwnerDirective: {
+					kind: "retain-owner",
+					owner: { candidateId: "account:mid", accountId: "mid" },
+				},
+			} as RequestMeta;
+			expect(
+				(await clocked.select([low, mid, high], directiveMeta))[0].id,
+			).toBe("mid");
+
+			// Drop the directive. mid goes down shortly after -- well inside the
+			// anti-thrash window measured from T1, which is what a buggy inherited
+			// upgradedAt would still be armed against. mid was never actually
+			// upgraded to via R13, so this must be ordinary preserve-for-snapback,
+			// not a fast-fail-after-upgrade.
+			now += 10;
+			const midDown = makeAccount({
+				id: "mid",
+				priority: 1,
+				rate_limited_until: now + 60_000,
+			});
+			expect((await clocked.select([low, midDown], laneMeta))[0].id).toBe(
+				"low",
+			);
+
+			// mid recovers, still well inside the window. Correct behavior: mid
+			// was preserved for snapback (never remapped away), so this is an
+			// ordinary sticky hit and mid comes back immediately. A buggy inherited
+			// upgradedAt would have made the prior step arm suppression and
+			// permanently swap the mapping to low -- in which case this select
+			// would wrongly stay on low instead of returning to mid.
+			now += 10;
+			expect((await clocked.select([low, mid], laneMeta))[0].id).toBe("mid");
+		});
+
+		it("regression: retain-owner directive installing a DIFFERENT owner must not inherit the previous owner's suppressUpgradesUntil -- a legitimate later upgrade for the new owner must not be spuriously withheld (critical fix pin)", async () => {
+			const windowMs = 1_000;
+			let now = Date.now();
+			const clocked = new SessionAffinityStrategy(
+				undefined,
+				undefined,
+				windowMs,
+				undefined,
+				() => now,
+			);
+			clocked.initialize(store);
+
+			const low = makeAccount({ id: "low", priority: 3 });
+			const mid = makeAccount({ id: "mid", priority: 2 });
+			const high = makeAccount({ id: "high", priority: 1 });
+			const top = makeAccount({ id: "top", priority: 0 });
+			const laneMeta = {
+				...metaFor("owner-swap-suppressuntil-client"),
+				affinityLaneKey: "owner-swap-suppressuntil-client:anthropic:opus",
+			} as RequestMeta;
+
+			// Install low as a genuine displaced fallback (mid is CONFIGURED but
+			// down at install time).
+			const midDown = makeAccount({
+				id: "mid",
+				priority: 2,
+				rate_limited_until: now + 60_000,
+			});
+			expect((await clocked.select([low, midDown], laneMeta))[0].id).toBe(
+				"low",
+			);
+
+			// mid recovers: a REAL R13 upgrade.
+			now += 10;
+			expect((await clocked.select([low, mid], laneMeta))[0].id).toBe("mid");
+
+			// mid genuinely fast-fails inside the anti-thrash window: this arms
+			// mapping.suppressUpgradesUntil (T2) against mid and remaps to low.
+			now += 10;
+			const midDown2 = makeAccount({
+				id: "mid",
+				priority: 2,
+				rate_limited_until: now + 60_000,
+			});
+			expect((await clocked.select([low, midDown2], laneMeta))[0].id).toBe(
+				"low",
+			);
+
+			// A retain-owner directive now installs a BRAND-NEW owner, high --
+			// unrelated to mid's flapping. top is CONFIGURED but down at this
+			// exact moment, so high installs as a genuine displaced fallback (not
+			// at-home), keeping it eligible to upgrade once top recovers.
+			now += 10;
+			const topDown = makeAccount({
+				id: "top",
+				priority: 0,
+				rate_limited_until: now + 60_000,
+			});
+			const directiveMeta = {
+				...laneMeta,
+				affinityOwnerDirective: {
+					kind: "retain-owner",
+					owner: { candidateId: "account:high", accountId: "high" },
+				},
+			} as RequestMeta;
+			expect(
+				(await clocked.select([low, high, topDown], directiveMeta))[0].id,
+			).toBe("high");
+
+			// Drop the directive. top recovers -- a legitimate future upgrade for
+			// the freshly-installed owner high, which never itself flapped. A
+			// buggy inherited suppressUpgradesUntil (still armed from mid's
+			// fast-fail, well inside the window) would spuriously withhold it.
+			now += 10;
+			expect((await clocked.select([low, high, top], laneMeta))[0].id).toBe(
+				"top",
 			);
 		});
 	});

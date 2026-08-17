@@ -110,6 +110,28 @@ interface SessionAffinityEntry {
 	upgradedAt: number | null;
 	/** If set, further upgrades are suppressed until this timestamp. */
 	suppressUpgradesUntil: number | null;
+	/**
+	 * True iff, at the moment `candidateId` was last installed, its routing
+	 * tier was strictly worse than the best (minimum) tier among the
+	 * request's CONFIGURED candidates -- i.e. the owner was installed as a
+	 * displaced fallback while something better was configured but not
+	 * currently routable (down/rate-limited/absent-this-request).
+	 *
+	 * False means the owner was installed "at home": at the best configured
+	 * tier available to the request. A later cross-tier outclass (a priority
+	 * edit, or a higher-priority account appearing) must never remap an
+	 * at-home owner -- only a displaced owner is eligible to keep chasing a
+	 * better tier. See the class doc comment for the full invariant.
+	 */
+	installedBelowBestConfiguredTier: boolean;
+	/**
+	 * Set once an at-home owner has been protected from a cross-tier
+	 * outclass and the protection has been logged at info level for this
+	 * episode. Reset to false on an ordinary sticky hit or any remap, so the
+	 * next distinct protection episode logs at info again instead of
+	 * spamming info on every request of a long-lived protected session.
+	 */
+	crossTierProtectionLogged: boolean;
 }
 
 /**
@@ -143,7 +165,24 @@ interface SessionAffinityEntry {
  * When the pinned account is temporarily unavailable, snapback is retained
  * only if its configured tier is strictly better than the fallback. Equal or
  * worse unavailable owners are replaced, as are routable owners outclassed by
- * a better tier (or comparable pressure class).
+ * a better tier (or comparable pressure class) -- subject to the at-home
+ * guard below.
+ *
+ * At-home guard (cross-tier outclass): a healthy owner that was installed AT
+ * the request's best-CONFIGURED tier ("at home") is never remapped by a
+ * later cross-tier outclass -- an operator priority edit or a newly-added
+ * higher-priority account must not silently move a live session mid-
+ * conversation and abandon its prompt-cache prefix. The at-home owner keeps
+ * the session (ranked first, others behind it) until it becomes unavailable
+ * or the session idles out past the TTL. An owner installed while a strictly
+ * better tier was CONFIGURED for the request but not currently routable (a
+ * genuine displaced fallback, e.g. during an outage) is NOT at home, and
+ * still upgrades home once that better tier recovers -- today's behavior,
+ * unchanged. Every failover, snapback, anti-thrash suppression, and forced
+ * priority probe path is also unchanged: an unavailable owner (at-home or
+ * not) still fails over immediately. Only a same-request, cross-TIER
+ * outclass of a healthy owner is gated; same-tier pressure-band outclass
+ * remaps are unaffected.
  *
  * Anti-thrash (R13): once a session's mapping is upgraded to a better tier,
  * if that new owner fails (rate-limited/paused) within `antiThrashWindowMs`
@@ -152,7 +191,11 @@ interface SessionAffinityEntry {
  * every recovery. The deterministic FIRST upgrade for a session is never
  * suppressed. Suppression is scoped per-session (per affinity-map entry),
  * never global, and does not apply to request-scoped hard exclusions:
- * only genuine account-level unavailability counts as a "failure".
+ * only genuine account-level unavailability counts as a "failure". This is
+ * orthogonal to the at-home guard above: anti-thrash governs a session that
+ * HAS just upgraded and had that upgrade fail, while the at-home guard
+ * governs a session that never left its best-configured tier in the first
+ * place.
  */
 export class SessionAffinityStrategy implements LoadBalancingStrategy {
 	private affinityTtlMs: number;
@@ -214,6 +257,76 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 		return clientId !== null ? `client:${clientId}` : null;
 	}
 
+	/** The minimum tier in a set, or null for an empty input. */
+	private minimumConfiguredTier(tiers: Iterable<number>): number | null {
+		let min: number | null = null;
+		for (const tier of tiers) {
+			if (min === null || tier < min) min = tier;
+		}
+		return min;
+	}
+
+	/**
+	 * Best (lowest) tier CONFIGURED on `meta.routingCandidateCatalog` alone,
+	 * hard-exclusion filtered, or null when no catalog is present. Split out
+	 * from {@link bestConfiguredTier} so `commitAffinityOwner` -- which has
+	 * no candidates list to fall back on -- can use the catalog-only half.
+	 */
+	private bestCatalogConfiguredTier(meta: RequestMeta): number | null {
+		const catalog = meta.routingCandidateCatalog;
+		if (!catalog) return null;
+		return this.minimumConfiguredTier(
+			catalog
+				.filter(
+					(candidate) => !meta.hardExcludedAccountIds?.has(candidate.accountId),
+				)
+				.map((candidate) => candidate.tier),
+		);
+	}
+
+	/**
+	 * Best (lowest) tier CONFIGURED for this request, independent of live
+	 * availability. Source mirrors the R13 `stillConfigured` preference
+	 * below: prefer `meta.routingCandidateCatalog` (complete even when combo
+	 * pre-filtering already dropped rate-limited/paused slots out of
+	 * `candidates` before the strategy ran); otherwise fall back to the
+	 * hard-exclusion-filtered configured candidate list, which in the plain
+	 * (non-combo) path still INCLUDES rate-limited/paused accounts -- that is
+	 * why `isAccountAvailable` filtering and `autoUnpauseElapsedAccounts`
+	 * live inside `select()` rather than upstream of it.
+	 *
+	 * Deliberately NOT `@better-ccflare/core`'s `minimumRoutableTier`: that
+	 * helper only ever sees candidates already filtered down to currently
+	 * routable ones. Reusing it here over CONFIGURED (possibly unavailable)
+	 * candidates would misreport a rate-limited best tier as "not
+	 * configured" and mark every genuinely displaced owner as at-home.
+	 */
+	private bestConfiguredTier(
+		meta: RequestMeta,
+		candidates: StrategyCandidate[],
+	): number | null {
+		if (meta.routingCandidateCatalog) {
+			return this.bestCatalogConfiguredTier(meta);
+		}
+		return this.minimumConfiguredTier(
+			candidates.map((candidate) => candidate.routing.tier),
+		);
+	}
+
+	/**
+	 * Whether installing `candidate` right now would count as "installed
+	 * below the best configured tier" (a displaced fallback) rather than "at
+	 * home". See {@link SessionAffinityEntry.installedBelowBestConfiguredTier}.
+	 */
+	private computeInstalledBelowBestConfiguredTier(
+		candidate: StrategyCandidate,
+		meta: RequestMeta,
+		candidates: StrategyCandidate[],
+	): boolean {
+		const bestTier = this.bestConfiguredTier(meta, candidates);
+		return bestTier !== null && candidate.routing.tier > bestTier;
+	}
+
 	snapshotAffinityOwner(meta: RequestMeta): AffinityOwnerSnapshot | null {
 		const affinityKey = this.affinityKey(meta);
 		if (affinityKey === null) return null;
@@ -253,6 +366,21 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 			return true;
 		}
 		if (!existing) this.evictOldestIfFull();
+		// commitAffinityOwner has no candidates list, only meta: compute
+		// "at home" from the catalog's own entry for this owner when a catalog
+		// is present. When the catalog is absent, or the owner isn't in it,
+		// default to false (protected/at-home) rather than true -- the failure
+		// mode of a wrong `false` here is "session stays put", never a
+		// surprise cross-tier move, so the conservative default is the safe
+		// one.
+		const catalogOwnerEntry = meta.routingCandidateCatalog?.find(
+			(candidate) => candidate.candidateId === owner.candidateId,
+		);
+		const bestCatalogTier = this.bestCatalogConfiguredTier(meta);
+		const installedBelowBestConfiguredTier =
+			catalogOwnerEntry !== undefined &&
+			bestCatalogTier !== null &&
+			catalogOwnerEntry.tier > bestCatalogTier;
 		this.affinity.set(affinityKey, {
 			candidateId: owner.candidateId,
 			accountId: owner.accountId,
@@ -260,6 +388,8 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 			assignedAt: now,
 			upgradedAt: null,
 			suppressUpgradesUntil: null,
+			installedBelowBestConfiguredTier,
+			crossTierProtectionLogged: false,
 		});
 		return true;
 	}
@@ -720,6 +850,27 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 				configuredOwner?.account.paused === true;
 
 			if (!hardInvalid) {
+				// The directive forces this exact owner regardless of ranking. The
+				// at-home marker is INSTALL-time state, so it is computed only when
+				// the directive actually installs an owner: a brand-new lane, or a
+				// retained owner that differs from the one already mapped.
+				// Recomputing it on an ordinary same-owner refresh would let a
+				// priority edit made while the directive is in force silently
+				// re-label an at-home owner as displaced, so the next cross-tier
+				// outclass after the directive lifts would remap the very session
+				// the guard exists to protect. `commitAffinityOwner` follows the
+				// same same-owner-refresh rule.
+				const retainedOwnerInstalledBelowBestConfiguredTier = (): boolean => {
+					const retainedOwnerTier =
+						catalogOwner?.tier ?? configuredOwner?.routing.tier;
+					const bestTier = this.bestConfiguredTier(meta, candidates);
+					return (
+						retainedOwnerTier !== undefined &&
+						bestTier !== null &&
+						retainedOwnerTier > bestTier
+					);
+				};
+
 				let mapping = this.affinity.get(affinityKey);
 				if (!mapping) {
 					this.evictOldestIfFull();
@@ -730,12 +881,32 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 						assignedAt: now,
 						upgradedAt: null,
 						suppressUpgradesUntil: null,
+						installedBelowBestConfiguredTier:
+							retainedOwnerInstalledBelowBestConfiguredTier(),
+						crossTierProtectionLogged: false,
 					};
 					this.affinity.set(affinityKey, mapping);
 				} else {
+					const ownerChanged =
+						mapping.candidateId !== retainedOwner.candidateId ||
+						mapping.accountId !== retainedOwner.accountId;
 					mapping.candidateId = retainedOwner.candidateId;
 					mapping.accountId = retainedOwner.accountId;
 					mapping.assignedAt = now;
+					if (ownerChanged) {
+						mapping.installedBelowBestConfiguredTier =
+							retainedOwnerInstalledBelowBestConfiguredTier();
+						mapping.crossTierProtectionLogged = false;
+						// Anti-thrash state belongs to the owner it was measured
+						// against. Installing a DIFFERENT owner here without clearing
+						// it lets the replacement inherit a predecessor's upgrade
+						// timestamp -- enough to fire the fast-fail-after-upgrade
+						// branch for an owner that never upgraded, and to arm
+						// suppression from a timestamp that predates it. Every other
+						// install site in this class already resets both.
+						mapping.upgradedAt = null;
+						mapping.suppressUpgradesUntil = null;
+					}
 				}
 
 				this.routeCircuitSelections.set(meta, {
@@ -934,6 +1105,10 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 					// Refresh assignedAt so an active session keeps its mapping alive.
 					mapping.assignedAt = now;
 					mapping.fallbackCandidateId = null;
+					// The owner is no longer cross-tier outclassed (if it ever was):
+					// end any in-progress protection episode so the next one logs
+					// at info again.
+					mapping.crossTierProtectionLogged = false;
 					const others = this.rankByLeastUsed(
 						available.filter(
 							(candidate) =>
@@ -985,6 +1160,49 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 						);
 					}
 
+					// At-home guard: a healthy owner installed AT the request's best
+					// configured tier must never be remapped by a later CROSS-TIER
+					// outclass (a priority edit, or a higher-priority account
+					// appearing) -- only same-tier pressure-band outclass and owners
+					// that were already displaced fallbacks remain eligible below.
+					// `best` is always the minimum tier in `available` (rankByLeastUsed
+					// sorts tier ascending), so `mapped` can never have a strictly
+					// better tier than `best` here -- equal tiers are the same-tier
+					// pressure case, which must fall through unchanged.
+					const crossTierOutclass = best.routing.tier < mapped.routing.tier;
+					if (crossTierOutclass && !mapping.installedBelowBestConfiguredTier) {
+						mapping.assignedAt = now;
+						mapping.fallbackCandidateId = null;
+						const others = this.rankByLeastUsed(
+							available.filter(
+								(candidate) =>
+									candidate.routing.candidateId !== mapped.routing.candidateId,
+							),
+							now,
+							meta,
+						);
+						const logFields = {
+							ownerCandidateId: mapped.routing.candidateId,
+							ownerTier: mapped.routing.tier,
+							bestCandidateId: best.routing.candidateId,
+							bestTier: best.routing.tier,
+							affinityLanePresent: meta.affinityLaneKey != null,
+						};
+						if (mapping.crossTierProtectionLogged) {
+							this.log.debug(
+								"At-home route owner protected from cross-tier outclass",
+								logFields,
+							);
+						} else {
+							this.log.info(
+								"At-home route owner protected from cross-tier outclass",
+								logFields,
+							);
+							mapping.crossTierProtectionLogged = true;
+						}
+						return commitStrategyCandidateOrder([mapped, ...others], meta);
+					}
+
 					// A routable better tier (or comparable higher-pressure class inside
 					// the same tier) is authoritative and becomes the new sticky owner.
 					const ordered = this.pickAndMark(available, now, meta, true);
@@ -996,10 +1214,26 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 						mapping.assignedAt = now;
 						mapping.upgradedAt = now;
 						mapping.suppressUpgradesUntil = null;
+						mapping.installedBelowBestConfiguredTier =
+							this.computeInstalledBelowBestConfiguredTier(
+								replacement,
+								meta,
+								candidates,
+							);
+						mapping.crossTierProtectionLogged = false;
 					}
+					// This line fires for both remaps the at-home guard deliberately
+					// allows: a same-tier pressure-band outclass, and a displaced
+					// owner recovering to its home tier. Carry the tiers and the
+					// previous owner so an incident review can tell which happened
+					// without re-deriving install-time state that isn't logged.
 					this.log.info("Outclassed route owner remapped", {
 						candidateId:
 							replacement?.routing.candidateId ?? best.routing.candidateId,
+						previousCandidateId: mapped.routing.candidateId,
+						previousTier: mapped.routing.tier,
+						replacementTier: (replacement ?? best).routing.tier,
+						crossTier: best.routing.tier < mapped.routing.tier,
 						affinityLanePresent: meta.affinityLaneKey != null,
 					});
 					return commitStrategyCandidateOrder(ordered, meta);
@@ -1065,6 +1299,13 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 							mapping.fallbackCandidateId = null;
 							mapping.assignedAt = now;
 							mapping.upgradedAt = null;
+							mapping.installedBelowBestConfiguredTier =
+								this.computeInstalledBelowBestConfiguredTier(
+									fallback,
+									meta,
+									candidates,
+								);
+							mapping.crossTierProtectionLogged = false;
 							this.log.info(
 								"Upgraded route owner failed inside anti-thrash window",
 								{
@@ -1107,6 +1348,13 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 						mapping.fallbackCandidateId = null;
 						mapping.assignedAt = now;
 						mapping.upgradedAt = null;
+						mapping.installedBelowBestConfiguredTier =
+							this.computeInstalledBelowBestConfiguredTier(
+								fallback,
+								meta,
+								candidates,
+							);
+						mapping.crossTierProtectionLogged = false;
 						this.log.info("Unavailable equal/worse route owner remapped", {
 							candidateId: fallback.routing.candidateId,
 							affinityLanePresent: meta.affinityLaneKey != null,
@@ -1136,6 +1384,13 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 				assignedAt: now,
 				upgradedAt: null,
 				suppressUpgradesUntil: null,
+				installedBelowBestConfiguredTier:
+					this.computeInstalledBelowBestConfiguredTier(
+						chosen,
+						meta,
+						candidates,
+					),
+				crossTierProtectionLogged: false,
 			});
 			this.log.debug("Least-used route owner assigned", {
 				candidateId: chosen.routing.candidateId,
