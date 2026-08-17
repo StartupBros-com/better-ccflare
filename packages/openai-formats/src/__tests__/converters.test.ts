@@ -715,6 +715,39 @@ describe("convertOpenAIResponseToAnthropic — success cases", () => {
 		expect(content[0]).toEqual({ type: "text", text: "Hello back!" });
 	});
 
+	it("maps reasoning_content to a thinking block ahead of the text block", () => {
+		const result = convertOpenAIResponseToAnthropic(
+			openaiTextResponse({
+				choices: [
+					{
+						index: 0,
+						message: {
+							role: "assistant",
+							reasoning_content: "Let me reason about this.",
+							content: "Hello back!",
+						},
+						finish_reason: "stop",
+					},
+				],
+			}),
+		);
+		const content = result.content ?? [];
+		expect(content).toHaveLength(2);
+		// Ordering matters: the streaming path opens the thinking block before
+		// text, so the non-streaming path must agree.
+		expect(content[0]).toEqual({
+			type: "thinking",
+			thinking: "Let me reason about this.",
+		});
+		expect(content[1]).toEqual({ type: "text", text: "Hello back!" });
+	});
+
+	it("omits the thinking block when reasoning_content is absent", () => {
+		const result = convertOpenAIResponseToAnthropic(openaiTextResponse());
+		const content = result.content ?? [];
+		expect(content.some((block) => block.type === "thinking")).toBe(false);
+	});
+
 	it("maps finish_reason stop → end_turn", () => {
 		const result = convertOpenAIResponseToAnthropic(openaiTextResponse());
 		expect(result.stop_reason).toBe("end_turn");

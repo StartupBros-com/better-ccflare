@@ -361,8 +361,18 @@ export function convertOpenAIResponseToAnthropic(
 		};
 	}
 
-	// Build content array with text and tool calls
+	// Build content array with reasoning, text and tool calls
 	const content: AnthropicContentBlock[] = [];
+
+	// Add reasoning content if present. Ordered ahead of text to match the
+	// streaming path, where reasoning_content arrives before content and the
+	// thinking block is opened first (see stream.ts).
+	if (choice.message?.reasoning_content) {
+		content.push({
+			type: "thinking",
+			thinking: choice.message.reasoning_content,
+		});
+	}
 
 	// Add text content if present
 	if (choice.message?.content) {
