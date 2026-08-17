@@ -213,6 +213,22 @@ export interface PoolStatus {
 	next_available_at: string | null; // ISO timestamp when earliest rate-limit expires
 }
 
+/** Restart-scoped routing state and monotonic transition counters. */
+export interface RoutingHealth {
+	affinityEntries: number;
+	routeSuppressionEntries: number;
+	routeSuppressionGcSweeps: number;
+	transitions: {
+		atHomeProtections: number;
+		outclassRemaps: {
+			crossTier: number;
+			sameTier: number;
+		};
+		failoverRemaps: number;
+		snapbackPreservations: number;
+	};
+}
+
 // Account detail for ?detail=1
 export interface AccountDetail {
 	name: string;
@@ -302,6 +318,7 @@ export interface HealthResponse {
 	git_ref?: string;
 	build_date?: string;
 	pool?: PoolStatus;
+	routing?: RoutingHealth;
 	accounts_detail?: Array<AccountDetail>;
 	runtime?: {
 		asyncWriter?: {
