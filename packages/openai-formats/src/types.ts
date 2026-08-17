@@ -205,6 +205,7 @@ export interface OpenAIResponse {
 		message?: {
 			content?: string | null;
 			role?: string;
+			reasoning_content?: string;
 			tool_calls?: OpenAIToolCall[];
 		};
 		delta?: OpenAIStreamDelta;
