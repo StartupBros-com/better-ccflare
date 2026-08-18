@@ -392,11 +392,25 @@ describe("resolveModelContextCapability", () => {
 		});
 		expect(
 			resolveModelContextCapability("codex", "gpt-5.4")?.effectiveContextWindow,
+		).toBe(950_000);
+		expect(
+			resolveModelContextCapability("codex", "gpt-5.4-mini")
+				?.effectiveContextWindow,
 		).toBe(258_400);
 	});
 
-	it("keeps default and max identical for models with one catalog window", () => {
+	it("splits default from max for models the catalog publishes with both", () => {
 		expect(resolveModelContextCapability("codex", "gpt-5.4")).toMatchObject({
+			defaultContextWindow: 272_000,
+			maxContextWindow: 1_000_000,
+			rawContextWindow: 1_000_000,
+		});
+	});
+
+	it("keeps default and max identical for models with one catalog window", () => {
+		expect(
+			resolveModelContextCapability("codex", "gpt-5.4-mini"),
+		).toMatchObject({
 			defaultContextWindow: 272_000,
 			maxContextWindow: 272_000,
 			rawContextWindow: 272_000,
@@ -407,7 +421,8 @@ describe("resolveModelContextCapability", () => {
 		expect(MODEL_CONTEXT_WINDOWS["gpt-5.6-sol"]).toBe(872_000);
 		expect(MODEL_CONTEXT_WINDOWS["gpt-5.6-terra"]).toBe(872_000);
 		expect(MODEL_CONTEXT_WINDOWS["gpt-5.6-luna"]).toBe(872_000);
-		expect(MODEL_CONTEXT_WINDOWS["gpt-5.4"]).toBe(272_000);
+		expect(MODEL_CONTEXT_WINDOWS["gpt-5.4"]).toBe(1_000_000);
+		expect(MODEL_CONTEXT_WINDOWS["gpt-5.4-mini"]).toBe(272_000);
 	});
 
 	it("resolves dated variants by the longest family prefix", () => {

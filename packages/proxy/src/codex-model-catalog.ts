@@ -31,7 +31,17 @@ export interface CodexModelEntry {
 	id: string;
 	displayName: string;
 	description: string | null;
+	/**
+	 * Catalog `context_window`: the DEFAULT/recommended window, not capacity.
+	 * Kept under its historical name for API compatibility; capacity lives in
+	 * {@link maxContextWindow}. Conflating the two is how issue #205's local
+	 * prompt-too-long failures happened.
+	 */
 	contextWindow: number | null;
+	/** Catalog `max_context_window`: capacity a client may opt into. */
+	maxContextWindow: number | null;
+	/** Catalog `effective_context_window_percent` (usable share of capacity). */
+	effectiveContextPercent: number | null;
 	/**
 	 * Model OpenAI says will replace this one, when it has announced a
 	 * deprecation. Worth surfacing: picking a model that is on its way out is
@@ -170,6 +180,8 @@ interface CodexModelsResponse {
 		display_name?: string;
 		description?: string;
 		context_window?: number;
+		max_context_window?: number;
+		effective_context_window_percent?: number;
 		/** "list" to be offered; "hide" for routing aliases and internal models. */
 		visibility?: string;
 		/** OpenAI's own ordering, frontier first. */
@@ -208,6 +220,14 @@ function normalize(body: CodexModelsResponse): CodexModelEntry[] {
 					: null,
 			contextWindow:
 				typeof raw.context_window === "number" ? raw.context_window : null,
+			maxContextWindow:
+				typeof raw.max_context_window === "number"
+					? raw.max_context_window
+					: null,
+			effectiveContextPercent:
+				typeof raw.effective_context_window_percent === "number"
+					? raw.effective_context_window_percent
+					: null,
 		});
 	}
 

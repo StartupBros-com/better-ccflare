@@ -208,12 +208,16 @@ interface ModelContextMetadata {
 // Synced from the Codex CLI model cache (~/.codex/models_cache.json,
 // codex-cli 0.147.0). This is the single source for Codex context capability.
 // The catalog distinguishes `context_window` (default/recommended) from
-// `max_context_window` (capacity a client may opt into). Models published with
-// one window carry default === max. GPT-5.6's 872k max is the catalog's stated
-// capacity, not an independently proven upstream hard limit — but production
-// has accepted cache-inclusive prompts of 799,652 (terra) and 565,703 (sol)
-// tokens, so the previous 372k value was provably below real capacity and
-// caused clients to fail large tool-result turns locally (issue #205).
+// `max_context_window` (capacity a client may opt into): gpt-5.5,
+// gpt-5.4-mini, and gpt-5.3-codex-spark are published single-window
+// (default === max); gpt-5.6-* carries 872k max and gpt-5.4 carries 1M max.
+// gpt-5.3-codex is a legacy entry absent from the current catalog, retained
+// with its historical value. A catalog max is the catalog's stated capacity,
+// not an independently proven upstream hard limit — but production has
+// accepted cache-inclusive prompts of 799,652 (gpt-5.6-terra) and 565,703
+// (gpt-5.6-sol) tokens, so the previous invented 372k value was provably
+// below real capacity and caused clients to fail large tool-result turns
+// locally before any request was sent (issue #205).
 const CODEX_MODEL_CONTEXT_METADATA: Readonly<
 	Record<string, ModelContextMetadata>
 > = {
@@ -229,7 +233,7 @@ const CODEX_MODEL_CONTEXT_METADATA: Readonly<
 	},
 	"gpt-5.4": {
 		defaultContextWindow: 272_000,
-		maxContextWindow: 272_000,
+		maxContextWindow: 1_000_000,
 		effectiveContextPercent: 95,
 	},
 	"gpt-5.4-mini": {

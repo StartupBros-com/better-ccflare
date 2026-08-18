@@ -773,7 +773,7 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 		const result = selectAdmittedCodexModel(
 			makeCodexAccount({
 				custom_endpoint: "https://api.openai.com/v1/responses",
-				model_mappings: JSON.stringify({ sonnet: "gpt-5.4" }),
+				model_mappings: JSON.stringify({ sonnet: "gpt-5.4-mini" }),
 			}),
 			"claude-sonnet-4-5",
 			tracker,
@@ -850,10 +850,10 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 		);
 		const custom = makeCodexAccount({
 			custom_endpoint: "https://api.openai.com/v1/responses",
-			model_mappings: JSON.stringify({ sonnet: "gpt-5.4" }),
+			model_mappings: JSON.stringify({ sonnet: "gpt-5.4-mini" }),
 		});
 		const subscription = makeCodexAccount({
-			model_mappings: JSON.stringify({ sonnet: "gpt-5.4" }),
+			model_mappings: JSON.stringify({ sonnet: "gpt-5.4-mini" }),
 		});
 		selectAdmittedCodexModel(custom, "claude-sonnet-4-5", tracker);
 		selectAdmittedCodexModel(subscription, "claude-sonnet-4-5", tracker);
@@ -1218,7 +1218,7 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
 		const account = makeCodexAccount({
 			model_mappings: JSON.stringify({
-				sonnet: ["gpt-5.3-codex-spark", "gpt-5.4"],
+				sonnet: ["gpt-5.3-codex-spark", "gpt-5.4-mini"],
 			}),
 		});
 		const tracker = createContextAdmissionTracker(
@@ -1247,7 +1247,7 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 		tracker.attemptedCount = 1;
 		const result = selectAdmittedCodexModel(
 			makeCodexAccount({
-				model_mappings: JSON.stringify({ sonnet: "gpt-5.4" }),
+				model_mappings: JSON.stringify({ sonnet: "gpt-5.4-mini" }),
 			}),
 			"claude-sonnet-4-5",
 			tracker,

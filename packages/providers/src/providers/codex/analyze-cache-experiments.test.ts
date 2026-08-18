@@ -10,7 +10,7 @@ describe("analyzeCodexCacheExperiments", () => {
 	test("excludes attempts annulled before dispatch from rollout evidence", () => {
 		const report = analyzeCodexCacheExperiments([
 			{
-				trace_schema_version: 18,
+				trace_schema_version: 19,
 				phase: "request",
 				ts: "2026-08-13T00:00:00.000Z",
 				request_id: "private-logical",
@@ -27,7 +27,7 @@ describe("analyzeCodexCacheExperiments", () => {
 			{
 				// Registered while its body was transformed, then abandoned before
 				// route claiming: a higher ordinal that never reached the wire.
-				trace_schema_version: 18,
+				trace_schema_version: 19,
 				phase: "request",
 				ts: "2026-08-13T00:00:01.000Z",
 				request_id: "private-logical",
@@ -41,14 +41,14 @@ describe("analyzeCodexCacheExperiments", () => {
 				codex_turn_state_replay_applied: false,
 			},
 			{
-				trace_schema_version: 18,
+				trace_schema_version: 19,
 				phase: "attempt_aborted",
 				ts: "2026-08-13T00:00:01.500Z",
 				request_id: "private-logical",
 				attempt_id: "private-attempt-abandoned",
 			},
 			{
-				trace_schema_version: 18,
+				trace_schema_version: 19,
 				phase: "response",
 				ts: "2026-08-13T00:00:03.000Z",
 				request_id: "private-logical",
@@ -92,7 +92,7 @@ describe("analyzeCodexCacheExperiments", () => {
 	test("attributes HTTP turn-state by first attempt and final outcome", () => {
 		const report = analyzeCodexCacheExperiments([
 			{
-				trace_schema_version: 18,
+				trace_schema_version: 19,
 				phase: "request",
 				ts: "2026-08-13T00:00:00.000Z",
 				request_id: "private-logical-first",
@@ -108,7 +108,7 @@ describe("analyzeCodexCacheExperiments", () => {
 				codex_turn_state_request_hmac: "matched-hmac",
 			},
 			{
-				trace_schema_version: 18,
+				trace_schema_version: 19,
 				phase: "request",
 				ts: "2026-08-13T00:00:01.000Z",
 				request_id: "private-logical-first",
@@ -123,7 +123,7 @@ describe("analyzeCodexCacheExperiments", () => {
 				codex_turn_state_replay_applied: false,
 			},
 			{
-				trace_schema_version: 18,
+				trace_schema_version: 19,
 				phase: "response",
 				ts: "2026-08-13T00:00:03.000Z",
 				request_id: "private-logical-first",
@@ -138,7 +138,7 @@ describe("analyzeCodexCacheExperiments", () => {
 				codex_turn_state_terminal_action: "advanced",
 			},
 			{
-				trace_schema_version: 18,
+				trace_schema_version: 19,
 				phase: "request",
 				ts: "2026-08-13T00:02:00.000Z",
 				request_id: "private-control",
@@ -221,7 +221,7 @@ describe("analyzeCodexCacheExperiments", () => {
 			const ts = `2026-08-13T00:00:${String(index).padStart(2, "0")}.000Z`;
 			return [
 				{
-					trace_schema_version: 18 as const,
+					trace_schema_version: 19 as const,
 					phase: "request" as const,
 					ts,
 					request_id: `private-logical-${index}`,
@@ -236,7 +236,7 @@ describe("analyzeCodexCacheExperiments", () => {
 					codex_turn_state_replay_applied: true,
 				},
 				{
-					trace_schema_version: 18 as const,
+					trace_schema_version: 19 as const,
 					phase: "response" as const,
 					ts,
 					request_id: `private-logical-${index}`,

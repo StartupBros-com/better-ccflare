@@ -121,7 +121,12 @@ export interface APIContext {
 				id: string;
 				displayName: string;
 				description: string | null;
+				/** Catalog default/recommended window — not capacity. */
 				contextWindow: number | null;
+				/** Catalog maximum window: capacity a client may opt into. */
+				maxContextWindow: number | null;
+				/** Usable share of capacity, e.g. 95. */
+				effectiveContextPercent: number | null;
 				supersededBy: string | null;
 			}>;
 			fetchedAt: number;
