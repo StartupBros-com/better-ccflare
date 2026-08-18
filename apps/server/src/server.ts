@@ -114,8 +114,14 @@ import { serve } from "bun";
 /**
  * Build a load-balancing strategy from its enum name. Add new strategies here
  * as additional cases. Falls back to SessionStrategy on unknown values.
+ *
+ * Exported for tests: this is the single factory both the initial strategy
+ * construction and the config-hot-reload path (`config.on("change", ...)`)
+ * call, always passing the same process-lifetime `routingTransitions`
+ * recorder — that sharing is what keeps /health's transition counters
+ * monotonic across a hot reload.
  */
-function buildStrategy(
+export function buildStrategy(
 	name: StrategyName,
 	sessionDurationMs: number,
 	routingTransitions: RoutingTransitionRecorder,

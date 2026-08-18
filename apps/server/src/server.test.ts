@@ -3,12 +3,20 @@ import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { BunSqlAdapter } from "@better-ccflare/database";
+import { RoutingTransitionRecorder } from "@better-ccflare/load-balancer";
 import { Logger, logBus } from "@better-ccflare/logger";
 import { CODEX_DEFAULT_ENDPOINT } from "@better-ccflare/providers";
-import type { LogEvent } from "@better-ccflare/types";
+import type {
+	Account,
+	LogEvent,
+	RequestMeta,
+	StrategyStore,
+} from "@better-ccflare/types";
+import { StrategyName } from "@better-ccflare/types";
 import {
 	accountSupportsRefreshBackedUsagePolling,
 	bootstrapMinimaxUsagePolling,
+	buildStrategy,
 	persistForwardOnlyCodexRateLimitReset,
 	registerMinimaxUsagePolling,
 	resolveDashboardRoute,
@@ -1051,5 +1059,224 @@ describe("startServer() wiring guards", () => {
 		// Third argument must flow through the configured poll interval —
 		// i.e. not a hardcoded numeric literal.
 		expect(argList[2]).not.toMatch(/^\d+$/);
+	});
+});
+
+// #197: buildStrategy() is the single factory both the initial strategy
+// construction and the config-hot-reload path in startServer() call, always
+// passing the one process-lifetime RoutingTransitionRecorder captured in its
+// closure. These tests exercise that factory directly (not the full
+// startServer() lifecycle, which is impractical to boot in a unit test — see
+// the "startServer() wiring guards" block above) to prove recorder sharing
+// survives a hot-reload rebuild, and add a structural guard that both real
+// call sites in server.ts still pass the shared instance.
+describe("buildStrategy() routing recorder sharing (#197)", () => {
+	function makeAccount(overrides: Partial<Account> = {}): Account {
+		return {
+			id: "a",
+			name: "a",
+			provider: "anthropic",
+			api_key: null,
+			refresh_token: "r",
+			access_token: "t",
+			expires_at: Date.now() + 3_600_000,
+			request_count: 0,
+			total_requests: 0,
+			last_used: null,
+			created_at: Date.now(),
+			rate_limited_until: null,
+			rate_limited_reason: null,
+			rate_limited_at: null,
+			session_start: null,
+			session_request_count: 0,
+			paused: false,
+			rate_limit_reset: null,
+			rate_limit_status: null,
+			rate_limit_remaining: null,
+			priority: 0,
+			auto_fallback_enabled: false,
+			auto_refresh_enabled: false,
+			auto_pause_on_overage_enabled: false,
+			peak_hours_pause_enabled: false,
+			custom_endpoint: null,
+			model_mappings: null,
+			cross_region_mode: null,
+			model_fallbacks: null,
+			billing_type: null,
+			pause_reason: null,
+			refresh_token_issued_at: null,
+			...overrides,
+		};
+	}
+
+	function metaFor(clientSessionId: string): RequestMeta {
+		return {
+			id: "req",
+			headers: new Headers(),
+			timestamp: Date.now(),
+			clientSessionId,
+		} as unknown as RequestMeta;
+	}
+
+	function makeStrategyStore(): StrategyStore {
+		return {
+			resetAccountSession() {},
+			async resumeAccount() {
+				return { resumed: true, pauseReason: null };
+			},
+			getAccountUtilization() {
+				return null;
+			},
+			getAccountWeeklyReset() {
+				return null;
+			},
+		} as unknown as StrategyStore;
+	}
+
+	it("keeps a shared recorder's counters monotonic across the initial build and a hot-reload rebuild", async () => {
+		const routingTransitions = new RoutingTransitionRecorder();
+
+		// The initial construction path: startServer() calls buildStrategy()
+		// once before the server starts serving.
+		const initial = buildStrategy(
+			StrategyName.SessionAffinity,
+			1_000,
+			routingTransitions,
+		);
+		initial.initialize?.(makeStrategyStore());
+
+		const owner = makeAccount({ id: "owner", priority: 5 });
+		const laneMeta = {
+			...metaFor("hot-reload-client"),
+			affinityLaneKey: "hot-reload-client:anthropic:opus",
+		} as RequestMeta;
+		expect((await initial.select([owner], laneMeta))[0].id).toBe("owner");
+		const better = makeAccount({ id: "better", priority: 0 });
+		// Owner is at-home below the configured tier of `better`; the strategy
+		// protects it rather than remapping, which is the transition this test
+		// drives through the real select() path.
+		expect((await initial.select([owner, better], laneMeta))[0].id).toBe(
+			"owner",
+		);
+		expect(initial.getRoutingHealth?.()?.transitions.atHomeProtections).toBe(1);
+
+		// The hot-reload path: config.on("change", ...) in startServer() calls
+		// buildStrategy() again with the SAME routingTransitions closure
+		// variable, then swaps `currentStrategy` to the rebuilt instance.
+		const reloaded = buildStrategy(
+			StrategyName.SessionAffinity,
+			1_000,
+			routingTransitions,
+		);
+		reloaded.initialize?.(makeStrategyStore());
+
+		// The new strategy's own local gauges (its affinity map) start fresh...
+		expect(reloaded.getRoutingHealth?.()?.affinityEntries).toBe(0);
+		// ...but the shared transition counters carry over from the old
+		// strategy instance, because both factory calls were given the same
+		// recorder.
+		expect(reloaded.getRoutingHealth?.()?.transitions.atHomeProtections).toBe(
+			1,
+		);
+
+		// An in-flight request that captured a reference to the OLD strategy
+		// before the hot reload swapped `currentStrategy` can still complete
+		// and record a transition afterwards. The shared recorder must make
+		// that late increment visible through the NEW strategy's getter —
+		// which is what /health actually reads once the reload has happened.
+		const laneMeta2 = {
+			...metaFor("hot-reload-client-2"),
+			affinityLaneKey: "hot-reload-client-2:anthropic:opus",
+		} as RequestMeta;
+		expect((await initial.select([owner], laneMeta2))[0].id).toBe("owner");
+		expect((await initial.select([owner, better], laneMeta2))[0].id).toBe(
+			"owner",
+		);
+
+		expect(reloaded.getRoutingHealth?.()?.transitions.atHomeProtections).toBe(
+			2,
+		);
+		// The old instance's own local affinity map is unaffected by the new
+		// instance's independent state, confirming the two counters
+		// (per-instance gauges vs. shared transitions) really are on separate
+		// storage rather than accidentally aliased. Two distinct lane keys
+		// (laneMeta, laneMeta2) were routed through `initial`, so it holds two
+		// affinity entries; `reloaded` never served a request and holds none.
+		expect(initial.getRoutingHealth?.()?.affinityEntries).toBe(2);
+		expect(reloaded.getRoutingHealth?.()?.affinityEntries).toBe(0);
+	});
+
+	it("wires SessionDrainSoonestStrategy to the same recorder as SessionAffinityStrategy", () => {
+		const routingTransitions = new RoutingTransitionRecorder();
+		const strategy = buildStrategy(
+			StrategyName.SessionDrainSoonest,
+			1_000,
+			routingTransitions,
+		);
+		strategy.initialize?.(makeStrategyStore());
+
+		expect(strategy.getRoutingHealth?.()?.transitions).toEqual({
+			atHomeProtections: 0,
+			outclassRemaps: { crossTier: 0, sameTier: 0 },
+			failoverRemaps: 0,
+			snapbackPreservations: 0,
+		});
+
+		const rebuilt = buildStrategy(
+			StrategyName.SessionDrainSoonest,
+			1_000,
+			routingTransitions,
+		);
+		rebuilt.initialize?.(makeStrategyStore());
+		// Same recorder instance shared across the rebuild for this strategy
+		// too — not just the plain SessionAffinity case above.
+		expect(rebuilt.getRoutingHealth?.()?.transitions).toEqual(
+			strategy.getRoutingHealth?.()?.transitions,
+		);
+	});
+
+	it("does not surface a routing block for strategies that don't implement getRoutingHealth", () => {
+		const routingTransitions = new RoutingTransitionRecorder();
+		const leastUsed = buildStrategy(
+			StrategyName.LeastUsed,
+			1_000,
+			routingTransitions,
+		);
+		expect(leastUsed.getRoutingHealth).toBeUndefined();
+
+		const session = buildStrategy(
+			StrategyName.Session,
+			1_000,
+			routingTransitions,
+		);
+		expect(session.getRoutingHealth).toBeUndefined();
+	});
+
+	// Structural guard: buildStrategy() being shareable is necessary but not
+	// sufficient — startServer() must actually pass the ONE closure-scoped
+	// `routingTransitions` (declared once, before the initial build) to both
+	// the initial build call and the config.on("change") hot-reload rebuild
+	// call. A regression that constructed a fresh `new RoutingTransitionRecorder()`
+	// at either call site would compile and pass every other test in this
+	// file (each call to buildStrategy() is independently well-typed), so
+	// this reads the source and pins both call sites to the same identifier.
+	it("passes the single closure-scoped routingTransitions instance to both the initial-build and hot-reload call sites in server.ts", () => {
+		const src = readFileSync(join(import.meta.dir, "server.ts"), "utf8");
+
+		expect(src).toMatch(
+			/const routingTransitions = new RoutingTransitionRecorder\(\);/,
+		);
+
+		const buildStrategyCalls = [
+			// Only the two real invocations assign a variable from the call
+			// (`const strategy = buildStrategy(...)`); the factory's own
+			// `export function buildStrategy(` definition line doesn't match
+			// this prefix, so it's excluded without needing to special-case it.
+			...src.matchAll(/=\s*buildStrategy\(\s*([\s\S]*?)\n\t+\);/g),
+		].map((m) => m[1]);
+		expect(buildStrategyCalls.length).toBe(2);
+		for (const call of buildStrategyCalls) {
+			expect(call).toMatch(/routingTransitions,\s*$/);
+		}
 	});
 });

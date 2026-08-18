@@ -216,6 +216,37 @@ describe("SessionAffinityStrategy", () => {
 			});
 		});
 
+		it("never increments atHomeProtections on a plain sticky hit where no better tier ever appears", async () => {
+			// Behavioral pin (#197 review gap): the counter above increments on
+			// every request where the owner is objectively outclassed but
+			// protected — it must NOT also increment on the much more common
+			// path where a repeat client just gets its existing sticky owner
+			// back because no better candidate is even in the pool.
+			const accounts = [
+				makeAccount({ id: "x", priority: 3 }),
+				makeAccount({ id: "y", priority: 3 }),
+				makeAccount({ id: "z", priority: 3 }),
+			];
+			const laneMeta = {
+				...metaFor("plain-sticky-health-client"),
+				affinityLaneKey: "plain-sticky-health-client:anthropic:opus",
+			} as RequestMeta;
+
+			const first = await strategy.select(accounts, laneMeta);
+			const assigned = first[0].id;
+			for (let i = 0; i < 5; i++) {
+				const next = await strategy.select(accounts, laneMeta);
+				expect(next[0].id).toBe(assigned);
+			}
+
+			expect(strategy.getRoutingHealth().transitions).toEqual({
+				atHomeProtections: 0,
+				outclassRemaps: { crossTier: 0, sameTier: 0 },
+				failoverRemaps: 0,
+				snapbackPreservations: 0,
+			});
+		});
+
 		it("counts only a cross-tier outclass remap when a displaced owner upgrades home", async () => {
 			const low = makeAccount({ id: "low", priority: 5 });
 			const highDown = makeAccount({
