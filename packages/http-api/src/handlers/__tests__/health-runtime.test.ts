@@ -110,7 +110,7 @@ describe("health runtime payload", () => {
 		});
 	});
 
-	it("omits runtime health when callbacks are not provided", async () => {
+	it("omits optional runtime and routing health when callbacks are not provided", async () => {
 		const db = {
 			getAllAccounts: async () => [
 				{ name: "acc1", paused: false, rate_limited_until: null },
@@ -127,6 +127,48 @@ describe("health runtime payload", () => {
 		const body = (await response.json()) as Record<string, unknown>;
 
 		expect(body).not.toHaveProperty("runtime");
+		expect(body).not.toHaveProperty("routing");
+	});
+
+	it("includes the active strategy's exact routing health snapshot", async () => {
+		const db = {
+			getAllAccounts: async () => [
+				{ name: "acc1", paused: false, rate_limited_until: null },
+			],
+		} as unknown as import("@better-ccflare/database").DatabaseOperations;
+		const config = {
+			getStrategy: () => "session-drain-soonest",
+			getHealthDetailEnabled: () => false,
+		} as unknown as import("@better-ccflare/config").Config;
+		const routing = {
+			affinityEntries: 41,
+			routeSuppressionEntries: 3,
+			routeSuppressionGcSweeps: 7,
+			transitions: {
+				atHomeProtections: 11,
+				outclassRemaps: {
+					crossTier: 13,
+					sameTier: 17,
+				},
+				failoverRemaps: 19,
+				snapbackPreservations: 23,
+			},
+		};
+
+		const response = await createHealthHandler(
+			db,
+			config,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			() => routing,
+		)(new URL("http://localhost/health"));
+		const body = (await response.json()) as HealthResponse;
+
+		expect(body.routing).toEqual(routing);
 	});
 
 	it("exposes only the fixed aggregate Anthropic degraded runtime schema", async () => {

@@ -1153,7 +1153,7 @@ async function handleProxyCoreImpl(
 			: undefined;
 
 	if (agentUsed && originalModel !== appliedModel) {
-		log.info(
+		log.debug(
 			`Agent ${agentUsed} detected, model changed from ${originalModel} to ${appliedModel}`,
 		);
 	}
@@ -1495,12 +1495,12 @@ async function handleProxyCoreImpl(
 		}
 
 		if (predictivelyThrottled.length > 0) {
-			log.info(
+			log.debug(
 				`Predictively usage-throttled ${predictivelyThrottled.length} account(s): ${predictivelyThrottled.map((account) => account.name).join(", ")}`,
 			);
 		}
 		if (reactivelyDepletedAccounts.length > 0) {
-			log.info(
+			log.debug(
 				`Reactively model-depleted ${reactivelyDepletedAccounts.length} account(s): ${reactivelyDepletedAccounts.map((account) => account.name).join(", ")}`,
 			);
 		}
@@ -1941,7 +1941,7 @@ async function handleProxyCoreImpl(
 	}
 
 	// 8. Log selected accounts
-	log.info(
+	log.debug(
 		`Selected ${accounts.length} accounts: ${accounts.map((a) => a.name).join(", ")}`,
 	);
 	if (
@@ -1949,7 +1949,7 @@ async function handleProxyCoreImpl(
 		process.env.DEBUG === "true" ||
 		process.env.NODE_ENV === "development"
 	) {
-		log.info(`Request: ${req.method} ${url.pathname}`);
+		log.debug(`Request: ${req.method} ${url.pathname}`);
 	}
 
 	// 9. Try each account
@@ -2558,7 +2558,7 @@ async function handleProxyCoreImpl(
 				modelOverride = slot.modelOverride;
 			}
 			requestMeta.comboSlotIndex = i;
-			log.info(
+			log.debug(
 				`Attempting combo slot ${i}/${accounts.length - 1} on account ${accounts[i].name} with model "${modelOverride}"`,
 			);
 		}
@@ -2580,7 +2580,7 @@ async function handleProxyCoreImpl(
 			if (contextAdmissionTracker) {
 				contextAdmissionTracker.nonCapacitySkipCount++;
 			}
-			log.info(
+			log.debug(
 				`Skipping account ${accounts[i].name} for model ${attemptModel}: recent model-scoped out_of_credits`,
 			);
 			continue;

@@ -2214,7 +2214,7 @@ async function selectAccountsForRequestInternal(
 					},
 				);
 				if (!resolution.active) {
-					log.info(
+					log.debug(
 						"Combo routing membership resolved",
 						buildComboMembershipDiagnostics(
 							resolution,
@@ -2493,7 +2493,7 @@ async function selectAccountsForRequestInternal(
 						);
 						if (orderedEntries.length > 0) {
 							const selectedEntry = orderedEntries[0];
-							log.info(
+							log.debug(
 								"Combo routing candidate selected",
 								buildComboMembershipDiagnostics(
 									resolution,

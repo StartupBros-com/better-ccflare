@@ -57,7 +57,7 @@ function writeFixturePrograms(dir: string): {
 			'import http from "node:http";',
 			'const portIndex = process.argv.indexOf("--port");',
 			"const port = Number(process.argv[portIndex + 1]);",
-			'appendFileSync(`${process.env.CAPTURE_DIR}/upstream.json`, JSON.stringify({ pid: process.pid, secret: process.env.CCFLARE_GUARD_CORRELATION_SECRET, argv: process.argv }) + "\\n");',
+			'appendFileSync(`${process.env.CAPTURE_DIR}/upstream.json`, JSON.stringify({ pid: process.pid, secret: process.env.CCFLARE_GUARD_CORRELATION_SECRET, logLevel: process.env.LOG_LEVEL, argv: process.argv }) + "\\n");',
 			"const server = http.createServer((_req, res) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{}'); });",
 			"server.listen(port, '127.0.0.1');",
 			"process.on('SIGTERM', () => server.close(() => process.exit(0)));",
@@ -182,7 +182,7 @@ async function runStackInvocation(
 	programs: { upstream: string; guard: string },
 	extraEnv: Record<string, string> = {},
 ): Promise<{
-	upstream: { secret: string; argv: string[] };
+	upstream: { secret: string; logLevel: string; argv: string[] };
 	guard: { secret: string; argv: string[] };
 	stdout: string;
 	stderr: string;
@@ -196,6 +196,7 @@ async function runStackInvocation(
 		cwd: repoRoot,
 		env: {
 			...process.env,
+			LOG_LEVEL: undefined,
 			CAPTURE_DIR: captureDir,
 			CCFLARE_BIN: programs.upstream,
 			GUARD_SCRIPT: programs.guard,
@@ -338,6 +339,28 @@ async function waitForExit(
 	]);
 }
 
+describe("run-ccflare-stack upstream environment", () => {
+	test("defaults LOG_LEVEL to warn when it is unset", async () => {
+		const fixtureDir = tempDir("ccflare-stack-log-level-default-fixture-");
+		const programs = writeFixturePrograms(fixtureDir);
+
+		const invocation = await runStackInvocation(programs);
+
+		expect(invocation.upstream.logLevel).toBe("warn");
+	});
+
+	test("passes an explicit LOG_LEVEL override to upstream", async () => {
+		const fixtureDir = tempDir("ccflare-stack-log-level-override-fixture-");
+		const programs = writeFixturePrograms(fixtureDir);
+
+		const invocation = await runStackInvocation(programs, {
+			LOG_LEVEL: "info",
+		});
+
+		expect(invocation.upstream.logLevel).toBe("info");
+	});
+});
+
 describe("run-ccflare-stack guard correlation credential", () => {
 	test(
 		"generates one high-entropy per-stack secret, passes it only by child env, and rotates on restart",
@@ -392,7 +415,7 @@ describe("run-ccflare-stack supervisor lifecycle", () => {
 				RUNNER_RESTART_BACKOFF_BASE_MS: "20",
 				RUNNER_RESTART_BACKOFF_MAX_MS: "40",
 				RUNNER_RESTART_MAX_FAILURES: "3",
-				RUNNER_RESTART_WINDOW_MS: "1000",
+				RUNNER_RESTART_WINDOW_MS: "10000",
 				RUNNER_RESTART_STABLE_MS: "1000",
 			});
 			const result = await waitForExit(runner.child, 5_000);

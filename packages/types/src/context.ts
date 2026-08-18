@@ -12,6 +12,7 @@ import type {
 	AnthropicDegradedRuntimeHealth,
 	IntegrityStatus,
 	RetentionStatus,
+	RoutingHealth,
 } from "./stats";
 import type { StrategyStore } from "./strategy";
 
@@ -215,6 +216,9 @@ export interface LoadBalancingStrategy {
 	getRouteCircuitRecoveryHint?(
 		meta: RequestMeta,
 	): RouteCircuitRecoveryHint | null;
+
+	/** Return a fresh snapshot of restart-scoped routing health. */
+	getRoutingHealth?(): RoutingHealth;
 
 	/**
 	 * Optional initialization method to inject dependencies

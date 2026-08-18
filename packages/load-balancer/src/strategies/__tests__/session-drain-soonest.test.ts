@@ -141,6 +141,29 @@ describe("SessionDrainSoonestStrategy", () => {
 		expect(secondPick[0]?.id).toBe("first");
 	});
 
+	it("inherits routing health from the shared session-affinity path", async () => {
+		const owner = makeAccount({ id: "owner", priority: 5 });
+		const better = makeAccount({ id: "better", priority: 0 });
+
+		expect((await strategy.select([owner], meta("health-client")))[0]?.id).toBe(
+			"owner",
+		);
+		expect(
+			(await strategy.select([owner, better], meta("health-client")))[0]?.id,
+		).toBe("owner");
+		expect(strategy.getRoutingHealth()).toEqual({
+			affinityEntries: 1,
+			routeSuppressionEntries: 0,
+			routeSuppressionGcSweeps: 1,
+			transitions: {
+				atHomeProtections: 1,
+				outclassRemaps: { crossTier: 0, sameTier: 0 },
+				failoverRemaps: 0,
+				snapbackPreservations: 0,
+			},
+		});
+	});
+
 	it("uses weekly reset ordering without a client session id", async () => {
 		const now = Date.now();
 		const later = makeAccount({ id: "later", priority: 0 });

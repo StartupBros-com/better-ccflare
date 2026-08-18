@@ -207,6 +207,7 @@ export class APIRouter {
 			undefined,
 			getAnthropicDegradedHealth,
 			getRetentionStatus,
+			() => getStrategy?.()?.getRoutingHealth?.(),
 		);
 		const statsHandler = createStatsHandler(dbOps);
 		const statsResetHandler = createStatsResetHandler(dbOps);

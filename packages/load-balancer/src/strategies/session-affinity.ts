@@ -13,6 +13,7 @@ import type {
 	RouteCircuitRecoveryHint,
 	RoutingCandidateFailureReport,
 	RoutingCandidateSuccessReport,
+	RoutingHealth,
 	StrategyStore,
 } from "@better-ccflare/types";
 import { isPeekAvailable, wouldAutoUnpause } from "./peek-availability";
@@ -134,6 +135,47 @@ interface SessionAffinityEntry {
 	crossTierProtectionLogged: boolean;
 }
 
+/** Process-lifetime scalar counters shared across hot strategy replacement. */
+export class RoutingTransitionRecorder {
+	private atHomeProtectionCount = 0;
+	private crossTierOutclassRemapCount = 0;
+	private sameTierOutclassRemapCount = 0;
+	private failoverRemapCount = 0;
+	private snapbackPreservationCount = 0;
+
+	recordAtHomeProtection(): void {
+		this.atHomeProtectionCount++;
+	}
+
+	recordCrossTierOutclassRemap(): void {
+		this.crossTierOutclassRemapCount++;
+	}
+
+	recordSameTierOutclassRemap(): void {
+		this.sameTierOutclassRemapCount++;
+	}
+
+	recordFailoverRemap(): void {
+		this.failoverRemapCount++;
+	}
+
+	recordSnapbackPreservation(): void {
+		this.snapbackPreservationCount++;
+	}
+
+	snapshot(): RoutingHealth["transitions"] {
+		return {
+			atHomeProtections: this.atHomeProtectionCount,
+			outclassRemaps: {
+				crossTier: this.crossTierOutclassRemapCount,
+				sameTier: this.sameTierOutclassRemapCount,
+			},
+			failoverRemaps: this.failoverRemapCount,
+			snapbackPreservations: this.snapbackPreservationCount,
+		};
+	}
+}
+
 /**
  * SessionAffinityStrategy — a hybrid of SessionStrategy and LeastUsedStrategy.
  *
@@ -224,6 +266,7 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 		antiThrashWindowMs: number = getSessionAffinityAntiThrashWindowMs(),
 		maxRouteSuppressionEntries: number = MAX_ROUTE_SUPPRESSION_ENTRIES,
 		private readonly now: () => number = Date.now,
+		private readonly routingTransitions: RoutingTransitionRecorder = new RoutingTransitionRecorder(),
 	) {
 		this.affinityTtlMs = affinityTtlMs;
 		this.maxAffinityEntries = maxAffinityEntries;
@@ -244,6 +287,15 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 	/** Amortized full-sweep count — useful for tests and runtime diagnostics. */
 	get routeSuppressionGcSweeps(): number {
 		return this.routeFailureGcSweepCount;
+	}
+
+	getRoutingHealth(): RoutingHealth {
+		return {
+			affinityEntries: this.affinityEntries,
+			routeSuppressionEntries: this.routeSuppressionEntries,
+			routeSuppressionGcSweeps: this.routeSuppressionGcSweeps,
+			transitions: this.routingTransitions.snapshot(),
+		};
 	}
 
 	initialize(store: StrategyStore): void {
@@ -1171,6 +1223,7 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 					// pressure case, which must fall through unchanged.
 					const crossTierOutclass = best.routing.tier < mapped.routing.tier;
 					if (crossTierOutclass && !mapping.installedBelowBestConfiguredTier) {
+						this.routingTransitions.recordAtHomeProtection();
 						mapping.assignedAt = now;
 						mapping.fallbackCandidateId = null;
 						const others = this.rankByLeastUsed(
@@ -1208,6 +1261,11 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 					const ordered = this.pickAndMark(available, now, meta, true);
 					const replacement = ordered[0];
 					if (replacement) {
+						if (crossTierOutclass) {
+							this.routingTransitions.recordCrossTierOutclassRemap();
+						} else {
+							this.routingTransitions.recordSameTierOutclassRemap();
+						}
 						mapping.candidateId = replacement.routing.candidateId;
 						mapping.accountId = replacement.account.id;
 						mapping.fallbackCandidateId = null;
@@ -1294,6 +1352,7 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 						mapping.suppressUpgradesUntil =
 							upgradedAt + this.antiThrashWindowMs;
 						if (fallback) {
+							this.routingTransitions.recordFailoverRemap();
 							mapping.candidateId = fallback.routing.candidateId;
 							mapping.accountId = fallback.account.id;
 							mapping.fallbackCandidateId = null;
@@ -1323,6 +1382,7 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 					const preserveForSnapback =
 						configuredOwnerTier !== undefined && configuredOwnerTier < bestTier;
 					if (preserveForSnapback) {
+						this.routingTransitions.recordSnapbackPreservation();
 						const ordered = this.orderWithActiveFallback(
 							available,
 							mapping,
@@ -1343,6 +1403,7 @@ export class SessionAffinityStrategy implements LoadBalancingStrategy {
 					const ordered = this.pickAndMark(available, now, meta, true);
 					const fallback = ordered[0];
 					if (fallback) {
+						this.routingTransitions.recordFailoverRemap();
 						mapping.candidateId = fallback.routing.candidateId;
 						mapping.accountId = fallback.account.id;
 						mapping.fallbackCandidateId = null;

@@ -134,7 +134,7 @@ export async function interceptAndModifyRequest(
 			if (preferredModel && preferredModel !== originalModel) {
 				const catalog = await loadModelCatalog();
 				if (isRewriteTargetServable(catalog, preferredModel)) {
-					log.info(
+					log.debug(
 						`Modifying model from ${originalModel} to ${preferredModel}`,
 					);
 					bodyContext.setModel(preferredModel);
@@ -248,7 +248,7 @@ export async function interceptAndModifyRequest(
 			// Only register if the workspace exists
 			if (existsSync(workspacePath)) {
 				await agentRegistry.registerWorkspace(workspacePath);
-				log.info(`Registered workspace: ${workspacePath}`);
+				log.debug(`Registered workspace: ${workspacePath}`);
 			} else {
 				log.debug(`Workspace path does not exist: ${workspacePath}`);
 			}
@@ -271,7 +271,7 @@ export async function interceptAndModifyRequest(
 			};
 		}
 
-		log.info(
+		log.debug(
 			`Detected agent usage: ${detectedAgent.name} (${detectedAgent.id})`,
 		);
 
@@ -315,7 +315,7 @@ export async function interceptAndModifyRequest(
 		}
 
 		// Modify the request body with the preferred model
-		log.info(`Modifying model from ${originalModel} to ${preferredModel}`);
+		log.debug(`Modifying model from ${originalModel} to ${preferredModel}`);
 		bodyContext.setModel(preferredModel);
 
 		return {

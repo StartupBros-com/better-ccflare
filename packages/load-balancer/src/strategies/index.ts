@@ -21,7 +21,10 @@ import {
 } from "./routing-metadata";
 
 export { LeastUsedStrategy } from "./least-used";
-export { SessionAffinityStrategy } from "./session-affinity";
+export {
+	RoutingTransitionRecorder,
+	SessionAffinityStrategy,
+} from "./session-affinity";
 export { SessionDrainSoonestStrategy } from "./session-drain-soonest";
 
 export class SessionStrategy implements LoadBalancingStrategy {
