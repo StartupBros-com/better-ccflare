@@ -45,7 +45,11 @@ export const CODEX_TRACE_HMAC_KEY_ENV = "CCFLARE_CODEX_TRACE_HMAC_KEY";
 /** Warn when one response spawns at least this many subagents (0 disables). */
 export const CODEX_FANOUT_WARN_ENV = "CCFLARE_CODEX_FANOUT_WARN";
 
-const TRACE_SCHEMA_VERSION = 18;
+// v19: context_utilization_pct's denominator (modelContextWindow) changed
+// epoch — GPT-5.6 moved from the invented 372k window to the catalog max
+// 872k, and gpt-5.4 to 1M (issue #205). Percentages are not comparable
+// across the v18/v19 boundary; segment any trend analysis on this version.
+const TRACE_SCHEMA_VERSION = 19;
 const DEFAULT_FANOUT_WARN = 8;
 const TURN_STATE_COHORT_PATTERN = /^[0-9a-f]{16}$/;
 // Derived from the canonical vocabularies so a new category cannot be emitted

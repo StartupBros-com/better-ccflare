@@ -56,6 +56,8 @@ const LIVE_BODY = {
 			display_name: "GPT-5.6-Sol",
 			description: "Latest frontier agentic coding model.",
 			context_window: 272_000,
+			max_context_window: 872_000,
+			effective_context_window_percent: 95,
 			visibility: "list",
 			priority: 1,
 		},
@@ -145,6 +147,13 @@ describe("getCodexModels", () => {
 			"gpt-5.4-mini",
 		]);
 		expect(listing?.models[0].contextWindow).toBe(272_000);
+		// The catalog's default and max are DIFFERENT concepts: keep both, so
+		// consumers stop treating the 272k recommendation as capacity (#205).
+		expect(listing?.models[0].maxContextWindow).toBe(872_000);
+		expect(listing?.models[0].effectiveContextPercent).toBe(95);
+		// Absent fields stay null rather than inventing values.
+		expect(listing?.models[1].maxContextWindow).toBeNull();
+		expect(listing?.models[1].effectiveContextPercent).toBeNull();
 		// OpenAI's own ordering, not alphabetical — which would have opened the
 		// list with the mini model.
 		expect(listing?.models[0].id).toBe("gpt-5.6-sol");

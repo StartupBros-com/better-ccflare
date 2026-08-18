@@ -5148,14 +5148,14 @@ describe("CodexProvider.processResponse", () => {
 				.split("\n")
 				.find((line) => line.includes('"type":"message_delta"'));
 
-			// 372000 * 95% effective = 353400
-			expect(messageDeltaLine).toContain('"context_window_size":353400');
+			// 872000 * 95% effective = 828400
+			expect(messageDeltaLine).toContain('"context_window_size":828400');
 		} finally {
 			delete process.env.CCFLARE_CODEX_EFFECTIVE_CONTEXT;
 		}
 	});
 
-	it("reports the 372k context_window for GPT-5.6 models", async () => {
+	it("reports the 872k operational context_window for GPT-5.6 models", async () => {
 		const provider = new CodexProvider();
 		const upstreamBody = sseBody([
 			...eventLine("response.created", {
@@ -5180,7 +5180,7 @@ describe("CodexProvider.processResponse", () => {
 			.split("\n")
 			.find((line) => line.includes('"type":"message_delta"'));
 
-		expect(messageDeltaLine).toContain('"context_window_size":372000');
+		expect(messageDeltaLine).toContain('"context_window_size":872000');
 	});
 
 	it("resolves dated model variants to their family context window", async () => {
@@ -5208,7 +5208,7 @@ describe("CodexProvider.processResponse", () => {
 			.split("\n")
 			.find((line) => line.includes('"type":"message_delta"'));
 
-		expect(messageDeltaLine).toContain('"context_window_size":372000');
+		expect(messageDeltaLine).toContain('"context_window_size":872000');
 	});
 
 	it("omits context_window when model metadata is unavailable", async () => {
@@ -5288,11 +5288,11 @@ describe("CodexProvider.processResponse", () => {
 		const provider = new CodexProvider();
 		const upstreamBody = sseBody([
 			...eventLine("response.created", {
-				response: { id: "resp_test", model: "gpt-5.4" },
+				response: { id: "resp_test", model: "gpt-5.4-mini" },
 			}),
 			...eventLine("response.completed", {
 				response: {
-					model: "gpt-5.4",
+					model: "gpt-5.4-mini",
 					usage: {
 						input_tokens: 42,
 						output_tokens: 7,
@@ -8191,7 +8191,7 @@ describe("CodexProvider.transformRequestBody", () => {
 			// recorded lineage and is admitted as root (basis: lineage_match), not
 			// demoted.
 			expect(requestTrace).toMatchObject({
-				trace_schema_version: 18,
+				trace_schema_version: 19,
 				orchestration_admission: "root",
 				orchestration_basis: "lineage_match",
 				cache_key_continuity_basis: "lineage_match",
@@ -8441,7 +8441,7 @@ describe("CodexProvider.transformRequestBody", () => {
 				(record) => record.phase === "request",
 			);
 			expect(requestTrace).toMatchObject({
-				trace_schema_version: 18,
+				trace_schema_version: 19,
 				orchestration_admission: "attributed_descendant",
 				orchestration_basis: null,
 				is_descendant: true,
@@ -8732,11 +8732,11 @@ describe("CodexProvider.transformRequestBody", () => {
 				(record) => record.request_id === "treated-compacted",
 			);
 			expect(treatedRootTrace).toMatchObject({
-				trace_schema_version: 18,
+				trace_schema_version: 19,
 				cache_key_continuity_applied: true,
 			});
 			expect(treatedCompactedTrace).toMatchObject({
-				trace_schema_version: 18,
+				trace_schema_version: 19,
 				cache_key_continuity_basis: "lineage_match",
 				cache_key_continuity_applied: true,
 			});

@@ -104,6 +104,8 @@ export function createModelsHandler(context: APIContext) {
 						source: "account" as const,
 						description: model.description,
 						contextWindow: model.contextWindow,
+						maxContextWindow: model.maxContextWindow,
+						effectiveContextPercent: model.effectiveContextPercent,
 						supersededBy: model.supersededBy,
 					})),
 					fetchedAt: listing.fetchedAt,
