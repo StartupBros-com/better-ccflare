@@ -5148,14 +5148,14 @@ describe("CodexProvider.processResponse", () => {
 				.split("\n")
 				.find((line) => line.includes('"type":"message_delta"'));
 
-			// 372000 * 95% effective = 353400
-			expect(messageDeltaLine).toContain('"context_window_size":353400');
+			// 872000 * 95% effective = 828400
+			expect(messageDeltaLine).toContain('"context_window_size":828400');
 		} finally {
 			delete process.env.CCFLARE_CODEX_EFFECTIVE_CONTEXT;
 		}
 	});
 
-	it("reports the 372k context_window for GPT-5.6 models", async () => {
+	it("reports the 872k operational context_window for GPT-5.6 models", async () => {
 		const provider = new CodexProvider();
 		const upstreamBody = sseBody([
 			...eventLine("response.created", {
@@ -5180,7 +5180,7 @@ describe("CodexProvider.processResponse", () => {
 			.split("\n")
 			.find((line) => line.includes('"type":"message_delta"'));
 
-		expect(messageDeltaLine).toContain('"context_window_size":372000');
+		expect(messageDeltaLine).toContain('"context_window_size":872000');
 	});
 
 	it("resolves dated model variants to their family context window", async () => {
@@ -5208,7 +5208,7 @@ describe("CodexProvider.processResponse", () => {
 			.split("\n")
 			.find((line) => line.includes('"type":"message_delta"'));
 
-		expect(messageDeltaLine).toContain('"context_window_size":372000');
+		expect(messageDeltaLine).toContain('"context_window_size":872000');
 	});
 
 	it("omits context_window when model metadata is unavailable", async () => {

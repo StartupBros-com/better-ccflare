@@ -10,6 +10,7 @@ import {
 	deriveComboRouteClass,
 	estimateAnthropicAdmissionTokens,
 	estimateAnthropicRequestTokens,
+	MODEL_CONTEXT_WINDOWS,
 	resolveAccountLogicalModelCapability,
 	resolveModelContextCapability,
 } from "./request-capabilities";
@@ -377,13 +378,15 @@ describe("managed routing capabilities", () => {
 });
 
 describe("resolveModelContextCapability", () => {
-	it("resolves exact Codex models with raw and effective windows", () => {
+	it("resolves exact Codex models with default, max, and effective windows", () => {
 		expect(resolveModelContextCapability("codex", "gpt-5.6-sol")).toEqual({
 			provider: "codex",
 			model: "gpt-5.6-sol",
 			family: "gpt-5.6-sol",
-			rawContextWindow: 372_000,
-			effectiveContextWindow: 353_400,
+			defaultContextWindow: 272_000,
+			maxContextWindow: 872_000,
+			rawContextWindow: 872_000,
+			effectiveContextWindow: 828_400,
 			effectiveContextPercent: 95,
 			match: "exact",
 		});
@@ -392,13 +395,30 @@ describe("resolveModelContextCapability", () => {
 		).toBe(258_400);
 	});
 
+	it("keeps default and max identical for models with one catalog window", () => {
+		expect(resolveModelContextCapability("codex", "gpt-5.4")).toMatchObject({
+			defaultContextWindow: 272_000,
+			maxContextWindow: 272_000,
+			rawContextWindow: 272_000,
+		});
+	});
+
+	it("projects the operational max into MODEL_CONTEXT_WINDOWS", () => {
+		expect(MODEL_CONTEXT_WINDOWS["gpt-5.6-sol"]).toBe(872_000);
+		expect(MODEL_CONTEXT_WINDOWS["gpt-5.6-terra"]).toBe(872_000);
+		expect(MODEL_CONTEXT_WINDOWS["gpt-5.6-luna"]).toBe(872_000);
+		expect(MODEL_CONTEXT_WINDOWS["gpt-5.4"]).toBe(272_000);
+	});
+
 	it("resolves dated variants by the longest family prefix", () => {
 		expect(
 			resolveModelContextCapability("codex", "gpt-5.6-sol-2026-05-13"),
 		).toMatchObject({
 			family: "gpt-5.6-sol",
-			rawContextWindow: 372_000,
-			effectiveContextWindow: 353_400,
+			defaultContextWindow: 272_000,
+			maxContextWindow: 872_000,
+			rawContextWindow: 872_000,
+			effectiveContextWindow: 828_400,
 			match: "prefix",
 		});
 	});

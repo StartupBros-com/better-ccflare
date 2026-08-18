@@ -615,7 +615,7 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 				"claude-opus-4-8",
 				createContextAdmissionTracker(
 					{
-						tokens: 378_049,
+						tokens: 853_049,
 						method: "request-envelope-bytes",
 						confidence: "low",
 					},
@@ -638,18 +638,35 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 			endpointClass: "subscription",
 			estimateMethod: "request-envelope-bytes",
 			estimateConfidence: "low",
-			estimatedInputTokens: 378_049,
+			estimatedInputTokens: 853_049,
 			outputReserveTokens: 0,
-			occupiedTokens: 378_049,
-			safeLimitTokens: 353_400,
+			occupiedTokens: 853_049,
+			safeLimitTokens: 828_400,
 			outcome: "defer_low_confidence",
 		});
+	});
+
+	it("admits a calibrated 500k prompt within GPT-5.6 operational capacity", () => {
+		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
+		const tracker = createContextAdmissionTracker(
+			calibratedAdmissionEstimate(500_000),
+			50_000,
+		);
+		const result = selectAdmittedCodexModel(
+			makeCodexAccount({
+				model_mappings: JSON.stringify({ opus: "gpt-5.6-sol" }),
+			}),
+			"claude-opus-4-8",
+			tracker,
+		);
+		expect(result).toEqual({ admitted: true, model: "gpt-5.6-sol" });
+		expect(tracker.rejectedCount).toBe(0);
 	});
 
 	it("still rejects a calibrated over-limit estimate", () => {
 		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
 		const tracker = createContextAdmissionTracker(
-			calibratedAdmissionEstimate(360_000),
+			calibratedAdmissionEstimate(835_000),
 			50_000,
 		);
 		const result = selectAdmittedCodexModel(
@@ -661,7 +678,7 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 		);
 		expect(result).toEqual({ admitted: false, model: null });
 		expect(tracker.rejectedCount).toBe(1);
-		expect(tracker.largestSafeLimit).toBe(353_400);
+		expect(tracker.largestSafeLimit).toBe(828_400);
 	});
 
 	it("skips an undersized Codex model before fetch and uses a larger mapped fallback", async () => {
@@ -796,7 +813,7 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 	it("reports occupied tokens paired with the largest safe rejected candidate", async () => {
 		process.env.CCFLARE_CONTEXT_ADMISSION = "1";
 		const tracker = createContextAdmissionTracker(
-			calibratedAdmissionEstimate(360_000),
+			calibratedAdmissionEstimate(900_000),
 			50_000,
 		);
 		selectAdmittedCodexModel(
@@ -815,12 +832,12 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 			tracker,
 		);
 
-		expect(tracker.largestSafeLimit).toBe(353_400);
-		expect(tracker.terminalOccupiedTokens).toBe(360_000);
+		expect(tracker.largestSafeLimit).toBe(828_400);
+		expect(tracker.terminalOccupiedTokens).toBe(900_000);
 		const response = createContextLengthExceededResponse(tracker);
 		expect(await response.json()).toMatchObject({
 			error: {
-				message: "prompt is too long: 360000 tokens > 353400 tokens",
+				message: "prompt is too long: 900000 tokens > 828400 tokens",
 			},
 		});
 	});

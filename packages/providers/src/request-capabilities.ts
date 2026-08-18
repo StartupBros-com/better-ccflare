@@ -182,6 +182,17 @@ export interface ModelContextCapability {
 	provider: string;
 	model: string;
 	family: string;
+	/** Catalog default/recommended window (`context_window`). Informational. */
+	defaultContextWindow: number;
+	/** Catalog maximum window (`max_context_window`): the operational client capacity. */
+	maxContextWindow: number;
+	/**
+	 * Compatibility projection of {@link maxContextWindow}. Historically this
+	 * held a single number that conflated catalog default with capacity; it now
+	 * always equals the max, because every operational consumer (admission,
+	 * response context-window telemetry, trace utilization) needs capacity, not
+	 * the recommendation.
+	 */
 	rawContextWindow: number;
 	effectiveContextWindow: number;
 	effectiveContextPercent: number;
@@ -189,33 +200,70 @@ export interface ModelContextCapability {
 }
 
 interface ModelContextMetadata {
-	rawContextWindow: number;
+	defaultContextWindow: number;
+	maxContextWindow: number;
 	effectiveContextPercent: number;
 }
 
 // Synced from the Codex CLI model cache (~/.codex/models_cache.json,
-// codex-cli 0.144.1). This is the single source for Codex context capability.
+// codex-cli 0.147.0). This is the single source for Codex context capability.
+// The catalog distinguishes `context_window` (default/recommended) from
+// `max_context_window` (capacity a client may opt into). Models published with
+// one window carry default === max. GPT-5.6's 872k max is the catalog's stated
+// capacity, not an independently proven upstream hard limit — but production
+// has accepted cache-inclusive prompts of 799,652 (terra) and 565,703 (sol)
+// tokens, so the previous 372k value was provably below real capacity and
+// caused clients to fail large tool-result turns locally (issue #205).
 const CODEX_MODEL_CONTEXT_METADATA: Readonly<
 	Record<string, ModelContextMetadata>
 > = {
-	"gpt-5.3-codex": { rawContextWindow: 272_000, effectiveContextPercent: 95 },
-	"gpt-5.3-codex-spark": {
-		rawContextWindow: 128_000,
+	"gpt-5.3-codex": {
+		defaultContextWindow: 272_000,
+		maxContextWindow: 272_000,
 		effectiveContextPercent: 95,
 	},
-	"gpt-5.4": { rawContextWindow: 272_000, effectiveContextPercent: 95 },
-	"gpt-5.4-mini": { rawContextWindow: 272_000, effectiveContextPercent: 95 },
-	"gpt-5.5": { rawContextWindow: 272_000, effectiveContextPercent: 95 },
-	"gpt-5.6-sol": { rawContextWindow: 372_000, effectiveContextPercent: 95 },
-	"gpt-5.6-terra": { rawContextWindow: 372_000, effectiveContextPercent: 95 },
-	"gpt-5.6-luna": { rawContextWindow: 372_000, effectiveContextPercent: 95 },
+	"gpt-5.3-codex-spark": {
+		defaultContextWindow: 128_000,
+		maxContextWindow: 128_000,
+		effectiveContextPercent: 95,
+	},
+	"gpt-5.4": {
+		defaultContextWindow: 272_000,
+		maxContextWindow: 272_000,
+		effectiveContextPercent: 95,
+	},
+	"gpt-5.4-mini": {
+		defaultContextWindow: 272_000,
+		maxContextWindow: 272_000,
+		effectiveContextPercent: 95,
+	},
+	"gpt-5.5": {
+		defaultContextWindow: 272_000,
+		maxContextWindow: 272_000,
+		effectiveContextPercent: 95,
+	},
+	"gpt-5.6-sol": {
+		defaultContextWindow: 272_000,
+		maxContextWindow: 872_000,
+		effectiveContextPercent: 95,
+	},
+	"gpt-5.6-terra": {
+		defaultContextWindow: 272_000,
+		maxContextWindow: 872_000,
+		effectiveContextPercent: 95,
+	},
+	"gpt-5.6-luna": {
+		defaultContextWindow: 272_000,
+		maxContextWindow: 872_000,
+		effectiveContextPercent: 95,
+	},
 };
 
 export const MODEL_CONTEXT_WINDOWS: Readonly<Record<string, number>> =
 	Object.fromEntries(
 		Object.entries(CODEX_MODEL_CONTEXT_METADATA).map(([model, metadata]) => [
 			model,
-			metadata.rawContextWindow,
+			metadata.maxContextWindow,
 		]),
 	);
 
@@ -244,9 +292,11 @@ export function resolveModelContextCapability(
 		provider: "codex",
 		model,
 		family,
-		rawContextWindow: metadata.rawContextWindow,
+		defaultContextWindow: metadata.defaultContextWindow,
+		maxContextWindow: metadata.maxContextWindow,
+		rawContextWindow: metadata.maxContextWindow,
 		effectiveContextWindow: Math.floor(
-			(metadata.rawContextWindow * metadata.effectiveContextPercent) / 100,
+			(metadata.maxContextWindow * metadata.effectiveContextPercent) / 100,
 		),
 		effectiveContextPercent: metadata.effectiveContextPercent,
 		match,
