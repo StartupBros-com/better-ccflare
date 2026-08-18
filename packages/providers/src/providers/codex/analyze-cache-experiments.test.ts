@@ -153,7 +153,11 @@ describe("analyzeCodexCacheExperiments", () => {
 			},
 		]);
 
-		expect(report.schemaVersion).toBe(2);
+		// schemaVersion bumped for #204: cache rows now also carry
+		// medianCachedReadPct/p25CachedReadPct/p75CachedReadPct alongside the
+		// pre-existing weighted figure, so consumers keyed on the row shape
+		// need to know the shape changed.
+		expect(report.schemaVersion).toBe(3);
 		expect(report.turnState.assignmentCounts).toEqual({
 			observe: 0,
 			control: 1,
@@ -348,7 +352,7 @@ describe("analyzeCodexCacheExperiments", () => {
 			},
 		]);
 
-		expect(report.schemaVersion).toBe(2);
+		expect(report.schemaVersion).toBe(3);
 		expect(report.attribution.unit).toBe("final_observed_codex_attempt");
 		expect(report.attribution.pacingWaitMs).toBe("unavailable");
 		expect(report.pacing.assignmentCounts).toEqual({
@@ -897,6 +901,11 @@ describe("analyzeCodexCacheExperiments", () => {
 			inputTokens: Number.MAX_SAFE_INTEGER,
 			cachedReadTokens: 0,
 			weightedCachedReadPct: 0,
+			// A single measured response: the distribution collapses to one point,
+			// so median/p25/p75 all equal that response's own share (0%).
+			medianCachedReadPct: 0,
+			p25CachedReadPct: 0,
+			p75CachedReadPct: 0,
 			cacheWriteMeasuredResponses: 1,
 			cacheWriteUnavailableResponses: 1,
 			cacheWriteOverflowResponses: 1,
@@ -978,5 +987,201 @@ describe("analyzeCodexCacheExperiments", () => {
 			cacheWriteUnavailableResponses: 1,
 			cacheWriteTokens: 0,
 		});
+	});
+});
+
+// #204: the analyzer previously reported ONLY the token-weighted cache share.
+// Median and weighted diverge sharply whenever a handful of very large
+// requests dominate the weighting -- on real 2026-08-17 data, treatment
+// replay was 94.48% median but 53.25% weighted, pointing in opposite
+// directions. Quoting one alone is exactly how the #174 readout got
+// retracted. These tests pin the per-response distribution stats
+// (medianCachedReadPct / p25CachedReadPct / p75CachedReadPct) that must ship
+// alongside weightedCachedReadPct on both CacheExperimentRow.cache (pacing +
+// explicitBreakpoint) and TurnStateExperimentRow.cache.
+describe("cache-read distribution stats (median alongside weighted)", () => {
+	function pacingPair(
+		requestId: string,
+		ts: string,
+		inputTokens: number,
+		cacheReadTokens: number,
+		extra: Record<string, unknown> = {},
+	) {
+		return [
+			{
+				trace_schema_version: 19 as const,
+				phase: "request" as const,
+				ts,
+				request_id: requestId,
+				attempt_id: `${requestId}-attempt`,
+				attempt_ordinal: 1,
+				attempt_cause: "initial" as const,
+				model_out: "gpt-5.6-sol",
+				pacing_canary: "bypass",
+				pacing_action: "bypassed",
+			},
+			{
+				trace_schema_version: 19 as const,
+				phase: "response" as const,
+				ts,
+				request_id: requestId,
+				attempt_id: `${requestId}-attempt`,
+				stop_reason: "end_turn" as const,
+				input_tokens: inputTokens,
+				cache_read_input_tokens: cacheReadTokens,
+				cache_creation_input_tokens: 0,
+				cache_creation_measurement_available: true,
+				...extra,
+			},
+		];
+	}
+
+	test("median and weighted disagree in direction when one huge low-cache response dominates the weighting", () => {
+		// Four small, heavily-cached responses (90% each) plus one huge,
+		// zero-cache response. The huge response swamps the token-weighted
+		// average (0.4%) while the per-response median still says ~90% reuse.
+		const small = [0, 1, 2, 3].flatMap((index) =>
+			pacingPair(
+				`small-${index}`,
+				`2026-08-17T00:00:0${index}.000Z`,
+				1_000,
+				900,
+			),
+		);
+		const huge = pacingPair("huge", "2026-08-17T00:00:10.000Z", 996_000, 0);
+
+		const records = [
+			...small,
+			...huge,
+			// Same underlying attempts, tagged for the explicit-breakpoint and
+			// turn-state dimensions too, so all three row shapes are exercised
+			// against one dataset.
+		].map((record) => ({
+			...record,
+			explicit_breakpoint_canary: "treatment",
+			explicit_breakpoint_action: "placed_source_marker",
+			...(record.phase === "request"
+				? {
+						codex_turn_state_arm: "treatment" as const,
+						codex_turn_state_request_action: "replay" as const,
+					}
+				: {}),
+		}));
+
+		const report = analyzeCodexCacheExperiments(records);
+
+		expect(report.pacing.rows).toHaveLength(1);
+		expect(report.pacing.rows[0]?.cache).toMatchObject({
+			measuredResponses: 5,
+			weightedCachedReadPct: 0.4,
+			medianCachedReadPct: 90,
+		});
+		expect(report.explicitBreakpoint.rows).toHaveLength(1);
+		expect(report.explicitBreakpoint.rows[0]?.cache).toMatchObject({
+			measuredResponses: 5,
+			weightedCachedReadPct: 0.4,
+			medianCachedReadPct: 90,
+		});
+		expect(report.turnState.rows).toHaveLength(1);
+		expect(report.turnState.rows[0]?.cache).toMatchObject({
+			measuredResponses: 5,
+			weightedCachedReadPct: 0.4,
+			medianCachedReadPct: 90,
+		});
+
+		// The regression that matters most: the two statistics point in
+		// opposite directions on this fixture, exactly as on the real trace.
+		const pacingCache = report.pacing.rows[0]?.cache;
+		expect(pacingCache?.weightedCachedReadPct).toBeLessThan(50);
+		expect(pacingCache?.medianCachedReadPct).toBeGreaterThan(50);
+
+		const text = formatCacheExperimentReport(report);
+		expect(text).toContain("medianCachedReadPct");
+		expect(text).toContain("weightedCachedReadPct");
+	});
+
+	test("computes an odd-length median as the true middle sample", () => {
+		const report = analyzeCodexCacheExperiments([
+			...pacingPair("a", "2026-08-17T01:00:00Z", 100, 20),
+			...pacingPair("b", "2026-08-17T01:00:01Z", 100, 50),
+			...pacingPair("c", "2026-08-17T01:00:02Z", 100, 80),
+		]);
+
+		expect(report.pacing.rows).toHaveLength(1);
+		expect(report.pacing.rows[0]?.cache).toMatchObject({
+			measuredResponses: 3,
+			medianCachedReadPct: 50,
+		});
+	});
+
+	test("computes an even-length median as the mean of the two middle samples, not the upper-middle observation", () => {
+		// Per-response shares: 10%, 20%, 80%, 90%. The conventional median is
+		// the mean of the two middle values (20 + 80) / 2 = 50. A prior
+		// throwaway script instead returned the upper-middle observation (80)
+		// -- this test pins the conventional definition against that bug.
+		const report = analyzeCodexCacheExperiments([
+			...pacingPair("a", "2026-08-17T02:00:00Z", 100, 10),
+			...pacingPair("b", "2026-08-17T02:00:01Z", 100, 20),
+			...pacingPair("c", "2026-08-17T02:00:02Z", 100, 80),
+			...pacingPair("d", "2026-08-17T02:00:03Z", 100, 90),
+		]);
+
+		expect(report.pacing.rows).toHaveLength(1);
+		expect(report.pacing.rows[0]?.cache.medianCachedReadPct).toBe(50);
+		expect(report.pacing.rows[0]?.cache.medianCachedReadPct).not.toBe(80);
+	});
+
+	test("a single measured response reports its own share as median, p25, and p75", () => {
+		const report = analyzeCodexCacheExperiments(
+			pacingPair("solo", "2026-08-17T03:00:00Z", 250, 200),
+		);
+
+		expect(report.pacing.rows).toHaveLength(1);
+		expect(report.pacing.rows[0]?.cache).toMatchObject({
+			measuredResponses: 1,
+			weightedCachedReadPct: 80,
+			medianCachedReadPct: 80,
+			p25CachedReadPct: 80,
+			p75CachedReadPct: 80,
+		});
+	});
+
+	test("reports median as null when there are zero measured responses", () => {
+		const report = analyzeCodexCacheExperiments(
+			pacingPair("unmeasured", "2026-08-17T04:00:00Z", 100, 50, {
+				cache_measurement_available: false,
+			}),
+		);
+
+		expect(report.pacing.rows).toHaveLength(1);
+		expect(report.pacing.rows[0]?.cache).toMatchObject({
+			measuredResponses: 0,
+			weightedCachedReadPct: null,
+			medianCachedReadPct: null,
+			p25CachedReadPct: null,
+			p75CachedReadPct: null,
+		});
+	});
+
+	test("excludes responses with unavailable cache measurement from the median instead of counting them as a zero share", () => {
+		// Two measured responses (shares 100% and 0%) plus one response whose
+		// cache measurement is unavailable. A correct median is the mean of the
+		// two MEASURED shares: (100 + 0) / 2 = 50. An implementation that
+		// wrongly folds the unmeasured response in as an implicit 0% sample
+		// would instead compute the median of [0, 0, 100] = 0.
+		const report = analyzeCodexCacheExperiments([
+			...pacingPair("full", "2026-08-17T05:00:00Z", 100, 100),
+			...pacingPair("zero", "2026-08-17T05:00:01Z", 100, 0),
+			...pacingPair("unmeasured", "2026-08-17T05:00:02Z", 100, 50, {
+				cache_measurement_available: false,
+			}),
+		]);
+
+		expect(report.pacing.rows).toHaveLength(1);
+		expect(report.pacing.rows[0]?.cache).toMatchObject({
+			measuredResponses: 2,
+			medianCachedReadPct: 50,
+		});
+		expect(report.pacing.rows[0]?.cache.medianCachedReadPct).not.toBe(0);
 	});
 });

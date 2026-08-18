@@ -329,6 +329,19 @@ export interface CacheExperimentRow {
 		inputTokens: number;
 		cachedReadTokens: number;
 		weightedCachedReadPct: number | null;
+		/**
+		 * Per-response cache-read share distribution (percentage, 0-100,
+		 * rounded to one decimal), over MEASURED responses only (same gate as
+		 * weightedCachedReadPct) -- null when there are none. #204: a handful
+		 * of very large requests can swamp the token-weighted average while
+		 * the median stays representative of a typical response, and the two
+		 * can point in opposite directions on real data. Never report
+		 * weightedCachedReadPct without medianCachedReadPct alongside it (see
+		 * the #174 retraction, caused by quoting one statistic alone).
+		 */
+		medianCachedReadPct: number | null;
+		p25CachedReadPct: number | null;
+		p75CachedReadPct: number | null;
 		cacheWriteMeasuredResponses: number;
 		cacheWriteUnavailableResponses: number;
 		cacheWriteOverflowResponses: number;
@@ -395,6 +408,10 @@ export interface TurnStateExperimentRow {
 		inputTokens: number;
 		cachedReadTokens: number;
 		weightedCachedReadPct: number | null;
+		/** See CacheExperimentRow.cache -- same #204 median-alongside-weighted contract. */
+		medianCachedReadPct: number | null;
+		p25CachedReadPct: number | null;
+		p75CachedReadPct: number | null;
 		positiveHitResponses: number;
 		positiveHitRatePct: number | null;
 		zeroHitResponses: number;
@@ -444,7 +461,14 @@ export interface TurnStateCacheExperimentReport {
 }
 
 export interface CodexCacheExperimentReport {
-	schemaVersion: 2;
+	/**
+	 * Bumped 2 -> 3 for #204: CacheExperimentRow.cache and
+	 * TurnStateExperimentRow.cache both gained medianCachedReadPct /
+	 * p25CachedReadPct / p75CachedReadPct alongside weightedCachedReadPct.
+	 * Consumers that key on the row shape (e.g. destructure a fixed field
+	 * list) need to know the shape changed.
+	 */
+	schemaVersion: 3;
 	attribution: {
 		unit: "final_observed_codex_attempt";
 		responseScope: "codex_trace_only_no_cross_provider_terminal_visibility";
@@ -1368,6 +1392,8 @@ interface CacheExperimentAnnotatedSample extends CacheExperimentLogicalSample {
 
 interface CacheExperimentRowAccumulator extends CacheExperimentRow {
 	elapsedSamples: number[];
+	/** Per-response cache-read share (%), one entry per MEASURED response in this row. */
+	cacheReadShareSamples: number[];
 }
 
 type CacheExperimentKind = "pacing" | "explicitBreakpoint";
@@ -2060,6 +2086,9 @@ function cacheExperimentRowAccumulator(
 			inputTokens: 0,
 			cachedReadTokens: 0,
 			weightedCachedReadPct: null,
+			medianCachedReadPct: null,
+			p25CachedReadPct: null,
+			p75CachedReadPct: null,
 			cacheWriteMeasuredResponses: 0,
 			cacheWriteUnavailableResponses: 0,
 			cacheWriteOverflowResponses: 0,
@@ -2089,6 +2118,7 @@ function cacheExperimentRowAccumulator(
 		},
 		actions: {},
 		elapsedSamples: [],
+		cacheReadShareSamples: [],
 	};
 }
 
@@ -2123,6 +2153,46 @@ function percentile(
 	const sorted = [...values].sort((a, b) => a - b);
 	const index = Math.max(0, Math.ceil(quantile * sorted.length) - 1);
 	return sorted[index] ?? null;
+}
+
+/**
+ * Conventional median: the true middle sample for odd-length inputs, the
+ * mean of the two middle samples for even-length inputs. Deliberately NOT
+ * `percentile(values, 0.5)` -- that helper's nearest-rank indexing
+ * (`ceil(0.5*n)-1`) returns the lower-middle observation on an even-length
+ * input rather than averaging the two middle values, which is a materially
+ * different (and non-conventional) statistic. #204 pinned this definition
+ * after a prior throwaway script used the upper-middle observation instead.
+ */
+function median(values: readonly number[]): number | null {
+	if (values.length === 0) return null;
+	const sorted = [...values].sort((a, b) => a - b);
+	const mid = sorted.length / 2;
+	if (Number.isInteger(mid)) {
+		const lower = sorted[mid - 1];
+		const upper = sorted[mid];
+		if (lower === undefined || upper === undefined) return null;
+		return (lower + upper) / 2;
+	}
+	return sorted[Math.floor(mid)] ?? null;
+}
+
+/** Round a percentage (0-100 scale) to one decimal place, or pass through null. */
+function roundPct(value: number | null): number | null {
+	return value === null ? null : Math.round(value * 10) / 10;
+}
+
+/**
+ * Per-response cache-read share as a percentage (0-100). `inputTokens` is
+ * schema-19 trace `input_tokens`, which is cache-INCLUSIVE, so this is
+ * `cache_read / input_tokens * 100` -- consistent with how
+ * weightedCachedReadPct is computed from the same two accumulated sums.
+ */
+function cacheReadSharePct(
+	inputTokens: number,
+	cacheReadTokens: number,
+): number {
+	return inputTokens > 0 ? (cacheReadTokens / inputTokens) * 100 : 0;
 }
 
 function incrementPacingAction(
@@ -2164,6 +2234,9 @@ function finishCacheExperimentRow(
 							(row.cache.cachedReadTokens / row.cache.inputTokens) * 1000,
 						) / 10
 					: null,
+			medianCachedReadPct: roundPct(median(row.cacheReadShareSamples)),
+			p25CachedReadPct: roundPct(percentile(row.cacheReadShareSamples, 0.25)),
+			p75CachedReadPct: roundPct(percentile(row.cacheReadShareSamples, 0.75)),
 			positiveHitRatePct:
 				row.cache.measuredResponses > 0
 					? Math.round(
@@ -2268,6 +2341,12 @@ function cacheExperimentDimension(
 				row.cache.measuredResponses++;
 				row.cache.inputTokens = nextInputTokens;
 				row.cache.cachedReadTokens = nextCachedReadTokens;
+				row.cacheReadShareSamples.push(
+					cacheReadSharePct(
+						response.input_tokens,
+						response.cache_read_input_tokens,
+					),
+				);
 				if (response.cache_read_input_tokens > 0)
 					row.cache.positiveHitResponses++;
 			}
@@ -2699,6 +2778,8 @@ interface TurnStateExperimentRowAccumulator extends TurnStateExperimentRow {
 	cachedReadTokens: number;
 	latencySamples: number[];
 	keyTimestamps: Map<string, number[]>;
+	/** Per-response cache-read share (%), one entry per MEASURED response in this row. */
+	cacheReadShareSamples: number[];
 }
 
 function turnStateArm(value: unknown): TurnStateExperimentArm {
@@ -2816,6 +2897,9 @@ function turnStateRowAccumulator(
 			inputTokens: 0,
 			cachedReadTokens: 0,
 			weightedCachedReadPct: null,
+			medianCachedReadPct: null,
+			p25CachedReadPct: null,
+			p75CachedReadPct: null,
 			positiveHitResponses: 0,
 			positiveHitRatePct: null,
 			zeroHitResponses: 0,
@@ -2849,6 +2933,7 @@ function turnStateRowAccumulator(
 		cachedReadTokens: 0,
 		latencySamples: [],
 		keyTimestamps: new Map(),
+		cacheReadShareSamples: [],
 	};
 }
 
@@ -2903,6 +2988,9 @@ function finishTurnStateRow(
 				row.inputTokens > 0
 					? Math.round((1000 * row.cachedReadTokens) / row.inputTokens) / 10
 					: null,
+			medianCachedReadPct: roundPct(median(row.cacheReadShareSamples)),
+			p25CachedReadPct: roundPct(percentile(row.cacheReadShareSamples, 0.25)),
+			p75CachedReadPct: roundPct(percentile(row.cacheReadShareSamples, 0.75)),
 			positiveHitRatePct:
 				row.cache.measuredResponses > 0
 					? Math.round(
@@ -3043,6 +3131,12 @@ function analyzeTurnStateCacheExperiments(
 				row.cachedReadTokens = nextRead;
 				row.cache.inputTokens = nextInput;
 				row.cache.cachedReadTokens = nextRead;
+				row.cacheReadShareSamples.push(
+					cacheReadSharePct(
+						response.input_tokens,
+						response.cache_read_input_tokens,
+					),
+				);
 				if (response.cache_read_input_tokens > 0)
 					row.cache.positiveHitResponses++;
 				else row.cache.zeroHitResponses++;
@@ -3128,7 +3222,7 @@ export function analyzeCodexCacheExperiments(
 	const records = withoutAbortedAttempts(allRecords);
 	const samples = cacheExperimentLogicalSamples(records);
 	return {
-		schemaVersion: 2,
+		schemaVersion: 3,
 		attribution: {
 			unit: "final_observed_codex_attempt",
 			responseScope: "codex_trace_only_no_cross_provider_terminal_visibility",
