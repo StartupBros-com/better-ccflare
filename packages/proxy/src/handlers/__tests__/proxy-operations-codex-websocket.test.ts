@@ -424,12 +424,15 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 	let originalFetch: typeof globalThis.fetch;
 	let originalPromptCacheKey: string | undefined;
 	let originalCacheKeyMode: string | undefined;
+	let originalPrefixShardPercent: string | undefined;
 	let originalAnthropicPrecommitTimeout: string | undefined;
 
 	beforeEach(() => {
 		originalFetch = globalThis.fetch;
 		originalPromptCacheKey = process.env.CCFLARE_CODEX_PROMPT_CACHE_KEY;
 		originalCacheKeyMode = process.env.CCFLARE_CODEX_CACHE_KEY_MODE;
+		originalPrefixShardPercent =
+			process.env.CCFLARE_CODEX_CACHE_KEY_PREFIX_SHARD_PERCENT;
 		originalAnthropicPrecommitTimeout =
 			process.env.CCFLARE_ANTHROPIC_PRECOMMIT_TIMEOUT_MS;
 		process.env.CCFLARE_CODEX_PROMPT_CACHE_KEY = "1";
@@ -447,6 +450,12 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 			delete process.env.CCFLARE_CODEX_CACHE_KEY_MODE;
 		} else {
 			process.env.CCFLARE_CODEX_CACHE_KEY_MODE = originalCacheKeyMode;
+		}
+		if (originalPrefixShardPercent === undefined) {
+			delete process.env.CCFLARE_CODEX_CACHE_KEY_PREFIX_SHARD_PERCENT;
+		} else {
+			process.env.CCFLARE_CODEX_CACHE_KEY_PREFIX_SHARD_PERCENT =
+				originalPrefixShardPercent;
 		}
 		if (originalAnthropicPrecommitTimeout === undefined) {
 			delete process.env.CCFLARE_ANTHROPIC_PRECOMMIT_TIMEOUT_MS;
@@ -1182,9 +1191,9 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 		expect(ledger.physicalAttemptCount).toBe(0);
 	});
 
-	it("passes a compaction-stable sibling-safe identity despite one shared session cache key", async () => {
+	it("keeps WebSocket function-call lineages distinct when sibling conversations share a prefix shard", async () => {
 		installUsageCollector();
-		process.env.CCFLARE_CODEX_CACHE_KEY_MODE = "session";
+		process.env.CCFLARE_CODEX_CACHE_KEY_PREFIX_SHARD_PERCENT = "100";
 		const upstreamConversationHeaders: Array<string | null> = [];
 		globalThis.fetch = mock(async (request: Request) => {
 			upstreamConversationHeaders.push(
@@ -1227,54 +1236,21 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 			},
 		);
 
-		const originalMessages = [
-			{ role: "user", content: "start the task" },
-			{
-				role: "assistant",
-				content: [
-					{
-						type: "tool_use",
-						id: "tool-lineage-root",
-						name: "Lookup",
-						input: { value: "root" },
-					},
-				],
-			},
-			{
-				role: "user",
-				content: [
-					{
-						type: "tool_result",
-						tool_use_id: "tool-lineage-root",
-						content: "root result",
-					},
-				],
-			},
-		];
-		const compactedMessages = [
-			...originalMessages.slice(1),
-			{ role: "user", content: "continue after compaction" },
-		];
-		const siblingMessages = [
-			{ role: "user", content: "sibling task" },
-			{
-				role: "assistant",
-				content: [
-					{
-						type: "tool_use",
-						id: "tool-lineage-sibling",
-						name: "Lookup",
-						input: { value: "sibling" },
-					},
-				],
-			},
-		];
-
-		for (const [index, messages] of [
-			originalMessages,
-			compactedMessages,
-			siblingMessages,
-		].entries()) {
+		for (let index = 0; index < 96; index++) {
+			const messages = [
+				{ role: "user", content: `sibling task ${index}` },
+				{
+					role: "assistant",
+					content: [
+						{
+							type: "tool_use",
+							id: `tool-lineage-sibling-${index}`,
+							name: "Lookup",
+							input: { value: `sibling-${index}` },
+						},
+					],
+				},
+			];
 			const body = makeConversationRequestBody(messages);
 			const response = await runProxy(
 				makeRequest(body),
@@ -1286,23 +1262,29 @@ describe("proxyWithAccount: Codex Responses WebSocket no-replay boundary", () =>
 			await response?.text();
 		}
 
-		expect(attempts).toHaveLength(3);
-		expect(attempts.map((attempt) => attempt.logicalModelFamily)).toEqual([
-			null,
-			null,
-			null,
-		]);
-		expect(upstreamConversationHeaders).toEqual([null, null, null]);
-		expect(
-			new Set(attempts.map((attempt) => attempt.promptCacheKey)).size,
-		).toBe(1);
-		expect(attempts[0]?.conversationIdentity).toMatch(/^[0-9a-f]{64}$/);
-		expect(attempts[1]?.conversationIdentity).toBe(
-			attempts[0]?.conversationIdentity,
+		expect(attempts).toHaveLength(96);
+		expect(attempts.map((attempt) => attempt.logicalModelFamily)).toEqual(
+			Array(96).fill(null),
 		);
-		expect(attempts[2]?.conversationIdentity).toMatch(/^[0-9a-f]{64}$/);
-		expect(attempts[2]?.conversationIdentity).not.toBe(
-			attempts[0]?.conversationIdentity,
+		expect(upstreamConversationHeaders).toEqual(Array(96).fill(null));
+		const attemptsByKey = new Map<string, typeof attempts>();
+		for (const attempt of attempts) {
+			const key = attempt.promptCacheKey;
+			expect(key).toMatch(/^[0-9a-f]{64}$/);
+			attemptsByKey.set(key ?? "", [
+				...(attemptsByKey.get(key ?? "") ?? []),
+				attempt,
+			]);
+		}
+		expect(attemptsByKey.size).toBe(8);
+		const siblings = [...attemptsByKey.values()].find(
+			(group) => group.length > 1,
+		);
+		expect(siblings).toBeDefined();
+		expect(siblings?.[0]?.conversationIdentity).toMatch(/^[0-9a-f]{64}$/);
+		expect(siblings?.[1]?.conversationIdentity).toMatch(/^[0-9a-f]{64}$/);
+		expect(siblings?.[1]?.conversationIdentity).not.toBe(
+			siblings?.[0]?.conversationIdentity,
 		);
 	});
 

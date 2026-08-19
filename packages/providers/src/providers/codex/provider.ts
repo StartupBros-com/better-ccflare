@@ -143,12 +143,18 @@ export const CODEX_CACHE_KEY_SESSION_PERCENT_ENV =
 	"CCFLARE_CODEX_CACHE_KEY_SESSION_PERCENT";
 export const CODEX_CACHE_KEY_CONTINUITY_PERCENT_ENV =
 	"CCFLARE_CODEX_CACHE_KEY_CONTINUITY_PERCENT";
+export const CODEX_CACHE_KEY_PREFIX_SHARD_PERCENT_ENV =
+	"CCFLARE_CODEX_CACHE_KEY_PREFIX_SHARD_PERCENT";
 export const CODEX_EXPLICIT_CACHE_BREAKPOINT_PERCENT_ENV =
 	"CCFLARE_CODEX_GPT56_EXPLICIT_CACHE_BREAKPOINT_PERCENT";
 const CODEX_CACHE_KEY_SESSION_BUCKET_DOMAIN =
 	"better-ccflare:codex-cache-key-session-canary:v1\0";
 const CODEX_CACHE_KEY_CONTINUITY_BUCKET_DOMAIN =
 	"better-ccflare:codex-cache-key-continuity-canary:v1\0";
+const CODEX_CACHE_KEY_PREFIX_SHARD_BUCKET_DOMAIN =
+	"better-ccflare:codex-prefix-shard-canary:v1\0";
+const CODEX_CACHE_KEY_PREFIX_SHARD_DOMAIN =
+	"better-ccflare:codex-prefix-shard:v1\0";
 const CODEX_CACHE_KEY_COHORT_DOMAIN =
 	"better-ccflare:codex-cache-key-cohort:v1\0";
 const CODEX_CACHE_LANE_RESCUE_DOMAIN =
@@ -228,6 +234,31 @@ export function deriveCodexCacheKeySessionBucket(sessionId: string): number {
 		.update(sessionId.toLowerCase())
 		.digest();
 	return digest.readUInt32BE(0) % 100;
+}
+
+export function readCodexCacheKeyPrefixShardPercent(
+	raw = process.env[CODEX_CACHE_KEY_PREFIX_SHARD_PERCENT_ENV],
+): number {
+	if (raw === undefined || !/^\d+$/.test(raw)) return 0;
+	return Math.min(Number.parseInt(raw, 10), 100);
+}
+
+function deriveCodexCacheKeyPrefixShardBucket(
+	conversationIdentity: string,
+): number {
+	const digest = createHash("sha256")
+		.update(CODEX_CACHE_KEY_PREFIX_SHARD_BUCKET_DOMAIN)
+		.update(conversationIdentity)
+		.digest();
+	return digest.readUInt32BE(0) % 100;
+}
+
+function deriveCodexCacheKeyPrefixShard(conversationIdentity: string): number {
+	const digest = createHash("sha256")
+		.update(CODEX_CACHE_KEY_PREFIX_SHARD_DOMAIN)
+		.update(conversationIdentity)
+		.digest();
+	return digest.readUInt32BE(0) % 8;
 }
 
 export function readCodexCacheKeyContinuityPercent(
@@ -609,7 +640,11 @@ interface CodexRequest {
 export interface CodexPromptCacheKeyDecision {
 	key: string | null;
 	assignment: "conversation" | "session" | null;
-	assignmentSource: "canary" | "explicit_session_override" | null;
+	assignmentSource:
+		| "canary"
+		| "explicit_session_override"
+		| "prefix_shard"
+		| null;
 	effectiveMode: "conversation" | "session" | null;
 	cohortId: string | null;
 	conversationIdentity: string | null;
@@ -2017,6 +2052,9 @@ export class CodexProvider extends BaseProvider {
 		body: AnthropicRequest,
 		instructions: string,
 		input: readonly unknown[],
+		tools: readonly CodexTool[] | undefined,
+		physicalModel: string,
+		endpoint: string,
 		account?: Account,
 		cacheLaneRescueSalt?: string,
 		orchestrationResult?: {
@@ -2086,15 +2124,43 @@ export class CodexProvider extends BaseProvider {
 			canonicalConversationIdentity
 				? canonicalConversationIdentity
 				: conversationIdentity;
+		const prefixShardPercent = readCodexCacheKeyPrefixShardPercent();
+		const prefixShardTreatment =
+			effectiveMode === "conversation" &&
+			isCodexSubscriptionEndpoint(endpoint) &&
+			(prefixShardPercent === 100 ||
+				(prefixShardPercent > 0 &&
+					conversationIdentity !== null &&
+					deriveCodexCacheKeyPrefixShardBucket(conversationIdentity) <
+						prefixShardPercent));
+		const prefixShardSeed =
+			canonicalConversationIdentity ?? conversationIdentity;
+		const prefixShard = prefixShardSeed
+			? deriveCodexCacheKeyPrefixShard(prefixShardSeed)
+			: null;
+		const prefixShardKey =
+			prefixShardTreatment && prefixShard !== null
+				? createHash("sha256")
+						.update(CODEX_CACHE_KEY_PREFIX_SHARD_DOMAIN)
+						.update(physicalModel)
+						.update("\0")
+						.update(instructions)
+						.update("\0")
+						.update(tools === undefined ? "<absent>" : JSON.stringify(tools))
+						.update("\0")
+						.update(String(prefixShard))
+						.digest("hex")
+				: null;
 		let key =
 			effectiveMode === "session"
 				? `ccflare-session-${createHash("sha256")
 						.update(sessionId)
 						.digest("hex")
 						.slice(0, 48)}`
-				: selectedConversationIdentity
-					? `ccflare-convo-${selectedConversationIdentity.slice(0, 48)}`
-					: null;
+				: (prefixShardKey ??
+					(selectedConversationIdentity
+						? `ccflare-convo-${selectedConversationIdentity.slice(0, 48)}`
+						: null));
 		if (key && cacheLaneRescueSalt) {
 			key = `ccflare-rescue-${createHash("sha256")
 				.update(CODEX_CACHE_LANE_RESCUE_DOMAIN)
@@ -2108,9 +2174,11 @@ export class CodexProvider extends BaseProvider {
 		return {
 			key,
 			assignment,
-			assignmentSource: explicitSessionOverride
-				? "explicit_session_override"
-				: "canary",
+			assignmentSource: prefixShardKey
+				? "prefix_shard"
+				: explicitSessionOverride
+					? "explicit_session_override"
+					: "canary",
 			effectiveMode: key ? effectiveMode : null,
 			cohortId: createHash("sha256")
 				.update(CODEX_CACHE_KEY_COHORT_DOMAIN)
@@ -2786,7 +2854,7 @@ export class CodexProvider extends BaseProvider {
 					.map((tool) => tool.name)
 			: [];
 		let tools: CodexTool[] | undefined;
-		if (body.tools && body.tools.length > 0) {
+		if (body.tools) {
 			const currentTools = shouldFilterOrchestrationTools
 				? body.tools.filter((tool) => !orchestrationToolNames.has(tool.name))
 				: body.tools;
@@ -2836,6 +2904,9 @@ export class CodexProvider extends BaseProvider {
 			body,
 			codexRequest.instructions,
 			input,
+			tools,
+			codexRequest.model,
+			endpoint,
 			account,
 			cacheLaneRescueSalt,
 			orchestrationCacheKeyResult ?? undefined,
@@ -2875,7 +2946,7 @@ export class CodexProvider extends BaseProvider {
 		if (body.tool_choice?.disable_parallel_tool_use === true) {
 			codexRequest.parallel_tool_calls = false;
 		}
-		if (tools) {
+		if (tools && (body.tools?.length ?? 0) > 0) {
 			codexRequest.tools = tools;
 		}
 

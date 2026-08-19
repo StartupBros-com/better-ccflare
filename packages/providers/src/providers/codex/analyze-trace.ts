@@ -32,7 +32,11 @@ export interface TraceRecord {
 	cache_key_assignment?: "conversation" | "session" | null;
 	cache_key_cohort_id?: string | null;
 	conversation_id?: string | null;
-	cache_key_assignment_source?: "canary" | "explicit_session_override" | null;
+	cache_key_assignment_source?:
+		| "canary"
+		| "explicit_session_override"
+		| "prefix_shard"
+		| null;
 	cache_key_continuity_basis?:
 		| "derived"
 		| "identity_match"
