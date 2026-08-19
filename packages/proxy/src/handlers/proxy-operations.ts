@@ -784,7 +784,6 @@ type BoundedModelRouteAdmissionErrorCode =
 interface BoundedModelRouteAdmissionBase {
 	readonly profileId: string;
 	readonly contextWindow: number;
-	readonly inputLimitTokens: number;
 	readonly requestedMaxOutputTokens: number | null;
 	readonly effectiveMaxOutputTokens: number | null;
 	readonly outputReserveTokens: number | null;
@@ -809,7 +808,6 @@ function boundedModelRouteAdmissionBase(
 	return {
 		profileId: profile.id,
 		contextWindow: profile.contextWindow,
-		inputLimitTokens: profile.contextWindow - profile.maxOutputTokens,
 		requestedMaxOutputTokens: null,
 		effectiveMaxOutputTokens: null,
 		outputReserveTokens: null,
