@@ -822,16 +822,34 @@ describe("analyzeCodexCacheExperiments", () => {
 	});
 
 	test("buckets official model families and never emits custom model strings", () => {
-		const secretModel = "gpt-5.6-sol-private-customer-secret";
+		const secretModel = "gpt-5.6-terra-private-customer-secret";
 		const report = analyzeCodexCacheExperiments([
 			{
 				trace_schema_version: 10,
 				phase: "request",
-				request_id: "official",
-				attempt_id: "official-attempt",
+				request_id: "official-sol",
+				attempt_id: "official-sol-attempt",
 				model_out: "gpt-5.6-sol-2026-05-13",
 				pacing_canary: "control",
 				pacing_cohort_id: "2222222222222222",
+			},
+			{
+				trace_schema_version: 10,
+				phase: "request",
+				request_id: "official-terra",
+				attempt_id: "official-terra-attempt",
+				model_out: "gpt-5.6-terra",
+				pacing_canary: "control",
+				pacing_cohort_id: "3333333333333333",
+			},
+			{
+				trace_schema_version: 10,
+				phase: "request",
+				request_id: "official-luna",
+				attempt_id: "official-luna-attempt",
+				model_out: "gpt-5.6-luna-2026-05-13",
+				pacing_canary: "control",
+				pacing_cohort_id: "4444444444444444",
 			},
 			{
 				trace_schema_version: 10,
@@ -840,12 +858,14 @@ describe("analyzeCodexCacheExperiments", () => {
 				attempt_id: "custom-attempt",
 				model_out: secretModel,
 				pacing_canary: "control",
-				pacing_cohort_id: "3333333333333333",
+				pacing_cohort_id: "5555555555555555",
 			},
 		]);
 
 		expect(report.pacing.rows.map((row) => row.model).sort()).toEqual([
+			"gpt-5.6-luna",
 			"gpt-5.6-sol",
+			"gpt-5.6-terra",
 			"other_or_custom",
 		]);
 		expect(formatCacheExperimentReport(report)).not.toContain(secretModel);
