@@ -847,6 +847,7 @@ async function handleProxyCoreImpl(
 	const requestModel = requestBodyContext.getModel();
 	const normalizedRequestModel = requestModel?.trim() ?? null;
 	const modelRouteRegistry = ctx.modelRouteSessionRegistry;
+	const isSubagent = isClaudeCodeSubagent(req.headers);
 	const { project, projectAttributionSource } =
 		extractProjectAttributionFromRequest(req.headers, parsedBody);
 
@@ -855,6 +856,35 @@ async function handleProxyCoreImpl(
 		if (parsedBody) {
 			// Reject requests without messages field (e.g., Claude Code internal events)
 			if (!parsedBody.messages || !Array.isArray(parsedBody.messages)) {
+				const malformedRouteResolution =
+					modelRouteRegistry &&
+					(isSubagent ||
+						(normalizedRequestModel !== null &&
+							modelRouteRegistry.hasPublicModelId(normalizedRequestModel)))
+						? modelRouteRegistry.resolve(
+								{
+									callerIdentity: routeCallerIdentity(req, apiKeyId),
+									requestModel: normalizedRequestModel,
+									sessionId: req.headers.get("x-claude-code-session-id"),
+									isSubagent,
+								},
+								rootIntentGeneration,
+								{ touchInheritedBinding: false },
+							)
+						: undefined;
+				if (
+					malformedRouteResolution?.kind === "route" &&
+					malformedRouteResolution.profile.selection === undefined &&
+					isBoundedModelRouteProfile(malformedRouteResolution.profile)
+				) {
+					const admission = admitBoundedModelRouteProfileRequest(
+						malformedRouteResolution.profile,
+						requestBodyContext,
+					);
+					if (admission.status === "reject") {
+						return createBoundedModelRouteAdmissionResponse(admission);
+					}
+				}
 				log.warn(
 					`Rejected invalid request to /v1/messages without messages field`,
 					{
@@ -934,7 +964,6 @@ async function handleProxyCoreImpl(
 			: new RequestBodyContext(finalBodyBuffer);
 	const effectiveModelAfterInterception =
 		finalRequestBodyContext.getModel()?.trim() ?? null;
-	const isSubagent = isClaudeCodeSubagent(req.headers);
 	const originalReservedPicker =
 		normalizedRequestModel?.startsWith(MODEL_ROUTE_PROFILE_MODEL_PREFIX) ===
 		true;

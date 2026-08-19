@@ -499,13 +499,17 @@ export class ModelRouteSessionRegistry {
 	resolve(
 		input: ModelRouteResolutionInput,
 		rootIntentGeneration: number | null = null,
+		options: { readonly touchInheritedBinding?: boolean } = {},
 	): ModelRouteResolution {
 		const requestModel = input.requestModel?.trim() ?? "";
 		const explicitProfile = this.profilesByPublicModelId.get(requestModel);
 		const bindingKey = this.bindingKey(input.callerIdentity, input.sessionId);
 		if (input.isSubagent) {
 			if (bindingKey) {
-				const inherited = this.getBinding(bindingKey);
+				const inherited = this.getBinding(
+					bindingKey,
+					options.touchInheritedBinding !== false,
+				);
 				if (inherited) {
 					return {
 						kind: "route",
@@ -607,9 +611,12 @@ export class ModelRouteSessionRegistry {
 		return state;
 	}
 
-	private getBinding(key: string): ModelRouteProfile | undefined {
+	private getBinding(
+		key: string,
+		touchBinding = true,
+	): ModelRouteProfile | undefined {
 		const now = this.now();
-		const state = this.getSessionState(key, now, true);
+		const state = this.getSessionState(key, now, touchBinding);
 		return state?.profile;
 	}
 

@@ -963,6 +963,41 @@ describe("ModelRouteSessionRegistry", () => {
 		expect(registry.size).toBe(0);
 	});
 
+	it("can inspect inherited bindings without extending their TTL", () => {
+		const configured = profile();
+		const clock = makeClock();
+		const registry = new ModelRouteSessionRegistry([configured], {
+			ttlMs: 1_000,
+			now: clock.now,
+		});
+		const root = {
+			callerIdentity: "caller",
+			requestModel: configured.publicModelId,
+			sessionId: "session",
+			isSubagent: false,
+		};
+		const child = {
+			callerIdentity: "caller",
+			requestModel: "claude-sonnet-4-5",
+			sessionId: "session",
+			isSubagent: true,
+		};
+		resolveAndCommit(registry, root);
+		clock.advance(999);
+
+		expect(
+			registry.resolve(child, null, { touchInheritedBinding: false }),
+		).toMatchObject({
+			kind: "route",
+			source: "inherited",
+			profile: configured,
+		});
+		clock.advance(1);
+
+		expect(resolveRequest(registry, child, null)).toEqual({ kind: "native" });
+		expect(registry.size).toBe(0);
+	});
+
 	it("evicts the oldest binding when the entry cap is reached", () => {
 		const configured = profile();
 		const clock = makeClock();

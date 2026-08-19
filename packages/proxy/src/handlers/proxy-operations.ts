@@ -840,6 +840,7 @@ export function admitBoundedModelRouteProfileRequest(
 	const requestedMaxOutputTokens = parsedBody?.max_tokens;
 	if (
 		!parsedBody ||
+		!Array.isArray(parsedBody.messages) ||
 		typeof requestedMaxOutputTokens !== "number" ||
 		!Number.isFinite(requestedMaxOutputTokens) ||
 		!Number.isInteger(requestedMaxOutputTokens) ||
@@ -900,7 +901,7 @@ export function createBoundedModelRouteAdmissionResponse(
 ): Response {
 	const message =
 		decision.code === "bounded_profile_invalid_request"
-			? "This bounded route profile requires a valid JSON request with a finite positive max_tokens."
+			? "This bounded route profile requires a valid JSON request with a messages array and a finite positive max_tokens."
 			: decision.code === "bounded_profile_deferred_tools_unsupported"
 				? "This profile does not support deferred custom tools. Select a native Anthropic route or start a fresh non-Anthropic client with ENABLE_TOOL_SEARCH=0."
 				: "This request exceeds the bounded route profile context limit.";

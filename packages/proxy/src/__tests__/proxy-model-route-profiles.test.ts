@@ -529,7 +529,7 @@ describe("Claude Code gateway model route profiles", () => {
 			error: {
 				type: "invalid_request_error",
 				message:
-					"This bounded route profile requires a valid JSON request with a finite positive max_tokens.",
+					"This bounded route profile requires a valid JSON request with a messages array and a finite positive max_tokens.",
 				code: "bounded_profile_invalid_request",
 			},
 		});
@@ -538,6 +538,78 @@ describe("Claude Code gateway model route profiles", () => {
 		expect(harness.strategySelect).toHaveBeenCalledTimes(0);
 		expect(fetchMock).toHaveBeenCalledTimes(0);
 		expect(registry.size).toBe(0);
+	});
+
+	it("reports malformed explicit bounded requests with the stable error code", async () => {
+		const registry = makeRegistry({
+			contextWindow: 24_000,
+			maxOutputTokens: 4_000,
+		});
+		const harness = makeContext(registry);
+		const { fetchMock } = installJsonUpstream();
+		const request = apiRequest(
+			"/v1/messages",
+			PROFILE_MODEL,
+			{},
+			{
+				messages: { malformed: true },
+			},
+		);
+
+		const response = await handleProxy(
+			request,
+			new URL(request.url),
+			harness.ctx,
+			"key-1",
+		);
+
+		expect(response.status).toBe(400);
+		expect(await response.json()).toEqual({
+			type: "error",
+			error: {
+				type: "invalid_request_error",
+				message:
+					"This bounded route profile requires a valid JSON request with a messages array and a finite positive max_tokens.",
+				code: "bounded_profile_invalid_request",
+			},
+		});
+		expect(harness.getAllAccounts).not.toHaveBeenCalled();
+		expect(harness.strategySelect).not.toHaveBeenCalled();
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(registry.size).toBe(0);
+	});
+
+	it("preserves the generic malformed-message response for non-profile requests", async () => {
+		const harness = makeContext(makeRegistry());
+		const { fetchMock } = installJsonUpstream();
+		const request = apiRequest(
+			"/v1/messages",
+			CHILD_MODEL,
+			{},
+			{
+				messages: { malformed: true },
+			},
+		);
+
+		const response = await handleProxy(
+			request,
+			new URL(request.url),
+			harness.ctx,
+			"key-1",
+		);
+
+		expect(response.status).toBe(400);
+		expect(await response.json()).toEqual({
+			type: "error",
+			error: {
+				type: "invalid_request_error",
+				message:
+					"messages: Field required for /v1/messages endpoint. Internal events should not be proxied.",
+			},
+		});
+		expect(harness.getAllAccounts).not.toHaveBeenCalled();
+		expect(harness.strategySelect).not.toHaveBeenCalled();
+		expect(fetchMock).not.toHaveBeenCalled();
 	});
 
 	it("rejects over-limit bounded requests before account selection or session commit", async () => {
@@ -762,6 +834,52 @@ describe("Claude Code gateway model route profiles", () => {
 			max_tokens: 4_000,
 		});
 		expect(harness.strategySelect).toHaveBeenCalledTimes(0);
+	});
+
+	it("reports malformed inherited bounded requests with the stable error code", async () => {
+		const registry = makeRegistry({
+			contextWindow: 24_000,
+			maxOutputTokens: 4_000,
+		});
+		const harness = makeContext(registry);
+		const { fetchMock, requests } = installJsonUpstream();
+		const session = { "x-claude-code-session-id": "malformed-bounded-child" };
+		const root = apiRequest("/v1/messages", PROFILE_MODEL, session);
+		expect(
+			(await handleProxy(root, new URL(root.url), harness.ctx, "key-1")).status,
+		).toBe(200);
+
+		const child = apiRequest(
+			"/v1/messages",
+			CHILD_MODEL,
+			{
+				...session,
+				"x-claude-code-agent-id": "malformed-bounded-child-agent",
+			},
+			{ messages: { malformed: true } },
+		);
+		const response = await handleProxy(
+			child,
+			new URL(child.url),
+			harness.ctx,
+			"key-1",
+		);
+
+		expect(response.status).toBe(400);
+		expect(await response.json()).toEqual({
+			type: "error",
+			error: {
+				type: "invalid_request_error",
+				message:
+					"This bounded route profile requires a valid JSON request with a messages array and a finite positive max_tokens.",
+				code: "bounded_profile_invalid_request",
+			},
+		});
+		expect(requests).toHaveLength(1);
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(harness.getAllAccounts).toHaveBeenCalledTimes(1);
+		expect(harness.strategySelect).not.toHaveBeenCalled();
+		expect(registry.size).toBe(1);
 	});
 
 	it("clears a session binding on a native root model selection", async () => {

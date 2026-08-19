@@ -402,7 +402,7 @@ For example, the complete environment value for the bounded GLM route is:
 CCFLARE_MODEL_ROUTE_PROFILES_JSON='[
   {
     "id": "glm-5-2-bounded-v1",
-    "displayName": "GLM-5.2 Local (bounded v1)",
+    "displayName": "GLM-5.2 Local: 20k input, 4k output, no deferred tools",
     "description": "Mac Studio local champion; 20k input / 4k output; no deferred tools; no fallback",
     "accountId": "59d5d8b1-fe47-44e7-b47b-171b0c902b0c",
     "logicalModel": "claude-fable-5",
