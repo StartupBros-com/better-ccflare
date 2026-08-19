@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { Account } from "@better-ccflare/types";
 import { deriveConversationIdentity } from "./orchestration-election";
 import {
+	CODEX_CACHE_KEY_PREFIX_SHARD_PERCENT_ENV,
 	CODEX_DEFAULT_ENDPOINT,
 	CODEX_EXPLICIT_CACHE_BREAKPOINT_PERCENT_ENV,
 	CODEX_PROMPT_CACHE_KEY_ENV,
@@ -128,6 +129,7 @@ function readTrace(dir: string): Record<string, unknown> {
 }
 
 afterEach(() => {
+	delete process.env[CODEX_CACHE_KEY_PREFIX_SHARD_PERCENT_ENV];
 	delete process.env[CODEX_EXPLICIT_CACHE_BREAKPOINT_PERCENT_ENV];
 	delete process.env[CODEX_PROMPT_CACHE_KEY_ENV];
 	delete process.env[CODEX_TRACE_DIR_ENV];
@@ -413,6 +415,22 @@ describe("Codex GPT-5.6 explicit prompt-cache breakpoint canary", () => {
 			expect(body.prompt_cache_key).toMatch(/^ccflare-rescue-/);
 			expect(breakpoints(body)).toHaveLength(0);
 		}
+	});
+
+	it("keeps breakpoint placement and rescue exclusion unchanged under prefix-shard treatment", async () => {
+		process.env[CODEX_CACHE_KEY_PREFIX_SHARD_PERCENT_ENV] = "100";
+		const ordinary = await transform({ percent: "100" });
+		expect(ordinary.prompt_cache_key).toMatch(/^[0-9a-f]{64}$/);
+		expect(breakpoints(ordinary)).toHaveLength(1);
+		expect(breakpoints(ordinary)[0]?.block.text).toBe("stable first request");
+
+		const rescue = await transform({
+			percent: "100",
+			requestId: "prefix-shard-rescue",
+			attemptCause: "cache_lane_rescue",
+		});
+		expect(rescue.prompt_cache_key).toMatch(/^ccflare-rescue-[0-9a-f]{48}$/);
+		expect(breakpoints(rescue)).toHaveLength(0);
 	});
 
 	it("uses a stable conversation-scoped deterministic assignment", async () => {

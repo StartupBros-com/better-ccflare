@@ -268,7 +268,11 @@ interface TraceInputs {
 	/** Bounded digest of the logical conversation identity. */
 	conversationId?: string | null;
 	/** Why the effective cache-key mode was selected. */
-	cacheKeyAssignmentSource?: "canary" | "explicit_session_override" | null;
+	cacheKeyAssignmentSource?:
+		| "canary"
+		| "explicit_session_override"
+		| "prefix_shard"
+		| null;
 	/** Low-cardinality continuity provenance for the outbound cache key. */
 	cacheKeyContinuityBasis?:
 		| "derived"
