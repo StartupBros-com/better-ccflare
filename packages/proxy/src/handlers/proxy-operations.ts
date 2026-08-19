@@ -149,6 +149,7 @@ import {
 	PhysicalAttemptBudgetExceededError,
 	type RoutingAttemptLedger,
 } from "./routing-attempt-ledger";
+import { clampFiniteRoutingRecoveryRetryAfterSeconds } from "./routing-recovery-advice";
 import { createProtectedAnthropicOverloadResponse } from "./routing-terminal";
 import {
 	canAttemptStaleTokenRefresh,
@@ -6959,8 +6960,8 @@ export async function proxyWithAccount(
  */
 export const POOL_EXHAUSTED_UNKNOWN_RESET_RETRY_AFTER_SECONDS = 600;
 
-/** Upper bound on Retry-After so clients don't sleep through a recovery. */
-export const POOL_EXHAUSTED_MAX_RETRY_AFTER_SECONDS = 3600;
+/** Compatibility alias for the shared routing recovery retry-advice ceiling. */
+export { ROUTING_RECOVERY_MAX_RETRY_AFTER_SECONDS as POOL_EXHAUSTED_MAX_RETRY_AFTER_SECONDS } from "./routing-recovery-advice";
 
 /**
  * Top-level error.type values produced by createPoolExhaustedResponse.
@@ -7115,13 +7116,7 @@ export function createPoolExhaustedResponse(
 	// telemetry rather than retrying blindly against a stale snapshot.
 	const usageAwareRetryAfterSeconds =
 		earliestRecoveryMs !== null
-			? Math.max(
-					1,
-					Math.min(
-						POOL_EXHAUSTED_MAX_RETRY_AFTER_SECONDS,
-						Math.ceil((earliestRecoveryMs - now) / 1000),
-					),
-				)
+			? clampFiniteRoutingRecoveryRetryAfterSeconds(earliestRecoveryMs, now)
 			: POOL_EXHAUSTED_UNKNOWN_RESET_RETRY_AFTER_SECONDS;
 
 	// For circuit_open, take the longer of the breaker's own cooldown and any

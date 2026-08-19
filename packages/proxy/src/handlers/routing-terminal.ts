@@ -13,6 +13,7 @@ import { sanitizeAnthropicRetryAfterSeconds } from "../anthropic-degraded-mode";
 import type { RoutingCapacityContext } from "./account-selector";
 import type { RequestRateLimitOutcome } from "./rate-limit-scope";
 import type { HostedDispatchState } from "./routing-attempt-ledger";
+import { clampFiniteRoutingRecoveryRetryAfterSeconds } from "./routing-recovery-advice";
 import { boundedRoutingSelectionCount } from "./routing-selection-diagnostics";
 
 const PROTECTED_ANTHROPIC_RETRY_CONFIG = Object.freeze({
@@ -468,9 +469,9 @@ export function createModelPoolExhaustedResponse(options: {
 	}
 	const headers = new Headers({ "content-type": "application/json" });
 	if (nextAvailableAt !== null) {
-		const retryAfterSeconds = Math.max(
-			1,
-			Math.ceil((nextAvailableAt - now) / 1000),
+		const retryAfterSeconds = clampFiniteRoutingRecoveryRetryAfterSeconds(
+			nextAvailableAt,
+			now,
 		);
 		headers.set("retry-after", String(retryAfterSeconds));
 		headers.set(RECOVERY_STATUS_HEADER, RECOVERY_STATUS_EXHAUSTED);
@@ -512,9 +513,9 @@ function createPoolExhaustedResponse(options: {
 				: null,
 		};
 	});
-	const retryAfterSeconds = Math.max(
-		1,
-		Math.ceil((nextAvailableAt - now) / 1000),
+	const retryAfterSeconds = clampFiniteRoutingRecoveryRetryAfterSeconds(
+		nextAvailableAt,
+		now,
 	);
 	const error: Record<string, unknown> = {
 		type: "pool_exhausted",
@@ -592,7 +593,9 @@ function createRouteUnavailableResponse(options: {
 		};
 		headers.set(
 			"retry-after",
-			String(Math.max(1, Math.ceil((effectiveRetryAt - now) / 1000))),
+			String(
+				clampFiniteRoutingRecoveryRetryAfterSeconds(effectiveRetryAt, now),
+			),
 		);
 		headers.set("x-better-ccflare-route-status", "circuit-open");
 		// Every candidate on this lane is circuit-open with a positively known

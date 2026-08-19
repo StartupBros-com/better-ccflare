@@ -10,6 +10,7 @@ import { GUARD_CORRELATION_SECRET_HEADER } from "../../packages/http-common/src/
 import { createGuardCorrelationVerifier } from "../../packages/proxy/src/handlers/guard-correlation-auth";
 import { GUARD_REQUEST_ID_HEADER } from "../../packages/proxy/src/handlers/internal-transport-headers";
 import { createRequestMetadata } from "../../packages/proxy/src/handlers/request-handler";
+import { createRoutingTerminalResponse } from "../../packages/proxy/src/handlers/routing-terminal";
 
 import {
 	DEFAULT_GUARD_MAX_ATTEMPTS,
@@ -2808,6 +2809,57 @@ describe("source-controlled guard", () => {
 		expect(guard.state.counters.retried).toBe(0);
 		expect(guard.state.counters.deadlineExceeded).toBe(0);
 		expect(guard.state.counters.finalError).toBe(1);
+	});
+
+	test("forwards capped active-terminal recovery advice without waiting through the true horizon", async () => {
+		const events: Array<Record<string, unknown>> = [];
+		const now = Date.UTC(2026, 6, 17, 12);
+		const recoveryAt = now + 7 * 24 * 60 * 60_000;
+		const terminal = createRoutingTerminalResponse({
+			source: "selection",
+			accounts: [],
+			capacityContext: null,
+			rateLimitOutcomes: [],
+			upstreamAttempts: 0,
+			now,
+			routeCircuitRecoveryHint: {
+				allCandidatesOpen: true,
+				candidateCount: 1,
+				probeLeased: false,
+				retryAt: recoveryAt,
+				reason: "semantic_stream_stall",
+			},
+		});
+		const { baseUrl, guard } = await startGuard("http://127.0.0.1:8789", {
+			logger: (line: string) => events.push(JSON.parse(line)),
+			maxRecoverySleepMs: 120_000,
+			retryAttemptHeadroomMs: 30_000,
+			totalDeadlineMs: 600_000,
+			fetchImpl: async () => terminal.response,
+		});
+
+		const startedAt = Date.now();
+		const response = await fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			body: "{}",
+		});
+		const body = (await response.json()) as {
+			error: { next_available_at: string };
+		};
+
+		expect(response.status).toBe(503);
+		expect(response.headers.get("retry-after")).toBe("3600");
+		expect(body.error.next_available_at).toBe(
+			new Date(recoveryAt).toISOString(),
+		);
+		expect(Date.now() - startedAt).toBeLessThan(500);
+		expect(guard.state.counters.retried).toBe(0);
+		expect(
+			events.find((event) => event.event === "proxy_final_error"),
+		).toMatchObject({
+			reason: "recovery_silence_budget_exceeded",
+			recoveryDelayMs: 3_600_000,
+		});
 	});
 
 	test("forwards a finite model recovery above the request-wide silence ceiling without leaking its permit", async () => {
