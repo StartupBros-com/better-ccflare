@@ -47,6 +47,9 @@ mock.module("../model-catalog", () => ({
 }));
 
 const usageCollectorModule = await import("../usage-collector");
+const serverToolReplayRuntimeModule = await import(
+	"../server-tool-replay-runtime"
+);
 const { handleProxy } = await import("../proxy");
 
 const PROFILE_MODEL = "claude-bccf-route-pro-primary-sol";
@@ -577,6 +580,62 @@ describe("Claude Code gateway model route profiles", () => {
 		expect(harness.strategySelect).toHaveBeenCalledTimes(0);
 		expect(fetchMock).toHaveBeenCalledTimes(0);
 		expect(registry.size).toBe(0);
+	});
+
+	it("rejects deferred custom tools on bounded profiles before selection or server-tool handling", async () => {
+		const registry = makeRegistry({
+			contextWindow: 24_000,
+			maxOutputTokens: 4_000,
+		});
+		const harness = makeContext(registry);
+		const { fetchMock } = installJsonUpstream();
+		const request = apiRequest(
+			"/v1/messages",
+			PROFILE_MODEL,
+			{ "x-claude-code-session-id": "deferred-tool-bounded-session" },
+			{
+				tools: [
+					{
+						name: "deferred_lookup",
+						input_schema: { type: "object" },
+						defer_loading: true,
+					},
+				],
+			},
+		);
+
+		const replayBindingSpy = spyOn(
+			serverToolReplayRuntimeModule,
+			"bindRequestPrivateServerToolReplay",
+		);
+		try {
+			const response = await handleProxy(
+				request,
+				new URL(request.url),
+				harness.ctx,
+				"key-1",
+			);
+
+			expect(response.status).toBe(400);
+			const payload = await response.json();
+			expect(payload).toEqual({
+				type: "error",
+				error: {
+					type: "invalid_request_error",
+					message:
+						"This profile does not support deferred custom tools. Select a native Anthropic route or start a fresh non-Anthropic client with ENABLE_TOOL_SEARCH=0.",
+					code: "bounded_profile_deferred_tools_unsupported",
+				},
+			});
+			expect(JSON.stringify(payload)).not.toContain(ROUTE_ACCOUNT_ID);
+			expect(harness.getAllAccounts).toHaveBeenCalledTimes(0);
+			expect(harness.strategySelect).toHaveBeenCalledTimes(0);
+			expect(fetchMock).toHaveBeenCalledTimes(0);
+			expect(registry.size).toBe(0);
+			expect(replayBindingSpy).not.toHaveBeenCalled();
+		} finally {
+			replayBindingSpy.mockRestore();
+		}
 	});
 
 	it("preserves explicit max effort and every other output_config field", async () => {
@@ -1459,6 +1518,13 @@ describe("Claude Code gateway model route profiles", () => {
 		const { requests } = installJsonUpstream();
 		const body = {
 			output_config: { effort: "medium", service_tier: "auto" },
+			tools: [
+				{
+					name: "deferred_lookup",
+					input_schema: { type: "object" },
+					defer_loading: true,
+				},
+			],
 		};
 		const request = apiRequest("/v1/messages", CHILD_MODEL, {}, body);
 		expect(

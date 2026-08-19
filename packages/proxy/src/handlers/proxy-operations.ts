@@ -25,6 +25,7 @@ import {
 	CODEX_TURN_STATE_HEADER,
 	decideContextAdmission,
 	estimateAnthropicAdmissionTokens,
+	hasDeferredCustomTool,
 	isAnthropicExtraUsageExhausted,
 	isAnthropicOutOfCredits,
 	isCodexSubscriptionEndpoint,
@@ -777,6 +778,7 @@ export function createContextLengthExceededResponse(
 
 type BoundedModelRouteAdmissionErrorCode =
 	| "bounded_profile_invalid_request"
+	| "bounded_profile_deferred_tools_unsupported"
 	| "bounded_profile_context_length_exceeded";
 
 interface BoundedModelRouteAdmissionBase {
@@ -829,6 +831,14 @@ export function admitBoundedModelRouteProfileRequest(
 ): BoundedModelRouteAdmissionDecision {
 	const base = boundedModelRouteAdmissionBase(profile);
 	const parsedBody = bodyContext.getParsedJson();
+	if (hasDeferredCustomTool(parsedBody)) {
+		return {
+			...base,
+			status: "reject",
+			code: "bounded_profile_deferred_tools_unsupported",
+		};
+	}
+
 	const requestedMaxOutputTokens = parsedBody?.max_tokens;
 	if (
 		!parsedBody ||
@@ -893,7 +903,9 @@ export function createBoundedModelRouteAdmissionResponse(
 	const message =
 		decision.code === "bounded_profile_invalid_request"
 			? "This bounded route profile requires a valid JSON request with a finite positive max_tokens."
-			: "This request exceeds the bounded route profile context limit.";
+			: decision.code === "bounded_profile_deferred_tools_unsupported"
+				? "This profile does not support deferred custom tools. Select a native Anthropic route or start a fresh non-Anthropic client with ENABLE_TOOL_SEARCH=0."
+				: "This request exceeds the bounded route profile context limit.";
 	return new Response(
 		JSON.stringify({
 			type: "error",

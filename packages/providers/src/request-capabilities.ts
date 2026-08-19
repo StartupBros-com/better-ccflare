@@ -380,6 +380,30 @@ export function estimateAnthropicRequestTokens(
 	};
 }
 
+/**
+ * Detect an Anthropic custom tool declaration that requests deferred loading.
+ * Server tools are typed; ordinary client functions omit `type` and carry a
+ * name plus input schema, matching the server-tool classifier's distinction.
+ */
+export function hasDeferredCustomTool(body: unknown): boolean {
+	if (!body || typeof body !== "object" || Array.isArray(body)) return false;
+	const tools = (body as Record<string, unknown>).tools;
+	if (!Array.isArray(tools)) return false;
+
+	return tools.some((tool) => {
+		if (!tool || typeof tool !== "object" || Array.isArray(tool)) return false;
+		const declaration = tool as Record<string, unknown>;
+		return (
+			declaration.type === undefined &&
+			typeof declaration.name === "string" &&
+			declaration.input_schema !== null &&
+			typeof declaration.input_schema === "object" &&
+			!Array.isArray(declaration.input_schema) &&
+			declaration.defer_loading === true
+		);
+	});
+}
+
 export function estimateAnthropicAdmissionTokens(
 	body: unknown,
 ): AnthropicRequestTokenEstimate {
