@@ -1000,6 +1000,7 @@ async function handleProxyCoreImpl(
 	const modelRouteResolution = modelRouteRegistry?.resolve(
 		modelRouteResolutionInput,
 		rootIntentGeneration,
+		{ touchInheritedBinding: !finalRequestBodyContext.hasParseFailed },
 	);
 	// A native root remains native even if an agent preference injects a reserved
 	// picker after /model selection. Resolve first so the authoritative native

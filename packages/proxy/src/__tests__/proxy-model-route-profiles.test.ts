@@ -132,7 +132,20 @@ function makeAccount(id = ROUTE_ACCOUNT_ID): Account {
 	};
 }
 
-function makeRegistry(profileOverrides: Record<string, unknown> = {}) {
+function makeClock(start = 1_000) {
+	let now = start;
+	return {
+		now: () => now,
+		advance: (ms: number) => {
+			now += ms;
+		},
+	};
+}
+
+function makeRegistry(
+	profileOverrides: Record<string, unknown> = {},
+	options?: ConstructorParameters<typeof ModelRouteSessionRegistry>[1],
+) {
 	return new ModelRouteSessionRegistry(
 		parseModelRouteProfiles(
 			JSON.stringify([
@@ -148,6 +161,7 @@ function makeRegistry(profileOverrides: Record<string, unknown> = {}) {
 				},
 			]),
 		),
+		options,
 	);
 }
 
@@ -880,6 +894,130 @@ describe("Claude Code gateway model route profiles", () => {
 		expect(harness.getAllAccounts).toHaveBeenCalledTimes(1);
 		expect(harness.strategySelect).not.toHaveBeenCalled();
 		expect(registry.size).toBe(1);
+	});
+
+	it("does not refresh a bounded inherited binding for an unparseable child, while admitted children refresh it", async () => {
+		const clock = makeClock();
+		const registry = makeRegistry(
+			{ contextWindow: 24_000, maxOutputTokens: 4_000 },
+			{ ttlMs: 1_000, now: clock.now },
+		);
+		const fallback = makeAccount("normal-route");
+		const harness = makeContext(registry, {
+			accounts: [makeAccount(), fallback],
+			normalAccountId: fallback.id,
+		});
+		const { requests } = installJsonUpstream();
+		const malformedSession = {
+			"x-claude-code-session-id": "unparseable-bounded-child",
+		};
+		const malformedRoot = apiRequest(
+			"/v1/messages",
+			PROFILE_MODEL,
+			malformedSession,
+		);
+		expect(
+			(
+				await handleProxy(
+					malformedRoot,
+					new URL(malformedRoot.url),
+					harness.ctx,
+					"key-1",
+				)
+			).status,
+		).toBe(200);
+
+		clock.advance(999);
+		const malformedChild = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				...malformedSession,
+				"x-claude-code-agent-id": "unparseable-bounded-child-agent",
+			},
+			body: "not-json",
+		});
+		const rejected = await handleProxy(
+			malformedChild,
+			new URL(malformedChild.url),
+			harness.ctx,
+			"key-1",
+		);
+		expect(rejected.status).toBe(400);
+		expect(await rejected.json()).toMatchObject({
+			error: { code: "bounded_profile_invalid_request" },
+		});
+
+		clock.advance(1);
+		const expiredChild = apiRequest("/v1/messages", CHILD_MODEL, {
+			...malformedSession,
+			"x-claude-code-agent-id": "child-after-unparseable-expiry",
+		});
+		expect(
+			(
+				await handleProxy(
+					expiredChild,
+					new URL(expiredChild.url),
+					harness.ctx,
+					"key-1",
+				)
+			).status,
+		).toBe(200);
+		expect(requests[1]?.url).toContain("/normal-route/");
+
+		const admittedSession = {
+			"x-claude-code-session-id": "admitted-bounded-child",
+		};
+		const admittedRoot = apiRequest(
+			"/v1/messages",
+			PROFILE_MODEL,
+			admittedSession,
+		);
+		expect(
+			(
+				await handleProxy(
+					admittedRoot,
+					new URL(admittedRoot.url),
+					harness.ctx,
+					"key-1",
+				)
+			).status,
+		).toBe(200);
+		clock.advance(999);
+		const admittedChild = apiRequest("/v1/messages", CHILD_MODEL, {
+			...admittedSession,
+			"x-claude-code-agent-id": "admitted-bounded-child-agent",
+		});
+		expect(
+			(
+				await handleProxy(
+					admittedChild,
+					new URL(admittedChild.url),
+					harness.ctx,
+					"key-1",
+				)
+			).status,
+		).toBe(200);
+		clock.advance(1);
+		const refreshedChild = apiRequest("/v1/messages", CHILD_MODEL, {
+			...admittedSession,
+			"x-claude-code-agent-id": "child-after-admitted-refresh",
+		});
+		expect(
+			(
+				await handleProxy(
+					refreshedChild,
+					new URL(refreshedChild.url),
+					harness.ctx,
+					"key-1",
+				)
+			).status,
+		).toBe(200);
+		expect(
+			requests
+				.slice(2)
+				.every((request) => request.url.includes(`/${ROUTE_ACCOUNT_ID}/`)),
+		).toBe(true);
 	});
 
 	it("clears a session binding on a native root model selection", async () => {
