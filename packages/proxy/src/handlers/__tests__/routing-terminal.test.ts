@@ -307,6 +307,69 @@ describe("routing terminal responses", () => {
 		expect(parsed.error.type).not.toBe("pool_exhausted");
 	});
 
+	it.each([
+		{
+			scope: "model",
+			createTerminal: (now: number, recoveryAt: number) =>
+				createRoutingTerminalResponse({
+					source: "selection",
+					accounts: [makeAccount()],
+					capacityContext: familyCapacityContext(recoveryAt),
+					rateLimitOutcomes: [],
+					upstreamAttempts: 0,
+					now,
+				}),
+		},
+		{
+			scope: "pool",
+			createTerminal: (now: number, recoveryAt: number) =>
+				createRoutingTerminalResponse({
+					source: "selection",
+					accounts: [
+						makeAccount({
+							rate_limited_until: recoveryAt,
+							rate_limited_reason: "upstream_429_with_reset",
+						}),
+					],
+					capacityContext: null,
+					rateLimitOutcomes: [],
+					upstreamAttempts: 0,
+					now,
+				}),
+		},
+		{
+			scope: "route",
+			createTerminal: (now: number, recoveryAt: number) =>
+				createRoutingTerminalResponse({
+					source: "selection",
+					accounts: [makeAccount()],
+					capacityContext: null,
+					rateLimitOutcomes: [],
+					upstreamAttempts: 0,
+					now,
+					routeCircuitRecoveryHint: {
+						allCandidatesOpen: true,
+						candidateCount: 1,
+						probeLeased: false,
+						retryAt: recoveryAt,
+						reason: "semantic_stream_stall",
+					},
+				}),
+		},
+	] as const)("caps seven-day $scope recovery advice without truncating the absolute recovery", async ({
+		createTerminal,
+	}) => {
+		const now = Date.UTC(2026, 6, 17, 12);
+		const recoveryAt = now + 7 * 24 * 60 * 60_000;
+		const terminal = createTerminal(now, recoveryAt);
+
+		expect(terminal.response.headers.get("retry-after")).toBe("3600");
+		const parsed = await body(terminal.response);
+		expect(parsed.error.next_available_at).toBe(
+			new Date(recoveryAt).toISOString(),
+		);
+	});
+
 	it("does not authorize circuit recovery after a hosted dispatch", async () => {
 		const now = Date.UTC(2026, 6, 17, 12);
 		const terminal = createRoutingTerminalResponse({
