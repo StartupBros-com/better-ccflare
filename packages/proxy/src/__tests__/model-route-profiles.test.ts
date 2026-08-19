@@ -1038,5 +1038,14 @@ describe("ModelRouteSessionRegistry", () => {
 		expect(registry.isExactProfileAccount(boundedV1, "mac-studio")).toBe(true);
 		expect(registry.isExactProfileAccount(boundedV2, "mac-studio")).toBe(true);
 		expect(registry.isExactProfileAccount(ordinary, "mac-studio")).toBe(false);
+		expect(
+			registry.isExactProfileRouteForAccount("bounded-v1", "mac-studio"),
+		).toBe(true);
+		expect(
+			registry.isExactProfileRouteForAccount("ordinary-route", "mac-studio"),
+		).toBe(false);
+		expect(
+			registry.isExactProfileRouteForAccount("unknown-route", "mac-studio"),
+		).toBe(false);
 	});
 });

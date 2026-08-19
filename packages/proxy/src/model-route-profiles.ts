@@ -395,6 +395,7 @@ export class ModelRouteSessionRegistry {
 		string,
 		ModelRouteProfile
 	>;
+	private readonly profilesById: ReadonlyMap<string, ModelRouteProfile>;
 	private readonly profileOnlyAccountIds: ReadonlySet<string>;
 	private readonly sessions = new Map<string, ModelRouteSessionState>();
 	private readonly rootIntents = new Map<string, ModelRouteRootIntentState>();
@@ -429,6 +430,9 @@ export class ModelRouteSessionRegistry {
 			}
 		}
 		this.profileOnlyAccountIds = profileOnlyAccountIds;
+		this.profilesById = new Map(
+			profiles.map((profile) => [profile.id, profile]),
+		);
 		this.profilesByPublicModelId = new Map(
 			profiles.map((profile) => [profile.publicModelId, profile]),
 		);
@@ -455,6 +459,13 @@ export class ModelRouteSessionRegistry {
 		accountId: string,
 	): boolean {
 		return profile.selection === undefined && profile.accountId === accountId;
+	}
+
+	isExactProfileRouteForAccount(profileId: string, accountId: string): boolean {
+		const profile = this.profilesById.get(profileId);
+		return (
+			profile !== undefined && this.isExactProfileAccount(profile, accountId)
+		);
 	}
 
 	getDiscoveryModels(): ReadonlyArray<{
