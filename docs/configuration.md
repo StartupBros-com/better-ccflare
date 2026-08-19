@@ -382,8 +382,40 @@ account UUID is copied into the public discovery response.
 | `defaultEffort` | no | Default used only when the request omits effort. Accepted values: `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`; an explicit client effort always wins |
 | `expectedProvider` | capability: yes; legacy: no | Lowercase provider guard. Capability profiles use it to build the candidate pool; legacy profiles fail closed if the pinned account differs |
 | `expectedPhysicalModel` | capability: yes; legacy: no | Guard for the first physical model produced by the account's mapping for `logicalModel`. Capability profiles use it as the pool predicate; legacy profiles fail closed if the pinned account differs |
+| `exclusiveAccount` | no | Exact-account profiles only; defaults to `false`. When `true`, reserves the named account for exact configured route profiles that name it |
+| `contextWindow` | no | Exact-account profiles only; required with `maxOutputTokens`. Positive integer total context bound |
+| `maxOutputTokens` | no | Exact-account profiles only; required with `contextWindow`. Positive integer less than `contextWindow`; caps request output |
 
 At startup, better-ccflare logs only the configured profile count, never the JSON, account IDs, logical models, or physical models. Legacy profiles name exact account IDs, so keep those values in a protected environment file or service-manager credential rather than committing a real deployment value. Capability profiles contain no account IDs, but their provider/model constraints are still operational configuration and should be protected accordingly.
+
+### Bounded exact-account profiles
+
+`exclusiveAccount`, `contextWindow`, and `maxOutputTokens` are optional additions to an exact-account profile. `exclusiveAccount` defaults to `false`; it is invalid on capability profiles. When it is `true`, normal routing, combo routing, capability profiles, and public `x-better-ccflare-account-id` force routes cannot reach that account. Only an exact configured route profile that names the account can select it. Manual pause, rate-limit, and capacity checks remain authoritative, so selecting the profile does not bypass an unavailable account.
+
+`contextWindow` and `maxOutputTokens` must either both be absent or both be positive integers, and `maxOutputTokens` must be less than `contextWindow`. Their fixed input limit is derived as `contextWindow - maxOutputTokens`; it is not configured separately. For a bounded profile, better-ccflare clamps a larger client `max_tokens` value to `maxOutputTokens` (while preserving a smaller valid value), estimates the complete serialized Anthropic request envelope conservatively, and reserves the full configured output cap. A malformed or unestimable request, an input estimate above the derived limit, or a total above `contextWindow` fails closed before account selection, with no fallback. The nominal context window of a model does not override an operator's profile bound.
+
+Bounded profiles reject requests using deferred custom tools. Use a native Anthropic route instead, or start a fresh non-Anthropic client with `ENABLE_TOOL_SEARCH=0`; do not reuse a client session that has already declared deferred tools.
+
+For example, the complete environment value for the bounded GLM route is:
+
+```bash
+CCFLARE_MODEL_ROUTE_PROFILES_JSON='[
+  {
+    "id": "glm-5-2-bounded-v1",
+    "displayName": "GLM-5.2 Local (bounded v1)",
+    "description": "Mac Studio local champion; 20k input / 4k output; no deferred tools; no fallback",
+    "accountId": "59d5d8b1-fe47-44e7-b47b-171b0c902b0c",
+    "logicalModel": "claude-fable-5",
+    "expectedProvider": "anthropic-compatible",
+    "expectedPhysicalModel": "local-champion",
+    "exclusiveAccount": true,
+    "contextWindow": 24000,
+    "maxOutputTokens": 4000
+  }
+]'
+```
+
+This profile has a fixed 20,000-token input limit, a 4,000-token output cap, and a 24,000-token total envelope. The deployment account ID shown here is protected operational configuration: do not commit real deployment IDs to a public configuration file. This repository is private, but use the same protected-environment or service-manager credential posture for deployed values. If other profiles exist, include this object in the same complete JSON array rather than replacing them or supplying the object alone. Its public picker ID is `claude-bccf-route-glm-5-2-bounded-v1`.
 
 ### Claude Code `/model` setup
 
@@ -393,7 +425,7 @@ Point Claude Code's Anthropic base URL and authentication at better-ccflare as u
 CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
 ```
 
-When at least one route profile is configured, authenticated `GET /v1/models` requests are answered locally with only each reserved public model ID and display name. Discovery does not select an account or contact an upstream provider. Claude Code labels these entries as gateway models in `/model`.
+When at least one route profile is configured, authenticated `GET /v1/models` requests are answered locally with only each reserved public model ID and display name. Discovery metadata is not enforcement: it does not select an account, impose profile bounds, or contact an upstream provider. The route-profile setting is read once at process start, so changing it requires a restart. Claude Code labels these entries as gateway models in `/model`.
 
 The reserved IDs are intentionally opaque to Claude Code's built-in model-family inference. To expose effort, `xhigh`, and `max` controls for one discovered profile, pair that same public ID with Claude Code's [custom model option](https://code.claude.com/docs/en/model-config):
 
