@@ -73,7 +73,7 @@ describe("parseModelRouteProfiles", () => {
 		expect(parseModelRouteProfiles("   ")).toEqual([]);
 	});
 
-	it("parses a strict route profile and derives its public Claude model id", () => {
+	it("preserves existing profile shapes when optional bounded fields are absent", () => {
 		expect(profile()).toEqual({
 			id: "pro-primary-sol",
 			publicModelId: `${MODEL_ROUTE_PROFILE_MODEL_PREFIX}pro-primary-sol`,
@@ -85,6 +85,97 @@ describe("parseModelRouteProfiles", () => {
 			expectedProvider: "codex",
 			expectedPhysicalModel: "gpt-5.6-sol",
 		});
+	});
+
+	it("parses bounded exclusive settings on an exact-account profile", () => {
+		const [configured] = parseModelRouteProfiles(
+			JSON.stringify([
+				{
+					id: "glm-5-2-bounded-v1",
+					displayName: "GLM-5.2 Local (bounded v1)",
+					accountId: "mac-studio",
+					logicalModel: "claude-fable-5",
+					exclusiveAccount: true,
+					contextWindow: 24_000,
+					maxOutputTokens: 4_000,
+				},
+			]),
+		);
+
+		expect(configured).toMatchObject({
+			exclusiveAccount: true,
+			contextWindow: 24_000,
+			maxOutputTokens: 4_000,
+		});
+	});
+
+	it("rejects malformed bounded exclusive settings", () => {
+		const exactProfile = {
+			id: "bounded-route",
+			displayName: "Bounded route",
+			accountId: "account",
+			logicalModel: "claude-fable-5",
+		};
+		const malformed = [
+			{ ...exactProfile, exclusiveAccount: "true" },
+			{ ...exactProfile, exclusiveAccount: 1 },
+			{ ...exactProfile, exclusiveAccount: null },
+			{ ...exactProfile, contextWindow: 24_000 },
+			{ ...exactProfile, maxOutputTokens: 4_000 },
+			{ ...exactProfile, contextWindow: "24000", maxOutputTokens: 4_000 },
+			{ ...exactProfile, contextWindow: 24_000, maxOutputTokens: "4000" },
+			{ ...exactProfile, contextWindow: 24_000.5, maxOutputTokens: 4_000 },
+			{ ...exactProfile, contextWindow: 24_000, maxOutputTokens: 4_000.5 },
+			{ ...exactProfile, contextWindow: 0, maxOutputTokens: 4_000 },
+			{ ...exactProfile, contextWindow: 24_000, maxOutputTokens: 0 },
+			{ ...exactProfile, contextWindow: -1, maxOutputTokens: 4_000 },
+			{ ...exactProfile, contextWindow: 24_000, maxOutputTokens: -1 },
+			{ ...exactProfile, contextWindow: 4_000, maxOutputTokens: 4_000 },
+			{ ...exactProfile, contextWindow: 3_999, maxOutputTokens: 4_000 },
+		];
+
+		for (const candidate of malformed) {
+			expect(() =>
+				parseModelRouteProfiles(JSON.stringify([candidate])),
+			).toThrow("CCFLARE_MODEL_ROUTE_PROFILES_JSON");
+		}
+	});
+
+	it("rejects exclusive accounts on capability profiles", () => {
+		expect(() =>
+			parseModelRouteProfiles(
+				JSON.stringify([
+					{
+						id: "capability-route",
+						displayName: "Capability route",
+						selection: "capability",
+						logicalModel: "claude-fable-5",
+						expectedProvider: "codex",
+						expectedPhysicalModel: "gpt-5.6-sol",
+						exclusiveAccount: true,
+					},
+				]),
+			),
+		).toThrow("CCFLARE_MODEL_ROUTE_PROFILES_JSON");
+	});
+
+	it("rejects bounded fields on capability profiles", () => {
+		expect(() =>
+			parseModelRouteProfiles(
+				JSON.stringify([
+					{
+						id: "bounded-capability-route",
+						displayName: "Bounded capability route",
+						selection: "capability",
+						logicalModel: "claude-fable-5",
+						expectedProvider: "codex",
+						expectedPhysicalModel: "gpt-5.6-sol",
+						contextWindow: 24_000,
+						maxOutputTokens: 4_000,
+					},
+				]),
+			),
+		).toThrow("CCFLARE_MODEL_ROUTE_PROFILES_JSON");
 	});
 
 	it("parses a capability profile without pinning an account", () => {
@@ -872,6 +963,41 @@ describe("ModelRouteSessionRegistry", () => {
 		expect(registry.size).toBe(0);
 	});
 
+	it("can inspect inherited bindings without extending their TTL", () => {
+		const configured = profile();
+		const clock = makeClock();
+		const registry = new ModelRouteSessionRegistry([configured], {
+			ttlMs: 1_000,
+			now: clock.now,
+		});
+		const root = {
+			callerIdentity: "caller",
+			requestModel: configured.publicModelId,
+			sessionId: "session",
+			isSubagent: false,
+		};
+		const child = {
+			callerIdentity: "caller",
+			requestModel: "claude-sonnet-4-5",
+			sessionId: "session",
+			isSubagent: true,
+		};
+		resolveAndCommit(registry, root);
+		clock.advance(999);
+
+		expect(
+			registry.resolve(child, null, { touchInheritedBinding: false }),
+		).toMatchObject({
+			kind: "route",
+			source: "inherited",
+			profile: configured,
+		});
+		clock.advance(1);
+
+		expect(resolveRequest(registry, child, null)).toEqual({ kind: "native" });
+		expect(registry.size).toBe(0);
+	});
+
 	it("evicts the oldest binding when the entry cap is reached", () => {
 		const configured = profile();
 		const clock = makeClock();
@@ -905,5 +1031,56 @@ describe("ModelRouteSessionRegistry", () => {
 				isSubagent: true,
 			}),
 		).toMatchObject({ kind: "route", source: "inherited" });
+	});
+
+	it("tracks exclusive accounts as profile-only across versioned exact profiles", () => {
+		const [boundedV1, boundedV2, ordinary] = parseModelRouteProfiles(
+			JSON.stringify([
+				{
+					id: "bounded-v1",
+					displayName: "Bounded v1",
+					accountId: "mac-studio",
+					logicalModel: "claude-fable-5",
+					exclusiveAccount: true,
+				},
+				{
+					id: "bounded-v2",
+					displayName: "Bounded v2",
+					accountId: "mac-studio",
+					logicalModel: "claude-fable-5",
+					exclusiveAccount: true,
+				},
+				{
+					id: "ordinary-route",
+					displayName: "Ordinary route",
+					accountId: "ordinary-account",
+					logicalModel: "claude-fable-5",
+				},
+			]),
+		);
+		if (!boundedV1 || !boundedV2 || !ordinary) {
+			throw new Error("Expected registry profiles to parse");
+		}
+		const registry = new ModelRouteSessionRegistry([
+			boundedV1,
+			boundedV2,
+			ordinary,
+		]);
+
+		expect(registry.isProfileOnlyAccount("mac-studio")).toBe(true);
+		expect(registry.isProfileOnlyAccount("ordinary-account")).toBe(false);
+		expect(registry.isProfileOnlyAccount("unknown-account")).toBe(false);
+		expect(registry.isExactProfileAccount(boundedV1, "mac-studio")).toBe(true);
+		expect(registry.isExactProfileAccount(boundedV2, "mac-studio")).toBe(true);
+		expect(registry.isExactProfileAccount(ordinary, "mac-studio")).toBe(false);
+		expect(
+			registry.isExactProfileRouteForAccount("bounded-v1", "mac-studio"),
+		).toBe(true);
+		expect(
+			registry.isExactProfileRouteForAccount("ordinary-route", "mac-studio"),
+		).toBe(false);
+		expect(
+			registry.isExactProfileRouteForAccount("unknown-route", "mac-studio"),
+		).toBe(false);
 	});
 });

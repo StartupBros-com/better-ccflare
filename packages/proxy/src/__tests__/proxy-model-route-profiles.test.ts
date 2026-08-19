@@ -47,6 +47,9 @@ mock.module("../model-catalog", () => ({
 }));
 
 const usageCollectorModule = await import("../usage-collector");
+const serverToolReplayRuntimeModule = await import(
+	"../server-tool-replay-runtime"
+);
 const { handleProxy } = await import("../proxy");
 
 const PROFILE_MODEL = "claude-bccf-route-pro-primary-sol";
@@ -129,7 +132,20 @@ function makeAccount(id = ROUTE_ACCOUNT_ID): Account {
 	};
 }
 
-function makeRegistry(profileOverrides: Record<string, unknown> = {}) {
+function makeClock(start = 1_000) {
+	let now = start;
+	return {
+		now: () => now,
+		advance: (ms: number) => {
+			now += ms;
+		},
+	};
+}
+
+function makeRegistry(
+	profileOverrides: Record<string, unknown> = {},
+	options?: ConstructorParameters<typeof ModelRouteSessionRegistry>[1],
+) {
 	return new ModelRouteSessionRegistry(
 		parseModelRouteProfiles(
 			JSON.stringify([
@@ -145,6 +161,7 @@ function makeRegistry(profileOverrides: Record<string, unknown> = {}) {
 				},
 			]),
 		),
+		options,
 	);
 }
 
@@ -471,6 +488,242 @@ describe("Claude Code gateway model route profiles", () => {
 		clearSession(sessionId);
 	});
 
+	it("forwards bounded profile output requests rematerialized at the 4k cap", async () => {
+		const harness = makeContext(
+			makeRegistry({ contextWindow: 24_000, maxOutputTokens: 4_000 }),
+		);
+		const { requests } = installJsonUpstream();
+
+		for (const maxTokens of [4_000, 8_000]) {
+			const request = apiRequest(
+				"/v1/messages",
+				PROFILE_MODEL,
+				{},
+				{
+					max_tokens: maxTokens,
+				},
+			);
+			expect(
+				(await handleProxy(request, new URL(request.url), harness.ctx, "key-1"))
+					.status,
+			).toBe(200);
+		}
+
+		expect(requests).toHaveLength(2);
+		for (const request of requests) {
+			expect((await fetchedJson(request)).max_tokens).toBe(4_000);
+		}
+	});
+
+	it("rejects invalid bounded requests before account selection or session commit", async () => {
+		const registry = makeRegistry({
+			contextWindow: 24_000,
+			maxOutputTokens: 4_000,
+		});
+		const harness = makeContext(registry);
+		const { fetchMock } = installJsonUpstream();
+		const request = apiRequest(
+			"/v1/messages",
+			PROFILE_MODEL,
+			{ "x-claude-code-session-id": "invalid-bounded-session" },
+			{ max_tokens: 0 },
+		);
+
+		const response = await handleProxy(
+			request,
+			new URL(request.url),
+			harness.ctx,
+			"key-1",
+		);
+
+		expect(response.status).toBe(400);
+		const payload = await response.json();
+		expect(payload).toEqual({
+			type: "error",
+			error: {
+				type: "invalid_request_error",
+				message:
+					"This bounded route profile requires a valid JSON request with a messages array and a finite positive max_tokens.",
+				code: "bounded_profile_invalid_request",
+			},
+		});
+		expect(JSON.stringify(payload)).not.toContain(ROUTE_ACCOUNT_ID);
+		expect(harness.getAllAccounts).toHaveBeenCalledTimes(0);
+		expect(harness.strategySelect).toHaveBeenCalledTimes(0);
+		expect(fetchMock).toHaveBeenCalledTimes(0);
+		expect(registry.size).toBe(0);
+	});
+
+	it("reports malformed explicit bounded requests with the stable error code", async () => {
+		const registry = makeRegistry({
+			contextWindow: 24_000,
+			maxOutputTokens: 4_000,
+		});
+		const harness = makeContext(registry);
+		const { fetchMock } = installJsonUpstream();
+		const request = apiRequest(
+			"/v1/messages",
+			PROFILE_MODEL,
+			{},
+			{
+				messages: { malformed: true },
+			},
+		);
+
+		const response = await handleProxy(
+			request,
+			new URL(request.url),
+			harness.ctx,
+			"key-1",
+		);
+
+		expect(response.status).toBe(400);
+		expect(await response.json()).toEqual({
+			type: "error",
+			error: {
+				type: "invalid_request_error",
+				message:
+					"This bounded route profile requires a valid JSON request with a messages array and a finite positive max_tokens.",
+				code: "bounded_profile_invalid_request",
+			},
+		});
+		expect(harness.getAllAccounts).not.toHaveBeenCalled();
+		expect(harness.strategySelect).not.toHaveBeenCalled();
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(registry.size).toBe(0);
+	});
+
+	it("preserves the generic malformed-message response for non-profile requests", async () => {
+		const harness = makeContext(makeRegistry());
+		const { fetchMock } = installJsonUpstream();
+		const request = apiRequest(
+			"/v1/messages",
+			CHILD_MODEL,
+			{},
+			{
+				messages: { malformed: true },
+			},
+		);
+
+		const response = await handleProxy(
+			request,
+			new URL(request.url),
+			harness.ctx,
+			"key-1",
+		);
+
+		expect(response.status).toBe(400);
+		expect(await response.json()).toEqual({
+			type: "error",
+			error: {
+				type: "invalid_request_error",
+				message:
+					"messages: Field required for /v1/messages endpoint. Internal events should not be proxied.",
+			},
+		});
+		expect(harness.getAllAccounts).not.toHaveBeenCalled();
+		expect(harness.strategySelect).not.toHaveBeenCalled();
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
+	it("rejects over-limit bounded requests before account selection or session commit", async () => {
+		const registry = makeRegistry({
+			contextWindow: 24_000,
+			maxOutputTokens: 4_000,
+		});
+		const harness = makeContext(registry);
+		const { fetchMock } = installJsonUpstream();
+		const request = apiRequest(
+			"/v1/messages",
+			PROFILE_MODEL,
+			{ "x-claude-code-session-id": "overflow-bounded-session" },
+			{
+				max_tokens: 4_000,
+				messages: [{ role: "user", content: "x".repeat(40_100) }],
+			},
+		);
+
+		const response = await handleProxy(
+			request,
+			new URL(request.url),
+			harness.ctx,
+			"key-1",
+		);
+
+		expect(response.status).toBe(400);
+		const payload = await response.json();
+		expect(payload).toEqual({
+			type: "error",
+			error: {
+				type: "invalid_request_error",
+				message:
+					"This request exceeds the bounded route profile context limit.",
+				code: "bounded_profile_context_length_exceeded",
+			},
+		});
+		expect(JSON.stringify(payload)).not.toContain(ROUTE_ACCOUNT_ID);
+		expect(harness.getAllAccounts).toHaveBeenCalledTimes(0);
+		expect(harness.strategySelect).toHaveBeenCalledTimes(0);
+		expect(fetchMock).toHaveBeenCalledTimes(0);
+		expect(registry.size).toBe(0);
+	});
+
+	it("rejects deferred custom tools on bounded profiles before selection or server-tool handling", async () => {
+		const registry = makeRegistry({
+			contextWindow: 24_000,
+			maxOutputTokens: 4_000,
+		});
+		const harness = makeContext(registry);
+		const { fetchMock } = installJsonUpstream();
+		const request = apiRequest(
+			"/v1/messages",
+			PROFILE_MODEL,
+			{ "x-claude-code-session-id": "deferred-tool-bounded-session" },
+			{
+				tools: [
+					{
+						name: "deferred_lookup",
+						input_schema: { type: "object" },
+						defer_loading: true,
+					},
+				],
+			},
+		);
+
+		const replayBindingSpy = spyOn(
+			serverToolReplayRuntimeModule,
+			"bindRequestPrivateServerToolReplay",
+		);
+		try {
+			const response = await handleProxy(
+				request,
+				new URL(request.url),
+				harness.ctx,
+				"key-1",
+			);
+
+			expect(response.status).toBe(400);
+			const payload = await response.json();
+			expect(payload).toEqual({
+				type: "error",
+				error: {
+					type: "invalid_request_error",
+					message:
+						"This profile does not support deferred custom tools. Select a native Anthropic route or start a fresh non-Anthropic client with ENABLE_TOOL_SEARCH=0.",
+					code: "bounded_profile_deferred_tools_unsupported",
+				},
+			});
+			expect(JSON.stringify(payload)).not.toContain(ROUTE_ACCOUNT_ID);
+			expect(harness.getAllAccounts).toHaveBeenCalledTimes(0);
+			expect(harness.strategySelect).toHaveBeenCalledTimes(0);
+			expect(fetchMock).toHaveBeenCalledTimes(0);
+			expect(registry.size).toBe(0);
+			expect(replayBindingSpy).not.toHaveBeenCalled();
+		} finally {
+			replayBindingSpy.mockRestore();
+		}
+	});
+
 	it("preserves explicit max effort and every other output_config field", async () => {
 		const harness = makeContext(makeRegistry());
 		const { requests } = installJsonUpstream();
@@ -557,6 +810,214 @@ describe("Claude Code gateway model route profiles", () => {
 		expect(upstream.model).toBe(CHILD_MODEL);
 		expect(upstream.output_config).toBeUndefined();
 		expect(harness.strategySelect).toHaveBeenCalledTimes(0);
+	});
+
+	it("clamps inherited child profile output without changing its model pin", async () => {
+		const fallback = makeAccount("normal-route");
+		const harness = makeContext(
+			makeRegistry({ contextWindow: 24_000, maxOutputTokens: 4_000 }),
+			{
+				accounts: [makeAccount(), fallback],
+				normalAccountId: fallback.id,
+			},
+		);
+		const { requests } = installJsonUpstream();
+		const session = { "x-claude-code-session-id": "bounded-child-session" };
+		const root = apiRequest("/v1/messages", PROFILE_MODEL, session);
+		expect(
+			(await handleProxy(root, new URL(root.url), harness.ctx, "key-1")).status,
+		).toBe(200);
+
+		const child = apiRequest(
+			"/v1/messages",
+			CHILD_MODEL,
+			{
+				...session,
+				"x-claude-code-agent-id": "bounded-child",
+			},
+			{ max_tokens: 8_000 },
+		);
+		expect(
+			(await handleProxy(child, new URL(child.url), harness.ctx, "key-1"))
+				.status,
+		).toBe(200);
+
+		expect(requests[1]?.url).toContain(`/${ROUTE_ACCOUNT_ID}/`);
+		expect(await fetchedJson(requests[1])).toMatchObject({
+			model: CHILD_MODEL,
+			max_tokens: 4_000,
+		});
+		expect(harness.strategySelect).toHaveBeenCalledTimes(0);
+	});
+
+	it("reports malformed inherited bounded requests with the stable error code", async () => {
+		const registry = makeRegistry({
+			contextWindow: 24_000,
+			maxOutputTokens: 4_000,
+		});
+		const harness = makeContext(registry);
+		const { fetchMock, requests } = installJsonUpstream();
+		const session = { "x-claude-code-session-id": "malformed-bounded-child" };
+		const root = apiRequest("/v1/messages", PROFILE_MODEL, session);
+		expect(
+			(await handleProxy(root, new URL(root.url), harness.ctx, "key-1")).status,
+		).toBe(200);
+
+		const child = apiRequest(
+			"/v1/messages",
+			CHILD_MODEL,
+			{
+				...session,
+				"x-claude-code-agent-id": "malformed-bounded-child-agent",
+			},
+			{ messages: { malformed: true } },
+		);
+		const response = await handleProxy(
+			child,
+			new URL(child.url),
+			harness.ctx,
+			"key-1",
+		);
+
+		expect(response.status).toBe(400);
+		expect(await response.json()).toEqual({
+			type: "error",
+			error: {
+				type: "invalid_request_error",
+				message:
+					"This bounded route profile requires a valid JSON request with a messages array and a finite positive max_tokens.",
+				code: "bounded_profile_invalid_request",
+			},
+		});
+		expect(requests).toHaveLength(1);
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(harness.getAllAccounts).toHaveBeenCalledTimes(1);
+		expect(harness.strategySelect).not.toHaveBeenCalled();
+		expect(registry.size).toBe(1);
+	});
+
+	it("does not refresh a bounded inherited binding for an unparseable child, while admitted children refresh it", async () => {
+		const clock = makeClock();
+		const registry = makeRegistry(
+			{ contextWindow: 24_000, maxOutputTokens: 4_000 },
+			{ ttlMs: 1_000, now: clock.now },
+		);
+		const fallback = makeAccount("normal-route");
+		const harness = makeContext(registry, {
+			accounts: [makeAccount(), fallback],
+			normalAccountId: fallback.id,
+		});
+		const { requests } = installJsonUpstream();
+		const malformedSession = {
+			"x-claude-code-session-id": "unparseable-bounded-child",
+		};
+		const malformedRoot = apiRequest(
+			"/v1/messages",
+			PROFILE_MODEL,
+			malformedSession,
+		);
+		expect(
+			(
+				await handleProxy(
+					malformedRoot,
+					new URL(malformedRoot.url),
+					harness.ctx,
+					"key-1",
+				)
+			).status,
+		).toBe(200);
+
+		clock.advance(999);
+		const malformedChild = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				...malformedSession,
+				"x-claude-code-agent-id": "unparseable-bounded-child-agent",
+			},
+			body: "not-json",
+		});
+		const rejected = await handleProxy(
+			malformedChild,
+			new URL(malformedChild.url),
+			harness.ctx,
+			"key-1",
+		);
+		expect(rejected.status).toBe(400);
+		expect(await rejected.json()).toMatchObject({
+			error: { code: "bounded_profile_invalid_request" },
+		});
+
+		clock.advance(1);
+		const expiredChild = apiRequest("/v1/messages", CHILD_MODEL, {
+			...malformedSession,
+			"x-claude-code-agent-id": "child-after-unparseable-expiry",
+		});
+		expect(
+			(
+				await handleProxy(
+					expiredChild,
+					new URL(expiredChild.url),
+					harness.ctx,
+					"key-1",
+				)
+			).status,
+		).toBe(200);
+		expect(requests[1]?.url).toContain("/normal-route/");
+
+		const admittedSession = {
+			"x-claude-code-session-id": "admitted-bounded-child",
+		};
+		const admittedRoot = apiRequest(
+			"/v1/messages",
+			PROFILE_MODEL,
+			admittedSession,
+		);
+		expect(
+			(
+				await handleProxy(
+					admittedRoot,
+					new URL(admittedRoot.url),
+					harness.ctx,
+					"key-1",
+				)
+			).status,
+		).toBe(200);
+		clock.advance(999);
+		const admittedChild = apiRequest("/v1/messages", CHILD_MODEL, {
+			...admittedSession,
+			"x-claude-code-agent-id": "admitted-bounded-child-agent",
+		});
+		expect(
+			(
+				await handleProxy(
+					admittedChild,
+					new URL(admittedChild.url),
+					harness.ctx,
+					"key-1",
+				)
+			).status,
+		).toBe(200);
+		clock.advance(1);
+		const refreshedChild = apiRequest("/v1/messages", CHILD_MODEL, {
+			...admittedSession,
+			"x-claude-code-agent-id": "child-after-admitted-refresh",
+		});
+		expect(
+			(
+				await handleProxy(
+					refreshedChild,
+					new URL(refreshedChild.url),
+					harness.ctx,
+					"key-1",
+				)
+			).status,
+		).toBe(200);
+		expect(
+			requests
+				.slice(2)
+				.every((request) => request.url.includes(`/${ROUTE_ACCOUNT_ID}/`)),
+		).toBe(true);
 	});
 
 	it("clears a session binding on a native root model selection", async () => {
@@ -1313,6 +1774,13 @@ describe("Claude Code gateway model route profiles", () => {
 		const { requests } = installJsonUpstream();
 		const body = {
 			output_config: { effort: "medium", service_tier: "auto" },
+			tools: [
+				{
+					name: "deferred_lookup",
+					input_schema: { type: "object" },
+					defer_loading: true,
+				},
+			],
 		};
 		const request = apiRequest("/v1/messages", CHILD_MODEL, {}, body);
 		expect(

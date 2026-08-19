@@ -22,6 +22,9 @@ const PROFILE_KEYS = new Set([
 	"defaultEffort",
 	"expectedProvider",
 	"expectedPhysicalModel",
+	"exclusiveAccount",
+	"contextWindow",
+	"maxOutputTokens",
 ]);
 
 const EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
@@ -47,6 +50,25 @@ export interface ModelRouteProfile {
 	readonly defaultEffort?: ModelRouteEffort;
 	readonly expectedProvider?: string;
 	readonly expectedPhysicalModel?: string;
+	/** An account reserved for exact configured route profiles. */
+	readonly exclusiveAccount?: boolean;
+	/** Maximum total input and output tokens for an explicit bounded profile. */
+	readonly contextWindow?: number;
+	/** Maximum response tokens for an explicit bounded profile. */
+	readonly maxOutputTokens?: number;
+}
+
+export type BoundedModelRouteProfile = ModelRouteProfile & {
+	readonly contextWindow: number;
+	readonly maxOutputTokens: number;
+};
+
+export function isBoundedModelRouteProfile(
+	profile: ModelRouteProfile,
+): profile is BoundedModelRouteProfile {
+	return (
+		profile.contextWindow !== undefined && profile.maxOutputTokens !== undefined
+	);
 }
 
 function configError(message: string): Error {
@@ -89,6 +111,34 @@ function optionalString(
 ): string | undefined {
 	if (!(key in entry)) return undefined;
 	return requiredString(entry, key, index, maxLength);
+}
+
+function optionalBoolean(
+	entry: Record<string, unknown>,
+	key: string,
+	index: number,
+): boolean | undefined {
+	if (!(key in entry)) return undefined;
+	const value = entry[key];
+	if (typeof value !== "boolean") {
+		throw configError(`profile ${index} field ${key} must be a boolean`);
+	}
+	return value;
+}
+
+function optionalPositiveInteger(
+	entry: Record<string, unknown>,
+	key: string,
+	index: number,
+): number | undefined {
+	if (!(key in entry)) return undefined;
+	const value = entry[key];
+	if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
+		throw configError(
+			`profile ${index} field ${key} must be a positive integer`,
+		);
+	}
+	return value;
 }
 
 /**
@@ -184,6 +234,47 @@ export function parseModelRouteProfiles(
 			);
 		}
 
+		const exclusiveAccount = optionalBoolean(
+			candidate,
+			"exclusiveAccount",
+			index,
+		);
+		if (selection === "capability" && exclusiveAccount !== undefined) {
+			throw configError(
+				`profile ${index} capability selection must omit exclusiveAccount`,
+			);
+		}
+
+		const contextWindow = optionalPositiveInteger(
+			candidate,
+			"contextWindow",
+			index,
+		);
+		const maxOutputTokens = optionalPositiveInteger(
+			candidate,
+			"maxOutputTokens",
+			index,
+		);
+		if ((contextWindow === undefined) !== (maxOutputTokens === undefined)) {
+			throw configError(
+				`profile ${index} fields contextWindow and maxOutputTokens must be provided together`,
+			);
+		}
+		if (selection === "capability" && contextWindow !== undefined) {
+			throw configError(
+				`profile ${index} capability selection must omit contextWindow and maxOutputTokens`,
+			);
+		}
+		if (
+			contextWindow !== undefined &&
+			maxOutputTokens !== undefined &&
+			maxOutputTokens >= contextWindow
+		) {
+			throw configError(
+				`profile ${index} field maxOutputTokens must be less than contextWindow`,
+			);
+		}
+
 		const expectedProvider = optionalString(
 			candidate,
 			"expectedProvider",
@@ -226,6 +317,9 @@ export function parseModelRouteProfiles(
 			),
 			...(accountId === undefined ? {} : { accountId }),
 			...(selection === undefined ? {} : { selection }),
+			...(exclusiveAccount === undefined ? {} : { exclusiveAccount }),
+			...(contextWindow === undefined ? {} : { contextWindow }),
+			...(maxOutputTokens === undefined ? {} : { maxOutputTokens }),
 			logicalModel: requiredString(
 				candidate,
 				"logicalModel",
@@ -301,6 +395,8 @@ export class ModelRouteSessionRegistry {
 		string,
 		ModelRouteProfile
 	>;
+	private readonly profilesById: ReadonlyMap<string, ModelRouteProfile>;
+	private readonly profileOnlyAccountIds: ReadonlySet<string>;
 	private readonly sessions = new Map<string, ModelRouteSessionState>();
 	private readonly rootIntents = new Map<string, ModelRouteRootIntentState>();
 	private readonly ttlMs: number;
@@ -323,6 +419,20 @@ export class ModelRouteSessionRegistry {
 				"Model route session entry cap must be a positive integer",
 			);
 		}
+		const profileOnlyAccountIds = new Set<string>();
+		for (const profile of profiles) {
+			if (
+				profile.exclusiveAccount &&
+				profile.selection === undefined &&
+				profile.accountId !== undefined
+			) {
+				profileOnlyAccountIds.add(profile.accountId);
+			}
+		}
+		this.profileOnlyAccountIds = profileOnlyAccountIds;
+		this.profilesById = new Map(
+			profiles.map((profile) => [profile.id, profile]),
+		);
 		this.profilesByPublicModelId = new Map(
 			profiles.map((profile) => [profile.publicModelId, profile]),
 		);
@@ -338,6 +448,24 @@ export class ModelRouteSessionRegistry {
 
 	hasPublicModelId(modelId: string): boolean {
 		return this.profilesByPublicModelId.has(modelId);
+	}
+
+	isProfileOnlyAccount(accountId: string): boolean {
+		return this.profileOnlyAccountIds.has(accountId);
+	}
+
+	isExactProfileAccount(
+		profile: ModelRouteProfile,
+		accountId: string,
+	): boolean {
+		return profile.selection === undefined && profile.accountId === accountId;
+	}
+
+	isExactProfileRouteForAccount(profileId: string, accountId: string): boolean {
+		const profile = this.profilesById.get(profileId);
+		return (
+			profile !== undefined && this.isExactProfileAccount(profile, accountId)
+		);
 	}
 
 	getDiscoveryModels(): ReadonlyArray<{
@@ -371,13 +499,17 @@ export class ModelRouteSessionRegistry {
 	resolve(
 		input: ModelRouteResolutionInput,
 		rootIntentGeneration: number | null = null,
+		options: { readonly touchInheritedBinding?: boolean } = {},
 	): ModelRouteResolution {
 		const requestModel = input.requestModel?.trim() ?? "";
 		const explicitProfile = this.profilesByPublicModelId.get(requestModel);
 		const bindingKey = this.bindingKey(input.callerIdentity, input.sessionId);
 		if (input.isSubagent) {
 			if (bindingKey) {
-				const inherited = this.getBinding(bindingKey);
+				const inherited = this.getBinding(
+					bindingKey,
+					options.touchInheritedBinding !== false,
+				);
 				if (inherited) {
 					return {
 						kind: "route",
@@ -479,9 +611,12 @@ export class ModelRouteSessionRegistry {
 		return state;
 	}
 
-	private getBinding(key: string): ModelRouteProfile | undefined {
+	private getBinding(
+		key: string,
+		touchBinding = true,
+	): ModelRouteProfile | undefined {
 		const now = this.now();
-		const state = this.getSessionState(key, now, true);
+		const state = this.getSessionState(key, now, touchBinding);
 		return state?.profile;
 	}
 

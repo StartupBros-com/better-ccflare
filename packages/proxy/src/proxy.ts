@@ -99,7 +99,9 @@ import {
 import {
 	type AnthropicDegradedRequestSendState,
 	type AnthropicDegradedSendDenied,
+	admitBoundedModelRouteProfileRequest,
 	createAnthropicDegradedNoAccountDenial,
+	createBoundedModelRouteAdmissionResponse,
 	discardUpstreamBody,
 	isAnthropicDegradedSendDenied,
 	type ProxyWithAccountResult,
@@ -113,6 +115,7 @@ import { getRequestRateLimitOutcomes } from "./handlers/rate-limit-scope";
 import { createProtectedAnthropicOverloadResponse } from "./handlers/routing-terminal";
 import { consumeInternalAutoRefreshAuth } from "./internal-probe-auth";
 import {
+	isBoundedModelRouteProfile,
 	MODEL_ROUTE_PROFILE_MODEL_PREFIX,
 	type ModelRouteProfile,
 } from "./model-route-profiles";
@@ -844,6 +847,7 @@ async function handleProxyCoreImpl(
 	const requestModel = requestBodyContext.getModel();
 	const normalizedRequestModel = requestModel?.trim() ?? null;
 	const modelRouteRegistry = ctx.modelRouteSessionRegistry;
+	const isSubagent = isClaudeCodeSubagent(req.headers);
 	const { project, projectAttributionSource } =
 		extractProjectAttributionFromRequest(req.headers, parsedBody);
 
@@ -852,6 +856,35 @@ async function handleProxyCoreImpl(
 		if (parsedBody) {
 			// Reject requests without messages field (e.g., Claude Code internal events)
 			if (!parsedBody.messages || !Array.isArray(parsedBody.messages)) {
+				const malformedRouteResolution =
+					modelRouteRegistry &&
+					(isSubagent ||
+						(normalizedRequestModel !== null &&
+							modelRouteRegistry.hasPublicModelId(normalizedRequestModel)))
+						? modelRouteRegistry.resolve(
+								{
+									callerIdentity: routeCallerIdentity(req, apiKeyId),
+									requestModel: normalizedRequestModel,
+									sessionId: req.headers.get("x-claude-code-session-id"),
+									isSubagent,
+								},
+								rootIntentGeneration,
+								{ touchInheritedBinding: false },
+							)
+						: undefined;
+				if (
+					malformedRouteResolution?.kind === "route" &&
+					malformedRouteResolution.profile.selection === undefined &&
+					isBoundedModelRouteProfile(malformedRouteResolution.profile)
+				) {
+					const admission = admitBoundedModelRouteProfileRequest(
+						malformedRouteResolution.profile,
+						requestBodyContext,
+					);
+					if (admission.status === "reject") {
+						return createBoundedModelRouteAdmissionResponse(admission);
+					}
+				}
 				log.warn(
 					`Rejected invalid request to /v1/messages without messages field`,
 					{
@@ -931,7 +964,6 @@ async function handleProxyCoreImpl(
 			: new RequestBodyContext(finalBodyBuffer);
 	const effectiveModelAfterInterception =
 		finalRequestBodyContext.getModel()?.trim() ?? null;
-	const isSubagent = isClaudeCodeSubagent(req.headers);
 	const originalReservedPicker =
 		normalizedRequestModel?.startsWith(MODEL_ROUTE_PROFILE_MODEL_PREFIX) ===
 		true;
@@ -968,6 +1000,7 @@ async function handleProxyCoreImpl(
 	const modelRouteResolution = modelRouteRegistry?.resolve(
 		modelRouteResolutionInput,
 		rootIntentGeneration,
+		{ touchInheritedBinding: !finalRequestBodyContext.hasParseFailed },
 	);
 	// A native root remains native even if an agent preference injects a reserved
 	// picker after /model selection. Resolve first so the authoritative native
@@ -1014,6 +1047,32 @@ async function handleProxyCoreImpl(
 			appliedModel = profile.logicalModel;
 			requestMeta.routeExpectedPhysicalModel = profile.expectedPhysicalModel;
 		}
+	}
+	if (
+		url.pathname === "/v1/messages" &&
+		modelRouteResolution?.kind === "route" &&
+		modelRouteResolution.profile.selection === undefined &&
+		isBoundedModelRouteProfile(modelRouteResolution.profile)
+	) {
+		const admission = admitBoundedModelRouteProfileRequest(
+			modelRouteResolution.profile,
+			finalRequestBodyContext,
+		);
+		log.info("bounded_model_route_admission", {
+			profileId: admission.profileId,
+			estimatedInputTokens: admission.estimatedInputTokens,
+			contextWindow: admission.contextWindow,
+			requestedMaxOutputTokens: admission.requestedMaxOutputTokens,
+			effectiveMaxOutputTokens: admission.effectiveMaxOutputTokens,
+			clamped: admission.clamped,
+			outcome: admission.status === "admit" ? "admit" : admission.code,
+		});
+		if (admission.status === "reject") {
+			return createBoundedModelRouteAdmissionResponse(admission);
+		}
+		// The body context is authoritative for semantic mutation, but transport
+		// receives this saved buffer. Rematerialize after output clamping.
+		finalBodyBuffer = finalRequestBodyContext.getBuffer();
 	}
 	const finalCreateBodyStream = () => {
 		if (!finalBodyBuffer) return undefined;

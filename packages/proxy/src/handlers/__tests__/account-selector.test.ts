@@ -20,6 +20,10 @@ import type {
 } from "../../anthropic-degraded-mode";
 import { CacheAffinityOrderer } from "../../cache-affinity-orderer";
 import { DegradedOwnerOverlay } from "../../degraded-owner-overlay";
+import {
+	ModelRouteSessionRegistry,
+	parseModelRouteProfiles,
+} from "../../model-route-profiles";
 import type { ProxyContext } from "../proxy-types";
 
 const { getProvider, registerProvider, usageCache } = await import(
@@ -148,6 +152,37 @@ function makeCtx(
 		refreshInFlight: new Map(),
 		asyncWriter: { enqueue: mock(() => {}) },
 	} as unknown as ProxyContext;
+}
+
+function makeProfileOnlyRegistry(
+	accountId: string,
+	options: { exclusive?: boolean; includeCapabilityProfile?: boolean } = {},
+): ModelRouteSessionRegistry {
+	return new ModelRouteSessionRegistry(
+		parseModelRouteProfiles(
+			JSON.stringify([
+				{
+					id: "exclusive-route",
+					displayName: "Exclusive route",
+					accountId,
+					logicalModel: "claude-fable-5",
+					...(options.exclusive === false ? {} : { exclusiveAccount: true }),
+				},
+				...(options.includeCapabilityProfile
+					? [
+							{
+								id: "capability-route",
+								displayName: "Capability route",
+								selection: "capability",
+								logicalModel: "claude-fable-5",
+								expectedProvider: "anthropic",
+								expectedPhysicalModel: "local-champion",
+							},
+						]
+					: []),
+			]),
+		),
+	);
 }
 
 function useSessionStrategy(ctx: ProxyContext): {
@@ -959,6 +994,173 @@ describe("selectAccountsForRequest — x-better-ccflare-account-id header", () =
 			reason: "lookup_failed",
 		});
 		expect(ctx.strategy.select).not.toHaveBeenCalled();
+	});
+});
+
+describe("selectAccountsForRequest — profile-only account eligibility", () => {
+	it("rejects a public force route to a profile-only account", async () => {
+		const exclusive = makeAccount({ id: "profile-only" });
+		const fallback = makeAccount({ id: "ordinary" });
+		const ctx = makeCtx({ accounts: [exclusive, fallback] });
+		ctx.modelRouteSessionRegistry = makeProfileOnlyRegistry(exclusive.id);
+		const meta = makeRequestMeta({
+			headers: new Headers({
+				"x-better-ccflare-account-id": exclusive.id,
+			}),
+		});
+
+		await expect(selectAccountsForRequest(meta, ctx)).rejects.toBeInstanceOf(
+			ForceRouteUnavailableError,
+		);
+		expect(ctx.strategy.select).not.toHaveBeenCalled();
+	});
+
+	it("excludes profile-only accounts from ordinary strategy candidates", async () => {
+		const exclusive = makeAccount({ id: "profile-only", priority: 0 });
+		const ordinary = makeAccount({ id: "ordinary", priority: 1 });
+		const ctx = makeCtx({ accounts: [exclusive, ordinary] });
+		ctx.modelRouteSessionRegistry = makeProfileOnlyRegistry(exclusive.id);
+
+		const result = await selectAccountsForRequest(makeRequestMeta(), ctx);
+
+		expect(result).toEqual([ordinary]);
+		expect(ctx.strategy.select).toHaveBeenCalledWith(
+			[ordinary],
+			expect.anything(),
+		);
+	});
+
+	it("excludes profile-only accounts from combo membership", async () => {
+		const exclusive = makeAccount({ id: "profile-only" });
+		const ordinary = makeAccount({ id: "ordinary" });
+		const combo = makeCombo([
+			{
+				id: "exclusive-slot",
+				combo_id: "combo-1",
+				account_id: exclusive.id,
+				model: "claude-fable-5",
+				priority: 0,
+				enabled: true,
+			},
+			{
+				id: "ordinary-slot",
+				combo_id: "combo-1",
+				account_id: ordinary.id,
+				model: "claude-fable-5",
+				priority: 1,
+				enabled: true,
+			},
+		]);
+		const ctx = makeCtx({
+			accounts: [exclusive, ordinary],
+			activeCombo: combo,
+		});
+		ctx.modelRouteSessionRegistry = makeProfileOnlyRegistry(exclusive.id);
+		const meta = makeRequestMeta();
+
+		const result = await selectAccountsForRequest(meta, ctx, "claude-fable-5");
+
+		expect(result).toEqual([ordinary]);
+		expect(
+			meta.routingCandidateCatalog?.map((candidate) => candidate.accountId),
+		).toEqual([ordinary.id]);
+	});
+
+	it("excludes profile-only accounts from capability-profile pools", async () => {
+		const exclusive = makeAccount({
+			id: "profile-only",
+			model_mappings: JSON.stringify({ fable: "local-champion" }),
+		});
+		const ctx = makeCtx({ accounts: [exclusive] });
+		ctx.modelRouteSessionRegistry = makeProfileOnlyRegistry(exclusive.id, {
+			includeCapabilityProfile: true,
+		});
+		const meta = makeRequestMeta({
+			routeProfileId: "capability-route",
+			routeProfileSelection: "capability",
+			routeProfileLogicalModel: "claude-fable-5",
+			routeProfileExpectedPhysicalModel: "local-champion",
+			routeExpectedProvider: "anthropic",
+		});
+
+		await expect(
+			selectAccountsForRequest(meta, ctx, "claude-fable-5"),
+		).rejects.toMatchObject({ reason: "model_mapping_mismatch" });
+		expect(ctx.strategy.select).toHaveBeenCalledWith([], expect.anything());
+	});
+
+	it("excludes profile-only combo slots before implicit session fallback", async () => {
+		const exclusive = makeAccount({ id: "profile-only" });
+		const ordinary = makeAccount({ id: "ordinary" });
+		const combo = makeCombo([
+			{
+				id: "exclusive-slot",
+				combo_id: "combo-1",
+				account_id: exclusive.id,
+				model: "claude-fable-5",
+				priority: 0,
+				enabled: true,
+			},
+		]);
+		const ctx = makeCtx({
+			accounts: [exclusive, ordinary],
+			activeCombo: combo,
+		});
+		ctx.modelRouteSessionRegistry = makeProfileOnlyRegistry(exclusive.id);
+		const meta = makeRequestMeta();
+
+		const result = await selectAccountsForRequest(meta, ctx, "claude-fable-5");
+
+		expect(result).toEqual([ordinary]);
+		expect(
+			meta.routingCandidateCatalog?.map((candidate) => candidate.accountId),
+		).toEqual([ordinary.id]);
+	});
+
+	it("allows an unpaused profile-only account for its exact configured profile", async () => {
+		const exclusive = makeAccount({ id: "profile-only" });
+		const ctx = makeCtx({ accounts: [exclusive] });
+		ctx.modelRouteSessionRegistry = makeProfileOnlyRegistry(exclusive.id);
+		const meta = makeRequestMeta({
+			forcedAccountId: exclusive.id,
+			routeProfileId: "exclusive-route",
+		});
+
+		await expect(
+			selectAccountsForRequest(meta, ctx, "claude-fable-5"),
+		).resolves.toEqual([exclusive]);
+		expect(ctx.strategy.select).not.toHaveBeenCalled();
+	});
+
+	it("keeps a manually paused profile-only account unavailable to its exact profile", async () => {
+		const exclusive = makeAccount({
+			id: "profile-only",
+			paused: true,
+			pause_reason: "manual",
+		});
+		const ctx = makeCtx({ accounts: [exclusive] });
+		ctx.modelRouteSessionRegistry = makeProfileOnlyRegistry(exclusive.id);
+		const meta = makeRequestMeta({
+			forcedAccountId: exclusive.id,
+			routeProfileId: "exclusive-route",
+		});
+
+		await expect(
+			selectAccountsForRequest(meta, ctx, "claude-fable-5"),
+		).rejects.toMatchObject({ accountId: exclusive.id, reason: "paused" });
+		expect(ctx.strategy.select).not.toHaveBeenCalled();
+	});
+
+	it("preserves ordinary routing for exact profiles without exclusiveAccount", async () => {
+		const ordinary = makeAccount({ id: "ordinary-profile-account" });
+		const ctx = makeCtx({ accounts: [ordinary] });
+		ctx.modelRouteSessionRegistry = makeProfileOnlyRegistry(ordinary.id, {
+			exclusive: false,
+		});
+
+		await expect(
+			selectAccountsForRequest(makeRequestMeta(), ctx),
+		).resolves.toEqual([ordinary]);
 	});
 });
 

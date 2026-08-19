@@ -10,6 +10,7 @@ import {
 	deriveComboRouteClass,
 	estimateAnthropicAdmissionTokens,
 	estimateAnthropicRequestTokens,
+	hasDeferredCustomTool,
 	MODEL_CONTEXT_WINDOWS,
 	resolveAccountLogicalModelCapability,
 	resolveModelContextCapability,
@@ -574,6 +575,98 @@ describe("estimateAnthropicAdmissionTokens", () => {
 		});
 		expect(emoji.tokens).toBeGreaterThan(ascii.tokens * 2);
 		expect(cjk.tokens).toBeGreaterThan(ascii.tokens * 1.5);
+	});
+});
+
+describe("hasDeferredCustomTool", () => {
+	it("returns false when the request has no tools", () => {
+		expect(hasDeferredCustomTool({ messages: [] })).toBeFalse();
+	});
+
+	it("returns false for an ordinary tool without a deferred marker", () => {
+		expect(
+			hasDeferredCustomTool({
+				tools: [
+					{
+						name: "lookup",
+						input_schema: { type: "object" },
+					},
+				],
+			}),
+		).toBeFalse();
+	});
+
+	it("detects an ordinary tool marked defer_loading true", () => {
+		expect(
+			hasDeferredCustomTool({
+				tools: [
+					{
+						name: "lookup",
+						input_schema: { type: "object" },
+						defer_loading: true,
+					},
+				],
+			}),
+		).toBeTrue();
+	});
+
+	it("does not detect an ordinary tool marked defer_loading false", () => {
+		expect(
+			hasDeferredCustomTool({
+				tools: [
+					{
+						name: "lookup",
+						input_schema: { type: "object" },
+						defer_loading: false,
+					},
+				],
+			}),
+		).toBeFalse();
+	});
+
+	it("detects a deferred ordinary tool within a mixed declaration list", () => {
+		expect(
+			hasDeferredCustomTool({
+				tools: [
+					{ type: "web_search_20250305", defer_loading: true },
+					{
+						name: "lookup",
+						input_schema: { type: "object" },
+					},
+					{
+						name: "deferred_lookup",
+						input_schema: { type: "object" },
+						defer_loading: true,
+					},
+				],
+			}),
+		).toBeTrue();
+	});
+
+	it("ignores malformed, non-object, and typed tool entries", () => {
+		expect(
+			hasDeferredCustomTool({
+				tools: [
+					null,
+					"not-a-tool",
+					42,
+					[],
+					{},
+					{ defer_loading: true },
+					{
+						name: "missing-schema",
+						input_schema: null,
+						defer_loading: true,
+					},
+					{
+						type: "web_search_20250305",
+						name: "typed-tool",
+						input_schema: { type: "object" },
+						defer_loading: true,
+					},
+				],
+			}),
+		).toBeFalse();
 	});
 });
 

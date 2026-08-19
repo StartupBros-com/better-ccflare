@@ -1472,6 +1472,27 @@ function isProviderExcludedForRequest(
 	return false;
 }
 
+/**
+ * Profile-only accounts are reserved for an active configured exact route.
+ * `forcedAccountId` is server-derived for profiles, so a public force header
+ * alone cannot satisfy this gate.
+ */
+function isAccountEligibleForRouteIntent(
+	account: Account,
+	meta: RequestMeta,
+	ctx: ProxyContext,
+): boolean {
+	const registry = ctx.modelRouteSessionRegistry;
+	if (!registry?.isProfileOnlyAccount(account.id)) return true;
+	const profileId = meta.routeProfileId?.trim();
+	const forcedAccountId = meta.forcedAccountId?.trim();
+	return (
+		profileId !== undefined &&
+		forcedAccountId === account.id &&
+		registry.isExactProfileRouteForAccount(profileId, account.id)
+	);
+}
+
 export type ImplicitFallbackPolicyDecisionReason =
 	| "off"
 	| "allowed"
@@ -1702,9 +1723,12 @@ export async function getOrderedAccounts(
 	try {
 		const loadedAccounts =
 			preloadedAccounts ?? (await ctx.dbOps.getAllAccounts());
-		const allAccounts = preselectionFilter
+		const preselectedAccounts = preselectionFilter
 			? preselectionFilter(loadedAccounts)
 			: loadedAccounts;
+		const allAccounts = preselectedAccounts.filter((account) =>
+			isAccountEligibleForRouteIntent(account, meta, ctx),
+		);
 		const excludedProviders = meta.serverToolRequirements
 			? getExcludedProviders(meta)
 			: [];
@@ -1879,6 +1903,12 @@ async function selectAccountsForRequestInternal(
 			);
 			if (!forcedAccount) {
 				throw new ForceRouteUnavailableError(forcedAccountId, "not_found");
+			}
+			if (!isAccountEligibleForRouteIntent(forcedAccount, meta, ctx)) {
+				throw new ForceRouteUnavailableError(
+					forcedAccountId,
+					"rate_limited_or_unavailable",
+				);
 			}
 			setXaiCacheEligibleAccounts(meta, [forcedAccount]);
 			if (
@@ -2093,6 +2123,7 @@ async function selectAccountsForRequestInternal(
 		const excludedProviders = getExcludedProviders(meta);
 		const matchingAccounts = allAccounts.filter(
 			(account) =>
+				isAccountEligibleForRouteIntent(account, meta, ctx) &&
 				matchesCapabilityRouteProfile(account, meta) &&
 				!isProviderExcludedForRequest(account, excludedProviders),
 		);
@@ -2107,6 +2138,7 @@ async function selectAccountsForRequestInternal(
 			(accounts) =>
 				accounts.filter(
 					(account) =>
+						isAccountEligibleForRouteIntent(account, meta, ctx) &&
 						matchesCapabilityRouteProfile(account, meta) &&
 						!isProviderExcludedForRequest(account, excludedProviders),
 				),
@@ -2116,6 +2148,7 @@ async function selectAccountsForRequestInternal(
 		// or an unrelated normal-pool route.
 		const available = selected.filter(
 			(account) =>
+				isAccountEligibleForRouteIntent(account, meta, ctx) &&
 				matchesCapabilityRouteProfile(account, meta) &&
 				!isProviderExcludedForRequest(account, excludedProviders) &&
 				isAccountAvailable(account),
@@ -2239,7 +2272,9 @@ async function selectAccountsForRequestInternal(
 						.map((member) => accountMap.get(member.account_id))
 						.filter(
 							(account): account is Account =>
-								account !== undefined && !isProviderExcluded(account),
+								account !== undefined &&
+								isAccountEligibleForRouteIntent(account, meta, ctx) &&
+								!isProviderExcluded(account),
 						);
 					const implicitComboAccounts = applyImplicitFallbackPolicy(
 						comboPolicyAccounts,
