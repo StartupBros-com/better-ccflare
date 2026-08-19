@@ -24,6 +24,7 @@ import {
 	CODEX_CONVERSATION_ID_HEADER,
 	CODEX_TURN_STATE_HEADER,
 	decideContextAdmission,
+	estimateAnthropicAdmissionTokens,
 	isAnthropicExtraUsageExhausted,
 	isAnthropicOutOfCredits,
 	isCodexSubscriptionEndpoint,
@@ -101,6 +102,7 @@ export {
 	getCacheBodyStagingAction,
 } from "../cache-transport-staging";
 
+import type { BoundedModelRouteProfile } from "../model-route-profiles";
 import {
 	getPreTransportDeadlineConfig,
 	PreTransportPhaseTimeoutError,
@@ -764,6 +766,141 @@ export function createContextLengthExceededResponse(
 				type: "invalid_request_error",
 				message: `prompt is too long: ${occupied} tokens > ${tracker.largestSafeLimit} tokens`,
 				code: "context_length_exceeded",
+			},
+		}),
+		{
+			status: 400,
+			headers: { "Content-Type": "application/json" },
+		},
+	);
+}
+
+type BoundedModelRouteAdmissionErrorCode =
+	| "bounded_profile_invalid_request"
+	| "bounded_profile_context_length_exceeded";
+
+interface BoundedModelRouteAdmissionBase {
+	readonly profileId: string;
+	readonly contextWindow: number;
+	readonly inputLimitTokens: number;
+	readonly requestedMaxOutputTokens: number | null;
+	readonly effectiveMaxOutputTokens: number | null;
+	readonly outputReserveTokens: number | null;
+	readonly estimatedInputTokens: number | null;
+	readonly occupiedTokens: number | null;
+	readonly clamped: boolean;
+}
+
+export type BoundedModelRouteAdmissionDecision =
+	| (BoundedModelRouteAdmissionBase & {
+			readonly status: "admit";
+			readonly code: null;
+	  })
+	| (BoundedModelRouteAdmissionBase & {
+			readonly status: "reject";
+			readonly code: BoundedModelRouteAdmissionErrorCode;
+	  });
+
+function boundedModelRouteAdmissionBase(
+	profile: BoundedModelRouteProfile,
+): BoundedModelRouteAdmissionBase {
+	return {
+		profileId: profile.id,
+		contextWindow: profile.contextWindow,
+		inputLimitTokens: profile.contextWindow - profile.maxOutputTokens,
+		requestedMaxOutputTokens: null,
+		effectiveMaxOutputTokens: null,
+		outputReserveTokens: null,
+		estimatedInputTokens: null,
+		occupiedTokens: null,
+		clamped: false,
+	};
+}
+
+/**
+ * Applies the fixed output cap and fail-closed envelope admission for an already
+ * resolved bounded exact profile. This deliberately uses the numeric conservative
+ * estimate even though the shared estimator labels its confidence as low; bounded
+ * profiles are a local capacity contract, unlike optional Codex admission.
+ */
+export function admitBoundedModelRouteProfileRequest(
+	profile: BoundedModelRouteProfile,
+	bodyContext: RequestBodyContext,
+): BoundedModelRouteAdmissionDecision {
+	const base = boundedModelRouteAdmissionBase(profile);
+	const parsedBody = bodyContext.getParsedJson();
+	const requestedMaxOutputTokens = parsedBody?.max_tokens;
+	if (
+		!parsedBody ||
+		typeof requestedMaxOutputTokens !== "number" ||
+		!Number.isFinite(requestedMaxOutputTokens) ||
+		!Number.isInteger(requestedMaxOutputTokens) ||
+		requestedMaxOutputTokens <= 0
+	) {
+		return {
+			...base,
+			status: "reject",
+			code: "bounded_profile_invalid_request",
+		};
+	}
+
+	const effectiveMaxOutputTokens = Math.min(
+		requestedMaxOutputTokens,
+		profile.maxOutputTokens,
+	);
+	const clamped = effectiveMaxOutputTokens !== requestedMaxOutputTokens;
+	if (clamped) {
+		bodyContext.mutateParsedJson((body) => {
+			body.max_tokens = effectiveMaxOutputTokens;
+		});
+	}
+
+	const estimate = estimateAnthropicAdmissionTokens(
+		bodyContext.getParsedJson(),
+	);
+	const admission = decideContextAdmission({
+		inputTokens: estimate.tokens,
+		effectiveContextWindow: profile.contextWindow,
+		// Reserve the configured cap, not the caller's smaller requested output.
+		requestedMaxOutputTokens: profile.maxOutputTokens,
+		safetyReserveTokens: 0,
+	});
+	const decision = {
+		...base,
+		requestedMaxOutputTokens,
+		effectiveMaxOutputTokens,
+		outputReserveTokens: admission.outputReserveTokens,
+		estimatedInputTokens: admission.inputTokens,
+		occupiedTokens: admission.occupiedTokens,
+		clamped,
+	};
+	if (admission.status !== "admit") {
+		return {
+			...decision,
+			status: "reject",
+			code: "bounded_profile_context_length_exceeded",
+		};
+	}
+	return { ...decision, status: "admit", code: null };
+}
+
+export function createBoundedModelRouteAdmissionResponse(
+	decision: Extract<
+		BoundedModelRouteAdmissionDecision,
+		{ readonly status: "reject" }
+	>,
+): Response {
+	const message =
+		decision.code === "bounded_profile_invalid_request"
+			? "This bounded route profile requires a valid JSON request with a finite positive max_tokens."
+			: "This request exceeds the bounded route profile context limit.";
+	return new Response(
+		JSON.stringify({
+			type: "error",
+			error: {
+				type: "invalid_request_error",
+				message,
+				code: decision.code,
 			},
 		}),
 		{

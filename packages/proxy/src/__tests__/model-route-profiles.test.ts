@@ -159,6 +159,25 @@ describe("parseModelRouteProfiles", () => {
 		).toThrow("CCFLARE_MODEL_ROUTE_PROFILES_JSON");
 	});
 
+	it("rejects bounded fields on capability profiles", () => {
+		expect(() =>
+			parseModelRouteProfiles(
+				JSON.stringify([
+					{
+						id: "bounded-capability-route",
+						displayName: "Bounded capability route",
+						selection: "capability",
+						logicalModel: "claude-fable-5",
+						expectedProvider: "codex",
+						expectedPhysicalModel: "gpt-5.6-sol",
+						contextWindow: 24_000,
+						maxOutputTokens: 4_000,
+					},
+				]),
+			),
+		).toThrow("CCFLARE_MODEL_ROUTE_PROFILES_JSON");
+	});
+
 	it("parses a capability profile without pinning an account", () => {
 		const [configured] = parseModelRouteProfiles(
 			JSON.stringify([

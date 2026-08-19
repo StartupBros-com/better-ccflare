@@ -10,12 +10,18 @@ import {
 import { CODEX_LOGICAL_MODEL_FAMILY_HEADER } from "@better-ccflare/http-common";
 import { logBus } from "@better-ccflare/logger";
 import type { Account, RequestMeta } from "@better-ccflare/types";
+import {
+	isBoundedModelRouteProfile,
+	parseModelRouteProfiles,
+} from "../../model-route-profiles";
+import { RequestBodyContext } from "../../request-body-context";
 import type { ProxyContext } from "../proxy-types";
 
 const { CodexProvider, estimateAnthropicAdmissionTokens, getProvider } =
 	await import("@better-ccflare/providers");
 const usageCollectorModule = await import("../../usage-collector");
 const {
+	admitBoundedModelRouteProfileRequest,
 	createContextAdmissionTracker,
 	createContextLengthExceededResponse,
 	proxyWithAccount,
@@ -120,6 +126,50 @@ function calibratedAdmissionEstimate(tokens: number) {
 		method: "test-calibrated",
 		confidence: "calibrated" as const,
 	};
+}
+
+function makeBoundedProfile() {
+	const [profile] = parseModelRouteProfiles(
+		JSON.stringify([
+			{
+				id: "bounded-test-profile",
+				displayName: "Bounded test profile",
+				accountId: "private-account-id",
+				logicalModel: "claude-fable-5",
+				contextWindow: 24_000,
+				maxOutputTokens: 4_000,
+			},
+		]),
+	);
+	if (!profile || !isBoundedModelRouteProfile(profile)) {
+		throw new Error("Expected a bounded test profile");
+	}
+	return profile;
+}
+
+function makeBoundedRequestBodyContext(
+	inputTokens: number,
+	maxTokens = 4_000,
+): RequestBodyContext {
+	const baseBody = {
+		model: "claude-fable-5",
+		messages: [{ role: "user", content: "" }],
+		max_tokens: maxTokens,
+	};
+	const baseBytes = new TextEncoder().encode(
+		JSON.stringify(baseBody),
+	).byteLength;
+	const contentLength = inputTokens * 2 - baseBytes;
+	if (contentLength < 0) {
+		throw new Error("Requested bounded test input is too small");
+	}
+	const body = {
+		...baseBody,
+		messages: [{ role: "user", content: "x".repeat(contentLength) }],
+	};
+	return new RequestBodyContext(
+		new TextEncoder().encode(JSON.stringify(body)).buffer,
+	);
 }
 
 describe("proxyWithAccount — Codex count_tokens", () => {
@@ -1598,5 +1648,121 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 		expect(
 			transformedHeaders?.get("x-better-ccflare-pacing-cohort-id") ?? null,
 		).toBeNull();
+	});
+});
+
+describe("bounded model-route profile admission", () => {
+	it("admits the 20k input boundary and rejects 20,001 using the low-confidence numeric envelope estimate", () => {
+		const profile = makeBoundedProfile();
+		const boundary = makeBoundedRequestBodyContext(20_000);
+		const overflow = makeBoundedRequestBodyContext(20_001);
+
+		expect(
+			estimateAnthropicAdmissionTokens(boundary.getParsedJson()).tokens,
+		).toBe(20_000);
+		expect(
+			estimateAnthropicAdmissionTokens(boundary.getParsedJson()).confidence,
+		).toBe("low");
+		expect(
+			admitBoundedModelRouteProfileRequest(profile, boundary),
+		).toMatchObject({
+			status: "admit",
+			estimatedInputTokens: 20_000,
+			outputReserveTokens: 4_000,
+			occupiedTokens: 24_000,
+			clamped: false,
+		});
+		expect(
+			admitBoundedModelRouteProfileRequest(profile, overflow),
+		).toMatchObject({
+			status: "reject",
+			code: "bounded_profile_context_length_exceeded",
+			estimatedInputTokens: 20_001,
+			outputReserveTokens: 4_000,
+			occupiedTokens: 24_001,
+		});
+	});
+
+	it("reserves the fixed 4k output cap even when the caller requests less", () => {
+		const profile = makeBoundedProfile();
+		const context = makeBoundedRequestBodyContext(20_001, 1);
+
+		expect(
+			admitBoundedModelRouteProfileRequest(profile, context),
+		).toMatchObject({
+			status: "reject",
+			code: "bounded_profile_context_length_exceeded",
+			requestedMaxOutputTokens: 1,
+			effectiveMaxOutputTokens: 1,
+			outputReserveTokens: 4_000,
+			occupiedTokens: 24_001,
+		});
+		expect(context.getParsedJson()?.max_tokens).toBe(1);
+	});
+
+	it("preserves a 4k output request and clamps a larger request before estimating", () => {
+		const profile = makeBoundedProfile();
+		const unchanged = makeBoundedRequestBodyContext(100, 4_000);
+		const clamped = makeBoundedRequestBodyContext(100, 8_000);
+
+		expect(
+			admitBoundedModelRouteProfileRequest(profile, unchanged),
+		).toMatchObject({
+			status: "admit",
+			requestedMaxOutputTokens: 4_000,
+			effectiveMaxOutputTokens: 4_000,
+			clamped: false,
+		});
+		expect(
+			admitBoundedModelRouteProfileRequest(profile, clamped),
+		).toMatchObject({
+			status: "admit",
+			requestedMaxOutputTokens: 8_000,
+			effectiveMaxOutputTokens: 4_000,
+			clamped: true,
+		});
+		expect(unchanged.getParsedJson()?.max_tokens).toBe(4_000);
+		expect(clamped.getParsedJson()?.max_tokens).toBe(4_000);
+	});
+
+	it("rejects malformed and invalid bounded requests", () => {
+		const profile = makeBoundedProfile();
+		const malformed = new RequestBodyContext(
+			new TextEncoder().encode("{not-json").buffer,
+		);
+		const invalidMaxTokens = RequestBodyContext.fromParsed(null, {
+			model: "claude-fable-5",
+			messages: [{ role: "user", content: "hello" }],
+			max_tokens: 0,
+		});
+
+		expect(
+			admitBoundedModelRouteProfileRequest(profile, malformed),
+		).toMatchObject({
+			status: "reject",
+			code: "bounded_profile_invalid_request",
+		});
+		expect(
+			admitBoundedModelRouteProfileRequest(profile, invalidMaxTokens),
+		).toMatchObject({
+			status: "reject",
+			code: "bounded_profile_invalid_request",
+		});
+	});
+
+	it("rejects a fractional max_tokens request", () => {
+		const profile = makeBoundedProfile();
+		const fractionalMaxTokens = RequestBodyContext.fromParsed(null, {
+			model: "claude-fable-5",
+			messages: [{ role: "user", content: "hello" }],
+			max_tokens: 1.5,
+		});
+
+		expect(
+			admitBoundedModelRouteProfileRequest(profile, fractionalMaxTokens),
+		).toMatchObject({
+			status: "reject",
+			code: "bounded_profile_invalid_request",
+		});
 	});
 });

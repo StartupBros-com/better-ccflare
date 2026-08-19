@@ -260,6 +260,11 @@ export function parseModelRouteProfiles(
 				`profile ${index} fields contextWindow and maxOutputTokens must be provided together`,
 			);
 		}
+		if (selection === "capability" && contextWindow !== undefined) {
+			throw configError(
+				`profile ${index} capability selection must omit contextWindow and maxOutputTokens`,
+			);
+		}
 		if (
 			contextWindow !== undefined &&
 			maxOutputTokens !== undefined &&

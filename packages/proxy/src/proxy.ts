@@ -99,7 +99,9 @@ import {
 import {
 	type AnthropicDegradedRequestSendState,
 	type AnthropicDegradedSendDenied,
+	admitBoundedModelRouteProfileRequest,
 	createAnthropicDegradedNoAccountDenial,
+	createBoundedModelRouteAdmissionResponse,
 	discardUpstreamBody,
 	isAnthropicDegradedSendDenied,
 	type ProxyWithAccountResult,
@@ -113,6 +115,7 @@ import { getRequestRateLimitOutcomes } from "./handlers/rate-limit-scope";
 import { createProtectedAnthropicOverloadResponse } from "./handlers/routing-terminal";
 import { consumeInternalAutoRefreshAuth } from "./internal-probe-auth";
 import {
+	isBoundedModelRouteProfile,
 	MODEL_ROUTE_PROFILE_MODEL_PREFIX,
 	type ModelRouteProfile,
 } from "./model-route-profiles";
@@ -1014,6 +1017,32 @@ async function handleProxyCoreImpl(
 			appliedModel = profile.logicalModel;
 			requestMeta.routeExpectedPhysicalModel = profile.expectedPhysicalModel;
 		}
+	}
+	if (
+		url.pathname === "/v1/messages" &&
+		modelRouteResolution?.kind === "route" &&
+		modelRouteResolution.profile.selection === undefined &&
+		isBoundedModelRouteProfile(modelRouteResolution.profile)
+	) {
+		const admission = admitBoundedModelRouteProfileRequest(
+			modelRouteResolution.profile,
+			finalRequestBodyContext,
+		);
+		log.info("bounded_model_route_admission", {
+			profileId: admission.profileId,
+			estimatedInputTokens: admission.estimatedInputTokens,
+			contextWindow: admission.contextWindow,
+			requestedMaxOutputTokens: admission.requestedMaxOutputTokens,
+			effectiveMaxOutputTokens: admission.effectiveMaxOutputTokens,
+			clamped: admission.clamped,
+			outcome: admission.status === "admit" ? "admit" : admission.code,
+		});
+		if (admission.status === "reject") {
+			return createBoundedModelRouteAdmissionResponse(admission);
+		}
+		// The body context is authoritative for semantic mutation, but transport
+		// receives this saved buffer. Rematerialize after output clamping.
+		finalBodyBuffer = finalRequestBodyContext.getBuffer();
 	}
 	const finalCreateBodyStream = () => {
 		if (!finalBodyBuffer) return undefined;

@@ -471,6 +471,114 @@ describe("Claude Code gateway model route profiles", () => {
 		clearSession(sessionId);
 	});
 
+	it("forwards bounded profile output requests rematerialized at the 4k cap", async () => {
+		const harness = makeContext(
+			makeRegistry({ contextWindow: 24_000, maxOutputTokens: 4_000 }),
+		);
+		const { requests } = installJsonUpstream();
+
+		for (const maxTokens of [4_000, 8_000]) {
+			const request = apiRequest(
+				"/v1/messages",
+				PROFILE_MODEL,
+				{},
+				{
+					max_tokens: maxTokens,
+				},
+			);
+			expect(
+				(await handleProxy(request, new URL(request.url), harness.ctx, "key-1"))
+					.status,
+			).toBe(200);
+		}
+
+		expect(requests).toHaveLength(2);
+		for (const request of requests) {
+			expect((await fetchedJson(request)).max_tokens).toBe(4_000);
+		}
+	});
+
+	it("rejects invalid bounded requests before account selection or session commit", async () => {
+		const registry = makeRegistry({
+			contextWindow: 24_000,
+			maxOutputTokens: 4_000,
+		});
+		const harness = makeContext(registry);
+		const { fetchMock } = installJsonUpstream();
+		const request = apiRequest(
+			"/v1/messages",
+			PROFILE_MODEL,
+			{ "x-claude-code-session-id": "invalid-bounded-session" },
+			{ max_tokens: 0 },
+		);
+
+		const response = await handleProxy(
+			request,
+			new URL(request.url),
+			harness.ctx,
+			"key-1",
+		);
+
+		expect(response.status).toBe(400);
+		const payload = await response.json();
+		expect(payload).toEqual({
+			type: "error",
+			error: {
+				type: "invalid_request_error",
+				message:
+					"This bounded route profile requires a valid JSON request with a finite positive max_tokens.",
+				code: "bounded_profile_invalid_request",
+			},
+		});
+		expect(JSON.stringify(payload)).not.toContain(ROUTE_ACCOUNT_ID);
+		expect(harness.getAllAccounts).toHaveBeenCalledTimes(0);
+		expect(harness.strategySelect).toHaveBeenCalledTimes(0);
+		expect(fetchMock).toHaveBeenCalledTimes(0);
+		expect(registry.size).toBe(0);
+	});
+
+	it("rejects over-limit bounded requests before account selection or session commit", async () => {
+		const registry = makeRegistry({
+			contextWindow: 24_000,
+			maxOutputTokens: 4_000,
+		});
+		const harness = makeContext(registry);
+		const { fetchMock } = installJsonUpstream();
+		const request = apiRequest(
+			"/v1/messages",
+			PROFILE_MODEL,
+			{ "x-claude-code-session-id": "overflow-bounded-session" },
+			{
+				max_tokens: 4_000,
+				messages: [{ role: "user", content: "x".repeat(40_100) }],
+			},
+		);
+
+		const response = await handleProxy(
+			request,
+			new URL(request.url),
+			harness.ctx,
+			"key-1",
+		);
+
+		expect(response.status).toBe(400);
+		const payload = await response.json();
+		expect(payload).toEqual({
+			type: "error",
+			error: {
+				type: "invalid_request_error",
+				message:
+					"This request exceeds the bounded route profile context limit.",
+				code: "bounded_profile_context_length_exceeded",
+			},
+		});
+		expect(JSON.stringify(payload)).not.toContain(ROUTE_ACCOUNT_ID);
+		expect(harness.getAllAccounts).toHaveBeenCalledTimes(0);
+		expect(harness.strategySelect).toHaveBeenCalledTimes(0);
+		expect(fetchMock).toHaveBeenCalledTimes(0);
+		expect(registry.size).toBe(0);
+	});
+
 	it("preserves explicit max effort and every other output_config field", async () => {
 		const harness = makeContext(makeRegistry());
 		const { requests } = installJsonUpstream();
@@ -556,6 +664,44 @@ describe("Claude Code gateway model route profiles", () => {
 		const upstream = await fetchedJson(requests[1]);
 		expect(upstream.model).toBe(CHILD_MODEL);
 		expect(upstream.output_config).toBeUndefined();
+		expect(harness.strategySelect).toHaveBeenCalledTimes(0);
+	});
+
+	it("clamps inherited child profile output without changing its model pin", async () => {
+		const fallback = makeAccount("normal-route");
+		const harness = makeContext(
+			makeRegistry({ contextWindow: 24_000, maxOutputTokens: 4_000 }),
+			{
+				accounts: [makeAccount(), fallback],
+				normalAccountId: fallback.id,
+			},
+		);
+		const { requests } = installJsonUpstream();
+		const session = { "x-claude-code-session-id": "bounded-child-session" };
+		const root = apiRequest("/v1/messages", PROFILE_MODEL, session);
+		expect(
+			(await handleProxy(root, new URL(root.url), harness.ctx, "key-1")).status,
+		).toBe(200);
+
+		const child = apiRequest(
+			"/v1/messages",
+			CHILD_MODEL,
+			{
+				...session,
+				"x-claude-code-agent-id": "bounded-child",
+			},
+			{ max_tokens: 8_000 },
+		);
+		expect(
+			(await handleProxy(child, new URL(child.url), harness.ctx, "key-1"))
+				.status,
+		).toBe(200);
+
+		expect(requests[1]?.url).toContain(`/${ROUTE_ACCOUNT_ID}/`);
+		expect(await fetchedJson(requests[1])).toMatchObject({
+			model: CHILD_MODEL,
+			max_tokens: 4_000,
+		});
 		expect(harness.strategySelect).toHaveBeenCalledTimes(0);
 	});
 
