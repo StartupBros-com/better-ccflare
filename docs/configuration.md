@@ -402,20 +402,20 @@ For example, the complete environment value for the bounded GLM route is:
 CCFLARE_MODEL_ROUTE_PROFILES_JSON='[
   {
     "id": "glm-5-2-bounded-v1",
-    "displayName": "GLM-5.2 Local: 20k input, 4k output, no deferred tools",
-    "description": "Mac Studio local champion; 20k input / 4k output; no deferred tools; no fallback",
+    "displayName": "GLM-5.2 Local: 2.5k input, 4k output, no deferred tools",
+    "description": "Mac Studio local champion; calibrated 2.5k input / 4k output; no deferred tools; no fallback",
     "accountId": "59d5d8b1-fe47-44e7-b47b-171b0c902b0c",
     "logicalModel": "claude-fable-5",
     "expectedProvider": "anthropic-compatible",
     "expectedPhysicalModel": "local-champion",
     "exclusiveAccount": true,
-    "contextWindow": 24000,
+    "contextWindow": 6500,
     "maxOutputTokens": 4000
   }
 ]'
 ```
 
-This profile has a fixed 20,000-token input limit, a 4,000-token output cap, and a 24,000-token total envelope. The deployment account ID shown here is protected operational configuration: do not commit real deployment IDs to a public configuration file. This repository is private, but use the same protected-environment or service-manager credential posture for deployed values. If other profiles exist, include this object in the same complete JSON array rather than replacing them or supplying the object alone. Its public picker ID is `claude-bccf-route-glm-5-2-bounded-v1`.
+This profile has a fixed 2,500-token input limit, a 4,000-token output cap, and a 6,500-token total envelope. That limit is calibrated for the current 440 GB DQ4plus-q8 champion on a 512 GB M3 Ultra: unique 1.5k–2.5k envelopes reached semantic output in 17–23 seconds, while 3k took 37 seconds, 4k took 60 seconds, and 8k took 108 seconds. Treat this as an emergency focused-worker route, not a normal Claude Code daily-driver profile; raise it only under a new versioned profile after runtime or model changes pass the same cold-prefix gate. The deployment account ID shown here is protected operational configuration: do not commit real deployment IDs to a public configuration file. This repository is private, but use the same protected-environment or service-manager credential posture for deployed values. If other profiles exist, include this object in the same complete JSON array rather than replacing them or supplying the object alone. Its public picker ID is `claude-bccf-route-glm-5-2-bounded-v1`.
 
 ### Claude Code `/model` setup
 
