@@ -179,7 +179,7 @@ export class XaiProvider extends OpenAICompatibleProvider {
 		let endpoint = XAI_DEFAULT_ENDPOINT;
 		try {
 			endpoint = account?.custom_endpoint
-				? getEndpointUrl(account)
+				? getEndpointUrl(account) ?? XAI_DEFAULT_ENDPOINT
 				: XAI_DEFAULT_ENDPOINT;
 			endpoint = validateEndpointUrl(endpoint, "xAI endpoint");
 		} catch (error) {
@@ -187,6 +187,7 @@ export class XaiProvider extends OpenAICompatibleProvider {
 				`Invalid xAI endpoint for ${account?.name ?? "unknown"}; using default`,
 				error,
 			);
+			endpoint = XAI_DEFAULT_ENDPOINT;
 		}
 
 		let openaiPath = path === "/v1/messages" ? "/v1/chat/completions" : path;

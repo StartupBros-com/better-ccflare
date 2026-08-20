@@ -1,7 +1,6 @@
 import {
-	getEndpointUrl,
+	resolveCompatibleEndpoint,
 	ValidationError,
-	validateEndpointUrl,
 } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import {
@@ -48,18 +47,23 @@ export class OpenAICompatibleProvider extends BaseProvider {
 	}
 
 	buildUrl(path: string, query: string, account?: Account): string {
-		// Get endpoint URL with validation
-		let endpoint: string;
-		try {
-			endpoint = account ? getEndpointUrl(account) : "https://api.openai.com";
-			// Validate the endpoint
-			endpoint = validateEndpointUrl(endpoint, "endpoint");
-		} catch (error) {
-			log.error(
-				`Invalid endpoint for account ${account?.name || "unknown"}, using default: ${error instanceof Error ? error.message : String(error)}`,
+		// Fail-closed endpoint resolution (R3): a compatible account with a
+		// missing or invalid endpoint must become unavailable rather than
+		// silently routing to the default OpenAI host.
+		if (!account) {
+			throw new ValidationError(
+				"compatible account is required to resolve an endpoint",
+				"account",
 			);
-			endpoint = "https://api.openai.com";
 		}
+		const resolution = resolveCompatibleEndpoint(account);
+		if (!resolution.ok) {
+			throw new ValidationError(
+				`account '${account.name}' has no valid custom endpoint — cannot route to a compatible provider`,
+				"custom_endpoint",
+			);
+		}
+		const endpoint = resolution.endpoint;
 
 		// Convert Anthropic paths to OpenAI-compatible paths
 		// Anthropic: /v1/messages → OpenAI: /v1/chat/completions
@@ -214,13 +218,17 @@ export class OpenAICompatibleProvider extends BaseProvider {
 			// that other request's endpoint/model win the race and cause
 			// DashScope-only cache_control/enable_thinking to land on the wrong
 			// provider or get dropped entirely.
-			let endpoint = "https://api.openai.com";
-			try {
-				if (account) {
-					endpoint = validateEndpointUrl(getEndpointUrl(account), "endpoint");
+			//
+			// Fail-closed endpoint resolution (R3): if the endpoint is missing or
+			// invalid, endpoint stays undefined and the DashScope hooks are
+			// skipped. This does not throw — the actual URL is built by
+			// buildUrl, which does throw when the endpoint is invalid.
+			let endpoint: string | undefined;
+			if (account) {
+				const resolution = resolveCompatibleEndpoint(account);
+				if (resolution.ok) {
+					endpoint = resolution.endpoint;
 				}
-			} catch {
-				endpoint = "https://api.openai.com";
 			}
 			const effectiveAccount = this.beforeConvert(body, account);
 			const openaiBody = convertAnthropicRequestToOpenAI(

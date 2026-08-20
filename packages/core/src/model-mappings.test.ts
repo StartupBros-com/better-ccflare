@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
 	getAllowedModelsMessage,
 	getConfiguredModelMapping,
+	getEndpointUrl,
 	getModelFamily,
 	getModelList,
 	getModelMappings,
@@ -12,6 +13,7 @@ import {
 	mapModelName,
 	parseCustomEndpointData,
 	parseModelMappings,
+	resolveCompatibleEndpoint,
 	resolveFamilyAliasModel,
 	ValidationError,
 } from "@better-ccflare/core";
@@ -500,5 +502,198 @@ describe("Family alias helpers", () => {
 		);
 		// A different family's bare word is not an alias for this family — passed through trimmed.
 		expect(resolveFamilyAliasModel("sonnet", "opus")).toBe("sonnet");
+	});
+});
+
+describe("getEndpointUrl — null when no endpoint (R3)", () => {
+	const baseAccount: Account = {
+		id: "test",
+		name: "test-account",
+		provider: "openai-compatible",
+		refresh_token: "",
+		access_token: null,
+		expires_at: null,
+		api_key: null,
+		custom_endpoint: null,
+		rate_limited_until: null,
+		rate_limit_status: null,
+		rate_limit_reset: null,
+		rate_limit_remaining: null,
+		created_at: Date.now(),
+		last_used: null,
+		request_count: 0,
+		total_requests: 0,
+		session_start: null,
+		session_request_count: 0,
+		paused: false,
+		priority: 0,
+		auto_fallback_enabled: false,
+		auto_refresh_enabled: false,
+	} as Account;
+
+	test("returns null when custom_endpoint is null", () => {
+		expect(getEndpointUrl({ ...baseAccount, custom_endpoint: null })).toBeNull();
+	});
+
+	test("returns null when custom_endpoint is undefined", () => {
+		expect(
+			getEndpointUrl({ ...baseAccount, custom_endpoint: undefined } as Account),
+		).toBeNull();
+	});
+
+	test("returns null when custom_endpoint is empty string", () => {
+		expect(getEndpointUrl({ ...baseAccount, custom_endpoint: "" })).toBeNull();
+	});
+
+	test("returns null when JSON blob has no endpoint field", () => {
+		expect(
+			getEndpointUrl({
+				...baseAccount,
+				custom_endpoint: JSON.stringify({ modelMappings: { opus: "gpt-4" } }),
+			}),
+		).toBeNull();
+	});
+
+	test("returns the endpoint for a plain string", () => {
+		expect(
+			getEndpointUrl({
+				...baseAccount,
+				custom_endpoint: "https://api.openrouter.ai/api/v1",
+			}),
+		).toBe("https://api.openrouter.ai/api/v1");
+	});
+
+	test("returns the endpoint from a JSON blob", () => {
+		expect(
+			getEndpointUrl({
+				...baseAccount,
+				custom_endpoint: JSON.stringify({
+					endpoint: "https://api.openrouter.ai/api/v1",
+				}),
+			}),
+		).toBe("https://api.openrouter.ai/api/v1");
+	});
+
+	test("returns the endpoint from a JSON blob with modelMappings", () => {
+		expect(
+			getEndpointUrl({
+				...baseAccount,
+				custom_endpoint: JSON.stringify({
+					endpoint: "https://api.openrouter.ai/api/v1",
+					modelMappings: { opus: "gpt-4" },
+				}),
+			}),
+		).toBe("https://api.openrouter.ai/api/v1");
+	});
+});
+
+describe("resolveCompatibleEndpoint — fail-closed (R3)", () => {
+	const baseAccount: Account = {
+		id: "test",
+		name: "test-account",
+		provider: "openai-compatible",
+		refresh_token: "",
+		access_token: null,
+		expires_at: null,
+		api_key: null,
+		custom_endpoint: null,
+		rate_limited_until: null,
+		rate_limit_status: null,
+		rate_limit_reset: null,
+		rate_limit_remaining: null,
+		created_at: Date.now(),
+		last_used: null,
+		request_count: 0,
+		total_requests: 0,
+		session_start: null,
+		session_request_count: 0,
+		paused: false,
+		priority: 0,
+		auto_fallback_enabled: false,
+		auto_refresh_enabled: false,
+	} as Account;
+
+	test("returns unavailable when custom_endpoint is null", () => {
+		const result = resolveCompatibleEndpoint({
+			...baseAccount,
+			custom_endpoint: null,
+		});
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.endpoint).toBeUndefined();
+		}
+	});
+
+	test("returns unavailable when custom_endpoint is empty string", () => {
+		const result = resolveCompatibleEndpoint({
+			...baseAccount,
+			custom_endpoint: "",
+		});
+		expect(result.ok).toBe(false);
+	});
+
+	test("returns unavailable when JSON blob has no endpoint field", () => {
+		const result = resolveCompatibleEndpoint({
+			...baseAccount,
+			custom_endpoint: JSON.stringify({ modelMappings: { opus: "gpt-4" } }),
+		});
+		expect(result.ok).toBe(false);
+	});
+
+	test("returns unavailable when the endpoint is not a valid URL", () => {
+		const result = resolveCompatibleEndpoint({
+			...baseAccount,
+			custom_endpoint: "not-a-url",
+		});
+		expect(result.ok).toBe(false);
+	});
+
+	test("returns a validated endpoint for a plain string", () => {
+		const result = resolveCompatibleEndpoint({
+			...baseAccount,
+			custom_endpoint: "https://api.openrouter.ai/api/v1",
+		});
+		expect(result.ok).toBe(true);
+		if (result.ok) {
+			expect(result.endpoint).toBe("https://api.openrouter.ai/api/v1");
+		}
+	});
+
+	test("returns a validated endpoint from a JSON blob", () => {
+		const result = resolveCompatibleEndpoint({
+			...baseAccount,
+			custom_endpoint: JSON.stringify({
+				endpoint: "https://api.openrouter.ai/api/v1",
+			}),
+		});
+		expect(result.ok).toBe(true);
+		if (result.ok) {
+			expect(result.endpoint).toBe("https://api.openrouter.ai/api/v1");
+		}
+	});
+
+	test("resolves a plain string and equivalent JSON blob identically", () => {
+		const plain = resolveCompatibleEndpoint({
+			...baseAccount,
+			custom_endpoint: "https://api.openrouter.ai/api/v1",
+		});
+		const json = resolveCompatibleEndpoint({
+			...baseAccount,
+			custom_endpoint: JSON.stringify({
+				endpoint: "https://api.openrouter.ai/api/v1",
+			}),
+		});
+		expect(plain).toEqual(json);
+	});
+
+	test("strips a trailing slash from the endpoint", () => {
+		const result = resolveCompatibleEndpoint({
+			...baseAccount,
+			custom_endpoint: "https://api.example.com/v1/",
+		});
+		expect(result.ok).toBe(true);
+		if (result.ok) {
+			expect(result.endpoint).toBe("https://api.example.com/v1");
+		}
 	});
 });

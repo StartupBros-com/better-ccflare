@@ -557,3 +557,45 @@ describe("OpenAICompatibleProvider.parseRateLimit - unchanged for generic provid
 		expect(body.reasoning_effort).toBe("low");
 	});
 });
+
+describe("xAI endpoint fallback (R3 isolation — xAI keeps its own default)", () => {
+	it("resolves to the xAI default when the account has no custom endpoint", () => {
+		const provider = new XaiProvider();
+		const url = provider.buildUrl("/v1/messages", "", account());
+		expect(url).toBe(`${XAI_DEFAULT_ENDPOINT}/chat/completions`);
+	});
+
+	it("resolves to the xAI default when the stored endpoint is malformed", () => {
+		const provider = new XaiProvider();
+		const url = provider.buildUrl(
+			"/v1/messages",
+			"",
+			account({ custom_endpoint: "not-a-valid-url" }),
+		);
+		expect(url).toBe(`${XAI_DEFAULT_ENDPOINT}/chat/completions`);
+	});
+
+	it("resolves to the xAI default when the JSON endpoint blob has no endpoint field", () => {
+		const provider = new XaiProvider();
+		const url = provider.buildUrl(
+			"/v1/messages",
+			"",
+			account({
+				custom_endpoint: JSON.stringify({
+					modelMappings: { opus: "grok-4.5" },
+				}),
+			}),
+		);
+		expect(url).toBe(`${XAI_DEFAULT_ENDPOINT}/chat/completions`);
+	});
+
+	it("uses a valid custom endpoint when provided", () => {
+		const provider = new XaiProvider();
+		const url = provider.buildUrl(
+			"/v1/messages",
+			"",
+			account({ custom_endpoint: "https://proxy.example.com/v1" }),
+		);
+		expect(url).toBe("https://proxy.example.com/v1/chat/completions");
+	});
+});

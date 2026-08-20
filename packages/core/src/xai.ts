@@ -52,7 +52,7 @@ export function isOfficialXaiEndpoint(account?: Account | null): boolean {
 	let endpoint = XAI_DEFAULT_ENDPOINT;
 	try {
 		endpoint = account?.custom_endpoint
-			? getEndpointUrl(account)
+			? getEndpointUrl(account) ?? XAI_DEFAULT_ENDPOINT
 			: XAI_DEFAULT_ENDPOINT;
 	} catch {
 		endpoint = XAI_DEFAULT_ENDPOINT;

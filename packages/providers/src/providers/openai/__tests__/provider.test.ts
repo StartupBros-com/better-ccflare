@@ -55,13 +55,14 @@ describe("OpenAICompatibleProvider", () => {
 			expect(url).toBe("https://api.openrouter.ai/api/v1/chat/completions");
 		});
 
-		it("should use default endpoint when no custom endpoint", () => {
+		it("should throw when no custom endpoint — fail-closed (R3)", () => {
 			const accountWithoutEndpoint = {
 				...mockAccount,
 				custom_endpoint: undefined,
 			};
-			const url = provider.buildUrl("/v1/messages", "", accountWithoutEndpoint);
-			expect(url).toBe("https://api.openai.com/v1/chat/completions");
+			expect(() =>
+				provider.buildUrl("/v1/messages", "", accountWithoutEndpoint),
+			).toThrow();
 		});
 
 		it("should convert Anthropic path to OpenAI path", () => {
@@ -88,19 +89,16 @@ describe("OpenAICompatibleProvider", () => {
 			expect(url).toBe("https://api.example.com/v1/chat/completions");
 		});
 
-		it("should fall back to default when JSON endpoint is missing", () => {
+		it("should throw when JSON endpoint blob has no endpoint field — fail-closed (R3)", () => {
 			const accountWithMappingsOnly = {
 				...mockAccount,
 				custom_endpoint: JSON.stringify({
 					modelMappings: { opus: "custom-model" },
 				}),
 			};
-			const url = provider.buildUrl(
-				"/v1/messages",
-				"",
-				accountWithMappingsOnly,
-			);
-			expect(url).toBe("https://api.openai.com/v1/chat/completions");
+			expect(() =>
+				provider.buildUrl("/v1/messages", "", accountWithMappingsOnly),
+			).toThrow();
 		});
 	});
 
@@ -717,6 +715,149 @@ describe("OpenAICompatibleProvider", () => {
 				expect(systemMsg.content[0]).toHaveProperty("cache_control");
 			}
 			expect(openaiBodyA.enable_thinking).toBe(true);
+		});
+	});
+
+	describe("fail-closed endpoint resolution (R3)", () => {
+		it("throws when account has no custom endpoint — does not reach OpenAI host", () => {
+			const accountWithoutEndpoint = {
+				...mockAccount,
+				custom_endpoint: undefined,
+			};
+			expect(() =>
+				provider.buildUrl("/v1/messages", "", accountWithoutEndpoint),
+			).toThrow();
+		});
+
+		it("throws when custom_endpoint is null — does not reach OpenAI host", () => {
+			const accountWithNull = { ...mockAccount, custom_endpoint: null };
+			expect(() =>
+				provider.buildUrl("/v1/messages", "", accountWithNull),
+			).toThrow();
+		});
+
+		it("throws when custom_endpoint is an empty string — does not reach OpenAI host", () => {
+			const accountWithEmpty = { ...mockAccount, custom_endpoint: "" };
+			expect(() =>
+				provider.buildUrl("/v1/messages", "", accountWithEmpty),
+			).toThrow();
+		});
+
+		it("throws when custom_endpoint is an unparseable URL — does not reach OpenAI host", () => {
+			const accountWithBad = { ...mockAccount, custom_endpoint: "not-a-url" };
+			expect(() =>
+				provider.buildUrl("/v1/messages", "", accountWithBad),
+			).toThrow();
+		});
+
+		it("throws when JSON endpoint blob has no endpoint field — does not reach OpenAI host", () => {
+			const accountMappingsOnly = {
+				...mockAccount,
+				custom_endpoint: JSON.stringify({
+					modelMappings: { opus: "custom-model" },
+				}),
+			};
+			expect(() =>
+				provider.buildUrl("/v1/messages", "", accountMappingsOnly),
+			).toThrow();
+		});
+
+		it("never produces a URL pointing at the default OpenAI host", () => {
+			// Even if somehow called without an account, the error must prevent
+			// a resolved URL from reaching api.openai.com.
+			expect(() => provider.buildUrl("/v1/messages", "")).toThrow();
+		});
+
+		it("joins a /v1 endpoint with the messages path yielding exactly one /v1 segment", () => {
+			const accountWithV1 = {
+				...mockAccount,
+				custom_endpoint: "https://api.example.com/v1",
+			};
+			const url = provider.buildUrl("/v1/messages", "", accountWithV1);
+			expect(url).toBe("https://api.example.com/v1/chat/completions");
+			expect(url.match(/\/v1/g)?.length).toBe(1);
+		});
+
+		it("resolves a plain-string endpoint identically to an equivalent JSON blob", () => {
+			const plainAccount = {
+				...mockAccount,
+				custom_endpoint: "https://api.openrouter.ai/api/v1",
+			};
+			const jsonAccount = {
+				...mockAccount,
+				custom_endpoint: JSON.stringify({
+					endpoint: "https://api.openrouter.ai/api/v1",
+				}),
+			};
+			expect(provider.buildUrl("/v1/messages", "", plainAccount)).toBe(
+				provider.buildUrl("/v1/messages", "", jsonAccount),
+			);
+		});
+
+		it("still injects cache_control and enable_thinking for DashScope endpoints", async () => {
+			const dashscopeAccount: Account = {
+				...mockAccount,
+				custom_endpoint: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+				model_mappings: JSON.stringify({ opus: "qwen3.5-plus" }),
+			};
+
+			const request = new Request("https://example.com/v1/messages", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					model: "claude-3-opus-20240229",
+					system: "You are a helpful assistant",
+					max_tokens: 1000,
+					messages: [
+						{ role: "user", content: "Hello" },
+						{ role: "assistant", content: "Hi" },
+					],
+				}),
+			});
+
+			const transformed = await provider.transformRequestBody(
+				request,
+				dashscopeAccount,
+			);
+			const body = await transformed.json();
+
+			expect(body.enable_thinking).toBe(true);
+			const systemMsg = body.messages.find(
+				(m: { role: string }) => m.role === "system",
+			);
+			expect(systemMsg).toBeDefined();
+			if (Array.isArray(systemMsg?.content)) {
+				expect(systemMsg.content[0]).toHaveProperty("cache_control");
+			}
+		});
+
+		it("transformRequestBody does not throw when endpoint is missing — hooks are skipped", async () => {
+			// transformRequestBody uses the endpoint only for DashScope hooks.
+			// A missing endpoint must not throw here — the actual URL is built
+			// by buildUrl, which does throw. The hooks are simply skipped.
+			const accountWithoutEndpoint = {
+				...mockAccount,
+				custom_endpoint: undefined,
+			};
+
+			const request = new Request("https://example.com/v1/messages", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					model: "claude-3-haiku-20241022",
+					max_tokens: 100,
+					messages: [{ role: "user", content: "Hello" }],
+				}),
+			});
+
+			// Must not throw — should return a transformed request
+			const transformed = await provider.transformRequestBody(
+				request,
+				accountWithoutEndpoint,
+			);
+			const body = await transformed.json();
+			expect(body.model).toBe("claude-3-haiku-20241022");
+			expect(body.enable_thinking).toBeUndefined();
 		});
 	});
 });

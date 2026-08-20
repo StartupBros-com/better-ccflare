@@ -80,6 +80,7 @@ export {
 	parseCustomEndpointData,
 	parseModelFallbacks,
 	parseModelMappings,
+	resolveCompatibleEndpoint,
 	resolveFamilyAliasModel,
 	validateAndSanitizeModelFallbacks,
 	validateAndSanitizeModelMappings,
