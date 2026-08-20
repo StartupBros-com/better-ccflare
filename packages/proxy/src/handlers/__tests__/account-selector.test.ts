@@ -5396,3 +5396,164 @@ describe("selectAccountsForRequest — pool-floor alarm on the force-route path"
 		}
 	});
 });
+
+// ── U5 canary contract: AE7 priority ordering and KTD9 429 classification ────
+//
+// ALL fixtures in this describe block are CONSTRUCTED, not observed from live
+// traffic. The account configurations mirror the U4 Vercel catch-all recipe
+// (priority 100, GLM model mappings) and a representative higher-priority
+// preferred account.
+
+describe("U5 canary: AE7 higher-priority account selected over Vercel catch-all (constructed)", () => {
+	function makeVercelAccount(): Account {
+		return makeAccount({
+			id: "vercel-catchall",
+			name: "vercel-catchall",
+			provider: "openai-compatible",
+			api_key: "vrsc-constructed-key",
+			refresh_token: null,
+			access_token: null,
+			expires_at: null,
+			priority: 100,
+			custom_endpoint: "https://ai-gateway.vercel.sh/v1",
+			model_mappings: JSON.stringify({
+				opus: ["zai/glm-5.2-fast", "zai/glm-5.2"],
+				sonnet: ["zai/glm-5.2-fast", "zai/glm-5.2"],
+				haiku: ["zai/glm-5.2-fast", "zai/glm-5.2"],
+			}),
+		});
+	}
+
+	function makePreferredAccount(family: string): Account {
+		return makeAccount({
+			id: `preferred-${family}`,
+			name: `preferred-${family}`,
+			provider: "anthropic",
+			priority: 30,
+		});
+	}
+
+	it.each([
+		["claude-opus-4-8", "opus"],
+		["claude-sonnet-4-5", "sonnet"],
+		["claude-haiku-4-5", "haiku"],
+	] as const)("selects the higher-priority account before the Vercel catch-all for %s", async (model, family) => {
+		const preferred = makePreferredAccount(family);
+		const vercel = makeVercelAccount();
+		const ctx = makeCtx({ accounts: [vercel, preferred] });
+		useSessionStrategy(ctx);
+
+		const result = await selectAccountsForRequest(
+			makeRequestMeta(),
+			ctx,
+			model,
+		);
+
+		// The preferred account (priority 30) must come before Vercel
+		// (priority 100, the platform max)
+		expect(result.length).toBeGreaterThanOrEqual(1);
+		expect(result[0]?.id).toBe(preferred.id);
+		// Vercel is present but not first
+		const vercelIdx = result.findIndex((a) => a.id === vercel.id);
+		if (vercelIdx >= 0) {
+			expect(vercelIdx).toBeGreaterThan(0);
+		}
+	});
+
+	it("does not select the Vercel catch-all first when a higher-priority account is eligible", async () => {
+		const preferred = makePreferredAccount("opus");
+		const vercel = makeVercelAccount();
+		const ctx = makeCtx({ accounts: [vercel, preferred] });
+		useSessionStrategy(ctx);
+
+		const result = await selectAccountsForRequest(
+			makeRequestMeta(),
+			ctx,
+			"claude-opus-4-8",
+		);
+
+		expect(result[0]?.id).not.toBe(vercel.id);
+		expect(result[0]?.id).toBe(preferred.id);
+	});
+});
+
+describe("U5 canary: KTD9 Vercel 429 is model-scoped, not an account bench (constructed)", () => {
+	// KTD9: parseRateLimit reports no rate limit for compatible accounts, so a
+	// Vercel 429 continues to behave as a model-unavailable signal rather than
+	// benching the account. This test pins that classification by asserting the
+	// OpenAI-compatible provider's parseRateLimit returns isRateLimited:false
+	// even for a 429 response — which is what keeps a Vercel 429 model-scoped.
+	//
+	// CONSTRUCTED fixture: the 429 response shape is built from documented
+	// OpenAI-compatible error shapes. No live 429 was observed (KTD7), so this
+	// test records explicitly that the 429 fixture was constructed rather than
+	// observed, and that no billing-exhaustion evidence was carried.
+	it("OpenAI-compatible parseRateLimit returns isRateLimited:false for a constructed Vercel 429", async () => {
+		const { OpenAICompatibleProvider } = await import(
+			"@better-ccflare/providers"
+		);
+		const provider = new OpenAICompatibleProvider();
+
+		// CONSTRUCTED 429 fixture — no billing-exhaustion evidence was observed.
+		// A Vercel AI Gateway 429 is built from the documented OpenAI-compatible
+		// error shape. The response carries no anthropic-ratelimit-unified-* or
+		// billing-exhaustion headers because Vercel's compatible surface does not
+		// emit Anthropic-native rate-limit metadata.
+		const response = new Response(
+			JSON.stringify({
+				error: {
+					type: "rate_limit_error",
+					code: "rate_limit_exceeded",
+					message: "Rate limit exceeded for this model",
+				},
+			}),
+			{
+				status: 429,
+				headers: {
+					"content-type": "application/json",
+					"x-ratelimit-remaining-requests": "0",
+					"retry-after": "60",
+				},
+			},
+		);
+
+		const rateLimit = provider.parseRateLimit(response);
+
+		// KTD9: always false — the 429 does not bench the account
+		expect(rateLimit.isRateLimited).toBe(false);
+		// The 429 is left to the model-fallback / model-unavailable path
+		// (isModelUnavailableError returns true for 429), which treats it as
+		// model-scoped rather than account-wide.
+	});
+
+	it("a constructed Vercel 429 without billing-exhaustion evidence does not bench the account", async () => {
+		// KTD9: Because parseRateLimit returns isRateLimited:false, a Vercel 429
+		// is classified as model-scoped (isModelUnavailableError returns true for
+		// 429) and the account is not benched. This test verifies the chain:
+		// parseRateLimit(false) → 429 enters model-fallback, not account cooldown.
+		const { isModelUnavailableError } = await import("../proxy-operations");
+		const { OpenAICompatibleProvider } = await import(
+			"@better-ccflare/providers"
+		);
+		const provider = new OpenAICompatibleProvider();
+
+		const response = new Response(
+			JSON.stringify({
+				error: {
+					type: "rate_limit_error",
+					message: "Rate limit exceeded",
+				},
+			}),
+			{
+				status: 429,
+				headers: { "content-type": "application/json" },
+			},
+		);
+
+		// parseRateLimit does not bench the account
+		expect(provider.parseRateLimit(response).isRateLimited).toBe(false);
+		// But isModelUnavailableError classifies the 429 as model-scoped,
+		// so it enters the model-fallback loop (try next model, not bench account)
+		expect(await isModelUnavailableError(response)).toBe(true);
+	});
+});

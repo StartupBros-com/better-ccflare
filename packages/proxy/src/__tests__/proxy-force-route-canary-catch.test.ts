@@ -249,3 +249,145 @@ describe("handleProxy: force-route fail-closed at the control-cohort first selec
 		expect(followUp?.role).toBe("leader");
 	});
 });
+
+// ── U5 canary contract: forced-route fail-closed for paused and missing accounts ─
+//
+// KTD6: The canary requires an unpause window because a paused account is
+// unavailable, and exact-account routing fails closed on unavailable accounts.
+// A forced canary to a paused or missing Vercel account must return the typed
+// 503 force_route_unavailable response instead of silently selecting another
+// account — the canary must not escape to a different account on failure.
+//
+// ALL fixtures are constructed (not observed from live traffic).
+
+describe("U5 canary: forced route to a paused or missing Vercel account fails closed (constructed)", () => {
+	it("returns the typed 503 force_route_unavailable for a paused Vercel catch-all account", async () => {
+		const vercel = makeAccount({
+			id: "vercel-catchall",
+			name: "vercel-catchall",
+			paused: true,
+			pause_reason: "manual",
+			custom_endpoint: "https://ai-gateway.vercel.sh/v1",
+			model_mappings: JSON.stringify({
+				opus: ["zai/glm-5.2-fast", "zai/glm-5.2"],
+				sonnet: ["zai/glm-5.2-fast", "zai/glm-5.2"],
+			}),
+		});
+
+		const ctx = {
+			strategy: { select: mock(() => []) },
+			dbOps: {
+				getAllAccounts: mock(async () => [vercel]),
+				getActiveComboForFamily: mock(async () => null),
+				getAgentPreference: mock(async () => null),
+			},
+			runtime: { port: 8080, clientId: "test" },
+			config: {
+				getUsageThrottlingFiveHourEnabled: () => false,
+				getUsageThrottlingWeeklyEnabled: () => false,
+				getSystemPromptCacheTtl1h: () => false,
+				getAgentFrontmatterModelFallback: () => false,
+				getStorePayloads: () => false,
+			},
+			provider: {
+				name: "openai-compatible",
+				canHandle: () => true,
+				buildUrl: (_path: string, _search: string, account: Account) =>
+					`https://upstream.test/${account.id}`,
+				prepareHeaders: (headers: Headers) => new Headers(headers),
+				processResponse: async (response: Response) => response,
+				parseRateLimit: () => ({
+					isRateLimited: false,
+					resetTime: null,
+				}),
+			},
+			refreshInFlight: new Map(),
+			asyncWriter: { enqueue: mock(() => undefined) },
+		} as unknown as ProxyContext;
+
+		const request = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"x-better-ccflare-account-id": "vercel-catchall",
+			},
+			body: JSON.stringify({
+				model: "claude-opus-4-8",
+				messages: [{ role: "user", content: "canary" }],
+				max_tokens: 16,
+			}),
+		});
+
+		const response = await handleProxy(request, new URL(request.url), ctx);
+
+		expect(response.status).toBe(503);
+		expect(response.headers.get("x-better-ccflare-force-route")).toBe(
+			"unavailable",
+		);
+		const parsed = (await response.json()) as {
+			error: { type: string; account_id: string; reason: string };
+		};
+		expect(parsed.error.type).toBe("force_route_unavailable");
+		expect(parsed.error.account_id).toBe("vercel-catchall");
+		expect(parsed.error.reason).toBe("paused");
+	});
+
+	it("returns the typed 503 force_route_unavailable for a missing Vercel account (not found)", async () => {
+		const ctx = {
+			strategy: { select: mock(() => []) },
+			dbOps: {
+				getAllAccounts: mock(async () => []),
+				getActiveComboForFamily: mock(async () => null),
+				getAgentPreference: mock(async () => null),
+			},
+			runtime: { port: 8080, clientId: "test" },
+			config: {
+				getUsageThrottlingFiveHourEnabled: () => false,
+				getUsageThrottlingWeeklyEnabled: () => false,
+				getSystemPromptCacheTtl1h: () => false,
+				getAgentFrontmatterModelFallback: () => false,
+				getStorePayloads: () => false,
+			},
+			provider: {
+				name: "openai-compatible",
+				canHandle: () => true,
+				buildUrl: (_path: string, _search: string, _account: Account) =>
+					`https://upstream.test/vercel-catchall`,
+				prepareHeaders: (headers: Headers) => new Headers(headers),
+				processResponse: async (response: Response) => response,
+				parseRateLimit: () => ({
+					isRateLimited: false,
+					resetTime: null,
+				}),
+			},
+			refreshInFlight: new Map(),
+			asyncWriter: { enqueue: mock(() => undefined) },
+		} as unknown as ProxyContext;
+
+		const request = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"x-better-ccflare-account-id": "vercel-catchall-deleted",
+			},
+			body: JSON.stringify({
+				model: "claude-opus-4-8",
+				messages: [{ role: "user", content: "canary" }],
+				max_tokens: 16,
+			}),
+		});
+
+		const response = await handleProxy(request, new URL(request.url), ctx);
+
+		expect(response.status).toBe(503);
+		expect(response.headers.get("x-better-ccflare-force-route")).toBe(
+			"unavailable",
+		);
+		const parsed = (await response.json()) as {
+			error: { type: string; account_id: string; reason: string };
+		};
+		expect(parsed.error.type).toBe("force_route_unavailable");
+		expect(parsed.error.account_id).toBe("vercel-catchall-deleted");
+		expect(parsed.error.reason).toBe("not_found");
+	});
+});
