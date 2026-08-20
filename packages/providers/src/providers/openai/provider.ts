@@ -1,4 +1,5 @@
 import {
+	AuthError,
 	resolveCompatibleEndpoint,
 	ValidationError,
 } from "@better-ccflare/core";
@@ -31,16 +32,24 @@ export class OpenAICompatibleProvider extends BaseProvider {
 		account: Account,
 		_clientId: string,
 	): Promise<TokenRefreshResult> {
-		// OpenAI-compatible providers use API keys, not OAuth tokens
-		// Store the API key in refresh_token field for consistency
-		if (!account.refresh_token) {
-			throw new Error(`No API key available for account ${account.name}`);
+		// KTD4/R2: resolve the static credential from the canonical `api_key`
+		// column, falling back to a legacy row that mirrors its key into
+		// `refresh_token` (older CLI-created accounts). A CLI-created compatible
+		// account never carries an OAuth-shaped refresh token, so reading
+		// `api_key` first is the correct contract.
+		const apiKey = account.api_key || account.refresh_token;
+
+		if (!apiKey) {
+			throw new AuthError(`No API key available for account ${account.name}`, {
+				accountId: account.id,
+				provider: account.provider,
+			});
 		}
 
 		// For API key based providers, we don't need to refresh tokens
 		// Just return the existing API key as both access and refresh token
 		return {
-			accessToken: account.refresh_token,
+			accessToken: apiKey,
 			expiresAt: Date.now() + 365 * 24 * 60 * 60 * 1000, // 1 year from now
 			refreshToken: "", // Empty string prevents DB update for API key accounts
 		};

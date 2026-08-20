@@ -1,3 +1,4 @@
+import { AuthError } from "@better-ccflare/core";
 import type { Account } from "@better-ccflare/types";
 import { OpenAICompatibleProvider } from "../provider";
 
@@ -7,14 +8,16 @@ describe("OpenAICompatibleProvider", () => {
 
 	beforeEach(() => {
 		provider = new OpenAICompatibleProvider();
+		// Canonical shape (KTD4/R2): a CLI-created compatible account stores
+		// its static key in `api_key` and has no OAuth-shaped `refresh_token`.
 		mockAccount = {
 			id: "test-id",
 			name: "test-account",
 			provider: "openai-compatible",
-			refresh_token: "test-api-key",
+			refresh_token: null,
 			access_token: null,
 			expires_at: null,
-			api_key: null,
+			api_key: "test-api-key",
 			custom_endpoint: JSON.stringify({
 				endpoint: "https://api.openrouter.ai/api/v1",
 			}),
@@ -270,7 +273,9 @@ describe("OpenAICompatibleProvider", () => {
 	});
 
 	describe("refreshToken", () => {
-		it("should return existing API key for API key providers", async () => {
+		it("authenticates from api_key (canonical compatible-lane shape, R2/KTD4)", async () => {
+			// A CLI-created compatible account holds only api_key — no
+			// OAuth-shaped refresh_token.
 			const result = await provider.refreshToken(mockAccount, "client-id");
 
 			expect(result.accessToken).toBe("test-api-key");
@@ -278,12 +283,32 @@ describe("OpenAICompatibleProvider", () => {
 			expect(result.expiresAt).toBeGreaterThan(Date.now());
 		});
 
-		it("should throw error when no API key is available", async () => {
-			const accountWithoutKey = { ...mockAccount, refresh_token: null };
+		it("authenticates from a legacy mirrored refresh_token (KTD4 fallback)", async () => {
+			// Legacy rows mirror the static key into refresh_token with no
+			// api_key. The contract must still resolve it.
+			const legacyAccount: Account = {
+				...mockAccount,
+				api_key: null,
+				refresh_token: "legacy-mirrored-key",
+			};
+
+			const result = await provider.refreshToken(legacyAccount, "client-id");
+
+			expect(result.accessToken).toBe("legacy-mirrored-key");
+			expect(result.refreshToken).toBe("");
+			expect(result.expiresAt).toBeGreaterThan(Date.now());
+		});
+
+		it("raises a typed credential error when neither api_key nor refresh_token exists", async () => {
+			const accountWithoutKey: Account = {
+				...mockAccount,
+				api_key: null,
+				refresh_token: null,
+			};
 
 			await expect(
 				provider.refreshToken(accountWithoutKey, "client-id"),
-			).rejects.toThrow("No API key available");
+			).rejects.toBeInstanceOf(AuthError);
 		});
 	});
 

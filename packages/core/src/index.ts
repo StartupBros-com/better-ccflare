@@ -21,6 +21,7 @@ export {
 	TIME_CONSTANTS,
 } from "./constants";
 export {
+	AuthError,
 	formatOAuthErrorMessage,
 	getExactOAuthErrorCode,
 	getOAuthErrorCode,
