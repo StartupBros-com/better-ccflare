@@ -61,10 +61,20 @@ function gitAt(cwd: string, ...args: string[]) {
 	});
 }
 
+function capturedOutput(
+	output: Uint8Array | undefined,
+	stream: "stdout" | "stderr",
+): string {
+	if (output === undefined) {
+		throw new Error(`command did not capture ${stream}`);
+	}
+	return output.toString();
+}
+
 function expectCommandOk(result: ReturnType<typeof Bun.spawnSync>): void {
 	if (result.exitCode !== 0) {
 		throw new Error(
-			`command failed (${result.exitCode}):\n${result.stdout.toString()}\n${result.stderr.toString()}`,
+			`command failed (${result.exitCode}):\n${capturedOutput(result.stdout, "stdout")}\n${capturedOutput(result.stderr, "stderr")}`,
 		);
 	}
 }
@@ -151,10 +161,10 @@ function shellPath(value: string): string {
 	);
 	if (result.exitCode !== 0) {
 		throw new Error(
-			`failed to convert Windows path for bash: ${result.stderr.toString().trim()}`,
+			`failed to convert Windows path for bash: ${capturedOutput(result.stderr, "stderr").trim()}`,
 		);
 	}
-	const converted = result.stdout.toString().trim();
+	const converted = capturedOutput(result.stdout, "stdout").trim();
 	if (!converted.startsWith("/")) {
 		throw new Error(`bash returned a non-POSIX path: ${converted}`);
 	}
@@ -408,7 +418,7 @@ describe("render_systemd_pin", () => {
 		);
 
 		expect(repoRootDeployTestArtifacts()).toEqual([]);
-		expect(result.stderr.toString()).toBe("");
+		expect(capturedOutput(result.stderr, "stderr")).toBe("");
 		expect(result.exitCode).toBe(0);
 		expect(readFileSync(output, "utf8")).toBe(
 			[
@@ -424,6 +434,10 @@ describe("render_systemd_pin", () => {
 				`Environment=GUARD_SHA256=${sha256Of(guardScript)}`,
 				`Environment=GUARD_POLICY_SHA256=${sha256Of(guardPolicyScript)}`,
 				`Environment=RUNNER_SHA256=${sha256Of(runnerScriptFixture)}`,
+				"Environment=GUARD_MAX_REQUEST_BODY_BYTES=33554432",
+				"Environment=GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES=268435456",
+				"Environment=CCFLARE_MAX_BUFFERED_REQUEST_BODY_BYTES=268435456",
+				"Environment=CCFLARE_MAX_BODY_ADMISSION_QUEUE=500",
 				"Environment=GUARD_TOTAL_DEADLINE_MS=600000",
 				"Environment=GUARD_RETRY_ATTEMPT_HEADROOM_MS=30000",
 				"Environment=GUARD_MAX_RECOVERY_SLEEP_MS=120000",
@@ -499,14 +513,14 @@ describe("render_systemd_pin", () => {
 		);
 
 		expect(result.exitCode).toBe(1);
-		expect(result.stderr.toString()).toContain(
+		expect(capturedOutput(result.stderr, "stderr")).toContain(
 			"contains unmanaged systemd configuration outside",
 		);
-		expect(result.stderr.toString()).toContain("line 2: [Service]");
-		expect(result.stderr.toString()).toContain(
+		expect(capturedOutput(result.stderr, "stderr")).toContain("line 2: [Service]");
+		expect(capturedOutput(result.stderr, "stderr")).toContain(
 			"Migrate operator policy to a later drop-in",
 		);
-		expect(result.stderr.toString()).toContain("90-operator-policy.conf");
+		expect(capturedOutput(result.stderr, "stderr")).toContain("90-operator-policy.conf");
 		expect(existsSync(output)).toBe(false);
 		expect(existsSync(mutationLog)).toBe(false);
 	});
@@ -525,7 +539,7 @@ describe("render_systemd_pin", () => {
 		);
 
 		expect(result.exitCode).not.toBe(0);
-		expect(result.stderr.toString()).toContain(
+		expect(capturedOutput(result.stderr, "stderr")).toContain(
 			"sha256_file requires one existing file",
 		);
 	});
@@ -592,7 +606,7 @@ describe("render_systemd_pin", () => {
 		);
 
 		expect(result.exitCode).not.toBe(0);
-		expect(result.stderr.toString()).toContain("invalid managed marker structure");
+		expect(capturedOutput(result.stderr, "stderr")).toContain("invalid managed marker structure");
 	});
 });
 
@@ -616,7 +630,7 @@ describe("configured_systemd_environment_value", () => {
 			].join("\n"),
 		);
 		expect(result.exitCode).toBe(0);
-		expect(result.stdout.toString().trim()).toBe("900000");
+		expect(capturedOutput(result.stdout, "stdout").trim()).toBe("900000");
 	});
 
 	test("matches systemd Service-section, reset, continuation, and last-wins semantics", () => {
@@ -649,7 +663,7 @@ describe("configured_systemd_environment_value", () => {
 			].join("\n"),
 		);
 		expect(result.exitCode).toBe(0);
-		expect(result.stdout.toString().trim().split("\n")).toEqual([
+		expect(capturedOutput(result.stdout, "stdout").trim().split("\n")).toEqual([
 			"900000",
 			"900000",
 		]);
@@ -672,6 +686,10 @@ describe("validate_deployment_timing", () => {
 					"guard_shutdown_grace_ms=600000",
 					"guard_max_recovery_waits=12",
 					"stop_timeout_ms=720000",
+						"guard_max_request_body_bytes=33554432",
+						"guard_max_buffered_request_body_bytes=268435456",
+						"body_admission_budget_bytes=268435456",
+						"body_admission_queue_limit=500",
 				].join("\n"),
 			],
 			[
@@ -687,6 +705,10 @@ describe("validate_deployment_timing", () => {
 					"guard_shutdown_grace_ms=900000",
 					"guard_max_recovery_waits=12",
 					"stop_timeout_ms=1020000",
+						"guard_max_request_body_bytes=33554432",
+						"guard_max_buffered_request_body_bytes=268435456",
+						"body_admission_budget_bytes=268435456",
+						"body_admission_queue_limit=500",
 				].join("\n"),
 			],
 		] as const) {
@@ -696,6 +718,10 @@ describe("validate_deployment_timing", () => {
 				pin,
 				[
 					"[Service]",
+					"Environment=GUARD_MAX_REQUEST_BODY_BYTES=33554432",
+					"Environment=GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES=268435456",
+					"Environment=CCFLARE_MAX_BUFFERED_REQUEST_BODY_BYTES=268435456",
+					"Environment=CCFLARE_MAX_BODY_ADMISSION_QUEUE=500",
 					`Environment=GUARD_TOTAL_DEADLINE_MS=${deadline}`,
 					`Environment=GUARD_RETRY_ATTEMPT_HEADROOM_MS=${headroom}`,
 					`Environment=GUARD_MAX_RECOVERY_SLEEP_MS=${maxSleep}`,
@@ -713,7 +739,7 @@ describe("validate_deployment_timing", () => {
 				].join("\n"),
 			);
 			expect(result.exitCode).toBe(0);
-			expect(result.stdout.toString().trim()).toBe(expected);
+			expect(capturedOutput(result.stdout, "stdout").trim()).toBe(expected);
 		}
 	});
 
@@ -749,6 +775,10 @@ describe("validate_deployment_timing", () => {
 			pin,
 			[
 				"[Service]",
+				"Environment=GUARD_MAX_REQUEST_BODY_BYTES=33554432",
+				"Environment=GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES=268435456",
+				"Environment=CCFLARE_MAX_BUFFERED_REQUEST_BODY_BYTES=268435456",
+				"Environment=CCFLARE_MAX_BODY_ADMISSION_QUEUE=500",
 				"Environment=GUARD_TOTAL_DEADLINE_MS=600000",
 				"Environment=GUARD_RETRY_ATTEMPT_HEADROOM_MS=30000",
 				"Environment=GUARD_MAX_RECOVERY_WAITS=12",
@@ -761,7 +791,7 @@ describe("validate_deployment_timing", () => {
 			`source ${shellQuote(helperScriptForShell)}\nvalidate_deployment_timing ${shellQuote(shellPath(pin))}`,
 		);
 		expect(result.exitCode).not.toBe(0);
-		expect(result.stderr.toString()).toContain(
+		expect(capturedOutput(result.stderr, "stderr")).toContain(
 			"missing GUARD_MAX_RECOVERY_SLEEP_MS",
 		);
 	});
@@ -890,7 +920,7 @@ describe("effective systemd policy validation", () => {
 			`export CCFLARE_TEST_SYSTEMCTL_LOG=${shellQuote(shellPath(log))}`,
 			"export CCFLARE_TEST_KILL_MODE=mixed",
 			"export CCFLARE_TEST_TIMEOUT=12min",
-			"export CCFLARE_TEST_ENVIRONMENT='KEEP=1 GUARD_TOTAL_DEADLINE_MS=600000 GUARD_RETRY_ATTEMPT_HEADROOM_MS=30000 GUARD_MAX_RECOVERY_SLEEP_MS=120000 GUARD_MAX_RECOVERY_WAITS=12 GUARD_SHUTDOWN_GRACE_MS=600000'",
+			"export CCFLARE_TEST_ENVIRONMENT='KEEP=1 GUARD_MAX_REQUEST_BODY_BYTES=33554432 GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES=268435456 CCFLARE_MAX_BUFFERED_REQUEST_BODY_BYTES=268435456 CCFLARE_MAX_BODY_ADMISSION_QUEUE=500 GUARD_TOTAL_DEADLINE_MS=600000 GUARD_RETRY_ATTEMPT_HEADROOM_MS=30000 GUARD_MAX_RECOVERY_SLEEP_MS=120000 GUARD_MAX_RECOVERY_WAITS=12 GUARD_SHUTDOWN_GRACE_MS=600000'",
 			`source ${shellQuote(helperScriptForShell)}`,
 		];
 		const good = bash(
@@ -900,11 +930,11 @@ describe("effective systemd policy validation", () => {
 			].join("\n"),
 		);
 		expect(good.exitCode).toBe(0);
-		expect(good.stdout.toString()).toContain(
+		expect(capturedOutput(good.stdout, "stdout")).toContain(
 			"guard_max_recovery_sleep_ms=120000",
 		);
-		expect(good.stdout.toString()).toContain("guard_max_recovery_waits=12");
-		expect(good.stdout.toString()).toContain(
+		expect(capturedOutput(good.stdout, "stdout")).toContain("guard_max_recovery_waits=12");
+		expect(capturedOutput(good.stdout, "stdout")).toContain(
 			"runner_failure_stop_budget_ms=30000",
 		);
 
@@ -937,15 +967,15 @@ describe("effective systemd policy validation", () => {
 			[
 				...base,
 				"export CCFLARE_TEST_TIMEOUT='17min'",
-				"export CCFLARE_TEST_ENVIRONMENT='GUARD_TOTAL_DEADLINE_MS=900000 GUARD_RETRY_ATTEMPT_HEADROOM_MS=45000 GUARD_MAX_RECOVERY_SLEEP_MS=90000 GUARD_MAX_RECOVERY_WAITS=20 GUARD_SHUTDOWN_GRACE_MS=900000'",
+				"export CCFLARE_TEST_ENVIRONMENT='GUARD_MAX_REQUEST_BODY_BYTES=16777216 GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES=33554432 CCFLARE_MAX_BUFFERED_REQUEST_BODY_BYTES=268435456 CCFLARE_MAX_BODY_ADMISSION_QUEUE=500 GUARD_TOTAL_DEADLINE_MS=900000 GUARD_RETRY_ATTEMPT_HEADROOM_MS=45000 GUARD_MAX_RECOVERY_SLEEP_MS=90000 GUARD_MAX_RECOVERY_WAITS=20 GUARD_SHUTDOWN_GRACE_MS=900000'",
 				"validate_effective_systemd_policy ccflare-stack.service",
 			].join("\n"),
 		);
 		expect(safeOperatorOverride.exitCode).toBe(0);
-		expect(safeOperatorOverride.stdout.toString()).toContain(
+		expect(capturedOutput(safeOperatorOverride.stdout, "stdout")).toContain(
 			"guard_max_recovery_sleep_ms=90000",
 		);
-		expect(safeOperatorOverride.stdout.toString()).toContain(
+		expect(capturedOutput(safeOperatorOverride.stdout, "stdout")).toContain(
 			"guard_max_recovery_waits=20",
 		);
 
@@ -1025,6 +1055,51 @@ describe("effective systemd policy validation", () => {
 			].join("\n"),
 		);
 		expect(missingHeadroom.exitCode).not.toBe(0);
+	});
+
+	test("rejects missing, noninteger, out-of-range, and inconsistent effective body policies", () => {
+		const dir = tempDir();
+		const { binDir, log } = writeSystemctlMock(dir);
+		const base = [
+			`export PATH=${shellQuote(shellPath(binDir))}:$PATH`,
+			`export CCFLARE_TEST_SYSTEMCTL_LOG=${shellQuote(shellPath(log))}`,
+			"export CCFLARE_TEST_KILL_MODE=mixed",
+			"export CCFLARE_TEST_TIMEOUT=12min",
+			`source ${shellQuote(helperScriptForShell)}`,
+		];
+		const safe = "GUARD_MAX_REQUEST_BODY_BYTES=33554432 GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES=268435456 CCFLARE_MAX_BUFFERED_REQUEST_BODY_BYTES=268435456 CCFLARE_MAX_BODY_ADMISSION_QUEUE=500 GUARD_TOTAL_DEADLINE_MS=600000 GUARD_RETRY_ATTEMPT_HEADROOM_MS=30000 GUARD_MAX_RECOVERY_SLEEP_MS=120000 GUARD_MAX_RECOVERY_WAITS=12 GUARD_SHUTDOWN_GRACE_MS=600000";
+		const good = bash([
+			...base,
+			`export CCFLARE_TEST_ENVIRONMENT='${safe}'`,
+			"validate_effective_systemd_policy ccflare-stack.service",
+		].join("\n"));
+		expect(good.exitCode).toBe(0);
+		expect(capturedOutput(good.stdout, "stdout")).toContain("guard_max_request_body_bytes=33554432");
+		expect(capturedOutput(good.stdout, "stdout")).toContain("guard_max_buffered_request_body_bytes=268435456");
+
+		for (const environment of [
+			safe.replace("GUARD_MAX_REQUEST_BODY_BYTES=33554432 ", ""),
+			safe.replace("GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES=268435456 ", ""),
+			safe.replace("CCFLARE_MAX_BUFFERED_REQUEST_BODY_BYTES=268435456 ", ""),
+			safe.replace("CCFLARE_MAX_BODY_ADMISSION_QUEUE=500 ", ""),
+			safe.replace("CCFLARE_MAX_BUFFERED_REQUEST_BODY_BYTES=268435456", "CCFLARE_MAX_BUFFERED_REQUEST_BODY_BYTES=1"),
+			safe.replace("CCFLARE_MAX_BUFFERED_REQUEST_BODY_BYTES=268435456", "CCFLARE_MAX_BUFFERED_REQUEST_BODY_BYTES=1073741825"),
+			safe.replace("CCFLARE_MAX_BODY_ADMISSION_QUEUE=500", "CCFLARE_MAX_BODY_ADMISSION_QUEUE=5001"),
+			safe.replace("CCFLARE_MAX_BODY_ADMISSION_QUEUE=500", "CCFLARE_MAX_BODY_ADMISSION_QUEUE=invalid"),
+			safe.replace("GUARD_MAX_REQUEST_BODY_BYTES=33554432", "GUARD_MAX_REQUEST_BODY_BYTES=1.5"),
+			safe.replace("GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES=268435456", "GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES=not-a-number"),
+			safe.replace("GUARD_MAX_REQUEST_BODY_BYTES=33554432", "GUARD_MAX_REQUEST_BODY_BYTES=1023"),
+			safe.replace("GUARD_MAX_REQUEST_BODY_BYTES=33554432", "GUARD_MAX_REQUEST_BODY_BYTES=33554433"),
+			safe.replace("GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES=268435456", "GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES=268435457"),
+			safe.replace("GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES=268435456", "GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES=67108863"),
+		]) {
+			const invalid = bash([
+				...base,
+				`export CCFLARE_TEST_ENVIRONMENT='${environment}'`,
+				"validate_effective_systemd_policy ccflare-stack.service",
+			].join("\n"));
+			expect(invalid.exitCode).not.toBe(0);
+		}
 	});
 
 	test("allows a legacy restart policy only for rollback compatibility", () => {
@@ -1140,10 +1215,10 @@ describe("effective systemd policy validation", () => {
 		);
 		expect(result.exitCode).toBe(70);
 		expect(readFileSync(pin, "utf8")).toBe("old pin\n");
-		expect(result.stderr.toString()).toContain(
+		expect(capturedOutput(result.stderr, "stderr")).toContain(
 			"operator drop-ins still produce an unsafe effective systemd policy",
 		);
-		expect(result.stderr.toString()).toContain("90-operator-policy.conf");
+		expect(capturedOutput(result.stderr, "stderr")).toContain("90-operator-policy.conf");
 		const events = readFileSync(log, "utf8").trim().split("\n");
 		expect(
 			events.filter((event) => event === "systemctl:daemon-reload"),
@@ -1179,7 +1254,7 @@ describe("effective systemd policy validation", () => {
 			].join("\n"),
 		);
 		expect(result.exitCode).toBe(0);
-		expect(result.stdout.toString()).toBe("1");
+		expect(capturedOutput(result.stdout, "stdout")).toBe("1");
 		expect(readFileSync(pin, "utf8")).toBe("new deploy pin\n");
 		expect(readFileSync(backup, "utf8")).toBe("original pin\n");
 		expect(existsSync(staged)).toBe(false);
@@ -1219,7 +1294,7 @@ describe("effective systemd policy validation", () => {
 		expect(result.exitCode).toBe(1);
 		expect(readFileSync(pin, "utf8")).toBe("operator edit\n");
 		expect(existsSync(staged)).toBe(false);
-		expect(result.stderr.toString()).toContain(
+		expect(capturedOutput(result.stderr, "stderr")).toContain(
 			"changed after the deployment snapshot was captured",
 		);
 	});
@@ -1238,7 +1313,7 @@ describe("effective systemd policy validation", () => {
 		);
 
 		expect(result.exitCode).not.toBe(0);
-		expect(result.stderr.toString()).toContain(
+		expect(capturedOutput(result.stderr, "stderr")).toContain(
 			"sha256_file requires one existing file",
 		);
 	});
@@ -1257,6 +1332,10 @@ describe("validate_deploy_health", () => {
 				guard: { path: "/artifacts/guard", sha256: "guard-digest" },
 				policy: { path: "/artifacts/policy", sha256: "policy-digest" },
 			},
+			bodyAdmission: {
+				budgetBytes: 268_435_456,
+				queueLimit: 500,
+			},
 			limits: {
 				totalDeadlineMs: 900_000,
 				retryAttemptHeadroomMs: 45_000,
@@ -1266,12 +1345,24 @@ describe("validate_deploy_health", () => {
 				maxAttempts: 3,
 				jitterMs: 2_000,
 				maxInspectionBytes: 65_536,
+				maxRequestBodyBytes: 33_554_432,
+				maxBufferedRequestBodyBytes: 268_435_456,
 			},
 		});
-		const proxy = JSON.stringify({ git_sha: "abc123" });
+		const proxy = JSON.stringify({
+			git_sha: "abc123",
+			runtime: {
+				bodyAdmission: {
+					budgetBytes: 268_435_456,
+					queueLimit: 500,
+				},
+			},
+		});
 		const guard = JSON.stringify({
 			sourceId: "full-sha",
 			policyId: "pool-exhaustion-finite-recovery-v1",
+			maxRequestBodyBytes: 33_554_432,
+			maxBufferedRequestBodyBytes: 268_435_456,
 			runtime: {
 				process: { runnerPid: 42 },
 				artifacts: {
@@ -1295,7 +1386,9 @@ describe("validate_deploy_health", () => {
 					maxAttempts: 3,
 					jitterMs: 2_000,
 					maxInspectionBytes: 65_536,
-				},
+					maxRequestBodyBytes: 33_554_432,
+					maxBufferedRequestBodyBytes: 268_435_456,
+					},
 			},
 		});
 		const good = bash(
@@ -1308,6 +1401,8 @@ describe("validate_deploy_health", () => {
 
 		for (const [needle, replacement] of [
 			['"git_sha":"abc123"', '"git_sha":"wrong"'],
+			['"budgetBytes":268435456', '"budgetBytes":1'],
+			['"queueLimit":500', '"queueLimit":1'],
 			['"runnerPid":42', '"runnerPid":99'],
 			['"sha256":"guard-digest"', '"sha256":"wrong"'],
 			['"maxAttempts":3', '"maxAttempts":9'],
@@ -1316,6 +1411,11 @@ describe("validate_deploy_health", () => {
 				'"retryAttemptHeadroomMs":1',
 			],
 			['"maxRecoverySleepMs":120000', '"maxRecoverySleepMs":300000'],
+			['"maxRequestBodyBytes":33554432', '"maxRequestBodyBytes":1'],
+			[
+				'"maxBufferedRequestBodyBytes":268435456,"runtime"',
+				'"maxBufferedRequestBodyBytes":1,"runtime"',
+			],
 		] as const) {
 			const bad = bash(
 				[
@@ -1337,11 +1437,12 @@ describe("validate_deploy_health", () => {
 });
 
 describe("rollback identity proof", () => {
-	test("returns hard-failure 70 when prior identity is absent or differs", () => {
+	test("accepts a legacy rollback identity without aggregate body-policy fields and rejects missing identity", () => {
 		const proxy = '{"git_sha":"old"}';
 		const completeGuard = JSON.stringify({
 			sourceId: "old-source",
 			policyId: "old-policy",
+			maxRequestBodyBytes: 4_194_304,
 			runtime: {
 				artifacts: {
 					binary: { path: "/b", sha256: "b" },
@@ -1354,7 +1455,8 @@ describe("rollback identity proof", () => {
 					maxAttempts: 3,
 					jitterMs: 2_000,
 					maxInspectionBytes: 65_536,
-				},
+					maxRequestBodyBytes: 4_194_304,
+					},
 			},
 		});
 		const good = bash(
@@ -1380,6 +1482,36 @@ describe("rollback identity proof", () => {
 			);
 			expect(bad.exitCode).toBe(70);
 		}
+	});
+
+	test("requires complete body-policy proof for current-format rollback snapshots", () => {
+		const proxy = '{"git_sha":"current"}';
+		const incompleteCurrentGuard = JSON.stringify({
+			sourceId: "current-source",
+			policyId: "current-policy",
+			maxRequestBodyBytes: 33_554_432,
+			maxBufferedRequestBodyBytes: 268_435_456,
+			runtime: {
+				artifacts: {
+					binary: { path: "/b", sha256: "b" },
+					runner: { path: "/r", sha256: "r" },
+					guard: { path: "/g", sha256: "g" },
+					policy: { path: "/p", sha256: "p" },
+				},
+				limits: {
+					totalDeadlineMs: 120_000,
+					maxAttempts: 3,
+					jitterMs: 2_000,
+					maxInspectionBytes: 65_536,
+					maxRequestBodyBytes: 33_554_432,
+				},
+			},
+		});
+		const result = bash([
+			`source ${shellQuote(helperScriptForShell)}`,
+			`validate_rollback_health ${shellQuote(proxy)} ${shellQuote(incompleteCurrentGuard)} ${shellQuote(proxy)} ${shellQuote(incompleteCurrentGuard)}`,
+		].join("\n"));
+		expect(result.exitCode).toBe(70);
 	});
 });
 
@@ -1436,7 +1568,7 @@ describe("guard_prune_candidates", () => {
 		);
 
 		expect(result.exitCode).toBe(0);
-		expect(result.stdout.toString().trim().split("\n")).toEqual([
+		expect(capturedOutput(result.stdout, "stdout").trim().split("\n")).toEqual([
 			`${shellRoot}/ccccccc`,
 		]);
 	});
@@ -1449,7 +1581,7 @@ describe("source-controlled stack runner", () => {
 				`GUARD_SHUTDOWN_GRACE_MS=${shellQuote(value)} CCFLARE_BIN=/bin/true GUARD_SCRIPT=/bin/true NODE_BIN=/bin/true AI_GATEWAY_TUNNEL_ENABLED=0 bash ${shellQuote(shellPath(runnerScript))}`,
 			);
 			expect(invalid.exitCode).toBe(64);
-			expect(invalid.stdout.toString()).toContain(
+			expect(capturedOutput(invalid.stdout, "stdout")).toContain(
 				`invalid GUARD_SHUTDOWN_GRACE_MS=${value}`,
 			);
 		}
@@ -1466,7 +1598,7 @@ describe("source-controlled stack runner", () => {
 				`RUNNER_FAILURE_STOP_BUDGET_MS=${shellQuote(value)} CCFLARE_BIN=/bin/true GUARD_SCRIPT=/bin/true NODE_BIN=/bin/true AI_GATEWAY_TUNNEL_ENABLED=0 bash ${shellQuote(shellPath(runnerScript))}`,
 			);
 			expect(invalid.exitCode).toBe(64);
-			expect(invalid.stdout.toString()).toContain(
+			expect(capturedOutput(invalid.stdout, "stdout")).toContain(
 				`invalid RUNNER_FAILURE_STOP_BUDGET_MS=${value}`,
 			);
 		}
@@ -1496,7 +1628,7 @@ describe("source-controlled stack runner", () => {
 			`GUARD_TOTAL_DEADLINE_MS=0 CCFLARE_BIN=/bin/true GUARD_SCRIPT=/bin/true NODE_BIN=/bin/true AI_GATEWAY_TUNNEL_ENABLED=0 bash ${shellQuote(shellPath(runnerScript))}`,
 		);
 		expect(result.exitCode).toBe(64);
-		expect(result.stdout.toString()).toContain(
+		expect(capturedOutput(result.stdout, "stdout")).toContain(
 			"invalid GUARD_TOTAL_DEADLINE_MS=0",
 		);
 	});
@@ -1506,7 +1638,7 @@ describe("source-controlled stack runner", () => {
 			`GUARD_RETRY_ATTEMPT_HEADROOM_MS=0 CCFLARE_BIN=/bin/true GUARD_SCRIPT=/bin/true NODE_BIN=/bin/true AI_GATEWAY_TUNNEL_ENABLED=0 bash ${shellQuote(shellPath(runnerScript))}`,
 		);
 		expect(result.exitCode).toBe(64);
-		expect(result.stdout.toString()).toContain(
+		expect(capturedOutput(result.stdout, "stdout")).toContain(
 			"invalid GUARD_RETRY_ATTEMPT_HEADROOM_MS=0",
 		);
 	});
@@ -1516,7 +1648,7 @@ describe("source-controlled stack runner", () => {
 			`GUARD_MAX_RECOVERY_SLEEP_MS=0 CCFLARE_BIN=/bin/true GUARD_SCRIPT=/bin/true NODE_BIN=/bin/true AI_GATEWAY_TUNNEL_ENABLED=0 bash ${shellQuote(shellPath(runnerScript))}`,
 		);
 		expect(invalid.exitCode).toBe(64);
-		expect(invalid.stdout.toString()).toContain(
+		expect(capturedOutput(invalid.stdout, "stdout")).toContain(
 			"invalid GUARD_MAX_RECOVERY_SLEEP_MS=0",
 		);
 
@@ -1524,7 +1656,7 @@ describe("source-controlled stack runner", () => {
 			`GUARD_TOTAL_DEADLINE_MS=100 GUARD_RETRY_ATTEMPT_HEADROOM_MS=40 GUARD_MAX_RECOVERY_SLEEP_MS=61 GUARD_SHUTDOWN_GRACE_MS=100 CCFLARE_BIN=/bin/true GUARD_SCRIPT=/bin/true NODE_BIN=/bin/true AI_GATEWAY_TUNNEL_ENABLED=0 bash ${shellQuote(shellPath(runnerScript))}`,
 		);
 		expect(infeasible.exitCode).toBe(64);
-		expect(infeasible.stdout.toString()).toContain(
+		expect(capturedOutput(infeasible.stdout, "stdout")).toContain(
 			"GUARD_MAX_RECOVERY_SLEEP_MS=61 must fit within",
 		);
 
@@ -1533,7 +1665,7 @@ describe("source-controlled stack runner", () => {
 				`GUARD_MAX_RECOVERY_SLEEP_MS=${value} CCFLARE_BIN=/bin/true GUARD_SCRIPT=/bin/true NODE_BIN=/bin/true AI_GATEWAY_TUNNEL_ENABLED=0 bash ${shellQuote(shellPath(runnerScript))}`,
 			);
 			expect(aboveHardMaximum.exitCode).toBe(64);
-			expect(aboveHardMaximum.stdout.toString()).toContain(
+			expect(capturedOutput(aboveHardMaximum.stdout, "stdout")).toContain(
 				`invalid GUARD_MAX_RECOVERY_SLEEP_MS=${value}`,
 			);
 		}
@@ -1544,7 +1676,7 @@ describe("source-controlled stack runner", () => {
 			`GUARD_TOTAL_DEADLINE_MS=900000 GUARD_SHUTDOWN_GRACE_MS=600000 CCFLARE_BIN=/bin/true GUARD_SCRIPT=/bin/true NODE_BIN=/bin/true AI_GATEWAY_TUNNEL_ENABLED=0 bash ${shellQuote(shellPath(runnerScript))}`,
 		);
 		expect(result.exitCode).toBe(64);
-		expect(result.stdout.toString()).toContain(
+		expect(capturedOutput(result.stdout, "stdout")).toContain(
 			"GUARD_SHUTDOWN_GRACE_MS=600000 must be at least GUARD_TOTAL_DEADLINE_MS=900000",
 		);
 	});
@@ -1889,8 +2021,8 @@ describe("validate_main_deploy_source", () => {
 		const result = runSourceGate("refs/heads/main", sha, sha);
 
 		expect(result.exitCode).toBe(0);
-		expect(result.stderr.toString()).toBe("");
-		expect(result.stdout.toString()).toContain(
+		expect(capturedOutput(result.stderr, "stderr")).toBe("");
+		expect(capturedOutput(result.stdout, "stdout")).toContain(
 			"is refs/heads/main at refs/remotes/origin/main",
 		);
 	});
@@ -1904,7 +2036,7 @@ describe("validate_main_deploy_source", () => {
 		);
 
 		expect(result.exitCode).toBe(1);
-		expect(result.stderr.toString()).toContain(
+		expect(capturedOutput(result.stderr, "stderr")).toContain(
 			"checkout must be refs/heads/main",
 		);
 	});
@@ -1914,7 +2046,7 @@ describe("validate_main_deploy_source", () => {
 		const result = runSourceGate("", sha, sha);
 
 		expect(result.exitCode).toBe(1);
-		expect(result.stderr.toString()).toContain("checkout has detached HEAD");
+		expect(capturedOutput(result.stderr, "stderr")).toContain("checkout has detached HEAD");
 	});
 
 	test("rejects local main whenever it differs from fetched origin/main", () => {
@@ -1925,7 +2057,7 @@ describe("validate_main_deploy_source", () => {
 		);
 
 		expect(result.exitCode).toBe(1);
-		expect(result.stderr.toString()).toContain(
+		expect(capturedOutput(result.stderr, "stderr")).toContain(
 			"does not exactly match refs/remotes/origin/main",
 		);
 	});
@@ -1939,10 +2071,10 @@ describe("deploy source gate in disposable repositories", () => {
 			"bash scripts/deploy-ccflare.sh --check",
 		);
 		expect(pass.exitCode).toBe(0);
-		expect(pass.stdout.toString()).toContain(
+		expect(capturedOutput(pass.stdout, "stdout")).toContain(
 			"is refs/heads/main at refs/remotes/origin/main",
 		);
-		expect(pass.stdout.toString()).toContain("no merged v* tags to compare");
+		expect(capturedOutput(pass.stdout, "stdout")).toContain("no merged v* tags to compare");
 
 		const feature = createDisposableDeployRepo();
 		expectCommandOk(gitAt(feature.checkout, "switch", "-c", "feature"));
@@ -1951,14 +2083,15 @@ describe("deploy source gate in disposable repositories", () => {
 			"bash scripts/deploy-ccflare.sh --check",
 		);
 		expect(wrongBranch.exitCode).toBe(1);
-		expect(wrongBranch.stderr.toString()).toContain(
+		expect(capturedOutput(wrongBranch.stderr, "stderr")).toContain(
 			"checkout must be refs/heads/main",
 		);
 
 		const staleMain = createDisposableDeployRepo();
-		const oldSha = gitAt(staleMain.checkout, "rev-parse", "HEAD")
-			.stdout.toString()
-			.trim();
+		const oldSha = capturedOutput(
+			gitAt(staleMain.checkout, "rev-parse", "HEAD").stdout,
+			"stdout",
+		).trim();
 		writeFileSync(join(staleMain.checkout, "remote-change.txt"), "new tip\n");
 		expectCommandOk(gitAt(staleMain.checkout, "add", "remote-change.txt"));
 		expectCommandOk(
@@ -1978,7 +2111,7 @@ describe("deploy source gate in disposable repositories", () => {
 			"bash scripts/deploy-ccflare.sh --check",
 		);
 		expect(behind.exitCode).toBe(1);
-		expect(behind.stderr.toString()).toContain(
+		expect(capturedOutput(behind.stderr, "stderr")).toContain(
 			"does not exactly match refs/remotes/origin/main",
 		);
 	});
@@ -1987,9 +2120,10 @@ describe("deploy source gate in disposable repositories", () => {
 		const { checkout } = createDisposableDeployRepo();
 		const snapshotParent = tempDir();
 		const snapshot = join(snapshotParent, "source");
-		const headSha = gitAt(checkout, "rev-parse", "HEAD")
-			.stdout.toString()
-			.trim();
+		const headSha = capturedOutput(
+			gitAt(checkout, "rev-parse", "HEAD").stdout,
+			"stdout",
+		).trim();
 		const create = bashAt(
 			checkout,
 			[
@@ -2004,7 +2138,7 @@ describe("deploy source gate in disposable repositories", () => {
 			'{"name":"deploy-fixture","version":"1.0.0"}\n',
 		);
 		expect(
-			gitAt(snapshot, "rev-parse", "HEAD").stdout.toString().trim(),
+			capturedOutput(gitAt(snapshot, "rev-parse", "HEAD").stdout, "stdout").trim(),
 		).toBe(headSha);
 		expect(gitAt(snapshot, "symbolic-ref", "-q", "HEAD").exitCode).toBe(1);
 		mkdirSync(join(snapshot, "node_modules"));
@@ -2018,7 +2152,7 @@ describe("deploy source gate in disposable repositories", () => {
 			].join("\n"),
 		);
 		expect(cleanup.exitCode).toBe(0);
-		expect(gitAt(checkout, "worktree", "list", "--porcelain").stdout.toString()).not.toContain(snapshot);
+		expect(capturedOutput(gitAt(checkout, "worktree", "list", "--porcelain").stdout, "stdout")).not.toContain(snapshot);
 	});
 });
 
@@ -2142,6 +2276,110 @@ describe("deployment flow safety contracts", () => {
 		expect(source).toContain(
 			'remove_verified_source_snapshot "$REPO_ROOT" "$BUILD_SOURCE_ROOT"',
 		);
+	});
+
+	test("uses a safe later 16 MiB/32 MiB body-policy override for health identity without pre-restart rollback", () => {
+		const source = readFileSync(deployScript, "utf8");
+		const effectivePolicy = source.indexOf(
+			"reload_validate_or_restore_systemd_policy",
+		);
+		const expectedIdentity = source.indexOf("EXPECTED_IDENTITY_JSON=", effectivePolicy);
+		const restart = source.indexOf(
+			"sudo systemctl restart ccflare-stack.service",
+			effectivePolicy,
+		);
+		const postReloadAssignments = source.slice(
+			effectivePolicy,
+			expectedIdentity,
+		);
+
+		// A later 90-operator-policy.conf can safely lower the request limit from
+		// the rendered 32 MiB / 256 MiB defaults. The post-reload identity must
+		// carry those effective values into health verification, rather than
+		// treating the safe difference as a reason to roll back.
+		expect(postReloadAssignments).toContain(
+			'CONFIGURED_GUARD_MAX_REQUEST_BODY_BYTES="$(deployment_timing_value "$EFFECTIVE_DEPLOYMENT_TIMING" guard_max_request_body_bytes)"',
+		);
+		expect(postReloadAssignments).toContain(
+			'CONFIGURED_GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES="$(deployment_timing_value "$EFFECTIVE_DEPLOYMENT_TIMING" guard_max_buffered_request_body_bytes)"',
+		);
+		expect(restart).toBeGreaterThan(effectivePolicy);
+
+		const expected = JSON.stringify({
+			proxyGitSha: "abc123",
+			sourceId: "full-sha",
+			policyId: "pool-exhaustion-finite-recovery-v1",
+			runnerPid: 42,
+			artifacts: {
+				binary: { path: "/artifacts/bin", sha256: "bin-digest" },
+				runner: { path: "/artifacts/runner", sha256: "runner-digest" },
+				guard: { path: "/artifacts/guard", sha256: "guard-digest" },
+				policy: { path: "/artifacts/policy", sha256: "policy-digest" },
+			},
+			bodyAdmission: {
+				budgetBytes: 268_435_456,
+				queueLimit: 500,
+			},
+			limits: {
+				totalDeadlineMs: 900_000,
+				retryAttemptHeadroomMs: 45_000,
+				maxRecoverySleepMs: 90_000,
+				maxRecoveryWaits: 20,
+				shutdownGraceMs: 900_000,
+				maxAttempts: 3,
+				jitterMs: 2_000,
+				maxInspectionBytes: 65_536,
+				maxRequestBodyBytes: 16_777_216,
+				maxBufferedRequestBodyBytes: 33_554_432,
+			},
+		});
+		const proxy = JSON.stringify({
+			git_sha: "abc123",
+			runtime: {
+				bodyAdmission: {
+					budgetBytes: 268_435_456,
+					queueLimit: 500,
+				},
+			},
+		});
+		const guard = JSON.stringify({
+			sourceId: "full-sha",
+			policyId: "pool-exhaustion-finite-recovery-v1",
+			maxRequestBodyBytes: 16_777_216,
+			maxBufferedRequestBodyBytes: 33_554_432,
+			runtime: {
+				process: { runnerPid: 42 },
+				artifacts: {
+					binary: { path: "/artifacts/bin", sha256: "bin-digest" },
+					runner: { path: "/artifacts/runner", sha256: "runner-digest" },
+					guard: { path: "/artifacts/guard", sha256: "guard-digest" },
+					policy: { path: "/artifacts/policy", sha256: "policy-digest" },
+				},
+				bodyAdmission: {
+					budgetBytes: 268_435_456,
+					queueLimit: 500,
+				},
+				limits: {
+					totalDeadlineMs: 900_000,
+					retryAttemptHeadroomMs: 45_000,
+					maxRecoverySleepMs: 90_000,
+					maxRecoveryWaits: 20,
+					shutdownGraceMs: 900_000,
+					maxAttempts: 3,
+					jitterMs: 2_000,
+					maxInspectionBytes: 65_536,
+					maxRequestBodyBytes: 16_777_216,
+					maxBufferedRequestBodyBytes: 33_554_432,
+				},
+			},
+		});
+		const health = bash(
+			[
+				`source ${shellQuote(helperScriptForShell)}`,
+				`validate_deploy_health ${shellQuote(proxy)} ${shellQuote(guard)} ${shellQuote(expected)}`,
+			].join("\n"),
+		);
+		expect(health.exitCode).toBe(0);
 	});
 
 	test("full deployment has rollback and exact dual-health verification", () => {

@@ -458,6 +458,10 @@ CONFIGURED_GUARD_RETRY_ATTEMPT_HEADROOM_MS="$(deployment_timing_value "$CONFIGUR
 CONFIGURED_GUARD_MAX_RECOVERY_SLEEP_MS="$(deployment_timing_value "$CONFIGURED_DEPLOYMENT_TIMING" guard_max_recovery_sleep_ms)"
 CONFIGURED_GUARD_SHUTDOWN_GRACE_MS="$(deployment_timing_value "$CONFIGURED_DEPLOYMENT_TIMING" guard_shutdown_grace_ms)"
 CONFIGURED_GUARD_MAX_RECOVERY_WAITS="$(deployment_timing_value "$CONFIGURED_DEPLOYMENT_TIMING" guard_max_recovery_waits)"
+CONFIGURED_GUARD_MAX_REQUEST_BODY_BYTES="$(deployment_timing_value "$CONFIGURED_DEPLOYMENT_TIMING" guard_max_request_body_bytes)"
+CONFIGURED_GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES="$(deployment_timing_value "$CONFIGURED_DEPLOYMENT_TIMING" guard_max_buffered_request_body_bytes)"
+CONFIGURED_BODY_ADMISSION_BUDGET_BYTES="$(deployment_timing_value "$CONFIGURED_DEPLOYMENT_TIMING" body_admission_budget_bytes)"
+CONFIGURED_BODY_ADMISSION_QUEUE_LIMIT="$(deployment_timing_value "$CONFIGURED_DEPLOYMENT_TIMING" body_admission_queue_limit)"
 CONFIGURED_STOP_TIMEOUT_MS="$(deployment_timing_value "$CONFIGURED_DEPLOYMENT_TIMING" stop_timeout_ms)"
 
 PIN_STAGED="${PIN}.new-${SHORT}-$$"
@@ -478,6 +482,10 @@ for expected_line in \
 	"Environment=GUARD_SHA256=${GUARD_SHA256}" \
 	"Environment=GUARD_POLICY_SHA256=${POLICY_SHA256}" \
 	"Environment=RUNNER_SHA256=${RUNNER_SHA256}" \
+	"Environment=GUARD_MAX_REQUEST_BODY_BYTES=33554432" \
+	"Environment=GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES=268435456" \
+	"Environment=CCFLARE_MAX_BUFFERED_REQUEST_BODY_BYTES=268435456" \
+	"Environment=CCFLARE_MAX_BODY_ADMISSION_QUEUE=500" \
 	"ExecStart=" \
 	"ExecStart=${RUNNER_SCRIPT}"; do
 	if [[ "$(grep -Fxc "$expected_line" "$PIN")" -lt 1 ]]; then
@@ -512,6 +520,10 @@ CONFIGURED_GUARD_RETRY_ATTEMPT_HEADROOM_MS="$(deployment_timing_value "$EFFECTIV
 CONFIGURED_GUARD_MAX_RECOVERY_SLEEP_MS="$(deployment_timing_value "$EFFECTIVE_DEPLOYMENT_TIMING" guard_max_recovery_sleep_ms)"
 CONFIGURED_GUARD_SHUTDOWN_GRACE_MS="$(deployment_timing_value "$EFFECTIVE_DEPLOYMENT_TIMING" guard_shutdown_grace_ms)"
 CONFIGURED_GUARD_MAX_RECOVERY_WAITS="$(deployment_timing_value "$EFFECTIVE_DEPLOYMENT_TIMING" guard_max_recovery_waits)"
+CONFIGURED_GUARD_MAX_REQUEST_BODY_BYTES="$(deployment_timing_value "$EFFECTIVE_DEPLOYMENT_TIMING" guard_max_request_body_bytes)"
+CONFIGURED_GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES="$(deployment_timing_value "$EFFECTIVE_DEPLOYMENT_TIMING" guard_max_buffered_request_body_bytes)"
+CONFIGURED_BODY_ADMISSION_BUDGET_BYTES="$(deployment_timing_value "$EFFECTIVE_DEPLOYMENT_TIMING" body_admission_budget_bytes)"
+CONFIGURED_BODY_ADMISSION_QUEUE_LIMIT="$(deployment_timing_value "$EFFECTIVE_DEPLOYMENT_TIMING" body_admission_queue_limit)"
 CONFIGURED_STOP_TIMEOUT_MS="$(deployment_timing_value "$EFFECTIVE_DEPLOYMENT_TIMING" stop_timeout_ms)"
 
 echo "==> Restarting ccflare-stack.service…"
@@ -548,6 +560,10 @@ EXPECTED_IDENTITY_JSON="$(
 		"$CONFIGURED_GUARD_MAX_RECOVERY_SLEEP_MS" \
 		"$CONFIGURED_GUARD_MAX_RECOVERY_WAITS" \
 		"$CONFIGURED_GUARD_SHUTDOWN_GRACE_MS" \
+		"$CONFIGURED_GUARD_MAX_REQUEST_BODY_BYTES" \
+		"$CONFIGURED_GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES" \
+		"$CONFIGURED_BODY_ADMISSION_BUDGET_BYTES" \
+		"$CONFIGURED_BODY_ADMISSION_QUEUE_LIMIT" \
 		"$(readlink -f "$DEST_BIN")" "$DEST_BIN_SHA256" \
 		"$(readlink -f "$RUNNER_SCRIPT")" "$RUNNER_SHA256" \
 		"$(readlink -f "$GUARD_SCRIPT")" "$GUARD_SHA256" \
@@ -562,6 +578,10 @@ const [
 	guardMaxRecoverySleepMs,
 	guardMaxRecoveryWaits,
 	guardShutdownGraceMs,
+	guardMaxRequestBodyBytes,
+	guardMaxBufferedRequestBodyBytes,
+	bodyAdmissionBudgetBytes,
+	bodyAdmissionQueueLimit,
 	binaryPath,
 	binarySha256,
 	runnerPath,
@@ -582,6 +602,10 @@ process.stdout.write(JSON.stringify({
 		guard: { path: guardPath, sha256: guardSha256 },
 		policy: { path: policyPath, sha256: policySha256 },
 	},
+	bodyAdmission: {
+		budgetBytes: Number(bodyAdmissionBudgetBytes),
+		queueLimit: Number(bodyAdmissionQueueLimit),
+	},
 	limits: {
 		totalDeadlineMs: Number(guardTotalDeadlineMs),
 		retryAttemptHeadroomMs: Number(guardRetryAttemptHeadroomMs),
@@ -591,6 +615,8 @@ process.stdout.write(JSON.stringify({
 		maxAttempts: 3,
 		jitterMs: 2000,
 		maxInspectionBytes: 65536,
+		maxRequestBodyBytes: Number(guardMaxRequestBodyBytes),
+		maxBufferedRequestBodyBytes: Number(guardMaxBufferedRequestBodyBytes),
 	},
 }));
 NODE

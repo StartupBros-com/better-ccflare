@@ -178,6 +178,12 @@ render_systemd_pin() {
 		printf 'Environment=%s\n' "GUARD_SHA256=$guard_sha256"
 		printf 'Environment=%s\n' "GUARD_POLICY_SHA256=$guard_policy_sha256"
 		printf 'Environment=%s\n' "RUNNER_SHA256=$runner_sha256"
+		printf '%s\n' "Environment=GUARD_MAX_REQUEST_BODY_BYTES=33554432"
+		printf '%s\n' "Environment=GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES=268435456"
+		# This is the Bun process's weighted-work admission policy. It is
+		# deliberately independent of the Node guard's encoded-buffer policy.
+		printf '%s\n' "Environment=CCFLARE_MAX_BUFFERED_REQUEST_BODY_BYTES=268435456"
+		printf '%s\n' "Environment=CCFLARE_MAX_BODY_ADMISSION_QUEUE=500"
 		printf 'Environment=%s\n' "GUARD_TOTAL_DEADLINE_MS=$deadline_ms"
 		printf 'Environment=%s\n' "GUARD_RETRY_ATTEMPT_HEADROOM_MS=$retry_attempt_headroom_ms"
 		printf 'Environment=%s\n' "GUARD_MAX_RECOVERY_SLEEP_MS=$max_recovery_sleep_ms"
@@ -426,14 +432,57 @@ validate_guard_timing_values() {
 	fi
 }
 
+validate_guard_body_policy_values() {
+	if [[ "$#" -ne 3 ]]; then
+		echo "validate_guard_body_policy_values requires: request-limit aggregate-limit label" >&2
+		return 2
+	fi
+	local request_limit="$1" aggregate_limit="$2" label="$3"
+	if [[ ! "$request_limit" =~ ^[0-9]{1,9}$ ]] \
+		|| ((request_limit < 1024 || request_limit > 33554432)); then
+		echo "unsafe ${label}GUARD_MAX_REQUEST_BODY_BYTES=${request_limit}; expected integer 1024..33554432" >&2
+		return 1
+	fi
+	if [[ ! "$aggregate_limit" =~ ^[0-9]{1,9}$ ]] \
+		|| ((aggregate_limit > 268435456)); then
+		echo "unsafe ${label}GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES=${aggregate_limit}; expected integer at most 268435456" >&2
+		return 1
+	fi
+	if ((aggregate_limit < 2 * request_limit)); then
+		echo "unsafe ${label}GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES=${aggregate_limit}; expected at least twice GUARD_MAX_REQUEST_BODY_BYTES=${request_limit}" >&2
+		return 1
+	fi
+}
+
+validate_bun_body_admission_policy_values() {
+	if [[ "$#" -ne 3 ]]; then
+		echo "validate_bun_body_admission_policy_values requires: budget queue label" >&2
+		return 2
+	fi
+	local budget="$1" queue="$2" label="$3"
+	if [[ ! "$budget" =~ ^[0-9]{1,10}$ ]] \
+		|| ((budget < 268435456 || budget > 1073741824)); then
+		echo "unsafe ${label}CCFLARE_MAX_BUFFERED_REQUEST_BODY_BYTES=${budget}; expected integer 268435456..1073741824" >&2
+		return 1
+	fi
+	if [[ ! "$queue" =~ ^[0-9]{1,4}$ ]] || ((queue > 5000)); then
+		echo "unsafe ${label}CCFLARE_MAX_BODY_ADMISSION_QUEUE=${queue}; expected integer 0..5000" >&2
+		return 1
+	fi
+}
+
 emit_deployment_timing() {
-	if [[ "$#" -ne 6 ]]; then return 2; fi
+	if [[ "$#" -ne 10 ]]; then return 2; fi
 	printf 'guard_total_deadline_ms=%s\n' "$1"
 	printf 'guard_retry_attempt_headroom_ms=%s\n' "$2"
 	printf 'guard_max_recovery_sleep_ms=%s\n' "$3"
 	printf 'guard_shutdown_grace_ms=%s\n' "$4"
 	printf 'guard_max_recovery_waits=%s\n' "$5"
 	printf 'stop_timeout_ms=%s\n' "$6"
+	printf 'guard_max_request_body_bytes=%s\n' "$7"
+	printf 'guard_max_buffered_request_body_bytes=%s\n' "$8"
+	printf 'body_admission_budget_bytes=%s\n' "$9"
+	printf 'body_admission_queue_limit=%s\n' "${10}"
 }
 
 deployment_timing_value() {
@@ -450,8 +499,40 @@ validate_deployment_timing() {
 		return 2
 	fi
 
-	local pin="$1" deadline_ms retry_attempt_headroom_ms max_recovery_sleep_ms shutdown_grace_ms max_recovery_waits kill_mode stop_timeout
+	local pin="$1" deadline_ms retry_attempt_headroom_ms max_recovery_sleep_ms shutdown_grace_ms max_recovery_waits max_request_body_bytes max_buffered_request_body_bytes body_admission_budget_bytes body_admission_queue_limit kill_mode stop_timeout
 	local stop_timeout_usec stop_timeout_ms minimum_stop_timeout_usec
+	body_admission_budget_bytes="$(
+		configured_systemd_environment_value "$pin" CCFLARE_MAX_BUFFERED_REQUEST_BODY_BYTES
+	)" || {
+		echo "systemd pin is missing CCFLARE_MAX_BUFFERED_REQUEST_BODY_BYTES" >&2
+		return 1
+	}
+	body_admission_queue_limit="$(
+		configured_systemd_environment_value "$pin" CCFLARE_MAX_BODY_ADMISSION_QUEUE
+	)" || {
+		echo "systemd pin is missing CCFLARE_MAX_BODY_ADMISSION_QUEUE" >&2
+		return 1
+	}
+	validate_bun_body_admission_policy_values \
+		"$body_admission_budget_bytes" \
+		"$body_admission_queue_limit" \
+		"" || return 1
+	max_request_body_bytes="$(
+		configured_systemd_environment_value "$pin" GUARD_MAX_REQUEST_BODY_BYTES
+	)" || {
+		echo "systemd pin is missing GUARD_MAX_REQUEST_BODY_BYTES" >&2
+		return 1
+	}
+	max_buffered_request_body_bytes="$(
+		configured_systemd_environment_value "$pin" GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES
+	)" || {
+		echo "systemd pin is missing GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES" >&2
+		return 1
+	}
+	validate_guard_body_policy_values \
+		"$max_request_body_bytes" \
+		"$max_buffered_request_body_bytes" \
+		"" || return 1
 	deadline_ms="$(
 		configured_systemd_environment_value "$pin" GUARD_TOTAL_DEADLINE_MS
 	)" || {
@@ -519,7 +600,11 @@ validate_deployment_timing() {
 		"$max_recovery_sleep_ms" \
 		"$shutdown_grace_ms" \
 		"$max_recovery_waits" \
-		"$stop_timeout_ms"
+		"$stop_timeout_ms" \
+		"$max_request_body_bytes" \
+		"$max_buffered_request_body_bytes" \
+		"$body_admission_budget_bytes" \
+		"$body_admission_queue_limit"
 }
 
 systemd_environment_text_value() {
@@ -581,6 +666,7 @@ validate_effective_systemd_policy() {
 	local kill_mode stop_timeout restart restart_sec restart_prevent_exit_status
 	local start_limit_interval start_limit_burst effective_environment effective_deadline_ms
 	local effective_retry_attempt_headroom_ms effective_max_recovery_sleep_ms effective_shutdown_grace_ms effective_max_recovery_waits effective_failure_stop_budget_ms
+	local effective_max_request_body_bytes effective_max_buffered_request_body_bytes effective_body_admission_budget_bytes effective_body_admission_queue_limit
 	local stop_timeout_usec restart_sec_usec start_limit_interval_usec stop_timeout_ms
 	local minimum_stop_timeout_usec
 	local minimum_start_limit_interval_usec=300000000 minimum_restart_sec_usec=5000000
@@ -602,6 +688,57 @@ validate_effective_systemd_policy() {
 		start_limit_burst="$(systemctl show "$service" --property=StartLimitBurst --value)" || return 1
 	fi
 	effective_environment="$(systemctl show "$service" --property=Environment --value)" || return 1
+	if ! effective_body_admission_budget_bytes="$(
+		systemd_environment_text_value "$effective_environment" CCFLARE_MAX_BUFFERED_REQUEST_BODY_BYTES
+	)"; then
+		effective_body_admission_budget_bytes=""
+	fi
+	if ! effective_body_admission_queue_limit="$(
+		systemd_environment_text_value "$effective_environment" CCFLARE_MAX_BODY_ADMISSION_QUEUE
+	)"; then
+		effective_body_admission_queue_limit=""
+	fi
+	if [[ -z "$effective_body_admission_budget_bytes" && -z "$effective_body_admission_queue_limit" \
+		&& "$allow_missing_new_guard_limits" == "1" ]]; then
+		# A pre-admission pin is valid only on the legacy rollback path.
+		effective_body_admission_budget_bytes=268435456
+		effective_body_admission_queue_limit=500
+	elif [[ -z "$effective_body_admission_budget_bytes" || -z "$effective_body_admission_queue_limit" ]]; then
+		echo "effective systemd environment is missing a CCFLARE body-admission setting" >&2
+		return 1
+	else
+		validate_bun_body_admission_policy_values \
+			"$effective_body_admission_budget_bytes" \
+			"$effective_body_admission_queue_limit" \
+			"effective " || return 1
+	fi
+	if ! effective_max_request_body_bytes="$(
+		systemd_environment_text_value "$effective_environment" GUARD_MAX_REQUEST_BODY_BYTES
+	)"; then
+		effective_max_request_body_bytes=""
+	fi
+	if ! effective_max_buffered_request_body_bytes="$(
+		systemd_environment_text_value "$effective_environment" GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES
+	)"; then
+		effective_max_buffered_request_body_bytes=""
+	fi
+	if [[ -z "$effective_max_request_body_bytes" && -z "$effective_max_buffered_request_body_bytes" \
+		&& "$allow_missing_new_guard_limits" == "1" ]]; then
+		# A fully pre-body-policy pin can be restored during rollback. A partially
+		# present pair is never legacy: it is an unsafe or interrupted current policy.
+		:
+	elif [[ -z "$effective_max_request_body_bytes" ]]; then
+		echo "effective systemd environment is missing GUARD_MAX_REQUEST_BODY_BYTES" >&2
+		return 1
+	elif [[ -z "$effective_max_buffered_request_body_bytes" ]]; then
+		echo "effective systemd environment is missing GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES" >&2
+		return 1
+	else
+		validate_guard_body_policy_values \
+			"$effective_max_request_body_bytes" \
+			"$effective_max_buffered_request_body_bytes" \
+			"effective " || return 1
+	fi
 	effective_deadline_ms="$(
 		systemd_environment_text_value "$effective_environment" GUARD_TOTAL_DEADLINE_MS
 	)" || {
@@ -727,7 +864,11 @@ validate_effective_systemd_policy() {
 		"$effective_max_recovery_sleep_ms" \
 		"$effective_shutdown_grace_ms" \
 		"$effective_max_recovery_waits" \
-		"$stop_timeout_ms"
+		"$stop_timeout_ms" \
+		"$effective_max_request_body_bytes" \
+		"$effective_max_buffered_request_body_bytes" \
+		"$effective_body_admission_budget_bytes" \
+		"$effective_body_admission_queue_limit"
 	printf 'runner_failure_stop_budget_ms=%s\n' "$effective_failure_stop_budget_ms"
 }
 
@@ -788,6 +929,16 @@ const compare = (label, actual, wanted) => {
 	}
 };
 compare("proxy git_sha", proxy?.git_sha, expected?.proxyGitSha);
+compare(
+	"Bun body-admission budgetBytes",
+	proxy?.runtime?.bodyAdmission?.budgetBytes,
+	expected?.bodyAdmission?.budgetBytes,
+);
+compare(
+	"Bun body-admission queueLimit",
+	proxy?.runtime?.bodyAdmission?.queueLimit,
+	expected?.bodyAdmission?.queueLimit,
+);
 compare("guard sourceId", guard?.sourceId, expected?.sourceId);
 compare("guard policyId", guard?.policyId, expected?.policyId);
 compare("runner pid", guard?.runtime?.process?.runnerPid, expected?.runnerPid);
@@ -812,6 +963,8 @@ for (const name of [
 	"maxAttempts",
 	"jitterMs",
 	"maxInspectionBytes",
+	"maxRequestBodyBytes",
+	"maxBufferedRequestBodyBytes",
 ]) {
 	compare(
 		`limit ${name}`,
@@ -819,6 +972,25 @@ for (const name of [
 		expected?.limits?.[name],
 	);
 }
+for (const name of ["maxRequestBodyBytes", "maxBufferedRequestBodyBytes"]) {
+	compare(
+		`root limit ${name}`,
+		guard?.[name],
+		expected?.limits?.[name],
+	);
+}
+
+const validateBodyPolicy = (label, requestLimit, aggregateLimit) => {
+	if (!Number.isSafeInteger(requestLimit) || requestLimit < 1024 || requestLimit > 33554432) {
+		mismatches.push(`${label} maxRequestBodyBytes=${JSON.stringify(requestLimit)} outside hard range 1024..33554432`);
+	}
+	if (!Number.isSafeInteger(aggregateLimit) || aggregateLimit > 268435456 || aggregateLimit < 2 * requestLimit) {
+		mismatches.push(`${label} maxBufferedRequestBodyBytes=${JSON.stringify(aggregateLimit)} outside hard range 2*request..268435456`);
+	}
+};
+validateBodyPolicy("root actual", guard?.maxRequestBodyBytes, guard?.maxBufferedRequestBodyBytes);
+validateBodyPolicy("runtime actual", guard?.runtime?.limits?.maxRequestBodyBytes, guard?.runtime?.limits?.maxBufferedRequestBodyBytes);
+validateBodyPolicy("expected", expected?.limits?.maxRequestBodyBytes, expected?.limits?.maxBufferedRequestBodyBytes);
 
 for (const [label, value] of [
 	["actual", guard?.runtime?.limits?.maxRecoverySleepMs],
@@ -864,21 +1036,59 @@ try {
 	process.exit(70);
 }
 
-const stableGuardIdentity = (guard) => ({
-	sourceId: guard?.sourceId,
-	policyId: guard?.policyId,
-	artifacts: Object.fromEntries(
-		["binary", "runner", "guard", "policy"].map((name) => [
-			name,
-			{
-				path: guard?.runtime?.artifacts?.[name]?.path,
-				sha256: guard?.runtime?.artifacts?.[name]?.sha256,
-			},
-		]),
-	),
-	limits: guard?.runtime?.limits,
-});
+const bodyPolicyProof = (guard) => {
+	const root = guard ?? {};
+	const limits = root.runtime?.limits ?? {};
+	// Older snapshots published only maxRequestBodyBytes. Aggregate reservation
+	// fields identify the current schema and therefore require complete proof.
+	const hasCurrentBodyFormat =
+		Object.hasOwn(root, "maxBufferedRequestBodyBytes") ||
+		Object.hasOwn(limits, "maxBufferedRequestBodyBytes");
+	if (!hasCurrentBodyFormat) return { legacy: true };
+	const rootRequest = root.maxRequestBodyBytes;
+	const rootAggregate = root.maxBufferedRequestBodyBytes;
+	const runtimeRequest = limits.maxRequestBodyBytes;
+	const runtimeAggregate = limits.maxBufferedRequestBodyBytes;
+	const values = [rootRequest, rootAggregate, runtimeRequest, runtimeAggregate];
+	if (
+		!values.every(Number.isSafeInteger) ||
+		rootRequest < 1024 ||
+		rootRequest > 33554432 ||
+		rootAggregate > 268435456 ||
+		rootAggregate < 2 * rootRequest ||
+		runtimeRequest !== rootRequest ||
+		runtimeAggregate !== rootAggregate
+	) {
+		return { error: "current-format guard body policy is incomplete or unsafe" };
+	}
+	return {
+		value: {
+			maxRequestBodyBytes: rootRequest,
+			maxBufferedRequestBodyBytes: rootAggregate,
+		},
+	};
+};
+const stableGuardIdentity = (guard) => {
+	const bodyPolicy = bodyPolicyProof(guard);
+	return {
+		sourceId: guard?.sourceId,
+		policyId: guard?.policyId,
+		artifacts: Object.fromEntries(
+			["binary", "runner", "guard", "policy"].map((name) => [
+				name,
+				{
+					path: guard?.runtime?.artifacts?.[name]?.path,
+					sha256: guard?.runtime?.artifacts?.[name]?.sha256,
+				},
+			]),
+		),
+		limits: guard?.runtime?.limits,
+		bodyPolicy: bodyPolicy.value,
+		bodyPolicyError: bodyPolicy.error,
+	};
+};
 const prior = stableGuardIdentity(priorGuard);
+const current = stableGuardIdentity(currentGuard);
 const limitNames = [
 	"totalDeadlineMs",
 	"maxAttempts",
@@ -890,6 +1100,8 @@ const complete =
 	typeof prior.sourceId === "string" &&
 	typeof prior.policyId === "string" &&
 	prior.limits &&
+	!prior.bodyPolicyError &&
+	!current.bodyPolicyError &&
 	limitNames.every((name) => Number.isFinite(prior.limits[name])) &&
 	Object.values(prior.artifacts).every(
 		(value) => typeof value.path === "string" && typeof value.sha256 === "string",
@@ -900,7 +1112,7 @@ if (!complete) {
 }
 if (
 	currentProxy?.git_sha !== priorProxy.git_sha ||
-	JSON.stringify(stableGuardIdentity(currentGuard)) !== JSON.stringify(prior)
+	JSON.stringify(current) !== JSON.stringify(prior)
 ) {
 	console.error("restored deployment identity does not match the captured prior identity");
 	process.exit(70);
