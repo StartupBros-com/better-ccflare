@@ -15,6 +15,7 @@ import {
 	parseModelMappings,
 	resolveCompatibleEndpoint,
 	resolveFamilyAliasModel,
+	validatePriority,
 	ValidationError,
 } from "@better-ccflare/core";
 import type { Account } from "@better-ccflare/types";
@@ -697,5 +698,86 @@ describe("resolveCompatibleEndpoint — fail-closed (R3)", () => {
 		if (result.ok) {
 			expect(result.endpoint).toBe("https://api.example.com/v1");
 		}
+	});
+});
+
+/**
+ * Vercel AI Gateway catch-all recipe (U4).
+ *
+ * Documents the model-mapping and priority contract an operator must configure
+ * for the Vercel catch-all lane. These tests guard the documented recipe so a
+ * refactor that breaks the ordered GLM resolution or rejects priority 100 is
+ * caught before the docs are trusted.
+ */
+describe("Vercel AI Gateway catch-all recipe (U4)", () => {
+	// The documented recipe: every Claude family maps to GLM Fast first, then
+	// standard GLM, within a single openai-compatible account.
+	const vercelMappings = {
+		fable: ["zai/glm-5.2-fast", "zai/glm-5.2"],
+		opus: ["zai/glm-5.2-fast", "zai/glm-5.2"],
+		sonnet: ["zai/glm-5.2-fast", "zai/glm-5.2"],
+		haiku: ["zai/glm-5.2-fast", "zai/glm-5.2"],
+	};
+
+	const vercelAccount: Account = {
+		id: "vercel-gateway",
+		name: "vercel-gateway",
+		provider: "openai-compatible",
+		model_mappings: JSON.stringify(vercelMappings),
+		model_fallbacks: null,
+		custom_endpoint: JSON.stringify({
+			endpoint: "https://ai-gateway.vercel.sh/v1",
+		}),
+		priority: 100,
+	} as Account;
+
+	test("an ordered-array family mapping resolves to GLM Fast first and standard GLM second", () => {
+		expect(getModelList("claude-sonnet-5", vercelAccount)).toEqual([
+			"zai/glm-5.2-fast",
+			"zai/glm-5.2",
+		]);
+	});
+
+	test("a single-string family mapping still resolves to that model", () => {
+		const singleStringAccount: Account = {
+			...vercelAccount,
+			model_mappings: JSON.stringify({ sonnet: "zai/glm-5.2" }),
+		} as Account;
+
+		expect(getModelList("claude-sonnet-5", singleStringAccount)).toEqual([
+			"zai/glm-5.2",
+		]);
+	});
+
+	test("every Claude family in the documented recipe resolves to a GLM target", () => {
+		for (const familyModel of Object.values(LATEST_MODEL_BY_FAMILY)) {
+			const resolved = getModelList(familyModel, vercelAccount);
+			expect(resolved).not.toBeNull();
+			expect(resolved!.length).toBeGreaterThan(0);
+			expect(resolved![0]).toMatch(/^zai\/glm-5\.2/);
+		}
+	});
+
+	test("an account with no configured mapping forwards the requested model unchanged", () => {
+		const unmappedAccount: Account = {
+			id: "unmapped",
+			name: "unmapped",
+			provider: "openai-compatible",
+			model_mappings: null,
+			model_fallbacks: null,
+			custom_endpoint: null,
+		} as Account;
+
+		expect(getModelList("claude-sonnet-5", unmappedAccount)).toBeNull();
+	});
+
+	test("the documented priority 100 is accepted by the shared priority validator", () => {
+		expect(validatePriority(100)).toBe(100);
+	});
+
+	test("the documented endpoint resolves to the Vercel AI Gateway URL", () => {
+		expect(getEndpointUrl(vercelAccount)).toBe(
+			"https://ai-gateway.vercel.sh/v1",
+		);
 	});
 });
