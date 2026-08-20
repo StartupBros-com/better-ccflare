@@ -75,11 +75,13 @@ export {
 	type CachePacingObservation,
 	type CachePacingRouteStats,
 	type CachePacingTarget,
+	CODEX_CACHE_PACING_SETTLE_MS_ENV,
 	CODEX_PACING_BYPASS_PERCENT_ENV,
 	getCachePacingRouteStats,
 	getCachePacingStats,
 	isCodexPacingBypassCandidate,
 	readCachePacingMs,
+	readCodexCachePacingSettleMs,
 	readCodexPacingBypassPercent,
 } from "./cache-pacing";
 export {

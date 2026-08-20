@@ -17,14 +17,18 @@ import { opaqueRuntimeId } from "./opaque-runtime-id";
 
 const log = new Logger("CachePacing");
 export const CACHE_PACING_MS_ENV = "CCFLARE_CACHE_PACING_MS";
+export const CODEX_CACHE_PACING_SETTLE_MS_ENV =
+	"CCFLARE_CODEX_CACHE_PACING_SETTLE_MS";
 export const CODEX_PACING_BYPASS_PERCENT_ENV =
 	"CCFLARE_CODEX_PACING_BYPASS_PERCENT";
+const MAX_CODEX_CACHE_PACING_SETTLE_MS = 10_000;
 const MAX_ROUTE_STATS = 256;
 
 interface LeaderEntry {
 	promise: Promise<void>;
 	resolve: () => void;
 	startedAt: number;
+	failsafeTimer: ReturnType<typeof setTimeout>;
 }
 
 const leaders = new Map<string, LeaderEntry>();
@@ -48,6 +52,9 @@ export interface CachePacingTarget {
 export interface CachePacingFamilyStats {
 	leaders: number;
 	leadersAbandoned: number;
+	leadersReachedTerminal: number;
+	leadersReleasedAfterSettle: number;
+	leadersReleasedOnCancelOrError: number;
 	staleLeadersReplaced: number;
 	followersHeld: number;
 	followersReleasedByLeader: number;
@@ -79,6 +86,9 @@ function newStats(): CachePacingFamilyStats {
 	return {
 		leaders: 0,
 		leadersAbandoned: 0,
+		leadersReachedTerminal: 0,
+		leadersReleasedAfterSettle: 0,
+		leadersReleasedOnCancelOrError: 0,
 		staleLeadersReplaced: 0,
 		followersHeld: 0,
 		followersReleasedByLeader: 0,
@@ -169,6 +179,7 @@ export function recordCachePacingRoute(
 	}
 	if (!observation) return;
 	if (observation.role === "leader") {
+		observation.slot?.bindServingProvider(target.provider, entry);
 		entry.leaders++;
 		return;
 	}
@@ -186,6 +197,11 @@ export interface CachePacingSlot {
 	readonly key: string;
 	wrap(response: Response): Response;
 	abandon(): void;
+	/** Internal route-accounting seam; only recordCachePacingRoute() calls this. */
+	bindServingProvider(
+		provider: string,
+		routeStats: CachePacingRouteStats,
+	): void;
 }
 
 export function readCachePacingMs(): number {
@@ -193,6 +209,15 @@ export function readCachePacingMs(): number {
 	if (raw === undefined || raw === "") return 0;
 	const parsed = Number.parseInt(raw, 10);
 	return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+/** Default-off Codex terminal settle window, bounded to retain pacing liveness. */
+export function readCodexCachePacingSettleMs(): number {
+	const raw = process.env[CODEX_CACHE_PACING_SETTLE_MS_ENV];
+	if (raw === undefined || raw === "" || !/^\d+$/.test(raw)) return 0;
+	const parsed = Number.parseInt(raw, 10);
+	if (!Number.isSafeInteger(parsed)) return 0;
+	return Math.min(parsed, MAX_CODEX_CACHE_PACING_SETTLE_MS);
 }
 
 export function readCodexPacingBypassPercent(): number {
@@ -290,50 +315,107 @@ export async function observeCachePacing(opts: {
 	const promise = new Promise<void>((r) => {
 		resolve = r;
 	});
-	const entry: LeaderEntry = { promise, resolve, startedAt: nowFn() };
+	let released = false;
+	let wrapped = false;
+	let servingProvider: string | null = null;
+	let servingRouteStats: CachePacingRouteStats | null = null;
+	const increment = (
+		field:
+			| "leadersAbandoned"
+			| "leadersReachedTerminal"
+			| "leadersReleasedAfterSettle"
+			| "leadersReleasedOnCancelOrError",
+	) => {
+		stats[field]++;
+		if (servingRouteStats) servingRouteStats[field]++;
+	};
+	const entry = {
+		promise,
+		resolve,
+		startedAt: nowFn(),
+		failsafeTimer: undefined as unknown as ReturnType<typeof setTimeout>,
+	} satisfies LeaderEntry;
+	const finish = () => {
+		if (released) return;
+		released = true;
+		clearTimeout(entry.failsafeTimer);
+		entry.resolve();
+		// A stale terminal timer must not delete a newer leader for this key.
+		if (leaders.get(key) === entry) leaders.delete(key);
+	};
+	entry.failsafeTimer = setTimeout(finish, maxHoldMs * 2);
 	leaders.set(key, entry);
 	stats.leaders++;
 
-	let done = false;
-	const finish = () => {
-		entry.resolve();
-		if (leaders.get(key) === entry) leaders.delete(key);
-	};
 	const slot: CachePacingSlot = {
 		key,
+		bindServingProvider(provider, routeStats): void {
+			servingProvider = provider;
+			servingRouteStats = routeStats;
+		},
 		wrap(response: Response): Response {
-			if (done) return response;
-			done = true;
+			if (wrapped || released) return response;
+			wrapped = true;
 			if (!response.body) {
 				finish();
 				return response;
 			}
-			let released = false;
-			const releaseOnce = () => {
-				if (!released) {
-					released = true;
-					finish();
-				}
+			const settleMs =
+				servingProvider === "codex" ? readCodexCachePacingSettleMs() : 0;
+			const reader = response.body.getReader();
+			const releaseOnCancelOrError = () => {
+				if (released) return;
+				increment("leadersReleasedOnCancelOrError");
+				finish();
 			};
-			const passThrough = new TransformStream<Uint8Array, Uint8Array>({
-				transform(chunk, controller) {
-					releaseOnce();
-					controller.enqueue(chunk);
+			const stream = new ReadableStream<Uint8Array>({
+				async pull(controller) {
+					try {
+						const { done, value } = await reader.read();
+						if (done) {
+							if (settleMs > 0) {
+								increment("leadersReachedTerminal");
+								const remainingLivenessMs = Math.max(
+									0,
+									maxHoldMs * 2 - (nowFn() - entry.startedAt),
+								);
+								setTimeout(
+									() => {
+										if (!released) increment("leadersReleasedAfterSettle");
+										finish();
+									},
+									Math.min(settleMs, remainingLivenessMs),
+								);
+							} else {
+								finish();
+							}
+							controller.close();
+							return;
+						}
+						if (settleMs <= 0) finish();
+						controller.enqueue(value);
+					} catch (error) {
+						releaseOnCancelOrError();
+						controller.error(error);
+					}
 				},
-				flush() {
-					releaseOnce();
+				async cancel(reason) {
+					try {
+						await reader.cancel(reason);
+					} finally {
+						releaseOnCancelOrError();
+					}
 				},
 			});
-			return new Response(response.body.pipeThrough(passThrough), {
+			return new Response(stream, {
 				status: response.status,
 				statusText: response.statusText,
 				headers: response.headers,
 			});
 		},
 		abandon(): void {
-			if (done) return;
-			done = true;
-			stats.leadersAbandoned++;
+			if (released) return;
+			increment("leadersAbandoned");
 			finish();
 		},
 	};

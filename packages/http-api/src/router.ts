@@ -10,6 +10,7 @@ import {
 	getCachePacingStats,
 	handleCacheDiagnosisRequest,
 	readCachePacingMs,
+	readCodexCachePacingSettleMs,
 } from "@better-ccflare/proxy";
 import {
 	createAccountAddHandler,
@@ -522,6 +523,7 @@ export class APIRouter {
 		this.handlers.set("GET:/api/debug/cache-pacing", () =>
 			Response.json({
 				pacing_ms: readCachePacingMs(),
+				codex_settle_ms: readCodexCachePacingSettleMs(),
 				families: getCachePacingStats(),
 				routes: getCachePacingRouteStats(),
 			}),
