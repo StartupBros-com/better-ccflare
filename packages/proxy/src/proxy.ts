@@ -1455,6 +1455,7 @@ async function handleProxyCoreImpl(
 				),
 			);
 		}
+		pacingObservation?.slot?.abandon();
 		throw error;
 	}
 	let reactiveModelRecoveryAt: number | null = null;
@@ -1723,6 +1724,7 @@ async function handleProxyCoreImpl(
 					),
 				);
 			}
+			pacingObservation?.slot?.abandon();
 			throw error;
 		}
 		({
@@ -1839,7 +1841,10 @@ async function handleProxyCoreImpl(
 		if (sessionId) clearSession(sessionId, requestMeta.timestamp);
 
 		if (requestMeta.comboName && isComboSessionFallbackDisabled()) {
-			return await returnComboSessionFallbackDisabled(requestMeta.comboName, 0);
+			return finishPacing(
+				pacingSlot,
+				await returnComboSessionFallbackDisabled(requestMeta.comboName, 0),
+			);
 		}
 
 		if (reactivelyDepletedAccounts.length > 0) {
@@ -2441,6 +2446,7 @@ async function handleProxyCoreImpl(
 				return null;
 			}
 			await routingAttemptLedger.discardTerminalResponse();
+			pacingSlot?.abandon();
 			throw error;
 		} finally {
 			if (probeAdmission === "admitted") {
@@ -2715,6 +2721,7 @@ async function handleProxyCoreImpl(
 				continue;
 			}
 			await routingAttemptLedger.discardTerminalResponse();
+			pacingSlot?.abandon();
 			throw error;
 		} finally {
 			if (probeAdmission === "admitted") {
@@ -2845,6 +2852,7 @@ async function handleProxyCoreImpl(
 				response = null;
 			} else {
 				await routingAttemptLedger.discardTerminalResponse();
+				pacingSlot?.abandon();
 				throw error;
 			}
 		}
@@ -2952,6 +2960,7 @@ async function handleProxyCoreImpl(
 				);
 			}
 			await routingAttemptLedger.discardTerminalResponse();
+			pacingSlot?.abandon();
 			throw error;
 		}
 		for (const route of getCapacityDeferredModelRoutes(requestMeta)) {
@@ -3079,6 +3088,7 @@ async function handleProxyCoreImpl(
 						continue;
 					}
 					await routingAttemptLedger.discardTerminalResponse();
+					pacingSlot?.abandon();
 					throw error;
 				} finally {
 					if (probeAdmission === "admitted") {
@@ -3181,6 +3191,7 @@ async function handleProxyCoreImpl(
 						response = null;
 					} else {
 						await routingAttemptLedger.discardTerminalResponse();
+						pacingSlot?.abandon();
 						throw error;
 					}
 				}
@@ -3509,9 +3520,12 @@ async function handleProxyCoreImpl(
 		log.warn(
 			`All combo slots and queued model routes failed for combo "${disabledComboSessionFallbackName}", session fallback disabled by CCFLARE_DISABLE_COMBO_SESSION_FALLBACK`,
 		);
-		return await returnComboSessionFallbackDisabled(
-			disabledComboSessionFallbackName,
-			accounts.length,
+		return finishPacing(
+			pacingSlot,
+			await returnComboSessionFallbackDisabled(
+				disabledComboSessionFallbackName,
+				accounts.length,
+			),
 		);
 	}
 

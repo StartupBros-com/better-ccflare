@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import {
 	acquireCachePacing,
 	CACHE_PACING_MS_ENV,
+	CODEX_CACHE_PACING_SETTLE_MS_ENV,
 	CODEX_PACING_BYPASS_PERCENT_ENV,
 	derivePacingCohortKey,
 	finishPacing,
@@ -10,6 +11,7 @@ import {
 	isCodexPacingBypassCandidate,
 	observeCachePacing,
 	readCachePacingMs,
+	readCodexCachePacingSettleMs,
 	readCodexPacingBypassPercent,
 	recordCachePacingRoute,
 	resetCachePacing,
@@ -18,6 +20,7 @@ import {
 afterEach(() => {
 	resetCachePacing();
 	delete process.env[CACHE_PACING_MS_ENV];
+	delete process.env[CODEX_CACHE_PACING_SETTLE_MS_ENV];
 	delete process.env[CODEX_PACING_BYPASS_PERCENT_ENV];
 });
 
@@ -40,6 +43,55 @@ function sseResponse(chunks: string[], delayMs = 0): Response {
 	});
 }
 
+function controlledResponse(): {
+	response: Response;
+	enqueue(chunk: string): void;
+	close(): void;
+	error(error: Error): void;
+} {
+	const encoder = new TextEncoder();
+	let controller!: ReadableStreamDefaultController<Uint8Array>;
+	const stream = new ReadableStream<Uint8Array>({
+		start(nextController) {
+			controller = nextController;
+		},
+	});
+	return {
+		response: new Response(stream, { status: 200 }),
+		enqueue(chunk) {
+			controller.enqueue(encoder.encode(chunk));
+		},
+		close() {
+			controller.close();
+		},
+		error(error) {
+			controller.error(error);
+		},
+	};
+}
+
+function route(
+	observation: Awaited<ReturnType<typeof observeCachePacing>>,
+	provider: string,
+): void {
+	recordCachePacingRoute(observation, {
+		accountId: `${provider}-account`,
+		accountName: `${provider}-account`,
+		provider,
+	});
+}
+
+function wait(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function requireReader(
+	response: Response,
+): ReadableStreamDefaultReader<Uint8Array> {
+	if (!response.body) throw new Error("expected response body");
+	return response.body.getReader();
+}
+
 describe("readCachePacingMs", () => {
 	test("disabled by default, parses overrides, rejects nonsense", () => {
 		expect(readCachePacingMs()).toBe(0);
@@ -47,6 +99,22 @@ describe("readCachePacingMs", () => {
 		expect(readCachePacingMs()).toBe(15_000);
 		process.env[CACHE_PACING_MS_ENV] = "junk";
 		expect(readCachePacingMs()).toBe(0);
+	});
+});
+
+describe("readCodexCachePacingSettleMs", () => {
+	test("defaults off, parses unsigned integers strictly, and clamps at ten seconds", () => {
+		expect(readCodexCachePacingSettleMs()).toBe(0);
+		process.env[CODEX_CACHE_PACING_SETTLE_MS_ENV] = "0";
+		expect(readCodexCachePacingSettleMs()).toBe(0);
+		process.env[CODEX_CACHE_PACING_SETTLE_MS_ENV] = "6000";
+		expect(readCodexCachePacingSettleMs()).toBe(6_000);
+		for (const invalid of ["5ms", "1e3", "+5", "-1", "1.5", " 5", "5 "]) {
+			process.env[CODEX_CACHE_PACING_SETTLE_MS_ENV] = invalid;
+			expect(readCodexCachePacingSettleMs()).toBe(0);
+		}
+		process.env[CODEX_CACHE_PACING_SETTLE_MS_ENV] = "999999";
+		expect(readCodexCachePacingSettleMs()).toBe(10_000);
 	});
 });
 
@@ -220,6 +288,191 @@ describe("acquireCachePacing", () => {
 		const wrapped = finishPacing(leader, sseResponse(["hello ", "world"], 1));
 		expect(await wrapped.text()).toBe("hello world");
 		expect(wrapped.headers.get("content-type")).toBe("text/event-stream");
+	});
+
+	test("Anthropic releases a follower at the first chunk even when Codex settling is enabled", async () => {
+		process.env[CACHE_PACING_MS_ENV] = "500";
+		process.env[CODEX_CACHE_PACING_SETTLE_MS_ENV] = "100";
+		const leader = await observeCachePacing({
+			sessionKey: "anthropic-first",
+			model: "m",
+		});
+		route(leader, "anthropic");
+		const follower = observeCachePacing({
+			sessionKey: "anthropic-first",
+			model: "m",
+		});
+		const source = controlledResponse();
+		const reader = requireReader(
+			finishPacing(leader?.slot ?? null, source.response),
+		);
+		source.enqueue("first");
+		expect(new TextDecoder().decode((await reader.read()).value)).toBe("first");
+		await follower;
+		source.close();
+	});
+
+	test("Codex holds through clean EOF, preserves chunks, then settles before releasing", async () => {
+		process.env[CACHE_PACING_MS_ENV] = "500";
+		process.env[CODEX_CACHE_PACING_SETTLE_MS_ENV] = "60";
+		const leader = await observeCachePacing({
+			sessionKey: "codex-terminal",
+			model: "m",
+		});
+		route(leader, "codex");
+		const follower = observeCachePacing({
+			sessionKey: "codex-terminal",
+			model: "m",
+		});
+		const source = controlledResponse();
+		const reader = requireReader(
+			finishPacing(leader?.slot ?? null, source.response),
+		);
+		source.enqueue("first");
+		expect(new TextDecoder().decode((await reader.read()).value)).toBe("first");
+		await wait(15);
+		let followerReleased = false;
+		void follower.then(() => {
+			followerReleased = true;
+		});
+		expect(followerReleased).toBe(false);
+		source.enqueue(" second");
+		expect(new TextDecoder().decode((await reader.read()).value)).toBe(
+			" second",
+		);
+		source.close();
+		expect((await reader.read()).done).toBe(true);
+		await wait(25);
+		expect(followerReleased).toBe(false);
+		await follower;
+		expect(
+			getCachePacingRouteStats()["codex-account"].leadersReachedTerminal,
+		).toBe(1);
+		expect(
+			getCachePacingRouteStats()["codex-account"].leadersReleasedAfterSettle,
+		).toBe(1);
+	});
+
+	test("Codex cancellation and stream errors release followers immediately", async () => {
+		process.env[CACHE_PACING_MS_ENV] = "500";
+		process.env[CODEX_CACHE_PACING_SETTLE_MS_ENV] = "200";
+		for (const mode of ["cancel", "error"] as const) {
+			const leader = await observeCachePacing({
+				sessionKey: `codex-${mode}`,
+				model: "m",
+			});
+			route(leader, "codex");
+			const follower = observeCachePacing({
+				sessionKey: `codex-${mode}`,
+				model: "m",
+			});
+			const source = controlledResponse();
+			const reader = requireReader(
+				finishPacing(leader?.slot ?? null, source.response),
+			);
+			if (mode === "cancel") {
+				await reader.cancel();
+			} else {
+				source.error(new Error("upstream failed"));
+				await expect(reader.read()).rejects.toThrow("upstream failed");
+			}
+			await follower;
+		}
+	});
+
+	test("bodyless and non-OK responses release Codex leaders immediately", async () => {
+		process.env[CACHE_PACING_MS_ENV] = "500";
+		process.env[CODEX_CACHE_PACING_SETTLE_MS_ENV] = "200";
+		for (const response of [
+			new Response(null, { status: 204 }),
+			new Response("bad", { status: 503 }),
+		]) {
+			const leader = await observeCachePacing({
+				sessionKey: `immediate-${response.status}`,
+				model: "m",
+			});
+			route(leader, "codex");
+			const follower = observeCachePacing({
+				sessionKey: `immediate-${response.status}`,
+				model: "m",
+			});
+			finishPacing(leader?.slot ?? null, response);
+			await follower;
+		}
+	});
+
+	test("follower cap bounds a longer Codex settle delay", async () => {
+		process.env[CACHE_PACING_MS_ENV] = "40";
+		process.env[CODEX_CACHE_PACING_SETTLE_MS_ENV] = "200";
+		const leader = await observeCachePacing({
+			sessionKey: "codex-cap",
+			model: "m",
+		});
+		route(leader, "codex");
+		const wrapped = finishPacing(leader?.slot ?? null, sseResponse(["done"]));
+		await wrapped.text();
+		const start = Date.now();
+		await observeCachePacing({ sessionKey: "codex-cap", model: "m" });
+		expect(Date.now() - start).toBeLessThan(150);
+	});
+
+	test("Anthropic winner after Codex intent uses default first-chunk release", async () => {
+		process.env[CACHE_PACING_MS_ENV] = "500";
+		process.env[CODEX_CACHE_PACING_SETTLE_MS_ENV] = "100";
+		const leader = await observeCachePacing({
+			sessionKey: "codex-failover",
+			model: "gpt-5",
+		});
+		route(leader, "anthropic");
+		const follower = observeCachePacing({
+			sessionKey: "codex-failover",
+			model: "gpt-5",
+		});
+		const source = controlledResponse();
+		const reader = requireReader(
+			finishPacing(leader?.slot ?? null, source.response),
+		);
+		source.enqueue("first");
+		await reader.read();
+		await follower;
+		source.close();
+	});
+
+	test("a stale delayed leader cannot delete its replacement", async () => {
+		process.env[CACHE_PACING_MS_ENV] = "100";
+		process.env[CODEX_CACHE_PACING_SETTLE_MS_ENV] = "60";
+		let clock = 0;
+		const first = await observeCachePacing({
+			sessionKey: "replace",
+			model: "m",
+			now: () => clock,
+		});
+		route(first, "codex");
+		const firstResponse = finishPacing(
+			first?.slot ?? null,
+			sseResponse(["done"]),
+		);
+		await firstResponse.text();
+		clock = 300;
+		const replacement = await observeCachePacing({
+			sessionKey: "replace",
+			model: "m",
+			now: () => clock,
+		});
+		await wait(80);
+		const follower = observeCachePacing({
+			sessionKey: "replace",
+			model: "m",
+			now: () => clock,
+		});
+		await wait(5);
+		let released = false;
+		void follower.then(() => {
+			released = true;
+		});
+		expect(released).toBe(false);
+		replacement?.slot?.abandon();
+		await follower;
 	});
 
 	test("abandon releases followers immediately", async () => {
