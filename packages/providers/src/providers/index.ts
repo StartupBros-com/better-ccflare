@@ -27,6 +27,7 @@ export {
 	CODEX_WHAM_USAGE_FALLBACK_ENDPOINT,
 	CodexOAuthProvider,
 	CodexProvider,
+	classifyCodexModelFamily,
 	deriveCodexExplicitBreakpointBucket,
 	extractChatGptAccountId,
 	fetchCodexUsageData,

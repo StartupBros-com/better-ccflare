@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import {
+	type CacheUsageObservation,
 	cacheReadSharePercent,
 	summarizeCacheReadHistogram,
 	summarizeCacheReadObservations,
-	type CacheUsageObservation,
 } from "./cache-metrics";
 
 describe("cacheReadSharePercent", () => {

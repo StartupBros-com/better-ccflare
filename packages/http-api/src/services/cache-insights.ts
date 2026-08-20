@@ -1,7 +1,4 @@
-import {
-	cacheReadSharePercent,
-	type ModelRates,
-} from "@better-ccflare/core";
+import { cacheReadSharePercent, type ModelRates } from "@better-ccflare/core";
 import type {
 	CacheInsightsResponse,
 	CacheInsightsRow,

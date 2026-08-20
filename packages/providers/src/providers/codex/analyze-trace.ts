@@ -1,9 +1,10 @@
 /** Analyze Codex JSONL traces without retaining prompt content. */
 import { readFileSync } from "node:fs";
 import {
-	summarizeCacheReadObservations,
 	type CacheUsageObservation,
+	summarizeCacheReadObservations,
 } from "@better-ccflare/core";
+import { classifyCodexModelFamily } from "./model-family";
 import {
 	CODEX_TURN_STATE_ARMS,
 	CODEX_TURN_STATE_REQUEST_ACTIONS,
@@ -1131,16 +1132,6 @@ function analyzeRequestTransitions(requests: TraceRecord[]) {
 const SAFE_COHORT = /^[a-fA-F0-9]{16}$/;
 const FALLBACK_CAUSES = new Set(["model_fallback", "account_failover"]);
 const PACING_ACTIONS = new Set(["paced", "bypassed", "crossover-paced"]);
-const OFFICIAL_CODEX_MODEL_FAMILIES: ReadonlyArray<readonly [RegExp, string]> =
-	[
-		[/^gpt-5\.6-sol(?:-\d{4}-\d{2}-\d{2})?$/, "gpt-5.6-sol"],
-		[/^gpt-5\.6-terra(?:-\d{4}-\d{2}-\d{2})?$/, "gpt-5.6-terra"],
-		[/^gpt-5\.6-luna(?:-\d{4}-\d{2}-\d{2})?$/, "gpt-5.6-luna"],
-		[/^gpt-5\.5(?:-\d{4}-\d{2}-\d{2})?$/, "gpt-5.5"],
-		[/^gpt-5\.4-mini(?:-\d{4}-\d{2}-\d{2})?$/, "gpt-5.4-mini"],
-		[/^gpt-5\.4(?:-\d{4}-\d{2}-\d{2})?$/, "gpt-5.4"],
-		[/^gpt-5\.3-codex(?:-\d{4}-\d{2}-\d{2})?$/, "gpt-5.3-codex"],
-	];
 // Derived from the canonical vocabularies in turn-state.ts. Repeating the
 // literals here once meant a newly emitted action could be silently dropped by
 // this allowlist -- making a fail-closed guard invisible to the analysis meant
@@ -1620,11 +1611,7 @@ function experimentArm(
 }
 
 function safeModel(request: TraceRecord): string {
-	const model = request.model_out ?? request.model_in;
-	if (typeof model !== "string" || model.length === 0) return "unknown";
-	for (const [pattern, family] of OFFICIAL_CODEX_MODEL_FAMILIES)
-		if (pattern.test(model)) return family;
-	return "other_or_custom";
+	return classifyCodexModelFamily(request.model_out ?? request.model_in);
 }
 
 function experimentAction(

@@ -11,6 +11,7 @@ export {
 	initiateCodexDeviceFlow,
 	pollCodexForToken,
 } from "./device-oauth";
+export { classifyCodexModelFamily } from "./model-family";
 export { CodexOAuthProvider } from "./oauth";
 export type { CodexUsageRefreshFetchResult } from "./on-demand-fetch";
 export { fetchCodexUsageOnDemand } from "./on-demand-fetch";
@@ -19,9 +20,9 @@ export {
 	CODEX_CONVERSATION_ID_HEADER,
 	CODEX_DEFAULT_ENDPOINT,
 	CODEX_EXPLICIT_CACHE_BREAKPOINT_PERCENT_ENV,
-	CODEX_PROMPT_CACHE_KEY_ENV,
 	CODEX_LOGICAL_MODEL_FAMILY_HEADER,
 	CODEX_PING_MODEL,
+	CODEX_PROMPT_CACHE_KEY_ENV,
 	CODEX_TURN_STATE_HEADER,
 	CODEX_USER_AGENT,
 	CODEX_VERSION,

@@ -128,9 +128,7 @@ describe("cache parity handler", () => {
 				(item: { key: string }) => item.key,
 			),
 		).toEqual(["gpt-5.6-sol", "other_or_custom"]);
-		expect(
-			data.windows.authoritative7d.codexByAccountContinuity,
-		).toEqual([
+		expect(data.windows.authoritative7d.codexByAccountContinuity).toEqual([
 			expect.objectContaining({
 				key: "same_account",
 				metrics: expect.objectContaining({ measuredResponses: 2 }),

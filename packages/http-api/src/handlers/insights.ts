@@ -8,6 +8,7 @@ import { Logger } from "@better-ccflare/logger";
 import {
 	CODEX_CACHE_KEY_MODE_ENV,
 	CODEX_PROMPT_CACHE_KEY_ENV,
+	classifyCodexModelFamily,
 	getCodexExplicitCacheBreakpointSuppressionCount,
 	readCodexCacheKeyContinuityPercent,
 	readCodexCacheKeyPrefixShardPercent,
@@ -293,39 +294,22 @@ const CACHE_PARITY_WINDOW_SQL = `
 	GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
 `;
 
-const OFFICIAL_CODEX_MODEL_FAMILIES: ReadonlyArray<readonly [RegExp, string]> = [
-	[/^gpt-5\.6-sol(?:-\d{4}-\d{2}-\d{2})?$/, "gpt-5.6-sol"],
-	[/^gpt-5\.6-terra(?:-\d{4}-\d{2}-\d{2})?$/, "gpt-5.6-terra"],
-	[/^gpt-5\.6-luna(?:-\d{4}-\d{2}-\d{2})?$/, "gpt-5.6-luna"],
-	[/^gpt-5\.5(?:-\d{4}-\d{2}-\d{2})?$/, "gpt-5.5"],
-	[/^gpt-5\.4-mini(?:-\d{4}-\d{2}-\d{2})?$/, "gpt-5.4-mini"],
-	[/^gpt-5\.4(?:-\d{4}-\d{2}-\d{2})?$/, "gpt-5.4"],
-	[/^gpt-5\.3-codex(?:-\d{4}-\d{2}-\d{2})?$/, "gpt-5.3-codex"],
-];
-
-function safeParityPhysicalModel(provider: string, model: string): string {
-	if (provider !== "codex") return model;
-	for (const [pattern, family] of OFFICIAL_CODEX_MODEL_FAMILIES) {
-		if (pattern.test(model)) return family;
-	}
-	return model === "unknown" ? "unknown" : "other_or_custom";
-}
-
 function toCacheParityAggregateRow(
 	row: CacheParitySqlRow,
 ): CacheParityAggregateRow {
 	return {
 		provider: row.provider,
-		physicalModel: safeParityPhysicalModel(row.provider, row.physical_model),
+		physicalModel:
+			row.provider === "codex"
+				? classifyCodexModelFamily(row.physical_model)
+				: row.physical_model,
 		accountName: row.account_name,
 		turnKind: row.turn_kind,
 		gapBand: row.gap_band,
 		contextBand: row.context_band,
 		sameAccount: row.same_account === true || Number(row.same_account) === 1,
 		cacheShareBucket:
-			row.cache_share_bucket === null
-				? null
-				: Number(row.cache_share_bucket),
+			row.cache_share_bucket === null ? null : Number(row.cache_share_bucket),
 		requests: Number(row.requests) || 0,
 		successfulRequests: Number(row.successful_requests) || 0,
 		fallbackRequests: Number(row.fallback_requests) || 0,
@@ -369,14 +353,12 @@ export function createCacheParityHandler(context: APIContext) {
 		const generatedAt = Date.now();
 		try {
 			const [rows24h, rows7d] = await Promise.all([
-				db.query<CacheParitySqlRow>(
-					CACHE_PARITY_WINDOW_SQL,
-					[generatedAt - 24 * 60 * 60 * 1000],
-				),
-				db.query<CacheParitySqlRow>(
-					CACHE_PARITY_WINDOW_SQL,
-					[generatedAt - 7 * 24 * 60 * 60 * 1000],
-				),
+				db.query<CacheParitySqlRow>(CACHE_PARITY_WINDOW_SQL, [
+					generatedAt - 24 * 60 * 60 * 1000,
+				]),
+				db.query<CacheParitySqlRow>(CACHE_PARITY_WINDOW_SQL, [
+					generatedAt - 7 * 24 * 60 * 60 * 1000,
+				]),
 			]);
 			return jsonResponse(
 				buildCacheParityResponse({

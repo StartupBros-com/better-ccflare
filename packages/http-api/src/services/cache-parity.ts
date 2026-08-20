@@ -46,9 +46,7 @@ function roundPercent(value: number | null): number | null {
 }
 
 function rate(numerator: number, denominator: number): number | null {
-	return denominator > 0
-		? roundPercent((numerator * 100) / denominator)
-		: null;
+	return denominator > 0 ? roundPercent((numerator * 100) / denominator) : null;
 }
 
 function aggregateMetrics(
@@ -184,10 +182,7 @@ function buildWindow(
 	const codexRows = rows.filter(
 		(row) => row.provider === "codex" && row.turnKind === "follow_up",
 	);
-	const codexByPhysicalModel = groupRows(
-		codexRows,
-		(row) => row.physicalModel,
-	);
+	const codexByPhysicalModel = groupRows(codexRows, (row) => row.physicalModel);
 	const codexByAccount = groupRows(codexRows, (row) => row.accountName);
 	const codexByGapBand = groupRows(codexRows, (row) => row.gapBand);
 	const codexByContextBand = groupRows(codexRows, (row) => row.contextBand);
