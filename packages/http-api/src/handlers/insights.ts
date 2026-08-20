@@ -339,10 +339,10 @@ function readCacheParityPolicy(context: APIContext): CacheParityPolicy {
 		turnStatePercent: turnState.percent,
 		turnStateObserveOnly: turnState.observeOnly,
 		webSocketPercent: readCodexWebSocketPercent(),
-		globalKeepaliveTtlMinutes:
-			typeof context.config.getCacheKeepaliveTtlMinutes === "function"
-				? context.config.getCacheKeepaliveTtlMinutes()
-				: 0,
+		// Read directly: this feeds the R18 fail-closed guard, so a missing or
+		// renamed accessor must break loudly rather than resolve to 0, which
+		// would read as "no synthetic traffic" and let parity pass.
+		globalKeepaliveTtlMinutes: context.config.getCacheKeepaliveTtlMinutes(),
 	};
 }
 

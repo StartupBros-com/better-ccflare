@@ -253,9 +253,20 @@ export function summarizeCacheReadHistogram(
 		histogram.cacheReadInputTokens > histogram.totalInputTokens ||
 		!validTokenCount(histogram.unavailableResponses)
 	) {
+		// The totals are untrustworthy, so no bucket derived from them can be
+		// reported as measured. Count every response the histogram claimed as
+		// unavailable rather than emitting a bucket-shaped sentinel: this is an
+		// observability surface, and a wrong count reads as a real measurement.
+		const claimedResponses = histogram.buckets.reduce(
+			(total, bucket) =>
+				validTokenCount(bucket.responses) ? total + bucket.responses : total,
+			0,
+		);
 		return summaryFromParts({
 			measuredResponses: 0,
-			unavailableResponses: histogram.buckets.length + 1,
+			unavailableResponses: Number.isSafeInteger(claimedResponses)
+				? claimedResponses
+				: 0,
 			totalInputTokens: 0,
 			cacheReadInputTokens: 0,
 			medianCacheReadPercent: null,
