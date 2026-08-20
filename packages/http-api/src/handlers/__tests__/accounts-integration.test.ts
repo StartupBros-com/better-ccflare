@@ -4,9 +4,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { Config } from "@better-ccflare/config";
 import { DatabaseOperations } from "@better-ccflare/database";
+import { deriveComboRouteClass } from "@better-ccflare/providers/request-capabilities";
 import {
 	createAccountResumeHandler,
 	createAccountsListHandler,
+	createMuseSparkAccountAddHandler,
+	createOpenAIAccountAddHandler,
 } from "../accounts";
 
 // Mock the usage fetcher functions directly
@@ -1289,5 +1292,224 @@ describe("Accounts Handler - OAuth control-plane hotfix (U8)", () => {
 
 		expect(account?.paused).toBe(false);
 		expect(account?.pauseReason).toBeNull();
+	});
+});
+
+/**
+ * U1 — Canonical static-key persistence in HTTP account creation (R1, R16, R17).
+ *
+ * These tests exercise the REAL createOpenAIAccountAddHandler and
+ * createMuseSparkAccountAddHandler against a real DatabaseOperations instance
+ * backed by a temp SQLite file, so a regression in the INSERT row shape
+ * actually fails these tests. No network traffic; credential columns only.
+ *
+ * The reference canonical static-key shape is what the CLI creation path writes
+ * (packages/cli-commands/src/commands/account.ts createOpenAIAccount): the key
+ * in `api_key`, and `refresh_token`, `access_token`, AND `expires_at` all NULL.
+ */
+describe("Accounts Handler - U1 static-key row-shape parity", () => {
+	let tmpDir: string;
+	let dbOps: DatabaseOperations;
+
+	beforeEach(() => {
+		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ccflare-u1-parity-"));
+		dbOps = new DatabaseOperations(path.join(tmpDir, "test.db"));
+	});
+
+	afterEach(async () => {
+		await dbOps.close();
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	});
+
+	type CredentialRow = {
+		api_key: string | null;
+		refresh_token: string | null;
+		access_token: string | null;
+		expires_at: number | null;
+	};
+
+	async function fetchCredentialRow(id: string): Promise<CredentialRow> {
+		const row = await dbOps
+			.getAdapter()
+			.get<CredentialRow>(
+				"SELECT api_key, refresh_token, access_token, expires_at FROM accounts WHERE id = ?",
+				[id],
+			);
+		if (!row) throw new Error(`account ${id} not found`);
+		return row;
+	}
+
+	function makeAddRequest(body: Record<string, unknown>): Request {
+		return new Request("http://localhost/api/accounts/add", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(body),
+		});
+	}
+
+	it("AE1: HTTP-created openai-compatible account stores the key in api_key only, leaving refresh_token, access_token, and expires_at empty", async () => {
+		const response = await createOpenAIAccountAddHandler(dbOps)(
+			makeAddRequest({
+				name: "vercel-gw",
+				apiKey: "sk-test-key-12345",
+				customEndpoint: "https://ai-gateway.vercel.app/v1",
+				priority: 10,
+			}),
+		);
+
+		expect(response.ok).toBe(true);
+		const payload = (await response.json()) as { account: { id: string } };
+		const row = await fetchCredentialRow(payload.account.id);
+
+		expect(row.api_key).toBe("sk-test-key-12345");
+		expect(row.refresh_token).toBeNull();
+		expect(row.access_token).toBeNull();
+		expect(row.expires_at).toBeNull();
+	});
+
+	it("CLI-created and HTTP-created openai-compatible accounts built from identical input produce identical credential columns", async () => {
+		const sharedKey = "sk-shared-key-67890";
+		const sharedEndpoint = "https://gateway.example.com/v1";
+
+		// CLI canonical shape — reproduced from createOpenAIAccount in
+		// packages/cli-commands/src/commands/account.ts (api_key only; the
+		// other three credential columns are NULL).
+		const now = Date.now();
+		const cliId = crypto.randomUUID();
+		await dbOps.getAdapter().run(
+			`INSERT INTO accounts (
+				id, name, provider, api_key, refresh_token, access_token,
+				expires_at, created_at, request_count, total_requests, priority, custom_endpoint, model_mappings, model_fallbacks
+			) VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, 0, 0, ?, ?, NULL, NULL)`,
+			[
+				cliId,
+				"cli-equivalent",
+				"openai-compatible",
+				sharedKey,
+				now,
+				10,
+				sharedEndpoint,
+			],
+		);
+		const cliRow = await fetchCredentialRow(cliId);
+
+		// HTTP-created account with the same inputs.
+		const response = await createOpenAIAccountAddHandler(dbOps)(
+			makeAddRequest({
+				name: "http-equivalent",
+				apiKey: sharedKey,
+				customEndpoint: sharedEndpoint,
+				priority: 10,
+			}),
+		);
+		expect(response.ok).toBe(true);
+		const payload = (await response.json()) as { account: { id: string } };
+		const httpRow = await fetchCredentialRow(payload.account.id);
+
+		// Credential columns must be byte-identical (excluding the volatile id).
+		expect(httpRow.api_key).toBe(cliRow.api_key);
+		expect(httpRow.refresh_token).toBe(cliRow.refresh_token);
+		expect(httpRow.access_token).toBe(cliRow.access_token);
+		expect(httpRow.expires_at).toBe(cliRow.expires_at);
+
+		// And must equal the canonical SHAPE the CLI writes: the key in
+		// api_key, and the other three credential columns NULL.
+		expect(httpRow.api_key).toBe(sharedKey);
+		expect(httpRow.refresh_token).toBeNull();
+		expect(httpRow.access_token).toBeNull();
+		expect(httpRow.expires_at).toBeNull();
+	});
+
+	it("an existing row whose key is mirrored across all three columns still resolves to the same routing class (R17)", async () => {
+		const now = Date.now();
+		const mirroredId = crypto.randomUUID();
+
+		// Legacy mirrored shape — the key byte-for-byte in all three columns.
+		await dbOps.getAdapter().run(
+			`INSERT INTO accounts (
+				id, name, provider, api_key, refresh_token, access_token,
+				expires_at, created_at, request_count, total_requests, priority, custom_endpoint
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)`,
+			[
+				mirroredId,
+				"legacy-mirrored",
+				"openai-compatible",
+				"sk-mirrored-key",
+				"sk-mirrored-key",
+				"sk-mirrored-key",
+				now + 365 * 24 * 60 * 60 * 1000,
+				now,
+				5,
+				"https://legacy.example.com/v1",
+			],
+		);
+
+		const mirroredRow = await dbOps.getAdapter().get<{
+			provider: string;
+			billing_type: string | null;
+			api_key: string | null;
+			refresh_token: string | null;
+			access_token: string | null;
+		}>(
+			"SELECT provider, billing_type, api_key, refresh_token, access_token FROM accounts WHERE id = ?",
+			[mirroredId],
+		);
+
+		// Canonical static-key row — key in api_key only.
+		const canonicalId = crypto.randomUUID();
+		await dbOps.getAdapter().run(
+			`INSERT INTO accounts (
+				id, name, provider, api_key, refresh_token, access_token,
+				expires_at, created_at, request_count, total_requests, priority, custom_endpoint
+			) VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, 0, 0, ?, ?)`,
+			[
+				canonicalId,
+				"canonical-static",
+				"openai-compatible",
+				"sk-mirrored-key",
+				now,
+				5,
+				"https://legacy.example.com/v1",
+			],
+		);
+		const canonicalRow = await dbOps.getAdapter().get<{
+			provider: string;
+			billing_type: string | null;
+			api_key: string | null;
+			refresh_token: string | null;
+			access_token: string | null;
+		}>(
+			"SELECT provider, billing_type, api_key, refresh_token, access_token FROM accounts WHERE id = ?",
+			[canonicalId],
+		);
+
+		// Both shapes resolve to the same "api-key" routing class.
+		expect(deriveComboRouteClass(mirroredRow)).toBe("api-key");
+		expect(deriveComboRouteClass(canonicalRow)).toBe("api-key");
+		expect(deriveComboRouteClass(mirroredRow)).toBe(
+			deriveComboRouteClass(canonicalRow),
+		);
+	});
+
+	it("creating a non-compatible API-key account through its own handler is unaffected (KTD2 — Muse Spark still canonical)", async () => {
+		const response = await createMuseSparkAccountAddHandler(dbOps)(
+			makeAddRequest({
+				name: "muse-spark-u1",
+				apiKey: "ms-key-abcdef",
+				priority: 7,
+			}),
+		);
+
+		expect(response.ok).toBe(true);
+		const payload = (await response.json()) as { account: { id: string } };
+		const row = await fetchCredentialRow(payload.account.id);
+
+		// Muse Spark is the precedent canonical static-key shape: key in
+		// api_key only, refresh_token and access_token NULL, expires_at kept
+		// as the 1-year expiry. This must not regress as a side effect of U1.
+		expect(row.api_key).toBe("ms-key-abcdef");
+		expect(row.refresh_token).toBeNull();
+		expect(row.access_token).toBeNull();
+		expect(row.expires_at).not.toBeNull();
 	});
 });

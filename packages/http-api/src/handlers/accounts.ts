@@ -1406,15 +1406,17 @@ export function createOpenAIAccountAddHandler(dbOps: DatabaseOperations) {
 				`INSERT INTO accounts (
 					id, name, provider, api_key, refresh_token, access_token,
 					expires_at, created_at, request_count, total_requests, priority, custom_endpoint, model_mappings
-				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				) VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?)`,
 				[
 					accountId,
 					name,
 					"openai-compatible",
 					apiKey,
-					apiKey, // Use API key as refresh token for consistency
-					apiKey, // Use API key as access token
-					now + 365 * 24 * 60 * 60 * 1000, // 1 year from now
+					// API-key providers store the credential in api_key only. Mirroring
+					// it into refresh_token/access_token/expires_at is the legacy shape
+					// that deriveComboRouteClass only tolerates for backward
+					// compatibility; the CLI creation path already writes NULL here.
+					// R1: both creation surfaces must produce the same credential row.
 					now,
 					0,
 					0,
@@ -1437,7 +1439,7 @@ export function createOpenAIAccountAddHandler(dbOps: DatabaseOperations) {
 				total_requests: number;
 				last_used: number | null;
 				created_at: number;
-				expires_at: number;
+				expires_at: number | null;
 				refresh_token: string;
 				paused: number;
 			}>(
@@ -1468,7 +1470,11 @@ export function createOpenAIAccountAddHandler(dbOps: DatabaseOperations) {
 					paused: account.paused === 1,
 					priority: priority,
 					tokenStatus: "valid" as const,
-					tokenExpiresAt: new Date(account.expires_at).toISOString(),
+					// Static-key accounts never expire; expires_at is NULL in the
+					// canonical row shape (matches the CLI creation path).
+					tokenExpiresAt: account.expires_at
+						? new Date(account.expires_at).toISOString()
+						: null,
 					rateLimitStatus: "OK",
 					rateLimitReset: null,
 					rateLimitRemaining: null,
