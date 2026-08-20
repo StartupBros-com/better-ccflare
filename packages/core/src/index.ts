@@ -1,5 +1,6 @@
 // Re-export only used items from each module
 
+export * from "./bounded-request-body";
 export * from "./combo-membership-resolver";
 export {
 	BUFFER_SIZES,

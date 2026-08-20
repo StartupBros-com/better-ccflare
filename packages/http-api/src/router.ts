@@ -196,6 +196,7 @@ export class APIRouter {
 			getIntegrityStatus,
 			getAnthropicDegradedHealth,
 			getRetentionStatus,
+			getBodyAdmissionHealth,
 			getStrategy,
 		} = this.context;
 
@@ -210,6 +211,7 @@ export class APIRouter {
 			getAnthropicDegradedHealth,
 			getRetentionStatus,
 			() => getStrategy?.()?.getRoutingHealth?.(),
+			getBodyAdmissionHealth,
 		);
 		const statsHandler = createStatsHandler(dbOps);
 		const statsResetHandler = createStatsResetHandler(dbOps);

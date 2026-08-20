@@ -110,6 +110,11 @@ import {
 	type StrategyStore,
 } from "@better-ccflare/types";
 import { serve } from "bun";
+import {
+	BODY_ADMISSION_RESERVATION_MULTIPLIER,
+	BodyAdmissionController,
+	withBodyAdmission,
+} from "./body-admission";
 
 /**
  * Build a load-balancing strategy from its enum name. Add new strategies here
@@ -481,6 +486,8 @@ function serveDashboardFile(
 
 // Module-level server instance
 let serverInstance: ReturnType<typeof serve> | null = null;
+// The active server has one independent Bun-process admission budget.
+let activeBodyAdmission: BodyAdmissionController | null = null;
 let registeredServerId: string | null = null;
 let stopRetentionJob: (() => void) | null = null;
 let stopOAuthCleanupJob: (() => void) | null = null;
@@ -1153,6 +1160,13 @@ export default async function startServer(options?: {
 		);
 	}
 	const runtime = config.getRuntime();
+	// This process-local controller is separate from the Node guard's
+	// encoded-buffer budget: each process admits its own work.
+	const bodyAdmission = new BodyAdmissionController({
+		budgetBytes: config.getMaxBufferedRequestBodyBytes(),
+		queueLimit: config.getMaxBodyAdmissionQueue(),
+	});
+	activeBodyAdmission = bodyAdmission;
 	// Route profiles are strict operator intent. Validate before database startup,
 	// background jobs, or the HTTP listener can make this process look healthy.
 	const modelRouteProfiles = parseModelRouteProfiles();
@@ -1481,6 +1495,7 @@ export default async function startServer(options?: {
 					shadowOwnerOverlay: degradedOwnerShadowOverlay,
 				}),
 			getRetentionStatus,
+			getBodyAdmissionHealth: () => bodyAdmission.snapshot(),
 			getStrategy: () => currentStrategy,
 			internalProbeSecret,
 			localControlSecret,
@@ -2101,29 +2116,47 @@ export default async function startServer(options?: {
 							);
 						}
 
-						if (
+						const proxyResponse =
 							req.method === "POST" &&
 							(url.pathname === "/v1/responses" ||
 								url.pathname === "/v1/responses/compact")
-						) {
-							return await handleResponsesRequest(
-								req,
-								url,
-								handleProxy as Parameters<typeof handleResponsesRequest>[2],
-								proxyContext,
-								authResult.apiKeyId,
-								authResult.apiKeyName,
-							);
-						}
-						return trackStreamForShutdown(
-							await handleProxy(
-								req,
-								url,
-								proxyContext,
-								authResult.apiKeyId,
-								authResult.apiKeyName,
-							),
-						);
+								? await withBodyAdmission(
+										req,
+										bodyAdmission,
+										(lease) =>
+											handleResponsesRequest(
+												req,
+												url,
+												handleProxy as Parameters<
+													typeof handleResponsesRequest
+												>[2],
+												proxyContext,
+												authResult.apiKeyId,
+												authResult.apiKeyName,
+												{
+													onBodySizeKnown: (actualBytes) => {
+														lease.reduceTo(
+															Math.min(
+																bodyAdmission.snapshot().budgetBytes,
+																actualBytes *
+																	BODY_ADMISSION_RESERVATION_MULTIPLIER,
+															),
+														);
+													},
+												},
+											),
+										{ forceFull: true },
+									)
+								: await withBodyAdmission(req, bodyAdmission, () =>
+										handleProxy(
+											req,
+											url,
+											proxyContext,
+											authResult.apiKeyId,
+											authResult.apiKeyName,
+										),
+									);
+						return trackStreamForShutdown(proxyResponse);
 					} catch (proxyError) {
 						const statusCode =
 							typeof proxyError === "object" &&
@@ -2528,6 +2561,8 @@ Available endpoints:
 	return {
 		port: serverPort,
 		stop: () => {
+			activeBodyAdmission?.shutdown();
+			activeBodyAdmission = null;
 			if (serverInstance) {
 				serverInstance.stop();
 				serverInstance = null;
@@ -2726,6 +2761,9 @@ async function handleGracefulShutdown(signal: string) {
 		return;
 	}
 	isShuttingDown = true;
+	// Reject queued requests before stopping the listener. Active leases still
+	// drain with their response streams and release through the terminal wrapper.
+	activeBodyAdmission?.shutdown();
 
 	console.log(`\n👋 Received ${signal}, shutting down gracefully...`);
 

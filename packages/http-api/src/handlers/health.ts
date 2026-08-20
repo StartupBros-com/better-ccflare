@@ -173,6 +173,9 @@ export function createHealthHandler(
 	getAnthropicDegradedHealth?: AnthropicDegradedHealthFn,
 	getRetentionStatus?: RetentionStatusFn,
 	getRoutingHealth?: () => RoutingHealth | undefined,
+	getBodyAdmissionHealth?: () => NonNullable<
+		NonNullable<HealthResponse["runtime"]>["bodyAdmission"]
+	>,
 ) {
 	const normalCache = new TtlCache<HealthResponse>(2000);
 	const detailCache = new TtlCache<HealthResponse>(2000);
@@ -241,6 +244,30 @@ export function createHealthHandler(
 			const runtime = response.runtime ?? {};
 			response.runtime = runtime;
 			runtime.anthropicDegraded = getAnthropicDegradedHealth();
+		}
+
+		if (getBodyAdmissionHealth) {
+			const runtime = response.runtime ?? {};
+			response.runtime = runtime;
+			const snapshot = getBodyAdmissionHealth();
+			// Copy the explicit allow-list only. Never expose queued request data.
+			runtime.bodyAdmission = {
+				enabled: snapshot.enabled,
+				budgetBytes: snapshot.budgetBytes,
+				reservedBytes: snapshot.reservedBytes,
+				activeLeases: snapshot.activeLeases,
+				queuedRequests: snapshot.queuedRequests,
+				queueLimit: snapshot.queueLimit,
+				peakReservedBytes: snapshot.peakReservedBytes,
+				peakActiveLeases: snapshot.peakActiveLeases,
+				counters: {
+					admitted: snapshot.counters.admitted,
+					queued: snapshot.counters.queued,
+					queueFull: snapshot.counters.queueFull,
+					queueAborted: snapshot.counters.queueAborted,
+					released: snapshot.counters.released,
+				},
+			};
 		}
 
 		// Add storage integrity independently — orthogonal to asyncWriter/usageWorker

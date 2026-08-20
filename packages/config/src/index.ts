@@ -45,6 +45,11 @@ const CANONICAL_32_BYTE_BASE64URL = /^[A-Za-z0-9_-]{43}$/;
 const SAFE_REPLAY_KEY_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const MAX_SERVER_TOOL_REPLAY_KEYS_BYTES = 64 * 1024;
 const MAX_SERVER_TOOL_REPLAY_JSON_DEPTH = 64;
+export const DEFAULT_MAX_BUFFERED_REQUEST_BODY_BYTES = 256 * 1024 * 1024;
+export const MIN_MAX_BUFFERED_REQUEST_BODY_BYTES = 256 * 1024 * 1024;
+export const MAX_MAX_BUFFERED_REQUEST_BODY_BYTES = 1024 * 1024 * 1024;
+export const DEFAULT_MAX_BODY_ADMISSION_QUEUE = 500;
+export const MAX_MAX_BODY_ADMISSION_QUEUE = 5_000;
 // Linux uapi asm-generic/fcntl.h. Node/Bun do not consistently expose O_PATH.
 const LINUX_O_PATH = 0o10000000;
 
@@ -1702,6 +1707,33 @@ export class Config extends EventEmitter {
 		const fromFile = this.data.health_detail_enabled;
 		if (typeof fromFile === "boolean") return fromFile;
 		return false;
+	}
+
+	/** Restart-scoped Bun body-admission budget; malformed input fails safe. */
+	getMaxBufferedRequestBodyBytes(): number {
+		const raw = process.env.CCFLARE_MAX_BUFFERED_REQUEST_BODY_BYTES;
+		if (raw === undefined || !/^\d+$/.test(raw)) {
+			return DEFAULT_MAX_BUFFERED_REQUEST_BODY_BYTES;
+		}
+		const parsed = Number(raw);
+		return Number.isSafeInteger(parsed) &&
+			parsed >= MIN_MAX_BUFFERED_REQUEST_BODY_BYTES &&
+			parsed <= MAX_MAX_BUFFERED_REQUEST_BODY_BYTES
+			? parsed
+			: DEFAULT_MAX_BUFFERED_REQUEST_BODY_BYTES;
+	}
+
+	/** Restart-scoped FIFO body-admission queue cap; malformed input fails safe. */
+	getMaxBodyAdmissionQueue(): number {
+		const raw = process.env.CCFLARE_MAX_BODY_ADMISSION_QUEUE;
+		if (raw === undefined || !/^\d+$/.test(raw)) {
+			return DEFAULT_MAX_BODY_ADMISSION_QUEUE;
+		}
+		const parsed = Number(raw);
+		return Number.isSafeInteger(parsed) &&
+			parsed <= MAX_MAX_BODY_ADMISSION_QUEUE
+			? parsed
+			: DEFAULT_MAX_BODY_ADMISSION_QUEUE;
 	}
 
 	getAnthropicDegradedModeConfig(): AnthropicDegradedModeConfig {

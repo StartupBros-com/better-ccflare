@@ -15,8 +15,13 @@ import { createRoutingTerminalResponse } from "../../packages/proxy/src/handlers
 import {
 	DEFAULT_GUARD_MAX_ATTEMPTS,
 	DEFAULT_GUARD_MAX_BODY_READERS,
+	DEFAULT_GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES,
 	DEFAULT_GUARD_MAX_INSPECTION_BYTES,
 	DEFAULT_GUARD_MAX_REQUEST_BODY_BYTES,
+	MAX_GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES,
+	MAX_GUARD_REQUEST_BODY_BYTES,
+	MIN_GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES,
+	MIN_GUARD_REQUEST_BODY_BYTES,
 	DEFAULT_GUARD_MAX_RECOVERY_SLEEP_MS,
 	DEFAULT_GUARD_RETRY_ATTEMPT_HEADROOM_MS,
 	DEFAULT_GUARD_RESPONSE_IDLE_TIMEOUT_MS,
@@ -390,7 +395,7 @@ describe("source-controlled guard", () => {
 		expect(DEFAULT_GUARD_MAX_RECOVERY_SLEEP_MS).toBe(120_000);
 		expect(DEFAULT_GUARD_RETRY_JITTER_MS).toBe(2_000);
 		expect(DEFAULT_GUARD_MAX_INSPECTION_BYTES).toBe(64 * 1_024);
-		expect(DEFAULT_GUARD_MAX_REQUEST_BODY_BYTES).toBe(4 * 1024 * 1024);
+		expect(DEFAULT_GUARD_MAX_REQUEST_BODY_BYTES).toBe(32 * 1024 * 1024);
 		expect(DEFAULT_GUARD_MAX_BODY_READERS).toBe(8);
 		expect(DEFAULT_GUARD_REQUEST_DRAIN_TIMEOUT_MS).toBe(10_000);
 		expect(MIN_GUARD_REQUEST_DRAIN_TIMEOUT_MS).toBe(1_000);
@@ -405,6 +410,50 @@ describe("source-controlled guard", () => {
 			}),
 		).toThrow(/GUARD_MAX_BODY_READERS/);
 		expect(DEFAULT_GUARD_RESPONSE_IDLE_TIMEOUT_MS).toBe(120_000);
+	});
+
+	test("bounds and publishes weighted request-body buffering", async () => {
+		expect(DEFAULT_GUARD_MAX_REQUEST_BODY_BYTES).toBe(32 * 1024 * 1024);
+		expect(MAX_GUARD_REQUEST_BODY_BYTES).toBe(32 * 1024 * 1024);
+		expect(MIN_GUARD_REQUEST_BODY_BYTES).toBe(1_024);
+		expect(DEFAULT_GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES).toBe(
+			256 * 1024 * 1024,
+		);
+		expect(MAX_GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES).toBe(
+			256 * 1024 * 1024,
+		);
+		expect(MIN_GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES).toBe(1_024);
+		expect(() =>
+			createGuard({
+				maxRequestBodyBytes: 16 * 1024 * 1024,
+				maxBufferedRequestBodyBytes: 32 * 1024 * 1024 - 1,
+				logger: () => {},
+			}),
+		).toThrow(/GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES/);
+		expect(() =>
+			createGuard({
+				maxBufferedRequestBodyBytes:
+					MAX_GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES + 1,
+				logger: () => {},
+			}),
+		).toThrow(/GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES/);
+
+		const { baseUrl } = await startGuard("http://127.0.0.1:1", {
+			maxRequestBodyBytes: 2_048,
+			maxBufferedRequestBodyBytes: 4_096,
+		});
+		const health = await fetch(`${baseUrl}/_guard/health`).then((response) =>
+			response.json(),
+		);
+		expect(health).toMatchObject({
+			maxBufferedRequestBodyBytes: 4_096,
+			bodyReaders: {
+				reservationLimitBytes: 4_096,
+				reservedBytes: 0,
+				reservedBytesPeak: 0,
+			},
+			runtime: { limits: { maxBufferedRequestBodyBytes: 4_096 } },
+		});
 	});
 
 	test("bounds the drain of a stalled rejected upload and tears down the socket", async () => {
@@ -587,6 +636,11 @@ describe("source-controlled guard", () => {
 		expect(fetchCalls).toBe(0);
 		expect(guard.state.active).toBe(0);
 		expect(guard.state.queued).toBe(0);
+		expect(guard.state.bodyReaders).toMatchObject({
+			active: 0,
+			reservedBytes: 0,
+			reservedBytesPeak: 0,
+		});
 		expect(guard.state.counters.oversizedRequestBodies).toBe(1);
 		const event = events.find(
 			(candidate) => candidate.event === "guard_request_body_too_large",
@@ -594,6 +648,40 @@ describe("source-controlled guard", () => {
 		expect(event).toMatchObject({
 			maxRequestBodyBytes: 1_024,
 			declaredBytes: 1_025,
+		});
+	});
+
+	test("rejects a decimal Content-Length above Number.MAX_SAFE_INTEGER without reserving or forwarding", async () => {
+		let fetchCalls = 0;
+		const { baseUrl, guard } = await startGuard("http://127.0.0.1:8789", {
+			maxRequestBodyBytes: 1_024,
+			maxBufferedRequestBodyBytes: 2_048,
+			fetchImpl: async () => {
+				fetchCalls += 1;
+				return new Response("must-not-forward", { status: 200 });
+			},
+		});
+		const guardUrl = new URL(baseUrl);
+		const socket = await openRawRequest(
+			baseUrl,
+			"POST /v1/messages HTTP/1.1\r\n" +
+				`Host: ${guardUrl.host}\r\n` +
+				"Content-Length: 9007199254740992\r\n" +
+				"Connection: close\r\n\r\n",
+		);
+
+		const rawResponse = await readRawResponsesUntil(
+			socket,
+			"guard_request_body_too_large",
+		);
+
+		expect(rawResponse).toContain("HTTP/1.1 413");
+		expect(fetchCalls).toBe(0);
+		expect(guard.state.bodyReaders).toMatchObject({
+			active: 0,
+			queued: 0,
+			reservedBytes: 0,
+			reservedBytesPeak: 0,
 		});
 	});
 
@@ -640,7 +728,7 @@ describe("source-controlled guard", () => {
 	});
 
 	test("forwards a body at or below the configured request-body limit unchanged", async () => {
-		let forwardedBody: string | null = null;
+		let forwardedBody = "";
 		const { baseUrl } = await startGuard("http://127.0.0.1:8789", {
 			maxRequestBodyBytes: 1_024,
 			fetchImpl: async (_url: URL, init: RequestInit) => {
@@ -663,7 +751,7 @@ describe("source-controlled guard", () => {
 		const spoofedId = "11111111-1111-4111-8111-111111111111";
 		const events: Array<Record<string, unknown>> = [];
 		let forwardedId: string | null = null;
-		let proxyRequestId: string | null = null;
+		let proxyRequestId = "";
 		const { baseUrl } = await startGuard("http://127.0.0.1:8789", {
 			guardCorrelationSecret: GUARD_CORRELATION_SECRET_ENCODED,
 			logger: (line: string) => events.push(JSON.parse(line)),
@@ -694,11 +782,15 @@ describe("source-controlled guard", () => {
 		expect(await response.text()).toBe("forwarded");
 
 		const guardEvent = events.find((event) => event.event === "proxy_response");
+		const guardEventId = guardEvent?.id;
 		expect(forwardedId).not.toBe(spoofedId);
 		expect(forwardedId).toMatch(
 			/^v1\.[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.1\.[A-Za-z0-9_-]{43}$/,
 		);
-		expect(proxyRequestId).toBe(guardEvent?.id);
+		if (typeof guardEventId !== "string") {
+			throw new Error("missing proxy response request ID");
+		}
+		expect(proxyRequestId).toBe(guardEventId);
 		expect(response.headers.get(GUARD_REQUEST_ID_HEADER)).toBeNull();
 	});
 
@@ -885,8 +977,9 @@ describe("source-controlled guard", () => {
 	test("aborts a stalled response body and releases its active lease", async () => {
 		let fetchCalls = 0;
 		let cancelCalls = 0;
-		let stalledController: ReadableStreamDefaultController<Uint8Array> | null =
-			null;
+		const stalledResponse: {
+			controller: ReadableStreamDefaultController<Uint8Array> | null;
+		} = { controller: null };
 		const events: string[] = [];
 		const { baseUrl, guard } = await startGuard("http://127.0.0.1:8789", {
 			maxActive: 1,
@@ -899,7 +992,7 @@ describe("source-controlled guard", () => {
 					return new Response(
 						new ReadableStream<Uint8Array>({
 							start(controller) {
-								stalledController = controller;
+								stalledResponse.controller = controller;
 								controller.enqueue(Buffer.from("first-prefix"));
 							},
 							cancel() {
@@ -940,7 +1033,7 @@ describe("source-controlled guard", () => {
 		} finally {
 			firstAbort.abort();
 			try {
-				stalledController?.close();
+				stalledResponse.controller?.close();
 			} catch {
 				// The watchdog may already have cancelled the source.
 			}
@@ -1306,14 +1399,18 @@ describe("source-controlled guard", () => {
 			"invalid_message_stop",
 			"unterminated_event",
 		]);
+		const malformedReasons = [
+			"invalid_json",
+			"event_type_mismatch",
+			"invalid_message_stop",
+			"unterminated_event",
+		];
 		for (const completion of completions) {
 			expect(completion.semanticParseState).toBe("malformed");
-			expect([
-				"invalid_json",
-				"event_type_mismatch",
-				"invalid_message_stop",
-				"unterminated_event",
-			]).toContain(completion.semanticParseReason);
+			if (typeof completion.semanticParseReason !== "string") {
+				throw new Error("missing malformed SSE reason");
+			}
+			expect(malformedReasons).toContain(completion.semanticParseReason);
 		}
 		for (const privateValue of privateValues) {
 			expect(JSON.stringify(completions)).not.toContain(privateValue);
@@ -1801,8 +1898,9 @@ describe("source-controlled guard", () => {
 	test("bounds a stalled partially inspected oversized response body (legacy body-only fallback)", async () => {
 		let fetchCalls = 0;
 		let cancelCalls = 0;
-		let stalledController: ReadableStreamDefaultController<Uint8Array> | null =
-			null;
+		const stalledResponse: {
+			controller: ReadableStreamDefaultController<Uint8Array> | null;
+		} = { controller: null };
 		const { baseUrl, guard } = await startGuard("http://127.0.0.1:8789", {
 			maxActive: 1,
 			maxInspectionBytes: 8,
@@ -1815,7 +1913,7 @@ describe("source-controlled guard", () => {
 					return new Response(
 						new ReadableStream<Uint8Array>({
 							start(controller) {
-								stalledController = controller;
+								stalledResponse.controller = controller;
 								controller.enqueue(Buffer.from("oversized-prefix"));
 							},
 							cancel() {
@@ -1860,7 +1958,7 @@ describe("source-controlled guard", () => {
 		} finally {
 			firstAbort.abort();
 			try {
-				stalledController?.close();
+				stalledResponse.controller?.close();
 			} catch {
 				// The watchdog may already have cancelled the source.
 			}
@@ -2192,6 +2290,241 @@ describe("source-controlled guard", () => {
 			await Promise.all(responses.map((response) => response.text())),
 		).toEqual(["ok", "ok"]);
 		expect(peakActive).toBe(1);
+	});
+
+	test("enforces FIFO aggregate reservations before body listeners", async () => {
+		const upstreamBase = await listen(
+			http.createServer((_req, res) => res.end("upstream-ok")),
+		);
+		const { baseUrl, guard } = await startGuard(upstreamBase, {
+			maxActive: 4,
+			maxQueue: 4,
+			maxBodyReaders: 4,
+			maxRequestBodyBytes: 2_048,
+			maxBufferedRequestBodyBytes: 4_096,
+			totalDeadlineMs: 5_000,
+		});
+		const guardUrl = new URL(baseUrl);
+		const unknown = await openRawRequest(
+			baseUrl,
+			"POST /v1/messages HTTP/1.1\r\n" +
+				`Host: ${guardUrl.host}\r\n` +
+				"Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n" +
+				"1\r\nx\r\n",
+		);
+		await waitFor(
+			() =>
+				guard.state.bodyReaders.active === 1 &&
+				guard.state.bodyReaders.reservedBytes === 4_096,
+		);
+
+		const blocked = fetch(`${baseUrl}/v1/messages`, {
+			method: "POST",
+			headers: { "content-length": "512" },
+			body: "y".repeat(512),
+		});
+		await waitFor(() => guard.state.bodyReaders.queued === 1);
+		expect(guard.state.bodyReaders).toMatchObject({
+			active: 1,
+			queued: 1,
+			reservedBytes: 4_096,
+			reservedBytesPeak: 4_096,
+		});
+		expect(guard.state.counters.bodyReaderBudgetBlocked).toBeGreaterThan(0);
+
+		const unknownResponse = readRawResponsesUntil(unknown, "upstream-ok");
+		unknown.write("0\r\n\r\n");
+		expect(await (await blocked).text()).toBe("upstream-ok");
+		expect(await unknownResponse).toContain("HTTP/1.1 200");
+		await waitFor(
+			() =>
+				guard.state.bodyReaders.active === 0 &&
+				guard.state.bodyReaders.reservedBytes === 0,
+		);
+	});
+
+	test("reserves declared bytes and retains a zero-body reader slot", async () => {
+		const upstreamBase = await listen(
+			http.createServer((_req, res) => res.end("upstream-ok")),
+		);
+		const { baseUrl, guard } = await startGuard(upstreamBase, {
+			maxBodyReaders: 2,
+			maxRequestBodyBytes: 2_048,
+			maxBufferedRequestBodyBytes: 4_096,
+			totalDeadlineMs: 5_000,
+		});
+		const guardUrl = new URL(baseUrl);
+		const partial = await openRawRequest(
+			baseUrl,
+			"POST /v1/messages HTTP/1.1\r\n" +
+				`Host: ${guardUrl.host}\r\n` +
+				"Content-Length: 512\r\nConnection: close\r\n\r\n" +
+				"x".repeat(16),
+		);
+		await waitFor(() => guard.state.bodyReaders.reservedBytes === 1_024);
+		expect(guard.state.bodyReaders.active).toBe(1);
+		const partialResponse = readRawResponsesUntil(partial, "upstream-ok");
+		partial.write("x".repeat(496));
+		expect(await partialResponse).toContain("HTTP/1.1 200");
+		await waitFor(() => guard.state.bodyReaders.reservedBytes === 0);
+
+		const { baseUrl: zeroBaseUrl, guard: zeroGuard } = await startGuard(
+			upstreamBase,
+			{
+				maxBodyReaders: 1,
+				maxRequestBodyBytes: 2_048,
+				maxBufferedRequestBodyBytes: 4_096,
+			},
+		);
+		const zeroResponse = await fetch(`${zeroBaseUrl}/v1/messages`, {
+			method: "POST",
+			headers: { "content-length": "0" },
+		});
+		expect(await zeroResponse.text()).toBe("upstream-ok");
+		expect(zeroGuard.state.bodyReaders).toMatchObject({
+			peak: 1,
+			reservedBytesPeak: 0,
+			reservedBytes: 0,
+		});
+	});
+
+	test.each([
+		{ name: "limited", path: "/v1/messages", maxActive: 2 },
+		{ name: "passthrough", path: "/v1/models", maxActive: 4 },
+	])("holds the $name body reservation until stalled forwarding finishes", async ({
+		path,
+		maxActive,
+	}) => {
+		let forwarded = 0;
+		let releaseFirstForward: (() => void) | undefined;
+		const firstForwardReleased = new Promise<void>((resolve) => {
+			releaseFirstForward = resolve;
+		});
+		const upstreamBase = await listen(
+			http.createServer(async (_req, res) => {
+				forwarded += 1;
+				if (forwarded === 1) {
+					await firstForwardReleased;
+					res.end("first-forwarded");
+					return;
+				}
+				res.end("second-forwarded");
+			}),
+		);
+		const { baseUrl, guard } = await startGuard(upstreamBase, {
+			maxActive,
+			maxQueue: 4,
+			maxBodyReaders: 2,
+			maxRequestBodyBytes: 2_048,
+			maxBufferedRequestBodyBytes: 4_096,
+			totalDeadlineMs: 5_000,
+		});
+		const guardUrl = new URL(baseUrl);
+		const first = await openRawRequest(
+			baseUrl,
+			"POST " +
+				`${path} HTTP/1.1\r\nHost: ${guardUrl.host}\r\n` +
+				"Content-Length: 2048\r\nConnection: close\r\n\r\n" +
+				"x".repeat(2_048),
+		);
+		await waitFor(() => forwarded === 1);
+
+		const second = await openRawRequest(
+			baseUrl,
+			"POST " +
+				`${path} HTTP/1.1\r\nHost: ${guardUrl.host}\r\n` +
+				"Content-Length: 2048\r\nConnection: close\r\n\r\n" +
+				"y".repeat(2_048),
+		);
+		const secondResponse = readRawResponsesUntil(second, "second-forwarded");
+		await waitFor(() => guard.state.bodyReaders.queued === 1);
+		expect(guard.state.bodyReaders).toMatchObject({
+			active: 1,
+			queued: 1,
+			reservedBytes: 4_096,
+			reservedBytesPeak: 4_096,
+		});
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		expect(forwarded).toBe(1);
+
+		const firstResponse = readRawResponsesUntil(first, "first-forwarded");
+		releaseFirstForward?.();
+		expect(await firstResponse).toContain("HTTP/1.1 200");
+		expect(await secondResponse).toContain("HTTP/1.1 200");
+		await waitFor(() => guard.state.bodyReaders.reservedBytes === 0);
+		expect(guard.state.bodyReaders.reservedBytesPeak).toBeLessThanOrEqual(
+			4_096,
+		);
+	});
+
+	test("admits a smaller tail after aborting a budget-blocked FIFO head", async () => {
+		let forwarded = 0;
+		const upstreamBase = await listen(
+			http.createServer((_req, res) => {
+				forwarded += 1;
+				res.end("tail-forwarded");
+			}),
+		);
+		const { baseUrl, guard } = await startGuard(upstreamBase, {
+			maxActive: 4,
+			maxQueue: 4,
+			maxBodyReaders: 3,
+			maxRequestBodyBytes: 2_048,
+			maxBufferedRequestBodyBytes: 4_096,
+			totalDeadlineMs: 5_000,
+		});
+		const guardUrl = new URL(baseUrl);
+		const stalled = await openRawRequest(
+			baseUrl,
+			"POST /v1/messages HTTP/1.1\r\n" +
+				`Host: ${guardUrl.host}\r\n` +
+				"Content-Length: 1024\r\nConnection: close\r\n\r\n" +
+				"x",
+		);
+		try {
+			await waitFor(
+				() =>
+					guard.state.bodyReaders.active === 1 &&
+					guard.state.bodyReaders.reservedBytes === 2_048,
+			);
+			const blockedHeadController = new AbortController();
+			const blockedHead = fetch(`${baseUrl}/v1/messages`, {
+				method: "POST",
+				headers: { "content-length": "2048" },
+				body: "h".repeat(2_048),
+				signal: blockedHeadController.signal,
+			}).catch((error: unknown) => error);
+			const tail = fetch(`${baseUrl}/v1/messages`, {
+				method: "POST",
+				headers: { "content-length": "512" },
+				body: "t".repeat(512),
+			});
+			await waitFor(() => guard.state.bodyReaders.queued === 2);
+			expect(guard.state.bodyReaders).toMatchObject({
+				active: 1,
+				queued: 2,
+				reservedBytes: 2_048,
+			});
+			const beforeHeadAbort = await Promise.race([
+				tail.then(() => "resolved" as const),
+				new Promise<"pending">((resolve) =>
+					setTimeout(() => resolve("pending"), 30),
+				),
+			]);
+			expect(beforeHeadAbort).toBe("pending");
+			expect(forwarded).toBe(0);
+
+			blockedHeadController.abort();
+			await blockedHead;
+			await waitFor(
+				() => guard.state.counters.bodyReaderQueueAborted === 1,
+			);
+			const tailResponse = await tail;
+			expect(await tailResponse.text()).toBe("tail-forwarded");
+			expect(forwarded).toBe(1);
+		} finally {
+			stalled.destroy();
+		}
 	});
 
 	test("does not consume a queued request body before its admission lease", async () => {
@@ -2865,7 +3198,9 @@ describe("source-controlled guard", () => {
 	test("forwards a finite model recovery above the request-wide silence ceiling without leaking its permit", async () => {
 		const events: Array<Record<string, unknown>> = [];
 		let attempts = 0;
-		let heldResponse: http.ServerResponse | null = null;
+		const heldResponse: { response: http.ServerResponse | null } = {
+			response: null,
+		};
 		const modelBody = JSON.stringify({
 			type: "error",
 			error: {
@@ -2885,7 +3220,7 @@ describe("source-controlled guard", () => {
 						"x-better-ccflare-pool-status": "exhausted",
 						"x-better-ccflare-recovery-scope": "model",
 					});
-					heldResponse = res;
+					heldResponse.response = res;
 					res.write(modelBody);
 					return;
 				}
@@ -2922,7 +3257,7 @@ describe("source-controlled guard", () => {
 			signal: AbortSignal.timeout(500),
 		});
 		expect(await next.text()).toBe("next request admitted");
-		heldResponse?.end();
+		heldResponse.response?.end();
 		expect(await response.text()).toBe(modelBody);
 		expect(Date.now() - startedAt).toBeLessThan(500);
 		expect(attempts).toBe(2);

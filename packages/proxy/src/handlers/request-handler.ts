@@ -1,5 +1,9 @@
 import crypto from "node:crypto";
-import { TIME_CONSTANTS, ValidationError } from "@better-ccflare/core";
+import {
+	readBoundedRequestBody,
+	TIME_CONSTANTS,
+	ValidationError,
+} from "@better-ccflare/core";
 import {
 	GUARD_CORRELATION_SECRET_HEADER,
 	GUARD_REQUEST_ID_HEADER,
@@ -75,11 +79,7 @@ export async function prepareRequestBody(req: Request): Promise<{
 	buffer: ArrayBuffer | null;
 	createStream: () => ReadableStream<Uint8Array> | undefined;
 }> {
-	let buffer: ArrayBuffer | null = null;
-
-	if (req.body) {
-		buffer = await req.arrayBuffer();
-	}
+	const buffer = await readBoundedRequestBody(req);
 
 	return {
 		buffer,

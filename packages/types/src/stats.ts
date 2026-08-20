@@ -330,6 +330,23 @@ export interface HealthResponse {
 			state: string;
 		};
 		anthropicDegraded?: AnthropicDegradedRuntimeHealth;
+		bodyAdmission?: {
+			enabled: boolean;
+			budgetBytes: number;
+			reservedBytes: number;
+			activeLeases: number;
+			queuedRequests: number;
+			queueLimit: number;
+			peakReservedBytes: number;
+			peakActiveLeases: number;
+			counters: {
+				admitted: number;
+				queued: number;
+				queueFull: number;
+				queueAborted: number;
+				released: number;
+			};
+		};
 		storage?: {
 			integrity?: {
 				status: "ok" | "corrupt" | "unchecked" | "running";

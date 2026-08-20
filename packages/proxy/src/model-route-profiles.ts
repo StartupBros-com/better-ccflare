@@ -338,9 +338,18 @@ interface ModelRouteSessionState {
 	readonly touchedAt: number;
 }
 
-interface ModelRouteRootIntentState {
+interface ModelRouteRootIntent {
 	readonly generation: number;
 	readonly reservedAt: number;
+}
+
+interface ModelRouteRootIntentState {
+	/**
+	 * Pending roots in reservation order. Keep only the two newest requests in a
+	 * lineage so a rejected newer request can restore its immediate predecessor
+	 * without retaining an unbounded recursive chain.
+	 */
+	readonly entries: readonly ModelRouteRootIntent[];
 }
 
 export interface ModelRouteRootIntentInput {
@@ -491,9 +500,41 @@ export class ModelRouteSessionRegistry {
 		if (!existing) this.evictOldestIfFull(this.rootIntents);
 		const generation = this.nextGeneration();
 		// Map insertion order is the O(1) recency index used by bounded eviction.
+		// Only reservation refreshes a lineage's recency; prune/cancel must not let
+		// a stalled request retain capacity indefinitely.
 		this.rootIntents.delete(key);
-		this.rootIntents.set(key, { generation, reservedAt: now });
+		this.rootIntents.set(key, {
+			entries: [
+				...(existing?.entries ?? []),
+				{ generation, reservedAt: now },
+			].slice(-2),
+		});
 		return generation;
+	}
+
+	/**
+	 * Withdraw a root that terminates before it is routed. Only the active
+	 * reservation may withdraw: an older request cannot disturb a later root.
+	 */
+	cancelRootIntent(
+		input: ModelRouteRootIntentInput,
+		generation: number | null,
+	): boolean {
+		if (input.isSubagent || generation === null) return false;
+		const key = this.bindingKey(input.callerIdentity, input.sessionId);
+		if (!key) return false;
+		const current = this.getRootIntentState(key, this.now());
+		const newest = current?.entries.at(-1);
+		if (!current || newest?.generation !== generation) return false;
+		const entries = current.entries.slice(0, -1);
+		if (entries.length === 0) {
+			this.rootIntents.delete(key);
+		} else {
+			// Updating an existing Map key preserves its insertion position, so a
+			// cancellation never refreshes this lineage's global-capacity recency.
+			this.rootIntents.set(key, { entries });
+		}
+		return true;
 	}
 
 	resolve(
@@ -535,12 +576,8 @@ export class ModelRouteSessionRegistry {
 			};
 		}
 
-		if (
-			bindingKey &&
-			this.isCurrentRootIntent(bindingKey, rootIntentGeneration, this.now())
-		) {
-			this.sessions.delete(bindingKey);
-		}
+		// Native roots are provisional too. A later malformed/injected picker must
+		// not clear an admitted binding before the native route is actually accepted.
 		return { kind: "native" };
 	}
 
@@ -568,6 +605,25 @@ export class ModelRouteSessionRegistry {
 			profile: resolution.profile,
 			touchedAt: now,
 		});
+		// A successful choice makes all earlier pending roots stale. This prevents
+		// any late commit or cancellation from reviving obsolete lineage state.
+		this.rootIntents.delete(bindingKey);
+	}
+
+	/** Commit a native root selection only after its route is accepted. */
+	commitNative(
+		input: ModelRouteResolutionInput,
+		resolution: ModelRouteResolution,
+		generation: number | null,
+	): void {
+		if (input.isSubagent || resolution.kind !== "native") return;
+		const bindingKey = this.bindingKey(input.callerIdentity, input.sessionId);
+		if (!bindingKey) return;
+		if (!this.isCurrentRootIntent(bindingKey, generation, this.now())) return;
+		this.sessions.delete(bindingKey);
+		// A successful choice makes all earlier pending roots stale. This prevents
+		// an older explicit root from restoring a route after a native switch.
+		this.rootIntents.delete(bindingKey);
 	}
 
 	private bindingKey(
@@ -595,7 +651,10 @@ export class ModelRouteSessionRegistry {
 		now: number,
 	): generation is number {
 		if (generation === null) return false;
-		return this.getRootIntentState(key, now)?.generation === generation;
+		return (
+			this.getRootIntentState(key, now)?.entries.at(-1)?.generation ===
+			generation
+		);
 	}
 
 	private getRootIntentState(
@@ -604,11 +663,18 @@ export class ModelRouteSessionRegistry {
 	): ModelRouteRootIntentState | undefined {
 		const state = this.rootIntents.get(key);
 		if (!state) return undefined;
-		if (now - state.reservedAt >= this.ttlMs) {
+		const entries = state.entries.filter(
+			(entry) => now - entry.reservedAt < this.ttlMs,
+		);
+		if (entries.length === 0) {
 			this.rootIntents.delete(key);
 			return undefined;
 		}
-		return state;
+		if (entries.length !== state.entries.length) {
+			// Map#set on the current key intentionally preserves global LRU order.
+			this.rootIntents.set(key, { entries });
+		}
+		return { entries };
 	}
 
 	private getBinding(

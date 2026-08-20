@@ -1,6 +1,8 @@
 import {
 	formatXaiCacheCanary,
 	getModelFamily,
+	MAX_REQUEST_BODY_BYTES,
+	RequestBodyTooLargeError,
 	requestEvents,
 	ServiceUnavailableError,
 	trackClientVersion,
@@ -118,6 +120,7 @@ import {
 	isBoundedModelRouteProfile,
 	MODEL_ROUTE_PROFILE_MODEL_PREFIX,
 	type ModelRouteProfile,
+	type ModelRouteRootIntentInput,
 } from "./model-route-profiles";
 import { opaqueRuntimeId } from "./opaque-runtime-id";
 import {
@@ -174,6 +177,22 @@ function modelRouteUnavailableResponse(
 				"content-type": "application/json",
 				"x-better-ccflare-model-route": "unavailable",
 			},
+		},
+	);
+}
+
+function requestBodyTooLargeResponse(): Response {
+	return new Response(
+		JSON.stringify({
+			type: "error",
+			error: {
+				type: "request_too_large",
+				message: `Request body exceeds the ${MAX_REQUEST_BODY_BYTES / (1024 * 1024)} MiB limit.`,
+			},
+		}),
+		{
+			status: 413,
+			headers: { "content-type": "application/json" },
 		},
 	);
 }
@@ -541,14 +560,15 @@ export async function handleProxy(
 	// interception can await and invert same-session request order. Discovery,
 	// unrelated paths, children, credentialless callers, and zero-profile
 	// registries remain allocation-free.
+	const rootIntentInput: ModelRouteRootIntentInput = {
+		callerIdentity: routeCallerIdentity(req, apiKeyId),
+		sessionId: req.headers.get("x-claude-code-session-id"),
+		isSubagent: isClaudeCodeSubagent(req.headers),
+	};
 	const rootIntentGeneration =
 		ctx.modelRouteSessionRegistry?.hasProfiles &&
 		isModelRouteIntentRequest(req, url)
-			? ctx.modelRouteSessionRegistry.beginRootIntent({
-					callerIdentity: routeCallerIdentity(req, apiKeyId),
-					sessionId: req.headers.get("x-claude-code-session-id"),
-					isSubagent: isClaudeCodeSubagent(req.headers),
-				})
+			? ctx.modelRouteSessionRegistry.beginRootIntent(rootIntentInput)
 			: null;
 	const telemetry: DegradedTelemetryHolder = { tracker: null };
 	const rescueRequestStartedAt = Date.now();
@@ -626,6 +646,13 @@ export async function handleProxy(
 			// Telemetry never changes request failure authority.
 		}
 		throw error;
+	} finally {
+		// Committed roots remove their complete pending lineage, making this a
+		// no-op. Every early response or throw withdraws only its own newest intent.
+		ctx.modelRouteSessionRegistry?.cancelRootIntent(
+			rootIntentInput,
+			rootIntentGeneration,
+		);
 	}
 }
 
@@ -754,8 +781,16 @@ async function handleProxyCoreImpl(
 	// 2. Validate provider can handle path
 	validateProviderPath(ctx.provider, url.pathname);
 
-	// 3. Prepare request body
-	const { buffer: requestBodyBuffer } = await prepareRequestBody(req);
+	// 3. Prepare request body before parsing, metadata, selection, persistence, or fetch.
+	let requestBodyBuffer: ArrayBuffer | null;
+	try {
+		({ buffer: requestBodyBuffer } = await prepareRequestBody(req));
+	} catch (error) {
+		if (error instanceof RequestBodyTooLargeError) {
+			return requestBodyTooLargeResponse();
+		}
+		throw error;
+	}
 	const requestBodyContext = new RequestBodyContext(requestBodyBuffer);
 	const originalParsedBody = requestBodyContext.getParsedJson();
 	// Scheduler auth has already been consumed above. Only an explicitly
@@ -2006,6 +2041,12 @@ async function handleProxyCoreImpl(
 		modelRouteRegistry?.commitExplicit(
 			modelRouteResolutionInput,
 			modelRouteResolution,
+		);
+	} else if (modelRouteResolution?.kind === "native" && accounts.length > 0) {
+		modelRouteRegistry?.commitNative(
+			modelRouteResolutionInput,
+			modelRouteResolution,
+			rootIntentGeneration,
 		);
 	}
 
