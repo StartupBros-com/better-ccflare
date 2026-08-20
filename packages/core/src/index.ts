@@ -56,6 +56,7 @@ export * from "./auth-failure-events";
 export * from "./build-provenance";
 export * from "./cache-flight-cohort-seal";
 export * from "./cache-flight-recorder";
+export * from "./cache-metrics";
 export {
 	type IntervalConfig,
 	intervalManager,

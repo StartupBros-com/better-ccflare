@@ -1,4 +1,7 @@
-import type { ModelRates } from "@better-ccflare/core";
+import {
+	cacheReadSharePercent,
+	type ModelRates,
+} from "@better-ccflare/core";
 import type {
 	CacheInsightsResponse,
 	CacheInsightsRow,
@@ -73,12 +76,14 @@ const TOKENS_PER_MILLION = 1_000_000;
  * Returns 0 when the denominator is 0. Matches the analytics.ts SQL definition.
  */
 export function computeCacheHitRate(sums: TokenSums): number {
-	const denominator =
-		sums.uncachedInputTokens +
-		sums.cacheReadInputTokens +
-		sums.cacheCreationInputTokens;
-	if (denominator === 0) return 0;
-	return (sums.cacheReadInputTokens * 100) / denominator;
+	return (
+		cacheReadSharePercent({
+			shape: "additive",
+			uncachedInputTokens: sums.uncachedInputTokens,
+			cacheReadInputTokens: sums.cacheReadInputTokens,
+			cacheWriteInputTokens: sums.cacheCreationInputTokens,
+		}) ?? 0
+	);
 }
 
 /**
