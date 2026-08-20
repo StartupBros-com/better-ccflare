@@ -15,8 +15,8 @@ import {
 	parseModelMappings,
 	resolveCompatibleEndpoint,
 	resolveFamilyAliasModel,
-	validatePriority,
 	ValidationError,
+	validatePriority,
 } from "@better-ccflare/core";
 import type { Account } from "@better-ccflare/types";
 import { validateModelMappings } from "./validation";
@@ -753,8 +753,8 @@ describe("Vercel AI Gateway catch-all recipe (U4)", () => {
 		for (const familyModel of Object.values(LATEST_MODEL_BY_FAMILY)) {
 			const resolved = getModelList(familyModel, vercelAccount);
 			expect(resolved).not.toBeNull();
-			expect(resolved!.length).toBeGreaterThan(0);
-			expect(resolved![0]).toMatch(/^zai\/glm-5\.2/);
+			expect(resolved?.length).toBeGreaterThan(0);
+			expect(resolved?.[0]).toMatch(/^zai\/glm-5\.2/);
 		}
 	});
 

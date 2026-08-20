@@ -37,14 +37,15 @@ export class OpenAICompatibleProvider extends BaseProvider {
 		// `refresh_token` (older CLI-created accounts). A CLI-created compatible
 		// account never carries an OAuth-shaped refresh token, so reading
 		// `api_key` first is the correct contract.
-		const apiKey = account.api_key || account.refresh_token;
+		const rawApiKey = account.api_key ?? account.refresh_token;
 
-		if (!apiKey) {
+		if (!rawApiKey) {
 			throw new AuthError(`No API key available for account ${account.name}`, {
 				accountId: account.id,
 				provider: account.provider,
 			});
 		}
+		const apiKey: string = rawApiKey;
 
 		// For API key based providers, we don't need to refresh tokens
 		// Just return the existing API key as both access and refresh token
