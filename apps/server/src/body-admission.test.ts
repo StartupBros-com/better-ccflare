@@ -6,6 +6,7 @@ import {
 	BodyAdmissionQueueFullError,
 	BodyAdmissionShuttingDownError,
 	bodyAdmissionReservationBytes,
+	MAX_BODY_ADMISSION_RESERVATION_BYTES,
 } from "./body-admission";
 
 const MiB = 1024 * 1024;
@@ -47,6 +48,47 @@ describe("bodyAdmissionReservationBytes", () => {
 		]) {
 			expect(bodyAdmissionReservationBytes(headers)).toBe(full);
 		}
+	});
+
+	test("MAX_BODY_ADMISSION_RESERVATION_BYTES is the multiplier times the canonical 32 MiB request ceiling", () => {
+		expect(MAX_BODY_ADMISSION_RESERVATION_BYTES).toBe(
+			BODY_ADMISSION_RESERVATION_MULTIPLIER * MAX_REQUEST_BODY_BYTES,
+		);
+		expect(MAX_BODY_ADMISSION_RESERVATION_BYTES).toBe(268435456);
+	});
+
+	test("caps unsafe metadata and encoded bodies at the worst-case reservation, not a larger configured budget", () => {
+		const budgetBytes = 1024 * 1024 * 1024; // 1 GiB, well above the worst-case cap
+		for (const headers of [
+			new Headers(),
+			new Headers({ "content-length": "-1" }),
+			new Headers({ "content-length": "1.5" }),
+			new Headers({ "content-length": "01" }),
+			new Headers({ "content-length": String(Number.MAX_SAFE_INTEGER + 1) }),
+			new Headers({ "content-length": String(MAX_REQUEST_BODY_BYTES + 1) }),
+			new Headers({ "content-length": "1", "transfer-encoding": "chunked" }),
+			...["gzip", "br", "deflate", "zstd"].map(
+				(contentEncoding) =>
+					new Headers({
+						"content-length": "1",
+						"content-encoding": contentEncoding,
+					}),
+			),
+		]) {
+			expect(bodyAdmissionReservationBytes(headers, budgetBytes)).toBe(
+				MAX_BODY_ADMISSION_RESERVATION_BYTES,
+			);
+		}
+	});
+
+	test("still reserves eight times content-length for a small transparent body under an enlarged budget", () => {
+		const budgetBytes = 1024 * 1024 * 1024; // 1 GiB
+		expect(
+			bodyAdmissionReservationBytes(
+				new Headers({ "content-length": "1024" }),
+				budgetBytes,
+			),
+		).toBe(1024 * BODY_ADMISSION_RESERVATION_MULTIPLIER);
 	});
 });
 
@@ -207,6 +249,43 @@ describe("BodyAdmissionController", () => {
 		expect(controller.snapshot()).toMatchObject({
 			activeLeases: 0,
 			reservedBytes: 0,
+		});
+	});
+
+	test("admits four worst-case reservations concurrently at the managed 1 GiB budget, then queues and drains a fifth FIFO", async () => {
+		const budgetBytes = 1024 * 1024 * 1024; // 1 GiB
+		const controller = new BodyAdmissionController({ budgetBytes });
+		const leases = await Promise.all(
+			Array.from({ length: 4 }, () =>
+				controller.acquire(MAX_BODY_ADMISSION_RESERVATION_BYTES),
+			),
+		);
+		expect(controller.snapshot()).toMatchObject({
+			activeLeases: 4,
+			reservedBytes: 4 * MAX_BODY_ADMISSION_RESERVATION_BYTES,
+			queuedRequests: 0,
+		});
+
+		let fifthAdmitted = false;
+		const fifth = controller
+			.acquire(MAX_BODY_ADMISSION_RESERVATION_BYTES)
+			.then((lease) => {
+				fifthAdmitted = true;
+				return lease;
+			});
+		await Promise.resolve();
+		expect(fifthAdmitted).toBe(false);
+		expect(controller.snapshot().queuedRequests).toBe(1);
+
+		leases[0].release();
+		const fifthLease = await fifth;
+		expect(fifthAdmitted).toBe(true);
+
+		for (const lease of [...leases.slice(1), fifthLease]) lease.release();
+		expect(controller.snapshot()).toMatchObject({
+			reservedBytes: 0,
+			activeLeases: 0,
+			queuedRequests: 0,
 		});
 	});
 });

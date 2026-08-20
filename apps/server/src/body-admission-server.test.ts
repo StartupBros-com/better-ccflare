@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { BodyAdmissionController, withBodyAdmission } from "./body-admission";
+import { MAX_REQUEST_BODY_BYTES } from "@better-ccflare/core";
+import {
+	BODY_ADMISSION_RESERVATION_MULTIPLIER,
+	BodyAdmissionController,
+	MAX_BODY_ADMISSION_RESERVATION_BYTES,
+	withBodyAdmission,
+} from "./body-admission";
 import { abortInflightStreams, trackStreamForShutdown } from "./server";
 
 function post(
@@ -96,6 +102,99 @@ describe("withBodyAdmission", () => {
 		expect(controller.snapshot()).toMatchObject({
 			reservedBytes: 0,
 			activeLeases: 0,
+		});
+	});
+
+	test("holds the worst-case reservation for a forceFull Responses request under a larger budget, then downgrades to 8x the actual size once known", async () => {
+		const budgetBytes = 1024 * 1024 * 1024; // 1 GiB, well above the worst-case cap
+		const controller = new BodyAdmissionController({ budgetBytes });
+		let responsesLease:
+			| Parameters<Parameters<typeof withBodyAdmission>[2]>[0]
+			| undefined;
+		const responses = await withBodyAdmission(
+			post("x", { "content-length": "1" }),
+			controller,
+			async (lease) => {
+				responsesLease = lease;
+				// Held at the capped worst case, not the whole 1 GiB budget, while
+				// read + decompress + parse + translate are in flight.
+				expect(controller.snapshot().reservedBytes).toBe(
+					MAX_BODY_ADMISSION_RESERVATION_BYTES,
+				);
+				return endlessResponse();
+			},
+			{ forceFull: true },
+		);
+
+		// onBodySizeKnown fires once the actual body size is known and downgrades
+		// the reservation to 8x that size, mirroring the Responses route call site.
+		const actualBytes = 4096;
+		responsesLease?.reduceTo(
+			Math.min(
+				controller.snapshot().budgetBytes,
+				actualBytes * BODY_ADMISSION_RESERVATION_MULTIPLIER,
+			),
+		);
+		expect(controller.snapshot().reservedBytes).toBe(
+			actualBytes * BODY_ADMISSION_RESERVATION_MULTIPLIER,
+		);
+
+		await responses.body?.cancel();
+		expect(controller.snapshot()).toMatchObject({
+			reservedBytes: 0,
+			activeLeases: 0,
+		});
+	});
+
+	test("admits four worst-case forceFull leases concurrently at the managed 1 GiB budget, queuing and draining a fifth FIFO", async () => {
+		const budgetBytes = 1024 * 1024 * 1024; // 1 GiB
+		const controller = new BodyAdmissionController({ budgetBytes });
+		const started: boolean[] = [];
+		const requests = Array.from({ length: 4 }, (_, index) =>
+			withBodyAdmission(
+				post("x", { "content-length": String(MAX_REQUEST_BODY_BYTES) }),
+				controller,
+				async () => {
+					started[index] = true;
+					return endlessResponse();
+				},
+				{ forceFull: true },
+			),
+		);
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(started).toEqual([true, true, true, true]);
+		expect(controller.snapshot()).toMatchObject({
+			activeLeases: 4,
+			reservedBytes: 4 * MAX_BODY_ADMISSION_RESERVATION_BYTES,
+			queuedRequests: 0,
+		});
+
+		let fifthStarted = false;
+		const fifth = withBodyAdmission(
+			post("x", { "content-length": String(MAX_REQUEST_BODY_BYTES) }),
+			controller,
+			async () => {
+				fifthStarted = true;
+				return endlessResponse();
+			},
+			{ forceFull: true },
+		);
+		await Promise.resolve();
+		expect(fifthStarted).toBe(false);
+		expect(controller.snapshot().queuedRequests).toBe(1);
+
+		const responses = await Promise.all(requests);
+		await responses[0].body?.cancel();
+		await fifth.then(async (response) => {
+			expect(fifthStarted).toBe(true);
+			await response.body?.cancel();
+		});
+		for (const response of responses.slice(1)) await response.body?.cancel();
+		expect(controller.snapshot()).toMatchObject({
+			reservedBytes: 0,
+			activeLeases: 0,
+			queuedRequests: 0,
 		});
 	});
 

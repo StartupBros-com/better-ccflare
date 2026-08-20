@@ -4,6 +4,16 @@ export const DEFAULT_BODY_ADMISSION_BUDGET_BYTES = 256 * 1024 * 1024;
 export const BODY_ADMISSION_RESERVATION_MULTIPLIER = 8;
 export const DEFAULT_BODY_ADMISSION_QUEUE_LIMIT = 500;
 export const MAX_BODY_ADMISSION_QUEUE_LIMIT = 5_000;
+/**
+ * The true worst-case weighted reservation for a single request: the
+ * multiplier applied to the canonical 32 MiB request-body ceiling. No body —
+ * transparent, encoded, chunked, or unmeasurable — can retain more process
+ * work than this once the downstream body readers enforce their exact
+ * ceiling, so no single reservation should ever need to claim more than this
+ * regardless of how large the configured budget is.
+ */
+export const MAX_BODY_ADMISSION_RESERVATION_BYTES =
+	BODY_ADMISSION_RESERVATION_MULTIPLIER * MAX_REQUEST_BODY_BYTES;
 
 export class BodyAdmissionQueueFullError extends Error {
 	constructor() {
@@ -69,8 +79,12 @@ function isCanonicalSafeContentLength(value: string | null): number | null {
 /**
  * Computes the process-local weighted reservation before a proxy body is read.
  * A transparent body can use its canonical Content-Length; every other body is
- * charged the complete budget because decompression and chunking obscure the
- * retained work until the body reader enforces its exact 32 MiB ceiling.
+ * charged the worst-case reservation (the multiplier times the canonical
+ * 32 MiB request ceiling, capped to the configured budget) because
+ * decompression and chunking obscure the retained work until the body reader
+ * enforces its exact 32 MiB ceiling. That worst case is a fixed multiple of
+ * the 32 MiB ceiling, not the entire configured budget, so a larger budget
+ * admits more concurrent requests instead of only ever admitting one.
  */
 export function bodyAdmissionReservationBytes(
 	headers: Headers,
@@ -80,13 +94,13 @@ export function bodyAdmissionReservationBytes(
 	const transparentEncoding =
 		contentEncoding === null || contentEncoding.toLowerCase() === "identity";
 	if (!transparentEncoding || headers.has("transfer-encoding"))
-		return budgetBytes;
+		return Math.min(budgetBytes, MAX_BODY_ADMISSION_RESERVATION_BYTES);
 
 	const contentLength = isCanonicalSafeContentLength(
 		headers.get("content-length"),
 	);
 	if (contentLength === null || contentLength > MAX_REQUEST_BODY_BYTES) {
-		return budgetBytes;
+		return Math.min(budgetBytes, MAX_BODY_ADMISSION_RESERVATION_BYTES);
 	}
 	return Math.min(
 		budgetBytes,
@@ -341,7 +355,7 @@ export async function withBodyAdmission(
 		const budgetBytes = controller.snapshot().budgetBytes;
 		lease = await controller.acquire(
 			options.forceFull
-				? budgetBytes
+				? Math.min(budgetBytes, MAX_BODY_ADMISSION_RESERVATION_BYTES)
 				: bodyAdmissionReservationBytes(request.headers, budgetBytes),
 			request.signal,
 		);

@@ -64,7 +64,7 @@ The production `ccflare-stack.service` deployment renders its build pin at `/etc
 ```ini
 Environment=GUARD_MAX_REQUEST_BODY_BYTES=33554432
 Environment=GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES=268435456
-Environment=CCFLARE_MAX_BUFFERED_REQUEST_BODY_BYTES=268435456
+Environment=CCFLARE_MAX_BUFFERED_REQUEST_BODY_BYTES=1073741824
 Environment=CCFLARE_MAX_BODY_ADMISSION_QUEUE=500
 ```
 
@@ -72,7 +72,7 @@ Environment=CCFLARE_MAX_BODY_ADMISSION_QUEUE=500
 
 A valid guard `Content-Length` reserves twice its declared number of bytes before buffering. Missing, chunked, invalid, or misleading length reserves twice the full 32 MiB limit. Guard reader admission is FIFO, and the independent `GUARD_MAX_BODY_READERS` limit caps active readers.
 
-`CCFLARE_MAX_BUFFERED_REQUEST_BODY_BYTES` is a separate 256 MiB **Bun-process weighted-work** admission budget, valid from 256 MiB through 1 GiB. `CCFLARE_MAX_BODY_ADMISSION_QUEUE` controls its FIFO queue, valid from 0 through 5000. Bun reserves 8× a canonical unencoded/`identity` `Content-Length` (zero reserves zero), up to the 32 MiB request limit. Missing, chunked, malformed, over-limit, compressed, and unknown-encoding metadata reserve the entire Bun budget. This 8× value is conservative admission weighting, not an exact heap or RSS measurement; downstream readers remain the exact size authority. The Node guard and Bun controller are independent process budgets—there is no bypass header or circular lock.
+`CCFLARE_MAX_BUFFERED_REQUEST_BODY_BYTES` is a separate **Bun-process weighted-work** admission budget, valid from 256 MiB through 1 GiB; the managed pin sets it to **1 GiB** (`1073741824`). `CCFLARE_MAX_BODY_ADMISSION_QUEUE` controls its FIFO queue, valid from 0 through 5000. Bun reserves 8× a canonical unencoded/`identity` `Content-Length` (zero reserves zero), up to the 32 MiB request limit. Missing, chunked, malformed, over-limit, compressed, and unknown-encoding metadata — and any handler that must hold the full worst case, such as the OpenAI Responses routes during translation — instead reserve the worst case, `8 × 32 MiB = 256 MiB`, capped at the configured budget rather than the budget's entirety. At the managed 1 GiB pin that combination admits four concurrent worst-case requests before a fifth queues, and roughly 5.3 MiB bodies at 24-way concurrency. This 8× value is conservative admission weighting bounding weighted admitted work, not an exact heap or RSS measurement; downstream readers remain the exact size authority. The Node guard and Bun controller are independent process budgets—there is no bypass header or circular lock.
 
 Bun rejects queue-full body requests locally with `503` and `Retry-After: 1` before proxy/provider work. It removes aborted queued requests, and a restart clears active leases and queue state. Its response lifetime can outlast handler return, so a reservation releases only when the response body closes, errors, or cancels (or shutdown aborts it).
 

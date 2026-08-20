@@ -182,7 +182,10 @@ render_systemd_pin() {
 		printf '%s\n' "Environment=GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES=268435456"
 		# This is the Bun process's weighted-work admission policy. It is
 		# deliberately independent of the Node guard's encoded-buffer policy.
-		printf '%s\n' "Environment=CCFLARE_MAX_BUFFERED_REQUEST_BODY_BYTES=268435456"
+		# The worst-case single reservation is capped at 8x the 32 MiB request
+		# ceiling (256 MiB), so this 1 GiB pin admits four concurrent
+		# worst-case requests rather than only ever admitting one.
+		printf '%s\n' "Environment=CCFLARE_MAX_BUFFERED_REQUEST_BODY_BYTES=1073741824"
 		printf '%s\n' "Environment=CCFLARE_MAX_BODY_ADMISSION_QUEUE=500"
 		printf 'Environment=%s\n' "GUARD_TOTAL_DEADLINE_MS=$deadline_ms"
 		printf 'Environment=%s\n' "GUARD_RETRY_ATTEMPT_HEADROOM_MS=$retry_attempt_headroom_ms"
