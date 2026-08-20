@@ -15,6 +15,18 @@ export type CacheUsageObservation =
 	| AdditiveCacheUsageObservation
 	| InclusiveCacheUsageObservation;
 
+export interface CacheReadHistogramBucket {
+	sharePercent: number;
+	responses: number;
+}
+
+export interface CacheReadHistogram {
+	totalInputTokens: number;
+	cacheReadInputTokens: number;
+	unavailableResponses: number;
+	buckets: readonly CacheReadHistogramBucket[];
+}
+
 export interface CacheReadSummary {
 	measuredResponses: number;
 	unavailableResponses: number;
@@ -123,6 +135,48 @@ function roundPercent(value: number | null): number | null {
 	return value === null ? null : Math.round(value * 10) / 10;
 }
 
+function summaryFromParts(input: {
+	totalInputTokens: number;
+	cacheReadInputTokens: number;
+	unavailableResponses: number;
+	measuredResponses: number;
+	medianCacheReadPercent: number | null;
+	p25CacheReadPercent: number | null;
+	p75CacheReadPercent: number | null;
+	positiveHitResponses: number;
+	zeroHitResponses: number;
+}): CacheReadSummary {
+	return {
+		measuredResponses: input.measuredResponses,
+		unavailableResponses: input.unavailableResponses,
+		totalInputTokens: input.totalInputTokens,
+		cacheReadInputTokens: input.cacheReadInputTokens,
+		weightedCacheReadPercent:
+			input.totalInputTokens > 0
+				? roundPercent(
+						(input.cacheReadInputTokens * 100) / input.totalInputTokens,
+					)
+				: input.measuredResponses > 0
+					? 0
+					: null,
+		medianCacheReadPercent: roundPercent(input.medianCacheReadPercent),
+		p25CacheReadPercent: roundPercent(input.p25CacheReadPercent),
+		p75CacheReadPercent: roundPercent(input.p75CacheReadPercent),
+		positiveHitResponses: input.positiveHitResponses,
+		positiveHitRatePercent:
+			input.measuredResponses > 0
+				? roundPercent(
+						(input.positiveHitResponses * 100) / input.measuredResponses,
+					)
+				: null,
+		zeroHitResponses: input.zeroHitResponses,
+		zeroHitRatePercent:
+			input.measuredResponses > 0
+				? roundPercent((input.zeroHitResponses * 100) / input.measuredResponses)
+				: null,
+	};
+}
+
 /** Aggregate weighted and per-request cache-read metrics from one source shape. */
 export function summarizeCacheReadObservations(
 	observations: readonly CacheUsageObservation[],
@@ -161,29 +215,101 @@ export function summarizeCacheReadObservations(
 
 	shares.sort((left, right) => left - right);
 	const measuredResponses = shares.length;
-	return {
+	return summaryFromParts({
 		measuredResponses,
 		unavailableResponses,
 		totalInputTokens,
 		cacheReadInputTokens,
-		weightedCacheReadPercent:
-			totalInputTokens > 0
-				? roundPercent((cacheReadInputTokens * 100) / totalInputTokens)
-				: measuredResponses > 0
-					? 0
-					: null,
-		medianCacheReadPercent: roundPercent(median(shares)),
-		p25CacheReadPercent: roundPercent(percentile(shares, 0.25)),
-		p75CacheReadPercent: roundPercent(percentile(shares, 0.75)),
+		medianCacheReadPercent: median(shares),
+		p25CacheReadPercent: percentile(shares, 0.25),
+		p75CacheReadPercent: percentile(shares, 0.75),
 		positiveHitResponses,
-		positiveHitRatePercent:
-			measuredResponses > 0
-				? roundPercent((positiveHitResponses * 100) / measuredResponses)
-				: null,
 		zeroHitResponses,
-		zeroHitRatePercent:
-			measuredResponses > 0
-				? roundPercent((zeroHitResponses * 100) / measuredResponses)
-				: null,
-	};
+	});
+}
+
+function histogramValueAtRank(
+	buckets: readonly CacheReadHistogramBucket[],
+	rank: number,
+): number | null {
+	let observed = 0;
+	for (const bucket of buckets) {
+		observed += bucket.responses;
+		if (rank < observed) return bucket.sharePercent;
+	}
+	return null;
+}
+
+/**
+ * Summarize a bounded cache-share histogram without expanding one value per
+ * request. Buckets must use a 0-100 percentage scale.
+ */
+export function summarizeCacheReadHistogram(
+	histogram: CacheReadHistogram,
+): CacheReadSummary {
+	if (
+		!validTokenCount(histogram.totalInputTokens) ||
+		!validTokenCount(histogram.cacheReadInputTokens) ||
+		histogram.cacheReadInputTokens > histogram.totalInputTokens ||
+		!validTokenCount(histogram.unavailableResponses)
+	) {
+		return summaryFromParts({
+			measuredResponses: 0,
+			unavailableResponses: histogram.buckets.length + 1,
+			totalInputTokens: 0,
+			cacheReadInputTokens: 0,
+			medianCacheReadPercent: null,
+			p25CacheReadPercent: null,
+			p75CacheReadPercent: null,
+			positiveHitResponses: 0,
+			zeroHitResponses: 0,
+		});
+	}
+
+	const buckets = [...histogram.buckets]
+		.filter(
+			(bucket) =>
+				Number.isFinite(bucket.sharePercent) &&
+				bucket.sharePercent >= 0 &&
+				bucket.sharePercent <= 100 &&
+				validTokenCount(bucket.responses) &&
+				bucket.responses > 0,
+		)
+		.sort((left, right) => left.sharePercent - right.sharePercent);
+	let measuredResponses = 0;
+	let positiveHitResponses = 0;
+	let zeroHitResponses = 0;
+	for (const bucket of buckets) {
+		measuredResponses += bucket.responses;
+		if (bucket.sharePercent > 0) positiveHitResponses += bucket.responses;
+		else zeroHitResponses += bucket.responses;
+	}
+
+	const medianRank = measuredResponses / 2;
+	const medianCacheReadPercent = Number.isInteger(medianRank)
+		? (() => {
+				const lower = histogramValueAtRank(buckets, medianRank - 1);
+				const upper = histogramValueAtRank(buckets, medianRank);
+				return lower === null || upper === null ? null : (lower + upper) / 2;
+			})()
+		: histogramValueAtRank(buckets, Math.floor(medianRank));
+	const percentileRank = (quantile: number) =>
+		measuredResponses > 0
+			? histogramValueAtRank(
+					buckets,
+					Math.max(0, Math.ceil(quantile * measuredResponses) - 1),
+				)
+			: null;
+
+	return summaryFromParts({
+		measuredResponses,
+		unavailableResponses: histogram.unavailableResponses,
+		totalInputTokens: histogram.totalInputTokens,
+		cacheReadInputTokens: histogram.cacheReadInputTokens,
+		medianCacheReadPercent,
+		p25CacheReadPercent: percentileRank(0.25),
+		p75CacheReadPercent: percentileRank(0.75),
+		positiveHitResponses,
+		zeroHitResponses,
+	});
 }

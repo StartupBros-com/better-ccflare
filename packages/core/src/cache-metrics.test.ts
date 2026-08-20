@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
 	cacheReadSharePercent,
+	summarizeCacheReadHistogram,
 	summarizeCacheReadObservations,
 	type CacheUsageObservation,
 } from "./cache-metrics";
@@ -132,6 +133,36 @@ describe("summarizeCacheReadObservations", () => {
 			totalInputTokens: 100,
 			cacheReadInputTokens: 50,
 			weightedCacheReadPercent: 50,
+		});
+	});
+});
+
+describe("summarizeCacheReadHistogram", () => {
+	test("derives request distributions without expanding bucket counts", () => {
+		expect(
+			summarizeCacheReadHistogram({
+				totalInputTokens: 1_000,
+				cacheReadInputTokens: 850,
+				unavailableResponses: 2,
+				buckets: [
+					{ sharePercent: 0, responses: 1 },
+					{ sharePercent: 50, responses: 1 },
+					{ sharePercent: 100, responses: 2 },
+				],
+			}),
+		).toEqual({
+			measuredResponses: 4,
+			unavailableResponses: 2,
+			totalInputTokens: 1_000,
+			cacheReadInputTokens: 850,
+			weightedCacheReadPercent: 85,
+			medianCacheReadPercent: 75,
+			p25CacheReadPercent: 0,
+			p75CacheReadPercent: 100,
+			positiveHitResponses: 3,
+			positiveHitRatePercent: 75,
+			zeroHitResponses: 1,
+			zeroHitRatePercent: 25,
 		});
 	});
 });

@@ -63,6 +63,7 @@ export {
 	type CohortSealServiceOptions,
 	type CohortSealServiceProfileV1,
 } from "./cache-flight-cohort-seal";
+export { readCodexWebSocketPercent } from "./codex-websocket-contract";
 export {
 	type CacheKeepalivePolicyConfig,
 	readEffectiveXaiKeepalivePolicy,

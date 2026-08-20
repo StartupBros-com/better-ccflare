@@ -165,6 +165,39 @@ describe("device setup authentication", () => {
 		}
 	});
 
+	test("keeps cache parity inside the authenticated dashboard boundary", async () => {
+		const path = "/api/insights/cache-parity";
+		const protectedAuth = authWithActiveKeyCount(1);
+		expect(await protectedAuth.isPathExempt(path, "GET")).toBe(false);
+		expect(
+			(
+				await protectedAuth.authenticateRequest(
+					new Request(`http://localhost${path}`),
+					path,
+					"GET",
+				)
+			).isAuthenticated,
+		).toBe(false);
+		expect(
+			(
+				await protectedAuth.authorizeEndpoint(
+					{ role: "api-only" } as never,
+					path,
+					"GET",
+				)
+			).authorized,
+		).toBe(false);
+		expect(
+			(
+				await protectedAuth.authorizeEndpoint(
+					{ role: "admin" } as never,
+					path,
+					"GET",
+				)
+			).authorized,
+		).toBe(true);
+	});
+
 	test("preserves no-key bootstrap while restricting dashboard routes to admin keys", async () => {
 		const bootstrap = authWithActiveKeyCount(0);
 		for (const [path, method] of protectedPaths) {

@@ -217,6 +217,10 @@ export function isCodexExplicitCacheBreakpointSuppressed(
 	);
 }
 
+export function getCodexExplicitCacheBreakpointSuppressionCount(): number {
+	return codexExplicitBreakpointSuppressions.size;
+}
+
 export function resetCodexExplicitBreakpointSuppressionsForTest(): void {
 	codexExplicitBreakpointSuppressions.clear();
 }
