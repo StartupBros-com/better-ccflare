@@ -242,7 +242,7 @@
         <span class="chip">Mode: repo-grounded</span>
         <span class="chip">Focus: the user’s own Z.ai free, Coding Plan, bonus, and paid compute</span>
       </div>
-      <div class="verdict"><strong>Recommended posture:</strong> do not implement OAuth first. Establish a native ZCode quota fingerprint, manually test the ZCode-provisioned key through the existing <code>zai</code> account path, and automate enrollment only if the counters prove entitlement equivalence.</div>
+      <div class="verdict"><strong>Recommended posture (updated after live measurement):</strong> do not build the OAuth enrollment adapter for the free tier. Measured evidence below shows this account’s free GLM-5.3 units live behind a captcha-gated ZCode gateway, while better-ccflare’s Z.ai endpoint reports no entitlement. A purchased GLM Coding Plan is the only path that works through the existing provider today.</div>
       <div class="stats" aria-label="Ideation counts">
         <div class="stat"><b>44</b><span>raw candidates</span></div>
         <div class="stat"><b>17</b><span>after deduplication</span></div>
@@ -250,6 +250,7 @@
         <div class="stat"><b>5</b><span>topic axes covered</span></div>
       </div>
       <nav aria-label="Document navigation">
+        <a href="#live-findings">Live Findings</a>
         <a href="#grounding-context">Grounding Context</a>
         <a href="#topic-axes">Topic Axes</a>
         <a href="#ranked-ideas">Ranked Ideas</a>
@@ -285,6 +286,38 @@
         <article class="panel">
           <h3>Policy Boundary</h3>
           <p>Z.ai’s Coding Plan is personal, coding-only, and limited to supported tools; its terms prohibit sharing, resale, and providing the benefit to third parties. A loopback-only single-user route reduces operational exposure but does not itself make better-ccflare an officially supported tool.</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="live-findings">
+      <div class="eyebrow">Measured on this account, 2026-08-20</div>
+      <h2>Live Findings</h2>
+      <div class="verdict"><strong>Verdict: contradicted for the free tier.</strong> The free GLM-5.3 allowance is bound to a ZCode JWT on the private <code>zcode.z.ai</code> gateway, and that gateway refuses inference from a non-ZCode client. better-ccflare’s Z.ai provider talks only to <code>api.z.ai/api/anthropic</code>, where this account has no entitlement. No plan units were consumed while establishing this.</div>
+      <div class="grounding-grid">
+        <article class="panel">
+          <h3>The entitlement is a Start Plan, not a Coding Plan</h3>
+          <p>The account carries an active <code>zcode-v3-start-plan-0817</code> “ZCode Start Plan” granting <strong>3,000,000 GLM-5.3 units and 2,000,000 GLM-5-Turbo units per day</strong>, read from the gateway’s own billing endpoint. The desktop runtime selects <code>builtin:zai-start-plan/GLM-5.3</code> at <code>thoughtLevel: max</code>.</p>
+        </article>
+        <article class="panel">
+          <h3>Two credentials, two different worlds</h3>
+          <p>Local provider state holds a <strong>231-character JWT</strong> pointed at <code>zcode.z.ai/api/v1/zcode-plan/anthropic</code> (enabled, carrying the free plan) and a separate <strong>49-character durable key</strong> pointed at <code>api.z.ai/api/anthropic</code> and flagged <code>coding_plan_not_entitled</code>.</p>
+        </article>
+        <article class="panel">
+          <h3>ccflare’s exact path is unentitled</h3>
+          <p>Calling the same quota endpoint better-ccflare polls, with the durable key, returned <code>success: false</code> and <code>当前用户不存在coding plan</code> (“user has no coding plan”) with zero limit rows. A routed request there could only fail or draw on pay-as-you-go funds.</p>
+        </article>
+        <article class="panel">
+          <h3>The gateway is device-gated</h3>
+          <p>One minimal, unspoofed Anthropic-format request to the gateway with the valid JWT returned <code>400</code> with <code>{"code":3007,"msg":"captcha verify failed"}</code>; the key-header form returned <code>401</code>. Reaching the free tier from another client would require defeating that verification, which this project will not do.</p>
+        </article>
+        <article class="panel">
+          <h3>Consumption stayed at zero</h3>
+          <p>Across every probe, GLM-5.3 remained <code>used_units: 0</code> of 3,000,000, and the local ZCode database recorded no completed model turn. The daily window also rolled over mid-investigation, which is why paired before/after counters must sit inside one period.</p>
+        </article>
+        <article class="panel">
+          <h3>What this changes</h3>
+          <p>Idea 1’s proof ladder resolved early and negatively for the free tier; idea 2 should not be built for it; idea 7 is no longer speculative but blocked by an explicit provider control. A purchased GLM Coding Plan is the one path that makes the existing provider work unchanged.</p>
         </article>
       </div>
     </section>
