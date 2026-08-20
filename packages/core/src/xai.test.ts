@@ -1,9 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { Account } from "@better-ccflare/types";
-import {
-	isOfficialXaiEndpoint,
-	resolveXaiContextWindow,
-} from "./xai";
+import { isOfficialXaiEndpoint, resolveXaiContextWindow } from "./xai";
 
 describe("resolveXaiContextWindow", () => {
 	it("resolves grok-4.5 and grok-4.6 at the official 500k window", () => {
@@ -55,7 +52,9 @@ describe("isOfficialXaiEndpoint", () => {
 
 	it("returns true for an xAI account with the official endpoint", () => {
 		expect(
-			isOfficialXaiEndpoint(xaiAccount({ custom_endpoint: "https://api.x.ai/v1" })),
+			isOfficialXaiEndpoint(
+				xaiAccount({ custom_endpoint: "https://api.x.ai/v1" }),
+			),
 		).toBe(true);
 	});
 
@@ -69,9 +68,7 @@ describe("isOfficialXaiEndpoint", () => {
 
 	it("returns false for an xAI account with a malformed endpoint (does not throw)", () => {
 		expect(
-			isOfficialXaiEndpoint(
-				xaiAccount({ custom_endpoint: "not-a-valid-url" }),
-			),
+			isOfficialXaiEndpoint(xaiAccount({ custom_endpoint: "not-a-valid-url" })),
 		).toBe(false);
 	});
 
@@ -89,9 +86,7 @@ describe("isOfficialXaiEndpoint", () => {
 
 	it("returns false for a non-xAI account", () => {
 		expect(
-			isOfficialXaiEndpoint(
-				xaiAccount({ provider: "openai-compatible" }),
-			),
+			isOfficialXaiEndpoint(xaiAccount({ provider: "openai-compatible" })),
 		).toBe(false);
 	});
 

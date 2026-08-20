@@ -179,7 +179,7 @@ export class XaiProvider extends OpenAICompatibleProvider {
 		let endpoint = XAI_DEFAULT_ENDPOINT;
 		try {
 			endpoint = account?.custom_endpoint
-				? getEndpointUrl(account) ?? XAI_DEFAULT_ENDPOINT
+				? (getEndpointUrl(account) ?? XAI_DEFAULT_ENDPOINT)
 				: XAI_DEFAULT_ENDPOINT;
 			endpoint = validateEndpointUrl(endpoint, "xAI endpoint");
 		} catch (error) {

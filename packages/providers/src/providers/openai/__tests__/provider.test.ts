@@ -885,4 +885,106 @@ describe("OpenAICompatibleProvider", () => {
 			expect(body.enable_thinking).toBeUndefined();
 		});
 	});
+
+	// R15/KTD8: an unknown gateway model must record no cost rather than a
+	// confident wrong estimate from the fallback price. An absent value is
+	// honestly unknown; the old `default` rate produced a fabricated number.
+	describe("cost for unknown models (R15/KTD8)", () => {
+		function openaiJsonResponse(body: object): Response {
+			return new Response(JSON.stringify(body), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		}
+
+		it("records no cost for a model with no known price (AE8)", async () => {
+			const response = openaiJsonResponse({
+				id: "chatcmpl-unk",
+				model: "zai/glm-5.2-fast",
+				choices: [
+					{
+						message: { role: "assistant", content: "hi" },
+						finish_reason: "stop",
+					},
+				],
+				usage: {
+					prompt_tokens: 1000,
+					completion_tokens: 500,
+					total_tokens: 1500,
+				},
+			});
+
+			const info = await provider.extractUsageInfo(response);
+			expect(info).not.toBeNull();
+			// No known price → costUsd is absent, not a fabricated estimate.
+			expect(info?.costUsd).toBeUndefined();
+		});
+
+		it("records the same cost as before for a model with a known price", async () => {
+			const response = openaiJsonResponse({
+				id: "chatcmpl-known",
+				model: "gpt-4o",
+				choices: [
+					{
+						message: { role: "assistant", content: "hi" },
+						finish_reason: "stop",
+					},
+				],
+				usage: {
+					prompt_tokens: 1000,
+					completion_tokens: 500,
+					total_tokens: 1500,
+				},
+			});
+
+			const info = await provider.extractUsageInfo(response);
+			expect(info).not.toBeNull();
+			// (1000/1000 * 0.005) + (500/1000 * 0.015) = 0.005 + 0.0075 = 0.0125
+			expect(info?.costUsd).toBeCloseTo(0.0125, 6);
+		});
+
+		it("distinguishes an absent cost from a recorded zero", async () => {
+			// A model with no known price yields an absent costUsd (undefined).
+			const unknownResponse = openaiJsonResponse({
+				id: "chatcmpl-unk2",
+				model: "totally-unknown-model",
+				choices: [
+					{
+						message: { role: "assistant", content: "hi" },
+						finish_reason: "stop",
+					},
+				],
+				usage: {
+					prompt_tokens: 100,
+					completion_tokens: 50,
+					total_tokens: 150,
+				},
+			});
+			const unknownInfo = await provider.extractUsageInfo(unknownResponse);
+			expect(unknownInfo?.costUsd).toBeUndefined();
+
+			// A recorded zero is a number — it must not collapse to undefined.
+			// A known model with zero tokens legitimately records cost 0.
+			const zeroResponse = openaiJsonResponse({
+				id: "chatcmpl-zero",
+				model: "gpt-4o",
+				choices: [
+					{
+						message: { role: "assistant", content: "" },
+						finish_reason: "stop",
+					},
+				],
+				usage: {
+					prompt_tokens: 0,
+					completion_tokens: 0,
+					total_tokens: 0,
+				},
+			});
+			const zeroInfo = await provider.extractUsageInfo(zeroResponse);
+			expect(zeroInfo?.costUsd).toBe(0);
+
+			// The two are distinguishable: undefined !== 0.
+			expect(unknownInfo?.costUsd).not.toBe(zeroInfo?.costUsd);
+		});
+	});
 });

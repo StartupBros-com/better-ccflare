@@ -352,35 +352,45 @@ export class OpenAICompatibleProvider extends BaseProvider {
 	}
 
 	/**
-	 * Calculate cost based on model and token usage
+	 * Calculate cost based on model and token usage.
+	 *
+	 * Returns `undefined` when the model has no known price (KTD8/R15): an
+	 * absent value is honestly unknown, while a fallback rate would produce a
+	 * confident wrong number for unknown gateway models. Models with a known
+	 * exact match or a matching known prefix still record a real cost.
 	 */
 	protected calculateCost(
 		model?: string,
 		promptTokens: number = 0,
 		completionTokens: number = 0,
-	): number {
+	): number | undefined {
 		if (!model) return 0;
 
-		// Basic OpenAI-compatible pricing (can be enhanced based on provider)
+		// Known OpenAI-compatible pricing. There is intentionally no `default`
+		// entry — unknown models record no cost rather than a fabricated
+		// estimate (KTD8/R15).
 		const pricing: Record<string, { input: number; output: number }> = {
 			"gpt-3.5-turbo": { input: 0.0005, output: 0.0015 },
 			"gpt-4": { input: 0.03, output: 0.06 },
 			"gpt-4-turbo": { input: 0.01, output: 0.03 },
 			"gpt-4o": { input: 0.005, output: 0.015 },
 			"gpt-4o-mini": { input: 0.00015, output: 0.0006 },
-			// Default pricing for unknown models
-			default: { input: 0.001, output: 0.002 },
 		};
 
-		// Find matching pricing (use exact match or default)
-		let modelPricing = pricing[model];
+		// Find matching pricing (exact match, or a known prefix for variant
+		// models). Unknown models get no pricing — return undefined so the
+		// caller records an absent cost instead of an estimate.
+		let modelPricing: { input: number; output: number } | undefined =
+			pricing[model];
 		if (!modelPricing) {
-			// Try to match prefix (e.g., "gpt-4o-*" models)
+			// Try to match a known prefix (e.g., "gpt-4o-*" variant models).
 			const prefix = Object.keys(pricing).find((key) =>
 				model.includes(key.split("*")[0]),
 			);
-			modelPricing = pricing[prefix || "default"];
+			modelPricing = prefix ? pricing[prefix] : undefined;
 		}
+
+		if (!modelPricing) return undefined;
 
 		const inputCost = (promptTokens / 1000) * modelPricing.input;
 		const outputCost = (completionTokens / 1000) * modelPricing.output;

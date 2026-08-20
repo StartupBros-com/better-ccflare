@@ -532,7 +532,9 @@ describe("getEndpointUrl — null when no endpoint (R3)", () => {
 	} as Account;
 
 	test("returns null when custom_endpoint is null", () => {
-		expect(getEndpointUrl({ ...baseAccount, custom_endpoint: null })).toBeNull();
+		expect(
+			getEndpointUrl({ ...baseAccount, custom_endpoint: null }),
+		).toBeNull();
 	});
 
 	test("returns null when custom_endpoint is undefined", () => {
