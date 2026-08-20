@@ -6,6 +6,7 @@ import {
 	MAX_OAUTH_ERROR_INPUT_LENGTH,
 	OAuthRefreshTokenError,
 	readBoundedOAuthResponseText,
+	resolveXaiContextWindow,
 	validateEndpointUrl,
 } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
@@ -53,6 +54,14 @@ function resolvedXaiModelMappings(): Record<string, string> {
 
 export class XaiProvider extends OpenAICompatibleProvider {
 	override name = "xai";
+
+	protected override resolveStreamContextWindow(
+		model: string,
+		account: Account | null,
+	): number | undefined {
+		if (!isOfficialXaiEndpoint(account)) return undefined;
+		return resolveXaiContextWindow(model)?.contextWindow;
+	}
 
 	getLogicalModelCapability(
 		logicalModel: string,

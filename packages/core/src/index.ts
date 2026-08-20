@@ -156,7 +156,9 @@ export {
 	cacheOutcomeFromTokens,
 	formatXaiCacheCanary,
 	isOfficialXaiEndpoint,
+	resolveXaiContextWindow,
 	XAI_EFFECTIVE_CACHE_HIT_MIN_RATIO,
 	type XaiCacheCanaryFields,
 	type XaiCacheOutcome,
+	type XaiContextWindowResolution,
 } from "./xai";

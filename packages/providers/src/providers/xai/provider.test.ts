@@ -146,6 +146,33 @@ describe("XaiProvider", () => {
 		expect(body.stream_options).toEqual({ include_usage: true });
 	});
 
+	it("advertises 500k only for streams from official xAI endpoints", async () => {
+		const provider = new XaiProvider();
+		const makeResponse = () =>
+			new Response(
+				[
+					`data: ${JSON.stringify({
+						model: "grok-4.6",
+						choices: [
+							{ index: 0, delta: { content: "Hi" }, finish_reason: null },
+						],
+						usage: { prompt_tokens: 20, completion_tokens: 5 },
+					})}\n\n`,
+					"data: [DONE]\n\n",
+				].join(""),
+				{ headers: { "content-type": "text/event-stream" } },
+			);
+
+		const official = await provider.processResponse(makeResponse(), account());
+		expect(await official.text()).toContain('"context_window_size":500000');
+
+		const custom = await provider.processResponse(
+			makeResponse(),
+			account({ custom_endpoint: "https://proxy.example.com/v1" }),
+		);
+		expect(await custom.text()).not.toContain("context_window");
+	});
+
 	it("attaches x-grok-conv-id only when cache-native is enabled on official xAI", async () => {
 		const original = process.env[XAI_CACHE_NATIVE_ENV];
 		const provider = new XaiProvider();

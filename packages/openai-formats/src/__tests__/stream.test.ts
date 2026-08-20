@@ -374,6 +374,79 @@ describe("transformStreamingResponse — text responses", () => {
 		);
 	});
 
+	it("advertises the official 500k Grok 4.6 window on message_delta", async () => {
+		const upstream = makeOpenAIStream([
+			JSON.stringify({
+				id: "c1",
+				model: "grok-4.6",
+				choices: [{ index: 0, delta: { content: "Hi" }, finish_reason: null }],
+				usage: {
+					prompt_tokens: 20,
+					completion_tokens: 5,
+					prompt_tokens_details: { cached_tokens: 12 },
+				},
+			}),
+			"[DONE]",
+		]);
+		const transformed = transformStreamingResponse(upstream, {
+			contextWindowForModel: (model) =>
+				model === "grok-4.6" ? 500_000 : undefined,
+		});
+		const raw = await readStream(transformed.body);
+		const events = parseSSEEvents(raw);
+		const msgDelta = events.find((event) => event.event === "message_delta");
+		expect(msgDelta).toBeDefined();
+		if (!msgDelta) throw new Error("expected message_delta event");
+
+		expect(parseEventData(msgDelta).context_window).toEqual({
+			current_usage: {
+				input_tokens: 8,
+				cache_read_input_tokens: 12,
+				cache_creation_input_tokens: 0,
+			},
+			context_window_size: 500_000,
+		});
+	});
+
+	it("does not infer context capacity from an upstream model name", async () => {
+		const upstream = makeOpenAIStream([
+			JSON.stringify({
+				id: "c1",
+				model: "grok-4.6",
+				choices: [{ index: 0, delta: { content: "Hi" }, finish_reason: null }],
+				usage: { prompt_tokens: 20, completion_tokens: 5 },
+			}),
+			"[DONE]",
+		]);
+		const transformed = transformStreamingResponse(upstream);
+		const raw = await readStream(transformed.body);
+		const events = parseSSEEvents(raw);
+		const msgDelta = events.find((event) => event.event === "message_delta");
+		expect(msgDelta).toBeDefined();
+		if (!msgDelta) throw new Error("expected message_delta event");
+		expect(parseEventData(msgDelta)).not.toHaveProperty("context_window");
+	});
+
+	it("omits context capacity when current prompt usage is unavailable", async () => {
+		const upstream = makeOpenAIStream([
+			JSON.stringify({
+				id: "c1",
+				model: "grok-4.6",
+				choices: [{ index: 0, delta: { content: "Hi" }, finish_reason: null }],
+			}),
+			"[DONE]",
+		]);
+		const transformed = transformStreamingResponse(upstream, {
+			contextWindowForModel: () => 500_000,
+		});
+		const raw = await readStream(transformed.body);
+		const events = parseSSEEvents(raw);
+		const msgDelta = events.find((event) => event.event === "message_delta");
+		expect(msgDelta).toBeDefined();
+		if (!msgDelta) throw new Error("expected message_delta event");
+		expect(parseEventData(msgDelta)).not.toHaveProperty("context_window");
+	});
+
 	it.each([
 		{ label: "missing", promptTokens: undefined },
 		{ label: "invalid", promptTokens: -1 },

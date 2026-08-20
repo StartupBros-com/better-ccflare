@@ -126,9 +126,16 @@ export class OpenAICompatibleProvider extends BaseProvider {
 		};
 	}
 
+	protected resolveStreamContextWindow(
+		_model: string,
+		_account: Account | null,
+	): number | undefined {
+		return undefined;
+	}
+
 	async processResponse(
 		response: Response,
-		_account: Account | null,
+		account: Account | null,
 	): Promise<Response> {
 		// Convert OpenAI response format back to Anthropic format
 		const contentType = response.headers.get("content-type");
@@ -165,7 +172,10 @@ export class OpenAICompatibleProvider extends BaseProvider {
 
 		// For streaming responses, we need to transform the SSE stream
 		if (contentType?.includes("text/event-stream")) {
-			const transformed = transformStreamingResponse(response);
+			const transformed = transformStreamingResponse(response, {
+				contextWindowForModel: (model) =>
+					this.resolveStreamContextWindow(model, account),
+			});
 			transferResponseDrainTransport(response, transformed);
 			return transformed;
 		}
