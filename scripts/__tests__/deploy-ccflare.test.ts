@@ -371,6 +371,26 @@ describe("systemd documentation contracts", () => {
 });
 
 describe("render_systemd_pin", () => {
+	// A deploy that renders one budget and then verifies a different literal
+	// aborts after the build, mid-pin-swap. That is exactly how the 1 GiB
+	// app-admission pin shipped broken: the renderer moved, the post-render
+	// verification list did not, and the failure only surfaced against the real
+	// systemd unit. Keep the two literal lists tied together here.
+	test("verifies every body-policy line it renders", () => {
+		const renderer = readFileSync(join(repoRoot, helperScriptForShell), "utf8");
+		const deployer = readFileSync(deployScript, "utf8");
+		const renderedBodyPolicyLines = [
+			...renderer.matchAll(
+				/"(Environment=(?:GUARD_MAX_REQUEST_BODY_BYTES|GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES|CCFLARE_MAX_BUFFERED_REQUEST_BODY_BYTES|CCFLARE_MAX_BODY_ADMISSION_QUEUE)=\d+)"/g,
+			),
+		].map((match) => match[1]);
+
+		expect(renderedBodyPolicyLines).toHaveLength(4);
+		for (const line of renderedBodyPolicyLines) {
+			expect(deployer).toContain(`"${line}"`);
+		}
+	});
+
 	test("renders only deploy-owned content, removes stale managed values, and is byte-idempotent", () => {
 		const dir = tempDir();
 		const input = join(dir, "pin.conf");
