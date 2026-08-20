@@ -157,7 +157,7 @@ describe("analyzeCodexCacheExperiments", () => {
 		// medianCachedReadPct/p25CachedReadPct/p75CachedReadPct alongside the
 		// pre-existing weighted figure, so consumers keyed on the row shape
 		// need to know the shape changed.
-		expect(report.schemaVersion).toBe(3);
+		expect(report.schemaVersion).toBe(4);
 		expect(report.turnState.assignmentCounts).toEqual({
 			observe: 0,
 			control: 1,
@@ -352,9 +352,9 @@ describe("analyzeCodexCacheExperiments", () => {
 			},
 		]);
 
-		expect(report.schemaVersion).toBe(3);
+		expect(report.schemaVersion).toBe(4);
 		expect(report.attribution.unit).toBe("final_observed_codex_attempt");
-		expect(report.attribution.pacingWaitMs).toBe("unavailable");
+		expect(report.attribution.pacingWaitMs).toBe("schema20_request_receipt");
 		expect(report.pacing.assignmentCounts).toEqual({
 			treatment: 2,
 			control: 1,
@@ -677,7 +677,7 @@ describe("analyzeCodexCacheExperiments", () => {
 		);
 
 		expect(text).toContain("CODEX CACHE EXPERIMENTS");
-		expect(text).toContain("pacing_wait_ms=unavailable");
+		expect(text).toContain("pacing_wait_ms=schema20_request_receipt");
 		for (const secret of [
 			"raw-request-id",
 			"raw-attempt-id",
@@ -688,6 +688,68 @@ describe("analyzeCodexCacheExperiments", () => {
 		]) {
 			expect(text).not.toContain(secret);
 		}
+	});
+
+	test("attributes follower cap receipts and observed wait time", () => {
+		const report = analyzeCodexCacheExperiments([
+			{
+				trace_schema_version: 20,
+				phase: "request",
+				ts: "2026-08-20T00:00:00Z",
+				request_id: "cap-request",
+				attempt_id: "cap-attempt",
+				model_out: "gpt-5.6-sol",
+				pacing_canary: "control",
+				pacing_cohort_id: "aaaaaaaaaaaaaaaa",
+				pacing_action: "paced",
+				pacing_role: "follower",
+				pacing_wait_ms: 60_000,
+				pacing_release_reason: "cap",
+			},
+			{
+				trace_schema_version: 20,
+				phase: "response",
+				ts: "2026-08-20T00:00:01Z",
+				request_id: "cap-request",
+				attempt_id: "cap-attempt",
+				stop_reason: "end_turn",
+				input_tokens: 1_000,
+				cache_read_input_tokens: 0,
+				cache_measurement_available: true,
+			},
+		]);
+
+		expect(report.pacing.rows[0]?.pacing).toMatchObject({
+			receiptCounts: {
+				leader: 0,
+				followerReleasedByLeader: 0,
+				followerReleasedByCap: 1,
+				unknown: 0,
+			},
+			waitMsAvailableRequests: 1,
+			waitMsUnavailableRequests: 0,
+			p50WaitMs: 60_000,
+			p95WaitMs: 60_000,
+		});
+	});
+
+	test("classifies pre-schema-20 pacing receipts as unknown", () => {
+		const report = analyzeCodexCacheExperiments([
+			{
+				trace_schema_version: 19,
+				phase: "request",
+				ts: "2026-08-20T00:00:00Z",
+				request_id: "legacy-request",
+				attempt_id: "legacy-attempt",
+				model_out: "gpt-5.6-sol",
+				pacing_canary: "control",
+				pacing_cohort_id: "bbbbbbbbbbbbbbbb",
+				pacing_action: "paced",
+			},
+		]);
+
+		expect(report.pacing.rows[0]?.pacing.receiptCounts.unknown).toBe(1);
+		expect(report.pacing.rows[0]?.pacing.waitMsUnavailableRequests).toBe(1);
 	});
 
 	test("keeps the legacy analyzer output unchanged unless explicitly selected", () => {

@@ -84,6 +84,7 @@ import {
 import {
 	createAnomalyInsightsHandler,
 	createCacheInsightsHandler,
+	createCacheParityHandler,
 	createContextInsightsHandler,
 } from "../handlers/insights";
 import { createCleanupHandler } from "../handlers/maintenance";
@@ -490,6 +491,8 @@ describe.skipIf(!livePgAvailable)(
 			cacheReadInputTokens?: number;
 			cacheCreationInputTokens?: number;
 			responseTimeMs?: number;
+			appliedModel?: string | null;
+			clientSessionId?: string | null;
 		}): Promise<void> {
 			await adapter.run(
 				`INSERT INTO requests
@@ -497,8 +500,9 @@ describe.skipIf(!livePgAvailable)(
 					 error_message, response_time_ms, failover_attempts, model,
 					 total_tokens, cost_usd, input_tokens, output_tokens,
 					 cache_read_input_tokens, cache_creation_input_tokens,
-					 api_key_id, api_key_name, project, billing_type)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+					 api_key_id, api_key_name, project, billing_type,
+					 applied_model, client_session_id)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				[
 					row.id,
 					row.timestamp,
@@ -521,6 +525,8 @@ describe.skipIf(!livePgAvailable)(
 					row.apiKeyName ?? null,
 					row.project ?? null,
 					row.billingType ?? "api",
+					row.appliedModel ?? null,
+					row.clientSessionId ?? null,
 				],
 			);
 		}
@@ -956,6 +962,61 @@ describe.skipIf(!livePgAvailable)(
 						),
 					);
 					expect(res.status).toBe(200);
+				},
+			);
+
+			liveIt(
+				"GET /api/insights/cache-parity matches the durable cohort contract",
+				async () => {
+					await seedAccount({
+						id: "codex-parity",
+						name: "codex-parity",
+						provider: "codex",
+					});
+					await seedRequest({
+						id: "parity-first",
+						timestamp: now - 2_000,
+						accountUsed: "codex-parity",
+						success: true,
+						model: "claude-sonnet-5",
+						appliedModel: "gpt-5.6-sol-2026-08-19",
+						clientSessionId: "pg-parity-session",
+						inputTokens: 1_000,
+						cacheReadInputTokens: 0,
+					});
+					await seedRequest({
+						id: "parity-follow",
+						timestamp: now - 1_000,
+						accountUsed: "codex-parity",
+						success: true,
+						model: "claude-sonnet-5",
+						appliedModel: "gpt-5.6-sol-2026-08-19",
+						clientSessionId: "pg-parity-session",
+						inputTokens: 100,
+						cacheReadInputTokens: 900,
+					});
+
+					const res = await createCacheParityHandler(context)();
+					const body = (await readJson(res)) as {
+						windows: {
+							authoritative7d: {
+								providers: Array<{
+									key: string;
+									followUps: { weightedCacheReadPercent: number };
+								}>;
+								codexByPhysicalModel: Array<{ key: string }>;
+							};
+						};
+					};
+					const codex = body.windows.authoritative7d.providers.find(
+						(provider) => provider.key === "codex",
+					);
+					expect(codex?.followUps.weightedCacheReadPercent).toBe(90);
+					expect(
+						body.windows.authoritative7d.codexByPhysicalModel.map(
+							(model) => model.key,
+						),
+					).toEqual(["gpt-5.6-sol"]);
 				},
 			);
 

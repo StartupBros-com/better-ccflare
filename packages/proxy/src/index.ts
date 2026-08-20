@@ -102,6 +102,7 @@ export type {
 	CodexModelListing,
 } from "./codex-model-catalog";
 export { getCodexModels } from "./codex-model-catalog";
+export { readCodexWebSocketPercent } from "./codex-websocket-contract";
 export {
 	type DegradedOwnerDirectiveInput,
 	type DegradedOwnerEvidenceInput,

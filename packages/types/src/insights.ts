@@ -61,6 +61,101 @@ export interface CacheInsightsResponse {
 	byProject: CacheInsightsRow[];
 }
 
+export type CacheParityVerdict =
+	| "at_parity"
+	| "below_parity"
+	| "insufficient_evidence";
+
+export interface CacheParityMetrics {
+	totalRequests: number;
+	successfulRequests: number;
+	successRatePercent: number | null;
+	fallbackRequests: number;
+	fallbackRatePercent: number | null;
+	contextOverflowRequests: number;
+	contextOverflowRatePercent: number | null;
+	measuredResponses: number;
+	unavailableResponses: number;
+	totalInputTokens: number;
+	cacheReadInputTokens: number;
+	weightedCacheReadPercent: number | null;
+	medianCacheReadPercent: number | null;
+	p25CacheReadPercent: number | null;
+	p75CacheReadPercent: number | null;
+	positiveHitResponses: number;
+	positiveHitRatePercent: number | null;
+	zeroHitResponses: number;
+	zeroHitRatePercent: number | null;
+}
+
+export interface CacheParityProviderSummary {
+	key: string;
+	firstObserved: CacheParityMetrics;
+	followUps: CacheParityMetrics;
+}
+
+export interface CacheParityDimensionSummary {
+	key: string;
+	metrics: CacheParityMetrics;
+}
+
+export interface CacheParityEvidence {
+	minimumFollowUps: number;
+	minimumInputTokens: number;
+	codexQualified: boolean;
+	anthropicQualified: boolean;
+}
+
+export interface CacheParityWindow {
+	verdict: CacheParityVerdict;
+	reasons: string[];
+	evidence: CacheParityEvidence;
+	providers: CacheParityProviderSummary[];
+	codexByPhysicalModel: CacheParityDimensionSummary[];
+	codexByAccount: CacheParityDimensionSummary[];
+	codexByGapBand: CacheParityDimensionSummary[];
+	codexByContextBand: CacheParityDimensionSummary[];
+	codexByAccountContinuity: CacheParityDimensionSummary[];
+}
+
+export interface CacheParityPolicySnapshot {
+	promptCacheKeyEnabled: boolean;
+	cacheKeyMode: "conversation" | "session";
+	cacheKeySessionPercent: number;
+	cacheKeyContinuityPercent: number;
+	cacheKeyPrefixShardPercent: number;
+	pacingMs: number;
+	codexSettleMs: number;
+	pacingBypassPercent: number;
+	explicitBreakpointPercent: number;
+	explicitBreakpointSuppressedScopes: number;
+	turnStatePercent: number;
+	turnStateObserveOnly: boolean;
+	webSocketPercent: number;
+	globalKeepaliveTtlMinutes: number;
+}
+
+export interface CacheParityResponse {
+	generatedAt: number;
+	verdict: CacheParityVerdict;
+	metricScopes: {
+		durable: "logical_request_final_usage";
+		trace: "physical_attempt_usage";
+	};
+	backendCapability: {
+		endpoint: "chatgpt_subscription";
+		explicitBreakpoint:
+			| "not_requested"
+			| "treatment_requested"
+			| "unsupported_observed";
+	};
+	policy: CacheParityPolicySnapshot;
+	windows: {
+		advisory24h: CacheParityWindow;
+		authoritative7d: CacheParityWindow;
+	};
+}
+
 /**
  * Response types for the anomaly insights endpoint (/api/insights/anomalies).
  */

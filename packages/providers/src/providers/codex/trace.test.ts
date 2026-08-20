@@ -40,7 +40,7 @@ describe("Codex HTTP turn-state telemetry (schema 18)", () => {
 				.split("\n")
 				.map((line) => JSON.parse(line));
 			expect(tombstone).toMatchObject({
-				trace_schema_version: 19,
+				trace_schema_version: 20,
 				// The analyzer duplicates this literal (it imports nothing from the
 				// provider); both sides are pinned so either one drifting fails here.
 				phase: "attempt_aborted",
@@ -81,7 +81,7 @@ describe("Codex HTTP turn-state telemetry (schema 18)", () => {
 				.split("\n")
 				.map((line) => JSON.parse(line));
 			expect(request).toMatchObject({
-				trace_schema_version: 19,
+				trace_schema_version: 20,
 				codex_turn_state_arm: "treatment",
 				codex_turn_state_cohort_id: "0123456789abcdef",
 				codex_turn_state_request_action: "replay",
@@ -89,7 +89,7 @@ describe("Codex HTTP turn-state telemetry (schema 18)", () => {
 			});
 			expect(request.codex_turn_state_request_hmac).toMatch(/^[0-9a-f]{64}$/);
 			expect(response).toMatchObject({
-				trace_schema_version: 19,
+				trace_schema_version: 20,
 				codex_turn_state_terminal_action: "advanced",
 			});
 			expect(rawTrace).not.toContain("private-request-turn-state");
@@ -153,7 +153,7 @@ describe("reasoning retention telemetry (schema 18)", () => {
 			const rawTrace = readFileSync(join(dir, file as string), "utf8");
 			const record = JSON.parse(rawTrace.trim());
 			expect(record).toMatchObject({
-				trace_schema_version: 19,
+				trace_schema_version: 20,
 				phase: "request",
 				reasoning_input_item_count: 1,
 			});
@@ -181,7 +181,7 @@ describe("reasoning retention telemetry (schema 18)", () => {
 				readFileSync(join(dir, file as string), "utf8").trim(),
 			);
 			expect(record).toMatchObject({
-				trace_schema_version: 19,
+				trace_schema_version: 20,
 				phase: "response",
 				reasoning_output_item_count: 3,
 				reasoning_encrypted_present: true,
@@ -220,7 +220,7 @@ describe("writeCodexTrace schema 18 cache experiments", () => {
 				readFileSync(join(dir, file as string), "utf8").trim(),
 			);
 			expect(record).toMatchObject({
-				trace_schema_version: 19,
+				trace_schema_version: 20,
 				cache_key_continuity_applied: false,
 				continuity_evidence_id: "0123456789abcdef",
 				request_id: "logical-1",
@@ -276,7 +276,7 @@ describe("orchestration demotion diagnostics (preserved in current schema)", () 
 				readFileSync(join(dir, file as string), "utf8").trim(),
 			);
 			expect(record).toMatchObject({
-				trace_schema_version: 19,
+				trace_schema_version: 20,
 				orchestration_demotion_observed: true,
 				elapsed_ms_since_root: 4_242,
 			});
@@ -295,7 +295,7 @@ describe("orchestration demotion diagnostics (preserved in current schema)", () 
 			const record = JSON.parse(
 				readFileSync(join(dir, file as string), "utf8").trim(),
 			);
-			expect(record.trace_schema_version).toBe(19);
+			expect(record.trace_schema_version).toBe(20);
 			expect(record.orchestration_demotion_observed).toBeNull();
 			expect(record.elapsed_ms_since_root).toBeNull();
 		} finally {
@@ -339,7 +339,7 @@ describe("orchestration admission basis (introduced in schema 13, preserved in s
 				readFileSync(join(dir, file as string), "utf8").trim(),
 			);
 			expect(record).toMatchObject({
-				trace_schema_version: 19,
+				trace_schema_version: 20,
 				orchestration_admission: "root",
 				orchestration_basis: "lineage_match",
 			});
