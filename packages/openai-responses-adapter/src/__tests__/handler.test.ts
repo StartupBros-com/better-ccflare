@@ -1,4 +1,5 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, it, test } from "bun:test";
+import * as zlib from "node:zlib";
 import { handleResponsesRequest } from "../handler";
 import type { HandleProxyFn } from "../types";
 
@@ -38,10 +39,10 @@ describe("handleResponsesRequest", () => {
 	});
 
 	test("Test 2: non-streaming path → calls handleProxy with /v1/messages, returns translated response", async () => {
-		let capturedUrl: URL | null = null;
+		let capturedPath = "";
 
 		const mockHandleProxy: HandleProxyFn = async (_req, url) => {
-			capturedUrl = url;
+			capturedPath = url.pathname;
 			return new Response(ANTHROPIC_MESSAGE_BODY, {
 				status: 200,
 				headers: { "Content-Type": "application/json" },
@@ -71,7 +72,7 @@ describe("handleResponsesRequest", () => {
 			{},
 		);
 
-		expect(capturedUrl?.pathname).toBe("/v1/messages");
+		expect(capturedPath).toBe("/v1/messages");
 		expect(resp.status).toBe(200);
 
 		const body = await resp.json();
@@ -439,5 +440,336 @@ describe("handleResponsesRequest", () => {
 		const rawBody = await resp.text();
 		expect(rawBody).toContain("response.created");
 		expect(rawBody).toContain("response.completed");
+	});
+});
+
+describe("Responses request body admission", () => {
+	const limit = 4 * 1024;
+	const encoder = new TextEncoder();
+
+	function validBody(input = "Hi"): Record<string, unknown> {
+		return { model: "claude-haiku-4-5", input, stream: false };
+	}
+
+	async function compressWithRuntimeStream(
+		bytes: Uint8Array,
+		format: "gzip" | "deflate",
+	): Promise<Uint8Array> {
+		const source = new Response(copiedArrayBuffer(bytes)).body;
+		if (!source) throw new Error("Missing compression source stream");
+		return new Uint8Array(
+			await new Response(
+				source.pipeThrough(new CompressionStream(format)),
+			).arrayBuffer(),
+		);
+	}
+
+	function copiedArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+		const copy = new Uint8Array(bytes.byteLength);
+		copy.set(bytes);
+		return copy.buffer;
+	}
+
+	function responseRequest(
+		body: BodyInit | Uint8Array,
+		contentEncoding?: string,
+		controller?: AbortController,
+	): Request {
+		const headers = new Headers({ "content-type": "application/json" });
+		if (contentEncoding) headers.set("content-encoding", contentEncoding);
+		return new Request("http://localhost/v1/responses", {
+			method: "POST",
+			headers,
+			body: body instanceof Uint8Array ? copiedArrayBuffer(body) : body,
+			signal: controller?.signal,
+		});
+	}
+
+	function countingProxy(): [HandleProxyFn, () => number] {
+		let calls = 0;
+		return [
+			async () => {
+				calls += 1;
+				return new Response(ANTHROPIC_MESSAGE_BODY, {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			},
+			() => calls,
+		];
+	}
+
+	async function handleWithLimit(
+		req: Request,
+		proxy: HandleProxyFn,
+		requestBodyLimit = limit,
+		onBodySizeKnown?: (bytes: number) => void | Promise<void>,
+	): Promise<Response> {
+		return handleResponsesRequest(
+			req,
+			new URL(req.url),
+			proxy,
+			{},
+			undefined,
+			undefined,
+			{ requestBodyLimit, onBodySizeKnown },
+		);
+	}
+
+	async function expectRejectedWithoutProxy(
+		req: Request,
+		status: 400 | 413,
+		requestBodyLimit = limit,
+	): Promise<void> {
+		const [proxy, calls] = countingProxy();
+		const response = await handleWithLimit(req, proxy, requestBodyLimit);
+		expect(response.status).toBe(status);
+		expect(calls()).toBe(0);
+		const payload = (await response.json()) as {
+			type: string;
+			error: { type: string; message: string };
+		};
+		expect(payload.type).toBe("error");
+		expect(payload.error.type).toBe("invalid_request_error");
+		expect(payload.error.message).not.toContain("x".repeat(20));
+	}
+
+	it("admits an identity body at the exact encoded limit and rejects one byte over", async () => {
+		const serialized = JSON.stringify(validBody());
+		const exact = encoder.encode(
+			serialized + " ".repeat(limit - Buffer.byteLength(serialized, "utf8")),
+		);
+		const [proxy, calls] = countingProxy();
+		const exactResponse = await handleWithLimit(responseRequest(exact), proxy);
+		expect(exactResponse.status).toBe(200);
+		expect(calls()).toBe(1);
+		await expectRejectedWithoutProxy(
+			responseRequest(encoder.encode(`${new TextDecoder().decode(exact)} `)),
+			413,
+			limit,
+		);
+	});
+
+	it("translates identity, gzip, deflate, and zstd requests from bounded input", async () => {
+		const encoded = encoder.encode(JSON.stringify(validBody()));
+		const compressed: Array<[string | undefined, Uint8Array]> = [
+			[undefined, encoded],
+			["gzip", await compressWithRuntimeStream(encoded, "gzip")],
+			["deflate", await compressWithRuntimeStream(encoded, "deflate")],
+			["zstd", Bun.zstdCompressSync(encoded)],
+		];
+
+		for (const [contentEncoding, bytes] of compressed) {
+			const [proxy, calls] = countingProxy();
+			const response = await handleWithLimit(
+				responseRequest(bytes, contentEncoding),
+				proxy,
+			);
+			expect(response.status).toBe(200);
+			expect(calls()).toBe(1);
+		}
+	});
+
+	it("rejects a zstd frame whose declared window exceeds the decoded limit", async () => {
+		const oversizedWindowFrame = copiedArrayBuffer(
+			new Uint8Array([0x28, 0xb5, 0x2f, 0xfd, 0x00, 0xa0]),
+		);
+
+		await expectRejectedWithoutProxy(
+			responseRequest(oversizedWindowFrame, "zstd"),
+			413,
+		);
+	});
+
+	it("rejects a zstd checksum mismatch without invoking the proxy", async () => {
+		const compressed = zlib.zstdCompressSync(
+			encoder.encode(JSON.stringify(validBody())),
+			{
+				params: { [zlib.constants.ZSTD_c_checksumFlag]: 1 },
+			},
+		);
+		const corruptChecksum = new Uint8Array(compressed.byteLength);
+		corruptChecksum.set(compressed);
+		const finalByte = corruptChecksum.byteLength - 1;
+		corruptChecksum[finalByte] ^= 0xff;
+
+		await expectRejectedWithoutProxy(
+			responseRequest(copiedArrayBuffer(corruptChecksum), "zstd"),
+			400,
+		);
+	});
+
+	it("rejects declared encoded overflow before decompression", async () => {
+		const req = responseRequest(
+			encoder.encode(JSON.stringify(validBody())),
+			"gzip",
+		);
+		Object.defineProperty(req, "headers", {
+			value: new Headers({
+				"content-type": "application/json",
+				"content-encoding": "gzip",
+				"content-length": String(limit + 1),
+			}),
+		});
+		await expectRejectedWithoutProxy(req, 413);
+	});
+
+	it("rejects gzip, deflate, and zstd decoded expansion without invoking the proxy", async () => {
+		const expanded = encoder.encode(
+			JSON.stringify(validBody("x".repeat(limit))),
+		);
+		const compressed: Array<[string, Uint8Array]> = [
+			["gzip", await compressWithRuntimeStream(expanded, "gzip")],
+			["deflate", await compressWithRuntimeStream(expanded, "deflate")],
+			["zstd", Bun.zstdCompressSync(expanded)],
+		];
+
+		for (const [contentEncoding, bytes] of compressed) {
+			await expectRejectedWithoutProxy(
+				responseRequest(bytes, contentEncoding),
+				413,
+			);
+		}
+	});
+
+	it("returns 400 for corrupt and truncated recognized encodings without parsing compressed bytes", async () => {
+		const encoded = encoder.encode(JSON.stringify(validBody()));
+		const cases: Array<[string, Uint8Array]> = [
+			["gzip", Bun.gzipSync(encoded).subarray(0, -2)],
+			["deflate", Bun.deflateSync(encoded).subarray(0, -2)],
+			["zstd", Bun.zstdCompressSync(encoded).subarray(0, -1)],
+			// These are valid JSON bodies, so forwarding them proves a recognized
+			// decompression error cannot fall through to identity parsing.
+			["gzip", encoded],
+			["deflate", encoded],
+			["zstd", encoded],
+		];
+
+		for (const [contentEncoding, bytes] of cases) {
+			await expectRejectedWithoutProxy(
+				responseRequest(bytes, contentEncoding),
+				400,
+			);
+		}
+	});
+
+	it("keeps unsupported encoding compatibility by parsing the bounded identity bytes", async () => {
+		const [proxy, calls] = countingProxy();
+		const response = await handleWithLimit(
+			responseRequest(encoder.encode(JSON.stringify(validBody())), "br"),
+			proxy,
+		);
+		expect(response.status).toBe(200);
+		expect(calls()).toBe(1);
+	});
+
+	it("reports the larger decoded or synthetic body before forwarding", async () => {
+		const source = JSON.stringify(validBody("Hi"));
+		let knownBytes: number | undefined;
+		let callbackFinished = false;
+		let forwardedBytes: number | undefined;
+		const proxy: HandleProxyFn = async (request) => {
+			expect(callbackFinished).toBe(true);
+			forwardedBytes = Buffer.byteLength(await request.text(), "utf8");
+			return new Response(ANTHROPIC_MESSAGE_BODY, {
+				headers: { "content-type": "application/json" },
+			});
+		};
+
+		const response = await handleWithLimit(
+			responseRequest(source),
+			proxy,
+			limit,
+			async (bytes) => {
+				knownBytes = bytes;
+				callbackFinished = true;
+			},
+		);
+
+		expect(response.status).toBe(200);
+		expect(knownBytes).toBe(
+			Math.max(Buffer.byteLength(source, "utf8"), forwardedBytes ?? 0),
+		);
+	});
+
+	it("fails before proxy work when the size callback fails", async () => {
+		let proxyCalled = false;
+		await expect(
+			handleWithLimit(
+				responseRequest(JSON.stringify(validBody())),
+				async () => {
+					proxyCalled = true;
+					return new Response(ANTHROPIC_MESSAGE_BODY);
+				},
+				limit,
+				() => {
+					throw new Error("lease update failed");
+				},
+			),
+		).rejects.toThrow("lease update failed");
+		expect(proxyCalled).toBe(false);
+	});
+
+	it("rejects a translated synthetic body that exceeds the same limit", async () => {
+		const source = encoder.encode(JSON.stringify(validBody("x".repeat(64))));
+		await expectRejectedWithoutProxy(
+			responseRequest(source),
+			413,
+			source.byteLength + 1,
+		);
+	});
+
+	it("stops admission on client abort before parsing or calling the proxy", async () => {
+		const controller = new AbortController();
+		const reason = new DOMException("client disconnected", "AbortError");
+		let startReading: (() => void) | undefined;
+		const reading = new Promise<void>((resolve) => {
+			startReading = resolve;
+		});
+		let cancellations = 0;
+		const delayedBody = new ReadableStream<Uint8Array>({
+			pull() {
+				startReading?.();
+				return new Promise<void>(() => {});
+			},
+			cancel() {
+				cancellations += 1;
+			},
+		});
+		const [proxy, calls] = countingProxy();
+		const response = handleWithLimit(
+			responseRequest(delayedBody, undefined, controller),
+			proxy,
+		);
+		await reading;
+		controller.abort(reason);
+
+		await expect(response).rejects.toBe(reason);
+		expect(calls()).toBe(0);
+		expect(cancellations).toBe(1);
+	});
+
+	it("preserves the client abort signal on the synthetic proxy request", async () => {
+		const controller = new AbortController();
+		let forwarded: Request | undefined;
+		const proxy: HandleProxyFn = async (req) => {
+			forwarded = req;
+			return new Response(ANTHROPIC_MESSAGE_BODY, {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		};
+		const req = responseRequest(
+			encoder.encode(JSON.stringify(validBody())),
+			undefined,
+			controller,
+		);
+
+		const response = await handleWithLimit(req, proxy);
+		expect(response.status).toBe(200);
+		expect(forwarded).toBeDefined();
+		expect(forwarded?.signal.aborted).toBe(false);
+		controller.abort();
+		expect(forwarded?.signal.aborted).toBe(true);
 	});
 });

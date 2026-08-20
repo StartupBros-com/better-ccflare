@@ -62,11 +62,15 @@ const SECOND_PROFILE_MODEL = "claude-bccf-route-second-route";
 const SECOND_ROUTE_ACCOUNT_ID = "second-route-secret";
 const originalFetch = globalThis.fetch;
 let restoreUsageCollector = (): void => {};
-let usageHandleStart = mock(() => undefined);
+let usageHandleStart = mock(
+	(_event: Parameters<UsageCollector["handleStart"]>[0]) => undefined,
+);
 
 beforeEach(() => {
 	useProfileTestCatalog = true;
-	usageHandleStart = mock(() => undefined);
+	usageHandleStart = mock(
+		(_event: Parameters<UsageCollector["handleStart"]>[0]) => undefined,
+	);
 	const collector = {
 		handleStart: usageHandleStart,
 		handleChunk: mock(() => undefined),
@@ -223,7 +227,9 @@ function makeContext(
 	const normalAccount =
 		accounts.find((account) => account.id === options.normalAccountId) ??
 		firstAccount;
-	const strategySelect = mock(() => [normalAccount]);
+	const strategySelect = mock<(accounts: Account[]) => Account[]>(() => [
+		normalAccount,
+	]);
 	const getAllAccounts = mock(async () => accounts);
 	const getActiveComboForFamily = mock(async () => null);
 	const getAgentPreference = mock(
@@ -486,6 +492,221 @@ describe("Claude Code gateway model route profiles", () => {
 			routeProfileId: "pro-primary-sol",
 		});
 		clearSession(sessionId);
+	});
+
+	it("lets an earlier buffered root commit after a later same-lineage streamed overflow", async () => {
+		const harness = makeContext(makeRegistry());
+		const { requests } = installJsonUpstream();
+		const session = { "x-claude-code-session-id": "buffered-root-session" };
+		const encoder = new TextEncoder();
+		let markFirstRead!: () => void;
+		const firstReadStarted = new Promise<void>((resolve) => {
+			markFirstRead = resolve;
+		});
+		let releaseFirstBody!: () => void;
+		const firstBodyReleased = new Promise<void>((resolve) => {
+			releaseFirstBody = resolve;
+		});
+		const earlier = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: { "content-type": "application/json", ...session },
+			body: new ReadableStream<Uint8Array>({
+				async pull(controller) {
+					markFirstRead();
+					await firstBodyReleased;
+					controller.enqueue(
+						encoder.encode(
+							JSON.stringify({
+								model: PROFILE_MODEL,
+								messages: [{ role: "user", content: "hello" }],
+								max_tokens: 16,
+							}),
+						),
+					);
+					controller.close();
+				},
+			}),
+		});
+		const earlierResponse = handleProxy(
+			earlier,
+			new URL(earlier.url),
+			harness.ctx,
+			"key-1",
+		);
+		await firstReadStarted;
+
+		const oversized = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: { "content-type": "application/json", ...session },
+			body: new ReadableStream<Uint8Array>({
+				start(controller) {
+					controller.enqueue(new Uint8Array(32 * 1024 * 1024 + 1));
+				},
+			}),
+		});
+		const oversizedResponse = await handleProxy(
+			oversized,
+			new URL(oversized.url),
+			harness.ctx,
+			"key-1",
+		);
+		expect(oversizedResponse.status).toBe(413);
+
+		releaseFirstBody();
+		expect((await earlierResponse).status).toBe(200);
+		const child = apiRequest("/v1/messages", CHILD_MODEL, {
+			...session,
+			"x-claude-code-agent-id": "child-after-overflow",
+		});
+		expect(
+			(await handleProxy(child, new URL(child.url), harness.ctx, "key-1"))
+				.status,
+		).toBe(200);
+		expect(requests.map((request) => request.url)).toEqual([
+			`https://upstream.test/${ROUTE_ACCOUNT_ID}/v1/messages`,
+			`https://upstream.test/${ROUTE_ACCOUNT_ID}/v1/messages`,
+		]);
+	});
+
+	it("lets an earlier buffered root commit after a later malformed same-lineage root", async () => {
+		const harness = makeContext(makeRegistry());
+		const { requests } = installJsonUpstream();
+		const session = { "x-claude-code-session-id": "malformed-root-session" };
+		const encoder = new TextEncoder();
+		let markFirstRead!: () => void;
+		const firstReadStarted = new Promise<void>((resolve) => {
+			markFirstRead = resolve;
+		});
+		let releaseFirstBody!: () => void;
+		const firstBodyReleased = new Promise<void>((resolve) => {
+			releaseFirstBody = resolve;
+		});
+		const earlier = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: { "content-type": "application/json", ...session },
+			body: new ReadableStream<Uint8Array>({
+				async pull(controller) {
+					markFirstRead();
+					await firstBodyReleased;
+					controller.enqueue(
+						encoder.encode(
+							JSON.stringify({
+								model: PROFILE_MODEL,
+								messages: [{ role: "user", content: "hello" }],
+								max_tokens: 16,
+							}),
+						),
+					);
+					controller.close();
+				},
+			}),
+		});
+		const earlierResponse = handleProxy(
+			earlier,
+			new URL(earlier.url),
+			harness.ctx,
+			"key-1",
+		);
+		await firstReadStarted;
+
+		const malformed = apiRequest("/v1/messages", PROFILE_MODEL, session, {
+			messages: { malformed: true },
+		});
+		expect(
+			(
+				await handleProxy(
+					malformed,
+					new URL(malformed.url),
+					harness.ctx,
+					"key-1",
+				)
+			).status,
+		).toBe(400);
+
+		releaseFirstBody();
+		expect((await earlierResponse).status).toBe(200);
+		const child = apiRequest("/v1/messages", CHILD_MODEL, {
+			...session,
+			"x-claude-code-agent-id": "child-after-malformed-root",
+		});
+		expect(
+			(await handleProxy(child, new URL(child.url), harness.ctx, "key-1"))
+				.status,
+		).toBe(200);
+		expect(requests.map((request) => request.url)).toEqual([
+			`https://upstream.test/${ROUTE_ACCOUNT_ID}/v1/messages`,
+			`https://upstream.test/${ROUTE_ACCOUNT_ID}/v1/messages`,
+		]);
+	});
+
+	it("lets an earlier buffered root commit after a later body abort", async () => {
+		const harness = makeContext(makeRegistry());
+		const { requests } = installJsonUpstream();
+		const session = { "x-claude-code-session-id": "aborted-root-session" };
+		const encoder = new TextEncoder();
+		let markFirstRead!: () => void;
+		const firstReadStarted = new Promise<void>((resolve) => {
+			markFirstRead = resolve;
+		});
+		let releaseFirstBody!: () => void;
+		const firstBodyReleased = new Promise<void>((resolve) => {
+			releaseFirstBody = resolve;
+		});
+		const earlier = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: { "content-type": "application/json", ...session },
+			body: new ReadableStream<Uint8Array>({
+				async pull(controller) {
+					markFirstRead();
+					await firstBodyReleased;
+					controller.enqueue(
+						encoder.encode(
+							JSON.stringify({
+								model: PROFILE_MODEL,
+								messages: [{ role: "user", content: "hello" }],
+								max_tokens: 16,
+							}),
+						),
+					);
+					controller.close();
+				},
+			}),
+		});
+		const earlierResponse = handleProxy(
+			earlier,
+			new URL(earlier.url),
+			harness.ctx,
+			"key-1",
+		);
+		await firstReadStarted;
+
+		const aborted = new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			headers: { "content-type": "application/json", ...session },
+			body: new ReadableStream<Uint8Array>({
+				start(controller) {
+					controller.error(new Error("fixture body abort"));
+				},
+			}),
+		});
+		await expect(
+			handleProxy(aborted, new URL(aborted.url), harness.ctx, "key-1"),
+		).rejects.toThrow("fixture body abort");
+
+		releaseFirstBody();
+		expect((await earlierResponse).status).toBe(200);
+		const child = apiRequest("/v1/messages", CHILD_MODEL, {
+			...session,
+			"x-claude-code-agent-id": "child-after-aborted-root",
+		});
+		expect(
+			(await handleProxy(child, new URL(child.url), harness.ctx, "key-1"))
+				.status,
+		).toBe(200);
+		expect(requests.map((request) => request.url)).toEqual([
+			`https://upstream.test/${ROUTE_ACCOUNT_ID}/v1/messages`,
+			`https://upstream.test/${ROUTE_ACCOUNT_ID}/v1/messages`,
+		]);
 	});
 
 	it("forwards bounded profile output requests rematerialized at the 4k cap", async () => {
@@ -1269,7 +1490,7 @@ describe("Claude Code gateway model route profiles", () => {
 		expect(requests).toHaveLength(1);
 	});
 
-	it("rejects a picker injected into a native root and clears the prior pin", async () => {
+	it("keeps the prior pin when a picker injected into a native root is rejected", async () => {
 		const fallback = makeAccount("normal-route");
 		const harness = makeContext(makeRegistry(), {
 			accounts: [makeAccount(), fallback],
@@ -1319,7 +1540,7 @@ describe("Claude Code gateway model route profiles", () => {
 		).toBe(200);
 
 		expect(requests[1]?.url).toBe(
-			"https://upstream.test/normal-route/v1/messages",
+			`https://upstream.test/${ROUTE_ACCOUNT_ID}/v1/messages`,
 		);
 		expect((await fetchedJson(requests[1])).model).toBe(CHILD_MODEL);
 	});

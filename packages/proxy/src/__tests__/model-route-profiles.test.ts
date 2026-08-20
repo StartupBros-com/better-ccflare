@@ -207,7 +207,7 @@ describe("parseModelRouteProfiles", () => {
 			"high",
 			"xhigh",
 			"max",
-		]) {
+		] as const) {
 			const parsed = parseModelRouteProfiles(
 				JSON.stringify([
 					{
@@ -425,28 +425,39 @@ describe("ModelRouteSessionRegistry", () => {
 		expect(registry.size).toBe(0);
 	});
 
-	it("clears the binding when the same caller/session makes a native root request", () => {
+	it("keeps a native root provisional until its accepted route commits", () => {
 		const configured = profile();
 		const registry = new ModelRouteSessionRegistry([configured]);
-		resolveAndCommit(registry, {
+		const rootInput = {
 			callerIdentity: "caller",
-			requestModel: configured.publicModelId,
 			sessionId: "session",
 			isSubagent: false,
+		};
+		resolveAndCommit(registry, {
+			...rootInput,
+			requestModel: configured.publicModelId,
 		});
+		const nativeInput = { ...rootInput, requestModel: "claude-opus-5" };
+		const generation = registry.beginRootIntent(nativeInput);
+		const native = registry.resolve(nativeInput, generation);
+
 		expect(
 			resolveRequest(registry, {
-				callerIdentity: "caller",
-				requestModel: "claude-opus-5",
-				sessionId: "session",
-				isSubagent: false,
-			}),
-		).toEqual({ kind: "native" });
-		expect(
-			resolveRequest(registry, {
-				callerIdentity: "caller",
+				...rootInput,
 				requestModel: "claude-sonnet-4-5",
-				sessionId: "session",
+				isSubagent: true,
+			}),
+		).toMatchObject({
+			kind: "route",
+			source: "inherited",
+			profile: configured,
+		});
+
+		registry.commitNative(nativeInput, native, generation);
+		expect(
+			resolveRequest(registry, {
+				...rootInput,
+				requestModel: "claude-sonnet-4-5",
 				isSubagent: true,
 			}),
 		).toEqual({ kind: "native" });
@@ -476,10 +487,154 @@ describe("ModelRouteSessionRegistry", () => {
 			{ ...baseInput, requestModel: alternate.publicModelId },
 			newer,
 		);
+		expect(registry.cancelRootIntent(baseInput, 1)).toBe(false);
 		registry.commitExplicit(
 			{ ...baseInput, requestModel: configured.publicModelId },
 			older,
 		);
+
+		expect(
+			resolveRequest(registry, {
+				...baseInput,
+				requestModel: "claude-sonnet-4-5",
+				isSubagent: true,
+			}),
+		).toMatchObject({
+			kind: "route",
+			source: "inherited",
+			profile: alternate,
+		});
+	});
+
+	it("withdraws a rejected newer root reservation so an earlier valid root can commit", () => {
+		const configured = profile();
+		const alternate = alternateProfile();
+		const registry = new ModelRouteSessionRegistry([configured, alternate]);
+		const baseInput = {
+			callerIdentity: "caller",
+			sessionId: "withdraw-newer-root",
+			isSubagent: false,
+		};
+		const earlierInput = {
+			...baseInput,
+			requestModel: configured.publicModelId,
+		};
+		const rejectedLaterInput = {
+			...baseInput,
+			requestModel: alternate.publicModelId,
+		};
+		const earlierIntent = registry.beginRootIntent(earlierInput);
+		const rejectedLaterIntent = registry.beginRootIntent(rejectedLaterInput);
+
+		expect(
+			registry.cancelRootIntent(rejectedLaterInput, rejectedLaterIntent),
+		).toBe(true);
+		const earlier = registry.resolve(earlierInput, earlierIntent);
+		registry.commitExplicit(earlierInput, earlier);
+
+		expect(
+			resolveRequest(registry, {
+				...baseInput,
+				requestModel: "claude-sonnet-4-5",
+				isSubagent: true,
+			}),
+		).toMatchObject({
+			kind: "route",
+			source: "inherited",
+			profile: configured,
+		});
+	});
+
+	it("drops the oldest of three pending roots while preserving two-entry rollback", () => {
+		const configured = profile();
+		const alternate = alternateProfile();
+		const registry = new ModelRouteSessionRegistry([configured, alternate]);
+		const root = {
+			callerIdentity: "caller",
+			sessionId: "three-pending-roots",
+			isSubagent: false,
+		};
+		const firstInput = { ...root, requestModel: configured.publicModelId };
+		const secondInput = { ...root, requestModel: alternate.publicModelId };
+		const thirdInput = { ...root, requestModel: configured.publicModelId };
+		const first = registry.beginRootIntent(firstInput);
+		const second = registry.beginRootIntent(secondInput);
+		const third = registry.beginRootIntent(thirdInput);
+
+		expect(registry.cancelRootIntent(thirdInput, third)).toBe(true);
+		const staleFirst = registry.resolve(firstInput, first);
+		const survivingSecond = registry.resolve(secondInput, second);
+		registry.commitExplicit(firstInput, staleFirst);
+		registry.commitExplicit(secondInput, survivingSecond);
+
+		expect(
+			resolveRequest(registry, {
+				...root,
+				requestModel: "claude-sonnet-4-5",
+				isSubagent: true,
+			}),
+		).toMatchObject({
+			kind: "route",
+			source: "inherited",
+			profile: alternate,
+		});
+	});
+
+	it("prunes each pending root at its own TTL boundary", () => {
+		const configured = profile();
+		const alternate = alternateProfile();
+		const clock = makeClock();
+		const registry = new ModelRouteSessionRegistry([configured, alternate], {
+			ttlMs: 1_000,
+			now: clock.now,
+		});
+		const root = {
+			callerIdentity: "caller",
+			sessionId: "per-entry-intent-ttl",
+			isSubagent: false,
+		};
+		const expiredInput = { ...root, requestModel: configured.publicModelId };
+		const freshInput = { ...root, requestModel: alternate.publicModelId };
+		const expired = registry.beginRootIntent(expiredInput);
+		clock.advance(500);
+		const fresh = registry.beginRootIntent(freshInput);
+		clock.advance(500);
+
+		expect(registry.cancelRootIntent(freshInput, fresh)).toBe(true);
+		const staleExpired = registry.resolve(expiredInput, expired);
+		registry.commitExplicit(expiredInput, staleExpired);
+		expect(
+			resolveRequest(registry, {
+				...root,
+				requestModel: "claude-sonnet-4-5",
+				isSubagent: true,
+			}),
+		).toEqual({ kind: "native" });
+	});
+
+	it("only cancels the current reservation and cannot revive an older root", () => {
+		const configured = profile();
+		const alternate = alternateProfile();
+		const registry = new ModelRouteSessionRegistry([configured, alternate]);
+		const baseInput = {
+			callerIdentity: "caller",
+			sessionId: "do-not-revive-older-root",
+			isSubagent: false,
+		};
+		const earlierInput = {
+			...baseInput,
+			requestModel: configured.publicModelId,
+		};
+		const laterInput = {
+			...baseInput,
+			requestModel: alternate.publicModelId,
+		};
+		const earlierIntent = registry.beginRootIntent(earlierInput);
+		const laterIntent = registry.beginRootIntent(laterInput);
+
+		expect(registry.cancelRootIntent(earlierInput, earlierIntent)).toBe(false);
+		const later = registry.resolve(laterInput, laterIntent);
+		registry.commitExplicit(laterInput, later);
 
 		expect(
 			resolveRequest(registry, {
@@ -512,12 +667,15 @@ describe("ModelRouteSessionRegistry", () => {
 			requestModel: alternate.publicModelId,
 		});
 		expect(pending).toMatchObject({ generation: 2 });
-		expect(
-			resolveRequest(registry, {
-				...baseInput,
-				requestModel: "claude-opus-5",
-			}),
-		).toEqual({ kind: "native" });
+		const nativeInput = {
+			...baseInput,
+			requestModel: "claude-opus-5",
+		};
+		const nativeGeneration = registry.beginRootIntent(nativeInput);
+		const native = registry.resolve(nativeInput, nativeGeneration);
+		expect(native).toEqual({ kind: "native" });
+		registry.commitNative(nativeInput, native, nativeGeneration);
+		expect(registry.cancelRootIntent(baseInput, 2)).toBe(false);
 
 		registry.commitExplicit(
 			{ ...baseInput, requestModel: alternate.publicModelId },

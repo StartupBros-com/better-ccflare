@@ -359,7 +359,13 @@ describe("proxy pre-transport recovery", () => {
 			"x-claude-code-session-id",
 			"pre-transport-server-tool-session",
 		);
-		const sourceBodyRead = spyOn(request, "arrayBuffer");
+		// Bounded admission consumes the client body through one reader rather
+		// than Request.arrayBuffer(); the invariant under test is still that the
+		// source body is read exactly once.
+		const sourceBodyRead = spyOn(
+			request.body as ReadableStream<Uint8Array>,
+			"getReader",
+		);
 		const response = await handleProxy(request, new URL(request.url), ctx);
 
 		expect(response.status).toBe(200);
@@ -441,7 +447,10 @@ describe("proxy pre-transport recovery", () => {
 				],
 			},
 		});
-		const sourceBodyRead = spyOn(request, "arrayBuffer");
+		const sourceBodyRead = spyOn(
+			request.body as ReadableStream<Uint8Array>,
+			"getReader",
+		);
 		const response = await handleProxy(request, new URL(request.url), ctx);
 
 		expect(response.status).toBe(200);

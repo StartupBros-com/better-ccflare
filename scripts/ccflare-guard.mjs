@@ -28,13 +28,17 @@ export const DEFAULT_GUARD_MAX_RECOVERY_SLEEP_MS = 120_000;
 export const MAX_GUARD_RECOVERY_SILENCE_MS = 120_000;
 export const DEFAULT_GUARD_RETRY_JITTER_MS = 2_000;
 export const DEFAULT_GUARD_MAX_INSPECTION_BYTES = 64 * 1_024;
-// Keep request-body retention aligned with the proxy's 4 MiB payload cap while
-// allowing operators to lower it for a smaller admission footprint. The hard
-// ceiling prevents an environment override from reintroducing an effectively
-// unbounded per-request allocation.
-export const DEFAULT_GUARD_MAX_REQUEST_BODY_BYTES = 4 * 1024 * 1024;
+// Keep request-body retention bounded even while allowing the proxy's 32 MiB
+// payload limit. Aggregate reservations are configured separately so body-reader
+// concurrency cannot turn that per-request cap into unbounded process memory.
+export const DEFAULT_GUARD_MAX_REQUEST_BODY_BYTES = 32 * 1024 * 1024;
 export const MIN_GUARD_REQUEST_BODY_BYTES = 1 * 1024;
-export const MAX_GUARD_REQUEST_BODY_BYTES = 16 * 1024 * 1024;
+export const MAX_GUARD_REQUEST_BODY_BYTES =
+	DEFAULT_GUARD_MAX_REQUEST_BODY_BYTES;
+export const DEFAULT_GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES = 256 * 1024 * 1024;
+export const MIN_GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES = 1 * 1024;
+export const MAX_GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES =
+	DEFAULT_GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES;
 export const DEFAULT_GUARD_REQUEST_DRAIN_TIMEOUT_MS = 10_000;
 export const MIN_GUARD_REQUEST_DRAIN_TIMEOUT_MS = 1_000;
 export const MAX_GUARD_REQUEST_DRAIN_TIMEOUT_MS = 60_000;
@@ -65,6 +69,7 @@ const MAX_GUARD_ATTEMPT_ORDINAL = 1_000_000;
 const CANONICAL_UUID_V4_PATTERN =
 	/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const CANONICAL_32_BYTE_BASE64URL = /^[A-Za-z0-9_-]{43}$/;
+const EMPTY_REQUEST_BODY = Buffer.alloc(0);
 
 // Bound the only response-content state retained by the guard. The observer
 // never logs event data (which can include provider or user content); it emits
@@ -329,16 +334,48 @@ function createGuardCorrelationSigner(encodedSecret) {
 
 function parseDeclaredContentLength(req) {
 	const raw = req.headers?.["content-length"];
-	if (Array.isArray(raw)) return null;
+	const transferEncoding = req.headers?.["transfer-encoding"];
+	if (
+		Array.isArray(raw) ||
+		Array.isArray(transferEncoding) ||
+		(typeof transferEncoding === "string" &&
+			transferEncoding
+				.toLowerCase()
+				.split(",")
+				.map((value) => value.trim())
+				.includes("chunked"))
+	) {
+		return null;
+	}
 	if (typeof raw !== "string" || !/^\s*\d+\s*$/.test(raw)) return null;
 	try {
-		const parsed = BigInt(raw.trim());
-		return parsed > BigInt(Number.MAX_SAFE_INTEGER)
-			? Number.MAX_SAFE_INTEGER
-			: Number(parsed);
+		return BigInt(raw.trim());
 	} catch {
 		return null;
 	}
+}
+
+function classifyRequestBody(req, maxRequestBodyBytes) {
+	const declaredLength = parseDeclaredContentLength(req);
+	if (
+		declaredLength != null &&
+		declaredLength > BigInt(maxRequestBodyBytes)
+	) {
+		return {
+			declaredBytes: maxRequestBodyBytes + 1,
+			declaredLength,
+			reservationBytes: 0,
+			oversized: true,
+		};
+	}
+	return {
+		declaredLength,
+		reservationBytes:
+			declaredLength === 0n
+				? 0
+				: 2 * Number(declaredLength ?? BigInt(maxRequestBodyBytes)),
+		oversized: false,
+	};
 }
 
 function drainRequest(
@@ -400,21 +437,23 @@ async function readBody(
 	maxBytes = DEFAULT_GUARD_MAX_REQUEST_BODY_BYTES,
 	drainTimeoutMs = DEFAULT_GUARD_REQUEST_DRAIN_TIMEOUT_MS,
 	onDrainTimeout,
+	declaredLength = parseDeclaredContentLength(req),
 ) {
-	const declaredLength = parseDeclaredContentLength(req);
 	if (signal?.aborted) {
 		drainRequest(req, drainTimeoutMs, onDrainTimeout);
 		throw signal.reason || abortError();
 	}
-	if (declaredLength != null && declaredLength > maxBytes) {
+	if (declaredLength != null && declaredLength > BigInt(maxBytes)) {
 		drainRequest(req, drainTimeoutMs, onDrainTimeout);
 		throw requestBodyTooLargeError(maxBytes, {
-			declaredBytes: Math.min(maxBytes + 1, declaredLength),
+			declaredBytes: maxBytes + 1,
 		});
 	}
 
 	return new Promise((resolve, reject) => {
-		const chunks = [];
+		const allocationBytes = Number(declaredLength ?? BigInt(maxBytes));
+		const destination =
+			allocationBytes === 0 ? null : Buffer.allocUnsafe(allocationBytes);
 		let totalBytes = 0;
 		let settled = false;
 		const cleanup = () => {
@@ -436,7 +475,10 @@ async function readBody(
 				return;
 			}
 			const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-			const remainingBytes = maxBytes - totalBytes;
+			const remainingBytes = Math.min(
+				maxBytes - totalBytes,
+				allocationBytes - totalBytes,
+			);
 			if (buffer.byteLength > remainingBytes) {
 				totalBytes = maxBytes;
 				const error = requestBodyTooLargeError(maxBytes);
@@ -444,11 +486,17 @@ async function readBody(
 				finish(() => reject(error));
 				return;
 			}
-			if (buffer.byteLength > 0) chunks.push(buffer);
+			if (buffer.byteLength > 0) destination.set(buffer, totalBytes);
 			totalBytes += buffer.byteLength;
 		};
 		const onEnd = () =>
-			finish(() => resolve(Buffer.concat(chunks, totalBytes)));
+			finish(() =>
+				resolve(
+					destination === null
+						? EMPTY_REQUEST_BODY
+						: destination.subarray(0, totalBytes),
+				),
+			);
 		const onError = (error) => finish(() => reject(error));
 		const onAbort = () => {
 			// Keep the connection usable long enough to return a finite deadline
@@ -1291,6 +1339,21 @@ export function createGuard(options = {}) {
 			max: MAX_GUARD_REQUEST_BODY_BYTES,
 		},
 	);
+	const maxBufferedRequestBodyBytes = configuredBoundedInteger(
+		options.maxBufferedRequestBodyBytes ??
+			env.GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES,
+		DEFAULT_GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES,
+		{
+			name: "GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES",
+			min: MIN_GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES,
+			max: MAX_GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES,
+		},
+	);
+	if (maxBufferedRequestBodyBytes < 2 * maxRequestBodyBytes) {
+		throw new RangeError(
+			"GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES must be at least twice GUARD_MAX_REQUEST_BODY_BYTES",
+		);
+	}
 	const requestDrainTimeoutMs = configuredBoundedInteger(
 		options.requestDrainTimeoutMs ?? env.GUARD_REQUEST_DRAIN_TIMEOUT_MS,
 		DEFAULT_GUARD_REQUEST_DRAIN_TIMEOUT_MS,
@@ -1371,6 +1434,7 @@ export function createGuard(options = {}) {
 		bodyReaderQueued: 0,
 		bodyReaderQueueAborted: 0,
 		bodyReaderQueueFull: 0,
+		bodyReaderBudgetBlocked: 0,
 		responseBodyIdleTimeouts: 0,
 		drainingRejected: 0,
 		// R21: per-outcome counts for terminal upstream-driven responses logged
@@ -1381,6 +1445,8 @@ export function createGuard(options = {}) {
 	let active = 0;
 	let bodyReadersActive = 0;
 	let peakBodyReaders = 0;
+	let reservedBodyReaderBytes = 0;
+	let peakReservedBodyReaderBytes = 0;
 	let activeRecoveryWaits = 0;
 	let peakRecoveryWaits = 0;
 	let draining = false;
@@ -1443,9 +1509,14 @@ export function createGuard(options = {}) {
 		}
 	}
 
-	function grantBodyReaderLease(queuedMs) {
+	function grantBodyReaderLease(queuedMs, reservationBytes) {
 		bodyReadersActive += 1;
+		reservedBodyReaderBytes += reservationBytes;
 		peakBodyReaders = Math.max(peakBodyReaders, bodyReadersActive);
+		peakReservedBodyReaderBytes = Math.max(
+			peakReservedBodyReaderBytes,
+			reservedBodyReaderBytes,
+		);
 		let released = false;
 		return {
 			queuedMs,
@@ -1453,30 +1524,48 @@ export function createGuard(options = {}) {
 				if (released) return;
 				released = true;
 				bodyReadersActive = Math.max(0, bodyReadersActive - 1);
+				reservedBodyReaderBytes = Math.max(
+					0,
+					reservedBodyReaderBytes - reservationBytes,
+				);
 				drainBodyReaderQueue();
 			},
 		};
 	}
 
-	function drainBodyReaderQueue() {
-		while (
+	function canAcquireBodyReader(reservationBytes) {
+		return (
 			bodyReadersActive < maxBodyReaders &&
-			bodyReaderQueue.length > 0
-		) {
-			const next = bodyReaderQueue.shift();
-			if (!next || next.settled) continue;
+			reservationBytes <= maxBufferedRequestBodyBytes - reservedBodyReaderBytes
+		);
+	}
+
+	function drainBodyReaderQueue() {
+		while (bodyReaderQueue.length > 0) {
+			const next = bodyReaderQueue[0];
+			if (!next || next.settled) {
+				bodyReaderQueue.shift();
+				continue;
+			}
+			if (!canAcquireBodyReader(next.reservationBytes)) {
+				if (bodyReadersActive < maxBodyReaders) {
+					counters.bodyReaderBudgetBlocked += 1;
+				}
+				return;
+			}
+			bodyReaderQueue.shift();
 			next.settled = true;
 			next.signal?.removeEventListener("abort", next.abort);
-			next.resolve(grantBodyReaderLease(now() - next.enqueuedAt));
+			next.resolve(
+				grantBodyReaderLease(now() - next.enqueuedAt, next.reservationBytes),
+			);
 		}
 	}
 
-	function acquireBodyReader(id, signal) {
-		if (signal?.aborted) {
-			return Promise.reject(signal.reason || abortError());
-		}
-		if (bodyReadersActive < maxBodyReaders && bodyReaderQueue.length === 0) {
-			return Promise.resolve(grantBodyReaderLease(0));
+	function acquireBodyReader(id, signal, reservationBytes) {
+		if (signal?.aborted) return Promise.reject(signal.reason || abortError());
+		if (bodyReaderQueue.length === 0 && canAcquireBodyReader(reservationBytes)) {
+			return Promise.resolve(grantBodyReaderLease(0, reservationBytes));
 		}
 		if (bodyReaderQueue.length >= maxQueue) {
 			counters.bodyReaderQueueFull += 1;
@@ -1484,13 +1573,13 @@ export function createGuard(options = {}) {
 			error.code = "GUARD_BODY_READER_QUEUE_FULL";
 			return Promise.reject(error);
 		}
-
 		const enqueuedAt = now();
 		counters.bodyReaderQueued += 1;
 		return new Promise((resolve, reject) => {
 			const entry = {
 				id,
 				enqueuedAt,
+				reservationBytes,
 				resolve,
 				reject,
 				signal,
@@ -1503,6 +1592,7 @@ export function createGuard(options = {}) {
 				const index = bodyReaderQueue.indexOf(entry);
 				if (index !== -1) bodyReaderQueue.splice(index, 1);
 				counters.bodyReaderQueueAborted += 1;
+				drainBodyReaderQueue();
 				reject(signal?.reason || abortError());
 			};
 			entry.abort = abort;
@@ -1514,6 +1604,7 @@ export function createGuard(options = {}) {
 				signal.addEventListener("abort", abort, { once: true });
 			}
 			bodyReaderQueue.push(entry);
+			drainBodyReaderQueue();
 		});
 	}
 
@@ -2535,6 +2626,7 @@ export function createGuard(options = {}) {
 					jitterMs,
 					maxInspectionBytes,
 					maxRequestBodyBytes,
+					maxBufferedRequestBodyBytes,
 					requestDrainTimeoutMs,
 					responseIdleTimeoutMs,
 					delayInspectionTimeoutMs,
@@ -2552,6 +2644,7 @@ export function createGuard(options = {}) {
 							jitterMs,
 							maxInspectionBytes,
 							maxRequestBodyBytes,
+							maxBufferedRequestBodyBytes,
 							requestDrainTimeoutMs,
 							responseIdleTimeoutMs,
 							delayInspectionTimeoutMs,
@@ -2569,6 +2662,9 @@ export function createGuard(options = {}) {
 					bodyReaders: {
 						configured: maxBodyReaders,
 						queueLimit: maxQueue,
+						reservationLimitBytes: maxBufferedRequestBodyBytes,
+						reservedBytes: reservedBodyReaderBytes,
+						reservedBytesPeak: peakReservedBodyReaderBytes,
 						current: bodyReadersActive,
 						queued: bodyReaderQueue.length,
 						peak: peakBodyReaders,
@@ -2633,12 +2729,37 @@ export function createGuard(options = {}) {
 			admissionLease = null;
 		}
 
+		// Classify before attaching body listeners. Declared oversize retains the
+		// admission decision above but never receives a body-reader reservation.
+		const bodyPlan = classifyRequestBody(req, maxRequestBodyBytes);
+		if (bodyPlan.oversized) {
+			drainRequestForContext(req, context);
+			counters.oversizedRequestBodies += 1;
+			log("guard_request_body_too_large", {
+				id: context.id,
+				maxRequestBodyBytes,
+				declaredBytes: bodyPlan.declaredBytes,
+				receivedBytes: maxRequestBodyBytes + 1,
+				elapsedMs: now() - context.acceptedAt,
+			});
+			sendJsonError(
+				res,
+				context,
+				413,
+				"guard_request_body_too_large",
+				"request body exceeds the local guard limit",
+			);
+			context.dispose();
+			return;
+		}
+
 		let body;
 		let bodyReadStarted = false;
 		try {
 			bodyReaderLease = await acquireBodyReader(
 				context.id,
 				context.signal,
+				bodyPlan.reservationBytes,
 			);
 			bodyReadStarted = true;
 			body = await readBody(
@@ -2650,6 +2771,7 @@ export function createGuard(options = {}) {
 					Math.max(1, context.remainingMs()),
 				),
 				() => onRequestDrainTimeout(context),
+				bodyPlan.declaredLength,
 			);
 		} catch (error) {
 			admissionLease?.release();
@@ -2691,9 +2813,10 @@ export function createGuard(options = {}) {
 
 		try {
 			if (limited) {
-				// Keep the bounded body-reader lease while the completed body waits
-				// for its physical upstream permit. This caps retained body buffers
-				// independently from the upstream attempt queue.
+				// Retain the weighted reservation through every upstream attempt and
+				// final response delivery. The body remains reachable for retry and
+				// forwarding until the selected handler returns; the outer finally
+				// releases it exactly once after that lifecycle ends.
 				try {
 					admissionLease = await acquire(context.id, context.signal);
 				} catch (error) {
@@ -2714,12 +2837,8 @@ export function createGuard(options = {}) {
 				}
 				const lease = admissionLease;
 				admissionLease = null;
-				bodyReaderLease?.release();
-				bodyReaderLease = null;
 				await handleLimited(req, res, body, context, upstreamTarget, lease);
 			} else {
-				bodyReaderLease?.release();
-				bodyReaderLease = null;
 				await handlePassthrough(req, res, body, context, upstreamTarget);
 			}
 		} finally {
@@ -2760,6 +2879,7 @@ export function createGuard(options = {}) {
 					maxRecoverySleepMs,
 					maxInspectionBytes,
 					maxRequestBodyBytes,
+					maxBufferedRequestBodyBytes,
 					requestDrainTimeoutMs,
 					responseIdleTimeoutMs,
 					delayInspectionTimeoutMs,
@@ -2811,6 +2931,9 @@ export function createGuard(options = {}) {
 				return {
 					configured: maxBodyReaders,
 					queueLimit: maxQueue,
+					reservationLimitBytes: maxBufferedRequestBodyBytes,
+					reservedBytes: reservedBodyReaderBytes,
+					reservedBytesPeak: peakReservedBodyReaderBytes,
 					active: bodyReadersActive,
 					queued: bodyReaderQueue.length,
 					peak: peakBodyReaders,

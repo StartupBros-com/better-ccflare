@@ -30,10 +30,11 @@ ExecStartPre=/opt/better-ccflare/scripts/preflight-env.sh
 # --smol enables aggressive GC (the correct way to reduce memory usage)
 ExecStart=/usr/bin/better-ccflare --smol --serve --port 8889
 
-# --- Resource limits ---
-MemoryMax=3G
-MemoryHigh=2G
-CPUQuota=200%
+# --- Optional resource-limit hardening example ---
+# Uncomment only after measuring this deployment under its expected load.
+# MemoryMax=3G
+# MemoryHigh=2G
+# CPUQuota=200%
 
 # --- Restart policy ---
 Restart=on-failure
@@ -55,6 +56,29 @@ SyslogIdentifier=better-ccflare
 [Install]
 WantedBy=multi-user.target
 ```
+
+## Managed Request-Body Policies
+
+The production `ccflare-stack.service` deployment renders its build pin at `/etc/systemd/system/ccflare-stack.service.d/50-pinned-build.conf`. It pins the Node front guard and Bun proxy separately:
+
+```ini
+Environment=GUARD_MAX_REQUEST_BODY_BYTES=33554432
+Environment=GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES=268435456
+Environment=CCFLARE_MAX_BUFFERED_REQUEST_BODY_BYTES=1073741824
+Environment=CCFLARE_MAX_BODY_ADMISSION_QUEUE=500
+```
+
+`GUARD_MAX_REQUEST_BODY_BYTES` is the 32 MiB request wire limit. `GUARD_MAX_BUFFERED_REQUEST_BODY_BYTES` is the Node guard's 256 MiB **encoded-buffer** reservation budget; it must be no greater than 256 MiB and at least twice the wire limit. At the defaults it admits four worst-case 32 MiB bodies because each reserves 64 MiB. The managed pin intentionally does **not** set `GUARD_MAX_BODY_READERS`: reader cardinality is independent of weighted byte reservations, so an operator override/default remains effective.
+
+A valid guard `Content-Length` reserves twice its declared number of bytes before buffering. Missing, chunked, invalid, or misleading length reserves twice the full 32 MiB limit. Guard reader admission is FIFO, and the independent `GUARD_MAX_BODY_READERS` limit caps active readers.
+
+`CCFLARE_MAX_BUFFERED_REQUEST_BODY_BYTES` is a separate **Bun-process weighted-work** admission budget, valid from 256 MiB through 1 GiB; the managed pin sets it to **1 GiB** (`1073741824`). `CCFLARE_MAX_BODY_ADMISSION_QUEUE` controls its FIFO queue, valid from 0 through 5000. Bun reserves 8× a canonical unencoded/`identity` `Content-Length` (zero reserves zero), up to the 32 MiB request limit. Missing, chunked, malformed, over-limit, compressed, and unknown-encoding metadata — and any handler that must hold the full worst case, such as the OpenAI Responses routes during translation — instead reserve the worst case, `8 × 32 MiB = 256 MiB`, capped at the configured budget rather than the budget's entirety. At the managed 1 GiB pin that combination admits four concurrent worst-case requests before a fifth queues, and roughly 5.3 MiB bodies at 24-way concurrency. This 8× value is conservative admission weighting bounding weighted admitted work, not an exact heap or RSS measurement; downstream readers remain the exact size authority. The Node guard and Bun controller are independent process budgets—there is no bypass header or circular lock.
+
+Bun rejects queue-full body requests locally with `503` and `Retry-After: 1` before proxy/provider work. It removes aborted queued requests, and a restart clears active leases and queue state. Its response lifetime can outlast handler return, so a reservation releases only when the response body closes, errors, or cancels (or shutdown aborts it).
+
+`deploy-ccflare.sh` validates the rendered pin and, after `systemctl daemon-reload`, validates the **effective merged** `Environment` from systemd. A later operator drop-in can override the values, but missing, partial, non-integer, out-of-range, or incompatible effective values restore the prior managed pin and prevent the service restart. Legacy rollback accepts an older pin only when both Bun admission variables are absent.
+
+After a restart, inspect `GET /_guard/health` and `GET /health` on naturally arriving authorized traffic; do not generate synthetic traffic against Anthropic-backed accounts. Guard root and `runtime.limits` must both report `maxRequestBodyBytes` and `maxBufferedRequestBodyBytes`. Root `bodyReaders.reservationLimitBytes`, `reservedBytes`, and `reservedBytesPeak` show the guard aggregate budget, current reservation, and high-water mark. Bun's `runtime.bodyAdmission` reports aggregate configuration, current/peak reservations, active/queued counts, and counters only; it never includes body data, paths, accounts, sessions, or request IDs. The OpenAI Responses endpoint also applies the 32 MiB limit separately to encoded and decoded `gzip`, `deflate`, and `zstd` request bodies.
 
 ## Memory Management
 
@@ -120,12 +144,14 @@ exec bun run better-ccflare --smol --serve
 
 ### Memory
 
+The live managed `ccflare-stack.service` deployment does **not** currently set `MemoryMax` or `MemoryHigh`. The following is recommended systemd hardening for operators who have measured their own process envelope; it is not a statement of the live deployment configuration:
+
 ```ini
 MemoryMax=3G      # Hard kill if exceeded (OOM)
 MemoryHigh=2G     # Kernel applies memory pressure, reclaims pages
 ```
 
-Set `MemoryMax` above what the process actually needs. `MemoryHigh` applies back-pressure before the hard limit. Combined with `--smol`, this keeps better-ccflare within predictable bounds.
+Set `MemoryMax` above what the process actually needs. `MemoryHigh` applies back-pressure before the hard limit. Combined with `--smol`, this can keep a measured deployment within predictable bounds.
 
 ### CPU
 

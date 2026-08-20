@@ -1,4 +1,12 @@
 import crypto from "node:crypto";
+import { constants as zlibConstants, zstdDecompressSync } from "node:zlib";
+import {
+	BoundedJsonTooLargeError,
+	MAX_REQUEST_BODY_BYTES,
+	RequestBodyTooLargeError,
+	readBoundedRequestBody,
+	serializeBoundedJson,
+} from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import {
 	RECOVERY_SCOPE_HEADER,
@@ -17,6 +25,85 @@ const SESSION_UUID_RE =
 	/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const RESPONSES_SESSION_ID_DOMAIN =
 	"better-ccflare:responses-session-identity:v1\0";
+interface ResponsesHandlerOptions {
+	/** Internal test seam; production always uses the canonical request limit. */
+	requestBodyLimit?: number;
+	/** Called after decoding and bounded translation, before proxy work begins. */
+	onBodySizeKnown?: (bytes: number) => void | Promise<void>;
+}
+
+function openAiRequestError(status: 400 | 413, message: string): Response {
+	return new Response(
+		JSON.stringify({
+			type: "error",
+			error: { type: "invalid_request_error", message },
+		}),
+		{ status, headers: { "Content-Type": "application/json" } },
+	);
+}
+
+async function decompressWithRuntimeStream(
+	encodedBody: ArrayBuffer,
+	format: "gzip" | "deflate",
+	limit: number,
+	signal?: AbortSignal,
+): Promise<ArrayBuffer> {
+	const compressedStream = new Response(encodedBody).body;
+	if (!compressedStream) return new ArrayBuffer(0);
+	const decodedBody = await readBoundedRequestBody(
+		{
+			body: compressedStream.pipeThrough(new DecompressionStream(format)),
+			headers: new Headers(),
+			signal,
+		},
+		limit,
+	);
+	return decodedBody ?? new ArrayBuffer(0);
+}
+
+function zstdWindowLogMax(limit: number): number {
+	// Zstd windows are powers of two. The decoder accepts at least a 1 KiB
+	// window, while the production admission ceiling remains 32 MiB (log 25).
+	const minimumWindowLog = 10;
+	const maximumWindowLog = 31;
+	const boundedLimit = Math.max(1, Math.floor(limit));
+	return Math.min(
+		maximumWindowLog,
+		Math.max(minimumWindowLog, Math.ceil(Math.log2(boundedLimit))),
+	);
+}
+
+function isZstdTooLargeError(error: unknown): boolean {
+	return (
+		typeof error === "object" &&
+		error !== null &&
+		((error as { code?: unknown }).code ===
+			"ZSTD_error_frameParameter_windowTooLarge" ||
+			(error as { code?: unknown }).code === "ERR_BUFFER_TOO_LARGE")
+	);
+}
+
+function decompressZstdBounded(
+	encodedBody: ArrayBuffer,
+	limit: number,
+): ArrayBuffer {
+	try {
+		const decoded = zstdDecompressSync(new Uint8Array(encodedBody), {
+			maxOutputLength: limit,
+			params: {
+				[zlibConstants.ZSTD_d_windowLogMax]: zstdWindowLogMax(limit),
+			},
+		});
+		const copy = new Uint8Array(decoded.byteLength);
+		copy.set(decoded);
+		return copy.buffer;
+	} catch (error) {
+		if (isZstdTooLargeError(error)) {
+			throw new RequestBodyTooLargeError("streamed", limit);
+		}
+		throw error;
+	}
+}
 
 function validSessionMetadataUserId(value: unknown): string | undefined {
 	if (typeof value !== "string" || value.length === 0) return undefined;
@@ -72,57 +159,64 @@ export async function handleResponsesRequest(
 	ctx: unknown,
 	apiKeyId?: string | null,
 	apiKeyName?: string | null,
+	options?: ResponsesHandlerOptions,
 ): Promise<Response> {
-	// 1. Parse body — Codex CLI compresses request bodies (zstd, gzip, deflate).
-	// Bun decompresses response bodies automatically but not request bodies,
-	// so we decompress manually when content-encoding is present.
-	let rawBody = await req.arrayBuffer();
-	const contentEncoding = req.headers.get("content-encoding")?.toLowerCase();
-	if (contentEncoding) {
-		try {
-			const bytes = new Uint8Array(rawBody);
-			let decompressed: Uint8Array;
-			if (contentEncoding === "zstd") {
-				decompressed = Bun.zstdDecompressSync(bytes);
-			} else if (contentEncoding === "gzip") {
-				decompressed = Bun.gunzipSync(bytes);
-			} else if (contentEncoding === "deflate") {
-				decompressed = Bun.inflateSync(bytes);
-			} else {
-				log.warn(`Unsupported content-encoding: ${contentEncoding}`);
-				decompressed = bytes;
-			}
-			rawBody = decompressed.buffer as ArrayBuffer;
-		} catch (e) {
-			log.warn(`Failed to decompress ${contentEncoding} request body: ${e}`);
+	const requestBodyLimit = options?.requestBodyLimit ?? MAX_REQUEST_BODY_BYTES;
+	// 1. Read encoded bytes before parsing. Codex CLI may use zstd, gzip, or
+	// deflate; unsupported encodings deliberately retain the historical identity
+	// parse behavior.
+	let rawBody: ArrayBuffer | null;
+	try {
+		rawBody = await readBoundedRequestBody(req, requestBodyLimit);
+	} catch (error) {
+		if (error instanceof RequestBodyTooLargeError) {
+			return openAiRequestError(413, "Request body too large");
 		}
+		throw error;
+	}
+
+	const contentEncoding = req.headers.get("content-encoding")?.toLowerCase();
+	if (
+		contentEncoding === "gzip" ||
+		contentEncoding === "deflate" ||
+		contentEncoding === "zstd"
+	) {
+		try {
+			const encodedBody = rawBody ?? new ArrayBuffer(0);
+			rawBody =
+				contentEncoding === "zstd"
+					? decompressZstdBounded(encodedBody, requestBodyLimit)
+					: await decompressWithRuntimeStream(
+							encodedBody,
+							contentEncoding,
+							requestBodyLimit,
+							req.signal,
+						);
+		} catch (error) {
+			if (error instanceof RequestBodyTooLargeError) {
+				return openAiRequestError(413, "Request body too large");
+			}
+			log.warn(
+				`Failed to decompress ${contentEncoding} request body: ${error}`,
+			);
+			return openAiRequestError(400, "Invalid request body");
+		}
+	} else if (contentEncoding) {
+		log.warn(`Unsupported content-encoding: ${contentEncoding}`);
 	}
 
 	let body: ResponsesRequest;
 	try {
-		body = JSON.parse(new TextDecoder().decode(rawBody)) as ResponsesRequest;
+		body = JSON.parse(
+			new TextDecoder().decode(rawBody ?? undefined),
+		) as ResponsesRequest;
 	} catch {
-		return new Response(
-			JSON.stringify({
-				type: "error",
-				error: { type: "invalid_request_error", message: "Invalid JSON body" },
-			}),
-			{ status: 400, headers: { "Content-Type": "application/json" } },
-		);
+		return openAiRequestError(400, "Invalid JSON body");
 	}
 
 	// 2. Validate & normalise `input` — OpenAI Responses API allows a plain string
 	if (!body || (typeof body.input !== "string" && !Array.isArray(body.input))) {
-		return new Response(
-			JSON.stringify({
-				type: "error",
-				error: {
-					type: "invalid_request_error",
-					message: "input: Field required",
-				},
-			}),
-			{ status: 400, headers: { "Content-Type": "application/json" } },
-		);
+		return openAiRequestError(400, "input: Field required");
 	}
 	if (typeof body.input === "string") {
 		body = {
@@ -175,7 +269,29 @@ export async function handleResponsesRequest(
 		}
 	}
 
-	// 5. Build synthetic request targeting /v1/messages
+	// 5. Keep translated request serialization within the same canonical budget.
+	// The shared serializer proves the serialized body fits before materializing it.
+	let syntheticBody: string;
+	try {
+		syntheticBody = serializeBoundedJson(anthropicBody, requestBodyLimit);
+	} catch (error) {
+		if (error instanceof BoundedJsonTooLargeError) {
+			return openAiRequestError(413, "Request body too large");
+		}
+		log.warn("Failed to serialize translated Responses request body");
+		return openAiRequestError(400, "Invalid translated request body");
+	}
+
+	// The decoded and translated forms are now both bounded. Report the larger
+	// retained representation before proxy work can begin.
+	await options?.onBodySizeKnown?.(
+		Math.max(
+			rawBody?.byteLength ?? 0,
+			Buffer.byteLength(syntheticBody, "utf8"),
+		),
+	);
+
+	// 6. Build synthetic request targeting /v1/messages
 	const messagesUrl = new URL(url.toString());
 	messagesUrl.pathname = "/v1/messages";
 	const syntheticHeaders = new Headers(req.headers);
@@ -197,7 +313,7 @@ export async function handleResponsesRequest(
 	const syntheticReq = new Request(messagesUrl.toString(), {
 		method: "POST",
 		headers: syntheticHeaders,
-		body: JSON.stringify(anthropicBody),
+		body: syntheticBody,
 		// Keep the client's disconnect wired to the upstream call: this request
 		// is built from a URL, which does not inherit the signal.
 		signal: req.signal,

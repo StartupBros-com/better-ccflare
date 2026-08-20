@@ -88,6 +88,24 @@ export interface APIContext {
 	/** Fixed aggregate-only, restart-scoped degraded-mode health snapshot. */
 	getAnthropicDegradedHealth?: () => AnthropicDegradedRuntimeHealth;
 	getRetentionStatus?: () => RetentionStatus;
+	/** Aggregate-only process-local Bun request-body admission telemetry. */
+	getBodyAdmissionHealth?: () => {
+		enabled: boolean;
+		budgetBytes: number;
+		reservedBytes: number;
+		activeLeases: number;
+		queuedRequests: number;
+		queueLimit: number;
+		peakReservedBytes: number;
+		peakActiveLeases: number;
+		counters: {
+			admitted: number;
+			queued: number;
+			queueFull: number;
+			queueAborted: number;
+			released: number;
+		};
+	};
 	getStrategy?: () => LoadBalancingStrategy | null;
 	/**
 	 * Live circuit breaker exposed by the proxy path. Optional so older
