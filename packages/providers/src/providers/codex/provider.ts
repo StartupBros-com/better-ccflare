@@ -104,6 +104,9 @@ const INTERNAL_HEADERS = [
 	"x-better-ccflare-pacing-canary",
 	"x-better-ccflare-pacing-cohort-id",
 	"x-better-ccflare-pacing-action",
+	"x-better-ccflare-pacing-role",
+	"x-better-ccflare-pacing-wait-ms",
+	"x-better-ccflare-pacing-release-reason",
 	"x-better-ccflare-codex-conversation-id",
 ];
 
@@ -1597,6 +1600,11 @@ export class CodexProvider extends BaseProvider {
 					"x-better-ccflare-pacing-cohort-id",
 				),
 				pacingAction: request.headers.get("x-better-ccflare-pacing-action"),
+				pacingRole: request.headers.get("x-better-ccflare-pacing-role"),
+				pacingWaitMs: request.headers.get("x-better-ccflare-pacing-wait-ms"),
+				pacingReleaseReason: request.headers.get(
+					"x-better-ccflare-pacing-release-reason",
+				),
 				turnStateArm: turnStateDecision.arm,
 				turnStateCohortId: turnStateDecision.cohortId,
 				turnStateRequestAction: turnStateDecision.action,
@@ -1643,6 +1651,9 @@ export class CodexProvider extends BaseProvider {
 			newHeaders.delete("x-better-ccflare-pacing-canary");
 			newHeaders.delete("x-better-ccflare-pacing-cohort-id");
 			newHeaders.delete("x-better-ccflare-pacing-action");
+			newHeaders.delete("x-better-ccflare-pacing-role");
+			newHeaders.delete("x-better-ccflare-pacing-wait-ms");
+			newHeaders.delete("x-better-ccflare-pacing-release-reason");
 			newHeaders.delete("content-length");
 
 			return new Request(request.url, {

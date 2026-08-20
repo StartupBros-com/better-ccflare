@@ -24,6 +24,7 @@ const {
 	admitBoundedModelRouteProfileRequest,
 	createContextAdmissionTracker,
 	createContextLengthExceededResponse,
+	isPreparedProxyAccountResponse,
 	proxyWithAccount,
 	sanitizeInternalHeaders,
 	selectAdmittedCodexModel,
@@ -1337,6 +1338,9 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 			"x-better-ccflare-pacing-canary": "bypass",
 			"x-better-ccflare-pacing-cohort-id": "cohort",
 			"x-better-ccflare-pacing-action": "bypassed",
+			"x-better-ccflare-pacing-role": "follower",
+			"x-better-ccflare-pacing-wait-ms": "60000",
+			"x-better-ccflare-pacing-release-reason": "cap",
 			"x-better-ccflare-request-stream": "true",
 			"x-better-ccflare-attributed-agent": "true",
 			[CODEX_LOGICAL_MODEL_FAMILY_HEADER]: "fable",
@@ -1350,6 +1354,9 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 			"x-better-ccflare-pacing-canary",
 			"x-better-ccflare-pacing-cohort-id",
 			"x-better-ccflare-pacing-action",
+			"x-better-ccflare-pacing-role",
+			"x-better-ccflare-pacing-wait-ms",
+			"x-better-ccflare-pacing-release-reason",
 			"x-better-ccflare-request-stream",
 			"x-better-ccflare-attributed-agent",
 			CODEX_LOGICAL_MODEL_FAMILY_HEADER,
@@ -1588,23 +1595,28 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 		).toBeNull();
 	});
 
-	it("does not trust client-supplied pacing experiment metadata", async () => {
+	it("replaces spoofed pacing metadata with the server receipt", async () => {
 		let transformedHeaders: Headers | null = null;
-		const provider = new CodexProvider();
+		let fetchedRequest: Request | null = null;
+		const provider = getProvider("codex");
+		if (!provider) throw new Error("Codex provider is not registered");
 		const originalTransform = provider.transformRequestBody.bind(provider);
-		provider.transformRequestBody = async (request, account) => {
+		const transformSpy = spyOn(
+			provider,
+			"transformRequestBody",
+		).mockImplementation(async (request, account) => {
 			transformedHeaders = new Headers(request.headers);
 			return originalTransform(request, account);
-		};
+		});
 		const ctx = makeProxyContext();
 		ctx.provider = provider as never;
-		globalThis.fetch = mock(
-			async () =>
-				new Response(JSON.stringify({ ok: true }), {
-					status: 200,
-					headers: { "content-type": "application/json" },
-				}),
-		);
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			fetchedRequest = input instanceof Request ? input : new Request(input);
+			return new Response(JSON.stringify({ ok: true }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		});
 		const collectorSpy = spyOn(
 			usageCollectorModule,
 			"getUsageCollector",
@@ -1621,26 +1633,37 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 					max_tokens: 16,
 				}),
 			).buffer;
+			const requestMeta = makeRequestMeta("/v1/messages");
+			requestMeta.codexPacingRole = "follower";
+			requestMeta.codexPacingWaitMs = 60_000;
+			requestMeta.codexPacingReleaseReason = "cap";
 			const result = await proxyWithAccount(
 				makeMessagesRequest(bodyBuffer, {
 					"Content-Type": "application/json",
 					"x-better-ccflare-pacing-canary": "spoofed",
 					"x-better-ccflare-pacing-cohort-id": "secret-value",
+					"x-better-ccflare-pacing-role": "leader",
+					"x-better-ccflare-pacing-wait-ms": "999",
+					"x-better-ccflare-pacing-release-reason": "leader",
 				}),
 				new URL("https://proxy.local/v1/messages"),
 				makeCodexAccount({
 					access_token: "access-token",
 					expires_at: Date.now() + 60 * 60 * 1000,
 				}),
-				makeRequestMeta("/v1/messages"),
+				requestMeta,
 				bodyBuffer,
 				() => undefined,
 				0,
 				ctx,
 			);
-			await result?.text();
+			const response = isPreparedProxyAccountResponse(result)
+				? await result.commit()
+				: result;
+			if (response instanceof Response) await response.text();
 		} finally {
 			collectorSpy.mockRestore();
+			transformSpy.mockRestore();
 		}
 		expect(
 			transformedHeaders?.get("x-better-ccflare-pacing-canary") ?? null,
@@ -1648,6 +1671,22 @@ describe("proxyWithAccount — Codex count_tokens", () => {
 		expect(
 			transformedHeaders?.get("x-better-ccflare-pacing-cohort-id") ?? null,
 		).toBeNull();
+		expect(transformedHeaders?.get("x-better-ccflare-pacing-role")).toBe(
+			"follower",
+		);
+		expect(transformedHeaders?.get("x-better-ccflare-pacing-wait-ms")).toBe(
+			"60000",
+		);
+		expect(
+			transformedHeaders?.get("x-better-ccflare-pacing-release-reason"),
+		).toBe("cap");
+		for (const header of [
+			"x-better-ccflare-pacing-role",
+			"x-better-ccflare-pacing-wait-ms",
+			"x-better-ccflare-pacing-release-reason",
+		]) {
+			expect(fetchedRequest?.headers.get(header) ?? null).toBeNull();
+		}
 	});
 });
 

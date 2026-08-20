@@ -1387,6 +1387,17 @@ async function handleProxyCoreImpl(
 		return finishPacing(pacingSlot, terminal.response);
 	};
 	let pacingObservation: CachePacingObservation | null = null;
+	const observeAndRecordPacing =
+		async (): Promise<CachePacingObservation | null> => {
+			const observation = await observeCachePacing({
+				sessionKey: requestMeta.clientSessionId,
+				model: effectiveModel,
+			});
+			requestMeta.codexPacingRole = observation?.role ?? null;
+			requestMeta.codexPacingWaitMs = observation?.waitedMs ?? null;
+			requestMeta.codexPacingReleaseReason = observation?.releaseReason ?? null;
+			return observation;
+		};
 	let pacingBypassed = false;
 	// Immutable assignment. Effective action may become crossover-paced, but
 	// route cohort attribution must remain treatment, not control.
@@ -1394,10 +1405,7 @@ async function handleProxyCoreImpl(
 	let selectedAccounts: Account[] | null = null;
 
 	if (!canaryCandidate && pacingEligible) {
-		pacingObservation = await observeCachePacing({
-			sessionKey: requestMeta.clientSessionId,
-			model: effectiveModel,
-		});
+		pacingObservation = await observeAndRecordPacing();
 	}
 	if (pacingEligible) {
 		warnOnLookbackRisk(parsedBody, requestMeta.clientSessionId);
@@ -1674,10 +1682,7 @@ async function handleProxyCoreImpl(
 		// This candidate did not resolve to a usable Codex route. Pace before any
 		// upstream call, then discard the pre-wait selection and route again so
 		// Anthropic availability/cooldowns are fresh after the wait.
-		pacingObservation = await observeCachePacing({
-			sessionKey: requestMeta.clientSessionId,
-			model: effectiveModel,
-		});
+		pacingObservation = await observeAndRecordPacing();
 		try {
 			selectedAccounts = await selectAccountsWithDeadline();
 		} catch (error) {
@@ -2557,10 +2562,7 @@ async function handleProxyCoreImpl(
 			!crossoverPacingRestored &&
 			route.account.provider !== "codex"
 		) {
-			pacingObservation = await observeCachePacing({
-				sessionKey: requestMeta.clientSessionId,
-				model: effectiveModel,
-			});
+			pacingObservation = await observeAndRecordPacing();
 			pacingSlot = pacingObservation?.slot ?? null;
 			crossoverPacingRestored = true;
 			pacingBypassed = false;
@@ -2602,10 +2604,7 @@ async function handleProxyCoreImpl(
 			!crossoverPacingRestored &&
 			accounts[i].provider !== "codex"
 		) {
-			pacingObservation = await observeCachePacing({
-				sessionKey: requestMeta.clientSessionId,
-				model: effectiveModel,
-			});
+			pacingObservation = await observeAndRecordPacing();
 			pacingSlot = pacingObservation?.slot ?? null;
 			crossoverPacingRestored = true;
 			pacingBypassed = false;
@@ -3020,10 +3019,7 @@ async function handleProxyCoreImpl(
 					!crossoverPacingRestored &&
 					fallbackAccounts[i].provider !== "codex"
 				) {
-					pacingObservation = await observeCachePacing({
-						sessionKey: requestMeta.clientSessionId,
-						model: effectiveModel,
-					});
+					pacingObservation = await observeAndRecordPacing();
 					pacingSlot = pacingObservation?.slot ?? null;
 					crossoverPacingRestored = true;
 					pacingBypassed = false;
@@ -3442,10 +3438,7 @@ async function handleProxyCoreImpl(
 				!crossoverPacingRestored &&
 				route.account.provider !== "codex"
 			) {
-				pacingObservation = await observeCachePacing({
-					sessionKey: requestMeta.clientSessionId,
-					model: effectiveModel,
-				});
+				pacingObservation = await observeAndRecordPacing();
 				pacingSlot = pacingObservation?.slot ?? null;
 				crossoverPacingRestored = true;
 				pacingBypassed = false;

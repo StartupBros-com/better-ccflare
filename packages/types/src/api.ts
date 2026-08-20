@@ -251,6 +251,12 @@ export interface RequestMeta {
 	codexPacingAction?: "paced" | "bypassed" | "crossover-paced" | null;
 	/** Privacy-preserving digest of the pacing-canary conversation identity. */
 	codexPacingCohortId?: string | null;
+	/** Actual coordination role assigned before routing. */
+	codexPacingRole?: "leader" | "follower" | null;
+	/** Observed follower wait; zero for a leader. */
+	codexPacingWaitMs?: number | null;
+	/** Event that released a follower; null for leaders and unpaced requests. */
+	codexPacingReleaseReason?: "leader" | "cap" | null;
 	/** One-based physical Codex transport sequence for this logical request. */
 	codexTransportAttemptOrdinal?: number;
 	/**

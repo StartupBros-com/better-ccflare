@@ -48,8 +48,9 @@ export const CODEX_FANOUT_WARN_ENV = "CCFLARE_CODEX_FANOUT_WARN";
 // v19: context_utilization_pct's denominator (modelContextWindow) changed
 // epoch — GPT-5.6 moved from the invented 372k window to the catalog max
 // 872k, and gpt-5.4 to 1M (issue #205). Percentages are not comparable
-// across the v18/v19 boundary; segment any trend analysis on this version.
-const TRACE_SCHEMA_VERSION = 19;
+// across the v18/v19 boundary. Schema 20 adds pacing role/release/wait receipts
+// without changing cache denominators.
+const TRACE_SCHEMA_VERSION = 20;
 const DEFAULT_FANOUT_WARN = 8;
 const TURN_STATE_COHORT_PATTERN = /^[0-9a-f]{16}$/;
 // Derived from the canonical vocabularies so a new category cannot be emitted
@@ -299,6 +300,12 @@ interface TraceInputs {
 	pacingCohortId?: string | null;
 	/** Effective request action: paced | bypassed | crossover-paced. */
 	pacingAction?: string | null;
+	/** Actual pacing coordination role; validated before persistence. */
+	pacingRole?: string | null;
+	/** Observed wait carried as a trusted internal decimal header. */
+	pacingWaitMs?: string | number | null;
+	/** Event that released a follower; null for leaders. */
+	pacingReleaseReason?: string | null;
 	turnStateArm?: CodexTurnStateArm;
 	turnStateCohortId?: string | null;
 	turnStateRequestAction?: CodexTurnStateRequestAction;
@@ -437,6 +444,29 @@ export function summarizeCodexResponse(
 	};
 }
 
+function normalizePacingRole(
+	value: string | null | undefined,
+): "leader" | "follower" | null {
+	return value === "leader" || value === "follower" ? value : null;
+}
+
+function normalizePacingWaitMs(
+	value: string | number | null | undefined,
+): number | null {
+	if (typeof value === "number") {
+		return Number.isSafeInteger(value) && value >= 0 ? value : null;
+	}
+	if (typeof value !== "string" || !/^\d+$/.test(value)) return null;
+	const parsed = Number.parseInt(value, 10);
+	return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
+function normalizePacingReleaseReason(
+	value: string | null | undefined,
+): "leader" | "cap" | null {
+	return value === "leader" || value === "cap" ? value : null;
+}
+
 /**
  * Append one request JSONL trace record. No-op (and never throws) when disabled.
  */
@@ -499,6 +529,11 @@ export function writeCodexTrace(inputs: TraceInputs): void {
 		pacing_canary: inputs.pacingCanary ?? null,
 		pacing_cohort_id: inputs.pacingCohortId ?? null,
 		pacing_action: inputs.pacingAction ?? null,
+		pacing_role: normalizePacingRole(inputs.pacingRole),
+		pacing_wait_ms: normalizePacingWaitMs(inputs.pacingWaitMs),
+		pacing_release_reason: normalizePacingReleaseReason(
+			inputs.pacingReleaseReason,
+		),
 		codex_turn_state_arm: turnStateArm,
 		codex_turn_state_cohort_id: turnStateCohortId,
 		codex_turn_state_request_action: turnStateRequestAction,

@@ -141,7 +141,7 @@ describe("Codex trace wiring (integration)", () => {
 		const rawTrace = readFileSync(join(dir, file as string), "utf8");
 		const record = JSON.parse(rawTrace.trim());
 		expect(record).toMatchObject({
-			trace_schema_version: 19,
+			trace_schema_version: 20,
 			phase: "response",
 			reasoning_output_item_count: 3,
 			reasoning_encrypted_present: true,
@@ -180,7 +180,7 @@ describe("Codex trace wiring (integration)", () => {
 		const rawTrace = readFileSync(join(dir, file as string), "utf8");
 		const record = JSON.parse(rawTrace.trim());
 		expect(record).toMatchObject({
-			trace_schema_version: 19,
+			trace_schema_version: 20,
 			phase: "request",
 			reasoning_input_item_count: 1,
 		});
@@ -373,7 +373,7 @@ describe("Codex trace wiring (integration)", () => {
 		const replayTerminal = byAttemptAndPhase.get("turn-attempt-2:response");
 
 		expect(initialRequest).toMatchObject({
-			trace_schema_version: 19,
+			trace_schema_version: 20,
 			codex_turn_state_arm: "treatment",
 			codex_turn_state_request_action: "new_turn",
 			codex_turn_state_replay_applied: false,
@@ -383,18 +383,18 @@ describe("Codex trace wiring (integration)", () => {
 			/^[0-9a-f]{16}$/,
 		);
 		expect(initialTerminal).toMatchObject({
-			trace_schema_version: 19,
+			trace_schema_version: 20,
 			codex_turn_state_terminal_action: "captured",
 			codex_turn_state_present: true,
 		});
 		expect(replayRequest).toMatchObject({
-			trace_schema_version: 19,
+			trace_schema_version: 20,
 			codex_turn_state_arm: "treatment",
 			codex_turn_state_request_action: "replay",
 			codex_turn_state_replay_applied: true,
 		});
 		expect(replayTerminal).toMatchObject({
-			trace_schema_version: 19,
+			trace_schema_version: 20,
 			codex_turn_state_terminal_action: "advanced",
 			codex_turn_state_present: true,
 		});
@@ -440,7 +440,7 @@ describe("Codex trace wiring (integration)", () => {
 		const files = readdirSync(dir).filter((f) => f.endsWith(".jsonl"));
 		expect(files.length).toBe(1);
 		const rec = JSON.parse(readFileSync(join(dir, files[0]), "utf8").trim());
-		expect(rec.trace_schema_version).toBe(19);
+		expect(rec.trace_schema_version).toBe(20);
 		expect(rec.phase).toBe("request");
 		expect(rec.orchestration_admission).toBe("no_orchestration_tools");
 		expect(rec.request_id).toBe("req_trace_1");
@@ -507,7 +507,7 @@ describe("Codex trace wiring (integration)", () => {
 			readFileSync(join(dir, file as string), "utf8").trim(),
 		);
 		expect(record).toMatchObject({
-			trace_schema_version: 19,
+			trace_schema_version: 20,
 			request_id: "req_trace_fable_default",
 			model_in: "claude-fable-5",
 			model_out: "gpt-5.6-sol",
@@ -561,7 +561,7 @@ describe("Codex trace wiring (integration)", () => {
 			.trim()
 			.split("\n")
 			.map((line) => JSON.parse(line));
-		expect(records.every((record) => record.trace_schema_version === 19)).toBe(
+		expect(records.every((record) => record.trace_schema_version === 20)).toBe(
 			true,
 		);
 		expect(records.map((record) => record.cache_key_assignment)).toEqual([
@@ -861,7 +861,10 @@ describe("Codex trace wiring (integration)", () => {
 			messagesRequest(SAMPLE, "req_canary", {
 				"x-better-ccflare-pacing-canary": "bypass",
 				"x-better-ccflare-pacing-cohort-id": "0123456789abcdef",
-				"x-better-ccflare-pacing-action": "bypassed",
+				"x-better-ccflare-pacing-action": "paced",
+				"x-better-ccflare-pacing-role": "follower",
+				"x-better-ccflare-pacing-wait-ms": "60000",
+				"x-better-ccflare-pacing-release-reason": "cap",
 			}),
 			undefined,
 		);
@@ -869,16 +872,20 @@ describe("Codex trace wiring (integration)", () => {
 		const rec = JSON.parse(readFileSync(join(dir, file), "utf8").trim());
 		expect(rec.pacing_canary).toBe("bypass");
 		expect(rec.pacing_cohort_id).toBe("0123456789abcdef");
-		expect(rec.pacing_action).toBe("bypassed");
-		expect(
-			transformed.headers.get("x-better-ccflare-pacing-canary"),
-		).toBeNull();
-		expect(
-			transformed.headers.get("x-better-ccflare-pacing-cohort-id"),
-		).toBeNull();
-		expect(
-			transformed.headers.get("x-better-ccflare-pacing-action"),
-		).toBeNull();
+		expect(rec.pacing_action).toBe("paced");
+		expect(rec.pacing_role).toBe("follower");
+		expect(rec.pacing_wait_ms).toBe(60000);
+		expect(rec.pacing_release_reason).toBe("cap");
+		for (const header of [
+			"x-better-ccflare-pacing-canary",
+			"x-better-ccflare-pacing-cohort-id",
+			"x-better-ccflare-pacing-action",
+			"x-better-ccflare-pacing-role",
+			"x-better-ccflare-pacing-wait-ms",
+			"x-better-ccflare-pacing-release-reason",
+		]) {
+			expect(transformed.headers.get(header)).toBeNull();
+		}
 	});
 
 	test("embeds full bodies only when CCFLARE_CODEX_TRACE_FULL=1", async () => {

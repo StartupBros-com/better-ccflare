@@ -3056,6 +3056,9 @@ export async function proxyWithAccount(
 				prepared.delete("x-better-ccflare-pacing-canary");
 				prepared.delete("x-better-ccflare-pacing-cohort-id");
 				prepared.delete("x-better-ccflare-pacing-action");
+				prepared.delete("x-better-ccflare-pacing-role");
+				prepared.delete("x-better-ccflare-pacing-wait-ms");
+				prepared.delete("x-better-ccflare-pacing-release-reason");
 				prepared.set("x-better-ccflare-request-id", requestMeta.id);
 				// Attribution is resolved by the proxy before account selection. Replace
 				// any client-supplied marker here, once the selected provider is known.
@@ -3080,6 +3083,28 @@ export async function proxyWithAccount(
 					prepared.set(
 						"x-better-ccflare-pacing-cohort-id",
 						requestMeta.codexPacingCohortId,
+					);
+				}
+				if (requestMeta.codexPacingRole) {
+					prepared.set(
+						"x-better-ccflare-pacing-role",
+						requestMeta.codexPacingRole,
+					);
+				}
+				if (
+					typeof requestMeta.codexPacingWaitMs === "number" &&
+					Number.isSafeInteger(requestMeta.codexPacingWaitMs) &&
+					requestMeta.codexPacingWaitMs >= 0
+				) {
+					prepared.set(
+						"x-better-ccflare-pacing-wait-ms",
+						String(requestMeta.codexPacingWaitMs),
+					);
+				}
+				if (requestMeta.codexPacingReleaseReason) {
+					prepared.set(
+						"x-better-ccflare-pacing-release-reason",
+						requestMeta.codexPacingReleaseReason,
 					);
 				}
 			} else {

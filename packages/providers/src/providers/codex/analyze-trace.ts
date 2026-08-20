@@ -56,6 +56,9 @@ export interface TraceRecord {
 	pacing_canary?: string | null;
 	pacing_cohort_id?: string | null;
 	pacing_action?: string | null;
+	pacing_role?: "leader" | "follower" | string | null;
+	pacing_wait_ms?: number | null;
+	pacing_release_reason?: "leader" | "cap" | string | null;
 	/** Additive schema reserved for the explicit cache-breakpoint canary. */
 	explicit_breakpoint_canary?: string | null;
 	explicit_breakpoint_cohort_id?: string | null;
@@ -376,6 +379,14 @@ export interface CacheExperimentRow {
 		unknownRequests: number;
 		waitMsAvailableRequests: number;
 		waitMsUnavailableRequests: number;
+		p50WaitMs: number | null;
+		p95WaitMs: number | null;
+		receiptCounts: {
+			leader: number;
+			followerReleasedByLeader: number;
+			followerReleasedByCap: number;
+			unknown: number;
+		};
 	};
 	/** Whitelisted action buckets only; unknown values are never echoed. */
 	actions: Record<string, number>;
@@ -470,20 +481,18 @@ export interface TurnStateCacheExperimentReport {
 
 export interface CodexCacheExperimentReport {
 	/**
-	 * Bumped 2 -> 3 for #204: CacheExperimentRow.cache and
-	 * TurnStateExperimentRow.cache both gained medianCachedReadPct /
-	 * p25CachedReadPct / p75CachedReadPct alongside weightedCachedReadPct.
-	 * Consumers that key on the row shape (e.g. destructure a fixed field
-	 * list) need to know the shape changed.
+	 * Bumped 3 -> 4 when CacheExperimentRow.pacing gained schema-20 role,
+	 * release-reason, and wait-duration receipt summaries. Consumers that key
+	 * on a fixed row shape need to know the report changed.
 	 */
-	schemaVersion: 3;
+	schemaVersion: 4;
 	attribution: {
 		unit: "final_observed_codex_attempt";
 		responseScope: "codex_trace_only_no_cross_provider_terminal_visibility";
 		elapsed: "observed_codex_response_ts_minus_observed_codex_attempt_request_ts";
 		gap: "prior_observed_codex_request_ts_in_same_trace_and_valid_cohort";
-		pacingWaitMs: "unavailable";
-		pacingWaitReason: "trace_has_action_but_no_wait_duration";
+		pacingWaitMs: "schema20_request_receipt";
+		pacingWaitReason: "legacy_or_invalid_receipt_is_unknown";
 	};
 	pacing: CacheExperimentDimensionReport;
 	explicitBreakpoint: CacheExperimentDimensionReport;
@@ -1404,6 +1413,7 @@ interface CacheExperimentRowAccumulator extends CacheExperimentRow {
 	elapsedSamples: number[];
 	/** Cache-inclusive observations, one entry per measured response in this row. */
 	cacheUsageObservations: CacheUsageObservation[];
+	pacingWaitSamples: number[];
 }
 
 type CacheExperimentKind = "pacing" | "explicitBreakpoint";
@@ -2125,10 +2135,19 @@ function cacheExperimentRowAccumulator(
 			unknownRequests: 0,
 			waitMsAvailableRequests: 0,
 			waitMsUnavailableRequests: 0,
+			p50WaitMs: null,
+			p95WaitMs: null,
+			receiptCounts: {
+				leader: 0,
+				followerReleasedByLeader: 0,
+				followerReleasedByCap: 0,
+				unknown: 0,
+			},
 		},
 		actions: {},
 		elapsedSamples: [],
 		cacheUsageObservations: [],
+		pacingWaitSamples: [],
 	};
 }
 
@@ -2169,16 +2188,51 @@ function incrementPacingAction(
 	row: CacheExperimentRowAccumulator,
 	action: string | null | undefined,
 ): void {
-	if (action === "paced") {
-		row.pacing.pacedRequests++;
-		row.pacing.waitMsUnavailableRequests++;
-	} else if (action === "bypassed") {
-		row.pacing.bypassedRequests++;
-	} else if (action === "crossover-paced") {
-		row.pacing.crossoverPacedRequests++;
-		row.pacing.waitMsUnavailableRequests++;
+	if (action === "paced") row.pacing.pacedRequests++;
+	else if (action === "bypassed") row.pacing.bypassedRequests++;
+	else if (action === "crossover-paced") row.pacing.crossoverPacedRequests++;
+	else row.pacing.unknownRequests++;
+}
+
+function incrementPacingReceipt(
+	row: CacheExperimentRowAccumulator,
+	request: TraceRecord,
+): void {
+	const waitExpected =
+		request.pacing_action === "paced" ||
+		request.pacing_action === "crossover-paced" ||
+		request.pacing_role === "leader" ||
+		request.pacing_role === "follower";
+	if ((request.trace_schema_version ?? 0) < 20) {
+		row.pacing.receiptCounts.unknown++;
+		if (waitExpected) row.pacing.waitMsUnavailableRequests++;
+		return;
+	}
+
+	if (
+		request.pacing_role === "leader" &&
+		request.pacing_release_reason == null
+	) {
+		row.pacing.receiptCounts.leader++;
+	} else if (
+		request.pacing_role === "follower" &&
+		request.pacing_release_reason === "leader"
+	) {
+		row.pacing.receiptCounts.followerReleasedByLeader++;
+	} else if (
+		request.pacing_role === "follower" &&
+		request.pacing_release_reason === "cap"
+	) {
+		row.pacing.receiptCounts.followerReleasedByCap++;
 	} else {
-		row.pacing.unknownRequests++;
+		row.pacing.receiptCounts.unknown++;
+	}
+
+	if (safeTokenCount(request.pacing_wait_ms)) {
+		row.pacing.waitMsAvailableRequests++;
+		row.pacingWaitSamples.push(request.pacing_wait_ms);
+	} else if (waitExpected) {
+		row.pacing.waitMsUnavailableRequests++;
 	}
 }
 
@@ -2214,7 +2268,11 @@ function finishCacheExperimentRow(
 			p95Ms: percentile(row.elapsedSamples, 0.95),
 		},
 		outcomes: row.outcomes,
-		pacing: row.pacing,
+		pacing: {
+			...row.pacing,
+			p50WaitMs: percentile(row.pacingWaitSamples, 0.5),
+			p95WaitMs: percentile(row.pacingWaitSamples, 0.95),
+		},
 		actions,
 	};
 }
@@ -2264,6 +2322,7 @@ function cacheExperimentDimension(
 		row.observedCodexAttempts++;
 		increment(row.actions, sample.action);
 		incrementPacingAction(row, sample.request.pacing_action);
+		incrementPacingReceipt(row, sample.request);
 		const fallbackAttempts = sample.attempts.filter((attempt) =>
 			FALLBACK_CAUSES.has(attempt.attempt_cause ?? ""),
 		).length;
@@ -3171,15 +3230,15 @@ export function analyzeCodexCacheExperiments(
 	const records = withoutAbortedAttempts(allRecords);
 	const samples = cacheExperimentLogicalSamples(records);
 	return {
-		schemaVersion: 3,
+		schemaVersion: 4,
 		attribution: {
 			unit: "final_observed_codex_attempt",
 			responseScope: "codex_trace_only_no_cross_provider_terminal_visibility",
 			elapsed:
 				"observed_codex_response_ts_minus_observed_codex_attempt_request_ts",
 			gap: "prior_observed_codex_request_ts_in_same_trace_and_valid_cohort",
-			pacingWaitMs: "unavailable",
-			pacingWaitReason: "trace_has_action_but_no_wait_duration",
+			pacingWaitMs: "schema20_request_receipt",
+			pacingWaitReason: "legacy_or_invalid_receipt_is_unknown",
 		},
 		pacing: cacheExperimentDimension(samples, "pacing"),
 		explicitBreakpoint: cacheExperimentDimension(samples, "explicitBreakpoint"),

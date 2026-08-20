@@ -8194,7 +8194,7 @@ describe("CodexProvider.transformRequestBody", () => {
 			// recorded lineage and is admitted as root (basis: lineage_match), not
 			// demoted.
 			expect(requestTrace).toMatchObject({
-				trace_schema_version: 19,
+				trace_schema_version: 20,
 				orchestration_admission: "root",
 				orchestration_basis: "lineage_match",
 				cache_key_continuity_basis: "lineage_match",
@@ -8444,7 +8444,7 @@ describe("CodexProvider.transformRequestBody", () => {
 				(record) => record.phase === "request",
 			);
 			expect(requestTrace).toMatchObject({
-				trace_schema_version: 19,
+				trace_schema_version: 20,
 				orchestration_admission: "attributed_descendant",
 				orchestration_basis: null,
 				is_descendant: true,
@@ -8755,11 +8755,11 @@ describe("CodexProvider.transformRequestBody", () => {
 				(record) => record.request_id === "treated-compacted",
 			);
 			expect(treatedRootTrace).toMatchObject({
-				trace_schema_version: 19,
+				trace_schema_version: 20,
 				cache_key_continuity_applied: true,
 			});
 			expect(treatedCompactedTrace).toMatchObject({
-				trace_schema_version: 19,
+				trace_schema_version: 20,
 				cache_key_continuity_basis: "lineage_match",
 				cache_key_continuity_applied: true,
 			});
