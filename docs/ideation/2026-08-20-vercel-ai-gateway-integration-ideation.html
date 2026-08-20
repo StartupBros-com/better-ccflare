@@ -1,0 +1,584 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ideation: Vercel AI Gateway integration</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f5f4ef;
+      --surface: #fffefa;
+      --surface-2: #ecebe5;
+      --text: #1d2421;
+      --muted: #59635e;
+      --border: #cfd4cf;
+      --accent: #176b52;
+      --accent-soft: #dff2e9;
+      --accent-text: #0c4d39;
+      --info: #2c5f91;
+      --info-soft: #e4eef9;
+      --info-text: #1d4d7b;
+      --warn: #8a5a08;
+      --warn-soft: #f8ebca;
+      --warn-text: #684104;
+      --danger: #9a3838;
+      --danger-soft: #f7e2e2;
+      --danger-text: #782828;
+      --shadow: 0 10px 30px rgba(24, 35, 30, .08);
+      --radius: 16px;
+      --radius-sm: 9px;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #111613;
+        --surface: #171d19;
+        --surface-2: #202823;
+        --text: #edf3ef;
+        --muted: #aebbb3;
+        --border: #35443b;
+        --accent: #79d7b4;
+        --accent-soft: #173c2e;
+        --accent-text: #a8efd4;
+        --info: #91bce7;
+        --info-soft: #1b3249;
+        --info-text: #b9d8f6;
+        --warn: #e8bd69;
+        --warn-soft: #403117;
+        --warn-text: #f5d798;
+        --danger: #efa0a0;
+        --danger-soft: #472424;
+        --danger-text: #ffc0c0;
+        --shadow: 0 12px 34px rgba(0, 0, 0, .28);
+      }
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      font-size: 15.5px;
+      line-height: 1.65;
+    }
+    a { color: var(--accent); text-underline-offset: 3px; }
+    a:hover { text-decoration-thickness: 2px; }
+    code {
+      font-family: var(--mono);
+      font-size: .9em;
+      padding: .08rem .3rem;
+      border-radius: 5px;
+      background: var(--surface-2);
+      overflow-wrap: anywhere;
+    }
+    strong { color: inherit; }
+    .page {
+      width: min(940px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 44px 0 72px;
+    }
+    header.hero {
+      padding: 30px;
+      border: 1px solid var(--border);
+      border-radius: calc(var(--radius) + 4px);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+    .eyebrow {
+      margin: 0 0 8px;
+      color: var(--accent);
+      font-size: .75rem;
+      font-weight: 800;
+      letter-spacing: .1em;
+      text-transform: uppercase;
+    }
+    h1, h2, h3 { line-height: 1.2; letter-spacing: -.02em; }
+    h1 { margin: 0; font-size: clamp(2rem, 5vw, 3.25rem); max-width: 19ch; }
+    h2 { margin: 0 0 16px; font-size: 1.55rem; }
+    h3 { margin: 0; font-size: 1.23rem; }
+    .dek { max-width: 72ch; margin: 18px 0 0; color: var(--muted); font-size: 1.03rem; }
+    .metadata, .stats, .chips { display: flex; flex-wrap: wrap; gap: 8px; }
+    .metadata { margin-top: 22px; }
+    .chip {
+      display: inline-flex;
+      gap: 6px;
+      align-items: center;
+      min-height: 30px;
+      padding: 5px 10px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: var(--surface-2);
+      color: var(--text);
+      font-size: .78rem;
+      font-weight: 700;
+    }
+    .chip.accent { border-color: transparent; background: var(--accent-soft); color: var(--accent-text); }
+    .chip.info { border-color: transparent; background: var(--info-soft); color: var(--info-text); }
+    .chip.warn { border-color: transparent; background: var(--warn-soft); color: var(--warn-text); }
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin: 18px 0 0;
+    }
+    .stat {
+      padding: 13px 14px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      background: var(--surface-2);
+    }
+    .stat b { display: block; font-size: 1.35rem; line-height: 1.1; }
+    .stat span { color: var(--muted); font-size: .76rem; }
+    nav.toc, section {
+      margin-top: 24px;
+      padding: 24px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+    }
+    nav.toc ul, .jump-list ol { margin: 8px 0 0; padding-left: 1.25rem; columns: 2; column-gap: 32px; }
+    nav.toc li, .jump-list li { break-inside: avoid; margin: 5px 0; }
+    .verdict {
+      margin: 18px 0;
+      padding: 18px;
+      border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border));
+      border-radius: var(--radius-sm);
+      background: var(--accent-soft);
+      color: var(--accent-text);
+    }
+    .verdict p { margin: 0; max-width: 74ch; }
+    .prose { max-width: 74ch; }
+    .prose p { margin: 0 0 12px; }
+    .evidence-grid, .axis-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 16px;
+    }
+    .evidence, .axis {
+      padding: 15px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      background: var(--surface-2);
+    }
+    .evidence h3, .axis h3 { font-size: 1rem; margin-bottom: 6px; }
+    .evidence p, .axis p { margin: 0; color: var(--muted); font-size: .9rem; }
+    .axis .n { color: var(--accent); font-family: var(--mono); font-weight: 800; }
+    figure { margin: 22px 0 0; }
+    figcaption { margin-top: 8px; color: var(--muted); font-size: .82rem; max-width: 72ch; }
+    svg.flow {
+      width: 100%;
+      height: auto;
+      display: block;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      background: var(--surface-2);
+    }
+    .flow .box { fill: var(--surface); stroke: var(--border); stroke-width: 1.5; }
+    .flow .highlight { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.5; }
+    .flow .decision { fill: var(--info-soft); stroke: var(--info); stroke-width: 1.5; }
+    .flow .stop { fill: var(--warn-soft); stroke: var(--warn); stroke-width: 1.5; }
+    .flow .line { stroke: var(--muted); stroke-width: 2; fill: none; marker-end: url(#arrow); }
+    .flow text { fill: var(--text); font-family: var(--sans); font-size: 13px; text-anchor: middle; }
+    .flow .small { fill: var(--muted); font-size: 11px; }
+    .flow .arrowhead { fill: var(--muted); }
+    .jump-list {
+      margin: 0 0 18px;
+      padding: 15px 18px;
+      border-radius: var(--radius-sm);
+      background: var(--surface-2);
+    }
+    .jump-list p { margin: 0; font-size: .78rem; font-weight: 800; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+    article.idea {
+      margin-top: 15px;
+      padding: 21px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: 0 5px 18px rgba(24, 35, 30, .05);
+      scroll-margin-top: 20px;
+    }
+    .idea-head { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; }
+    .rank {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 36px;
+      height: 30px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent-text);
+      font-family: var(--mono);
+      font-size: .78rem;
+      font-weight: 800;
+    }
+    .idea-title { display: flex; align-items: center; gap: 10px; }
+    .idea-desc { max-width: 75ch; margin: 14px 0; }
+    dl.idea-fields {
+      display: grid;
+      grid-template-columns: 110px minmax(0, 1fr);
+      gap: 8px 14px;
+      margin: 16px 0 0;
+      padding-top: 15px;
+      border-top: 1px solid var(--border);
+    }
+    dl.idea-fields dt { color: var(--muted); font-size: .72rem; font-weight: 800; letter-spacing: .07em; text-transform: uppercase; }
+    dl.idea-fields dd { margin: 0; max-width: 75ch; }
+    .tradeoff { color: var(--warn-text); }
+    .sequence {
+      display: grid;
+      grid-template-columns: repeat(7, minmax(0, 1fr));
+      gap: 7px;
+      margin-top: 16px;
+    }
+    .sequence a {
+      min-height: 72px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      padding: 9px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      background: var(--surface-2);
+      text-decoration: none;
+      font-size: .75rem;
+      line-height: 1.3;
+    }
+    .sequence b { font-family: var(--mono); color: var(--accent); }
+    .sequence span { color: var(--text); }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: .87rem; }
+    th, td { padding: 10px 11px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
+    th { color: var(--muted); font-size: .7rem; letter-spacing: .07em; text-transform: uppercase; }
+    tbody tr:last-child td { border-bottom: 0; }
+    .rejected { color: var(--muted); }
+    .refuted { background: var(--danger-soft); color: var(--danger-text); }
+    .sources ul { margin: 0; padding-left: 1.25rem; }
+    .sources li { margin: 7px 0; overflow-wrap: anywhere; }
+    footer.composition-signal { margin-top: 24px; color: var(--muted); font-size: .78rem; text-align: center; }
+    @media (max-width: 720px) {
+      .page { width: min(100% - 20px, 940px); padding-top: 12px; }
+      header.hero, nav.toc, section { padding: 18px; border-radius: 12px; }
+      .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .evidence-grid, .axis-grid { grid-template-columns: 1fr; }
+      nav.toc ul, .jump-list ol { columns: 1; }
+      .idea-head { display: block; }
+      .idea-head .chips { margin-top: 10px; }
+      dl.idea-fields { grid-template-columns: 1fr; gap: 4px; }
+      dl.idea-fields dd { margin-bottom: 9px; }
+      .sequence { grid-template-columns: 1fr 1fr; }
+      .sequence a:last-child { grid-column: 1 / -1; }
+    }
+    @media print {
+      body { background: #fff; color: #111; }
+      .page { width: 100%; padding: 0; }
+      header.hero, nav.toc, section, article.idea { box-shadow: none; break-inside: avoid; }
+      a { color: inherit; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="hero">
+      <p class="eyebrow">Ideation · repo-grounded</p>
+      <h1>Vercel AI Gateway integration</h1>
+      <p class="dek">How better-ccflare could safely route the Vercel team used by <code>fx</code>, exploiting observed zero-cost GLM standard/Fast compute while protecting the recurring or paid Gateway balance.</p>
+      <div class="metadata" aria-label="Document metadata">
+        <span class="chip"><strong>Date</strong> <time datetime="2026-08-20">2026-08-20</time></span>
+        <span class="chip"><strong>Topic</strong> vercel-ai-gateway-integration</span>
+        <span class="chip"><strong>Focus</strong> fx account free/paid compute</span>
+        <span class="chip"><strong>Mode</strong> repo-grounded</span>
+      </div>
+      <div class="stats" aria-label="Ideation statistics">
+        <div class="stat"><b>47</b><span>raw ideas</span></div>
+        <div class="stat"><b>29</b><span>after dedupe</span></div>
+        <div class="stat"><b>7</b><span>ranked survivors</span></div>
+        <div class="stat"><b>$0</b><span>observed GLM spend</span></div>
+      </div>
+    </header>
+
+    <nav class="toc" aria-label="Document sections">
+      <p class="eyebrow">Contents</p>
+      <ul>
+        <li><a href="#grounding-context">Grounding Context</a></li>
+        <li><a href="#topic-axes">Topic Axes</a></li>
+        <li><a href="#ranked-ideas">Ranked Ideas</a></li>
+        <li><a href="#rejection-summary">Rejection Summary</a></li>
+        <li><a href="#sources-references">Sources &amp; References</a></li>
+      </ul>
+    </nav>
+
+    <section id="grounding-context">
+      <p class="eyebrow">Evidence before ideas</p>
+      <h2>Grounding Context</h2>
+      <div class="verdict">
+        <p><strong>Verdict: yes.</strong> A static Vercel AI Gateway key can enter better-ccflare through the existing OpenAI-compatible account path now. That is sufficient for a fail-closed canary; faithfully reusing <code>fx login</code>, Fast behavior, account-specific free entitlement, and paid-balance safety requires additional first-class contracts.</p>
+      </div>
+      <div class="prose">
+        <p><strong>Repository fit.</strong> The generic adapter already accepts a custom endpoint and bearer key, maps Claude-family names to a physical model, converts Anthropic Messages to Chat Completions, and translates JSON/SSE back. Exact-account routing already refuses to fall through to a different account when the selected account is missing, paused, rate-limited, or capacity-exhausted.</p>
+        <p><strong>Observed account state.</strong> Local <code>fx</code> v0.0.4 is refreshably logged into Vercel team <code>startupbros</code>. Its partial local 30-day ledger records standard GLM at 1,070 requests / 117,304,989 tokens / <strong>$0</strong>, Fast GLM at 18 requests / 580,043 tokens / <strong>$0</strong>, and Grok at 49 requests / <strong>$3.555518</strong>. The live Gateway balance was <strong>$1.44447645</strong>.</p>
+        <p><strong>Evidence boundary.</strong> The fx ledger is machine-local and incomplete. Public August 27 terms do not explain this account’s zero-cost Fast observations, so “free” must remain account-specific, revocable evidence—not a model constant or compiled promotion date.</p>
+        <p><strong>External capability.</strong> Vercel exposes native Anthropic Messages, OpenAI Chat Completions, OpenAI Responses, public model/endpoint catalogs, and authenticated credit/report/generation metadata. Its API-key budgets are soft: the request crossing a cap can finish, so upstream 402 handling alone cannot protect a small reserve.</p>
+      </div>
+
+      <div class="evidence-grid" aria-label="Key constraints">
+        <article class="evidence">
+          <h3>Auth is not one thing</h3>
+          <p><code>fx setup</code> stores a Gateway key; <code>fx login</code> stores refreshable OAuth plus team scope. Copying a rotating refresh chain creates two potential writers.</p>
+        </article>
+        <article class="evidence">
+          <h3>Protocols lose different semantics</h3>
+          <p>The existing Responses → Anthropic → Chat path drops xhigh; Chat lacks thinking budgets; no generic request type carries Vercel Fast metadata.</p>
+        </article>
+        <article class="evidence">
+          <h3>Billed truth beats list price</h3>
+          <p>Current request rows estimate cost but lack Gateway generation IDs, actual charge lineage, credit source, and promotion attribution.</p>
+        </article>
+        <article class="evidence">
+          <h3>Error scope already matters</h3>
+          <p>400/404 remain model/configuration failures, 402 is account-wide billing failure, and 429 scope depends on the evidence accompanying it.</p>
+        </article>
+      </div>
+
+      <figure aria-labelledby="flow-caption">
+        <svg class="flow" viewBox="0 0 880 300" role="img" aria-labelledby="flow-title flow-desc">
+          <title id="flow-title">Evidence-gated Vercel Gateway adoption flow</title>
+          <desc id="flow-desc">A static key begins in an exact-account canary, produces a Gateway settlement receipt, and either renews a zero-cost entitlement lease and graduates routing or is demoted and requires explicit paid authorization.</desc>
+          <defs>
+            <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+              <path class="arrowhead" d="M0,0 L8,4 L0,8 Z"></path>
+            </marker>
+          </defs>
+          <rect class="box" x="32" y="92" width="145" height="76" rx="12"></rect>
+          <text x="104" y="120">Gateway key</text>
+          <text class="small" x="104" y="143">no OAuth copy</text>
+
+          <rect class="highlight" x="220" y="92" width="155" height="76" rx="12"></rect>
+          <text x="297" y="120">Exact-account</text>
+          <text x="297" y="140">canary</text>
+
+          <rect class="box" x="418" y="92" width="155" height="76" rx="12"></rect>
+          <text x="495" y="120">Settlement</text>
+          <text x="495" y="140">receipt</text>
+
+          <polygon class="decision" points="668,72 750,130 668,188 586,130"></polygon>
+          <text x="668" y="124">Actual cost</text>
+          <text x="668" y="144">still $0?</text>
+
+          <rect class="highlight" x="618" y="220" width="210" height="52" rx="12"></rect>
+          <text x="723" y="242">Renew lease · graduate</text>
+          <text class="small" x="723" y="260">profile → normal → preferred</text>
+
+          <rect class="stop" x="618" y="10" width="210" height="46" rx="12"></rect>
+          <text x="723" y="38">Demote · require paid authority</text>
+
+          <path class="line" d="M177 130 H214"></path>
+          <path class="line" d="M375 130 H412"></path>
+          <path class="line" d="M573 130 H580"></path>
+          <path class="line" d="M668 188 V214"></path>
+          <path class="line" d="M668 72 V62 H723 V60"></path>
+          <text class="small" x="688" y="207">yes</text>
+          <text class="small" x="646" y="66">no / unknown</text>
+        </svg>
+        <figcaption id="flow-caption">The strongest combined direction is deliberately staged: prove connectivity with a static key, then let actual billed evidence—not promotion copy—control admission. This is illustrative, not an implementation specification.</figcaption>
+      </figure>
+    </section>
+
+    <section id="topic-axes">
+      <p class="eyebrow">Surface map</p>
+      <h2>Topic Axes</h2>
+      <div class="axis-grid">
+        <article class="axis"><h3><span class="n">01</span> Credential lifecycle and ownership</h3><p>Gateway key vs OIDC vs fx OAuth, team scoping, refresh ownership, and reauthentication.</p></article>
+        <article class="axis"><h3><span class="n">02</span> Protocol, model, and reasoning fidelity</h3><p>Messages vs Chat vs Responses, model mapping, xhigh, thinking, Fast, tools, and SSE.</p></article>
+        <article class="axis"><h3><span class="n">03</span> Credits, entitlements, and observability</h3><p>Observed-zero status, recurring balance, catalog prices, generation receipts, 402/429, and reset evidence.</p></article>
+        <article class="axis"><h3><span class="n">04</span> Routing and safety</h3><p>Fail-closed canaries, inner and outer failover, affinity, scoped benches, and entitlement expiry.</p></article>
+        <article class="axis"><h3><span class="n">05</span> Setup and maintainability</h3><p>Generic account now, richer integration later, dynamic catalogs, schema, CLI, dashboard, and test surface.</p></article>
+      </div>
+    </section>
+
+    <section id="ranked-ideas">
+      <p class="eyebrow">Seven directions survived</p>
+      <h2>Ranked Ideas</h2>
+      <div class="jump-list">
+        <p>Jump to an idea</p>
+        <ol>
+          <li><a href="#idea-1">Static-key exact-account canary</a></li>
+          <li><a href="#idea-2">Receipt-backed entitlement leases</a></li>
+          <li><a href="#idea-3">Gateway settlement receipt</a></li>
+          <li><a href="#idea-4">Credential custody contract</a></li>
+          <li><a href="#idea-5">Semantic-loss firewall</a></li>
+          <li><a href="#idea-6">Maximum-loss preauthorization holds</a></li>
+          <li><a href="#idea-7">Entitlement graduation</a></li>
+        </ol>
+      </div>
+
+      <div class="sequence" aria-label="Recommended exploration order">
+        <a href="#idea-1"><b>Idea 1</b><span>Prove the connection</span></a>
+        <a href="#idea-3"><b>Idea 3</b><span>Capture billed truth</span></a>
+        <a href="#idea-2"><b>Idea 2</b><span>Lease free capacity</span></a>
+        <a href="#idea-6"><b>Idea 6</b><span>Protect paid value</span></a>
+        <a href="#idea-5"><b>Idea 5</b><span>Preserve semantics</span></a>
+        <a href="#idea-4"><b>Idea 4</b><span>Choose auth custody</span></a>
+        <a href="#idea-7"><b>Idea 7</b><span>Graduate routing</span></a>
+      </div>
+
+      <article class="idea" id="idea-1">
+        <div class="idea-head">
+          <div class="idea-title"><span class="rank">Idea 1</span><h3>Static-key exact-account canary</h3></div>
+          <div class="chips"><span class="chip accent">Confidence 96%</span><span class="chip info">Complexity Low</span></div>
+        </div>
+        <p class="idea-desc">Add a Vercel AI Gateway key through the existing <code>openai-compatible</code> account surface, use base <code>https://ai-gateway.vercel.sh/v1</code>, map only intended Claude families to standard or Fast GLM, and force-route canary sessions to this account. Do not copy fx OAuth and do not admit the account to the normal pool yet.</p>
+        <dl class="idea-fields">
+          <dt>Axis</dt><dd>Setup and maintainability</dd>
+          <dt>Basis</dt><dd><strong>direct:</strong> Generic transport already handles custom endpoint, bearer auth, model mapping, JSON/SSE conversion, and duplicate <code>/v1</code> avoidance. Exact-account routing is tested fail-closed.</dd>
+          <dt>Rationale</dt><dd>This is the smallest reversible route to the compute and answers whether the same team entitlement is available through a Gateway key before broader work begins.</dd>
+          <dt>Downsides</dt><dd class="tradeoff">It does not reproduce fx-login refresh, team metadata, <code>gateway.speed=fast</code>, account-wide free-entitlement truth, thinking-budget fidelity, or native Responses behavior. The existing Chat translator only carries xhigh when it arrives as an effort field.</dd>
+        </dl>
+      </article>
+
+      <article class="idea" id="idea-2">
+        <div class="idea-head">
+          <div class="idea-title"><span class="rank">Idea 2</span><h3>Receipt-backed entitlement leases</h3></div>
+          <div class="chips"><span class="chip accent">Confidence 86%</span><span class="chip info">Complexity Medium</span></div>
+        </div>
+        <p class="idea-desc">Represent zero-cost access as a short-lived lease scoped to Vercel team, physical model, execution class, and protocol. Bootstrap from the local fx history, then renew only from recent account-specific <strong>$0</strong> generation receipts; staleness, missing attribution, or any nonzero charge revokes the lease.</p>
+        <dl class="idea-fields">
+          <dt>Axis</dt><dd>Credits, entitlements, and observability</dd>
+          <dt>Basis</dt><dd><strong>direct:</strong> Standard and Fast GLM have substantial local zero-spend observations, but the ledger is incomplete and public promotion terms conflict with Fast. Vercel exposes exact generation cost.</dd>
+          <dt>Rationale</dt><dd>Observed billing truth captures the valuable account-specific behavior without turning a temporary or undocumented entitlement into permanent code.</dd>
+          <dt>Downsides</dt><dd class="tradeoff">The lease needs Idea 3’s settlement evidence, an explicit freshness policy, and conservative behavior when reporting is unavailable. “Unknown” cannot mean “free.”</dd>
+        </dl>
+      </article>
+
+      <article class="idea" id="idea-3">
+        <div class="idea-head">
+          <div class="idea-title"><span class="rank">Idea 3</span><h3>Gateway settlement receipt</h3></div>
+          <div class="chips"><span class="chip accent">Confidence 94%</span><span class="chip info">Complexity Medium</span></div>
+        </div>
+        <p class="idea-desc">Persist a settlement record that binds the better-ccflare request to Gateway generation ID, requested and served model/mode, inner provider, token dimensions, actual billed amount, balance movement, and known or unknown credit source. Keep list-price estimates as forecasts, not billing truth.</p>
+        <dl class="idea-fields">
+          <dt>Axis</dt><dd>Credits, entitlements, and observability</dd>
+          <dt>Basis</dt><dd><strong>external:</strong> Vercel exposes generation IDs, actual cost, serving provider, latency, tokens, and cache data. <strong>direct:</strong> Current request rows have nullable estimated cost but no Gateway identifiers or charge lineage.</dd>
+          <dt>Rationale</dt><dd>The receipt is the enabling evidence for leases, billed-vs-estimated anomaly detection, inner-provider diagnosis, and account-wide reconciliation.</dd>
+          <dt>Downsides</dt><dd class="tradeoff">Some reporting calls may be metered; retention and failure behavior need care. Attribution unavailable at request completion must remain explicitly unknown rather than silently estimated.</dd>
+        </dl>
+      </article>
+
+      <article class="idea" id="idea-4">
+        <div class="idea-head">
+          <div class="idea-title"><span class="rank">Idea 4</span><h3>Credential custody contract</h3></div>
+          <div class="chips"><span class="chip accent">Confidence 93%</span><span class="chip info">Complexity Medium</span></div>
+        </div>
+        <p class="idea-desc">Make authentication mode and refresh ownership explicit. A connection uses a non-rotating Gateway key, fx remains the sole refresh owner and delegates short-lived access, or renewable custody transfers exclusively to better-ccflare. Sharing one rotating refresh chain between fx and better-ccflare is invalid.</p>
+        <dl class="idea-fields">
+          <dt>Axis</dt><dd>Credential lifecycle and ownership</dd>
+          <dt>Basis</dt><dd><strong>direct:</strong> Current accounts lack auth-mode, owner, team, and provenance fields. The xAI importer already warns that continued source-CLI use can create competing rotating-token chains; better-ccflare’s CAS protects only its own writers.</dd>
+          <dt>Rationale</dt><dd>This is the precondition for safely reusing <code>fx login</code> itself rather than merely using the same Vercel team through a static key.</dd>
+          <dt>Downsides</dt><dd class="tradeoff">fx does not currently expose a verified delegation interface, and OAuth token portability to public Gateway endpoints remains unconfirmed. Static keys are therefore the dependable first mode.</dd>
+        </dl>
+      </article>
+
+      <article class="idea" id="idea-5">
+        <div class="idea-head">
+          <div class="idea-title"><span class="rank">Idea 5</span><h3>Semantic-loss firewall</h3></div>
+          <div class="chips"><span class="chip accent">Confidence 91%</span><span class="chip warn">Complexity High</span></div>
+        </div>
+        <p class="idea-desc">Classify the request semantics that must survive—reasoning effort, thinking budget, execution class, tool types, metadata, streaming events, and cache accounting—and admit only routes that preserve them. Native Messages, Chat, or Responses can be selected by need; any downgrade is explicit and caller-authorized.</p>
+        <dl class="idea-fields">
+          <dt>Axis</dt><dd>Protocol, model, and reasoning fidelity</dd>
+          <dt>Basis</dt><dd><strong>direct:</strong> The current Responses → Anthropic → Chat path drops xhigh, Chat does not model thinking budgets, Responses omits thinking and several tool classes, and no generic request field carries Vercel Fast intent.</dd>
+          <dt>Rationale</dt><dd>Free compute is not useful if the proxy silently sends a materially weaker request than the client asked for.</dd>
+          <dt>Downsides</dt><dd class="tradeoff">This likely requires capability descriptors and native Vercel protocol fan-out. Full parity is considerably more work than the static-key canary.</dd>
+        </dl>
+      </article>
+
+      <article class="idea" id="idea-6">
+        <div class="idea-head">
+          <div class="idea-title"><span class="rank">Idea 6</span><h3>Maximum-loss preauthorization holds</h3></div>
+          <div class="chips"><span class="chip warn">Confidence 78%</span><span class="chip info">Complexity Medium</span></div>
+        </div>
+        <p class="idea-desc">Before any balance-authorized request, reserve its worst plausible token and service-class exposure against the allowed reserve; settle the hold against actual Gateway cost afterward. Unknown prices or output bounds fail closed unless explicitly overridden.</p>
+        <dl class="idea-fields">
+          <dt>Axis</dt><dd>Credits, entitlements, and observability</dd>
+          <dt>Basis</dt><dd><strong>external:</strong> Vercel budgets are soft and allow the crossing request to complete. <strong>direct:</strong> better-ccflare already estimates cost from model prices and token bounds.</dd>
+          <dt>Rationale</dt><dd>Preauthorization protects the recurring or paid balance under concurrency before a 402 can arrive.</dd>
+          <dt>Downsides</dt><dd class="tradeoff">Worst-case estimates can over-reserve and reduce utilization. The model needs strict concurrency accounting and careful cancellation/release behavior.</dd>
+        </dl>
+      </article>
+
+      <article class="idea" id="idea-7">
+        <div class="idea-head">
+          <div class="idea-title"><span class="rank">Idea 7</span><h3>Entitlement graduation</h3></div>
+          <div class="chips"><span class="chip accent">Confidence 89%</span><span class="chip info">Complexity Medium</span></div>
+        </div>
+        <p class="idea-desc">Graduate newly observed capacity through existing routing trust tiers: exact-account canary, profile-only, normal pool, then preferred priority. Promote on accumulated cost/fidelity/reliability evidence and demote immediately when a receipt, protocol result, or availability signal contradicts the current tier.</p>
+        <dl class="idea-fields">
+          <dt>Axis</dt><dd>Routing and safety</dd>
+          <dt>Basis</dt><dd><strong>direct:</strong> Exact-account, profile-only, normal, affinity, and priority routing already exist and provide natural admission boundaries.</dd>
+          <dt>Rationale</dt><dd>This turns volatile promotional or gateway capacity into an ordinary evidence-driven onboarding process reusable beyond Vercel.</dd>
+          <dt>Downsides</dt><dd class="tradeoff">Promotion and demotion thresholds must be explicit and visible. Overly eager promotion risks spend or fidelity surprises; overly conservative thresholds strand free capacity.</dd>
+        </dl>
+      </article>
+    </section>
+
+    <section id="rejection-summary">
+      <p class="eyebrow">What did not survive</p>
+      <h2>Rejection Summary</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>#</th><th>Idea</th><th>Reason rejected</th></tr></thead>
+          <tbody>
+            <tr><td>2</td><td>Two-speed adoption ladder</td><td class="rejected">Duplicates the stronger combination of the canary plus entitlement graduation.</td></tr>
+            <tr><td>3</td><td>Gateway capability profile overlay</td><td class="rejected">Capability gaps are proven; preference for an overlay over the existing thin-provider pattern is not.</td></tr>
+            <tr><td>4</td><td>Provider manifest compiler</td><td class="rejected">Valuable consolidation, but too broad and expensive relative to this integration.</td></tr>
+            <tr><td>5</td><td>Probe-free connection doctor</td><td class="rejected">No stable non-secret fx inspection contract was verified.</td></tr>
+            <tr><td>7</td><td>fx-owned access broker</td><td class="rejected">Token portability and a broker interface are unconfirmed; retain as a custody-contract variant.</td></tr>
+            <tr><td>8</td><td>Vercel team as principal</td><td class="rejected">Team identity is required within custody and settlement records, but not a standalone direction.</td></tr>
+            <tr><td>9</td><td>Native protocol fan-out</td><td class="rejected">One likely implementation of the semantic firewall rather than a separate product direction.</td></tr>
+            <tr><td>11</td><td>Execution class orthogonal to model</td><td class="rejected">An important requirement inside leases and semantic admission, not a standalone survivor.</td></tr>
+            <tr><td>14</td><td>Reconciled inference ledger</td><td class="rejected">Useful follow-on; the settlement receipt establishes the authoritative record first.</td></tr>
+            <tr><td>15</td><td>Separate economic identities</td><td class="rejected">Overlaps the lease and preauthorization controls more sharply retained above.</td></tr>
+            <tr><td>16</td><td>Capital-provenance tranches</td><td class="rejected">Vercel does not expose enforceable per-generation capital provenance.</td></tr>
+            <tr><td>18</td><td>Credibility-weighted capacity</td><td class="rejected">Historical sample volume does not predict abrupt entitlement change; freshness is stronger.</td></tr>
+            <tr><td>20</td><td>Passive-only discovery</td><td class="rejected">A policy variant of entitlement leases that conflicts with the bounded-truth-budget alternative.</td></tr>
+            <tr><td>21</td><td>Bounded truth budget</td><td class="rejected">Useful brainstorm variant for lease renewal, not a separate product direction.</td></tr>
+            <tr><td>22</td><td>Route warrant / interlocking</td><td class="rejected">Broader and less precise than semantic admission plus economic preauthorization.</td></tr>
+            <tr><td>23</td><td>Nested-gateway failure envelopes</td><td class="rejected">Sound, but lower immediate value; revisit after basic Gateway routing is established.</td></tr>
+            <tr><td>24</td><td>Self-expiring model mappings</td><td class="rejected">A downstream mechanism under leases, semantic admission, and graduation.</td></tr>
+            <tr><td>25</td><td>Dynamic account-aware catalog</td><td class="rejected">Authenticated account-specific availability was not confirmed.</td></tr>
+            <tr><td>26</td><td>Interruptible workload class</td><td class="rejected">Later scheduling policy once entitlement graduation exists.</td></tr>
+            <tr class="refuted"><td>27</td><td>Wallet and entitlement independent at zero</td><td>Basis refuted: Vercel documents requests stopping when prepaid balance reaches zero.</td></tr>
+            <tr><td>28</td><td>Per-request economic bid</td><td class="rejected">Strong future refinement of preauthorization, but overlapping at this stage.</td></tr>
+            <tr><td>29</td><td>Receipt-triggered reserve breaker</td><td class="rejected">Post-response receipts cannot stop concurrent spend without the retained holds.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="sources" id="sources-references">
+      <p class="eyebrow">Evidence index</p>
+      <h2>Sources &amp; References</h2>
+      <ul>
+        <li><a href="https://github.com/StartupBros-com/better-ccflare/blob/main/packages/providers/src/providers/openai/provider.ts">Generic OpenAI-compatible provider</a> — endpoint construction, bearer auth, request/response translation.</li>
+        <li><a href="https://github.com/StartupBros-com/better-ccflare/blob/main/packages/proxy/src/handlers/account-selector.ts">Account selector</a> — exact-account, profile, capacity, and fail-closed routing.</li>
+        <li><a href="https://github.com/StartupBros-com/better-ccflare/blob/main/packages/openai-responses-adapter/src/request-translator.ts">Responses request translator</a> — model and reasoning translation limits.</li>
+        <li><a href="https://github.com/StartupBros-com/better-ccflare/blob/main/packages/core/src/usage-windows.ts">Canonical usage windows</a> — provider-neutral entitlement normalization.</li>
+        <li><a href="https://github.com/StartupBros-com/better-ccflare/blob/main/docs/solutions/rate-limit-scope-and-duration.md">Rate-limit scope and duration learning</a> — narrowest supported exclusion.</li>
+        <li><a href="https://github.com/StartupBros-com/better-ccflare/issues/224">Issue #224</a> — ideation tracker.</li>
+        <li><a href="https://vercel.com/docs/ai-gateway/sdks-and-apis">Vercel AI Gateway SDKs and APIs</a> — Messages, Chat, Responses, and native surfaces.</li>
+        <li><a href="https://vercel.com/docs/ai-gateway/authentication-and-byok">Vercel AI Gateway authentication</a> — API-key, OIDC, and BYOK behavior.</li>
+        <li><a href="https://vercel.com/docs/ai-gateway/models-and-providers">Vercel models and providers</a> — catalogs, endpoints, capabilities, and routing.</li>
+        <li><a href="https://vercel.com/ai-gateway/models/glm-5.2-fast">GLM-5.2 Fast model page</a> — current model capabilities and provider pricing.</li>
+        <li><a href="https://vercel.com/docs/ai-gateway/pricing">Vercel AI Gateway pricing</a> — credits, free allowance, and prepaid-balance behavior.</li>
+        <li><a href="https://fx.sh/docs/getting-started/authentication">fx authentication</a> — Gateway key setup and Vercel-login behavior.</li>
+        <li><a href="https://github.com/vercel-labs/fx/tree/v0.0.4">fx v0.0.4 source</a> — credential precedence, native Gateway transport, models, and usage.</li>
+      </ul>
+    </section>
+
+    <footer class="composition-signal">Composed 2026-08-20T09:30Z by <code>ce-ideate</code> from the user’s Vercel AI Gateway integration question, repository evidence, current Vercel/fx sources, and local non-inference fx metadata.</footer>
+  </main>
+</body>
+</html>
