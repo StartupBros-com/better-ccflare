@@ -1795,9 +1795,12 @@ describe("source-controlled guard", () => {
 				"{}",
 		);
 		await new Promise<void>((resolve, reject) => {
+			// 2000ms matches waitForEvent's default above: the window has to cover
+			// real child-process spawn, the guard's startup handshake, and actual
+			// socket I/O under CI scheduling variance, not just local timing.
 			const timer = setTimeout(
 				() => reject(new Error("timed out waiting for committed response")),
-				500,
+				2_000,
 			);
 			const onData = (chunk: Buffer) => {
 				if (!chunk.toString().includes(partial)) return;
