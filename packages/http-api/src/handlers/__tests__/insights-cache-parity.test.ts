@@ -21,6 +21,7 @@ describe("cache parity handler", () => {
 			db: adapter,
 			config: {
 				getCacheKeepaliveTtlMinutes: () => 0,
+				getXaiCacheKeepaliveTtlMinutes: () => 0,
 			} as APIContext["config"],
 			dbOps: {
 				getAdapter: () => adapter,
