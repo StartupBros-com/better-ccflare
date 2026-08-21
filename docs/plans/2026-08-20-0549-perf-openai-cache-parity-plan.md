@@ -125,7 +125,7 @@ The 24-hour view is advisory and cannot declare sustained parity by itself. Firs
 
 ### Key Technical Decisions
 
-- KTD1. **Use the existing telemetry planes.** Durable `requests` rows own cross-provider logical-final parity; schema-19 Codex traces own physical-attempt diagnosis; cache-flight-recorder evidence owns prefix/account continuity. No new event store or migration is justified.
+- KTD1. **Use the existing telemetry planes.** Durable `requests` rows own cross-provider logical-final parity; schema-19 Codex traces own physical-attempt diagnosis. No new event store or migration is justified. (The cache flight recorder is a separate, xAI-scoped telemetry plane; it is not wired into the Codex physical-attempt analyzer and owns no part of this parity read model.)
 - KTD2. **Centralize source-aware cache math in a pure core module.** `cache-insights` and the Codex analyzer consume one metric contract while retaining explicit additive versus inclusive source tags (R5-R8).
 - KTD3. **Make the rolling seven-day verdict authoritative.** The endpoint owns the thresholds in Success Criteria and emits the 24-hour window only as an early-warning view; it never infers parity from an unmatched short sample.
 - KTD4. **Carry pacing receipts through the existing trusted internal-header seam.** The proxy already owns `CachePacingObservation`, and the provider already strips server-derived pacing headers before upstream dispatch. Extend that seam instead of adding cross-package mutable state (R9).
@@ -149,13 +149,13 @@ flowchart TB
   C --> D[ChatGPT subscription Responses endpoint]
   B --> E[Logical final request usage]
   C --> F[Physical Codex trace]
-  B --> G[Cache flight recorder]
   E --> H[Source-aware metric kernel]
   F --> H
   H --> I[Physical-attempt analyzer]
-  G --> I
   H --> J[Durable parity and policy endpoint]
 ```
+
+Note: the cache flight recorder (xAI-scoped telemetry) is not part of this data flow; it owns no part of the parity read model above.
 
 The metric kernel serves both consumers without merging their populations. The parity endpoint labels durable usage as logical-final, while the existing analyzer labels trace evidence as physical-attempt; the operator contract keeps both scopes explicit.
 
