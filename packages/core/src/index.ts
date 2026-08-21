@@ -141,6 +141,7 @@ export {
 	patterns,
 	sanitizers,
 	validateApiKey,
+	validateBoolean,
 	validateEndpointUrl,
 	validateModelMappings,
 	validateNumber,

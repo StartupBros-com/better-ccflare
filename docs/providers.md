@@ -795,16 +795,33 @@ standard" ordering requirement.
 
 Create the account paused so it cannot receive traffic until it has been canaried.
 After creation, unpause it only for the bounded canary window, then pause it again
-on any failure:
+on any failure.
+
+The CLI's `--add-account <name> --mode openai-compatible` flow is interactive (it
+prompts for API key, endpoint, priority, and model mappings), so for a non-interactive
+rollout use the HTTP API instead. `POST /api/accounts/openai-compatible` accepts the
+full account shape as JSON, including a `paused` field that creates the row already
+paused (`paused = 1`, `pause_reason = 'manual'`):
 
 ```bash
-# 1. Add the account (created paused so it stays quarantined until canaried)
-better-ccflare --add-account vercel-gateway \
-  --provider openai-compatible \
-  --api-key vck_... \
-  --endpoint https://ai-gateway.vercel.sh/v1 \
-  --priority 100 \
-  --model-mappings '{"fable":["zai/glm-5.2-fast","zai/glm-5.2"],"opus":["zai/glm-5.2-fast","zai/glm-5.2"],"sonnet":["zai/glm-5.2-fast","zai/glm-5.2"],"haiku":["zai/glm-5.2-fast","zai/glm-5.2"]}'
+# 1. Add the account (created paused so it stays quarantined until canaried).
+#    The HTTP API accepts the full shape as JSON; `paused: true` writes the row
+#    with paused=1 and pause_reason='manual' so it cannot receive traffic yet.
+curl -X POST http://localhost:8080/api/accounts/openai-compatible \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "vercel-gateway",
+    "apiKey": "vck_...",
+    "customEndpoint": "https://ai-gateway.vercel.sh/v1",
+    "priority": 100,
+    "paused": true,
+    "modelMappings": {
+      "fable": ["zai/glm-5.2-fast", "zai/glm-5.2"],
+      "opus": ["zai/glm-5.2-fast", "zai/glm-5.2"],
+      "sonnet": ["zai/glm-5.2-fast", "zai/glm-5.2"],
+      "haiku": ["zai/glm-5.2-fast", "zai/glm-5.2"]
+    }
+  }'
 
 # 2. Resume only for the bounded canary window (KTD6)
 curl -X POST http://localhost:8080/api/accounts/<vercel-account-id>/resume
@@ -812,6 +829,13 @@ curl -X POST http://localhost:8080/api/accounts/<vercel-account-id>/resume
 # 3. If the canary fails, pause the account again to re-quarantine it
 curl -X POST http://localhost:8080/api/accounts/<vercel-account-id>/pause
 ```
+
+> **Why the HTTP API and not the CLI?** The CLI's `--add-account <name> --mode
+> openai-compatible` flow is interactive: it prompts for the API key, endpoint,
+> priority, and model mappings one at a time. A rollout recipe that must be
+> copy-pasted verbatim cannot rely on interactive prompts, so it uses the HTTP
+> API (`POST /api/accounts/openai-compatible`), which accepts every field as a
+> single JSON body — including `paused: true` for quarantine-at-creation.
 
 **Why priority 100:** `validatePriority` caps priority at 100, so 100 is the lowest
 routing precedence the platform allows — every preferred cloud or local account

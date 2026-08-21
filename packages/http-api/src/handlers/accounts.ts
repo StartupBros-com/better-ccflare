@@ -11,6 +11,7 @@ import {
 	REAUTHENTICATION_REQUIRED_CODE,
 	sanitizers,
 	validateAndSanitizeModelMappings,
+	validateBoolean,
 	validateEndpointUrl,
 	validateModelMappings,
 	validateNumber,
@@ -279,8 +280,11 @@ export function createAccountsListHandler(
 					model_fallbacks,
 					billing_type,
 					pause_reason,
+					-- API-key accounts never expire: expires_at is NULL (no expiry),
+					-- not 0 (already expired). Treat NULL as valid so a freshly
+					-- created static-key account does not immediately list as expired.
 					CASE
-						WHEN expires_at > ? THEN 1
+						WHEN expires_at IS NULL OR expires_at > ? THEN 1
 						ELSE 0
 					END as token_valid,
 					CASE
@@ -1388,6 +1392,12 @@ export function createOpenAIAccountAddHandler(dbOps: DatabaseOperations) {
 					? JSON.stringify(modelMappings)
 					: null;
 
+			// Optional paused-at-creation flag for the Vercel AI Gateway
+			// quarantine recipe (PR #236): create the account already paused so
+			// it cannot receive traffic until it has been canaried. Defaults to
+			// false (the historical behaviour — row is immediately route-eligible).
+			const createPaused = validateBoolean(body.paused, "paused") ?? false;
+
 			// Create account
 			const accountId = crypto.randomUUID();
 			const now = Date.now();
@@ -1405,8 +1415,9 @@ export function createOpenAIAccountAddHandler(dbOps: DatabaseOperations) {
 			await db.run(
 				`INSERT INTO accounts (
 					id, name, provider, api_key, refresh_token, access_token,
-					expires_at, created_at, request_count, total_requests, priority, custom_endpoint, model_mappings
-				) VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?)`,
+					expires_at, created_at, request_count, total_requests, priority, custom_endpoint, model_mappings,
+					paused, pause_reason
+				) VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				[
 					accountId,
 					name,
@@ -1423,6 +1434,8 @@ export function createOpenAIAccountAddHandler(dbOps: DatabaseOperations) {
 					priority,
 					customEndpoint,
 					finalModelMappings,
+					createPaused ? 1 : 0,
+					createPaused ? "manual" : null,
 				],
 			);
 

@@ -1512,4 +1512,105 @@ describe("Accounts Handler - U1 static-key row-shape parity", () => {
 		expect(row.access_token).toBeNull();
 		expect(row.expires_at).not.toBeNull();
 	});
+
+	// PR #236 — Finding 2: the HTTP API createOpenAIAccountAddHandler must
+	// support `paused: true` so the Vercel AI Gateway quarantine recipe can
+	// create a row that is already paused (paused=1, pause_reason='manual')
+	// instead of immediately route-eligible.
+	it("PR#236 F2: creating an openai-compatible account with paused:true writes a paused row with pause_reason='manual'", async () => {
+		const response = await createOpenAIAccountAddHandler(dbOps)(
+			makeAddRequest({
+				name: "vercel-quarantine",
+				apiKey: "vck-test-key",
+				customEndpoint: "https://ai-gateway.vercel.sh/v1",
+				priority: 100,
+				paused: true,
+				modelMappings: {
+					sonnet: ["zai/glm-5.2-fast", "zai/glm-5.2"],
+				},
+			}),
+		);
+
+		expect(response.ok).toBe(true);
+		const payload = (await response.json()) as {
+			account: { id: string; paused: boolean };
+		};
+		expect(payload.account.paused).toBe(true);
+
+		const row = await dbOps
+			.getAdapter()
+			.get<{ paused: number; pause_reason: string | null }>(
+				"SELECT paused, pause_reason FROM accounts WHERE id = ?",
+				[payload.account.id],
+			);
+		expect(row?.paused).toBe(1);
+		expect(row?.pause_reason).toBe("manual");
+	});
+
+	it("PR#236 F2: creating an openai-compatible account without paused defaults to an active (unpaused) row", async () => {
+		const response = await createOpenAIAccountAddHandler(dbOps)(
+			makeAddRequest({
+				name: "vercel-active-default",
+				apiKey: "vck-test-key-2",
+				customEndpoint: "https://ai-gateway.vercel.sh/v1",
+				priority: 50,
+			}),
+		);
+
+		expect(response.ok).toBe(true);
+		const payload = (await response.json()) as {
+			account: { id: string; paused: boolean };
+		};
+		expect(payload.account.paused).toBe(false);
+
+		const row = await dbOps
+			.getAdapter()
+			.get<{ paused: number; pause_reason: string | null }>(
+				"SELECT paused, pause_reason FROM accounts WHERE id = ?",
+				[payload.account.id],
+			);
+		expect(row?.paused).toBe(0);
+		expect(row?.pause_reason).toBeNull();
+	});
+
+	// PR #236 — Finding 3: API-key accounts have expires_at = NULL (never
+	// expire). The GET /accounts list query must treat NULL as valid, not
+	// expired, so a freshly created account does not immediately show
+	// tokenStatus: "expired" in the dashboard.
+	it("PR#236 F3: an openai-compatible account with expires_at=NULL lists as tokenStatus 'valid' (not 'expired')", async () => {
+		// Create a real account through the handler (expires_at is NULL).
+		const createResponse = await createOpenAIAccountAddHandler(dbOps)(
+			makeAddRequest({
+				name: "vercel-token-check",
+				apiKey: "vck-test-key-3",
+				customEndpoint: "https://ai-gateway.vercel.sh/v1",
+				priority: 100,
+			}),
+		);
+		expect(createResponse.ok).toBe(true);
+		const createPayload = (await createResponse.json()) as {
+			account: { id: string };
+		};
+
+		// Verify the canonical row shape: expires_at is NULL.
+		const credRow = await fetchCredentialRow(createPayload.account.id);
+		expect(credRow.expires_at).toBeNull();
+
+		// Now list accounts through the real handler and check tokenStatus.
+		const config = {
+			getUsageThrottlingFiveHourEnabled: () => false,
+			getUsageThrottlingWeeklyEnabled: () => false,
+		} as unknown as Config;
+
+		const listResponse = await createAccountsListHandler(dbOps, config)();
+		expect(listResponse.ok).toBe(true);
+		const list = (await listResponse.json()) as Array<{
+			id: string;
+			tokenStatus: string;
+		}>;
+		const account = list.find((a) => a.id === createPayload.account.id);
+
+		expect(account).toBeDefined();
+		expect(account?.tokenStatus).toBe("valid");
+	});
 });
