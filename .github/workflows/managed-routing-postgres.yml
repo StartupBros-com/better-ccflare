@@ -67,6 +67,7 @@ jobs:
           bun test
           packages/database/src/__tests__/managed-routing-postgres.integration.test.ts
           packages/database/src/repositories/__tests__/server-tool-replay-issuance.repository.test.ts
+          packages/http-api/src/__tests__/pg-live-queries.test.ts
 
       - name: Run full test suite
         run: |
@@ -77,9 +78,16 @@ jobs:
             fi
           done
 
+          # pg-live-queries.test.ts already ran above against a live database
+          # (its live block is gated on BETTER_CCFLARE_TEST_POSTGRES_URL /
+          # DATABASE_URL and fails loudly in CI if neither is set — see the
+          # file's own guard). Excluded here so it isn't also run a second
+          # time in this loop's bare env, where it would have neither var and
+          # correctly abort the whole step.
           mapfile -d '' -t test_files < <(
             find apps packages scripts tests -type f \
               \( -name '*.test.ts' -o -name '*.test.tsx' -o -name '*.spec.ts' -o -name '*.spec.tsx' \) \
+              -not -path '*/http-api/src/__tests__/pg-live-queries.test.ts' \
               -print0 | LC_ALL=C sort -z
           )
 
