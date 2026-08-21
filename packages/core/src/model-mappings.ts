@@ -5,6 +5,7 @@ import { LATEST_MODEL_BY_FAMILY } from "./models";
 import {
 	MAX_MODEL_MAPPING_CANDIDATES,
 	safeJsonParse,
+	validateEndpointUrl,
 	validateModelMappings,
 } from "./validation";
 
@@ -391,10 +392,16 @@ export function mapModelName(anthropicModel: string, account: Account): string {
 }
 
 /**
- * Get endpoint URL from account, falling back to default
+ * Get endpoint URL from account.
+ *
+ * Returns the custom endpoint string when one is configured, or `null` when the
+ * account has no endpoint. Callers that need a hard default (xAI) must supply
+ * their own fallback — this function never silently defaults to the OpenAI host.
+ *
+ * This replaces the old behavior of falling back to `https://api.openai.com`,
+ * which made missing endpoints silently route to OpenAI (R3).
  */
-export function getEndpointUrl(account: Account): string {
-	const defaultEndpoint = "https://api.openai.com";
+export function getEndpointUrl(account: Account): string | null {
 	const customEndpointData = parseCustomEndpointData(account.custom_endpoint);
 
 	if (customEndpointData?.endpoint) {
@@ -410,8 +417,48 @@ export function getEndpointUrl(account: Account): string {
 		return account.custom_endpoint.trim();
 	}
 
-	// No custom endpoint - use default
-	return defaultEndpoint;
+	// No custom endpoint — return null so callers can fail closed (R3)
+	return null;
+}
+
+/**
+ * A typed result for compatible-endpoint resolution.
+ * Either the endpoint is available, or the account is unavailable with a reason.
+ */
+export type CompatibleEndpointResolution =
+	| { ok: true; endpoint: string }
+	| { ok: false };
+
+/**
+ * Resolve a compatible account's endpoint with fail-closed semantics (R3).
+ *
+ * Returns `{ ok: true, endpoint }` when the account has a valid, parseable
+ * endpoint URL. Returns `{ ok: false }` when the endpoint is missing, empty,
+ * or unparseable — the account becomes unavailable instead of silently
+ * routing to the default OpenAI host.
+ *
+ * The returned endpoint is validated and has its trailing slash stripped.
+ */
+export function resolveCompatibleEndpoint(
+	account: Account,
+): CompatibleEndpointResolution {
+	let raw: string | null;
+	try {
+		raw = getEndpointUrl(account);
+	} catch {
+		return { ok: false };
+	}
+
+	if (!raw) {
+		return { ok: false };
+	}
+
+	try {
+		const validated = validateEndpointUrl(raw, "endpoint");
+		return { ok: true, endpoint: validated };
+	} catch {
+		return { ok: false };
+	}
 }
 
 /**

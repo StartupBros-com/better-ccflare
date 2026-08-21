@@ -1,3 +1,4 @@
+import { AuthError } from "@better-ccflare/core";
 import type { Account } from "@better-ccflare/types";
 import { OpenAICompatibleProvider } from "../provider";
 
@@ -7,14 +8,16 @@ describe("OpenAICompatibleProvider", () => {
 
 	beforeEach(() => {
 		provider = new OpenAICompatibleProvider();
+		// Canonical shape (KTD4/R2): a CLI-created compatible account stores
+		// its static key in `api_key` and has no OAuth-shaped `refresh_token`.
 		mockAccount = {
 			id: "test-id",
 			name: "test-account",
 			provider: "openai-compatible",
-			refresh_token: "test-api-key",
+			refresh_token: null,
 			access_token: null,
 			expires_at: null,
-			api_key: null,
+			api_key: "test-api-key",
 			custom_endpoint: JSON.stringify({
 				endpoint: "https://api.openrouter.ai/api/v1",
 			}),
@@ -55,13 +58,14 @@ describe("OpenAICompatibleProvider", () => {
 			expect(url).toBe("https://api.openrouter.ai/api/v1/chat/completions");
 		});
 
-		it("should use default endpoint when no custom endpoint", () => {
+		it("should throw when no custom endpoint — fail-closed (R3)", () => {
 			const accountWithoutEndpoint = {
 				...mockAccount,
 				custom_endpoint: undefined,
 			};
-			const url = provider.buildUrl("/v1/messages", "", accountWithoutEndpoint);
-			expect(url).toBe("https://api.openai.com/v1/chat/completions");
+			expect(() =>
+				provider.buildUrl("/v1/messages", "", accountWithoutEndpoint),
+			).toThrow();
 		});
 
 		it("should convert Anthropic path to OpenAI path", () => {
@@ -88,19 +92,16 @@ describe("OpenAICompatibleProvider", () => {
 			expect(url).toBe("https://api.example.com/v1/chat/completions");
 		});
 
-		it("should fall back to default when JSON endpoint is missing", () => {
+		it("should throw when JSON endpoint blob has no endpoint field — fail-closed (R3)", () => {
 			const accountWithMappingsOnly = {
 				...mockAccount,
 				custom_endpoint: JSON.stringify({
 					modelMappings: { opus: "custom-model" },
 				}),
 			};
-			const url = provider.buildUrl(
-				"/v1/messages",
-				"",
-				accountWithMappingsOnly,
-			);
-			expect(url).toBe("https://api.openai.com/v1/chat/completions");
+			expect(() =>
+				provider.buildUrl("/v1/messages", "", accountWithMappingsOnly),
+			).toThrow();
 		});
 	});
 
@@ -272,7 +273,9 @@ describe("OpenAICompatibleProvider", () => {
 	});
 
 	describe("refreshToken", () => {
-		it("should return existing API key for API key providers", async () => {
+		it("authenticates from api_key (canonical compatible-lane shape, R2/KTD4)", async () => {
+			// A CLI-created compatible account holds only api_key — no
+			// OAuth-shaped refresh_token.
 			const result = await provider.refreshToken(mockAccount, "client-id");
 
 			expect(result.accessToken).toBe("test-api-key");
@@ -280,12 +283,32 @@ describe("OpenAICompatibleProvider", () => {
 			expect(result.expiresAt).toBeGreaterThan(Date.now());
 		});
 
-		it("should throw error when no API key is available", async () => {
-			const accountWithoutKey = { ...mockAccount, refresh_token: null };
+		it("authenticates from a legacy mirrored refresh_token (KTD4 fallback)", async () => {
+			// Legacy rows mirror the static key into refresh_token with no
+			// api_key. The contract must still resolve it.
+			const legacyAccount: Account = {
+				...mockAccount,
+				api_key: null,
+				refresh_token: "legacy-mirrored-key",
+			};
+
+			const result = await provider.refreshToken(legacyAccount, "client-id");
+
+			expect(result.accessToken).toBe("legacy-mirrored-key");
+			expect(result.refreshToken).toBe("");
+			expect(result.expiresAt).toBeGreaterThan(Date.now());
+		});
+
+		it("raises a typed credential error when neither api_key nor refresh_token exists", async () => {
+			const accountWithoutKey: Account = {
+				...mockAccount,
+				api_key: null,
+				refresh_token: null,
+			};
 
 			await expect(
 				provider.refreshToken(accountWithoutKey, "client-id"),
-			).rejects.toThrow("No API key available");
+			).rejects.toBeInstanceOf(AuthError);
 		});
 	});
 
@@ -717,6 +740,251 @@ describe("OpenAICompatibleProvider", () => {
 				expect(systemMsg.content[0]).toHaveProperty("cache_control");
 			}
 			expect(openaiBodyA.enable_thinking).toBe(true);
+		});
+	});
+
+	describe("fail-closed endpoint resolution (R3)", () => {
+		it("throws when account has no custom endpoint — does not reach OpenAI host", () => {
+			const accountWithoutEndpoint = {
+				...mockAccount,
+				custom_endpoint: undefined,
+			};
+			expect(() =>
+				provider.buildUrl("/v1/messages", "", accountWithoutEndpoint),
+			).toThrow();
+		});
+
+		it("throws when custom_endpoint is null — does not reach OpenAI host", () => {
+			const accountWithNull = { ...mockAccount, custom_endpoint: null };
+			expect(() =>
+				provider.buildUrl("/v1/messages", "", accountWithNull),
+			).toThrow();
+		});
+
+		it("throws when custom_endpoint is an empty string — does not reach OpenAI host", () => {
+			const accountWithEmpty = { ...mockAccount, custom_endpoint: "" };
+			expect(() =>
+				provider.buildUrl("/v1/messages", "", accountWithEmpty),
+			).toThrow();
+		});
+
+		it("throws when custom_endpoint is an unparseable URL — does not reach OpenAI host", () => {
+			const accountWithBad = { ...mockAccount, custom_endpoint: "not-a-url" };
+			expect(() =>
+				provider.buildUrl("/v1/messages", "", accountWithBad),
+			).toThrow();
+		});
+
+		it("throws when JSON endpoint blob has no endpoint field — does not reach OpenAI host", () => {
+			const accountMappingsOnly = {
+				...mockAccount,
+				custom_endpoint: JSON.stringify({
+					modelMappings: { opus: "custom-model" },
+				}),
+			};
+			expect(() =>
+				provider.buildUrl("/v1/messages", "", accountMappingsOnly),
+			).toThrow();
+		});
+
+		it("never produces a URL pointing at the default OpenAI host", () => {
+			// Even if somehow called without an account, the error must prevent
+			// a resolved URL from reaching api.openai.com.
+			expect(() => provider.buildUrl("/v1/messages", "")).toThrow();
+		});
+
+		it("joins a /v1 endpoint with the messages path yielding exactly one /v1 segment", () => {
+			const accountWithV1 = {
+				...mockAccount,
+				custom_endpoint: "https://api.example.com/v1",
+			};
+			const url = provider.buildUrl("/v1/messages", "", accountWithV1);
+			expect(url).toBe("https://api.example.com/v1/chat/completions");
+			expect(url.match(/\/v1/g)?.length).toBe(1);
+		});
+
+		it("resolves a plain-string endpoint identically to an equivalent JSON blob", () => {
+			const plainAccount = {
+				...mockAccount,
+				custom_endpoint: "https://api.openrouter.ai/api/v1",
+			};
+			const jsonAccount = {
+				...mockAccount,
+				custom_endpoint: JSON.stringify({
+					endpoint: "https://api.openrouter.ai/api/v1",
+				}),
+			};
+			expect(provider.buildUrl("/v1/messages", "", plainAccount)).toBe(
+				provider.buildUrl("/v1/messages", "", jsonAccount),
+			);
+		});
+
+		it("still injects cache_control and enable_thinking for DashScope endpoints", async () => {
+			const dashscopeAccount: Account = {
+				...mockAccount,
+				custom_endpoint: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+				model_mappings: JSON.stringify({ opus: "qwen3.5-plus" }),
+			};
+
+			const request = new Request("https://example.com/v1/messages", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					model: "claude-3-opus-20240229",
+					system: "You are a helpful assistant",
+					max_tokens: 1000,
+					messages: [
+						{ role: "user", content: "Hello" },
+						{ role: "assistant", content: "Hi" },
+					],
+				}),
+			});
+
+			const transformed = await provider.transformRequestBody(
+				request,
+				dashscopeAccount,
+			);
+			const body = await transformed.json();
+
+			expect(body.enable_thinking).toBe(true);
+			const systemMsg = body.messages.find(
+				(m: { role: string }) => m.role === "system",
+			);
+			expect(systemMsg).toBeDefined();
+			if (Array.isArray(systemMsg?.content)) {
+				expect(systemMsg.content[0]).toHaveProperty("cache_control");
+			}
+		});
+
+		it("transformRequestBody does not throw when endpoint is missing — hooks are skipped", async () => {
+			// transformRequestBody uses the endpoint only for DashScope hooks.
+			// A missing endpoint must not throw here — the actual URL is built
+			// by buildUrl, which does throw. The hooks are simply skipped.
+			const accountWithoutEndpoint = {
+				...mockAccount,
+				custom_endpoint: undefined,
+			};
+
+			const request = new Request("https://example.com/v1/messages", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					model: "claude-3-haiku-20241022",
+					max_tokens: 100,
+					messages: [{ role: "user", content: "Hello" }],
+				}),
+			});
+
+			// Must not throw — should return a transformed request
+			const transformed = await provider.transformRequestBody(
+				request,
+				accountWithoutEndpoint,
+			);
+			const body = await transformed.json();
+			expect(body.model).toBe("claude-3-haiku-20241022");
+			expect(body.enable_thinking).toBeUndefined();
+		});
+	});
+
+	// R15/KTD8: an unknown gateway model must record no cost rather than a
+	// confident wrong estimate from the fallback price. An absent value is
+	// honestly unknown; the old `default` rate produced a fabricated number.
+	describe("cost for unknown models (R15/KTD8)", () => {
+		function openaiJsonResponse(body: object): Response {
+			return new Response(JSON.stringify(body), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		}
+
+		it("records no cost for a model with no known price (AE8)", async () => {
+			const response = openaiJsonResponse({
+				id: "chatcmpl-unk",
+				model: "zai/glm-5.2-fast",
+				choices: [
+					{
+						message: { role: "assistant", content: "hi" },
+						finish_reason: "stop",
+					},
+				],
+				usage: {
+					prompt_tokens: 1000,
+					completion_tokens: 500,
+					total_tokens: 1500,
+				},
+			});
+
+			const info = await provider.extractUsageInfo(response);
+			expect(info).not.toBeNull();
+			// No known price → costUsd is absent, not a fabricated estimate.
+			expect(info?.costUsd).toBeUndefined();
+		});
+
+		it("records the same cost as before for a model with a known price", async () => {
+			const response = openaiJsonResponse({
+				id: "chatcmpl-known",
+				model: "gpt-4o",
+				choices: [
+					{
+						message: { role: "assistant", content: "hi" },
+						finish_reason: "stop",
+					},
+				],
+				usage: {
+					prompt_tokens: 1000,
+					completion_tokens: 500,
+					total_tokens: 1500,
+				},
+			});
+
+			const info = await provider.extractUsageInfo(response);
+			expect(info).not.toBeNull();
+			// (1000/1000 * 0.005) + (500/1000 * 0.015) = 0.005 + 0.0075 = 0.0125
+			expect(info?.costUsd).toBeCloseTo(0.0125, 6);
+		});
+
+		it("distinguishes an absent cost from a recorded zero", async () => {
+			// A model with no known price yields an absent costUsd (undefined).
+			const unknownResponse = openaiJsonResponse({
+				id: "chatcmpl-unk2",
+				model: "totally-unknown-model",
+				choices: [
+					{
+						message: { role: "assistant", content: "hi" },
+						finish_reason: "stop",
+					},
+				],
+				usage: {
+					prompt_tokens: 100,
+					completion_tokens: 50,
+					total_tokens: 150,
+				},
+			});
+			const unknownInfo = await provider.extractUsageInfo(unknownResponse);
+			expect(unknownInfo?.costUsd).toBeUndefined();
+
+			// A recorded zero is a number — it must not collapse to undefined.
+			// A known model with zero tokens legitimately records cost 0.
+			const zeroResponse = openaiJsonResponse({
+				id: "chatcmpl-zero",
+				model: "gpt-4o",
+				choices: [
+					{
+						message: { role: "assistant", content: "" },
+						finish_reason: "stop",
+					},
+				],
+				usage: {
+					prompt_tokens: 0,
+					completion_tokens: 0,
+					total_tokens: 0,
+				},
+			});
+			const zeroInfo = await provider.extractUsageInfo(zeroResponse);
+			expect(zeroInfo?.costUsd).toBe(0);
+
+			// The two are distinguishable: undefined !== 0.
+			expect(unknownInfo?.costUsd).not.toBe(zeroInfo?.costUsd);
 		});
 	});
 });

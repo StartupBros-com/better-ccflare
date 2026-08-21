@@ -11,6 +11,7 @@ import {
 	REAUTHENTICATION_REQUIRED_CODE,
 	sanitizers,
 	validateAndSanitizeModelMappings,
+	validateBoolean,
 	validateEndpointUrl,
 	validateModelMappings,
 	validateNumber,
@@ -279,8 +280,11 @@ export function createAccountsListHandler(
 					model_fallbacks,
 					billing_type,
 					pause_reason,
+					-- API-key accounts never expire: expires_at is NULL (no expiry),
+					-- not 0 (already expired). Treat NULL as valid so a freshly
+					-- created static-key account does not immediately list as expired.
 					CASE
-						WHEN expires_at > ? THEN 1
+						WHEN expires_at IS NULL OR expires_at > ? THEN 1
 						ELSE 0
 					END as token_valid,
 					CASE
@@ -1388,6 +1392,12 @@ export function createOpenAIAccountAddHandler(dbOps: DatabaseOperations) {
 					? JSON.stringify(modelMappings)
 					: null;
 
+			// Optional paused-at-creation flag for the Vercel AI Gateway
+			// quarantine recipe (PR #236): create the account already paused so
+			// it cannot receive traffic until it has been canaried. Defaults to
+			// false (the historical behaviour — row is immediately route-eligible).
+			const createPaused = validateBoolean(body.paused, "paused") ?? false;
+
 			// Create account
 			const accountId = crypto.randomUUID();
 			const now = Date.now();
@@ -1405,22 +1415,27 @@ export function createOpenAIAccountAddHandler(dbOps: DatabaseOperations) {
 			await db.run(
 				`INSERT INTO accounts (
 					id, name, provider, api_key, refresh_token, access_token,
-					expires_at, created_at, request_count, total_requests, priority, custom_endpoint, model_mappings
-				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+					expires_at, created_at, request_count, total_requests, priority, custom_endpoint, model_mappings,
+					paused, pause_reason
+				) VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				[
 					accountId,
 					name,
 					"openai-compatible",
 					apiKey,
-					apiKey, // Use API key as refresh token for consistency
-					apiKey, // Use API key as access token
-					now + 365 * 24 * 60 * 60 * 1000, // 1 year from now
+					// API-key providers store the credential in api_key only. Mirroring
+					// it into refresh_token/access_token/expires_at is the legacy shape
+					// that deriveComboRouteClass only tolerates for backward
+					// compatibility; the CLI creation path already writes NULL here.
+					// R1: both creation surfaces must produce the same credential row.
 					now,
 					0,
 					0,
 					priority,
 					customEndpoint,
 					finalModelMappings,
+					createPaused ? 1 : 0,
+					createPaused ? "manual" : null,
 				],
 			);
 
@@ -1437,7 +1452,7 @@ export function createOpenAIAccountAddHandler(dbOps: DatabaseOperations) {
 				total_requests: number;
 				last_used: number | null;
 				created_at: number;
-				expires_at: number;
+				expires_at: number | null;
 				refresh_token: string;
 				paused: number;
 			}>(
@@ -1468,7 +1483,11 @@ export function createOpenAIAccountAddHandler(dbOps: DatabaseOperations) {
 					paused: account.paused === 1,
 					priority: priority,
 					tokenStatus: "valid" as const,
-					tokenExpiresAt: new Date(account.expires_at).toISOString(),
+					// Static-key accounts never expire; expires_at is NULL in the
+					// canonical row shape (matches the CLI creation path).
+					tokenExpiresAt: account.expires_at
+						? new Date(account.expires_at).toISOString()
+						: null,
 					rateLimitStatus: "OK",
 					rateLimitReset: null,
 					rateLimitRemaining: null,

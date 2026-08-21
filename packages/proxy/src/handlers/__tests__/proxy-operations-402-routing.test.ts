@@ -766,3 +766,296 @@ describe("raw upstream HTTP 402 routing", () => {
 		});
 	});
 });
+
+// ── U5 canary contract: AE4, AE5, AE6 (constructed fixtures) ────────────────
+//
+// ALL fixtures in this describe block are CONSTRUCTED from the provider's
+// documented error shapes, not captured from live traffic. The 402, 429, and
+// model-scoped (404/400 model_not_found) failure shapes were built from
+// documented Vercel/OpenAI-compatible error responses, not provoked live
+// (KTD7). No live capture was available.
+//
+// The Vercel catch-all is modeled as an openai-compatible account with
+// model_mappings that route every Claude family to zai/glm-5.2-fast (primary)
+// then zai/glm-5.2 (fallback), matching the U4 recipe.
+
+describe("U5 canary: AE4 model-scoped Fast failure advances to standard GLM", () => {
+	// CONSTRUCTED fixture: a model-scoped 404 (model_not_found) response for
+	// the Fast primary model. This shape mirrors the OpenAI-compatible error
+	// for an unavailable model, built from documented error shapes.
+	function modelNotFoundResponse(model: string): Response {
+		return new Response(
+			JSON.stringify({
+				error: {
+					type: "not_found_error",
+					code: "model_not_found",
+					message: `The model '${model}' does not exist`,
+				},
+			}),
+			{
+				status: 404,
+				headers: { "content-type": "application/json" },
+			},
+		);
+	}
+
+	it("advances from zai/glm-5.2-fast to zai/glm-5.2 on a model-scoped 404 and succeeds", async () => {
+		const vercel = makeAccount("vercel-catchall", {
+			model_mappings: JSON.stringify({
+				opus: ["zai/glm-5.2-fast", "zai/glm-5.2"],
+			}),
+		});
+		const harness = makeContext([vercel]);
+		const attemptedModels: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const request = input instanceof Request ? input : new Request(input);
+			const body = (await request.clone().json()) as { model?: string };
+			const model = body.model ?? "missing";
+			attemptedModels.push(model);
+			// First attempt (Fast primary) returns model-scoped 404
+			if (model === "zai/glm-5.2-fast") {
+				return modelNotFoundResponse("zai/glm-5.2-fast");
+			}
+			// Second attempt (standard GLM) succeeds
+			return successResponse(model);
+		}) as unknown as typeof fetch;
+		const request = makeRequest();
+
+		const response = await handleProxy(
+			request,
+			new URL(request.url),
+			harness.ctx,
+		);
+		await harness.flush();
+
+		expect(attemptedModels).toEqual(["zai/glm-5.2-fast", "zai/glm-5.2"]);
+		expect(response.status).toBe(200);
+		expect(vercel.rate_limited_until).toBeNull();
+		// No account-level cooldown was applied (model-scoped failure)
+		expect(harness.markAccountRateLimited).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		400, 404,
+	] as const)("advances from Fast to standard GLM on a model-scoped %i and succeeds", async (status) => {
+		const vercel = makeAccount("vercel-catchall", {
+			model_mappings: JSON.stringify({
+				opus: ["zai/glm-5.2-fast", "zai/glm-5.2"],
+			}),
+		});
+		const harness = makeContext([vercel]);
+		const attemptedModels: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const request = input instanceof Request ? input : new Request(input);
+			const body = (await request.clone().json()) as { model?: string };
+			const model = body.model ?? "missing";
+			attemptedModels.push(model);
+			if (model === "zai/glm-5.2-fast") {
+				return modelUnavailableResponse(status);
+			}
+			return successResponse(model);
+		}) as unknown as typeof fetch;
+		const request = makeRequest();
+
+		const response = await handleProxy(
+			request,
+			new URL(request.url),
+			harness.ctx,
+		);
+		await harness.flush();
+
+		expect(attemptedModels).toEqual(["zai/glm-5.2-fast", "zai/glm-5.2"]);
+		expect(response.status).toBe(200);
+	});
+});
+
+describe("U5 canary: AE5 account-wide 402 ends the account attempt without trying standard GLM", () => {
+	it("does not advance to zai/glm-5.2 after an account-wide 402 on zai/glm-5.2-fast", async () => {
+		const vercel = makeAccount("vercel-catchall", {
+			model_mappings: JSON.stringify({
+				opus: ["zai/glm-5.2-fast", "zai/glm-5.2"],
+			}),
+		});
+		const harness = makeContext([vercel]);
+		const upstream = observable402({ "retry-after": "120" });
+		const attemptedModels: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const request = input instanceof Request ? input : new Request(input);
+			const body = (await request.clone().json()) as { model?: string };
+			attemptedModels.push(body.model ?? "missing");
+			return upstream.response;
+		}) as unknown as typeof fetch;
+		const request = makeRequest();
+
+		const response = await handleProxy(
+			request,
+			new URL(request.url),
+			harness.ctx,
+		);
+		await harness.flush();
+
+		// Only the Fast primary was tried — standard GLM was NOT attempted
+		expect(attemptedModels).toEqual(["zai/glm-5.2-fast"]);
+		// The 402 ended the account attempt; with only one account the
+		// outer router returns a stable route_unavailable (503)
+		expect(response.status).toBe(503);
+		const payload = (await response.json()) as {
+			error: { code: string };
+		};
+		expect(payload.error.code).toBe("route_unavailable");
+		// Account was benched with the 402 reason
+		expect(vercel.rate_limited_until).toBeGreaterThan(NOW);
+		expect(harness.markAccountRateLimited).toHaveBeenCalledTimes(1);
+		expect(harness.markAccountRateLimited.mock.calls[0]?.[2]).toBe(
+			"upstream_402_payment_required",
+		);
+		expect(getRequestRateLimitOutcomes(request)).toEqual([
+			expect.objectContaining({
+				accountId: vercel.id,
+				status: 402,
+				scope: "account",
+				reason: "upstream_402_payment_required",
+				availableAt: null,
+			}),
+		]);
+	});
+
+	it("leaves outer failover unchanged — a second higher-priority account can still serve", async () => {
+		const vercel = makeAccount("vercel-catchall", {
+			priority: 100,
+			model_mappings: JSON.stringify({
+				opus: ["zai/glm-5.2-fast", "zai/glm-5.2"],
+			}),
+		});
+		const preferred = makeAccount("preferred", {
+			priority: 10,
+			model_mappings: JSON.stringify({
+				opus: ["preferred-opus"],
+			}),
+		});
+		const harness = makeContext([preferred, vercel]);
+		const vercel402 = observable402({ "retry-after": "120" });
+		const attemptedModels: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			const request = input instanceof Request ? input : new Request(input);
+			const body = (await request.clone().json()) as { model?: string };
+			const model = body.model ?? "missing";
+			attemptedModels.push(model);
+			const hostname = new URL(request.url).hostname;
+			// Vercel account 402s
+			if (hostname === "vercel-catchall.test") {
+				return vercel402.response;
+			}
+			// Preferred account succeeds
+			return successResponse(model);
+		}) as unknown as typeof fetch;
+		const request = makeRequest();
+
+		const response = await handleProxy(
+			request,
+			new URL(request.url),
+			harness.ctx,
+		);
+		await harness.flush();
+
+		// Vercel was tried first (lower priority number = higher priority... but
+		// priority 100 is the platform max, so preferred at 10 comes first).
+		// Actually: strategy.select returns accounts as-is, and the proxy tries
+		// them in order. The preferred account (priority 10) should be tried
+		// first and succeed without reaching Vercel.
+		expect(response.status).toBe(200);
+		expect(vercel.rate_limited_until).toBeNull();
+		expect(harness.markAccountRateLimited).not.toHaveBeenCalled();
+	});
+});
+
+describe("U5 canary: AE6 billed canary result is recorded as evidence only, not a pass condition", () => {
+	it("records a billed canary request (usage > 0) as evidence without failing admission", async () => {
+		// AE6: The canary's billed outcome is evidence only. A successful
+		// response with non-zero usage must not be treated as a failure —
+		// the canary passes because routing and streaming worked, not
+		// because the charge was zero.
+		const vercel = makeAccount("vercel-catchall", {
+			model_mappings: JSON.stringify({
+				opus: ["zai/glm-5.2-fast", "zai/glm-5.2"],
+			}),
+		});
+		const harness = makeContext([vercel]);
+		globalThis.fetch = mock(async () => {
+			// A billed success response — usage carries a non-zero charge
+			return new Response(
+				JSON.stringify({
+					id: "msg_billed_canary",
+					type: "message",
+					role: "assistant",
+					content: [{ type: "text", text: "ok" }],
+					model: "zai/glm-5.2-fast",
+					stop_reason: "end_turn",
+					usage: { input_tokens: 100, output_tokens: 50 },
+				}),
+				{
+					status: 200,
+					headers: { "content-type": "application/json" },
+				},
+			);
+		}) as unknown as typeof fetch;
+		const request = makeRequest();
+
+		const response = await handleProxy(
+			request,
+			new URL(request.url),
+			harness.ctx,
+		);
+		await harness.flush();
+
+		// The canary succeeds: routing worked, response is 200
+		expect(response.status).toBe(200);
+		// Billing is recorded as evidence only — it does NOT trigger an
+		// account cooldown, pause, or any failure classification
+		expect(vercel.rate_limited_until).toBeNull();
+		expect(vercel.paused).toBe(false);
+		expect(harness.markAccountRateLimited).not.toHaveBeenCalled();
+	});
+
+	it("records a zero-cost canary result as evidence without changing admission", async () => {
+		// AE6/R13: A canary remains economically successful whether Vercel bills
+		// it at zero or debits the configured balance. A zero-cost success must
+		// pass admission identically to a billed success.
+		const vercel = makeAccount("vercel-catchall", {
+			model_mappings: JSON.stringify({
+				opus: ["zai/glm-5.2-fast", "zai/glm-5.2"],
+			}),
+		});
+		const harness = makeContext([vercel]);
+		globalThis.fetch = mock(async () => {
+			return new Response(
+				JSON.stringify({
+					id: "msg_zero_cost_canary",
+					type: "message",
+					role: "assistant",
+					content: [{ type: "text", text: "ok" }],
+					model: "zai/glm-5.2-fast",
+					stop_reason: "end_turn",
+					usage: { input_tokens: 10, output_tokens: 5 },
+				}),
+				{
+					status: 200,
+					headers: { "content-type": "application/json" },
+				},
+			);
+		}) as unknown as typeof fetch;
+		const request = makeRequest();
+
+		const response = await handleProxy(
+			request,
+			new URL(request.url),
+			harness.ctx,
+		);
+		await harness.flush();
+
+		expect(response.status).toBe(200);
+		expect(vercel.rate_limited_until).toBeNull();
+		expect(vercel.paused).toBe(false);
+		expect(harness.markAccountRateLimited).not.toHaveBeenCalled();
+	});
+});

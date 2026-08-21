@@ -585,7 +585,7 @@ describe("extractUsageInfo", () => {
 		expect(info?.costUsd).toBeCloseTo(0.0125, 6);
 	});
 
-	it("returns non-zero cost for unknown model using default pricing", async () => {
+	it("records no cost for an unknown model (R15/KTD8)", async () => {
 		const provider = makeProvider();
 		const response = openaiJsonResponse({
 			id: "chatcmpl-unk",
@@ -601,8 +601,9 @@ describe("extractUsageInfo", () => {
 
 		const info = await provider.extractUsageInfo(response);
 		expect(info).not.toBeNull();
-		// Default pricing: input 0.001/1k, output 0.002/1k → (100/1000)*0.001 + (50/1000)*0.002 = 0.0001 + 0.0001 = 0.0002
-		expect(info?.costUsd).toBeGreaterThan(0);
+		// No known price → no fabricated cost (KTD8/R15). An absent value is
+		// honestly unknown, unlike the old default-rate estimate.
+		expect(info?.costUsd).toBeUndefined();
 	});
 
 	it("returns null for streaming (SSE) responses", async () => {

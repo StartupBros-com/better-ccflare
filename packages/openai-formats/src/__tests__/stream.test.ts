@@ -1669,3 +1669,243 @@ describe("transformStreamingResponse — block index assignment", () => {
 		expect(indices.sort()).toEqual([0, 1]);
 	});
 });
+
+// ── U5 canary contract: AE3 streamed xhigh reasoning + tool turn ───────────
+//
+// ALL fixtures in this describe block are CONSTRUCTED from the provider's
+// documented streaming shape, not captured from live traffic. The success
+// shape (reasoning_content + tool_calls + usage + [DONE]) mirrors what a
+// Vercel AI Gateway compatible stream would emit for a GLM model serving a
+// Claude Code turn with xhigh reasoning intent and a function tool. No live
+// capture was available (KTD7), so this fixture is explicitly labelled as
+// constructed rather than observed.
+
+describe("U5 canary: AE3 streamed xhigh reasoning + function tool turn (constructed fixture)", () => {
+	/**
+	 * CONSTRUCTED fixture: a complete OpenAI SSE stream representing a Claude
+	 * Code turn with xhigh reasoning intent. The stream carries:
+	 *   1. reasoning_content (thinking) — the xhigh reasoning intent
+	 *   2. a tool_call (function round trip)
+	 *   3. terminal usage (prompt_tokens, completion_tokens)
+	 *   4. anormal termination)
+	 *
+	 * Built from the documented OpenAI-compatible streaming shape, not from a
+	 * live capture. Credentials, trace IDs, team IDs, and billed amounts are
+	 * absent by construction.
+	 */
+	function makeXhighToolTurnStream(): Response {
+		return makeOpenAIStream([
+			// 1. Reasoning content (xhigh thinking)
+			JSON.stringify({
+				id: "chatcmpl-canary-constructed",
+				object: "chat.completion.chunk",
+				model: "zai/glm-5.2-fast",
+				choices: [
+					{
+						index: 0,
+						delta: { reasoning_content: "Analyzing the request " },
+						finish_reason: null,
+					},
+				],
+			}),
+			JSON.stringify({
+				id: "chatcmpl-canary-constructed",
+				object: "chat.completion.chunk",
+				model: "zai/glm-5.2-fast",
+				choices: [
+					{
+						index: 0,
+						delta: { reasoning_content: "before tool use." },
+						finish_reason: null,
+					},
+				],
+			}),
+			// 2. Function tool call (start)
+			JSON.stringify({
+				id: "chatcmpl-canary-constructed",
+				object: "chat.completion.chunk",
+				model: "zai/glm-5.2-fast",
+				choices: [
+					{
+						index: 0,
+						delta: {
+							tool_calls: [
+								{
+									index: 0,
+									id: "call_canary_constructed",
+									type: "function",
+									function: { name: "read_file", arguments: "" },
+								},
+							],
+						},
+						finish_reason: null,
+					},
+				],
+			}),
+			// 3. Function tool call (argument fragments)
+			JSON.stringify({
+				id: "chatcmpl-canary-constructed",
+				object: "chat.completion.chunk",
+				model: "zai/glm-5.2-fast",
+				choices: [
+					{
+						index: 0,
+						delta: {
+							tool_calls: [
+								{ index: 0, function: { arguments: '{"path":"src' } },
+							],
+						},
+						finish_reason: null,
+					},
+				],
+			}),
+			JSON.stringify({
+				id: "chatcmpl-canary-constructed",
+				object: "chat.completion.chunk",
+				model: "zai/glm-5.2-fast",
+				choices: [
+					{
+						index: 0,
+						delta: {
+							tool_calls: [
+								{ index: 0, function: { arguments: '/index.ts"}' } },
+							],
+						},
+						finish_reason: "tool_calls",
+					},
+				],
+			}),
+			// 4. Terminal usage
+			JSON.stringify({
+				id: "chatcmpl-canary-constructed",
+				object: "chat.completion.chunk",
+				model: "zai/glm-5.2-fast",
+				choices: [],
+				usage: { prompt_tokens: 42, completion_tokens: 13 },
+			}),
+			// 5. Normal termination
+			"[DONE]",
+		]);
+	}
+
+	it("emits thinking blocks from reasoning_content (xhigh reasoning intent)", async () => {
+		const upstream = makeXhighToolTurnStream();
+		const transformed = transformStreamingResponse(upstream);
+		const raw = await readStream(transformed.body);
+		const events = parseSSEEvents(raw);
+
+		const thinkingStarts = events.filter(
+			(e) =>
+				e.event === "content_block_start" &&
+				parseEventData(e).content_block?.type === "thinking",
+		);
+		expect(thinkingStarts).toHaveLength(1);
+		expect(parseEventData(thinkingStarts[0]).index).toBe(0);
+
+		const thinkingDeltas = events.filter(
+			(e) =>
+				e.event === "content_block_delta" &&
+				parseEventData(e).delta?.type === "thinking_delta",
+		);
+		expect(thinkingDeltas.length).toBeGreaterThanOrEqual(2);
+		const thoughts = thinkingDeltas.map(
+			(e) => parseEventData(e).delta.thinking,
+		);
+		expect(thoughts).toContain("Analyzing the request ");
+		expect(thoughts).toContain("before tool use.");
+	});
+
+	it("emits a tool_use block with the function round trip", async () => {
+		const upstream = makeXhighToolTurnStream();
+		const transformed = transformStreamingResponse(upstream);
+		const raw = await readStream(transformed.body);
+		const events = parseSSEEvents(raw);
+
+		const toolStart = events.find(
+			(e) =>
+				e.event === "content_block_start" &&
+				parseEventData(e).content_block?.type === "tool_use",
+		);
+		expect(toolStart).toBeDefined();
+		if (!toolStart) throw new Error("expected tool_use block_start event");
+		const toolStartData = parseEventData(toolStart);
+		expect(toolStartData.content_block.name).toBe("read_file");
+		expect(toolStartData.content_block.id).toBe("call_canary_constructed");
+		// Tool block follows thinking at index 1
+		expect(toolStartData.index).toBe(1);
+
+		// Buffered input_json_delta emitted with complete arguments
+		const jsonDelta = events.find(
+			(e) =>
+				e.event === "content_block_delta" &&
+				parseEventData(e).delta?.type === "input_json_delta",
+		);
+		expect(jsonDelta).toBeDefined();
+		if (!jsonDelta) throw new Error("expected input_json_delta event");
+		expect(parseEventData(jsonDelta).delta.partial_json).toBe(
+			'{"path":"src/index.ts"}',
+		);
+	});
+
+	it("emits terminal usage from the upstream usage chunk", async () => {
+		const upstream = makeXhighToolTurnStream();
+		const transformed = transformStreamingResponse(upstream);
+		const raw = await readStream(transformed.body);
+		const events = parseSSEEvents(raw);
+		const msgDelta = events.find((e) => e.event === "message_delta");
+		expect(msgDelta).toBeDefined();
+		if (!msgDelta) throw new Error("expected message_delta event");
+		const usage = parseEventData(msgDelta).usage;
+		expect(usage.input_tokens).toBe(42);
+		expect(usage.output_tokens).toBe(13);
+	});
+
+	it("terminates normally with tool_use stop_reason and message_stop as the final event", async () => {
+		const upstream = makeXhighToolTurnStream();
+		const transformed = transformStreamingResponse(upstream);
+		const raw = await readStream(transformed.body);
+		const events = parseSSEEvents(raw);
+		const types = events.map((e) => e.event);
+
+		const msgDelta = events.find((e) => e.event === "message_delta");
+		expect(msgDelta).toBeDefined();
+		if (!msgDelta) throw new Error("expected message_delta event");
+		expect(parseEventData(msgDelta).delta.stop_reason).toBe("tool_use");
+
+		// message_stop must be the final event
+		expect(types).toContain("message_stop");
+		const msgStopIdx = types.lastIndexOf("message_stop");
+		expect(msgStopIdx).toBe(types.length - 1);
+	});
+
+	it("closes the thinking block before opening the tool_use block", async () => {
+		const upstream = makeXhighToolTurnStream();
+		const transformed = transformStreamingResponse(upstream);
+		const raw = await readStream(transformed.body);
+		const events = parseSSEEvents(raw);
+
+		const thinkingStopIdx = events.findIndex(
+			(e) => e.event === "content_block_stop" && parseEventData(e).index === 0,
+		);
+		const toolStartIdx = events.findIndex(
+			(e) =>
+				e.event === "content_block_start" &&
+				parseEventData(e).content_block?.type === "tool_use",
+		);
+		expect(thinkingStopIdx).toBeGreaterThanOrEqual(0);
+		expect(toolStartIdx).toBeGreaterThanOrEqual(0);
+		expect(thinkingStopIdx).toBeLessThan(toolStartIdx);
+	});
+
+	it("emits content_block_stop for every block (thinking + tool_use)", async () => {
+		const upstream = makeXhighToolTurnStream();
+		const transformed = transformStreamingResponse(upstream);
+		const raw = await readStream(transformed.body);
+		const events = parseSSEEvents(raw);
+
+		const stops = events.filter((e) => e.event === "content_block_stop");
+		// Exactly 2: thinking (index 0) + tool_use (index 1)
+		expect(stops).toHaveLength(2);
+		expect(stops.map((e) => parseEventData(e).index).sort()).toEqual([0, 1]);
+	});
+});

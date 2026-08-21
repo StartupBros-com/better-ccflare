@@ -1,7 +1,7 @@
 import {
-	getEndpointUrl,
+	AuthError,
+	resolveCompatibleEndpoint,
 	ValidationError,
-	validateEndpointUrl,
 } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import {
@@ -32,34 +32,48 @@ export class OpenAICompatibleProvider extends BaseProvider {
 		account: Account,
 		_clientId: string,
 	): Promise<TokenRefreshResult> {
-		// OpenAI-compatible providers use API keys, not OAuth tokens
-		// Store the API key in refresh_token field for consistency
-		if (!account.refresh_token) {
-			throw new Error(`No API key available for account ${account.name}`);
+		// KTD4/R2: resolve the static credential from the canonical `api_key`
+		// column, falling back to a legacy row that mirrors its key into
+		// `refresh_token` (older CLI-created accounts). A CLI-created compatible
+		// account never carries an OAuth-shaped refresh token, so reading
+		// `api_key` first is the correct contract.
+		const rawApiKey = account.api_key ?? account.refresh_token;
+
+		if (!rawApiKey) {
+			throw new AuthError(`No API key available for account ${account.name}`, {
+				accountId: account.id,
+				provider: account.provider,
+			});
 		}
+		const apiKey: string = rawApiKey;
 
 		// For API key based providers, we don't need to refresh tokens
 		// Just return the existing API key as both access and refresh token
 		return {
-			accessToken: account.refresh_token,
+			accessToken: apiKey,
 			expiresAt: Date.now() + 365 * 24 * 60 * 60 * 1000, // 1 year from now
 			refreshToken: "", // Empty string prevents DB update for API key accounts
 		};
 	}
 
 	buildUrl(path: string, query: string, account?: Account): string {
-		// Get endpoint URL with validation
-		let endpoint: string;
-		try {
-			endpoint = account ? getEndpointUrl(account) : "https://api.openai.com";
-			// Validate the endpoint
-			endpoint = validateEndpointUrl(endpoint, "endpoint");
-		} catch (error) {
-			log.error(
-				`Invalid endpoint for account ${account?.name || "unknown"}, using default: ${error instanceof Error ? error.message : String(error)}`,
+		// Fail-closed endpoint resolution (R3): a compatible account with a
+		// missing or invalid endpoint must become unavailable rather than
+		// silently routing to the default OpenAI host.
+		if (!account) {
+			throw new ValidationError(
+				"compatible account is required to resolve an endpoint",
+				"account",
 			);
-			endpoint = "https://api.openai.com";
 		}
+		const resolution = resolveCompatibleEndpoint(account);
+		if (!resolution.ok) {
+			throw new ValidationError(
+				`account '${account.name}' has no valid custom endpoint — cannot route to a compatible provider`,
+				"custom_endpoint",
+			);
+		}
+		const endpoint = resolution.endpoint;
 
 		// Convert Anthropic paths to OpenAI-compatible paths
 		// Anthropic: /v1/messages → OpenAI: /v1/chat/completions
@@ -214,13 +228,17 @@ export class OpenAICompatibleProvider extends BaseProvider {
 			// that other request's endpoint/model win the race and cause
 			// DashScope-only cache_control/enable_thinking to land on the wrong
 			// provider or get dropped entirely.
-			let endpoint = "https://api.openai.com";
-			try {
-				if (account) {
-					endpoint = validateEndpointUrl(getEndpointUrl(account), "endpoint");
+			//
+			// Fail-closed endpoint resolution (R3): if the endpoint is missing or
+			// invalid, endpoint stays undefined and the DashScope hooks are
+			// skipped. This does not throw — the actual URL is built by
+			// buildUrl, which does throw when the endpoint is invalid.
+			let endpoint: string | undefined;
+			if (account) {
+				const resolution = resolveCompatibleEndpoint(account);
+				if (resolution.ok) {
+					endpoint = resolution.endpoint;
 				}
-			} catch {
-				endpoint = "https://api.openai.com";
 			}
 			const effectiveAccount = this.beforeConvert(body, account);
 			const openaiBody = convertAnthropicRequestToOpenAI(
@@ -335,35 +353,45 @@ export class OpenAICompatibleProvider extends BaseProvider {
 	}
 
 	/**
-	 * Calculate cost based on model and token usage
+	 * Calculate cost based on model and token usage.
+	 *
+	 * Returns `undefined` when the model has no known price (KTD8/R15): an
+	 * absent value is honestly unknown, while a fallback rate would produce a
+	 * confident wrong number for unknown gateway models. Models with a known
+	 * exact match or a matching known prefix still record a real cost.
 	 */
 	protected calculateCost(
 		model?: string,
 		promptTokens: number = 0,
 		completionTokens: number = 0,
-	): number {
+	): number | undefined {
 		if (!model) return 0;
 
-		// Basic OpenAI-compatible pricing (can be enhanced based on provider)
+		// Known OpenAI-compatible pricing. There is intentionally no `default`
+		// entry — unknown models record no cost rather than a fabricated
+		// estimate (KTD8/R15).
 		const pricing: Record<string, { input: number; output: number }> = {
 			"gpt-3.5-turbo": { input: 0.0005, output: 0.0015 },
 			"gpt-4": { input: 0.03, output: 0.06 },
 			"gpt-4-turbo": { input: 0.01, output: 0.03 },
 			"gpt-4o": { input: 0.005, output: 0.015 },
 			"gpt-4o-mini": { input: 0.00015, output: 0.0006 },
-			// Default pricing for unknown models
-			default: { input: 0.001, output: 0.002 },
 		};
 
-		// Find matching pricing (use exact match or default)
-		let modelPricing = pricing[model];
+		// Find matching pricing (exact match, or a known prefix for variant
+		// models). Unknown models get no pricing — return undefined so the
+		// caller records an absent cost instead of an estimate.
+		let modelPricing: { input: number; output: number } | undefined =
+			pricing[model];
 		if (!modelPricing) {
-			// Try to match prefix (e.g., "gpt-4o-*" models)
+			// Try to match a known prefix (e.g., "gpt-4o-*" variant models).
 			const prefix = Object.keys(pricing).find((key) =>
 				model.includes(key.split("*")[0]),
 			);
-			modelPricing = pricing[prefix || "default"];
+			modelPricing = prefix ? pricing[prefix] : undefined;
 		}
+
+		if (!modelPricing) return undefined;
 
 		const inputCost = (promptTokens / 1000) * modelPricing.input;
 		const outputCost = (completionTokens / 1000) * modelPricing.output;

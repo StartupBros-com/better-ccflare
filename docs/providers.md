@@ -336,7 +336,7 @@ prepareHeaders(headers: Headers, accessToken?: string, apiKey?: string): Headers
 }
 ```
 
-The API key is stored in the `refresh_token` field of the account record for consistency with the authentication system.
+The API key is stored in the `api_key` field of the account record for consistency with the authentication system.
 
 ## MuseSparkProvider Implementation
 
@@ -523,7 +523,7 @@ Anthropic Client → better-ccflare Proxy → OpenAI Provider (OpenRouter, etc.)
 - **Model mapping**: `claude-3-haiku` → `openai/gpt-5-mini` (via `model-mapping.ts`)
 - **Body transform**: Anthropic `{system, messages}` → OpenAI `{messages: [{role:"system"}, ...]}`
 - **Streaming**: OpenAI SSE → Anthropic SSE via `TransformStream` + state machine
-- **Auth**: API keys (stored in `refresh_token`), no OAuth
+- **Auth**: API keys (stored in `api_key`), no OAuth
 
 ### Streaming Transformation (Key Innovation)
 Uses `TransformStream` with state tracking across chunks:
@@ -746,6 +746,101 @@ better-ccflare --add-account custom-provider \
   --api-key sk-... \
   --endpoint '{"modelMappings": {"opus": "gpt-4-turbo", "haiku": "gpt-3.5-turbo"}}'
 ```
+
+### Usage Example: Vercel AI Gateway catch-all lane
+
+The Vercel AI Gateway (`https://ai-gateway.vercel.sh/v1`) is an OpenAI-compatible
+endpoint that can front non-Anthropic models as a last-resort fallback lane. This
+recipe configures one lowest-priority Vercel account that translates every Claude
+family to GLM Fast first, then standard GLM, so ordinary traffic only reaches it
+after no higher-priority eligible account can serve it.
+
+> **Prerequisite — set the Vercel-side API-key budget before admission (R12).**
+> Create the Vercel AI Gateway API key in the Vercel dashboard and configure its
+> spend limit *before* adding the account below. The account must not enter normal
+> fallback routing until the budget cap is in place. The API key is stored in the
+> account's `api_key` field (not `refresh_token`), consistent with every other
+> API-key provider.
+
+**Settings:**
+
+| Setting | Value |
+| --- | --- |
+| Provider mode | `openai-compatible` |
+| Endpoint | `https://ai-gateway.vercel.sh/v1` |
+| Priority | `100` (platform maximum — lowest routing precedence) |
+| API key storage | `api_key` |
+| Model mappings | every Claude family → `["zai/glm-5.2-fast", "zai/glm-5.2"]` |
+
+**Model mappings (write explicitly at account creation):**
+
+The CLI's displayed defaults are prompt text only — accepting them persists **no**
+mapping. Ordered arrays are already supported per family, so write the full mapping
+explicitly:
+
+```json
+{
+  "fable": ["zai/glm-5.2-fast", "zai/glm-5.2"],
+  "opus": ["zai/glm-5.2-fast", "zai/glm-5.2"],
+  "sonnet": ["zai/glm-5.2-fast", "zai/glm-5.2"],
+  "haiku": ["zai/glm-5.2-fast", "zai/glm-5.2"]
+}
+```
+
+Within each family the resolver tries `zai/glm-5.2-fast` first and falls back to
+`zai/glm-5.2` if the fast variant is unavailable, satisfying the "fast before
+standard" ordering requirement.
+
+**Setup (created paused — quarantined):**
+
+Create the account paused so it cannot receive traffic until it has been canaried.
+After creation, unpause it only for the bounded canary window, then pause it again
+on any failure.
+
+The CLI's `--add-account <name> --mode openai-compatible` flow is interactive (it
+prompts for API key, endpoint, priority, and model mappings), so for a non-interactive
+rollout use the HTTP API instead. `POST /api/accounts/openai-compatible` accepts the
+full account shape as JSON, including a `paused` field that creates the row already
+paused (`paused = 1`, `pause_reason = 'manual'`):
+
+```bash
+# 1. Add the account (created paused so it stays quarantined until canaried).
+#    The HTTP API accepts the full shape as JSON; `paused: true` writes the row
+#    with paused=1 and pause_reason='manual' so it cannot receive traffic yet.
+curl -X POST http://localhost:8080/api/accounts/openai-compatible \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "vercel-gateway",
+    "apiKey": "vck_...",
+    "customEndpoint": "https://ai-gateway.vercel.sh/v1",
+    "priority": 100,
+    "paused": true,
+    "modelMappings": {
+      "fable": ["zai/glm-5.2-fast", "zai/glm-5.2"],
+      "opus": ["zai/glm-5.2-fast", "zai/glm-5.2"],
+      "sonnet": ["zai/glm-5.2-fast", "zai/glm-5.2"],
+      "haiku": ["zai/glm-5.2-fast", "zai/glm-5.2"]
+    }
+  }'
+
+# 2. Resume only for the bounded canary window (KTD6)
+curl -X POST http://localhost:8080/api/accounts/<vercel-account-id>/resume
+
+# 3. If the canary fails, pause the account again to re-quarantine it
+curl -X POST http://localhost:8080/api/accounts/<vercel-account-id>/pause
+```
+
+> **Why the HTTP API and not the CLI?** The CLI's `--add-account <name> --mode
+> openai-compatible` flow is interactive: it prompts for the API key, endpoint,
+> priority, and model mappings one at a time. A rollout recipe that must be
+> copy-pasted verbatim cannot rely on interactive prompts, so it uses the HTTP
+> API (`POST /api/accounts/openai-compatible`), which accepts every field as a
+> single JSON body — including `paused: true` for quarantine-at-creation.
+
+**Why priority 100:** `validatePriority` caps priority at 100, so 100 is the lowest
+routing precedence the platform allows — every preferred cloud or local account
+(with a lower priority number) is tried first. Ordinary traffic reaches the Vercel
+account only after no higher-priority eligible account can serve it.
 
 ### Rate Limit Handling
 

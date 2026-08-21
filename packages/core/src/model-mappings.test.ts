@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
 	getAllowedModelsMessage,
 	getConfiguredModelMapping,
+	getEndpointUrl,
 	getModelFamily,
 	getModelList,
 	getModelMappings,
@@ -12,8 +13,10 @@ import {
 	mapModelName,
 	parseCustomEndpointData,
 	parseModelMappings,
+	resolveCompatibleEndpoint,
 	resolveFamilyAliasModel,
 	ValidationError,
+	validatePriority,
 } from "@better-ccflare/core";
 import type { Account } from "@better-ccflare/types";
 import { validateModelMappings } from "./validation";
@@ -500,5 +503,281 @@ describe("Family alias helpers", () => {
 		);
 		// A different family's bare word is not an alias for this family — passed through trimmed.
 		expect(resolveFamilyAliasModel("sonnet", "opus")).toBe("sonnet");
+	});
+});
+
+describe("getEndpointUrl — null when no endpoint (R3)", () => {
+	const baseAccount: Account = {
+		id: "test",
+		name: "test-account",
+		provider: "openai-compatible",
+		refresh_token: "",
+		access_token: null,
+		expires_at: null,
+		api_key: null,
+		custom_endpoint: null,
+		rate_limited_until: null,
+		rate_limit_status: null,
+		rate_limit_reset: null,
+		rate_limit_remaining: null,
+		created_at: Date.now(),
+		last_used: null,
+		request_count: 0,
+		total_requests: 0,
+		session_start: null,
+		session_request_count: 0,
+		paused: false,
+		priority: 0,
+		auto_fallback_enabled: false,
+		auto_refresh_enabled: false,
+	} as Account;
+
+	test("returns null when custom_endpoint is null", () => {
+		expect(
+			getEndpointUrl({ ...baseAccount, custom_endpoint: null }),
+		).toBeNull();
+	});
+
+	test("returns null when custom_endpoint is undefined", () => {
+		expect(
+			getEndpointUrl({ ...baseAccount, custom_endpoint: undefined } as Account),
+		).toBeNull();
+	});
+
+	test("returns null when custom_endpoint is empty string", () => {
+		expect(getEndpointUrl({ ...baseAccount, custom_endpoint: "" })).toBeNull();
+	});
+
+	test("returns null when JSON blob has no endpoint field", () => {
+		expect(
+			getEndpointUrl({
+				...baseAccount,
+				custom_endpoint: JSON.stringify({ modelMappings: { opus: "gpt-4" } }),
+			}),
+		).toBeNull();
+	});
+
+	test("returns the endpoint for a plain string", () => {
+		expect(
+			getEndpointUrl({
+				...baseAccount,
+				custom_endpoint: "https://api.openrouter.ai/api/v1",
+			}),
+		).toBe("https://api.openrouter.ai/api/v1");
+	});
+
+	test("returns the endpoint from a JSON blob", () => {
+		expect(
+			getEndpointUrl({
+				...baseAccount,
+				custom_endpoint: JSON.stringify({
+					endpoint: "https://api.openrouter.ai/api/v1",
+				}),
+			}),
+		).toBe("https://api.openrouter.ai/api/v1");
+	});
+
+	test("returns the endpoint from a JSON blob with modelMappings", () => {
+		expect(
+			getEndpointUrl({
+				...baseAccount,
+				custom_endpoint: JSON.stringify({
+					endpoint: "https://api.openrouter.ai/api/v1",
+					modelMappings: { opus: "gpt-4" },
+				}),
+			}),
+		).toBe("https://api.openrouter.ai/api/v1");
+	});
+});
+
+describe("resolveCompatibleEndpoint — fail-closed (R3)", () => {
+	const baseAccount: Account = {
+		id: "test",
+		name: "test-account",
+		provider: "openai-compatible",
+		refresh_token: "",
+		access_token: null,
+		expires_at: null,
+		api_key: null,
+		custom_endpoint: null,
+		rate_limited_until: null,
+		rate_limit_status: null,
+		rate_limit_reset: null,
+		rate_limit_remaining: null,
+		created_at: Date.now(),
+		last_used: null,
+		request_count: 0,
+		total_requests: 0,
+		session_start: null,
+		session_request_count: 0,
+		paused: false,
+		priority: 0,
+		auto_fallback_enabled: false,
+		auto_refresh_enabled: false,
+	} as Account;
+
+	test("returns unavailable when custom_endpoint is null", () => {
+		const result = resolveCompatibleEndpoint({
+			...baseAccount,
+			custom_endpoint: null,
+		});
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.endpoint).toBeUndefined();
+		}
+	});
+
+	test("returns unavailable when custom_endpoint is empty string", () => {
+		const result = resolveCompatibleEndpoint({
+			...baseAccount,
+			custom_endpoint: "",
+		});
+		expect(result.ok).toBe(false);
+	});
+
+	test("returns unavailable when JSON blob has no endpoint field", () => {
+		const result = resolveCompatibleEndpoint({
+			...baseAccount,
+			custom_endpoint: JSON.stringify({ modelMappings: { opus: "gpt-4" } }),
+		});
+		expect(result.ok).toBe(false);
+	});
+
+	test("returns unavailable when the endpoint is not a valid URL", () => {
+		const result = resolveCompatibleEndpoint({
+			...baseAccount,
+			custom_endpoint: "not-a-url",
+		});
+		expect(result.ok).toBe(false);
+	});
+
+	test("returns a validated endpoint for a plain string", () => {
+		const result = resolveCompatibleEndpoint({
+			...baseAccount,
+			custom_endpoint: "https://api.openrouter.ai/api/v1",
+		});
+		expect(result.ok).toBe(true);
+		if (result.ok) {
+			expect(result.endpoint).toBe("https://api.openrouter.ai/api/v1");
+		}
+	});
+
+	test("returns a validated endpoint from a JSON blob", () => {
+		const result = resolveCompatibleEndpoint({
+			...baseAccount,
+			custom_endpoint: JSON.stringify({
+				endpoint: "https://api.openrouter.ai/api/v1",
+			}),
+		});
+		expect(result.ok).toBe(true);
+		if (result.ok) {
+			expect(result.endpoint).toBe("https://api.openrouter.ai/api/v1");
+		}
+	});
+
+	test("resolves a plain string and equivalent JSON blob identically", () => {
+		const plain = resolveCompatibleEndpoint({
+			...baseAccount,
+			custom_endpoint: "https://api.openrouter.ai/api/v1",
+		});
+		const json = resolveCompatibleEndpoint({
+			...baseAccount,
+			custom_endpoint: JSON.stringify({
+				endpoint: "https://api.openrouter.ai/api/v1",
+			}),
+		});
+		expect(plain).toEqual(json);
+	});
+
+	test("strips a trailing slash from the endpoint", () => {
+		const result = resolveCompatibleEndpoint({
+			...baseAccount,
+			custom_endpoint: "https://api.example.com/v1/",
+		});
+		expect(result.ok).toBe(true);
+		if (result.ok) {
+			expect(result.endpoint).toBe("https://api.example.com/v1");
+		}
+	});
+});
+
+/**
+ * Vercel AI Gateway catch-all recipe (U4).
+ *
+ * Documents the model-mapping and priority contract an operator must configure
+ * for the Vercel catch-all lane. These tests guard the documented recipe so a
+ * refactor that breaks the ordered GLM resolution or rejects priority 100 is
+ * caught before the docs are trusted.
+ */
+describe("Vercel AI Gateway catch-all recipe (U4)", () => {
+	// The documented recipe: every Claude family maps to GLM Fast first, then
+	// standard GLM, within a single openai-compatible account.
+	const vercelMappings = {
+		fable: ["zai/glm-5.2-fast", "zai/glm-5.2"],
+		opus: ["zai/glm-5.2-fast", "zai/glm-5.2"],
+		sonnet: ["zai/glm-5.2-fast", "zai/glm-5.2"],
+		haiku: ["zai/glm-5.2-fast", "zai/glm-5.2"],
+	};
+
+	const vercelAccount: Account = {
+		id: "vercel-gateway",
+		name: "vercel-gateway",
+		provider: "openai-compatible",
+		model_mappings: JSON.stringify(vercelMappings),
+		model_fallbacks: null,
+		custom_endpoint: JSON.stringify({
+			endpoint: "https://ai-gateway.vercel.sh/v1",
+		}),
+		priority: 100,
+	} as Account;
+
+	test("an ordered-array family mapping resolves to GLM Fast first and standard GLM second", () => {
+		expect(getModelList("claude-sonnet-5", vercelAccount)).toEqual([
+			"zai/glm-5.2-fast",
+			"zai/glm-5.2",
+		]);
+	});
+
+	test("a single-string family mapping still resolves to that model", () => {
+		const singleStringAccount: Account = {
+			...vercelAccount,
+			model_mappings: JSON.stringify({ sonnet: "zai/glm-5.2" }),
+		} as Account;
+
+		expect(getModelList("claude-sonnet-5", singleStringAccount)).toEqual([
+			"zai/glm-5.2",
+		]);
+	});
+
+	test("every Claude family in the documented recipe resolves to a GLM target", () => {
+		for (const familyModel of Object.values(LATEST_MODEL_BY_FAMILY)) {
+			const resolved = getModelList(familyModel, vercelAccount);
+			expect(resolved).not.toBeNull();
+			expect(resolved?.length).toBeGreaterThan(0);
+			expect(resolved?.[0]).toMatch(/^zai\/glm-5\.2/);
+		}
+	});
+
+	test("an account with no configured mapping forwards the requested model unchanged", () => {
+		const unmappedAccount: Account = {
+			id: "unmapped",
+			name: "unmapped",
+			provider: "openai-compatible",
+			model_mappings: null,
+			model_fallbacks: null,
+			custom_endpoint: null,
+		} as Account;
+
+		expect(getModelList("claude-sonnet-5", unmappedAccount)).toBeNull();
+	});
+
+	test("the documented priority 100 is accepted by the shared priority validator", () => {
+		expect(validatePriority(100)).toBe(100);
+	});
+
+	test("the documented endpoint resolves to the Vercel AI Gateway URL", () => {
+		expect(getEndpointUrl(vercelAccount)).toBe(
+			"https://ai-gateway.vercel.sh/v1",
+		);
 	});
 });

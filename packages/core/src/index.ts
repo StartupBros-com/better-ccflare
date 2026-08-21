@@ -21,6 +21,7 @@ export {
 	TIME_CONSTANTS,
 } from "./constants";
 export {
+	AuthError,
 	formatOAuthErrorMessage,
 	getExactOAuthErrorCode,
 	getOAuthErrorCode,
@@ -80,6 +81,7 @@ export {
 	parseCustomEndpointData,
 	parseModelFallbacks,
 	parseModelMappings,
+	resolveCompatibleEndpoint,
 	resolveFamilyAliasModel,
 	validateAndSanitizeModelFallbacks,
 	validateAndSanitizeModelMappings,
@@ -111,6 +113,7 @@ export {
 	estimateCostUSD,
 	getModelRates,
 	initializeNanoGPTPricingIfAccountsExist,
+	isModelPriced,
 	listCatalogueModels,
 	type ModelRates,
 	resetNanoGPTPricingCacheForTest,
@@ -139,6 +142,7 @@ export {
 	patterns,
 	sanitizers,
 	validateApiKey,
+	validateBoolean,
 	validateEndpointUrl,
 	validateModelMappings,
 	validateNumber,
