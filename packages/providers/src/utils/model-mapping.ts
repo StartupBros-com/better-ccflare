@@ -81,13 +81,22 @@ async function readBodyForTransform(request: Request): Promise<{
 	// Rebuilding from `request.url` (a string) does not inherit the signal, so
 	// it is carried over explicitly — otherwise a client disconnect can no
 	// longer abort the upstream fetch for every caller of this helper.
-	const rebuild = (body: BodyInit): Request =>
-		new Request(request.url, {
+	// The inbound content-length must not ride along either: every transform
+	// that reaches rebuild() changed the body's byte length (model rename,
+	// reasoning strip, skill elision), and a Request constructed with an
+	// explicit content-length keeps it verbatim rather than recomputing, so
+	// the upstream fetch would see wrong framing. Deleting it lets the length
+	// be derived from the actual bytes (same fix muse-spark applies locally).
+	const rebuild = (body: BodyInit): Request => {
+		const headers = new Headers(request.headers);
+		headers.delete("content-length");
+		return new Request(request.url, {
 			method: request.method,
-			headers: request.headers,
+			headers,
 			body,
 			signal: request.signal,
 		});
+	};
 	try {
 		return { bytes: await request.arrayBuffer(), rebuild };
 	} catch (error) {

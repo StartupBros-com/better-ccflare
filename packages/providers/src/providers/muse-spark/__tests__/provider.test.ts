@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Account } from "@better-ccflare/types";
 import {
 	isMuseSparkMessagesPath,
@@ -434,9 +437,24 @@ describe("MuseSparkProvider", () => {
 
 	describe("skill elision (Messages sanitizer path)", () => {
 		const SKILL_MARKER = "Base directory for this skill: ";
+		const originalConfigPath = process.env.BETTER_CCFLARE_CONFIG_PATH;
 		const originalBlocked = process.env.CCFLARE_SKILL_ELISION_BLOCKED;
+		let tmpDir: string;
+
+		beforeEach(() => {
+			tmpDir = mkdtempSync(
+				join(tmpdir(), "better-ccflare-skill-elision-muse-spark-"),
+			);
+			process.env.BETTER_CCFLARE_CONFIG_PATH = join(tmpDir, "config.json");
+		});
 
 		afterEach(() => {
+			rmSync(tmpDir, { recursive: true, force: true });
+			if (originalConfigPath === undefined) {
+				delete process.env.BETTER_CCFLARE_CONFIG_PATH;
+			} else {
+				process.env.BETTER_CCFLARE_CONFIG_PATH = originalConfigPath;
+			}
 			if (originalBlocked === undefined) {
 				delete process.env.CCFLARE_SKILL_ELISION_BLOCKED;
 			} else {

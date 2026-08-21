@@ -267,6 +267,80 @@ describe("elideSkillBundles", () => {
 		).text;
 		expect(stubText.length).toBeLessThan(200);
 	});
+
+	it("elides two bundles in one content array without dropping or reordering neighbors", () => {
+		const bundleA = makeSkillText("skill-a", 12_000);
+		const bundleB = makeSkillText("skill-b", 12_000);
+		const body = {
+			messages: [
+				{
+					role: "user",
+					content: [
+						{ type: "text", text: "before" },
+						{ type: "text", text: bundleA },
+						{ type: "text", text: "between" },
+						{ type: "text", text: bundleB },
+						{ type: "text", text: "after" },
+					],
+				},
+			],
+		};
+
+		const result = elideSkillBundles(body, ["skill-a", "skill-b"]);
+
+		expect(result.elided).toHaveLength(2);
+		expect(result.elided.map((r) => r.skillName)).toEqual([
+			"skill-a",
+			"skill-b",
+		]);
+		const content = (result.body as typeof body).messages[0].content;
+		expect(content).toHaveLength(5);
+		expect(content[0].text).toBe("before");
+		expect(content[1].text).toContain("'skill-a' skill document elided");
+		expect(content[2].text).toBe("between");
+		expect(content[3].text).toContain("'skill-b' skill document elided");
+		expect(content[4].text).toBe("after");
+	});
+
+	it("elides a middle tool_result sub-block while preserving trailing sub-blocks", () => {
+		const bundle = makeSkillText("some-skill", 12_000);
+		const body = {
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "untouched msg" }] },
+				{
+					role: "user",
+					content: [
+						{
+							type: "tool_result",
+							tool_use_id: "call_1",
+							content: [
+								{ type: "text", text: "loaded ok" },
+								{ type: "text", text: bundle },
+								{ type: "text", text: "trailing note" },
+								{ type: "image", source: { data: "not-text" } },
+							],
+						},
+					],
+				},
+			],
+		};
+
+		const result = elideSkillBundles(body, ["some-skill"]);
+
+		expect(result.elided).toHaveLength(1);
+		const messages = (result.body as typeof body).messages;
+		expect(messages[0]).toBe(body.messages[0]);
+		const sub = (
+			messages[1].content[0] as {
+				content: Array<{ type: string; text?: string }>;
+			}
+		).content;
+		expect(sub).toHaveLength(4);
+		expect(sub[0].text).toBe("loaded ok");
+		expect(sub[1].text).toContain("'some-skill' skill document elided");
+		expect(sub[2].text).toBe("trailing note");
+		expect(sub[3].type).toBe("image");
+	});
 });
 
 describe("applySkillElision", () => {
