@@ -20,6 +20,7 @@ const POLICY: CacheParityPolicy = {
 	turnStateObserveOnly: false,
 	webSocketPercent: 0,
 	globalKeepaliveTtlMinutes: 0,
+	xaiCacheKeepaliveTtlMinutes: 0,
 };
 
 function row(
@@ -153,5 +154,18 @@ describe("buildCacheParityResponse", () => {
 		expect(data.windows.authoritative7d.reasons).toContain(
 			"unattributed_synthetic_traffic_possible",
 		);
+	});
+
+	test("carries a drift report, and a live turn-state percent reports as acknowledged", () => {
+		const data = response([row()], [row()], {
+			...POLICY,
+			turnStatePercent: 50,
+		});
+		const turnStateDrift = data.driftReport.deviations.find(
+			(deviation) => deviation.lever === "turnStatePercent",
+		);
+		expect(turnStateDrift?.acknowledged).toBe(true);
+		expect(turnStateDrift?.acknowledgement?.issue).toBe(199);
+		expect(data.driftReport.floorHeld).toBe(true);
 	});
 });

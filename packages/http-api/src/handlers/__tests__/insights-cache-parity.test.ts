@@ -5,6 +5,7 @@ import {
 	ensureSchema,
 	runMigrations,
 } from "@better-ccflare/database";
+import { createCacheParityConfigStub } from "../../__tests__/support/cache-parity-config-stub";
 import type { APIContext } from "../../types";
 import { createCacheParityHandler } from "../insights";
 
@@ -19,9 +20,7 @@ describe("cache parity handler", () => {
 		const adapter = new BunSqlAdapter(db);
 		context = {
 			db: adapter,
-			config: {
-				getCacheKeepaliveTtlMinutes: () => 0,
-			} as APIContext["config"],
+			config: createCacheParityConfigStub() as APIContext["config"],
 			dbOps: {
 				getAdapter: () => adapter,
 			} as unknown as APIContext["dbOps"],

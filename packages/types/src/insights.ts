@@ -133,6 +133,58 @@ export interface CacheParityPolicySnapshot {
 	turnStateObserveOnly: boolean;
 	webSocketPercent: number;
 	globalKeepaliveTtlMinutes: number;
+	xaiCacheKeepaliveTtlMinutes: number;
+}
+
+/**
+ * Levers a live {@link CacheParityPolicySnapshot} is compared against a
+ * declared default for. Deliberately excludes
+ * `explicitBreakpointSuppressedScopes`, which is an observed suppression
+ * counter, not a settable lever with a declared intent.
+ */
+export type CacheParityLeverKey = Exclude<
+	keyof CacheParityPolicySnapshot,
+	"explicitBreakpointSuppressedScopes"
+>;
+
+/** A GitHub issue that owns a knowingly-live deviation from declared policy. */
+export interface CacheParityDeclaredAcknowledgement {
+	issue: number;
+	note: string;
+}
+
+/** One lever whose live value differs from its declared default. */
+export interface CacheParityDriftEntry {
+	lever: CacheParityLeverKey;
+	declaredValue: CacheParityPolicySnapshot[CacheParityLeverKey];
+	liveValue: CacheParityPolicySnapshot[CacheParityLeverKey];
+	/** True when a CacheParityDeclaredAcknowledgement exists for this lever. */
+	acknowledged: boolean;
+	acknowledgement: CacheParityDeclaredAcknowledgement | null;
+}
+
+/**
+ * The parity floor the system is expected to hold, based on the currently
+ * achieved and measured level (see cache-parity-expectations.ts for the
+ * measured source figures) — deliberately NOT Anthropic's cache-read level,
+ * which remains the longer-range #174 target.
+ */
+export interface CacheParityDeclaredFloor {
+	weightedCacheReadPercent: number;
+	zeroHitRatePercent: number;
+}
+
+export interface CacheParityDriftReport {
+	declaredDefaults: CacheParityPolicySnapshot;
+	/** Levers whose live value differs from its declared default. */
+	deviations: CacheParityDriftEntry[];
+	floor: CacheParityDeclaredFloor;
+	/**
+	 * True when the authoritative seven-day Codex follow-up metrics meet
+	 * `floor`. False (not null) when evidence is missing, so a regression
+	 * cannot silently read as "held".
+	 */
+	floorHeld: boolean;
 }
 
 export interface CacheParityResponse {
@@ -150,6 +202,7 @@ export interface CacheParityResponse {
 			| "unsupported_observed";
 	};
 	policy: CacheParityPolicySnapshot;
+	driftReport: CacheParityDriftReport;
 	windows: {
 		advisory24h: CacheParityWindow;
 		authoritative7d: CacheParityWindow;
