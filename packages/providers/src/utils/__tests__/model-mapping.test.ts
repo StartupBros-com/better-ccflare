@@ -120,6 +120,43 @@ describe("transformRequestBodyModel", () => {
 		expect(resultBody.messages).toEqual([{ role: "user", content: "test" }]);
 	});
 
+	it("drops a stale inbound content-length when the transform changes body size", async () => {
+		const requestBody = {
+			model: "claude-sonnet-4-5-20250929",
+			messages: [{ role: "user", content: "test" }],
+		};
+		const serialized = JSON.stringify(requestBody);
+
+		const request = new Request("http://test.com", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				// A client-supplied length for the ORIGINAL body. If the rebuilt
+				// request kept it, the upstream fetch would see wrong framing once
+				// the model rename / elision / reasoning-strip changed the size.
+				"content-length": String(serialized.length),
+			},
+			body: serialized,
+		});
+
+		const account = {
+			id: "test-id",
+			name: "test-account",
+			provider: "test-provider",
+			model_mappings: JSON.stringify({
+				"claude-sonnet-4-5-20250929": "much-longer-custom-model-name",
+			}),
+		} as Account;
+
+		const result = await transformRequestBodyModel(request, account);
+
+		expect(result.headers.get("content-length")).not.toBe(
+			String(serialized.length),
+		);
+		const resultBody = await result.json();
+		expect(resultBody.model).toBe("much-longer-custom-model-name");
+	});
+
 	it("preserves request when no transformation needed", async () => {
 		const requestBody = {
 			model: "claude-sonnet-4-5-20250929",

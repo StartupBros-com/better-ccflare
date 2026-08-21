@@ -1,6 +1,18 @@
-import { beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Account } from "@better-ccflare/types";
 import { AnthropicProvider } from "../provider";
+
+const SKILL_MARKER = "Base directory for this skill: ";
+
+/** Build marker-bearing text of exactly `totalLength` characters. */
+function makeSkillText(dir: string, totalLength: number): string {
+	const header = `${SKILL_MARKER}${dir}\n`;
+	const body = "x".repeat(Math.max(0, totalLength - header.length));
+	return header + body;
+}
 
 describe("AnthropicProvider", () => {
 	let provider: AnthropicProvider;
@@ -346,6 +358,59 @@ describe("AnthropicProvider", () => {
 			);
 			const opusBody = await opusResult.json();
 			expect(opusBody.model).toBe("mapped-opus");
+		});
+	});
+
+	describe("skill elision (defense-in-depth)", () => {
+		let tmpDir: string;
+		const originalConfigPath = process.env.BETTER_CCFLARE_CONFIG_PATH;
+		const originalBlocked = process.env.CCFLARE_SKILL_ELISION_BLOCKED;
+
+		beforeEach(() => {
+			tmpDir = mkdtempSync(
+				join(tmpdir(), "better-ccflare-skill-elision-anthropic-"),
+			);
+			process.env.BETTER_CCFLARE_CONFIG_PATH = join(tmpDir, "config.json");
+		});
+
+		afterEach(() => {
+			rmSync(tmpDir, { recursive: true, force: true });
+			if (originalConfigPath === undefined) {
+				delete process.env.BETTER_CCFLARE_CONFIG_PATH;
+			} else {
+				process.env.BETTER_CCFLARE_CONFIG_PATH = originalConfigPath;
+			}
+			if (originalBlocked === undefined) {
+				delete process.env.CCFLARE_SKILL_ELISION_BLOCKED;
+			} else {
+				process.env.CCFLARE_SKILL_ELISION_BLOCKED = originalBlocked;
+			}
+		});
+
+		it("never elides a skill bundle even when the skill is in the blocklist", async () => {
+			process.env.CCFLARE_SKILL_ELISION_BLOCKED = "ce-plan";
+			const bundleText = makeSkillText("ce-plan", 12_000);
+			const request = new Request("https://api.anthropic.com/v1/messages", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					model: "claude-sonnet-4-5-20250929",
+					max_tokens: 100,
+					messages: [
+						{
+							role: "user",
+							content: [{ type: "text", text: bundleText }],
+						},
+					],
+				}),
+			});
+
+			const result = await provider.transformRequestBody(request, mockAccount);
+			const body = (await result.json()) as {
+				messages: Array<{ content: Array<{ type: string; text: string }> }>;
+			};
+
+			expect(body.messages[0].content[0].text).toBe(bundleText);
 		});
 	});
 });

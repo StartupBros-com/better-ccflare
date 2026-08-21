@@ -1,6 +1,18 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { AuthError } from "@better-ccflare/core";
 import type { Account } from "@better-ccflare/types";
 import { OpenAICompatibleProvider } from "../provider";
+
+const SKILL_MARKER = "Base directory for this skill: ";
+
+/** Build marker-bearing text of exactly `totalLength` characters. */
+function makeSkillText(dir: string, totalLength: number): string {
+	const header = `${SKILL_MARKER}${dir}\n`;
+	const body = "x".repeat(Math.max(0, totalLength - header.length));
+	return header + body;
+}
 
 describe("OpenAICompatibleProvider", () => {
 	let provider: OpenAICompatibleProvider;
@@ -557,6 +569,86 @@ describe("OpenAICompatibleProvider", () => {
 			const body = await transformed.json();
 
 			expect(body.model).toBe("custom/haiku-model");
+		});
+	});
+
+	describe("skill elision", () => {
+		let tmpDir: string;
+		const originalConfigPath = process.env.BETTER_CCFLARE_CONFIG_PATH;
+		const originalBlocked = process.env.CCFLARE_SKILL_ELISION_BLOCKED;
+
+		beforeEach(() => {
+			tmpDir = mkdtempSync(
+				join(tmpdir(), "better-ccflare-skill-elision-openai-"),
+			);
+			process.env.BETTER_CCFLARE_CONFIG_PATH = join(tmpDir, "config.json");
+		});
+
+		afterEach(() => {
+			rmSync(tmpDir, { recursive: true, force: true });
+			if (originalConfigPath === undefined) {
+				delete process.env.BETTER_CCFLARE_CONFIG_PATH;
+			} else {
+				process.env.BETTER_CCFLARE_CONFIG_PATH = originalConfigPath;
+			}
+			if (originalBlocked === undefined) {
+				delete process.env.CCFLARE_SKILL_ELISION_BLOCKED;
+			} else {
+				process.env.CCFLARE_SKILL_ELISION_BLOCKED = originalBlocked;
+			}
+		});
+
+		it("elides a blocked skill bundle before translating to OpenAI format", async () => {
+			process.env.CCFLARE_SKILL_ELISION_BLOCKED = "some-skill";
+			const bundleText = makeSkillText("some-skill", 12_000);
+			const anthropicRequest = {
+				model: "claude-3-5-sonnet-20241022",
+				max_tokens: 1000,
+				messages: [
+					{ role: "user", content: [{ type: "text", text: bundleText }] },
+				],
+			};
+			const request = new Request("https://example.com/v1/messages", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(anthropicRequest),
+			});
+
+			const transformed = await provider.transformRequestBody(
+				request,
+				mockAccount,
+			);
+			const body = await transformed.json();
+			const content = body.messages[0].content as string;
+
+			expect(content).toContain("[better-ccflare]");
+			expect(content).not.toContain(bundleText);
+			expect(content.length).toBeLessThan(200);
+		});
+
+		it("leaves a bundle for a skill not in the blocklist unchanged", async () => {
+			process.env.CCFLARE_SKILL_ELISION_BLOCKED = "other-skill";
+			const bundleText = makeSkillText("some-skill", 12_000);
+			const anthropicRequest = {
+				model: "claude-3-5-sonnet-20241022",
+				max_tokens: 1000,
+				messages: [
+					{ role: "user", content: [{ type: "text", text: bundleText }] },
+				],
+			};
+			const request = new Request("https://example.com/v1/messages", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(anthropicRequest),
+			});
+
+			const transformed = await provider.transformRequestBody(
+				request,
+				mockAccount,
+			);
+			const body = await transformed.json();
+
+			expect(body.messages[0].content).toBe(bundleText);
 		});
 	});
 

@@ -1,6 +1,18 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Account } from "@better-ccflare/types";
 import { OllamaProvider } from "../provider";
+
+const SKILL_MARKER = "Base directory for this skill: ";
+
+/** Build marker-bearing text of exactly `totalLength` characters. */
+function makeSkillText(dir: string, totalLength: number): string {
+	const header = `${SKILL_MARKER}${dir}\n`;
+	const body = "x".repeat(Math.max(0, totalLength - header.length));
+	return header + body;
+}
 
 describe("OllamaProvider", () => {
 	const provider = new OllamaProvider();
@@ -249,6 +261,83 @@ describe("OllamaProvider", () => {
 			const result = (await transformed.json()) as { model?: string };
 
 			expect(result.model).toBe("llama3.1");
+		});
+	});
+
+	describe("skill elision", () => {
+		let tmpDir: string;
+		const originalConfigPath = process.env.BETTER_CCFLARE_CONFIG_PATH;
+		const originalBlocked = process.env.CCFLARE_SKILL_ELISION_BLOCKED;
+
+		beforeEach(() => {
+			tmpDir = mkdtempSync(
+				join(tmpdir(), "better-ccflare-skill-elision-ollama-"),
+			);
+			process.env.BETTER_CCFLARE_CONFIG_PATH = join(tmpDir, "config.json");
+		});
+
+		afterEach(() => {
+			rmSync(tmpDir, { recursive: true, force: true });
+			if (originalConfigPath === undefined) {
+				delete process.env.BETTER_CCFLARE_CONFIG_PATH;
+			} else {
+				process.env.BETTER_CCFLARE_CONFIG_PATH = originalConfigPath;
+			}
+			if (originalBlocked === undefined) {
+				delete process.env.CCFLARE_SKILL_ELISION_BLOCKED;
+			} else {
+				process.env.CCFLARE_SKILL_ELISION_BLOCKED = originalBlocked;
+			}
+		});
+
+		it("replaces a blocked skill bundle with the elision stub", async () => {
+			process.env.CCFLARE_SKILL_ELISION_BLOCKED = "some-skill";
+			const bundleText = makeSkillText("some-skill", 12_000);
+			const account = makeAccount(null);
+			const body = JSON.stringify({
+				model: "claude-sonnet-4-5",
+				messages: [
+					{ role: "user", content: [{ type: "text", text: bundleText }] },
+				],
+			});
+			const request = new Request("http://localhost:8080/v1/messages", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body,
+			});
+
+			const transformed = await provider.transformRequestBody(request, account);
+			const result = (await transformed.json()) as {
+				messages: Array<{ content: Array<{ type: string; text: string }> }>;
+			};
+			const text = result.messages[0].content[0].text;
+
+			expect(text).toContain("[better-ccflare]");
+			expect(text).not.toContain(bundleText);
+		});
+
+		it("leaves a bundle for a skill not in the blocklist unchanged", async () => {
+			process.env.CCFLARE_SKILL_ELISION_BLOCKED = "other-skill";
+			const bundleText = makeSkillText("some-skill", 12_000);
+			const account = makeAccount(null);
+			const body = JSON.stringify({
+				model: "claude-sonnet-4-5",
+				messages: [
+					{ role: "user", content: [{ type: "text", text: bundleText }] },
+				],
+			});
+			const request = new Request("http://localhost:8080/v1/messages", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body,
+			});
+
+			const transformed = await provider.transformRequestBody(request, account);
+			const result = (await transformed.json()) as {
+				messages: Array<{ content: Array<{ type: string; text: string }> }>;
+			};
+
+			expect(result.messages[0].content[0].text).toBe(bundleText);
 		});
 	});
 });

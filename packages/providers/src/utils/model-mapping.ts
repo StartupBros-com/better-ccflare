@@ -2,6 +2,10 @@ import { mapModelName } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import type { Account } from "@better-ccflare/types";
 import { stripCodexReasoningRetention } from "./codex-reasoning-retention";
+import {
+	applySkillElision,
+	resolveSkillElisionBlockedSkills,
+} from "./skill-elision";
 
 const log = new Logger("ModelMappingUtils");
 
@@ -77,13 +81,22 @@ async function readBodyForTransform(request: Request): Promise<{
 	// Rebuilding from `request.url` (a string) does not inherit the signal, so
 	// it is carried over explicitly — otherwise a client disconnect can no
 	// longer abort the upstream fetch for every caller of this helper.
-	const rebuild = (body: BodyInit): Request =>
-		new Request(request.url, {
+	// The inbound content-length must not ride along either: every transform
+	// that reaches rebuild() changed the body's byte length (model rename,
+	// reasoning strip, skill elision), and a Request constructed with an
+	// explicit content-length keeps it verbatim rather than recomputing, so
+	// the upstream fetch would see wrong framing. Deleting it lets the length
+	// be derived from the actual bytes (same fix muse-spark applies locally).
+	const rebuild = (body: BodyInit): Request => {
+		const headers = new Headers(request.headers);
+		headers.delete("content-length");
+		return new Request(request.url, {
 			method: request.method,
-			headers: request.headers,
+			headers,
 			body,
 			signal: request.signal,
 		});
+	};
 	try {
 		return { bytes: await request.arrayBuffer(), rebuild };
 	} catch (error) {
@@ -109,6 +122,7 @@ export async function transformRequestBodyModel<T extends TransformRequestBody>(
 	request: Request,
 	account?: Account | undefined,
 	providerSpecificMapping?: (model: string, account?: Account) => string,
+	providerName?: string,
 ): Promise<Request> {
 	// Only JSON bodies carry a model to map; anything else passes through
 	// untouched (and is left un-consumed so identity is preserved), matching the
@@ -129,7 +143,15 @@ export async function transformRequestBodyModel<T extends TransformRequestBody>(
 	if (!bytes) return request;
 
 	try {
-		const parsedBody: T = JSON.parse(new TextDecoder().decode(bytes));
+		const rawParsedBody: T = JSON.parse(new TextDecoder().decode(bytes));
+		const parsedBody: T = providerName
+			? applySkillElision(
+					providerName,
+					rawParsedBody,
+					resolveSkillElisionBlockedSkills(),
+				)
+			: rawParsedBody;
+		const bodyChangedByElision = parsedBody !== rawParsedBody;
 		const { body, strippedCount } = stripCodexReasoningRetention(parsedBody);
 		let modelChanged = false;
 
@@ -150,7 +172,7 @@ export async function transformRequestBodyModel<T extends TransformRequestBody>(
 			}
 		}
 
-		if (modelChanged || strippedCount > 0) {
+		if (modelChanged || strippedCount > 0 || bodyChangedByElision) {
 			return rebuild(JSON.stringify(body));
 		}
 

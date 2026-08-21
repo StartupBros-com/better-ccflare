@@ -4,6 +4,10 @@ import type { Account, LogicalModelCapability } from "@better-ccflare/types";
 import type { RateLimitInfo } from "../../types";
 import { stripCodexReasoningRetention } from "../../utils/codex-reasoning-retention";
 import { transformRequestBodyModel } from "../../utils/model-mapping";
+import {
+	applySkillElision,
+	resolveSkillElisionBlockedSkills,
+} from "../../utils/skill-elision";
 import { BaseAnthropicCompatibleProvider } from "../base-anthropic-compatible";
 import { sanitizeMuseSparkRequestBody } from "./request-sanitizer";
 
@@ -216,7 +220,12 @@ export class MuseSparkProvider extends BaseAnthropicCompatibleProvider {
 		// Other JSON endpoints retain their own schema, but still cannot receive
 		// proxy-minted reasoning if they carry a Messages transcript.
 		if (!isMuseSparkMessagesPath(request.url)) {
-			return transformRequestBodyModel(request);
+			return transformRequestBodyModel(
+				request,
+				undefined,
+				undefined,
+				this.name,
+			);
 		}
 
 		// Sanitization changes the body length, so the inbound content-length must
@@ -247,7 +256,11 @@ export class MuseSparkProvider extends BaseAnthropicCompatibleProvider {
 				return rebuild(bytes);
 			}
 
-			const body = parsed as Record<string, unknown>;
+			const body = applySkillElision(
+				this.name,
+				parsed as Record<string, unknown>,
+				resolveSkillElisionBlockedSkills(),
+			);
 			const { body: reasoningFiltered, strippedCount } =
 				stripCodexReasoningRetention(body);
 

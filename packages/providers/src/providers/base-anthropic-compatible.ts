@@ -180,21 +180,26 @@ export abstract class BaseAnthropicCompatibleProvider extends BaseProvider {
 		// Retained Codex reasoning must be removed for every Anthropic-compatible
 		// upstream. Keep the historical no-model-mapping behavior for providers
 		// that disable streaming, while still allowing the shared filter to run.
-		return transformRequestBodyModel(request, account, (model, acc) => {
-			if (!this.config.supportsStreaming) return model;
+		return transformRequestBodyModel(
+			request,
+			account,
+			(model, acc) => {
+				if (!this.config.supportsStreaming) return model;
 
-			if (acc) {
-				// Use core mapModelName which handles arrays, fallbacks, env overrides, and defaults
-				return mapModelName(model, acc);
-			}
+				if (acc) {
+					// Use core mapModelName which handles arrays, fallbacks, env overrides, and defaults
+					return mapModelName(model, acc);
+				}
 
-			// Fall back to static config mappings for backward compatibility
-			if (this.config.modelMappings?.[model]) {
-				return this.config.modelMappings[model];
-			}
+				// Fall back to static config mappings for backward compatibility
+				if (this.config.modelMappings?.[model]) {
+					return this.config.modelMappings[model];
+				}
 
-			return model;
-		});
+				return model;
+			},
+			this.name,
+		);
 	}
 
 	parseRateLimit(response: Response): RateLimitInfo {
