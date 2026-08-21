@@ -68,15 +68,26 @@ export const CACHE_PARITY_DECLARED_DEFAULTS: CacheParityPolicySnapshot = {
  * number (that remains the longer-range #174 target, tracked separately by
  * the `at_parity` verdict thresholds in cache-parity.ts).
  *
- * Measured source figures for Codex follow-ups (issue #233, seven-day window
- * ending 2026-08-20): 79.1% weighted cache-read, 9.1% zero-hit. The
- * 2026-08-20 plan doc's own seven-day read: 78.91% weighted cache-read,
- * 9.36% zero-hit. The floor below sits at/inside both readings so ordinary
- * measurement noise does not itself register as a breach.
+ * Retuned in #233/#238 follow-up: the original 79 / 10 floor (set from the
+ * same measurement it was meant to police) left only ~0.1pp of headroom
+ * against the authoritative seven-day reading, so it was one bad week away
+ * from firing on ordinary drift rather than a real regression. Values below
+ * are chosen for margin against three reference points:
+ *
+ * - Pre-campaign baseline (issue #174): 43.6% weighted cache-read, 32.7%
+ *   zero-hit — what "the gain was actually lost" looks like.
+ * - Currently achieved and measured: 79.1% weighted / 9.1% zero-hit on the
+ *   authoritative seven-day Codex follow-up window, and 81.2% weighted /
+ *   7.2% zero-hit on the 24-hour window.
+ * - Declared floor: 75% weighted / 12% zero-hit — about 4 points below the
+ *   achieved weighted level and about 3 points above the achieved zero-hit
+ *   level, giving real week-to-week variance room to breathe, while still
+ *   enormously far from the 43.6% / 32.7% pre-campaign state. A breach here
+ *   means the gain was actually lost, not that the metric wiggled.
  */
 export const CACHE_PARITY_DECLARED_FLOOR: CacheParityDeclaredFloor = {
-	weightedCacheReadPercent: 79,
-	zeroHitRatePercent: 10,
+	weightedCacheReadPercent: 75,
+	zeroHitRatePercent: 12,
 };
 
 /**

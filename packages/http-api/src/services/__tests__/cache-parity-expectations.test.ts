@@ -120,6 +120,34 @@ describe("buildCacheParityDriftReport", () => {
 		expect(report.floorHeld).toBe(false);
 	});
 
+	test("holds at exactly the declared floor (75% weighted, 12% zero-hit)", () => {
+		const report = buildCacheParityDriftReport(
+			CACHE_PARITY_DECLARED_DEFAULTS,
+			metrics({ weightedCacheReadPercent: 75, zeroHitRatePercent: 12 }),
+		);
+		expect(report.floor).toEqual({
+			weightedCacheReadPercent: 75,
+			zeroHitRatePercent: 12,
+		});
+		expect(report.floorHeld).toBe(true);
+	});
+
+	test("breaches just below the declared weighted floor (74.9% < 75%)", () => {
+		const report = buildCacheParityDriftReport(
+			CACHE_PARITY_DECLARED_DEFAULTS,
+			metrics({ weightedCacheReadPercent: 74.9, zeroHitRatePercent: 9.1 }),
+		);
+		expect(report.floorHeld).toBe(false);
+	});
+
+	test("breaches just above the declared zero-hit ceiling (12.1% > 12%)", () => {
+		const report = buildCacheParityDriftReport(
+			CACHE_PARITY_DECLARED_DEFAULTS,
+			metrics({ weightedCacheReadPercent: 79.1, zeroHitRatePercent: 12.1 }),
+		);
+		expect(report.floorHeld).toBe(false);
+	});
+
 	test("does not report the floor as held when Codex has no qualified follow-up metrics", () => {
 		const report = buildCacheParityDriftReport(
 			CACHE_PARITY_DECLARED_DEFAULTS,
