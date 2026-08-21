@@ -116,6 +116,7 @@ import { createStatsHandler, createStatsResetHandler } from "../handlers/stats";
 import { createUsageHistoryHandler } from "../handlers/usage-history";
 import { AlertService } from "../services/alerts";
 import type { APIContext } from "../types";
+import { createCacheParityConfigStub } from "./support/cache-parity-config-stub";
 
 // ---------------------------------------------------------------------------
 // Static dialect-hazard gates — always run, no server required.
@@ -460,12 +461,13 @@ describe.skipIf(!livePgAvailable)(
 				getRequestRetentionDays: () => 30,
 				getDataRetentionDays: () => 7,
 				getStorePayloads: () => true,
-				// createCacheParityHandler's readCacheParityPolicy reads this
+				// createCacheParityHandler's readCacheParityPolicy reads these
 				// directly (see insights.ts) as the R18 fail-closed guard, so an
-				// incomplete stub throws rather than resolving to 0. Kept in sync
-				// with the SQLite-side fixture at
-				// insights-cache-parity.test.ts:23.
-				getCacheKeepaliveTtlMinutes: () => 0,
+				// incomplete stub throws rather than resolving to 0. Built from
+				// the same factory the SQLite-side fixture
+				// (insights-cache-parity.test.ts) uses, so the two can't drift
+				// apart again when a new accessor is added.
+				...createCacheParityConfigStub(),
 			} as unknown as Config;
 
 			// AlertService touches no external state until start() is called,
