@@ -113,6 +113,7 @@ export {
 	estimateCostUSD,
 	getModelRates,
 	initializeNanoGPTPricingIfAccountsExist,
+	isModelPriced,
 	listCatalogueModels,
 	type ModelRates,
 	resetNanoGPTPricingCacheForTest,

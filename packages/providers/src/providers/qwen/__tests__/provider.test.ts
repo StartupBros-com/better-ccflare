@@ -1125,3 +1125,41 @@ describe("QwenProvider", () => {
 		});
 	});
 });
+
+// QwenProvider overrides neither buildUrl nor transformRequestBody, so it
+// inherits the compatible lane's endpoint resolution wholesale. These pin that
+// inheritance on QwenProvider itself: the base-class tests never instantiate it,
+// so without this a future override — or a bad merge — could change Qwen's
+// endpoint behaviour with nothing failing.
+describe("QwenProvider endpoint resolution (inherited from the compatible lane)", () => {
+	it("builds the chat-completions URL from the account's stored DashScope endpoint", () => {
+		const provider = new QwenProvider();
+		const account = makeAccount({
+			custom_endpoint: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+		});
+
+		const url = provider.buildUrl("/v1/messages", "", account);
+
+		expect(url).toBe(
+			"https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+		);
+		expect(url.match(/\/v1/g)?.length).toBe(1);
+	});
+
+	it("fails closed rather than falling through to the default OpenAI host when no endpoint is stored", () => {
+		const provider = new QwenProvider();
+		const account = makeAccount({ custom_endpoint: null });
+
+		expect(() => provider.buildUrl("/v1/messages", "", account)).toThrow();
+
+		// The point of R3 is not merely that it throws, but that no code path
+		// can still resolve this account to api.openai.com.
+		let resolved: string | null = null;
+		try {
+			resolved = provider.buildUrl("/v1/messages", "", account);
+		} catch {
+			resolved = null;
+		}
+		expect(resolved).toBeNull();
+	});
+});

@@ -4,6 +4,7 @@ import {
 	cacheOutcomeFromTokens,
 	estimateCostUSD,
 	formatXaiCacheCanary,
+	isModelPriced,
 	TIME_CONSTANTS,
 	type TurnEvidence,
 } from "@better-ccflare/core";
@@ -1242,13 +1243,29 @@ export class UsageCollector {
 				state.usage.costUsd = await this.estimateCostWithDeadline(
 					startMessage.requestId,
 					pricingModel,
-					() =>
-						estimateCostUSD(pricingModel, {
+					async () => {
+						// R15/KTD8: on the generic API-key lane a model the pricing
+						// catalogue has never heard of has an UNKNOWN cost, not a $0
+						// one. estimateCostUSD() cannot express that — it returns 0
+						// for an unpriced model exactly as it does for a genuinely
+						// free one — so a gateway model would otherwise be recorded
+						// as a confident $0 and read as confirmed upstream billing.
+						// Deliberately scoped to openai-compatible: lanes whose
+						// traffic really is free (local anthropic-compatible models)
+						// keep recording a correct, meaningful zero.
+						if (
+							startMessage.providerName === "openai-compatible" &&
+							!(await isModelPriced(pricingModel))
+						) {
+							return undefined;
+						}
+						return estimateCostUSD(pricingModel, {
 							inputTokens: state.usage.inputTokens,
 							outputTokens: finalOutputTokens,
 							cacheReadInputTokens: state.usage.cacheReadInputTokens,
 							cacheCreationInputTokens: state.usage.cacheCreationInputTokens,
-						}),
+						});
+					},
 				);
 			}
 
@@ -1919,8 +1936,8 @@ export class UsageCollector {
 	private async estimateCostWithDeadline(
 		requestId: string,
 		model: string,
-		estimate: () => Promise<number>,
-	): Promise<number> {
+		estimate: () => Promise<number | undefined>,
+	): Promise<number | undefined> {
 		let timeoutHandle: Timer | undefined;
 		const timeout = new Promise<number>((resolve) => {
 			timeoutHandle = setTimeout(() => {

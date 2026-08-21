@@ -5416,7 +5416,11 @@ describe("U5 canary: AE7 higher-priority account selected over Vercel catch-all 
 			expires_at: null,
 			priority: 100,
 			custom_endpoint: "https://ai-gateway.vercel.sh/v1",
+			// Every Claude family the U4 recipe documents, so AE7's "not selected
+			// for any Claude family" claim is exercised over the same set an
+			// operator would actually configure.
 			model_mappings: JSON.stringify({
+				fable: ["zai/glm-5.2-fast", "zai/glm-5.2"],
 				opus: ["zai/glm-5.2-fast", "zai/glm-5.2"],
 				sonnet: ["zai/glm-5.2-fast", "zai/glm-5.2"],
 				haiku: ["zai/glm-5.2-fast", "zai/glm-5.2"],
@@ -5434,6 +5438,7 @@ describe("U5 canary: AE7 higher-priority account selected over Vercel catch-all 
 	}
 
 	it.each([
+		["claude-fable-5", "fable"],
 		["claude-opus-4-8", "opus"],
 		["claude-sonnet-4-5", "sonnet"],
 		["claude-haiku-4-5", "haiku"],

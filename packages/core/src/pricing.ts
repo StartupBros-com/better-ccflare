@@ -1003,6 +1003,26 @@ export async function getModelRates(
 }
 
 /**
+ * Whether the pricing catalogue can price this model at all.
+ *
+ * `estimateCostUSD` returns 0 both for a model that genuinely costs nothing and
+ * for one the catalogue has never heard of, so a caller that must keep "unknown"
+ * distinguishable from "free" has to ask this first.
+ *
+ * A catalogue failure is not evidence that a model is unpriced, so it answers
+ * `true` and leaves the existing estimate path (and its own error handling) in
+ * charge rather than turning a transient fault into a missing cost.
+ */
+export async function isModelPriced(modelId: string): Promise<boolean> {
+	try {
+		const model = await findModel(modelId);
+		return Boolean(model?.cost);
+	} catch {
+		return true;
+	}
+}
+
+/**
  * Estimate the total cost in USD for a request based on token counts
  * @returns Cost in dollars (NOT per million)
  */

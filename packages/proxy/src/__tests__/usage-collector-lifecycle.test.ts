@@ -30,6 +30,15 @@ const estimateCostUSD = mock((model: string, tokens: PricingTokens) =>
 	pricingImplementation(model, tokens),
 );
 
+// isModelPriced answers "can the catalogue price this model at all", which the
+// collector consults so an unknown gateway model records an absent cost instead
+// of a fabricated $0. Defaults to "priced" so every pre-existing case in this
+// file keeps its original behaviour; the real implementation would reach for
+// the remote models.dev catalogue, which tests must not do.
+let modelPricedImplementation: (model: string) => Promise<boolean> = async () =>
+	true;
+const isModelPriced = mock((model: string) => modelPricedImplementation(model));
+
 // Spread the real module so every other export (constants, isValidClaudeModel,
 // isOverloadReason, computeRateLimitBackoffMs, ...) stays intact for the rest
 // of the process — mock.module replaces the WHOLE module globally and across
@@ -42,6 +51,7 @@ const actualCore = await import("@better-ccflare/core");
 mock.module("@better-ccflare/core", () => ({
 	...actualCore,
 	estimateCostUSD,
+	isModelPriced,
 }));
 
 // Unlike @better-ccflare/core above, this file never touches
@@ -365,6 +375,8 @@ describe("UsageCollector request lifecycle", () => {
 		process.env.CF_STREAM_TIMEOUT_MS = String(INACTIVITY_TIMEOUT_MS);
 		pricingImplementation = async () => 0;
 		estimateCostUSD.mockClear();
+		modelPricedImplementation = async () => true;
+		isModelPriced.mockClear();
 	});
 
 	afterEach(() => {
@@ -4185,5 +4197,87 @@ describe("UsageCollector request lifecycle", () => {
 			"No state found for request reused-warning-id",
 			"No state found for request reused-warning-id",
 		]);
+	});
+
+	// R15/KTD8. estimateCostUSD() returns 0 both for a model that genuinely
+	// costs nothing and for one the pricing catalogue has never heard of, so
+	// without a separate "can this be priced at all" question an unknown gateway
+	// model is recorded as a confident $0 and reads as confirmed upstream
+	// billing. These pin the distinction on the path Claude Code actually
+	// produces, which is where the provider's own calculateCost never runs.
+	describe("unknown-model cost on the generic API-key lane", () => {
+		const GATEWAY_MODEL = "zai/glm-5.2-fast";
+
+		async function runJsonTurn(
+			requestId: string,
+			providerName: string,
+		): Promise<TestHarness> {
+			const testHarness = harness();
+			const responseBody = Buffer.from(
+				JSON.stringify({
+					model: GATEWAY_MODEL,
+					usage: { input_tokens: 11, output_tokens: 13 },
+				}),
+			).toString("base64");
+
+			testHarness.collector.handleStart(
+				makeStartMessage(requestId, {
+					isStream: false,
+					providerName,
+					responseHeaders: { "content-type": "application/json" },
+				}),
+			);
+			await testHarness.collector.handleEnd({
+				type: "end",
+				requestId,
+				success: true,
+				responseBody,
+			});
+			await testHarness.collector.drain();
+			return testHarness;
+		}
+
+		it("records an absent cost rather than a confident zero when the model cannot be priced", async () => {
+			pricingImplementation = async () => 0.25;
+			modelPricedImplementation = async () => false;
+
+			const { savedUsages, summaryCosts } = await runJsonTurn(
+				"gateway-unpriced",
+				"openai-compatible",
+			);
+
+			expect(savedUsages.get("gateway-unpriced")?.costUsd).toBeUndefined();
+			expect(summaryCosts.get("gateway-unpriced")).toBeUndefined();
+			// The estimate is skipped outright — a priced-looking 0 never exists.
+			expect(estimateCostUSD).not.toHaveBeenCalled();
+		});
+
+		it("still records a real cost for a compatible model the catalogue can price", async () => {
+			pricingImplementation = async () => 0.25;
+			modelPricedImplementation = async () => true;
+
+			const { savedUsages } = await runJsonTurn(
+				"gateway-priced",
+				"openai-compatible",
+			);
+
+			expect(savedUsages.get("gateway-priced")?.costUsd).toBe(0.25);
+			expect(estimateCostUSD).toHaveBeenCalledTimes(1);
+		});
+
+		it("leaves a genuinely free lane's zero cost meaningful", async () => {
+			pricingImplementation = async () => 0;
+			modelPricedImplementation = async () => false;
+
+			const { savedUsages } = await runJsonTurn(
+				"local-free",
+				"anthropic-compatible",
+			);
+
+			// Local inference really does cost nothing, so 0 is the correct value
+			// there and must not be rewritten as "unknown".
+			expect(savedUsages.get("local-free")?.costUsd).toBe(0);
+			expect(isModelPriced).not.toHaveBeenCalled();
+		});
 	});
 });
