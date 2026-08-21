@@ -1,0 +1,232 @@
+name: Upstream Cache Capability Watch
+
+# Re-entry watch for the Codex cache-parity levers deferred in #233 item 3 —
+# all of them need an upstream OpenAI/codex change first. This job checks
+# whether that upstream signal has changed and, if so, comments on #233 so
+# the deferred work re-enters on a signal instead of on someone remembering.
+# It never modifies or closes anything upstream or locally, and it must never
+# fail the schedule — every external call is best-effort and the job always
+# exits 0.
+
+on:
+  schedule:
+    # Weekly, off the top of the hour.
+    - cron: '23 14 * * 1'
+  workflow_dispatch: {}
+
+permissions:
+  issues: write
+  contents: read
+
+concurrency:
+  group: upstream-cache-capability-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check upstream re-entry condition and report on #233
+        id: watch
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TRACKING_REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+
+          UPSTREAM_REPO="openai/codex"
+          TRACKING_ISSUE="233"
+          ISSUE_NUMBERS=(35300 33821 30425 35925)
+          MARKER="<!-- upstream-cache-capability-watch:state"
+          STATE_FILE="$RUNNER_TEMP/watch-state.json"
+          PREV_FILE="$RUNNER_TEMP/watch-prev.json"
+
+          echo "{}" > "$PREV_FILE"
+
+          echo "Reading prior watch state from ${TRACKING_REPO}#${TRACKING_ISSUE}..."
+          if ! COMMENTS=$(gh api "repos/${TRACKING_REPO}/issues/${TRACKING_ISSUE}/comments?per_page=100" 2>/dev/null); then
+            echo "::warning::Could not read comments on ${TRACKING_REPO}#${TRACKING_ISSUE} (gh api failed, e.g. rate limit); skipping this run (fail-soft)."
+            exit 0
+          fi
+
+          PREV_BODY=$(echo "$COMMENTS" | jq -r --arg m "$MARKER" '
+            [.[] | select(.body // "" | contains($m))] | sort_by(.created_at) | last | .body // empty
+          ' 2>/dev/null)
+
+          if [ -n "$PREV_BODY" ] && [ "$PREV_BODY" != "null" ]; then
+            echo "$PREV_BODY" | awk -v marker="upstream-cache-capability-watch:state" '
+              $0 ~ marker { flag=1; next }
+              /-->/ { flag=0 }
+              flag { print }
+            ' > "$PREV_FILE"
+            jq empty "$PREV_FILE" 2>/dev/null || echo "{}" > "$PREV_FILE"
+          fi
+
+          echo "Prior state:"; cat "$PREV_FILE"
+
+          # --- Build current state ---------------------------------------
+
+          ISSUES_STATE="{}"
+          for num in "${ISSUE_NUMBERS[@]}"; do
+            if ! ISSUE_DATA=$(gh api "repos/${UPSTREAM_REPO}/issues/${num}" 2>/dev/null) || ! echo "$ISSUE_DATA" | jq -e '.state' >/dev/null 2>&1; then
+              echo "::warning::Could not fetch ${UPSTREAM_REPO}#${num}; carrying forward prior state for it."
+              PRIOR=$(jq -c --arg n "$num" '.issues[$n] // {state:"open", maintainer_comments:0}' "$PREV_FILE")
+              ISSUES_STATE=$(echo "$ISSUES_STATE" | jq --arg n "$num" --argjson v "$PRIOR" '.[$n]=$v')
+              continue
+            fi
+            STATE=$(echo "$ISSUE_DATA" | jq -r '.state // "unknown"')
+            if ISSUE_COMMENTS=$(gh api "repos/${UPSTREAM_REPO}/issues/${num}/comments?per_page=100" 2>/dev/null) \
+              && echo "$ISSUE_COMMENTS" | jq -e 'type == "array"' >/dev/null 2>&1; then
+              MAINT=$(echo "$ISSUE_COMMENTS" | jq '[.[] | select(.author_association=="OWNER" or .author_association=="MEMBER" or .author_association=="COLLABORATOR")] | length')
+            else
+              echo "::warning::Could not fetch comments for ${UPSTREAM_REPO}#${num}; carrying forward prior maintainer-comment count for it."
+              MAINT=$(jq -r --arg n "$num" '.issues[$n].maintainer_comments // 0' "$PREV_FILE")
+            fi
+            ISSUES_STATE=$(echo "$ISSUES_STATE" | jq --arg n "$num" --arg s "$STATE" --argjson m "${MAINT:-0}" '.[$n]={state:$s, maintainer_comments:$m}')
+          done
+
+          MERGED_PRS="[]"
+          MERGED_PRS_SEARCH_OK="true"
+          for term in "prompt_cache_breakpoint" "prompt_cache_options"; do
+            if RES=$(gh search prs --repo "$UPSTREAM_REPO" --merged --json number,title,url "$term" 2>/dev/null) \
+              && echo "$RES" | jq -e 'type == "array"' >/dev/null 2>&1; then
+              MERGED_PRS=$(jq -c -n --argjson a "$MERGED_PRS" --argjson b "$RES" '($a+$b) | unique_by(.number)')
+            else
+              echo "::warning::gh search prs failed for term '$term'."
+              MERGED_PRS_SEARCH_OK="false"
+            fi
+          done
+
+          COMMITS="[]"
+          COMMITS_SEARCH_OK="true"
+          for term in "prompt_cache_breakpoint" "prompt_cache_options"; do
+            if RES=$(gh search commits --repo "$UPSTREAM_REPO" --json sha,url "$term" 2>/dev/null) \
+              && echo "$RES" | jq -e 'type == "array"' >/dev/null 2>&1; then
+              COMMITS=$(jq -c -n --argjson a "$COMMITS" --argjson b "$RES" '($a+$b) | unique_by(.sha)')
+            else
+              echo "::warning::gh search commits failed for term '$term'."
+              COMMITS_SEARCH_OK="false"
+            fi
+          done
+
+          # A search call that actually failed (rate limit, transient API error)
+          # must never look like "no hits found" — fall back to the prior list
+          # for that pass rather than risk masking a real hit that already fired.
+          if [ "$MERGED_PRS_SEARCH_OK" != "true" ]; then
+            echo "::warning::At least one PR search failed; carrying forward prior merged_prs list unchanged this pass."
+            MERGED_PRS=$(jq -c '.merged_prs // []' "$PREV_FILE")
+          fi
+          if [ "$COMMITS_SEARCH_OK" != "true" ]; then
+            echo "::warning::At least one commit search failed; carrying forward prior commits list unchanged this pass."
+            COMMITS=$(jq -c '.commits // []' "$PREV_FILE")
+          fi
+
+          jq -n --argjson issues "$ISSUES_STATE" --argjson prs "$MERGED_PRS" --argjson commits "$COMMITS" \
+            '{issues:$issues, merged_prs:$prs, commits:$commits}' > "$STATE_FILE"
+
+          echo "Current state:"; cat "$STATE_FILE"
+
+          # --- Compare against prior state --------------------------------
+
+          IS_FIRST_RUN="false"
+          [ "$(jq -c . "$PREV_FILE")" = "{}" ] && IS_FIRST_RUN="true"
+
+          CHANGED_ISSUES=$(jq -n --slurpfile prev "$PREV_FILE" --slurpfile cur "$STATE_FILE" '
+            (($prev[0].issues) // {}) as $p | ($cur[0].issues) as $c |
+            [ $c | keys[] | . as $k |
+              ($p[$k] // {state:"open", maintainer_comments:0}) as $pi |
+              $c[$k] as $ci |
+              select(
+                (($pi.state != $ci.state) and $ci.state == "closed")
+                or ($ci.maintainer_comments > ($pi.maintainer_comments // 0))
+              ) |
+              {number:$k, prev:$pi, cur:$ci}
+            ]
+          ')
+
+          NEW_PRS=$(jq -n --slurpfile prev "$PREV_FILE" --slurpfile cur "$STATE_FILE" '
+            (($prev[0].merged_prs // []) | map(.number)) as $pn |
+            ($cur[0].merged_prs) as $c |
+            [ $c[] | select(.number as $n | ($pn | index($n)) | not) ]
+          ')
+
+          NEW_COMMITS=$(jq -n --slurpfile prev "$PREV_FILE" --slurpfile cur "$STATE_FILE" '
+            (($prev[0].commits // []) | map(.sha)) as $ps |
+            ($cur[0].commits) as $c |
+            [ $c[] | select(.sha as $s | ($ps | index($s)) | not) ]
+          ')
+
+          HAS_SIGNAL="false"
+          if [ "$(echo "$CHANGED_ISSUES" | jq 'length')" -gt 0 ] \
+            || [ "$(echo "$NEW_PRS" | jq 'length')" -gt 0 ] \
+            || [ "$(echo "$NEW_COMMITS" | jq 'length')" -gt 0 ]; then
+            HAS_SIGNAL="true"
+          fi
+
+          # --- Report -------------------------------------------------------
+
+          if [ "$IS_FIRST_RUN" = "true" ]; then
+            echo "First run — recording baseline only, nothing to compare against yet."
+            BODY="Upstream cache capability watch initialized. This is a one-time baseline comment, not a signal — weekly runs from here compare against it and only comment here when a re-entry condition in item 3 above actually changes: one of the four tracked issues closes or gains a maintainer response, or a PR/commit merges upstream mentioning \`prompt_cache_breakpoint\` or \`prompt_cache_options\`. When nothing changes, the workflow stays silent.
+
+          Tracked: openai/codex#35300, openai/codex#33821, openai/codex#30425, openai/codex#35925.
+
+          $MARKER
+          $(cat "$STATE_FILE")
+          -->"
+            gh issue comment "$TRACKING_ISSUE" --repo "$TRACKING_REPO" --body "$BODY" 2>/dev/null \
+              || echo "::warning::Failed to post baseline comment on #${TRACKING_ISSUE}."
+            exit 0
+          fi
+
+          if [ "$HAS_SIGNAL" != "true" ]; then
+            echo "No change in the upstream re-entry condition. Staying silent."
+            exit 0
+          fi
+
+          echo "Signal detected — posting comment on ${TRACKING_REPO}#${TRACKING_ISSUE}."
+
+          ISSUE_LINES=$(echo "$CHANGED_ISSUES" | jq -r '.[] | "- openai/codex#\(.number): state \(.prev.state // "open") -> \(.cur.state), maintainer comments \(.prev.maintainer_comments // 0) -> \(.cur.maintainer_comments)"')
+          PR_LINES=$(echo "$NEW_PRS" | jq -r '.[] | "- \(.url) — \(.title)"')
+          COMMIT_LINES=$(echo "$NEW_COMMITS" | jq -r '.[] | "- \(.url)"')
+
+          BODY="## Upstream cache capability watch — signal detected
+
+          One or more re-entry conditions listed in item 3 above may have changed upstream in \`openai/codex\`. Re-verify before resuming any deferred cache lever."
+
+          if [ -n "$ISSUE_LINES" ]; then
+            BODY="$BODY
+
+          ### Issue changes
+          $ISSUE_LINES"
+          fi
+
+          if [ -n "$PR_LINES" ]; then
+            BODY="$BODY
+
+          ### New merged PRs mentioning prompt_cache_breakpoint / prompt_cache_options
+          $PR_LINES"
+          fi
+
+          if [ -n "$COMMIT_LINES" ]; then
+            BODY="$BODY
+
+          ### New commits mentioning prompt_cache_breakpoint / prompt_cache_options
+          $COMMIT_LINES"
+          fi
+
+          BODY="$BODY
+
+          $MARKER
+          $(cat "$STATE_FILE")
+          -->"
+
+          gh issue comment "$TRACKING_ISSUE" --repo "$TRACKING_REPO" --body "$BODY" 2>/dev/null \
+            || echo "::warning::Failed to post signal comment on #${TRACKING_ISSUE}."
+          exit 0
+
+      - name: Fail-soft guard
+        if: steps.watch.outcome == 'failure'
+        run: echo "::warning::upstream-cache-capability-watch step reported failure but is fail-soft by design; not failing the job."
