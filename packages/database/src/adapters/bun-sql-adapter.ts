@@ -260,7 +260,14 @@ export class BunSqlAdapter {
 				sqlStr,
 			),
 		);
-		return result as unknown as R[];
+		// Bun.SQL's query result is an array-like that also carries extra own
+		// enumerable properties (`count`, `command`, `lastInsertRowid`,
+		// `affectedRows` — the same DML metadata runWithChanges() reads via
+		// `.count`) even for a plain SELECT. Object.keys()/for-in/spread on the
+		// raw result therefore enumerate those alongside the real row indices
+		// (3 rows read back as 7 keys). Normalize to a genuine plain array so
+		// callers see exactly the rows; .length/.map/indexing are unaffected.
+		return Array.from(result as ArrayLike<R>);
 	}
 
 	/**

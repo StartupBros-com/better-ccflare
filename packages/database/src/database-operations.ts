@@ -1280,6 +1280,19 @@ OAuth tokens will need to be re-authenticated.
 		);
 	}
 
+	/**
+	 * Unconditionally set (or clear) an account's requires_reauth flag. Unlike
+	 * flagAccountRequiresReauthIfTokenMatches, this does not gate on the
+	 * refresh token matching — callers that need that CAS protection should
+	 * use that method instead. This exposes the repository's existing
+	 * unconditional setter (already covered directly by
+	 * account-cas-writes.test.ts) on the facade for callers that manage the
+	 * flag out of band, e.g. account maintenance and test harnesses.
+	 */
+	async setRequiresReauth(accountId: string, value: boolean): Promise<void> {
+		await this.accounts.setRequiresReauth(accountId, value);
+	}
+
 	async hasAccountsForProvider(provider: string): Promise<boolean> {
 		return this.accounts.hasAccountsForProvider(provider);
 	}
