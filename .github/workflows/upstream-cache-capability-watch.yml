@@ -169,14 +169,17 @@ jobs:
 
           if [ "$IS_FIRST_RUN" = "true" ]; then
             echo "First run — recording baseline only, nothing to compare against yet."
-            BODY="Upstream cache capability watch initialized. This is a one-time baseline comment, not a signal — weekly runs from here compare against it and only comment here when a re-entry condition in item 3 above actually changes: one of the four tracked issues closes or gains a maintainer response, or a PR/commit merges upstream mentioning \`prompt_cache_breakpoint\` or \`prompt_cache_options\`. When nothing changes, the workflow stays silent.
-
-          Tracked: openai/codex#35300, openai/codex#33821, openai/codex#30425, openai/codex#35925.
-
-          $MARKER
-          $(cat "$STATE_FILE")
-          -->"
-            gh issue comment "$TRACKING_ISSUE" --repo "$TRACKING_REPO" --body "$BODY" 2>/dev/null \
+            BODY_FILE="$RUNNER_TEMP/watch-body.md"
+            {
+              printf '%s\n' "Upstream cache capability watch initialized. This is a one-time baseline comment, not a signal — weekly runs from here compare against it and only comment here when a re-entry condition in item 3 above actually changes: one of the four tracked issues closes or gains a maintainer response, or a PR/commit merges upstream mentioning \`prompt_cache_breakpoint\` or \`prompt_cache_options\`. When nothing changes, the workflow stays silent."
+              printf '\n'
+              printf '%s\n' "Tracked: openai/codex#35300, openai/codex#33821, openai/codex#30425, openai/codex#35925."
+              printf '\n'
+              printf '%s\n' "$MARKER"
+              cat "$STATE_FILE"
+              printf '%s\n' "-->"
+            } > "$BODY_FILE"
+            gh issue comment "$TRACKING_ISSUE" --repo "$TRACKING_REPO" --body-file "$BODY_FILE" 2>/dev/null \
               || echo "::warning::Failed to post baseline comment on #${TRACKING_ISSUE}."
             exit 0
           fi
@@ -192,38 +195,37 @@ jobs:
           PR_LINES=$(echo "$NEW_PRS" | jq -r '.[] | "- \(.url) — \(.title)"')
           COMMIT_LINES=$(echo "$NEW_COMMITS" | jq -r '.[] | "- \(.url)"')
 
-          BODY="## Upstream cache capability watch — signal detected
+          BODY_FILE="$RUNNER_TEMP/watch-body.md"
+          {
+            printf '%s\n' "## Upstream cache capability watch — signal detected"
+            printf '\n'
+            printf '%s\n' "One or more re-entry conditions listed in item 3 above may have changed upstream in \`openai/codex\`. Re-verify before resuming any deferred cache lever."
 
-          One or more re-entry conditions listed in item 3 above may have changed upstream in \`openai/codex\`. Re-verify before resuming any deferred cache lever."
+            if [ -n "$ISSUE_LINES" ]; then
+              printf '\n'
+              printf '%s\n' "### Issue changes"
+              printf '%s\n' "$ISSUE_LINES"
+            fi
 
-          if [ -n "$ISSUE_LINES" ]; then
-            BODY="$BODY
+            if [ -n "$PR_LINES" ]; then
+              printf '\n'
+              printf '%s\n' "### New merged PRs mentioning prompt_cache_breakpoint / prompt_cache_options"
+              printf '%s\n' "$PR_LINES"
+            fi
 
-          ### Issue changes
-          $ISSUE_LINES"
-          fi
+            if [ -n "$COMMIT_LINES" ]; then
+              printf '\n'
+              printf '%s\n' "### New commits mentioning prompt_cache_breakpoint / prompt_cache_options"
+              printf '%s\n' "$COMMIT_LINES"
+            fi
 
-          if [ -n "$PR_LINES" ]; then
-            BODY="$BODY
+            printf '\n'
+            printf '%s\n' "$MARKER"
+            cat "$STATE_FILE"
+            printf '%s\n' "-->"
+          } > "$BODY_FILE"
 
-          ### New merged PRs mentioning prompt_cache_breakpoint / prompt_cache_options
-          $PR_LINES"
-          fi
-
-          if [ -n "$COMMIT_LINES" ]; then
-            BODY="$BODY
-
-          ### New commits mentioning prompt_cache_breakpoint / prompt_cache_options
-          $COMMIT_LINES"
-          fi
-
-          BODY="$BODY
-
-          $MARKER
-          $(cat "$STATE_FILE")
-          -->"
-
-          gh issue comment "$TRACKING_ISSUE" --repo "$TRACKING_REPO" --body "$BODY" 2>/dev/null \
+          gh issue comment "$TRACKING_ISSUE" --repo "$TRACKING_REPO" --body-file "$BODY_FILE" 2>/dev/null \
             || echo "::warning::Failed to post signal comment on #${TRACKING_ISSUE}."
           exit 0
 
