@@ -604,7 +604,7 @@ export class RequestRepository extends BaseRepository<RequestData> {
 			FROM requests r
 			LEFT JOIN accounts a ON r.account_used = a.id
 			${whereClause}
-			GROUP BY r.account_used
+			GROUP BY r.account_used, a.name
 			ORDER BY request_count DESC
 		`,
 			params,

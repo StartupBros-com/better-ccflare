@@ -30,9 +30,24 @@
  *    packages/database source: a placeholder inside GROUP BY, a bind parameter
  *    on the left of IN, a `?` inside a `--` SQL comment, or a jsonb `?|`/`?&`
  *    operator that convertPlaceholders would mangle.
- * 2. A live block, gated on DATABASE_URL exactly like migrations-pg.test.ts,
- *    which runs the real StatsRepository / DatabaseOperations / handler code
- *    against a real server inside a throwaway schema.
+ * 2. A live block, gated on DATABASE_URL (same variable migrations-pg.test.ts
+ *    uses, and the one DatabaseOperations itself reads to select PostgreSQL)
+ *    or, as a fallback, BETTER_CCFLARE_TEST_POSTGRES_URL — the var
+ *    managed-routing-postgres.yml already exports for its other PG steps.
+ *    Whichever is set, the live block runs the real StatsRepository /
+ *    DatabaseOperations / handler code against a real server inside a
+ *    throwaway schema.
+ *
+ * CI FAIL-CLOSED GUARD
+ * ---------------------
+ * This file's own history is the reason for this section: CI paid for a live
+ * postgres:16 service sitting right next to this suite and never pointed it
+ * here (see issue #233), so the live block silently skipped in every run.
+ * To make that class of regression impossible to reintroduce silently, this
+ * file throws at module load if `CI` is set and neither env var resolves to
+ * a postgres:// URL — a live-database contract gate must fail loudly in CI,
+ * not skip. Local `bun test` runs with no Postgres and no `CI` env var still
+ * skip normally.
  *
  * HOW TO RUN
  * ----------
@@ -41,6 +56,10 @@
  *
  *   # full harness against a real server
  *   DATABASE_URL=postgres://user:pass@host:5432/db \
+ *     bun test packages/http-api/src/__tests__/pg-live-queries.test.ts
+ *
+ *   # equivalently, via the CI-provisioned var
+ *   BETTER_CCFLARE_TEST_POSTGRES_URL=postgres://user:pass@host:5432/db \
  *     bun test packages/http-api/src/__tests__/pg-live-queries.test.ts
  *
  * ISOLATION
@@ -279,14 +298,56 @@ describe("SQL dialect hazards (static, always runs)", () => {
 // Gate copied verbatim from packages/database/src/migrations-pg.test.ts.
 // ---------------------------------------------------------------------------
 
-function hasLivePg(): boolean {
-	const url = process.env.DATABASE_URL;
+function isPostgresUrl(url: string | undefined): url is string {
 	return (
 		!!url && (url.startsWith("postgres://") || url.startsWith("postgresql://"))
 	);
 }
 
+/**
+ * DATABASE_URL is DatabaseOperations' own switch for selecting PostgreSQL
+ * (see database-operations.ts), so it always wins when both are set.
+ * BETTER_CCFLARE_TEST_POSTGRES_URL is the fallback: it's the var
+ * managed-routing-postgres.yml already provisions a postgres:16 service and
+ * exports for its other PG-integration steps, so this harness can run off
+ * it directly instead of requiring CI to also export DATABASE_URL — which
+ * would silently redirect every *other* DatabaseOperations-backed test in
+ * the same job onto the live server (most construct `new DatabaseOperations()`
+ * with no args and default to a throwaway SQLite db).
+ */
+function resolveLivePgUrl(): string | undefined {
+	if (isPostgresUrl(process.env.DATABASE_URL)) return process.env.DATABASE_URL;
+	if (isPostgresUrl(process.env.BETTER_CCFLARE_TEST_POSTGRES_URL)) {
+		return process.env.BETTER_CCFLARE_TEST_POSTGRES_URL;
+	}
+	return undefined;
+}
+
+function hasLivePg(): boolean {
+	return resolveLivePgUrl() !== undefined;
+}
+
+const livePgUrl = resolveLivePgUrl();
 const livePgAvailable = hasLivePg();
+
+// This exact shape — a live-database contract gate that skips instead of
+// failing when its database is missing — is how this file went unexecuted
+// in CI for months next to a live postgres:16 service nobody ever pointed it
+// at (see issue #233 and the file header). Skipping is fine for a local
+// `bun test` with no Postgres running; it must not be possible in CI, where
+// a skip renders as a green, unremarkable check. Keep this guard tiny and
+// local to this file rather than generalizing it — it exists to catch a
+// regression of this file's own wiring, not to police skip logic elsewhere.
+if (process.env.CI && !livePgAvailable) {
+	throw new Error(
+		"pg-live-queries.test.ts: running in CI with neither DATABASE_URL nor " +
+			"BETTER_CCFLARE_TEST_POSTGRES_URL set to a postgres:// URL. This is a " +
+			"live-database contract gate — it must fail loudly here instead of " +
+			"silently skipping. Wire one of those env vars for this invocation " +
+			"(see the dedicated step in managed-routing-postgres.yml) rather than " +
+			"letting it no-op.",
+	);
+}
 
 /** Throwaway schema, unique per process so parallel runs cannot collide. */
 const SCHEMA = `ccflare_pgq_${process.pid.toString(36)}_${Date.now().toString(36)}`;
@@ -349,6 +410,13 @@ describe.skipIf(!livePgAvailable)(
 			process.env.BETTER_CCFLARE_DB_POOL_MAX = "1";
 			process.env.BETTER_CCFLARE_DB_IDLE_TIMEOUT = "0";
 			delete process.env.BETTER_CCFLARE_DB_PG_PREPARE;
+			// DatabaseOperations only reads DATABASE_URL to select PostgreSQL
+			// (database-operations.ts). Mirror the resolved URL into it so the
+			// harness works whether the caller supplied DATABASE_URL directly or
+			// only BETTER_CCFLARE_TEST_POSTGRES_URL.
+			if (!process.env.DATABASE_URL && livePgUrl) {
+				process.env.DATABASE_URL = livePgUrl;
+			}
 
 			const { DatabaseOperations: DbOps } = await import(
 				"@better-ccflare/database"
@@ -392,6 +460,12 @@ describe.skipIf(!livePgAvailable)(
 				getRequestRetentionDays: () => 30,
 				getDataRetentionDays: () => 7,
 				getStorePayloads: () => true,
+				// createCacheParityHandler's readCacheParityPolicy reads this
+				// directly (see insights.ts) as the R18 fail-closed guard, so an
+				// incomplete stub throws rather than resolving to 0. Kept in sync
+				// with the SQLite-side fixture at
+				// insights-cache-parity.test.ts:23.
+				getCacheKeepaliveTtlMinutes: () => 0,
 			} as unknown as Config;
 
 			// AlertService touches no external state until start() is called,
@@ -1427,8 +1501,17 @@ describe.skipIf(!livePgAvailable)(
 					rateLimitedUntil: now + HOUR,
 				});
 
+				// clearExpiredRateLimits returns the (id, provider) pairs it
+				// cleared, not a count — apps/server/src/server.ts iterates this
+				// to force-close the circuit breaker for each entry. The prior
+				// assertion (`toBe(1)`) compared that array against the number
+				// 1, which cannot pass regardless of how many rows were cleared.
 				const cleared = await dbOps.clearExpiredRateLimits(now);
-				expect(cleared).toBe(1);
+				expect(cleared).toHaveLength(1);
+				expect(cleared[0]).toMatchObject({
+					id: "acct-expired",
+					provider: "anthropic",
+				});
 
 				const still = await adapter.get<{ rate_limited_until: number | null }>(
 					"SELECT rate_limited_until FROM accounts WHERE id = ?",
