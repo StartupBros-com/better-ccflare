@@ -432,6 +432,69 @@ describe("MuseSparkProvider", () => {
 		});
 	});
 
+	describe("skill elision (Messages sanitizer path)", () => {
+		const SKILL_MARKER = "Base directory for this skill: ";
+		const originalBlocked = process.env.CCFLARE_SKILL_ELISION_BLOCKED;
+
+		afterEach(() => {
+			if (originalBlocked === undefined) {
+				delete process.env.CCFLARE_SKILL_ELISION_BLOCKED;
+			} else {
+				process.env.CCFLARE_SKILL_ELISION_BLOCKED = originalBlocked;
+			}
+		});
+
+		function makeSkillText(dir: string, totalLength: number): string {
+			const header = `${SKILL_MARKER}${dir}\n`;
+			return header + "x".repeat(Math.max(0, totalLength - header.length));
+		}
+
+		it("elides a blocked skill bundle on the sanitized Messages path", async () => {
+			process.env.CCFLARE_SKILL_ELISION_BLOCKED = "some-skill";
+			const bundleText = makeSkillText("/skills/some-skill", 12_000);
+			const body = await bodyOf(
+				await provider.transformRequestBody(
+					jsonRequest({
+						model: "muse-spark-1.2",
+						max_tokens: 4096,
+						messages: [
+							{ role: "user", content: [{ type: "text", text: bundleText }] },
+						],
+					}),
+					account,
+				),
+			);
+
+			const messages = body.messages as Array<{
+				content: Array<{ type: string; text: string }>;
+			}>;
+			expect(messages[0].content[0].text).toContain("[better-ccflare]");
+			expect(messages[0].content[0].text.length).toBeLessThan(200);
+		});
+
+		it("leaves an unblocked skill bundle intact on the Messages path", async () => {
+			process.env.CCFLARE_SKILL_ELISION_BLOCKED = "other-skill";
+			const bundleText = makeSkillText("/skills/some-skill", 12_000);
+			const body = await bodyOf(
+				await provider.transformRequestBody(
+					jsonRequest({
+						model: "muse-spark-1.2",
+						max_tokens: 4096,
+						messages: [
+							{ role: "user", content: [{ type: "text", text: bundleText }] },
+						],
+					}),
+					account,
+				),
+			);
+
+			const messages = body.messages as Array<{
+				content: Array<{ type: string; text: string }>;
+			}>;
+			expect(messages[0].content[0].text).toBe(bundleText);
+		});
+	});
+
 	describe("isMuseSparkMessagesPath", () => {
 		it("matches the Messages surface only", () => {
 			expect(isMuseSparkMessagesPath("https://api.meta.ai/v1/messages")).toBe(

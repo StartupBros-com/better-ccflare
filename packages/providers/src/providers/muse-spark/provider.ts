@@ -4,6 +4,10 @@ import type { Account, LogicalModelCapability } from "@better-ccflare/types";
 import type { RateLimitInfo } from "../../types";
 import { stripCodexReasoningRetention } from "../../utils/codex-reasoning-retention";
 import { transformRequestBodyModel } from "../../utils/model-mapping";
+import {
+	applySkillElision,
+	resolveSkillElisionBlockedSkills,
+} from "../../utils/skill-elision";
 import { BaseAnthropicCompatibleProvider } from "../base-anthropic-compatible";
 import { sanitizeMuseSparkRequestBody } from "./request-sanitizer";
 
@@ -252,7 +256,11 @@ export class MuseSparkProvider extends BaseAnthropicCompatibleProvider {
 				return rebuild(bytes);
 			}
 
-			const body = parsed as Record<string, unknown>;
+			const body = applySkillElision(
+				this.name,
+				parsed as Record<string, unknown>,
+				resolveSkillElisionBlockedSkills(),
+			);
 			const { body: reasoningFiltered, strippedCount } =
 				stripCodexReasoningRetention(body);
 
