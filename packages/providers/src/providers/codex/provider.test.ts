@@ -1308,6 +1308,132 @@ describe("CodexProvider request conversion", () => {
 		);
 	});
 
+	describe("skill elision", () => {
+		const SKILL_MARKER = "Base directory for this skill: ";
+
+		/** Build marker-bearing text of exactly `totalLength` characters. */
+		function makeSkillText(dir: string, totalLength: number): string {
+			const header = `${SKILL_MARKER}${dir}\n`;
+			const body = "x".repeat(Math.max(0, totalLength - header.length));
+			return header + body;
+		}
+
+		let tmpDir: string;
+		const originalConfigPath = process.env.BETTER_CCFLARE_CONFIG_PATH;
+		const originalBlocked = process.env.CCFLARE_SKILL_ELISION_BLOCKED;
+
+		beforeEach(() => {
+			tmpDir = mkdtempSync(
+				join(tmpdir(), "better-ccflare-skill-elision-codex-"),
+			);
+			process.env.BETTER_CCFLARE_CONFIG_PATH = join(tmpDir, "config.json");
+		});
+
+		afterEach(() => {
+			rmSync(tmpDir, { recursive: true, force: true });
+			if (originalConfigPath === undefined) {
+				delete process.env.BETTER_CCFLARE_CONFIG_PATH;
+			} else {
+				process.env.BETTER_CCFLARE_CONFIG_PATH = originalConfigPath;
+			}
+			if (originalBlocked === undefined) {
+				delete process.env.CCFLARE_SKILL_ELISION_BLOCKED;
+			} else {
+				process.env.CCFLARE_SKILL_ELISION_BLOCKED = originalBlocked;
+			}
+		});
+
+		it("elides a blocked skill bundle before Codex input conversion", async () => {
+			process.env.CCFLARE_SKILL_ELISION_BLOCKED = "ce-plan";
+			const bundleText = makeSkillText("ce-plan", 12_000);
+			const provider = new CodexProvider();
+			const request = new Request("https://example.com/v1/messages", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					model: "claude-3-7-sonnet",
+					max_tokens: 10,
+					messages: [
+						{
+							role: "user",
+							content: [{ type: "text", text: bundleText }],
+						},
+					],
+				}),
+			});
+
+			const transformed = await provider.transformRequestBody(
+				request,
+				undefined,
+			);
+			const body = await transformed.json();
+			const serializedInput = JSON.stringify(body.input);
+
+			expect(serializedInput).not.toContain(bundleText);
+			expect(serializedInput).toContain("[better-ccflare]");
+		});
+
+		it("elides the skill bundle text while still firing the Skill continuation nudge", async () => {
+			process.env.CCFLARE_SKILL_ELISION_BLOCKED = "ce-plan";
+			const bundleText = makeSkillText("ce-plan", 12_000);
+			const provider = new CodexProvider();
+			const request = new Request("https://example.com/v1/messages", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					model: "claude-3-7-sonnet",
+					max_tokens: 10,
+					messages: [
+						{ role: "user", content: "load /ce-plan" },
+						{
+							role: "assistant",
+							content: [
+								{
+									type: "tool_use",
+									id: "call_skill_1",
+									name: "Skill",
+									input: { skill: "ce-plan" },
+								},
+							],
+						},
+						{
+							role: "user",
+							content: [
+								{
+									type: "tool_result",
+									tool_use_id: "call_skill_1",
+									content: [
+										{ type: "text", text: "Successfully loaded skill" },
+									],
+								},
+								{ type: "text", text: bundleText },
+							],
+						},
+					],
+				}),
+			});
+
+			const transformed = await provider.transformRequestBody(
+				request,
+				undefined,
+			);
+			const body = await transformed.json();
+
+			expect(body.input).toContainEqual({
+				role: "user",
+				content: [
+					{
+						type: "input_text",
+						text: "The requested Skill tool has loaded additional instructions. Continue the user's original request now, applying those instructions. Do not wait for another user message.",
+					},
+				],
+			});
+			const serializedInput = JSON.stringify(body.input);
+			expect(serializedInput).not.toContain(bundleText);
+			expect(serializedInput).toContain("[better-ccflare]");
+		});
+	});
+
 	it("forwards xhigh reasoning effort to Codex unchanged", async () => {
 		const provider = new CodexProvider();
 		const request = new Request("https://example.com/v1/messages", {

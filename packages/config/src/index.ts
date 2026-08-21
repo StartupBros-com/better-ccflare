@@ -886,6 +886,7 @@ export interface ConfigData {
 	implicit_fallback_mode?: string;
 	implicit_fallback_allowed_classes?: string;
 	implicit_fallback_denied_classes?: string;
+	skill_elision_blocked_skills?: string;
 	health_detail_enabled?: boolean;
 	anthropic_degraded_mode?: AnthropicDegradedMode;
 	anthropic_degraded_large_request_tokens?: number;
@@ -1100,6 +1101,50 @@ function parseImplicitFallbackClassList(
 		// Four is the complete class universe. A larger list is necessarily
 		// malformed (or an attempt to smuggle unbounded config into health/logs).
 		if (normalized.length > IMPLICIT_FALLBACK_ROUTE_CLASSES.size) return null;
+	}
+	return Object.freeze(normalized);
+}
+
+const MAX_SKILL_ELISION_BLOCKED_SKILLS = 16;
+
+/**
+ * Parse the CSV/array config-file or env value for
+ * `CCFLARE_SKILL_ELISION_BLOCKED` / `skill_elision_blocked_skills` into a
+ * bounded, normalized list of lowercased skill names. Fails closed to an
+ * empty list (feature effectively off) on any malformed input — oversized
+ * lists, non-string elements, or an unsupported input type — rather than
+ * partially applying it. Never throws.
+ */
+export function parseSkillElisionBlockedSkills(
+	value: unknown,
+): readonly string[] {
+	if (value === undefined || value === null) return Object.freeze([]);
+	const rawValues = Array.isArray(value)
+		? value
+		: typeof value === "string"
+			? value.split(",")
+			: null;
+	if (rawValues === null) return Object.freeze([]);
+	if (rawValues.length > MAX_SKILL_ELISION_BLOCKED_SKILLS) {
+		return Object.freeze([]);
+	}
+
+	const seen = new Set<string>();
+	const normalized: string[] = [];
+	for (const raw of rawValues) {
+		if (typeof raw !== "string") return Object.freeze([]);
+		const candidate = raw.trim().toLowerCase();
+		if (!candidate) continue;
+		if (seen.has(candidate)) continue;
+		seen.add(candidate);
+		normalized.push(candidate);
+		// Belt-and-suspenders double-check (mirrors parseImplicitFallbackClassList):
+		// the raw-length guard above already bounds this, but re-check the
+		// de-duped count too so a future change to that guard can't silently
+		// let an oversized list through.
+		if (normalized.length > MAX_SKILL_ELISION_BLOCKED_SKILLS) {
+			return Object.freeze([]);
+		}
 	}
 	return Object.freeze(normalized);
 }
@@ -1650,6 +1695,24 @@ export class Config extends EventEmitter {
 			);
 		}
 		return resolved;
+	}
+
+	/**
+	 * Restart-scoped, opt-in list of Skill-tool document bundles to elide when
+	 * a request is routed to a non-Anthropic provider (see
+	 * `@better-ccflare/providers` skill-elision utilities). Default-off (empty
+	 * list). The environment wins over the file wholesale when set at all —
+	 * even a malformed env value fails closed to `[]` rather than falling back
+	 * to the file, matching `parseSkillElisionBlockedSkills`'s own contract.
+	 */
+	getSkillElisionBlockedSkills(): readonly string[] {
+		const fromEnv = process.env.CCFLARE_SKILL_ELISION_BLOCKED;
+		if (fromEnv !== undefined) {
+			return parseSkillElisionBlockedSkills(fromEnv);
+		}
+		return parseSkillElisionBlockedSkills(
+			this.data.skill_elision_blocked_skills,
+		);
 	}
 
 	setUsageThrottlingFiveHourEnabled(value: boolean): void {

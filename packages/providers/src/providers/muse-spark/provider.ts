@@ -216,7 +216,12 @@ export class MuseSparkProvider extends BaseAnthropicCompatibleProvider {
 		// Other JSON endpoints retain their own schema, but still cannot receive
 		// proxy-minted reasoning if they carry a Messages transcript.
 		if (!isMuseSparkMessagesPath(request.url)) {
-			return transformRequestBodyModel(request);
+			return transformRequestBodyModel(
+				request,
+				undefined,
+				undefined,
+				this.name,
+			);
 		}
 
 		// Sanitization changes the body length, so the inbound content-length must

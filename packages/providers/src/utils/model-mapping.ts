@@ -2,6 +2,10 @@ import { mapModelName } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import type { Account } from "@better-ccflare/types";
 import { stripCodexReasoningRetention } from "./codex-reasoning-retention";
+import {
+	applySkillElision,
+	resolveSkillElisionBlockedSkills,
+} from "./skill-elision";
 
 const log = new Logger("ModelMappingUtils");
 
@@ -109,6 +113,7 @@ export async function transformRequestBodyModel<T extends TransformRequestBody>(
 	request: Request,
 	account?: Account | undefined,
 	providerSpecificMapping?: (model: string, account?: Account) => string,
+	providerName?: string,
 ): Promise<Request> {
 	// Only JSON bodies carry a model to map; anything else passes through
 	// untouched (and is left un-consumed so identity is preserved), matching the
@@ -129,7 +134,15 @@ export async function transformRequestBodyModel<T extends TransformRequestBody>(
 	if (!bytes) return request;
 
 	try {
-		const parsedBody: T = JSON.parse(new TextDecoder().decode(bytes));
+		const rawParsedBody: T = JSON.parse(new TextDecoder().decode(bytes));
+		const parsedBody: T = providerName
+			? applySkillElision(
+					providerName,
+					rawParsedBody,
+					resolveSkillElisionBlockedSkills(),
+				)
+			: rawParsedBody;
+		const bodyChangedByElision = parsedBody !== rawParsedBody;
 		const { body, strippedCount } = stripCodexReasoningRetention(parsedBody);
 		let modelChanged = false;
 
@@ -150,7 +163,7 @@ export async function transformRequestBodyModel<T extends TransformRequestBody>(
 			}
 		}
 
-		if (modelChanged || strippedCount > 0) {
+		if (modelChanged || strippedCount > 0 || bodyChangedByElision) {
 			return rebuild(JSON.stringify(body));
 		}
 

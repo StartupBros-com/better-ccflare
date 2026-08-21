@@ -50,6 +50,10 @@ import type {
 	TokenRefreshResult,
 } from "../../types";
 import { CODEX_REASONING_RETENTION_PREFIX } from "../../utils/codex-reasoning-retention";
+import {
+	applySkillElision,
+	resolveSkillElisionBlockedSkills,
+} from "../../utils/skill-elision";
 import { transferResponseDrainTransport } from "../../utils/stream-drain";
 import {
 	CODEX_SINGLE_ORCHESTRATION_ROOT_ENV,
@@ -1466,7 +1470,12 @@ export class CodexProvider extends BaseProvider {
 		try {
 			this.sweepRequestStreamById();
 			this.sweepRequestToolSchemasById();
-			const body = (await request.json()) as AnthropicRequest;
+			const rawBody = (await request.json()) as AnthropicRequest;
+			const body = applySkillElision(
+				this.name,
+				rawBody,
+				resolveSkillElisionBlockedSkills(),
+			);
 			const logicalModelFamily =
 				trustedLogicalModelFamily ?? getModelFamily(body.model);
 			if (isSyntheticCountTokens) {

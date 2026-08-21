@@ -298,12 +298,17 @@ export class AnthropicProvider extends BaseProvider {
 		request: Request,
 		account?: Account,
 	): Promise<Request> {
-		return transformRequestBodyModel(request, account, (model, acc) => {
-			if (acc) {
-				return mapModelName(model, acc);
-			}
-			return model;
-		});
+		return transformRequestBodyModel(
+			request,
+			account,
+			(model, acc) => {
+				if (acc) {
+					return mapModelName(model, acc);
+				}
+				return model;
+			},
+			this.name,
+		);
 	}
 
 	buildUrl(path: string, query: string, account?: Account): string {

@@ -16,6 +16,10 @@ import {
 import type { Account } from "@better-ccflare/types";
 import { BaseProvider } from "../../base";
 import type { RateLimitInfo, TokenRefreshResult } from "../../types";
+import {
+	applySkillElision,
+	resolveSkillElisionBlockedSkills,
+} from "../../utils/skill-elision";
 import { transferResponseDrainTransport } from "../../utils/stream-drain";
 
 const log = new Logger("OpenAICompatibleProvider");
@@ -218,7 +222,12 @@ export class OpenAICompatibleProvider extends BaseProvider {
 		}
 
 		try {
-			const body = await request.json();
+			const rawBody = await request.json();
+			const body = applySkillElision(
+				this.name,
+				rawBody,
+				resolveSkillElisionBlockedSkills(),
+			);
 
 			// Derive endpoint + model from this request's own account/body — never
 			// from shared instance state. The provider instance is a long-lived
