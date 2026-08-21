@@ -26,7 +26,14 @@ export type ResponseItem =
 	| FunctionCallItem
 	| FunctionCallOutputItem
 	| CustomToolCallItem
-	| CustomToolCallOutputItem;
+	| CustomToolCallOutputItem
+	| LocalShellCallItem
+	| LocalShellCallOutputItem
+	| AgentMessageItem
+	| ReasoningItem
+	| CompactionItem
+	| CompactionSummaryItem
+	| CompactionTriggerItem;
 
 export interface ResponseMessageItem {
 	type: "message";
@@ -88,6 +95,77 @@ export interface CustomToolCallOutputItem {
 	type: "custom_tool_call_output";
 	call_id: string;
 	output: string;
+}
+
+export interface LocalShellAction {
+	type: "exec";
+	command: string[];
+	timeout_ms?: number;
+	working_directory?: string;
+	env?: Record<string, string>;
+	user?: string;
+}
+
+export interface LocalShellCallItem {
+	type: "local_shell_call";
+	id?: string;
+	call_id?: string;
+	status?: string;
+	action: LocalShellAction;
+}
+
+export interface LocalShellCallOutputItem {
+	type: "local_shell_call_output";
+	id?: string;
+	call_id?: string;
+	output: string;
+	status?: string;
+}
+
+export interface AgentMessageInputTextContent {
+	type: "input_text";
+	text: string;
+}
+
+export interface AgentMessageEncryptedContent {
+	type: "encrypted_content";
+	encrypted_content: string;
+}
+
+export type AgentMessageContent =
+	| AgentMessageInputTextContent
+	| AgentMessageEncryptedContent;
+
+export interface AgentMessageItem {
+	type: "agent_message";
+	id?: string;
+	author: string;
+	recipient: string;
+	content: AgentMessageContent[];
+}
+
+// These three are intentionally modeled (rather than left for the generic
+// catch-all) so the translator can give each a type-specific drop-warning.
+// They are always dropped: reasoning has no verifiable signature, compaction*
+// is an opaque encrypted blob, and compaction_trigger carries no payload.
+// See request-translator.ts for the rationale on each.
+export interface ReasoningItem {
+	type: "reasoning";
+	id?: string;
+}
+
+export interface CompactionItem {
+	type: "compaction";
+	id?: string;
+}
+
+export interface CompactionSummaryItem {
+	type: "compaction_summary";
+	id?: string;
+}
+
+export interface CompactionTriggerItem {
+	type: "compaction_trigger";
 }
 
 // Tool definition

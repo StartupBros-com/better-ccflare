@@ -139,6 +139,13 @@ export function translateRequestToAnthropic(
 	const developerBlocks: string[] = [];
 
 	for (const item of req.input) {
+		// Captured before any narrowing so the generic catch-all below can log
+		// the real runtime type string without needing a cast: once every
+		// literal member of the ResponseItem union has been excluded by the
+		// branches below, `item` itself narrows to `never`, and `never` has no
+		// properties to read from.
+		const itemType = item.type;
+
 		if (item.type === "message") {
 			const content: AnthropicContent[] = item.content.map((c) =>
 				translateContentItem(c),
@@ -186,7 +193,103 @@ export function translateRequestToAnthropic(
 					},
 				],
 			});
+			continue;
 		}
+
+		if (item.type === "local_shell_call") {
+			const toolUseId = item.call_id ?? item.id;
+			if (toolUseId === undefined) {
+				logger.warn(
+					"Dropping local_shell_call with no call_id or id — cannot fabricate a tool_use id",
+				);
+				continue;
+			}
+			const toolUseBlock: AnthropicContent = {
+				type: "tool_use",
+				id: toolUseId,
+				name: "local_shell",
+				input: item.action,
+			};
+			const last = messages[messages.length - 1];
+			if (last && last.role === "assistant") {
+				last.content.push(toolUseBlock);
+			} else {
+				messages.push({ role: "assistant", content: [toolUseBlock] });
+			}
+			continue;
+		}
+
+		if (item.type === "local_shell_call_output") {
+			const toolUseId = item.call_id ?? item.id;
+			if (toolUseId === undefined) {
+				logger.warn(
+					"Dropping local_shell_call_output with no call_id/id — cannot map to a tool_result",
+				);
+				continue;
+			}
+			messages.push({
+				role: "user",
+				content: [
+					{
+						type: "tool_result",
+						tool_use_id: toolUseId,
+						content: item.output,
+					},
+				],
+			});
+			continue;
+		}
+
+		if (item.type === "agent_message") {
+			const textParts: string[] = [];
+			for (const c of item.content) {
+				if (c.type === "input_text") {
+					textParts.push(c.text);
+				} else if (c.type === "encrypted_content") {
+					logger.warn(
+						`Dropping encrypted_content part of agent_message from "${item.author}" — cannot decode encrypted_content`,
+					);
+				}
+			}
+			const text =
+				textParts.length > 0
+					? `[agent message from ${item.author} to ${item.recipient}]: ${textParts.join("\n\n")}`
+					: "(sub-agent message received)";
+			messages.push({ role: "user", content: [{ type: "text", text }] });
+			continue;
+		}
+
+		// reasoning/compaction/compaction_summary/compaction_trigger are
+		// modeled as real ResponseItem union members (see types.ts) purely so
+		// each gets its own type-specific drop-warning below — they are never
+		// translated to Anthropic content. Once these and every other literal
+		// member has been excluded, `item` narrows to `never` for the generic
+		// catch-all that follows; `itemType` was captured before any
+		// narrowing began, so it still holds the real runtime type string.
+		if (item.type === "reasoning") {
+			logger.warn(
+				"Dropping reasoning item — OpenAI reasoning has no signature field and Anthropic verifies thinking-block signatures server-side, so a fabricated signature would 400",
+			);
+			continue;
+		}
+
+		if (item.type === "compaction" || item.type === "compaction_summary") {
+			logger.warn(
+				`Dropping ${item.type} item — opaque server-encrypted_content blob, cannot decode`,
+			);
+			continue;
+		}
+
+		if (item.type === "compaction_trigger") {
+			logger.warn(
+				"Dropping compaction_trigger item — zero-payload control signal, no Anthropic mapping",
+			);
+			continue;
+		}
+
+		logger.warn(
+			`Dropping unhandled Responses input item type "${itemType}" — no Anthropic mapping implemented`,
+		);
 	}
 
 	const mergedMessages = mergeConsecutiveSameRole(messages);

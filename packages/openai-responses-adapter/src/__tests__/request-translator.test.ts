@@ -4,8 +4,24 @@ import {
 	LATEST_OPUS_MODEL,
 	LATEST_SONNET_MODEL,
 } from "@better-ccflare/core";
+import { logBus } from "@better-ccflare/logger";
+import type { LogEvent } from "@better-ccflare/types";
 import { translateRequestToAnthropic } from "../request-translator";
 import type { ResponsesRequest } from "../types";
+
+function captureWarnings(fn: () => void): LogEvent[] {
+	const captured: LogEvent[] = [];
+	const handler = (event: LogEvent) => {
+		if (event.level === "WARN") captured.push(event);
+	};
+	logBus.on("log", handler);
+	try {
+		fn();
+	} finally {
+		logBus.off("log", handler);
+	}
+	return captured;
+}
 
 describe("translateRequestToAnthropic", () => {
 	test("simple user message → single messages entry", () => {
@@ -543,5 +559,263 @@ describe("translateRequestToAnthropic", () => {
 			stream: true,
 		};
 		expect(translateRequestToAnthropic(req).stream).toBe(true);
+	});
+
+	test("local_shell_call → tool_use appended to trailing assistant message, action passed through unparsed", () => {
+		const action = {
+			type: "exec" as const,
+			command: ["ls", "-la"],
+			timeout_ms: 5000,
+		};
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "message",
+					role: "assistant",
+					content: [{ type: "output_text", text: "Running shell..." }],
+				},
+				{
+					type: "local_shell_call",
+					call_id: "shell_1",
+					action,
+				},
+			],
+		};
+		const result = translateRequestToAnthropic(req);
+		expect(result.messages).toHaveLength(1);
+		expect(result.messages[0].role).toBe("assistant");
+		expect(result.messages[0].content).toHaveLength(2);
+		expect(result.messages[0].content[1]).toEqual({
+			type: "tool_use",
+			id: "shell_1",
+			name: "local_shell",
+			input: action,
+		});
+		// Verify the exact same object reference/shape — not re-parsed via JSON.
+		expect(
+			(
+				result.messages[0].content[1] as {
+					input: typeof action;
+				}
+			).input,
+		).toBe(action);
+	});
+
+	test("local_shell_call with no call_id or id → dropped with warning", () => {
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "local_shell_call",
+					action: { type: "exec", command: ["echo", "hi"] },
+				},
+			],
+		};
+		const warnings = captureWarnings(() => {
+			const result = translateRequestToAnthropic(req);
+			expect(result.messages).toHaveLength(0);
+		});
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0].msg).toContain("local_shell_call");
+	});
+
+	test("local_shell_call_output with call_id → tool_result tool_use_id === call_id", () => {
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "local_shell_call_output",
+					call_id: "shell_1",
+					output: "total 0",
+				},
+			],
+		};
+		const result = translateRequestToAnthropic(req);
+		expect(result.messages).toHaveLength(1);
+		expect(result.messages[0].content[0]).toEqual({
+			type: "tool_result",
+			tool_use_id: "shell_1",
+			content: "total 0",
+		});
+	});
+
+	test("local_shell_call_output with only id (no call_id) → tool_result tool_use_id === id", () => {
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "local_shell_call_output",
+					id: "shell_out_1",
+					output: "total 0",
+				},
+			],
+		};
+		const result = translateRequestToAnthropic(req);
+		expect(result.messages).toHaveLength(1);
+		expect(result.messages[0].content[0]).toEqual({
+			type: "tool_result",
+			tool_use_id: "shell_out_1",
+			content: "total 0",
+		});
+	});
+
+	test("local_shell_call_output with neither call_id nor id → dropped with one warning", () => {
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "local_shell_call_output",
+					output: "total 0",
+				},
+			],
+		};
+		const warnings = captureWarnings(() => {
+			const result = translateRequestToAnthropic(req);
+			expect(result.messages).toHaveLength(0);
+		});
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0].msg).toContain("local_shell_call_output");
+		expect(warnings[0].msg).toContain("call_id/id");
+	});
+
+	test("agent_message with input_text → new user message with formatted text", () => {
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "agent_message",
+					author: "planner",
+					recipient: "coder",
+					content: [{ type: "input_text", text: "do X" }],
+				},
+			],
+		};
+		const result = translateRequestToAnthropic(req);
+		expect(result.messages).toEqual([
+			{
+				role: "user",
+				content: [
+					{
+						type: "text",
+						text: "[agent message from planner to coder]: do X",
+					},
+				],
+			},
+		]);
+	});
+
+	test("agent_message with only encrypted_content → placeholder text + warning mentioning encrypted_content and author", () => {
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "agent_message",
+					author: "planner",
+					recipient: "coder",
+					content: [
+						{ type: "encrypted_content", encrypted_content: "abc123==" },
+					],
+				},
+			],
+		};
+		const warnings = captureWarnings(() => {
+			const result = translateRequestToAnthropic(req);
+			expect(result.messages).toEqual([
+				{
+					role: "user",
+					content: [{ type: "text", text: "(sub-agent message received)" }],
+				},
+			]);
+		});
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0].msg).toContain("encrypted_content");
+		expect(warnings[0].msg).toContain("planner");
+	});
+
+	test("reasoning item is dropped — never emitted as thinking or tool_use, warns about signature", () => {
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "reasoning",
+					// biome-ignore lint/suspicious/noExplicitAny: exercising an unmodeled field shape from codex-rs
+				} as any,
+			],
+		};
+		const warnings = captureWarnings(() => {
+			const result = translateRequestToAnthropic(req);
+			expect(result.messages).toHaveLength(0);
+			for (const msg of result.messages) {
+				for (const c of msg.content) {
+					expect(c.type).not.toBe("thinking");
+					expect(c.type).not.toBe("tool_use");
+				}
+			}
+		});
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0].msg).toContain("reasoning");
+		expect(warnings[0].msg).toContain("signature");
+	});
+
+	test("unknown/future item type does not throw, drops item, warns with the literal type string", () => {
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "web_search_call",
+					// biome-ignore lint/suspicious/noExplicitAny: exercising an unmodeled future item type
+				} as any,
+			],
+		};
+		let result: ReturnType<typeof translateRequestToAnthropic> | undefined;
+		const warnings = captureWarnings(() => {
+			expect(() => {
+				result = translateRequestToAnthropic(req);
+			}).not.toThrow();
+		});
+		expect(result?.messages).toHaveLength(0);
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0].msg).toContain("web_search_call");
+	});
+
+	test("compaction_trigger and compaction items are dropped with type-specific warnings", () => {
+		const triggerReq: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "compaction_trigger",
+					// biome-ignore lint/suspicious/noExplicitAny: exercising an unmodeled field shape from codex-rs
+				} as any,
+			],
+		};
+		const triggerWarnings = captureWarnings(() => {
+			const result = translateRequestToAnthropic(triggerReq);
+			expect(result.messages).toHaveLength(0);
+		});
+		expect(triggerWarnings).toHaveLength(1);
+		expect(triggerWarnings[0].msg).toContain("control signal");
+		expect(triggerWarnings[0].msg).not.toContain(
+			"no Anthropic mapping implemented",
+		);
+
+		const compactionReq: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "compaction",
+					// biome-ignore lint/suspicious/noExplicitAny: exercising an unmodeled field shape from codex-rs
+				} as any,
+			],
+		};
+		const compactionWarnings = captureWarnings(() => {
+			const result = translateRequestToAnthropic(compactionReq);
+			expect(result.messages).toHaveLength(0);
+		});
+		expect(compactionWarnings).toHaveLength(1);
+		expect(compactionWarnings[0].msg).toContain("encrypted_content");
+		expect(compactionWarnings[0].msg).not.toContain(
+			"no Anthropic mapping implemented",
+		);
 	});
 });
