@@ -343,6 +343,8 @@ function readCacheParityPolicy(context: APIContext): CacheParityPolicy {
 		// renamed accessor must break loudly rather than resolve to 0, which
 		// would read as "no synthetic traffic" and let parity pass.
 		globalKeepaliveTtlMinutes: context.config.getCacheKeepaliveTtlMinutes(),
+		xaiCacheKeepaliveTtlMinutes:
+			context.config.getXaiCacheKeepaliveTtlMinutes(),
 	};
 }
 
