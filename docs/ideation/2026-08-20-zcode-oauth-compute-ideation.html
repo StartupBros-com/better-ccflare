@@ -1,0 +1,503 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ideation: ZCode OAuth Compute in better-ccflare</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f4f3ef;
+      --surface: #fffdf8;
+      --surface-2: #eeece5;
+      --ink: #1f2623;
+      --muted: #5f6964;
+      --line: #d5d3ca;
+      --accent: #176b56;
+      --accent-soft: #dcefe8;
+      --accent-text: #124b3d;
+      --info-soft: #e2edf5;
+      --info-text: #244e6a;
+      --warn-soft: #f7ead0;
+      --warn-text: #765114;
+      --danger-soft: #f5dddd;
+      --danger-text: #7c2929;
+      --shadow: 0 14px 40px rgb(27 37 32 / 8%);
+      --radius: 15px;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #151a18;
+        --surface: #1d2421;
+        --surface-2: #252d29;
+        --ink: #edf2ef;
+        --muted: #b1bdb6;
+        --line: #39443e;
+        --accent: #71c7a9;
+        --accent-soft: #173a30;
+        --accent-text: #b8ead8;
+        --info-soft: #1d3544;
+        --info-text: #bedcf0;
+        --warn-soft: #44371e;
+        --warn-text: #f1d08d;
+        --danger-soft: #482929;
+        --danger-text: #f1b5b5;
+        --shadow: 0 18px 48px rgb(0 0 0 / 28%);
+      }
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 15.5px;
+      line-height: 1.65;
+    }
+    a { color: var(--accent); text-underline-offset: 3px; }
+    code {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      font-size: .9em;
+      background: var(--surface-2);
+      border-radius: 5px;
+      padding: .08rem .35rem;
+    }
+    .page { width: min(94vw, 960px); margin: 0 auto; padding: 3.4rem 0 5rem; }
+    header {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      box-shadow: var(--shadow);
+      padding: clamp(1.5rem, 4vw, 3rem);
+    }
+    .eyebrow {
+      color: var(--accent);
+      font-size: .76rem;
+      font-weight: 750;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+    h1, h2, h3 { line-height: 1.18; letter-spacing: -.02em; }
+    h1 { margin: .55rem 0 .7rem; font-size: clamp(2rem, 5vw, 3.45rem); max-width: 17ch; }
+    h2 { margin: 0 0 1.1rem; font-size: clamp(1.5rem, 3vw, 2rem); }
+    h3 { margin: 0; font-size: 1.28rem; }
+    p { max-width: 72ch; }
+    .lede { font-size: 1.1rem; color: var(--muted); max-width: 68ch; }
+    .metadata { display: flex; flex-wrap: wrap; gap: .55rem; margin: 1.5rem 0 0; }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--surface-2);
+      color: var(--ink);
+      padding: .35rem .7rem;
+      font-size: .82rem;
+    }
+    .verdict {
+      margin-top: 1.35rem;
+      padding: 1rem 1.1rem;
+      border-radius: 12px;
+      background: var(--accent-soft);
+      color: var(--accent-text);
+    }
+    .verdict strong { color: inherit; }
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: .75rem;
+      margin-top: 1.4rem;
+    }
+    .stat { background: var(--surface-2); border-radius: 12px; padding: .8rem .9rem; }
+    .stat b { display: block; font-size: 1.45rem; line-height: 1.1; }
+    .stat span { color: var(--muted); font-size: .78rem; }
+    nav {
+      display: flex;
+      flex-wrap: wrap;
+      gap: .55rem;
+      margin: 1.3rem 0 0;
+    }
+    nav a {
+      text-decoration: none;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: .35rem .7rem;
+      background: var(--surface);
+      font-size: .82rem;
+    }
+    section { margin-top: 3.2rem; }
+    .panel, .idea, .table-wrap {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+    }
+    .panel { padding: 1.35rem 1.45rem; }
+    .grounding-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+    .grounding-grid h3 { font-size: 1rem; margin-bottom: .35rem; }
+    .grounding-grid p { margin: 0; color: var(--muted); }
+    .axes { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: .7rem; }
+    .axis {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: .85rem;
+    }
+    .axis b { display: block; font-size: .86rem; line-height: 1.3; }
+    .axis span { display: block; margin-top: .25rem; color: var(--muted); font-size: .78rem; }
+    .jump-list {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: .45rem .8rem;
+      margin: 0 0 1.15rem;
+      padding: 1rem 1.15rem 1rem 2.3rem;
+      background: var(--surface-2);
+      border-radius: 12px;
+    }
+    .jump-list a { text-decoration: none; }
+    .idea { padding: 1.35rem 1.45rem; margin: 1rem 0; scroll-margin-top: 1rem; }
+    .idea-head { display: flex; gap: 1rem; justify-content: space-between; align-items: flex-start; }
+    .rank {
+      display: inline-grid;
+      place-items: center;
+      flex: 0 0 auto;
+      width: 2.2rem;
+      height: 2.2rem;
+      border-radius: 50%;
+      background: var(--accent-soft);
+      color: var(--accent-text);
+      font-weight: 800;
+    }
+    .title-wrap { display: flex; align-items: center; gap: .75rem; }
+    .idea-tags { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: .4rem; }
+    .tag {
+      border-radius: 999px;
+      padding: .22rem .55rem;
+      font-size: .73rem;
+      font-weight: 700;
+      background: var(--info-soft);
+      color: var(--info-text);
+      white-space: nowrap;
+    }
+    .tag.low { background: var(--accent-soft); color: var(--accent-text); }
+    .tag.high { background: var(--warn-soft); color: var(--warn-text); }
+    .tag.conf-low { background: var(--danger-soft); color: var(--danger-text); }
+    .description { font-size: 1.02rem; margin: 1rem 0; }
+    dl { display: grid; grid-template-columns: 8.2rem 1fr; gap: .55rem 1rem; margin: 1rem 0 0; }
+    dt { font-size: .74rem; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+    dd { margin: 0; max-width: 75ch; }
+    .diagram {
+      overflow-x: auto;
+      margin: 1rem 0 .2rem;
+      border-radius: 12px;
+      background: var(--surface-2);
+      padding: .8rem;
+    }
+    svg { display: block; width: 100%; min-width: 650px; height: auto; }
+    .svg-box { fill: var(--surface); stroke: var(--line); stroke-width: 1.5; }
+    .svg-pass { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.5; }
+    .svg-stop { fill: var(--warn-soft); stroke: var(--warn-text); stroke-width: 1.5; }
+    .svg-line { stroke: var(--muted); stroke-width: 1.5; fill: none; marker-end: url(#arrow); }
+    .svg-text { fill: var(--ink); font: 600 13px Inter, ui-sans-serif, system-ui, sans-serif; text-anchor: middle; }
+    .svg-small { fill: var(--muted); font: 500 11px Inter, ui-sans-serif, system-ui, sans-serif; text-anchor: middle; }
+    .decision-note {
+      margin-top: 1rem;
+      background: var(--warn-soft);
+      color: var(--warn-text);
+      border-radius: 11px;
+      padding: .75rem .9rem;
+      font-size: .9rem;
+    }
+    table { width: 100%; border-collapse: collapse; font-size: .89rem; }
+    th, td { text-align: left; vertical-align: top; padding: .72rem .8rem; border-bottom: 1px solid var(--line); }
+    th { color: var(--muted); font-size: .72rem; letter-spacing: .07em; text-transform: uppercase; }
+    tr:last-child td { border-bottom: 0; }
+    .table-wrap { overflow-x: auto; }
+    .references { columns: 2; column-gap: 2rem; padding-left: 1.2rem; }
+    .references li { break-inside: avoid; margin-bottom: .55rem; }
+    footer { margin-top: 3.5rem; color: var(--muted); font-size: .78rem; text-align: center; }
+    @media (max-width: 760px) {
+      .page { width: min(94vw, 960px); padding-top: 1.2rem; }
+      .stats { grid-template-columns: repeat(2, 1fr); }
+      .grounding-grid, .jump-list { grid-template-columns: 1fr; }
+      .axes { grid-template-columns: 1fr 1fr; }
+      .idea-head { display: block; }
+      .idea-tags { justify-content: flex-start; margin-top: .65rem; }
+      dl { grid-template-columns: 1fr; gap: .15rem; }
+      dd { margin-bottom: .65rem; }
+      .references { columns: 1; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header>
+      <div class="eyebrow">Grounded ideation · provider integration</div>
+      <h1>Can ZCode OAuth compute feed better-ccflare?</h1>
+      <p class="lede">Yes, probably through a much smaller seam than a new provider: ZCode 0.16.3 already turns OAuth into a durable Z.ai API key and points it at the Anthropic endpoint better-ccflare already supports. The unresolved question is economic, not transport: does that key debit the same free or promotional allowance visible inside ZCode?</p>
+      <div class="metadata" aria-label="Document metadata">
+        <span class="chip">Date: <time datetime="2026-08-20">2026-08-20</time></span>
+        <span class="chip">Topic: zcode-oauth-compute</span>
+        <span class="chip">Mode: repo-grounded</span>
+        <span class="chip">Focus: the user’s own Z.ai free, Coding Plan, bonus, and paid compute</span>
+      </div>
+      <div class="verdict"><strong>Recommended posture (updated after live measurement):</strong> do not build the OAuth enrollment adapter for the free tier. Measured evidence below shows this account’s free GLM-5.3 units live behind a captcha-gated ZCode gateway, while better-ccflare’s Z.ai endpoint reports no entitlement. A purchased GLM Coding Plan is the only path that works through the existing provider today.</div>
+      <div class="stats" aria-label="Ideation counts">
+        <div class="stat"><b>44</b><span>raw candidates</span></div>
+        <div class="stat"><b>17</b><span>after deduplication</span></div>
+        <div class="stat"><b>7</b><span>ranked directions</span></div>
+        <div class="stat"><b>5</b><span>topic axes covered</span></div>
+      </div>
+      <nav aria-label="Document navigation">
+        <a href="#live-findings">Live Findings</a>
+        <a href="#grounding-context">Grounding Context</a>
+        <a href="#topic-axes">Topic Axes</a>
+        <a href="#ranked-ideas">Ranked Ideas</a>
+        <a href="#rejection-summary">Rejection Summary</a>
+        <a href="#sources">Sources &amp; References</a>
+      </nav>
+    </header>
+
+    <section id="grounding-context">
+      <div class="eyebrow">Evidence before options</div>
+      <h2>Grounding Context</h2>
+      <div class="grounding-grid">
+        <article class="panel">
+          <h3>Codebase Context</h3>
+          <p>better-ccflare already registers a <code>zai</code> provider with Anthropic Messages transport, streaming, model mapping, API-key storage, quota polling, and Z.ai-specific rate-limit reset parsing. Existing account storage can also hold OAuth access/refresh/expiry data, while Qwen and Codex provide non-Anthropic OAuth precedents.</p>
+        </article>
+        <article class="panel">
+          <h3>Installed ZCode Evidence</h3>
+          <p>The local ZCode CLI is version 0.16.3. Its bundle runs server-mediated OAuth, retains a Z.ai access token and ZCode JWT, exchanges the Z.ai token for a business token, creates or reuses <code>zcode-api-key</code>, and writes a normal Z.ai provider pointed at <code>https://api.z.ai/api/anthropic</code>.</p>
+        </article>
+        <article class="panel">
+          <h3>External Context</h3>
+          <p>Z.ai officially documents Claude Code and the Anthropic endpoint for GLM Coding Plan. GLM-5.3 supports <code>low</code>, <code>high</code>, and <code>max</code>; Claude Code <code>xhigh</code> maps to upstream <code>max</code>. Independent integrations have reproduced the OAuth-to-key path, including one reported live GLM-5.2 response.</p>
+        </article>
+        <article class="panel">
+          <h3>Load-bearing Unknown</h3>
+          <p>ZCode also carries a JWT and knows a separate plan gateway. Current reports disagree about which surface pays from which allowance, and the private gateway is device/captcha protected. A successful model response therefore proves transport only—not that the intended free, plan, bonus, or PAYG bucket funded it.</p>
+        </article>
+        <article class="panel">
+          <h3>Repository Learnings</h3>
+          <p>Rate-limit scope, duration, and evidence must name the same capacity window; uncertainty should choose a narrower and shorter hold. Provider behavior must be checked against live payloads rather than fixtures alone.</p>
+        </article>
+        <article class="panel">
+          <h3>Policy Boundary</h3>
+          <p>Z.ai’s Coding Plan is personal, coding-only, and limited to supported tools; its terms prohibit sharing, resale, and providing the benefit to third parties. A loopback-only single-user route reduces operational exposure but does not itself make better-ccflare an officially supported tool.</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="live-findings">
+      <div class="eyebrow">Measured on this account, 2026-08-20</div>
+      <h2>Live Findings</h2>
+      <div class="verdict"><strong>Verdict: contradicted for the free tier.</strong> The free GLM-5.3 allowance is bound to a ZCode JWT on the private <code>zcode.z.ai</code> gateway, and that gateway refuses inference from a non-ZCode client. better-ccflare’s Z.ai provider talks only to <code>api.z.ai/api/anthropic</code>, where this account has no entitlement. No plan units were consumed while establishing this.</div>
+      <div class="grounding-grid">
+        <article class="panel">
+          <h3>The entitlement is a Start Plan, not a Coding Plan</h3>
+          <p>The account carries an active <code>zcode-v3-start-plan-0817</code> “ZCode Start Plan” granting <strong>3,000,000 GLM-5.3 units and 2,000,000 GLM-5-Turbo units per day</strong>, read from the gateway’s own billing endpoint. The desktop runtime selects <code>builtin:zai-start-plan/GLM-5.3</code> at <code>thoughtLevel: max</code>.</p>
+        </article>
+        <article class="panel">
+          <h3>Two credentials, two different worlds</h3>
+          <p>Local provider state holds a <strong>231-character JWT</strong> pointed at <code>zcode.z.ai/api/v1/zcode-plan/anthropic</code> (enabled, carrying the free plan) and a separate <strong>49-character durable key</strong> pointed at <code>api.z.ai/api/anthropic</code> and flagged <code>coding_plan_not_entitled</code>.</p>
+        </article>
+        <article class="panel">
+          <h3>ccflare’s exact path is unentitled</h3>
+          <p>Calling the same quota endpoint better-ccflare polls, with the durable key, returned <code>success: false</code> and <code>当前用户不存在coding plan</code> (“user has no coding plan”) with zero limit rows. A routed request there could only fail or draw on pay-as-you-go funds.</p>
+        </article>
+        <article class="panel">
+          <h3>The gateway is device-gated</h3>
+          <p>One minimal, unspoofed Anthropic-format request to the gateway with the valid JWT returned <code>400</code> with <code>{"code":3007,"msg":"captcha verify failed"}</code>; the key-header form returned <code>401</code>. Reaching the free tier from another client would require defeating that verification, which this project will not do.</p>
+        </article>
+        <article class="panel">
+          <h3>Consumption stayed at zero</h3>
+          <p>Across every probe, GLM-5.3 remained <code>used_units: 0</code> of 3,000,000, and the local ZCode database recorded no completed model turn. The daily window also rolled over mid-investigation, which is why paired before/after counters must sit inside one period.</p>
+        </article>
+        <article class="panel">
+          <h3>What this changes</h3>
+          <p>Idea 1’s proof ladder resolved early and negatively for the free tier; idea 2 should not be built for it; idea 7 is no longer speculative but blocked by an explicit provider control. A purchased GLM Coding Plan is the one path that makes the existing provider work unchanged.</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="topic-axes">
+      <div class="eyebrow">The surface map</div>
+      <h2>Topic Axes</h2>
+      <div class="axes">
+        <div class="axis"><b>1. Entitlement fidelity</b><span>Which real allowance moves?</span></div>
+        <div class="axis"><b>2. Authentication lifecycle</b><span>Acquire, derive, store, rotate.</span></div>
+        <div class="axis"><b>3. Transport fidelity</b><span>Model, effort, tools, streams.</span></div>
+        <div class="axis"><b>4. Quota &amp; routing safety</b><span>No wrong-wallet surprises.</span></div>
+        <div class="axis"><b>5. Policy containment</b><span>Personal, local, coding-only.</span></div>
+      </div>
+    </section>
+
+    <section id="ranked-ideas">
+      <div class="eyebrow">Seven directions that survived</div>
+      <h2>Ranked Ideas</h2>
+      <ol class="jump-list">
+        <li><a href="#idea-1">Two-stage Entitlement Proof Ladder</a></li>
+        <li><a href="#idea-2">OAuth-to-Key Enrollment Adapter</a></li>
+        <li><a href="#idea-3">Entitlement-Aware Account Twins</a></li>
+        <li><a href="#idea-4">GLM-5.3 Max Conformance Gate</a></li>
+        <li><a href="#idea-5">Direct Claude Code Z.ai Launch Profile</a></li>
+        <li><a href="#idea-6">Official Z.ai Support Gate</a></li>
+        <li><a href="#idea-7">Distinct ZCode JWT Lane</a></li>
+      </ol>
+
+      <article class="idea" id="idea-1">
+        <div class="idea-head">
+          <div class="title-wrap"><span class="rank">1</span><h3>1. Two-stage Entitlement Proof Ladder</h3></div>
+          <div class="idea-tags"><span class="tag">Entitlement fidelity</span><span class="tag low">Complexity: Low</span><span class="tag low">Confidence: 90%</span></div>
+        </div>
+        <p class="description">Use one real interactive ZCode turn as the control, recording every visible plan, quota, bonus, and paid-balance counter before and after. Then manually import or copy the durable <code>zcode-api-key</code> that ZCode already provisions, send one tiny user-initiated request force-routed through better-ccflare’s existing <code>zai</code> account, disable all failover, and compare the same counters after propagation. The test lane self-disables and remains quarantined unless the intended bucket moves and prohibited wallets do not.</p>
+        <div class="diagram" role="img" aria-label="Proof ladder from native control to promoted route">
+          <svg viewBox="0 0 820 190" xmlns="http://www.w3.org/2000/svg">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker></defs>
+            <rect class="svg-box" x="20" y="42" width="145" height="72" rx="10"/><text class="svg-text" x="92" y="71">Native ZCode turn</text><text class="svg-small" x="92" y="92">capture counter signature</text>
+            <path class="svg-line" d="M165 78 H220"/>
+            <rect class="svg-box" x="220" y="42" width="145" height="72" rx="10"/><text class="svg-text" x="292" y="71">Import named key</text><text class="svg-small" x="292" y="92">existing zai provider</text>
+            <path class="svg-line" d="M365 78 H420"/>
+            <rect class="svg-box" x="420" y="42" width="145" height="72" rx="10"/><text class="svg-text" x="492" y="71">One sealed turn</text><text class="svg-small" x="492" y="92">force-route · no failover</text>
+            <path class="svg-line" d="M565 78 H620"/>
+            <rect class="svg-pass" x="620" y="15" width="175" height="58" rx="10"/><text class="svg-text" x="707" y="42">Counters match</text><text class="svg-small" x="707" y="58">promote cautiously</text>
+            <rect class="svg-stop" x="620" y="91" width="175" height="58" rx="10"/><text class="svg-text" x="707" y="118">Mismatch / ambiguity</text><text class="svg-small" x="707" y="134">stop; keep quarantined</text>
+            <path class="svg-line" d="M590 78 C608 78 604 44 620 44"/><path class="svg-line" d="M590 78 C608 78 604 120 620 120"/>
+          </svg>
+        </div>
+        <dl>
+          <dt>Basis</dt><dd><strong>direct:</strong> the existing provider already accepts a Z.ai API key and polls quota, while installed ZCode 0.16.3 independently derives a durable key for the same Anthropic endpoint. The repo’s live-payload learning explicitly rejects inferring billing identity from a successful response.</dd>
+          <dt>Rationale</dt><dd>This settles the only question that determines architecture. If counters match, the desired compute may already be one account-add away; if they do not, an OAuth implementation that emits the same key would be wasted work.</dd>
+          <dt>Downsides</dt><dd>One test can consume a small amount of paid balance, counters may lag or quantize, and concurrent ZCode traffic can contaminate the comparison. The experiment needs a quiet window, repeated snapshots, and a deliberately tiny request.</dd>
+        </dl>
+      </article>
+
+      <article class="idea" id="idea-2">
+        <div class="idea-head">
+          <div class="title-wrap"><span class="rank">2</span><h3>2. OAuth-to-Key Enrollment Adapter</h3></div>
+          <div class="idea-tags"><span class="tag">Authentication lifecycle</span><span class="tag">Complexity: Medium</span><span class="tag">Confidence: 68%</span></div>
+        </div>
+        <p class="description">After idea 1 proves bucket equivalence, add a login-only Z.ai onboarding surface that mirrors ZCode’s setup-time behavior: server-mediated OAuth, Z.ai business login, organization/project resolution, and create-or-reuse of a better-ccflare-named durable key. Persist the resulting key as an ordinary <code>zai</code> account, record whether it was created or reused, and leave runtime inference on the mature provider path. The account commits only after a bounded validation; abort never revokes a reused ZCode-owned key.</p>
+        <dl>
+          <dt>Basis</dt><dd><strong>direct + external:</strong> the installed ZCode bundle contains this exact derivation flow; provider OAuth registration and durable credential fields already exist in better-ccflare; oh-my-pi merged the same shape, and gajae-code reported a live response with the derived key.</dd>
+          <dt>Rationale</dt><dd>The high-leverage seam is credential enrollment, not transport. Isolating OAuth from the hot path avoids a second refresh/auth regime in streaming, retry, and load-balancing code.</dd>
+          <dt>Downsides</dt><dd>ZCode’s OAuth and business endpoints are not the public Coding Plan integration contract, upstream details can change, and better-ccflare is not currently a named supported tool. Keep it opt-in and local until Z.ai approves or documents the flow.</dd>
+        </dl>
+        <div class="decision-note"><strong>Gate:</strong> do not build this if the manually imported key in idea 1 does not debit the desired entitlement.</div>
+      </article>
+
+      <article class="idea" id="idea-3">
+        <div class="idea-head">
+          <div class="title-wrap"><span class="rank">3</span><h3>3. Entitlement-Aware Account Twins</h3></div>
+          <div class="idea-tags"><span class="tag">Entitlement fidelity</span><span class="tag high">Complexity: High</span><span class="tag low">Confidence: 82%</span></div>
+        </div>
+        <p class="description">Stop treating every credential for one Z.ai identity as fungible. Materialize manual PAYG, Coding Plan, OAuth-minted, bonus-backed, and any future plan-JWT surfaces as separate route identities carrying acquisition origin, endpoint, observed quota source, verified funding bucket, evidence freshness, and <code>unknown → verified → drifted</code> state. New twins are explicit-route-only until evidence promotes them; retries cannot cross wallets merely because the provider name matches.</p>
+        <dl>
+          <dt>Basis</dt><dd><strong>direct:</strong> today the account row holds generic credentials, endpoint, mappings, and <code>billing_type</code>, while Z.ai usage has only broad time/token windows. Current JWT-versus-key reports demonstrate that two credentials from one login can have different economic behavior.</dd>
+          <dt>Rationale</dt><dd>This creates a reusable abstraction for every provider where subscription, promotional, and PAYG capacity coexist. It makes economic provenance part of route identity instead of an operator memory.</dd>
+          <dt>Downsides</dt><dd>Requires database changes in both SQLite and PostgreSQL, UI/CLI semantics, routing eligibility changes, and a migration strategy for existing opaque Z.ai accounts. It is excessive for a one-user proof unless other subscription integrations will reuse it.</dd>
+        </dl>
+      </article>
+
+      <article class="idea" id="idea-4">
+        <div class="idea-head">
+          <div class="title-wrap"><span class="rank">4</span><h3>4. GLM-5.3 Max Conformance Gate</h3></div>
+          <div class="idea-tags"><span class="tag">Transport fidelity</span><span class="tag">Complexity: Medium</span><span class="tag low">Confidence: 88%</span></div>
+        </div>
+        <p class="description">Define “GLM-5.3 xhigh” as a behavior contract, not a model alias. Certify each exact credential × endpoint tuple for upstream model identity, 1M context, Claude Code <code>xhigh → max</code>, streaming event order, incremental tool arguments, stop events, system/cache behavior, and usage accounting. Initially admit only the official Anthropic Messages endpoint; an OpenAI-compatible route earns a separate certificate rather than becoming an opportunistic fallback.</p>
+        <dl>
+          <dt>Basis</dt><dd><strong>external + direct:</strong> Z.ai’s current GLM-5.3 guide documents the model, 1M context, and effort conversion. The existing native provider streams through the official endpoint; the repo’s OpenAI converter uses a different reasoning shape and therefore cannot be presumed semantically equivalent.</dd>
+          <dt>Rationale</dt><dd>The user values maximum reasoning inside an agent loop. Plain text success can hide downgraded thinking, broken tool assembly, missing cache behavior, or an incorrect context window.</dd>
+          <dt>Downsides</dt><dd>Requires a live non-Anthropic request and exact upstream observations. Tests must obey the repo restriction against scripted Anthropic traffic and should use the user’s Z.ai account only through a deliberate force-routed canary.</dd>
+        </dl>
+      </article>
+
+      <article class="idea" id="idea-5">
+        <div class="idea-head">
+          <div class="title-wrap"><span class="rank">5</span><h3>5. Direct Claude Code Z.ai Launch Profile</h3></div>
+          <div class="idea-tags"><span class="tag">Policy containment</span><span class="tag low">Complexity: Low</span><span class="tag low">Confidence: 85%</span></div>
+        </div>
+        <p class="description">If forwarding subscription traffic through better-ccflare remains policy-ambiguous, invert the integration: better-ccflare selects the credential and produces an ephemeral Claude Code launch profile, but Claude Code connects directly to Z.ai’s documented Anthropic endpoint. The profile pins GLM-5.3, 1M context, and model mappings, and it stays separate from the normal multi-provider pool.</p>
+        <dl>
+          <dt>Basis</dt><dd><strong>external:</strong> Z.ai explicitly lists Claude Code as supported and publishes its configuration. A direct connection removes the unnamed intermediary from the data plane while retaining useful account-selection and launch ergonomics.</dd>
+          <dt>Rationale</dt><dd>This may deliver nearly all of the user value with lower technical and policy risk if “inside the same ccflare pool” is less important than easy access to the compute.</dd>
+          <dt>Downsides</dt><dd>It does not provide seamless per-request load balancing or failover through better-ccflare, and it still needs a usable key. It is a sibling launch lane, not a true provider integration.</dd>
+        </dl>
+      </article>
+
+      <article class="idea" id="idea-6">
+        <div class="idea-head">
+          <div class="title-wrap"><span class="rank">6</span><h3>6. Official Z.ai Support Gate</h3></div>
+          <div class="idea-tags"><span class="tag">Policy containment</span><span class="tag low">Complexity: Low code</span><span class="tag">Confidence: 72%</span></div>
+        </div>
+        <p class="description">Before making the feature generally available, ask Z.ai to list better-ccflare as a supported local coding tool, provide a documented client registration, or grant written permission for a single-user local intermediary. Supply a narrow technical brief: loopback-only deployment, owner-only credentials, Claude Code request shape, no resale, and no bypass of provider controls.</p>
+        <dl>
+          <dt>Basis</dt><dd><strong>external:</strong> Z.ai’s current usage policy restricts Coding Plan benefits to supported tools, and its subscription terms prohibit unsupported general integration and providing access to third parties. The docs show no established public app-registration process, so approval is an external dependency rather than an assumed API.</dd>
+          <dt>Rationale</dt><dd>Official support converts a fragile private integration into a durable product surface and eliminates the largest nontechnical uncertainty.</dd>
+          <dt>Downsides</dt><dd>Z.ai may not respond, may decline, or may require product changes. This does not unblock a same-day personal experiment, but it should gate upstreaming or distributing the feature.</dd>
+        </dl>
+      </article>
+
+      <article class="idea" id="idea-7">
+        <div class="idea-head">
+          <div class="title-wrap"><span class="rank">7</span><h3>7. Distinct ZCode JWT Lane <small>(contingent only)</small></h3></div>
+          <div class="idea-tags"><span class="tag">Auth + transport</span><span class="tag high">Complexity: High</span><span class="tag conf-low">Confidence: 28%</span></div>
+        </div>
+        <p class="description">If—and only if—the proof ladder shows that the desired free promotion exists exclusively behind the ZCode JWT plan gateway, keep it separate from ordinary <code>zai</code>. A future lane would need its own endpoint, credential lifecycle, quota source, conformance certificate, and policy status. It should proceed only after Z.ai publishes or approves the contract; better-ccflare must not reproduce, bypass, or automate the gateway’s captcha/device controls.</p>
+        <dl>
+          <dt>Basis</dt><dd><strong>external:</strong> current reverse-engineering reports show a separate JWT gateway and plan balance surface, while installed ZCode retains a JWT alongside the durable key. Those reports also show device/captcha enforcement and unresolved refresh/entitlement semantics.</dd>
+          <dt>Rationale</dt><dd>Separating the identity is architecturally honest if the promotion truly cannot be reached by a normal key. It preserves the option without contaminating the supported provider.</dd>
+          <dt>Downsides</dt><dd>Private unstable endpoints, unclear refresh, high operational burden, explicit provider controls, and weak policy footing. This is a stop sign unless official documentation or approval arrives—not an implementation recommendation.</dd>
+        </dl>
+      </article>
+    </section>
+
+    <section id="rejection-summary">
+      <div class="eyebrow">What did not survive alone</div>
+      <h2>Rejection Summary</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>#</th><th>Idea</th><th>Reason Rejected or Absorbed</th></tr></thead>
+          <tbody>
+            <tr><td>1</td><td>Native-control fingerprint</td><td>Merged into ranked idea 1; stronger when paired with the imported-key treatment.</td></tr>
+            <tr><td>2</td><td>Manual key-import proof</td><td>Merged into ranked idea 1; a model call alone would not identify the funding bucket.</td></tr>
+            <tr><td>3</td><td>Transactional OAuth enrollment</td><td>Absorbed into ranked idea 2; necessary engineering hygiene, but not a meeting-worthy direction by itself.</td></tr>
+            <tr><td>4</td><td>Quarantine-first graduation</td><td>Absorbed into ranked ideas 1 and 3 as the admission state for ambiguous credentials.</td></tr>
+            <tr><td>5</td><td>Native-Anthropic-only support</td><td>Absorbed into ranked idea 4; this is already the provider’s current transport, not a standalone improvement.</td></tr>
+            <tr><td>6</td><td>Full model-and-money matrix</td><td>Narrowed into ranked idea 3; a complete cross-product is premature before entitlement evidence exists.</td></tr>
+            <tr><td>7</td><td>Free-compute fail-closed lane</td><td>Rejected alone: ccflare can stop downstream failover, but cannot prevent one upstream credential from spilling internally into bonus, cash, or PAYG without authoritative counters.</td></tr>
+            <tr><td>8</td><td>Entitlement-scoped session leases</td><td>Basis refuted: session affinity already supplies pinning, and no evidence shows Z.ai entitlement is session-scoped.</td></tr>
+            <tr><td>9</td><td>Continuous wrong-wallet fuse</td><td>Deferred: current usage polling is too coarse for reliable event-level reconciliation. Revisit only if Z.ai exposes authoritative balance telemetry.</td></tr>
+            <tr><td>10</td><td>Personal local route seal</td><td>Absorbed as containment for ranked ideas 2–3; local-only topology does not itself satisfy the supported-tool policy.</td></tr>
+            <tr><td>11</td><td>ZCode sidecar inference bridge</td><td>Refuted: no stable Messages-compatible machine interface, brittle agent-within-agent semantics, and no policy advantage over ranked idea 5.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="sources">
+      <div class="eyebrow">Evidence index</div>
+      <h2>Sources &amp; References</h2>
+      <ul class="references">
+        <li><a href="https://docs.z.ai/devpack/latest-model">Z.ai — How to Switch Models</a>: GLM-5.3, 1M context, Claude Code configuration, and effort conversion.</li>
+        <li><a href="https://docs.z.ai/devpack/usage-policy">Z.ai — Usage Policy</a>: supported tools, personal use, and concurrency.</li>
+        <li><a href="https://docs.z.ai/legal-agreement/subscription-terms">Z.ai — Subscription Terms</a>: unsupported integrations, third-party proxying, and personal-use restrictions.</li>
+        <li><a href="https://docs.z.ai/devpack/tool/others">Z.ai — Supported Tools</a>: Claude Code and endpoint contracts.</li>
+        <li><a href="https://github.com/can1357/oh-my-pi/pull/6385">oh-my-pi PR #6385</a>: OAuth-to-durable-key implementation.</li>
+        <li><a href="https://github.com/can1357/oh-my-pi/issues/8802">oh-my-pi issue #8802</a>: current JWT gateway, quota, and captcha distinctions.</li>
+        <li><a href="https://github.com/Yeachan-Heo/gajae-code/issues/1016">gajae-code issue #1016</a>: reported live response through a ZCode-derived key.</li>
+        <li><code>/mnt/c/Users/will/AppData/Local/Programs/ZCode/resources/glm/zcode.cjs</code>: installed ZCode 0.16.3 bundle inspected locally without reading stored credentials.</li>
+        <li><a href="https://github.com/StartupBros-com/better-ccflare/blob/main/packages/providers/src/providers/zai/provider.ts">packages/providers/src/providers/zai/provider.ts</a>: existing native Z.ai provider.</li>
+        <li><a href="https://github.com/StartupBros-com/better-ccflare/blob/main/packages/providers/src/zai-usage-fetcher.ts">packages/providers/src/zai-usage-fetcher.ts</a>: current quota polling.</li>
+        <li><a href="https://github.com/StartupBros-com/better-ccflare/blob/main/packages/types/src/account.ts">packages/types/src/account.ts</a>: account and quota data model.</li>
+        <li><a href="https://github.com/StartupBros-com/better-ccflare/blob/main/docs/solutions/rate-limit-scope-and-duration.md">rate-limit scope and duration learning</a>.</li>
+        <li><a href="https://github.com/StartupBros-com/better-ccflare/blob/main/docs/solutions/validate-against-live-payloads.md">live-payload validation learning</a>.</li>
+      </ul>
+    </section>
+
+    <footer class="composition-signal">Composed 2026-08-20T09:41Z by <code>ce-ideate</code> from the user’s ZCode OAuth integration question, the current better-ccflare codebase, installed ZCode 0.16.3, and cited external evidence.</footer>
+  </main>
+</body>
+</html>
