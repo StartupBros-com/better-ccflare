@@ -66,6 +66,18 @@ export const ServiceUnavailable = (message: string, details?: unknown) =>
 export const GatewayTimeout = (message: string, details?: unknown) =>
 	new HttpError(504, message, details);
 
+// Ordered by classification precedence; the first matching group wins.
+const ERROR_MESSAGE_PATTERNS = [
+	[
+		ERROR_TYPES.NETWORK,
+		["network", "fetch failed", "connection", "econnrefused"],
+	],
+	[ERROR_TYPES.AUTH, ["unauthorized", "authentication", "401", "token"]],
+	[ERROR_TYPES.RATE_LIMIT, ["rate limit", "too many requests", "429"]],
+	[ERROR_TYPES.VALIDATION, ["validation", "invalid", "bad request"]],
+	[ERROR_TYPES.SERVER, ["server error", "500", "502", "503", "504"]],
+] as const;
+
 // Error type detection
 export function getErrorType(error: unknown): ErrorType {
 	if (error instanceof HttpError) {
@@ -79,49 +91,10 @@ export function getErrorType(error: unknown): ErrorType {
 	if (error instanceof Error) {
 		const message = error.message.toLowerCase();
 
-		// Check for specific error types in message
-		if (
-			message.includes("network") ||
-			message.includes("fetch failed") ||
-			message.includes("connection") ||
-			message.includes("econnrefused")
-		) {
-			return ERROR_TYPES.NETWORK;
-		}
-
-		if (
-			message.includes("unauthorized") ||
-			message.includes("authentication") ||
-			message.includes("401") ||
-			message.includes("token")
-		) {
-			return ERROR_TYPES.AUTH;
-		}
-
-		if (
-			message.includes("rate limit") ||
-			message.includes("too many requests") ||
-			message.includes("429")
-		) {
-			return ERROR_TYPES.RATE_LIMIT;
-		}
-
-		if (
-			message.includes("validation") ||
-			message.includes("invalid") ||
-			message.includes("bad request")
-		) {
-			return ERROR_TYPES.VALIDATION;
-		}
-
-		if (
-			message.includes("server error") ||
-			message.includes("500") ||
-			message.includes("502") ||
-			message.includes("503") ||
-			message.includes("504")
-		) {
-			return ERROR_TYPES.SERVER;
+		for (const [type, patterns] of ERROR_MESSAGE_PATTERNS) {
+			if (patterns.some((pattern) => message.includes(pattern))) {
+				return type;
+			}
 		}
 	}
 
