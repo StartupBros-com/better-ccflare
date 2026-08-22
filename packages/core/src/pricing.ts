@@ -365,8 +365,13 @@ class PriceCatalogue {
 	): ApiResponse {
 		const merged: ApiResponse = {};
 
-		// List of preferred providers in priority order
-		const preferredProviders = ["zai", "anthropic"];
+		// List of preferred providers in priority order. These are the
+		// canonical, first-party sections for models that also get
+		// re-published (often at different rates) under reseller sections
+		// elsewhere in the catalogue - putting them first here means
+		// findModel()'s first-match-wins scan sees the canonical entry
+		// before any reseller duplicate.
+		const preferredProviders = ["zai", "anthropic", "openai"];
 
 		// First, add preferred providers from remote data
 		for (const providerName of preferredProviders) {
