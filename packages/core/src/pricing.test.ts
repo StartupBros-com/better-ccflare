@@ -11,6 +11,26 @@ import {
 	type TokenBreakdown,
 } from "./pricing";
 
+/**
+ * Build a mock fetch that serves a synthetic models.dev catalogue for
+ * "https://models.dev/api.json" and an empty NanoGPT model list for
+ * everything else (mirroring the other tests in this file).
+ */
+function mockModelsDevFetch(catalogue: Record<string, unknown>) {
+	return vi.fn((input: string | URL | Request) => {
+		if (String(input) === "https://models.dev/api.json") {
+			return Promise.resolve({
+				ok: true,
+				json: async () => catalogue,
+			} as Response);
+		}
+		return Promise.resolve({
+			ok: true,
+			json: async () => ({ object: "list", data: [] }),
+		} as Response);
+	});
+}
+
 // Mock logger for testing
 const mockLogger = {
 	warn: vi.fn(),
@@ -105,6 +125,69 @@ describe("models.dev pricing", () => {
 
 		expect(modelsDevSignal).toBeInstanceOf(AbortSignal);
 		expect(cost).toBe(15);
+	});
+
+	it("prefers the canonical openai section over an earlier-serialized reseller section for the same bare model id (#254)", async () => {
+		// Same shape as the real regression: a reseller section ("ai-router")
+		// is serialized before the canonical "openai" section in the remote
+		// catalogue, and both publish the same bare model id at different rates.
+		global.fetch = mockModelsDevFetch({
+			"ai-router": {
+				models: {
+					"gpt-5.6-terra": {
+						id: "gpt-5.6-terra",
+						name: "GPT-5.6 Terra (reseller)",
+						cost: {
+							input: 2.5,
+							output: 15,
+							cache_read: 0.25,
+							cache_write: 2.5,
+						},
+					},
+				},
+			},
+			openai: {
+				models: {
+					"gpt-5.6-terra": {
+						id: "gpt-5.6-terra",
+						name: "GPT-5.6 Terra",
+						cost: { input: 2.0, output: 12, cache_read: 0.2, cache_write: 2.0 },
+					},
+				},
+			},
+		}) as typeof global.fetch;
+
+		const rates = await getModelRates("gpt-5.6-terra");
+
+		expect(rates).toEqual({
+			input: 2.0,
+			output: 12,
+			cacheRead: 0.2,
+			cacheWrite: 2.0,
+		});
+	});
+
+	it("still resolves a model that exists only in a non-canonical (reseller) section", async () => {
+		global.fetch = mockModelsDevFetch({
+			"ai-router": {
+				models: {
+					"reseller-only-model": {
+						id: "reseller-only-model",
+						name: "Reseller Only Model",
+						cost: { input: 1, output: 5, cache_read: 0.1, cache_write: 1 },
+					},
+				},
+			},
+		}) as typeof global.fetch;
+
+		const rates = await getModelRates("reseller-only-model");
+
+		expect(rates).toEqual({
+			input: 1,
+			output: 5,
+			cacheRead: 0.1,
+			cacheWrite: 1,
+		});
 	});
 });
 
