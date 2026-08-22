@@ -1156,14 +1156,6 @@ OAuth tokens will need to be re-authenticated.
 		return this.usageWindows.listWindows(options);
 	}
 
-	async getRecentClosedUsageWindowValues(
-		accountId: string,
-		windowKey: string,
-		limit: number,
-	): Promise<number[]> {
-		return this.usageWindows.getRecentClosedValues(accountId, windowKey, limit);
-	}
-
 	getCacheFlightRecorderRepository(): CacheFlightRecorderRepository {
 		return this.cacheFlightRecorder;
 	}

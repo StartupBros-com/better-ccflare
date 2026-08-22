@@ -315,30 +315,4 @@ export class UsageWindowsRepository extends BaseRepository<UsageWindow> {
 		);
 		return rows.map(toUsageWindow);
 	}
-
-	/**
-	 * Most recent closed windows' value_usd for `accountId`/`windowKey`, most
-	 * recent first — feeds the median-of-recent-windows alert. Open windows
-	 * (aggregates still NULL) and closed windows with a NULL value_usd
-	 * (unpriced/free lane) are excluded so neither skews the median.
-	 */
-	async getRecentClosedValues(
-		accountId: string,
-		windowKey: string,
-		limit: number,
-	): Promise<number[]> {
-		requireNonEmpty(accountId, "accountId");
-		requireNonEmpty(windowKey, "windowKey");
-		if (!Number.isSafeInteger(limit) || limit < 1) {
-			throw new TypeError("limit must be a positive integer");
-		}
-		const rows = await this.query<{ value_usd: number }>(
-			`SELECT value_usd FROM usage_windows
-			 WHERE account_id = ? AND window_key = ? AND closed_at IS NOT NULL
-			   AND value_usd IS NOT NULL
-			 ORDER BY closed_at DESC LIMIT ?`,
-			[accountId, windowKey, limit],
-		);
-		return rows.map((row) => Number(row.value_usd));
-	}
 }

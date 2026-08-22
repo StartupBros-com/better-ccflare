@@ -354,93 +354,6 @@ describe("UsageWindowsRepository", () => {
 			db.close();
 		});
 	});
-
-	describe("getRecentClosedValues", () => {
-		it("excludes open windows and closed windows with a null value_usd", async () => {
-			const db = makeDb();
-			const repo = makeRepo(db);
-			const open = await repo.openWindow({
-				accountId: "acc1",
-				windowKey: "five_hour",
-				startedAt: 1000,
-				resetsAt: 6000,
-				grantType: "natural",
-			});
-			const unpriced = await repo.openWindow({
-				accountId: "acc1",
-				windowKey: "five_hour",
-				startedAt: 6000,
-				resetsAt: 11000,
-				grantType: "natural",
-			});
-			await repo.closeWindow(unpriced.id, {
-				closedAt: 11000,
-				valueUsd: null,
-				inputTokens: null,
-				cacheReadInputTokens: null,
-				cacheCreationInputTokens: null,
-				outputTokens: null,
-				requestCount: null,
-				modelBreakdown: null,
-				unpricedTokens: null,
-				projectionVersion: null,
-			});
-			const priced = await repo.openWindow({
-				accountId: "acc1",
-				windowKey: "five_hour",
-				startedAt: 11000,
-				resetsAt: 16000,
-				grantType: "natural",
-			});
-			await repo.closeWindow(priced.id, {
-				closedAt: 16000,
-				valueUsd: 5,
-				inputTokens: null,
-				cacheReadInputTokens: null,
-				cacheCreationInputTokens: null,
-				outputTokens: null,
-				requestCount: null,
-				modelBreakdown: null,
-				unpricedTokens: null,
-				projectionVersion: null,
-			});
-
-			const values = await repo.getRecentClosedValues("acc1", "five_hour", 10);
-			expect(values).toEqual([5]);
-			// The still-open window never appears.
-			void open;
-			db.close();
-		});
-
-		it("respects the limit and orders most-recently-closed first", async () => {
-			const db = makeDb();
-			const repo = makeRepo(db);
-			for (let i = 0; i < 5; i++) {
-				const window = await repo.openWindow({
-					accountId: "acc1",
-					windowKey: "five_hour",
-					startedAt: i * 5000,
-					resetsAt: (i + 1) * 5000,
-					grantType: "natural",
-				});
-				await repo.closeWindow(window.id, {
-					closedAt: (i + 1) * 5000,
-					valueUsd: i + 1,
-					inputTokens: null,
-					cacheReadInputTokens: null,
-					cacheCreationInputTokens: null,
-					outputTokens: null,
-					requestCount: null,
-					modelBreakdown: null,
-					unpricedTokens: null,
-					projectionVersion: null,
-				});
-			}
-			const values = await repo.getRecentClosedValues("acc1", "five_hour", 3);
-			expect(values).toEqual([5, 4, 3]);
-			db.close();
-		});
-	});
 });
 
 // ---------------------------------------------------------------------------
@@ -481,13 +394,6 @@ describe("DatabaseOperations usage-windows facade", () => {
 			const rows = await dbOps.listUsageWindows({ accountId: "acc1" });
 			expect(rows).toHaveLength(1);
 			expect(rows[0].valueUsd).toBe(3.5);
-
-			const recent = await dbOps.getRecentClosedUsageWindowValues(
-				"acc1",
-				"five_hour",
-				5,
-			);
-			expect(recent).toEqual([3.5]);
 		} finally {
 			await dbOps.dispose();
 		}
@@ -596,13 +502,6 @@ describe.skipIf(!livePgAvailable)(
 				expect(rows[0].modelBreakdown).toEqual({
 					"claude-opus-4": { requests: 1 },
 				});
-
-				const recent = await repo.getRecentClosedValues(
-					accountId,
-					"five_hour",
-					5,
-				);
-				expect(recent).toEqual([2.75]);
 			} finally {
 				await adapter.run("DELETE FROM usage_windows WHERE account_id = ?", [
 					accountId,
