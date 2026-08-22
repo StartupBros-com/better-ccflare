@@ -89,6 +89,10 @@ export {
 } from "./repositories/server-tool-replay-issuance.repository";
 // Re-export repository types
 export type { StatsRepository } from "./repositories/stats.repository";
+export type {
+	UsageWindow,
+	UsageWindowGrantType,
+} from "./repositories/usage-windows.repository";
 // Re-export retry utilities for external use (from your improvements)
 export { withDatabaseRetry, withDatabaseRetrySync } from "./retry";
 export { DatabaseOperations };

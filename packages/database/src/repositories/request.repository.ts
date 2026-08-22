@@ -1,3 +1,4 @@
+import type { WindowTokenAggregate } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import type {
 	AgentAttributionSource,
@@ -614,6 +615,62 @@ export class RequestRepository extends BaseRepository<RequestData> {
 			accountName: row.account_name,
 			requestCount: row.request_count,
 			successRate: row.success_rate,
+		}));
+	}
+
+	/**
+	 * Per-model token/request totals for `accountId` in `[fromMs, toMs)`,
+	 * scoped to plan-billed Messages traffic — the input to the Window Value
+	 * Ledger's valuation step (see `valueWindowAggregates` in
+	 * @better-ccflare/core). `path = '/v1/messages'` is an EXACT match,
+	 * deliberately excluding `/v1/messages/count_tokens` (a distinct,
+	 * non-billed endpoint that happens to share the prefix). Only
+	 * `billing_type = 'plan'` rows count toward a window's value — pay-as-you-go
+	 * ('api') usage doesn't consume the subscription window's capacity.
+	 * NULL token columns (never populated, e.g. an errored request) are
+	 * treated as 0 via COALESCE rather than excluding the row or poisoning
+	 * the SUM with NULL.
+	 */
+	async aggregateTokensByModel(
+		accountId: string,
+		fromMs: number,
+		toMs: number,
+	): Promise<WindowTokenAggregate[]> {
+		const rows = await this.query<{
+			model: string;
+			request_count: number;
+			input_tokens: number;
+			cache_read_input_tokens: number;
+			cache_creation_input_tokens: number;
+			output_tokens: number;
+		}>(
+			`
+			SELECT
+				COALESCE(model, '') as model,
+				COUNT(*) as request_count,
+				SUM(COALESCE(input_tokens, 0)) as input_tokens,
+				SUM(COALESCE(cache_read_input_tokens, 0)) as cache_read_input_tokens,
+				SUM(COALESCE(cache_creation_input_tokens, 0)) as cache_creation_input_tokens,
+				SUM(COALESCE(output_tokens, 0)) as output_tokens
+			FROM requests
+			WHERE account_used = ?
+			  AND path = '/v1/messages'
+			  AND billing_type = 'plan'
+			  AND timestamp >= ? AND timestamp < ?
+			GROUP BY model
+		`,
+			[accountId, fromMs, toMs],
+		);
+		return rows.map((row) => ({
+			// Bun.SQL returns COUNT()/SUM() as JavaScript strings on PostgreSQL
+			// (BIGINT stringified, see Bun#22188) — coerce to Number so this
+			// holds identically on both dialects (mirrors getRequestStats above).
+			model: row.model,
+			requestCount: Number(row.request_count) || 0,
+			inputTokens: Number(row.input_tokens) || 0,
+			cacheReadInputTokens: Number(row.cache_read_input_tokens) || 0,
+			cacheCreationInputTokens: Number(row.cache_creation_input_tokens) || 0,
+			outputTokens: Number(row.output_tokens) || 0,
 		}));
 	}
 

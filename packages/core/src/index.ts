@@ -165,6 +165,12 @@ export {
 	trackClientVersion,
 } from "./version";
 export {
+	type ModelValueBreakdownEntry,
+	valueWindowAggregates,
+	type WindowTokenAggregate,
+	type WindowValuation,
+} from "./window-valuation";
+export {
 	cacheOutcomeFromTokens,
 	formatXaiCacheCanary,
 	isOfficialXaiEndpoint,

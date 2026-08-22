@@ -35,6 +35,7 @@ import {
 	APIRouter,
 	AuthService,
 	createServerDeviceSetupCoordinator,
+	UsageWindowLedger,
 } from "@better-ccflare/http-api";
 import {
 	LeastUsedStrategy,
@@ -785,6 +786,7 @@ function startUsagePollingWithRefresh(
 	account: Account,
 	proxyContext: ProxyContext,
 	alertService: AlertService,
+	usageWindowLedger: UsageWindowLedger,
 	startupDelayMs: number = 0,
 	intervalMs: number = 90000,
 ) {
@@ -888,6 +890,18 @@ function startUsagePollingWithRefresh(
 						.catch((err) =>
 							logger.warn(
 								`Failed to evaluate usage-window alerts for account ${accountId}: ${err}`,
+							),
+						);
+					// Window Value Ledger (issue #252). Independent of the alert
+					// evaluation above. observeSnapshot is internally resilient
+					// per-window (see its implementation), but this .catch() is
+					// kept anyway for defense-in-depth, matching every other
+					// fire-and-forget call in this callback.
+					usageWindowLedger
+						.observeSnapshot(accountId, windows, now)
+						.catch((err) =>
+							logger.warn(
+								`Usage window ledger failed for account ${accountId}: ${err}`,
 							),
 						);
 				},
@@ -1281,6 +1295,15 @@ export default async function startServer(options?: {
 	alertService.start();
 	registerDisposable({ dispose: () => alertService.stop() });
 
+	// Window Value Ledger (issue #252): tracks and prices each account's
+	// rolling 'seven_day' usage window. Driven from the same poll callbacks
+	// as alertService, immediately after evaluateUsageSnapshot, on both the
+	// refresh-backed onSnapshot path below and makeSnapshotDispatch's
+	// API-key-poller path — a minimax account's 'seven_day' window would
+	// otherwise never reach the ledger. Internally resilient: see
+	// UsageWindowLedger.observeSnapshot's per-window try/catch.
+	const usageWindowLedger = new UsageWindowLedger(dbOps);
+
 	// Shared successful-poll snapshot dispatch for the API-key pollers
 	// (nanogpt/zai/kilo/minimax): history persistence + usage-window alert
 	// evaluation, mirroring the refresh-backed path's onSnapshot callback.
@@ -1310,6 +1333,17 @@ export default async function startServer(options?: {
 				.catch((err) =>
 					log.warn(
 						`Failed to evaluate usage-window alerts for account ${accountId}: ${err}`,
+					),
+				);
+			// Window Value Ledger (issue #252). API-key pollers (nanogpt/zai/kilo/
+			// minimax) can report a 'seven_day' window same as refresh-backed
+			// accounts — must be wired here too, or that account class's window
+			// value is silently never ledgered.
+			usageWindowLedger
+				.observeSnapshot(accountId, windows, now)
+				.catch((err) =>
+					log.warn(
+						`Usage window ledger failed for account ${accountId}: ${err}`,
 					),
 				);
 		};
@@ -1724,6 +1758,7 @@ export default async function startServer(options?: {
 			account,
 			proxyContext,
 			alertService,
+			usageWindowLedger,
 			0,
 			config.getUsagePollIntervalMs(),
 		);
@@ -2342,6 +2377,7 @@ Available endpoints:
 					account,
 					proxyContext,
 					alertService,
+					usageWindowLedger,
 					startupDelayMs,
 					config.getUsagePollIntervalMs(),
 				);

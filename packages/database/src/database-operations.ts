@@ -7,6 +7,7 @@ import type {
 	CacheFlightCohortSealReceipt,
 	Disposable,
 	TurnEvidence,
+	WindowTokenAggregate,
 } from "@better-ccflare/core";
 import {
 	PAUSE_REASON_NEEDS_REAUTH,
@@ -1579,6 +1580,16 @@ OAuth tokens will need to be re-authenticated.
 		}>
 	> {
 		return this.requests.getRequestsByAccount(since);
+	}
+
+	/** See RequestRepository.aggregateTokensByModel — the Window Value
+	 * Ledger's per-model token/request source for one window's life. */
+	async aggregateTokensByModel(
+		accountId: string,
+		fromMs: number,
+		toMs: number,
+	): Promise<WindowTokenAggregate[]> {
+		return this.requests.aggregateTokensByModel(accountId, fromMs, toMs);
 	}
 
 	// Cleanup operations — two explicit passes:
