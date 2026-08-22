@@ -59,11 +59,12 @@ export class UsageWindowLedger {
 
 	/**
 	 * Processes one poll's worth of canonical usage windows for `accountId`.
-	 * Non-'seven_day' keys and windows with no resets_at are skipped outright
-	 * (no ledger row, no error). Each remaining window is handled inside its
-	 * own try/catch so one bad window (or one account, since this is called
-	 * once per account per poll) can never cancel the rest of the poll loop —
-	 * matches `AlertService.evaluateUsageSnapshot`'s per-window resilience.
+	 * Inactive rows, non-'seven_day' keys, and windows with no resets_at are
+	 * skipped outright (no ledger row, no error). Each remaining window is
+	 * handled inside its own try/catch so one bad window (or one account,
+	 * since this is called once per account per poll) can never cancel the
+	 * rest of the poll loop — matches `AlertService.evaluateUsageSnapshot`'s
+	 * per-window resilience.
 	 */
 	async observeSnapshot(
 		accountId: string,
@@ -72,6 +73,12 @@ export class UsageWindowLedger {
 	): Promise<void> {
 		for (const window of windows) {
 			if (window.windowKey !== LEDGER_WINDOW_KEY) continue;
+			// `normalizeProviderUsageWindows` preserves inactive limits[] rows
+			// rather than dropping them, leaving the filter to consumers. An
+			// inactive row describes no currently consumable capacity, so its
+			// resets_at must never close the live window or open a new cluster
+			// — same guard, same reason as `AlertService.evaluateUsageSnapshot`.
+			if (!window.active) continue;
 			if (window.resetsAtMs == null) continue;
 			try {
 				await this.observeWindow(
@@ -182,9 +189,10 @@ export class UsageWindowLedger {
 	 * already happened under the old rate. This is a deliberate design
 	 * choice, not an oversight — keep it if this method is ever touched.
 	 *
-	 * Exposed as a public method (not inlined into observeWindow) specifically
-	 * so the planned historical backfill CLI (issue #252, later task) can
-	 * reuse this exact logic against closed-but-unpriced legacy windows.
+	 * Public rather than private so a caller holding an already-identified
+	 * window can settle it directly. Note the backfill CLI deliberately does
+	 * NOT use this entry point — it replays snapshots through observeSnapshot
+	 * so it inherits the clustering decisions too, not just the pricing.
 	 */
 	async closeAndValue(
 		window: UsageWindow,

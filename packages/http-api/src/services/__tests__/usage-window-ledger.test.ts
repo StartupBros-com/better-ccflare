@@ -275,6 +275,45 @@ describe("UsageWindowLedger", () => {
 	});
 
 	// -------------------------------------------------------------------
+	// Inactive rows: normalizeProviderUsageWindows keeps limits[] entries
+	// flagged is_active:false, leaving the filter to consumers. They describe
+	// no consumable capacity, so they must neither open nor close a window.
+	// -------------------------------------------------------------------
+	it("ignores an inactive seven_day row rather than opening a window for it", async () => {
+		const t0 = Date.parse("2026-08-13T00:00:00Z");
+		await ledger.observeSnapshot(
+			ACCOUNT_ID,
+			[{ ...sevenDay(40, t0 + 7 * DAY_MS), active: false }],
+			t0,
+		);
+		const windows = await dbOps.listUsageWindows({ accountId: ACCOUNT_ID });
+		expect(windows).toHaveLength(0);
+	});
+
+	it("never closes the live window when an inactive row carries a different resets_at", async () => {
+		const t0 = Date.parse("2026-08-13T00:00:00Z");
+		const liveResetsAt = t0 + 7 * DAY_MS;
+		await ledger.observeSnapshot(ACCOUNT_ID, [sevenDay(20, liveResetsAt)], t0);
+
+		// A stale/promotional limits[] entry the provider still echoes, far
+		// outside the 120s cluster tolerance: it must be inert.
+		await ledger.observeSnapshot(
+			ACCOUNT_ID,
+			[
+				{ ...sevenDay(0, t0 + 30 * DAY_MS), active: false },
+				sevenDay(45, liveResetsAt),
+			],
+			t0 + 60 * 60 * 1000,
+		);
+
+		const windows = await dbOps.listUsageWindows({ accountId: ACCOUNT_ID });
+		expect(windows).toHaveLength(1);
+		expect(windows[0].closedAt).toBeNull();
+		expect(windows[0].resetsAt).toBe(liveResetsAt);
+		expect(windows[0].peakUtilization).toBe(45);
+	});
+
+	// -------------------------------------------------------------------
 	// (g) closeAndValue prices from seeded requests; unknown model lands
 	// in unpricedTokens. Real gpt-5.6-terra list rates: 2.0/0.2/12 per 1M.
 	// -------------------------------------------------------------------
