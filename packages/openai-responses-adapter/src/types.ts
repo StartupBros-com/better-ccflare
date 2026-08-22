@@ -39,7 +39,9 @@ export interface ResponseMessageItem {
 	type: "message";
 	role: "user" | "assistant";
 	id?: string;
-	content: ResponseContent[];
+	// OpenAI permits a string shorthand (equivalent to a single input_text
+	// part) in addition to the structured array form.
+	content: string | ResponseContent[];
 }
 
 export type ResponseContent =

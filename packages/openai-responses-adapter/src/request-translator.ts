@@ -17,6 +17,11 @@ import type {
 
 const logger = new Logger("openai-responses-adapter");
 
+// Bounds per-item content-array iteration so a huge malformed content array
+// (e.g. millions of nulls) cannot turn into unbounded synchronous log calls
+// or unbounded iteration — a request→log amplification DoS.
+const MAX_MESSAGE_CONTENT_PARTS = 100_000;
+
 // Map OpenAI model names to Claude family aliases so per-account model_mappings
 // (opus/sonnet/haiku) resolve correctly when Codex CLI requests reach the proxy.
 // Rules based on OpenAI naming conventions:
@@ -49,6 +54,35 @@ function parseArguments(args: string): unknown {
 // string-and-nonempty check so every call site drops-with-warn consistently.
 function asToolId(v: unknown): string | undefined {
 	return typeof v === "string" && v.length > 0 ? v : undefined;
+}
+
+// Anthropic tool_use/tool_result ids must match this grammar. OpenAI call_ids
+// are not guaranteed to (e.g. "call:1"), so a non-conforming id must be
+// sanitized rather than emitted verbatim — an unsanitized id 400s the whole
+// request.
+const ANTHROPIC_TOOL_ID_RE = /^[A-Za-z0-9_-]+$/;
+
+// Builds a request-scoped id mapper: sanitizes grammar-invalid tool ids while
+// keeping tool_use/tool_result pairing intact (same original id → same
+// emitted id) and collision-free across the request. Scoped per-request
+// (not module-level) so unrelated requests never share mapping state.
+function makeToolIdMapper(): (original: string) => string {
+	const seen = new Map<string, string>(); // original -> emitted (preserves tool_use/tool_result pairing)
+	const used = new Set<string>(); // emitted values, for collision-free assignment
+	return (original) => {
+		const existing = seen.get(original);
+		if (existing !== undefined) return existing;
+		let candidate = ANTHROPIC_TOOL_ID_RE.test(original)
+			? original
+			: original.replace(/[^A-Za-z0-9_-]/g, "_");
+		if (candidate.length === 0) candidate = "tool_id";
+		let unique = candidate;
+		let n = 1;
+		while (used.has(unique)) unique = `${candidate}_${n++}`;
+		seen.set(original, unique);
+		used.add(unique);
+		return unique;
+	};
 }
 
 function translateTools(tools: ResponsesTool[]): AnthropicTool[] {
@@ -162,6 +196,10 @@ export function translateRequestToAnthropic(
 ): AnthropicRequest {
 	const messages: AnthropicMessage[] = [];
 	const developerBlocks: string[] = [];
+	// Request-scoped: pairing (function_call <-> function_call_output etc.)
+	// must survive sanitization, so the mapper is built once per request, not
+	// globally.
+	const mapToolId = makeToolIdMapper();
 
 	for (const item of req.input) {
 		// Captured before any narrowing so the generic catch-all below can log
@@ -172,21 +210,38 @@ export function translateRequestToAnthropic(
 		const itemType = item.type;
 
 		if (item.type === "message") {
-			// Guard runtime-malformed input: content is type-required, but a
-			// non-array (undefined/null) here would throw on the .map below and
-			// fail the whole request — drop-with-warn instead, as agent_message does.
-			if (!Array.isArray(item.content)) {
+			// OpenAI permits content as either a string (shorthand for a single
+			// input_text part) or an array of structured parts; normalize both
+			// into a parts array before validating each part below. Anything
+			// else is runtime-malformed input (content is type-required) that
+			// would throw on the loop below — drop-with-warn instead.
+			let parts: unknown[];
+			if (typeof item.content === "string") {
+				parts = [{ type: "input_text", text: item.content }];
+			} else if (Array.isArray(item.content)) {
+				parts = item.content as unknown[];
+			} else {
 				logger.warn(
-					`Dropping message with role "${item.role}" — content is not an array, cannot translate`,
+					`Dropping message with role "${item.role}" — content is neither a string nor an array, cannot translate`,
 				);
 				continue;
 			}
+
+			// Bound the work below: a huge malformed content array (e.g.
+			// millions of nulls) must not turn into unbounded iteration or
+			// unbounded synchronous log calls (a request→log amplification DoS).
+			if (parts.length > MAX_MESSAGE_CONTENT_PARTS) {
+				logger.warn(
+					`Message with role "${item.role}" has ${parts.length} content parts — truncating to the first ${MAX_MESSAGE_CONTENT_PARTS}`,
+				);
+				parts = parts.slice(0, MAX_MESSAGE_CONTENT_PARTS);
+			}
+
 			const content: AnthropicContent[] = [];
-			for (const rawC of item.content as unknown[]) {
+			let malformedCount = 0;
+			for (const rawC of parts) {
 				if (rawC === null || typeof rawC !== "object" || Array.isArray(rawC)) {
-					logger.warn(
-						`Dropping malformed content part in message with role "${item.role}" — content part is not an object`,
-					);
+					malformedCount++;
 					continue;
 				}
 				content.push(
@@ -201,6 +256,26 @@ export function translateRequestToAnthropic(
 					),
 				);
 			}
+			if (malformedCount > 0) {
+				// One summary warn for the whole batch, not one per element — see
+				// MAX_MESSAGE_CONTENT_PARTS comment above.
+				logger.warn(
+					`Dropped ${malformedCount} malformed content part(s) in message with role "${item.role}" — not objects`,
+				);
+			} else if (content.length === 0) {
+				// Only warn here when nothing was malformed either (i.e. the parts
+				// array was empty to begin with) — the malformed-count warn above
+				// already explains an all-malformed empty result.
+				logger.warn(
+					`Dropping message with role "${item.role}" — no usable content parts after filtering`,
+				);
+			}
+
+			if (content.length === 0) {
+				// Anthropic rejects a message with an empty content array.
+				continue;
+			}
+
 			// developer role is used by Codex CLI for system-level instructions.
 			// Anthropic /v1/messages does not accept this role in the messages array
 			// so we extract the text and merge it into the system prompt instead.
@@ -228,7 +303,7 @@ export function translateRequestToAnthropic(
 			}
 			const toolUseBlock: AnthropicContent = {
 				type: "tool_use",
-				id: toolUseId,
+				id: mapToolId(toolUseId),
 				name: item.name,
 				input: parseArguments(item.arguments),
 			};
@@ -254,7 +329,7 @@ export function translateRequestToAnthropic(
 				content: [
 					{
 						type: "tool_result",
-						tool_use_id: toolUseId,
+						tool_use_id: mapToolId(toolUseId),
 						content: item.output,
 					},
 				],
@@ -286,7 +361,7 @@ export function translateRequestToAnthropic(
 					: {};
 			const toolUseBlock: AnthropicContent = {
 				type: "tool_use",
-				id: toolUseId,
+				id: mapToolId(toolUseId),
 				name: "local_shell",
 				input,
 			};
@@ -311,7 +386,7 @@ export function translateRequestToAnthropic(
 				content: [
 					{
 						type: "tool_result",
-						tool_use_id: toolUseId,
+						tool_use_id: mapToolId(toolUseId),
 						content: item.output,
 					},
 				],
@@ -328,22 +403,41 @@ export function translateRequestToAnthropic(
 				);
 				continue;
 			}
+			let parts = item.content as unknown[];
+			// Bound the work below — see MAX_MESSAGE_CONTENT_PARTS comment in the
+			// message branch above.
+			if (parts.length > MAX_MESSAGE_CONTENT_PARTS) {
+				logger.warn(
+					`agent_message from "${item.author}" has ${parts.length} content parts — truncating to the first ${MAX_MESSAGE_CONTENT_PARTS}`,
+				);
+				parts = parts.slice(0, MAX_MESSAGE_CONTENT_PARTS);
+			}
 			const textParts: string[] = [];
-			for (const rawC of item.content as unknown[]) {
+			let malformedCount = 0;
+			let encryptedCount = 0;
+			for (const rawC of parts) {
 				if (rawC === null || typeof rawC !== "object" || Array.isArray(rawC)) {
-					logger.warn(
-						`Dropping malformed content part of agent_message from "${item.author}" — content part is not an object`,
-					);
+					malformedCount++;
 					continue;
 				}
 				const c = rawC as { type: string; text: string };
 				if (c.type === "input_text") {
 					textParts.push(c.text);
 				} else if (c.type === "encrypted_content") {
-					logger.warn(
-						`Dropping encrypted_content part of agent_message from "${item.author}" — cannot decode encrypted_content`,
-					);
+					encryptedCount++;
 				}
+			}
+			// One summary warn per batch, not one per element — see
+			// MAX_MESSAGE_CONTENT_PARTS comment in the message branch above.
+			if (malformedCount > 0) {
+				logger.warn(
+					`Dropped ${malformedCount} malformed content part(s) of agent_message from "${item.author}" — not objects`,
+				);
+			}
+			if (encryptedCount > 0) {
+				logger.warn(
+					`Dropped ${encryptedCount} encrypted_content part(s) of agent_message from "${item.author}" — cannot decode encrypted_content`,
+				);
 			}
 			const text =
 				textParts.length > 0
