@@ -15,6 +15,7 @@ mock.module("@better-ccflare/http-api", () => ({
 	AlertService: MockHttpApiService,
 	APIRouter: MockHttpApiService,
 	AuthService: MockHttpApiService,
+	UsageWindowLedger: MockHttpApiService,
 	createServerDeviceSetupCoordinator: () => ({
 		tick: async () => {},
 		dispose: () => {},
