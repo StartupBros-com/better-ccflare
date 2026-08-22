@@ -132,6 +132,22 @@ function mergeConsecutiveSameRole(
 	return merged;
 }
 
+// Append an assistant-authored block (a tool_use) to the trailing assistant
+// message, or open a new assistant message when the previous item was not the
+// assistant's. Shared by the function_call/custom_tool_call and
+// local_shell_call branches so both keep identical merge behavior.
+function appendAssistantBlock(
+	messages: AnthropicMessage[],
+	block: AnthropicContent,
+): void {
+	const last = messages[messages.length - 1];
+	if (last && last.role === "assistant") {
+		last.content.push(block);
+	} else {
+		messages.push({ role: "assistant", content: [block] });
+	}
+}
+
 export function translateRequestToAnthropic(
 	req: ResponsesRequest & { input: ResponseItem[] },
 ): AnthropicRequest {
@@ -170,12 +186,7 @@ export function translateRequestToAnthropic(
 				name: item.name,
 				input: parseArguments(item.arguments),
 			};
-			const last = messages[messages.length - 1];
-			if (last && last.role === "assistant") {
-				last.content.push(toolUseBlock);
-			} else {
-				messages.push({ role: "assistant", content: [toolUseBlock] });
-			}
+			appendAssistantBlock(messages, toolUseBlock);
 			continue;
 		}
 
@@ -197,10 +208,13 @@ export function translateRequestToAnthropic(
 		}
 
 		if (item.type === "local_shell_call") {
-			const toolUseId = item.call_id ?? item.id;
+			// `||` (not `??`) so an empty-string call_id/id — which would produce
+			// an unusable empty tool_use id on the wire — falls through to the
+			// drop-with-warn below instead of being treated as present.
+			const toolUseId = item.call_id || item.id || undefined;
 			if (toolUseId === undefined) {
 				logger.warn(
-					"Dropping local_shell_call with no call_id or id — cannot fabricate a tool_use id",
+					"Dropping local_shell_call with no usable call_id or id — cannot fabricate a tool_use id",
 				);
 				continue;
 			}
@@ -208,22 +222,22 @@ export function translateRequestToAnthropic(
 				type: "tool_use",
 				id: toolUseId,
 				name: "local_shell",
-				input: item.action,
+				// `?? {}` guards against runtime-malformed input missing the
+				// (type-required) action: Anthropic tool_use.input must be an object.
+				input: item.action ?? {},
 			};
-			const last = messages[messages.length - 1];
-			if (last && last.role === "assistant") {
-				last.content.push(toolUseBlock);
-			} else {
-				messages.push({ role: "assistant", content: [toolUseBlock] });
-			}
+			appendAssistantBlock(messages, toolUseBlock);
 			continue;
 		}
 
 		if (item.type === "local_shell_call_output") {
-			const toolUseId = item.call_id ?? item.id;
+			// `||` (not `??`) so an empty-string call_id/id falls through to the
+			// drop-with-warn instead of producing a tool_result whose
+			// tool_use_id can never match a real tool_use block.
+			const toolUseId = item.call_id || item.id || undefined;
 			if (toolUseId === undefined) {
 				logger.warn(
-					"Dropping local_shell_call_output with no call_id/id — cannot map to a tool_result",
+					"Dropping local_shell_call_output with no usable call_id/id — cannot map to a tool_result",
 				);
 				continue;
 			}
@@ -241,6 +255,14 @@ export function translateRequestToAnthropic(
 		}
 
 		if (item.type === "agent_message") {
+			// Guard runtime-malformed input: content is type-required, but a
+			// non-array (undefined/null) here would throw on the for..of below.
+			if (!Array.isArray(item.content)) {
+				logger.warn(
+					`Dropping agent_message from "${item.author}" — content is not an array, cannot synthesize text`,
+				);
+				continue;
+			}
 			const textParts: string[] = [];
 			for (const c of item.content) {
 				if (c.type === "input_text") {
