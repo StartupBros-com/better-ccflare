@@ -7,7 +7,7 @@ import {
 import { logBus } from "@better-ccflare/logger";
 import type { LogEvent } from "@better-ccflare/types";
 import { translateRequestToAnthropic } from "../request-translator";
-import type { ResponsesRequest } from "../types";
+import type { ResponseItem, ResponsesRequest } from "../types";
 
 function captureWarnings(fn: () => void): LogEvent[] {
 	const captured: LogEvent[] = [];
@@ -1507,5 +1507,241 @@ describe("translateRequestToAnthropic", () => {
 		});
 		const rejectWarnings = warnings.filter((w) => w.msg.includes("invalid"));
 		expect(rejectWarnings).toHaveLength(1);
+	});
+
+	// --- P1 finding #3: empty text/refusal strings emit empty text blocks ---
+
+	test("message with an empty-string input_text is dropped, not emitted as an empty text block", () => {
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "message",
+					role: "user",
+					content: [{ type: "input_text", text: "" }],
+				},
+			],
+		};
+		const warnings = captureWarnings(() => {
+			const result = translateRequestToAnthropic(req);
+			expect(result.messages).toHaveLength(0);
+		});
+		const rejectWarnings = warnings.filter((w) => w.msg.includes("invalid"));
+		expect(rejectWarnings).toHaveLength(1);
+	});
+
+	test("message with an empty string content (shorthand) is dropped, not emitted as an empty text block", () => {
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "message",
+					role: "user",
+					content: "",
+				},
+			],
+		};
+		let result: ReturnType<typeof translateRequestToAnthropic> | undefined;
+		expect(() => {
+			result = translateRequestToAnthropic(req);
+		}).not.toThrow();
+		expect(result?.messages).toHaveLength(0);
+	});
+
+	test("message content with one empty text part and one valid text part keeps only the valid part", () => {
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "message",
+					role: "user",
+					content: [
+						{ type: "input_text", text: "" },
+						{ type: "input_text", text: "hi" },
+					],
+				},
+			],
+		};
+		const result = translateRequestToAnthropic(req);
+		expect(result.messages).toHaveLength(1);
+		expect(result.messages[0].content).toEqual([{ type: "text", text: "hi" }]);
+	});
+
+	test("message with an empty-string refusal is dropped, not emitted as an empty text block", () => {
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "message",
+					role: "assistant",
+					content: [{ type: "refusal", refusal: "" }],
+				},
+			],
+		};
+		const warnings = captureWarnings(() => {
+			const result = translateRequestToAnthropic(req);
+			expect(result.messages).toHaveLength(0);
+		});
+		const rejectWarnings = warnings.filter((w) => w.msg.includes("invalid"));
+		expect(rejectWarnings).toHaveLength(1);
+	});
+
+	test("message with a non-empty string content (shorthand) still produces a text block unchanged (regression guard)", () => {
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "message",
+					role: "user",
+					content: "hello",
+				},
+			],
+		};
+		const result = translateRequestToAnthropic(req);
+		expect(result.messages).toEqual([
+			{ role: "user", content: [{ type: "text", text: "hello" }] },
+		]);
+	});
+
+	// --- P2 finding #4: agent_message with only unknown-type junk fabricates a placeholder ---
+
+	test("agent_message with only unknown-type junk content is dropped entirely, does not fabricate the placeholder", () => {
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "agent_message",
+					author: "planner",
+					recipient: "coder",
+					content: [
+						// biome-ignore lint/suspicious/noExplicitAny: exercising an unmodeled/unknown agent_message content part type
+						{ type: "nope" } as any,
+					],
+				},
+			],
+		};
+		const warnings = captureWarnings(() => {
+			const result = translateRequestToAnthropic(req);
+			expect(result.messages).toHaveLength(0);
+		});
+		const rejectWarnings = warnings.filter((w) =>
+			w.msg.includes("unsupported"),
+		);
+		expect(rejectWarnings).toHaveLength(1);
+		expect(
+			warnings.some((w) => w.msg.includes("sub-agent message received")),
+		).toBe(false);
+	});
+
+	test("agent_message with only encrypted_content still emits the placeholder (encrypted-only case preserved)", () => {
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "agent_message",
+					author: "planner",
+					recipient: "coder",
+					content: [
+						{ type: "encrypted_content", encrypted_content: "abc123==" },
+					],
+				},
+			],
+		};
+		const warnings = captureWarnings(() => {
+			const result = translateRequestToAnthropic(req);
+			expect(result.messages).toEqual([
+				{
+					role: "user",
+					content: [{ type: "text", text: "(sub-agent message received)" }],
+				},
+			]);
+		});
+		expect(warnings.some((w) => w.msg.includes("encrypted_content"))).toBe(
+			true,
+		);
+	});
+
+	test("agent_message with a real input_text produces the formatted agent-message text unchanged", () => {
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "agent_message",
+					author: "planner",
+					recipient: "coder",
+					content: [{ type: "input_text", text: "do X" }],
+				},
+			],
+		};
+		const result = translateRequestToAnthropic(req);
+		expect(result.messages).toEqual([
+			{
+				role: "user",
+				content: [
+					{
+						type: "text",
+						text: "[agent message from planner to coder]: do X",
+					},
+				],
+			},
+		]);
+	});
+
+	// --- P1 finding #1: request-wide log-amplification (item count + warn budget) ---
+
+	test("request with more than MAX_REQUEST_INPUT_ITEMS input items is truncated with a single warning", () => {
+		// Must match the module const of the same name in request-translator.ts.
+		const MAX_REQUEST_INPUT_ITEMS = 100_000;
+		const items: ResponseItem[] = Array.from(
+			{ length: MAX_REQUEST_INPUT_ITEMS + 5 },
+			() => ({
+				type: "message",
+				role: "user",
+				content: [{ type: "input_text", text: "x" }],
+			}),
+		);
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: items,
+		};
+		const warnings = captureWarnings(() => {
+			const result = translateRequestToAnthropic(req);
+			// All items share role "user" and merge into a single message; the
+			// truncation must still have capped how many content parts landed in
+			// it (proof the extra 5 items past the cap were never processed).
+			const totalParts = result.messages.reduce(
+				(sum, m) => sum + m.content.length,
+				0,
+			);
+			expect(totalParts).toBe(MAX_REQUEST_INPUT_ITEMS);
+		});
+		const truncationWarnings = warnings.filter((w) =>
+			w.msg.includes("truncating"),
+		);
+		expect(truncationWarnings).toHaveLength(1);
+	});
+
+	test("request-scoped warn budget caps total warnings emitted from many per-item warns", () => {
+		// Must match the module consts of the same name in request-translator.ts.
+		const MAX_REQUEST_WARNS = 50;
+		const items = Array.from({ length: 120 }, () => ({
+			type: "message" as const,
+			role: "user" as const,
+			// Each item's sole content part is malformed (null), producing exactly
+			// one "malformed" summary warn per item — 120 raw warn calls total.
+			// biome-ignore lint/suspicious/noExplicitAny: exercising runtime-malformed content (null) at scale to exercise the warn budget
+			content: [null as any],
+		}));
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: items,
+		};
+		const warnings = captureWarnings(() => {
+			const result = translateRequestToAnthropic(req);
+			expect(result.messages).toHaveLength(0);
+		});
+		// Budget + the single "further ... suppressed" summary — NOT ~120.
+		expect(warnings.length).toBeLessThanOrEqual(MAX_REQUEST_WARNS + 1);
+		expect(warnings.some((w) => w.msg.includes("suppressed"))).toBe(true);
 	});
 });

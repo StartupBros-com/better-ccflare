@@ -22,6 +22,12 @@ const logger = new Logger("openai-responses-adapter");
 // or unbounded iteration — a request→log amplification DoS.
 const MAX_MESSAGE_CONTENT_PARTS = 100_000;
 
+// Bounds request-wide item-count iteration: MAX_MESSAGE_CONTENT_PARTS only
+// caps parts *within* one message, but req.input.length (item count) was
+// otherwise uncapped, and each item can emit its own summary warn(s) — N
+// items → O(N) synchronous logger.warn calls from a single admitted request.
+const MAX_REQUEST_INPUT_ITEMS = 100_000;
+
 // Map OpenAI model names to Claude family aliases so per-account model_mappings
 // (opus/sonnet/haiku) resolve correctly when Codex CLI requests reach the proxy.
 // Rules based on OpenAI naming conventions:
@@ -145,12 +151,20 @@ function translateContentItem(c: {
 		if (typeof c.text !== "string") {
 			return { ok: false, reason: `${c.type} has non-string text` };
 		}
+		if (c.text.length === 0) {
+			// Anthropic 400s a request containing an empty text block.
+			return { ok: false, reason: `${c.type} has empty text` };
+		}
 		return { ok: true, block: { type: "text", text: c.text } };
 	}
 
 	if (c.type === "refusal") {
 		if (typeof c.refusal !== "string") {
 			return { ok: false, reason: "refusal has non-string refusal" };
+		}
+		if (c.refusal.length === 0) {
+			// Anthropic 400s a request containing an empty text block.
+			return { ok: false, reason: "refusal has empty refusal" };
 		}
 		return { ok: true, block: { type: "text", text: c.refusal } };
 	}
@@ -238,7 +252,35 @@ export function translateRequestToAnthropic(
 	// globally.
 	const mapToolId = makeToolIdMapper();
 
-	for (const item of req.input) {
+	// Bound the item loop below: an uncapped req.input.length lets a request
+	// split across hundreds of thousands of tiny items amplify into unbounded
+	// iteration — see MAX_REQUEST_INPUT_ITEMS comment above. This one warn
+	// always fires (it is not subject to the per-request warn budget below,
+	// since it is inherently O(1) regardless of input size). Named `items`
+	// rather than `input` — the local_shell_call branch below declares its own
+	// block-scoped `const input` for the tool_use payload, and reusing the
+	// name here would shadow it.
+	let items: ResponseItem[] = req.input;
+	if (items.length > MAX_REQUEST_INPUT_ITEMS) {
+		logger.warn(
+			`Request has ${items.length} input items — truncating to the first ${MAX_REQUEST_INPUT_ITEMS}`,
+		);
+		items = items.slice(0, MAX_REQUEST_INPUT_ITEMS);
+	}
+
+	// Request-scoped warning budget: per-item summary warns are already O(1)
+	// per item, but a request with many items can still drive total warns to
+	// O(N) — cap total synchronous logger.warn calls per request regardless of
+	// item count (a second, request-wide layer on top of the per-item
+	// batching above).
+	let warnCount = 0;
+	const MAX_REQUEST_WARNS = 50;
+	const emitWarn = (msg: string) => {
+		warnCount++;
+		if (warnCount <= MAX_REQUEST_WARNS) logger.warn(msg);
+	};
+
+	for (const item of items) {
 		// Captured before any narrowing so the generic catch-all below can log
 		// the real runtime type string without needing a cast: once every
 		// literal member of the ResponseItem union has been excluded by the
@@ -258,7 +300,7 @@ export function translateRequestToAnthropic(
 			} else if (Array.isArray(item.content)) {
 				parts = item.content as unknown[];
 			} else {
-				logger.warn(
+				emitWarn(
 					`Dropping message with role "${item.role}" — content is neither a string nor an array, cannot translate`,
 				);
 				continue;
@@ -268,7 +310,7 @@ export function translateRequestToAnthropic(
 			// millions of nulls) must not turn into unbounded iteration or
 			// unbounded synchronous log calls (a request→log amplification DoS).
 			if (parts.length > MAX_MESSAGE_CONTENT_PARTS) {
-				logger.warn(
+				emitWarn(
 					`Message with role "${item.role}" has ${parts.length} content parts — truncating to the first ${MAX_MESSAGE_CONTENT_PARTS}`,
 				);
 				parts = parts.slice(0, MAX_MESSAGE_CONTENT_PARTS);
@@ -300,12 +342,12 @@ export function translateRequestToAnthropic(
 			// At most two summary warns for the whole batch, never one per
 			// element — see MAX_MESSAGE_CONTENT_PARTS comment above.
 			if (malformedCount > 0) {
-				logger.warn(
+				emitWarn(
 					`Dropped ${malformedCount} malformed content part(s) in message with role "${item.role}" — not objects`,
 				);
 			}
 			if (rejectedCount > 0) {
-				logger.warn(
+				emitWarn(
 					`Dropped ${rejectedCount} unsupported/invalid content part(s) in message with role "${item.role}"`,
 				);
 			}
@@ -313,7 +355,7 @@ export function translateRequestToAnthropic(
 				// Only warn here when nothing was malformed or rejected either (i.e.
 				// the parts array was empty to begin with) — the two summary warns
 				// above already explain a filtered-to-empty result.
-				logger.warn(
+				emitWarn(
 					`Dropping message with role "${item.role}" — no usable content parts after filtering`,
 				);
 			}
@@ -343,7 +385,7 @@ export function translateRequestToAnthropic(
 			// can never pair with its result — drop-with-warn instead.
 			const toolUseId = asToolId(item.call_id);
 			if (toolUseId === undefined) {
-				logger.warn(
+				emitWarn(
 					`Dropping ${item.type} with no usable call_id — cannot fabricate a tool_use id`,
 				);
 				continue;
@@ -366,7 +408,7 @@ export function translateRequestToAnthropic(
 			// never match a real tool_use block (mirrors the call-side guard above).
 			const toolUseId = asToolId(item.call_id);
 			if (toolUseId === undefined) {
-				logger.warn(
+				emitWarn(
 					`Dropping ${item.type} with no usable call_id — cannot map to a tool_result`,
 				);
 				continue;
@@ -391,7 +433,7 @@ export function translateRequestToAnthropic(
 			// drop-with-warn below instead of being treated as present.
 			const toolUseId = asToolId(item.call_id) ?? asToolId(item.id);
 			if (toolUseId === undefined) {
-				logger.warn(
+				emitWarn(
 					"Dropping local_shell_call with no usable call_id or id — cannot fabricate a tool_use id",
 				);
 				continue;
@@ -423,7 +465,7 @@ export function translateRequestToAnthropic(
 			// match a real tool_use block.
 			const toolUseId = asToolId(item.call_id) ?? asToolId(item.id);
 			if (toolUseId === undefined) {
-				logger.warn(
+				emitWarn(
 					"Dropping local_shell_call_output with no usable call_id/id — cannot map to a tool_result",
 				);
 				continue;
@@ -445,7 +487,7 @@ export function translateRequestToAnthropic(
 			// Guard runtime-malformed input: content is type-required, but a
 			// non-array (undefined/null) here would throw on the for..of below.
 			if (!Array.isArray(item.content)) {
-				logger.warn(
+				emitWarn(
 					`Dropping agent_message from "${item.author}" — content is not an array, cannot synthesize text`,
 				);
 				continue;
@@ -454,7 +496,7 @@ export function translateRequestToAnthropic(
 			// Bound the work below — see MAX_MESSAGE_CONTENT_PARTS comment in the
 			// message branch above.
 			if (parts.length > MAX_MESSAGE_CONTENT_PARTS) {
-				logger.warn(
+				emitWarn(
 					`agent_message from "${item.author}" has ${parts.length} content parts — truncating to the first ${MAX_MESSAGE_CONTENT_PARTS}`,
 				);
 				parts = parts.slice(0, MAX_MESSAGE_CONTENT_PARTS);
@@ -462,6 +504,7 @@ export function translateRequestToAnthropic(
 			const textParts: string[] = [];
 			let malformedCount = 0;
 			let encryptedCount = 0;
+			let rejectedCount = 0;
 			for (const rawC of parts) {
 				if (rawC === null || typeof rawC !== "object" || Array.isArray(rawC)) {
 					malformedCount++;
@@ -478,25 +521,46 @@ export function translateRequestToAnthropic(
 					// this branch's existing single summary warn rather than a new
 					// per-element one.
 					malformedCount++;
+				} else {
+					// A truly-unknown-type object (not input_text, not
+					// encrypted_content) — counted separately from malformedCount
+					// (non-objects) so it can't silently fall through and still
+					// trigger the "(sub-agent message received)" placeholder below.
+					rejectedCount++;
 				}
 			}
 			// One summary warn per batch, not one per element — see
 			// MAX_MESSAGE_CONTENT_PARTS comment in the message branch above.
 			if (malformedCount > 0) {
-				logger.warn(
+				emitWarn(
 					`Dropped ${malformedCount} malformed content part(s) of agent_message from "${item.author}" — not objects`,
 				);
 			}
 			if (encryptedCount > 0) {
-				logger.warn(
+				emitWarn(
 					`Dropped ${encryptedCount} encrypted_content part(s) of agent_message from "${item.author}" — cannot decode encrypted_content`,
 				);
 			}
-			const text =
-				textParts.length > 0
-					? `[agent message from ${item.author} to ${item.recipient}]: ${textParts.join("\n\n")}`
-					: "(sub-agent message received)";
-			messages.push({ role: "user", content: [{ type: "text", text }] });
+			if (rejectedCount > 0) {
+				emitWarn(
+					`Dropped ${rejectedCount} unsupported content part(s) of agent_message from "${item.author}"`,
+				);
+			}
+			if (textParts.length > 0) {
+				const text = `[agent message from ${item.author} to ${item.recipient}]: ${textParts.join("\n\n")}`;
+				messages.push({ role: "user", content: [{ type: "text", text }] });
+				continue;
+			}
+			if (encryptedCount > 0) {
+				// A real encrypted part was present but undecodable — surface that
+				// something was received rather than dropping it silently.
+				messages.push({
+					role: "user",
+					content: [{ type: "text", text: "(sub-agent message received)" }],
+				});
+			}
+			// Nothing usable (only junk/malformed, no encrypted part either) — do
+			// not fabricate a placeholder message from pure junk; drop the item.
 			continue;
 		}
 
@@ -508,28 +572,34 @@ export function translateRequestToAnthropic(
 		// catch-all that follows; `itemType` was captured before any
 		// narrowing began, so it still holds the real runtime type string.
 		if (item.type === "reasoning") {
-			logger.warn(
+			emitWarn(
 				"Dropping reasoning item — OpenAI reasoning has no signature field and Anthropic verifies thinking-block signatures server-side, so a fabricated signature would 400",
 			);
 			continue;
 		}
 
 		if (item.type === "compaction" || item.type === "compaction_summary") {
-			logger.warn(
+			emitWarn(
 				`Dropping ${item.type} item — opaque server-encrypted_content blob, cannot decode`,
 			);
 			continue;
 		}
 
 		if (item.type === "compaction_trigger") {
-			logger.warn(
+			emitWarn(
 				"Dropping compaction_trigger item — zero-payload control signal, no Anthropic mapping",
 			);
 			continue;
 		}
 
-		logger.warn(
+		emitWarn(
 			`Dropping unhandled Responses input item type "${itemType}" — no Anthropic mapping implemented`,
+		);
+	}
+
+	if (warnCount > MAX_REQUEST_WARNS) {
+		logger.warn(
+			`${warnCount - MAX_REQUEST_WARNS} further translation warning(s) suppressed`,
 		);
 	}
 
