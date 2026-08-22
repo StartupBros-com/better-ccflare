@@ -28,7 +28,18 @@ export type AlertType =
 	 * projection (computeUsagePrediction, packages/http-api/src/services/
 	 * usage-prediction.ts) says it will exhaust before its resets_at. Fires
 	 * unconditionally (no separate enable toggle), like model_routing_drift. */
-	| "usage_window_exhaustion_projected";
+	| "usage_window_exhaustion_projected"
+	/** A usage window CLOSED (fully settled and priced) with a value
+	 * markedly lower than its recent history: closedValue fell more than
+	 * the configured fraction below the median of its priced prior closed
+	 * siblings. Unlike the two alerts above, this evaluates a settled
+	 * window after the fact rather than an open window's live utilization
+	 * — see AlertService.evaluateClosedWindow and
+	 * UsageWindowLedger.closeAndValue in packages/http-api/src/services/
+	 * (alerts.ts, usage-window-ledger.ts), issue #252's Window Value
+	 * Ledger. Needs at least two priced prior closed windows to have a
+	 * baseline; with fewer, it never fires. */
+	| "usage_window_value_drop";
 
 /**
  * Discriminates the two staleness classes detected under the
@@ -89,6 +100,14 @@ export interface AlertsConfigPayload {
 	 * usage_window_threshold; 0 = disabled. Does not gate
 	 * usage_window_exhaustion_projected, which is unconditional. */
 	usageWindowThresholdPercent: number;
+	/** Fraction (0-1) a closed usage window's priced value must fall below
+	 * the median of its recent priced prior closed windows before
+	 * usage_window_value_drop fires — e.g. 0.25 fires once the closed
+	 * value is more than 25% below that median. Optional (unlike its
+	 * sibling thresholds above) so a hand-built payload that omits it
+	 * still satisfies this type; getAlertsConfig always populates a real
+	 * number (default 0.25). See AlertService.evaluateClosedWindow. */
+	usageWindowValueDropThreshold?: number;
 	anomalyEnabled: boolean;
 	anomalyIntervalMinutes: number;
 	/**

@@ -225,6 +225,48 @@ async function ensureServerToolReplayIssuanceSchemaPg(
 	`);
 }
 
+/**
+ * PostgreSQL mirror of the SQLite usage_windows table (see migrations.ts
+ * ensureSchema for rationale). Column names are kept in exact parity with
+ * SQLite — enforced by the static schema-parity test in
+ * migrations-pg.test.ts — while types use PG-appropriate widths (BIGINT for
+ * timestamps, DOUBLE PRECISION for REAL).
+ */
+async function ensureUsageWindowsSchemaPg(
+	adapter: BunSqlAdapter,
+): Promise<void> {
+	await adapter.unsafe(`
+		CREATE TABLE IF NOT EXISTS usage_windows (
+			id TEXT PRIMARY KEY,
+			account_id TEXT NOT NULL,
+			window_key TEXT NOT NULL,
+			started_at BIGINT NOT NULL,
+			resets_at BIGINT NOT NULL,
+			closed_at BIGINT,
+			grant_type TEXT NOT NULL CHECK (grant_type IN ('natural', 'early_reset', 'first_observed')),
+			peak_utilization DOUBLE PRECISION NOT NULL DEFAULT 0,
+			first_100_at BIGINT,
+			value_usd DOUBLE PRECISION,
+			input_tokens BIGINT,
+			cache_read_input_tokens BIGINT,
+			cache_creation_input_tokens BIGINT,
+			output_tokens BIGINT,
+			request_count BIGINT,
+			model_breakdown TEXT,
+			unpriced_tokens BIGINT,
+			projection_version TEXT
+		)
+	`);
+	await adapter.unsafe(
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_windows_unique
+		 ON usage_windows(account_id, window_key, resets_at)`,
+	);
+	await adapter.unsafe(
+		`CREATE INDEX IF NOT EXISTS idx_usage_windows_closed
+		 ON usage_windows(account_id, window_key, closed_at)`,
+	);
+}
+
 async function ensureManagedRoutingPolicyTablesPg(
 	adapter: BunSqlAdapter,
 ): Promise<void> {
@@ -563,6 +605,7 @@ export async function ensureSchemaPg(adapter: BunSqlAdapter): Promise<void> {
 	);
 	await ensureDeviceSetupJobsSchemaPg(adapter);
 	await ensureServerToolReplayIssuanceSchemaPg(adapter);
+	await ensureUsageWindowsSchemaPg(adapter);
 
 	// Create agent_preferences table
 	await adapter.unsafe(`
@@ -1351,6 +1394,7 @@ export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 	);
 	await ensureDeviceSetupJobsSchemaPg(adapter);
 	await ensureServerToolReplayIssuanceSchemaPg(adapter);
+	await ensureUsageWindowsSchemaPg(adapter);
 
 	// Performance indexes — mirrors packages/database/src/performance-indexes.ts
 	// (addPerformanceIndexes) plus idx_api_keys_role, both applied to SQLite via

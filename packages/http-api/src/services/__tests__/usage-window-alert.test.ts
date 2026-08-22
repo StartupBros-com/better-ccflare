@@ -30,6 +30,13 @@ function makeConfig(
 		cooldownMinutes: number;
 	}> = {},
 ): Config {
+	// Generic get/set backing store, mirroring packages/config/src/index.ts's
+	// real semantics (a first read with a default PERSISTS that default).
+	// getAlertsConfig() now always calls config.get() for
+	// usageWindowValueDropThreshold (see getUsageWindowValueDropThreshold in
+	// ../alerts.ts, issue #252 task P1.6), so every fake Config needs this
+	// even though none of the tests below exercise that alert directly.
+	const store = new Map<string, string | number | boolean>();
 	return Object.assign(new EventEmitter(), {
 		getAlertDailySpendUsd: () => 0,
 		getAlertTokensPerHour: () => 0,
@@ -41,6 +48,20 @@ function makeConfig(
 		getAlertAnomalyLoopMinRequests: () => 25,
 		getAlertCooldownMinutes: () => overrides.cooldownMinutes ?? 60,
 		getAlertWebhookUrl: () => "",
+		get: (
+			key: string,
+			defaultValue?: string | number | boolean,
+		): string | number | boolean | undefined => {
+			if (store.has(key)) return store.get(key);
+			if (defaultValue !== undefined) {
+				store.set(key, defaultValue);
+				return defaultValue;
+			}
+			return undefined;
+		},
+		set: (key: string, value: string | number | boolean): void => {
+			store.set(key, value);
+		},
 	}) as unknown as Config;
 }
 

@@ -22,6 +22,12 @@ function makeConfig(
 		webhookUrl: string;
 	}> = {},
 ): Config {
+	// Generic get/set backing store: getAlertsConfig() always calls
+	// config.get() for usageWindowValueDropThreshold now (see
+	// getUsageWindowValueDropThreshold in ../alerts.ts, issue #252 task
+	// P1.6), so every fake Config needs this even though none of the tests
+	// below exercise that alert directly.
+	const store = new Map<string, string | number | boolean>();
 	return Object.assign(new EventEmitter(), {
 		getAlertDailySpendUsd: () => 0,
 		getAlertTokensPerHour: () => 0,
@@ -33,6 +39,20 @@ function makeConfig(
 		getAlertCooldownMinutes: () => 60,
 		getAlertWebhookUrl: () =>
 			overrides.webhookUrl ?? "http://127.0.0.1:9999/webhook",
+		get: (
+			key: string,
+			defaultValue?: string | number | boolean,
+		): string | number | boolean | undefined => {
+			if (store.has(key)) return store.get(key);
+			if (defaultValue !== undefined) {
+				store.set(key, defaultValue);
+				return defaultValue;
+			}
+			return undefined;
+		},
+		set: (key: string, value: string | number | boolean): void => {
+			store.set(key, value);
+		},
 	}) as unknown as Config;
 }
 
