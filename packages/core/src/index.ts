@@ -150,6 +150,12 @@ export {
 	validateString,
 } from "./validation";
 export {
+	LIST_PRICE_ERAS,
+	type ListPriceEra,
+	priceTokensAtListPrice,
+	VALUE_PRICING_VERSION,
+} from "./value-pricing";
+export {
 	CLAUDE_CLI_VERSION,
 	extractClaudeVersion,
 	getClientVersion,
