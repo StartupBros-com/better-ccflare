@@ -423,6 +423,14 @@ export function ensureSchema(db: Database): void {
 		`CREATE INDEX IF NOT EXISTS idx_requests_timestamp_account ON requests(timestamp DESC, account_used)`,
 	);
 
+	// Per-account time-range queries (usage-window aggregation, account analytics).
+	// Mirrors idx_requests_account_timestamp in migrations-pg.ts — PG gained it in
+	// runMigrationsPg long ago; SQLite was missing the equivalent until the
+	// usage-windows live-value endpoint made the gap load-bearing (#252).
+	db.run(
+		`CREATE INDEX IF NOT EXISTS idx_requests_account_timestamp ON requests(account_used, timestamp DESC)`,
+	);
+
 	// Create alerts table for threshold and anomaly alert history
 	db.run(`
 		CREATE TABLE IF NOT EXISTS alerts (
