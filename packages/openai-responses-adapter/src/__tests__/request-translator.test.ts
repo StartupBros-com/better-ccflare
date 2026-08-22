@@ -999,4 +999,128 @@ describe("translateRequestToAnthropic", () => {
 		expect(warnings[0].msg).toContain("function_call_output");
 		expect(warnings[0].msg).toContain("no usable call_id");
 	});
+	test("message with a null content element is dropped without throwing, keeps the valid element", () => {
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "message",
+					role: "user",
+					content: [
+						// biome-ignore lint/suspicious/noExplicitAny: exercising a runtime-malformed content element (null)
+						null as any,
+						{ type: "input_text", text: "keep me" },
+					],
+				},
+			],
+		};
+		let result: ReturnType<typeof translateRequestToAnthropic> | undefined;
+		const warnings = captureWarnings(() => {
+			expect(() => {
+				result = translateRequestToAnthropic(req);
+			}).not.toThrow();
+		});
+		expect(result?.messages).toHaveLength(1);
+		expect(result?.messages[0].content).toEqual([
+			{ type: "text", text: "keep me" },
+		]);
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0].msg).toContain("user");
+	});
+
+	test("agent_message with a null content element is dropped without throwing, keeps the valid element", () => {
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "agent_message",
+					author: "planner",
+					recipient: "coder",
+					content: [
+						// biome-ignore lint/suspicious/noExplicitAny: exercising a runtime-malformed content element (null)
+						null as any,
+						{ type: "input_text", text: "hi" },
+					],
+				},
+			],
+		};
+		let result: ReturnType<typeof translateRequestToAnthropic> | undefined;
+		const warnings = captureWarnings(() => {
+			expect(() => {
+				result = translateRequestToAnthropic(req);
+			}).not.toThrow();
+		});
+		expect(result?.messages).toHaveLength(1);
+		const block = result?.messages[0].content[0] as {
+			type: string;
+			text: string;
+		};
+		expect(block.type).toBe("text");
+		expect(block.text).toContain("hi");
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0].msg).toContain("planner");
+	});
+
+	test("function_call with a non-string call_id (number) is dropped with a warning", () => {
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "function_call",
+					// biome-ignore lint/suspicious/noExplicitAny: exercising a runtime-malformed call_id (number, not string)
+					call_id: 1 as any,
+					name: "get_weather",
+					arguments: "{}",
+				},
+			],
+		};
+		const warnings = captureWarnings(() => {
+			const result = translateRequestToAnthropic(req);
+			expect(result.messages).toHaveLength(0);
+		});
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0].msg).toContain("function_call");
+		expect(warnings[0].msg).toContain("no usable call_id");
+	});
+
+	test("function_call_output with a non-string call_id (object) is dropped with a warning", () => {
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "function_call_output",
+					// biome-ignore lint/suspicious/noExplicitAny: exercising a runtime-malformed call_id (object, not string)
+					call_id: {} as any,
+					output: "result",
+				},
+			],
+		};
+		const warnings = captureWarnings(() => {
+			const result = translateRequestToAnthropic(req);
+			expect(result.messages).toHaveLength(0);
+		});
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0].msg).toContain("function_call_output");
+		expect(warnings[0].msg).toContain("no usable call_id");
+	});
+
+	test("local_shell_call with a non-string call_id falls back to the string id", () => {
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "local_shell_call",
+					// biome-ignore lint/suspicious/noExplicitAny: exercising a runtime-malformed call_id (number, not string)
+					call_id: 123 as any,
+					id: "real-id",
+					action: { type: "exec", command: ["ls"] },
+				},
+			],
+		};
+		const result = translateRequestToAnthropic(req);
+		expect(result.messages).toHaveLength(1);
+		const block = result.messages[0].content[0] as { type: string; id: string };
+		expect(block.type).toBe("tool_use");
+		expect(block.id).toBe("real-id");
+	});
 });

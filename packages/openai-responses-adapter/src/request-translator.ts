@@ -42,6 +42,15 @@ function parseArguments(args: string): unknown {
 	}
 }
 
+// Tool IDs (call_id / id) are pairing keys emitted verbatim onto the wire as
+// Anthropic id/tool_use_id, which MUST be strings — a truthy non-string
+// (number, object, array) would otherwise pass a bare truthiness check and
+// get emitted, and Anthropic 400s the whole request. Centralize the
+// string-and-nonempty check so every call site drops-with-warn consistently.
+function asToolId(v: unknown): string | undefined {
+	return typeof v === "string" && v.length > 0 ? v : undefined;
+}
+
 function translateTools(tools: ResponsesTool[]): AnthropicTool[] {
 	const result: AnthropicTool[] = [];
 	for (const tool of tools) {
@@ -172,9 +181,26 @@ export function translateRequestToAnthropic(
 				);
 				continue;
 			}
-			const content: AnthropicContent[] = item.content.map((c) =>
-				translateContentItem(c),
-			);
+			const content: AnthropicContent[] = [];
+			for (const rawC of item.content as unknown[]) {
+				if (rawC === null || typeof rawC !== "object" || Array.isArray(rawC)) {
+					logger.warn(
+						`Dropping malformed content part in message with role "${item.role}" — content part is not an object`,
+					);
+					continue;
+				}
+				content.push(
+					translateContentItem(
+						rawC as {
+							type: string;
+							text?: string;
+							refusal?: string;
+							image_url?: string;
+							file_id?: string;
+						},
+					),
+				);
+			}
 			// developer role is used by Codex CLI for system-level instructions.
 			// Anthropic /v1/messages does not accept this role in the messages array
 			// so we extract the text and merge it into the system prompt instead.
@@ -193,7 +219,8 @@ export function translateRequestToAnthropic(
 			// (its type has no `id` fallback), so an empty-string call_id would
 			// emit a tool_use whose id collides with any other empty-id call and
 			// can never pair with its result — drop-with-warn instead.
-			if (!item.call_id) {
+			const toolUseId = asToolId(item.call_id);
+			if (toolUseId === undefined) {
 				logger.warn(
 					`Dropping ${item.type} with no usable call_id — cannot fabricate a tool_use id`,
 				);
@@ -201,7 +228,7 @@ export function translateRequestToAnthropic(
 			}
 			const toolUseBlock: AnthropicContent = {
 				type: "tool_use",
-				id: item.call_id,
+				id: toolUseId,
 				name: item.name,
 				input: parseArguments(item.arguments),
 			};
@@ -215,7 +242,8 @@ export function translateRequestToAnthropic(
 		) {
 			// Empty-string call_id would emit a tool_result whose tool_use_id can
 			// never match a real tool_use block (mirrors the call-side guard above).
-			if (!item.call_id) {
+			const toolUseId = asToolId(item.call_id);
+			if (toolUseId === undefined) {
 				logger.warn(
 					`Dropping ${item.type} with no usable call_id — cannot map to a tool_result`,
 				);
@@ -226,7 +254,7 @@ export function translateRequestToAnthropic(
 				content: [
 					{
 						type: "tool_result",
-						tool_use_id: item.call_id,
+						tool_use_id: toolUseId,
 						content: item.output,
 					},
 				],
@@ -235,10 +263,11 @@ export function translateRequestToAnthropic(
 		}
 
 		if (item.type === "local_shell_call") {
-			// `||` (not `??`) so an empty-string call_id/id — which would produce
-			// an unusable empty tool_use id on the wire — falls through to the
+			// asToolId (not `??`/`||` on the raw values) so an empty-string or
+			// non-string call_id/id — which would produce an unusable or
+			// invalid tool_use id on the wire — falls through to the
 			// drop-with-warn below instead of being treated as present.
-			const toolUseId = item.call_id || item.id || undefined;
+			const toolUseId = asToolId(item.call_id) ?? asToolId(item.id);
 			if (toolUseId === undefined) {
 				logger.warn(
 					"Dropping local_shell_call with no usable call_id or id — cannot fabricate a tool_use id",
@@ -266,10 +295,11 @@ export function translateRequestToAnthropic(
 		}
 
 		if (item.type === "local_shell_call_output") {
-			// `||` (not `??`) so an empty-string call_id/id falls through to the
-			// drop-with-warn instead of producing a tool_result whose
-			// tool_use_id can never match a real tool_use block.
-			const toolUseId = item.call_id || item.id || undefined;
+			// asToolId (not `??`/`||` on the raw values) so an empty-string or
+			// non-string call_id/id falls through to the drop-with-warn
+			// instead of producing a tool_result whose tool_use_id can never
+			// match a real tool_use block.
+			const toolUseId = asToolId(item.call_id) ?? asToolId(item.id);
 			if (toolUseId === undefined) {
 				logger.warn(
 					"Dropping local_shell_call_output with no usable call_id/id — cannot map to a tool_result",
@@ -299,7 +329,14 @@ export function translateRequestToAnthropic(
 				continue;
 			}
 			const textParts: string[] = [];
-			for (const c of item.content) {
+			for (const rawC of item.content as unknown[]) {
+				if (rawC === null || typeof rawC !== "object" || Array.isArray(rawC)) {
+					logger.warn(
+						`Dropping malformed content part of agent_message from "${item.author}" — content part is not an object`,
+					);
+					continue;
+				}
+				const c = rawC as { type: string; text: string };
 				if (c.type === "input_text") {
 					textParts.push(c.text);
 				} else if (c.type === "encrypted_content") {
