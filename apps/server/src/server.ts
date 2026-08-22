@@ -1302,7 +1302,7 @@ export default async function startServer(options?: {
 	// API-key-poller path — a minimax account's 'seven_day' window would
 	// otherwise never reach the ledger. Internally resilient: see
 	// UsageWindowLedger.observeSnapshot's per-window try/catch.
-	const usageWindowLedger = new UsageWindowLedger(dbOps);
+	const usageWindowLedger = new UsageWindowLedger(dbOps, alertService);
 
 	// Shared successful-poll snapshot dispatch for the API-key pollers
 	// (nanogpt/zai/kilo/minimax): history persistence + usage-window alert

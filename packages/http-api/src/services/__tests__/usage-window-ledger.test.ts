@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { LIST_PRICE_ERAS, VALUE_PRICING_VERSION } from "@better-ccflare/core";
-import { DatabaseOperations } from "@better-ccflare/database";
+import { DatabaseOperations, type UsageWindow } from "@better-ccflare/database";
 import type { CanonicalUsageWindow } from "@better-ccflare/types";
+import type { AlertService } from "../alerts";
 import { UsageWindowLedger } from "../usage-window-ledger";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -85,6 +86,35 @@ async function seedRequest(
 			opts.outputTokens ?? 0,
 		],
 	);
+}
+
+async function seedAccount(
+	dbOps: DatabaseOperations,
+	opts: { id: string; name: string; createdAt?: number },
+): Promise<void> {
+	await dbOps
+		.getAdapter()
+		.run(`INSERT INTO accounts (id, name, created_at) VALUES (?, ?, ?)`, [
+			opts.id,
+			opts.name,
+			opts.createdAt ?? 0,
+		]);
+}
+
+/** Minimal AlertService double for wiring tests below — only
+ * evaluateClosedWindow is exercised by UsageWindowLedger, so nothing else
+ * on the real class needs a fake. */
+function fakeAlertService(
+	impl: (window: UsageWindow, accountName: string) => Promise<void>,
+): { service: AlertService; calls: Array<[UsageWindow, string]> } {
+	const calls: Array<[UsageWindow, string]> = [];
+	const service = {
+		evaluateClosedWindow: async (window: UsageWindow, accountName: string) => {
+			calls.push([window, accountName]);
+			await impl(window, accountName);
+		},
+	} as unknown as AlertService;
+	return { service, calls };
 }
 
 describe("UsageWindowLedger", () => {
@@ -379,6 +409,137 @@ describe("UsageWindowLedger", () => {
 		await expect(
 			ledger.observeSnapshot(ACCOUNT_ID, [sevenDay(10, -1)], t0),
 		).resolves.toBeUndefined();
+	});
+});
+
+describe("UsageWindowLedger alertService wiring", () => {
+	let dbOps: DatabaseOperations;
+
+	beforeEach(() => {
+		dbOps = new DatabaseOperations(":memory:", { walMode: false });
+	});
+
+	afterEach(async () => {
+		await dbOps.dispose();
+	});
+
+	it("invokes alertService.evaluateClosedWindow with the closed window and the account's current name after a successful close", async () => {
+		await seedAccount(dbOps, { id: ACCOUNT_ID, name: "Primary account" });
+		const { service, calls } = fakeAlertService(async () => {});
+		const ledger = new UsageWindowLedger(dbOps, service);
+
+		const startedAt = Date.parse("2026-08-10T00:00:00Z");
+		const closedAt = startedAt + 7 * DAY_MS;
+		const opened = await dbOps.openUsageWindow({
+			accountId: ACCOUNT_ID,
+			windowKey: "seven_day",
+			startedAt,
+			resetsAt: closedAt,
+			grantType: "natural",
+		});
+
+		const closedOk = await ledger.closeAndValue(opened, closedAt);
+		expect(closedOk).toBe(true);
+
+		expect(calls).toHaveLength(1);
+		const [closedWindow, accountName] = calls[0];
+		expect(accountName).toBe("Primary account");
+		expect(closedWindow.id).toBe(opened.id);
+		expect(closedWindow.closedAt).toBe(closedAt);
+		expect(closedWindow.valueUsd).toBe(0);
+	});
+
+	it("falls back to the accountId when no accounts row exists", async () => {
+		// No seedAccount call — dbOps.getAccount returns null for an unknown id.
+		const { service, calls } = fakeAlertService(async () => {});
+		const ledger = new UsageWindowLedger(dbOps, service);
+
+		const startedAt = Date.parse("2026-08-10T00:00:00Z");
+		const closedAt = startedAt + 7 * DAY_MS;
+		const opened = await dbOps.openUsageWindow({
+			accountId: ACCOUNT_ID,
+			windowKey: "seven_day",
+			startedAt,
+			resetsAt: closedAt,
+			grantType: "natural",
+		});
+
+		await ledger.closeAndValue(opened, closedAt);
+
+		expect(calls).toHaveLength(1);
+		expect(calls[0][1]).toBe(ACCOUNT_ID);
+	});
+
+	it("does not invoke alertService on a no-op close (window already closed)", async () => {
+		await seedAccount(dbOps, { id: ACCOUNT_ID, name: "Primary account" });
+		const { service, calls } = fakeAlertService(async () => {});
+		const ledger = new UsageWindowLedger(dbOps, service);
+
+		const startedAt = Date.parse("2026-08-10T00:00:00Z");
+		const closedAt = startedAt + 7 * DAY_MS;
+		const opened = await dbOps.openUsageWindow({
+			accountId: ACCOUNT_ID,
+			windowKey: "seven_day",
+			startedAt,
+			resetsAt: closedAt,
+			grantType: "natural",
+		});
+
+		const firstClose = await ledger.closeAndValue(opened, closedAt);
+		expect(firstClose).toBe(true);
+		// Second close of the same already-closed window is a no-op
+		// (UsageWindowsRepository.closeWindow guards on closed_at IS NULL).
+		const secondClose = await ledger.closeAndValue(opened, closedAt + 1_000);
+		expect(secondClose).toBe(false);
+
+		expect(calls).toHaveLength(1);
+	});
+
+	it("isolates an alertService failure from the close path — closeAndValue still succeeds and does not throw", async () => {
+		await seedAccount(dbOps, { id: ACCOUNT_ID, name: "Primary account" });
+		const { service, calls } = fakeAlertService(async () => {
+			throw new Error("boom: alert evaluation exploded");
+		});
+		const ledger = new UsageWindowLedger(dbOps, service);
+
+		const startedAt = Date.parse("2026-08-10T00:00:00Z");
+		const closedAt = startedAt + 7 * DAY_MS;
+		const opened = await dbOps.openUsageWindow({
+			accountId: ACCOUNT_ID,
+			windowKey: "seven_day",
+			startedAt,
+			resetsAt: closedAt,
+			grantType: "natural",
+		});
+
+		let closedOk: boolean | undefined;
+		await expect(
+			(async () => {
+				closedOk = await ledger.closeAndValue(opened, closedAt);
+			})(),
+		).resolves.toBeUndefined();
+
+		expect(closedOk).toBe(true);
+		expect(calls).toHaveLength(1);
+
+		// The window itself is genuinely closed in the DB despite the alert
+		// failure — the failure isolation must not roll back or skip the close.
+		const windows = await dbOps.listUsageWindows({ accountId: ACCOUNT_ID });
+		expect(windows[0]?.closedAt).toBe(closedAt);
+	});
+
+	it("does not require an alertService at all (backward compatible)", async () => {
+		const ledger = new UsageWindowLedger(dbOps);
+		const startedAt = Date.parse("2026-08-10T00:00:00Z");
+		const closedAt = startedAt + 7 * DAY_MS;
+		const opened = await dbOps.openUsageWindow({
+			accountId: ACCOUNT_ID,
+			windowKey: "seven_day",
+			startedAt,
+			resetsAt: closedAt,
+			grantType: "natural",
+		});
+		await expect(ledger.closeAndValue(opened, closedAt)).resolves.toBe(true);
 	});
 });
 

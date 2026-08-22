@@ -5,6 +5,7 @@ import {
 import type { DatabaseOperations, UsageWindow } from "@better-ccflare/database";
 import { Logger } from "@better-ccflare/logger";
 import type { CanonicalUsageWindow } from "@better-ccflare/types";
+import type { AlertService } from "./alerts";
 
 const log = new Logger("UsageWindowLedger");
 
@@ -41,9 +42,20 @@ const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
  * `evaluateUsageSnapshot`. Every public entry point mirrors AlertService's
  * resilience contract: a single window's failure is logged and swallowed,
  * never allowed to break the poll loop or take down sibling accounts/windows.
+ *
+ * `alertService` is optional (mirrors this class's own tests, which
+ * construct it without one) and drives the `usage_window_value_drop` alert
+ * (issue #252, task P1.6): closeAndValue calls back into
+ * `alertService.evaluateClosedWindow` right after a successful close, with
+ * the same swallow-and-log isolation as every other window-level failure in
+ * this class — an alert failure must never surface as a closeAndValue
+ * failure.
  */
 export class UsageWindowLedger {
-	constructor(private readonly dbOps: DatabaseOperations) {}
+	constructor(
+		private readonly dbOps: DatabaseOperations,
+		private readonly alertService?: AlertService,
+	) {}
 
 	/**
 	 * Processes one poll's worth of canonical usage windows for `accountId`.
@@ -186,7 +198,7 @@ export class UsageWindowLedger {
 			upperBoundMs,
 		);
 		const valuation = valueWindowAggregates(aggregates, window.startedAt);
-		return this.dbOps.closeUsageWindow(window.id, {
+		const closeInput = {
 			closedAt: closedAtMs,
 			valueUsd: valuation.valueUsd,
 			inputTokens: valuation.inputTokens,
@@ -197,6 +209,38 @@ export class UsageWindowLedger {
 			modelBreakdown: valuation.modelBreakdown,
 			unpricedTokens: valuation.unpricedTokens,
 			projectionVersion: VALUE_PRICING_VERSION,
-		});
+		};
+		const closed = await this.dbOps.closeUsageWindow(window.id, closeInput);
+		if (closed && this.alertService) {
+			// Isolation, not detachment: awaited so the guarantee ("an alert
+			// failure must never break the ledger") is deterministic and
+			// testable, matching observeWindow's own try/catch above rather
+			// than an un-awaited promise this class can't otherwise observe.
+			try {
+				const closedWindow: UsageWindow = { ...window, ...closeInput };
+				await this.notifyClosedWindow(closedWindow);
+			} catch (error) {
+				log.warn(
+					`usage_window_value_drop evaluation failed for account ${window.accountId} window ${window.id}: ${error}`,
+				);
+			}
+		}
+		return closed;
+	}
+
+	/**
+	 * Resolves the account's CURRENT name (not a closure-captured one — the
+	 * same "resolve at dispatch" rule server.ts's alert-evaluation callback
+	 * already follows for usage_window_threshold/usage_window_exhaustion_
+	 * projected) and hands the closed window to AlertService for the
+	 * usage_window_value_drop evaluation.
+	 */
+	private async notifyClosedWindow(closedWindow: UsageWindow): Promise<void> {
+		if (!this.alertService) return;
+		const account = await this.dbOps.getAccount(closedWindow.accountId);
+		await this.alertService.evaluateClosedWindow(
+			closedWindow,
+			account?.name ?? closedWindow.accountId,
+		);
 	}
 }

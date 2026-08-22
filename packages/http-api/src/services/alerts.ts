@@ -13,7 +13,7 @@ import {
 	type RequestEvt,
 	requestEvents,
 } from "@better-ccflare/core";
-import type { BunSqlAdapter } from "@better-ccflare/database";
+import type { BunSqlAdapter, UsageWindow } from "@better-ccflare/database";
 import { Logger } from "@better-ccflare/logger";
 import type {
 	AlertEvent,
@@ -45,6 +45,73 @@ const USAGE_WINDOW_EXHAUSTION_MIN_UTILIZATION = 50;
  * segmentation inside computeUsagePrediction still cuts to the current
  * window via resets_at, so over-fetching here is safe, just wasted rows. */
 const USAGE_WINDOW_HISTORY_FALLBACK_LOOKBACK_MS = 8 * 24 * 60 * 60 * 1000;
+
+/**
+ * Config key backing usageWindowValueDropThreshold. Read/written through
+ * Config's generic get/set rather than a dedicated typed getter/setter like
+ * every other alert threshold in this file — packages/config is out of
+ * scope for the Window Value Ledger's alert work (issue #252, task P1.6),
+ * and Config.get/set is itself an established pattern for settings that
+ * skip a bespoke accessor (see e.g. `retry_attempts` in apps/server/src/
+ * server.ts). See getUsageWindowValueDropThreshold below.
+ */
+const ALERT_USAGE_WINDOW_VALUE_DROP_THRESHOLD_KEY =
+	"alert_usage_window_value_drop_threshold";
+/** Default fraction (25%) a closed window's value must fall below the
+ * median of its priced prior closed siblings before usage_window_value_drop
+ * fires. */
+const DEFAULT_USAGE_WINDOW_VALUE_DROP_THRESHOLD = 0.25;
+/** How many of the most recent priced closed windows feed the median. */
+const USAGE_WINDOW_VALUE_DROP_PRIOR_LIMIT = 8;
+/** Fewer priced priors than this and there is no meaningful median to
+ * compare against — evaluateClosedWindow never fires (issue #252's planted
+ * negative: "usage_window_value_drop must not fire with <2 priors"). */
+const USAGE_WINDOW_VALUE_DROP_MIN_PRIORS = 2;
+
+function clampUnitFraction(value: number): number {
+	if (!Number.isFinite(value)) {
+		return DEFAULT_USAGE_WINDOW_VALUE_DROP_THRESHOLD;
+	}
+	return Math.max(0, Math.min(1, value));
+}
+
+function getUsageWindowValueDropThreshold(config: Config): number {
+	const fromEnv = process.env.ALERT_USAGE_WINDOW_VALUE_DROP_THRESHOLD;
+	if (fromEnv) {
+		const parsed = Number.parseFloat(fromEnv);
+		if (!Number.isNaN(parsed)) return clampUnitFraction(parsed);
+	}
+	const raw = config.get(
+		ALERT_USAGE_WINDOW_VALUE_DROP_THRESHOLD_KEY,
+		DEFAULT_USAGE_WINDOW_VALUE_DROP_THRESHOLD,
+	);
+	return typeof raw === "number"
+		? clampUnitFraction(raw)
+		: DEFAULT_USAGE_WINDOW_VALUE_DROP_THRESHOLD;
+}
+
+function setUsageWindowValueDropThreshold(config: Config, value: number): void {
+	config.set(
+		ALERT_USAGE_WINDOW_VALUE_DROP_THRESHOLD_KEY,
+		clampUnitFraction(value),
+	);
+}
+
+/** Mirrors the median helper in packages/core/src/cache-metrics.ts:122 —
+ * that one is module-private (not exported), so it is copied rather than
+ * imported (avoids a speculative cross-package cycle for one tiny function).
+ * `sortedValues` must already be ascending. */
+function median(sortedValues: readonly number[]): number | null {
+	if (sortedValues.length === 0) return null;
+	const midpoint = sortedValues.length / 2;
+	if (Number.isInteger(midpoint)) {
+		const lower = sortedValues[midpoint - 1];
+		const upper = sortedValues[midpoint];
+		if (lower === undefined || upper === undefined) return null;
+		return (lower + upper) / 2;
+	}
+	return sortedValues[Math.floor(midpoint)] ?? null;
+}
 
 interface AlertRow {
 	id: string;
@@ -96,6 +163,7 @@ export function getAlertsConfig(config: Config): AlertsConfigPayload {
 		tokensPerHour: config.getAlertTokensPerHour(),
 		requestTokens: config.getAlertRequestTokens(),
 		usageWindowThresholdPercent: config.getAlertUsageWindowThresholdPercent(),
+		usageWindowValueDropThreshold: getUsageWindowValueDropThreshold(config),
 		anomalyEnabled: config.getAlertAnomalyEnabled(),
 		anomalyIntervalMinutes: config.getAlertAnomalyIntervalMinutes(),
 		loopMinRequests: config.getAlertAnomalyLoopMinRequests(),
@@ -118,6 +186,12 @@ export function setAlertsConfig(
 	config.setAlertUsageWindowThresholdPercent(
 		payload.usageWindowThresholdPercent,
 	);
+	if (payload.usageWindowValueDropThreshold !== undefined) {
+		setUsageWindowValueDropThreshold(
+			config,
+			payload.usageWindowValueDropThreshold,
+		);
+	}
 	config.setAlertAnomalyEnabled(payload.anomalyEnabled);
 	config.setAlertAnomalyIntervalMinutes(payload.anomalyIntervalMinutes);
 	config.setAlertAnomalyLoopMinRequests(payload.loopMinRequests);
@@ -185,7 +259,10 @@ export function extractUsageWindows(
  * advances to the next cycle.
  */
 export function buildUsageWindowAlertId(
-	type: "usage_window_threshold" | "usage_window_exhaustion_projected",
+	type:
+		| "usage_window_threshold"
+		| "usage_window_exhaustion_projected"
+		| "usage_window_value_drop",
 	accountId: string,
 	windowKey: string,
 	resetsAtMs: number,
@@ -194,6 +271,9 @@ export function buildUsageWindowAlertId(
 	 * consumes the cycle's one id and the later 100% critical escalation is
 	 * silently deduped away (pro-gate finding). Threshold alerts pass
 	 * "warning" | "critical"; the projection type has a single stage.
+	 * usage_window_value_drop also uses the "single" default — a closed
+	 * window's resetsAt never changes again, so there is no escalation
+	 * sequence to distinguish.
 	 */
 	stage = "single",
 ): string {
@@ -759,6 +839,83 @@ export class AlertService {
 			requestId: null,
 			acknowledged: false,
 		};
+	}
+
+	/**
+	 * Evaluates the `usage_window_value_drop` alert for one just-CLOSED
+	 * usage window (issue #252's Window Value Ledger). Called by
+	 * UsageWindowLedger.closeAndValue immediately after a successful close;
+	 * `window` already carries the final valueUsd/grantType/aggregates that
+	 * close produced, so this method never re-reads the just-closed row —
+	 * it only queries PRIOR closed siblings, excluded by `id` (not by
+	 * position/value), so a `closed_at` tie can never accidentally
+	 * include/exclude the wrong row.
+	 *
+	 * Needs at least USAGE_WINDOW_VALUE_DROP_MIN_PRIORS (2) priced prior
+	 * closed windows to have a meaningful median; with fewer, this never
+	 * fires. Fires when `window.valueUsd < median * (1 - threshold)`, using
+	 * the configured (or default 0.25) usageWindowValueDropThreshold.
+	 *
+	 * Dedup id is (type, accountId, windowKey, resetsAtMs) via
+	 * buildUsageWindowAlertId — a closed window's resetsAt is fixed
+	 * forever, so persistAndEmit's INSERT OR IGNORE guarantees the SAME
+	 * closed window can never alert twice even if this method is invoked
+	 * for it repeatedly (e.g. a retried close).
+	 */
+	async evaluateClosedWindow(
+		window: UsageWindow,
+		accountName: string,
+	): Promise<void> {
+		if (window.valueUsd == null) return;
+		const config = getAlertsConfig(this.config);
+		const threshold =
+			config.usageWindowValueDropThreshold ??
+			DEFAULT_USAGE_WINDOW_VALUE_DROP_THRESHOLD;
+		const priorRows = await this.db.query<{ value_usd: number }>(
+			`SELECT value_usd FROM usage_windows
+			 WHERE account_id = ? AND window_key = ? AND id != ?
+			   AND closed_at IS NOT NULL AND value_usd IS NOT NULL
+			 ORDER BY closed_at DESC LIMIT ?`,
+			[
+				window.accountId,
+				window.windowKey,
+				window.id,
+				USAGE_WINDOW_VALUE_DROP_PRIOR_LIMIT,
+			],
+		);
+		if (priorRows.length < USAGE_WINDOW_VALUE_DROP_MIN_PRIORS) return;
+		const priors = priorRows
+			.map((row) => Number(row.value_usd))
+			.sort((a, b) => a - b);
+		const med = median(priors);
+		if (med == null) return;
+		const closedValue = window.valueUsd;
+		const dropFloor = med * (1 - threshold);
+		if (!(closedValue < dropFloor)) return;
+		const percentBelow = med > 0 ? ((med - closedValue) / med) * 100 : 100;
+		const alert: AlertEvent = {
+			id: buildUsageWindowAlertId(
+				"usage_window_value_drop",
+				window.accountId,
+				window.windowKey,
+				window.resetsAt,
+			),
+			timestamp: window.closedAt ?? Date.now(),
+			type: "usage_window_value_drop",
+			severity: "warning",
+			title: "Usage window value dropped",
+			message: `Account ${accountName}'s ${window.windowKey} usage window (${new Date(
+				window.startedAt,
+			).toISOString()} to ${new Date(window.resetsAt).toISOString()}) closed at $${closedValue.toFixed(2)}, ${percentBelow.toFixed(1)}% below the $${med.toFixed(2)} median of its last ${priors.length} priced closed windows (grant_type: ${window.grantType}).`,
+			value: closedValue,
+			threshold,
+			account: accountName,
+			model: null,
+			project: null,
+			requestId: null,
+			acknowledged: false,
+		};
+		await this.persistAndEmit(alert, config.webhookUrl);
 	}
 
 	async listAlerts(limit = 100): Promise<AlertEvent[]> {
