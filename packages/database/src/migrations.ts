@@ -734,6 +734,43 @@ export function ensureSchema(db: Database): void {
 		`CREATE INDEX IF NOT EXISTS idx_usage_snapshots_ts ON usage_snapshots(timestamp)`,
 	);
 
+	// Create usage_windows table: one row per derived provider usage window
+	// (e.g. one five_hour cycle), closed out with its final value/aggregates
+	// once the window rolls over. Distinct from usage_snapshots (a raw
+	// utilization time series) — this is the settled-window ledger that
+	// backs the Window Value Ledger feature (issue #252).
+	db.run(`
+		CREATE TABLE IF NOT EXISTS usage_windows (
+			id TEXT PRIMARY KEY,
+			account_id TEXT NOT NULL,
+			window_key TEXT NOT NULL,
+			started_at INTEGER NOT NULL,
+			resets_at INTEGER NOT NULL,
+			closed_at INTEGER,
+			grant_type TEXT NOT NULL CHECK (grant_type IN ('natural', 'early_reset', 'first_observed')),
+			peak_utilization REAL NOT NULL DEFAULT 0,
+			first_100_at INTEGER,
+			value_usd REAL,
+			input_tokens INTEGER,
+			cache_read_input_tokens INTEGER,
+			cache_creation_input_tokens INTEGER,
+			output_tokens INTEGER,
+			request_count INTEGER,
+			model_breakdown TEXT,
+			unpriced_tokens INTEGER,
+			projection_version TEXT
+		)
+	`);
+	// Idempotent backfill anchor: (account_id, window_key, resets_at)
+	// uniquely identifies one canonical window cluster representative, so a
+	// re-poll can INSERT ... ON CONFLICT DO NOTHING against it safely.
+	db.run(
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_windows_unique ON usage_windows(account_id, window_key, resets_at)`,
+	);
+	db.run(
+		`CREATE INDEX IF NOT EXISTS idx_usage_windows_closed ON usage_windows(account_id, window_key, closed_at)`,
+	);
+
 	// Dedicated privacy-safe cache flight recorder storage. Conversation rows
 	// carry retention and health metadata; turn rows contain only TurnEvidence.
 	db.run(`
