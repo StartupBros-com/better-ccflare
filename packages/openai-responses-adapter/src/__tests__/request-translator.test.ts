@@ -915,4 +915,88 @@ describe("translateRequestToAnthropic", () => {
 			{ type: "tool_use", id: "call_sh", name: "local_shell", input: {} },
 		]);
 	});
+
+	test("local_shell_call with a non-object action coerces input to an empty object", () => {
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "local_shell_call",
+					call_id: "call_sh",
+					// biome-ignore lint/suspicious/noExplicitAny: exercising runtime-malformed input whose action is a bare string, not an object
+					action: "ls -la" as any,
+				},
+			],
+		};
+		const result = translateRequestToAnthropic(req);
+		expect(result.messages).toHaveLength(1);
+		expect(result.messages[0].role).toBe("assistant");
+		expect(result.messages[0].content).toEqual([
+			{ type: "tool_use", id: "call_sh", name: "local_shell", input: {} },
+		]);
+	});
+
+	test("message with a non-array content is dropped without throwing, warns with the role", () => {
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "message",
+					role: "user",
+					// biome-ignore lint/suspicious/noExplicitAny: exercising runtime-malformed input whose content is not an array
+				} as any,
+			],
+		};
+		let result: ReturnType<typeof translateRequestToAnthropic> | undefined;
+		const warnings = captureWarnings(() => {
+			expect(() => {
+				result = translateRequestToAnthropic(req);
+			}).not.toThrow();
+		});
+		expect(result?.messages).toHaveLength(0);
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0].msg).toContain("message");
+		expect(warnings[0].msg).toContain("user");
+	});
+
+	test("function_call with an empty-string call_id is dropped with a warning", () => {
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "function_call",
+					call_id: "",
+					name: "get_weather",
+					arguments: "{}",
+				},
+			],
+		};
+		const warnings = captureWarnings(() => {
+			const result = translateRequestToAnthropic(req);
+			expect(result.messages).toHaveLength(0);
+		});
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0].msg).toContain("function_call");
+		expect(warnings[0].msg).toContain("no usable call_id");
+	});
+
+	test("function_call_output with an empty-string call_id is dropped with a warning", () => {
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "function_call_output",
+					call_id: "",
+					output: "result",
+				},
+			],
+		};
+		const warnings = captureWarnings(() => {
+			const result = translateRequestToAnthropic(req);
+			expect(result.messages).toHaveLength(0);
+		});
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0].msg).toContain("function_call_output");
+		expect(warnings[0].msg).toContain("no usable call_id");
+	});
 });

@@ -163,6 +163,15 @@ export function translateRequestToAnthropic(
 		const itemType = item.type;
 
 		if (item.type === "message") {
+			// Guard runtime-malformed input: content is type-required, but a
+			// non-array (undefined/null) here would throw on the .map below and
+			// fail the whole request — drop-with-warn instead, as agent_message does.
+			if (!Array.isArray(item.content)) {
+				logger.warn(
+					`Dropping message with role "${item.role}" — content is not an array, cannot translate`,
+				);
+				continue;
+			}
 			const content: AnthropicContent[] = item.content.map((c) =>
 				translateContentItem(c),
 			);
@@ -180,6 +189,16 @@ export function translateRequestToAnthropic(
 		}
 
 		if (item.type === "function_call" || item.type === "custom_tool_call") {
+			// call_id is the sole pairing key with the matching *_output item
+			// (its type has no `id` fallback), so an empty-string call_id would
+			// emit a tool_use whose id collides with any other empty-id call and
+			// can never pair with its result — drop-with-warn instead.
+			if (!item.call_id) {
+				logger.warn(
+					`Dropping ${item.type} with no usable call_id — cannot fabricate a tool_use id`,
+				);
+				continue;
+			}
 			const toolUseBlock: AnthropicContent = {
 				type: "tool_use",
 				id: item.call_id,
@@ -194,6 +213,14 @@ export function translateRequestToAnthropic(
 			item.type === "function_call_output" ||
 			item.type === "custom_tool_call_output"
 		) {
+			// Empty-string call_id would emit a tool_result whose tool_use_id can
+			// never match a real tool_use block (mirrors the call-side guard above).
+			if (!item.call_id) {
+				logger.warn(
+					`Dropping ${item.type} with no usable call_id — cannot map to a tool_result`,
+				);
+				continue;
+			}
 			messages.push({
 				role: "user",
 				content: [
@@ -218,13 +245,21 @@ export function translateRequestToAnthropic(
 				);
 				continue;
 			}
+			// action is type-required, but runtime-malformed input can omit it or
+			// send a non-object (e.g. a bare command string); Anthropic
+			// tool_use.input must be a JSON object, so coerce anything else to {}.
+			const rawAction: unknown = item.action;
+			const input =
+				rawAction !== null &&
+				typeof rawAction === "object" &&
+				!Array.isArray(rawAction)
+					? rawAction
+					: {};
 			const toolUseBlock: AnthropicContent = {
 				type: "tool_use",
 				id: toolUseId,
 				name: "local_shell",
-				// `?? {}` guards against runtime-malformed input missing the
-				// (type-required) action: Anthropic tool_use.input must be an object.
-				input: item.action ?? {},
+				input,
 			};
 			appendAssistantBlock(messages, toolUseBlock);
 			continue;
