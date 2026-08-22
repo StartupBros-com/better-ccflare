@@ -145,6 +145,7 @@ import {
 	createTokenHealthHandler,
 } from "./handlers/token-health";
 import { createUsageHistoryHandler } from "./handlers/usage-history";
+import { createUsageWindowsHandler } from "./handlers/usage-windows";
 import { createVersionCheckHandler } from "./handlers/version";
 import { AuthService } from "./services/auth-service";
 import type { DeviceSetupCoordinator } from "./services/device-setup-jobs";
@@ -253,6 +254,7 @@ export class APIRouter {
 		const logsHistoryHandler = createLogsHistoryHandler();
 		const analyticsHandler = createAnalyticsHandler(this.context);
 		const usageHistoryHandler = createUsageHistoryHandler(this.context);
+		const usageWindowsHandler = createUsageWindowsHandler(this.context);
 		const cacheInsightsHandler = createCacheInsightsHandler(this.context);
 		const cacheParityHandler = createCacheParityHandler(this.context);
 		const anomalyInsightsHandler = createAnomalyInsightsHandler(this.context);
@@ -481,6 +483,9 @@ export class APIRouter {
 		});
 		this.handlers.set("GET:/api/usage-history", (_req, url) =>
 			usageHistoryHandler(url.searchParams),
+		);
+		this.handlers.set("GET:/api/usage-windows", (_req, url) =>
+			usageWindowsHandler(url.searchParams),
 		);
 		this.handlers.set("GET:/api/insights/cache", (_req, url) =>
 			cacheInsightsHandler(url.searchParams),
