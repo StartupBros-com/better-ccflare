@@ -18,6 +18,7 @@
 		"@better-ccflare/core-di": "workspace:*",
 		"@better-ccflare/config": "workspace:*",
 		"@better-ccflare/database": "workspace:*",
+		"@better-ccflare/http-api": "workspace:*",
 		"@better-ccflare/providers": "workspace:*",
 		"@better-ccflare/oauth-flow": "workspace:*",
 		"@better-ccflare/types": "workspace:*",

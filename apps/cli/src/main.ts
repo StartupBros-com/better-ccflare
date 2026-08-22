@@ -182,6 +182,9 @@ ${getManagedRoutingHelpText()}
     --json             Emit exactly one structured JSON object
   --reset-stats        Reset usage statistics
   --clear-history      Clear request history
+  --rebuild-windows    Rebuild usage_windows from raw usage_snapshots history
+    --since <date>        Only replay snapshots at/after this date (YYYY-MM-DD)
+    --dry-run              Report what would change; write nothing
   --compact            Compact database (WAL checkpoint + VACUUM)
   --get-model          Show current default agent model
   --set-model <model>  Set default agent model (opus-4 or sonnet-4)
@@ -207,6 +210,8 @@ Examples:
   better-ccflare --force-reset-rate-limit work  # Force-clear stale rate-limit lock
   better-ccflare --pause work           # Pause account
   better-ccflare --analyze              # Run performance analysis
+  better-ccflare --rebuild-windows --dry-run  # Preview rebuilt usage windows without writing
+  better-ccflare --rebuild-windows --since 2026-08-01  # Rebuild windows from a start date
   better-ccflare --stats                # View stats
   better-ccflare --generate-api-key "My App"  # Generate API-only key
   better-ccflare --generate-api-key "Admin Key" --admin  # Generate admin key
@@ -259,6 +264,9 @@ interface ParsedArgs {
 	json: boolean;
 	resetStats: boolean;
 	clearHistory: boolean;
+	rebuildWindows: boolean;
+	rebuildWindowsSince: number | null;
+	rebuildWindowsDryRun: boolean;
 	compact: boolean;
 	getModel: boolean;
 	setModel: string | null;
@@ -628,6 +636,9 @@ function parseArgs(args: string[]): ParsedArgs {
 		json: false,
 		resetStats: false,
 		clearHistory: false,
+		rebuildWindows: false,
+		rebuildWindowsSince: null,
+		rebuildWindowsDryRun: false,
 		compact: false,
 		getModel: false,
 		setModel: null,
@@ -877,6 +888,30 @@ function parseArgs(args: string[]): ParsedArgs {
 				break;
 			case "--clear-history":
 				parsed.clearHistory = true;
+				break;
+			case "--rebuild-windows":
+				parsed.rebuildWindows = true;
+				break;
+			case "--since": {
+				if (i + 1 >= args.length || args[i + 1].startsWith("--")) {
+					console.error("❌ --since requires a date (YYYY-MM-DD)");
+					fastExit(1);
+				}
+				const raw = args[++i];
+				const sinceMs = /^\d{4}-\d{2}-\d{2}$/.test(raw)
+					? Date.parse(`${raw}T00:00:00.000Z`)
+					: NaN;
+				if (Number.isNaN(sinceMs)) {
+					console.error(
+						`❌ Invalid --since date: ${raw} (expected YYYY-MM-DD)`,
+					);
+					fastExit(1);
+				}
+				parsed.rebuildWindowsSince = sinceMs;
+				break;
+			}
+			case "--dry-run":
+				parsed.rebuildWindowsDryRun = true;
 				break;
 			case "--compact":
 				parsed.compact = true;
@@ -1224,6 +1259,7 @@ async function main() {
 		forceResetRateLimit,
 		formatApiKeyForDisplay,
 		formatApiKeyGenerationResult,
+		formatRebuildWindowsReport,
 		generateApiKey,
 		getAccountsList,
 		getApiKeyStats,
@@ -1231,6 +1267,7 @@ async function main() {
 		listApiKeys,
 		pauseAccount,
 		reauthenticateAccount,
+		rebuildWindows: runRebuildWindows,
 		removeAccount,
 		resetAllStats,
 		resumeAccount,
@@ -1663,6 +1700,15 @@ async function main() {
 
 	if (parsed.resolveFamilyPolicyAliases) {
 		await resolveFamilyPolicyAliases(dbOps);
+		await exitGracefully(0);
+	}
+
+	if (parsed.rebuildWindows) {
+		const result = await runRebuildWindows(dbOps, {
+			sinceMs: parsed.rebuildWindowsSince ?? undefined,
+			dryRun: parsed.rebuildWindowsDryRun,
+		});
+		console.log(formatRebuildWindowsReport(result));
 		await exitGracefully(0);
 	}
 

@@ -8,6 +8,7 @@ export * from "./commands/database-repair";
 export * from "./commands/help";
 export * from "./commands/managed-routing";
 export * from "./commands/managed-routing-client";
+export * from "./commands/rebuild-windows";
 export * from "./commands/stats";
 
 // Export prompts
