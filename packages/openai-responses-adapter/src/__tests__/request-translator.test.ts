@@ -1342,4 +1342,170 @@ describe("translateRequestToAnthropic", () => {
 		};
 		expect(toolUse.id).toBe("call_abc123");
 	});
+
+	// --- P1 finding #1: quadratic tool-ID collision resolution ---
+
+	test("many call_ids sanitizing to the same candidate all get distinct, grammar-valid emitted ids", () => {
+		// Each call_id embeds a distinct single Unicode symbol (code points
+		// starting at U+2200, "FOR ALL") that is grammar-invalid per
+		// ANTHROPIC_TOOL_ID_RE. Sanitization replaces any single disallowed
+		// char with one "_", so every call_id below — despite being pairwise
+		// distinct originals — collapses to the identical sanitized candidate
+		// ("call_1"), forcing the collision-resolution path on every item.
+		const count = 50;
+		const collidingInput = Array.from({ length: count }, (_, i) => ({
+			type: "function_call" as const,
+			call_id: `call${String.fromCodePoint(0x2200 + i)}1`,
+			name: "get_weather",
+			arguments: "{}",
+		}));
+		// Sanity check on the fixture itself: all originals distinct, all
+		// sanitize to the same candidate.
+		expect(new Set(collidingInput.map((i) => i.call_id)).size).toBe(count);
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: collidingInput,
+		};
+		const result = translateRequestToAnthropic(req);
+		expect(result.messages).toHaveLength(1);
+		expect(result.messages[0].content).toHaveLength(count);
+		const ids = result.messages[0].content.map((c) => {
+			const block = c as { type: string; id: string };
+			expect(block.type).toBe("tool_use");
+			expect(block.id).toMatch(/^[A-Za-z0-9_-]+$/);
+			return block.id;
+		});
+		expect(new Set(ids).size).toBe(count);
+	});
+
+	test("tool_use/tool_result pairing survives id sanitization under collision (call_id 'call:1')", () => {
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "function_call",
+					call_id: "call:1",
+					name: "get_weather",
+					arguments: "{}",
+				},
+				{
+					type: "function_call_output",
+					call_id: "call:1",
+					output: "ok",
+				},
+			],
+		};
+		const result = translateRequestToAnthropic(req);
+		const toolUse = result.messages[0].content[0] as {
+			type: string;
+			id: string;
+		};
+		const toolResult = result.messages[1].content[0] as {
+			type: string;
+			tool_use_id: string;
+		};
+		expect(toolUse.id).toBe(toolResult.tool_use_id);
+	});
+
+	// --- P1 finding #2: object-shaped malformed content bypasses validation ---
+
+	test("message content with a non-string (number) text is dropped with no non-string text emitted, warns once", () => {
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "message",
+					role: "user",
+					content: [
+						// biome-ignore lint/suspicious/noExplicitAny: exercising a runtime-malformed content part (non-string text)
+						{ type: "input_text", text: 1 } as any,
+					],
+				},
+			],
+		};
+		const warnings = captureWarnings(() => {
+			const result = translateRequestToAnthropic(req);
+			expect(result.messages).toHaveLength(0);
+		});
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0].msg).toContain("invalid");
+	});
+
+	test("message content with one valid text part and one non-string ({}) text part keeps only the valid part, warns once", () => {
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "message",
+					role: "user",
+					content: [
+						{ type: "input_text", text: "ok" },
+						// biome-ignore lint/suspicious/noExplicitAny: exercising a runtime-malformed content part (non-string text)
+						{ type: "input_text", text: {} } as any,
+					],
+				},
+			],
+		};
+		const warnings = captureWarnings(() => {
+			const result = translateRequestToAnthropic(req);
+			expect(result.messages).toHaveLength(1);
+			expect(result.messages[0].content).toEqual([
+				{ type: "text", text: "ok" },
+			]);
+		});
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0].msg).toContain("invalid");
+	});
+
+	test("many unknown-type content parts in one message produce exactly one batched reject warning, not one per element", () => {
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "message",
+					role: "user",
+					content: [
+						// biome-ignore lint/suspicious/noExplicitAny: exercising runtime-malformed content parts (unknown type)
+						{ type: "nope" } as any,
+						// biome-ignore lint/suspicious/noExplicitAny: exercising runtime-malformed content parts (unknown type)
+						{ type: "nope" } as any,
+						// biome-ignore lint/suspicious/noExplicitAny: exercising runtime-malformed content parts (unknown type)
+						{ type: "nope" } as any,
+					],
+				},
+			],
+		};
+		const warnings = captureWarnings(() => {
+			const result = translateRequestToAnthropic(req);
+			expect(result.messages).toHaveLength(0);
+		});
+		const rejectWarnings = warnings.filter((w) => w.msg.includes("invalid"));
+		expect(rejectWarnings).toHaveLength(1);
+	});
+
+	test("unknown content type is dropped entirely (no empty text block emitted), keeps the valid sibling part", () => {
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "message",
+					role: "user",
+					content: [
+						// biome-ignore lint/suspicious/noExplicitAny: exercising a runtime-malformed content part (unknown type)
+						{ type: "weird" } as any,
+						{ type: "input_text", text: "hi" },
+					],
+				},
+			],
+		};
+		const warnings = captureWarnings(() => {
+			const result = translateRequestToAnthropic(req);
+			expect(result.messages).toHaveLength(1);
+			expect(result.messages[0].content).toEqual([
+				{ type: "text", text: "hi" },
+			]);
+		});
+		const rejectWarnings = warnings.filter((w) => w.msg.includes("invalid"));
+		expect(rejectWarnings).toHaveLength(1);
+	});
 });

@@ -69,6 +69,11 @@ const ANTHROPIC_TOOL_ID_RE = /^[A-Za-z0-9_-]+$/;
 function makeToolIdMapper(): (original: string) => string {
 	const seen = new Map<string, string>(); // original -> emitted (preserves tool_use/tool_result pairing)
 	const used = new Set<string>(); // emitted values, for collision-free assignment
+	// Per-candidate next-suffix-to-try, so N originals colliding on the same
+	// sanitized candidate cost amortized O(1) each instead of O(N) (which
+	// makes N such originals O(N^2) overall) — restarting the suffix counter
+	// at 1 for every collision was the bug.
+	const nextSuffix = new Map<string, number>();
 	return (original) => {
 		const existing = seen.get(original);
 		if (existing !== undefined) return existing;
@@ -77,8 +82,15 @@ function makeToolIdMapper(): (original: string) => string {
 			: original.replace(/[^A-Za-z0-9_-]/g, "_");
 		if (candidate.length === 0) candidate = "tool_id";
 		let unique = candidate;
-		let n = 1;
-		while (used.has(unique)) unique = `${candidate}_${n++}`;
+		if (used.has(unique)) {
+			let n = nextSuffix.get(candidate) ?? 1;
+			unique = `${candidate}_${n}`;
+			while (used.has(unique)) {
+				n++;
+				unique = `${candidate}_${n}`;
+			}
+			nextSuffix.set(candidate, n + 1);
+		}
 		seen.set(original, unique);
 		used.add(unique);
 		return unique;
@@ -114,19 +126,33 @@ function translateToolChoice(
 	return undefined;
 }
 
+// Validates and translates a single message content part. Deliberately does
+// NOT call logger.warn — a huge malformed content array (e.g. 100k objects of
+// an unknown/invalid shape) must not turn into 100k synchronous log calls (a
+// request→log amplification DoS); callers batch rejections into a single
+// summary warn instead. Also deliberately rejects rather than coercing
+// non-string text/refusal fields (e.g. `{type:"input_text", text:1}`) — `??`
+// alone lets a truthy non-string value pass through and reach Anthropic,
+// which 400s the whole request on a non-string content field.
 function translateContentItem(c: {
 	type: string;
 	text?: string;
 	refusal?: string;
 	image_url?: string;
 	file_id?: string;
-}): AnthropicContent {
+}): { ok: true; block: AnthropicContent } | { ok: false; reason: string } {
 	if (c.type === "input_text" || c.type === "output_text") {
-		return { type: "text", text: c.text ?? "" };
+		if (typeof c.text !== "string") {
+			return { ok: false, reason: `${c.type} has non-string text` };
+		}
+		return { ok: true, block: { type: "text", text: c.text } };
 	}
 
 	if (c.type === "refusal") {
-		return { type: "text", text: c.refusal ?? "" };
+		if (typeof c.refusal !== "string") {
+			return { ok: false, reason: "refusal has non-string refusal" };
+		}
+		return { ok: true, block: { type: "text", text: c.refusal } };
 	}
 
 	if (c.type === "input_image") {
@@ -136,28 +162,39 @@ function translateContentItem(c: {
 			const dataUrlMatch = /^data:([^;]+);base64,(.+)$/.exec(trimmed);
 			if (dataUrlMatch) {
 				return {
-					type: "image",
-					source: {
-						type: "base64",
-						media_type: dataUrlMatch[1],
-						data: dataUrlMatch[2],
+					ok: true,
+					block: {
+						type: "image",
+						source: {
+							type: "base64",
+							media_type: dataUrlMatch[1],
+							data: dataUrlMatch[2],
+						},
 					},
 				};
 			}
 			if (trimmed.length > 0) {
-				return { type: "image", source: { type: "url", url: trimmed } };
+				return {
+					ok: true,
+					block: { type: "image", source: { type: "url", url: trimmed } },
+				};
 			}
 		}
 
 		if (typeof c.file_id === "string" && c.file_id.length > 0) {
-			return { type: "text", text: `[image file_id: ${c.file_id}]` };
+			return {
+				ok: true,
+				block: { type: "text", text: `[image file_id: ${c.file_id}]` },
+			};
 		}
 
-		return { type: "text", text: "[image content omitted]" };
+		return {
+			ok: true,
+			block: { type: "text", text: "[image content omitted]" },
+		};
 	}
 
-	logger.warn(`Unknown content type "${c.type}" — content dropped`);
-	return { type: "text", text: "" };
+	return { ok: false, reason: `unknown content type "${c.type}"` };
 }
 
 function mergeConsecutiveSameRole(
@@ -239,33 +276,43 @@ export function translateRequestToAnthropic(
 
 			const content: AnthropicContent[] = [];
 			let malformedCount = 0;
+			let rejectedCount = 0;
 			for (const rawC of parts) {
 				if (rawC === null || typeof rawC !== "object" || Array.isArray(rawC)) {
 					malformedCount++;
 					continue;
 				}
-				content.push(
-					translateContentItem(
-						rawC as {
-							type: string;
-							text?: string;
-							refusal?: string;
-							image_url?: string;
-							file_id?: string;
-						},
-					),
+				const res = translateContentItem(
+					rawC as {
+						type: string;
+						text?: string;
+						refusal?: string;
+						image_url?: string;
+						file_id?: string;
+					},
 				);
+				if (res.ok) {
+					content.push(res.block);
+				} else {
+					rejectedCount++;
+				}
 			}
+			// At most two summary warns for the whole batch, never one per
+			// element — see MAX_MESSAGE_CONTENT_PARTS comment above.
 			if (malformedCount > 0) {
-				// One summary warn for the whole batch, not one per element — see
-				// MAX_MESSAGE_CONTENT_PARTS comment above.
 				logger.warn(
 					`Dropped ${malformedCount} malformed content part(s) in message with role "${item.role}" — not objects`,
 				);
-			} else if (content.length === 0) {
-				// Only warn here when nothing was malformed either (i.e. the parts
-				// array was empty to begin with) — the malformed-count warn above
-				// already explains an all-malformed empty result.
+			}
+			if (rejectedCount > 0) {
+				logger.warn(
+					`Dropped ${rejectedCount} unsupported/invalid content part(s) in message with role "${item.role}"`,
+				);
+			}
+			if (malformedCount === 0 && rejectedCount === 0 && content.length === 0) {
+				// Only warn here when nothing was malformed or rejected either (i.e.
+				// the parts array was empty to begin with) — the two summary warns
+				// above already explain a filtered-to-empty result.
 				logger.warn(
 					`Dropping message with role "${item.role}" — no usable content parts after filtering`,
 				);
@@ -420,11 +467,17 @@ export function translateRequestToAnthropic(
 					malformedCount++;
 					continue;
 				}
-				const c = rawC as { type: string; text: string };
-				if (c.type === "input_text") {
+				const c = rawC as { type: string; text: unknown };
+				if (c.type === "input_text" && typeof c.text === "string") {
 					textParts.push(c.text);
 				} else if (c.type === "encrypted_content") {
 					encryptedCount++;
+				} else if (c.type === "input_text") {
+					// input_text with a non-string text field — same malformed-input
+					// guard as the message branch's translateContentItem, folded into
+					// this branch's existing single summary warn rather than a new
+					// per-element one.
+					malformedCount++;
 				}
 			}
 			// One summary warn per batch, not one per element — see
