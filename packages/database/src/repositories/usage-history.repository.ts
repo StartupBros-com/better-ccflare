@@ -63,6 +63,14 @@ export interface FleetSeriesResult {
 	returnedPointCount: number;
 }
 
+/** One raw snapshot row, as fed to UsageWindowLedger.observeSnapshot by the
+ * historical window-rebuild CLI (issue #252, task P1.4). */
+export interface RawUsageSnapshot {
+	timestampMs: number;
+	utilization: number;
+	resetsAtMs: number | null;
+}
+
 /**
  * Default ceiling on points in one fleet read. Sized well above a normal fleet
  * (accounts x windows x ~500 bucketed points) so it only engages on genuinely
@@ -185,6 +193,32 @@ export class UsageHistoryRepository extends BaseRepository<UsageSnapshotRow> {
 	 * budgeted response and a genuinely empty fleet must not look alike to the
 	 * dashboard.
 	 */
+	/**
+	 * Ordered raw snapshot history for one account+window key, oldest first —
+	 * the plain time-ordered read that feeds the historical window-rebuild CLI
+	 * (issue #252, task P1.4). Deliberately just a read: the clustering /
+	 * grant-type decision logic that turns this series into windows lives in
+	 * UsageWindowLedger and is reused, not duplicated, by that CLI.
+	 */
+	async getRawSnapshots(
+		accountId: string,
+		windowKey: string,
+		sinceMs = 0,
+	): Promise<RawUsageSnapshot[]> {
+		const rows = await this.query<SnapshotDbRow>(
+			`SELECT account_id, timestamp, window_key, utilization, resets_at
+			 FROM usage_snapshots
+			 WHERE account_id = ? AND window_key = ? AND timestamp >= ?
+			 ORDER BY timestamp ASC`,
+			[accountId, windowKey, sinceMs],
+		);
+		return rows.map((r) => ({
+			timestampMs: Number(r.timestamp),
+			utilization: Number(r.utilization),
+			resetsAtMs: r.resets_at == null ? null : Number(r.resets_at),
+		}));
+	}
+
 	async getFleetUsageHistory(
 		opts: GetFleetSeriesOptions,
 	): Promise<FleetSeriesResult> {

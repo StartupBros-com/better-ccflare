@@ -7,6 +7,7 @@ import type {
 	CacheFlightCohortSealReceipt,
 	Disposable,
 	TurnEvidence,
+	WindowTokenAggregate,
 } from "@better-ccflare/core";
 import {
 	PAUSE_REASON_NEEDS_REAUTH,
@@ -70,6 +71,13 @@ import { ServerToolReplayIssuanceRepository } from "./repositories/server-tool-r
 import { StatsRepository } from "./repositories/stats.repository";
 import { StrategyRepository } from "./repositories/strategy.repository";
 import { UsageHistoryRepository } from "./repositories/usage-history.repository";
+import type {
+	CloseWindowInput,
+	ListWindowsOptions,
+	OpenWindowInput,
+	UsageWindow,
+} from "./repositories/usage-windows.repository";
+import { UsageWindowsRepository } from "./repositories/usage-windows.repository";
 import { withDatabaseRetry } from "./retry";
 
 export interface DatabaseConfig {
@@ -379,6 +387,7 @@ export class DatabaseOperations implements StrategyStore, Disposable {
 	private deviceSetupJobs: DeviceSetupJobRepository;
 	private serverToolReplayIssuance: ServerToolReplayIssuanceRepository;
 	private usageHistory: UsageHistoryRepository;
+	private usageWindows: UsageWindowsRepository;
 	private cacheFlightRecorder: CacheFlightRecorderRepository;
 
 	constructor(
@@ -531,6 +540,7 @@ export class DatabaseOperations implements StrategyStore, Disposable {
 			this.adapter,
 		);
 		this.usageHistory = new UsageHistoryRepository(this.adapter);
+		this.usageWindows = new UsageWindowsRepository(this.adapter);
 		this.cacheFlightRecorder = new CacheFlightRecorderRepository(this.adapter);
 	}
 
@@ -1109,6 +1119,43 @@ OAuth tokens will need to be re-authenticated.
 		return this.usageHistory.deleteOlderThan(cutoffTs);
 	}
 
+	// Usage-windows operations delegated to repository
+	getUsageWindowsRepository(): UsageWindowsRepository {
+		return this.usageWindows;
+	}
+
+	async getOpenUsageWindow(
+		accountId: string,
+		windowKey: string,
+	): Promise<UsageWindow | null> {
+		return this.usageWindows.getOpenWindow(accountId, windowKey);
+	}
+
+	async openUsageWindow(input: OpenWindowInput): Promise<UsageWindow> {
+		return this.usageWindows.openWindow(input);
+	}
+
+	async recordUsageWindowUtilization(
+		id: string,
+		utilization: number,
+		timestampMs: number,
+	): Promise<void> {
+		await this.usageWindows.recordUtilization(id, utilization, timestampMs);
+	}
+
+	async closeUsageWindow(
+		id: string,
+		input: CloseWindowInput,
+	): Promise<boolean> {
+		return this.usageWindows.closeWindow(id, input);
+	}
+
+	async listUsageWindows(
+		options: ListWindowsOptions = {},
+	): Promise<UsageWindow[]> {
+		return this.usageWindows.listWindows(options);
+	}
+
 	getCacheFlightRecorderRepository(): CacheFlightRecorderRepository {
 		return this.cacheFlightRecorder;
 	}
@@ -1525,6 +1572,16 @@ OAuth tokens will need to be re-authenticated.
 		}>
 	> {
 		return this.requests.getRequestsByAccount(since);
+	}
+
+	/** See RequestRepository.aggregateTokensByModel — the Window Value
+	 * Ledger's per-model token/request source for one window's life. */
+	async aggregateTokensByModel(
+		accountId: string,
+		fromMs: number,
+		toMs: number,
+	): Promise<WindowTokenAggregate[]> {
+		return this.requests.aggregateTokensByModel(accountId, fromMs, toMs);
 	}
 
 	// Cleanup operations — two explicit passes:

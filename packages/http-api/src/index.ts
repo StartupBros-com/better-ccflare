@@ -13,6 +13,7 @@ export {
 	type DeviceSetupCoordinatorDependencies,
 } from "./services/device-setup-jobs";
 export { createServerDeviceSetupCoordinator } from "./services/server-device-setup";
+export { UsageWindowLedger } from "./services/usage-window-ledger";
 // Export types
 export * from "./types";
 // Export utilities

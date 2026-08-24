@@ -275,6 +275,95 @@ describe("UsageHistoryRepository", () => {
 	});
 });
 
+describe("UsageHistoryRepository.getRawSnapshots", () => {
+	it("returns ordered snapshots for one account+window key, excluding other keys/accounts", async () => {
+		const db = makeDb();
+		const repo = makeRepo(db);
+		await writeSnapshot(
+			repo,
+			"acc1",
+			{ seven_day: { utilization: 10, resets_at: "2026-08-10T00:00:00Z" } },
+			1000,
+		);
+		await writeSnapshot(
+			repo,
+			"acc1",
+			{ seven_day: { utilization: 20, resets_at: "2026-08-10T00:00:00Z" } },
+			2000,
+		);
+		// Different window key on the same account -> excluded.
+		await writeSnapshot(
+			repo,
+			"acc1",
+			{ five_hour: { utilization: 99, resets_at: null } },
+			1500,
+		);
+		// Same window key on a different account -> excluded.
+		await writeSnapshot(
+			repo,
+			"acc2",
+			{ seven_day: { utilization: 50, resets_at: "2026-08-10T00:00:00Z" } },
+			1200,
+		);
+		const rows = await repo.getRawSnapshots("acc1", "seven_day");
+		expect(rows).toEqual([
+			{
+				timestampMs: 1000,
+				utilization: 10,
+				resetsAtMs: new Date("2026-08-10T00:00:00Z").getTime(),
+			},
+			{
+				timestampMs: 2000,
+				utilization: 20,
+				resetsAtMs: new Date("2026-08-10T00:00:00Z").getTime(),
+			},
+		]);
+		db.close();
+	});
+
+	it("filters by sinceMs", async () => {
+		const db = makeDb();
+		const repo = makeRepo(db);
+		await writeSnapshot(
+			repo,
+			"acc1",
+			{ seven_day: { utilization: 10, resets_at: "2026-08-10T00:00:00Z" } },
+			1000,
+		);
+		await writeSnapshot(
+			repo,
+			"acc1",
+			{ seven_day: { utilization: 20, resets_at: "2026-08-10T00:00:00Z" } },
+			2000,
+		);
+		const rows = await repo.getRawSnapshots("acc1", "seven_day", 1500);
+		expect(rows.map((r) => r.timestampMs)).toEqual([2000]);
+		db.close();
+	});
+
+	it("defaults sinceMs to 0 (full history)", async () => {
+		const db = makeDb();
+		const repo = makeRepo(db);
+		await writeSnapshot(
+			repo,
+			"acc1",
+			{ seven_day: { utilization: 10, resets_at: "2026-08-10T00:00:00Z" } },
+			1000,
+		);
+		const rows = await repo.getRawSnapshots("acc1", "seven_day");
+		expect(rows).toHaveLength(1);
+		db.close();
+	});
+
+	it("returns an empty array for an account/key with no history", async () => {
+		const db = makeDb();
+		const repo = makeRepo(db);
+		const rows = await repo.getRawSnapshots("acc-none", "seven_day");
+		expect(rows).toEqual([]);
+		db.close();
+	});
+});
+
 // ---------------------------------------------------------------------------
 // Facade smoke test: exercise the usage-history methods through a real
 // in-memory DatabaseOperations. Construction opens no background workers and
