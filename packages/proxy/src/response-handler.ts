@@ -339,14 +339,6 @@ interface RawSseFrame {
 	remainder: Uint8Array;
 }
 
-function appendBytes(left: Uint8Array, right: Uint8Array): Uint8Array {
-	if (left.byteLength === 0) return right;
-	const combined = new Uint8Array(left.byteLength + right.byteLength);
-	combined.set(left);
-	combined.set(right, left.byteLength);
-	return combined;
-}
-
 function takeRawSseFrame(bytes: Uint8Array): RawSseFrame | null {
 	for (let index = 0; index < bytes.byteLength; index += 1) {
 		let delimiterLength = 0;
@@ -370,42 +362,232 @@ function takeRawSseFrame(bytes: Uint8Array): RawSseFrame | null {
 	return null;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null;
+interface JsonStringNode {
+	kind: "string";
+	value: string;
+	start: number;
+	end: number;
+}
+
+interface JsonObjectNode {
+	kind: "object";
+	properties: Array<{ key: JsonStringNode; value: JsonNode }>;
+}
+
+type JsonNode = JsonStringNode | JsonObjectNode | { kind: "other" };
+
+interface DataSegment {
+	value: string;
+	start: number;
+}
+
+function isJsonWhitespace(char: string): boolean {
+	return char === " " || char === "\t" || char === "\n" || char === "\r";
+}
+
+/** Strict JSON parser retaining token offsets so no payload bytes are reserialized. */
+function parseJsonWithOffsets(source: string): JsonNode | null {
+	let position = 0;
+	const skipWhitespace = (): void => {
+		while (position < source.length && isJsonWhitespace(source[position]))
+			position += 1;
+	};
+	const parseString = (): JsonStringNode | null => {
+		if (source[position] !== '"') return null;
+		const start = position++;
+		while (position < source.length) {
+			const char = source[position++];
+			if (char === '"') {
+				try {
+					return {
+						kind: "string",
+						value: JSON.parse(source.slice(start, position)),
+						start,
+						end: position,
+					};
+				} catch {
+					return null;
+				}
+			}
+			if (char.charCodeAt(0) < 0x20) return null;
+			if (char === "\\") {
+				const escapedCharacter = source[position++];
+				if (!escapedCharacter || !'"\\/bfnrtu'.includes(escapedCharacter)) {
+					return null;
+				}
+				if (escapedCharacter === "u") {
+					const hex = source.slice(position, position + 4);
+					if (!/^[0-9a-fA-F]{4}$/.test(hex)) return null;
+					position += 4;
+				}
+			}
+		}
+		return null;
+	};
+	const parseValue = (): JsonNode | null => {
+		skipWhitespace();
+		if (source[position] === '"') return parseString();
+		if (source[position] === "{") {
+			position += 1;
+			skipWhitespace();
+			const properties: JsonObjectNode["properties"] = [];
+			if (source[position] === "}") {
+				position += 1;
+				return { kind: "object", properties };
+			}
+			while (position < source.length) {
+				skipWhitespace();
+				const key = parseString();
+				if (!key) return null;
+				skipWhitespace();
+				if (source[position++] !== ":") return null;
+				const value = parseValue();
+				if (!value) return null;
+				properties.push({ key, value });
+				skipWhitespace();
+				if (source[position] === "}") {
+					position += 1;
+					return { kind: "object", properties };
+				}
+				if (source[position++] !== ",") return null;
+			}
+			return null;
+		}
+		if (source[position] === "[") {
+			position += 1;
+			skipWhitespace();
+			if (source[position] === "]") {
+				position += 1;
+				return { kind: "other" };
+			}
+			while (position < source.length) {
+				if (!parseValue()) return null;
+				skipWhitespace();
+				if (source[position] === "]") {
+					position += 1;
+					return { kind: "other" };
+				}
+				if (source[position++] !== ",") return null;
+			}
+			return null;
+		}
+		const literal =
+			/^(?:true|false|null|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)/.exec(
+				source.slice(position),
+			);
+		if (!literal) return null;
+		position += literal[0].length;
+		return { kind: "other" };
+	};
+	const value = parseValue();
+	skipWhitespace();
+	return value && position === source.length ? value : null;
+}
+
+function uniqueProperty(object: JsonObjectNode, name: string): JsonNode | null {
+	const matches = object.properties.filter(
+		(property) => property.key.value === name,
+	);
+	return matches.length === 1 ? matches[0].value : null;
+}
+
+function parseSseFrame(frame: string): {
+	event: string | null;
+	data: DataSegment[];
+	ambiguousEvent: boolean;
+} {
+	const events: string[] = [];
+	const data: DataSegment[] = [];
+	let lineStart = 0;
+	while (lineStart <= frame.length) {
+		let lineEnd = frame.indexOf("\n", lineStart);
+		if (lineEnd === -1) lineEnd = frame.length;
+		const contentEnd =
+			lineEnd > lineStart && frame[lineEnd - 1] === "\r"
+				? lineEnd - 1
+				: lineEnd;
+		const colon = frame.indexOf(":", lineStart);
+		if (colon !== -1 && colon < contentEnd && frame[lineStart] !== ":") {
+			const field = frame.slice(lineStart, colon);
+			const valueStart = frame[colon + 1] === " " ? colon + 2 : colon + 1;
+			const value = frame.slice(valueStart, contentEnd);
+			if (field === "event") events.push(value);
+			if (field === "data") data.push({ value, start: valueStart });
+		}
+		if (lineEnd === frame.length) break;
+		lineStart = lineEnd + 1;
+	}
+	return {
+		event: events.length === 1 ? events[0] : null,
+		data,
+		ambiguousEvent: events.length > 1,
+	};
 }
 
 function rewriteUnknownOpenRouterModelFrame(
-	frame: string,
+	frame: Uint8Array,
 	attemptedModel: string,
-): string | null {
+): {
+	inspected: boolean;
+	replacement: Uint8Array | null;
+	invalidUtf8: boolean;
+} {
+	let source: string;
 	try {
-		const eventMatch = /(?:^|\r?\n)event:[ \t]*([^\r\n]*)/.exec(frame);
-		const dataLines = frame.match(/(?:^|\r?\n)data:/g) ?? [];
-		const dataMatch = /(^|\r?\n)(data:[ \t]*)([^\r\n]*)/m.exec(frame);
-		if (
-			eventMatch?.[1].trim() !== "message_start" ||
-			dataLines.length !== 1 ||
-			!dataMatch
-		) {
-			return null;
-		}
-
-		const payload: unknown = JSON.parse(dataMatch[3]);
-		if (!isRecord(payload) || !isRecord(payload.message)) return null;
-		const message = payload.message;
-		if (message.model !== "unknown") return null;
-
-		message.model = attemptedModel;
-		const dataStart =
-			(dataMatch.index ?? 0) + dataMatch[1].length + dataMatch[2].length;
-		return (
-			frame.slice(0, dataStart) +
-			JSON.stringify(payload) +
-			frame.slice(dataStart + dataMatch[3].length)
-		);
+		source = new TextDecoder("utf-8", { fatal: true }).decode(frame);
 	} catch {
-		return null;
+		return { inspected: false, replacement: null, invalidUtf8: true };
 	}
+	const sse = parseSseFrame(source);
+	if (sse.ambiguousEvent || sse.event !== "message_start") {
+		return { inspected: false, replacement: null, invalidUtf8: false };
+	}
+	const payload = parseJsonWithOffsets(
+		sse.data.map(({ value }) => value).join("\n"),
+	);
+	if (!payload || payload.kind !== "object") {
+		return { inspected: true, replacement: null, invalidUtf8: false };
+	}
+	const type = uniqueProperty(payload, "type");
+	const message = uniqueProperty(payload, "message");
+	if (
+		!type ||
+		type.kind !== "string" ||
+		type.value !== "message_start" ||
+		!message ||
+		message.kind !== "object"
+	) {
+		return { inspected: true, replacement: null, invalidUtf8: false };
+	}
+	const model = uniqueProperty(message, "model");
+	if (!model || model.kind !== "string" || model.value !== "unknown") {
+		return { inspected: true, replacement: null, invalidUtf8: false };
+	}
+	let logicalStart = 0;
+	for (const segment of sse.data) {
+		const logicalEnd = logicalStart + segment.value.length;
+		if (model.start >= logicalStart && model.end <= logicalEnd) {
+			const start = segment.start + model.start - logicalStart;
+			const end = segment.start + model.end - logicalStart;
+			const rawStart = new TextEncoder().encode(
+				source.slice(0, start),
+			).byteLength;
+			const rawEnd = new TextEncoder().encode(source.slice(0, end)).byteLength;
+			const replacement = new TextEncoder().encode(
+				JSON.stringify(attemptedModel),
+			);
+			const rewritten = new Uint8Array(
+				frame.byteLength - (rawEnd - rawStart) + replacement.byteLength,
+			);
+			rewritten.set(frame.subarray(0, rawStart));
+			rewritten.set(replacement, rawStart);
+			rewritten.set(frame.subarray(rawEnd), rawStart + replacement.byteLength);
+			return { inspected: true, replacement: rewritten, invalidUtf8: false };
+		}
+		logicalStart = logicalEnd + 1;
+	}
+	// Replacing a token that crosses an inserted SSE newline is not provably a raw span.
+	return { inspected: true, replacement: null, invalidUtf8: false };
 }
 
 /**
@@ -420,59 +602,90 @@ function createOpenRouterModelNormalizationStream(
 		maxFrameBytes: BUFFER_SIZES.SSE_TRANSPORT_FRAME_MAX_BYTES,
 		maxBufferBytes: BUFFER_SIZES.SSE_TRANSPORT_TAIL_MAX_BYTES,
 	});
-	const encoder = new TextEncoder();
-	let rawTail: Uint8Array<ArrayBufferLike> = new Uint8Array();
-	let failOpen = false;
+	let rawParts: Uint8Array[] = [];
+	let rawByteLength = 0;
+	let passThrough = false;
+	const drainRawParts = (
+		controller: TransformStreamDefaultController<Uint8Array>,
+	): void => {
+		for (const part of rawParts) controller.enqueue(part);
+		rawParts = [];
+		rawByteLength = 0;
+	};
 
 	return upstream.pipeThrough(
 		new TransformStream<Uint8Array, Uint8Array>({
 			transform(chunk, controller) {
-				if (failOpen) {
+				if (passThrough) {
 					controller.enqueue(chunk);
 					return;
 				}
-
-				rawTail = appendBytes(rawTail, chunk);
+				rawParts.push(chunk);
+				rawByteLength += chunk.byteLength;
 				let parsedFrames: string[];
 				try {
 					parsedFrames = frames.push(chunk);
 				} catch {
-					failOpen = true;
-					controller.enqueue(rawTail);
-					rawTail = new Uint8Array();
+					passThrough = true;
+					drainRawParts(controller);
 					return;
 				}
+				if (parsedFrames.length === 0) return;
 
-				for (const parsedFrame of parsedFrames) {
-					const rawFrame = takeRawSseFrame(rawTail);
-					if (!rawFrame) {
-						failOpen = true;
-						controller.enqueue(rawTail);
-						rawTail = new Uint8Array();
-						return;
+				// A complete frame is bounded by SseFrameBuffer. Materialize retained
+				// raw fragments only once here; no-delimiter pushes retain fragments.
+				const rawBlock = new Uint8Array(rawByteLength);
+				let offset = 0;
+				for (const part of rawParts) {
+					rawBlock.set(part, offset);
+					offset += part.byteLength;
+				}
+				rawParts = [];
+				rawByteLength = 0;
+				const rawFrames: RawSseFrame[] = [];
+				let remainder: Uint8Array<ArrayBufferLike> = rawBlock;
+				let rawFrame = takeRawSseFrame(remainder);
+				while (rawFrame) {
+					rawFrames.push(rawFrame);
+					remainder = rawFrame.remainder;
+					rawFrame = takeRawSseFrame(remainder);
+				}
+				if (rawFrames.length !== parsedFrames.length) {
+					passThrough = true;
+					controller.enqueue(rawBlock);
+					return;
+				}
+				for (const frame of rawFrames) {
+					if (passThrough) {
+						controller.enqueue(frame.frame);
+						controller.enqueue(frame.delimiter);
+						continue;
 					}
-					rawTail = rawFrame.remainder;
-					const normalizedFrame = rewriteUnknownOpenRouterModelFrame(
-						parsedFrame,
+					const inspection = rewriteUnknownOpenRouterModelFrame(
+						frame.frame,
 						attemptedModel,
 					);
-					controller.enqueue(
-						normalizedFrame === null
-							? rawFrame.frame
-							: encoder.encode(normalizedFrame),
-					);
-					controller.enqueue(rawFrame.delimiter);
+					if (inspection.invalidUtf8) passThrough = true;
+					controller.enqueue(inspection.replacement ?? frame.frame);
+					controller.enqueue(frame.delimiter);
+					if (inspection.inspected) passThrough = true;
+				}
+				if (passThrough) {
+					if (remainder.byteLength > 0) controller.enqueue(remainder);
+				} else if (remainder.byteLength > 0) {
+					rawParts = [remainder];
+					rawByteLength = remainder.byteLength;
 				}
 			},
 			flush(controller) {
-				if (!failOpen) {
+				if (!passThrough) {
 					try {
 						frames.flush();
 					} catch {
-						// The retained raw tail is emitted unchanged below.
+						// The retained raw fragments are emitted unchanged below.
 					}
 				}
-				if (rawTail.byteLength > 0) controller.enqueue(rawTail);
+				drainRawParts(controller);
 			},
 		}),
 	);

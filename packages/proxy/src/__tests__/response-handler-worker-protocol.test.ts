@@ -585,6 +585,11 @@ describe("forwardToClient usage-collector protocol", () => {
 		model: string;
 		split?: boolean;
 		rawBody?: string;
+		chunks?: Uint8Array[];
+		method?: string;
+		path?: string;
+		status?: number;
+		contentType?: string;
 	}): Promise<{
 		clientBody: string;
 		collectorBody: string;
@@ -608,7 +613,9 @@ describe("forwardToClient usage-collector protocol", () => {
 		const encoded = new TextEncoder().encode(upstreamBody);
 		const body = new ReadableStream<Uint8Array>({
 			start(controller) {
-				if (options.split) {
+				if (options.chunks) {
+					for (const chunk of options.chunks) controller.enqueue(chunk);
+				} else if (options.split) {
 					const splitAt = messageStart.indexOf("unknown") + 3;
 					controller.enqueue(encoded.subarray(0, splitAt));
 					controller.enqueue(
@@ -625,8 +632,8 @@ describe("forwardToClient usage-collector protocol", () => {
 		const response = await forwardToClient(
 			{
 				requestId: options.requestId,
-				method: "POST",
-				path: "/v1/messages",
+				method: options.method ?? "POST",
+				path: options.path ?? "/v1/messages",
 				account: null,
 				requestHeaders: new Headers({
 					"anthropic-version": "2023-06-01",
@@ -634,8 +641,10 @@ describe("forwardToClient usage-collector protocol", () => {
 				}),
 				requestBody: new TextEncoder().encode("{}"),
 				response: new Response(body, {
-					status: 200,
-					headers: { "content-type": "text/event-stream" },
+					status: options.status ?? 200,
+					headers: {
+						"content-type": options.contentType ?? "text/event-stream",
+					},
 				}),
 				timestamp: Date.now(),
 				retryAttempt: 0,
@@ -665,6 +674,57 @@ describe("forwardToClient usage-collector protocol", () => {
 			expect(body).toContain('"model":"anthropic/claude-opus-5"');
 			expect(body).not.toContain('"model":"unknown"');
 		}
+	});
+
+	it("replaces only the raw message.model token across split chunks", async () => {
+		const attemptedModel = "anthropic/claude-opus-5";
+		const target =
+			"event: message_start\r\n" +
+			'data: { "type" : "message_start" , "message" : { "model" : "\\u0075nknown", "usage" : { "input_tokens" : 1e1 } } }\r\n\r\n';
+		const terminal =
+			'event: message_stop\r\ndata: {"type":"message_stop"}\r\n\r\n';
+		const upstreamBody = target + terminal;
+		const encoded = new TextEncoder().encode(upstreamBody);
+		const tokenOffset = target.indexOf("\\u0075nknown") + 5;
+		const result = await forwardModelStartStream({
+			requestId: "req-openrouter-exact-token",
+			providerName: "openrouter",
+			attemptedModel,
+			model: "unknown",
+			rawBody: upstreamBody,
+			chunks: [
+				encoded.subarray(0, tokenOffset),
+				encoded.subarray(tokenOffset, target.length - 1),
+				encoded.subarray(target.length - 1),
+			],
+		});
+		const expected = upstreamBody.replace(
+			'"\\u0075nknown"',
+			JSON.stringify(attemptedModel),
+		);
+		expect(result.clientBody).toBe(expected);
+		expect(result.collectorBody).toBe(expected);
+	});
+
+	it("supports legal multi-line data while preserving raw SSE prefixes and delimiters", async () => {
+		const upstreamBody =
+			"event: message_start\r\n" +
+			'data: {"type":"message_start","message":{"model":"unknown","usage":{"input_tokens":1e1}}}\r\n' +
+			"data:  \r\n\r\n" +
+			'event: message_stop\r\ndata: {"type":"message_stop"}\r\n\r\n';
+		const result = await forwardModelStartStream({
+			requestId: "req-openrouter-multiline-data",
+			providerName: "openrouter",
+			attemptedModel: "anthropic/claude-opus-5",
+			model: "unknown",
+			rawBody: upstreamBody,
+		});
+		const expected = upstreamBody.replace(
+			'"unknown"',
+			'"anthropic/claude-opus-5"',
+		);
+		expect(result.clientBody).toBe(expected);
+		expect(result.collectorBody).toBe(expected);
 	});
 
 	it.each([
@@ -697,6 +757,34 @@ describe("forwardToClient usage-collector protocol", () => {
 			providerName: "anthropic",
 			attemptedModel: "anthropic/claude-opus-5",
 			model: "unknown",
+		},
+		{
+			label: "GET method",
+			providerName: "openrouter",
+			attemptedModel: "anthropic/claude-opus-5",
+			model: "unknown",
+			method: "GET",
+		},
+		{
+			label: "wrong path",
+			providerName: "openrouter",
+			attemptedModel: "anthropic/claude-opus-5",
+			model: "unknown",
+			path: "/v1/complete",
+		},
+		{
+			label: "non-OK SSE",
+			providerName: "openrouter",
+			attemptedModel: "anthropic/claude-opus-5",
+			model: "unknown",
+			status: 500,
+		},
+		{
+			label: "non-SSE content type",
+			providerName: "openrouter",
+			attemptedModel: "anthropic/claude-opus-5",
+			model: "unknown",
+			contentType: "application/json",
 		},
 	])("preserves the message_start frame for $label", async (testCase) => {
 		const result = await forwardModelStartStream({
@@ -735,6 +823,39 @@ describe("forwardToClient usage-collector protocol", () => {
 		await expect(response.text()).resolves.toBe(body);
 	});
 
+	it.each([
+		{
+			label: "missing payload type",
+			frame: 'event: message_start\ndata: {"message":{"model":"unknown"}}\n\n',
+		},
+		{
+			label: "wrong payload type",
+			frame:
+				'event: message_start\ndata: {"type":"message_delta","message":{"model":"unknown"}}\n\n',
+		},
+		{
+			label: "duplicate model path",
+			frame:
+				'event: message_start\ndata: {"type":"message_start","message":{"model":"unknown","model":"unknown"}}\n\n',
+		},
+		{
+			label: "conflicting event fields",
+			frame:
+				'event: message_start\nevent: message_delta\ndata: {"type":"message_start","message":{"model":"unknown"}}\n\n',
+		},
+	])("preserves $label exactly", async ({ frame }) => {
+		const rawBody = `${frame}event: message_stop\ndata: {"type":"message_stop"}\n\n`;
+		const result = await forwardModelStartStream({
+			requestId: `req-openrouter-preserve-${frame.length}`,
+			providerName: "openrouter",
+			attemptedModel: "anthropic/claude-opus-5",
+			model: "unknown",
+			rawBody,
+		});
+		expect(result.clientBody).toBe(rawBody);
+		expect(result.collectorBody).toBe(rawBody);
+	});
+
 	it("fails open for malformed OpenRouter message_start frames", async () => {
 		const rawBody =
 			'event: message_start\ndata: {"type":"message_start","message":{"model":unknown}}\n\n' +
@@ -751,18 +872,44 @@ describe("forwardToClient usage-collector protocol", () => {
 		expect(result.collectorBody).toBe(rawBody);
 	});
 
-	it("fails open for an over-limit unterminated OpenRouter SSE tail", async () => {
+	it("rewrites a completed target and preserves its buffered unterminated tail", async () => {
+		const target =
+			'event: message_start\ndata: {"type":"message_start","message":{"model":"unknown"}}\n\n';
+		const tail = 'event: message_delta\ndata: {"type":"message_delta"}';
+		const rawBody = target + tail;
+		const result = await forwardModelStartStream({
+			requestId: "req-openrouter-target-then-tail",
+			providerName: "openrouter",
+			attemptedModel: "anthropic/claude-opus-5",
+			model: "unknown",
+			rawBody,
+		});
+		const expected = rawBody.replace('"unknown"', '"anthropic/claude-opus-5"');
+		expect(result.clientBody).toBe(expected);
+		expect(result.collectorBody).toBe(expected);
+	});
+
+	it("fails open linearly for an over-limit unterminated tail fragmented into many chunks", async () => {
 		const rawBody = `event: message_start\ndata: ${"x".repeat(
 			BUFFER_SIZES.SSE_TRANSPORT_TAIL_MAX_BYTES + 1,
 		)}`;
+		const encoded = new TextEncoder().encode(rawBody);
+		const fragments: Uint8Array[] = [];
+		for (let offset = 0; offset < encoded.byteLength; offset += 257) {
+			fragments.push(encoded.subarray(offset, offset + 257));
+		}
 		const result = await forwardModelStartStream({
 			requestId: "req-openrouter-over-limit-tail",
 			providerName: "openrouter",
 			attemptedModel: "anthropic/claude-opus-5",
 			model: "unknown",
 			rawBody,
+			chunks: fragments,
 		});
 
+		// Exact reconstruction from hundreds of fragments guards against a
+		// quadratic append/rebuffer implementation without a flaky timer.
+		expect(fragments.length).toBeGreaterThan(100);
 		expect(result.clientBody).toBe(rawBody);
 		expect(result.collectorBody).toBe(rawBody);
 	});
