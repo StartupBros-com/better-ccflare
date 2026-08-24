@@ -500,13 +500,16 @@ function parseSseFrame(frame: string): {
 	const data: DataSegment[] = [];
 	let lineStart = 0;
 	while (lineStart <= frame.length) {
-		let lineEnd = frame.indexOf("\n", lineStart);
-		if (lineEnd === -1) lineEnd = frame.length;
+		let lineEnd = lineStart;
+		let colon = -1;
+		while (lineEnd < frame.length && frame[lineEnd] !== "\n") {
+			if (colon === -1 && frame[lineEnd] === ":") colon = lineEnd;
+			lineEnd += 1;
+		}
 		const contentEnd =
 			lineEnd > lineStart && frame[lineEnd - 1] === "\r"
 				? lineEnd - 1
 				: lineEnd;
-		const colon = frame.indexOf(":", lineStart);
 		if (colon !== -1 && colon < contentEnd && frame[lineStart] !== ":") {
 			const field = frame.slice(lineStart, colon);
 			const valueStart = frame[colon + 1] === " " ? colon + 2 : colon + 1;
@@ -532,6 +535,11 @@ function rewriteUnknownOpenRouterModelFrame(
 	replacement: Uint8Array | null;
 	invalidUtf8: boolean;
 } {
+	if (frame[0] === 0xef && frame[1] === 0xbb && frame[2] === 0xbf) {
+		// TextDecoder strips a UTF-8 BOM, making source offsets unsuitable for a
+		// byte-local replacement. Preserve this and all following frames verbatim.
+		return { inspected: true, replacement: null, invalidUtf8: false };
+	}
 	let source: string;
 	try {
 		source = new TextDecoder("utf-8", { fatal: true }).decode(frame);
@@ -539,7 +547,10 @@ function rewriteUnknownOpenRouterModelFrame(
 		return { inspected: false, replacement: null, invalidUtf8: true };
 	}
 	const sse = parseSseFrame(source);
-	if (sse.ambiguousEvent || sse.event !== "message_start") {
+	if (sse.ambiguousEvent) {
+		return { inspected: true, replacement: null, invalidUtf8: false };
+	}
+	if (sse.event !== "message_start") {
 		return { inspected: false, replacement: null, invalidUtf8: false };
 	}
 	const payload = parseJsonWithOffsets(
@@ -594,6 +605,8 @@ function rewriteUnknownOpenRouterModelFrame(
  * Normalizes OpenRouter's Anthropic-compatible `message_start` placeholder.
  * attemptedModel is requested transport provenance, not confirmed served identity.
  */
+const MAX_RETAINED_SSE_FRAGMENTS = 1_024;
+
 function createOpenRouterModelNormalizationStream(
 	upstream: ReadableStream<Uint8Array>,
 	attemptedModel: string,
@@ -616,12 +629,18 @@ function createOpenRouterModelNormalizationStream(
 	return upstream.pipeThrough(
 		new TransformStream<Uint8Array, Uint8Array>({
 			transform(chunk, controller) {
+				if (chunk.byteLength === 0) return;
 				if (passThrough) {
 					controller.enqueue(chunk);
 					return;
 				}
 				rawParts.push(chunk);
 				rawByteLength += chunk.byteLength;
+				if (rawParts.length > MAX_RETAINED_SSE_FRAGMENTS) {
+					passThrough = true;
+					drainRawParts(controller);
+					return;
+				}
 				let parsedFrames: string[];
 				try {
 					parsedFrames = frames.push(chunk);

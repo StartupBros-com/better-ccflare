@@ -592,7 +592,9 @@ describe("forwardToClient usage-collector protocol", () => {
 		contentType?: string;
 	}): Promise<{
 		clientBody: string;
+		clientBytes: Uint8Array;
 		collectorBody: string;
+		collectorBytes: Uint8Array;
 		upstreamBody: string;
 	}> {
 		const { chunks, ends } = createMockCollector();
@@ -653,12 +655,20 @@ describe("forwardToClient usage-collector protocol", () => {
 			},
 			ctx,
 		);
-		const clientBody = await response.text();
+		const clientBytes = new Uint8Array(await response.arrayBuffer());
+		const clientBody = new TextDecoder().decode(clientBytes);
 		await waitFor(() => ends.length > 0);
-		const collectorBody = new TextDecoder().decode(
+		const collectorBytes = new Uint8Array(
 			Buffer.concat(chunks.map(({ data }) => Buffer.from(data))),
 		);
-		return { clientBody, collectorBody, upstreamBody };
+		const collectorBody = new TextDecoder().decode(collectorBytes);
+		return {
+			clientBody,
+			clientBytes,
+			collectorBody,
+			collectorBytes,
+			upstreamBody,
+		};
 	}
 
 	it("replaces OpenRouter's unknown Anthropic model before client delivery and collection across split chunks", async () => {
@@ -723,6 +733,42 @@ describe("forwardToClient usage-collector protocol", () => {
 			'"unknown"',
 			'"anthropic/claude-opus-5"',
 		);
+		expect(result.clientBody).toBe(expected);
+		expect(result.collectorBody).toBe(expected);
+	});
+
+	it("preserves a BOM-prefixed message_start exactly for client and collector", async () => {
+		const rawBody =
+			String.fromCharCode(0xfeff) +
+			'event: message_start\ndata: {"type":"message_start","message":{"model":"unknown"}}\n\n' +
+			'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+		const result = await forwardModelStartStream({
+			requestId: "req-openrouter-bom-message-start",
+			providerName: "openrouter",
+			attemptedModel: "anthropic/claude-opus-5",
+			model: "unknown",
+			rawBody,
+		});
+
+		const expectedBytes = new TextEncoder().encode(rawBody);
+		expect(result.clientBytes).toEqual(expectedBytes);
+		expect(result.collectorBytes).toEqual(expectedBytes);
+	});
+
+	it("normalizes a target after many legal colon-free extension lines", async () => {
+		const extensions = "x-openrouter-extension\n".repeat(2_048);
+		const rawBody =
+			extensions +
+			'event: message_start\ndata: {"type":"message_start","message":{"model":"unknown"}}\n\n';
+		const result = await forwardModelStartStream({
+			requestId: "req-openrouter-extension-lines",
+			providerName: "openrouter",
+			attemptedModel: "anthropic/claude-opus-5",
+			model: "unknown",
+			rawBody,
+		});
+		const expected = rawBody.replace('"unknown"', '"anthropic/claude-opus-5"');
+
 		expect(result.clientBody).toBe(expected);
 		expect(result.collectorBody).toBe(expected);
 	});
@@ -856,6 +902,24 @@ describe("forwardToClient usage-collector protocol", () => {
 		expect(result.collectorBody).toBe(rawBody);
 	});
 
+	it("latches pass-through after an ambiguous event frame", async () => {
+		const ambiguous =
+			'event: message_start\nevent: message_delta\ndata: {"type":"message_start","message":{"model":"unknown"}}\n\n';
+		const validLookingTarget =
+			'event: message_start\ndata: {"type":"message_start","message":{"model":"unknown"}}\n\n';
+		const rawBody = ambiguous + validLookingTarget;
+		const result = await forwardModelStartStream({
+			requestId: "req-openrouter-ambiguous-event-terminal",
+			providerName: "openrouter",
+			attemptedModel: "anthropic/claude-opus-5",
+			model: "unknown",
+			rawBody,
+		});
+
+		expect(result.clientBody).toBe(rawBody);
+		expect(result.collectorBody).toBe(rawBody);
+	});
+
 	it("fails open for malformed OpenRouter message_start frames", async () => {
 		const rawBody =
 			'event: message_start\ndata: {"type":"message_start","message":{"model":unknown}}\n\n' +
@@ -910,6 +974,50 @@ describe("forwardToClient usage-collector protocol", () => {
 		// Exact reconstruction from hundreds of fragments guards against a
 		// quadratic append/rebuffer implementation without a flaky timer.
 		expect(fragments.length).toBeGreaterThan(100);
+		expect(result.clientBody).toBe(rawBody);
+		expect(result.collectorBody).toBe(rawBody);
+	});
+
+	it("does not retain zero-length chunks before a valid target", async () => {
+		const rawBody =
+			'event: message_start\ndata: {"type":"message_start","message":{"model":"unknown"}}\n\n';
+		const encoded = new TextEncoder().encode(rawBody);
+		const chunks = [
+			...Array.from({ length: 2_048 }, () => new Uint8Array()),
+			encoded,
+		];
+		const result = await forwardModelStartStream({
+			requestId: "req-openrouter-zero-fragments",
+			providerName: "openrouter",
+			attemptedModel: "anthropic/claude-opus-5",
+			model: "unknown",
+			rawBody,
+			chunks,
+		});
+		const expected = rawBody.replace('"unknown"', '"anthropic/claude-opus-5"');
+
+		expect(result.clientBody).toBe(expected);
+		expect(result.collectorBody).toBe(expected);
+	});
+
+	it("drains retained fragments unchanged after the fragment-count cap", async () => {
+		const rawBody =
+			"x-openrouter-extension\n".repeat(64) +
+			'event: message_start\ndata: {"type":"message_start","message":{"model":"unknown"}}\n\n';
+		const encoded = new TextEncoder().encode(rawBody);
+		const fragments = Array.from({ length: encoded.byteLength }, (_, index) =>
+			encoded.subarray(index, index + 1),
+		);
+		const result = await forwardModelStartStream({
+			requestId: "req-openrouter-fragment-cap",
+			providerName: "openrouter",
+			attemptedModel: "anthropic/claude-opus-5",
+			model: "unknown",
+			rawBody,
+			chunks: fragments,
+		});
+
+		expect(fragments.length).toBeGreaterThan(1_024);
 		expect(result.clientBody).toBe(rawBody);
 		expect(result.collectorBody).toBe(rawBody);
 	});
