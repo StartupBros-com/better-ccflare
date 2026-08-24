@@ -80,6 +80,21 @@ export class UsageWindowLedger {
 			// — same guard, same reason as `AlertService.evaluateUsageSnapshot`.
 			if (!window.active) continue;
 			if (window.resetsAtMs == null) continue;
+			// A freshly reset account that hasn't been used yet reports a SLIDING
+			// placeholder: utilization 0 with resets_at = poll_time + 7d exactly,
+			// moving forward on every poll until first usage anchors the real
+			// window (observed live on all three codex Pro accounts, 2026-08-24;
+			// pro-secondary idled that way from 00:44 to 20:39 UTC). The window
+			// does not exist yet — processing these would churn a close+open
+			// every ~2-3 polls as the slide drifts past CLUSTER_TOLERANCE_MS,
+			// poisoning the value-drop alert's priors with junk $0 windows.
+			if (
+				window.utilization === 0 &&
+				Math.abs(window.resetsAtMs - (timestampMs + SEVEN_DAYS_MS)) <=
+					CLUSTER_TOLERANCE_MS
+			) {
+				continue;
+			}
 			try {
 				await this.observeWindow(
 					accountId,
@@ -126,9 +141,18 @@ export class UsageWindowLedger {
 				return;
 			}
 
-			// Different cluster: the open window's life ends here, priced through
-			// to the moment this new cluster was first observed.
-			await this.closeAndValue(open, timestampMs, timestampMs);
+			// Different cluster: the open window's life ends here. The provider
+			// anchors resets_at = first_use + 7d, so resetsAtMs - 7d is the true
+			// start of the new window — usually minutes before the poll that
+			// first reports it. Use it as the close/open boundary when it falls
+			// strictly inside (open.startedAt, timestampMs) so the two windows
+			// still partition time exactly; otherwise fall back to the poll time.
+			const anchorStart = resetsAtMs - SEVEN_DAYS_MS;
+			const boundary =
+				anchorStart > open.startedAt && anchorStart < timestampMs
+					? anchorStart
+					: timestampMs;
+			await this.closeAndValue(open, timestampMs, boundary);
 
 			// The old window still had days of runway left when a new cluster
 			// showed up -> the provider granted an early/bonus reset. If the old
@@ -142,7 +166,7 @@ export class UsageWindowLedger {
 			const next = await this.dbOps.openUsageWindow({
 				accountId,
 				windowKey: LEDGER_WINDOW_KEY,
-				startedAt: timestampMs,
+				startedAt: boundary,
 				resetsAt: resetsAtMs,
 				grantType,
 			});
