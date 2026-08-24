@@ -47,6 +47,54 @@ export type Stats = StatsWithAccounts;
 export type LogEntry = LogEvent;
 export type RequestSummary = RequestResponse;
 
+export type UsageWindowGrantType = "natural" | "early_reset" | "first_observed";
+
+export interface ClosedUsageWindow {
+	id: string;
+	accountId: string;
+	windowKey: string;
+	startedAt: number;
+	resetsAt: number;
+	closedAt: number;
+	grantType: UsageWindowGrantType;
+	peakUtilization: number;
+	first100At: number | null;
+	valueUsd: number;
+	inputTokens: number;
+	cacheReadInputTokens: number;
+	cacheCreationInputTokens: number;
+	outputTokens: number;
+	requestCount: number;
+	modelBreakdown: Record<string, unknown>;
+	unpricedTokens: number;
+	projectionVersion: string;
+}
+
+export interface OpenUsageWindow
+	extends Omit<ClosedUsageWindow, "closedAt" | "valueUsd"> {
+	closedAt: null;
+	valueUsd: null;
+	valueSoFarUsd: number;
+	utilization: number;
+	ageHours: number;
+}
+
+export interface AccountUsageWindows {
+	accountId: string;
+	accountName: string;
+	provider: string;
+	windows: ClosedUsageWindow[];
+	openWindow: OpenUsageWindow | null;
+}
+
+export interface FleetUsageWindowsResponse {
+	accounts: AccountUsageWindows[];
+}
+
+export type UsageWindowsResponse =
+	| AccountUsageWindows
+	| FleetUsageWindowsResponse;
+
 export interface AccountCreatedApiResponse {
 	success: true;
 	accountId: string;
@@ -1090,6 +1138,23 @@ class API extends HttpClient {
 		const params = new URLSearchParams({ account: "all", range });
 		return this.get<FleetUsageHistoryResponse>(
 			`/api/usage-history?${params.toString()}`,
+		);
+	}
+
+	/** Closed and active value records for one account or the full fleet. */
+	async getUsageWindows(
+		account?: string,
+		windowKey = "seven_day",
+		limit = 20,
+	): Promise<UsageWindowsResponse> {
+		const params = new URLSearchParams({
+			window_key: windowKey,
+			limit: String(limit),
+		});
+		if (account) params.set("account", account);
+
+		return this.get<UsageWindowsResponse>(
+			`/api/usage-windows?${params.toString()}`,
 		);
 	}
 
