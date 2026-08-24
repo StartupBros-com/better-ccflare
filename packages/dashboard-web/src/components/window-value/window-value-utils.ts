@@ -99,6 +99,29 @@ export function deltaVsPriorMedian(
 	return ((window.valueUsd - priorMedian) / priorMedian) * 100;
 }
 
+/**
+ * Returns a closed window's change versus the immediately preceding qualifying period.
+ * The API is newest-first, so the preceding period is the first qualifying row after
+ * this one. Partial and first-observed rows neither establish nor receive a delta.
+ */
+export function deltaVsPreviousQualifying(
+	windows: readonly ClosedUsageWindow[],
+	windowIndex: number,
+): number | null {
+	const window = windows[windowIndex];
+	if (!window || !isQualifyingWindow(window)) return null;
+
+	const previousWindow = windows
+		.slice(windowIndex + 1)
+		.find(isQualifyingWindow);
+	if (!previousWindow || previousWindow.valueUsd === 0) return null;
+
+	return (
+		((window.valueUsd - previousWindow.valueUsd) / previousWindow.valueUsd) *
+		100
+	);
+}
+
 /** Groups accounts into stable provider sections, putting paid Claude-code providers first. */
 export function groupByProvider(
 	accounts: readonly AccountUsageWindows[],
