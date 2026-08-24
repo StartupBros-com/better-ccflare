@@ -165,6 +165,45 @@ describe("createUsageWindowsHandler", () => {
 		expect(body.openWindow?.closedAt).toBeNull();
 	});
 
+	it("surfaces live unpriced tokens on the open window instead of the row's null column", async () => {
+		await insertAccount(dbOps, ACCOUNT_ID);
+		const startedAt = Date.now() - 2 * HOUR_MS;
+		await dbOps.openUsageWindow({
+			accountId: ACCOUNT_ID,
+			windowKey: "seven_day",
+			startedAt,
+			resetsAt: startedAt + 7 * DAY_MS,
+			grantType: "natural",
+		});
+
+		await seedRequest(dbOps, {
+			id: "req-priced",
+			timestamp: startedAt + 1_000,
+			model: "gpt-5.6-terra",
+			inputTokens: 1_000_000, // -> 2.0 at list rates
+		});
+		await seedRequest(dbOps, {
+			id: "req-unpriced",
+			timestamp: startedAt + 2_000,
+			model: "unknown-model-zzz",
+			inputTokens: 300,
+			cacheReadInputTokens: 20,
+			outputTokens: 75,
+		});
+
+		const handler = createUsageWindowsHandler(context);
+		const res = await handler(new URLSearchParams(`account=${ACCOUNT_ID}`));
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as {
+			openWindow: { valueSoFarUsd: number; unpricedTokens: number } | null;
+		};
+		expect(body.openWindow).not.toBeNull();
+		// The unpriced model's tokens are counted loudly, never silently $0'd...
+		expect(body.openWindow?.unpricedTokens).toBe(395);
+		// ...while the priced remainder still values normally.
+		expect(body.openWindow?.valueSoFarUsd).toBeCloseTo(2.0, 10);
+	});
+
 	it("parses model_breakdown to JSON, keeping an unpriced model's valueUsd null", async () => {
 		await insertAccount(dbOps, ACCOUNT_ID);
 		const startedAt = Date.parse("2026-08-10T00:00:00Z");
