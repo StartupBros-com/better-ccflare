@@ -2,6 +2,7 @@ import { describe, expect, it, test } from "bun:test";
 import * as zlib from "node:zlib";
 import { handleResponsesRequest } from "../handler";
 import {
+	MAX_RESPONSES_CONTENT_PARTS,
 	MAX_RESPONSES_INPUT_ITEMS,
 	MAX_RESPONSES_TOOLS,
 } from "../request-limits";
@@ -848,6 +849,65 @@ describe("Responses request body admission", () => {
 			expect(calls()).toBe(1);
 		});
 
+		test("rejects oversized message and agent_message content arrays without proxying", async () => {
+			const oversizedContent = Array.from(
+				{ length: MAX_RESPONSES_CONTENT_PARTS + 1 },
+				() => ({ type: "input_text", text: "x" }),
+			);
+			for (const item of [
+				{ type: "message", role: "user", content: oversizedContent },
+				{
+					type: "agent_message",
+					author: "planner",
+					recipient: "coder",
+					content: oversizedContent,
+				},
+			]) {
+				const [proxy, calls] = countingProxy();
+				const req = request({ model: "claude-haiku-4-5", input: [item] });
+				const response = await handleResponsesRequest(
+					req,
+					new URL(req.url),
+					proxy,
+					{},
+				);
+				expect(response.status).toBe(413);
+				expect(calls()).toBe(0);
+				expect(await response.json()).toEqual({
+					type: "error",
+					error: {
+						type: "invalid_request_error",
+						message: `Too many ${item.type} content parts`,
+					},
+				});
+			}
+		});
+
+		test("accepts exactly the message content-part limit", async () => {
+			const [proxy, calls] = countingProxy();
+			const req = request({
+				model: "claude-haiku-4-5",
+				input: [
+					{
+						type: "message",
+						role: "user",
+						content: Array.from(
+							{ length: MAX_RESPONSES_CONTENT_PARTS },
+							() => ({ type: "input_text", text: "x" }),
+						),
+					},
+				],
+			});
+			const response = await handleResponsesRequest(
+				req,
+				new URL(req.url),
+				proxy,
+				{},
+			);
+			expect(response.status).toBe(200);
+			expect(calls()).toBe(1);
+		});
+
 		test("rejects non-array tools with the invalid-request envelope before proxying", async () => {
 			for (const tools of [null, {}, "not-an-array"]) {
 				const [proxy, calls] = countingProxy();
@@ -865,6 +925,33 @@ describe("Responses request body admission", () => {
 					error: {
 						type: "invalid_request_error",
 						message: "tools must be an array",
+					},
+				});
+			}
+		});
+
+		test("rejects non-object tool entries with required choice before proxying", async () => {
+			for (const tool of [null, 1, "tool", []]) {
+				const [proxy, calls] = countingProxy();
+				const req = request({
+					model: "claude-haiku-4-5",
+					input: "Hi",
+					tools: [tool],
+					tool_choice: "required",
+				});
+				const response = await handleResponsesRequest(
+					req,
+					new URL(req.url),
+					proxy,
+					{},
+				);
+				expect(response.status).toBe(400);
+				expect(calls()).toBe(0);
+				expect(await response.json()).toEqual({
+					type: "error",
+					error: {
+						type: "invalid_request_error",
+						message: "Invalid tool definition",
 					},
 				});
 			}

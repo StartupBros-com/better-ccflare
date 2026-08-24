@@ -6,7 +6,10 @@ import {
 } from "@better-ccflare/core";
 import { logBus } from "@better-ccflare/logger";
 import type { LogEvent } from "@better-ccflare/types";
-import { MAX_RESPONSES_INPUT_ITEMS } from "../request-limits";
+import {
+	MAX_RESPONSES_CONTENT_PARTS,
+	MAX_RESPONSES_INPUT_ITEMS,
+} from "../request-limits";
 import { translateRequestToAnthropic } from "../request-translator";
 import type { ResponseItem, ResponsesRequest } from "../types";
 
@@ -1724,6 +1727,24 @@ describe("translateRequestToAnthropic", () => {
 			0,
 		);
 		expect(totalParts).toBe(MAX_RESPONSES_INPUT_ITEMS + 5);
+	});
+
+	test("does not truncate direct message content; handler owns content-part admission", () => {
+		const partCount = MAX_RESPONSES_CONTENT_PARTS + 1;
+		const result = translateRequestToAnthropic({
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "message",
+					role: "user",
+					content: Array.from({ length: partCount }, () => ({
+						type: "input_text" as const,
+						text: "x",
+					})),
+				},
+			],
+		});
+		expect(result.messages[0].content).toHaveLength(partCount);
 	});
 
 	test("request-scoped warn budget caps total warnings emitted from many per-item warns", () => {

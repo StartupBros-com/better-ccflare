@@ -15,6 +15,7 @@ import {
 	recoveryScopeForCode,
 } from "@better-ccflare/types/routing-recovery";
 import {
+	MAX_RESPONSES_CONTENT_PARTS,
 	MAX_RESPONSES_INPUT_ITEMS,
 	MAX_RESPONSES_TOOLS,
 } from "./request-limits";
@@ -43,6 +44,37 @@ function openAiRequestError(status: 400 | 413, message: string): Response {
 			error: { type: "invalid_request_error", message },
 		}),
 		{ status, headers: { "Content-Type": "application/json" } },
+	);
+}
+
+function oversizedContentItemType(
+	input: unknown,
+): "message" | "agent_message" | undefined {
+	if (!Array.isArray(input)) return undefined;
+	for (const rawItem of input) {
+		if (
+			rawItem === null ||
+			typeof rawItem !== "object" ||
+			Array.isArray(rawItem)
+		) {
+			continue;
+		}
+		const item = rawItem as Record<string, unknown>;
+		if (
+			(item.type === "message" || item.type === "agent_message") &&
+			Array.isArray(item.content) &&
+			item.content.length > MAX_RESPONSES_CONTENT_PARTS
+		) {
+			return item.type;
+		}
+	}
+	return undefined;
+}
+
+function hasNonObjectToolEntry(tools: unknown[]): boolean {
+	return tools.some(
+		(rawTool) =>
+			rawTool === null || typeof rawTool !== "object" || Array.isArray(rawTool),
 	);
 }
 
@@ -260,11 +292,21 @@ export async function handleResponsesRequest(
 	if (body.input.length > MAX_RESPONSES_INPUT_ITEMS) {
 		return openAiRequestError(413, "Too many input items");
 	}
+	const oversizedContentType = oversizedContentItemType(body.input);
+	if (oversizedContentType !== undefined) {
+		return openAiRequestError(
+			413,
+			`Too many ${oversizedContentType} content parts`,
+		);
+	}
 	if (body.tools !== undefined && !Array.isArray(body.tools)) {
 		return openAiRequestError(400, "tools must be an array");
 	}
 	if (body.tools && body.tools.length > MAX_RESPONSES_TOOLS) {
 		return openAiRequestError(413, "Too many tools");
+	}
+	if (body.tools && hasNonObjectToolEntry(body.tools)) {
+		return openAiRequestError(400, "Invalid tool definition");
 	}
 	if (body.tools && hasMalformedFunctionTool(body.tools)) {
 		return openAiRequestError(400, "Invalid function tool definition");

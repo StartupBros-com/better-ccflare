@@ -16,11 +16,6 @@ import type {
 
 const logger = new Logger("openai-responses-adapter");
 
-// Bounds per-item content-array iteration so a huge malformed content array
-// (e.g. millions of nulls) cannot turn into unbounded synchronous log calls
-// or unbounded iteration — a request→log amplification DoS.
-const MAX_MESSAGE_CONTENT_PARTS = 100_000;
-
 // Map OpenAI model names to Claude family aliases so per-account model_mappings
 // (opus/sonnet/haiku) resolve correctly when Codex CLI requests reach the proxy.
 // Rules based on OpenAI naming conventions:
@@ -324,16 +319,6 @@ export function translateRequestToAnthropic(
 				continue;
 			}
 
-			// Bound the work below: a huge malformed content array (e.g.
-			// millions of nulls) must not turn into unbounded iteration or
-			// unbounded synchronous log calls (a request→log amplification DoS).
-			if (parts.length > MAX_MESSAGE_CONTENT_PARTS) {
-				emitWarn(
-					`Message with role "${item.role}" has ${parts.length} content parts — truncating to the first ${MAX_MESSAGE_CONTENT_PARTS}`,
-				);
-				parts = parts.slice(0, MAX_MESSAGE_CONTENT_PARTS);
-			}
-
 			const content: AnthropicContent[] = [];
 			let malformedCount = 0;
 			let rejectedCount = 0;
@@ -357,8 +342,7 @@ export function translateRequestToAnthropic(
 					rejectedCount++;
 				}
 			}
-			// At most two summary warns for the whole batch, never one per
-			// element — see MAX_MESSAGE_CONTENT_PARTS comment above.
+			// At most two summary warns for the whole batch, never one per element.
 			if (malformedCount > 0) {
 				emitWarn(
 					`Dropped ${malformedCount} malformed content part(s) in message with role "${item.role}" — not objects`,
@@ -538,15 +522,7 @@ export function translateRequestToAnthropic(
 				);
 				continue;
 			}
-			let parts = item.content as unknown[];
-			// Bound the work below — see MAX_MESSAGE_CONTENT_PARTS comment in the
-			// message branch above.
-			if (parts.length > MAX_MESSAGE_CONTENT_PARTS) {
-				emitWarn(
-					`agent_message from "${item.author}" has ${parts.length} content parts — truncating to the first ${MAX_MESSAGE_CONTENT_PARTS}`,
-				);
-				parts = parts.slice(0, MAX_MESSAGE_CONTENT_PARTS);
-			}
+			const parts = item.content as unknown[];
 			const textParts: string[] = [];
 			let malformedCount = 0;
 			let encryptedCount = 0;
@@ -583,8 +559,7 @@ export function translateRequestToAnthropic(
 					rejectedCount++;
 				}
 			}
-			// One summary warn per batch, not one per element — see
-			// MAX_MESSAGE_CONTENT_PARTS comment in the message branch above.
+			// One summary warn per batch, not one per element.
 			if (malformedCount > 0) {
 				emitWarn(
 					`Dropped ${malformedCount} malformed content part(s) of agent_message from "${item.author}" — invalid shape`,
