@@ -113,7 +113,9 @@ describe("rebuildWindows", () => {
 			// still had days of runway left.
 			const t1 = t0 + 1_000;
 			const newResetsAt = t1 + 7 * DAY_MS;
-			await seedSnapshot(dbOps, ACCOUNT_ID, 0, newResetsAt, t1);
+			// utilization 1, not 0: a 0% snapshot with resets_at == now+7d is the
+			// provider's SLIDING pre-anchor placeholder and is skipped by the ledger.
+			await seedSnapshot(dbOps, ACCOUNT_ID, 1, newResetsAt, t1);
 
 			const result = await rebuildWindows(dbOps, {});
 			expect(result.dryRun).toBe(false);
@@ -183,7 +185,9 @@ describe("rebuildWindows", () => {
 			});
 			const t1 = t0 + 1_000;
 			const newResetsAt = t1 + 7 * DAY_MS;
-			await seedSnapshot(dbOps, ACCOUNT_ID, 0, newResetsAt, t1);
+			// utilization 1, not 0: a 0% snapshot with resets_at == now+7d is the
+			// provider's SLIDING pre-anchor placeholder and is skipped by the ledger.
+			await seedSnapshot(dbOps, ACCOUNT_ID, 1, newResetsAt, t1);
 
 			const first = await rebuildWindows(dbOps, {});
 			const rowsAfterFirst = await dbOps.listUsageWindows({
@@ -224,7 +228,9 @@ describe("rebuildWindows", () => {
 			});
 			const t1 = t0 + 1_000;
 			const newResetsAt = t1 + 7 * DAY_MS;
-			await seedSnapshot(dbOps, ACCOUNT_ID, 0, newResetsAt, t1);
+			// utilization 1, not 0: a 0% snapshot with resets_at == now+7d is the
+			// provider's SLIDING pre-anchor placeholder and is skipped by the ledger.
+			await seedSnapshot(dbOps, ACCOUNT_ID, 1, newResetsAt, t1);
 
 			await rebuildWindows(dbOps, {});
 			const rowsAfterFirst = await dbOps.listUsageWindows({
@@ -314,7 +320,9 @@ describe("rebuildWindows", () => {
 			});
 			const t1 = t0 + 1_000;
 			const newResetsAt = t1 + 7 * DAY_MS;
-			await seedSnapshot(dbOps, ACCOUNT_ID, 0, newResetsAt, t1);
+			// utilization 1, not 0: a 0% snapshot with resets_at == now+7d is the
+			// provider's SLIDING pre-anchor placeholder and is skipped by the ledger.
+			await seedSnapshot(dbOps, ACCOUNT_ID, 1, newResetsAt, t1);
 
 			const rowsBefore = await dbOps.listUsageWindows({
 				accountId: ACCOUNT_ID,

@@ -167,7 +167,9 @@ describe("UsageWindowLedger", () => {
 		const t1 = t0 + 1_000;
 		const newResetsAt = t1 + 7 * DAY_MS;
 		expect(Math.abs(newResetsAt - oldResetsAt)).toBeGreaterThan(DAY_MS);
-		await ledger.observeSnapshot(ACCOUNT_ID, [sevenDay(0, newResetsAt)], t1);
+		// utilization 1, not 0: a 0% snapshot with resets_at == now+7d is the
+		// provider's sliding pre-anchor placeholder, which the ledger skips.
+		await ledger.observeSnapshot(ACCOUNT_ID, [sevenDay(1, newResetsAt)], t1);
 
 		const windows = await dbOps.listUsageWindows({ accountId: ACCOUNT_ID });
 		expect(windows).toHaveLength(2);
@@ -189,9 +191,10 @@ describe("UsageWindowLedger", () => {
 		await ledger.observeSnapshot(ACCOUNT_ID, [sevenDay(80, oldResetsAt)], t0);
 
 		// Poll lands just after the old window's natural reset time.
+		// (utilization 1: an anchored window has usage — see placeholder note above.)
 		const t1 = oldResetsAt + 1_000;
 		const newResetsAt = t1 + 7 * DAY_MS;
-		await ledger.observeSnapshot(ACCOUNT_ID, [sevenDay(0, newResetsAt)], t1);
+		await ledger.observeSnapshot(ACCOUNT_ID, [sevenDay(1, newResetsAt)], t1);
 
 		const windows = await dbOps.listUsageWindows({ accountId: ACCOUNT_ID });
 		expect(windows).toHaveLength(2);
@@ -592,5 +595,121 @@ describe("UsageWindowLedger real pricing table sanity", () => {
 		expect(era?.inputPerM).toBe(2.0);
 		expect(era?.cacheReadPerM).toBe(0.2);
 		expect(era?.outputPerM).toBe(12.0);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Sliding placeholder resets. Live pattern observed 2026-08-24 on all three
+// codex Pro accounts: after the provider cuts an account to 0%, every poll
+// reports utilization 0 with resets_at = poll_time + 7d EXACTLY, sliding
+// forward until first usage anchors the real window (pro-secondary idled
+// 00:44->20:39 UTC that way). Without the placeholder guard the accumulated
+// slide drifts past the 120s cluster tolerance every ~2-3 polls and the
+// ledger churns a close+open each time — junk windows that poison the
+// value-drop alert's priors median.
+// ---------------------------------------------------------------------------
+describe("UsageWindowLedger sliding placeholder resets", () => {
+	let dbOps: DatabaseOperations;
+	let ledger: UsageWindowLedger;
+
+	beforeEach(() => {
+		dbOps = new DatabaseOperations(":memory:", { walMode: false });
+		ledger = new UsageWindowLedger(dbOps);
+	});
+
+	afterEach(async () => {
+		await dbOps.dispose();
+	});
+
+	it("does not churn windows while an idle account's resets_at slides", async () => {
+		const t0 = Date.parse("2026-08-20T03:35:00Z");
+		const liveResetsAt = t0 + 7 * DAY_MS;
+		await ledger.observeSnapshot(ACCOUNT_ID, [sevenDay(100, liveResetsAt)], t0);
+
+		// The cut: ~4 days later the account idles at 0% while resets_at
+		// slides with each ~95s poll.
+		const cut = Date.parse("2026-08-24T00:44:54Z");
+		for (let i = 0; i < 6; i++) {
+			const ts = cut + i * 95_000;
+			await ledger.observeSnapshot(
+				ACCOUNT_ID,
+				[sevenDay(0, ts + 7 * DAY_MS)],
+				ts,
+			);
+		}
+
+		const windows = await dbOps.listUsageWindows({ accountId: ACCOUNT_ID });
+		expect(windows).toHaveLength(1);
+		expect(windows[0].closedAt).toBeNull();
+		expect(windows[0].resetsAt).toBe(liveResetsAt);
+	});
+
+	it("anchors the new window at resets_at - 7d and classifies it early_reset once usage resumes", async () => {
+		await seedAccount(dbOps, { id: ACCOUNT_ID, name: "acct" });
+		const t0 = Date.parse("2026-08-20T03:35:00Z");
+		const oldResetsAt = t0 + 7 * DAY_MS;
+		await ledger.observeSnapshot(ACCOUNT_ID, [sevenDay(50, oldResetsAt)], t0);
+
+		// Usage inside the old window: 1M input of gpt-5.6-terra = $2.00 list.
+		await seedRequest(dbOps, {
+			id: "req-old",
+			timestamp: t0 + 60 * 60 * 1000,
+			model: "gpt-5.6-terra",
+			inputTokens: 1_000_000,
+		});
+
+		// Idle slide phase — every snapshot skipped as a placeholder.
+		const cut = Date.parse("2026-08-24T00:44:54Z");
+		for (let i = 0; i < 3; i++) {
+			const ts = cut + i * 95_000;
+			await ledger.observeSnapshot(
+				ACCOUNT_ID,
+				[sevenDay(0, ts + 7 * DAY_MS)],
+				ts,
+			);
+		}
+
+		// First usage at 18:30:44 anchors resets_at = first_use + 7d; the poll
+		// only notices at 18:52. A request inside the 18:30->18:52 gap must be
+		// attributed to the NEW window, not the old one.
+		const anchor = Date.parse("2026-08-24T18:30:44Z");
+		const poll = Date.parse("2026-08-24T18:52:20Z");
+		await seedRequest(dbOps, {
+			id: "req-new",
+			timestamp: anchor + 5 * 60 * 1000,
+			model: "gpt-5.6-terra",
+			inputTokens: 1_000_000,
+		});
+		await ledger.observeSnapshot(
+			ACCOUNT_ID,
+			[sevenDay(1, anchor + 7 * DAY_MS)],
+			poll,
+		);
+
+		const windows = await dbOps.listUsageWindows({ accountId: ACCOUNT_ID });
+		expect(windows).toHaveLength(2);
+		const closed = windows.find((w) => w.resetsAt === oldResetsAt);
+		const opened = windows.find((w) => w.resetsAt === anchor + 7 * DAY_MS);
+		expect(closed?.closedAt).toBe(poll);
+		// Value cut at the anchor, not the poll: req-new is excluded.
+		expect(closed?.valueUsd).toBeCloseTo(2.0, 10);
+		expect(opened?.grantType).toBe("early_reset");
+		expect(opened?.startedAt).toBe(anchor);
+	});
+
+	it("still processes a genuine zero-utilization window whose resets_at is not a now+7d placeholder", async () => {
+		const t0 = Date.parse("2026-08-20T03:35:00Z");
+		const liveResetsAt = t0 + 7 * DAY_MS;
+		await ledger.observeSnapshot(ACCOUNT_ID, [sevenDay(60, liveResetsAt)], t0);
+
+		// 0% but with a FIXED resets_at well short of now+7d (e.g. a provider
+		// stamping calendar boundaries): must close/reopen normally rather
+		// than be mistaken for a pending placeholder.
+		const t1 = t0 + 2 * DAY_MS;
+		const fixedResetsAt = t1 + 4 * DAY_MS;
+		await ledger.observeSnapshot(ACCOUNT_ID, [sevenDay(0, fixedResetsAt)], t1);
+
+		const windows = await dbOps.listUsageWindows({ accountId: ACCOUNT_ID });
+		expect(windows).toHaveLength(2);
 	});
 });
