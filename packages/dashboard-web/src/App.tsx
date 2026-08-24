@@ -40,6 +40,11 @@ const LazyUsageHistoryTab = lazy(() =>
 		default: m.UsageHistoryTab,
 	})),
 );
+const LazyWindowValueTab = lazy(() =>
+	import("./components/window-value/WindowValueTab").then((m) => ({
+		default: m.WindowValueTab,
+	})),
+);
 const LoadingSkeleton = () => (
 	<div className="space-y-6 p-6">
 		<div className="animate-pulse">
@@ -118,6 +123,16 @@ export function App() {
 				),
 				title: "Usage History",
 				subtitle: "Per-account usage windows over time, with limit prediction",
+			},
+			{
+				path: "/window-value",
+				element: (
+					<Suspense fallback={<LoadingSkeleton />}>
+						<LazyWindowValueTab />
+					</Suspense>
+				),
+				title: "Window Value",
+				subtitle: "Track the value of active and completed usage windows",
 			},
 			{
 				path: "/agents",

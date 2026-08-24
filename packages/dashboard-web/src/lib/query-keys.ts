@@ -47,6 +47,8 @@ export const queryKeys = {
 	storage: () => [...queryKeys.all, "storage"] as const,
 	usageHistory: (account?: string, range?: string) =>
 		[...queryKeys.all, "usage-history", { account, range }] as const,
+	usageWindows: (account?: string, windowKey = "seven_day", limit = 20) =>
+		[...queryKeys.all, "usage-windows", { account, windowKey, limit }] as const,
 	fleetUsageHistory: (range?: string) =>
 		[...queryKeys.all, "usage-history", "fleet", { range }] as const,
 	models: () => [...queryKeys.all, "models"] as const,

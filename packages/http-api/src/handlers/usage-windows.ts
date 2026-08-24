@@ -137,6 +137,11 @@ async function buildAccountResponse(
 		openWindow = {
 			...toRecord(open),
 			valueSoFarUsd: valuation.valueUsd,
+			// The unclosed ledger row's own unpriced_tokens column is still null;
+			// the live valuation is the only source that can report unpriced usage
+			// inside an open window, so surface it (the dashboard's "unpriced"
+			// warning on live windows depends on this field).
+			unpricedTokens: valuation.unpricedTokens,
 			utilization: open.peakUtilization,
 			ageHours: (nowMs - open.startedAt) / HOUR_MS,
 		};
