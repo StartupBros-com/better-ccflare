@@ -337,8 +337,10 @@ describe("translateRequestToAnthropic", () => {
 			input: [],
 			tools: [{ type: "function", name: "simple_tool", parameters: null }],
 			tool_choice: "required",
-		} as ResponsesRequest;
-		const result = translateRequestToAnthropic(req);
+		};
+		const result = translateRequestToAnthropic(
+			req as unknown as ResponsesRequest & { input: ResponseItem[] },
+		);
 		expect(result.tools).toEqual([
 			{ name: "simple_tool", description: undefined, input_schema: {} },
 		]);
