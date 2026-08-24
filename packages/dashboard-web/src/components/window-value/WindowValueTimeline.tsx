@@ -3,6 +3,7 @@ import type {
 	ClosedUsageWindow,
 	OpenUsageWindow,
 } from "../../api";
+import { WindowValueComparisonTable } from "./WindowValueComparisonTable";
 import {
 	deltaVsPriorMedian,
 	formatCompactWindowValue,
@@ -351,6 +352,11 @@ export function WindowValueTimeline({
 								/>
 							))}
 						</div>
+
+						<WindowValueComparisonTable
+							accounts={section.accounts}
+							nowMs={nowMs}
+						/>
 					</section>
 				);
 			})}

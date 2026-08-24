@@ -6,8 +6,10 @@ import type {
 	OpenUsageWindow,
 	UsageWindowGrantType,
 } from "../../../api";
+import { WindowValueComparisonTable } from "../WindowValueComparisonTable";
 import { WindowValueTimeline } from "../WindowValueTimeline";
 import {
+	deltaVsPreviousQualifying,
 	deltaVsPriorMedian,
 	groupByProvider,
 	sectionLastFullWindowSubtotal,
@@ -333,6 +335,49 @@ describe("window-value timeline helpers", () => {
 		expect(deltaVsPriorMedian(proPrimary.windows, 1)).toBeNull();
 		expect(deltaVsPriorMedian(proPrimary.windows, 3)).toBeNull();
 	});
+
+	it("compares each full window with the next qualifying period only", () => {
+		expect(deltaVsPreviousQualifying(proPrimary.windows, 0)).toBeCloseTo(
+			79.2,
+			1,
+		);
+		expect(deltaVsPreviousQualifying(proPrimary.windows, 1)).toBeCloseTo(
+			-34.5,
+			1,
+		);
+		expect(deltaVsPreviousQualifying(proPrimary.windows, 2)).toBeNull();
+		expect(deltaVsPreviousQualifying(proPrimary.windows, 3)).toBeNull();
+
+		// The $85/6% partial observation must not establish the latest full window's
+		// baseline: it compares to the next complete $3,110 period instead.
+		expect(deltaVsPreviousQualifying(maxPrimary.windows, 0)).toBeCloseTo(
+			-3.5,
+			1,
+		);
+		expect(deltaVsPreviousQualifying(maxPrimary.windows, 1)).toBeNull();
+		expect(deltaVsPreviousQualifying(maxPrimary.windows, 0)).not.toBeCloseTo(
+			((3_000 - 85) / 85) * 100,
+			1,
+		);
+
+		const zeroBaseline = [
+			closedWindow({
+				id: "zero-baseline-current",
+				accountId: "zero-baseline",
+				startedAt: AUG_19,
+				closedAt: AUG_20,
+				valueUsd: 100,
+			}),
+			closedWindow({
+				id: "zero-baseline-prior",
+				accountId: "zero-baseline",
+				startedAt: AUG_18,
+				closedAt: AUG_19,
+				valueUsd: 0,
+			}),
+		];
+		expect(deltaVsPreviousQualifying(zeroBaseline, 0)).toBeNull();
+	});
 });
 
 describe("WindowValueTimeline", () => {
@@ -392,5 +437,72 @@ describe("WindowValueTimeline", () => {
 		);
 		// Wide windows keep their inline label.
 		expect(html).toContain('class="truncate">$3.1k');
+	});
+
+	it("renders a semantic period-over-period comparison table for every provider", () => {
+		expect(WindowValueComparisonTable).toBeDefined();
+
+		const html = renderToString(
+			<WindowValueTimeline
+				accounts={[
+					proPrimary,
+					proSecondary,
+					maxPrimary,
+					otherProvider,
+					firstObservedOpen,
+				]}
+				nowMs={NOW_MS}
+			/>,
+		);
+		const rows = html.match(/<tr\b[\s\S]*?<\/tr>/g) ?? [];
+		const rowContaining = (text: string): string => {
+			const row = rows.find((candidate) => candidate.includes(text));
+			expect(row).toBeDefined();
+			return row ?? "";
+		};
+
+		expect(html).toContain("Period over period");
+		for (const header of [
+			"Account",
+			"Window",
+			"Days",
+			"Value",
+			"Util",
+			"Grant",
+			"Δ prev",
+			"Δ median",
+		]) {
+			expect(html).toMatch(
+				new RegExp(`<th[^>]*scope="col"[^>]*>${header}<\\/th>`),
+			);
+		}
+
+		const latestProRow = rowContaining("$2,962.44");
+		expect(latestProRow).toContain("pro-primary");
+		expect(latestProRow).toContain("Aug 20 → Aug 24");
+		expect(latestProRow).toContain("4.0");
+		expect(latestProRow).toContain("100%");
+		expect(latestProRow).toContain("natural");
+		expect(latestProRow).toContain("+79.2%");
+
+		const aug13NerfRow = rowContaining("$1,653.13");
+		expect(aug13NerfRow).toContain("bonus reset");
+		expect(aug13NerfRow).toContain("−34.5%");
+
+		const partialRow = rowContaining("$85.00");
+		expect(partialRow).toContain("window-value-row--partial");
+		expect(partialRow).toContain("6%");
+		expect(partialRow).toContain("—");
+		expect(partialRow).not.toMatch(/[+−]\d+\.\d+%/);
+
+		const firstObservedClosedRow = rowContaining("$1,960.00");
+		expect(firstObservedClosedRow).toContain("≥ $1,960.00");
+		const firstObservedOpenRow = rowContaining("$95.00");
+		expect(firstObservedOpenRow).toContain("≥ $95.00");
+
+		const openRow = rowContaining("$812.55");
+		expect(openRow).toContain("open");
+		expect(openRow).toContain("—");
+		expect(openRow.match(/—/g)).toHaveLength(2);
 	});
 });
