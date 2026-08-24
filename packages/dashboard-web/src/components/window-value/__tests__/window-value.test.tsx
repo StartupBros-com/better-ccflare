@@ -1,76 +1,64 @@
 import { describe, expect, it } from "bun:test";
 import { renderToString } from "react-dom/server";
-import { AccountWindowValueCard } from "../AccountWindowValueCard";
+import type {
+	AccountUsageWindows,
+	ClosedUsageWindow,
+	OpenUsageWindow,
+	UsageWindowGrantType,
+} from "../../../api";
+import { WindowValueComparisonTable } from "../WindowValueComparisonTable";
+import { WindowValueTimeline } from "../WindowValueTimeline";
 import {
+	deltaVsPreviousQualifying,
 	deltaVsPriorMedian,
-	fleetOpenWindowSummary,
-	formatCountdown,
-	formatWindowValue,
-	sortAccountsByWindowValue,
+	groupByProvider,
+	sectionLastFullWindowSubtotal,
+	timeDomain,
+	timelineSegmentGeometry,
+	weeklyTimelineTicks,
 } from "../window-value-utils";
-
-type GrantType = "natural" | "early_reset" | "first_observed";
-
-interface ClosedWindowFixture {
-	id: string;
-	accountId: string;
-	windowKey: "seven_day";
-	startedAt: number;
-	resetsAt: number;
-	closedAt: number;
-	grantType: GrantType;
-	peakUtilization: number;
-	first100At: number | null;
-	valueUsd: number;
-	inputTokens: number;
-	cacheReadInputTokens: number;
-	cacheCreationInputTokens: number;
-	outputTokens: number;
-	requestCount: number;
-	modelBreakdown: Record<string, unknown>;
-	unpricedTokens: number;
-	projectionVersion: string;
-}
-
-interface OpenWindowFixture
-	extends Omit<ClosedWindowFixture, "closedAt" | "valueUsd"> {
-	closedAt: null;
-	valueUsd: null;
-	valueSoFarUsd: number;
-	utilization: number;
-	ageHours: number;
-}
-
-interface AccountUsageWindowsFixture {
-	accountId: string;
-	accountName: string;
-	provider: string;
-	windows: ClosedWindowFixture[];
-	openWindow: OpenWindowFixture | null;
-}
 
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
-const NOW_MS = Date.UTC(2026, 7, 24, 12, 0, 0);
+const NOW_MS = Date.UTC(2026, 7, 25, 0, 0, 0);
 
-function closedWindow(
-	id: string,
-	accountId: string,
-	grantType: GrantType,
-	valueUsd: number,
-	resetsAt: number,
-	unpricedTokens = 0,
-): ClosedWindowFixture {
+const AUG_8 = Date.UTC(2026, 7, 8, 0, 0, 0);
+const AUG_11 = Date.UTC(2026, 7, 11, 0, 0, 0);
+const AUG_13 = Date.UTC(2026, 7, 13, 0, 0, 0);
+const AUG_18 = Date.UTC(2026, 7, 18, 0, 0, 0);
+const AUG_19 = Date.UTC(2026, 7, 19, 0, 0, 0);
+const AUG_20 = Date.UTC(2026, 7, 20, 0, 0, 0);
+const AUG_24 = Date.UTC(2026, 7, 24, 0, 0, 0);
+const AUG_24_1830 = Date.UTC(2026, 7, 24, 18, 30, 0);
+const AUG_31_1830 = Date.UTC(2026, 7, 31, 18, 30, 0);
+
+function closedWindow({
+	id,
+	accountId,
+	startedAt,
+	closedAt,
+	grantType = "natural",
+	peakUtilization = 100,
+	valueUsd,
+}: {
+	id: string;
+	accountId: string;
+	startedAt: number;
+	closedAt: number;
+	grantType?: UsageWindowGrantType;
+	peakUtilization?: number;
+	valueUsd: number;
+}): ClosedUsageWindow {
 	return {
 		id,
 		accountId,
 		windowKey: "seven_day",
-		startedAt: resetsAt - 7 * DAY_MS,
-		resetsAt,
-		closedAt: resetsAt,
+		startedAt,
+		resetsAt: closedAt,
+		closedAt,
 		grantType,
-		peakUtilization: 100,
-		first100At: resetsAt - HOUR_MS,
+		peakUtilization,
+		first100At: peakUtilization >= 95 ? closedAt - HOUR_MS : null,
 		valueUsd,
 		inputTokens: 10_000_000,
 		cacheReadInputTokens: 5_000_000,
@@ -78,249 +66,443 @@ function closedWindow(
 		outputTokens: 500_000,
 		requestCount: 100,
 		modelBreakdown: {},
-		unpricedTokens,
+		unpricedTokens: 0,
 		projectionVersion: "v1",
 	};
 }
 
-function openWindow(
-	accountId: string,
-	valueSoFarUsd: number,
-	utilization: number,
-	resetsAt: number,
-): OpenWindowFixture {
+function openWindow({
+	accountId,
+	startedAt,
+	resetsAt,
+	grantType = "natural",
+	valueSoFarUsd,
+	utilization,
+}: {
+	accountId: string;
+	startedAt: number;
+	resetsAt: number;
+	grantType?: UsageWindowGrantType;
+	valueSoFarUsd: number;
+	utilization: number;
+}): OpenUsageWindow {
 	return {
-		id: `${accountId}-open`,
-		accountId,
-		windowKey: "seven_day",
-		startedAt: NOW_MS - 4 * DAY_MS,
-		resetsAt,
+		...closedWindow({
+			id: `${accountId}-open`,
+			accountId,
+			startedAt,
+			closedAt: resetsAt,
+			grantType,
+			peakUtilization: utilization,
+			valueUsd: 0,
+		}),
 		closedAt: null,
-		grantType: "natural",
-		peakUtilization: utilization,
-		first100At: null,
 		valueUsd: null,
-		inputTokens: 5_000_000,
-		cacheReadInputTokens: 2_500_000,
-		cacheCreationInputTokens: 500_000,
-		outputTokens: 250_000,
-		requestCount: 50,
-		modelBreakdown: {},
-		unpricedTokens: 0,
-		projectionVersion: "v1",
 		valueSoFarUsd,
 		utilization,
-		ageHours: 96,
+		ageHours: (NOW_MS - startedAt) / HOUR_MS,
 	};
 }
 
 // API order is newest first, matching GET /api/usage-windows.
-const proPrimary: AccountUsageWindowsFixture = {
+const proPrimary: AccountUsageWindows = {
 	accountId: "pro-primary",
 	accountName: "pro-primary",
 	provider: "codex",
 	windows: [
-		closedWindow(
-			"primary-w4",
-			"pro-primary",
-			"natural",
-			2_962.44,
-			NOW_MS - DAY_MS,
-		),
-		closedWindow(
-			"primary-w3",
-			"pro-primary",
-			"early_reset",
-			1_653.13,
-			NOW_MS - 8 * DAY_MS,
-		),
-		closedWindow(
-			"primary-w2",
-			"pro-primary",
-			"natural",
-			2_522.09,
-			NOW_MS - 15 * DAY_MS,
-		),
-		closedWindow(
-			"primary-w1",
-			"pro-primary",
-			"first_observed",
-			1_100,
-			NOW_MS - 22 * DAY_MS,
-		),
+		closedWindow({
+			id: "pro-natural",
+			accountId: "pro-primary",
+			startedAt: AUG_20,
+			closedAt: AUG_24,
+			valueUsd: 2_962.44,
+		}),
+		closedWindow({
+			id: "pro-early-reset-2",
+			accountId: "pro-primary",
+			startedAt: AUG_13,
+			closedAt: AUG_20,
+			grantType: "early_reset",
+			valueUsd: 1_653.13,
+		}),
+		closedWindow({
+			id: "pro-early-reset-1",
+			accountId: "pro-primary",
+			startedAt: AUG_11,
+			closedAt: AUG_13,
+			grantType: "early_reset",
+			valueUsd: 2_522.09,
+		}),
+		closedWindow({
+			id: "pro-first-observed",
+			accountId: "pro-primary",
+			startedAt: AUG_8,
+			closedAt: AUG_13,
+			grantType: "first_observed",
+			peakUtilization: 86,
+			valueUsd: 1_960,
+		}),
 	],
-	openWindow: openWindow(
-		"pro-primary",
-		812.55,
-		34,
-		NOW_MS + 2 * DAY_MS + 14 * HOUR_MS,
-	),
+	openWindow: openWindow({
+		accountId: "pro-primary",
+		startedAt: AUG_24_1830,
+		resetsAt: AUG_31_1830,
+		grantType: "early_reset",
+		valueSoFarUsd: 812.55,
+		utilization: 34,
+	}),
 };
 
-const proSecondary: AccountUsageWindowsFixture = {
+const proSecondary: AccountUsageWindows = {
 	accountId: "pro-secondary",
 	accountName: "pro-secondary",
 	provider: "codex",
 	windows: [
-		closedWindow(
-			"secondary-w1",
-			"pro-secondary",
-			"natural",
-			1_655.28,
-			NOW_MS - DAY_MS,
-			5_000_000,
-		),
-	],
-	openWindow: openWindow("pro-secondary", 95, 4, NOW_MS + 3 * DAY_MS),
-};
-
-const maxTertiary: AccountUsageWindowsFixture = {
-	accountId: "max-tertiary",
-	accountName: "max-tertiary",
-	provider: "anthropic",
-	windows: [
-		closedWindow(
-			"tertiary-w3",
-			"max-tertiary",
-			"natural",
-			2_587,
-			NOW_MS - DAY_MS,
-		),
-		closedWindow(
-			"tertiary-w2",
-			"max-tertiary",
-			"natural",
-			2_608,
-			NOW_MS - 8 * DAY_MS,
-		),
-		closedWindow(
-			"tertiary-w1",
-			"max-tertiary",
-			"natural",
-			3_179,
-			NOW_MS - 15 * DAY_MS,
-		),
+		closedWindow({
+			id: "secondary-natural",
+			accountId: "pro-secondary",
+			startedAt: AUG_18,
+			closedAt: AUG_24,
+			valueUsd: 1_655.28,
+		}),
 	],
 	openWindow: null,
 };
 
-describe("AccountWindowValueCard", () => {
-	it("renders primary values, grant badges, and a lower bound for a partial window", () => {
-		const html = renderToString(
-			<AccountWindowValueCard account={proPrimary} nowMs={NOW_MS} />,
-		);
+// The $85 row is real production-shaped fixture data: its 6% utilization is a
+// partial observation, not an $85 Pro grant. It sits between full $2.9k-$3.1k
+// windows and must neither establish a delta baseline nor change the subtotal.
+const maxPrimary: AccountUsageWindows = {
+	accountId: "max-primary-bros",
+	accountName: "max-primary-bros",
+	provider: "anthropic",
+	windows: [
+		closedWindow({
+			id: "max-latest-full",
+			accountId: "max-primary-bros",
+			startedAt: AUG_19,
+			closedAt: AUG_24,
+			valueUsd: 3_000,
+		}),
+		closedWindow({
+			id: "max-phantom-nerf",
+			accountId: "max-primary-bros",
+			startedAt: AUG_18,
+			closedAt: AUG_19,
+			peakUtilization: 6,
+			valueUsd: 85,
+		}),
+		closedWindow({
+			id: "max-middle-full",
+			accountId: "max-primary-bros",
+			startedAt: AUG_11,
+			closedAt: AUG_18,
+			valueUsd: 3_110,
+		}),
+		closedWindow({
+			id: "max-oldest-full",
+			accountId: "max-primary-bros",
+			startedAt: AUG_8,
+			closedAt: AUG_11,
+			valueUsd: 2_900,
+		}),
+	],
+	openWindow: null,
+};
 
-		expect(html).toContain("pro-primary");
-		expect(html).toContain("$2,962.44");
-		expect(html).toContain("$1,653.13");
-		expect(html).toContain("bonus reset");
-		expect(html).toContain("partial");
-		expect(html).toMatch(/(?:≥|&gt;=|>=)\s*\$1,100\.00/);
+const otherProvider: AccountUsageWindows = {
+	accountId: "other-primary",
+	accountName: "other-primary",
+	provider: "ollama",
+	windows: [
+		closedWindow({
+			id: "other-full",
+			accountId: "other-primary",
+			startedAt: AUG_20,
+			closedAt: AUG_24,
+			valueUsd: 420,
+		}),
+	],
+	openWindow: null,
+};
+
+const firstObservedOpen: AccountUsageWindows = {
+	accountId: "partial-open",
+	accountName: "partial-open",
+	provider: "ollama",
+	windows: [],
+	openWindow: openWindow({
+		accountId: "partial-open",
+		startedAt: AUG_24_1830,
+		resetsAt: AUG_31_1830,
+		grantType: "first_observed",
+		valueSoFarUsd: 95,
+		utilization: 4,
+	}),
+};
+
+describe("window-value timeline helpers", () => {
+	it("uses one fixed-now domain and deterministic weekly date ticks", () => {
+		const domain = timeDomain([proPrimary, maxPrimary], NOW_MS);
+
+		expect(domain).toEqual({ startMs: AUG_8, endMs: NOW_MS });
+		expect(weeklyTimelineTicks(domain)).toEqual([
+			{ atMs: AUG_8, label: "Aug 8" },
+			{ atMs: AUG_8 + 7 * DAY_MS, label: "Aug 15" },
+			{ atMs: AUG_8 + 14 * DAY_MS, label: "Aug 22" },
+		]);
 	});
 
-	it("shows the live value and a deterministic reset countdown", () => {
-		const html = renderToString(
-			<AccountWindowValueCard account={proPrimary} nowMs={NOW_MS} />,
-		);
+	it("places closed segments in the shared time domain and clamps open segments at now", () => {
+		const domain = { startMs: AUG_8, endMs: AUG_8 + 10 * DAY_MS };
+		const closed = closedWindow({
+			id: "geometry-closed",
+			accountId: "geometry",
+			startedAt: AUG_8 + 2 * DAY_MS,
+			closedAt: AUG_8 + 5 * DAY_MS,
+			valueUsd: 500,
+		});
+		const open = openWindow({
+			accountId: "geometry",
+			startedAt: AUG_8 + 6 * DAY_MS,
+			resetsAt: AUG_8 + 12 * DAY_MS,
+			valueSoFarUsd: 300,
+			utilization: 40,
+		});
 
-		expect(formatWindowValue(812.55)).toBe("$812.55");
-		expect(formatCountdown(proPrimary.openWindow?.resetsAt ?? 0, NOW_MS)).toBe(
-			"2d 14h",
-		);
-		expect(html).toContain("$812.55");
-		expect(html).toContain("resets in 2d 14h");
+		expect(timelineSegmentGeometry(closed, domain, domain.endMs)).toEqual({
+			leftPercent: 20,
+			widthPercent: 30,
+		});
+		expect(timelineSegmentGeometry(open, domain, domain.endMs)).toEqual({
+			leftPercent: 60,
+			widthPercent: 40,
+		});
 	});
 
-	it("renders the no-live-window state without crashing", () => {
-		const html = renderToString(
-			<AccountWindowValueCard account={maxTertiary} nowMs={NOW_MS} />,
-		);
+	it("orders provider sections and sums each account's latest fully-consumed window", () => {
+		const sections = groupByProvider([
+			otherProvider,
+			maxPrimary,
+			proSecondary,
+			proPrimary,
+		]);
 
-		expect(html).toContain("no live window");
+		expect(sections.map((section) => section.provider)).toEqual([
+			"codex",
+			"anthropic",
+			"ollama",
+		]);
+		expect(
+			sectionLastFullWindowSubtotal(
+				sections.find((section) => section.provider === "codex")?.accounts ??
+					[],
+			),
+		).toBeCloseTo(4_617.72, 2);
+		expect(
+			sectionLastFullWindowSubtotal(
+				sections.find((section) => section.provider === "anthropic")
+					?.accounts ?? [],
+			),
+		).toBe(3_000);
 	});
 
-	it("renders a first-observed open window's live value as a lower bound", () => {
-		// A ledger that first saw this account mid-cycle only knows a floor for
-		// the live window — presenting it as exact would overstate a screenshot.
-		const partialOpen: AccountUsageWindowsFixture = {
-			...proPrimary,
-			openWindow: {
-				...(proPrimary.openWindow as OpenWindowFixture),
-				grantType: "first_observed",
-			},
+	it("skips a most-recent partial row when choosing a section subtotal", () => {
+		const partialIsNewest: AccountUsageWindows = {
+			...maxPrimary,
+			windows: [
+				maxPrimary.windows[1],
+				maxPrimary.windows[0],
+				...maxPrimary.windows.slice(2),
+			],
 		};
 
-		const partialHtml = renderToString(
-			<AccountWindowValueCard account={partialOpen} nowMs={NOW_MS} />,
-		);
-		expect(partialHtml).toMatch(/(?:≥|&gt;=|>=)\s*\$812\.55/);
-
-		// The natural open window keeps its exact presentation.
-		const naturalHtml = renderToString(
-			<AccountWindowValueCard account={proPrimary} nowMs={NOW_MS} />,
-		);
-		expect(naturalHtml).not.toMatch(/(?:≥|&gt;=|>=)\s*\$812\.55/);
+		expect(sectionLastFullWindowSubtotal([partialIsNewest])).toBe(3_000);
+		expect(sectionLastFullWindowSubtotal([partialIsNewest])).not.toBe(85);
 	});
 
-	it("does not render a delta chip for a single closed window but flags unpriced usage", () => {
-		const html = renderToString(
-			<AccountWindowValueCard account={proSecondary} nowMs={NOW_MS} />,
-		);
+	it("excludes partial and first-observed rows from delta baselines and requires two priors", () => {
+		const partialDelta = deltaVsPriorMedian(maxPrimary.windows, 1);
+		const latestDelta = deltaVsPriorMedian(maxPrimary.windows, 0);
+		const naiveDeltaIncludingThePartial = ((3_000 - 2_900) / 2_900) * 100;
 
-		expect(html).not.toContain("Δ");
-		expect(html).toContain("unpriced");
-	});
-});
+		expect(partialDelta).toBeNull();
+		expect(latestDelta).toBeCloseTo(-0.17, 2);
+		expect(latestDelta).not.toBeCloseTo(naiveDeltaIncludingThePartial, 1);
 
-describe("window-value utilities", () => {
-	it("compares a natural window against only earlier qualifying windows", () => {
-		// W4's priors are W3 + W2: W1 is first_observed and must be excluded.
-		const w4Delta = deltaVsPriorMedian(proPrimary.windows, 0);
-		expect(w4Delta).not.toBeNull();
-		expect(w4Delta).toBeCloseTo(41.9, 1);
-
-		// W3 has only W2 as a qualifying earlier window, so it has no baseline.
+		// The first-observed $1,960 floor cannot affect pro-primary's baseline.
+		expect(deltaVsPriorMedian(proPrimary.windows, 0)).toBeCloseTo(41.9, 1);
 		expect(deltaVsPriorMedian(proPrimary.windows, 1)).toBeNull();
-		// A first-observed row never gets a delta, even if later data exists.
 		expect(deltaVsPriorMedian(proPrimary.windows, 3)).toBeNull();
 	});
 
-	it("sums fleet live value and marks it a lower bound only when a partial window is included", () => {
-		const exact = fleetOpenWindowSummary([
-			proPrimary,
-			proSecondary,
-			maxTertiary,
-		]);
-		expect(exact.totalUsd).toBeCloseTo(907.55, 10);
-		expect(exact.liveCount).toBe(2);
-		expect(exact.isLowerBound).toBe(false);
+	it("compares each full window with the next qualifying period only", () => {
+		expect(deltaVsPreviousQualifying(proPrimary.windows, 0)).toBeCloseTo(
+			79.2,
+			1,
+		);
+		expect(deltaVsPreviousQualifying(proPrimary.windows, 1)).toBeCloseTo(
+			-34.5,
+			1,
+		);
+		expect(deltaVsPreviousQualifying(proPrimary.windows, 2)).toBeNull();
+		expect(deltaVsPreviousQualifying(proPrimary.windows, 3)).toBeNull();
 
-		const withPartial = fleetOpenWindowSummary([
-			{
-				...proPrimary,
-				openWindow: {
-					...(proPrimary.openWindow as OpenWindowFixture),
-					grantType: "first_observed",
-				},
-			},
-			proSecondary,
-		]);
-		expect(withPartial.totalUsd).toBeCloseTo(907.55, 10);
-		expect(withPartial.liveCount).toBe(2);
-		expect(withPartial.isLowerBound).toBe(true);
+		// The $85/6% partial observation must not establish the latest full window's
+		// baseline: it compares to the next complete $3,110 period instead.
+		expect(deltaVsPreviousQualifying(maxPrimary.windows, 0)).toBeCloseTo(
+			-3.5,
+			1,
+		);
+		expect(deltaVsPreviousQualifying(maxPrimary.windows, 1)).toBeNull();
+		expect(deltaVsPreviousQualifying(maxPrimary.windows, 0)).not.toBeCloseTo(
+			((3_000 - 85) / 85) * 100,
+			1,
+		);
+
+		const zeroBaseline = [
+			closedWindow({
+				id: "zero-baseline-current",
+				accountId: "zero-baseline",
+				startedAt: AUG_19,
+				closedAt: AUG_20,
+				valueUsd: 100,
+			}),
+			closedWindow({
+				id: "zero-baseline-prior",
+				accountId: "zero-baseline",
+				startedAt: AUG_18,
+				closedAt: AUG_19,
+				valueUsd: 0,
+			}),
+		];
+		expect(deltaVsPreviousQualifying(zeroBaseline, 0)).toBeNull();
+	});
+});
+
+describe("WindowValueTimeline", () => {
+	it("renders provider sections, muted partials, lower bounds, bonus-reset markers, and detailed titles", () => {
+		const html = renderToString(
+			<WindowValueTimeline
+				accounts={[
+					proPrimary,
+					proSecondary,
+					maxPrimary,
+					otherProvider,
+					firstObservedOpen,
+				]}
+				nowMs={NOW_MS}
+			/>,
+		);
+
+		expect(html.indexOf("Codex Pro")).toBeLessThan(html.indexOf("Claude Max"));
+		expect(html).toContain("last full window: $4,617.72");
+		expect(html).toContain("window-value-segment--partial");
+		expect(html).toContain("$85.00 · 6% used");
+		expect(html).toContain("window-value-segment--early-reset");
+		expect(html).toContain("bonus reset");
+		expect(html).toContain("≥ $2k");
+		expect(html).toContain("≥ $95.00");
+		expect(html).toMatch(
+			/title="[^"]*Aug 18[^"]*Aug 19[^"]*\$85\.00[^"]*6%[^"]*natural[^"]*"/,
+		);
 	});
 
-	it("orders live accounts by open value before accounts with no live window", () => {
-		const sorted = sortAccountsByWindowValue([
-			maxTertiary,
-			proSecondary,
-			proPrimary,
-		]);
+	it("keeps lower bounds in titles and floats labels for too-narrow segments", () => {
+		const html = renderToString(
+			<WindowValueTimeline
+				accounts={[
+					proPrimary,
+					proSecondary,
+					maxPrimary,
+					otherProvider,
+					firstObservedOpen,
+				]}
+				nowMs={NOW_MS}
+			/>,
+		);
 
-		expect(sorted.map((account) => account.accountId)).toEqual([
-			"pro-primary",
-			"pro-secondary",
-			"max-tertiary",
-		]);
+		// Tooltips carry the ≥ floor for first-observed values, closed and open —
+		// an observational floor must never read as an exact grant anywhere.
+		expect(html).toMatch(
+			/title="[^"]*Aug 8[^"]*≥ \$1,960\.00[^"]*partial[^"]*"/,
+		);
+		expect(html).toMatch(/title="[^"]*≥ \$95\.00[^"]*open[^"]*"/);
+
+		// The one-day $85/6% window (~5.9% of the Aug 8→25 domain) cannot fit
+		// its own label inside the clipped segment; it must float as a callout
+		// chip so the "6% used" qualifier is never truncated away.
+		expect(html).toMatch(
+			/window-value-segment-label--outside[^>]*>[^<]*\$85\.00 · 6% used/,
+		);
+		// Wide windows keep their inline label.
+		expect(html).toContain('class="truncate">$3.1k');
+	});
+
+	it("renders a semantic period-over-period comparison table for every provider", () => {
+		expect(WindowValueComparisonTable).toBeDefined();
+
+		const html = renderToString(
+			<WindowValueTimeline
+				accounts={[
+					proPrimary,
+					proSecondary,
+					maxPrimary,
+					otherProvider,
+					firstObservedOpen,
+				]}
+				nowMs={NOW_MS}
+			/>,
+		);
+		const rows = html.match(/<tr\b[\s\S]*?<\/tr>/g) ?? [];
+		const rowContaining = (text: string): string => {
+			const row = rows.find((candidate) => candidate.includes(text));
+			expect(row).toBeDefined();
+			return row ?? "";
+		};
+
+		expect(html).toContain("Period over period");
+		for (const header of [
+			"Account",
+			"Window",
+			"Days",
+			"Value",
+			"Util",
+			"Grant",
+			"Δ prev",
+			"Δ median",
+		]) {
+			expect(html).toMatch(
+				new RegExp(`<th[^>]*scope="col"[^>]*>${header}<\\/th>`),
+			);
+		}
+
+		const latestProRow = rowContaining("$2,962.44");
+		expect(latestProRow).toContain("pro-primary");
+		expect(latestProRow).toContain("Aug 20 → Aug 24");
+		expect(latestProRow).toContain("4.0");
+		expect(latestProRow).toContain("100%");
+		expect(latestProRow).toContain("natural");
+		expect(latestProRow).toContain("+79.2%");
+
+		const aug13NerfRow = rowContaining("$1,653.13");
+		expect(aug13NerfRow).toContain("bonus reset");
+		expect(aug13NerfRow).toContain("−34.5%");
+
+		const partialRow = rowContaining("$85.00");
+		expect(partialRow).toContain("window-value-row--partial");
+		expect(partialRow).toContain("6%");
+		expect(partialRow).toContain("—");
+		expect(partialRow).not.toMatch(/[+−]\d+\.\d+%/);
+
+		const firstObservedClosedRow = rowContaining("$1,960.00");
+		expect(firstObservedClosedRow).toContain("≥ $1,960.00");
+		const firstObservedOpenRow = rowContaining("$95.00");
+		expect(firstObservedOpenRow).toContain("≥ $95.00");
+
+		const openRow = rowContaining("$812.55");
+		expect(openRow).toContain("open");
+		expect(openRow).toContain("—");
+		expect(openRow.match(/—/g)).toHaveLength(2);
 	});
 });
