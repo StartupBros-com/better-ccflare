@@ -12,7 +12,6 @@ import type {
 	AnthropicToolChoice,
 	ResponseItem,
 	ResponsesRequest,
-	ResponsesTool,
 } from "./types";
 
 const logger = new Logger("openai-responses-adapter");
@@ -21,12 +20,6 @@ const logger = new Logger("openai-responses-adapter");
 // (e.g. millions of nulls) cannot turn into unbounded synchronous log calls
 // or unbounded iteration — a request→log amplification DoS.
 const MAX_MESSAGE_CONTENT_PARTS = 100_000;
-
-// Bounds request-wide item-count iteration: MAX_MESSAGE_CONTENT_PARTS only
-// caps parts *within* one message, but req.input.length (item count) was
-// otherwise uncapped, and each item can emit its own summary warn(s) — N
-// items → O(N) synchronous logger.warn calls from a single admitted request.
-const MAX_REQUEST_INPUT_ITEMS = 100_000;
 
 // Map OpenAI model names to Claude family aliases so per-account model_mappings
 // (opus/sonnet/haiku) resolve correctly when Codex CLI requests reach the proxy.
@@ -103,17 +96,49 @@ function makeToolIdMapper(): (original: string) => string {
 	};
 }
 
-function translateTools(tools: ResponsesTool[]): AnthropicTool[] {
+function translateTools(
+	tools: unknown[],
+	emitWarn: (message: string) => void,
+): AnthropicTool[] {
 	const result: AnthropicTool[] = [];
-	for (const tool of tools) {
+	for (const rawTool of tools) {
+		if (
+			rawTool === null ||
+			typeof rawTool !== "object" ||
+			Array.isArray(rawTool)
+		) {
+			emitWarn("Dropping malformed tool definition — expected an object");
+			continue;
+		}
+		const tool = rawTool as Record<string, unknown>;
 		if (tool.type !== "function") {
-			logger.warn(`Skipping unsupported/built-in tool type: ${tool.type}`);
+			emitWarn(`Skipping unsupported/built-in tool type: ${String(tool.type)}`);
+			continue;
+		}
+		if (typeof tool.name !== "string" || tool.name.length === 0) {
+			emitWarn("Dropping malformed function tool with no usable name");
+			continue;
+		}
+		if (
+			tool.description !== undefined &&
+			typeof tool.description !== "string"
+		) {
+			emitWarn(`Dropping malformed function tool "${tool.name}" description`);
+			continue;
+		}
+		if (
+			tool.parameters !== undefined &&
+			tool.parameters !== null &&
+			(typeof tool.parameters !== "object" || Array.isArray(tool.parameters))
+		) {
+			emitWarn(`Dropping malformed function tool "${tool.name}" parameters`);
 			continue;
 		}
 		result.push({
 			name: tool.name,
 			description: tool.description,
-			input_schema: tool.parameters ?? {},
+			input_schema:
+				(tool.parameters as Record<string, unknown> | undefined) ?? {},
 		});
 	}
 	return result;
@@ -248,31 +273,15 @@ export function translateRequestToAnthropic(
 	const messages: AnthropicMessage[] = [];
 	const developerBlocks: string[] = [];
 	// Request-scoped: pairing (function_call <-> function_call_output etc.)
-	// must survive sanitization, so the mapper is built once per request, not
-	// globally.
+	// must survive sanitization, so the mapper and side-specific consumption
+	// tracking are built once per request, never globally.
 	const mapToolId = makeToolIdMapper();
+	const consumedCallIds = new Set<string>();
+	const consumedResultIds = new Set<string>();
 
-	// Bound the item loop below: an uncapped req.input.length lets a request
-	// split across hundreds of thousands of tiny items amplify into unbounded
-	// iteration — see MAX_REQUEST_INPUT_ITEMS comment above. This one warn
-	// always fires (it is not subject to the per-request warn budget below,
-	// since it is inherently O(1) regardless of input size). Named `items`
-	// rather than `input` — the local_shell_call branch below declares its own
-	// block-scoped `const input` for the tool_use payload, and reusing the
-	// name here would shadow it.
-	let items: ResponseItem[] = req.input;
-	if (items.length > MAX_REQUEST_INPUT_ITEMS) {
-		logger.warn(
-			`Request has ${items.length} input items — truncating to the first ${MAX_REQUEST_INPUT_ITEMS}`,
-		);
-		items = items.slice(0, MAX_REQUEST_INPUT_ITEMS);
-	}
-
-	// Request-scoped warning budget: per-item summary warns are already O(1)
-	// per item, but a request with many items can still drive total warns to
-	// O(N) — cap total synchronous logger.warn calls per request regardless of
-	// item count (a second, request-wide layer on top of the per-item
-	// batching above).
+	// Request-scoped warning budget covers both input and tool translation.
+	// This prevents either independently bounded collection from amplifying a
+	// single admitted request into unbounded synchronous logging.
 	let warnCount = 0;
 	const MAX_REQUEST_WARNS = 50;
 	const emitWarn = (msg: string) => {
@@ -280,7 +289,16 @@ export function translateRequestToAnthropic(
 		if (warnCount <= MAX_REQUEST_WARNS) logger.warn(msg);
 	};
 
-	for (const item of items) {
+	for (const rawItem of req.input as unknown[]) {
+		if (
+			rawItem === null ||
+			typeof rawItem !== "object" ||
+			Array.isArray(rawItem)
+		) {
+			emitWarn("Dropping malformed Responses input item — expected an object");
+			continue;
+		}
+		const item = rawItem as ResponseItem;
 		// Captured before any narrowing so the generic catch-all below can log
 		// the real runtime type string without needing a cast: once every
 		// literal member of the ResponseItem union has been excluded by the
@@ -390,6 +408,13 @@ export function translateRequestToAnthropic(
 				);
 				continue;
 			}
+			if (consumedCallIds.has(toolUseId)) {
+				emitWarn(
+					`Dropping duplicate ${item.type} call_id "${toolUseId}" — tool_use already emitted`,
+				);
+				continue;
+			}
+			consumedCallIds.add(toolUseId);
 			const toolUseBlock: AnthropicContent = {
 				type: "tool_use",
 				id: mapToolId(toolUseId),
@@ -413,6 +438,13 @@ export function translateRequestToAnthropic(
 				);
 				continue;
 			}
+			if (consumedResultIds.has(toolUseId)) {
+				emitWarn(
+					`Dropping duplicate ${item.type} call_id "${toolUseId}" — tool_result already emitted`,
+				);
+				continue;
+			}
+			consumedResultIds.add(toolUseId);
 			messages.push({
 				role: "user",
 				content: [
@@ -438,6 +470,13 @@ export function translateRequestToAnthropic(
 				);
 				continue;
 			}
+			if (consumedCallIds.has(toolUseId)) {
+				emitWarn(
+					`Dropping duplicate local_shell_call call_id "${toolUseId}" — tool_use already emitted`,
+				);
+				continue;
+			}
+			consumedCallIds.add(toolUseId);
 			// action is type-required, but runtime-malformed input can omit it or
 			// send a non-object (e.g. a bare command string); Anthropic
 			// tool_use.input must be a JSON object, so coerce anything else to {}.
@@ -470,6 +509,13 @@ export function translateRequestToAnthropic(
 				);
 				continue;
 			}
+			if (consumedResultIds.has(toolUseId)) {
+				emitWarn(
+					`Dropping duplicate local_shell_call_output call_id "${toolUseId}" — tool_result already emitted`,
+				);
+				continue;
+			}
+			consumedResultIds.add(toolUseId);
 			messages.push({
 				role: "user",
 				content: [
@@ -510,12 +556,20 @@ export function translateRequestToAnthropic(
 					malformedCount++;
 					continue;
 				}
-				const c = rawC as { type: string; text: unknown };
+				const c = rawC as {
+					type: string;
+					text: unknown;
+					encrypted_content: unknown;
+				};
 				if (c.type === "input_text" && typeof c.text === "string") {
 					textParts.push(c.text);
-				} else if (c.type === "encrypted_content") {
+				} else if (
+					c.type === "encrypted_content" &&
+					typeof c.encrypted_content === "string" &&
+					c.encrypted_content.length > 0
+				) {
 					encryptedCount++;
-				} else if (c.type === "input_text") {
+				} else if (c.type === "encrypted_content" || c.type === "input_text") {
 					// input_text with a non-string text field — same malformed-input
 					// guard as the message branch's translateContentItem, folded into
 					// this branch's existing single summary warn rather than a new
@@ -533,7 +587,7 @@ export function translateRequestToAnthropic(
 			// MAX_MESSAGE_CONTENT_PARTS comment in the message branch above.
 			if (malformedCount > 0) {
 				emitWarn(
-					`Dropped ${malformedCount} malformed content part(s) of agent_message from "${item.author}" — not objects`,
+					`Dropped ${malformedCount} malformed content part(s) of agent_message from "${item.author}" — invalid shape`,
 				);
 			}
 			if (encryptedCount > 0) {
@@ -597,12 +651,6 @@ export function translateRequestToAnthropic(
 		);
 	}
 
-	if (warnCount > MAX_REQUEST_WARNS) {
-		logger.warn(
-			`${warnCount - MAX_REQUEST_WARNS} further translation warning(s) suppressed`,
-		);
-	}
-
 	const mergedMessages = mergeConsecutiveSameRole(messages);
 
 	const result: AnthropicRequest = {
@@ -623,13 +671,21 @@ export function translateRequestToAnthropic(
 	}
 
 	const translatedTools =
-		req.tools && req.tools.length > 0 ? translateTools(req.tools) : [];
+		Array.isArray(req.tools) && req.tools.length > 0
+			? translateTools(req.tools, emitWarn)
+			: [];
 	if (translatedTools.length > 0) {
 		result.tools = translatedTools;
 		const toolChoice = translateToolChoice(req.tool_choice);
 		if (toolChoice !== undefined) {
 			result.tool_choice = toolChoice;
 		}
+	}
+
+	if (warnCount > MAX_REQUEST_WARNS) {
+		logger.warn(
+			`${warnCount - MAX_REQUEST_WARNS} further translation warning(s) suppressed`,
+		);
 	}
 
 	return result;

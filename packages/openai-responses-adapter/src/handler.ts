@@ -14,6 +14,10 @@ import {
 	RECOVERY_STATUS_HEADER,
 	recoveryScopeForCode,
 } from "@better-ccflare/types/routing-recovery";
+import {
+	MAX_RESPONSES_INPUT_ITEMS,
+	MAX_RESPONSES_TOOLS,
+} from "./request-limits";
 import { translateRequestToAnthropic } from "./request-translator";
 import { translateAnthropicResponseToResponses } from "./response-translator";
 import { translateAnthropicStreamToResponses } from "./stream-translator";
@@ -40,6 +44,29 @@ function openAiRequestError(status: 400 | 413, message: string): Response {
 		}),
 		{ status, headers: { "Content-Type": "application/json" } },
 	);
+}
+
+function hasMalformedFunctionTool(tools: unknown[]): boolean {
+	return tools.some((rawTool) => {
+		if (
+			rawTool === null ||
+			typeof rawTool !== "object" ||
+			Array.isArray(rawTool)
+		) {
+			return false;
+		}
+		const tool = rawTool as Record<string, unknown>;
+		if (tool.type !== "function") return false;
+		return (
+			typeof tool.name !== "string" ||
+			tool.name.length === 0 ||
+			(tool.description !== undefined &&
+				typeof tool.description !== "string") ||
+			(tool.parameters !== undefined &&
+				tool.parameters !== null &&
+				(typeof tool.parameters !== "object" || Array.isArray(tool.parameters)))
+		);
+	});
 }
 
 async function decompressWithRuntimeStream(
@@ -229,6 +256,18 @@ export async function handleResponsesRequest(
 				},
 			],
 		};
+	}
+	if (body.input.length > MAX_RESPONSES_INPUT_ITEMS) {
+		return openAiRequestError(413, "Too many input items");
+	}
+	if (body.tools !== undefined && !Array.isArray(body.tools)) {
+		return openAiRequestError(400, "tools must be an array");
+	}
+	if (body.tools && body.tools.length > MAX_RESPONSES_TOOLS) {
+		return openAiRequestError(413, "Too many tools");
+	}
+	if (body.tools && hasMalformedFunctionTool(body.tools)) {
+		return openAiRequestError(400, "Invalid function tool definition");
 	}
 
 	// `previous_response_id` is intentionally ignored. Codex only sends this

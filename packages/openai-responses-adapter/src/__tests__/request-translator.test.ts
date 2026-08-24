@@ -6,6 +6,7 @@ import {
 } from "@better-ccflare/core";
 import { logBus } from "@better-ccflare/logger";
 import type { LogEvent } from "@better-ccflare/types";
+import { MAX_RESPONSES_INPUT_ITEMS } from "../request-limits";
 import { translateRequestToAnthropic } from "../request-translator";
 import type { ResponseItem, ResponsesRequest } from "../types";
 
@@ -328,6 +329,20 @@ describe("translateRequestToAnthropic", () => {
 		};
 		const result = translateRequestToAnthropic(req);
 		expect(result.tools?.[0].input_schema).toEqual({});
+	});
+
+	test("function tool with null parameters keeps required tool choice and normalizes its schema", () => {
+		const req = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [],
+			tools: [{ type: "function", name: "simple_tool", parameters: null }],
+			tool_choice: "required",
+		} as ResponsesRequest;
+		const result = translateRequestToAnthropic(req);
+		expect(result.tools).toEqual([
+			{ name: "simple_tool", description: undefined, input_schema: {} },
+		]);
+		expect(result.tool_choice).toEqual({ type: "any" });
 	});
 
 	test("refusal content maps to text", () => {
@@ -1689,36 +1704,24 @@ describe("translateRequestToAnthropic", () => {
 
 	// --- P1 finding #1: request-wide log-amplification (item count + warn budget) ---
 
-	test("request with more than MAX_REQUEST_INPUT_ITEMS input items is truncated with a single warning", () => {
-		// Must match the module const of the same name in request-translator.ts.
-		const MAX_REQUEST_INPUT_ITEMS = 100_000;
+	test("does not truncate translator input; handler owns item-count admission", () => {
 		const items: ResponseItem[] = Array.from(
-			{ length: MAX_REQUEST_INPUT_ITEMS + 5 },
+			{ length: MAX_RESPONSES_INPUT_ITEMS + 5 },
 			() => ({
 				type: "message",
 				role: "user",
 				content: [{ type: "input_text", text: "x" }],
 			}),
 		);
-		const req: ResponsesRequest = {
+		const result = translateRequestToAnthropic({
 			model: "claude-3-5-sonnet-20241022",
 			input: items,
-		};
-		const warnings = captureWarnings(() => {
-			const result = translateRequestToAnthropic(req);
-			// All items share role "user" and merge into a single message; the
-			// truncation must still have capped how many content parts landed in
-			// it (proof the extra 5 items past the cap were never processed).
-			const totalParts = result.messages.reduce(
-				(sum, m) => sum + m.content.length,
-				0,
-			);
-			expect(totalParts).toBe(MAX_REQUEST_INPUT_ITEMS);
 		});
-		const truncationWarnings = warnings.filter((w) =>
-			w.msg.includes("truncating"),
+		const totalParts = result.messages.reduce(
+			(sum, message) => sum + message.content.length,
+			0,
 		);
-		expect(truncationWarnings).toHaveLength(1);
+		expect(totalParts).toBe(MAX_RESPONSES_INPUT_ITEMS + 5);
 	});
 
 	test("request-scoped warn budget caps total warnings emitted from many per-item warns", () => {
@@ -1743,5 +1746,184 @@ describe("translateRequestToAnthropic", () => {
 		// Budget + the single "further ... suppressed" summary — NOT ~120.
 		expect(warnings.length).toBeLessThanOrEqual(MAX_REQUEST_WARNS + 1);
 		expect(warnings.some((w) => w.msg.includes("suppressed"))).toBe(true);
+	});
+
+	test("keeps only the first call and result for a repeated original function call_id", () => {
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "function_call",
+					call_id: "call_1",
+					name: "one",
+					arguments: "{}",
+				},
+				{
+					type: "function_call",
+					call_id: "call_1",
+					name: "two",
+					arguments: "{}",
+				},
+				{ type: "function_call_output", call_id: "call_1", output: "first" },
+				{ type: "function_call_output", call_id: "call_1", output: "second" },
+			],
+		};
+		const warnings = captureWarnings(() => {
+			const result = translateRequestToAnthropic(req);
+			expect(result.messages).toEqual([
+				{
+					role: "assistant",
+					content: [{ type: "tool_use", id: "call_1", name: "one", input: {} }],
+				},
+				{
+					role: "user",
+					content: [
+						{ type: "tool_result", tool_use_id: "call_1", content: "first" },
+					],
+				},
+			]);
+		});
+		expect(warnings).toHaveLength(2);
+		expect(warnings.every((warning) => warning.msg.includes("duplicate"))).toBe(
+			true,
+		);
+	});
+
+	test("deduplicates original IDs across function, custom, and local-shell call variants", () => {
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "function_call",
+					call_id: "shared",
+					name: "one",
+					arguments: "{}",
+				},
+				{
+					type: "local_shell_call",
+					call_id: "shared",
+					action: { type: "exec", command: ["pwd"] },
+				},
+				{ type: "custom_tool_call_output", call_id: "shared", output: "first" },
+				{
+					type: "local_shell_call_output",
+					call_id: "shared",
+					output: "second",
+				},
+			],
+		};
+		const warnings = captureWarnings(() => {
+			const result = translateRequestToAnthropic(req);
+			expect(result.messages).toHaveLength(2);
+			expect(result.messages[0].content).toHaveLength(1);
+			expect(result.messages[1].content).toEqual([
+				{ type: "tool_result", tool_use_id: "shared", content: "first" },
+			]);
+		});
+		expect(warnings).toHaveLength(2);
+	});
+
+	test("keeps one sanitized pair when an invalid original ID is repeated", () => {
+		const req: ResponsesRequest = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "function_call",
+					call_id: "call:1",
+					name: "one",
+					arguments: "{}",
+				},
+				{
+					type: "custom_tool_call",
+					call_id: "call:1",
+					name: "two",
+					arguments: "{}",
+				},
+				{ type: "function_call_output", call_id: "call:1", output: "first" },
+				{
+					type: "custom_tool_call_output",
+					call_id: "call:1",
+					output: "second",
+				},
+			],
+		};
+		const result = translateRequestToAnthropic(req);
+		const toolUse = result.messages[0].content[0] as { id: string };
+		const toolResult = result.messages[1].content[0] as { tool_use_id: string };
+		expect(toolUse.id).toMatch(/^[A-Za-z0-9_-]+$/);
+		expect(toolUse.id).toBe(toolResult.tool_use_id);
+		expect(result.messages[0].content).toHaveLength(1);
+		expect(result.messages[1].content).toHaveLength(1);
+	});
+
+	test("drops null, primitive, and array top-level input items without throwing", () => {
+		const req = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				null,
+				7,
+				[],
+				{ type: "message", role: "user", content: "keep me" },
+			],
+		} as ResponsesRequest;
+		const warnings = captureWarnings(() => {
+			const result = translateRequestToAnthropic(
+				req as ResponsesRequest & { input: ResponseItem[] },
+			);
+			expect(result.messages).toEqual([
+				{ role: "user", content: [{ type: "text", text: "keep me" }] },
+			]);
+		});
+		expect(warnings).toHaveLength(3);
+	});
+
+	test("does not fabricate an encrypted-agent placeholder from missing, empty, or non-string ciphertext", () => {
+		const req = {
+			model: "claude-3-5-sonnet-20241022",
+			input: [
+				{
+					type: "agent_message",
+					author: "planner",
+					recipient: "coder",
+					content: [
+						{ type: "encrypted_content" },
+						{ type: "encrypted_content", encrypted_content: "" },
+						{ type: "encrypted_content", encrypted_content: 1 },
+					],
+				},
+			],
+		} as ResponsesRequest;
+		const warnings = captureWarnings(() => {
+			const result = translateRequestToAnthropic(
+				req as ResponsesRequest & { input: ResponseItem[] },
+			);
+			expect(result.messages).toHaveLength(0);
+		});
+		expect(warnings.some((warning) => warning.msg.includes("malformed"))).toBe(
+			true,
+		);
+	});
+
+	test("shares one warning budget between malformed input items and tools", () => {
+		const req = {
+			model: "claude-3-5-sonnet-20241022",
+			input: Array.from({ length: 50 }, () => ({
+				type: "message",
+				role: "user",
+				content: [null],
+			})),
+			tools: Array.from({ length: 10 }, () => null),
+		} as ResponsesRequest;
+		const warnings = captureWarnings(() => {
+			expect(() =>
+				translateRequestToAnthropic(
+					req as ResponsesRequest & { input: ResponseItem[] },
+				),
+			).not.toThrow();
+		});
+		expect(warnings).toHaveLength(51);
+		expect(warnings.at(-1)?.msg).toBe(
+			"10 further translation warning(s) suppressed",
+		);
 	});
 });

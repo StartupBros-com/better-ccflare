@@ -1,6 +1,10 @@
 import { describe, expect, it, test } from "bun:test";
 import * as zlib from "node:zlib";
 import { handleResponsesRequest } from "../handler";
+import {
+	MAX_RESPONSES_INPUT_ITEMS,
+	MAX_RESPONSES_TOOLS,
+} from "../request-limits";
 import type { HandleProxyFn } from "../types";
 
 const ANTHROPIC_MESSAGE_BODY = JSON.stringify({
@@ -771,5 +775,203 @@ describe("Responses request body admission", () => {
 		expect(forwarded?.signal.aborted).toBe(false);
 		controller.abort();
 		expect(forwarded?.signal.aborted).toBe(true);
+	});
+
+	describe("Responses structural request admission", () => {
+		function request(body: Record<string, unknown>): Request {
+			return new Request("http://localhost/v1/responses", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(body),
+			});
+		}
+
+		function countingProxy(): [HandleProxyFn, () => number] {
+			let calls = 0;
+			return [
+				async () => {
+					calls += 1;
+					return new Response(ANTHROPIC_MESSAGE_BODY, {
+						headers: { "content-type": "application/json" },
+					});
+				},
+				() => calls,
+			];
+		}
+
+		test("rejects more than the input-item limit without truncating or proxying", async () => {
+			const [proxy, calls] = countingProxy();
+			const req = request({
+				model: "claude-haiku-4-5",
+				input: Array.from({ length: MAX_RESPONSES_INPUT_ITEMS + 1 }, () => ({
+					type: "message",
+					role: "user",
+					content: "x",
+				})),
+			});
+
+			const response = await handleResponsesRequest(
+				req,
+				new URL(req.url),
+				proxy,
+				{},
+			);
+			expect(response.status).toBe(413);
+			expect(calls()).toBe(0);
+			expect(await response.json()).toEqual({
+				type: "error",
+				error: {
+					type: "invalid_request_error",
+					message: "Too many input items",
+				},
+			});
+		});
+
+		test("accepts exactly the input-item limit", async () => {
+			const [proxy, calls] = countingProxy();
+			const req = request({
+				model: "claude-haiku-4-5",
+				input: Array.from({ length: MAX_RESPONSES_INPUT_ITEMS }, () => ({
+					type: "message",
+					role: "user",
+					content: "x",
+				})),
+			});
+
+			const response = await handleResponsesRequest(
+				req,
+				new URL(req.url),
+				proxy,
+				{},
+			);
+			expect(response.status).toBe(200);
+			expect(calls()).toBe(1);
+		});
+
+		test("rejects non-array tools with the invalid-request envelope before proxying", async () => {
+			for (const tools of [null, {}, "not-an-array"]) {
+				const [proxy, calls] = countingProxy();
+				const req = request({ model: "claude-haiku-4-5", input: "Hi", tools });
+				const response = await handleResponsesRequest(
+					req,
+					new URL(req.url),
+					proxy,
+					{},
+				);
+				expect(response.status).toBe(400);
+				expect(calls()).toBe(0);
+				expect(await response.json()).toEqual({
+					type: "error",
+					error: {
+						type: "invalid_request_error",
+						message: "tools must be an array",
+					},
+				});
+			}
+		});
+
+		test("forwards a null-parameter function tool with required choice", async () => {
+			let forwarded: Record<string, unknown> | undefined;
+			const proxy: HandleProxyFn = async (request) => {
+				forwarded = (await request.json()) as Record<string, unknown>;
+				return new Response(ANTHROPIC_MESSAGE_BODY, {
+					headers: { "content-type": "application/json" },
+				});
+			};
+			const req = request({
+				model: "claude-haiku-4-5",
+				input: "Hi",
+				tools: [{ type: "function", name: "lookup", parameters: null }],
+				tool_choice: "required",
+			});
+
+			const response = await handleResponsesRequest(
+				req,
+				new URL(req.url),
+				proxy,
+				{},
+			);
+
+			expect(response.status).toBe(200);
+			expect(forwarded?.tools).toEqual([{ name: "lookup", input_schema: {} }]);
+			expect(forwarded?.tool_choice).toEqual({ type: "any" });
+		});
+
+		test("rejects malformed function tools before proxying", async () => {
+			for (const tool of [
+				{ type: "function", name: "" },
+				{ type: "function", name: 1 },
+				{ type: "function", name: "lookup", description: 1 },
+				{ type: "function", name: "lookup", parameters: "schema" },
+				{ type: "function", name: "lookup", parameters: [] },
+			]) {
+				const [proxy, calls] = countingProxy();
+				const req = request({
+					model: "claude-haiku-4-5",
+					input: "Hi",
+					tools: [tool],
+				});
+				const response = await handleResponsesRequest(
+					req,
+					new URL(req.url),
+					proxy,
+					{},
+				);
+				expect(response.status).toBe(400);
+				expect(calls()).toBe(0);
+				expect(await response.json()).toEqual({
+					type: "error",
+					error: {
+						type: "invalid_request_error",
+						message: "Invalid function tool definition",
+					},
+				});
+			}
+		});
+
+		test("keeps unsupported non-function built-ins skippable", async () => {
+			const [proxy, calls] = countingProxy();
+			const req = request({
+				model: "claude-haiku-4-5",
+				input: "Hi",
+				tools: [{ type: "web_search_preview" }],
+			});
+			const response = await handleResponsesRequest(
+				req,
+				new URL(req.url),
+				proxy,
+				{},
+			);
+			expect(response.status).toBe(200);
+			expect(calls()).toBe(1);
+		});
+
+		test("rejects more than the tool limit without proxying", async () => {
+			const [proxy, calls] = countingProxy();
+			const req = request({
+				model: "claude-haiku-4-5",
+				input: "Hi",
+				tools: Array.from({ length: MAX_RESPONSES_TOOLS + 1 }, () => ({
+					type: "function",
+					name: "tool",
+				})),
+			});
+
+			const response = await handleResponsesRequest(
+				req,
+				new URL(req.url),
+				proxy,
+				{},
+			);
+			expect(response.status).toBe(413);
+			expect(calls()).toBe(0);
+			expect(await response.json()).toEqual({
+				type: "error",
+				error: {
+					type: "invalid_request_error",
+					message: "Too many tools",
+				},
+			});
+		});
 	});
 });
