@@ -1,5 +1,6 @@
 import { describe, expect, it, mock, spyOn } from "bun:test";
 import {
+	BUFFER_SIZES,
 	type CacheFlightCohortSealReceipt,
 	requestEvents,
 } from "@better-ccflare/core";
@@ -575,6 +576,195 @@ describe("forwardToClient usage-collector protocol", () => {
 		} finally {
 			Response.prototype.clone = originalClone;
 		}
+	});
+
+	async function forwardModelStartStream(options: {
+		requestId: string;
+		providerName: string;
+		attemptedModel: string | null;
+		model: string;
+		split?: boolean;
+		rawBody?: string;
+	}): Promise<{
+		clientBody: string;
+		collectorBody: string;
+		upstreamBody: string;
+	}> {
+		const { chunks, ends } = createMockCollector();
+		const ctx = createCtx();
+		ctx.provider.name = options.providerName;
+		ctx.provider.isStreamingResponse = () => true;
+		const messageStart = `event: message_start\ndata: ${JSON.stringify({
+			type: "message_start",
+			message: {
+				model: options.model,
+				usage: { input_tokens: 11, output_tokens: 0 },
+			},
+		})}\n\n`;
+		const terminal =
+			'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\n' +
+			'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+		const upstreamBody = options.rawBody ?? messageStart + terminal;
+		const encoded = new TextEncoder().encode(upstreamBody);
+		const body = new ReadableStream<Uint8Array>({
+			start(controller) {
+				if (options.split) {
+					const splitAt = messageStart.indexOf("unknown") + 3;
+					controller.enqueue(encoded.subarray(0, splitAt));
+					controller.enqueue(
+						encoded.subarray(splitAt, messageStart.length - 1),
+					);
+					controller.enqueue(encoded.subarray(messageStart.length - 1));
+				} else {
+					controller.enqueue(encoded);
+				}
+				controller.close();
+			},
+		});
+
+		const response = await forwardToClient(
+			{
+				requestId: options.requestId,
+				method: "POST",
+				path: "/v1/messages",
+				account: null,
+				requestHeaders: new Headers({
+					"anthropic-version": "2023-06-01",
+					"content-type": "application/json",
+				}),
+				requestBody: new TextEncoder().encode("{}"),
+				response: new Response(body, {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				}),
+				timestamp: Date.now(),
+				retryAttempt: 0,
+				failoverAttempts: 0,
+				attemptedModel: options.attemptedModel,
+			},
+			ctx,
+		);
+		const clientBody = await response.text();
+		await waitFor(() => ends.length > 0);
+		const collectorBody = new TextDecoder().decode(
+			Buffer.concat(chunks.map(({ data }) => Buffer.from(data))),
+		);
+		return { clientBody, collectorBody, upstreamBody };
+	}
+
+	it("replaces OpenRouter's unknown Anthropic model before client delivery and collection across split chunks", async () => {
+		const result = await forwardModelStartStream({
+			requestId: "req-openrouter-unknown-model",
+			providerName: "openrouter",
+			attemptedModel: "anthropic/claude-opus-5",
+			model: "unknown",
+			split: true,
+		});
+
+		for (const body of [result.clientBody, result.collectorBody]) {
+			expect(body).toContain('"model":"anthropic/claude-opus-5"');
+			expect(body).not.toContain('"model":"unknown"');
+		}
+	});
+
+	it.each([
+		{
+			label: "real upstream model",
+			providerName: "openrouter",
+			attemptedModel: "anthropic/claude-opus-5",
+			model: "upstream-served-model",
+		},
+		{
+			label: "blank attempted model",
+			providerName: "openrouter",
+			attemptedModel: "   ",
+			model: "unknown",
+		},
+		{
+			label: "null attempted model",
+			providerName: "openrouter",
+			attemptedModel: null,
+			model: "unknown",
+		},
+		{
+			label: "unknown attempted model",
+			providerName: "openrouter",
+			attemptedModel: "unknown",
+			model: "unknown",
+		},
+		{
+			label: "different provider",
+			providerName: "anthropic",
+			attemptedModel: "anthropic/claude-opus-5",
+			model: "unknown",
+		},
+	])("preserves the message_start frame for $label", async (testCase) => {
+		const result = await forwardModelStartStream({
+			requestId: `req-preserve-${testCase.label.replaceAll(" ", "-")}`,
+			...testCase,
+		});
+		expect(result.collectorBody).toBe(result.clientBody);
+		expect(result.clientBody).toBe(result.upstreamBody);
+	});
+
+	it("does not normalize a non-SSE OpenRouter response", async () => {
+		createMockCollector();
+		const ctx = createCtx();
+		ctx.provider.name = "openrouter";
+		ctx.provider.isStreamingResponse = () => false;
+		const body = JSON.stringify({ type: "message", model: "unknown" });
+		const response = await forwardToClient(
+			{
+				requestId: "req-openrouter-unknown-json",
+				method: "POST",
+				path: "/v1/messages",
+				account: null,
+				requestHeaders: new Headers(),
+				requestBody: null,
+				response: new Response(body, {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+				timestamp: Date.now(),
+				retryAttempt: 0,
+				failoverAttempts: 0,
+				attemptedModel: "anthropic/claude-opus-5",
+			},
+			ctx,
+		);
+		await expect(response.text()).resolves.toBe(body);
+	});
+
+	it("fails open for malformed OpenRouter message_start frames", async () => {
+		const rawBody =
+			'event: message_start\ndata: {"type":"message_start","message":{"model":unknown}}\n\n' +
+			'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+		const result = await forwardModelStartStream({
+			requestId: "req-openrouter-malformed-model",
+			providerName: "openrouter",
+			attemptedModel: "anthropic/claude-opus-5",
+			model: "unknown",
+			rawBody,
+		});
+
+		expect(result.clientBody).toBe(rawBody);
+		expect(result.collectorBody).toBe(rawBody);
+	});
+
+	it("fails open for an over-limit unterminated OpenRouter SSE tail", async () => {
+		const rawBody = `event: message_start\ndata: ${"x".repeat(
+			BUFFER_SIZES.SSE_TRANSPORT_TAIL_MAX_BYTES + 1,
+		)}`;
+		const result = await forwardModelStartStream({
+			requestId: "req-openrouter-over-limit-tail",
+			providerName: "openrouter",
+			attemptedModel: "anthropic/claude-opus-5",
+			model: "unknown",
+			rawBody,
+		});
+
+		expect(result.clientBody).toBe(rawBody);
+		expect(result.collectorBody).toBe(rawBody);
 	});
 
 	it("records one failed end with partial usage when the downstream cancels", async () => {

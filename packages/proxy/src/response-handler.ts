@@ -1,6 +1,8 @@
 import {
+	BUFFER_SIZES,
 	type CacheFlightCohortSealReceipt,
 	requestEvents,
+	SseFrameBuffer,
 	TIME_CONSTANTS,
 } from "@better-ccflare/core";
 import {
@@ -329,6 +331,151 @@ function logNonStreamingUpstream403(
 		accountId,
 		...telemetry,
 	});
+}
+
+interface RawSseFrame {
+	frame: Uint8Array;
+	delimiter: Uint8Array;
+	remainder: Uint8Array;
+}
+
+function appendBytes(left: Uint8Array, right: Uint8Array): Uint8Array {
+	if (left.byteLength === 0) return right;
+	const combined = new Uint8Array(left.byteLength + right.byteLength);
+	combined.set(left);
+	combined.set(right, left.byteLength);
+	return combined;
+}
+
+function takeRawSseFrame(bytes: Uint8Array): RawSseFrame | null {
+	for (let index = 0; index < bytes.byteLength; index += 1) {
+		let delimiterLength = 0;
+		if (bytes[index] === 10) {
+			if (bytes[index + 1] === 10) delimiterLength = 2;
+			else if (bytes[index + 1] === 13 && bytes[index + 2] === 10)
+				delimiterLength = 3;
+		} else if (bytes[index] === 13 && bytes[index + 1] === 10) {
+			if (bytes[index + 2] === 10) delimiterLength = 3;
+			else if (bytes[index + 2] === 13 && bytes[index + 3] === 10)
+				delimiterLength = 4;
+		}
+		if (delimiterLength > 0) {
+			return {
+				frame: bytes.subarray(0, index),
+				delimiter: bytes.subarray(index, index + delimiterLength),
+				remainder: bytes.subarray(index + delimiterLength),
+			};
+		}
+	}
+	return null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
+
+function rewriteUnknownOpenRouterModelFrame(
+	frame: string,
+	attemptedModel: string,
+): string | null {
+	try {
+		const eventMatch = /(?:^|\r?\n)event:[ \t]*([^\r\n]*)/.exec(frame);
+		const dataLines = frame.match(/(?:^|\r?\n)data:/g) ?? [];
+		const dataMatch = /(^|\r?\n)(data:[ \t]*)([^\r\n]*)/m.exec(frame);
+		if (
+			eventMatch?.[1].trim() !== "message_start" ||
+			dataLines.length !== 1 ||
+			!dataMatch
+		) {
+			return null;
+		}
+
+		const payload: unknown = JSON.parse(dataMatch[3]);
+		if (!isRecord(payload) || !isRecord(payload.message)) return null;
+		const message = payload.message;
+		if (message.model !== "unknown") return null;
+
+		message.model = attemptedModel;
+		const dataStart =
+			(dataMatch.index ?? 0) + dataMatch[1].length + dataMatch[2].length;
+		return (
+			frame.slice(0, dataStart) +
+			JSON.stringify(payload) +
+			frame.slice(dataStart + dataMatch[3].length)
+		);
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Normalizes OpenRouter's Anthropic-compatible `message_start` placeholder.
+ * attemptedModel is requested transport provenance, not confirmed served identity.
+ */
+function createOpenRouterModelNormalizationStream(
+	upstream: ReadableStream<Uint8Array>,
+	attemptedModel: string,
+): ReadableStream<Uint8Array> {
+	const frames = new SseFrameBuffer({
+		maxFrameBytes: BUFFER_SIZES.SSE_TRANSPORT_FRAME_MAX_BYTES,
+		maxBufferBytes: BUFFER_SIZES.SSE_TRANSPORT_TAIL_MAX_BYTES,
+	});
+	const encoder = new TextEncoder();
+	let rawTail: Uint8Array<ArrayBufferLike> = new Uint8Array();
+	let failOpen = false;
+
+	return upstream.pipeThrough(
+		new TransformStream<Uint8Array, Uint8Array>({
+			transform(chunk, controller) {
+				if (failOpen) {
+					controller.enqueue(chunk);
+					return;
+				}
+
+				rawTail = appendBytes(rawTail, chunk);
+				let parsedFrames: string[];
+				try {
+					parsedFrames = frames.push(chunk);
+				} catch {
+					failOpen = true;
+					controller.enqueue(rawTail);
+					rawTail = new Uint8Array();
+					return;
+				}
+
+				for (const parsedFrame of parsedFrames) {
+					const rawFrame = takeRawSseFrame(rawTail);
+					if (!rawFrame) {
+						failOpen = true;
+						controller.enqueue(rawTail);
+						rawTail = new Uint8Array();
+						return;
+					}
+					rawTail = rawFrame.remainder;
+					const normalizedFrame = rewriteUnknownOpenRouterModelFrame(
+						parsedFrame,
+						attemptedModel,
+					);
+					controller.enqueue(
+						normalizedFrame === null
+							? rawFrame.frame
+							: encoder.encode(normalizedFrame),
+					);
+					controller.enqueue(rawFrame.delimiter);
+				}
+			},
+			flush(controller) {
+				if (!failOpen) {
+					try {
+						frames.flush();
+					} catch {
+						// The retained raw tail is emitted unchanged below.
+					}
+				}
+				if (rawTail.byteLength > 0) controller.enqueue(rawTail);
+			},
+		}),
+	);
 }
 
 export interface ResponseHandlerOptions {
@@ -739,7 +886,7 @@ export async function forwardToClient(
 				.includes("text/event-stream") ??
 				false);
 		let streamTerminalState: AnthropicTerminalState | null = null;
-		const responseBody = isAnthropicMessagesSseResponse
+		const terminalRecoveredBody = isAnthropicMessagesSseResponse
 			? createAnthropicTerminalRecoveryStream(semanticallyBoundedBody, {
 					drainAbort,
 					gracePeriodMs: anthropicStreamConfig?.terminalGraceMs,
@@ -790,6 +937,27 @@ export async function forwardToClient(
 		const anthropicOutcomeTracker = isAnthropicMessagesSseResponse
 			? new AnthropicStreamOutcomeTracker()
 			: null;
+		const normalizedAttemptedModel = attemptedModel?.trim() ?? "";
+		const shouldNormalizeOpenRouterModel =
+			ctx.provider.name === "openrouter" &&
+			method === "POST" &&
+			path === "/v1/messages" &&
+			response.ok &&
+			(response.headers
+				.get("content-type")
+				?.toLowerCase()
+				.includes("text/event-stream") ??
+				false) &&
+			normalizedAttemptedModel.length > 0 &&
+			normalizedAttemptedModel.toLowerCase() !== "unknown";
+		// Normalize after terminal recovery so outcome tracking, the client, and
+		// the usage collector consume the same bytes.
+		const responseBody = shouldNormalizeOpenRouterModel
+			? createOpenRouterModelNormalizationStream(
+					terminalRecoveredBody,
+					normalizedAttemptedModel,
+				)
+			: terminalRecoveredBody;
 
 		const onChunk = (value: Uint8Array): void => {
 			anthropicOutcomeTracker?.push(value);
