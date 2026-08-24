@@ -1,37 +1,32 @@
 import { useUsageWindows } from "../../hooks/queries";
 import { Card, CardContent } from "../ui/card";
-import { AccountWindowValueCard } from "./AccountWindowValueCard";
-import {
-	fleetOpenWindowSummary,
-	formatWindowValue,
-	sortAccountsByWindowValue,
-} from "./window-value-utils";
+import { WindowValueTimeline } from "./WindowValueTimeline";
 
 function WindowValueLoadingState() {
 	return (
-		<div className="space-y-4">
-			<div className="h-28 animate-pulse rounded-lg bg-muted" />
-			<div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
-				{Array.from(
-					{ length: 3 },
-					(_, index) => `window-value-skeleton-${index}`,
-				).map((key) => (
-					<div key={key} className="h-80 animate-pulse rounded-lg bg-muted" />
-				))}
-			</div>
+		<div className="space-y-6">
+			{Array.from(
+				{ length: 2 },
+				(_, index) => `window-value-timeline-skeleton-${index}`,
+			).map((key) => (
+				<div key={key} className="space-y-3">
+					<div className="h-6 w-56 animate-pulse rounded bg-muted" />
+					<div className="h-8 animate-pulse rounded bg-muted" />
+					<div className="h-14 animate-pulse rounded bg-muted" />
+					<div className="h-14 animate-pulse rounded bg-muted" />
+				</div>
+			))}
 		</div>
 	);
 }
 
-/** Fleet view of current usage-window value and the most recent completed windows. */
+/** Fleet usage-window timeline, grouped into provider sections. */
 export function WindowValueTab() {
 	const { data, error, isLoading } = useUsageWindows("all");
 	const accounts = data && "accounts" in data ? data.accounts : [];
 	const populatedAccounts = accounts.filter(
 		(account) => account.openWindow !== null || account.windows.length > 0,
 	);
-	const sortedAccounts = sortAccountsByWindowValue(populatedAccounts);
-	const fleet = fleetOpenWindowSummary(sortedAccounts);
 
 	if (isLoading) return <WindowValueLoadingState />;
 
@@ -52,7 +47,7 @@ export function WindowValueTab() {
 		);
 	}
 
-	if (sortedAccounts.length === 0) {
+	if (populatedAccounts.length === 0) {
 		return (
 			<Card>
 				<CardContent className="p-8 text-center">
@@ -66,32 +61,6 @@ export function WindowValueTab() {
 	}
 
 	return (
-		<div className="space-y-5">
-			<section
-				className="rounded-lg border border-primary/20 bg-primary/5 p-5"
-				aria-label="Fleet window value"
-			>
-				<p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-					Fleet open-window value
-				</p>
-				<div className="mt-1 flex flex-wrap items-end justify-between gap-3">
-					<p className="text-3xl font-bold tracking-tight text-foreground">
-						{fleet.isLowerBound ? "≥ " : ""}
-						{formatWindowValue(fleet.totalUsd)}
-					</p>
-					<p className="text-sm text-muted-foreground">
-						{sortedAccounts.length} account
-						{sortedAccounts.length === 1 ? "" : "s"} · {fleet.liveCount} live
-						window{fleet.liveCount === 1 ? "" : "s"}
-					</p>
-				</div>
-			</section>
-
-			<div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
-				{sortedAccounts.map((account) => (
-					<AccountWindowValueCard key={account.accountId} account={account} />
-				))}
-			</div>
-		</div>
+		<WindowValueTimeline accounts={populatedAccounts} nowMs={Date.now()} />
 	);
 }
